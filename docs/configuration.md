@@ -214,6 +214,8 @@ effective timeout = min(
 
 where absent values do not participate, and time spent inside a `humanWaitRefs` call is not counted. Outside interactive Main, orchestration programs (`agents.run` / `agents.wait` / `agents.ask`, `workflow.agent`, ...) keep their separate `agents.timeoutMs` floor, which is unaffected by `executor.maxTimeoutMs`. In interactive Main, the fixed `executor.mainMaxTimeoutMs` ceiling takes precedence over every source above; repeated host calls cannot extend it.
 
+`executor.powershell` (default `"refuse"`) gates PowerShell (smarty-dev#9826). By default `pi.powershell` is **refused**, and so is every captured or extension `powershell` override, whether it is reached through `pi.powershell` or `extensions.powershell`. The refusal names smarty-dev#9826 and happens before any `tool_call` hook or execution. The reason: no Fabric guard judges PowerShell grammar, and the fleet's command guards are bash-only. Showing them PowerShell source as a bash call is not a safety mechanism, because PowerShell-only spellings (for example `Set-Location <dir>; …`, the `&` call operator or `-EncodedCommand`) do not parse the way a bash guard reads them. Set `"powershell": "allow"` under `executor` in the host profile's `PI_CODING_AGENT_DIR/fabric.json` to opt in. The key is **host-only**: a workspace `.pi/fabric.json` cannot set or withdraw it. **The opt-in accepts that grammar gap.** With it, each call is first shown to guards as a `bash` `tool_call` (`input.shell: "powershell"`, a non-session `cwd` as a leading `cd`), then as the `powershell`-named `tool_call`. A block from either refuses the call. A hook that rewrites either input also refuses it, so the command runs only exactly as judged. Any other value refuses. Pi's own model-facing `powershell` tool, used outside full code mode, is not gated by this key.
+
 ## Full reference
 
 ```json
@@ -231,6 +233,7 @@ where absent values do not participate, and time spent inside a `humanWaitRefs` 
     "hostCallTimeouts": {},
     "humanWaitRefs": ["extensions.ask"],
     "shellHangMs": 120000,
+    "powershell": "refuse",
     "memoryLimitBytes": 67108864,
     "maxOutputChars": 100000,
     "maxNestedResultChars": 2000000,
@@ -318,6 +321,7 @@ where absent values do not participate, and time spent inside a `humanWaitRefs` 
     "sessionExportDir": "",
     "nice": 0,
     "deadRootFilter": { "mode": "off", "exempt": [] },
+    "stuckPreparingMs": 600000,
     "childQuestions": "cancel",
     "childQuestionTimeoutMs": 600000
   },
@@ -364,6 +368,7 @@ where absent values do not participate, and time spent inside a `humanWaitRefs` 
     "maxEventBytes": 262144,
     "maxReadEvents": 500,
     "actorPollMs": 250,
+    "residentIdleExitMs": 600000,
     "idleReadCoalesceMs": 5000,
     "actorQueueLimit": 32,
     "eventContextChars": 40000,
@@ -696,7 +701,7 @@ Fabric clears inactive run artifacts by age. It never truncates active JSONL fil
 
 Run housekeeping begins on actual agent storage use (not manager startup), continues during use, and runs best-effort on close. It never truncates live run JSONL or actor `session.jsonl` files. Existing actor archive expiry and residency cleanup still apply after compaction; result files are never compacted. Caller-owned run roots retain their existing explicit-cleanup semantics. Symlink roots/markers, wrong-uid files, malformed ownership, unknown contents, and unverifiable incomplete descendants are preserved. `/fabric settings` exposes these values under **Retention**. Changing them requires `/fabric reload`.
 
-For a one-time **offline** mesh compaction, run `node dist/storage/retention-cli.js <mesh-root> --dry-run` (the default): it lists eligible paths and before/after bytes without creating or changing files. `--apply` performs the same compaction and backup pruning; normal expiry ages remain unchanged. The sweep requires existing Linux host flocks and proven-dead diagnostic holders, and skips live, legacy, unfenced or unreadable custody. Actors must belong to a fenced resident root; latest-run references and malformed-session recovery backups remain protected.
+For a one-time **offline** mesh compaction, run `node dist/storage/retention-cli.js <mesh-root> --dry-run` (the default): it lists eligible paths and before/after bytes without creating or changing files. `--apply` performs the same compaction and backup pruning; normal expiry ages remain unchanged. The sweep requires existing Linux host flocks and proven-dead diagnostic holders, and skips live, legacy, unfenced or unreadable custody. Actors must belong to a fenced resident root; latest-run references and malformed-session recovery backups remain protected. On Windows, `--apply` deletes only with the bundled `dist/native/fabric-win-remove.exe` whose sha256 matches the digest built into the CLI: it checks each entry's owner SID, volume serial and file index on an open handle (and, for a file, its judged last-write time and size, with writes denied while it is held, so a file refreshed after the scan is kept), never follows a reparse point, and deletes by handle (smarty-dev#7858). Without it, `--apply` deletes nothing there.
 
 Persistent actor hosts also start this CLI themselves, **once a day per mesh**, with `--apply --runs-older-than <retention.actorRunArchiveMs>`. Whichever host claims the day's slot file (`<mesh>/.mesh-retention-sweep-<day>.json`) runs it as a detached, niced process. Single flight is a kernel lock: the host takes an exclusive non-blocking `flock` on `<mesh>/.mesh-retention-sweep.lock` before it claims the slot, and hands the locked descriptor to the sweep, which holds it until it exits (a crash releases it). While a sweep holds the lock, no new sweep starts. If the lock state is uncertain (for example `flock` is missing), no sweep runs: the host logs one line and publishes one `fabric.alarm.retention-sweep-lock` event. Linux only; elsewhere the CLI refuses `--apply`.
 
@@ -741,6 +746,7 @@ Other agent settings:
 - `maxTokensPerChild`: cumulative token bound per child (0 disables).
 - `nice`: Unix niceness 0-19 for every child agent: task agents, actors (supervisors, review agents) and durable resident children. The default, `0`, leaves priority unchanged. Fabric calls `os.setPriority(child, nice)` right after the spawn. On Linux it also sets best-effort IO priority with `ionice -c2 -n7`, when `ionice` is installed. The child's own tools (its bash commands) inherit both on Linux and macOS. On Windows `os.setPriority` maps to a priority class. A failure is logged once per worker in the run's `events.jsonl` (`fabric_priority_error`) and never stops the run. Values outside 0-19 are clamped; there is no environment override. A per-call `nice` on `agents.run`/`agents.spawn`, actor creation or `agents.setNice` can only raise it.
 - `deadRootFilter`: **host-only** skip of durable-actor activations whose owning root is positively dead (smarty-dev#6062). `mode`: `"off"` (default) or `"on"`; `exempt`: actor ids, id prefixes or exact names that always run. Fail-open: only an expired-for-over-10-minutes root lease with no live participant skips. See [agents](agents.md#dead-root-activation-filter).
+- `stuckPreparingMs`: **host-only** threshold in ms (default `600000`, ten minutes; clamped to 1 s to 7 days). An activation hung in preparation never fails, so the three-failure notice cannot fire for it (smarty-dev#6337). The resident host's maintenance tick (at most every 10 s) therefore tells the actor's root Main once per stuck episode: `Fabric host notice: actor NAME stuck in preparing for N min (since T); its queued events are waiting.` Preparation time adds up across phases; a permit wait (`waiting`) does not count. The episode ends when the activation leaves preparing. Each notice appends one line to `<mesh>/metrics/stuck-preparing.jsonl` (`stuckMs`, `waitedMs`, and `queued` including the overflow backlog).
 - `notifyOnComplete`: show concise detached `agents.spawn()` completion notices and batch unread results for Main at a safe tool-turn boundary (or wake idle Main). `wait`/`join` and terminal `status` retract pending notifications; running/UI status does not. Escape/error parks results until new input.
 - `processSlice`: optional **root-policy-only** Linux systemd user slice for process-transport workers, for example `"batch.slice"`. Unset by default; configure it in `/etc/smarty/fabric-policy.json`. Agent-dir and workspace configuration cannot enable or override it; other platforms keep direct launches. When enabled, Fabric uses `systemd-run --user --scope --slice=<slice> --quiet --collect -- <worker command>`. Scope admission and the worker execute in place, preserving worker PID/PGID and the existing exit/custody fences. If the executable is unavailable or admission fails, Fabric logs one warning per transport instance and launches directly, only after the failed attempt confirms native close; an already-admitted worker is never replayed. Admission is bounded to five seconds; an unconfirmed teardown vetoes fallback. This changes placement only: configure CPU/IO limits on the slice separately.
 - `instructionsRoot`: host-only allowed root for actor `instructionsFile` inputs (unset defaults to `~/.local/share/smarty-dev/factory/current/`). Configure it in the host agent directory's `fabric.json`; workspace config cannot widen or replace it. Main and resident owners realpath the root at first use, so `current` may point to an installed factory generation.
@@ -845,7 +851,7 @@ variable `PI_FABRIC_MESH_STATE_BACKEND` overrides it. A root on a network filesy
 fenced only on the mesh `.lock` plus `custody.lock`; its writer census is advisory only (printed as
 `advisory: N writers, M unknown`) and never a cutover gate (smarty-dev#6982). Do not set it by hand on a shared mesh.
 
-`mesh.lockProtocol` accepts only numeric `1` or `2` and defaults to `1`. It is captured
+`mesh.lockProtocol` accepts only numeric `1`, `2` or `3` and defaults to `1`. It is captured
 when each mesh store is constructed; editing configuration does not switch an existing
 store. Protocol 1 keeps the B68 canonical-directory mkdir and three-line token/PID/time
 wire without an incarnation: if a dead holder's PID is reused by a live process, v1
@@ -864,6 +870,59 @@ Fresh ownerless directories, empty/torn/corrupt owner files and nonempty unrecor
 directories fail closed; recorded live owners never expire. Unrecoverable unrecorded
 orphans need trusted repair after all possible writers/cleaners are fenced out. Immediate
 proven-dead-holder recovery, retained recovery receipts and bounded jitter/backoff remain.
+
+Protocol 3 (smarty-dev#9569) is protocol 2 plus the holder's PID namespace on its own owner line:
+`linux:<machine-id>:<boot_id>:<pid-ns inode>`, `darwin:<IOPlatformUUID>:<bootsessionuuid>:host` or
+`win32:<MachineGuid>:<boot ticks>:host`. The mesh `.lock` and `custody.lock` (plain and host-qualified) write it.
+
+- **Why:** a container, VM or other host sharing a mesh root sees ESRCH, or an unrelated process, for a LIVE holder
+  in another namespace. Reclaiming that holder lets two writers into the critical section.
+- **Pid evidence only in our own namespace:** a reclaimer uses pid evidence (ESRCH, another incarnation) only for a
+  holder of ITS OWN namespace.
+- **No earlier-boot inference:** another boot id with the same machine id is NOT taken as proof of death (two running
+  VM clones look exactly like that), so it is unproven (pi-fabric#923).
+- **Precondition: a mesh root lives on ONE host's local filesystem** (pi-fabric#923 round 3). A live VM snapshot clone
+  can reproduce the whole namespace id, but two clones can share a root only over shared storage. So pid evidence is
+  used only when the root is on a known local filesystem:
+  - **Linux:** `statfs` type ext2/3/4, xfs, btrfs, tmpfs, zfs or f2fs, read through the held root fd
+    (`/proc/self/fd/N`). overlay is not on the list: its backing filesystem is not checked.
+  - **Not detected: one disk attached to two hosts at once** (a multi-attach block volume, a shared SAN LUN) and
+    mounted with one of those filesystems. The type looks local, but two hosts share the root. Such a mount is
+    unsupported (these filesystems are corrupted by it anyway). It is an accepted security gap, smarty-dev#9813
+    (fabric-store, 2026-10-11), whose holder-lease design closes it.
+  - **Anything else is unproven:** overlay, nfs, cifs/smb, 9p, virtiofs, fuse, ceph, gfs2, ocfs2, an unknown or
+    unreadable type.
+  - **macOS fails closed:** Node exposes only `statfs`'s numeric `f_type`, which macOS does not keep stable. A crashed
+    holder there needs `--unsafe-holder-stopped`.
+  - **Windows fails closed** (below).
+- **Never reclaimed automatically:** a holder of another namespace, or one whose namespace is unknown or malformed
+  (`FABRIC_MESH_LOCK_FOREIGN_HOLDER` / `FABRIC_MESH_LOCK_UNPROVEN_HOLDER`, still a `MeshLockTimeoutError`).
+  - **Under protocol 3, a record without a namespace (a holder from before protocol 3) is UNPROVEN too**
+    (pi-fabric#923). Its pid may name nothing here although it is alive in another namespace.
+    No exception: a crashed pre-3 holder, of any lock, needs the operator step after the switch.
+  - The error, and a `[pi-fabric] ALARM` line (once per holder), name the lock path and the exact command, with the
+    root and the token shell-quoted: `fabric-mesh-backend lock-recover --root 'DIR' --lock mesh|custody --holder 'TOKEN'`.
+    That command acts only on a holder of its own namespace whose pid is gone; run it inside the holder's namespace.
+  - Its labelled `--unsafe-holder-stopped` override recovers on the operator's word that the holder is stopped,
+    prints an ALARM, and appends an audit line naming the operator (uid, user, pid, parent pid and executable, host) to
+    `<root>/lock-recoveries.jsonl`. It records the parent's executable path and pid, never its command line. The
+    audit is opened without following a symlink and must be a private (0600) regular file of this user. It rotates
+    once at 1 MiB (`.1`). On Windows it is only ever created exclusively: an existing audit file refuses the next
+    recovery until it is moved aside. If it cannot be written, nothing is recovered.
+- **Rollout:**
+  - Old releases accept only 4- or 5-field (custody: 7-field) records, so they can never reclaim a protocol-3
+    record.
+  - New releases at protocol 1 or 2 reclaim legacy records by today's rule. At protocol 3 they do not. So switch a
+    root to 3 only after its writers run a release that knows it, and recover any crashed old holder with the
+    command above.
+- **Windows fails closed:** the namespace id there is a machine and boot identity, which cannot tell Windows silos
+  (containers) apart. So under protocol 3 a Windows holder is never reclaimed on pid evidence, even one whose
+  namespace equals ours. A crashed Windows holder needs `--unsafe-holder-stopped`, until the handle-based release of
+  smarty-dev#9569 (d) can prove liveness.
+- **Not covered:** the synchronous SQLite create fence (`holdMeshFenceSync`, a single brief attempt) still writes
+  the legacy record.
+- **Residual off Linux:** a holder's release by name is still exposed to a forced rename (smarty-dev#9569 (b)/(d)).
+  Linux releases through the pinned directory fd.
 These safeguards do not repair old B68 binaries still running on the root. Even on
 protocol 1, claiming this new-only safety boundary requires fencing every older capable
 writer/cleaner and preventing respawn or later resumption. Rollback needs the same
@@ -944,6 +1003,8 @@ to canonical reads. The added UUID/hash fields and sidecar remain backward-compa
 writer cadence and CAS revisions are unchanged. See [mesh state read gates](mesh-state-reads.md).
 
 Mesh topics, shared state, and the participant directory remain project-scoped. Every runtime publishes one short-lived host lease and records for the roots, agents, and actors it owns. `agents.members()` and `mesh.members()` read those records. `agents.main()` and `agents.peers()` project roots. When a lease expires, its records leave normal discovery together. A host that stops without a clean shutdown leaves them in the shared state, so each runtime removes, every 15 minutes, the records of hosts whose lease expired more than 6 hours ago. Each removal is checked against the record's version. Existing needed directory writes also compact at most 64 expired native/resident host records per batch, without touching participant or delivery retention. `mesh.actorPollMs` controls fallback polling for actor events and owner-addressed commands when filesystem notifications are unavailable.
+
+A resident host exits cleanly when its root Main is no longer live (including the existing 180-second reload lease), it owns no actors (including idle or stopped actors), and it has no queued/processing requests or active agents continuously for `mesh.residentIdleExitMs` (default `600000`, 10 minutes; range 0–7 days). `0` disables this exit policy. Actor/request activity or a renewed root lease resets the window. The host logs `resident exiting: root dead, no actors, idle N min`, withdraws its lease, and leaves an intentional-exit marker so its launcher does not restart it. A later explicit spawn or actor-create request clears the marker and starts a new host normally. Accepted same-release configuration updates apply the setting during resident maintenance; rollback is a revert or setting `mesh.residentIdleExitMs` to `0`.
 
 Shared state keeps a persistent revision clock (`highWater` in the mesh `state.json`). A new key takes the next clock revision, and an update takes its key's version plus one. Compare revisions only through `ifVersion`; a new key seldom starts at 1. Fabric builds from before this clock can still write to a shared root. A newer Fabric then raises its clock to the highest retained revision, so both can use one root.
 

@@ -53,6 +53,52 @@ afterEach(async () => {
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 
+describe("sender final delivery outcomes", () => {
+  const outcomes = (root: string) => {
+    const directory = path.join(root, "delivery-outcomes");
+    return fs.existsSync(directory) ? fs.readdirSync(directory).flatMap(file =>
+      fs.readFileSync(path.join(directory, file), "utf8").trim().split("\n").map(line => JSON.parse(line))) : [];
+  };
+  it.each(["Unknown Fabric participant: missing", "Main's followUp queue is full"])("records an owner rejection without notRun (%s) as unknown: its handler may have run", async reason => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-send-rejected-")); roots.push(root);
+    const owner = plane(root, "host:owner"), sender = plane(root, "host:sender");
+    owner.start(() => ({ accepted: false, error: reason })); sender.start(() => ({ accepted: false }));
+    await expect(sender.request("host:owner", "session:target", "followUp", { message: "later" })).rejects.toThrow(reason);
+    const event = sender.mesh.read({ topic: "fabric.control.command" })[0]!;
+    expect(outcomes(root)).toEqual([{ eventId: event.id, to: "session:target", from: "host:sender", mode: "followUp", outcome: "unknown", reason, at: expect.any(Number) }]);
+  });
+  it.each(["Unknown Fabric participant: missing", "Main's followUp queue is full"])("records an owner rejection with notRun: true (%s) as failed", async reason => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-send-failed-")); roots.push(root);
+    const owner = plane(root, "host:owner"), sender = plane(root, "host:sender");
+    owner.start(() => ({ accepted: false, error: reason, notRun: true })); sender.start(() => ({ accepted: false }));
+    await expect(sender.request("host:owner", "session:target", "followUp", { message: "later" })).rejects.toThrow(reason);
+    // A proven-notRun message is resent once; each published attempt failed.
+    const events = sender.mesh.read({ topic: "fabric.control.command" });
+    expect(events.length).toBeGreaterThan(0);
+    expect(outcomes(root)).toEqual(events.map(event => ({ eventId: event.id, to: "session:target", from: "host:sender", mode: "followUp", outcome: "failed", reason, at: expect.any(Number) })));
+  });
+  it("records an unclaimed command withdrawn at its deadline as failed (smarty-dev#6729)", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-send-withdrawn-")); roots.push(root);
+    const sender = plane(root, "host:sender", {}, { acknowledgementTimeoutMs: 30, pollMs: 5 });
+    sender.start(() => ({ accepted: false }));
+    await expect(sender.request("host:missing", "session:target", "steer", { message: "hello" })).rejects.toThrow("now withdrawn");
+    const event = sender.mesh.read({ topic: "fabric.control.command" })[0]!;
+    expect(outcomes(root)).toEqual([{ eventId: event.id, to: "session:target", from: "host:sender", mode: "steer", outcome: "failed", reason: expect.stringContaining("not delivered"), at: expect.any(Number) }]);
+  });
+  it("records timeout unknown without falsely treating admission as delivered", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-send-unknown-")); roots.push(root);
+    const owner = plane(root, "host:owner", {}, { pollMs: 5 }), sender = plane(root, "host:sender", {}, { acknowledgementTimeoutMs: 30, pollMs: 5 });
+    // Claimed, never acknowledged before the sender gives up; released after the assertion.
+    let release: (() => void) | undefined;
+    owner.start(() => new Promise(resolve => { release = () => resolve({ accepted: false }); }));
+    sender.start(() => ({ accepted: false }));
+    await expect(sender.request("host:owner", "session:target", "steer", { message: "hello" })).rejects.toThrow("outcome is unknown");
+    release?.();
+    const event = sender.mesh.read({ topic: "fabric.control.command" })[0]!;
+    expect(outcomes(root)).toEqual([{ eventId: event.id, to: "session:target", from: "host:sender", mode: "steer", outcome: "unknown", reason: expect.stringContaining("outcome is unknown"), at: expect.any(Number) }]);
+  });
+});
+
 describe("FabricControlPlane", () => {
   it("delivers ordinary control to older owners unfenced with one counted warning per request", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-sender-incarnation-")); roots.push(root);
@@ -1798,6 +1844,42 @@ describe("FabricControlPlane", () => {
 
     expect(receive).not.toHaveBeenCalled();
     expect(store.read({ topic: "fabric.control.ack", limit: 10 })).toEqual([]);
+  });
+
+  // smarty-dev#9751: a command a bridge delivered long after its deadline (its bridged copy is new on this mesh)
+  // used to be skipped like history, with no ACK: its sender never learnt. It now gets the expired ACK.
+  it("answers a command a bridge delivered past its deadline with an expired ACK, never a silent skip", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-control-"));
+    roots.push(root);
+    const meshRoot = path.join(root, "mesh");
+    const store = new MeshStore(meshRoot, 64 * 1024, 1_000);
+    const receiver = plane(meshRoot, "host:receiver");
+    const receive = vi.fn(() => ({ accepted: true }));
+    receiver.start(receive);
+    await store.publish({
+      topic: "fabric.control.command",
+      kind: "steer",
+      from: identity("host:sender"),
+      to: "host:receiver",
+      data: {
+        version: 1,
+        commandId: "command:late",
+        targetId: "agent:target",
+        operation: "steer",
+        replyTo: "host:sender",
+        message: "late",
+        requestedAt: Date.now() - 11 * 60_000,                 // a 30 s command, carried 11 min late
+        deadlineAt: Date.now() - 11 * 60_000 + 30_000,
+        bridge: { from: "qs32729", id: "evt-remote" },
+      },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 150));
+
+    expect(receive).not.toHaveBeenCalled();
+    expect(store.read({ topic: "fabric.control.ack", limit: 10 })).toContainEqual(expect.objectContaining({
+      to: "host:sender",
+      data: expect.objectContaining({ commandId: "command:late", accepted: false, error: "Fabric control command expired" }),
+    }));
   });
 
   it("final-drains a command published immediately before close", async () => {

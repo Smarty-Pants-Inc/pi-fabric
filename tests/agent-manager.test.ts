@@ -2,9 +2,11 @@ import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
+import { senderHeaderHookPath } from "../src/guards/sender-headers.js";
 import type { FabricLifecyclePublishRequest } from "../src/lifecycle/types.js";
 import { snapshotHandoffSession } from "../src/agents/handoff.js";
 import {
@@ -2371,11 +2373,13 @@ describe("AgentManager", () => {
     });
     expect(native.status).toBe("completed");
     // --no-extensions disables Fabric/discovery, not explicitly installed host helpers.
-    // Principal delivery and native session observation remain installed host helpers;
-    // neither widens the child's tools nor enables Fabric/discovery.
+    // Principal delivery, native session observation and the sender-header hook (smarty-dev#6207,
+    // every Pi-backed child) remain installed host helpers; none widens the child's tools nor
+    // enables Fabric/discovery. The hook path comes from the worker's own resolver.
     expect(JSON.parse(native.text).extensionPaths).toEqual([
       path.resolve("src/worker/principal-delivery.ts"),
       path.resolve("src/worker/session-id.ts"),
+      senderHeaderHookPath(pathToFileURL(path.resolve("src/worker.ts")).href),
     ]);
     expect(JSON.parse(native.text)).toMatchObject({
       extensions: false,

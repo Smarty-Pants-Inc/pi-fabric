@@ -26,7 +26,8 @@ export type StateFenceStore = Pick<MeshStore, "writeBatch" | "withTryLock">;
 /**
  * Runs `body` synchronously under the state write lock, on the committed state, and writes
  * nothing. `timeoutMs` bounds the whole fence (0: one zero-wait try); a bounded try whose prepared
- * snapshot moved is retried while the budget lasts. A body that throws is never retried.
+ * snapshot moved is retried while the budget lasts. A body that throws is never retried. On SQLite a
+ * `timeoutMs` of 1 s or more waits at least 6 s for the write lock (smarty-dev#9805, state-backend.ts).
  */
 export const withStateFence = async <T>(
   mesh: StateFenceStore, identity: MeshIdentity, body: (view: MeshBatchView) => T, timeoutMs?: number,

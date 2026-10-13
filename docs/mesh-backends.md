@@ -29,6 +29,10 @@ replays the stream. The factory then returns that prepared backend.
 - **Refusals:** a server older than 2.11; a server whose `sync_always` is not proven true, unless the host passes
 `acceptPeriodicSync` (then `sync()`, the #9313 barrier, rejects with `MeshStateNatsNotDurableError`: not durable); a retired stream; writes while the stream is importing; a `fresh` read while the projector lags
 (busy, retryable); and a stream message that could not have passed the CAS (the backend fails closed).
+- **Bridges (interim):** on `nats` the R20 state write fence excludes no other writer, so a bridge's held-event
+ownership check (security F2) cannot hold. A root where a bridge holds events (a mirrored remote host record) refuses
+`nats`, and a bridge refuses a `nats` store (`FABRIC_MESH_STATE_NATS_BRIDGE_REFUSED`). This lasts until the event log
+moves onto the state stream (smarty-dev#9725) or a lease fences the append.
 - **Lifecycle:** `import-begin` (ready, newer epoch) -> importing; `import-commit` (importing, same epoch) -> ready;
 `retire` (ready or importing, newer epoch) -> retired, terminal. Any other control record, or a batch after `retire`, is a
 protocol violation: the projector fails closed.
@@ -142,7 +146,10 @@ the marker is removed. The new parts are a `nats` value for `MeshBackendFlag` an
    refuse. The migrator projects the stream and checks the digest against the source snapshot
    (as the `import-verify` step). It then re-reads the source and compares it with G0, as
    cutover does today.
-3. **Commit.** Install the moved marker (`backend: "nats"`, epoch E+1) over `state.json`. Then
+3. **Commit.** Install the NATS moved marker (epoch E+1) over `state.json`. It is the SQLite
+   marker's exact shape plus `natsStream`, so every release since pi-fabric#627 (main c58cec72)
+   refuses it on its tolerant read as well (a new `format` would read as damage there, so as an
+   EMPTY mesh). Releases before c58cec72 know no marker, the same gap the SQLite cutover accepts. Then
    publish `import-commit{E+1}` with the expected last sequence. Then set the local flag to
    `nats`. Every crash point reruns from the stream head plus the marker, as the `importing`
    rerun does now.
@@ -152,6 +159,32 @@ the marker is removed. The new parts are a `nats` value for `MeshBackendFlag` an
    `retire` sequence through the existing import (into `state.db`) or export (into
    `state.json.rollback-<E>.tmp`) path. Verify the digest, switch the local flag, and replace
    the marker. **Abort** publishes `unretire{E+2}`, as `abortMeshRollback` does.
+
+**Built (smarty-dev#9670, `backend-migration-nats.ts`): file <-> nats.** `importMeshStateToNats`
+and `rollbackMeshStateFromNats` run steps 2-4 for a file root (no `state.db`, epoch 0, so E+1 = 1
+and `retire` is epoch 2). A sqlite root refuses: roll it back to file first (`rollbackMeshState`),
+then import. The details:
+
+- `import-begin` also records the source digest and `readGeneration`.
+- The chunks are deterministic batch records: entries in key order, then tombstones in eviction
+  order, at most 512 KiB of changes each, with fixed message ids.
+- The source is kept at `state.json.nats-cutover-<E+1>` before the marker goes in.
+- **Rerun without the marker:** the same source resumes. Stored chunks must match byte for byte.
+  A changed source refuses. An import never purges, and the stream name is derived from the root (pi-fabric#937).
+  A leftover of a failed import (still importing, no marker) may be deleted on the server, after checking that no
+  Fabric process serves the root from NATS. A stream with committed state refuses the import and is never deleted.
+- **Rerun with the marker:** the stream is checked against the kept copy, then committed.
+- **Rollback:** it retires the stream and exports the projection through the `state.json`
+  encoder into `state.json.nats-rollback-<E+2>-<uuid>.tmp`. It reads the temp back, checks the digest
+  and renames it over the marker. A rerun redoes the export, or only verifies after the rename.
+- **Files:** every file is created with O_CREAT|O_EXCL|O_NOFOLLOW at 0600 and checked as our own
+  regular file. An existing kept copy must be ours and hold the source's digest, else the import refuses.
+- **Limits (`LIMIT: FABRIC_MESH_NATS_MIGRATION_LIMIT`):** `maxReplay` stream messages,
+  `maxStateBytes` of projected state and of the export, and `maxStateTombstones` (bounded as the
+  backend bounds them), and `maxPayloadBytes` per import chunk (default 1 MiB, the server default),
+  checked before `import-begin`. A rollback counts its own `retire` record against `maxReplay`. A
+  limit refuses before any retire, rename or commit.
+- **Not built:** the sqlite-direct path and abort (`unretire`).
 
 The local locks fence only this host. Other hosts are fenced by the stream itself, because every
 nats write carries an expected sequence. Each host's `.lock` and the census still stop its

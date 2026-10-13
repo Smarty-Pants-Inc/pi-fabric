@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { MeshBackgroundQueue, MeshBackgroundRetry } from "../core/atomic-write.js";
 import { rethrowMeshLockTimeout } from "../core/atomic-write.js";
-import { MeshStore, type MeshIdentity, type MeshStateEntry } from "../mesh/store.js";
+import { MeshStore, meshOutageAlarmSink, type MeshIdentity, type MeshStateEntry } from "../mesh/store.js";
 import type { FabricParticipantInfo, FabricParticipantSource } from "../topology/types.js";
 import {
   FABRIC_LIFECYCLE_SUBSCRIPTION_PREFIX,
@@ -31,7 +31,8 @@ const subscriptionKey = (id: string): string =>
   FABRIC_LIFECYCLE_SUBSCRIPTION_PREFIX + id;
 
 export class LifecycleBroker {
-  readonly #backgroundPoll = new MeshBackgroundRetry("lifecycle cursor poll");
+  readonly #backgroundPoll = new MeshBackgroundRetry("lifecycle cursor poll")
+    .alarmsTo(meshOutageAlarmSink(() => ({ mesh: this.mesh, from: this.identity })));
   readonly #backgroundPublish = new MeshBackgroundQueue("participant lifecycle event");
 
   publishBackground(request: FabricLifecyclePublishRequest): Promise<void> {

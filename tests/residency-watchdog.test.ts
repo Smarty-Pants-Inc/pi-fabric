@@ -32,6 +32,20 @@ const fixture = () => {
 };
 
 describe("resident watchdog", () => {
+  it.each(["actor", "session actor"])("never keeps dormant %s definitions warm", async kind => {
+    const { root, config, client } = fixture();
+    const directory = kind === "actor" ? config.actorRoot : config.sessionActorRoot!;
+    fs.mkdirSync(directory, { recursive: true });
+    fs.writeFileSync(path.join(directory, "actors.json"), JSON.stringify({ actors: [
+      { id: "dormant", rootId: config.rootId, residency: "durable", status: "dormant" },
+    ] }));
+    const start = vi.spyOn(client, "ensureHost").mockResolvedValue({} as Awaited<ReturnType<typeof client.ensureHost>>);
+    vi.useFakeTimers();
+    try {
+      client.start(); await vi.advanceTimersByTimeAsync(180_000);
+      expect(start).not.toHaveBeenCalled();
+    } finally { await client.close(); vi.useRealTimers(); fs.rmSync(root, { recursive: true, force: true }); }
+  });
   it("F6 pending completion outbox alone owns automatic recovery with unchanged-work backoff", async () => {
     const { root, config, client } = fixture();
     const outbox = path.join(config.residencyRoot, "delivery-outbox");
@@ -207,6 +221,26 @@ describe("resident watchdog", () => {
       await vi.advanceTimersByTimeAsync(19_950);
       expect(start).toHaveBeenCalledTimes(3);
     } finally { await client.close(); vi.useRealTimers(); fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it("never rearms an intentional dead-root idle exit from retained actor/outbox work", async () => {
+    const { root, config, client } = fixture();
+    fs.mkdirSync(config.actorRoot, { recursive: true });
+    fs.writeFileSync(path.join(config.actorRoot, "actors.json"), JSON.stringify({ actors: [
+      { id: "stale", rootId: config.rootId, residency: "durable", status: "idle" },
+    ] }));
+    fs.mkdirSync(config.residencyRoot, { recursive: true });
+    fs.writeFileSync(path.join(config.residencyRoot, "idle-exit.json"), JSON.stringify({ format: 1,
+      reason: "root-dead-idle", rootId: config.rootId, pid: 123, token: "retired-token", at: Date.now(), idleMs: 600_000 }));
+    const start = vi.spyOn(client, "ensureHost").mockResolvedValue({} as Awaited<ReturnType<typeof client.ensureHost>>);
+    vi.useFakeTimers();
+    try {
+      client.start();
+      await vi.advanceTimersByTimeAsync(180_000);
+      expect(start).not.toHaveBeenCalled();
+    } finally {
+      await client.close(); vi.useRealTimers(); start.mockRestore(); fs.rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it("does not launch for another root's actors or terminal agents", async () => {

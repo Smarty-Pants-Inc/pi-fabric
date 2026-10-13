@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { createHash } from "node:crypto";
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { existsSync, lstatSync, readdirSync, readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
@@ -36,6 +36,7 @@ const stable = [
   "cli/index.js",
 ];
 const lazy = [
+  "storage/verified-remove.js",
   "residency/launcher-owner.js",
   "judge/agent.js",
   "core/landlock.js",
@@ -44,6 +45,7 @@ const lazy = [
   "lifecycle/reload-slots.js",
   "coordination/unverified-ids.js",
   "agents/model-route.js",
+  "agents/per-call-route.js",
   "agents/spawn-router.js",
   "durable/worker-host.js",
   "native-discovery.js",
@@ -97,6 +99,7 @@ const lazy = [
   "worker/session-id.js",
   "guards/actor-bash-hook.js",
   "guards/model-route-hook.js",
+  "guards/sender-headers.js",
   "worker/options.js",
   "worker/recovery-watchdog.js",
   "worker/retry-profile.js",
@@ -134,6 +137,19 @@ if (process.platform === "linux") {
     throw new Error(`Native helpers are unpinned (${manifest.compiler}); CI and FABRIC_NATIVE_CC_PINNED=1 builds require the pinned zig (smarty-dev#8121)`);
   }
   if (!pinned) console.warn(`[pi-fabric] native helpers are UNPINNED (${manifest.compiler}): a local build only (smarty-dev#8121)`);
+  // smarty-dev#8145: the lease probe refuses a helper or gate bundle whose chain up to the package root
+  // another user can write: the package root, and everything in dist/, ours, no group/other write, no symlink.
+  const owned = (file, label) => {
+    const stat = lstatSync(file);
+    if (stat.isSymbolicLink()) throw new Error(`${label} must not be a symlink`);
+    if ((stat.mode & 0o022) !== 0 || stat.uid !== process.geteuid()) {
+      throw new Error(`${label} must be owned by uid ${process.geteuid()} and not group/other-writable (uid ${stat.uid}, mode ${(stat.mode & 0o777).toString(8)})`);
+    }
+    if (stat.isDirectory()) for (const name of readdirSync(file)) owned(join(file, name), `${label}/${name}`);
+  };
+  owned(dist, "dist");
+  const top = lstatSync(root);
+  if ((top.mode & 0o022) !== 0 || top.uid !== process.geteuid()) throw new Error(`the package root ${root} must be owned by uid ${process.geteuid()} and not group/other-writable`);
   for (const helper of ["fabric-landlock", "fabric-mesh-lease"]) {
     const actual = createHash("sha256").update(readFileSync(join(dist, "native", helper))).digest("hex");
     if (!manifest.helpers?.[helper] || manifest.helpers[helper] !== actual) {
@@ -145,6 +161,8 @@ if (process.platform === "linux") {
   if (!cli.includes(`"fabric-mesh-lease":"${manifest.helpers["fabric-mesh-lease"]}"`)) {
     throw new Error("dist/mesh/mesh-backend-cli.js does not embed the fabric-mesh-lease digest of the build manifest (a lost esbuild define)");
   }
+  // bin/fabric-mesh-backend checks this one bundle before it loads it (pi-fabric#880): it must import no package file.
+  if (/\bfrom\s*["']\.|\bimport\s*\(\s*["']\./.test(cli)) throw new Error("dist/mesh/mesh-backend-cli.js imports a package file: bin/fabric-mesh-backend's pre-load check would not cover it");
 }
 
 const { WORKER_PROTOCOL_VERSION } = await import("../dist/agents/worker-protocol.js");
@@ -233,7 +251,10 @@ const startupBytes = [...startupFiles].reduce((sum, file) => sum + Buffer.byteLe
 // are the same (smarty-dev#2004).
 // Still 45 after the upstream 0.110.1 merge (smarty-dev#5776): the entry is upstream's
 // extension-bootstrap.js, and the prewalk model picker loads on first use instead of eagerly.
-if (startupBytes > 1150 * 1024 || startupFiles.size > 45) {
+// Re-baselined 2026-10-12: main + 8 KiB after #982's eager entry; smarty-dev#10373 (lazy bootstrap entry) takes it back down.
+const STARTUP_BUDGET_BYTES = 1232 * 1024;
+const STARTUP_BUDGET_FILES = 53;
+if (startupBytes > STARTUP_BUDGET_BYTES || startupFiles.size > STARTUP_BUDGET_FILES) {
   throw new Error(`Startup static graph grew beyond its budget: ${startupBytes} bytes in ${startupFiles.size} files`);
 }
 const optionalPackages = ["yaml", "@lezer/python", "shiki", "@shikijs/langs", "@shikijs/themes", "typescript", "mcporter", "jev-fabric", "@earendil-works/pi-durable", "@earendil-works/chord", "pi-fabric-worker-sdk"];
@@ -252,7 +273,9 @@ if ([...startupFiles].some(file => /class ProviderOperations|Fabric provider ope
 const initialSource = [...startupFiles]
   .map((file) => readFileSync(file, "utf8"))
   .join("\n");
-for (const forbidden of ["src/bash-idle-watchdog.ts", "src/core/file-lock.ts", "src/guards/foreground-wait.ts", "src/lifecycle/reload-slots.ts", "src/core/landlock.ts", "src/core/pattern-kill.ts", "src/compaction/hook.ts", "src/compaction/branch-summary.ts", "src/compaction/projections.ts", "src/coordination/unverified-ids.ts", "src/main-agent.ts", "src/providers/agents-message-router.ts", "src/fabric-runtime-state.ts", "src/topology/root-inbox.ts", "src/topology/root-inbox-context.ts", "src/prewalk/handoff.ts", "src/jev/client.ts", "src/ui/languages/bend.ts", "src/ui/settings.ts", "src/ui/conversation.ts", "src/ui/conversation-chrome.ts", 'from "mcporter"', "src/native-discovery.ts", "src/memory/extractive-history.ts", "src/memory/extractive-index.ts", "src/entropy/compiler.ts", "src/entropy/trial.ts", "src/ui/image-overlays.ts", "src/ui/kitty-viewport.ts"]) {
+// file-lock, entropy/compiler and entropy/trial are eager while Pi loads dist/index.js (pi-fabric#982): its
+// re-exported entropy barrel imports them. Restore these 3 markers with the bootstrap entry, smarty-dev#10373.
+for (const forbidden of ["src/storage/verified-remove.ts", "src/bash-idle-watchdog.ts", "src/guards/foreground-wait.ts", "src/lifecycle/reload-slots.ts", "src/core/landlock.ts", "src/core/pattern-kill.ts", "src/compaction/hook.ts", "src/compaction/branch-summary.ts", "src/compaction/projections.ts", "src/coordination/unverified-ids.ts", "src/main-agent.ts", "src/providers/agents-message-router.ts", "src/fabric-runtime-state.ts", "src/topology/root-inbox.ts", "src/topology/root-inbox-context.ts", "src/prewalk/handoff.ts", "src/jev/client.ts", "src/ui/languages/bend.ts", "src/ui/settings.ts", "src/ui/conversation.ts", "src/ui/conversation-chrome.ts", 'from "mcporter"', "src/native-discovery.ts", "src/memory/extractive-history.ts", "src/memory/extractive-index.ts", "src/ui/image-overlays.ts", "src/ui/kitty-viewport.ts"]) {
   if (initialSource.includes(forbidden)) {
     throw new Error(`Startup static graph contains lazy module marker: ${forbidden}`);
   }
@@ -265,7 +288,12 @@ if (actorBashHookFiles.size !== 1) {
 }
 const routeHookFiles = staticClosure([join(dist, "guards/model-route-hook.js")]);
 if (routeHookFiles.size !== 1) throw new Error("Model route hook must remain standalone");
+// smarty-dev#6207: loaded with -e into every Pi worker child; one self-contained file.
+if (staticClosure([join(dist, "guards/sender-headers.js")]).size !== 1) throw new Error("Sender header hook must remain standalone");
 if (initialSource.includes("src/agents/model-route.ts")) throw new Error("Model routing escaped into startup graph");
+if (initialSource.includes("src/agents/per-call-route.ts") || initialSource.includes("src/jev/gateway-transport.ts")) {
+  throw new Error("Per-call routing escaped into startup graph");
+}
 if ([...staticClosure([join(dist, "index.js"), join(dist, "fabric-runtime-state.js")])]
   .some(file => readFileSync(file, "utf8").includes("src/agents/spawn-router.ts"))) {
   throw new Error("Spawn router adapter escaped into the eager/provider static graph");
@@ -307,5 +335,5 @@ await Promise.all(
   ),
 );
 console.log(
-  `build artifacts and lazy startup graph verified (${startupFiles.size} startup files, ${startupBytes} startup bytes, ${lazy.length} stable lazy entries, ${chunkFiles.length} chunks)`,
+  `build artifacts and lazy startup graph verified (${startupFiles.size} startup files, ${startupBytes} startup bytes, ${STARTUP_BUDGET_BYTES - startupBytes} bytes headroom, ${lazy.length} stable lazy entries, ${chunkFiles.length} chunks)`,
 );

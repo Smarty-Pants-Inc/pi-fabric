@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import { readHostPolicy, warnAgentLandlockDisabled, type HostPolicy } from "./host-policy.js";
 import type { ModelRoutingConfig } from "./agents/model-route.js";
+import { parsePerCallRouting } from "./agents/per-call-config.js";
 import { normalizeAgentRouterConfig, type FabricAgentRouterConfig } from "./agents/router-config.js";
 export type { FabricAgentRouterConfig } from "./agents/router-config.js";
 import { normalizeAgentPlacement, type AgentPlacementConfig } from "./agents/placement-config.js";
@@ -78,6 +79,9 @@ type FabricActorScope = "project" | "session";
 
 export type FabricPythonRuntime = "cpython" | "monty";
 
+/** Whether pi.powershell and extension powershell overrides may run (smarty-dev#9826). */
+export type FabricPowerShellPolicy = "refuse" | "allow";
+
 interface FabricExecutorConfig {
   kernel: FabricKernel;
   pythonRuntime: FabricPythonRuntime;
@@ -112,6 +116,11 @@ interface FabricExecutorConfig {
   shellHangMs: number;
   /** Linux filesystem confinement for local pi.bash; no audit-only kernel mode. */
   landlock: LandlockSettings;
+  /** pi.powershell and every captured or extension powershell override are
+   * refused unless the host profile sets "allow" (smarty-dev#9826). No guard
+   * judges PowerShell grammar, so "allow" accepts that gap. Host-only: the
+   * project layer cannot opt in. */
+  powershell: FabricPowerShellPolicy;
   memoryLimitBytes: number;
   maxOutputChars: number;
   maxNestedResultChars: number;
@@ -266,6 +275,8 @@ export interface FabricAgentConfig {
   wakeText?: FabricWakeTextConfig;
   /** Host-only: skip durable-actor activations whose owning root is dead (smarty-dev#6062). */
   deadRootFilter: FabricDeadRootFilterConfig;
+  /** Host-only: tell the root's Main once an activation stays in preparing this long (smarty-dev#6337). */
+  stuckPreparingMs: number;
   /** Admission policy for the model a child process actually reports. */
   modelAdmission: FabricModelAdmission;
   /** Shell command run in each new agent worktree before the child starts. */
@@ -426,12 +437,18 @@ export interface FabricActorsConfig {
   transientBlockMaxMs?: number;
 }
 
-export type MeshLockProtocol = 1 | 2;
+/**
+ * 1: the B68 wire; 2: a complete owner published by rename, with the holder's process incarnation; 3: protocol 2 plus
+ * the holder's PID namespace on its own line (smarty-dev#9569), so a reclaimer uses pid evidence only in its own
+ * namespace, and processes from before protocol 3 cannot parse (so never reclaim) its records. Switch a root to 3 once
+ * its writers run a release that knows it.
+ */
+export type MeshLockProtocol = 1 | 2 | 3;
 
 const meshLockProtocol = (value: unknown): MeshLockProtocol => {
   if (value === undefined) return 1;
-  if (value === 1 || value === 2) return value;
-  throw new Error("mesh.lockProtocol must be 1 or 2");
+  if (value === 1 || value === 2 || value === 3) return value;
+  throw new Error("mesh.lockProtocol must be 1, 2 or 3");
 };
 
 /** Keyed mesh state backend (smarty-dev#6477 L2a): see src/mesh/state-backend.ts. */
@@ -460,6 +477,8 @@ const meshControlIncarnationFence = (value: unknown): MeshControlIncarnationFenc
   throw new Error("mesh.controlIncarnationFence must be warn or enforce");
 };
 
+export const RESIDENT_IDLE_EXIT_MS = 10 * 60_000;
+
 export interface FabricMeshConfig {
   /** Host-only; warn admits legacy senders, enforce requires a captured destination epoch. */
   controlIncarnationFence: MeshControlIncarnationFence;
@@ -475,6 +494,8 @@ export interface FabricMeshConfig {
   maxEventBytes: number;
   maxReadEvents: number;
   actorPollMs: number;
+  /** Exit a dead-root resident after this long with no actors or requests; 0 disables. */
+  residentIdleExitMs: number;
   /** Explicit background observational age; 1 s runtime floor, never ordinary authority reads. */
   idleReadCoalesceMs: number;
   /** Admission window for commands routed over a mesh bridge, minimum 30 s. */
@@ -666,6 +687,7 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
     humanWaitRefs: ["extensions.ask"],
     shellHangMs: DEFAULT_SHELL_HANG_MS,
     landlock: { mode: "off", disabled: false },
+    powershell: "refuse",
     memoryLimitBytes: 64 * 1024 * 1024,
     maxOutputChars: 50_000,
     maxNestedResultChars: 2_000_000,
@@ -728,6 +750,7 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
     sessionExportDir: "",
     nice: 0,
     deadRootFilter: { mode: "off", exempt: [] },
+    stuckPreparingMs: 600_000,
     modelAdmission: "strict",
   },
   jev: { ...DEFAULT_JEV_CONFIG, credentialCommand: [] },
@@ -798,6 +821,7 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
     maxEventBytes: 256 * 1024,
     maxReadEvents: 500,
     actorPollMs: 250,
+    residentIdleExitMs: RESIDENT_IDLE_EXIT_MS,
     idleReadCoalesceMs: 5_000,
     bridgeControlTimeoutMs: 30_000,
     actorQueueLimit: 32,
@@ -1308,6 +1332,8 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
         disabled: landlock.disabled === true,
         ...(landlock.allowEscape === true ? { allowEscape: true } : {}),
       },
+      // Fail closed: anything but the exact opt-in refuses PowerShell (smarty-dev#9826).
+      powershell: executor.powershell === "allow" ? "allow" : "refuse",
       memoryLimitBytes: boundedInteger(
         executor.memoryLimitBytes,
         DEFAULT_FABRIC_CONFIG.executor.memoryLimitBytes,
@@ -1453,6 +1479,7 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
                 }
                 return { ...routing.revertReset as Record<string, string> };
               })(),
+              ...(routing.perCall !== undefined ? { perCall: parsePerCallRouting(routing.perCall) } : {}),
               ...(typeof routing.pinModel === "string" ? { pinModel: routing.pinModel } : {}),
               ...(isFabricThinking(routing.pinThinking) ? { pinThinking: routing.pinThinking } : {}),
               shadowCandidates: Array.isArray(routing.shadowCandidates)
@@ -1547,6 +1574,7 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
           : DEFAULT_FABRIC_CONFIG.agents.sessionExportDir,
       nice: boundedInteger(agents.nice, DEFAULT_FABRIC_CONFIG.agents.nice, 0, 19),
       deadRootFilter: normalizeDeadRootFilterConfig(agents.deadRootFilter),
+      stuckPreparingMs: boundedInteger(agents.stuckPreparingMs, DEFAULT_FABRIC_CONFIG.agents.stuckPreparingMs, 1_000, 7 * 24 * 60 * 60_000),
       ...(stringValue(agents.instructionsRoot)?.trim() ? { instructionsRoot: stringValue(agents.instructionsRoot)!.trim() } : {}),
       ...(wakeText ? { wakeText } : {}),
       modelAdmission: modelAdmissionValue(
@@ -1714,6 +1742,9 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
         DEFAULT_FABRIC_CONFIG.mesh.actorPollMs,
         50,
         10_000,
+      ),
+      residentIdleExitMs: boundedInteger(
+        mesh.residentIdleExitMs, DEFAULT_FABRIC_CONFIG.mesh.residentIdleExitMs, 0, 7 * 24 * 60 * 60_000,
       ),
       idleReadCoalesceMs: boundedInteger(
         mesh.idleReadCoalesceMs,
@@ -2135,6 +2166,7 @@ const resolveFabricConfig = (
       delete agents.processSlice;
       delete agents.placement;
       delete agents.deadRootFilter; // Host-only: a lane cannot drop the fleet's exemptions.
+      delete agents.stuckPreparingMs; // Host-only: a lane cannot silence the stuck-preparing owner notice.
       document.agents = agents;
       const mesh = { ...objectValue(document.mesh) };
       delete mesh.controlIncarnationFence; // Host-only: a workspace cannot weaken the fence.
@@ -2145,7 +2177,15 @@ const resolveFabricConfig = (
       delete landlock.allowEscape; // Only root policy can grant a per-command escape.
       if (landlock.mode !== "enforce") delete landlock.mode;
       executor.landlock = landlock;
+      // Host-only: a workspace cannot opt into unguarded PowerShell (smarty-dev#9826).
+      delete executor.powershell;
       document.executor = executor;
+      if (Object.hasOwn(document, "jev")) {
+        // Host-only: a lane cannot redirect Jev questions to another socket.
+        const jev = { ...objectValue(document.jev) };
+        delete jev.gatewaySocket;
+        document.jev = jev;
+      }
     }
     merged = mergeObjects(merged, document);
   }

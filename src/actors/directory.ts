@@ -94,6 +94,13 @@ export class ActorDirectory extends ActorManager {
 
   override retryCapabilityWaiters(): void { super.retryCapabilityWaiters(); this.#secondary.retryCapabilityWaiters(); }
   override resumeQueued(): void { super.resumeQueued(); this.#secondary.resumeQueued(); }
+  override hasDormantIdleActor(protectedIds: ReadonlySet<string> = new Set()): boolean {
+    return super.hasDormantIdleActor(protectedIds) || this.#secondary.hasDormantIdleActor(protectedIds);
+  }
+  override async dormantIdleActors(protectedIds: ReadonlySet<string> = new Set()): Promise<number> {
+    return await super.dormantIdleActors(protectedIds) + await this.#secondary.dormantIdleActors(protectedIds);
+  }
+  override meshCaughtUp(): boolean { return super.meshCaughtUp() && this.#secondary.meshCaughtUp(); }
   override async create(request: FabricActorRequest, options: Parameters<ActorManager["create"]>[1] = {}): Promise<FabricActorInfo> {
     const scope = request.scope ?? this.#defaultScope;
     if (scope !== "project" && scope !== "session") {
@@ -129,6 +136,8 @@ export class ActorDirectory extends ActorManager {
     return [...actors.values()];
   }
   override listOwned(registryView = false): FabricActorInfo[] { return [...super.listOwned(registryView), ...this.#secondary.listOwned(registryView)]; }
+  override hasOwnedActors(): boolean { return super.hasOwnedActors() || this.#secondary.hasOwnedActors(); }
+  override hasDurableActor(): boolean { return super.hasDurableActor() || this.#secondary.hasDurableActor(); }
   override hasActiveDurableActor(): boolean { return super.hasActiveDurableActor() || this.#secondary.hasActiveDurableActor(); }
   override presenceBatch(full: boolean): ReturnType<ActorManager["presenceBatch"]> {
     const first = super.presenceBatch(full), second = this.#secondary.presenceBatch(full);
@@ -186,6 +195,7 @@ export class ActorDirectory extends ActorManager {
   override get halted(): boolean { return super.halted && this.#secondary.halted; }
   /** Both scopes: a reload stops a session-scope actor's run as well (review/astra round 2 on #158). */
   override inFlightActorIds(): string[] { return [...super.inFlightActorIds(), ...this.#secondary.inFlightActorIds()]; }
+  override reportStuckPreparing(...args: Parameters<ActorManager["reportStuckPreparing"]>): number { return super.reportStuckPreparing(...args) + this.#secondary.reportStuckPreparing(...args); }
   override inFlightCount(): number { return super.inFlightCount() + this.#secondary.inFlightCount(); }
   override haltAll(): { halted: number } {
     return { halted: haltEvery([() => super.haltAll().halted, () => this.#secondary.haltAll().halted]) };

@@ -1,7 +1,8 @@
 import fs, { type FSWatcher } from "node:fs";
-import { MeshBackgroundRetry } from "../core/atomic-write.js";
+import { MeshBackgroundRetry, type MeshOutageAlarm } from "../core/atomic-write.js";
 import path from "node:path";
 import { writeJsonAtomic } from "../core/atomic-write.js";
+import { warnWatchFallback } from "../core/watch-fallback.js";
 import type { FabricMeshConfig } from "../config.js";
 import { meshCursorAtStart, meshCursorGeneration, type MeshEvent, type MeshStore } from "../mesh/store.js";
 
@@ -18,7 +19,9 @@ const isWork = (event: MeshEvent): boolean => event.topic.startsWith(WORK_TOPIC_
 
 /** Owns observation resources and the format-1 cursor, never actor ownership or dispatch policy. */
 export class ActorMeshMonitor {
-  readonly #backgroundPoll = new MeshBackgroundRetry("actor mesh monitor");
+  // The monitor has no identity or publish of its own: its owner supplies the outage sink (smarty-dev#8825).
+  readonly #backgroundPoll = new MeshBackgroundRetry("actor mesh monitor")
+    .alarmsTo((alarm) => this.callbacks.outageAlarm?.(alarm));
   #safetyNetTimer: NodeJS.Timeout | undefined;
   #dueTimer: NodeJS.Timeout | undefined;
   #dueAt: number | undefined;
@@ -57,11 +60,15 @@ export class ActorMeshMonitor {
        * restart replays the gap it missed and not a long downtime (#37's replay storm).
        */
       maxReplayAgeMs?: number | undefined;
+      /** Sleeping residents replay subscribed events after live-log compaction. */
+      replayAll?: boolean;
       beforePoll(): boolean;
       /** Rechecked per event: a page can outlast the resident host lease. */
       canConsumeMesh?: (() => boolean) | undefined;
       /** false: full (retry unchanged); "ignored": no local delivery; true/void: handed on. */
       onEvent(event: MeshEvent): boolean | void | "ignored";
+      /** The owner's MeshBackgroundRetry outage sink (smarty-dev#8825). */
+      outageAlarm?: ((alarm: MeshOutageAlarm) => Promise<unknown> | void) | undefined;
     },
   ) {
     const saved = this.#readCursor();
@@ -98,12 +105,19 @@ export class ActorMeshMonitor {
         this.#schedule();
       });
       this.#watcher = watcher;
-      watcher.on("error", () => this.#fallback(watcher));
-    } catch {
+      watcher.on("error", (error) => this.#fallback(watcher, error));
+    } catch (error) {
       // An unsupported watch (including a missing directory) takes the fallback.
+      // ENOSPC here is the inotify watch limit (smarty-dev#5247), not a full disk: poll instead
+      // and say so once, so nobody hunts for free space and the session never crashes.
+      warnWatchFallback("actor mesh monitor", this.mesh.root, error, this.config.actorPollMs);
     }
     this.#startSafetyNet();
     this.schedule();
+  }
+
+  caughtUp(): boolean {
+    return !this.#polling && this.#archiveAfter === undefined && this.#safeCursor.cursor === this.mesh.latestOffset();
   }
 
   /** Checked release receipt; normal best-effort writes are NOT a handover barrier. */
@@ -151,8 +165,9 @@ export class ActorMeshMonitor {
     });
   }
 
-  #fallback(watcher: FSWatcher): void {
+  #fallback(watcher: FSWatcher, error: unknown): void {
     if (this.#closed || this.#watcher !== watcher) return;
+    warnWatchFallback("actor mesh monitor", this.mesh.root, error, this.config.actorPollMs);
     watcher.close();
     this.#watcher = undefined;
     this.#startSafetyNet();
@@ -269,7 +284,7 @@ export class ActorMeshMonitor {
           return;
         }
         if (this.#delivered(event)) continue;
-        if (this.#replayFloor !== undefined && event.createdAt < this.#replayFloor && !isWork(event)) {
+        if (this.#replayFloor !== undefined && event.createdAt < this.#replayFloor && !isWork(event) && !this.callbacks.replayAll) {
           if (typeof event.sequence === "number" && typeof event.id === "string") this.#last = { sequence: event.sequence, id: event.id };
           continue;
         }
@@ -290,7 +305,7 @@ export class ActorMeshMonitor {
         }
         // A receiver that is full holds the event: while catching up, and for work events always
         // (smarty-dev#754), so work waits for room instead of being dropped.
-        if (accepted === false && (catchingUp || isWork(event))) {
+        if (accepted === false && (catchingUp || isWork(event) || this.callbacks.replayAll)) {
           // A full actor queue rejected this event while catching up (smarty-dev#472): keep
           // the cursor on it and offer it again later; earlier events are already delivered.
           // The boundary comes from this same read, so a compaction since cannot move it.
@@ -339,7 +354,7 @@ export class ActorMeshMonitor {
     let handedOn = false;
     for (const event of older) {
       if (this.callbacks.canConsumeMesh?.() === false) return false;
-      if (isWork(event) && !this.#delivered(event)) {
+      if ((isWork(event) || this.callbacks.replayAll) && !this.#delivered(event)) {
         const accepted = this.callbacks.onEvent(event);
         if (this.callbacks.canConsumeMesh?.() === false) return false;
         if (accepted === false) {

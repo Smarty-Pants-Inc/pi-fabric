@@ -23,6 +23,7 @@ import type { FabricShellJobStore } from "./core/shell-jobs.js";
 import { SessionsProvider } from "./providers/sessions-provider.js";
 import { TasksProvider } from "./providers/tasks-provider.js";
 import { StateProvider } from "./providers/state-provider.js";
+import { createShellCommandPreflight } from "./providers/shell-preflight.js";
 
 import type { FabricManagedHost } from "./managed-host.js";
 
@@ -46,7 +47,11 @@ export class RuntimeStateBuiltins {
     cwd: string,
     config: FabricConfig,
     capturedTools: CapturedToolCatalog,
-    shell: { jobs: FabricShellJobStore; getHangMs: () => number; getLandlockSettings?: () => FabricConfig["executor"]["landlock"] },
+    shell: {
+      jobs: FabricShellJobStore; getHangMs: () => number; getLandlockSettings?: () => FabricConfig["executor"]["landlock"];
+      /** Live executor.powershell; absent refuses PowerShell (smarty-dev#9826). */
+      getPowerShellPolicy?: () => FabricConfig["executor"]["powershell"];
+    },
   ): Promise<void> {
     let mcpProvider: McpProvider | undefined;
     const enforceSchema = config.schema.mode === "enforce";
@@ -57,7 +62,10 @@ export class RuntimeStateBuiltins {
     // namespace in enforce mode.
     const capturedToolsProvider =
       effectiveFullCodeMode && (config.capture.enabled || enforceSchema)
-        ? new CapturedToolsProvider(capturedTools, entry => config.mcp.enabled && isSelectedNativeMcpTool(entry.definition, config.mcp.nativeServers))
+        ? new CapturedToolsProvider(capturedTools, {
+            getPowerShellPolicy: shell.getPowerShellPolicy,
+            omitFromDiscovery: entry => config.mcp.enabled && isSelectedNativeMcpTool(entry.definition, config.mcp.nativeServers),
+          })
         : undefined;
     if (effectiveFullCodeMode) {
       await this.install(createProviderComponent({
@@ -68,9 +76,10 @@ export class RuntimeStateBuiltins {
           capturedTools,
           capturedToolsProvider,
           this.managedHost
-            ? {requireCapturedOverrides: true, powerShellToolDefinitionFactory: undefined, getLandlockSettings: shell.getLandlockSettings}
+            ? {requireCapturedOverrides: true, powerShellToolDefinitionFactory: undefined, getLandlockSettings: shell.getLandlockSettings,
+                getPowerShellPolicy: shell.getPowerShellPolicy}
             : {
-                powerShellToolDefinitionFactory,
+                powerShellToolDefinitionFactory, getPowerShellPolicy: shell.getPowerShellPolicy,
                 shellJobs: shell.jobs, getShellHangMs: shell.getHangMs,
                 getLandlockSettings: shell.getLandlockSettings,
               },
@@ -125,7 +134,7 @@ export class RuntimeStateBuiltins {
     }
   }
 
-  async mesh(config: FabricConfig, mesh: MeshStore, identity: MeshIdentity, participants: ParticipantDirectory): Promise<void> {
+  async mesh(config: FabricConfig, mesh: MeshStore, identity: MeshIdentity, participants: ParticipantDirectory, capturedTools: CapturedToolCatalog): Promise<void> {
     if (this.managedHost) {
       for (const provider of ["mesh", "state"]) {
         if (this.managedHost.has(provider)) await this.install(createProviderComponent({provider, description: "Managed scoped provider", create: () => this.managedHost!.provider(provider)}));
@@ -144,7 +153,7 @@ export class RuntimeStateBuiltins {
         create: () => new StateProvider(mesh, identity, {
           schemaMode: config.schema.mode,
           piTools: () => config.fullCodeMode || config.schema.mode === "enforce",
-        }),
+        }, { preflight: createShellCommandPreflight(capturedTools) }),
       }));
       await this.install(createProviderComponent({
         provider: "decisions",

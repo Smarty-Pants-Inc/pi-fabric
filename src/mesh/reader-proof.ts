@@ -259,8 +259,61 @@ export const embeddedNativeDigests = (): Record<string, string> => {
 export interface LeaseProbeOptions { platform?: NodeJS.Platform; helper?: string; procRoot?: string; leasesEnable?: string;
   /** Tests: the expected sha256 instead of the embedded one. */ expectedDigest?: string;
   /** Tests: runs after the helper fd is hashed and before it is executed (the swap test). */ afterHash?: () => void;
+  /** Tests: the install root above `helper` (default: its directory for an injected helper, else installRoot()). */ trustRoot?: string;
   /** Tests (pi-fabric#881): run inside the switch's fenced watch, right before and after its final report. */
   beforeReport?: () => void; afterReport?: () => void }
+
+/**
+ * The trusted install root (smarty-dev#8145): the package directory, two levels above this module both in
+ * src/ (src/mesh/) and in the bundle (dist/<dir>/). Above it, a release directory or node_modules is the
+ * installer's; inside it, nothing may be writable by another user.
+ */
+export const installRoot = (): string => fileURLToPath(new URL("../..", import.meta.url));
+
+/**
+ * Why `file` is unsafe to trust, or undefined: on its REAL path (ancestor symlinks resolved), the file and
+ * every directory up to and including the real `root` must be inside `root`, no symlink, owned by this
+ * user (or root) and not group/other-writable. With `fd`, the checked file must be the opened one.
+ */
+export const unsafeChain = (file: string, root: string, fd?: number,
+  /** Tests: an injected lstat (root ownership cannot be made in a test). */ lstat: (at: string) => fs.Stats = at => fs.lstatSync(at)): string | undefined => {
+  let real: string, top: string;
+  try { real = fs.realpathSync(file); top = fs.realpathSync(root); }
+  catch (error) { return `${file} cannot be resolved (${errno(error)})`; }
+  const inside = path.relative(top, real);
+  if (inside === "" || inside.startsWith("..") || path.isAbsolute(inside)) return `${real} (from ${file}) is outside the install root ${top}`;
+  // pi-fabric#880 review round 4: no symlink at or below the root on the LEXICAL path either: whoever writes a
+  // link's parent could swap it after the realpath (bin/fabric-mesh-backend checks the same before loading).
+  const lexical = path.relative(root, file);
+  if (!lexical.startsWith("..") && !path.isAbsolute(lexical)) {
+    let at = root;
+    for (const part of lexical.split(path.sep)) {
+      at = path.join(at, part);
+      if (fs.lstatSync(at, { throwIfNoEntry: false })?.isSymbolicLink()) return `${at} is a symlink inside the install root`;
+    }
+  }
+  const euid = process.geteuid?.();
+  let above = false;
+  for (let at = real; ; at = path.dirname(at)) {
+    let stat: fs.Stats;
+    try { stat = lstat(at); } catch (error) { return `${at} cannot be checked (${errno(error)})`; }
+    if (at === real && fd !== undefined) {
+      const opened = fs.fstatSync(fd);
+      if (opened.dev !== stat.dev || opened.ino !== stat.ino) return `${file} changed while it was checked`;
+    }
+    // Above the install root (pi-fabric#880 review rounds 2 and 7): another user who can write ANY ancestor can
+    // rename the package away and put another in place, so the walk goes all the way to / and never stops early.
+    // Every ancestor is a real directory, ours or root's, not group/other-writable. ponytail: a root-owned
+    // STICKY one (/tmp) passes: there only an entry's owner can rename it, and the entry below was checked.
+    // The same rule as bin/fabric-mesh-backend (unsafeAbove), duplicated there on purpose.
+    const sticky = above && stat.uid === 0 && stat.isDirectory() && (stat.mode & 0o1000) !== 0;
+    const why = sticky ? undefined : stat.isSymbolicLink() ? "a symlink" : ownership(stat, stat.uid === 0 ? 0 : euid)
+      ?? (above && !stat.isDirectory() ? "not a directory" : undefined);
+    if (why) return `${at} is ${why}`;
+    if (at === top) above = true;
+    if (at === path.dirname(at)) return undefined;
+  }
+};
 
 /** The installed lease helper, built beside fabric-landlock (scripts/build-landlock.mjs). */
 export const leaseHelperPath = (): string => fileURLToPath(new URL("../../dist/native/fabric-mesh-lease", import.meta.url));
@@ -341,6 +394,11 @@ const verifiedLeaseHelper = (root: string, files: readonly string[], probe: Leas
   catch (error) { return unavailable(`helper integrity: ${helper} cannot be opened (${errno(error)})`); }
   let verified = false;
   try {
+    // smarty-dev#8145: another user who can write the helper, the gate's own module, or any directory
+    // above them up to the install root could change what runs: refuse unless the whole chain is ours.
+    const unsafe = unsafeChain(helper, probe.trustRoot ?? (probe.helper ? path.dirname(probe.helper) : installRoot()), fd)
+      ?? unsafeChain(fileURLToPath(import.meta.url), installRoot());
+    if (unsafe) return unavailable(`helper integrity: ${unsafe}`);
     const actual = createHash("sha256").update(fs.readFileSync(fd)).digest("hex");
     if (actual !== expected) return unavailable(`helper integrity: ${helper} sha256 ${actual} does not match the embedded digest ${expected}`);
     probe.afterHash?.();

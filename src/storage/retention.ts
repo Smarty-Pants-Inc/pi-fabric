@@ -7,6 +7,7 @@ import { countRefusal, removalTallyOn, verifiedRemove } from "./verified-remove.
 import { processStartTime } from "../residency/process-identity.js";
 import { FileLockBusy, lockFile } from "../residency/file-lock.js";
 import { recoverActorRunArchives } from "../actors/child-completions.js";
+import { recoverEnodevTaskRun } from "../agents/enodev-recovery.js";
 import { copyFabricProvenance } from "../fabric-provenance.js";
 import { readFinalAnswerReceipt } from "../worker/terminal-answer.js";
 import { terminalAdmissionFromEntry, terminalControlMatchesAdmission, terminalSenderMatches, type TerminalAdmission } from "../agents/terminal-notices.js";
@@ -227,6 +228,9 @@ const runFiles = new Set([
   "reply.json", "relaunches.jsonl", "completion-recipient.json", "route-session.jsonl", "route-dispatch-receipt.json",
   // Native session of an unrouted process Pi task (worker.ts persistentPiTask); owned file only.
   "session.jsonl",
+  // The Pi worker's settlement receipt (worker.ts savePiSettlementReceipt), written for every completed process run:
+  // without it no such run was ever collected (smarty-dev#9855).
+  "settlement.json",
 ]);
 const runFile = (name: string): boolean => runFiles.has(name) || /^oversized-event-prefix(-\d+)?\.txt$/.test(name);
 const followUpName = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.json$/;
@@ -434,6 +438,11 @@ export const canRemoveManagedRunRoot = (root: string): boolean => {
   const owner = readJson<RunRootOwner>(ownerPath(root));
   return validOwner(owner) && owner.pid === process.pid && safeRootContents(root, true);
 };
+/** smarty-dev#9855: offline recovery of a dead root's ENODEV-unconfirmed task-agent run (delivers or settles it
+ * once and clears its marker); a failure keeps the veto, as for recoverActorRunArchives. */
+const recoverEnodevTask = (directory: string): void => {
+  try { recoverEnodevTaskRun(directory); } catch { /* the marker stays: the run stays vetoed */ }
+};
 /** Main's path-based recursive removal: the non-Linux fallback of verifiedRemove only (smarty-dev#7858). */
 const rmTree = (target: string) => (): boolean => { fs.rmSync(target, { recursive: true, force: true }); return true; };
 export const removeEmptyRunRoot = (root: string): boolean => {
@@ -466,7 +475,7 @@ const pruneClosedRunRoot = (
       compactTerminalRunEvents(directory, { ...eventsRetention, now, expired });
       continue;
     }
-    if (!processAlive(owner.pid)) recoverActorRunArchives(directory, expired);
+    if (!processAlive(owner.pid)) { recoverActorRunArchives(directory, expired); recoverEnodevTask(directory); }
     // The judged stat: taken after recovery, before the safety walk; the removal requires it unchanged.
     const judged = ownedStat(directory);
     if (!safeRunTree(directory, owner.childrenStopped === true, 0, expired)) { countRefusal("pruneClosedRunRoot", "run tree is not proven safe", directory); continue; }
@@ -639,6 +648,7 @@ export const sweepTempRunRoots = (options: TempRunSweepRequest & {
       if (run.name === RUN_ROOT_OWNER_FILE || !run.isDirectory()) continue;
       const directory = path.join(root, run.name);
       recoverActorRunArchives(directory, expired);
+      recoverEnodevTask(directory);
       const judged = ownedStat(directory);
       if (!safeRunTree(directory, false, 0, expired)) { countRefusal("sweepTempRunRoots", "run tree is not proven safe", directory); continue; }
       // Reported as the root's removal once it is empty, as before.

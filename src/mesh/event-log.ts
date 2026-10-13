@@ -13,6 +13,12 @@ import { jsonClone } from "./state-file.js";
 // Mesh events (smarty-dev#6477 L0): publish, publishBatch, dedupe receipts, the live log, its
 // compaction, archive coupling and recovery, and cursor reads.
 
+// smarty-dev#10391: stop a catch-up prefix at either bound so other writers can interleave.
+// Check elapsed time between events: one synchronous append/fsync or scheduler stall cannot
+// be preempted. SQLite ownership fences already release per event; these cap the outer .lock.
+export const BRIDGE_BATCH_MAX_EVENTS = 32;
+export const BRIDGE_BATCH_MAX_MS = 50;
+
 export interface MeshIdentity {
   id: string;
   name: string;
@@ -223,7 +229,8 @@ export class EventLog {
   #oldestLive: { identity: string; sequence: number | undefined } | undefined;
   #preparedLiveCatchUp: PreparedLiveCatchUp | undefined;
 
-  constructor(context: MeshStoreContext, options: EventLogOptions) {
+  constructor(context: MeshStoreContext, options: EventLogOptions,
+    readonly indexDeliveryBeforeAppend?: (event: MeshEvent) => void) {
     const { root, maxEventBytes } = context;
     this.root = root;
     this.maxEventBytes = maxEventBytes;
@@ -695,6 +702,10 @@ export class EventLog {
         if (intentPath && this.#pruneDedupeReceipts(1) >= this.#maxDedupeReceipts) {
           throw new MeshDedupeStoreFullError(this.#maxDedupeReceipts);
         }
+        // Match and bound the wake set before touching the live/archive event. Overflow
+        // remains a durable pending nudge for the next delivery, never a post-append throw.
+        // A failed append can leave only a harmless nudge; actor cursors still own delivery.
+        this.indexDeliveryBeforeAppend?.(event);
         // The counter is a reservation: a crash after it leaves a gap, never a reused sequence.
         // The archive holds the event durably before it goes live (smarty-dev#754); the live
         // append commits it. If either step fails, the event is cut back out of the archive.
@@ -787,7 +798,8 @@ export class EventLog {
     return event;
   }
 
-  /** Commits a prefix in order under one lock. At most 256 events and 50 ms of work
+  /** Commits a prefix in order under one lock. At most BRIDGE_BATCH_MAX_EVENTS events and
+   * BRIDGE_BATCH_MAX_MS of work
    * (checked between events; a synchronous fsync/scheduler stall cannot be preempted).
    * Events retain publish's append/archive/receipt protocol. Under the lock only the appends
    * (and a keyed event's intent fence, or an archive-coupled receipt) run; one live-log barrier
@@ -817,7 +829,8 @@ export class EventLog {
           for (const { commit, outcome, after } of prepared) {
             // Keep the entire uncheckpointed prefix inside the retained tail, including
             // a line-boundary slack event, rather than compacting away its recovery IDs.
-            if (events.length && (performance.now() - started >= 50 || bytes + 2 * this.maxEventBytes + 1 > this.#retainedEventLogBytes)) break;
+            if (events.length && (events.length >= BRIDGE_BATCH_MAX_EVENTS || performance.now() - started >= BRIDGE_BATCH_MAX_MS ||
+                bytes + 2 * this.maxEventBytes + 1 > this.#retainedEventLogBytes)) break;
             try { events.push(commit()); committed.push(after); bytes += outcome.bytes; }
             catch (error) {
               // After append begins, success may be unknown. Stop rather than replay a

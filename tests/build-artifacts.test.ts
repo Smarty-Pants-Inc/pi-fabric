@@ -57,7 +57,7 @@ describe("published build artifact guards", () => {
   it.each(["yaml", "pi-fabric-worker-sdk"])("rejects eager %s in the actual extension entry", (dependency) => {
     const dir = fixture();
     const manifest = JSON.parse(fs.readFileSync(path.join(dir, "package.json"), "utf8"));
-    expect(manifest.pi.extensions).toEqual(["./dist/extension-bootstrap.js"]);
+    expect(manifest.pi.extensions).toEqual(["./dist/index.js"]);
     fs.appendFileSync(path.join(dir, manifest.pi.extensions[0]), `\nimport "${dependency}";\n`);
     rejected(dir, `Startup eagerly imports optional dependency ${dependency}`);
   });
@@ -93,7 +93,9 @@ describe("published build artifact guards", () => {
   });
   it("rejects an eager extractive engine implementation", () => {
     const dir = fixture();
-    fs.appendFileSync(path.join(dir, "dist/extension-bootstrap.js"), "\n// src/memory/extractive-index.ts\n");
+    // The entry Pi loads (package.json pi.extensions), not a fixed file (pi-fabric#982).
+    const manifest = JSON.parse(fs.readFileSync(path.join(dir, "package.json"), "utf8"));
+    fs.appendFileSync(path.join(dir, manifest.pi.extensions[0]), "\n// src/memory/extractive-index.ts\n");
     rejected(dir, "Startup static graph contains lazy module marker: src/memory/extractive-index.ts");
   });
   it("rejects a missing generated ABI declaration", () => {
@@ -105,6 +107,18 @@ describe("published build artifact guards", () => {
     const dir = fixture();
     fs.appendFileSync(path.join(dir, "dist/verified/generated/storage-kernel.js"), "\n// changed\n");
     rejected(dir, "Bundled verified artifact differs");
+  });
+  // smarty-dev#8145: the lease probe trusts dist/ only when no other user can write any of it.
+  it.skipIf(process.platform !== "linux")("rejects a group- or other-writable dist/, or a symlink inside it", () => {
+    const dir = fixture();
+    fs.chmodSync(path.join(dir, "dist"), 0o775);
+    rejected(dir, "dist must be owned by uid");
+    fs.chmodSync(path.join(dir, "dist"), 0o755);
+    fs.chmodSync(path.join(dir, "dist/mesh/mesh-backend-cli.js"), 0o646);
+    rejected(dir, "dist/mesh/mesh-backend-cli.js must be owned by uid");
+    fs.chmodSync(path.join(dir, "dist/mesh/mesh-backend-cli.js"), 0o644);
+    fs.symlinkSync(os.tmpdir(), path.join(dir, "dist/native/elsewhere"));
+    rejected(dir, "dist/native/elsewhere must not be a symlink");
   });
   // smarty-dev#8121: CI and release builds ship the helpers, so they must come from the pinned toolchain.
   it.runIf(process.platform === "linux")("rejects unpinned native helpers under CI or FABRIC_NATIVE_CC_PINNED=1, and only warns locally", () => {

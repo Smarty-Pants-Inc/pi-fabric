@@ -1,6 +1,6 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { RootInbox, type RootInboxBatch, type RootInboxSession, type RootInboxReconcileOptions } from "./topology/root-inbox.js";
-import { MainInboxMaintenance, registerMainInbox, recordMainSuccessor, mainInboxOwns, mainInboxActive, rootPresenceAlarms, stageMainSuccessor, confirmMainSuccessor, providerDeadAlarms, providerDeadAlarmFields } from "./topology/stall-alarms.js";
+import { MainInboxMaintenance, registerMainInbox, recordMainSuccessor, mainInboxOwns, mainInboxActive, rootPresenceAlarms, stageMainSuccessor, confirmMainSuccessor, providerDeadAlarms, providerDeadAlarmFields, admissionAlarmRecipient } from "./topology/stall-alarms.js";
 import type { RecordsService } from "./records/service.js";
 import { recordsInboxMessage, recordsInboxSession, type RecordsInboxBatch, type RecordsInboxSession } from "./records/inbox.js";
 import { RECORDS_DISABLED_HINT } from "./records/config.js";
@@ -83,7 +83,7 @@ import { RuntimeStateSpeculation } from "./runtime-state-speculation.js";
 import { schemaRefAllowedInEnforce } from "./schema/policy.js";
 import { actionApprovalOverride } from "./core/approval-overrides.js";
 import type { FabricSpeculationStreamTap } from "./speculation/stream-tap.js";
-import { MeshStore, type MeshIdentity } from "./mesh/store.js";
+import { MeshStore, meshOutageAlarmSink, type MeshIdentity } from "./mesh/store.js";
 import { acquireMeshCustodyLock, meshCustodyMode } from "./mesh/custody-lock.js";
 import { MeshBackgroundQueue, MeshBackgroundRetry, isMeshLockTimeout } from "./core/atomic-write.js";
 import { DecisionStore } from "./decisions/store.js";
@@ -187,6 +187,7 @@ const escapeXmlText = (value: string): string =>
 
 import type { FabricManagedHost } from "./managed-host.js";
 import { captureLoadedFileIdentity, type FabricLoadedFileIdentity } from "./build-identity.js";
+import { senderAgent } from "./guards/sender-headers.js";
 
 // Loaded-code identity of this lazy runtime module. Stable-path lazy imports
 // keep their first evaluation for the life of the host process, so a hash
@@ -244,7 +245,8 @@ export class FabricRuntimeState {
   #mesh: MeshStore | undefined;
   #disposableMeshWrites: AbortController | undefined;
   #backgroundMesh = new MeshBackgroundQueue("runtime lifecycle/compaction");
-  readonly #inboxRetry = new MeshBackgroundRetry("root inbox cursor");
+  readonly #inboxRetry = new MeshBackgroundRetry("root inbox cursor")
+    .alarmsTo(meshOutageAlarmSink(() => ({ mesh: this.#mesh, from: this.#identity })));
   #identity: MeshIdentity | undefined;
   /** Durable decisions for headless approvals and routed child dialogs; mesh-enabled sessions only. */
   #decisions: DecisionStore | undefined;
@@ -293,6 +295,8 @@ export class FabricRuntimeState {
   // Each initialize() starts a new epoch. Sources and closures built by an older epoch never
   // read the live ctx again, even after the runtime is rebound to a successor session.
   #epoch = 0;
+  /** The initialize() epoch that built #participants. */
+  #participantsEpoch = -1;
 
   constructor(
     readonly pi: ExtensionAPI,
@@ -500,6 +504,9 @@ export class FabricRuntimeState {
   /** Rebinds session-bound background reads to this ctx while `current()` holds (smarty-dev#5962). */
   bindLifecycle(context: ExtensionContext, current: () => boolean): void {
     this.#binding = { context, current };
+    // A live successor binding re-arms this epoch's own single heartbeat; a retired epoch's
+    // suspended directory is never resumed (smarty-dev#10004).
+    if (this.#participantsEpoch === this.#epoch && this.lifecycleCurrent) this.#participants?.resume();
   }
 
   /** False once the bound lifecycle retired: background ticks must skip, not read a stale ctx. */
@@ -557,6 +564,9 @@ export class FabricRuntimeState {
     this.#meshActivationReady = () => false;
     const epoch = this.#epoch;
     this.#binding = undefined;
+    // The retired epoch's heartbeat stops now, before teardown awaits: it never ticks again,
+    // even while quiesce/close still publish explicitly (smarty-dev#10004).
+    this.#participants?.suspend();
     const live = this.#liveReads(epoch);
     const predecessor = this.#mainAgent?.local && this.#mainAgent.sessionId && this.#mesh
       ? { id: this.#mainAgent.id, sessionId: this.#mainAgent.sessionId, meshRoot: this.#mesh.root, cwd: this.#mainAgent.cwd } : undefined;
@@ -695,6 +705,8 @@ export class FabricRuntimeState {
       // F2: the host kill switch is re-read per call, never a cached value.
       getLandlockSettings: () => liveLandlockSettings(
         this.#config?.executor.landlock ?? { mode: "off", disabled: false }, resolveAgentDir()),
+      // smarty-dev#9826: read per call; anything but the host opt-in refuses PowerShell.
+      getPowerShellPolicy: () => this.#config?.executor.powershell ?? "refuse",
     });
     if (!this.#managedHost && (this.#config.fullCodeMode || enforceSchema)) {
       this.#shellInbox = new ShellEventInbox(this.pi, context, this.shellJobs);
@@ -758,6 +770,10 @@ export class FabricRuntimeState {
       !enforceSchema &&
       projectTrusted &&
       this.#config.mesh.enabled;
+    const projectRoot = process.env.PI_FABRIC_PROJECT_ROOT ?? context.cwd;
+    const configuredMeshRoot = this.#config.mesh.root;
+    const meshRoot = process.env.PI_FABRIC_MESH_ROOT ?? (configuredMeshRoot
+      ? path.resolve(projectRoot, configuredMeshRoot) : path.join(projectRoot, ".pi", "fabric", "mesh"));
     const mainAgent = new MainAgentController(
       this.pi,
       mainAgentId,
@@ -775,6 +791,7 @@ export class FabricRuntimeState {
         },
       },
       (event) => { this.#alarmProviderDead(mainAgentId, event); },
+      meshRoot,
     );
     this.#mainAgent = mainAgent;
     // smarty-dev#6758: an unnamed interactive Main publishes its Herdr agent name. One lookup per
@@ -789,13 +806,6 @@ export class FabricRuntimeState {
       });
     }
     const mainName = (): string => rootParticipantName(live.sessionName(), herdr.name);
-    const projectRoot = process.env.PI_FABRIC_PROJECT_ROOT ?? context.cwd;
-    const configuredMeshRoot = this.#config.mesh.root;
-    const meshRoot =
-      process.env.PI_FABRIC_MESH_ROOT ??
-      (configuredMeshRoot
-        ? path.resolve(projectRoot, configuredMeshRoot)
-        : path.join(projectRoot, ".pi", "fabric", "mesh"));
     this.#backgroundMesh = new MeshBackgroundQueue("runtime lifecycle/compaction");
     this.#disposableMeshWrites = identity.kind === "actor" || identity.kind === "agent"
       ? new AbortController() : undefined;
@@ -812,6 +822,9 @@ export class FabricRuntimeState {
         ...(this.#disposableMeshWrites ? { writeSignal: this.#disposableMeshWrites.signal } : {}),
       },
     );
+    // The managed composition returned above without native managers or a mesh root.
+    // Bind native custody to this execution session once, never to a hosted invocation context.
+    if (this.#config.mesh.enabled) this.#registry.setResidentProcessWorkSession(sessionId);
     // A Main on the shared mesh reconciles the work events a steer missed (smarty-dev#754).
     this.#rootInbox = identity.kind === "main" && mainAgent.local && this.#config.mesh.enabled
       ? new RootInbox(this.#mesh, identity, () => [mainAgentId, live.sessionName() ?? ""])
@@ -821,6 +834,7 @@ export class FabricRuntimeState {
     const rootInbox = this.#rootInbox;
     let initialMeshError: unknown;
     let inboxMaintenance: MainInboxMaintenance | undefined;
+    this.#participantsEpoch = epoch;
     this.#participants = new ParticipantDirectory(this.#mesh, {
       beforePublication: async () => {
         // Hand the early acquisition failure to start() once, without another inline
@@ -941,7 +955,7 @@ export class FabricRuntimeState {
       readMirroredOwner: (ownerHostId, ownerIdentityId, targetId) =>
         this.#participants?.mirroredControlOwner(ownerHostId, ownerIdentityId, targetId),
     });
-    await builtins.mesh(this.#config, this.#mesh, identity, this.#participants);
+    await builtins.mesh(this.#config, this.#mesh, identity, this.#participants, this.capturedTools);
     this.#decisions = this.#config.mesh.enabled ? new DecisionStore(this.#mesh, identity) : undefined;
     this.#schema = new SchemaController(
       context.cwd,
@@ -1044,6 +1058,7 @@ export class FabricRuntimeState {
         startedAt: mainAgent.info(context).startedAt ?? Date.now(),
       }) } : {}),
       spawnerSessionId: sessionId,
+      spawnerName: () => senderAgent(process.env, this.pi.getSessionName?.()),
       retention: this.#config.retention,
       ...(this.#paths
         ? {
@@ -1104,6 +1119,22 @@ export class FabricRuntimeState {
           from: { id: notice.targetId, name: `Task ${notice.targetId}`, kind: "agent" },
           triggerTurn: false, idempotencyKey: `terminal-refusal:${notice.targetId}:${notice.messageId}`,
         });
+      },
+      // smarty-dev#9855: held admission permits at half of maxConcurrent. The fabric.alarm envelope, routed to the
+      // owner identity as the provider-dead alarm is (PI_FABRIC_OWNER_IDENTITY_ID).
+      onAdmissionAlarm: (alarm) => {
+        if (!this.#mesh || !this.#identity || !this.#config?.mesh.enabled) return;
+        const mesh = this.#mesh, from = this.#identity;
+        // Always addressed (pi-fabric#939 P2-b): the owner identity, else this Main itself; never a broadcast.
+        const to = admissionAlarmRecipient(process.env.PI_FABRIC_OWNER_IDENTITY_ID, from);
+        if (!to) {
+          console.warn("[pi-fabric] agent-admission alarm not published: no owner session address (the stderr line stands)");
+          return;
+        }
+        // A named run's failed recovery save is an ops.owner alarm (pi-fabric#939 round 4); the held count stays a fabric.alarm.
+        const owner = alarm.kind === "recovered-answer-save-failed";
+        void this.#backgroundMesh.enqueue(() => mesh.publish({ topic: owner ? "ops.owner" : "fabric.alarm.agent-admission",
+          kind: owner ? "actor.alarm" : "agent-admission-held", from, to, text: alarm.message, data: { ...alarm } })).catch(() => undefined);
       },
       onFollowUpAlarm: (alarm) => {
         this.pi.sendMessage({ customType: "pi-fabric-follow-up-alarm", content: alarm.message, display: true, details: alarm },
@@ -2017,6 +2048,8 @@ export class FabricRuntimeState {
 
   async shutdown(reason?: string, targetSessionFile?: string): Promise<void> {
     this.#meshActivationReady = () => false;
+    // The session lifecycle retired: stop the background heartbeat before any teardown await.
+    this.#participants?.suspend();
     try {
       await this.#shutdownSteps(reason, targetSessionFile);
     } catch (error) {
@@ -2184,7 +2217,9 @@ export class FabricRuntimeState {
     if (this.capturedTools.suspended) return;
     this.#repairs.setCatalogSurface({
       providers: this.#registry.providers().map((provider) => provider.name),
-      capturedTools: this.capturedTools.list().map((entry) => entry.name),
+      // The repair digest tracks registrations, not the host's per-turn
+      // visibility, so toggling a tool off cannot churn repair tables.
+      capturedTools: this.capturedTools.listRegistered().map((entry) => entry.name),
     });
   }
 

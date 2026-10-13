@@ -2,7 +2,7 @@
 import { build as esbuild } from "esbuild";
 import { copyFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { buildLandlock } from "./build-landlock.mjs";
+import { buildLandlock, stripGroupOtherWrite } from "./build-landlock.mjs";
 
 const primaryEntryPoints = [
   "src/index.ts",
@@ -51,7 +51,13 @@ const primaryEntryPoints = [
 // path lets a session that loaded the previous index resolve delayed modules
 // after the installed package is replaced, while preserving lazy evaluation.
 const lazyEntryPoints = [
+  // First-use scratch removal: a stable entry keeps the shared verifier out of the startup graph.
+  "src/storage/verified-remove.ts",
   "src/residency/launcher-owner.ts",
+  "src/residency/wake.ts",
+  "src/residency/process-work.ts",
+  "src/agents/transports/process-utils.ts",
+  "src/core/pid-namespace.ts",
   "src/mesh/state-projector.ts",
   "src/judge/agent.ts",
   "src/core/landlock.ts",
@@ -76,6 +82,7 @@ const lazyEntryPoints = [
   "src/guards/foreground-wait.ts",
   "src/agents/model-route.ts",
   "src/agents/model-route-prepare.ts",
+  "src/agents/per-call-route.ts",
   "src/agents/spawn-router.ts",
   "src/agents/claude-cli.ts",
   "src/agents/compact-control.ts",
@@ -233,7 +240,7 @@ const standalone = await build({
 // smarty-dev#2184: the worker loads this timeout-only hook into every Pi actor run, native-tool
 // ones included. Built on its own, without splitting, so it shares no chunk with index.js.
 await build({
-  entryPoints: ["src/guards/actor-bash-hook.ts", "src/guards/model-route-hook.ts"],
+  entryPoints: ["src/guards/actor-bash-hook.ts", "src/guards/model-route-hook.ts", "src/guards/sender-headers.ts"],
   outdir: "dist",
   outbase: "src",
   entryNames: "[dir]/[name]",
@@ -335,3 +342,6 @@ if (unstableLazyImports.length > 0) {
     `Package-local dynamic imports must use stable entry paths:\n${unstableLazyImports.join("\n")}`,
   );
 }
+
+// Last: nothing in dist/ may be writable by another user (smarty-dev#8145; assert-build-artifacts.mjs checks).
+stripGroupOtherWrite("dist");

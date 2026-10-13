@@ -24,6 +24,8 @@ import { readChildToolAllowlist } from "../core/child-tool-allowlist.js";
 import { readFileRetrying, syncDirectoryChain, writeJsonAtomic } from "../core/atomic-write.js";
 import { discardWorkerCompletion, type CompletionRecipient } from "./completion-journal.js";
 import { processStartTime } from "../residency/process-identity.js";
+import { countUnknownEnodevStarts, enodevDelivered, enodevUnresolvedRuns, noteEnodevDelivered, peekEnodevRun, settleEnodevRun,
+  settleGoneEnodevLaunch, settleLostEnodevRun, ownedProcess, provenGoneEnodevLaunch, goneEnodevOutcome, savedEnodevAnswer, type OwnedProcess } from "./enodev-recovery.js";
 import {
   DEFAULT_FABRIC_CONFIG,
   MAX_AGENT_TIMEOUT_MS,
@@ -75,6 +77,7 @@ import { scriptSpawnArgs } from "./transports/process-utils.js";
 import { ScreenTransport } from "./transports/screen-transport.js";
 import { TmuxTransport } from "./transports/tmux-transport.js";
 import { resolveAgentSpawner } from "./spawner.js";
+import { senderAgent, senderHeaderValue } from "../guards/sender-headers.js";
 import type {
   AgentSpawner,
   AgentChildQuestionRequest,
@@ -94,7 +97,7 @@ import type {
   AgentTransportLaunch,
   AgentUsage,
 } from "./types.js";
-import { FOLLOW_UP_RUNNING_TASK_MESSAGE, type AgentFollowUpAlarm, type AgentFollowUpDelivery } from "./types.js";
+import { FOLLOW_UP_RUNNING_TASK_MESSAGE, type AgentAdmissionAlarm, type AgentFollowUpAlarm, type AgentFollowUpDelivery } from "./types.js";
 import { followUpFile, followUpState, settleFollowUp, releaseFollowUpPayload } from "./follow-up-delivery.js";
 import { createRunRouteMetadata } from "../worker/run-record.js";
 import { readFinalAnswerReceipt, type FinalAnswerReceipt } from "../worker/terminal-answer.js";
@@ -180,6 +183,16 @@ import {
 } from "./constants.js";
 const NESTED_SNAPSHOT_POLL_MS = 500;
 const TRANSPORT_EXIT_GRACE_MS = 1_000;
+/** smarty-dev#9855: a standing held-permit alarm repeats this often. */
+const ADMISSION_REALARM_MS = 6 * 60 * 60 * 1_000;
+/** pi-fabric#939 round 4: a failed recovered-answer save retries after 1, 2, 4, 8 and 16 s (5 tries). */
+const RECOVERY_RETRY_MAX = 5;
+const RECOVERY_RETRY_BASE_MS = 1_000;
+/** The first call runs `release`; later calls do nothing (a permit is released at most once). */
+const once = (release: () => void): (() => void) => {
+  let done = false;
+  return () => { if (!done) { done = true; release(); } };
+};
 // These adapters conflate CLI/socket errors with absent sessions and have no
 // checked exit receipt. Scope-cut release/collection rather than trust false.
 const uncheckedExternalExit = (transport: Pick<AgentTransportHandle, "kind">): boolean =>
@@ -345,8 +358,27 @@ export const awaitAgentCwd = async (
     await new Promise((resolve) => setTimeout(resolve, wait));
   }
 };
+/** pi-fabric#939 rounds 4-5: a held run's bounded save retry and its one owner alarm (managed or queued). */
+interface RecoveryRetry {
+  recoveryTimer?: NodeJS.Timeout;
+  recoveryRetries?: number;
+  recoveryAlarmed?: boolean;
+}
+
 interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
   runRoute: AgentRunRouteMetadata;
+  /** smarty-dev#9855: the admission permit a lost-contact process run holds until it is proven gone (once-only). */
+  heldPermit?: () => void;
+  /** pi-fabric#939: the worker pid and birth this manager recorded at launch; the only proof source for release. */
+  ownProcess?: OwnedProcess;
+  /** pi-fabric#939 round 2: its saved answer was delivered to the spawner after an unconfirmed exit (once). */
+  recoveredAnswer?: boolean;
+  /** Round 3: that delivery's save succeeded; only its completed mark is left. */
+  recoveredSaved?: boolean;
+  /** Round 4: the bounded save retry (one one-shot timer) and its one owner alarm. */
+  recoveryTimer?: NodeJS.Timeout;
+  recoveryRetries?: number;
+  recoveryAlarmed?: boolean;
   id: string;
   name: string;
   task: string;
@@ -455,6 +487,15 @@ interface QueuedAgent {
   routeOutcome?: (result: AgentRunResult) => void;
   /** Also guard cleanup if writing the persistent unresolved marker failed. */
   cleanupPending?: string;
+  /** smarty-dev#9855: the admission permit an unknown-outcome launch holds until it is proven gone (once-only). */
+  heldPermit?: () => void;
+  /** pi-fabric#939: the pid the launch obligation reported to this manager, with its birth when readable. */
+  ownProcess?: OwnedProcess;
+  /** Round 5: its recovered outcome was handed to the waiter (once). */
+  resolvedRecovered?: boolean;
+  recoveryTimer?: NodeJS.Timeout;
+  recoveryRetries?: number;
+  recoveryAlarmed?: boolean;
   info: AgentHandleInfo;
   task: string;
   enqueuedAt: number;
@@ -777,6 +818,7 @@ export class AgentManager {
   readonly #pythonRuntime: () => FabricPythonRuntime;
   readonly #mainAgentId: string | undefined;
   readonly #spawner: AgentSpawner | undefined;
+  readonly #spawnerName: () => string | undefined;
   readonly #fabricSessionId: string | undefined;
   readonly #meshRoot: string | undefined;
   /** The Fabric-owned root below which our own group/other-writable containers are tightened on first use
@@ -800,11 +842,17 @@ export class AgentManager {
   readonly #onSettled: ((result: AgentRunResult, admittedRecipient?: CompletionRecipient) => void) | undefined;
   /** Results of runs a previous runtime of this session stopped at reload/shutdown. */
   readonly #previousRuns = new Map<string, AgentRunResult>();
+  #enodevRuns: string[] | undefined;
+  readonly #enodevCommits = new Map<string, { directory: string; actorId: string; activationId: string }>();
+  /** pi-fabric#939 round 3: runs THIS manager settled through #912's recovery (it removed their markers itself). */
+  readonly #enodevSettledHere = new Set<string>();
   readonly #foregroundPrepared = new Set<string>();
   readonly #pendingAbandonment = new Set<string>();
   readonly #foregroundDelivered = new Set<string>();
   readonly #onLifecycle: ((event: FabricLifecyclePublishRequest) => void) | undefined;
   readonly #onFollowUpAlarm: ((alarm: AgentFollowUpAlarm) => void) | undefined;
+  readonly #onAdmissionAlarm: ((alarm: AgentAdmissionAlarm) => void) | undefined;
+  #admissionAlarmAt: number | undefined;
   readonly #terminalNoticeOutbox: TerminalNoticeOutbox;
   readonly #followUps = new Map<string, Map<string, AgentFollowUpDelivery>>();
   readonly #followUpTimers = new Map<string, NodeJS.Timeout>();
@@ -881,6 +929,8 @@ export class AgentManager {
       identityId?: string;
       /** Immediate caller's Pi session, distinct from the inherited root Fabric session. */
       spawnerSessionId?: string;
+      /** This caller's sender name for its children's X-Smarty-Spawner (smarty-dev#6207). */
+      spawnerName?: () => string | undefined;
       retention?: FabricRetentionConfig;
       onBackgroundComplete?: (result: AgentRunResult, admittedRecipient?: CompletionRecipient) => void;
       onResultConsumed?: (id: string) => void;
@@ -893,6 +943,8 @@ export class AgentManager {
       onSettled?: (result: AgentRunResult, admittedRecipient?: CompletionRecipient) => void;
       onLifecycle?: (event: FabricLifecyclePublishRequest) => void;
       onFollowUpAlarm?: (alarm: AgentFollowUpAlarm) => void;
+      /** smarty-dev#9855: held permits reached half of maxConcurrent (again every 6 h while they stay there). */
+      onAdmissionAlarm?: (alarm: AgentAdmissionAlarm) => void;
       onTerminalNotice?: (notice: AgentTerminalNotice) => Promise<void> | void;
       preparePiModel?: (model: string | undefined, requiredPin?: boolean) => Promise<string | void>;
       /** agents.childQuestions "route": answer a child dialog via parent UI or a decision. */
@@ -938,6 +990,7 @@ export class AgentManager {
     this.#onSettled = options.onSettled;
     this.#onLifecycle = options.onLifecycle;
     this.#onFollowUpAlarm = options.onFollowUpAlarm;
+    this.#onAdmissionAlarm = options.onAdmissionAlarm;
     this.#terminalNoticeOutbox = new TerminalNoticeOutbox(options.onTerminalNotice);
     this.#onChildQuestion = options.onChildQuestion;
     this.#preparePiModel = options.preparePiModel;
@@ -968,6 +1021,7 @@ export class AgentManager {
       options.spawnerSessionId ?? process.env.PI_SESSION_ID ?? this.#fabricSessionId,
       this.#mainAgentId,
     );
+    this.#spawnerName = options.spawnerName ?? (() => senderAgent());
     const inheritedBudget = activeBudgetState();
     this.#budget =
       inheritedBudget ??
@@ -1183,10 +1237,29 @@ export class AgentManager {
    */
   spawn(request: AgentRunRequest, signal?: AbortSignal, authorize?: () => boolean, beforeCommit?: (id: string) => void, onOutputPrincipalDowngrade?: () => void, onLaunched?: (handle: AgentHandleInfo) => void, preparation?: AgentLaunchPreparationOptions, callerReturnAddress?: TaskReturnAddress): Promise<AgentHandleInfo> {
     if (this.#closing) return Promise.reject(new Error("Fabric agent manager is closing"));
+    // smarty-dev#9855: at admission, free the permits of launches now proven gone, before asking for one.
+    this.#releaseProvenGone();
+    // pi-fabric#939 P2-a: the 6 h re-alarm is also due on every admission attempt, where a stuck state is felt.
+    this.#checkHeldPermits();
     const pending = this.#spawn(request, signal, authorize, beforeCommit, onOutputPrincipalDowngrade, onLaunched, preparation, callerReturnAddress && structuredClone(callerReturnAddress));
     this.#spawns.add(pending);
     void pending.then(() => this.#spawns.delete(pending), () => this.#spawns.delete(pending));
     return pending;
+  }
+
+  readonly #workerIdentities = new WeakMap<AgentTransportHandle, { pid: number; startTime: string | undefined; closed: boolean }>();
+
+  /** The current worker of a live run, as this host launched it: pid and kernel start time (undefined when it could
+   * not be read, e.g. off Linux), and whether this host still holds its transport open (not settled, not exited,
+   * contact not lost). Undefined: no live handle, or a transport without a local process. */
+  workerIdentity(runId: string): { pid: number; startTime: string | undefined; open: boolean } | undefined {
+    const managed = this.#runs.get(runId);
+    const identity = managed?.transport ? this.#workerIdentities.get(managed.transport) : undefined;
+    if (!managed || !identity) return undefined;
+    // A closed native handle is not open, even before the monitor marks executionExited (smarty-dev#10067 P2-1): its
+    // pid may already name another process. A handle with no close notification is indeterminate: not open.
+    const open = managed.transport.closed !== undefined && !identity.closed && !managed.settled && managed.executionExited !== true && managed.transport.lostContact?.() === undefined;
+    return { pid: identity.pid, startTime: identity.startTime, open };
   }
 
   async #launchTransport(adapter: AgentTransportAdapter, request: AgentTransportLaunch): Promise<AgentTransportHandle> {
@@ -1198,6 +1271,15 @@ export class AgentManager {
       const transport = await pending;
       // Includes launches that race close, before a ManagedAgent can own them.
       this.#unregisteredTransports.add(transport);
+      // The launched worker's identity, from this host's own spawn (never the worker's status file): its pid and
+      // kernel start time, read now, while this process still holds the unreaped child (smarty-dev#9332).
+      const pid = transport.kind === "process" ? Number(transport.sessionId) : NaN;
+      if (Number.isSafeInteger(pid) && pid > 1) {
+        const identity = { pid, startTime: processStartTime(pid), closed: false };
+        this.#workerIdentities.set(transport, identity);
+        // Registered first, at launch: it runs before any monitor reaction to the close. A rejection proves nothing.
+        void transport.closed?.then(() => { identity.closed = true; }, () => undefined);
+      }
       return transport;
     } finally {
       this.#launches.delete(pending);
@@ -1619,6 +1701,7 @@ export class AgentManager {
           ...(this.#mainAgentId ? ["--main-agent-id", this.#mainAgentId] : []),
           ...(this.#spawner ? ["--spawner-id", this.#spawner.id, "--spawner-kind", this.#spawner.kind,
             ...(this.#spawner.runId ? ["--spawner-run", this.#spawner.runId] : [])] : []),
+          ...((name?: string) => name ? ["--spawner-name", name] : [])(senderHeaderValue(this.#spawnerName())),
           ...(this.#fabricSessionId ? ["--fabric-session-id", this.#fabricSessionId] : []),
           ...(adapter.kind === "process" && !request.actorId
             ? callerReturnAddress ? ["--task-return-address", JSON.stringify(callerReturnAddress)] : this.#taskReturnAddressArguments
@@ -1774,6 +1857,8 @@ export class AgentManager {
           id,
           name,
           task: request.task,
+          // pi-fabric#939: the manager's own pid and birth record, read at launch from the transport handle.
+          ...((owned => owned ? { ownProcess: owned } : {})(transport.kind === "process" ? ownedProcess(transport.sessionId) : undefined)),
           ...(this.#mainAgentId ? { mainAgentId: this.#mainAgentId } : {}),
           ...(this.#fabricSessionId ? { fabricSessionId: this.#fabricSessionId } : {}),
           outputPrincipal: copyFabricPrincipal(request.provenance?.principal),
@@ -1876,6 +1961,9 @@ export class AgentManager {
             this.#queued.set(id, queued);
           }
           queued.cleanupPending = obligation.message;
+          queued.heldPermit ??= once(release);
+          const owned = obligation.transport === "process" ? ownedProcess(obligation.sessionId) : undefined;
+          if (owned) queued.ownProcess ??= owned;
           queued.info = { ...queued.info, ...(worktree ? { worktree } : {}), ...(branch ? { branch } : {}) };
           try {
             markUnresolvedWorker(runDirectory, obligation.message, {
@@ -1885,6 +1973,11 @@ export class AgentManager {
           } catch { /* best effort: the worktree is kept either way */ }
           // No exact handle means no safe retry or exit receipt. Preserve the
           // permit and actor/queue join rather than rejecting into another writer.
+          this.#checkHeldPermits();
+          queueMicrotask(() => this.#releaseProvenGone()); // already gone when the hold began: free it now
+          // pi-fabric#939 round 3: event-driven, no polling. The launched process's own close event re-checks the
+          // proof; a release wakes the admission waiters through the semaphore.
+          void (obligation as { closed?: Promise<unknown> }).closed?.then(() => this.#releaseProvenGone(), () => this.#releaseProvenGone());
           return this.#queuedInfo(queued);
         }
         release();
@@ -1962,6 +2055,8 @@ export class AgentManager {
       } catch (error) {
         if (queued.cleanupPending || (error as { launchOutcome?: string } | undefined)?.launchOutcome === "unknown") {
           queued.cleanupPending ??= error instanceof Error ? error.message : String(error);
+          if (release) queued.heldPermit ??= once(release);
+          this.#checkHeldPermits();
           return;
         }
         release?.();
@@ -1977,8 +2072,167 @@ export class AgentManager {
 
   #queuedInfo(queued: QueuedAgent): AgentHandleInfo {
     const waiting = [...this.#queued.values()].filter((run) => !run.terminal && !run.preparing);
+    const held = this.heldPermits();
     return structuredClone({ ...queued.info,
-      ...(!queued.preparing ? { queuePosition: waiting.indexOf(queued) + 1 } : {}) });
+      ...(!queued.preparing ? { queuePosition: waiting.indexOf(queued) + 1 } : {}),
+      // smarty-dev#9855: why a spawn waits: unknown-outcome launches still holding a permit.
+      ...(!queued.terminal && held > 0 ? { heldPermits: held } : {}) });
+  }
+
+  /** smarty-dev#9855: admission permits held by unknown-outcome or lost-contact launches not yet proven gone. */
+  heldPermits(): number {
+    return [...this.#queued.values()].filter(queued => queued.heldPermit).length +
+      [...this.#runs.values()].filter(managed => managed.heldPermit).length;
+  }
+
+  /**
+   * smarty-dev#9855 part A: a held permit whose run is now proven gone (ENODEV-unconfirmed exit, worker gone, pid-reuse
+   * safe; settleGoneEnodevLaunch) is released in the same step as the settle, exactly once (the permit is taken off the
+   * entry before it is called; the settle removes the marker, so a second pass finds nothing). Anything not proven
+   * gone keeps its permit. Evaluated where permits are acquired (spawn) and held; no timer.
+   */
+  #releaseProvenGone(): number {
+    if (process.platform !== "linux") return 0;
+    let released = 0;
+    for (const queued of this.#queued.values()) {
+      if (!queued.heldPermit) continue;
+      const directory = path.join(this.#runRoot, queued.info.id);
+      const settledHere = this.#enodevSettledHere.has(queued.info.id);
+      // pi-fabric#939 round 5: prove, save and route the outcome, and only then settle the marker and release. Until
+      // the save succeeds the marker, the custody and the permit stay (a crash or a failing save loses nothing).
+      const outcome = settledHere ? settleGoneEnodevLaunch(directory, queued.ownProcess, true)
+        : (record => record && goneEnodevOutcome(directory, record))(provenGoneEnodevLaunch(directory, queued.ownProcess));
+      if (!outcome) continue;
+      if (!queued.terminal || !queued.outcomeSaved) {
+        const pendingCleanup = queued.cleanupPending;
+        delete queued.cleanupPending; // the route save is fenced while it is set
+        queued.terminal ??= outcome;
+        let saved = false;
+        try { saved = this.#saveQueuedRouteOutcome(queued); } catch { saved = false; }
+        if (!saved) {
+          if (pendingCleanup !== undefined) queued.cleanupPending = pendingCleanup;
+          this.#retryRecoveredAnswer(queued.info.id, queued);
+          continue;
+        }
+        if (!queued.resolvedRecovered) {
+          queued.resolvedRecovered = true;
+          queued.resolve(queued.terminal);
+          this.#emitLifecycle(queued.info, `run.${queued.terminal.status}`, Date.now(), { status: queued.terminal.status });
+          this.#notifyQueuedComplete(queued);
+        }
+      }
+      // The marker is removed only now. A failure here keeps it and the permit; the saved outcome is not saved again.
+      let markerSettled = settledHere;
+      if (!markerSettled) { try { markerSettled = settleGoneEnodevLaunch(directory, queued.ownProcess) !== undefined; } catch { markerSettled = false; } }
+      if (!markerSettled) { this.#retryRecoveredAnswer(queued.info.id, queued); continue; }
+      delete queued.cleanupPending;
+      this.#stopRecoveryRetry(queued);
+      const permit = queued.heldPermit;
+      delete queued.heldPermit;
+      this.#retentionRevision++;
+      permit();
+      released++;
+    }
+    for (const managed of this.#runs.values()) {
+      if (!managed.heldPermit || !managed.settled) continue;
+      // pi-fabric#939 round 3: the record must be the CURRENT attempt's (a relaunch replaces it), and the exact gate
+      // (own pid gone, exact ENODEV marker, this process run) holds BEFORE anything is delivered or written.
+      if (!managed.ownProcess || String(managed.ownProcess.pid) !== managed.transport.sessionId) continue;
+      const record = provenGoneEnodevLaunch(managed.runDirectory, managed.ownProcess);
+      if (!record) continue;
+      // Then prove, save, mark completed, release: a saved answer the spawner never got goes through its completion
+      // path first (round 2), once; any failure keeps the permit and is retried.
+      if (!this.#deliverRecoveredAnswer(managed, record)) { this.#retryRecoveredAnswer(managed.id, managed); continue; }
+      if (!settleGoneEnodevLaunch(managed.runDirectory, managed.ownProcess)) continue;
+      this.#stopRecoveryRetry(managed);
+      const permit = managed.heldPermit;
+      delete managed.heldPermit;
+      delete managed.lostContact;
+      managed.executionExited = true;
+      this.#retentionRevision++;
+      permit();
+      released++;
+    }
+    if (released) this.#invalidateUiList();
+    if (this.heldPermits() * 2 < this.config.maxConcurrent) this.#admissionAlarmAt = undefined; // the episode ended
+    return released;
+  }
+
+  /**
+   * The worker saved an answer (settlement.json) but the run settled without it (its exit was unconfirmed): deliver
+   * the completed result through the spawner's completion path. True when there is nothing to deliver or it was
+   * delivered (now or before: managed.recoveredAnswer makes it once); false keeps the permit for a later retry.
+   */
+  #deliverRecoveredAnswer(managed: ManagedAgent, record: Record<string, unknown>): boolean {
+    if (managed.recoveredAnswer) return true;
+    // A pending save (of the original settlement or of this recovery) is checked BEFORE any fast path (SEC 2).
+    const pending = managed.settlementSaveFailure;
+    const text = savedEnodevAnswer(managed.runDirectory);
+    if (text === undefined || record.status === "completed") {
+      return pending ? this.#saveSettledResult(managed, pending.result) : true;
+    }
+    const { error: _error, ...rest } = record as unknown as AgentRunResult;
+    const recovered = { ...rest, status: "completed", text, enodevDelivered: true,
+      finishedAt: typeof record.finishedAt === "number" ? record.finishedAt : Date.now(), updatedAt: Date.now() } as AgentRunResult;
+    // Save (deliver) first; only a saved delivery is marked completed. A failed save leaves the record unmarked, so
+    // the next pass retries the delivery; a failed mark after a save re-marks without saving again.
+    if (!managed.recoveredSaved) {
+      if (!this.#saveSettledResult(managed, recovered)) return false;
+      managed.recoveredSaved = true;
+    }
+    try { writeJsonAtomic(managed.statusFile, recovered, { durable: true }); } catch { return false; }
+    managed.recoveredAnswer = true;
+    managed.latestRecord = compactUiRecord(recovered);
+    managed.latestUiRecord = managed.latestRecord;
+    if (managed.background && !this.#closing && this.config.notifyOnComplete && this.#onBackgroundComplete) {
+      try { this.#onBackgroundComplete(this.#withTransportMetadata(recovered, managed) as AgentRunResult); } catch { /* best effort */ }
+    }
+    return true;
+  }
+
+  /**
+   * pi-fabric#939 round 4: a held run whose recovered answer could not be saved retries on its own, not only on a later
+   * spawn: one one-shot timer per held run, backoff 1, 2, 4, 8, 16 s, at most RECOVERY_RETRY_MAX tries (a reviewed
+   * bounded retry, not a poll). The FIRST failure sends one owner alarm naming the run, whatever the held count. After
+   * the last try the permit stays held (the next spawn or close event still re-checks).
+   */
+  #retryRecoveredAnswer(runId: string, managed: RecoveryRetry): void {
+    if (!managed.recoveryAlarmed) {
+      managed.recoveryAlarmed = true;
+      const alarm: AgentAdmissionAlarm = { kind: "recovered-answer-save-failed", runId,
+        heldPermits: this.heldPermits(), maxConcurrent: this.config.maxConcurrent, at: Date.now(),
+        message: `run ${runId}: its recovered answer could not be saved for its spawner; its admission permit stays held ` +
+          "while the save is retried (smarty-dev#9855)" };
+      console.warn(`[pi-fabric] ${alarm.message}`);
+      try { this.#onAdmissionAlarm?.(structuredClone(alarm)); } catch { /* the stderr line stands */ }
+    }
+    const tries = managed.recoveryRetries ?? 0;
+    if (managed.recoveryTimer || tries >= RECOVERY_RETRY_MAX || this.#closing) return;
+    managed.recoveryRetries = tries + 1;
+    managed.recoveryTimer = setTimeout(() => {
+      delete managed.recoveryTimer;
+      if (!this.#closing) this.#releaseProvenGone();
+    }, RECOVERY_RETRY_BASE_MS * 2 ** tries);
+    managed.recoveryTimer.unref?.();
+  }
+
+  /** Round 5 P2: a success by any path, or close, clears the run's retry timer. */
+  #stopRecoveryRetry(entry: RecoveryRetry): void {
+    if (entry.recoveryTimer) clearTimeout(entry.recoveryTimer);
+    delete entry.recoveryTimer;
+  }
+
+  /** One alarm when held permits reach half of maxConcurrent, again every 6 h while they stay there. */
+  #checkHeldPermits(now = Date.now()): void {
+    const held = this.heldPermits();
+    if (held * 2 < this.config.maxConcurrent) { this.#admissionAlarmAt = undefined; return; }
+    if (this.#admissionAlarmAt !== undefined && now - this.#admissionAlarmAt < ADMISSION_REALARM_MS) return;
+    this.#admissionAlarmAt = now;
+    const alarm: AgentAdmissionAlarm = { heldPermits: held, maxConcurrent: this.config.maxConcurrent, at: now,
+      message: `${held} of ${this.config.maxConcurrent} agent admission permits are held by launches whose exit is ` +
+        "unconfirmed; new spawns queue behind them (smarty-dev#9855)" };
+    console.warn(`[pi-fabric] ${alarm.message}`);
+    try { this.#onAdmissionAlarm?.(structuredClone(alarm)); } catch { /* the stderr line stands */ }
   }
 
   #settleQueued(queued: QueuedAgent, status: "stopped" | "failed", error: unknown): void {
@@ -2295,6 +2549,8 @@ export class AgentManager {
     onQueued?: (handle: AgentHandleInfo) => void,
     preparation?: AgentLaunchPreparationOptions,
   ): Promise<AgentRunResult> {
+    const recovered = this.#recoverEnodevRun(request, signal, authorize);
+    if (recovered) return recovered;
     const handle = await this.spawn(request, signal, authorize, undefined, onOutputPrincipalDowngrade, onSpawned, preparation);
     const queued = this.#queued.get(handle.id);
     if (queued && !queued.terminal && !queued.preparing) onQueued?.(this.#queuedInfo(queued));
@@ -2881,6 +3137,84 @@ export class AgentManager {
       [...this.#queued.values()].filter((queued) => !queued.terminal).length;
   }
 
+  /**
+   * smarty-dev#8935: a restored actor activation whose earlier run completed, but was left "execution exit
+   * unconfirmed" by the pre-pi-fabric#849 ENODEV scope observation, gets that run's saved answer instead of a rerun.
+   * The run root is scanned once per manager; each run settles at most once (settleEnodevRun).
+   */
+  // pi-fabric#912 round 3: the shortcut runs only for an authorized, unaborted request (the same gate spawn applies;
+  // otherwise spawn refuses it and the marker is untouched), and it settles nothing: the actor commits after it
+  // delivered the answer (commitEnodevRecovery). An uncommitted recovery keeps the marker and the answer.
+  #recoverEnodevRun(request: AgentRunRequest, signal?: AbortSignal, authorize?: () => boolean): AgentRunResult | undefined {
+    if (!request.actorId || !request.activationId || process.platform !== "linux") return undefined;
+    if (signal?.aborted || (authorize && !authorize())) return undefined;
+    this.#enodevRuns ??= enodevUnresolvedRuns(this.#runRoot);
+    for (const directory of this.#enodevRuns) {
+      const result = peekEnodevRun(directory, request.actorId, request.activationId);
+      if (!result) continue;
+      this.#enodevCommits.set(result.id, { directory, actorId: request.actorId, activationId: request.activationId });
+      // A receipt means a delivery may already have happened (a crash before the queue ack): replay it idempotently.
+      const replay = enodevDelivered(directory, result.id, request.activationId);
+      return { ...result, enodevRecovered: true, ...(replay ? { enodevReplay: true } : {}) };
+    }
+    return undefined;
+  }
+
+  /** The actor delivered a recovered answer: its durable receipt, written before the actor acks its queue. */
+  noteEnodevDelivered(runId: string): boolean {
+    const pending = this.#enodevCommits.get(runId);
+    if (!pending) return false;
+    noteEnodevDelivered(pending.directory, runId, pending.activationId);
+    return true;
+  }
+
+  /** The actor acked the delivered activation in its queue: settle its run (terminal record, archive, marker last). */
+  commitEnodevRecovery(runId: string): boolean {
+    const pending = this.#enodevCommits.get(runId);
+    if (!pending) return false;
+    this.#enodevCommits.delete(runId);
+    const result = settleEnodevRun(pending.directory, pending.actorId, pending.activationId);
+    if (result) this.#enodevSettledHere.add(runId);
+    if (!result) return false;
+    this.#enodevRuns = (this.#enodevRuns ?? []).filter(other => other !== pending.directory);
+    this.#previousRuns.set(result.id, structuredClone(result));
+    this.#retentionRevision++;
+    this.#releaseProvenGone(); // smarty-dev#9855: same step as the settle
+    return true;
+  }
+
+  /**
+   * smarty-dev#8935: an ENODEV-unconfirmed run of `actorId` whose activation is not in `pending` (the actor's
+   * restored queue) will never be claimed by a run request: settle it as lost once its worker is proven gone, so
+   * retention can collect it. One log line per run.
+   */
+  settleLostEnodevRuns(actorId: string, pending: ReadonlySet<string>): void {
+    if (process.platform !== "linux") return;
+    this.#enodevRuns ??= enodevUnresolvedRuns(this.#runRoot);
+    for (const directory of this.#enodevRuns) {
+      const activationId = settleLostEnodevRun(directory, actorId, pending);
+      if (activationId === undefined) continue;
+      this.#enodevSettledHere.add(path.basename(directory));
+      this.#enodevRuns = this.#enodevRuns.filter(other => other !== directory);
+      this.#retentionRevision++;
+      if (enodevDelivered(directory, path.basename(directory), activationId)) {
+        console.warn(`[pi-fabric] actor ${actorId}: run ${path.basename(directory)} settled as delivered: its activation ` +
+          `${activationId} was delivered and acknowledged before a restart (ENODEV, smarty-dev#8935)`);
+        continue;
+      }
+      console.warn(`[pi-fabric] actor ${actorId}: run ${path.basename(directory)} settled as lost: its activation ${activationId} ` +
+        "is no longer pending and its worker exit was unconfirmed (ENODEV, smarty-dev#8935)");
+    }
+    this.#releaseProvenGone(); // smarty-dev#9855: a run this settle proved gone frees its held permit in the same step
+  }
+
+  /** pi-fabric#912: counts consecutive starts whose queue state for `actorId` was unknown in its ENODEV markers. */
+  countUnknownEnodevStarts(actorId: string, unknown: boolean): { starts: number; alarm: boolean } {
+    if (process.platform !== "linux") return { starts: 0, alarm: false };
+    this.#enodevRuns ??= enodevUnresolvedRuns(this.#runRoot);
+    return countUnknownEnodevStarts(this.#enodevRuns, actorId, unknown);
+  }
+
   #previousRun(id: string): AgentRunResult | undefined {
     const previous = this.#runs.has(id) ? undefined : this.#previousRuns.get(id);
     if (!previous) return undefined;
@@ -3289,6 +3623,7 @@ export class AgentManager {
     this.#archiveRecovery.clear();
     for (const timer of this.#followUpTimers.values()) clearTimeout(timer);
     this.#followUpTimers.clear();
+    for (const entry of [...this.#runs.values(), ...this.#queued.values()]) this.#stopRecoveryRetry(entry);
     this.#closeAbort.abort(new Error("Fabric agent manager is closing"));
     return this.#closePromise ??= this.#close().catch(error => {
       this.#closePromise = undefined; // retain exact custody for a later close retry
@@ -3853,10 +4188,15 @@ export class AgentManager {
 
       fs.rmSync(managed.statusFile, { force: true });
       if (managed.settled || this.#closing || managed.stopRequested || managed.abandoned) return false;
+      // pi-fabric#939 round 3: the old attempt's pid proves nothing about the replacement. No attempt's pid is known
+      // until the launch resolves, so nothing can be proven gone in between (or ever, if the launch is unknown).
+      delete managed.ownProcess;
       const transport = await this.#launchTransport(managed.adapter, managed.launch);
       // Stop receipts belong to one transport attempt, not the run id. Install
       // the replacement and its fresh custody together, after launch resolves.
       managed.transport = transport;
+      const owned = transport.kind === "process" ? ownedProcess(transport.sessionId) : undefined;
+      if (owned) managed.ownProcess = owned;
       managed.executionExited = false;
       delete managed.processStop;
       delete managed.processStopPending;
@@ -4255,7 +4595,14 @@ export class AgentManager {
     if (managed.transport.kind === "process" && managed.lostContact) {
       // Reporting a terminal result is allowed; releasing native admission is not.
       // An uncertain Windows tree can still contain untracked native descendants.
+      // smarty-dev#9855: the permit is held, not lost: a later proof of exit releases it once.
+      managed.heldPermit ??= once(managed.release);
       managed.release = () => {};
+      this.#checkHeldPermits();
+      queueMicrotask(() => this.#releaseProvenGone()); // after settlement completes below: deliver, then release
+      // Event-driven (round 3): the current attempt's own close event re-checks; its pid record matches this transport.
+      const transport = managed.transport;
+      void transport.closed?.then(() => this.#releaseProvenGone(), () => this.#releaseProvenGone());
     }
     if (!managed.finalAnswer && managed.transport.kind === "process" && process.platform === "win32" &&
         managed.transport.waitForClose && !managed.lostContact && !managed.processStop) {

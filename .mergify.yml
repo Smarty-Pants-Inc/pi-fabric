@@ -1,6 +1,9 @@
 merge_queue:
   mode: serial
-  max_parallel_checks: 1
+  # Two speculative batches at once (chief-of-staff GO 10-12 01:42Z): a bisect or a slow batch no longer
+  # blocks the whole line (10-11 23:54Z-02:00Z: one #864 bisect held every PR, P0 pi-fabric#936 included).
+  # Revert to 1 if queue-draft resets rise or CI runners can't carry two batches.
+  max_parallel_checks: 2
   reset_on_external_merge: always
 
 # smarty-dev's plain rule (smarty-dev#865): the PR, its required checks and this queue are the

@@ -1,3 +1,4 @@
+import { appendDeliveryOutcome, type DeliverySend } from "../mesh/delivery-outcomes.js";
 import type { MeshControlIncarnationFence } from "../config.js";
 import { FabricParticipantStaleError, participantLeaseGraceMs } from "./host-leases.js";
 import { retryDelayMs } from "../core/retry-backoff.js";
@@ -9,7 +10,7 @@ import { createHash, randomUUID } from "node:crypto";
 import path from "node:path";
 import { mainExecutionCeilingAbortReason, withoutMainExecutionCeiling } from "../async-settlement.js";
 import type { FabricActorRunBinding, FabricActorBindingProvenance } from "../actors/types.js";
-import { MeshStore, type MeshEvent, type MeshIdentity } from "../mesh/store.js";
+import { MeshStore, meshOutageAlarmSink, type MeshEvent, type MeshIdentity } from "../mesh/store.js";
 import { MeshBackgroundQueue, MeshBackgroundRetry } from "../core/atomic-write.js";
 import { rethrowMeshLockTimeout } from "../core/atomic-write.js";
 import { MeshConsumptionPausedError, assertMeshConsumption } from "./mesh-consumption.js";
@@ -94,6 +95,8 @@ const detachedControlOperation = (operation: FabricControlOperation): boolean =>
   operation === "ask";
 
 export interface FabricControlCommand {
+  /** Hydrated from the mesh envelope, never caller data. */
+  eventId?: string;
   /** Hydrated from the admitted MeshEvent envelope, never event.data. */
   principal?: FabricPrincipal | undefined;
   version: 1;
@@ -153,6 +156,8 @@ export interface FabricControlAcceptance {
 
 /** An owner's rejection; `notRun` only when the owner proved the handler did not run. */
 class FabricControlRejection extends Error {
+  /** Marks an owner's remote rejection; the router records no local refusal outcome for it. */
+  readonly rejection = "FABRIC_CONTROL_REJECTED";
   constructor(message: string, readonly notRun: boolean, readonly code?: FabricInterruptErrorCode) {
     super(message);
     if (code) this.name = code === "FABRIC_INTERRUPT_NOT_AUTHORIZED"
@@ -274,7 +279,7 @@ const commandFromEvent = (event: MeshEvent): FabricControlCommand | undefined =>
   const { sender: _forged, ...command } = data;
   const wakeCause = data.operation === "steer" || data.operation === "followUp"
     ? fabricWakeCause(event.from, data.operation, event.topic, event.id) : undefined;
-  return withFabricWakeAdmission({ ...command, wakeCause, principal: event.verification === "mesh" || event.verification === "bridge"
+  return withFabricWakeAdmission({ ...command, eventId: event.id, wakeCause, principal: event.verification === "mesh" || event.verification === "bridge"
     ? copyFabricPrincipal(event.principal) : undefined, ...(event.sender ? { sender: event.sender } : {}) } as unknown as FabricControlCommand, wakeCause ? [wakeCause] : []);
 };
 
@@ -349,25 +354,28 @@ export interface FabricControlInput {
 
 /** Trust owner-default provenance only from a validated member of that actor's root. */
 export const controlActorBindingOptions = (
-  command: Pick<FabricControlCommand, "binding" | "bindingProvenance">,
+  command: Pick<FabricControlCommand, "binding" | "bindingProvenance"> & Partial<Pick<FabricControlCommand, "eventId" | "commandId" | "targetId" | "operation">>,
   from: MeshIdentity,
   actorRootId: string | undefined,
   senderRootId: string | undefined,
-): { overrides?: FabricActorRunBinding; binding?: FabricActorRunBinding } => {
+): { overrides?: FabricActorRunBinding; binding?: FabricActorRunBinding; outcomeSend?: DeliverySend } => {
+  const outcomeSend = (command.operation === "steer" || command.operation === "followUp") && command.targetId && command.commandId ? {
+    eventId: command.eventId ?? command.commandId, to: command.targetId, from: from.id, mode: command.operation,
+  } : undefined;
   const provenance = command.bindingProvenance;
   if (provenance) {
     if (provenance.kind !== "owner-defaults" || !actorRootId || provenance.rootId !== actorRootId ||
       (from.id !== actorRootId && senderRootId !== actorRootId)) {
       throw new Error("Invalid actor owner-default binding provenance");
     }
-    return { overrides: command.binding ?? {} };
+    return { overrides: command.binding ?? {}, ...(outcomeSend ? { outcomeSend } : {}) };
   }
   // An explicit caller view is fixed, even when one or both fields are absent.
-  if (command.binding !== undefined) return { binding: command.binding };
+  if (command.binding !== undefined) return { binding: command.binding, ...(outcomeSend ? { outcomeSend } : {}) };
   // Preserve legacy unbound own-root requests, but never promote an empty foreign
   // view into the owner's private session defaults.
-  return actorRootId && (from.id === actorRootId || senderRootId === actorRootId)
-    ? {} : { binding: {} };
+  return { ...(actorRootId && (from.id === actorRootId || senderRootId === actorRootId)
+    ? {} : { binding: {} }), ...(outcomeSend ? { outcomeSend } : {}) };
 };
 
 export interface FabricControlRequestOptions {
@@ -442,7 +450,8 @@ export class FabricControlPlane {
   #timer: NodeJS.Timeout | undefined;
   #leaseWatchdog: NodeJS.Timeout | undefined;
   #polling: Promise<void> | undefined;
-  readonly #backgroundPoll = new MeshBackgroundRetry("control claim/ack poll");
+  readonly #backgroundPoll = new MeshBackgroundRetry("control claim/ack poll")
+    .alarmsTo(meshOutageAlarmSink(() => ({ mesh: this.mesh, from: this.identity })));
   // Cancellation may become publishable after close, when an admitted command finally commits.
   // Its queue owns that final obligation until success/deadline; idle has no timer or resources.
   readonly #backgroundCancellations = new MeshBackgroundQueue("control cancellation");
@@ -681,6 +690,14 @@ export class FabricControlPlane {
     const timeoutMs = Math.max(this.#pollMs * 4, originalTimeoutMs - retryBudgetSpentMs);
     const ackGraceMs = Math.min(MAX_CONTROL_ACK_GRACE_MS, 2 * timeoutMs);
     let pendingRequest: PendingControlRequest;
+    let publishedEvent: MeshEvent | undefined;
+    let finalOutcome: { outcome: "failed" | "unknown"; reason: string } | undefined;
+    const recordFinal = (): void => {
+      if (!publishedEvent || !finalOutcome || (operation !== "steer" && operation !== "followUp")) return;
+      appendDeliveryOutcome(this.mesh.root, { eventId: publishedEvent.id, to: targetId, from: this.identity.id, mode: operation },
+        finalOutcome.outcome, finalOutcome.reason);
+      finalOutcome = undefined;
+    };
     const acceptance = new Promise<FabricControlAcceptance>((resolve, reject) => {
       const pending: PendingControlRequest = {
         resolve,
@@ -761,7 +778,9 @@ export class FabricControlPlane {
           requestedAt: committedAt,
           deadlineAt: committedAt + timeoutMs,
         }),
-      }).then(() => {
+      }).then((event) => {
+        publishedEvent = event;
+        recordFinal();
         pendingRequest!.commandPublished = true;
         // Other requests retain their commit-time ACK window. Never overwrite a mirrored
         // message's admission timer, or revive a request already settled while publishing.
@@ -794,6 +813,15 @@ export class FabricControlPlane {
       }
       return { commandId, acceptance: acknowledged };
     } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      // A command withdrawn unclaimed at its deadline (smarty-dev#6729) is definitely not delivered.
+      // An owner rejection proves that only with notRun; otherwise its handler may have run.
+      if ((error instanceof FabricControlRejection && error.notRun) || (isObject(error) && error.notDelivered === true)) finalOutcome = { outcome: "failed", reason };
+      else if (error instanceof FabricControlRejection || reason.includes("outcome is unknown") || error instanceof FabricParticipantStaleError ||
+        (options.signal?.aborted && isObject(options.signal.reason) && options.signal.reason.name === "TimeoutError")) {
+        finalOutcome = { outcome: "unknown", reason };
+      }
+      recordFinal();
       const cancelled = this.#clearPending(commandId);
       if (cancelled) void this.#publishCancellation(commandId, cancelled);
       throw error;
@@ -1166,8 +1194,12 @@ export class FabricControlPlane {
       command.requestedAt + MAX_CONTROL_TIMEOUT_MS,
     );
     const key = ownedKey;
-    // Historical replay has no waiting sender; keep relaunches free of redundant ACK writes.
-    if (now > deadlineAt + MAX_CONTROL_ACK_GRACE_MS + this.#pollMs * 4) return;
+    // Historical replay has no waiting sender; keep relaunches free of redundant ACK writes. A command a
+    // bridge delivered late (its bridged copy was published here just now, smarty-dev#9751) is not history:
+    // it gets the expired answer below, never a silent skip, so its sender and the fleet see it.
+    const lateDelivery = isObject(event.data) && isObject(event.data.bridge) &&
+      now - event.createdAt <= MAX_CONTROL_ACK_GRACE_MS + this.#pollMs * 4;
+    if (now > deadlineAt + MAX_CONTROL_ACK_GRACE_MS + this.#pollMs * 4 && !lateDelivery) return;
     // Dedupe precedes the new-admission fence: completed earlier outcomes remain observable,
     // but their ACK names the claiming activation, never this publisher's new activation.
     const duplicate = this.#sharedClaims.has(ownedKey)

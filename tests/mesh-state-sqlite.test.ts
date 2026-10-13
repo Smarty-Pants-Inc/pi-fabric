@@ -571,6 +571,22 @@ describe("SqliteStateStore", () => {
     const sampler = setInterval(() => { maxWal = Math.max(maxWal, maintainer.walBytes()); }, 10);
     fs.writeFileSync(go, "");
     const writerResults = await Promise.all(children.slice(0, writers).map(entry => entry.done));
+    const duringBurst = { ...maintainer.stats().checkpoints };
+    // smarty-dev#7651: the claim under test, with the readers still scanning back to back. A guarded TRUNCATE yields to
+    // every concurrent commit by design (smarty-dev#6100), so how many win DURING the write burst depends on host load
+    // (CI saw 0 at high load). Once the writers are done, constant readers alone must not keep it from winning.
+    // One more commit, so the WAL holds frames to reset even if a burst-time TRUNCATE already emptied it.
+    await maintainer.put({ key: "after/burst", value: 1, identity });
+    let underReaders = false;
+    const settleStarted = Date.now();
+    let settleCalls = 0;
+    while (!underReaders && Date.now() - settleStarted < 30_000) {
+      settleCalls += 1;
+      underReaders = (await maintainer.checkpointSettled(0)).truncated;
+      if (!underReaders) await new Promise(resolve => setTimeout(resolve, 100));
+    }
+    const settleMs = Date.now() - settleStarted;
+    const walAfterSettle = maintainer.walBytes();
     fs.writeFileSync(stop, "");
     const readerResults = await Promise.all(children.slice(writers).map(entry => entry.done));
     clearInterval(sampler);
@@ -580,11 +596,15 @@ describe("SqliteStateStore", () => {
     const stats = maintainer.stats();
     const walTraffic = writers * fills * 3_000;
     // Evidence for the PR: WAL bound versus the bytes written through it.
-    console.log(JSON.stringify({ maxWal, walTraffic, reads, checkpoints: stats.checkpoints }));
+    console.log(JSON.stringify({ maxWal, walTraffic, reads, duringBurst, checkpoints: stats.checkpoints, underReaders, settleMs, settleCalls }));
     expect(reads).toBeGreaterThan(readers);
+    expect(underReaders).toBe(true); // constant readers cannot starve the TRUNCATE
+    expect(walAfterSettle).toBe(0); // and it reset the WAL while they were still reading
     expect(stats.checkpoints.truncate).toBeGreaterThan(0);
-    // Without TRUNCATE under constant readers, the WAL only grows (review-opus P2-1 probe).
-    expect(maxWal).toBeLessThan(Math.max(16 * 1024 * 1024, walTraffic / 2));
+    // Without TRUNCATE under constant readers, the WAL only grows (review-opus P2-1 probe). Under any load it stays
+    // below the store's emergency checkpoint bound (64 MiB): the guarantee a busy host keeps. On an idle host the
+    // burst-time TRUNCATEs keep it near 6 MiB (logged above), but that depends on quiet windows the load removes.
+    expect(maxWal).toBeLessThan(64 * 1024 * 1024);
     maintainer.checkpoint(0);
     expect(maintainer.walBytes()).toBe(0);
     await maintainer.sync();

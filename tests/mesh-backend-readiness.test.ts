@@ -3,11 +3,12 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { meshBackendStatus, type MeshBackendOptions } from "../src/mesh/backend-migration.js";
 import { main } from "../src/mesh/mesh-backend-cli.js";
 import { openNodeSqlite } from "../src/mesh/state-sqlite.js";
-import { leaseHelperPath, probeStateDbLeases, proveFabricReader, procLocksKey, readerReadiness, requiredReaders, type InstalledReader, type LeaseProbeOptions, type ProcScanOptions, type ReaderProof } from "../src/mesh/reader-proof.js";
+import { leaseHelperPath, unsafeChain, probeStateDbLeases, proveFabricReader, procLocksKey, readerReadiness, requiredReaders, type InstalledReader, type LeaseProbeOptions, type ProcScanOptions, type ReaderProof } from "../src/mesh/reader-proof.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 
 // smarty-dev#7815: the switch refuses unless every REQUIRED reader (the inventory: live Fabric releases,
@@ -495,6 +496,254 @@ sys.stdin.readline()`;
     expect(ready.stdout).toMatch(/^cutover done: backend=sqlite epoch 1 \(from 0\)/);
   });
 
+  // smarty-dev#8145 item 3, STRESS coverage: swaps during whole CLI runs through the operator's bin on a copy of the
+  // built package; the probe-window overlap is not asserted. The deterministic proof of the hash-to-exec window is the
+  // unit test "executes the hashed fd: a helper swapped at its path after the hash never runs" (afterHash hook).
+  it.skipIf(binSkip !== "")(`stress: a helper swapped at its path during whole CLI runs never reports a held state.db free${binSkip ? ` (skipped: ${binSkip})` : ""}`, async () => {
+    const root = await crashedImport();
+    const pkg = tempDir("pkg");
+    fs.cpSync(path.resolve("dist"), path.join(pkg, "dist"), { recursive: true });
+    fs.cpSync(path.resolve("bin"), path.join(pkg, "bin"), { recursive: true });
+    const helper = path.join(pkg, "dist/native/fabric-mesh-lease");
+    // A racing child swaps a fake ("free" for every file) and the real helper at the path, without pause.
+    const racer = spawn(process.execPath, ["-e", `
+const fs = require("node:fs");
+const [helper] = process.argv.slice(1);
+fs.linkSync(helper, helper + ".real");
+fs.writeFileSync(helper + ".fake", '#!/bin/sh\\nfor f in "$@"; do echo "free $f"; done\\n', { mode: 0o700 });
+// Hard links, not rewrites: a swap is two syscalls, so it lands often inside the hash-to-exec window.
+// Every 64 swaps it publishes its count: it shows swaps went on during a CLI run (not inside the probe window).
+for (let i = 0; ; i++) {
+  fs.linkSync(helper + (i % 2 ? ".real" : ".fake"), helper + ".next");
+  fs.renameSync(helper + ".next", helper);
+  if (i % 64 === 0) fs.writeFileSync(helper + ".swaps", String(i));
+}`, helper], { stdio: "ignore" });
+    const swaps = (): number => { try { return Number(fs.readFileSync(`${helper}.swaps`, "utf8")); } catch { return -1; } };
+    const holder = await pythonHolder(path.join(root, "state.db"), "nondumpable");
+    try {
+      const started = Date.now();
+      while (swaps() < 64) {
+        if (Date.now() - started > 10_000) throw new Error("the racer did not start swapping");
+        await new Promise(resolve => setTimeout(resolve, 5));
+      }
+      let overlapped = 0;
+      for (let run = 0; run < 8; run++) {
+        const before = swaps();
+        const result = spawnSync(process.execPath, [path.join(pkg, "bin/fabric-mesh-backend"), "cutover", "--root", root,
+          "--accept-unready", "factory,fabric@unknown"], { encoding: "utf8", timeout: 60_000, env: { ...process.env, PI_FABRIC_MESH_STATE_BACKEND: "" } });
+        expect(result.status, result.stderr).toBe(3);
+        // Refused by the real verdict, or fail closed (the swapped bytes fail the hash): never "free".
+        expect(result.stderr).toMatch(/cutover refused: readers not ready for sqlite: holder@lease(:state\.db \(unidentified holder|-probe \(state\.db lease probe unavailable)/);
+        // Swaps went on during the run (stress: swaps during whole CLI runs; the probe-window overlap is not asserted).
+        if (swaps() > before) overlapped++;
+      }
+      // Under a loaded host a short run may see no published count; at least one run must have seen swaps.
+      expect(overlapped).toBeGreaterThan(0);
+      expect(await backendOf(root)).toBe("importing");
+    } finally {
+      racer.kill("SIGKILL");
+      await holder.release();
+    }
+  }, 120_000);
+
+  // smarty-dev#8145 round 1 (SEC P1): the whole real chain up to the install root, not only the helper's directory.
+  it.skipIf(leaseSkip !== "")(`fails closed on a group-writable or symlinked directory between the helper and the install root${leaseSkip ? ` (skipped: ${leaseSkip})` : ""}`, async () => {
+    const root = await crashedImport();
+    const pkg = tempDir("chain");
+    const native = path.join(pkg, "dist/native");
+    fs.mkdirSync(native, { recursive: true, mode: 0o700 });
+    const helper = path.join(native, "fabric-mesh-lease");
+    fs.copyFileSync(leaseHelperPath(), helper);
+    fs.chmodSync(helper, 0o700);
+    expect(probeStateDbLeases(root, { helper, trustRoot: pkg })).toEqual([]);
+    const dist = fs.realpathSync(path.join(pkg, "dist"));
+    fs.chmodSync(dist, 0o770);
+    expect(probeStateDbLeases(root, { helper, trustRoot: pkg })[0]).toMatchObject({ name: "holder@lease-probe",
+      reason: expect.stringContaining(`helper integrity: ${dist} is group/other-writable (mode 770)`) });
+    fs.chmodSync(dist, 0o700);
+    // dist/native as a symlink to a directory outside the package: its real path is not under the install root.
+    const elsewhere = tempDir("elsewhere");
+    fs.renameSync(native, path.join(elsewhere, "native"));
+    fs.symlinkSync(path.join(elsewhere, "native"), native);
+    expect(probeStateDbLeases(root, { helper, trustRoot: pkg })[0]).toMatchObject({ name: "holder@lease-probe",
+      reason: expect.stringContaining(`is outside the install root ${fs.realpathSync(pkg)}`) });
+  });
+
+  // pi-fabric#880 review round 2: above the install root up to the first root-owned, root-only (or sticky) ancestor.
+  // pi-fabric#880 review round 7 (SEC P1): the walk above the install root stopped at the FIRST root-owned 0755 dir, so
+  // a writable parent above it could rename it and replace the package. Root ownership cannot be made in a test: the
+  // ancestors above a scratch tree are an injected lstat. Both the bin's shipped check (its <chain-check> text, run
+  // as is) and the bundle's unsafeChain must agree.
+  describe("the chain above the install root walks to / (pi-fabric#880 round 7)", () => {
+    const fake = (uid: number, mode: number): fs.Stats =>
+      ({ uid, mode, dev: 0, ino: 0, isDirectory: () => true, isSymbolicLink: () => false, isFile: () => false }) as unknown as fs.Stats;
+    /** A scratch package; every ancestor above `base` is fake: `first` just above it, `higher` for all others. */
+    const layout = (first: fs.Stats, higher: (at: string) => fs.Stats) => {
+      const base = fs.realpathSync(tempDir("above"));
+      const pkg = path.join(base, "pkg");
+      fs.mkdirSync(path.join(pkg, "dist/native"), { recursive: true, mode: 0o700 });
+      const file = path.join(pkg, "dist/native/fabric-mesh-lease");
+      fs.writeFileSync(file, "x", { mode: 0o700 });
+      const inside = (at: string) => at === base || at.startsWith(`${base}${path.sep}`);
+      const lstat = (at: string): fs.Stats => inside(at) ? fs.lstatSync(at) : at === path.dirname(base) ? first : higher(at);
+      return { pkg, file, lstat, top: path.dirname(path.dirname(base)) };
+    };
+    const source = fs.readFileSync(path.resolve("bin/fabric-mesh-backend"), "utf8");
+    const region = source.slice(source.indexOf("// <chain-check>"), source.indexOf("// </chain-check>"));
+    const shim = new Function("fs", "path", "process", `${region}\nreturn { unsafeAbove };`)(fs, path, process) as
+      { unsafeAbove: (root: string, lstat: (at: string) => fs.Stats, euid?: number) => string | undefined };
+    const bundle = (file: string, pkg: string, lstat: (at: string) => fs.Stats) => unsafeChain(file, pkg, undefined, lstat);
+
+    it.skipIf(process.platform === "win32")("refuses a package under a root-owned 0755 dir whose parent is group/other-writable", () => {
+      const { pkg, file, lstat, top } = layout(fake(0, 0o40755), at => at === top ? fake(0, 0o40777) : fake(0, 0o40755));
+      expect(shim.unsafeAbove(pkg, lstat)).toBe(`${top} is group/other-writable (mode 777)`);
+      expect(bundle(file, pkg, lstat)).toBe(`${top} is group/other-writable (mode 777)`);
+    });
+
+    it.skipIf(process.platform === "win32")("passes a root-owned sticky dir (like /tmp) with our own entry below it", () => {
+      const { pkg, file, lstat } = layout(fake(0, 0o41777), () => fake(0, 0o40755));
+      expect(shim.unsafeAbove(pkg, lstat)).toBeUndefined();
+      expect(bundle(file, pkg, lstat)).toBeUndefined();
+    });
+  });
+
+  it.skipIf(leaseSkip !== "")(`fails closed on a group-writable, non-sticky parent of the install root${leaseSkip ? ` (skipped: ${leaseSkip})` : ""}`, async () => {
+    const root = await crashedImport();
+    const parent = tempDir("parent");
+    const pkg = path.join(parent, "pkg");
+    fs.mkdirSync(path.join(pkg, "dist/native"), { recursive: true, mode: 0o700 });
+    const helper = path.join(pkg, "dist/native/fabric-mesh-lease");
+    fs.copyFileSync(leaseHelperPath(), helper);
+    fs.chmodSync(helper, 0o700);
+    const real = fs.realpathSync(parent);
+    fs.chmodSync(real, 0o770);
+    expect(probeStateDbLeases(root, { helper, trustRoot: pkg })[0]).toMatchObject({ name: "holder@lease-probe",
+      reason: expect.stringContaining(`helper integrity: ${real} is group/other-writable (mode 770)`) });
+    // A 0755 parent passes, and so do the test directory's own ancestors (/tmp is root-owned and sticky).
+    fs.chmodSync(real, 0o755);
+    expect(probeStateDbLeases(root, { helper, trustRoot: pkg })).toEqual([]);
+  });
+
+  // pi-fabric#880 review round 3 (SEC P1): a swapped-in bundle drops any check it carries, so the operator's shim checks
+  // the chain BEFORE it imports the bundle. The fake bundle leaves a marker if any of its code runs.
+  it.skipIf(binSkip !== "")(`the operator's bin refuses before loading a bundle under a group-writable parent${binSkip ? ` (skipped: ${binSkip})` : ""}`, async () => {
+    const root = await crashedImport();
+    const parent = tempDir("shim");
+    const pkg = path.join(parent, "pkg");
+    fs.cpSync(path.resolve("dist"), path.join(pkg, "dist"), { recursive: true });
+    fs.cpSync(path.resolve("bin"), path.join(pkg, "bin"), { recursive: true });
+    const bundle = path.join(pkg, "dist/mesh/mesh-backend-cli.js");
+    const real = fs.readFileSync(bundle);
+    const marker = path.join(parent, "bundle-ran");
+    fs.writeFileSync(bundle, `import fs from "node:fs";\nfs.writeFileSync(${JSON.stringify(marker)}, "ran");\nexport const main = async () => 0;\n`, { mode: 0o600 });
+    const cli = () => spawnSync(process.execPath, [path.join(pkg, "bin/fabric-mesh-backend"), "cutover", "--root", root,
+      "--accept-unready", "factory,fabric@unknown"], { encoding: "utf8", timeout: 60_000, env: { ...process.env, PI_FABRIC_MESH_STATE_BACKEND: "" } });
+    const parentReal = fs.realpathSync(parent);
+    fs.chmodSync(parentReal, 0o770);
+    const refused = cli();
+    expect(refused.status, refused.stderr).toBe(3);
+    expect(refused.stderr).toBe(`fabric-mesh-backend: refused before loading: helper integrity: ${parentReal} is group/other-writable (mode 770)\n`);
+    expect(fs.existsSync(marker)).toBe(false);                 // no bundle code ran
+    // Under a 0755 parent, with the real bundle back, the real switch passes.
+    fs.chmodSync(parentReal, 0o755);
+    fs.writeFileSync(bundle, real);
+    const ready = cli();
+    expect(ready.status, ready.stderr).toBe(0);
+    expect(await backendOf(root)).toBe("sqlite");
+  });
+
+  // pi-fabric#880 review round 4 (CODE P1): a symlink at or below the package root could be swapped after the check.
+  it.skipIf(binSkip !== "")(`the operator's bin refuses a symlinked bundle or bundle directory inside the package${binSkip ? ` (skipped: ${binSkip})` : ""}`, async () => {
+    const root = await crashedImport();
+    const pkg = path.join(tempDir("links"), "pkg");
+    fs.cpSync(path.resolve("dist"), path.join(pkg, "dist"), { recursive: true });
+    fs.cpSync(path.resolve("bin"), path.join(pkg, "bin"), { recursive: true });
+    const cli = () => spawnSync(process.execPath, [path.join(pkg, "bin/fabric-mesh-backend"), "cutover", "--root", root,
+      "--accept-unready", "factory,fabric@unknown"], { encoding: "utf8", timeout: 60_000, env: { ...process.env, PI_FABRIC_MESH_STATE_BACKEND: "" } });
+    const pkgReal = fs.realpathSync(pkg);
+    // (1) The bundle is a symlink, in a group-writable dist/mesh, to an in-root copy (here a fake that leaves a marker).
+    const mesh = path.join(pkgReal, "dist/mesh");
+    const bundle = path.join(mesh, "mesh-backend-cli.js");
+    const copy = path.join(pkgReal, "dist/copy");
+    fs.mkdirSync(copy, { mode: 0o700 });
+    const marker = path.join(pkgReal, "..", "bundle-ran");
+    fs.writeFileSync(path.join(copy, "cli.js"), `import fs from "node:fs";\nfs.writeFileSync(${JSON.stringify(marker)}, "ran");\nexport const main = async () => 0;\n`, { mode: 0o600 });
+    const real = fs.readFileSync(bundle);
+    fs.unlinkSync(bundle);
+    fs.symlinkSync(path.join(copy, "cli.js"), bundle);
+    fs.chmodSync(mesh, 0o770);
+    // Walking down from the root, the writable dist/mesh refuses first; with it fixed, the symlinked bundle does.
+    const writable = cli();
+    expect(writable.status, writable.stderr).toBe(3);
+    expect(writable.stderr).toBe(`fabric-mesh-backend: refused before loading: helper integrity: ${mesh} is group/other-writable (mode 770)\n`);
+    fs.chmodSync(mesh, 0o700);
+    const linked = cli();
+    expect(linked.status, linked.stderr).toBe(3);
+    expect(linked.stderr).toBe(`fabric-mesh-backend: refused before loading: helper integrity: ${bundle} is a symlink inside the install root\n`);
+    expect(fs.existsSync(marker)).toBe(false);
+    fs.unlinkSync(bundle);
+    fs.writeFileSync(bundle, real, { mode: 0o600 });
+    // (2) dist/mesh itself is an in-root symlink to the real directory.
+    fs.renameSync(mesh, path.join(pkgReal, "dist/mesh-real"));
+    fs.symlinkSync(path.join(pkgReal, "dist/mesh-real"), mesh);
+    const dir = cli();
+    expect(dir.status, dir.stderr).toBe(3);
+    expect(dir.stderr).toBe(`fabric-mesh-backend: refused before loading: helper integrity: ${mesh} is a symlink inside the install root\n`);
+    fs.unlinkSync(mesh);
+    fs.renameSync(path.join(pkgReal, "dist/mesh-real"), mesh);
+    // (2b) dist/ itself is an in-root symlink to a trusted copy: refused as a symlink, never resolved.
+    const dist = path.join(pkgReal, "dist");
+    fs.renameSync(dist, path.join(pkgReal, "dist-real"));
+    fs.symlinkSync(path.join(pkgReal, "dist-real"), dist);
+    const top = cli();
+    expect(top.status, top.stderr).toBe(3);
+    expect(top.stderr).toBe(`fabric-mesh-backend: refused before loading: helper integrity: ${dist} is a symlink inside the install root\n`);
+    fs.unlinkSync(dist);
+    fs.renameSync(path.join(pkgReal, "dist-real"), dist);
+    // (3) The normal layout passes.
+    const ready = cli();
+    expect(ready.status, ready.stderr).toBe(0);
+    expect(await backendOf(root)).toBe("sqlite");
+  });
+
+  // pi-fabric#880 review round 5 (CODE P1): launched through a symlinked package-root alias with the symlink-preserving
+  // flags, the bin must still load the CANONICAL bundle it checked, never the alias (which another uid could swap).
+  it.skipIf(binSkip !== "")(`the operator's bin loads the canonical bundle when launched through a package-root alias${binSkip ? ` (skipped: ${binSkip})` : ""}`, () => {
+    const parent = tempDir("alias");
+    const pkg = path.join(parent, "pkg");
+    fs.cpSync(path.resolve("dist"), path.join(pkg, "dist"), { recursive: true });
+    fs.cpSync(path.resolve("bin"), path.join(pkg, "bin"), { recursive: true });
+    // The bundle records the URL it was loaded as.
+    const seen = path.join(parent, "loaded-as");
+    fs.writeFileSync(path.join(pkg, "dist/mesh/mesh-backend-cli.js"),
+      `import fs from "node:fs";\nfs.writeFileSync(${JSON.stringify(seen)}, import.meta.url);\nexport const main = async () => 0;\n`, { mode: 0o600 });
+    const alias = path.join(parent, "alias");
+    fs.symlinkSync(pkg, alias);
+    const result = spawnSync(process.execPath, [path.join(alias, "bin/fabric-mesh-backend"), "--help"], { encoding: "utf8", timeout: 60_000,
+      env: { ...process.env, NODE_OPTIONS: "--preserve-symlinks --preserve-symlinks-main" } });
+    expect(result.status, result.stderr).toBe(0);
+    expect(fs.readFileSync(seen, "utf8")).toBe(pathToFileURL(path.join(fs.realpathSync(pkg), "dist/mesh/mesh-backend-cli.js")).href);
+  });
+
+  it.skipIf(binSkip !== "")(`end to end: a group-writable directory of the gate's own bundle refuses the switch${binSkip ? ` (skipped: ${binSkip})` : ""}`, async () => {
+    const root = await crashedImport();
+    const pkg = tempDir("bundle");
+    fs.cpSync(path.resolve("dist"), path.join(pkg, "dist"), { recursive: true });
+    fs.cpSync(path.resolve("bin"), path.join(pkg, "bin"), { recursive: true });
+    const cli = () => spawnSync(process.execPath, [path.join(pkg, "bin/fabric-mesh-backend"), "cutover", "--root", root,
+      "--accept-unready", "factory,fabric@unknown"], { encoding: "utf8", timeout: 60_000, env: { ...process.env, PI_FABRIC_MESH_STATE_BACKEND: "" } });
+    // dist/mesh holds the gate (mesh-backend-cli.js), not the helper: only the bundle chain covers it.
+    const mesh = fs.realpathSync(path.join(pkg, "dist/mesh"));
+    fs.chmodSync(mesh, 0o775);
+    const refused = cli();
+    expect(refused.status, refused.stderr).toBe(3);
+    // Since round 3 the shim refuses first, before the bundle loads; the bundle's own check stays as defence in depth.
+    expect(refused.stderr).toBe(`fabric-mesh-backend: refused before loading: helper integrity: ${mesh} is group/other-writable (mode 775)\n`);
+    fs.chmodSync(mesh, 0o700);
+    const ready = cli();
+    expect(ready.status, ready.stderr).toBe(0);
+  });
+
   // smarty-dev#8116: a holder that opens AFTER the fenced lease probe and before the commit. The python3 child
   // waits for a trigger file, so the switch's own onStep (between its open of state.db and the commit) runs it.
   const lateHolder = async (file: string, mode: "open" | "link"): Promise<{ trigger: () => void; release: () => Promise<void> }> => {
@@ -789,6 +1038,27 @@ exec sleep 30
     fs.symlinkSync(leaseHelperPath(), link);
     expect(probeStateDbLeases(root, { helper: link })[0]!.reason).toContain(`helper integrity: ${link} cannot be opened (ELOOP)`);
     expect(probeStateDbLeases(root, { expectedDigest: "" })[0]!.reason).toContain("helper integrity: no embedded digest in this build");
+  });
+
+  // smarty-dev#8145 item 2: another user who can write the helper or its directory could change what runs.
+  it.skipIf(leaseSkip !== "")(`fails closed on a group- or other-writable helper or helper directory${leaseSkip ? ` (skipped: ${leaseSkip})` : ""}`, async () => {
+    const root = await crashedImport();
+    const copy = tempDir("helper");
+    const helper = path.join(copy, "fabric-mesh-lease");
+    fs.copyFileSync(leaseHelperPath(), helper);
+    fs.chmodSync(copy, 0o700);
+    fs.chmodSync(helper, 0o700);
+    expect(probeStateDbLeases(root, { helper })).toEqual([]);
+    fs.chmodSync(helper, 0o720);
+    expect(probeStateDbLeases(root, { helper })[0]).toMatchObject({ name: "holder@lease-probe",
+      reason: expect.stringContaining(`helper integrity: ${helper} is group/other-writable (mode 720)`) });
+    fs.chmodSync(helper, 0o700);
+    fs.chmodSync(copy, 0o703);
+    try {
+      const refused = await run(["cutover", "--root", root], { procScan: { listPids: () => [] }, leaseProbe: { helper } });
+      expect(refused.code).toBe(3);
+      expect(refused.err).toContain(`helper integrity: ${copy} is group/other-writable (mode 703)`);
+    } finally { fs.chmodSync(copy, 0o700); }
   });
 
   it.skipIf(leaseSkip !== "")(`executes the hashed fd: a helper swapped at its path after the hash never runs${leaseSkip ? ` (skipped: ${leaseSkip})` : ""}`, async () => {

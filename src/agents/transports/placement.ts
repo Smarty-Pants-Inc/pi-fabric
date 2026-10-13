@@ -197,6 +197,9 @@ export const launchPlacedTask = async (request: AgentTransportLaunch, config: Ag
     // Reuse the manager's unknown-launch fence; never release or relaunch it.
     throw Object.assign(error instanceof Error ? error : new Error(String(error)), {
       launchOutcome: "unknown", cleanupPending: true, transport: "process", sessionId: handle.sessionId,
+      // pi-fabric#939 round 3: the launched process's own close event (manager-owned), so a held permit is
+      // re-checked when it exits, without polling.
+      ...(handle.closed ? { closed: handle.closed } : {}),
     });
   }
 };

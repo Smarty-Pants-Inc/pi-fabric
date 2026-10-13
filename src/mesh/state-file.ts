@@ -11,7 +11,8 @@ import { readFileRetrying, writeFileAtomic, renameAtomic, MeshLockTimeoutError, 
 import { MeshSyncNotDurableError } from "./not-durable.js";
 import { captureStoragePut, captureStorageDelete, storageRevision } from "../verified/storage.js";
 import { delay, describeLockHolder, errorCode, lockStats, type MeshLock, type MeshStoreContext } from "./mesh-lock.js";
-import { assertFileStateWritable, isMeshStateMovedMarker, meshStateMovedError, readMeshStateMovedMarker, type MeshStateMovedMarker } from "./backend-fence.js";
+import { assertFileStateWritable, isMeshStateMovedMarker, isMeshStateNatsMarker, meshStateMovedError, meshStateMovedToNatsError, readMeshStateMovedMarker,
+  type MeshStateMovedMarker, type MeshStateNatsMarker } from "./backend-fence.js";
 import type { MeshIdentity } from "./event-log.js";
 import type { MeshCommitEffects, MeshStateFileRead, StateBackend, StateBackendBatchInput, StateBackendDiagnostics } from "./state-backend.js";
 
@@ -206,14 +207,14 @@ const readState = (
     throw new Error(`Failed to read Fabric mesh state: ${message}`);
   }
   if (!serialized.trim() && recoverDamage) return emptyState();
-  let moved: MeshStateMovedMarker | undefined;
+  let moved: MeshStateMovedMarker | MeshStateNatsMarker | undefined;
   try {
     const parsed: unknown = JSON.parse(serialized);
     if (isMeshStateFile(parsed)) {
       observed?.(serialized);
       return parsed;
     }
-    if (!isMeshStateMovedMarker(parsed)) throw new Error("invalid state format");
+    if (!isMeshStateMovedMarker(parsed) && !isMeshStateNatsMarker(parsed)) throw new Error("invalid state format");
     moved = parsed;
   } catch (error) {
     // Failed parsing must not silently erase the allocation clock. Read-only
@@ -227,7 +228,7 @@ const readState = (
   // pi-fabric#627 review round 3: cutover's moved marker (backend-fence.ts). Never state, damage or an
   // empty mesh, for strict and tolerant reads alike: this file-mode store fails closed (a write is
   // refused before it stages anything; a reader does not report false absence).
-  throw meshStateMovedError(filePath, moved);
+  throw isMeshStateNatsMarker(moved) ? meshStateMovedToNatsError(filePath, moved) : meshStateMovedError(filePath, moved);
 };
 
 // smarty-dev#2014 read signal: state.read-signal.json, rewritten best effort after each commit
@@ -921,7 +922,7 @@ export class StateFile implements StateBackend {
     // The reduced remaining budget below must not turn an ordinary cold protocol-2
     // write into a bounded custody try. Await constructor preparation outside custody;
     // an actual registry-fenced try still fails closed promptly in #withLock.
-    if (this.#lock.lockProtocol === 2 && !this.#lock.ownIncarnationReady && !scope?.active) {
+    if (this.#lock.lockProtocol >= 2 && !this.#lock.ownIncarnationReady && !scope?.active) {
       await this.#lock.ownIncarnation;
     }
     for (;;) {

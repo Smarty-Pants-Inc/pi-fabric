@@ -4,9 +4,14 @@ import { resolveToolPath } from "./write-guard.js";
  * smarty-dev#8758 item 2: the tool-generated receipt of what a process task agent changed, carried in its final
  * envelope (AgentRunResult.writeReceipt), so the spawning lane trusts the receipt, not the child's prose. Recorded by
  * the worker from the Pi child's own tool events (the same tool boundary the write guard sees): every path a write or
- * edit call completed on, and the text of every shell command that ran (only possible where the shell is allowed). No
- * file contents. Bounded: at most 256 paths, 64 commands of at most 4,096 characters, 64 KiB in all; `truncated`
- * marks a receipt that dropped or cut anything.
+ * edit call completed on, and the text of every shell command the child ran or tried. The content a write or edit
+ * call carries is never recorded; a shell command's text is recorded as given, so inline data in it is kept.
+ * Bounded: at most 256 paths, 64 commands of at most 4,096 characters, 64 KiB in all; `truncated` marks a receipt
+ * that dropped or cut anything.
+ *
+ * Trust: the events come from the child's Pi process stdout, so the receipt catches a child whose report is wrong,
+ * not a malicious child process: code running as the child (an extension, or a shell writing to Pi's stdout) can add
+ * or hide entries. It is evidence against the child's prose, not an authenticated audit log.
  */
 export interface AgentWriteReceipt {
   /** Absolute paths, in first-touch order, deduplicated. */
@@ -48,18 +53,18 @@ export class WriteReceiptRecorder {
   }
 
   /**
-   * A tool_execution_end event: a write or edit that completed records its path; a shell command that ran (even with a
-   * failing exit) records its text. A call the guard blocked did not run (no durationMs, an error): nothing is
-   * recorded. Returns true when the receipt changed.
+   * A tool_execution_end event: a write or edit that completed records its path (a blocked or failed one does not). A
+   * shell call records its text once it ended, whether it ran or was refused: not every producer says which (a nested
+   * pi.bash or a durable run's end event has no durationMs), and a receipt should over-report a command rather than
+   * miss one that ran. Returns true when the receipt changed.
    */
   end(event: { toolCallId?: unknown; isError?: unknown; durationMs?: unknown }): boolean {
     if (typeof event.toolCallId !== "string") return false;
     const call = this.#pending.get(event.toolCallId);
     if (!call) return false;
     this.#pending.delete(event.toolCallId);
-    const ran = typeof event.durationMs === "number" || event.isError !== true;
     if (call.path !== undefined && event.isError !== true) return this.#add("path", call.path);
-    if (call.command !== undefined && ran) return this.#add("command", call.command);
+    if (call.command !== undefined) return this.#add("command", call.command);
     return false;
   }
 

@@ -925,12 +925,14 @@ Confinement is inherited and only narrows. A confined agent's own children inher
 
 ### Write receipt
 
-The result of a Pi process child carries `writeReceipt: { paths, commands, truncated? }`. Fabric records it from the child's own tool events, not from the child's report:
+The result of every Pi child carries `writeReceipt: { paths, commands, truncated? }`, empty (`{ paths: [], commands: [] }`) when it changed nothing. Fabric records it from the child's own tool events, not from the child's report:
 
-- `paths`: every absolute path a `write` or `edit` call completed on, in first-touch order. A call the guard blocked is not listed.
-- `commands`: the text of every `bash` or `powershell` command that ran, including one that exited non-zero. A shell call runs only where the shell is allowed.
+- `paths`: every absolute path a `write` or `edit` call completed on, in first-touch order. A blocked or failed call is not listed.
+- `commands`: the text of every `bash` or `powershell` call the child made, whether it ran or the guard refused it. Not every event says which, so the receipt over-reports rather than miss one that ran.
 
-File contents are never recorded. The receipt holds at most 256 paths and 64 commands of at most 4,096 characters, 64 KiB in all, and `truncated: true` marks one that dropped or cut anything. A spawner should check the receipt, not the child's prose.
+The content a `write` or `edit` call carries is never recorded. A shell command's text is recorded as given, so data written inline in a command (a heredoc, for example) is kept in the receipt. The receipt holds at most 256 paths and 64 commands of at most 4,096 characters, 64 KiB in all, and `truncated: true` marks one that dropped or cut anything.
+
+A spawner should check the receipt, not the child's prose. The receipt catches a child whose report is wrong. It is not an authenticated audit log: the events come from the child's Pi process output, so code running as the child (an extension, or a shell that writes to that output) can add or hide entries.
 
 ### Scope narrowing
 

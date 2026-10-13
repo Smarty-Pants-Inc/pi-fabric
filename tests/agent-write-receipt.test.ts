@@ -48,6 +48,26 @@ describe("agent write receipt (smarty-dev#8758 item 2)", () => {
     expect(result.writeReceipt).toEqual({ paths: [], commands: [] });
   }, 30_000);
 
+  // Round-2 review P2: a failed Pi child's record carries the empty receipt too (it exists from record creation).
+  it("a Pi child that fails without a turn still carries the empty receipt", async () => {
+    const { manager } = managerIn("exit-error");
+    const result = await manager.run({ task: "fail", runner: "pi", transport: "process", extensions: false });
+    expect(result.status).not.toBe("completed");
+    expect(result.writeReceipt).toEqual({ paths: [], commands: [] });
+  }, 30_000);
+
+  // Round-2 review P2: a nested pi.bash or a durable run's end event has no durationMs; a shell call that ended with
+  // an error is recorded either way (over-report rather than miss one that ran). A failed write is still not.
+  it("records a shell call that ended with an error and no durationMs; never a failed write", async () => {
+    const { WriteReceiptRecorder } = await import("../src/agents/write-receipt.js");
+    const recorder = new WriteReceiptRecorder("/work");
+    recorder.start({ toolCallId: "n1", toolName: "bash", args: { command: "false" } });
+    recorder.end({ toolCallId: "n1", isError: true });
+    recorder.start({ toolCallId: "w1", toolName: "write", args: { path: "x.txt", content: "X" } });
+    recorder.end({ toolCallId: "w1", isError: true });
+    expect(recorder.receipt).toEqual({ paths: [], commands: ["false"] });
+  });
+
   it("bounds the receipt: a capped number of paths, cut command text, and truncated marked; no contents", async () => {
     // Imported here, so the other cases still run (and fail) on a tree without the module.
     const { WriteReceiptRecorder, WRITE_RECEIPT_MAX_COMMAND_CHARS, WRITE_RECEIPT_MAX_PATHS } = await import("../src/agents/write-receipt.js");

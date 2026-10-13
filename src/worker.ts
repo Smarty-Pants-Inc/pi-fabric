@@ -388,6 +388,9 @@ const main = async (): Promise<void> => {
   mkdirPrivate(deliveryDirectory, runRoot);
   const images = readImages(options.imagesFile);
   const record = createRunningRecord(options, task, thinking, Date.now());
+  // pi-fabric#1034: every Pi child's record carries a receipt from its creation, so an early refusal or failure
+  // record has the empty one too (round-2 review P2).
+  if (isPi) record.writeReceipt = { paths: [], commands: [] };
   if (options.runner === "pi") {
     // The manager removes the old status to fence terminal verdicts on relaunch.
     // History is explicitly handed across that boundary, not a Pi resume target.
@@ -876,9 +879,6 @@ const main = async (): Promise<void> => {
   const unresolvedToolCalls = new Set<string>();
   // smarty-dev#8758 item 2: what the child's write/edit/shell tools actually did, from Pi's own tool events.
   const writeReceipt = new WriteReceiptRecorder(options.cwd);
-  // pi-fabric#1034 Astra P2: every Pi child's result carries a receipt, empty when nothing was tracked, so a caller can
-  // tell "nothing written" from "no receipt".
-  if (isPi) record.writeReceipt = writeReceipt.receipt;
 
   // Only ordinary tasks with real, completed tool work and retained prose can
   // expose an interrupted report without claiming success. Never suppress

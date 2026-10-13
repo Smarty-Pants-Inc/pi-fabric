@@ -138,6 +138,47 @@ describe("incoming Fabric display projection", () => {
     expect(h.render({ ...message("Reply for Paul"), details: { ...carrier, items: [unmarked] } })).toBeUndefined();
   });
 
+  it.each(["org", "org-agent", "org-agent@revision"])("collapses all incoming labels in the %s pane, with exact native expansion", role => {
+    vi.stubEnv("PI_FABRIC_ROLE", undefined); vi.stubEnv("SMARTY_ROLE", role);
+    initTheme("dark", false);
+    const h = harness("auto");
+    const carriers: CustomMessage[] = [
+      { ...message("Peer status\nFULL_PEER_DETAIL"), details: { from: sender, delivery: "followUp", data: { to: "principal" } } },
+      { ...message(), content: '<fabric-agent-message from_name="org-agent@revision" to="principal">Org-labeled status\nFULL_REMOTE_ORG_DETAIL</fabric-agent-message>' },
+      { ...message(), customType: "pi-fabric-actor", content: '<fabric-actor name="org" to="principal">Actor status\nFULL_ACTOR_DETAIL</fabric-actor>' },
+      { ...message("mail.inbound: Mail status\nFULL_MAIL_DETAIL"), details: { to: "principal", from: sender } },
+      { ...inbox([event("unseen", "Inbox status\nFULL_INBOX_DETAIL", { key: "unseen" })]), details: { to: "principal" } },
+      { ...message("Inbox summary"), customType: "pi-fabric-inbox-summary", details: { to: "principal" } },
+    ];
+    const bytes = JSON.stringify(carriers); const llmBytes = JSON.stringify(convertToLlm(carriers));
+    for (const value of carriers) {
+      const lines = h.render(value)!;
+      expect(lines).toHaveLength(1); expect(lines[0]).toContain("\x1b[2m");
+      const actual = new CustomMessageComponent(value, h.renderers.get(value.customType));
+      actual.setExpanded(true);
+      expect(actual.render(120)).toEqual(new CustomMessageComponent(value).render(120));
+      actual.setExpanded(false); expect(plain(actual.render(120).join("\n"))).toContain("↳");
+      h.setMode("expanded"); expect(h.render(value)).toBeUndefined(); h.setMode("auto");
+    }
+    expect(JSON.stringify(carriers)).toBe(bytes); expect(JSON.stringify(convertToLlm(carriers))).toBe(llmBytes);
+  });
+
+  it("collapses a principal-addressed mixed org burst once and preserves inbox dedup", () => {
+    vi.stubEnv("PI_FABRIC_ROLE", "org"); vi.stubEnv("SMARTY_ROLE", "task-agent");
+    const h = harness("collapsed");
+    const first = message("Peer status");
+    const burst = { ...first, content: `${first.content}\n<fabric-agent-message from_name="org" delivery="followUp">Remote org status</fabric-agent-message>`,
+      details: { to: "principal", items: [first.details, { from: { id: "session:org", name: "org" }, delivery: "followUp" }] } };
+    expect(plain(h.render(burst)![0]!)).toBe(" ↳ Build & Test +1 sender: [2 agent/followUp] Peer status");
+    h.setBranch([entry(message())]);
+    const shadow = inbox([event("shadow", "SHADOW_DUPLICATE")]);
+    expect(h.render(shadow)).toEqual([]);
+    expect(h.render(shadow, true)).toBeUndefined();
+    // Non-org sessions retain the existing recipient/sender exceptions, even with principal view on.
+    vi.stubEnv("PI_FABRIC_ROLE", "project"); vi.stubEnv("SMARTY_ROLE", "org-agent");
+    expect(h.render(burst)).toBeUndefined();
+  });
+
   it("uses the exact native current rendering when expanded and can collapse again", () => {
     initTheme("dark", false);
     const h = harness(); const value = message("first line\nsecond line\nfinal detail");

@@ -10,6 +10,18 @@ import { decodeMeshStateFile, encodeMeshStateFile, type MeshStateFile } from "..
 import { openNodeSqlite, type SqliteConnection, type SqliteOpener } from "../src/mesh/state-sqlite.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 
+// Review 1029: a deterministic randomBytes(16) failure (only the quarantine entry name draws 16 bytes), armed only at
+// the importing refusal; every other call delegates to the real node:crypto.
+const rng = vi.hoisted(() => ({ fail: false, hits: 0 }));
+vi.mock("node:crypto", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:crypto")>();
+  const randomBytes = ((size: number, ...rest: unknown[]) => {
+    if (rng.fail && size === 16) { rng.hits += 1; throw Object.assign(new Error("injected RNG failure"), { code: "ERR_INJECTED_RNG" }); }
+    return (actual.randomBytes as (...args: unknown[]) => unknown)(size, ...rest);
+  }) as typeof actual.randomBytes;
+  return { ...actual, default: { ...actual, randomBytes }, randomBytes };
+});
+
 // smarty-dev#9501 (no-deletion goal): a readiness refusal under the fence, before the importing commit, MOVES the
 // state.db, -wal and -shm this run created (lstat identity re-checked, through the held directory fd, fence still held)
 // into a private `.import-quarantine-*` slot and RETAINS every moved entry: no unlink and no rmdir, ever. The report
@@ -26,6 +38,8 @@ const savedRelease = process.env.PI_FABRIC_RELEASE_SHA;
 beforeEach(() => { process.env.PI_FABRIC_RELEASE_SHA = "fabric-rel-a"; });
 afterEach(() => {
   vi.restoreAllMocks(); // before the teardown: the fixture removes only its own mkdtemp roots, with the real fs
+  rng.fail = false;
+  rng.hits = 0;
   if (savedRelease === undefined) delete process.env.PI_FABRIC_RELEASE_SHA; else process.env.PI_FABRIC_RELEASE_SHA = savedRelease;
   for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
 });
@@ -455,6 +469,27 @@ describe.skipIf(process.platform !== "linux")("recorded cleanup", () => {
     expect(result.json.reason).toBe("cleanup-failed");
     const warnings = result.json.cleanupWarnings ?? [];
     expect(warnings.some(text => text.includes("EIO") && text.includes(root))).toBe(true);
+    for (const text of warnings) expect(result.err).toContain(text);
+  });
+
+  it("an RNG failure for the quarantine entry name keeps the originals (cleanup-failed) and leaves no unreported quarantine directory", async () => {
+    const root = await fileRoot();
+    await proveSqlite(root);
+    const calls = recordRemovals(root);
+    const result = await run(root, "import", { refuseAt: "importing", beforeCommit: (commit) => { if (commit.phase === "importing") rng.fail = true; } });
+    rng.fail = false;
+    refusedUnderFence(result, "importing");
+    expect(rng.hits).toBeGreaterThan(0);
+    expect(calls).toEqual([]);
+    expect(idOf(fs.lstatSync(path.join(root, "state.db")))).toBe(result.opened[0]);
+    const onDisk = fs.readdirSync(root).filter(name => name.startsWith(".import-quarantine"));
+    const reported = (result.json.retained ?? []).filter(kept => kept.startsWith(".import-quarantine"));
+    expect(onDisk.filter(dir => !reported.some(kept => kept === dir || kept.startsWith(`${dir}/`))), "unreported quarantine dirs").toEqual([]);
+    expect(onDisk).toEqual([]);
+    expect([...result.json.retained ?? []].sort()).toEqual(dbNames(root));
+    expect(result.json.reason).toBe("cleanup-failed");
+    const warnings = result.json.cleanupWarnings ?? [];
+    expect(warnings.some(text => text.includes("injected RNG failure") && text.includes(root))).toBe(true);
     for (const text of warnings) expect(result.err).toContain(text);
   });
 

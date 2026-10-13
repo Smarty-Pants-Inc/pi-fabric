@@ -140,9 +140,10 @@ export const pinImportRoot = (root: string): OwnedImportFiles => {
         // ponytail: no unlink/rmdir, even after checking the moved inode. Fresh random private destinations protect
         // honest writers; deliberately hostile same-UID writes inside the quarantine require isolation (#11066).
         let slot: string;
-        try { slot = path.basename(fs.mkdtempSync(path.join(pinnedDir!, ".import-quarantine-"))); }
+        let entry: string;
+        // The entry name is drawn before mkdtemp: an RNG failure must not leave an unreported empty quarantine directory.
+        try { entry = `${name}-${randomBytes(16).toString("hex")}`; slot = path.basename(fs.mkdtempSync(path.join(pinnedDir!, ".import-quarantine-"))); }
         catch (error) { keep(name, `could not make a quarantine directory in ${root} for ${name}: ${messageOf(error)}`); return; }
-        const entry = `${name}-${randomBytes(16).toString("hex")}`;
         const moved = path.join(pinnedDir!, slot, entry);
         const qname = `${slot}/${entry}`;
         const inspect = `inspect ${root}/${slot}, then remove it manually once its contents are not needed`;

@@ -52,11 +52,13 @@ release. Required: each distinct release of a live Fabric writer (host leases an
 the built-in installed readers (factory) and each --require-reader. --accept-unready NAME,... is the
 only override. The intent is written to <root>/backend-switches.jsonl before the switch; the check
 runs again under the fence right before each flag commit (importing, sqlite), crash reruns included.
-A refusal before the importing commit removes the state.db, -wal and -shm that run created (smarty-dev#9501),
-through a root directory fd held via /proc/self/fd; what it keeps is reported (stderr; "cleanupWarnings",
-"retained", "reason"). Reasons: no-held-dir-fd (no working /proc/self/fd, any platform: nothing is removed),
-close-failed (the database close failed: nothing is removed), cleanup-failed, not-this-runs-file. The refusal
-and exit 3 are unchanged. Errors (exit 1) keep the files, so a rerun converges.
+A refusal before the importing commit moves the state.db, -wal and -shm that run created into a reported
+quarantine directory (smarty-dev#9501), through a root directory fd held via /proc/self/fd. Cleanup deletes
+nothing; inspect the quarantine and remove it manually once its contents are not needed. Kept paths are
+reported on stderr and in JSON ("cleanupWarnings", "retained", "reason"). Reasons: quarantined-after-refusal,
+no-held-dir-fd (no working /proc/self/fd: nothing is moved), close-failed (the database close failed: nothing
+is moved), cleanup-failed, not-this-runs-file. Refusal exit 3 is unchanged. Errors (exit 1) keep the files
+so a rerun converges.
 
 --scratch-proof-from STATE_JSON (import only, smarty-dev#9404): a reader's proof step. The CLI itself
 creates a fresh 0700 scratch directory (mkdtemp in --scratch-parent, default the OS temp directory; its

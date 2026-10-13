@@ -2,6 +2,11 @@ import { invocationFabricPrincipal, snapshotFabricInvocation, fabricHostIdentity
 import { createHash, randomUUID } from "node:crypto";
 import { actorInstructionsSource, resolveActorInstructions, assertActorInstructionReplacement } from "../actors/instructions-file.js";
 import { readTaskReturnAddress } from "../agents/task-return-address.js";
+import { RemoteTaskClient } from "../agents/remote-tasks.js";
+import { RemoteTaskError } from "../agents/remote-task-errors.js";
+import { normalizeAgentCapabilityTokens } from "../host-compatibility.js";
+import { readWritePolicy } from "../agents/child-env.js";
+import type { CompletionRecipient } from "../agents/completion-journal.js";
 import type { RouteEvaluate } from "../agents/model-route.js";
 import type { JevRequest, JevResponse } from "../jev/types.js";
 import { formatAge, residentHostId, RESIDENT_HOST_FORMAT, ResidentOutcomeUnknownError, ResidentActorAuthorizationError, assertResidentActorMain, assertResidentActorToolCeiling, type ResidentActorCaller, type ResidentActorMutation } from "../residency/protocol.js";
@@ -441,6 +446,9 @@ export class AgentsProvider implements FabricProvider {
   readonly #router: AgentMessageRouter;
   readonly #projectLeadId: string | undefined;
   readonly #taskReturnAddress = readTaskReturnAddress();
+  #remoteTasks: RemoteTaskClient | undefined;
+  onRemoteComplete: (result: AgentRunResult, recipient: CompletionRecipient) => void = () => {};
+  onRemoteConsumed: (id: string) => void = () => {};
   readonly name = "agents";
   /** Session registry of `provider:` participants; stop/steer/followUp route there. */
   providerParticipants: ProviderParticipantRegistry | undefined;
@@ -479,6 +487,20 @@ export class AgentsProvider implements FabricProvider {
         );
       },
     );
+  }
+
+  #remote(): RemoteTaskClient {
+    if (!this.control) throw new RemoteTaskError("FABRIC_REMOTE_TASK_NO_OWNER", "Remote capability tasks require the mesh control plane");
+    return this.#remoteTasks ??= new RemoteTaskClient(this.actorManager.mesh.root, this.actorManager.identity,
+      this.manager.runtimeHostId ?? this.actorManager.identity.id, this.participants, this.control,
+      (result, recipient) => this.onRemoteComplete(result, recipient), id => this.onRemoteConsumed(id));
+  }
+
+  #remoteProxy(id: string): RemoteTaskClient | undefined {
+    // Native/local controls must remain available without mesh-backed actor services.
+    if (!this.control || !this.actorManager.mesh?.root) return undefined;
+    const client = this.#remote();
+    return client.has(id) ? client : undefined;
   }
 
   readonly #lifecycleScheduler: LifecycleDeliveryScheduler;
@@ -911,6 +933,22 @@ export class AgentsProvider implements FabricProvider {
       case "handoff":
         return this.handoff(args, context);
       case "spawn": {
+        const needs = normalizeAgentCapabilityTokens(args.needs);
+        if (needs?.length && !needs.includes("local")) {
+          if (needs.some(need => !this.manager.config.hostCapabilities?.includes(need))) {
+            if (this.#taskReturnAddress || readWritePolicy() || sessionScope()) {
+              throw new RemoteTaskError("FABRIC_REMOTE_TASK_POLICY_REFUSED", "A task or scoped/confined caller cannot transfer ambient authority to a foreign host");
+            }
+            const request = await this.#prepareSpawnRequest(args, context);
+            const handle = await this.#remote().spawn(request, isInteractiveMain(context.extensionContext) ? withoutMainExecutionCeiling(context.signal) : context.signal);
+            context.activity?.({ type: "entity", id: handle.id, kind: "agent", name: handle.name });
+            context.update(`Remote ${agentStartedMessage(handle)}`);
+            return handle;
+          }
+          // This host itself satisfies the needs: don't let an optional work-host
+          // placement launcher move the task away from the capability it requires.
+          args = { ...args, needs: [...needs, "local"] };
+        }
         const request = this.#applySeed(
           args,
           await this.#routeCreationDefault("spawn", args, await this.#prepareSpawnRequest(args, context), context),
@@ -951,6 +989,7 @@ export class AgentsProvider implements FabricProvider {
         context.update(agentStartedMessage(handle));
         return request.routeDecision ? { ...handle, routeDecision: request.routeDecision } : handle;
       }
+      case "result":
       case "join":
       case "wait": {
         const id = String(args.id);
@@ -960,6 +999,15 @@ export class AgentsProvider implements FabricProvider {
           ? mainAgentWaitBound(args.timeoutMs, context.mainDeadlineAt)
           : agentWaitBound(args.timeoutMs, AGENT_WAIT_MAX_MS);
         const atBound = (record: object) => this.#mainWaitAtBound(record, timeoutMs);
+        const remote = this.#remoteProxy(id);
+        if (remote) {
+          const result = await remote.observe(id, actionName === "result" ? "taskResult" : "taskWait", timeoutMs, context.signal, context.deferResultConsumption);
+          if ("waitTimedOut" in result) {
+            if (main) return atBound(result);
+            throw new AgentWaitBoundError(`Remote task ${id} still running at the observation bound; it continues`);
+          }
+          return result;
+        }
         if (this.residency?.hasAgent(id)) {
           const status = this.residency.statusAgent(id);
           context.activity?.({ type: "entity", id, kind: "agent", name: status.name });
@@ -996,6 +1044,8 @@ export class AgentsProvider implements FabricProvider {
       }
       case "status": {
         const id = String(args.id);
+        const remote = this.#remoteProxy(id);
+        if (remote) return remote.observe(id, "taskStatus", 60_000, context.signal, context.deferResultConsumption);
         if (this.mainAgent.matches(id)) {
           if (this.mainAgent.local) return this.mainAgent.info(context.extensionContext);
           const root = await this.#router.resolveParticipantFresh(this.mainAgent.id);
@@ -1272,6 +1322,8 @@ export class AgentsProvider implements FabricProvider {
       }
       case "stop": {
         const id = String(args.id);
+        const remote = this.#remoteProxy(id);
+        if (remote) return remote.stop(id, context.signal);
         return this.#router.withStopDirectory(id, async () => {
           // Only canonical process-owned tasks/Main bypass actor classification.
           // Resident and foreign actors retain the root identity and request fence.
@@ -1871,6 +1923,10 @@ export class AgentsProvider implements FabricProvider {
     signal?: AbortSignal,
     verification?: "mesh" | "bridge",
   ): Promise<FabricControlAcceptance> {
+    if (command.operation === "taskComplete") return this.#remote().acceptCompletion(command, from, verification);
+    if (command.operation === "spawn" || command.operation.startsWith("task")) {
+      return { accepted: false, error: "Remote tasks must target an advertised resident owner", errorCode: "FABRIC_REMOTE_TASK_POLICY_REFUSED" };
+    }
     if (isProviderParticipantRef(command.targetId)) {
       return acceptProviderParticipantControl(this.providerParticipants, command);
     }

@@ -5,6 +5,7 @@
 const BLOCKING_ORCHESTRATION_REFS = new Set([
   "agents.run",
   "agents.wait",
+  "agents.result",
   "agents.join",
   "agents.ask",
   "jev.run",
@@ -21,7 +22,7 @@ export const isBlockingOrchestrationRef = (ref: string): boolean =>
 // agents.handoff is excluded because it only schedules work at the completed
 // outer fabric_exec boundary.
 const ORCHESTRATION_RE =
-  /\b(?:workflow\.agent|agents\.(?:run|wait|join|ask)|jev\.(?:run|wait|join)|programs\.run|council\.run|rlm\.query)\s*(?:<[^<>]*>)?\s*\(|(?<!\.)\bagent\s*(?:<[^<>]*>)?\s*\(/;
+  /\b(?:workflow\.agent|agents\.(?:run|wait|result|join|ask)|jev\.(?:run|wait|join)|programs\.run|council\.run|rlm\.query)\s*(?:<[^<>]*>)?\s*\(|(?<!\.)\bagent\s*(?:<[^<>]*>)?\s*\(/;
 
 export const codeUsesOrchestration = (code: string): boolean =>
   ORCHESTRATION_RE.test(code);

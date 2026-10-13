@@ -45,6 +45,10 @@ const GUEST_FABRIC_ERROR_NAMES: Readonly<Record<string, string>> = Object.freeze
   FABRIC_PROJECT_AGENT_UNRESOLVED: "FabricProjectAgentUnresolvedError",
   FABRIC_PROJECT_AGENT_AMBIGUOUS: "FabricProjectAgentAmbiguousError",
   FABRIC_PROJECT_LEAD_INVALID: "FabricProjectLeadInvalidError",
+  FABRIC_REMOTE_TASK_NO_OWNER: "RemoteTaskError",
+  FABRIC_REMOTE_TASK_BRIDGE_STALE: "RemoteTaskError",
+  FABRIC_REMOTE_TASK_POLICY_REFUSED: "RemoteTaskError",
+  FABRIC_REMOTE_TASK_LOST: "RemoteTaskError",
 });
 const guestFabricErrorMetadata = (error: unknown): Record<string, string | boolean> | undefined => {
   if (!(error instanceof Error)) return undefined;
@@ -557,6 +561,7 @@ globalThis.agents = Object.freeze({
   handoff: __handoff,
   spawn: (args) => __call("agents.spawn", args),
   wait: (args) => __call("agents.wait", args),
+  result: (args) => __call("agents.result", args),
   join: (args) => __call("agents.join", args),
   status: (args) => __call("agents.status", args),
   list: (args = {}) => __call("agents.list", args),

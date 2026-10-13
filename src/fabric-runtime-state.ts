@@ -1501,6 +1501,14 @@ export class FabricRuntimeState {
         return pending;
       },
     );
+    agentsProvider.onRemoteComplete = (result, recipient) => {
+      if (!this.#residency) throw new Error("Remote completion requires the Main's durable completion journal");
+      this.#residency.enqueueCompletion(result, recipient);
+    };
+    agentsProvider.onRemoteConsumed = id => {
+      completionInbox.acknowledge(id);
+      this.#residency?.acknowledgeCompletion(id, true);
+    };
     agentsProvider.providerParticipants = providerParticipants;
     this.#agentsProvider = agentsProvider;
     this.#control.start((command, from, signal, verification) =>

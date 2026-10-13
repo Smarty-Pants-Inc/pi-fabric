@@ -42,6 +42,7 @@ import { ActorSessionResetCancelledError } from "../actors/session-reset-error.j
 import type { FabricActorInfo } from "../actors/types.js";
 import type { StateProjector } from "../mesh/state-projector.js";
 import { AgentManager } from "../agents/manager.js";
+import { RemoteTaskOwner } from "../agents/remote-tasks.js";
 import { terminalRejectionFields, type AgentTerminalNotice } from "../agents/terminal-target.js";
 import { launchScope } from "../scope.js";
 import { useBudgetLedger } from "../agents/budget-ledger.js";
@@ -51,7 +52,7 @@ import { MeshStore, meshOutageAlarmSink, RUNTIME_MESH_READ_CACHE_MS, type MeshBa
 import { CommitOutbox, withStateFence } from "../mesh/commit-outbox.js";
 import { MeshBackgroundQueue, MeshBackgroundRetry } from "../core/atomic-write.js";
 import { isMeshWriteDeferred } from "../core/atomic-write.js";
-import { FabricControlPlane, controlOwnerIncarnation, controlActorBindingOptions, type FabricControlAcceptance, type FabricControlCommand } from "../topology/control-plane.js";
+import { FabricControlPlane, controlOwnerIncarnation, controlActorBindingOptions, isRemoteTaskOperation, type FabricControlAcceptance, type FabricControlCommand } from "../topology/control-plane.js";
 import { MeshConsumptionPausedError, assertMeshConsumption } from "../topology/mesh-consumption.js";
 import { ParticipantDirectory } from "../topology/participant-directory.js";
 import { hostLeasePath, readHostLeaseCurrent } from "../topology/host-leases.js";
@@ -241,6 +242,7 @@ export class ResidentHost {
   participants!: ParticipantDirectory;
   control!: FabricControlPlane;
   agents!: AgentManager;
+  #remoteTasks: RemoteTaskOwner | undefined;
   actors!: ActorDirectory;
   lifecycle!: LifecycleBroker;
   #lockFd: number | undefined;
@@ -427,6 +429,7 @@ export class ResidentHost {
       hostId: this.hostId,
       rootId: config.rootId,
       identity: this.identity,
+      ...(config.agents.hostCapabilities ? { taskCapabilities: config.agents.hostCapabilities } : {}),
       reapDeadHosts: false,                                    // its session's runtime sweeps
       presencePass: async () => {
         await rootPresenceAlarms(this.mesh, this.identity, this.hostId,
@@ -569,6 +572,7 @@ export class ResidentHost {
       onLifecycle: (event) => { if (this.lifecycle) this.#trackPublication(this.lifecycle.publishBackground(event)); },
       onTerminalNotice: notice => this.#deliverTerminalNotice(notice),
       onSettled: (result) => {
+        if (this.#remoteTasks?.remember(result)) this.#trackPublication(this.#retryDeliveries());
         this.#scheduleIdleCheck();
         // Only public durable task runs: actor activations are cleaned by their actor (review/astra on #136).
         if (result.actorId) return;
@@ -589,6 +593,10 @@ export class ResidentHost {
         } catch (error) { this.#publicationFailed = true; throw error; }
       },
       onBackgroundComplete: (result) => {
+        if (this.#remoteTasks?.owns(result.id)) {
+          this.#trackPublication(this.#retryDeliveries());
+          return;
+        }
         if (!config.agents.notifyOnComplete) return;
         const durationMs = Math.max(0, (result.finishedAt ?? Date.now()) - result.startedAt);
         const summary = (result.text || result.error || "no result").slice(0, COMPLETION_MAX_CHARS);
@@ -602,6 +610,7 @@ export class ResidentHost {
         ));
       },
     });
+    this.#remoteTasks = new RemoteTaskOwner(config.residencyRoot, this.hostId, this.agents, this.participants, this.control, config.agents);
     const canManageActor = (id: string, fresh = true): boolean | undefined => {
       const participant = this.participants.get(id, undefined, { fresh });
       return participant ? participant.ownerHostId === this.hostId : undefined;
@@ -1000,6 +1009,7 @@ export class ResidentHost {
   }
 
   async #handleControl(command: FabricControlCommand, from: MeshIdentity, signal?: AbortSignal, verification?: "mesh" | "bridge"): Promise<FabricControlAcceptance> {
+    if (isRemoteTaskOperation(command.operation)) return this.#remoteTasks!.accept(command, from, signal, verification);
     if (command.operation === "setModel" || command.operation === "setThinking") {
       return { accepted: false, error: "remote Main model changes are not supported yet; see smarty-dev#4153" };
     }
@@ -1243,8 +1253,11 @@ export class ResidentHost {
     // An empty maintenance retry is not delivery custody. Avoid creating a pending
     // promise on every request tick which can falsely restart the host idle window.
     if (this.#deliveryCommitsRecovered && (!fs.existsSync(this.#deliveryOutboxPath) ||
-        !fs.readdirSync(this.#deliveryOutboxPath).some(entry => entry.endsWith(".json")))) return Promise.resolve();
-    const flushing = this.#deliveryRetry.run(() => this.#flushDeliveries());
+        !fs.readdirSync(this.#deliveryOutboxPath).some(entry => entry.endsWith(".json"))) && !this.#remoteTasks?.pendingCompletions) return Promise.resolve();
+    const flushing = this.#deliveryRetry.run(async () => {
+      await this.#flushDeliveries();
+      await this.#remoteTasks?.flushCompletions();
+    });
     this.#flushingDeliveries = flushing;
     void flushing.finally(() => {
       if (this.#flushingDeliveries === flushing) this.#flushingDeliveries = undefined;
@@ -1570,7 +1583,7 @@ export class ResidentHost {
 
   #hasHostWork(): boolean {
     return this.#wakeRecoveryPending !== undefined || residentProcessWorkPending(this.processWorkSessionId) || this.#admissions > 0 || this.#boundaryRequests.size > 0 ||
-      this.#publicationFailed || this.actors.inFlightCount() > 0 ||
+      this.#publicationFailed || this.#remoteTasks?.pendingCompletions === true || this.actors.inFlightCount() > 0 ||
       this.agents.listForUi().some(agent => agent.status === "queued" || agent.status === "running") ||
       [this.#requestsPath, this.#processingPath].some(directory => {
         try { return fs.readdirSync(directory).some(entry => entry.endsWith(".json")); }

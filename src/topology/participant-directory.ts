@@ -442,7 +442,10 @@ const hostFromEntry = (entry: MeshStateEntry): FabricHostRecord | undefined => {
     (value.incarnationToken !== undefined && (typeof value.incarnationToken !== "string" || value.incarnationToken.length === 0)) ||
     typeof value.startedAt !== "number" ||
     typeof value.updatedAt !== "number" ||
-    typeof value.expiresAt !== "number"
+    typeof value.expiresAt !== "number" ||
+    (value.taskCapabilities !== undefined && (!Array.isArray(value.taskCapabilities) || value.taskCapabilities.length > 32 ||
+      value.taskCapabilities.some(token => typeof token !== "string" || !/^[a-z0-9._-]{1,64}$/.test(token) || token === "local"))) ||
+    (value.ownerIncarnation !== undefined && (typeof value.ownerIncarnation !== "string" || !value.ownerIncarnation || value.ownerIncarnation.length > 128))
   ) {
     return undefined;
   }
@@ -627,6 +630,8 @@ export interface ParticipantDirectoryOptions {
   hostId: string;
   rootId: string;
   identity: MeshIdentity;
+  /** Loaded resident capability advertisement, never a source-provided participant field. */
+  taskCapabilities?: string[];
   onRootCollision?: (collision: FabricRootCollision) => void;
   selfOwnerHostId?: string;
   selfOwnerIdentityId?: string;
@@ -1525,6 +1530,12 @@ export class ParticipantDirectory implements FabricParticipantSource {
   ): { remoteHost: string; expiresAt: number } | undefined {
     if (!this.options.enabled || ownerIdentityId === undefined) return undefined;
     const read = { fresh: true };
+    // Remote task proxies control the resident itself: task participants do not cross
+    // the root-only bridge. Require its loaded advertisement, not a payload host name.
+    if (targetId === ownerHostId && ownerHostId.startsWith("resident:")) {
+      const owner = this.taskOwners().find(host => host.id === ownerHostId && host.identity.id === ownerIdentityId);
+      return owner?.remoteHost ? { remoteHost: owner.remoteHost, expiresAt: owner.expiresAt } : undefined;
+    }
     const entry = this.#participantEntry(keyFor(PARTICIPANT_PREFIX, targetId), read);
     const participant = entry ? participantFromEntry(entry) : undefined;
     if (
@@ -1869,6 +1880,14 @@ export class ParticipantDirectory implements FabricParticipantSource {
       local: (this.options.selfOwnerHostId ?? this.options.hostId) === this.options.hostId,
       stale: false,
     };
+  }
+
+  taskOwners(): Array<FabricHostRecord & { stale: boolean }> {
+    const now = Date.now();
+    return [...this.#liveHosts(this.mesh.listAll(HOST_PREFIX, { fresh: true })).values()]
+      .filter(host => host.id.startsWith("resident:") && host.identity.id === host.id && host.identity.kind === "agent" &&
+        host.taskCapabilities?.length && host.ownerIncarnation && !(host.remoteHost && host.id === this.options.hostId))
+      .map(host => ({ ...host, stale: !Number.isFinite(host.expiresAt) || host.expiresAt <= now }));
   }
 
   sessions(now = Date.now()): FabricParticipantInfo[] {
@@ -2495,6 +2514,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
           identity: this.options.identity,
           startedAt: this.#startedAt,
           incarnationToken: this.#incarnationToken,
+          ...(this.options.taskCapabilities?.length ? { taskCapabilities: [...this.options.taskCapabilities], ownerIncarnation: this.ownerIncarnation } : {}),
           updatedAt: leaseAt,
           expiresAt: this.#reloadUntil ?? leaseAt + this.#leaseMs,
         }),

@@ -11,6 +11,7 @@ export function createAgentServiceHandler(service: AgentService, callerId: strin
     switch (action) {
       case "run": return service.run(callerId, args as unknown as AgentServiceRequest, signal);
       case "spawn": return service.spawn(callerId, args as unknown as AgentServiceRequest, signal);
+      case "result":
       case "join":
       case "wait": return service.wait(callerId, args.id as string, signal, args.timeoutMs as number | undefined);
       case "status": return service.status(callerId, args.id as string);
@@ -39,6 +40,7 @@ export function createAgentServiceClient(dispatch: AgentServiceDispatcher, capab
     run: (request, signal) => record("run", request as unknown as Record<string, unknown>, signal),
     spawn: (request, signal) => record("spawn", request as unknown as Record<string, unknown>, signal),
     wait: (id, signal, timeoutMs) => record("wait", {id, ...(timeoutMs !== undefined ? {timeoutMs} : {})}, signal),
+    result: (id, signal, timeoutMs) => record("result", {id, ...(timeoutMs !== undefined ? {timeoutMs} : {})}, signal),
     join: (id, signal, timeoutMs) => record("wait", {id, ...(timeoutMs !== undefined ? {timeoutMs} : {})}, signal),
     status: (id) => record("status", {id}),
     list: () => dispatch("list", {}) as Promise<AgentPublicRecord[]>,

@@ -1,4 +1,5 @@
 import { appendDeliveryOutcome, type DeliverySend } from "../mesh/delivery-outcomes.js";
+import { isRemoteTaskErrorCode, RemoteTaskError, type RemoteTaskErrorCode } from "../agents/remote-task-errors.js";
 import type { MeshControlIncarnationFence } from "../config.js";
 import { FabricParticipantStaleError, participantLeaseGraceMs } from "./host-leases.js";
 import { retryDelayMs } from "../core/retry-backoff.js";
@@ -87,12 +88,22 @@ const SHARED_SEEN_GRACE_MS = 10 * 60 * 1_000;
 export const CONTROL_CLAIMS_POLICY_KEY = "topology/control-claims";
 
 // Legacy Main setter wire names remain parseable only so owners can refuse them clearly.
-export type FabricControlOperation = "steer" | "followUp" | "stop" | "ask" | "cancel" | "setModel" | "setThinking";
+export type FabricControlOperation = "steer" | "followUp" | "stop" | "ask" | "cancel" | "setModel" | "setThinking" |
+  "spawn" | "taskStatus" | "taskWait" | "taskResult" | "taskStop" | "taskComplete";
+
+export const isRemoteTaskOperation = (operation: string): boolean =>
+  ["spawn", "taskStatus", "taskWait", "taskResult", "taskStop", "taskComplete"].includes(operation);
+const commandBinding = (command: FabricControlCommand): string => createHash("sha256")
+  .update(JSON.stringify([command.operation, command.targetId, command.replyTo, command.data])).digest("hex");
+const interruptedAcceptance = (operation: FabricControlOperation): FabricControlAcceptance => ({
+  accepted: false, error: "Fabric control outcome is indeterminate after owner restart; do not replay accepted work",
+  ...(isRemoteTaskOperation(operation) ? { errorCode: "FABRIC_REMOTE_TASK_LOST" as const } : {}),
+});
 
 // Keep the reader free to deliver cancellation while asynchronous work waits at its
 // commit fence. These commands own their handler and outcome/ACK retries after the cursor.
 const detachedControlOperation = (operation: FabricControlOperation): boolean =>
-  operation === "ask";
+  operation === "ask" || isRemoteTaskOperation(operation);
 
 export interface FabricControlCommand {
   /** Hydrated from the mesh envelope, never caller data. */
@@ -124,6 +135,8 @@ export interface FabricControlCommand {
   deadlineAt?: number;
   /** The command event's host stamp, copied by the receiving owner; never read from command data. */
   sender?: FabricMessageSender;
+  /** Receiver-hydrated bridge origin; model-supplied data never grants it. */
+  senderRemoteHost?: string;
 }
 
 import type { FabricInterruptErrorCode } from "../interrupt-authority.js";
@@ -149,7 +162,7 @@ export interface FabricControlAcceptance {
   replacedMessageId?: string;
   result?: unknown;
   error?: string;
-  errorCode?: typeof CONTROL_STALE_INCARNATION | FabricInterruptErrorCode;
+  errorCode?: typeof CONTROL_STALE_INCARNATION | FabricInterruptErrorCode | RemoteTaskErrorCode;
   /** The owner proves the handler did not run for this command, so a new command cannot deliver twice. */
   notRun?: true;
 }
@@ -253,7 +266,8 @@ const commandFromEvent = (event: MeshEvent): FabricControlCommand | undefined =>
       data.operation !== "ask" &&
       data.operation !== "cancel" &&
       data.operation !== "setModel" &&
-      data.operation !== "setThinking") ||
+      data.operation !== "setThinking" &&
+      !isRemoteTaskOperation(String(data.operation))) ||
     typeof data.replyTo !== "string" ||
     typeof data.requestedAt !== "number" ||
     (data.requestCreatedAt !== undefined &&
@@ -276,10 +290,11 @@ const commandFromEvent = (event: MeshEvent): FabricControlCommand | undefined =>
   }
   // Sender diagnostics are never evidence. Derive only from the admitted envelope.
   // A sender stamp is host-set on the event; a payload-supplied one is forged and dropped.
-  const { sender: _forged, ...command } = data;
+  const { sender: _forged, senderRemoteHost: _forgedRemote, ...command } = data;
+  const senderRemoteHost = event.verification === "bridge" && isObject(data.bridge) && typeof data.bridge.from === "string" ? data.bridge.from : undefined;
   const wakeCause = data.operation === "steer" || data.operation === "followUp"
     ? fabricWakeCause(event.from, data.operation, event.topic, event.id) : undefined;
-  return withFabricWakeAdmission({ ...command, eventId: event.id, wakeCause, principal: event.verification === "mesh" || event.verification === "bridge"
+  return withFabricWakeAdmission({ ...command, ...(senderRemoteHost ? { senderRemoteHost } : {}), eventId: event.id, wakeCause, principal: event.verification === "mesh" || event.verification === "bridge"
     ? copyFabricPrincipal(event.principal) : undefined, ...(event.sender ? { sender: event.sender } : {}) } as unknown as FabricControlCommand, wakeCause ? [wakeCause] : []);
 };
 
@@ -296,6 +311,9 @@ interface FabricControlSeenRecord {
   /** The command event's sequence, or an upper bound for a record moved from the shared state. */
   sequence?: number;
   acceptance?: FabricControlAcceptance;
+  /** Remote task receipts are bound to the authenticated sender and unchanged input. */
+  requesterId?: string;
+  inputBinding?: string;
 }
 
 const controlSeenRecord = (value: unknown): FabricControlSeenRecord | undefined => {
@@ -803,12 +821,13 @@ export class FabricControlPlane {
         if (acknowledged.errorCode === CONTROL_STALE_INCARNATION) {
           throw new FabricControlStaleIncarnationError(targetId);
         }
+        if (isRemoteTaskErrorCode(acknowledged.errorCode)) throw new RemoteTaskError(acknowledged.errorCode, error);
         throw new FabricControlRejection(
           acknowledged.notRun === true && error === CONTROL_COMMAND_EXPIRED
             ? `${error}; not delivered, safe to resend.`
             : error,
           acknowledged.notRun === true,
-          acknowledged.errorCode,
+          acknowledged.errorCode as FabricInterruptErrorCode | undefined,
         );
       }
       return { commandId, acceptance: acknowledged };
@@ -1152,7 +1171,7 @@ export class FabricControlPlane {
       ...(typeof event.data.error === "string" ? { error: event.data.error } : {}),
       ...(event.data.accepted === false && event.data.errorCode === CONTROL_STALE_INCARNATION
         ? { errorCode: CONTROL_STALE_INCARNATION } : {}),
-      ...(event.data.errorCode === "FABRIC_INTERRUPT_NOT_AUTHORIZED" || event.data.errorCode === "FABRIC_INTERRUPT_RATE_LIMITED"
+      ...(event.data.errorCode === "FABRIC_INTERRUPT_NOT_AUTHORIZED" || event.data.errorCode === "FABRIC_INTERRUPT_RATE_LIMITED" || isRemoteTaskErrorCode(event.data.errorCode)
         ? { errorCode: event.data.errorCode } : {}),
       ...(event.data.accepted !== true && event.data.notRun === true ? { notRun: true as const } : {}),
     });
@@ -1174,9 +1193,19 @@ export class FabricControlPlane {
     assertMeshConsumption(this.options.canConsumeMesh);
     const command = commandFromEvent(event);
     if (!command) return;
+    if (isRemoteTaskOperation(command.operation) && command.replyTo !== event.from.id) {
+      await this.#publishAcknowledgement({ ...command, replyTo: event.from.id }, {
+        accepted: false, error: "Remote task reply address must be the authenticated sender", errorCode: "FABRIC_REMOTE_TASK_POLICY_REFUSED",
+      });
+      return;
+    }
     const ownedKey = controlSeenKey(this.options.hostId, command.commandId);
     const owned = this.#ownedCommands.get(ownedKey);
     if (owned) {
+      if (isRemoteTaskOperation(command.operation) && (owned.event.from.id !== event.from.id || commandBinding(commandFromEvent(owned.event)!) !== commandBinding(command))) {
+        await this.#publishAcknowledgement(command, { accepted: false, error: "Remote task retry key has different sender or input", errorCode: "FABRIC_REMOTE_TASK_POLICY_REFUSED" });
+        return;
+      }
       if (!owned.running) await this.#runOwnedCommand(ownedKey, owned);
       return;
     }
@@ -1207,9 +1236,11 @@ export class FabricControlPlane {
     if (duplicate) {
       if (duplicate.hostId === this.options.hostId && duplicate.commandId === command.commandId &&
         duplicate.targetId === command.targetId) {
-        await this.#publishAcknowledgement(command, duplicate.acceptance ?? {
-          accepted: false, error: "Fabric control outcome is indeterminate after owner restart",
-        }, duplicate.ownerIncarnation ?? null);
+        if (isRemoteTaskOperation(command.operation) && (duplicate.requesterId !== event.from.id || duplicate.inputBinding !== commandBinding(command))) {
+          await this.#publishAcknowledgement(command, { accepted: false, error: "Remote task retry key has different sender or input", errorCode: "FABRIC_REMOTE_TASK_POLICY_REFUSED" });
+          return;
+        }
+        await this.#publishAcknowledgement(command, duplicate.acceptance ?? interruptedAcceptance(command.operation), duplicate.ownerIncarnation ?? null);
       }
       return;
     }
@@ -1237,7 +1268,7 @@ export class FabricControlPlane {
       const ownRecord = (record: FabricControlSeenRecord | undefined) =>
         record?.hostId === this.options.hostId && record.commandId === command.commandId &&
           record.targetId === command.targetId ? record : undefined;
-      const indeterminate = { accepted: false, error: "Fabric control outcome is indeterminate after owner restart" };
+      const indeterminate = interruptedAcceptance(command.operation);
       const local = ownRecord(controlSeenRecord(this.#seen.get(key)?.value));
       let acceptance: FabricControlAcceptance;
       let outcomeIncarnation: string | null = this.incarnation;
@@ -1288,6 +1319,7 @@ export class FabricControlPlane {
           commandId: command.commandId,
           targetId: command.targetId,
           ownerIncarnation: this.incarnation,
+          ...(isRemoteTaskOperation(command.operation) ? { requesterId: event.from.id, inputBinding: commandBinding(command) } : {}),
           expiresAt: deadlineAt + this.#ackTimeoutMs,
           ...(command.deadlineAt !== undefined ? { explicitDeadline: true } : {}),
         } satisfies FabricControlSeenRecord,
@@ -1303,6 +1335,7 @@ export class FabricControlPlane {
           commandId: command.commandId,
           targetId: command.targetId,
           ownerIncarnation: this.incarnation,
+          ...(isRemoteTaskOperation(command.operation) ? { requesterId: event.from.id, inputBinding: commandBinding(command) } : {}),
           expiresAt: deadlineAt + this.#ackTimeoutMs,
         } satisfies FabricControlSeenRecord,
         identity: this.identity,
@@ -1319,10 +1352,9 @@ export class FabricControlPlane {
       ) {
         await this.#publishAcknowledgement(
           command,
-          raced.acceptance ?? {
-            accepted: false,
-            error: "Fabric control outcome is indeterminate after concurrent claim",
-          },
+          isRemoteTaskOperation(command.operation) && (raced.requesterId !== event.from.id || raced.inputBinding !== commandBinding(command))
+            ? { accepted: false, error: "Remote task retry key has different sender or input", errorCode: "FABRIC_REMOTE_TASK_POLICY_REFUSED" }
+            : raced.acceptance ?? interruptedAcceptance(command.operation),
           raced.ownerIncarnation ?? null,
         );
       }
@@ -1422,6 +1454,7 @@ export class FabricControlPlane {
         acceptance = {
           accepted: false,
           error: error instanceof Error ? error.message : String(error),
+          ...(error instanceof RemoteTaskError ? { errorCode: error.code } : {}),
         };
       }
       acceptance = this.#boundedAcceptance(acceptance);
@@ -1435,6 +1468,7 @@ export class FabricControlPlane {
             commandId: command.commandId,
             targetId: command.targetId,
             ownerIncarnation: this.incarnation,
+            ...(isRemoteTaskOperation(command.operation) ? { requesterId: from.id, inputBinding: commandBinding(command) } : {}),
             expiresAt: Math.max(deadlineAt, Date.now()) + this.#ackTimeoutMs,
             sequence,
             acceptance,
@@ -1468,7 +1502,9 @@ export class FabricControlPlane {
         try {
           const retained = await this.#seen.put({ key, identity: this.identity, ifVersion: owned.claimVersion,
             value: { format: 1, hostId: this.options.hostId, commandId: command.commandId,
-              targetId: command.targetId, ownerIncarnation: this.incarnation, expiresAt: Math.max(deadlineAt, Date.now()) + this.#ackTimeoutMs,
+              targetId: command.targetId, ownerIncarnation: this.incarnation,
+              ...(isRemoteTaskOperation(command.operation) ? { requesterId: from.id, inputBinding: commandBinding(command) } : {}),
+              expiresAt: Math.max(deadlineAt, Date.now()) + this.#ackTimeoutMs,
               acceptance: owned.acceptance } satisfies FabricControlSeenRecord });
           owned.claimVersion = retained.version;
         } catch { /* The owned in-memory outcome and durable claim remain; never replay. */ }

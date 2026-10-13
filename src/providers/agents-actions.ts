@@ -16,7 +16,7 @@ const RUNNER_ID_SOURCE = "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$";
 const runProperties = {
   task: { type: "string", description: "A self-contained task for the child agent" },
   name: { type: "string" },
-  needs: { type: "array", items: { type: "string", minLength: 1 }, description: "Required placement target capabilities, NFKC-normalized then lowercased and split on commas/Unicode White_Space; tokens must match [a-z0-9._-], canonical local always pins to the Main host, and any unmet need stays local and is audited." },
+  needs: { type: "array", items: { type: "string", minLength: 1 }, description: "Required host capabilities, NFKC-normalized then lowercased and split on commas/Unicode White_Space; tokens must match [a-z0-9._-]. For spawn by a lead Main, unmet nonlocal needs select a capable bridged resident or fail typed; canonical local always pins to the Main host. Legacy run/launcher placement keeps its local fallback rules." },
   requires: { type: "array", maxItems: MAX_AGENT_REQUIRED_INPUTS, items: { type: "string", minLength: 1, maxLength: MAX_AGENT_REQUIRED_INPUT_BYTES }, description: "Literal absolute selected-host input paths, each at most 4096 UTF-8 bytes, without dot/dot-dot segments, line breaks or control characters. Local process spawns check existence before starting; unsupported transports refuse requires with AgentInputError; remote launches preflight via repeated --require PATH arguments." },
   runner: {
     type: "string",
@@ -192,7 +192,7 @@ const spawnSchema = {
   properties: {
     ...runProperties, residency: residencySchema,
     complexity: { type: "string", enum: ["simple", "normal", "complex", "delicate"], description: "Caller complexity hint for the optional host spawn router; delicate is a distinct delicate-code class, never mapped to complex or inferred from task text." },
-    idempotencyKey: residentIdempotencyKeySchema,
+    idempotencyKey: { ...residentIdempotencyKeySchema, description: "Retry key. Remote capability spawns persist the same-key unchanged-input route/outcome across caller and owner restarts; interrupted owner claims return FABRIC_REMOTE_TASK_LOST, never replay. Local durable spawn keys remain host-local/bounded as described for actor creation." },
     model: { ...runProperties.model, description: `${strictModelProperty.description} \"auto\" records a finite Choice; trusted liveClasses can launch it, otherwise the child runs pinModel/pinThinking.` },
     pinModel: { type: "string", description: "Role's required Pi model pin; overrides agents.modelRouting.pinModel." },
     pinThinking: { ...runProperties.thinking, description: "Role's required effort pin; overrides agents.modelRouting.pinThinking. Never inferred from the default medium effort." },
@@ -320,6 +320,13 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
   {
     name: "wait",
     description: "Wait for a previously spawned child agent and acknowledge its result, suppressing a duplicate completion notification. Bounded by timeoutMs (default and at most 5 min): a child still running then keeps running, the wait throws, and its result arrives as a completion message after the turn",
+    effect: { kind: "emission", ordering: "commutative", resources: ["agents.completions"] },
+    inputSchema: waitSchema,
+    risk: "read",
+  },
+  {
+    name: "result",
+    description: "Alias for agents.wait: retrieve a spawned task's final result with the same bounded observation and completion-consumption behavior, including remote capability task proxies",
     effect: { kind: "emission", ordering: "commutative", resources: ["agents.completions"] },
     inputSchema: waitSchema,
     risk: "read",

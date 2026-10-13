@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { writeFileAtomic } from "../core/atomic-write.js";
-import { withTaskControlDirectory } from "./terminal-answer.js";
+import { readTaskControlJson, MAX_TASK_CONTROL_ROWS, FabricTaskControlDirectoryError, withTaskControlDirectory } from "./terminal-answer.js";
 import { copyFabricProvenance, type FabricTurnProvenance } from "../fabric-provenance.js";
 
 export interface TerminalControl {
@@ -25,9 +25,10 @@ export const trackTerminalControl = (directory: string, control: Omit<TerminalCo
   writeFileAtomic(file, JSON.stringify({ ...control, state: "queued" }), { durable: true });
 });
 export const readTerminalControl = (directory: string, id: string): TerminalControl | undefined => {
+  if (!validId(id)) return;
   try {
-    const item = withTaskControlDirectory(directory, pinned => JSON.parse(fs.readFileSync(controlFile(pinned, id), "utf8")));
-    if (item.id === id && ["steer", "followUp"].includes(item.delivery) && ["queued", "delivered", "refused"].includes(item.state)) {
+    const item = readTaskControlJson<any>(directory, path.join("terminal-controls", id + ".json"));
+    if (item?.id === id && ["steer", "followUp"].includes(item.delivery) && ["queued", "delivered", "refused"].includes(item.state)) {
       return { id, delivery: item.delivery, state: item.state, provenance: copyFabricProvenance(item.provenance),
         ...(item.state === "refused" && item.reason === "run-ended" ? { reason: "run-ended" as const } : {}) };
     }
@@ -41,10 +42,19 @@ export const settleTerminalControl = (directory: string, id: string, state: "del
 };
 export const queuedTerminalControls = (directory: string): TerminalControl[] => {
   try {
-    return withTaskControlDirectory(directory, pinned => fs.readdirSync(path.join(pinned, "terminal-controls"))).flatMap(name => {
-      if (!name.endsWith(".json") || !validId(name.slice(0, -5))) return [];
-      const item = readTerminalControl(directory, name.slice(0, -5));
-      return item?.state === "queued" ? [item] : [];
+    return withTaskControlDirectory(directory, pinned => {
+      const entries = fs.opendirSync(path.join(pinned, "terminal-controls"), { bufferSize: 32 }), queued: TerminalControl[] = [];
+      let count = 0;
+      try {
+        for (;;) {
+          const entry = entries.readSync();
+          if (!entry) return queued;
+          if (++count > MAX_TASK_CONTROL_ROWS) throw new FabricTaskControlDirectoryError("Terminal control registry exceeds its entry bound");
+          if (!entry.isFile() || !entry.name.endsWith(".json") || !validId(entry.name.slice(0, -5))) continue;
+          const item = readTerminalControl(directory, entry.name.slice(0, -5));
+          if (item?.state === "queued") queued.push(item);
+        }
+      } finally { entries.closeSync(); }
     });
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];

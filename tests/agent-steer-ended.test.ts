@@ -1,12 +1,13 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { spawnSync } from "node:child_process";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agents/manager.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { writeJsonAtomic } from "../src/core/atomic-write.js";
-import { saveFinalAnswerReceipt, taskControlDirectory, taskSteerFile } from "../src/worker/terminal-answer.js";
+import { MAX_TASK_CONTROL_BYTES, saveFinalAnswerReceipt, taskControlDirectory, taskSteerFile } from "../src/worker/terminal-answer.js";
 import type { AgentRunRecord } from "../src/agents/types.js";
 import { FabricSteerAdmissionLimitError, type AgentTerminalNotice } from "../src/agents/terminal-target.js";
 import { MAX_STEER_BYTES, MAX_STEER_CONTROLS, MAX_PUBLIC_REFUSALS, readTerminalAdmissions } from "../src/agents/terminal-notices.js";
@@ -155,7 +156,11 @@ describe("steer/followUp after an ordinary Pi task's final answer", () => {
       if (file === taskSteerFile(directory)) throw new Error("unbounded admission read");
       return (read as any)(file, ...args);
     }) as typeof fs.readFileSync);
-    const streaming = vi.spyOn(fs, "readSync");
+    const readChunk = fs.readSync; let journalChunks = 0;
+    const streaming = vi.spyOn(fs, "readSync").mockImplementation(((fd: number, buffer: Buffer, offset: number, length: number, position: number) => {
+      if (fs.fstatSync(fd).ino === fs.statSync(taskSteerFile(directory)).ino) journalChunks++;
+      return readChunk(fd, buffer, offset, length, position);
+    }) as typeof fs.readSync);
     const status = manager.status(handle.id);
     expect(status.undeliveredMessages).toHaveLength(MAX_PUBLIC_REFUSALS);
     expect(status).toMatchObject({ undeliveredMessagesTotal: 256, undeliveredMessagesTruncated: true });
@@ -163,7 +168,7 @@ describe("steer/followUp after an ordinary Pi task's final answer", () => {
     expect(new Set(notices.map(notice => notice.messageId))).toEqual(new Set(admitted));
     expect(notices.every(notice => notice.sender?.id === sender.id)).toBe(true);
     // One <=1MiB stream pass shared by scan, view and routing, not N full reads.
-    expect(streaming.mock.calls.length).toBeLessThanOrEqual(Math.ceil(fs.statSync(taskSteerFile(directory)).size / (16 * 1024)) + 1);
+    expect(journalChunks).toBeLessThanOrEqual(Math.ceil(fs.statSync(taskSteerFile(directory)).size / (16 * 1024)) + 1);
     journalReads.mockRestore(); streaming.mockRestore();
     const elapsedMs = performance.now() - started, heapGrowth = process.memoryUsage().heapUsed - heap;
     expect(elapsedMs).toBeLessThan(20000);
@@ -171,6 +176,45 @@ describe("steer/followUp after an ordinary Pi task's final answer", () => {
     console.log(JSON.stringify({ proof: "5000 admission attempts", admitted: admitted.length, refused, routed: notices.length, publicEntries: status.undeliveredMessages?.length,
       total: status.undeliveredMessagesTotal, truncated: status.undeliveredMessagesTruncated, elapsedMs, heapGrowth }));
   }, 30000);
+
+  it.each(process.platform === "win32" ? ["oversized"] : ["fifo", "oversized"])("manager final-state scan refuses a %s registry without blocking or inventing delivery", async fault => {
+    const h = harness(), handle = await h.manager.spawn({ task: "bounded scan", transport: "process" });
+    const sent = h.manager.steer(handle.id, "unconsumed", undefined, provenance);
+    const controls = path.join(taskControlDirectory(path.join(h.root, handle.id)), "terminal-controls"); fs.mkdirSync(controls);
+    const file = path.join(controls, sent.messageId + ".json");
+    if (fault === "fifo") expect(spawnSync("mkfifo", [file]).status).toBe(0);
+    else fs.writeFileSync(file, "x".repeat(MAX_TASK_CONTROL_BYTES + 1));
+    h.finish(handle.id, "done");
+    const start = performance.now();
+    expect(() => h.manager.status(handle.id)).not.toThrow();
+    expect(performance.now() - start).toBeLessThan(1000);
+    expect(h.notices).toEqual([]); h.close(handle.id);
+  });
+
+  const failedQueuedLaunch = async (recorded: boolean) => {
+    const h = harness(), first = await h.manager.spawn({ task: "occupy capacity", transport: "process" });
+    const queued = await h.manager.spawn({ task: "queued launch fails", transport: "process" });
+    expect(queued.status).toBe("queued");
+    const directory = path.join(h.root, queued.id), control = taskControlDirectory(directory);
+    h.launch.mockImplementationOnce(async () => {
+      expect(fs.existsSync(control)).toBe(true);
+      expect(fs.existsSync(path.join(directory, "status.json"))).toBe(false);
+      throw new Error("fixture launch failed after ctl creation");
+    });
+    const remove = recorded ? vi.spyOn(fs, "rmSync").mockImplementation(() => undefined) : undefined;
+    h.finish(first.id, "done"); h.close(first.id);
+    const result = await h.manager.wait(queued.id, { timeoutMs: 5000 });
+    expect(result).toMatchObject({ status: "failed", error: expect.stringContaining("after ctl creation") });
+    if (remove) {
+      expect(remove.mock.calls.map(call => call[0]).filter(target => target === control || target === directory)).toEqual([control, directory]);
+      expect(fs.existsSync(control)).toBe(true); expect(fs.existsSync(directory)).toBe(true);
+      remove.mockRestore();
+    } else {
+      expect(fs.existsSync(control)).toBe(false); expect(fs.existsSync(directory)).toBe(false);
+    }
+  };
+  it("records paired cleanup after a queued launch fails between ctl creation and status", () => failedQueuedLaunch(true));
+  it("CI-only: failed queued launch removes both run and ctl", () => failedQueuedLaunch(false));
 
   it("records paired ctl/run cleanup together without deleting either fixture", async () => {
     const { manager, root, finish, close } = harness(false);

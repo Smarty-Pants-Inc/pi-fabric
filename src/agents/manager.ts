@@ -100,7 +100,7 @@ import type {
 import { FOLLOW_UP_RUNNING_TASK_MESSAGE, type AgentAdmissionAlarm, type AgentFollowUpAlarm, type AgentFollowUpDelivery } from "./types.js";
 import { followUpFile, followUpState, settleFollowUp, releaseFollowUpPayload } from "./follow-up-delivery.js";
 import { createRunRouteMetadata } from "../worker/run-record.js";
-import { readFinalAnswerReceipt, taskControlDirectory, taskSteerFile, withTaskControlDirectory, FabricTaskControlDirectoryError, type FinalAnswerReceipt } from "../worker/terminal-answer.js";
+import { readFinalAnswerReceipt, readTaskControlJson, taskControlDirectory, taskSteerFile, withTaskControlDirectory, FabricTaskControlDirectoryError, type FinalAnswerReceipt } from "../worker/terminal-answer.js";
 import { FabricTargetTerminalError, FabricSteerAdmissionLimitError, type AgentTerminalNotice } from "./terminal-target.js";
 import { TerminalNoticeOutbox, appendTerminalAdmission, readTerminalAdmission, readTerminalAdmissions, readUndeliveredMessage, readUndeliveredMessageView, MAX_STEER_CONTROLS, MAX_STEER_BYTES, MAX_STEER_ENTRY_BYTES, terminalControlMatchesAdmission, terminalSenderMatches } from "./terminal-notices.js";
 import type { AgentRunRouteMetadata } from "./types.js";
@@ -1562,6 +1562,7 @@ export class AgentManager {
           : undefined;
         this.#assertTaskControlRoot(runDirectory, agentCwd, writePolicy);
         mkdirPrivate(taskControlDirectory(runDirectory), this.#trustRoot());
+        if (process.platform !== "win32") withTaskControlDirectory(runDirectory, (_directory, fd) => fs.fsyncSync(fd));
         const parentSessionId = this.#sessionId?.();
         const parentRunId = this.#parentLineage?.runId ?? (this.#currentDepth > 0 ? process.env.PI_FABRIC_PARENT_RUN : undefined);
         const lineage: FabricAgentLineage = {
@@ -2288,7 +2289,7 @@ export class AgentManager {
             startedAt: queued.terminal.startedAt, updatedAt: queued.terminal.updatedAt, finishedAt: queued.terminal.finishedAt }, { durable: true });
           try {
             fs.rmSync(path.join(directory, "queued-result.json"), { force: true });
-            fs.rmSync(directory, { recursive: true, force: true });
+            this.#removeRunTreeSync(directory);
           } catch { /* Its committed terminal state is collectible later. */ }
         }
         queued.outcomeSaved = true;
@@ -3542,15 +3543,19 @@ export class AgentManager {
     return new FabricTargetTerminalError(managed.id, managed.finalAnswer!.id, managed.finalAnswerResult?.status ?? "final-answer-pending");
   }
 
-  async #removeRunTree(runDirectory: string): Promise<void> {
+  #runDeletionPaths(runDirectory: string): string[] {
     const control = taskControlDirectory(runDirectory);
     // Remove the paired host metadata first: failure retains the run, and a
     // later run-removal failure never leaves an orphan control directory.
-    if (fs.existsSync(control)) {
-      withTaskControlDirectory(runDirectory, () => undefined);
-      await removeTree(control);
-    }
-    await removeTree(runDirectory);
+    if (!fs.existsSync(control)) return [runDirectory];
+    withTaskControlDirectory(runDirectory, () => undefined);
+    return [control, runDirectory];
+  }
+  #removeRunTreeSync(runDirectory: string): void {
+    for (const directory of this.#runDeletionPaths(runDirectory)) fs.rmSync(directory, { recursive: true, force: true });
+  }
+  async #removeRunTree(runDirectory: string): Promise<void> {
+    for (const directory of this.#runDeletionPaths(runDirectory)) await removeTree(directory);
   }
 
   #assertTaskControlRoot(runDirectory: string, cwd: string, policy: FabricWritePolicy | undefined): void {
@@ -3752,7 +3757,7 @@ export class AgentManager {
           if (this.#onStoppedAtClose) for (const result of results) {
             const directory = path.join(this.#runRoot, result.id);
             this.#commitArchive(directory, result, "shutdown");
-            if (this.#queued.has(result.id) && !this.#queued.get(result.id)?.routeSaveFailure && !fs.existsSync(path.join(directory, "status.json"))) fs.rmSync(directory, { recursive: true, force: true });
+            if (this.#queued.has(result.id) && !this.#queued.get(result.id)?.routeSaveFailure && !fs.existsSync(path.join(directory, "status.json"))) this.#removeRunTreeSync(directory);
           }
           break;
         }
@@ -4413,7 +4418,7 @@ export class AgentManager {
     const admission = readTerminalAdmission(managed.runDirectory, notice.messageId);
     if (!admission || admission.delivery !== notice.delivery) return;
     try {
-      const control = JSON.parse(fs.readFileSync(path.join(taskControlDirectory(managed.runDirectory), "terminal-controls", `${notice.messageId}.json`), "utf8"));
+      const control = readTaskControlJson<any>(managed.runDirectory, path.join("terminal-controls", `${notice.messageId}.json`));
       if (control?.state === "delivered" && terminalControlMatchesAdmission(control, admission)) return;
     } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
     // Worker event fields cannot select the recipient. Verify supplied attribution
@@ -4442,7 +4447,7 @@ export class AgentManager {
     const admissions = readTerminalAdmissions(managed.runDirectory);
     for (const admission of admissions.byId.values()) {
       let state: { state?: string } | undefined;
-      try { state = JSON.parse(fs.readFileSync(path.join(taskControlDirectory(managed.runDirectory), "terminal-controls", `${admission.id}.json`), "utf8")); }
+      try { state = readTaskControlJson(managed.runDirectory, path.join("terminal-controls", `${admission.id}.json`)); }
       catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
       if (state?.state === "delivered" && terminalControlMatchesAdmission(state, admission)) continue;
       // Refused registry entries may already have emitted a worker notice. The

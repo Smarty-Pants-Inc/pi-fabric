@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { writeJsonAtomic } from "../core/atomic-write.js";
-import { readFinalAnswerReceipt, taskControlDirectory, withTaskControlDirectory } from "../worker/terminal-answer.js";
+import { readFinalAnswerReceipt, readTaskControlJson, openTaskControlFile, taskControlFileStat, MAX_TASK_CONTROL_ROWS, taskControlDirectory, withTaskControlDirectory } from "../worker/terminal-answer.js";
 import { FabricSteerAdmissionLimitError, type AgentTerminalNotice, type AgentUndeliveredMessage } from "./terminal-target.js";
 import { followUpFile, releaseFollowUpPayload, settleFollowUp } from "./follow-up-delivery.js";
 import { copyFabricProvenance, type FabricTurnProvenance } from "../fabric-provenance.js";
@@ -42,7 +42,7 @@ export const terminalControlMatchesAdmission = (value: unknown, admission: Termi
   return terminalSenderMatches(provenance?.sender, admission.sender);
 };
 
-export const MAX_STEER_CONTROLS = 256;
+export const MAX_STEER_CONTROLS = MAX_TASK_CONTROL_ROWS;
 export const MAX_STEER_BYTES = 1024 * 1024;
 export const MAX_STEER_ENTRY_BYTES = 64 * 1024;
 export const MAX_PUBLIC_REFUSALS = 64;
@@ -61,21 +61,22 @@ export class FabricSteerJournalError extends Error {
   readonly code = "FABRIC_STEER_JOURNAL_INVALID";
 }
 const requireJournal = (fd: number): fs.BigIntStats => {
-  const stat = fs.fstatSync(fd, { bigint: true });
-  if (!stat.isFile() || stat.nlink !== 1n || (process.getuid && stat.uid !== BigInt(process.getuid()))) {
-    throw new FabricSteerJournalError("Steering journal must be an owned regular file with one link");
-  }
-  return stat;
+  try { return taskControlFileStat(fd); }
+  catch { throw new FabricSteerJournalError("Steering journal must be an owned regular file with one link"); }
 };
-export const appendTerminalAdmission = (directory: string, line: string): void => withTaskControlDirectory(directory, control => {
+export const appendTerminalAdmission = (directory: string, line: string): void => withTaskControlDirectory(directory, (control, directoryFd) => {
   // Recheck at the actual write too: a host downgrade hook may re-enter admission.
   const index = readTerminalAdmissions(directory), bytes = Buffer.byteLength(line);
   if (index.truncated || index.controls >= MAX_STEER_CONTROLS || bytes > MAX_STEER_ENTRY_BYTES || index.bytes + bytes > MAX_STEER_BYTES) {
     throw new FabricSteerAdmissionLimitError(path.basename(directory), MAX_STEER_CONTROLS, MAX_STEER_BYTES);
   }
-  const fd = fs.openSync(path.join(control, "steer.jsonl"), fs.constants.O_WRONLY | fs.constants.O_APPEND | fs.constants.O_CREAT |
+  const file = path.join(control, "steer.jsonl"), created = !fs.existsSync(file);
+  const fd = fs.openSync(file, fs.constants.O_WRONLY | fs.constants.O_APPEND | fs.constants.O_CREAT |
     (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0), 0o600);
-  try { requireJournal(fd); fs.appendFileSync(fd, line, "utf8"); }
+  try {
+    requireJournal(fd); fs.appendFileSync(fd, line, "utf8"); fs.fsyncSync(fd);
+    if (created && process.platform !== "win32") fs.fsyncSync(directoryFd);
+  }
   finally { fs.closeSync(fd); }
 });
 const cacheIndex = (directory: string, version: string, index: TerminalAdmissionIndex): void => {
@@ -86,7 +87,7 @@ const cacheIndex = (directory: string, version: string, index: TerminalAdmission
 export const readTerminalAdmissions = (directory: string): TerminalAdmissionIndex => {
   const empty = (): TerminalAdmissionIndex => ({ byId: new Map(), controls: 0, bytes: 0, truncated: false });
   try { return withTaskControlDirectory(directory, control => {
-  const fd = fs.openSync(path.join(control, "steer.jsonl"), fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0));
+  const fd = openTaskControlFile(path.join(control, "steer.jsonl"));
   try {
     const stat = requireJournal(fd), version = signature(stat);
     const cached = admissionCache.get(directory);
@@ -139,7 +140,7 @@ export const readTerminalAdmission = (directory: string, id: string): TerminalAd
 const retainedNotice = (directory: string, admission: TerminalAdmission, receiptId: string): AgentTerminalNotice | undefined => {
   for (const suffix of [".json.delivered", ".json"]) {
     try {
-      const notice = JSON.parse(fs.readFileSync(path.join(taskControlDirectory(directory), "terminal-notices", admission.id + suffix), "utf8"));
+      const notice = readTaskControlJson<AgentTerminalNotice>(directory, path.join("terminal-notices", admission.id + suffix));
       if (notice?.code === "FABRIC_TARGET_TERMINAL" && notice.targetId === path.basename(directory) && notice.finalAnswerReceiptId === receiptId &&
           notice.messageId === admission.id && notice.delivery === admission.delivery && terminalSenderMatches(notice.sender, admission.sender)) return notice;
     } catch { /* An uncertain notice never establishes a refusal. */ }
@@ -199,7 +200,7 @@ export class TerminalNoticeOutbox {
       const index = readTerminalAdmissions(directory);
       for (const admission of index.byId.values()) {
         let state: { state?: string } | undefined;
-        try { state = JSON.parse(fs.readFileSync(path.join(taskControlDirectory(directory), "terminal-controls", `${admission.id}.json`), "utf8")); }
+        try { state = readTaskControlJson(directory, path.join("terminal-controls", `${admission.id}.json`)); }
         catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
         if (state?.state === "delivered" && terminalControlMatchesAdmission(state, admission)) continue;
         this.retain(directory, { code: "FABRIC_TARGET_TERMINAL", targetId: receipt.runId,
@@ -234,14 +235,14 @@ export class TerminalNoticeOutbox {
       const entry = admission.id + ".json";
       const file = path.join(outbox, entry);
       if (this.#routing.has(file)) continue;
-      let notice: AgentTerminalNotice;
-      try { notice = JSON.parse(fs.readFileSync(file, "utf8")); } catch { continue; }
+      let notice: AgentTerminalNotice | undefined;
+      try { notice = readTaskControlJson(directory, path.join("terminal-notices", entry)); } catch { continue; }
       if (!notice || notice.code !== "FABRIC_TARGET_TERMINAL" || notice.targetId !== receipt.runId || notice.finalAnswerReceiptId !== receipt.id ||
           entry !== `${notice.messageId}.json` || admission?.delivery !== notice.delivery || !admission.sender ||
           !terminalSenderMatches(notice.sender, admission.sender)) continue;
       if (fs.existsSync(`${file}.delivered`)) {
         try {
-          const acknowledged = JSON.parse(fs.readFileSync(`${file}.delivered`, "utf8"));
+          const acknowledged = readTaskControlJson(directory, path.join("terminal-notices", entry + ".delivered"));
           if (JSON.stringify(acknowledged) === JSON.stringify(notice)) fs.rmSync(file);
         } catch { /* Uncertain/corrupt route receipt retains custody, never repeats delivery. */ }
         continue;

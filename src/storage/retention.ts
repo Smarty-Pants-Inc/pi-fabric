@@ -9,8 +9,8 @@ import { FileLockBusy, lockFile } from "../residency/file-lock.js";
 import { recoverActorRunArchives } from "../actors/child-completions.js";
 import { recoverEnodevTaskRun } from "../agents/enodev-recovery.js";
 import { copyFabricProvenance } from "../fabric-provenance.js";
-import { readFinalAnswerReceipt, taskControlDirectory, withTaskControlDirectory } from "../worker/terminal-answer.js";
-import { readTerminalAdmissions, terminalControlMatchesAdmission, terminalSenderMatches } from "../agents/terminal-notices.js";
+import { readFinalAnswerReceipt, readTaskControlFile, taskControlDirectory, withTaskControlDirectory } from "../worker/terminal-answer.js";
+import { readTerminalAdmissions, MAX_STEER_CONTROLS, MAX_STEER_BYTES, terminalControlMatchesAdmission, terminalSenderMatches } from "../agents/terminal-notices.js";
 import { boundedRunTree } from "./reference-scan.js";
 
 export const FABRIC_RUN_ROOT_PREFIX = "pi-fabric-runs-";
@@ -260,6 +260,26 @@ const safeFollowUps = (directory: string, expired: Deadline): boolean => {
   }
   return true;
 };
+interface TerminalArtifactBudget { entries: number; bytes: number }
+const MAX_TERMINAL_ARTIFACT_ENTRIES = MAX_STEER_CONTROLS * 3;
+const MAX_TERMINAL_ARTIFACT_BYTES = MAX_STEER_BYTES * 4;
+/** Lazy enumeration closes even when a caller vetoes early. Directory churn,
+ * unknown entries and oversized collections never grant deletion authority. */
+function* terminalArtifactNames(directory: string, budget: TerminalArtifactBudget, expired: Deadline): Generator<string> {
+  if (!ownedStat(directory)?.isDirectory()) throw new Error("Invalid terminal artifact directory");
+  const entries = fs.opendirSync(directory, { bufferSize: 32 });
+  let count = 0;
+  try {
+    for (;;) {
+      if (expired()) throw new Error("Terminal artifact scan deadline exceeded");
+      const entry = entries.readSync();
+      if (!entry) return;
+      if (++count > MAX_STEER_CONTROLS * 2 || ++budget.entries > MAX_TERMINAL_ARTIFACT_ENTRIES) throw new Error("Terminal artifact entry bound exceeded");
+      if (!entry.isFile()) throw new Error("Terminal artifact is not a regular file");
+      yield entry.name;
+    }
+  } finally { entries.closeSync(); }
+}
 /** A refusal journal is not a sender route receipt. Every unconsumed admission
  * needs its retained delivered notice; pending, malformed and linked artifacts veto. */
 const safeTerminalArtifacts = (root: string, expired: Deadline): boolean => {
@@ -271,20 +291,28 @@ const safeTerminalArtifacts = (root: string, expired: Deadline): boolean => {
   if (["steer.jsonl", "final-answer.json", "terminal-controls", "terminal-notices"].some(name => fs.existsSync(path.join(root, name)))) return false;
   const index = readTerminalAdmissions(root);
   if (index.truncated || expired()) return false;
-  const admissions = index.byId;
+  const admissions = index.byId, budget: TerminalArtifactBudget = { entries: 0, bytes: 0 };
+  const readArtifact = <T>(relative: string): T | undefined => {
+    const contents = readTaskControlFile(root, relative);
+    if (contents === undefined) return;
+    budget.bytes += Buffer.byteLength(contents);
+    if (budget.bytes > MAX_TERMINAL_ARTIFACT_BYTES) throw new Error("Terminal artifact aggregate byte bound exceeded");
+    return JSON.parse(contents) as T;
+  };
   if (!fs.existsSync(answerFile)) {
-    if (fs.existsSync(notices) && (!ownedStat(notices)?.isDirectory() || fs.readdirSync(notices).length > 0)) return false;
+    if (fs.existsSync(notices)) for (const _name of terminalArtifactNames(notices, budget, expired)) return false;
     if (!fs.existsSync(controls)) return true;
     if (!ownedStat(controls)?.isDirectory()) return false;
     // A failed/interrupted task need not have a final answer. Already consumed
     // controls remain known collectible artifacts; queued/unknown ones do not.
-    return fs.readdirSync(controls).every(name => {
-      if (expired() || !/^[a-zA-Z0-9_-]{1,200}\.json$/.test(name)) return false;
-      const control = readJson<{ id?: string; state?: string; delivery?: string; provenance?: unknown }>(path.join(controls, name));
-      return !!control && control.state === "delivered" &&
-        Object.keys(control).every(key => ["id", "state", "delivery", "provenance"].includes(key)) &&
-        terminalControlMatchesAdmission(control, admissions.get(name.slice(0, -5)));
-    });
+    for (const name of terminalArtifactNames(controls, budget, expired)) {
+      if (!/^[a-zA-Z0-9_-]{1,200}\.json$/.test(name)) return false;
+      const control = readArtifact<{ id?: string; state?: string; delivery?: string; provenance?: unknown }>(path.join("terminal-controls", name));
+      if (!control || control.state !== "delivered" ||
+          Object.keys(control).some(key => !["id", "state", "delivery", "provenance"].includes(key)) ||
+          !terminalControlMatchesAdmission(control, admissions.get(name.slice(0, -5)))) return false;
+    }
+    return true;
   }
   if (!ownedStat(answerFile)?.isFile()) return false;
   const record = readJson<RunRecordSummary>(path.join(root, "status.json"));
@@ -297,10 +325,10 @@ const safeTerminalArtifacts = (root: string, expired: Deadline): boolean => {
   const routed = new Set<string>();
   if (fs.existsSync(notices)) {
     if (!ownedStat(notices)?.isDirectory()) return false;
-    for (const name of fs.readdirSync(notices)) {
+    for (const name of terminalArtifactNames(notices, budget, expired)) {
       if (expired() || !/^[a-zA-Z0-9_-]{1,200}\.json(?:\.delivered)?$/.test(name)) return false;
       const deliveredName = name.endsWith(".delivered") ? name : `${name}.delivered`;
-      const notice = readJson<{ code?: string; targetId?: string; messageId?: string; delivery?: string; finalAnswerReceiptId?: string; sender?: { id?: string; kind?: string; verified?: string } }>(path.join(notices, deliveredName));
+      const notice = readArtifact<{ code?: string; targetId?: string; messageId?: string; delivery?: string; finalAnswerReceiptId?: string; sender?: { id?: string; kind?: string; verified?: string } }>(path.join("terminal-notices", deliveredName));
       if (!notice || notice.code !== "FABRIC_TARGET_TERMINAL" || notice.targetId !== answer.runId ||
           notice.finalAnswerReceiptId !== answer.id || deliveredName !== `${notice.messageId}.json.delivered` ||
           !["steer", "followUp"].includes(notice.delivery ?? "") || !notice.sender?.id ||
@@ -308,7 +336,7 @@ const safeTerminalArtifacts = (root: string, expired: Deadline): boolean => {
       const admission = admissions.get(notice.messageId!);
       if (!admission || notice.delivery !== admission.delivery || !terminalSenderMatches(notice.sender, admission.sender)) return false;
       if (!name.endsWith(".delivered")) {
-        const pending = readJson<unknown>(path.join(notices, name));
+        const pending = readArtifact<unknown>(path.join("terminal-notices", name));
         if (JSON.stringify(pending) !== JSON.stringify(notice)) return false;
       }
       routed.add(notice.messageId!);
@@ -317,9 +345,9 @@ const safeTerminalArtifacts = (root: string, expired: Deadline): boolean => {
   const consumed = new Set<string>();
   if (fs.existsSync(controls)) {
     if (!ownedStat(controls)?.isDirectory()) return false;
-    for (const name of fs.readdirSync(controls)) {
+    for (const name of terminalArtifactNames(controls, budget, expired)) {
       if (expired() || !/^[a-zA-Z0-9_-]{1,200}\.json$/.test(name)) return false;
-      const control = readJson<{ id?: string; state?: string; delivery?: string; provenance?: unknown; reason?: unknown }>(path.join(controls, name));
+      const control = readArtifact<{ id?: string; state?: string; delivery?: string; provenance?: unknown; reason?: unknown }>(path.join("terminal-controls", name));
       const id = name.slice(0, -5), admission = admissions.get(id);
       if (!control || !admission || typeof control.id !== "string" || !/^[a-zA-Z0-9_-]{1,200}$/.test(control.id) ||
           !["steer", "followUp"].includes(control.delivery ?? "") || !["queued", "refused", "delivered"].includes(control.state ?? "") ||

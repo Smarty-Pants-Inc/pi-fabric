@@ -5,11 +5,11 @@ import { spawn, spawnSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
 import { buildSync } from "esbuild";
 import { describe, expect, it, vi } from "vitest";
-import { MAX_FINAL_ANSWER_BYTES, readFinalAnswerReceipt, saveFinalAnswerReceipt, taskControlDirectory, taskSteerFile, withTaskFinalAnswerLock } from "../src/worker/terminal-answer.js";
-import { appendTerminalAdmission, FabricSteerJournalError, readTerminalAdmissions } from "../src/agents/terminal-notices.js";
+import { MAX_FINAL_ANSWER_BYTES, MAX_TASK_CONTROL_BYTES, readFinalAnswerReceipt, readTaskControlFile, readTaskControlJson, saveFinalAnswerReceipt, taskControlDirectory, taskSteerFile, withTaskFinalAnswerLock } from "../src/worker/terminal-answer.js";
+import { appendTerminalAdmission, FabricSteerJournalError, readTerminalAdmissions, readUndeliveredMessage, TerminalNoticeOutbox } from "../src/agents/terminal-notices.js";
 import { canRemoveTerminalRun, removeUnreferencedRun } from "../src/storage/retention.js";
 import { writeJsonAtomic } from "../src/core/atomic-write.js";
-import { readTerminalControl, settleTerminalControl, trackTerminalControl } from "../src/worker/terminal-controls.js";
+import { queuedTerminalControls, readTerminalControl, settleTerminalControl, trackTerminalControl } from "../src/worker/terminal-controls.js";
 
 // All fixture paths are private and retained. No local deletion is performed.
 const fixture = () => {
@@ -42,6 +42,90 @@ describe("host-owned task controls", () => {
     const regular = fixture();
     appendTerminalAdmission(regular.run, JSON.stringify({ type: "steer", id: "original", message: "allowed" }) + "\n");
     expect(readTerminalAdmissions(regular.run).byId.get("original")).toMatchObject({ id: "original", delivery: "steer" });
+  });
+
+  it.each((process.platform === "win32" ? ["oversized"] : ["fifo", "oversized"]).flatMap(fault =>
+    ["registry", "pending notice", "acknowledged notice", "final receipt"].map(kind => ({ fault, kind }))))(
+    "bounded $kind reader refuses $fault without blocking or routing invented evidence", ({ fault, kind }) => {
+      const s = fixture(), id = "11111111-1111-4111-8111-111111111111";
+      const sender = { id: "session:original", kind: "main", verified: "mesh" };
+      appendTerminalAdmission(s.run, JSON.stringify({ id, type: "steer", provenance: { v: 1, channel: "fabric", via: "steer", sender } }) + "\n");
+      const receipt = kind === "final receipt" ? undefined : saveFinalAnswerReceipt(s.run, "run", "final");
+      const notice = { code: "FABRIC_TARGET_TERMINAL", targetId: "run", messageId: id, delivery: "steer", sender, finalAnswerReceiptId: receipt?.id };
+      writeJsonAtomic(path.join(s.run, "status.json"), { id: "run", runner: "pi", status: "completed", finalAnswerReceipt: receipt });
+      const relative = kind === "registry" ? path.join("terminal-controls", id + ".json") : kind === "final receipt" ? "final-answer.json"
+        : path.join("terminal-notices", id + (kind === "acknowledged notice" ? ".json.delivered" : ".json"));
+      const file = path.join(s.control, relative); fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+      if (kind === "acknowledged notice") writeJsonAtomic(path.join(s.control, "terminal-notices", id + ".json"), notice);
+      if (fault === "fifo") expect(spawnSync("mkfifo", [file]).status).toBe(0);
+      else fs.writeFileSync(file, "x".repeat((kind === "final receipt" ? MAX_FINAL_ANSWER_BYTES : MAX_TASK_CONTROL_BYTES) + 1));
+      const started = performance.now(), deliveries: unknown[] = [], outbox = new TerminalNoticeOutbox(value => { deliveries.push(value); });
+      expect(() => readTaskControlJson(s.run, relative)).toThrow();
+      if (kind === "registry") expect(readTerminalControl(s.run, id)).toBeUndefined();
+      if (kind === "final receipt") expect(readFinalAnswerReceipt(s.run, "run")).toBeUndefined();
+      outbox.recover(s.run); outbox.route(s.run);
+      const view = readUndeliveredMessage(s.run, id);
+      if (view) expect(view.sender).toEqual(sender); // only the valid original pending row may prove refusal
+      expect(deliveries).toEqual([]);
+      expect(canRemoveTerminalRun(s.run)).toBe(false);
+      expect(performance.now() - started).toBeLessThan(1000);
+    });
+
+  it("bounds a file that grows after fstat instead of following its growing EOF", () => {
+    const s = fixture(), relative = "metadata.json", file = path.join(s.control, relative);
+    fs.writeFileSync(file, "{}");
+    const read = fs.readSync; let requested = 0, grew = false;
+    const spy = vi.spyOn(fs, "readSync").mockImplementation(((fd: number, buffer: Buffer, offset: number, length: number, position: number) => {
+      requested += length;
+      if (!grew) { grew = true; fs.appendFileSync(file, "x".repeat(MAX_TASK_CONTROL_BYTES + 1)); }
+      return read(fd, buffer, offset, length, position);
+    }) as typeof fs.readSync);
+    expect(() => readTaskControlFile(s.run, relative)).toThrow(/byte bound/);
+    expect(requested).toBeLessThanOrEqual(MAX_TASK_CONTROL_BYTES + 1); spy.mockRestore();
+  });
+
+  it("makes accepted admission durable: append, file fsync, then creation directory fsync", () => {
+    const s = fixture(), order: string[] = [], append = fs.appendFileSync, sync = fs.fsyncSync;
+    const appender = vi.spyOn(fs, "appendFileSync").mockImplementation(((...args: Parameters<typeof fs.appendFileSync>) => {
+      order.push("append"); return append(...args);
+    }) as typeof fs.appendFileSync);
+    const barrier = vi.spyOn(fs, "fsyncSync").mockImplementation(fd => { order.push(fs.fstatSync(fd).isDirectory() ? "directory fsync" : "file fsync"); sync(fd); });
+    appendTerminalAdmission(s.run, JSON.stringify({ type: "steer", id: "first" }) + "\n");
+    expect(order).toEqual(["append", "file fsync", ...(process.platform === "win32" ? [] : ["directory fsync"])]);
+    order.length = 0;
+    appendTerminalAdmission(s.run, JSON.stringify({ type: "steer", id: "second" }) + "\n");
+    expect(order).toEqual(["append", "file fsync"]);
+    expect(readTerminalAdmissions(s.run).controls).toBe(2); appender.mockRestore(); barrier.mockRestore();
+  });
+
+  it.each(["entry count", "aggregate bytes"] as const)("bounds retention enumeration by %s, even under directory churn", limit => {
+    const s = fixture(), id = "11111111-1111-4111-8111-111111111111", controls = path.join(s.control, "terminal-controls");
+    appendTerminalAdmission(s.run, JSON.stringify({ id, type: "steer" }) + "\n");
+    writeJsonAtomic(path.join(s.run, "status.json"), { id: "run", runner: "pi", status: "completed", transport: "process", sessionId: "99999999", updatedAt: Date.now() });
+    fs.mkdirSync(controls);
+    const value = JSON.stringify({ id, delivery: "steer", state: "delivered" });
+    fs.writeFileSync(path.join(controls, id + ".json"), limit === "aggregate bytes" ? value + " ".repeat(MAX_TASK_CONTROL_BYTES - Buffer.byteLength(value)) : value);
+    expect(canRemoveTerminalRun(s.run)).toBe(true);
+    // Retain the private native file; record a churned stream of 5,000 valid
+    // entries. A full readdir on the fixture would incorrectly authorize it.
+    const readSync = vi.fn(() => ({ name: id + ".json", isFile: () => true })), closeSync = vi.fn(), open = fs.opendirSync;
+    const spy = vi.spyOn(fs, "opendirSync").mockImplementation(((directory: fs.PathLike, options?: fs.OpenDirOptions) =>
+      String(directory) === controls ? { readSync, closeSync } as unknown as fs.Dir : open(directory, options)) as typeof fs.opendirSync);
+    expect(canRemoveTerminalRun(s.run)).toBe(false);
+    expect(readSync.mock.calls.length).toBe(limit === "entry count" ? 513 : 65);
+    expect(readSync.mock.calls.length).toBeLessThan(5000); expect(closeSync).toHaveBeenCalledOnce(); spy.mockRestore();
+    if (limit === "entry count") expect(canRemoveTerminalRun(s.run)).toBe(true); // real one-entry directory still collects
+  });
+
+  it("bounds the worker's queued-registry directory stream and closes on overflow", () => {
+    const s = fixture(), id = "11111111-1111-4111-8111-111111111111", controls = path.join(s.control, "terminal-controls");
+    trackTerminalControl(s.run, { id, delivery: "steer" });
+    const readSync = vi.fn(() => ({ name: id + ".json", isFile: () => true })), closeSync = vi.fn(), open = fs.opendirSync;
+    const spy = vi.spyOn(fs, "opendirSync").mockImplementation(((directory: fs.PathLike, options?: fs.OpenDirOptions) =>
+      fs.realpathSync(String(directory)) === controls ? { readSync, closeSync } as unknown as fs.Dir : open(directory, options)) as typeof fs.opendirSync);
+    expect(() => queuedTerminalControls(s.run)).toThrow(/entry bound/);
+    expect(readSync.mock.calls.length).toBe(257); expect(closeSync).toHaveBeenCalledOnce(); spy.mockRestore();
+    expect(queuedTerminalControls(s.run)).toMatchObject([{ id, state: "queued" }]);
   });
 
   it("ignores a task-written oversized journal and retention fails closed without reading it", () => {

@@ -239,6 +239,30 @@ reportCallerMarker();
 console.log("RECORDER:" + JSON.stringify({ calls, exists: fs.existsSync(target) }));
 `;
 
+// F-01: on POSIX "\" is a filename character, not a separator. Recorder installed BEFORE the explicit
+// guard import, so even a buggy delegation reaches only the recorder; no native deleter is ever called.
+const backslashChild = String.raw`
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+import { tmpdir } from "node:os";
+import { basename, dirname, join } from "node:path";
+const root = fs.mkdtempSync(join(tmpdir(), "backslash-root-"));
+Object.assign(process.env, { TMPDIR: root, TMP: root, TEMP: root });
+const calls = [];
+fs.rmSync = (path) => { calls.push(String(path)); };
+syncBuiltinESMExports();
+await import(process.argv[2]);
+const bs = String.fromCharCode(92);
+process.chdir(dirname(root));
+const paths = { backslash: root + bs, relativeBackslash: basename(root) + bs, sibling: root + "-sibling",
+  child: root + "/x", trailingSlash: root + "/" };
+const results = {};
+for (const [label, path] of Object.entries(paths)) {
+  try { fs.rmSync(path); results[label] = null; } catch (error) { results[label] = error.message; }
+}
+console.log(JSON.stringify({ root, results, calls }));
+`;
+
 const withoutGuard = (options = "") => {
   const tokens = options.split(/\s+/).filter(Boolean);
   const kept: string[] = [];
@@ -337,5 +361,20 @@ describe("deletion guard in child processes", () => {
     expect(recorder.calls).toEqual([{ name: "rmSync", path: externalFile }]);
     expect(recorder.exists).toBe(true);
     expectExternalIntact();
+  });
+
+  it.skipIf(!posix)("refuses a POSIX literal trailing backslash and sibling but delegates root/ and root/x to a recorder", () => {
+    const nodeOptions = withoutGuard(process.env.NODE_OPTIONS);
+    expect(nodeOptions).not.toContain(guardFile);
+    const result = runChild("backslash-recorder-child.mjs", backslashChild, [guardUrl],
+      { ...process.env, GITHUB_ACTIONS: "false", NODE_OPTIONS: nodeOptions });
+    const output = JSON.parse(result.stdout.trim()) as
+      { root: string; results: Record<string, string | null>; calls: string[] };
+    expect(inside(privateTemp, output.root)).toBe(true);
+    expect(output.results).toEqual({
+      backslash: expect.stringMatching(refusal), relativeBackslash: expect.stringMatching(refusal),
+      sibling: expect.stringMatching(refusal), child: null, trailingSlash: null,
+    });
+    expect(output.calls).toEqual([`${output.root}/x`, `${output.root}/`]);
   });
 });

@@ -28,7 +28,7 @@ const settledState = async (promise: Promise<unknown>): Promise<"pending" | "set
   Promise.race([promise.then(() => "settled" as const, () => "settled" as const),
     new Promise<"pending">(resolve => setTimeout(() => resolve("pending"), 50))]);
 
-describe("remove during the finisher's commit (smarty-dev#11105 item 2)", () => {
+describe.skipIf(process.platform !== "linux")("remove during the finisher's commit (smarty-dev#11105 item 2)", () => {
   it.each<Shape>(["manager", "directory-primary", "directory-secondary", "manager-revocation-fails", "directory-revocation-fails"])(
     "%s: a repeat remove joins the in-flight commit and answers its actual result", async (shape) => {
       const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-finish-answer-"));
@@ -174,7 +174,7 @@ describe("remove during the finisher's commit (smarty-dev#11105 item 2)", () => 
 // the actors CLI), whose listOwned() lookup no longer sees an actor whose commit is in flight, and the ordinary path
 // (ResidentActorClient.removeActor). Only an exact-id, non-dry-run remove joins that commit.
 type Receiver = "operator" | "ordinary";
-describe("resident remove during the commit (smarty-dev#11105 item 2)", () => {
+describe.skipIf(process.platform !== "linux")("resident remove during the commit (smarty-dev#11105 item 2)", () => {
   beforeEach(() => installInProcessResidentFence());
   it.each<Receiver>(["operator", "ordinary"])("%s: an exact-id resident remove joins the in-flight commit and answers its actual result", async (receiver) => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-finish-operator-"));

@@ -216,6 +216,23 @@ describe("steer/followUp after an ordinary Pi task's final answer", () => {
   it("records paired cleanup after a queued launch fails between ctl creation and status", () => failedQueuedLaunch(true));
   it("CI-only: failed queued launch removes both run and ctl", () => failedQueuedLaunch(false));
 
+  it("queued launch cleanup refuses and logs a dangling ctl link instead of deleting only the run", async () => {
+    const h = harness(), first = await h.manager.spawn({ task: "occupy capacity", transport: "process" });
+    const queued = await h.manager.spawn({ task: "queued linked controls", transport: "process" });
+    const directory = path.join(h.root, queued.id), control = taskControlDirectory(directory);
+    h.launch.mockImplementationOnce(async () => {
+      fs.renameSync(control, control + ".retained"); fs.symlinkSync(path.join(h.root, "missing"), control, process.platform === "win32" ? "junction" : "dir");
+      throw new Error("fixture dangling ctl launch failure");
+    });
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined), remove = vi.spyOn(fs, "rmSync").mockImplementation(() => undefined);
+    h.finish(first.id, "done"); h.close(first.id);
+    expect((await h.manager.wait(queued.id, { timeoutMs: 5000 })).status).toBe("failed");
+    expect(warning).toHaveBeenCalledWith(expect.stringContaining("FABRIC_TASK_CONTROL_UNSAFE cleanup refused"));
+    expect(remove.mock.calls.some(call => call[0] === directory || call[0] === control)).toBe(false);
+    expect(fs.existsSync(directory)).toBe(true); expect(fs.lstatSync(control).isSymbolicLink()).toBe(true);
+    await h.manager.close(); warning.mockRestore(); remove.mockRestore();
+  });
+
   it("records paired ctl/run cleanup together without deleting either fixture", async () => {
     const { manager, root, finish, close } = harness(false);
     const handle = await manager.spawn({ task: "paired cleanup", transport: "process" });

@@ -1047,8 +1047,17 @@ export const removeUnreferencedRun = (
   const check = (): boolean => { try { return !!referenced?.(); } catch { return true; } };
   if (check()) { countRefusal(deleter, "referenced at the final check", directory, bytes); return false; }
   const control = taskControlDirectory(directory);
-  if (fs.existsSync(control)) {
-    try { withTaskControlDirectory(directory, () => undefined); } catch { return false; }
+  let controlStat: fs.Stats | undefined;
+  try { controlStat = fs.lstatSync(control); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") return false; }
+  if (controlStat) {
+    try {
+      if (!controlStat.isDirectory() || controlStat.isSymbolicLink()) throw new Error("Refusing linked or non-directory task control path");
+      withTaskControlDirectory(directory, () => undefined);
+    } catch (error) {
+      console.warn(`[pi-fabric] FABRIC_TASK_CONTROL_UNSAFE cleanup refused for ${control}: ${String(error)}`);
+      return false;
+    }
     // Paired host metadata goes first, so an interrupted run removal cannot
     // strand orphan control metadata. A failed control delete retains the run.
     if (!verifiedRemove(control, ownedStat(control), { deleter, ...(dryRun ? { dryRun: true } : {}), proceed: () => !check(), fallback: rmTree(control) }).removed) return false;

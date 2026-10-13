@@ -138,6 +138,38 @@ describe("runner-end steer fence (persisted receipt before its worker event)", (
     console.log(`INTERLEAVING: PASS mode=${mode} receiptFirst=true injected=false refused=${messageId} childExited=true root=${s.root}`);
   }, 45000);
 
+  it.each(process.getuid ? ["oversized", "growing", "controls", "owner"] as const : ["oversized", "growing", "controls"] as const)("fails the live journal closed for %s without allowing later input", async fault => {
+    const s = setup();
+    const hook = path.join(s.root, "journal-bound-hook.mjs");
+    fs.writeFileSync(hook, `import fs from 'node:fs';
+if(process.argv.includes('--steer-file')){
+ const root=${JSON.stringify(s.root)}, fault=${JSON.stringify(fault)}, descriptors=new Map(), open=fs.openSync, stat=fs.fstatSync, read=fs.readSync;
+ fs.openSync=(file,...args)=>{const fd=open(file,...args);if(String(file).endsWith('steer.jsonl'))descriptors.set(fd,String(file));else descriptors.delete(fd);return fd;};
+ fs.fstatSync=(fd,...args)=>{const value=stat(fd,...args);if(fault==='owner'&&descriptors.has(fd)&&fs.existsSync(root+'/armed'))value.uid=typeof value.uid==='bigint'?value.uid+1n:value.uid+1;return value;};
+ fs.readSync=(fd,...args)=>{if(fault==='growing'&&descriptors.has(fd)&&fs.existsSync(root+'/armed')&&!fs.existsSync(root+'/grew')){fs.appendFileSync(descriptors.get(fd),'x'.repeat(1048577));fs.writeFileSync(root+'/grew','');}return read(fd,...args);};
+}
+`);
+    vi.stubEnv("NODE_OPTIONS", `${process.env.NODE_OPTIONS ?? ""} --import=${pathToFileURL(hook).href}`);
+    const handle = await s.manager.spawn({ task: "bounded live journal", model: "steer-ended/fake", thinking: "off", transport: "process", extensions: false, tools: [], cwd: s.workspace });
+    const directory = path.join(s.root, "runs", handle.id), file = taskSteerFile(directory), fake = path.join(s.root, "fake.jsonl");
+    await until(() => rows(fake).some(row => row.type === "task"));
+    const id = randomUUID(), entry = JSON.stringify({ id, type: "steer", message: "NO_OVERLIMIT_DELIVERY", provenance }) + "\n";
+    fs.writeFileSync(path.join(s.root, "armed"), "");
+    fs.writeFileSync(file, fault === "oversized" ? entry + "x".repeat(1048577) : fault === "controls"
+      ? Array.from({ length: 257 }, () => JSON.stringify({ type: "set_steering_mode", mode: "all" }) + "\n").join("") : entry);
+    await until(() => rows(path.join(directory, "events.jsonl")).some(row => row.type === "fabric_steer_journal_invalid"));
+    if (fault === "growing") expect(fs.existsSync(path.join(s.root, "grew"))).toBe(true);
+    expect(rows(fake).some(row => row.type === "delivery")).toBe(false);
+    // Shrinking/replacing the bad journal cannot reset the lifetime fence.
+    fs.writeFileSync(file, entry); fs.writeFileSync(path.join(s.root, "final"), "");
+    await until(() => rows(fake).some(row => row.type === "receipt"));
+    fs.writeFileSync(path.join(s.root, "release"), "");
+    expect((await s.manager.wait(handle.id, { timeoutMs: 30000 })).status).toBe("completed");
+    await s.manager.close();
+    expect(rows(fake).some(row => row.type === "delivery")).toBe(false);
+    expect(fs.existsSync(path.join(s.workspace, "SOURCE_WRITE_SENTINEL"))).toBe(false);
+  }, 45000);
+
   it("counterexample: an injected post-receipt delivery is a recorded source write", async () => {
     // Proves the sentinel is live: without the worker fence, the fake obeys.
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "worker-steer-ended-counter-"));

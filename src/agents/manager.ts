@@ -3547,8 +3547,16 @@ export class AgentManager {
     const control = taskControlDirectory(runDirectory);
     // Remove the paired host metadata first: failure retains the run, and a
     // later run-removal failure never leaves an orphan control directory.
-    if (!fs.existsSync(control)) return [runDirectory];
-    withTaskControlDirectory(runDirectory, () => undefined);
+    let stat: fs.Stats;
+    try { stat = fs.lstatSync(control); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return [runDirectory]; throw error; }
+    try {
+      if (!stat.isDirectory() || stat.isSymbolicLink()) throw new FabricTaskControlDirectoryError("Refusing cleanup of a linked or non-directory task control path");
+      withTaskControlDirectory(runDirectory, () => undefined);
+    } catch (error) {
+      console.warn(`[pi-fabric] FABRIC_TASK_CONTROL_UNSAFE cleanup refused for ${control}: ${String(error)}`);
+      throw error;
+    }
     return [control, runDirectory];
   }
   #removeRunTreeSync(runDirectory: string): void {

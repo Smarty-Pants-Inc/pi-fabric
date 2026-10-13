@@ -51,7 +51,8 @@ import type { ActorContextReseed } from "./worker/context-admission.js";
 import { readPiSessionHeader } from "./core/pi-session-header.js";
 import { savePiSettlementReceipt } from "./worker/settlement-receipt.js";
 import { syncPathNamespace } from "./core/atomic-write.js";
-import { finalAssistantText, readFinalAnswerReceipt, withTaskFinalAnswerLock, type FinalAnswerReceipt } from "./worker/terminal-answer.js";
+import { finalAssistantText, readFinalAnswerReceipt, openTaskControlFile, taskControlFileStat, withTaskFinalAnswerLock, type FinalAnswerReceipt } from "./worker/terminal-answer.js";
+import { MAX_STEER_BYTES, MAX_STEER_CONTROLS } from "./agents/terminal-notices.js";
 import { queuedTerminalControls, readTerminalControl, settleTerminalControl, trackTerminalControl, type TerminalControl } from "./worker/terminal-controls.js";
 import { DEFAULT_BASH_IDLE_S } from "./guards/actor-bash-timeout.js";
 import { senderHeaderHookPath } from "./guards/sender-headers.js";
@@ -202,7 +203,6 @@ const senderHeaderHookArguments = (runner: string): string[] => {
 const MAX_STDERR_CHARS = 20_000;
 const STEER_READ_CHUNK_BYTES = 256 * 1024;
 const MAX_STEER_LINE_BYTES = 64 * 1024;
-const MAX_STEER_COMMANDS_PER_POLL = 256;
 const MAX_CLAUDE_PENDING_INPUTS = 256;
 const MAX_CLAUDE_PENDING_TOOLS = 1_000;
 const KILL_GRACE_MS = 5_000;
@@ -2155,7 +2155,14 @@ const main = async (): Promise<void> => {
   let steerOffset = 0;
   let steerRemainder = Buffer.alloc(0);
   let skippingOversizedSteerLine = false;
+  let steerCommands = 0;
+  let steerJournalInvalid = false;
+  const refuseSteerJournal = (error: unknown): void => {
+    steerJournalInvalid = true;
+    appendLog(`${JSON.stringify({ type: "fabric_steer_journal_invalid", code: "FABRIC_STEER_JOURNAL_INVALID", message: String(error) })}\n`);
+  };
   const pollSteer = (): void => {
+    if (steerJournalInvalid) return;
     // The native receipt can precede its IPC frame. Reuse this bounded file
     // reader to record unread input, but never inject it after that boundary.
     let endedReceipt = finalAnswerReceipt;
@@ -2164,14 +2171,15 @@ const main = async (): Promise<void> => {
         (!piControlLive || childExited || !modelControl.ready || !child.stdin?.writable || child.stdin.writableEnded || child.stdin.destroyed))))) return;
     let descriptor: number | undefined;
     try {
-      descriptor = fs.openSync(options.steerFile, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0));
-    } catch {
+      descriptor = openTaskControlFile(options.steerFile);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") refuseSteerJournal(error);
       return;
     }
     try {
-      const journal = fs.fstatSync(descriptor);
-      if (!journal.isFile() || journal.nlink !== 1) throw new Error("Steering journal is not an owned regular control file");
-      const size = journal.size;
+      const journal = taskControlFileStat(descriptor);
+      if (journal.size > BigInt(MAX_STEER_BYTES)) throw new Error("Steering journal exceeds its total byte bound");
+      const size = Number(journal.size);
       if (size < steerOffset) {
         steerOffset = 0;
         steerRemainder = Buffer.alloc(0);
@@ -2181,6 +2189,9 @@ const main = async (): Promise<void> => {
       const length = Math.min(size - steerOffset, STEER_READ_CHUNK_BYTES);
       const buffer = Buffer.allocUnsafe(length);
       const bytesRead = fs.readSync(descriptor, buffer, 0, length, steerOffset);
+      // A growing regular file cannot turn a bounded preflight into delivery
+      // from an over-limit journal. Validate again before consuming any row.
+      if (taskControlFileStat(descriptor).size > BigInt(MAX_STEER_BYTES)) throw new Error("Steering journal exceeds its total byte bound");
       steerOffset += bytesRead;
       let combined = Buffer.concat([steerRemainder, buffer.subarray(0, bytesRead)]);
       if (skippingOversizedSteerLine) {
@@ -2206,13 +2217,11 @@ const main = async (): Promise<void> => {
       } else {
         steerRemainder = Buffer.from(remainder);
       }
-      let processedCommands = 0;
       for (const raw of combined.subarray(0, newline + 1).toString("utf8").split("\n")) {
-        if (processedCommands >= MAX_STEER_COMMANDS_PER_POLL) break;
-        if (Buffer.byteLength(raw, "utf8") > MAX_STEER_LINE_BYTES) continue;
         const line = raw.trim();
         if (!line) continue;
-        processedCommands += 1;
+        if (++steerCommands > MAX_STEER_CONTROLS) throw new Error("Steering journal exceeds its total control bound");
+        if (Buffer.byteLength(raw, "utf8") > MAX_STEER_LINE_BYTES) continue;
         let command: { id?: string; type?: string; message?: string; mode?: string; instructions?: string; provenance?: unknown; followUpId?: string; requestId?: string };
         try {
           command = JSON.parse(line);
@@ -2287,6 +2296,8 @@ const main = async (): Promise<void> => {
           /* Closed stdin or failed refusal persistence: manager scans durable admissions. */
         }
       }
+    } catch (error) {
+      refuseSteerJournal(error);
     } finally {
       fs.closeSync(descriptor);
     }

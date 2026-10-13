@@ -195,6 +195,20 @@ describe("host-owned task controls", () => {
     });
   });
 
+  it("refuses and logs a dangling ctl link before retention can remove its run", () => {
+    const s = fixture(), retained = s.control + ".retained";
+    fs.renameSync(s.control, retained); fs.symlinkSync(path.join(s.root, "missing"), s.control, process.platform === "win32" ? "junction" : "dir");
+    expect(fs.existsSync(s.control)).toBe(false); expect(fs.lstatSync(s.control).isSymbolicLink()).toBe(true);
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined), remove = vi.spyOn(fs, "rmSync").mockImplementation(() => undefined);
+    expect(removeUnreferencedRun(s.run, fs.statSync(s.run), undefined, true)).toBe(false);
+    expect(warning).toHaveBeenCalledWith(expect.stringContaining("FABRIC_TASK_CONTROL_UNSAFE cleanup refused"));
+    expect(remove).not.toHaveBeenCalled(); expect(fs.existsSync(s.run)).toBe(true);
+    // No unlink: keep the offending link as evidence, restore the real directory.
+    fs.renameSync(s.control, s.control + ".link-evidence"); fs.renameSync(retained, s.control);
+    expect(removeUnreferencedRun(s.run, fs.statSync(s.run), undefined, true)).toBe(true);
+    warning.mockRestore(); remove.mockRestore();
+  });
+
   it("pairs ctl with run cleanup in a dry run; neither fixture is removed", () => {
     const s = fixture(); writeJsonAtomic(path.join(s.run, "status.json"), { id: "run", status: "completed" });
     expect(removeUnreferencedRun(s.run, fs.statSync(s.run), undefined, true)).toBe(true);

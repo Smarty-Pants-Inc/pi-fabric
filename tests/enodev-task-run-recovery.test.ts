@@ -1,15 +1,15 @@
 // smarty-dev#9855: task-agent runs (no actorId) left "execution exit unconfirmed" by the pre-pi-fabric#849 ENODEV
 // scope observation kept unresolved-worker.json forever: #912 recovers actor runs only, and retention vetoes a run with
-// the marker. Offline retention now recovers them once: a saved answer goes to the run's recorded spawner when that
-// exact Main session can still take it (the completion journal, keyed by run id), else the run settles lost; the
-// marker goes, so retention collects the run.
+// the marker. Offline retention now settles each such run LOST once and clears the marker, so retention collects it.
+// It never delivers a recovered answer (pi-fabric#1027 review round 1, principal-data P1): a same-uid worker can
+// rewrite the run's recipient manifest and its exit proof, so nothing recovered here may cross to another session.
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agents/manager.js";
-import { CompletionJournal, consumeCompletion, pendingCompletions, type CompletionRecipient } from "../src/agents/completion-journal.js";
+import { CompletionJournal, pendingCompletions, type CompletionRecipient } from "../src/agents/completion-journal.js";
 import { recoverEnodevTaskRun } from "../src/agents/enodev-recovery.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
@@ -41,15 +41,16 @@ const livePid = (): number => {
   return child.pid!;
 };
 const SESSION = "11111111-2222-3333-4444-555555555555";
-const recipientOf = (projectRoot: string): CompletionRecipient =>
-  ({ rootId: `session:${SESSION}`, sessionId: SESSION, cwd: projectRoot, projectRoot, name: "main", startedAt: 1 });
-/** The spawner's Main session holds a live host lease (or `session` names another Main session). */
-const liveSpawner = (meshRoot: string, recipient: CompletionRecipient, session = recipient.sessionId): void => {
+const OTHER = "99999999-0000-0000-0000-000000000000";
+const recipientOf = (projectRoot: string, session = SESSION): CompletionRecipient =>
+  ({ rootId: `session:${session}`, sessionId: session, cwd: projectRoot, projectRoot, name: "main", startedAt: 1 });
+/** A Main session that holds a live host lease. */
+const liveSpawner = (meshRoot: string, recipient: CompletionRecipient): void => {
   const now = Date.now();
   writeHostLease(meshRoot, { id: recipient.rootId, rootId: recipient.rootId, identityId: recipient.rootId, updatedAt: now,
-    expiresAt: now + 60_000, startedAt: now, session: { id: session, startedAt: now, updatedAt: now, expiresAt: now + 60_000 } });
+    expiresAt: now + 60_000, startedAt: now, session: { id: recipient.sessionId, startedAt: now, updatedAt: now, expiresAt: now + 60_000 } });
 };
-interface Fixture { pid?: number; birth?: string; actorId?: string; settlement?: unknown; reason?: string; recipient?: CompletionRecipient | null;
+interface Fixture { pid?: number; birth?: string; actorId?: string; settlement?: unknown; reason?: string; recipient?: CompletionRecipient;
   status?: string; text?: string }
 const runDir = (runRoot: string, meshRoot: string, id: string, fixture: Fixture = {}): string => {
   const directory = path.join(runRoot, id);
@@ -59,10 +60,8 @@ const runDir = (runRoot: string, meshRoot: string, id: string, fixture: Fixture 
     runner: "pi", transport: "process", startedAt: 1, sessionId: String(fixture.pid ?? deadPid()),
     ...(fixture.birth ? { processStartTime: fixture.birth } : {}), ...(fixture.actorId ? { actorId: fixture.actorId } : {}) }));
   fs.writeFileSync(path.join(directory, "unresolved-worker.json"), JSON.stringify({ reason: fixture.reason ?? ENODEV, markedAt: 1, runId: id }));
-  if (fixture.recipient !== null) {
-    fs.writeFileSync(path.join(directory, "completion-recipient.json"), JSON.stringify({ meshRoot,
-      recipient: fixture.recipient ?? recipientOf(meshRoot), supervisor: { pid: deadPid() } }));
-  }
+  fs.writeFileSync(path.join(directory, "completion-recipient.json"), JSON.stringify({ meshRoot,
+    recipient: fixture.recipient ?? recipientOf(meshRoot), supervisor: { pid: deadPid() } }));
   if (fixture.settlement !== null) {
     fs.writeFileSync(path.join(directory, "settlement.json"),
       JSON.stringify(fixture.settlement ?? { version: 1, runId: id, outcome: "completed", text: "the saved answer" }));
@@ -71,55 +70,45 @@ const runDir = (runRoot: string, meshRoot: string, id: string, fixture: Fixture 
 };
 const vetoed = (directory: string): boolean => fs.existsSync(path.join(directory, "unresolved-worker.json"));
 const status = (directory: string) => JSON.parse(fs.readFileSync(path.join(directory, "status.json"), "utf8"));
+/** Every envelope in the mesh's completion journal, whoever it is addressed to. */
+const journal = (meshRoot: string): string[] => {
+  try { return fs.readdirSync(path.join(meshRoot, "agent-completions"), { recursive: true }).map(String).filter(name => name.endsWith(".json")); }
+  catch { return []; }
+};
 
 describe.runIf(process.platform === "linux")("ENODEV-unconfirmed task-agent runs (smarty-dev#9855)", () => {
-  it("(a) a gone worker's saved answer reaches its live spawner once; a second sweep delivers nothing", () => {
+  it("(a) a saved answer, a live spawner AND a manifest naming another live session: settled lost, nothing delivered", () => {
     const meshRoot = tempRoot();
-    const recipient = recipientOf(meshRoot);
-    liveSpawner(meshRoot, recipient);
-    const id = "a".repeat(32);
-    const directory = runDir(tempRoot(), meshRoot, id);
-    // The read-only report's dry run decides the same outcome and writes nothing.
-    expect(recoverEnodevTaskRun(directory, { dryRun: true })).toBe("delivered");
-    expect(vetoed(directory)).toBe(true);
-    expect(pendingCompletions(meshRoot, meshRoot)).toHaveLength(0);
-    expect(recoverEnodevTaskRun(directory)).toBe("delivered");
+    const spawner = recipientOf(meshRoot);
+    const other = recipientOf(meshRoot, OTHER);
+    liveSpawner(meshRoot, spawner);
+    liveSpawner(meshRoot, other);
+    // The manifest a same-uid worker could have rewritten names another live Main session.
+    const directory = runDir(tempRoot(), meshRoot, "a".repeat(32), { recipient: other });
+    expect(recoverEnodevTaskRun(directory)).toBe("lost");
     expect(vetoed(directory)).toBe(false);
-    expect(status(directory)).toMatchObject({ status: "completed", text: "the saved answer", enodevDelivered: true });
-    const pending = pendingCompletions(meshRoot, meshRoot);
-    expect(pending.map(envelope => [envelope.result.id, envelope.result.text, envelope.recipient.sessionId]))
-      .toEqual([[id, "the saved answer", SESSION]]);
-    // A second sweep: no marker, nothing to do.
+    expect(status(directory)).toMatchObject({ status: "completed", settledLost: true, text: "the saved answer" });
+    expect(status(directory).enodevDelivered).toBeUndefined();
+    expect(journal(meshRoot)).toEqual([]);
+    expect(pendingCompletions(meshRoot, meshRoot)).toHaveLength(0);
+    // Once: a second sweep finds no marker and changes nothing.
+    const settled = fs.readFileSync(path.join(directory, "status.json"), "utf8");
     expect(recoverEnodevTaskRun(directory)).toBeUndefined();
-    expect(pendingCompletions(meshRoot, meshRoot)).toHaveLength(1);
-    // A crash after the save, before the marker went: the retry saves the SAME envelope (keyed by run id).
-    fs.writeFileSync(path.join(directory, "unresolved-worker.json"), JSON.stringify({ reason: ENODEV, markedAt: 1, runId: id }));
-    expect(recoverEnodevTaskRun(directory)).toBe("delivered");
-    expect(pendingCompletions(meshRoot, meshRoot)).toHaveLength(1);
+    expect(fs.readFileSync(path.join(directory, "status.json"), "utf8")).toBe(settled);
+    expect(journal(meshRoot)).toEqual([]);
   });
 
-  it("(b) no live spawner: settled lost, nothing delivered, marker cleared", () => {
-    for (const [name, spawner] of [["no lease", undefined], ["another Main session", "99999999-0000-0000-0000-000000000000"],
-      ["no recipient manifest", null]] as const) {
-      const meshRoot = tempRoot();
-      const recipient = recipientOf(meshRoot);
-      if (typeof spawner === "string") liveSpawner(meshRoot, recipient, spawner);
-      const directory = runDir(tempRoot(), meshRoot, "b".repeat(32), spawner === null ? { recipient: null } : {});
-      expect(recoverEnodevTaskRun(directory), name).toBe("lost");
-      expect(vetoed(directory), name).toBe(false);
-      expect(status(directory), name).toMatchObject({ status: "completed", settledLost: true, text: "the saved answer" });
-      expect(pendingCompletions(meshRoot, meshRoot), name).toHaveLength(0);
-    }
-    // No saved answer: failed lost, even with a live spawner.
+  it("(b) no saved answer: failed lost, marker cleared, nothing delivered", () => {
     const meshRoot = tempRoot();
     liveSpawner(meshRoot, recipientOf(meshRoot));
     const directory = runDir(tempRoot(), meshRoot, "c".repeat(32), { settlement: null });
     expect(recoverEnodevTaskRun(directory)).toBe("lost");
+    expect(vetoed(directory)).toBe(false);
     expect(status(directory)).toMatchObject({ status: "failed", settledLost: true });
-    expect(pendingCompletions(meshRoot, meshRoot)).toHaveLength(0);
+    expect(journal(meshRoot)).toEqual([]);
   });
 
-  it("(c) a live worker, a foreign settlement, another reason or an actor run: untouched, the veto stays", () => {
+  it("(c) a live worker, an actor run or another reason: untouched, the veto stays", () => {
     const meshRoot = tempRoot();
     liveSpawner(meshRoot, recipientOf(meshRoot));
     const pid = livePid();
@@ -136,35 +125,53 @@ describe.runIf(process.platform === "linux")("ENODEV-unconfirmed task-agent runs
       expect(vetoed(directory), name).toBe(true);
       expect(fs.readFileSync(path.join(directory, "status.json"), "utf8"), name).toBe(before);
     }
-    // A settlement for another run is no saved answer: settled lost, not delivered.
+    // A settlement for another run is no saved answer: failed lost.
     const foreign = runDir(tempRoot(), meshRoot, "e".repeat(32), { settlement: { version: 1, runId: "0".repeat(32), outcome: "completed", text: "x" } });
     expect(recoverEnodevTaskRun(foreign)).toBe("lost");
-    expect(pendingCompletions(meshRoot, meshRoot)).toHaveLength(0);
+    expect(status(foreign)).toMatchObject({ status: "failed", settledLost: true });
+    expect(journal(meshRoot)).toEqual([]);
   });
 
-  // Ryzen 1's real runs (copies from fabric-store): most records are already terminal (completed with text, or
-  // stopped). Such a record keeps its outcome; a result its spawner already consumed is never sent again.
-  it("(d) a record its manager made terminal keeps its outcome; a consumed result is not resent", () => {
+  // Ryzen 1's real runs (copies from fabric-store) are mostly already terminal (completed with text, or stopped).
+  it("(d) a record its manager made terminal keeps its outcome and gains settledLost", () => {
     const meshRoot = tempRoot();
-    const recipient = recipientOf(meshRoot);
-    liveSpawner(meshRoot, recipient);
+    liveSpawner(meshRoot, recipientOf(meshRoot));
     const stopped = runDir(tempRoot(), meshRoot, "5".repeat(32), { status: "stopped", settlement: null });
     expect(recoverEnodevTaskRun(stopped)).toBe("lost");
     expect(status(stopped)).toMatchObject({ status: "stopped", settledLost: true });
     expect(vetoed(stopped)).toBe(false);
-    const id = "6".repeat(32);
-    const completed = runDir(tempRoot(), meshRoot, id, { status: "completed", text: "the manager's text" });
-    expect(recoverEnodevTaskRun(completed)).toBe("delivered");
-    expect(status(completed)).toMatchObject({ status: "completed", text: "the manager's text", enodevDelivered: true });
-    expect(pendingCompletions(meshRoot, meshRoot).map(envelope => envelope.result.text)).toEqual(["the manager's text"]);
-    // Consumed by its spawner, then the marker reappears (a crash replay): nothing is sent again.
-    consumeCompletion(meshRoot, id, recipient.sessionId);
-    fs.writeFileSync(path.join(completed, "unresolved-worker.json"), JSON.stringify({ reason: ENODEV, markedAt: 1, runId: id }));
-    expect(recoverEnodevTaskRun(completed)).toBe("delivered");
-    expect(pendingCompletions(meshRoot, meshRoot)).toHaveLength(0);
+    const completed = runDir(tempRoot(), meshRoot, "6".repeat(32), { status: "completed", text: "the manager's text" });
+    expect(recoverEnodevTaskRun(completed)).toBe("lost");
+    expect(status(completed)).toMatchObject({ status: "completed", text: "the manager's text", settledLost: true });
+    expect(journal(meshRoot)).toEqual([]);
   });
 
-  it("forced ENODEV in a real scratch process task: after its manager is gone, retention delivers the answer once", async () => {
+  // retention's run-file allowlist gains settlement.json (worker.ts writes it for every completed process run):
+  // a terminal run with a dead worker is collected with it; a run whose worker lives is not.
+  it("retention collects a terminal run holding settlement.json once its worker is dead, never while it lives", () => {
+    const tmp = tempRoot("fabric-enodev-tmp-");
+    const runRoot = path.join(tmp, "pi-fabric-runs-settled");
+    fs.mkdirSync(runRoot, { mode: 0o700 });
+    const run = (id: string, pid: number): string => {
+      const directory = path.join(runRoot, id);
+      fs.mkdirSync(directory, { mode: 0o700 });
+      fs.writeFileSync(path.join(directory, "task.txt"), "t");
+      fs.writeFileSync(path.join(directory, "status.json"), JSON.stringify({ id, name: "done", task: "t", status: "completed", text: "answer",
+        runner: "pi", transport: "process", startedAt: 1, finishedAt: 2, sessionId: String(pid), processStartTime: processStartTime(pid) ?? "1" }));
+      fs.writeFileSync(path.join(directory, "settlement.json"), JSON.stringify({ version: 1, runId: id, outcome: "completed", text: "answer" }));
+      return directory;
+    };
+    const dead = run("7".repeat(32), deadPid());
+    const live = run("8".repeat(32), livePid());
+    const now = Date.now();
+    fs.writeFileSync(path.join(runRoot, ".fabric-owner.json"), JSON.stringify({ pid: deadPid(), startedAt: now - 3_600_000,
+      heartbeatAt: now - 3_600_000, orphanedAt: now - 3_600_000 }));
+    sweepTempRunRoots({ tempRoot: tmp, orphanedTempRunRetentionMs: 1_000, oneShotRunRetentionMs: 1_000, now });
+    expect(fs.existsSync(dead)).toBe(false);
+    expect(fs.existsSync(path.join(live, "settlement.json"))).toBe(true);
+  });
+
+  it("forced ENODEV in a real scratch process task: retention settles it lost once, delivers nothing, then collects it", async () => {
     const meshRoot = tempRoot();
     const tmp = tempRoot("fabric-enodev-tmp-");
     const runRoot = path.join(tmp, "pi-fabric-runs-scratch");
@@ -187,7 +194,6 @@ describe.runIf(process.platform === "linux")("ENODEV-unconfirmed task-agent runs
     launch.mockRestore();
     const directory = path.join(runRoot, handle.id);
     expect(vetoed(directory)).toBe(true);
-    expect(fs.existsSync(path.join(directory, "completion-recipient.json"))).toBe(true);
     fs.writeFileSync(path.join(directory, "status.json"), JSON.stringify({ id: handle.id, name: "scratch", task: "scratch",
       status: "running", runner: "pi", transport: "process", sessionId: String(worker.pid), startedAt: 1 }));
     // The worker saved its answer, then exited; its manager is gone too (a dead owner, orphaned long ago).
@@ -197,18 +203,22 @@ describe.runIf(process.platform === "linux")("ENODEV-unconfirmed task-agent runs
     const owner = path.join(runRoot, ".fabric-owner.json");
     const now = Date.now();
     fs.writeFileSync(owner, JSON.stringify({ pid: deadPid(), startedAt: now - 3_600_000, heartbeatAt: now - 3_600_000, orphanedAt: now - 3_600_000 }));
-    const sweep = () => sweepTempRunRoots({ tempRoot: tmp, orphanedTempRunRetentionMs: 1_000, oneShotRunRetentionMs: 1_000, now });
-    sweep();
+    // Recovery alone first (what the sweep runs before its safety walk): settled lost, once.
+    expect(recoverEnodevTaskRun(directory)).toBe("lost");
     expect(vetoed(directory)).toBe(false);
-    // The spawner's Main drains its journal: the answer arrives once.
-    expect(pendingCompletions(meshRoot, meshRoot).map(envelope => envelope.result.id)).toEqual([handle.id]);
+    expect(status(directory)).toMatchObject({ status: "completed", settledLost: true, text: "SCRATCH ANSWER" });
+    expect(recoverEnodevTaskRun(directory)).toBeUndefined();
+    // The spawner's Main drains its journal: nothing arrives.
     const mesh = new MeshStore(meshRoot, 65536, 1000);
     const delivered: AgentRunResult[] = [];
-    const journal = new CompletionJournal(meshRoot, recipient, {} as never, mesh,
-      (result, done) => { delivered.push(result); done(); });
-    await journal.drain();
-    sweep();
-    await journal.drain();
-    expect(delivered.map(result => [result.id, result.status, result.text])).toEqual([[handle.id, "completed", "SCRATCH ANSWER"]]);
+    const completions = new CompletionJournal(meshRoot, recipient, {} as never, mesh, (result, done) => { delivered.push(result); done(); });
+    await completions.drain();
+    expect(delivered).toEqual([]);
+    expect(journal(meshRoot)).toEqual([]);
+    // With the marker gone, retention can collect the run.
+    sweepTempRunRoots({ tempRoot: tmp, orphanedTempRunRetentionMs: 1_000, oneShotRunRetentionMs: 1_000, now });
+    expect(fs.existsSync(directory)).toBe(false);
+    await completions.drain();
+    expect(delivered).toEqual([]);
   });
 });

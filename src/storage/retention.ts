@@ -228,6 +228,9 @@ const runFiles = new Set([
   "reply.json", "relaunches.jsonl", "completion-recipient.json", "route-session.jsonl", "route-dispatch-receipt.json",
   // Native session of an unrouted process Pi task (worker.ts persistentPiTask); owned file only.
   "session.jsonl",
+  // The Pi worker's settlement receipt (worker.ts savePiSettlementReceipt), written for every completed process run:
+  // without it no such run was ever collected (smarty-dev#9855).
+  "settlement.json",
 ]);
 const runFile = (name: string): boolean => runFiles.has(name) || /^oversized-event-prefix(-\d+)?\.txt$/.test(name);
 const followUpName = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.json$/;

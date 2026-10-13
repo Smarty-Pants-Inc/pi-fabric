@@ -5,8 +5,6 @@ import { processStartTime } from "../residency/process-identity.js";
 import { ownedStat, processAlive } from "../storage/scratch.js";
 import { UNRESOLVED_WORKER_FILE } from "../storage/retention.js";
 import { commitRunArchive } from "./archive-custody.js";
-import { completionRecipientFromRun, saveCompletion, type CompletionRecipient } from "./completion-journal.js";
-import { readHostLease } from "../topology/host-leases.js";
 import type { AgentRunResult } from "./types.js";
 
 /**
@@ -227,34 +225,16 @@ export const settleEnodevRun = (directory: string, actorId: string, activationId
 };
 
 /**
- * smarty-dev#9855: the recipient a task agent's answer can still reach. The completion journal delivers an envelope
- * only to its exact spawn-time root AND session (sameRecipient), so the spawner can take it only while that root's
- * host lease names that same Main session and is live. Anything else (a Main restarted under a new session, an
- * expired or missing lease) can never consume it.
- */
-const recipientLive = (meshRoot: string, recipient: CompletionRecipient, now: number): boolean => {
-  let lease: ReturnType<typeof readHostLease>;
-  try { lease = readHostLease(meshRoot, recipient.rootId); } catch { return false; }
-  const session = lease?.session;
-  return session?.id === recipient.sessionId && Math.max(session.expiresAt, lease?.reloadUntil ?? -Infinity) > now;
-};
-
-/**
  * smarty-dev#9855: an ENODEV-unconfirmed TASK-AGENT run (no actorId; #912 recovers actor runs) found by offline
  * retention, whose manager is gone. The same facts as #912: the exact ENODEV marker, this run's own process status
- * record, its worker proven gone (pid-reuse safe). Then, ONCE (the marker goes last, after a durable save):
- * - a saved answer (settlement.json receipt for exactly this run) whose recorded spawner can still take it is put
- *   in that spawner's completion journal, addressed ONLY to the host-owned launch manifest's recipient
- *   (completion-recipient.json: exact root and session, never a name); the journal's per-run envelope and receipt
- *   make delivery idempotent, so a crash before the marker goes saves the same envelope again and it is consumed
- *   once. The run settles completed (enodevDelivered).
- * - otherwise the run settles lost (settledLost; a saved answer stays in its status record), delivering nothing.
- * The marker is removed, so retention can collect the run. Nothing is deleted here. Undefined keeps the veto.
- * `dryRun` decides the same outcome and writes nothing (the read-only report).
+ * record, its worker proven gone (pid-reuse safe). Then it settles the run LOST, once, and delivers nothing: a
+ * record its manager already made terminal keeps its outcome and gains settledLost; a running one becomes completed
+ * with its saved answer (settlement.json receipt for exactly this run) kept in its own status record, or failed
+ * with none. The marker goes last, so retention can collect the run. Nothing is deleted here. Undefined keeps the
+ * veto. Delivery was removed in pi-fabric#1027 review round 1 (principal-data P1): a same-uid worker can rewrite the
+ * run's recipient manifest and its exit proof, so no answer recovered here may cross to another session.
  */
-export const recoverEnodevTaskRun = (directory: string, options: { now?: number; dryRun?: boolean } = {}):
-  "delivered" | "lost" | undefined => {
-  const now = options.now ?? Date.now();
+export const recoverEnodevTaskRun = (directory: string): "lost" | undefined => {
   const id = path.basename(directory);
   if (!RUN_ID.test(id)) return undefined;
   const marker = readJson(path.join(directory, UNRESOLVED_WORKER_FILE));
@@ -265,23 +245,7 @@ export const recoverEnodevTaskRun = (directory: string, options: { now?: number;
   if (!enodevWorkerGone(record)) return undefined;
   const text = savedEnodevAnswer(directory);
   const run: EnodevRun = { id, statusFile, record, activationId: "", ...(text === undefined ? {} : { text }) };
-  let address: { meshRoot: string; recipient: CompletionRecipient } | undefined;
-  try {
-    const meshRoot = readJson(path.join(directory, "completion-recipient.json"))?.meshRoot;
-    const recipient = typeof meshRoot === "string" ? completionRecipientFromRun(meshRoot, directory) : undefined;
-    if (typeof meshRoot === "string" && recipient) address = { meshRoot, recipient };
-  } catch { address = undefined; } // A malformed manifest proves no recipient: settled lost.
-  // A record its manager already made terminal keeps its outcome (goneEnodevOutcome); only a running one takes the
-  // saved answer. Either way the journal's run-id receipt means a result its spawner consumed is never sent again.
   const terminal = record.status !== "running" && record.status !== "queued";
-  if (text !== undefined && address && recipientLive(address.meshRoot, address.recipient, now)) {
-    if (options.dryRun) return "delivered";
-    const result = { ...goneEnodevOutcome(directory, record), enodevDelivered: true } as AgentRunResult;
-    saveCompletion(address.meshRoot, address.recipient, result); // durable, idempotent by run id
-    settle(directory, run, terminal ? { enodevDelivered: true } : { status: "completed", enodevDelivered: true, text });
-    return "delivered";
-  }
-  if (options.dryRun) return "lost";
   settle(directory, run, terminal ? { settledLost: true } : text === undefined
     ? { status: "failed", settledLost: true, error: "lost: the worker exit was unconfirmed (ENODEV), no answer was saved and its manager is gone" }
     : { status: "completed", settledLost: true, text });

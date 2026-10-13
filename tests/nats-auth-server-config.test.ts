@@ -553,3 +553,166 @@ describe("validateNatsServerConfigInput: public JWT and key consistency (install
     }
   });
 });
+
+// Review regressions C1/C2 (.local/7504-final-change-only-code-security.md). Pure config checks only: they cannot show
+// that a real nats-server on Windows parses drive paths (hosted T8/T1, owner fabric-store, unconfirmed).
+describe("config review regressions", () => {
+  const PATH_FIELDS = ["jetstream.storeDir", "resolver.dir", "cluster.tls.certFile", "cluster.tls.keyFile", "cluster.tls.caFile"] as const;
+  type PathField = (typeof PATH_FIELDS)[number];
+  const setPath = (i: ServerConfigInput, field: PathField, value: string) => {
+    const tls = i.cluster?.tls;
+    assert(tls, "the triple fixture has route TLS");
+    if (field === "jetstream.storeDir") i.jetstream.storeDir = value;
+    else if (field === "resolver.dir") i.resolver.dir = value;
+    else if (field === "cluster.tls.certFile") tls.certFile = value;
+    else if (field === "cluster.tls.keyFile") tls.keyFile = value;
+    else tls.caFile = value;
+  };
+  const getPath = (i: ServerConfigInput, field: PathField): string | undefined =>
+    field === "jetstream.storeDir"
+      ? i.jetstream.storeDir
+      : field === "resolver.dir"
+        ? i.resolver.dir
+        : i.cluster?.tls[field.slice("cluster.tls.".length) as "certFile" | "keyFile" | "caFile"];
+
+  it("C1 refuses a route inventory that omits this node's cluster.listen host and port", async () => {
+    const mod = await load();
+    const missingLocal = mutate(triple, (i) => {
+      if (i.cluster) i.cluster.routes = [ROUTES[0] as string, ROUTES[2] as string, "nats-route://n4.example.ts.net:6222"];
+    });
+    expect(refusal(mod, missingLocal).field).toBe("cluster.routes");
+    const wrongPort = mutate(triple, (i) => i.cluster && (i.cluster.listen.port = 6223));
+    expect(refusal(mod, wrongPort).field).toBe("cluster.routes");
+    const error = refusal(mod, missingLocal);
+    expect(error.message.includes("cluster.listen")).toBe(true);
+    expect(error.message.includes("n4.example")).toBe(false);
+  });
+
+  it("C1 refuses an IP cluster.listen (DNS-only routes cannot represent it) and leading-zero route ports", async () => {
+    const mod = await load();
+    for (const host of ["100.64.0.2", "10.0.0.2"]) {
+      expect(refusal(mod, mutate(triple, (i) => i.cluster && (i.cluster.listen.host = host))).field, host).toBe(
+        "cluster.listen.host",
+      );
+    }
+    // A leading-zero port is the same endpoint as 6222 and must not pass as a distinct node.
+    for (const route of ["nats-route://n1.example.ts.net:06222", "nats-route://n3.example.ts.net:006222"]) {
+      const input = mutate(triple, (i) => i.cluster && (i.cluster.routes[route.includes("n1.") ? 0 : 2] = route));
+      expect(refusal(mod, input).field, route).toBe("cluster.routes");
+    }
+  });
+
+  it("C1 keeps accepting the uniform DNS route inventory in any order, for any configured local node", async () => {
+    const mod = await load();
+    const [a, b, c] = ROUTES as [string, string, string];
+    for (const order of [[a, b, c], [c, b, a], [b, a, c], [c, a, b]]) {
+      const input = mutate(triple, (i) => i.cluster && (i.cluster.routes = [...order]));
+      expect(mod.validateNatsServerConfigInput(input).cluster?.routes, order.join(",")).toEqual(order);
+    }
+    for (const node of ["n1", "n3"]) {
+      const input = mutate(triple, (i) => {
+        i.serverName = node;
+        i.listen.host = `${node}.example.ts.net`;
+        if (i.cluster) i.cluster.listen.host = `${node}.example.ts.net`;
+      });
+      expect(mod.validateNatsServerConfigInput(input)).toEqual(input);
+    }
+  });
+
+  it("C2 accepts drive-rooted Windows paths with either separator for every path field, canonicalized to forward slashes", async () => {
+    const mod = await load();
+    for (const field of PATH_FIELDS) {
+      for (const [given, canonical] of [
+        ["C:/NATS/js", "C:/NATS/js"],
+        ["C:\\NATS\\js", "C:/NATS/js"],
+        ["d:\\NATS/mixed sep\\x.crt", "D:/NATS/mixed sep/x.crt"],
+      ] as const) {
+        const input = mutate(triple, (i) => setPath(i, field, given));
+        const normalized = mod.validateNatsServerConfigInput(input);
+        expect(getPath(normalized, field), `${field} ${JSON.stringify(given)}`).toBe(canonical);
+        const lines = configLines(mod.renderNatsServerConfig(input));
+        expect(lines.some((line) => line.endsWith(`: ${JSON.stringify(canonical)}`)), `${field} rendered`).toBe(true);
+        // Rendering the normalized copy is stable (render validates again).
+        expect(mod.renderNatsServerConfig(normalized)).toBe(mod.renderNatsServerConfig(input));
+      }
+    }
+  });
+
+  it("C2 compares Windows paths after normalization for the distinctness checks", async () => {
+    const mod = await load();
+    const sameDir = mutate(triple, (i) => {
+      i.jetstream.storeDir = "C:\\NATS\\js";
+      i.resolver.dir = "c:/nats/JS";
+    });
+    expect(refusal(mod, sameDir).field).toBe("resolver.dir");
+    const sameTls = mutate(triple, (i) => {
+      if (!i.cluster) return;
+      i.cluster.tls.certFile = "C:/NATS/tls/n2.crt";
+      i.cluster.tls.keyFile = "C:\\NATS\\tls\\n2.crt";
+    });
+    expect(refusal(mod, sameTls).field).toBe("cluster.tls");
+  });
+
+  it("C2 refuses UNC, device/namespace, drive- and slash-relative, non-normalized, control, env and reserved Windows forms", async () => {
+    const mod = await load();
+    const forbidden = [
+      "\\\\server\\share\\js",
+      "//server/share/js",
+      "\\\\?\\C:\\NATS\\js",
+      "\\\\.\\C:\\NATS\\js",
+      "\\\\?\\UNC\\server\\share",
+      "\\??\\C:\\NATS",
+      "C:NATS\\js",
+      "C:",
+      "C:/",
+      "C:\\",
+      "\\NATS\\js",
+      "CC:/NATS",
+      "1:/NATS",
+      "C:/NATS/../js",
+      "C:\\NATS\\..\\js",
+      "C:/NATS/./js",
+      "C:\\NATS\\\\js",
+      "C:/NATS//js",
+      "C:\\NATS\\js\\",
+      "C:/NATS/js/",
+      "C:/NATS/js\n",
+      "C:/NA\u0000TS",
+      "C:/NA\tTS",
+      "C:/N\u00c4TS",
+      "C:/$HOME/js",
+      "C:/%USERPROFILE%/js",
+      "%SYSTEMROOT%\\js",
+      "C:/NATS/a:b",
+      "C:/NATS/a*b",
+      "C:/NATS/a?b",
+      'C:/NATS/a"b',
+      "C:/NATS/a<b",
+      "C:/NATS/a>b",
+      "C:/NATS/a|b",
+      "C:/NATS/js.",
+      "C:/NATS/js ",
+    ];
+    for (const field of PATH_FIELDS) {
+      for (const value of forbidden) {
+        const error = refusal(mod, mutate(triple, (i) => setPath(i, field, value)));
+        expect(error.field, `${field} ${JSON.stringify(value)}`).toBe(field);
+        const echoes = error.message.includes(value) || error.message.includes("USERPROFILE") || error.message.includes("share");
+        expect(echoes, `${field} ${JSON.stringify(value)}: value-free message`).toBe(false);
+      }
+    }
+  });
+
+  it("C2 leaves POSIX paths unchanged: backslash stays literal inside a segment, relative and traversal still refused", async () => {
+    const mod = await load();
+    for (const field of PATH_FIELDS) {
+      for (const value of ["/srv/fabric/nats/js", "/srv/nats\\js", "/srv/C:/js", '/srv/a"b}c{#d\\e ;f']) {
+        const input = mutate(triple, (i) => setPath(i, field, value));
+        expect(getPath(mod.validateNatsServerConfigInput(input), field), `${field} ${JSON.stringify(value)}`).toBe(value);
+      }
+      for (const value of ["srv/js", "~/js", "/srv/../js", "/srv//js", "/srv/js/", "/srv/$HOME", "/srv/j\u0000s"]) {
+        expect(refusal(mod, mutate(triple, (i) => setPath(i, field, value))).field, `${field} ${JSON.stringify(value)}`).toBe(field);
+      }
+    }
+  });
+});

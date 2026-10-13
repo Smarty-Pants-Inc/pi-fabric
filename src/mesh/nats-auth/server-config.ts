@@ -39,7 +39,10 @@ export interface NatsClusterConfig {
   /** Cluster name, identical on every node. */
   name: string;
   listen: NatsHostPort;
-  /** Every configured node including this one, as nats-route://<dns-name>:<port>; the same list on every node. */
+  /**
+   * Every configured node including this one, as nats-route://<dns-name>:<port> (no leading-zero ports); the same list
+   * on every node, in any order. Must contain this node's cluster.listen host and port, so that host must be DNS.
+   */
   routes: string[];
   tls: NatsRouteTls;
 }
@@ -76,7 +79,9 @@ const DURATION = /^[1-9][0-9]{0,8}(ms|s|m|h)$/;
 const PUBLIC_KEY = /^[A-Z2-7]{56}$/;
 const JWT_SEGMENT = /^[A-Za-z0-9_-]+$/;
 const DNS_LABEL = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
-const ROUTE = /^nats-route:\/\/([^:/@[\]]+):([0-9]{1,5})$/;
+const ROUTE = /^nats-route:\/\/([^:/@[\]]+):([1-9][0-9]{0,4})$/;
+const WINDOWS_DRIVE = /^([A-Za-z]):[\\/]/;
+const WINDOWS_RESERVED = /[<>:"|?*%]/;
 const MAX_JWT_BYTES = 1 << 20;
 
 function fail(field: string, reason: string): never {
@@ -105,16 +110,37 @@ function name(value: unknown, field: string): string {
   return NAME.test(s) ? s : fail(field, "must be 1-64 characters of [A-Za-z0-9_-], starting with a letter or digit");
 }
 
-/** Absolute, normalized, printable-ASCII path without variables; rendered JSON-quoted. */
+const NORMALIZED = "must be a normalized path without empty, '.' or '..' segments";
+
+/**
+ * Absolute, normalized, printable-ASCII path without variables; rendered JSON-quoted. POSIX paths start with '/' and
+ * are returned unchanged (a backslash is a literal segment character). Drive-rooted Windows paths (X:/ or X:\) are
+ * accepted on any platform and returned canonical (upper-case drive, '/' separators); UNC, device/namespace,
+ * drive-relative and slash-relative forms are refused. Whether nats-server on Windows parses them is a hosted check.
+ */
 function absolutePath(value: unknown, field: string): string {
   const s = text(value, field);
   if (!/^[\x20-\x7e]+$/.test(s) || s.includes("$")) fail(field, "must be printable ASCII without '$'");
-  if (!s.startsWith("/")) fail(field, "must be an absolute path (no HOME or relative default)");
-  const segments = s.slice(1).split("/");
-  if (segments.some((segment) => segment === "" || segment === "." || segment === "..")) {
-    fail(field, "must be a normalized path without empty, '.' or '..' segments");
+  const drive = WINDOWS_DRIVE.exec(s);
+  if (drive) {
+    const segments = s.slice(3).split(/[\\/]/);
+    if (segments.some((segment) => segment === "" || segment === "." || segment === "..")) fail(field, NORMALIZED);
+    if (segments.some((segment) => WINDOWS_RESERVED.test(segment) || /[. ]$/.test(segment))) {
+      fail(field, "Windows path segments must not contain < > : \" | ? * % or end in a dot or space");
+    }
+    return `${(drive[1] as string).toUpperCase()}:/${segments.join("/")}`;
   }
+  if (!s.startsWith("/")) {
+    fail(field, "must be an absolute POSIX or drive-rooted Windows path (no HOME, UNC, device or relative default)");
+  }
+  const segments = s.slice(1).split("/");
+  if (segments.some((segment) => segment === "" || segment === "." || segment === "..")) fail(field, NORMALIZED);
   return s;
+}
+
+/** Comparison key for distinctness: Windows drive paths are case-insensitive. */
+function pathKey(path: string): string {
+  return WINDOWS_DRIVE.test(path) ? path.toLowerCase() : path;
 }
 
 function port(value: unknown, field: string): number {
@@ -259,7 +285,7 @@ export function validateNatsServerConfigInput(input: unknown): NatsServerConfigI
 
   const resolverRecord = record(v.resolver, "resolver", ["dir"], ["interval", "timeout"]);
   const resolver: NatsResolverConfig = { dir: absolutePath(resolverRecord.dir, "resolver.dir") };
-  if (resolver.dir === storeDir) fail("resolver.dir", "must differ from jetstream.storeDir");
+  if (pathKey(resolver.dir) === pathKey(storeDir)) fail("resolver.dir", "must differ from jetstream.storeDir");
   if (resolverRecord.interval !== undefined) resolver.interval = duration(resolverRecord.interval, "resolver.interval");
   if (resolverRecord.timeout !== undefined) resolver.timeout = duration(resolverRecord.timeout, "resolver.timeout");
 
@@ -295,6 +321,9 @@ export function validateNatsServerConfigInput(input: unknown): NatsServerConfigI
   const c = record(v.cluster, "cluster", ["name", "listen", "routes", "tls"]);
   const clusterName = name(c.name, "cluster.name");
   const clusterListen = hostPort(c.listen, "cluster.listen", false);
+  if (ipv4(clusterListen.host)) {
+    fail("cluster.listen.host", "must be this node's DNS name: routes are DNS-only, so an IP listener cannot be in them");
+  }
   if (clusterListen.port === listen.port || clusterListen.port === monitor?.port) {
     fail("cluster.listen.port", "must differ from listen.port and monitor.port");
   }
@@ -309,14 +338,18 @@ export function validateNatsServerConfigInput(input: unknown): NatsServerConfigI
     port(Number((match as RegExpExecArray)[2]), "cluster.routes");
     return route as string;
   });
+  // The port pattern has no leading zeros, so each route string is its canonical endpoint.
   if (new Set(routes).size !== routes.length) fail("cluster.routes", "must not repeat a route");
+  if (!routes.includes(`nats-route://${clusterListen.host}:${clusterListen.port}`)) {
+    fail("cluster.routes", "must include this node's cluster.listen host and port");
+  }
   const tlsRecord = record(c.tls, "cluster.tls", ["certFile", "keyFile", "caFile"]);
   const tls: NatsRouteTls = {
     certFile: absolutePath(tlsRecord.certFile, "cluster.tls.certFile"),
     keyFile: absolutePath(tlsRecord.keyFile, "cluster.tls.keyFile"),
     caFile: absolutePath(tlsRecord.caFile, "cluster.tls.caFile"),
   };
-  if (new Set([tls.certFile, tls.keyFile, tls.caFile]).size !== 3) fail("cluster.tls", "files must be distinct");
+  if (new Set([tls.certFile, tls.keyFile, tls.caFile].map(pathKey)).size !== 3) fail("cluster.tls", "files must be distinct");
   config.cluster = { name: clusterName, listen: clusterListen, routes, tls };
   return config;
 }

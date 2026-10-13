@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -5,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { meshBackendStatus, type MeshBackendOptions } from "../src/mesh/backend-migration.js";
 import { main } from "../src/mesh/mesh-backend-cli.js";
+import { decodeMeshStateFile, encodeMeshStateFile, type MeshStateFile } from "../src/mesh/state-file.js";
 import { openNodeSqlite, type SqliteConnection, type SqliteOpener } from "../src/mesh/state-sqlite.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 
@@ -292,6 +294,62 @@ describe.skipIf(process.platform !== "linux")("recorded cleanup", () => {
     const warnings = result.json.cleanupWarnings ?? [];
     expect(warnings.some(text => text.includes("EIO") && text.includes(root))).toBe(true);
     for (const text of warnings) expect(result.err).toContain(text);
+  });
+
+  // A writer that ignored .lock rewrites state.json at import-read: the fence error (exit 3) precedes the importing
+  // commit. A fresh root's state.db is this run's (removed under the fence); one left by an earlier exit-1 run is not.
+  const rogueAt = (root: string) => (step: string): void => {
+    if (step !== "import-read") return;
+    const file = decodeMeshStateFile(path.join(root, "state.json"), 64 * 1024 * 1024, false) as MeshStateFile & { highWater: number };
+    const version = file.highWater + 1;
+    fs.writeFileSync(path.join(root, "state.json"), encodeMeshStateFile({ ...file, highWater: version,
+      entries: { ...file.entries, "rogue/key": { key: "rogue/key", value: 1, version, updatedAt: Date.now(), updatedBy: identity } } } as never).serialized);
+  };
+  const rogueKept = (root: string): void => {
+    const file = decodeMeshStateFile(path.join(root, "state.json"), 64 * 1024 * 1024, false) as MeshStateFile;
+    expect(file.entries["rogue/key"]?.value).toBe(1);
+  };
+
+  it("a state.json moved at import-read (fresh root): removes only this run's state.db*, under the fence", async () => {
+    const root = await fileRoot();
+    await proveSqlite(root);
+    const calls = recordRemovals(root);
+    const result = await run(root, "cutover", { onStep: rogueAt(root) });
+    expect(result.code, result.err).toBe(3);
+    expect(result.json.error).toMatch(/changed before the flag commit/);
+    rogueKept(root);
+    fencedRemovals(calls);
+    expect(calls.find(call => call.name === "state.db")?.target).toBe(result.opened[0]);
+    expect(dbNames(root).filter(name => !calls.some(call => call.name === name))).toEqual([]);
+    expect(result.json.cleanupWarnings ?? []).toEqual([]);
+  });
+
+  it("refusals over a database an exit-1 run left keep its inode, bytes and meta (backend=file, epoch 0)", async () => {
+    const root = await fileRoot();
+    await proveSqlite(root);
+    const calls = recordRemovals(root);
+    const crashed = await run(root, "cutover", { onStep: (at) => { if (at === "import-read") throw new Error("killed"); } });
+    expect(crashed.code, crashed.err).toBe(1);
+    expect(calls).toEqual([]);
+    const kept = idOf(fs.lstatSync(path.join(root, "state.db")));
+    const existing = new Set(dbNames(root).map(name => idOf(fs.lstatSync(path.join(root, name)))));
+    const sha = (): string => createHash("sha256").update(fs.readFileSync(path.join(root, "state.db"))).digest("hex");
+    const bytesBefore = sha();
+    const statusBefore = await meshBackendStatus(root);
+    for (const attempt of ["file-move", "readiness"] as const) {
+      const result = await run(root, "cutover", attempt === "file-move" ? { onStep: rogueAt(root) } : { refuseAt: "importing" });
+      expect(result.code, `${attempt}: ${result.err}`).toBe(3);
+      if (attempt === "file-move") expect(result.json.error).toMatch(/changed before the flag commit/);
+      else refusedUnderFence(result, "importing");
+    }
+    rogueKept(root);
+    fencedRemovals(calls);
+    expect(calls.filter(call => call.name === "state.db" || existing.has(call.target))).toEqual([]);
+    expect(idOf(fs.lstatSync(path.join(root, "state.db")))).toBe(kept);
+    expect(sha()).toBe(bytesBefore);
+    const statusAfter = await meshBackendStatus(root);
+    expect(statusAfter).toMatchObject({ backend: "file", epoch: 0 });
+    expect({ commit: statusAfter.commit, dbDigest: statusAfter.dbDigest }).toEqual({ commit: statusBefore.commit, dbDigest: statusBefore.dbDigest });
   });
 
   it("a refusal before the final sqlite commit keeps the committed importing database", async () => {

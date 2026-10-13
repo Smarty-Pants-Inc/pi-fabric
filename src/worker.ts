@@ -1651,9 +1651,10 @@ const main = async (): Promise<void> => {
       runLog.event(line, undefined);
       // pi-fabric#1034 round 6: an unparsable Pi frame (cut at close, or a projection sentinel) may have been a tool
       // start or end; the receipt cannot vouch for it.
-      if (isPi && line.trim()) {
+      if (isPi && line.trim() && !receiptLineDropped) {
         receiptLineDropped = true;
         record.writeReceipt = receiptNow();
+        update(); // persist the first transition, so a checkpoint read by the manager shows it
       }
       return;
     }

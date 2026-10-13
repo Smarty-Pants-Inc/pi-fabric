@@ -641,6 +641,8 @@ const reconcileNestedAgents = (records: AgentRunRecord[], owner: AgentRunRecord)
         ...rest,
         status: "failed",
         error: `Nested agent owner ${owner.id} finished (${owner.status}) before a terminal result was retained`,
+        // pi-fabric#1034 round 7: a running checkpoint made terminal here; later effects are unknown.
+        ...carriedWriteReceipt(record.runner, record),
         finishedAt,
         updatedAt: Math.max(record.updatedAt, finishedAt),
       };
@@ -714,10 +716,11 @@ const carriedWriteReceipt = (
   runner: string,
   previous: AgentRunRecord | undefined,
 ): { writeReceipt?: NonNullable<AgentRunRecord["writeReceipt"]> } => {
+  if (runner !== "pi" && runner !== "pi-durable") return {}; // only Pi children have a receipt
   const receipt = previous?.writeReceipt;
   const known = previous !== undefined && previous.status !== "queued" && previous.status !== "running";
   if (receipt) return { writeReceipt: known ? receipt : { ...receipt, truncated: true } };
-  return runner === "pi" || runner === "pi-durable" ? { writeReceipt: { paths: [], commands: [], truncated: true } } : {};
+  return { writeReceipt: { paths: [], commands: [], truncated: true } };
 };
 
 const failedRecord = (

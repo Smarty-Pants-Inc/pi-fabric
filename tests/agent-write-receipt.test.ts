@@ -7,6 +7,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { AgentManager } from "../src/agents/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
+import { processStartTime } from "../src/residency/process-identity.js";
 
 const roots: string[] = [];
 const managers: AgentManager[] = [];
@@ -79,9 +80,10 @@ import fs from "node:fs";
 process.stdin.resume(); process.stdin.on("data", () => {});
 const mode = ${JSON.stringify(mode)};
 const emit = (event) => process.stdout.write(JSON.stringify(event) + String.fromCharCode(10));
-emit({ type: "tool_execution_start", toolCallId: "w1", toolName: "write", args: { path: "f.txt", content: "F" } });
+if (mode === "garbage") process.stdout.write('{"type":"tool_execution_start","toolCallId":"w1"' + String.fromCharCode(10));
+else emit({ type: "tool_execution_start", toolCallId: "w1", toolName: "write", args: { path: "f.txt", content: "F" } });
 fs.writeFileSync("f.txt", "F");
-if (!mode.endsWith("pending")) emit({ type: "tool_execution_end", toolCallId: "w1", toolName: "write", isError: false, durationMs: 1, result: { content: [{ type: "text", text: "ok" }] } });
+if (!mode.endsWith("pending") && mode !== "garbage") emit({ type: "tool_execution_end", toolCallId: "w1", toolName: "write", isError: false, durationMs: 1, result: { content: [{ type: "text", text: "ok" }] } });
 setInterval(() => {}, 1000);
 `;
 
@@ -108,7 +110,12 @@ describe("terminal paths keep the write receipt (pi-fabric#1034 round 7)", () =>
     while (Date.now() < until) {
       try {
         const status = JSON.parse(fs.readFileSync(statusFile, "utf8"));
-        if (ready(status.writeReceipt)) { pid = Number(status.sessionId); break; }
+        // Only a still-running record names a live worker; its pid must also match its recorded /proc birth time.
+        if (status.status === "running" && ready(status.writeReceipt)) {
+          const candidate = Number(status.sessionId);
+          if (candidate > 0 && (status.processStartTime === undefined || processStartTime(candidate) === status.processStartTime)) pid = candidate;
+          break;
+        }
       } catch { /* not written yet */ }
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
@@ -137,6 +144,21 @@ describe("terminal paths keep the write receipt (pi-fabric#1034 round 7)", () =>
     const result = await manager.wait(handle.id);
     expect(["failed", "timed_out"]).toContain(result.status);
     expect(result.writeReceipt?.truncated).toBe(true);
+  }, 60_000);
+
+  it("an unparsable frame is persisted at once: the running checkpoint already shows truncated", async () => {
+    const { root, manager } = lifecycleManager("garbage");
+    const handle = await manager.spawn({ task: "cut frame then hang", runner: "pi", transport: "process", extensions: false });
+    const statusFile = path.join(root, "runs", handle.id, "status.json");
+    const until = Date.now() + 20_000;
+    let checkpoint: { status?: string; writeReceipt?: { truncated?: boolean } } = {};
+    while (Date.now() < until) {
+      try { checkpoint = JSON.parse(fs.readFileSync(statusFile, "utf8")); } catch { /* not written yet */ }
+      if (checkpoint.writeReceipt?.truncated) break;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    expect(checkpoint).toMatchObject({ status: "running", writeReceipt: { truncated: true } });
+    await manager.stop(handle.id);
   }, 60_000);
 
   // Worker-written terminal records (regression guards; green on f8090829 too).

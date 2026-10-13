@@ -404,11 +404,22 @@ describe.skipIf(process.platform === "win32")("fabric-mesh-backend readiness gat
     const root = await fileRoot();
     expect((await run(["reader-proof", "--root", root, "--backend", "sqlite"])).code).toBe(0); // fabric-rel-a
     let live: Writer[] = [{ pid: 7, release: "fabric-rel-a", mode: "sqlite" }];
+    const stateJson = fs.readFileSync(path.join(root, "state.json"));
+    expect(fs.existsSync(path.join(root, "state.db"))).toBe(false);
     const result = await run(["cutover", "--root", root], { writers: () => live,
       options: { beforeCommit: () => { live = [...live, { pid: 11, release: "fabric-rel-new", mode: "sqlite" }]; } } });
     expect(result.code).toBe(3);
     expect(result.err).toContain("(under the fence, before the importing commit): fabric@fabric-rel-new (no proof from installed reader fabric release fabric-rel-new");
-    expect(await backendOf(root)).toBe("file");
+    // smarty-dev#9501: the refusal precedes the importing commit and this run created state.db, so it is removed under
+    // the fence: status backend "none" means no state.db (the file reader stays). Without a held directory fd
+    // (macOS smarty-dev#11066) the database is kept, at backend=file.
+    expect(fs.readFileSync(path.join(root, "state.json")).equals(stateJson)).toBe(true);
+    if (result.err.includes("no-held-dir-fd")) {
+      expect(await backendOf(root)).toBe("file");
+    } else {
+      expect(fs.readdirSync(root).filter(name => /^state\.db(?:-wal|-shm|-journal)?$/.test(name))).toEqual([]);
+      expect(await meshBackendStatus(root)).toMatchObject({ backend: "none", epoch: 0, reader: { source: "file" } });
+    }
   });
 
   // ponytail: the holder scan reads /proc and /proc/locks, Linux only (smarty-dev#7936); off Linux it

@@ -461,11 +461,20 @@ describe("mesh backend cutover fence: .lock and custody.lock; census advisory", 
     };
     const before = tempRoot("moved-before");
     await seedFileRoot(before);
+    expect(fs.existsSync(path.join(before, "state.db"))).toBe(false);
     const aborted = await cutoverMeshState(before, { onStep: (step) => { if (step === "import-read") rogueWrite(before); } })
       .catch((error: unknown) => error);
     expect(aborted).toBeInstanceOf(MeshBackendFenceError);
     expect((aborted as Error).message).toMatch(/changed before the flag commit .*import aborted, the backend flag is unchanged/);
-    expect(rawMeta(before)).toMatchObject({ backend: "file", epoch: 0, commit_no: 0 });
+    // smarty-dev#9501: this run created state.db (the root had none), so the fence refusal before the importing commit
+    // removes it through the held root fd. rawMeta would open (and so create) an empty state.db: only read meta where
+    // the database was kept (no held directory fd: macOS smarty-dev#11066, Windows smarty-dev#7858).
+    if ((aborted as { reason?: string }).reason === "no-held-dir-fd") {
+      expect(rawMeta(before)).toMatchObject({ backend: "file", epoch: 0, commit_no: 0 });
+    } else {
+      expect(fs.readdirSync(before).filter(name => /^state\.db(?:-wal|-shm|-journal)?$/.test(name))).toEqual([]);
+      expect(await meshBackendStatus(before)).toMatchObject({ backend: "none", epoch: 0, reader: { source: "file" } });
+    }
     expect(resolveMeshStateSource(before).source).toBe("file");
     expect(decodeFile(before).entries["rogue/key"]?.value).toBe(1);
 

@@ -493,7 +493,23 @@ export class EventLog {
           try { liveOffset = fs.statSync(this.#eventsPath).size; }
           catch (error) { if (errorCode(error) !== "ENOENT") throw error; }
           restored = JSON.stringify({ ...intent, liveOffset });
-          writeFileAtomic(file, restored, { durable: true });
+          writeFileAtomic(file, restored, { durable: true, beforeRename: () => {
+            // pi-fabric#1036 r4: this rewrite replaces the ORIGINAL judged intent (pre-read inode `judged`, exact bytes
+            // `text`), not bytes this hold wrote: those are proven later by #removeWrittenIntent. Before each rename,
+            // lstat, reread, lstat again: both must be the judged regular-file inode and the bytes unchanged, else a
+            // missing, successor or in-place-refreshed intent is kept. Plain rename leaves a check-to-rename window.
+            // size/mtimeMs/ctimeMs (not atime) catch an in-place write during the reread or a refreshed original.
+            const unchanged = (stat: fs.Stats | undefined): boolean => !!stat?.isFile() && stat.dev === judged.dev &&
+              stat.ino === judged.ino && stat.size === judged.size && stat.mtimeMs === judged.mtimeMs && stat.ctimeMs === judged.ctimeMs;
+            const named = fs.lstatSync(file, { throwIfNoEntry: false });
+            let current: string | undefined;
+            try { if (named?.isFile()) current = fs.readFileSync(file, "utf8"); }
+            catch (error) { if (errorCode(error) !== "ENOENT") throw error; }
+            const reread = fs.lstatSync(file, { throwIfNoEntry: false });
+            if (current !== text || !unchanged(named) || !unchanged(reread)) {
+              throw new MeshDedupeRecoveryError(`Cannot recover dedupe intent ${intent.dedupeKey}: the judged intent was replaced or refreshed and is kept`);
+            }
+          } });
           fs.appendFileSync(this.#eventsPath, `${entry.line}\n`, { encoding: "utf8", mode: 0o600 });
           this.#confirmEventFile(this.#eventsPath);
         }

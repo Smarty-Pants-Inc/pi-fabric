@@ -5,6 +5,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MESH_ARCHIVE_CONFIG } from "../src/mesh/archive.js";
 import { MeshStore, type MeshStoreOptions } from "../src/mesh/store.js";
+import * as verifiedRemoval from "../src/storage/verified-remove.js";
 import { MeshDedupeStoreFullError } from "../src/mesh.js";
 
 const roots: string[] = [];
@@ -129,10 +130,12 @@ describe("durable mesh dedupe receipt retention", () => {
       ...(archived ? { archiveDir: path.join(store.root, "archive") } : {}),
     }));
     time.set(original.createdAt + 1000);
-    const remove = fs.rmSync.bind(fs);
-    const unavailable = vi.spyOn(fs, "rmSync").mockImplementation((target, options) => {
+    // Inject at the intent removal boundary itself: verifiedRemove contains primitive (rmSync) failures as
+    // a refusal, so only a throw from this call reaches compaction. Every other removal runs the real helper.
+    const remove = verifiedRemoval.verifiedRemove;
+    const unavailable = vi.spyOn(verifiedRemoval, "verifiedRemove").mockImplementation((target, judged, options) => {
       if (target === pending) throw new Error("pending cleanup unavailable");
-      remove(target, options);
+      return remove(target, judged, options);
     });
     await expect(compact(store)).rejects.toThrow("pending cleanup unavailable");
     expect(generation(store)).toBe(0);

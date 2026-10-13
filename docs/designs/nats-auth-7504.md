@@ -96,10 +96,10 @@ the lead's decisions on it. Section 11 has the detail. Docs only: nothing is imp
   closed when the issuer is unavailable, with a logged one-start operator override, and it rechecks a record that
   changes during startup. T16 covers both profiles. Section 11.4.
 
-Slice 1 (`feat/sd-7504-nats-auth-p1`, fs-fence) keeps its fixed scope: four scoped keys, a mint output record per
-credential, a per-key retirement guard, POSIX mint checks of the real file mode and UID before secret bytes are
-written, and win32 refusing to write seeds (smarty-dev#11482). Everything section 11 needs beyond that is marked
-**slice 2+**.
+Slice 1 (fs-fence's unmerged slice 1 branch, cited at 48fe892f) keeps its fixed scope: four scoped keys, issuance
+metadata returned per credential (no durable record or inventory), a per-key retirement guard over a caller-complete
+inventory, POSIX mint checks of the real file mode and UID before secret bytes are written, and win32 refusing to
+write seeds (smarty-dev#11482). Everything section 11 needs beyond that is marked **slice 2+**.
 
 ## 1. Decision and identity model
 
@@ -697,7 +697,8 @@ security review of the frozen text follow; this note does not claim them.
 - Removing a key early cuts every user it signed: that is the leaked-key response (section 5), not a rotation.
 - Test T15. This replaces the single 7-day rule in 2.1.
 - *Amended (11.1, slice 2+):* with every user JWT at most 1 h, the longest credential a key signed expires within
-  1 h of its last mint (break-glass and SYS: 1 h). Slice 1's per-key retirement guard is not read here (11.1).
+  1 h of its last mint (break-glass and SYS: 1 h). Slice 1's per-key retirement guard needs a caller-complete
+  inventory (11.1).
 
 ### 10.5 SYS-only user (lead clarification)
 
@@ -750,17 +751,23 @@ Docs only: nothing in this section is implemented, tested or measured. Basis: As
 Its same-UID finding is answered in 10.2 (org's delegate acceptance), not here. Source reads are cited with their
 time; NATS built-ins come first (user JWT `exp`, account `revocations`, KV CAS), bespoke parts are named.
 
-Slice 1 (`feat/sd-7504-nats-auth-p1`, fs-fence) keeps its fixed scope: four scoped keys, a mint output record per
-credential, a per-key retirement guard, POSIX mint checks of the real file mode and UID before secret bytes are
-written, and win32 refusing to write seeds (smarty-dev#11482). Rotate, inventory, reissue and revoke are later
-slices. Everything below beyond slice 1 is **slice 2+**, and no fleet root switches before it (G-9, G-10, G-11).
+Slice 1 (fs-fence's unmerged slice 1 branch, cited at 48fe892f) keeps its fixed scope: four scoped keys, issuance
+metadata returned per credential (U key, role, signer, `issuedAt`, expiry, digest: `src/mesh/nats-auth/mint.ts`,
+at 48fe892f ~L375-389, and the CLI output, `cli.ts` ~L232; no durable record or inventory is written), a per-key
+retirement guard, POSIX mint checks of the real file mode and UID before secret bytes are written, and win32
+refusing to write seeds (smarty-dev#11482). Rotate, inventory, reissue and revoke are later slices. Everything below beyond slice 1 is **slice 2+**, and no fleet root switches before it (G-9, G-10, G-11).
 
 ### 11.1 Revocation bound on every node: a 1 h user JWT (Astra P1, partition; C7)
 
 - **Mechanism (NATS built-in).** Every user JWT the issuer signs has `exp` at most 1 h after the moment it is
   signed: agent, principal, maintainer and custodian (11.2). Break-glass and the SYS-only user were already 1 h and
-  are not renewed. `iat` is the signing time minus 60 s (1.4; slice 1 `src/mesh/nats-auth.ts:200-201`), so
-  `exp − iat` is at most 3660 s; every bound below counts from the signing time. **Bound: 1 h**, plus the node's
+  are not renewed. For CLI-minted user credentials (SYS-only user included), `iat` is the signing time minus 60 s
+  (1.4): slice 1's `src/mesh/nats-auth/jwt.ts` has a default backdate of 60 s (at 48fe892f ~L109; the user encoder
+  ~L436, the SYS user encoder ~L457), and `mint.ts` freezes the signing time once and passes no override (~L358-365).
+  Operator and account JWTs use `iat` = now (`jwt.ts` ~L322, ~L418). So on the mint path `exp − iat` is at most
+  3600 + 60 = 3660 s. That is the mint path's cap, not a wire-token cap: the low-level encoders accept an explicit
+  backdate of up to 300 s, and the renewal check (`exp − iat` at most 3660 s, below) refuses any wider token, so it
+  fails closed. Every bound below counts from the signing time. **Bound: 1 h**, plus the node's
   clock error. Fleet nodes and the issuer keep clock error at most 30 s (NTP; T5 checks a +30 s skew), so the
   worst case is 1 h 30 s.
 - **The node enforces it alone.** Read 10-13 20:30Z from nats-server v2.14.7 and nats-io/jwt v2.8.2 (the version in
@@ -813,12 +820,13 @@ slices. Everything below beyond slice 1 is **slice 2+**, and no fleet root switc
   longer than 1 h, the unrevoked users of the partitioned node lose it too; they can reconnect to a majority node in
   their server list, where renewals arrive.
 - **Replaced.** The C6 cutoff at `exp − 1 h` of a 7-day JWT and the 90-day principal JWT (1.4, D6). Slice 1's
-  defaults (agent 7 days, principal 90 days, maintainer 2 h: `src/mesh/nats-auth.ts:178` on
-  `feat/sd-7504-nats-auth-p1` @632d353d) stay for slice 1's test users. The 1 h default, the ledger, the renewal
+  lifetimes (the TTL table in `src/mesh/nats-auth/mint.ts`, at 48fe892f ~L81-89: agent 7 days, principal 90 days,
+  maintainer compaction 1 h, maintainer migration 2 h, break-glass 1 h, SYS 1 h) stay for slice 1's test users. The 1 h default, the ledger, the renewal
   job and client renewal are slice 2+ (G-11).
 - **Rotation (10.4).** With every renewed JWT at most 1 h old, a retiring key's longest credential ends within 1 h
-  of its last signature. How slice 1's per-key retirement guard computes that is not read here (slice 1 is not
-  handed off); slice 2+ keeps it consistent.
+  of its last signature. Slice 1's per-key retirement guard decides from a caller-complete inventory
+  (`src/mesh/nats-auth/retirement.ts`, at 48fe892f ~L7-14), and slice 1 writes none; the issuance ledger (slice 2+,
+  above) supplies it.
 - Lame duck (2.4) stays a faster manual containment; it is no longer the bound. Tests T5, T17, T19.
 - C7: ADOPT, bound stated: 1 h.
 
@@ -907,8 +915,9 @@ no write without the tag.
   approval itself stays Paul's own inbox answer.
 - **Durable audit record.** Before the mint, a comment on the tracking issue the item names (default
   smarty-dev#7504), posted by the fleet write App, with the item id, org, stream, config SHA-256, minter and planned
-  window. Mint takes `--approval <item id> --audit <comment URL> --config <file>`. Its append-only mint record (one
-  JSON line per mint, fsynced, in the issuer's state dir) keeps a snapshot of the audit comment: repository, issue,
+  window. Mint takes `--approval <item id> --audit <comment URL> --config <file>`. Its append-only mint record
+  (slice 2+: slice 1 returns issuance metadata and writes no durable record; one JSON line per mint, fsynced, in
+  the issuer's state dir) keeps a snapshot of the audit comment: repository, issue,
   comment id, author, `created_at`, and the SHA-256 of the comment body as read at mint, with the item id, target,
   config SHA-256, minter and mint time. A later edit or deletion of the comment no longer matches that snapshot,
   so the audit check of the runbook detects it. After runbook step 4 (recheck) the operator posts the
@@ -920,7 +929,7 @@ no write without the tag.
   3. `--person` is not the approver.
   4. `--audit` resolves, through a GitHub REST read with the fleet App, to a comment on the named issue, by the
      fleet write App, created after Paul's answer and before this mint, that carries the same item id and SHA-256.
-  5. The approval is reserved atomically before anything is signed: mint creates `consumed/<item id>` in the
+  5. (slice 2+) The approval is reserved atomically before anything is signed: mint creates `consumed/<item id>` in the
      issuer's state dir with an exclusive create (`O_EXCL`), fsyncs it and its directory, and refuses when it
      exists. Two concurrent mints cannot both pass. A crash after the reservation leaves the item consumed and no
      credential (the creds live only in that process's memory, 2.3), so it fails closed and a new approval is

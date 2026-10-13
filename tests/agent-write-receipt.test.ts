@@ -68,6 +68,36 @@ describe("agent write receipt (smarty-dev#8758 item 2)", () => {
     expect(recorder.receipt).toEqual({ paths: [], commands: ["false"] });
   });
 
+  // pi-fabric#1034 security P2: starts without ends are bounded at start (count, command text, id and path length);
+  // a start that cannot be held is dropped and the receipt is marked truncated.
+  it("bounds calls started but never ended: many large starts hold a capped count and cut text, and mark truncated", async () => {
+    const { WriteReceiptRecorder, WRITE_RECEIPT_MAX_PENDING, WRITE_RECEIPT_MAX_COMMAND_CHARS } = await import("../src/agents/write-receipt.js");
+    const recorder = new WriteReceiptRecorder("/work");
+    const big = "y".repeat(1024 * 1024); // 1 Mi chars per command
+    for (let n = 0; n < WRITE_RECEIPT_MAX_PENDING * 4; n++) {
+      recorder.start({ toolCallId: `s${n}`, toolName: "bash", args: { command: `${n} ${big}` } });
+    }
+    recorder.start({ toolCallId: "i".repeat(WRITE_RECEIPT_MAX_COMMAND_CHARS + 1), toolName: "bash", args: { command: "x" } });
+    recorder.start({ toolCallId: "p", toolName: "write", args: { path: "z".repeat(WRITE_RECEIPT_MAX_COMMAND_CHARS + 1) } });
+    expect(recorder.pending).toBe(WRITE_RECEIPT_MAX_PENDING);
+    expect(recorder.receipt.truncated).toBe(true);
+    // A held call's end records its text cut to the limit; the dropped ones never appear.
+    expect(recorder.end({ toolCallId: "s0", isError: false, durationMs: 1 })).toBe(true);
+    expect(recorder.end({ toolCallId: `s${WRITE_RECEIPT_MAX_PENDING * 4 - 1}`, isError: false, durationMs: 1 })).toBe(false);
+    expect(recorder.receipt.commands).toEqual([`0 ${big}`.slice(0, WRITE_RECEIPT_MAX_COMMAND_CHARS)]);
+    expect(recorder.pending).toBe(WRITE_RECEIPT_MAX_PENDING - 1);
+  });
+
+  it("a dropped start is reported by the next end, so the stored receipt shows truncated", async () => {
+    const { WriteReceiptRecorder, WRITE_RECEIPT_MAX_PENDING } = await import("../src/agents/write-receipt.js");
+    const recorder = new WriteReceiptRecorder("/work");
+    for (let n = 0; n <= WRITE_RECEIPT_MAX_PENDING; n++) recorder.start({ toolCallId: `s${n}`, toolName: "bash", args: { command: "c" } });
+    expect(recorder.receipt.truncated).toBe(true);
+    // The dropped call's own end (unknown id) still reports the change once.
+    expect(recorder.end({ toolCallId: `s${WRITE_RECEIPT_MAX_PENDING}`, isError: false })).toBe(true);
+    expect(recorder.end({ toolCallId: "never-started", isError: false })).toBe(false);
+  });
+
   it("bounds the receipt: a capped number of paths, cut command text, and truncated marked; no contents", async () => {
     // Imported here, so the other cases still run (and fail) on a tree without the module.
     const { WriteReceiptRecorder, WRITE_RECEIPT_MAX_COMMAND_CHARS, WRITE_RECEIPT_MAX_PATHS } = await import("../src/agents/write-receipt.js");

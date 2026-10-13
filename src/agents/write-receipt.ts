@@ -25,31 +25,56 @@ export const WRITE_RECEIPT_MAX_PATHS = 256;
 export const WRITE_RECEIPT_MAX_COMMANDS = 64;
 export const WRITE_RECEIPT_MAX_COMMAND_CHARS = 4_096;
 export const WRITE_RECEIPT_MAX_BYTES = 64 * 1024;
+/**
+ * pi-fabric#1034 security P2: calls started but not yet ended are bounded too, at start. At most this many are held;
+ * a command is cut to WRITE_RECEIPT_MAX_COMMAND_CHARS, and an id or path longer than that is not held. A start that
+ * cannot be held is dropped and the receipt is marked truncated, so held data never exceeds about
+ * 256 x (4,096 + 4,096) characters whatever a child emits.
+ */
+export const WRITE_RECEIPT_MAX_PENDING = 256;
 const WRITE_TOOLS = new Set(["write", "edit"]);
 const SHELL_TOOLS = new Set(["bash", "powershell"]);
 
 export class WriteReceiptRecorder {
-  readonly #pending = new Map<string, { path?: string; command?: string }>();
+  readonly #pending = new Map<string, { path?: string; command?: string; cut?: true }>();
   readonly #paths = new Set<string>();
   readonly #commands: string[] = [];
   #bytes = 0;
   #truncated = false;
+  // A start dropped since the last end() reported a change: the next end() reports the truncated receipt.
+  #unreported = false;
 
   constructor(readonly cwd: string) {}
 
-  /** A tool_execution_start event: remember what the call names, until it ends. */
+  /** Calls started and not yet ended (bounded by WRITE_RECEIPT_MAX_PENDING). */
+  get pending(): number { return this.#pending.size; }
+
+  /** A tool_execution_start event: remember what the call names, until it ends. Bounded at start (see above). */
   start(event: { toolCallId?: unknown; toolName?: unknown; args?: unknown }): void {
     if (typeof event.toolCallId !== "string" || typeof event.toolName !== "string") return;
     const args = typeof event.args === "object" && event.args !== null ? event.args as Record<string, unknown> : {};
+    let call: { path?: string; command?: string; cut?: true } | undefined;
     if (WRITE_TOOLS.has(event.toolName)) {
       const raw = [args.path, args.file_path, args.filePath].find((value) => typeof value === "string" && value !== "");
       if (typeof raw !== "string") return;
       let resolved: string;
       try { resolved = resolveToolPath(raw, this.cwd); } catch { resolved = raw; }
-      this.#pending.set(event.toolCallId, { path: resolved });
+      if (resolved.length > WRITE_RECEIPT_MAX_COMMAND_CHARS) return this.#drop();
+      call = { path: resolved };
     } else if (SHELL_TOOLS.has(event.toolName) && typeof args.command === "string") {
-      this.#pending.set(event.toolCallId, { command: args.command });
+      call = args.command.length > WRITE_RECEIPT_MAX_COMMAND_CHARS
+        ? { command: args.command.slice(0, WRITE_RECEIPT_MAX_COMMAND_CHARS), cut: true }
+        : { command: args.command };
     }
+    if (!call) return;
+    if (event.toolCallId.length > WRITE_RECEIPT_MAX_COMMAND_CHARS ||
+      (this.#pending.size >= WRITE_RECEIPT_MAX_PENDING && !this.#pending.has(event.toolCallId))) return this.#drop();
+    this.#pending.set(event.toolCallId, call);
+  }
+
+  #drop(): void {
+    if (!this.#truncated) this.#unreported = true;
+    this.#truncated = true;
   }
 
   /**
@@ -59,13 +84,18 @@ export class WriteReceiptRecorder {
    * miss one that ran. Returns true when the receipt changed.
    */
   end(event: { toolCallId?: unknown; isError?: unknown; durationMs?: unknown }): boolean {
-    if (typeof event.toolCallId !== "string") return false;
+    // A start dropped since the last reported change makes this end report the (now truncated) receipt.
+    const unreported = this.#unreported;
+    this.#unreported = false;
+    if (typeof event.toolCallId !== "string") return unreported;
     const call = this.#pending.get(event.toolCallId);
-    if (!call) return false;
+    if (!call) return unreported;
     this.#pending.delete(event.toolCallId);
-    if (call.path !== undefined && event.isError !== true) return this.#add("path", call.path);
-    if (call.command !== undefined) return this.#add("command", call.command);
-    return false;
+    if (call.cut) this.#truncated = true;
+    let changed = false;
+    if (call.path !== undefined && event.isError !== true) changed = this.#add("path", call.path);
+    else if (call.command !== undefined) changed = this.#add("command", call.command);
+    return changed || unreported || call.cut === true;
   }
 
   #add(kind: "path" | "command", value: string): boolean {

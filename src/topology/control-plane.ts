@@ -14,6 +14,8 @@ import { MeshStore, meshOutageAlarmSink, type MeshEvent, type MeshIdentity } fro
 import { MeshBackgroundQueue, MeshBackgroundRetry } from "../core/atomic-write.js";
 import { rethrowMeshLockTimeout } from "../core/atomic-write.js";
 import { MeshConsumptionPausedError, assertMeshConsumption } from "./mesh-consumption.js";
+import { isWatchLimitError } from "../core/watch-fallback.js";
+import { watchBridgeStore } from "../mesh/change-notifier.js";
 import type { FabricMessageSender } from "../protocol.js";
 
 const CONTROL_TOPIC = "fabric.control.command";
@@ -22,6 +24,12 @@ const CONTROL_SEEN_PREFIX = "topology/control-seen/";
 // The participant directory's host records (topology/participant-directory.ts).
 const HOST_PREFIX = "topology/hosts/";
 const DEFAULT_POLL_MS = 100;
+/** Retained-work retry ceiling: a failed/deferred/gated drain re-arms one-shot timers, never an interval. */
+const DRAIN_RETRY_MAX_MS = 30_000;
+/** Watcher re-arm after a watch failure: one-shot, bounded attempts, then notifications stay off. */
+const WATCH_REARM_BASE_MS = 1_000;
+const WATCH_REARM_MAX_MS = 60_000;
+const WATCH_REARM_ATTEMPTS = 6;
 const DEFAULT_ACK_TIMEOUT_MS = 5_000;
 const UNFENCED_SENDER_WARNING_MS = 60 * 60 * 1_000;
 // A cancellation owns a separate retry deadline, longer than a production mesh lock wait.
@@ -447,7 +455,22 @@ export class FabricControlPlane {
   readonly #bridgeTimeoutMs: number;
   #offset: number;
   #lastSequence: number;
-  #timer: NodeJS.Timeout | undefined;
+  // Drains run at start, on mesh event-log notifications and after this process's own
+  // publishes. Idle has no timer: #retryTimer exists only for retained work (a failed or
+  // deferred drain's backoff, a gated drain, a retained owned outcome, or a shared claim's
+  // real expiry), #rearmTimer only for a failed watcher's bounded re-arm.
+  #started = false;
+  #stopWatch: (() => void) | undefined;
+  #stopStateChanges: (() => void) | undefined;
+  #rearmTimer: NodeJS.Timeout | undefined;
+  #rearmAttempts = 0;
+  #watchWarned = false;
+  #retryTimer: NodeJS.Timeout | undefined;
+  #retryDelay = 0;
+  /** A wake no completed drain has served yet; a wake during a drain makes the loop run again. */
+  #dirty = false;
+  #draining = false;
+  #wakeScheduled = false;
   #leaseWatchdog: NodeJS.Timeout | undefined;
   #polling: Promise<void> | undefined;
   readonly #backgroundPoll = new MeshBackgroundRetry("control claim/ack poll")
@@ -500,10 +523,13 @@ export class FabricControlPlane {
 
   start(handler: FabricControlHandler): void {
     this.#handler = handler;
-    if (!this.options.enabled || this.#timer) return;
+    if (!this.options.enabled || this.#started) return;
+    this.#started = true;
     this.#closed = false;
     this.#paused = false;
-    this.#schedulePoll(this.#pollMs);
+    this.#armWatch();
+    this.#subscribeStateChanges();
+    this.#wake(); // a microtask: a synchronous pause() right after start() still gates it
   }
 
   async request(
@@ -779,6 +805,7 @@ export class FabricControlPlane {
           deadlineAt: committedAt + timeoutMs,
         }),
       }).then((event) => {
+        this.#wake(); // own publish: never depend on this process's own watcher
         publishedEvent = event;
         recordFinal();
         pendingRequest!.commandPublished = true;
@@ -996,24 +1023,26 @@ export class FabricControlPlane {
           typeof pending.destinationRemoteHost === "string" ? this.#bridgeTimeoutMs : 0),
       }),
     };
-    await this.#backgroundCancellations.enqueue(() => {
-      if (Date.now() <= expiresAt) return this.mesh.publish(cancellation);
-      return undefined;
+    await this.#backgroundCancellations.enqueue(async () => {
+      if (Date.now() > expiresAt) return undefined;
+      const event = await this.mesh.publish(cancellation);
+      this.#wake();
+      return event;
     });
   }
 
   /** Reload: leave commands queued; the next activation fences execution-bound addresses. */
   pause(): void {
     this.#paused = true;
-    if (this.#timer) clearTimeout(this.#timer);
-    this.#timer = undefined;
+    // Pending work stays #dirty; resume() drains it. A paused plane arms no retry.
+    clearTimeout(this.#retryTimer);
+    this.#retryTimer = undefined;
   }
 
   resume(): void {
     if (this.#closed || !this.#paused) return;
     this.#paused = false;
-    this.#schedulePoll(this.#pollMs);
-    void this.#backgroundPoll.run(() => this.#poll(), false);
+    this.#wake();
   }
 
   /** Join through outcome and ACK publication, not merely the host admission counter. */
@@ -1032,8 +1061,15 @@ export class FabricControlPlane {
     // Fence new requests before joining polls: a late notRun ACK must not arm a resend.
     this.#closed = true;
     for (const cancel of this.#resendWaits) cancel();
-    if (this.#timer) clearTimeout(this.#timer);
-    this.#timer = undefined;
+    this.#started = false;
+    this.#stopWatch?.();
+    this.#stopWatch = undefined;
+    try { this.#stopStateChanges?.(); } catch {}
+    this.#stopStateChanges = undefined;
+    clearTimeout(this.#rearmTimer);
+    this.#rearmTimer = undefined;
+    clearTimeout(this.#retryTimer);
+    this.#retryTimer = undefined;
     await this.#polling?.catch(() => undefined);
     if (!this.#paused) await this.#drain().catch(() => undefined);
     this.#sharedClaims.clear();
@@ -1050,36 +1086,172 @@ export class FabricControlPlane {
     this.#handler = undefined;
   }
 
-  async #poll(): Promise<void> {
-    if (this.#closed || this.#paused || !this.options.enabled || this.options.canConsumeMesh?.() === false) return;
-    if (this.#polling) return this.#polling;
+  /** True only when a drain read the log to its end; a gated or paused drain retains its work. */
+  async #poll(): Promise<boolean> {
+    if (this.#gated()) return false;
+    if (this.#polling) { await this.#polling; return false; }
     const operation = this.#drain();
-    this.#polling = operation;
+    // Joiners (checkpoint/close) still observe a failure; the drain loop below handles it.
+    const polling = operation.then(() => undefined);
+    void polling.catch(() => undefined);
+    this.#polling = polling;
     try {
-      await operation;
+      const complete = await operation;
       if (!this.#ownedCommands.size && !this.#sharedClaims.size) this.#backgroundPoll.success();
+      return complete;
     } catch (error) {
       if (!(error instanceof MeshConsumptionPausedError)) throw error;
+      return false;
     } finally {
-      if (this.#polling === operation) this.#polling = undefined;
+      if (this.#polling === polling) this.#polling = undefined;
     }
   }
 
-  #schedulePoll(waitMs: number): void {
-    const timer = setTimeout(() => {
-      void this.#backgroundPoll.run(() => this.#poll(), false).finally(() => {
-        // A pause/close/resume can replace the timer while a drain is in flight.
-        // Only this captured generation may schedule its next randomized wake.
-        if (this.#timer === timer && !this.#closed && !this.#paused) {
-          this.#schedulePoll(this.#backgroundPoll.waitMs || this.#pollMs);
-        }
-      });
-    }, waitMs);
-    this.#timer = timer;
-    timer.unref();
+  #gated(): boolean {
+    return this.#closed || this.#paused || !this.options.enabled || this.options.canConsumeMesh?.() === false;
   }
 
-  async #drain(): Promise<void> {
+  #armWatch(): void {
+    if (this.#closed || this.#stopWatch) return;
+    try {
+      this.#stopWatch = watchBridgeStore(this.mesh.root, (kind) => {
+        this.#rearmAttempts = 0; // a delivered notification proves the watch works
+        // Commands and ACKs live in the event log (or its rotated generation). Presence or
+        // lease writes matter only to work a consumption gate is holding back.
+        if (kind === "events" || this.#dirty) this.#wake();
+      }, (error) => this.#watchFailed(error));
+    } catch (error) {
+      this.#watchFailed(error);
+    }
+  }
+
+  // A replicated state backend (NATS) commits remotely where no local fs watch can see it.
+  // Its optional MeshStore change listener is one more dirty wake; on the filesystem
+  // backends it is a no-op and the directory watch above remains the notifier.
+  #subscribeStateChanges(): void {
+    if (this.#stopStateChanges) return;
+    try {
+      this.#stopStateChanges = this.mesh.subscribeStateChanges(() => this.#wake());
+    } catch (error) {
+      // Not fatal: the fs watch and own-publish wakes still drain; say so once.
+      try { console.warn(`[pi-fabric] control plane: mesh state change subscription failed (${error instanceof Error ? error.message : String(error)}); relying on mesh directory notifications.`); } catch {}
+    }
+  }
+
+  // A watcher error is one rescan plus a bounded one-shot re-arm, never a standing poll.
+  #watchFailed(error: unknown): void {
+    this.#stopWatch?.();
+    this.#stopWatch = undefined;
+    if (this.#closed) return;
+    const delay = Math.min(WATCH_REARM_MAX_MS, WATCH_REARM_BASE_MS * 2 ** this.#rearmAttempts);
+    if (!this.#watchWarned) {
+      this.#watchWarned = true;
+      const cause = isWatchLimitError(error)
+        ? "ENOSPC: inotify watch limit, not disk space (raise fs.inotify.max_user_watches)"
+        : error instanceof Error ? error.message : String(error);
+      try {
+        console.warn(`[pi-fabric] control plane: mesh notifications failed for ${this.mesh.root} (${cause}); ` +
+          `rescanned once, re-arming in ${delay} ms with bounded retries. There is no polling: ` +
+          "commands and ACKs arriving while unarmed are drained at a re-arm, after this process's next publish, " +
+          "or by a pending-work retry; a sender's own ACK deadline still settles its request.");
+      } catch {}
+    }
+    this.#wake();
+    if (this.#rearmTimer || this.#rearmAttempts >= WATCH_REARM_ATTEMPTS) return;
+    this.#rearmAttempts++;
+    this.#rearmTimer = setTimeout(() => {
+      this.#rearmTimer = undefined;
+      if (this.#closed) return;
+      this.#armWatch();
+      if (this.#stopWatch) this.#wake(); // notifications may have been missed while unarmed
+    }, delay);
+    this.#rearmTimer.unref();
+  }
+
+  #wake(): void {
+    if (this.#closed || !this.options.enabled || !this.#started) return;
+    this.#dirty = true;
+    if (this.#wakeScheduled) return;
+    this.#wakeScheduled = true;
+    queueMicrotask(() => {
+      this.#wakeScheduled = false;
+      void this.#runDrains();
+    });
+  }
+
+  // Serial drain loop. A wake during a drain sets #dirty, so the loop drains again instead of
+  // dropping it. Work a drain could not finish keeps #dirty and arms one bounded one-shot retry.
+  async #runDrains(): Promise<void> {
+    if (this.#draining) return;
+    this.#draining = true;
+    try {
+      while (this.#dirty && !this.#gated()) {
+        clearTimeout(this.#retryTimer);
+        this.#retryTimer = undefined;
+        this.#dirty = false;
+        let complete = false;
+        const outcome = await this.#backgroundPoll.run(async () => { complete = await this.#poll(); }, false);
+        if (outcome === "done" && complete) {
+          // A detached outcome whose save/ACK failed is retained, not running: retry it with backoff.
+          if ([...this.#ownedCommands.values()].some((owned) => !owned.running)) {
+            this.#dirty = true;
+            this.#scheduleRetry(this.#backgroundPoll.waitMs > 0 ? "retry" : "failed");
+            return;
+          }
+          this.#retryDelay = 0;
+          continue;
+        }
+        this.#dirty = true;
+        this.#scheduleRetry(outcome);
+        return;
+      }
+      // A consumption gate held a wake back: it stays #dirty with no timer. The gate reopens
+      // through a presence/lease notification (the watcher wakes a dirty plane) or resume().
+      if (!this.#dirty) this.#scheduleClaimExpiry();
+    } finally {
+      this.#draining = false;
+    }
+  }
+
+  #scheduleRetry(outcome: "done" | "retry" | "failed" | "skipped"): void {
+    // A gated plane retains its dirty work for the reopen wake; only a drain that could run retries.
+    if (this.#gated()) return;
+    let delay: number;
+    if (outcome === "retry" || outcome === "skipped") delay = Math.max(1, this.#backgroundPoll.waitMs);
+    else {
+      this.#retryDelay = Math.min(DRAIN_RETRY_MAX_MS, this.#retryDelay ? this.#retryDelay * 2 : this.#pollMs);
+      delay = this.#retryDelay;
+    }
+    clearTimeout(this.#retryTimer);
+    this.#retryTimer = setTimeout(() => {
+      this.#retryTimer = undefined;
+      this.#wake();
+    }, delay);
+    this.#retryTimer.unref();
+  }
+
+  /** A retained shared claim's real expiry is the only deadline an idle drained plane keeps;
+   * the drain at that expiry purges it, and with nothing pending no timer remains. */
+  #scheduleClaimExpiry(): void {
+    if (this.#closed || this.#paused || this.#retryTimer || !this.#sharedClaims.size) return;
+    const expiresAt = Math.min(...this.#sharedClaims.values());
+    this.#retryTimer = setTimeout(() => {
+      this.#retryTimer = undefined;
+      this.#wake();
+    }, Math.max(1, expiresAt - Date.now() + 1));
+    this.#retryTimer.unref();
+  }
+
+  /** A detached execution settled while its outcome is still owned (deferred save/ACK): retry
+   * it with bounded backoff, without needing another mesh event. */
+  #retryRetainedOwned(key: string, owned: OwnedControlCommand): void {
+    if (this.#closed || this.#ownedCommands.get(key) !== owned || owned.running) return;
+    this.#dirty = true;
+    if (this.#draining) return; // the running loop sees the retained outcome when it finishes
+    this.#scheduleRetry(this.#backgroundPoll.waitMs > 0 ? "retry" : "failed");
+  }
+
+  async #drain(): Promise<boolean> {
     const now = Date.now();
     for (const [key, expiresAt] of this.#sharedClaims) if (expiresAt < now) this.#sharedClaims.delete(key);
     // Detached asks may already be behind the log cursor. Resume their owned
@@ -1090,7 +1262,7 @@ export class FabricControlPlane {
     while (this.options.canConsumeMesh?.() !== false) {
       const tail = this.mesh.tail(this.#offset, 100);
       for (const event of tail.events) {
-        if (this.#paused || this.options.canConsumeMesh?.() === false) return;
+        if (this.#paused || this.options.canConsumeMesh?.() === false) return false;
         if (event.sequence <= this.#lastSequence) continue;
         // An event is consumed only once handled: a command that hit a lock timeout throws,
         // and the next poll reads this page again from it (smarty-dev#424). Each retry is
@@ -1099,14 +1271,15 @@ export class FabricControlPlane {
           if (event.topic === ACK_TOPIC) this.#acceptAcknowledgement(event);
           else if (event.topic === CONTROL_TOPIC) await this.#acceptCommand(event);
         }
-        if (this.options.canConsumeMesh?.() === false) return;
+        if (this.options.canConsumeMesh?.() === false) return false;
         this.#lastSequence = event.sequence;
       }
       this.#offset = tail.nextOffset;
       if (tail.events.length < 100) break;
     }
-    if (this.options.canConsumeMesh?.() === false) return;
+    if (this.options.canConsumeMesh?.() === false) return false;
     await this.#cleanupSeen(Date.now()).catch(rethrowMeshLockTimeout);
+    return true;
   }
 
   #acceptAcknowledgement(event: MeshEvent): void {
@@ -1348,7 +1521,10 @@ export class FabricControlPlane {
       .finally(() => { owned.running = false; });
     if (detachedControlOperation(command.operation)) {
       this.#activeHandlers.add(execution);
-      void execution.finally(() => this.#activeHandlers.delete(execution)).catch(() => undefined);
+      void execution.finally(() => {
+        this.#activeHandlers.delete(execution);
+        this.#retryRetainedOwned(key, owned);
+      }).catch(() => undefined);
       return;
     }
     await execution;
@@ -1623,5 +1799,7 @@ export class FabricControlPlane {
         // A lock timeout published nothing: the caller retries it (smarty-dev#424).
         if (isLockTimeout(error) || error instanceof MeshConsumptionPausedError) throw error;
       });
+    // An ACK this host addressed to itself is consumed by its own drain, not its own watcher.
+    if (command.replyTo === this.options.hostId) this.#wake();
   }
 }

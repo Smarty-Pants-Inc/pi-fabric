@@ -3,6 +3,7 @@ import fsp from "node:fs/promises";
 import path from "node:path";
 import { setImmediate as yieldTurn } from "node:timers/promises";
 import { writeJsonAtomic } from "../core/atomic-write.js";
+import { isWatchLimitError } from "../core/watch-fallback.js";
 import { retentionV2Enabled } from "../storage/retention-platform.js";
 import { processAlive } from "../storage/scratch.js";
 
@@ -40,6 +41,15 @@ const unaliasedDirectory = async (directory: string): Promise<boolean> => {
   } catch { return false; }
 };
 interface TreeProof { fingerprint: string; status: string; finishedAt: number }
+/** Observation only (never authority): a run whose root status is not terminal,
+ * or not yet written, will close by a status.json event worth watching. */
+const openRun = async (directory: string): Promise<boolean> => {
+  try {
+    const stat = await owned(path.join(directory, "status.json"));
+    if (!stat.isFile() || stat.size > 1024 * 1024) return false;
+    return !terminal.has(JSON.parse(await fsp.readFile(path.join(directory, "status.json"), "utf8"))?.status);
+  } catch (error) { return gone(error); }
+};
 
 /** Separate legacy proof, NOT a relaxation of runTreeExitVeto or deletion.
  * Async directory cursors yield between files. Oversized/unknown/pending trees
@@ -104,13 +114,35 @@ interface ArchiveOptions {
   isRetained: (id: string) => boolean;
 }
 
+const RUN_ID = /^[A-Za-z0-9_-]+$/;
+/** Full-pass cadence. One unref'd one-shot; never an idle sub-second poll. It
+ * covers age eligibility (no filesystem event fires when 48h elapse), policy
+ * re-enable and custody release, which have no event carrier in this module. */
+export const LEGACY_ARCHIVE_DEADLINE_MS = 60_000;
+/** Bounded queue of event-named run IDs; overflow is covered by the next full pass. */
+const MAX_PENDING = 256;
+/** Bounded per-active-run status watchers (oldest evicted first). */
+const MAX_RUN_WATCHERS = 64;
+/** Watcher re-arm backoff: one-shot retries 1s..32s, then stop (log once). */
+const REARM_BASE_MS = 1_000, REARM_ATTEMPTS = 6;
+
 /** Off-request-path retirement by same-filesystem rename only. Sources remain
  * ordinary directories forever: opaque descriptor custody cannot lose bytes.
  * The legacy public names/policy keys are retained for configuration compatibility. */
 export class ResidentLegacyRunArchive {
   #directory: fs.Dir | undefined;
   #nextScan = 0;
-  #timer: NodeJS.Timeout | undefined;
+  #deadline: NodeJS.Timeout | undefined;
+  #immediate: NodeJS.Immediate | undefined;
+  #rearm: NodeJS.Timeout | undefined;
+  #rearmAttempts = 0;
+  #watchFailureLogged = false;
+  #started = false;
+  #runsWatcher: fs.FSWatcher | undefined;
+  readonly #runWatchers = new Map<string, fs.FSWatcher>();
+  /** Runs whose status watcher errored this full pass: one re-arm each, no spin. */
+  readonly #runWatchErrors = new Set<string>();
+  readonly #pending = new Set<string>();
   #work: Promise<void> | undefined;
   #closed = false;
   #blocked = false;
@@ -119,23 +151,132 @@ export class ResidentLegacyRunArchive {
 
   #enabled(): boolean { return this.policy.legacyRunArchiveEnabled !== false; }
 
+  /** Event-driven: root/runs entry events and bounded per-run status.json
+   * events queue the named run; a cursor with remaining work continues with
+   * setImmediate; otherwise only the slow full-pass deadline is armed. */
   start(): void {
-    if (!retentionV2Enabled() || this.#timer || this.#closed) return;
-    this.#timer = setInterval(() => {
-      if (!this.#work) {
-        this.#work = this.sweep().catch(error => { this.health.error = String(error); }).finally(() => { this.#work = undefined; });
-      }
-    }, 250);
-    this.#timer.unref();
+    if (!retentionV2Enabled() || this.#started || this.#closed) return;
+    this.#started = true;
+    this.#watchRuns();
+    this.#run();
   }
 
   async close(): Promise<void> {
     this.#closed = true;
-    if (this.#timer) clearInterval(this.#timer);
-    this.#timer = undefined;
+    if (this.#deadline) clearTimeout(this.#deadline);
+    if (this.#rearm) clearTimeout(this.#rearm);
+    if (this.#immediate) clearImmediate(this.#immediate);
+    this.#deadline = this.#rearm = this.#immediate = undefined;
+    this.#runsWatcher?.close(); this.#runsWatcher = undefined;
+    for (const watcher of this.#runWatchers.values()) watcher.close();
+    this.#runWatchers.clear(); this.#pending.clear(); this.#runWatchErrors.clear();
     await this.#work;
     const directory = this.#directory; this.#directory = undefined;
     await directory?.close();
+  }
+
+  #enqueue(id: string): void {
+    if (this.#closed) return;
+    // Overflow is not lost work: the next full pass visits every run.
+    if (this.#pending.size < MAX_PENDING) this.#pending.add(id);
+    if (!this.#work && !this.#immediate) this.#immediate = setImmediate(() => { this.#immediate = undefined; this.#run(); });
+  }
+
+  #run(): void {
+    if (this.#closed || this.#work) return;
+    if (this.#deadline) clearTimeout(this.#deadline);
+    this.#deadline = undefined;
+    if (!this.#runsWatcher && this.#rearmAttempts < REARM_ATTEMPTS && !this.#rearm) this.#watchRuns();
+    this.#work = this.sweep().catch(error => { this.health.error = String(error); }).finally(() => {
+      this.#work = undefined;
+      if (this.#closed) return;
+      // Remaining work continues without a timer; idle arms one slow deadline.
+      if (!this.#blocked && this.#enabled() && (this.#directory || this.#pending.size)) {
+        if (!this.#immediate) this.#immediate = setImmediate(() => { this.#immediate = undefined; this.#run(); });
+        return;
+      }
+      // A blocked (faulted) archive stays inert until restart: no standing poll.
+      if (this.#blocked) return;
+      this.#deadline = setTimeout(() => { this.#deadline = undefined; this.#run(); }, LEGACY_ARCHIVE_DEADLINE_MS);
+      this.#deadline.unref();
+    });
+  }
+
+  #watchRuns(): void {
+    if (this.#closed || this.#runsWatcher) return;
+    const runs = path.join(this.root, "runs");
+    try {
+      const watcher = fs.watch(runs, { persistent: false }, (_event, name) => {
+        const id = name === null ? undefined : String(name);
+        if (id === undefined) { this.#rescan(); return; }
+        if (!RUN_ID.test(id)) return;
+        this.#watchRun(id);
+        this.#enqueue(id);
+      });
+      watcher.on("error", error => this.#watchFailed(watcher, error));
+      this.#runsWatcher = watcher;
+      this.#rearmAttempts = 0;
+    } catch (error) {
+      // Absent runs directory: the full pass retries the watch; not a fault.
+      if (!gone(error)) this.#watchFailed(undefined, error);
+    }
+  }
+
+  /** Watcher error = one rescan plus bounded one-shot re-arm; never a poll. */
+  #watchFailed(watcher: fs.FSWatcher | undefined, error: unknown): void {
+    watcher?.close();
+    if (watcher && this.#runsWatcher !== watcher) return;
+    this.#runsWatcher = undefined;
+    if (this.#closed) return;
+    if (!this.#watchFailureLogged) {
+      this.#watchFailureLogged = true;
+      // Truthful degraded mode: no polling. One rescan, bounded one-shot re-arms,
+      // then the 60s full-pass deadline alone. ENOSPC here is the inotify limit.
+      const cause = isWatchLimitError(error) ? "inotify watch limit reached (fs.inotify.max_user_watches), not disk space" : String(error);
+      console.warn(`[fabric] legacy run archive watcher on ${path.join(this.root, "runs")} failed: ${cause}; ` +
+        `rescanning once and re-arming with bounded backoff (${REARM_ATTEMPTS} attempts), then full passes every ${LEGACY_ARCHIVE_DEADLINE_MS / 1000}s`);
+    }
+    this.#rescan();
+    if (this.#rearm || this.#rearmAttempts >= REARM_ATTEMPTS) return;
+    const delay = REARM_BASE_MS * 2 ** this.#rearmAttempts++;
+    this.#rearm = setTimeout(() => { this.#rearm = undefined; this.#watchRuns(); if (this.#runsWatcher) this.#rescan(); }, delay);
+    this.#rearm.unref();
+  }
+
+  #rescan(): void {
+    if (this.#closed) return;
+    this.#nextScan = 0;
+    if (!this.#work && !this.#immediate) this.#immediate = setImmediate(() => { this.#immediate = undefined; this.#run(); });
+  }
+
+  #watchRun(id: string): void {
+    if (this.#closed || this.#runWatchers.has(id)) return;
+    try {
+      const watcher = fs.watch(path.join(this.root, "runs", id), { persistent: false }, (_event, name) => {
+        // Run close is an atomic status.json replacement; ignore event streams.
+        if (name === null || String(name) === "status.json") this.#enqueue(id);
+      });
+      // Error: drop the watcher and queue one check; that check re-arms it once.
+      // A repeat error in the same full pass stays unwatched until the next pass
+      // (the slow deadline), so a permanently failing watch cannot spin.
+      watcher.on("error", () => {
+        const repeat = this.#runWatchErrors.has(id);
+        this.#runWatchErrors.add(id);
+        this.#unwatchRun(id, watcher);
+        if (!repeat) this.#enqueue(id);
+      });
+      this.#runWatchers.set(id, watcher);
+      if (this.#runWatchers.size > MAX_RUN_WATCHERS) {
+        const [oldest] = this.#runWatchers.keys();
+        this.#unwatchRun(oldest!);
+      }
+    } catch { /* gone or not a directory: the queued check skips it */ }
+  }
+
+  #unwatchRun(id: string, expected?: fs.FSWatcher): void {
+    const watcher = this.#runWatchers.get(id);
+    if (!watcher || (expected && watcher !== expected)) { expected?.close(); return; }
+    this.#runWatchers.delete(id); watcher.close();
   }
 
   async sweep(now = Date.now(), maxEntries = 32, budgetMs = 20): Promise<void> {
@@ -147,7 +288,8 @@ export class ResidentLegacyRunArchive {
       // All Windows retention changes are deferred to smarty-dev#5132.
       return;
     }
-    if (this.#blocked || !this.#enabled() || now < this.#nextScan) return;
+    if (this.#blocked || !this.#enabled() || (now < this.#nextScan && !this.#pending.size)) return;
+    const scanning = now >= this.#nextScan;
     const runs = path.join(this.root, "runs");
     const started = performance.now(), candidates: Array<{ id: string; proof: TreeProof }> = [];
     try {
@@ -155,17 +297,38 @@ export class ResidentLegacyRunArchive {
         await fsp.lstat(runs); // An absent runs directory is not a permanent fault.
         throw new Error("aliased/unknown run namespace");
       }
-      if (!this.#directory) {
-        if (!(await owned(runs)).isDirectory()) return;
-        this.#directory = await fsp.opendir(runs);
-      }
-      for (let count = 0; count < maxEntries && performance.now() - started < budgetMs && !this.#closed; count++) {
-        const entry = await this.#directory.read();
-        if (!entry) { await this.#directory.close(); this.#directory = undefined; this.#nextScan = now + 60_000; break; }
-        if (!entry.isDirectory() || !/^[A-Za-z0-9_-]+$/.test(entry.name) || this.options.isRetained(entry.name)) continue;
+      // At least one entry per slice so a setImmediate continuation always progresses.
+      for (let count = 0; count < maxEntries && (count === 0 || performance.now() - started < budgetMs) && !this.#closed; count++) {
+        let id: string;
+        const queued = this.#pending.values().next();
+        if (!queued.done) {
+          id = queued.value; this.#pending.delete(id);
+          try { if (!(await fsp.lstat(path.join(runs, id))).isDirectory()) continue; }
+          catch { this.#unwatchRun(id); continue; }
+        } else if (scanning) {
+          if (!this.#directory) {
+            if (!(await owned(runs)).isDirectory()) return;
+            this.#directory = await fsp.opendir(runs);
+          }
+          const entry = await this.#directory.read();
+          if (!entry) {
+            await this.#directory.close(); this.#directory = undefined; this.#nextScan = now + LEGACY_ARCHIVE_DEADLINE_MS;
+            this.#runWatchErrors.clear();
+            break;
+          }
+          if (!entry.isDirectory()) continue;
+          id = entry.name;
+        } else break;
+        if (!RUN_ID.test(id) || candidates.some(run => run.id === id) || this.options.isRetained(id)) continue;
         this.health.checked++;
-        const proof = await legacyRunTreeProof(path.join(runs, entry.name), now, this.policy.legacyRunArchiveAgeMs ?? DEFAULT_AGE_MS);
-        if (proof) candidates.push({ id: entry.name, proof }); else this.health.skipped++;
+        const proof = await legacyRunTreeProof(path.join(runs, id), now, this.policy.legacyRunArchiveAgeMs ?? DEFAULT_AGE_MS);
+        if (proof) candidates.push({ id, proof });
+        else {
+          this.health.skipped++;
+          // Pre-existing (scan) and re-armed (queued) open runs get the bounded
+          // status watcher, so their atomic close wakes without the deadline.
+          if (!this.#closed && !this.#runWatchers.has(id) && await openRun(path.join(runs, id))) this.#watchRun(id);
+        }
         await yieldTurn();
       }
       if (!candidates.length || this.#closed) return;
@@ -191,6 +354,8 @@ export class ResidentLegacyRunArchive {
         if (!await unaliasedDirectory(runs) || !await unaliasedDirectory(batch)) throw new Error("run namespace changed");
         // No copy fallback on EXDEV, no compression and no source unlink.
         await fsp.rename(source, path.join(batch, run.id));
+        // A directory watch follows the inode: stop observing retired bytes.
+        this.#unwatchRun(run.id);
         moved.push(run); this.health.archived++;
       }
       // Known live actors/managers can reopen by path, so retain their original

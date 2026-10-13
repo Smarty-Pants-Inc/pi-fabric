@@ -252,8 +252,11 @@ const stopResident = async (config: ResidentHostConfig): Promise<void> => {
     // looks dead, ends the fork with no output. Release an in-process host through its own close path instead.
     const stoppers = [...(inProcessHosts.get(config.residencyRoot) ?? [])];
     if (stoppers.length === 0) {
-      // A host made directly (new ResidentHost): its test closes it. Never wait on or signal ourselves here.
-      console.warn(`stopResident: owner.json names this test process (pid ${owner.pid}); left to its own close`);
+      // A host made directly (new ResidentHost): only its test can close it. Never signal ourselves; wait briefly for
+      // that close, then fail loudly so the caller keeps the root instead of deleting it under a live host.
+      await waitFor(() => readOwner(ownerPath)?.token !== owner.token, 5_000).catch(() => {
+        throw new Error(`stopResident: owner.json still names this test process (pid ${owner.pid}); its in-process host was not closed`);
+      });
       return;
     }
     for (const stopper of stoppers) stopper.abort();
@@ -286,22 +289,26 @@ const stopResident = async (config: ResidentHostConfig): Promise<void> => {
 
 afterEach(async () => {
   vi.unstubAllEnvs();
+  const stopFailures: unknown[] = [];
   for (const root of roots.splice(0)) {
     const residencyDirectory = path.join(root, "mesh", "residency");
-    try {
-      for (const entry of fs.readdirSync(residencyDirectory)) {
-        const config = JSON.parse(
-          fs.readFileSync(path.join(residencyDirectory, entry, "config.json"), "utf8"),
-        ) as ResidentHostConfig;
-        await stopResident(config);
-      }
-    } catch {
-      // No resident host was created.
+    let entries: string[] = [];
+    try { entries = fs.readdirSync(residencyDirectory); } catch { /* No resident host was created. */ }
+    let stopFailed = false;
+    for (const entry of entries) {
+      let config: ResidentHostConfig;
+      try {
+        config = JSON.parse(fs.readFileSync(path.join(residencyDirectory, entry, "config.json"), "utf8")) as ResidentHostConfig;
+      } catch { continue; } // not a resident root
+      try { await stopResident(config); } catch (error) { stopFailed = true; stopFailures.push(error); }
     }
+    // A host that could not be stopped may still write: keep its root (the failure below names it).
+    if (stopFailed) continue;
     // A host that already removed owner.json (idle exit) may still be finishing its last mesh
     // writes: retry ENOTEMPTY briefly instead of failing the suite on a loaded runner.
     fs.rmSync(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
   }
+  if (stopFailures.length > 0) throw stopFailures[0];
 });
 
 describe("durable cwd validation", () => {

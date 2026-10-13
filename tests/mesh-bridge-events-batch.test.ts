@@ -8,6 +8,7 @@ import { BridgeOwnershipError, MeshBridge, RemoteBridgeSide, serveBridgeAgent, S
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { MESH_ARCHIVE_CONFIG, MeshArchive } from "../src/mesh/archive.js";
 import { meshLockQueueDirectory } from "../src/mesh/lock-queue.js";
+import { BRIDGE_BATCH_MAX_EVENTS } from "../src/mesh/event-log.js";
 
 const roots: string[] = [];
 const closes: Array<() => Promise<unknown>> = [];
@@ -61,7 +62,7 @@ const setup = async (wire: boolean) => {
 };
 
 describe("bounded durable bridge event batches", () => {
-  it("takes one lock for 256 events, pins the peer, and shares one durability barrier", async () => {
+  it("caps a 256-event input at 32 events, pins the peer, and shares one durability barrier", async () => {
     // Canonicalize the fixture so the expected chain has no additional symlink parents.
     const mesh = new MeshStore(fs.realpathSync(scratch()), 65536, 500), side = new StoreBridgeSide(mesh, "forge");
     // Deterministic count bound independent of this machine's fsync latency.
@@ -70,9 +71,9 @@ describe("bounded durable bridge event batches", () => {
     const sync = vi.spyOn(fs, "fsyncSync");
     const events = Array.from({ length: 256 }, (_, index) => ({ event: event(String(index)) }));
     const first = await side.publishBatch(events);
-    expect(first).toHaveLength(256);
+    expect(first).toHaveLength(BRIDGE_BATCH_MAX_EVENTS);
     expect(count()).toBe(1);
-    expect(mesh.read({ limit: 500 }).map(e => e.text)).toEqual(events.map(e => e.event.text));
+    expect(mesh.read({ limit: 500 }).map(e => e.text)).toEqual(events.slice(0, first.length).map(e => e.event.text));
     expect(mesh.read({ limit: 500 }).every(e => (e.data as BridgePublish["data"]).bridge.from === "forge")).toBe(true);
     // One event-file sync plus exactly one barrier per namespace ancestor, not receipts
     // per event. A fixed threshold depends on TMPDIR depth and fails on fleet task roots.

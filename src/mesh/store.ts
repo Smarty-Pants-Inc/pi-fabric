@@ -6,7 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { MeshLock, type MeshStoreContext } from "./mesh-lock.js";
 import { acquireMeshCustodyLock, withMeshCustody } from "./custody-lock.js";
-import type { MeshReadOptions, MeshStateEntry, MeshBatchResult } from "./state-file.js";
+import type { MeshReadOptions, MeshStateEntry, MeshBatchResult, MeshBatchView } from "./state-file.js";
 import { createStateBackend, isMeshStateWalCap, type MeshStateBackendKind, type StateBackend, type StateBackendBatchInput,
   type StateBackendDiagnostics } from "./state-backend.js";
 import { EventLog, type MeshEvent, type MeshIdentity, type MeshPublishInput, type MeshTailResult } from "./event-log.js";
@@ -341,6 +341,12 @@ export interface MeshStoreOptions {
 
 /** Distinct revisions for a SQLite stamp that could not be read: never equal, so never validating. */
 let unreadableStateRevisions = 0;
+
+/** The SQLite backend's revision views (SqliteStateBackend), reached without a value import. */
+interface SqliteStateViews {
+  unchangedSince(stamp: string, prefixes: readonly string[]): boolean;
+  stateView(): { stamp: string; view: MeshBatchView };
+}
 
 /** A background mesh path whose writes stay deferred past MESH_OUTAGE_ALARM_AFTER_MS, and its recovery (smarty-dev#8825). */
 export const FABRIC_MESH_OUTAGE_ALARM_TOPIC = "fabric.alarm.mesh-outage";
@@ -818,6 +824,29 @@ export class MeshStore {
   stateRevision(): string | undefined {
     if (this.#state.kind !== "sqlite") return undefined;
     return this.#state.stateStamp() ?? `unreadable:${++unreadableStateRevisions}`;
+  }
+
+  /**
+   * smarty-dev#10391, sqlite only: whether no key under `prefixes` changed after `revision` (a `stateRevision()`),
+   * from the change feed, cheap enough to run in `withStateWriteFence`. False on other backends or when unknown.
+   */
+  stateUnchangedSince(revision: string, prefixes: readonly string[]): boolean {
+    const state = this.#sqliteState();
+    return state !== undefined && state.unchangedSince(revision, prefixes);
+  }
+
+  /** smarty-dev#10391, sqlite only: a read-only view of the committed state now and its `stateRevision()`. */
+  stateView(): { revision: string; view: MeshBatchView } | undefined {
+    const state = this.#sqliteState();
+    if (!state) return undefined;
+    const { stamp, view } = state.stateView();
+    return { revision: stamp, view };
+  }
+
+  #sqliteState(): (StateBackend & SqliteStateViews) | undefined {
+    const state = this.#state as StateBackend & Partial<SqliteStateViews>;
+    return state.kind === "sqlite" && typeof state.unchangedSince === "function" && typeof state.stateView === "function"
+      ? state as StateBackend & SqliteStateViews : undefined;
   }
 
   cachedStateStamp(fresh = false, revalidateGeneration = false): string | undefined {

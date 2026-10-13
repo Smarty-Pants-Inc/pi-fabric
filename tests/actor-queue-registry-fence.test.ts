@@ -1,4 +1,5 @@
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -118,6 +119,58 @@ it("a manager whose first queue read is busy restores its accepted backlog on th
     recorder.mockRestore(); fs.rmSync(root, { recursive: true, force: true });
   }
 }, 10000);
+
+it.each([false, true])("binds a rightful first publication only if the accepted queue revision is unchanged (replaced: %s)", async replaced => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "queue-first-publication-"));
+  const actorRoot = path.join(root, "actors"), mesh = new MeshStore(path.join(root, "mesh"), 65536, 100);
+  const identity = { id: "session:first", name: "owner", kind: "main" as const };
+  const agents = new AgentManager(root, DEFAULT_FABRIC_CONFIG.agents, { runRoot: path.join(root, "runs") });
+  let published = false;
+  const manager = new ActorManager("first", identity, mesh, { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 600000 }, agents, () => {},
+    { persistent: true, actorRoot, releasePaused: true, retentionSweepMs: 600000, canManageActor: () => published ? true : undefined });
+  const remove = fs.rmSync, rename = fs.renameSync;
+  const recorder = vi.spyOn(fs, "rmSync").mockImplementation((file, options) => {
+    if (/^queue-[a-f0-9]{16}\.json$/.test(path.basename(String(file)))) return;
+    return remove(file, options);
+  });
+  const digest = (value: string) => createHash("sha256").update(value).digest("hex");
+  try {
+    const actor = await manager.create({ name: "first-publication", instructions: "Wait", triggerTurn: false });
+    manager.tell(actor.id, "accepted before first participant publication");
+    const file = path.join(path.dirname(actor.sessionFile!), `queue-${digest([identity.id, actor.residency].join("\0")).slice(0, 16)}.json`);
+    if (replaced) {
+      const staging = `${file}.fixture`; fs.writeFileSync(staging, JSON.stringify({ format: 1, items: [{ id: "external-work" }] }));
+      fs.renameSync(staging, file);
+    }
+    const before = fs.readFileSync(file, "utf8");
+    await new ActorRegistryStore(actorRoot).withLock(async () => {
+      await mesh.put({ key: `topology/hosts/${digest("host:first")}`, identity,
+        value: { format: 1, id: "host:first", rootId: identity.id, identity, startedAt: 1, updatedAt: Date.now(), expiresAt: Date.now() + 120000 } });
+      await mesh.put({ key: `topology/participants/${digest(actor.id)}`, identity,
+        value: { format: 1, id: actor.id, kind: "actor", rootId: identity.id, ownerHostId: "host:first", ownerIdentityId: identity.id,
+          name: actor.name, status: "idle", runner: "pi", transport: "host", capabilities: [], startedAt: 1, updatedAt: Date.now(), controlProtocol: "v1" } });
+      published = true;
+    });
+    const attempts: string[] = [];
+    const replace = vi.spyOn(fs, "renameSync").mockImplementation((source, target) => {
+      if (String(target) === file) { attempts.push(file); if (replaced) return; }
+      return rename(source, target);
+    });
+    try {
+      manager.tell(actor.id, "accepted after rightful first publication");
+      if (replaced) {
+        expect(attempts).toEqual([]); expect(fs.readFileSync(file, "utf8")).toBe(before);
+        expect(manager.status(actor.id).lastError).toContain("queue custody changed");
+      } else {
+        expect(attempts).toEqual([file]);
+        expect(JSON.parse(fs.readFileSync(file, "utf8")).items).toHaveLength(manager.status(actor.id).queued);
+        expect(manager.status(actor.id).queued).toBe(2);
+        expect(manager.status(actor.id).lastError).toBeUndefined();
+      }
+      expect(agents.list()).toEqual([]);
+    } finally { await manager.close(); replace.mockRestore(); }
+  } finally { await manager.close(); await agents.close(); recorder.mockRestore(); fs.rmSync(root, { recursive: true, force: true }); }
+});
 
 it("a cross-process holder gives one zero-wait busy refusal with no mutation or stale recovery", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "queue-registry-busy-"));

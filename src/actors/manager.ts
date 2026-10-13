@@ -6601,7 +6601,9 @@ export class ActorManager {
       finally { this.#directoryOwnership = cached; }
       const generation = this.#queueOwnershipGeneration(actor);
       const expected = this.#queueOwnerGenerations.get(actorId);
-      if (!owned || (expected !== undefined && expected !== generation) ||
+      const firstPublication = expected !== undefined && expected !== generation &&
+        this.#isFirstQueuePublication(actor, expected, generation);
+      if (!owned || (expected !== undefined && expected !== generation && !firstPublication) ||
           this.#queueRevision(file) !== this.#queueRevisions.get(file)) throw new ActorQueueCustodyLostError(actorId);
       this.#queueOwnerGenerations.set(actorId, generation);
       return true;
@@ -6903,6 +6905,20 @@ export class ActorManager {
     const revision = this.#queueRevision(file);
     if (revision === undefined) throw new Error("Queue mutation has no bound revision receipt");
     this.#queueRevisions.set(file, revision);
+  }
+
+  /** A newly created lineage can accept work before its first participant commit.
+   * Bind that first SELF publication only under the existing queue/registry fence;
+   * a known owner transition or a same-lineage file replacement is never rebased. */
+  #isFirstQueuePublication(actor: ManagedActor, expected: string, generation: string): boolean {
+    const before = JSON.parse(expected) as unknown[], after = JSON.parse(generation) as unknown[];
+    return before.slice(4).every(value => value === null) &&
+      JSON.stringify(before.slice(0, 4)) === JSON.stringify(after.slice(0, 4)) &&
+      after[4] === this.#rootId && after[6] === this.identity.id &&
+      (after[9] === null || after[9] === actor.residency) &&
+      // No same-root/residency fallback: the canonical directory must explicitly
+      // confirm this owner now, while publication/transfer still cannot enter.
+      this.#canManageActor?.(actor.id, true) === true;
   }
 
   #queueOwnershipGeneration(actor: ManagedActor): string {

@@ -592,7 +592,10 @@ const readFile = (root: string, options: MeshBackendOptions): FencedFile =>
 const dropBlankStateFile = (root: string): void => {
   const file = path.join(root, STATE_JSON);
   // smarty-dev#8907: judged by this lstat; the content is read through a descriptor proven to be that inode, and only
-  // that inode is removed. A successor swapped in since is kept and the import refused. Off Linux: main's rmSync.
+  // that inode is removed. A successor swapped in since is kept and the import refused. pi-fabric#1036 round 3 P2: no
+  // path fallback here (smarty-dev#7858): where the verified path is unavailable (darwin, Windows without the helper)
+  // nothing is deleted, the file is kept and the import refused, so a successor swapped in after the blank judgment
+  // is never removed by name. The Windows helper, where switched on, still verifies the judged inode.
   const stat = fs.lstatSync(file, { throwIfNoEntry: false });
   if (!stat?.isFile() || stat.size > 4096) return;
   const descriptor = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
@@ -600,7 +603,7 @@ const dropBlankStateFile = (root: string): void => {
     const opened = fs.fstatSync(descriptor);
     if (opened.dev !== stat.dev || opened.ino !== stat.ino || fs.readFileSync(descriptor, "utf8").trim() !== "") return;
   } finally { fs.closeSync(descriptor); }
-  const result = verifiedRemove(file, stat, { deleter: "meshBlankStateFile", fallback: () => { fs.rmSync(file, { force: true }); return true; } });
+  const result = verifiedRemove(file, stat, { deleter: "meshBlankStateFile" });
   if (!result.removed) throw new MeshBackendRefusedError(`Fabric mesh blank state.json was not dropped (${result.reason}); import refused`);
 };
 

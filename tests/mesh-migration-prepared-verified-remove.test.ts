@@ -11,11 +11,14 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const probe = vi.hoisted(() => ({ dry: true, moveAway: undefined as ((target: string) => void) | undefined,
+  /** Runs at the verifier boundary (same mock on base and fix), after the caller's judgment, before the verifier. */
+  beforeVerify: undefined as ((target: string) => void) | undefined,
   judged: [] as Array<{ target: string; ino: number; mtimeMs: number }> }));
 vi.mock("../src/storage/verified-remove.js", async (original) => {
   const real = await original<typeof import("../src/storage/verified-remove.js")>();
   return { ...real, verifiedRemove: (target: string, judged: fs.Stats | undefined, options: Parameters<typeof real.verifiedRemove>[2]) => {
     probe.judged.push({ target, ino: judged?.ino ?? -1, mtimeMs: judged?.mtimeMs ?? -1 });
+    probe.beforeVerify?.(target);
     const dryRun = probe.dry || process.platform === "linux";
     const result = real.verifiedRemove(target, judged, dryRun ? { ...options, dryRun: true } : options);
     if (dryRun && result.removed && !path.basename(target).startsWith("state.json")) probe.moveAway?.(target);
@@ -90,7 +93,7 @@ const emulate = (op: "rmSync" | "unlinkSync" | "rmdirSync", target: string, opti
 };
 
 beforeEach(() => {
-  probe.dry = true; probe.judged.length = 0; primitive.length = 0; failPrimitive = false;
+  probe.dry = true; probe.beforeVerify = undefined; probe.judged.length = 0; primitive.length = 0; failPrimitive = false;
   pendingSwaps.clear(); swapped.clear();
   trash = fs.mkdtempSync(path.join(os.tmpdir(), "mesh-8907-trash-"));
   probe.moveAway = (target) => { if (real.lstatSync(target, { throwIfNoEntry: false })) real.renameSync(target, path.join(trash, randomUUID())); };
@@ -227,5 +230,51 @@ describe("migration and rollback temps (smarty-dev#8907)", () => {
     expectSuccessorKept(state, "{}");
     expect(outcome).toBeInstanceOf(MeshBackendRefusedError);
     expect(String((outcome as Error).message)).toMatch(/blank state.json was not dropped/);
+  });
+
+  // pi-fabric#1036 round 3 P2: the blank drop has no path fallback. Unverified platform (darwin stub, real verifier,
+  // no dry run): a successor swapped in after the content judgment, before the verifier, is never removed by name.
+  it("off Linux: a blank state.json swapped after its judgment is kept, no primitive, import refused", async () => {
+    const root = rootOf(), state = path.join(root, "state.json");
+    const blank = write(state, "  \n");
+    probe.dry = false;
+    pendingSwaps.set(state, "{}");
+    probe.beforeVerify = (target) => { if (target === state) injectSwap(state); };
+    asPlatform("darwin");
+    const outcome = await settle(importMeshState(root));
+    asPlatform(realPlatform);
+    expectSwapFired(state);
+    expect(primitive).toEqual([]);
+    expectSuccessorKept(state, "{}");
+    expect(swapped.get(state)).not.toBe(blank.ino);
+    // Lock releases go through the verifier too; the state.json judgment is the blank's original inode.
+    expect(probe.judged.filter(({ target }) => target === state)).toEqual([{ target: state, ino: blank.ino, mtimeMs: blank.mtimeMs }]);
+    expect(outcome).toBeInstanceOf(MeshBackendRefusedError);
+    expect(String((outcome as Error).message)).toMatch(/blank state.json was not dropped \((directory-relative removal needs Linux|file ownership cannot be proven)/);
+  });
+
+  it("off Linux: an unchanged blank state.json is kept (no path removal) and the import refused", async () => {
+    const root = rootOf(), state = path.join(root, "state.json");
+    const blank = write(state, "");
+    probe.dry = false;
+    asPlatform("darwin");
+    const outcome = await settle(importMeshState(root));
+    asPlatform(realPlatform);
+    expect(primitive).toEqual([]);
+    expect(real.lstatSync(state).ino).toBe(blank.ino);
+    expect(fs.readFileSync(state, "utf8")).toBe("");
+    expect(outcome).toBeInstanceOf(MeshBackendRefusedError);
+    expect(String((outcome as Error).message)).toMatch(/blank state.json was not dropped/);
+  });
+
+  linuxIt("import: an unchanged blank state.json is verified with its judged stat (dry run keeps it), no primitive", async () => {
+    const root = rootOf(), state = path.join(root, "state.json");
+    const blank = write(state, "  \n");
+    const outcome = await settle(importMeshState(root));
+    expect(probe.judged).toEqual([{ target: state, ino: blank.ino, mtimeMs: blank.mtimeMs }]);
+    expect(primitive).toEqual([]);
+    expect(real.lstatSync(state).ino).toBe(blank.ino);
+    // The dry run kept the file, so the strict decoder (recoverDamage=false) reads it as damage; not a drop refusal.
+    expect(String((outcome as Error | undefined)?.message)).not.toMatch(/not dropped/);
   });
 });

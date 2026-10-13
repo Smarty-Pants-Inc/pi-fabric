@@ -283,3 +283,202 @@ it("off Linux runs main's removal as the fallback and propagates its failure", a
     Object.defineProperty(process, "platform", platform);
   }
 });
+
+// pi-fabric#1036 r3 P1: an intent this hold itself wrote (an archive restore's rewrite, an archive-coupled publication's
+// crash fence) has no pre-judgment stat. A legacy off-lock writer can rename a successor over it inside the hold: no
+// by-name removal, no stat-only removal and no same-hold compaction may take that successor.
+const { MESH_ARCHIVE_CONFIG, MeshArchive } = await import("../src/mesh/archive.js");
+const seedArchived = (options: ConstructorParameters<typeof MeshStore>[3] = {}) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "mesh-1036-"));
+  roots.push(root);
+  const archiveDir = path.join(root, "event-archive");
+  fs.mkdirSync(archiveDir, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(root, MESH_ARCHIVE_CONFIG), JSON.stringify({ version: 1, dir: archiveDir }));
+  const file = receiptPath(root, "k").replace(/\.json$/, ".pending.json");
+  return { root, archiveDir, file, store: new MeshStore(root, 4096, 100, options) };
+};
+/** An archived reservation whose live line is gone (commit death, then an old rewrite emptied the log): the next
+ * settle restores it, rewriting the intent first. Returns the archived event and the dead publisher's intent inode. */
+const seedRestore = async (seeded: ReturnType<typeof seedArchived>) => {
+  const crash = vi.spyOn(MeshArchive.prototype, "commit").mockImplementationOnce(() => { throw new Error("death before archive commit"); });
+  await expect(seeded.store.publish({ topic: "mesh.1036", from, dedupeKey: "k" })).rejects.toThrow("death before archive commit");
+  crash.mockRestore();
+  const event = JSON.parse((fs.readFileSync(path.join(seeded.root, "events.jsonl"), "utf8") as string).trim()) as { id: string; sequence: number };
+  fs.writeFileSync(path.join(seeded.root, "events.jsonl"), "");
+  return { event, deadIno: fs.lstatSync(seeded.file).ino };
+};
+/** The shared seam (prior and fixed code): right after the hold's own intent write, its live append of events.jsonl
+ * returns; `act` runs once there, before the receipt and the intent cleanup. */
+const afterOwnIntentAppend = (root: string, file: string, act: () => void) => {
+  const appendFileSync = fs.appendFileSync;
+  const state = { fired: false, written: "", writtenIno: 0 };
+  vi.spyOn(fs, "appendFileSync").mockImplementation(((target: fs.PathOrFileDescriptor, ...rest: unknown[]) => {
+    const result = (appendFileSync as (...args: unknown[]) => unknown)(target, ...rest);
+    const own = real.lstatSync(file, { throwIfNoEntry: false });
+    if (!state.fired && target === path.join(root, "events.jsonl") && own) {
+      state.fired = true; state.written = fs.readFileSync(file, "utf8") as string; state.writtenIno = own.ino; act();
+    }
+    return result;
+  }) as never);
+  return state;
+};
+const successorText = (archiveDir: string) =>
+  JSON.stringify({ dedupeKey: "k", reservedSequence: 7, eventId: "successor-id", liveOffset: 0, archiveDir });
+const installArchivedSuccessor = (file: string, archiveDir: string) => {
+  fs.writeFileSync(`${file}.swap`, successorText(archiveDir), { mode: 0o600 });
+  fs.renameSync(`${file}.swap`, file);
+};
+const expectSuccessorKept = (seeded: ReturnType<typeof seedArchived>, swap: { fired: boolean; writtenIno: number }, successorIno: number) => {
+  expect(swap.fired).toBe(true);
+  expect(successorIno).not.toBe(swap.writtenIno); // a real new inode replaced the hold's own write
+  expect(fs.lstatSync(seeded.file).ino).toBe(successorIno);
+  expect(fs.readFileSync(seeded.file, "utf8")).toBe(successorText(seeded.archiveDir));
+  expect(receiptRemovals(seeded.file)).toEqual([]); // no primitive by-name call
+  expect(probe.calls.filter(call => call.target === seeded.file)).toEqual([]); // never judged, nor re-judged by compaction
+  expect(fs.existsSync(path.join(seeded.root, "generation"))).toBe(false); // no same-hold compaction rewrite
+};
+
+/** pi-fabric#1036 r3: a later, separate hold whose compaction really runs (maxEventLogBytes floors at maxEventBytes + 2,
+ * so a second 2 KB unkeyed event pushes the live log over it). Returns the outcome and the log bytes before it. */
+const laterCompaction = async (root: string) => {
+  const events = path.join(root, "events.jsonl");
+  const later = new MeshStore(root, 4096, 100, { maxEventLogBytes: 1 });
+  await later.publish({ topic: "mesh.1036", from, text: "z".repeat(2000) }); // still under the threshold
+  expect(fs.statSync(events).size).toBeLessThanOrEqual(4098);
+  const before = fs.readFileSync(events, "utf8") as string;
+  const outcome = await later.publish({ topic: "mesh.1036", from, text: "z".repeat(2000) }).then(event => event, (error: unknown) => error);
+  return { outcome, before, after: fs.readFileSync(events, "utf8") as string };
+};
+/** A kept successor beside the original's receipt (eventId/sequence mismatch) is never settled by that receipt: the
+ * later compaction fails closed before prune and rewrite, the successor never judged. */
+const expectLaterCompactionKeeps = async (seeded: ReturnType<typeof seedArchived>, swap: { fired: boolean; writtenIno: number }, successorIno: number) => {
+  const { outcome, before, after } = await laterCompaction(seeded.root);
+  // Trigger proof first, valid whether or not a rewrite followed: the second event's line (the log's last line in
+  // either case) appended to `before` crossed the threshold, so compaction really ran in this later hold.
+  const lastLine = after.trimEnd().split("\n").at(-1)!;
+  expect(JSON.parse(lastLine)).toMatchObject({ topic: "mesh.1036", text: "z".repeat(2000) });
+  expect(before.length + lastLine.length + 1).toBeGreaterThan(4098); // ASCII log
+  // That compaction never judged the successor (before the fix: one meshDedupeIntent call on its inode, removed:true).
+  expect(probe.calls.filter(call => call.target === seeded.file), `successor ino ${successorIno}`).toEqual([]);
+  expect(outcome).toBeInstanceOf(MeshDedupeRecoveryError);
+  expect(after.startsWith(before)).toBe(true); // appended only, never rewritten
+  expectSuccessorKept(seeded, swap, successorIno);
+};
+/** Counterpart: the dry run leaves the matching own intent beside its receipt; a later compaction settles it by that
+ * receipt (eventId and sequence match) through the verifier, then prunes and rewrites normally. */
+const expectLaterCompactionClears = async (seeded: ReturnType<typeof seedArchived>, ino: number) => {
+  const { outcome } = await laterCompaction(seeded.root);
+  expect(outcome).toMatchObject({ topic: "mesh.1036" });
+  expect(probe.calls.filter(call => call.target === seeded.file)).toEqual([
+    { target: seeded.file, ino, deleter: "meshDedupeIntent", removed: true },
+    { target: seeded.file, ino, deleter: "meshDedupeIntent", removed: true },
+  ]);
+  expect(fs.existsSync(path.join(seeded.root, "generation"))).toBe(true);
+  expect(receiptRemovals(seeded.file)).toEqual([]);
+};
+
+it.runIf(process.platform === "linux")("an archive restore keeps a successor swapped in after its intent rewrite", async () => {
+  const seeded = seedArchived({ maxEventLogBytes: 1 });
+  const { event, deadIno } = await seedRestore(seeded);
+  let successorIno = 0;
+  const swap = afterOwnIntentAppend(seeded.root, seeded.file, () => { installArchivedSuccessor(seeded.file, seeded.archiveDir); successorIno = fs.lstatSync(seeded.file).ino; });
+  const outcome = await seeded.store.publishBatch([{ topic: "mesh.1036", from, dedupeKey: "k" }]).then(() => undefined, (error: unknown) => error);
+  expect(outcome).toBeInstanceOf(MeshDedupeRecoveryError);
+  expect(swap.writtenIno).not.toBe(deadIno); // the seam fired after the restore's own rewrite, not on the dead intent
+  expect(JSON.parse(swap.written)).toMatchObject({ eventId: event.id, reservedSequence: event.sequence });
+  expectSuccessorKept(seeded, swap, successorIno);
+  // The restored event's receipt is durable: a retry confirms it and still keeps the successor (CAS mismatch).
+  expect(JSON.parse(fs.readFileSync(receiptPath(seeded.root, "k"), "utf8") as string)).toMatchObject({ id: event.id });
+  await expect(seeded.store.publish({ topic: "mesh.1036", from, dedupeKey: "k" })).resolves.toMatchObject({ id: event.id });
+  expectSuccessorKept(seeded, swap, successorIno);
+  await expectLaterCompactionKeeps(seeded, swap, successorIno);
+});
+
+it.runIf(process.platform === "linux")("an archive-coupled publication keeps a successor swapped in after its intent write", async () => {
+  const seeded = seedArchived({ maxEventLogBytes: 1 });
+  let successorIno = 0;
+  const swap = afterOwnIntentAppend(seeded.root, seeded.file, () => { installArchivedSuccessor(seeded.file, seeded.archiveDir); successorIno = fs.lstatSync(seeded.file).ino; });
+  await expect(seeded.store.publish({ topic: "mesh.1036", from, dedupeKey: "k" })).rejects.toBeInstanceOf(MeshDedupeRecoveryError);
+  const published = JSON.parse((fs.readFileSync(path.join(seeded.root, "events.jsonl"), "utf8") as string).trim()) as { id: string };
+  expect(JSON.parse(swap.written)).toMatchObject({ eventId: published.id });
+  expectSuccessorKept(seeded, swap, successorIno);
+  expect(JSON.parse(fs.readFileSync(receiptPath(seeded.root, "k"), "utf8") as string)).toMatchObject({ id: published.id });
+  await expect(seeded.store.publish({ topic: "mesh.1036", from, dedupeKey: "k" })).resolves.toMatchObject({ id: published.id });
+  expectSuccessorKept(seeded, swap, successorIno);
+  await expectLaterCompactionKeeps(seeded, swap, successorIno);
+});
+
+it.runIf(process.platform === "linux")("a successor swapped after the written-bytes proof is refused by the verifier, never re-judged", async () => {
+  const seeded = seedArchived({ maxEventLogBytes: 1 });
+  const { verifiedRemoveTestHooks } = await import("../src/storage/verified-remove.js");
+  let successorIno = 0;
+  let ownIno = 0;
+  verifiedRemoveTestHooks.beforeOpen = target => {
+    if (target !== seeded.file || successorIno) return;
+    ownIno = fs.lstatSync(seeded.file).ino;
+    installArchivedSuccessor(seeded.file, seeded.archiveDir);
+    successorIno = fs.lstatSync(seeded.file).ino;
+  };
+  try {
+    await expect(seeded.store.publish({ topic: "mesh.1036", from, dedupeKey: "k" })).rejects.toBeInstanceOf(MeshDedupeRecoveryError);
+  } finally { verifiedRemoveTestHooks.beforeOpen = undefined; }
+  expect(successorIno).not.toBe(0);
+  expect(successorIno).not.toBe(ownIno);
+  expect(fs.lstatSync(seeded.file).ino).toBe(successorIno);
+  expect(fs.readFileSync(seeded.file, "utf8")).toBe(successorText(seeded.archiveDir));
+  // Only the proved own inode was judged (and refused); the successor never was, and no compaction ran.
+  expect(probe.calls.filter(call => call.target === seeded.file)).toEqual([{ target: seeded.file, ino: ownIno, deleter: "meshDedupeIntent", removed: false }]);
+  expect(receiptRemovals(seeded.file)).toEqual([]);
+  expect(fs.existsSync(path.join(seeded.root, "generation"))).toBe(false);
+});
+
+it("off Linux every intent cleanup is verified-only: retained, fails closed or bounded, never a pathname removal", async () => {
+  const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+  Object.defineProperty(process, "platform", { ...platform, value: "darwin" });
+  try {
+    probe.dryRun = false;
+    // Archive-coupled publication: its proved own intent is retained beside the authoritative receipt; no error.
+    const archived = seedArchived();
+    const event = await archived.store.publish({ topic: "mesh.1036", from, dedupeKey: "k" });
+    expect(JSON.parse(fs.readFileSync(archived.file, "utf8") as string)).toMatchObject({ eventId: event.id });
+    expect(probe.calls.filter(call => call.target === archived.file)).toMatchObject([{ deleter: "meshDedupeIntent", removed: false }]);
+    await expect(archived.store.publish({ topic: "mesh.1036", from, dedupeKey: "k" })).resolves.toMatchObject({ id: event.id });
+    expect(receiptRemovals(archived.file)).toEqual([]);
+    // The direct judged no-archive branch: a stale intent cannot be removed, so it fails closed before any append.
+    const stale = seedIntent();
+    await expect(stale.store.publish({ topic: "mesh.8907", from, dedupeKey: "k" })).rejects.toBeInstanceOf(MeshDedupeRecoveryError);
+    expect(receiptRemovals(stale.file)).toEqual([]);
+    nothingWritten(stale.root);
+    // Admission stays bounded: a retained intent holds its key's slot, a new key is refused (no hang, no deletion).
+    const bounded = seedArchived({ maxDedupeReceipts: 1 });
+    await expect(bounded.store.publish({ topic: "mesh.1036", from, dedupeKey: "k" })).resolves.toMatchObject({ dedupeKey: "k" });
+    await expect(bounded.store.publish({ topic: "mesh.1036", from, dedupeKey: "other" })).rejects.toBeInstanceOf(MeshDedupeStoreFullError);
+    expect(fs.existsSync(bounded.file)).toBe(true);
+    expect(removals.filter(target => target.endsWith(".pending.json"))).toEqual([]);
+  } finally {
+    Object.defineProperty(process, "platform", platform);
+  }
+});
+
+it.runIf(process.platform === "linux")("an unchanged archive restore settles its own rewritten intent by that inode (dry run)", async () => {
+  const seeded = seedArchived();
+  const { event, deadIno } = await seedRestore(seeded);
+  await expect(seeded.store.publish({ topic: "mesh.1036", from, dedupeKey: "k" })).resolves.toMatchObject({ id: event.id });
+  const restoredIno = fs.lstatSync(seeded.file).ino; // dry run: the verified intent stays
+  expect(restoredIno).not.toBe(deadIno);
+  expect(probe.calls.filter(call => call.target === seeded.file)).toEqual([{ target: seeded.file, ino: restoredIno, deleter: "meshDedupeIntent", removed: true }]);
+  expect(receiptRemovals(seeded.file)).toEqual([]);
+  expect(JSON.parse(fs.readFileSync(receiptPath(seeded.root, "k"), "utf8") as string)).toMatchObject({ id: event.id });
+  await expectLaterCompactionClears(seeded, restoredIno);
+});
+
+it.runIf(process.platform === "linux")("an unchanged archive-coupled publication settles its own intent by that inode (dry run)", async () => {
+  const seeded = seedArchived();
+  const event = await seeded.store.publish({ topic: "mesh.1036", from, dedupeKey: "k" });
+  const ino = fs.lstatSync(seeded.file).ino;
+  expect(JSON.parse(fs.readFileSync(seeded.file, "utf8") as string)).toMatchObject({ eventId: event.id });
+  expect(probe.calls.filter(call => call.target === seeded.file)).toEqual([{ target: seeded.file, ino, deleter: "meshDedupeIntent", removed: true }]);
+  expect(receiptRemovals(seeded.file)).toEqual([]);
+  expect(JSON.parse(fs.readFileSync(receiptPath(seeded.root, "k"), "utf8") as string)).toMatchObject({ id: event.id });
+  await expectLaterCompactionClears(seeded, ino);
+});

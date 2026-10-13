@@ -271,15 +271,18 @@ export const recoverEnodevTaskRun = (directory: string, options: { now?: number;
     const recipient = typeof meshRoot === "string" ? completionRecipientFromRun(meshRoot, directory) : undefined;
     if (typeof meshRoot === "string" && recipient) address = { meshRoot, recipient };
   } catch { address = undefined; } // A malformed manifest proves no recipient: settled lost.
+  // A record its manager already made terminal keeps its outcome (goneEnodevOutcome); only a running one takes the
+  // saved answer. Either way the journal's run-id receipt means a result its spawner consumed is never sent again.
+  const terminal = record.status !== "running" && record.status !== "queued";
   if (text !== undefined && address && recipientLive(address.meshRoot, address.recipient, now)) {
     if (options.dryRun) return "delivered";
-    const result = { ...goneEnodevOutcome(directory, record), status: "completed", text, enodevDelivered: true } as AgentRunResult;
+    const result = { ...goneEnodevOutcome(directory, record), enodevDelivered: true } as AgentRunResult;
     saveCompletion(address.meshRoot, address.recipient, result); // durable, idempotent by run id
-    settle(directory, run, { status: "completed", enodevDelivered: true, text });
+    settle(directory, run, terminal ? { enodevDelivered: true } : { status: "completed", enodevDelivered: true, text });
     return "delivered";
   }
   if (options.dryRun) return "lost";
-  settle(directory, run, text === undefined
+  settle(directory, run, terminal ? { settledLost: true } : text === undefined
     ? { status: "failed", settledLost: true, error: "lost: the worker exit was unconfirmed (ENODEV), no answer was saved and its manager is gone" }
     : { status: "completed", settledLost: true, text });
   return "lost";

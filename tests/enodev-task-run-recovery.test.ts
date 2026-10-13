@@ -9,7 +9,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agents/manager.js";
-import { CompletionJournal, pendingCompletions, type CompletionRecipient } from "../src/agents/completion-journal.js";
+import { CompletionJournal, consumeCompletion, pendingCompletions, type CompletionRecipient } from "../src/agents/completion-journal.js";
 import { recoverEnodevTaskRun } from "../src/agents/enodev-recovery.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
@@ -49,11 +49,13 @@ const liveSpawner = (meshRoot: string, recipient: CompletionRecipient, session =
   writeHostLease(meshRoot, { id: recipient.rootId, rootId: recipient.rootId, identityId: recipient.rootId, updatedAt: now,
     expiresAt: now + 60_000, startedAt: now, session: { id: session, startedAt: now, updatedAt: now, expiresAt: now + 60_000 } });
 };
-interface Fixture { pid?: number; birth?: string; actorId?: string; settlement?: unknown; reason?: string; recipient?: CompletionRecipient | null }
+interface Fixture { pid?: number; birth?: string; actorId?: string; settlement?: unknown; reason?: string; recipient?: CompletionRecipient | null;
+  status?: string; text?: string }
 const runDir = (runRoot: string, meshRoot: string, id: string, fixture: Fixture = {}): string => {
   const directory = path.join(runRoot, id);
   fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
-  fs.writeFileSync(path.join(directory, "status.json"), JSON.stringify({ id, name: "task-run", task: "t", status: "running",
+  fs.writeFileSync(path.join(directory, "status.json"), JSON.stringify({ id, name: "task-run", task: "t", status: fixture.status ?? "running",
+    ...(fixture.text !== undefined ? { text: fixture.text } : {}),
     runner: "pi", transport: "process", startedAt: 1, sessionId: String(fixture.pid ?? deadPid()),
     ...(fixture.birth ? { processStartTime: fixture.birth } : {}), ...(fixture.actorId ? { actorId: fixture.actorId } : {}) }));
   fs.writeFileSync(path.join(directory, "unresolved-worker.json"), JSON.stringify({ reason: fixture.reason ?? ENODEV, markedAt: 1, runId: id }));
@@ -137,6 +139,28 @@ describe.runIf(process.platform === "linux")("ENODEV-unconfirmed task-agent runs
     // A settlement for another run is no saved answer: settled lost, not delivered.
     const foreign = runDir(tempRoot(), meshRoot, "e".repeat(32), { settlement: { version: 1, runId: "0".repeat(32), outcome: "completed", text: "x" } });
     expect(recoverEnodevTaskRun(foreign)).toBe("lost");
+    expect(pendingCompletions(meshRoot, meshRoot)).toHaveLength(0);
+  });
+
+  // Ryzen 1's real runs (copies from fabric-store): most records are already terminal (completed with text, or
+  // stopped). Such a record keeps its outcome; a result its spawner already consumed is never sent again.
+  it("(d) a record its manager made terminal keeps its outcome; a consumed result is not resent", () => {
+    const meshRoot = tempRoot();
+    const recipient = recipientOf(meshRoot);
+    liveSpawner(meshRoot, recipient);
+    const stopped = runDir(tempRoot(), meshRoot, "5".repeat(32), { status: "stopped", settlement: null });
+    expect(recoverEnodevTaskRun(stopped)).toBe("lost");
+    expect(status(stopped)).toMatchObject({ status: "stopped", settledLost: true });
+    expect(vetoed(stopped)).toBe(false);
+    const id = "6".repeat(32);
+    const completed = runDir(tempRoot(), meshRoot, id, { status: "completed", text: "the manager's text" });
+    expect(recoverEnodevTaskRun(completed)).toBe("delivered");
+    expect(status(completed)).toMatchObject({ status: "completed", text: "the manager's text", enodevDelivered: true });
+    expect(pendingCompletions(meshRoot, meshRoot).map(envelope => envelope.result.text)).toEqual(["the manager's text"]);
+    // Consumed by its spawner, then the marker reappears (a crash replay): nothing is sent again.
+    consumeCompletion(meshRoot, id, recipient.sessionId);
+    fs.writeFileSync(path.join(completed, "unresolved-worker.json"), JSON.stringify({ reason: ENODEV, markedAt: 1, runId: id }));
+    expect(recoverEnodevTaskRun(completed)).toBe("delivered");
     expect(pendingCompletions(meshRoot, meshRoot)).toHaveLength(0);
   });
 

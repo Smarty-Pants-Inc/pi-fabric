@@ -4,10 +4,10 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { meshBackendStatus, type MeshBackendOptions } from "../src/mesh/backend-migration.js";
+import { cutoverMeshState, importMeshState, meshBackendStatus, type MeshBackendOptions } from "../src/mesh/backend-migration.js";
 import { main } from "../src/mesh/mesh-backend-cli.js";
 import { decodeMeshStateFile, encodeMeshStateFile, type MeshStateFile } from "../src/mesh/state-file.js";
-import { openNodeSqlite, type SqliteConnection, type SqliteOpener } from "../src/mesh/state-sqlite.js";
+import { MeshStateUnsupportedError, openNodeSqlite, type SqliteConnection, type SqliteOpener, type SqliteStatement } from "../src/mesh/state-sqlite.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 
 // Review 1029: a deterministic randomBytes(16) failure (only the quarantine entry name draws 16 bytes), armed only at
@@ -705,6 +705,201 @@ describe.skipIf(process.platform !== "linux")("recorded cleanup", () => {
     refusedUnderFence(result, "sqlite");
     expect(calls).toEqual([]);
     expect((await meshBackendStatus(root)).backend).toBe("importing");
+  });
+
+  // smarty-dev#9501 P2 (review 1029): a WAL setup refusal inside FenceDb.open (the `PRAGMA journal_mode = WAL` check,
+  // backend-migration.ts FenceDb.open) runs BEFORE owned.createSidecars and before cutoverWithFence's refusal cleanup,
+  // so a state.db that owned.create made for this run is left at its root name. These call importMeshState and
+  // cutoverMeshState directly with a pure fake SqliteOpener (no SQLite at all: a plain read descriptor on the checked
+  // inode satisfies the gate's fd binding, exec/prepare are scripted). The removal recorder is installed BEFORE every
+  // product run. "Gone" means the root names are free and the created inode is kept at its reported quarantine path:
+  // the helper quarantines and never unlinks.
+  type WalFakeMode = "sentinel" | "wrong-mode" | "ordinary-error";
+  const walFake = (input: { mode: WalFakeMode; onRefuse?: () => void; failClose?: boolean }) => {
+    const sentinel = new MeshStateUnsupportedError("injected WAL setup refusal (sentinel)");
+    const ordinary = Object.assign(new Error("SQLITE_IOERR: injected ordinary WAL setup I/O error"), { code: "ERR_SQLITE_ERROR" });
+    const log: string[] = [];
+    const opened: string[] = [];
+    const fds = new Set<number>();
+    let armed = false;
+    let closes = 0;
+    const open: SqliteOpener = (file) => {
+      opened.push(idOf(fs.lstatSync(file))!);
+      const fd = fs.openSync(file, "r"); // the connection's own descriptor on the checked inode, never SQLite
+      fds.add(fd);
+      const statement = (sql: string): SqliteStatement => ({
+        get: () => {
+          log.push(`get ${sql}`);
+          if (sql !== "PRAGMA journal_mode = WAL") throw new Error(`unexpected get: ${sql}`);
+          armed = input.mode !== "ordinary-error";
+          input.onRefuse?.();
+          if (input.mode === "sentinel") throw sentinel;
+          if (input.mode === "ordinary-error") throw ordinary;
+          return { journal_mode: "delete" };
+        },
+        run: () => { throw new Error(`unexpected run: ${sql}`); },
+        all: () => { throw new Error(`unexpected all: ${sql}`); },
+      });
+      return {
+        exec: (sql) => {
+          log.push(`exec ${sql}`);
+          if (!/^PRAGMA (?:busy_timeout|trusted_schema) =/.test(sql)) throw new Error(`unexpected exec: ${sql}`);
+        },
+        prepare: (sql) => { log.push(`prepare ${sql}`); return statement(sql); },
+        get isTransaction() { return false; },
+        close: () => {
+          closes += 1;
+          log.push("close");
+          if (input.failClose && armed) { armed = false; throw Object.assign(new Error("EIO: injected close failure"), { code: "EIO" }); }
+          if (fds.delete(fd)) fs.closeSync(fd);
+        },
+      };
+    };
+    /** The fixture's own release of descriptors a failed close left open (real fs). */
+    const release = (): void => { for (const fd of fds) { try { fs.closeSync(fd); } catch { /* closed */ } } fds.clear(); };
+    return { open, sentinel, ordinary, log, opened, release, closes: () => closes };
+  };
+  type WalReport = { cleanupWarnings?: string[]; retained?: string[]; reason?: string };
+  const walRun = async (root: string, command: "import" | "cutover", fake: ReturnType<typeof walFake>): Promise<unknown> => {
+    try {
+      await (command === "import" ? importMeshState : cutoverMeshState)(root, { open: fake.open });
+    } catch (error) { return error; }
+    finally { fake.release(); }
+    throw new Error(`${command} unexpectedly succeeded`);
+  };
+  const reportOf = (error: unknown): WalReport => error as WalReport;
+  const quarantineDirs = (root: string): string[] => fs.readdirSync(root).filter(name => name.startsWith(".import-quarantine"));
+  /** The API report (no stderr here): each quarantine entry named in a warning, with manual-cleanup guidance. */
+  const walGuidance = (report: WalReport, q: string[]): void => {
+    const warnings = report.cleanupWarnings ?? [];
+    expect(warnings.length).toBeGreaterThan(0);
+    for (const kept of q) expect(warnings.some(text => text.includes(kept)), kept).toBe(true);
+    expect(warnings.some(text => /manual/i.test(text))).toBe(true);
+  };
+
+  it.each([["sentinel", "import"], ["wrong-mode", "cutover"]] as const)("WAL setup refusal (%s, %s) on a fresh root: the error is rethrown, the root state.db* names are free, the created inode is kept at its reported quarantine path", async (mode, command) => {
+    const root = await fileRoot();
+    expect(dbNames(root)).toEqual([]);
+    const before = fs.readFileSync(path.join(root, "state.json"));
+    const fake = walFake({ mode });
+    const calls = recordRemovals(root, undefined, () => new Set(fake.opened));
+    const error = await walRun(root, command, fake);
+    expect(fake.log).toContain("get PRAGMA journal_mode = WAL"); // the WAL setup path, before owned.createSidecars
+    if (mode === "sentinel") expect(error).toBe(fake.sentinel);
+    else {
+      expect(error).toBeInstanceOf(MeshStateUnsupportedError);
+      expect((error as Error).message).toMatch(/could not enter WAL mode \(delete\)/);
+    }
+    expect(calls).toEqual([]);
+    expect(fs.readFileSync(path.join(root, "state.json")).equals(before)).toBe(true);
+    const created = fake.opened[0];
+    expect(created).toBeDefined();
+    expect(dbNames(root)).toEqual([]); // state.db, -wal, -shm (and -journal) names are free
+    const report = reportOf(error);
+    const q = quarantinePaths({ json: report } as never);
+    // Only the created database: no sidecar was created (createSidecars runs only after a successful WAL pragma).
+    expect(q).toHaveLength(1);
+    expect(q[0]).toMatch(/\/state\.db-[a-f0-9]{32}$/);
+    expect(whereIs(root, created)).toEqual(q);
+    expect(quarantineDirs(root)).toEqual([q[0]!.split("/")[0]]);
+    expect(report.reason).toBe("quarantined-after-refusal");
+    walGuidance(report, q);
+  });
+
+  it("WAL setup refusal over a pre-existing state.db: its exact inode and bytes stay at the name; no quarantine, no report", async () => {
+    const root = await fileRoot();
+    const db = path.join(root, "state.db");
+    fs.writeFileSync(db, "pre-existing bytes", { mode: 0o600, flag: "wx" });
+    const kept = idOf(fs.lstatSync(db));
+    const fake = walFake({ mode: "sentinel" });
+    const calls = recordRemovals(root, undefined, () => new Set([kept]));
+    const error = await walRun(root, "import", fake);
+    expect(fake.log).toContain("get PRAGMA journal_mode = WAL");
+    expect(error).toBe(fake.sentinel);
+    expect(calls).toEqual([]);
+    expect(idOf(fs.lstatSync(db))).toBe(kept);
+    expect(fs.readFileSync(db, "utf8")).toBe("pre-existing bytes");
+    expect(whereIs(root, kept)).toEqual(["state.db"]);
+    expect(quarantineDirs(root)).toEqual([]);
+    expect(reportOf(error).retained ?? []).toEqual([]);
+    expect(reportOf(error).cleanupWarnings ?? []).toEqual([]);
+  });
+
+  it("WAL setup refusal after state.db was replaced between its creation and the cleanup: the foreign inode and bytes stay, the moved owned file remains, the warning says not this run's file", async () => {
+    const root = await fileRoot();
+    const db = path.join(root, "state.db");
+    let foreign: string | undefined;
+    const fake = walFake({ mode: "sentinel", onRefuse: () => {
+      fs.renameSync(db, path.join(root, "moved-away.db"));
+      fs.writeFileSync(db, "foreign", { mode: 0o600, flag: "wx" });
+      foreign = idOf(fs.lstatSync(db));
+    } });
+    const calls = recordRemovals(root, undefined, () => new Set([...fake.opened, foreign]));
+    const error = await walRun(root, "cutover", fake);
+    expect(error).toBe(fake.sentinel);
+    expect(foreign).toBeDefined();
+    expect(calls).toEqual([]);
+    expect(whereIs(root, foreign)).toEqual(["state.db"]);
+    expect(fs.readFileSync(db, "utf8")).toBe("foreign");
+    expect(whereIs(root, fake.opened[0])).toEqual(["moved-away.db"]);
+    const report = reportOf(error);
+    expect(report.retained ?? []).toContain("state.db");
+    expect(report.reason).toBe("not-this-runs-file");
+    expect((report.cleanupWarnings ?? []).some(text => text.includes(`${root}/state.db`) && /not the file this run created/.test(text))).toBe(true);
+  });
+
+  it("WAL setup refusal with an untracked driver-created state.db-wal: no owned identity is invented for it; its inode and bytes keep the name", async () => {
+    const root = await fileRoot();
+    const wal = path.join(root, "state.db-wal");
+    let driverWal: string | undefined;
+    const fake = walFake({ mode: "sentinel", onRefuse: () => {
+      fs.writeFileSync(wal, "driver wal", { mode: 0o600, flag: "wx" });
+      driverWal = idOf(fs.lstatSync(wal));
+    } });
+    const calls = recordRemovals(root, undefined, () => new Set([...fake.opened, driverWal]));
+    const error = await walRun(root, "import", fake);
+    expect(error).toBe(fake.sentinel);
+    expect(driverWal).toBeDefined();
+    expect(calls).toEqual([]);
+    expect(whereIs(root, driverWal)).toEqual(["state.db-wal"]); // never moved into quarantine as "this run's"
+    expect(fs.readFileSync(wal, "utf8")).toBe("driver wal");
+    expect(whereIs(root, fake.opened[0])).toEqual(["state.db"]); // an unowned sidecar also keeps its main database
+    const report = reportOf(error);
+    expect((report.retained ?? []).filter(kept => /state\.db-wal-[a-f0-9]{32}$/.test(kept))).toEqual([]);
+    expect(report.retained ?? []).toEqual(expect.arrayContaining(["state.db-wal", "state.db"]));
+    expect(report.reason).toBe("not-this-runs-file");
+    expect((report.cleanupWarnings ?? []).some(text => text.includes(`${root}/state.db-wal`))).toBe(true);
+  });
+
+  it("WAL setup refusal whose connection close throws: the refusal is unchanged, the created state.db stays at its name (close-failed), nothing is moved or removed", async () => {
+    const root = await fileRoot();
+    const fake = walFake({ mode: "sentinel", failClose: true });
+    const calls = recordRemovals(root, undefined, () => new Set(fake.opened));
+    const error = await walRun(root, "cutover", fake);
+    expect(error).toBe(fake.sentinel);
+    expect((error as Error).message).toBe("injected WAL setup refusal (sentinel)");
+    expect(fake.closes()).toBe(1); // a failed close must not be retried before cleanup or rethrow
+    expect(calls).toEqual([]);
+    expect(idOf(fs.lstatSync(path.join(root, "state.db")))).toBe(fake.opened[0]);
+    expect(quarantineDirs(root)).toEqual([]);
+    const report = reportOf(error);
+    expect(report.reason).toBe("close-failed");
+    expect(report.retained ?? []).toContain("state.db");
+    expect((report.cleanupWarnings ?? []).some(text => text.includes("EIO: injected close failure") && text.includes("close-failed"))).toBe(true);
+  });
+
+  it("WAL setup refusal control: an ordinary (non-refusal) WAL pragma error keeps the created state.db at its name, with no quarantine and no report", async () => {
+    const root = await fileRoot();
+    const fake = walFake({ mode: "ordinary-error" });
+    const calls = recordRemovals(root, undefined, () => new Set(fake.opened));
+    const error = await walRun(root, "import", fake);
+    expect(fake.log).toContain("get PRAGMA journal_mode = WAL");
+    expect(error).toBe(fake.ordinary);
+    expect(calls).toEqual([]);
+    expect(idOf(fs.lstatSync(path.join(root, "state.db")))).toBe(fake.opened[0]);
+    expect(quarantineDirs(root)).toEqual([]);
+    expect(reportOf(error).retained ?? []).toEqual([]);
+    expect(reportOf(error).cleanupWarnings ?? []).toEqual([]);
   });
 });
 

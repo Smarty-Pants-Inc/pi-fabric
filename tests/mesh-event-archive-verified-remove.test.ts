@@ -421,7 +421,7 @@ it.runIf(process.platform === "linux")("a successor swapped after the written-by
   };
   try {
     await expect(seeded.store.publish({ topic: "mesh.1036", from, dedupeKey: "k" })).rejects.toBeInstanceOf(MeshDedupeRecoveryError);
-  } finally { verifiedRemoveTestHooks.beforeOpen = undefined; }
+  } finally { delete verifiedRemoveTestHooks.beforeOpen; }
   expect(successorIno).not.toBe(0);
   expect(successorIno).not.toBe(ownIno);
   expect(fs.lstatSync(seeded.file).ino).toBe(successorIno);

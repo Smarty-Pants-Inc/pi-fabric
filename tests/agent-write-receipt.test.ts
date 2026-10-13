@@ -113,7 +113,8 @@ describe("terminal paths keep the write receipt (pi-fabric#1034 round 7)", () =>
         // Only a still-running record names a live worker; its pid must also match its recorded /proc birth time.
         if (status.status === "running" && ready(status.writeReceipt)) {
           const candidate = Number(status.sessionId);
-          if (candidate > 0 && (status.processStartTime === undefined || processStartTime(candidate) === status.processStartTime)) pid = candidate;
+          // No recorded birth time (off Linux): never signal; the test fails instead of risking a reused pid.
+          if (candidate > 0 && typeof status.processStartTime === "string" && processStartTime(candidate) === status.processStartTime) pid = candidate;
           break;
         }
       } catch { /* not written yet */ }
@@ -190,6 +191,29 @@ describe("terminal paths keep the write receipt (pi-fabric#1034 round 7)", () =>
     expect(result.status).toBe("stopped");
     expect(result.writeReceipt?.paths).toEqual([path.join(root, "f.txt")]);
   }, 60_000);
+
+  it("ENODEV recovery of a running Pi checkpoint marks its receipt truncated; a terminal record keeps its own", async () => {
+    const { goneEnodevOutcome } = await import("../src/agents/enodev-recovery.js");
+    const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-receipt-enodev-")));
+    roots.push(root);
+    const directory = path.join(root, "0123456789abcdef0123456789abcdef");
+    fs.mkdirSync(directory);
+    const base = { id: path.basename(directory), runner: "pi", transport: "process", writeReceipt: { paths: ["/w/f.txt"], commands: [] } };
+    expect(goneEnodevOutcome(directory, { ...base, status: "running" }).writeReceipt)
+      .toEqual({ paths: ["/w/f.txt"], commands: [], truncated: true });
+    expect(goneEnodevOutcome(directory, { ...base, status: "completed" }).writeReceipt).toEqual({ paths: ["/w/f.txt"], commands: [] });
+    expect(goneEnodevOutcome(directory, { ...base, runner: "claude", status: "running" }).writeReceipt).toEqual({ paths: ["/w/f.txt"], commands: [] });
+  });
+
+  it("a Pi worker startup failure carries an empty, complete receipt", async () => {
+    const { writeWorkerStartupFailure } = await import("../src/worker/startup.js");
+    const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-receipt-startup-")));
+    roots.push(root);
+    const file = path.join(root, "status.json");
+    writeWorkerStartupFailure(["node", "worker.js", "--id", "probe", "--runner", "pi", "--status-file", file], new Error("missing module"));
+    expect(JSON.parse(fs.readFileSync(file, "utf8"))).toMatchObject({ status: "failed", writeReceipt: { paths: [], commands: [] } });
+    expect(JSON.parse(fs.readFileSync(file, "utf8")).writeReceipt.truncated).toBeUndefined();
+  });
 
   it("a worker crash keeps the live receipt: an unended write call is published as truncated", async () => {
     const { createRunningRecord, writeCrashRunRecord } = await import("../src/worker/run-record.js");

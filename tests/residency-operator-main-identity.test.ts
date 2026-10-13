@@ -116,7 +116,9 @@ describe.skipIf(process.platform !== "linux")("live operator removal final check
     }, 60_000);
 
   // pi-fabric#1031 round 3 (c6148722668): a malformed recorded start time is no identity: unknown, never "reused".
-  const BAD = ["not-a-proc-tick", " 1", "1 ", "+1", "-1", "1.0", "1e3", "0x1", "01", "18446744073709551616"];
+  const BAD = ["not-a-proc-tick", " 1", "1 ", "+1", "-1", "1.0", "1e3", "0x1", "01", "18446744073709551616",
+    // Regression guards (already refused at baseline, not a new RED): ECMAScript `$` without /m rejects terminators.
+    "1\n", "1\r", "1\r\n", "1\u2028", "1\u2029"];
   it.each(BAD.map(startTime => [startTime] as const))("malformed start time %j on the live current pid refuses", async startTime => {
     const f = await fixture();
     try {

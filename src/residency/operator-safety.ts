@@ -138,7 +138,7 @@ const checkPid = (pid: number, host: string, startedAt: number | undefined): Mai
 
 /** A /proc/<pid>/stat field 22 start time as the kernel prints it: canonical unsigned decimal (%llu), no sign, space,
  * fraction, exponent, hex or leading zero, at most 2^64-1. Compared as strings, so no Number precision loss. */
-const procStartTick = (value: unknown): value is string => typeof value === "string" && /^(0|[1-9][0-9]{0,19})$/.test(value) &&
+const procStartTick = (value: unknown): value is string => typeof value === "string" && /^(?:0|[1-9][0-9]{0,19})$/.exec(value)?.[0] === value &&
   BigInt(value) <= BigInt("18446744073709551615");
 
 /** The recorded Main process is gone from this host ("gone: ..."), or why that cannot be verified. */

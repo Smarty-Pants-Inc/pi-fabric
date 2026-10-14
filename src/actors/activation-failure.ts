@@ -3,7 +3,8 @@
  *
  * A block only expires for a clearly transient cause: a provider 5xx or throttling 429,
  * a stream error or network disconnect, a timeout, a preparation or lock timeout, a lost
- * activation window, a child that exited before model admission, or a missing directive reply
+ * activation window, a registry update veto that committed nothing, a child that exited before
+ * model admission, or a missing directive reply
  * after one of those. Credential, permission, security-policy, quota, rejected-request (4xx
  * other than 429), context and other preparation failures (a model not allowed, invalid
  * instructions) stay blocked, and so does anything not recognised: fail closed.
@@ -21,7 +22,7 @@ export interface ActivationFailureClass {
 /** Codes whose block expires after the bounded backoff; every other code needs a completed run.
  * smarty-dev#6509: a preparation or lock timeout is transient too ("preparation-timeout"). */
 export const TRANSIENT_ACTIVATION_BLOCK_CODES: ReadonlySet<string> = new Set([
-  "provider-transient", "activation-window-lost", "child-exit-before-admission", "preparation-timeout",
+  "provider-transient", "activation-window-lost", "child-exit-before-admission", "preparation-timeout", "registry-update-vetoed",
 ]);
 
 /** smarty-dev#6509: a block's class. Derived from its code, never trusted from a stored record:
@@ -119,16 +120,25 @@ const providerTransientIn = (text: string): { why: string; match: string } | und
  * full failure text; evidence is the run's worker warnings, when the run produced any.
  */
 const WINDOW_LOST = /^[ \t]*(?:Fabric activation window failed: )?(?:Error: )?(Activation window lost (?:current activation messages|its authorized compaction|its native history boundary|its native system records|its native system prompt|the Google config object))[ \t]*\r?$/m;
+// Only the store's exact error, optionally wrapped by #prepare or Error.toString(). A mention
+// in other error text or model prose is not evidence that no registry update committed.
+const REGISTRY_VETO = /^(?:(?:Error|ActorPreparationError): )?(?:Actor [\w:-]+ preparation \([\w-]+\): )?(?:ActorRegistryUpdateVetoedError: )?Actor registry update was vetoed by its validation and not committed; retry$/;
 export const classifyActivationFailure = (input: {
   lastError: string; error?: string | undefined; evidence?: readonly string[] | undefined; preparation?: boolean | undefined;
   /** The preparation error is a timeout by type (a preparation, launch or mesh lock deadline). */
   preparationTimeout?: boolean | undefined;
+  /** The preparation cause is the store's typed veto (not an arbitrary retryable error). */
+  registryVeto?: boolean | undefined;
 }): ActivationFailureClass => {
+  const permanent = permanentAnywhere(input);
+  if (!permanent && (input.registryVeto || REGISTRY_VETO.test(input.lastError))) {
+    return { code: "registry-update-vetoed", transient: true,
+      classification: "transient: actor registry validation veto committed nothing; retry after backoff" };
+  }
   if (input.preparation || input.preparationTimeout) {
     // smarty-dev#6509: a preparation that only ran out of time (its own deadline, a model/auth
     // launch deadline, a mesh or registry lock wait) is transient; any other preparation failure,
     // and a timeout with a permanent cause anywhere in its text, stays a hard block.
-    const permanent = permanentAnywhere(input);
     const timeout = permanent ? undefined
       : input.preparationTimeout ? "a preparation deadline" : TIMEOUT.exec(withoutModelText(input.lastError))?.[0];
     if (timeout) {
@@ -142,7 +152,6 @@ export const classifyActivationFailure = (input: {
     return permanent;
   }
   // Permanent causes first, across the whole failure; only then any transient evidence.
-  const permanent = permanentAnywhere(input);
   if (permanent) return permanent;
   const line = withoutModelText(input.lastError);
   // smarty-dev#9890: every terminal "Activation window lost …" (its messages, history boundary,

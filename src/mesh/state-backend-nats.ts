@@ -1135,7 +1135,7 @@ export const redactNatsUrls = (text: string): string => redactSecrets(text
  * A NEW error fit to leave the NATS client (pi-fabric#937 round 2). It keeps the prototype (so `instanceof`, e.g.
  * NatsWrongLastSequenceError, still works), a redacted name, message, stack and `code`, the number and boolean own
  * fields (`transient`, `expected`, `afterLostAck`: no text), a sanitized `cause` and AggregateError `errors` (depth
- * cap 4), and a sanitized `apiError()` result. Every other field is dropped. A non-Error throw becomes an Error with
+ * cap 4), a numeric `status`, and a sanitized `apiError()` result. Every other field is dropped. A non-Error throw becomes an Error with
  * its printable() text: a string redacted, an object only its type and allowlisted fields. Total: no coercion can throw out of it (a hostile toString, getter or proxy gives
  * "[unprintable error]").
  */
@@ -1169,16 +1169,20 @@ const sanitizeNatsError = (error: unknown, depth: number): Error => {
   if (!(error instanceof Error)) return new Error(printable(error));
   const read = (key: string): unknown => { try { return (error as unknown as Record<string, unknown>)[key]; } catch { return undefined; } };
   const safe = Object.create(Object.getPrototypeOf(error) as object) as Error & Record<string, unknown>;
-  const define = (key: string, value: unknown) => Object.defineProperty(safe, key, { value, writable: true, configurable: true, enumerable: false });
+  const define = (key: string, value: unknown, enumerable = false) => Object.defineProperty(safe, key, { value, writable: true, configurable: true, enumerable });
   define("name", printable(read("name") ?? "Error"));
   define("message", printable(read("message") ?? ""));
   define("stack", printable(read("stack") ?? ""));
   for (const key of Object.keys(error)) {
     const value = read(key);
-    if (typeof value === "number" || typeof value === "boolean") safe[key] = value;
+    if (typeof value === "number" || typeof value === "boolean") define(key, value, true);
   }
+  // SDK code/status can be getter-only and backed by private fields absent from this prototype-preserving clone.
+  // Own data properties bypass setters and keep both the first and subsequent sanitizations readable.
   const code = read("code");
-  if (code !== undefined) safe.code = typeof code === "number" ? code : printable(code);
+  if (code !== undefined) define("code", typeof code === "number" ? code : printable(code), true);
+  const status = read("status");
+  if (typeof status === "number") define("status", status, true);
   if ("cause" in error && read("cause") !== undefined) define("cause", depth < 4 ? redactNatsError(read("cause"), depth + 1) : undefined);
   const errors = read("errors");
   if (Array.isArray(errors)) define("errors", depth < 4 ? errors.map(inner => redactNatsError(inner, depth + 1)) : []);

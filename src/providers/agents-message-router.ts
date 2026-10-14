@@ -359,8 +359,8 @@ export class AgentMessageRouter {
   }
 
   /** Stop shares delivery's exact local proof; actors and selectors retain directory admission. */
-  withStopDirectory<T>(id: string, operation: () => Promise<T>): Promise<T> {
-    return this.isProcessOwnedTarget(id) ? operation() : this.#withDirectory(operation, id);
+  withStopDirectory<T>(id: string, operation: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+    return this.isProcessOwnedTarget(id) ? operation() : this.#withDirectory(operation, id, true, signal);
   }
 
   /** Normalize late stop-route reads just like message-route reads. */
@@ -774,7 +774,7 @@ export class AgentMessageRouter {
           ...(context?.signal ? { signal: context.signal } : {}),
         },
       );
-    });
+    }, context?.signal);
   }
 
   /**
@@ -794,6 +794,7 @@ export class AgentMessageRouter {
   async sendAfterDormantWake<T>(
     addressed: FabricParticipantInfo,
     send: (owner: FabricParticipantInfo) => Promise<T>,
+    signal?: AbortSignal,
   ): Promise<T> {
     try {
       return await send(addressed);
@@ -802,9 +803,10 @@ export class AgentMessageRouter {
       let current: FabricParticipantInfo | undefined;
       let fresh: string | undefined;
       try {
-        current = (await this.resolveActorMessageTarget(addressed.id)).participant;
+        current = (await this.resolveActorMessageTarget(addressed.id, signal)).participant;
         fresh = current ? controlOwnerIncarnation(current) : undefined;
-      } catch { throw error; }
+      } catch { signal?.throwIfAborted(); throw error; }
+      signal?.throwIfAborted();
       if (!current || fresh === undefined || fresh === controlOwnerIncarnation(addressed) ||
           current.id !== addressed.id || current.kind !== "actor" || current.rootId !== addressed.rootId ||
           current.ownerHostId !== addressed.ownerHostId || current.ownerIdentityId !== addressed.ownerIdentityId ||
@@ -962,8 +964,8 @@ export class AgentMessageRouter {
 
   /** A lease can still look fresh after SIGKILL. For this root's non-owned durable
    * actors, check the real owner before delivery, not just participant freshness. */
-  async resolveActorMessageTarget(id: string): Promise<ReturnType<AgentMessageRouter["resolveActorTarget"]>> {
-    return this.#withDirectory(() => this.#resolveActorMessageTarget(id), id);
+  async resolveActorMessageTarget(id: string, signal?: AbortSignal): Promise<ReturnType<AgentMessageRouter["resolveActorTarget"]>> {
+    return this.#withDirectory(() => this.#resolveActorMessageTarget(id), id, true, signal);
   }
 
   async #resolveActorMessageTarget(id: string, recoverLease = true): Promise<ReturnType<AgentMessageRouter["resolveActorTarget"]>> {
@@ -999,18 +1001,18 @@ export class AgentMessageRouter {
   }
 
   /** Status uses the same bounded lease recovery as followUp/steer. */
-  async resolveParticipantFresh(id: string): Promise<FabricParticipantInfo | undefined> {
+  async resolveParticipantFresh(id: string, signal?: AbortSignal): Promise<FabricParticipantInfo | undefined> {
     return this.#withDirectory(async () => {
       const known = this.#get(id);
       if (known || !this.participants.resolveRoutingLease) return known;
-      if (!await this.#resolveRoutingLease(id)) throw this.#unknownParticipant(id);
+      if (!await this.#resolveRoutingLease(id, signal)) throw this.#unknownParticipant(id);
       return this.#get(id);
-    }, id);
+    }, id, true, signal);
   }
 
   /** Async callers revalidate an overdue/uninitialized view before resolving ownership. */
-  async resolveActorTargetFresh(id: string): Promise<ReturnType<AgentMessageRouter["resolveActorTarget"]>> {
-    return this.#withDirectory(async () => this.resolveActorTarget(id), id);
+  async resolveActorTargetFresh(id: string, signal?: AbortSignal): Promise<ReturnType<AgentMessageRouter["resolveActorTarget"]>> {
+    return this.#withDirectory(async () => this.resolveActorTarget(id), id, true, signal);
   }
 
   resolveActorTarget(id: string, recoverLease = true): {

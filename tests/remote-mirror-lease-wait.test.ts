@@ -169,6 +169,80 @@ const observeLeaseWait = (root: string, controller: AbortController, abortDuring
 };
 const invocation = (signal: AbortSignal) => ({ signal } as FabricInvocationContext);
 
+// F-001 enters the real provider API, retaining the real directory/bridge/control ports.
+// Only process-local managers are inert: these operations address a foreign Main mirror.
+const invokingProvider = (w: Awaited<ReturnType<typeof world>>, mainMatch = false) => {
+  type Ports = ConstructorParameters<typeof AgentsProvider>;
+  const main = mainMatch
+    ? { id: w.target.identity.id, local: false, matches: (id: string) => id === w.target.identity.id }
+    : w.sending.mainAgent;
+  return new AgentsProvider(w.sending.manager as Ports[0], w.sending.actorManager as Ports[1], {} as Ports[2],
+    main as Ports[3], w.hubDirectory, w.sender, {} as Ports[6], () => false, undefined, false);
+};
+
+describe("F-001 provider invocation mirror wait", () => {
+  it.each([
+    ["status-main", "status", true, "bootstrap"],
+    ["status-main", "status", true, "lookup"],
+    ["status-generic", "status", false, "bootstrap"],
+    ["status-generic", "status", false, "lookup"],
+    ["actor-target-resident", "resetSession", false, "bootstrap"],
+    ["actor-message-target", "ask", false, "bootstrap"],
+    ["stop-wrapper", "stop", false, "bootstrap"],
+  ] as const)("F-001 cancellation %s at %s mainMatch=%s entry=%s releases resources before publication", async (branch, action, mainMatch, entry) => {
+    const w = await world();
+    if (entry === "lookup") await w.hubDirectory.refreshRoutingView();
+    const provider = invokingProvider(w, mainMatch);
+    const controller = new AbortController();
+    const resources = observeLeaseWait(w.hub.root, controller);
+    const pending = provider.invoke(action, { id: w.target.identity.id, thinking: "high", message: "never publish" }, invocation(controller.signal));
+    const state = settle(pending); // Attach rejection observation before abort, including on old source.
+    await resources.ready;
+    expect(resources.watchers.length).toBeGreaterThan(0);
+    expect(resources.timers).toHaveLength(1);
+    expect(state.done).toBeUndefined();
+    const reason = { cancelled: branch, entry };
+    controller.abort(reason);
+    resources.assertClean(); // Synchronous abort cleanup: fail red without waiting the 15 s deadline.
+    await expect(pending).rejects.toBe(reason);
+    expect(state.done?.error).toBe(reason);
+    expect(on(w.hub, "fabric.control.command")).toEqual([]);
+    expect(w.sendMessage).not.toHaveBeenCalled();
+  }, 20_000);
+
+  it.each([true, false])("F-001 non-cancelled status mainMatch=%s returns the same-owner renewed root", async mainMatch => {
+    const w = await world();
+    const controller = new AbortController();
+    const resources = observeLeaseWait(w.hub.root, controller);
+    const pending = invokingProvider(w, mainMatch).invoke("status", { id: w.target.identity.id }, invocation(controller.signal));
+    const state = settle(pending);
+    await resources.ready;
+    expect(state.done).toBeUndefined();
+    await w.bridge.syncPresence();
+    await expect(pending).resolves.toMatchObject({ id: w.target.identity.id, kind: "root",
+      ownerHostId: w.target.hostId, ownerIdentityId: w.target.identity.id, rootId: w.target.identity.id, remoteHost: "forge" });
+    resources.assertClean();
+    expect(controller.signal.aborted).toBe(false);
+    expect(on(w.hub, "fabric.control.command")).toEqual([]);
+    expect(w.sendMessage).not.toHaveBeenCalled();
+  }, 20_000);
+
+  it("F-001 actor mismatch still refuses a Main target after same-owner renewal", async () => {
+    const w = await world();
+    const controller = new AbortController();
+    const resources = observeLeaseWait(w.hub.root, controller);
+    const pending = invokingProvider(w).invoke("resetSession", { id: w.target.identity.id }, invocation(controller.signal));
+    const state = settle(pending);
+    await resources.ready;
+    expect(state.done).toBeUndefined();
+    await w.bridge.syncPresence();
+    await expect(pending).rejects.toThrow(`Fabric Main participant ${w.target.identity.id} is not an actor`);
+    resources.assertClean();
+    expect(on(w.hub, "fabric.control.command")).toEqual([]);
+    expect(w.sendMessage).not.toHaveBeenCalled();
+  }, 20_000);
+});
+
 describe("remote mirror lease wait (smarty-dev#11703)", () => {
   it.each([
     ["followUp", "bootstrap"], ["steer", "lookup"], ["followUp", "late-read"],

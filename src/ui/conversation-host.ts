@@ -12,9 +12,9 @@ type ConversationHost = Pick<typeof Pi,
 
 let host: ConversationHost | undefined;
 
-// The eager controller receives Pi's aliased/virtual host module. Initialize
-// this native-lazy module before loading any chat views, rather than resolving
-// a second Pi installation (and its proper-lockfile/signal-exit dependency tree).
+// The controller resolves the running CLI's own SDK (src/core/host-sdk.ts) and
+// initializes this native-lazy module before loading any chat views, rather
+// than resolving a second Pi installation (and its dependency tree).
 // Rebind on reopen so native module caching across /reload uses the current host.
 export function initializeConversationHost(value: ConversationHost): void {
   host = value;

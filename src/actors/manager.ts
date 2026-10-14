@@ -622,13 +622,14 @@ export class ActorPreparationTimeoutError extends ActorPreparationError {
   }
 }
 
-/** smarty-dev#6509: a preparation deadline or deferred mesh write blocks as transient,
- * never for good. The existing preparation-timeout block is the retryable category. */
-const preparationRetryable = (error: unknown): boolean => {
+/** Only known preparation deadlines/deferred mesh writes and registry vetoes may expire.
+ * Keep the typed veto distinct: it committed nothing, but is not a timeout. */
+const preparationFailureKind = (error: unknown): true | "timeout" | "registry-veto" => {
   for (let cause: unknown = error, depth = 0; cause instanceof Error && depth < 4; cause = cause.cause, depth++) {
-    if (cause instanceof ActorPreparationTimeoutError || cause instanceof AgentLaunchPreparationTimeoutError || Boolean(isMeshWriteDeferred(cause))) return true;
+    if (cause instanceof ActorRegistryUpdateVetoedError) return "registry-veto";
+    if (cause instanceof ActorPreparationTimeoutError || cause instanceof AgentLaunchPreparationTimeoutError || Boolean(isMeshWriteDeferred(cause))) return "timeout";
   }
-  return false;
+  return true;
 };
 
 export class ActorManager {
@@ -4393,7 +4394,7 @@ export class ActorManager {
                 Math.min(item.preparationAttempts, ACTOR_PREPARATION_BACKOFF.length) - 1]!;
               if (item.preparationAttempts > ACTOR_PREPARATION_MAX_RETRIES) {
                 this.#noteFailedActivation(actor, message, runId, false, ACTOR_FAILURE_NOTICE_AFTER,
-                  preparationRetryable(error) ? "timeout" : true);
+                  preparationFailureKind(error));
               }
             }
             retryDrain = true;
@@ -4413,7 +4414,8 @@ export class ActorManager {
           item.reject?.(new Error(message));
           this.#noteFailedActivation(actor, message, runId, abortController.signal.aborted || runStopped,
             retryPreparation && (item.preparationAttempts ?? 0) >= ACTOR_PREPARATION_MAX_RETRIES ? ACTOR_FAILURE_NOTICE_AFTER : 0,
-            false, error instanceof ActorContextOverflowError, undefined, item.overflowRetried === true);
+            preparationFailureKind(error) === "registry-veto" ? "registry-veto" : false,
+            error instanceof ActorContextOverflowError, undefined, item.overflowRetried === true);
           // A callerless event that failed here is not retried: it is dropped (smarty-dev#9332).
           if (!item.resolve && !item.reject && !abortController.signal.aborted && !runStopped) {
             this.#noteDroppedEvent(actor, item, message, runId);
@@ -4562,7 +4564,7 @@ export class ActorManager {
   // Counts consecutive failed activations and, once per streak, tells the owner's Main:
   // a blind supervisor is otherwise silent for as long as it stays broken.
   #noteFailedActivation(actor: ManagedActor, error: string, runId: string | undefined, interrupted: boolean, countFloor = 0,
-    preparation: boolean | "timeout" = false, contextOverflowCode = false, evidence?: readonly string[], overflowRetried = false): void {
+    preparation: boolean | "timeout" | "registry-veto" = false, contextOverflowCode = false, evidence?: readonly string[], overflowRetried = false): void {
     // An interrupt (ESC), a stop or a shutdown is not a failing actor, and a notice that
     // starts a turn must never cut through the stop-the-world halt.
     if (interrupted || this.#halted || this.#closing) return;
@@ -4584,7 +4586,7 @@ export class ActorManager {
     const classified = contextOverflowCode && !preparation
       ? { code: "context-overflow", transient: false, classification: "permanent: context window exceeded (typed CONTEXT_OVERFLOW run code)" }
       : classifyActivationFailure({ lastError, error, evidence,
-        preparation: preparation === true, preparationTimeout: preparation === "timeout" });
+        preparation: preparation === true, preparationTimeout: preparation === "timeout", registryVeto: preparation === "registry-veto" });
     // Error text that only quotes "Context exceeds window" stays blocked (never expires), but it is not an overflow.
     const { code, transient, classification } = classified.code === "context-overflow" && !contextOverflowCode
       ? { code: "unknown", transient: false,
@@ -6359,10 +6361,16 @@ export class ActorManager {
         const states = owned.map(actor => ({ actor, updatedAt: actor.updatedAt, status: actor.status,
           append: this.#unarchivedMessages.get(actor), count: this.#unarchivedMessages.get(actor)?.length }));
         return { actors, durable: removedIds.size > 0 || options?.durable === true || this.#registrySaveDurable,
-          validate: () => (options?.assertHeld?.(), !signal?.aborted) && revision === this.#registrySaveRevision && ownership.unchanged() &&
-            states.every(({ actor, updatedAt, status, append, count }) => this.#actors.get(actor.id) === actor &&
+          validate: () => {
+            options?.assertHeld?.();
+            if (signal?.aborted) return "cancelled";
+            if (revision !== this.#registrySaveRevision) return "revision";
+            if (!ownership.unchanged()) return "ownership";
+            return states.every(({ actor, updatedAt, status, append, count }) => this.#actors.get(actor.id) === actor &&
               actor.updatedAt === updatedAt && actor.status === status && !this.#ceded.has(actor.id) &&
-              !this.#finishCalls.has(actor.id) && append === this.#unarchivedMessages.get(actor) && append?.length === count),
+              !this.#finishCalls.has(actor.id) && append === this.#unarchivedMessages.get(actor) && append?.length === count)
+              ? true : "actor-state";
+          },
           value: { owned, revoked, actors, saved, revision,
             appends: new Map(owned.map(actor => [actor, [...(this.#unarchivedMessages.get(actor) ?? [])]])) } };
       });

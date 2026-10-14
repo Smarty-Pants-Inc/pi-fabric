@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { verifiedRemove } from "../storage/verified-remove.js";
+import { fabricStderr } from "../core/diagnostics.js";
 
 /**
  * Per-generation exit record (smarty-dev#7950): `<residencyRoot>/generations/<token>.exit.json`, where `<token>` is
@@ -82,7 +83,7 @@ export type GenerationExitOutcome = { outcome: "written" | "exists" | "unavailab
 const publish = (residencyRoot: string, record: ResidentGenerationExit, name: string,
   constants: Partial<typeof fs.constants>): GenerationExitOutcome => {
   const refuse = (outcome: "unavailable" | "invalid", reason: string): GenerationExitOutcome => {
-    try { process.stderr.write(`Fabric resident generation ${name} ${outcome} (${record.generation}): ${reason}\n`); }
+    try { fabricStderr(`Fabric resident generation ${name} ${outcome} (${record.generation}): ${reason}\n`); }
     catch { /* best effort */ }
     return { outcome, reason };
   };

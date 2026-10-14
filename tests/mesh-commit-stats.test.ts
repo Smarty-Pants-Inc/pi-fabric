@@ -31,9 +31,9 @@ describe("PI_FABRIC_COMMIT_STATS", () => {
     const { root, file } = setup();
     vi.useFakeTimers();
     const baselineExitListeners = process.listenerCount("exit");
-    // Each generation is a full installed tree: mesh/commit-stats.ts imports ../storage/verified-remove.js.
+    // Each generation is a full installed tree: commit-stats imports verified-remove, which imports core/agent-dir.
     const copies = ["release-a", "release-b"].map(release => {
-      for (const module of ["mesh/commit-stats.ts", "storage/verified-remove.ts"]) {
+      for (const module of ["mesh/commit-stats.ts", "storage/verified-remove.ts", "core/agent-dir.ts"]) {
         fs.mkdirSync(path.dirname(path.join(root, release, module)), { recursive: true });
         fs.copyFileSync(fileURLToPath(new URL(`../src/${module}`, import.meta.url)), path.join(root, release, module));
       }

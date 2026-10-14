@@ -7,6 +7,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { configureFabricDiagnostics, fabricDiagnosticsHaveTerminalUI, fabricWarn, fabricError, fabricInfo, fabricDebug, fabricStderr } from "../src/core/diagnostics.js";
 import { MeshBackgroundRetry, MeshLockTimeoutError } from "../src/core/atomic-write.js";
+import { recordResidentGenerationExit } from "../src/residency/generation-exit.js";
 
 const scratch: string[] = [];
 afterEach(() => {
@@ -39,6 +40,30 @@ const timeout = () => new MeshLockTimeoutError(" held by pid 123 (alive, running
 // Decision C: the real offline Pi TUI/held-lock proof is scripts/probe-main-diagnostics.py.
 // These small tests additionally prove the no-UI counterexample, failure and rotation branches.
 describe("Fabric diagnostics protect Pi's editor", () => {
+  it("routes a generation refusal through diagnostics without changing headless stderr bytes", () => {
+    const { root, log } = profile();
+    const { stderr, stdout } = streams();
+    const residencyRoot = path.join(root, "generation-refusal-not-created");
+    const generation = "invalid-token";
+    const refusal = `Fabric resident generation ${generation}.exit.json unavailable (${generation}): invalid generation token\n`;
+    configureFabricDiagnostics({ hasUI: true, mode: "tui", ui: { notify: vi.fn() } });
+    expect(recordResidentGenerationExit(residencyRoot, {
+      format: 1, generation, writer: "host", reason: "test", pid: process.pid, at: Date.now(),
+    })).toEqual({ outcome: "unavailable", reason: "invalid generation token" });
+    expect(stderr).not.toHaveBeenCalled();
+    expect(stdout).not.toHaveBeenCalled();
+    expect(fs.existsSync(residencyRoot)).toBe(false);
+    expect(fs.readFileSync(log, "utf8")).toContain(refusal.replaceAll("\n", "\\n"));
+
+    configureFabricDiagnostics();
+    expect(recordResidentGenerationExit(residencyRoot, {
+      format: 1, generation, writer: "host", reason: "test", pid: process.pid, at: Date.now(),
+    })).toEqual({ outcome: "unavailable", reason: "invalid generation token" });
+    expect(stderr.mock.calls).toEqual([[refusal]]);
+    expect(stdout).not.toHaveBeenCalled();
+    expect(fs.existsSync(residencyRoot)).toBe(false);
+  });
+
   it("a UI-active mesh lock timeout writes nothing to either terminal stream and logs the unchanged warning", () => {
     const { log } = profile();
     const notify = vi.fn();

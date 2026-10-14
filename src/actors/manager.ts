@@ -5427,7 +5427,8 @@ export class ActorManager {
 
   /**
    * smarty-dev#9332: actor states that cannot act raise the same owner alarm as a blocked activation
-   * (fabric.alarm.actor-activation, ownerRoot routing), evaluated on the existing retention sweep, no new timer:
+   * (fabric.alarm.actor-activation records ownerRoot; onDeliver reaches the owner's Main),
+   * evaluated on the existing retention sweep, no new timer:
    * - actor-stopped: a durable or supervisor actor stopped for over 10 min and not removed;
    * - actor-run-stuck: an in-flight run older than max(30 min, 2x the actor's p95 run time) whose run directory is
    *   missing or whose worker is gone;
@@ -5577,12 +5578,34 @@ export class ActorManager {
       // is idempotent per (kind, actor, episode, slot) through the mesh's durable dedupe receipt (smarty-dev#8903):
       // a crash after it and before the claim is marked published lets a later sweep take the claim over, and its
       // publish returns the first event instead of appending a second alarm.
+      const attemptId = randomUUID();
+      const dedupeKey = actorAlarmDedupeKey(kind, actor.id, since, slot);
+      let event: MeshEvent;
       try {
-        await this.mesh.publish({ topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, kind, from: this.identity, data,
-          dedupeKey: actorAlarmDedupeKey(kind, actor.id, since, slot) });
+        event = await this.mesh.publish({ id: attemptId, topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, kind, from: this.identity, data,
+          dedupeKey });
       } catch {
         await release();
         return;
+      }
+      // At-most-once Main delivery: receipt replay returns the original id, never this attempt's id.
+      // ponytail: a crash after publish but before onDeliver loses this slot's notice; the next slot re-alarms.
+      if (event.id === attemptId) {
+        // Restored episodes can carry legacy reason text: only fixed codes may enter Main.
+        const reason = typeof data.reason === "string" && [
+          "unknown", "context-overflow", "auth", "permission", "security-policy", "quota", "invalid-request",
+          "provider-transient", "activation-window-lost", "child-exit-before-admission", "preparation-timeout", "failing-preparation",
+          "relaunch", "stop", "error", "worker-unverified", "run-dir-missing", "worker-gone", "worker-pid-reused",
+        ].includes(data.reason) ? data.reason : "unknown";
+        const notice: FabricActorMessage = {
+          id: dedupeKey, actorId: actor.id, actorName: actor.name, direction: "out",
+          source: "fabric-host", createdAt: now, action: "message",
+          // Only the alarm kind and fixed reason code, never raw errors or classification text.
+          text: `Fabric host notice: ${kind}; reason: ${reason}. Inspect it with agents.actorStatus and agents.log.`,
+        };
+        try {
+          this.onDeliver({ actor: this.#publicInfo(actor), message: notice, delivery: "followUp", triggerTurn: true });
+        } catch { /* Best effort: the mesh alarm remains, and the slot is still marked published below. */ }
       }
       await this.mesh.put({ key, identity: this.identity, value: { ...claimed, state: "published" }, ifVersion: claim.version })
         .catch(() => undefined);

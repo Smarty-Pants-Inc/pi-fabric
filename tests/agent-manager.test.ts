@@ -128,12 +128,22 @@ const expectUnconfirmedClose = async (manager: AgentManager) => {
   managers.splice(managers.indexOf(manager), 1);
 };
 describe("Agent prompt retention (#11663)", () => {
-  it("keeps a failed prompt and metadata across manager close while successful trees are removed", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-prompt-retention-")); roots.push(root);
+  const managedFixture = (prefix: string) => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), prefix)); roots.push(tempRoot);
+    // Retention belongs to managed OS-temp roots, not explicit caller roots.
+    vi.spyOn(os, "tmpdir").mockReturnValue(tempRoot);
+    vi.stubEnv("PI_FABRIC_TMPDIR", undefined);
+    vi.stubEnv("PI_FABRIC_RUN_ROOT", undefined);
     const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, retainRuns: false }, {
-      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root,
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
     });
     managers.push(manager);
+    return manager;
+  };
+  afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); });
+
+  it("keeps a failed prompt and metadata across manager close while successful trees are removed", async () => {
+    const manager = managedFixture("pi-fabric-prompt-retention-");
     const prompt = "FAIL_DIRECTIVE\nprivate brief with exact bytes: π\n";
     const failedHandle = await manager.spawn({ task: prompt, transport: "process" });
     expect(failedHandle).toMatchObject({
@@ -162,28 +172,28 @@ describe("Agent prompt retention (#11663)", () => {
       expect(fs.statSync(promptPath).mode & 0o777).toBe(0o600);
       expect(fs.statSync(path.dirname(promptPath)).mode & 0o777).toBe(0o700);
     }
-    const successfulDirectory = path.join(root, successfulHandle.id);
+    const successfulDirectory = manager.runDirectory(successfulHandle.id)!;
     await manager.close();
     expect(fs.existsSync(successfulDirectory)).toBe(false);
     expect(fs.existsSync(promptPath)).toBe(true);
     expect(fs.readdirSync(path.dirname(promptPath)).sort()).toEqual(["status.json", "task.txt"]);
     const persisted = JSON.parse(fs.readFileSync(path.join(path.dirname(promptPath), "status.json"), "utf8")) as AgentRunRecord;
     expect(persisted).toMatchObject({
+      status: "failed",
       promptSha256: failedStatus.promptSha256,
       promptBytes: failedStatus.promptBytes,
       promptPath,
+      inputSha256: createHash("sha256").update(fs.readFileSync(promptPath)).digest("hex"),
+      inputBytes: fs.readFileSync(promptPath).byteLength,
     });
+    expect(persisted).not.toHaveProperty("task");
     const afterClose = manager.status(failedHandle.id) as AgentRunRecord;
     expect(afterClose.promptSha256).toBe(failedStatus.promptSha256);
     expect(createHash("sha256").update(fs.readFileSync(afterClose.promptPath!)).digest("hex")).toBe(afterClose.inputSha256);
   });
 
   it("retains a failed continuation under its current digest while preserving the original metadata", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-prompt-continuation-")); roots.push(root);
-    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, retainRuns: false }, {
-      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root,
-    });
-    managers.push(manager);
+    const manager = managedFixture("pi-fabric-prompt-continuation-");
     const original = "RESUME_FAIL_AFTER_STOP\noriginal brief π\n";
     const handle = await manager.spawn({ task: original, transport: "process" });
     const result = await manager.wait(handle.id);
@@ -201,15 +211,16 @@ describe("Agent prompt retention (#11663)", () => {
     expect(persisted.promptSha256).toBe(beforeClose.promptSha256);
     expect(persisted.promptBytes).toBe(beforeClose.promptBytes);
     expect(persisted.inputSha256).toBe(beforeClose.inputSha256);
+    expect(persisted.inputBytes).toBe(beforeClose.inputBytes);
+    expect(persisted.promptPath).toBe(taskPath);
+    expect(persisted.status).toBe("failed");
+    expect(persisted).not.toHaveProperty("task");
+    expect(fs.readFileSync(taskPath)).toEqual(currentBytes);
     expect(persisted.promptRetentionDropped).toBeUndefined();
   });
 
   it("drops a tampered task file but retains a mismatch status record", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-prompt-tamper-")); roots.push(root);
-    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, retainRuns: false }, {
-      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root,
-    });
-    managers.push(manager);
+    const manager = managedFixture("pi-fabric-prompt-tamper-");
     const handle = await manager.spawn({ task: "FAIL_DIRECTIVE\noriginal bytes\n", transport: "process" });
     await manager.wait(handle.id);
     const taskPath = (manager.status(handle.id) as AgentRunRecord).promptPath!;
@@ -220,6 +231,8 @@ describe("Agent prompt retention (#11663)", () => {
     expect(persisted.promptRetentionDropped).toBe(true);
     expect(persisted.promptRetentionMismatch).toBe(true);
     expect(persisted.inputSha256).toBeDefined();
+    expect(persisted.status).toBe("failed");
+    expect(persisted).not.toHaveProperty("task");
   });
 
   it("marks a managed root closed for the configured one-shot sweep age", async () => {

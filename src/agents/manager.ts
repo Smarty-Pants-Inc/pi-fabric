@@ -208,8 +208,8 @@ const MAX_RETAINED_RUN_HANDLES = 1_000;
 const MAX_LOG_SUMMARY_CHARS = 7_000;
 const MAX_LOG_DETAIL_CHARS = 900;
 const RETENTION_SWEEP_INTERVAL_MS = 15 * 60 * 1_000;
-/** Failed prompts are retained with their status record only up to the existing UI text bound. */
-const FAILED_PROMPT_RETENTION_MAX_BYTES = MAX_UI_TEXT_CHARS;
+/** Unsuccessful managed prompts are retained only up to the existing UI bound, in bytes. */
+const TERMINAL_PROMPT_RETENTION_MAX_BYTES = MAX_UI_TEXT_CHARS;
 
 type AgentPromptMetadata = {
   promptSha256: string;
@@ -671,12 +671,20 @@ const safeName = (value: string): string =>
     .trim()
     .slice(0, MAX_NAME_LENGTH) || "Fabric agent";
 
+// Retained disk records omit task fields; public/UI readers still receive strings.
+// Never reconstruct a prompt from provenance or another retained field.
+const normalizeRecordTasks = (record: AgentRunRecord): AgentRunRecord => ({
+  ...record,
+  task: record.task ?? "",
+  ...(record.nestedAgents ? { nestedAgents: record.nestedAgents.map(normalizeRecordTasks) } : {}),
+});
+
 const readRecord = (filePath: string): AgentRunRecord | undefined => {
   try {
     const parsed: unknown = JSON.parse(readFileRetrying(filePath));
     if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return undefined;
     const record = parsed as AgentRunRecord;
-    return { ...record, runner: isFabricRunnerId(record.runner) ? record.runner : "pi" };
+    return { ...normalizeRecordTasks(record), runner: isFabricRunnerId(record.runner) ? record.runner : "pi" };
   } catch {
     return undefined;
   }
@@ -719,6 +727,17 @@ const compactUiRecord = (record: AgentRunRecord): AgentRunRecord => {
       ? { nestedAgents: nestedAgents.map((nested) => compactUiRecord(nested)) }
       : {}),
   };
+};
+
+type RetainedPromptRecord = Omit<AgentRunRecord, "task" | "nestedAgents"> & {
+  nestedAgents?: RetainedPromptRecord[];
+};
+
+// Disk-only task omission, including copied nested snapshots. Live names,
+// diagnostic output and UI compaction keep their existing policy (#11712).
+const omitRetainedTasks = (record: AgentRunRecord): RetainedPromptRecord => {
+  const { task: _task, nestedAgents, ...rest } = record;
+  return { ...rest, ...(nestedAgents ? { nestedAgents: nestedAgents.map(omitRetainedTasks) } : {}) };
 };
 
 // A terminal owner no longer hosts its session children. Preserve genuine final
@@ -3841,13 +3860,10 @@ export class AgentManager {
     if (!this.config.retainRuns && !this.#parentOwnedRunRoot) {
       await Promise.all(all.filter(managed => this.#canCollect(managed))
         .map(async (managed) => {
-          // Only failed prompts remain beside their terminal status for the
-          // normal 24 h sweep; successful, stopped and timed-out runs keep
-          // today's whole-tree deletion behavior. Oversized prompts are dropped and marked in the
-          // terminal result by #withTransportMetadata.
-          // A failed prompt retention error is a custody failure: keep the whole
-          // tree rather than falling back to destructive cleanup.
-          if (await this.#retainFailedPromptRecord(managed).catch(() => true)) return;
+          // Only sweep-owned managed roots retain unsuccessful terminal prompts.
+          // Explicit roots (including judge runs) and completed runs keep whole-tree
+          // deletion. Retention errors preserve custody rather than authorize deletion.
+          if (await this.#retainTerminalPromptRecord(managed).catch(() => true)) return;
           await removeTree(managed.runDirectory).catch(() => undefined);
         }));
     }
@@ -3857,7 +3873,7 @@ export class AgentManager {
       const storageSafe = !this.#managedTempRoot || canRemoveManagedRunRoot(this.#runRoot);
       if (!this.config.retainRuns) {
         if (storageSafe && !this.#parentOwnedRunRoot) {
-          // The closed marker hands retained failed records to the normal one-shot
+          // The closed marker hands retained terminal records to the normal one-shot
           // sweep. Without it, a live manager owner makes the root invisible to
           // the 24 h retention pass after close.
           if (this.#managedTempRoot) {
@@ -4997,16 +5013,17 @@ export class AgentManager {
     }
   }
 
-  async #retainFailedPromptRecord(managed: ManagedAgent): Promise<boolean> {
+  async #retainTerminalPromptRecord(managed: ManagedAgent): Promise<boolean> {
+    if (!this.#managedTempRoot) return false;
     const record = readRecord(managed.statusFile) ?? managed.latestRecord;
-    if (!record || record.status !== "failed") return false;
+    if (!record || (record.status !== "failed" && record.status !== "stopped" && record.status !== "timed_out")) return false;
     const promptFile = path.join(managed.runDirectory, "task.txt");
     const stat = ownedStat(promptFile);
     const expectedSha256 = managed.inputSha256 ?? record.inputSha256;
     const expectedBytes = managed.inputBytes ?? record.inputBytes;
-    const oversized = expectedBytes !== undefined && expectedBytes > FAILED_PROMPT_RETENTION_MAX_BYTES;
+    const oversized = expectedBytes !== undefined && expectedBytes > TERMINAL_PROMPT_RETENTION_MAX_BYTES;
     const currentMatches = !oversized && stat?.isFile() === true && expectedSha256 !== undefined && expectedBytes !== undefined &&
-      stat.size <= FAILED_PROMPT_RETENTION_MAX_BYTES && promptFileMatches(promptFile, expectedSha256, expectedBytes);
+      stat.size <= TERMINAL_PROMPT_RETENTION_MAX_BYTES && promptFileMatches(promptFile, expectedSha256, expectedBytes);
     if (!currentMatches) {
       managed.promptRetentionDropped = true;
       // A small file that fails its current-input digest is not safe to retain.
@@ -5016,12 +5033,12 @@ export class AgentManager {
     // Persist the manager's authoritative metadata before removing every other
     // artifact. A verified current task.txt and status.json are the complete
     // retained proof; a mismatch retains status.json only.
-    writeRecord(managed.statusFile, compactUiRecord(this.#withTransportMetadata(record, managed, false)));
+    writeJsonAtomic(managed.statusFile, omitRetainedTasks(compactUiRecord(this.#withTransportMetadata(record, managed, false))), { space: 2 });
     for (const entry of fs.readdirSync(managed.runDirectory)) {
       if (entry === "status.json" || (entry === "task.txt" && currentMatches)) continue;
       await removeTree(path.join(managed.runDirectory, entry));
     }
-    // Once a failure has a retained status, never fall back to deleting its
+    // Once an unsuccessful run has a retained status, never fall back to deleting its
     // whole tree. Any cleanup error propagates to the close custody fence.
     return true;
   }

@@ -169,8 +169,6 @@ const assertPairCopy = (source: string, destination: string) => {
 const copyRun = (source: string, destination: string) => {
   fs.mkdirSync(path.dirname(destination), { recursive: true, mode: 0o700 });
   fs.cpSync(source, destination, { recursive: true });
-  const controls = taskControlDirectory(source);
-  if (fs.existsSync(controls)) fs.cpSync(controls, taskControlDirectory(destination), { recursive: true });
   // cpSync creates directories using the host umask, not the source's private mode.
   const makePrivate = (directory: string): void => {
     fs.chmodSync(directory, 0o700);
@@ -179,8 +177,12 @@ const copyRun = (source: string, destination: string) => {
     }
   };
   makePrivate(destination);
-  if (fs.existsSync(controls)) makePrivate(taskControlDirectory(destination));
   const check = (from: string, to: string): void => {
+    const controls = taskControlDirectory(from);
+    if (fs.existsSync(controls)) {
+      fs.cpSync(controls, taskControlDirectory(to), { recursive: true });
+      makePrivate(taskControlDirectory(to));
+    }
     assertPairCopy(from, to);
     const nested = path.join(from, "nested");
     if (!fs.existsSync(nested)) return;

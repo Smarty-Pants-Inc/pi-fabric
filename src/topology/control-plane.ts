@@ -32,6 +32,11 @@ const WATCH_REARM_BASE_MS = 1_000;
 const WATCH_REARM_MAX_MS = 60_000;
 const WATCH_REARM_ATTEMPTS = 6;
 const DEFAULT_ACK_TIMEOUT_MS = 5_000;
+// Source-local recovery only after an authenticated relay refusal. The UDS relay's
+// fixed 4 s receipt window permits at most this 8 s observation window; no idle timer.
+// Keep this constant local: importing the optional UDS runtime would widen startup.
+const RELAY_ACK_RECOVERY_TTL_MS = 8_000;
+const RELAY_ACK_RECOVERY_LIMIT = 256;
 const UNFENCED_SENDER_WARNING_MS = 60 * 60 * 1_000;
 // A cancellation owns a separate retry deadline, longer than a production mesh lock wait.
 const CANCELLATION_RETENTION_MS = 60_000;
@@ -39,6 +44,17 @@ const CONTROL_COMMAND_EXPIRED = "Fabric control command expired";
 /** A timed-out message the sender withdrew before its owner claimed it: definitely not delivered. */
 export const CONTROL_NOT_DELIVERED = "FABRIC_CONTROL_NOT_DELIVERED";
 export const CONTROL_STALE_INCARNATION = "FABRIC_CONTROL_STALE_INCARNATION";
+/** Infrastructure refusal, not an owner's ACK or proof that the command did not run. */
+export const RELAY_DESTINATION_UNAVAILABLE = "FABRIC_RELAY_DESTINATION_UNAVAILABLE";
+export class FabricRelayDestinationUnavailableError extends Error {
+  override readonly name = "FabricRelayDestinationUnavailableError";
+  readonly code = RELAY_DESTINATION_UNAVAILABLE;
+  readonly retryable = true;
+  constructor(readonly targetId: string, readonly idempotencyKey: string) {
+    super(`Relay destination unavailable for ${targetId}; the outcome is unknown; ` +
+      `retry once only with the same idempotencyKey (${idempotencyKey}) and unchanged input.`);
+  }
+}
 export const STALE_INCARNATION_ERROR =
   "Fabric control command targets a previous or unverifiable owner incarnation; re-resolve the participant and retry only if still wanted.";
 export class FabricControlStaleIncarnationError extends Error {
@@ -415,14 +431,47 @@ interface PendingControlRequest {
   commandPublished: boolean;
   readonly requestCreatedAt: number;
   readOwnerExpiry?: () => number;
-  idempotencyKey?: string;
+  readonly idempotencyKey: string;
   readonly destinationRemoteHost?: string | null;
+  /** Original source event, fixed before publication can yield. */
+  readonly commandEventId: string;
+  /** Validated relay link at admission; never re-resolved from mutable directory state. */
+  readonly relayHub?: string;
   cancellationRequested?: boolean;
   cancellationPublished?: boolean;
   mirroredOwner?: { remoteHost: string; expiresAt: number };
   signal?: AbortSignal;
   onAbort?: () => void;
 }
+
+/** Only captured authority survives a typed refusal: no callbacks, input, lease reads or timers. */
+type ControlAcknowledgementAuthority = Readonly<Pick<PendingControlRequest,
+  "ownerHostId" | "ownerIdentityId" | "ownerIncarnation" | "targetId" | "destinationRemoteHost">> & {
+  readonly mirroredOwner?: Readonly<{ remoteHost: string }>;
+};
+interface OwnerAcknowledgement {
+  readonly from: Readonly<Pick<MeshIdentity, "id">>;
+  readonly data: unknown;
+}
+interface RetainedRelayAcknowledgement {
+  readonly commandId: string;
+  readonly idempotencyKey: string;
+  readonly expiresAt: number;
+  readonly authority: ControlAcknowledgementAuthority;
+  readonly acknowledgement?: OwnerAcknowledgement;
+}
+
+/** Never invoke a getter while capturing a late ACK; wire records must be plain own data. */
+const ownDataRecord = (value: unknown): Record<string, unknown> | undefined => {
+  if (!isObject(value)) return undefined;
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) return undefined;
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  if (Object.values(descriptors).some(descriptor => !Object.hasOwn(descriptor, "value"))) return undefined;
+  return Object.fromEntries(Object.entries(descriptors).map(([key, descriptor]) => [key, descriptor.value]));
+};
+const relayAcknowledgementKey = (commandId: string, idempotencyKey: string): string =>
+  JSON.stringify([commandId, idempotencyKey]);
 
 interface OwnedControlCommand {
   event: MeshEvent;
@@ -435,6 +484,61 @@ interface OwnedControlCommand {
 export class FabricControlPlane {
   readonly incarnation: string;
   readonly #pending = new Map<string, PendingControlRequest>();
+  // Insertion order is LRU, shared by the authority-only and validated-ACK entries.
+  readonly #relayAcknowledgements = new Map<string, RetainedRelayAcknowledgement>();
+
+  #pruneRelayAcknowledgements(): void {
+    const now = Date.now();
+    for (const [key, entry] of this.#relayAcknowledgements) {
+      if (entry.expiresAt <= now) this.#relayAcknowledgements.delete(key);
+    }
+  }
+
+  /** Body/identity-free diagnostics; access and event receipt reclaim expired recovery state. */
+  relayAcknowledgementRecoverySnapshot(): { retained: number; acknowledged: number; limit: number; ttlMs: number } {
+    this.#pruneRelayAcknowledgements();
+    return { retained: this.#relayAcknowledgements.size,
+      acknowledged: [...this.#relayAcknowledgements.values()].filter(entry => entry.acknowledgement !== undefined).length,
+      limit: RELAY_ACK_RECOVERY_LIMIT, ttlMs: RELAY_ACK_RECOVERY_TTL_MS };
+  }
+
+  #retainRelayAuthority(commandId: string, pending: PendingControlRequest): void {
+    this.#pruneRelayAcknowledgements();
+    if (this.#closed || !pending.mirroredOwner || typeof pending.destinationRemoteHost !== "string" ||
+        pending.relayHub === undefined || (pending.operation !== "steer" && pending.operation !== "followUp")) return;
+    const key = relayAcknowledgementKey(commandId, pending.idempotencyKey);
+    const authority: ControlAcknowledgementAuthority = Object.freeze({
+      ownerHostId: pending.ownerHostId, ownerIdentityId: pending.ownerIdentityId,
+      ownerIncarnation: pending.ownerIncarnation, targetId: pending.targetId,
+      destinationRemoteHost: pending.destinationRemoteHost,
+      mirroredOwner: Object.freeze({ remoteHost: pending.mirroredOwner.remoteHost }),
+    });
+    // Another refusal cannot renew an existing recovery window or overwrite its original authority.
+    const entry = this.#relayAcknowledgements.get(key) ?? Object.freeze({ commandId,
+      idempotencyKey: pending.idempotencyKey, expiresAt: Date.now() + RELAY_ACK_RECOVERY_TTL_MS, authority });
+    this.#relayAcknowledgements.delete(key);
+    this.#relayAcknowledgements.set(key, entry);
+    while (this.#relayAcknowledgements.size > RELAY_ACK_RECOVERY_LIMIT) {
+      this.#relayAcknowledgements.delete(this.#relayAcknowledgements.keys().next().value!);
+    }
+  }
+
+  #cachedRelayAcknowledgement(commandId: string, pending: PendingControlRequest): OwnerAcknowledgement | undefined {
+    this.#pruneRelayAcknowledgements();
+    const key = relayAcknowledgementKey(commandId, pending.idempotencyKey);
+    const entry = this.#relayAcknowledgements.get(key);
+    if (!entry?.acknowledgement) return undefined;
+    const data = this.#authenticatedAcknowledgement(entry.acknowledgement, pending);
+    // A retry must still be on the captured remote link/epoch, not a now-native or new owner.
+    if (!pending.mirroredOwner || typeof pending.destinationRemoteHost !== "string" ||
+        !data || (pending.ownerIncarnation !== undefined && data.ownerIncarnation !== pending.ownerIncarnation)) {
+      this.#relayAcknowledgements.delete(key);
+      return undefined;
+    }
+    this.#relayAcknowledgements.delete(key);
+    this.#relayAcknowledgements.set(key, entry); // access promotes LRU, never extends TTL
+    return entry.acknowledgement;
+  }
   readonly #activeCommands = new Map<
     string,
     { controller: AbortController; requesterId: string; targetId: string }
@@ -705,6 +809,21 @@ export class FabricControlPlane {
       destination.remoteHost = mirroredOwner?.remoteHost ?? (this.options.readMirroredOwner ? null : undefined);
     }
     const destinationRemoteHost = destination.remoteHost;
+    // Only directory-validated remote ownership can authorize an infrastructure refusal.
+    // Read the canonical host row freshly; never infer a hub from caller data or ACK data.
+    let relayHub: string | undefined;
+    if (mirroredOwner && destinationRemoteHost === mirroredOwner.remoteHost) {
+      const entry = this.mesh.get(HOST_PREFIX + createHash("sha256").update(ownerHostId).digest("hex"), { fresh: true });
+      const host = entry?.value;
+      if (isObject(host) && host.format === 1 && host.id === ownerHostId && host.rootId === targetId &&
+          isObject(host.identity) && host.identity.id === ownerIdentityId && entry?.updatedBy.id === ownerIdentityId &&
+          host.remoteHost === mirroredOwner.remoteHost && typeof host.bridgeVia === "string" &&
+          /^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$/.test(host.bridgeVia) && host.bridgeVia !== host.remoteHost) {
+        relayHub = host.bridgeVia;
+      }
+    }
+    // A refusal's stamp must name this exact publication, not merely the logical retry key.
+    const commandEventId = randomUUID();
     if (ownerIncarnation === undefined && notRunAttempt === 0) {
       // Once per logical legacy delivery, not once per proven-notRun resend.
       warnUnfencedControlDelivery(operation, targetId, ++this.#legacyDeliveryCount);
@@ -731,6 +850,7 @@ export class FabricControlPlane {
     const timeoutMs = Math.max(this.#pollMs * 4, originalTimeoutMs - retryBudgetSpentMs);
     const ackGraceMs = Math.min(MAX_CONTROL_ACK_GRACE_MS, 2 * timeoutMs);
     let pendingRequest: PendingControlRequest;
+    let recoveredAcknowledgement = false;
     let publishedEvent: MeshEvent | undefined;
     let finalOutcome: { outcome: "failed" | "unknown"; reason: string } | undefined;
     const recordFinal = (): void => {
@@ -750,12 +870,23 @@ export class FabricControlPlane {
         targetId,
         commandPublished: false,
         requestCreatedAt,
-        ...(readOwnerExpiry && messageRequest ? { readOwnerExpiry, idempotencyKey } : {}),
+        idempotencyKey,
+        commandEventId,
+        ...(relayHub !== undefined ? { relayHub } : {}),
+        ...(readOwnerExpiry && messageRequest ? { readOwnerExpiry } : {}),
         ...(destinationRemoteHost !== undefined ? { destinationRemoteHost } : {}),
         ...(mirroredOwner ? { mirroredOwner: { ...mirroredOwner } } : {}),
       };
       pendingRequest = pending;
       this.#pending.set(commandId, pending);
+      // Revalidate against this NEW admission's owner/epoch/link before publishing anything.
+      // Use the ordinary settlement path, including its single clear/timer/abort cleanup.
+      const cached = this.#cachedRelayAcknowledgement(commandId, pending);
+      if (cached) {
+        recoveredAcknowledgement = true;
+        this.#settleAcknowledgement(commandId, pending, cached.data as Record<string, unknown>);
+        return;
+      }
       if (pending.mirroredOwner) {
         // Capture validated authority first, then arm before publish can wait on the mesh lock.
         // Renewal or a failed directory read cannot extend this sender-local message budget.
@@ -790,7 +921,8 @@ export class FabricControlPlane {
     try {
       // Settlement must not wait for the original publish or a best-effort cancellation.
       // The publish still completes once, and then cancels if settlement won while in flight.
-      const publishing = this.mesh.publish({
+      const publishing = recoveredAcknowledgement ? Promise.resolve() : this.mesh.publish({
+        id: commandEventId,
         topic: CONTROL_TOPIC,
         kind: operation,
         from: this.identity,
@@ -1100,6 +1232,7 @@ export class FabricControlPlane {
     for (const active of this.#activeCommands.values()) active.controller.abort();
     await Promise.allSettled([...this.#activeHandlers]);
     this.#handler = undefined;
+    this.#relayAcknowledgements.clear();
   }
 
   /** True only when a drain read the log to its end; a gated or paused drain retains its work. */
@@ -1272,6 +1405,7 @@ export class FabricControlPlane {
 
   async #drain(): Promise<boolean> {
     const now = Date.now();
+    this.#pruneRelayAcknowledgements();
     for (const [key, expiresAt] of this.#sharedClaims) if (expiresAt < now) this.#sharedClaims.delete(key);
     // Detached asks may already be behind the log cursor. Resume their owned
     // claims/outcomes too, without replaying a handler that completed.
@@ -1287,8 +1421,13 @@ export class FabricControlPlane {
         // and the next poll reads this page again from it (smarty-dev#424). Each retry is
         // bounded by the command's deadline plus the acknowledgement grace.
         if (event.to === this.options.hostId) {
-          if (event.topic === ACK_TOPIC) this.#acceptAcknowledgement(event);
-          else if (event.topic === CONTROL_TOPIC) await this.#acceptCommand(event);
+          if (event.topic === ACK_TOPIC) {
+            // A hub speaks only for relay infrastructure, never for the destination owner.
+            const envelope = ownDataRecord(event);
+            const data = envelope && ownDataRecord(envelope.data);
+            if (data?.errorCode === RELAY_DESTINATION_UNAVAILABLE) this.#acceptRelayRefusal(event);
+            else if (data) this.#acceptAcknowledgement(event);
+          } else if (event.topic === CONTROL_TOPIC) await this.#acceptCommand(event);
         }
         if (this.options.canConsumeMesh?.() === false) return false;
         this.#lastSequence = event.sequence;
@@ -1301,11 +1440,74 @@ export class FabricControlPlane {
     return true;
   }
 
+  #acceptRelayRefusal(event: MeshEvent): void {
+    const data = event.data;
+    if (!ownDataRecord(event) || !ownDataRecord(event.from) || !ownDataRecord(data) ||
+        !isObject(data) || typeof data.commandId !== "string" || !ownDataRecord(data.bridge)) return;
+    const pending = this.#pending.get(data.commandId);
+    if (!pending || pending.relayHub === undefined || !pending.mirroredOwner ||
+        Object.hasOwn(event, "text") || Object.hasOwn(event, "message") ||
+        Object.keys(data).some((field) => !["version", "commandId", "targetId", "accepted", "error", "errorCode", "retryable", "bridge"].includes(field)) ||
+        pending.destinationRemoteHost !== pending.mirroredOwner.remoteHost ||
+        event.to !== this.options.hostId || event.verification !== "bridge" ||
+        event.from.id !== `bridge:${pending.relayHub}` || event.from.name !== "mesh-bridge" || event.from.kind !== "main" ||
+        data.version !== 1 || data.targetId !== pending.targetId || data.accepted !== false ||
+        data.error !== "Relay destination unavailable" || data.errorCode !== RELAY_DESTINATION_UNAVAILABLE ||
+        data.retryable !== true || !isObject(data.bridge) ||
+        Object.keys(data.bridge).some((field) => field !== "from" && field !== "id") ||
+        data.bridge.from !== pending.relayHub || data.bridge.id !== pending.commandEventId ||
+        // Infrastructure cannot attest an owner epoch or a definite non-delivery outcome.
+        ["ownerIncarnation", "notRun", "notDelivered"].some((field) => Object.hasOwn(data, field))) return;
+    this.#retainRelayAuthority(data.commandId, pending);
+    this.#clearPending(data.commandId);
+    // Reject directly: do not broaden owner ACK error codes or enter the notRun resend path.
+    pending.reject(new FabricRelayDestinationUnavailableError(pending.targetId, pending.idempotencyKey));
+  }
+
   #acceptAcknowledgement(event: MeshEvent): void {
-    if (!isObject(event.data) || typeof event.data.commandId !== "string") return;
-    const pending = this.#pending.get(event.data.commandId);
+    this.#pruneRelayAcknowledgements();
+    const envelope = ownDataRecord(event);
+    const data = envelope && ownDataRecord(envelope.data);
+    const from = envelope && ownDataRecord(envelope.from);
+    if (!data || !from || typeof data.commandId !== "string" || typeof from.id !== "string") return;
+    const pending = this.#pending.get(data.commandId);
+    if (pending) {
+      if (this.#authenticatedAcknowledgement({ from: { id: from.id }, data }, pending)) this.#settleAcknowledgement(data.commandId, pending, data);
+      return;
+    }
+    // No general ACK cache: only an exact command with previously retained refusal authority.
+    for (const [key, entry] of this.#relayAcknowledgements) {
+      if (entry.commandId !== data.commandId || envelope?.verification !== "bridge" ||
+          envelope.to !== this.options.hostId || typeof data.accepted !== "boolean" ||
+          data.errorCode === RELAY_DESTINATION_UNAVAILABLE ||
+          (entry.authority.ownerIncarnation !== undefined && data.ownerIncarnation !== entry.authority.ownerIncarnation)) continue;
+      const bridge = ownDataRecord(data.bridge);
+      const warning = data.warning === undefined ? undefined : ownDataRecord(data.warning);
+      if (!bridge || (data.warning !== undefined && !warning)) continue;
+      const safeData = { ...data, bridge, ...(warning ? { warning } : {}) };
+      const safeEvent = { from: { id: from.id }, data: safeData };
+      if (!this.#authenticatedAcknowledgement(safeEvent, entry.authority)) continue;
+      // Keep only the ordinary receipt and the authority fields that the SAME verifier needs.
+      // Bridged message results are scrubbed at ingress; never retain an arbitrary result/body.
+      const { result: _result, ...acceptance } = this.#acknowledgementAcceptance(safeData, entry.authority);
+      if (acceptance.warning) Object.freeze(acceptance.warning);
+      const acknowledgement: OwnerAcknowledgement = Object.freeze({ from: Object.freeze({ id: from.id }),
+        data: Object.freeze({ ...acceptance, version: 1, commandId: entry.commandId, targetId: entry.authority.targetId,
+          ...(data.ownerIncarnation !== undefined ? { ownerIncarnation: data.ownerIncarnation } : {}),
+          ...(isIncarnation(data.staleIncarnation) || data.staleIncarnation === null
+            ? { staleIncarnation: data.staleIncarnation } : {}),
+          bridge: Object.freeze({ from: bridge.from }),
+        }) });
+      this.#relayAcknowledgements.delete(key);
+      this.#relayAcknowledgements.set(key, Object.freeze({ ...entry, acknowledgement }));
+      return; // preserve the refusal's absolute deadline, not a receipt-relative TTL
+    }
+  }
+
+  /** Live and recovered owner receipts share the full owner/epoch/origin verifier. */
+  #authenticatedAcknowledgement(event: OwnerAcknowledgement, pending: ControlAcknowledgementAuthority): Record<string, unknown> | undefined {
+    if (!isObject(event.data) || typeof event.data.commandId !== "string") return undefined;
     if (
-      !pending ||
       event.data.version !== 1 ||
       event.data.targetId !== pending.targetId ||
       event.from.id !== pending.ownerIdentityId ||
@@ -1326,28 +1528,35 @@ export class FabricControlPlane {
           ? !Object.prototype.hasOwnProperty.call(event.data, "bridge")
           : this.#bridgeMatches(pending.ownerHostId, event.data))
     ) {
-      return;
+      return undefined;
     }
-    this.#clearPending(event.data.commandId);
-    pending.resolve({
-      accepted: event.data.accepted === true,
-      ...(event.data.accepted !== true && terminalRejectionFields(event.data)?.targetId === pending.targetId
-        ? terminalRejectionFields(event.data) : {}),
-      ...(typeof event.data.messageId === "string" ? { messageId: event.data.messageId } : {}),
-      ...queueDepthOf(event.data),
-      ...coalescedOf(event.data),
-      ...runningTaskWarningOf(event.data, pending.targetId),
-      ...triggeredOf(event.data),
-      ...(Object.prototype.hasOwnProperty.call(event.data, "result")
-        ? { result: event.data.result }
-        : {}),
-      ...(typeof event.data.error === "string" ? { error: event.data.error } : {}),
-      ...(event.data.accepted === false && event.data.errorCode === CONTROL_STALE_INCARNATION
+    return event.data;
+  }
+
+  #settleAcknowledgement(commandId: string, pending: PendingControlRequest, data: Record<string, unknown>): void {
+    if (this.#pending.get(commandId) !== pending) return;
+    this.#clearPending(commandId);
+    pending.resolve(this.#acknowledgementAcceptance(data, pending));
+  }
+
+  #acknowledgementAcceptance(data: Record<string, unknown>, pending: ControlAcknowledgementAuthority): FabricControlAcceptance {
+    return {
+      accepted: data.accepted === true,
+      ...(data.accepted !== true && terminalRejectionFields(data)?.targetId === pending.targetId
+        ? terminalRejectionFields(data) : {}),
+      ...(typeof data.messageId === "string" ? { messageId: data.messageId } : {}),
+      ...queueDepthOf(data),
+      ...coalescedOf(data),
+      ...runningTaskWarningOf(data, pending.targetId),
+      ...triggeredOf(data),
+      ...(Object.prototype.hasOwnProperty.call(data, "result") ? { result: data.result } : {}),
+      ...(typeof data.error === "string" ? { error: data.error } : {}),
+      ...(data.accepted === false && data.errorCode === CONTROL_STALE_INCARNATION
         ? { errorCode: CONTROL_STALE_INCARNATION } : {}),
-      ...(event.data.errorCode === "FABRIC_INTERRUPT_NOT_AUTHORIZED" || event.data.errorCode === "FABRIC_INTERRUPT_RATE_LIMITED"
-        ? { errorCode: event.data.errorCode } : {}),
-      ...(event.data.accepted !== true && event.data.notRun === true ? { notRun: true as const } : {}),
-    });
+      ...(data.errorCode === "FABRIC_INTERRUPT_NOT_AUTHORIZED" || data.errorCode === "FABRIC_INTERRUPT_RATE_LIMITED"
+        ? { errorCode: data.errorCode } : {}),
+      ...(data.accepted !== true && data.notRun === true ? { notRun: true as const } : {}),
+    };
   }
 
   // smarty-dev#2004: an owner mirrored from remote host R answers only through R's mesh bridge,

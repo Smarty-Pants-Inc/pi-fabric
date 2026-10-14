@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { QuickJsRuntime } from "../src/runtime/quickjs-runtime.js";
 import { FabricModelDeniedError } from "../src/core/model-policy.js";
 import { FabricInterruptNotAuthorizedError, FabricInterruptRateLimitedError } from "../src/interrupt-authority.js";
-import { FabricControlStaleIncarnationError, STALE_INCARNATION_ERROR } from "../src/topology/control-plane.js";
+import { FabricControlStaleIncarnationError, FabricRelayDestinationUnavailableError, STALE_INCARNATION_ERROR } from "../src/topology/control-plane.js";
 import { classifyPiBashError } from "../src/core/pi-bash-error.js";
 import { MeshLockTimeoutError, MESH_LOCK_TIMEOUT_CODE } from "../src/core/atomic-write.js";
 import { transpileFabricCodeWithSourceMap } from "../src/runtime/type-checker.js";
@@ -244,10 +244,35 @@ catch (error) { return { name: error.name, code: typeof error.code, extra: typeo
     expect(calls).toEqual(Array(2).fill({ id: "session:test", message: "unchanged", idempotencyKey: "original-key" }));
   });
 
-  it("never bridges invalid, oversized, inherited, unrelated or getter retry keys", async () => {
+  it("carries only safe relay refusal metadata through public guest followUp calls", async () => {
+    const error = Object.assign(new FabricRelayDestinationUnavailableError("session:test", "original-key"), {
+      notRun: true, notDelivered: true, secret: "host-only",
+    });
+    const hostCall = vi.fn(async () => { throw error; });
+    const result = await new QuickJsRuntime().execute(
+      `const failures = [];
+       for (const followUp of [agents.followUp, args => tools.call({ ref: "agents.followUp", args })]) {
+         try { await followUp({ id: "session:test", message: "unchanged", idempotencyKey: "original-key" }); }
+         catch (error) { failures.push({ name: error.name, code: error.code, retryable: error.retryable,
+           idempotencyKey: error.idempotencyKey, isError: error instanceof Error,
+           notRun: typeof error.notRun, notDelivered: typeof error.notDelivered,
+           keys: Object.keys(error).sort() }); }
+       } return failures;`, hostCall, options,
+    );
+    expect(result.error).toBeUndefined();
+    expect(result.value).toEqual(Array(2).fill({ name: "FabricRelayDestinationUnavailableError",
+      code: "FABRIC_RELAY_DESTINATION_UNAVAILABLE", retryable: true, idempotencyKey: "original-key", isError: true,
+      notRun: "undefined", notDelivered: "undefined", keys: ["code", "idempotencyKey", "message", "name", "retryable"] }));
+    expect(hostCall.mock.calls).toHaveLength(2);
+  });
+
+  it.each([
+    ["FABRIC_PARTICIPANT_STALE", "FabricParticipantStaleError"],
+    ["FABRIC_RELAY_DESTINATION_UNAVAILABLE", "FabricRelayDestinationUnavailableError"],
+  ])("never bridges invalid, oversized, inherited, unrelated or getter retry keys for %s", async (code, name) => {
     const getter = vi.fn(() => { throw new Error("must not invoke a getter"); });
-    const make = (key: unknown) => Object.assign(new Error("stale"), {
-      name: "FabricParticipantStaleError", code: "FABRIC_PARTICIPANT_STALE", retryable: true, idempotencyKey: key,
+    const make = (key: unknown) => Object.assign(new Error("retryable refusal"), {
+      name, code, retryable: true, idempotencyKey: key,
     });
     const errors = [make(""), make("x".repeat(201)), make(7), make(null), make("x".repeat(200)), make("getter"), make("inherited"), make("unrelated")];
     Object.defineProperty(errors[5], "idempotencyKey", { get: getter });
@@ -284,6 +309,7 @@ catch (error) { return { name: error.name, code: typeof error.code, extra: typeo
   it.each([
     ["FABRIC_CONTROL_INCARNATION_REQUIRED", "FabricControlIncarnationRequiredError"],
     ["FABRIC_CONTROL_STALE_INCARNATION", "FabricControlStaleIncarnationError"],
+    ["FABRIC_RELAY_DESTINATION_UNAVAILABLE", "FabricRelayDestinationUnavailableError"],
     ["FABRIC_PARTICIPANT_NOT_YET_MIRRORED", "FabricParticipantNotYetMirroredError"],
     ["FABRIC_PARTICIPANT_NON_INTERACTIVE", "FabricParticipantNonInteractiveError"],
     ["FABRIC_TASK_ESCALATION_TARGET_DENIED", "TaskEscalationTargetError"],
@@ -320,20 +346,24 @@ catch (error) { return { name: error.name, code: typeof error.code, extra: typeo
     let call = 0;
     const result = await new QuickJsRuntime().execute(
       `const failures = [];
-       for (let i = 0; i < 3; i++) {
+       for (let i = 0; i < 5; i++) {
          try { await tools.call({ ref: "demo.error" }); }
-         catch (error) { failures.push({ name: error.name, code: error.code, retryable: error.retryable, secret: error.secret }); }
+         catch (error) { failures.push({ name: error.name, code: error.code, retryable: error.retryable,
+           idempotencyKey: error.idempotencyKey, secret: error.secret }); }
        }
        return failures;`,
       async () => {
         const index = call++;
         if (index === 0) throw Object.assign(new Error("mismatch"), { name: "RangeError", code: "FABRIC_PROJECT_LEAD_INVALID", retryable: true });
         if (index === 1) throw Object.assign(new Error("non-string"), { name: 7, code: "FABRIC_PROJECT_LEAD_INVALID", retryable: true });
+        if (index === 3) throw Object.assign(new Error("relay mismatch"), { name: "RangeError", code: "FABRIC_RELAY_DESTINATION_UNAVAILABLE", retryable: true, idempotencyKey: "must-not-cross" });
+        if (index === 4) throw Object.assign(new Error("unknown relay code"), { name: "FabricRelayDestinationUnavailableError", code: "HOST_SECRET", retryable: true, idempotencyKey: "must-not-cross" });
         throw { name: "FabricProjectLeadInvalidError", code: "FABRIC_PROJECT_LEAD_INVALID", retryable: true, secret: "not-guest-data" };
       }, options,
     );
     expect(result.error).toBeUndefined();
-    expect(result.value).toEqual([{ name: "RangeError" }, { name: "Error" }, { name: "Error" }]);
+    expect(result.value).toEqual([{ name: "RangeError" }, { name: "Error" }, { name: "Error" },
+      { name: "RangeError" }, { name: "FabricRelayDestinationUnavailableError" }]);
   });
 
   it.each(["bash", "powershell"])("keeps vetted Fabric fields and %s exit metadata together", async (tool) => {

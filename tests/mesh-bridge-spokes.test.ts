@@ -9,7 +9,7 @@ import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { FabricControlPlane } from "../src/topology/control-plane.js";
 import { AgentsProvider } from "../src/providers/agents-provider.js";
-import { writeHostLease } from "../src/topology/host-leases.js";
+import { readHostLease, writeHostLease } from "../src/topology/host-leases.js";
 import { writeParticipantFile } from "../src/topology/participant-files.js";
 
 // #11199: exercise lease-removal admission with recorded calls, never delete a lease locally.
@@ -45,17 +45,42 @@ const expectRelayedOnly = (store: MeshStore, secret: string, to: string) => {
   expect(acks.length).toBeGreaterThan(0);
   for (const ack of acks) {
     expect(Object.keys(ack.data as object).filter(field => !RELAYED_ACK_FIELDS.has(field))).toEqual([]);
+    expect(ack).not.toHaveProperty("text");
     expect(JSON.stringify(ack)).not.toContain(secret);
   }
 };
 
-const native = async (store: MeshStore, name: string, ttl = 60_000) => {
+// Data safety: inspect actual persisted bytes, including state, event archives and outbox files,
+// rather than proving only that a filtered read or recorded publish omitted the marker.
+const persistedMarkerFiles = (root: string, marker: string): string[] => {
+  const found: string[] = [];
+  const visit = (dir: string): void => {
+    for (const name of fs.readdirSync(dir)) {
+      const file = path.join(dir, name);
+      try {
+        const stat = fs.lstatSync(file);
+        expect(stat.isSymbolicLink()).toBe(false);
+        if (stat.isDirectory()) visit(file);
+        else if (stat.isFile() && fs.readFileSync(file).includes(Buffer.from(marker))) found.push(path.relative(root, file));
+      } catch (error) {
+        // Atomic lease/state writers may rename a temporary entry during the scan.
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
+    }
+  };
+  visit(root);
+  return found;
+};
+
+const native = async (store: MeshStore, name: string, ttl = 60_000, incarnationToken?: string) => {
   const now = Date.now();
   const identity: MeshIdentity = { id: `session:${name}-00000000`, name: "main", kind: "main", sessionId: name };
   const ownerIncarnation = `fixture:${identity.id}`;
-  const host = { format: 1 as const, id: identity.id, rootId: identity.id, identity, startedAt: now, updatedAt: now, expiresAt: now + ttl };
+  const host = { format: 1 as const, id: identity.id, rootId: identity.id, identity, startedAt: now, updatedAt: now, expiresAt: now + ttl,
+    ...(incarnationToken !== undefined ? { incarnationToken } : {}) };
   await store.put({ key: hostKey(identity.id), identity, value: host });
-  writeHostLease(store.root, { id: identity.id, rootId: identity.id, identityId: identity.id, startedAt: now, updatedAt: now, expiresAt: now + ttl });
+  writeHostLease(store.root, { id: identity.id, rootId: identity.id, identityId: identity.id, startedAt: now, updatedAt: now, expiresAt: now + ttl,
+    ...(incarnationToken !== undefined ? { incarnationToken } : {}) });
   writeParticipantFile(store.root, { key: participantKey(identity.id), version: 1, updatedAt: now, updatedBy: identity, value: {
     format: 1, id: identity.id, kind: "root", rootId: identity.id, ownerHostId: identity.id, ownerIdentityId: identity.id,
     ownerIncarnation, name, label: name.toUpperCase(), status: "idle", runner: "pi", transport: "host",
@@ -64,22 +89,31 @@ const native = async (store: MeshStore, name: string, ttl = 60_000) => {
   return { identity, ownerIncarnation, host };
 };
 
-const fixture = async (targetTtl = 60_000) => {
+const fixture = async (targetTtl = 60_000, targetToken?: string,
+  afterRelayDelivery?: (event: import("../src/mesh/bridge.js").BridgePublish) => Promise<void>) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-spokes-"));
   scratchRoots.push(dir);
   const stores = Object.fromEntries(["ryzen1", "ryzen2", "ryzen3"].map(name => [name, new MeshStore(path.join(dir, name), 64 * 1024, 100)]));
   const hub = stores.ryzen1!;
-  const links = ["ryzen2", "ryzen3"].map(name => {
+  const links: Array<{ bridge: MeshBridge; remote: RemoteBridgeSide }> = ["ryzen2", "ryzen3"].map(name => {
     const input = new PassThrough();
     const output = new PassThrough();
     const serving = serveBridgeAgent(new StoreBridgeSide(stores[name]!, "ryzen1", () => Date.now()), input, output);
     const remote = new RemoteBridgeSide(output, input);
     closers.push(async () => { remote.close(); input.end(); await serving; output.end(); });
     const bridge = new MeshBridge({ localName: "ryzen1", remoteName: name, local: new StoreBridgeSide(hub, name, () => Date.now()), remote,
-      cursorPath: path.join(dir, `${name}.json`), presenceMs: 0 });
+      cursorPath: path.join(dir, `${name}.json`), presenceMs: 0,
+      relay: async (destinationRemote, event) => {
+        const destination = links.find(link => link.bridge.options.remoteName === destinationRemote);
+        if (!destination) throw Object.assign(new Error("Fixture relay destination unavailable"), {
+          code: "FABRIC_RELAY_DESTINATION_UNAVAILABLE", retryable: true });
+        await destination.bridge.deliverRelay(name, event);
+        await afterRelayDelivery?.(event);
+      } });
     return { bridge, remote };
   });
-  const roots = await Promise.all(Object.entries(stores).map(async ([name, store]) => [name, await native(store, name, name === "ryzen2" ? targetTtl : 60_000)] as const));
+  const roots = await Promise.all(Object.entries(stores).map(async ([name, store]) => [name,
+    await native(store, name, name === "ryzen2" ? targetTtl : 60_000, name === "ryzen2" ? targetToken : undefined)] as const));
   const mains = Object.fromEntries(roots);
   for (const { bridge } of links) await bridge.start();
   for (const { bridge } of links) await bridge.syncPresence();
@@ -323,6 +357,236 @@ describe("spoke-to-spoke roots and addressed control through the hub", () => {
     }
     // A receives RELAYED_ACK_FIELDS only: no result, triggered or pendingFollowUps.
     expectRelayedOnly(a, secret, source.identity.id);
+  });
+
+  it.each([false, true])("P1-b suppresses sensitive relayed ACK text in persisted hub/spoke stores (negotiated batch=%s), not hub-local text", async negotiatedBatch => {
+    const f = await fixture();
+    const a = f.stores.ryzen3!, b = f.stores.ryzen2!, hub = f.stores.ryzen1!;
+    const source = f.mains.ryzen3!, target = f.mains.ryzen2!, local = f.mains.ryzen1!;
+    if (negotiatedBatch) {
+      await Promise.all(f.links.map(link => link.remote.hello()));
+      expect(f.links.every(link => typeof link.remote.publishBatch === "function")).toBe(true);
+    } else {
+      expect(f.links.every(link => link.remote.publishBatch === undefined)).toBe(true);
+    }
+    const batches = vi.spyOn(StoreBridgeSide.prototype, "publishBatch");
+    const count = negotiatedBatch ? 3 : 1;
+    const markers = Array.from({ length: count }, (_, index) => `pr1076-ack-text-${negotiatedBatch}-${index}-PRIVATE`);
+    for (const [index, marker] of markers.entries()) {
+      await b.publish({ topic: "fabric.control.ack", kind: "accepted", from: target.identity, to: source.identity.id,
+        text: marker, data: { version: 1, commandId: `text-${index}`, targetId: target.identity.id,
+          ownerIncarnation: target.ownerIncarnation, accepted: true, messageId: `delivered-${index}`,
+          triggered: true, pendingFollowUps: 1, result: { marker } } });
+    }
+    // Positive control: these are real native records containing the sensitive text at B.
+    expect(events(b, "fabric.control.ack").map(event => event.text)).toEqual(markers);
+    for (const marker of markers) expect(persistedMarkerFiles(b.root, marker).length).toBeGreaterThan(0);
+    await f.drain(); await f.drain();
+    expect(events(hub, "fabric.control.ack")).toHaveLength(count);
+    expect(events(a, "fabric.control.ack")).toHaveLength(count);
+    for (const [index, ack] of events(a, "fabric.control.ack").entries()) {
+      expect(ack).toMatchObject({ from: target.identity, to: source.identity.id, verification: "bridge",
+        data: { commandId: `text-${index}`, targetId: target.identity.id, accepted: true,
+          messageId: `delivered-${index}`, ownerIncarnation: target.ownerIncarnation,
+          bridge: { from: "ryzen2", via: "ryzen1" } } });
+    }
+    if (negotiatedBatch) {
+      // Both actual store append boundaries: B -> hub and negotiated RPC hub -> A.
+      expect(batches.mock.calls.filter(([batch]) => batch.length === count)).toHaveLength(2);
+    } else expect(batches).not.toHaveBeenCalled();
+    for (const marker of markers) {
+      expectRelayedOnly(hub, marker, source.identity.id);
+      expectRelayedOnly(a, marker, source.identity.id);
+      expect(persistedMarkerFiles(hub.root, marker)).toEqual([]);
+      expect(persistedMarkerFiles(a.root, marker)).toEqual([]);
+      for (const link of f.links) expect(fs.readFileSync(link.bridge.options.cursorPath, "utf8")).not.toContain(marker);
+    }
+    // Exact branch counterexample: a native hub recipient still receives text and full data.
+    const hubMarker = `pr1076-hub-local-ack-text-${negotiatedBatch}`;
+    await b.publish({ topic: "fabric.control.ack", kind: "accepted", from: target.identity, to: local.identity.id,
+      text: hubMarker, data: { version: 1, commandId: "hub-local-text", targetId: target.identity.id,
+        accepted: true, messageId: "hub-delivered", triggered: true, result: { marker: hubMarker } } });
+    await f.drain(); await f.drain();
+    expect(events(hub, "fabric.control.ack").find(event => event.to === local.identity.id)).toMatchObject({
+      text: hubMarker, data: { triggered: true, result: { marker: hubMarker }, bridge: { from: "ryzen2" } } });
+    expect(persistedMarkerFiles(hub.root, hubMarker).length).toBeGreaterThan(0);
+    expect(events(a, "fabric.control.ack")).toHaveLength(count);
+    expect(persistedMarkerFiles(a.root, hubMarker)).toEqual([]);
+    // A subsequent drain must not restore the private text or duplicate either receipt.
+    await f.drain();
+    expect(events(hub, "fabric.control.ack")).toHaveLength(count + 1);
+    expect(events(a, "fabric.control.ack")).toHaveLength(count);
+    for (const marker of markers) expect(persistedMarkerFiles(hub.root, marker)).toEqual([]);
+  });
+
+  it.each([false, true])("P1 legacy replay strips an old FULL hub ACK before sending it to A (negotiated batch=%s)", async negotiatedBatch => {
+    const f = await fixture();
+    const a = f.stores.ryzen3!, hub = f.stores.ryzen1!;
+    const source = f.mains.ryzen3!, target = f.mains.ryzen2!;
+    if (negotiatedBatch) await Promise.all(f.links.map(link => link.remote.hello()));
+    const markers = Array.from({ length: negotiatedBatch ? 3 : 1 }, (_, index) => `pr1076-old-full-ack-${negotiatedBatch}-${index}`);
+    // Seed historical hub bytes through the real bridge store publication boundary. The
+    // upstream ingress scrub is intentionally bypassed: a pre-fix hub already holds these.
+    const oldHubIngress = new StoreBridgeSide(hub, "ryzen2");
+    for (const [index, marker] of markers.entries()) {
+      await oldHubIngress.publish({ topic: "fabric.control.ack", kind: "accepted", from: target.identity, to: source.identity.id,
+        text: marker, data: { version: 1, commandId: `legacy-${index}`, targetId: target.identity.id,
+          ownerIncarnation: target.ownerIncarnation, accepted: true, messageId: `old-delivered-${index}`,
+          triggered: true, pendingFollowUps: 1, result: { marker },
+          bridge: { from: "ryzen2", id: `old-bridge-id-${index}` } } });
+    }
+    expect(events(hub, "fabric.control.ack").map(ack => ack.text)).toEqual(markers);
+    for (const marker of markers) expect(persistedMarkerFiles(hub.root, marker).length).toBeGreaterThan(0);
+    const batches = vi.spyOn(StoreBridgeSide.prototype, "publishBatch");
+    await f.drain(); await f.drain();
+    expect(events(a, "fabric.control.ack")).toHaveLength(markers.length);
+    for (const [index, ack] of events(a, "fabric.control.ack").entries()) {
+      expect(ack).toMatchObject({ verification: "bridge", from: target.identity, to: source.identity.id,
+        data: { commandId: `legacy-${index}`, targetId: target.identity.id, accepted: true,
+          messageId: `old-delivered-${index}`, ownerIncarnation: target.ownerIncarnation,
+          bridge: { from: "ryzen2", via: "ryzen1" } } });
+    }
+    if (negotiatedBatch) expect(batches.mock.calls.filter(([batch]) => batch.length === markers.length)).toHaveLength(1);
+    else expect(batches).not.toHaveBeenCalled();
+    for (const marker of markers) {
+      expectRelayedOnly(a, marker, source.identity.id);
+      expect(persistedMarkerFiles(a.root, marker)).toEqual([]);
+    }
+    // The legacy payload really remains in the old hub log: this is egress prevention,
+    // not a source assertion or a test that accidentally seeded already-scrubbed input.
+    expect(events(hub, "fabric.control.ack")).toHaveLength(markers.length);
+    await f.drain();
+    expect(events(a, "fabric.control.ack")).toHaveLength(markers.length);
+  });
+
+  it("admits only a correlated captured-hub refusal; forged/body-bearing refusals do not steal a normal owner ACK", async () => {
+    const f = await fixture();
+    const a = f.stores.ryzen3!;
+    const source = f.mains.ryzen3!, target = f.mains.ryzen2!;
+    const directory = new ParticipantDirectory(a, { enabled: true, hostId: source.identity.id, rootId: source.identity.id, identity: source.identity });
+    const sender = new FabricControlPlane(a, source.identity, { enabled: true, hostId: source.identity.id,
+      readMirroredOwner: (...args) => directory.mirroredControlOwner(...args) });
+    sender.start(() => ({ accepted: false }));
+    closers.push(() => sender.close());
+    const hubIdentity: MeshIdentity = { id: "bridge:ryzen1", name: "mesh-bridge", kind: "main" };
+    const sourceIngress = new StoreBridgeSide(a, "ryzen1");
+    const cases: Array<{ label: string; native?: boolean; from?: MeshIdentity; data?: Record<string, unknown>; text?: string; wrongEvent?: boolean }> = [
+      { label: "native unverified hub lookalike", native: true },
+      { label: "forged destination owner", from: target.identity },
+      { label: "wrong bridge identity", from: { ...hubIdentity, id: "bridge:ryzen2" } },
+      { label: "wrong command", data: { commandId: "not-pending" } },
+      { label: "wrong target", data: { targetId: source.identity.id } },
+      { label: "wrong source event", wrongEvent: true },
+      { label: "owner epoch claim", data: { ownerIncarnation: target.ownerIncarnation } },
+      { label: "notRun claim", data: { notRun: true } },
+      { label: "notDelivered claim", data: { notDelivered: true } },
+      { label: "private result", data: { result: { secret: "refusal-private-result" } } },
+      { label: "private message", data: { message: "refusal-private-message" } },
+      { label: "private text", text: "refusal-private-text" },
+    ];
+    for (const [index, invalid] of cases.entries()) {
+      const pending = sender.request(target.identity.id, target.identity.id, "followUp",
+        { message: invalid.label, ownerIncarnation: target.ownerIncarnation }, target.identity.id,
+        { routedRemoteHost: "ryzen2", idempotencyKey: `refusal-case-${index}` });
+      void pending.catch(() => undefined);
+      await vi.waitFor(() => expect(events(a, "fabric.control.command")).toHaveLength(index + 1));
+      const command = events(a, "fabric.control.command")[index]!;
+      const commandId = (command.data as { commandId: string }).commandId;
+      const data = { version: 1, commandId, targetId: target.identity.id, accepted: false,
+        error: "Relay destination unavailable", errorCode: "FABRIC_RELAY_DESTINATION_UNAVAILABLE", retryable: true,
+        bridge: { from: "ryzen1", id: invalid.wrongEvent ? "not-the-source-event" : command.id }, ...invalid.data };
+      if (invalid.native) await a.publish({ topic: "fabric.control.ack", kind: "rejected", from: hubIdentity, to: source.identity.id, data });
+      else await sourceIngress.publish({ topic: "fabric.control.ack", kind: "rejected", from: invalid.from ?? hubIdentity,
+        to: source.identity.id, data, ...(invalid.text !== undefined ? { text: invalid.text } : {}) });
+      // A real, origin-authenticated owner ACK is the behavioral sentinel: an invalid
+      // infrastructure refusal must not settle/reject this pending request first.
+      await sourceIngress.publish({ topic: "fabric.control.ack", kind: "accepted", from: target.identity, to: source.identity.id,
+        data: { version: 1, commandId, targetId: target.identity.id, ownerIncarnation: target.ownerIncarnation,
+          accepted: true, messageId: `owner-ack-${index}`, bridge: { from: "ryzen2", id: `owner-event-${index}`, via: "ryzen1" } } }, [], true);
+      await expect(pending, invalid.label).resolves.toMatchObject({ acknowledged: true, messageId: `owner-ack-${index}` });
+    }
+    const valid = sender.request(target.identity.id, target.identity.id, "followUp",
+      { message: "valid-refusal", ownerIncarnation: target.ownerIncarnation }, target.identity.id,
+      { routedRemoteHost: "ryzen2", idempotencyKey: "valid-refusal-stable-key" });
+    void valid.catch(() => undefined);
+    await vi.waitFor(() => expect(events(a, "fabric.control.command")).toHaveLength(cases.length + 1));
+    const command = events(a, "fabric.control.command").at(-1)!;
+    await sourceIngress.publish({ topic: "fabric.control.ack", kind: "rejected", from: hubIdentity, to: source.identity.id,
+      data: { version: 1, commandId: (command.data as { commandId: string }).commandId, targetId: target.identity.id,
+        accepted: false, error: "Relay destination unavailable", errorCode: "FABRIC_RELAY_DESTINATION_UNAVAILABLE", retryable: true,
+        bridge: { from: "ryzen1", id: command.id } } });
+    await expect(valid).rejects.toMatchObject({ code: "FABRIC_RELAY_DESTINATION_UNAVAILABLE", retryable: true,
+      idempotencyKey: "valid-refusal-stable-key" });
+  });
+
+  it("lost relay receipt retries the same sender key with exactly one destination append and handler delivery", async () => {
+    let attempts = 0;
+    const f = await fixture(60_000, undefined, async () => {
+      if (++attempts === 1) throw Object.assign(new Error("Fixture dropped response after durable destination append"), {
+        code: "FABRIC_RELAY_DESTINATION_UNAVAILABLE", retryable: true });
+    });
+    const a = f.stores.ryzen3!, b = f.stores.ryzen2!, hub = f.stores.ryzen1!;
+    const source = f.mains.ryzen3!, target = f.mains.ryzen2!;
+    const directory = new ParticipantDirectory(a, { enabled: true, hostId: source.identity.id, rootId: source.identity.id, identity: source.identity });
+    const sender = new FabricControlPlane(a, source.identity, { enabled: true, hostId: source.identity.id,
+      readMirroredOwner: (...args) => directory.mirroredControlOwner(...args) });
+    const receiver = new FabricControlPlane(b, target.identity, { enabled: true, hostId: target.identity.id, ownerIncarnation: target.ownerIncarnation });
+    sender.start(() => ({ accepted: false }));
+    // Hold owner execution until the same-key retry is pending. This loses the relay
+    // response AFTER the real append, not a pre-dispatch error or a mock-call assertion.
+    const receive = vi.fn(() => ({ accepted: true, messageId: "one-real-delivery" }));
+    closers.push(async () => { await sender.close(); await receiver.close(); });
+    const marker = "pr1076-lost-relay-response-private";
+    const input = { message: marker, data: { marker }, ownerIncarnation: target.ownerIncarnation };
+    const options = { routedRemoteHost: "ryzen2", idempotencyKey: "lost-response-stable-key" };
+    const first = sender.request(target.identity.id, target.identity.id, "followUp", input, target.identity.id, options);
+    void first.catch(() => undefined);
+    await vi.waitFor(() => expect(events(a, "fabric.control.command")).toHaveLength(1));
+    await f.drain().catch(error => expect(error).toMatchObject({ code: "FABRIC_RELAY_DESTINATION_UNAVAILABLE" }));
+    expect(events(b, "fabric.control.command")).toHaveLength(1); // append preceded loss
+    expect(receive).not.toHaveBeenCalled();
+    await expect(first).rejects.toMatchObject({ code: "FABRIC_RELAY_DESTINATION_UNAVAILABLE", retryable: true });
+    const retry = sender.request(target.identity.id, target.identity.id, "followUp", input, target.identity.id, options);
+    void retry.catch(() => undefined);
+    await vi.waitFor(() => expect(events(a, "fabric.control.command")).toHaveLength(2));
+    const sourceCommands = events(a, "fabric.control.command");
+    expect((sourceCommands[0]!.data as { commandId: string }).commandId)
+      .toBe((sourceCommands[1]!.data as { commandId: string }).commandId);
+    await f.drain(); await f.drain();
+    expect(attempts).toBeGreaterThanOrEqual(2);
+    expect(events(b, "fabric.control.command")).toHaveLength(1);
+    receiver.start(receive);
+    await vi.waitFor(() => expect(events(b, "fabric.control.ack")).toHaveLength(1));
+    await f.drain(); await f.drain();
+    await expect(retry).resolves.toMatchObject({ acknowledged: true, messageId: "one-real-delivery" });
+    expect(receive).toHaveBeenCalledOnce();
+    expect(receive.mock.calls[0]).toEqual(expect.arrayContaining([expect.objectContaining({ message: marker }),
+      expect.objectContaining({ id: source.identity.id, verified: "bridge" })]));
+    expect(events(b, "fabric.control.command")).toHaveLength(1);
+    expect(persistedMarkerFiles(b.root, marker).length).toBeGreaterThan(0);
+    expect(persistedMarkerFiles(hub.root, marker)).toEqual([]);
+    for (const receipt of events(hub, "fabric.control.command")) {
+      for (const field of ["data", "text", "message"]) expect(receipt).not.toHaveProperty(field);
+    }
+  });
+
+  it("P2 preserves a token-bearing origin's incarnation in both direct and re-exported mirror leases", async () => {
+    const token = "pr1076-origin-incarnation-token";
+    const f = await fixture(60_000, token);
+    const b = f.stores.ryzen2!, hub = f.stores.ryzen1!, a = f.stores.ryzen3!;
+    const target = f.mains.ryzen2!;
+    for (const store of [b, hub, a]) {
+      expect(store.get(hostKey(target.identity.id), { fresh: true })!.value).toMatchObject({ incarnationToken: token });
+      expect(readHostLease(store.root, target.identity.id)).toMatchObject({ id: target.identity.id,
+        rootId: target.identity.id, identityId: target.identity.id, startedAt: target.host.startedAt, incarnationToken: token });
+    }
+    const reexport = a.get(hostKey(target.identity.id), { fresh: true })!.value;
+    expect(reexport).toMatchObject({ remoteHost: "ryzen2", bridgeVia: "ryzen1" });
+    expect((await new StoreBridgeSide(a, "ryzen1").owned()).hosts.map(host => host.record))
+      .toEqual(expect.arrayContaining([expect.objectContaining({ id: target.identity.id, incarnationToken: token })]));
+    await f.drain(); await f.drain();
+    for (const store of [hub, a]) expect(readHostLease(store.root, target.identity.id)).toMatchObject({ incarnationToken: token });
+    expect(removals).toEqual([]); // no product lease removal is required for this counterprobe
   });
 
   it("does not retarget a captured native or other-host control, but still carries the correctly captured destination", async () => {

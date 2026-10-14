@@ -42,7 +42,7 @@ import { ActorSessionResetCancelledError } from "../actors/session-reset-error.j
 import type { FabricActorInfo } from "../actors/types.js";
 import type { StateProjector } from "../mesh/state-projector.js";
 import { AgentManager } from "../agents/manager.js";
-import { terminalRejectionFields, type AgentTerminalNotice } from "../agents/terminal-target.js";
+import { FabricTargetTerminalError, terminalRejectionFields, type AgentTerminalNotice } from "../agents/terminal-target.js";
 import { launchScope } from "../scope.js";
 import { useBudgetLedger } from "../agents/budget-ledger.js";
 import { LifecycleBroker } from "../lifecycle/broker.js";
@@ -1095,6 +1095,7 @@ export class ResidentHost {
       const result = command.operation === "steer"
         ? this.agents.steer(command.targetId, message, command.data, provenance)
         : this.agents.followUp(command.targetId, message, command.data, provenance);
+      if (result.undelivered) throw new FabricTargetTerminalError(command.targetId, result.undelivered.finalAnswerReceiptId);
       return { accepted: true, messageId: result.messageId,
         ...(result.warning ? { warning: result.warning } : {}) };
     } catch (error) {

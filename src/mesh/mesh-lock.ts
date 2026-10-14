@@ -1,5 +1,5 @@
-import { createLockEvents, createLockStats, lockHeldEventThreshold, type MeshLockClass } from "./commit-stats.js";
-import { MeshLockTicket } from "./lock-queue.js";
+import { createLockEvents, createLockStats, lockHeldEventThreshold, type LockEventStore, type MeshLockClass } from "./commit-stats.js";
+import { meshLockQueueDirectory, MeshLockTicket } from "./lock-queue.js";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { retryDelayMs } from "../core/retry-backoff.js";
 import type { MeshLockProtocol } from "../config.js";
@@ -41,6 +41,46 @@ export const lockOwnerPid = (ownerPath: string): number | undefined => {
 
 const LOCK_TIMEOUT_MS = 10_000;
 const STALE_LOCK_MS = 30_000;
+
+/** A wait budget exhausted before FIFO admission, not a failed acquisition of the canonical lock. */
+export class MeshLockQueueExpiredError extends MeshLockTimeoutError {
+  readonly preLockCode = "FABRIC_MESH_LOCK_QUEUE_EXPIRED";
+  readonly kind = "pre-lock";
+  readonly retryable = true;
+  constructor(readonly lockPath: string, readonly waitersAhead: number | undefined, readonly waitedMs: number) {
+    super("", 0, 0);
+    this.name = "MeshLockQueueExpiredError";
+    this.message = `${this.preLockCode} (code ${this.code}): Fabric mesh lock ${lockPath} expired in the FIFO queue before its turn, ` +
+      `${waitersAhead === undefined ? "waiter count unavailable" : `${waitersAhead} waiters ahead`}, waited ${waitedMs} ms`;
+  }
+}
+
+// Diagnostic snapshot only: admission remains MeshLockTicket's decision. Count matching receipts before our exact
+// token; a concurrent removal or an unreadable directory makes the count unavailable, never an invented number.
+const queueWaitersAhead = (root: string, token: string): number | undefined => {
+  try {
+    const receipts = fs.readdirSync(meshLockQueueDirectory(root)).filter(name => /^\d{24}-\d+-[a-f0-9-]+$/.test(name)).sort();
+    const index = receipts.findIndex(name => name.endsWith(`-${process.pid}-${token}`));
+    return index < 0 ? undefined : index;
+  } catch { return undefined; }
+};
+
+/** Both canonical mesh and SQLite writers start relative waits after ticket setup. Expiry before any acquisition
+ * stays a FIFO refusal: close admission before emitting its separate event, never a contention counter/event. */
+export const createMeshLockAdmission = (root: string, token: string, budgetMs: number,
+  options: { passStalledHead?: boolean } = {}, now: () => number = Date.now) => {
+  const ticket = new MeshLockTicket(root, token, budgetMs, options);
+  const startedAt = now();
+  return {
+    ticket, startedAt, deadline: startedAt + Math.max(0, budgetMs),
+    expire(lockPath: string, eventRoot: string, store: LockEventStore, lockClass: MeshLockClass): MeshLockQueueExpiredError {
+      const refusal = new MeshLockQueueExpiredError(lockPath, queueWaitersAhead(root, token), Math.max(0, now() - startedAt));
+      ticket.close();
+      lockEvents?.queueExpired(eventRoot, store, lockClass, refusal.waitedMs, refusal.waitersAhead);
+      return refusal;
+    },
+  };
+};
 
 // Keep the normal global timer seam (including diagnostic/test clocks). An
 // aborted lifetime clears its referenced retry timer instead of awaiting the lock.
@@ -236,7 +276,7 @@ export class MeshLock {
     const startTime = this.#lockProtocol >= 2
       ? this.#ownIncarnationReady ? this.#ownStartTime : await this.#ownIncarnation
       : undefined;
-    const deadline = Date.now() + Math.min(this.#lockTimeoutMs, Math.max(0, budget));
+    const waitMs = Math.min(this.#lockTimeoutMs, Math.max(0, budget));
     const token = randomUUID();
     // Protocol 3 (smarty-dev#9569): the start line is always present (empty: unknown) and the PID namespace follows
     // on its own line (empty: unknown, which no reclaimer may treat as its own). Six fields: a reader from before
@@ -272,7 +312,9 @@ export class MeshLock {
         // Already replaced/removed, unreadable, or cleanup failed: never delete canonical.
       }
     };
-    const ticket = new MeshLockTicket(this.root, token, deadline - Date.now());
+    const admission = createMeshLockAdmission(this.root, token, waitMs);
+    const { ticket, deadline } = admission;
+    // The shared admission helper fixes the relative budget only after setup; expiry cannot grant admission.
     try {
       // Attempts and the largest gap between two of them: a large gap means this waiter stalled
       // (no CPU); many attempts with small gaps mean it kept losing the race (smarty-dev#816).
@@ -283,10 +325,14 @@ export class MeshLock {
       while (true) {
         this.#writeAbortSignal?.throwIfAborted();
         if (!ticket.mayContend()) {
-          if (Date.now() >= deadline) throw new MeshLockTimeoutError(describeLockHolder(ownerPath), attempts, maxGapMs);
-          // Woken when the predecessor's receipt goes; the short poll is only a safety net.
-          await ticket.wait(Math.min(20, Math.max(0, deadline - Date.now())), this.#writeAbortSignal);
-          continue;
+          if (Date.now() < deadline) {
+            // Woken when the predecessor's receipt goes; the short poll is only a safety net.
+            await ticket.wait(Math.min(20, Math.max(0, deadline - Date.now())), this.#writeAbortSignal);
+            continue;
+          }
+          // Expiry never grants FIFO admission: only an eligible head may probe at its deadline. Keep the legacy
+          // retry code, but report this zero-acquisition refusal separately from real lock contention.
+          throw admission.expire(this.#lockPath, this.root, "mesh-lock", lockClass);
         }
         const attemptAt = Date.now();
         if (attempts > 0) maxGapMs = Math.max(maxGapMs, attemptAt - lastAttemptAt);
@@ -394,7 +440,9 @@ export class MeshLock {
         if (timed) holdMs = performance.now() - lockHeldAt;
       }
     } catch (error) {
-      if (timed && lockHeldAt < 0 && error instanceof MeshLockTimeoutError) failedWaitMs = performance.now() - lockWaitStart;
+      if (timed && lockHeldAt < 0 && error instanceof MeshLockTimeoutError && !(error instanceof MeshLockQueueExpiredError)) {
+        failedWaitMs = performance.now() - lockWaitStart;
+      }
       throw error;
     } finally {
       ticket.close();

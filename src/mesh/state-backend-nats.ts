@@ -484,7 +484,8 @@ export class NatsStateBackend implements StateBackend {
   async #startProjector(): Promise<void> {
     for (let attempt = 1; ; attempt++) {
       const loaded = await this.#loadSnapshot();
-      if (loaded && loaded.seq > this.#snapshot.seq) { this.#snapshot = loaded; this.#settle(); }
+      // A newer snapshot replaces the model: one state-change hint per install (none at open: no listener yet).
+      if (loaded && loaded.seq > this.#snapshot.seq) { this.#snapshot = loaded; this.#settle(); this.#notifyStateChanged(); }
       const last = await this.#options.port.lastSequence(this.#options.stream);
       this.#knownSeq = Math.max(this.#knownSeq, last);
       const backlog = last - this.#snapshot.seq;

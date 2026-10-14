@@ -250,7 +250,7 @@ describe.runIf(process.env.GITHUB_ACTIONS === "true" && process.platform === "wi
   // token's TokenUser nor its TokenOwner. The DACL is left as created (we keep access), so only the owner differs.
   // No real unreadable-owner fixture is claimed: denying READ_CONTROL makes the helper fail at open first,
   // not at GetSecurityInfo(OWNER). A DACL refusal is not a substitute for that missing evidence.
-  it("refuses to remove a file owned by a foreign SID, and the file, its id and contents survive", ({ skip }) => {
+  it("refuses to remove a file owned by a foreign SID, and the file, its id and contents survive", () => {
     const { user, owner } = tokenSids();
     // Users, then SYSTEM, then Administrators: the first that is neither token SID (an elevated token's owner is
     // often Administrators, so it is never assumed to differ).
@@ -264,8 +264,9 @@ describe.runIf(process.env.GITHUB_ACTIONS === "true" && process.platform === "wi
     expect(original.sid, `a fresh file's owner (${original.trace})`).toBeDefined();
     const set = setOwner(file, foreign!);
     try {
-      // Never a silent pass: without the privilege to give the file away, this test is reported skipped, with why.
-      if (!set.changed) skip(`cannot make ${foreign!} the owner (token user ${user}, owner ${owner}): ${set.trace.join(" | ")}`);
+      // Never a silent pass: if neither attempt (nor its Get-Acl confirmation) gives the file away, this hosted test
+      // fails loudly with why; the finally below still restores the owner.
+      expect(set.changed, `cannot make ${foreign!} the owner (token user ${user}, owner ${owner}): ${set.trace.join(" | ")}`).toBe(true);
       console.info(`[foreign-owner fixture] token user ${user}, owner ${owner}, file owner ${foreign!}: ${set.trace.join(" | ")}`);
       const id = ids(file);
       const judged = fs.lstatSync(file);

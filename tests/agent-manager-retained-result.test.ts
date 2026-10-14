@@ -66,7 +66,21 @@ const disguise = (files: string | string[], mode: Disguise = "absent"): () => vo
   const read = fs.readFileSync;
   const exists = fs.existsSync;
   const lstat = fs.lstatSync;
+  const open = fs.openSync;
   const enoent = () => Object.assign(new Error(`recorded ${mode}`), { code: "ENOENT" });
+  // The authenticated manager path opens a descriptor, so path-only seams are
+  // insufficient: corrupt/foreign reads are redirected to a real regular file
+  // whose inode cannot match the retained publication; absent/dangling opens
+  // refuse without touching the preserved original.
+  const redirected = new Map<string, string>();
+  if (mode === "corrupt" || mode === "foreign") for (const file of hidden) {
+    const replacement = `${file}.disguise-${mode}`;
+    const source = String(Reflect.apply(read, fs, [file, "utf8"]));
+    fs.writeFileSync(replacement, mode === "corrupt"
+      ? "{not json"
+      : JSON.stringify({ ...JSON.parse(source), id: "foreign-run" }), { mode: 0o600 });
+    redirected.set(file, replacement);
+  }
   const readSpy = vi.spyOn(fs, "readFileSync").mockImplementation(((...args: unknown[]) => {
     if (!hidden.has(String(args[0]))) return Reflect.apply(read, fs, args);
     if (mode === "corrupt") return "{not json";
@@ -82,7 +96,13 @@ const disguise = (files: string | string[], mode: Disguise = "absent"): () => vo
     }
     throw enoent();
   }) as typeof fs.lstatSync);
-  return () => { readSpy.mockRestore(); existsSpy.mockRestore(); lstatSpy.mockRestore(); };
+  const openSpy = vi.spyOn(fs, "openSync").mockImplementation(((...args: unknown[]) => {
+    const target = String(args[0]);
+    if (!hidden.has(target)) return Reflect.apply(open, fs, args);
+    if (mode === "absent" || mode === "dangling") throw enoent();
+    return Reflect.apply(open, fs, [redirected.get(target)!, ...args.slice(1)]);
+  }) as typeof fs.openSync);
+  return () => { readSpy.mockRestore(); existsSpy.mockRestore(); lstatSpy.mockRestore(); openSpy.mockRestore(); };
 };
 
 const refusal = async (manager: AgentManager, id: string): Promise<void> => {

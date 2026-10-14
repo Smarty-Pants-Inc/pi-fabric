@@ -73,9 +73,14 @@ describe("disk-backed previous-run index", () => {
     expect(consumed).not.toHaveBeenCalled();
     consume!();
     expect(consumed).toHaveBeenCalledExactlyOnceWith("old-run");
-    // This detects returning a cached clone/summary rather than loading the canonical disk result.
+    // A same-ID worker/foreign replacement is not a newer archive: the retained
+    // manager publication must refuse it until the caller explicitly republishes
+    // an in-memory archive through restorePreviousRuns.
     const newer = { ...expected, text: "new exact disk result", value: { disk: "fresh\udfff" } };
     writeJsonAtomic(file, newer);
+    expect(() => manager.status("old-run")).toThrow(/no saved terminal result/);
+    await expect(manager.wait("old-run")).rejects.toThrow(/no saved terminal result/);
+    manager.restorePreviousRuns([newer]);
     expect(manager.status("old-run")).toEqual(newer);
     expect(await manager.wait("old-run")).toEqual(newer);
     expect(await manager.stop("old-run")).toEqual(newer);

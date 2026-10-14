@@ -232,6 +232,7 @@ const MAX_RETAINED_UI_BYTES = 2 * 1024 * 1024;
 const MAX_RETAINED_UI_SNAPSHOT_BYTES = MAX_RETAINED_UI_BYTES / 2;
 const MAX_RETAINED_RUN_HANDLES = 1_000;
 const MAX_PREVIOUS_RUN_BYTES = 2 * 1024 * 1024;
+const PRIVATE_FILE_FINGERPRINT_BYTES = 256;
 // Manager-owned immutable terminal outcome; worker status can still be rewritten
 // during native close, after host schema validation has already settled the task.
 const MANAGER_RESULT_FILE = "manager-result.json";
@@ -267,8 +268,27 @@ const promptMetadata = (task: string, promptPath: string): AgentPromptMetadata =
  * and no directory fsync. */
 const NATIVE_WINDOWS_FILESYSTEM = process.platform === "win32";
 
+/** Constant-sized proof of one manager-origin private publication. */
+interface PrivateFileFingerprint {
+  dev: number;
+  ino: number;
+  size: number;
+  mtimeMs: number;
+  ctimeMs: number;
+  sha256: string;
+}
+
+const fingerprintFromStat = (stat: fs.Stats, sha256: string): PrivateFileFingerprint => ({
+  dev: stat.dev,
+  ino: stat.ino,
+  size: stat.size,
+  mtimeMs: stat.mtimeMs,
+  ctimeMs: stat.ctimeMs,
+  sha256,
+});
+
 /** Write private task/provenance bytes without ever following a planted link. */
-const writePrivateFileAtomic = (filePath: string, bytes: Uint8Array): void => {
+const writePrivateFileAtomic = (filePath: string, bytes: Uint8Array): PrivateFileFingerprint => {
   const temporary = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
   const releaseTemporary = trackTemporary(temporary);
   const noFollow = fs.constants.O_NOFOLLOW ?? 0;
@@ -281,15 +301,28 @@ const writePrivateFileAtomic = (filePath: string, bytes: Uint8Array): void => {
       offset += written;
     }
     fs.fsyncSync(fd);
+    // The digest is fixed from manager-origin bytes BEFORE rename. Keep the
+    // descriptor through rename so ctime is pinned from the original inode even
+    // on filesystems where rename changes it; a worker replacement cannot alter
+    // this descriptor's identity or stats.
+    const sha256 = createHash("sha256").update(bytes).digest("hex");
+    renameAtomic(temporary, filePath);
+    const fingerprint = fingerprintFromStat(fs.fstatSync(fd), sha256);
+    if (!NATIVE_WINDOWS_FILESYSTEM) syncDirectoryChain(path.dirname(filePath));
     fs.closeSync(fd);
     fd = undefined;
-    renameAtomic(temporary, filePath);
-    if (!NATIVE_WINDOWS_FILESYSTEM) syncDirectoryChain(path.dirname(filePath));
+    return fingerprint;
   } finally {
     if (fd !== undefined) fs.closeSync(fd);
     try { fs.rmSync(temporary, { force: true }); } catch { /* The committed file is already authoritative. */ }
     releaseTemporary();
   }
+};
+
+const writePrivateJsonAtomic = (filePath: string, value: unknown): PrivateFileFingerprint => {
+  const serialized = JSON.stringify(value, null, 2);
+  if (serialized === undefined) throw new Error(`Could not serialize ${filePath}`);
+  return writePrivateFileAtomic(filePath, Buffer.from(serialized, "utf8"));
 };
 
 /** Verify the retained task is still the exact admitted brief. The open descriptor,
@@ -537,6 +570,8 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
   finalAnswerResult?: AgentRunResult;
   /** Full immutable published outcome, demand-loaded after settlement. */
   settledResultFile?: string;
+  /** Constant-sized proof of the manager-origin result publication. */
+  resultFingerprint?: PrivateFileFingerprint;
   /** Status of the associated validated final-answer outcome after its full copy is evicted. */
   finalAnswerStatus?: AgentRunResult["status"];
   /** Bounded scalar facts of the published outcome, read only after close collected its file. */
@@ -742,6 +777,68 @@ const readRecord = (filePath: string): AgentRunRecord | undefined => {
   }
 };
 
+/** Read only the exact manager publication proved by its original descriptor. */
+const readPrivateFileBytes = (
+  filePath: string,
+  expectedPath: string,
+  expected: PrivateFileFingerprint | undefined,
+): Buffer | undefined => {
+  if (!expected || path.resolve(filePath) !== path.resolve(expectedPath)) return undefined;
+  const noFollow = fs.constants.O_NOFOLLOW ?? 0;
+  const nonBlocking = fs.constants.O_NONBLOCK ?? 0;
+  let fd: number | undefined;
+  try {
+    // Reject a known non-regular/link entry before opening; O_NONBLOCK also
+    // closes the replacement-to-FIFO race before fstat can establish its type.
+    const candidate = ownedStat(filePath);
+    if (!candidate?.isFile()) return undefined;
+    fd = fs.openSync(filePath, fs.constants.O_RDONLY | noFollow | nonBlocking);
+    const before = fs.fstatSync(fd);
+    if (!before.isFile() || before.nlink !== 1 ||
+        (!NATIVE_WINDOWS_FILESYSTEM && (before.mode & 0o777) !== 0o600) ||
+        before.dev !== expected.dev || before.ino !== expected.ino || before.size !== expected.size ||
+        before.mtimeMs !== expected.mtimeMs || before.ctimeMs !== expected.ctimeMs) return undefined;
+    const bytes = Buffer.allocUnsafe(before.size);
+    for (let offset = 0; offset < bytes.byteLength;) {
+      const read = fs.readSync(fd, bytes, offset, bytes.byteLength - offset, offset);
+      if (read <= 0) return undefined;
+      offset += read;
+    }
+    const after = fs.fstatSync(fd);
+    const current = ownedStat(filePath);
+    if (!current || !after.isFile() || after.nlink !== 1 ||
+        before.dev !== after.dev || before.ino !== after.ino || before.uid !== after.uid ||
+        before.mode !== after.mode || before.nlink !== after.nlink || before.size !== after.size ||
+        before.mtimeMs !== after.mtimeMs || before.ctimeMs !== after.ctimeMs ||
+        current.dev !== after.dev || current.ino !== after.ino || current.uid !== after.uid ||
+        current.mode !== after.mode || current.nlink !== after.nlink || current.size !== after.size ||
+        current.mtimeMs !== after.mtimeMs || current.ctimeMs !== after.ctimeMs ||
+        createHash("sha256").update(bytes).digest("hex") !== expected.sha256) return undefined;
+    return bytes;
+  } catch {
+    return undefined;
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+  }
+};
+
+const readAuthenticatedRecord = (
+  filePath: string,
+  expectedPath: string,
+  expected: PrivateFileFingerprint | undefined,
+): AgentRunRecord | undefined => {
+  const bytes = readPrivateFileBytes(filePath, expectedPath, expected);
+  if (!bytes) return undefined;
+  try {
+    const parsed: unknown = JSON.parse(bytes.toString("utf8"));
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return undefined;
+    const record = parsed as AgentRunRecord;
+    return { ...normalizeRecordTasks(record), runner: isFabricRunnerId(record.runner) ? record.runner : "pi" };
+  } catch {
+    return undefined;
+  }
+};
+
 const uiText = (text: string, max: number): string =>
   detachedPreview(text, max) + (text.length > max ? "…" : "");
 
@@ -828,6 +925,7 @@ const SETTLED_SUMMARY_ERROR_CHARS = 1_000;
 interface PreviousRun {
   summary: PreviousRunSummary;
   resultFile: string;
+  fingerprint: PrivateFileFingerprint;
   bytes: number;
 }
 
@@ -3004,7 +3102,8 @@ export class AgentManager {
 
   #readResult(managed: ManagedAgent): AgentRunRecord | undefined {
     if (!managed.settledResultFile) return readRecord(managed.statusFile);
-    const result = readRecord(managed.settledResultFile);
+    const expectedFile = path.join(managed.runDirectory, MANAGER_RESULT_FILE);
+    const result = readAuthenticatedRecord(managed.settledResultFile, expectedFile, managed.resultFingerprint);
     if (result && result.id === managed.id && terminalStatuses.has(result.status)) return result;
     // Close's whole-tree collection is the only owned path that removes the published
     // file while the handle stays readable. Only its recorded provenance (validated
@@ -3590,12 +3689,12 @@ export class AgentManager {
       // leaving the old index/result intact and the caller's archive unconsumed.
       writeJsonAtomic(statusFile, result, { space: 2, durable: true });
       const resultFile = path.join(directory, MANAGER_RESULT_FILE);
-      writeJsonAtomic(resultFile, result, { space: 2, durable: true });
-      this.#rememberPreviousRun(result, resultFile);
+      const fingerprint = writePrivateJsonAtomic(resultFile, result);
+      this.#rememberPreviousRun(result, resultFile, fingerprint);
     }
   }
 
-  #rememberPreviousRun(result: AgentRunResult, resultFile: string): void {
+  #rememberPreviousRun(result: AgentRunResult, resultFile: string, fingerprint: PrivateFileFingerprint): void {
     const summary: PreviousRunSummary = {
       id: detachedPreview(result.id, result.id.length),
       name: uiText(result.name, MAX_NAME_LENGTH),
@@ -3609,8 +3708,10 @@ export class AgentManager {
       ...(result.error !== undefined ? { error: uiText(result.error, MAX_UI_ERROR_CHARS) } : {}),
     };
     this.#dropPreviousRun(result.id);
-    const bytes = uiPayloadBytes(summary) + resultFile.length * 2;
-    this.#previousRuns.set(summary.id, { summary, resultFile, bytes });
+    // The result stays on disk; only this bounded summary, path and fixed proof
+    // remain indexed in memory. Do not charge the retained result payload to heap.
+    const bytes = uiPayloadBytes(summary) + resultFile.length * 2 + PRIVATE_FILE_FINGERPRINT_BYTES;
+    this.#previousRuns.set(summary.id, { summary, resultFile, fingerprint, bytes });
     this.#previousRunBytes += bytes;
     while (this.#previousRuns.size > MAX_RETAINED_RUN_HANDLES || this.#previousRunBytes > MAX_PREVIOUS_RUN_BYTES) {
       this.#forgetRunMetadata(this.#previousRuns.keys().next().value!);
@@ -3685,7 +3786,9 @@ export class AgentManager {
     if (result) this.#enodevSettledHere.add(runId);
     if (!result) return false;
     this.#enodevRuns = (this.#enodevRuns ?? []).filter(other => other !== pending.directory);
-    this.#rememberPreviousRun(result, path.join(pending.directory, "status.json"));
+    const resultFile = path.join(pending.directory, MANAGER_RESULT_FILE);
+    const fingerprint = writePrivateJsonAtomic(resultFile, result);
+    this.#rememberPreviousRun(result, resultFile, fingerprint);
     this.#retentionRevision++;
     this.#releaseProvenGone(); // smarty-dev#9855: same step as the settle
     return true;
@@ -3726,9 +3829,10 @@ export class AgentManager {
   #previousRun(id: string): AgentRunResult | undefined {
     const previous = this.#runs.has(id) ? undefined : this.#previousRuns.get(id);
     if (!previous) return undefined;
-    const record = readRecord(previous.resultFile);
+    const record = readAuthenticatedRecord(previous.resultFile, previous.resultFile, previous.fingerprint);
     if (!record || record.id !== id || !terminalStatuses.has(record.status)) {
-      throw new Error(`Fabric agent ${id} has no saved terminal result at ${previous.resultFile}`);
+      throw Object.assign(new Error(`Fabric agent ${id} has no saved terminal result at ${previous.resultFile}`),
+        { code: "FABRIC_MISSING_RESULT" as const });
     }
     return record as AgentRunResult;
   }
@@ -5483,8 +5587,9 @@ export class AgentManager {
       // our exact validated outcome to a manager-only file before dropping full
       // completion caches; a failed save retains the full retry/custody debt.
       const resultFile = path.join(managed.runDirectory, MANAGER_RESULT_FILE);
-      writeJsonAtomic(resultFile, full, { space: 2, durable: true });
+      const fingerprint = writePrivateJsonAtomic(resultFile, full);
       managed.settledResultFile = resultFile;
+      managed.resultFingerprint = fingerprint;
       delete managed.resultCollected;
       if (managed.routeOutcome || this.#onSettled) this.#stageArchive(managed.runDirectory, full, "settlement", undefined, !managed.routeOutcome);
       managed.routeOutcome?.(result);
@@ -5522,7 +5627,7 @@ export class AgentManager {
     const record = this.#readResult(managed) ?? managed.latestRecord;
     if (!record || (record.status !== "failed" && record.status !== "stopped" && record.status !== "timed_out")) return false;
     const resultFile = managed.settledResultFile;
-    const keepResult = resultFile === path.join(managed.runDirectory, MANAGER_RESULT_FILE) && fs.existsSync(resultFile);
+    const keepResult = resultFile === path.join(managed.runDirectory, MANAGER_RESULT_FILE) && this.#exactResultPresent(managed);
     const promptFile = path.join(managed.runDirectory, "task.txt");
     const stat = ownedStat(promptFile);
     const expectedSha256 = managed.inputSha256 ?? record.inputSha256;
@@ -5541,7 +5646,7 @@ export class AgentManager {
     // retained proof; a mismatch drops task.txt. The manager's exact outcome stays
     // beside status.json with only its task fields removed; every other field is
     // kept uncompacted. status.json stays compact and taskless.
-    if (keepResult && resultFile) writeJsonAtomic(resultFile, omitRetainedTasks(record), { space: 2, durable: true });
+    if (keepResult && resultFile) managed.resultFingerprint = writePrivateJsonAtomic(resultFile, omitRetainedTasks(record));
     writeJsonAtomic(managed.statusFile, omitRetainedTasks(compactUiRecord(this.#withTransportMetadata(record, managed, false))), { space: 2 });
     for (const entry of fs.readdirSync(managed.runDirectory)) {
       if (entry === "status.json" || (entry === "task.txt" && currentMatches) || (entry === MANAGER_RESULT_FILE && keepResult)) continue;
@@ -5552,11 +5657,12 @@ export class AgentManager {
     return true;
   }
 
-  /** The manager's own regular, exact terminal result file (no symlink/foreign/corrupt). */
+  /** The manager's own exact terminal result file (no replacement/mutation/symlink). */
   #exactResultPresent(managed: ManagedAgent): boolean {
     const file = managed.settledResultFile;
-    if (!file || !ownedStat(file)?.isFile()) return false;
-    const result = readRecord(file);
+    const expectedFile = path.join(managed.runDirectory, MANAGER_RESULT_FILE);
+    if (!file || path.resolve(file) !== path.resolve(expectedFile)) return false;
+    const result = readAuthenticatedRecord(file, expectedFile, managed.resultFingerprint);
     return result?.id === managed.id && terminalStatuses.has(result.status);
   }
 
@@ -5946,7 +6052,9 @@ export class AgentManager {
   // directories. Terminal-owner reconciliation prevents cached active ghosts.
   #nestedAgents(managed: ManagedAgent, force = false): AgentRunRecord[] {
     if (managed.nestedSnapshot === undefined && managed.nestedSnapshotSaved) {
-      const saved = readRecord(managed.settledResultFile ?? path.join(managed.runDirectory, MANAGER_NESTED_FILE));
+      const saved = managed.settledResultFile
+        ? this.#readResult(managed)
+        : readRecord(path.join(managed.runDirectory, MANAGER_NESTED_FILE));
       if (saved?.id === managed.id && Array.isArray(saved.nestedAgents) && saved.nestedAgents.length > 0) {
         managed.nestedSnapshot = saved.nestedAgents.map(record => compactUiRecord(record));
       }

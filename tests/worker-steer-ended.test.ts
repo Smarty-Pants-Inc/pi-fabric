@@ -50,9 +50,15 @@ const setup = () => {
   const helper = path.join(root, "terminal-answer.mjs");
   buildSync({ entryPoints: [path.resolve("src/worker/terminal-answer.ts")], outfile: helper, bundle: true, platform: "node", format: "esm" });
   vi.stubEnv("STEER_ENDED_HELPER", pathToFileURL(helper).href);
+  // NODE_OPTIONS --import is a Node preload contract; Bun's direct .ts
+  // launcher ignores it. Run the real source through Node/jiti so the fault
+  // and interleaving hooks actually observe the worker's held FILE fds.
+  const sourceWorker = path.join(root, "worker.mjs");
+  fs.writeFileSync(sourceWorker, `import { createJiti } from ${JSON.stringify(pathToFileURL(path.resolve("node_modules/jiti/lib/jiti.mjs")).href)};\nawait createJiti(import.meta.url).import(${JSON.stringify(path.resolve("src/worker.ts"))});\n`);
+  vi.stubEnv("NODE_OPTIONS", `${process.env.NODE_OPTIONS ?? ""} --import=${pathToFileURL(path.resolve("node_modules/jiti/lib/jiti-register.mjs")).href}`);
   const notices: Record<string, any>[] = [];
   const manager = new AgentManager(workspace, { ...DEFAULT_FABRIC_CONFIG.agents, timeoutMs: 30000, nice: 19 }, {
-    workerPath: path.resolve(process.env.FABRIC_STEER_ENDED_WORKER ?? "src/worker.ts"), piBinary: fakeSdk(root), runRoot: path.join(root, "runs"),
+    workerPath: path.resolve(process.env.FABRIC_STEER_ENDED_WORKER ?? sourceWorker), piBinary: fakeSdk(root), runRoot: path.join(root, "runs"),
     fullCodeMode: false, onTerminalNotice: notice => { notices.push(notice as Record<string, any>); },
   }); managers.push(manager);
   return { root, workspace, manager, notices };
@@ -144,7 +150,7 @@ describe("runner-end steer fence (persisted receipt before its worker event)", (
     fs.writeFileSync(hook, `import fs from 'node:fs';
 if(process.argv.includes('--steer-file')){
  const root=${JSON.stringify(s.root)}, fault=${JSON.stringify(fault)}, descriptors=new Map(), open=fs.openSync, stat=fs.fstatSync, read=fs.readSync;
- fs.openSync=(file,...args)=>{const fd=open(file,...args);if(String(file).endsWith('steer.jsonl'))descriptors.set(fd,String(file));else descriptors.delete(fd);return fd;};
+ fs.openSync=(file,...args)=>{const fd=open(file,...args);descriptors.delete(fd);const actual=fs.realpathSync(process.platform==='linux'?'/proc/self/fd/'+fd:String(file));if(actual.endsWith('/steer.jsonl'))descriptors.set(fd,actual);return fd;};
  fs.fstatSync=(fd,...args)=>{const value=stat(fd,...args);if(fault==='owner'&&descriptors.has(fd)&&fs.existsSync(root+'/armed'))value.uid=typeof value.uid==='bigint'?value.uid+1n:value.uid+1;return value;};
  fs.readSync=(fd,...args)=>{if(fault==='growing'&&descriptors.has(fd)&&fs.existsSync(root+'/armed')&&!fs.existsSync(root+'/grew')){fs.appendFileSync(descriptors.get(fd),'x'.repeat(1048577));fs.writeFileSync(root+'/grew','');}return read(fd,...args);};
 }

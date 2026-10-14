@@ -5,11 +5,13 @@ import { spawn, spawnSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
 import { buildSync } from "esbuild";
 import { describe, expect, it, vi } from "vitest";
-import { MAX_FINAL_ANSWER_BYTES, MAX_TASK_CONTROL_BYTES, readFinalAnswerReceipt, readTaskControlFile, readTaskControlJson, saveFinalAnswerReceipt, taskControlDirectory, taskSteerFile, withTaskFinalAnswerLock } from "../src/worker/terminal-answer.js";
+import { MAX_FINAL_ANSWER_BYTES, MAX_TASK_CONTROL_BYTES, readFinalAnswerReceipt, readTaskControlFile, readTaskControlJson, saveFinalAnswerReceipt, initializeTaskControlDirectory, taskControlDirectory, taskControlReadDirectory, taskSteerFile, withTaskFinalAnswerLock } from "../src/worker/terminal-answer.js";
 import { appendTerminalAdmission, FabricSteerJournalError, readTerminalAdmissions, readUndeliveredMessage, TerminalNoticeOutbox } from "../src/agents/terminal-notices.js";
 import { canRemoveTerminalRun, removeUnreferencedRun } from "../src/storage/retention.js";
 import { writeJsonAtomic } from "../src/core/atomic-write.js";
 import { queuedTerminalControls, readTerminalControl, settleTerminalControl, trackTerminalControl } from "../src/worker/terminal-controls.js";
+import { resolveChildWritePolicy } from "../src/agents/child-env.js";
+import { assertTaskControlWriteRoots } from "../src/worker/terminal-answer.js";
 
 // All fixture paths are private and retained. No local deletion is performed.
 const fixture = () => {
@@ -18,6 +20,21 @@ const fixture = () => {
   for (const directory of [run, workspace, taskControlDirectory(run)]) fs.mkdirSync(directory, { mode: 0o700 });
   return { root, run, workspace, control: taskControlDirectory(run) };
 };
+const confined = (script: string, s: ReturnType<typeof fixture>, policy = resolveChildWritePolicy({ writableRoots: [s.run, s.workspace] }, undefined, s.workspace)!) => {
+  assertTaskControlWriteRoots(s.run, s.workspace, policy);
+  const roots = [...new Set([s.run, s.workspace, ...policy.writableRoots])];
+  const writes = roots.map(directory => {
+    const stat = fs.statSync(directory, { bigint: true });
+    return `${stat.dev}:${stat.ino}:${directory}`;
+  }).join("\n");
+  return spawnSync(path.resolve("dist/native/fabric-landlock"), ["-c", `exec ${JSON.stringify(process.execPath)} ${JSON.stringify(script)}`], {
+    cwd: s.workspace, encoding: "utf8", timeout: 5000,
+    env: { ...process.env, LC_ALL: "C", PI_FABRIC_LANDLOCK_SHELL: "/bin/sh", PI_FABRIC_LANDLOCK_WRITES: writes },
+  });
+};
+// CI=true is not authority to delete on a fleet lane. True removal/replacement
+// counterprobes are restricted to GitHub's disposable hosted runner.
+const hostedDeletion = process.env.GITHUB_ACTIONS === "true" && process.env.RUNNER_ENVIRONMENT === "github-hosted";
 const child = (script: string, cwd: string) => new Promise<{ code: number | null; output: string }>((resolve, reject) => {
   const process = spawn(globalThis.process.execPath, [script], { cwd, env: { ...globalThis.process.env }, stdio: ["ignore", "pipe", "pipe"] });
   let output = "";
@@ -110,11 +127,11 @@ describe("host-owned task controls", () => {
     // entries. A full readdir on the fixture would incorrectly authorize it.
     const readSync = vi.fn(() => ({ name: id + ".json", isFile: () => true })), closeSync = vi.fn(), open = fs.opendirSync;
     const spy = vi.spyOn(fs, "opendirSync").mockImplementation(((directory: fs.PathLike, options?: fs.OpenDirOptions) =>
-      String(directory) === controls ? { readSync, closeSync } as unknown as fs.Dir : open(directory, options)) as typeof fs.opendirSync);
+      fs.realpathSync(String(directory)) === fs.realpathSync(controls) ? { readSync, closeSync } as unknown as fs.Dir : open(directory, options)) as typeof fs.opendirSync);
     expect(canRemoveTerminalRun(s.run)).toBe(false);
     expect(readSync.mock.calls.length).toBe(limit === "entry count" ? 513 : 65);
     expect(readSync.mock.calls.length).toBeLessThan(5000); expect(closeSync).toHaveBeenCalledOnce(); spy.mockRestore();
-    if (limit === "entry count") expect(canRemoveTerminalRun(s.run)).toBe(true); // real one-entry directory still collects
+    expect(canRemoveTerminalRun(s.run)).toBe(true); // real one-entry directory still collects under either budget
   });
 
   it("bounds the worker's queued-registry directory stream and closes on overflow", () => {
@@ -157,6 +174,59 @@ describe("host-owned task controls", () => {
     expect(canRemoveTerminalRun(s.run)).toBe(false);
   });
 
+  it.each(["missing", "malformed", ...(process.platform === "win32" ? [] : ["fifo"])] as const)(
+    "a task-forged legacy-read status cannot downgrade a new protected run with %s control evidence", fault => {
+      const s = fixture(), id = "11111111-1111-4111-8111-111111111111";
+      // Establish a NEW host control namespace before any task-written status.
+      // Status in the writable run must not authorize legacy fallback.
+      initializeTaskControlDirectory(s.run);
+      const sender = { id: "session:forged-route", kind: "main", verified: "mesh" };
+      const receipt = { version: 1, id: "forged-answer", runId: "run", recordedAt: 1, text: "TASK_FORGED_FINAL" };
+      const provenance = { v: 1, channel: "fabric", via: "steer", sender };
+      fs.writeFileSync(path.join(s.run, "status.json"), JSON.stringify({
+        id: "run", status: "completed", runner: "pi", transport: "process", sessionId: "2147483647", updatedAt: 2,
+        taskControlLayout: "legacy-read", finalAnswerReceipt: { id: receipt.id, recordedAt: receipt.recordedAt },
+      }));
+      fs.writeFileSync(path.join(s.run, "steer.jsonl"), JSON.stringify({ id, type: "steer", provenance }) + "\n");
+      writeJsonAtomic(path.join(s.run, "final-answer.json"), receipt);
+      writeJsonAtomic(path.join(s.run, "terminal-controls", id + ".json"), { id, delivery: "steer", provenance, state: "queued" });
+      writeJsonAtomic(path.join(s.run, "terminal-notices", id + ".json"), {
+        code: "FABRIC_TARGET_TERMINAL", targetId: "run", messageId: id, delivery: "steer", sender, finalAnswerReceiptId: receipt.id,
+      });
+      if (fault !== "missing") {
+        for (const relative of ["final-answer.json", path.join("terminal-controls", id + ".json")]) {
+          const file = path.join(s.control, relative); fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+          if (fault === "fifo") expect(spawnSync("mkfifo", [file]).status).toBe(0);
+          else fs.writeFileSync(file, "{malformed");
+        }
+      }
+      const deliveries: unknown[] = [], outbox = new TerminalNoticeOutbox(notice => { deliveries.push(notice); });
+      expect(taskControlReadDirectory(s.run)).toBe(s.control);
+      expect(readTaskControlFile(s.run, "steer.jsonl")).toBeUndefined();
+      expect(readTerminalAdmissions(s.run)).toMatchObject({ controls: 0, bytes: 0, truncated: false });
+      expect(readFinalAnswerReceipt(s.run, "run")).toBeUndefined();
+      expect(readTerminalControl(s.run, id)).toBeUndefined();
+      if (fault === "malformed") expect(() => queuedTerminalControls(s.run)).toThrow(SyntaxError);
+      else expect(queuedTerminalControls(s.run)).toEqual([]);
+      outbox.recover(s.run); outbox.route(s.run);
+      expect(deliveries).toEqual([]);
+      expect(canRemoveTerminalRun(s.run)).toBe(false);
+      expect(fs.readFileSync(path.join(s.run, "final-answer.json"), "utf8")).toContain("TASK_FORGED_FINAL");
+    });
+
+  it.each(["sibling-v1", "legacy-read", "unknown-layout"])("a missing sibling plus task-written %s status never authorizes legacy reads or reader repair", layout => {
+    const s = fixture(); initializeTaskControlDirectory(s.run);
+    fs.renameSync(s.control, s.control + ".retained-evidence");
+    writeJsonAtomic(path.join(s.run, "status.json"), { id: "run", runner: "pi", status: "completed", taskControlLayout: layout });
+    writeJsonAtomic(path.join(s.run, "final-answer.json"), { version: 1, id: "forged", runId: "run", recordedAt: 1, text: "untrusted" });
+    expect(() => taskControlReadDirectory(s.run)).toThrow();
+    expect(() => readFinalAnswerReceipt(s.run, "run")).toThrow();
+    expect(() => initializeTaskControlDirectory(s.run)).toThrow();
+    expect(fs.existsSync(s.control)).toBe(false);
+    expect(canRemoveTerminalRun(s.run)).toBe(false);
+    expect(fs.readFileSync(path.join(s.run, "final-answer.json"), "utf8")).toContain("untrusted");
+  });
+
   it("stages a large answer before contending with a real other-process lock, then publishes immutably", async () => {
     const s = fixture(), module = path.join(s.root, "receipt.mjs");
     buildSync({ entryPoints: [path.resolve("src/worker/terminal-answer.ts")], outfile: module, bundle: true, platform: "node", format: "esm" });
@@ -174,25 +244,108 @@ describe("host-owned task controls", () => {
     console.log(`CONTROL_LOCK: PASS twoRealProcesses=true stagedBeforeLock=true bytes=2097152 root=${s.root}`);
   }, 15000);
 
-  it("the task shell cannot write/remove the live host lock; the old run-local lock was writable", () => {
-    if (process.platform !== "linux") return;
-    const s = fixture(), unsafe = path.join(s.run, ".task-final-answer.lock"); fs.mkdirSync(unsafe, { mode: 0o700 });
+  it.skipIf(process.platform !== "linux").each(["explicit request", "inherited parent policy"] as const)(
+    "confines every control write/FIFO/rename and live lock change under %s while run/workspace operations remain allowed", mode => {
+    const s = fixture(), id = "11111111-1111-4111-8111-111111111111";
+    const policy = mode === "explicit request"
+      ? resolveChildWritePolicy({ writableRoots: [s.run, s.workspace] }, undefined, s.workspace)
+      : resolveChildWritePolicy({}, { readOnly: false, writableRoots: [s.run, s.workspace], shell: "deny" }, s.workspace);
+    expect(policy).toEqual({ readOnly: false, writableRoots: [s.run, s.workspace], shell: "deny" });
+    const unsafe = path.join(s.run, ".task-final-answer.lock"); fs.mkdirSync(unsafe, { mode: 0o700 });
     fs.writeFileSync(path.join(unsafe, "owner"), "legacy");
-    const probe = path.join(s.workspace, "probe.mjs");
-    // O_WRONLY without TRUNC writes no bytes: this is a non-destructive real
-    // Landlock access probe. The removal trigger is a recorded-call probe only.
-    fs.writeFileSync(probe, `import fs from 'node:fs';const open=p=>{try{const fd=fs.openSync(p,fs.constants.O_WRONLY);fs.closeSync(fd);return true;}catch(e){if(e.code!=='EACCES'&&e.code!=='EPERM')throw e;return false;}};if(!open(${JSON.stringify(path.join(unsafe, "owner"))}))throw Error('counterexample not writable');if(open(${JSON.stringify(path.join(s.control, ".task-final-answer.lock", "owner"))}))throw Error('host lock writable');console.log('LANDLOCK: PASS legacyWritable=true hostLockWritable=false');`);
-    const writes = [s.run, s.workspace].map(directory => { const stat = fs.statSync(directory, { bigint: true }); return `${stat.dev}:${stat.ino}:${directory}`; }).join("\n");
+    const relative = ["steer.jsonl", "final-answer.json", path.join("terminal-controls", id + ".json"), path.join("terminal-notices", id + ".json")];
+    const files = relative.map(name => path.join(s.control, name));
+    for (const file of files) {
+      fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+      fs.writeFileSync(file, "{\"hostOwned\":true}\n", { mode: 0o600 });
+    }
+    const probe = path.join(s.workspace, "probe.mjs"), lock = path.join(s.control, ".task-final-answer.lock");
     withTaskFinalAnswerLock(s.run, () => {
-      const remove = vi.spyOn(fs, "rmSync").mockImplementation(() => undefined);
-      fs.rmSync(unsafe, { recursive: true, force: true }); // recorded, never executed locally
-      expect(remove).toHaveBeenCalledWith(unsafe, { recursive: true, force: true }); remove.mockRestore();
-      const result = spawnSync(path.resolve("dist/native/fabric-landlock"), ["-c", `exec ${JSON.stringify(process.execPath)} ${JSON.stringify(probe)}`], { cwd: s.workspace,
-        env: { ...process.env, PI_FABRIC_LANDLOCK_SHELL: "/bin/sh", PI_FABRIC_LANDLOCK_WRITES: writes }, encoding: "utf8", timeout: 5000 });
+      const protectedFiles = [...files, path.join(lock, "owner")];
+      const before = protectedFiles.map(file => ({ file, bytes: fs.readFileSync(file), ino: fs.statSync(file).ino }));
+      fs.writeFileSync(probe, `
+import fs from 'node:fs';
+import path from 'node:path';
+import {spawnSync} from 'node:child_process';
+const run=${JSON.stringify(s.run)}, workspace=${JSON.stringify(s.workspace)}, control=${JSON.stringify(s.control)}, lock=${JSON.stringify(lock)};
+const files=${JSON.stringify(protectedFiles)}, denied=[];
+const refuse=(name, operation)=>{
+  try { operation(); } catch(error) {
+    if (!['EACCES','EPERM','EXDEV'].includes(error.code)) throw error;
+    denied.push(name); return;
+  }
+  throw Error('confinement bypass: '+name);
+};
+// These attempts do not truncate or unlink. Even a regression preserves bytes:
+// the r+ write repeats the original first byte; rename destinations are absent.
+for (const [index,file] of files.entries()) {
+  refuse('write-open-'+index,()=>{const fd=fs.openSync(file,fs.constants.O_WRONLY);fs.closeSync(fd);});
+  const first=fs.readFileSync(file).subarray(0,1);
+  refuse('same-byte-write-'+index,()=>{const fd=fs.openSync(file,'r+');try{fs.writeSync(fd,first,0,first.length,0);}finally{fs.closeSync(fd);}});
+  const staged=path.join(run,'staged-'+index);fs.writeFileSync(staged,'owned rename evidence');
+  refuse('rename-into-controls-'+index,()=>fs.renameSync(staged,path.join(path.dirname(file),'injected-'+index)));
+}
+refuse('create-control',()=>{const fd=fs.openSync(path.join(control,'injected.json'),'wx');fs.closeSync(fd);});
+refuse('hardlink-control',()=>fs.linkSync(files[0],path.join(run,'host-hardlink')));
+refuse('rename-lock-owner',()=>fs.renameSync(path.join(lock,'owner'),path.join(run,'lock-owner-evidence')));
+refuse('rename-live-lock',()=>fs.renameSync(lock,path.join(run,'lock-evidence')));
+refuse('rename-control-directory',()=>fs.renameSync(control,control+'.retained-evidence'));
+fs.symlinkSync(control,path.join(run,'control-alias'),'dir');
+refuse('write-through-alias',()=>{const fd=fs.openSync(path.join(run,'control-alias','steer.jsonl'),'r+');fs.closeSync(fd);});
+const fifo=spawnSync('mkfifo',[path.join(control,'injected.fifo')],{encoding:'utf8',timeout:1000});
+if(fifo.error)throw fifo.error;
+if(fifo.status!==1||!fifo.stderr.includes('Permission denied'))throw Error('FIFO not refused: '+JSON.stringify(fifo));
+denied.push('control-fifo');
+// Positive counterexamples use the SAME confined process and syscall paths.
+const legacy=fs.openSync(${JSON.stringify(path.join(unsafe, "owner"))},fs.constants.O_WRONLY);fs.closeSync(legacy);
+for (const directory of [run,workspace]) {
+  const file=path.join(directory,'allowed-write');const fd=fs.openSync(file,'wx');
+  try{fs.writeSync(fd,'allowed');}finally{fs.closeSync(fd);}
+  const allowedFifo=spawnSync('mkfifo',[path.join(directory,'allowed.fifo')],{encoding:'utf8',timeout:1000});
+  if(allowedFifo.error||allowedFifo.status!==0)throw Error('allowed FIFO failed');
+}
+fs.renameSync(path.join(run,'allowed-write'),path.join(workspace,'allowed-rename'));
+console.log(JSON.stringify({type:'LANDLOCK_COUNTERPROBES',denied,allowed:['legacy-write-open','run-write','workspace-write','run-fifo','workspace-fifo','run-to-workspace-rename']}));
+`);
+      const result = confined(probe, s, policy!);
+      expect(result.error).toBeUndefined(); expect(result.signal).toBeNull();
       expect(result.status, result.stderr).toBe(0);
-      expect(result.stdout).toContain("LANDLOCK: PASS");
-      console.log(result.stdout.trim());
+      const evidence = JSON.parse(result.stdout.trim());
+      expect(evidence.denied).toHaveLength(protectedFiles.length * 3 + 7);
+      expect(evidence.allowed).toHaveLength(6);
+      for (const item of before) {
+        expect(fs.readFileSync(item.file)).toEqual(item.bytes);
+        expect(fs.statSync(item.file).ino).toBe(item.ino);
+        expect(fs.statSync(item.file).nlink).toBe(1);
+      }
+      expect(fs.readFileSync(path.join(s.workspace, "allowed-rename"), "utf8")).toBe("allowed");
+      expect(fs.statSync(path.join(s.run, "allowed.fifo")).isFIFO()).toBe(true);
+      expect(fs.statSync(path.join(s.workspace, "allowed.fifo")).isFIFO()).toBe(true);
+      console.log(`LANDLOCK: PASS policyMode=${mode} denied=${evidence.denied.length} allowed=${evidence.allowed.length} root=${s.root} removal=not-executed`);
     });
+  });
+
+  it.skipIf(process.platform !== "linux" || !hostedDeletion)("hosted-only: refuses actual control replacement/removal and live-lock deletion", () => {
+    const s = fixture(), controlFile = taskSteerFile(s.run), lock = path.join(s.control, ".task-final-answer.lock");
+    fs.writeFileSync(controlFile, "HOST_CONTROL\n");
+    fs.mkdirSync(lock); fs.writeFileSync(path.join(lock, "owner"), "HOST_LOCK\n");
+    const staged = path.join(s.run, "replacement"); fs.writeFileSync(staged, "ATTACKER\n");
+    const probe = path.join(s.workspace, "delete-probe.mjs");
+    fs.writeFileSync(probe, `
+import fs from 'node:fs';
+const refuse=operation=>{try{operation();}catch(error){if(['EACCES','EPERM','EXDEV'].includes(error.code))return;throw error;}throw Error('confinement bypass');};
+refuse(()=>fs.renameSync(${JSON.stringify(staged)},${JSON.stringify(controlFile)}));
+refuse(()=>fs.unlinkSync(${JSON.stringify(controlFile)}));
+refuse(()=>fs.rmSync(${JSON.stringify(lock)},{recursive:true}));
+refuse(()=>fs.rmSync(${JSON.stringify(s.control)},{recursive:true}));
+console.log('HOSTED_DELETE: PASS actualReplacementAndRemovalRefused=true');
+`);
+    const result = confined(probe, s);
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toContain("HOSTED_DELETE: PASS");
+    expect(fs.readFileSync(controlFile, "utf8")).toBe("HOST_CONTROL\n");
+    expect(fs.readFileSync(path.join(lock, "owner"), "utf8")).toBe("HOST_LOCK\n");
+    expect(fs.readFileSync(staged, "utf8")).toBe("ATTACKER\n");
   });
 
   it("refuses and logs a dangling ctl link before retention can remove its run", () => {

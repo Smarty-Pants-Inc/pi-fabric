@@ -199,6 +199,8 @@ export interface AgentCompactionStatus {
 }
 
 export interface AgentRunRecord {
+  /** Advisory downgrade fence only; legacy READ authority lives in host-owned controls. */
+  taskControlLayout?: "sibling-v1";
   /** Canonical Fabric package root selected for the process worker at spawn time. */
   fabricRelease?: string;
   /** Always populated for new runs; optional for legacy records. */

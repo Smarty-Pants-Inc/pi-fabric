@@ -13,13 +13,13 @@ import {
 } from "../thinking.js";
 import type { FabricKernel } from "../runtime/kernel.js";
 import fs from "node:fs";
-import { spawn, execFileSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import os from "node:os";
-import { debuglog } from "node:util";
+
 import { fabricDataRoot } from "../storage/temp-root.js";
 import path from "node:path";
 import { mkdirPrivate } from "../storage/private-dir.js";
-const taskControlDebug = debuglog("pi-fabric:task-control");
+
 import { fileURLToPath } from "node:url";
 import { assertFabricModelAllowed, FabricModelDeniedError } from "../core/model-policy.js";
 import { readChildToolAllowlist } from "../core/child-tool-allowlist.js";
@@ -102,7 +102,7 @@ import type {
 import { FOLLOW_UP_RUNNING_TASK_MESSAGE, type AgentAdmissionAlarm, type AgentFollowUpAlarm, type AgentFollowUpDelivery } from "./types.js";
 import { followUpFile, followUpState, settleFollowUp, releaseFollowUpPayload } from "./follow-up-delivery.js";
 import { createRunRouteMetadata } from "../worker/run-record.js";
-import { readFinalAnswerReceipt, readTaskControlJson, taskControlDirectory, taskSteerFile, withTaskControlDirectory, FabricTaskControlDirectoryError, type FinalAnswerReceipt } from "../worker/terminal-answer.js";
+import { readFinalAnswerReceipt, readTaskControlJson, taskControlDirectory, taskSteerFile, withTaskControlDirectory, initializeTaskControlDirectory, assertTaskControlWriteRoots, isTaskControlDirectoryEntry, taskControlReadDirectory, FabricTaskControlDirectoryError, type FinalAnswerReceipt } from "../worker/terminal-answer.js";
 import { FabricTargetTerminalError, FabricSteerAdmissionLimitError, type AgentTerminalNotice } from "./terminal-target.js";
 import { TerminalNoticeOutbox, appendTerminalAdmission, readTerminalAdmission, readTerminalAdmissions, readUndeliveredMessage, readUndeliveredMessageView, MAX_STEER_CONTROLS, MAX_STEER_BYTES, MAX_STEER_ENTRY_BYTES, terminalControlMatchesAdmission, terminalSenderMatches } from "./terminal-notices.js";
 import type { AgentRunRouteMetadata } from "./types.js";
@@ -665,6 +665,7 @@ const readNestedAgents = (runDirectory: string, depth = 0): AgentRunRecord[] => 
   }
   const agents: AgentRunRecord[] = [];
   for (const entry of entries.slice(0, 200)) {
+    if (isTaskControlDirectoryEntry(nestedRoot, entry)) continue;
     const runDirectory = path.join(nestedRoot, entry);
     const record = readRecord(path.join(runDirectory, "status.json"));
     if (!record) continue;
@@ -742,6 +743,7 @@ const failedRecord = (
   }
   return {
     ...managed.runRoute,
+    ...(previous?.taskControlLayout ? { taskControlLayout: previous.taskControlLayout } : {}),
     id: managed.id,
     name: managed.name,
     task: managed.task,
@@ -809,7 +811,8 @@ const hostStoppedResult = (result: AgentRunResult, lastEventAt: number | undefin
 const runRootHasExitVeto = (root: string, prelaunchIds: ReadonlySet<string>): boolean => {
   try {
     return fs.readdirSync(root, { withFileTypes: true })
-      .some((entry) => entry.isDirectory() && !!runTreeResourceVeto(path.join(root, entry.name), 0, undefined, true, !prelaunchIds.has(entry.name)));
+      .some((entry) => !isTaskControlDirectoryEntry(root, entry.name) && (!entry.isDirectory() && entry.name !== ".fabric-owner.json" ||
+        entry.isDirectory() && !!runTreeResourceVeto(path.join(root, entry.name), 0, undefined, true, !prelaunchIds.has(entry.name))));
   } catch (error) {
     return (error as NodeJS.ErrnoException).code !== "ENOENT";
   }
@@ -873,7 +876,7 @@ export class AgentManager {
   readonly #onAdmissionAlarm: ((alarm: AgentAdmissionAlarm) => void) | undefined;
   #admissionAlarmAt: number | undefined;
   readonly #terminalNoticeOutbox: TerminalNoticeOutbox;
-  #unconfinedControlOverlapLogged = false;
+
   readonly #followUps = new Map<string, Map<string, AgentFollowUpDelivery>>();
   readonly #followUpTimers = new Map<string, NodeJS.Timeout>();
   readonly #onChildQuestion:
@@ -1581,8 +1584,7 @@ export class AgentManager {
           ? resolveChildWritePolicy(request, this.#parentWritePolicy, agentCwd)
           : undefined;
         this.#assertTaskControlRoot(runDirectory, agentCwd, writePolicy);
-        mkdirPrivate(taskControlDirectory(runDirectory), this.#trustRoot());
-        if (process.platform !== "win32") withTaskControlDirectory(runDirectory, (_directory, fd) => fs.fsyncSync(fd));
+        initializeTaskControlDirectory(runDirectory);
         const parentSessionId = this.#sessionId?.();
         const parentRunId = this.#parentLineage?.runId ?? (this.#currentDepth > 0 ? process.env.PI_FABRIC_PARENT_RUN : undefined);
         const lineage: FabricAgentLineage = {
@@ -2488,6 +2490,7 @@ export class AgentManager {
     }
     const recovered: string[] = [];
     for (const entry of entries) {
+      if (isTaskControlDirectoryEntry(this.#runRoot, entry)) continue;
       if (this.#closing || this.#runs.has(entry) || !/^[0-9a-f]{32}$/.test(entry)) continue;
       const runDirectory = path.join(this.#runRoot, entry);
       const statusFile = path.join(runDirectory, "status.json");
@@ -2924,6 +2927,7 @@ export class AgentManager {
       let entry: fs.Dirent | null;
       while (!expired() && (entry = directory.readSync())) {
         if (this.#managedTempRoot && entry.name === ".fabric-owner.json") continue;
+        if (isTaskControlDirectoryEntry(this.#runRoot, entry.name)) continue;
         if (this.#runs.has(entry.name) || this.#queued.has(entry.name)) continue;
         const run = path.join(this.#runRoot, entry.name);
         if (!entry.isDirectory()) { refs.add("*"); continue; }
@@ -3058,6 +3062,7 @@ export class AgentManager {
         directory = fs.opendirSync(this.#runRoot);
         let entry: fs.Dirent | null;
         while ((entry = directory.readSync())) {
+          if (isTaskControlDirectoryEntry(this.#runRoot, entry.name)) { if (expired()) yield; continue; }
           if (!(this.#managedTempRoot && entry.name === ".fabric-owner.json") && !this.#runs.has(entry.name) && !this.#queued.has(entry.name)) {
             const run = path.join(this.#runRoot, entry.name), stat = ownedStat(run);
             if (!entry.isDirectory() || !stat?.isDirectory()) protect("*");
@@ -3127,6 +3132,7 @@ export class AgentManager {
     const sources = new Map<string, string>();
     if (!ownedStat(this.#runRoot)?.isDirectory()) return sources;
     for (const runId of fs.readdirSync(this.#runRoot)) {
+      if (isTaskControlDirectoryEntry(this.#runRoot, runId)) continue;
       if (!/^[a-f0-9]{32}$/.test(runId)) continue;
       const directory = path.join(this.#runRoot, runId);
       const file = path.join(directory, ACTOR_RUN_ARCHIVE_PENDING_FILE);
@@ -3565,11 +3571,18 @@ export class AgentManager {
 
   #runDeletionPaths(runDirectory: string): string[] {
     const control = taskControlDirectory(runDirectory);
-    // Remove the paired host metadata first: failure retains the run, and a
-    // later run-removal failure never leaves an orphan control directory.
+    // Judge both paths first, then remove the run before its host metadata.
+    // A failed run removal must not leave a protected run with erased controls.
     let stat: fs.Stats;
     try { stat = fs.lstatSync(control); }
-    catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return [runDirectory]; throw error; }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      // Missing controls never downgrade a marked run. A no-status prelaunch
+      // source still has its manager-owned cleanup path from main.
+      try { taskControlReadDirectory(runDirectory); }
+      catch (readError) { if ((readError as NodeJS.ErrnoException).code !== "ENOENT") throw readError; }
+      return [runDirectory];
+    }
     try {
       if (!stat.isDirectory() || stat.isSymbolicLink()) throw new FabricTaskControlDirectoryError("Refusing cleanup of a linked or non-directory task control path");
       withTaskControlDirectory(runDirectory, () => undefined);
@@ -3577,7 +3590,7 @@ export class AgentManager {
       console.warn(`[pi-fabric] FABRIC_TASK_CONTROL_UNSAFE cleanup refused for ${control}: ${String(error)}`);
       throw error;
     }
-    return [control, runDirectory];
+    return [runDirectory, control];
   }
   #removeRunTreeSync(runDirectory: string): void {
     for (const directory of this.#runDeletionPaths(runDirectory)) fs.rmSync(directory, { recursive: true, force: true });
@@ -3587,35 +3600,7 @@ export class AgentManager {
   }
 
   #assertTaskControlRoot(runDirectory: string, cwd: string, policy: FabricWritePolicy | undefined): void {
-    const control = taskControlDirectory(runDirectory);
-    const physical = (value: string): string => {
-      const resolved = path.resolve(value);
-      let ancestor = resolved;
-      while (!fs.existsSync(ancestor)) ancestor = path.dirname(ancestor);
-      return path.join(fs.realpathSync(ancestor), path.relative(ancestor, resolved));
-    };
-    // The parent controls its children already; only the CHILD's grants must
-    // exclude this sibling. Its TMPDIR is replaced with the private run leaf.
-    const roots = [cwd, path.join(runDirectory, "tmp"), ...(policy?.writableRoots ?? []),
-      ...[".cache", ".npm", ".bun"].map(name => path.join(os.homedir(), name)), "/dev/null", "/dev/tty", "/dev/pts"];
-    try { roots.push(execFileSync("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim()); }
-    catch { /* A non-Git cwd has no common-Git write grant. */ }
-    for (const root of roots) {
-      const writable = physical(root), target = physical(control);
-      if (target === writable || target.startsWith(writable + path.sep)) {
-        if (!policy) {
-          // #11308: an unconfined same-uid child can reach host files anywhere;
-          // relocating them cannot add isolation. Explicit/inherited policy
-          // still requires this host authority outside all child write grants.
-          if (!this.#unconfinedControlOverlapLogged) {
-            this.#unconfinedControlOverlapLogged = true;
-            taskControlDebug(`unconfined task control directory overlaps ${root}; accepted residual smarty-dev#11308`);
-          }
-          return;
-        }
-        throw new FabricTaskControlDirectoryError(`Task control directory ${control} overlaps writable root ${root}; choose a runRoot outside task write grants`);
-      }
-    }
+    assertTaskControlWriteRoots(runDirectory, cwd, policy);
   }
 
   #requireSteerAdmission(managed: ManagedAgent, bytes = 0) {
@@ -3727,7 +3712,9 @@ export class AgentManager {
         }
       }
       const nested = path.join(directory, "nested");
-      if (fs.existsSync(nested)) for (const name of fs.readdirSync(nested)) inspect(path.join(nested, name), false, depth + 1);
+      if (fs.existsSync(nested)) for (const name of fs.readdirSync(nested)) {
+        if (!isTaskControlDirectoryEntry(nested, name)) inspect(path.join(nested, name), false, depth + 1);
+      }
     };
     let entries: fs.Dirent[];
     try { entries = fs.readdirSync(this.#runRoot, { withFileTypes: true }); }
@@ -3737,8 +3724,16 @@ export class AgentManager {
     }
     for (const entry of entries) {
       if (this.#managedTempRoot && entry.name === ".fabric-owner.json") continue;
+      if (isTaskControlDirectoryEntry(this.#runRoot, entry.name)) continue;
       if (!entry.isDirectory()) throw new Error("Agent release quiescence has unknown run-root contents");
-      inspect(path.join(this.#runRoot, entry.name), this.#runs.has(entry.name));
+      const directory = path.join(this.#runRoot, entry.name);
+      // An empty, unadmitted top-level workspace is not a worker. Classify it
+      // before the run-only control selector; any admission, content or sibling
+      // (including unsafe/dangling links) keeps the full native-custody veto.
+      if (!this.#runs.has(entry.name) && !this.#queued.has(entry.name) && !this.#previousRuns.has(entry.name) &&
+          ownedStat(directory)?.isDirectory() && fs.readdirSync(directory).length === 0 &&
+          !fs.lstatSync(taskControlDirectory(directory), { throwIfNoEntry: false }) && !expired()) continue;
+      inspect(directory, this.#runs.has(entry.name));
     }
     if (obligations()) throw new Error("Agent release quiescence changed while checking workers");
   }
@@ -4388,8 +4383,11 @@ export class AgentManager {
   #observeFinalAnswer(managed: ManagedAgent): boolean {
     if (managed.actorId || managed.runner !== "pi" || managed.transport.kind !== "process") return false;
     if (managed.finalAnswer) return true;
-    const receipt = readFinalAnswerReceipt(managed.runDirectory, managed.id);
-    if (!receipt) return false;
+    let observedReceipt: FinalAnswerReceipt | undefined;
+    try { observedReceipt = readFinalAnswerReceipt(managed.runDirectory, managed.id); }
+    catch { return false; /* Unsafe metadata grants no finality, but must not block native stop/drain. */ }
+    if (!observedReceipt) return false;
+    const receipt = observedReceipt;
     managed.finalAnswer = receipt; // Fence synchronous ingress before any validation yields.
     managed.finalAnswerCompletion = (async () => {
       let snapshot = readRecord(managed.statusFile) ?? managed.latestRecord;
@@ -4849,10 +4847,14 @@ export class AgentManager {
         } catch { /* The persisted veto remains for the next recovery attempt. */ }
       }
       const nested = path.join(directory, "nested");
-      if (ownedStat(nested)?.isDirectory()) for (const name of fs.readdirSync(nested)) visit(path.join(nested, name), depth + 1);
+      if (ownedStat(nested)?.isDirectory()) for (const name of fs.readdirSync(nested)) {
+        if (!isTaskControlDirectoryEntry(nested, name)) visit(path.join(nested, name), depth + 1);
+      }
     };
     if (runDirectory) visit(runDirectory, 0);
-    else if (ownedStat(this.#runRoot)?.isDirectory()) for (const name of fs.readdirSync(this.#runRoot)) visit(path.join(this.#runRoot, name), 0);
+    else if (ownedStat(this.#runRoot)?.isDirectory()) for (const name of fs.readdirSync(this.#runRoot)) {
+      if (!isTaskControlDirectoryEntry(this.#runRoot, name)) visit(path.join(this.#runRoot, name), 0);
+    }
     return recovered;
   }
 
@@ -4867,7 +4869,7 @@ export class AgentManager {
         let entry: fs.Dirent | null;
         while ((entry = cursor.readSync())) {
           yield 0;
-          if (entry.isDirectory()) yield* visit(path.join(directory, entry.name), depth);
+          if (!isTaskControlDirectoryEntry(directory, entry.name) && entry.isDirectory()) yield* visit(path.join(directory, entry.name), depth);
         }
       } catch { /* Unknown sources retain their custody marker. */ }
       finally { try { cursor?.closeSync(); } catch { /* retry next sweep */ } }

@@ -9,6 +9,7 @@ import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { writeJsonAtomic } from "../src/core/atomic-write.js";
 import { MAX_TASK_CONTROL_BYTES, saveFinalAnswerReceipt, taskControlDirectory, taskSteerFile } from "../src/worker/terminal-answer.js";
 import type { AgentRunRecord } from "../src/agents/types.js";
+import type { FabricWritePolicy } from "../src/agents/write-guard.js";
 import { FabricSteerAdmissionLimitError, type AgentTerminalNotice } from "../src/agents/terminal-target.js";
 import { MAX_STEER_BYTES, MAX_STEER_CONTROLS, MAX_PUBLIC_REFUSALS, readTerminalAdmissions } from "../src/agents/terminal-notices.js";
 
@@ -21,12 +22,13 @@ afterEach(async () => {
   vi.restoreAllMocks();
 });
 
-const harness = (retainRuns = true) => {
+const harness = (retainRuns = true, parentPolicy?: (root: string, workspace: string) => FabricWritePolicy) => {
   const notices: AgentTerminalNotice[] = [];
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "steer-ended-"));
   const workspace = path.join(root, "workspace"); fs.mkdirSync(workspace);
   const records = new Map<string, AgentRunRecord>();
   const closures = new Map<string, () => void>();
+  if (parentPolicy) vi.stubEnv("PI_FABRIC_WRITE_POLICY", JSON.stringify(parentPolicy(root, workspace)));
   const launch = vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async request => {
     const args = new Map<string, string>();
     for (let i = 0; i < request.workerArguments.length; i += 2) args.set(request.workerArguments[i]!, request.workerArguments[i + 1]!);
@@ -52,7 +54,7 @@ const harness = (retainRuns = true) => {
       finalAnswerReceipt: { id: receipt.id, recordedAt: receipt.recordedAt } });
     return receipt;
   };
-  return { manager, root, launch, records, notices, finish, close: (id: string) => closures.get(id)!() };
+  return { manager, root, workspace, launch, records, notices, finish, close: (id: string) => closures.get(id)!() };
 };
 const waitUntil = async (condition: () => boolean) => {
   for (let i = 0; i < 200 && !condition(); i++) await new Promise(resolve => setTimeout(resolve, 10));
@@ -206,7 +208,7 @@ describe("steer/followUp after an ordinary Pi task's final answer", () => {
     const result = await h.manager.wait(queued.id, { timeoutMs: 5000 });
     expect(result).toMatchObject({ status: "failed", error: expect.stringContaining("after ctl creation") });
     if (remove) {
-      expect(remove.mock.calls.map(call => call[0]).filter(target => target === control || target === directory)).toEqual([control, directory]);
+      expect(remove.mock.calls.map(call => call[0]).filter(target => target === control || target === directory)).toEqual([directory, control]);
       expect(fs.existsSync(control)).toBe(true); expect(fs.existsSync(directory)).toBe(true);
       remove.mockRestore();
     } else {
@@ -253,6 +255,40 @@ describe("steer/followUp after an ordinary Pi task's final answer", () => {
       name: "FabricTaskControlDirectoryError", code: "FABRIC_TASK_CONTROL_UNSAFE", message: expect.stringContaining("overlaps writable root"),
     });
     expect(launch).not.toHaveBeenCalled();
+  });
+
+  it("refuses inherited parent write roots that overlap the protected control namespace", async () => {
+    const h = harness(true, root => ({ readOnly: false, writableRoots: [root], shell: "deny" }));
+    try {
+      await expect(h.manager.spawn({ task: "inherited unsafe root", transport: "process" })).rejects.toMatchObject({
+        name: "FabricTaskControlDirectoryError", code: "FABRIC_TASK_CONTROL_UNSAFE", message: expect.stringContaining("overlaps writable root"),
+      });
+      expect(h.launch).not.toHaveBeenCalled();
+    } finally { vi.unstubAllEnvs(); }
+  });
+
+  it("inherits a safe parent policy through the real manager worker arguments", async () => {
+    const h = harness(true, (_root, workspace) => ({ readOnly: false, writableRoots: [workspace], shell: "deny" }));
+    try {
+      const handle = await h.manager.spawn({ task: "safe inherited layout", transport: "process" });
+      const args = h.launch.mock.calls[0]![0].workerArguments;
+      const policyIndex = args.indexOf("--write-policy");
+      expect(policyIndex).toBeGreaterThanOrEqual(0);
+      const forwarded = JSON.parse(args[policyIndex + 1]!) as FabricWritePolicy;
+      expect(forwarded).toEqual({ readOnly: false, writableRoots: [h.workspace], shell: "deny" });
+      const statusIndex = args.indexOf("--status-file");
+      const runDirectory = path.dirname(args[statusIndex + 1]!);
+      const controls = taskControlDirectory(runDirectory);
+      expect(fs.existsSync(controls)).toBe(true);
+      const controlParent = path.dirname(controls);
+      expect(forwarded.writableRoots.some(root => {
+        const relative = path.relative(root, controlParent);
+        return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+      })).toBe(false);
+      expect(path.dirname(controls)).toBe(h.root);
+      h.finish(handle.id, "done"); h.close(handle.id);
+      expect(await h.manager.wait(handle.id, { timeoutMs: 1000 })).toMatchObject({ status: "completed", text: "done" });
+    } finally { vi.unstubAllEnvs(); }
   });
 
   it("allows default unconfined tasks with runs under cwd, keeping Fabric-owned private control directories", async () => {

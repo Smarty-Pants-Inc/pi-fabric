@@ -110,6 +110,16 @@ describe("terminal-answer retention custody", () => {
     fs.rmSync(taskSteerFile(f.run));
     expect(canRemoveTerminalRun(f.run)).toBe(false);
   });
+  it("retains unread admission debt even without a final answer or any consumption registry", () => {
+    const f = fixture();
+    fs.renameSync(path.join(f.ctl, "final-answer.json"), path.join(f.root, "held-final-answer.json"));
+    expect(canRemoveTerminalRun(f.run)).toBe(false);
+    writeJsonAtomic(path.join(f.ctl, "terminal-controls", `${f.id}.json`), { ...f.control, state: "delivered" });
+    expect(canRemoveTerminalRun(f.run)).toBe(true);
+    const other = "unread-admission";
+    fs.appendFileSync(taskSteerFile(f.run), JSON.stringify({ id: other, type: "steer", provenance: f.control.provenance }) + "\n");
+    expect(canRemoveTerminalRun(f.run)).toBe(false);
+  });
   it("fails closed for unknown rows and does not normalize malformed provenance into anonymous consumption", () => {
     const f = fixture();
     const admission = readTerminalAdmission(f.run, f.id)!;

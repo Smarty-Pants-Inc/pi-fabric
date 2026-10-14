@@ -50,6 +50,10 @@ export const legacyRunTreeProof = async (directory: string, now: number, ageMs: 
   let rootRecord: { status: string; finishedAt: number } | undefined;
   const walk = async (dir: string, depth: number): Promise<void> => {
     if (depth > 32 || ++count > 4096) throw new Error("tree limit");
+    // This old-layout path renames only the run. Any sibling (even a dangling
+    // link) is protected-layout custody and cannot be stranded by that rename.
+    try { await fsp.lstat(dir + ".ctl"); throw new Error("paired task controls require ordinary retention"); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
     const dirStat = await owned(dir);
     if (!dirStat.isDirectory() || (dirStat.mode & 0o077) !== 0) throw new Error("unsafe run directory");
     identities.push([path.relative(directory, dir), dirStat.dev, dirStat.ino, dirStat.mode]);
@@ -58,7 +62,7 @@ export const legacyRunTreeProof = async (directory: string, now: number, ageMs: 
     const record = JSON.parse(await fsp.readFile(statusFile, "utf8"));
     if (!record || !terminal.has(record.status) || !Number.isSafeInteger(record.finishedAt) || record.finishedAt < 0 ||
         now - record.finishedAt < ageMs || record.cleanupPending || record.pending || record.queuedArchiveCommitted === false ||
-        (record.transport !== undefined && record.transport !== "process")) throw new Error("terminal/age/custody proof missing");
+        (record.transport !== undefined && record.transport !== "process") || "taskControlLayout" in record) throw new Error("terminal/age/custody proof missing");
     if (depth === 0) {
       if (record.sessionId !== undefined || record.processStartTime !== undefined) throw new Error("not a legacy run");
       rootRecord = { status: record.status, finishedAt: record.finishedAt };
@@ -93,6 +97,8 @@ export const legacyRunTreeProof = async (directory: string, now: number, ageMs: 
     if (!Number.isSafeInteger(ageMs) || ageMs < 0) return;
     if (!await unaliasedDirectory(directory)) return;
     await walk(directory, 0);
+    try { await fsp.lstat(directory + ".ctl"); return; }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
     if (!await unaliasedDirectory(directory)) return;
     identities.sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)));
     return rootRecord && { ...rootRecord, fingerprint: JSON.stringify(identities) };
@@ -189,6 +195,10 @@ export class ResidentLegacyRunArchive {
         if ((await legacyRunTreeProof(source, now, this.policy.legacyRunArchiveAgeMs ?? DEFAULT_AGE_MS))?.fingerprint !== run.proof.fingerprint) continue;
         if (await this.#referenceFence(ids) !== fence || this.options.isRetained(run.id) || this.#closed || !this.#enabled()) break;
         if (!await unaliasedDirectory(runs) || !await unaliasedDirectory(batch)) throw new Error("run namespace changed");
+        // Recheck absence after the async reference/namespace fences too. No
+        // pair-rename protocol: migrated sources stay with their sibling.
+        try { await fsp.lstat(source + ".ctl"); continue; }
+        catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
         // No copy fallback on EXDEV, no compression and no source unlink.
         await fsp.rename(source, path.join(batch, run.id));
         moved.push(run); this.health.archived++;

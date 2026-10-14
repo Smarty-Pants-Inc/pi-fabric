@@ -1,7 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { writeFileAtomic } from "../core/atomic-write.js";
-import { readTaskControlJson, MAX_TASK_CONTROL_ROWS, FabricTaskControlDirectoryError, withTaskControlDirectory } from "./terminal-answer.js";
+import { readTaskControlJson, readTaskControlJsonAt, writeTaskControlJson, MAX_TASK_CONTROL_ROWS, FabricTaskControlDirectoryError, withTaskControlReadDirectory, withLegacyTaskControlDirectory, withTaskControlSubdirectory } from "./terminal-answer.js";
 import { copyFabricProvenance, type FabricTurnProvenance } from "../fabric-provenance.js";
 
 export interface TerminalControl {
@@ -17,13 +16,11 @@ const controlFile = (directory: string, id: string): string => {
   if (!validId(id)) throw new Error("Invalid terminal control identity");
   return path.join(directory, "terminal-controls", id + ".json");
 };
-export const trackTerminalControl = (directory: string, control: Omit<TerminalControl, "state">): void => withTaskControlDirectory(directory, pinned => {
-  // The durable atomic writer fsyncs ancestors; /proc is not fsync-able.
-  // Resolve the validated host-owned fd to its canonical namespace for writes.
-  const file = controlFile(fs.realpathSync(pinned), control.id);
-  if (fs.existsSync(file)) return; // A replay never resurrects consumed/refused input.
-  writeFileAtomic(file, JSON.stringify({ ...control, state: "queued" }), { durable: true });
-});
+export const trackTerminalControl = (directory: string, control: Omit<TerminalControl, "state">): void => {
+  controlFile(directory, control.id); // validate before publication
+  if (readTerminalControl(directory, control.id)) return; // never resurrect consumed/refused input
+  writeTaskControlJson(directory, path.join("terminal-controls", control.id + ".json"), { ...control, state: "queued" });
+};
 export const readTerminalControl = (directory: string, id: string): TerminalControl | undefined => {
   if (!validId(id)) return;
   try {
@@ -37,25 +34,35 @@ export const readTerminalControl = (directory: string, id: string): TerminalCont
 };
 export const settleTerminalControl = (directory: string, id: string, state: "delivered" | "refused", reason?: "run-ended"): void => {
   const item = readTerminalControl(directory, id);
-  if (item?.state === "queued") withTaskControlDirectory(directory, pinned => writeFileAtomic(controlFile(fs.realpathSync(pinned), id),
-    JSON.stringify({ ...item, state, ...(state === "refused" && reason ? { reason } : {}) }), { durable: true }));
+  if (item?.state === "queued") writeTaskControlJson(directory, path.join("terminal-controls", id + ".json"),
+    { ...item, state, ...(state === "refused" && reason ? { reason } : {}) });
 };
 export const queuedTerminalControls = (directory: string): TerminalControl[] => {
   try {
-    return withTaskControlDirectory(directory, pinned => {
-      const entries = fs.opendirSync(path.join(pinned, "terminal-controls"), { bufferSize: 32 }), queued: TerminalControl[] = [];
-      let count = 0;
-      try {
-        for (;;) {
-          const entry = entries.readSync();
-          if (!entry) return queued;
-          if (++count > MAX_TASK_CONTROL_ROWS) throw new FabricTaskControlDirectoryError("Terminal control registry exceeds its entry bound");
-          if (!entry.isFile() || !entry.name.endsWith(".json") || !validId(entry.name.slice(0, -5))) continue;
-          const item = readTerminalControl(directory, entry.name.slice(0, -5));
-          if (item?.state === "queued") queued.push(item);
-        }
-      } finally { entries.closeSync(); }
-    });
+    const controls = new Map<string, TerminalControl>();
+    let count = 0, legacySelected = false;
+    const scan = (pinned: string): void => {
+      try { withTaskControlSubdirectory(pinned, "terminal-controls", parent => {
+        // Keep the namespace fd alive through enumeration AND row reads.
+        const entries = fs.opendirSync(parent, { bufferSize: 32 });
+        try {
+          for (;;) {
+            const entry = entries.readSync();
+            if (!entry) return;
+            if (++count > MAX_TASK_CONTROL_ROWS) throw new FabricTaskControlDirectoryError("Terminal control registry exceeds its entry bound");
+            const id = entry.name.slice(0, -5);
+            if (!entry.isFile() || !entry.name.endsWith(".json") || !validId(id) || controls.has(id)) continue;
+            let item: TerminalControl | undefined;
+            try { item = readTaskControlJsonAt<TerminalControl>(parent, entry.name); }
+            catch (error) { if (error instanceof SyntaxError) throw error; continue; /* unsafe rows prove no queued input */ }
+            if (item?.id === id && ["steer", "followUp"].includes(item.delivery) && ["queued", "delivered", "refused"].includes(item.state)) controls.set(id, item);
+          }
+        } finally { entries.closeSync(); }
+      }); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+    };
+    withTaskControlReadDirectory(directory, pinned => { legacySelected = fs.realpathSync(pinned) === path.resolve(directory); scan(pinned); });
+    if (!legacySelected) withLegacyTaskControlDirectory(directory, scan);
+    return [...controls.values()].filter(item => item.state === "queued");
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
     throw error;

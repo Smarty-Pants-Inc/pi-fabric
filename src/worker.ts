@@ -51,7 +51,8 @@ import type { ActorContextReseed } from "./worker/context-admission.js";
 import { readPiSessionHeader } from "./core/pi-session-header.js";
 import { savePiSettlementReceipt } from "./worker/settlement-receipt.js";
 import { syncPathNamespace } from "./core/atomic-write.js";
-import { finalAssistantText, readFinalAnswerReceipt, openTaskControlFile, taskControlFileStat, withTaskFinalAnswerLock, type FinalAnswerReceipt } from "./worker/terminal-answer.js";
+import { finalAssistantText, readFinalAnswerReceipt, openTaskControlFile, openLegacyTaskControlFile, withTaskControlDirectory, taskControlFileStat, withTaskFinalAnswerLock, initializeTaskControlDirectory, assertTaskControlWriteRoots, taskSteerFile, type FinalAnswerReceipt } from "./worker/terminal-answer.js";
+import { readWritePolicy } from "./agents/child-env.js";
 import { MAX_STEER_BYTES, MAX_STEER_CONTROLS } from "./agents/terminal-notices.js";
 import { queuedTerminalControls, readTerminalControl, settleTerminalControl, trackTerminalControl, type TerminalControl } from "./worker/terminal-controls.js";
 import { DEFAULT_BASH_IDLE_S } from "./guards/actor-bash-timeout.js";
@@ -361,6 +362,12 @@ const main = async (): Promise<void> => {
     writeRunRecord,
   } = loadedRunRecordHelpers;
   const options = optionHelpers.parseWorkerOptions();
+  const ownRunDirectory = path.dirname(options.statusFile);
+  // Direct activation/ephemeral workers bypass AgentManager. Bootstrap before
+  // any child, status replacement, steering read or final-answer lock.
+  assertTaskControlWriteRoots(ownRunDirectory, options.cwd, readWritePolicy(options.writePolicy));
+  initializeTaskControlDirectory(ownRunDirectory);
+  if (options.steerFile) options.steerFile = taskSteerFile(ownRunDirectory);
   const isPi = PI_BACKED_RUNNERS.has(options.runner);
   const sessionExporter = options.sessionExportFile
     ? new sessionExportHelpers.SessionExporter({
@@ -389,6 +396,7 @@ const main = async (): Promise<void> => {
   mkdirPrivate(deliveryDirectory, runRoot);
   const images = readImages(options.imagesFile);
   const record = createRunningRecord(options, task, thinking, Date.now());
+  record.taskControlLayout = "sibling-v1";
   // pi-fabric#1034: every Pi child's record carries a receipt from its creation, so an early refusal or failure
   // record has the empty one too (round-2 review P2).
   if (isPi) record.writeReceipt = { paths: [], commands: [] };
@@ -2188,6 +2196,8 @@ const main = async (): Promise<void> => {
   let skippingOversizedSteerLine = false;
   let steerCommands = 0;
   let steerJournalInvalid = false;
+  let legacySteerComplete = false;
+  let legacySteerBytes = 0;
   const refuseSteerJournal = (error: unknown): void => {
     steerJournalInvalid = true;
     appendLog(`${JSON.stringify({ type: "fabric_steer_journal_invalid", code: "FABRIC_STEER_JOURNAL_INVALID", message: String(error) })}\n`);
@@ -2200,23 +2210,36 @@ const main = async (): Promise<void> => {
     if (persistentPiTask && piRetrySdk && !endedReceipt) endedReceipt = readFinalAnswerReceipt(path.dirname(options.statusFile), options.id);
     if (!options.steerFile || (!endedReceipt && (terminalStatus || (isPi &&
         (!piControlLive || childExited || !modelControl.ready || !child.stdin?.writable || child.stdin.writableEnded || child.stdin.destroyed))))) return;
-    let descriptor: number | undefined;
+    let descriptor: number | undefined, legacy = false;
     try {
-      descriptor = openTaskControlFile(options.steerFile);
+      if (!legacySteerComplete) {
+        try { descriptor = openLegacyTaskControlFile(ownRunDirectory, "steer.jsonl"); }
+        catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+        if (descriptor === undefined) legacySteerComplete = true;
+        else legacy = true;
+      }
+      descriptor ??= withTaskControlDirectory(ownRunDirectory, directory => openTaskControlFile(path.join(directory, "steer.jsonl")));
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") refuseSteerJournal(error);
       return;
     }
     try {
       const journal = taskControlFileStat(descriptor);
-      if (journal.size > BigInt(MAX_STEER_BYTES)) throw new Error("Steering journal exceeds its total byte bound");
+      if (journal.size + BigInt(legacy ? 0 : legacySteerBytes) > BigInt(MAX_STEER_BYTES)) throw new Error("Steering journal exceeds its total byte bound");
       const size = Number(journal.size);
       if (size < steerOffset) {
         steerOffset = 0;
         steerRemainder = Buffer.alloc(0);
         skippingOversizedSteerLine = false;
       }
-      if (size <= steerOffset) return;
+      if (size <= steerOffset) {
+        if (legacy) {
+          if (steerRemainder.length || skippingOversizedSteerLine) throw new Error("Incomplete legacy steering journal");
+          legacySteerComplete = true; legacySteerBytes = size;
+          steerOffset = 0; steerRemainder = Buffer.alloc(0); skippingOversizedSteerLine = false;
+        }
+        return;
+      }
       const length = Math.min(size - steerOffset, STEER_READ_CHUNK_BYTES);
       const buffer = Buffer.allocUnsafe(length);
       const bytesRead = fs.readSync(descriptor, buffer, 0, length, steerOffset);
@@ -2271,6 +2294,10 @@ const main = async (): Promise<void> => {
               if (control?.state === "queued") refuseTerminalControl(control, endedReceipt.id);
             }
             continue;
+          }
+          if (persistentPiTask && piRetrySdk && (command.type === "steer" || command.type === "follow_up") && typeof command.id === "string") {
+            const prior = readTerminalControl(ownRunDirectory, command.id);
+            if (prior && prior.state !== "queued") continue; // legacy/native resume never replays consumed input
           }
           if (options.runner === "claude") {
             if (claudeCloseTimer) clearTimeout(claudeCloseTimer);

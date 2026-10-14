@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agents/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import type { AgentRunRecord } from "../src/agents/types.js";
+import { taskControlDirectory } from "../src/worker/terminal-answer.js";
 
 const roots: string[] = [];
 const managers: AgentManager[] = [];
@@ -21,7 +22,7 @@ afterEach(async () => {
 // rescue imports. Pi managed installs deliberately omit host-provided peers.
 const installation = (text = "hi") => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-worker-install-"));
-  roots.push(root);
+  roots.push(root, taskControlDirectory(root));
   fs.cpSync(path.resolve("dist"), path.join(root, "dist"), { recursive: true });
   fs.writeFileSync(path.join(root, "package.json"), '{"type":"module"}');
   fs.mkdirSync(path.join(root, "node_modules"));
@@ -55,10 +56,29 @@ const installation = (text = "hi") => {
 
 describe("standalone worker without Pi host peers", () => {
   it("boots a published worker without typebox or Pi packages installed", async () => {
-    const { run } = installation();
+    const { root, run } = installation();
+    // Raw worker invocation deliberately bypasses AgentManager: startup owns
+    // legitimate standalone initialization, not a fixture-provided workaround.
+    expect(fs.existsSync(taskControlDirectory(root))).toBe(false);
     const { child, record } = await run();
     expect(child, child.stderr).toMatchObject({ exitCode: 0 });
-    expect(record).toMatchObject({ status: "completed", text: "hi" });
+    expect(record).toMatchObject({ status: "completed", text: "hi", taskControlLayout: "sibling-v1" });
+    expect(fs.statSync(taskControlDirectory(root)).isDirectory()).toBe(true);
+    if (process.platform !== "win32") expect(fs.statSync(taskControlDirectory(root)).mode & 0o777).toBe(0o700);
+  });
+
+  it("initializes direct activation controls before refusing an unadmitted native child", async () => {
+    const { root, run } = installation();
+    expect(fs.existsSync(taskControlDirectory(root))).toBe(false);
+    const { child, record } = await run({
+      "actor-id": "standalone-activation", "activation-id": "activation-probe",
+      "session-file": path.join(root, "actor.jsonl"), "inference-context": "activation",
+    });
+    expect(record, child.stderr).toMatchObject({ status: "failed", taskControlLayout: "sibling-v1" });
+    expect(record?.error).toMatch(/activation window|before.*admission|model selection/);
+    expect(fs.statSync(taskControlDirectory(root)).isDirectory()).toBe(true);
+    if (process.platform !== "win32") expect(fs.statSync(taskControlDirectory(root)).mode & 0o777).toBe(0o700);
+    expect(fs.readFileSync(path.join(root, "events.jsonl"), "utf8")).not.toContain('"type":"prompt"');
   });
 
   it.each([

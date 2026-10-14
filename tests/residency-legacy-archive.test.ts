@@ -14,6 +14,7 @@ import { AgentManager } from "../src/agents/manager.js";
 import { DEFAULT_FABRIC_CONFIG, normalizeFabricConfig } from "../src/config.js";
 import { RetentionReferenceScan } from "../src/storage/reference-scan.js";
 import { ResidentLegacyRunArchive, legacyRunTreeProof } from "../src/residency/legacy-run-archive.js";
+import { initializeTaskControlDirectory, taskControlDirectory } from "../src/worker/terminal-answer.js";
 
 const roots: string[] = [];
 const temporary = () => { const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-legacy-archive-")); roots.push(root); return root; };
@@ -328,6 +329,46 @@ describe.skipIf(process.platform === "win32")("bounded retention reference prepa
 });
 
 describe("rename-only legacy run retention", () => {
+  it.skipIf(process.platform === "win32")("keeps migrated controls paired while retaining the original no-sibling legacy rename path", async () => {
+    const root = temporary(), ordinary = run(root, "ordinary"), migrated = run(root, "migrated", { runner: "pi" });
+    initializeTaskControlDirectory(migrated);
+    const sibling = taskControlDirectory(migrated), marker = fs.readFileSync(path.join(sibling, ".legacy-read.json"));
+    const before = fs.readFileSync(path.join(migrated, "events.jsonl"));
+    const inode = fs.statSync(ordinary).ino;
+    expect(await legacyRunTreeProof(ordinary, now, 48 * 60 * 60 * 1000)).toBeDefined();
+    expect(await legacyRunTreeProof(migrated, now, 48 * 60 * 60 * 1000)).toBeUndefined();
+    const missingProtected = run(root, "missing-protected", { taskControlLayout: "sibling-v1" });
+    expect(await legacyRunTreeProof(missingProtected, now, 48 * 60 * 60 * 1000)).toBeUndefined();
+    const archive = archiver(root);
+    try { await sweepArchive(archive, now, 32, 1000); }
+    finally { await archive.close(); }
+    expect(archive.health.error).toBe(""); expect(archive.health.archived).toBe(1);
+    expect(fs.readFileSync(path.join(sibling, ".legacy-read.json"))).toEqual(marker);
+    expect(fs.readFileSync(path.join(migrated, "events.jsonl"))).toEqual(before);
+    expect(fs.existsSync(missingProtected)).toBe(true);
+    expect(retiredRuns(root).map(directory => path.basename(directory))).toEqual(["ordinary"]);
+    expect(fs.statSync(retiredRuns(root)[0]!).ino).toBe(inode);
+  });
+
+  it.skipIf(process.platform === "win32")("rechecks sibling absence after asynchronous retirement namespace fences", async () => {
+    const root = temporary(), source = run(root, "late-controls");
+    const realpath = fsp.realpath; let created = false;
+    vi.spyOn(fsp, "realpath").mockImplementation(async (...args: Parameters<typeof realpath>) => {
+      if (!created && String(args[0]).includes(`${path.sep}slice-`)) {
+        created = true; fs.mkdirSync(taskControlDirectory(source), { mode: 0o700 });
+        fs.writeFileSync(path.join(taskControlDirectory(source), "original-control"), "retained custody");
+      }
+      return realpath(...args);
+    });
+    const archive = archiver(root);
+    try { await sweepArchive(archive, now, 32, 1000); }
+    finally { await archive.close(); }
+    expect(created).toBe(true); expect(archive.health.archived).toBe(0);
+    expect(fs.existsSync(source)).toBe(true);
+    expect(fs.readFileSync(path.join(taskControlDirectory(source), "original-control"), "utf8")).toBe("retained custody");
+    expect(retiredRuns(root)).toEqual([]);
+  });
+
   it.skipIf(process.platform !== "win32")("keeps main silent on native Windows, including disabled policy and repeated calls (smarty-dev#5132)", async () => {
     const root = temporary(), directory = run(root, "kept");
     const policy = { legacyRunArchiveEnabled: false };

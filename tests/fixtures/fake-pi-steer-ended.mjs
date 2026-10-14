@@ -30,7 +30,7 @@ const recordReceipt = () => {
   if (terminal) receipt = terminal.saveFinalAnswerReceipt(runDirectory, runId, "AUTHORIZED_FINAL_ANSWER");
   else {
     receipt = { version: 1, id: randomUUID(), runId, recordedAt: Date.now(), text: "AUTHORIZED_FINAL_ANSWER" };
-    const temporary = path.join(runDirectory, `.final-answer.${process.pid}.tmp`);
+    const temporary = path.join(controlDirectory, `.final-answer.${process.pid}.tmp`);
     fs.writeFileSync(temporary, JSON.stringify(receipt));
     fs.renameSync(temporary, path.join(controlDirectory, "final-answer.json"));
   }

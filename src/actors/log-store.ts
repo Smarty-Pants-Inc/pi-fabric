@@ -5,7 +5,216 @@ import type { FabricMeshConfig, FabricRetentionConfig } from "../config.js";
 import type { MeshStore } from "../mesh/store.js";
 import { pruneActorRunArchives, pruneActorSessionBackups } from "../storage/retention.js";
 import { closeDirectory, openPrivateDir, writeArchiveFile, type PrivateDirectory } from "../storage/private-dir.js";
+import { MAX_STEER_BYTES, MAX_STEER_ENTRY_BYTES, terminalAdmissionFromEntry, terminalControlMatchesAdmission, terminalSenderMatches, type TerminalAdmission } from "../agents/terminal-notices.js";
+import { MAX_FINAL_ANSWER_BYTES, MAX_TASK_CONTROL_BYTES, MAX_TASK_CONTROL_ROWS, isTaskControlDirectoryEntry, openTaskControlFile, readFinalAnswerReceipt, readTaskRunStatus, taskControlDirectory, withLegacyTaskControlDirectory, withTaskControlDirectory, withTaskControlReadDirectory, withTaskControlSubdirectory } from "../worker/terminal-answer.js";
 import type { FabricActorMessage } from "./types.js";
+
+const controlFiles = new Set(["steer.jsonl", "final-answer.json"]);
+const controlDirectories = new Set(["terminal-controls", "terminal-notices"]);
+/** Preserve bounded original bytes, never copy the inode-bound legacy grant.
+ * Eligible legacy evidence is promoted into the protected archive namespace.
+ * Journals stay legacy-first; only matching delivered overlays replace old debt.
+ * Duplicate final answers always refuse, even when their bytes are identical. */
+const archiveControls = (runDirectory: string): Map<string, Buffer> | undefined => {
+  const sibling = !!fs.lstatSync(taskControlDirectory(runDirectory), { throwIfNoEntry: false });
+  const local = [...controlFiles, ...controlDirectories].some(name => fs.lstatSync(path.join(runDirectory, name), { throwIfNoEntry: false }));
+  // The shared status reader also proves the source root owned and unaliased.
+  // Keep the older receipt-only / opaque-status archive behavior when there are
+  // no controls, but never excuse an unsafe root or a marked missing sibling.
+  try {
+    const record = readTaskRunStatus<Record<string, unknown>>(runDirectory);
+    if (!sibling && !local && record && !("taskControlLayout" in record)) return;
+  } catch (error) {
+    if (!sibling && !local && (error instanceof SyntaxError || (error as NodeJS.ErrnoException).code === "ENOENT")) return;
+    throw error;
+  }
+  const result = new Map<string, Buffer>(), overlays = new Map<string, [Buffer, Buffer]>();
+  let entries = 0, bytes = 0, artifactBytes = 0;
+  const read = (directory: string, name: string, relative = name): void => {
+    if (++entries > MAX_TASK_CONTROL_ROWS * 3 + 2) throw new Error("Archive control entry bound exceeded");
+    const max = relative === "final-answer.json" ? MAX_FINAL_ANSWER_BYTES : relative === "steer.jsonl" ? MAX_STEER_BYTES : MAX_TASK_CONTROL_BYTES;
+    const fd = openTaskControlFile(path.join(directory, name));
+    try {
+      if (fs.fstatSync(fd).size > max) throw new Error("Archive control byte bound exceeded");
+      const buffer = Buffer.alloc(max + 1);
+      let length = 0;
+      while (length < buffer.length) {
+        const count = fs.readSync(fd, buffer, length, buffer.length - length, length);
+        if (!count) break;
+        length += count;
+      }
+      if (length > max || (bytes += length) > MAX_FINAL_ANSWER_BYTES + MAX_STEER_BYTES * 5) throw new Error("Archive control byte bound exceeded");
+      // Count both copies BEFORE normalization: collapsing whitespace or old
+      // debt must not turn retention's oversized source into new authority.
+      if (path.dirname(relative) !== "." && (artifactBytes += length) > MAX_STEER_BYTES * 4) throw new Error("Archive terminal artifact byte bound exceeded");
+      const content = Buffer.from(buffer.subarray(0, length)), existing = result.get(relative);
+      if (existing) {
+        if (relative === "steer.jsonl") {
+          if (existing.length && existing.at(-1) !== 10 || content.length && content.at(-1) !== 10 || existing.length + content.length > MAX_STEER_BYTES) {
+            throw new Error("Invalid combined archive steering journal");
+          }
+          result.set(relative, Buffer.concat([existing, content]));
+        } else if (relative === "final-answer.json") throw new Error(`Conflicting legacy archive control ${relative}`);
+        else overlays.set(relative, [existing, content]);
+      } else result.set(relative, content);
+    } finally { fs.closeSync(fd); }
+  };
+  const scan = (directory: string, legacy: boolean, markerAllowed: boolean): void => {
+    const cursor = fs.opendirSync(directory, { bufferSize: 32 });
+    try {
+      let seen = 0;
+      for (;;) {
+        const entry = cursor.readSync();
+        if (!entry) break;
+        if (++seen > MAX_TASK_CONTROL_ROWS * 3 + 32) throw new Error("Archive control namespace bound exceeded");
+        if (entry.name === ".legacy-read.json" && !legacy && markerAllowed) continue;
+        if (controlFiles.has(entry.name)) { read(directory, entry.name); continue; }
+        if (controlDirectories.has(entry.name)) {
+          withTaskControlSubdirectory(directory, entry.name, child => {
+            const children = fs.opendirSync(child, { bufferSize: 32 });
+            try {
+              for (;;) {
+                const item = children.readSync();
+                if (!item) break;
+                const pattern = entry.name === "terminal-controls" ? /^[a-zA-Z0-9_-]{1,200}\.json$/ : /^[a-zA-Z0-9_-]{1,200}\.json(?:\.delivered)?$/;
+                if (!pattern.test(item.name)) throw new Error("Unknown archive control artifact");
+                read(child, item.name, path.join(entry.name, item.name));
+              }
+            } finally { children.closeSync(); }
+          });
+          continue;
+        }
+        if (!legacy) throw new Error(`Unknown archive control artifact ${entry.name}`);
+      }
+    } finally { cursor.closeSync(); }
+  };
+  withTaskControlReadDirectory(runDirectory, selected => {
+    if (!sibling) { scan(selected, true, false); return; }
+    const legacy = withLegacyTaskControlDirectory(runDirectory, directory => { scan(directory, true, false); return true; }) === true;
+    if (!legacy && local) throw new Error("Unproven legacy archive controls");
+    scan(selected, false, legacy);
+  });
+  if (overlays.size || result.has("steer.jsonl")) {
+    const admissions = new Map<string, TerminalAdmission>(), journal = result.get("steer.jsonl")?.toString("utf8") ?? "";
+    if (journal && !journal.endsWith("\n")) throw new Error("Incomplete archive steering journal");
+    let rows = 0;
+    for (const line of journal.split("\n")) {
+      if (!line.trim()) continue;
+      if (++rows > MAX_TASK_CONTROL_ROWS || Buffer.byteLength(line) > MAX_STEER_ENTRY_BYTES) throw new Error("Archive steering row bound exceeded");
+      const entry = JSON.parse(line);
+      if (entry?.type !== "steer" && entry?.type !== "follow_up") continue;
+      const admission = terminalAdmissionFromEntry(entry);
+      if (!admission || admissions.has(admission.id)) throw new Error("Invalid or duplicate archive admission");
+      admissions.set(admission.id, admission);
+    }
+    // Mirror retention's consumed legacy no-answer overlay, not a receipt claim:
+    // only old queued debt plus an independently matching delivered sibling.
+    const record = overlays.size ? readTaskRunStatus<{ id?: string; status?: string; finalAnswerReceipt?: { id: string; recordedAt: number } }>(runDirectory) : undefined;
+    const answer = typeof record?.id === "string" ? readFinalAnswerReceipt(runDirectory, record.id) : undefined;
+    const noAnswer = !!record && typeof record.id === "string" && !('finalAnswerReceipt' in record) &&
+      !result.has("final-answer.json") && ["stopped", "failed"].includes(record.status ?? "");
+    if (noAnswer && [...result.keys()].some(relative => path.dirname(relative) === "terminal-notices")) {
+      throw new Error("Archive no-answer overlay has terminal notices");
+    }
+    for (const [relative, [oldBytes, newBytes]] of overlays) {
+      if (!noAnswer && (!answer || record?.finalAnswerReceipt?.id !== answer.id || record.finalAnswerReceipt.recordedAt !== answer.recordedAt)) {
+        throw new Error("Archive overlay lacks its original final receipt");
+      }
+      const old = JSON.parse(oldBytes.toString("utf8")), newer = JSON.parse(newBytes.toString("utf8"));
+      const name = path.basename(relative), id = name.replace(/\.json(?:\.delivered)?$/, ""), admission = admissions.get(id);
+      if (path.dirname(relative) === "terminal-controls") {
+        const keys = ["id", "state", "delivery", "provenance", ...(noAnswer ? [] : ["reason"])];
+        if (!old || !newer || !(noAnswer ? ["queued"] : ["queued", "refused"]).includes(old.state) || newer.state !== "delivered" ||
+            Object.keys(old).some(key => !keys.includes(key)) || Object.keys(newer).some(key => !keys.includes(key)) ||
+            old.reason !== undefined && (old.state !== "refused" || old.reason !== "run-ended") || newer.reason !== undefined ||
+            !terminalControlMatchesAdmission(old, admission) || !terminalControlMatchesAdmission(newer, admission)) {
+          throw new Error(`Conflicting legacy archive control ${relative}`);
+        }
+      } else {
+        if (!answer || !admission || JSON.stringify(old) !== JSON.stringify(newer) || newer?.code !== "FABRIC_TARGET_TERMINAL" || newer.targetId !== answer.runId ||
+            newer.finalAnswerReceiptId !== answer.id || newer.messageId !== id || newer.delivery !== admission.delivery ||
+            !terminalSenderMatches(newer.sender, admission.sender)) throw new Error(`Conflicting legacy archive notice ${relative}`);
+      }
+      result.set(relative, newBytes);
+    }
+  }
+  return result;
+};
+
+/** Validate every nested pair before publication. The copy excludes ALL source
+ * control namespaces; each validated run receives a fresh protected sibling. */
+const archiveNestedControls = (runDirectory: string): Map<string, Map<string, Buffer> | undefined> => {
+  const result = new Map<string, Map<string, Buffer> | undefined>();
+  let entries = 0;
+  const visit = (run: string, depth: number): void => {
+    if (depth > 32) throw new Error("Archive nested depth bound exceeded");
+    const nested = path.join(run, "nested");
+    if (!fs.lstatSync(nested, { throwIfNoEntry: false })) return;
+    withTaskControlSubdirectory(run, "nested", directory => {
+      const cursor = fs.opendirSync(directory, { bufferSize: 32 });
+      try {
+        for (;;) {
+          const entry = cursor.readSync();
+          if (!entry) break;
+          if (++entries > MAX_TASK_CONTROL_ROWS * 3 + 32) throw new Error("Archive nested entry bound exceeded");
+          // Use the canonical path only after the held, no-follow parent check;
+          // the shared reader rejects aliases through any source symlink.
+          if (isTaskControlDirectoryEntry(nested, entry.name)) continue;
+          if (!entry.isDirectory()) throw new Error("Unsafe nested archive run");
+          const child = path.join(nested, entry.name);
+          readTaskRunStatus(child);
+          result.set(child, archiveControls(child));
+          visit(child, depth + 1);
+        }
+      } finally { cursor.closeSync(); }
+    });
+  };
+  visit(path.resolve(runDirectory), 0);
+  return result;
+};
+
+const assertArchiveRunIdentity = (dest: string, held: PrivateDirectory): void => {
+  const named = fs.lstatSync(dest), opened = held.fd === undefined ? fs.statSync(held.path) : fs.fstatSync(held.fd);
+  if (!named.isDirectory() || named.isSymbolicLink() || named.dev !== opened.dev || named.ino !== opened.ino || fs.realpathSync(dest) !== path.resolve(dest)) {
+    throw new Error(`Archive directory ${dest} changed while it was held`);
+  }
+};
+
+const writeArchivedControls = (dest: string, anchor: string, controls: Map<string, Buffer>, run: PrivateDirectory): void => {
+  assertArchiveRunIdentity(dest, run);
+  if (fs.lstatSync(taskControlDirectory(dest), { throwIfNoEntry: false })) withTaskControlDirectory(dest, () => undefined);
+  const parent = openPrivateDir(path.dirname(dest), anchor);
+  try {
+    const sibling = path.join(parent.path, path.basename(dest) + ".ctl");
+    assertArchiveRunIdentity(dest, run);
+    try { fs.mkdirSync(sibling, { mode: 0o700 }); fs.chmodSync(sibling, 0o700); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
+    assertArchiveRunIdentity(dest, run);
+    withTaskControlDirectory(dest, () => undefined);
+    if (parent.fd !== undefined) fs.fsyncSync(parent.fd);
+  } finally { parent.close(); }
+  withTaskControlDirectory(dest, (directory, fd) => {
+      assertArchiveRunIdentity(dest, run);
+      for (const [relative, bytes] of controls) {
+        const parent = path.dirname(relative);
+        const write = (at: string, parentFd: number): void => {
+          if (!writeArchiveFile({ path: at, fd: parentFd, close() {} }, path.basename(relative), { bytes }, true)) throw new Error(`Unsafe archive control ${relative}`);
+        };
+        if (parent === ".") write(directory, fd);
+        else {
+          try { fs.mkdirSync(path.join(directory, parent), { mode: 0o700 }); fs.chmodSync(path.join(directory, parent), 0o700); }
+          catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
+          withTaskControlSubdirectory(directory, parent, write);
+        }
+      }
+      if (process.platform !== "win32") fs.fsyncSync(fd);
+      const named = fs.lstatSync(taskControlDirectory(dest)), opened = fs.fstatSync(fd);
+      if (named.dev !== opened.dev || named.ino !== opened.ino) throw new Error("Archive controls changed while held");
+      assertArchiveRunIdentity(dest, run);
+      syncDirectoryChain(taskControlDirectory(dest));
+      assertArchiveRunIdentity(dest, run);
+  });
+};
 
 /** 0700 every directory of a copied tree, each through its own O_NOFOLLOW fd after fstat proves it ours; a link, a
  * file or a foreign entry is skipped, never followed (pi-fabric#875 round 1 P1-2). */
@@ -110,6 +319,8 @@ export class ActorLogStore {
       return;
     }
     try {
+      runDirectory = path.resolve(runDirectory);
+      const controls = archiveControls(runDirectory), nestedControls = archiveNestedControls(runDirectory);
       const receipt = path.join(runDirectory, "route-dispatch-receipt.json");
       if (fs.existsSync(receipt)) {
         const { readRouteDispatchReceipt } = await import("../agents/model-route.js");
@@ -120,10 +331,14 @@ export class ActorLogStore {
         if (!writeArchiveFile(held, "route-dispatch-receipt.json", { bytes: Buffer.from(JSON.stringify(source)) }, true)) {
           throw new Error(`Archive entry ${path.join(dest, "route-dispatch-receipt.json")} exists and is not our regular file`);
         }
-        const named = fs.statSync(dest), opened = fs.statSync(held.path);
-        if (named.dev !== opened.dev || named.ino !== opened.ino) throw new Error(`Archive directory ${dest} changed while it was held`);
+        assertArchiveRunIdentity(dest, held);
         syncDirectoryChain(dest);
       }
+      // The source was validated before publication. Never transport
+      // .legacy-read.json: its source inode is not the archive's.
+      assertArchiveRunIdentity(dest, held);
+      if (controls) writeArchivedControls(dest, anchor, controls, held);
+      assertArchiveRunIdentity(dest, held);
       // pi-fabric#875 round 4 SEC P1: no path write into the archive. Each entry is created O_EXCL|O_NOFOLLOW through
       // the held fd, or replaced by rename only when it is our own regular file; anything else (a symlink planted while
       // a healed directory was writable) refuses that entry, with one line, and the source is untouched.
@@ -141,13 +356,35 @@ export class ActorLogStore {
           fs.mkdirSync(path.join(held.path, "nested"), { mode: 0o700 });
           fs.chmodSync(path.join(held.path, "nested"), 0o700); // our fresh directory; a umask 0400 left 0300 (unopenable)
           if (!closeDirectory(path.join(held.path, "nested"))) throw new Error("the new nested directory is not ours");
-          fs.cpSync(nested, path.join(held.path, "nested"), { recursive: true });
-          // cpSync keeps the source's modes; a run made under umask 002 is 0775. Archived directories are 0700, like
-          // the archive itself (smarty-dev#9016), each through its own O_NOFOLLOW fd. Files keep their modes.
+          const excluded = new Set<string>();
+          for (const source of nestedControls.keys()) {
+            excluded.add(taskControlDirectory(source));
+            for (const name of [...controlFiles, ...controlDirectories]) excluded.add(path.join(source, name));
+          }
+          fs.cpSync(nested, path.join(held.path, "nested"), { recursive: true, filter: source => {
+            if (excluded.has(path.resolve(source))) return false;
+            // A marker outside a validated/excluded sibling is unknown evidence,
+            // not a grant to silently drop or transplant into another inode.
+            if (path.basename(source) === ".legacy-read.json") throw new Error("Unproven nested legacy grant");
+            const stat = fs.lstatSync(source);
+            if (stat.isSymbolicLink() || process.getuid && stat.uid !== process.getuid() ||
+                !stat.isDirectory() && (!stat.isFile() || stat.nlink !== 1)) throw new Error("Unsafe nested archive artifact");
+            return true;
+          } });
+          // Copied directories may have permissive modes; make fresh archives
+          // private before publishing protected siblings through held descriptors.
           if (process.platform !== "win32") closeDirectories(path.join(held.path, "nested"));
+          assertArchiveRunIdentity(dest, held);
+          for (const [source, childControls] of nestedControls) {
+            if (!childControls) continue;
+            const child = path.join(dest, path.relative(runDirectory, source)), childHeld = openPrivateDir(child, anchor);
+            try { writeArchivedControls(child, anchor, childControls, childHeld); }
+            finally { childHeld.close(); }
+          }
+          assertArchiveRunIdentity(dest, held);
         } catch (error) {
           if ((error as NodeJS.ErrnoException).code === "EEXIST") console.warn(`[pi-fabric] actor run ${runId}: archive nested/ exists; not copied again`);
-          /* otherwise best-effort recursive run retention */
+          else throw error; // incomplete control transfer never confirms archival
         }
       }
     } finally { held.close(); }
@@ -171,7 +408,7 @@ export class ActorLogStore {
   retainedRunIds(actor: ActorLogTarget): string[] {
     const runsDir = path.join(path.dirname(actor.sessionFile), "runs");
     try {
-      return fs.readdirSync(runsDir).sort();
+      return fs.readdirSync(runsDir).filter(name => !name.endsWith(".ctl")).sort();
     } catch {
       return [];
     }

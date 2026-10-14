@@ -4,7 +4,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { AgentManager } from "../src/agents/manager.js";
-import { taskSteerFile } from "../src/worker/terminal-answer.js";
+import { taskControlDirectory, taskSteerFile } from "../src/worker/terminal-answer.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import principalDelivery from "../src/worker/principal-delivery.js";
 import { AGENTS_ACTION_DESCRIPTORS } from "../src/providers/agents-actions.js";
@@ -74,7 +74,33 @@ describe("follow-up release checkpoint", () => {
       provenance: { v: 1, channel: "fabric", via: "followUp", sender: { id: "sender", kind: "main", verified: "mesh" } },
     }));
     await p.manager.stop(p.handle.id);
+    const admissions = fs.readFileSync(taskSteerFile(p.run), "utf8").trim().split("\n").map(line => JSON.parse(line));
+    expect(admissions).toEqual([expect.objectContaining({ id: p.receipt.messageId, type: "follow_up", followUpId: p.receipt.messageId })]);
+    expect(fs.readFileSync(path.join(p.run, "follow-ups", p.receipt.messageId + ".json.settled", "state"), "utf8")).toBe(state);
+    expect(fs.existsSync(path.join(taskControlDirectory(p.run), "terminal-controls", p.receipt.messageId + ".json"))).toBe(false);
     await expect(p.manager.checkpointForRelease()).resolves.toBeUndefined();
+  });
+  it("skips the original empty workspace but retains unknown workspace contents", async () => {
+    const p = await setup(60_000);
+    p.manager.cancelFollowUp(p.handle.id, p.receipt.messageId);
+    await p.manager.stop(p.handle.id);
+    const workspace = path.join(path.dirname(p.run), "workspace");
+    expect(fs.readdirSync(workspace)).toEqual([]);
+    await expect(p.manager.checkpointForRelease()).resolves.toBeUndefined();
+    fs.writeFileSync(path.join(workspace, "unknown.json"), "{}");
+    await expect(p.manager.checkpointForRelease()).rejects.toThrow(/unresolved run tree/);
+  });
+  it.each(["missing", ...(process.platform === "win32" ? [] : ["linked"])])("vetoes a protected run with %s controls beside the original empty workspace", async bad => {
+    const p = await setup(60_000);
+    p.manager.cancelFollowUp(p.handle.id, p.receipt.messageId);
+    await p.manager.stop(p.handle.id);
+    const status = path.join(p.run, "status.json");
+    fs.writeFileSync(status, JSON.stringify({ ...JSON.parse(fs.readFileSync(status, "utf8")), taskControlLayout: "sibling-v1" }));
+    const control = taskControlDirectory(p.run), held = path.join(p.run, "held-controls");
+    fs.renameSync(control, held);
+    if (bad === "linked") fs.symlinkSync(held, control);
+    await expect(p.manager.checkpointForRelease()).rejects.toThrow(/unresolved run tree|Task control directory/);
+    expect(fs.existsSync(held)).toBe(true);
   });
   it("vetoes checked worker exit with an expired but still queued follow-up", async () => {
     const p = await setup(); await p.ingest(); await p.manager.stop(p.handle.id);

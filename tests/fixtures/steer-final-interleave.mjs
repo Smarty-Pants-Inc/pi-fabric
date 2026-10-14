@@ -4,8 +4,10 @@ import fs from "node:fs";
 import path from "node:path";
 import { syncBuiltinESMExports } from "node:module";
 const root = process.env.STEER_ENDED_ROOT;
-if (root && path.basename(process.argv[1] ?? "") === "worker.js") {
-  const open = fs.openSync.bind(fs), write = fs.writeFileSync.bind(fs);
+if (root && process.argv.includes("--steer-file")) {
+  const open = fs.openSync.bind(fs), write = fs.writeFileSync.bind(fs), stat = fs.fstatSync.bind(fs);
+  const descriptors = new Map();
+  const physical = file => fs.realpathSync(String(file));
   const armed = path.join(root, "interleave.json");
   let fired = false;
   const pauseForReceipt = directory => {
@@ -18,25 +20,36 @@ if (root && path.basename(process.argv[1] ?? "") === "worker.js") {
     fs.appendFileSync(path.join(root, "interleave-log.jsonl"), JSON.stringify({ event: "receipt-before-injection", pid: process.pid }) + "\n");
   };
   fs.openSync = (file, ...args) => {
-    if (!fired && path.basename(String(file)) === "steer.jsonl" && (args[0] === "r" || (typeof args[0] === "number" && (args[0] & (fs.constants.O_WRONLY | fs.constants.O_RDWR)) === 0)) && fs.existsSync(armed)) {
+    const fd = open(file, ...args);
+    descriptors.delete(fd);
+    const actual = physical(process.platform === "linux" ? `/proc/self/fd/${fd}` : file);
+    if (path.basename(actual) === "steer.jsonl") descriptors.set(fd, actual);
+    return fd;
+  };
+  // Hook the held FILE's size snapshot, not a directory fd pathname which is
+  // already closed when the bounded read starts.
+  fs.fstatSync = (fd, ...args) => {
+    const before = stat(fd, ...args);
+    const file = descriptors.get(fd);
+    if (!fired && file && fs.existsSync(armed)) {
       const setting = JSON.parse(fs.readFileSync(armed, "utf8"));
       if (setting.mode === "read") {
         fired = true;
-        const before = fs.statSync(file).size;
         fs.appendFileSync(file, JSON.stringify(setting.entry) + "\n");
-        fs.appendFileSync(path.join(root, "interleave-log.jsonl"), JSON.stringify({ event: "stat-before-append", bytes: before, pid: process.pid }) + "\n");
-        pauseForReceipt(path.dirname(String(file)));
+        fs.appendFileSync(path.join(root, "interleave-log.jsonl"), JSON.stringify({ event: "stat-before-append", bytes: Number(before.size), pid: process.pid }) + "\n");
+        pauseForReceipt(path.dirname(file));
       }
     }
-    return open(file, ...args);
+    return before;
   };
   fs.writeFileSync = (file, ...args) => {
     const result = write(file, ...args);
-    if (!fired && path.basename(path.dirname(String(file))) === "deliveries" && fs.existsSync(armed)) {
+    const actual = typeof file === "number" ? descriptors.get(file) : physical(file);
+    if (!fired && actual && path.basename(path.dirname(actual)) === "deliveries" && fs.existsSync(armed)) {
       const setting = JSON.parse(fs.readFileSync(armed, "utf8"));
       if (setting.mode === "inject") {
         fired = true;
-        pauseForReceipt(path.dirname(path.dirname(String(file))) + ".ctl");
+        pauseForReceipt(path.dirname(path.dirname(actual)) + ".ctl");
       }
     }
     return result;

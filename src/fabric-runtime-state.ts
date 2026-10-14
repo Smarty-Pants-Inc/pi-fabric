@@ -933,10 +933,10 @@ export class FabricRuntimeState {
       // ops topic instead of vanishing from the directory in silence. The UI ctx is retired too.
       // Non-Main runtimes (actors, agents) heartbeat their own host lease too, so they report
       // their own participant and session, never the Main they belong to (pi-fabric#660).
-      onLifecycleLost: ticks => {
+      onLifecycleLost: (ticks, reason) => {
         void this.publishOpsEvent("ops.fabric.presence", "fabric.presence.degraded", {
           participantId: identity.kind === "main" ? mainAgentId : identity.id, sessionId, hostId, ticks,
-          reason: "no live session ctx (session replaced or reloaded)",
+          reason: reason ?? "no live session ctx (session replaced or reloaded)",
         }).catch(() => undefined);
       },
       ...(process.env.PI_FABRIC_OWNER_HOST_ID
@@ -1534,12 +1534,13 @@ export class FabricRuntimeState {
       await this.#participants.start();
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
+      const recovery = this.#participants.heartbeatArmed ? "retrying in the background" : "presence stopped; reload to retry";
       console.warn(
-        `[pi-fabric] Initial mesh publish failed (${detail}); the participant heartbeat will keep retrying.`,
+        `[pi-fabric] Initial mesh publish failed (${detail}); ${recovery}.`,
       );
       if (context.hasUI) {
         context.ui.notify(
-          `Pi Fabric could not reach the mesh (${detail}); retrying in the background.`,
+          `Pi Fabric could not reach the mesh (${detail}); ${recovery}.`,
           "warning",
         );
       }

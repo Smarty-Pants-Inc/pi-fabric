@@ -946,11 +946,16 @@ describe("stuck preparing owner notice (smarty-dev#6337)", () => {
     const s = await stuckSetup("stuck-prep");
     const since = await s.begin();
     at(since + THRESHOLD - 1_000);
+    // #11172 Decision C: real stuck-preparing deadline, not a running-item poll. E2E idle-wakes,
+    // owner fv2-11172wake/event-lead: <=1 wake/s and no non-allowed site >1/min in both modes.
+    expect(s.actors.nextStuckPreparingAt(THRESHOLD)).toBe(since + THRESHOLD);
     expect(s.actors.reportStuckPreparing(THRESHOLD)).toBe(0);
     expect(s.stuck()).toEqual([]);
     expect(s.metrics()).toEqual([]);
     at(since + THRESHOLD);
+    expect(s.actors.nextStuckPreparingAt(THRESHOLD)).toBe(since + THRESHOLD);
     expect(s.actors.reportStuckPreparing(THRESHOLD)).toBe(1);
+    expect(s.actors.nextStuckPreparingAt(THRESHOLD)).toBeUndefined();
     at(since + 3 * THRESHOLD);
     expect(s.actors.reportStuckPreparing(THRESHOLD)).toBe(0);
     expect(s.stuck()).toEqual([expect.stringContaining(
@@ -1016,6 +1021,7 @@ describe("stuck preparing owner notice (smarty-dev#6337)", () => {
     const waitingAt = s.actors.status(actor.id).preparing!.startedAt;
     expect(s.actors.reportStuckPreparing(THRESHOLD)).toBe(0);
     jump(waitingAt + 30 * MIN);
+    expect(s.actors.nextStuckPreparingAt(THRESHOLD)).toBeUndefined(); // paused clock owes no wake
     expect(s.actors.reportStuckPreparing(THRESHOLD)).toBe(0);
     expect(stuck()).toEqual([]);
     // The permit arrives; model preparation then hangs in launch.
@@ -1023,6 +1029,9 @@ describe("stuck preparing owner notice (smarty-dev#6337)", () => {
     await waitFor(() => s.actors.status(actor.id).status === "preparing" && s.actors.status(actor.id).preparing?.phase === "launch");
     const admittedAt = s.actors.status(actor.id).preparing!.startedAt;
     expect(admittedAt).toBeGreaterThanOrEqual(waitingAt + 30 * MIN);
+    const dueAt = s.actors.nextStuckPreparingAt(THRESHOLD)!;
+    expect(dueAt).toBeGreaterThan(admittedAt + MIN);
+    expect(dueAt).toBeLessThanOrEqual(admittedAt + 2 * MIN + 1_000);
     expect(s.actors.reportStuckPreparing(THRESHOLD)).toBe(0); // About 8 min of preparation, not 38.
     jump(admittedAt + MIN);
     expect(s.actors.reportStuckPreparing(THRESHOLD)).toBe(0); // About 9 min: binding time is kept, the wait is not.

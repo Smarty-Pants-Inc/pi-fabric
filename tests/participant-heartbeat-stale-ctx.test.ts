@@ -13,7 +13,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
-import { ParticipantDirectory } from "../src/topology/participant-directory.js";
+import { PARTICIPANT_HEARTBEAT_MS, ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { readHostLeases } from "../src/topology/host-leases.js";
 import type { FabricParticipantRecord } from "../src/topology/types.js";
 
@@ -37,6 +37,26 @@ const lines = (warn: ReturnType<typeof vi.spyOn>): string[] =>
   warn.mock.calls.map((call: unknown[]) => call.map(String).join(" "));
 const staleFailures = (warn: ReturnType<typeof vi.spyOn>): string[] => lines(warn).filter((line) => /ctx is stale/.test(line));
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// smarty-dev#11172 moved the default participant heartbeat to 60 s (TTL 180 s, confirmation 120 s).
+// The default-cadence cases below wait for a successor's renewal within a few seconds, so only the
+// ParticipantDirectory #armHeartbeat interval physically fires every TEST_PHYSICAL_HEARTBEAT_MS.
+// Every directory keeps the production 60 s heartbeat, 180 s lease and 120 s confirmation
+// arithmetic: no heartbeatMs option (which would also select the legacy 15 s TTL), no fake clock.
+// The compiled dist host loaded in-process calls the same global setInterval, so it is redirected too.
+const TEST_PHYSICAL_HEARTBEAT_MS = 5_000;
+const redirectParticipantHeartbeat = () => {
+  const realSetInterval = globalThis.setInterval;
+  let redirected = 0;
+  const spy = vi.spyOn(globalThis, "setInterval").mockImplementation(((handler: () => void, delay?: number, ...args: unknown[]) => {
+    if (delay === PARTICIPANT_HEARTBEAT_MS && new Error().stack?.includes("armHeartbeat")) {
+      redirected++;
+      delay = TEST_PHYSICAL_HEARTBEAT_MS;
+    }
+    return realSetInterval(handler, delay, ...args);
+  }) as unknown as typeof setInterval);
+  return { spy, redirected: () => redirected };
+};
 
 /** Pi's ctx/pi after invalidate(): every read throws the stale message (mirrors ExtensionRunner.invalidate). */
 const invalidatable = <T extends object>(target: T): { value: T; invalidate: () => void } => {
@@ -191,12 +211,15 @@ describe("participant heartbeat with a stale ctx after reload (smarty-dev#10004)
       return register.call(this, source);
     });
     const warn = vi.spyOn(console, "warn");
+    // Default 60 s heartbeat (smarty-dev#11172): physically 5 s so the successor's renewal lands in the wait below.
+    const heartbeat = redirectParticipantHeartbeat();
 
     let generation = 1;
     const first = session();
     await runtime.initialize(first.value as unknown as ExtensionContext, config(), { lifecycle: () => generation === 1 });
     const [old] = directories;
     expect(old?.heartbeatArmed).toBe(true);
+    expect(heartbeat.redirected()).toBe(1); // the first epoch's production-cadence timer
     const hostId = `session:${sessionId}`;
     const renewedAt = (): number => readHostLeases(meshRoot).get(hostId)?.updatedAt ?? 0;
     expect(renewedAt()).toBeGreaterThan(0);
@@ -212,12 +235,15 @@ describe("participant heartbeat with a stale ctx after reload (smarty-dev#10004)
     const reloadedAt = Date.now();
     expect(directories.length).toBe(2);
     expect(directories.filter((directory) => directory.heartbeatArmed)).toEqual([directories[1]]);
+    expect(heartbeat.redirected()).toBe(2); // exactly one successor timer, at the production cadence
     // A successor ensure() that rebinds the same epoch never arms a second timer, nor the old one.
     runtime.bindLifecycle(second.value as unknown as ExtensionContext, () => generation === 2);
     expect(directories.filter((directory) => directory.heartbeatArmed)).toEqual([directories[1]]);
 
-    // One full heartbeat (5 s) plus margin: presence renews from the successor, with no stale failure.
+    // One physical heartbeat (5 s, redirected from the 60 s default) plus margin: presence renews from
+    // the successor, with no stale failure.
     await vi.waitFor(() => expect(renewedAt()).toBeGreaterThan(reloadedAt), { timeout: 8_000, interval: 100 });
+    expect(heartbeat.redirected()).toBe(2); // the rebind armed no further timer
     expect(staleFailures(warn)).toEqual([]);
     expect(directories.filter((directory) => directory.heartbeatArmed)).toEqual([directories[1]]);
   }, 30_000);
@@ -235,6 +261,8 @@ describe("participant heartbeat with a stale ctx after reload (smarty-dev#10004)
     vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
     vi.stubEnv("PI_FABRIC_PROJECT_ROOT", root);
     const warn = vi.spyOn(console, "warn");
+    // Default 60 s heartbeat (smarty-dev#11172) in the compiled in-process host: physically 5 s.
+    const heartbeat = redirectParticipantHeartbeat();
     const faults: unknown[] = [];
     const onFault = (error: unknown) => { faults.push(error); };
     process.on("uncaughtException", onFault);
@@ -258,10 +286,13 @@ describe("participant heartbeat with a stale ctx after reload (smarty-dev#10004)
     await session.prompt("activate");
     const hostId = `session:${sessionManager.getSessionId()}`;
     expect(readHostLeases(meshRoot).get(hostId)?.updatedAt ?? 0).toBeGreaterThan(0);
+    const armedBeforeReload = heartbeat.redirected();
+    expect(armedBeforeReload).toBeGreaterThanOrEqual(1);
     await session.reload();
     const reloadedAt = Date.now();
     await vi.waitFor(() => expect(readHostLeases(meshRoot).get(hostId)?.updatedAt ?? 0).toBeGreaterThan(reloadedAt),
       { timeout: 12_000, interval: 200 });
+    expect(heartbeat.redirected()).toBeGreaterThan(armedBeforeReload); // the reloaded host armed its own timer
     await sleep(5_500);
     expect(staleFailures(warn)).toEqual([]);
     expect(lines(warn).filter((line) => /background operation failed/.test(line))).toEqual([]);

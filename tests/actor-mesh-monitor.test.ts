@@ -72,7 +72,7 @@ describe("ActorMeshMonitor", () => {
       expect(Date.now() - startedAt).toBeLessThan(100);
       await vi.advanceTimersByTimeAsync(10); // no quiet window between events
     }
-    expect(vi.getTimerCount()).toBe(1); // only the named safety net
+    expect(vi.getTimerCount()).toBe(0); // healthy watch: no safety timer (smarty-dev#11172)
     const count = s.mesh.tail.mock.calls.length;
     notify("change", "events.jsonl"); await flush();
     expect(s.mesh.tail).toHaveBeenCalledTimes(count); // duplicate edge, unchanged stamp
@@ -81,19 +81,57 @@ describe("ActorMeshMonitor", () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
-  it("uses only a >=5 s safety net, with no idle log rereads over 60 s", async () => {
+  // smarty-dev#11172: the 5 s healthy-watch safety net woke each monitor ~0.2/s while idle.
+  it("arms no timer and wakes nothing over 60 s idle with a healthy watch", async () => {
     const s = setup();
     s.mesh.tail.mockReturnValue({ events: [], nextOffset: 10 });
     const interval = vi.spyOn(globalThis, "setInterval");
     s.monitor.start(); await flush();
-    expect(interval).toHaveBeenCalledTimes(1);
-    expect(interval.mock.calls[0]![1]).toBe(5_000);
-    await vi.advanceTimersByTimeAsync(4_999);
-    expect(s.beforePoll).toHaveBeenCalledOnce();
-    await vi.advanceTimersByTimeAsync(55_001);
-    expect(s.beforePoll).toHaveBeenCalledTimes(13); // startup + 12 recovery sweeps
+    expect(interval).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(s.beforePoll).toHaveBeenCalledOnce(); // startup only
     expect(s.mesh.tail).toHaveBeenCalledOnce();
     expect(s.mesh.latestOffset).toHaveBeenCalledOnce(); // no log-derived stamp
+  });
+
+  it("falls back to actorPollMs polling when a healthy watch closes on its own", async () => {
+    const s = setup();
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    s.mesh.tail.mockReturnValue({ events: [], nextOffset: 10 });
+    s.monitor.start(); await flush();
+    expect(vi.getTimerCount()).toBe(0);
+    s.watcher.emit("close");
+    await flush();
+    expect(vi.getTimerCount()).toBe(1);
+    const count = s.mesh.tail.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(50);
+    expect(s.mesh.tail).toHaveBeenCalledTimes(count + 1); // unhealthy: forced poll at actorPollMs
+    s.monitor.close();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("arms the due timer when schedules.json changes while the event log is unchanged", async () => {
+    const s = setup();
+    s.mesh.tail.mockReturnValue({ events: [], nextOffset: 10 });
+    fs.writeFileSync(path.join(s.root, "events.jsonl"), "quiet\n");
+    let dueAt: number | undefined;
+    const nextScheduleDueAt = vi.fn(() => dueAt);
+    const releaseDueSchedules = vi.fn(async () => { dueAt = undefined; return []; });
+    Object.assign(s.mesh, { nextScheduleDueAt, releaseDueSchedules });
+    s.monitor.start(); await flush();
+    expect(vi.getTimerCount()).toBe(0);
+    const notify = vi.mocked(fs.watch).mock.calls[0]!.at(-1) as fs.WatchListener<string>;
+    // Another process schedules: only schedules.json changes.
+    dueAt = Date.now() + 2_000;
+    fs.writeFileSync(path.join(s.root, "schedules.json"), JSON.stringify({ dueAt }));
+    notify("rename", "schedules.json"); await flush();
+    expect(vi.getTimerCount()).toBe(1); // the due timer, not a safety net
+    await vi.advanceTimersByTimeAsync(1_999);
+    expect(releaseDueSchedules).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(releaseDueSchedules).toHaveBeenCalledOnce();
+    expect(vi.getTimerCount()).toBe(0);
   });
 
   it("checks stamps before noisy notifications and detects same-size rewrites and generation changes", async () => {
@@ -147,7 +185,7 @@ describe("ActorMeshMonitor", () => {
       notify("rename", "registry.json"); await flush();
       expect(s.mesh.tail).toHaveBeenCalledTimes(5);
       expect(fs.watch).toHaveBeenCalledOnce(); // replacing files never detaches a directory watch
-      expect(vi.getTimerCount()).toBe(1);
+      expect(vi.getTimerCount()).toBe(0);
       await vi.advanceTimersByTimeAsync(60_000);
       expect(s.mesh.tail).toHaveBeenCalledTimes(5); // no healthy-watch idle polling
       s.monitor.schedule(); await flush();
@@ -185,25 +223,50 @@ describe("ActorMeshMonitor", () => {
     }
   });
 
+  it("notifies poll completion after an ignored publication's read, once caught up and no longer polling", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "actor-monitor-complete-"));
+    roots.push(root);
+    const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
+    const completions: boolean[] = [];
+    let monitor!: ActorMeshMonitor;
+    monitor = new ActorMeshMonitor(mesh, { enabled: true, actorPollMs: 50, maxReadEvents: 100 }, {
+      beforePoll: () => true, onEvent: () => "ignored", onPollComplete: () => { completions.push(monitor.caughtUp()); },
+    });
+    monitors.push(monitor);
+    try {
+      monitor.start(); await flush();
+      const before = completions.length;
+      await mesh.publish({ topic: "ignored.topic", from: { id: "session:peer", name: "peer", kind: "main" as const }, text: "x" });
+      // The event (not a timer) arrives through the real watch; the read completes caught up.
+      await vi.waitFor(() => expect(completions.slice(before)).toContain(true), { timeout: 1_000, interval: 10 });
+      expect(completions.at(-1)).toBe(true);
+    } finally {
+      monitor.close();
+      mesh.closeState();
+    }
+  });
+
   it("does not treat unreadable metadata as an unchanged mesh", async () => {
     const s = setup(); s.monitor.start(); await flush();
+    const notify = vi.mocked(fs.watch).mock.calls[0]!.at(-1) as fs.WatchListener<string>;
     const stat = vi.spyOn(fs, "statSync").mockImplementation(() => { throw new Error("metadata unavailable"); });
     try {
-      await vi.advanceTimersByTimeAsync(10_000);
+      notify("change", "events.jsonl"); await flush();
+      notify("change", "events.jsonl"); await flush();
       expect(s.mesh.tail).toHaveBeenCalledTimes(3);
     } finally { stat.mockRestore(); }
   });
 
-  it("retains unread work for safety-net recovery even when the log stamp is unchanged", async () => {
+  it("retains unread work for the capacity wake even when the log stamp is unchanged", async () => {
     const s = setup();
     s.mesh.tail.mockReturnValue({ events: [{ topic: "fleet.wait" } as MeshEvent], nextOffset: 20 });
     s.onEvent.mockReturnValue(false);
     s.monitor.start(); await flush();
     expect(JSON.parse(fs.readFileSync(s.cursorPath, "utf8")).cursor).toBe(10);
     s.onEvent.mockReturnValue(true);
-    await vi.advanceTimersByTimeAsync(4_999);
-    expect(s.onEvent).toHaveBeenCalledOnce();
-    await vi.advanceTimersByTimeAsync(1);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(s.onEvent).toHaveBeenCalledOnce(); // healthy watch: no idle timer re-offers it
+    s.monitor.schedule(); await flush(); // the owner's freed-slot wake
     expect(s.onEvent).toHaveBeenCalledTimes(2);
     expect(JSON.parse(fs.readFileSync(s.cursorPath, "utf8")).cursor).toBe(20);
   });
@@ -230,7 +293,8 @@ describe("ActorMeshMonitor", () => {
     expect(s.mesh.tail).toHaveBeenCalledTimes(3);
   });
 
-  it("flushes an ignored-only checkpoint at the safety net without rereading an unchanged log", async () => {
+  // smarty-dev#11172: the owed ten-second checkpoint keeps its own one-shot deadline, armed only while dirty.
+  it("flushes an ignored-only checkpoint at its own deadline without rereading, and arms nothing when clean", async () => {
     const s = setup();
     s.mesh.tail.mockReturnValue({ events: [], nextOffset: 10 });
     s.monitor.start(); await flush();
@@ -239,10 +303,38 @@ describe("ActorMeshMonitor", () => {
     s.mesh.tail.mockReturnValue({ events: [{ topic: "noise" } as MeshEvent], nextOffset: 20 });
     s.monitor.schedule(); await flush();
     expect(JSON.parse(fs.readFileSync(s.cursorPath, "utf8")).cursor).toBe(10);
+    expect(vi.getTimerCount()).toBe(1); // the owed checkpoint, nothing else
     await vi.advanceTimersByTimeAsync(10_000);
     expect(s.mesh.tail).toHaveBeenCalledTimes(2);
+    expect(s.beforePoll).toHaveBeenCalledTimes(2); // a checkpoint is not a poll
     expect(JSON.parse(fs.readFileSync(s.cursorPath, "utf8")).cursor).toBe(20);
     expect(writes.mock.calls.filter(([, target]) => String(target) === s.cursorPath)).toHaveLength(1);
+    expect(vi.getTimerCount()).toBe(0); // clean cursor: no timer
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(writes.mock.calls.filter(([, target]) => String(target) === s.cursorPath)).toHaveLength(1);
+  });
+
+  // smarty-dev#11172: lease regain has no event; a poll the lapsed lease refused retries once, not idly.
+  it("retries a poll a lapsed lease refused, and arms nothing once consumed", async () => {
+    const s = setup();
+    let leased = true;
+    Object.assign(s.monitor.callbacks, { canConsumeMesh: () => leased });
+    s.mesh.tail.mockReturnValue({ events: [], nextOffset: 10 });
+    s.monitor.start(); await flush();
+    expect(vi.getTimerCount()).toBe(0);
+    leased = false;
+    const notify = vi.mocked(fs.watch).mock.calls[0]!.at(-1) as fs.WatchListener<string>;
+    s.mesh.tail.mockReturnValue({ events: [{ topic: "fleet.work" } as MeshEvent], nextOffset: 20 });
+    fs.writeFileSync(path.join(s.root, "events.jsonl"), "work\n");
+    notify("change", "events.jsonl"); await flush();
+    expect(s.onEvent).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(1);
+    leased = true; // regained without any mesh event
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(s.onEvent).toHaveBeenCalledOnce();
+    expect(vi.getTimerCount()).toBe(0);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(s.onEvent).toHaveBeenCalledOnce();
   });
 
   it("3864 holds the event boundary when the lease is lost during dispatch", async () => {
@@ -765,7 +857,7 @@ describe("ActorManager idle checkpoints", () => {
       s.reads.mockClear();
       await vi.advanceTimersByTimeAsync(60_000);
       expect(s.reads).not.toHaveBeenCalled();
-      expect(maintenance).toHaveBeenCalledTimes(12);
+      expect(maintenance).not.toHaveBeenCalled(); // healthy watch: no idle maintenance wakes (smarty-dev#11172)
       expect(s.run).not.toHaveBeenCalled();
       await s.mesh.publish({ topic: "fleet.work.wanted", to: s.actor.id, from: s.from });
       const startedAt = Date.now();

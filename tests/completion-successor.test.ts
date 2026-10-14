@@ -1237,8 +1237,10 @@ describe("exact Main completion recipients", () => {
   it("a live owner with a simulated 20 s stale lease receives once on return; same-lane B receives nothing", async () => {
     const h = harness();
     const directory = (session: string) => {
+      // smarty-dev#11172: the production default TTL is 180 s; this case simulates a lapse of the historical
+      // short (5 s / 15 s) lease, so it pins that fixture explicitly. A 20 s gap then really is stale.
       const value = new ParticipantDirectory(h.mesh, { enabled: true, hostId: `session:${session}`, rootId: `session:${session}`,
-        identity: { id: `session:${session}`, name: "main", kind: "main", sessionId: session } });
+        identity: { id: `session:${session}`, name: "main", kind: "main", sessionId: session }, heartbeatMs: 5_000, leaseMs: 15_000 });
       value.registerSource(() => [h.participant(session, session === "A" ? 100 : 200, { local: true })]);
       return value;
     };

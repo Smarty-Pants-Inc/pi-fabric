@@ -9,7 +9,7 @@ import { ActorRegistryStore } from "../src/actors/registry-store.js";
 import { ResidentHost } from "../src/residency/host.js";
 import { residentRoot, type ResidentHostConfig } from "../src/residency/protocol.js";
 import { MeshStore } from "../src/mesh/store.js";
-import { ParticipantDirectory } from "../src/topology/participant-directory.js";
+import { PARTICIPANT_HEARTBEAT_MS, ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { readParticipantFile } from "../src/topology/participant-files.js";
 import { readHostLease } from "../src/topology/host-leases.js";
 
@@ -19,6 +19,25 @@ const waitFor = async (predicate: () => boolean, boundMs: number, label: string)
     if (Date.now() >= until) throw new Error(`Timed out: ${label}`);
     await new Promise(resolve => setTimeout(resolve, 20));
   }
+};
+
+// smarty-dev#11172 moved the default participant heartbeat to 60 s (TTL 180 s, confirmation 120 s).
+// This test proves physical timer/lock interleaving across five real heartbeats, so only the
+// ParticipantDirectory #armHeartbeat interval physically fires every TEST_PHYSICAL_HEARTBEAT_MS.
+// Every directory keeps the production 60 s heartbeat, 180 s lease and 120 s confirmation
+// arithmetic: no heartbeatMs option (which would also select the legacy 15 s TTL), no fake clock.
+const TEST_PHYSICAL_HEARTBEAT_MS = 5_000;
+const redirectParticipantHeartbeat = () => {
+  const realSetInterval = globalThis.setInterval;
+  let redirected = 0;
+  const spy = vi.spyOn(globalThis, "setInterval").mockImplementation(((handler: () => void, delay?: number, ...args: unknown[]) => {
+    if (delay === PARTICIPANT_HEARTBEAT_MS && new Error().stack?.includes("armHeartbeat")) {
+      redirected++;
+      delay = TEST_PHYSICAL_HEARTBEAT_MS;
+    }
+    return realSetInterval(handler, delay, ...args);
+  }) as unknown as typeof setInterval);
+  return { spy, redirected: () => redirected };
 };
 
 it("#4383 real resident actor envelopes renew on every heartbeat through another process's 30 s registry hold", async () => {
@@ -47,7 +66,9 @@ it("#4383 real resident actor envelopes renew on every heartbeat through another
   let holder: ReturnType<typeof spawn> | undefined;
   let exited: Promise<{ code: number | null; signal: NodeJS.Signals | null }> | undefined;
   try {
+    const heartbeat = redirectParticipantHeartbeat(); // restored by vi.restoreAllMocks() below
     await main.start(); await host.start();
+    expect(heartbeat.redirected()).toBeGreaterThanOrEqual(2); // main + resident host, never a legacy cadence
     const actors: Array<Awaited<ReturnType<typeof host.actors.create>>> = [];
     for (let index = 0; index < 3; index++) actors.push(await host.actors.create({ name: `outage-${index}`, instructions: "Stay live.", residency: "durable" }));
     await host.participants.refresh();

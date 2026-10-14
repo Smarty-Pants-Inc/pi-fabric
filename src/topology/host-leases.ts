@@ -107,8 +107,9 @@ export interface FabricHostLease {
   incarnationToken?: string;
   /** Root Main's bounded reload lease; absent on ordinary heartbeats and older writers. */
   reloadUntil?: number;
-  /** Main session has a fixed 15 s TTL, independent of the host TTL. */
-  session?: Liveness & { id: string; startedAt: number };
+  /** Main session. Historical writers: a fixed 15 s TTL. hostTtl: 1 (smarty-dev#11172): it follows
+   * the host TTL (never below 15 s), so a long ordinary lease is not read as a legacy reload lease. */
+  session?: Liveness & { id: string; startedAt: number; hostTtl?: 1 };
   /** Writer census metadata, absent on leases from pre-census releases. */
   writer?: MeshWriterRecord;
 }

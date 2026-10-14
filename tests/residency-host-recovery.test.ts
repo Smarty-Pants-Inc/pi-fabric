@@ -126,7 +126,11 @@ describe("resident recovery startup and lease fence (#3864)", () => {
       await host.participants.refresh();
       expect(host.participants.canConsumeMesh()).toBe(true);
       await vi.waitFor(() => expect(tail!.mock.results.some((result: { value?: { events?: Array<{ id: string }> } }) => result.value?.events?.some((row: { id: string }) => row.id === event.id))).toBe(true), { timeout: 3_000 });
-      expect(host.participants.canConsumeMesh(host.participants.confirmedAt() + 10_001)).toBe(false);
+      // smarty-dev#11172: the default heartbeat is 60 s, so confirmation lasts two heartbeats (120 s).
+      // The recovered confirmation still admits inside that window and lapses just past it.
+      const confirmed = host.participants.confirmedAt();
+      expect(host.participants.canConsumeMesh(confirmed + 110_000)).toBe(true);
+      expect(host.participants.canConsumeMesh(confirmed + 120_001)).toBe(false);
     } finally { writes?.mockRestore(); confirmations?.mockRestore(); tail?.mockRestore(); lifecycle?.mockRestore(); await host.close(); fs.rmSync(root, { recursive: true, force: true }); }
   });
 });

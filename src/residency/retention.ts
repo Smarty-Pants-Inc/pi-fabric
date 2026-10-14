@@ -148,6 +148,10 @@ export class ResidentRequestRetention {
   #resample = false;
   #nextSample = 0;
   #scanning = false;
+  // smarty-dev#11172: the last complete sample found nothing to retain or collect. No sample is
+  // due until the host marks new exchange or run activity (markDirty).
+  #empty = false;
+  #runsSeen = 0;
   #expiredBefore = 0;
   #now = 0;
   #runReferences: { fingerprint: string; ids: Set<string> } | undefined;
@@ -164,6 +168,17 @@ export class ResidentRequestRetention {
 
   due(now = Date.now()): boolean { return this.#scanning || now >= this.#nextSample; }
 
+  /** The host's maintenance deadline (smarty-dev#11172): 0 while a scan is in progress, else the next sample. */
+  nextDueAt(): number | undefined { return this.#scanning ? 0 : this.#empty ? undefined : this.#nextSample; }
+
+  /** New exchange/run activity: an empty root has an obligation again from its next scheduled sample. */
+  markDirty(): void { this.#empty = false; }
+
+  #finishSample(): void {
+    const health = this.#health;
+    this.#empty = !this.#resample && health.entries === 0 && health.unknown === 0 && health.legacy === 0 && !health.error && this.#runsSeen === 0;
+  }
+
   close(): void {
     this.#runReferences = undefined;
     this.#pendingRun = undefined;
@@ -175,7 +190,7 @@ export class ResidentRequestRetention {
     if (!retentionV2Enabled()) return this.#mainSweep(now, liveIds, budgetMs, stoppedWritersGone);
     if (!this.#scanning) {
       if (now < this.#nextSample) return;
-      this.#scanning = true; this.#index = 0; this.#now = now;
+      this.#scanning = true; this.#index = 0; this.#now = now; this.#runsSeen = 0;
       this.#health = { entries: 0, bytes: 0, unknown: 0, legacy: 0, collected: 0, sampledAt: now, error: "" };
       try { this.#expiredBefore = advanceResidentRequestExpiry(this.root, now); }
       catch { this.#expiredBefore = 0; this.#health.error = "expiry fence unreadable or could not be advanced; collection disabled"; }
@@ -186,6 +201,7 @@ export class ResidentRequestRetention {
     while (!expired() && entries++ < 64) {
       const kind = directories[this.#index];
       if (kind === undefined) {
+        this.#finishSample();
         this.#scanning = false; this.#nextSample = this.#resample ? now : now + SAMPLE_INTERVAL_MS;
         this.#resample = false;
         try { writeJsonAtomic(path.join(this.root, "request-retention.json"), this.#health); } catch { /* next sample retries */ }
@@ -217,6 +233,7 @@ export class ResidentRequestRetention {
       if (!entry) { this.close(); this.#index++; continue; }
       const file = path.join(directory, entry.name);
       if (kind === "runs") {
+        this.#runsSeen++;
         // The request-proof wildcard is not an exit receipt for any particular run.
         const retainedRuns = this.#runReferences!.ids;
         // Incomplete reference preparation is a veto, never authority to walk
@@ -305,7 +322,7 @@ export class ResidentRequestRetention {
   #mainSweep(now: number, liveIds: ReadonlySet<string>, budgetMs = 5, stoppedWritersGone: ReadonlySet<string> = new Set()): void {
     if (!this.#scanning) {
       if (now < this.#nextSample) return;
-      this.#scanning = true; this.#index = 0; this.#now = now;
+      this.#scanning = true; this.#index = 0; this.#now = now; this.#runsSeen = 0;
       this.#health = { entries: 0, bytes: 0, unknown: 0, legacy: 0, collected: 0, sampledAt: now, error: "" };
       try { this.#expiredBefore = advanceResidentRequestExpiry(this.root, now); }
       catch { this.#expiredBefore = 0; this.#health.error = "expiry fence unreadable or could not be advanced; collection disabled"; }
@@ -315,6 +332,7 @@ export class ResidentRequestRetention {
     while (!expired()) {
       const kind = directories[this.#index];
       if (kind === undefined) {
+        this.#finishSample();
         this.#scanning = false; this.#nextSample = now + SAMPLE_INTERVAL_MS;
         try { writeJsonAtomic(path.join(this.root, "request-retention.json"), this.#health); } catch { /* next sample retries */ }
         return;
@@ -343,6 +361,7 @@ export class ResidentRequestRetention {
       if (!entry) { this.close(); this.#index++; continue; }
       const file = path.join(directory, entry.name);
       if (kind === "runs") {
+        this.#runsSeen++;
         // The request-proof wildcard is not an exit receipt for any particular run.
         const retainedRuns = this.#runReferences!.ids;
         // Replay one untracked run (and its nested sources) under the host fence,

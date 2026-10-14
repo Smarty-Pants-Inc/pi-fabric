@@ -19,10 +19,12 @@ vi.mock("../src/storage/retention-platform.js", async (importOriginal) => ({
   retentionV2Enabled: () => platform.retentionV2,
 }));
 const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
+const PRESENCE_SAMPLE_MS = 60_000;
 const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => {
   vi.restoreAllMocks();
   for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
+  vi.useRealTimers();
   platform.retentionV2 = process.platform !== "win32";
 });
 
@@ -40,13 +42,21 @@ async function fixture(idleExitMs = RESIDENT_IDLE_EXIT_MS) {
   fs.writeFileSync(configPath, JSON.stringify(config));
   let now = Date.now(), exited = 0;
   vi.spyOn(Date, "now").mockImplementation(() => now);
+  // smarty-dev#11172: the host has no request tick; idle samples and exits run at armed deadlines
+  // (idle window, maintenance, presence pass). Fake timers advance those with the host clock;
+  // shouldAdvanceTime keeps startup's real waits and the 150 ms settles progressing.
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval"], shouldAdvanceTime: true });
   const log = vi.spyOn(console, "error").mockImplementation(() => {});
   const host = new ResidentHost(config, () => { exited++; });
   cleanups.push(async () => { await host.close(); fs.rmSync(root, { recursive: true, force: true }); });
   await host.start();
-  await sleep(150); // Actual request ticks, deterministic host clock.
+  await sleep(150); // Startup settles; deterministic host clock.
   return { root, config, configPath, host, log, exited: () => exited, now: () => now,
-    advance: async (ms: number) => { now += ms; await sleep(150); } };
+    // Move the host clock, fire every deadline armed within it, then let the event work settle.
+    advance: async (ms: number) => { now += ms; await vi.advanceTimersByTimeAsync(ms); await sleep(150); },
+    // Root liveness has no event: the participant presence pass re-samples it at most once a minute
+    // (smarty-dev#11172 trade-off; formerly every 50 ms tick). One pass starts a dead-root window.
+    sample: async () => { now += PRESENCE_SAMPLE_MS; await vi.advanceTimersByTimeAsync(PRESENCE_SAMPLE_MS); await sleep(150); } };
 }
 
 function rootLease(f: Awaited<ReturnType<typeof fixture>>, expiresAt: number) {
@@ -83,14 +93,14 @@ describe("resident dead-root idle retirement (smarty-dev#6086)", () => {
     await f.advance(5_000);
     expect(f.exited()).toBe(0);
     fs.rmSync(hostLeasePath(f.config.meshRoot, f.config.rootId));
-    await f.advance(1_000); // first absent-root sample
+    await f.sample(); // first absent-root sample
     await f.advance(1_999);
     expect(f.exited()).toBe(0);
     rootLease(f, f.now() + 10_000); // before final fresh exit validation
     await f.advance(1);
     expect(f.exited()).toBe(0);
     fs.rmSync(hostLeasePath(f.config.meshRoot, f.config.rootId));
-    await f.advance(1_000);
+    await f.sample();
     await f.advance(2_000);
     expect(f.exited()).toBe(1);
   });
@@ -112,7 +122,7 @@ describe("resident dead-root idle retirement (smarty-dev#6086)", () => {
     expect(f.exited()).toBe(0);
     await f.advance(2);
     expect(f.exited()).toBe(0);
-    await f.advance(1_000); // observe expiry after the bounded root-observation cache
+    await f.sample(); // observe expiry at the next presence pass
     await f.advance(2_000);
     expect(f.exited()).toBe(1);
   });
@@ -125,7 +135,7 @@ describe("resident dead-root idle retirement (smarty-dev#6086)", () => {
     expect(f.host.actors.hasOwnedActors()).toBe(true);
     expect(f.exited()).toBe(0);
     await f.host.actors.remove(actor.id);
-    await f.advance(1_000);
+    await f.sample();
     await f.advance(1_999);
     expect(f.exited()).toBe(0);
     await f.advance(1);
@@ -146,7 +156,7 @@ describe("resident dead-root idle retirement (smarty-dev#6086)", () => {
     await f.advance(10_000);
     expect(f.exited()).toBe(0);
     fs.rmSync(file);
-    await f.advance(1_000);
+    await f.sample();
     await f.advance(1_999);
     expect(f.exited()).toBe(0);
     await f.advance(1);
@@ -197,7 +207,7 @@ describe("resident dead-root idle retirement (smarty-dev#6086)", () => {
     await f.advance(10_000);
     expect(f.exited()).toBe(0);
     agents.mockRestore();
-    await f.advance(1_000);
+    await f.sample();
     await f.advance(2_000);
     expect(f.exited()).toBe(1);
   });

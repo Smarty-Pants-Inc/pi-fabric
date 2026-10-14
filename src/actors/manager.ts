@@ -303,6 +303,8 @@ const MAIN_REVISION_EVENTS: ReadonlySet<FabricActorHostEvent> = new Set([
 ]);
 const ORPHAN_ADOPTION_RETRY_MS = 30_000;
 const RETENTION_SWEEP_INTERVAL_MS = 15 * 60 * 1_000;
+/** smarty-dev#11172: a one-shot owner-poll retry only while upkeep is owed (dirty filter state, unwritten or unconfirmed delivery outcomes). */
+const OWED_UPKEEP_RETRY_MS = 5_000;
 /** One mesh-wide run-retention sweep per mesh per day, whichever owner claims it (smarty-dev#3252). Daily, not hourly
  * (smarty-dev#7916, measured on Ryzen 1 2026-10-11: each sweep took 30-35 min at ~0.7 core, so hourly cost ~0.4 core
  * on average). It collects runs older than the 7-day archive TTL, so a daily cadence loses nothing. */
@@ -747,7 +749,11 @@ export class ActorManager {
   readonly #adoptionGraceMs: number;
   readonly #listeners = new Set<() => void>();
   readonly #meshListeners = new Set<() => void>();
+  readonly #meshPollListeners = new Set<() => void>();
   #retentionTimer: NodeJS.Timeout | undefined;
+  /** The nearest owed beforePoll deadline (filter expiry or upkeep retry); never armed while nothing is owed. */
+  #upkeepTimer: NodeJS.Timeout | undefined;
+  #upkeepDueAt: number | undefined;
   /** One unref'd wake per transient activation block, to republish its actor record at expiry. */
   readonly #blockExpiryTimers = new Map<string, { at: number; timer: NodeJS.Timeout }>();
   readonly #meshRetentionSweepPath: string | undefined;
@@ -983,6 +989,7 @@ export class ActorManager {
         }
         this.#confirmDeliveryOutcomes();
         this.#flushFilterState();
+        this.#armUpkeep();
         // Preserve deferred events while halted; fencing remains manager-owned.
         if (!this.#halted) this.#reconcileChildCompletions();
         return !this.#halted;
@@ -1000,6 +1007,11 @@ export class ActorManager {
         if (event.topic === "fabric.steer") this.#relaySteer(event);
         else if (!event.topic.startsWith("fabric.control.")) return this.#dispatchMeshEvent(event);
         return event.topic === "fabric.steer" ? true : "ignored";
+      },
+      onPollComplete: () => {
+        for (const listener of this.#meshPollListeners) {
+          try { listener(); } catch { /* Observers must not interrupt the monitor. */ }
+        }
       },
     });
     this.#meshMonitor.start();
@@ -1026,6 +1038,12 @@ export class ActorManager {
   subscribeMesh(listener: () => void): () => void {
     this.#meshListeners.add(listener);
     return () => this.#meshListeners.delete(listener);
+  }
+
+  /** smarty-dev#11172: a monitor log read completed (cursor updated, no longer polling). */
+  subscribeMeshPoll(listener: () => void): () => void {
+    this.#meshPollListeners.add(listener);
+    return () => { this.#meshPollListeners.delete(listener); };
   }
 
   retryCapabilityWaiters(): void {
@@ -1676,6 +1694,7 @@ export class ActorManager {
     actor.updatedAt = Date.now();
     this.#filterQueued(actor);
     this.#replayDeadLetters(actor);
+    this.#armUpkeep();
     await this.#publishPresence(actor, true);
     return this.#publicInfo(actor);
   }
@@ -3211,6 +3230,8 @@ export class ActorManager {
     this.#orphanPresenceTimer = undefined;
     if (this.#retentionTimer) clearInterval(this.#retentionTimer);
     this.#retentionTimer = undefined;
+    if (this.#upkeepTimer) clearTimeout(this.#upkeepTimer);
+    this.#upkeepTimer = this.#upkeepDueAt = undefined;
     for (const { timer } of this.#blockExpiryTimers.values()) clearTimeout(timer);
     this.#blockExpiryTimers.clear();
     // Cancellation is monotonic: pending claims must settle before the enclosing
@@ -3223,6 +3244,7 @@ export class ActorManager {
     await this.#retentionSweep;
     this.#listeners.clear();
     this.#meshListeners.clear();
+    this.#meshPollListeners.clear();
     if (this.#persistent) {
       this.#refreshOwnership();
       const owned = [...this.#actors.values()].filter((actor) => this.#canManageCached(actor.id));
@@ -3819,6 +3841,7 @@ export class ActorManager {
           continue;
         }
         this.#inFlight.set(actor.id, item);
+        if (item.outcomeSend) this.#armUpkeep(); // its inference-start receipt is owed
         // Only after tracking (or checkpointing a skip): admission must never
         // persist a snapshot with the dequeued item absent from queue/inFlight.
         queueMicrotask(() => this.#resumeSettledWindows(actor.id));
@@ -4953,7 +4976,57 @@ export class ActorManager {
     this.#filterStateDirty = false;
     this.#filterStateSave = this.#saveActors().catch(() => {
       this.#filterStateDirty = true;
-    }).finally(() => { this.#filterStateSave = undefined; });
+    }).finally(() => { this.#filterStateSave = undefined; this.#armUpkeep(); });
+  }
+
+  /**
+   * smarty-dev#11172: the monitor has no healthy idle tick, so beforePoll's deadline work owns a
+   * one-shot wake: the earliest managed activation-filter expiry, or a retry while filter telemetry,
+   * a delivery-outcome append or an inference-start confirmation is still owed. Nothing owed: no timer.
+   */
+  #armUpkeep(): void {
+    if (this.#closing) return;
+    const now = Date.now();
+    const owed = this.#filterStateDirty || this.#pendingDeliveryOutcomes.size > 0 ||
+      [...this.#inFlight.values()].some((item) => item.outcomeSend !== undefined);
+    let dueAt = owed ? now + OWED_UPKEEP_RETRY_MS : Infinity;
+    for (const actor of this.#actors.values()) {
+      if (actor.activationFilterExpiresAt !== undefined && this.#canManageCached(actor.id)) dueAt = Math.min(dueAt, actor.activationFilterExpiresAt);
+    }
+    if (dueAt === Infinity) {
+      if (this.#upkeepTimer) clearTimeout(this.#upkeepTimer);
+      this.#upkeepTimer = this.#upkeepDueAt = undefined;
+      return;
+    }
+    if (this.#upkeepTimer && this.#upkeepDueAt! <= dueAt) return;
+    if (this.#upkeepTimer) clearTimeout(this.#upkeepTimer);
+    this.#upkeepDueAt = dueAt;
+    this.#upkeepTimer = setTimeout(() => {
+      this.#upkeepTimer = this.#upkeepDueAt = undefined;
+      // The monitor's gated poll runs beforePoll, which does the work and re-arms what remains.
+      if (!this.#closing) this.#meshMonitor.schedule();
+    }, Math.min(Math.max(0, dueAt - now), 2_147_000_000));
+    this.#upkeepTimer.unref();
+  }
+
+  /**
+   * smarty-dev#11172: when reportStuckPreparing(thresholdMs) can next notify, or undefined. Mirrors its
+   * filters: only un-notified, actively preparing episodes owe a deadline; a permit wait pauses the clock
+   * (its waiting-to-active transition publishes presence, which emits a change for the caller to re-ask).
+   */
+  nextStuckPreparingAt(thresholdMs: number, now = Date.now()): number | undefined {
+    if (this.#halted || this.#closing || !(thresholdMs > 0)) return undefined;
+    let dueAt: number | undefined;
+    for (const actor of this.#draining.values()) {
+      const preparing = actor.preparing;
+      const episode = this.#stuckPreparing.get(actor.id);
+      if (!preparing || !episode || episode.notified || episode.activeSince === undefined || preparing.phase === "waiting" ||
+        actor.status === "stopped" || actor.removal) continue;
+      if (episode.itemId !== this.#inFlight.get(actor.id)?.id || !this.#canManageCached(actor.id)) continue;
+      const at = now + Math.max(0, thresholdMs - this.#preparationActiveMs(episode, now));
+      dueAt = dueAt === undefined ? at : Math.min(dueAt, at);
+    }
+    return dueAt;
   }
 
   #recordFiltered(actor: ManagedActor, item: Pick<ActorQueueItem, "id" | "source" | "payload"> & { coalesceKey?: string }, ruleId: string): void {
@@ -4971,6 +5044,7 @@ export class ActorManager {
       lastAt: now,
     };
     this.#filterStateDirty = true;
+    this.#armUpkeep();
     actor.filteredCount = (actor.filteredCount ?? 0) + 1;
     actor.lastFilteredAt = now;
     actor.updatedAt = now;
@@ -6835,7 +6909,7 @@ export class ActorManager {
     while (pending.length) {
       const record = pending[0]!;
       try { appendDeliveryOutcome(this.mesh.root, record, record.outcome, record.reason, record.at); }
-      catch { return; } // Retained in the queue envelope, independently of runnable work.
+      catch { this.#armUpkeep(); return; } // Retained in the queue envelope, independently of runnable work.
       pending.shift();
     }
     this.#pendingDeliveryOutcomes.delete(actorId);

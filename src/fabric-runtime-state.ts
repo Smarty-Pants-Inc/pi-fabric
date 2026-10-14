@@ -1287,10 +1287,8 @@ export class FabricRuntimeState {
       const participant = this.#participants?.get(actorId, undefined, { fresh });
       return participant ? participant.ownerHostId === hostId : undefined;
     };
-    const snapshotActorOwnership = (fresh = true): ReadonlyMap<string, boolean> => new Map(
-      (this.#participants?.list({ scope: "project", fresh }) ?? [])
-        .map((participant) => [participant.id, participant.ownerHostId === hostId]),
-    );
+    const snapshotActorOwnership = (fresh = true, actorIds?: readonly string[]): ReadonlyMap<string, boolean> =>
+      this.#participants?.actorOwnership(hostId, { fresh, ...(fresh ? {} : { actorIds }) }) ?? new Map();
     // Capture this generation's directory: replacement/quiesce must veto old
     // deferred slices, and new actors cannot maintain archives before publication.
     const actorParticipants = this.#participants;

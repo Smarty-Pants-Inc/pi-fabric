@@ -1,14 +1,16 @@
 import fs, { lstatSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 
-// Only call immediately after mkdtemp: path ownership is not ownership of a replacement.
-const ownedRootCleanup = (directory: string): (() => void) => {
+// Pin immediately after creation or stale-marker validation: path ownership is not ownership of a replacement.
+const ownedRootCleanup = (directory: string, stillOwned: () => boolean = () => true): (() => void) => {
   const pin = lstatSync(directory, { bigint: true });
   const parent = dirname(directory);
   const parentPin = lstatSync(parent, { bigint: true });
   return () => {
     try {
+      if (!stillOwned()) return;
       const current = lstatSync(directory, { bigint: true });
       const currentParent = lstatSync(parent, { bigint: true });
       if (!current.isDirectory() || current.isSymbolicLink()
@@ -92,12 +94,139 @@ export function cleanupIsolatedTestTemp(): void {
   for (const cleanup of ownedTempCleanups()) cleanup();
 }
 
+// Launcher ownership is separate from the Windows runner's persistent MSYS job ownership.
+// These exact names deliberately survive isolateTestFleetEnvironment's production-selector scrub.
+export const testTempRunEnvironment = "PI_TEST_TEMP_RUN_DIR";
+export const testTempOwnerMarker = ".pi-fabric-vitest-owner.json";
+export const testTempRunPrefix = "pi-fabric-vitest-";
+type ProcessIdentity = (pid: number) => string | null | undefined;
+
+/** Native start identity, null for a confirmed dead pid, undefined when identity cannot be established. */
+export const testTempProcessIdentity: ProcessIdentity = (pid) => {
+  try {
+    if (process.platform === "linux") {
+      const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+      const fields = stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/);
+      if (fields[0] === "Z" || fields[0] === "X" || fields[0] === "x") return null; // Exited, even under a non-reaping container PID 1.
+      const start = fields[19]; // /proc stat field 22; comm may contain spaces and parentheses.
+      const boot = fs.readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
+      return start && /^\d+$/.test(start) && boot ? `${boot}:${start}` : undefined;
+    }
+    if (process.platform !== "win32") {
+      const start = execFileSync("ps", ["-o", "lstart=", "-p", String(pid)], {
+        encoding: "utf8", env: { ...process.env, LC_ALL: "C" }, stdio: ["ignore", "pipe", "ignore"], timeout: 2_000,
+      }).trim();
+      return start ? `ps:${start}` : undefined;
+    }
+  } catch { /* A failed read is not evidence of death (permissions, unsupported procfs, etc.). */ }
+  try { process.kill(pid, 0); } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ESRCH") return null;
+  }
+  return undefined;
+};
+
+type RunOwner = { version: 1; pid: number; startIdentity: string };
+const safeRunDirectory = (directory: string, base: string): boolean => {
+  if (dirname(directory) !== base || !/^pi-fabric-vitest-[A-Za-z0-9]{6}$/.test(basename(directory))) return false;
+  try {
+    const parent = lstatSync(base);
+    const root = lstatSync(directory);
+    return parent.isDirectory() && !parent.isSymbolicLink() && root.isDirectory() && !root.isSymbolicLink()
+      && (typeof process.getuid !== "function" || (root.uid === process.getuid() && (root.mode & 0o777) === 0o700));
+  } catch { return false; }
+};
+const readRunOwner = (directory: string): RunOwner | undefined => {
+  try {
+    const path = join(directory, testTempOwnerMarker);
+    const pin = lstatSync(path, { bigint: true });
+    if (!pin.isFile() || pin.isSymbolicLink() || pin.nlink !== 1n || pin.size > 4096n
+      || (typeof process.getuid === "function" && (pin.uid !== BigInt(process.getuid()) || (pin.mode & 0o777n) !== 0o600n))) return;
+    // O_NOFOLLOW closes the final-component symlink gap on platforms that provide it.
+    const fd = fs.openSync(path, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+    let text: string;
+    try {
+      const opened = fs.fstatSync(fd, { bigint: true });
+      if (opened.dev !== pin.dev || opened.ino !== pin.ino) return;
+      text = fs.readFileSync(fd, "utf8");
+    } finally { fs.closeSync(fd); }
+    const value = JSON.parse(text) as Partial<RunOwner> | null;
+    if (value?.version === 1 && Number.isSafeInteger(value.pid) && value.pid! > 0
+      && typeof value.startIdentity === "string" && value.startIdentity.length > 0 && value.startIdentity.length < 256) {
+      return value as RunOwner;
+    }
+  } catch { /* Markerless, malformed, unreadable, or replaced: never claim ownership. */ }
+  return undefined;
+};
+
+/** Sweep only direct, private, harness-marked children of the ORIGINAL caller temp base.
+ * The identity seam lets unit tests record removals without killing/reusing real pids.
+ * Like ownedRootCleanup, this is an inode-pinned JS guard, not native race-proof unlinkat.
+ */
+export function sweepStaleTestTemp(base: string, identity: ProcessIdentity = testTempProcessIdentity): void {
+  if (process.platform === "win32") return; // Never sweep persistent MSYS job roots.
+  base = resolve(base);
+  let entries: string[];
+  try { entries = fs.readdirSync(base); } catch { return; }
+  for (const name of entries) {
+    const directory = join(base, name);
+    if (!safeRunDirectory(directory, base)) continue;
+    try {
+      const markerPin = lstatSync(join(directory, testTempOwnerMarker), { bigint: true });
+      const owner = readRunOwner(directory);
+      if (!owner) continue;
+      const cleanup = ownedRootCleanup(directory, () => {
+        const identityNow = identity(owner.pid);
+        if (identityNow !== null && (typeof identityNow !== "string" || identityNow === owner.startIdentity)) return false;
+        if (!safeRunDirectory(directory, base)) return false;
+        const marker = lstatSync(join(directory, testTempOwnerMarker), { bigint: true });
+        const current = readRunOwner(directory);
+        return marker.dev === markerPin.dev && marker.ino === markerPin.ino
+          && current?.pid === owner.pid && current.startIdentity === owner.startIdentity;
+      });
+      cleanup();
+    } catch { /* Replaced roots and markers are not ours. */ }
+  }
+}
+
+/** Ordinary launcher entry: sweep before allocating and mark only this process's new root. */
+export function launcherTestTemp(): Record<"TMPDIR" | "TMP" | "TEMP", string> {
+  const base = resolve(tmpdir());
+  sweepStaleTestTemp(base);
+  // A launcher is always a new owner, even if invoked from another run's environment.
+  const inherited = process.env[testTempRunEnvironment];
+  delete process.env[testTempRunEnvironment];
+  let temp: Record<"TMPDIR" | "TMP" | "TEMP", string>;
+  try { temp = isolatedTestTemp(testTempRunPrefix); }
+  finally { if (inherited !== undefined) process.env[testTempRunEnvironment] = inherited; }
+  // Windows RUNNER_TEMP children stay runner-owned, exactly as before.
+  if (!(process.platform === "win32" && process.env.RUNNER_TEMP)) {
+    const startIdentity = testTempProcessIdentity(process.pid);
+    if (typeof startIdentity === "string") {
+      writeFileSync(join(temp.TMPDIR, testTempOwnerMarker), JSON.stringify({ version: 1, pid: process.pid, startIdentity }),
+        { mode: 0o600, flag: "wx" });
+      process.env[testTempRunEnvironment] = temp.TMPDIR;
+    }
+  }
+  return temp;
+}
+
+const inheritedLauncherRoot = (prefix: string): string | undefined => {
+  if (prefix !== testTempRunPrefix) return;
+  const directory = process.env[testTempRunEnvironment];
+  if (!directory || resolve(directory) !== resolve(tmpdir())) return;
+  const root = resolve(directory);
+  if (!safeRunDirectory(root, dirname(root))) return;
+  const owner = readRunOwner(root);
+  if (owner && testTempProcessIdentity(owner.pid) === owner.startIdentity) return root;
+  return undefined;
+};
+
 /** Tests must never prune a real session's caches or leave their own behind. */
 export function isolatedTestTemp(prefix: string): Record<"TMPDIR" | "TMP" | "TEMP", string> {
   if (!prefix || prefix === "." || prefix === ".." || /[/\\]/.test(prefix)) {
     throw new Error("Test temp prefix must be a single name inside the test temp base");
   }
-  const sharedDirectory = stableRoot(prefix);
+  const sharedDirectory = stableRoot(prefix) ?? inheritedLauncherRoot(prefix);
   if (sharedDirectory) {
     // Config probes and workers share this path; their exit must not delete live siblings.
     return { TMPDIR: sharedDirectory, TMP: sharedDirectory, TEMP: sharedDirectory };

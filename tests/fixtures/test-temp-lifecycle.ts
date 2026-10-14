@@ -19,7 +19,9 @@ it("holds a real temporary tree until the controller releases or stops the run",
     });
     watcher.once("error", reject);
     // Writing is permitted; an outside-root rename would correctly be refused by the guard.
-    fs.writeFileSync(join(evidence, "ready.json"), JSON.stringify({ runRoot, fixtureDir, pid: process.pid }));
+    const ready = { runRoot, fixtureDir, pid: process.pid };
+    fs.writeFileSync(join(evidence, "ready.json"), JSON.stringify(ready));
+    console.log(`TEMPFIX_READY ${JSON.stringify(ready)}`);
   });
   await released;
   if (mode === "fail") throw new Error("Intentional lifecycle failure after the tree exists");

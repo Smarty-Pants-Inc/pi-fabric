@@ -404,6 +404,8 @@ export class MeshProvider implements FabricProvider {
     context: FabricInvocationContext,
   ): Record<string, unknown> {
     this.guardArguments(actionName, args, context);
+    // Public optional nullish fields (including `to`) intentionally normalize to omission.
+    // Raw bridge publication frames receive no argument repair and still require a string recipient.
     const normalized = (fabricHostCallerId(context) === undefined ? normalizeMeshArgs : normalizeHostMeshArgs)(actionName, args);
     this.guardArguments(actionName, normalized, context);
     return normalized;

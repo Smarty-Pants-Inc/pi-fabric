@@ -1,8 +1,12 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { PassThrough } from "node:stream";
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it } from "vitest";
-import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
+import { ActionRegistry, type FabricRegistryInvocationContext } from "../src/core/action-registry.js";
+import { type BridgePublish, isHubFactoryEvent, RemoteBridgeSide, serveBridgeAgent, StoreBridgeSide } from "../src/mesh/bridge.js";
+import { MeshStore, type MeshEvent, type MeshIdentity } from "../src/mesh/store.js";
 import type { FabricInvocationContext } from "../src/protocol.js";
 import { MeshProvider } from "../src/providers/mesh-provider.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
@@ -94,5 +98,95 @@ describe("mesh.publish to the hub factory role address", () => {
     await expect(provider.invoke("publish", { topic: "fleet.work.pi-fabric.1", kind: "wait", to: "factory", afterMs: 60_000 }, context))
       .resolves.toMatchObject({ scheduled: true });
     expect(outcomes()).toEqual([]);
+  });
+});
+
+// Decision B (smarty-dev#9349 review P2): the public registry path deliberately normalizes an
+// optional `to: null` to omission (src/providers/arg-normalization.ts strips nonnullable optional
+// nulls) before the provider; the raw `.invoke` cases above stay as compatibility cases.
+const registryContext = (): FabricRegistryInvocationContext => ({
+  cwd: process.cwd(),
+  signal: undefined,
+  parentToolCallId: "parent",
+  nestedToolCallId: "nested",
+  extensionContext: {} as ExtensionContext,
+  update() {},
+  approve: async () => {},
+  audits: [],
+  maxResultChars: 10_000,
+}) as FabricRegistryInvocationContext;
+
+const viaRegistry = () => {
+  const fx = fixture();
+  const registry = new ActionRegistry();
+  registry.register(fx.provider);
+  return { ...fx, registry };
+};
+
+describe("mesh.publish through the ActionRegistry (Decision B)", () => {
+  it.each([
+    ["omitted", {}, undefined],
+    ["null", { to: null }, undefined],
+    ["factory", { to: "factory" }, "factory"],
+  ] as const)("persists to=%s on a parsed work topic for wait and eta", async (_label, toArgs, expectedTo) => {
+    const { mesh, registry } = viaRegistry();
+    for (const kind of ["wait", "eta"]) {
+      const topic = `fleet.work.pi-fabric.${kind === "wait" ? 9349 : 1}`;
+      const text = kind === "wait" ? "WAIT: review (owner fv2-9349) next-check ~00:40Z" : "ETA ~00:40Z";
+      await registry.invoke("mesh.publish", { topic, kind, text, ...toArgs }, registryContext());
+      const [event] = mesh.read({ after: 0, limit: 100 }).filter((item) => item.topic === topic);
+      expect(event).toMatchObject({ topic, kind, from: identity });
+      expect(event!.from).toEqual(identity); // sender stays host-owned
+      if (expectedTo === undefined) expect(event).not.toHaveProperty("to");
+      else expect(event!.to).toBe(expectedTo);
+    }
+    expect(mesh.latestSequence()).toBe(2);
+  });
+
+  it("refuses a caller-supplied sender at the public schema, appending nothing", async () => {
+    const { mesh, registry } = viaRegistry();
+    await expect(registry.invoke("mesh.publish", { topic: "fleet.work.pi-fabric.1", kind: "wait", to: "factory", from: { id: "session:forged" } }, registryContext()))
+      .rejects.toThrow(/mesh\.publish[\s\S]*\/from/);
+    expect(mesh.latestSequence()).toBe(0);
+  });
+
+  it.each([[["factory"]], [{ id: "factory" }], [42]])("refuses malformed non-null to=%j at the schema, appending nothing", async (to) => {
+    const { mesh, registry } = viaRegistry();
+    await expect(registry.invoke("mesh.publish", { topic: "fleet.work.pi-fabric.1", kind: "wait", text: "x", to }, registryContext()))
+      .rejects.toThrow(/Invalid arguments for mesh\.publish: must be string/);
+    expect(mesh.latestSequence()).toBe(0);
+  });
+});
+
+// The bridge wire has no provider normalization: a raw `to: null` is malformed there.
+describe("bridge wire publish without a recipient", () => {
+  it("rejects to=null/array/object with 'no recipient' and stores nothing", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-mesh-wire-")); roots.push(root);
+    const far = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
+    const toAgent = new PassThrough();
+    const fromAgent = new PassThrough();
+    const served = serveBridgeAgent(new StoreBridgeSide(far, "dev1"), toAgent, fromAgent);
+    const remote = new RemoteBridgeSide(fromAgent, toAgent);
+    try {
+      for (const to of [null, ["factory"], { id: "factory" }]) {
+        // BridgePublish types `to` as a required string; this cast is the deliberate malformed input.
+        const event = {
+          topic: "fleet.work.pi-fabric.9349", kind: "wait", to, text: "WAIT: x",
+          from: { id: "session:far", name: "far", kind: "main" },
+          data: { bridge: { from: "forge", id: `wire-${JSON.stringify(to)}` } },
+        } as unknown as BridgePublish;
+        await expect(remote.publish(event)).rejects.toThrow(/no recipient/);
+      }
+      expect(far.latestSequence()).toBe(0);
+    } finally {
+      toAgent.end(); // only after every RPC above replied; ending the agent input resolves serveBridgeAgent
+      await served;
+    }
+  });
+
+  it("does not treat a raw to=null WAIT as an unaddressed hub factory event", () => {
+    const raw = { topic: "fleet.work.pi-fabric.9349", kind: "wait", to: null } as unknown as Pick<MeshEvent, "topic" | "kind" | "to">;
+    expect(isHubFactoryEvent(raw)).toBe(false);
+    expect(isHubFactoryEvent({ topic: "fleet.work.pi-fabric.9349", kind: "wait" })).toBe(true);
   });
 });

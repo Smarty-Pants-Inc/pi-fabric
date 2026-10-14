@@ -25,8 +25,12 @@ existing events and mirrors root presence. There is no new store or protocol.
   it to the hub. Other unknown targets still fail before publication.
 - From the remote to the hub only: unaddressed `wait` and `eta` records on a parsed
   `fleet.work.<repo>.<n>` topic also reach the factory (smarty-dev#9349). The hub copy gains
-  `to: "factory"` to keep the existing bridge wire format. Unaddressed `progress`, acknowledgments
-  and other chatter stay local; an explicit unrelated recipient does not gain this exception.
+  `to: "factory"` to keep the existing bridge wire format. Public `mesh.publish` argument preparation
+  keeps its existing optional-null behavior: `to: null` means omission, just like leaving out `to`.
+  Non-null malformed recipients still fail public schema validation. The raw bridge publication
+  wire has no argument repair: `to: null` or another non-string recipient is invalid and is not
+  converted into the unaddressed route. Unaddressed `progress`, acknowledgments and other chatter
+  stay local; an explicit unrelated recipient does not gain this exception.
 - These factory events are rate bound per link, in events and in bytes: a token bucket
   of 30 events a minute, burst 60 (`--factory-rate PER_MINUTE`, `--factory-burst N`), and one of
   512 KiB a minute, burst 1 MiB, of the events as published (`--factory-bytes BYTES_PER_MINUTE`,

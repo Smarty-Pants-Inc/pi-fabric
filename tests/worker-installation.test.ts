@@ -7,7 +7,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agents/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import type { AgentRunRecord } from "../src/agents/types.js";
-import { taskControlDirectory } from "../src/worker/terminal-answer.js";
+import { TASK_CONTROL_LAYOUT, taskControlDirectory } from "../src/worker/terminal-answer.js";
 
 const roots: string[] = [];
 const managers: AgentManager[] = [];
@@ -62,7 +62,7 @@ describe("standalone worker without Pi host peers", () => {
     expect(fs.existsSync(taskControlDirectory(root))).toBe(false);
     const { child, record } = await run();
     expect(child, child.stderr).toMatchObject({ exitCode: 0 });
-    expect(record).toMatchObject({ status: "completed", text: "hi", taskControlLayout: "sibling-v1" });
+    expect(record).toMatchObject({ status: "completed", text: "hi", taskControlLayout: TASK_CONTROL_LAYOUT });
     expect(fs.statSync(taskControlDirectory(root)).isDirectory()).toBe(true);
     if (process.platform !== "win32") expect(fs.statSync(taskControlDirectory(root)).mode & 0o777).toBe(0o700);
   });
@@ -74,7 +74,7 @@ describe("standalone worker without Pi host peers", () => {
       "actor-id": "standalone-activation", "activation-id": "activation-probe",
       "session-file": path.join(root, "actor.jsonl"), "inference-context": "activation",
     });
-    expect(record, child.stderr).toMatchObject({ status: "failed", taskControlLayout: "sibling-v1" });
+    expect(record, child.stderr).toMatchObject({ status: "failed", taskControlLayout: TASK_CONTROL_LAYOUT });
     expect(record?.error).toMatch(/activation window|before.*admission|model selection/);
     expect(fs.statSync(taskControlDirectory(root)).isDirectory()).toBe(true);
     if (process.platform !== "win32") expect(fs.statSync(taskControlDirectory(root)).mode & 0o777).toBe(0o700);

@@ -11,29 +11,24 @@
 import fs from "node:fs";
 import path from "node:path";
 import readline from "node:readline";
-import { randomUUID } from "node:crypto";
 
 const root = process.env.STEER_ENDED_ROOT;
 const runDirectory = process.env.PI_FABRIC_AGENT_RUN_DIR;
 const runId = process.env.PI_FABRIC_PARENT_RUN;
-const controlDirectory = path.resolve(runDirectory) + ".ctl";
 const deliveries = process.env.PI_FABRIC_DELIVERY_DIR;
 const log = value => fs.appendFileSync(path.join(root, "fake.jsonl"), JSON.stringify({ pid: process.pid, ...value }) + "\n");
 const send = event => process.stdout.write(JSON.stringify(event) + "\n");
 const model = { provider: "steer-ended", id: "fake" };
 // The race proof compiles the production receipt helper into its private root.
-const terminal = process.env.STEER_ENDED_HELPER ? await import(process.env.STEER_ENDED_HELPER) : undefined;
+// Fail closed: without the real helper there is no trusted control layout.
+if (!process.env.STEER_ENDED_HELPER) throw new Error("STEER_ENDED_HELPER is required");
+const terminal = await import(process.env.STEER_ENDED_HELPER);
+const controlDirectory = terminal.taskControlDirectory(runDirectory);
 let receipt;
 let released = false;
 
 const recordReceipt = () => {
-  if (terminal) receipt = terminal.saveFinalAnswerReceipt(runDirectory, runId, "AUTHORIZED_FINAL_ANSWER");
-  else {
-    receipt = { version: 1, id: randomUUID(), runId, recordedAt: Date.now(), text: "AUTHORIZED_FINAL_ANSWER" };
-    const temporary = path.join(controlDirectory, `.final-answer.${process.pid}.tmp`);
-    fs.writeFileSync(temporary, JSON.stringify(receipt));
-    fs.renameSync(temporary, path.join(controlDirectory, "final-answer.json"));
-  }
+  receipt = terminal.saveFinalAnswerReceipt(runDirectory, runId, "AUTHORIZED_FINAL_ANSWER");
   log({ type: "receipt", id: receipt.id });
 };
 const release = () => {

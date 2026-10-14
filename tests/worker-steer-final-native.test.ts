@@ -2,6 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
+import { buildSync } from "esbuild";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agents/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
@@ -36,6 +37,7 @@ const alive = (pid: number): boolean => {
 const provider = `
 import fs from "node:fs";
 import path from "node:path";
+import { createRequire } from "node:module";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 export default function (pi) {
   const root = process.env.FINAL_STEER_PROOF_ROOT;
@@ -54,7 +56,9 @@ export default function (pi) {
   };
   pi.registerProvider({id:"final-steer-proof",name:"Offline native proof",auth:{apiKey:{name:"Offline",check:async()=>({type:"api_key",source:"fixture"}),resolve:async()=>({auth:{}})}},getModels:()=>[model],stream,streamSimple:stream});
   const appendAfterFinal = () => {
-    const directory = path.dirname(process.env.PI_FABRIC_DELIVERY_DIR) + ".ctl";
+    // Central layout: resolve through the real production helper (same XDG_STATE_HOME as host).
+    const helper = createRequire(import.meta.url)(process.env.FINAL_STEER_PROOF_HELPER);
+    const directory = helper.taskControlDirectory(path.dirname(process.env.PI_FABRIC_DELIVERY_DIR));
     const receipt = JSON.parse(fs.readFileSync(path.join(directory,"final-answer.json"),"utf8"));
     const ids = JSON.parse(process.env.FINAL_STEER_PROOF_IDS);
     const sender = {id:"session:native-proof-sender",name:"Native proof sender",kind:"main",verified:"mesh"};
@@ -85,6 +89,9 @@ describe("real process task steered at its native final report", () => {
     fs.writeFileSync(path.join(profile, "extensions", "provider.ts"), provider);
     fs.writeFileSync(path.join(workspace, "source.ts"), "AUTHORIZED_SOURCE\n");
     const ids = [randomUUID(), randomUUID()];
+    const helper = path.join(root, "terminal-answer.cjs");
+    buildSync({ entryPoints: [path.resolve("src/worker/terminal-answer.ts")], outfile: helper, bundle: true, platform: "node", format: "cjs" });
+    vi.stubEnv("FINAL_STEER_PROOF_HELPER", helper);
     vi.stubEnv("PI_CODING_AGENT_DIR", profile); vi.stubEnv("PI_OFFLINE", "1");
     vi.stubEnv("FINAL_STEER_PROOF_ROOT", root); vi.stubEnv("FINAL_STEER_PROOF_IDS", JSON.stringify(ids));
     const notices: Record<string, any>[] = [];

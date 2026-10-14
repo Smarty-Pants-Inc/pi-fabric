@@ -105,14 +105,32 @@ export const ensureTaskControlRoot = (): string => {
   return root;
 };
 /**
+ * Refuse a run path with ANY symlink component (leaf or nested ancestor), by an lstat
+ * walk from `/`. Missing trailing components (a future run path) are accepted: they
+ * cannot alias until created, and every existing prefix is a real directory/entry.
+ */
+const assertNoLinkComponent = (lexical: string): void => {
+  const parts = lexical.split(path.sep).filter(Boolean);
+  let current = path.parse(lexical).root;
+  for (const part of parts) {
+    current = path.join(current, part);
+    let stat: fs.Stats;
+    try { stat = fs.lstatSync(current); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return; throw error; }
+    if (stat.isSymbolicLink()) throw new FabricTaskControlDirectoryError(`Task run path ${lexical} must not traverse a link alias at ${current}`);
+  }
+};
+/**
  * Stable contract: the central control destination for a run. Deterministic: the
- * run id (basename) plus a digest of the run's physical path, so archives that reuse
- * a run id under another path never collide with the live run's controls.
+ * lexical run id (basename) plus a digest of the UNRESOLVED lexical run path (never
+ * realpath), so archives that reuse a run id under another path never collide, and a
+ * planted symlink alias cannot map onto another run's controls (it is refused).
  */
 export const taskControlDirectory = (runDirectory: string): string => {
-  const physical = physicalPath(runDirectory);
-  const id = path.basename(physical).replace(/[^A-Za-z0-9._-]/g, "_").replace(/^\.+/, "_").slice(0, 96) || "_";
-  const digest = createHash("sha256").update(physical).digest("hex").slice(0, 32);
+  const lexical = path.resolve(runDirectory);
+  assertNoLinkComponent(lexical);
+  const id = path.basename(lexical).replace(/[^A-Za-z0-9._-]/g, "_").replace(/^\.+/, "_").slice(0, 96) || "_";
+  const digest = createHash("sha256").update(lexical).digest("hex").slice(0, 32);
   return path.join(taskControlRoot(), `${id}--${digest}`);
 };
 export const taskSteerFile = (runDirectory: string): string => path.join(taskControlDirectory(runDirectory), "steer.jsonl");

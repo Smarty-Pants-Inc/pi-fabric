@@ -11,7 +11,7 @@ import { RESIDENT_RUN_RETENTION_MS, sweepResidentRuns } from "../src/residency/h
 import { findExecutable } from "../src/agents/transports/process-utils.js";
 import { decideModelRoute } from "../src/agents/model-route.js";
 import { ActorLogStore } from "../src/actors/log-store.js";
-import { taskControlDirectory } from "../src/worker/terminal-answer.js";
+import { TASK_CONTROL_LAYOUT, taskControlDirectory } from "../src/worker/terminal-answer.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { fabricTurnProvenance } from "../src/fabric-provenance.js";
 import { FABRIC_RUN_ROOT_PREFIX, canRemoveTerminalRun, markRunRootActive, markRunRootClosed, runTreeExitVeto, sweepTempRunRoots } from "../src/storage/retention.js";
@@ -102,7 +102,7 @@ const productionRun = async (principal: boolean, retainRuns = true, nestedRunRoo
   expect(requests).toHaveLength(1);
   expect(JSON.stringify(requests[0]!.messages.filter(message => message.role === "user"))).toContain(task);
   expect(fs.readdirSync(path.join(run, "deliveries"))).toEqual([]);
-  expect(JSON.parse(fs.readFileSync(path.join(run, "status.json"), "utf8"))).toMatchObject({ id: result.id, taskControlLayout: "sibling-v1" });
+  expect(JSON.parse(fs.readFileSync(path.join(run, "status.json"), "utf8"))).toMatchObject({ id: result.id, taskControlLayout: TASK_CONTROL_LAYOUT });
   expect(fs.statSync(taskControlDirectory(run)).isDirectory()).toBe(true);
   expect(fs.existsSync(path.join(taskControlDirectory(run), ".legacy-read.json"))).toBe(false);
   expect(fs.existsSync(path.join(run, "task.txt.provenance.json"))).toBe(principal);
@@ -147,7 +147,7 @@ const assertPairCopy = (source: string, destination: string) => {
   expect(fs.readFileSync(path.join(destination, "status.json"))).toEqual(fs.readFileSync(path.join(source, "status.json")));
   const controls = taskControlDirectory(source);
   if (!fs.existsSync(controls)) {
-    // Only the genuinely legacy failed-parent fixture may lack a sibling.
+    // Only the genuinely legacy failed-parent fixture may lack controls.
     expect(JSON.parse(fs.readFileSync(path.join(source, "status.json"), "utf8"))).not.toHaveProperty("taskControlLayout");
     return;
   }

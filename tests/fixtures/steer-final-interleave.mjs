@@ -5,6 +5,9 @@ import path from "node:path";
 import { syncBuiltinESMExports } from "node:module";
 const root = process.env.STEER_ENDED_ROOT;
 if (root && process.argv.includes("--steer-file")) {
+  // Fail closed: the control layout comes only from the real bundled helper.
+  if (!process.env.STEER_ENDED_HELPER) throw new Error("STEER_ENDED_HELPER is required");
+  const terminal = await import(process.env.STEER_ENDED_HELPER);
   const open = fs.openSync.bind(fs), write = fs.writeFileSync.bind(fs), stat = fs.fstatSync.bind(fs);
   const descriptors = new Map();
   const physical = file => fs.realpathSync(String(file));
@@ -49,7 +52,9 @@ if (root && process.argv.includes("--steer-file")) {
       const setting = JSON.parse(fs.readFileSync(armed, "utf8"));
       if (setting.mode === "inject") {
         fired = true;
-        pauseForReceipt(path.dirname(path.dirname(actual)) + ".ctl");
+        // Same lexical run path the worker used (the helper digests it unresolved).
+        const lexical = typeof file === "number" ? actual : path.resolve(String(file));
+        pauseForReceipt(terminal.taskControlDirectory(path.dirname(path.dirname(lexical))));
       }
     }
     return result;

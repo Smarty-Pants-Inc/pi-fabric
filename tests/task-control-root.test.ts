@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   TASK_CONTROL_LAYOUT, assertTaskControlWriteRoots, createArchiveTaskControlDirectory, ensureTaskControlRoot, initializeTaskControlDirectory,
   isTaskControlDirectoryEntry, legacyTaskControlSibling, openLegacyTaskControlFiles, readFinalAnswerReceipt, saveFinalAnswerReceipt, taskControlDirectory,
-  taskControlReadDirectory, taskControlRoot,
+  taskControlReadDirectory, taskControlRoot, writeTaskControlJson,
 } from "../src/worker/terminal-answer.js";
 import { writeJsonAtomic } from "../src/core/atomic-write.js";
 import { resolveChildWritePolicy } from "../src/agents/child-env.js";
@@ -70,7 +70,51 @@ describe.skipIf(!usable)("central task control root", () => {
     for (const root of [process.env.XDG_STATE_HOME, taskControlRoot(), path.dirname(taskControlRoot()), taskControlDirectory(s.run), taskControlDirectory(parentRun.run)]) {
       expect(() => assertTaskControlWriteRoots(s.run, s.workspace, grant(s.run, s.workspace, root))).toThrow(/overlaps writable root/);
     }
-    expect(() => assertTaskControlWriteRoots(s.run, s.workspace, grant(s.run, path.join(taskControlDirectory(parentRun.run), "x")))).toThrow(/overlaps writable root/);
+    // The child grant validator requires an existing root outside the cwd: create a
+    // safe private x so the overlap refusal itself is what the assertion exercises.
+    const nested = path.join(taskControlDirectory(parentRun.run), "x"); fs.mkdirSync(nested, { mode: 0o700 });
+    expect(() => assertTaskControlWriteRoots(s.run, s.workspace, grant(s.run, nested))).toThrow(/overlaps writable root/);
+  });
+
+  it("keys the lexical path, refusing a child-planted nested alias onto a victim run without touching its controls", () => {
+    process.env.XDG_STATE_HOME = stateCase();
+    const victim = runFixture(), child = runFixture();
+    initializeTaskControlDirectory(victim.run);
+    expect(saveFinalAnswerReceipt(victim.run, "run", "VICTIM").text).toBe("VICTIM");
+    writeTaskControlJson(victim.run, "marker.json", { owner: "victim" });
+    const victimControl = taskControlDirectory(victim.run);
+    const snapshot = () => fs.readdirSync(victimControl).sort().map(name => {
+      const stat = fs.lstatSync(path.join(victimControl, name));
+      return [name, stat.mode, stat.ino, stat.isFile() ? fs.readFileSync(path.join(victimControl, name)).toString("base64") : "dir"];
+    });
+    const before = snapshot(), beforeDir = fs.lstatSync(victimControl);
+    // Nested ancestor alias: child/nest/deep/link -> victim root, so link/run physically is victim.run.
+    fs.mkdirSync(path.join(child.workspace, "nest", "deep"), { recursive: true, mode: 0o700 });
+    const link = path.join(child.workspace, "nest", "deep", "link"); fs.symlinkSync(victim.root, link, "dir");
+    // Leaf alias: child/nest/run -> victim.run (same basename).
+    const leaf = path.join(child.workspace, "nest", "run"); fs.symlinkSync(victim.run, leaf, "dir");
+    for (const alias of [path.join(link, "run"), leaf, path.join(link, "missing", "run")]) {
+      expect(() => taskControlDirectory(alias)).toThrow(/link alias/);
+      expect(() => initializeTaskControlDirectory(alias)).toThrow(/link alias/);
+      expect(() => saveFinalAnswerReceipt(alias, "run", "FORGED")).toThrow(/link alias/);
+      expect(() => writeTaskControlJson(alias, "marker.json", { owner: "child" })).toThrow(/link alias/);
+    }
+    expect(snapshot()).toEqual(before);
+    const afterDir = fs.lstatSync(victimControl);
+    expect([afterDir.ino, afterDir.mode, afterDir.mtimeMs]).toEqual([beforeDir.ino, beforeDir.mode, beforeDir.mtimeMs]);
+    expect(readFinalAnswerReceipt(victim.run, "run")?.text).toBe("VICTIM");
+    // Counterexample: a real nested child run with the same basename works in its own namespace.
+    const real = path.join(child.workspace, "nest", "deep", "real", "run"); fs.mkdirSync(real, { recursive: true, mode: 0o700 });
+    initializeTaskControlDirectory(real);
+    expect(saveFinalAnswerReceipt(real, "run", "CHILD").text).toBe("CHILD");
+    expect(path.basename(taskControlDirectory(real))).toMatch(/^run--[0-9a-f]{32}$/);
+    expect(taskControlDirectory(real)).not.toBe(victimControl);
+    expect(readFinalAnswerReceipt(victim.run, "run")?.text).toBe("VICTIM");
+    expect(snapshot()).toEqual(before);
+    // A missing future run path without a link is accepted deterministically.
+    const future = path.join(child.workspace, "future", "run");
+    expect(taskControlDirectory(future)).toBe(taskControlDirectory(future + path.sep));
+    expect(taskControlDirectory(future)).not.toBe(victimControl);
   });
 
   it("never recreates missing controls of a central-v1 run, while archive creation admits a fresh destination", () => {

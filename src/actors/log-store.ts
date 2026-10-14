@@ -92,18 +92,28 @@ const archiveControls = (runDirectory: string): Map<string, Buffer> | undefined 
       }
     } finally { cursor.closeSync(); }
   };
+  // Hold the run root for the whole read; a held source proves in-run by fd
+  // identity (st_dev/st_ino), never by comparing pinned /proc paths to lexical ones.
+  const runFd = fs.openSync(runDirectory, fs.constants.O_RDONLY | (fs.constants.O_DIRECTORY ?? 0) | (fs.constants.O_NOFOLLOW ?? 0));
+  try {
+  const run = fs.fstatSync(runFd, { bigint: true }), named = fs.lstatSync(runDirectory, { bigint: true });
+  if (!run.isDirectory() || named.isSymbolicLink() || named.dev !== run.dev || named.ino !== run.ino) throw new Error("Archive run directory changed while held");
   withTaskControlReadDirectory(runDirectory, selected => {
     if (!sibling) { scan(selected, true, false); return; }
     // Chronological: in-run, then old sibling, then central. Journals append
     // oldest first; an overlay pairs older queued debt with newer delivery.
     const [legacy, inRun] = withLegacyTaskControlDirectories(runDirectory, sources => {
       for (const source of [...sources].reverse()) scan(source.directory, true, false);
-      return [sources.length > 0, sources.some(source => path.resolve(source.directory) === path.resolve(runDirectory))];
+      return [sources.length > 0, sources.some(source => {
+        const held = fs.fstatSync(source.fd, { bigint: true });
+        return held.dev === run.dev && held.ino === run.ino;
+      })];
     });
     // In-run controls the archive copy excludes must be a proven layer, never dropped.
     if (local && !inRun) throw new Error("Unproven legacy archive controls");
     scan(selected, false, legacy);
   });
+  } finally { fs.closeSync(runFd); }
   if (overlays.size || result.has("steer.jsonl")) {
     const admissions = new Map<string, TerminalAdmission>(), journal = result.get("steer.jsonl")?.toString("utf8") ?? "";
     if (journal && !journal.endsWith("\n")) throw new Error("Incomplete archive steering journal");

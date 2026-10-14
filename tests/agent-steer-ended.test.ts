@@ -7,7 +7,7 @@ import { AgentManager } from "../src/agents/manager.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { writeJsonAtomic } from "../src/core/atomic-write.js";
-import { MAX_TASK_CONTROL_BYTES, saveFinalAnswerReceipt, taskControlDirectory, taskSteerFile } from "../src/worker/terminal-answer.js";
+import { MAX_TASK_CONTROL_BYTES, ensureTaskControlRoot, saveFinalAnswerReceipt, taskControlDirectory, taskControlRoot, taskSteerFile } from "../src/worker/terminal-answer.js";
 import type { AgentRunRecord } from "../src/agents/types.js";
 import type { FabricWritePolicy } from "../src/agents/write-guard.js";
 import { FabricSteerAdmissionLimitError, type AgentTerminalNotice } from "../src/agents/terminal-target.js";
@@ -249,16 +249,18 @@ describe("steer/followUp after an ordinary Pi task's final answer", () => {
     remove.mockRestore();
   });
 
-  it("fails launch closed with a typed error when the ctl sibling overlaps the task cwd", async () => {
+  it("fails launch closed with a typed error when an explicit grant covers the central task-control root", async () => {
     const { manager, root, launch } = harness();
-    await expect(manager.spawn({ task: "unsafe custom root", transport: "process", cwd: root, writableRoots: [root] })).rejects.toMatchObject({
+    // Explicit write roots must exist; create the real central root the manager itself would use.
+    const controlRoot = ensureTaskControlRoot();
+    await expect(manager.spawn({ task: "unsafe custom root", transport: "process", cwd: root, writableRoots: [controlRoot] })).rejects.toMatchObject({
       name: "FabricTaskControlDirectoryError", code: "FABRIC_TASK_CONTROL_UNSAFE", message: expect.stringContaining("overlaps writable root"),
     });
     expect(launch).not.toHaveBeenCalled();
   });
 
-  it("refuses inherited parent write roots that overlap the protected control namespace", async () => {
-    const h = harness(true, root => ({ readOnly: false, writableRoots: [root], shell: "deny" }));
+  it("refuses inherited parent write roots that cover the central task-control root's state ancestor", async () => {
+    const h = harness(true, () => ({ readOnly: false, writableRoots: [path.dirname(taskControlRoot())], shell: "deny" }));
     try {
       await expect(h.manager.spawn({ task: "inherited unsafe root", transport: "process" })).rejects.toMatchObject({
         name: "FabricTaskControlDirectoryError", code: "FABRIC_TASK_CONTROL_UNSAFE", message: expect.stringContaining("overlaps writable root"),
@@ -285,7 +287,7 @@ describe("steer/followUp after an ordinary Pi task's final answer", () => {
         const relative = path.relative(root, controlParent);
         return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
       })).toBe(false);
-      expect(path.dirname(controls)).toBe(h.root);
+      expect(path.dirname(controls)).toBe(taskControlRoot());
       h.finish(handle.id, "done"); h.close(handle.id);
       expect(await h.manager.wait(handle.id, { timeoutMs: 1000 })).toMatchObject({ status: "completed", text: "done" });
     } finally { vi.unstubAllEnvs(); }

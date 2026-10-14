@@ -987,8 +987,10 @@ export class AgentManager {
   ) {
     this.#semaphore = new AgentAdmission(config.maxConcurrent, Infinity, config.maxDepth);
     this.#managedTempRoot = options.runRoot === undefined && process.env.PI_FABRIC_RUN_ROOT === undefined;
-    this.#runRoot =
-      options.runRoot ?? process.env.PI_FABRIC_RUN_ROOT ?? fs.mkdtempSync(path.join(fabricDataRoot(), "pi-fabric-runs-"));
+    // Trusted host root canonicalized ONCE here, before any run id: realpath of the host-created temp root, or of the
+    // deepest existing ancestor of an explicit host root (no mkdir). Inherited PI_FABRIC_RUN_ROOT stays lexical (strict refusal).
+    this.#runRoot = options.runRoot !== undefined ? ((root: string) => { let base = root; while (!fs.existsSync(base) && path.dirname(base) !== base) base = path.dirname(base); return path.join(fs.realpathSync(base), path.relative(base, root)); })(path.resolve(options.runRoot))
+      : process.env.PI_FABRIC_RUN_ROOT ?? fs.realpathSync(fs.mkdtempSync(path.join(fabricDataRoot(), "pi-fabric-runs-")));
     // Nested run artifacts belong to the enclosing run, not the short-lived Pi
     // child. Its owner removes them on cleanup/retention/root shutdown.
     this.#parentOwnedRunRoot = options.runRoot === undefined &&

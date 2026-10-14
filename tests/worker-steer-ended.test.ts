@@ -8,7 +8,7 @@ import { buildSync } from "esbuild";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agents/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
-import { readFinalAnswerReceipt, taskControlDirectory, taskSteerFile } from "../src/worker/terminal-answer.js";
+import { ensureTaskControlRoot, readFinalAnswerReceipt, taskControlDirectory, taskSteerFile } from "../src/worker/terminal-answer.js";
 import { readTerminalControl } from "../src/worker/terminal-controls.js";
 
 // Fixtures are retained under the (scoped) TMPDIR: these tests never delete.
@@ -180,11 +180,15 @@ if(process.argv.includes('--steer-file')){
     // Proves the sentinel is live: without the worker fence, the fake obeys.
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "worker-steer-ended-counter-"));
     const runDirectory = path.join(root, "run"); const deliveries = path.join(root, "deliveries"); const workspace = path.join(root, "workspace");
+    ensureTaskControlRoot();
     for (const dir of [runDirectory, taskControlDirectory(runDirectory), deliveries, workspace]) fs.mkdirSync(dir, { mode: 0o700 });
+    // The fixture resolves the central control directory through the real helper.
+    const helper = path.join(root, "terminal-answer.mjs");
+    buildSync({ entryPoints: [path.resolve("src/worker/terminal-answer.ts")], outfile: helper, bundle: true, platform: "node", format: "esm" });
     const id = randomUUID();
     fs.writeFileSync(path.join(deliveries, id + ".json"), JSON.stringify({ message: "LATE", delivery: "steer", controlId: id }));
     const child = spawnProcess(process.execPath, [fixture], { cwd: workspace, stdio: ["pipe", "ignore", "inherit"],
-      env: { ...process.env, STEER_ENDED_ROOT: root, PI_FABRIC_AGENT_RUN_DIR: runDirectory, PI_FABRIC_PARENT_RUN: "run", PI_FABRIC_DELIVERY_DIR: deliveries } });
+      env: { ...process.env, STEER_ENDED_ROOT: root, STEER_ENDED_HELPER: pathToFileURL(helper).href, PI_FABRIC_AGENT_RUN_DIR: runDirectory, PI_FABRIC_PARENT_RUN: "run", PI_FABRIC_DELIVERY_DIR: deliveries } });
     const exited = new Promise(resolve => child.once("exit", resolve));
     fs.writeFileSync(path.join(root, "final"), "");
     await until(() => rows(path.join(root, "fake.jsonl")).some(row => row.type === "receipt"));

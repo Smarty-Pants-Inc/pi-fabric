@@ -336,9 +336,9 @@ describe.runIf(hasPosixTrustMetadata)("fresh root-metadata v1 host model-excepti
 describe.runIf(hasPosixTrustMetadata)("root-record lane and host binding", () => {
   it.each([
     ["absent callback", { bindRoot: false }],
-    ["undefined root record", { rootSessionCwd: () => undefined }],
-    ["relative root cwd", { rootSessionCwd: () => "project" }],
-    ["different bound root", { rootSessionCwd: () => path.resolve("different-root") }],
+    ["undefined root record", { rootSessionCwd: (): string | undefined => undefined }],
+    ["relative root cwd", { rootSessionCwd: (): string => "project" }],
+    ["different bound root", { rootSessionCwd: (): string => path.resolve("different-root") }],
   ] as const)("refuses %s despite matching manager/request cwd and hostile context", async (_label, options) => {
     const state = fixture(options);
     writeGrant(state.exceptionPath);

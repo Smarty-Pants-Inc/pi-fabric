@@ -2884,7 +2884,7 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
       "probe-late/claude-late-5-6",
       "probe-late/claude-late-5-7",
       "probe-missing/claude-late-5-9", // Preserve the unavailable-model rejection below.
-    ].map(model => modelExceptionGrant({ model, lane: path.basename(boundRootRecord.cwd), role: "actor:late-model-witness" })) }));
+    ].map(model => modelExceptionGrant({ model, lane: path.basename(boundRootRecord.cwd!), role: "actor:late-model-witness" })) }));
     trustedExceptionFixturePaths.add(state.config.agents.modelExceptionsPath);
     state.config.piModels = {
       available: [{ provider: "probe-late", id: "claude-late-5-5" }],

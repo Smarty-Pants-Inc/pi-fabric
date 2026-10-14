@@ -807,6 +807,16 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
   // host signal so a cancel after turn_end still invalidates the unreceived queue.
   let rootInboxRunSignal: AbortSignal | undefined;
   const queuedRootInboxIds = new Map<string, number>();
+  // Native Pi preserves details by reference from sendMessage / the legacy hook result to
+  // message_end. Serialized fields, queue leases and wake metadata are not consumption authority.
+  // Snapshot shown-only ids/receipts so even mutation of an issued object cannot ack withheld work.
+  let issuedRootInboxDetails = new WeakMap<object, { ids: string[]; receipts: string[] }>();
+  const inboxStrings = (value: unknown): string[] => Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === "string") : [];
+  const registerIssuedInbox = (details: object): void => {
+    const fields = details as { ids?: unknown; receipts?: unknown };
+    issuedRootInboxDetails.set(details, { ids: inboxStrings(fields.ids), receipts: inboxStrings(fields.receipts) });
+  };
   type InboxQueueMessage = { role?: string; customType?: string; details?: unknown };
   const inboxEventsToQueue = (inbox: RootInboxBatch, pendingMessages?: readonly InboxQueueMessage[]) => {
     const pending = new Set(inbox.events.map(event => event.id));
@@ -830,11 +840,15 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     return inbox.events.filter(event => !queuedRootInboxIds.has(event.id));
   };
   const consumeInjectedInbox = async (details: unknown): Promise<void> => {
+    if (!details || typeof details !== "object") return;
+    const issued = issuedRootInboxDetails.get(details);
+    if (!issued) {
+      console.warn("pi-fabric: ignored unissued root-inbox carrier");
+      return;
+    }
+    issuedRootInboxDetails.delete(details); // One rendered carrier authorizes consumption once.
     if (!state.initialized) return;
-    const fields = (details && typeof details === "object" ? details : {}) as { ids?: unknown; receipts?: unknown };
-    const strings = (value: unknown): string[] => Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
-    const ids = strings(fields.ids);
-    if (ids.length) await state.consumeRootInbox(ids, strings(fields.receipts)).catch(() => undefined);
+    if (issued.ids.length) await state.consumeRootInbox(issued.ids, issued.receipts).catch(() => undefined);
   };
   const reconcileRootInbox = async (
     context: ExtensionContext, options: RootInboxReconcileOptions, pendingMessages?: readonly InboxQueueMessage[],
@@ -850,13 +864,14 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     const events = inboxEventsToQueue(inbox, pendingMessages);
     if (options.commitOnly) return;
     if (!events.length) return;
-    for (const id of deliverRootInbox(pi, events)) queuedRootInboxIds.set(id, rootInboxTurn);
+    for (const id of deliverRootInbox(pi, events, undefined, registerIssuedInbox)) queuedRootInboxIds.set(id, rootInboxTurn);
   };
   const stopInboxWake = (): void => {
     if (inboxWake.timer) clearInterval(inboxWake.timer);
     inboxWake.timer = undefined;
     inboxWake.context = undefined;
     queuedRootInboxIds.clear();
+    issuedRootInboxDetails = new WeakMap();
     rootInboxRunSignal = undefined;
   };
   const wakeIdleMain = async (): Promise<void> => {
@@ -880,7 +895,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
       await reportInboxExpiry(pi, inbox);
       // A turn that started meanwhile takes the pending batch at its own start: never a second run.
       if (inbox?.events.length && idle()) {
-        for (const id of deliverRootInbox(pi, inbox.events)) queuedRootInboxIds.set(id, rootInboxTurn);
+        for (const id of deliverRootInbox(pi, inbox.events, undefined, registerIssuedInbox)) queuedRootInboxIds.set(id, rootInboxTurn);
         return;
       }
       // Records: the same gate, re-checked after the read (F21).
@@ -1612,10 +1627,11 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     // only actual rows, never the overflow summary, so withheld work is eligible next turn.
     if (!fabricProvenanceSupported(pi)) {
       const message = rootInboxMessage(events);
+      registerIssuedInbox(message.details);
       for (const id of message.details.ids) queuedRootInboxIds.set(id, rootInboxTurn);
       return { message };
     }
-    for (const id of deliverRootInbox(pi, events, { deliverAs: "nextTurn", triggerTurn: false })) {
+    for (const id of deliverRootInbox(pi, events, { deliverAs: "nextTurn", triggerTurn: false }, registerIssuedInbox)) {
       queuedRootInboxIds.set(id, rootInboxTurn);
     }
   });

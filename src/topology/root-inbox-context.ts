@@ -23,6 +23,7 @@ export interface RootInboxContextOptions {
 // Event text is XML-escaped (root-inbox.ts rootInboxMessage), so it cannot close an element early.
 const EVENT = /\n?<event id="([^"]*)" sequence="(\d+)"[\s\S]*?<\/event>/g;
 const OVERFLOW = /\n?<overflow count="\d+">[\s\S]*?<\/overflow>/;
+const OVERFLOW_COUNT = /<overflow count="(\d+)">/;
 const OVERFLOW_RANGE = /<overflow count="\d+">[^<]*?\(sequence (\d+)-(\d+)/;
 const HEADER = /<fabric-inbox count="\d+"(?: shown="\d+")?>/;
 const NOTHING_NEW = `<fabric-inbox count="0">Nothing new: this delivery repeated work events you already received.</fabric-inbox>`;
@@ -45,16 +46,19 @@ const texts = (content: unknown): string[] => typeof content === "string" ? [con
     return typeof text === "string" ? [text] : [];
   }) : [];
 
-/** Shown events carry their sequence; summarized ones get the overflow range's upper bound. */
-const eventSequences = (content: unknown): { shown: Map<string, number>; overflow?: number } => {
+/** Pending summary counts are independent of shown-only ids and legacy sequence bounds. */
+const eventSequences = (content: unknown): { shown: Map<string, number>; overflowCount: number; overflowSequence?: number } => {
   const shown = new Map<string, number>();
-  let overflow: number | undefined;
+  let overflowCount = 0;
+  let overflowSequence: number | undefined;
   for (const text of texts(content)) {
     for (const match of text.matchAll(EVENT)) shown.set(match[1]!, Number(match[2]));
+    const count = OVERFLOW_COUNT.exec(text);
+    if (count) overflowCount = Number(count[1]);
     const range = OVERFLOW_RANGE.exec(text);
-    if (range) overflow = Number(range[2]);
+    if (range) overflowSequence = Number(range[2]);
   }
-  return { shown, ...(overflow === undefined ? {} : { overflow }) };
+  return { shown, overflowCount, ...(overflowSequence === undefined ? {} : { overflowSequence }) };
 };
 
 /** How many root inbox copies of each event id these session entries (or messages) hold. */
@@ -77,10 +81,10 @@ export const rootInboxCompactedCopies = (branch: readonly unknown[]): Map<string
   return rootInboxCopies(branch.slice(0, kept < 0 ? compaction : kept));
 };
 
-const cutEvents = (text: string, drop: ReadonlySet<string>, shown: number, overflow: number, dropOverflow: boolean): string => {
+const cutEvents = (text: string, drop: ReadonlySet<string>, shown: number, overflow: number): string => {
   let next = text.replace(EVENT, (element, id: string) => drop.has(id) ? "" : element);
-  if (dropOverflow) next = next.replace(OVERFLOW, "");
-  else next = next.replace(/<overflow count="\d+">\+\d+ more/, `<overflow count="${overflow}">+${overflow} more`);
+  // Removing shown duplicates cannot deliver or reduce the original pending summary.
+  if (overflow === 0) next = next.replace(OVERFLOW, "");
   return next.replace(HEADER, `<fabric-inbox count="${shown + overflow}"${overflow ? ` shown="${shown}"` : ""}>`);
 };
 
@@ -111,7 +115,7 @@ export const filterRootInboxContext = <Message>(
     const sequences = eventSequences(fields.content);
     const drop = new Set<string>();
     for (const id of ids) {
-      if (seen.has(id) || consumedEarlier(id, sequences.shown.get(id) ?? sequences.overflow)) drop.add(id);
+      if (seen.has(id) || consumedEarlier(id, sequences.shown.get(id) ?? sequences.overflowSequence)) drop.add(id);
       else seen.add(id);
     }
     if (!drop.size) {
@@ -119,14 +123,14 @@ export const filterRootInboxContext = <Message>(
       return;
     }
     changed = true;
-    if (drop.size === ids.length) {
+    if (drop.size === ids.length && sequences.overflowCount === 0) {
       if (index === messages.length - 1) droppedLast = message;
       return;
     }
     const kept = ids.filter((id) => !drop.has(id));
     const shown = kept.filter((id) => sequences.shown.has(id)).length;
-    const overflow = kept.length - shown;
-    const edit = (text: string) => cutEvents(text, drop, shown, overflow, overflow === 0);
+    const overflow = sequences.overflowCount;
+    const edit = (text: string) => cutEvents(text, drop, shown, overflow);
     const content = typeof fields.content === "string" ? edit(fields.content)
       : Array.isArray(fields.content) ? fields.content.map((part) => {
         const text = record(part)?.type === "text" ? record(part)!.text : undefined;

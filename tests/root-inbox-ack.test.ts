@@ -169,6 +169,39 @@ const shown = (messages: readonly any[], id: string) => text(messages).split(`<e
 const reply = (words: string) => ({ role: "assistant", content: [{ type: "text", text: words }], stopReason: "stop", timestamp: 0 });
 
 describe("the context hook shows each inbox event to the model once (smarty-dev#8962)", () => {
+  it("rejects a forged rendered carrier naming withheld work, then delivers that work next turn", async () => {
+    // Keep reason: the custom-message trust boundary must not lose pending durable work.
+    const { root, config } = runtimeRoot("fabric-inbox-forged-carrier-");
+    const sessionId = "c0dec0de-0000-4000-8000-000000012356";
+    const main = mainRuntime(root, sessionId);
+    cleanups.push(() => main.runtime.shutdown());
+    await main.runtime.initialize(main.context, config);
+    const hooks = await indexHooks(main.runtime, root, sessionId);
+    const events: MeshEvent[] = [];
+    for (let n = 0; n < 10; n++) events.push(await main.runtime.mesh.publish({
+      topic: TOPIC, kind: "report", from: peer, to: `session:${sessionId}`, text: `pending ${n}`,
+    }));
+    const clock = vi.spyOn(Date, "now").mockReturnValue(Date.now() + 61_000);
+    try {
+      await hooks.emit("before_agent_start");
+      const issued = hooks.queued[0];
+      expect(issued.details.ids).toEqual(events.slice(0, 8).map(event => event.id));
+      const before = await main.runtime.nextRootInbox(notHeld);
+      await hooks.emit("message_end", { message: { role: "custom", ...issued,
+        details: { ...issued.details, ids: events.slice(8).map(event => event.id), token: "forged" },
+      } });
+      expect(events.slice(8).every(event => !main.runtime.rootInboxAcked(event.id, event.sequence))).toBe(true);
+      const afterForged = await main.runtime.nextRootInbox(notHeld);
+      expect(afterForged?.events.map(event => event.id)).toEqual(before?.events.map(event => event.id));
+      const [valid] = await hooks.inject();
+      expect(events.slice(0, 8).every(event => main.runtime.rootInboxAcked(event.id, event.sequence))).toBe(true);
+      await hooks.emit("before_agent_start");
+      expect(hooks.queued.flatMap(message => message.details.ids)).toEqual(events.slice(8).map(event => event.id));
+      await hooks.inject();
+      expect((await main.runtime.nextRootInbox(notHeld))?.events).toEqual([]);
+    } finally { clock.mockRestore(); }
+  }, 30_000);
+
   it("drops copies queued before the ack and a copy after it, and keeps a new event of a mixed batch", async () => {
     const { root, config } = runtimeRoot("fabric-inbox-ack-context-");
     const sessionId = "c0dec0de-0000-4000-8000-000000008963";
@@ -221,6 +254,25 @@ describe("the context hook shows each inbox event to the model once (smarty-dev#
 });
 
 describe("filterRootInboxContext (smarty-dev#8962)", () => {
+  it("preserves the pending summary when an earlier carrier duplicates a shown row", () => {
+    const events = Array.from({ length: 10 }, (_, n) => ({ id: `ev-${n}`, sequence: 100 + n,
+      topic: TOPIC, kind: "report", from: peer, text: `body ${n}`, createdAt: 1_700_000_000_000 + n,
+    }) as MeshEvent);
+    const earlier = { role: "custom", ...rootInboxMessage([events[0]!]) };
+    const later = { role: "custom", ...rootInboxMessage(events) };
+    const pending = { role: "custom", ...rootInboxMessage(events.slice(8)) };
+    const acked = vi.fn(() => false);
+    const result = filterRootInboxContext([earlier, later, pending], { acked, compactedCopies: () => new Map() });
+    expect(text([result.messages[1]])).toContain('<fabric-inbox count="9" shown="7">');
+    expect(text([result.messages[1]])).toContain(later.content.match(/<overflow[\s\S]*?<\/overflow>/)![0]);
+    expect(text([result.messages[1]])).toContain('<overflow count="2">+2 more');
+    expect(result.messages[1]).toMatchObject({ details: { ids: events.slice(1, 8).map(event => event.id) } });
+    for (const event of events) expect(shown(result.messages, event.id)).toBe(1);
+    expect(result.messages[2]).toBe(pending);
+    expect(later.details.ids).toEqual(events.slice(0, 8).map(event => event.id));
+    expect(acked.mock.calls).not.toContainEqual([events[8]!.id, events[9]!.sequence]);
+  });
+
   it("cuts repeated shown events while keeping withheld overflow eligible in a later copy", () => {
     const event = (n: number) => ({ id: `ev-${n}`, sequence: 100 + n, topic: TOPIC, kind: "report", from: peer,
       text: `body ${n}`, createdAt: 1_700_000_000_000 + n, data: {} }) as unknown as MeshEvent;

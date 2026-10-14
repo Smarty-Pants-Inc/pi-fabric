@@ -11,6 +11,8 @@ const eventProvenance = (event: MeshEvent) => event.verification === "mesh" || e
 export const deliverRootInbox = (
   pi: ExtensionAPI, events: readonly RootInboxEvent[],
   options: Parameters<ExtensionAPI["sendMessage"]>[1] = { deliverAs: "followUp", triggerTurn: true },
+  /** Register the exact details object the native host will carry into message_end. */
+  onIssued?: (details: object) => void,
 ): string[] => {
   if (!events.length) return [];
   const seen = new Set<string>();
@@ -42,8 +44,10 @@ export const deliverRootInbox = (
     const wakeCauses = batch.map((event) => fabricWakeCause(event.from, "mesh", event.topic, event.id));
     // One native message can admit several sources. Keep the whole FIFO cause
     // list, including on legacy hosts that batch events from different senders.
-    pi.sendMessage(fabricWakeMessage(pi, message, delivery, wakeCauses),
-      provenance ? fabricProvenanceOptions(pi, delivery, provenance) : delivery);
+    const issued = fabricWakeMessage(pi, message, delivery, wakeCauses);
+    // Wake stamping can replace details; register after stamping, before native ingestion.
+    if (issued.details && typeof issued.details === "object") onIssued?.(issued.details);
+    pi.sendMessage(issued, provenance ? fabricProvenanceOptions(pi, delivery, provenance) : delivery);
     start = end;
   }
   return events.map((event) => event.id);

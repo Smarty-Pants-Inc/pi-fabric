@@ -91,14 +91,14 @@ describe("recipient-scoped shadow dedup (smarty-dev#3036)", () => {
     expect((await h.box().next(h.session())).events).toEqual([]);
   });
 
-  it("remembers consumed inbox work identities when a new shadow id repeats the work", async () => {
+  it("remembers a consumed delivery identity when a new event id replays the same work", async () => {
     const h = setup(); const inbox = h.box(); inbox.start();
-    await h.publish(); h.advance(1);
+    await h.publish({ key: "work:1", deliveryId: "delivery:work:1" }); h.advance(1);
     const batch = await inbox.next(h.session());
     h.entries.push({ type: "custom_message", ...rootInboxMessage(batch.events) });
     await inbox.next(h.session());
     h.entries.length = 0;
-    await h.publish(); h.advance(1);
+    await h.publish({ key: "work:1", deliveryId: "delivery:work:1" }); h.advance(1);
     expect((await h.box().next(h.session())).events).toEqual([]);
   });
 
@@ -132,7 +132,7 @@ describe("recipient-scoped shadow dedup (smarty-dev#3036)", () => {
     expect((await h.box().next(h.session())).events.map(event => event.id)).toEqual([other.id]);
   });
 
-  it("recognises pre-upgrade inbox receipts beyond the recent-entry window", async () => {
+  it("recognises pre-upgrade inbox receipts by event id, not an ambiguous work key", async () => {
     const h = setup(); const inbox = h.box(); inbox.start();
     const event = await h.publish(); h.advance(1);
     // Old bundles wrote ids only, without stable work receipt metadata.
@@ -140,8 +140,9 @@ describe("recipient-scoped shadow dedup (smarty-dev#3036)", () => {
     h.entries.push(...Array.from({ length: 600 }, () => ({ type: "message" })));
     expect((await inbox.next(h.session())).events).toEqual([]);
     h.entries.length = 0;
-    await h.publish(); h.advance(1);
-    expect((await h.box().next(h.session())).events).toEqual([]);
+    // The legacy receipt names only the first event id; its ambiguous work key claims no new event.
+    const fresh = await h.publish(); h.advance(1);
+    expect((await h.box().next(h.session())).events.map(item => item.id)).toEqual([fresh.id]);
   });
 
   it("preserves pending recovery uncertainty when the mesh temporarily cannot return an event", async () => {
@@ -208,7 +209,7 @@ describe("confirmed persisted Main/inbox receipts (review F5)", () => {
       expect(h.receipts(inbox)).toEqual([]);
       h.main.closeFollowUpDrain(); h.reload();
       expect(h.manager().getEntries().filter(entry => entry.type === "custom_message")).toHaveLength(0);
-      const event = await h.publish(); h.advance(1);
+      const event = await h.publish({ key: "work:1", deliveryId: "delivery:work:1" }); h.advance(1);
       const retry = h.box();
       const batch = await retry.next(h.session());
       expect(batch.events.map(event => event.id)).toEqual([event.id]);
@@ -216,7 +217,7 @@ describe("confirmed persisted Main/inbox receipts (review F5)", () => {
       h.record(batch.events);
       expect((await retry.next(h.session())).events).toEqual([]);
       expect(h.receipts(retry).length).toBeGreaterThan(0);
-      await h.publish(); h.advance(1);
+      await h.publish({ key: "work:1", deliveryId: "delivery:work:1" }); h.advance(1);
       expect((await h.box().next(h.session())).events).toEqual([]);
       expect(h.manager().getEntries().filter(entry => entry.type === "custom_message" && entry.customType === "pi-fabric-inbox")).toHaveLength(1);
     } finally { h.main.closeFollowUpDrain(); }
@@ -230,7 +231,7 @@ describe("confirmed persisted Main/inbox receipts (review F5)", () => {
       expect(fs.existsSync(h.manager().getSessionFile()!)).toBe(false);
       await inbox.next(h.session());
       expect(h.receipts(inbox)).toEqual([]);
-      const event = await h.publish(); h.advance(1);
+      const event = await h.publish({ key: "work:1", deliveryId: "delivery:work:1" }); h.advance(1);
       const batch = await inbox.next(h.session());
       expect(batch.events.map(event => event.id)).toEqual([event.id]);
       h.record(batch.events); // Also deferred: it must NOT commit the pending batch.
@@ -241,7 +242,7 @@ describe("confirmed persisted Main/inbox receipts (review F5)", () => {
       expect(h.session().holdsBatch([event.id])).toBe(true);
       expect((await inbox.next(h.session())).events).toEqual([]);
       expect(h.receipts(inbox).length).toBeGreaterThan(0);
-      await h.publish(); h.advance(1);
+      await h.publish({ key: "work:1", deliveryId: "delivery:work:1" }); h.advance(1);
       expect((await h.box().next(h.session())).events).toEqual([]);
     } finally { h.main.closeFollowUpDrain(); }
   });
@@ -432,7 +433,7 @@ describe("addressed-shadow age horizon (smarty-dev#3036)", () => {
   it("remembers a late answer at delivery time and never repeats it across drains and reloads", async () => {
     const h = setup(); const inbox = h.box(); inbox.start();
     const packet = { topic: "fleet.work.tasks", kind: "answer", from: peer, to: me.id,
-      text: "FAIL lane result", data: { key: "ryzen2-task-lane-2" } };
+      text: "FAIL lane result", data: { key: "ryzen2-task-lane-2", deliveryId: "delivery:ryzen2-task-lane-2" } };
     await h.mesh.publish(packet);
     h.advance(3 * HOUR);
     const batch = await inbox.next(h.session());

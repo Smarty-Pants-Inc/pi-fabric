@@ -7,8 +7,10 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 // sweep is recorded at admission too, so a child cannot escape the fs spies.
 const removalIntents = vi.hoisted(() => [] as string[]);
 const sweepClaims = vi.hoisted(() => [] as string[]);
+// Per-target seams model the collection boundary's observable effect (or failure) through reads.
+const removalHooks = vi.hoisted(() => new Map<string, () => void>());
 vi.mock("../src/agents/rm.js", () => ({
-  removeTree: vi.fn(async (target: string) => { removalIntents.push(target); }),
+  removeTree: vi.fn(async (target: string) => { removalIntents.push(target); removalHooks.get(target)?.(); }),
 }));
 vi.mock("../src/storage/verified-remove.js", async original => ({
   ...await original<typeof import("../src/storage/verified-remove.js")>(),
@@ -57,6 +59,37 @@ const managedFixture = () => {
 
 const readJson = (file: string): AgentRunRecord => JSON.parse(fs.readFileSync(file, "utf8")) as AgentRunRecord;
 
+type Disguise = "absent" | "dangling" | "corrupt" | "foreign";
+/** Model files' state through read/lstat/exists seams only; nothing is physically deleted. Install once at a time. */
+const disguise = (files: string | string[], mode: Disguise = "absent"): () => void => {
+  const hidden = new Set([files].flat());
+  const read = fs.readFileSync;
+  const exists = fs.existsSync;
+  const lstat = fs.lstatSync;
+  const enoent = () => Object.assign(new Error(`recorded ${mode}`), { code: "ENOENT" });
+  const readSpy = vi.spyOn(fs, "readFileSync").mockImplementation(((...args: unknown[]) => {
+    if (!hidden.has(String(args[0]))) return Reflect.apply(read, fs, args);
+    if (mode === "corrupt") return "{not json";
+    if (mode === "foreign") return JSON.stringify({ ...JSON.parse(String(Reflect.apply(read, fs, [args[0], "utf8"]))), id: "foreign-run" });
+    throw enoent();
+  }) as typeof fs.readFileSync);
+  const existsSpy = vi.spyOn(fs, "existsSync").mockImplementation(target =>
+    hidden.has(String(target)) ? mode === "corrupt" || mode === "foreign" : exists(target));
+  const lstatSpy = vi.spyOn(fs, "lstatSync").mockImplementation(((...args: unknown[]) => {
+    if (!hidden.has(String(args[0])) || mode === "corrupt" || mode === "foreign") return Reflect.apply(lstat, fs, args);
+    if (mode === "dangling") {
+      return { isSymbolicLink: () => true, isFile: () => false, isDirectory: () => false, nlink: 1, uid: process.getuid?.() ?? 0, size: 0 } as unknown as fs.Stats;
+    }
+    throw enoent();
+  }) as typeof fs.lstatSync);
+  return () => { readSpy.mockRestore(); existsSpy.mockRestore(); lstatSpy.mockRestore(); };
+};
+
+const refusal = async (manager: AgentManager, id: string): Promise<void> => {
+  expect(() => manager.status(id)).toThrow(/no saved terminal result/);
+  await expect(manager.wait(id)).rejects.toThrow(/no saved terminal result/);
+};
+
 afterEach(async () => {
   const outcomes = await Promise.allSettled(managers.splice(0).map(async manager => {
     manager.config.retainRuns = true;
@@ -65,6 +98,7 @@ afterEach(async () => {
   vi.restoreAllMocks();
   vi.unstubAllEnvs();
   removalIntents.splice(0);
+  removalHooks.clear();
   fsRemovals.splice(0);
   sweepClaims.splice(0);
   expect(outcomes.filter(outcome => outcome.status === "rejected")).toEqual([]);
@@ -131,28 +165,89 @@ describe("retained manager outcome at close", () => {
     const result = await manager.run({ task: "collected result", transport: "process", extensions: false });
     const run = manager.runDirectory(result.id)!;
     const file = path.join(run, "manager-result.json");
-    const read = fs.readFileSync;
-    const exists = fs.existsSync;
-    const hide = () => {
-      vi.spyOn(fs, "readFileSync").mockImplementation(((...args: unknown[]) => {
-        if (String(args[0]) === file) throw Object.assign(new Error("recorded collection"), { code: "ENOENT" });
-        return Reflect.apply(read, fs, args);
-      }) as typeof fs.readFileSync);
-      vi.spyOn(fs, "existsSync").mockImplementation(target => String(target) === file ? false : exists(target));
-    };
-    hide();
+    const exact = readJson(file);
+    const unhide = disguise(file);
     expect(() => manager.status(result.id)).toThrow(/no saved terminal result/);
-    vi.mocked(fs.readFileSync).mockRestore();
-    vi.mocked(fs.existsSync).mockRestore();
+    unhide();
+    expect(manager.status(result.id)).toMatchObject({ id: exact.id, status: "completed" });
+    // The recorded owned removal yields a proven no-follow absence at the actual collection boundary.
+    removalHooks.set(run, () => { disguise(file); });
     await manager.close();
     expect(removalIntents).toContain(run);
-    hide(); // Model the recorded tree removal through reads, never physical deletion.
     expect(manager.status(result.id)).toMatchObject({ status: "completed", task: expect.any(String) });
     const after = await manager.wait(result.id);
     expect(after.status).toBe("completed");
     expect(after.warnings).toContain("Run files were collected at close; this is the manager's bounded terminal summary, not the exact result");
     expect(await manager.stop(result.id)).toMatchObject({ status: "completed" });
-    vi.mocked(fs.readFileSync).mockRestore();
-    vi.mocked(fs.existsSync).mockRestore();
+  });
+
+  // F4: an unexpected pre-collection loss is never turned into a close summary or cleanup.
+  it.each(["absent", "dangling", "corrupt", "foreign"] as const)(
+    "keeps custody and refuses status/wait when a failed manager result is %s before close collection", async mode => {
+      recordFsRemovals();
+      vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(request => fakeManagerHeapWorker(request, 64, true));
+      const { manager } = managedFixture();
+      const handle = await manager.spawn({ task: "f4 private brief", transport: "process", extensions: false,
+        schema: { type: "object", properties: { output: { type: "boolean" } }, required: ["output"] } });
+      expect(await manager.wait(handle.id, { timeoutMs: 2_000 })).toMatchObject({ status: "failed" });
+      const run = manager.runDirectory(handle.id)!;
+      const file = path.join(run, "manager-result.json");
+      const statusFile = path.join(run, "status.json");
+      expect(readJson(file)).toMatchObject({ id: handle.id, status: "failed" });
+      // A late worker success must never surface in place of the manager's failure.
+      writeJsonAtomic(statusFile, { ...readJson(statusFile), status: "completed", error: undefined, text: "late success",
+        exitCode: 0, updatedAt: Date.now() + 1_000 });
+      const statusBytes = fs.readFileSync(statusFile, "utf8");
+      disguise(file, mode);
+      await refusal(manager, handle.id);
+      // Only close-time collection is under test, not task-write temporary-file cleanup during setup.
+      removalIntents.splice(0);
+      fsRemovals.splice(0);
+
+      await manager.close();
+      // No unauthorized collection or outcome rewrite. Checked-exit marker/lock cleanup is independent.
+      expect(fs.readFileSync(statusFile, "utf8")).toBe(statusBytes);
+      await refusal(manager, handle.id);
+      for (const target of removalIntents) {
+        expect(target === run || target.startsWith(run + path.sep) || run.startsWith(target + path.sep), target).toBe(false);
+      }
+      const protectedPaths = [run, file, statusFile, path.join(run, "task.txt")];
+      for (const target of fsRemovals) {
+        expect(protectedPaths.some(file => file === target || file.startsWith(target + path.sep)), target).toBe(false);
+      }
+      expect(await manager.stop(handle.id).then(record => record.status, () => "refused")).not.toBe("completed");
+    });
+
+  it("does not count a no-op or failed close removal as collection", async () => {
+    recordFsRemovals();
+    vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(request => fakeManagerHeapWorker(request));
+    const { manager } = managedFixture();
+    const noop = await manager.run({ task: "noop removal", transport: "process", extensions: false });
+    const failing = await manager.run({ task: "failing removal", transport: "process", extensions: false });
+    const noopRun = manager.runDirectory(noop.id)!;
+    const failingRun = manager.runDirectory(failing.id)!;
+    const failingFile = path.join(failingRun, "manager-result.json");
+    removalHooks.set(failingRun, () => { throw new Error("recorded removal failure"); });
+    await manager.close();
+    expect(removalIntents).toEqual(expect.arrayContaining([noopRun, failingRun]));
+    // The no-op left the exact file: it still reads exactly, and a later loss is refused.
+    expect(manager.status(noop.id)).toMatchObject({ id: noop.id, status: "completed" });
+    expect((await manager.wait(noop.id)).warnings ?? []).not.toContain(
+      "Run files were collected at close; this is the manager's bounded terminal summary, not the exact result");
+    disguise([path.join(noopRun, "manager-result.json"), failingFile]);
+    await refusal(manager, noop.id);
+    // A swallowed removal failure grants no provenance even if the file then reads absent.
+    await refusal(manager, failing.id);
+  });
+
+  it("reports the typed missing-result code before collection provenance", async () => {
+    recordFsRemovals();
+    vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(request => fakeManagerHeapWorker(request));
+    const { manager } = managedFixture();
+    const result = await manager.run({ task: "typed missing", transport: "process", extensions: false });
+    disguise(path.join(manager.runDirectory(result.id)!, "manager-result.json"), "dangling");
+    let caught: unknown;
+    try { manager.status(result.id); } catch (error) { caught = error; }
+    expect(caught).toMatchObject({ code: "FABRIC_MISSING_RESULT", message: expect.stringMatching(/no saved terminal result/) });
   });
 });

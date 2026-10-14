@@ -541,6 +541,8 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
   finalAnswerStatus?: AgentRunResult["status"];
   /** Bounded scalar facts of the published outcome, read only after close collected its file. */
   settledSummary?: SettledSummary;
+  /** Set only after a manager-owned close collection removed the validated result file (no-follow absence). */
+  resultCollected?: boolean;
   finalAnswerCompletion?: Promise<void>;
   terminalNoticeSeen?: Set<string>;
   /** Process teardown is an ownership obligation, even after logical settlement. */
@@ -722,6 +724,12 @@ const normalizeRecordTasks = (record: AgentRunRecord): AgentRunRecord => ({
   task: record.task ?? "",
   ...(record.nestedAgents ? { nestedAgents: record.nestedAgents.map(normalizeRecordTasks) } : {}),
 });
+
+/** True only for a confirmed ENOENT from lstat; a dangling entry or other error is not absence. */
+const pathAbsentNoFollow = (file: string): boolean => {
+  try { fs.lstatSync(file); return false; }
+  catch (error) { return (error as NodeJS.ErrnoException).code === "ENOENT"; }
+};
 
 const readRecord = (filePath: string): AgentRunRecord | undefined => {
   try {
@@ -2919,13 +2927,14 @@ export class AgentManager {
     if (!managed.settledResultFile) return readRecord(managed.statusFile);
     const result = readRecord(managed.settledResultFile);
     if (result && result.id === managed.id && terminalStatuses.has(result.status)) return result;
-    // Close collection (whole-tree removal or retained-prompt cleanup) is the only
-    // owned path that removes the published file while the handle stays readable.
-    // It requires checked execution exit and runs only while closing. A corrupt or
-    // foreign file, or an absence outside that window, still fails loudly.
-    if (!result && this.#closing && managed.executionExited && managed.settledSummary &&
-        !fs.existsSync(managed.settledResultFile)) return this.#collectedResult(managed, managed.settledSummary);
-    throw new Error(`Fabric agent ${managed.id} has no saved terminal result at ${managed.settledResultFile}`);
+    // Close's whole-tree collection is the only owned path that removes the published
+    // file while the handle stays readable. Only its recorded provenance (validated
+    // exact file, successful removal, no-follow absence) authorizes the bounded summary.
+    // An unexpected absence, dangling entry, corrupt or foreign file still fails loudly.
+    if (!result && this.#closing && managed.executionExited && managed.settledSummary && managed.resultCollected &&
+        pathAbsentNoFollow(managed.settledResultFile)) return this.#collectedResult(managed, managed.settledSummary);
+    throw Object.assign(new Error(`Fabric agent ${managed.id} has no saved terminal result at ${managed.settledResultFile}`),
+      { code: "FABRIC_MISSING_RESULT" as const });
   }
 
   /** The manager's own validated terminal facts over its bounded last snapshot, once close collected the exact file. */
@@ -4155,8 +4164,13 @@ export class AgentManager {
           // Only sweep-owned managed roots retain unsuccessful terminal prompts.
           // Explicit roots (including judge runs) and completed runs keep whole-tree
           // deletion. Retention errors preserve custody rather than authorize deletion.
+          // Validate the exact result before any collection attempt, including
+          // explicit roots: an unexpected loss keeps custody and a loud refusal.
+          if (managed.settledResultFile && !this.#exactResultPresent(managed)) return;
           if (await this.#retainTerminalPromptRecord(managed).catch(() => true)) return;
-          await removeTree(managed.runDirectory).catch(() => undefined);
+          try { await removeTree(managed.runDirectory); } catch { return; } // A swallowed failure is no provenance.
+          // A no-op removal or remaining/dangling entry is not collection.
+          if (managed.settledResultFile && pathAbsentNoFollow(managed.settledResultFile)) managed.resultCollected = true;
         }));
     }
     // A failed stop is not authority to delete a child's working files.
@@ -5309,6 +5323,7 @@ export class AgentManager {
       const resultFile = path.join(managed.runDirectory, MANAGER_RESULT_FILE);
       writeJsonAtomic(resultFile, full, { space: 2, durable: true });
       managed.settledResultFile = resultFile;
+      delete managed.resultCollected;
       if (managed.routeOutcome || this.#onSettled) this.#stageArchive(managed.runDirectory, full, "settlement", undefined, !managed.routeOutcome);
       managed.routeOutcome?.(result);
       this.#onSettled?.(full);
@@ -5373,6 +5388,14 @@ export class AgentManager {
     // Once an unsuccessful run has a retained status, never fall back to deleting its
     // whole tree. Any cleanup error propagates to the close custody fence.
     return true;
+  }
+
+  /** The manager's own regular, exact terminal result file (no symlink/foreign/corrupt). */
+  #exactResultPresent(managed: ManagedAgent): boolean {
+    const file = managed.settledResultFile;
+    if (!file || !ownedStat(file)?.isFile()) return false;
+    const result = readRecord(file);
+    return result?.id === managed.id && terminalStatuses.has(result.status);
   }
 
   #canCollect(managed: ManagedAgent): boolean {

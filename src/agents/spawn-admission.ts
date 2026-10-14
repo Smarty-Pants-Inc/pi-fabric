@@ -1,9 +1,13 @@
 /**
- * Leaf-by-default task spawn admission (smarty-dev#12187).
+ * Leaf-by-default task delegation admission (smarty-dev#12187).
  *
  * A Fabric task agent (identity kind "agent": PI_FABRIC_PARENT_RUN without
- * PI_FABRIC_ACTOR_ID) may not create further agents unless its own launch was
- * `recursive: true`. That launch grant is the manager's `--granted-risks
+ * PI_FABRIC_ACTOR_ID) may not delegate unless its own launch was `recursive:
+ * true`. Delegation covers every creation and continuation surface: agents.run,
+ * spawn, create/createActor, import (realizing a global actor), handoff
+ * (scheduling and boundary execution), and ask (an actor turn run on the
+ * task's behalf). Addressed reporting (followUp/steer/tell/send) is not
+ * delegation and stays allowed. That launch grant is the manager's `--granted-risks
  * ["agent"]`, which worker.ts writes into PI_FABRIC_GRANTED_RISKS, replacing
  * any inherited value. The decision is snapshotted once, host-side, so a task
  * cannot grant itself spawning by mutating its environment later, by asking
@@ -43,6 +47,11 @@ export const captureTaskSpawnAdmission = (environment: NodeJS.ProcessEnv = proce
   const granted = (environment.PI_FABRIC_GRANTED_RISKS ?? "").split(",").map((risk) => risk.trim());
   return Object.freeze({ kind: "agent", id: runId, spawnAllowed: granted.includes("agent") });
 };
+
+/** agents.* action names that delegate work and therefore require task admission. */
+export const TASK_DELEGATION_ACTIONS: ReadonlySet<string> = new Set([
+  "run", "spawn", "create", "createActor", "import", "ask", "handoff",
+]);
 
 /** Throws the fixed TaskSpawnDeniedError for a non-recursive task agent. */
 export const assertTaskSpawnAdmitted = (admission: TaskSpawnAdmission, action: string): void => {

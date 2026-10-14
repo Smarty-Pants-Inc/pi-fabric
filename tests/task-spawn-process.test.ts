@@ -42,7 +42,8 @@ afterEach(async () => {
 });
 
 /** A task whose deterministic turn is the given QuickJS guest program. */
-const taskText = (guest: string, label: string) => `${MARKER}${JSON.stringify({ guest, label })}`;
+const taskText = (guest: string, label: string, extra: Record<string, unknown> = {}) =>
+  `${MARKER}${JSON.stringify({ guest, label, ...extra })}`;
 /** Guest-side source of a task literal (for a child spawned by a guest). */
 const guestTask = (guest: string, label: string) => JSON.stringify(taskText(guest, label));
 
@@ -69,8 +70,8 @@ const fixture = async () => {
   });
   closers.push(() => manager.close());
   /** Main launches a task (real worker process) and waits for its own final result. */
-  const launch = async (guest: string, label: string, options: Record<string, unknown> = {}) => {
-    const handle = await manager.spawn({ task: taskText(guest, label), transport: "process", extensions: false, ...options });
+  const launch = async (guest: string, label: string, options: Record<string, unknown> = {}, extra: Record<string, unknown> = {}) => {
+    const handle = await manager.spawn({ task: taskText(guest, label, extra), transport: "process", extensions: false, ...options });
     const result = await manager.wait(handle.id);
     expect(result.status, result.error ?? result.text).toBe("completed");
     const report = JSON.parse(result.text);
@@ -163,6 +164,92 @@ describe("task spawn admission through the real worker process transport (#12187
     expect(child.guest).toEqual({ leaf: true });
   }, 90_000);
 
+  // SEC-1/SEC-2: every public creation/delegation action is refused for a leaf before any actor
+  // state, deferred handoff, or child launch; the direct executeHandoff boundary is refused too.
+  const delegationProbes = `{
+      create: await ${probe(`agents.create({ name: "leaf-actor", instructions: "x" })`)},
+      createActor: await ${probe(`agents.createActor({ name: "leaf-actor-2", instructions: "x" })`)},
+      importActor: await ${probe(`agents.import({ id: "global-template" })`)},
+      ask: await ${probe(`agents.ask({ id: "actor-existing-12187", message: "hi" })`)},
+      handoff: await ${probe(`agents.handoff({ model: "fake/fake" })`)},
+      handoffRecursive: await ${probe(`agents.handoff({ model: "fake/fake", recursive: true })`)},
+    }`;
+  const DELEGATION_KEYS = ["create", "createActor", "importActor", "ask", "handoff", "handoffRecursive"];
+
+  it.each([
+    ["default (recursive omitted)", {}],
+    ["explicit recursive: false", { recursive: false }],
+  ])("%s: a leaf task is refused create/createActor/import/ask/handoff and direct executeHandoff (SEC-1/SEC-2)", async (_l, launchOptions) => {
+    const f = await fixture();
+    const guest = `return { probes: ${delegationProbes}, final: "leaf-final-answer" };`;
+    const { handle, report } = await f.launch(guest, "leaf-delegation", launchOptions, { directHandoff: true });
+    expect(report.identity).toEqual({ id: handle.id, kind: "agent" });
+    expect(report.grantedRisks).toBe("");
+    for (const key of DELEGATION_KEYS) expectDenied(report.guest.probes[key]);
+    expect(report.guest.final).toBe("leaf-final-answer");
+    // Direct host executeHandoff at the modeled outer boundary: refused with the same typed error.
+    expect(report.handoff).toMatchObject({ ok: false, name: DENIED_NAME, code: DENIED_CODE });
+    // Nothing reached actor state, no deferred handoff request, no child.
+    expect(report.actorCalls).toEqual([]);
+    expect(report.deferredHandoffs).toBe(0);
+    expect(report.children).toEqual([]);
+    expect(f.nestedRuns(handle.id)).toEqual([]);
+    expect(f.manager.list().map(record => record.id)).toEqual([handle.id]);
+  }, 60_000);
+
+  it.each([
+    ["recursive: true task", { recursive: true, extensions: true }],
+    ["explicit actor", { actorId: "actor-12187-h", actorName: "admission-actor-h" }],
+  ])("%s: delegation actions pass admission, and a deferred handoff launches a real child to a terminal result", async (_l, launchOptions) => {
+    const f = await fixture();
+    const guest = `const probes = ${delegationProbes}; return { probes };`;
+    const { handle, report } = await f.launch(guest, "permitted-delegation", launchOptions, { runDeferredHandoff: true });
+    for (const key of DELEGATION_KEYS) {
+      // Admission passed; any failure is downstream (modeled actor stand-in / registry), never the leaf rule.
+      expect(report.guest.probes[key].name, JSON.stringify(report.guest.probes[key])).not.toBe(DENIED_NAME);
+    }
+    expect(report.guest.probes.handoff).toMatchObject({ ok: true, value: { scheduled: true } });
+    expect(report.deferredHandoffs).toBe(2);
+    // ask reached the (modeled) actor lifecycle.
+    expect(report.actorCalls).toContain("validateDirectMessage");
+    // Real handoff child: launched by the task's real manager, terminal, own final result.
+    expect(report.handoff, JSON.stringify(report.handoff)).toMatchObject({ ok: true, status: "completed" });
+    expect(report.handoff.id).not.toBe(handle.id);
+    expect(report.children).toContainEqual({ id: report.handoff.id, status: "completed" });
+    const child = JSON.parse(report.handoff.text);
+    expect(child.identity).toEqual({ id: report.handoff.id, kind: "agent" });
+    // The handoff child was not requested recursive: it is a leaf.
+    expect(child.grantedRisks).toBe("");
+  }, 90_000);
+
+  // Real actor lifecycle (Decision C limits modeling to registry/session/context inference only):
+  // the task's fixture builds an actual ActorManager + GlobalActorRegistry, so create -> ask -> actor
+  // worker bootstrap -> actor-turn spawn -> leaf child terminal runs through real code end to end.
+  it.each([
+    ["recursive: true task", { recursive: true, extensions: true }],
+    ["explicit actor", { actorId: "actor-12187-r", actorName: "admission-actor-r" }],
+  ])("%s: real actor create -> ask -> actor turn spawns a leaf child to a terminal result", async (_l, launchOptions) => {
+    const f = await fixture();
+    const actorTurn = `const handle = await agents.spawn(${leafChild("actor-turn-child")});
+      const waited = await agents.wait({ id: handle.id });
+      return { id: handle.id, status: waited.status, text: waited.text };`;
+    const guest = `const actor = await agents.create({ name: "delegation-proof", instructions: "Do deterministic task",
+        residency: "session", extensions: false });
+      const reply = await agents.ask({ id: actor.id, message: ${guestTask(actorTurn, "actor-turn")} });
+      return { actorId: actor.id, reply };`;
+    const { report } = await f.launch(guest, "real-actor-flow", launchOptions, { realActorFlow: true });
+    expect(typeof report.guest.actorId).toBe("string");
+    // ask resolves to a FabricActorMessage whose text is the actor turn's own final report.
+    const turn = JSON.parse(report.guest.reply.text);
+    expect(turn.label).toBe("actor-turn");
+    expect(turn.identity.kind).toBe("actor");
+    expect(turn.guest.status).toBe("completed");
+    expect(turn.children).toEqual([{ id: turn.guest.id, status: "completed" }]);
+    const child = JSON.parse(turn.guest.text);
+    expect(child).toMatchObject({ label: "actor-turn-child", identity: { id: turn.guest.id, kind: "agent" }, grantedRisks: "" });
+    expect(child.guest).toEqual({ leaf: true });
+  }, 120_000);
+
   it("Main still spawns through its real AgentsProvider from a QuickJS guest", async () => {
     const f = await fixture();
     const identity: MeshIdentity = { id: MAIN, name: "Main", kind: "main" };
@@ -185,5 +272,36 @@ describe("task spawn admission through the real worker process transport (#12187
     const waited = await f.manager.wait(id);
     expect(waited.status, waited.error ?? waited.text).toBe("completed");
     expect(JSON.parse(waited.text)).toMatchObject({ label: "main-child", identity: { id, kind: "agent" }, guest: { leaf: true } });
-  }, 60_000);
+
+    // Main counterexample for SEC-1/SEC-2: create is admitted (downstream modeled-actor failure only),
+    // handoff defers, and the modeled outer boundary launches a real child to a terminal result.
+    const deferred: Array<Record<string, unknown>> = [];
+    const fake = { provider: "fake", id: "fake", api: "openai-completions", name: "fake", reasoning: false, input: ["text"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 8192, maxTokens: 1024 };
+    const handoffContext = { ...context, deferHandoff: async (args: Record<string, unknown>) => { deferred.push(args); return { scheduled: true }; },
+      extensionContext: { ...context.extensionContext, model: fake,
+        modelRegistry: { getAvailable: () => [fake], getAll: () => [fake], find: (p: string, m: string) => p === "fake" && m === "fake" ? fake : undefined } } };
+    const delegated = await new QuickJsRuntime().execute(`return {
+      create: await ${probe(`agents.create({ name: "main-actor", instructions: "x" })`)},
+      handoff: await ${probe(`agents.handoff({ model: "fake/fake" })`)} };`,
+      async (ref, args) => provider.invoke(ref.slice("agents.".length), args, handoffContext),
+      { timeoutMs: 30_000, memoryLimitBytes: 64 * 1024 * 1024 });
+    const probes = delegated.value as any;
+    expect(probes.create.name, JSON.stringify(probes.create)).not.toBe(DENIED_NAME);
+    expect(probes.handoff).toMatchObject({ ok: true, value: { scheduled: true } });
+    expect(deferred).toHaveLength(1);
+    const seed = { sourceSessionId: MAIN.slice(8), sourceBranchLeafId: "seed-leaf",
+      sourceBranch: [{ type: "message", id: "seed-leaf", parentId: null, timestamp: new Date(0).toISOString(),
+        message: { role: "user", content: "handoff seed", timestamp: 0 } }],
+      sourceModel: { provider: "fake", modelId: "fake" },
+      outerToolResult: { role: "toolResult", toolCallId: "seed-call", toolName: "fabric_exec",
+        content: [{ type: "text", text: "handoff scheduled" }], isError: false, timestamp: 0 } } as any;
+    const before = new Set(f.manager.list().map(record => record.id));
+    await provider.executeHandoff(deferred[0]!, handoffContext, seed);
+    const handoff = { id: f.manager.list().map(record => record.id).find(candidate => !before.has(candidate))! };
+    expect(handoff.id).toBeDefined();
+    const handoffResult = await f.manager.wait(handoff.id);
+    expect(handoffResult.status, handoffResult.error ?? handoffResult.text).toBe("completed");
+    expect(JSON.parse(handoffResult.text)).toMatchObject({ identity: { id: handoff.id, kind: "agent" }, grantedRisks: "" });
+  }, 90_000);
 });

@@ -7,7 +7,7 @@ import type { JevRequest, JevResponse } from "../jev/types.js";
 import { formatAge, residentHostId, RESIDENT_HOST_FORMAT, ResidentOutcomeUnknownError, ResidentActorAuthorizationError, assertResidentActorMain, assertResidentActorToolCeiling, type ResidentActorCaller, type ResidentActorMutation } from "../residency/protocol.js";
 import { readChildToolAllowlist } from "../core/child-tool-allowlist.js";
 import { ActorManager, ActorRegistryOwnershipError, parseBashTimeoutSeconds } from "../actors/manager.js";
-import { assertTaskSpawnAdmitted, captureTaskSpawnAdmission } from "../agents/spawn-admission.js";
+import { assertTaskSpawnAdmitted, captureTaskSpawnAdmission, TASK_DELEGATION_ACTIONS } from "../agents/spawn-admission.js";
 import { participantProject, recordedProjectLead, repositoryOf, resolveProjectAgent } from "../topology/project-identity.js";
 import { GlobalActorRegistry } from "../actors/global-registry.js";
 import { isFabricActorHostEvent, normalizeActorActivation, validateActorCoalesceKey, validateActorDedupeKey, validateActorInferenceContext } from "../actors/types.js";
@@ -732,6 +732,8 @@ export class AgentsProvider implements FabricProvider {
     args: Record<string, unknown>,
     context: FabricInvocationContext,
   ): Promise<Record<string, unknown>> {
+    // Direct callers (boundary runner) bypass #invoke: refuse a leaf task before any preparation.
+    assertTaskSpawnAdmitted(this.#spawnAdmission, "handoff");
     context = snapshotFabricInvocation(context);
     const model = typeof args.model === "string" ? args.model.trim() : "";
     if (!model) throw new Error("agents.handoff requires an explicit Pi target model");
@@ -763,6 +765,8 @@ export class AgentsProvider implements FabricProvider {
     context: FabricInvocationContext,
     sessionSeed: AgentSessionSeed,
   ): Promise<Record<string, unknown>> {
+    // Prewalk/runtime-state boundary calls this directly: re-check the immutable launch snapshot.
+    assertTaskSpawnAdmitted(this.#spawnAdmission, "handoff");
     context = snapshotFabricInvocation(context);
     const model = typeof args.model === "string" ? args.model.trim() : "";
     if (!model) throw new Error("agents.handoff requires an explicit Pi target model");
@@ -865,9 +869,10 @@ export class AgentsProvider implements FabricProvider {
   ): Promise<unknown> {
     const checkCommit = (): void => throwIfExecutionExpired(context);
     checkCommit();
-    // Leaf-by-default tasks: refuse before model policy, routing, cwd or residency resolution.
+    // Leaf-by-default tasks: refuse every delegation (run/spawn/create/createActor/import/ask/
+    // handoff) before model policy, routing, cwd, residency or global template resolution.
     // The request's own recursive flag describes the child, never the caller's grant.
-    if (actionName === "run" || actionName === "spawn") assertTaskSpawnAdmitted(this.#spawnAdmission, actionName);
+    if (TASK_DELEGATION_ACTIONS.has(actionName)) assertTaskSpawnAdmitted(this.#spawnAdmission, actionName);
     // Only explicit public selections: inherited/default models and existing actors are untouched.
     if (actionName === "run" || actionName === "spawn" || actionName === "create" || actionName === "createActor") {
       const runner = checkedRunner(args.runner, this.manager.config.runner);
@@ -1889,6 +1894,8 @@ export class AgentsProvider implements FabricProvider {
   }
 
   async #createActor(request: FabricActorCreateRequest, context: FabricInvocationContext): Promise<FabricActorInfo> {
+    // Defense in depth: every local/resident actor realization path requires task admission.
+    assertTaskSpawnAdmitted(this.#spawnAdmission, "createActor");
     const { signal } = context;
     const checkCommit = (): void => throwIfExecutionExpired(context);
     checkCommit();

@@ -89,8 +89,27 @@ describe("AgentsProvider launch admission (smarty-dev#12187)", () => {
     const residency = {
       spawnAgent: vi.fn(async () => handle), createActor: vi.fn(), ensureHost: vi.fn(async () => {}), ensureActor: vi.fn(async () => {}),
     };
+    // Actor and global-template plumbing: every side-effecting entry point is a spy so a refusal
+    // can prove nothing behind the gate ran. Identity is Main-like; the gate uses its own snapshot.
+    const actor = { id: "actor-x", name: "actor-x", runner: "pi", status: "idle" };
+    const template = { id: "tpl-1", name: "tpl", instructions: "be helpful", model: "test/model" };
+    const actors = {
+      create: vi.fn(async () => actor),
+      ask: vi.fn(async () => ({ id: "m1", text: "ok" })),
+      validateDirectMessage: vi.fn(),
+      owns: vi.fn(() => true),
+      resolveBinding: vi.fn(() => ({})),
+      status: vi.fn(() => actor),
+    };
+    const actorManager = { identity: { kind: "main", id: "main-1" }, mesh: { root: root }, ...actors };
+    const templates = {
+      create: vi.fn(() => template),
+      resolve: vi.fn(() => template),
+      toRequest: vi.fn(() => ({ name: template.name, instructions: template.instructions, model: template.model })),
+    };
+    const deferHandoff = vi.fn(async (args: Record<string, unknown>) => ({ deferred: true, model: args.model }));
     const provider = new AgentsProvider(
-      manager, {} as ProviderArgs[1], {} as ProviderArgs[2], {} as ProviderArgs[3],
+      manager, actorManager as unknown as ProviderArgs[1], templates as unknown as ProviderArgs[2], {} as ProviderArgs[3],
       { scheduleRefresh: spies.refresh, async refresh() {} } as unknown as ProviderArgs[4],
       undefined, {} as ProviderArgs[6], () => false, residency as unknown as ProviderArgs[8], false,
     );
@@ -99,7 +118,9 @@ describe("AgentsProvider launch admission (smarty-dev#12187)", () => {
       extensionContext: { modelRegistry: { getAvailable: spies.getAvailable, find: spies.find } },
       update() {}, activity() {},
     } as unknown as FabricInvocationContext;
-    return { provider, context, spies, residency };
+    // Same context with the active-fabric_exec handoff deferral callback supplied.
+    const handoffContext = { ...context, deferHandoff } as unknown as FabricInvocationContext;
+    return { provider, context, handoffContext, spies, residency, actors, templates, deferHandoff };
   };
   const stubCaller = (env: { parent?: string; actor?: string; risks?: string }) => {
     vi.stubEnv("PI_FABRIC_PARENT_RUN", env.parent);
@@ -150,6 +171,97 @@ describe("AgentsProvider launch admission (smarty-dev#12187)", () => {
     const result = setup();
     stubCaller({ actor: "actor-1", risks: "agent" });
     for (const [action, args] of attempts) await expectRefused(result, action, args);
+  });
+
+  // SEC-1/SEC-2 (.local/code-security-audit.md): actor creation/import/ask and handoff are
+  // delegation routes too. A leaf must get the same typed refusal before templates, resident
+  // host, actor create/ask, registry/model preparation, deferHandoff or manager launch.
+  const delegationAttempts: [string, Record<string, unknown>][] = [
+    ["create", { name: "a", instructions: "i" }],
+    ["createActor", { name: "a", instructions: "i" }],
+    ["create", { name: "a", instructions: "i", residency: "durable" }],
+    ["createActor", { name: "a", instructions: "i", scope: "global" }],
+    ["create", { name: "a", instructions: "i", model: "auto" }],
+    ["import", { id: "tpl-1" }],
+    ["import", { name: "tpl", as: "copy" }],
+    ["ask", { id: "actor-x", message: "go" }],
+    ["handoff", { model: "test/model" }],
+    // A leaf may not grant its handoff child recursion either.
+    ["handoff", { model: "test/model", recursive: true }],
+  ];
+  const expectDelegationRefused = async (
+    result: ReturnType<typeof setup>, run: () => Promise<unknown>, action?: string,
+  ) => {
+    let caught: unknown;
+    try { await run(); } catch (error) { caught = error; }
+    expect(caught).toBeInstanceOf(TaskSpawnDeniedError);
+    expect(caught).toMatchObject({ name: "TaskSpawnDeniedError", code: TASK_SPAWN_DENIED_CODE });
+    const message = (caught as Error).message;
+    expect(message.startsWith("task agents do not spawn; return your result to your spawner")).toBe(true);
+    expect(message).toContain("task-run-1");
+    if (action) expect(message).toContain(`agents.${action} refused`);
+    for (const group of [result.spies, result.residency, result.actors, result.templates]) {
+      for (const spy of Object.values(group)) expect(spy).not.toHaveBeenCalled();
+    }
+    expect(result.deferHandoff).not.toHaveBeenCalled();
+  };
+  const seed = { sourceModel: "test/model" } as unknown as Parameters<AgentsProvider["executeHandoff"]>[2];
+
+  it.each(delegationAttempts)("refuses a non-recursive task's %s %j before any side effect", async (action, args) => {
+    stubCaller({ parent: "task-run-1" });
+    const result = setup();
+    await expectDelegationRefused(result, () => result.provider.invoke(action, args, result.handoffContext), action);
+  });
+
+  it("refuses direct public handoff() and executeHandoff() before deferral or manager launch", async () => {
+    stubCaller({ parent: "task-run-1" });
+    const result = setup();
+    await expectDelegationRefused(result, () => result.provider.handoff({ model: "test/model" }, result.handoffContext));
+    await expectDelegationRefused(result, () => result.provider.handoff({ model: "test/model", recursive: true }, result.handoffContext));
+    await expectDelegationRefused(result, () => result.provider.executeHandoff({ model: "test/model", task: "t" }, result.context, seed));
+    await expectDelegationRefused(result, () => result.provider.executeHandoff({ model: "test/model", task: "t", recursive: true }, result.context, seed));
+  });
+
+  it("keeps refusing delegation routes after post-construction environment mutation", async () => {
+    stubCaller({ parent: "task-run-1", risks: "read" });
+    const result = setup();
+    stubCaller({ actor: "actor-1", risks: "agent" });
+    for (const [action, args] of delegationAttempts) {
+      await expectDelegationRefused(result, () => result.provider.invoke(action, args, result.handoffContext), action);
+    }
+    await expectDelegationRefused(result, () => result.provider.executeHandoff({ model: "test/model", task: "t" }, result.context, seed));
+  });
+
+  // Allowed counterexamples: the gate must not be what stops Main, actors or recursive tasks.
+  // Plumbing is mocked, so these assert only that the call passes the admission gate and reaches
+  // its first mocked collaborator; they do not claim a full actor lifecycle or real handoff.
+  const notRefused = async (run: () => Promise<unknown>): Promise<void> => {
+    let caught: unknown;
+    try { await run(); } catch (error) { caught = error; }
+    expect(caught).not.toBeInstanceOf(TaskSpawnDeniedError);
+  };
+  it.each([
+    ["Main", {}],
+    ["recursive task (agent grant)", { parent: "task-run-1", risks: "agent" }],
+    ["actor (identity wins over PI_FABRIC_PARENT_RUN)", { parent: "task-run-1", actor: "actor-1" }],
+  ] as const)("admits %s through actor creation, import, ask and handoff", async (_label, env) => {
+    stubCaller(env);
+    const result = setup();
+    stubCaller({ parent: "task-run-2" });
+    const { provider, context, handoffContext, templates, actors, spies, deferHandoff } = result;
+    spies.find.mockImplementation(((providerName: string, id: string) =>
+      providerName === "test" && id === "model" ? { provider: "test", id: "model" } : undefined) as never);
+    await notRefused(() => provider.invoke("createActor", { name: "g", instructions: "i", scope: "global" }, context));
+    expect(templates.create).toHaveBeenCalledTimes(1);
+    await notRefused(() => provider.invoke("create", { name: "a", instructions: "i" }, context));
+    await notRefused(() => provider.invoke("import", { id: "tpl-1" }, context));
+    expect(templates.resolve).toHaveBeenCalled();
+    await notRefused(() => provider.invoke("ask", { id: "actor-x", message: "go" }, context));
+    expect(actors.validateDirectMessage).toHaveBeenCalled();
+    await notRefused(() => provider.invoke("handoff", { model: "test/model" }, handoffContext));
+    await notRefused(() => provider.handoff({ model: "test/model", recursive: true }, handoffContext));
+    expect(deferHandoff.mock.calls.length + spies.find.mock.calls.length + spies.getAvailable.mock.calls.length).toBeGreaterThan(0);
+    await notRefused(() => provider.executeHandoff({ model: "test/model", task: "t" }, context, seed));
   });
 
   it.each([

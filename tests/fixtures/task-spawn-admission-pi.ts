@@ -5,6 +5,10 @@
 // the QuickJS guest runtime with its host error bridge. Children spawned by the guest run through
 // the same real manager -> worker -> this stand-in path.
 import readline from "node:readline";
+import fs from "node:fs";
+import path from "node:path";
+import { ActorManager } from "../../src/actors/manager.js";
+import { GlobalActorRegistry } from "../../src/actors/global-registry.js";
 import { resolveFabricIdentity } from "../../src/main-agent-identity.js";
 import { MainAgentController } from "../../src/main-agent.js";
 import { MeshStore } from "../../src/mesh/store.js";
@@ -22,7 +26,22 @@ let model = { provider: "fake", id: "fake" };
 let thinkingLevel = "off";
 
 // The manager may decorate the prompt; the deterministic program is one marked JSON line.
-const parseTask = (message: string): { guest: string; label?: string } => {
+type Task = { guest: string; label?: string; directHandoff?: boolean; runDeferredHandoff?: boolean; realActorFlow?: boolean };
+const FAKE_MODEL = { provider: "fake", id: "fake", api: "openai-completions", name: "fake", reasoning: false,
+  input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 8192, maxTokens: 1024 };
+// Minimal AgentSessionSeed for the modeled outer fabric_exec result boundary (no paid inference).
+const seed = (sessionId: string) => ({ sourceSessionId: sessionId, sourceBranchLeafId: "seed-leaf",
+  sourceBranch: [{ type: "message", id: "seed-leaf", parentId: null, timestamp: new Date(0).toISOString(),
+    message: { role: "user", content: "handoff seed", timestamp: 0 } }],
+  sourceModel: { provider: "fake", modelId: "fake" },
+  outerToolResult: { role: "toolResult", toolCallId: "seed-call", toolName: "fabric_exec",
+    content: [{ type: "text", text: "handoff scheduled" }], isError: false, timestamp: 0 } }) as any;
+const refusal = (error: any) => ({ ok: false, name: error?.name, code: error?.code, message: String(error?.message ?? error) });
+const parseTask = (message: string): Task => {
+  // Real ActorManager wraps direct messages in its JSON payload; decode before reading the marker.
+  if (message.startsWith("Fabric actor message from direct:\n\n")) {
+    return parseTask(JSON.parse(message.slice(message.indexOf("\n\n") + 2)).payload.message);
+  }
   const start = message.indexOf(TASK_MARKER);
   if (start < 0) return { guest: "return null;" };
   const line = message.slice(start + TASK_MARKER.length).split("\n")[0]!;
@@ -61,14 +80,40 @@ input.on("line", async line => {
   const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, deniedModels: [],
     maxDepth: 10, nice: 0, timeoutMs: 20_000 }, {
     workerPath: process.env.PI_FABRIC_TEST_ADMISSION_WORKER!, fabricExtensionPath: process.env.PI_FABRIC_TEST_ADMISSION_EXTENSION!,
-    meshRoot: process.env.PI_FABRIC_MESH_ROOT!, mainAgentId, identityId: identity.id, spawnerSessionId: sessionId,
+    meshRoot: process.env.PI_FABRIC_MESH_ROOT!, mainAgentId, hostId: identity.id, identityId: identity.id, spawnerSessionId: sessionId,
   });
-  const actors = { identity, mesh, status() { throw new Error("Unknown Fabric actor"); }, validateDirectMessage() {} };
-  const provider = new AgentsProvider(manager, actors as any, {} as any, main, directory, control, {} as any);
+  // MODELED actor lifecycle (Decision C): a recording stand-in, not a real ActorManager. Every
+  // method touch is counted so a refused leaf can be shown to reach no actor state at all.
+  const actorCalls: string[] = [];
+  const actors = new Proxy({ identity, mesh } as any, { get(target, key) {
+    if (typeof key !== "string" || key in target || key === "then") return target[key as any];
+    return (..._args: unknown[]) => {
+      actorCalls.push(key);
+      if (key === "owns") return false;
+      if (key === "validateDirectMessage") return undefined;
+      throw new Error(`modeled actor stand-in: ${key}`);
+    };
+  } });
+  outcome.actorCalls = actorCalls;
+  // realActorFlow: REAL actor lifecycle (no stand-in) - actual ActorManager + GlobalActorRegistry over
+  // this task's real AgentManager, persistent actor root in a unique child directory of the run's mesh root.
+  let realActors: ActorManager | undefined;
+  let globalActors: any = {};
+  if (task.realActorFlow) {
+    const actorRoot = path.join(process.env.PI_FABRIC_MESH_ROOT!, "..", `actors-${process.pid}-${Date.now()}`);
+    fs.mkdirSync(actorRoot, { recursive: true });
+    realActors = new ActorManager(sessionId, identity, mesh, { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 }, manager,
+      () => {}, { actorRoot, persistent: true, mainAgent: main as any, rootId: mainAgentId });
+    globalActors = new GlobalActorRegistry(actorRoot, 64 * 1024);
+  }
+  const provider = new AgentsProvider(manager, (realActors ?? actors) as any, globalActors, main, directory, control, {} as any);
   // A task cannot grant itself spawning after launch: the admission snapshot was taken above.
   process.env.PI_FABRIC_GRANTED_RISKS = "agent";
+  const deferred: Array<Record<string, unknown>> = [];
   const context = { cwd: process.cwd(), update() {}, activity() {},
-    extensionContext: { cwd: process.cwd(), model: undefined, modelRegistry: { getAvailable: () => [], getAll: () => [], find: () => undefined },
+    deferHandoff: async (args: Record<string, unknown>) => { deferred.push(args); return { scheduled: true }; },
+    extensionContext: { cwd: process.cwd(), model: FAKE_MODEL, modelRegistry: { getAvailable: () => [FAKE_MODEL], getAll: () => [FAKE_MODEL],
+      find: (provider: string, id: string) => provider === "fake" && id === "fake" ? FAKE_MODEL : undefined },
       sessionManager: { getEntries: () => [], getSessionId: () => sessionId } } } as any;
   try {
     await directory.start();
@@ -80,10 +125,26 @@ input.on("line", async line => {
       }, { timeoutMs: 40_000, memoryLimitBytes: 64 * 1024 * 1024 });
     outcome.guest = result.value;
     if (result.error) outcome.guestError = result.error;
+    outcome.deferredHandoffs = deferred.length;
+    // Modeled outer boundary (FabricRuntimeState.runHandoffAtBoundary): the same provider's
+    // executeHandoff, invoked after the guest returned. Direct mode probes it with no deferral.
+    const boundary = task.directHandoff ? [{ model: "fake/fake", task: "direct handoff" }]
+      : task.runDeferredHandoff ? deferred : [];
+    if (boundary.length) {
+      try {
+        const before = new Set(manager.list().map((record: any) => record.id));
+        // executeHandoff waits for the child internally; the child id is taken from the real manager.
+        const compact: any = await provider.executeHandoff(boundary[0]!, context, seed(sessionId));
+        const id = manager.list().map((record: any) => record.id).find((candidate: string) => !before.has(candidate));
+        const waited: any = id ? await manager.wait(id) : {};
+        outcome.handoff = { ok: true, id, compactStatus: compact?.status, status: waited.status, text: waited.text, error: waited.error };
+      } catch (error) { outcome.handoff = refusal(error); }
+    }
     // Host-side observation of children this task's real manager actually created.
     outcome.children = manager.list().map((record: any) => ({ id: record.id, status: record.status }));
   } catch (error) { outcome.error = (error as Error).message; }
   finally {
+    if (realActors) await realActors.close();
     await manager.close(); await control.close(); await directory.close(); main.closeFollowUpDrain();
   }
   const message = { role: "assistant", content: [{ type: "text", text: JSON.stringify(outcome) }],

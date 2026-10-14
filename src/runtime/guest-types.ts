@@ -84,9 +84,10 @@ interface FabricAgentRequest {
   nice?: number;
   extensions?: boolean;
   /**
-   * Grant this child agents.run/spawn. Tasks are leaf by default: a task not itself launched
-   * recursive: true gets TaskSpawnDeniedError (code FABRIC_TASK_SPAWN_DENIED, "task agents do not
-   * spawn; return your result to your spawner"). Setting it on your own child grants you nothing.
+   * Grant this child delegation: agents.run/spawn/handoff/create/createActor/import/ask. Tasks are
+   * leaf by default: a task not itself launched recursive: true gets TaskSpawnDeniedError (code
+   * FABRIC_TASK_SPAWN_DENIED, "task agents do not spawn; return your result to your spawner") for
+   * all of them. Setting it on your own child grants you nothing. followUp/steer/tell stay allowed.
    */
   recursive?: boolean;
   /** Filesystem execution directory; relative paths resolve from the parent agent cwd. */

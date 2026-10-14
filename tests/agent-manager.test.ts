@@ -1666,6 +1666,14 @@ describe("AgentManager", () => {
           modelPolicy: { ...DEFAULT_FABRIC_CONFIG.agents.modelPolicy, fallbackModel: safeModel },
         }, { rootSessionCwd: () => boundRelaunchRootRecord.cwd, workerPath: path.resolve("tests/fixtures/fake-worker-startup-retry.mjs"), runRoot: root, preparePiModel });
         managers.push(manager);
+        if (!hasPosixTrustMetadata && !inherited) {
+          await expect(manager.run({ task: `Recover startup ${mode}`, model, transport: "process", modelReason: reason }))
+            .rejects.toMatchObject({ code: "FABRIC_MODEL_EXCEPTION_DENIED", denial: "untrusted-source" });
+          expect(launches).toBe(0);
+          expect(manager.list()).toEqual([]);
+          expect(fs.existsSync(auditFile)).toBe(false);
+          return;
+        }
         const result = await manager.run({ task: `Recover startup ${mode}`, model, transport: "process",
           ...(inherited ? { modelSource: "inherited" as const } : { modelReason: reason }) });
         const refused = mode === "missing" || mode === "expired";

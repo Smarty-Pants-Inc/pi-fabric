@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { canRemoveTerminalRun, pruneActorRunArchives, runTreeExitVeto } from "../src/storage/retention.js";
 import { initializeTaskControlDirectory, legacyTaskControlSibling, MAX_FINAL_ANSWER_BYTES, readFinalAnswerReceipt, taskControlDirectory, withLegacyTaskControlDirectory } from "../src/worker/terminal-answer.js";
 import { bytesOf, day, json, originalFiles, registerArchiveCleanup, removalPaths, roots, setup, setupCurrent } from "./task-control-archive-fixtures.js";
@@ -12,6 +12,11 @@ vi.mock("../src/storage/verified-remove.js", async importOriginal => {
   return { ...actual, verifiedRemove: vi.fn(() => ({ removed: true, bytes: 0 })) };
 });
 registerArchiveCleanup();
+const nativeGetuid = Object.getOwnPropertyDescriptor(process, "getuid");
+afterEach(() => {
+  if (nativeGetuid) Object.defineProperty(process, "getuid", nativeGetuid);
+  else Reflect.deleteProperty(process, "getuid");
+});
 // The archive's OWN fresh v2 current-only binding: bound to the held archive inode,
 // named for the archive leaf, never the source grant, never a snapshot.
 const expectOwnNullBinding = (run: string) => {
@@ -192,12 +197,20 @@ describe("actor archive paired task controls", () => {
     }
     if (bad === "missing") fs.renameSync(f.controls, f.controls + "-missing");
     if (bad === "foreign") {
-      const identity = fs.statSync(f.controls), native = fs.fstatSync;
-      vi.spyOn(fs, "fstatSync").mockImplementation(((...args: Parameters<typeof native>) => {
-        const stat = native(...args);
+      // Supply both ownership capability and the platform's actual stat path:
+      // Windows checks a directory with lstat, POSIX through its held fd.
+      const identity = fs.statSync(f.controls), uid = process.getuid?.() ?? identity.uid;
+      if (!process.getuid) Object.defineProperty(process, "getuid", { configurable: true, value: () => uid });
+      const foreign = <T extends fs.Stats | fs.BigIntStats>(stat: T): T => {
         if (String(stat.dev) !== String(identity.dev) || String(stat.ino) !== String(identity.ino)) return stat;
-        return Object.assign(Object.create(Object.getPrototypeOf(stat)), stat, { uid: typeof stat.uid === "bigint" ? BigInt((process.getuid?.() ?? 0) + 1) : (process.getuid?.() ?? 0) + 1 });
-      }) as typeof native);
+        return Object.assign(Object.create(Object.getPrototypeOf(stat)), stat, { uid: typeof stat.uid === "bigint" ? BigInt(uid + 1) : uid + 1 });
+      };
+      const fstat = fs.fstatSync, lstat = fs.lstatSync;
+      vi.spyOn(fs, "fstatSync").mockImplementation(((...args: Parameters<typeof fstat>) => foreign(fstat(...args))) as typeof fstat);
+      vi.spyOn(fs, "lstatSync").mockImplementation(((...args: Parameters<typeof lstat>) => {
+        const stat = lstat(...args);
+        return stat ? foreign(stat) : stat;
+      }) as typeof lstat);
     }
     await expect(f.store.retainRun(f.actor, f.alias, f.source)).rejects.toThrow();
     expect(fs.existsSync(taskControlDirectory(f.archive))).toBe(false);

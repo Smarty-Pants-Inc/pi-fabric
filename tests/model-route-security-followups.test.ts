@@ -11,7 +11,7 @@ import type { FabricRegistryInvocationContext } from "../src/core/action-registr
 import { FabricRuntimeState } from "../src/fabric-runtime-state.js";
 import { registerFabricPrincipalCapture } from "../src/fabric-provenance.js";
 import { JevClient, JevCredentials } from "../src/jev/client.js";
-import { FABRIC_RUN_ROOT_PREFIX, markRunRootActive, markRunRootClosed, markUnresolvedWorker, sweepTempRunRoots } from "../src/storage/retention.js";
+import { markRunRootActive, markRunRootClosed, markUnresolvedWorker, sweepTempRunRoots } from "../src/storage/retention.js";
 
 const workerPath = path.resolve("dist/worker.js");
 const pin = { model: "openai-codex/gpt-5.6-sol", effort: "high" as const };
@@ -29,13 +29,15 @@ async function setup(network: FabricConfig["approvals"]["network"] = "allow", at
   expect(fs.existsSync(workerPath), "Build the real worker before running these regressions").toBe(true);
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-route-followups-")); roots.push(root);
   const cwd = path.join(root, "work"); fs.mkdirSync(cwd);
-  const runRoot = path.join(root, FABRIC_RUN_ROOT_PREFIX + "followups");
   const agentDir = path.join(cwd, "agent");
   fs.mkdirSync(path.join(cwd, ".pi"));
   const scenario = path.join(cwd, "scenario"); fs.writeFileSync(scenario, "success");
   vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
   vi.stubEnv("PI_FABRIC_PROJECT_ROOT", cwd);
-  vi.stubEnv("PI_FABRIC_RUN_ROOT", runRoot);
+  // Host authority is not an inherited selector (refused on Windows). Clear
+  // the global POSIX fixture selector too, so this host owns a fixture-local root.
+  vi.stubEnv("PI_FABRIC_RUN_ROOT", undefined);
+  vi.stubEnv("PI_FABRIC_TMPDIR", root);
   vi.stubEnv("PI_FABRIC_PI_BINARY", path.resolve("tests/fixtures/fake-pi-route.mjs"));
   vi.stubEnv("FAKE_MODEL_SCENARIO", scenario);
   vi.stubEnv("PI_FABRIC_GRANTED_RISKS", "");
@@ -74,9 +76,11 @@ async function setup(network: FabricConfig["approvals"]["network"] = "allow", at
     const rows = fs.readFileSync(path.join(agentDir, "fabric/model-routing.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
     expect(rows).toHaveLength(2);
     expect(rows[1]).toMatchObject({ type: "outcome", decisionId: rows[0].decisionId, status: "completed" });
-    return { handle, result, rows, run: path.join(runRoot, handle.id) };
+    const run = runtime.agents.runDirectory(handle.id);
+    expect(run).toBeDefined();
+    return { handle, result, rows, run: run!, runRoot: path.dirname(run!) };
   };
-  return { cwd, runRoot, runtime, context, invocation, spawn, credentials, evaluate, http };
+  return { cwd, runtime, context, invocation, spawn, credentials, evaluate, http };
 }
 
 describe("SR-5 shadow routing obeys current ordinary Jev network approval through the real registry", () => {
@@ -334,14 +338,14 @@ describe("SR-7 Windows command-backed credential scope cut through the real regi
 });
 
 const deliveryId = "01234567-89ab-4cde-8fab-0123456789ab.json";
-function expire(fixture: Awaited<ReturnType<typeof setup>>) {
-  const now = Date.now(); markRunRootActive(fixture.runRoot, now - 10000); markRunRootClosed(fixture.runRoot, now, true);
-  return sweepTempRunRoots({ tempRoot: path.dirname(fixture.runRoot), now: now + 20000, oneShotRunRetentionMs: 10000, orphanedTempRunRetentionMs: 10000 });
+function expire(runRoot: string) {
+  const now = Date.now(); markRunRootActive(runRoot, now - 10000); markRunRootClosed(runRoot, now, true);
+  return sweepTempRunRoots({ tempRoot: path.dirname(runRoot), now: now + 20000, oneShotRunRetentionMs: 10000, orphanedTempRunRetentionMs: 10000 });
 }
 describe("SR-6 real routed worker artifacts are safely retained or collected", () => {
   it.each(["empty", "nonempty"])("collects a closed expired successful run with provenance and %s deliveries", async contents => {
     const fixture = await setup("allow", contents === "nonempty");
-    const { run } = await fixture.spawn();
+    const { run, runRoot } = await fixture.spawn();
     expect(fs.statSync(path.join(run, "task.txt.provenance.json")).isFile()).toBe(true);
     const deliveries = path.join(run, "deliveries"); expect(fs.statSync(deliveries).isDirectory()).toBe(true);
     // The real worker writes the envelope; the fake RPC peer intentionally does
@@ -356,16 +360,16 @@ describe("SR-6 real routed worker artifacts are safely retained or collected", (
     if (contents === "nonempty") {
       // Main retains unconsumed ingress, even a known worker-owned envelope.
       // Prove that veto before simulating the native hook's consumption.
-      expect(expire(fixture)).toEqual({ removedRuns: [], removedRoots: [] });
+      expect(expire(runRoot)).toEqual({ removedRuns: [], removedRoots: [] });
       expect(fs.existsSync(run)).toBe(true);
       fs.unlinkSync(path.join(deliveries, envelopes[0]!));
     }
-    const result = expire(fixture);
-    expect(result.removedRuns).toEqual([run]); expect(result.removedRoots).toEqual([fixture.runRoot]);
+    const result = expire(runRoot);
+    expect(result.removedRuns).toEqual([run]); expect(result.removedRoots).toEqual([runRoot]);
     expect(fs.existsSync(run)).toBe(false);
   });
   it.each(["pending", "live", "unresolved", "unknown", "unknown-sidecar", "delivery-unknown", "delivery-directory", "delivery-symlink", "delivery-hardlink", "deliveries-symlink", "provenance-symlink", "provenance-hardlink", "provenance-directory"])("keeps the %s veto with known artifacts present", async veto => {
-    const fixture = await setup(); const { run } = await fixture.spawn(); await fixture.runtime.shutdown();
+    const fixture = await setup(); const { run, runRoot } = await fixture.spawn(); await fixture.runtime.shutdown();
     const deliveries = path.join(run, "deliveries"); const provenance = path.join(run, "task.txt.provenance.json");
     const target = path.join(fixture.cwd, "unowned-content"); fs.writeFileSync(target, "must survive");
     if (veto === "pending") fs.writeFileSync(path.join(run, "pending-route-outcome.json"), "{}");
@@ -379,7 +383,7 @@ describe("SR-6 real routed worker artifacts are safely retained or collected", (
     if (veto === "delivery-hardlink") fs.linkSync(target, path.join(deliveries, deliveryId));
     if (veto === "deliveries-symlink") { fs.rmdirSync(deliveries); const directory = path.join(fixture.cwd, "external-directory"); fs.mkdirSync(directory); fs.symlinkSync(directory, deliveries, "junction"); }
     if (veto.startsWith("provenance-")) { fs.unlinkSync(provenance); if (veto === "provenance-directory") fs.mkdirSync(provenance); else if (veto === "provenance-symlink") fs.symlinkSync(target, provenance); else fs.linkSync(target, provenance); }
-    expect(expire(fixture)).toEqual({ removedRuns: [], removedRoots: [] });
+    expect(expire(runRoot)).toEqual({ removedRuns: [], removedRoots: [] });
     expect(fs.existsSync(run)).toBe(true); expect(fs.readFileSync(target, "utf8")).toBe("must survive");
   });
 });

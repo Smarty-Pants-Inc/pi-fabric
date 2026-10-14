@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { ResidentRequestRetention, sweepResidentRuns } from "../src/residency/retention.js";
 import { canRemoveManagedRunRoot, canRemoveTerminalRun, isPairedTaskControlEntry, markRunRootClosed, pruneActorRunArchives, removeUnreferencedRun, runTreeExitVeto, sweepTempRunRoots } from "../src/storage/retention.js";
 import { verifiedRemove } from "../src/storage/verified-remove.js";
+import { retentionV2Enabled } from "../src/storage/retention-platform.js";
 import { createHostTaskRun, initializeTaskControlDirectory, legacyTaskControlSibling, saveFinalAnswerReceipt, taskControlDirectory, taskSteerFile, TASK_CONTROL_LAYOUT } from "../src/worker/terminal-answer.js";
 import { settleTerminalControl, trackTerminalControl } from "../src/worker/terminal-controls.js";
 
@@ -14,11 +15,16 @@ vi.mock("../src/storage/verified-remove.js", async importOriginal => {
   const actual = await importOriginal<typeof import("../src/storage/verified-remove.js")>();
   return { ...actual, verifiedRemove: vi.fn(() => ({ removed: true, bytes: 0 })) };
 });
+vi.mock("../src/storage/retention-platform.js", async importOriginal => {
+  const actual = await importOriginal<typeof import("../src/storage/retention-platform.js")>();
+  return { ...actual, retentionV2Enabled: vi.fn(actual.retentionV2Enabled) };
+});
 const roots: string[] = [];
 const nativePlatform = Object.getOwnPropertyDescriptor(process, "platform")!;
 afterEach(() => {
   Object.defineProperty(process, "platform", nativePlatform);
   vi.restoreAllMocks(); vi.mocked(verifiedRemove).mockReset();
+  vi.mocked(retentionV2Enabled).mockReturnValue(nativePlatform.value !== "win32");
   vi.mocked(verifiedRemove).mockReturnValue({ removed: true, bytes: 0 });
   // Fixture cleanup is covered by the parent's recorded-removal runner locally;
   // real removal coverage belongs to hosted CI, never a local apply.
@@ -317,7 +323,8 @@ describe("paired control tree collection", () => {
 
 describe("resident pair callers", () => {
   it.each(["linux", "win32"] as const)("streaming %s keeps the fingerprint fence on both recorded pair removals", platform => {
-    Object.defineProperty(process, "platform", { ...nativePlatform, value: platform });
+    // Select the collector algorithm, not a foreign filesystem contract.
+    vi.mocked(retentionV2Enabled).mockReturnValue(platform !== "win32");
     const root = scratch(), runs = path.join(root, "runs"), f = seedCurrentRun(runs);
     const actorRoot = path.join(root, "actors"); json(path.join(actorRoot, "actors.json"), { actors: [] });
     json(path.join(root, "results", `${f.id}.json`), { ...f.record, text: "preserved full result", events: [], exitCode: 0 });

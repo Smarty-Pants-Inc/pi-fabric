@@ -6,8 +6,11 @@ import { ActorLogStore, ACTOR_MESSAGE_HISTORY_LIMIT } from "../src/actors/log-st
 import type { FabricActorMessage } from "../src/actors/types.js";
 
 const roots: string[] = [];
+const nativeGetuid = Object.getOwnPropertyDescriptor(process, "getuid");
 afterEach(() => {
   vi.restoreAllMocks();
+  if (nativeGetuid) Object.defineProperty(process, "getuid", nativeGetuid);
+  else Reflect.deleteProperty(process, "getuid");
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 const setup = () => {
@@ -111,10 +114,14 @@ describe("ActorLogStore", () => {
     else fs.writeFileSync(file, "opaque bytes");
     if (bad === "hardlink") fs.linkSync(file, path.join(root, "extra-link"));
     if (bad === "foreign") {
+      // Windows has no getuid: supply the ownership capability as well as the
+      // foreign stat, without pretending its filesystem has POSIX ancestry.
+      const uid = process.getuid?.() ?? fs.lstatSync(source).uid;
+      if (!process.getuid) Object.defineProperty(process, "getuid", { configurable: true, value: () => uid });
       const native = fs.lstatSync;
       vi.spyOn(fs, "lstatSync").mockImplementation(((...args: Parameters<typeof native>) => {
         const stat = native(...args);
-        return String(args[0]) === file && stat ? Object.assign(Object.create(Object.getPrototypeOf(stat)), stat, { uid: (process.getuid?.() ?? 0) + 1 }) : stat;
+        return String(args[0]) === file && stat ? Object.assign(Object.create(Object.getPrototypeOf(stat)), stat, { uid: uid + 1 }) : stat;
       }) as typeof native);
     }
     const prune = vi.spyOn(store, "pruneRuns");

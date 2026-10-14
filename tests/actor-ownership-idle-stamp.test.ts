@@ -13,16 +13,7 @@ import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 // reuses the poll map only while those actors' ownership inputs hold. Authority stays fresh.
 const roots: string[] = [];
 const closers: Array<() => Promise<unknown>> = [];
-const removeFixture = fs.rmSync;
-beforeEach(() => {
-  vi.spyOn(console, "warn").mockImplementation(() => {});
-  const remove = removeFixture;
-  // Product queue removal is recorded/no-op locally; real-delete CI is separate (#4664).
-  vi.spyOn(fs, "rmSync").mockImplementation((file, options) => {
-    if (/^queue-[a-f0-9]{16}\.json$/.test(path.basename(String(file)))) return;
-    return remove(file, options);
-  });
-});
+beforeEach(() => { vi.spyOn(console, "warn").mockImplementation(() => {}); });
 afterEach(async () => {
   vi.restoreAllMocks();
   for (const close of closers.splice(0).reverse()) await close().catch(() => undefined);
@@ -96,72 +87,6 @@ describe("fv2-11107 actor poll ownership stamp gate on a real ParticipantDirecto
     // Rightful restoration: ownership returns and is visible on the next poll.
     await putActor(actor.id, SELF);
     expect(actors.listOwned().map((owned) => owned.id)).toEqual([actor.id]);
-  });
-
-  it.each([false, true])("refuses a stale owner's queue mutation after a same-lineage successor takes ownership (non-empty: %s)", async (nonEmpty) => {
-    const { actors, directory, writer, putActor } = await setup();
-    const actor = await actors.create({ name: "queue-custody", instructions: "Wait", triggerTurn: false });
-    await putActor(actor.id, SELF);
-    expect(actors.listOwned().map((owned) => owned.id)).toEqual([actor.id]);
-    if (nonEmpty) {
-      actors.pauseForRelease(); // Accept durable work without launching a worker.
-      actors.tell(actor.id, "stale manager's accepted work");
-    }
-    if (!actor.sessionFile) throw new Error("persistent actor has no session file");
-    const key = digest([SELF.id, actor.residency].join("\0")).slice(0, 16);
-    const file = path.join(path.dirname(actor.sessionFile), `queue-${key}.json`);
-    const bytes = JSON.stringify({ format: 1, items: [{ id: "successor-item", source: "mesh", payload: { text: "successor work" },
-      createdAt: Date.now(), activation: {}, attempts: 0, executionStarted: false, preparationAttempts: 0,
-      bindingVersion: 2, principalLineageVersion: 1, launchEvidenceVersion: 1 }], latestActivationSequence: 1,
-      mainRevision: 0, taskRevision: 0 });
-    // Same root and residency means the successor's queue has the SAME filename.
-    // Recording is a no-op, NOT an EPERM protection: old product code must fail
-    // the zero-attempt assertion. Never execute a product delete locally (#4664).
-    const remove = removeFixture;
-    const removals: string[] = [];
-    const recorder = vi.spyOn(fs, "rmSync").mockImplementation((target, options) => {
-      if (path.resolve(String(target)) === file) { removals.push(String(target)); return; }
-      return remove(target, options);
-    });
-    const rename = fs.renameSync;
-    const overwrites: string[] = [];
-    const writeRecorder = vi.spyOn(fs, "renameSync").mockImplementation((source, target) => {
-      if (path.resolve(String(target)) === file) { overwrites.push(String(target)); return; }
-      return rename(source, target);
-    });
-    const get = vi.spyOn(directory, "get");
-    try {
-      fs.writeFileSync(file, bytes);
-      const successor = "host:same-lineage-successor";
-      get.mockClear();
-      await writer.put({ key: "topology/hosts/" + digest(successor), identity: SELF,
-        value: { format: 1, id: successor, rootId: SELF.id, identity: SELF, startedAt: 2,
-          updatedAt: Date.now(), expiresAt: Date.now() + 120_000 } });
-      const participantKey = "topology/participants/" + digest(actor.id);
-      const current = writer.get(participantKey, { fresh: true });
-      if (!current) throw new Error("actor participant missing");
-      await writer.put({ key: participantKey, identity: SELF,
-        value: { ...(current.value as Record<string, unknown>), ownerHostId: successor, updatedAt: Date.now() } });
-      expect(directory.list({ scope: "project", fresh: true }).find(row => row.id === actor.id)?.ownerHostId).toBe(successor);
-      expect(actors.listOwned()).toEqual([]); // ownership loss -> park -> persist
-      expect(removals).toEqual([]);
-      expect(overwrites).toEqual([]);
-      expect(fs.readFileSync(file, "utf8")).toBe(bytes);
-      expect(get).toHaveBeenCalledWith(actor.id, undefined, { fresh: true });
-      expect(vi.mocked(console.warn).mock.calls.filter(([text]) => String(text).includes("queue persistence refused"))).toHaveLength(1);
-
-      // Counterexample: the current owner can still persist its own queue.
-      // The recorders observe permission without deleting or replacing the file.
-      fs.writeFileSync(file, JSON.stringify({ format: 1, items: [], latestActivationSequence: 0 }));
-      await putActor(actor.id, SELF);
-      expect(actors.listOwned().map((owned) => owned.id)).toEqual([actor.id]);
-      if (nonEmpty) expect(overwrites.length).toBeGreaterThan(0);
-      else expect(removals).toEqual([file]);
-    } finally {
-      await actors.close(); // keep recorder armed through any queued ownership work
-      recorder.mockRestore();
-      writeRecorder.mockRestore();
-    }
   });
 
   it("fresh reads never take the poll map even while it is still armed", async () => {

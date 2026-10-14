@@ -649,8 +649,6 @@ export class ActorManager {
   // snapshot taken before the load (a passive view, or the empty queue a new owner parks before
   // it reloads) would replace or delete the owner's accepted work (review/astra F1 on #79).
   readonly #ownQueueRead = new Set<string>();
-  // One refusal notice per actor instance, without retaining removed actor ids forever.
-  readonly #queuePersistenceRefused = new WeakSet<ManagedActor>();
   // smarty-dev#1065: callerless work past an actor's queue limit waits here, in order, instead of
   // holding the mesh cursor for every actor of this manager (or being lost in live mode).
   readonly #overflow = new Map<string, ActorQueueItem[]>();
@@ -6520,22 +6518,6 @@ export class ActorManager {
         return true;
       });
     const file = this.#ownQueueFile(actor);
-    const mayPersistQueue = (): boolean => {
-      // A park can run inside a held poll snapshot. Every queue mutation needs
-      // fresh authority, not that snapshot's permission (same check as ownership refresh).
-      const cached = this.#directoryOwnership;
-      this.#directoryOwnership = undefined;
-      let owned = false;
-      try { owned = this.#ownershipDecision(actorId); }
-      catch { /* Unknown ownership cannot authorize a queue mutation. */ }
-      finally { this.#directoryOwnership = cached; }
-      if (owned) { this.#queuePersistenceRefused.delete(actor); return true; }
-      if (!this.#queuePersistenceRefused.has(actor)) {
-        this.#queuePersistenceRefused.add(actor);
-        console.warn(`[pi-fabric] actor ${actorId}: queue persistence refused; fresh ownership is not confirmed for this manager`);
-      }
-      return false;
-    };
     const cleanHandover = release || this.#releasePaused;
     const processedKeys = [...(this.#processedKeys.get(actorId) ?? [])];
     const pendingWindows = [...(this.#settledWindows.get(actorId) ?? [])]
@@ -6596,17 +6578,12 @@ export class ActorManager {
       // cancellation/predecessor fences require a file + namespace receipt.
       if (items.length === 0 && processedKeys.length === 0 && settledWindows.length === 0 && !cleanHandover && !durable && !cancelledPredecessors.length &&
           !pendingDeliveryOutcomes.length) {
-        if (!mayPersistQueue()) return false;
         fs.rmSync(file, { force: true });
-      } else {
-        if (!mayPersistQueue()) return false;
-        writeJsonAtomic(file, snapshot, { durable });
-      }
+      } else writeJsonAtomic(file, snapshot, { durable });
     } catch (error) {
       if (durable || pendingWindows.length || transfer) actor.lastError = errorText(error);
       if (release) throw error;
       if (cancellationFallback && snapshot) {
-        if (!mayPersistQueue()) return false;
         try {
           // This marker describes only this snapshot, not a permanent actor disable.
           const cancelled = settledWindows.length === 0 && items.every(item => item.deferredHandoff);
@@ -6627,7 +6604,6 @@ export class ActorManager {
       const sources = this.#takenOver.get(actorId);
       for (const source of sources ?? []) {
         if (source === file) continue;
-        if (!mayPersistQueue()) return false;
         try {
           fs.rmSync(source, { force: true });
           syncDirectoryChain(path.dirname(source));

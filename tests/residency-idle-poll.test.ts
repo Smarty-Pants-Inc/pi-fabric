@@ -64,15 +64,15 @@ describe("idle resident host polling (smarty-dev#6729)", () => {
       expect(await waitUntil(() => configReads() > 0)).toBe(true);
       await host.actors.create({ name: "idle-poll", instructions: "wait", residency: "durable" });
       await host.participants.refresh();
-      // Count the fleet-wide listings the idle check itself makes. The actor mesh monitor also
-      // lists participants before each of its polls; that cadence is its own and differs by
-      // platform (a 250 ms timer on Windows, file-watch wakes plus a 2 s reconcile elsewhere).
+      // Count the idle check's ownership observations, not the implementation's full
+      // participant listings: #11107 permits reuse only after validating managed inputs.
+      // The mesh monitor's separate ownership refreshes must not enter this count.
       let inCheck = 0;
       let checkListings = 0;
-      const list = host.participants.list.bind(host.participants);
-      vi.spyOn(host.participants, "list").mockImplementation((...args: Parameters<typeof list>) => {
+      const ownership = host.participants.actorOwnership.bind(host.participants);
+      vi.spyOn(host.participants, "actorOwnership").mockImplementation((...args: Parameters<typeof ownership>) => {
         if (inCheck > 0) checkListings++;
-        return list(...args);
+        return ownership(...args);
       });
       const active = host.actors.hasOwnedActors.bind(host.actors);
       const checks = vi.spyOn(host.actors, "hasOwnedActors").mockImplementation(() => {
@@ -118,6 +118,28 @@ describe("idle resident host polling (smarty-dev#6729)", () => {
       await host.close();
       fs.rmSync(root, { recursive: true, force: true });
     };
+
+    it("does not scan retained-run references or list owned actors before maintenance is due", async () => {
+      const { root, host } = fixture();
+      try {
+        await start(host);
+        vi.spyOn(ResidentRequestRetention.prototype, "due").mockReturnValue(false);
+        const references = vi.spyOn(host.agents, "retentionReferences");
+        let maintenanceListings = 0;
+        const list = host.actors.listOwned.bind(host.actors);
+        vi.spyOn(host.actors, "listOwned").mockImplementation(() => {
+          // Startup/dormancy has an independent actor observation, not retention work.
+          if (new Error().stack?.includes("#maintainRequests")) maintenanceListings++;
+          return list();
+        });
+        // Several original 100 ms maintenance ticks, but no retention obligation.
+        await sleep(400);
+        expect(references).not.toHaveBeenCalled();
+        expect(maintenanceListings).toBe(0);
+      } finally {
+        await finish(host, root);
+      }
+    });
 
     it("applies a replaced config.json retention overlay at the next maintenance pass, then caches it", async () => {
       const { root, config, file, host } = fixture();

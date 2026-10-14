@@ -610,10 +610,9 @@ export class ResidentHost {
       const participant = this.participants.get(id, undefined, { fresh });
       return participant ? participant.ownerHostId === this.hostId : undefined;
     };
-    const snapshotActorOwnership = (fresh = true): ReadonlyMap<string, boolean> => new Map(
-      this.participants.list({ scope: "project", fresh })
-        .map((participant) => [participant.id, participant.ownerHostId === this.hostId]),
-    );
+    // Polls may reuse validated ownership inputs; authority decisions still read exactly.
+    const snapshotActorOwnership = (fresh = true, actorIds?: readonly string[]): ReadonlyMap<string, boolean> =>
+      this.participants.actorOwnership(this.hostId, { fresh, ...(fresh ? {} : { actorIds }) });
     const lineageAlive = (rootId: string): boolean =>
       this.participants.lineageAlive(rootId);
     const actorRoots = residentActorRoots(config);
@@ -1380,24 +1379,17 @@ export class ResidentHost {
   #maintainRequests(): void {
     const now = Date.now();
     if (!this.#ready || this.#closed || !this.participants.canConsumeMesh()) return;
-    // smarty-dev#6337: a hung preparation never fails, so the failure-streak notice
-    // cannot fire. Check on this tick, at most every 10 s (or the threshold, if shorter).
+    // Keep the stuck-preparing cadence independent from retention, as in origin/main.
     const stuckPreparingMs = this.config.agents?.stuckPreparingMs ?? DEFAULT_STUCK_PREPARING_MS;
     if (now - this.#stuckPreparingCheckedAt >= Math.min(STUCK_PREPARING_CHECK_MS, stuckPreparingMs)) {
       this.#stuckPreparingCheckedAt = now;
-      try {
-        this.actors.reportStuckPreparing(stuckPreparingMs, now);
-      } catch {
-        // Best effort: the next tick retries; retention below must still run.
-      }
+      try { this.actors.reportStuckPreparing(stuckPreparingMs, now); } catch { /* next tick retries */ }
     }
-    if (!retentionV2Enabled() && !this.#requestRetention.due(now)) return;
-    // ensureHost/syncPiModels already publishes reloads to config.json. Apply
-    // only the same-release/root/session overlay at the next existing sweep;
-    // actor archives and agent collectors hold this same policy object.
+    // Preserve main's policy-reload observation cadence; this is one cached config stamp,
+    // not the retained-run reference scan. B gates the expensive work on due() in both modes.
     Object.assign(this.#retention, this.#currentRetention(now));
+    if (!this.#requestRetention.due(now)) return;
     const live = retentionV2Enabled() ? this.agents.retentionReferences({ now }) : this.agents.retentionReferences();
-    if (retentionV2Enabled() && !this.#requestRetention.due(now)) return;
     for (const id of this.actors.inFlightActorIds()) live.add(id);
     const stoppedWritersGone = new Set<string>();
     for (const actor of this.actors.listOwned()) {

@@ -6,7 +6,9 @@ import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import childProcess from "node:child_process";
-import { readFileRetrying, writeFileAtomic, renameAtomic, MeshLockTimeoutError, trackTemporary } from "../core/atomic-write.js";
+import { readFileRetrying, writeFileAtomic, renameAtomic, MeshLockTimeoutError, trackTemporary, isNamespaceRace,
+  requireNamespaceBarrier, syncPathNamespaceDurable } from "../core/atomic-write.js";
+import { MeshSyncNotDurableError } from "./not-durable.js";
 import { captureStoragePut, captureStorageDelete, storageRevision } from "../verified/storage.js";
 import { verifiedRemove } from "../storage/verified-remove.js";
 import { delay, describeLockHolder, errorCode, lockStats, type MeshLock, type MeshStoreContext } from "./mesh-lock.js";
@@ -601,6 +603,21 @@ const processStartedAfter = (pid: number, modifiedAt: number): boolean => {
   } catch { return false; }
 };
 
+/**
+ * `StateFile.sync()` on a platform with no durable namespace barrier (Windows: no directory fsync, and
+ * `renameAtomic` is a plain rename). state.json is replaced by a rename on every commit, so an fsync of the
+ * file cannot confirm the directory entry survives a power loss. Not retryable: the caller must not advance
+ * an external cursor or delivered mark on it (smarty-dev#9313; one MeshSyncNotDurableError shape for every backend).
+ */
+export class MeshStateFileNotDurableError extends MeshSyncNotDurableError {
+  constructor(readonly platform: NodeJS.Platform) {
+    super("FABRIC_MESH_STATE_FILE_NOT_DURABLE", "state", `state.json is replaced by a rename and ${platform} has no directory fsync barrier for it, so a commit may not survive a power loss`);
+    this.name = "MeshStateFileNotDurableError";
+  }
+}
+
+const stateFileNotDurable = (platform: NodeJS.Platform): MeshStateFileNotDurableError => new MeshStateFileNotDurableError(platform);
+
 export class StateFile implements StateBackend {
   readonly kind = "file" as const;
   /** Set by the backend factory when a configured sqlite/shadow backend runs as file. */
@@ -1167,6 +1184,33 @@ export class StateFile implements StateBackend {
   /** R20 write fence: every state.json writer takes `.lock`, which the caller holds. */
   withWriteFence<T>(operation: () => T): T {
     return operation();
+  }
+
+  /**
+   * Durability barrier (smarty-dev#9313): state.json is renamed into place without an fsync, so this
+   * fsyncs the file the path names now and its namespace, outside `.lock`. A commit made before the
+   * call is that file or an older one it replaced, and the directory barrier persists the rename. A
+   * concurrent rename during the namespace check is retried within the budget; an I/O error is not.
+   * On Windows there is no directory barrier (syncPathNamespace skips it), so the durable namespace
+   * variant fails closed with MeshStateFileNotDurableError, before any I/O, instead of claiming
+   * durability for the rename.
+   */
+  async sync(budgetMs: number): Promise<void> {
+    requireNamespaceBarrier(stateFileNotDurable);
+    const deadline = Date.now() + Math.max(0, budgetMs);
+    for (;;) {
+      let fd: number;
+      try { fd = fs.openSync(this.#statePath, "r"); }
+      catch (error) { if (errorCode(error) === "ENOENT") return; throw error; }
+      try {
+        fs.fsyncSync(fd);
+        syncPathNamespaceDurable(this.#statePath, fs.fstatSync(fd), stateFileNotDurable);
+        return;
+      } catch (error) {
+        if (!isNamespaceRace(error) || Date.now() >= deadline) throw error;
+      } finally { fs.closeSync(fd); }
+      await delay(1 + Math.random() * 3);
+    }
   }
 
   async confirmWritable(onAcquired?: (at: number) => void): Promise<void> {

@@ -9,6 +9,13 @@ import type { AgentRunResult } from "../src/agents/types.js";
 import { MeshStore } from "../src/mesh/store.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 
+// RECORDED-CALL seam (#4664): real rotations/stores/worker still run, but this suite never
+// executes the product backup deleter. vitest records every prune request instead.
+vi.mock("../src/storage/retention.js", async importOriginal => ({
+  ...await importOriginal<typeof import("../src/storage/retention.js")>(),
+  pruneActorSessionBackups: vi.fn(),
+}));
+
 // smarty-dev#3238: review actors silently dropped events on "Context exceeds window". A real
 // ActorManager, MeshStore, AgentManager and worker drive an offline Pi child that refuses a run
 // with the worker's window error: a carried session is reset and the event retried once; an
@@ -36,7 +43,7 @@ const waitFor = async (predicate: () => boolean, timeoutMs = 60_000): Promise<vo
   }
 };
 
-const setup = () => {
+const setup = (options: ConstructorParameters<typeof ActorManager>[6] = {}) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-overflow-"));
   roots.push(dir);
   const log = path.join(dir, "prompts.jsonl");
@@ -49,7 +56,7 @@ const setup = () => {
   const alarms: FabricActorDeliveryRequest[] = [];
   const makeActors = () => new ActorManager("overflow-test", { id: "owner", name: "owner", kind: "main", sessionId: "overflow-test" }, mesh,
     { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 }, agents, (request) => { alarms.push(request); },
-    { actorRoot: path.join(dir, "actors"), persistent: true, maxSessionBytes: 0 });
+    { actorRoot: path.join(dir, "actors"), persistent: true, maxSessionBytes: 0, ...options });
   const actors = makeActors();
   managers.push(actors, agents);
   const prompts = (): Prompt[] => fs.existsSync(log)
@@ -110,7 +117,7 @@ describe("actor context overflow (smarty-dev#3238, offline Pi child)", () => {
     expect(s.alarms).toEqual([]);
   }, TEST_GUARD_MS);
 
-  it.each(["text", "directive"] as const)("10049 blocks and alarms only after a second real preflight overflow (%s)", async responseMode => {
+  it.each(["text", "directive"] as const)("10049 alarms only after a second real preflight overflow and restores routing (%s)", async responseMode => {
     const s = setup();
     const actor = await s.create("preflight-stubborn", { inferenceContext: "activation", responseMode });
     await s.actors.ask(actor.id, "FIRST_REVIEW");
@@ -123,8 +130,9 @@ describe("actor context overflow (smarty-dev#3238, offline Pi child)", () => {
       { history: false, marker: "PREFLIGHT_ALWAYS" },
     ]);
     expect(fs.readFileSync(path.join(s.dir, "prompts.jsonl.requests"), "utf8")).toBe("request\n");
-    expect(resets(s.actors, actor.id)).toHaveLength(1);
-    expect(s.actors.status(actor.id).activationBlocked).toMatchObject({ code: "context-overflow", class: "hard", count: 1 });
+    await waitFor(() => resets(s.actors, actor.id).length === 2 && s.actors.status(actor.id).activationBlocked === undefined);
+    expect(resets(s.actors, actor.id)).toHaveLength(2);
+    expect(s.actors.status(actor.id).activationBlocked).toBeUndefined();
     expect(s.ownerAlarms()).toHaveLength(1);
     expect(s.overflowEvents()).toHaveLength(1);
     expect(s.alarms).toHaveLength(1);
@@ -258,13 +266,15 @@ describe("actor context overflow (smarty-dev#3238, offline Pi child)", () => {
       },
     });
     // No retry loop: a fresh session that cannot fit the event ran it exactly once.
-    expect(s.prompts()).toEqual([{ history: false, overflow: true, session: header(actor.sessionFile!), marker: "OVERFLOW_ALWAYS" }]);
+    expect(s.prompts()).toEqual([{ history: false, overflow: true, session: expect.any(String), marker: "OVERFLOW_ALWAYS" }]);
+    await waitFor(() => s.actors.status(actor.id).activationBlocked === undefined && resets(s.actors, actor.id).length === 1);
+    expect(header(actor.sessionFile!)).not.toBe(s.prompts()[0]!.session);
     // The existing owner alarm, and the failure is recorded on the actor, not as a silent drop.
     expect(s.ownerAlarms()).toEqual([expect.objectContaining({ data: expect.objectContaining({ actorId: actor.id, reason: "context_window" }) })]);
     expect(s.alarms).toHaveLength(1);
     const status = s.actors.status(actor.id);
     expect(status.status).not.toBe("stopped");
-    expect(status.activationBlocked).toMatchObject({ code: "context-overflow", count: 1 });
+    expect(status.activationBlocked).toBeUndefined();
     const messages = s.actors.messages(actor.id, 50);
     expect(messages.filter((message) => message.error?.includes("Context exceeds window"))).toHaveLength(1);
     expect(messages.some((message) => message.error?.startsWith("Dropped"))).toBe(false);
@@ -287,7 +297,8 @@ describe("actor context overflow (smarty-dev#3238, offline Pi child)", () => {
     expect(s.prompts().map(({ history, overflow }) => ({ history, overflow }))).toEqual([
       { history: false, overflow: false }, { history: true, overflow: true }, { history: false, overflow: true },
     ]);
-    expect(resets(s.actors, actor.id)).toHaveLength(1);
+    await waitFor(() => resets(s.actors, actor.id).length === 2 && s.actors.status(actor.id).activationBlocked === undefined);
+    expect(resets(s.actors, actor.id)).toHaveLength(2);
     expect(s.overflowEvents()).toEqual([expect.objectContaining({ data: expect.objectContaining({ eventRef: expect.objectContaining({ pr: 77 }) }) })]);
     expect(s.ownerAlarms()).toHaveLength(1);
     expect(s.alarms[0]!.message.text).toContain("retried once after resetting its session");
@@ -368,26 +379,49 @@ describe("actor context overflow (smarty-dev#3238, offline Pi child)", () => {
     expect(s.overflowEvents()).toEqual([expect.objectContaining({ data: expect.objectContaining({
       reason: "no verdict (context overflow)", eventRef: expect.objectContaining({ pr: 41 }) }) })]);
     expect(s.ownerAlarms()).toEqual([expect.objectContaining({ data: expect.objectContaining({ actorId: actor.id, reason: "context_window" }) })]);
-    expect(s.actors.status(actor.id).activationBlocked).toMatchObject({ code: "context-overflow", count: 1 });
+    await waitFor(() => s.actors.status(actor.id).activationBlocked === undefined && resets(s.actors, actor.id).length === 1);
+    expect(s.actors.status(actor.id).activationBlocked).toBeUndefined();
   }, TEST_GUARD_MS);
 
   // Round 3 (PR #853 review, P1 src/actors/manager.ts): a retry replays the event. After a tool ran,
   // a replay could repeat its side effects, so the overflow settles like a fresh-session overflow.
-  it("does not replay an event whose run executed a tool before it overflowed: no retry, overflow notice and alarm", async () => {
+  it("fails a toolful overflowing item with its typed code, never replays it, and runs already queued work fresh", async () => {
     const s = setup();
-    s.recordResults();
     const actor = await s.create("tooling");
     await s.actors.ask(actor.id, "FIRST_REVIEW");
+    await waitFor(() => s.actors.inFlightCount() === 0);
     const carried = header(actor.sessionFile!);
-    await expect(s.actors.ask(actor.id, "TOOL_THEN_OVERFLOW_ON_HISTORY", { pr: 88 })).rejects.toThrow(/prompt is too long/);
-    expect(s.results.at(-1)).toMatchObject({ status: "failed", errorCode: "CONTEXT_OVERFLOW", toolCalls: 1 });
-    // One run on the carried session, never a fresh-session replay; the side effect happened once.
+    // Gate only delivery of the real process result, not the worker or its tool execution.
+    let release!: () => void, entered!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const ready = new Promise<void>(resolve => { entered = resolve; });
+    const run = s.agents.run.bind(s.agents);
+    vi.spyOn(s.agents, "run").mockImplementation(async (...args: Parameters<AgentManager["run"]>) => {
+      const result = await run(...args);
+      s.results.push(result);
+      if (result.toolCalls > 0) { entered(); await gate; }
+      return result;
+    });
+    const failed = s.actors.ask(actor.id, "TOOL_THEN_OVERFLOW_ON_HISTORY", { pr: 88 }).catch(error => error);
+    await ready;
+    const next = s.actors.ask(actor.id, "NEXT_REVIEW");
+    release();
+    expect(await failed).toMatchObject({ code: "CONTEXT_OVERFLOW", message: expect.stringContaining("prompt is too long") });
+    await expect(next).resolves.toMatchObject({ text: "verdict: ok" });
+    await waitFor(() => s.actors.inFlightCount() === 0);
+    expect(s.results).toEqual([
+      expect.objectContaining({ status: "failed", errorCode: "CONTEXT_OVERFLOW", toolCalls: 1 }),
+      expect.objectContaining({ status: "completed", toolCalls: 0 }),
+    ]);
+    // One failed run and one tool effect; only its distinct, already queued successor runs fresh.
     expect(s.prompts()).toEqual([
       { history: false, overflow: false, session: carried, marker: "FIRST_REVIEW" },
       { history: true, overflow: true, session: carried, marker: "TOOL_THEN_OVERFLOW_ON_HISTORY" },
+      { history: false, overflow: false, session: expect.not.stringMatching(carried), marker: "NEXT_REVIEW" },
     ]);
     expect(s.toolRuns()).toHaveLength(1);
-    expect(resets(s.actors, actor.id)).toEqual([]);
+    await waitFor(() => resets(s.actors, actor.id).length === 1 && s.actors.status(actor.id).activationBlocked === undefined);
+    expect(resets(s.actors, actor.id)).toEqual([expect.objectContaining({ trigger: "context", overflow: true })]);
     const overflowMessages = s.actors.messages(actor.id, 50)
       .map((message) => (message.data as { contextOverflow?: Record<string, unknown> } | undefined)?.contextOverflow)
       .filter((value): value is Record<string, unknown> => value !== undefined);
@@ -396,10 +430,10 @@ describe("actor context overflow (smarty-dev#3238, offline Pi child)", () => {
     expect(s.overflowEvents()).toEqual([expect.objectContaining({ data: expect.objectContaining({
       reason: "no verdict (context overflow)", eventRef: expect.objectContaining({ pr: 88 }) }) })]);
     expect(s.ownerAlarms()).toEqual([expect.objectContaining({ data: expect.objectContaining({ actorId: actor.id, reason: "context_window" }) })]);
-    expect(s.actors.status(actor.id).activationBlocked).toMatchObject({ code: "context-overflow", count: 1 });
+    expect(s.actors.status(actor.id).activationBlocked).toBeUndefined();
     expect(s.actors.status(actor.id).status).not.toBe("stopped");
     await new Promise((resolve) => setTimeout(resolve, 200));
-    expect(s.prompts()).toHaveLength(2);
+    expect(s.prompts()).toHaveLength(3);
     expect(s.toolRuns()).toHaveLength(1);
   }, TEST_GUARD_MS);
 
@@ -436,6 +470,249 @@ describe("actor context overflow (smarty-dev#3238, offline Pi child)", () => {
     expect(s.overflowEvents()).toEqual([]);
     await new Promise((resolve) => setTimeout(resolve, 200));
     expect(s.prompts()).toHaveLength(3);
+  }, TEST_GUARD_MS);
+
+  it("re-arms a successor queued while a fresh overflow's final reset publication is still settling", async () => {
+    const s = setup();
+    const actor = await s.create("reset-rearm");
+    let release!: () => void, entered!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const ready = new Promise<void>(resolve => { entered = resolve; });
+    const put = s.mesh.put.bind(s.mesh);
+    let gated = false;
+    vi.spyOn(s.mesh, "put").mockImplementation(async request => {
+      if (!gated && request.key === `actors/overflow-test/${actor.id}` && resets(s.actors, actor.id).length === 1 &&
+          !(request.value as { activationBlocked?: unknown }).activationBlocked) {
+        gated = true; entered(); await gate;
+      }
+      return put(request);
+    });
+    const failed = s.actors.ask(actor.id, "OVERFLOW_ALWAYS").catch(error => error);
+    await ready;
+    // The drain's loop already ended, but its final reset still owns admission.
+    const next = s.actors.ask(actor.id, "NEXT_REVIEW");
+    release();
+    expect(await failed).toMatchObject({ code: "CONTEXT_OVERFLOW" });
+    await expect(next).resolves.toMatchObject({ text: "verdict: ok" });
+    await waitFor(() => s.actors.inFlightCount() === 0);
+    expect(s.prompts().map(({ history, marker }) => ({ history, marker }))).toEqual([
+      { history: false, marker: "OVERFLOW_ALWAYS" }, { history: false, marker: "NEXT_REVIEW" },
+    ]);
+    expect(s.ownerAlarms()).toHaveLength(1);
+    expect(s.overflowEvents()).toHaveLength(1);
+    expect(s.actors.status(actor.id).activationBlocked).toBeUndefined();
+  }, TEST_GUARD_MS);
+
+  it("keeps the exact once-only retry ahead of coalesced successors across a host reload", async () => {
+    const s = setup();
+    const actor = await s.create("retry-coalesce", { topics: ["github.retry"], coalesceKey: "payload.pull_request.number" });
+    const ingress = { id: "ingress", name: "ingress", kind: "agent" as const };
+    const publish = (title: string) => s.mesh.publish({ topic: "github.retry", from: ingress,
+      data: { payload: { title, pull_request: { number: 996 } } } });
+    const queue = () => fs.readdirSync(path.dirname(actor.sessionFile!)).filter(name => /^queue-.*\.json$/.test(name))
+      .flatMap(name => (JSON.parse(fs.readFileSync(path.join(path.dirname(actor.sessionFile!), name), "utf8")) as
+        { items: Array<{ id: string; overflowRetried?: boolean; executionStarted?: boolean; payload: { data: { payload: { title: string } } } }> }).items);
+    await s.actors.ask(actor.id, "FIRST_REVIEW");
+    await waitFor(() => s.actors.inFlightCount() === 0);
+    // Hold settlement after the retry checkpoint, but keep ingress live: pauseForRelease
+    // also pauses mesh ingestion, so it cannot be used until the successors are accepted.
+    let release!: () => void, entered!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const ready = new Promise<void>(resolve => { entered = resolve; });
+    const put = s.mesh.put.bind(s.mesh);
+    let gated = false;
+    vi.spyOn(s.mesh, "put").mockImplementation(async request => {
+      if (!gated && request.key === `actors/overflow-test/${actor.id}` &&
+          queue().some(item => item.overflowRetried && !item.executionStarted)) {
+        gated = true; entered(); await gate;
+      }
+      return put(request);
+    });
+    try {
+      await publish("OVERFLOW_ON_HISTORY");
+      await ready;
+      const retryId = queue()[0]!.id;
+      await publish("NEXT_REVIEW");
+      await publish("LAST_REVIEW");
+      await waitFor(() => queue().length === 2 && queue()[1]!.payload.data.payload.title === "LAST_REVIEW");
+      expect(queue()[0]).toMatchObject({ id: retryId, overflowRetried: true, payload: { data: { payload: { title: "OVERFLOW_ON_HISTORY" } } } });
+      s.actors.pauseForRelease();
+    } finally { release(); }
+    await s.actors.close();
+    vi.restoreAllMocks();
+    const restarted = s.makeActors();
+    managers.push(restarted);
+    await waitFor(() => s.prompts().length === 4 && restarted.inFlightCount() === 0);
+    expect(s.prompts().map(({ history, marker }) => ({ history, marker }))).toEqual([
+      { history: false, marker: "FIRST_REVIEW" }, { history: true, marker: "OVERFLOW_ON_HISTORY" },
+      { history: false, marker: "OVERFLOW_ON_HISTORY" }, { history: true, marker: "LAST_REVIEW" },
+    ]);
+    expect(resets(restarted, actor.id)).toHaveLength(1);
+    expect(s.overflowEvents()).toEqual([]);
+    expect(s.ownerAlarms()).toEqual([]);
+    expect(queue()).toEqual([]);
+  }, TEST_GUARD_MS);
+
+  it.each(["idle", "deferred"] as const)("a real process %s hard-block reset clears durable routing and runs queued/next work fresh", async mode => {
+    const s = setup();
+    const actor = await s.create(`reset-${mode}`);
+    await s.actors.ask(actor.id, "FIRST_REVIEW");
+    await waitFor(() => s.actors.inFlightCount() === 0);
+    const carried = header(actor.sessionFile!);
+    const run = s.agents.run.bind(s.agents);
+    let release!: () => void, entered!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const ready = new Promise<void>(resolve => { entered = resolve; });
+    vi.spyOn(s.agents, "run").mockImplementation(async (...args: Parameters<AgentManager["run"]>) => {
+      const result = await run(...args);
+      if (mode === "deferred" && result.status === "failed") { entered(); await gate; }
+      return result;
+    });
+    const failed = s.actors.ask(actor.id, "QUOTED_PHRASE").catch(error => error);
+    let next: ReturnType<ActorManager["ask"]>;
+    let owner = s.actors;
+    if (mode === "deferred") {
+      await ready;
+      const reset = s.actors.resetSession(actor.id);
+      next = s.actors.ask(actor.id, "NEXT_REVIEW");
+      release();
+      expect(await failed).toBeInstanceOf(Error);
+      await expect(reset).resolves.toMatchObject({ id: actor.id });
+    } else {
+      expect(await failed).toBeInstanceOf(Error);
+      await waitFor(() => s.actors.inFlightCount() === 0);
+      expect(s.actors.status(actor.id).activationBlocked).toMatchObject({ class: "hard" });
+      await expect(s.actors.resetSession(actor.id)).resolves.toMatchObject({ id: actor.id, status: "idle" });
+      // Read through a fresh manager BEFORE graceful close can conceal a missing reset commit.
+      owner = s.makeActors();
+      managers.push(owner);
+      expect(owner.status(actor.id).activationBlocked).toBeUndefined();
+      await s.actors.close();
+      next = owner.ask(actor.id, "NEXT_REVIEW");
+    }
+    await expect(next).resolves.toMatchObject({ text: "verdict: ok" });
+    await waitFor(() => owner.inFlightCount() === 0);
+    expect(s.prompts().at(-1)).toMatchObject({ history: false, session: expect.not.stringMatching(carried), marker: "NEXT_REVIEW" });
+    expect(owner.status(actor.id).activationBlocked).toBeUndefined();
+    const registry = JSON.parse(fs.readFileSync(path.join(s.dir, "actors", "actors.json"), "utf8"));
+    expect(registry.actors.find((row: { id: string }) => row.id === actor.id)).not.toHaveProperty("activationBlocked");
+    await waitFor(() => (s.mesh.get(`actors/overflow-test/${actor.id}`)?.value as { activationBlocked?: unknown } | undefined)?.activationBlocked === undefined);
+    expect(resets(owner, actor.id)).toEqual([expect.objectContaining({ trigger: "requested" })]);
+    expect(s.overflowEvents()).toEqual([]);
+  }, TEST_GUARD_MS);
+
+  it.each([false, true])("a real stream disconnect stays transient with bounded backoff, even with a legacy false overflow tag (%s)", async malformed => {
+    const cooldown = 987_654;
+    const s = setup({ transientBlockCooldownMs: cooldown, transientBlockMaxMs: cooldown });
+    const actor = await s.create("stream");
+    await s.actors.ask(actor.id, "FIRST_REVIEW");
+    await waitFor(() => s.actors.inFlightCount() === 0);
+    const carried = header(actor.sessionFile!);
+    const wakes: Array<() => void> = [];
+    const realSetTimeout = globalThis.setTimeout;
+    vi.spyOn(globalThis, "setTimeout").mockImplementation(((callback: () => void, ms?: number, ...args: unknown[]) => {
+      if (ms === cooldown) wakes.push(callback);
+      return realSetTimeout(callback, ms, ...args);
+    }) as typeof setTimeout);
+    const run = s.agents.run.bind(s.agents);
+    vi.spyOn(s.agents, "run").mockImplementation(async (...args: Parameters<AgentManager["run"]>) => {
+      const result = await run(...args);
+      if (malformed && result.status === "failed") result.errorCode = "CONTEXT_OVERFLOW";
+      s.results.push(result);
+      return result;
+    });
+    await expect(s.actors.ask(actor.id, "STREAM_DISCONNECT_ONCE")).rejects.toThrow(/stream disconnected before completion/);
+    await waitFor(() => s.actors.inFlightCount() === 0);
+    const blocked = s.actors.status(actor.id).activationBlocked!;
+    expect(blocked).toMatchObject({ code: "provider-transient", class: "transient", retryAt: blocked.since + cooldown });
+    expect(s.prompts().map(({ marker }) => marker)).toEqual(["FIRST_REVIEW", "STREAM_DISCONNECT_ONCE"]);
+    expect(s.results[0]).toMatchObject({ status: "failed", toolCalls: 0 });
+    expect(resets(s.actors, actor.id)).toEqual([]);
+    expect(s.overflowEvents()).toEqual([]);
+    expect(s.ownerAlarms()).toEqual([]);
+    expect(wakes).toHaveLength(1);
+    const realNow = Date.now.bind(Date);
+    const skew = blocked.retryAt! + 1 - realNow();
+    vi.spyOn(Date, "now").mockImplementation(() => realNow() + skew);
+    wakes[0]!();
+    const presence = () => s.mesh.get(`actors/overflow-test/${actor.id}`)?.value as
+      { activationBlocked?: unknown; activationBlockExpired?: { code: string } } | undefined;
+    await waitFor(() => presence()?.activationBlockExpired?.code === "provider-transient");
+    expect(presence()?.activationBlocked).toBeUndefined();
+    await expect(s.actors.ask(actor.id, "STREAM_DISCONNECT_ONCE")).resolves.toMatchObject({ text: "verdict: ok" });
+    await waitFor(() => s.actors.inFlightCount() === 0);
+    expect(s.prompts().map(({ marker }) => marker)).toEqual(["FIRST_REVIEW", "STREAM_DISCONNECT_ONCE", "STREAM_DISCONNECT_ONCE"]);
+    expect(header(actor.sessionFile!)).toBe(carried);
+    expect(s.actors.status(actor.id).activationBlocked).toBeUndefined();
+    expect(resets(s.actors, actor.id)).toEqual([]);
+  }, TEST_GUARD_MS);
+
+  it("keeps permanent worker warning evidence hard when a stream failure carries a contradictory legacy overflow tag", async () => {
+    const s = setup();
+    const actor = await s.create("stream-security");
+    await s.actors.ask(actor.id, "FIRST_REVIEW");
+    await waitFor(() => s.actors.inFlightCount() === 0);
+    const run = s.agents.run.bind(s.agents);
+    vi.spyOn(s.agents, "run").mockImplementation(async (...args: Parameters<AgentManager["run"]>) => {
+      const result = await run(...args);
+      if (result.status === "failed") {
+        result.errorCode = "CONTEXT_OVERFLOW";
+        result.warnings = ["Refused by security policy"];
+      }
+      return result;
+    });
+    await expect(s.actors.ask(actor.id, "STREAM_DISCONNECT_ONCE")).rejects.toThrow(/stream disconnected before completion/);
+    await waitFor(() => s.actors.inFlightCount() === 0);
+    expect(s.actors.status(actor.id).activationBlocked).toMatchObject({ code: "security-policy", class: "hard" });
+    expect(s.actors.status(actor.id).activationBlocked).not.toHaveProperty("retryAt");
+    expect(s.prompts()).toHaveLength(2);
+    expect(resets(s.actors, actor.id)).toEqual([]);
+    expect(s.overflowEvents()).toEqual([]);
+  }, TEST_GUARD_MS);
+
+  it.each([
+    ["stream", "Model stream disconnected before a complete assistant response: other side closed", "provider-transient"],
+    ["overflow", "Context exceeds window: estimated 272511 input tokens, window 272000", undefined],
+    ["auth", "401 Unauthorized: stream disconnected", "auth"],
+    ["security", "Refused by security policy: stream disconnected", "security-policy"],
+  ] as const)("repairs a restored legacy %s overflow tag without replaying its settled item", async (_name, reason, expectedCode) => {
+    const s = setup();
+    const actor = await s.create("legacy");
+    await s.actors.ask(actor.id, "FIRST_REVIEW");
+    await waitFor(() => s.actors.inFlightCount() === 0);
+    const carried = header(actor.sessionFile!);
+    await s.actors.close();
+    const file = path.join(s.dir, "actors", "actors.json");
+    const registry = JSON.parse(fs.readFileSync(file, "utf8"));
+    const row = registry.actors.find((candidate: { id: string }) => candidate.id === actor.id);
+    row.activationBlocked = { code: "context-overflow", class: "hard", reason, since: Date.now() - 24 * 60 * 60 * 1000,
+      count: 3, classification: "permanent: context window exceeded (typed CONTEXT_OVERFLOW run code)" };
+    row.failureStreak = { count: 3, notified: true };
+    fs.writeFileSync(file, JSON.stringify(registry));
+    const restarted = s.makeActors();
+    managers.push(restarted);
+    const presence = () => s.mesh.get(`actors/overflow-test/${actor.id}`)?.value as
+      { activationBlocked?: { code: string }; activationBlockExpired?: { code: string } } | undefined;
+    if (expectedCode === "provider-transient") {
+      // Upgrade/startup alone repairs the routing view; no new activation or manual reset is needed.
+      await waitFor(() => presence()?.activationBlockExpired?.code === expectedCode);
+      expect(presence()?.activationBlocked).toBeUndefined();
+      expect(header(actor.sessionFile!)).toBe(carried);
+    } else if (expectedCode === undefined) {
+      await waitFor(() => resets(restarted, actor.id).length === 1 && presence()?.activationBlocked === undefined);
+      expect(header(actor.sessionFile!)).not.toBe(carried);
+    } else {
+      await waitFor(() => presence()?.activationBlocked?.code === expectedCode);
+      expect(restarted.status(actor.id).activationBlocked).toMatchObject({ code: expectedCode, class: "hard" });
+      expect(resets(restarted, actor.id)).toEqual([]);
+      await restarted.resetSession(actor.id);
+    }
+    // The old failure is already settled: repairing its session/block must not resurrect it.
+    expect(s.prompts()).toHaveLength(1);
+    await expect(restarted.ask(actor.id, "NEXT_REVIEW")).resolves.toMatchObject({ text: "verdict: ok" });
+    await waitFor(() => restarted.inFlightCount() === 0);
+    expect(s.prompts()).toHaveLength(2);
+    expect(restarted.status(actor.id).activationBlocked).toBeUndefined();
   }, TEST_GUARD_MS);
 
   it("addresses the triggering event by topic, key and PR or issue reference", () => {

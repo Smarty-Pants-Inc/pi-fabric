@@ -503,6 +503,45 @@ describe("NATS state snapshots and purge: bounded replay (smarty-dev#7504)", () 
     replica.close();
   });
 
+  it("a lagging replica that installs a newer snapshot on re-sync notifies its state listeners once for the install", async () => {
+    const server = fakeJetStream();
+    const backend = await open(server, { snapshotEvery: 0 });
+    await backend.put({ key: "n/0", value: 0, identity });
+    const replicaPort = server.port();
+    const replica = await NatsStateBackend.open({ port: replicaPort, stream: "S", subject: "S.state", snapshotSubject: "S.snapshot", maxEventBytes: 1 << 20 });
+    const originalSeq = replica.diagnostics().nats!.appliedSeq;
+    let calls = 0;
+    const unsubscribe = replica.subscribeStateChanges(() => { calls++; });
+    let release!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    let atInstall: { calls: number; keys: string[] } | undefined;
+    try {
+      replicaPort.pause();
+      for (let index = 1; index < 4; index++) await backend.put({ key: `n/${index}`, value: index, identity });
+      expect(await backend.compact()).toBe(true);
+      await backend.put({ key: "n/after", value: 1, identity });
+      // Hold the re-sync's replacement consumer: only the snapshot install has happened, no replay can mask it.
+      server.beforeConsume = async afterSeq => {
+        if (afterSeq <= originalSeq || atInstall) return;
+        await settle();
+        atInstall = { calls, keys: replica.listAll("n/").map(entry => entry.key) };
+        await held;
+      };
+      expect(calls).toBe(0);
+      replicaPort.resume(); // the purge leaves a gap: the replica re-syncs from the snapshot
+      for (let tries = 0; tries < 200 && !atInstall; tries++) await settle();
+      expect(atInstall).toEqual({ calls: 1, keys: ["n/0", "n/1", "n/2", "n/3"] });
+      release();
+      for (let tries = 0; tries < 200 && replica.diagnostics().nats!.appliedSeq < server.messages.length; tries++) await settle();
+      expect(replica.listAll("n/")).toEqual(backend.listAll("n/"));
+    } finally {
+      release();
+      delete server.beforeConsume;
+      unsubscribe();
+      replica.close();
+    }
+  });
+
   it("a lost ack whose stored batch was purged before the lookup is an unknown outcome, never a rerun", async () => {
     const server = fakeJetStream();
     const backend = await open(server, { snapshotEvery: 0 });

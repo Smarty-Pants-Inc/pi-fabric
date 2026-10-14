@@ -49,6 +49,7 @@ const GUEST_FABRIC_ERROR_NAMES: Readonly<Record<string, string>> = Object.freeze
   FABRIC_INTERRUPT_RATE_LIMITED: "FabricInterruptRateLimitedError",
   FABRIC_PARTICIPANT_STALE: "FabricParticipantStaleError",
   FABRIC_RELAY_DESTINATION_UNAVAILABLE: "FabricRelayDestinationUnavailableError",
+  FABRIC_IDEMPOTENCY_KEY_REUSED: "FabricIdempotencyKeyReusedError",
   FABRIC_PARTICIPANT_NOT_YET_MIRRORED: "FabricParticipantNotYetMirroredError",
   FABRIC_PARTICIPANT_NON_INTERACTIVE: "FabricParticipantNonInteractiveError",
   FABRIC_TASK_ESCALATION_TARGET_DENIED: "TaskEscalationTargetError",
@@ -71,7 +72,7 @@ const guestFabricErrorMetadata = (error: unknown): Record<string, string | boole
   const metadata: Record<string, string | boolean> = { name, code };
   const retryable = Object.getOwnPropertyDescriptor(error, "retryable")?.value;
   if (typeof retryable === "boolean") metadata.retryable = retryable;
-  if (code === "FABRIC_PARTICIPANT_STALE" || code === "FABRIC_RELAY_DESTINATION_UNAVAILABLE") {
+  if (code === "FABRIC_PARTICIPANT_STALE" || code === "FABRIC_RELAY_DESTINATION_UNAVAILABLE" || code === "FABRIC_IDEMPOTENCY_KEY_REUSED") {
     // The public message schema bounds retry keys to 1-200 chars. Read only own
     // data properties: never invoke a host getter or export unrelated metadata.
     const key = Object.getOwnPropertyDescriptor(error, "idempotencyKey")?.value;

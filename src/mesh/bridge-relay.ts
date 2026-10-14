@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { peerCredentials, type PeerInfo } from "../records/peer.js";
 import type { BridgePublish } from "./bridge.js";
+import { FABRIC_IDEMPOTENCY_KEY_REUSED, FabricIdempotencyKeyReusedError } from "./control-idempotency.js";
 
 export const FABRIC_RELAY_DESTINATION_UNAVAILABLE = "FABRIC_RELAY_DESTINATION_UNAVAILABLE";
 
@@ -316,6 +317,7 @@ const encode = (value: unknown): Buffer => {
 const READY = encode({ version: 1, ready: true });
 const OK = encode({ version: 1, ok: true });
 const REFUSED = encode({ version: 1, ok: false, code: FABRIC_RELAY_DESTINATION_UNAVAILABLE });
+const IDEMPOTENCY_REFUSED = encode({ version: 1, ok: false, code: FABRIC_IDEMPOTENCY_KEY_REUSED });
 const parse = (buffer: Buffer): unknown => {
   const text = buffer.toString("utf8");
   if (!Buffer.from(text, "utf8").equals(buffer)) throw unavailable();
@@ -496,9 +498,10 @@ export async function startBridgeRelay(options: {
           if (closed || !ready) throw unavailable();
           limit.remaining();
           await limit.wait(writeFrame(socket, OK, true));
-        } catch {
+        } catch (error) {
           if (!socket.destroyed && !socket.writableEnded) {
-            try { await limit.wait(writeFrame(socket, REFUSED, true)); } catch { /* fixed refusal or connection loss only */ }
+            const refusal = object(error) && error.code === FABRIC_IDEMPOTENCY_KEY_REUSED ? IDEMPOTENCY_REFUSED : REFUSED;
+            try { await limit.wait(writeFrame(socket, refusal, true)); } catch { /* fixed refusal or connection loss only */ }
           }
         } finally { limit.finish(); socket.destroy(); incoming.delete(socket); }
       })();
@@ -569,8 +572,13 @@ export async function startBridgeRelay(options: {
             writeFrame(socket, frame, true), readFrame(socket, 1024, true),
           ]));
           const result = parse(receipt);
+          if (object(result) && exactKeys(result, ["version", "ok", "code"]) && result.version === 1 && result.ok === false &&
+            result.code === FABRIC_IDEMPOTENCY_KEY_REUSED) throw new FabricIdempotencyKeyReusedError();
           if (!object(result) || !exactKeys(result, ["version", "ok"]) || result.version !== 1 || result.ok !== true) throw unavailable();
-        } catch { throw unavailable(); }
+        } catch (error) {
+          if (object(error) && error.code === FABRIC_IDEMPOTENCY_KEY_REUSED) throw new FabricIdempotencyKeyReusedError();
+          throw unavailable();
+        }
         finally {
           limit?.finish();
           if (socket) { socket.destroy(); outgoing.delete(socket); }

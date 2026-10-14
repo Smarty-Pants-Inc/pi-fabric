@@ -16,6 +16,7 @@ import { CommitOutbox, type CommitOutboxEffect } from "./commit-outbox.js";
 import { assertBridgeStateBackend, isMeshRetryableBusy, isMeshStateBusy, isMeshStateWalCap } from "./state-backend.js";
 import { watchBridgeStore, type BridgeChange } from "./change-notifier.js";
 import { BRIDGE_BATCH_MAX_EVENTS } from "./event-log.js";
+import { controlBodyFingerprint, FABRIC_IDEMPOTENCY_KEY_REUSED, FabricIdempotencyKeyReusedError } from "./control-idempotency.js";
 import { HUB_FACTORY_RECIPIENT, isAddressedHubFactoryEvent, isWorkTopic, parseWorkTopic } from "./bridge-topics.js";
 export { HUB_FACTORY_RECIPIENT, isWorkTopic, parseWorkTopic } from "./bridge-topics.js";
 
@@ -108,6 +109,9 @@ const participantFileSnapshot = (root: string): { entries: readonly MeshStateEnt
 
 const isObject = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
+
+const isIdempotencyKeyReused = (error: unknown): boolean =>
+  isObject(error) && error.code === FABRIC_IDEMPOTENCY_KEY_REUSED;
 
 const isIdentity = (value: unknown): value is MeshIdentity =>
   isObject(value) && typeof value.id === "string" && value.id.length > 0 && typeof value.name === "string" &&
@@ -778,7 +782,7 @@ export class StoreBridgeSide implements BridgeSide {
       try {
         return await publish();
       } catch (error) {
-        if (!isMeshStateBusy(error) || Date.now() >= deadline) throw error;
+        if (isIdempotencyKeyReused(error) || !isMeshStateBusy(error) || Date.now() >= deadline) throw error;
         const cap = Math.min(25, 2 ** Math.min(attempt, 5));
         await new Promise((resolve) => setTimeout(resolve, cap * (0.5 + Math.random() / 2)));
       }
@@ -800,6 +804,10 @@ export class StoreBridgeSide implements BridgeSide {
         typeof checked.data.commandId === "string" && checked.data.commandId.length > 0
         ? [data.bridge.from, checked.from.id, checked.data.commandId]
         : [data.bridge.from, data.bridge.id])}`,
+      // Host-only: bind the destination receipt to canonical semantic input, never a
+      // wire-supplied fingerprint. Hub recordRelay envelopes deliberately omit it.
+      ...(checked.topic === "fabric.control.command"
+        ? { dedupeFingerprint: controlBodyFingerprint(checked.data, checked.principal) } : {}),
       from: { ...checked.from, verified: "bridge" },
       // The data is fixed, so the store encodes it before the lock (smarty-dev#6729); the
       // ownership check is its admission step. Evaluated under the mesh lock that commits the
@@ -1334,6 +1342,12 @@ export const serveBridgeAgent = (side: StoreBridgeSide, input: Readable, output:
             if (closed) { finish(); return; }
             reply({ id: request.id, ok: true, result });
           } catch (error) {
+            if (isIdempotencyKeyReused(error)) {
+              // Exact code only; never forward the store's key, causes or payload.
+              reply({ id: request.id, ok: false, code: FABRIC_IDEMPOTENCY_KEY_REUSED,
+                error: "Fabric idempotency key reused with different input" });
+              return;
+            }
             reply({
               id: request.id, ok: false, error: error instanceof Error ? error.message : String(error),
               ...(isMeshIncarnationPending(error) ? { code: MESH_INCARNATION_PENDING_CODE }
@@ -1446,6 +1460,10 @@ export class RemoteBridgeSide implements BridgeSide {
         this.#pending.delete(response.id as number);
         if (response.ok === true) pending.resolve(response.result);
         else {
+          if (response.code === FABRIC_IDEMPOTENCY_KEY_REUSED) {
+            pending.reject(new FabricIdempotencyKeyReusedError());
+            return;
+          }
           const error = new Error(`Bridge agent: ${String(response.error)}`);
           // Only allow-listed store refusal codes, never arbitrary peer error properties.
           if (response.code === MESH_LOCK_TIMEOUT_CODE || response.code === MESH_INCARNATION_PENDING_CODE ||
@@ -1983,7 +2001,10 @@ export class MeshBridge {
    * supplied by the UDS registry, never inferred from the event. No hub publication here.
    */
   deliverRelay(sourceRemote: string, input: BridgePublish): Promise<void> {
-    const work = this.#deliverRelay(sourceRemote, input).catch(() => { throw relayUnavailable(); });
+    const work = this.#deliverRelay(sourceRemote, input).catch((error: unknown) => {
+      if (isIdempotencyKeyReused(error)) throw new FabricIdempotencyKeyReusedError();
+      throw relayUnavailable();
+    });
     this.#relayDeliveries.add(work);
     void work.then(() => this.#relayDeliveries.delete(work), () => this.#relayDeliveries.delete(work));
     return work;
@@ -2135,7 +2156,7 @@ export class MeshBridge {
         if (this.#legacyPolling) delay = Math.min(delay ?? Infinity, this.options.pollMs ?? LEGACY_POLL_MS);
       } catch (error) {
         if (!running()) return;
-        if (!isMeshRetryableBusy(error)) {
+        if (isIdempotencyKeyReused(error) || !isMeshRetryableBusy(error)) {
           this.#notificationError ??= error instanceof Error ? error : new Error(String(error));
           this.#wake?.();
           return;
@@ -2241,7 +2262,7 @@ export class MeshBridge {
             try { committed = await target.publishBatch(candidates); }
             catch (error) {
               // No admitted prefix: let the original path refresh/drop this one event.
-              if (!(error instanceof BridgeOwnershipError) && !isPermanent(error)) throw error;
+              if (isIdempotencyKeyReused(error) || (!(error instanceof BridgeOwnershipError) && !isPermanent(error))) throw error;
             }
             if (committed) {
               if (!Array.isArray(committed) || !committed.length || committed.length > candidates.length ||
@@ -2352,7 +2373,7 @@ export class MeshBridge {
               // Ownership errors happen before append, under the publish lock. A mirror can
               // lapse during that wait: refresh once, reread authority, then retry once.
               const ids = direction === "toLocal" ? held : [event.to!];
-              if (!(error instanceof BridgeOwnershipError) || refreshed || this.#destinationRefusal(event, direction) ||
+              if (isIdempotencyKeyReused(error) || !(error instanceof BridgeOwnershipError) || refreshed || this.#destinationRefusal(event, direction) ||
                   !ids.some((id) => this.options.local.mirrored?.(id))) throw error;
               await refresh();
               if (this.#stopped) return { forwarded, dropped };
@@ -2409,14 +2430,17 @@ export class MeshBridge {
         pub.data.destinationRemoteHost !== destination || local.relayOrigin?.(pub.to) !== destination ||
         !local.holds?.(pub.from.id, pub.from)) throw relayUnavailable();
       await relay(destination, pub);
-    } catch {
-      // Timeout is ambiguous: no owner incarnation, notRun or notDelivered assertion, and
-      // no arbitrary exception/cause/body in logs or on the hub. The sender retries its key.
+    } catch (error) {
+      // Timeout remains ambiguous. A typed conflict is a fixed, nonretryable source-local
+      // refusal; neither case exposes owner assertions, arbitrary errors, body or hash.
+      const refusal = isIdempotencyKeyReused(error)
+        ? { error: "Fabric idempotency key reused with different input", errorCode: FABRIC_IDEMPOTENCY_KEY_REUSED, retryable: false }
+        : { error: "Relay destination unavailable", errorCode: RELAY_UNAVAILABLE_CODE, retryable: true };
       await remote.publish({
         topic: "fabric.control.ack", kind: "ack",
         from: { id: `bridge:${localName}`, name: "mesh-bridge", kind: "main" }, to: pub.from.id,
         data: { version: 1, commandId: pub.data.commandId, targetId: pub.data.targetId,
-          accepted: false, error: "Relay destination unavailable", errorCode: RELAY_UNAVAILABLE_CODE, retryable: true,
+          accepted: false, ...refusal,
           bridge: { from: localName, id: event.id } },
       });
       return { delivered: false };
@@ -2660,6 +2684,6 @@ const allBridgedIds = async (side: BridgeSide, after: number): Promise<Set<strin
 };
 
 const isPermanent = (error: unknown): boolean =>
-  !isMeshIncarnationPending(error) && !isMeshSnapshotRetriesExhausted(error) &&
+  !isIdempotencyKeyReused(error) && !isMeshIncarnationPending(error) && !isMeshSnapshotRetriesExhausted(error) &&
   !isMeshLockTimeout(error) && (error instanceof BridgeOwnershipError ||
     error instanceof Error && /exceeds|not allowed|no bridge stamp|no recipient|no sender|Invalid mesh topic/i.test(error.message));

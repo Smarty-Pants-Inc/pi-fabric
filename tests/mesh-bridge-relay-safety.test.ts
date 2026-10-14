@@ -9,6 +9,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { MeshBridge, RemoteBridgeSide, serveBridgeAgent, StoreBridgeSide, type BridgePublish } from "../src/mesh/bridge.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { FabricControlPlane } from "../src/topology/control-plane.js";
+import { FABRIC_IDEMPOTENCY_KEY_REUSED, FabricIdempotencyKeyReusedError } from "../src/mesh/control-idempotency.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { readHostLease, writeHostLease } from "../src/topology/host-leases.js";
 import { writeParticipantFile } from "../src/topology/participant-files.js";
@@ -233,6 +234,143 @@ describe("local singleton relay data safety", () => {
     bodyFreeReceipts(hub);
   });
 
+  it("rejects changed nested data against authority-only recovery, but dedupes reordered identical JSON at B", async () => {
+    let calls = 0;
+    const f = await fixture(async deliver => { await deliver(); if (++calls === 1) throw unavailable(); });
+    const a = f.stores.ryzen3!, b = f.stores.ryzen2!, hub = f.stores.ryzen1!, target = f.mains.ryzen2!;
+    const sender = senderFor(f), marker = "local-authority-only-original-body";
+    let now = Date.now();
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+    const input = { message: marker, data: { nested: { marker, count: 1 }, list: [{ a: 1, b: 2 }] }, ownerIncarnation: target.ownerIncarnation };
+    const options = { routedRemoteHost: "ryzen2", idempotencyKey: "authority-only-body-key" };
+    const first = sender.request(target.identity.id, target.identity.id, "followUp", input, target.identity.id, options);
+    void first.catch(() => undefined);
+    await vi.waitFor(() => expect(events(a, "fabric.control.command")).toHaveLength(1));
+    await f.drain();
+    await expect(first).rejects.toMatchObject({ code: "FABRIC_RELAY_DESTINATION_UNAVAILABLE" });
+    expect(sender.relayAcknowledgementRecoverySnapshot()).toMatchObject({ retained: 1, acknowledged: 0 });
+    const conflict = sender.request(target.identity.id, target.identity.id, "followUp",
+      { ...input, data: { ...input.data, nested: { ...input.data.nested, count: 2 } } }, target.identity.id, options);
+    await expect(conflict).rejects.toBeInstanceOf(FabricIdempotencyKeyReusedError);
+    await expect(conflict).rejects.toMatchObject({ name: "FabricIdempotencyKeyReusedError", code: FABRIC_IDEMPOTENCY_KEY_REUSED,
+      retryable: false, idempotencyKey: options.idempotencyKey, message: "Fabric idempotency key reused with different input" });
+    expect(events(a, "fabric.control.command")).toHaveLength(1);
+    expect(events(b, "fabric.control.command")).toHaveLength(1);
+    expect(calls).toBe(1);
+    expect(sender.relayAcknowledgementRecoverySnapshot()).toMatchObject({ retained: 1, acknowledged: 0 });
+    now += 1_000; // fresh attempt times, still inside the original absolute recovery window
+    const retry = sender.request(target.identity.id, target.identity.id, "followUp",
+      { ownerIncarnation: target.ownerIncarnation, data: { list: [{ b: 2, a: 1 }], nested: { count: 1, marker } }, message: marker },
+      target.identity.id, options);
+    void retry.catch(() => undefined);
+    await vi.waitFor(() => expect(events(a, "fabric.control.command")).toHaveLength(2));
+    const commands = events(a, "fabric.control.command");
+    expect(commands[0]!.id).not.toBe(commands[1]!.id);
+    expect((commands[0]!.data as { commandId: string }).commandId).toBe((commands[1]!.data as { commandId: string }).commandId);
+    const originalAttempt = commands[0]!.data as { requestCreatedAt: number; requestedAt: number; deadlineAt: number };
+    const freshAttempt = commands[1]!.data as typeof originalAttempt;
+    expect(freshAttempt.requestCreatedAt - originalAttempt.requestCreatedAt).toBe(1_000);
+    expect(freshAttempt.requestedAt - originalAttempt.requestedAt).toBe(1_000);
+    expect(freshAttempt.deadlineAt - originalAttempt.deadlineAt).toBe(1_000);
+    await f.drain();
+    expect(calls).toBe(2);
+    expect(events(b, "fabric.control.command")).toHaveLength(1);
+    const receiver = new FabricControlPlane(b, target.identity, { enabled: true, hostId: target.identity.id, ownerIncarnation: target.ownerIncarnation });
+    const receive = vi.fn(() => ({ accepted: true, messageId: "authority-only-original-receipt" }));
+    receiver.start(receive);
+    closers.push(() => receiver.close());
+    await vi.waitFor(() => expect(events(b, "fabric.control.ack")).toHaveLength(1));
+    await f.drain(); await f.drain();
+    await expect(retry).resolves.toMatchObject({ acknowledged: true, messageId: "authority-only-original-receipt" });
+    expect(receive).toHaveBeenCalledOnce();
+    expect(events(b, "fabric.control.command")[0]!.data).toMatchObject({ message: marker, data: input.data });
+    expect(markerFiles(hub.root, marker)).toEqual([]);
+    bodyFreeReceipts(hub);
+  });
+
+  it("snapshots nested caller input before a delayed real source publication", async () => {
+    const f = await fixture();
+    const a = f.stores.ryzen3!, b = f.stores.ryzen2!, target = f.mains.ryzen2!;
+    const sender = senderFor(f), marker = "local-snapshot-original-body";
+    const input = { message: marker, data: { nested: { marker, count: 1 } }, ownerIncarnation: target.ownerIncarnation };
+    const publish = a.publish.bind(a);
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    vi.spyOn(a, "publish").mockImplementationOnce(async publication => { await gate; return publish(publication); });
+    const pending = sender.request(target.identity.id, target.identity.id, "followUp", input, target.identity.id,
+      { routedRemoteHost: "ryzen2", idempotencyKey: "immutable-source-body-key" });
+    void pending.catch(() => undefined);
+    input.message = "caller-mutated-message";
+    input.data.nested.marker = "caller-mutated-nested-data";
+    input.data.nested.count = 2;
+    release();
+    await vi.waitFor(() => expect(events(a, "fabric.control.command")).toHaveLength(1));
+    expect(events(a, "fabric.control.command")[0]!.data).toMatchObject({ message: marker, data: { nested: { marker, count: 1 } } });
+    const receiver = new FabricControlPlane(b, target.identity, { enabled: true, hostId: target.identity.id, ownerIncarnation: target.ownerIncarnation });
+    const receive = vi.fn(() => ({ accepted: true, messageId: "immutable-source-receipt" }));
+    receiver.start(receive);
+    closers.push(() => receiver.close());
+    await f.drain();
+    await vi.waitFor(() => expect(events(b, "fabric.control.ack")).toHaveLength(1));
+    await f.drain(); await f.drain();
+    await expect(pending).resolves.toMatchObject({ acknowledged: true, messageId: "immutable-source-receipt" });
+    expect(events(b, "fabric.control.command")[0]!.data).toMatchObject({ message: marker, data: { nested: { marker, count: 1 } } });
+    expect(receive).toHaveBeenCalledOnce();
+    expect(markerFiles(f.stores.ryzen1!.root, marker)).toEqual([]);
+  });
+
+  it.each(["absent", "expired"] as const)("propagates a real destination body conflict to A when source recovery is %s", async recovery => {
+    let calls = 0;
+    const f = await fixture(async deliver => { calls += 1; await deliver(); if (calls === 1) throw unavailable(); });
+    const a = f.stores.ryzen3!, b = f.stores.ryzen2!, hub = f.stores.ryzen1!, source = f.mains.ryzen3!, target = f.mains.ryzen2!;
+    const sender = senderFor(f), marker = `local-destination-conflict-original-${recovery}`, changedMarker = `local-destination-conflict-changed-${recovery}`;
+    let now = Date.now();
+    if (recovery === "expired") vi.spyOn(Date, "now").mockImplementation(() => now);
+    const input = { message: marker, data: { nested: { marker, count: 1 } }, ownerIncarnation: target.ownerIncarnation };
+    const options = { routedRemoteHost: "ryzen2", idempotencyKey: `destination-conflict-${recovery}-key` };
+    const first = sender.request(target.identity.id, target.identity.id, "followUp", input, target.identity.id, options);
+    void first.catch(() => undefined);
+    await vi.waitFor(() => expect(events(a, "fabric.control.command")).toHaveLength(1));
+    await f.drain();
+    await expect(first).rejects.toMatchObject({ code: "FABRIC_RELAY_DESTINATION_UNAVAILABLE" });
+    expect(events(b, "fabric.control.command")).toHaveLength(1);
+    const retrySender = recovery === "absent" ? senderFor(f) : sender;
+    if (recovery === "expired") now += 8_000;
+    expect(retrySender.relayAcknowledgementRecoverySnapshot()).toMatchObject({ retained: 0, acknowledged: 0 });
+    const conflict = retrySender.request(target.identity.id, target.identity.id, "followUp",
+      { ...input, data: { nested: { marker: changedMarker, count: 2 } } }, target.identity.id, options);
+    void conflict.catch(() => undefined);
+    await vi.waitFor(() => expect(events(a, "fabric.control.command")).toHaveLength(2));
+    await f.drain();
+    await expect(conflict).rejects.toBeInstanceOf(FabricIdempotencyKeyReusedError);
+    await expect(conflict).rejects.toMatchObject({ name: "FabricIdempotencyKeyReusedError", code: FABRIC_IDEMPOTENCY_KEY_REUSED,
+      retryable: false, idempotencyKey: options.idempotencyKey, message: "Fabric idempotency key reused with different input" });
+    expect(calls).toBe(2);
+    expect(events(a, "fabric.control.command")).toHaveLength(2);
+    expect(events(b, "fabric.control.command")).toHaveLength(1);
+    expect(events(b, "fabric.control.command")[0]!.data).toMatchObject({ message: marker, data: input.data });
+    const refusal = events(a, "fabric.control.ack").find(event => (event.data as { errorCode?: string }).errorCode === FABRIC_IDEMPOTENCY_KEY_REUSED)!;
+    expect(refusal).toMatchObject({ from: { id: "bridge:ryzen1", name: "mesh-bridge", kind: "main" }, verification: "bridge", to: source.identity.id,
+      data: { version: 1, targetId: target.identity.id, accepted: false, errorCode: FABRIC_IDEMPOTENCY_KEY_REUSED, retryable: false,
+        error: "Fabric idempotency key reused with different input", bridge: { from: "ryzen1", id: events(a, "fabric.control.command")[1]!.id } } });
+    expect(refusal).not.toHaveProperty("text");
+    for (const field of ["ownerIncarnation", "notRun", "notDelivered", "result", "message", "dedupeFingerprint", "bodyFingerprint"]) expect(refusal.data).not.toHaveProperty(field);
+    expect(retrySender.relayAcknowledgementRecoverySnapshot()).toMatchObject({ retained: 0, acknowledged: 0 });
+    expect(events(hub, "fabric.control.command")).toEqual([]);
+    expect(events(hub, "fabric.control.ack")).toEqual([]);
+    expect(markerFiles(b.root, changedMarker)).toEqual([]);
+    for (const privateMarker of [marker, changedMarker]) expect(markerFiles(hub.root, privateMarker)).toEqual([]);
+    const receiver = new FabricControlPlane(b, target.identity, { enabled: true, hostId: target.identity.id, ownerIncarnation: target.ownerIncarnation });
+    const receive = vi.fn(() => ({ accepted: true, messageId: "destination-original-body-receipt" }));
+    receiver.start(receive);
+    closers.push(() => receiver.close());
+    await vi.waitFor(() => expect(events(b, "fabric.control.ack")).toHaveLength(1));
+    await f.drain(); await f.drain();
+    expect(receive).toHaveBeenCalledOnce();
+    expect(events(b, "fabric.control.command")).toHaveLength(1);
+    bodyFreeReceipts(hub);
+  });
+
   it("keeps hub-local followUp delivery and full command body unchanged", async () => {
     const f = await fixture();
     const a = f.stores.ryzen3!, b = f.stores.ryzen2!, hub = f.stores.ryzen1!;
@@ -298,6 +436,26 @@ describe("local singleton relay data safety", () => {
     await expect(pending).resolves.toMatchObject({ acknowledged: true, messageId: "genuine-owner-ack" });
   });
 
+  it.each(["retryable", "error"] as const)("ignores a malformed idempotency-refusal %s combination and still accepts the owner ACK", async field => {
+    const f = await fixture();
+    const a = f.stores.ryzen3!, source = f.mains.ryzen3!, target = f.mains.ryzen2!, sender = senderFor(f);
+    const pending = sender.request(target.identity.id, target.identity.id, "followUp", { message: "typed-refusal-admission", ownerIncarnation: target.ownerIncarnation },
+      target.identity.id, { routedRemoteHost: "ryzen2", idempotencyKey: `invalid-idempotency-refusal-${field}` });
+    void pending.catch(() => undefined);
+    await vi.waitFor(() => expect(events(a, "fabric.control.command")).toHaveLength(1));
+    const command = events(a, "fabric.control.command")[0]!, commandId = (command.data as { commandId: string }).commandId;
+    const ingress = new StoreBridgeSide(a, "ryzen1");
+    await ingress.publish({ topic: "fabric.control.ack", kind: "rejected", from: { id: "bridge:ryzen1", name: "mesh-bridge", kind: "main" }, to: source.identity.id,
+      data: { version: 1, commandId, targetId: target.identity.id, accepted: false, errorCode: FABRIC_IDEMPOTENCY_KEY_REUSED,
+        error: field === "error" ? "Untrusted replacement error" : "Fabric idempotency key reused with different input",
+        retryable: field === "retryable", bridge: { from: "ryzen1", id: command.id } } }, [], true);
+    await ingress.publish({ topic: "fabric.control.ack", kind: "accepted", from: target.identity, to: source.identity.id,
+      data: { version: 1, commandId, targetId: target.identity.id, ownerIncarnation: target.ownerIncarnation, accepted: true,
+        messageId: "owner-after-invalid-idempotency-refusal", bridge: { from: "ryzen2", id: "valid-owner-after-invalid-refusal", via: "ryzen1" } } }, [], true);
+    await expect(pending).resolves.toMatchObject({ acknowledged: true, messageId: "owner-after-invalid-idempotency-refusal" });
+    expect(sender.relayAcknowledgementRecoverySnapshot()).toMatchObject({ retained: 0, acknowledged: 0 });
+  });
+
   it("recovers the real owner ACK consumed at A after refusal but BEFORE same-key retry registration", async () => {
     let calls = 0;
     const f = await fixture(async deliver => { await deliver(); if (++calls === 1) throw unavailable(); });
@@ -333,6 +491,59 @@ describe("local singleton relay data safety", () => {
     expect(calls).toBe(1);
     expect(markerFiles(a.root, marker).length).toBeGreaterThan(0);
     expect(markerFiles(b.root, marker).length).toBeGreaterThan(0);
+    expect(markerFiles(hub.root, marker)).toEqual([]);
+    bodyFreeReceipts(hub);
+  });
+
+  it("rejects changed body against a real cached late ACK without publishing, then accepts reordered identical input", async () => {
+    let calls = 0;
+    const f = await fixture(async deliver => { await deliver(); if (++calls === 1) throw unavailable(); });
+    const a = f.stores.ryzen3!, b = f.stores.ryzen2!, hub = f.stores.ryzen1!, target = f.mains.ryzen2!;
+    const sender = senderFor(f), marker = "local-cached-late-ack-original-body";
+    const input = { message: marker, data: { nested: { marker, count: 1 }, list: [{ a: 1, b: 2 }] }, ownerIncarnation: target.ownerIncarnation,
+      principal: { id: "cache-body-principal", binding: "herdr-client" as const } };
+    const options = { routedRemoteHost: "ryzen2", idempotencyKey: "cached-late-ack-body-key" };
+    const receiver = new FabricControlPlane(b, target.identity, { enabled: true, hostId: target.identity.id, ownerIncarnation: target.ownerIncarnation });
+    const receive = vi.fn(() => ({ accepted: true, messageId: "cached-original-body-receipt" }));
+    closers.push(() => receiver.close());
+    const first = sender.request(target.identity.id, target.identity.id, "followUp", input, target.identity.id, options);
+    void first.catch(() => undefined);
+    await vi.waitFor(() => expect(events(a, "fabric.control.command")).toHaveLength(1));
+    await f.drain();
+    await expect(first).rejects.toMatchObject({ code: "FABRIC_RELAY_DESTINATION_UNAVAILABLE" });
+    receiver.start(receive);
+    await vi.waitFor(() => expect(events(b, "fabric.control.ack")).toHaveLength(1));
+    await f.drain(); await f.drain();
+    await vi.waitFor(() => expect(sender.relayAcknowledgementRecoverySnapshot().acknowledged).toBe(1));
+    const publish = vi.spyOn(a, "publish"), controller = new AbortController();
+    const abortListener = vi.spyOn(controller.signal, "addEventListener");
+    for (const changed of [
+      { ...input, message: "local-cached-changed-message" },
+      { ...input, data: { ...input.data, nested: { ...input.data.nested, count: 2 } } },
+      { ...input, principal: { ...input.principal, id: "cache-changed-principal" } },
+    ]) {
+      const conflict = sender.request(target.identity.id, target.identity.id, "followUp", changed, target.identity.id,
+        { ...options, signal: controller.signal });
+      await expect(conflict).rejects.toBeInstanceOf(FabricIdempotencyKeyReusedError);
+      await expect(conflict).rejects.toMatchObject({ name: "FabricIdempotencyKeyReusedError", code: FABRIC_IDEMPOTENCY_KEY_REUSED,
+        retryable: false, idempotencyKey: options.idempotencyKey, message: "Fabric idempotency key reused with different input" });
+    }
+    expect(publish).not.toHaveBeenCalled();
+    expect(abortListener).not.toHaveBeenCalled();
+    expect(events(a, "fabric.control.command")).toHaveLength(1);
+    expect(events(b, "fabric.control.command")).toHaveLength(1);
+    expect(events(b, "fabric.control.command")[0]!.data).toMatchObject({ message: marker, data: input.data });
+    expect(receive).toHaveBeenCalledOnce();
+    expect(calls).toBe(1);
+    expect(sender.relayAcknowledgementRecoverySnapshot()).toMatchObject({ retained: 1, acknowledged: 1 });
+    const retry = sender.request(target.identity.id, target.identity.id, "followUp",
+      { principal: { binding: "herdr-client", id: "cache-body-principal" }, ownerIncarnation: target.ownerIncarnation,
+        data: { list: [{ b: 2, a: 1 }], nested: { count: 1, marker } }, message: marker }, target.identity.id, options);
+    await expect(retry).resolves.toMatchObject({ acknowledged: true, messageId: "cached-original-body-receipt" });
+    expect(publish).not.toHaveBeenCalled();
+    expect(events(a, "fabric.control.command")).toHaveLength(1);
+    expect(events(b, "fabric.control.command")).toHaveLength(1);
+    expect(receive).toHaveBeenCalledOnce();
     expect(markerFiles(hub.root, marker)).toEqual([]);
     bodyFreeReceipts(hub);
   });

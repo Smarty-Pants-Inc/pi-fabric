@@ -1,4 +1,5 @@
 import { appendDeliveryOutcome, type DeliverySend } from "../mesh/delivery-outcomes.js";
+import { controlBodyFingerprint, FABRIC_IDEMPOTENCY_KEY_REUSED, FabricIdempotencyKeyReusedError } from "../mesh/control-idempotency.js";
 import type { MeshControlIncarnationFence } from "../config.js";
 import { FabricParticipantStaleError, participantLeaseGraceMs } from "./host-leases.js";
 import { retryDelayMs } from "../core/retry-backoff.js";
@@ -41,6 +42,7 @@ const UNFENCED_SENDER_WARNING_MS = 60 * 60 * 1_000;
 // A cancellation owns a separate retry deadline, longer than a production mesh lock wait.
 const CANCELLATION_RETENTION_MS = 60_000;
 const CONTROL_COMMAND_EXPIRED = "Fabric control command expired";
+const IDEMPOTENCY_KEY_REUSED_ERROR = new FabricIdempotencyKeyReusedError().message;
 /** A timed-out message the sender withdrew before its owner claimed it: definitely not delivered. */
 export const CONTROL_NOT_DELIVERED = "FABRIC_CONTROL_NOT_DELIVERED";
 export const CONTROL_STALE_INCARNATION = "FABRIC_CONTROL_STALE_INCARNATION";
@@ -381,6 +383,19 @@ export interface FabricControlInput {
   bindingProvenance?: FabricActorBindingProvenance;
 }
 
+/** Snapshot the actual wire input once; caller mutation cannot change hashed/published bytes. */
+const snapshotControlInput = (input: FabricControlInput): FabricControlInput => JSON.parse(JSON.stringify({
+  ownerIncarnation: input.ownerIncarnation,
+  principal: copyFabricPrincipal(input.principal),
+  message: input.message,
+  data: input.data,
+  wakeCause: copyFabricWakeCause(input.wakeCause),
+  triggerTurn: input.triggerTurn,
+  priority: input.priority,
+  binding: input.binding,
+  bindingProvenance: input.bindingProvenance,
+})) as FabricControlInput;
+
 /** Trust owner-default provenance only from a validated member of that actor's root. */
 export const controlActorBindingOptions = (
   command: Pick<FabricControlCommand, "binding" | "bindingProvenance"> & Partial<Pick<FabricControlCommand, "eventId" | "commandId" | "targetId" | "operation">>,
@@ -432,6 +447,8 @@ interface PendingControlRequest {
   readonly requestCreatedAt: number;
   readOwnerExpiry?: () => number;
   readonly idempotencyKey: string;
+  /** Canonical semantic wire input; authority/attempt metadata is authenticated separately. */
+  readonly bodyFingerprint: string;
   readonly destinationRemoteHost?: string | null;
   /** Original source event, fixed before publication can yield. */
   readonly commandEventId: string;
@@ -456,6 +473,8 @@ interface OwnerAcknowledgement {
 interface RetainedRelayAcknowledgement {
   readonly commandId: string;
   readonly idempotencyKey: string;
+  /** Retain only the digest, never the command body. */
+  readonly bodyFingerprint: string;
   readonly expiresAt: number;
   readonly authority: ControlAcknowledgementAuthority;
   readonly acknowledgement?: OwnerAcknowledgement;
@@ -515,7 +534,8 @@ export class FabricControlPlane {
     });
     // Another refusal cannot renew an existing recovery window or overwrite its original authority.
     const entry = this.#relayAcknowledgements.get(key) ?? Object.freeze({ commandId,
-      idempotencyKey: pending.idempotencyKey, expiresAt: Date.now() + RELAY_ACK_RECOVERY_TTL_MS, authority });
+      idempotencyKey: pending.idempotencyKey, bodyFingerprint: pending.bodyFingerprint,
+      expiresAt: Date.now() + RELAY_ACK_RECOVERY_TTL_MS, authority });
     this.#relayAcknowledgements.delete(key);
     this.#relayAcknowledgements.set(key, entry);
     while (this.#relayAcknowledgements.size > RELAY_ACK_RECOVERY_LIMIT) {
@@ -527,7 +547,22 @@ export class FabricControlPlane {
     this.#pruneRelayAcknowledgements();
     const key = relayAcknowledgementKey(commandId, pending.idempotencyKey);
     const entry = this.#relayAcknowledgements.get(key);
-    if (!entry?.acknowledgement) return undefined;
+    if (!entry) return undefined;
+    // A changed owner/epoch/route invalidates recovery, not the newly resolved request.
+    // Check this even before a late ACK arrives; an authority-only entry binds its body too.
+    const authority = entry.authority;
+    if (!pending.mirroredOwner || typeof pending.destinationRemoteHost !== "string" ||
+        authority.ownerHostId !== pending.ownerHostId || authority.ownerIdentityId !== pending.ownerIdentityId ||
+        authority.ownerIncarnation !== pending.ownerIncarnation || authority.targetId !== pending.targetId ||
+        authority.destinationRemoteHost !== pending.destinationRemoteHost ||
+        authority.mirroredOwner?.remoteHost !== pending.mirroredOwner.remoteHost) {
+      this.#relayAcknowledgements.delete(key);
+      return undefined;
+    }
+    if (entry.bodyFingerprint !== pending.bodyFingerprint) {
+      throw new FabricIdempotencyKeyReusedError(pending.idempotencyKey);
+    }
+    if (!entry.acknowledgement) return undefined;
     const data = this.#authenticatedAcknowledgement(entry.acknowledgement, pending);
     // A retry must still be on the captured remote link/epoch, not a now-native or new owner.
     if (!pending.mirroredOwner || typeof pending.destinationRemoteHost !== "string" ||
@@ -662,8 +697,8 @@ export class FabricControlPlane {
     assertSteerPriority(input.priority, operation);
     // Resends retain both the originally resolved activation and logical request origin.
     const requestCreatedAt = Date.now();
-    // Freeze diagnostic producer attribution before publication or an observation retry yields.
-    input = { ...input, wakeCause: copyFabricWakeCause(input.wakeCause) };
+    // Clone semantic JSON plus normalized attribution before publication or any retry yields.
+    input = snapshotControlInput(input);
     // One logical message key survives both observation retries and a proven-notRun resend.
     options = { ...options, idempotencyKey: options.idempotencyKey ?? randomUUID() };
     let notRunAttempt = 0;
@@ -748,7 +783,7 @@ export class FabricControlPlane {
       ownerHostId,
       targetId,
       operation,
-      input,
+      snapshotControlInput(input),
       ownerIdentityId,
       { ...options, timeoutMs: options.timeoutMs ?? DEFAULT_RESULT_TIMEOUT_MS },
     );
@@ -787,7 +822,6 @@ export class FabricControlPlane {
     const commandId = createHash("sha256")
       .update(JSON.stringify([this.options.hostId, ownerHostId, ownerIdentityId, targetId, operation, idempotencyKey, notRunAttempt]))
       .digest("hex");
-    if (this.#pending.has(commandId)) throw new Error(`Fabric message with idempotencyKey ${idempotencyKey} is already awaiting acknowledgement`);
     let mirroredOwner: PendingControlRequest["mirroredOwner"];
     const unavailable = (host: string): Error => new Error(
       `Fabric mesh bridge routing to remote host ${host} is unavailable for ${targetId}; ` +
@@ -809,6 +843,28 @@ export class FabricControlPlane {
       destination.remoteHost = mirroredOwner?.remoteHost ?? (this.options.readMirroredOwner ? null : undefined);
     }
     const destinationRemoteHost = destination.remoteHost;
+    // All input references belong to the private JSON snapshot. Publish this same body,
+    // not a later read of caller-owned objects, after computing the shared wire fingerprint.
+    const commandBody = Object.freeze({
+      targetId, operation,
+      ...(ownerIncarnation !== undefined ? { ownerIncarnation } : {}),
+      ...(destinationRemoteHost !== undefined ? { destinationRemoteHost } : {}),
+      ...(input.message !== undefined ? { message: input.message } : {}),
+      ...(input.data !== undefined ? { data: input.data } : {}),
+      ...(input.wakeCause !== undefined ? { wakeCause: input.wakeCause } : {}),
+      ...(input.triggerTurn !== undefined ? { triggerTurn: input.triggerTurn } : {}),
+      ...(input.priority !== undefined ? { priority: input.priority } : {}),
+      ...(input.binding !== undefined ? { binding: input.binding } : {}),
+      ...(input.bindingProvenance !== undefined ? { bindingProvenance: input.bindingProvenance } : {}),
+    });
+    const bodyFingerprint = controlBodyFingerprint(commandBody, input.principal);
+    const existingPending = this.#pending.get(commandId);
+    if (existingPending) {
+      if (existingPending.ownerIncarnation === ownerIncarnation &&
+          existingPending.destinationRemoteHost === destinationRemoteHost &&
+          existingPending.bodyFingerprint !== bodyFingerprint) throw new FabricIdempotencyKeyReusedError(idempotencyKey);
+      throw new Error(`Fabric message with idempotencyKey ${idempotencyKey} is already awaiting acknowledgement`);
+    }
     // Only directory-validated remote ownership can authorize an infrastructure refusal.
     // Read the canonical host row freshly; never infer a hub from caller data or ACK data.
     let relayHub: string | undefined;
@@ -850,7 +906,7 @@ export class FabricControlPlane {
     const timeoutMs = Math.max(this.#pollMs * 4, originalTimeoutMs - retryBudgetSpentMs);
     const ackGraceMs = Math.min(MAX_CONTROL_ACK_GRACE_MS, 2 * timeoutMs);
     let pendingRequest: PendingControlRequest;
-    let recoveredAcknowledgement = false;
+    let skipPublication = false;
     let publishedEvent: MeshEvent | undefined;
     let finalOutcome: { outcome: "failed" | "unknown"; reason: string } | undefined;
     const recordFinal = (): void => {
@@ -871,6 +927,7 @@ export class FabricControlPlane {
         commandPublished: false,
         requestCreatedAt,
         idempotencyKey,
+        bodyFingerprint,
         commandEventId,
         ...(relayHub !== undefined ? { relayHub } : {}),
         ...(readOwnerExpiry && messageRequest ? { readOwnerExpiry } : {}),
@@ -881,9 +938,18 @@ export class FabricControlPlane {
       this.#pending.set(commandId, pending);
       // Revalidate against this NEW admission's owner/epoch/link before publishing anything.
       // Use the ordinary settlement path, including its single clear/timer/abort cleanup.
-      const cached = this.#cachedRelayAcknowledgement(commandId, pending);
+      let cached: OwnerAcknowledgement | undefined;
+      try {
+        cached = this.#cachedRelayAcknowledgement(commandId, pending);
+      } catch (error) {
+        // No publication, timer, lease watchdog or abort listener on a local conflict.
+        skipPublication = true;
+        this.#clearPending(commandId);
+        reject(error as Error);
+        return;
+      }
       if (cached) {
-        recoveredAcknowledgement = true;
+        skipPublication = true;
         this.#settleAcknowledgement(commandId, pending, cached.data as Record<string, unknown>);
         return;
       }
@@ -921,7 +987,7 @@ export class FabricControlPlane {
     try {
       // Settlement must not wait for the original publish or a best-effort cancellation.
       // The publish still completes once, and then cancels if settlement won while in flight.
-      const publishing = recoveredAcknowledgement ? Promise.resolve() : this.mesh.publish({
+      const publishing = skipPublication ? Promise.resolve() : this.mesh.publish({
         id: commandEventId,
         topic: CONTROL_TOPIC,
         kind: operation,
@@ -935,18 +1001,8 @@ export class FabricControlPlane {
         data: (committedAt: number): FabricControlCommand => ({
           version: 1,
           commandId,
-          targetId,
-          operation,
+          ...commandBody,
           replyTo: this.options.hostId,
-          ...(ownerIncarnation !== undefined ? { ownerIncarnation } : {}),
-          ...(destinationRemoteHost !== undefined ? { destinationRemoteHost } : {}),
-          ...(input.message !== undefined ? { message: input.message } : {}),
-          ...(input.data !== undefined ? { data: input.data } : {}),
-          ...(input.wakeCause !== undefined ? { wakeCause: copyFabricWakeCause(input.wakeCause) } : {}),
-          ...(input.triggerTurn !== undefined ? { triggerTurn: input.triggerTurn } : {}),
-          ...(input.priority !== undefined ? { priority: input.priority } : {}),
-          ...(input.binding !== undefined ? { binding: input.binding } : {}),
-          ...(input.bindingProvenance !== undefined ? { bindingProvenance: input.bindingProvenance } : {}),
           requestCreatedAt,
           requestedAt: committedAt,
           deadlineAt: committedAt + timeoutMs,
@@ -1425,7 +1481,7 @@ export class FabricControlPlane {
             // A hub speaks only for relay infrastructure, never for the destination owner.
             const envelope = ownDataRecord(event);
             const data = envelope && ownDataRecord(envelope.data);
-            if (data?.errorCode === RELAY_DESTINATION_UNAVAILABLE) this.#acceptRelayRefusal(event);
+            if (data?.errorCode === RELAY_DESTINATION_UNAVAILABLE || data?.errorCode === FABRIC_IDEMPOTENCY_KEY_REUSED) this.#acceptRelayRefusal(event);
             else if (data) this.#acceptAcknowledgement(event);
           } else if (event.topic === CONTROL_TOPIC) await this.#acceptCommand(event);
         }
@@ -1452,16 +1508,20 @@ export class FabricControlPlane {
         event.to !== this.options.hostId || event.verification !== "bridge" ||
         event.from.id !== `bridge:${pending.relayHub}` || event.from.name !== "mesh-bridge" || event.from.kind !== "main" ||
         data.version !== 1 || data.targetId !== pending.targetId || data.accepted !== false ||
-        data.error !== "Relay destination unavailable" || data.errorCode !== RELAY_DESTINATION_UNAVAILABLE ||
-        data.retryable !== true || !isObject(data.bridge) ||
+        !((data.errorCode === RELAY_DESTINATION_UNAVAILABLE && data.error === "Relay destination unavailable" && data.retryable === true) ||
+          (data.errorCode === FABRIC_IDEMPOTENCY_KEY_REUSED && data.error === IDEMPOTENCY_KEY_REUSED_ERROR && data.retryable === false)) ||
+        !isObject(data.bridge) ||
         Object.keys(data.bridge).some((field) => field !== "from" && field !== "id") ||
         data.bridge.from !== pending.relayHub || data.bridge.id !== pending.commandEventId ||
         // Infrastructure cannot attest an owner epoch or a definite non-delivery outcome.
         ["ownerIncarnation", "notRun", "notDelivered"].some((field) => Object.hasOwn(data, field))) return;
-    this.#retainRelayAuthority(data.commandId, pending);
+    if (data.errorCode === RELAY_DESTINATION_UNAVAILABLE) this.#retainRelayAuthority(data.commandId, pending);
     this.#clearPending(data.commandId);
-    // Reject directly: do not broaden owner ACK error codes or enter the notRun resend path.
-    pending.reject(new FabricRelayDestinationUnavailableError(pending.targetId, pending.idempotencyKey));
+    // Reject directly with our own pending key; a conflict retains no authority and cannot retry.
+    // Do not broaden owner ACK error codes or enter the notRun resend path.
+    pending.reject(data.errorCode === FABRIC_IDEMPOTENCY_KEY_REUSED
+      ? new FabricIdempotencyKeyReusedError(pending.idempotencyKey)
+      : new FabricRelayDestinationUnavailableError(pending.targetId, pending.idempotencyKey));
   }
 
   #acceptAcknowledgement(event: MeshEvent): void {
@@ -1479,7 +1539,7 @@ export class FabricControlPlane {
     for (const [key, entry] of this.#relayAcknowledgements) {
       if (entry.commandId !== data.commandId || envelope?.verification !== "bridge" ||
           envelope.to !== this.options.hostId || typeof data.accepted !== "boolean" ||
-          data.errorCode === RELAY_DESTINATION_UNAVAILABLE ||
+          data.errorCode === RELAY_DESTINATION_UNAVAILABLE || data.errorCode === FABRIC_IDEMPOTENCY_KEY_REUSED ||
           (entry.authority.ownerIncarnation !== undefined && data.ownerIncarnation !== entry.authority.ownerIncarnation)) continue;
       const bridge = ownDataRecord(data.bridge);
       const warning = data.warning === undefined ? undefined : ownDataRecord(data.warning);

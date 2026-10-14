@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { QuickJsRuntime } from "../src/runtime/quickjs-runtime.js";
 import { FabricModelDeniedError } from "../src/core/model-policy.js";
+import { FabricIdempotencyKeyReusedError } from "../src/mesh/control-idempotency.js";
 import { FabricInterruptNotAuthorizedError, FabricInterruptRateLimitedError } from "../src/interrupt-authority.js";
 import { FabricControlStaleIncarnationError, FabricRelayDestinationUnavailableError, STALE_INCARNATION_ERROR } from "../src/topology/control-plane.js";
 import { classifyPiBashError } from "../src/core/pi-bash-error.js";
@@ -266,13 +267,53 @@ catch (error) { return { name: error.name, code: typeof error.code, extra: typeo
     expect(hostCall.mock.calls).toHaveLength(2);
   });
 
+  it("carries only the typed idempotency conflict contract through public guest followUp calls", async () => {
+    const error = Object.assign(new FabricIdempotencyKeyReusedError("original-key"), {
+      secret: "host-only", cause: { secret: "nested-host-only" }, fingerprint: "host-only",
+    });
+    const hostCall = vi.fn(async (_ref: string) => { throw error; });
+    const result = await new QuickJsRuntime().execute(
+      `const failures = [];
+       for (const followUp of [agents.followUp, args => tools.call({ ref: "agents.followUp", args })]) {
+         try { await followUp({ id: "session:test", message: "different input", idempotencyKey: "original-key" }); }
+         catch (error) { failures.push({ name: error.name, code: error.code, message: error.message,
+           retryable: error.retryable, idempotencyKey: error.idempotencyKey, isError: error instanceof Error,
+           secret: typeof error.secret, cause: typeof error.cause, fingerprint: typeof error.fingerprint,
+           keys: Object.keys(error).sort() }); }
+       } return failures;`, hostCall, options,
+    );
+    expect(result.error).toBeUndefined();
+    expect(result.value).toEqual(Array(2).fill({ name: "FabricIdempotencyKeyReusedError",
+      code: "FABRIC_IDEMPOTENCY_KEY_REUSED", message: "Fabric idempotency key reused with different input",
+      retryable: false, idempotencyKey: "original-key", isError: true,
+      secret: "undefined", cause: "undefined", fingerprint: "undefined",
+      keys: ["code", "idempotencyKey", "message", "name", "retryable"] }));
+    expect(hostCall.mock.calls.map(([ref]) => ref)).toEqual(["agents.followUp", "fabric.$call"]);
+  });
+
+  it("does not invoke a typed idempotency conflict retryable getter", async () => {
+    const getter = vi.fn(() => { throw new Error("must not invoke a getter"); });
+    const error = new FabricIdempotencyKeyReusedError("original-key");
+    Object.defineProperty(error, "retryable", { get: getter });
+    const result = await new QuickJsRuntime().execute(
+      `try { await agents.followUp({ id: "session:test", message: "different input", idempotencyKey: "original-key" }); }
+       catch (error) { return { name: error.name, code: error.code, retryable: error.retryable,
+         idempotencyKey: error.idempotencyKey }; }`, async () => { throw error; }, options,
+    );
+    expect(result.error).toBeUndefined();
+    expect(result.value).toEqual({ name: "FabricIdempotencyKeyReusedError", code: "FABRIC_IDEMPOTENCY_KEY_REUSED",
+      idempotencyKey: "original-key" });
+    expect(getter).not.toHaveBeenCalled();
+  });
+
   it.each([
     ["FABRIC_PARTICIPANT_STALE", "FabricParticipantStaleError"],
     ["FABRIC_RELAY_DESTINATION_UNAVAILABLE", "FabricRelayDestinationUnavailableError"],
+    ["FABRIC_IDEMPOTENCY_KEY_REUSED", "FabricIdempotencyKeyReusedError"],
   ])("never bridges invalid, oversized, inherited, unrelated or getter retry keys for %s", async (code, name) => {
     const getter = vi.fn(() => { throw new Error("must not invoke a getter"); });
     const make = (key: unknown) => Object.assign(new Error("retryable refusal"), {
-      name, code, retryable: true, idempotencyKey: key,
+      name, code, retryable: code !== "FABRIC_IDEMPOTENCY_KEY_REUSED", idempotencyKey: key,
     });
     const errors = [make(""), make("x".repeat(201)), make(7), make(null), make("x".repeat(200)), make("getter"), make("inherited"), make("unrelated")];
     Object.defineProperty(errors[5], "idempotencyKey", { get: getter });
@@ -346,7 +387,7 @@ catch (error) { return { name: error.name, code: typeof error.code, extra: typeo
     let call = 0;
     const result = await new QuickJsRuntime().execute(
       `const failures = [];
-       for (let i = 0; i < 5; i++) {
+       for (let i = 0; i < 8; i++) {
          try { await tools.call({ ref: "demo.error" }); }
          catch (error) { failures.push({ name: error.name, code: error.code, retryable: error.retryable,
            idempotencyKey: error.idempotencyKey, secret: error.secret }); }
@@ -358,12 +399,16 @@ catch (error) { return { name: error.name, code: typeof error.code, extra: typeo
         if (index === 1) throw Object.assign(new Error("non-string"), { name: 7, code: "FABRIC_PROJECT_LEAD_INVALID", retryable: true });
         if (index === 3) throw Object.assign(new Error("relay mismatch"), { name: "RangeError", code: "FABRIC_RELAY_DESTINATION_UNAVAILABLE", retryable: true, idempotencyKey: "must-not-cross" });
         if (index === 4) throw Object.assign(new Error("unknown relay code"), { name: "FabricRelayDestinationUnavailableError", code: "HOST_SECRET", retryable: true, idempotencyKey: "must-not-cross" });
+        if (index === 5) throw Object.assign(new Error("conflict mismatch"), { name: "RangeError", code: "FABRIC_IDEMPOTENCY_KEY_REUSED", retryable: false, idempotencyKey: "must-not-cross" });
+        if (index === 6) throw Object.assign(new Error("unknown conflict code"), { name: "FabricIdempotencyKeyReusedError", code: "HOST_SECRET", retryable: false, idempotencyKey: "must-not-cross" });
+        if (index === 7) throw { name: "FabricIdempotencyKeyReusedError", code: "FABRIC_IDEMPOTENCY_KEY_REUSED", retryable: false, idempotencyKey: "must-not-cross", secret: "not-guest-data" };
         throw { name: "FabricProjectLeadInvalidError", code: "FABRIC_PROJECT_LEAD_INVALID", retryable: true, secret: "not-guest-data" };
       }, options,
     );
     expect(result.error).toBeUndefined();
     expect(result.value).toEqual([{ name: "RangeError" }, { name: "Error" }, { name: "Error" },
-      { name: "RangeError" }, { name: "FabricRelayDestinationUnavailableError" }]);
+      { name: "RangeError" }, { name: "FabricRelayDestinationUnavailableError" },
+      { name: "RangeError" }, { name: "FabricIdempotencyKeyReusedError" }, { name: "Error" }]);
   });
 
   it.each(["bash", "powershell"])("keeps vetted Fabric fields and %s exit metadata together", async (tool) => {

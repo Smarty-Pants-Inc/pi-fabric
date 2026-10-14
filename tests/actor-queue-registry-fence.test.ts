@@ -221,6 +221,42 @@ it.each([false, true])("keeps a byte-identical queue receipt across an atomic re
   }
 });
 
+it.each(["win32", "linux"] as const)("keeps Windows replacement-open retries bounded without changing Linux (%s)", async platform => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "queue-windows-open-"));
+  const mesh = new MeshStore(path.join(root, "mesh"), 65536, 100);
+  const agents = new AgentManager(root, DEFAULT_FABRIC_CONFIG.agents, { runRoot: path.join(root, "runs") });
+  const manager = new ActorManager("read-retry", { id: "session:read-retry", name: "owner", kind: "main" }, mesh,
+    { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 600000 }, agents, () => {}, { persistent: true,
+      actorRoot: path.join(root, "actors"), releasePaused: true, retentionSweepMs: 600000, canManageActor: () => true });
+  const descriptor = Object.getOwnPropertyDescriptor(process, "platform")!;
+  const open = fs.openSync;
+  let failures = 0;
+  let spy: ReturnType<typeof vi.spyOn> | undefined;
+  try {
+    const actor = await manager.create({ name: "windows-replacement", instructions: "Wait", triggerTurn: false });
+    Object.defineProperty(process, "platform", { ...descriptor, value: platform });
+    spy = vi.spyOn(fs, "openSync").mockImplementation(((file: fs.PathLike, flags: string | number, mode?: fs.Mode) => {
+      if (/queue-[a-f0-9]+\.json$/.test(String(file)) && typeof flags === "number" && fs.existsSync(file) && failures === 0) {
+        failures++;
+        throw Object.assign(new Error("replacement pending deletion"), { code: "EPERM" });
+      }
+      return open(file, flags, mode);
+    }) as typeof fs.openSync);
+    manager.tell(actor.id, "first accepted item");
+    manager.tell(actor.id, "second accepted item");
+    const file = fs.readdirSync(path.dirname(actor.sessionFile!)).find(name => name.startsWith("queue-"))!;
+    const saved = JSON.parse(fs.readFileSync(path.join(path.dirname(actor.sessionFile!), file), "utf8"));
+    expect(failures).toBe(1);
+    expect(saved.items).toHaveLength(platform === "win32" ? 2 : 1);
+    if (platform === "win32") expect(manager.status(actor.id).lastError).toBeUndefined();
+    else expect(manager.status(actor.id).lastError).toContain("custody changed");
+    expect(agents.list()).toEqual([]);
+  } finally {
+    spy?.mockRestore(); Object.defineProperty(process, "platform", descriptor);
+    await manager.close(); await agents.close(); fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 it("a cross-process holder gives one zero-wait busy refusal with no mutation or stale recovery", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "queue-registry-busy-"));
   const store = new ActorRegistryStore(root);

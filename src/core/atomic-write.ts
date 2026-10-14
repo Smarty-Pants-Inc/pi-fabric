@@ -181,11 +181,10 @@ const syncSleep = (() => {
 // (the old file is pending deletion) or probed by a scanner: milliseconds, not a real answer.
 const RETRYABLE_READ_CODES = new Set(["EPERM", "EACCES", "EBUSY"]);
 
-/** readFileSync that retries the transient Windows open failures a few times, briefly. */
-export const readFileRetrying = (file: string, attempts = 5, delayMs = 5): string => {
+const retryRead = <T>(read: () => T, attempts = 5, delayMs = 5): T => {
   for (let attempt = 1; ; attempt++) {
     try {
-      return fs.readFileSync(file, "utf8");
+      return read();
     } catch (error) {
       const code = errorCode(error);
       if (attempt >= attempts || code === undefined || !RETRYABLE_READ_CODES.has(code)) throw error;
@@ -193,6 +192,16 @@ export const readFileRetrying = (file: string, attempts = 5, delayMs = 5): strin
     }
   }
 };
+
+/** readFileSync that retries the transient Windows open failures a few times, briefly. */
+export const readFileRetrying = (file: string, attempts = 5, delayMs = 5): string =>
+  retryRead(() => fs.readFileSync(file, "utf8"), attempts, delayMs);
+
+/** The SAME bounded read policy for a descriptor open. Flags (including no-follow)
+ * are unchanged; callers still validate type, descriptor identity and custody.
+ * Linux opens keep their original single-attempt behavior. */
+export const openFileRetrying = (file: string, flags: number): number =>
+  process.platform === "win32" ? retryRead(() => fs.openSync(file, flags)) : fs.openSync(file, flags);
 
 // Rename-only: callers needing stable storage must provide their own barriers.
 export const renameAtomic = (

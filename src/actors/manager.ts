@@ -1,5 +1,5 @@
 import { appendDeliveryOutcome, deliverySend, type DeliverySend, type DeliveryOutcome, type DeliveryOutcomeRecord } from "../mesh/delivery-outcomes.js";
-import { childProcessEnvironment } from "../core/atomic-write.js";
+import { childProcessEnvironment, openFileRetrying } from "../core/atomic-write.js";
 import { copyFabricProvenance, fabricTurnProvenance, fabricWakeCause, type FabricTurnProvenance, type FabricPrincipal } from "../fabric-provenance.js";
 import type { ImageContent } from "@earendil-works/pi-ai";
 import { formatAge } from "../residency/protocol.js";
@@ -6907,6 +6907,10 @@ export class ActorManager {
     });
   }
 
+  #openQueueRead(file: string): number {
+    return openFileRetrying(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0));
+  }
+
   /** Descriptor-bound content, including in-place changes; absent is a receipt,
    * unknown/non-regular is not. Queue mutation and acquisition share registry custody. */
   #queueRevision(file: string): string | undefined {
@@ -6915,7 +6919,7 @@ export class ActorManager {
     try {
       const endpoint = fs.lstatSync(file, { bigint: true });
       if (!endpoint.isFile() || endpoint.isSymbolicLink()) return undefined;
-      fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0));
+      fd = this.#openQueueRead(file);
       const held = fs.fstatSync(fd, { bigint: true });
       const current = fs.lstatSync(file, { bigint: true });
       if (!held.isFile() || revision(endpoint) !== revision(held) || revision(held) !== revision(current)) return undefined;
@@ -6971,7 +6975,7 @@ export class ActorManager {
         let fd: number | undefined;
         try {
           if (fs.lstatSync(file).isSymbolicLink()) return undefined;
-          fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0));
+          fd = this.#openQueueRead(file);
           if (!fs.fstatSync(fd).isFile()) return undefined;
           return JSON.parse(fs.readFileSync(fd, "utf8"));
         } catch { return undefined; }
@@ -6981,7 +6985,7 @@ export class ActorManager {
       const stamp = (stat: fs.BigIntStats): string => `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
       try {
         if (fs.lstatSync(file).isSymbolicLink()) return undefined;
-        fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0));
+        fd = this.#openQueueRead(file);
         const held = fs.fstatSync(fd, { bigint: true });
         if (!held.isFile()) return undefined;
         const bytes = fs.readFileSync(fd, "utf8"); // bytes and receipt name the SAME descriptor

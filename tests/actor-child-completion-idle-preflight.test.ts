@@ -178,7 +178,10 @@ it("releases completion watches on stop, transfer and 200 recorded actor removal
     const file = path.resolve(String(target));
     // Record data removal, never execute it. Atomic-write lock/temp cleanup is
     // fixture housekeeping, not a real actor/session purge (#4664).
-    if (file.startsWith(actorRoot + path.sep) &&
+    // relative() compares Windows drive/path case with Windows semantics;
+    // a case-sensitive string prefix can miss the very same fixture directory.
+    const relative = path.relative(actorRoot, file);
+    if (relative && relative !== ".." && !relative.startsWith(".." + path.sep) && !path.isAbsolute(relative) &&
         (path.basename(file).startsWith("queue-") || path.basename(file).startsWith("removal-") ||
          /^[a-f0-9]{32}$/.test(path.basename(file)))) {
       removals.push(file);

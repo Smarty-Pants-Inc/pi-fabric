@@ -20,7 +20,7 @@ const ci = process.env.CI === "true";
 // outside hosted CI. Syntactic (TypeScript AST; comments and plain string mentions do not count), not a proof.
 // A suite qualifies by importing/requiring a deletion entry module, calling a deletion function (including the resident
 // removeActor request, which deletes the actor directory), calling .remove with
-// an actor-manager import (or on a .actors/manager receiver), calling .publishBatch/.prune/.compact with a mesh
+// an actor-manager/directory value import (or on a .actors/manager receiver), calling .publishBatch/.prune/.compact with a mesh
 // store/bridge import, or spawning/executing fabric-win-remove or a retention CLI with --apply.
 export const productDeletionMarkers: readonly string[] = ["actors-cli", "actors/remove-offline",
   "storage/verified-remove", "storage/retention", "storage/scratch", "mesh/event-log"];
@@ -68,7 +68,7 @@ function reachesProductDeletion(path: string, source: string): boolean {
     return needles.some((needle) => module === needle || module.endsWith("/" + needle));
   });
   if (imports(...productDeletionMarkers)) return true;
-  const managerImport = imports("actors/manager", "fabric-actors");
+  const managerImport = imports("actors/manager", "actors/directory", "fabric-actors");
   const meshImport = imports("mesh/store", "mesh/bridge");
   return calls.some(({ name, receiver, args }) => deletionCalls.has(name)
     || (name === "remove" && (managerImport || receiver === "actors" || receiver === "manager"))

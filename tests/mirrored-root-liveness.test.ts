@@ -174,8 +174,11 @@ describe("source-clock root liveness (#10068)", () => {
     expect((await settle(request(f))).error).toHaveProperty("code", "FABRIC_BRIDGE_STALE");
     expect(commands(f)).toHaveLength(0);
     // Read-only selection probe: unconfirmed authority does not mean an epoch-old owner.
-    expect(deadHostRecords(f.store, { ownHostId: senderId, now: f.now() })).toHaveLength(0);
-    expect(deadHostRecords(f.store, { ownHostId: senderId, now: f.now() + DEAD_HOST_RECORDS_MS + 1 }).length).toBeGreaterThan(0);
+    // The reaper ages the row by its store commit stamp (wall clock at commit), not the fixture
+    // clock, so the boundary is pinned to that stamp; a slow commit (hosted Windows) cannot skew it.
+    const checkpoint = f.store.get(key("topology/hosts/", rootId))!.updatedAt;
+    expect(deadHostRecords(f.store, { ownHostId: senderId, now: checkpoint + DEAD_HOST_RECORDS_MS - 2 })).toHaveLength(0);
+    expect(deadHostRecords(f.store, { ownHostId: senderId, now: checkpoint + DEAD_HOST_RECORDS_MS }).length).toBeGreaterThan(0);
   });
 
   it("does not mirror a source-clock expired root even if hub time would consider it live", async () => {

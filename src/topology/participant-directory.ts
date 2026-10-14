@@ -1695,7 +1695,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
         const lease = owner ? readHostLease(this.mesh.root, owner.id) : undefined;
         const leases = lease ? new Map([[owner!.id, lease]]) : new Map<string, FabricHostLease>();
         const mirror = owner && hostMirrorLease(leases, owner);
-        const status = owner?.remoteHost ? this.#mirrorStatus({ ...owner, ...(mirror ? { mirror } : {}) }, now) : undefined;
+        const status = owner?.remoteHost ? this.#mirrorStatus({ ...owner, ...hostLiveness(leases, owner), ...(mirror ? { mirror } : {}) }, now) : undefined;
         if (
           owner &&
           ownerMatches(participant, owner, this.options.hostId) &&

@@ -6,7 +6,7 @@ import { afterAll, afterEach, describe, expect, it } from "vitest";
 import { MESH_ARCHIVE_CONFIG } from "../src/mesh/archive.js";
 import { MeshBridge, StoreBridgeSide } from "../src/mesh/bridge.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
-import { writeHostLease } from "../src/topology/host-leases.js";
+import { readHostLease, writeHostLease, type FabricHostLease } from "../src/topology/host-leases.js";
 import { writeParticipantFile } from "../src/topology/participant-files.js";
 
 // smarty-dev#10391: a bridge catch-up must never hold state.db's SQLite write lock above 100 ms.
@@ -261,11 +261,26 @@ describe("bridge catch-up SQLite write-lock holds (smarty-dev#10391), real store
     it("a renewed lease file: the proof fails, the full check passes, and the event commits", async () => {
       const f = await held();
       const lease = path.join(f.hub.root, "host-leases");
-      const now = Date.now();
-      f.set(() => writeHostLease(f.hub.root, { id: f.spoke.id, rootId: f.spoke.id, identityId: f.spoke.id,
-        updatedAt: now, expiresAt: now + 30000, startedAt: now }));
+      // #10068: renew the bridge's own mirror lease (same incarnation, a newer source sample), as
+      // its next presence pass would; a native lease without the mirror would not be this link's.
+      const current = readHostLease(f.hub.root, f.spoke.id)!;
+      expect(current).toMatchObject({ rootId: f.spoke.id, identityId: f.spoke.id, mirrorLease: 1, mirror: { remoteHost: "far" } });
+      let renewed: FabricHostLease | undefined;
+      f.set(() => {
+        const now = Date.now(), mirror = current.mirror!;
+        renewed = { ...current, updatedAt: mirror.sourceObservedAt + 1, expiresAt: now + 15000, mirror: { ...mirror, observedAt: now,
+          sourceObservedAt: mirror.sourceObservedAt + 1, sourceUpdatedAt: mirror.sourceObservedAt + 1, sourceExpiresAt: mirror.sourceExpiresAt + 30000 } };
+        writeHostLease(f.hub.root, renewed);
+      });
       await f.send("renewed");
       expect(fs.existsSync(lease)).toBe(true);
+      expect(renewed).toBeDefined();
+      // The same incarnation's mirror stays on disk (a later bridge pass may only renew it further).
+      const after = readHostLease(f.hub.root, f.spoke.id)!;
+      expect(after).toMatchObject({ id: current.id, rootId: current.rootId, identityId: current.identityId,
+        startedAt: current.startedAt, mirrorLease: 1, mirror: { remoteHost: "far" } });
+      expect(after.incarnationToken).toBe(current.incarnationToken);
+      expect(after.mirror!.observedAt).toBeGreaterThanOrEqual(renewed!.mirror!.observedAt);
       expect(f.fences()).toBe(2);
       expect(f.hub.read({ after: 0, limit: 100 }).map(e => e.text)).toContain("renewed");
       await f.bridge.stop();

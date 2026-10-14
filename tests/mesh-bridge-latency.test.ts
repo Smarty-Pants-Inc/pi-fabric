@@ -6,7 +6,7 @@ import { PassThrough } from "node:stream";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { BRIDGE_LEASE_MS, MeshBridge, RemoteBridgeSide, serveBridgeAgent, StoreBridgeSide } from "../src/mesh/bridge.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
-import { LIVENESS_POLICY_KEY, readHostLeases, writeHostLease } from "../src/topology/host-leases.js";
+import { LIVENESS_POLICY_KEY, mirroredLeaseStatus, readHostLeases, writeHostLease } from "../src/topology/host-leases.js";
 import { writeParticipantFile } from "../src/topology/participant-files.js";
 
 // smarty-dev#6477: a spoke's live Main (15 s file lease, renewed every 5 s) was never mirrored
@@ -62,7 +62,9 @@ describe("bridge presence latency (smarty-dev#6477)", () => {
     const serving = serveBridgeAgent(spoke, input, output);
     const remote = new RemoteBridgeSide(output, input);
     closers.push(async () => { remote.close(); input.end(); await serving; output.end(); });
-    const bridge = new MeshBridge({ localName: "dev1", remoteName: "ryzen3", local: new StoreBridgeSide(hub, "ryzen3"),
+    const hubSide = new StoreBridgeSide(hub, "ryzen3");
+    const requestedAt = now;
+    const bridge = new MeshBridge({ localName: "dev1", remoteName: "ryzen3", local: hubSide,
       remote, cursorPath: path.join(root, "cursor.json") });
     await bridge.syncPresence();
     expect(hub.get(key("topology/participants/", lane.id))?.value).toMatchObject({ id: lane.id, kind: "root", remoteHost: "ryzen3" });
@@ -71,6 +73,11 @@ describe("bridge presence latency (smarty-dev#6477)", () => {
     const lease = readHostLeases(hub.root).get(lane.id)!;
     expect(lease.expiresAt).toBeGreaterThan(now);
     expect(lease.expiresAt).toBeLessThanOrEqual(now + 15_000);
+    // Bridge authority survives the slow commit, but freshness stays anchored at the request
+    // (#10068): the delayed commit never makes the sample look newer.
+    expect(hubSide.holds(lane.id)).toBe(true);
+    expect(lease.mirror?.observedAt).toBe(requestedAt);
+    expect(mirroredLeaseStatus("ryzen3", lease.mirror, now)).toBe("live");
   });
 
   it("still refuses a host whose lease had already lapsed when the hub asked", async () => {
@@ -81,14 +88,26 @@ describe("bridge presence latency (smarty-dev#6477)", () => {
     const hub = new MeshStore(path.join(root, "hub"), 64 * 1024, 100);
     const far = new MeshStore(path.join(root, "spoke"), 64 * 1024, 100);
     const lane = await liveMain(far, "lane", now);
-    const hubSide = new StoreBridgeSide(hub, "ryzen3");
     now += 11_000;
-    // A spoke that claims the lapsed lease anyway (an older or lying peer).
+    // The source itself no longer offers a lease that lapsed on its own clock.
+    expect((await new StoreBridgeSide(far, "dev1", () => now).presence()).hosts).toHaveLength(0);
+    // A peer that claims it anyway (an older or lying peer). With a source sample the lapse is
+    // judged on the SOURCE clock, whatever the hub clock or skew (#10068); a legacy peer without
+    // one is judged when the hub asked, as before (#6477).
     const claimed = await new StoreBridgeSide(far, "dev1", () => now - 11_000).presence();
     expect(claimed.hosts).toHaveLength(1);
-    await hubSide.mirror(claimed, now);
+    const sourceLapsed = claimed.hosts.map(host => ({ ...host, observedAt: host.expiresAt + 1_000 }));
+    const legacy = claimed.hosts.map(({ observedAt: _sampledAt, ...host }) => host);
+    for (const [name, hosts] of [["source-lapsed", sourceLapsed], ["legacy", legacy]] as const) {
+      const store = new MeshStore(path.join(root, `hub-${name}`), 64 * 1024, 100);
+      const hubSide = new StoreBridgeSide(store, "ryzen3");
+      await hubSide.mirror({ ...claimed, hosts }, now);
+      expect(store.get(key("topology/hosts/", lane.id)), name).toBeUndefined();
+      expect(store.get(key("topology/participants/", lane.id)), name).toBeUndefined();
+      expect(readHostLeases(store.root).has(lane.id), name).toBe(false);
+      expect(hubSide.holds(lane.id), name).toBe(false);
+    }
     expect(hub.get(key("topology/hosts/", lane.id))).toBeUndefined();
-    expect(hub.get(key("topology/participants/", lane.id))).toBeUndefined();
   });
 
   // Independent review P2: the pass-delay shift was uncapped, so a pass that stalled 60 s kept a
@@ -115,15 +134,19 @@ describe("bridge presence latency (smarty-dev#6477)", () => {
     const serving = serveBridgeAgent(spoke, input, output);
     const remote = new RemoteBridgeSide(output, input);
     closers.push(async () => { remote.close(); input.end(); await serving; output.end(); });
-    const bridge = new MeshBridge({ localName: "dev1", remoteName: "ryzen3", local: new StoreBridgeSide(hub, "ryzen3"),
+    const hubSide = new StoreBridgeSide(hub, "ryzen3");
+    const bridge = new MeshBridge({ localName: "dev1", remoteName: "ryzen3", local: hubSide,
       remote, cursorPath: path.join(root, "cursor.json") });
     await bridge.syncPresence();
     // Uncapped, the mirror lived until now + 10 s, i.e. 60 s past the origin's own expiry.
     expect(originExpiry + BRIDGE_LEASE_MS).toBeLessThan(now);
     const lease = readHostLeases(hub.root).get(lane.id);
     expect(lease === undefined || lease.expiresAt <= originExpiry + BRIDGE_LEASE_MS).toBe(true);
-    expect(hub.get(key("topology/hosts/", lane.id))).toBeUndefined();
-    expect(hub.get(key("topology/participants/", lane.id))).toBeUndefined();
+    // #10068 may retain the root for a precise bridge-stale routing error, but grants it no
+    // authority: its lease lapsed before the commit and the stalled sample is bridge-stale.
+    expect(lease === undefined || lease.expiresAt <= now).toBe(true);
+    expect(hubSide.holds(lane.id)).toBe(false);
+    if (lease) expect(mirroredLeaseStatus("ryzen3", lease.mirror, now)).toBe("bridge-stale");
   });
 
   it("bounds the shift of a slow pass's still-live mirror by one BRIDGE_LEASE_MS past its origin", async () => {
@@ -139,11 +162,16 @@ describe("bridge presence latency (smarty-dev#6477)", () => {
       const observedAt = now;
       const snapshot = await new StoreBridgeSide(far, "dev1").presence();
       now += stall;
-      await new StoreBridgeSide(hub, "ryzen3").mirror(snapshot, observedAt);
+      const hubSide = new StoreBridgeSide(hub, "ryzen3");
+      await hubSide.mirror(snapshot, observedAt);
       const lease = readHostLeases(hub.root).get(lane.id);
       const until = Math.min(originExpiry + Math.min(stall, BRIDGE_LEASE_MS), now + BRIDGE_LEASE_MS);
-      if (until > now) expect(lease?.expiresAt, `stall ${stall}`).toBe(until);
-      else expect(lease, `stall ${stall}`).toBeUndefined();
+      // Past `until`, a sampled mirror is at most retained as bridge-stale (#10068), never held.
+      if (until > now || lease) expect(lease?.expiresAt, `stall ${stall}`).toBe(until);
+      // Authority also needs a fresh sample: a stall of one BRIDGE_LEASE_MS or more is bridge-stale.
+      const fresh = now - observedAt < BRIDGE_LEASE_MS;
+      expect(hubSide.holds(lane.id), `stall ${stall}`).toBe(until > now && fresh);
+      if (lease) expect(mirroredLeaseStatus("ryzen3", lease.mirror, now), `stall ${stall}`).toBe(fresh ? "live" : "bridge-stale");
       expect(lease === undefined || lease.expiresAt - originExpiry <= BRIDGE_LEASE_MS, `stall ${stall}`).toBe(true);
       vi.restoreAllMocks();
     }
@@ -166,9 +194,15 @@ describe("bridge presence latency (smarty-dev#6477)", () => {
     expect(live.get(key("topology/participants/", lane.id))?.value).toMatchObject({ id: lane.id, remoteHost: "ryzen3" });
     // A host whose lease lapsed before this pass: refused, as with observedAt = now.
     const lapsed = new MeshStore(path.join(root, "hub-lapsed"), 64 * 1024, 100);
+    expect(readHostLeases(live.root).get(lane.id)?.mirror?.observedAt).toBe(now);
     const claimed = await new StoreBridgeSide(far, "dev1").presence();
     now += 11_000;
-    await new StoreBridgeSide(lapsed, "ryzen3").mirror(claimed, observedAt);
+    // Lapsed on the hub clock (a legacy peer, no sample) or on the source clock (sampled): the
+    // non-finite observedAt admits neither, and source time never meets the hub clock (#10068).
+    const legacy = claimed.hosts.map(({ observedAt: _sampledAt, ...host }) => host);
+    const sourceLapsed = claimed.hosts.map(host => ({ ...host, observedAt: host.expiresAt + 1_000 }));
+    await new StoreBridgeSide(lapsed, "ryzen3").mirror({ ...claimed, hosts: legacy }, observedAt);
+    await new StoreBridgeSide(lapsed, "ryzen3").mirror({ ...claimed, hosts: sourceLapsed }, observedAt);
     expect(lapsed.get(key("topology/hosts/", lane.id))).toBeUndefined();
     expect(lapsed.get(key("topology/participants/", lane.id))).toBeUndefined();
     expect(readHostLeases(lapsed.root).has(lane.id)).toBe(false);

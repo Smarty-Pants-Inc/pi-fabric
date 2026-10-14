@@ -949,8 +949,14 @@ export class StoreBridgeSide implements BridgeSide {
           // successful per-host observation. A delayed commit never makes that snapshot fresh.
           const sampled = typeof sourceObservedAt === "number" && Number.isFinite(sourceObservedAt);
           if (!Number.isFinite(expiresAt) || expiresAt <= (sampled ? sourceObservedAt : liveAt)) continue;
-          const until = sampled ? liveAt + Math.min(BRIDGE_LEASE_MS, expiresAt - sourceObservedAt) :
-            Math.min(expiresAt + Math.min(now - liveAt, BRIDGE_LEASE_MS), now + BRIDGE_LEASE_MS);
+          // A sampled origin's remaining life is a SOURCE-clock duration, anchored at liveAt (this
+          // clock, before the source read it), so liveAt + remaining never overstates the origin.
+          // A slow pass shifts that deadline by its own latency, capped at one BRIDGE_LEASE_MS and
+          // at now + BRIDGE_LEASE_MS (smarty-dev#6477; independent review P2). The shift extends
+          // authority only: mirror.observedAt stays liveAt, and readers cap authority at
+          // observedAt + MIRROR_FRESH_MS, so a delayed commit never makes the sample fresher.
+          const origin = sampled ? liveAt + Math.min(BRIDGE_LEASE_MS, expiresAt - sourceObservedAt) : expiresAt;
+          const until = Math.min(origin + Math.min(now - liveAt, BRIDGE_LEASE_MS), now + BRIDGE_LEASE_MS);
           if (!sampled && until <= now) continue;
           const renewedAt = sampled ? record.updatedAt : Math.min(record.updatedAt, now);
           const mirror: FabricMirrorLease | undefined = sampled ? { remoteHost: this.peer, observedAt: liveAt,

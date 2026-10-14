@@ -429,14 +429,33 @@ describe("mirrored remote roots (smarty-dev#2004)", () => {
     writeHostLease(meshRoot, { id: remote.id, rootId: remote.id, identityId: remote.id, updatedAt: now, expiresAt: now + 60_000 });
     // The file lease renews the mirrored host without a shared-state write.
     expect(directory.get(remote.id, now + 30_000)).toMatchObject({ remoteHost: "forge", stale: false });
-    expect(directory.get(remote.id, now + 61_000)).toBeUndefined();
-    expect(directory.peers(now + 61_000)).toEqual([]);
+    expect(directory.get(remote.id, now + 30_000)?.bridgeStale).toBeUndefined();
+    // #10068: an unsampled (older-bridge) projection past its deadline is bridge-stale, not owner
+    // death; it stays discoverable and attributed to forge so routing can name the host.
+    expect(directory.get(remote.id, now + 61_000)).toMatchObject({ remoteHost: "forge", stale: false, bridgeStale: true });
+    expect(directory.peers(now + 61_000).map((peer) => peer.id)).toEqual([remote.id]);
 
-    await mirror({ expiresAt: Date.now() - 2_000 });
-    writeHostLease(meshRoot, { id: remote.id, rootId: remote.id, identityId: remote.id, updatedAt: now, expiresAt: Date.now() - 2_000 });
-    expect(directory.lastKnown(remote.id)).toMatchObject({ participant: { remoteHost: "forge" } });
     const request = vi.fn();
     const router = routerFor(directory, { request } as unknown as FabricControlPlane, local);
+    // Stale transport sample: refused at once, naming the remote host, before any publication.
+    await mirror({ expiresAt: Date.now() - 2_000 });
+    writeHostLease(meshRoot, { id: remote.id, rootId: remote.id, identityId: remote.id, updatedAt: now, expiresAt: Date.now() - 2_000 });
+    await expect(router.routeMessage(remote.id, "hello", undefined, "followUp")).rejects.toMatchObject({
+      name: "FabricBridgeStaleError", code: "FABRIC_BRIDGE_STALE", remoteHost: "forge", targetId: remote.id,
+      message: expect.stringContaining("Fabric bridge-stale for remote host forge"),
+    });
+    expect(request).not.toHaveBeenCalled();
+
+    // Fresh bridge sample of a source lease that lapsed on the source clock: the mirrored lease
+    // expired, so the root is gone and the lapse names forge at once (smarty-dev#2004).
+    const observedAt = Date.now();
+    await mirror({ expiresAt: observedAt + 15_000, host: { mirrorLease: 1 } });
+    writeHostLease(meshRoot, { id: remote.id, rootId: remote.id, identityId: remote.id, startedAt: 1,
+      updatedAt: observedAt, expiresAt: observedAt + 15_000, mirrorLease: 1, mirror: { remoteHost: "forge", observedAt,
+        sourceObservedAt: observedAt - 90_000, sourceUpdatedAt: observedAt - 110_000, sourceExpiresAt: observedAt - 95_000 } });
+    expect(directory.get(remote.id)).toBeUndefined();
+    expect(directory.peers()).toEqual([]);
+    expect(directory.lastKnown(remote.id)).toMatchObject({ participant: { remoteHost: "forge", stale: true } });
     await expect(router.routeMessage(remote.id, "hello", undefined, "followUp"))
       .rejects.toThrow(`Unknown Fabric participant: ${remote.id} (its lease mirrored from remote host forge lapsed`);
     expect(request).not.toHaveBeenCalled();

@@ -78,7 +78,7 @@ export const releaseLabel = (root: string): string => path.basename(root);
 // Colocated with the existing cheap agent-dir module to avoid another eager shared chunk.
 const LOG_CAP_BYTES = 5 * 1024 * 1024;
 const NOTICE_WINDOW_MS = 10 * 60 * 1000;
-type DiagnosticLevel = "warn" | "error" | "info" | "debug";
+type DiagnosticLevel = "warn" | "error" | "info" | "debug" | "stderr";
 type DiagnosticContext = {
   hasUI: boolean;
   mode?: string;
@@ -99,7 +99,9 @@ export const configureFabricDiagnostics = (context?: DiagnosticContext): void =>
 /** No host imports, timers or log I/O until a diagnostic occurs with an active terminal UI. */
 const fabricDiagnostic = (level: DiagnosticLevel, args: unknown[]): void => {
   if (!interactive) {
-    console[level](...args);
+    // Preserve the caller's exact channel: raw stderr is not a console warning (nor vice versa).
+    if (level === "stderr") process.stderr.write(args[0] as string);
+    else console[level](...args);
     return;
   }
   let message: string;
@@ -145,7 +147,7 @@ const fabricDiagnostic = (level: DiagnosticLevel, args: unknown[]): void => {
   notices.set(key, now);
   try {
     interactive.notify(`${key === "mesh-lock-timeout" ? "[pi-fabric] Mesh lock contention; background operations are retrying." : message.split("\n")[0]} ${logFailed ? "Diagnostic log unavailable:" : "Details:"} ${logPath}`,
-      level === "warn" ? "warning" : level === "error" ? "error" : "info");
+      level === "warn" || level === "stderr" ? "warning" : level === "error" ? "error" : "info");
   } catch { /* A stale UI must not change operation or retry semantics. */ }
 };
 
@@ -153,3 +155,5 @@ export const fabricWarn = (...args: unknown[]): void => fabricDiagnostic("warn",
 export const fabricError = (...args: unknown[]): void => fabricDiagnostic("error", args);
 export const fabricInfo = (...args: unknown[]): void => fabricDiagnostic("info", args);
 export const fabricDebug = (...args: unknown[]): void => fabricDiagnostic("debug", args);
+/** Raw stderr diagnostics preserve every byte in non-TUI hosts, including the caller's newline. */
+export const fabricStderr = (text: string): void => fabricDiagnostic("stderr", [text]);

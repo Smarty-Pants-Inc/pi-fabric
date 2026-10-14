@@ -1,10 +1,14 @@
 import fs from "node:fs";
-import { fabricWarn } from "../core/diagnostics.js";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
+
+// Native Node type-stripping callers need a real .ts path; warnings must remain synchronous.
+// ponytail: import the same sink directly, not a second fallback or an async warning queue.
+// @ts-expect-error TS5097: tsc emits declarations only; esbuild resolves this source into the shared sink chunk.
+import { fabricWarn } from "../core/agent-dir.ts";
 
 /**
  * The one removal path of every retention and scratch deleter (smarty-dev#7916). A deleter judges a target by

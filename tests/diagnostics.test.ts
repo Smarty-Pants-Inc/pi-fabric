@@ -3,7 +3,7 @@ import { Console } from "node:console";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { configureFabricDiagnostics, fabricWarn, fabricError, fabricInfo, fabricDebug } from "../src/core/diagnostics.js";
+import { configureFabricDiagnostics, fabricWarn, fabricError, fabricInfo, fabricDebug, fabricStderr } from "../src/core/diagnostics.js";
 import { MeshBackgroundRetry, MeshLockTimeoutError } from "../src/core/atomic-write.js";
 
 const scratch: string[] = [];
@@ -69,6 +69,35 @@ describe("Fabric diagnostics protect Pi's editor", () => {
     expect(stdout).not.toHaveBeenCalled();
     expect(fs.existsSync(log)).toBe(false);
     expect(notify).not.toHaveBeenCalled();
+  });
+
+  it("preserves each console method and raw stderr bytes without a UI; raw stderr stays off an active TUI", () => {
+    const { log } = profile();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    const info = vi.spyOn(console, "info").mockImplementation(() => {});
+    const debug = vi.spyOn(console, "debug").mockImplementation(() => {});
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    const failure = new Error("failure");
+    fabricWarn("warn %s", "exact");
+    fabricError("error", failure);
+    fabricInfo("info %d", 3);
+    fabricDebug("debug", { value: true });
+    fabricStderr("raw diagnostic\n");
+    expect(warn.mock.calls).toEqual([["warn %s", "exact"]]);
+    expect(error.mock.calls).toEqual([["error", failure]]);
+    expect(info.mock.calls).toEqual([["info %d", 3]]);
+    expect(debug.mock.calls).toEqual([["debug", { value: true }]]);
+    expect(stderr.mock.calls).toEqual([["raw diagnostic\n"]]);
+    expect(stdout).not.toHaveBeenCalled();
+    expect(fs.existsSync(log)).toBe(false);
+    configureFabricDiagnostics({ hasUI: true, mode: "tui", ui: { notify: vi.fn() } });
+    fabricStderr("UI diagnostic\n");
+    expect(stderr).toHaveBeenCalledOnce();
+    expect(warn).toHaveBeenCalledOnce();
+    expect(stdout).not.toHaveBeenCalled();
+    expect(fs.readFileSync(log, "utf8")).toContain("UI diagnostic\\n");
   });
 
   it("logs every diagnostic, deduplicates varied mesh retries, and rebinds after session replacement", () => {

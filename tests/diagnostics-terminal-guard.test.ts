@@ -11,7 +11,7 @@ const allowlist: Record<string, { reason: string; calls: Record<string, number> 
   "src/bash-idle-watchdog.ts": { reason: "Separate bash child wrapper forwards the captured child's streams, not the Main terminal.", calls: { "process.stderr.write": 4, "process.stdout.write": 1 } },
   "src/cli/index.ts": { reason: "Standalone pi-fabric command entry.", calls: { "process.stdout.write": 1, "process.stderr.write": 2 } },
   "src/cli/mesh.ts": { reason: "CLI subcommand, loaded only by the standalone entry.", calls: { "process.stdout.write": 2, "process.stderr.write": 2 } },
-  "src/core/agent-dir.ts": { reason: "The single diagnostics sink's no-terminal-UI console fallback.", calls: { "console[level]": 1 } },
+  "src/core/agent-dir.ts": { reason: "The single diagnostics sink's no-terminal-UI fallbacks preserve the caller's exact console method or raw stderr channel.", calls: { "console[level]": 1, "process.stderr.write": 1 } },
   "src/durable/worker-host.ts": { reason: "Separate durable worker's print/JSON host, never Pi Main's TUI.", calls: { "process.stderr.write": 4 } },
   "src/durable/worker.ts": { reason: "Fatal error in standalone durable worker entry.", calls: { "process.stderr.write": 1 } },
   "src/extension.ts": { reason: "Exactly one resident readiness protocol ACK, gated by mode === rpc and PI_FABRIC_PARENT_RUN; TUI refuses before this write.", calls: { "writeSync": 1 } },

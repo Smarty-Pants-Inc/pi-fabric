@@ -10,6 +10,7 @@ import {
   alarmForeignHolder, MeshLockForeignHolderError, MeshLockTimeoutError, ownProcessIncarnation, processIncarnation, validProcessIncarnation, type StaleLockNote,
 } from "../core/atomic-write.js";
 import { FOREIGN_LOCK, pinFenceLock, releaseFenceLock } from "./fence-lock.js";
+import { verifiedRemove } from "../storage/verified-remove.js";
 
 // The mesh `.lock` domain (smarty-dev#6477 L0): acquisition (withLock, withTryLock), lock tickets,
 // timeouts, the L8 timing hook and recovery of stale owners. State (state-file.ts) and events
@@ -255,12 +256,18 @@ export class MeshLock {
       if (held !== undefined) { releaseFenceLock(this.#lockPath, ownerRecord, {}, held); return; }
       // Non-Linux keeps main's release; the stalled-holder race there is tracked in smarty-dev#9569.
       try {
+        // smarty-dev#8907: the directory judged by its owner record, stat captured before that read; only that inode
+        // is removed (detached into verifiedRemove's graveyard first). A swapped-in successor is refused, never removed.
+        const judged = fs.lstatSync(this.#lockPath);
         if (fs.readFileSync(ownerPath, "utf8") === ownerRecord) {
-          // Detach the complete owned directory before unlinking anything inside it.
-          // Interrupted/resumed recursive cleanup must never follow the canonical name.
-          const released = `${this.#lockPath}.released.${token}`;
-          fs.renameSync(this.#lockPath, released);
-          fs.rmSync(released, { recursive: true, force: true });
+          verifiedRemove(this.#lockPath, judged, { deleter: "meshLockRelease", fallback: () => {
+            // Off Linux, main's release: detach the complete owned directory before unlinking anything inside it.
+            // Interrupted/resumed recursive cleanup must never follow the canonical name.
+            const released = `${this.#lockPath}.released.${token}`;
+            fs.renameSync(this.#lockPath, released);
+            fs.rmSync(released, { recursive: true, force: true });
+            return true;
+          } });
         }
       } catch {
         // Already replaced/removed, unreadable, or cleanup failed: never delete canonical.
@@ -333,6 +340,9 @@ export class MeshLock {
               // old-format writers that create an empty canonical after the absence check.
               fs.renameSync(staging, this.#lockPath);
             } finally {
+              // ponytail: no judgment precedes this. `staging` is this attempt's own unpublished mkdtemp name (random
+              // suffix, never published under it, never a recovery or rename target); after a successful publish the
+              // name is empty and `force` makes this a no-op. smarty-dev#8907 inventory.
               fs.rmSync(staging, { recursive: true, force: true });
             }
           }
@@ -426,6 +436,10 @@ export class MeshLock {
           current.mtimeMs !== stat.mtimeMs || readOwner() !== undefined) return false;
         // Native emptiness is the final fence, including against an initializer that
         // publishes and enters while this recoverer is paused at the removal syscall.
+        // ponytail (smarty-dev#8907): atomic rmdir, not verifiedRemove. It removes only an EMPTY directory, so a
+        // directory swapped in after this judgment loses no data and no custody: an ownerless directory grants none,
+        // and a protocol-1 initializer enters only after its `wx` owner write and its lstat identity recheck of its own
+        // mkdir, which fail (ENOENT / identity) if this rmdir took its directory. Any published owner makes it ENOTEMPTY.
         fs.rmdirSync(this.#lockPath);
         // Retain a nonempty recovery receipt, without ever renaming a live canonical.
         // Inode reuse may revisit the same receipt; that must not undo successful recovery.

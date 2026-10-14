@@ -155,10 +155,13 @@ const archiveControls = (runDirectory: string): Map<string, Buffer> | undefined 
       const old = JSON.parse(oldBytes.toString("utf8")), newer = JSON.parse(newBytes.toString("utf8"));
       const name = path.basename(relative), id = name.replace(/\.json(?:\.delivered)?$/, ""), admission = admissions.get(id);
       if (path.dirname(relative) === "terminal-controls") {
-        const keys = ["id", "state", "delivery", "provenance", ...(noAnswer ? [] : ["reason"])];
+        // Main's `forwarded` transport evidence is optional and boolean-only; the
+        // delivered sibling settles it, so it never retires an unproven row here.
+        const keys = ["id", "state", "delivery", "provenance", "forwarded", ...(noAnswer ? [] : ["reason"])];
         if (!old || !newer || !(noAnswer ? ["queued"] : ["queued", "refused"]).includes(old.state) || newer.state !== "delivered" ||
             Object.keys(old).some(key => !keys.includes(key)) || Object.keys(newer).some(key => !keys.includes(key)) ||
             old.reason !== undefined && (old.state !== "refused" || old.reason !== "run-ended") || newer.reason !== undefined ||
+            old.forwarded !== undefined && typeof old.forwarded !== "boolean" || newer.forwarded !== undefined && typeof newer.forwarded !== "boolean" ||
             !terminalControlMatchesAdmission(old, admission) || !terminalControlMatchesAdmission(newer, admission)) {
           throw new Error(`Conflicting legacy archive control ${relative}`);
         }

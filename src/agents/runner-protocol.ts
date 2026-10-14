@@ -21,6 +21,13 @@ export const AgentRunRecordSchema = Type.Object(
     id: Type.String(),
     name: Type.String(),
     task: Type.String(),
+    promptSha256: Type.Optional(Type.String({ pattern: "^[a-f0-9]{64}$" })),
+    promptBytes: Type.Optional(Type.Integer({ minimum: 0 })),
+    promptPath: Type.Optional(Type.String()),
+    inputSha256: Type.Optional(Type.String({ pattern: "^[a-f0-9]{64}$" })),
+    inputBytes: Type.Optional(Type.Integer({ minimum: 0 })),
+    promptRetentionDropped: Type.Optional(Type.Boolean()),
+    promptRetentionMismatch: Type.Optional(Type.Boolean()),
     status: Type.Union([
       Type.Literal("queued"),
       Type.Literal("running"),

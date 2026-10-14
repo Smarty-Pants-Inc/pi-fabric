@@ -328,7 +328,13 @@ describe("durable route dispatch", () => {
     expect(rows).toHaveLength(2); expect(rows[1]).toMatchObject({ status: "failed", admittedModel: null, admittedEffort: null }); expect(launch).not.toHaveBeenCalled();
   });
   it.each(["task.txt", "schema.json", "images.json"])("R2 settles failed pre-worker %s writes", async leaf => {
-    const dir = root(); const write = fs.writeFileSync;
+    const dir = root(); const write = fs.writeFileSync; const open = fs.openSync;
+    // #11663 stages task.txt through an exclusive descriptor before atomic rename;
+    // fail that actual input-write boundary, not the retired direct path writer.
+    vi.spyOn(fs, "openSync").mockImplementation((file, flags, mode) => {
+      if (leaf === "task.txt" && path.basename(String(file)).startsWith("task.txt.") && String(file).endsWith(".tmp")) throw new Error("input write failed");
+      return open(file, flags, mode);
+    });
     vi.spyOn(fs, "writeFileSync").mockImplementation((file, data, options) => { if (String(file).endsWith(leaf)) throw new Error("input write failed"); return write(file, data, options); });
     const decision = await decideModelRoute(input, async () => response());
     const manager = new AgentManager(dir, DEFAULT_FABRIC_CONFIG.agents, { runRoot: path.join(dir, "runs") }); managers.push(manager);

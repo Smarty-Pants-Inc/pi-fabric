@@ -657,7 +657,13 @@ describe.skipIf(process.platform !== "linux")("#2566 owned startup shutdown", ()
       await vi.waitFor(() => expect(fs.existsSync(path.join(config.residencyRoot, "stubborn-child-ready"))).toBe(true), { timeout: 5_000 });
       expect(executing()).toHaveLength(2);
       if (mode === "close") await client.close();
-      if (mode === "failure") fs.writeFileSync(path.join(config.residencyRoot, "error.json"), JSON.stringify({ error: "injected failure" }));
+      if (mode === "failure") {
+        const generation = fs.readFileSync(path.join(config.residencyRoot, "stubborn-launch-token"), "utf8");
+        fs.mkdirSync(path.join(config.residencyRoot, "generations"), { recursive: true });
+        fs.writeFileSync(path.join(config.residencyRoot, "generations", `${generation}.error.json`), JSON.stringify({
+          format: 1, generation, writer: "launcher", error: "injected failure", occurredAt: Date.now(), pid: process.pid,
+        }));
+      }
       const error = await starting;
       expect(error).toBeInstanceOf(Error);
       expect(String(error)).toMatch(mode === "timeout" ? /Timed out/ : mode === "close" ? /client is closed/ : /injected failure/);

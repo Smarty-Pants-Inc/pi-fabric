@@ -7,7 +7,9 @@ import { AgentManager } from "../src/agents/manager.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { writeJsonAtomic } from "../src/core/atomic-write.js";
-import { MAX_TASK_CONTROL_BYTES, ensureTaskControlRoot, saveFinalAnswerReceipt, taskControlDirectory, taskControlRoot, taskSteerFile } from "../src/worker/terminal-answer.js";
+import { readTerminalControl, settleTerminalControl } from "../src/worker/terminal-controls.js";
+import { TerminalNoticeOutbox } from "../src/agents/terminal-notices.js";
+import { createHostTaskRun, MAX_TASK_CONTROL_BYTES, ensureTaskControlRoot, saveFinalAnswerReceipt, taskControlDirectory, taskControlRoot, taskSteerFile } from "../src/worker/terminal-answer.js";
 import type { AgentRunRecord } from "../src/agents/types.js";
 import type { FabricWritePolicy } from "../src/agents/write-guard.js";
 import { FabricSteerAdmissionLimitError, type AgentTerminalNotice } from "../src/agents/terminal-target.js";
@@ -80,15 +82,15 @@ describe("steer/followUp after an ordinary Pi task's final answer", () => {
       ? manager.steer(handle.id, "racing input", undefined, provenance)
       : manager.followUp(handle.id, "racing input", undefined, { ...provenance, via: "followUp" }, { deadlineMs: 60_000 });
     expect(receipt).toBeDefined();
-    const expected = { code: "FABRIC_TARGET_TERMINAL", reason: "run-ended", messageId: sent.messageId, delivery: kind,
+    const expected = { code: "FABRIC_TARGET_TERMINAL", reason: "run-ended", deliveryStatus: "undelivered", messageId: sent.messageId, delivery: kind,
       finalAnswerReceiptId: receipt!.id, sender };
-    expect(sent).toMatchObject({ queued: true, messageId: sent.messageId, undelivered: expected });
+    expect(sent).toMatchObject({ queued: true, messageId: sent.messageId, undelivered: { ...expected, runState: "completed" } });
     // Visible through status while the native process is still alive.
     expect(manager.hasRunCustody(handle.id)).toBe(true);
-    expect(manager.status(handle.id).undeliveredMessages).toEqual([expected]);
+    expect(manager.status(handle.id).undeliveredMessages).toMatchObject([expected]);
     // The parent consumes the result; it reports the same refusal, still without native exit.
     const result = await manager.wait(handle.id, { timeoutMs: 1000 });
-    expect(result).toMatchObject({ status: "completed", text: "done", undeliveredMessages: [expected] });
+    expect(result).toMatchObject({ status: "completed", text: "done", undeliveredMessages: [expected] }); // runState is view-time
     await waitUntil(() => fs.existsSync(path.join(taskControlDirectory(directory), "terminal-notices", `${sent.messageId}.json.delivered`)));
     expect(notices).toEqual([{ code: "FABRIC_TARGET_TERMINAL", targetId: handle.id, finalAnswerReceiptId: receipt!.id,
       messageId: sent.messageId, delivery: kind, sender }]);
@@ -99,7 +101,7 @@ describe("steer/followUp after an ordinary Pi task's final answer", () => {
     close(handle.id);
     await new Promise(resolve => setTimeout(resolve, 20));
     expect(notices).toHaveLength(1);
-    expect(manager.status(handle.id).undeliveredMessages).toEqual([expected]);
+    expect(manager.status(handle.id).undeliveredMessages).toMatchObject([expected]);
   });
 
   it("an unread admission appended just before the final answer is run-ended in status without waiting on native exit", async () => {
@@ -109,7 +111,7 @@ describe("steer/followUp after an ordinary Pi task's final answer", () => {
     expect(sent.undelivered).toBeUndefined();
     const receipt = finish(handle.id, "done");
     expect(manager.hasRunCustody(handle.id)).toBe(true);
-    expect(manager.status(handle.id).undeliveredMessages).toEqual([{ code: "FABRIC_TARGET_TERMINAL", reason: "run-ended",
+    expect(manager.status(handle.id).undeliveredMessages).toMatchObject([{ code: "FABRIC_TARGET_TERMINAL", reason: "run-ended", deliveryStatus: "undelivered",
       messageId: sent.messageId, delivery: "steer", finalAnswerReceiptId: receipt.id, sender }]);
     await waitUntil(() => fs.existsSync(path.join(taskControlDirectory(path.join(root, handle.id)), "terminal-notices", `${sent.messageId}.json.delivered`)));
     expect(notices.map(notice => notice.sender)).toEqual([sender]);
@@ -343,5 +345,98 @@ describe("steer/followUp after an ordinary Pi task's final answer", () => {
     expect(() => manager.followUp(handle.id, "late")).toThrow(expect.objectContaining({ code: "FABRIC_TARGET_TERMINAL",
       reason: "run-ended", runState: "completed", message: expect.stringMatching(/run ended \(completed\)/) }));
     expect(fs.existsSync(taskSteerFile(path.join(root, handle.id)))).toBe(false); // nothing was admitted
+  });
+});
+
+// Main (deliveryStatus/runState + forwarded transport evidence) cases, ported onto
+// the protected harness: controls/journal/receipt live in taskControlDirectory.
+// Receipt-only (status unpublished) models main's `finish(id, false)`.
+const receiptOnly = (root: string, id: string) => saveFinalAnswerReceipt(path.join(root, id), id, "done");
+describe("manager final-answer admission race", () => {
+  it.each([
+    { delivery: "steer", runState: "completed" }, { delivery: "followUp", runState: "completed" },
+    { delivery: "steer", runState: "final-answer-pending" }, { delivery: "followUp", runState: "final-answer-pending" },
+  ] as const)("$delivery reports the real $runState when final is published during append", async ({ delivery, runState }) => {
+    const h = harness();
+    const handle = await h.manager.spawn({ task: "ordinary", transport: "process" });
+    const journal = taskSteerFile(path.join(h.root, handle.id));
+    const append = fs.appendFileSync;
+    let final: ReturnType<typeof h.finish> | undefined;
+    vi.spyOn(fs, "appendFileSync").mockImplementation(((file: fs.PathOrFileDescriptor, data: string | Uint8Array, options?: fs.WriteFileOptions) => {
+      const isJournal = file === journal || typeof file === "number" && fs.fstatSync(file).ino === fs.statSync(journal).ino;
+      if (isJournal && !final) final = runState === "completed" ? h.finish(handle.id, "done") : receiptOnly(h.root, handle.id);
+      return append(file, data, options);
+    }) as typeof fs.appendFileSync);
+    const sent = delivery === "steer" ? h.manager.steer(handle.id, "racing input", undefined, provenance)
+      : h.manager.followUp(handle.id, "racing input", undefined, { ...provenance, via: "followUp" }, { deadlineMs: 60_000 });
+    expect(sent.undelivered).toEqual({ code: "FABRIC_TARGET_TERMINAL", reason: "run-ended", deliveryStatus: "undelivered",
+      messageId: sent.messageId, delivery, finalAnswerReceiptId: final!.id, runState, sender: provenance.sender });
+    h.finish(handle.id, "done"); // Publish the delayed associated status after inspecting the pending receipt.
+    if (delivery === "followUp") expect(h.manager.status(handle.id).followUpDeliveries).toMatchObject([{ state: "cancelled" }]);
+    expect(await h.manager.wait(handle.id)).toMatchObject({ status: "completed", text: "done", turns: 1 });
+    h.close(handle.id); await h.manager.close();
+    expect(h.notices).toEqual([{ code: "FABRIC_TARGET_TERMINAL", targetId: handle.id, finalAnswerReceiptId: final!.id,
+      messageId: sent.messageId, delivery, sender: provenance.sender }]);
+    expect(h.launch).toHaveBeenCalledTimes(1);
+  });
+
+  it("counterexample: an exactly attributed control consumed before final is not refused", async () => {
+    const h = harness();
+    const handle = await h.manager.spawn({ task: "ordinary", transport: "process" });
+    const sent = h.manager.steer(handle.id, "consumed", undefined, provenance);
+    expect(sent.undelivered).toBeUndefined();
+    writeJsonAtomic(path.join(taskControlDirectory(path.join(h.root, handle.id)), "terminal-controls", `${sent.messageId}.json`),
+      { id: sent.messageId, delivery: "steer", state: "delivered", provenance });
+    h.finish(handle.id, "done");
+    expect(await h.manager.wait(handle.id)).toMatchObject({ status: "completed", turns: 1 });
+    h.close(handle.id); await h.manager.close();
+    expect(h.notices).toEqual([]);
+  });
+
+  // Keep reason: data-safety/trust boundary. Native close cannot prove that a
+  // forwarded frame was discarded; recovery must not invent sender receipts.
+  it.each(["queued", "refused"] as const)("forwarded control with %s native ACK preserves its exact evidence through close and outbox recovery", async state => {
+    const h = harness();
+    const handle = await h.manager.spawn({ task: "ordinary", transport: "process" });
+    const directory = path.join(h.root, handle.id);
+    const sent = h.manager.steer(handle.id, "possibly consumed native input", undefined, provenance);
+    expect(sent.undelivered).toBeUndefined();
+    const controls = taskControlDirectory(directory);
+    writeJsonAtomic(path.join(controls, "terminal-controls", `${sent.messageId}.json`),
+      { id: sent.messageId, delivery: "steer", state: "queued", forwarded: true, provenance });
+    if (state === "refused") settleTerminalControl(directory, sent.messageId, "refused"); // Confirmed native discard ACK.
+    const final = h.finish(handle.id, "done");
+    expect(await h.manager.wait(handle.id)).toMatchObject({ status: "completed", turns: 1 });
+    h.close(handle.id); await h.manager.close();
+    const notice: AgentTerminalNotice = { code: "FABRIC_TARGET_TERMINAL", targetId: handle.id,
+      finalAnswerReceiptId: final.id, messageId: sent.messageId, delivery: "steer", sender: provenance.sender };
+    expect(h.notices).toEqual(state === "refused" ? [notice] : []);
+    expect(readTerminalControl(directory, sent.messageId)).toMatchObject({ state, forwarded: true });
+
+    // Independent restart fixture has NO outbox or delivery receipt. Preserve
+    // the original admission and terminal registry exactly; no deletes needed.
+    const restartRoot = fs.mkdtempSync(path.join(os.tmpdir(), "steer-ended-outbox-recovery-"));
+    const restartDirectory = path.join(restartRoot, handle.id);
+    // Fresh protected namespace for the restarted run; copy bytes into it, never
+    // into the task-writable run directory (raw in-run controls are not authority).
+    createHostTaskRun(restartDirectory);
+    const restartControls = taskControlDirectory(restartDirectory);
+    fs.copyFileSync(path.join(controls, "steer.jsonl"), path.join(restartControls, "steer.jsonl"));
+    fs.mkdirSync(path.join(restartControls, "terminal-controls"), { recursive: true, mode: 0o700 });
+    fs.copyFileSync(path.join(controls, "terminal-controls", `${sent.messageId}.json`),
+      path.join(restartControls, "terminal-controls", `${sent.messageId}.json`));
+    fs.copyFileSync(path.join(controls, "final-answer.json"), path.join(restartControls, "final-answer.json"));
+    fs.copyFileSync(path.join(directory, "status.json"), path.join(restartDirectory, "status.json"));
+    const recovered: AgentTerminalNotice[] = [];
+    const outbox = new TerminalNoticeOutbox(replayed => { recovered.push(replayed); });
+    outbox.recover(restartDirectory);
+    // Outbox delivery is a Promise microtask chain, not an event/timer poll.
+    for (let i = 0; i < 8; i++) await Promise.resolve();
+    expect(recovered).toEqual(state === "refused" ? [notice] : []);
+    expect(readTerminalControl(restartDirectory, sent.messageId)).toMatchObject({ state, forwarded: true });
+    expect(fs.existsSync(path.join(restartControls, "terminal-notices", `${sent.messageId}.json.delivered`))).toBe(state === "refused");
+    outbox.recover(restartDirectory);
+    for (let i = 0; i < 8; i++) await Promise.resolve();
+    expect(recovered).toEqual(state === "refused" ? [notice] : []); // No invented refusal or restart duplicate.
   });
 });

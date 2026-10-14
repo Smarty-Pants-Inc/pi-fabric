@@ -140,6 +140,8 @@ import type { FabricInterruptErrorCode } from "../interrupt-authority.js";
 export interface FabricControlAcceptance {
   code?: "FABRIC_TARGET_TERMINAL";
   finalAnswerReceiptId?: string;
+  deliveryStatus?: "undelivered";
+  runState?: import("../agents/terminal-target.js").FabricTargetRunState;
   targetId?: string;
   warning?: AgentFollowUpRunningWarning;
   accepted: boolean;

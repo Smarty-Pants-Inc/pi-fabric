@@ -5,11 +5,11 @@ export class FabricTargetTerminalError extends Error {
   override readonly name = "FabricTargetTerminalError";
   readonly code = "FABRIC_TARGET_TERMINAL";
   readonly reason = "run-ended";
+  readonly deliveryStatus = "undelivered";
   /** Run state at refusal: the settled status, or `final-answer-pending` before result validation lands. */
-  readonly runState: FabricTargetRunState;
-  constructor(readonly targetId: string, readonly finalAnswerReceiptId: string, runState: FabricTargetRunState = "final-answer-recorded") {
-    super(`Fabric task ${targetId} run ended (${runState}); it recorded its final answer (${finalAnswerReceiptId}); input cannot revive it. Start a new task.`);
-    this.runState = runState;
+  constructor(readonly targetId: string, readonly finalAnswerReceiptId: string,
+    readonly runState: FabricTargetRunState = "final-answer-recorded") {
+    super(`undelivered: task already finished — Fabric task ${targetId} run ended (${runState}); it recorded its final answer (${finalAnswerReceiptId}); input cannot revive it. Start a new task.`);
   }
 }
 
@@ -24,13 +24,16 @@ export class FabricSteerAdmissionLimitError extends Error {
 
 export type FabricTargetRunState = "final-answer-pending" | "final-answer-recorded" | "completed" | "failed" | "stopped" | "timed_out";
 
-/** Sender-visible receipt for one admitted control that the ended run never consumed. */
+/** One admitted control the ended run never consumed (append race or retained refusal). */
 export interface AgentUndeliveredMessage {
   code: "FABRIC_TARGET_TERMINAL";
   reason: "run-ended";
+  deliveryStatus: "undelivered";
   messageId: string;
   delivery: "steer" | "followUp";
   finalAnswerReceiptId: string;
+  /** The target's real run state when the append lost the race; carried to remote errors. */
+  runState: FabricTargetRunState;
   sender?: FabricTurnProvenance["sender"];
 }
 
@@ -44,7 +47,7 @@ export interface AgentTerminalNotice {
 }
 
 /** Copy the fixed rejection fields through owner ACKs; never trust arbitrary error data. */
-export const terminalRejectionFields = (value: unknown): { code: "FABRIC_TARGET_TERMINAL"; finalAnswerReceiptId: string; targetId: string; reason?: "run-ended"; runState?: FabricTargetRunState } | undefined => {
+export const terminalRejectionFields = (value: unknown): { code: "FABRIC_TARGET_TERMINAL"; finalAnswerReceiptId: string; targetId: string; reason?: "run-ended"; deliveryStatus?: "undelivered"; runState?: FabricTargetRunState } | undefined => {
   if (!value || typeof value !== "object") return undefined;
   const error = value as Record<string, unknown>;
   if (error.code !== "FABRIC_TARGET_TERMINAL" || typeof error.finalAnswerReceiptId !== "string" || !error.finalAnswerReceiptId ||
@@ -52,5 +55,6 @@ export const terminalRejectionFields = (value: unknown): { code: "FABRIC_TARGET_
   const runState = typeof error.runState === "string" && ["final-answer-pending", "final-answer-recorded", "completed", "failed", "stopped", "timed_out"].includes(error.runState)
     ? error.runState as FabricTargetRunState : undefined;
   return { code: "FABRIC_TARGET_TERMINAL", finalAnswerReceiptId: error.finalAnswerReceiptId, targetId: error.targetId,
-    ...(error.reason === "run-ended" ? { reason: "run-ended" as const } : {}), ...(runState ? { runState } : {}) };
+    ...(error.reason === "run-ended" ? { reason: "run-ended" as const } : {}),
+    ...(error.deliveryStatus === "undelivered" ? { deliveryStatus: "undelivered" as const } : {}), ...(runState ? { runState } : {}) };
 };

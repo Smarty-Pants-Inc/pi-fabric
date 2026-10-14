@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
-import { MeshBackgroundQueue, MeshBackgroundRetry } from "../core/atomic-write.js";
+import { MeshBackgroundQueue, MeshBackgroundRetry, isMeshWriteDeferred } from "../core/atomic-write.js";
 import { participantProject, ParticipantRoleGrant, repositoryOf } from "./project-identity.js";
 import { mainPublicationFenced, MainPublicationFencedError } from "./main-publication-fence.js";
 import type { FabricMainAgentInfo } from "../main-agent.js";
@@ -300,6 +300,7 @@ interface PeerSignals {
   checkedAt: number;
 }
 
+// Message-only legacy compatibility stays narrow; retry policy also uses shared isMeshWriteDeferred.
 const isMeshLockTimeout = (error: unknown): error is Error =>
   error instanceof Error &&
   ((error as Error & { code?: unknown }).code === "FABRIC_MESH_LOCK_TIMEOUT" ||
@@ -609,7 +610,7 @@ export interface ParticipantDirectoryOptions {
   /** Existing actor file renewal only; validate the last known lineage against
    * an atomic registry snapshot at the per-key write decision. Never admits keys. */
   actorRenewalAllowed?: (record: FabricParticipantRecord) => boolean;
-  /** Complete runtime mesh activation before any presence write. A lock timeout
+  /** Complete runtime mesh activation before any presence write. A deferred write
    * follows the same startup warning and background refresh retry as publication. */
   beforePublication?: () => Promise<void>;
   /** Prepare outside custody; validate exact registry generations inside the
@@ -1025,7 +1026,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
   // Publishes changed local records soon: at once after a quiet second, otherwise at the
   // end of that second (one write for a burst of changes).
   scheduleRefresh(): void {
-    if (this.#closed || this.#superseded || isMeshLockTimeout(this.#refreshError)) return;
+    if (this.#closed || this.#superseded || isMeshWriteDeferred(this.#refreshError) || isMeshLockTimeout(this.#refreshError)) return;
     if (this.#refreshing) {
       this.#refreshAgain = true;
       return;
@@ -1048,21 +1049,21 @@ export class ParticipantDirectory implements FabricParticipantSource {
     this.#refreshTimer.unref?.();
   }
 
-  /** Actor mutations publish changes, not a full heartbeat or a lock-outage retry. */
+  /** Actor mutations publish changes, not a full heartbeat or a deferred-write retry. */
   async refreshPresence(): Promise<void> {
     this.#assertLeaseActive();
-    if (isMeshLockTimeout(this.#refreshError)) return;
+    if (isMeshWriteDeferred(this.#refreshError) || isMeshLockTimeout(this.#refreshError)) return;
     // A setter may finish saving after an in-flight heartbeat selected its source.
     // Wait for that round, then flush the pending revision under a fresh registry
     // fence. Coalescing with it could acknowledge presence it never committed.
     while (this.#refreshing) {
       try { await this.#refreshing; }
       catch (error) {
-        if (isMeshLockTimeout(error)) return;
+        if (isMeshWriteDeferred(error) || isMeshLockTimeout(error)) return;
         throw error;
       }
     }
-    if (isMeshLockTimeout(this.#refreshError)) return;
+    if (isMeshWriteDeferred(this.#refreshError) || isMeshLockTimeout(this.#refreshError)) return;
     // Do not call refresh(): mutation callers must not masquerade as automatic
     // heartbeats. The next full round still renews every actor envelope (#5128)
     // and its host lease in the same single batch.
@@ -1092,7 +1093,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       if (this.#refreshingFull) return join(this.#refreshing);
       // A change-only refresh may skip its write; renew the lease right after it.
       return join(this.#refreshing.catch(error => {
-        if (isMeshLockTimeout(error)) throw error;
+        if (isMeshWriteDeferred(error) || isMeshLockTimeout(error)) throw error;
       }).then(() => this.refresh()));
     }
     return join(this.#runRefresh(true));
@@ -1154,7 +1155,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
   }
 
   async #finishRefresh(operation: Promise<number | false>, full: boolean): Promise<void> {
-    let lockTimedOut = false;
+    let writeDeferred = false;
     try {
       const committed = await operation;
       if (!committed || this.#closed) return;
@@ -1200,9 +1201,9 @@ export class ParticipantDirectory implements FabricParticipantSource {
       this.#refreshError = error;
       this.#routingReadAt = 0;
       if (error instanceof ParticipantFileLockBusyError) this.#prepareFileLocks = true;
-      lockTimedOut = isMeshLockTimeout(error);
+      writeDeferred = isMeshWriteDeferred(error) || isMeshLockTimeout(error);
       if (error instanceof HostLeaseLockBusyError) this.#cancelPublicationRetry();
-      if (lockTimedOut) {
+      if (writeDeferred) {
         // A change timer may predate this heartbeat and still be waiting to run.
         // Cancel it too: pending state rides one host-level recovery, not actor retries.
         if (this.#refreshTimer) clearTimeout(this.#refreshTimer);
@@ -1216,9 +1217,9 @@ export class ParticipantDirectory implements FabricParticipantSource {
       if (this.#refreshAgain) {
         this.#refreshAgain = false;
         // Never retry separately for every mutation received during an outage.
-        if (!lockTimedOut) this.scheduleRefresh();
+        if (!writeDeferred) this.scheduleRefresh();
       }
-      if (lockTimedOut) this.#schedulePublicationRetry();
+      if (writeDeferred) this.#schedulePublicationRetry();
     }
   }
 
@@ -1229,7 +1230,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
 
   #schedulePublicationRetry(): void {
     if (!this.options.waitForPublicationRetry || !this.#timer || this.#closed || this.#quiescing ||
-      !isMeshLockTimeout(this.#refreshError) || this.#refreshError instanceof HostLeaseLockBusyError ||
+      !(isMeshWriteDeferred(this.#refreshError) || isMeshLockTimeout(this.#refreshError)) || this.#refreshError instanceof HostLeaseLockBusyError ||
       this.#publicationRetryTimer || this.#publicationRetrying) return;
     // Not tied to the heartbeat phase: one jittered, capped retry for the whole host.
     const wait = 50 + Math.floor(Math.random() * (this.#publicationRetryDelay - 50));
@@ -1255,14 +1256,14 @@ export class ParticipantDirectory implements FabricParticipantSource {
       // lock order. Without a prepared fence, #refresh runs inside the publication fence: admit first.
       if (!this.options.preparePublicationFence) {
         await this.options.waitForPublicationRetry!();
-        if (this.#closed || this.#quiescing || !isMeshLockTimeout(this.#refreshError)) return;
+        if (this.#closed || this.#quiescing || !(isMeshWriteDeferred(this.#refreshError) || isMeshLockTimeout(this.#refreshError))) return;
         await this.refresh();
         return;
       }
       // smarty-dev#8880: with a prepared fence, selection runs outside every fence, so the admission is
       // awaited inside #refresh, after selection and right before the fence: the short free window it opens
       // goes to the fence and the mesh try, not to selection. No fence is held while it waits.
-      if (this.#closed || this.#quiescing || !isMeshLockTimeout(this.#refreshError)) return;
+      if (this.#closed || this.#quiescing || !(isMeshWriteDeferred(this.#refreshError) || isMeshLockTimeout(this.#refreshError))) return;
       this.#admitBeforeCommit = this.options.waitForPublicationRetry!;
       try { await this.refresh(); }
       finally {
@@ -1271,7 +1272,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
         await admitted?.catch(() => undefined); // an interrupted admission still finishes inside this retry
       }
     } catch (error) {
-      if (!isMeshLockTimeout(error)) this.#refreshError = error;
+      if (!(isMeshWriteDeferred(error) || isMeshLockTimeout(error))) this.#refreshError = error;
       this.#backgroundRefresh.failure(error);
     }
   }
@@ -1885,9 +1886,9 @@ export class ParticipantDirectory implements FabricParticipantSource {
     // A resumed/suspended process (or a forward wall-clock adjustment) must not
     // wait a full heartbeat interval before trying to confirm its lapsed lease.
     // This never grants admission: refresh still needs the real mesh lock.
-    // A typed lock timeout already has a single host recovery lane. Idle consumers
+    // A deferred write already has a single host recovery lane. Idle consumers
     // call this gate as often as every 100 ms; they must not multiply attempts.
-    if (!confirmed && !isMeshLockTimeout(this.#refreshError) && !this.#closed && !this.#quiescing && this.#timer) {
+    if (!confirmed && !(isMeshWriteDeferred(this.#refreshError) || isMeshLockTimeout(this.#refreshError)) && !this.#closed && !this.#quiescing && this.#timer) {
       this.#runBackground(() => this.refresh());
     }
     return confirmed;

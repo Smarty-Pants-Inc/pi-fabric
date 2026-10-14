@@ -1329,9 +1329,13 @@ export class FabricControlPlane {
    * Empty state has no deadline; shared records are swept at the existing 15-minute cadence. */
   #scheduleSeenCleanup(): void {
     if (this.#closed || this.#paused || this.#retryTimer) return;
+    const now = Date.now();
     const legacyDeadline = this.#legacySeenPending
       ? this.#legacySeenCleanupAt + LEGACY_SEEN_CLEANUP_MS : Infinity;
-    const expiresAt = Math.min(legacyDeadline, ...this.#sharedClaims.values());
+    // A spent claim may outlive its compacted input; keep custody but reconcile it on cadence.
+    const claimDeadlines = [...this.#sharedClaims.values()].map((deadline) =>
+      deadline > now ? deadline : now + LEGACY_SEEN_CLEANUP_MS);
+    const expiresAt = Math.min(legacyDeadline, ...claimDeadlines);
     if (!Number.isFinite(expiresAt)) return;
     this.#retryTimer = setTimeout(() => {
       this.#retryTimer = undefined;

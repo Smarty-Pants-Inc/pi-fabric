@@ -20,8 +20,10 @@ does not depend on Vitest teardown or the config process's exit callback.
 `SIGKILL` and a whole-scope timeout cannot run cleanup code. At the start of the next ordinary
 command, the helper scans direct `pi-fabric-vitest-*` children of the same caller `TMPDIR`. It
 removes only private harness-marked directories whose recorded owner pid and native process-start
-identity no longer identify a live owner. A reused pid is not that owner. Live-owner roots,
-markerless directories, symlinks and unsafe or replaced directories are left alone. No other
+identity no longer identify a live owner. On Linux, boot ID and kernel start ticks distinguish PID reuse.
+On other POSIX systems, whole-second `ps lstart` can preserve a stale root during same-second PID
+reuse, but never deletes a live-owner root; a later run sweeps it once the reusing process exits.
+Live-owner roots, markerless directories, symlinks and unsafe or replaced directories are left alone. No other
 caller's temp parent is swept. If no subsequent run starts, the stale root remains for caller or
 runner cleanup; the launcher does not claim immediate cleanup after an uncatchable signal.
 

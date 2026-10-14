@@ -592,23 +592,42 @@ type ActivationBlock = { reason: string; code: string; class: ActivationBlockCla
  * older host blocked for good on a transient cause recovers after an upgrade without a re-create. */
 const REDERIVED_BLOCK_CODES: ReadonlySet<string> = new Set(["unknown", "failing-preparation"]);
 /** Recognisable contradictory causes override an overflow tag, never weaken permanent failures. */
-const CONTRADICTORY_OVERFLOW_CODES: ReadonlySet<string> = new Set(["provider-transient", "auth", "permission", "security-policy", "quota", "invalid-request", "incomplete-evidence"]);
+const CONTRADICTORY_OVERFLOW_CODES: ReadonlySet<string> = new Set(["provider-transient", "auth", "permission", "security-policy", "quota", "invalid-request", "incomplete-evidence", "unknown"]);
 // Saturated worker warnings cannot prove that permanent evidence was not evicted.
 const saturatedWarningEvidence = (warnings: readonly string[] | undefined): boolean =>
   (warnings?.length ?? 0) >= WARNING_RETENTION_CAP;
 // Context-only wording must not hide an independent permanent cause, nor turn a
 // correctly typed provider overflow ("prompt is too long") into invalid configuration.
 const OVERFLOW_WORDING = /Context exceeds window|prompt (?:is )?too long|maximum context length|context(?:[ _-]+(?:window|length))?[ _-]+(?:overflow|exceeded|too long)|too many tokens/gi;
+// A typed overflow may carry provider details after its wording. Those details are not an
+// independent cause; any other residual error or warning is. Keep this narrow so an unknown
+// residual cannot authorize overflow recovery while genuine overflow-only runs still recover.
+const OVERFLOW_MARKER = "\u0000";
+const residualText = (text: string): string => text.replace(/^\s*(?:Error|Warning)\s*:?\s*/i, "")
+  .replace(/[\s:;,./()<>+="'_-]|\d/g, "");
+const hasUnknownResidual = (texts: readonly string[]): boolean => texts.some(text => text.split(/\r?\n/).some(line => {
+  const marker = line.indexOf(OVERFLOW_MARKER);
+  if (marker >= 0) {
+    // A provider/model prefix and the detail after a typed overflow are context. Only a named
+    // Error/Warning before or after that wording can be an independent same-line cause.
+    const before = line.slice(0, marker), after = line.slice(marker + 1);
+    return /\b(?:Error|Warning)\b/i.test(before) && residualText(before).length > 0 ||
+      /\b(?:Error|Warning)\b/i.test(after) && residualText(after).length > 0;
+  }
+  return residualText(line).length > 0;
+}));
 const classifyManagerActivationFailure = (input: Parameters<typeof classifyActivationFailure>[0], typedOverflow = false): ReturnType<typeof classifyActivationFailure> => {
   let contextWording = false;
-  const strip = (text: string): string => text.replace(OVERFLOW_WORDING, () => { contextWording = true; return ""; });
+  const strip = (text: string): string => text.replace(OVERFLOW_WORDING, () => { contextWording = true; return OVERFLOW_MARKER; });
   // Strip each field independently but keep the input structure (terminal line, full error,
   // worker warnings, preparation flags), so a permanent cause keeps its provenance suffix.
-  const contradiction = classifyActivationFailure({ ...input, lastError: strip(input.lastError),
-    error: input.error === undefined ? undefined : strip(input.error), evidence: input.evidence?.map(strip) });
-  if (!contradiction.transient && CONTRADICTORY_OVERFLOW_CODES.has(contradiction.code)) return contradiction;
+  const stripped = { ...input, lastError: strip(input.lastError),
+    error: input.error === undefined ? undefined : strip(input.error), evidence: input.evidence?.map(strip) };
+  const contradiction = classifyActivationFailure(stripped);
   if (saturatedWarningEvidence(input.evidence)) return { code: "incomplete-evidence", transient: false,
     classification: "fail-closed: saturated worker warnings may have evicted permanent evidence; explicit session reset required" };
+  if (!contradiction.transient && CONTRADICTORY_OVERFLOW_CODES.has(contradiction.code) &&
+      (contradiction.code !== "unknown" || hasUnknownResidual([stripped.lastError, stripped.error ?? "", ...(stripped.evidence ?? [])]))) return contradiction;
   const failure = classifyActivationFailure(input);
   return typedOverflow && contextWording && failure.code === "invalid-request"
     ? { code: "context-overflow", transient: false, classification: "permanent: context window exceeded (typed run with context-only wording)" }

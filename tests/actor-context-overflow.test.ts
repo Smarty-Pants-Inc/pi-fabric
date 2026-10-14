@@ -664,7 +664,7 @@ describe("actor context overflow (smarty-dev#3238, offline Pi child)", () => {
     ["STREAM_DISCONNECT_ONCE", "Authentication failed", "incomplete-evidence", 20],
     ["OVERFLOW_ALWAYS", "Authentication failed", "incomplete-evidence", 20],
     ["STREAM_DISCONNECT_ONCE", "benign diagnostic", "provider-transient", 19],
-    ["OVERFLOW_ALWAYS", "benign diagnostic", "context-overflow", 19],
+    ["OVERFLOW_ALWAYS", "benign diagnostic", "unknown", 19],
   ] as const)("classifies same-run %s with warning %s as %s at count %s", async (marker, warning, code, count) => {
     const s = setup();
     const actor = await s.create("stream-security");
@@ -693,9 +693,13 @@ describe("actor context overflow (smarty-dev#3238, offline Pi child)", () => {
         const realNow = Date.now.bind(Date);
         const skew = blocked.retryAt! + 1 - realNow();
         vi.spyOn(Date, "now").mockImplementation(() => realNow() + skew);
-      } else {
+      } else if ((code as string) === "context-overflow") {
         await waitFor(() => s.actors.status(actor.id).activationBlocked === undefined);
         expect(resets(s.actors, actor.id)).toHaveLength(2);
+      } else {
+        expect(s.actors.status(actor.id).activationBlocked).toMatchObject({ code: "unknown", class: "hard" });
+        expect(resets(s.actors, actor.id)).toHaveLength(0);
+        await s.actors.resetSession(actor.id);
       }
       await expect(s.actors.ask(actor.id, "NEXT_REVIEW")).resolves.toMatchObject({ text: "verdict: ok" });
       await waitFor(() => s.actors.inFlightCount() === 0);
@@ -717,6 +721,8 @@ describe("actor context overflow (smarty-dev#3238, offline Pi child)", () => {
     ["STREAM_DISCONNECT_ONCE", "error", "Error: 403 Forbidden", "permission", / in another failure line\)$/],
     ["STREAM_DISCONNECT_ONCE", "warning", "Error: 401 Unauthorized", "auth", / in a worker warning\)$/],
     ["OVERFLOW_ALWAYS", "warning", "Error: 403 Forbidden", "permission", / in a worker warning\)$/],
+    ["OVERFLOW_ALWAYS", "error", "Error: unclassified activation failure", "unknown", /^fail-closed: no transient cause recognised/],
+    ["OVERFLOW_ALWAYS", "warning", "Warning: unclassified activation warning", "unknown", /^fail-closed: no transient cause recognised/],
   ] as const)("attributes same-run %s %s evidence %s as %s with provenance across reload", async (marker, where, text, code, provenance) => {
     const s = setup();
     const actor = await s.create("provenance");
@@ -739,22 +745,28 @@ describe("actor context overflow (smarty-dev#3238, offline Pi child)", () => {
     const blocked = s.actors.status(actor.id).activationBlocked!;
     expect(blocked).toMatchObject({ code, class: "hard" });
     expect(blocked).not.toHaveProperty("retryAt");
+    expect(blocked).not.toMatchObject({ overflowEvidence: { complete: true } });
     expect(blocked.classification).toMatch(provenance);
     expect(resets(s.actors, actor.id)).toEqual([]);
     expect(s.overflowEvents()).toEqual([]);
     await s.actors.close();
     const restarted = s.makeActors();
     managers.push(restarted);
-    await waitFor(() => restarted.status(actor.id).activationBlocked?.code === code);
-    expect(restarted.status(actor.id).activationBlocked).toMatchObject({ code, class: "hard", classification: blocked.classification });
+    await waitFor(() => restarted.status(actor.id).activationBlocked?.class === "hard");
+    // A current unknown block may be re-derived from its terminal overflow wording on load;
+    // either representation remains hard and lacks the complete overflow proof needed to reset.
+    expect(restarted.status(actor.id).activationBlocked).toMatchObject({ class: "hard" });
     expect(restarted.status(actor.id).activationBlocked).not.toHaveProperty("retryAt");
+    expect(resets(restarted, actor.id)).toEqual([]);
     expect(s.prompts()).toHaveLength(2);
   }, TEST_GUARD_MS);
 
   // Trust-boundary/data-safety check: old blocks omitted warnings. Use the actual process
   // worker's retained status, then model old metadata and missing/corrupt/mismatched evidence.
-  it.each((["stream", "overflow"] as const).flatMap(cause =>
-    (["pure", "nineteen", "saturated", "marked-saturated", "auth", "security", "missing", "unreadable", "mismatched"] as const).map(evidence => ({ cause, evidence }))))
+  it.each((["stream", "overflow"] as const).flatMap(cause => {
+    const evidence = ["pure", "nineteen", "saturated", "marked-saturated", "auth", "security", "missing", "unreadable", "mismatched"] as const;
+    return [...evidence, ...(cause === "overflow" ? ["unknown"] as const : [])].map(evidence => ({ cause, evidence }));
+  }))
   ("restores legacy $cause with $evidence complete-run evidence, never replaying the settled item", async ({ cause, evidence }) => {
     const s = setup();
     const actor = await s.create("legacy");
@@ -782,6 +794,7 @@ describe("actor context overflow (smarty-dev#3238, offline Pi child)", () => {
     }
     if (evidence === "auth") status.warnings = ["Authentication failed"];
     if (evidence === "security") status.warnings = ["Refused by security policy"];
+    if (evidence === "unknown") status.warnings = ["Warning: unclassified activation warning"];
     if (evidence === "mismatched") status.id = "not-the-blocked-run";
     if (evidence === "missing") fs.renameSync(statusFile, `${statusFile}.missing`);
     else fs.writeFileSync(statusFile, evidence === "unreadable" ? "{" : JSON.stringify(status));
@@ -798,7 +811,7 @@ describe("actor context overflow (smarty-dev#3238, offline Pi child)", () => {
     managers.push(restarted);
     const presence = () => s.mesh.get(`actors/overflow-test/${actor.id}`)?.value as
       { activationBlocked?: { code: string }; activationBlockExpired?: { code: string } } | undefined;
-    const recoverable = evidence === "pure" || evidence === "nineteen";
+    const recoverable = evidence === "pure" || (evidence === "nineteen" && cause === "stream");
     if (recoverable && cause === "stream") {
       await waitFor(() => presence()?.activationBlockExpired?.code === "provider-transient");
       expect(presence()?.activationBlocked).toBeUndefined();
@@ -809,10 +822,14 @@ describe("actor context overflow (smarty-dev#3238, offline Pi child)", () => {
       expect(header(actor.sessionFile!)).not.toBe(carried);
       expect(resets(restarted, actor.id).at(-1)).toMatchObject({ overflow: true, retry: false });
     } else {
-      const code = evidence === "auth" ? "auth" : evidence === "security" ? "security-policy" : evidence === "saturated" ? "incomplete-evidence" : "context-overflow";
+      const code = evidence === "auth" ? "auth" : evidence === "security" ? "security-policy"
+        : evidence === "unknown" || (evidence === "nineteen" && cause === "overflow") ? "unknown"
+        : evidence === "saturated" ? "incomplete-evidence" : "context-overflow";
       await waitFor(() => presence()?.activationBlocked?.code === code);
       expect(restarted.status(actor.id).activationBlocked).toMatchObject({ code, class: "hard" });
       expect(restarted.status(actor.id).activationBlocked).not.toHaveProperty("retryAt");
+      if (code === "unknown") expect(restarted.status(actor.id).activationBlocked)
+        .toMatchObject({ overflowEvidence: { version: 1, complete: false } });
       expect(header(actor.sessionFile!)).toBe(carried);
       expect(resets(restarted, actor.id)).toHaveLength(resetCount);
       if (code === "context-overflow" || code === "incomplete-evidence") {

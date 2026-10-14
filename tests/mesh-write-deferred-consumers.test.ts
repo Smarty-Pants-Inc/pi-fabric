@@ -246,6 +246,54 @@ it.each(controlCases.flatMap(stage => controlErrors.map(([name, makeError]) => (
     plane.pause();
   });
 
+function ackPlane() {
+  const mesh = new RecordedStore(root, 65_536, 100);
+  const plane = new FabricControlPlane(mesh, identity, { enabled: true, hostId: identity.id,
+    pollMs: 20, acknowledgementTimeoutMs: 1_000, ownerIncarnation: "recorded:epoch" });
+  cleanups.push(() => plane.close());
+  const state = io.stores.get(root)!;
+  const send = (commandId: string) => state.events.push({ id: commandId, sequence: state.events.length + 1,
+    topic: "fabric.control.command", kind: "steer", createdAt: Date.now(), verification: "mesh",
+    from: { id: "sender", name: "sender", kind: "main" }, to: identity.id,
+    data: { version: 1, commandId, targetId: "actor:recorded", operation: "ask", replyTo: "sender",
+      ownerIncarnation: plane.incarnation, requestedAt: Date.now(), deadlineAt: Date.now() + 10_000 } } as MeshEvent);
+  const acks = () => state.events.filter(event => event.topic === "fabric.control.ack").map(event => event.data);
+  return { mesh, plane, send, acks };
+}
+
+// A generic ACK failure is indeterminate: here the recorded event commits and then the call
+// throws, so even the readback would pass. Known no-write refusals are recoverable.
+// Does not address per-command ACK reconciliation (#12634).
+it.each(["indeterminate", "known no-write"] as const)("ack %s failure versus an unrelated later command's confirmed ACK at release", async kind => {
+  const { mesh, plane, send, acks } = ackPlane();
+  send("first");
+  const handler = vi.fn((command: { commandId: string }) => ({ accepted: true, messageId: `done-${command.commandId}` }));
+  if (kind === "known no-write") io.failure = { stage: "ack", error: new MeshLockTimeoutError("", 1, 0) };
+  else {
+    const publish = vi.mocked(mesh.publish).getMockImplementation()!;
+    vi.mocked(mesh.publish).mockImplementationOnce(async input => {
+      await publish(input); throw new Error("generic ACK failure after commit, outcome unknown");
+    });
+  }
+  plane.start(handler); await vi.advanceTimersByTimeAsync(0);
+  expect(acks()).toHaveLength(kind === "indeterminate" ? 1 : 0);
+  send("second"); plane.pause(true); plane.resume(); await vi.advanceTimersByTimeAsync(100);
+  plane.pause(true);
+  expect(handler.mock.calls.map(([command]) => command.commandId)).toEqual(["first", "second"]);
+  const seen = [...io.stores.entries()].find(([store]) => store.includes("control-seen"))![1];
+  expect([...seen.entries.values()].map(entry => (entry.value as { acceptance?: unknown }).acceptance)).toEqual(
+    expect.arrayContaining([{ accepted: true, messageId: "done-first" }, { accepted: true, messageId: "done-second" }]));
+  expect(acks()).toEqual([expect.objectContaining({ commandId: "first", accepted: true, messageId: "done-first" }),
+    expect.objectContaining({ commandId: "second", accepted: true, messageId: "done-second" })]);
+  if (kind === "indeterminate") {
+    await expect(plane.checkpointForRelease()).rejects.toThrow(/unsettled publication/);
+    expect(() => plane.releaseCheckpointReceipt()).toThrow(/unavailable or unsettled/);
+  } else {
+    await plane.checkpointForRelease();
+    expect(plane.releaseCheckpointReceipt()).toMatchObject({ admissionHeld: true });
+  }
+});
+
 it("control preserves the historical plain code-shaped timeout receipt", async () => {
   const mesh = new RecordedStore(root, 65_536, 100);
   const plane = new FabricControlPlane(mesh, identity, { enabled: true, hostId: identity.id,

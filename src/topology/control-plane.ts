@@ -1926,9 +1926,9 @@ export class FabricControlPlane {
         this.#releasePublicationFailed = true;
         throw error;
       });
-    // A confirmed ACK repairs the release publication obligation. An ACK this host addressed to
-    // itself is consumed by its own drain, not its own watcher.
-    this.#releasePublicationFailed = false;
+    // Never clear #releasePublicationFailed here: one success cannot reconcile earlier unknown
+    // obligations. A retained known no-write outcome settles via #ownedCommands instead.
+    // An ACK this host addressed to itself is consumed by its own drain, not its own watcher.
     if (command.replyTo === this.options.hostId) this.#wake();
   }
 }

@@ -66,7 +66,8 @@ const MAX_BATCH_TEXT_BYTES = 32 * 1024;
 const MAX_EVENT_TEXT_BYTES = 8 * 1024;
 /**
  * Every idle wake is a model turn (smarty-dev#1579), so an idle root wakes at most this often,
- * unless the batch holds an urgent event. PI_FABRIC_INBOX_WAKE_COOLDOWN_MS overrides it.
+ * unless the batch holds an urgent event. PI_FABRIC_INBOX_WAKE_COOLDOWN_MS overrides it, capped at
+ * MAX_WAKE_COOLDOWN_MS so a typo cannot silence idle wakes for days.
  */
 const WAKE_COOLDOWN_MS = 5 * 60_000;
 const URGENT_KINDS = new Set(["p0", "steer"]);
@@ -75,9 +76,17 @@ export const ROOT_INBOX_WAKE_TOPIC = "fabric.inbox.wake";
 /** Observational, once per pending range, only when a turn proves the root is active. */
 export const ROOT_INBOX_ALARM_TOPIC = "fleet.alarm.root-inbox";
 const PENDING_ALARM_MS = 15 * 60_000;
+const MAX_WAKE_COOLDOWN_MS = 60 * 60_000;
+let warnedWakeCooldownCap = false;
 const wakeCooldownMs = (): number => {
   const value = Number(process.env.PI_FABRIC_INBOX_WAKE_COOLDOWN_MS);
-  return process.env.PI_FABRIC_INBOX_WAKE_COOLDOWN_MS?.trim() && Number.isFinite(value) && value >= 0 ? value : WAKE_COOLDOWN_MS;
+  if (!process.env.PI_FABRIC_INBOX_WAKE_COOLDOWN_MS?.trim() || !Number.isFinite(value) || value < 0) return WAKE_COOLDOWN_MS;
+  if (value <= MAX_WAKE_COOLDOWN_MS) return value;
+  if (!warnedWakeCooldownCap) {
+    warnedWakeCooldownCap = true;
+    console.warn(`[pi-fabric] PI_FABRIC_INBOX_WAKE_COOLDOWN_MS=${value} exceeds ${MAX_WAKE_COOLDOWN_MS}; using ${MAX_WAKE_COOLDOWN_MS}`);
+  }
+  return MAX_WAKE_COOLDOWN_MS;
 };
 
 interface RootInboxState {

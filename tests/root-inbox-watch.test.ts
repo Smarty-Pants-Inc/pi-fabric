@@ -90,6 +90,62 @@ describe("RootInboxWatch (#4313 contract)", () => {
     watch.close();
   });
 
+  // Node clamps a setTimeout delay above 2^31-1 ms to 1 ms: a far deadline (a huge cooldown) must
+  // arm bounded chunks that re-arm silently, never an immediate read loop.
+  const MAX_TIMER_DELAY = 2 ** 31 - 1;
+
+  it("chunks a far deadline under the 2^31-1 ms timer limit and reads only at the deadline", async () => {
+    const timer = vi.spyOn(globalThis, "setTimeout");
+    const due = Date.now() + 1e12;
+    const wake = vi.fn<() => Promise<number | undefined>>().mockResolvedValueOnce(due).mockResolvedValue(undefined);
+    const watch = new RootInboxWatch(healthyRoot, wake);
+    watch.start();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(wake).toHaveBeenCalledTimes(1);
+    const delays = () => timer.mock.calls.map((call) => Number(call[1] ?? 0));
+    expect(delays().length).toBeGreaterThan(0);
+    expect(Math.max(...delays())).toBeLessThanOrEqual(MAX_TIMER_DELAY);
+    // One full chunk plus part of the remainder: chunk re-arms are not reads.
+    await vi.advanceTimersByTimeAsync(MAX_TIMER_DELAY + 1_000);
+    expect(wake).toHaveBeenCalledTimes(1);
+    expect(vi.getTimerCount()).toBe(1);
+    await vi.advanceTimersByTimeAsync(due - Date.now() - 1);
+    expect(wake).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(wake).toHaveBeenCalledTimes(2);   // exactly the deadline read; it reports nothing more
+    expect(vi.getTimerCount()).toBe(0);
+    expect(Math.max(...delays())).toBeLessThanOrEqual(MAX_TIMER_DELAY);
+    watch.close();
+  });
+
+  it("under a far deadline, an earlier request and deadline still read, and close cancels a re-armed chunk", async () => {
+    const wake = vi.fn<() => Promise<number | undefined>>()
+      .mockImplementationOnce(async () => Date.now() + 1e12)
+      .mockImplementationOnce(async () => Date.now() + 60_000)
+      .mockResolvedValueOnce(undefined)
+      .mockImplementationOnce(async () => Date.now() + 1e12)
+      .mockResolvedValue(undefined);
+    const watch = new RootInboxWatch(healthyRoot, wake);
+    watch.start();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(wake).toHaveBeenCalledTimes(1);
+    watch.request();   // a notification still reads at once
+    await vi.advanceTimersByTimeAsync(0);
+    expect(wake).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(59_999);
+    expect(wake).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(wake).toHaveBeenCalledTimes(3);   // the earlier deadline wins over the far one
+    watch.request();   // reports a far deadline again
+    await vi.advanceTimersByTimeAsync(MAX_TIMER_DELAY + 1_000);
+    expect(wake).toHaveBeenCalledTimes(4);   // past one chunk: re-armed, not read
+    expect(vi.getTimerCount()).toBe(1);
+    watch.close();
+    expect(vi.getTimerCount()).toBe(0);
+    await vi.advanceTimersByTimeAsync(1e12);
+    expect(wake).toHaveBeenCalledTimes(4);
+  });
+
   it("reports a watch failure once and still serves requests and deadlines", async () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const missing = path.join(os.tmpdir(), "pi-fabric-root-inbox-watch-missing-never-created");

@@ -1,5 +1,8 @@
 import fs from "node:fs";
 
+/** setTimeout fires at once for delays above 2^31-1 ms; longer deadlines are reached in chunks. */
+const MAX_TIMER_MS = 2 ** 31 - 1;
+
 /**
  * Event-driven idle wake for a local Main's root inbox (smarty-dev#4313; replaces the 15 s
  * interval). A non-persistent directory watch on the mesh root (atomic renames replace the file
@@ -96,12 +99,19 @@ export class RootInboxWatch {
   /** Keep only the earliest deadline; one that passed during the read fires at the next tick. */
   #schedule(dueAt: number | undefined): void {
     if (this.#closed || dueAt === undefined || !Number.isFinite(dueAt)) return;
-    const delay = Math.max(1, dueAt - this.now());
     if (this.#timer && this.#timerAt <= dueAt) return;
     if (this.#timer) clearTimeout(this.#timer);
     this.#timerAt = dueAt;
+    this.#arm();
+  }
+
+  /** One chunk toward #timerAt; an early chunk re-arms the remainder without reading the inbox. */
+  #arm(): void {
+    const delay = Math.min(MAX_TIMER_MS, Math.max(1, this.#timerAt - this.now()));
     this.#timer = setTimeout(() => {
       this.#timer = undefined;
+      if (this.#closed) return;
+      if (this.now() < this.#timerAt) return this.#arm();
       this.#timerAt = Number.POSITIVE_INFINITY;
       this.request();
     }, delay);

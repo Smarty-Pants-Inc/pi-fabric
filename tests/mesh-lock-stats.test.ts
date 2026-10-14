@@ -335,6 +335,46 @@ describe("mesh lock stats recorder", () => {
     expect(fs.readdirSync(directory).filter(name => !name.startsWith(lockStatsHost()))).toEqual(["racer-5.json"]);
   });
 
+  it("keeps a refreshed graveyard when relinking fails, but drops it on EEXIST (smarty-dev#8954)", () => {
+    const stats = createLockStats("1")!;
+    for (const code of ["EPERM", "EEXIST"]) {
+      const root = path.join(temp(), "mesh");
+      const directory = path.join(root, "lock-stats");
+      fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+      const file = path.join(directory, "racer-5.json");
+      const grave = `${file}.prune-${process.pid}`;
+      const old = (Date.now() - 25 * 60 * 60_000) / 1000;
+      fs.writeFileSync(file, "{}");
+      fs.utimesSync(file, old, old);
+      const renameSync = fs.renameSync, linkSync = fs.linkSync;
+      vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+        if (String(from) === file) {
+          // A writer replaces the aged inode just before the pruner moves it aside.
+          fs.writeFileSync(`${file}.next`, "{\"fresh\":1}");
+          renameSync(`${file}.next`, file);
+        }
+        renameSync(from, to);
+      });
+      const link = vi.spyOn(fs, "linkSync").mockImplementationOnce((from, to) => {
+        if (code === "EPERM") throw Object.assign(new Error("relink denied"), { code });
+        fs.writeFileSync(file, "{\"fresh\":2}");
+        linkSync(from, to); // The newer file makes the real no-replace link fail with EEXIST.
+      });
+      stats.acquired(root, "custody", 1, 1);
+      registry[lockKey]!.flush();
+      expect(link).toHaveBeenCalledExactlyOnceWith(grave, file);
+      if (code === "EPERM") {
+        expect(fs.existsSync(grave)).toBe(true);
+        expect(fs.readFileSync(grave, "utf8")).toBe("{\"fresh\":1}");
+        expect(fs.existsSync(file)).toBe(false);
+      } else {
+        expect(fs.existsSync(grave)).toBe(false);
+        expect(fs.readFileSync(file, "utf8")).toBe("{\"fresh\":2}");
+      }
+      vi.restoreAllMocks();
+    }
+  });
+
   it("prunes a quiet root opportunistically on explicit flush and drops a removed root", () => {
     vi.useFakeTimers();
     vi.setSystemTime(T0);

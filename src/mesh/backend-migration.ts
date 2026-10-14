@@ -85,6 +85,7 @@ import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { renameAtomic } from "../core/atomic-write.js";
+import { verifiedRemove } from "../storage/verified-remove.js";
 import { storageRevision } from "../verified/storage.js";
 import { assertFileStateWritable, encodeMeshStateMovedMarker, encodeMeshStateNatsMarker, MeshBackendFenceError, meshFenceAlarm, meshStateSourceOf,
   readMeshStateMovedMarker, readMeshStateNatsMarker, readStateFileEpoch as readEpochHeader, type MeshBackendAlarm, type MeshStateMovedMarker,
@@ -619,9 +620,20 @@ const readFile = (root: string, options: MeshBackendOptions): FencedFile =>
  */
 const dropBlankStateFile = (root: string): void => {
   const file = path.join(root, STATE_JSON);
-  const stat = fs.statSync(file, { throwIfNoEntry: false });
-  if (!stat?.isFile() || stat.size > 4096 || fs.readFileSync(file, "utf8").trim() !== "") return;
-  fs.rmSync(file, { force: true });
+  // smarty-dev#8907: judged by this lstat; the content is read through a descriptor proven to be that inode, and only
+  // that inode is removed. A successor swapped in since is kept and the import refused. pi-fabric#1036 round 3 P2: no
+  // path fallback here (smarty-dev#7858): where the verified path is unavailable (darwin, Windows without the helper)
+  // nothing is deleted, the file is kept and the import refused, so a successor swapped in after the blank judgment
+  // is never removed by name. The Windows helper, where switched on, still verifies the judged inode.
+  const stat = fs.lstatSync(file, { throwIfNoEntry: false });
+  if (!stat?.isFile() || stat.size > 4096) return;
+  const descriptor = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+  try {
+    const opened = fs.fstatSync(descriptor);
+    if (opened.dev !== stat.dev || opened.ino !== stat.ino || fs.readFileSync(descriptor, "utf8").trim() !== "") return;
+  } finally { fs.closeSync(descriptor); }
+  const result = verifiedRemove(file, stat, { deleter: "meshBlankStateFile" });
+  if (!result.removed) throw new MeshBackendRefusedError(`Fabric mesh blank state.json was not dropped (${result.reason}); import refused`);
 };
 
 const fileEpochOf = (state: FencedFile): number => (state.backendEpoch === undefined ? 0 : storageRevision(state.backendEpoch));
@@ -666,9 +678,21 @@ const fsyncDirectory = (directory: string): void => {
   try { fs.fsyncSync(descriptor); } finally { fs.closeSync(descriptor); }
 };
 
+/** smarty-dev#8907: a migration or rollback temp judged by its name, then this lstat; only that inode is removed.
+ * A refusal throws, as a failed rmSync did: a successor swapped in since stays in place and is never renamed or
+ * overwritten (the export opens its temp "wx"). Off Linux: main's rmSync (#7858 fallback). */
+const removeTemp = (root: string, name: string): void => {
+  const file = path.join(root, name);
+  const stat = fs.lstatSync(file, { throwIfNoEntry: false });
+  if (!stat) return;
+  if (!stat.isFile()) throw new MeshBackendRefusedError(`Fabric mesh temp ${file} is not a regular file; left in place`);
+  const result = verifiedRemove(file, stat, { deleter: "meshMigrationTemp", fallback: () => { fs.rmSync(file, { force: true }); return true; } });
+  if (!result.removed) throw new MeshBackendRefusedError(`Fabric mesh temp ${file} was not removed (${result.reason}); left in place`);
+};
+
 const removeStaleTemps = (root: string): void => {
   for (const name of fs.readdirSync(root)) {
-    if (name.startsWith(TEMP_PREFIX) && name.endsWith(".tmp")) fs.rmSync(path.join(root, name), { force: true });
+    if (name.startsWith(TEMP_PREFIX) && name.endsWith(".tmp")) removeTemp(root, name);
   }
 };
 
@@ -990,6 +1014,8 @@ const writeMovedMarker = (root: string, epoch: number): void => {
     fs.writeSync(descriptor, encodeMeshStateMovedMarker(epoch));
     fs.fsyncSync(descriptor);
   } finally { fs.closeSync(descriptor); }
+  // ponytail: replacement, not cleanup: under the fence (custody.lock, .lock) the marker replaces state.json by design
+  // (retireStateFile keeps a copy first; a cutover conflict is copied aside); legacy writers serialize on .lock.
   renameAtomic(temporary, path.join(root, STATE_JSON));
   fsyncDirectory(root);
 };
@@ -1016,7 +1042,7 @@ const ROLLBACK_TEMP = /^state\.json\.rollback-\d+\.tmp$/;
 
 const removeRollbackTemps = (root: string, keep?: string): void => {
   for (const name of fs.readdirSync(root)) {
-    if (ROLLBACK_TEMP.test(name) && name !== keep) fs.rmSync(path.join(root, name), { force: true });
+    if (ROLLBACK_TEMP.test(name) && name !== keep) removeTemp(root, name);
   }
 };
 
@@ -1138,6 +1164,8 @@ const rollbackSwitch = (root: string, options: MeshBackendOptions, fence: FenceD
 
 /** Step 5, the very last: the verified temp replaces the marker (atomic rename, directory fsync). */
 const rollbackReplace = (root: string, options: MeshBackendOptions, temporary: string): void => {
+  // ponytail: replacement, not cleanup: under the fence the verified export replaces the marker, which no writer
+  // can commit over (legacy strict reads fail on it; sqlite writers are fenced by the flag).
   renameAtomic(temporary, path.join(root, STATE_JSON));
   fsyncDirectory(root);
   options.onStep?.("rollback-replace");

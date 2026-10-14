@@ -6,6 +6,7 @@ import { writeJsonAtomic } from "../core/atomic-write.js";
 import { isWatchLimitError } from "../core/watch-fallback.js";
 import { retentionV2Enabled } from "../storage/retention-platform.js";
 import { processAlive } from "../storage/scratch.js";
+import { legacyTaskControlSibling, taskControlDirectory } from "../worker/terminal-answer.js";
 
 export interface LegacyRunArchivePolicy {
   legacyRunArchiveEnabled?: boolean;
@@ -17,6 +18,16 @@ const files = new Set([
   "task.txt", "task.txt.provenance.json", "status.json", "events.jsonl", "lifecycle.jsonl", "reply.json",
   "schema.json", "images.json", "steer.jsonl", "relaunches.jsonl", "session.jsonl", "route-session.jsonl",
 ]);
+/** Any control namespace (old sibling-v1, even a dangling link, or the CENTRAL
+ * directory outside the run tree) is protected custody: renaming only the run
+ * would strand it, so such runs stay on ordinary retention. */
+const hasTaskControls = async (directory: string): Promise<boolean> => {
+  for (const control of [legacyTaskControlSibling(directory), taskControlDirectory(directory)]) {
+    try { await fsp.lstat(control); return true; }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+  }
+  return false;
+};
 const gone = (error: unknown): boolean => ["ENOENT", "ESRCH"].includes((error as NodeJS.ErrnoException).code ?? "");
 const owned = async (file: string): Promise<fs.Stats> => {
   const stat = await fsp.lstat(file);
@@ -73,8 +84,7 @@ const inspectLegacyRunTree = async (directory: string, now: number, ageMs: numbe
     if (depth > 32 || ++count > 4096) throw new Error("tree limit");
     // This old-layout path renames only the run. Any sibling (even a dangling
     // link) is protected-layout custody and cannot be stranded by that rename.
-    try { await fsp.lstat(dir + ".ctl"); throw new Error("paired task controls require ordinary retention"); }
-    catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+    if (await hasTaskControls(dir)) throw new Error("paired task controls require ordinary retention");
     const dirStat = await owned(dir);
     if (!dirStat.isDirectory() || (dirStat.mode & 0o077) !== 0) throw new Error("unsafe run directory");
     identities.push([path.relative(directory, dir), dirStat.dev, dirStat.ino, dirStat.mode]);
@@ -126,8 +136,7 @@ const inspectLegacyRunTree = async (directory: string, now: number, ageMs: numbe
     if (!Number.isSafeInteger(ageMs) || ageMs < 0) return {};
     if (!await unaliasedDirectory(directory)) return {};
     await walk(directory, 0);
-    try { await fsp.lstat(directory + ".ctl"); return {}; }
-    catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+    if (await hasTaskControls(directory)) return {};
     if (!await unaliasedDirectory(directory)) return {};
     const due = ageDue();
     if (due !== undefined) return { retryAt: due };
@@ -494,8 +503,7 @@ export class ResidentLegacyRunArchive {
         if (!await unaliasedDirectory(runs) || !await unaliasedDirectory(batch)) throw new Error("run namespace changed");
         // Recheck absence after the async reference/namespace fences too. No
         // pair-rename protocol: migrated sources stay with their sibling.
-        try { await fsp.lstat(source + ".ctl"); continue; }
-        catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+        if (await hasTaskControls(source)) continue;
         // No copy fallback on EXDEV, no compression and no source unlink.
         await fsp.rename(source, path.join(batch, run.id));
         // A directory watch follows the inode: stop observing retired bytes.

@@ -10,7 +10,7 @@ import { FileLockBusy, lockFile } from "../residency/file-lock.js";
 import { recoverActorRunArchives } from "../actors/child-completions.js";
 import { recoverEnodevTaskRun } from "../agents/enodev-recovery.js";
 import { copyFabricProvenance } from "../fabric-provenance.js";
-import { readFinalAnswerReceipt, openTaskControlFile, MAX_TASK_CONTROL_BYTES, taskControlDirectory, taskControlReadDirectory, withTaskControlDirectory, withTaskControlReadDirectory, withLegacyTaskControlDirectory } from "../worker/terminal-answer.js";
+import { readFinalAnswerReceipt, openTaskControlFile, MAX_TASK_CONTROL_BYTES, isTaskControlDirectoryEntry, legacyTaskControlSibling, taskControlDirectory, taskControlReadDirectory, withTaskControlDirectory, withTaskControlReadDirectory, withLegacyTaskControlDirectory } from "../worker/terminal-answer.js";
 import { MAX_STEER_CONTROLS, MAX_STEER_BYTES, MAX_STEER_ENTRY_BYTES, terminalAdmissionFromEntry, terminalControlMatchesAdmission, terminalSenderMatches, type TerminalAdmission } from "../agents/terminal-notices.js";
 
 export const FABRIC_RUN_ROOT_PREFIX = "pi-fabric-runs-";
@@ -551,8 +551,57 @@ export const isPairedTaskControlEntry = (parent: string, name: string, expired: 
   if (!runName || runName.endsWith(".ctl")) return false; // Controls cannot themselves admit a second control sibling.
   const run = path.join(parent, runName);
   if (!ownedStat(run)?.isDirectory() || !ownedStat(path.join(parent, name))?.isDirectory()) return false;
-  try { return withTaskControlDirectory(run, () => !expired()); }
+  // sibling-v1 only: taskControlDirectory(run) is now the CENTRAL namespace, so
+  // validate this exact old sibling through the shared compatibility filter.
+  try { return isTaskControlDirectoryEntry(parent, name) && !expired(); }
   catch { return false; }
+};
+/** Old read-only sibling-v1 location of a run's controls. */
+const legacyControlSibling = legacyTaskControlSibling;
+type ControlRemoval = { path: string; stat: fs.Stats };
+/** Every control namespace a run removal must collect with its run: the run's
+ * CENTRAL directory (outside the tree), its validated old sibling, and the
+ * central directories of nested runs (their old siblings sit inside the tree
+ * and go with it). Undefined refuses the whole removal: never strand or drop
+ * an unvalidated control namespace. */
+const runControlRemovals = (directory: string): ControlRemoval[] | undefined => {
+  const removals: ControlRemoval[] = [];
+  let visited = 0;
+  const add = (run: string, nested: boolean): boolean => {
+    if (++visited > 4096) throw new Error("Task control removal plan bound exceeded");
+    const central = taskControlDirectory(run);
+    const stat = fs.lstatSync(central, { throwIfNoEntry: false });
+    if (stat) {
+      if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("Refusing linked or non-directory task control path");
+      withTaskControlDirectory(run, () => undefined);
+      removals.push({ path: central, stat });
+    }
+    if (!nested) {
+      const sibling = legacyControlSibling(run), old = fs.lstatSync(sibling, { throwIfNoEntry: false });
+      if (old && sibling !== central) {
+        if (!isTaskControlDirectoryEntry(path.dirname(sibling), path.basename(sibling))) throw new Error("Unvalidated legacy task control sibling");
+        removals.push({ path: sibling, stat: old });
+      }
+    }
+    return true;
+  };
+  const visit = (run: string, depth: number, nested: boolean): void => {
+    if (depth > 32) throw new Error("Task control removal nested depth bound exceeded");
+    add(run, nested);
+    const children = path.join(run, "nested");
+    const stat = fs.lstatSync(children, { throwIfNoEntry: false });
+    if (!stat) return;
+    if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("Unsafe nested run directory");
+    for (const entry of fs.readdirSync(children, { withFileTypes: true })) {
+      // Nested old siblings live inside the tree and go with it.
+      if (entry.isDirectory() && !entry.name.endsWith(".ctl")) visit(path.join(children, entry.name), depth + 1, true);
+    }
+  };
+  try { visit(path.resolve(directory), 0, false); return removals; }
+  catch (error) {
+    console.warn(`[pi-fabric] FABRIC_TASK_CONTROL_UNSAFE cleanup refused for ${directory}: ${String(error)}`);
+    return undefined;
+  }
 };
 /** Why safeRunTree refused a run, as a fixed category for the retention report (ids and paths removed). Report only:
  * it repeats the checks in safeRunTree's order and is not a deletion authority. */
@@ -1191,19 +1240,8 @@ export const removeUnreferencedRun = (
     console.warn(`[pi-fabric] FABRIC_TASK_CONTROL_UNSAFE cleanup refused for ${directory}: ${String(error)}`);
     return false;
   }
-  const control = taskControlDirectory(directory);
-  let controlStat: fs.Stats | undefined;
-  try { controlStat = fs.lstatSync(control); }
-  catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") return false; }
-  if (controlStat) {
-    try {
-      if (!controlStat.isDirectory() || controlStat.isSymbolicLink()) throw new Error("Refusing linked or non-directory task control path");
-      withTaskControlDirectory(directory, () => undefined);
-    } catch (error) {
-      console.warn(`[pi-fabric] FABRIC_TASK_CONTROL_UNSAFE cleanup refused for ${control}: ${String(error)}`);
-      return false;
-    }
-  }
+  const controls = runControlRemovals(directory);
+  if (!controls) return false;
   // The main run judgment/reference/identity fence runs FIRST. Deleting controls
   // first loses a retained protected run's admission evidence when a late veto
   // or inode change rejects its removal. Never manufacture a missing-ctl legacy
@@ -1211,13 +1249,16 @@ export const removeUnreferencedRun = (
   const removed = verifiedRemove(directory, judged, { deleter, ...(dryRun ? { dryRun: true } : {}), proceed: () => !check(),
     fallback: () => mainRemoveUnreferencedRun(directory, referenced, check) }).removed;
   if (!removed) return false;
-  if (controlStat && !verifiedRemove(control, controlStat, { deleter, ...(dryRun ? { dryRun: true } : {}),
-    proceed: () => !check(), fallback: rmTree(control) }).removed) {
-    // Partial collection: the run is already removed (and is reported as such),
-    // but control evidence stays. An unknown/orphan .ctl never gains cleanup
-    // authority on a later sweep; do not lie that the run itself was retained.
-    countRefusal(deleter, "run removed but paired task control removal incomplete", control);
-    console.warn(`[pi-fabric] FABRIC_TASK_CONTROL_UNSAFE partial cleanup: run removed, controls retained at ${control}`);
+  for (const control of controls) {
+    if (fs.lstatSync(control.path, { throwIfNoEntry: false }) === undefined && !dryRun) continue; // went with its tree
+    if (!verifiedRemove(control.path, control.stat, { deleter, ...(dryRun ? { dryRun: true } : {}),
+      proceed: () => !check(), fallback: rmTree(control.path) }).removed) {
+      // Partial collection: the run is already removed (and is reported as such),
+      // but control evidence stays. An unknown/orphan .ctl never gains cleanup
+      // authority on a later sweep; do not lie that the run itself was retained.
+      countRefusal(deleter, "run removed but paired task control removal incomplete", control.path);
+      console.warn(`[pi-fabric] FABRIC_TASK_CONTROL_UNSAFE partial cleanup: run removed, controls retained at ${control.path}`);
+    }
   }
   return true;
 };

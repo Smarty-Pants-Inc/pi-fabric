@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { ActorLogStore } from "../src/actors/log-store.js";
 import { canRemoveTerminalRun, pruneActorRunArchives, runTreeExitVeto } from "../src/storage/retention.js";
 import { verifiedRemove } from "../src/storage/verified-remove.js";
-import { initializeTaskControlDirectory, MAX_FINAL_ANSWER_BYTES, MAX_TASK_CONTROL_BYTES, readFinalAnswerReceipt, taskControlDirectory, withLegacyTaskControlDirectory } from "../src/worker/terminal-answer.js";
+import { initializeTaskControlDirectory, legacyTaskControlSibling, MAX_FINAL_ANSWER_BYTES, MAX_TASK_CONTROL_BYTES, readFinalAnswerReceipt, taskControlDirectory, withLegacyTaskControlDirectory } from "../src/worker/terminal-answer.js";
 import { queuedTerminalControls, settleTerminalControl } from "../src/worker/terminal-controls.js";
 
 // Keep reason: trust boundary / data safety. Exercise the actual archive and
@@ -35,7 +35,8 @@ const setup = (layout: "sibling-v1" | "legacy" | "migrated" = "sibling-v1", alia
     ...(layout === "sibling-v1" ? { taskControlLayout: layout } : {}), finalAnswerReceipt: { id: receipt.id, recordedAt: receipt.recordedAt } };
   json(path.join(source, "status.json"), record);
   fs.writeFileSync(path.join(source, "task.txt"), "original task", { mode: 0o600 });
-  const controls = layout === "sibling-v1" ? taskControlDirectory(source) : source;
+  // sibling-v1 fixtures are OLD read-only siblings; new controls are central.
+  const controls = layout === "sibling-v1" ? legacyTaskControlSibling(source) : source;
   fs.mkdirSync(controls, { recursive: true, mode: 0o700 });
   json(path.join(controls, "final-answer.json"), receipt);
   const sender = { id: "session:original", kind: "main", verified: "mesh" };
@@ -107,6 +108,8 @@ describe("actor archive paired task controls", () => {
     expect(fs.existsSync(path.join(taskControlDirectory(f.archive), ".legacy-read.json"))).toBe(false);
     expect(withLegacyTaskControlDirectory(f.archive, () => true)).toBeUndefined();
     if (process.platform !== "win32") expect(fs.statSync(taskControlDirectory(f.archive)).mode & 0o777).toBe(0o700);
+    // Published centrally: no raw `<archive>.ctl` sibling in the task-visible runs tree.
+    expect(fs.existsSync(legacyTaskControlSibling(f.archive))).toBe(false);
     expect(f.store.retainedRunIds(f.actor)).toEqual([f.alias]);
     expect(canRemoveTerminalRun(f.archive)).toBe(true);
     f.store.pruneRuns({ ...f.actor, lastRunId: "newest" }, 4 * day);
@@ -123,8 +126,8 @@ describe("actor archive paired task controls", () => {
     // Move the real protected pair: cpSync creates its root with 0755 here,
     // which is correctly NOT a valid protected source sibling.
     fs.renameSync(child.source, nested);
-    fs.renameSync(taskControlDirectory(child.source), taskControlDirectory(nested));
-    if (process.platform !== "win32") expect(fs.statSync(taskControlDirectory(nested)).mode & 0o777).toBe(0o700);
+    fs.renameSync(legacyTaskControlSibling(child.source), legacyTaskControlSibling(nested));
+    if (process.platform !== "win32") expect(fs.statSync(legacyTaskControlSibling(nested)).mode & 0o777).toBe(0o700);
     expect(runTreeExitVeto(f.source, 0, undefined, true)).toBeUndefined();
     expect(readFinalAnswerReceipt(nested, child.record.id)).toEqual(child.receipt);
     expect(canRemoveTerminalRun(nested)).toBe(true);
@@ -132,9 +135,12 @@ describe("actor archive paired task controls", () => {
     await f.store.retainRun(f.actor, f.alias, f.source);
     const archivedChild = path.join(f.archive, "nested", "child");
     expect(readFinalAnswerReceipt(archivedChild, child.record.id)).toEqual(child.receipt);
+    // The source's old nested sibling is not copied; the archived child is central.
+    expect(fs.existsSync(legacyTaskControlSibling(archivedChild))).toBe(false);
     expect(canRemoveTerminalRun(f.archive)).toBe(true);
     f.store.pruneRuns({ ...f.actor, lastRunId: "newest" }, 4 * day);
-    expect(removalPaths()).toEqual([f.archive, taskControlDirectory(f.archive)]);
+    // Nested central controls live outside the tree, so they join the plan.
+    expect(removalPaths()).toEqual([f.archive, taskControlDirectory(f.archive), taskControlDirectory(archivedChild)]);
   });
 
   it("preserves opaque nested bytes alongside a genuine protected run pair", async () => {
@@ -142,7 +148,7 @@ describe("actor archive paired task controls", () => {
     const nested = path.join(f.source, "nested", "child");
     fs.mkdirSync(path.dirname(nested), { mode: 0o700 });
     fs.renameSync(child.source, nested);
-    fs.renameSync(taskControlDirectory(child.source), taskControlDirectory(nested));
+    fs.renameSync(legacyTaskControlSibling(child.source), legacyTaskControlSibling(nested));
     const opaque = Buffer.from([0, 255, 10, 128, 65]);
     fs.writeFileSync(path.join(f.source, "nested", "plain.txt"), opaque, { mode: 0o600 });
     await f.store.retainRun(f.actor, f.alias, f.source);
@@ -150,7 +156,7 @@ describe("actor archive paired task controls", () => {
     expect(fs.readFileSync(path.join(f.source, "nested", "plain.txt"))).toEqual(opaque);
     const archivedChild = path.join(f.archive, "nested", "child");
     for (const relative of originalFiles) {
-      expect(fs.readFileSync(path.join(taskControlDirectory(archivedChild), relative))).toEqual(fs.readFileSync(path.join(taskControlDirectory(nested), relative)));
+      expect(fs.readFileSync(path.join(taskControlDirectory(archivedChild), relative))).toEqual(fs.readFileSync(path.join(legacyTaskControlSibling(nested), relative)));
     }
     expect(fs.readFileSync(path.join(archivedChild, "status.json"))).toEqual(fs.readFileSync(path.join(nested, "status.json")));
     expect(readFinalAnswerReceipt(archivedChild, child.record.id)).toEqual(child.receipt);
@@ -171,7 +177,7 @@ describe("actor archive paired task controls", () => {
         fs.renameSync(path.join(f.source, name), path.join(f.root, "saved-" + name));
       }
       fs.renameSync(child.source, nested);
-      fs.renameSync(taskControlDirectory(child.source), taskControlDirectory(nested));
+      fs.renameSync(legacyTaskControlSibling(child.source), legacyTaskControlSibling(nested));
     } else fs.writeFileSync(path.join(f.source, "nested", "plain.txt"), "opaque");
     const prune = vi.spyOn(f.store, "pruneRuns");
     vi.spyOn(fs, "cpSync").mockImplementation(() => { throw new Error("nested unavailable"); });
@@ -230,7 +236,9 @@ describe("actor archive paired task controls", () => {
     expect(JSON.parse(fs.readFileSync(path.join(taskControlDirectory(path.join(f.archive, "nested", "child-alias")), "terminal-controls", child.admission.id + ".json"), "utf8"))).toEqual(mixed.delivered);
     expect(canRemoveTerminalRun(f.archive)).toBe(true);
     f.store.pruneRuns({ ...f.actor, lastRunId: "newest" }, 4 * day);
-    expect(removalPaths()).toEqual([f.archive, taskControlDirectory(f.archive)]);
+    const archivedNested = path.join(f.archive, "nested", "child-alias");
+    expect(removalPaths()).toEqual([f.archive, taskControlDirectory(f.archive), taskControlDirectory(archivedNested),
+      taskControlDirectory(path.join(archivedNested, "nested", "deep-alias"))]);
   });
 
   it.each(["stopped", "failed"] as const)("archives real consumed legacy %s no-answer overlays, including nested aliases, and collects both pairs", async status => {
@@ -257,7 +265,9 @@ describe("actor archive paired task controls", () => {
     }
     expect(pruneActorRunArchives({ runsDirectory: f.sourceRuns, retentionMs: day, now: 4 * day, dryRun: true })).toEqual([f.source]);
     expect(pruneActorRunArchives({ runsDirectory: path.dirname(f.archive), retentionMs: day, now: 4 * day, dryRun: true })).toEqual([f.archive]);
-    expect(removalPaths()).toEqual([f.source, f.sibling, f.archive, taskControlDirectory(f.archive)]);
+    // f.sibling is the source's CENTRAL bootstrap; nested centrals sit outside each tree.
+    expect(removalPaths()).toEqual([f.source, f.sibling, taskControlDirectory(nested),
+      f.archive, taskControlDirectory(f.archive), taskControlDirectory(path.join(f.archive, "nested", "child-alias"))]);
     expect(vi.mocked(verifiedRemove).mock.calls.every(([, , options]) => options.dryRun === true)).toBe(true);
     expect(fs.existsSync(f.source)).toBe(true);
     expect(fs.existsSync(f.archive)).toBe(true);
@@ -319,6 +329,15 @@ describe("actor archive paired task controls", () => {
     expect(canRemoveTerminalRun(f.archive)).toBe(true);
   });
 
+  it("counts runs once: skips only validated old siblings and keeps unknown .ctl entries visible", async () => {
+    const f = setup(); await f.store.retainRun(f.actor, f.alias, f.source);
+    const runs = path.dirname(f.archive);
+    fs.mkdirSync(path.join(runs, "old-run"), { mode: 0o700 });
+    fs.mkdirSync(legacyTaskControlSibling(path.join(runs, "old-run")), { mode: 0o700 });
+    fs.mkdirSync(path.join(runs, "stray.ctl"), { mode: 0o700 });
+    expect(f.store.retainedRunIds(f.actor)).toEqual([f.alias, "old-run", "stray.ctl"]);
+  });
+
   it("preserves the late-reference fence and leaves the paired controls untouched", async () => {
     const f = setup(); await f.store.retainRun(f.actor, f.alias, f.source);
     expect(pruneActorRunArchives({ runsDirectory: path.dirname(f.archive), retentionMs: day, now: 4 * day,
@@ -360,11 +379,11 @@ describe("actor archive paired task controls", () => {
   });
 
   it("rejects a renamed/replaced archive run during control creation even without a route receipt", async () => {
-    const f = setup(), mkdir = fs.mkdirSync;
+    const f = setup(), mkdir = fs.mkdirSync, central = path.basename(taskControlDirectory(f.archive));
     let swapped = false;
     vi.spyOn(fs, "mkdirSync").mockImplementation(((...args: Parameters<typeof mkdir>) => {
       const result = mkdir(...args);
-      if (!swapped && String(args[0]).endsWith(f.alias + ".ctl")) {
+      if (!swapped && path.basename(String(args[0])) === central) {
         swapped = true;
         fs.renameSync(f.archive, f.archive + "-held");
         mkdir(f.archive, { mode: 0o700 });
@@ -383,6 +402,7 @@ describe("actor archive paired task controls", () => {
   it("does not heal or follow an unsafe destination control sibling", async () => {
     const f = setup(), target = path.join(f.root, "unrelated"); fs.mkdirSync(target, { mode: 0o700 });
     fs.mkdirSync(path.dirname(f.archive), { recursive: true, mode: 0o700 });
+    fs.mkdirSync(path.dirname(taskControlDirectory(f.archive)), { recursive: true, mode: 0o700 });
     fs.symlinkSync(target, taskControlDirectory(f.archive), "dir");
     await expect(f.store.retainRun(f.actor, f.alias, f.source)).rejects.toThrow();
     expect(fs.readdirSync(target)).toEqual([]);

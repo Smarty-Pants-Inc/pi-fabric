@@ -102,7 +102,7 @@ import type {
 import { FOLLOW_UP_RUNNING_TASK_MESSAGE, type AgentAdmissionAlarm, type AgentFollowUpAlarm, type AgentFollowUpDelivery } from "./types.js";
 import { followUpFile, followUpState, settleFollowUp, releaseFollowUpPayload } from "./follow-up-delivery.js";
 import { createRunRouteMetadata } from "../worker/run-record.js";
-import { readFinalAnswerReceipt, readTaskControlJson, taskControlDirectory, taskSteerFile, withTaskControlDirectory, initializeTaskControlDirectory, assertTaskControlWriteRoots, isTaskControlDirectoryEntry, taskControlReadDirectory, FabricTaskControlDirectoryError, type FinalAnswerReceipt } from "../worker/terminal-answer.js";
+import { readFinalAnswerReceipt, readTaskControlJson, taskControlDirectory, taskSteerFile, withTaskControlDirectory, initializeTaskControlDirectory, assertTaskControlWriteRoots, isTaskControlDirectoryEntry, legacyTaskControlSibling, taskControlReadDirectory, FabricTaskControlDirectoryError, type FinalAnswerReceipt } from "../worker/terminal-answer.js";
 import { FabricTargetTerminalError, FabricSteerAdmissionLimitError, type AgentTerminalNotice } from "./terminal-target.js";
 import { TerminalNoticeOutbox, appendTerminalAdmission, readTerminalAdmission, readTerminalAdmissions, readUndeliveredMessage, readUndeliveredMessageView, MAX_STEER_CONTROLS, MAX_STEER_BYTES, MAX_STEER_ENTRY_BYTES, terminalControlMatchesAdmission, terminalSenderMatches } from "./terminal-notices.js";
 import type { AgentRunRouteMetadata } from "./types.js";
@@ -3624,27 +3624,62 @@ export class AgentManager {
   }
 
   #runDeletionPaths(runDirectory: string): string[] {
-    const control = taskControlDirectory(runDirectory);
-    // Judge both paths first, then remove the run before its host metadata.
+    // Judge every path first, then remove the run before its host metadata.
     // A failed run removal must not leave a protected run with erased controls.
-    let stat: fs.Stats;
-    try { stat = fs.lstatSync(control); }
-    catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    // Controls: the CENTRAL directory (outside the run tree), a validated old
+    // sibling-v1 directory, and nested runs' central directories.
+    const paths = [runDirectory];
+    const control = taskControlDirectory(runDirectory);
+    const stat = fs.lstatSync(control, { throwIfNoEntry: false });
+    if (!stat) {
       // Missing controls never downgrade a marked run. A no-status prelaunch
       // source still has its manager-owned cleanup path from main.
       try { taskControlReadDirectory(runDirectory); }
       catch (readError) { if ((readError as NodeJS.ErrnoException).code !== "ENOENT") throw readError; }
-      return [runDirectory];
+    } else {
+      try {
+        if (!stat.isDirectory() || stat.isSymbolicLink()) throw new FabricTaskControlDirectoryError("Refusing cleanup of a linked or non-directory task control path");
+        withTaskControlDirectory(runDirectory, () => undefined);
+      } catch (error) {
+        console.warn(`[pi-fabric] FABRIC_TASK_CONTROL_UNSAFE cleanup refused for ${control}: ${String(error)}`);
+        throw error;
+      }
+      paths.push(control);
     }
-    try {
-      if (!stat.isDirectory() || stat.isSymbolicLink()) throw new FabricTaskControlDirectoryError("Refusing cleanup of a linked or non-directory task control path");
-      withTaskControlDirectory(runDirectory, () => undefined);
-    } catch (error) {
-      console.warn(`[pi-fabric] FABRIC_TASK_CONTROL_UNSAFE cleanup refused for ${control}: ${String(error)}`);
-      throw error;
+    const sibling = legacyTaskControlSibling(runDirectory);
+    if (sibling !== control && fs.lstatSync(sibling, { throwIfNoEntry: false })) {
+      try {
+        if (!isTaskControlDirectoryEntry(path.dirname(sibling), path.basename(sibling))) throw new FabricTaskControlDirectoryError("Unvalidated legacy task control sibling");
+      } catch (error) {
+        console.warn(`[pi-fabric] FABRIC_TASK_CONTROL_UNSAFE cleanup refused for ${sibling}: ${String(error)}`);
+        throw error;
+      }
+      paths.push(sibling);
     }
-    return [runDirectory, control];
+    // Nested central controls are best-effort: an unvalidated one is retained
+    // (never deleted), and a failed walk never blocks the run's own cleanup.
+    let visited = 0;
+    const visit = (run: string, depth: number): void => {
+      const nested = path.join(run, "nested");
+      if (depth > 32 || !fs.lstatSync(nested, { throwIfNoEntry: false })?.isDirectory()) return;
+      for (const entry of fs.readdirSync(nested, { withFileTypes: true })) {
+        if (++visited > 4096) throw new Error("nested control walk bound exceeded");
+        if (!entry.isDirectory() || entry.name.endsWith(".ctl")) continue; // old nested siblings go with the tree
+        const child = path.join(nested, entry.name), central = taskControlDirectory(child);
+        const childStat = fs.lstatSync(central, { throwIfNoEntry: false });
+        if (childStat) {
+          try {
+            if (!childStat.isDirectory() || childStat.isSymbolicLink()) throw new FabricTaskControlDirectoryError("linked or non-directory task control path");
+            withTaskControlDirectory(child, () => undefined);
+            paths.push(central);
+          } catch (error) { console.warn(`[pi-fabric] FABRIC_TASK_CONTROL_UNSAFE nested control retained at ${central}: ${String(error)}`); }
+        }
+        visit(child, depth + 1);
+      }
+    };
+    try { visit(runDirectory, 0); }
+    catch (error) { console.warn(`[pi-fabric] nested task control collection incomplete for ${runDirectory}: ${String(error)}`); }
+    return paths;
   }
   #removeRunTreeSync(runDirectory: string): void {
     for (const directory of this.#runDeletionPaths(runDirectory)) fs.rmSync(directory, { recursive: true, force: true });
@@ -3786,7 +3821,8 @@ export class AgentManager {
       // (including unsafe/dangling links) keeps the full native-custody veto.
       if (!this.#runs.has(entry.name) && !this.#queued.has(entry.name) && !this.#previousRuns.has(entry.name) &&
           ownedStat(directory)?.isDirectory() && fs.readdirSync(directory).length === 0 &&
-          !fs.lstatSync(taskControlDirectory(directory), { throwIfNoEntry: false }) && !expired()) continue;
+          !fs.lstatSync(taskControlDirectory(directory), { throwIfNoEntry: false }) &&
+          !fs.lstatSync(legacyTaskControlSibling(directory), { throwIfNoEntry: false }) && !expired()) continue;
       inspect(directory, this.#runs.has(entry.name));
     }
     if (obligations()) throw new Error("Agent release quiescence changed while checking workers");

@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { ResidentRequestRetention, sweepResidentRuns } from "../src/residency/retention.js";
 import { canRemoveManagedRunRoot, canRemoveTerminalRun, isPairedTaskControlEntry, markRunRootClosed, pruneActorRunArchives, removeUnreferencedRun, runTreeExitVeto, sweepTempRunRoots } from "../src/storage/retention.js";
 import { verifiedRemove } from "../src/storage/verified-remove.js";
-import { initializeTaskControlDirectory, taskControlDirectory } from "../src/worker/terminal-answer.js";
+import { initializeTaskControlDirectory, legacyTaskControlSibling, taskControlDirectory, TASK_CONTROL_LAYOUT } from "../src/worker/terminal-answer.js";
 import { queuedTerminalControls, settleTerminalControl } from "../src/worker/terminal-controls.js";
 
 // Keep reason: trust-boundary and data-safety coverage of the real selection /
@@ -33,7 +33,8 @@ const scratch = () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "legacy-control-retention-")); roots.push(root); return root;
 };
 const seedRun = (root: string, id = "run", layout: "legacy" | "sibling-v1" | "legacy-read" = "legacy") => {
-  const run = path.join(root, id), sibling = taskControlDirectory(run);
+  // sibling-v1 is the OLD read-only sibling; host bootstrap (legacy-read) is central.
+  const run = path.join(root, id), sibling = layout === "sibling-v1" ? legacyTaskControlSibling(run) : taskControlDirectory(run);
   fs.mkdirSync(run, { recursive: true, mode: 0o700 });
   if (layout === "sibling-v1") fs.mkdirSync(sibling, { mode: 0o700 });
   const ctl = layout === "sibling-v1" ? sibling : run;
@@ -70,7 +71,7 @@ const seedTrackedFollowUpRun = () => {
   fs.mkdirSync(run, { mode: 0o700 });
   initializeTaskControlDirectory(run);
   json(path.join(run, "status.json"), { id: "run", status: "stopped", transport: "process", sessionId: "2147483647",
-    taskControlLayout: "sibling-v1", finishedAt: day, updatedAt: day });
+    taskControlLayout: TASK_CONTROL_LAYOUT, finishedAt: day, updatedAt: day });
   const messageId = "11111111-1111-4111-8111-111111111111";
   const provenance = { v: 1, channel: "fabric", via: "followUp", sender: { id: "session:original", kind: "main", verified: "mesh" } };
   const entry = { id: messageId, type: "follow_up", followUpId: messageId, deadlineAt: day, provenance, message: "tracked input" };
@@ -336,6 +337,17 @@ describe("paired control tree collection", () => {
     expect(sweepTempRunRoots({ tempRoot, now, orphanedTempRunRetentionMs: day, oneShotRunRetentionMs: day })).toEqual({ removedRoots: [], removedRuns: [f.run] });
     expect(removePaths()).toEqual([f.run, f.sibling]);
     expect(fs.existsSync(path.join(root, "unknown.ctl"))).toBe(true);
+  });
+  it("plans central controls with their run, keeps a validated old sibling, and never strands nested central controls", () => {
+    const f = seedRun(scratch(), "run", "sibling-v1");
+    initializeTaskControlDirectory(f.run); // host bootstrap: central over the intact old sibling
+    const child = seedRun(path.join(f.run, "nested"), "child", "legacy-read");
+    expect(fs.existsSync(child.sibling)).toBe(true);
+    expect(canRemoveTerminalRun(f.run)).toBe(true);
+    expect(pruneActorRunArchives({ runsDirectory: f.root, retentionMs: day, now, dryRun: true })).toEqual([f.run]);
+    expect(removePaths()).toEqual([f.run, taskControlDirectory(f.run), f.sibling, child.sibling]);
+    // Recorded dry run: every original byte stays.
+    expect(fs.existsSync(path.join(f.sibling, "final-answer.json"))).toBe(true);
   });
   it.each(["late reference", "run identity refusal"])("retains control evidence when the main run fence rejects %s", refusal => {
     const f = seedRun(scratch(), "run", "sibling-v1");

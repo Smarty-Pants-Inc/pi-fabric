@@ -73,7 +73,11 @@ const archiveFixture = () => {
   const root = tmp("fabric-archive-race-");
   const source = path.join(root, "source");
   fs.mkdirSync(path.join(source, "nested", "child"), { recursive: true });
+  // Source preflight (archiveNestedControls) reads every nested run's status through an owned, non-group-writable
+  // directory chain: give the nested child its own opaque status and pin modes independent of the host umask.
+  for (const directory of [source, path.join(source, "nested"), path.join(source, "nested", "child")]) fs.chmodSync(directory, 0o755);
   fs.writeFileSync(path.join(source, "status.json"), "{}");
+  fs.writeFileSync(path.join(source, "nested", "child", "status.json"), "{}");
   const sessionFile = path.join(root, "actor", "session.jsonl");
   fs.mkdirSync(path.dirname(sessionFile), { recursive: true, mode: 0o700 });
   fs.chmodSync(path.dirname(sessionFile), 0o700);
@@ -89,15 +93,17 @@ it.skipIf(process.platform === "win32")("does not follow a symlink swapped in at
   const swap = () => { if (swapped) return; swapped = true; fs.rmSync(child, { recursive: true, force: true }); fs.symlinkSync(outside, child); };
   // The swap lands at the walk's first look at the copied child, by lstat (a path walk) or by open (an fd walk, which
   // may reach it through /proc/self/fd/<archive fd>/nested/child).
+  // Only the copied (destination) path counts: the source preflight also looks at source/nested/child before any copy.
   const tail = `${path.sep}nested${path.sep}child`;
+  const copied = (file: fs.PathLike) => String(file).endsWith(tail) && !String(file).startsWith(source + path.sep);
   const lstat = fs.lstatSync, open = fs.openSync;
   vi.spyOn(fs, "lstatSync").mockImplementation(((file: fs.PathLike, ...rest: unknown[]) => {
     const result = (lstat as (...args: unknown[]) => unknown)(file, ...rest);
-    if (String(file).endsWith(tail)) swap();
+    if (copied(file)) swap();
     return result;
   }) as typeof fs.lstatSync);
   vi.spyOn(fs, "openSync").mockImplementation(((file: fs.PathLike, ...rest: unknown[]) => {
-    if (String(file).endsWith(tail)) swap();
+    if (copied(file)) swap();
     return (open as (...args: unknown[]) => unknown)(file, ...rest);
   }) as typeof fs.openSync);
   await store.retainRun({ sessionFile }, "run-1", source);
@@ -355,8 +361,12 @@ it.skipIf(process.platform === "win32")("archives an actor run's nested tree wit
   const root = tmp("fabric-archive-mode-");
   const source = path.join(root, "source");
   const nested = path.join(source, "nested", "child", "nested", "grandchild");
-  fs.mkdirSync(nested, { recursive: true, mode: 0o775 });
-  for (const directory of [path.join(source, "nested"), path.join(source, "nested", "child"), path.join(source, "nested", "child", "nested"), nested]) fs.chmodSync(directory, 0o775);
+  fs.mkdirSync(nested, { recursive: true, mode: 0o755 });
+  // Source preflight refuses group-writable run/nested directories (Unsafe task control subdirectory), so the source
+  // tree is permissive-but-safe 0755; the archive must still tighten every copied directory to 0700. Every nested run
+  // (child and grandchild) carries its own opaque status, as the preflight reads each one.
+  for (const directory of [source, path.join(source, "nested"), path.join(source, "nested", "child"), path.join(source, "nested", "child", "nested"), nested]) fs.chmodSync(directory, 0o755);
+  fs.writeFileSync(path.join(source, "nested", "child", "status.json"), "{}");
   fs.writeFileSync(path.join(nested, "status.json"), "{}", { mode: 0o644 });
   fs.writeFileSync(path.join(source, "status.json"), "{}");
   const sessionFile = path.join(root, "actor", "session.jsonl");

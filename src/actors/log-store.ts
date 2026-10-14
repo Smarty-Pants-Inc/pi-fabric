@@ -6,17 +6,21 @@ import type { MeshStore } from "../mesh/store.js";
 import { pruneActorRunArchives, pruneActorSessionBackups } from "../storage/retention.js";
 import { closeDirectory, openPrivateDir, writeArchiveFile, type PrivateDirectory } from "../storage/private-dir.js";
 import { MAX_STEER_BYTES, MAX_STEER_ENTRY_BYTES, terminalAdmissionFromEntry, terminalControlMatchesAdmission, terminalSenderMatches, type TerminalAdmission } from "../agents/terminal-notices.js";
-import { MAX_FINAL_ANSWER_BYTES, MAX_TASK_CONTROL_BYTES, MAX_TASK_CONTROL_ROWS, isTaskControlDirectoryEntry, openTaskControlFile, readFinalAnswerReceipt, readTaskRunStatus, taskControlDirectory, withLegacyTaskControlDirectory, withTaskControlDirectory, withTaskControlReadDirectory, withTaskControlSubdirectory } from "../worker/terminal-answer.js";
+import { MAX_FINAL_ANSWER_BYTES, MAX_TASK_CONTROL_BYTES, MAX_TASK_CONTROL_ROWS, createArchiveTaskControlDirectory, isTaskControlDirectoryEntry, legacyTaskControlSibling, openTaskControlFile, readFinalAnswerReceipt, readTaskRunStatus, taskControlDirectory, withLegacyTaskControlDirectory, withTaskControlDirectory, withTaskControlReadDirectory, withTaskControlSubdirectory } from "../worker/terminal-answer.js";
 import type { FabricActorMessage } from "./types.js";
 
 const controlFiles = new Set(["steer.jsonl", "final-answer.json"]);
+/** Read-only sibling-v1 location; new controls live in the central namespace. */
+const legacyControlSibling = legacyTaskControlSibling;
 const controlDirectories = new Set(["terminal-controls", "terminal-notices"]);
 /** Preserve bounded original bytes, never copy the inode-bound legacy grant.
  * Eligible legacy evidence is promoted into the protected archive namespace.
  * Journals stay legacy-first; only matching delivered overlays replace old debt.
  * Duplicate final answers always refuse, even when their bytes are identical. */
 const archiveControls = (runDirectory: string): Map<string, Buffer> | undefined => {
-  const sibling = !!fs.lstatSync(taskControlDirectory(runDirectory), { throwIfNoEntry: false });
+  // Protected controls are central (central-v1) or an old sibling-v1 directory.
+  const sibling = !!fs.lstatSync(taskControlDirectory(runDirectory), { throwIfNoEntry: false }) ||
+    !!fs.lstatSync(legacyControlSibling(runDirectory), { throwIfNoEntry: false });
   const local = [...controlFiles, ...controlDirectories].some(name => fs.lstatSync(path.join(runDirectory, name), { throwIfNoEntry: false }));
   // The shared status reader also proves the source root owned and unaliased.
   // Keep the older receipt-only / opaque-status archive behavior when there are
@@ -190,16 +194,13 @@ const assertArchiveRunIdentity = (dest: string, held: PrivateDirectory): void =>
 const writeArchivedControls = (dest: string, anchor: string, controls: Map<string, Buffer>, run: PrivateDirectory): void => {
   assertArchiveRunIdentity(dest, run);
   if (fs.lstatSync(taskControlDirectory(dest), { throwIfNoEntry: false })) withTaskControlDirectory(dest, () => undefined);
-  const parent = openPrivateDir(path.dirname(dest), anchor);
-  try {
-    const sibling = path.join(parent.path, path.basename(dest) + ".ctl");
-    assertArchiveRunIdentity(dest, run);
-    try { fs.mkdirSync(sibling, { mode: 0o700 }); fs.chmodSync(sibling, 0o700); }
-    catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
-    assertArchiveRunIdentity(dest, run);
-    withTaskControlDirectory(dest, () => undefined);
-    if (parent.fd !== undefined) fs.fsyncSync(parent.fd);
-  } finally { parent.close(); }
+  // Publish into the CENTRAL namespace keyed by the archive path, never a raw
+  // `<dest>.ctl` sibling inside the (task-visible) archive tree.
+  if (fs.lstatSync(legacyControlSibling(dest), { throwIfNoEntry: false })) throw new Error(`Archive destination ${dest} has a stray control sibling`);
+  void anchor;
+  assertArchiveRunIdentity(dest, run);
+  createArchiveTaskControlDirectory(dest);
+  assertArchiveRunIdentity(dest, run);
   withTaskControlDirectory(dest, (directory, fd) => {
       assertArchiveRunIdentity(dest, run);
       for (const [relative, bytes] of controls) {
@@ -365,7 +366,8 @@ export class ActorLogStore {
           if (!closeDirectory(path.join(held.path, "nested"))) throw new Error("the new nested directory is not ours");
           const excluded = new Set<string>();
           for (const source of nestedControls.keys()) {
-            excluded.add(taskControlDirectory(source));
+            // Source trees only contain OLD sibling-v1 controls; central ones are outside the tree.
+            excluded.add(legacyControlSibling(source));
             for (const name of [...controlFiles, ...controlDirectories]) excluded.add(path.join(source, name));
           }
           let unsafeArtifact = false;
@@ -424,7 +426,11 @@ export class ActorLogStore {
   retainedRunIds(actor: ActorLogTarget): string[] {
     const runsDir = path.join(path.dirname(actor.sessionFile), "runs");
     try {
-      return fs.readdirSync(runsDir).filter(name => !name.endsWith(".ctl")).sort();
+      // Skip ONLY validated sibling-v1 control directories of a surviving run; an
+      // unknown/unvalidated `.ctl` entry stays visible rather than hidden.
+      return fs.readdirSync(runsDir).filter(name => {
+        try { return !isTaskControlDirectoryEntry(runsDir, name); } catch { return true; }
+      }).sort();
     } catch {
       return [];
     }

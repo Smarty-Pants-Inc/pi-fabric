@@ -396,7 +396,7 @@ const main = async (): Promise<void> => {
   mkdirPrivate(deliveryDirectory, runRoot);
   const images = readImages(options.imagesFile);
   const record = createRunningRecord(options, task, thinking, Date.now());
-  record.taskControlLayout = "sibling-v1";
+  record.taskControlLayout = "central-v1";
   // pi-fabric#1034: every Pi child's record carries a receipt from its creation, so an early refusal or failure
   // record has the empty one too (round-2 review P2).
   if (isPi) record.writeReceipt = { paths: [], commands: [] };

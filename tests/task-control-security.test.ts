@@ -11,12 +11,13 @@ import { canRemoveTerminalRun, removeUnreferencedRun } from "../src/storage/rete
 import { writeJsonAtomic } from "../src/core/atomic-write.js";
 import { queuedTerminalControls, readTerminalControl, settleTerminalControl, trackTerminalControl } from "../src/worker/terminal-controls.js";
 import { resolveChildWritePolicy } from "../src/agents/child-env.js";
-import { assertTaskControlWriteRoots } from "../src/worker/terminal-answer.js";
+import { assertTaskControlWriteRoots, ensureTaskControlRoot } from "../src/worker/terminal-answer.js";
 
 // All fixture paths are private and retained. No local deletion is performed.
 const fixture = () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "task-control-security-"));
   const run = path.join(root, "run"), workspace = path.join(root, "workspace");
+  ensureTaskControlRoot(); // central root lives under the caller-isolated XDG_STATE_HOME, outside TMPDIR
   for (const directory of [run, workspace, taskControlDirectory(run)]) fs.mkdirSync(directory, { mode: 0o700 });
   return { root, run, workspace, control: taskControlDirectory(run) };
 };

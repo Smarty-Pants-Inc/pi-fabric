@@ -184,7 +184,9 @@ const BINDING = ".legacy-read.json", SNAPSHOT = ".legacy-snapshot";
 const unsafe = (message: string): never => { throw new FabricTaskControlDirectoryError(`FABRIC_LEGACY_SNAPSHOT_REQUIRED: ${message}`); };
 /** Reserved protected metadata: public write/remove never touches these names. */
 const assertPublicControlName = (relative: string): void => {
-  const first = relative.split(/[\\/]/)[0];
+  // Fail closed on every platform for NTFS/APFS case aliases and Win32's
+  // trailing-dot/space aliases, including a reserved directory component.
+  const first = relative.split(/[\\/]/)[0]?.replace(/[. ]+$/u, "").toLowerCase();
   if (first === BINDING || first === SNAPSHOT) unsafe("Protected task control metadata is not publicly writable");
 };
 const identityOf = (stat: fs.BigIntStats): Identity => ({ dev: String(stat.dev), ino: String(stat.ino) });

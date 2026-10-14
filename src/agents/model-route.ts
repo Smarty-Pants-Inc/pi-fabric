@@ -336,7 +336,38 @@ function saveRouteOutcome(decision: ModelRouteDecision, result: { status: string
   }
 }
 
-export function prepareRouteDispatch(decision: ModelRouteDecision, cwd: string | undefined, runDirectory: string, childId: string, options: { ledger?: string; decisionRecorded?: boolean } = {}): {
+/** DELTA-SEC-02: typed refusal code for a run directory whose bound allocation identity changed. */
+export const RUN_IDENTITY_REFUSED = "FABRIC_RUN_IDENTITY_REFUSED";
+/** The allocated run directory, bound once (dev+ino, no-follow). `use` reverifies the identity immediately before
+ * each in-run write and passes the directory to write through: the held fd path on Linux, else the checked path.
+ * A mismatch throws an error whose `code` is RUN_IDENTITY_REFUSED, before the operation runs. */
+export interface RunDirectoryPin { readonly run: string; use<T>(operation: (directory: string, fd: number | undefined) => T): T }
+const isRunIdentityRefusal = (error: unknown): boolean => (error as { code?: unknown } | undefined)?.code === RUN_IDENTITY_REFUSED;
+/** Atomic publication inside the pinned run: O_EXCL|O_NOFOLLOW temp, then rename within the same directory. */
+const publishInRun = (pin: RunDirectoryPin, name: string, contents: string, durable: boolean): string => pin.use((directory, directoryFd) => {
+  const temporary = path.join(directory, `.${name}.${process.pid}.${randomUUID()}.tmp`);
+  let renamed = false;
+  try {
+    const fd = fs.openSync(temporary, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | (fs.constants.O_NOFOLLOW ?? 0), 0o600);
+    try { fs.writeFileSync(fd, contents, "utf8"); if (durable) fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+    // No traversable fd base on this platform: recheck the allocation again at
+    // publication, after the potentially blocking file fsync. Linux stays fd-relative.
+    if (directory === pin.run) pin.use(current => fs.renameSync(temporary, path.join(current, name)));
+    else fs.renameSync(temporary, path.join(directory, name));
+    renamed = true;
+    if (durable && directoryFd !== undefined && process.platform !== "win32") fs.fsyncSync(directoryFd);
+  } finally {
+    if (!renamed) {
+      try {
+        if (directory === pin.run) pin.use(current => fs.unlinkSync(path.join(current, path.basename(temporary))));
+        else fs.unlinkSync(temporary);
+      } catch (error) { if (isRunIdentityRefusal(error)) throw error; /* never created or already gone */ }
+    }
+  }
+  return path.join(pin.run, name);
+});
+
+export function prepareRouteDispatch(decision: ModelRouteDecision, cwd: string | undefined, runDirectory: string, childId: string, options: { ledger?: string; decisionRecorded?: boolean; runPin?: RunDirectoryPin } = {}): {
   header: string; sessionFile?: string; bindSession: (cwd: string) => string; outcome: (result: Pick<AgentRunResult, "status"> & Partial<AgentRunResult>) => void;
 } {
   const file = options.ledger ?? path.join(resolveAgentDir(), "fabric", "model-routing.jsonl");
@@ -344,17 +375,22 @@ export function prepareRouteDispatch(decision: ModelRouteDecision, cwd: string |
   const receiptFile = path.resolve(runDirectory, "route-dispatch-receipt.json");
   // Record before admission; seed only once the run's final worktree is known.
   // A seed write failure must never fall back to a different working directory.
+  const pin = options.runPin;
   const bindSession = (finalCwd: string): string => {
+    const line = `${JSON.stringify({ type: "session", version: CURRENT_SESSION_VERSION,
+      id: childId, timestamp: new Date().toISOString(), cwd: finalCwd })}\n`;
+    if (pin) { sessionFile = publishInRun(pin, "route-session.jsonl", line, false); return sessionFile; }
     fs.mkdirSync(runDirectory, { recursive: true, mode: 0o700 });
     const file = path.join(runDirectory, "route-session.jsonl");
-    fs.writeFileSync(file, `${JSON.stringify({ type: "session", version: CURRENT_SESSION_VERSION,
-      id: childId, timestamp: new Date().toISOString(), cwd: finalCwd })}\n`, { mode: 0o600 });
+    fs.writeFileSync(file, line, { mode: 0o600 });
     sessionFile = file;
     return file;
   };
+  // DELTA-SEC-02: a changed run identity refuses (typed) before ANY ledger or run write.
+  pin?.use(() => undefined);
   try {
     // Direct callers may already know the final cwd; manager binds after worktree creation.
-    fs.mkdirSync(runDirectory, { recursive: true, mode: 0o700 });
+    if (!pin) fs.mkdirSync(runDirectory, { recursive: true, mode: 0o700 });
     if (cwd !== undefined) bindSession(cwd);
     if (decision.mode === "live") {
       try {
@@ -376,10 +412,12 @@ export function prepareRouteDispatch(decision: ModelRouteDecision, cwd: string |
       }
     }
     if (!options.decisionRecorded) appendRouteRecord(file, { type: "decision", ...decision, childSessionId: decision.actorId ? null : childId, childAgentId: childId, runId: childId, at: Date.now() });
-    writeJsonAtomic(receiptFile, { decision, ledger: file, runId: childId }, { durable: true });
+    if (pin) publishInRun(pin, path.basename(receiptFile), JSON.stringify({ decision, ledger: file, runId: childId }), true);
+    else writeJsonAtomic(receiptFile, { decision, ledger: file, runId: childId }, { durable: true });
   } catch (error) {
     // Judgment dispatch is fail-closed; only shadow routing may fall back.
-    if (decision.mode === "judgment") throw error;
+    // An identity refusal is never demoted to a shadow fallback.
+    if (decision.mode === "judgment" || isRunIdentityRefusal(error)) throw error;
     decision.reasonCode = "record-failed";
     decision.mode = "shadow";
     Object.assign(decision, decision.pin);
@@ -393,6 +431,8 @@ export function prepareRouteDispatch(decision: ModelRouteDecision, cwd: string |
     header: routeHeader(decision), ...(sessionFile ? { sessionFile } : {}), bindSession,
     outcome(result) {
       if (appended) return;
+      // DELTA-SEC-02: refuse (typed) before any outcome ledger or pending write.
+      pin?.use(() => undefined);
       pendingRecord ??= { type: "outcome", decisionId: decision.decisionId, childSessionId: decision.actorId ? null : childId, runId: childId,
         ...(decision.actorId ? { actorId: decision.actorId, activationId: decision.activationId } : {}),
         status: result.status, admittedModel: result.admittedModel ?? (result.status === "completed" ? result.model ?? null : null),
@@ -416,12 +456,20 @@ export function prepareRouteDispatch(decision: ModelRouteDecision, cwd: string |
       catch (error) {
         // Preserve the exact join across close/reload, including rejected pre-worker spawns.
         // The manager also keeps its in-memory obligation if this storage write fails.
-        try { writeJsonAtomic(pendingFile, { ledger: file, record: pendingRecord }, { durable: true, renameRetries: 1 }); } catch { /* manager retains and surfaces the failure */ }
+        try {
+          if (pin) publishInRun(pin, path.basename(pendingFile), JSON.stringify({ ledger: file, record: pendingRecord }), true);
+          else writeJsonAtomic(pendingFile, { ledger: file, record: pendingRecord }, { durable: true, renameRetries: 1 });
+        } catch (pendingError) {
+          if (isRunIdentityRefusal(pendingError)) throw pendingError; // nothing written; never swallowed
+          /* manager retains and surfaces the failure */
+        }
         throw error;
       }
       appended = true;
       pendingRecord = undefined;
-      try { fs.unlinkSync(pendingFile); } catch { /* the durable ledger is authoritative */ }
+      // The durable ledger is authoritative; a refused identity removes nothing.
+      try { if (pin) pin.use(directory => fs.unlinkSync(path.join(directory, path.basename(pendingFile)))); else fs.unlinkSync(pendingFile); }
+      catch (error) { if (isRunIdentityRefusal(error)) throw error; /* the durable ledger is authoritative */ }
     },
   };
 }

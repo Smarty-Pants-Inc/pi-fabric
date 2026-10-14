@@ -18,7 +18,8 @@ import os from "node:os";
 
 import { fabricDataRoot } from "../storage/temp-root.js";
 import path from "node:path";
-import { mkdirPrivate } from "../storage/private-dir.js";
+import { fdBase, mkdirPrivate } from "../storage/private-dir.js";
+import type { RunDirectoryPin } from "./model-route.js";
 import { assertTaskRunPathUnaliased, assertTaskRunRootAdmissible } from "../worker/task-run-path.js";
 
 /** DELTA-SEC-02: errors from the run-path alias guard; never followed by a run-path outcome write. */
@@ -34,6 +35,64 @@ const assertRunPathSafe = (runDirectory: string, inheritedRoot: boolean): void =
   assertTaskRunRootAdmissible(inheritedRoot, makeError);
   assertTaskRunPathUnaliased(runDirectory, makeError);
 };
+/** DELTA-SEC-02 typed refusal (same code as model-route RUN_IDENTITY_REFUSED); never followed by a run-path write. */
+const runIdentityRefusal = (message: string): Error => {
+  const error = Object.assign(new FabricTaskControlDirectoryError(message), { code: "FABRIC_RUN_IDENTITY_REFUSED" });
+  unsafeRunPathErrors.add(error);
+  return error;
+};
+const NOFOLLOW_DIRECTORY = fs.constants.O_RDONLY | (fs.constants.O_DIRECTORY ?? 0) | (fs.constants.O_NOFOLLOW ?? 0);
+/**
+ * DELTA-SEC-02: bind the freshly allocated run directory's dev+ino ONCE, right after createHostTaskRun and before any
+ * yield. The bound identity must equal both the no-follow opened directory and the central v2 binding the exclusive
+ * allocation published, so a replacement cannot be recaptured. `use` reopens no-follow and rechecks dev+ino immediately
+ * before each write; on Linux the write goes through the held fd (`/proc/self/fd/N`), elsewhere through the checked
+ * path (Windows: lstat-checked; named check-to-use residual off Linux).
+ */
+const pinRunDirectory = (runDirectory: string): RunDirectoryPin => {
+  const run = path.resolve(runDirectory);
+  const win32 = process.platform === "win32";
+  const base = win32 ? undefined : fdBase();
+  if (!win32 && base === undefined && process.platform === "linux") throw runIdentityRefusal(`Cannot pin run directory ${run}: /proc/self/fd does not resolve a held directory`);
+  const open = (): { fd: number | undefined; dev: bigint; ino: bigint } => {
+    if (win32) {
+      let stat: fs.BigIntStats;
+      try { stat = fs.lstatSync(run, { bigint: true }); }
+      catch (error) { throw runIdentityRefusal(`Run directory ${run} is gone (${(error as NodeJS.ErrnoException).code}); refusing route write`); }
+      if (stat.isSymbolicLink() || !stat.isDirectory()) throw runIdentityRefusal(`Run directory ${run} was replaced by a link or non-directory; refusing route write`);
+      return { fd: undefined, dev: stat.dev, ino: stat.ino };
+    }
+    let fd: number;
+    try { fd = fs.openSync(run, NOFOLLOW_DIRECTORY); }
+    catch (error) { throw runIdentityRefusal(`Run directory ${run} cannot be opened without following links (${(error as NodeJS.ErrnoException).code}); refusing route write`); }
+    try {
+      const stat = fs.fstatSync(fd, { bigint: true });
+      if (!stat.isDirectory()) throw runIdentityRefusal(`Run directory ${run} is not a directory; refusing route write`);
+      return { fd, dev: stat.dev, ino: stat.ino };
+    } catch (error) { fs.closeSync(fd); throw error; }
+  };
+  const first = open();
+  let bound: { dev: bigint; ino: bigint };
+  try {
+    // The allocation's own central v2 binding must name this exact lifetime (refuses a replacement).
+    withLegacyTaskControlDirectories(run, () => undefined);
+    const named = fs.lstatSync(run, { bigint: true });
+    if (named.dev !== first.dev || named.ino !== first.ino) throw runIdentityRefusal(`Run directory ${run} changed while its allocation identity was bound`);
+    bound = { dev: first.dev, ino: first.ino };
+  } finally { if (first.fd !== undefined) fs.closeSync(first.fd); }
+  return {
+    run,
+    use<T>(operation: (directory: string, fd: number | undefined) => T): T {
+      const current = open();
+      try {
+        if (current.dev !== bound.dev || current.ino !== bound.ino) throw runIdentityRefusal(`Run directory ${run} is no longer the allocated directory; refusing route write (nothing written)`);
+        return operation(current.fd !== undefined && base !== undefined ? `${base}/${current.fd}` : run, current.fd);
+      } finally { if (current.fd !== undefined) fs.closeSync(current.fd); }
+    },
+  };
+};
+/** Test seam only: awaited (when set) at the post-allocation yield, before route-module import and receipt write. */
+export const managerRunTestHooks: { afterRunAllocation?: (runDirectory: string) => void | Promise<void> } = {};
 
 import { fileURLToPath } from "node:url";
 import { assertFabricModelAllowed, FabricModelDeniedError } from "../core/model-policy.js";
@@ -117,7 +176,7 @@ import type {
 import { FOLLOW_UP_RUNNING_TASK_MESSAGE, type AgentAdmissionAlarm, type AgentFollowUpAlarm, type AgentFollowUpDelivery } from "./types.js";
 import { followUpFile, followUpState, settleFollowUp, releaseFollowUpPayload } from "./follow-up-delivery.js";
 import { createRunRouteMetadata } from "../worker/run-record.js";
-import { readFinalAnswerReceipt, readTaskControlJson, taskControlDirectory, taskSteerFile, withTaskControlDirectory, createHostTaskRun, initializeTaskControlDirectory, assertTaskControlWriteRoots, isTaskControlDirectoryEntry, legacyTaskControlSibling, taskControlReadDirectory, FabricTaskControlDirectoryError, type FinalAnswerReceipt } from "../worker/terminal-answer.js";
+import { readFinalAnswerReceipt, readTaskControlJson, taskControlDirectory, taskSteerFile, withTaskControlDirectory, withLegacyTaskControlDirectories, createHostTaskRun, initializeTaskControlDirectory, assertTaskControlWriteRoots, isTaskControlDirectoryEntry, legacyTaskControlSibling, taskControlReadDirectory, FabricTaskControlDirectoryError, type FinalAnswerReceipt } from "../worker/terminal-answer.js";
 import { FabricTargetTerminalError, FabricSteerAdmissionLimitError, type AgentTerminalNotice } from "./terminal-target.js";
 import { TerminalNoticeOutbox, appendTerminalAdmission, readTerminalAdmission, readTerminalAdmissions, readUndeliveredMessage, readUndeliveredMessageView, MAX_STEER_CONTROLS, MAX_STEER_BYTES, MAX_STEER_ENTRY_BYTES, terminalControlMatchesAdmission, terminalSenderMatches } from "./terminal-notices.js";
 import type { AgentRunRouteMetadata } from "./types.js";
@@ -1523,6 +1582,9 @@ export class AgentManager {
     this.#semaphore.admit(this.#currentDepth + 1);
     // Exclusive fresh allocation is the host witness; publish current-only authority before route/custody/task writes.
     createHostTaskRun(path.join(this.#runRoot, id));
+    // DELTA-SEC-02: bind the ORIGINAL allocation identity before any yield; every later route write reverifies it.
+    const runPin = pinRunDirectory(path.join(this.#runRoot, id));
+    if (managerRunTestHooks.afterRunAllocation) await managerRunTestHooks.afterRunAllocation(runPin.run);
     const name = safeName(request.name ?? request.task.split("\n", 1)[0] ?? "Fabric agent");
     const callerSignal = signal;
     const assertAuthorized = (): void => {
@@ -1536,7 +1598,7 @@ export class AgentManager {
     let routeDispatch: ReturnType<typeof import("./model-route.js")["prepareRouteDispatch"]> | undefined;
     if (request.routeDecision) {
       const { prepareRouteDispatch } = await import("./model-route.js");
-      routeDispatch = prepareRouteDispatch(request.routeDecision, undefined, path.join(this.#runRoot, id), id, request.routeRecord);
+      routeDispatch = prepareRouteDispatch(request.routeDecision, undefined, path.join(this.#runRoot, id), id, { ...request.routeRecord, runPin });
       // Failed decision storage demotes before admission: no unlogged candidate.
       routePin = Object.freeze({ ...(request.routeDecision.mode === "live"
         ? { model: request.routeDecision.model, effort: request.routeDecision.effort } : request.routeDecision.pin) });
@@ -1558,14 +1620,18 @@ export class AgentManager {
         // Activation authority and durable request commit are independent obligations.
         beforeCommit?.(id);
       } catch (error) {
-        try { routeDispatch?.outcome({ status: signal?.aborted ? "stopped" : "failed" }); } catch { /* pinned work is never blocked by routing storage */ }
+        let refusal: unknown;
+        try { routeDispatch?.outcome({ status: signal?.aborted ? "stopped" : "failed" }); }
+        catch (saveError) { if (isUnsafeRunPathError(saveError)) refusal = saveError; /* else pinned work is never blocked by routing storage */ }
         release();
-        throw error;
+        throw refusal ?? error;
       }
       const runDirectory = path.join(this.#runRoot, id);
       // DELTA-SEC-02: recheck after async preparation (an alias may have changed) BEFORE the first mkdir/custody/task write.
       // Refusal releases admission but never invokes the route outcome saver through the aliased path.
       assertRunPathSafe(runDirectory, this.#inheritedRunRoot);
+      // A real replacement directory is not an alias: require the original allocation identity too.
+      runPin.use(() => undefined);
       // 0700 whatever the umask (smarty-dev#9016): a login shell's umask 002 made run directories 0775, which
       // verified retention refuses (group-writable). Only directories it creates are changed.
       mkdirPrivate(runDirectory, this.#trustRoot());
@@ -2090,7 +2156,8 @@ export class AgentManager {
           return this.#queuedInfo(queued);
         }
         release();
-        try { routeDispatch?.outcome({ status: signal?.aborted ? "stopped" : "failed" }); } catch { /* pinned work is never blocked by routing storage */ }
+        try { routeDispatch?.outcome({ status: signal?.aborted ? "stopped" : "failed" }); }
+        catch (saveError) { if (isUnsafeRunPathError(saveError)) error = saveError; /* else pinned work is never blocked by routing storage */ }
         // Prelaunch archive custody is not native worker debt. Persisted worker
         // records still require a checked root exit before rollback.
         if (worktree && !runTreeResourceVeto(runDirectory, 0, undefined, true, fs.existsSync(path.join(runDirectory, "status.json")))) {
@@ -2107,7 +2174,7 @@ export class AgentManager {
         if ((error as { launchOutcome?: string } | undefined)?.launchOutcome !== "unknown") release();
         if ((error as { launchOutcome?: string } | undefined)?.launchOutcome !== "unknown" && !this.#queued.has(id) && !isUnsafeRunPathError(error)) {
           try { routeDispatch?.outcome({ status: signal?.aborted ? "stopped" : "failed" }); }
-          catch (saveError) { console.warn(`[pi-fabric] Pre-worker route outcome save failed; files retained at ${path.join(this.#runRoot, id)}: ${String(saveError)}`); }
+          catch (saveError) { if (isUnsafeRunPathError(saveError)) throw saveError; console.warn(`[pi-fabric] Pre-worker route outcome save failed; files retained at ${path.join(this.#runRoot, id)}: ${String(saveError)}`); }
         }
         throw error;
       }
@@ -2115,7 +2182,8 @@ export class AgentManager {
     let release: (() => void) | undefined;
     try { release = this.#semaphore.tryAcquire("native", admissionSignal); }
     catch (error) {
-      try { routeDispatch?.outcome({ status: admissionSignal.aborted ? "stopped" : "failed" }); } catch { /* storage does not block cancellation */ }
+      try { routeDispatch?.outcome({ status: admissionSignal.aborted ? "stopped" : "failed" }); }
+      catch (saveError) { if (isUnsafeRunPathError(saveError)) throw saveError; /* storage does not block cancellation */ }
       throw error;
     }
     if (release) return start(release).catch((error) => { release(); throw error; });

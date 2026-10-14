@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { readTaskControlJson, readTaskControlJsonAt, writeTaskControlJson, MAX_TASK_CONTROL_ROWS, FabricTaskControlDirectoryError, withTaskControlReadDirectory, withLegacyTaskControlDirectory, withTaskControlSubdirectory } from "./terminal-answer.js";
+import { readTaskControlJson, readTaskControlJsonAt, writeTaskControlJson, MAX_TASK_CONTROL_ROWS, FabricTaskControlDirectoryError, withTaskControlReadDirectory, visitLegacyTaskControlDirectories, withTaskControlSubdirectory } from "./terminal-answer.js";
 import { copyFabricProvenance, type FabricTurnProvenance } from "../fabric-provenance.js";
 
 export interface TerminalControl {
@@ -61,7 +61,7 @@ export const queuedTerminalControls = (directory: string): TerminalControl[] => 
       }); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
     };
     withTaskControlReadDirectory(directory, pinned => { legacySelected = fs.realpathSync(pinned) === path.resolve(directory); scan(pinned); });
-    if (!legacySelected) withLegacyTaskControlDirectory(directory, scan);
+    if (!legacySelected) visitLegacyTaskControlDirectories(directory, scan);
     return [...controls.values()].filter(item => item.state === "queued");
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];

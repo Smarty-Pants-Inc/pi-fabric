@@ -51,7 +51,7 @@ import type { ActorContextReseed } from "./worker/context-admission.js";
 import { readPiSessionHeader } from "./core/pi-session-header.js";
 import { savePiSettlementReceipt } from "./worker/settlement-receipt.js";
 import { syncPathNamespace } from "./core/atomic-write.js";
-import { finalAssistantText, readFinalAnswerReceipt, openTaskControlFile, openLegacyTaskControlFile, withTaskControlDirectory, taskControlFileStat, withTaskFinalAnswerLock, initializeTaskControlDirectory, assertTaskControlWriteRoots, taskSteerFile, type FinalAnswerReceipt } from "./worker/terminal-answer.js";
+import { finalAssistantText, readFinalAnswerReceipt, openTaskControlFile, openLegacyTaskControlFiles, withTaskControlDirectory, taskControlFileStat, withTaskFinalAnswerLock, initializeTaskControlDirectory, assertTaskControlWriteRoots, taskSteerFile, type FinalAnswerReceipt } from "./worker/terminal-answer.js";
 import { readWritePolicy } from "./agents/child-env.js";
 import { MAX_STEER_BYTES, MAX_STEER_CONTROLS } from "./agents/terminal-notices.js";
 import { queuedTerminalControls, readTerminalControl, settleTerminalControl, trackTerminalControl, type TerminalControl } from "./worker/terminal-controls.js";
@@ -2199,6 +2199,10 @@ const main = async (): Promise<void> => {
   let steerJournalInvalid = false;
   let legacySteerComplete = false;
   let legacySteerBytes = 0;
+  // Tri-layout legacy journals (in-run, old sibling) are consumed oldest
+  // first, one at a time, before central; identities dedup hardlinked layers.
+  const legacySteerConsumed = new Set<string>();
+  const steerIdentity = (fd: number): string => { const stat = taskControlFileStat(fd); return `${stat.dev}:${stat.ino}`; };
   const refuseSteerJournal = (error: unknown): void => {
     steerJournalInvalid = true;
     appendLog(`${JSON.stringify({ type: "fabric_steer_journal_invalid", code: "FABRIC_STEER_JOURNAL_INVALID", message: String(error) })}\n`);
@@ -2211,22 +2215,36 @@ const main = async (): Promise<void> => {
     if (persistentPiTask && piRetrySdk && !endedReceipt) endedReceipt = readFinalAnswerReceipt(path.dirname(options.statusFile), options.id);
     if (!options.steerFile || (!endedReceipt && (terminalStatus || (isPi &&
         (!piControlLive || childExited || !modelControl.ready || !child.stdin?.writable || child.stdin.writableEnded || child.stdin.destroyed))))) return;
-    let descriptor: number | undefined, legacy = false;
+    let descriptor: number | undefined, legacy = false, identity = "";
     try {
       if (!legacySteerComplete) {
-        try { descriptor = openLegacyTaskControlFile(ownRunDirectory, "steer.jsonl"); }
-        catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+        // Newest-first sources reversed: in-run, then old sibling.
+        const layers = openLegacyTaskControlFiles(ownRunDirectory, "steer.jsonl").reverse();
+        try {
+          for (const fd of layers) {
+            const id = steerIdentity(fd);
+            if (descriptor === undefined && !legacySteerConsumed.has(id)) { descriptor = fd; identity = id; legacy = true; }
+          }
+        } finally {
+          for (const fd of layers) if (fd !== descriptor) fs.closeSync(fd);
+        }
         if (descriptor === undefined) legacySteerComplete = true;
-        else legacy = true;
       }
-      descriptor ??= withTaskControlDirectory(ownRunDirectory, directory => openTaskControlFile(path.join(directory, "steer.jsonl")));
+      if (descriptor === undefined) {
+        descriptor = withTaskControlDirectory(ownRunDirectory, directory => openTaskControlFile(path.join(directory, "steer.jsonl")));
+        try { identity = steerIdentity(descriptor); }
+        catch (error) { fs.closeSync(descriptor); throw error; }
+        // Central hardlinked to a consumed legacy journal: already delivered.
+        if (legacySteerConsumed.has(identity)) { fs.closeSync(descriptor); return; }
+      }
     } catch (error) {
+      if (descriptor !== undefined && legacy) fs.closeSync(descriptor);
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") refuseSteerJournal(error);
       return;
     }
     try {
       const journal = taskControlFileStat(descriptor);
-      if (journal.size + BigInt(legacy ? 0 : legacySteerBytes) > BigInt(MAX_STEER_BYTES)) throw new Error("Steering journal exceeds its total byte bound");
+      if (journal.size + BigInt(legacySteerBytes) > BigInt(MAX_STEER_BYTES)) throw new Error("Steering journal exceeds its total byte bound");
       const size = Number(journal.size);
       if (size < steerOffset) {
         steerOffset = 0;
@@ -2236,7 +2254,7 @@ const main = async (): Promise<void> => {
       if (size <= steerOffset) {
         if (legacy) {
           if (steerRemainder.length || skippingOversizedSteerLine) throw new Error("Incomplete legacy steering journal");
-          legacySteerComplete = true; legacySteerBytes = size;
+          legacySteerConsumed.add(identity); legacySteerBytes += size;
           steerOffset = 0; steerRemainder = Buffer.alloc(0); skippingOversizedSteerLine = false;
         }
         return;

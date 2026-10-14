@@ -10,7 +10,7 @@ import { FileLockBusy, lockFile } from "../residency/file-lock.js";
 import { recoverActorRunArchives } from "../actors/child-completions.js";
 import { recoverEnodevTaskRun } from "../agents/enodev-recovery.js";
 import { copyFabricProvenance } from "../fabric-provenance.js";
-import { readFinalAnswerReceipt, openTaskControlFile, MAX_TASK_CONTROL_BYTES, isTaskControlDirectoryEntry, legacyTaskControlSibling, taskControlDirectory, taskControlReadDirectory, withTaskControlDirectory, withTaskControlReadDirectory, withLegacyTaskControlDirectory } from "../worker/terminal-answer.js";
+import { readFinalAnswerReceipt, openTaskControlFile, MAX_TASK_CONTROL_BYTES, isTaskControlDirectoryEntry, legacyTaskControlSibling, taskControlDirectory, taskControlReadDirectory, withTaskControlDirectory, withTaskControlReadDirectory, withLegacyTaskControlDirectories } from "../worker/terminal-answer.js";
 import { MAX_STEER_CONTROLS, MAX_STEER_BYTES, MAX_STEER_ENTRY_BYTES, terminalAdmissionFromEntry, terminalControlMatchesAdmission, terminalSenderMatches, type TerminalAdmission } from "../agents/terminal-notices.js";
 
 export const FABRIC_RUN_ROOT_PREFIX = "pi-fabric-runs-";
@@ -311,14 +311,14 @@ const terminalArtifactDirectories = new Set(["terminal-controls", "terminal-noti
 const safeTerminalArtifacts = (root: string, expired: Deadline): boolean => withTaskControlReadDirectory(root, (selected, fd) => {
   const runStat = ownedStat(root), selectedStat = fs.fstatSync(fd);
   const selectedLegacy = !!runStat && runStat.dev === selectedStat.dev && runStat.ino === selectedStat.ino;
-  if (selectedLegacy) return safeSelectedTerminalArtifacts(root, selected, true, undefined, expired);
+  if (selectedLegacy) return safeSelectedTerminalArtifacts(root, selected, true, [], expired);
   // Status is task-writable. Only the shared host-owned inode-bound eligibility
   // check may expose old artifacts after recovery creates a protected sibling.
-  const legacy = withLegacyTaskControlDirectory(root, directory => safeSelectedTerminalArtifacts(root, selected, false, directory, expired));
-  return legacy ?? safeSelectedTerminalArtifacts(root, selected, false, undefined, expired);
+  // Every legacy layer (tri-layout: old sibling AND in-run) is judged together.
+  return withLegacyTaskControlDirectories(root, sources => safeSelectedTerminalArtifacts(root, selected, false, sources.map(source => source.directory), expired));
 });
-const safeSelectedTerminalArtifacts = (root: string, selected: string, selectedLegacy: boolean, legacy: string | undefined, expired: Deadline): boolean => {
-  const namespaces = [selected, ...(legacy ? [legacy] : [])];
+const safeSelectedTerminalArtifacts = (root: string, selected: string, selectedLegacy: boolean, legacy: string[], expired: Deadline): boolean => {
+  const namespaces = [selected, ...legacy];
   const artifactPaths = (name: string): string[] => namespaces.map(directory => path.join(directory, name))
     .filter(file => !!fs.lstatSync(file, { throwIfNoEntry: false }));
   const answers = artifactPaths("final-answer.json");
@@ -326,14 +326,14 @@ const safeSelectedTerminalArtifacts = (root: string, selected: string, selectedL
   const answerFile = answers[0];
   const controlDirectories = artifactPaths("terminal-controls"), noticeDirectories = artifactPaths("terminal-notices");
   if (!selectedLegacy) {
-    if (!legacy && [...terminalArtifactFiles, ...terminalArtifactDirectories].some(name => fs.lstatSync(path.join(root, name), { throwIfNoEntry: false }))) return false;
+    if (!legacy.length && [...terminalArtifactFiles, ...terminalArtifactDirectories].some(name => fs.lstatSync(path.join(root, name), { throwIfNoEntry: false }))) return false;
     // A private sibling is not an unlimited artifact allowlist. Interrupted
     // staging/locks, unknown names, links and nonregular artifacts retain custody.
     for (const name of fs.readdirSync(selected)) {
       if (expired()) return false;
       const stat = ownedStat(path.join(selected, name));
       if (!stat || !(terminalArtifactFiles.has(name) && stat.isFile() || terminalArtifactDirectories.has(name) && stat.isDirectory() ||
-          name === ".legacy-read.json" && !!legacy && stat.isFile())) return false;
+          name === ".legacy-read.json" && legacy.length > 0 && stat.isFile())) return false;
     }
   }
   // Sender views may omit malformed/duplicate rows; omission is never retention
@@ -376,7 +376,7 @@ const safeSelectedTerminalArtifacts = (root: string, selected: string, selectedL
     for (const controls of controlDirectories) for (const name of terminalArtifactNames(controls, budget, expired)) {
       if (!/^[a-zA-Z0-9_-]{1,200}\.json$/.test(name)) return false;
       const control = readArtifact<{ id?: string; state?: string; delivery?: string; provenance?: unknown }>(path.join(controls, name));
-      if (!control || control.state !== "delivered" && !(control.state === "queued" && legacy !== undefined && controls === path.join(legacy, "terminal-controls")) ||
+      if (!control || control.state !== "delivered" && !(control.state === "queued" && legacy.some(directory => controls === path.join(directory, "terminal-controls"))) ||
           Object.keys(control).some(key => !["id", "state", "delivery", "provenance"].includes(key)) ||
           !terminalControlMatchesAdmission(control, admissions.get(name.slice(0, -5)))) return false;
       if (control.state === "delivered") consumed.add(name.slice(0, -5));

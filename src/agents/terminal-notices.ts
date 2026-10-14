@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { readFinalAnswerReceipt, readTaskControlJson, readTaskControlJsonAt, readTaskRunStatus, writeTaskControlJson, removeTaskControlFile, openTaskControlReadFile, openLegacyTaskControlFile, taskControlFileStat, MAX_TASK_CONTROL_ROWS, taskControlDirectory, withTaskControlDirectory, withTaskControlReadDirectory, withLegacyTaskControlDirectory, withTaskControlSubdirectory, initializeTaskControlDirectory } from "../worker/terminal-answer.js";
+import { readFinalAnswerReceipt, readTaskControlJson, readTaskControlJsonAt, readTaskRunStatus, writeTaskControlJson, removeTaskControlFile, openTaskControlReadFile, openLegacyTaskControlFiles, taskControlFileStat, MAX_TASK_CONTROL_ROWS, taskControlDirectory, withTaskControlDirectory, withTaskControlReadDirectory, visitLegacyTaskControlDirectories, withTaskControlSubdirectory, initializeTaskControlDirectory } from "../worker/terminal-answer.js";
 import { FabricSteerAdmissionLimitError, type AgentTerminalNotice, type AgentUndeliveredMessage } from "./terminal-target.js";
 import { followUpFile, releaseFollowUpPayload, settleFollowUp } from "./follow-up-delivery.js";
 import { copyFabricProvenance, type FabricTurnProvenance } from "../fabric-provenance.js";
@@ -139,8 +139,14 @@ export const readTerminalAdmissions = (directory: string): TerminalAdmissionInde
       seen.add(identity); journals.push(readAdmissionJournal(fd, directory));
     };
     // Original admissions precede newer sibling ingress after a legacy restart.
-    try { read(openLegacyTaskControlFile(directory, "steer.jsonl")); }
+    // Oldest layer first (in-run, then old sibling): every legacy journal is kept.
+    let legacyFds: number[] = [];
+    try { legacyFds = openLegacyTaskControlFiles(directory, "steer.jsonl").reverse(); }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+    for (let index = 0; index < legacyFds.length; index++) {
+      try { read(legacyFds[index]); }
+      catch (error) { for (const fd of legacyFds.slice(index + 1)) fs.closeSync(fd); throw error; }
+    }
     try { read(openTaskControlReadFile(directory, "steer.jsonl")); }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
     const index = emptyAdmissions();
@@ -258,7 +264,7 @@ export class TerminalNoticeOutbox {
     };
     try {
       const pending = withTaskControlReadDirectory(directory, pinned => { legacySelected = fs.realpathSync(pinned) === path.resolve(directory); return scan(pinned); });
-      return pending || (!legacySelected && withLegacyTaskControlDirectory(directory, scan) === true);
+      return pending || (!legacySelected && visitLegacyTaskControlDirectories(directory, scan).some(Boolean));
     } catch (error) { return (error as NodeJS.ErrnoException).code !== "ENOENT"; }
   }
 

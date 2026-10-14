@@ -326,6 +326,48 @@ console.log(JSON.stringify({type:'LANDLOCK_COUNTERPROBES',denied,allowed:['legac
     });
   });
 
+  it.skipIf(process.platform !== "linux")("SEC01 #12079: a parent run grant covering descendant R/nested/C refuses both central ctls with EACCES while nested artifacts stay writable", () => {
+    const s = fixture(), descendant = path.join(s.run, "nested", "C");
+    fs.mkdirSync(descendant, { recursive: true, mode: 0o700 });
+    initializeTaskControlDirectory(descendant);
+    const descendantControl = taskControlDirectory(descendant);
+    saveFinalAnswerReceipt(s.run, "run", "PARENT_RECEIPT");
+    const receipt = path.join(s.control, "final-answer.json"), marker = path.join(descendantControl, "steer.jsonl");
+    fs.writeFileSync(marker, "HOST_DESCENDANT_MARKER\n", { mode: 0o600 });
+    const policy = resolveChildWritePolicy({ writableRoots: [s.run, s.workspace] }, undefined, s.workspace)!;
+    const within = (parent: string, child: string) => { const relative = path.relative(fs.realpathSync(parent), fs.realpathSync(child)); return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative)); };
+    expect(policy.writableRoots).toContain(s.run);
+    expect(within(s.run, descendant)).toBe(true);
+    for (const root of policy.writableRoots) for (const control of [s.control, descendantControl]) {
+      expect(within(root, control)).toBe(false); expect(within(control, root)).toBe(false);
+    }
+    expect(() => assertTaskControlWriteRoots(descendant, s.workspace, policy)).not.toThrow();
+    const protectedFiles = [receipt, marker], before = protectedFiles.map(file => fs.readFileSync(file));
+    const artifact = path.join(descendant, "artifact.txt"), probe = path.join(s.workspace, "descendant-probe.mjs");
+    // Open-only and same-byte r+ writes: no truncation, unlink, rename or replacement.
+    fs.writeFileSync(probe, `
+import fs from 'node:fs';
+const files=${JSON.stringify(protectedFiles)}, codes=[];
+const attempt=operation=>{try{operation();codes.push('ALLOWED');}catch(error){codes.push(error.code);}};
+for (const file of files) {
+  attempt(()=>{const fd=fs.openSync(file,fs.constants.O_WRONLY);fs.closeSync(fd);});
+  const first=fs.readFileSync(file).subarray(0,1);
+  attempt(()=>{const fd=fs.openSync(file,'r+');try{fs.writeSync(fd,first,0,first.length,0);}finally{fs.closeSync(fd);}});
+}
+const fd=fs.openSync(${JSON.stringify(artifact)},'wx');try{fs.writeSync(fd,'nested-allowed');}finally{fs.closeSync(fd);}
+console.log(JSON.stringify({codes}));
+`);
+    const result = confined(probe, s, policy);
+    expect(result.error).toBeUndefined(); expect(result.signal).toBeNull();
+    expect(result.status, result.stderr).toBe(0);
+    expect(JSON.parse(result.stdout.trim()).codes).toEqual(["EACCES", "EACCES", "EACCES", "EACCES"]);
+    protectedFiles.forEach((file, index) => expect(fs.readFileSync(file)).toEqual(before[index]));
+    expect(readFinalAnswerReceipt(s.run, "run")?.text).toBe("PARENT_RECEIPT");
+    expect(fs.readFileSync(marker, "utf8")).toBe("HOST_DESCENDANT_MARKER\n");
+    expect(fs.readFileSync(artifact, "utf8")).toBe("nested-allowed");
+    console.log(`SEC01_DESCENDANT: PASS root=${s.root} removal=not-executed`);
+  });
+
   it.skipIf(process.platform !== "linux" || !hostedDeletion)("hosted-only: refuses actual control replacement/removal and live-lock deletion", () => {
     const s = fixture(), controlFile = taskSteerFile(s.run), lock = path.join(s.control, ".task-final-answer.lock");
     fs.writeFileSync(controlFile, "HOST_CONTROL\n");

@@ -449,4 +449,47 @@ describe("actor archive paired task controls", () => {
     expect(fs.existsSync(nested)).toBe(true);
     expect(removalPaths()).toEqual([]);
   });
+
+  // Real filesystem tri-layout: in-run legacy -> old bound sibling-v1 -> central.
+  const triLayout = (options: { bound?: boolean; siblingAnswer?: boolean } = {}) => {
+    const f = setup("legacy"), sibling = legacyTaskControlSibling(f.source);
+    json(path.join(f.source, "terminal-controls", f.admission.id + ".json"), { ...f.control, state: "queued", reason: undefined });
+    fs.mkdirSync(sibling, { mode: 0o700 });
+    const stat = fs.lstatSync(f.source, { bigint: true });
+    if (options.bound !== false) json(path.join(sibling, ".legacy-read.json"), { version: 1, runId: path.basename(f.source), dev: String(stat.dev), ino: String(stat.ino) });
+    const row = (id: string, message: string) => Buffer.from(JSON.stringify({ ...f.admission, id, message }) + "\n");
+    const siblingJournal = row("sibling-steer", "old sibling admission"), centralJournal = row("central-steer", "central admission");
+    fs.writeFileSync(path.join(sibling, "steer.jsonl"), siblingJournal, { mode: 0o600 });
+    const delivered = { ...f.control, state: "delivered", reason: undefined };
+    json(path.join(sibling, "terminal-controls", f.admission.id + ".json"), delivered);
+    if (options.siblingAnswer) json(path.join(sibling, "final-answer.json"), f.receipt);
+    json(path.join(f.source, "status.json"), { ...f.record, taskControlLayout: "sibling-v1" });
+    initializeTaskControlDirectory(f.source);
+    fs.writeFileSync(path.join(taskControlDirectory(f.source), "steer.jsonl"), centralJournal, { mode: 0o600 });
+    const snapshot = (directory: string) => fs.readdirSync(directory, { recursive: true, withFileTypes: true }).filter(entry => entry.isFile())
+      .map(entry => [path.relative(directory, path.join(entry.parentPath, entry.name)), fs.readFileSync(path.join(entry.parentPath, entry.name)).toString("base64")]).sort();
+    return { ...f, sibling, siblingJournal, centralJournal, delivered, snapshot };
+  };
+
+  it("tri-layout archive retains in-run, old sibling, then central rows chronologically with the legitimate overlay", async () => {
+    const t = triLayout(), inRunJournal = fs.readFileSync(path.join(t.source, "steer.jsonl"));
+    const before = [t.snapshot(t.source), t.snapshot(t.sibling)];
+    await t.store.retainRun(t.actor, t.alias, t.source);
+    const archived = taskControlDirectory(t.archive);
+    expect(fs.readFileSync(path.join(archived, "steer.jsonl"))).toEqual(Buffer.concat([inRunJournal, t.siblingJournal, t.centralJournal]));
+    expect(JSON.parse(fs.readFileSync(path.join(archived, "terminal-controls", t.admission.id + ".json"), "utf8"))).toEqual(t.delivered);
+    expect(JSON.parse(fs.readFileSync(path.join(archived, "terminal-notices", t.admission.id + ".json.delivered"), "utf8"))).toEqual(t.notice);
+    expect(readFinalAnswerReceipt(t.archive, t.record.id)).toEqual(t.receipt);
+    // Archival never rewrites the in-run or old sibling layers.
+    expect([t.snapshot(t.source), t.snapshot(t.sibling)]).toEqual(before);
+  });
+
+  it.each(["duplicate-result", "unbound"] as const)("tri-layout archive refuses a %s chain without dropping in-run evidence", async bad => {
+    const t = triLayout(bad === "unbound" ? { bound: false } : { siblingAnswer: true });
+    const before = t.snapshot(t.source);
+    await expect(t.store.retainRun(t.actor, t.alias, t.source)).rejects.toThrow(bad === "unbound" ? "Unproven legacy archive controls" : "Conflicting legacy archive control");
+    expect(fs.existsSync(path.join(t.archive, "status.json"))).toBe(false);
+    expect(t.snapshot(t.source)).toEqual(before);
+    expect(removalPaths()).toEqual([]);
+  });
 });

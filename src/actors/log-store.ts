@@ -6,7 +6,7 @@ import type { MeshStore } from "../mesh/store.js";
 import { pruneActorRunArchives, pruneActorSessionBackups } from "../storage/retention.js";
 import { closeDirectory, openPrivateDir, writeArchiveFile, type PrivateDirectory } from "../storage/private-dir.js";
 import { MAX_STEER_BYTES, MAX_STEER_ENTRY_BYTES, terminalAdmissionFromEntry, terminalControlMatchesAdmission, terminalSenderMatches, type TerminalAdmission } from "../agents/terminal-notices.js";
-import { MAX_FINAL_ANSWER_BYTES, MAX_TASK_CONTROL_BYTES, MAX_TASK_CONTROL_ROWS, createArchiveTaskControlDirectory, isTaskControlDirectoryEntry, legacyTaskControlSibling, openTaskControlFile, readFinalAnswerReceipt, readTaskRunStatus, taskControlDirectory, withLegacyTaskControlDirectory, withTaskControlDirectory, withTaskControlReadDirectory, withTaskControlSubdirectory } from "../worker/terminal-answer.js";
+import { MAX_FINAL_ANSWER_BYTES, MAX_TASK_CONTROL_BYTES, MAX_TASK_CONTROL_ROWS, createArchiveTaskControlDirectory, isTaskControlDirectoryEntry, legacyTaskControlSibling, openTaskControlFile, readFinalAnswerReceipt, readTaskRunStatus, taskControlDirectory, withLegacyTaskControlDirectories, withTaskControlDirectory, withTaskControlReadDirectory, withTaskControlSubdirectory } from "../worker/terminal-answer.js";
 import type { FabricActorMessage } from "./types.js";
 
 const controlFiles = new Set(["steer.jsonl", "final-answer.json"]);
@@ -94,8 +94,14 @@ const archiveControls = (runDirectory: string): Map<string, Buffer> | undefined 
   };
   withTaskControlReadDirectory(runDirectory, selected => {
     if (!sibling) { scan(selected, true, false); return; }
-    const legacy = withLegacyTaskControlDirectory(runDirectory, directory => { scan(directory, true, false); return true; }) === true;
-    if (!legacy && local) throw new Error("Unproven legacy archive controls");
+    // Chronological: in-run, then old sibling, then central. Journals append
+    // oldest first; an overlay pairs older queued debt with newer delivery.
+    const [legacy, inRun] = withLegacyTaskControlDirectories(runDirectory, sources => {
+      for (const source of [...sources].reverse()) scan(source.directory, true, false);
+      return [sources.length > 0, sources.some(source => path.resolve(source.directory) === path.resolve(runDirectory))];
+    });
+    // In-run controls the archive copy excludes must be a proven layer, never dropped.
+    if (local && !inRun) throw new Error("Unproven legacy archive controls");
     scan(selected, false, legacy);
   });
   if (overlays.size || result.has("steer.jsonl")) {

@@ -97,10 +97,9 @@ export const taskControlRoot = (): string => {
 /** Host-only: create the central root (0700, owned) under a validated state home. */
 export const ensureTaskControlRoot = (): string => {
   const root = taskControlRoot();
-  for (const directory of [path.dirname(stateHome()), stateHome(), path.dirname(root), root]) {
-    try { fs.mkdirSync(directory, { mode: 0o700 }); }
-    catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
-  }
+  // Every missing component (an arbitrarily deep absolute XDG_STATE_HOME) is created
+  // 0700; existing ancestry was validated above and is re-validated below.
+  fs.mkdirSync(root, { recursive: true, mode: 0o700 });
   // Re-validate after creation: a concurrent alias or foreign directory still refuses.
   if (taskControlRoot() !== root) throw new FabricTaskControlDirectoryError("Task control root changed during creation");
   return root;
@@ -219,19 +218,53 @@ export const withTaskControlReadDirectory = <T>(runDirectory: string, operation:
  * old layout: the validated old sibling if present, else the in-run directory.
  * Authority comes from the host-written central `.legacy-read.json`, never status.
  */
-export const withLegacyTaskControlDirectory = <T>(runDirectory: string, operation: (directory: string, fd: number) => T): T | undefined => {
-  if (centralExists(runDirectory)) {
-    if (!withTaskControlDirectory(runDirectory, directory => hasLegacyAuthority(runDirectory, directory))) return undefined;
-    // Bootstrapped from sibling-v1: the old sibling holds the old rows; else in-run legacy.
-    return oldSiblingExists(runDirectory) ? withOldSibling(runDirectory, operation) : withDirectory(path.resolve(runDirectory), false, operation);
+type LegacySource = { directory: string; privateMode: boolean };
+/**
+ * Ordered read-only legacy sources, NEWEST first (overlay order after the selected
+ * directory): old sibling-v1, then in-run. Each step needs host-written inode-bound
+ * `.legacy-read.json` authority from the layer above it; status never authorizes it.
+ */
+const legacySources = (runDirectory: string): LegacySource[] => {
+  const run = path.resolve(runDirectory);
+  const sibling = { directory: legacyTaskControlSibling(run), privateMode: true }, inRun = { directory: run, privateMode: false };
+  const siblingAdmitsInRun = (): boolean => withOldSibling(run, directory => hasLegacyAuthority(run, directory));
+  if (centralExists(run)) {
+    if (!withTaskControlDirectory(run, directory => hasLegacyAuthority(run, directory))) return [];
+    // Bootstrapped from sibling-v1: the old sibling, plus the in-run rows it was itself
+    // bootstrapped over (tri-layout); else bootstrapped directly from in-run legacy.
+    if (!oldSiblingExists(run)) return [inRun];
+    return siblingAdmitsInRun() ? [sibling, inRun] : [sibling];
   }
-  if (runLayout(runDirectory) === TASK_CONTROL_LAYOUT) return undefined;
+  if (runLayout(run) === TASK_CONTROL_LAYOUT) return [];
   // Un-bootstrapped old sibling is the primary read source; its own host-written
   // legacy binding (old sibling-over-legacy bootstrap) still admits in-run rows.
-  const allowed = oldSiblingExists(runDirectory)
-    ? withOldSibling(runDirectory, directory => hasLegacyAuthority(runDirectory, directory)) : legacyRecord(runDirectory);
-  return allowed ? withDirectory(path.resolve(runDirectory), false, operation) : undefined;
+  if (oldSiblingExists(run)) return siblingAdmitsInRun() ? [inRun] : [];
+  return legacyRecord(run) ? [inRun] : [];
 };
+/** Shared ordered-source helper: hold every eligible legacy source pinned at once (newest first). */
+export const withLegacyTaskControlDirectories = <T>(runDirectory: string, operation: (sources: Array<{ directory: string; fd: number }>) => T): T => {
+  const sources = legacySources(runDirectory);
+  const hold = (index: number, held: Array<{ directory: string; fd: number }>): T => index === sources.length ? operation(held)
+    : withDirectory(sources[index]!.directory, sources[index]!.privateMode, (directory, fd) => hold(index + 1, [...held, { directory, fd }]));
+  return hold(0, []);
+};
+/** Visit every eligible legacy source in order; returns one result per visited source. */
+export const visitLegacyTaskControlDirectories = <T>(runDirectory: string, operation: (directory: string, fd: number) => T): T[] =>
+  withLegacyTaskControlDirectories(runDirectory, sources => sources.map(source => operation(source.directory, source.fd)));
+/** First source where `operation` does not raise ENOENT (single-file lookups). */
+const firstLegacy = <T>(runDirectory: string, operation: (directory: string) => T): T | undefined =>
+  withLegacyTaskControlDirectories(runDirectory, sources => {
+    let missing: unknown;
+    for (const source of sources) {
+      try { return operation(source.directory); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; missing ??= error; }
+    }
+    if (missing) throw missing;
+    return undefined;
+  });
+/** Compatibility: the newest legacy source only. Prefer the ordered visitor. */
+export const withLegacyTaskControlDirectory = <T>(runDirectory: string, operation: (directory: string, fd: number) => T): T | undefined =>
+  withLegacyTaskControlDirectories(runDirectory, sources => sources.length ? operation(sources[0]!.directory, sources[0]!.fd) : undefined);
 const createCentral = (runDirectory: string, legacy: boolean): void => {
   ensureTaskControlRoot();
   const control = taskControlDirectory(runDirectory), parent = openPrivateDir(path.dirname(control), path.dirname(control));
@@ -372,13 +405,31 @@ export const withTaskControlSubdirectory = <T>(directory: string, relative: stri
   withControlPath(directory, path.join(relative, ".entry"), false, (_file, parent, fd) => operation(parent, fd));
 /** The returned FILE fd remains valid after the directory callback closes; no fd path escapes. */
 export const openLegacyTaskControlFile = (runDirectory: string, relative: string): number | undefined =>
-  withLegacyTaskControlDirectory(runDirectory, directory => withControlPath(directory, relative, false, openTaskControlFile));
+  firstLegacy(runDirectory, directory => withControlPath(directory, relative, false, openTaskControlFile));
+/** Every legacy source's copy of `relative` (newest first); missing copies are skipped. */
+export const openLegacyTaskControlFiles = (runDirectory: string, relative: string): number[] => {
+  // A later source may fail (unsafe/FIFO/etc.) after earlier fds opened: close them
+  // all before rethrowing; on success every fd is owned by the caller.
+  const fds: number[] = [];
+  try {
+    withLegacyTaskControlDirectories(runDirectory, sources => {
+      for (const source of sources) {
+        try { fds.push(withControlPath(source.directory, relative, false, openTaskControlFile)); }
+        catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+      }
+    });
+    return fds;
+  } catch (error) {
+    for (const fd of fds) { try { fs.closeSync(fd); } catch { /* best-effort cleanup */ } }
+    throw error;
+  }
+};
 export const openTaskControlReadFile = (runDirectory: string, relative: string): number => {
   const open = (directory: string): number => withControlPath(directory, relative, false, openTaskControlFile);
   try { return withTaskControlReadDirectory(runDirectory, open); }
   catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-    const legacy = withLegacyTaskControlDirectory(runDirectory, open);
+    const legacy = firstLegacy(runDirectory, open);
     if (legacy !== undefined) return legacy;
     throw error;
   }
@@ -392,7 +443,7 @@ export const readTaskControlFile = (runDirectory: string, relative: string, maxB
   try { return withTaskControlReadDirectory(runDirectory, read); }
   catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-    try { return withLegacyTaskControlDirectory(runDirectory, read); }
+    try { return firstLegacy(runDirectory, read); }
     catch (legacyError) { if ((legacyError as NodeJS.ErrnoException).code === "ENOENT") return; throw legacyError; }
   }
 };
@@ -401,23 +452,46 @@ export const readTaskControlJson = <T>(runDirectory: string, relative: string, m
   return contents === undefined ? undefined : JSON.parse(contents) as T;
 };
 const readReceipt = (directory: string, runId: string, legacyRun?: string): FinalAnswerReceipt | undefined => {
+  let value: FinalAnswerReceipt | undefined;
   try {
-    const value = JSON.parse(readBoundedControlFile(path.join(directory, "final-answer.json"), MAX_FINAL_ANSWER_BYTES));
-    if (value?.version === 1 && value.runId === runId && typeof value.id === "string" && value.id.length > 0 &&
-        Number.isSafeInteger(value.recordedAt) && value.recordedAt > 0 && typeof value.text === "string") return value;
+    const parsed = JSON.parse(readBoundedControlFile(path.join(directory, "final-answer.json"), MAX_FINAL_ANSWER_BYTES));
+    if (parsed?.version === 1 && parsed.runId === runId && typeof parsed.id === "string" && parsed.id.length > 0 &&
+        Number.isSafeInteger(parsed.recordedAt) && parsed.recordedAt > 0 && typeof parsed.text === "string") value = parsed;
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT" && legacyRun && hasLegacyAuthority(legacyRun, directory)) {
-      return withLegacyTaskControlDirectory(legacyRun, legacy => readReceipt(legacy, runId));
+      // Exactly one legacy result may establish finality; conflicting copies never do.
+      return withLegacyTaskControlDirectories(legacyRun, sources => {
+        const present = legacyAnswerDirectories(sources);
+        return present.length === 1 ? readReceipt(present[0]!, runId) : undefined;
+      });
     }
     /* Missing or invalid bounded receipts never establish finality. */
   }
-  return undefined;
+  // Central answer plus ANY eligible legacy answer is a duplicate: never final.
+  // Checked outside the try so a legacy-source ENOENT cannot reach the fallback.
+  if (value && legacyRun && withLegacyTaskControlDirectories(legacyRun, sources => legacyAnswerDirectories(sources).length) > 0) return undefined;
+  return value;
+};
+/** Distinct directories (by dev/ino, so selected in-run == legacy in-run counts once) holding an answer. */
+const answerSourceCount = (runDirectory: string): number => {
+  const keys = new Set<string>();
+  const add = (directory: string, fd: number): void => {
+    if (!fs.lstatSync(path.join(directory, "final-answer.json"), { throwIfNoEntry: false })) return;
+    const stat = fs.fstatSync(fd, { bigint: true });
+    keys.add(`${stat.dev}:${stat.ino}`);
+  };
+  withTaskControlReadDirectory(runDirectory, add);
+  withLegacyTaskControlDirectories(runDirectory, sources => { for (const source of sources) add(source.directory, source.fd); });
+  return keys.size;
 };
 export const readFinalAnswerReceipt = (runDirectory: string, runId: string): FinalAnswerReceipt | undefined => {
   try {
     const value = readTaskControlJson<FinalAnswerReceipt>(runDirectory, "final-answer.json", MAX_FINAL_ANSWER_BYTES);
     if (value?.version === 1 && value.runId === runId && typeof value.id === "string" && value.id.length > 0 &&
-        Number.isSafeInteger(value.recordedAt) && value.recordedAt > 0 && typeof value.text === "string") return value;
+        Number.isSafeInteger(value.recordedAt) && value.recordedAt > 0 && typeof value.text === "string" &&
+        // Exactly ONE distinct source (selected + eligible legacy layers) may hold an
+        // answer; central+legacy or sibling+in-run duplicates never establish finality.
+        answerSourceCount(runDirectory) === 1) return value;
   } catch (error) {
     if (error instanceof FabricTaskControlDirectoryError && !/byte bound|regular file/.test(error.message)) throw error;
     // Malformed/unsafe receipts never establish finality or authorize fallback.
@@ -425,6 +499,10 @@ export const readFinalAnswerReceipt = (runDirectory: string, runId: string): Fin
   return undefined;
 };
 
+/** Pinned legacy sources (all layers) that hold a final-answer entry. */
+const legacyAnswerDirectories = (sources: Array<{ directory: string }>): string[] => sources
+  .filter(source => !!fs.lstatSync(path.join(source.directory, "final-answer.json"), { throwIfNoEntry: false }))
+  .map(source => source.directory);
 const locked = <T>(directory: string, operation: () => T): T => withExclusiveFileLock({
   directory, lockName: ".task-final-answer.lock", attempts: 200, delayMs: 5,
   timeoutMessage: "Task final-answer publication/injection lock timed out",
@@ -446,8 +524,9 @@ export const saveFinalAnswerReceipt = (runDirectory: string, runId: string, text
     try {
       const published = locked(directory, () => {
         const file = path.join(directory, "final-answer.json");
+        // Never replace an existing result in ANY legacy layer (old sibling and in-run).
         if (fs.lstatSync(file, { throwIfNoEntry: false }) || (hasLegacyAuthority(runDirectory, directory) &&
-            !!withLegacyTaskControlDirectory(runDirectory, legacy => !!fs.lstatSync(path.join(legacy, "final-answer.json"), { throwIfNoEntry: false })))) return false; // never replace an existing result, including legacy
+            withLegacyTaskControlDirectories(runDirectory, sources => legacyAnswerDirectories(sources).length > 0))) return false;
         fs.renameSync(temporary, file); // no serialization, payload read or fsync under this lock
         return true;
       });

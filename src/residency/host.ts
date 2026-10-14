@@ -1124,7 +1124,7 @@ export class ResidentHost {
     if (!notice.sender?.id) throw new Error("Terminal refusal has no attributed sender; retain native receipt");
     if (!this.#ready || this.#closed || this.#staged || this.#handover) throw new Error(HOST_CLOSING_RETRY);
     assertMeshConsumption(() => this.participants.canConsumeMesh());
-    const message = `FABRIC_TARGET_TERMINAL: ${notice.delivery} ${notice.messageId} was not delivered to task ${notice.targetId}; ` +
+    const message = `FABRIC_TARGET_TERMINAL: undelivered: task already finished; ${notice.delivery} ${notice.messageId} was not delivered to task ${notice.targetId}; ` +
       `its final answer receipt is ${notice.finalAnswerReceiptId}. Start a new task; this input cannot revive the old one.`;
     const from: MeshIdentity = { id: notice.targetId, name: `Task ${notice.targetId}`, kind: "agent" };
     if (notice.sender.id === this.config.rootId) {

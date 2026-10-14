@@ -4,9 +4,25 @@ import type { FabricTurnProvenance } from "../fabric-provenance.js";
 export class FabricTargetTerminalError extends Error {
   override readonly name = "FabricTargetTerminalError";
   readonly code = "FABRIC_TARGET_TERMINAL";
-  constructor(readonly targetId: string, readonly finalAnswerReceiptId: string) {
-    super(`Fabric task ${targetId} recorded its final answer (${finalAnswerReceiptId}); input cannot revive it. Start a new task.`);
+  readonly reason = "run-ended";
+  readonly deliveryStatus = "undelivered";
+  constructor(readonly targetId: string, readonly finalAnswerReceiptId: string,
+    readonly runState: FabricTargetRunState = "final-answer-recorded") {
+    super(`undelivered: task already finished — Fabric task ${targetId} run ended (${runState}); it recorded its final answer (${finalAnswerReceiptId}); input cannot revive it. Start a new task.`);
   }
+}
+
+export type FabricTargetRunState = "final-answer-pending" | "final-answer-recorded" | "completed" | "failed" | "stopped" | "timed_out";
+
+/** One admitted control lost the final-answer race; it was not consumed. */
+export interface AgentUndeliveredMessage {
+  code: "FABRIC_TARGET_TERMINAL";
+  reason: "run-ended";
+  deliveryStatus: "undelivered";
+  messageId: string;
+  delivery: "steer" | "followUp";
+  finalAnswerReceiptId: string;
+  sender?: FabricTurnProvenance["sender"];
 }
 
 export interface AgentTerminalNotice {
@@ -19,10 +35,14 @@ export interface AgentTerminalNotice {
 }
 
 /** Copy the fixed rejection fields through owner ACKs; never trust arbitrary error data. */
-export const terminalRejectionFields = (value: unknown): { code: "FABRIC_TARGET_TERMINAL"; finalAnswerReceiptId: string; targetId: string } | undefined => {
+export const terminalRejectionFields = (value: unknown): { code: "FABRIC_TARGET_TERMINAL"; finalAnswerReceiptId: string; targetId: string; reason?: "run-ended"; deliveryStatus?: "undelivered"; runState?: FabricTargetRunState } | undefined => {
   if (!value || typeof value !== "object") return undefined;
   const error = value as Record<string, unknown>;
   if (error.code !== "FABRIC_TARGET_TERMINAL" || typeof error.finalAnswerReceiptId !== "string" || !error.finalAnswerReceiptId ||
       error.finalAnswerReceiptId.length > 200 || typeof error.targetId !== "string" || !error.targetId || error.targetId.length > 200) return undefined;
-  return { code: "FABRIC_TARGET_TERMINAL", finalAnswerReceiptId: error.finalAnswerReceiptId, targetId: error.targetId };
+  const runState = typeof error.runState === "string" && ["final-answer-pending", "final-answer-recorded", "completed", "failed", "stopped", "timed_out"].includes(error.runState)
+    ? error.runState as FabricTargetRunState : undefined;
+  return { code: "FABRIC_TARGET_TERMINAL", finalAnswerReceiptId: error.finalAnswerReceiptId, targetId: error.targetId,
+    ...(error.reason === "run-ended" ? { reason: "run-ended" as const } : {}),
+    ...(error.deliveryStatus === "undelivered" ? { deliveryStatus: "undelivered" as const } : {}), ...(runState ? { runState } : {}) };
 };

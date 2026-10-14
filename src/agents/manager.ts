@@ -101,7 +101,7 @@ import { FOLLOW_UP_RUNNING_TASK_MESSAGE, type AgentAdmissionAlarm, type AgentFol
 import { followUpFile, followUpState, settleFollowUp, releaseFollowUpPayload } from "./follow-up-delivery.js";
 import { createRunRouteMetadata } from "../worker/run-record.js";
 import { readFinalAnswerReceipt, type FinalAnswerReceipt } from "../worker/terminal-answer.js";
-import { FabricTargetTerminalError, type AgentTerminalNotice } from "./terminal-target.js";
+import { FabricTargetTerminalError, type AgentTerminalNotice, type AgentUndeliveredMessage } from "./terminal-target.js";
 import { TerminalNoticeOutbox, readTerminalAdmission, terminalControlMatchesAdmission, terminalSenderMatches } from "./terminal-notices.js";
 import type { AgentRunRouteMetadata } from "./types.js";
 import { WorktreeManager, type AgentWorktreeResult } from "./worktree-manager.js";
@@ -3406,9 +3406,9 @@ export class AgentManager {
     try { receipt = this.#appendSteer(id, { type: "follow_up", message, data, provenance, followUpId: messageId, deadlineAt }); }
     catch (error) { fs.unlinkSync(file); throw error; }
     const entries = this.#followUps.get(id) ?? new Map<string, AgentFollowUpDelivery>();
-    entries.set(messageId, { messageId, deadlineAt, state: "queued" });
+    entries.set(messageId, { messageId, deadlineAt, state: receipt.undelivered ? "cancelled" : "queued" });
     this.#followUps.set(id, entries);
-    this.#armFollowUpDeadline(managed, entries.get(messageId)!);
+    if (!receipt.undelivered) this.#armFollowUpDeadline(managed, entries.get(messageId)!);
     return { ...receipt, messageId, deadlineAt };
   }
 
@@ -3468,10 +3468,13 @@ export class AgentManager {
   // at call time instead of the command being silently dropped by the worker.
   #requireSteerable(id: string, kind: "steer" | "followUp" = "steer"): void {
     const previous = this.#previousRun(id);
-    if (previous?.runner === "pi" && previous.finalAnswerReceipt && !previous.actorId) throw new FabricTargetTerminalError(previous.id, previous.finalAnswerReceipt.id);
+    if (previous?.runner === "pi" && previous.finalAnswerReceipt && !previous.actorId) {
+      throw new FabricTargetTerminalError(previous.id, previous.finalAnswerReceipt.id,
+        terminalStatuses.has(previous.status) ? previous.status as AgentRunResult["status"] : "final-answer-recorded");
+    }
     const managed = this.#requireRun(id);
     this.#observeFinalAnswer(managed);
-    if (managed.finalAnswer) throw new FabricTargetTerminalError(managed.id, managed.finalAnswer.id);
+    if (managed.finalAnswer) throw this.#terminalError(managed);
     if (!managed.runnerAdapter.capabilities[kind]) {
       throw new Error(
         managed.runner === "veda"
@@ -3540,10 +3543,31 @@ export class AgentManager {
     });
   }
 
+  #terminalError(managed: ManagedAgent): FabricTargetTerminalError {
+    return new FabricTargetTerminalError(managed.id, managed.finalAnswer!.id,
+      managed.finalAnswerResult?.status ?? "final-answer-pending");
+  }
+
+  /** Close the receipt-publication race between ingress preflight and append. */
+  #appendRaceRefusal(managed: ManagedAgent, messageId: string, delivery: "steer" | "followUp"): AgentUndeliveredMessage | undefined {
+    if (!this.#observeFinalAnswer(managed) || !managed.finalAnswer) return;
+    const admission = readTerminalAdmission(managed.runDirectory, messageId);
+    if (!admission || admission.delivery !== delivery) return;
+    try {
+      const control = JSON.parse(fs.readFileSync(path.join(managed.runDirectory, "terminal-controls", `${messageId}.json`), "utf8"));
+      if (control?.state === "delivered" && terminalControlMatchesAdmission(control, admission)) return;
+    } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+    this.#retainTerminalNotice(managed, { code: "FABRIC_TARGET_TERMINAL", targetId: managed.id,
+      messageId, delivery, finalAnswerReceiptId: managed.finalAnswer.id });
+    return { code: "FABRIC_TARGET_TERMINAL", reason: "run-ended", deliveryStatus: "undelivered",
+      messageId, delivery, finalAnswerReceiptId: managed.finalAnswer.id,
+      ...(admission.sender ? { sender: admission.sender } : {}) };
+  }
+
   #appendSteer(id: string, entry: Omit<AgentSteerEntry, "id" | "ts">): AgentSteerResult {
     const managed = this.#requireRun(id);
     this.#observeFinalAnswer(managed);
-    if (managed.finalAnswer) throw new FabricTargetTerminalError(managed.id, managed.finalAnswer.id);
+    if (managed.finalAnswer) throw this.#terminalError(managed);
     if (managed.transport.controls === false) throw new Error("Remote placement has no steering, follow-up, or compaction channel; start a new task");
     const record = readRecord(managed.statusFile);
     if (record && terminalStatuses.has(record.status)) {
@@ -3564,9 +3588,12 @@ export class AgentManager {
       }
     }
     fs.appendFileSync(steerFile, line, { encoding: "utf8", mode: 0o600 });
+    const undelivered = entry.type === "steer" || entry.type === "follow_up"
+      ? this.#appendRaceRefusal(managed, messageId, entry.type === "steer" ? "steer" : "followUp") : undefined;
     return {
       queued: true,
       messageId,
+      ...(undelivered ? { undelivered } : {}),
       ...(entry.type === "follow_up" && record?.status === "running" ? { warning: {
         code: "FABRIC_FOLLOW_UP_RUNNING_TASK" as const,
         targetId: managed.id,

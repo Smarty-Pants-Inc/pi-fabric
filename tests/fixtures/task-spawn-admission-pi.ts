@@ -13,6 +13,7 @@ import { resolveFabricIdentity } from "../../src/main-agent-identity.js";
 import { MainAgentController } from "../../src/main-agent.js";
 import { MeshStore } from "../../src/mesh/store.js";
 import { ParticipantDirectory } from "../../src/topology/participant-directory.js";
+import { actorParticipantRecord, agentParticipantRecords } from "../../src/topology/records.js";
 import { FabricControlPlane } from "../../src/topology/control-plane.js";
 import { AgentsProvider } from "../../src/providers/agents-provider.js";
 import { AgentManager } from "../../src/agents/manager.js";
@@ -75,7 +76,8 @@ input.on("line", async line => {
   };
   const mesh = new MeshStore(process.env.PI_FABRIC_MESH_ROOT!, 64 * 1024, 100);
   const directory = new ParticipantDirectory(mesh, { enabled: true, hostId: identity.id, rootId: mainAgentId, identity });
-  const control = new FabricControlPlane(mesh, identity, { enabled: true, hostId: identity.id, pollMs: 10, acknowledgementTimeoutMs: 3_000 });
+  const control = new FabricControlPlane(mesh, identity, { enabled: true, hostId: identity.id,
+    ownerIncarnation: directory.ownerIncarnation, pollMs: 10, acknowledgementTimeoutMs: 3_000 });
   const main = new MainAgentController({} as any, mainAgentId, false, process.cwd());
   // Real nested manager: inherits PI_FABRIC_RUN_ROOT / DEPTH / PI binary from the real worker env.
   const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, deniedModels: [],
@@ -83,6 +85,10 @@ input.on("line", async line => {
     workerPath: process.env.PI_FABRIC_TEST_ADMISSION_WORKER!, fabricExtensionPath: process.env.PI_FABRIC_TEST_ADMISSION_EXTENSION!,
     meshRoot: process.env.PI_FABRIC_MESH_ROOT!, mainAgentId, hostId: identity.id, identityId: identity.id, spawnerSessionId: sessionId,
   });
+  const firstSeenAgents = new Map<string, number>();
+  directory.registerSource(() => agentParticipantRecords(manager.listForUi(),
+    mainAgentId, identity.id, identity.id, identity.id, firstSeenAgents));
+  manager.subscribeUi(() => directory.scheduleRefresh());
   // MODELED actor lifecycle (Decision C): a recording stand-in, not a real ActorManager. Every
   // method touch is counted so a refused leaf can be shown to reach no actor state at all.
   const actorCalls: string[] = [];
@@ -113,6 +119,9 @@ input.on("line", async line => {
       await realActors.dormantIdleActors();
       outcome.actorsBefore = realActors.list();
     }
+    directory.registerSource(() => realActors!.listOwned(true).map(actor =>
+      actorParticipantRecord(actor, mainAgentId, identity.id, identity.id, identity.id)));
+    realActors.subscribe(() => directory.scheduleRefresh());
   }
   const provider = new AgentsProvider(manager, (realActors ?? actors) as any, globalActors, main, directory, control, {} as any);
   // A task cannot grant itself spawning after launch: the admission snapshot was taken above.

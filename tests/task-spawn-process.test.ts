@@ -288,6 +288,9 @@ describe("task spawn admission through the real worker process transport (#12187
     expect(turn.children).toEqual([{ id: turn.guest.id, status: "completed" }]);
     const child = JSON.parse(turn.guest.text);
     expect(child).toMatchObject({ label: "actor-turn-child", identity: { id: turn.guest.id, kind: "agent" }, grantedRisks: "" });
+    expect(child.error, JSON.stringify(child)).toBeUndefined();
+    expect(child.guestError, JSON.stringify(child)).toBeUndefined();
+    expect(child.guest, JSON.stringify(child)).toBeDefined();
     expectDenied(child.guest.spawn);
     expect(child.children).toEqual([]);
     expect(child.guest.spawnerId).toBe(report.guest.actorId);

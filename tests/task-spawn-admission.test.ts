@@ -113,7 +113,8 @@ describe("AgentsProvider launch admission (smarty-dev#12187)", () => {
     const provider = new AgentsProvider(
       manager, actorManager as unknown as ProviderArgs[1], templates as unknown as ProviderArgs[2], {} as ProviderArgs[3],
       { get: () => undefined, scheduleRefresh: spies.refresh, async refresh() {} } as unknown as ProviderArgs[4],
-      undefined, {} as ProviderArgs[6], () => false, residency as unknown as ProviderArgs[8], false,
+      undefined, {} as ProviderArgs[6], () => false,
+      { ...residency, options: { config: { rootId: "main-1", meshRoot: root } } } as unknown as ProviderArgs[8], false,
     );
     const context = {
       cwd: process.cwd(), signal: undefined, parentToolCallId: "outer", nestedToolCallId: "nested",

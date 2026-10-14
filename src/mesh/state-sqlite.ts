@@ -35,8 +35,10 @@
  * attempt) starved next to those barging writers (smarty-dev#10391), so it is opt-in. A waiter passes a head whose
  * heartbeat stalled (its event loop blocked, or it stopped attempting) as soon as the stall bound shows it, not only
  * past 80% of its budget: the ticket closes at BEGIN IMMEDIATE, so a stale head here never holds the lock.
- * The wait honours `writeSignal`, the `withTryLock` budget and `lockTimeoutMs`, and times out with the existing
- * `MeshLockTimeoutError`.
+ * The wait honours `writeSignal`, the `withTryLock` budget and `lockTimeoutMs`. Relative budgets start after initial
+ * admission setup; a still-ineligible ticket with no BEGIN attempt expires separately as MeshLockQueueExpiredError.
+ * Real BEGIN contention keeps the existing MeshLockTimeoutError and timeout counter/event. Later queue joins after
+ * a BEGIN attempt do not extend that operation's deadline.
  *
  * Durability (review-luna P1-3, review-opus P3-3): `synchronous=NORMAL`. A commit is atomic and
  * never torn; a process crash loses nothing committed; an OS crash or power loss can drop the most
@@ -116,7 +118,8 @@ import { MeshLockTimeoutError } from "../core/atomic-write.js";
 import { captureStorageDelete, captureStoragePut, storageRevision, type StorageTransition } from "../verified/storage.js";
 import { encodeMeshStateMovedMarker, isMeshStateMovedMarker, isMeshStateNatsMarker, meshStateMovedToNatsError, readMeshStateMovedMarker } from "./backend-fence.js";
 import { holdMeshFence, holdMeshFenceSync } from "./fence-lock.js";
-import { MeshLockTicket, meshLockQueueBusy, meshLockQueueDirectory } from "./lock-queue.js";
+import { type MeshLockTicket, meshLockQueueBusy, meshLockQueueDirectory } from "./lock-queue.js";
+import { createMeshLockAdmission } from "./mesh-lock.js";
 import { processStartTime, residentProcessAlive } from "../residency/process-identity.js";
 import { verifiedRemove } from "../storage/verified-remove.js";
 // From the domain modules, not the store.ts facade: store.ts loads this module through state-backend.ts (L2a).
@@ -1616,12 +1619,13 @@ export class SqliteStateStore {
     walCapExempt = false): Promise<T> {
     const scope = this.#tryLockScope.getStore();
     const budget = scope?.active ? Math.min(scope.timeoutMs, lockTimeoutMs) : lockTimeoutMs;
-    const started = performance.now();
-    const deadline = started + Math.max(0, budget);
+    let started = 0;
+    let deadline = 0;
     let attempts = 0;
     let maxGap = 0;
-    let last = started;
+    let last = 0;
     let transient = 0;
+    let admission: ReturnType<typeof createMeshLockAdmission> | undefined;
     let ticket: MeshLockTicket | undefined;
     let yieldedMs = 0;
     let waiting = true;
@@ -1631,9 +1635,14 @@ export class SqliteStateStore {
       // queues behind them, never barging the FIFO head. Inside the try (pi-fabric#936 round 3): the finally always
       // releases the ticket and #writesWaiting.
       if (this.#fifoAfterMs === 0 && this.#queueBusy()) {
-        ticket = this.#ticket(Math.max(0, deadline - started));
+        admission = this.#ticket(Math.max(0, budget));
+        ticket = admission?.ticket;
         if (ticket) this.#stats.fifoJoins += 1;
       }
+      // No acquisition has been attempted: queue lookup/receipt construction cannot spend this relative budget.
+      started = admission?.startedAt ?? performance.now();
+      deadline = admission?.deadline ?? started + Math.max(0, budget);
+      last = started;
       for (;;) {
         const iteration = performance.now();
         let yielding = false;
@@ -1643,8 +1652,10 @@ export class SqliteStateStore {
         if (this.#inTransaction) throw new Error("Fabric mesh state callbacks must not call store writers");
         if (!walCapExempt) this.#refuseAboveWalCap();
         // smarty-dev#6100: a checkpoint flag pauses this writer for at most WRITER_YIELD_BUDGET_MS in total.
-        if (yieldedMs < WRITER_YIELD_BUDGET_MS && this.#checkpointPending()) { this.#stats.checkpoints.writerYields += 1; yielding = true; }
-        else if (!ticket || this.#mayContend(ticket)) {
+        const eligible = !ticket || this.#mayContend(ticket);
+        if (iteration < deadline && yieldedMs < WRITER_YIELD_BUDGET_MS && this.#checkpointPending()) {
+          this.#stats.checkpoints.writerYields += 1; yielding = true;
+        } else if (eligible) {
           const now = performance.now();
           if (attempts > 0) maxGap = Math.max(maxGap, now - last);
           last = now;
@@ -1679,6 +1690,11 @@ export class SqliteStateStore {
         }
         const now = performance.now();
         if (now >= deadline) {
+          if (attempts === 0) {
+            if (!eligible && admission) throw admission.expire(this.file, this.root, "sqlite", lockClass);
+            // A checkpoint yield can consume the last slice, but an eligible waiter still gets a real attempt.
+            continue;
+          }
           this.#stats.lockTimeouts += 1;
           this.#window.lockTimeouts += 1;
           this.#window.maxWaitMs = Math.max(this.#window.maxWaitMs, now - started);
@@ -1693,7 +1709,9 @@ export class SqliteStateStore {
           throw new MeshLockTimeoutError(` (SQLite state ${this.file})`, attempts, Math.round(maxGap));
         }
         if (!ticket && now - started >= this.#fifoAfterMs) {
-          ticket = this.#ticket(deadline - now);
+          // This writer already tried BEGIN IMMEDIATE: later queue setup must not reset the operation deadline.
+          admission = this.#ticket(deadline - now);
+          ticket = admission?.ticket;
           if (ticket) this.#stats.fifoJoins += 1;
         }
         const cap = Math.min(4, 2 ** Math.min(attempts - 1, 2));
@@ -1729,8 +1747,8 @@ export class SqliteStateStore {
     catch { ticket.close(); return true; }
   }
 
-  #ticket(budgetMs: number): MeshLockTicket | undefined {
-    try { return new MeshLockTicket(this.file, randomUUID(), budgetMs, { passStalledHead: true }); }
+  #ticket(budgetMs: number): ReturnType<typeof createMeshLockAdmission> | undefined {
+    try { return createMeshLockAdmission(this.file, randomUUID(), budgetMs, { passStalledHead: true }, () => performance.now()); }
     catch { return undefined; } // Advisory only: an unusable queue leaves the plain jittered contest.
   }
 

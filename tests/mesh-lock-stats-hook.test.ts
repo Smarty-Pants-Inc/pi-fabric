@@ -119,6 +119,51 @@ describe("MeshStore lock-timing hook", () => {
     expect(recorded.custody).toMatchObject({ n: 0, timeouts: 0, tries: 1 });
   });
 
+  it.each(["before the lock", "under the lock"])("a snapshot that keeps changing %s exhausts validation retries without a failed-acquisition count", async (where) => {
+    const root = temp();
+    const mesh = new store.MeshStore(root, 64 * 1024, 100, { lockTimeoutMs: 100 });
+    await mesh.put({ key: "presence/a", value: 0, identity }); // state exists: the snapshot path
+    const state = path.join(root, "state.json");
+    const replace = (): void => { fs.copyFileSync(state, `${state}.swap`); fs.renameSync(`${state}.swap`, state); };
+    const atomic = await import("../src/core/atomic-write.js");
+    const realNow = Date.now.bind(Date);
+    let skew = 0;
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => realNow() + skew);
+    const original = atomic.writeFileAtomic;
+    // Each off-lock preparation spends budget; a concurrent writer replaces the state before or after admission.
+    const staging = vi.spyOn(atomic, "writeFileAtomic").mockImplementation((...args: Parameters<typeof original>) => {
+      skew += 40;
+      const result = original(...args);
+      if (where === "before the lock") replace();
+      return result;
+    });
+    const mkdir = fs.mkdirSync;
+    const lockDir = vi.spyOn(fs, "mkdirSync").mockImplementation(((file: fs.PathLike, options?: unknown) => {
+      const result = mkdir(file, options as undefined);
+      if (where === "under the lock" && String(file) === path.join(root, ".lock")) replace();
+      return result;
+    }) as typeof fs.mkdirSync);
+    let error: unknown;
+    try {
+      error = await mesh.put({ key: "presence/a", value: 1, identity }).catch((caught: unknown) => caught);
+    } finally {
+      lockDir.mockRestore();
+      staging.mockRestore();
+      clock.mockRestore();
+    }
+    expect(error).toBeInstanceOf(store.MeshSnapshotRetriesExhaustedError);
+    expect(error).not.toBeInstanceOf(store.MeshLockTimeoutError);
+    const refusal = error as InstanceType<typeof store.MeshSnapshotRetriesExhaustedError>;
+    expect(refusal).toMatchObject({ code: "FABRIC_MESH_SNAPSHOT_RETRIES_EXHAUSTED" });
+    expect(refusal.message.startsWith("FABRIC_MESH_SNAPSHOT_RETRIES_EXHAUSTED: ")).toBe(true);
+    expect(refusal.message).not.toMatch(/Timed out|0 attempts/);
+    expect(refusal.attempts).toBeGreaterThan(1); // validation attempts, not lock contention
+    // Only snapshots invalidated under custody add successful admissions; neither path adds a timeout.
+    const recorded = classes(root)["put/delete"]!;
+    expect(recorded).toMatchObject({ n: 1 + (where === "before the lock" ? 0 : refusal.attempts), timeouts: 0, tries: 0 });
+    expect(JSON.parse(fs.readFileSync(state, "utf8")).entries["presence/a"].value).toBe(0);
+  });
+
   it("closes the FIFO ticket before recording, so bookkeeping never delays a follower", async () => {
     const root = temp();
     const mesh = new store.MeshStore(root, 64 * 1024, 100);

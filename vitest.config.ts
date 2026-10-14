@@ -5,7 +5,8 @@ import ts from "typescript";
 import type { ViteUserConfig as UserConfig } from "vitest/config";
 import { isolatedTestTemp, isolateTestFleetEnvironment } from "./scripts/test-temp.js";
 
-// Mutate the parent before Vitest snapshots its environment or forks any workers.
+// Assign the caller-owned run root before Vitest snapshots its environment, forks workers,
+// or allocates fleet state. Every later fixture temp directory stays beneath this root.
 const temp = isolatedTestTemp("pi-fabric-vitest-");
 Object.assign(process.env, temp);
 const fleet = isolateTestFleetEnvironment();
@@ -20,7 +21,7 @@ const ci = process.env.CI === "true";
 // outside hosted CI. Syntactic (TypeScript AST; comments and plain string mentions do not count), not a proof.
 // A suite qualifies by importing/requiring a deletion entry module, calling a deletion function (including the resident
 // removeActor request, which deletes the actor directory), calling .remove with
-// an actor-manager import (or on a .actors/manager receiver), calling .publishBatch/.prune/.compact with a mesh
+// an actor-manager/directory value import (or on a .actors/manager receiver), calling .publishBatch/.prune/.compact with a mesh
 // store/bridge import, or spawning/executing fabric-win-remove or a retention CLI with --apply.
 export const productDeletionMarkers: readonly string[] = ["actors-cli", "actors/remove-offline",
   "storage/verified-remove", "storage/retention", "storage/scratch", "mesh/event-log"];
@@ -68,7 +69,7 @@ function reachesProductDeletion(path: string, source: string): boolean {
     return needles.some((needle) => module === needle || module.endsWith("/" + needle));
   });
   if (imports(...productDeletionMarkers)) return true;
-  const managerImport = imports("actors/manager", "fabric-actors");
+  const managerImport = imports("actors/manager", "actors/directory", "fabric-actors");
   const meshImport = imports("mesh/store", "mesh/bridge");
   return calls.some(({ name, receiver, args }) => deletionCalls.has(name)
     || (name === "remove" && (managerImport || receiver === "actors" || receiver === "manager"))
@@ -130,6 +131,9 @@ export default {
   test: {
     ...sharedTests,
     reporters: ci ? ["default", "./scripts/ci-retry-reporter.ts"] : ["default"],
+    // Root config only: teardown removes this process's created root on pass and failure.
+    // The exit fallback keeps the same inode pins; Windows job temp stays runner-owned.
+    globalSetup: ["./scripts/test-temp-global-setup.ts"],
     maxWorkers: 2,
     // Expose GC only for retention tests: application worker_threads reject this flag.
     // Explicit shared options avoid extends merging the broad include into the GC project.

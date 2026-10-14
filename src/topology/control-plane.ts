@@ -1094,9 +1094,9 @@ export class FabricControlPlane {
         (timedOut.mirroredOwner
           ? `Fabric mesh bridge to remote host ${timedOut.mirroredOwner.remoteHost} is not responding for ${timedOut.targetId}; `
           : `Timed out waiting for the remote Fabric owner to acknowledge ${timedOut.targetId}; `) +
-          (timedOut.idempotencyKey
-            ? `the outcome is unknown; retry once only with the same idempotencyKey (${timedOut.idempotencyKey}) and unchanged input.`
-            : "the outcome is unknown and it may still be delivered, so a retry can deliver it twice."),
+          // A blind retry mints a new key and can duplicate an admitted command. Only
+          // the authenticated relay-refusal path prescribes an explicit same-key retry.
+          "the outcome is unknown and it may still be delivered, so a retry can deliver it twice.",
       );
       if (timedOut.idempotencyKey) Object.assign(error, { idempotencyKey: timedOut.idempotencyKey });
       timedOut.reject(error);

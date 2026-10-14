@@ -821,12 +821,14 @@ export class StoreBridgeSide implements BridgeSide {
       ...checked,
       // The cursor advances only after the destination confirms its append durably.
       durable: true,
-      // Commands dedupe caller retries even when a new source event id was minted. Other
-      // controls/ACKs use the original bridge stamp, never a hub-copy id or a receipt key.
-      dedupeKey: `bridge-publish:${contentDigest(checked.topic === "fabric.control.command" &&
-        typeof checked.data.commandId === "string" && checked.data.commandId.length > 0
-        ? [data.bridge.from, checked.from.id, checked.data.commandId]
-        : [data.bridge.from, data.bridge.id])}`,
+      // Only controls need durable retry receipts. Ordinary events retain the batched
+      // live-log barrier and cursor reconciliation, without per-event receipt writes.
+      // Commands use the logical command id; ACKs use the original bridge stamp.
+      ...(checked.topic === "fabric.control.command" || checked.topic === "fabric.control.ack"
+        ? { dedupeKey: `bridge-publish:${contentDigest(checked.topic === "fabric.control.command" &&
+          typeof checked.data.commandId === "string" && checked.data.commandId.length > 0
+          ? [data.bridge.from, checked.from.id, checked.data.commandId]
+          : [data.bridge.from, data.bridge.id])}` } : {}),
       // Host-only: bind the destination receipt to canonical semantic input, never a
       // wire-supplied fingerprint. Hub recordRelay envelopes deliberately omit it.
       ...(checked.topic === "fabric.control.command"
@@ -1977,6 +1979,15 @@ export class MeshBridge {
       unaddressed.more ? ", ..." : ""}; toRemote ${unaddressed.toRemote}, toLocal ${unaddressed.toLocal} (to factory ${unaddressed.factory}))`);
   }
 
+  async #reconcileSeen(): Promise<void> {
+    const cursor = this.#cursor!; // start() initialized it, or run() already observed readiness.
+    const [toRemote, toLocal] = await Promise.all([
+      allBridgedIds(this.options.remote, cursor.toRemote.mark),
+      allBridgedIds(this.options.local, cursor.toLocal.mark),
+    ]);
+    this.#seen = { toRemote, toLocal };
+  }
+
   /** Restore event recovery and reconcile live participants on every (re)connect. */
   async start(): Promise<void> {
     if (this.#stopped) throw relayUnavailable();
@@ -2007,11 +2018,7 @@ export class MeshBridge {
       };
       this.#save();
     }
-    const [toRemote, toLocal] = await Promise.all([
-      allBridgedIds(remote, this.#cursor.toRemote.mark),
-      allBridgedIds(local, this.#cursor.toLocal.mark),
-    ]);
-    this.#seen = { toRemote, toLocal };
+    await this.#reconcileSeen();
     // Read CURRENT natives (including participants/ files), never a saved projection set.
     // Reconcile against the destination under its lock: unchanged digests skip state writes,
     // but lost records must be recreated and missing sources must not have their lease renewed.
@@ -2602,7 +2609,12 @@ export class MeshBridge {
           if (this.#stopped) return;
           if (!started) {
             if (!this.#ready) await this.start();
-            else await this.syncPresence(); // Reconcile again after subscriptions, without resetting ready cursors.
+            else {
+              // Subscription setup can race an append: recover IDs again without
+              // resetting already-ready cursors or losing their committed marks.
+              await this.#reconcileSeen();
+              await this.syncPresence();
+            }
           } else if (this.#presenceDue()) await this.syncPresence();
         })();
         // stop() needs a settlement fence, not a second rejection of a failed pass.

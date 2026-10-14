@@ -2,6 +2,8 @@ import fs from "node:fs";
 import path from "node:path";
 import type { Reporter, TestCase } from "vitest/node";
 
+const errorClasses = new Set(["Error", "AssertionError", "TypeError", "RangeError", "ReferenceError", "SyntaxError", "EvalError", "URIError", "AggregateError"]);
+
 // Lists every test that CI retried (smarty-dev#7651), on stdout and in the GitHub step summary. A retried test
 // passed only on a later attempt or failed every attempt: either way it belongs on #7651 until fixed.
 export default class CiRetryReporter implements Reporter {
@@ -15,14 +17,29 @@ export default class CiRetryReporter implements Reporter {
     // Vitest 4 retains errors in attempt order, including when a later retry passes.
     const error = result.errors?.[0];
     if (error) {
-      const root = process.cwd().replace(/\\/g, "/") + "/";
-      const location = error.stack?.split("\n").map(line => {
-        const normalized = line.replace(/\\/g, "/").trim();
-        if (!normalized.startsWith("at ") || !normalized.includes(root) || normalized.includes("/node_modules/")) return undefined;
-        return normalized.slice(normalized.lastIndexOf(root) + root.length).match(/^([^()\r\n]+:\d+:\d+)\)?$/)?.[1];
-      }).find(location => location !== undefined && location.length <= 300);
-      // Error messages can contain credentials or private records. Emit only the class and source location.
-      if (location) detail = `  first failure (${error.name ?? "Error"}): ${location}`;
+      const name = typeof error.name === "string" && errorClasses.has(error.name) ? error.name : "Error";
+      const safeRelative = (file: string): boolean => /^[A-Za-z0-9._\/-]{1,200}$/.test(file) &&
+        !path.isAbsolute(file) && !file.split("/").includes("..");
+      try {
+        const root = fs.realpathSync(process.cwd());
+        for (const line of typeof error.stack === "string" ? error.stack.split("\n") : []) {
+          const normalized = line.replace(/\\/g, "/").trim();
+          if (!normalized.startsWith("at ")) continue;
+          const location = normalized.endsWith(")") ? normalized.slice(normalized.lastIndexOf("(") + 1, -1) : normalized.slice(3);
+          const frame = location.match(/^([^()\r\n]+):([0-9]{1,7}):([0-9]{1,7})$/);
+          if (!frame || !path.isAbsolute(frame[1]!) || frame[1]!.split("/").includes("..")) continue;
+          const candidate = path.relative(process.cwd(), frame[1]!).replace(/\\/g, "/");
+          if (!safeRelative(candidate) || candidate.split("/").includes("node_modules")) continue;
+          const resolved = path.resolve(root, candidate);
+          if (!fs.existsSync(resolved)) continue;
+          const file = fs.realpathSync(resolved);
+          const relative = path.relative(root, file).replace(/\\/g, "/");
+          if (!safeRelative(relative) || relative.split("/").includes("node_modules") || !fs.statSync(file).isFile()) continue;
+          // Error metadata is untrusted: emit only a validated class and an existing in-root file location.
+          detail = `  first failure (${name}): ${relative}:${frame[2]}:${frame[3]}`;
+          break;
+        }
+      } catch { /* Unverifiable source location: keep the unavailable diagnostic. */ }
     }
     const moduleId = path.relative(process.cwd(), test.module.moduleId).replace(/\\/g, "/");
     this.#retried.push(`${moduleId} > ${test.fullName} (retried ${retries}x, final ${result.state})\n${detail}`);

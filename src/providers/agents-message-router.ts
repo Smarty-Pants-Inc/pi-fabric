@@ -164,9 +164,14 @@ export class AgentMessageRouter {
       ? new LeaseResolutionRequired(id, error, pin) : error;
   }
 
-  async #resolveRoutingLease(id: string): Promise<boolean | undefined> {
-    try { return await this.participants.resolveRoutingLease?.(id); }
-    catch (error) {
+  async #resolveRoutingLease(id: string, signal?: AbortSignal): Promise<boolean | undefined> {
+    signal?.throwIfAborted();
+    try {
+      const resolved = await this.participants.resolveRoutingLease?.(id, signal);
+      signal?.throwIfAborted();
+      return resolved;
+    } catch (error) {
+      signal?.throwIfAborted();
       if (error instanceof FabricParticipantStaleError) {
         throw new LeaseResolutionStale(error.targetId, error.lapsedMs, error.idempotencyKey);
       }
@@ -192,14 +197,22 @@ export class AgentMessageRouter {
       : this.participants.writeStalled?.()?.message;
   }
 
-  async #withDirectory<T>(operation: (authority?: FabricParticipantInfo) => Promise<T>, id?: string, recoverLease = true): Promise<T> {
+  async #withDirectory<T>(operation: (authority?: FabricParticipantInfo) => Promise<T>, id?: string, recoverLease = true, signal?: AbortSignal): Promise<T> {
+    signal?.throwIfAborted();
     let authority: FabricParticipantInfo | undefined;
     const resolveLease = async (target: string): Promise<boolean | undefined> => {
-      // Pin raw validated presence before EVERY resolution wait, including bootstrap/overdue-view recovery.
-      // This is only a refusal fence; canonical directory refresh still controls admission below.
-      const known = this.participants.lastKnown?.(target)?.participant;
-      if (known?.kind === "root" && known.remoteHost !== undefined) authority ??= known;
-      return this.#resolveRoutingLease(target);
+      if (!this.participants.resolveRoutingLease) return undefined;
+      // Bootstrap/late-read recovery must pin before waiting, even while the view is unavailable.
+      // If this raw refusal-fence read fails, skip the wait, but never skip the canonical probe.
+      try {
+        const known = this.participants.lastKnown?.(target)?.participant;
+        if (known?.kind === "root" && known.remoteHost !== undefined) authority ??= known;
+      } catch {
+        // No wait took place, so no pre-wait authority was selected. The canonical refresh
+        // below may recover; normal routing still revalidates its cached/fresh owner fence.
+        return undefined;
+      }
+      return this.#resolveRoutingLease(target, signal);
     };
     const reason = this.#directoryUnavailable();
     if (reason) {
@@ -209,9 +222,11 @@ export class AgentMessageRouter {
     try {
       return await operation(authority);
     } catch (error) {
+      signal?.throwIfAborted();
       // Lease recovery is pre-publication only. A failed ACK is never replayed here.
       if (recoverLease && error instanceof LeaseResolutionRequired && this.participants.resolveRoutingLease) {
-        if (await resolveLease(error.targetId)) return operation(error.authority ?? authority);
+        // The canonical unknown classification already captured the pre-wait authority.
+        if (await this.#resolveRoutingLease(error.targetId, signal)) return operation(error.authority ?? authority);
         throw error.original;
       }
       // A read can fail after the preflight. Retry resolution once, never delivery after
@@ -403,8 +418,9 @@ export class AgentMessageRouter {
       result = provenLocal
         ? await this.#route(id, message, data, kind, context, options, true)
         : await this.#withDurableRecovery(id, recovering =>
-          this.#withDirectory((authority) => this.#route(id, message, data, kind, context, options, false, !recovering, authority), id, !recovering));
+          this.#withDirectory((authority) => this.#route(id, message, data, kind, context, options, false, !recovering, authority), id, !recovering, context?.signal));
     } catch (error) {
+      context?.signal?.throwIfAborted();
       const reason = error instanceof Error ? error.message : String(error);
       const root = this.actorManager.mesh?.root ?? this.residency?.options.config.meshRoot;
       // Only pre-publication/local definite refusals. Remote ACK outcomes belong to control.
@@ -569,7 +585,7 @@ export class AgentMessageRouter {
         throw this.participants.writeStalled?.() ?? this.#unknownParticipant(this.mainAgent.id, "Fabric Main participant");
       }
       if (participant.stale && this.participants.resolveRoutingLease) {
-        if (!await this.#resolveRoutingLease(participant.id)) throw this.#unknownParticipant(participant.id);
+        if (!await this.#resolveRoutingLease(participant.id, context?.signal)) throw this.#unknownParticipant(participant.id);
         const refreshed = this.#rootRouteSnapshot(participant.id, participant);
         if (!refreshed || refreshed.ownerHostId !== participant.ownerHostId || refreshed.ownerIdentityId !== participant.ownerIdentityId) {
           throw new FabricRouteAuthorityError(participant.id);

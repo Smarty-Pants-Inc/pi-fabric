@@ -27,7 +27,8 @@ import { FabricControlPlane } from "../src/topology/control-plane.js";
 import { BRIDGE_LEASE_MS, MeshBridge, StoreBridgeSide } from "../src/mesh/bridge.js";
 import { MeshStore, type MeshEvent, type MeshIdentity } from "../src/mesh/store.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
-import { FabricPeerLeaseStaleError } from "../src/agents/peer-lease-stale.js";
+import { FabricPeerLeaseStaleError, PEER_LEASE_WAIT_MS } from "../src/agents/peer-lease-stale.js";
+import type { FabricInvocationContext } from "../src/protocol.js";
 
 const realSetTimeout = globalThis.setTimeout;
 const realNow = Date.now.bind(Date);
@@ -132,7 +133,118 @@ const settle = <T>(promise: Promise<T>) => {
   return state;
 };
 
+// Keep reason: #1136 cancellation at the pre-publication trust boundary. Observe genuine
+// fs watches/timers, not fake notifications or clocks; no extra polling drives these checks.
+const observeLeaseWait = (root: string, controller: AbortController, abortDuringArm = false) => {
+  const realWatch = fs.watch;
+  const watchers: fs.FSWatcher[] = [];
+  const timers: Array<ReturnType<typeof setTimeout>> = [];
+  let armed!: () => void;
+  const ready = new Promise<void>(resolve => { armed = resolve; });
+  vi.spyOn(fs, "watch").mockImplementation(((...args: unknown[]) => {
+    const watcher = Reflect.apply(realWatch, fs, args) as fs.FSWatcher;
+    if (String(args[0]) === root || String(args[0]).startsWith(root + path.sep)) {
+      vi.spyOn(watcher, "close");
+      watchers.push(watcher);
+      if (abortDuringArm && !controller.signal.aborted) controller.abort("cancel during watch setup");
+    }
+    return watcher;
+  }) as typeof fs.watch);
+  vi.spyOn(globalThis, "setTimeout").mockImplementation(((callback: (...args: any[]) => void, delay?: number, ...args: any[]) => {
+    const timer = realSetTimeout(callback, delay, ...args);
+    if (delay === PEER_LEASE_WAIT_MS) { timers.push(timer); armed(); }
+    return timer;
+  }) as typeof setTimeout);
+  const cleared = vi.spyOn(globalThis, "clearTimeout");
+  const added = vi.spyOn(controller.signal, "addEventListener");
+  const removed = vi.spyOn(controller.signal, "removeEventListener");
+  const assertClean = () => {
+    for (const watcher of watchers) expect(watcher.close).toHaveBeenCalledOnce();
+    for (const timer of timers) expect(cleared).toHaveBeenCalledWith(timer);
+    for (const [event, listener] of added.mock.calls) {
+      if (event === "abort") expect(removed).toHaveBeenCalledWith("abort", listener);
+    }
+  };
+  return { ready, watchers, timers, assertClean };
+};
+const invocation = (signal: AbortSignal) => ({ signal } as FabricInvocationContext);
+
 describe("remote mirror lease wait (smarty-dev#11703)", () => {
+  it.each([
+    ["followUp", "bootstrap"], ["steer", "lookup"], ["followUp", "late-read"],
+  ] as const)("%s cancels the %s mirror wait immediately, releasing watches/timer without publication", async (kind, entry) => {
+    const w = await world();
+    if (entry !== "bootstrap") await w.hubDirectory.refreshRoutingView();
+    if (entry === "late-read") vi.spyOn(w.hubDirectory, "get").mockImplementationOnce(() => { throw new Error("late routing read"); });
+    const controller = new AbortController();
+    const resources = observeLeaseWait(w.hub.root, controller);
+    const pending = w.sending.routeMessage(w.target.identity.id, "cancel before publication", undefined, kind, invocation(controller.signal));
+    const state = settle(pending);
+    await resources.ready;
+    expect(resources.watchers.length).toBeGreaterThan(0);
+    expect(resources.timers).toHaveLength(1);
+    expect(state.done).toBeUndefined();
+    const reason = { cancelled: entry }; // Identity must survive every wrapper, not just Error.message.
+    controller.abort(reason);
+    await expect(pending).rejects.toBe(reason);
+    resources.assertClean();
+    expect(on(w.hub, "fabric.control.command")).toEqual([]);
+    expect(w.sendMessage).not.toHaveBeenCalled();
+  }, 20_000);
+
+  it.each(["preaborted", "watch-setup"] as const)("%s cancellation never leaves an armed watcher/timer or publishes", async entry => {
+    const w = await world();
+    const controller = new AbortController();
+    if (entry === "preaborted") controller.abort("already cancelled");
+    const resources = observeLeaseWait(w.hub.root, controller, entry === "watch-setup");
+    const pending = w.sending.routeMessage(w.target.identity.id, "never arm after cancellation", undefined, "steer", invocation(controller.signal));
+    const error = await pending.catch((reason: unknown) => reason);
+    expect(error).toBe(controller.signal.reason);
+    resources.assertClean();
+    expect(resources.timers).toEqual([]);
+    if (entry === "preaborted") expect(resources.watchers).toEqual([]);
+    else expect(resources.watchers.length).toBeGreaterThan(0);
+    expect(on(w.hub, "fabric.control.command")).toEqual([]);
+    expect(w.sendMessage).not.toHaveBeenCalled();
+  }, 20_000);
+
+  it.each([
+    ["bootstrap", false], ["bootstrap", true],
+    ["retained-lastKnown", false], ["retained-lastKnown", true],
+    ["diagnostic-lastKnown", false], ["diagnostic-lastKnown", true],
+  ] as const)("%s recovers through one canonical probe with resolver=%s, never waiting on an unreadable pin", async (entry, hasResolver) => {
+    const w = await world();
+    let failed = true, reads = 0;
+    const pinFailure = new Error("lastKnown unreadable");
+    const resolver = vi.fn(w.hubDirectory.resolveRoutingLease.bind(w.hubDirectory));
+    const probe = vi.fn(async () => { await w.hubDirectory.refreshRoutingView(); failed = false; });
+    const source = {
+      get: (id: string, now?: number, options?: { fresh?: boolean }) => failed ? undefined : w.hubDirectory.get(id, now, options),
+      lastKnown: () => {
+        if (failed && (entry !== "diagnostic-lastKnown" || ++reads >= 3)) throw pinFailure;
+        return undefined;
+      },
+      routingUnavailable: () => entry === "bootstrap" && failed ? "no confirmed view" : undefined,
+      refreshRoutingView: probe, scheduleRefresh: () => undefined,
+      ...(hasResolver ? { resolveRoutingLease: resolver } : {}),
+    };
+    const router = new AgentMessageRouter(w.sending.manager, w.sending.actorManager, w.sending.mainAgent,
+      source, w.sender, binding => binding);
+    const target = entry === "diagnostic-lastKnown" ? sid("absent") : w.local.identity.id;
+    const pending = router.routeMessage(target, "recover canonical view", undefined, "followUp");
+    if (entry === "diagnostic-lastKnown") {
+      await expect(pending).rejects.toThrow(`Unknown Fabric participant: ${target}`);
+      expect(on(w.hub, "fabric.control.command")).toEqual([]);
+    } else {
+      await expect(pending).resolves.toMatchObject({ acknowledged: true, messageId: "local-delivery" });
+      expect(w.localHandler).toHaveBeenCalledOnce();
+      expect(on(w.hub, "fabric.control.command")).toHaveLength(1);
+    }
+    expect(probe).toHaveBeenCalledOnce();
+    expect(resolver).not.toHaveBeenCalled(); // Pin failed or no resolver: no selected wait authority.
+    expect(w.sendMessage).not.toHaveBeenCalled();
+  }, 20_000);
+
   it.each(["followUp", "steer"] as const)("%s waits once for the bridge renewal, then delivers exactly once through the real receiving handler", async kind => {
     const w = await world();
     const started = performance.now();

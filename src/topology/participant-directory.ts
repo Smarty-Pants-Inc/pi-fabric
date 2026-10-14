@@ -1615,9 +1615,10 @@ export class ParticipantDirectory implements FabricParticipantSource {
   }
 
   /** Recovery is resolution-only: no mesh write, ownership transfer, or delivery retry here. */
-  async resolveRoutingLease(id: string): Promise<boolean> {
+  async resolveRoutingLease(id: string, signal?: AbortSignal): Promise<boolean> {
+    signal?.throwIfAborted();
     const record = this.#routingOwner(id);
-    if (!record) return this.#resolveRemoteMirrorLease(id); // Unknown ids retain the ordinary resolver.
+    if (!record) return this.#resolveRemoteMirrorLease(id, signal); // Unknown ids retain the ordinary resolver.
     const { participant, owner } = record;
     const options = this.options.routingLease ?? {};
     const now = (options.now ?? Date.now)();
@@ -1680,7 +1681,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
   /** Resolution only: one notification-driven wait (no polling) of at most PEER_LEASE_WAIT_MS for
    * an EXPIRED validated remote mirror. true lets the caller re-run ordinary fresh routing; it never
    * routes the expired mirror. The watcher is armed before the re-read so a renewal cannot be lost. */
-  async #resolveRemoteMirrorLease(id: string): Promise<boolean> {
+  async #resolveRemoteMirrorLease(id: string, signal?: AbortSignal): Promise<boolean> {
+    signal?.throwIfAborted();
     const initial = this.#remoteMirrorLease(id);
     if (initial.state === "none" || initial.state === "live") return true;
     if (initial.state === "ended") return false;
@@ -1698,12 +1700,14 @@ export class ParticipantDirectory implements FabricParticipantSource {
       const settle = (outcome: () => boolean): void => {
         if (settled) return;
         settled = true;
+        signal?.removeEventListener("abort", abort);
         if (timer !== undefined) clearTimeout(timer);
         timer = undefined;
         try { unwatch?.(); } catch { /* best effort */ }
         unwatch = undefined;
         try { resolve(outcome()); } catch (error) { reject(error); }
       };
+      const abort = (): void => settle(() => { throw signal!.reason; });
       const stale = (current: { expiresAt: number }): never => {
         throw new FabricPeerLeaseStaleError(id, initial.remoteHost, Math.max(0, now() - current.expiresAt));
       };
@@ -1711,6 +1715,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       // ordinary routing. A different valid owner/link gets a typed stale refusal; removed,
       // invalid or ended mirrors keep the ordinary refusal (R1: never redirect the retry).
       const decide = (final: boolean): boolean | undefined => {
+        signal?.throwIfAborted();
         const current = this.#remoteMirrorLease(id);
         if (current.state === "none" || current.state === "ended") return false;
         if (!sameOwner(current)) return stale(initial);
@@ -1725,16 +1730,24 @@ export class ParticipantDirectory implements FabricParticipantSource {
         } catch (error) { settle(() => { throw error; }); }
       };
       const timeout = (): void => settle(() => decide(true) ?? stale(initial));
+      signal?.addEventListener("abort", abort, { once: true });
+      if (signal?.aborted) abort();
+      if (settled) return;
       try {
-        unwatch = watchBridgeStore(this.mesh.root, check, () => {
+        const stop = watchBridgeStore(this.mesh.root, check, () => {
           // Notifications unavailable: no polling fallback; one canonical read, else refuse typed.
           settle(() => decide(true) ?? stale(initial));
         });
+        // Arming can synchronously settle (abort, renewal or watch failure) before stop exists.
+        if (settled) { stop(); return; }
+        unwatch = stop;
       } catch {
         settle(() => decide(true) ?? stale(initial));
         return;
       }
-      timer = setTimeout(timeout, waitMs);
+      const armedTimer = setTimeout(timeout, waitMs);
+      if (settled) { clearTimeout(armedTimer); return; }
+      timer = armedTimer;
       check();
     });
   }

@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agents/manager.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
-import { TaskCgroupStopUnconfirmedError, TaskScopeAdmissionError } from "../src/agents/transports/task-cgroup.js";
+import { stopTaskCgroup, TaskCgroupStopUnconfirmedError, TaskScopeAdmissionError } from "../src/agents/transports/task-cgroup.js";
 import type { AgentHandleInfo, AgentTransportHandle } from "../src/agents/types.js";
 import { taskCgroupUnavailableReason } from "./helpers/task-cgroup-capability.js";
 
@@ -164,6 +164,82 @@ const expectDetachedGrandchild = (report: Report, procs: Proc[]): void => {
   expect(groupOnly.sid).toBe(worker.sid);
   expect(procs.length).toBeGreaterThanOrEqual(6);
 };
+
+// Stop-observation mechanism: real fs.watch and a recording cgroup.kill file, not a kernel cgroup.
+// No process is signalled. Trust-boundary regression: only populated=0 can confirm subtree stop;
+// unchanged populated=1, malformed receipts and watcher failure must keep typed custody debt.
+describe("owned cgroup.events stop confirmation (smarty-dev#8257)", () => {
+  const fds: number[] = [];
+  afterEach(() => { for (const fd of fds.splice(0)) fs.closeSync(fd); });
+  const fixture = () => {
+    const root = temp("events");
+    fs.writeFileSync(path.join(root, "cgroup.procs"), "424242\n");
+    fs.writeFileSync(path.join(root, "cgroup.kill"), "");
+    fs.writeFileSync(path.join(root, "cgroup.events"), "populated 1\nfrozen 0\n");
+    const fd = fs.openSync(root, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY); fds.push(fd);
+    const boundary = { relative: "/fixture/fabric-task-events.scope", fd, memoryMax: GIB };
+    // Retain the old caller's delay as a negative-control trap: an event wait never calls it.
+    const delay = vi.fn(async () => { throw new Error("membership polling delay invoked"); });
+    return { root, boundary, delay, options: { termMs: 30, killMs: 100, delay } };
+  };
+
+  it("confirms the populated-0 event without a membership polling delay", async () => {
+    const f = fixture();
+    const watch = fs.watch;
+    const watched: string[] = [];
+    vi.spyOn(fs, "watch").mockImplementation(((...args: Parameters<typeof fs.watch>) => {
+      watched.push(String(args[0]));
+      const watcher = watch(...args);
+      setImmediate(() => fs.writeFileSync(path.join(f.root, "cgroup.events"), "populated 0\nfrozen 0\n"));
+      return watcher;
+    }) as typeof fs.watch);
+    await expect(stopTaskCgroup(f.boundary, f.options)).resolves.toBe("cgroup.kill");
+    expect(watched).toEqual([`/proc/self/fd/${f.boundary.fd}/cgroup.events`]);
+    expect(f.delay).not.toHaveBeenCalled();
+  });
+
+  it("fences an already-empty receipt and closes the watcher without waiting for another event", async () => {
+    const f = fixture();
+    fs.writeFileSync(path.join(f.root, "cgroup.events"), "populated 0\nfrozen 0\n");
+    const watch = vi.spyOn(fs, "watch");
+    await expect(stopTaskCgroup(f.boundary, f.options)).resolves.toBe("cgroup.kill");
+    expect(watch).toHaveBeenCalledOnce();
+    expect(f.delay).not.toHaveBeenCalled();
+  });
+
+  it("a populated scope at the bounded deadline fails typed with exact remaining pids, without polling", async () => {
+    const f = fixture();
+    f.options.killMs = 20;
+    const outcome = await stopTaskCgroup(f.boundary, f.options).catch(error => error);
+    expect(outcome).toBeInstanceOf(TaskCgroupStopUnconfirmedError);
+    expect(outcome.pids).toEqual([424242]);
+    expect(outcome.message).toContain("did not empty");
+    expect(f.delay).not.toHaveBeenCalled();
+  });
+
+  it("an empty cgroup.procs cannot override a populated subtree receipt at the deadline", async () => {
+    const f = fixture();
+    f.options.killMs = 20;
+    fs.writeFileSync(path.join(f.root, "cgroup.procs"), ""); // descendants may populate nested cgroups
+    await expect(stopTaskCgroup(f.boundary, f.options)).rejects.toBeInstanceOf(TaskCgroupStopUnconfirmedError);
+    expect(f.delay).not.toHaveBeenCalled();
+  });
+
+  it("unreadable populated state and watcher errors fail closed", async () => {
+    const f = fixture();
+    fs.writeFileSync(path.join(f.root, "cgroup.events"), "frozen 0\n");
+    await expect(stopTaskCgroup(f.boundary, f.options)).rejects.toThrow(/populated.*unreadable/);
+    fs.writeFileSync(path.join(f.root, "cgroup.events"), "populated 1\n");
+    const watch = fs.watch;
+    vi.spyOn(fs, "watch").mockImplementation(((...args: Parameters<typeof fs.watch>) => {
+      const watcher = watch(...args);
+      setImmediate(() => watcher.emit("error", Object.assign(new Error("event watch failed"), { code: "EIO" })));
+      return watcher;
+    }) as typeof fs.watch);
+    await expect(stopTaskCgroup(f.boundary, f.options)).rejects.toThrow(/EIO/);
+    expect(f.delay).not.toHaveBeenCalled();
+  });
+});
 
 describe.skipIf(skipReason !== undefined && !required)("capped task cgroup on a real systemd --user (smarty-dev#8257)", () => {
   it("AgentManager task: default 24GiB scope, public cgroup receipt, and stop leaves zero live pids", async () => {

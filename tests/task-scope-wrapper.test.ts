@@ -35,6 +35,7 @@ const fixture = () => {
   return { root, real, wrapper, run };
 };
 /** The command prints its pid and unified cgroup: proves in-place exec (same PID) and the same leaf. */
+const USER_UNIT_RULE = /smarty-dev#8257: user-manager units must not escape task memory cap\/agents\.stop/;
 const PROBE = ["/bin/sh", "-c", 'echo "$$"; cat /proc/self/cgroup'];
 
 describe.skipIf(!ownCgroup)("task-local systemd-run wrapper (smarty-dev#8257)", () => {
@@ -88,10 +89,15 @@ describe.skipIf(!ownCgroup)("task-local systemd-run wrapper (smarty-dev#8257)", 
 
   it.each([
     [["--version"]],
-    [["--user", "--unit=svc", "sleep", "1"]], // service mode, not a scope
+    [["--user", "--version"]], // informational: systemd-run exits before creating any unit
+    [["--user", "--help"]],
+    [["--unit=svc", "sleep", "1"]], // system manager service (no --user)
     [["--scope", "--", "true"]], // system manager scope (no --user)
-    [["--user", "--no-such-option", "--", "true"]], // unknown option outside scope mode
-  ])("passes non `--user --scope` modes %j to the real executable unchanged", (args) => {
+    [["--scope", "--", "sh", "-c", "echo --user"]], // --user only in command text
+    [["--unit=svc", "sh", "--user"]], // --user after the first non-option is command text
+    [["--description", "--user", "--scope", "--", "true"]], // --user is the description VALUE
+    [["--description=--user", "--", "true"]],
+  ])("passes non-user modes %j to the real executable unchanged", (args) => {
     const f = fixture();
     const result = f.run(args);
     expect(result.real).toEqual(args);
@@ -119,8 +125,133 @@ describe.skipIf(!ownCgroup)("task-local systemd-run wrapper (smarty-dev#8257)", 
     expect(result.status).toBe(1); // unsupported cluster refused, not a real scope
     expect(result.real).toBeUndefined();
     const ordinary = f.run(["--user", cluster, "value", "--", "true"]);
-    expect(ordinary.status).toBe(42); // the same non-scope mode still passes through
-    expect(ordinary.real).toEqual(["--user", cluster, "value", "--", "true"]);
+    expect(ordinary.status).toBe(1); // a user-manager service is refused, never dispatched
+    expect(ordinary.real).toBeUndefined();
+    expect(ordinary.stderr).toMatch(USER_UNIT_RULE);
+  });
+
+  // Astra P2: inside the capped leaf any `--user` mode other than `--scope` (service, timer, path,
+  // socket, shell, unknown) would start a user-manager unit outside the task memory cap and outside
+  // agents.stop. It is refused by name and never reaches the real binary.
+  it.each([
+    [["--user", "--unit=svc", "sleep", "1"]], // service via --unit=
+    [["--user", "-u", "svc", "sleep", "1"]],
+    [["--user", "--on-active=30", "true"]], // timer
+    [["--user", "--on-calendar", "hourly", "true"]],
+    [["--user", "--path-property=PathExists=/tmp/x", "true"]], // path unit
+    [["--user", "true"]], // ordinary transient service
+    [["--user", "-S"]], // shell service
+    [["--user", "-qt", "--", "true"]], // cluster without a value
+    [["--user", "--no-such-option", "--", "true"]], // unknown option: never guessed through
+    [["-q", "--user", "--", "true"]], // --user after another option
+    [["--user", "-qpp", "--scope", "--", "true"]], // value attached in the cluster: must not hide --scope
+  ])("inside the leaf refuses user-manager non-scope mode %j without real dispatch", (args) => {
+    const f = fixture();
+    const result = f.run(args);
+    expect(result.status).toBe(1);
+    expect(result.real).toBeUndefined();
+    expect(result.stderr).toMatch(/fabric task systemd-run/);
+    if (!args.includes("--scope")) expect(result.stderr).toMatch(USER_UNIT_RULE);
+  });
+
+  // LEAD getopt parity: like getopt_long, a unique long-option prefix resolves to its option (exact
+  // name wins) and options may come in any order; `--us --scope` and `--desc x --user --scope` are the
+  // in-place scope mode (same PID, same leaf), never the real binary.
+  it.each([
+    [["--us", "--scope", "--"]],
+    [["--desc", "x", "--user", "--scope", "--"]],
+    [["--user", "--sco", "--"]],
+    [["--desc=x", "--sc", "--qui", "--prop=MemoryMax=infinity", "--us"]], // no `--` separator
+    [["--pr", "MemorySwapMax=0", "--us", "--un", "esc.scope", "--scop", "--"]],
+  ])("resolves unique abbreviations %j and runs `--user --scope` in place", (options) => {
+    const f = fixture();
+    const result = f.run([...options, ...PROBE]);
+    expect(result.status, result.stderr).toBe(0);
+    const [pid, cgroup] = result.stdout.trim().split("\n");
+    expect(Number(pid)).toBe(result.pid);
+    expect(cgroup).toBe(`0::${ownCgroup}`);
+    expect(result.real).toBeUndefined();
+  });
+
+  it.each([
+    [["--us", "--", "true"]], // abbreviated --user without --scope: a user-manager service
+    [["--desc", "x", "--us", "true"]],
+    [["--us", "--on-cal", "hourly", "true"]],
+  ])("inside the leaf refuses abbreviated user-manager non-scope mode %j", (args) => {
+    const f = fixture();
+    const result = f.run(args);
+    expect(result.status).toBe(1);
+    expect(result.real).toBeUndefined();
+    expect(result.stderr).toMatch(USER_UNIT_RULE);
+  });
+
+  // Ambiguous or unknown long options, or an unknown option that may take a value, make the scan
+  // unprovable: fail closed inside the leaf, never forwarded.
+  it.each([
+    [["--u", "--scope", "--", "true"]], // ambiguous: --user --unit --uid
+    [["--user", "--s", "--", "true"]], // ambiguous: --scope --slice ...
+    [["--u", "--", "true"]],
+    [["--no-such", "--user", "--scope", "--", "true"]], // unknown long option
+    [["--userx", "--scope", "--", "true"]],
+    [["-X", "value", "--user", "--scope", "--", "true"]], // unknown short option with a value
+    [["--quiet=1", "--user", "--scope", "--", "true"]], // malformed known flag
+    [["--us=1", "--scope", "--", "true"]], // no-arg flag given a value
+  ])("inside the leaf refuses unprovable option scan %j without real dispatch", (args) => {
+    const f = fixture();
+    const result = f.run(args);
+    expect(result.status).toBe(1);
+    expect(result.real).toBeUndefined();
+    expect(result.stderr).toMatch(/smarty-dev#8257/);
+  });
+
+  it.each([
+    [["--quiet", "--no-block", "--wait", "-rG", "--unit=svc", "true"]], // known no-arg flags, non-user
+    [["--scope", "--", "sh", "--us", "--desc"]], // abbreviations only in command text
+    [["--description", "--us", "--scope", "--", "true"]], // abbreviation only as a value
+    [["-E", "--us", "--scope", "--", "true"]],
+    [["--desc", "--user", "--scope", "--", "true"]], // abbreviated value option: --user is its value
+    [["--desc=--user", "--sco", "--", "true"]],
+    [["--set", "--us", "--wait", "true"]], // --setenv VALUE
+    [["--qui", "--no-b", "--sco", "--", "sh", "--user"]],
+  ])("inside the leaf passes provable non-user mode %j unchanged", (args) => {
+    const f = fixture();
+    const result = f.run(args);
+    expect(result.real).toEqual(args);
+    expect(result.status).toBe(42);
+  });
+
+  it("abbreviations in command text keep `--user --scope` in place", () => {
+    const f = fixture();
+    const result = f.run(["--user", "--scope", "--", ...PROBE, "--desc", "x", "--us"]);
+    expect(result.status, result.stderr).toBe(0);
+    expect(Number(result.stdout.trim().split("\n")[0])).toBe(result.pid);
+    expect(result.real).toBeUndefined();
+  });
+
+  it("flags in command text are not options: `--user --scope -- cmd --unit=svc` still runs in place", () => {
+    const f = fixture();
+    const result = f.run(["--user", "--scope", "--", ...PROBE, "--unit=svc", "--user"]);
+    expect(result.status, result.stderr).toBe(0);
+    const [pid, cgroup] = result.stdout.trim().split("\n");
+    expect(Number(pid)).toBe(result.pid);
+    expect(cgroup).toBe(`0::${ownCgroup}`);
+    expect(result.real).toBeUndefined();
+  });
+
+  it.each([
+    [["--user", "--unit=svc", "sleep", "1"]],
+    [["--user", "--on-active=30", "true"]],
+    [["--user", "true"]],
+    [["--desc", "x", "--user", "--scope", "--", "true"]], // abbreviated: real getopt semantics
+    [["--us", "--", "true"]],
+    [["--us", "--scope", "--", "true"]],
+    [["--u", "--scope", "--", "true"]], // ambiguous: the real binary reports it
+  ])("outside its own leaf user-manager mode %j keeps real semantics", (args) => {
+    const f = fixture();
+    fs.writeFileSync(f.wrapper, taskScopeWrapperSource(f.real, `${ownCgroup}-not-this-leaf/fabric-task-x.scope`, CAP), { mode: 0o700 });
+    const result = f.run(args);
+    expect(result.real).toEqual(args);
+    expect(result.status).toBe(42);
   });
 
   it("outside its own leaf it keeps real semantics: `--user --scope` goes to the real binary unchanged", () => {

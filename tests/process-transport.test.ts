@@ -520,6 +520,63 @@ describe.skipIf(process.platform !== "linux" || !isV2)("ProcessTransport task me
     expect(console.warn).not.toHaveBeenCalled();
   });
 
+  // Astra P1 counterprobe: systemd-run itself exiting nonzero BEFORE the admission marker is a capped
+  // admission failure, never permission to replay the task uncapped. Exit codes/diagnostics never prove
+  // a missing executable.
+  it.each([
+    [1, "Failed to start transient scope unit: Access denied"],
+    [203, "Failed to execute: No such file or directory"],
+    [127, "systemd-run: command not found"],
+  ])("astra-p1: systemd-run exit %i before the marker fails typed with no uncapped replay", async (code, diagnostic) => {
+    const f = await fixture("live");
+    fs.writeFileSync(path.join(f.root, "systemd-run"),
+      `#!/bin/sh\nprintf '%s\\n' "$@" >> "${f.root}/scope-args"\necho '${diagnostic}' >&2\nexit ${code}\n`, { mode: 0o700 });
+    await refused(new ProcessTransport(undefined, undefined, undefined, 24 * GIB), f.request, f.root);
+    expect(console.warn).not.toHaveBeenCalled(); // no "launching worker normally" fallback
+    expect(scopeArgs(f.root)!.filter(arg => arg.startsWith("--unit="))).toHaveLength(1); // one attempt, no replay
+  });
+
+  it("astra-p1 counterexample: a non-executable systemd-run at lookup is pre-admission missing (direct launch, never invoked)", async () => {
+    const f = await fixture("live");
+    fs.chmodSync(path.join(f.root, "systemd-run"), 0o600);
+    const handle = await launch(new ProcessTransport(undefined, undefined, undefined, 24 * GIB), f.request, f.root);
+    expect(scopeArgs(f.root)).toBeUndefined();
+    expect(handle.cgroup).toBeUndefined();
+  });
+
+  it("astra-p1: spawnDetached capped EACCES is typed; the same uncapped scope keeps legacy fallback", async () => {
+    const f = await fixture("live");
+    fs.chmodSync(path.join(f.root, "systemd-run"), 0o600);
+    const warn = vi.fn();
+    const executable = path.join(f.root, "systemd-run");
+    const outcome = await spawnDetached(f.worker, [], f.root, undefined, undefined, { executable, slice: "app.slice", warn, memoryMaxBytes: GIB })
+      .then(async handle => { await handle.stop(); return handle; }, (error: unknown) => error);
+    expect(outcome).toBeInstanceOf(TaskScopeAdmissionError);
+    expect(warn).not.toHaveBeenCalled();
+    await new Promise(resolve => setTimeout(resolve, 200));
+    expect(fs.existsSync(path.join(f.root, "started"))).toBe(false);
+    const handle = await spawnDetached(f.worker, [], f.root, undefined, undefined, { executable, slice: "batch.slice", warn });
+    try { expect(await started(f.root)).toBe(handle.pid); expect(warn).toHaveBeenCalledOnce(); expect(handle.cgroup).toBeUndefined(); }
+    finally { await handle.stop(); await handle.waitForClose(); }
+  });
+
+  it("astra-p1 counterexample: a capped executable that disappeared after lookup (ENOENT) keeps the warned direct fallback", async () => {
+    const f = await fixture("live");
+    const warn = vi.fn();
+    const handle = await spawnDetached(f.worker, [], f.root, undefined, undefined,
+      { executable: path.join(f.root, "vanished-systemd-run"), slice: "app.slice", warn, memoryMaxBytes: GIB });
+    try { expect(await started(f.root)).toBe(handle.pid); expect(warn).toHaveBeenCalledOnce(); expect(handle.cgroup).toBeUndefined(); }
+    finally { await handle.stop(); await handle.waitForClose(); }
+  });
+
+  it("astra-p1 counterexample: no user bus stays pre-admission ineligible even when systemd-run would fail", async () => {
+    const f = await fixture("none");
+    fs.writeFileSync(path.join(f.root, "systemd-run"), `#!/bin/sh\nprintf ran > "${f.root}/scope-args"\nexit 1\n`, { mode: 0o700 });
+    const handle = await launch(new ProcessTransport(undefined, undefined, undefined, 24 * GIB), f.request, f.root);
+    expect(scopeArgs(f.root)).toBeUndefined();
+    expect(handle.cgroup).toBeUndefined();
+  });
+
   it("an omitted cap defaults to 24 GiB on an eligible host; an invalid cap is refused at construction", async () => {
     const f = await fixture("live");
     await refused(new ProcessTransport(), f.request, f.root);

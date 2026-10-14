@@ -163,14 +163,60 @@ const writeKill = (boundary: TaskCgroupBoundary): boolean | undefined => {
   finally { fs.closeSync(fd); }
 };
 
+/** Subscribe before reading populated state, so last exit cannot fall in an admission gap. */
+const waitForTaskCgroupEmpty = async (boundary: TaskCgroupBoundary, ms: number): Promise<boolean> => {
+  let fd: number | undefined;
+  let watcher: fs.FSWatcher | undefined;
+  let deadline: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const events = leaf(boundary, "cgroup.events");
+    fd = fs.openSync(events, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    const buffer = Buffer.alloc(4096);
+    const empty = (): boolean => {
+      let size: number;
+      try { size = fs.readSync(fd!, buffer, 0, buffer.length, 0); }
+      catch (error) {
+        // Kernfs returns ENODEV on a retained file after the empty scope is removed.
+        // cgroup v2 cannot remove a populated subtree. Other errors remain failures.
+        if (errno(error) === "ENODEV") return true;
+        throw error;
+      }
+      const populated = buffer.toString("utf8", 0, size).match(/^populated ([01])$/m)?.[1];
+      if (populated === undefined) throw new Error("Owned task cgroup populated receipt is unreadable");
+      return populated === "0";
+    };
+    return await new Promise<boolean>((resolve, reject) => {
+      let settled = false;
+      const finish = (value: boolean): void => { settled = true; resolve(value); };
+      const changed = (): void => {
+        if (settled) return;
+        try { if (empty()) finish(true); } catch (error) { settled = true; reject(error); }
+      };
+      watcher = fs.watch(events, { persistent: false }, changed);
+      watcher.on("error", error => { settled = true; reject(error); });
+      changed();
+      // One bounded safety deadline, not a membership polling cadence. Re-read once
+      // at the deadline in case the final notification was lost; never infer exit from pids.
+      if (!settled) deadline = setTimeout(() => { changed(); if (!settled) finish(false); }, ms);
+    });
+  } catch (error) {
+    if (gone(error) && taskCgroupPids(boundary) === undefined) return true;
+    throw error;
+  } finally {
+    clearTimeout(deadline);
+    watcher?.close();
+    if (fd !== undefined) fs.closeSync(fd);
+  }
+};
+
 /**
- * Kill the whole owned leaf and confirm every nested cgroup.procs is empty
- * within bounded deadlines. Throws TaskCgroupStopUnconfirmedError naming the
- * remaining pids and cgroup path.
+ * Kill the whole owned leaf and confirm its cgroup.events populated=0 receipt
+ * within bounded deadlines. Membership is read only for signalling or failure
+ * diagnostics. Throws TaskCgroupStopUnconfirmedError naming remaining pids.
  */
 export const stopTaskCgroup = async (
   boundary: TaskCgroupBoundary,
-  options: { termMs: number; killMs: number; delay: () => Promise<void> },
+  options: { termMs: number; killMs: number },
 ): Promise<"cgroup.kill" | "signals" | "removed"> => {
   try { return await stopTaskCgroupOnce(boundary, options); }
   catch (error) {
@@ -184,34 +230,22 @@ export const stopTaskCgroup = async (
 
 const stopTaskCgroupOnce = async (
   boundary: TaskCgroupBoundary,
-  options: { termMs: number; killMs: number; delay: () => Promise<void> },
+  options: { termMs: number; killMs: number },
 ): Promise<"cgroup.kill" | "signals" | "removed"> => {
-  const confirm = async (ms: number, again: () => void): Promise<number[]> => {
-    const deadline = Date.now() + ms;
-    for (;;) {
-      const pids = taskCgroupPids(boundary);
-      if (!pids || pids.length === 0) return [];
-      if (Date.now() >= deadline) return pids;
-      again();
-      await options.delay();
-    }
-  };
-  const fail = (pids: number[], reason: string): never => { throw new TaskCgroupStopUnconfirmedError(boundary.relative, pids, reason); };
+  const fail = (reason: string): never => { throw new TaskCgroupStopUnconfirmedError(boundary.relative, taskCgroupPids(boundary) ?? [], reason); };
   let killed: boolean | undefined;
   try { killed = writeKill(boundary); }
-  catch (error) { fail(taskCgroupPids(boundary) ?? [], `cgroup.kill failed: ${errno(error) ?? String(error)}`); }
+  catch (error) { fail(`cgroup.kill failed: ${errno(error) ?? String(error)}`); }
   if (killed === undefined) return "removed";
   if (killed) {
-    const remaining = await confirm(options.killMs, () => { writeKill(boundary); });
-    if (remaining.length) fail(remaining, "cgroup.kill did not empty the subtree");
+    if (!await waitForTaskCgroupEmpty(boundary, options.killMs)) fail("cgroup.kill did not empty the subtree");
     return "cgroup.kill";
   }
   const initial = taskCgroupPids(boundary);
   if (!initial) return "removed";
   signalMembers(boundary, initial, "SIGTERM");
-  let remaining = await confirm(options.termMs, () => undefined);
-  if (remaining.length === 0) return "signals";
-  remaining = await confirm(options.killMs, () => signalMembers(boundary, taskCgroupPids(boundary) ?? [], "SIGKILL"));
-  if (remaining.length) fail(remaining, "SIGTERM/SIGKILL did not empty the subtree");
+  if (await waitForTaskCgroupEmpty(boundary, options.termMs)) return "signals";
+  signalMembers(boundary, taskCgroupPids(boundary) ?? [], "SIGKILL");
+  if (!await waitForTaskCgroupEmpty(boundary, options.killMs)) fail("SIGTERM/SIGKILL did not empty the subtree");
   return "signals";
 };

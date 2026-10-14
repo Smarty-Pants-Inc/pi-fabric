@@ -861,10 +861,13 @@ To be eligible, a launch must be a task: the worker arguments carry no exact
 These checks only stat or read files; Fabric runs no D-Bus command. The scope goes
 in `agents.processSlice` when root policy sets it, and in `app.slice` otherwise.
 
-Everything else keeps the legacy launch exactly. This covers actors, non-Linux
-hosts, and scrubbed environments such as CI or `smarty-test-env`. Without an
-explicit `processSlice` they do not run `systemd-run`, and an explicit slice still
-gives an uncapped scope as before.
+Pre-admission ineligibility keeps the legacy launch. This covers actors,
+non-Linux hosts, and scrubbed environments such as CI or `smarty-test-env`.
+Without an explicit `processSlice` they do not run `systemd-run`, and an explicit
+slice still gives an uncapped scope as before. A backend executable proven
+missing also permits legacy launch. Once capped admission starts, a scope
+rejection, failed cap request, timeout or unverified receipt raises
+`TaskScopeAdmissionError`; the task is never replayed uncapped.
 
 Task environments drop inherited `FABRIC_TASK_MEMORY_MAX`,
 `FABRIC_TASK_CGROUP` and `FABRIC_TASK_SYSTEMD_RUN_WRAPPER`. The launcher
@@ -896,10 +899,20 @@ self-contained POSIX `sh` script, so it needs no Node or Bun features.
   - Any other option or property in this mode (`--slice`, `--setenv`,
     `--machine`, `CPUQuota=`, `1.5G` and so on) exits 1 with a message. It never
     falls through to the real binary, which would create an escaping scope.
-- **Every other mode** (`--version`, service units without `--scope`, a
-  system-manager `--scope` without `--user`) runs the absolute real
-  `systemd-run` with the original arguments. So does a process outside the
-  task leaf, which the cap never covered.
+- **Other `--user` modes inside the task leaf** (services, timers, path units
+  or shell mode without `--scope`) are refused under rule smarty-dev#8257:
+  user-manager units must not escape the task memory cap or `agents.stop`.
+  Unique long-option abbreviations resolve to their full names before policy
+  checks. Ambiguous or unknown options that cannot prove a safe mode are refused.
+- **Known non-user modes and information commands** (`--version`, `--help`, a
+  system-manager `--scope` without `--user`) run the absolute real binary with
+  the original arguments. So does a process outside the task leaf.
+
+Stop confirmation watches the retained owned leaf's `cgroup.events` for
+`populated 0`, which covers the whole subtree. It subscribes before the first
+read and uses one bounded deadline, not membership polling. Watch/read failures
+or a still-populated subtree raise `TaskCgroupStopUnconfirmedError` with the
+remaining pids instead of claiming success.
 
 **Tighter limits apply to the whole task (ponytail tradeoff).** A process in a
 leaf cgroup that holds processes cannot get its own memory sub-cgroup (cgroup v2

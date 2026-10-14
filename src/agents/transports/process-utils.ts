@@ -293,6 +293,11 @@ const STOP_TERM_MS = 2_000;
 const STOP_KILL_MS = 2_000;
 const TREE_CENSUS_MIN_SPACING_MS = 60_000;
 const stopDelay = () => new Promise<void>((resolve) => setTimeout(resolve, 20));
+/** ENOENT alone is not proof (a missing cwd or #! interpreter also yields it): the path must be absent. */
+const executableMissing = (executable: string): boolean => {
+  try { fs.lstatSync(executable); fs.statSync(executable); return false; }
+  catch (error) { return (error as NodeJS.ErrnoException).code === "ENOENT"; }
+};
 
 export const spawnDetached = async (
   workerPath: string,
@@ -383,6 +388,12 @@ export const spawnDetached = async (
     await new Promise<void>(resolve => child.once("close", () => resolve()));
     if (!scope) throw spawnError ?? new Error("Failed to launch Fabric worker process");
     fs.rmSync(scopeRoot!, { recursive: true, force: true });
+    // Capped tasks fall back only when the backend executable is PROVEN missing (ENOENT and
+    // absent now, e.g. removed after lookup). EACCES, a missing interpreter/cwd, or any other
+    // spawn error is a capped admission failure, never an uncapped replay.
+    if (capped && !(((spawnError as NodeJS.ErrnoException | undefined)?.code === "ENOENT") && executableMissing(scope.executable))) {
+      throw new TaskScopeAdmissionError(scopeUnit!, `systemd-run spawn failed: ${spawnError?.message ?? "no pid"}`);
+    }
     assertTransportLaunchAllowed(authority);
     scope.warn(spawnError?.message ?? "systemd-run did not launch");
     return spawnDetached(workerPath, workerArguments, cwd, authority, environment, undefined, termGraceMs, executionCustodian);
@@ -394,7 +405,7 @@ export const spawnDetached = async (
   child.once("exit", () => { exited = true; clearTimeout(force); });
   const closed = new Promise<void>((resolve) => child.once("close", () => { exited = true; clearTimeout(force); resolve(); }));
   const workerExited = new Promise<void>(resolve => child.once("exit", () => resolve()));
-  // systemd-run's own failure exits with a status before any marker; a signal is not "unavailable".
+  // Capture a scope-start failure for the typed capped admission refusal, never for replay.
   let exitStatus: { code: number | null; signal: NodeJS.Signals | null } | undefined;
   child.once("exit", (code, signal) => { exitStatus = { code, signal }; });
   let stopping: Promise<void> | undefined;
@@ -774,7 +785,7 @@ export const spawnDetached = async (
               await Promise.race([workerExited, new Promise<void>(resolve => { grace = setTimeout(resolve, termGraceMs); })]);
               clearTimeout(grace);
             }
-            await stopTaskCgroup(verified, { termMs: STOP_TERM_MS, killMs: STOP_KILL_MS, delay: stopDelay });
+            await stopTaskCgroup(verified, { termMs: STOP_TERM_MS, killMs: STOP_KILL_MS });
           }
           // Empty owned leaf proves no execution descendant remains inside it.
           // Only this uncertainty is cleared; recorded watcher/native-close debt stays.
@@ -940,17 +951,14 @@ export const spawnDetached = async (
       if (handle.lostContact()) throw new Error(handle.lostContact());
       if (await handle.isAlive()) throw new Error("Scope termination is unconfirmed; custody retained");
       assertTransportLaunchAllowed(authority);
-      // A capped shim refused at the gate never executed the worker: replay is safe.
+      // A gated shim never executed the worker, but that alone cannot authorize uncapped replay.
       if (!capped && markerIsAdmitted()) return await admittedHandle(); // admitted during teardown: never replay
       if (capped) {
-        // The gate was never released: no worker ran. Only systemd-run itself exiting with a
-        // status before any admission marker is "unavailable" (legacy fallback). An admitted
-        // receipt, cap/watcher mismatch, signal (e.g. OOM shim) or timeout fails closed.
-        const unavailable = !admitted && !markerIsAdmitted() && exitStatus?.signal === null && exitStatus.code !== 0;
-        if (!unavailable) {
-          throw new TaskScopeAdmissionError(scopeUnit!, cappedRefusal ?? (exitStatus
-            ? `scope exited before release (code ${exitStatus.code}, signal ${exitStatus.signal})` : "scope admission timed out"));
-        }
+        // The gate was never released: no worker ran. systemd-run launched (it had a pid), so
+        // the executable was present: ANY exit status, diagnostic, signal, receipt mismatch or
+        // timeout fails closed. Uncapped replay is reserved for a proven missing executable.
+        throw new TaskScopeAdmissionError(scopeUnit!, cappedRefusal ?? (exitStatus
+          ? `scope exited before release (code ${exitStatus.code}, signal ${exitStatus.signal})` : "scope admission timed out"));
       }
       scope.warn(spawnError?.message ?? "systemd-run failed or scope admission timed out");
       return await spawnDetached(workerPath, workerArguments, cwd, authority, environment, undefined, termGraceMs, executionCustodian);

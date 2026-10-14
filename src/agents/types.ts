@@ -14,6 +14,7 @@ import type { FabricParticipantResidency } from "../topology/types.js";
 import type { AgentWriteReceipt } from "./write-receipt.js";
 import type { InheritedSessionPin } from "./session-pins.js";
 import type { AgentWorktreeResult } from "./worktree-manager.js";
+import type { AgentUndeliveredMessage } from "./terminal-target.js";
 
 /** Fabric run transports plus adapter-owned ("hosted") runs. */
 export type AgentRunTransport = FabricAgentTransport | "hosted";
@@ -201,6 +202,8 @@ export interface AgentCompactionStatus {
 export interface AgentRunRecord {
   /** Canonical Fabric package root selected for the process worker at spawn time. */
   fabricRelease?: string;
+  /** Admitted memory-capped task cgroup (smarty-dev#8257); absent when uncapped. */
+  cgroup?: string;
   /** Always populated for new runs; optional for legacy records. */
   routeClass?: string;
   routeClassSource?: AgentRunRouteMetadata["routeClassSource"];
@@ -215,6 +218,17 @@ export interface AgentRunRecord {
   id: string;
   name: string;
   task: string;
+  /** Exact original spawn brief, retained separately from mutable continuation task text. */
+  promptSha256?: string;
+  promptBytes?: number;
+  promptPath?: string;
+  /** Current task.txt bytes; changes when a same-run continuation rewrites the input. */
+  inputSha256?: string;
+  inputBytes?: number;
+  /** True when close/retention dropped the current input file. */
+  promptRetentionDropped?: boolean;
+  /** True when the current input failed stable digest verification. */
+  promptRetentionMismatch?: boolean;
   status: AgentRunStatus;
   /** One-based FIFO admission position; present only while queued. */
   queuePosition?: number;
@@ -330,6 +344,8 @@ export interface AgentHandleInfo {
   heldPermits?: number;
   /** Canonical Fabric package root selected for the process worker at spawn time. */
   fabricRelease?: string;
+  /** Admitted memory-capped task cgroup (smarty-dev#8257); absent when uncapped. */
+  cgroup?: string;
   followUpDeliveries?: AgentFollowUpDelivery[];
   routeClass?: string;
   routeClassSource?: AgentRunRouteMetadata["routeClassSource"];
@@ -339,6 +355,15 @@ export interface AgentHandleInfo {
   compactionSkipped?: string;
   id: string;
   name: string;
+  /** Exact original spawn brief metadata; never contains prompt text. */
+  promptSha256?: string;
+  promptBytes?: number;
+  promptPath?: string;
+  /** Current task.txt bytes, updated for a same-run continuation. */
+  inputSha256?: string;
+  inputBytes?: number;
+  promptRetentionDropped?: boolean;
+  promptRetentionMismatch?: boolean;
   status: AgentRunStatus;
   /** One-based FIFO admission position; present only while queued. */
   queuePosition?: number;
@@ -379,6 +404,12 @@ export interface AgentWorkerOptions {
   pythonRuntime?: FabricPythonRuntime;
   name: string;
   taskFile: string;
+  /** Exact original spawn brief metadata. The task file may later contain a continuation. */
+  promptSha256?: string;
+  promptBytes?: number;
+  promptPath?: string;
+  inputSha256?: string;
+  inputBytes?: number;
   imagesFile?: string;
   statusFile: string;
   lifecycleFile: string;
@@ -538,6 +569,9 @@ export interface AgentTransportHandle {
    * observation failure rejects, never authorizes collection/replacement.
    * Unverified scopes and unscoped workers omit this field entirely. */
   treeClosed?: Promise<void>;
+  /** Admitted, memory-capped task cgroup path (smarty-dev#8257). Present only after the
+   * launcher verified the capped scope receipt; uncapped/fallback launches omit it. */
+  cgroup?: string;
   /** Bounded diagnostic tail for workers that fail before writing a status record. */
   readStderr?(): string;
   isAlive(options?: AgentTransportObservationOptions): Promise<boolean>;
@@ -645,6 +679,8 @@ export type AgentChildQuestionResponse =
   | { cancelled: true };
 
 export interface AgentSteerResult {
+  /** Explicit receipt when the final answer won the admission/append race. */
+  undelivered?: AgentUndeliveredMessage;
   deadlineAt?: number;
   warning?: AgentFollowUpRunningWarning;
   queued: true;

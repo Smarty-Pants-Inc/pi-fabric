@@ -86,7 +86,7 @@ import { actionApprovalOverride } from "./core/approval-overrides.js";
 import type { FabricSpeculationStreamTap } from "./speculation/stream-tap.js";
 import { MeshStore, meshOutageAlarmSink, type MeshIdentity } from "./mesh/store.js";
 import { acquireMeshCustodyLock, meshCustodyMode } from "./mesh/custody-lock.js";
-import { MeshBackgroundQueue, MeshBackgroundRetry, isMeshLockTimeout } from "./core/atomic-write.js";
+import { MeshBackgroundQueue, MeshBackgroundRetry, isMeshWriteDeferred } from "./core/atomic-write.js";
 import { DecisionStore } from "./decisions/store.js";
 import { requestHeadlessApproval, routeChildQuestion } from "./decisions/host.js";
 import { LifecycleBroker } from "./lifecycle/broker.js";
@@ -1061,7 +1061,7 @@ export class FabricRuntimeState {
     try {
       await initializeMeshActivation();
     } catch (error) {
-      if (!isMeshLockTimeout(error)) throw error;
+      if (!isMeshWriteDeferred(error)) throw error;
       initialMeshError = error;
     }
     // Capture this activation's directory: no control may claim/run before its epoch
@@ -1241,7 +1241,7 @@ export class FabricRuntimeState {
       },
       onTerminalNotice: async (notice) => {
         if (!notice.sender?.id) throw new Error("Terminal refusal has no attributed sender; retain native receipt");
-        const message = `FABRIC_TARGET_TERMINAL: ${notice.delivery} ${notice.messageId} was not delivered to task ${notice.targetId}; ` +
+        const message = `FABRIC_TARGET_TERMINAL: undelivered: task already finished; ${notice.delivery} ${notice.messageId} was not delivered to task ${notice.targetId}; ` +
           `its final answer receipt is ${notice.finalAnswerReceiptId}. Start a new task; this input cannot revive the old one.`;
         if (notice.sender.id === identity.id || mainAgent.matches(notice.sender.id) && mainAgent.local) {
           this.pi.sendMessage({ customType: "pi-fabric-target-terminal", content: message, display: true, details: notice },

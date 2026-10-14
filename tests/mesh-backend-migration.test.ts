@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { acquireMeshCustodyLock } from "../src/mesh/custody-lock.js";
 import { abortMeshRollback, assertFileStateWritable, cutoverMeshState, describeCensusAdvisory, importMeshState, meshBackendStatus, MeshBackendFenceError,
   MeshBackendRefusedError, MeshCutoverFailedError, meshSnapshotDigest, encodeMeshStateNatsMarker, readMeshStateMovedMarker, readMeshStateNatsMarker, readStateFileEpoch, resolveMeshStateSource, rollbackMeshState,
@@ -29,8 +29,18 @@ const tempRoot = (label: string): string => {
 };
 
 const children: ChildProcessWithoutNullStreams[] = [];
+/** The owning-lead recipient of the --accept-unready override alarm (smarty-dev#9436), fixed for the tests. */
+const SWITCH_OWNER = "session:0a1b2c3d-0000-4000-8000-00000000c944";
+
+// Hermetic alarm recipient: a launcher's SMARTY_LEAD_SESSION or PI_FABRIC_MESH_ALARM_TO must not leak in. A test whose
+// accepted-unready switch is expected to succeed sets PI_FABRIC_MESH_ALARM_TO itself.
+beforeEach(() => {
+  vi.stubEnv("PI_FABRIC_MESH_ALARM_TO", undefined);
+  vi.stubEnv("SMARTY_LEAD_SESSION", undefined);
+});
 
 afterEach(() => {
+  vi.unstubAllEnvs();
   for (const child of children.splice(0)) if (child.exitCode === null) child.kill("SIGKILL");
   for (const store of stores.splice(0)) try { store.close(); } catch { /* closed by the test */ }
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
@@ -428,6 +438,7 @@ describe("mesh backend cutover fence: .lock and custody.lock; census advisory", 
     const other = tempRoot("late-cli");
     await seedFileRoot(other);
     let err = "";
+    vi.stubEnv("PI_FABRIC_MESH_ALARM_TO", SWITCH_OWNER); // off Linux the switch accepts fabric@unknown: alarm addressed
     // ponytail: off Linux there is no state.db holder scan, so the gate's own state.db connection stays
     // fabric@unknown under the fence (fail closed, smarty-dev#7936): accept it there.
     const code = await main(["cutover", "--root", other, ...(process.platform === "linux" ? [] : ["--accept-unready", "fabric@unknown"])], {
@@ -967,6 +978,7 @@ describe("mesh backend 5 MB round trip", () => {
 describe("fabric-mesh-backend CLI", () => {
   // ponytail: no cutover or import runs on Windows until reader proofs can be verified there (ACLs: smarty-dev#7548).
   it.skipIf(process.platform === "win32")("runs status, cutover and rollback with exit codes", async () => {
+    vi.stubEnv("PI_FABRIC_MESH_ALARM_TO", SWITCH_OWNER);
     const root = tempRoot("cli");
     await seedFileRoot(root);
     const run = async (...argv: string[]): Promise<{ code: number; out: string; err: string }> => {

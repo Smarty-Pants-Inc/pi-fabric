@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
-import { writeJsonAtomic } from "../core/atomic-write.js";
-import { readFinalAnswerReceipt } from "../worker/terminal-answer.js";
+import { syncPathNamespace, writeJsonAtomic } from "../core/atomic-write.js";
+import { readFinalAnswerReceipt, withTaskFinalAnswerLock } from "../worker/terminal-answer.js";
 import type { AgentTerminalNotice } from "./terminal-target.js";
 import { followUpFile, releaseFollowUpPayload, settleFollowUp } from "./follow-up-delivery.js";
 import { copyFabricProvenance, type FabricTurnProvenance } from "../fabric-provenance.js";
@@ -42,6 +42,53 @@ export const terminalControlMatchesAdmission = (value: unknown, admission: Termi
   return terminalSenderMatches(provenance?.sender, admission.sender);
 };
 
+/** Refusal requires a native discard ACK or locked proof that no stdin bytes
+ * were attempted. Native close, a queued row, or an event alone proves neither.
+ * Legacy queued rows without transport evidence remain uncertain. */
+export const terminalControlRefusalProven = (directory: string, admission: TerminalAdmission, runId: string): boolean =>
+  withTaskFinalAnswerLock(directory, () => {
+    const receipt = readFinalAnswerReceipt(directory, runId);
+    if (!receipt) return false;
+    const file = path.join(directory, "terminal-controls", `${admission.id}.json`);
+    let control: { state?: string; forwarded?: unknown };
+    try { control = JSON.parse(fs.readFileSync(file, "utf8")); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      // A dangling link is uncertainty, not an absent transport row.
+      try { fs.lstatSync(file); return false; }
+      catch (missing) { if ((missing as NodeJS.ErrnoException).code !== "ENOENT") throw missing; }
+      try { if (!fs.lstatSync(path.dirname(file)).isDirectory()) return false; }
+      catch (missing) { if ((missing as NodeJS.ErrnoException).code !== "ENOENT") throw missing; }
+      return true;
+    }
+    if (!terminalControlMatchesAdmission(control, admission) ||
+        Object.keys(control).some(key => !["id", "delivery", "state", "provenance", "forwarded"].includes(key)) ||
+        control.forwarded !== undefined && typeof control.forwarded !== "boolean") return false;
+    // Legacy shape: pre-`forwarded` workers wrote stdin, then marked queued rows
+    // refused at final answer while the frame could still be buffered. Neither a
+    // legacy queued nor a legacy refused row proves refusal; they stay uncertain.
+    if (control.forwarded === undefined) return false;
+    // Current shape: false is a locked host refusal, true a child discard ACK.
+    if (control.state === "refused") return true;
+    if (control.state !== "queued" || control.forwarded !== false) return false;
+    // The receipt blocks every later injection under this same lock. Recovery
+    // must publish the same lifecycle evidence as the worker BEFORE the registry
+    // transition; a failed barrier leaves the unforwarded row queued for retry.
+    const lifecycleFile = path.join(directory, "lifecycle.jsonl");
+    const data = { code: "FABRIC_TARGET_TERMINAL", targetId: runId, messageId: admission.id,
+      delivery: admission.delivery, finalAnswerReceiptId: receipt.id,
+      ...(admission.sender ? { sender: admission.sender } : {}) };
+    const descriptor = fs.openSync(lifecycleFile, "a", 0o600);
+    try {
+      fs.appendFileSync(descriptor, JSON.stringify({ version: 1, event: "message.refused",
+        runId, occurredAt: Date.now(), data }) + "\n", "utf8");
+      fs.fsyncSync(descriptor);
+    } finally { fs.closeSync(descriptor); }
+    syncPathNamespace(lifecycleFile);
+    writeJsonAtomic(file, { ...control, state: "refused" }, { durable: true });
+    return true;
+  });
+
 /** Manager-owned native ingress journal, not worker event data or final prose. */
 export const readTerminalAdmission = (directory: string, id: string): TerminalAdmission | undefined => {
   try {
@@ -61,6 +108,11 @@ export class TerminalNoticeOutbox {
   constructor(readonly deliver?: (notice: AgentTerminalNotice) => void | Promise<void>) {}
 
   retain(directory: string, notice: AgentTerminalNotice): void {
+    const admission = readTerminalAdmission(directory, notice.messageId);
+    const receipt = readFinalAnswerReceipt(directory, notice.targetId);
+    if (!admission || admission.delivery !== notice.delivery || !receipt || receipt.id !== notice.finalAnswerReceiptId ||
+        !terminalSenderMatches(notice.sender, admission.sender) ||
+        !terminalControlRefusalProven(directory, admission, receipt.runId)) return;
     const file = path.join(directory, "terminal-notices", `${notice.messageId}.json`);
     if (fs.existsSync(`${file}.delivered`)) return;
     writeJsonAtomic(file, notice, { durable: true });
@@ -88,10 +140,7 @@ export class TerminalNoticeOutbox {
         if ((entry.type !== "steer" && entry.type !== "follow_up") || typeof entry.id !== "string" || !/^[a-zA-Z0-9_-]{1,200}$/.test(entry.id)) continue;
         const admission = readTerminalAdmission(directory, entry.id);
         if (!admission) continue;
-        let state: { state?: string } | undefined;
-        try { state = JSON.parse(fs.readFileSync(path.join(directory, "terminal-controls", `${entry.id}.json`), "utf8")); }
-        catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
-        if (state?.state === "delivered" && terminalControlMatchesAdmission(state, admission)) continue;
+        if (!terminalControlRefusalProven(directory, admission, receipt.runId)) continue;
         this.retain(directory, { code: "FABRIC_TARGET_TERMINAL", targetId: receipt.runId,
           finalAnswerReceiptId: receipt.id, messageId: entry.id, delivery: admission.delivery,
           ...(admission.sender ? { sender: admission.sender } : {}) });
@@ -121,7 +170,8 @@ export class TerminalNoticeOutbox {
       const admission = readTerminalAdmission(directory, notice.messageId);
       if (notice.code !== "FABRIC_TARGET_TERMINAL" || notice.targetId !== receipt.runId || notice.finalAnswerReceiptId !== receipt.id ||
           entry !== `${notice.messageId}.json` || admission?.delivery !== notice.delivery || !admission.sender ||
-          !terminalSenderMatches(notice.sender, admission.sender)) continue;
+          !terminalSenderMatches(notice.sender, admission.sender) ||
+          !terminalControlRefusalProven(directory, admission, receipt.runId)) continue;
       if (fs.existsSync(`${file}.delivered`)) {
         try {
           const acknowledged = JSON.parse(fs.readFileSync(`${file}.delivered`, "utf8"));
@@ -130,7 +180,11 @@ export class TerminalNoticeOutbox {
         continue;
       }
       this.#routing.add(file);
-      void Promise.resolve().then(() => this.deliver!(notice)).then(() => {
+      void Promise.resolve().then(() => {
+        // Recheck at actual dispatch, not only while enumerating the outbox.
+        if (!terminalControlRefusalProven(directory, admission!, receipt.runId)) throw new Error("Terminal refusal is unproven");
+        return this.deliver!(notice);
+      }).then(() => {
         // A routed ACK is not sender consumption. Keep the native refusal and
         // its route receipt through retention, and suppress restart duplicates.
         writeJsonAtomic(`${file}.delivered`, notice, { durable: true });

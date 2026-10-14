@@ -29,7 +29,7 @@
  */
 import fs from "node:fs";
 import path from "node:path";
-import { isMeshLockTimeout, MeshLockTimeoutError } from "../core/atomic-write.js";
+import { isMeshIncarnationPending, isMeshSnapshotRetriesExhausted, isMeshLockTimeout, MeshLockTimeoutError } from "../core/atomic-write.js";
 import type { MeshIdentity } from "./event-log.js";
 import { isMeshStateBackendKind, MESH_STATE_BACKEND_KIND_LIST, type MeshStateBackendKind } from "./state-backend-kinds.js";
 import type { MeshStoreContext } from "./mesh-lock.js";
@@ -319,12 +319,15 @@ export const isMeshStateWalCap = (error: unknown): boolean =>
   error instanceof Error && (error as { code?: unknown }).code === MESH_STATE_WAL_CAP_CODE;
 
 /**
- * Lock contention a caller retries (smarty-dev#6477): a mesh lock timeout, `FABRIC_MESH_STATE_BUSY`, a
+ * A refusal a caller retries (smarty-dev#6477): pending process identity, snapshot validation exhaustion,
+ * a mesh lock timeout, `FABRIC_MESH_STATE_BUSY`, a
  * raw SQLite busy error that escaped a path without its own mapping, or a WAL-cap refusal
  * (`FABRIC_MESH_STATE_WAL_CAP`, pi-fabric#694 P1 2: the operator rolls back; writes resume once the reader
  * lets go). Never fatal for a long-lived loop.
  */
-export const isMeshRetryableBusy = (error: unknown): boolean => isMeshLockTimeout(error) || isSqliteBusy(error) || isMeshStateWalCap(error);
+export const isMeshRetryableBusy = (error: unknown): boolean =>
+  isMeshIncarnationPending(error) || isMeshSnapshotRetriesExhausted(error) ||
+  isMeshLockTimeout(error) || isSqliteBusy(error) || isMeshStateWalCap(error);
 
 /** Wraps a raw SQLite busy error as the retryable `MeshStateBusyError` (a `MeshLockTimeoutError`). */
 export const meshStateBusyFrom = (database: string, error: unknown, attempts = 1, waitedMs = 0, where = "read"): MeshStateBusyError => {

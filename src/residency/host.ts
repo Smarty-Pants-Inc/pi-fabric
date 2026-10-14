@@ -2181,14 +2181,24 @@ export class ResidentHost {
         // Exact id/name within this executor's root only; never resolve via the caller's root.
         const candidates = this.actors.listOwned().filter(actor => actor.rootId === this.config.rootId &&
           actor.residency === "durable" && (actor.id === command.id || actor.name === command.id));
-        if (candidates.length !== 1) throw new Error(candidates.length
-          ? `Ambiguous resident actor: ${command.id}` : `Unknown Fabric actor: ${command.id}`);
-        const actor = candidates[0]!;
-        if (command.dryRun === true) {
+        // smarty-dev#11105: an exact-id remove of this root's durable actor whose commit is in flight joins
+        // that commit (no preliminary stop: its run already ended). Never for stop, dry-run or an alias.
+        const finishing = candidates.length === 0 && command.action === "remove" && command.dryRun !== true
+          ? this.actors.finishingRemoval(command.id) : undefined;
+        if (finishing && finishing.rootId === this.config.rootId && finishing.residency === "durable") {
+          // Same lease veto, then this request's commit, as the stop-first path's callback.
+          const pending = this.#removeResidentActor(finishing.id, requestId, id => { check(); commit(id); }, true);
+          boundaryAdmitted?.();
+          response = await pending;
+        } else if (candidates.length !== 1) {
+          throw new Error(candidates.length ? `Ambiguous resident actor: ${command.id}` : `Unknown Fabric actor: ${command.id}`);
+        } else if (command.dryRun === true) {
+          const actor = candidates[0]!;
           response = { format: RESIDENT_HOST_FORMAT, requestId, ok: true, actor, operatorEvidence: evidence, completedAt: Date.now() };
         } else {
           // Re-read the uncached current lease immediately before each mutation.
           // This is a lease veto, not a proof that no Main exists or can restart.
+          const actor = candidates[0]!;
           const pending = this.actors.stop(actor.id, id => { check(); commit(id); }, true);
           boundaryAdmitted?.();
           const stopped = await pending;
@@ -2244,7 +2254,9 @@ export class ResidentHost {
         }
         response = { format: RESIDENT_HOST_FORMAT, requestId, ok: true, actor: updated, completedAt: Date.now() };
       } else {
-        response = await this.#removeResidentActor(command.id, requestId, commit);
+        const pending = this.#removeResidentActor(command.id, requestId, commit);
+        boundaryAdmitted?.();
+        response = await pending;
       }
     } catch (error) {
       response = {

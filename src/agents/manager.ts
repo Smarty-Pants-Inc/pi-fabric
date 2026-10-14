@@ -195,6 +195,26 @@ const once = (release: () => void): (() => void) => {
   let done = false;
   return () => { if (!done) { done = true; release(); } };
 };
+// The transport launch keeps this callback for the worker's lifetime. Build it at
+// module scope so it captures only these audit fields, never run()'s lexical
+// Context (request.task and every other launch-time value).
+const writePolicyDispositionAudit = (
+  logFile: string, id: string, runner: string, writePolicy: FabricWritePolicy | undefined,
+): ((disposition: "local" | "remote") => void) => {
+  let logged = false;
+  return (disposition) => {
+    if (logged) return;
+    logged = true;
+    const local = disposition === "local";
+    const policy = local ? writePolicy : undefined;
+    const warning = local
+      ? "Shell writes are unconfined by the task write policy (native bash/powershell and nested pi.bash); any Fabric Landlock settings are independent and may grant wider roots."
+      : "Remote one-shot placement cannot forward task write roots or scratch yet; remote task remains unrestricted.";
+    fs.appendFileSync(logFile, JSON.stringify({ type: local ? "write_policy.default" : "write_policy.remote_unconfined",
+      ts: Date.now(), id, runner, ...(policy ? { policy } : {}), warning,
+    }) + "\n", { mode: 0o600 });
+  };
+};
 // These adapters conflate CLI/socket errors with absent sessions and have no
 // checked exit receipt. Scope-cut release/collection rather than trust false.
 const uncheckedExternalExit = (transport: Pick<AgentTransportHandle, "kind">): boolean =>
@@ -1739,15 +1759,7 @@ export class AgentManager {
         } else if (defaultTaskWritePolicy && !applyTaskWriteDefault) {
           auditWritePolicy("write_policy.unsupported", `${runnerAdapter.label} does not enforce task write roots; launch remains unrestricted.`);
         }
-        let dispositionLogged = false;
-        const onWritePolicyDisposition = (disposition: "local" | "remote"): void => {
-          if (dispositionLogged) return;
-          dispositionLogged = true;
-          if (disposition === "local") auditWritePolicy("write_policy.default",
-            "Shell writes are unconfined by the task write policy (native bash/powershell and nested pi.bash); any Fabric Landlock settings are independent and may grant wider roots.", writePolicy);
-          else auditWritePolicy("write_policy.remote_unconfined",
-            "Remote one-shot placement cannot forward task write roots or scratch yet; remote task remains unrestricted.");
-        };
+        const onWritePolicyDisposition = writePolicyDispositionAudit(logFile, id, runner, writePolicy);
         const parentSessionId = this.#sessionId?.();
         const parentRunId = this.#parentLineage?.runId ?? (this.#currentDepth > 0 ? process.env.PI_FABRIC_PARENT_RUN : undefined);
         const lineage: FabricAgentLineage = {

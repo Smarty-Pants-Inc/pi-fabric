@@ -138,6 +138,68 @@ it.each(cases)("refuses %s without blocking or consuming it; a normal completion
   }
 }, 10_000);
 
+it("bounds warnings for a persistent unsafe set while reconciling safe completions and clearing removed paths", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "actor-spool-warning-flood-"));
+  try {
+    const script = `
+      import fs from "node:fs";
+      import path from "node:path";
+      import { ActorChildCompletionStore } from ${JSON.stringify(path.resolve("src/actors/child-completions.ts"))};
+      const root = ${JSON.stringify(root)};
+      const session = path.join(root, "session.jsonl"); fs.writeFileSync(session, "");
+      const store = new ActorChildCompletionStore(session); fs.mkdirSync(store.directory);
+      const warnings = [];
+      console.warn = message => { warnings.push(String(message)); };
+      let cache, maxSeen = 0;
+      const add = Set.prototype.add;
+      Set.prototype.add = function(value) {
+        const answer = add.call(this, value);
+        if (typeof value === "string" && value.startsWith(store.directory + path.sep) && value.endsWith(".json")) {
+          cache = this; maxSeen = Math.max(maxSeen, this.size);
+        }
+        return answer;
+      };
+      const name = index => path.join(store.directory, index.toString(16).padStart(32, "0") + ".json");
+      for (let index = 0; index < 1_000; index++) fs.mkdirSync(name(index));
+      for (let scan = 0; scan < 10; scan++) store.pending({ actorId: "actor:owner" });
+      const afterPersistentScans = warnings.length;
+      const summaries = warnings.filter(message => /overflow|additional|suppressed|limit|more/i.test(message));
+      const individual = warnings.length - summaries.length;
+      const spawner = { id: "actor:owner", kind: "actor", runId: "c".repeat(32) };
+      const result = id => ({ id, name: "child", status: "completed", text: "saved", startedAt: Date.now(), finishedAt: Date.now() });
+      store.enqueue(result("e".repeat(32)), spawner);
+      const firstSafe = store.pending({ actorId: spawner.id }).map(item => item.result.id);
+      store.enqueue(result("f".repeat(32)), spawner);
+      const afterSafeChurn = store.pending({ actorId: spawner.id }).map(item => item.result.id);
+      const afterChurnWarnings = warnings.length;
+      // Swap an unlisted member without changing cardinality or freeing a warning
+      // key; directory order must not decide whether this earns an individual warning.
+      const replaced = Array.from({ length: 1_000 }, (_, index) => index).find(index => !cache.has(name(index)));
+      fs.rmdirSync(name(replaced)); fs.mkdirSync(name(1_000));
+      for (let scan = 0; scan < 10; scan++) store.pending({ actorId: spawner.id });
+      const changedSetWarnings = warnings.length - afterChurnWarnings;
+      const changedSetSummary = warnings[afterChurnWarnings];
+      for (let index = 0; index < 1_000; index++) if (index !== replaced) fs.rmdirSync(name(index));
+      fs.rmdirSync(name(1_000));
+      store.pending();
+      console.log(JSON.stringify({ afterPersistentScans, individual, summaries, maxSeen, firstSafe, afterSafeChurn,
+        afterChurnWarnings, changedSetWarnings, changedSetSummary, afterRemoval: cache.size }));
+    `;
+    const output = JSON.parse((await run(script, 30_000)).trim());
+    expect(output.afterPersistentScans).toBeLessThanOrEqual(257);
+    expect(output.individual).toBeLessThanOrEqual(256);
+    expect(output.summaries.length).toBeLessThanOrEqual(1);
+    expect(output.summaries.length).toBe(1); // A bounded overflow warning makes the suppression visible.
+    expect(output.maxSeen).toBeLessThanOrEqual(256);
+    expect(output.firstSafe).toContain("e".repeat(32));
+    expect(output.afterSafeChurn).toEqual(expect.arrayContaining(["e".repeat(32), "f".repeat(32)]));
+    expect(output.afterChurnWarnings).toBe(output.afterPersistentScans);
+    expect(output.changedSetWarnings).toBe(1);
+    expect(output.changedSetSummary).toMatch(/overflow|additional|suppressed|limit|more/i);
+    expect(output.afterRemoval).toBe(0);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+}, 40_000);
+
 it("bounds warning deduplication across 10,000 serial unsafe entries and prunes removed paths on a scan", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "actor-spool-warning-bound-"));
   try {

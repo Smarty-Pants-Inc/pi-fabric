@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import fs, { type FSWatcher } from "node:fs";
 import path from "node:path";
 import { syncDirectoryChain, withExclusiveFileLock, writeJsonAtomic } from "../core/atomic-write.js";
@@ -191,7 +191,10 @@ export class ActorChildCompletionStore {
   readonly #consumed = new Set<string>();
   readonly #publicationId = randomUUID();
   readonly #uncertainReceipts = new Set<string>();
+  // Retain listed paths until absent, even if their contents/type become readable.
   readonly #warnedEntries = new Set<string>();
+  #overflowSignature: string | undefined;
+  #overflowScanned = false;
   #claimDepth = 0;
   constructor(readonly sessionFile: string) {
     this.directory = path.join(path.dirname(sessionFile), "child-completions");
@@ -201,14 +204,61 @@ export class ActorChildCompletionStore {
     let files: string[];
     try { files = fs.readdirSync(this.directory); }
     catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") this.#warnedEntries.clear();
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        this.#warnedEntries.clear();
+        this.#overflowSignature = undefined;
+        this.#overflowScanned = false;
+      }
       throw error;
     }
     if (this.#warnedEntries.size) {
       const present = new Set(files);
       for (const file of this.#warnedEntries) if (!present.has(path.basename(file))) this.#warnedEntries.delete(file);
     }
+    this.#overflowScanned = false;
+    // Inventory before callers short-circuit on a legitimate envelope/source. Only
+    // saturated warning caches (or a still-active overflow) pay for this metadata-
+    // only pass; no spool is opened. Safe-file churn cannot reset the summary.
+    if (this.#warnedEntries.size === MAX_WARNING_ENTRIES || this.#overflowSignature !== undefined) this.#warnOverflow(files);
     return files;
+  }
+
+  #safeSpoolStat(stat: fs.Stats): boolean {
+    return stat.isFile() && stat.nlink === 1 &&
+      (!process.getuid || stat.uid === process.getuid()) && stat.size <= MAX_SPOOL_JSON_BYTES;
+  }
+
+  #warnOverflow(files?: string[], refused?: string): void {
+    // A direct receipt/control read may precede any scan. Inventory at most once
+    // between directory scans, never once per overflowing read. Later direct-read
+    // changes remain refused; the next scan refreshes their aggregate visibility.
+    if (this.#overflowScanned) return;
+    this.#overflowScanned = true;
+    try { files ??= fs.readdirSync(this.directory); } catch { files = []; }
+    // XOR of path digests is order-independent and retains no unlisted path keys.
+    const digest = Buffer.alloc(32);
+    let unsafe = 0, additional = 0, includedRefused = false;
+    const include = (file: string): void => {
+      unsafe++;
+      if (!this.#warnedEntries.has(file)) additional++;
+      const entry = createHash("sha256").update(file).digest();
+      for (let index = 0; index < digest.length; index++) digest[index] = digest[index]! ^ entry[index]!;
+    };
+    for (const name of files) {
+      if (!WAKE_FILE.test(name) && !STORED_FILE.test(name)) continue;
+      const file = path.join(this.directory, name);
+      if (file === refused) { include(file); includedRefused = true; continue; }
+      try { if (!this.#safeSpoolStat(fs.lstatSync(file))) include(file); }
+      catch { /* Unreadable metadata is not proof of an unsafe entry. */ }
+    }
+    // Preserve visibility for a raced refusal even if its current metadata is safe
+    // or its directory entry disappeared before this inventory.
+    if (refused && !includedRefused) include(refused);
+    const signature = `${unsafe}:${digest.toString("hex")}`;
+    if (additional && signature !== this.#overflowSignature) {
+      console.warn(`[pi-fabric] ${additional} additional unsafe child completion entries retained, not read; individual warning limit ${MAX_WARNING_ENTRIES} reached in ${this.directory}`);
+    }
+    this.#overflowSignature = unsafe ? signature : undefined;
   }
 
   /** A task can write spool names. Refuse unsafe entries before open and bound every
@@ -217,16 +267,14 @@ export class ActorChildCompletionStore {
     let fd: number | undefined;
     try {
       const expected = fs.lstatSync(file);
-      const regular = (stat: fs.Stats): boolean => stat.isFile() && stat.nlink === 1 &&
-        (!process.getuid || stat.uid === process.getuid()) && stat.size <= MAX_SPOOL_JSON_BYTES;
-      if (expected.isSymbolicLink() || !regular(expected)) throw new UnsafeCompletionEntry("not an owned bounded regular file");
+      if (expected.isSymbolicLink() || !this.#safeSpoolStat(expected)) throw new UnsafeCompletionEntry("not an owned bounded regular file");
       // ponytail: Windows has no task confinement, so a same-user task can already
       // end the host directly. Refuse Node-reported symlinks/junctions BEFORE open
       // and retain fstat checks; the remaining Windows lstat/open swap is an accepted
       // security gap, not a claim that these unavailable POSIX flags protect it.
       fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0));
       const stat = fs.fstatSync(fd);
-      if (!regular(stat) || stat.dev !== expected.dev || stat.ino !== expected.ino) {
+      if (!this.#safeSpoolStat(stat) || stat.dev !== expected.dev || stat.ino !== expected.ino) {
         throw new UnsafeCompletionEntry("file changed before read");
       }
       // The sentinel catches growth, without allocating/reading beyond the bound.
@@ -238,20 +286,17 @@ export class ActorChildCompletionStore {
         length += read;
       }
       const after = fs.fstatSync(fd);
-      if (length !== stat.size || !regular(after) || after.size !== stat.size || after.mtimeMs !== stat.mtimeMs) {
+      if (length !== stat.size || !this.#safeSpoolStat(after) || after.size !== stat.size || after.mtimeMs !== stat.mtimeMs) {
         throw new UnsafeCompletionEntry("file changed during read");
       }
-      this.#warnedEntries.delete(file);
       return JSON.parse(bytes.subarray(0, length).toString("utf8"));
     } catch (error) {
       if (error instanceof UnsafeCompletionEntry || (error as NodeJS.ErrnoException).code === "ELOOP") {
         if (!this.#warnedEntries.has(file)) {
-          if (this.#warnedEntries.size >= MAX_WARNING_ENTRIES) {
-            const oldest = this.#warnedEntries.values().next().value;
-            if (oldest !== undefined) this.#warnedEntries.delete(oldest);
-          }
-          this.#warnedEntries.add(file);
-          console.warn(`[pi-fabric] unsafe child completion entry retained, not read: ${file}`);
+          if (this.#warnedEntries.size < MAX_WARNING_ENTRIES) {
+            this.#warnedEntries.add(file);
+            console.warn(`[pi-fabric] unsafe child completion entry retained, not read: ${file}`);
+          } else this.#warnOverflow(undefined, file);
         }
         throw error instanceof UnsafeCompletionEntry ? error : new UnsafeCompletionEntry("no-follow open refused");
       }

@@ -104,7 +104,8 @@ export const eventReceipt = (id: string): string => receipt("", "event", id);
 /**
  * Receipts that a native carrier records for the same identity under its other kind: a shadow's
  * messageId is often the control commandId the follow-up arrived with (recorded as "delivery"),
- * and a shadow's deliveryId can be the carrier id (recorded as "id"). Matching only, never stored.
+ * and a shadow's deliveryId can be the carrier id (recorded as "id"). RootInbox uses these for
+ * matching, not batch dedup; inbox carriers also include them for display identity projection.
  */
 export const crossIdentityReceipts = (fromId: string, data: unknown): string[] => {
   const identity = deliveryIdentity(data);
@@ -129,13 +130,15 @@ export const eventReceipts = (event: MeshEvent): string[] => {
 };
 /**
  * Display-only shadow metadata for an inbox carrier's receipt group (smarty-dev#12140): an event
- * without its own messageId/deliveryId names its sender/topic key (else ref) under the retired
- * "topic-*" kind, which the incoming-message renderer matches against delivered native carriers.
- * Root-inbox dedup never consults "topic-*" (only "native-topic-*"), so a canonical inbox/cursor
- * that stores these hashes cannot collapse distinct durable events. An explicit identity outranks it.
+ * with an explicit identity carries the other-kind receipt too, because native carriers record
+ * deliveryId as "delivery" while mesh shadows record messageId as "id" (and vice versa). An event
+ * without an explicit identity names its sender/topic key (else ref) under the retired "topic-*"
+ * kind, which the incoming-message renderer matches against delivered native carriers. Root-inbox
+ * dedup never consults "topic-*" (only "native-topic-*"), so these display hashes cannot collapse
+ * distinct durable events; explicit identity still outranks the key/ref fallback.
  */
 const shadowDisplayReceipts = (event: MeshEvent): string[] => {
-  if (deliveryIdentity(event.data)) return [];
+  if (deliveryIdentity(event.data)) return crossIdentityReceipts(event.from.id, event.data);
   const key = workKey(event.data), ref = workRef(event.data);
   const legacy = (kind: "key" | "ref", value: string) => receipt(event.from.id, `topic-${kind}`, JSON.stringify([event.topic, value]));
   return key ? [legacy("key", key)] : ref ? [legacy("ref", ref)] : [];

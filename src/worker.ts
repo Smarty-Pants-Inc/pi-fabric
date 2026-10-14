@@ -18,7 +18,7 @@ import type {
 } from "./agents/types.js";
 import { applyChildPriority } from "./agents/priority.js";
 import { saveWorkerCompletion } from "./agents/completion-journal.js";
-import { taskAgentEnvironment } from "./agents/task-environment.js";
+import { taskAgentEnvironment, withoutTaskBoundary } from "./agents/task-environment.js";
 import { applyTaskReturnAddress } from "./agents/task-return-address.js";
 import { processStartTime } from "./residency/process-identity.js";
 import { executionGroup, observeExecutionGroup } from "./worker/execution-group.js";
@@ -662,8 +662,10 @@ const main = async (): Promise<void> => {
       appendLog(`${JSON.stringify({ type: "fabric_priority_error", error: message })}\n`));
   }
   // smarty-dev#2339 F4: a nested actor gets its own default, never its parent's override.
+  // smarty-dev#8257: only this task's own native child keeps its admitted boundary.
+  // Actors defensively clear any stale caller receipt, preserving actor roles (SRC-1).
   const childEnvironment = applyTaskReturnAddress(
-    options.actorId ? { ...process.env } : taskAgentEnvironment(), process.argv.slice(2),
+    options.actorId ? withoutTaskBoundary(process.env) : taskAgentEnvironment(process.env, true), process.argv.slice(2),
   );
   // Native session metadata belongs to this child, never its parent/resident host.
   delete childEnvironment.PI_SESSION_ID;

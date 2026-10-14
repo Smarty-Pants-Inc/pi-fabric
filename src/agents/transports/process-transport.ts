@@ -53,17 +53,67 @@ const selectWorkerRelease = (workerPath: string): { workerPath: string; fabricRe
 /** Default per-task memory.max (24 GiB, swap 0), mirrored from config to keep this module light. */
 const DEFAULT_TASK_MEMORY_MAX_BYTES = 24 * 1024 ** 3;
 
-const isSocket = (file: string): boolean => {
-  try { return fs.statSync(file).isSocket(); } catch { return false; }
+type ProbeOutcome = "supported" | "unsupported";
+
+const errorCode = (error: unknown): string => {
+  if (error && typeof error === "object" && "code" in error && typeof error.code === "string") return error.code;
+  return error instanceof Error && error.message ? error.message : "unknown";
+};
+
+/** A host capability probe failed closed: it was neither present nor absent. */
+export class TaskScopeProbeError extends Error {
+  readonly code = "TASK_SCOPE_PROBE_UNKNOWN" as const;
+  constructor(readonly probe: string, readonly errno: string, readonly cause: unknown) {
+    super(`Task scope probe ${probe} returned unknown error ${errno}`);
+    this.name = "TaskScopeProbeError";
+  }
+}
+
+const probeStat = (file: string, predicate: (stats: fs.Stats) => boolean, probe: string): ProbeOutcome => {
+  try { return predicate(fs.statSync(file)) ? "supported" : "unsupported"; }
+  catch (error) {
+    const errno = errorCode(error);
+    if (errno === "ENOENT") return "unsupported";
+    throw new TaskScopeProbeError(probe, errno, error);
+  }
+};
+
+const probeSocket = (file: string, probe: string): ProbeOutcome => probeStat(file, stats => stats.isSocket(), probe);
+
+const probeFileText = (file: string, predicate: (text: string) => boolean, probe: string): ProbeOutcome => {
+  try { return predicate(fs.readFileSync(file, "utf8")) ? "supported" : "unsupported"; }
+  catch (error) {
+    const errno = errorCode(error);
+    if (errno === "ENOENT") return "unsupported";
+    throw new TaskScopeProbeError(probe, errno, error);
+  }
+};
+
+const busAvailable = (environment: NodeJS.ProcessEnv): ProbeOutcome => {
+  const candidates: string[] = [];
+  const runtime = environment.XDG_RUNTIME_DIR;
+  const bus = environment.DBUS_SESSION_BUS_ADDRESS?.match(/^unix:path=([^,;]+)/)?.[1];
+  if (runtime && path.isAbsolute(runtime)) candidates.push(path.join(runtime, "bus"));
+  if (bus && path.isAbsolute(bus)) candidates.push(bus);
+  if (candidates.length === 0) return "unsupported";
+  let unknown: TaskScopeProbeError | undefined;
+  for (const candidate of candidates) {
+    try {
+      if (probeSocket(candidate, "bus socket") === "supported") return "supported";
+    } catch (error) {
+      if (error instanceof TaskScopeProbeError) unknown ??= error;
+      else throw error;
+    }
+  }
+  if (unknown) throw unknown;
+  return "unsupported";
 };
 
 /**
- * smarty-dev#8257: cheap, D-Bus-free proof that `systemd-run --user --scope` can
- * create a memory-capped scope. All of: Linux, unified cgroup v2, an explicit and
- * usable user-bus environment (XDG_RUNTIME_DIR/bus or a unix:path=
- * DBUS_SESSION_BUS_ADDRESS socket; a bare /run/user socket is not enough, so
- * scrubbed test environments stay legacy), and the memory controller delegated
- * to this UID's user manager. Any doubt answers false: the launch stays legacy.
+ * smarty-dev#8257/#11898: D-Bus-free proof that `systemd-run --user --scope`
+ * can create a memory-capped scope. ENOENT and positive absence are legacy
+ * eligibility results; an unreadable probe is a typed refusal, never permission
+ * to launch the worker uncapped.
  */
 export const delegatedUserCgroupAvailable = (
   environment: NodeJS.ProcessEnv = process.env,
@@ -72,16 +122,29 @@ export const delegatedUserCgroupAvailable = (
   if (process.platform !== "linux") return false;
   const uid = process.getuid?.();
   if (uid === undefined) return false;
-  const runtime = environment.XDG_RUNTIME_DIR;
-  const bus = environment.DBUS_SESSION_BUS_ADDRESS?.match(/^unix:path=([^,;]+)/)?.[1];
-  const busUsable = (runtime && path.isAbsolute(runtime) && isSocket(path.join(runtime, "bus")))
-    || (bus && path.isAbsolute(bus) && isSocket(bus));
-  if (!busUsable) return false;
-  try {
-    if (!fs.statSync(path.join(cgroupRoot, "cgroup.controllers")).isFile()) return false;
-    const manager = path.join(cgroupRoot, "user.slice", `user-${uid}.slice`, `user@${uid}.service`);
-    return fs.readFileSync(path.join(manager, "cgroup.subtree_control"), "utf8").split(/\s+/).includes("memory");
-  } catch { return false; }
+  if (busAvailable(environment) !== "supported") return false;
+  const controllers = path.join(cgroupRoot, "cgroup.controllers");
+  if (probeStat(controllers, stats => stats.isFile(), "cgroup controllers") !== "supported") return false;
+  if (probeFileText(controllers, text => text.split(/\s+/).includes("memory"), "cgroup controllers") !== "supported") return false;
+  const manager = path.join(cgroupRoot, "user.slice", `user-${uid}.slice`, `user@${uid}.service`);
+  return probeFileText(path.join(manager, "cgroup.subtree_control"), text => text.split(/\s+/).includes("memory"), "memory delegation") === "supported";
+};
+
+const findExecutableStrict = (command: string, environment: NodeJS.ProcessEnv): string | undefined => {
+  let unknown: TaskScopeProbeError | undefined;
+  const executable = findExecutable(command, environment, candidate => {
+    try {
+      const stats = fs.statSync(candidate);
+      return stats.isFile() && (process.platform === "win32" || (stats.mode & 0o111) !== 0);
+    } catch (error) {
+      const errno = errorCode(error);
+      if (errno !== "ENOENT") unknown ??= new TaskScopeProbeError("systemd-run executable", errno, error);
+      return false;
+    }
+  });
+  if (executable) return executable;
+  if (unknown) throw unknown;
+  return undefined;
 };
 
 /** Exact flag-position `--actor-id` only; a flag-shaped value is not an actor identity. */
@@ -187,7 +250,7 @@ export class ProcessTransport implements AgentTransportAdapter {
       PATH: (process.env.PATH ?? "").split(path.delimiter)
         .filter(directory => path.resolve(directory, "systemd-run") !== wrapper).join(path.delimiter),
     } : process.env;
-    const executable = slice && process.platform === "linux" ? findExecutable("systemd-run", backendEnvironment) : undefined;
+    const executable = slice && process.platform === "linux" ? findExecutableStrict("systemd-run", backendEnvironment) : undefined;
     if (this.processSlice && process.platform === "linux" && !executable) this.#warnScope("systemd-run unavailable");
     const scope: { executable: string; slice: string; warn: (reason: string) => void; memoryMaxBytes?: number } | undefined =
       executable && slice

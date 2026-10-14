@@ -10,6 +10,7 @@ import { ProcessTransport } from "../src/agents/transports/process-transport.js"
 import { ProcessTreeCustodyUnconfirmedError, spawnDetached } from "../src/agents/transports/process-utils.js";
 import type { AgentTransportHandle } from "../src/agents/types.js";
 import { taskCgroupUnavailableReason } from "./helpers/task-cgroup-capability.js";
+import * as taskCgroup from "../src/agents/transports/task-cgroup.js";
 
 vi.mock("node:child_process", async importOriginal => {
   const actual = await importOriginal<typeof import("node:child_process")>();
@@ -337,8 +338,8 @@ describe.skipIf(process.platform !== "linux")("event-driven scope admission mark
   });
 });
 
-type ReceiptFailure = "missing" | "mismatched" | "mismatched-receipt" | "wrong-slice" | "v1-only" | "hybrid" | "unowned" | "open" | "read" | "watcher-arm" | "watcher-arm-async" | "identity-during-arm" | "read-after-arm";
-async function fixtureTree(termGraceMs = 7_000, scoped = false, initialPopulated = "1", failure?: ReceiptFailure, viaTransport = false) {
+type ReceiptFailure = "missing" | "mismatched" | "mismatched-receipt" | "wrong-slice" | "v1-only" | "hybrid" | "unowned" | "open" | "read" | "watcher-arm" | "watcher-arm-async" | "identity-during-arm" | "read-after-arm" | "wrapper" | "gate";
+async function fixtureTree(termGraceMs = 7_000, scoped = false, initialPopulated = "1", failure?: ReceiptFailure, viaTransport = false, capped = false) {
   vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout", "setInterval", "clearInterval"] });
   const directory = root();
   const workerPath = path.join(directory, "worker.mjs");
@@ -352,7 +353,21 @@ async function fixtureTree(termGraceMs = 7_000, scoped = false, initialPopulated
   let liveCgroup: string | undefined;
   let populated = initialPopulated;
   let scopeRemoved: string | undefined;
-  const eventsFd = 700_000_010;
+  // Capped counterprobes hold real descriptors, not synthetic fd numbers.
+  const leaf = path.join(directory, "leaf");
+  if (capped) {
+    fs.mkdirSync(leaf);
+    fs.writeFileSync(path.join(leaf, "memory.max"), String(1024 ** 3));
+    fs.writeFileSync(path.join(leaf, "memory.swap.max"), "0");
+    fs.writeFileSync(path.join(leaf, "cgroup.events"), `populated ${initialPopulated}\nfrozen 0\n`);
+  }
+  const nativeMkdir = fs.mkdirSync.bind(fs);
+  if (failure === "wrapper") vi.spyOn(fs, "mkdirSync").mockImplementation(((file: fs.PathLike, options?: unknown) => {
+    if (path.basename(String(file)) === "bin") throw new Error("wrapper creation failed");
+    return nativeMkdir(file, options as never);
+  }) as typeof fs.mkdirSync);
+  let boundaryFd: number | undefined;
+  let eventsFd = 700_000_010;
   const order: string[] = [];
   const watcher = Object.assign(new EventEmitter(), { close: vi.fn() }) as unknown as fs.FSWatcher;
   const admissionWatcher = Object.assign(new EventEmitter(), { close: vi.fn() }) as unknown as fs.FSWatcher;
@@ -389,6 +404,11 @@ async function fixtureTree(termGraceMs = 7_000, scoped = false, initialPopulated
   vi.spyOn(fs, "lstatSync").mockImplementation(((file: fs.PathLike, options?: unknown) => {
     if (String(file) === scopeDirectory) {
       const unowned = failure === "unowned" || (failure === "identity-during-arm" && ++directoryChecks > 1);
+      if (capped) {
+        const stat = nativeLstat(leaf);
+        if (unowned) stat.uid = process.getuid!() + 1;
+        return stat;
+      }
       return { uid: process.getuid!() + (unowned ? 1 : 0), isDirectory: () => true };
     }
     return nativeLstat(file, options as never);
@@ -400,9 +420,14 @@ async function fixtureTree(termGraceMs = 7_000, scoped = false, initialPopulated
   }) as typeof fs.statfsSync);
   const nativeOpen = fs.openSync.bind(fs);
   const opened = vi.spyOn(fs, "openSync").mockImplementation((file, flags, mode) => {
+    if (capped && String(file) === scopeDirectory) {
+      boundaryFd = nativeOpen(leaf, flags, mode);
+      return boundaryFd;
+    }
     if (String(file) !== scopeEvents) return nativeOpen(file, flags, mode);
     order.push("open");
     if (failure === "open") throw new Error("cannot open events");
+    if (capped) eventsFd = nativeOpen(path.join(leaf, "cgroup.events"), flags, mode);
     return eventsFd;
   });
   const nativeReadSync = fs.readSync.bind(fs);
@@ -412,13 +437,14 @@ async function fixtureTree(termGraceMs = 7_000, scoped = false, initialPopulated
     order.push("read");
     if (failure === "read" || (failure === "read-after-arm" && ++eventReads > 1)) throw new Error("events unreadable");
     if (scopeRemoved) throw Object.assign(new Error(`${scopeRemoved}: read failed`), { code: scopeRemoved });
+    if (capped) return (nativeReadSync as (...values: unknown[]) => number)(...args);
     const text = `populated ${populated}\nfrozen 0\n`;
     (args[1] as Buffer).write(text);
     return Buffer.byteLength(text);
   }) as typeof fs.readSync);
   const nativeClose = fs.closeSync.bind(fs);
   const closeEvents = vi.spyOn(fs, "closeSync").mockImplementation(fd => {
-    if (fd === eventsFd) { order.push("close"); return; }
+    if (fd === eventsFd) { order.push("close"); if (!capped) return; }
     nativeClose(fd);
   });
   const nativeReaddir = fs.readdirSync.bind(fs);
@@ -427,10 +453,17 @@ async function fixtureTree(termGraceMs = 7_000, scoped = false, initialPopulated
     return nativeReaddir(file, options as never);
   }) as typeof fs.readdirSync);
   const kill = vi.spyOn(process, "kill").mockImplementation((_pid, signal) => {
-    if (signal === "SIGTERM" || signal === "SIGKILL") descendantAlive = false;
+    if (signal === "SIGTERM" || signal === "SIGKILL") {
+      descendantAlive = false;
+      if (capped && primaryAlive) {
+        primaryAlive = false;
+        child.emit("exit", 0); child.emit("close", 0);
+      }
+    }
     return true;
   });
-  const child = Object.assign(new EventEmitter(), { pid, unref: vi.fn(), channel: {} });
+  const gate = Object.assign(new EventEmitter(), { writable: failure !== "gate", end: vi.fn(), destroy: vi.fn() });
+  const child = Object.assign(new EventEmitter(), { pid, unref: vi.fn(), channel: {}, stdio: [null, null, null, null, gate] });
   vi.mocked(spawn).mockClear();
   vi.mocked(spawn).mockImplementationOnce((_command, args) => {
     if (scoped) {
@@ -447,7 +480,7 @@ async function fixtureTree(termGraceMs = 7_000, scoped = false, initialPopulated
     return child as unknown as ChildProcess;
   });
   const unconfirmed = vi.fn();
-  const scope = scoped ? { executable: "/fixture-systemd-run", slice: "fixture.slice", warn: vi.fn() } : undefined;
+  const scope = scoped ? { executable: "/fixture-systemd-run", slice: "fixture.slice", warn: vi.fn(), ...(capped ? { memoryMaxBytes: 1024 ** 3 } : {}) } : undefined;
   if (viaTransport) {
     // This is an uncapped receipt mechanism, with fake children/files/clock. Do
     // not select the capped admission protocol or depend on a host executable.
@@ -465,7 +498,12 @@ async function fixtureTree(termGraceMs = 7_000, scoped = false, initialPopulated
   const timeout = vi.spyOn(globalThis, "setTimeout");
   return {
     handle, transport, census, kill, timeout, unconfirmed, watcher, admissionWatcher, opened, readEvents, closeEvents, order,
-    emptyScope: () => { populated = "0"; watcher.emit("change"); },
+    boundaryFd: () => boundaryFd,
+    emptyScope: () => {
+      populated = "0";
+      if (capped) fs.writeFileSync(path.join(leaf, "cgroup.events"), "populated 0\nfrozen 0\n");
+      watcher.emit("change");
+    },
     // systemd collects an empty scope (processSlice): the retained events fd then reads ENODEV.
     removeScope: (code = "ENODEV") => { scopeRemoved = code; watcher.emit("change"); },
     depart: () => { descendantAlive = false; },
@@ -539,6 +577,78 @@ describe.skipIf(process.platform !== "linux")("verified cgroup-v2 receipt admiss
     await expect(f.handle.treeClosed).rejects.toMatchObject({ code });
     expect(f.unconfirmed).toHaveBeenCalledOnce();
     expect(f.handle.lostContact()).toContain("Owned scope observation failed");
+  });
+
+  it.each(["open", "read", "watcher-arm", "watcher-arm-async", "identity-during-arm", "read-after-arm"] as const)("releases real capped admission descriptors on %s refusal", async failure => {
+    const baseline = fs.readdirSync("/proc/self/fd").length;
+    await expect(fixtureTree(7_000, true, "1", failure, false, true)).rejects.toBeInstanceOf(taskCgroup.TaskScopeAdmissionError);
+    expect(fs.readdirSync("/proc/self/fd").length).toBe(baseline);
+    expect(spawn).toHaveBeenCalledOnce(); // refusal must not replay the gated worker
+  });
+
+  it.each(["wrapper", "gate"] as const)("tears down and releases an admitted leaf when %s prevents gate release", async failure => {
+    const baseline = fs.readdirSync("/proc/self/fd").length;
+    const stop = vi.spyOn(taskCgroup, "stopTaskCgroup").mockResolvedValue("cgroup.kill");
+    await expect(fixtureTree(7_000, true, "1", failure, false, true)).rejects.toBeInstanceOf(taskCgroup.TaskScopeAdmissionError);
+    expect(stop).toHaveBeenCalledOnce();
+    expect(fs.readdirSync("/proc/self/fd").length).toBe(baseline);
+    expect(spawn).toHaveBeenCalledOnce();
+  });
+
+  it("releases real capped descriptors on a populated-zero receipt", async () => {
+    const baseline = fs.readdirSync("/proc/self/fd").length;
+    const f = await fixtureTree(7_000, true, "1", undefined, false, true);
+    const fd = f.boundaryFd()!;
+    f.closeEvents.mockClear();
+    expect(fs.readdirSync("/proc/self/fd").length).toBe(baseline + 2);
+    await f.close(); f.depart(); f.emptyScope();
+    await expect(f.handle.treeClosed).resolves.toBeUndefined();
+    expect(fs.readdirSync("/proc/self/fd").length).toBe(baseline);
+    const stop = vi.spyOn(taskCgroup, "stopTaskCgroup");
+    await f.handle.stop();
+    expect(stop).not.toHaveBeenCalled();
+    expect(f.closeEvents.mock.calls.filter(([closedFd]) => closedFd === fd)).toHaveLength(1);
+    expect(f.handle.stopDebt?.()).toBeUndefined();
+  });
+
+  // smarty-dev#11920: watcher rejection must not strand the admitted directory fd.
+  // Real /proc/self/fd counterprobe: only child/cgroup operations are mocked.
+  it("releases the real admitted directory fd after watcher failure then successful stop", async () => {
+    const baseline = fs.readdirSync("/proc/self/fd").length;
+    const deletes = vi.spyOn(fs, "rmSync");
+    const stop = vi.spyOn(taskCgroup, "stopTaskCgroup").mockRejectedValueOnce(new Error("teardown still unconfirmed"));
+    const f = await fixtureTree(7_000, true, "1", undefined, false, true);
+    const fd = f.boundaryFd()!;
+    f.closeEvents.mockClear(); // admission marker may have reused this fd number
+    expect(fs.readdirSync("/proc/self/fd").length).toBe(baseline + 2);
+    const error = new Error("post-admission capped watcher failure");
+    f.watcher.emit("error", error);
+    await expect(f.handle.treeClosed).rejects.toBe(error);
+    const debt = f.handle.lostContact();
+    expect(debt).toContain("Owned scope watcher failed");
+    expect(f.handle.stopDebt?.()).toBe(debt);
+    expect(f.unconfirmed).toHaveBeenCalledOnce();
+    expect(fs.readdirSync("/proc/self/fd").length).toBe(baseline + 1);
+    expect(fs.fstatSync(fd).isDirectory()).toBe(true); // still needed for teardown
+    await f.close(); f.depart();
+    await expect(f.handle.stop()).rejects.toThrow("teardown still unconfirmed");
+    expect(fs.readdirSync("/proc/self/fd").length).toBe(baseline + 1);
+    expect(fs.fstatSync(fd).isDirectory()).toBe(true); // failed stop cannot surrender it
+    stop.mockResolvedValue("cgroup.kill");
+    await f.handle.stop();
+    expect(stop).toHaveBeenCalledTimes(2);
+    expect(stop).toHaveBeenLastCalledWith(expect.objectContaining({ fd }), { termMs: 2_000, killMs: 2_000 });
+    expect(fs.readdirSync("/proc/self/fd").length).toBe(baseline);
+    expect(f.closeEvents.mock.calls.filter(([closedFd]) => closedFd === fd)).toHaveLength(1);
+    expect(() => fs.fstatSync(fd)).toThrow();
+    await f.handle.stop(); // descriptor release and successful stop are idempotent
+    expect(stop).toHaveBeenCalledTimes(2);
+    expect(fs.readdirSync("/proc/self/fd").length).toBe(baseline);
+    await expect(f.handle.treeClosed).rejects.toBe(error); // no fabricated clean receipt
+    expect(f.handle.lostContact()).toBe(debt);
+    expect(f.handle.stopDebt?.()).toBe(debt);
+    expect(f.unconfirmed).toHaveBeenCalledOnce();
+    expect(deletes).toHaveBeenCalledWith(expect.stringContaining("fabric-scope-"), { recursive: true, force: true });
   });
 
   it("rejects and retains custody if an admitted watcher later fails", async () => {

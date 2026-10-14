@@ -440,6 +440,79 @@ const refused = async (transport: ProcessTransport, request: Awaited<ReturnType<
 };
 
 describe.skipIf(process.platform !== "linux" || !isV2)("ProcessTransport task memory cap mechanism (smarty-dev#8257)", () => {
+  // Trust-boundary countertests (#11898): indeterminate host probes cannot authorize uncapped work.
+  const probeCases = [
+    ...["bus socket", "memory delegation"].flatMap(probe => [undefined, "batch.slice"].flatMap(slice =>
+      ["EIO", "EACCES"].map(errno => ({ probe, errno, slice, operation: probe === "bus socket" ? "stat" : "read" })))),
+    ...["stat", "read"].flatMap(operation => ["EIO", "EACCES"].flatMap(errno =>
+      [undefined, "batch.slice"].map(slice => ({ probe: "cgroup controllers", errno, slice, operation })))),
+    ...["EIO", "EACCES"].map(errno => ({ probe: "systemd-run executable", errno, slice: "batch.slice", operation: "stat" })),
+  ];
+  it.each(probeCases)("astra-p2: $probe $operation $errno refuses before any spawn (slice=$slice)", async ({ probe, errno, slice, operation }) => {
+    const f = await fixture("live"); // restore both bus variables after smarty-test-env scrubs them
+    const statSync = fs.statSync;
+    const readFileSync = fs.readFileSync;
+    const target = probe === "bus socket" ? path.join(f.root, "run/bus")
+      : probe === "cgroup controllers" ? "/sys/fs/cgroup/cgroup.controllers"
+      : probe === "systemd-run executable" ? path.join(f.root, "systemd-run")
+      : `/sys/fs/cgroup/user.slice/user-${process.getuid!()}.slice/user@${process.getuid!()}.service/cgroup.subtree_control`;
+    const failure = Object.assign(new Error(errno), { code: errno });
+    if (operation === "read") {
+      vi.spyOn(fs, "readFileSync").mockImplementation(((file: fs.PathOrFileDescriptor, ...rest: unknown[]) => {
+        if (String(file) === target) throw failure;
+        return (readFileSync as (...a: unknown[]) => string | Buffer)(file, ...rest);
+      }) as typeof fs.readFileSync);
+    } else {
+      vi.spyOn(fs, "statSync").mockImplementation(((file: fs.PathLike, ...rest: unknown[]) => {
+        if (String(file) === target) throw failure;
+        return (statSync as (...a: unknown[]) => fs.Stats)(file, ...rest);
+      }) as typeof fs.statSync);
+    }
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const authorize = vi.fn(() => true); // spawnDetached consults authority before spawning
+    const outcome = await new ProcessTransport(slice).launch({ ...f.request, authorize })
+      .then(async handle => { await handle.stop(); await handle.waitForClose?.(); return handle; }, (error: unknown) => error);
+    expect(outcome).toBeInstanceOf(Error);
+    expect(outcome).toMatchObject({ name: "TaskScopeProbeError", code: "TASK_SCOPE_PROBE_UNKNOWN", probe, errno, cause: failure });
+    expect((outcome as Error).message).toContain(probe);
+    expect((outcome as Error).message).toContain(errno);
+    expect(authorize).not.toHaveBeenCalled();
+    expect(warn).not.toHaveBeenCalled();
+    expect(scopeArgs(f.root)).toBeUndefined();
+    expect(fs.existsSync(path.join(f.root, "started"))).toBe(false);
+  });
+
+  it.each([
+    { probe: "bus socket", operation: "stat", slice: undefined },
+    { probe: "cgroup controllers", operation: "stat", slice: undefined },
+    { probe: "cgroup controllers", operation: "read", slice: undefined },
+    { probe: "memory delegation", operation: "read", slice: undefined },
+    { probe: "systemd-run executable", operation: "stat", slice: "batch.slice" },
+  ])("astra-p2: $probe $operation ENOENT remains verified-unsupported and launches directly", async ({ probe, operation, slice }) => {
+    const f = await fixture("live");
+    const statSync = fs.statSync;
+    const readFileSync = fs.readFileSync;
+    const target = probe === "bus socket" ? path.join(f.root, "run/bus")
+      : probe === "cgroup controllers" ? "/sys/fs/cgroup/cgroup.controllers"
+      : probe === "systemd-run executable" ? path.join(f.root, "systemd-run")
+      : `/sys/fs/cgroup/user.slice/user-${process.getuid!()}.slice/user@${process.getuid!()}.service/cgroup.subtree_control`;
+    const failure = Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+    if (operation === "read") {
+      vi.spyOn(fs, "readFileSync").mockImplementation(((file: fs.PathOrFileDescriptor, ...rest: unknown[]) => {
+        if (String(file) === target) throw failure;
+        return (readFileSync as (...a: unknown[]) => string | Buffer)(file, ...rest);
+      }) as typeof fs.readFileSync);
+    } else {
+      vi.spyOn(fs, "statSync").mockImplementation(((file: fs.PathLike, ...rest: unknown[]) => {
+        if (String(file) === target) throw failure;
+        return (statSync as (...a: unknown[]) => fs.Stats)(file, ...rest);
+      }) as typeof fs.statSync);
+    }
+    const handle = await launch(new ProcessTransport(slice), f.request, f.root);
+    expect(scopeArgs(f.root)).toBeUndefined();
+    expect(handle.cgroup).toBeUndefined();
+  });
+
   it("an eligible task requests a capped fabric-task scope in app.slice with swap 0; an unverifiable receipt fails typed with no worker", async () => {
     const f = await fixture("live");
     await refused(new ProcessTransport(undefined, undefined, undefined, 24 * GIB), f.request, f.root);

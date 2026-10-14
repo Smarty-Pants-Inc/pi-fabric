@@ -581,6 +581,13 @@ export const spawnDetached = async (
   const posix = process.platform !== "win32";
   let treeConfirmed = false;
   let boundaryReleased = false;
+  // Physical boundary ownership is independent of the one-shot tree receipt.
+  // A failed watcher settles that receipt, but teardown still needs this fd.
+  const releaseBoundary = (): void => {
+    if (!boundary || boundaryReleased) return;
+    fs.closeSync(boundary.fd);
+    boundaryReleased = true;
+  };
   let treeFinished = false;
   let nativeClosed = false;
   // Receipt existence, not merely requested scope admission, enables events.
@@ -625,7 +632,7 @@ export const spawnDetached = async (
     else {
       treeConfirmed = true;
       // Populated-0 receipt: the leaf is empty and may be collected; release its descriptor.
-      if (boundary && !boundaryReleased) { boundaryReleased = true; fs.closeSync(boundary.fd); }
+      releaseBoundary();
       releaseScratch();
       resolveTree();
     }
@@ -737,7 +744,7 @@ export const spawnDetached = async (
       return true;
     } catch (error) {
       cappedRefusal = String(error);
-      if (boundary) { fs.closeSync(boundary.fd); boundary = undefined; }
+      if (boundary) { releaseBoundary(); boundary = undefined; }
       // Scope launch is not replayed. This SAME worker keeps legacy checked
       // monitoring, with no treeClosed receipt and no event census deadline.
       scopeWatcher?.close();
@@ -772,7 +779,8 @@ export const spawnDetached = async (
       const pending = (async () => {
         // Verified capped boundary: the owned leaf, not a /proc census, defines
         // the tree, so setsid/separately grouped descendants are inside it.
-        const verified = boundary && gateReleased ? boundary : undefined;
+        // An admitted leaf also owns the unreleased shim on refusal paths.
+        const verified = boundary;
         if (verified) {
           if (!treeConfirmed && !boundaryReleased) {
             const current = birth && !exited ? linuxGroupMember(pid) : undefined;
@@ -787,6 +795,9 @@ export const spawnDetached = async (
             }
             await stopTaskCgroup(verified, { termMs: STOP_TERM_MS, killMs: STOP_KILL_MS });
           }
+          // Successful teardown proves emptiness even if finishTree(error)
+          // already latched the immutable failed observation receipt.
+          releaseBoundary();
           // Empty owned leaf proves no execution descendant remains inside it.
           // Only this uncertainty is cleared; recorded watcher/native-close debt stays.
           executionPending = false;
@@ -947,7 +958,7 @@ export const spawnDetached = async (
       }
       // Unproven capped admission: EOF makes the shim exit 125 before the worker runs.
       gate?.destroy();
-      if (!nativeClosed) await handle.stop();
+      if (!nativeClosed || (boundary && !boundaryReleased)) await handle.stop();
       if (handle.lostContact()) throw new Error(handle.lostContact());
       if (await handle.isAlive()) throw new Error("Scope termination is unconfirmed; custody retained");
       assertTransportLaunchAllowed(authority);

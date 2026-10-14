@@ -24,10 +24,14 @@ const entryArgs = (file: string, kind?: "f" | "d") => { const stat = fs.lstatSyn
     (stat.mtimeNs / 100n + 116_444_736_000_000_000n).toString(16), stat.size.toString(16), path.toNamespacedPath(file)]; };
 
 // Foreign-owner fixture (smarty-dev#7858 / #4664): bounded Windows PowerShell 5.1 children, inputs by environment only.
+// PSModulePath is dropped (Windows env keys are case-insensitive): node spawned from pwsh inherits pwsh 7's module
+// path, and 5.1 then fails to load Microsoft.PowerShell.Security (Get-Acl). 5.1 rebuilds its default path itself.
+const withoutModulePath = (env: Record<string, string | undefined>) =>
+  Object.fromEntries(Object.entries(env).filter(([key]) => key.toLowerCase() !== "psmodulepath"));
 const powershell = (script: string, env: Record<string, string> = {}) => spawnSync("powershell.exe",
   // -EncodedCommand (UTF-16LE base64): no command-line quoting of the script at all.
   ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", Buffer.from(script, "utf16le").toString("base64")],
-  { encoding: "utf8", timeout: 90_000, windowsHide: true, env: { ...process.env, ...env } });
+  { encoding: "utf8", timeout: 90_000, windowsHide: true, env: { ...withoutModulePath(process.env), ...withoutModulePath(env) } });
 const brief = (result: { status: number | null; error?: Error | undefined; stdout: unknown; stderr: unknown }): string =>
   `exit ${String(result.status)}${result.error ? ` ${result.error.message}` : ""}: ${`${String(result.stdout)} ${String(result.stderr)}`.replace(/\s+/g, " ").trim().slice(0, 300)}`;
 /** This process's token SIDs, as the helper reads them: TokenUser and TokenOwner (WindowsIdentity.User / .Owner). */
@@ -37,11 +41,11 @@ const tokenSids = (): { user: string; owner: string } => {
   if (result.status !== 0 || !match) throw new Error(`token SID query failed (${brief(result)})`);
   return { user: match[1]!, owner: match[2]! };
 };
-/** The owner SID Get-Acl reads now (undefined when it cannot be read). */
-const aclOwner = (file: string): string | undefined => {
+/** The owner SID Get-Acl reads now (sid undefined when it cannot be read), with that child's brief() as trace. */
+const aclOwner = (file: string): { sid: string | undefined; trace: string } => {
   const result = powershell("(Get-Acl -LiteralPath $env:FABRIC_TEST_FILE).GetOwner([Security.Principal.SecurityIdentifier]).Value", { FABRIC_TEST_FILE: file });
   const sid = String(result.stdout).trim();
-  return result.status === 0 && /^S-1-[\d-]+$/.test(sid) ? sid : undefined;
+  return { sid: result.status === 0 && /^S-1-[\d-]+$/.test(sid) ? sid : undefined, trace: `Get-Acl ${brief(result)}` };
 };
 /** Sets only the owner section, with SeRestorePrivilege enabled in THIS child's own token (process-local, gone at its
  * exit; it is only enabled if already held: nothing global changes). Exit 5 when the privilege is not held. */
@@ -79,12 +83,12 @@ const setOwner = (file: string, sid: string): { changed: boolean; trace: string[
   const trace: string[] = [];
   const icacls = spawnSync("icacls", [file, "/setowner", `*${sid}`], { encoding: "utf8", timeout: 30_000, windowsHide: true });
   let now = aclOwner(file);
-  trace.push(`icacls /setowner *${sid}: ${brief(icacls)}; Get-Acl owner ${String(now)}`);
-  if (now === sid) return { changed: true, trace };
+  trace.push(`icacls /setowner *${sid}: ${brief(icacls)}; Get-Acl owner ${String(now.sid)} (${now.trace})`);
+  if (now.sid === sid) return { changed: true, trace };
   const privileged = powershell(PRIVILEGED_SET_OWNER, { FABRIC_TEST_FILE: file, FABRIC_TEST_SID: sid });
   now = aclOwner(file);
-  trace.push(`SetAccessControl (SeRestorePrivilege) ${sid}: ${brief(privileged)}; Get-Acl owner ${String(now)}`);
-  return { changed: now === sid, trace };
+  trace.push(`SetAccessControl (SeRestorePrivilege) ${sid}: ${brief(privileged)}; Get-Acl owner ${String(now.sid)} (${now.trace})`);
+  return { changed: now.sid === sid, trace };
 };
 
 describe.runIf(process.env.GITHUB_ACTIONS === "true" && process.platform === "win32")("Windows verified removal (smarty-dev#7858)", () => {
@@ -257,7 +261,7 @@ describe.runIf(process.env.GITHUB_ACTIONS === "true" && process.platform === "wi
     const contents = "foreign owner\n";
     fs.writeFileSync(file, contents);
     const original = aclOwner(file);
-    expect(original, "a fresh file's owner").toBeDefined();
+    expect(original.sid, `a fresh file's owner (${original.trace})`).toBeDefined();
     const set = setOwner(file, foreign!);
     try {
       // Never a silent pass: without the privilege to give the file away, this test is reported skipped, with why.
@@ -274,12 +278,13 @@ describe.runIf(process.env.GITHUB_ACTIONS === "true" && process.platform === "wi
       expect(ids(file)).toEqual(id);
       expect(fs.lstatSync(file).size).toBe(Buffer.byteLength(contents));
       expect(fs.readdirSync(dir)).toEqual(["foreign.bak"]);
-      expect(aclOwner(file)).toBe(foreign);
+      const surviving = aclOwner(file);
+      expect(surviving.sid, `the surviving file's owner (${surviving.trace})`).toBe(foreign);
     } finally {
       // Give the fixture its original owner back before the temp dir teardown (best effort; the DACL entry made for us
       // at creation still allows the delete). Only this one temp file is ever touched.
-      if (aclOwner(file) !== original) {
-        const back = setOwner(file, original!);
+      if (aclOwner(file).sid !== original.sid) {
+        const back = setOwner(file, original.sid!);
         if (!back.changed) console.warn(`[foreign-owner fixture] owner not reverted: ${back.trace.join(" | ")}`);
       }
     }

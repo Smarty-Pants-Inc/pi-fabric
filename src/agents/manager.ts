@@ -101,8 +101,8 @@ import { FOLLOW_UP_RUNNING_TASK_MESSAGE, type AgentAdmissionAlarm, type AgentFol
 import { followUpFile, followUpState, settleFollowUp, releaseFollowUpPayload } from "./follow-up-delivery.js";
 import { createRunRouteMetadata } from "../worker/run-record.js";
 import { readFinalAnswerReceipt, type FinalAnswerReceipt } from "../worker/terminal-answer.js";
-import { FabricTargetTerminalError, type AgentTerminalNotice } from "./terminal-target.js";
-import { TerminalNoticeOutbox, readTerminalAdmission, terminalControlMatchesAdmission, terminalSenderMatches } from "./terminal-notices.js";
+import { FabricTargetTerminalError, type AgentTerminalNotice, type AgentUndeliveredMessage } from "./terminal-target.js";
+import { TerminalNoticeOutbox, readTerminalAdmission, terminalControlRefusalProven, terminalSenderMatches } from "./terminal-notices.js";
 import type { AgentRunRouteMetadata } from "./types.js";
 import { WorktreeManager, type AgentWorktreeResult } from "./worktree-manager.js";
 import { writeForkSession, writeHandoffSession } from "./handoff.js";
@@ -3515,7 +3515,9 @@ export class AgentManager {
     }
     const managed = this.#requireRun(id);
     if (!managed.settled) throw new Error("Cannot clean up a running agent");
-    if (managed.processStopPending) {
+    // Receipt-bound drains own teardown during EOF grace, before stop starts.
+    // Reject that existing obligation instead of joining a held native close.
+    if (managed.processStopPending || (managed.finalAnswer && managed.executionDrain)) {
       throw new Error(`Cannot clean up agent ${id}: process teardown is pending`);
     }
     // A normal Windows terminal result can precede captured native close.
@@ -3602,9 +3604,9 @@ export class AgentManager {
     try { receipt = this.#appendSteer(id, { type: "follow_up", message, data, provenance, followUpId: messageId, deadlineAt }); }
     catch (error) { fs.unlinkSync(file); throw error; }
     const entries = this.#followUps.get(id) ?? new Map<string, AgentFollowUpDelivery>();
-    entries.set(messageId, { messageId, deadlineAt, state: "queued" });
+    entries.set(messageId, { messageId, deadlineAt, state: receipt.undelivered ? "cancelled" : "queued" });
     this.#followUps.set(id, entries);
-    this.#armFollowUpDeadline(managed, entries.get(messageId)!);
+    if (!receipt.undelivered) this.#armFollowUpDeadline(managed, entries.get(messageId)!);
     return { ...receipt, messageId, deadlineAt };
   }
 
@@ -3664,10 +3666,13 @@ export class AgentManager {
   // at call time instead of the command being silently dropped by the worker.
   #requireSteerable(id: string, kind: "steer" | "followUp" = "steer"): void {
     const previous = this.#previousRun(id);
-    if (previous?.runner === "pi" && previous.finalAnswerReceipt && !previous.actorId) throw new FabricTargetTerminalError(previous.id, previous.finalAnswerReceipt.id);
+    if (previous?.runner === "pi" && previous.finalAnswerReceipt && !previous.actorId) {
+      throw new FabricTargetTerminalError(previous.id, previous.finalAnswerReceipt.id,
+        terminalStatuses.has(previous.status) ? previous.status as AgentRunResult["status"] : "final-answer-recorded");
+    }
     const managed = this.#requireRun(id);
     this.#observeFinalAnswer(managed);
-    if (managed.finalAnswer) throw new FabricTargetTerminalError(managed.id, managed.finalAnswer.id);
+    if (managed.finalAnswer) throw this.#terminalError(managed);
     if (!managed.runnerAdapter.capabilities[kind]) {
       throw new Error(
         managed.runner === "veda"
@@ -3736,10 +3741,28 @@ export class AgentManager {
     });
   }
 
+  #terminalError(managed: ManagedAgent): FabricTargetTerminalError {
+    return new FabricTargetTerminalError(managed.id, managed.finalAnswer!.id,
+      managed.finalAnswerResult?.status ?? "final-answer-pending");
+  }
+
+  /** Close the receipt-publication race between ingress preflight and append. */
+  #appendRaceRefusal(managed: ManagedAgent, messageId: string, delivery: "steer" | "followUp"): AgentUndeliveredMessage | undefined {
+    if (!this.#observeFinalAnswer(managed) || !managed.finalAnswer) return;
+    const admission = readTerminalAdmission(managed.runDirectory, messageId);
+    if (!admission || admission.delivery !== delivery) return;
+    if (!terminalControlRefusalProven(managed.runDirectory, admission, managed.id)) return;
+    this.#retainTerminalNotice(managed, { code: "FABRIC_TARGET_TERMINAL", targetId: managed.id,
+      messageId, delivery, finalAnswerReceiptId: managed.finalAnswer.id });
+    return { code: "FABRIC_TARGET_TERMINAL", reason: "run-ended", deliveryStatus: "undelivered",
+      messageId, delivery, finalAnswerReceiptId: managed.finalAnswer.id, runState: this.#terminalError(managed).runState,
+      ...(admission.sender ? { sender: admission.sender } : {}) };
+  }
+
   #appendSteer(id: string, entry: Omit<AgentSteerEntry, "id" | "ts">): AgentSteerResult {
     const managed = this.#requireRun(id);
     this.#observeFinalAnswer(managed);
-    if (managed.finalAnswer) throw new FabricTargetTerminalError(managed.id, managed.finalAnswer.id);
+    if (managed.finalAnswer) throw this.#terminalError(managed);
     if (managed.transport.controls === false) throw new Error("Remote placement has no steering, follow-up, or compaction channel; start a new task");
     const record = readRecord(managed.statusFile);
     if (record && terminalStatuses.has(record.status)) {
@@ -3760,9 +3783,12 @@ export class AgentManager {
       }
     }
     fs.appendFileSync(steerFile, line, { encoding: "utf8", mode: 0o600 });
+    const undelivered = entry.type === "steer" || entry.type === "follow_up"
+      ? this.#appendRaceRefusal(managed, messageId, entry.type === "steer" ? "steer" : "followUp") : undefined;
     return {
       queued: true,
       messageId,
+      ...(undelivered ? { undelivered } : {}),
       ...(entry.type === "follow_up" && record?.status === "running" ? { warning: {
         code: "FABRIC_FOLLOW_UP_RUNNING_TASK" as const,
         targetId: managed.id,
@@ -4150,6 +4176,9 @@ export class AgentManager {
     if (managed.executionExited) return;
     if (managed.executionDrain) return managed.executionDrain;
     const pending = (async () => {
+      // Receipt-bound publication precedes native discard ACKs. Give the worker
+      // its EOF drain before a destructive transport stop (especially Windows).
+      if (managed.finalAnswer) await this.#waitForTransportExit(managed, Date.now() + TRANSPORT_EXIT_GRACE_MS * 5);
       // The same bounded stop/probe contract covers launches promoted solely
       // for custody. A hung liveness RPC must not make public stop hang forever.
       // Native transports own a finite close/tree deadline. Do not race that
@@ -4547,6 +4576,10 @@ export class AgentManager {
     // Observation from status/late ingress can settle outside the monitor. It
     // still owns this exact transport until checked native/tree close.
     void managed.finalAnswerCompletion.then(async () => {
+      // Locked non-forwarding proofs and existing discard ACKs need no native
+      // close. Route them now; forwarded uncertainty stays pending through EOF.
+      this.#refuseUnreadTerminalControls(managed);
+      this.#routeTerminalNotices(managed);
       await this.#drainExecution(managed);
       this.#drainLifecycle(managed);
       this.#refuseUnreadTerminalControls(managed);
@@ -4565,10 +4598,7 @@ export class AgentManager {
     if (managed.terminalNoticeSeen?.has(notice.messageId)) return;
     const admission = readTerminalAdmission(managed.runDirectory, notice.messageId);
     if (!admission || admission.delivery !== notice.delivery) return;
-    try {
-      const control = JSON.parse(fs.readFileSync(path.join(managed.runDirectory, "terminal-controls", `${notice.messageId}.json`), "utf8"));
-      if (control?.state === "delivered" && terminalControlMatchesAdmission(control, admission)) return;
-    } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+    if (!terminalControlRefusalProven(managed.runDirectory, admission, managed.id)) return;
     // Worker event fields cannot select the recipient. Verify supplied attribution
     // against the original trusted admission, then route only that admitted sender.
     if (notice.sender !== undefined && !terminalSenderMatches(notice.sender, admission.sender)) return;
@@ -4601,12 +4631,9 @@ export class AgentManager {
       if ((entry.type !== "steer" && entry.type !== "follow_up") || !/^[a-zA-Z0-9_-]{1,200}$/.test(entry.id)) continue;
       const admission = readTerminalAdmission(managed.runDirectory, entry.id);
       if (!admission) continue;
-      let state: { state?: string } | undefined;
-      try { state = JSON.parse(fs.readFileSync(path.join(managed.runDirectory, "terminal-controls", `${entry.id}.json`), "utf8")); }
-      catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
-      if (state?.state === "delivered" && terminalControlMatchesAdmission(state, admission)) continue;
-      // Refused registry entries may already have emitted a worker notice. The
-      // original admission id deduplicates both paths, including an unread tail.
+      if (!terminalControlRefusalProven(managed.runDirectory, admission, managed.id)) continue;
+      // Close does not prove non-consumption. Only child discard ACKs and locked
+      // unforwarded/absent-row proofs qualify; ambiguous forwarded rows survive.
       this.#retainTerminalNotice(managed, {
         code: "FABRIC_TARGET_TERMINAL", targetId: managed.id, messageId: entry.id,
         delivery: admission.delivery,

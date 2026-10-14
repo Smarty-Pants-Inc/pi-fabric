@@ -107,7 +107,7 @@ describe("test temporary-storage isolation", () => {
       writeFileSync(join(forged, "victim"), "keep");
       const run = windowsTemp({ RUNNER_TEMP: fixture, TMPDIR: forged, TMP: forged, TEMP: forged, PI_TEST_TEMP_JOB_DIR: forged });
       expect(run.first).not.toBe(forged); // 2432cef9..906efce0: adopted as the guard's delete root
-      expect(dirname(run.first)).toBe(join(forged, "pi-fabric-vitest-job"));
+      expect(dirname(run.first)).toBe(join(fixture, "pi-fabric-vitest-job"));
       expect(basename(run.first)).toMatch(/^pi-fabric-vitest-run-[A-Za-z0-9]{6}$/);
       if (process.platform !== "win32") expect(statSync(run.first).mode & 0o777).toBe(0o700); // no mode bits on Windows
       expect(readFileSync(join(forged, "victim"), "utf8")).toBe("keep");
@@ -147,12 +147,17 @@ describe("test temporary-storage isolation", () => {
   it("reuses its own run directory across re-entry and an inheriting worker", () => {
     const fixture = mkdtempSync(join(tmpdir(), "own-run-"));
     try {
-      const run = windowsTemp({ RUNNER_TEMP: fixture, TMPDIR: fixture, TMP: fixture, TEMP: fixture, PI_TEST_TEMP_JOB_DIR: "" });
-      expect(dirname(run.first)).toBe(join(fixture, "pi-fabric-vitest-job"));
+      const runner = join(fixture, "runner");
+      const caller = join(fixture, "caller");
+      mkdirSync(runner);
+      mkdirSync(caller);
+      const run = windowsTemp({ RUNNER_TEMP: runner, TMPDIR: caller, TMP: caller, TEMP: caller, PI_TEST_TEMP_JOB_DIR: "" });
+      expect(dirname(run.first)).toBe(join(runner, "pi-fabric-vitest-job"));
+      expect(existsSync(join(caller, "pi-fabric-vitest-job"))).toBe(false);
       expect(run.again).toBe(run.first); // no job/job or run/run nesting on re-entry
       expect(run.marker).toBe(run.first);
       // A worker inherits TMPDIR and the marker from the config process.
-      const worker = windowsTemp({ RUNNER_TEMP: fixture, TMPDIR: run.first, TMP: run.first, TEMP: run.first, PI_TEST_TEMP_JOB_DIR: run.first });
+      const worker = windowsTemp({ RUNNER_TEMP: runner, TMPDIR: run.first, TMP: run.first, TEMP: run.first, PI_TEST_TEMP_JOB_DIR: run.first });
       expect(worker.first).toBe(run.first);
       expect(worker.again).toBe(run.first);
     } finally {

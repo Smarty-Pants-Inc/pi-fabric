@@ -28,7 +28,8 @@ const ownedRootCleanup = (directory: string): (() => void) => {
 // Git Bash in the next run starts with "bash.exe: warning: could not find /tmp, please create!"
 // on stderr. On a Windows CI runner, reuse one path per job and leave it for the runner
 // to clean: no test process owns this shared parent or the lifetime of a pinned /tmp.
-// RUNNER_TEMP selects job lifetime only; caller TMPDIR remains the allocation boundary.
+// RUNNER_TEMP also keeps Windows paths on the runner's checkout volume, so drive-relative
+// paths resolve on that drive and temp I/O uses runner storage rather than caller TMPDIR.
 // Not PI_FABRIC_-prefixed: isolateTestFleetEnvironment keeps it, so workers and children inherit it.
 const jobTempMarker = "PI_TEST_TEMP_JOB_DIR";
 const escapeRegExp = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -56,17 +57,17 @@ const stableRoot = (prefix: string): string | undefined => {
   const runnerTemp = process.env.RUNNER_TEMP;
   if (process.platform !== "win32" || !runnerTemp) return;
   // Never adopt a directory this run did not create (smarty-dev#11145 r5). The first call makes a fresh private
-  // mkdtemp child of `<caller TMPDIR>/<prefix>job` and exports it as the marker; vitest.config makes it TMPDIR, so
+  // mkdtemp child of `<RUNNER_TEMP>/<prefix>job` and exports it as the marker; vitest.config makes it TMPDIR, so
   // a later call in that process or an inheriting child (a config probe, a worker) stands in it and reuses it
   // without nesting. A marker that is not such a child, or not the current TMPDIR, is ignored: a new child is made.
   // The shared `<prefix>job` root itself is never a run directory, so it never becomes the deletion guard's root.
-  const base = resolve(tmpdir());
+  const currentTemp = resolve(tmpdir());
   const inherited = process.env[jobTempMarker];
-  if (inherited !== undefined && resolve(inherited) === base && ownRunDirectory(base, prefix)) return base;
-  const jobRoot = join(base, `${prefix}job`);
+  if (inherited !== undefined && resolve(inherited) === currentTemp && ownRunDirectory(currentTemp, prefix)) return currentTemp;
+  const jobRoot = join(resolve(runnerTemp), `${prefix}job`);
   mkdirSync(jobRoot, { recursive: true });
   if (!lstatSync(jobRoot).isDirectory()) {
-    throw new Error(`Windows job temp must be a real directory inside caller TMPDIR: ${jobRoot}`);
+    throw new Error(`Windows job temp must be a real directory inside RUNNER_TEMP on the runner's checkout volume: ${jobRoot}`);
   }
   const directory = mkdtempSync(join(jobRoot, `${prefix}run-`));
   process.env[jobTempMarker] = directory;
@@ -76,15 +77,15 @@ const stableRoot = (prefix: string): string | undefined => {
 /** Tests must never prune a real session's caches or leave their own behind. */
 export function isolatedTestTemp(prefix: string): Record<"TMPDIR" | "TMP" | "TEMP", string> {
   if (!prefix || prefix === "." || prefix === ".." || /[/\\]/.test(prefix)) {
-    throw new Error("Test temp prefix must be a single name inside caller TMPDIR");
+    throw new Error("Test temp prefix must be a single name inside the test temp base");
   }
   const sharedDirectory = stableRoot(prefix);
   if (sharedDirectory) {
     // Config probes and workers share this path; their exit must not delete live siblings.
     return { TMPDIR: sharedDirectory, TMP: sharedDirectory, TEMP: sharedDirectory };
   }
-  // Long paths stay private. Socket fixtures that need shorter paths must use a shorter
-  // caller TMPDIR or refuse explicitly; never relocate into a shared /tmp fallback.
+  // Outside Windows runner jobs, long paths stay private. Socket fixtures that need shorter
+  // paths must use a shorter caller TMPDIR or refuse explicitly; never use a shared /tmp fallback.
   const directory = mkdtempSync(join(resolve(tmpdir()), prefix));
   process.once("exit", ownedRootCleanup(directory));
   return { TMPDIR: directory, TMP: directory, TEMP: directory };

@@ -4273,10 +4273,13 @@ export class AgentManager {
         // A continuation rewrites the run's input in place. The prompt metadata
         // stays bound to the original spawn brief; it is never recomputed from
         // this same-run continuation (smarty-dev#11663).
-        writePrivateFileAtomic(path.join(managed.runDirectory, "task.txt"), Buffer.from(resume.task, "utf8"));
         const currentInput = promptMetadata(resume.task, managed.promptPath ?? path.join(managed.runDirectory, "task.txt"));
         managed.inputSha256 = currentInput.inputSha256;
         managed.inputBytes = currentInput.inputBytes;
+        // Publish the new input identity before replacing the bytes. A host death
+        // between these writes leaves a detectable mismatch, never a false match.
+        writeRecord(managed.statusFile, this.#withTransportMetadata(record, managed, false));
+        writePrivateFileAtomic(path.join(managed.runDirectory, "task.txt"), Buffer.from(resume.task, "utf8"));
         setWorkerArgument(managed.launch.workerArguments, "input-sha256", currentInput.inputSha256);
         setWorkerArgument(managed.launch.workerArguments, "input-bytes", String(currentInput.inputBytes));
         setWorkerArgument(
@@ -4395,14 +4398,13 @@ export class AgentManager {
       } catch {
         // The status record below still carries the failure.
       }
-      const failed = {
+      const failed = this.#withTransportMetadata({
         ...record,
         // Keep the run's real progress: the relaunch failed, not the attempt.
         turns: Math.max(record.turns, managed.observedProgress.turns),
         toolCalls: Math.max(record.toolCalls, managed.observedProgress.toolCalls),
         error: `${record.error ?? "Agent run failed"} · relaunch failed: ${retryError}`,
-      };
-      Object.assign(failed, managed.runRoute);
+      }, managed, false);
       writeRecord(managed.statusFile, failed);
       managed.latestRecord = failed;
       managed.relaunchFailure = failed;

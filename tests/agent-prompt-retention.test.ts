@@ -23,6 +23,7 @@ import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { AgentManager } from "../src/agents/manager.js";
 import type { AgentRunRecord } from "../src/agents/types.js";
 import { sweepTempRunRoots } from "../src/storage/retention.js";
+import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 
 const managers: AgentManager[] = [];
 const roots: string[] = [];
@@ -122,6 +123,50 @@ describe("Agent prompt retention at manager close (#11663)", () => {
       inputBytes: beforeClose.inputBytes,
     });
     expect(savedStatus(taskPath).promptRetentionDropped).toBeUndefined();
+  });
+
+  it("persists the rewritten current digest when a continuation launch fails before manager close", async () => {
+    const { manager } = fixture();
+    const original = "RESUME_AFTER_STOP\noriginal launch-failure brief π\n";
+    const launch = ProcessTransport.prototype.launch;
+    let launches = 0;
+    const launchSpy = vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async function (this: ProcessTransport, request) {
+      if (++launches === 2) throw new Error("replacement launch failed");
+      return launch.call(this, request);
+    });
+    let renameSpy: ReturnType<typeof vi.spyOn> | undefined;
+    try {
+      const handle = await manager.spawn({ task: original, transport: "process" });
+      const taskPath = handle.promptPath!;
+      const rename = fs.renameSync.bind(fs);
+      let sawPreRewriteMismatch = false;
+      renameSpy = vi.spyOn(fs, "renameSync").mockImplementation((source, target) => {
+        if (String(target) === taskPath) {
+          const intermediate = savedStatus(taskPath);
+          expect(intermediate.promptSha256).toBe(hash(original));
+          expect(intermediate.inputSha256).not.toBe(hash(fs.readFileSync(taskPath)));
+          sawPreRewriteMismatch = true;
+        }
+        rename(source, target);
+      });
+      const result = await manager.wait(handle.id);
+      expect(result.error).toContain("replacement launch failed");
+      expect(launches).toBe(2);
+      expect(sawPreRewriteMismatch).toBe(true);
+      // Simulate host death before close: authenticate the on-disk record now,
+      // not the manager-enriched public result or close-time status rewrite.
+      const persisted = savedStatus(taskPath);
+      const bytes = fs.readFileSync(taskPath);
+      expect(persisted.promptSha256).toBe(hash(original));
+      expect(persisted.promptBytes).toBe(Buffer.byteLength(original));
+      expect(persisted.promptPath).toBe(taskPath);
+      expect(persisted.inputSha256).toBe(hash(bytes));
+      expect(persisted.inputBytes).toBe(bytes.byteLength);
+      expect(persisted.inputSha256).not.toBe(persisted.promptSha256);
+    } finally {
+      renameSpy?.mockRestore();
+      launchSpy.mockRestore();
+    }
   });
 
   it("drops an oversized failed prompt but keeps its bounded status record", async () => {

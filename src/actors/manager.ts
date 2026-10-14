@@ -581,34 +581,73 @@ const activationBlockExpired = (blocked: Parameters<typeof activationBlockExpire
 /** class is derived from code (never trusted from a stored record); blockedAt is the latest failure;
  * a transient block carries backoffMs (its current cooldown) and retryAt (its expiry). */
 type ActivationBlock = { reason: string; code: string; class: ActivationBlockClass; since: number; blockedAt: number; count: number;
-  retryAt?: number; backoffMs?: number; classification: string };
+  retryAt?: number; backoffMs?: number; classification: string;
+  /** No raw failure text: whether the complete run error/warnings authorised overflow recovery. */
+  overflowEvidence?: { version: 1; runId?: string; complete: boolean } };
 /** Codes whose stored classification carries no evidence a newer rule could overturn into a
  * permanent cause: a fail-closed "unknown" (its full failure was already scanned for a permanent
  * cause and had none) and the fixed "failing-preparation" text (a preparation timeout is
  * transient since smarty-dev#6509). Re-derived from the stored reason on load, so an actor an
  * older host blocked for good on a transient cause recovers after an upgrade without a re-create. */
 const REDERIVED_BLOCK_CODES: ReadonlySet<string> = new Set(["unknown", "failing-preparation"]);
-/** Recognisable contradictory causes override a legacy overflow tag, never weaken auth/security. */
-const CONTRADICTORY_OVERFLOW_CODES: ReadonlySet<string> = new Set(["provider-transient", "auth", "permission", "security-policy", "quota"]);
+/** Recognisable contradictory causes override an overflow tag, never weaken permanent failures. */
+const CONTRADICTORY_OVERFLOW_CODES: ReadonlySet<string> = new Set(["provider-transient", "auth", "permission", "security-policy", "quota", "invalid-request"]);
+// Context-only wording must not hide an independent permanent cause, nor turn a
+// correctly typed provider overflow ("prompt is too long") into invalid configuration.
+const OVERFLOW_WORDING = /Context exceeds window|prompt (?:is )?too long|maximum context length|context(?:[ _-]+(?:window|length))?[ _-]+(?:overflow|exceeded|too long)|too many tokens/gi;
+const classifyManagerActivationFailure = (input: Parameters<typeof classifyActivationFailure>[0], typedOverflow = false): ReturnType<typeof classifyActivationFailure> => {
+  let contextWording = false;
+  for (const text of [input.lastError, input.error ?? "", ...(input.evidence ?? [])]) {
+    const remaining = text.replace(OVERFLOW_WORDING, () => { contextWording = true; return ""; });
+    const failure = classifyActivationFailure({ lastError: remaining, error: remaining });
+    if (!failure.transient && CONTRADICTORY_OVERFLOW_CODES.has(failure.code)) return failure;
+  }
+  const failure = classifyActivationFailure(input);
+  return typedOverflow && contextWording && failure.code === "invalid-request"
+    ? { code: "context-overflow", transient: false, classification: "permanent: context window exceeded (typed run with context-only wording)" }
+    : failure;
+};
+const verifiedOverflowBlock = (blocked: ActivationBlock | undefined, runId: string | undefined): boolean =>
+  blocked?.code === "context-overflow" && blocked.overflowEvidence?.version === 1 &&
+  blocked.overflowEvidence.complete === true && blocked.overflowEvidence.runId === runId && typeof runId === "string";
+const retainedOverflowRunId = (value: unknown): value is string => typeof value === "string" && value.length > 0 &&
+  value !== "." && value !== ".." && !/[\\/\\\\]/.test(value);
 const finitePositive = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value) && value > 0;
 /** A stored block without a classification comes from an older writer: re-derive its class from
  * its stored reason with today's rules, so only a recognisably transient one can expire. */
 const restoredActivationBlock = (stored: { reason: string; code: string; since: number; count: number;
-  retryAt?: unknown; classification?: unknown; blockedAt?: unknown; backoffMs?: unknown }): ActivationBlock => {
-  // Older workers falsely typed ordinary stream disconnects as overflow. Re-derive recognisable
-  // contradictory causes; the permanent-first classifier keeps auth/security failures hard.
-  const legacyOverflow = stored.code === "context-overflow" ? classifyActivationFailure({ lastError: stored.reason }) : undefined;
-  const rederive = typeof stored.classification !== "string" || REDERIVED_BLOCK_CODES.has(stored.code) ||
-    (legacyOverflow !== undefined && CONTRADICTORY_OVERFLOW_CODES.has(legacyOverflow.code));
-  const derived = !rederive ? { code: stored.code, classification: stored.classification as string }
+  retryAt?: unknown; classification?: unknown; blockedAt?: unknown; backoffMs?: unknown; overflowEvidence?: unknown },
+  run: AgentRunRecord | undefined, runId: string | undefined, actorId: string): ActivationBlock => {
+  let overflowEvidence: ActivationBlock["overflowEvidence"];
+  let legacyOverflow: ReturnType<typeof classifyActivationFailure> | undefined;
+  if (stored.code === "context-overflow") {
+    const marker = refRecord(stored.overflowEvidence);
+    // An incomplete migration is sticky across re-saves/reloads: only an explicit reset releases it.
+    const markedComplete = marker?.version === 1 && marker.complete === true && marker.runId === runId && typeof runId === "string";
+    const authoritative = marker === undefined && run !== undefined && retainedOverflowRunId(runId) &&
+      run.id === runId && run.actorId === actorId && run.status === "failed" &&
+      typeof run.error === "string" && stored.reason.length > 0 && run.error.includes(stored.reason) &&
+      (run.warnings === undefined || (Array.isArray(run.warnings) && run.warnings.every(warning => typeof warning === "string")));
+    const failure = authoritative && run ? classifyManagerActivationFailure({ lastError: run.error!, error: run.error, evidence: run.warnings }, run.errorCode === "CONTEXT_OVERFLOW") : undefined;
+    const pureStream = failure?.code === "provider-transient" && failure.classification.startsWith("transient: model stream disconnect");
+    const genuineOverflow = failure?.code === "context-overflow" && run?.errorCode === "CONTEXT_OVERFLOW";
+    const complete = markedComplete || pureStream || genuineOverflow;
+    overflowEvidence = { version: 1, ...(typeof runId === "string" ? { runId } : {}), complete };
+    legacyOverflow = failure && !failure.transient && CONTRADICTORY_OVERFLOW_CODES.has(failure.code) ? failure
+      : pureStream ? failure : { code: "context-overflow", transient: false,
+        classification: complete ? "permanent: context window exceeded (complete run evidence)"
+          : "fail-closed: legacy overflow lacks complete matching run evidence; explicit session reset required" };
+  }
+  const rederive = legacyOverflow !== undefined || typeof stored.classification !== "string" || REDERIVED_BLOCK_CODES.has(stored.code);
+  const derived = legacyOverflow ?? (!rederive ? { code: stored.code, classification: stored.classification as string }
     : (({ code, classification }) => ({ code, classification: code === stored.code && typeof stored.classification === "string"
       ? stored.classification : `${classification} (re-derived from an older record's stored reason)` }))(
-      legacyOverflow ?? classifyActivationFailure({ lastError: stored.reason, preparation: stored.code === "failing-preparation" ||
-        stored.code === "preparation-timeout" }));
+      classifyActivationFailure({ lastError: stored.reason, preparation: stored.code === "failing-preparation" ||
+        stored.code === "preparation-timeout" })));
   const transient = TRANSIENT_ACTIVATION_BLOCK_CODES.has(derived.code);
   return { reason: stored.reason, code: derived.code, class: activationBlockClass(derived.code), since: stored.since,
     blockedAt: finitePositive(stored.blockedAt) ? stored.blockedAt : stored.since, count: stored.count,
-    classification: derived.classification,
+    classification: derived.classification, ...(overflowEvidence ? { overflowEvidence } : {}),
     ...(transient && finitePositive(stored.retryAt) ? { retryAt: stored.retryAt } : {}),
     ...(transient && finitePositive(stored.backoffMs) ? { backoffMs: stored.backoffMs } : {}) };
 };
@@ -1826,7 +1865,7 @@ export class ActorManager {
     }
     // A terminal overflow failed only its item. Rotate after settlement, never replay tool work,
     // and restore routing even when there is no queued successor or new event to wake the actor.
-    const overflowFailure = live.activationBlocked?.code === "context-overflow";
+    const overflowFailure = verifiedOverflowBlock(live.activationBlocked, live.lastRunId);
     let trigger: "requested" | "size" | "context" | undefined = waiters ? "requested" : overflowFailure ? "context" : undefined;
     if (!trigger && this.#maxSessionBytes > 0) {
       try {
@@ -1844,7 +1883,7 @@ export class ActorManager {
       usage.tokens >= usage.contextWindow * ACTOR_CONTEXT_RESET_RATIO))) trigger = "context";
     if (!trigger) return undefined;
     try {
-      this.#archiveSession(live, trigger, overflowRetry || overflowFailure);
+      this.#archiveSession(live, trigger, overflowRetry || overflowFailure, overflowRetry);
     } catch (error) {
       const failure = error instanceof Error ? error : new Error(String(error));
       waiters?.forEach((waiter) => waiter.reject(failure));
@@ -1868,7 +1907,7 @@ export class ActorManager {
   }
 
   // Moves session.jsonl to session.jsonl.<UTC stamp>.bak, keeps the newest backup and logs it.
-  #archiveSession(actor: ManagedActor, trigger: "requested" | "size" | "context", overflow = false): void {
+  #archiveSession(actor: ManagedActor, trigger: "requested" | "size" | "context", overflow = false, overflowRetry = false): void {
     const running = this.#runningActor(actor.id);
     if (this.#inFlight.has(actor.id) || running?.abortController || running?.inFlightRun) {
       throw new Error(`Cannot rotate actor ${actor.name} while an activation is in flight`);
@@ -1917,11 +1956,12 @@ export class ActorManager {
       reason: trigger === "size"
         ? `session reset (size limit): ${bytes} bytes > ${this.#maxSessionBytes}`
         : trigger === "context"
-        ? overflow ? "session reset (context overflow): retrying the event once on a fresh session"
+        ? overflow ? overflowRetry ? "session reset (context overflow): retrying the event once on a fresh session"
+            : "session reset (context overflow): failed item will not be replayed; next work starts on a fresh session"
           : `session reset (context window): last run used ${usage?.tokens} of ${usage?.contextWindow} tokens`
         : "session reset (requested)",
       data: { sessionReset: { trigger, bytes, archived, ...(trigger === "context" ? { overflow,
-        ...(usage ? { contextUsage: { tokens: usage.tokens, contextWindow: usage.contextWindow } } : {}) } : {}) } },
+        ...(overflow ? { retry: overflowRetry } : {}), ...(usage ? { contextUsage: { tokens: usage.tokens, contextWindow: usage.contextWindow } } : {}) } : {}) } },
     });
   }
 
@@ -4031,7 +4071,7 @@ export class ActorManager {
             // signal, retries or reports an overflow; error text that quotes the phrase never does.
             // A legacy/malformed typed result must not replay a provider disconnect as overflow.
             // The normal classifier scans permanent causes first, including real window refusals.
-            const failure = classifyActivationFailure({ lastError: result.error ?? "", error: result.error, evidence: result.warnings });
+            const failure = classifyManagerActivationFailure({ lastError: result.error ?? "", error: result.error, evidence: result.warnings }, result.errorCode === "CONTEXT_OVERFLOW");
             const contextOverflow = result.errorCode === "CONTEXT_OVERFLOW" && !CONTRADICTORY_OVERFLOW_CODES.has(failure.code) &&
               !abortController.signal.aborted && !runStopped;
             // smarty-dev#3238 round 3: a retry replays the whole event. Once a tool has run, its side
@@ -4330,7 +4370,8 @@ export class ActorManager {
       // fresh drain instead of stranding a just-enqueued item.
       // A reset requested during the last run is applied before a new drain can start one.
       // Its caller may queue work at once, which the drain after this one runs.
-      const resetAtExit = this.#pendingResets.has(actor.id) || this.#liveActor(actor).activationBlocked?.code === "context-overflow";
+      const resetLive = this.#liveActor(actor);
+      const resetAtExit = this.#pendingResets.has(actor.id) || verifiedOverflowBlock(resetLive.activationBlocked, resetLive.lastRunId);
       // A reset caller can enqueue another reset from its resolved promise while
       // the boundary presence write is settling. Consume it before releasing admission.
       while (this.#pendingResets.has(actor.id) && !this.#inFlight.has(actor.id) && !actor.abortController) {
@@ -4338,7 +4379,7 @@ export class ActorManager {
       }
       // No backlog is needed to repair routing after a terminal overflow. The failed activation
       // has already left the checkpoint; only its session/block are repaired, never its effects.
-      if (this.#liveActor(actor).activationBlocked?.code === "context-overflow" &&
+      if (verifiedOverflowBlock(this.#liveActor(actor).activationBlocked, this.#liveActor(actor).lastRunId) &&
           !this.#inFlight.has(actor.id) && !actor.abortController && !this.#closing && actor.status !== "stopped") {
         await this.#resetAtBoundary(actor)?.catch(() => undefined);
       }
@@ -4433,8 +4474,8 @@ export class ActorManager {
       ?? lines.at(-1) ?? "Unknown activation failure";
     // smarty-dev#3238 round 2: context-overflow comes only from the run's typed CONTEXT_OVERFLOW code.
     // Fail closed (smarty-dev#8487): only an explicitly transient cause may expire.
-    const failure = classifyActivationFailure({ lastError, error, evidence,
-      preparation: preparation === true, preparationTimeout: preparation === "timeout" });
+    const failure = classifyManagerActivationFailure({ lastError, error, evidence,
+      preparation: preparation === true, preparationTimeout: preparation === "timeout" }, contextOverflowCode && !preparation);
     const classified = contextOverflowCode && !preparation && !CONTRADICTORY_OVERFLOW_CODES.has(failure.code)
       ? { code: "context-overflow", transient: false, classification: "permanent: context window exceeded (typed CONTEXT_OVERFLOW run code)" }
       : failure;
@@ -4459,6 +4500,7 @@ export class ActorManager {
     actor.activationBlocked = {
       reason, code, class: activationBlockClass(code), since: previous?.code === code ? previous.since : now, blockedAt: now, count,
       classification, ...(transient ? { retryAt: now + backoffMs, backoffMs } : {}),
+      ...(code === "context-overflow" ? { overflowEvidence: { version: 1 as const, ...(typeof runId === "string" ? { runId } : {}), complete: contextOverflowCode && typeof runId === "string" } } : {}),
     };
     this.#armActivationBlockExpiry(actor, now);
     actor.updatedAt = now;
@@ -6518,7 +6560,10 @@ export class ActorManager {
           : {}),
         ...(typeof record.activationBlocked?.reason === "string" && typeof record.activationBlocked?.code === "string" &&
           typeof record.activationBlocked?.since === "number" && typeof record.activationBlocked?.count === "number"
-          ? { activationBlocked: restoredActivationBlock(record.activationBlocked) }
+          ? { activationBlocked: restoredActivationBlock(record.activationBlocked,
+            record.activationBlocked.code === "context-overflow" && retainedOverflowRunId(record.lastRunId)
+              ? readRunRecord(path.join(this.#actorRoot, record.id, "runs", record.lastRunId, "status.json")) : undefined,
+            record.lastRunId, record.id) }
           : {}),
         ...(Number.isSafeInteger(record.failureStreak?.count) && (record.failureStreak?.count ?? 0) > 0 &&
           typeof record.failureStreak?.notified === "boolean"
@@ -6637,7 +6682,7 @@ export class ActorManager {
         this.#replayDeadLetters(live);
         // A restored terminal overflow may have no pending activation: repair only the
         // session/routing at a settled boundary, never resurrect its dropped (possibly toolful) item.
-        if (live.activationBlocked?.code === "context-overflow") this.#requestDrain(live);
+        if (verifiedOverflowBlock(live.activationBlocked, live.lastRunId)) this.#requestDrain(live);
       }
     });
   }

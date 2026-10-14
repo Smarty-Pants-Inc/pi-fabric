@@ -4,7 +4,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { expect, it, vi } from "vitest";
 import { ActorContextAdmission, loadActorInputEstimator, loadPiContextOverflow } from "../src/worker/context-admission.js";
-import { retryableProviderError } from "../src/worker/provider-error.js";
+import { interruptedModelStreamError, retryableProviderError } from "../src/worker/provider-error.js";
 const fixture = (window = 272_000) => {
   const sent: Record<string, unknown>[] = [];
   const ready = vi.fn(); const fail = vi.fn(); const compact = vi.fn(); const reseed = vi.fn();
@@ -86,14 +86,27 @@ it.each(["fake-pi-session-id.mjs", "fake-pi-rpc.mjs"])("does not infer native Pi
   expect(await loadActorInputEstimator(fileURLToPath(new URL(`./fixtures/${name}`, import.meta.url)))).toBeUndefined();
 });
 // Recorded incident #11998: exercise the selected-launcher boundary, not its source text.
-it("retries interrupted provider streams but keeps auth, quota, and context failures terminal", () => {
+it("retries interrupted provider streams but keeps permanent auth, policy, quota, and context failures terminal", () => {
   for (const error of [
     "cliproxyapi/gpt-6-luna: stream error: stream disconnected before completion: stream closed before response.completed",
     "stream disconnected before completion: stream closed before response.completed",
+    "stream ended without completing",
   ]) expect(retryableProviderError(error)).toBe(true);
-  expect(retryableProviderError("401 Unauthorized: stream disconnected before completion")).toBe(false);
-  expect(retryableProviderError("quota exceeded: stream disconnected before completion")).toBe(false);
-  expect(retryableProviderError("context exceeded: stream disconnected before completion")).toBe(false);
+  const permanent = [
+    "401 Unauthorized: stream disconnected before completion",
+    "Authentication failed: stream disconnected before completion",
+    "AuthError: stream ended without completing",
+    "Refused by security policy: stream disconnected before completion",
+    "Permission denied: stream disconnected before completion",
+    "quota exceeded: stream disconnected before completion",
+    "context exceeded: stream disconnected before completion",
+  ];
+  for (const error of permanent) {
+    expect(retryableProviderError(error), error).toBe(false);
+    // This predicate also gates retention of successful-looking partial output.
+    expect(interruptedModelStreamError(error), error).toBe(false);
+  }
+  expect(interruptedModelStreamError("stream disconnected before completion")).toBe(true);
 });
 it("keeps stream failures out of every native overflow classifier", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "actor-native-overflow-"));
@@ -109,6 +122,8 @@ it("keeps stream failures out of every native overflow classifier", async () => 
     expect(classify).toBeTypeOf("function");
     expect(classify!({ role: "assistant", stopReason: "error",
       errorMessage: "stream disconnected before completion: stream closed before response.completed" }, 272_000)).toBe(false);
+    expect(classify!({ role: "assistant", stopReason: "error",
+      errorMessage: "stream ended without completing" }, 272_000)).toBe(false);
     expect(classify!({ role: "assistant", stopReason: "error",
       errorMessage: "prompt is too long: 280000 tokens > 272000 maximum" }, 272_000)).toBe(true);
     expect(classify!({ role: "assistant", stopReason: "stop",

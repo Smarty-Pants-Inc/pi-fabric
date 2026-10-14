@@ -285,9 +285,39 @@ const namespaceSnapshot = (target: string, receipt?: Inode) => {
     return { entries, directories, parents };
 };
 
+/**
+ * Whether syncPathNamespace can confirm a directory entry on this platform. Windows has no directory
+ * fsync, so every namespace barrier below is skipped there (NTFS journals names, but nothing here
+ * confirms it). The single platform fact behind syncPathNamespace, its async form, syncDirectoryChain
+ * and the fail-closed durability variant.
+ */
+export const namespaceBarrierAvailable = (): boolean => process.platform !== "win32";
+
+/** Builds the caller's typed not-durable error (for mesh.sync: a MeshSyncNotDurableError code). */
+export type NamespaceNotDurable = (platform: NodeJS.Platform) => Error;
+
+/**
+ * Refuses, before any I/O, a durability barrier that would need a namespace (directory) step on a
+ * platform without one (pi-fabric#894): a barrier that reports success to a caller, which then
+ * advances an external cursor or delivered mark, must never skip the directory fsync silently.
+ */
+export const requireNamespaceBarrier = (notDurable: NamespaceNotDurable): void => {
+  if (!namespaceBarrierAvailable()) throw notDurable(process.platform);
+};
+
+/**
+ * syncPathNamespace for a durability barrier (mesh.sync, smarty-dev#9313): fails closed with
+ * notDurable(platform) where syncPathNamespace would skip the directory fsync (win32), instead of
+ * returning as if the namespace were confirmed. Ordinary atomic writes keep syncPathNamespace.
+ */
+export const syncPathNamespaceDurable = (target: string, receipt: Inode | undefined, notDurable: NamespaceNotDurable): void => {
+  requireNamespaceBarrier(notDurable);
+  syncPathNamespace(target, receipt);
+};
+
 export const syncPathNamespace = (target: string, receipt?: Inode): void => {
   const before = namespaceSnapshot(target, receipt);
-  if (process.platform !== "win32") {
+  if (namespaceBarrierAvailable()) {
     const synced = new Set<string>();
     for (const parent of before.parents.reverse()) {
       for (let current = parent; ; current = path.dirname(current)) {
@@ -315,7 +345,7 @@ export const syncPathNamespace = (target: string, receipt?: Inode): void => {
  * that a newly created or replaced child directory is durably linked. */
 export const syncPathNamespaceAsync = async (target: string, receipt: Inode): Promise<void> => {
   const before = namespaceSnapshot(target, receipt);
-  if (process.platform !== "win32") {
+  if (namespaceBarrierAvailable()) {
     for (const [directory, expected] of [...before.directories].reverse()) {
       const handle = await fs.promises.open(directory, fs.constants.O_RDONLY);
       try {
@@ -329,9 +359,17 @@ export const syncPathNamespaceAsync = async (target: string, receipt: Inode): Pr
     throw new Error("Namespace changed during durability barriers");
   }
 };
+/**
+ * A namespace barrier refused because a path it confirms was replaced meanwhile (a concurrent
+ * rename: compaction, a state commit). The fsyncs themselves succeeded, so a new barrier may run.
+ * Never true for an I/O error: a failed fsync is not retried (its dirty pages may be dropped).
+ */
+export const isNamespaceRace = (error: unknown): boolean => error instanceof Error &&
+  /^(Namespace (changed|directory changed|link changed)|Session receipt inode changed)/.test(error.message);
+
 /** Existence is not a receipt; retry every required directory barrier without a cache. */
 export const syncDirectoryChain = (directory: string): void => {
-  if (process.platform !== "win32") syncPathNamespace(directory);
+  if (namespaceBarrierAvailable()) syncPathNamespace(directory);
 };
 
 // Temps this process staged and has not yet renamed or removed (smarty-dev#6622).
@@ -672,6 +710,34 @@ export const writeJsonAtomicAsync = async (
 };
 
 export const MESH_LOCK_TIMEOUT_CODE = "FABRIC_MESH_LOCK_TIMEOUT";
+export const MESH_INCARNATION_PENDING_CODE = "FABRIC_MESH_INCARNATION_PENDING";
+export const MESH_SNAPSHOT_RETRIES_EXHAUSTED_CODE = "FABRIC_MESH_SNAPSHOT_RETRIES_EXHAUSTED";
+
+/** Constructor-owned process identity is not ready: no mesh lock acquisition was attempted. */
+export class MeshIncarnationPendingError extends Error {
+  readonly code = MESH_INCARNATION_PENDING_CODE;
+  constructor() {
+    super(`${MESH_INCARNATION_PENDING_CODE}: Fabric mesh process incarnation preparation is still pending`);
+    this.name = "MeshIncarnationPendingError";
+  }
+}
+
+/** Also recognizes the bridge's deliberately narrow error wire, without classifying pending as a timeout. */
+export const isMeshIncarnationPending = (error: unknown): error is Error & { code: typeof MESH_INCARNATION_PENDING_CODE } =>
+  error instanceof Error && "code" in error && error.code === MESH_INCARNATION_PENDING_CODE;
+
+/** Optimistic state snapshots kept changing before admission: no write was committed. */
+export class MeshSnapshotRetriesExhaustedError extends Error {
+  readonly code = MESH_SNAPSHOT_RETRIES_EXHAUSTED_CODE;
+  constructor(readonly attempts: number) {
+    super(`${MESH_SNAPSHOT_RETRIES_EXHAUSTED_CODE}: Fabric mesh state snapshot retries exhausted after ${attempts} validation attempts`);
+    this.name = "MeshSnapshotRetriesExhaustedError";
+  }
+}
+
+/** The narrow bridge wire retains the refusal code/message, not arbitrary error properties. */
+export const isMeshSnapshotRetriesExhausted = (error: unknown): error is Error & { code: typeof MESH_SNAPSHOT_RETRIES_EXHAUSTED_CODE } =>
+  error instanceof Error && "code" in error && error.code === MESH_SNAPSHOT_RETRIES_EXHAUSTED_CODE;
 
 /** A failed acquisition wrote nothing. Foreground callers must see this error, not a retry. */
 export class MeshLockTimeoutError extends Error {
@@ -732,14 +798,17 @@ export const alarmForeignHolder = (error: MeshLockForeignHolderError): void => {
 export const isMeshLockTimeout = (error: unknown): error is Error & { code: typeof MESH_LOCK_TIMEOUT_CODE } =>
   error instanceof Error && "code" in error && error.code === MESH_LOCK_TIMEOUT_CODE;
 
-/** A write that wrote nothing and may succeed later: a lock timeout, or a SQLite WAL-cap refusal
+/** A write that wrote nothing and may succeed later: pending identity, snapshot validation exhaustion,
+ * a lock timeout, or a SQLite WAL-cap refusal
  * (`FABRIC_MESH_STATE_WAL_CAP`, state-backend.ts isMeshStateWalCap; smarty-dev#7451 item 8). */
 export const isMeshWriteDeferred = (error: unknown): error is Error =>
-  isMeshLockTimeout(error) || (error instanceof Error && (error as { code?: unknown }).code === "FABRIC_MESH_STATE_WAL_CAP");
+  isMeshIncarnationPending(error) || isMeshSnapshotRetriesExhausted(error) || isMeshLockTimeout(error) ||
+  (error instanceof Error && (error as { code?: unknown }).code === "FABRIC_MESH_STATE_WAL_CAP");
 
-/** Best-effort protocol writes may swallow conflicts, but not a retryable lock wait. */
+/** Best-effort protocol writes may swallow conflicts, but not retryable admission refusals.
+ * Retain the historical name and the same refusals that previously carried the timeout code. */
 export const rethrowMeshLockTimeout = (error: unknown): undefined => {
-  if (isMeshLockTimeout(error)) throw error;
+  if (isMeshIncarnationPending(error) || isMeshSnapshotRetriesExhausted(error) || isMeshLockTimeout(error)) throw error;
   return undefined;
 };
 
@@ -752,7 +821,7 @@ export const meshRetryWarningWindowMs = (): number => {
   return raw?.trim() && Number.isFinite(value) && value >= 1 ? Math.floor(value) : DEFAULT_MESH_RETRY_WARNING_WINDOW_MS;
 };
 
-/** A deferred-write outage (lock timeout or WAL-cap refusal) this long on one background path raises one alarm
+/** A deferred-write outage (admission refusal, lock timeout or WAL-cap refusal) this long on one background path raises one alarm
  * (smarty-dev#8825). */
 export const MESH_OUTAGE_ALARM_AFTER_MS = 5 * 60 * 1_000;
 /** An outage ends only after this many consecutive confirmed writes, so one lucky write does not restart the window. */
@@ -831,7 +900,7 @@ const emitMeshJournalAlarm = (alarm: Parameters<typeof meshJournalAlarmLine>[0])
 /** A log-safe description of a deferred write (pi-fabric#893 round 3). A WAL-cap refusal's message embeds the pinning
  * readers' pids and command lines, which can carry secrets: only its sizes and reader count are logged. */
 export const meshDeferredSummary = (error: unknown): string => {
-  if (isMeshLockTimeout(error)) return error.message;
+  if (isMeshIncarnationPending(error) || isMeshSnapshotRetriesExhausted(error) || isMeshLockTimeout(error)) return error.message;
   const capped = error as { walBytes?: unknown; capBytes?: unknown; readerCount?: unknown };
   return `FABRIC_MESH_STATE_WAL_CAP: the SQLite WAL is ${String(capped.walBytes)} bytes, above the ${String(capped.capBytes)}-byte cap; `
     + `${typeof capped.readerCount === "number" ? capped.readerCount : "unknown"} WAL reader(s)`;
@@ -930,6 +999,7 @@ export class MeshBackgroundRetry {
   #delay = 0;
   #retryAt = 0;
   #lastReportedAt: number | undefined;
+  #recoveryMessage = "mesh lock recovered";
   #suppressed = 0;
   #running = false;
   // Opt-in (backoffFailures) state for non-transient failures; the default boundary never sets it.
@@ -972,7 +1042,7 @@ export class MeshBackgroundRetry {
     // Final summary: retries suppressed after the last line are reported once the window
     // has passed, so an outage that ends inside a window is not silently dropped. It takes
     // that window's single line; a later outage inside it is counted, not printed.
-    console.warn(`[pi-fabric] ${this.label}: mesh lock recovered (${this.#suppressed} similar retries suppressed in the last ${Math.floor(elapsedMs / 1_000)}s)`);
+    console.warn(`[pi-fabric] ${this.label}: ${this.#recoveryMessage} (${this.#suppressed} similar retries suppressed in the last ${Math.floor(elapsedMs / 1_000)}s)`);
     this.#lastReportedAt = now;
     this.#suppressed = 0;
   }
@@ -1001,10 +1071,14 @@ export class MeshBackgroundRetry {
     const clock = performance.now();
     if (this.#outageSince === undefined) { this.#outageSince = clock; this.#outageSinceWall = now; }
     this.#outageSuccesses = 0;
+    const refusal = isMeshIncarnationPending(error) ? "mesh incarnation pending"
+      : isMeshSnapshotRetriesExhausted(error) ? "mesh snapshot retries exhausted" : undefined;
+    this.#recoveryMessage = isMeshIncarnationPending(error) ? "mesh incarnation preparation ready"
+      : isMeshSnapshotRetriesExhausted(error) ? "mesh snapshot validation recovered" : "mesh lock recovered";
     if (!this.#outageRaised && clock - this.#outageSince >= this.#alarmAfterMs) {
       this.#outageRaised = true;
       this.#raise({ label: this.label, state: "outage", sinceMs: this.#outageSinceWall, durationMs: Math.round(clock - this.#outageSince),
-        reason: isMeshLockTimeout(error) ? "mesh lock timeout" : "SQLite WAL cap" });
+        reason: refusal ?? (isMeshLockTimeout(error) ? "mesh lock timeout" : "SQLite WAL cap") });
     } else void this.#flushAlarms();
     const elapsedMs = this.#lastReportedAt === undefined ? Infinity : now - this.#lastReportedAt;
     // At most one lock-retry line per instance per window (default 60 s), even across
@@ -1013,7 +1087,7 @@ export class MeshBackgroundRetry {
     if (elapsedMs >= this.warningWindowMs) {
       const summary = this.#suppressed > 0
         ? ` (${this.#suppressed} similar retries suppressed in the last ${Math.floor(elapsedMs / 1_000)}s)` : "";
-      console.warn(`[pi-fabric] ${this.label}: ${isMeshLockTimeout(error) ? "mesh lock timeout; retrying" : "mesh WAL cap; retrying"} in ${delayMs} ms: ${meshDeferredSummary(error)}${summary}`);
+      console.warn(`[pi-fabric] ${this.label}: ${refusal ?? (isMeshLockTimeout(error) ? "mesh lock timeout" : "mesh WAL cap")}; retrying in ${delayMs} ms: ${meshDeferredSummary(error)}${summary}`);
       this.#lastReportedAt = now;
       this.#suppressed = 0;
     } else {

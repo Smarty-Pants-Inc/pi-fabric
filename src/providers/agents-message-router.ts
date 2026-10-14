@@ -1,7 +1,7 @@
 import { appendDeliveryOutcome } from "../mesh/delivery-outcomes.js";
 import { interruptErrorCode } from "../interrupt-authority.js";
 import { boundAgentSpawner } from "../agents/spawner.js";
-import { terminalRejectionFields } from "../agents/terminal-target.js";
+import { FabricTargetTerminalError, terminalRejectionFields } from "../agents/terminal-target.js";
 import { terminalAgentStatuses } from "../agents/lifecycle.js";
 import { invocationFabricPrincipal, snapshotFabricInvocation, fabricTurnProvenance, copyFabricWakeCause, copyFabricWakeAdmission, type FabricWakeCause, type FabricPrincipal } from "../fabric-provenance.js";
 import type { AgentManager } from "../agents/manager.js";
@@ -601,6 +601,7 @@ export class AgentMessageRouter {
             ? this.manager.followUp(id, message, data, provenance, { deadlineMs: options.deadlineMs ?? DEFAULT_FOLLOW_UP_DEADLINE_MS })
             : this.manager.followUp(id, message, data, provenance);
       return { queued: true, messageId: result.messageId, routed: "local",
+        ...(result.undelivered ? { undelivered: result.undelivered } : {}),
         ...(result.warning ? { warning: result.warning } : {}),
         ...(result.deadlineAt !== undefined ? { deadlineAt: result.deadlineAt } : {}) };
     } catch (error) {
@@ -882,6 +883,7 @@ export class AgentMessageRouter {
         command.operation === "steer"
           ? this.manager.steer(command.targetId, message, command.data, provenance)
           : this.manager.followUp(command.targetId, message, command.data, provenance);
+      if (result.undelivered) throw new FabricTargetTerminalError(command.targetId, result.undelivered.finalAnswerReceiptId, result.undelivered.runState);
       return { accepted: true, messageId: result.messageId,
         ...(result.warning ? { warning: result.warning } : {}) };
     } catch (error) {

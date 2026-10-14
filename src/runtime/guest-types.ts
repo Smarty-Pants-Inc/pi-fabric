@@ -92,7 +92,9 @@ interface FabricAgentRequest {
   /** Pi only. branch: fork this conversation (last completed turn); snippet: prefix recent messages. */
   seed?: "task" | "branch" | "snippet";
   seedMessages?: number;
-  /** Pi only write confinement; bash needs shell: "unconfined". */
+  /** Audited opt-out of the process task write default; cannot escape inherited confinement. */
+  writePolicy?: "unrestricted";
+  /** Pi only write confinement; explicit policies deny bash unless shell: "unconfined". */
   readOnly?: boolean;
   writableRoots?: string[];
   shell?: "deny" | "unconfined";
@@ -299,6 +301,9 @@ interface FabricLifecycleSubscription {
   lastError?: string;
 }
 interface FabricTargetTerminalError extends Error {
+  readonly reason: "run-ended";
+  readonly deliveryStatus: "undelivered";
+  readonly runState: "final-answer-pending" | "final-answer-recorded" | "completed" | "failed" | "stopped" | "timed_out";
   readonly code: "FABRIC_TARGET_TERMINAL";
   readonly targetId: string;
   readonly finalAnswerReceiptId: string;
@@ -320,6 +325,15 @@ interface FabricAgentHandle {
   routeClass?: string;
   routeClassSource?: "explicit" | "derived";
   protected?: boolean;
+  /** Original spawn brief metadata. task.txt may later contain a continuation. */
+  promptSha256?: string;
+  promptBytes?: number;
+  promptPath?: string;
+  /** Current task.txt bytes, updated on same-run continuation. */
+  inputSha256?: string;
+  inputBytes?: number;
+  promptRetentionDropped?: boolean;
+  promptRetentionMismatch?: boolean;
   /** Immediate spawning participant, distinct from rootId. */
   spawner?: { id: string; kind: "main" | "agent" | "actor"; runId?: string };
   /** Present on terminal status snapshots when the full log was retained. */
@@ -1022,6 +1036,13 @@ interface FabricFollowUpDelivery {
   alarm?: FabricFollowUpAlarm;
 }
 interface FabricMessageDelivery {
+  /** Local task admission raced its final answer; this input was not consumed. */
+  undelivered?: {
+    code: "FABRIC_TARGET_TERMINAL"; reason: "run-ended"; deliveryStatus: "undelivered";
+    messageId: string; delivery: "steer" | "followUp"; finalAnswerReceiptId: string;
+    runState: FabricTargetTerminalError["runState"];
+    sender?: FabricTargetTerminalNotice["sender"];
+  };
   /** Local Pi task: absolute delivery deadline; expiry alarms but does not dequeue. */
   deadlineAt?: number;
   /** Sender-only: owner observed a running task when it admitted this followUp. Delivery is unchanged. */

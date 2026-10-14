@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -105,12 +106,26 @@ describe("AgentManager close storage", () => {
     await expect(manager.spawn({ task: "late" })).rejects.toThrow("closing");
   });
 
-  it("honors retainRuns:false for a managed root after stopping a running worker", async () => {
+  it("retains a stopped prompt and closed managed root with retainRuns:false", async () => {
     const { manager, root } = setup(false);
-    await manager.spawn({ task: "HANG", runner: "pi", extensions: false });
+    const task = "HANG";
+    const handle = await manager.spawn({ task, runner: "pi", extensions: false });
     expect(fs.readdirSync(root).length).toBeGreaterThan(1);
     await manager.close();
-    expect(fs.existsSync(root)).toBe(false);
+    await expect(manager.wait(handle.id)).resolves.toMatchObject({ status: "stopped" });
+    expect(fs.readdirSync(root).sort()).toEqual([".fabric-owner.json", handle.id].sort());
+    expect(JSON.parse(fs.readFileSync(path.join(root, ".fabric-owner.json"), "utf8"))).toMatchObject({ childrenStopped: true, closedAt: expect.any(Number) });
+    const run = path.join(root, handle.id);
+    const taskPath = path.join(run, "task.txt");
+    expect(fs.readdirSync(run).sort()).toEqual(["status.json", "task.txt"]);
+    expect(fs.readFileSync(taskPath)).toEqual(Buffer.from(task, "utf8"));
+    const digest = createHash("sha256").update(Buffer.from(task, "utf8")).digest("hex");
+    const persisted = JSON.parse(fs.readFileSync(path.join(run, "status.json"), "utf8"));
+    expect(persisted).toMatchObject({ id: handle.id, status: "stopped", promptPath: taskPath,
+      promptSha256: digest, promptBytes: Buffer.byteLength(task, "utf8"),
+      inputSha256: digest, inputBytes: Buffer.byteLength(task, "utf8") });
+    expect(persisted).not.toHaveProperty("task");
+    expect(hasUnresolvedWorker(run)).toBe(false);
   });
 
   it.each(["EBUSY", "EPERM"])("retries transient %s when removing an owned empty root", async (code) => {
@@ -256,6 +271,22 @@ describe("AgentManager close storage", () => {
     await vi.waitFor(() => expect(fs.existsSync(sentinel)).toBe(false), { timeout: 20_000 });
   });
 
+  it("removes an explicit caller root after stopping a worker with retainRuns:false", async () => {
+    const caller = fs.mkdtempSync(path.join(os.tmpdir(), "caller-stopped-root-"));
+    roots.push(caller);
+    const { manager, root } = setup(false, { runRoot: caller });
+    const handle = await manager.spawn({ task: "HANG", runner: "pi", extensions: false });
+    const run = manager.runDirectory(handle.id)!;
+    expect(root).toBe(caller);
+    expect(path.dirname(run)).toBe(caller);
+    expect(fs.existsSync(path.join(root, ".fabric-owner.json"))).toBe(false);
+    expect(fs.readFileSync(path.join(run, "task.txt"), "utf8")).toBe("HANG");
+    await manager.close();
+    await expect(manager.wait(handle.id)).resolves.toMatchObject({ status: "stopped" });
+    expect(fs.existsSync(run)).toBe(false);
+    expect(fs.existsSync(root)).toBe(false);
+  });
+
   it("preserves explicit caller roots with retainRuns:true", async () => {
     const caller = fs.mkdtempSync(path.join(os.tmpdir(), "caller-root-"));
     roots.push(caller);
@@ -346,14 +377,33 @@ describe("AgentManager close storage", () => {
     }
   }, 30_000);
 
-  it("cancels queued admissions on close instead of launching after shutdown", async () => {
+  it("cancels queued admissions on close without launching and retains the active stopped prompt", async () => {
     const { manager, root } = setup(false);
-    await manager.spawn({ task: "HANG", extensions: false });
-    const queued = await manager.spawn({ task: "queued", extensions: false });
-    expect(queued.status).toBe("queued");
-    await manager.close();
-    await expect(manager.wait(queued.id)).resolves.toMatchObject({ status: "stopped" });
-    expect(fs.existsSync(root)).toBe(false);
+    const active = await manager.spawn({ task: "HANG", extensions: false });
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    try {
+      const queued = await manager.spawn({ task: "queued", extensions: false });
+      expect(queued.status).toBe("queued");
+      await manager.close();
+      await expect(manager.wait(queued.id)).resolves.toMatchObject({ status: "stopped" });
+      expect(launch).not.toHaveBeenCalled();
+      // The queued admission never reached startPrepared, so it never wrote a
+      // verified task file. Its recordless rollback still leaves no run tree.
+      expect(fs.existsSync(path.join(root, queued.id))).toBe(false);
+      expect(fs.readdirSync(root).sort()).toEqual([".fabric-owner.json", active.id].sort());
+      expect(JSON.parse(fs.readFileSync(path.join(root, ".fabric-owner.json"), "utf8"))).toMatchObject({ childrenStopped: true, closedAt: expect.any(Number) });
+      const run = path.join(root, active.id);
+      const taskPath = path.join(run, "task.txt");
+      expect(fs.readdirSync(run).sort()).toEqual(["status.json", "task.txt"]);
+      expect(fs.readFileSync(taskPath, "utf8")).toBe("HANG");
+      const digest = createHash("sha256").update("HANG", "utf8").digest("hex");
+      const persisted = JSON.parse(fs.readFileSync(path.join(run, "status.json"), "utf8"));
+      expect(persisted).toMatchObject({ id: active.id, status: "stopped", promptPath: taskPath,
+        promptSha256: digest, promptBytes: Buffer.byteLength("HANG", "utf8"),
+        inputSha256: digest, inputBytes: Buffer.byteLength("HANG", "utf8") });
+      expect(persisted).not.toHaveProperty("task");
+      expect(hasUnresolvedWorker(run)).toBe(false);
+    } finally { launch.mockRestore(); }
   });
 
   it("waits for a pending spawn to observe close before deleting the root", async () => {

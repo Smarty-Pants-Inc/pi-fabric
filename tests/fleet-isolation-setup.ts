@@ -6,6 +6,10 @@ import { isolateTestFleetEnvironment } from "../scripts/test-temp.js";
 // Tests can still opt into specific behavior with vi.stubEnv after this boundary.
 isolateTestFleetEnvironment();
 
+// smarty-dev#11145: refuse deletion outside this run's private TMPDIR; hosted CI reports instead.
+// Install before test imports. Node children inherit the same module through NODE_OPTIONS --import.
+await import(new URL("./test-deletion-guard.mjs", import.meta.url).href);
+
 // smarty-dev#6477: production sqlite mode opens only an imported root. In-process test fixtures that
 // build fresh sqlite roots keep doing so (state.db plus the moved marker, as an import leaves a fresh
 // root); tests of the production rule delete this symbol. No import: setup stays free of the mesh graph.

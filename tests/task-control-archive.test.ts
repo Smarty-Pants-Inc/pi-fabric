@@ -3,7 +3,7 @@ import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { canRemoveTerminalRun, pruneActorRunArchives, runTreeExitVeto } from "../src/storage/retention.js";
 import { initializeTaskControlDirectory, legacyTaskControlSibling, MAX_FINAL_ANSWER_BYTES, readFinalAnswerReceipt, taskControlDirectory, withLegacyTaskControlDirectory } from "../src/worker/terminal-answer.js";
-import { bytesOf, day, json, originalFiles, registerArchiveCleanup, removalPaths, setup, setupCurrent } from "./task-control-archive-fixtures.js";
+import { bytesOf, day, json, originalFiles, registerArchiveCleanup, removalPaths, roots, setup, setupCurrent } from "./task-control-archive-fixtures.js";
 
 // Keep reason: trust boundary / data safety. Exercise the actual archive and
 // collection judgment, recording only the last native removal boundary.
@@ -25,14 +25,15 @@ const archivedPath = (f: { source: string; controls: string }, file: string, arc
   file.startsWith(f.controls + path.sep) ? path.join(taskControlDirectory(archive), path.relative(f.controls, file)) : path.join(archive, path.relative(f.source, file));
 
 describe("actor archive paired task controls", () => {
-  // DELTA-SEC-01 cutoff (#12214): raw old/v1/unbound history is ALWAYS refused and
-  // byte-preserved, never final; "migrated" is the refused bootstrap of raw in-run history.
+  // central-v1 permits read-only unmarked pre-v2 in-run evidence, but never
+  // promotes it into archive authority. Old siblings/unbound central still refuse.
   it.each(["sibling-v1", "legacy", "migrated"] as const)("retainRun preserves original %s evidence under an alias, then selects paired collection", async layout => {
     const f = setup(layout);
     const dirs = [f.source, legacyTaskControlSibling(f.source), taskControlDirectory(f.source)], before = bytesOf(...dirs);
     for (const file of originalFiles(f)) expect(before[file]).toBe(fs.readFileSync(file).toString("base64"));
     expect(() => initializeTaskControlDirectory(f.source)).toThrow("FABRIC_LEGACY_SNAPSHOT_REQUIRED");
-    expect(() => readFinalAnswerReceipt(f.source, f.record.id)).toThrow();
+    if (layout === "legacy") expect(readFinalAnswerReceipt(f.source, f.record.id)).toEqual(f.receipt);
+    else expect(() => readFinalAnswerReceipt(f.source, f.record.id)).toThrow();
     expect(canRemoveTerminalRun(f.source)).toBe(false);
     await expect(f.store.retainRun(f.actor, f.alias, f.source)).rejects.toThrow();
     expect(fs.existsSync(path.join(f.archive, "status.json"))).toBe(false);
@@ -173,14 +174,17 @@ describe("actor archive paired task controls", () => {
     const f = setupCurrent(); // f.controls: the protected central controls of a genuine v2 run
     expect(canRemoveTerminalRun(f.source)).toBe(true);
     if (bad === "unknown") fs.writeFileSync(path.join(f.controls, "arbitrary-private-data"), "not an archive artifact");
-    if (bad === "hardlink") fs.linkSync(path.join(f.controls, "final-answer.json"), path.join(f.root, "extra-link"));
+    // Central state and the temporary run can be on different Windows volumes.
+    // Keep link/rename fault artifacts beside the source namespace, not in temp.
+    const extraLink = f.controls + ".extra-link", linkedAnswer = f.controls + ".linked-answer";
+    if (bad === "hardlink") { fs.linkSync(path.join(f.controls, "final-answer.json"), extraLink); roots.push(extraLink); }
     if (bad === "subdirectory-link") {
       const source = path.join(f.controls, "terminal-controls"); fs.renameSync(source, source + "-original");
       fs.symlinkSync(source + "-original", source, "dir");
     }
     if (bad === "file-link") {
-      const file = path.join(f.controls, "final-answer.json"); fs.renameSync(file, path.join(f.root, "linked-answer"));
-      fs.symlinkSync(path.join(f.root, "linked-answer"), file);
+      const file = path.join(f.controls, "final-answer.json"); fs.renameSync(file, linkedAnswer); roots.push(linkedAnswer);
+      fs.symlinkSync(linkedAnswer, file);
     }
     if (bad === "oversized") fs.writeFileSync(path.join(f.controls, "final-answer.json"), Buffer.alloc(MAX_FINAL_ANSWER_BYTES + 1));
     if (bad === "entry-bound") {

@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { randomUUID } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import http from "node:http";
@@ -15,6 +16,27 @@ const cleanups: Array<() => Promise<unknown> | void> = [];
 afterEach(async () => {
   try { for (const close of cleanups.splice(0).reverse()) await close(); }
   finally { vi.unstubAllEnvs(); }
+});
+
+// Keep reason: missing-spool Windows incident fail-116090200428. The store's
+// public read preflight already treats absence as empty without creating state;
+// unreadable/unsafe custody must still prevent sleep. Do not demote those errors.
+describe("native child archive observation", () => {
+  it("treats an absent lazy spool as no rows without creating it", () => {
+    const sessionFile = path.join(os.tmpdir(), `not-created-native-spool-${randomUUID()}`, "session.jsonl");
+    const store = new ActorChildCompletionStore(sessionFile);
+    expect(fs.existsSync(store.directory)).toBe(false);
+    expect(store.pending()).toEqual([]);
+    expect(store.hasPendingReply()).toBe(false);
+    expect(fs.existsSync(store.directory)).toBe(false);
+  });
+
+  it.each(["EACCES", "ENOTDIR", "ELOOP"])("keeps %s custody visible instead of treating it as absent", (code) => {
+    const failure = Object.assign(new Error(`refused spool: ${code}`), { code });
+    vi.spyOn(fs, "readdirSync").mockImplementation(() => { throw failure; });
+    const store = new ActorChildCompletionStore(path.join("unsafe-spool", "session.jsonl"));
+    expect(store.hasPendingReply()).toBe(true); // Unknown custody never authorizes sleep.
+  });
 });
 
 // Production compiled activation worker -> native Pi CLI -> production compiled

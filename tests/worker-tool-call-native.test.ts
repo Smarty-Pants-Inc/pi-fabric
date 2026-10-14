@@ -21,6 +21,10 @@ describe("Fabric worker -> native Pi -> whitespace fixture provider", () => {
     fs.writeFileSync(path.join(agentDir, "settings.json"), JSON.stringify({ compaction: { enabled: false }, defaultProjectTrust: "approve" }));
     // Load the checked fixture through ordinary personal resource discovery.
     fs.writeFileSync(path.join(agentDir, "extensions", "provider.ts"), `export { default } from ${JSON.stringify(path.resolve("tests/fixtures/whitespace-native-provider.ts"))};\n`);
+    // HOME is intentionally temporary for Pi discovery, but central-v1 state
+    // cannot follow it into TMPDIR. Preserve the caller's isolated XDG state,
+    // or use retained suite-owned state outside temp (never the real user home).
+    vi.stubEnv("XDG_STATE_HOME", process.env.XDG_STATE_HOME ?? path.resolve(".local/state/worker-native-whitespace"));
     vi.stubEnv("PI_CODING_AGENT_DIR", agentDir); vi.stubEnv("HOME", root); vi.stubEnv("PI_OFFLINE", "1");
     vi.stubEnv("FABRIC_NATIVE_WHITESPACE_LOG", path.join(root, "provider.jsonl"));
     vi.stubEnv("FABRIC_NATIVE_WHITESPACE_ROOT", root);

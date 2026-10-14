@@ -662,6 +662,8 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
 }
 
 interface QueuedAgent {
+  /** Unallocated admission: mint strict host authority only at launch commit or required archive custody. */
+  allocateRun?: () => void;
   /** Host-owned admission address, including terminal outcomes with no launch manifest. */
   completionRecipient?: CompletionRecipient;
   routeSaveFailure?: string;
@@ -1796,13 +1798,24 @@ export class AgentManager {
     assertRunPathSafe(path.join(this.#runRoot, id), this.#inheritedRunRoot);
     // Count accepted requests, including queued ones, exactly once.
     this.#semaphore.admit(this.#currentDepth + 1);
-    // Exclusive fresh allocation is the host witness; publish current-only authority before route/custody/task writes.
     const runDirectory = path.join(this.#runRoot, id);
-    createHostTaskRun(runDirectory);
+    let runAllocated = false;
+    const allocateRun = (): void => {
+      if (runAllocated) return;
+      // Exclusive fresh allocation is the host witness; never adopt a blank/pre-existing run.
+      assertRunPathSafe(runDirectory, this.#inheritedRunRoot);
+      createHostTaskRun(runDirectory);
+      runAllocated = true;
+      const queued = this.#queued.get(id);
+      if (queued) delete queued.allocateRun;
+    };
+    // Routed receipts need authority before dispatch. Ordinary admissions remain
+    // in memory until model preparation, activation authority and commit succeed.
+    if (request.routeDecision) allocateRun();
     // Routed dispatch is the only path that publishes route controls in C. Plain
     // task spawns keep working on platforms without a traversable directory fd.
     const runPin = request.routeDecision ? pinRunDirectory(runDirectory) : undefined;
-    if (managerRunTestHooks.afterRunAllocation) await managerRunTestHooks.afterRunAllocation(runDirectory);
+    if (runAllocated && managerRunTestHooks.afterRunAllocation) await managerRunTestHooks.afterRunAllocation(runDirectory);
     const name = safeName(request.name ?? request.task.split("\n", 1)[0] ?? "Fabric agent");
     const prompt = promptMetadata(request.task, path.join(this.#runRoot, id, "task.txt"));
     const callerSignal = signal;
@@ -1840,6 +1853,10 @@ export class AgentManager {
         // Internal resident-host fence: preparation may outlive the caller's deadline.
         // Activation authority and durable request commit are independent obligations.
         beforeCommit?.(id);
+        if (!runAllocated) {
+          allocateRun();
+          if (managerRunTestHooks.afterRunAllocation) await managerRunTestHooks.afterRunAllocation(runDirectory);
+        }
       } catch (error) {
         let refusal: unknown;
         try { routeDispatch?.outcome({ status: signal?.aborted ? "stopped" : "failed" }); }
@@ -2440,7 +2457,7 @@ export class AgentManager {
       ...(request.capabilityRequirements ? { capabilityRequirements: [...request.capabilityRequirements] } : {}),
       ...(request.capabilityDigest ? { capabilityDigest: request.capabilityDigest } : {}),
       ...(request.runnerSessionId ? { runnerSessionId: request.runnerSessionId } : {}),
-    }, request.task, start, authorize ? callerSignal : undefined, routeDispatch?.outcome, completionRecipient);
+    }, request.task, start, authorize ? callerSignal : undefined, routeDispatch?.outcome, completionRecipient, runAllocated ? undefined : allocateRun);
   }
 
   #enqueue(
@@ -2450,6 +2467,7 @@ export class AgentManager {
     ownerSignal?: AbortSignal,
     routeOutcome?: (result: AgentRunResult) => void,
     completionRecipient?: CompletionRecipient,
+    allocateRun?: () => void,
   ): AgentHandleInfo {
     const abort = new AbortController();
     // Guest receipts belong to the session, not a program deadline. Host-owned
@@ -2458,6 +2476,7 @@ export class AgentManager {
     let resolve!: (result: AgentRunResult) => void;
     const result = new Promise<AgentRunResult>((done) => { resolve = done; });
     const queued: QueuedAgent = { info, task, enqueuedAt: Date.now(), abort, result, resolve, background: false,
+      ...(allocateRun ? { allocateRun } : {}),
       ...(routeOutcome ? { routeOutcome } : {}), ...(completionRecipient ? { completionRecipient } : {}) };
     this.#queued.set(info.id, queued);
     const admission = this.#semaphore.acquire("native", signal);
@@ -2682,10 +2701,19 @@ export class AgentManager {
       queued.outcomeSaved = true;
       return true;
     }
+    if (queued.allocateRun && !queued.routeOutcome && !this.#onSettled) {
+      // No worker or durable settlement sink: the terminal receipt belongs only
+      // to memory. Shutdown archival, if required, allocates at its own fence.
+      queued.outcomeSaved = true;
+      return true;
+    }
     let failure: unknown;
     // Finite retries only; persistent failure keeps the full terminal receipt and run files.
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
+        // A failed unlaunched admission may still owe a durable archive source.
+        // Establish strict central authority BEFORE queued-result/status/custody writes.
+        queued.allocateRun?.();
         if (queued.routeOutcome || this.#onSettled) {
           // Even an unlaunched queued run needs a durable full source if archival fails.
           writeJsonAtomic(path.join(this.#runRoot, queued.info.id, "queued-result.json"), queued.terminal, { durable: true });
@@ -3991,8 +4019,10 @@ export class AgentManager {
     const control = taskControlDirectory(runDirectory);
     const stat = fs.lstatSync(control, { throwIfNoEntry: false });
     if (!stat) {
-      // Missing controls never downgrade a marked run. A no-status prelaunch
-      // source still has its manager-owned cleanup path from main.
+      // A never-launched in-memory receipt has neither namespace to collect.
+      // Do not invoke the strict read selector (or remove a later planted run).
+      if (!fs.lstatSync(runDirectory, { throwIfNoEntry: false })) return [];
+      // Missing controls never downgrade an existing marked/unknown run.
       try { taskControlReadDirectory(runDirectory); }
       catch (readError) { if ((readError as NodeJS.ErrnoException).code !== "ENOENT") throw readError; }
     } else {
@@ -4290,7 +4320,11 @@ export class AgentManager {
     if (results.length > 0) {
       for (let attempt = 0; attempt < 3; attempt++) {
         try {
-          if (this.#onStoppedAtClose) for (const result of results) this.#stageArchive(path.join(this.#runRoot, result.id), result, "shutdown");
+          if (this.#onStoppedAtClose) for (const result of results) {
+            // A queued stop can be memory-only until shutdown requires custody.
+            this.#queued.get(result.id)?.allocateRun?.();
+            this.#stageArchive(path.join(this.#runRoot, result.id), result, "shutdown");
+          }
           this.#onStoppedAtClose?.(results);
           if (this.#onStoppedAtClose) for (const result of results) {
             const directory = path.join(this.#runRoot, result.id);

@@ -8,6 +8,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest
 import { AgentManager } from "../src/agents/manager.js";
 import type { AgentRunRecord } from "../src/agents/types.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
+import { createHostTaskRun } from "../src/worker/terminal-answer.js";
 
 // No dist dependency and no fake Pi binary: manager -> compiled parent worker
 // -> compiled durable host -> native SDK RPC/tools, with only inference offline.
@@ -277,8 +278,12 @@ describe("compiled parent recorded-result RPC failure boundaries", () => {
   ] as const)("handles %s without falling back or accepting an unrelated response", async (mode, error) => {
     const { cwd } = setup();
     vi.stubEnv("DURABLE_RPC_FAULT", mode);
-    fs.writeFileSync(path.join(cwd, "task.txt"), "task");
-    const result = await restart(cwd, { id: "recorded-rpc", name: "Recorded RPC", cwd }, {}, faultWorkerPath);
+    // central-v1: the host allocates an absent run before task/history writes;
+    // worker startup validates that authority and must never mint it itself.
+    const directory = path.join(cwd, "recorded-rpc");
+    createHostTaskRun(directory);
+    fs.writeFileSync(path.join(directory, "task.txt"), "task");
+    const result = await restart(directory, { id: "recorded-rpc", name: "Recorded RPC", cwd }, {}, faultWorkerPath);
     expect(result.status, result.error).toBe(error ? "failed" : "completed");
     if (error) expect(result.error).toContain(error);
     if (mode === "success" || mode === "partial" || mode === "error") {

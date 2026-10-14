@@ -100,7 +100,7 @@ export const ensureTaskControlRoot = (): string => {
   const root = taskControlRoot();
   // Every missing component (an arbitrarily deep absolute XDG_STATE_HOME) is created
   // 0700; existing ancestry was validated above and is re-validated below.
-  fs.mkdirSync(root, { recursive: true, mode: 0o700 });
+  openPrivateDir(root, root).close();
   // Re-validate after creation: a concurrent alias or foreign directory still refuses.
   if (taskControlRoot() !== root) throw new FabricTaskControlDirectoryError("Task control root changed during creation");
   return root;
@@ -313,7 +313,13 @@ const publishCentral = (runDirectory: string, build: (stage: string) => BindingV
   try {
     withExclusiveFileLock({ directory: root.path, lockName: `.${base}.lock`, attempts: 200, delayMs: 5, timeoutMessage: "Task control publication lock timed out" }, () => {
       if (entryExists(path.join(root.path, base))) unsafe("Task control destination already exists; refusing to replace");
-      try { fs.mkdirSync(path.join(root.path, stageName), { mode: 0o700 }); }
+      try {
+        const stage = path.join(root.path, stageName);
+        fs.mkdirSync(stage, { mode: 0o700 });
+        // The held private root protects this exclusive create. Restore owner
+        // search removed by restrictive umasks before opening/writing the stage.
+        if (process.platform !== "win32") fs.chmodSync(stage, 0o700);
+      }
       catch (error) {
         if ((error as NodeJS.ErrnoException).code === "EEXIST") unsafe("Outstanding task control stage exists; refusing (custody preserved)");
         throw error;

@@ -9,6 +9,7 @@ import { AgentManager } from "../src/agents/manager.js";
 import { BUILT_IN_RUNNER_IDS, requireAgentRunner, registerAgentRunner } from "../src/agents/runner-registry.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { parseWorkerOptions } from "../src/worker/options.js";
+import { createHostTaskRun } from "../src/worker/terminal-answer.js";
 
 const roots: string[] = [];
 const managers: AgentManager[] = [];
@@ -144,7 +145,10 @@ describe("real worker durable process protocol", () => {
   });
 
   const run = async (runner = "pi-durable", scenario = "success") => {
-    const root = temporary();
+    // Direct worker probes still need the host's exclusive central-v1 allocation,
+    // before any task/status/history write; startup only validates it.
+    const root = path.join(temporary(), "durable-probe");
+    createHostTaskRun(root);
     fs.writeFileSync(path.join(root, "task.txt"), "run on requested model");
     fs.writeFileSync(path.join(root, "scenario"), scenario);
     const args = argv(root, { runner, kernel: "typescript", "write-policy": JSON.stringify({ readOnly: true }),

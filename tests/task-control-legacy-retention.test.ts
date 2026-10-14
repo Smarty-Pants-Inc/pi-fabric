@@ -131,7 +131,9 @@ describe("existing-record legacy READ retention", () => {
   });
   it("requires the original sender ACK for an unconsumed current admission", () => {
     const f = seedCurrentRun(scratch());
-    json(path.join(f.ctl, "terminal-controls", `${f.messageId}.json`), { ...f.control, state: "refused", reason: "run-ended" });
+    // Current unforwarded refusal must retain the host's transport evidence.
+    // Omitting `forwarded` fabricates an uncertain pre-v2 row even after an ACK.
+    json(path.join(f.ctl, "terminal-controls", `${f.messageId}.json`), { ...f.control, forwarded: false, state: "refused", reason: "run-ended" });
     expect(canRemoveTerminalRun(f.run)).toBe(false);
     json(path.join(f.ctl, "terminal-notices", `${f.messageId}.json.delivered`), { ...f.notice, sender: { ...f.notice.sender, id: "session:forged" } });
     expect(canRemoveTerminalRun(f.run)).toBe(false);
@@ -344,20 +346,24 @@ describe("resident pair callers", () => {
   });
 });
 
-// DELTA-SEC-01 cutoff (#12214): raw old/v1 history is unknown custody. It vetoes
-// collection with every byte preserved; no layout is upgraded or silently dropped.
+// central-v1 preserves unmarked pre-v2 in-run READ/retention semantics without
+// minting write authority. Old siblings still veto; no layout is auto-upgraded.
 const filesOf = (...directories: string[]) => directories.filter(directory => fs.existsSync(directory)).flatMap(directory =>
   fs.readdirSync(directory, { recursive: true, withFileTypes: true }).filter(entry => entry.isFile())
     .map(entry => [path.join(entry.parentPath, entry.name), fs.readFileSync(path.join(entry.parentPath, entry.name)).toString("base64")]))
   .sort(([a], [b]) => a!.localeCompare(b!));
 describe("raw legacy retention cutoff", () => {
-  it.each(["legacy", "sibling-v1"] as const)("vetoes unknown %s controls, records no removal and preserves bytes", layout => {
+  it.each(["legacy", "sibling-v1"] as const)("judges settled %s history read-only without minting authority or changing bytes", layout => {
     const f = seedRun(scratch(), "run", layout);
     const before = filesOf(f.run, legacyTaskControlSibling(f.run), taskControlDirectory(f.run));
     expect(() => initializeTaskControlDirectory(f.run)).toThrow("FABRIC_LEGACY_SNAPSHOT_REQUIRED");
-    expect(canRemoveTerminalRun(f.run)).toBe(false);
-    expect(pruneActorRunArchives({ runsDirectory: f.root, retentionMs: day, now, dryRun: true })).toEqual([]);
-    expect(removePaths()).toEqual([]);
+    const collectible = layout === "legacy";
+    expect(canRemoveTerminalRun(f.run)).toBe(collectible);
+    expect(pruneActorRunArchives({ runsDirectory: f.root, retentionMs: day, now, dryRun: true })).toEqual(collectible ? [f.run] : []);
+    // A pre-v2 run has no central pair to remove. The native removal is recorded,
+    // not executed; this checks selection without laundering legacy authority.
+    expect(removePaths()).toEqual(collectible ? [f.run] : []);
+    expect(fs.existsSync(taskControlDirectory(f.run))).toBe(false);
     expect(filesOf(f.run, legacyTaskControlSibling(f.run), taskControlDirectory(f.run))).toEqual(before);
   });
   it("unknown raw queued debt keeps custody: no upgrade, no settle, no collection", () => {
@@ -365,7 +371,9 @@ describe("raw legacy retention cutoff", () => {
     json(path.join(f.run, "status.json"), { ...f.record, status: "stopped", finishedAt: day });
     const before = filesOf(f.run, taskControlDirectory(f.run));
     expect(() => initializeTaskControlDirectory(f.run)).toThrow("FABRIC_LEGACY_SNAPSHOT_REQUIRED");
-    settleTerminalControl(f.run, f.messageId, "delivered"); // API fails closed; exact queued bytes below must remain unchanged.
+    // Read-only fallback never authorizes the lock/write path. Assert the typed
+    // refusal rather than treating validation-only setup as a silent bootstrap.
+    expect(() => settleTerminalControl(f.run, f.messageId, "delivered")).toThrow("FABRIC_LEGACY_SNAPSHOT_REQUIRED");
     expect(canRemoveTerminalRun(f.run)).toBe(false);
     expect(removePaths()).toEqual([]);
     expect(filesOf(f.run, taskControlDirectory(f.run))).toEqual(before);

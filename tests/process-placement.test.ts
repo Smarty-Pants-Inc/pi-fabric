@@ -378,7 +378,11 @@ describe("host process task placement", () => {
   });
   it.each(["home","non-git"])("keeps an unshippable %s --src cwd local", async kind => {
     const f=fixture(); f.config.placement.command=f.config.placement.command.map(entry=>entry==="--cwd"?"--src":entry);
-    if(kind==="home") vi.stubEnv("HOME",f.root);
+    if(kind==="home") {
+      // HOME selects an unshippable cwd, not temporary central control storage.
+      vi.stubEnv("XDG_STATE_HOME",process.env.XDG_STATE_HOME ?? path.resolve(".local/state/process-placement"));
+      vi.stubEnv("HOME",f.root);
+    }
     const h=await f.manager.spawn({task:"x",transport:"process"});
     expect((await f.manager.wait(h.id)).text).toBe("LOCAL");
     expect(fs.readFileSync(path.join(f.manager.runDirectory(h.id)!,"events.jsonl"),"utf8")).toContain('"reason":"cwd-not-shippable"');

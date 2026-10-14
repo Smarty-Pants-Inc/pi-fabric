@@ -114,15 +114,17 @@ describe("actor archive paired task controls", () => {
     if (bad === "duplicate-answer") json(path.join(f.source, "final-answer.json"), f.receipt);
     if (bad === "duplicate-admission") fs.writeFileSync(path.join(f.source, "steer.jsonl"), JSON.stringify(f.admission) + "\n");
     if (bad === "mismatched-notice") json(path.join(sibling, "terminal-notices", f.admission.id + ".json.delivered"), { ...f.notice, finalAnswerReceiptId: "other-answer" });
-    if (bad === "missing-answer") fs.renameSync(path.join(f.controls, "final-answer.json"), path.join(f.root, "original-answer.json"));
+    // Preserve the missing answer beside central controls, not across a possible Windows temp-volume boundary.
+    const originalAnswer = f.controls + ".original-answer.json";
+    if (bad === "missing-answer") { fs.renameSync(path.join(f.controls, "final-answer.json"), originalAnswer); roots.push(originalAnswer); }
     if (bad === "incomplete-journal") fs.writeFileSync(path.join(f.controls, "steer.jsonl"), JSON.stringify(f.admission));
-    const layers = [f.source, legacyTaskControlSibling(f.source), sibling, path.join(f.root, "original-answer.json")], before = filesOf(...layers);
+    const layers = [f.source, legacyTaskControlSibling(f.source), sibling, originalAnswer], before = filesOf(...layers);
     expect(() => initializeTaskControlDirectory(f.source)).toThrow(LEGACY);
     expect(() => readFinalAnswerReceipt(f.source, f.record.id)).toThrow(LEGACY);
     await expect(f.store.retainRun(f.actor, f.alias, f.source)).rejects.toThrow(LEGACY);
     expect(fs.existsSync(taskControlDirectory(f.archive))).toBe(false);
     expect(fs.existsSync(path.join(f.archive, "status.json"))).toBe(false);
-    expect(fs.readFileSync(bad === "missing-answer" ? path.join(f.root, "original-answer.json") : path.join(f.controls, "final-answer.json"), "utf8")).toContain(f.receipt.text);
+    expect(fs.readFileSync(bad === "missing-answer" ? originalAnswer : path.join(f.controls, "final-answer.json"), "utf8")).toContain(f.receipt.text);
     expect(canRemoveTerminalRun(f.source)).toBe(false);
     expect(removalPaths()).toEqual([]);
     expect(filesOf(...layers)).toEqual(before);
@@ -215,11 +217,14 @@ const bytesOf = (...directories: string[]) => directories.filter(directory => fs
     .map(entry => [path.join(entry.parentPath, entry.name), fs.readFileSync(path.join(entry.parentPath, entry.name)).toString("base64")]))
   .sort(([a], [b]) => a!.localeCompare(b!));
 describe("raw legacy cutoff: unknown history refuses, every byte preserved", () => {
-  it.each(["sibling-v1", "legacy"] as const)("refuses %s raw history at bootstrap, read, archive and collection", async layout => {
+  it.each(["sibling-v1", "legacy"] as const)("preserves %s raw history without bootstrap or archive promotion", async layout => {
     const f = setup(layout);
     const before = bytesOf(f.source, legacyTaskControlSibling(f.source), taskControlDirectory(f.source));
     expect(() => initializeTaskControlDirectory(f.source)).toThrow("FABRIC_LEGACY_SNAPSHOT_REQUIRED");
-    expect(() => readFinalAnswerReceipt(f.source, f.record.id)).toThrow();
+    // Unmarked pre-v2 in-run history is readable, not writable or promotable.
+    // The old sibling shape is still unsupported and must refuse the same read.
+    if (layout === "legacy") expect(readFinalAnswerReceipt(f.source, f.record.id)).toEqual(f.receipt);
+    else expect(() => readFinalAnswerReceipt(f.source, f.record.id)).toThrow();
     await expect(f.store.retainRun(f.actor, f.alias, f.source)).rejects.toThrow();
     expect(fs.existsSync(path.join(f.archive, "status.json"))).toBe(false);
     expect(canRemoveTerminalRun(f.source)).toBe(false);

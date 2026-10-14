@@ -59,9 +59,9 @@ const fixture = (cooldownMs = COOLDOWN_MS) => {
   const router = new MeshStore(meshRoot, 65_536, 100);
   const from: MeshIdentity = { id: "session:router", name: "router", kind: "main", sessionId: "router" };
   const token = randomUUID().replace(/-/g, "");
-  closers.push(async () => {
-    for (const marker of ["TRANSIENT_FAILS", "AUTH_FAILS"]) fs.rmSync(path.join(os.tmpdir(), `fake-pi-rpc-${marker}-${token}`), { force: true });
-  });
+  // Actor requests omit cwd, so AgentManager uses config.cwd (root) and the
+  // worker passes it to fake Pi. Its token-named counters live under this stable
+  // fixture root, not the worker's per-run TMPDIR, and root cleanup owns them.
   const start = async (onIdle?: ConstructorParameters<typeof ResidentHost>[1]) => {
     const host = new ResidentHost(config, onIdle);
     closers.push(() => host.close());

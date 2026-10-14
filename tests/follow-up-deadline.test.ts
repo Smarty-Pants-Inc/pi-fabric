@@ -96,8 +96,9 @@ describe("follow-up release checkpoint", () => {
     await p.manager.stop(p.handle.id);
     const status = path.join(p.run, "status.json");
     fs.writeFileSync(status, JSON.stringify({ ...JSON.parse(fs.readFileSync(status, "utf8")), taskControlLayout: "sibling-v1" }));
-    const control = taskControlDirectory(p.run), held = path.join(p.run, "held-controls");
-    fs.renameSync(control, held);
+    // Central state and temporary runs can be on different Windows volumes.
+    const control = taskControlDirectory(p.run), held = control + ".held";
+    fs.renameSync(control, held); roots.push(held);
     if (bad === "linked") fs.symlinkSync(held, control);
     await expect(p.manager.checkpointForRelease()).rejects.toThrow(/unresolved run tree|Task control directory/);
     expect(fs.existsSync(held)).toBe(true);

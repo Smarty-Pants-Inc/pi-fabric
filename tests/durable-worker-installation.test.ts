@@ -8,6 +8,7 @@ import { createRequire } from "node:module";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agents/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
+import { createHostTaskRun } from "../src/worker/terminal-answer.js";
 
 const roots: string[] = [];
 const managers: AgentManager[] = [];
@@ -64,13 +65,17 @@ const bunAvailable = spawnSync("bun", ["--version"], { timeout: 5000 }).status =
 describe("installed durable worker without host peers", () => {
   it.skipIf(!bunAvailable)("runs the parent and durable SDK worker under Bun without host peers", async () => {
     const { root } = installation();
-    const taskFile = path.join(root, "task.txt");
-    const statusFile = path.join(root, "bun-status.json");
+    // The host, not the standalone worker, creates current-only authority.
+    // Keep the installation/workspace separate from the exclusively allocated run.
+    const run = path.join(root, "bun-probe");
+    createHostTaskRun(run);
+    const taskFile = path.join(run, "task.txt");
+    const statusFile = path.join(run, "status.json");
     fs.writeFileSync(taskFile, "read fixture");
     const flags = {
       id: "bun-probe", name: "bun-probe", runner: "pi-durable", cwd: root,
       "task-file": taskFile, "status-file": statusFile,
-      "lifecycle-file": path.join(root, "bun-lifecycle.jsonl"), "log-file": path.join(root, "bun-events.jsonl"),
+      "lifecycle-file": path.join(run, "lifecycle.jsonl"), "log-file": path.join(run, "events.jsonl"),
       "pi-binary": "forbidden-legacy-fallback", "claude-binary": "unused", "veda-binary": "unused",
       "veda-backend": "agy", "veda-persona": "unused", "timeout-ms": "20000", depth: "1",
       "full-code-mode": "false", extensions: "true", tools: '["read"]', "granted-risks": "[]", transport: "process",

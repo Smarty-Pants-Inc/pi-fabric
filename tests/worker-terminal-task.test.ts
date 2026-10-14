@@ -4,7 +4,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agents/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
-import { finalAssistantText, readFinalAnswerReceipt, saveFinalAnswerReceipt, initializeTaskControlDirectory, taskControlDirectory } from "../src/worker/terminal-answer.js";
+import { finalAssistantText, readFinalAnswerReceipt, saveFinalAnswerReceipt, createHostTaskRun, taskControlDirectory } from "../src/worker/terminal-answer.js";
 import { readTerminalControl, settleTerminalControl, trackTerminalControl } from "../src/worker/terminal-controls.js";
 
 const roots: string[] = [];
@@ -91,7 +91,8 @@ const spawn = async (s: ReturnType<typeof setup>, extra: Record<string, unknown>
 
 describe("durable task final-answer contract", () => {
   it("keeps the first complete full answer immutable and rejects malformed/mismatched receipts", () => {
-    const root = temporary(); initializeTaskControlDirectory(root);
+    // Validation no longer bootstraps authority: allocate an absent host run first.
+    const root = path.join(temporary(), "run"); createHostTaskRun(root);
     const text = "full answer ".repeat(100000);
     const first = saveFinalAnswerReceipt(root, "run", text);
     expect(readFinalAnswerReceipt(root, "run")).toEqual(first);
@@ -111,7 +112,8 @@ describe("durable task final-answer contract", () => {
     expect(finalAssistantText({ role: "assistant", stopReason: "stop", content: [] })).toBe("");
   });
   it("does not resurrect a consumed control on replay", () => {
-    const root = temporary(); initializeTaskControlDirectory(root);
+    // Validation no longer bootstraps authority: allocate an absent host run first.
+    const root = path.join(temporary(), "run"); createHostTaskRun(root);
     const id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
     trackTerminalControl(root, { id, delivery: "steer" }); settleTerminalControl(root, id, "delivered");
     trackTerminalControl(root, { id, delivery: "steer" }); settleTerminalControl(root, id, "refused");

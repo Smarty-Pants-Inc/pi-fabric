@@ -6,7 +6,7 @@ import { AgentManager } from "../src/agents/manager.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { writeJsonAtomic } from "../src/core/atomic-write.js";
-import { saveFinalAnswerReceipt } from "../src/worker/terminal-answer.js";
+import { saveFinalAnswerReceipt, taskControlDirectory, writeTaskControlJson } from "../src/worker/terminal-answer.js";
 import type { AgentRunRecord } from "../src/agents/types.js";
 import type { AgentTerminalNotice } from "../src/agents/terminal-target.js";
 import { TerminalNoticeOutbox, readTerminalAdmission } from "../src/agents/terminal-notices.js";
@@ -96,8 +96,10 @@ describe("legacy terminal refusal rows across manager, restart recovery and coll
     const directory = path.join(root, handle.id);
     const sent = manager.steer(handle.id, "late steer", undefined, provenance);
     expect(sent.undelivered).toBeUndefined();
-    const registry = path.join(directory, "terminal-controls", `${sent.messageId}.json`);
-    writeJsonAtomic(registry, row(variant, sent.messageId));
+    // The row format is intentionally pre-forwarded; its current host-owned
+    // storage is central-v1. An in-run overlay would never replace the real row.
+    const registry = path.join(taskControlDirectory(directory), "terminal-controls", `${sent.messageId}.json`);
+    writeTaskControlJson(directory, path.join("terminal-controls", `${sent.messageId}.json`), row(variant, sent.messageId));
     const persisted = fs.readFileSync(registry, "utf8");
     const receipt = finish(handle.id);
     await manager.wait(handle.id, { timeoutMs: 1000 });
@@ -109,7 +111,7 @@ describe("legacy terminal refusal rows across manager, restart recovery and coll
     manager.status(handle.id);
     const expected: AgentTerminalNotice = { code: "FABRIC_TARGET_TERMINAL", targetId: handle.id,
       finalAnswerReceiptId: receipt.id, messageId: sent.messageId, delivery: "steer", sender };
-    const pending = path.join(directory, "terminal-notices", `${sent.messageId}.json`);
+    const pending = path.join(taskControlDirectory(directory), "terminal-notices", `${sent.messageId}.json`);
     if (routed) await waitUntil(() => fs.existsSync(`${pending}.delivered`));
     else await settle();
     expect(notices).toEqual(routed ? [expected] : []);
@@ -137,7 +139,7 @@ describe("legacy terminal refusal rows across manager, restart recovery and coll
     const handle = await manager.spawn({ task: "ordinary", transport: "process" });
     const directory = path.join(root, handle.id);
     const sent = manager.steer(handle.id, "late steer", undefined, provenance);
-    writeJsonAtomic(path.join(directory, "terminal-controls", `${sent.messageId}.json`), row("legacy-refused", sent.messageId));
+    writeTaskControlJson(directory, path.join("terminal-controls", `${sent.messageId}.json`), row("legacy-refused", sent.messageId));
     const receipt = finish(handle.id);
     await manager.wait(handle.id, { timeoutMs: 1000 });
     const next = await manager.spawn({ task: "native-close barrier", transport: "process" });
@@ -148,8 +150,8 @@ describe("legacy terminal refusal rows across manager, restart recovery and coll
     // An earlier host may have retained the outbox entry before restart.
     const notice: AgentTerminalNotice = { code: "FABRIC_TARGET_TERMINAL", targetId: handle.id,
       finalAnswerReceiptId: receipt.id, messageId: sent.messageId, delivery: "steer", sender };
-    const pending = path.join(directory, "terminal-notices", `${sent.messageId}.json`);
-    writeJsonAtomic(pending, notice);
+    const pending = path.join(taskControlDirectory(directory), "terminal-notices", `${sent.messageId}.json`);
+    writeTaskControlJson(directory, path.join("terminal-notices", `${sent.messageId}.json`), notice);
     const recovered: AgentTerminalNotice[] = [];
     const outbox = new TerminalNoticeOutbox(value => { recovered.push(value); });
     outbox.recover(directory);
@@ -161,7 +163,7 @@ describe("legacy terminal refusal rows across manager, restart recovery and coll
     expect(fs.existsSync(`${pending}.delivered`)).toBe(false);
     expect(canRemoveTerminalRun(directory)).toBe(false);
     // Even an old route receipt (sender already told) does not discharge the uncertain row.
-    writeJsonAtomic(`${pending}.delivered`, notice);
+    writeTaskControlJson(directory, path.join("terminal-notices", `${sent.messageId}.json.delivered`), notice);
     expect(canRemoveTerminalRun(directory)).toBe(false);
     expect(pruneActorRunArchives({ runsDirectory: root, retentionMs: 0, now: Date.now() + 1_000, dryRun: true })).not.toContain(directory);
   });

@@ -76,7 +76,9 @@ export const setupCurrent = (alias = "archive", sourceDirectory?: string) => {
   appendTerminalAdmission(source, JSON.stringify(admission) + "\n");
   trackTerminalControl(source, { id: admission.id, delivery: "steer", provenance });
   settleTerminalControl(source, admission.id, "refused", "run-ended");
-  const control: TerminalControl = { id: admission.id, delivery: "steer", state: "refused", reason: "run-ended", provenance };
+  // Current host tracking persists write-ahead transport evidence; only RAW
+  // legacy fixture rows above intentionally omit `forwarded`.
+  const control: TerminalControl = { id: admission.id, delivery: "steer", state: "refused", reason: "run-ended", provenance, forwarded: false };
   const notice: AgentTerminalNotice = { code: "FABRIC_TARGET_TERMINAL", targetId: receipt.runId, messageId: admission.id, delivery: "steer", finalAnswerReceiptId: receipt.id, sender };
   writeTaskControlJson(source, path.join("terminal-notices", admission.id + ".json.delivered"), notice);
   const record = { id: "source-run", runner: "pi", status: "completed", transport: "process", sessionId: "2147483647", finishedAt: day,

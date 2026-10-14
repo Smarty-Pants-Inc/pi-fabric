@@ -10,7 +10,8 @@ import { FabricControlPlane } from "../src/topology/control-plane.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { writeJsonAtomic } from "../src/core/atomic-write.js";
-import { saveFinalAnswerReceipt, taskControlDirectory } from "../src/worker/terminal-answer.js";
+import { saveFinalAnswerReceipt, taskControlDirectory, taskSteerFile } from "../src/worker/terminal-answer.js";
+import { settleTerminalControl } from "../src/worker/terminal-controls.js";
 
 beforeEach(() => installInProcessResidentFence());
 const fixture = () => {
@@ -70,20 +71,26 @@ describe("resident ordinary-task terminal notices", () => {
       await f.host.start(); sender.start(() => ({ accepted: false }));
       const task = await f.host.agents.spawn({ task: "HANG", transport: "process" });
       const run = f.host.agents.runDirectory(task.id)!;
-      const journal = path.join(run, "steer.jsonl");
+      const journal = taskSteerFile(run);
       const allowed = await sender.request(f.host.hostId, task.id, "steer", { message: "before final" }, f.host.identity.id);
       expect(allowed).toMatchObject({ acknowledged: true });
       // The fake child does not consume controls. Mark the exact original
       // admission consumed, as native context delivery does in E-steer-final.
-      const admission = JSON.parse(fs.readFileSync(journal, "utf8").trim());
-      writeJsonAtomic(path.join(run, "terminal-controls", `${allowed.messageId}.json`), {
-        id: allowed.messageId, delivery: "steer", state: "delivered", provenance: admission.provenance,
+      // Preserve the real host row/provenance/forwarded metadata in central-v1,
+      // rather than writing an ignored (and unsafe) in-run registry overlay.
+      expect(settleTerminalControl(run, allowed.messageId!, "delivered")).toMatchObject({
+        id: allowed.messageId, delivery: "steer", state: "delivered",
       });
       const append = fs.appendFileSync;
       let receipt: ReturnType<typeof saveFinalAnswerReceipt> | undefined;
       let racingId = "";
       appendSpy = vi.spyOn(fs, "appendFileSync").mockImplementation(((file: fs.PathOrFileDescriptor, data: string | Uint8Array, options?: fs.WriteFileOptions) => {
-        if (file === journal && !receipt) {
+        // Admission now appends through its checked fd, not the public pathname.
+        const isJournal = file === journal || typeof file === "number" && (() => {
+          const opened = fs.fstatSync(file), named = fs.statSync(journal);
+          return opened.dev === named.dev && opened.ino === named.ino;
+        })();
+        if (isJournal && !receipt) {
           racingId = JSON.parse(String(data)).id;
           const snapshot = JSON.parse(fs.readFileSync(path.join(run, "status.json"), "utf8"));
           receipt = saveFinalAnswerReceipt(run, task.id, "durable final answer");

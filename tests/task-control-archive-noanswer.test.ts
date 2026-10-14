@@ -47,7 +47,9 @@ const setupNoAnswer = (status: "stopped" | "failed", sourceDirectory?: string) =
   const journal = Buffer.from(JSON.stringify(admission) + "\n");
   appendTerminalAdmission(source, journal.toString("utf8"));
   trackTerminalControl(source, { id: admission.id, delivery: "steer", provenance });
-  const queued = { id: admission.id, delivery: "steer", provenance, state: "queued" };
+  // Current host tracking includes durable transport evidence; this is not a
+  // legacy no-forwarded row like setupLegacyNoAnswer below.
+  const queued = { id: admission.id, delivery: "steer", provenance, forwarded: false, state: "queued" };
   expect(queuedTerminalControls(source)).toEqual([queued]);
   settleTerminalControl(source, admission.id, "delivered");
   const delivered = { ...queued, state: "delivered" };
@@ -165,7 +167,7 @@ describe("actor archive paired task controls", () => {
       trackTerminalControl(f.source, { id, delivery: "steer", provenance: f.admission.provenance });
       settleTerminalControl(f.source, id, "delivered");
       const row = path.join(f.controls, "terminal-controls", id + ".json"), delivered = fs.readFileSync(row, "utf8");
-      expect(JSON.parse(delivered)).toEqual({ id, delivery: "steer", provenance: f.admission.provenance, state: "delivered" });
+      expect(JSON.parse(delivered)).toEqual({ id, delivery: "steer", provenance: f.admission.provenance, forwarded: false, state: "delivered" });
       fs.writeFileSync(row, delivered.padEnd(MAX_TASK_CONTROL_BYTES - 1, " "));
     }
     expect(queuedTerminalControls(f.source)).toEqual([]);

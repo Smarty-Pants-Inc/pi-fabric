@@ -14,15 +14,20 @@ import { AgentManager } from "../src/agents/manager.js";
 import { DEFAULT_FABRIC_CONFIG, normalizeFabricConfig } from "../src/config.js";
 import { RetentionReferenceScan } from "../src/storage/reference-scan.js";
 import { ResidentLegacyRunArchive, legacyRunTreeProof } from "../src/residency/legacy-run-archive.js";
-import { initializeTaskControlDirectory, taskControlDirectory } from "../src/worker/terminal-answer.js";
+import { createHostTaskRun, TASK_CONTROL_LAYOUT, taskControlDirectory } from "../src/worker/terminal-answer.js";
 
 const roots: string[] = [];
 const temporary = () => { const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-legacy-archive-")); roots.push(root); return root; };
 const now = Date.now(), old = now - 49 * 60 * 60 * 1000;
-const run = (root: string, id: string, record: Record<string, unknown> = {}) => {
+const run = (root: string, id: string, record: Record<string, unknown> = {}, current = false) => {
   const dir = path.join(root, "runs", id);
-  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-  fs.writeFileSync(path.join(dir, "status.json"), JSON.stringify({ id, status: "completed", finishedAt: old, transport: "process", ...record }), { mode: 0o600 });
+  // Most fixtures intentionally predate v2 and keep the rename-only contract.
+  // A CURRENT control pair must be host-allocated before status/history writes;
+  // validation-only initialize cannot upgrade an existing legacy run.
+  if (current) createHostTaskRun(dir);
+  else fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(dir, "status.json"), JSON.stringify({ id, status: "completed", finishedAt: old, transport: "process",
+    ...(current ? { taskControlLayout: TASK_CONTROL_LAYOUT } : {}), ...record }), { mode: 0o600 });
   fs.writeFileSync(path.join(dir, "events.jsonl"), Buffer.from([0, 255, 10, 65, 66]), { mode: 0o600 });
   return dir;
 };
@@ -330,8 +335,7 @@ describe.skipIf(process.platform === "win32")("bounded retention reference prepa
 
 describe("rename-only legacy run retention", () => {
   it.skipIf(process.platform === "win32")("keeps migrated controls paired while retaining the original no-sibling legacy rename path", async () => {
-    const root = temporary(), ordinary = run(root, "ordinary"), migrated = run(root, "migrated", { runner: "pi" });
-    initializeTaskControlDirectory(migrated);
+    const root = temporary(), ordinary = run(root, "ordinary"), migrated = run(root, "migrated", { runner: "pi" }, true);
     const sibling = taskControlDirectory(migrated), marker = fs.readFileSync(path.join(sibling, ".legacy-read.json"));
     const before = fs.readFileSync(path.join(migrated, "events.jsonl"));
     const inode = fs.statSync(ordinary).ino;

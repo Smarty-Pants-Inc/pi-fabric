@@ -285,7 +285,7 @@ export function isolateTestFleetEnvironment(): Record<string, string> {
     // Writable project state is private; PI_FABRIC_PROJECT is attribution only.
     // Leave it scrubbed so participantProject(cwd) keeps the fixture's real project.
     PI_FABRIC_PROJECT_ROOT: join(root, "project"),
-    PI_FABRIC_RUN_ROOT: join(root, "runs"),
+    ...(process.platform === "win32" ? {} : { PI_FABRIC_RUN_ROOT: join(root, "runs") }),
     PI_FABRIC_AGENT_DIR: join(root, "exports"),
     PI_CODING_AGENT_DIR: join(root, "agent"),
     // An explicit private MCP layer prevents fallback to the real home config.
@@ -294,7 +294,13 @@ export function isolateTestFleetEnvironment(): Record<string, string> {
     // suites that list a mesh root must not race that timer. Lock-stats suites opt in explicitly.
     PI_FABRIC_LOCK_STATS: "0",
   };
-  for (const directory of ["mesh", "project", "runs", "exports", "agent"]) {
+  // On Windows a host with no selector allocates its own private run root under
+  // our TMPDIR. Injecting PI_FABRIC_RUN_ROOT makes every host look nested: Windows
+  // intentionally refuses that inherited authority (#12214). Fixtures needing a
+  // specific root must pass the trusted AgentManager { runRoot } option themselves.
+  // XDG_STATE_HOME remains caller/fixture-owned. Central state must be outside
+  // temp AND writable fixture cwd/grants; no location under TMPDIR can replace it.
+  for (const directory of ["mesh", "project", ...(process.platform === "win32" ? [] : ["runs"]), "exports", "agent"]) {
     mkdirSync(join(root, directory), { recursive: true });
   }
   writeFileSync(environment.MCPORTER_CONFIG, '{"mcpServers":{},"imports":[]}\n');

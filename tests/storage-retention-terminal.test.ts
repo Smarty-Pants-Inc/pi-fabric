@@ -1,5 +1,4 @@
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
@@ -8,13 +7,14 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { TerminalNoticeOutbox, readTerminalAdmission, terminalControlMatchesAdmission } from "../src/agents/terminal-notices.js";
 import { writeJsonAtomic } from "../src/core/atomic-write.js";
 import { canRemoveTerminalRun, pruneActorRunArchives } from "../src/storage/retention.js";
-import { createHostTaskRun, saveFinalAnswerReceipt, taskControlDirectory, taskSteerFile } from "../src/worker/terminal-answer.js";
+import { createHostTaskRun, ensureTaskControlRoot, saveFinalAnswerReceipt, taskControlDirectory, taskSteerFile } from "../src/worker/terminal-answer.js";
 import { markTerminalControlForwarded, settleTerminalControl, trackTerminalControl } from "../src/worker/terminal-controls.js";
 
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
 const fixture = () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "terminal-retention-")); roots.push(root);
+  // Locks and receipts move from central controls into this fixture: temp may be on another Windows volume.
+  const root = fs.mkdtempSync(path.join(path.dirname(ensureTaskControlRoot()), "terminal-retention-")); roots.push(root);
   const run = path.join(root, "run"); createHostTaskRun(run);
   const receipt = saveFinalAnswerReceipt(run, "run", "final answer");
   const record = { id: "run", runner: "pi", status: "completed", transport: "process", sessionId: "99999999", updatedAt: Date.now(),
@@ -166,9 +166,12 @@ describe("terminal-answer retention custody", () => {
     const registry = path.join(f.ctl, "terminal-controls", `${f.id}.json`);
     const lifecycle = path.join(f.run, "lifecycle.jsonl");
     const pending = path.join(f.ctl, "terminal-notices", `${f.id}.json`);
-    // Protected writes may rename through a pinned descriptor path; match the registry entry, not the prefix.
+    // central-v1 pins EACH control subdirectory: its fd path has no literal
+    // `terminal-controls` parent name. Match the exact held parent inode and leaf,
+    // so this barrier probe still observes the real protected publication.
     const isRegistry = (to: fs.PathLike): boolean =>
-      path.basename(String(to)) === `${f.id}.json` && path.basename(path.dirname(String(to))) === "terminal-controls";
+      path.basename(String(to)) === `${f.id}.json` &&
+      sameInode(fs.statSync(path.dirname(String(to))), fs.statSync(path.dirname(registry)));
     const namespaces: fs.Stats[] = [];
     for (let directory = f.run; ; directory = path.dirname(directory)) {
       namespaces.push(fs.statSync(directory));

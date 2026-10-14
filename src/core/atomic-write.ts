@@ -561,6 +561,9 @@ export const withExclusiveFileLock = <T>(
     try {
       fs.mkdirSync(lock, { mode: 0o700 });
       try {
+        // mkdir's mode is umask-filtered (0177 removes search). Restore only
+        // our newly created lock, never an EEXIST holder's permissions.
+        if (process.platform !== "win32") fs.chmodSync(lock, 0o700);
         fs.writeFileSync(ownerPath, `${token}\n${process.pid}\n${Date.now()}\n`, {
           encoding: "utf-8",
           mode: 0o600,

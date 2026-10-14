@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import readline from "node:readline";
 
@@ -44,10 +43,12 @@ const authFailure = () => ({ ...pinnedFailure(), errorMessage: "401 Unauthorized
 
 // TRANSIENT_FAILS=<n>#<token> / AUTH_FAILS=<n>#<token>: the first n activations naming the token fail,
 // later ones succeed (smarty-dev#6509). Each activation is a new child, so the count is a file.
+// Worker TMPDIR is per-run, but its cwd is the suite's stable private workspace
+// across activations/host restart. Token-named counters remain inside that fixture.
 const failsFirst = (task, marker) => {
   const match = new RegExp(`${marker}=(\\d+)#([A-Za-z0-9_-]+)`).exec(task);
   if (!match) return false;
-  const file = path.join(os.tmpdir(), `fake-pi-rpc-${marker}-${match[2]}`);
+  const file = path.join(process.cwd(), `fake-pi-rpc-${marker}-${match[2]}`);
   let used = 0;
   try { used = Number(fs.readFileSync(file, "utf8")) || 0; } catch { /* first activation */ }
   if (used >= Number(match[1])) return false;

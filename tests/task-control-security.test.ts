@@ -428,9 +428,9 @@ console.log('FORGED');
     expect(fs.readdirSync(central).sort()).toEqual(names);
   });
 
-  // CUTOFF (owner OPTION 1): every existing raw old/v1/unbound history is unknown. Refuse every
-  // history/finality-dependent operation, preserve all bytes, no upgrade or recovery path.
-  it.each(["in-run", "sibling", "in-run+sibling", "unbound central-v1"] as const)("CUTOFF: pre-existing %s history is refused and preserved byte-for-byte", shape => {
+  // central-v1 keeps the unmarked pre-v2 in-run READ contract, never its WRITE
+  // authority. Sibling/unbound layers still refuse; all original bytes survive.
+  it.each(["in-run", "sibling", "in-run+sibling", "unbound central-v1"] as const)("CUTOFF: pre-existing %s history is read-only or refused, never upgraded, and byte-preserved", shape => {
     const s = fixture(), C = path.join(s.run, "nested", "C"), sibling = legacyTaskControlSibling(C), central = taskControlDirectory(C);
     const answer = JSON.stringify({ version: 1, id: "old", runId: "C", recordedAt: 1, text: "OLD_UNKNOWN" });
     const steer = JSON.stringify({ type: "steer", id: "55555555-5555-4555-8555-555555555555", message: "old" }) + "\n";
@@ -447,10 +447,16 @@ console.log('FORGED');
     }));
     const before = snapshot(), centralExisted = fs.existsSync(central);
     expect(() => initializeTaskControlDirectory(C)).toThrow(FabricTaskControlDirectoryError);
-    expect(() => readFinalAnswerReceipt(C, "C")).toThrow(FabricTaskControlDirectoryError);
+    if (shape === "in-run") {
+      expect(taskControlReadDirectory(C)).toBe(C);
+      expect(readFinalAnswerReceipt(C, "C")).toEqual(JSON.parse(answer));
+      expect(readTerminalAdmissions(C)).toMatchObject({ controls: 1, bytes: Buffer.byteLength(steer), truncated: false });
+    } else {
+      expect(() => readFinalAnswerReceipt(C, "C")).toThrow(FabricTaskControlDirectoryError);
+      expect(() => readTerminalAdmissions(C)).toThrow(); // may wrap the typed refusal
+    }
     expect(() => withTaskFinalAnswerLock(C, read => read("C"))).toThrow(FabricTaskControlDirectoryError);
     expect(() => saveFinalAnswerReceipt(C, "C", "HOST")).toThrow(FabricTaskControlDirectoryError);
-    expect(() => readTerminalAdmissions(C)).toThrow(); // may wrap the typed refusal
     expect(canRemoveTerminalRun(C)).toBe(false);
     expect(snapshot()).toEqual(before);
     expect(fs.existsSync(central)).toBe(centralExisted);

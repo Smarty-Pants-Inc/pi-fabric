@@ -28,6 +28,7 @@ export class ActorDirectory extends ActorManager {
   readonly #defaultScope: FabricActorStorageScope;
   readonly #sessionOrphans: SessionActorOrphans | undefined;
   #orphanReconcilePending: Promise<number> | undefined;
+  // Startup releasePaused is activation-only; explicit pauseForRelease owns this fence.
   #orphanReconcileHeld = false;
   #releaseCheckpointReady = false;
 
@@ -70,7 +71,6 @@ export class ActorDirectory extends ActorManager {
       actorScope: secondaryScope,
     });
     this.#defaultScope = defaultScope;
-    this.#orphanReconcileHeld = options.releasePaused === true;
     this.#sessionOrphans = persistent && base[3].enabled
       // A resident host outlives Main and must also observe Main's own private
       // session registry. A Main never repairs its current session's records.

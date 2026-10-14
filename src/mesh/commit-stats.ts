@@ -275,7 +275,7 @@ export const createLockStats = (setting = process.env.PI_FABRIC_LOCK_STATS,
   const prune = (directory: string, now: number): void => {
     checkStatsDirectory(directory);
     for (const name of fs.readdirSync(directory)) {
-      // A `.prune-<pid>` name is a pruner's graveyard; one left by a crash is pruned by age too.
+      // A `.prune-<pid>` name is a pruner's graveyard; one left by a crash or failed relink is pruned by age too.
       if (!(name.endsWith(".json") || name.endsWith(".tmp") || /\.prune-\d+$/.test(name))) continue;
       const file = path.join(directory, name);
       try {
@@ -293,12 +293,15 @@ export const createLockStats = (setting = process.env.PI_FABRIC_LOCK_STATS,
         // at any time. Move it aside atomically (readers skip non-.json names), then delete it only
         // if it is still the aged file. Otherwise the writer's fresh file was moved: put it back with
         // an atomic no-replace link (EEXIST when an even newer file holds the name: keep that one;
-        // works on NTFS too), then drop the graveyard name either way.
+        // works on NTFS too), then drop the graveyard name only after restoration or EEXIST.
         const grave = `${file}.prune-${process.pid}`;
         fs.renameSync(file, grave);
         const moved = fs.lstatSync(grave);
         if (moved.dev !== seen.dev || moved.ino !== seen.ino || moved.mtimeMs !== seen.mtimeMs) {
-          try { fs.linkSync(grave, file); } catch { /* A newer file holds the name. */ }
+          try { fs.linkSync(grave, file); } catch (error) {
+            // Keep the fresh graveyard for age pruning unless a newer file holds the name.
+            if (errorCodeOf(error) !== "EEXIST") continue;
+          }
           // ponytail: not the aged inode: our per-pid graveyard name (no writer writes it) only drops the extra link of
           // the refreshed file put back above, or one a newer file at the name superseded (main's behaviour).
           fs.unlinkSync(grave);

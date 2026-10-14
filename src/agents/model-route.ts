@@ -347,16 +347,25 @@ export interface RunDirectoryPin { readonly run: string; use<T>(operation: (dire
 const isRunIdentityRefusal = (error: unknown): boolean => [RUN_IDENTITY_REFUSED, CONTROL_PUBLISH_UNSUPPORTED_PLATFORM]
   .includes(String((error as { code?: unknown } | undefined)?.code));
 const unsupportedControlPublication = (run: string): Error => Object.assign(new Error(
-  `${CONTROL_PUBLISH_UNSUPPORTED_PLATFORM}: routed dispatch control publication is unsupported on this platform until smarty-dev#12444 lands; non-routed spawns are unaffected (${run})`,
+  `${CONTROL_PUBLISH_UNSUPPORTED_PLATFORM}: routed model dispatch is unavailable on ${process.platform} until smarty-dev#12444 lands; pass an explicit model (for example model: "cliproxyapi/gpt-6.1-sol") instead of model: "auto" (${run})`,
 ), { code: CONTROL_PUBLISH_UNSUPPORTED_PLATFORM });
+/** The identity of the route-session file published for the worker's no-follow open. */
+export interface RouteSessionIdentity { readonly dev: string; readonly ino: string }
+export interface RouteSessionBinding { readonly path: string; readonly identity: RouteSessionIdentity }
 /** Atomic publication inside the pinned run: O_EXCL|O_NOFOLLOW temp, then rename within the directory fd. */
-const publishInRun = (pin: RunDirectoryPin, name: string, contents: string, durable: boolean): string => pin.use((directory, directoryFd) => {
+const publishInRun = (pin: RunDirectoryPin, name: string, contents: string, durable: boolean, withIdentity = false): string | RouteSessionBinding => pin.use((directory, directoryFd) => {
   if (directory === pin.run || directoryFd === undefined) throw unsupportedControlPublication(pin.run);
   const temporary = path.join(directory, `.${name}.${process.pid}.${randomUUID()}.tmp`);
   let renamed = false;
+  let identity: RouteSessionIdentity | undefined;
   try {
     const fd = fs.openSync(temporary, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | (fs.constants.O_NOFOLLOW ?? 0), 0o600);
-    try { fs.writeFileSync(fd, contents, "utf8"); if (durable) fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+    try {
+      fs.writeFileSync(fd, contents, "utf8");
+      if (durable) fs.fsyncSync(fd);
+      const stat = fs.fstatSync(fd, { bigint: true });
+      identity = { dev: String(stat.dev), ino: String(stat.ino) };
+    } finally { fs.closeSync(fd); }
     fs.renameSync(temporary, path.join(directory, name));
     renamed = true;
     if (durable) fs.fsyncSync(directoryFd);
@@ -366,11 +375,23 @@ const publishInRun = (pin: RunDirectoryPin, name: string, contents: string, dura
       catch { /* never created or already gone */ }
     }
   }
-  return path.join(pin.run, name);
+  const published = path.join(pin.run, name);
+  if (!withIdentity) return published;
+  // The identity comes from the file we wrote, never a later named reopen.
+  return { path: published, identity: identity! };
 });
 
+const routeSessionIdentity = (file: string): RouteSessionIdentity => {
+  const fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+  try {
+    const stat = fs.fstatSync(fd, { bigint: true });
+    if (!stat.isFile()) throw new Error("Route-session is not a regular file");
+    return { dev: String(stat.dev), ino: String(stat.ino) };
+  } finally { fs.closeSync(fd); }
+};
+
 export function prepareRouteDispatch(decision: ModelRouteDecision, cwd: string | undefined, runDirectory: string, childId: string, options: { ledger?: string; decisionRecorded?: boolean; runPin?: RunDirectoryPin } = {}): {
-  header: string; sessionFile?: string; bindSession: (cwd: string) => string; outcome: (result: Pick<AgentRunResult, "status"> & Partial<AgentRunResult>) => void;
+  header: string; sessionFile?: string; bindSession: (cwd: string) => RouteSessionBinding; outcome: (result: Pick<AgentRunResult, "status"> & Partial<AgentRunResult>) => void;
 } {
   const file = options.ledger ?? path.join(resolveAgentDir(), "fabric", "model-routing.jsonl");
   let sessionFile: string | undefined;
@@ -378,15 +399,19 @@ export function prepareRouteDispatch(decision: ModelRouteDecision, cwd: string |
   // Record before admission; seed only once the run's final worktree is known.
   // A seed write failure must never fall back to a different working directory.
   const pin = options.runPin;
-  const bindSession = (finalCwd: string): string => {
+  const bindSession = (finalCwd: string): RouteSessionBinding => {
     const line = `${JSON.stringify({ type: "session", version: CURRENT_SESSION_VERSION,
       id: childId, timestamp: new Date().toISOString(), cwd: finalCwd })}\n`;
-    if (pin) { sessionFile = publishInRun(pin, "route-session.jsonl", line, false); return sessionFile; }
+    if (pin) {
+      const published = publishInRun(pin, "route-session.jsonl", line, false, true) as RouteSessionBinding;
+      sessionFile = published.path;
+      return published;
+    }
     fs.mkdirSync(runDirectory, { recursive: true, mode: 0o700 });
     const file = path.join(runDirectory, "route-session.jsonl");
     fs.writeFileSync(file, line, { mode: 0o600 });
     sessionFile = file;
-    return file;
+    return { path: file, identity: routeSessionIdentity(file) };
   };
   // DELTA-SEC-02: a changed run identity refuses (typed) before ANY ledger or run write.
   pin?.use(() => undefined);

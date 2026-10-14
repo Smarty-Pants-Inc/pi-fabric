@@ -38,13 +38,13 @@ const assertRunPathSafe = (runDirectory: string, inheritedRoot: boolean): void =
 };
 /** DELTA-SEC-02 typed refusal (same code as model-route RUN_IDENTITY_REFUSED); never followed by a run-path write. */
 const runIdentityRefusal = (message: string): Error => {
-  const error = Object.assign(new FabricTaskControlDirectoryError(message), { code: "FABRIC_RUN_IDENTITY_REFUSED" });
+  const error = Object.assign(new FabricTaskControlDirectoryError(`FABRIC_RUN_IDENTITY_REFUSED: ${message}`), { code: "FABRIC_RUN_IDENTITY_REFUSED" });
   unsafeRunPathErrors.add(error);
   return error;
 };
 const unsupportedControlPublication = (run: string): Error => {
   const error = Object.assign(new FabricTaskControlDirectoryError(
-    `FABRIC_CONTROL_PUBLISH_UNSUPPORTED_PLATFORM: routed dispatch control publication is unsupported on this platform until smarty-dev#12444 lands; non-routed spawns are unaffected (${run})`,
+    `FABRIC_CONTROL_PUBLISH_UNSUPPORTED_PLATFORM: routed model dispatch is unavailable on ${managerRunTestHooks.platform ?? process.platform} until smarty-dev#12444 lands; pass an explicit model (for example model: "cliproxyapi/gpt-6.1-sol") instead of model: "auto" (${run})`,
   ), { code: "FABRIC_CONTROL_PUBLISH_UNSUPPORTED_PLATFORM" });
   unsafeRunPathErrors.add(error);
   return error;
@@ -1382,7 +1382,21 @@ export class AgentManager {
   async #launchTransport(adapter: AgentTransportAdapter, request: AgentTransportLaunch): Promise<AgentTransportHandle> {
     if (this.#closing) throw new Error("Fabric agent manager is closing");
     const signal = request.signal ? AbortSignal.any([request.signal, this.#closeAbort.signal]) : this.#closeAbort.signal;
-    const pending = adapter.launch({ ...request, signal });
+    // Re-pin for EVERY launch, including startup/provider retries. Only this
+    // invocation owns the duplicate; the stored retry request never retains a
+    // closed descriptor number. The worker receives its own inherited copy.
+    let sessionDirectoryFd: number | undefined;
+    if (request.workerArguments.some((value, index) => index % 2 === 0 && value === "--session-file-identity")) {
+      if (adapter.kind !== "process") throw runIdentityRefusal("Pinned routed sessions require the local process transport");
+      const statusIndex = request.workerArguments.indexOf("--status-file");
+      const statusFile = request.workerArguments[statusIndex + 1];
+      if (statusIndex < 0 || !statusFile) throw runIdentityRefusal("Pinned routed session has no run directory");
+      sessionDirectoryFd = pinRunDirectory(path.dirname(statusFile)).use(directory =>
+        fs.openSync(directory, fs.constants.O_RDONLY | (fs.constants.O_DIRECTORY ?? 0)));
+    }
+    let pending: Promise<AgentTransportHandle>;
+    try { pending = adapter.launch({ ...request, signal, ...(sessionDirectoryFd !== undefined ? { inheritFds: [sessionDirectoryFd] } : {}) }); }
+    catch (error) { if (sessionDirectoryFd !== undefined) fs.closeSync(sessionDirectoryFd); throw error; }
     this.#launches.add(pending);
     try {
       const transport = await pending;
@@ -1400,6 +1414,7 @@ export class AgentManager {
       return transport;
     } finally {
       this.#launches.delete(pending);
+      if (sessionDirectoryFd !== undefined) fs.closeSync(sessionDirectoryFd);
     }
   }
 
@@ -1755,6 +1770,7 @@ export class AgentManager {
           childIndex: this.#childIndex++,
           worker: true,
         };
+        const routeSession = !routedActor ? routeDispatch?.bindSession(agentCwd) : undefined;
         const sessionFile = request.forkSeed
           ? writeForkSession(request.forkSeed, agentCwd, path.join(runDirectory, "fork-session"), request.thinkingTransfer)
           : request.sessionSeed
@@ -1766,7 +1782,7 @@ export class AgentManager {
               request.handoffCompact,
               request.handoffCompact ? await this.#resolveHandoffCompactionBudget?.(model, agentCwd) : undefined,
             )
-          : routedActor ? request.sessionFile : routeDispatch?.bindSession(agentCwd) ?? request.sessionFile;
+          : routedActor ? request.sessionFile : routeSession?.path ?? request.sessionFile;
         const adapter = await this.#resolveTransport(request.transport ?? this.config.transport);
         const runRoute = createRunRouteMetadata({ ...routeFacts, runner, transport: adapter.kind });
         const timeoutMs = effectiveAgentTimeoutMs(
@@ -1927,6 +1943,7 @@ export class AgentManager {
           ...(request.routeDecision?.mode === "judgment" ? ["--judgment", "true"] : []),
           ...(systemPrompt ? ["--system-prompt", systemPrompt] : []),
           ...(sessionFile ? ["--session-file", sessionFile] : []),
+          ...(routeSession ? ["--session-file-identity", JSON.stringify(routeSession.identity), "--session-directory-fd", "4"] : []),
           ...(request.inferenceContext ? ["--inference-context", request.inferenceContext] : []),
           ...(sessionExportFile ? ["--session-export-file", sessionExportFile] : []),
           ...(inheritedSessionPins && inheritedSessionPins.length > 0

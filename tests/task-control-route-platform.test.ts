@@ -64,7 +64,8 @@ describe.skipIf(!usable)("routed control publication refuses without a traversab
     const launch = vi.spyOn(ProcessTransport.prototype, "launch");
     const manager = managerFor(runRoot);
     await expect(manager.run({ task: "must not launch", transport: "process", ...routed(ledger) } as never))
-      .rejects.toMatchObject({ code: "FABRIC_CONTROL_PUBLISH_UNSUPPORTED_PLATFORM" });
+      .rejects.toMatchObject({ code: "FABRIC_CONTROL_PUBLISH_UNSUPPORTED_PLATFORM",
+        message: expect.stringContaining(`routed model dispatch is unavailable on ${managerRunTestHooks.platform} until smarty-dev#12444 lands; pass an explicit model (for example model: "cliproxyapi/gpt-6.1-sol") instead of model: "auto"`) });
     // Refused at the pin, before the post-allocation yield, route import, receipt, session or pending write.
     expect(allocated).toEqual([]);
     expect(launch).not.toHaveBeenCalled();

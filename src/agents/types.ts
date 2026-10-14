@@ -486,6 +486,8 @@ export interface AgentTransportLaunch {
   cwd: string;
   workerPath: string;
   workerArguments: string[];
+  /** Host-owned descriptors inherited as stdio slots 4+; slot 3 stays IPC (routed session handoff only). */
+  inheritFds?: number[];
   needs?: string[];
   requires?: string[];
   /** Host-derived incompatibility, never accepted from guest arguments. */

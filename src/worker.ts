@@ -62,6 +62,27 @@ import { WriteReceiptRecorder } from "./agents/write-receipt.js";
 let crossSpawn: typeof import("cross-spawn");
 
 const NODE_SCRIPT_EXTENSIONS = new Set([".js", ".cjs", ".mjs", ".ts", ".cts", ".mts"]);
+const ROUTE_SESSION_REFUSED = "FABRIC_ROUTE_SESSION_IDENTITY_REFUSED";
+type RouteSessionIdentity = { dev: string; ino: string };
+class RouteSessionIdentityRefusedError extends Error {
+  readonly code = ROUTE_SESSION_REFUSED;
+  constructor(message: string) { super(`${ROUTE_SESSION_REFUSED}: ${message}`); this.name = "RouteSessionIdentityRefusedError"; }
+}
+const routeSessionArgument = (name: string): string | undefined => {
+  for (let index = 2; index < process.argv.length; index += 2) {
+    if (process.argv[index] === name) return process.argv[index + 1];
+  }
+  return undefined;
+};
+const routeSessionIdentityArgument = (): RouteSessionIdentity | undefined => {
+  const source = routeSessionArgument("--session-file-identity");
+  if (source === undefined) return undefined;
+  try {
+    const value = source ? JSON.parse(source) as Partial<RouteSessionIdentity> : undefined;
+    if (!value || !/^[0-9]+$/.test(value.dev ?? "") || !/^[0-9]+$/.test(value.ino ?? "")) throw new Error("invalid identity");
+    return { dev: value.dev!, ino: value.ino! };
+  } catch { throw new RouteSessionIdentityRefusedError("invalid session-file identity"); }
+};
 
 // Extensionless launchers such as ~/.local/bin/pi start with
 // `#!/usr/bin/env node`; a Herdr child's server PATH need not contain node.
@@ -362,6 +383,35 @@ const main = async (): Promise<void> => {
     writeRunRecord,
   } = loadedRunRecordHelpers;
   const options = optionHelpers.parseWorkerOptions();
+  const routeSessionIdentity = routeSessionIdentityArgument();
+  let routeSessionDirectoryFd: number | undefined;
+  let routeSessionFileFd: number | undefined;
+  if (routeSessionIdentity) {
+    if (!options.sessionFile) throw new RouteSessionIdentityRefusedError("session-file identity has no session file");
+    try {
+      if (process.platform !== "linux") throw new RouteSessionIdentityRefusedError("pinned route-session handoff requires Linux");
+      const inheritedFd = Number(routeSessionArgument("--session-directory-fd") ?? NaN);
+      if (!Number.isSafeInteger(inheritedFd) || inheritedFd < 3) throw new RouteSessionIdentityRefusedError("missing inherited route-session directory descriptor");
+      const held = fs.fstatSync(inheritedFd, { bigint: true });
+      const named = fs.lstatSync(path.dirname(options.sessionFile), { bigint: true });
+      if (!held.isDirectory() || !named.isDirectory() || named.isSymbolicLink() || named.dev !== held.dev || named.ino !== held.ino) {
+        throw new RouteSessionIdentityRefusedError("route-session directory changed before worker open");
+      }
+      routeSessionDirectoryFd = inheritedFd;
+      const routeSessionPath = `/proc/self/fd/${routeSessionDirectoryFd}/${path.basename(options.sessionFile)}`;
+      routeSessionFileFd = fs.openSync(routeSessionPath,
+        fs.constants.O_RDWR | fs.constants.O_APPEND | (fs.constants.O_NOFOLLOW ?? 0));
+      const stat = fs.fstatSync(routeSessionFileFd, { bigint: true });
+      if (!stat.isFile() || String(stat.dev) !== routeSessionIdentity.dev || String(stat.ino) !== routeSessionIdentity.ino) {
+        throw new RouteSessionIdentityRefusedError("route-session identity changed before worker open");
+      }
+    } catch (error) {
+      if (routeSessionFileFd !== undefined) { fs.closeSync(routeSessionFileFd); routeSessionFileFd = undefined; }
+      if (routeSessionDirectoryFd !== undefined) { fs.closeSync(routeSessionDirectoryFd); routeSessionDirectoryFd = undefined; }
+      if (error instanceof RouteSessionIdentityRefusedError) throw error;
+      throw new RouteSessionIdentityRefusedError(`route-session cannot be opened safely (${(error as NodeJS.ErrnoException).code ?? "unknown"})`);
+    }
+  }
   const ownRunDirectory = path.dirname(options.statusFile);
   // Direct activation/ephemeral workers bypass AgentManager. Bootstrap before
   // any child, status replacement, steering read or final-answer lock.
@@ -445,12 +495,6 @@ const main = async (): Promise<void> => {
   });
   const appendLog = runLog.raw;
   flushRunLog = runLog.flush;
-  const sessionStream =
-    options.runner === "claude" && options.sessionFile
-      ? fs.createWriteStream(options.sessionFile, { flags: "a", mode: 0o600 })
-      : undefined;
-  sessionStream?.on("error", () => {});
-
   const schema = options.schemaFile
     ? fs.readFileSync(options.schemaFile, "utf8")
     : undefined;
@@ -461,7 +505,16 @@ const main = async (): Promise<void> => {
   const recoveryScale = recoveryTimeScale();
   const persistentPiTask = options.runner === "pi" && options.transport === "process" &&
     !options.actorId && !options.actorName && !options.residentStartupProbe;
-  const piSessionFile = options.sessionFile ?? (persistentPiTask ? path.join(path.dirname(options.statusFile), "session.jsonl") : undefined);
+  let piSessionFile = options.sessionFile ?? (persistentPiTask ? path.join(path.dirname(options.statusFile), "session.jsonl") : undefined);
+  const sessionStream = options.runner === "claude" && options.sessionFile
+    ? routeSessionFileFd !== undefined
+      ? fs.createWriteStream(options.sessionFile, { fd: routeSessionFileFd, autoClose: true })
+      : fs.createWriteStream(options.sessionFile, { flags: "a", mode: 0o600 })
+    : undefined;
+  sessionStream?.on("error", () => {});
+  // Keep the checked file fd too: passing the file descriptor, rather than its
+  // leaf name, prevents a later leaf replacement from redirecting Pi's reopen.
+  if (routeSessionFileFd !== undefined && options.runner === "pi") piSessionFile = `/proc/self/fd/${routeSessionFileFd}`;
   let piRetrySdk: string | undefined;
   // Activation windows stay on the CLI, which owns their process-wide native
   // compaction fence. The SDK entry customizes only ordinary task retries.
@@ -493,7 +546,9 @@ const main = async (): Promise<void> => {
     piReleaseSdk = piRetrySdk ?? resolveRetrySdk(options.piBinary);
   }
   const piArguments = ["--mode", "rpc"];
-  if (piSessionFile) piArguments.push("--session", activationSession?.file ?? piSessionFile);
+  const routeChildSessionFd = piRetrySdk ? 4 : 3;
+  if (piSessionFile) piArguments.push("--session", routeSessionFileFd !== undefined && options.runner === "pi"
+    ? `/proc/self/fd/${routeChildSessionFd}` : activationSession?.file ?? piSessionFile);
   else piArguments.push("--no-session");
   // Opaque launchers have no supplied native discovery API. Keep discovery
   // disabled, but replay the personal profile's explicit non-Fabric extensions
@@ -803,7 +858,9 @@ const main = async (): Promise<void> => {
       // Also drop an inherited target for an explicitly loaded bridge.
       PI_FABRIC_EXTENSION_MODEL: undefined,
     },
-    stdio: piRetrySdk ? ["pipe", "pipe", "pipe", "ipc"] : ["pipe", "pipe", "pipe"],
+    stdio: routeSessionFileFd !== undefined && options.runner === "pi"
+      ? piRetrySdk ? ["pipe", "pipe", "pipe", "ipc", routeSessionFileFd] : ["pipe", "pipe", "pipe", routeSessionFileFd]
+      : piRetrySdk ? ["pipe", "pipe", "pipe", "ipc"] : ["pipe", "pipe", "pipe"],
   });
   // Every provider resume is a new execution obligation. Drain each attempt
   // before replacement, but retain the worker's custody until the whole run ends.

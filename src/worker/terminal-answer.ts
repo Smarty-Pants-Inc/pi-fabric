@@ -184,6 +184,9 @@ const BINDING = ".legacy-read.json", SNAPSHOT = ".legacy-snapshot";
 const unsafe = (message: string): never => { throw new FabricTaskControlDirectoryError(`FABRIC_LEGACY_SNAPSHOT_REQUIRED: ${message}`); };
 /** Reserved protected metadata: public write/remove never touches these names. */
 const assertPublicControlName = (relative: string): void => {
+  // Colons are refused on every platform: Win32 uses them for NTFS alternate
+  // data streams, and public control names have no valid colon-bearing form.
+  if (relative.includes(":")) unsafe("Colon-bearing task control names are not publicly writable");
   // Fail closed on every platform for NTFS/APFS case aliases and Win32's
   // trailing-dot/space aliases, including a reserved directory component.
   const first = relative.split(/[\\/]/)[0]?.replace(/[. ]+$/u, "").toLowerCase();

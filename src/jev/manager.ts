@@ -256,9 +256,9 @@ export class JevProgramManager {
             } catch (error) {
               if (inference && !accounted) {
                 if (ref === "jev.evaluate" && error instanceof JevBilledError) {
-                  // A malformed answer with well-formed usage, or a transient HTTP error at
-                  // its reported or fixed cost, is billed and does not close inference:
-                  // the guest may fall back, back off and retry within its budgets.
+                  // A malformed answer or transient HTTP error with validated reported
+                  // usage is billed and does not close inference: the guest may fall back,
+                  // back off and retry within its budgets. Unknown usage remains blocked.
                   accountInference({ input: error.usage.input_tokens, output: error.usage.output_tokens, exhausted: false });
                   accounted = true;
                   if (reportedTokens > maxTokens) return failBudget("Jev reported-token budget exhausted");

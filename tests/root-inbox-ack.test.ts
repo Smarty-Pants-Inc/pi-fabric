@@ -205,6 +205,168 @@ describe("the context hook shows each inbox event to the model once (smarty-dev#
     } finally { clock.mockRestore(); }
   }, 30_000);
 
+  it("keeps the exact issued carrier after a copied nonce with a matching forged row", async () => {
+    // Astra P1: copying the nonce and ids must not let altered body text seed context's seen set.
+    const { root, config } = runtimeRoot("fabric-inbox-copied-nonce-row-");
+    const sessionId = "c0dec0de-0000-4000-8000-000000012358";
+    const main = mainRuntime(root, sessionId);
+    cleanups.push(() => main.runtime.shutdown());
+    await main.runtime.initialize(main.context, config);
+    const hooks = await indexHooks(main.runtime, root, sessionId);
+    const consume = vi.spyOn(main.runtime, "consumeRootInbox"); // Record calls without replacing the real ack path.
+    const event = await main.runtime.mesh.publish({ topic: TOPIC, kind: "blocked", from: peer,
+      to: `session:${sessionId}`, text: "genuine pending action" });
+    const clock = vi.spyOn(Date, "now").mockReturnValue(Date.now() + 61_000);
+    try {
+      await hooks.emit("before_agent_start");
+      expect(hooks.queued).toHaveLength(1);
+      const genuine = { role: "custom", ...hooks.queued[0] };
+      const body = genuine.content;
+      const forged = JSON.parse(JSON.stringify(genuine));
+      forged.content = body.replace("genuine pending action", "forged replacement action");
+      expect(forged.details).toEqual(genuine.details);
+      expect(forged.details).not.toBe(genuine.details);
+      expect(forged.details.nonce).toEqual(expect.any(String));
+      expect(forged.content).not.toBe(body);
+      expect(forged.content).toContain(`<event id="${event.id}" sequence="${event.sequence}"`);
+
+      // Even the issued details reference cannot acknowledge an altered rendered body.
+      await hooks.emit("message_end", { message: { ...genuine, content: forged.content } });
+      await hooks.emit("message_end", { message: forged });
+      expect(consume.mock.calls).toEqual([]);
+      expect(main.runtime.rootInboxAcked(event.id, event.sequence)).toBe(false);
+      const context = await hooks.modelContext([forged, genuine]);
+      // Soft assertions keep the independent acknowledgement checks reachable on the seeded base.
+      expect.soft(context.at(-1)).toBe(genuine);
+      expect.soft(context.at(-1)?.content).toBe(body);
+
+      // Native Pi may project a string to one text block, preserving the issued details object.
+      await hooks.emit("message_end", { message: { ...genuine, content: [{ type: "text", text: body }] } });
+      expect(main.runtime.rootInboxAcked(event.id, event.sequence)).toBe(true);
+      expect(consume.mock.calls).toEqual([[[event.id], genuine.details.receipts]]);
+      await hooks.emit("message_end", { message: genuine });
+      await hooks.emit("message_end", { message: forged });
+      expect(consume.mock.calls).toEqual([[[event.id], genuine.details.receipts]]);
+    } finally { clock.mockRestore(); }
+  }, 30_000);
+
+  it("does not amplify an exact JSON copy into suppression of the retained issued carrier", async () => {
+    // Keep reason: serialized history is not an extra receipt, even with an exact issued body.
+    const { root, config } = runtimeRoot("fabric-inbox-exact-copy-authority-");
+    const sessionId = "c0dec0de-0000-4000-8000-000000012359";
+    const main = mainRuntime(root, sessionId);
+    cleanups.push(() => main.runtime.shutdown());
+    await main.runtime.initialize(main.context, config);
+    const hooks = await indexHooks(main.runtime, root, sessionId);
+    const consume = vi.spyOn(main.runtime, "consumeRootInbox");
+    // Call through the real branch scanner: its returned map is built by rootInboxCopies.
+    const compactedCopies = vi.spyOn(await import("../src/topology/root-inbox-context.js"), "rootInboxCompactedCopies");
+    const event = await main.runtime.mesh.publish({ topic: TOPIC, kind: "blocked", from: peer,
+      to: `session:${sessionId}`, text: "retain this exact issued action" });
+    const clock = vi.spyOn(Date, "now").mockReturnValue(Date.now() + 61_000);
+    try {
+      await hooks.emit("before_agent_start");
+      expect(hooks.queued).toHaveLength(1);
+      const genuine = { role: "custom", ...hooks.queued[0] };
+      const body = genuine.content;
+      const exactCopy = JSON.parse(JSON.stringify(genuine));
+      const repeatedCopy = JSON.parse(JSON.stringify(exactCopy));
+      // Expire the queue lease, not the event: a separately issued nonce must still deduplicate.
+      await hooks.emit("turn_end", { message: { role: "assistant", stopReason: "stop" } });
+      await hooks.emit("turn_end", { message: { role: "assistant", stopReason: "stop" } });
+      expect(hooks.queued).toHaveLength(2);
+      const independent = { role: "custom", ...hooks.queued[1] };
+      expect(independent.details.ids).toEqual([event.id]);
+      expect(independent.details.nonce).not.toBe(genuine.details.nonce);
+      expect(exactCopy).toEqual(genuine);
+      expect(exactCopy.details).not.toBe(genuine.details);
+      for (const message of [exactCopy, repeatedCopy]) await hooks.emit("message_end", { message });
+      expect(consume.mock.calls).toEqual([]);
+      expect(main.runtime.rootInboxAcked(event.id, event.sequence)).toBe(false);
+      // One nonce cannot gain extra suppression authority by appearing twice, nor exhaust a later scan.
+      for (let scan = 0; scan < 2; scan++) {
+        const context = await hooks.modelContext([exactCopy, repeatedCopy, genuine]);
+        expect.soft(context.at(-1)).toBe(genuine);
+        expect.soft(context.at(-1)?.content).toBe(body);
+        const issuedOnly = await hooks.modelContext([genuine, independent]);
+        expect.soft(issuedOnly[0]).toBe(genuine);
+        expect.soft(shown(issuedOnly, event.id)).toBe(1);
+      }
+
+      await hooks.emit("message_end", { message: genuine });
+      expect(main.runtime.rootInboxAcked(event.id, event.sequence)).toBe(true);
+      for (const [id, message] of [["exact-copy-1", exactCopy], ["exact-copy-2", repeatedCopy],
+        ["genuine-kept", genuine]] as const) {
+        hooks.entries.push(JSON.parse(JSON.stringify({ type: "custom_message", id,
+          timestamp: new Date().toISOString(), ...message })));
+      }
+      hooks.entries.push({ type: "compaction", id: "compact-exact-copies", firstKeptEntryId: "genuine-kept" });
+      // The two earlier occurrences of that same nonce cannot manufacture a compacted consuming copy
+      // while the actual issued carrier remains in context. Clone visibility is deliberately unspecified.
+      for (let scan = 0; scan < 2; scan++) {
+        const context = await hooks.modelContext([
+          { role: "compactionSummary", summary: "earlier history", tokensBefore: 1, timestamp: 0 }, genuine,
+        ]);
+        expect.soft(context.at(-1)).toBe(genuine);
+        expect.soft(context.at(-1)?.content).toBe(body);
+      }
+      // Now genuinely compact away the first issued carrier, leaving the independent nonce.
+      // Three occurrences of the first nonce (two JSON copies and its original) prove ONE copy,
+      // and that proof still suppresses the independently issued duplicate on each fresh scan.
+      hooks.entries.pop();
+      hooks.entries.push(JSON.parse(JSON.stringify({ type: "custom_message", id: "independent-kept",
+        timestamp: new Date().toISOString(), ...independent })));
+      hooks.entries.push({ type: "compaction", id: "compact-consuming-carrier", firstKeptEntryId: "independent-kept" });
+      for (let scan = 0; scan < 2; scan++) {
+        compactedCopies.mockClear();
+        const context = await hooks.modelContext([
+          { role: "compactionSummary", summary: "consumed action", tokensBefore: 1, timestamp: 0 }, independent,
+        ]);
+        expect.soft(shown(context, event.id)).toBe(0);
+        expect.soft(compactedCopies.mock.results.at(-1)?.value?.get(event.id)).toBe(1);
+      }
+      for (const message of [exactCopy, repeatedCopy, genuine]) await hooks.emit("message_end", { message });
+      expect(consume.mock.calls).toEqual([[[event.id], genuine.details.receipts]]);
+    } finally { clock.mockRestore(); }
+  }, 30_000);
+
+  it("starts a new extension instance without authority from historic issued carriers", async () => {
+    // Keep reason: generation-local issuer authority must not leak through serialized session history.
+    const { root, config } = runtimeRoot("fabric-inbox-issuer-generation-");
+    const sessionId = "c0dec0de-0000-4000-8000-000000012360";
+    const main = mainRuntime(root, sessionId);
+    cleanups.push(() => main.runtime.shutdown());
+    await main.runtime.initialize(main.context, config);
+    const previous = await indexHooks(main.runtime, root, sessionId);
+    const consume = vi.spyOn(main.runtime, "consumeRootInbox");
+    const event = await main.runtime.mesh.publish({ topic: TOPIC, kind: "blocked", from: peer,
+      to: `session:${sessionId}`, text: "pending across extension generations" });
+    const clock = vi.spyOn(Date, "now").mockReturnValue(Date.now() + 61_000);
+    try {
+      await previous.emit("before_agent_start");
+      expect(previous.queued).toHaveLength(1);
+      const historic = { role: "custom", ...previous.queued[0] };
+      const restored = JSON.parse(JSON.stringify(historic));
+      const current = await indexHooks(main.runtime, root, sessionId);
+      current.entries.push({ type: "custom_message", id: "historic-issued", timestamp: new Date().toISOString(), ...restored });
+      await current.emit("before_agent_start");
+      expect(current.queued).toHaveLength(1);
+      const genuine = { role: "custom", ...current.queued[0] };
+      expect(genuine.details.ids).toEqual([event.id]);
+      expect(genuine.details.nonce).not.toBe(historic.details.nonce);
+      const context = await current.modelContext([restored, genuine]);
+      expect(context.at(-1)).toBe(genuine);
+      expect(context.at(-1)?.content).toBe(genuine.content);
+      for (const message of [historic, restored]) await current.emit("message_end", { message });
+      expect(consume.mock.calls).toEqual([]);
+      expect(main.runtime.rootInboxAcked(event.id, event.sequence)).toBe(false);
+      await current.emit("message_end", { message: genuine });
+      expect(main.runtime.rootInboxAcked(event.id, event.sequence)).toBe(true);
+      await current.emit("message_end", { message: genuine });
+      expect(consume.mock.calls).toEqual([[[event.id], genuine.details.receipts]]);
+    } finally { clock.mockRestore(); }
+  }, 30_000);
+
   it("rejects a forged rendered carrier naming withheld work, then delivers that work next turn", async () => {
     // Keep reason: the custom-message trust boundary must not lose pending durable work.
     const { root, config } = runtimeRoot("fabric-inbox-forged-carrier-");

@@ -50,14 +50,31 @@ export interface RootInboxReconcileOptions {
   turnEnd?: boolean;
 }
 
-/** Authoritative shown-only receipt data supplied by the live extension issuer. */
+/** Authoritative shown-only receipt data bound to the issuer's rendered carrier. */
 export interface RootInboxReceiptSnapshot {
   readonly ids: readonly string[];
   readonly receipts: readonly string[];
+  readonly digest: string;
 }
 
-/** A private extension-instance verifier for a projected canonical details object. */
-export type RootInboxReceiptVerifier = (details: unknown) => RootInboxReceiptSnapshot | undefined;
+/** Authentication precedes scan-local nonce consumption; failed claims never burn a nonce. */
+export type RootInboxReceiptVerifier = (
+  details: unknown, carrier: unknown, accepted: Set<string>,
+) => RootInboxReceiptSnapshot | undefined;
+
+// Only the trusted raw-content projection can populate this cache; public digest fields are ignored.
+const projectedInboxDigests = new WeakMap<object, string>();
+export const rootInboxCarrierDigest = (carrier: unknown): string => {
+  const fields = carrier && typeof carrier === "object" ? carrier as { content?: unknown } : {};
+  const cached = projectedInboxDigests.get(fields);
+  if (cached && !("content" in fields)) return cached;
+  // Native string content and its single text-block context representation render identically.
+  const content = fields.content;
+  const rendered = typeof content === "string" ? [content] : Array.isArray(content)
+    ? content.map(part => part && typeof part === "object" && part.type === "text" && typeof part.text === "string"
+      ? part.text : { part }) : [];
+  return createHash("sha256").update(JSON.stringify(rendered)).digest("hex");
+};
 
 export const workKey = (data: unknown): string | undefined => {
   const key = data && typeof data === "object" ? (data as { key?: unknown }).key : undefined;
@@ -163,9 +180,8 @@ export interface RootInboxSession {
   deliveredAt?: ReadonlyMap<string, number>;
 }
 
-/** Only receipt identity survives the canonical-file scan. Delivered bodies and
- * arbitrary metadata are already durable in Pi; caching them again defeats its
- * cold entries. Preserve every field consumed by both receipt readers below. */
+/** Only receipt identity and a private raw-content digest survive the canonical-file scan.
+ * Delivered bodies and arbitrary metadata stay durable in Pi, not duplicated in this cache. */
 export const projectRootInboxReceipt = (value: unknown): unknown => {
   const object = (item: unknown): Record<string, unknown> | undefined =>
     item !== null && typeof item === "object" ? item as Record<string, unknown> : undefined;
@@ -182,7 +198,7 @@ export const projectRootInboxReceipt = (value: unknown): unknown => {
   const entry = object(value);
   if (!entry) return value;
   const details = object(entry.details);
-  return {
+  const projected = {
     type: entry.type, id: entry.id, timestamp: entry.timestamp, customType: entry.customType,
     ...(details ? { details: {
       ...carried(details),
@@ -193,6 +209,8 @@ export const projectRootInboxReceipt = (value: unknown): unknown => {
       items: Array.isArray(details.items) ? details.items.map(carried) : details.items,
     } } : {}),
   };
+  if (entry.customType === ROOT_INBOX_CUSTOM_TYPE) projectedInboxDigests.set(projected, rootInboxCarrierDigest(entry));
+  return projected;
 };
 
 const matchesInboxReceipt = (line: string): boolean =>
@@ -222,15 +240,16 @@ export const confirmedMainInboxIds = (manager: SessionReceiptManager, sessionId:
 /** Persisted sessions must use confirmed file receipts, never Pi's pre-write memory index.
  * A failed barrier supplies no positive delivery evidence, so shadows remain recoverable. */
 const verifiedInboxReceipt = (
-  details: unknown, verifier: RootInboxReceiptVerifier | undefined,
+  entry: { details?: unknown }, verifier: RootInboxReceiptVerifier | undefined, accepted: Set<string>,
 ): RootInboxReceiptSnapshot | undefined => {
   if (!verifier) return undefined;
-  const snapshot = verifier(details);
+  const snapshot = verifier(entry.details, entry, accepted);
   if (!snapshot || !Array.isArray(snapshot.ids) || !Array.isArray(snapshot.receipts)) return undefined;
   // Do not let a verifier's mutable return value become shared reader state.
   return Object.freeze({
     ids: Object.freeze(snapshot.ids.filter((id): id is string => typeof id === "string")),
     receipts: Object.freeze(snapshot.receipts.filter((id): id is string => typeof id === "string")),
+    digest: snapshot.digest,
   });
 };
 
@@ -265,6 +284,7 @@ const inboxReceiptSession = (
   verifier?: RootInboxReceiptVerifier,
 ): RootInboxSession => {
   const batchIds = new Set<string>();
+  const accepted = new Set<string>();
   let hasBatch = false;
   const steers = new Map<string, Set<string>>();
   const delivered = new Set<string>();
@@ -282,7 +302,7 @@ const inboxReceiptSession = (
     const parsedAt = Date.parse(entry.timestamp ?? "");
     const at = Number.isFinite(parsedAt) ? parsedAt : Date.now();
     if (entry.customType === ROOT_INBOX_CUSTOM_TYPE) {
-      const receipt = verifiedInboxReceipt(entry.details, verifier);
+      const receipt = verifiedInboxReceipt(entry, verifier, accepted);
       if (receipt) {
         if (index >= Math.max(0, count - lookback)) {
           hasBatch = true;
@@ -325,10 +345,11 @@ export const sessionHoldsInboxBatch = (
 ): boolean => {
   if (!verifier) return false;
   const missing = new Set(ids);
+  const accepted = new Set<string>();
   for (let index = entries.length - 1; index >= Math.max(0, entries.length - lookback); index--) {
     const entry = entries[index] as { type?: string; customType?: string; details?: unknown } | undefined;
     if (entry?.type !== "custom_message" || entry.customType !== ROOT_INBOX_CUSTOM_TYPE) continue;
-    const receipt = verifiedInboxReceipt(entry.details, verifier);
+    const receipt = verifiedInboxReceipt(entry, verifier, accepted);
     if (!receipt) continue;
     for (const id of receipt.ids) missing.delete(id);
     if (missing.size === 0) return true;

@@ -6,6 +6,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { deliverRootInbox } from "../src/topology/root-inbox-delivery.js";
 import { MeshStore, type MeshEvent, type MeshIdentity } from "../src/mesh/store.js";
 import { RootInbox, projectRootInboxReceipt, rootInboxSession as unsignedSession, type RootInboxSession } from "../src/topology/root-inbox.js";
+import { rootInboxCarrierDigest } from "../src/topology/root-inbox-shared.js";
 import { registerIssuedInbox, rootInboxMessage, rootInboxSession, sessionHoldsInboxBatch } from "./root-inbox-issued-fixture.js";
 
 // smarty-dev#754 §3.2 step 3: a Main reconciles the work events addressed to it that no steer
@@ -194,6 +195,35 @@ describe("RootInbox", () => {
     expect(unsignedSession([projected]).holdsBatch(["shown"])).toBe(false);
     cold.details.nonce = "unissued";
     expect(rootInboxSession([projectRootInboxReceipt(cold)]).holdsBatch(["shown"])).toBe(false);
+  });
+
+  it("rejects primitive content arrays while preserving canonical text-block projections", () => {
+    const body = "shown body";
+    const carrier = {
+      type: "custom_message", customType: "pi-fabric-inbox", content: body,
+      details: { ids: ["shown"], receipts: ["shown-receipt"] },
+    };
+    registerIssuedInbox(carrier.details, carrier.content);
+    const canonical = projectRootInboxReceipt({ ...carrier, content: [{ type: "text", text: body }] });
+    const valid = rootInboxSession([canonical]);
+    expect(valid.holdsBatch(["shown"])).toBe(true);
+    expect(valid.delivered?.has("shown-receipt")).toBe(true);
+
+    const publicDigest = rootInboxCarrierDigest(carrier);
+    const forged = {
+      ...carrier, content: [carrier.content], digest: publicDigest,
+      details: { ...carrier.details, digest: publicDigest },
+    };
+    const rejected = rootInboxSession([forged]);
+    expect(rejected.holdsBatch(["shown"])).toBe(false);
+    expect(rejected.delivered?.has("shown-receipt")).toBe(false);
+
+    Object.assign(canonical as object, { content: "changed body" });
+    expect(rootInboxSession([canonical]).holdsBatch(["shown"])).toBe(false);
+    Object.assign(canonical as object, { content: body });
+    const recovered = rootInboxSession([canonical, forged]);
+    expect(recovered.holdsBatch(["shown"])).toBe(true);
+    expect(recovered.delivered?.has("shown-receipt")).toBe(true);
   });
 });
 

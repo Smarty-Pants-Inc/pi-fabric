@@ -19,7 +19,7 @@ export interface RootInboxContextOptions {
   /** The root inbox acked this event: its id is in the acked set or its sequence at or below the mark. */
   acked: (id: string, sequence?: number) => boolean;
   /** Inbox copies per event id that compaction cut from the context; read only for an acked event. */
-  compactedCopies: () => ReadonlyMap<string, number>;
+  compactedCopies: (accepted: Set<string>) => ReadonlyMap<string, number>;
 }
 
 // Event text is XML-escaped (root-inbox.ts rootInboxMessage), so it cannot close an element early.
@@ -34,11 +34,11 @@ const record = (value: unknown): Record<string, unknown> | undefined =>
   value && typeof value === "object" ? value as Record<string, unknown> : undefined;
 
 /** Unissued history and ids without a shown row cannot hide genuine work (smarty-dev#12356). */
-const inboxIds = (message: unknown, verifier: RootInboxReceiptVerifier): string[] | undefined => {
+const inboxIds = (message: unknown, verifier: RootInboxReceiptVerifier, accepted: Set<string>): string[] | undefined => {
   const fields = record(message);
   if (fields?.role !== "custom" && fields?.type !== "custom_message") return undefined;
   if (fields.customType !== ROOT_INBOX_CUSTOM_TYPE) return undefined;
-  const ids = verifier(fields.details)?.ids;
+  const ids = verifier(fields.details, fields, accepted)?.ids;
   if (!ids?.length) return undefined;
   const shown = eventSequences(fields.content).shown;
   return [...new Set(ids.filter((id) => shown.has(id)))];
@@ -66,23 +66,32 @@ const eventSequences = (content: unknown): { shown: Map<string, number>; overflo
 };
 
 /** How many root inbox copies of each event id these session entries (or messages) hold. */
-export const rootInboxCopies = (entries: readonly unknown[], verifier: RootInboxReceiptVerifier): Map<string, number> => {
+export const rootInboxCopies = (
+  entries: readonly unknown[], verifier: RootInboxReceiptVerifier, accepted = new Set<string>(),
+): Map<string, number> => {
   const copies = new Map<string, number>();
-  for (const entry of entries) for (const id of inboxIds(entry, verifier) ?? []) copies.set(id, (copies.get(id) ?? 0) + 1);
+  for (const entry of entries) for (const id of inboxIds(entry, verifier, accepted) ?? []) copies.set(id, (copies.get(id) ?? 0) + 1);
   return copies;
 };
 
 /**
- * Inbox copies per event id that the latest compaction on this branch summarized out of the context:
- * every entry before its first kept entry, as Pi's buildContextEntries projects it.
+ * Count issuances wholly summarized out by the latest compaction, not serialized occurrences.
+ * A nonce authenticated anywhere in the retained branch cannot also prove a compacted copy.
  */
-export const rootInboxCompactedCopies = (branch: readonly unknown[], verifier: RootInboxReceiptVerifier): Map<string, number> => {
+export const rootInboxCompactedCopies = (
+  branch: readonly unknown[], verifier: RootInboxReceiptVerifier, accepted = new Set<string>(),
+): Map<string, number> => {
   let compaction = -1;
   branch.forEach((entry, index) => { if (record(entry)?.type === "compaction") compaction = index; });
   if (compaction < 0) return new Map();
   const firstKept = record(branch[compaction])?.firstKeptEntryId;
   const kept = branch.findIndex((entry, index) => index < compaction && record(entry)?.id === firstKept);
-  return rootInboxCopies(branch.slice(0, kept < 0 ? compaction : kept), verifier);
+  const cut = kept < 0 ? compaction : kept;
+  // Retained-first accounting protects exact copies even outside a context traversal.
+  // Isolate this scan so branch evidence cannot spend later context messages' nonces.
+  const scan = new Set(accepted);
+  for (const entry of branch.slice(cut)) inboxIds(entry, verifier, scan);
+  return rootInboxCopies(branch.slice(0, cut), verifier, scan);
 };
 
 const cutEvents = (text: string, drop: ReadonlySet<string>, shown: number, overflow: number): string => {
@@ -97,10 +106,12 @@ export const filterRootInboxContext = <Message>(
   options: RootInboxContextOptions,
 ): { messages: Message[]; changed: boolean } => {
   let compacted: ReadonlyMap<string, number> | undefined;
+  // Compaction evidence inherits these accepted nonces without spending later context rows.
+  const accepted = new Set<string>();
   // Acked, and the copy that consumed it was compacted away: the model saw it before this context.
   const consumedEarlier = (id: string, sequence: number | undefined): boolean => {
     if (!options.acked(id, sequence)) return false;
-    compacted ??= options.compactedCopies();
+    compacted ??= options.compactedCopies(accepted);
     return (compacted.get(id) ?? 0) > 0;
   };
   const seen = new Set<string>();
@@ -108,7 +119,7 @@ export const filterRootInboxContext = <Message>(
   let changed = false;
   let droppedLast: Message | undefined;
   messages.forEach((message, index) => {
-    const ids = inboxIds(message, options.verifier);
+    const ids = inboxIds(message, options.verifier, accepted);
     if (!ids?.length) {
       filtered.push(message);
       return;

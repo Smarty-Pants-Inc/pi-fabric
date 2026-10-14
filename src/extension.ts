@@ -5,7 +5,7 @@ import { extensionContextLive } from "./session-liveness.js";
 import { registerIncomingMessageRenderers } from "./ui/incoming-messages.js";
 import { principalViewIncomingMode, registerPrincipalView } from "./ui/principal-view.js";
 import {
-  rootInboxMessage, confirmedRootInboxSession, rootInboxSummary, ROOT_INBOX_CUSTOM_TYPE,
+  rootInboxMessage, confirmedRootInboxSession, rootInboxSummary, rootInboxCarrierDigest, ROOT_INBOX_CUSTOM_TYPE,
   type RootInboxBatch, type RootInboxReceiptSnapshot, type RootInboxReceiptVerifier, type RootInboxReconcileOptions,
 } from "./topology/root-inbox-shared.js";
 import { deliverRootInbox } from "./topology/root-inbox-delivery.js";
@@ -814,25 +814,30 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
   const queuedRootInboxIds = new Map<string, number>();
   // Native Pi preserves details by reference from sendMessage / the legacy hook result to
   // message_end. Serialized fields, queue leases and wake metadata are not consumption authority.
-  // Snapshot shown-only ids/receipts so even mutation of an issued object cannot ack withheld work.
-  // The nonce registry is private to this extension instance: a canonical entry is authoritative
-  // only while this generation can resolve the exact carrier it issued. Eviction fails open and
+  // Bind shown-only ids/receipts to rendered content; public nonce/receipt copies grant no new proof.
+  // The nonce registry is private to this extension instance: readers authenticate the exact content
+  // before consuming a nonce in their own traversal, never for its lifetime. Eviction fails open and
   // causes a duplicate, never a lost event.
   const MAX_ISSUED_ROOT_INBOX_RECEIPTS = 2_048;
   let issuedRootInboxDetails = new WeakMap<object, RootInboxReceiptSnapshot>();
   const issuedRootInboxReceipts = new Map<string, RootInboxReceiptSnapshot>();
   const inboxStrings = (value: unknown): string[] => Array.isArray(value)
     ? value.filter((item): item is string => typeof item === "string") : [];
-  const verifyIssuedInbox: RootInboxReceiptVerifier = (details) => {
+  const verifyIssuedInbox: RootInboxReceiptVerifier = (details, carrier, accepted) => {
     if (!details || typeof details !== "object") return undefined;
     const nonce = (details as { nonce?: unknown }).nonce;
-    return typeof nonce === "string" ? issuedRootInboxReceipts.get(nonce) : undefined;
+    if (typeof nonce !== "string" || accepted.has(nonce)) return undefined;
+    const snapshot = issuedRootInboxReceipts.get(nonce);
+    if (!snapshot || snapshot.digest !== rootInboxCarrierDigest(carrier)) return undefined;
+    accepted.add(nonce);
+    return snapshot;
   };
-  const registerIssuedInbox = (details: object): void => {
+  const registerIssuedInbox = (details: object, content: unknown): void => {
     const fields = details as { ids?: unknown; receipts?: unknown; nonce?: unknown };
     const snapshot: RootInboxReceiptSnapshot = Object.freeze({
       ids: Object.freeze(inboxStrings(fields.ids)),
       receipts: Object.freeze(inboxStrings(fields.receipts)),
+      digest: rootInboxCarrierDigest({ content }),
     });
     const nonce = randomUUID();
     fields.nonce = nonce;
@@ -866,10 +871,10 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     }
     return inbox.events.filter(event => !queuedRootInboxIds.has(event.id));
   };
-  const consumeInjectedInbox = async (details: unknown): Promise<void> => {
+  const consumeInjectedInbox = async (details: unknown, carrier: unknown): Promise<void> => {
     if (!details || typeof details !== "object") return;
     const issued = issuedRootInboxDetails.get(details);
-    if (!issued) {
+    if (!issued || issued.digest !== rootInboxCarrierDigest(carrier)) {
       console.warn("pi-fabric: ignored unissued root-inbox carrier");
       return;
     }
@@ -1478,9 +1483,9 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     const inbox = filter ? filter.filterRootInboxContext(planning.messages, {
       verifier: verifyIssuedInbox,
       acked: (id, sequence) => state.initialized && state.rootInboxAcked(id, sequence),
-      compactedCopies: () => {
+      compactedCopies: (accepted) => {
         try {
-          return filter.rootInboxCompactedCopies(context.sessionManager.getBranch?.() ?? [], verifyIssuedInbox);
+          return filter.rootInboxCompactedCopies(context.sessionManager.getBranch?.() ?? [], verifyIssuedInbox, accepted);
         } catch {
           return new Map();
         }
@@ -1656,7 +1661,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     // only actual rows, never the overflow summary, so withheld work is eligible next turn.
     if (!fabricProvenanceSupported(pi)) {
       const message = rootInboxMessage(events);
-      registerIssuedInbox(message.details);
+      registerIssuedInbox(message.details, message.content);
       for (const id of message.details.ids) queuedRootInboxIds.set(id, rootInboxTurn);
       return { message };
     }
@@ -1670,7 +1675,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
   pi.on("message_end", async (event) => {
     const message = event.message as unknown as { role?: string; customType?: string; details?: unknown };
     if (message.role !== "custom" || message.customType !== "pi-fabric-inbox") return undefined;
-    await consumeInjectedInbox(message.details);
+    await consumeInjectedInbox(message.details, message);
     return undefined;
   });
 

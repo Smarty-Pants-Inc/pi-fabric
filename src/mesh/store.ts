@@ -15,6 +15,7 @@ import { writeFileAtomic } from "../core/atomic-write.js";
 import type { FabricMessageSender } from "../protocol.js";
 import { copyFabricPrincipal, type FabricPrincipal } from "../fabric-provenance.js";
 import { processSender } from "../scope.js";
+import { verifiedRemove } from "../storage/verified-remove.js";
 export { MeshLockTimeoutError } from "../core/atomic-write.js";
 export type { MeshIdentity, MeshEvent, MeshPublishInput, MeshTailResult } from "./event-log.js";
 export { meshCursorGeneration, meshCursorAtStart, MeshDedupeRecoveryError, MeshDedupeStoreFullError } from "./event-log.js";
@@ -183,7 +184,14 @@ export const pruneDeadCensusRecords = (root: string): void => {
     if (!/^\d+-\d+\.json$/.test(name.slice(prefix.length))) continue;
     const file = path.join(directory, name);
     try {
-      if (censusRecordPrunable(JSON.parse(fs.readFileSync(file, "utf8")), host)) fs.rmSync(file, { force: true });
+      // smarty-dev#8907: the stat and the judged content come from one fd, so only that judged inode is removed
+      // (a record swapped in after the judgment stays); off Linux main's removal (smarty-dev#7858).
+      const fd = fs.openSync(file, "r");
+      let judged: fs.Stats, text: string;
+      try { judged = fs.fstatSync(fd); text = fs.readFileSync(fd, "utf8"); } finally { fs.closeSync(fd); }
+      if (censusRecordPrunable(JSON.parse(text), host)) {
+        verifiedRemove(file, judged, { deleter: "censusRecordPrune", fallback: () => { fs.rmSync(file, { force: true }); return true; } });
+      }
     } catch { /* unreadable or already gone: left to the next prune */ }
   }
 };
@@ -208,6 +216,9 @@ const censusDirectoryIdentity = (directory: string, create = true): string => {
 const prunedCensusRoots = new Set<string>();
 /** This process's census records by directory identity: the file and its stores still open. */
 const ownCensusRecords = new Map<string, { file: string; stores: number }>();
+// ponytail: no judgment precedes these two removals: the name <hostSlug>-<pid>-<startedAt>.json is this live process's
+// own record, written only by it (writeMeshWriterRecord refuses any other content), and no other process prunes it
+// while this incarnation is alive (censusRecordPrunable), so no aged or judged inode can be swapped in.
 const removeOwnCensusRecords = (): void => {
   for (const { file } of ownCensusRecords.values()) try { fs.rmSync(file, { force: true }); } catch { /* best effort */ }
 };
@@ -267,6 +278,7 @@ const writeMeshWriterRecord = (directory: string, file: string, host: string, lo
       const temporary = `${file}.${randomBytes(8).toString("hex")}.tmp`;
       fs.writeFileSync(temporary, serialized, { flag: "w", mode: 0o600 });
       try { fs.renameSync(temporary, file); }
+      // ponytail: our own unpublished temporary (random name, created just above), removed only after its rename failed.
       catch (error) { fs.rmSync(temporary, { force: true }); throw error; }
     }
     if (ownCensusRecords.size === 0) process.once("exit", removeOwnCensusRecords);
@@ -732,6 +744,8 @@ export class MeshStore {
 
   #writeSchedules(schedules: MeshSchedule[]): void {
     if (schedules.length === 0) {
+      // ponytail: not an expiry judgment: a locked state write (callers re-read under the mesh lock), the empty
+      // schedule list, exactly as writeFileAtomic below replaces the name; no other writer changes it unlocked.
       fs.rmSync(this.#schedulesPath, { force: true });
       this.#scheduleCache = undefined;
       return;

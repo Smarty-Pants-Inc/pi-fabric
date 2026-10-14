@@ -11,7 +11,7 @@ import { activeFabricRoot, loadedFabricRoot, resolveAgentDir } from "../../core/
 import { fabricResourceRoot } from "../../core/fabric-resource.js";
 import { WORKER_PROTOCOL_VERSION } from "../worker-protocol.js";
 import { executeFile, findExecutable, spawnDetached } from "./process-utils.js";
-import { taskAgentEnvironment } from "../task-environment.js";
+import { taskAgentEnvironment, withoutTaskBoundary } from "../task-environment.js";
 import { applyTaskReturnAddress } from "../task-return-address.js";
 import type { AgentPlacementConfig } from "../placement-config.js";
 import { agentPlacementProbe, liveAgentPlacement } from "../placement-config.js";
@@ -223,7 +223,8 @@ export class ProcessTransport implements AgentTransportAdapter {
       // Worker arguments are flag/value pairs. A flag-shaped value is not an
       // actor identity; explicit actor ids alone retain the parent's role env.
       applyTaskReturnAddress(
-        isActorLaunch(workerArguments) ? { ...process.env } : taskAgentEnvironment(),
+        // Actors keep their roles, never their caller's capped-task receipt (SRC-1).
+        isActorLaunch(workerArguments) ? withoutTaskBoundary(process.env) : taskAgentEnvironment(),
         workerArguments,
       ),
       scope,

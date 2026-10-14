@@ -1,3 +1,12 @@
+/** A new run cannot claim its caller's task boundary; keep roles and ordinary env intact. */
+export const withoutTaskBoundary = (environment: NodeJS.ProcessEnv): NodeJS.ProcessEnv => {
+  const child = { ...environment };
+  delete child.FABRIC_TASK_MEMORY_MAX;
+  delete child.FABRIC_TASK_CGROUP;
+  delete child.FABRIC_TASK_SYSTEMD_RUN_WRAPPER;
+  return child;
+};
+
 /**
  * Task identity is set before exec, not by mutating the worker's environment later.
  * `preserveTaskBoundary` is only for the worker's own same-run child: the launcher exported the
@@ -8,7 +17,7 @@ export const taskAgentEnvironment = (
   environment: NodeJS.ProcessEnv = process.env,
   preserveTaskBoundary = false,
 ): NodeJS.ProcessEnv => {
-  const child = { ...environment };
+  const child = preserveTaskBoundary ? { ...environment } : withoutTaskBoundary(environment);
   // smarty-role's @stamp is the shared org repository revision, not a role
   // content hash. Keep that provenance when switching to its task-agent role;
   // an unstamped/non-fleet parent must not invent a revision.
@@ -24,13 +33,5 @@ export const taskAgentEnvironment = (
   // An actor's task child is a task, not another activation of the parent's actor.
   delete child.PI_FABRIC_ACTOR_ID;
   delete child.PI_FABRIC_TASK_PROCESS_CHILD;
-  // smarty-dev#8257: cap evidence is exported only by the launcher after it admits a
-  // capped receipt. An inherited value would make an uncapped fallback claim a cap, and the
-  // task-local systemd-run shim belongs to the parent's leaf; the launcher sets its own.
-  if (!preserveTaskBoundary) {
-    delete child.FABRIC_TASK_MEMORY_MAX;
-    delete child.FABRIC_TASK_CGROUP;
-    delete child.FABRIC_TASK_SYSTEMD_RUN_WRAPPER;
-  }
   return child;
 };

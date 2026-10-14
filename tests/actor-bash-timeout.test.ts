@@ -500,18 +500,25 @@ describe.skipIf(!ownCgroup)("actor-bash-hook capped-task systemd-run guard (smar
 });
 
 // smarty-dev#2339 F4: actor B's unset override must not inherit actor A's timeout.
-describe("nested actor bash timeout isolation (smarty-dev#2339 F4)", () => {
+describe("nested actor bash timeout isolation and boundary scrub (smarty-dev#2339 F4, #8257 SRC-1)", () => {
   const roots: string[] = [];
   const closers: Array<() => Promise<void>> = [];
   afterEach(async () => {
     vi.unstubAllEnvs();
     for (const close of closers.splice(0)) await close();
+    vi.restoreAllMocks();
     for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
   });
 
   it.each(["0", "2"])("clears parent timeout %s in the real worker and keeps the child's own 7 s override", { timeout: 20_000 }, async (inherited) => {
     vi.stubEnv("PI_FABRIC_ACTOR_ID", "actor:parent");
     vi.stubEnv("PI_FABRIC_ACTOR_BASH_TIMEOUT_S", inherited);
+    vi.stubEnv("FABRIC_TASK_MEMORY_MAX", "25769803776");
+    vi.stubEnv("FABRIC_TASK_CGROUP", "/a/fabric-task-parent.scope");
+    vi.stubEnv("FABRIC_TASK_SYSTEMD_RUN_WRAPPER", "/parent/bin/systemd-run");
+    // Fault-injected parent transport: deliberately pass stale receipt through,
+    // so only the real worker bootstrap (separate process, unmocked) can clear it.
+    vi.spyOn(await import("../src/agents/task-environment.js"), "withoutTaskBoundary").mockImplementation(env => ({ ...env }));
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-nested-actor-bash-"));
     roots.push(root);
     const fakePi = path.join(root, "fake-pi.mjs");
@@ -519,7 +526,7 @@ describe("nested actor bash timeout isolation (smarty-dev#2339 F4)", () => {
       "#!/usr/bin/env node",
       "import readline from 'node:readline';",
       "const send = (event) => process.stdout.write(JSON.stringify(event) + '\\n');",
-      "const text = JSON.stringify({ actorId: process.env.PI_FABRIC_ACTOR_ID, timeout: process.env.PI_FABRIC_ACTOR_BASH_TIMEOUT_S });",
+      "const text = JSON.stringify({ actorId: process.env.PI_FABRIC_ACTOR_ID, timeout: process.env.PI_FABRIC_ACTOR_BASH_TIMEOUT_S, cap: process.env.FABRIC_TASK_MEMORY_MAX, cgroup: process.env.FABRIC_TASK_CGROUP, wrapper: process.env.FABRIC_TASK_SYSTEMD_RUN_WRAPPER });",
       "const message = { role: 'assistant', content: [{ type: 'text', text }], provider: 'fake', model: 'fake', usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 }, stopReason: 'stop' };",
       "let started = false;",
       "readline.createInterface({ input: process.stdin }).on('line', (line) => {",
@@ -541,7 +548,9 @@ describe("nested actor bash timeout isolation (smarty-dev#2339 F4)", () => {
         ...(bashTimeoutSeconds === undefined ? {} : { bashTimeoutSeconds }),
       });
       expect(result.status).toBe("completed");
-      return JSON.parse(result.text) as { actorId: string; timeout?: string };
+      const native = JSON.parse(result.text) as { actorId: string; timeout?: string; cap?: string; cgroup?: string; wrapper?: string };
+      for (const key of ["cap", "cgroup", "wrapper"]) expect(native).not.toHaveProperty(key);
+      return native;
     };
     const defaults = await surface();
     expect(defaults.actorId).toBe("actor:child");

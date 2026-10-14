@@ -462,6 +462,11 @@ describe.skipIf(process.platform !== "linux" || !isV2)("ProcessTransport task me
 
   it("does not cap actors: an actor launch keeps the uncapped processSlice scope, or none", async () => {
     const f = await fixture("live");
+    vi.stubEnv("FABRIC_TASK_MEMORY_MAX", "25769803776");
+    vi.stubEnv("FABRIC_TASK_CGROUP", "/a/fabric-task-parent.scope");
+    vi.stubEnv("FABRIC_TASK_SYSTEMD_RUN_WRAPPER", "/parent/bin/systemd-run");
+    vi.stubEnv("PI_FABRIC_ROLE", "actor");
+    fs.appendFileSync(f.worker, '\nfs.writeFileSync("actor-env.json", JSON.stringify(process.env));');
     const actor = { ...f.request, workerArguments: ["--actor-id", "actor:a"] };
     await launch(new ProcessTransport(undefined, undefined, undefined, 24 * GIB), actor, f.root);
     expect(scopeArgs(f.root)).toBeUndefined();
@@ -470,6 +475,13 @@ describe.skipIf(process.platform !== "linux" || !isV2)("ProcessTransport task me
     const args = scopeArgs(f.root)!;
     expect(args.find(arg => arg.startsWith("--unit="))).toMatch(/^--unit=fabric-scope-.+\.scope$/);
     expect(properties(args).filter(p => /^Memory(Swap)?Max=/.test(p))).toEqual([]);
+    const environment = JSON.parse(fs.readFileSync(path.join(f.root, "actor-env.json"), "utf8"));
+    for (const key of ["FABRIC_TASK_MEMORY_MAX", "FABRIC_TASK_CGROUP", "FABRIC_TASK_SYSTEMD_RUN_WRAPPER"]) {
+      expect(environment[key], `uncapped actor inherited ${key}`).toBeUndefined();
+    }
+    expect(environment.PI_FABRIC_ROLE).toBe("actor");
+    const { cappedTaskBashBlockReason } = await import("../src/guards/actor-bash-hook.js");
+    expect(cappedTaskBashBlockReason(environment, "/usr/bin/systemd-run --user --scope -- true")).toBeUndefined();
   });
 
   it("without a user bus the cap is ineligible: direct launch, no systemd-run, no cgroup claim", async () => {
@@ -563,6 +575,14 @@ describe("taskAgentEnvironment capped-boundary evidence (smarty-dev#8257)", () =
     expect(child.FABRIC_TASK_SYSTEMD_RUN_WRAPPER).toBeUndefined();
     expect(child).toMatchObject({ PATH: parent.PATH, OTHER: "kept" });
     expect(taskAgentEnvironment({ ...parent }, false).FABRIC_TASK_CGROUP).toBeUndefined();
+  });
+  it("new actor scrub keeps roles while dropping only the caller's boundary", async () => {
+    const { withoutTaskBoundary } = await import("../src/agents/task-environment.js");
+    const environment = { ...parent, SMARTY_ROLE: "actor@abcdef123456", PI_FABRIC_ROLE: "actor", PI_FABRIC_ACTOR_ID: "actor:a" };
+    const child = withoutTaskBoundary(environment);
+    expect(child).toMatchObject({ SMARTY_ROLE: environment.SMARTY_ROLE, PI_FABRIC_ROLE: "actor", PI_FABRIC_ACTOR_ID: "actor:a", PATH: parent.PATH });
+    for (const key of ["FABRIC_TASK_MEMORY_MAX", "FABRIC_TASK_CGROUP", "FABRIC_TASK_SYSTEMD_RUN_WRAPPER"]) expect(child[key]).toBeUndefined();
+    expect(environment.FABRIC_TASK_CGROUP).toBe(parent.FABRIC_TASK_CGROUP); // original task stays truthful
   });
   it("preserves all three for the same run when preserveTaskBoundary is true", async () => {
     const { taskAgentEnvironment } = await import("../src/agents/task-environment.js");

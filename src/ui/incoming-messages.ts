@@ -66,43 +66,42 @@ const rows = (message: IncomingMessage): Row[] => {
 const receipt = (from: string, kind: string, value: string): string =>
   createHash("sha256").update(JSON.stringify([from, kind, value])).digest("hex");
 
-/** A display-only index, separate from the authoritative delivery/inbox state. */
+/**
+ * A display-only index, separate from the authoritative delivery/inbox state.
+ * Keep only stable scalar branch metadata. In particular, never retain the branch array or
+ * any entry object. V8 slices retain their parent strings, so scalar IDs are detached first.
+ * Entry keys are the detached string id, a private token object for id-less objects, or
+ * the numeric index for non-objects; the key types never collide. The session version is `<session id>:<header version>`, or the bare session id without a header version.
+ */
+type SessionSource = { getBranch: () => readonly unknown[]; getHeader?: () => unknown; getSessionId?: () => unknown };
 class DeliveredDisplayIndex {
-  // Keep only stable scalar branch metadata. In particular, never retain the branch array or
-  // any entry object. V8 slices retain their parent strings, so scalar IDs are detached first.
-  #seenIds: readonly string[] = [];
-  #seenLength = 0;
-  #sessionVersion: string | number | undefined;
-  #fallbackIds = new WeakMap<object, string>();
-  #nextFallbackId = 0;
+  #seen: readonly unknown[] = [];
+  #version: string | undefined;
+  #tokens = new WeakMap<object, object>();
   #receipts = new Set<string>();
 
-  #entryId(entry: unknown, index: number): string {
-    const value = record(entry).id;
-    if (typeof value === "string" && value) return detachedPreview(`id:${value}`, value.length + 3);
-    if (entry !== null && typeof entry === "object") {
-      const object = entry as object;
-      const existing = this.#fallbackIds.get(object);
-      if (existing) return existing;
-      const generated = `object:${++this.#nextFallbackId}`;
-      this.#fallbackIds.set(object, generated);
-      return generated;
-    }
-    return `index:${index}`;
-  }
-
-  update(entries: readonly unknown[], sessionVersion?: string | number): ReadonlySet<string> {
-    const currentIds = entries.map((entry, index) => this.#entryId(entry, index));
-    const versionChanged = this.#sessionVersion !== undefined && sessionVersion !== undefined &&
-      this.#sessionVersion !== sessionVersion;
-    const samePrefix = currentIds.length >= this.#seenLength &&
-      this.#seenIds.every((id, index) => currentIds[index] === id);
-    if (versionChanged || !samePrefix) {
+  update(entries: readonly unknown[], session?: SessionSource): ReadonlySet<string> {
+    const header = record(session?.getHeader?.()).version;
+    const rawId = session?.getSessionId?.();
+    const sessionId = typeof rawId === "string" ? rawId : undefined;
+    const version = typeof header === "string" || typeof header === "number" ? `${sessionId ?? ""}:${header}` : sessionId;
+    const ids = entries.map((entry, index) => {
+      const id = record(entry).id;
+      if (typeof id === "string" && id) return detachedPreview(id, Infinity);
+      if (entry === null || typeof entry !== "object") return index;
+      let token = this.#tokens.get(entry);
+      if (!token) this.#tokens.set(entry, token = {});
+      return token;
+    });
+    const seen = this.#seen;
+    let start = seen.length;
+    // A known session version that differs from the last known one resets the index.
+    if ((version !== undefined && (this.#version ?? version) !== version) ||
+      ids.length < start || seen.some((id, index) => ids[index] !== id)) {
       this.#receipts.clear();
-      this.#seenIds = [];
-      this.#seenLength = 0;
+      start = 0;
     }
-    for (let index = this.#seenLength; index < entries.length; index++) {
+    for (let index = start; index < entries.length; index++) {
       const entry = record(entries[index]);
       if (entry.type !== "custom_message" || entry.customType !== "pi-fabric-agent-message") continue;
       const details = record(entry.details);
@@ -124,9 +123,8 @@ class DeliveredDisplayIndex {
         else if (typeof data.ref === "string" && data.ref.trim() && topic) add("topic-ref", JSON.stringify([topic, data.ref.trim()]));
       }
     }
-    this.#seenIds = currentIds;
-    this.#seenLength = currentIds.length;
-    this.#sessionVersion = sessionVersion ?? this.#sessionVersion;
+    this.#seen = ids;
+    if (version !== undefined) this.#version = detachedPreview(version, Infinity);
     return this.#receipts;
   }
 }
@@ -211,29 +209,14 @@ export const registerIncomingMessageRenderers = (
   pi: ExtensionAPI,
   mode: () => FabricIncomingMessageMode,
 ): void => {
-  let entries: () => readonly unknown[] = () => [];
-  let sessionVersion: () => string | number | undefined = () => undefined;
+  let session: SessionSource | undefined;
   const delivered = new DeliveredDisplayIndex();
   pi.on("session_start", (_event, context) => {
-    const manager = context.sessionManager as unknown as {
-      getBranch: () => readonly unknown[];
-      getHeader?: () => unknown;
-      getSessionId?: () => unknown;
-    };
-    entries = () => manager.getBranch();
-    sessionVersion = () => {
-      const headerVersion = record(manager.getHeader?.()).version;
-      const sessionId = manager.getSessionId?.();
-      if (typeof headerVersion === "string" || typeof headerVersion === "number") {
-        const version = `${typeof sessionId === "string" ? sessionId : ""}:${headerVersion}`;
-        return detachedPreview(version, version.length);
-      }
-      return typeof sessionId === "string" ? detachedPreview(sessionId, sessionId.length) : undefined;
-    };
+    session = context.sessionManager as unknown as SessionSource;
   });
   for (const type of INCOMING_MESSAGE_TYPES) {
     pi.registerMessageRenderer(type, (message, options, theme) => {
-      const history = type === "pi-fabric-inbox" ? entries() : [];
+      const history = type === "pi-fabric-inbox" ? session?.getBranch() ?? [] : [];
       const prior = priorInboxReceipts(history, message);
       const all = rows(message);
       if (options.expanded || !incomingMessagesCollapsed(mode())) {
@@ -242,7 +225,7 @@ export const registerIncomingMessageRenderers = (
         const repeated = repeatedInboxRows(all, prior);
         return repeated.length ? fullCarrier(message, repeated, theme) : undefined;
       }
-      const receipts = new Set(type === "pi-fabric-inbox" ? delivered.update(history, sessionVersion()) : []);
+      const receipts = new Set(type === "pi-fabric-inbox" ? delivered.update(history, session) : []);
       for (const id of prior) receipts.add(id);
       const visible = unseenRows(message, all, receipts);
       if (!visible.length) return { render: () => [], invalidate() {} };

@@ -1,5 +1,5 @@
 import fs from "node:fs";
-import { readJsonlRecords } from "./jsonl.js";
+import { StringDecoder } from "node:string_decoder";
 import { detachedPreview } from "../core/preview.js";
 import type { FabricExecutionOutcomeV1, FabricTraceJsonValue } from "../audit/trace.js";
 import {
@@ -123,9 +123,7 @@ const truncate = (text: string, max: number): { text: string; truncated: boolean
   let scalarCount = 0;
   let utf16End = 0;
   for (const scalar of text) {
-    if (scalarCount >= scalarLimit) {
-      return { text: detachedPreview(text, utf16End), truncated: true };
-    }
+    if (scalarCount >= scalarLimit) return { text: detachedPreview(text, utf16End), truncated: true };
     utf16End += scalar.length;
     scalarCount += 1;
   }
@@ -689,6 +687,34 @@ export const normalizeRecords = (
     indexCoverage: { complete: sortedReasons.length === 0, reasons: sortedReasons },
   };
 };
+
+/**
+ * Parse tolerant JSONL one record at a time, skipping blank and invalid lines
+ * like the historical whole-file parser, without materialising the source file.
+ * The iterator owns the descriptor and closes it even when a caller stops early.
+ * Session logs are append-only and can contain a torn final line. Lives here,
+ * re-exported by `./jsonl.js`, so the eager normalize chunk carries no extra module.
+ */
+export function* readJsonlRecords(file: string): Generator<unknown> {
+  const fd = fs.openSync(file, "r");
+  const buffer = Buffer.allocUnsafe(65536);
+  const decoder = new StringDecoder();
+  let pending = "";
+  try {
+    for (let read = 1; read;) {
+      read = fs.readSync(fd, buffer);
+      const lines = (pending + (read ? decoder.write(buffer.subarray(0, read)) : decoder.end())).split("\n");
+      // Only a partial line survives a chunk; EOF flushes it.
+      pending = read ? lines.pop()! : "";
+      for (const line of lines) {
+        const text = line.trim();
+        if (text) try { yield JSON.parse(text) as unknown; } catch { /* torn or invalid line */ }
+      }
+    }
+  } finally {
+    fs.closeSync(fd);
+  }
+}
 
 /**
  * Parse a session JSONL file into typed {@link NormalizedEntry} records.

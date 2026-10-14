@@ -537,6 +537,10 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
   finalAnswerResult?: AgentRunResult;
   /** Full immutable published outcome, demand-loaded after settlement. */
   settledResultFile?: string;
+  /** Status of the associated validated final-answer outcome after its full copy is evicted. */
+  finalAnswerStatus?: AgentRunResult["status"];
+  /** Bounded scalar facts of the published outcome, read only after close collected its file. */
+  settledSummary?: SettledSummary;
   finalAnswerCompletion?: Promise<void>;
   terminalNoticeSeen?: Set<string>;
   /** Process teardown is an ownership obligation, even after logical settlement. */
@@ -797,6 +801,21 @@ interface PreviousRunSummary {
   finalAnswerReceipt?: AgentRunResult["finalAnswerReceipt"];
   error?: string;
 }
+
+/** Scalar manager-validated terminal facts. Never a substitute for the disk result while it exists. */
+interface SettledSummary {
+  status: AgentRunResult["status"];
+  startedAt: number;
+  updatedAt: number;
+  finishedAt?: number;
+  exitCode?: number | null;
+  error?: string;
+  turns: number;
+  toolCalls: number;
+  usage: AgentRunResult["usage"];
+}
+
+const SETTLED_SUMMARY_ERROR_CHARS = 1_000;
 
 interface PreviousRun {
   summary: PreviousRunSummary;
@@ -2899,10 +2918,35 @@ export class AgentManager {
   #readResult(managed: ManagedAgent): AgentRunRecord | undefined {
     if (!managed.settledResultFile) return readRecord(managed.statusFile);
     const result = readRecord(managed.settledResultFile);
-    if (!result || result.id !== managed.id || !terminalStatuses.has(result.status)) {
-      throw new Error(`Fabric agent ${managed.id} has no saved terminal result at ${managed.settledResultFile}`);
-    }
-    return result;
+    if (result && result.id === managed.id && terminalStatuses.has(result.status)) return result;
+    // Close collection (whole-tree removal or retained-prompt cleanup) is the only
+    // owned path that removes the published file while the handle stays readable.
+    // It requires checked execution exit and runs only while closing. A corrupt or
+    // foreign file, or an absence outside that window, still fails loudly.
+    if (!result && this.#closing && managed.executionExited && managed.settledSummary &&
+        !fs.existsSync(managed.settledResultFile)) return this.#collectedResult(managed, managed.settledSummary);
+    throw new Error(`Fabric agent ${managed.id} has no saved terminal result at ${managed.settledResultFile}`);
+  }
+
+  /** The manager's own validated terminal facts over its bounded last snapshot, once close collected the exact file. */
+  #collectedResult(managed: ManagedAgent, summary: SettledSummary): AgentRunRecord {
+    const retained = readRecord(managed.statusFile);
+    const base: AgentRunRecord = managed.latestRecord ?? (retained?.id === managed.id ? retained : undefined) ?? {
+      ...managed.runRoute, id: managed.id, name: managed.name, task: "", status: summary.status, runner: managed.runner,
+      transport: managed.transport.kind, cwd: managed.cwd, startedAt: summary.startedAt, updatedAt: summary.updatedAt,
+      turns: summary.turns, toolCalls: summary.toolCalls, text: "", usage: { ...summary.usage },
+    };
+    const { error: _error, exitCode: _exitCode, finishedAt: _finishedAt, ...rest } = base;
+    return {
+      ...rest,
+      status: summary.status,
+      updatedAt: Math.max(rest.updatedAt, summary.updatedAt),
+      ...(summary.finishedAt !== undefined ? { finishedAt: summary.finishedAt } : {}),
+      ...(summary.exitCode !== undefined ? { exitCode: summary.exitCode } : {}),
+      ...(summary.error !== undefined ? { error: summary.error } : {}),
+      warnings: [...(rest.warnings ?? []),
+        "Run files were collected at close; this is the manager's bounded terminal summary, not the exact result"],
+    };
   }
 
   /** Observe a settled outcome, independently of foreground consumption receipts. */
@@ -3093,9 +3137,14 @@ export class AgentManager {
       if (deliveries.length) info.followUpDeliveries = deliveries;
       return info;
     }
-    managed.latestRecord = compactUiRecord(record);
-    if (!managed.latestUiRecord) {
-      managed.latestUiRecord = managed.latestRecord;
+    const compact = compactUiRecord(record);
+    const ui = managed.latestUiRecord;
+    managed.latestRecord = compact;
+    // A status read can refresh the cache before the monitor's next poll. Keep the
+    // UI projection in step, or the monitor's change check never republishes it.
+    if (!ui || ui.updatedAt !== compact.updatedAt || ui.status !== compact.status ||
+        ui.runnerSessionId !== compact.runnerSessionId || ui.currentTool !== compact.currentTool) {
+      managed.latestUiRecord = compact;
       this.#invalidateUiList();
     }
     const result = structuredClone(this.#withTransportMetadata(record, managed));
@@ -3905,7 +3954,7 @@ export class AgentManager {
 
   #terminalError(managed: ManagedAgent): FabricTargetTerminalError {
     return new FabricTargetTerminalError(managed.id, managed.finalAnswer!.id,
-      managed.finalAnswerResult?.status ?? "final-answer-pending");
+      managed.finalAnswerResult?.status ?? managed.finalAnswerStatus ?? "final-answer-pending");
   }
 
   /** Close the receipt-publication race between ingress preflight and append. */
@@ -4847,7 +4896,9 @@ export class AgentManager {
       this.#checkFollowUps(managed, record);
       if (record) {
         this.#observeProgress(managed, record);
-        const previous = managed.latestRecord;
+        // Compare with the published UI projection: status() may already have
+        // refreshed latestRecord from the same disk record.
+        const previous = managed.latestUiRecord;
         managed.latestRecord = compactUiRecord(record);
         if (
           !previous ||
@@ -5265,6 +5316,15 @@ export class AgentManager {
       else if (this.#onStoppedAtClose && !this.#closing) commitRunArchive(managed.runDirectory);
       if (managed.settlementSaveFailure) this.#retentionRevision++;
       delete managed.settlementSaveFailure;
+      managed.settledSummary = {
+        status: full.status, startedAt: full.startedAt, updatedAt: full.updatedAt, turns: full.turns, toolCalls: full.toolCalls,
+        usage: { ...full.usage },
+        ...(full.finishedAt !== undefined ? { finishedAt: full.finishedAt } : {}),
+        ...(full.exitCode !== undefined ? { exitCode: full.exitCode } : {}),
+        ...(full.error !== undefined ? { error: uiText(full.error, SETTLED_SUMMARY_ERROR_CHARS) } : {}),
+      };
+      // Main's terminal refusal reports the associated validated status; keep only that scalar.
+      if (managed.finalAnswerResult) managed.finalAnswerStatus = managed.finalAnswerResult.status;
       delete managed.finalAnswerResult;
       return true;
     } catch (error) {
@@ -5280,8 +5340,12 @@ export class AgentManager {
 
   async #retainTerminalPromptRecord(managed: ManagedAgent): Promise<boolean> {
     if (!this.#managedTempRoot) return false;
-    const record = readRecord(managed.statusFile) ?? managed.latestRecord;
+    // The manager's exact validated outcome governs retention. A worker can still
+    // have written a completed status.json after host validation failed the run.
+    const record = this.#readResult(managed) ?? managed.latestRecord;
     if (!record || (record.status !== "failed" && record.status !== "stopped" && record.status !== "timed_out")) return false;
+    const resultFile = managed.settledResultFile;
+    const keepResult = resultFile === path.join(managed.runDirectory, MANAGER_RESULT_FILE) && fs.existsSync(resultFile);
     const promptFile = path.join(managed.runDirectory, "task.txt");
     const stat = ownedStat(promptFile);
     const expectedSha256 = managed.inputSha256 ?? record.inputSha256;
@@ -5297,10 +5361,13 @@ export class AgentManager {
     }
     // Persist the manager's authoritative metadata before removing every other
     // artifact. A verified current task.txt and status.json are the complete
-    // retained proof; a mismatch retains status.json only.
+    // retained proof; a mismatch drops task.txt. The manager's exact outcome stays
+    // beside status.json with only its task fields removed; every other field is
+    // kept uncompacted. status.json stays compact and taskless.
+    if (keepResult && resultFile) writeJsonAtomic(resultFile, omitRetainedTasks(record), { space: 2, durable: true });
     writeJsonAtomic(managed.statusFile, omitRetainedTasks(compactUiRecord(this.#withTransportMetadata(record, managed, false))), { space: 2 });
     for (const entry of fs.readdirSync(managed.runDirectory)) {
-      if (entry === "status.json" || (entry === "task.txt" && currentMatches)) continue;
+      if (entry === "status.json" || (entry === "task.txt" && currentMatches) || (entry === MANAGER_RESULT_FILE && keepResult)) continue;
       await removeTree(path.join(managed.runDirectory, entry));
     }
     // Once an unsuccessful run has a retained status, never fall back to deleting its

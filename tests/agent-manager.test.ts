@@ -180,7 +180,10 @@ describe("Agent prompt retention (#11663)", () => {
     await manager.close();
     expect(fs.existsSync(successfulDirectory)).toBe(false);
     expect(fs.existsSync(promptPath)).toBe(true);
-    expect(fs.readdirSync(path.dirname(promptPath)).sort()).toEqual(["status.json", "task.txt"]);
+    expect(fs.readdirSync(path.dirname(promptPath)).sort()).toEqual(["manager-result.json", "status.json", "task.txt"]);
+    const retainedResult = JSON.parse(fs.readFileSync(path.join(path.dirname(promptPath), "manager-result.json"), "utf8")) as AgentRunRecord;
+    expect(retainedResult).toMatchObject({ id: failedHandle.id, status: "failed" });
+    expect(retainedResult).not.toHaveProperty("task");
     const persisted = JSON.parse(fs.readFileSync(path.join(path.dirname(promptPath), "status.json"), "utf8")) as AgentRunRecord;
     expect(persisted).toMatchObject({
       status: "failed",
@@ -210,7 +213,8 @@ describe("Agent prompt retention (#11663)", () => {
     expect(createHash("sha256").update(currentBytes).digest("hex")).toBe(beforeClose.inputSha256);
     expect(Buffer.byteLength(currentBytes)).toBe(beforeClose.inputBytes);
     await manager.close();
-    expect(fs.readdirSync(path.dirname(taskPath)).sort()).toEqual(["status.json", "task.txt"]);
+    expect(fs.readdirSync(path.dirname(taskPath)).sort()).toEqual(["manager-result.json", "status.json", "task.txt"]);
+    expect(JSON.parse(fs.readFileSync(path.join(path.dirname(taskPath), "manager-result.json"), "utf8"))).not.toHaveProperty("task");
     const persisted = JSON.parse(fs.readFileSync(path.join(path.dirname(taskPath), "status.json"), "utf8")) as AgentRunRecord;
     expect(persisted.promptSha256).toBe(beforeClose.promptSha256);
     expect(persisted.promptBytes).toBe(beforeClose.promptBytes);
@@ -230,7 +234,9 @@ describe("Agent prompt retention (#11663)", () => {
     const taskPath = (manager.status(handle.id) as AgentRunRecord).promptPath!;
     fs.writeFileSync(taskPath, "tampered bytes\n", { mode: 0o600 });
     await manager.close();
-    expect(fs.readdirSync(path.dirname(taskPath)).sort()).toEqual(["status.json"]);
+    expect(fs.readdirSync(path.dirname(taskPath)).sort()).toEqual(["manager-result.json", "status.json"]);
+    expect(JSON.parse(fs.readFileSync(path.join(path.dirname(taskPath), "manager-result.json"), "utf8"))).toMatchObject({ status: "failed" });
+    expect(JSON.parse(fs.readFileSync(path.join(path.dirname(taskPath), "manager-result.json"), "utf8"))).not.toHaveProperty("task");
     const persisted = JSON.parse(fs.readFileSync(path.join(path.dirname(taskPath), "status.json"), "utf8")) as AgentRunRecord;
     expect(persisted.promptRetentionDropped).toBe(true);
     expect(persisted.promptRetentionMismatch).toBe(true);

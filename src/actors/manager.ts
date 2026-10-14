@@ -652,7 +652,7 @@ const restoredActivationBlock = (stored: { reason: string; code: string; since: 
     const markedComplete = marker?.version === 1 && marker.complete === true && marker.runId === runId && typeof runId === "string";
     const matchingRun = run !== undefined && retainedOverflowRunId(runId) && run.id === runId &&
       run.actorId === actorId && run.status === "failed";
-    const inspectableRun = matchingRun && typeof run.error === "string" && stored.reason.length > 0 &&
+    const inspectableRun = (marker === undefined || markedComplete) && matchingRun && typeof run.error === "string" && stored.reason.length > 0 &&
       run.error.includes(stored.reason) &&
       (run.warnings === undefined || (Array.isArray(run.warnings) && run.warnings.every(warning => typeof warning === "string")));
     const failure = inspectableRun && run ? classifyManagerActivationFailure({ lastError: run.error!, error: run.error, evidence: run.warnings }, run.errorCode === "CONTEXT_OVERFLOW") : undefined;
@@ -660,7 +660,10 @@ const restoredActivationBlock = (stored: { reason: string; code: string; since: 
     const genuineOverflow = failure?.code === "context-overflow" && run?.errorCode === "CONTEXT_OVERFLOW";
     // A retained run is authoritative even when an older writer marked it complete: reclassify
     // its full error and warnings, and only complete the proof when that record proves overflow alone.
-    const complete = !saturatedWarningEvidence(run?.warnings) && (matchingRun ? genuineOverflow : markedComplete);
+    // An incomplete v1 marker is sticky: a later readable record cannot upgrade lost evidence.
+    const complete = !saturatedWarningEvidence(run?.warnings) && (matchingRun
+      ? (marker === undefined ? pureStream || genuineOverflow : markedComplete && genuineOverflow)
+      : markedComplete);
     overflowEvidence = { version: 1, ...(typeof runId === "string" ? { runId } : {}), complete };
     legacyOverflow = failure && !failure.transient && CONTRADICTORY_OVERFLOW_CODES.has(failure.code) ? failure
       : pureStream ? failure : { code: "context-overflow", transient: false,

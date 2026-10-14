@@ -121,8 +121,8 @@ export interface ActorRegistrySnapshot {
 export interface ActorRegistryMutation<T> {
   actors: readonly Record<string, unknown>[];
   durable?: boolean;
-  /** Cheap synchronous validation of caller-local state after acquisition. */
-  validate?: () => boolean;
+  /** Cheap synchronous validation after acquisition. A fixed reason is a veto, like false. */
+  validate?: () => boolean | "cancelled" | "revision" | "ownership" | "actor-state";
   value: T;
 }
 
@@ -243,6 +243,8 @@ export class ActorRegistryStore {
     };
     return {
       valid: () => this.fingerprint() === snapshot.generation && payload.valid(),
+      // Diagnostic only, evaluated after valid() refused; no actor text or paths are logged.
+      vetoReason: () => this.fingerprint() !== snapshot.generation ? "generation" : "payload-generation",
       /**
        * Under custody: the payload commit, the rename and (unless `deferBarrier`) the directory barrier.
        * smarty-dev#6100: `deferBarrier` leaves the post-rename directory fsync chain to `barrier()`, which the
@@ -298,7 +300,19 @@ export class ActorRegistryStore {
     // and nothing validates or commits, after it (smarty-dev#816, pi-fabric#577).
     const retryUntil = this.#now() + ACTOR_REGISTRY_VETO_RETRY_MS;
     let vetoed = false;
-    const expire = (): never => { throw new ActorRegistryUpdateVetoedError(); };
+    const refusals = new Set<string>();
+    const callerVeto = (validation: boolean | string | undefined): boolean => {
+      if (validation !== false && typeof validation !== "string") return false;
+      refusals.add(validation === "cancelled" || validation === "revision" || validation === "ownership" || validation === "actor-state"
+        ? validation : "caller-validation");
+      return true;
+    };
+    // Once per failed update episode, at the throw site, not once per retry. Fixed labels
+    // explain the validation without logging registry contents, credentials or actor prose.
+    const expire = (): never => {
+      console.warn(`[pi-fabric] actor registry update vetoed: operation=${label}; validations=${[...refusals].join(",") || "deadline"}; budgetMs=${ACTOR_REGISTRY_VETO_RETRY_MS}`);
+      throw new ActorRegistryUpdateVetoedError();
+    };
     const live = (): void => { if (this.#now() >= retryUntil) expire(); };
     // Every fence wait gets only the remaining budget, never a fresh 5 s, and the
     // deadline is rechecked right after acquisition; a throw releases the fence.
@@ -308,7 +322,7 @@ export class ActorRegistryStore {
       try {
         return await this.withLock(() => { live(); return operation(); }, remaining, label);
       } catch (error) {
-        if (vetoed && error instanceof ActorRegistryLockTimeoutError) expire();
+        if (vetoed && error instanceof ActorRegistryLockTimeoutError) { refusals.add("lock"); expire(); }
         throw error;
       }
     };
@@ -320,7 +334,8 @@ export class ActorRegistryStore {
       // smarty-dev#6100: custody covers only the generation check, the rename and the payload commit; the directory
       // barrier runs after release, before the write is acknowledged.
       const committed = await locked(() => {
-        if (!prepared.valid() || mutation.validate?.() === false) return false;
+        if (!prepared.valid()) { refusals.add(prepared.vetoReason()); return false; }
+        if (callerVeto(mutation.validate?.())) return false;
         live();
         prepared.commit({ deferBarrier: true });
         return true;
@@ -346,7 +361,8 @@ export class ActorRegistryStore {
       const prepared = this.prepare(selected.actors, { durable: selected.durable === true }, current);
       try {
         live();
-        if (prepared.valid() && selected.validate?.() !== false) {
+        if (!prepared.valid()) refusals.add(prepared.vetoReason());
+        else if (!callerVeto(selected.validate?.())) {
           live();
           prepared.commit({ deferBarrier: true });
           barrier = prepared.barrier;

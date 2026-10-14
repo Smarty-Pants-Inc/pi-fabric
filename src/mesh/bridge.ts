@@ -2004,8 +2004,8 @@ export class MeshBridge {
       if (this.#now() < this.#factoryRetryAt) return { forwarded, dropped };
       this.#factoryWaiting = false;
     }
-    // ponytail: a confirmed smaller prefix constrains later speculation in this pass.
-    // All holds stay fresh; even a transient short prefix keeps the remainder small.
+    // ponytail: a confirmed short receipt constrains later speculation in this pass.
+    // All holds stay fresh; even a transient short receipt keeps the remainder small.
     // The next #forward pass starts at the full batch limit again.
     let candidateLimit = BRIDGE_BATCH_MAX_EVENTS;
     while (true) {
@@ -2075,7 +2075,7 @@ export class MeshBridge {
                   committed.some(result => !Number.isSafeInteger(result?.sequence) || result.sequence <= 0)) {
                 throw new Error("Invalid bridge batch receipt");
               }
-              candidateLimit = Math.min(candidateLimit, committed.length);
+              if (committed.length < candidates.length) candidateLimit = Math.min(candidateLimit, committed.length);
               const spent = spends.slice(0, committed.length).filter((size) => size > 0);
               this.#factoryTokens -= spent.length;
               this.#factoryBytes -= spent.reduce((sum, size) => sum + size, 0);

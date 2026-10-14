@@ -11,7 +11,7 @@ import path from "node:path";
 import { mainExecutionCeilingAbortReason, withoutMainExecutionCeiling } from "../async-settlement.js";
 import type { FabricActorRunBinding, FabricActorBindingProvenance } from "../actors/types.js";
 import { MeshStore, meshOutageAlarmSink, type MeshEvent, type MeshIdentity } from "../mesh/store.js";
-import { MeshBackgroundQueue, MeshBackgroundRetry } from "../core/atomic-write.js";
+import { MeshBackgroundQueue, MeshBackgroundRetry, isMeshWriteDeferred } from "../core/atomic-write.js";
 import { rethrowMeshLockTimeout } from "../core/atomic-write.js";
 import { MeshConsumptionPausedError, assertMeshConsumption } from "./mesh-consumption.js";
 import { isWatchLimitError } from "../core/watch-fallback.js";
@@ -1457,7 +1457,7 @@ export class FabricControlPlane {
           });
           acceptance = expired;
         } catch (error) {
-          if (isLockTimeout(error) || error instanceof MeshConsumptionPausedError) throw error;
+          if (isMeshWriteDeferred(error) || isLockTimeout(error) || error instanceof MeshConsumptionPausedError) throw error;
           const raced = ownRecord(controlSeenRecord(this.mesh.get(key, { fresh: true })?.value));
           acceptance = raced?.acceptance ?? indeterminate;
           outcomeIncarnation = raced?.ownerIncarnation ?? null;
@@ -1501,7 +1501,7 @@ export class FabricControlPlane {
         ifVersion: 0,
       });
     } catch (error) {
-      if (isLockTimeout(error) || error instanceof MeshConsumptionPausedError) throw error;
+      if (isMeshWriteDeferred(error) || isLockTimeout(error) || error instanceof MeshConsumptionPausedError) throw error;
       this.#sharedClaims.delete(key);
       const raced = this.#seenRecord(key);
       if (
@@ -1648,7 +1648,7 @@ export class FabricControlPlane {
         this.#releasePublicationFailed = true;
         // A conflict belongs to another owner; a timeout wrote nothing. Preserve the actual
         // result under the original version fence and retry it without running the handler.
-        if (!isLockTimeout(error)) { this.#ownedCommands.delete(key); return; }
+        if (!(isMeshWriteDeferred(error) || isLockTimeout(error))) { this.#ownedCommands.delete(key); return; }
         throw error; // the owned outcome is retried by the next confirmed drain
       }
       try {
@@ -1824,7 +1824,7 @@ export class FabricControlPlane {
       })
       .catch((error: unknown) => {
         // A lock timeout published nothing: the caller retries it (smarty-dev#424).
-        if (isLockTimeout(error) || error instanceof MeshConsumptionPausedError) throw error;
+        if (isMeshWriteDeferred(error) || isLockTimeout(error) || error instanceof MeshConsumptionPausedError) throw error;
       });
     // An ACK this host addressed to itself is consumed by its own drain, not its own watcher.
     if (command.replyTo === this.options.hostId) this.#wake();

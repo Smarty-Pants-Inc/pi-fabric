@@ -45,6 +45,42 @@ const harness = () => {
 
 describe("root inbox display identity projection (smarty-dev#12140)", () => {
   it.each([
+    ["cross-kind overflow", { deliveryId: "overflow-id" }, { messageId: "overflow-id" }],
+    ["same-kind explicit overflow", { deliveryId: "overflow-id" }, { deliveryId: "overflow-id" }],
+    ["key-only overflow", { data: { topic: "fleet.work", key: "overflow-key" } }, { key: "overflow-key" }],
+    ["unrelated overflow", { deliveryId: "overflow-id" }, { messageId: "unrelated-id" }],
+    ["no overflow", { deliveryId: "overflow-id" }, undefined],
+  ])("preserves eight unseen shown rows with %s", (_name, delivered, overflowData) => {
+    const h = harness();
+    h.setBranch([entry(native(peer, delivered))]);
+    const shown = Array.from({ length: 8 }, (_, index) =>
+      event(`ROW_${index}`, peer, { key: `unseen-${index}` }, `ROW_${index}`));
+    const events = overflowData === undefined ? shown : [...shown, event("overflow", peer, overflowData)];
+    const rendered = h.render(inbox(events));
+    expect(rendered).toHaveLength(1);
+    expect(plain(rendered!.join("\n"))).toContain("[8 work]");
+  });
+
+  it.each([
+    ["principal", (content: string) => content.replace('id="ROW_7"', 'id="ROW_7" to="principal"'), peer],
+    ["org", (content: string) => content, { id: "session:org", name: "org", kind: "main" as const }],
+  ])("preserves a full %s last shown row beside delivered overflow", (_name, mark, fullSender) => {
+    initTheme("dark", false);
+    const h = harness();
+    h.setBranch([entry(native(peer, { deliveryId: "overflow-id" }))]);
+    const shown = Array.from({ length: 8 }, (_, index) => event(
+      `ROW_${index}`, index === 7 ? fullSender : peer, { key: `unseen-${index}` },
+      index === 7 ? "FULL_LAST_REPLY" : `ROW_${index}`,
+    ));
+    const carrier = inbox([...shown, event("overflow", peer, { messageId: "overflow-id" })]);
+    const marked = { ...carrier, content: mark(String(carrier.content)) };
+    const rendered = new CustomMessageComponent(marked, h.renderer).render(120).map(plain).join("\n");
+    expect(rendered).toContain("FULL_LAST_REPLY");
+    expect(rendered).toContain("ROW_6");
+    expect(rendered).not.toContain("↳");
+  });
+
+  it.each([
     ["native deliveryId to shadow messageId", { deliveryId: "cross-delivery" }, { messageId: "cross-delivery", key: "same-work" }],
     ["native item id to shadow deliveryId", { id: "cross-item" }, { deliveryId: "cross-item", key: "same-work" }],
   ])("hides explicit cross-kind shadow: %s", (_name, nativeDetails, shadowData) => {

@@ -364,6 +364,8 @@ export const rootInboxMessage = (input: readonly MeshEvent[], extra?: readonly M
   ].join("\n"),
   display: true,
   // Each group starts with the event receipt (the renderer's boundary); display metadata trails it.
-  details: { ids: all.map((event) => event.id), receipts: all.flatMap((event) => [...eventReceipts(event), ...shadowDisplayReceipts(event)]) },
+  // Overflow has no XML row/boundary: put its groups first so the last shown row's group
+  // ends at receipts.length without inheriting unrelated overflow identities. IDs stay in delivery order.
+  details: { ids: all.map((event) => event.id), receipts: [...rest, ...events].flatMap((event) => [...eventReceipts(event), ...shadowDisplayReceipts(event)]) },
   };
 };

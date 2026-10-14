@@ -24,6 +24,7 @@ import { residentHostId, RESIDENT_COMMANDS } from "../src/residency/protocol.js"
 import { LifecycleBroker } from "../src/lifecycle/broker.js";
 import * as deliveryOutcomes from "../src/mesh/delivery-outcomes.js";
 import * as wakeText from "../src/actors/wake-text.js";
+import * as scratch from "../src/storage/scratch.js";
 
 // #11199: recorded-call proof only. No worker, removal, retention or recursive fixture deletion.
 // Fixtures stay inside the runner's private TMPDIR. Hosted CI owns real-delete regressions.
@@ -793,7 +794,8 @@ describe("round 2 batch failure and recovery interleavings", () => {
     expect(inputs(second.runs[1]!).map(input => input.payload.data)).toEqual([{ ref: "new-after-crash" }]);
   });
 
-  it.each([1, 3])("ENODEV saved-answer recovery recognizes an explicit %s-event activation without inference", async count => {
+  it.each([1, 3].flatMap(count => ["native", "win32"].map(platform => ({ count, platform }))))(
+    "ENODEV saved-answer recovery recognizes an explicit $count-event activation without inference ($platform)", async ({ count, platform }) => {
     const f = await fixture();
     const actor = await create(f.actors, { batchMax: count });
     fakeClock();
@@ -805,23 +807,43 @@ describe("round 2 batch failure and recovery interleavings", () => {
     const directory = path.join(runRoot, id);
     fs.mkdirSync(directory, { recursive: true });
     fs.writeFileSync(path.join(directory, "task.txt"), request.task);
-    fs.writeFileSync(path.join(directory, "status.json"), JSON.stringify({ id, actorId: actor.id, status: "running", transport: "process", sessionId: String(process.ppid), processStartTime: "0" }));
+    // Recorded worker, not the live test parent: a fake /proc birth mismatch is
+    // Linux-only death evidence and must never relax the live/unknown Windows veto.
+    const workerPid = 2_147_483_647;
+    const alive = scratch.processAlive;
+    const workerAlive = vi.spyOn(scratch, "processAlive").mockImplementation(pid => pid === workerPid ? false : alive(pid));
+    fs.writeFileSync(path.join(directory, "status.json"), JSON.stringify({ id, actorId: actor.id, status: "running", transport: "process", sessionId: String(workerPid), processStartTime: "0" }));
     fs.writeFileSync(path.join(directory, "unresolved-worker.json"), JSON.stringify({ reason: ENODEV_UNRESOLVED_REASON }));
     fs.writeFileSync(path.join(directory, "settlement.json"), JSON.stringify({ version: 1, runId: id, outcome: "completed", text: "saved batch answer" }));
-    expect(peekEnodevRun(directory, actor.id, request.activationId!)).toMatchObject({ status: "completed", text: "saved batch answer" });
-    expect(peekEnodevRun(directory, actor.id, "another-activation")).toBeUndefined();
     const manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, { runRoot });
     closers.push(() => manager.close());
     const spawn = vi.spyOn(manager, "spawn").mockRejectedValue(new Error("must not infer again"));
-    expect(await manager.run(request)).toMatchObject({ id, status: "completed", enodevRecovered: true, text: "saved batch answer" });
-    expect(spawn).not.toHaveBeenCalled();
-    expect(fs.existsSync(path.join(directory, "unresolved-worker.json"))).toBe(true); // No local real-delete commit.
-    fs.writeFileSync(path.join(directory, "task.txt"), ACTOR_ACTIVATION_HEADER + JSON.stringify({ activationId: "bad", batchIds: [] }) + "\n" + request.task);
-    expect(peekEnodevRun(directory, actor.id, request.activationId!)).toBeUndefined();
-    // W=0 legacy object tasks still match their own top-level id, not nested payload data.
-    fs.writeFileSync(path.join(directory, "task.txt"), "Fabric actor message:\n" + JSON.stringify({ payload: { id: "nested" }, id: "legacy" }, null, 2));
-    expect(peekEnodevRun(directory, actor.id, "legacy")).toMatchObject({ text: "saved batch answer" });
-    expect(peekEnodevRun(directory, actor.id, "nested")).toBeUndefined();
+    const nativePlatform = Object.getOwnPropertyDescriptor(process, "platform")!;
+    try {
+      if (platform === "win32") Object.defineProperty(process, "platform", { ...nativePlatform, value: "win32" });
+      if (process.platform === "win32") {
+        workerAlive.mockImplementation(pid => pid === workerPid ? true : alive(pid));
+        expect(peekEnodevRun(directory, actor.id, request.activationId!)).toBeUndefined(); // Live, unreadable birth keeps the veto.
+        workerAlive.mockImplementation(pid => pid === workerPid ? false : alive(pid));
+      }
+      expect(peekEnodevRun(directory, actor.id, request.activationId!)).toMatchObject({ status: "completed", text: "saved batch answer" });
+      expect(peekEnodevRun(directory, actor.id, "another-activation")).toBeUndefined();
+      expect(await manager.run(request)).toMatchObject({ id, status: "completed", enodevRecovered: true, text: "saved batch answer" });
+      expect(spawn).not.toHaveBeenCalled();
+      // The same authorization/abort fences still apply on native and forced win32.
+      await expect(manager.run(request, undefined, undefined, () => false)).rejects.toThrow("must not infer again");
+      const aborted = new AbortController();
+      aborted.abort();
+      await expect(manager.run(request, aborted.signal)).rejects.toThrow("must not infer again");
+      expect(spawn).toHaveBeenCalledTimes(2);
+      expect(fs.existsSync(path.join(directory, "unresolved-worker.json"))).toBe(true); // No local real-delete commit.
+      fs.writeFileSync(path.join(directory, "task.txt"), ACTOR_ACTIVATION_HEADER + JSON.stringify({ activationId: "bad", batchIds: [] }) + "\n" + request.task);
+      expect(peekEnodevRun(directory, actor.id, request.activationId!)).toBeUndefined();
+      // W=0 legacy object tasks still match their own top-level id, not nested payload data.
+      fs.writeFileSync(path.join(directory, "task.txt"), "Fabric actor message:\n" + JSON.stringify({ payload: { id: "nested" }, id: "legacy" }, null, 2));
+      expect(peekEnodevRun(directory, actor.id, "legacy")).toMatchObject({ text: "saved batch answer" });
+      expect(peekEnodevRun(directory, actor.id, "nested")).toBeUndefined();
+    } finally { Object.defineProperty(process, "platform", nativePlatform); }
   });
 });
 

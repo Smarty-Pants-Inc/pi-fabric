@@ -5877,9 +5877,12 @@ export class ActorManager {
         await release();
         return;
       }
+      // The first state alarm stays on the existing actor/mesh path; only its repeat slots reach Main here.
+      // Blocked activation slot 0 follows its already-delivered streak notice; other kinds repeat after slot 0.
+      const repeat = kind === "actor-activation-blocked" ? slot >= 0 : slot > 0;
       // At-most-once Main delivery: receipt replay returns the original id, never this attempt's id.
       // ponytail: a crash after publish but before onDeliver loses this slot's notice; the next slot re-alarms.
-      if (event.id === attemptId) {
+      if (repeat && event.id === attemptId) {
         // Restored episodes can carry legacy reason text: only fixed codes may enter Main.
         const reason = typeof data.reason === "string" && [
           "unknown", "context-overflow", "auth", "permission", "security-policy", "quota", "invalid-request",

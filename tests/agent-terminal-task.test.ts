@@ -10,6 +10,7 @@ import { writeJsonAtomic } from "../src/core/atomic-write.js";
 import { saveFinalAnswerReceipt } from "../src/worker/terminal-answer.js";
 import type { AgentRunRecord } from "../src/agents/types.js";
 import type { AgentTerminalNotice } from "../src/agents/terminal-target.js";
+import { TerminalNoticeOutbox, readTerminalAdmission } from "../src/agents/terminal-notices.js";
 import { canRemoveTerminalRun } from "../src/storage/retention.js";
 
 const roots: string[] = [];
@@ -168,9 +169,9 @@ describe("ordinary process-task final answer boundary", () => {
   it.each([
     ["delivery", "lifecycle"], ["sender", "lifecycle"], ["id", "lifecycle"],
     ["delivery", "unread"], ["sender", "unread"], ["id", "unread"],
-  ])("refuses a mismatched delivered %s row through %s exactly once to the original sender", async (mismatch, source) => {
+  ])("retains uncertainty without refusing a mismatched delivered %s row through %s", async (mismatch, source) => {
     const notices: AgentTerminalNotice[] = [];
-    const { manager, root, close, finish } = harness(notice => { notices.push(notice); });
+    const { manager, root, launch, close, finish } = harness(notice => { notices.push(notice); });
     const handle = await manager.spawn({ task: "ordinary", transport: "process" });
     const sender = { id: "session:senderA", name: "Sender A", kind: "main" as const, verified: "mesh" as const };
     const provenance = { v: 1 as const, channel: "fabric" as const, via: "steer" as const, sender };
@@ -187,24 +188,33 @@ describe("ordinary process-task final answer boundary", () => {
       fs.appendFileSync(path.join(directory, "lifecycle.jsonl"), JSON.stringify({ version: 1, event: "message.refused", occurredAt: Date.now(), data: {
         code: "FABRIC_TARGET_TERMINAL", targetId: handle.id, messageId: queued.messageId, delivery: "steer", finalAnswerReceiptId: receipt.id, sender,
       } }) + "\n");
-      // Prove the lifecycle skip site independently, before the unread exit scan.
-      await waitUntil(() => notices.length === 1);
+      // The lifecycle claim cannot override an unattributed consumption ACK.
+      manager.status(handle.id);
+      expect(notices).toEqual([]);
       expect(manager.hasRunCustody(handle.id)).toBe(true);
     }
     await manager.wait(handle.id, { timeoutMs: 1000 });
+    const next = await manager.spawn({ task: "native-close barrier", transport: "process" });
     close(handle.id);
-    const delivered = path.join(directory, "terminal-notices", `${queued.messageId}.json.delivered`);
-    await waitUntil(() => fs.existsSync(delivered));
+    await waitUntil(() => launch.mock.calls.length === 2);
+    close(next.id);
     manager.status(handle.id);
+    const recovery = new TerminalNoticeOutbox(notice => { notices.push(notice); });
+    recovery.recover(directory);
+    recovery.recover(directory);
     await new Promise(resolve => setTimeout(resolve, 10));
-    expect(notices).toEqual([{ code: "FABRIC_TARGET_TERMINAL", targetId: handle.id,
-      finalAnswerReceiptId: receipt.id, messageId: queued.messageId, delivery: "steer", sender }]);
-    expect(canRemoveTerminalRun(directory)).toBe(true);
+    const pending = path.join(directory, "terminal-notices", `${queued.messageId}.json`);
+    expect(notices).toEqual([]);
+    expect(fs.existsSync(pending)).toBe(false);
+    expect(fs.existsSync(`${pending}.delivered`)).toBe(false);
+    expect(fs.existsSync(path.join(directory, "terminal-controls", `${queued.messageId}.json`))).toBe(true);
+    expect(readTerminalAdmission(directory, queued.messageId)).toEqual({ id: queued.messageId, delivery: "steer", sender });
+    expect(canRemoveTerminalRun(directory)).toBe(false);
   });
 
-  it("preserves the original followUp kind when the delivered row wrongly names steer", async () => {
+  it("retains the original followUp without cancellation when the delivered row wrongly names steer", async () => {
     const notices: AgentTerminalNotice[] = [];
-    const { manager, root, close, finish } = harness(notice => { notices.push(notice); });
+    const { manager, root, launch, close, finish } = harness(notice => { notices.push(notice); });
     const handle = await manager.spawn({ task: "ordinary", transport: "process" });
     const sender = { id: "session:followUp-sender", kind: "main" as const, verified: "mesh" as const };
     const provenance = { v: 1 as const, channel: "fabric" as const, via: "followUp" as const, sender };
@@ -213,13 +223,24 @@ describe("ordinary process-task final answer boundary", () => {
     writeJsonAtomic(path.join(directory, "terminal-controls", `${queued.messageId}.json`), {
       id: queued.messageId, delivery: "steer", state: "delivered", provenance,
     });
-    const receipt = finish(handle.id, "done");
-    await manager.wait(handle.id, { timeoutMs: 1000 }); close(handle.id);
-    await waitUntil(() => fs.existsSync(path.join(directory, "terminal-notices", `${queued.messageId}.json.delivered`)));
-    expect(notices).toEqual([{ code: "FABRIC_TARGET_TERMINAL", targetId: handle.id,
-      finalAnswerReceiptId: receipt.id, messageId: queued.messageId, delivery: "followUp", sender }]);
-    expect(manager.status(handle.id).followUpDeliveries).toContainEqual(expect.objectContaining({ messageId: queued.messageId, state: "cancelled" }));
-    expect(canRemoveTerminalRun(directory)).toBe(true);
+    finish(handle.id, "done");
+    await manager.wait(handle.id, { timeoutMs: 1000 });
+    const next = await manager.spawn({ task: "native-close barrier", transport: "process" });
+    close(handle.id);
+    await waitUntil(() => launch.mock.calls.length === 2);
+    close(next.id);
+    const recovery = new TerminalNoticeOutbox(notice => { notices.push(notice); });
+    recovery.recover(directory);
+    recovery.recover(directory);
+    await new Promise(resolve => setTimeout(resolve, 10));
+    expect(notices).toEqual([]);
+    const pending = path.join(directory, "terminal-notices", `${queued.messageId}.json`);
+    expect(fs.existsSync(pending)).toBe(false);
+    expect(fs.existsSync(`${pending}.delivered`)).toBe(false);
+    expect(manager.status(handle.id).followUpDeliveries).toContainEqual(expect.objectContaining({ messageId: queued.messageId, state: "queued" }));
+    expect(fs.existsSync(path.join(directory, "terminal-controls", `${queued.messageId}.json`))).toBe(true);
+    expect(readTerminalAdmission(directory, queued.messageId)).toEqual({ id: queued.messageId, delivery: "followUp", sender });
+    expect(canRemoveTerminalRun(directory)).toBe(false);
   });
 
   it("cannot use a forged worker refusal to notify a different sender", async () => {
@@ -241,7 +262,9 @@ describe("ordinary process-task final answer boundary", () => {
 
   it("retries a failed sender route on status and retains an acknowledged notice for collection", async () => {
     let attempts = 0, acknowledged = 0;
-    const { manager, root, close, finish } = harness(() => {
+    const routed: AgentTerminalNotice[] = [];
+    const { manager, root, launch, close, finish } = harness(notice => {
+      routed.push(notice);
       attempts++;
       if (attempts === 1) throw new Error("sender temporarily unavailable");
       acknowledged++;
@@ -251,21 +274,30 @@ describe("ordinary process-task final answer boundary", () => {
       sender: { id: "session:sender", kind: "main" as const, verified: "mesh" as const } };
     const queued = manager.steer(handle.id, "queued", undefined, provenance);
     writeJsonAtomic(path.join(root, handle.id, "terminal-controls", `${queued.messageId}.json`), {
-      id: queued.messageId, delivery: "followUp", state: "delivered",
-      provenance: { ...provenance, sender: { ...provenance.sender, id: "session:wrong-sender" } },
+      id: queued.messageId, delivery: "steer", state: "refused", forwarded: true, provenance,
     });
-    finish(handle.id, "done");
-    await manager.wait(handle.id, { timeoutMs: 1000 }); close(handle.id);
+    const receipt = finish(handle.id, "done");
+    await manager.wait(handle.id, { timeoutMs: 1000 });
+    const next = await manager.spawn({ task: "native-close barrier", transport: "process" });
+    expect(next.status).toBe("queued");
+    close(handle.id);
     const outbox = path.join(root, handle.id, "terminal-notices", `${queued.messageId}.json`);
     await waitUntil(() => attempts === 1 && fs.existsSync(outbox));
     expect(canRemoveTerminalRun(path.join(root, handle.id))).toBe(false);
     manager.status(handle.id);
     await waitUntil(() => fs.existsSync(`${outbox}.delivered`));
     expect(acknowledged).toBe(1); expect(attempts).toBe(2);
+    const expectedNotice = { code: "FABRIC_TARGET_TERMINAL", targetId: handle.id,
+      finalAnswerReceiptId: receipt.id, messageId: queued.messageId, delivery: "steer", sender: provenance.sender };
+    expect(routed).toEqual([expectedNotice, expectedNotice]);
     manager.status(handle.id);
     await new Promise(resolve => setTimeout(resolve, 10));
     expect(attempts).toBe(2);
     expect(canRemoveTerminalRun(path.join(root, handle.id))).toBe(true);
+    // Sender routing can complete before the independently owned native drain.
+    // The queued next launch proves the first run released native admission.
+    await waitUntil(() => launch.mock.calls.length === 2);
+    close(next.id);
     expect((await manager.cleanup(handle.id)).cleaned).toBe(false); // retained run, no worktree
   });
 

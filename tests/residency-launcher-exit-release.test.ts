@@ -136,7 +136,7 @@ it.skipIf(posix)("win32: an idle exit writes no exit line (no O_NOFOLLOW) and th
 });
 
 // #1882: after the host releases owner.json the root may belong to the next
-// generation: no exit line after it. (error.json handling is main's, unchanged here.)
+// generation: no exit line after it. Any startup diagnostic is generation-private.
 it("a failure from close() after the release writes no exit line after the release", { timeout: 60_000 }, async () => {
   const h = harness("release");
   // The release is the last step of close(); this failure surfaces after it.
@@ -151,8 +151,8 @@ it("a failure from close() after the release writes no exit line after the relea
     const expected = posix ? [expect.objectContaining({ event: "resident-exit", reason: "stopped" })] : [];
     expect(h.atRelease.lines).toEqual(expected);
     expect(exitLines(h.residencyRoot)).toEqual(expected);
-    // Only main's own error.json write may follow the release; never launcher.log.
-    expect(h.late().filter(file => path.basename(file) !== "error.json")).toEqual([]);
+    // Only a generation-private diagnostic may follow the release; never a shared-root write.
+    expect(h.late().filter(file => !/generations[\\/]\S+\.error\.json$/.test(file))).toEqual([]);
   } finally {
     vi.restoreAllMocks();
     fs.rmSync(h.root, { recursive: true, force: true });

@@ -2,6 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { HOST_POLICY_PATH } from "../src/host-policy.js";
 import {
   DEFAULT_FABRIC_CONFIG,
   MODEL_EXCEPTIONS_PATH,
@@ -199,6 +200,71 @@ describe("host-only processSlice (#4383)", () => {
     expect(loadFabricConfig({ cwd, agentDir, projectTrusted }).agents.processSlice).toBeUndefined();
     fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({ agents: { processSlice: "batch.slice" } }));
     expect(loadFabricConfig({ cwd, agentDir, projectTrusted }).agents.processSlice).toBeUndefined();
+  });
+});
+
+describe("host/root-only processMemoryMaxBytes (smarty-dev#8257)", () => {
+  const DEFAULT = 24 * 1024 ** 3;
+  it("defaults to 24 GiB", () => {
+    expect(DEFAULT_FABRIC_CONFIG.agents.processMemoryMaxBytes).toBe(DEFAULT);
+    expect(normalizeFabricConfig({}).agents.processMemoryMaxBytes).toBe(DEFAULT);
+  });
+  it.each([true, false])("ignores agent-dir and project config, even trusted (trusted=%s)", projectTrusted => {
+    const cwd = temporaryDirectory(); const agentDir = temporaryDirectory(); fs.mkdirSync(path.join(cwd, ".pi"));
+    fs.writeFileSync(path.join(cwd, ".pi", "fabric.json"), JSON.stringify({ agents: { processMemoryMaxBytes: 1024 ** 4 } }));
+    expect(loadFabricConfig({ cwd, agentDir, projectTrusted }).agents.processMemoryMaxBytes).toBe(DEFAULT);
+    fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({ agents: { processMemoryMaxBytes: 1024 ** 3 } }));
+    expect(loadFabricConfig({ cwd, agentDir, projectTrusted }).agents.processMemoryMaxBytes).toBe(DEFAULT);
+    expect(loadFabricConfigForScope({ cwd, agentDir, projectTrusted }, "global").agents.processMemoryMaxBytes).toBe(DEFAULT);
+  });
+  // Root ownership of the private test policy path only is simulated, as in process-slice-scope-e2e.
+  const withRootPolicy = <T>(document: unknown, run: () => T): T => {
+    if (!HOST_POLICY_PATH.startsWith(`${os.tmpdir()}${path.sep}`)) throw new Error("test policy path is not private");
+    fs.mkdirSync(path.dirname(HOST_POLICY_PATH), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(HOST_POLICY_PATH, JSON.stringify(document), { mode: 0o600 });
+    const ancestors = new Set<string>();
+    for (let dir = path.dirname(HOST_POLICY_PATH); ; dir = path.dirname(dir)) { ancestors.add(dir); if (path.dirname(dir) === dir) break; }
+    const as = (stat: fs.Stats, changes: Partial<fs.Stats>): fs.Stats => Object.assign(Object.create(Object.getPrototypeOf(stat)) as fs.Stats, stat, changes);
+    const lstat = fs.lstatSync, open = fs.openSync, fstat = fs.fstatSync;
+    let policyFd: number | undefined;
+    vi.spyOn(fs, "lstatSync").mockImplementation(((file: fs.PathLike, ...rest: unknown[]) => {
+      const stat = (lstat as (...args: unknown[]) => fs.Stats)(file, ...rest);
+      const name = String(file);
+      return name === HOST_POLICY_PATH || ancestors.has(name) ? as(stat, { uid: 0, ...(ancestors.has(name) ? { mode: stat.mode & ~0o022 } : {}) }) : stat;
+    }) as typeof fs.lstatSync);
+    vi.spyOn(fs, "openSync").mockImplementation(((file: fs.PathLike, ...rest: unknown[]) => {
+      const fd = (open as (...args: unknown[]) => number)(file, ...rest);
+      if (String(file) === HOST_POLICY_PATH) policyFd = fd;
+      return fd;
+    }) as typeof fs.openSync);
+    vi.spyOn(fs, "fstatSync").mockImplementation(((fd: number, ...rest: unknown[]) => {
+      const stat = (fstat as (...args: unknown[]) => fs.Stats)(fd, ...rest);
+      return fd === policyFd ? as(stat, { uid: 0 }) : stat;
+    }) as typeof fs.fstatSync);
+    try { return run(); } finally { vi.restoreAllMocks(); fs.rmSync(path.dirname(HOST_POLICY_PATH), { recursive: true, force: true }); }
+  };
+  // The fixture simulates root ownership only, never kernel capability. readHostPolicy needs O_NOFOLLOW to prove
+  // root policy (absent on Windows) and otherwise fails closed to the default; that is asserted, not skipped.
+  const rootPolicyProvable = typeof fs.constants.O_NOFOLLOW === "number";
+  it("takes a custom value from the root host policy only", () => {
+    const cwd = temporaryDirectory(); const agentDir = temporaryDirectory(); fs.mkdirSync(path.join(cwd, ".pi"));
+    fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({ agents: { processMemoryMaxBytes: 1024 ** 4 } }));
+    expect(withRootPolicy({ agents: { processMemoryMaxBytes: 8 * 1024 ** 3 } },
+      () => loadFabricConfig({ cwd, agentDir, projectTrusted: true }).agents.processMemoryMaxBytes))
+      .toBe(rootPolicyProvable ? 8 * 1024 ** 3 : DEFAULT);
+  });
+  it.runIf(rootPolicyProvable)("fails closed to the default without O_NOFOLLOW, even with root-owned policy", async () => {
+    // Proxy the test's fs so withRootPolicy's root-owner spies still apply; only O_NOFOLLOW is removed.
+    const { O_NOFOLLOW: _omitted, ...constants } = fs.constants;
+    const noNofollow = new Proxy({} as typeof fs, { get: (_, key) => key === "constants" ? constants : Reflect.get(fs, key) });
+    vi.doMock("node:fs", () => ({ ...fs, default: noNofollow, constants }));
+    vi.resetModules();
+    try {
+      const { loadFabricConfig: load } = await import("../src/config.js");
+      const cwd = temporaryDirectory(); const agentDir = temporaryDirectory();
+      expect(withRootPolicy({ agents: { processMemoryMaxBytes: 8 * 1024 ** 3 } },
+        () => load({ cwd, agentDir, projectTrusted: true }).agents.processMemoryMaxBytes)).toBe(DEFAULT);
+    } finally { vi.doUnmock("node:fs"); vi.resetModules(); }
   });
 });
 

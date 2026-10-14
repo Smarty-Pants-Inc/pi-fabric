@@ -156,7 +156,23 @@ export class ActorDirectory extends ActorManager {
       throw error;
     }
   }
-  override owns(...args: Parameters<ActorManager["owns"]>): ReturnType<ActorManager["owns"]> { try { return this.#isPrimary(args[0]) ? super.owns(...args) : this.#secondary.owns(...args); } catch { return false; } }
+  override owns(...args: Parameters<ActorManager["owns"]>): ReturnType<ActorManager["owns"]> {
+    try {
+      const finishing = this.#finishingScope(args[0]);
+      if (finishing) return finishing === "primary" ? super.owns(...args) : this.#secondary.owns(...args);
+      return this.#isPrimary(args[0]) ? super.owns(...args) : this.#secondary.owns(...args);
+    } catch { return false; }
+  }
+  override finishingRemoval(id: string): ReturnType<ActorManager["finishingRemoval"]> {
+    const finishing = this.#finishingScope(id);
+    return finishing === "primary" ? super.finishingRemoval(id) : finishing ? this.#secondary.finishingRemoval(id) : undefined;
+  }
+  /** smarty-dev#11105: exact-id route to the manager whose removal commit is in flight; never by name or prefix. */
+  #finishingScope(id: string): "primary" | "secondary" | undefined {
+    const primary = super.finishingRemoval(id) !== undefined, secondary = this.#secondary.finishingRemoval(id) !== undefined;
+    if (primary && secondary) throw new Error(`Ambiguous Fabric actor: ${id}`);
+    return primary ? "primary" : secondary ? "secondary" : undefined;
+  }
   override resolveBinding(...args: Parameters<ActorManager["resolveBinding"]>): ReturnType<ActorManager["resolveBinding"]> { return this.#isPrimary(args[0]) ? super.resolveBinding(...args) : this.#secondary.resolveBinding(...args); }
   override resolveActivationBinding(...args: Parameters<ActorManager["resolveActivationBinding"]>): ReturnType<ActorManager["resolveActivationBinding"]> { return this.#isPrimary(args[0]) ? super.resolveActivationBinding(...args) : this.#secondary.resolveActivationBinding(...args); }
   override setModel(...args: Parameters<ActorManager["setModel"]>): ReturnType<ActorManager["setModel"]> { return this.#isPrimary(args[0]) ? super.setModel(...args) : this.#secondary.setModel(...args); }
@@ -210,6 +226,8 @@ export class ActorDirectory extends ActorManager {
     // Cleanup obligations route only by exact id, never by name or prefix.
     if (super.cleanupObligation(args[0])) return super.remove(...args);
     if (this.#secondary.cleanupObligation(args[0])) return this.#secondary.remove(...args);
+    const finishing = this.#finishingScope(args[0]);
+    if (finishing) return finishing === "primary" ? super.remove(...args) : this.#secondary.remove(...args);
     return this.#isPrimary(args[0]) ? super.remove(...args) : this.#secondary.remove(...args);
   }
   override pauseForRelease(): void { super.pauseForRelease(); this.#secondary.pauseForRelease(); }

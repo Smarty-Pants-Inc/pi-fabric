@@ -781,6 +781,7 @@ for (const mode of ["long", "short"]) {
   Object.assign(process.env, { TMPDIR: envTemp, TMP: envTemp, TEMP: envTemp });
   delete process.env.RUNNER_TEMP;
   delete process[Symbol.for("pi-fabric.test-owned-fleet-roots")];
+  delete process[Symbol.for("pi-fabric.test-owned-temp-cleanups")];
   hooks = []; early = []; guarded = []; outside = [];
   const temp = helper.isolatedTestTemp("owned-");
   // Sibling roots let us replace each identity independently without moving the other fixture.

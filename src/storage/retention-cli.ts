@@ -7,6 +7,7 @@ import { isMeshStateMovedMarker, readMeshStateMovedMarker } from "../mesh/backen
 import { meshStateDocumentProblem } from "../mesh/state-file.js";
 import { setWindowsVerifiedRemoval, startRemovalTally, stopRemovalTally, windowsPrivate, windowsRemoveHelper, type DeleterTally } from "./verified-remove.js";
 import { sweepResidentRuns } from "../residency/retention.js";
+import { sweepResidentGenerationRecords } from "../residency/generation-retention.js";
 import { compactTerminalRunEvents, pruneActorRunArchives, pruneActorSessionBackups, registryReferences } from "./retention.js";
 import { ownedStat, processAlive } from "./scratch.js";
 
@@ -510,6 +511,8 @@ const sweep = async (meshRoot: string, options: {
       }
     };
     for (const [rootId, root] of residents) await fenced(rootId, root, veto => {
+      // Always preview stale diagnostic records under the dead host's own flock fence; apply remains unreachable.
+      sweepResidentGenerationRecords(root, now, veto, true, change => changes.push(change));
       // The dead host's own startup sweep, under its flock fence: the same exit, tree,
       // preserved-result and latest-run fences as a live host's removal (smarty-dev#3252).
       if (options.runRetentionMs !== undefined) {

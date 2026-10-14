@@ -114,6 +114,10 @@ const fabricEnvKeys = [
   "PI_FABRIC_BUDGET",
   "PI_FABRIC_BUDGET_FILE",
   "PI_FABRIC_BUDGET_ID",
+  // Manager fixtures below assert legacy live-worker/debt behavior, not capped
+  // subtree teardown. Select that route explicitly even on delegated CI hosts.
+  "DBUS_SESSION_BUS_ADDRESS",
+  "XDG_RUNTIME_DIR",
 ] as const;
 const inheritedFabricEnv = new Map(
   fabricEnvKeys.map((key) => [key, process.env[key]]),

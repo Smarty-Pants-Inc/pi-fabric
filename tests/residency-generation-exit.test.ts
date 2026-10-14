@@ -123,7 +123,7 @@ describe.skipIf(process.platform !== "linux")("resident generation exit record",
     expect(readResidentGenerationExit(g.root, g.generation)).toMatchObject({ writer: "host" });
   });
 
-  it("retention: 40 generations leave the newest 32 generations' records", () => {
+  it("publication never prunes predecessor or successor generation records", () => {
     const f = setup();
     const generations: string[] = [];
     const base = Date.now() / 1000 - 1_000;
@@ -134,7 +134,7 @@ describe.skipIf(process.platform !== "linux")("resident generation exit record",
         .toEqual({ outcome: "written" });
       fs.utimesSync(residentGenerationExitPath(f.root, generation), base + index, base + index); // a strict file-time order
     }
-    expect(f.entries()).toEqual(generations.slice(-32).map(generation => `${generation}.exit.json`).sort());
+    expect(f.entries()).toEqual(generations.map(generation => `${generation}.exit.json`).sort());
   });
 
   it("a launcher-chosen generation is the host's owner token; a malformed one refuses the start", async () => {

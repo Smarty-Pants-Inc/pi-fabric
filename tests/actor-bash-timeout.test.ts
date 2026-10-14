@@ -411,19 +411,114 @@ describe("timeout-only actor bash hook (smarty-dev#2184)", () => {
   });
 });
 
+// smarty-dev#8257: inside a capped task scope the native bash tool routes plain `systemd-run` to the
+// task-local PATH wrapper (which keeps the command inside the capped leaf). The hook permits that
+// plain form only while FABRIC_TASK_SYSTEMD_RUN_WRAPPER is truthful (PATH really resolves
+// systemd-run to it) and refuses an absolute/path bypass of the wrapper. This is a TOOL GUARD on
+// command words, not a same-UID sandbox. Uncapped runs (no FABRIC_TASK_MEMORY_MAX) are unchanged.
+const ownCgroup = (() => {
+  if (process.platform !== "linux") return undefined;
+  try {
+    const line = fs.readFileSync("/proc/self/cgroup", "utf8").trim();
+    return line.startsWith("0::/") && !line.includes("\n") ? line.slice(3) : undefined;
+  } catch { return undefined; }
+})();
+describe.skipIf(!ownCgroup)("actor-bash-hook capped-task systemd-run guard (smarty-dev#8257)", () => {
+  const roots: string[] = [];
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
+  });
+  const EXACT = "systemd-run --user --scope -- timeout 300 sleep 600";
+  const capped = () => {
+    vi.stubEnv("FABRIC_TASK_CGROUP", ownCgroup!);
+    vi.stubEnv("FABRIC_TASK_MEMORY_MAX", String(24 * 1024 ** 3));
+  };
+  /** A real task-local PATH entry whose systemd-run is the named wrapper. */
+  const wrapperOnPath = (truthful = true) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-scope-wrapper-guard-"));
+    roots.push(root);
+    const wrapper = path.join(root, "systemd-run");
+    fs.writeFileSync(wrapper, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    vi.stubEnv("FABRIC_TASK_SYSTEMD_RUN_WRAPPER", wrapper);
+    vi.stubEnv("PATH", truthful ? `${root}${path.delimiter}${process.env.PATH ?? ""}` : "/usr/bin:/bin");
+    return wrapper;
+  };
+  const hook = async (command: string) => {
+    const { default: actorBashHook } = await import("../src/guards/actor-bash-hook.js");
+    const handlers: Array<(event: unknown) => unknown> = [];
+    actorBashHook({ on: (name: string, handler: (event: unknown) => unknown) => { if (name === "tool_call") handlers.push(handler); } } as unknown as ExtensionAPI);
+    return await handlers[0]!({ type: "tool_call", toolName: "bash", toolCallId: "call-1", input: { command } }) as { block?: boolean; reason?: string } | undefined;
+  };
+  it("capped + truthful wrapper: the exact plain command is permitted (it must execute, not be refused)", async () => {
+    capped(); wrapperOnPath();
+    for (const command of [EXACT, `env X=1 ${EXACT}`, `cd /tmp && ${EXACT}`,
+      `${EXACT} &\npython3 - <<'PY'\nimport os\nprint(os.environ.get("PATH"))\nPY`]) {
+      expect((await hook(command))?.block, command).toBeFalsy();
+    }
+  });
+
+  it("capped + truthful wrapper: changing PATH resolution is still refused", async () => {
+    capped(); wrapperOnPath();
+    for (const command of [`PATH=/usr/bin ${EXACT}`, `unset PATH; ${EXACT}`, `env -i ${EXACT}`, `command -p ${EXACT}`]) {
+      expect((await hook(command))?.block, command).toBe(true);
+    }
+  });
+
+  it("capped + truthful wrapper: an absolute or path-qualified systemd-run that bypasses the wrapper is refused", async () => {
+    capped(); const wrapper = wrapperOnPath();
+    for (const command of ["/usr/bin/systemd-run --user --scope -- timeout 300 sleep 600", "env X=1 /usr/bin/systemd-run --user true",
+      "cd /tmp && '/usr/bin/systemd-run' --user --scope -- true", "./systemd-run --user --scope -- true"]) {
+      const result = await hook(command);
+      expect(result?.block, command).toBe(true);
+      expect(result?.reason).toMatch(/systemd-run/);
+    }
+    // Naming the wrapper itself by its absolute path is not a bypass.
+    expect((await hook(`${wrapper} --user --scope -- timeout 300 sleep 600`))?.block).toBeFalsy();
+  });
+
+  it("capped without a truthful wrapper: plain systemd-run is refused (env names a wrapper PATH does not resolve, or none)", async () => {
+    capped(); wrapperOnPath(false);
+    expect((await hook(EXACT))?.block).toBe(true);
+    vi.stubEnv("FABRIC_TASK_SYSTEMD_RUN_WRAPPER", undefined);
+    expect((await hook(EXACT))?.block).toBe(true);
+  });
+
+  it("leaves ordinary commands alone inside the capped task", async () => {
+    capped(); wrapperOnPath();
+    expect((await hook("ls -la"))?.block).toBeFalsy();
+    expect((await hook("echo systemd-run-notes > notes.txt"))?.block).toBeFalsy();
+  });
+
+  it("uncapped runs are unchanged: no FABRIC_TASK_MEMORY_MAX, nothing is refused", async () => {
+    vi.stubEnv("FABRIC_TASK_MEMORY_MAX", undefined);
+    vi.stubEnv("FABRIC_TASK_CGROUP", undefined);
+    vi.stubEnv("FABRIC_TASK_SYSTEMD_RUN_WRAPPER", undefined);
+    expect((await hook(EXACT))?.block).toBeFalsy();
+    expect((await hook("/usr/bin/systemd-run --user --scope -- true"))?.block).toBeFalsy();
+  });
+});
+
 // smarty-dev#2339 F4: actor B's unset override must not inherit actor A's timeout.
-describe("nested actor bash timeout isolation (smarty-dev#2339 F4)", () => {
+describe("nested actor bash timeout isolation and boundary scrub (smarty-dev#2339 F4, #8257 SRC-1)", () => {
   const roots: string[] = [];
   const closers: Array<() => Promise<void>> = [];
   afterEach(async () => {
     vi.unstubAllEnvs();
     for (const close of closers.splice(0)) await close();
+    vi.restoreAllMocks();
     for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
   });
 
   it.each(["0", "2"])("clears parent timeout %s in the real worker and keeps the child's own 7 s override", { timeout: 20_000 }, async (inherited) => {
     vi.stubEnv("PI_FABRIC_ACTOR_ID", "actor:parent");
     vi.stubEnv("PI_FABRIC_ACTOR_BASH_TIMEOUT_S", inherited);
+    vi.stubEnv("FABRIC_TASK_MEMORY_MAX", "25769803776");
+    vi.stubEnv("FABRIC_TASK_CGROUP", "/a/fabric-task-parent.scope");
+    vi.stubEnv("FABRIC_TASK_SYSTEMD_RUN_WRAPPER", "/parent/bin/systemd-run");
+    // Fault-injected parent transport: deliberately pass stale receipt through,
+    // so only the real worker bootstrap (separate process, unmocked) can clear it.
+    vi.spyOn(await import("../src/agents/task-environment.js"), "withoutTaskBoundary").mockImplementation(env => ({ ...env }));
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-nested-actor-bash-"));
     roots.push(root);
     const fakePi = path.join(root, "fake-pi.mjs");
@@ -431,7 +526,7 @@ describe("nested actor bash timeout isolation (smarty-dev#2339 F4)", () => {
       "#!/usr/bin/env node",
       "import readline from 'node:readline';",
       "const send = (event) => process.stdout.write(JSON.stringify(event) + '\\n');",
-      "const text = JSON.stringify({ actorId: process.env.PI_FABRIC_ACTOR_ID, timeout: process.env.PI_FABRIC_ACTOR_BASH_TIMEOUT_S });",
+      "const text = JSON.stringify({ actorId: process.env.PI_FABRIC_ACTOR_ID, timeout: process.env.PI_FABRIC_ACTOR_BASH_TIMEOUT_S, cap: process.env.FABRIC_TASK_MEMORY_MAX, cgroup: process.env.FABRIC_TASK_CGROUP, wrapper: process.env.FABRIC_TASK_SYSTEMD_RUN_WRAPPER });",
       "const message = { role: 'assistant', content: [{ type: 'text', text }], provider: 'fake', model: 'fake', usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 }, stopReason: 'stop' };",
       "let started = false;",
       "readline.createInterface({ input: process.stdin }).on('line', (line) => {",
@@ -453,7 +548,9 @@ describe("nested actor bash timeout isolation (smarty-dev#2339 F4)", () => {
         ...(bashTimeoutSeconds === undefined ? {} : { bashTimeoutSeconds }),
       });
       expect(result.status).toBe("completed");
-      return JSON.parse(result.text) as { actorId: string; timeout?: string };
+      const native = JSON.parse(result.text) as { actorId: string; timeout?: string; cap?: string; cgroup?: string; wrapper?: string };
+      for (const key of ["cap", "cgroup", "wrapper"]) expect(native).not.toHaveProperty(key);
+      return native;
     };
     const defaults = await surface();
     expect(defaults.actorId).toBe("actor:child");

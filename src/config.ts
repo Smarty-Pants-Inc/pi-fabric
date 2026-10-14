@@ -242,6 +242,9 @@ export interface FabricAgentConfig {
   transport: FabricAgentTransport;
   /** Root-policy Linux user scope slice; agent-dir values cannot relax this. */
   processSlice?: string;
+  /** Root-policy memory.max (bytes) for capped process task cgroups, with swap 0
+   * (smarty-dev#8257). Default 24 GiB; agent-dir/workspace values cannot relax it. */
+  processMemoryMaxBytes?: number;
   /** Host-only opt-in process task placement; workspace files cannot override it. */
   placement?: AgentPlacementConfig;
   /** User/workspace Pi default; package defaults intentionally leave this unset. */
@@ -698,6 +701,13 @@ export const maxExecutorMemoryLimitBytes = (
     ? Math.min(QUICKJS_MAX_MEMORY_LIMIT_BYTES, MAX_EXECUTOR_MEMORY_LIMIT_BYTES)
     : MAX_EXECUTOR_MEMORY_LIMIT_BYTES;
 
+/** Default per-task cgroup memory.max (smarty-dev#8257): 24 GiB, swap capped at 0. */
+export const DEFAULT_PROCESS_MEMORY_MAX_BYTES = 24 * 1024 ** 3;
+
+/** A positive safe integer byte count, or the 24 GiB default for absent/invalid values. */
+export const processMemoryMaxBytesValue = (value: unknown): number =>
+  typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : DEFAULT_PROCESS_MEMORY_MAX_BYTES;
+
 export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
   fullCodeMode: true,
   autoReload: true,
@@ -760,6 +770,7 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
     // behaviour key on the "pi" runner; upstream's pi-durable default stays opt-in here.
     runner: "pi",
     transport: "process",
+    processMemoryMaxBytes: DEFAULT_PROCESS_MEMORY_MAX_BYTES,
     deniedModels: [],
     modelExceptionsPath: MODEL_EXCEPTIONS_PATH,
     modelPolicy: {
@@ -1529,6 +1540,7 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
       transport: transportValue(agents.transport, DEFAULT_FABRIC_CONFIG.agents.transport),
       ...(typeof agents.processSlice === "string" && /^[a-zA-Z0-9_.-]+\.slice$/.test(agents.processSlice)
         ? { processSlice: agents.processSlice } : {}),
+      processMemoryMaxBytes: processMemoryMaxBytesValue(agents.processMemoryMaxBytes),
       ...(placement ? { placement } : {}),
       ...(router ? { router } : {}),
       ...(agentModel ? { model: agentModel } : {}),
@@ -2190,6 +2202,7 @@ const resolveFabricConfig = (
     merged = mergeObjects(merged, {
       agents: {
         ...(Object.hasOwn(agents, "processSlice") ? { processSlice: agents.processSlice } : {}),
+        ...(Object.hasOwn(agents, "processMemoryMaxBytes") ? { processMemoryMaxBytes: agents.processMemoryMaxBytes } : {}),
         ...(Array.isArray(agents.deniedModels) ? { deniedModels: agents.deniedModels } : {}),
         ...(Array.isArray(requireReason) ? { modelPolicy: { requireReason } } : {}),
       },
@@ -2220,6 +2233,7 @@ const resolveFabricConfig = (
       document.executor = executor;
       const agents = { ...objectValue(document.agents) };
       delete agents.processSlice;
+      delete agents.processMemoryMaxBytes; // Root-policy-only, like processSlice.
       const inheritedAgents = objectValue(merged.agents);
       // Agent-writable lists can add restrictions, never remove a root/default gate.
       const union = (base: unknown, extra: unknown): unknown[] => [
@@ -2242,6 +2256,7 @@ const resolveFabricConfig = (
       delete agents.instructionsRoot;
       delete agents.wakeText;
       delete agents.processSlice;
+      delete agents.processMemoryMaxBytes;
       delete agents.placement;
       delete agents.deadRootFilter; // Host-only: a lane cannot drop the fleet's exemptions.
       delete agents.stuckPreparingMs; // Host-only: a lane cannot silence the stuck-preparing owner notice.

@@ -499,7 +499,8 @@ export class NatsStateBackend implements StateBackend {
   async #startProjector(): Promise<void> {
     for (let attempt = 1; ; attempt++) {
       const loaded = await this.#loadSnapshot();
-      if (loaded && loaded.seq > this.#snapshot.seq) { this.#snapshot = loaded; this.#settle(); }
+      // A newer snapshot replaces the model: one state-change hint per install (none at open: no listener yet).
+      if (loaded && loaded.seq > this.#snapshot.seq) { this.#snapshot = loaded; this.#settle(); this.#notifyStateChanged(); }
       const last = await this.#options.port.lastSequence(this.#options.stream);
       this.#knownSeq = Math.max(this.#knownSeq, last);
       const backlog = last - this.#snapshot.seq;
@@ -704,9 +705,36 @@ export class NatsStateBackend implements StateBackend {
     this.#knownSeq = Math.max(this.#knownSeq, message.seq);
     // Stream sequences are contiguous until a purge: a gap means a snapshot purged what this model still needed.
     if (message.seq > this.#snapshot.seq + 1) { this.#resync(); return; }
+    const before = this.#snapshot;
     try { this.#snapshot = applyNatsMessage(this.#snapshot, message, this.#options.maxStateTombstones ?? DEFAULT_TOMBSTONES, this.#limits); }
     catch (error) { this.#fail(error); return; }
     this.#settle();
+    if (this.#snapshot !== before) this.#notifyStateChanged();
+  }
+
+  readonly #stateListeners = new Set<() => void>();
+  #notifyPending = false;
+
+  /** pi-fabric#7978: hints after the projector applied a whole stream message (no mesh-root file changes for it). */
+  subscribeStateChanges(listener: () => void): () => void {
+    const own = (): void => listener();
+    this.#stateListeners.add(own);
+    return () => { this.#stateListeners.delete(own); };
+  }
+
+  // Coalesced to one microtask per burst of applied messages, after the snapshot is assigned and waiters settled.
+  // A throwing listener never reaches the projector or another listener.
+  #notifyStateChanged(): void {
+    if (this.#notifyPending || this.#stateListeners.size === 0) return;
+    this.#notifyPending = true;
+    queueMicrotask(() => {
+      this.#notifyPending = false;
+      if (this.#closed || this.#failure !== undefined) return;
+      for (const listener of [...this.#stateListeners]) {
+        if (!this.#stateListeners.has(listener)) continue; // unsubscribed by an earlier listener
+        try { listener(); } catch {}
+      }
+    });
   }
 
   /** Resolves once the model has applied `seq`; a projector that does not get there within the write budget is busy. */

@@ -458,6 +458,11 @@ export class MeshStore {
     return this.#state;
   }
 
+  /** Projection-applied state change hints (see `StateBackend.subscribeStateChanges`); a no-op where the backend has none. */
+  subscribeStateChanges(listener: () => void): () => void {
+    return this.#state.subscribeStateChanges?.(listener) ?? (() => undefined);
+  }
+
   stateDiagnostics(): StateBackendDiagnostics {
     return this.#state.diagnostics();
   }

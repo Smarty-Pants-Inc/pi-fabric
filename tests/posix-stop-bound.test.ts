@@ -124,7 +124,8 @@ describe.skipIf(process.platform === "win32")("POSIX stop deadline (#360 Astra R
   });
 
   it.each(["stop", "deadline", "close"] as const)("lets the real worker join its separate TERM-ignoring native group before %s completes", async action => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-native-stop-order-"));
+    const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-native-stop-order-"));
+    const root = path.join(fixtureRoot, "cwd"); fs.mkdirSync(root);
     const nativePath = path.join(root, "native.mjs");
     const workerPath = path.join(root, "worker.mjs");
     // Execute the production worker, but delay its TERM delivery to reproduce
@@ -160,7 +161,7 @@ fs.writeFileSync("native-ready", String(process.pid));`);
     const manager = new AgentManager(root, {
       ...DEFAULT_FABRIC_CONFIG.agents, timeoutMs: action === "deadline" ? 10_000 : 60_000,
       maxConcurrent: 1, retainRuns: false, budgetUsd: 0, sessionExport: false,
-    }, { runRoot: path.join(root, "runs"), workerPath, piBinary: nativePath });
+    }, { runRoot: path.join(fixtureRoot, "runs"), workerPath, piBinary: nativePath });
     let native: Owned | undefined;
     try {
       const handle = await manager.spawn({ task: "native progress", transport: "process", extensions: false });
@@ -196,12 +197,13 @@ fs.writeFileSync("native-ready", String(process.pid));`);
       await closed;
       await manager.close();
       if (native) expect(same(native), "fixture must leave no native child running").toBe(false);
-      fs.rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+      fs.rmSync(fixtureRoot, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
     }
   }, 40_000);
 
   it.each(["stop", "deadline", "close"] as const)("escalates a real TERM-ignoring worker and completes %s", async action => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-term-ignore-"));
+    const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-term-ignore-"));
+    const root = path.join(fixtureRoot, "cwd"); fs.mkdirSync(root);
     const worker = path.join(root, "worker.mjs");
     fs.writeFileSync(worker, `import fs from "node:fs";
 const args = new Map();
@@ -225,7 +227,7 @@ fs.writeFileSync(args.get("--status-file"), JSON.stringify({
     const manager = new AgentManager(root, {
       ...DEFAULT_FABRIC_CONFIG.agents, timeoutMs: action === "deadline" ? 10_000 : 60_000,
       retainRuns: false, budgetUsd: 0,
-    }, { runRoot: path.join(root, "runs"), workerPath: worker });
+    }, { runRoot: path.join(fixtureRoot, "runs"), workerPath: worker });
     try {
       const handle = await manager.spawn({ task: "progress", transport: "process" });
       const run = manager.runDirectory(handle.id)!;
@@ -250,7 +252,7 @@ fs.writeFileSync(args.get("--status-file"), JSON.stringify({
       if (child && child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
       if (closed) await closed;
       await manager.close();
-      fs.rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+      fs.rmSync(fixtureRoot, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
     }
   }, 40_000);
 });

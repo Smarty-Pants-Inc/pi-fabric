@@ -27,6 +27,7 @@
  * build against these declarations. Changes after that commit are recorded in the lane's
  * `iface-changes.md`.
  */
+import fs from "node:fs";
 import path from "node:path";
 import { isMeshLockTimeout, MeshLockTimeoutError } from "../core/atomic-write.js";
 import type { MeshIdentity } from "./event-log.js";
@@ -228,8 +229,25 @@ export interface StateBackend {
    */
   withWriteFence<T>(operation: () => T): T;
 
+  /**
+   * Durability barrier (smarty-dev#9313): resolves once every state commit made before the call, by
+   * any process on this root, is on disk, or throws (within about `budgetMs` for sqlite). Never
+   * holds a writer lock while it syncs. file: fsync of state.json and its namespace; on Windows, which
+   * has no directory barrier, rejects (before any I/O) with MeshStateFileNotDurableError. sqlite: the
+   * store's PASSIVE checkpoint barrier. shadow: its authority, state.json. nats: resolves at once on a
+   * server with sync_always (a commit resolves only on the server's publish ack and the backend buffers
+   * nothing); rejects with MeshStateNatsNotDurableError when opened with acceptPeriodicSync (see NatsStateBackend.sync).
+   */
+  sync(budgetMs: number): Promise<void>;
   /** Drops parsed caches (called after a failed operation under the mesh lock). */
   dropCache(): void;
+  /**
+   * Optional (pi-fabric#7978): calls `listener` after this process's read projection has applied a whole committed
+   * change that arrived without a watched mesh-root file write (nats: the stream consumer). A hint, never authority:
+   * consumers re-read state. Backends whose commits already touch watched files (file, sqlite, shadow) omit it.
+   * Returns the unsubscribe function.
+   */
+  subscribeStateChanges?(listener: () => void): () => void;
   diagnostics(): StateBackendDiagnostics;
   /** Releases database handles; reads and writes after close throw (file: no-op). */
   close(): void;
@@ -765,6 +783,14 @@ export class SqliteStateBackend implements StateBackend {
     }
   }
 
+  /** The store's PASSIVE-checkpoint barrier (no writer lock). A database never created holds no commit. */
+  async sync(budgetMs: number): Promise<void> {
+    const deadline = performance.now() + Math.max(0, budgetMs);
+    if (!this.#store && !fs.existsSync(this.database)) return;
+    const store = await this.#openAsync(deadline);
+    await store.sync(Math.max(0, deadline - performance.now()));
+  }
+
   dropCache(): void {
     this.#snapshot = undefined;
   }
@@ -1078,6 +1104,9 @@ export class ShadowStateBackend implements StateBackend {
   // state.json is the authority and its writers take `.lock`; the shadow database is never read
   // for a decision, so fencing it would only add busy refusals.
   withWriteFence<T>(operation: () => T): T { return this.#file.withWriteFence(operation); }
+
+  // state.json is the authority; the shadow database is a copy rebuilt from it, so only the file syncs.
+  sync(budgetMs: number): Promise<void> { return this.#file.sync(budgetMs); }
 
   dropCache(): void { this.#file.dropCache(); }
 

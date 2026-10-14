@@ -1245,6 +1245,7 @@ export function registerFabricCommand(pi: ExtensionAPI, deps: FabricCommandDeps)
           `actors: ${state.actors.list().length} · mesh: ${config.mesh.enabled ? state.mesh.root : "disabled"}`,
           `MCP: ${config.mcp.enabled ? "enabled" : "disabled"}`,
           `UI: ${config.ui.enabled ? `${config.ui.widget} widget above chat` : "disabled"}`,
+          ...(state.observationHealth?.() ?? []),
         ].join("\n"),
         "info",
       );

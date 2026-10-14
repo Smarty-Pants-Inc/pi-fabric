@@ -12,6 +12,7 @@ const primaryEntryPoints = [
   "src/mesh-bridge.ts",
   "src/participants-cli.ts",
   "src/actors-cli.ts",
+  "src/resident-drain-cli.ts",
   "src/judge-cli.ts",
   "src/releases-cli.ts",
   "src/mesh-lock-stats-cli.ts",
@@ -75,6 +76,7 @@ const lazyEntryPoints = [
   "src/memory/extractive-history.ts",
   "src/cli/mesh.ts",
   "src/cli/decisions.ts",
+  "src/mesh/nats-auth/cli.ts",
   "src/thinking-control.ts",
   "src/compaction/owner.ts",
   "src/compaction/orphan-repair.ts",
@@ -157,6 +159,8 @@ const lazyEntryPoints = [
   "src/worker/session-export.ts",
   // smarty-dev#7504: the NATS state backend's official client, loaded only by openNatsStateBackend.
   "src/mesh/state-backend-nats-client.ts",
+  "src/config.ts",
+  "src/core/agent-dir.ts",
 ];
 
 // smarty-dev#7936: the native helpers' sha256 values become a constant of the bundle (reader-proof.ts).

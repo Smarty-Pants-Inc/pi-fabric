@@ -285,9 +285,39 @@ const namespaceSnapshot = (target: string, receipt?: Inode) => {
     return { entries, directories, parents };
 };
 
+/**
+ * Whether syncPathNamespace can confirm a directory entry on this platform. Windows has no directory
+ * fsync, so every namespace barrier below is skipped there (NTFS journals names, but nothing here
+ * confirms it). The single platform fact behind syncPathNamespace, its async form, syncDirectoryChain
+ * and the fail-closed durability variant.
+ */
+export const namespaceBarrierAvailable = (): boolean => process.platform !== "win32";
+
+/** Builds the caller's typed not-durable error (for mesh.sync: a MeshSyncNotDurableError code). */
+export type NamespaceNotDurable = (platform: NodeJS.Platform) => Error;
+
+/**
+ * Refuses, before any I/O, a durability barrier that would need a namespace (directory) step on a
+ * platform without one (pi-fabric#894): a barrier that reports success to a caller, which then
+ * advances an external cursor or delivered mark, must never skip the directory fsync silently.
+ */
+export const requireNamespaceBarrier = (notDurable: NamespaceNotDurable): void => {
+  if (!namespaceBarrierAvailable()) throw notDurable(process.platform);
+};
+
+/**
+ * syncPathNamespace for a durability barrier (mesh.sync, smarty-dev#9313): fails closed with
+ * notDurable(platform) where syncPathNamespace would skip the directory fsync (win32), instead of
+ * returning as if the namespace were confirmed. Ordinary atomic writes keep syncPathNamespace.
+ */
+export const syncPathNamespaceDurable = (target: string, receipt: Inode | undefined, notDurable: NamespaceNotDurable): void => {
+  requireNamespaceBarrier(notDurable);
+  syncPathNamespace(target, receipt);
+};
+
 export const syncPathNamespace = (target: string, receipt?: Inode): void => {
   const before = namespaceSnapshot(target, receipt);
-  if (process.platform !== "win32") {
+  if (namespaceBarrierAvailable()) {
     const synced = new Set<string>();
     for (const parent of before.parents.reverse()) {
       for (let current = parent; ; current = path.dirname(current)) {
@@ -315,7 +345,7 @@ export const syncPathNamespace = (target: string, receipt?: Inode): void => {
  * that a newly created or replaced child directory is durably linked. */
 export const syncPathNamespaceAsync = async (target: string, receipt: Inode): Promise<void> => {
   const before = namespaceSnapshot(target, receipt);
-  if (process.platform !== "win32") {
+  if (namespaceBarrierAvailable()) {
     for (const [directory, expected] of [...before.directories].reverse()) {
       const handle = await fs.promises.open(directory, fs.constants.O_RDONLY);
       try {
@@ -329,9 +359,17 @@ export const syncPathNamespaceAsync = async (target: string, receipt: Inode): Pr
     throw new Error("Namespace changed during durability barriers");
   }
 };
+/**
+ * A namespace barrier refused because a path it confirms was replaced meanwhile (a concurrent
+ * rename: compaction, a state commit). The fsyncs themselves succeeded, so a new barrier may run.
+ * Never true for an I/O error: a failed fsync is not retried (its dirty pages may be dropped).
+ */
+export const isNamespaceRace = (error: unknown): boolean => error instanceof Error &&
+  /^(Namespace (changed|directory changed|link changed)|Session receipt inode changed)/.test(error.message);
+
 /** Existence is not a receipt; retry every required directory barrier without a cache. */
 export const syncDirectoryChain = (directory: string): void => {
-  if (process.platform !== "win32") syncPathNamespace(directory);
+  if (namespaceBarrierAvailable()) syncPathNamespace(directory);
 };
 
 // Temps this process staged and has not yet renamed or removed (smarty-dev#6622).
@@ -788,6 +826,46 @@ export const meshJournalAlarmLine = (alarm: { label: string; state: "outage" | "
   `${MESH_JOURNAL_ALARM_TAG} ${JSON.stringify(alarm)}`;
 export interface MeshOutageAlarm { label: string; state: "outage" | "recovered"; sinceMs: number; durationMs: number; reason?: string }
 
+let journalToolUnavailable = false;
+let journalMirrorFailures = 0;
+/** Diagnostic count of failed native journal attempts (each child counts at most once). */
+export const meshJournalMirrorFailures = (): number => journalMirrorFailures;
+
+/** Pane stderr is not necessarily journal-backed (smarty-dev#9657). Only probe at alarm time. */
+const mirrorMeshJournalLine = (line: string): void => {
+  if (process.platform !== "linux" || journalToolUnavailable) return;
+  const stream = process.env.JOURNAL_STREAM;
+  if (stream && /^\d+:\d+$/.test(stream)) {
+    try {
+      const stat = fs.fstatSync(2, { bigint: true });
+      if (stream === `${stat.dev}:${stat.ino}`) return;
+    } catch { /* Unknown stderr identity needs the independent journal sink. */ }
+  }
+  let failed = false;
+  const fail = (error: unknown): void => {
+    if (errorCode(error) === "ENOENT") journalToolUnavailable = true;
+    if (!failed) { failed = true; journalMirrorFailures++; }
+  };
+  try {
+    // No shell/tool lookup, no await: a broken journal never blocks mesh delivery. execFile
+    // owns child errors and its kill deadline; stdin needs its own local error boundary.
+    // Fixed trusted system path: a pane's PATH may start with a writable project directory.
+    const child = childProcess.execFile("/usr/bin/systemd-cat", ["--identifier", MESH_OUTAGE_ALARM_TAG], {
+      // systemd-cat also resolves its default cat child: both executable paths must be trusted.
+      timeout: 2_000, maxBuffer: 4_096, env: { PATH: "/usr/bin:/bin" },
+    }, (error) => { if (error) fail(error); });
+    child.unref();
+    if (!child.stdin) { fail(undefined); return; }
+    child.stdin.on("error", fail);
+    child.stdin.end(`${line}\n`);
+  } catch (error) { fail(error); }
+};
+const emitMeshJournalAlarm = (alarm: Parameters<typeof meshJournalAlarmLine>[0]): void => {
+  const line = meshJournalAlarmLine(alarm);
+  console.warn(line);
+  mirrorMeshJournalLine(line);
+};
+
 /** A log-safe description of a deferred write (pi-fabric#893 round 3). A WAL-cap refusal's message embeds the pinning
  * readers' pids and command lines, which can carry secrets: only its sizes and reader count are logged. */
 export const meshDeferredSummary = (error: unknown): string => {
@@ -838,7 +916,7 @@ export class MeshBackgroundRetry {
   }
   #raise(alarm: MeshOutageAlarm): void {
     // The independent sink: one structured line, written at alarm time whatever the mesh does.
-    console.warn(meshJournalAlarmLine({ ...alarm }));
+    emitMeshJournalAlarm({ ...alarm });
     if (this.#alarm) {
       this.#pendingAlarms.push({ alarm, attempts: 0, firstAt: performance.now() });
       while (this.#pendingAlarms.length > MESH_ALARM_QUEUE_MAX) { this.#pendingAlarms.shift(); this.#droppedOverflow++; this.#reportUndeliverable(); }
@@ -849,8 +927,8 @@ export class MeshBackgroundRetry {
   #reportUndeliverable(): void {
     if (this.#undeliverableReported) return;
     this.#undeliverableReported = true;
-    console.warn(meshJournalAlarmLine({ label: this.label, state: "outage", sinceMs: Date.now(), reason: "mesh-alarm-undeliverable",
-      droppedOverflow: this.#droppedOverflow, droppedAfterRetries: this.#droppedExhausted, queued: this.#pendingAlarms.length }));
+    emitMeshJournalAlarm({ label: this.label, state: "outage", sinceMs: Date.now(), reason: "mesh-alarm-undeliverable",
+      droppedOverflow: this.#droppedOverflow, droppedAfterRetries: this.#droppedExhausted, queued: this.#pendingAlarms.length });
   }
   /** Remove `head` by identity (pi-fabric#893 Astra P1): while its publish was awaited, an overflow in #raise may
    * already have dropped (and counted) it, and the queue's first entry is then the NEXT, unattempted event. */
@@ -892,11 +970,27 @@ export class MeshBackgroundRetry {
   #lastReportedAt: number | undefined;
   #suppressed = 0;
   #running = false;
+  // Opt-in (backoffFailures) state for non-transient failures; the default boundary never sets it.
+  #failureBackoff: { minMs: number; maxMs: number } | undefined;
+  #failureDelay = 0;
+  #failureMessage: string | undefined;
+  #failureReportedAt: number | undefined;
+  #failureSuppressed = 0;
   constructor(readonly label: string, readonly minMs = 100, readonly maxMs = 5_000,
     readonly warningWindowMs = meshRetryWarningWindowMs()) {}
 
+  /** Opt-in for a self-retriggering path (a periodic refresh, not a queue): a non-transient failure stays
+   * `failed` but waits out a deterministic exponential backoff (minMs doubling to maxMs) before run() tries
+   * again, and the same repeated message is printed at most once per warning window. A confirmed success()
+   * clears the backoff. Default instances keep the immediate-retry semantics. */
+  backoffFailures(minMs: number, maxMs: number): this {
+    const min = Math.max(1, Math.floor(minMs));
+    this.#failureBackoff = { minMs: min, maxMs: Math.max(min, Math.floor(maxMs)) };
+    return this;
+  }
+
   get waitMs(): number { return Math.max(0, this.#retryAt - Date.now()); }
-  #resetBackoff(): void { this.#delay = 0; this.#retryAt = 0; }
+  #resetBackoff(): void { this.#delay = 0; this.#retryAt = 0; this.#failureDelay = 0; }
   /** A confirmed acquisition: reset backoff, never the warning window (smarty-dev#8305). `final`: the path's work is
    * done (a one-shot write such as one actor's presence), so its outage ends now, with no further writes to wait for. */
   success(final = false): void {
@@ -927,8 +1021,13 @@ export class MeshBackgroundRetry {
       // Contain the owned callback, but surface unrelated bugs and preserve its existing
       // retry cadence. Only a typed acquisition failure earns lock backoff/deduplication.
       // Not proof that the lock is free: no recovery summary, suppression is kept.
+      const message = error instanceof Error ? error.message : String(error);
+      if (this.#failureBackoff) {
+        this.#failBackoff(message);
+        return false;
+      }
       this.#resetBackoff();
-      console.warn(`[pi-fabric] ${this.label}: background operation failed: ${error instanceof Error ? error.message : String(error)}`);
+      console.warn(`[pi-fabric] ${this.label}: background operation failed: ${message}`);
       return false;
     }
     this.#delay = Math.min(this.maxMs, Math.max(this.minMs, this.#delay * 2));
@@ -959,6 +1058,24 @@ export class MeshBackgroundRetry {
       this.#suppressed++;
     }
     return transient;
+  }
+
+  #failBackoff(message: string): void {
+    const { minMs, maxMs } = this.#failureBackoff!;
+    this.#failureDelay = Math.min(maxMs, Math.max(minMs, this.#failureDelay * 2));
+    const now = Date.now();
+    this.#retryAt = now + this.#failureDelay;
+    const elapsedMs = this.#failureReportedAt === undefined ? Infinity : now - this.#failureReportedAt;
+    if (message === this.#failureMessage && elapsedMs < this.warningWindowMs) {
+      this.#failureSuppressed++;
+      return;
+    }
+    const summary = this.#failureSuppressed > 0
+      ? ` (${this.#failureSuppressed} similar failures suppressed in the last ${Math.floor(elapsedMs / 1_000)}s)` : "";
+    console.warn(`[pi-fabric] ${this.label}: background operation failed: ${message}; retrying in ${this.#failureDelay} ms${summary}`);
+    this.#failureMessage = message;
+    this.#failureReportedAt = now;
+    this.#failureSuppressed = 0;
   }
 
   /** Polls retry unchanged state on a later tick after backoff; contains sync handlers too.

@@ -224,6 +224,7 @@ export class ProcessTransport implements AgentTransportAdapter {
       }
       if (!reason) {
         const { launchPlacedTask } = await import("./placement.js");
+        request.onWritePolicyDisposition?.("remote");
         return launchPlacedTask(request, placement);
       }
       const args = new Map<string, string>();
@@ -234,6 +235,7 @@ export class ProcessTransport implements AgentTransportAdapter {
     }
     // Check on Main only after the remote decision; required paths may exist solely on the target.
     assertAgentRequiredInputsExist(requires, file => fs.existsSync(file));
+    request.onWritePolicyDisposition?.("local");
     const actor = isActorLaunch(request.workerArguments);
     // smarty-dev#8257: tasks get their own memory-capped scope only on a proven
     // delegated v2 user manager. Actors and unproven hosts keep the legacy path:

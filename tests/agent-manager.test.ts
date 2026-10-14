@@ -328,7 +328,10 @@ describe("AgentManager fleet model admission (#2490)", () => {
     const before = fs.readdirSync(root); const launch = vi.spyOn(ProcessTransport.prototype, "launch");
     const beforeCommit = vi.fn();
     try {
-      await expect(manager.spawn({ task: "must not queue", runner, ...(source === "explicit" ? { model: selector } : {}), ...(runner === "claude" ? { modelReason: "Named exception to isolate Claude deny policy #11864" } : {}) }, undefined, undefined, beforeCommit)).rejects.toMatchObject({ name: "FabricModelDeniedError", code: "FABRIC_MODEL_DENIED" });
+      const denial = runner === "claude" && selector === "unknown-runtime-alias" && !hasPosixTrustMetadata
+        ? { code: "FABRIC_MODEL_EXCEPTION_DENIED", denial: "model-mismatch" }
+        : { name: "FabricModelDeniedError", code: "FABRIC_MODEL_DENIED" };
+      await expect(manager.spawn({ task: "must not queue", runner, ...(source === "explicit" ? { model: selector } : {}), ...(runner === "claude" ? { modelReason: "Named exception to isolate Claude deny policy #11864" } : {}) }, undefined, undefined, beforeCommit)).rejects.toMatchObject(denial);
       expect(manager.list().map(agent => agent.id)).toEqual([occupied.id]);
       expect(fs.readdirSync(root)).toEqual(before);
       expect(launch).not.toHaveBeenCalled(); expect(beforeCommit).not.toHaveBeenCalled();
@@ -359,7 +362,10 @@ describe("AgentManager fleet model admission (#2490)", () => {
     const catalog = vi.spyOn(manager, "claudeModels").mockResolvedValue([{ value: "shortcut", resolvedModel: "shortcut", resolvedModelKnown: false, displayName: "Shortcut", description: "No native target" }]);
     const launch = vi.spyOn(ProcessTransport.prototype, "launch");
     try {
-      await expect(manager.spawn({ task: "no proof", runner: mode === "unresolved-catalog" ? "claude" : "veda", model: mode === "unresolved-catalog" ? "shortcut" : "cliproxyapi/gpt-6.1-sol", ...(mode === "unresolved-catalog" ? { modelReason: "Named exception to isolate Claude catalog denial #11864" } : {}) })).rejects.toMatchObject({ code: "FABRIC_MODEL_DENIED" });
+      const denial = mode === "unresolved-catalog" && !hasPosixTrustMetadata
+        ? { code: "FABRIC_MODEL_EXCEPTION_DENIED", denial: "model-mismatch" }
+        : { code: "FABRIC_MODEL_DENIED" };
+      await expect(manager.spawn({ task: "no proof", runner: mode === "unresolved-catalog" ? "claude" : "veda", model: mode === "unresolved-catalog" ? "shortcut" : "cliproxyapi/gpt-6.1-sol", ...(mode === "unresolved-catalog" ? { modelReason: "Named exception to isolate Claude catalog denial #11864" } : {}) })).rejects.toMatchObject(denial);
       expect(manager.list()).toEqual([]); expect(launch).not.toHaveBeenCalled(); expect(fs.readdirSync(root)).toEqual([]);
     } finally { launch.mockRestore(); catalog.mockRestore(); }
   });
@@ -641,7 +647,8 @@ describe("resolved manager policy (#11864)", () => {
     try {
       if (model === "VEDA/sonnet") {
         await expect(manager.spawn({ task: "opaque Veda selector", model, modelReason: reason, transport: "process" }))
-          .rejects.toMatchObject({ code: "FABRIC_MODEL_EXCEPTION_DENIED", denial: "model-mismatch" });
+          .rejects.toMatchObject({ code: "FABRIC_MODEL_EXCEPTION_DENIED", denial: hasPosixTrustMetadata ? "model-mismatch" : "untrusted-source" });
+        expect(manager.list()).toEqual([]);
         expect(launch).not.toHaveBeenCalled();
         return;
       }
@@ -1689,7 +1696,10 @@ describe("AgentManager", () => {
           expect(result.text).toBe("startup retry recovered");
           expect(result.model).toBe(inherited ? safeModel : model);
           expect(result.modelReason).toBe(inherited ? undefined : reason);
-          expect(preparePiModel).toHaveBeenLastCalledWith(inherited ? safeModel : model);
+          // Preparation may be cached or refreshed as an exact required pin;
+          // neither call shape may retarget the already admitted model.
+          const expectedModel = inherited ? safeModel : model;
+          expect([[expectedModel], [expectedModel, true]]).toContainEqual(preparePiModel.mock.calls.at(-1));
         }
       } finally { launch.mockRestore(); homedir.mockRestore(); }
     }, 30_000,
@@ -3876,23 +3886,21 @@ describe("AgentManager steering", () => {
     expect(() => manager.compact(result.id)).toThrow(/already finished/);
   });
 
-  it("compact rejects claude-runner children with a clear error", async () => {
+  it("compact rejects non-Pi runner children with a clear error", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-compact-"));
     roots.push(root);
-    const fakeClaude = path.resolve("tests/fixtures/fake-claude.mjs");
     const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents,
-      claude: { ...DEFAULT_FABRIC_CONFIG.agents.claude, model: "claude/haiku" },
+      veda: { ...DEFAULT_FABRIC_CONFIG.agents.veda, backend: "pi" },
     }, {
       rootSessionCwd: () => boundRootRecord.cwd,
-      workerPath: path.resolve("src/worker.ts"),
-      claudeBinary: fakeClaude,
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
       runRoot: root,
     });
     managers.push(manager);
     const handle = await manager.spawn({
-      task: "Initial Claude task",
-      runner: "claude",
-      modelReason: "Named Claude compaction compatibility probe #11864",
+      task: "Initial Veda task",
+      runner: "veda",
+      model: "cliproxyapi/gpt-6.1-sol",
       transport: "process",
       tools: ["read"],
     });

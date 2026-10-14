@@ -820,9 +820,15 @@ describe("fleet model policy (#2490)", () => {
     (state.provider as unknown as { residency: ResidencyClient }).residency = { spawnAgent } as unknown as ResidencyClient;
     const launch = vi.spyOn(ProcessTransport.prototype, "launch");
     try {
+      const unsupportedHost = runner === "claude" && selector === "unknown-runtime-alias" &&
+        (process.platform === "win32" || typeof process.getuid !== "function");
+      // An unknown native alias cannot establish a canonical exception target.
+      const denial = unsupportedHost
+        ? { code: "FABRIC_MODEL_EXCEPTION_DENIED", denial: "model-mismatch" }
+        : { name: "FabricModelDeniedError", code: "FABRIC_MODEL_DENIED" };
       await expect(state.provider.invoke("spawn", { task: "must not submit", residency, transport: "process",
         ...(source === "explicit" ? { model: selector } : {}), modelReason: "#11864 backend denial boundary" }, context))
-        .rejects.toMatchObject({ name: "FabricModelDeniedError", code: "FABRIC_MODEL_DENIED" });
+        .rejects.toMatchObject(denial);
       expect(state.agents.list()).toEqual([]); expect(fs.existsSync(path.join(state.root, "runs"))).toBe(false);
       expect(launch).not.toHaveBeenCalled(); expect(spawnAgent).not.toHaveBeenCalled();
     } finally { launch.mockRestore(); }

@@ -17,13 +17,15 @@ import { typeCheckFabricCode } from "../src/runtime/type-checker.js";
 
 const roots: string[] = [];
 const managers: AgentManager[] = [];
-const hasPosixTrustMetadata = process.platform !== "win32" && typeof process.getuid === "function";
 const trustedExceptionFixturePaths = new Set<string>();
 const realAdmitModelException = AgentManager.prototype.admitModelException;
 let restoreAdmissionFixture: (() => void) | undefined;
 const context = {
   cwd: process.cwd(), signal: undefined, parentToolCallId: "outer", nestedToolCallId: "nested",
-  extensionContext: { modelRegistry: { getAvailable: () => [{ provider: "test", id: "model" }], find: () => undefined } },
+  extensionContext: { modelRegistry: {
+    getAvailable: () => [{ provider: "test", id: "model" }, { provider: "cliproxyapi", id: "gpt-6.1-sol" }],
+    find: (provider: string, id: string) => provider === "cliproxyapi" && id === "gpt-6.1-sol" ? { provider, id } : undefined,
+  } },
   update() {}, activity() {},
 } as unknown as FabricInvocationContext;
 const handle: AgentHandleInfo = {
@@ -169,15 +171,13 @@ describe("provider kernel forwarding", () => {
     expect(spawn).not.toHaveBeenCalled();
   });
 
-  it.each([{ runner: "claude", modelReason: "Test exception for #11864" }, { runner: "veda" }, { extensions: false }])("rejects concrete incompatible durable kernel before contacting resident: %j", async (request) => {
+  it.each([{ runner: "veda", model: "cliproxyapi/gpt-6.1-sol" }, { extensions: false, model: "cliproxyapi/gpt-6.1-sol" }])("rejects concrete incompatible durable kernel before contacting resident: %j", async (request) => {
     const { provider, residency } = setup();
     await expect(provider.invoke("spawn", { task: "task", residency: "durable", kernel: "python", ...request }, context)).rejects.toThrow("Fabric extensions");
     expect(residency.spawnAgent).not.toHaveBeenCalled();
-    if (request.runner !== "claude" || hasPosixTrustMetadata) {
-      await provider.invoke("spawn", { task: "task", residency: "durable", kernel: "inherit", ...request }, context);
-      expect(residency.spawnAgent.mock.calls[0]![0]).not.toHaveProperty("kernel");
-      expect(residency.spawnAgent.mock.calls[0]![0]).not.toHaveProperty("pythonRuntime");
-    }
+    await provider.invoke("spawn", { task: "task", residency: "durable", kernel: "inherit", ...request }, context);
+    expect(residency.spawnAgent.mock.calls[0]![0]).not.toHaveProperty("kernel");
+    expect(residency.spawnAgent.mock.calls[0]![0]).not.toHaveProperty("pythonRuntime");
   });
 
   it.each(["run", "spawn", "create", "handoff"])("rejects invalid direct provider %s calls instead of dropping the selector", async (action) => {

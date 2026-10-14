@@ -562,7 +562,7 @@ describe("agents provider seeds and confinement", () => {
 
   it("refuses seeds without Pi, without a session, or with durable branch forks", async () => {
     const { provider, requests } = createProvider();
-    await expect(provider.invoke("spawn", { task: "x", seed: "branch", runner: "claude", modelReason: "Test exception for #11864" }, context(callerBranch())))
+    await expect(provider.invoke("spawn", { task: "x", seed: "branch", runner: "veda", model: "cliproxyapi/gpt-6.1-sol" }, context(callerBranch())))
       .rejects.toThrow(/requires the Pi runner/);
     await expect(provider.invoke("run", { task: "x", seed: "snippet" }, context(undefined)))
       .rejects.toThrow(/requires a Pi session/);

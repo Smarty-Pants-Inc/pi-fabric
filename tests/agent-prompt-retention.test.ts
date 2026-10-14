@@ -51,6 +51,7 @@ afterEach(async () => {
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   removalIntents.splice(0);
   sweepIntents.splice(0);
+  vi.restoreAllMocks();
   vi.unstubAllEnvs();
 });
 
@@ -263,8 +264,10 @@ describe("Agent prompt retention at manager close (#11663)", () => {
 
   it("hands a closed managed root to the configured one-shot sweep without deleting it", async () => {
     const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "agent-prompt-sweep-")); roots.push(tempRoot);
-    fs.chmodSync(tempRoot, 0o700);
-    vi.stubEnv("PI_FABRIC_TMPDIR", tempRoot);
+    // Match agent-manager-close's private OS-temp fixture; an explicit override
+    // requires a safe Windows volume ancestor, which CI's D:\ does not prove.
+    vi.spyOn(os, "tmpdir").mockReturnValue(tempRoot);
+    vi.stubEnv("PI_FABRIC_TMPDIR", undefined);
     vi.stubEnv("PI_FABRIC_RUN_ROOT", undefined);
     const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, retainRuns: false }, { workerPath });
     managers.push(manager);
@@ -272,6 +275,7 @@ describe("Agent prompt retention at manager close (#11663)", () => {
     const result = await manager.wait(handle.id);
     const taskPath = (manager.status(handle.id) as AgentRunRecord).promptPath!;
     const directory = path.dirname(taskPath), runRoot = path.dirname(directory);
+    expect(path.dirname(runRoot)).toBe(tempRoot);
     await manager.close();
     const owner = JSON.parse(fs.readFileSync(path.join(runRoot, ".fabric-owner.json"), "utf8"));
     expect(owner.closedAt).toBeTypeOf("number");

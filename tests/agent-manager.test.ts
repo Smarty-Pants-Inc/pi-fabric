@@ -224,8 +224,10 @@ describe("Agent prompt retention (#11663)", () => {
 
   it("marks a managed root closed for the configured one-shot sweep age", async () => {
     const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-prompt-sweep-")); roots.push(tempRoot);
-    fs.chmodSync(tempRoot, 0o700);
-    vi.stubEnv("PI_FABRIC_TMPDIR", tempRoot);
+    // Match agent-manager-close's private OS-temp fixture; an explicit override
+    // requires a safe Windows volume ancestor, which CI's D:\ does not prove.
+    const tmpdir = vi.spyOn(os, "tmpdir").mockReturnValue(tempRoot);
+    vi.stubEnv("PI_FABRIC_TMPDIR", undefined);
     vi.stubEnv("PI_FABRIC_RUN_ROOT", undefined);
     try {
       const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, retainRuns: false }, {
@@ -236,6 +238,7 @@ describe("Agent prompt retention (#11663)", () => {
       const result = await manager.wait(handle.id);
       const taskPath = (manager.status(handle.id) as AgentRunRecord).promptPath!;
       const runRoot = path.dirname(path.dirname(taskPath));
+      expect(path.dirname(runRoot)).toBe(tempRoot);
       await manager.close();
       const owner = JSON.parse(fs.readFileSync(path.join(runRoot, ".fabric-owner.json"), "utf8")) as { closedAt?: number };
       expect(owner.closedAt).toBeTypeOf("number");
@@ -251,7 +254,7 @@ describe("Agent prompt retention (#11663)", () => {
         now: result.finishedAt! + DEFAULT_FABRIC_CONFIG.retention.oneShotRunMs + 1,
       });
       expect(swept.removedRuns).toContain(path.dirname(taskPath));
-    } finally { vi.unstubAllEnvs(); }
+    } finally { tmpdir.mockRestore(); vi.unstubAllEnvs(); }
   });
 });
 

@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { writeJsonAtomic } from "../core/atomic-write.js";
+import { verifiedRemove } from "../storage/verified-remove.js";
 import { isFabricThinking, type FabricThinking } from "../thinking.js";
 
 export interface ActorSessionBindingRecord {
@@ -212,13 +213,16 @@ export class ActorBindingStore {
       } catch (error) {
         if (errorCode(error) !== "EEXIST") throw error;
         try {
+          // smarty-dev#8907: the lock directory's stat, captured before its owner record is judged stale; only that
+          // inode is removed. A lock recovered and re-taken by another process meanwhile is refused and kept.
+          const judged = fs.lstatSync(lockPath);
           const firstOwner = fs.readFileSync(ownerPath, "utf8");
           const [, pidText, createdText] = firstOwner.trim().split("\n");
           const stale = Date.now() - Number(createdText) > BINDING_STALE_LOCK_MS;
           if (stale && !processAlive(Number(pidText))) {
             const secondOwner = fs.readFileSync(ownerPath, "utf8");
-            if (secondOwner === firstOwner) {
-              fs.rmSync(lockPath, { recursive: true, force: true });
+            if (secondOwner === firstOwner && verifiedRemove(lockPath, judged, { deleter: "actorBindingLockReclaim",
+              fallback: () => { fs.rmSync(lockPath, { recursive: true, force: true }); return true; } }).removed) {
               continue;
             }
           }
@@ -235,9 +239,12 @@ export class ActorBindingStore {
       return operation();
     } finally {
       try {
+        // smarty-dev#8907: stat captured before the owner judgment; a swapped-in lock is refused and kept.
+        const judged = fs.lstatSync(lockPath);
         const owner = fs.readFileSync(ownerPath, "utf8");
         if (owner.startsWith(`${token}\n`)) {
-          fs.rmSync(lockPath, { recursive: true, force: true });
+          verifiedRemove(lockPath, judged, { deleter: "actorBindingLockRelease",
+            fallback: () => { fs.rmSync(lockPath, { recursive: true, force: true }); return true; } });
         }
       } catch {
         // A recovering process already removed this lock.

@@ -86,7 +86,7 @@ process.stdin.on("data", async (chunk) => {
       if (process.env.FAKE_PI_LOG) {
         fs.appendFileSync(process.env.FAKE_PI_LOG, JSON.stringify({
           history, overflow, session: journal.find((entry) => entry.type === "session")?.id,
-          marker: (task.match(/\b(?:PREFLIGHT_ALWAYS|PREFLIGHT_ON_HISTORY|OVERFLOW_ALWAYS|PROVIDER_OVERFLOW_ON_HISTORY|TOOL_THEN_OVERFLOW_ON_HISTORY|OVERFLOW_ON_HISTORY|SILENT_OVERFLOW|QUOTED_PHRASE|FILL_CONTEXT|[A-Z]+_REVIEW)\b/g) ?? []).join(","),
+          marker: (task.match(/\b(?:PREFLIGHT_ALWAYS|PREFLIGHT_ON_HISTORY|OVERFLOW_ALWAYS|PROVIDER_OVERFLOW_ON_HISTORY|TOOL_THEN_OVERFLOW_ON_HISTORY|OVERFLOW_ON_HISTORY|SILENT_OVERFLOW|QUOTED_PHRASE|FILL_CONTEXT_85|FILL_CONTEXT|[A-Z]+_REVIEW)\b/g) ?? []).join(","),
         }) + "\n");
       }
       append({ role: "user", content: task, timestamp: Date.now() });
@@ -148,7 +148,8 @@ process.stdin.on("data", async (chunk) => {
         if (quoted || providerOverflow) emit({ type: "agent_settled", outcome: "error" });
         continue;
       }
-      const input = task.includes("FILL_CONTEXT") ? Math.floor(WINDOW * 0.9) : 1000;
+      const input = task.includes("FILL_CONTEXT_85") ? Math.floor(WINDOW * 0.85) :
+        task.includes("FILL_CONTEXT") ? Math.floor(WINDOW * 0.9) : 1000;
       const message = { role: "assistant", provider, model: model.id, content: [{ type: "text", text: "verdict: ok" }], stopReason: "stop",
         usage: { input, output: 10, cacheRead: 0, cacheWrite: 0, totalTokens: input + 10 }, timestamp: Date.now() };
       append(message);

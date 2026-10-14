@@ -52,6 +52,13 @@ release. Required: each distinct release of a live Fabric writer (host leases an
 the built-in installed readers (factory) and each --require-reader. --accept-unready NAME,... is the
 only override. The intent is written to <root>/backend-switches.jsonl before the switch; the check
 runs again under the fence right before each flag commit (importing, sqlite), crash reruns included.
+A refusal before the importing commit moves the state.db, -wal and -shm that run created into a reported
+quarantine directory (smarty-dev#9501), through a root directory fd held via /proc/self/fd. Cleanup deletes
+nothing; inspect the quarantine and remove it manually once its contents are not needed. Kept paths are
+reported on stderr and in JSON ("cleanupWarnings", "retained", "reason"). Reasons: quarantined-after-refusal,
+no-held-dir-fd (no working /proc/self/fd: nothing is moved), close-failed (the database close failed: nothing
+is moved), cleanup-failed, not-this-runs-file. Refusal exit 3 is unchanged. Errors (exit 1) keep the files
+so a rerun converges.
 
 --scratch-proof-from STATE_JSON (import only, smarty-dev#9404): a reader's proof step. The CLI itself
 creates a fresh 0700 scratch directory (mkdtemp in --scratch-parent, default the OS temp directory; its
@@ -293,6 +300,8 @@ const makeScratchCopy = (stateJson: string, parent: string | undefined): Scratch
   catch (error) {
     // smarty-dev#9637: no fd (EMFILE, say), so no pin. Remove the directory just made, by name and only while it is
     // still empty (rmdir, never recursive), then surface the open's error.
+    // ponytail: smarty-dev#8907: no judgment, a fresh mkdtemp of ours; assertSafeChain(base) means no other uid can
+    // rename it, and rmdir removes only an empty directory, so a swap cannot cost data.
     const warnings: string[] = [];
     try { fs.rmdirSync(root); }
     catch (cleanup) { warnings.push(`could not remove the scratch directory ${root}: ${(cleanup as Error).message}`); }
@@ -319,12 +328,18 @@ const makeScratchCopy = (stateJson: string, parent: string | undefined): Scratch
  */
 const removeScratch = (scratch: Scratch, warnings: string[]): boolean => {
   try {
+    // ponytail: smarty-dev#8907: no expiry judgment, so no verifiedRemove. Each path starts at `pinned`
+    // (/proc/self/fd/<fd> or /dev/fd/<fd>), so the held fd resolves the parent and a swap of `root` cannot redirect
+    // it. The directory is our fresh 0700 mkdtemp: only this process's copy and import write in it, and rmSync
+    // unlinks a symlink entry rather than following it.
     for (const name of fs.readdirSync(scratch.pinned)) {
       try { fs.rmSync(path.join(scratch.pinned, name), { recursive: true, force: true }); }
       catch (error) { warnings.push(`could not remove ${scratch.root}/${name}: ${(error as Error).message}`); }
     }
     if (!sameScratch(scratch.root, scratch.fd)) warnings.push(`did not remove ${scratch.root}: the path no longer names the scratch directory this process made`);
     else {
+      // ponytail: smarty-dev#8907: rmdir by name right after sameScratch. It removes only an empty directory, and
+      // assertSafeChain bars any other uid from renaming it, so a swap in this window cannot cost data.
       try { fs.rmdirSync(scratch.root); }
       catch (error) { warnings.push(`could not remove the scratch directory ${scratch.root}: ${(error as Error).message}`); }
     }
@@ -593,8 +608,15 @@ export const main = async (argv: string[], io: {
     const refused = error instanceof MeshBackendRefusedError || error instanceof MeshBackendFenceError;
     const message = error instanceof Error ? error.message : String(error);
     if (gate) closeGate(options.root, gate, warn, { ok: false, refused, error: message });
+    // smarty-dev#9501: what a refused import could not remove (the library attaches it to the refusal itself).
+    const carried = (error ?? {}) as { cleanupWarnings?: unknown; retained?: unknown; reason?: unknown };
+    const cleanupWarnings = Array.isArray(carried.cleanupWarnings) ? carried.cleanupWarnings as string[] : [];
+    const cleanup = cleanupWarnings.length === 0 ? {} : { cleanupWarnings, ...(Array.isArray(carried.retained) ? { retained: carried.retained } : {}),
+      ...(typeof carried.reason === "string" ? { reason: carried.reason } : {}) };
+    for (const text of cleanupWarnings) warn(`fabric-mesh-backend: ${text}\n`);
     if (options.json) {
-      write(`${JSON.stringify({ command: options.command, ok: false, refused, code: (error as { code?: unknown }).code, error: message, alarms }, null, 2)}\n`);
+      write(`${JSON.stringify({ command: options.command, ok: false, refused, code: (error as { code?: unknown }).code, error: message,
+        ...cleanup, alarms }, null, 2)}\n`);
     }
     warn(`fabric-mesh-backend: ${options.command} ${refused ? "refused" : "failed"}: ${message}\n`);
     return refused ? 3 : 1;

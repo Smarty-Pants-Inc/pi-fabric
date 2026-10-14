@@ -3873,7 +3873,17 @@ export class AgentManager {
         managed.onOutputPrincipalDowngrade?.();
       }
     }
-    fs.appendFileSync(steerFile, line, { encoding: "utf8", mode: 0o600 });
+    try {
+      fs.appendFileSync(steerFile, line, { encoding: "utf8", mode: 0o600 });
+    } catch (error) {
+      // Terminal cleanup may remove the journal between the preflight and append.
+      // If the receipt won that race, preserve the typed refusal instead of
+      // leaking the native ENOENT through the owner ACK.
+      if ((error as NodeJS.ErrnoException).code === "ENOENT" && this.#observeFinalAnswer(managed) && managed.finalAnswer) {
+        throw this.#terminalError(managed);
+      }
+      throw error;
+    }
     const undelivered = entry.type === "steer" || entry.type === "follow_up"
       ? this.#appendRaceRefusal(managed, messageId, entry.type === "steer" ? "steer" : "followUp") : undefined;
     return {

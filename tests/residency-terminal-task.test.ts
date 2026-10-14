@@ -115,6 +115,42 @@ describe("resident ordinary-task terminal notices", () => {
 
   // Decision C: only the manager's append-race receipt is mocked to pin a resolved
   // run state; the resident host, control planes and sender error are real.
+  it("returns a typed terminal refusal when the append target disappears after final publication", async () => {
+    const f = fixture();
+    const who: MeshIdentity = { id: f.config.rootId, name: "Root sender", kind: "main" };
+    const sender = new FabricControlPlane(new MeshStore(f.config.meshRoot, 65536, 1000), who,
+      { enabled: true, hostId: who.id, pollMs: 20, acknowledgementTimeoutMs: 2000 });
+    let appendSpy: ReturnType<typeof vi.spyOn> | undefined;
+    try {
+      await f.host.start(); sender.start(() => ({ accepted: false }));
+      const task = await f.host.agents.spawn({ task: "HANG", transport: "process" });
+      const run = f.host.agents.runDirectory(task.id)!;
+      const journal = path.join(run, "steer.jsonl");
+      const append = fs.appendFileSync;
+      let receipt: ReturnType<typeof saveFinalAnswerReceipt> | undefined;
+      appendSpy = vi.spyOn(fs, "appendFileSync").mockImplementation(((file: fs.PathOrFileDescriptor, data: string | Uint8Array, options?: fs.WriteFileOptions) => {
+        if (file === journal && !receipt) {
+          const snapshot = JSON.parse(fs.readFileSync(path.join(run, "status.json"), "utf8"));
+          receipt = saveFinalAnswerReceipt(run, task.id, "durable final answer");
+          writeJsonAtomic(path.join(run, "status.json"), { ...snapshot, status: "completed", text: receipt.text,
+            finalAnswerReceipt: { id: receipt.id, recordedAt: receipt.recordedAt }, finishedAt: receipt.recordedAt });
+          const error = new Error("append target disappeared during terminal transition") as NodeJS.ErrnoException;
+          error.code = "ENOENT";
+          throw error;
+        }
+        return append(file, data, options);
+      }) as typeof fs.appendFileSync);
+      await expect(sender.request(f.host.hostId, task.id, "steer", { message: "racing final" }, f.host.identity.id))
+        .rejects.toMatchObject({ code: "FABRIC_TARGET_TERMINAL", deliveryStatus: "undelivered", targetId: task.id,
+          reason: "run-ended", runState: "completed", message: expect.stringContaining("undelivered: task already finished") });
+      expect(receipt).toBeDefined();
+    } finally {
+      appendSpy?.mockRestore(); await sender.close(); await f.host.close();
+    }
+  });
+
+  // Decision C: only the manager's append-race receipt is mocked to pin a resolved
+  // run state; the resident host, control planes and sender error are real.
   it.each(["completed", "failed"] as const)("resident owner carries the real %s run state of an append-race receipt", async runState => {
     const f = fixture();
     const who: MeshIdentity = { id: f.config.rootId, name: "Root sender", kind: "main" };

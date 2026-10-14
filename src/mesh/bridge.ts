@@ -1989,6 +1989,10 @@ export class MeshBridge {
       if (this.#now() < this.#factoryRetryAt) return { forwarded, dropped };
       this.#factoryWaiting = false;
     }
+    // ponytail: a confirmed smaller prefix constrains later speculation in this pass.
+    // All holds stay fresh; even a transient short prefix keeps the remainder small.
+    // The next #forward pass starts at the full batch limit again.
+    let candidateLimit = BRIDGE_BATCH_MAX_EVENTS;
     while (true) {
       const start = cursor.after;
       const startOffset = cursor.offset;
@@ -2009,7 +2013,7 @@ export class MeshBridge {
         if (this.#stopped) return { forwarded, dropped };
         // Batch only a contiguous, already-admitted prefix. Refusals, lapsed authority and
         // legacy peers retain the single-event refresh/refusal path below.
-        if (target.publishBatch && page.events.length - index > 1 && !seen.has(event.id)) {
+        if (target.publishBatch && candidateLimit > 1 && page.events.length - index > 1 && !seen.has(event.id)) {
           if (this.#presenceDue()) {
             await this.syncPresence();
             rules = await authority(false);
@@ -2023,7 +2027,7 @@ export class MeshBridge {
           let spending = 0;
           let spendingBytes = 0;
           let bytes = 0;
-          for (const candidate of page.events.slice(index, index + BRIDGE_BATCH_MAX_EVENTS)) {
+          for (const candidate of page.events.slice(index, index + candidateLimit)) {
             if (candidate.sequence <= cursor.after || seen.has(candidate.id) || this.#refusal(candidate, rules, direction)) break;
             if (direction === "toRemote" && this.options.local.holds && !this.options.local.holds(candidate.to!)) break;
             const data = isObject(candidate.data) ? candidate.data : {};
@@ -2056,6 +2060,7 @@ export class MeshBridge {
                   committed.some(result => !Number.isSafeInteger(result?.sequence) || result.sequence <= 0)) {
                 throw new Error("Invalid bridge batch receipt");
               }
+              candidateLimit = Math.min(candidateLimit, committed.length);
               const spent = spends.slice(0, committed.length).filter((size) => size > 0);
               this.#factoryTokens -= spent.length;
               this.#factoryBytes -= spent.reduce((sum, size) => sum + size, 0);

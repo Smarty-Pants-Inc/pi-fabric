@@ -1,4 +1,7 @@
-import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
+// The local mirror, not the host package: Pi loads this extension as native
+// ESM, where a runtime import of the SDK bypasses Pi's jiti virtual modules
+// and evaluates a second, unbundled SDK copy inside the bundled CLI.
+import { CONFIG_DIR_NAME } from "./agent-dir.js";
 
 // Single source of truth for Fabric's own project state directory. The runtime
 // writes caches and stores there, so mutation-drift detection must read those

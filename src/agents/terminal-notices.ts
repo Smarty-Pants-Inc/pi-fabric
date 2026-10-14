@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { syncPathNamespace } from "../core/atomic-write.js";
-import { readFinalAnswerReceipt, readTaskControlJson, readTaskControlJsonAt, readTaskRunStatus, writeTaskControlJson, removeTaskControlFile, openTaskControlReadFile, openLegacyTaskControlFiles, taskControlFileStat, MAX_TASK_CONTROL_ROWS, taskControlDirectory, withTaskControlDirectory, withTaskControlReadDirectory, visitLegacyTaskControlDirectories, withTaskControlSubdirectory, initializeTaskControlDirectory, withTaskFinalAnswerLock } from "../worker/terminal-answer.js";
+import { readFinalAnswerReceipt, readTaskControlJson, readTaskControlJsonAt, readTaskRunStatus, statDir, writeTaskControlJson, removeTaskControlFile, openTaskControlReadFile, openLegacyTaskControlFiles, taskControlFileStat, MAX_TASK_CONTROL_ROWS, taskControlDirectory, withTaskControlDirectory, withTaskControlReadDirectory, visitLegacyTaskControlDirectories, withTaskControlSubdirectory, initializeTaskControlDirectory, withTaskFinalAnswerLock } from "../worker/terminal-answer.js";
 import { FabricSteerAdmissionLimitError, type AgentTerminalNotice, type AgentUndeliveredMessage, type FabricTargetRunState } from "./terminal-target.js";
 import { followUpFile, releaseFollowUpPayload, settleFollowUp } from "./follow-up-delivery.js";
 import { copyFabricProvenance, type FabricTurnProvenance } from "../fabric-provenance.js";
@@ -120,7 +120,7 @@ export const appendTerminalAdmission = (directory: string, line: string): void =
     (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0), 0o600);
   try {
     requireJournal(fd); fs.appendFileSync(fd, line, "utf8"); fs.fsyncSync(fd);
-    if (created && process.platform !== "win32") fs.fsyncSync(directoryFd);
+    if (created && directoryFd !== undefined && process.platform !== "win32") fs.fsyncSync(directoryFd);
   }
   finally { fs.closeSync(fd); }
 });
@@ -344,8 +344,8 @@ export class TerminalNoticeOutbox {
           }
         } catch { continue; }
         initializeTaskControlDirectory(directory);
-        const identity = withTaskControlDirectory(directory, (_pinned, fd) => {
-          const stat = fs.fstatSync(fd, { bigint: true }); return `${stat.dev}:${stat.ino}`;
+        const identity = withTaskControlDirectory(directory, (pinned, fd) => {
+          const stat = statDir(fd, pinned); return `${stat.dev}:${stat.ino}`;
         });
         this.#routing.add(file); // stable key only; never a retained /proc/self/fd path
         void Promise.resolve().then(() => {
@@ -354,8 +354,8 @@ export class TerminalNoticeOutbox {
           return this.deliver!(notice);
         }).then(() => {
           // Reopen after the async route, and require the original host namespace.
-          withTaskControlDirectory(directory, (_pinned, fd) => {
-            const stat = fs.fstatSync(fd, { bigint: true });
+          withTaskControlDirectory(directory, (pinned, fd) => {
+            const stat = statDir(fd, pinned);
             if (`${stat.dev}:${stat.ino}` !== identity || readFinalAnswerReceipt(directory, receipt.runId)?.id !== receipt.id) throw new Error("Terminal outbox namespace changed during route");
             const current = readTaskControlJson(directory, path.join("terminal-notices", entry));
             if (JSON.stringify(current) !== JSON.stringify(notice)) throw new Error("Terminal notice changed during route");

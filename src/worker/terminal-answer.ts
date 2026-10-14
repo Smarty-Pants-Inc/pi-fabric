@@ -6,7 +6,7 @@ import { debuglog } from "node:util";
 import type { FabricWritePolicy } from "../agents/write-guard.js";
 import { createHash, randomUUID } from "node:crypto";
 import { withExclusiveFileLock } from "../core/atomic-write.js";
-import { openPrivateDir, writeArchiveFile } from "../storage/private-dir.js";
+import { openPrivateDir, privateDirTestHooks, writeArchiveFile } from "../storage/private-dir.js";
 import { assertTaskRunPathUnaliased } from "./task-run-path.js";
 
 export interface FinalAnswerReceipt {
@@ -120,44 +120,56 @@ export const taskControlDirectory = (runDirectory: string): string => {
 };
 export const taskSteerFile = (runDirectory: string): string => path.join(taskControlDirectory(runDirectory), "steer.jsonl");
 
-const withDirectory = <T>(directory: string, privateMode: boolean, operation: (directory: string, fd: number) => T): T => {
-  const before = fs.lstatSync(directory);
+/** Windows cannot open a directory: as openPrivateDir there, use the checked no-follow path (lstat) with no fd. */
+const openDir = (directory: string): number | undefined => (privateDirTestHooks.platform ?? process.platform) === "win32" ? undefined :
+  fs.openSync(directory, fs.constants.O_RDONLY | (fs.constants.O_DIRECTORY ?? 0) | (fs.constants.O_NOFOLLOW ?? 0));
+export const statDir = (fd: number | undefined, directory: string): fs.BigIntStats => {
+  if (fd !== undefined) return fs.fstatSync(fd, { bigint: true });
+  // No held fd: a junction/reparse alias may lstat as a directory, so require realpath equality too.
+  const stat = fs.lstatSync(directory, { bigint: true });
+  if (fs.realpathSync(directory) !== path.resolve(directory)) throw new FabricTaskControlDirectoryError("Task control directory must not traverse a link");
+  return stat;
+};
+const closeDir = (fd: number | undefined): void => { if (fd !== undefined) fs.closeSync(fd); };
+const heldDir = (directory: string, fd: number | undefined) => ({ path: directory, fd, close() {} });
+const withDirectory = <T>(directory: string, privateMode: boolean, operation: (directory: string, fd: number | undefined) => T): T => {
+  const before = fs.lstatSync(directory, { bigint: true });
   if (before.isSymbolicLink() || fs.realpathSync(directory) !== path.resolve(directory)) throw new FabricTaskControlDirectoryError("Task control directory must not traverse a link");
-  const fd = fs.openSync(directory, fs.constants.O_RDONLY | (fs.constants.O_DIRECTORY ?? 0) | (fs.constants.O_NOFOLLOW ?? 0));
+  const fd = openDir(directory);
   try {
-    const stat = fs.fstatSync(fd);
-    if (!stat.isDirectory() || stat.dev !== before.dev || stat.ino !== before.ino || (process.getuid && stat.uid !== process.getuid()) ||
-        (process.platform !== "win32" && (stat.mode & (privateMode ? 0o077 : 0o022)) !== 0)) {
+    const stat = statDir(fd, directory);
+    if (!stat.isDirectory() || stat.dev !== before.dev || stat.ino !== before.ino || (process.getuid && stat.uid !== BigInt(process.getuid())) ||
+        (process.platform !== "win32" && (stat.mode & (privateMode ? 0o077n : 0o022n)) !== 0n)) {
       throw new FabricTaskControlDirectoryError("Task control directory must be an owned private directory");
     }
     // Paths through a held fd are synchronous-only; never retain one for an ACK.
-    return operation(process.platform === "linux" ? `/proc/self/fd/${fd}` : directory, fd);
-  } finally { fs.closeSync(fd); }
+    return operation(pinnedPath(fd, directory), fd);
+  } finally { closeDir(fd); }
 };
 /** Strict WRITE/lock namespace. A reader never creates or repairs this sibling. */
-export const withTaskControlDirectory = <T>(runDirectory: string, operation: (directory: string, fd: number) => T): T =>
+export const withTaskControlDirectory = <T>(runDirectory: string, operation: (directory: string, fd: number | undefined) => T): T =>
   withDirectory(taskControlDirectory(runDirectory), true, operation);
 
 /** Check every intermediate directory too, not only the no-follow file leaf. */
-const withControlPath = <T>(directory: string, relative: string, create: boolean, operation: (file: string, parent: string, fd: number) => T): T => {
+const withControlPath = <T>(directory: string, relative: string, create: boolean, operation: (file: string, parent: string, fd: number | undefined) => T): T => {
   const parts = relative.split(/[\\/]/);
   if (path.isAbsolute(relative) || parts.some(part => !part || part === "." || part === "..")) throw new FabricTaskControlDirectoryError("Invalid task control relative path");
   const walk = (parent: string, index: number): T => {
-    const fd = fs.openSync(index === 0 ? parent + path.sep + "." : parent, fs.constants.O_RDONLY | (fs.constants.O_DIRECTORY ?? 0) | (fs.constants.O_NOFOLLOW ?? 0));
+    const opened = index === 0 ? parent + path.sep + "." : parent, fd = openDir(opened);
     try {
-      const stat = fs.fstatSync(fd);
-      if (!stat.isDirectory() || (process.getuid && stat.uid !== process.getuid()) || (process.platform !== "win32" && (stat.mode & 0o022))) {
+      const stat = statDir(fd, opened);
+      if (!stat.isDirectory() || (process.getuid && stat.uid !== BigInt(process.getuid())) || (process.platform !== "win32" && (stat.mode & 0o022n))) {
         throw new FabricTaskControlDirectoryError("Unsafe task control subdirectory");
       }
-      const pinned = process.platform === "linux" ? `/proc/self/fd/${fd}` : parent;
+      const pinned = pinnedPath(fd, parent);
       if (index === parts.length - 1) return operation(path.join(pinned, parts[index]!), pinned, fd);
       const child = path.join(pinned, parts[index]!);
       if (create) {
-        try { fs.mkdirSync(child, { mode: 0o700 }); fs.chmodSync(child, 0o700); if (process.platform !== "win32") fs.fsyncSync(fd); }
+        try { fs.mkdirSync(child, { mode: 0o700 }); fs.chmodSync(child, 0o700); fsyncFd(fd); }
         catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
       }
       return walk(child, index + 1);
-    } finally { fs.closeSync(fd); }
+    } finally { closeDir(fd); }
   };
   return walk(directory, 0);
 };
@@ -168,7 +180,7 @@ const entryExists = (entry: string): boolean => {
 const centralExists = (runDirectory: string): boolean => entryExists(taskControlDirectory(runDirectory));
 const oldSiblingExists = (runDirectory: string): boolean => entryExists(legacyTaskControlSibling(runDirectory));
 /** Old sibling-v1 directory shape check (archive discovery only); NEVER a read source. */
-const withOldSibling = <T>(runDirectory: string, operation: (directory: string, fd: number) => T): T =>
+const withOldSibling = <T>(runDirectory: string, operation: (directory: string, fd: number | undefined) => T): T =>
   withDirectory(legacyTaskControlSibling(runDirectory), true, operation);
 export const readTaskRunStatus = <T>(runDirectory: string): T => withDirectory(path.resolve(runDirectory), false,
   directory => JSON.parse(readBoundedControlFile(path.join(directory, "status.json"), 1024 * 1024)) as T);
@@ -206,16 +218,16 @@ const parseBinding = (text: string): BindingV2 => {
   if (value.snapshot !== null) return unsafe("Non-null legacy snapshot binding is not supported; refusing (bytes preserved)");
   return value as unknown as BindingV2;
 };
-const pinnedPath = (fd: number, fallback: string): string => process.platform === "linux" ? `/proc/self/fd/${fd}` : fallback;
+const pinnedPath = (fd: number | undefined, fallback: string): string => fd !== undefined && process.platform === "linux" ? `/proc/self/fd/${fd}` : fallback;
 /** Open a protected private child directory under a held parent; check exact identity. */
-const openHeldChild = (parent: string, name: string, expected?: Identity): number => {
-  const fd = fs.openSync(path.join(parent, name), fs.constants.O_RDONLY | (fs.constants.O_DIRECTORY ?? 0) | (fs.constants.O_NOFOLLOW ?? 0));
+const openHeldChild = (parent: string, name: string, expected?: Identity): number | undefined => {
+  const child = path.join(parent, name), fd = openDir(child);
   try {
-    const stat = fs.fstatSync(fd, { bigint: true });
+    const stat = statDir(fd, child);
     if (!stat.isDirectory() || (process.getuid && stat.uid !== BigInt(process.getuid())) || (process.platform !== "win32" && (stat.mode & 0o077n) !== 0n) ||
         (expected && !sameId(identityOf(stat), expected))) unsafe("Protected task control directory identity mismatch");
     return fd;
-  } catch (error) { fs.closeSync(fd); throw error; }
+  } catch (error) { closeDir(fd); throw error; }
 };
 const runIdentity = (runDirectory: string): Identity => identityOf(fs.lstatSync(path.resolve(runDirectory), { bigint: true }));
 const fsyncFd = (fd: number | undefined): void => { if (fd !== undefined && process.platform !== "win32") fs.fsyncSync(fd); };
@@ -265,7 +277,7 @@ export const taskControlReadDirectory = (runDirectory: string): string => {
   withLegacyTaskControlDirectories(runDirectory, () => undefined);
   return taskControlDirectory(runDirectory);
 };
-export const withTaskControlReadDirectory = <T>(runDirectory: string, operation: (directory: string, fd: number) => T): T => {
+export const withTaskControlReadDirectory = <T>(runDirectory: string, operation: (directory: string, fd: number | undefined) => T): T => {
   const selected = taskControlReadDirectory(runDirectory);
   return selected === path.resolve(runDirectory) ? withDirectory(selected, false, operation) : withTaskControlDirectory(runDirectory, operation);
 };
@@ -312,12 +324,12 @@ const publishCentral = (runDirectory: string, build: (stage: string) => BindingV
         const binding = build(stage);
         const bytes = Buffer.from(JSON.stringify(binding));
         if (bytes.length > MAX_TASK_CONTROL_BYTES) unsafe("Task control binding exceeds its byte bound");
-        if (!writeArchiveFile({ path: stage, fd: stageFd, close() {} }, BINDING, { bytes }, true)) unsafe("Refusing unsafe binding publication");
+        if (!writeArchiveFile(heldDir(stage, stageFd), BINDING, { bytes }, true)) unsafe("Refusing unsafe binding publication");
         fsyncFd(stageFd);
         if (!sameId(binding, runIdentity(runDirectory))) unsafe("Run identity changed during task control publication");
         if (entryExists(path.join(root.path, base))) unsafe("Task control destination appeared during publication");
         fs.renameSync(path.join(root.path, stageName), path.join(root.path, base));
-      } finally { fs.closeSync(stageFd); }
+      } finally { closeDir(stageFd); }
       fsyncFd(root.fd);
     });
   } finally { root.close(); }
@@ -357,25 +369,25 @@ export const createHostTaskRun = (runDirectory: string): void => {
   // ancestry, then exclusively allocate only the run leaf through the held parent.
   openPrivateDir(parent, parent).close();
   const allocated = withDirectory(parent, false, (held, parentFd): Identity => {
-    const target = path.join(held, leaf);
+    const target = path.join(held, leaf), heldParent = identityOf(statDir(parentFd, held));
     try { fs.mkdirSync(target, { mode: 0o700 }); }
     catch (error) {
       if ((error as NodeJS.ErrnoException).code === "EEXIST") unsafe("Run directory already exists; exclusive host allocation refused");
       throw error;
     }
     fs.chmodSync(target, 0o700);
-    const leafFd = fs.openSync(target, fs.constants.O_RDONLY | (fs.constants.O_DIRECTORY ?? 0) | (fs.constants.O_NOFOLLOW ?? 0));
+    const leafFd = openDir(target);
     try {
-      const created = fs.fstatSync(leafFd, { bigint: true });
+      const created = statDir(leafFd, target);
       if (!created.isDirectory() || (process.getuid && created.uid !== BigInt(process.getuid()))) unsafe("Allocated run is not an owned directory");
       fsyncFd(parentFd);
-      if (!sameId(identityOf(fs.fstatSync(parentFd, { bigint: true })), identityOf(fs.lstatSync(parent, { bigint: true })))) {
+      if (!sameId(heldParent, identityOf(fs.lstatSync(parent, { bigint: true })))) {
         unsafe("Run parent changed during exclusive host allocation");
       }
       const identity = identityOf(created);
       if (!sameId(identity, runIdentity(run))) unsafe("Named run does not match the exclusively allocated directory");
       return identity;
-    } finally { fs.closeSync(leafFd); }
+    } finally { closeDir(leafFd); }
   });
   createHostTaskControlDirectory(run, allocated);
 };
@@ -405,7 +417,7 @@ export const writeTaskControlJson = (runDirectory: string, relative: string, val
     withControlPath(directory, relative, true, (_file, parent, fd) => {
       const bytes = Buffer.from(JSON.stringify(value));
       if (bytes.length > MAX_TASK_CONTROL_BYTES) throw new FabricTaskControlDirectoryError("Task control file exceeds its byte bound");
-      if (!writeArchiveFile({ path: parent, fd, close() {} }, path.basename(relative), { bytes }, true)) {
+      if (!writeArchiveFile(heldDir(parent, fd), path.basename(relative), { bytes }, true)) {
         throw new FabricTaskControlDirectoryError("Refusing replacement of unsafe task control file");
       }
     }));
@@ -502,7 +514,7 @@ const readBoundedControlFile = (file: string, maxBytes: number): string => {
     return Buffer.concat(chunks, bytes).toString("utf8");
   } finally { fs.closeSync(fd); }
 };
-export const withTaskControlSubdirectory = <T>(directory: string, relative: string, operation: (directory: string, fd: number) => T): T =>
+export const withTaskControlSubdirectory = <T>(directory: string, relative: string, operation: (directory: string, fd: number | undefined) => T): T =>
   withControlPath(directory, path.join(relative, ".entry"), false, (_file, parent, fd) => operation(parent, fd));
 /** The returned FILE fd remains valid after the directory callback closes; no fd path escapes. */
 export const openLegacyTaskControlFile = (runDirectory: string, relative: string): number | undefined =>
@@ -610,7 +622,7 @@ export const saveFinalAnswerReceipt = (runDirectory: string, runId: string, text
         fs.renameSync(temporary, file); // no serialization, payload read or fsync under this lock
         return true;
       });
-      if (process.platform !== "win32") fs.fsyncSync(directoryFd);
+      fsyncFd(directoryFd);
       const result = published ? receipt : readReceipt(directory, runId, runDirectory);
       if (!result) throw new Error("Invalid or mismatched final-answer receipt already exists");
       return result;

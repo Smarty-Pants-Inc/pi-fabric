@@ -11,7 +11,7 @@ import { recoverActorRunArchives } from "../actors/child-completions.js";
 import { recoverEnodevTaskRun } from "../agents/enodev-recovery.js";
 import { copyFabricProvenance } from "../fabric-provenance.js";
 import { readTerminalControl } from "../worker/terminal-controls.js";
-import { readFinalAnswerReceipt, openTaskControlFile, MAX_TASK_CONTROL_BYTES, isTaskControlDirectoryEntry, legacyTaskControlSibling, taskControlDirectory, taskControlReadDirectory, withTaskControlDirectory, withTaskControlReadDirectory, withLegacyTaskControlDirectories } from "../worker/terminal-answer.js";
+import { readFinalAnswerReceipt, openTaskControlFile, statDir, MAX_TASK_CONTROL_BYTES, isTaskControlDirectoryEntry, legacyTaskControlSibling, taskControlDirectory, taskControlReadDirectory, withTaskControlDirectory, withTaskControlReadDirectory, withLegacyTaskControlDirectories } from "../worker/terminal-answer.js";
 import { MAX_STEER_CONTROLS, MAX_STEER_BYTES, MAX_STEER_ENTRY_BYTES, readTerminalAdmission, terminalAdmissionFromEntry, terminalControlMatchesAdmission, terminalSenderMatches, type TerminalAdmission } from "../agents/terminal-notices.js";
 
 export const FABRIC_RUN_ROOT_PREFIX = "pi-fabric-runs-";
@@ -329,7 +329,7 @@ const terminalArtifactDirectories = new Set(["terminal-controls", "terminal-noti
 /** A refusal journal is not a sender route receipt. Unconsumed admissions need
  * their own settled tracked follow-up or delivered notice; unsafe artifacts veto. */
 const safeTerminalArtifacts = (root: string, expired: Deadline): boolean => withTaskControlReadDirectory(root, (selected, fd) => {
-  const runStat = ownedStat(root) ? fs.lstatSync(root, { bigint: true }) : undefined, selectedStat = fs.fstatSync(fd, { bigint: true });
+  const runStat = ownedStat(root) ? fs.lstatSync(root, { bigint: true }) : undefined, selectedStat = statDir(fd, selected);
   if (!runStat) return false;
   // The shared read selector holds the run itself ONLY for an unmarked pre-v2 run;
   // judge its raw artifacts read-only with no protected layers (queued still vetoes).

@@ -6,7 +6,7 @@ import type { MeshStore } from "../mesh/store.js";
 import { pruneActorRunArchives, pruneActorSessionBackups } from "../storage/retention.js";
 import { closeDirectory, openPrivateDir, writeArchiveFile, type PrivateDirectory } from "../storage/private-dir.js";
 import { MAX_STEER_BYTES, MAX_STEER_ENTRY_BYTES, terminalAdmissionFromEntry, terminalControlMatchesAdmission, terminalSenderMatches, type TerminalAdmission } from "../agents/terminal-notices.js";
-import { MAX_FINAL_ANSWER_BYTES, MAX_TASK_CONTROL_BYTES, MAX_TASK_CONTROL_ROWS, createArchiveTaskControlDirectory, isTaskControlDirectoryEntry, legacyTaskControlSibling, openTaskControlFile, readFinalAnswerReceipt, readTaskRunStatus, taskControlDirectory, withLegacyTaskControlDirectories, withTaskControlDirectory, withTaskControlReadDirectory, withTaskControlSubdirectory } from "../worker/terminal-answer.js";
+import { MAX_FINAL_ANSWER_BYTES, MAX_TASK_CONTROL_BYTES, MAX_TASK_CONTROL_ROWS, createArchiveTaskControlDirectory, isTaskControlDirectoryEntry, legacyTaskControlSibling, openTaskControlFile, readFinalAnswerReceipt, readTaskRunStatus, statDir, taskControlDirectory, withLegacyTaskControlDirectories, withTaskControlDirectory, withTaskControlReadDirectory, withTaskControlSubdirectory } from "../worker/terminal-answer.js";
 import type { FabricActorMessage } from "./types.js";
 
 const controlFiles = new Set(["steer.jsonl", "final-answer.json"]);
@@ -107,7 +107,7 @@ const archiveControls = (runDirectory: string): Map<string, Buffer> | undefined 
   if (!run.isDirectory() || named.isSymbolicLink() || named.dev !== run.dev || named.ino !== run.ino) throw new Error("Archive run directory changed while held");
   withTaskControlReadDirectory(runDirectory, (selected, selectedFd) => {
     // Protected-only: the raw run (or any non-central selection) is never authority.
-    const held = fs.fstatSync(selectedFd, { bigint: true });
+    const held = statDir(selectedFd, selected);
     if (!central || held.dev === run.dev && held.ino === run.ino) throw new Error("Unprotected archive control selection");
     // Chronological: in-run, then sibling, then central. Journals append
     // oldest first; an overlay pairs older queued debt with newer delivery.
@@ -236,7 +236,7 @@ const writeArchivedControls = (dest: string, anchor: string, controls: Map<strin
       assertArchiveRunIdentity(dest, run);
       for (const [relative, bytes] of controls) {
         const parent = path.dirname(relative);
-        const write = (at: string, parentFd: number): void => {
+        const write = (at: string, parentFd: number | undefined): void => {
           if (!writeArchiveFile({ path: at, fd: parentFd, close() {} }, path.basename(relative), { bytes }, true)) throw new Error(`Unsafe archive control ${relative}`);
         };
         if (parent === ".") write(directory, fd);
@@ -246,8 +246,8 @@ const writeArchivedControls = (dest: string, anchor: string, controls: Map<strin
           withTaskControlSubdirectory(directory, parent, write);
         }
       }
-      if (process.platform !== "win32") fs.fsyncSync(fd);
-      const named = fs.lstatSync(taskControlDirectory(dest)), opened = fs.fstatSync(fd);
+      if (fd !== undefined && process.platform !== "win32") fs.fsyncSync(fd);
+      const named = fs.lstatSync(taskControlDirectory(dest), { bigint: true }), opened = statDir(fd, directory);
       if (named.dev !== opened.dev || named.ino !== opened.ino) throw new Error("Archive controls changed while held");
       assertArchiveRunIdentity(dest, run);
       syncDirectoryChain(taskControlDirectory(dest));

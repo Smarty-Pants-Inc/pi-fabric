@@ -15,9 +15,10 @@ import {
 const WRONG_LAST_SEQUENCE = 10071;
 const STREAM_NOT_FOUND = 10059;
 // @nats-io/nats-core 3.4 names NoRespondersError "NoResponders". JetStream wraps a RequestError (whose
-// cause is that transport error) in JetStreamNotEnabled, so classification must inspect only a short cause chain.
+// cause is that transport error) in JetStreamNotEnabled; only those known wrappers may pass through classification.
 const TRANSIENT = new Set(["TimeoutError", "NoResponders", "ConnectionError", "RequestError", "ClosedConnectionError"]);
-const PERMANENT_TRANSPORT = new Set(["AuthorizationError", "UserAuthenticationExpiredError", "PermissionViolationError", "AuthenticationError", "PermissionError"]);
+const PERMANENT_TRANSPORT = new Set(["AuthorizationError", "UserAuthenticationExpiredError", "PermissionViolationError", "AuthenticationError", "PermissionError", "ProtocolError"]);
+const OPAQUE_WRAPPERS = new Set(["JetStreamNotEnabled", "RequestError"]);
 const READ_RETRY_ATTEMPTS = 3;
 const STREAM_ADD_ATTEMPTS = 3;
 const READ_RETRY_DELAY_MS = 100;
@@ -34,26 +35,27 @@ const isTransientReadError = (error: unknown): boolean => {
   let current: unknown = error;
   const seen = new Set<object>();
   let transport = false;
-  for (let depth = 0; depth < 8 && current instanceof Error; depth++) {
-    if (PERMANENT_TRANSPORT.has(current.name)) return false;
+  for (let depth = 0; depth < 8; depth++) {
+    if (!(current instanceof Error)) return false;
+    if (seen.has(current) || PERMANENT_TRANSPORT.has(current.name)) return false;
+    seen.add(current);
+    const cause = (current as Error & { cause?: unknown }).cause;
     if (current instanceof JetStreamApiError) {
       try {
         const api = current.apiError();
         if (api.err_code === 10039) return false; // JetStreamNotEnabledForAccount is permanent, not election transience.
-        if (api.code === 503) transport = true;
-      } catch { /* malformed API errors are not retried */ }
-    }
-    if (current.name === "RequestError") {
-      const cause = (current as Error & { cause?: unknown }).cause;
-      if (cause instanceof Error && TRANSIENT.has(cause.name) && cause.name !== "RequestError") transport = true;
-    } else if (TRANSIENT.has(current.name)) {
+        if (api.code !== 503) return false; // Non-503 JetStream API errors are permanent.
+        transport = true;
+      } catch { return false; } // malformed API errors are not retried
+    } else if (TRANSIENT.has(current.name) && current.name !== "RequestError") {
       transport = true;
+    } else if (!OPAQUE_WRAPPERS.has(current.name) && current.name !== "JetStreamApiError" && !TRANSIENT.has(current.name)) {
+      return false;
     }
-    if (seen.has(current)) return false;
-    seen.add(current);
-    current = (current as Error & { cause?: unknown }).cause;
+    if (cause === undefined || cause === null) return transport;
+    current = cause;
   }
-  return transport;
+  return false; // The chain did not end within the fixed inspection bound.
 };
 const retryTransientRead = async <T>(operation: () => Promise<T>, attempts = READ_RETRY_ATTEMPTS): Promise<T> => {
   for (let attempt = 1; ; attempt++) {
@@ -110,17 +112,37 @@ export const connectJetStream = async (servers: string[], options: ConnectJetStr
     let info = current;
     if (info?.cluster?.leader) return info;
     for (;;) {
-      try {
-        info = await retryTransientRead(() => jsm.streams.info(stream));
-        if (info.cluster?.leader) return info;
-      } catch (error) {
-        if (!isTransientReadError(error)) throw error;
+      if (deadline - Date.now() <= 0) {
+        throw new MeshStateNatsBusyError(`stream ${stream} had no elected leader after ${STREAM_LEADER_TIMEOUT_MS}ms`);
       }
       const remaining = deadline - Date.now();
       if (remaining <= 0) {
         throw new MeshStateNatsBusyError(`stream ${stream} had no elected leader after ${STREAM_LEADER_TIMEOUT_MS}ms`);
       }
-      await new Promise<void>(resolve => setTimeout(resolve, Math.min(STREAM_LEADER_POLL_MS, remaining)));
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const outcome = await Promise.race([
+        jsm.streams.info(stream).then(
+          value => ({ kind: "info" as const, value }),
+          error => ({ kind: "error" as const, error }),
+        ),
+        new Promise<{ kind: "deadline" }>(resolve => {
+          timer = setTimeout(() => resolve({ kind: "deadline" }), remaining);
+        }),
+      ]).finally(() => { if (timer !== undefined) clearTimeout(timer); });
+      if (outcome.kind === "deadline") {
+        throw new MeshStateNatsBusyError(`stream ${stream} had no elected leader after ${STREAM_LEADER_TIMEOUT_MS}ms`);
+      }
+      if (outcome.kind === "error") {
+        if (!isTransientReadError(outcome.error)) throw outcome.error;
+      } else {
+        info = outcome.value;
+        if (Date.now() < deadline && info.cluster?.leader) return info;
+      }
+      const afterRequest = deadline - Date.now();
+      if (afterRequest <= 0) {
+        throw new MeshStateNatsBusyError(`stream ${stream} had no elected leader after ${STREAM_LEADER_TIMEOUT_MS}ms`);
+      }
+      await new Promise<void>(resolve => setTimeout(resolve, Math.min(STREAM_LEADER_POLL_MS, afterRequest)));
     }
   };
   return guardNatsPort({

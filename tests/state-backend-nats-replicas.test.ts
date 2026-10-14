@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { inspect } from "node:util";
+import { ProtocolError } from "@nats-io/nats-core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // Stream replicas: omitted values come only from the agent-dir fabric.json reader (default 1); explicit values still
@@ -9,7 +10,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 // Options are passed through wide variables so assertions remain behavioral across the old option types.
 const fake = vi.hoisted(() => {
   class FakeJetStreamApiError extends Error {
-    constructor(readonly errCode: number, readonly statusCode = 404) { super(`fake JetStream API error ${errCode}`); this.name = "JetStreamApiError"; }
+    constructor(readonly errCode: number, readonly statusCode = 404, options?: ErrorOptions) { super(`fake JetStream API error ${errCode}`, options); this.name = "JetStreamApiError"; }
     apiError() { return { code: this.statusCode, err_code: this.errCode, description: "stream not found" }; }
   }
   type StreamInfo = { config: Record<string, unknown> & { name: string; subjects?: string[] }; state: { last_seq: number; first_seq: number }; cluster?: { leader?: string } };
@@ -19,6 +20,7 @@ const fake = vi.hoisted(() => {
     log: [] as { op: string; args: unknown[] }[],
     managerErrors: [] as unknown[],
     infoErrors: [] as unknown[],
+    infoDelays: [] as number[],
     messageErrors: [] as unknown[],
     consumerErrors: [] as unknown[],
     consumerOptions: [] as unknown[],
@@ -84,7 +86,12 @@ vi.mock("@nats-io/jetstream", () => ({
     streams: {
       info: async (name: string) => {
         fake.log.push({ op: "info", args: [name] });
-        if (fake.infoErrors.length > 0) throw fake.infoErrors.shift();
+        const delay = fake.infoDelays.shift() ?? 0;
+        if (delay > 0) await new Promise<void>(resolve => setTimeout(resolve, delay));
+        if (fake.infoErrors.length > 0) {
+          const error = fake.infoErrors.shift();
+          if (error !== undefined) throw error;
+        }
         const stream = fake.streams.get(name);
         if (!stream) throw new fake.FakeJetStreamApiError(10059);
         const result = structuredClone(stream);
@@ -176,6 +183,7 @@ beforeEach(() => {
   fake.log.length = 0;
   fake.managerErrors.length = 0;
   fake.infoErrors.length = 0;
+  fake.infoDelays.length = 0;
   fake.messageErrors.length = 0;
   fake.consumerErrors.length = 0;
   fake.consumerOptions.length = 0;
@@ -215,6 +223,44 @@ describe("NATS client read resilience (pure fakes)", () => {
 
   it("preserves transient JetStream API 503 retry handling", async () => {
     fake.managerErrors.push(new fake.FakeJetStreamApiError(0, 503), new fake.FakeJetStreamApiError(0, 503));
+    const port = await connectJetStream(SERVERS, withReplicas(1));
+    expect(fake.log.filter(entry => entry.op === "managerInfo")).toHaveLength(3);
+    await port.close();
+  });
+
+  it("treats non-503 JetStream API errors as permanent even when they wrap NoResponders", async () => {
+    fake.managerErrors.push(new fake.FakeJetStreamApiError(0, 500, { cause: fake.wrappedTransient() }));
+    await expect(connectJetStream(SERVERS, withReplicas(1))).rejects.toThrow();
+    expect(fake.log.filter(entry => entry.op === "managerInfo")).toHaveLength(1);
+  });
+
+  it("does not retry a 503 that wraps the installed protocol-error class name", async () => {
+    const protocol = new ProtocolError("protocol violation");
+    fake.managerErrors.push(new fake.FakeJetStreamApiError(0, 503, { cause: protocol }));
+    await expect(connectJetStream(SERVERS, withReplicas(1))).rejects.toThrow();
+    expect(fake.log.filter(entry => entry.op === "managerInfo")).toHaveLength(1);
+    expect(fake.drains).toBe(1);
+  });
+
+  it("fails closed when an authorization cause is beyond the eight-link bound", async () => {
+    let cause: Error = Object.assign(new Error("authorization denied"), { name: "AuthorizationError" });
+    for (let index = 0; index < 9; index++) cause = Object.assign(new Error("JetStream wrapper"), { name: "JetStreamNotEnabled", cause });
+    fake.managerErrors.push(new fake.FakeJetStreamApiError(0, 503, { cause }));
+    await expect(connectJetStream(SERVERS, withReplicas(1))).rejects.toThrow();
+    expect(fake.log.filter(entry => entry.op === "managerInfo")).toHaveLength(1);
+  });
+
+  it("fails closed on a cyclic cause chain", async () => {
+    const cycle = Object.assign(new Error("JetStream wrapper"), { name: "JetStreamNotEnabled" }) as Error & { cause?: unknown };
+    cycle.cause = cycle;
+    fake.managerErrors.push(new fake.FakeJetStreamApiError(0, 503, { cause: cycle }));
+    await expect(connectJetStream(SERVERS, withReplicas(1))).rejects.toThrow();
+    expect(fake.log.filter(entry => entry.op === "managerInfo")).toHaveLength(1);
+  });
+
+  it("retries wrapped NoResponders under API 503 at most three times and recovers", async () => {
+    fake.managerErrors.push(new fake.FakeJetStreamApiError(0, 503, { cause: fake.wrappedTransient() }),
+      new fake.FakeJetStreamApiError(0, 503, { cause: fake.wrappedTransient() }));
     const port = await connectJetStream(SERVERS, withReplicas(1));
     expect(fake.log.filter(entry => entry.op === "managerInfo")).toHaveLength(3);
     await port.close();
@@ -335,6 +381,47 @@ describe("NATS stream replicas: real client ensureStream (pure fakes)", () => {
     const port = await connectJetStream(SERVERS, withReplicas(3));
     await expect(port.ensureStream(STREAM, SUBJECTS, { maxMsgSize: 1024 * 1024 })).resolves.toEqual({ lastSeq: 7, maxMsgSize: 1024 * 1024 });
     expect(fake.log.filter(entry => entry.op === "info")).toHaveLength(3);
+  });
+
+  it("rejects a leader that arrives after two slow INFO requests consume the 10-second deadline", async () => {
+    seedStream(STREAM, 3, SUBJECTS);
+    fake.leaderPolls = 1;
+    fake.infoDelays.push(0, 5_000, 5_000);
+    fake.infoErrors.push(undefined, Object.assign(new Error("timeout"), { name: "TimeoutError" }));
+    vi.useFakeTimers();
+    try {
+      const port = await connectJetStream(SERVERS, withReplicas(3));
+      const result = port.ensureStream(STREAM, SUBJECTS, { maxMsgSize: 1024 * 1024 }).then(() => undefined, error => error);
+      await vi.advanceTimersByTimeAsync(5_000);
+      await vi.advanceTimersByTimeAsync(100);
+      await vi.advanceTimersByTimeAsync(4_900);
+      const error = await result;
+      expect(error).toBeInstanceOf(MeshStateNatsBusyError);
+      expect(fake.log.filter(entry => entry.op === "info")).toHaveLength(3); // initial lookup + two deadline-bounded polls
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("stops starting leader INFO requests when repeated five-second timeouts exhaust the deadline", async () => {
+    seedStream(STREAM, 3, SUBJECTS);
+    fake.leaderPolls = 1;
+    fake.infoDelays.push(0, 5_000, 5_000);
+    fake.infoErrors.push(undefined, Object.assign(new Error("timeout"), { name: "TimeoutError" }),
+      Object.assign(new Error("timeout"), { name: "TimeoutError" }));
+    vi.useFakeTimers();
+    try {
+      const port = await connectJetStream(SERVERS, withReplicas(3));
+      const result = port.ensureStream(STREAM, SUBJECTS, { maxMsgSize: 1024 * 1024 }).then(() => undefined, error => error);
+      await vi.advanceTimersByTimeAsync(5_000);
+      await vi.advanceTimersByTimeAsync(100);
+      await vi.advanceTimersByTimeAsync(4_900);
+      const error = await result;
+      expect(error).toBeInstanceOf(MeshStateNatsBusyError);
+      expect(fake.log.filter(entry => entry.op === "info")).toHaveLength(3);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("waits for a leader after creating a replicated stream", async () => {

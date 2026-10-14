@@ -8,6 +8,7 @@ import { AgentManager } from "../src/agents/manager.js";
 import { checkWritePolicyRequest, resolveChildWritePolicy } from "../src/agents/child-env.js";
 import { completionRecipientFromRun } from "../src/agents/completion-journal.js";
 import { normalizeAgentRunRequest } from "../src/agents/request.js";
+import { residentRoot } from "../src/residency/protocol.js";
 import type { AgentRunRequest } from "../src/agents/types.js";
 import { DEFAULT_FABRIC_CONFIG, normalizeFabricConfig } from "../src/config.js";
 import { AGENTS_ACTION_DESCRIPTORS } from "../src/providers/agents-actions.js";
@@ -23,7 +24,7 @@ afterEach(async () => {
   await Promise.all(managers.splice(0).map(manager => manager.close()));
   vi.unstubAllEnvs();
 });
-const fixture = (placement = false, overlap?: "option" | "environment" | "equal" | "alias") => {
+const fixture = (placement = false, overlap?: "option" | "environment" | "equal" | "alias" | "resident") => {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "fabric-task-write-")));
   const cwd = path.join(root, "work");
   fs.mkdirSync(cwd);
@@ -61,6 +62,7 @@ const [mode,id]=process.argv.slice(2); if(mode==='launch'){const dir=path.join($
     } } }).agents.placement;
   }
   let runRoot = path.join(overlap ? cwd : root, FABRIC_RUN_ROOT_PREFIX + "write-scope");
+  if (overlap === "resident") runRoot = path.join(residentRoot(path.join(cwd, ".pi", "fabric", "mesh"), "session:write-scope"), "runs");
   if (overlap === "equal") runRoot = cwd;
   if (overlap === "alias") {
     fs.mkdirSync(runRoot);
@@ -109,13 +111,20 @@ describe("local process task write default", () => {
       .toEqual([expect.objectContaining({ type: "write_policy.default", policy: value.policy, warning: expect.stringContaining("Shell writes are unconfined") })]);
   });
 
-  it.each(["option", "environment", "equal", "alias"] as const)("refuses a default launch when the %s host run root overlaps cwd before admission", async source => {
+  it.each(["option", "environment", "equal", "resident"] as const)("keeps the %s overlapping layout unscoped and logs the relocation notice once", async source => {
     const f = fixture(false, source);
-    await expect(f.manager.spawn({ task: "must not launch", transport: "process" })).rejects.toMatchObject({
-      name: "AgentWriteRootOverlapError", code: "FABRIC_AGENT_WRITE_ROOT_OVERLAP", launchOutcome: "unlaunched",
-      writableRoot: f.cwd, runRoot: source === "equal" ? f.cwd : path.join(f.cwd, FABRIC_RUN_ROOT_PREFIX + "write-scope"),
-      message: expect.stringContaining("contains host-owned run root"),
-    });
+    const { result, value } = await report(f, { residency: "durable" });
+    expect(value.policy).toBeNull();
+    expect(value.tmpdir).toBeNull();
+    expect(value.args["--write-policy"]).toBeUndefined();
+    expect(value.probes.map((probe: { allowed: boolean }) => probe.allowed)).toEqual([true, true]);
+    expect(f.events(result.id).filter(event => event.type.startsWith("write_policy.")))
+      .toEqual([expect.objectContaining({ type: "write_policy.default_overlap_unconfined", warning: expect.stringContaining("smarty-dev#11705") })]);
+  });
+
+  it.skipIf(process.platform === "win32" || process.getuid?.() === 0)("still refuses an unsafe symlinked host run root in an overlapping layout", async () => {
+    const f = fixture(false, "alias");
+    await expect(f.manager.spawn({ task: "must not launch", transport: "process" })).rejects.toThrow("symbolic link or not a directory");
     expect(f.manager.listForUi()).toEqual([]);
   });
 

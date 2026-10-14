@@ -107,6 +107,7 @@ import type { AgentRunRouteMetadata } from "./types.js";
 import { WorktreeManager, type AgentWorktreeResult } from "./worktree-manager.js";
 import { writeForkSession, writeHandoffSession } from "./handoff.js";
 import {
+  AgentWriteRootOverlapError,
   assertDefaultTaskWriteRoots,
   checkWritePolicyRequest,
   readAgentLineage,
@@ -1395,11 +1396,20 @@ export class AgentManager {
     const defaultTaskWritePolicy = !hostedAdapter && (transport === "auto" || transport === "process") &&
       !request.actorId && !request.actorName && !request.residentStartupProbe &&
       !requestsWritePolicy(request) && this.#parentWritePolicy === undefined;
+    // Existing resident layouts keep main's unscoped behavior until #11705 relocates
+    // their host runs outside cwd. Explicit and inherited policies stay unchanged.
+    let defaultWriteScopeOverlap: AgentWriteRootOverlapError | undefined;
+    const defaultWriteScopeFits = (cwd: string): boolean => {
+      try { assertDefaultTaskWriteRoots(this.#runRoot, [cwd]); return true; }
+      catch (error) {
+        if (!(error instanceof AgentWriteRootOverlapError)) throw error;
+        defaultWriteScopeOverlap = error;
+        return false;
+      }
+    };
     // Runners without write-policy support keep their historical behavior; log the gap below.
-    const applyTaskWriteDefault = defaultTaskWritePolicy && capabilities.writePolicy;
-    // Before admission/host records, reject a cwd grant over the host run root.
-    // Worktrees get their effective cwd below; explicit policies remain caller choices.
-    if (applyTaskWriteDefault && !request.worktree) assertDefaultTaskWriteRoots(this.#runRoot, [selectedCwd]);
+    let applyTaskWriteDefault = defaultTaskWritePolicy && capabilities.writePolicy &&
+      (Boolean(request.worktree) || defaultWriteScopeFits(selectedCwd));
     const confined = applyTaskWriteDefault ||
       (requestsWritePolicy(request) && request.writePolicy !== "unrestricted") || this.#parentWritePolicy !== undefined;
     if (confined && !capabilities.writePolicy) {
@@ -1570,6 +1580,7 @@ export class AgentManager {
 
       try {
         if (worktree && worktreeSetup?.trim()) await this.#worktrees.setup(id, worktreeSetup);
+        if (applyTaskWriteDefault && worktree) applyTaskWriteDefault = defaultWriteScopeFits(agentCwd);
         const tmpdir = applyTaskWriteDefault ? path.join(runDirectory, "tmp") : undefined;
         if (tmpdir) mkdirPrivate(tmpdir, this.#trustRoot());
         const writePolicy = capabilities.writePolicy
@@ -1584,7 +1595,10 @@ export class AgentManager {
           }) + "\n", { mode: 0o600 });
         };
         if (request.writePolicy === "unrestricted") auditWritePolicy("write_policy.unrestricted");
-        else if (defaultTaskWritePolicy && !applyTaskWriteDefault) {
+        else if (defaultWriteScopeOverlap) {
+          auditWritePolicy("write_policy.default_overlap_unconfined",
+            `smarty-dev#11705: cwd ${defaultWriteScopeOverlap.writableRoot} contains host-owned run root ${defaultWriteScopeOverlap.runRoot}; no implicit write scope is imposed on this layout (accepted residual smarty-dev#11308).`);
+        } else if (defaultTaskWritePolicy && !applyTaskWriteDefault) {
           auditWritePolicy("write_policy.unsupported", `${runnerAdapter.label} does not enforce task write roots; launch remains unrestricted.`);
         }
         let dispositionLogged = false;

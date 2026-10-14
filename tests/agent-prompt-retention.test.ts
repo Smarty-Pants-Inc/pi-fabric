@@ -148,7 +148,9 @@ describe("Agent prompt retention at manager close (#11663)", () => {
       expect(launchSpy).not.toHaveBeenCalled();
       expect(processAlive(pid), "checked ESRCH for the captured primary").toBe(false);
       expect(removalIntents.filter(target => target === directory || target.startsWith(directory + path.sep))).toEqual([directory]);
-      expect(removalIntents.filter(target => target === failedDirectory || target.startsWith(failedDirectory + path.sep))).toEqual([]);
+      expect(removalIntents).not.toContain(failedDirectory);
+      expect(removalIntents).not.toContain(failedTask);
+      expect(removalIntents).not.toContain(path.join(failedDirectory, "status.json"));
       expect(fs.readFileSync(failedTask, "utf8")).toBe(prompt);
       expect(savedStatus(failedTask)).toMatchObject({ status: "failed", promptSha256: hash(prompt) });
     } finally {

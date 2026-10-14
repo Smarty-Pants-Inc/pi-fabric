@@ -223,8 +223,11 @@ try {
     json(path.join(evidence, 'parent-state.json'), state);
     const run = path.join(runs, handle.id);
     const record = readJson(path.join(run, 'status.json'));
-    const receipt = readJson(path.join(run, 'final-answer.json'));
+    const control = run + '.ctl';
+    const receipt = readJson(path.join(control, 'final-answer.json'));
     fs.cpSync(run, path.join(evidence, 'run'), { recursive: true });
+    if (expectTerminal) assert(fs.statSync(control).isDirectory(), 'Candidate host-control tree missing');
+    if (fs.existsSync(control)) fs.cpSync(control, path.join(evidence, 'run.ctl'), { recursive: true });
     const notices = (messages?.messages ?? messages ?? []).filter(message => message.customType === 'pi-fabric-target-terminal' || message.details?.code === 'FABRIC_TARGET_TERMINAL');
     const nativeProcesses = readJson(path.join(evidence, 'native-processes-at-stream.json'));
     const taskProcesses = nativeProcesses.filter(p => p.pid !== activeParent.child.pid);
@@ -259,7 +262,7 @@ try {
       assert.equal(notice.details.delivery, 'steer');
       assert.equal(notice.details.finalAnswerReceiptId, receipt.id);
       assert.equal(notice.details.sender?.id, handle.spawner.id, 'Refusal lost original sender identity');
-      assert.equal(readJson(path.join(run, 'terminal-controls', `${steer.messageId}.json`))?.state, 'refused', 'Native terminal-control custody was not settled refused');
+      assert.equal(readJson(path.join(control, 'terminal-controls', `${steer.messageId}.json`))?.state, 'refused', 'Native terminal-control custody was not settled refused');
     } else if (scenario === 'final') {
       assert(checks.markerExists, 'Baseline must ACTUALLY execute forbidden source write, not just admit steer');
       assert(childCalls > 1, 'Baseline must ACTUALLY issue resumed native provider requests');
@@ -269,7 +272,7 @@ try {
       assert(childCalls > 1, 'Intermediate task must continue after toolUse');
       assert.equal(result.text, finalText);
       assert.equal(notices.filter(message => message.details?.messageId === steer.messageId).length, 0, 'Intermediate control was falsely declared terminal');
-      if (expectTerminal) assert.equal(readJson(path.join(run, 'terminal-controls', `${steer.messageId}.json`))?.state, 'delivered', 'Native context never consumed valid intermediate control');
+      if (expectTerminal) assert.equal(readJson(path.join(control, 'terminal-controls', `${steer.messageId}.json`))?.state, 'delivered', 'Native context never consumed valid intermediate control');
     }
     if (checks.markerExists) fs.cpSync(path.join(cwd, 'src'), path.join(evidence, 'native-source-writes'), { recursive: true });
     json(path.join(evidence, 'scenario-result.json'), { scenario, checks, handle, steer, result, late, receipt, notices, markerContent: checks.markerExists ? fs.readFileSync(marker, 'utf8') : null });

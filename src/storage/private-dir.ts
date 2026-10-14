@@ -242,7 +242,7 @@ export const openPrivateDir = (directory: string, anchor?: string): PrivateDirec
   const target = path.resolve(directory);
   const platform = privateDirTestHooks.platform ?? process.platform;
   if (platform === "win32") {
-    fs.mkdirSync(target, { recursive: true });
+    fs.mkdirSync(target, { recursive: true, mode: 0o700 });
     return { path: target, fd: undefined, close: () => undefined };
   }
   const root = anchor === undefined ? undefined : path.resolve(anchor);

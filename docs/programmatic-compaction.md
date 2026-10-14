@@ -205,11 +205,11 @@ await agents.compact({ id: handle.id, instructions: "Keep the finding list." });
 return await agents.wait({ id: handle.id });
 ```
 
-- Fabric appends the request to the same `<runDir>/steer.jsonl` channel as
+- Fabric appends the request to the same `<runDir>.ctl/steer.jsonl` channel as
   `agents.steer`. The orchestrator, or any peer through the mesh relay, can
   request a child compaction without stopping or respawning the child, and the
   child keeps its accumulated context.
-- The worker tails `steer.jsonl` and never forwards compact during an active
+- The worker tails `<runDir>.ctl/steer.jsonl` and never forwards compact during an active
   child turn. It waits for `agent_settled`, then sends
   `{"id":"...","type":"compact","customInstructions":"..."}`, with the
   instructions field omitted when absent. See pi's [RPC `compact`](https://github.com/earendil-works/pi-coding-agent/blob/main/docs/rpc.md).

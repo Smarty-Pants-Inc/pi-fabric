@@ -209,6 +209,33 @@ describe("host-owned task controls", () => {
     warning.mockRestore(); remove.mockRestore();
   });
 
+  it("refuses a foreign control-directory owner even for an otherwise private directory", () => {
+    if (!process.getuid) return;
+    const s = fixture(), inode = fs.statSync(s.control).ino, stat = fs.fstatSync;
+    const owner = vi.spyOn(fs, "fstatSync").mockImplementation(((...args: Parameters<typeof fs.fstatSync>) => {
+      const value = stat(...args);
+      if (value.isDirectory() && String(value.ino) === String(inode)) return Object.assign(Object.create(Object.getPrototypeOf(value)), value, { uid: process.getuid!() + 1 });
+      return value;
+    }) as typeof fs.fstatSync);
+    expect(() => readTaskControlFile(s.run, "missing.json")).toThrow(/owned private directory/);
+    owner.mockRestore(); expect(readTaskControlFile(s.run, "missing.json")).toBeUndefined();
+  });
+
+  it("Windows-mode creation on POSIX still creates private Fabric controls, without weakening existing-directory validation", async () => {
+    if (!process.getuid) return; // Windows has no POSIX uid/mode contract.
+    const { mkdirPrivate } = await import("../src/storage/private-dir.js");
+    const s = fixture(), run = path.join(s.root, "emulated-run"), control = taskControlDirectory(run);
+    fs.mkdirSync(run);
+    const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+    try { Object.defineProperty(process, "platform", { ...platform, value: "win32" }); mkdirPrivate(control); }
+    finally { Object.defineProperty(process, "platform", platform); }
+    expect(fs.statSync(control).mode & 0o777).toBe(0o700);
+    expect(readTaskControlFile(run, "missing.json")).toBeUndefined();
+    const bad = path.join(s.root, "replaced-run"); fs.mkdirSync(bad); fs.mkdirSync(taskControlDirectory(bad), { mode: 0o755 });
+    expect(() => readTaskControlFile(bad, "missing.json")).toThrow(/owned private directory/);
+    expect(fs.statSync(taskControlDirectory(bad)).mode & 0o777).toBe(0o755); // never silently heal replaced controls
+  });
+
   it("pairs ctl with run cleanup in a dry run; neither fixture is removed", () => {
     const s = fixture(); writeJsonAtomic(path.join(s.run, "status.json"), { id: "run", status: "completed" });
     expect(removeUnreferencedRun(s.run, fs.statSync(s.run), undefined, true)).toBe(true);

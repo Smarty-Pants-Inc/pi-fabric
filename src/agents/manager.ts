@@ -15,9 +15,11 @@ import type { FabricKernel } from "../runtime/kernel.js";
 import fs from "node:fs";
 import { spawn, execFileSync } from "node:child_process";
 import os from "node:os";
+import { debuglog } from "node:util";
 import { fabricDataRoot } from "../storage/temp-root.js";
 import path from "node:path";
 import { mkdirPrivate } from "../storage/private-dir.js";
+const taskControlDebug = debuglog("pi-fabric:task-control");
 import { fileURLToPath } from "node:url";
 import { assertFabricModelAllowed, FabricModelDeniedError } from "../core/model-policy.js";
 import { readChildToolAllowlist } from "../core/child-tool-allowlist.js";
@@ -854,6 +856,7 @@ export class AgentManager {
   readonly #onAdmissionAlarm: ((alarm: AgentAdmissionAlarm) => void) | undefined;
   #admissionAlarmAt: number | undefined;
   readonly #terminalNoticeOutbox: TerminalNoticeOutbox;
+  #unconfinedControlOverlapLogged = false;
   readonly #followUps = new Map<string, Map<string, AgentFollowUpDelivery>>();
   readonly #followUpTimers = new Map<string, NodeJS.Timeout>();
   readonly #onChildQuestion:
@@ -3583,6 +3586,16 @@ export class AgentManager {
     for (const root of roots) {
       const writable = physical(root), target = physical(control);
       if (target === writable || target.startsWith(writable + path.sep)) {
+        if (!policy) {
+          // #11308: an unconfined same-uid child can reach host files anywhere;
+          // relocating them cannot add isolation. Explicit/inherited policy
+          // still requires this host authority outside all child write grants.
+          if (!this.#unconfinedControlOverlapLogged) {
+            this.#unconfinedControlOverlapLogged = true;
+            taskControlDebug(`unconfined task control directory overlaps ${root}; accepted residual smarty-dev#11308`);
+          }
+          return;
+        }
         throw new FabricTaskControlDirectoryError(`Task control directory ${control} overlaps writable root ${root}; choose a runRoot outside task write grants`);
       }
     }

@@ -249,10 +249,25 @@ describe("steer/followUp after an ordinary Pi task's final answer", () => {
 
   it("fails launch closed with a typed error when the ctl sibling overlaps the task cwd", async () => {
     const { manager, root, launch } = harness();
-    await expect(manager.spawn({ task: "unsafe custom root", transport: "process", cwd: root })).rejects.toMatchObject({
+    await expect(manager.spawn({ task: "unsafe custom root", transport: "process", cwd: root, writableRoots: [root] })).rejects.toMatchObject({
       name: "FabricTaskControlDirectoryError", code: "FABRIC_TASK_CONTROL_UNSAFE", message: expect.stringContaining("overlaps writable root"),
     });
     expect(launch).not.toHaveBeenCalled();
+  });
+
+  it("allows default unconfined tasks with runs under cwd, keeping Fabric-owned private control directories", async () => {
+    const h = harness();
+    const first = await h.manager.spawn({ task: "legitimate unconfined layout", transport: "process", cwd: h.root });
+    h.finish(first.id, "done"); h.close(first.id); await h.manager.wait(first.id, { timeoutMs: 1000 });
+    const second = await h.manager.spawn({ task: "same owner next run", transport: "process", cwd: h.root });
+    await waitUntil(() => h.launch.mock.calls.length === 2);
+    expect(h.launch).toHaveBeenCalledTimes(2);
+    for (const id of [first.id, second.id]) {
+      const stat = fs.statSync(taskControlDirectory(path.join(h.root, id)));
+      if (process.getuid) expect(stat.uid).toBe(process.getuid());
+      if (process.platform !== "win32") expect(stat.mode & 0o777).toBe(0o700);
+    }
+    h.finish(second.id, "done"); h.close(second.id); await h.manager.close();
   });
 
   it("allows a trusted parent run to contain its child's control sibling outside the child's own grants", async () => {

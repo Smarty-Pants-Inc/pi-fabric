@@ -3530,10 +3530,12 @@ export class ActorManager {
     // A synchronous resolver (the resident owner) rejects a hidden model here, so the caller
     // learns at once. A resolver that may refresh the registry is async: #drain resolves the
     // model again when the activation runs, and enqueue stays synchronous (smarty-dev#1830).
-    // Resolve only supplied overrides. In owner-defaults mode, adding the
-    // current session thinking here would persist a synthetic override and shadow
-    // a later owner default when drain layers the queued binding.
-    const resolving = unresolved.model ? this.#resolvedRunBinding(actor, unresolved) : unresolved;
+    // Check against current owner effort without making it a queued override.
+    // Foreign resolved bindings must not borrow the owner's private defaults.
+    const ownerThinking = options.binding === undefined ? this.#runBinding(actor).thinking : undefined;
+    const resolving = unresolved.model ? this.#resolvedRunBindingFor(
+      actor.runner, unresolved, actor.routeClass !== undefined, false, `actor:${actor.name}`, ownerThinking,
+    ) : unresolved;
     const binding = resolving instanceof Promise ? (resolving.catch(() => undefined), unresolved) : resolving;
     const sender = options.sender === null ? undefined : options.sender ?? processSender();
     const createdAt = Date.now();
@@ -7200,6 +7202,7 @@ export class ActorManager {
     requiredPin = false,
     policyOnly = false,
     role?: string,
+    ownerThinking?: FabricThinking,
   ): FabricActorRunBinding | Promise<FabricActorRunBinding> {
     const reason = binding.modelReason ?? binding.opusReason;
     const source = binding.modelSource ?? (requiredPin ? "route" : binding.model ? "explicit" : "default");
@@ -7207,7 +7210,7 @@ export class ActorManager {
     const resolve = (key: string): string | Promise<string> => this.#resolvedModel(runner, key, requiredPin);
     const admit = (model: string | undefined): FabricActorRunBinding | Promise<FabricActorRunBinding> => {
       const admission = this.agents.resolveModelReasonPolicy(model, reason, runner, {
-        modelSource: source, thinking: binding.thinking, requiredPin,
+        modelSource: source, thinking: binding.thinking ?? ownerThinking, requiredPin,
         resolveFallback: key => this.#resolvedModel(runner, key, true),
         ...(role !== undefined ? { role } : {}),
       });
@@ -7217,7 +7220,7 @@ export class ActorManager {
           // into a model override. Only a policy substitution must freeze it.
           ...(admitted.model && (binding.model || admitted.fallback) ? { model: admitted.model } : {}),
           ...(reason !== undefined ? { modelReason: reason } : {}),
-          ...(admitted.thinking ? { thinking: admitted.thinking } : {}) };
+          ...(admitted.thinking && (binding.thinking !== undefined || admitted.fallback) ? { thinking: admitted.thinking } : {}) };
         delete result.opusReason;
         if (admitted.fallback) {
           delete result.modelReason;

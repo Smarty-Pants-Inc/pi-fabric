@@ -65,7 +65,7 @@ describe("placement import/registration/idle boundary", () => {
   it("normalizes literal shared roots and rejects roots that cannot safely prove affinity", () => {
     const shared = root();
     expect(normalizeAgentPlacement({ ...raw(), sharedMounts: [shared, path.join(shared, ".")] })?.sharedMounts).toEqual([shared]);
-    for (const sharedMounts of [[path.parse(shared).root], ["relative/root"], [`${shared}\\ncontrol`], ["/literal/{cwd}"]]) {
+    for (const sharedMounts of [[path.parse(shared).root], ["relative/root"], [`${shared}\ncontrol`], ["/literal/{cwd}"]]) {
       expect(() => normalizeAgentPlacement({ ...raw(), sharedMounts })).toThrow("sharedMounts");
     }
   });

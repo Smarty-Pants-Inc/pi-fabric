@@ -40,14 +40,17 @@ const failure = (host: string, reason: string): AgentInputError => new AgentInpu
 const query = (executable: string, argv: string[], deadline: number, environment: NodeJS.ProcessEnv, signal?: AbortSignal, input?: string): Promise<{ stdout: string; stderr: string; code: number | null }> =>
   new Promise((resolve, reject) => {
     if (signal?.aborted || Date.now() >= deadline) { reject(new Error("Preflight cancelled or deadline expired")); return; }
-    const child = spawn(executable, argv, { env: environment, detached: process.platform !== "win32", stdio: "pipe" });
+    const options = { env: environment, detached: process.platform !== "win32" };
+    const child = input
+      ? spawn(executable, argv, { ...options, stdio: "pipe" })
+      : spawn(executable, argv, { ...options, stdio: ["ignore", "pipe", "pipe"] });
     let stdout = "", stderr = "", error: Error | undefined;
     const terminate = (reason: string): void => {
       error ??= new Error(reason);
       if (child.pid && process.platform !== "win32") {
         try { process.kill(-child.pid, "SIGKILL"); } catch { /* Native close remains the receipt. */ }
       } else child.kill("SIGKILL");
-      child.stdin.destroy(); child.stdout.destroy(); child.stderr.destroy();
+      child.stdin?.destroy(); child.stdout.destroy(); child.stderr.destroy();
     };
     const timer = setTimeout(() => terminate("Preflight deadline expired"), Math.max(1, deadline - Date.now()));
     const abort = (): void => terminate("Preflight cancelled");
@@ -56,12 +59,17 @@ const query = (executable: string, argv: string[], deadline: number, environment
     child.stdout.on("data", (part: string) => { stdout += part; if (stdout.length > 1_000_000) terminate("Preflight output too large"); });
     child.stderr.on("data", (part: string) => { stderr += part; if (stderr.length > 1_000_000) terminate("Preflight output too large"); });
     child.on("error", cause => { error = cause; });
-    child.stdin.on("error", cause => { error ??= cause; });
+    child.stdout.on("error", cause => { error ??= cause; });
+    child.stderr.on("error", cause => { error ??= cause; });
+    child.stdin?.on("error", cause => {
+      // A fast query may close stdin before consuming input; its output and exit remain authoritative.
+      if ((cause as NodeJS.ErrnoException).code !== "EPIPE") error ??= cause;
+    });
     child.once("close", code => {
       clearTimeout(timer); signal?.removeEventListener("abort", abort);
       if (error) reject(error); else resolve({ stdout, stderr, code });
     });
-    child.stdin.end(input ?? "");
+    child.stdin?.end(input);
     if (signal?.aborted) abort();
   });
 

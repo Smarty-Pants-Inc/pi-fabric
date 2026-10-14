@@ -22,6 +22,7 @@ function fixture(options: { candidates?: string[]; pickerExit?: number; sshExit?
     "import sys",
     "args = sys.argv",
     "if '--probe' in args: sys.exit(0)",
+    "sys.stdin.read()",
     "count_at = args.index('--admit') + 3",
     "requires = int(args[count_at])",
     "paths = args[count_at + 1:count_at + 1 + requires]",

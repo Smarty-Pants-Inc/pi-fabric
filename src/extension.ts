@@ -850,8 +850,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     const events = inboxEventsToQueue(inbox, pendingMessages);
     if (options.commitOnly) return;
     if (!events.length) return;
-    deliverRootInbox(pi, events);
-    for (const event of events) queuedRootInboxIds.set(event.id, rootInboxTurn);
+    for (const id of deliverRootInbox(pi, events)) queuedRootInboxIds.set(id, rootInboxTurn);
   };
   const stopInboxWake = (): void => {
     if (inboxWake.timer) clearInterval(inboxWake.timer);
@@ -881,7 +880,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
       await reportInboxExpiry(pi, inbox);
       // A turn that started meanwhile takes the pending batch at its own start: never a second run.
       if (inbox?.events.length && idle()) {
-        await deliverRootInbox(pi, inbox.events);
+        for (const id of deliverRootInbox(pi, inbox.events)) queuedRootInboxIds.set(id, rootInboxTurn);
         return;
       }
       // Records: the same gate, re-checked after the read (F21).
@@ -1609,10 +1608,16 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     if (!inbox) return;
     const events = inboxEventsToQueue(inbox);
     if (!events.length) return;
-    for (const event of events) queuedRootInboxIds.set(event.id, rootInboxTurn);
-    // Only capable Pi consumes nextTurn after hooks; legacy Pi needs the hook result.
-    if (!fabricProvenanceSupported(pi)) return { message: rootInboxMessage(events) };
-    await deliverRootInbox(pi, events, { deliverAs: "nextTurn", triggerTurn: false });
+    // Only capable Pi consumes nextTurn after hooks; legacy Pi needs the hook result. Lease
+    // only actual rows, never the overflow summary, so withheld work is eligible next turn.
+    if (!fabricProvenanceSupported(pi)) {
+      const message = rootInboxMessage(events);
+      for (const id of message.details.ids) queuedRootInboxIds.set(id, rootInboxTurn);
+      return { message };
+    }
+    for (const id of deliverRootInbox(pi, events, { deliverAs: "nextTurn", triggerTurn: false })) {
+      queuedRootInboxIds.set(id, rootInboxTurn);
+    }
   });
 
   // An inbox message that entered a turn is consumed (R-token-waste): its events are never

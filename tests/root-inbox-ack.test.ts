@@ -221,18 +221,19 @@ describe("the context hook shows each inbox event to the model once (smarty-dev#
 });
 
 describe("filterRootInboxContext (smarty-dev#8962)", () => {
-  it("cuts repeated events from a batch, including summarized ones, and keeps its count honest", () => {
+  it("cuts repeated shown events while keeping withheld overflow eligible in a later copy", () => {
     const event = (n: number) => ({ id: `ev-${n}`, sequence: 100 + n, topic: TOPIC, kind: "report", from: peer,
       text: `body ${n}`, createdAt: 1_700_000_000_000 + n, data: {} }) as unknown as MeshEvent;
-    // Ten events: eight shown, two summarized in the overflow line.
+    // Ten events: eight shown and two withheld for a later bounded injection; only shown ids deduplicate.
     const first = { role: "custom", ...rootInboxMessage(Array.from({ length: 10 }, (_, n) => event(n))), timestamp: 1 };
     const later = { role: "custom", ...rootInboxMessage([event(3), event(9), event(20)]), timestamp: 2 };
     const result = filterRootInboxContext([first, reply("ok"), later], { acked: () => false, compactedCopies: () => new Map() });
+    expect(first.details.ids).toEqual(Array.from({ length: 8 }, (_, n) => `ev-${n}`));
     expect(result.messages[0]).toBe(first);
-    expect(result.messages[2]).toMatchObject({ details: { ids: ["ev-20"] } });
-    expect(text([result.messages[2]])).toMatch(/^<fabric-inbox count="1">/);
+    expect(result.messages[2]).toMatchObject({ details: { ids: ["ev-9", "ev-20"] } });
+    expect(text([result.messages[2]])).toMatch(/^<fabric-inbox count="2">/);
     expect(shown(result.messages, "ev-3")).toBe(1);
-    expect(shown(result.messages, "ev-9")).toBe(0);
+    expect(shown(result.messages, "ev-9")).toBe(1);
     expect(shown(result.messages, "ev-20")).toBe(1);
   });
 });

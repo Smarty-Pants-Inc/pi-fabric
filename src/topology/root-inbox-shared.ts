@@ -22,8 +22,8 @@ const AGENT_MESSAGE_CUSTOM_TYPE = "pi-fabric-agent-message";
 export const INBOX_HORIZON_MS = 2 * 60 * 60_000;
 /**
  * One injection (R-token-waste): at most this many events are rendered in full, with at most this
- * much event text in total and per event; every further event of the batch is summarized in one
- * line. A 20-event batch was ~15k tokens per turn; the budget keeps one injection near 3k.
+ * much event text in total and per event. Action events bypass the row/total-text limits, but
+ * retain the per-event cap. Overflow remains pending; a summary is never a delivery receipt.
  */
 export const INBOX_INJECT_MAX_EVENTS = 8;
 export const INBOX_INJECT_MAX_TEXT_BYTES = 12 * 1024;
@@ -36,7 +36,7 @@ export interface RootInboxEvent extends MeshEvent {
 
 export interface RootInboxBatch {
   events: RootInboxEvent[];
-  /** The sequence the cursor moves to once these events are in the session. */
+  /** End of the contiguous durable prefix; priority lookahead may include higher sequences. */
   through: number;
   /** Expired addressed shadows skipped in this drain, never delivered as work. */
   skippedStale?: number;
@@ -302,17 +302,35 @@ const bounded = (text: string, sequence: number): string => {
   return `${cut}\n[cut at ${INBOX_INJECT_EVENT_TEXT_BYTES} bytes; read the whole event with mesh.read({ after: ${sequence - 1}, limit: 1 })]`;
 };
 
-/** Split one injection into the events rendered in full and the overflow summarized in one line. */
+/** Shared internally with priority lookahead; ordinary durable admission stays bounded. */
+export const ROOT_INBOX_ACTION_KINDS = new Set(["blocked", "blocker", "ask", "handoff"]);
+const INBOX_PRIORITY = ["blocked", "blocker", "ask", "handoff", "done", "wait", "answer", "info", "progress", "status", "ack"];
+export const compareRootInboxEvents = (a: MeshEvent, b: MeshEvent): number => {
+  // Scheduled waits only enter the mesh once due. Keep the legacy completion spelling with done.
+  const rank = (kind: string): number => {
+    const index = INBOX_PRIORITY.indexOf(kind === "completion" ? "done" : kind);
+    return index < 0 ? INBOX_PRIORITY.length : index;
+  };
+  return rank(a.kind) - rank(b.kind) || a.createdAt - b.createdAt || a.sequence - b.sequence;
+};
+
+/** Overflow is withheld work, not a receipt. All action rows retain their per-event text cap. */
 export const rootInboxBudget = (events: readonly MeshEvent[]): { shown: MeshEvent[]; overflow: MeshEvent[] } => {
-  const shown: MeshEvent[] = [];
+  const shown: MeshEvent[] = [], overflow: MeshEvent[] = [];
   let bytes = 0;
-  for (const event of events) {
+  let full = false;
+  for (const event of [...events].sort(compareRootInboxEvents)) {
     const size = Math.min(Buffer.byteLength(event.text ?? ""), INBOX_INJECT_EVENT_TEXT_BYTES);
-    if (shown.length >= INBOX_INJECT_MAX_EVENTS || (shown.length > 0 && bytes + size > INBOX_INJECT_MAX_TEXT_BYTES)) break;
+    if (!ROOT_INBOX_ACTION_KINDS.has(event.kind) &&
+      (full || shown.length >= INBOX_INJECT_MAX_EVENTS || (shown.length > 0 && bytes + size > INBOX_INJECT_MAX_TEXT_BYTES))) {
+      full = true;
+      overflow.push(event);
+      continue;
+    }
     shown.push(event);
     bytes += size;
   }
-  return { shown, overflow: events.slice(shown.length) };
+  return { shown, overflow };
 };
 
 const overflowLine = (events: readonly MeshEvent[]): string => {
@@ -321,7 +339,7 @@ const overflowLine = (events: readonly MeshEvent[]): string => {
   const senders = [...new Set(events.map((event) => event.from.name || event.from.id))];
   const from = senders.slice(0, 3).map((name) => JSON.stringify(name)).join(", ") + (senders.length > 3 ? ` and ${senders.length - 3} more` : "");
   return `<overflow count="${events.length}">+${events.length} more addressed event(s) not shown (sequence ${first}-${last}, from ${escapeXml(from)}); ` +
-    `they count as delivered and will not be injected again; read them with mesh.read({ after: ${first - 1}, limit: ${last - first + 1} }) if you need them.</overflow>`;
+    `${events.length} more pending, shown next turn.</overflow>`;
 };
 
 /** A single passive summary, never stale event bodies or a batch of work to act on. */
@@ -333,7 +351,8 @@ export const rootInboxSummary = (batch: RootInboxBatch) => ({
 });
 /**
  * The one message that brings a batch into the session. Without an explicit `overflow`, the batch
- * is cut to the injection budget itself; every event id (shown or summarized) is in details.
+ * is cut to the injection budget itself. Only shown event ids/receipts enter details: an overflow
+ * summary neither acknowledges work nor prevents that work from being shown on the next turn.
  */
 export const rootInboxMessage = (input: readonly MeshEvent[], extra?: readonly MeshEvent[]) => {
   // A re-read shadow can repeat an event id; the carrier names each event once (smarty-dev#5518).
@@ -363,9 +382,7 @@ export const rootInboxMessage = (input: readonly MeshEvent[], extra?: readonly M
     "</fabric-inbox>",
   ].join("\n"),
   display: true,
-  // Each group starts with the event receipt (the renderer's boundary); display metadata trails it.
-  // Overflow has no XML row/boundary: put its groups first so the last shown row's group
-  // ends at receipts.length without inheriting unrelated overflow identities. IDs stay in delivery order.
-  details: { ids: all.map((event) => event.id), receipts: [...rest, ...events].flatMap((event) => [...eventReceipts(event), ...shadowDisplayReceipts(event)]) },
+  // Each shown group starts with its event receipt; withheld identities never enter the carrier.
+  details: { ids: events.map((event) => event.id), receipts: events.flatMap((event) => [...eventReceipts(event), ...shadowDisplayReceipts(event)]) },
   };
 };

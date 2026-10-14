@@ -31,9 +31,9 @@ const setup = () => {
     sendMessage: (message: unknown) => entries.push({ type: "custom_message", timestamp: new Date(now).toISOString(), ...(message as object) }),
   } as unknown as ExtensionAPI;
   const main = new MainAgentController(pi, me.id, true, root, "ops-lead");
-  const publish = (data: unknown, text = "shadow", topic = TOPIC) =>
-    mesh.publish({ topic, kind: "report", from: peer, to: me.id, text, data });
-  return { root, mesh, entries, box, main, publish, advance: (ms: number) => { now += ms; }, session: () => rootInboxSession(entries) };
+  const publish = (data: unknown, text = "shadow", topic = TOPIC, kind = "report") =>
+    mesh.publish({ topic, kind, from: peer, to: me.id, text, data });
+  return { root, mesh, entries, pi, box, main, publish, advance: (ms: number) => { now += ms; }, session: () => rootInboxSession(entries) };
 };
 afterEach(() => {
   vi.restoreAllMocks();
@@ -50,8 +50,14 @@ describe("root inbox injects a batch once (R-token-waste)", () => {
     expect(batch.events.map(event => event.id)).toEqual(events.map(event => event.id));
     // Before the fix: an unconfirmed pending batch came back on every reconcile.
     expect((await h.box().next(notHeld)).events).toHaveLength(20);
-    const { details } = rootInboxMessage(batch.events);
-    await inbox.consume(details.ids, details.receipts);
+    let shown = rootInboxMessage(batch.events).details;
+    await inbox.consume(shown.ids, shown.receipts);
+    let remaining = await inbox.next(notHeld);
+    while (remaining.events.length) {
+      shown = rootInboxMessage(remaining.events).details;
+      await inbox.consume(shown.ids, shown.receipts);
+      remaining = await inbox.next(notHeld);
+    }
     for (let turn = 0; turn < 5; turn++) expect((await inbox.next(notHeld)).events).toEqual([]);
     expect((await h.box().next(notHeld)).events).toEqual([]);
     const cursor = h.mesh.get(inbox.key, { fresh: true })!.value as { after: number; pending?: unknown };
@@ -161,9 +167,10 @@ describe("root inbox injects a batch once (R-token-waste)", () => {
     expect((await inbox.next(session)).events.map(event => event.id)).toEqual([plain.id, withId.id]);
   });
 
-  it("bounds one injection and summarizes the overflow in one line", async () => {
-    const h = setup(); const inbox = h.box(); inbox.start();
-    for (let index = 0; index < 20; index++) await h.publish({ key: `big:${index}` }, `report ${index} ${"x".repeat(1400)}`);
+  it("bounds each injection and consumes only displayed events across turns and restart", async () => {
+    const h = setup(); let inbox = h.box(); inbox.start();
+    const events: MeshEvent[] = [];
+    for (let index = 0; index < 20; index++) events.push(await h.publish({ key: `big:${index}`, ...(index === 3 ? { deliveryId: "delivery:report:3" } : {}) }, `info ${index} ${"x".repeat(1400)}`, TOPIC, "info"));
     h.advance(1);
     const batch = await inbox.next(notHeld);
     expect(batch.events).toHaveLength(20);
@@ -174,7 +181,7 @@ describe("root inbox injects a batch once (R-token-waste)", () => {
     expect(message.content.match(/<overflow /g)).toHaveLength(1);
     expect(message.content).toMatch(new RegExp(`<overflow count="${20 - rendered.length}">\\+${20 - rendered.length} more addressed event`));
     expect(Buffer.byteLength(message.content)).toBeLessThan(INBOX_INJECT_MAX_TEXT_BYTES + 4096);
-    expect(message.details.ids).toEqual(batch.events.map(event => event.id));
+    expect(message.details.ids).toEqual(batch.events.slice(0, rendered.length).map(event => event.id));
 
     // Delivery splits by provenance on capable Pi: the budget and the one line hold across messages.
     const sent: Array<{ content: string; details: { ids: string[] } }> = [];
@@ -185,6 +192,37 @@ describe("root inbox injects a batch once (R-token-waste)", () => {
     const total = sent.reduce((bytes, value) => bytes + Buffer.byteLength(value.content), 0);
     expect(total).toBeLessThan(INBOX_INJECT_MAX_TEXT_BYTES + 4096 * 2);
     expect(sent.map(value => value.content).join("\n").match(/<overflow /g)).toHaveLength(1);
-    expect(sent.flatMap(value => value.details.ids)).toEqual(mixed.map(event => event.id));
+    expect(sent.flatMap(value => value.details.ids)).toEqual(mixed.slice(0, rendered.length).map(event => event.id));
+
+    // Receipt only what each bounded injection rendered; the remainder must survive restart.
+    const delivered: string[] = [];
+    let current = batch;
+    for (let turn = 0; turn < 3; turn++) {
+      const before = h.entries.length;
+      deliverRootInbox(h.pi, current.events);
+      const messages = h.entries.slice(before) as Array<ReturnType<typeof rootInboxMessage>>;
+      expect(messages.flatMap(value => value.details.ids)).toHaveLength(Math.min(8, current.events.length));
+      for (const value of messages) {
+        delivered.push(...value.details.ids);
+        await inbox.consume(value.details.ids, value.details.receipts);
+      }
+      if (turn === 0) {
+        await inbox.close();
+        inbox = h.box();
+      }
+      if (turn < 2) current = await inbox.next(h.session());
+    }
+    expect(delivered).toEqual(events.map(event => event.id));
+    expect(new Set(delivered).size).toBe(20);
+    expect((await inbox.next(h.session())).events).toEqual([]);
+    const cursor = h.mesh.get(inbox.key, { fresh: true })!.value as { after: number; pending?: unknown };
+    expect(cursor.pending).toBeUndefined();
+    expect(cursor.after).toBe(events.at(-1)!.sequence);
+
+    // A later shadow of consumed work is still suppressed; unrelated fresh work remains deliverable.
+    await h.publish({ key: "big:3", deliveryId: "delivery:report:3" }); h.advance(1);
+    expect((await h.box().next(h.session())).events).toEqual([]);
+    const fresh = await h.publish({ key: "report:new" }); h.advance(1);
+    expect((await h.box().next(h.session())).events.map(event => event.id)).toEqual([fresh.id]);
   });
 });

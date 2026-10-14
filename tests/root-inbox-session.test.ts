@@ -307,7 +307,8 @@ describe.skipIf(!built)("the root inbox in a real Pi session", () => {
       await session.prompt("resume without reload");
       expect(ids()).toEqual([held, pending, newer]);
       expect(new Set(ids()).size).toBe(3);
-      expect(inferences).toBe(3);
+      // Both action events join the resumed inference; priority lookahead adds no extra turn.
+      expect(inferences).toBe(2);
       expect(cursor().pending).toBeUndefined();
       faux.setResponses([fauxAssistantMessage("no duplicate")]);
       await session.prompt("check once more");

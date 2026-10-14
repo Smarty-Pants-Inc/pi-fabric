@@ -131,6 +131,8 @@ type ProviderDeadState = {
 
 /** Unclassified failures in a row (no successful turn between them) before Main alarms (smarty-dev#8742). */
 export const UNCLASSIFIED_PROVIDER_DEAD_AFTER = 3;
+/** Last-resort, non-rearming alarm deadline for a pending provider recovery step. */
+export const MAIN_PROVIDER_RECOVERY_TIMEOUT_MS = 5 * 60_000;
 
 /** `provider-dead (non-retryable: <allowlisted short>)` or `provider-dead (unclassified)`. */
 const providerDeadLabel = (dead: { kind: "non-retryable" | "unclassified"; error: string }): string =>
@@ -156,9 +158,10 @@ export interface FabricMainProviderDeadEvent {
   /**
    * compaction-failed: the recovery compaction failed. failed-after-compaction: the one attempt
    * after it failed non-retryably again. unclassified-repeated: UNCLASSIFIED_PROVIDER_DEAD_AFTER
-   * failures in a row without an HTTP status, error body or known token.
+   * failures in a row without an HTTP status, error body or known token. recovery-timeout: the
+   * pending recovery step did not become runnable within its five-minute last-resort deadline.
    */
-  cause: "compaction-failed" | "failed-after-compaction" | "unclassified-repeated";
+  cause: "compaction-failed" | "failed-after-compaction" | "unclassified-repeated" | "recovery-timeout";
   /** Peer messages Fabric holds unread for this Main, oldest first. */
   held: Array<{ id: string; from: string; sentAt: number }>;
 }
@@ -430,6 +433,7 @@ export class MainAgentController implements FabricMainAgentTarget {
   // input or a successful turn. One alarm per incident.
   #providerDead: ProviderDeadState | undefined;
   #providerDeadTimer: ReturnType<typeof setTimeout> | undefined;
+  #providerDeadDeadline: ReturnType<typeof setTimeout> | undefined;
   // smarty-dev#8742: an unclassified failure (no status, body or known token: a network blip, or a
   // dead provider Fabric cannot recognise) is backoff until the third settle in a row; then alarm.
   #unclassifiedFailures = 0;
@@ -583,6 +587,7 @@ export class MainAgentController implements FabricMainAgentTarget {
     this.#bindingsLive = false;
     this.#reloading = true;
     this.#stopWake();
+    this.#stopProviderDeadDeadline();
   }
 
   /** Escape can halt an idle Main without producing an aborted run event. */
@@ -590,6 +595,7 @@ export class MainAgentController implements FabricMainAgentTarget {
     this.#interrupts.clear();
     this.#halted = true;
     this.#providerReleaseUntil = undefined;
+    this.#stopProviderDeadDeadline();
     this.#consumedDirty = true;
     const index = this.#consumedPath();
     if (index && !pendingHalts().has(index)) pendingHalts().set(index, { warned: false });
@@ -1270,8 +1276,8 @@ export class MainAgentController implements FabricMainAgentTarget {
         this.#suspended = false;
       }
     });
-    const settleGate = (event: { outcome?: string }, ctx: ExtensionContext): void => {
-      if (ctx.signal?.aborted || isCompactionCancelled(this.#compactionDecline) ||
+    const settleGate = (event: { outcome?: string; aborted?: boolean }, ctx: ExtensionContext, finalSettle = false): void => {
+      if (ctx.signal?.aborted || event.aborted === true || isCompactionCancelled(this.#compactionDecline) ||
         (event.outcome === "aborted" && !this.#compactionDecline)) { if (!this.#interrupts.size) this.halt(); }
       // turn_end already classified a non-retryable failure: recover at idle, never back off.
       else if (event.outcome === "error" && this.#providerDead) { this.#runUnclassified = false; this.#armProviderDeadTimer(); }
@@ -1279,12 +1285,13 @@ export class MainAgentController implements FabricMainAgentTarget {
       else if (event.outcome === "error" && this.#countUnclassified()) { /* alarmed and held */ }
       else if (event.outcome === "error") this.#recordProviderFailure();
       else if (event.outcome === "completed") this.#recoverProvider();
-      // Older hosts omit outcome: neither grant recovery nor invent an owner stop.
+      else if (finalSettle && event.outcome === undefined) this.#countUnclassified();
+      // Older hosts omit outcome: only the final boundary counts an unclassified turn_end.
       // Every settle is an idle edge for a pending recovery step (smarty-dev#8742: event-driven, no polling).
       if (this.#providerDead && !this.#halted) this.#armProviderDeadTimer();
     };
-    on("agent_before_settle", settleGate);
-    on("agent_settled", settleGate);
+    on("agent_before_settle", (event, ctx) => settleGate(event, ctx));
+    on("agent_settled", (event, ctx) => settleGate(event, ctx, true));
     let interruptedSettle = false;
     on("agent_settled", (_event, ctx) => {
       this.#context = ctx;
@@ -1378,6 +1385,7 @@ export class MainAgentController implements FabricMainAgentTarget {
       this.#stopProviderWake();
       // A run is the attempt (or its settle re-arms recovery); stop waiting for idle.
       this.#stopProviderDeadTimer();
+      this.#stopProviderDeadDeadline();
     });
     // The end of a run, and a finished /tree summary, are idle edges for a pending recovery step.
     on("agent_end", () => { this.#armProviderDeadTimer(); });
@@ -1475,6 +1483,7 @@ export class MainAgentController implements FabricMainAgentTarget {
     this.#context = undefined;
     this.#providerReleaseUntil = undefined;
     this.#stopProviderDeadTimer();
+    this.#stopProviderDeadDeadline();
     this.#stopOperation();
     this.#compactionDecline = undefined;
     takeCompactionDecline(this.pi);
@@ -1757,24 +1766,47 @@ export class MainAgentController implements FabricMainAgentTarget {
   /**
    * At idle: run the one recovery compaction, or the one post-compaction attempt.
    *
-   * Event-driven, never polled (smarty-dev#8742 review): one zero-delay tick leaves the emitting hook
-   * (ctx.compact aborts an active run, and a settle may still be running other handlers). If Main is
-   * busy at that tick, the step stays pending with no timer, and the next lifecycle edge re-arms it:
-   * a run's end (agent_end, agent_before_settle, agent_settled), a compaction's end (session_compact,
-   * session_compact_failed, ctx.compact's completion), session_tree, the drain's idle and preflight
-   * waiters, or a newly held peer message. agent_start stops a pending tick; owner input ends the incident.
+   * Event-driven, never polled: a zero-delay tick leaves the emitting hook, while one non-rearming
+   * five-minute last-resort alarm covers a pending recovery step. If Main is busy at the tick, the
+   * next lifecycle edge retries it: agent_end, settle, compaction completion, session_tree, idle or
+   * preflight waiters, or a newly held peer message. agent_start stops the tick; an admitted probation
+   * attempt is already in flight and needs neither timer; owner input ends the incident.
    */
   #armProviderDeadTimer(): void {
     const phase = this.#providerDead?.phase;
-    if (this.#providerDeadTimer || (phase !== "recovering" && phase !== "probation")) return;
+    if (phase !== "recovering" && phase !== "probation") return;
+    if (phase === "probation" && this.#providerAttemptInFlight) return;
+    if (!this.#providerDeadDeadline) {
+      this.#providerDeadDeadline = setTimeout(() => {
+        this.#providerDeadDeadline = undefined;
+        if (this.#contextRetired()) return;
+        const dead = this.#providerDead;
+        const ctx = this.#context;
+        try {
+          if (!dead || (dead.phase !== "recovering" && dead.phase !== "probation") || !ctx ||
+            !this.#bindingsLive || this.#reloading || this.#halted || ctx.signal?.aborted) return;
+        } catch {
+          this.#contextRetired();
+          return;
+        }
+        this.#raiseProviderDead("recovery-timeout");
+      }, MAIN_PROVIDER_RECOVERY_TIMEOUT_MS);
+      this.#providerDeadDeadline.unref?.();
+    }
+    if (this.#providerDeadTimer) return;
     this.#providerDeadTimer = setTimeout(() => {
       this.#providerDeadTimer = undefined;
       if (this.#contextRetired()) return;
       const dead = this.#providerDead;
       const ctx = this.#context;
-      if (!dead || !ctx || !this.#bindingsLive || this.#reloading || this.#halted || ctx.signal?.aborted) return;
-      // Busy: no re-arm here. The edge that ends this busy state calls back in.
-      if (!ctx.isIdle() || promptPending(ctx) || (ctx as { isSettling?: () => boolean }).isSettling?.() === true) return;
+      try {
+        if (!dead || !ctx || !this.#bindingsLive || this.#reloading || this.#halted || ctx.signal?.aborted) return;
+        // Busy: no re-arm here. The edge that ends this busy state calls back in.
+        if (!ctx.isIdle() || promptPending(ctx) || (ctx as { isSettling?: () => boolean }).isSettling?.() === true) return;
+      } catch {
+        this.#contextRetired();
+        return;
+      }
       if (dead.phase === "recovering") this.#compactForRecovery(dead, ctx);
       else if (dead.phase === "probation") this.#attemptAfterCompaction();
     }, 0);
@@ -1786,13 +1818,20 @@ export class MainAgentController implements FabricMainAgentTarget {
     this.#providerDeadTimer = undefined;
   }
 
+  #stopProviderDeadDeadline(): void {
+    if (this.#providerDeadDeadline) clearTimeout(this.#providerDeadDeadline);
+    this.#providerDeadDeadline = undefined;
+  }
+
   #clearProviderDead(): void {
     this.#providerDead = undefined;
     this.#stopProviderDeadTimer();
+    this.#stopProviderDeadDeadline();
   }
 
   /** The same path a human /compact takes; compaction extensions may drop provider-bound blocks. */
   #compactForRecovery(dead: ProviderDeadState, ctx: ExtensionContext): void {
+    this.#stopProviderDeadDeadline();
     dead.phase = "compacting";
     // smarty-dev#8881: Pi may deliver these callbacks after dispose() or session replacement. Only the
     // incident they were started for, through the still-live ctx they were started on, may advance it;
@@ -1829,6 +1868,7 @@ export class MainAgentController implements FabricMainAgentTarget {
     if (this.#providerAttemptInFlight) return;
     if (this.#held.some(item => item.deliverAs !== "nextTurn" && (item.triggerTurn ?? true))) {
       this.#release(true);                               // held work goes first, as one attempt
+      if (this.#providerAttemptInFlight) this.#stopProviderDeadDeadline();
       return;
     }
     // Nothing held: the failed turn itself is the work. Continue it once, as #4012's retry does.
@@ -1838,6 +1878,7 @@ export class MainAgentController implements FabricMainAgentTarget {
         customType: "pi-fabric-provider-retry", display: true,
         content: "Continue the interrupted turn: the provider rejected the previous request as non-retryable, and Fabric compacted the session once to recover. This is Fabric's one automatic retry.",
       }, { deliverAs: "followUp", triggerTurn: true });
+      this.#stopProviderDeadDeadline();
     } catch {
       this.#providerAttemptInFlight = false;
       this.#raiseProviderDead("failed-after-compaction");
@@ -1872,6 +1913,7 @@ export class MainAgentController implements FabricMainAgentTarget {
     const dead = this.#providerDead;
     if (!dead) return;
     this.#stopProviderDeadTimer();
+    this.#stopProviderDeadDeadline();
     dead.phase = "alarmed";
     this.#providerAttemptInFlight = false;
     this.#providerFailed = true;
@@ -1881,6 +1923,7 @@ export class MainAgentController implements FabricMainAgentTarget {
     dead.alarmed = true;
     const why = cause === "compaction-failed" ? "the recovery compaction failed"
       : cause === "unclassified-repeated" ? `${dead.failures ?? UNCLASSIFIED_PROVIDER_DEAD_AFTER} provider failures in a row without an HTTP status or error body`
+      : cause === "recovery-timeout" ? "the recovery step did not become runnable before its deadline"
       : "the one retry after compaction failed again";
     // Fixed text and allowlisted tokens only; the provider's own error text stays in the session log.
     const message = `${providerDeadLabel(dead)}: ${why}. The provider's error text is in the session log. Held peer messages stay journalled and ops.owner is alarmed; fix the provider, then send any input to resume.`;

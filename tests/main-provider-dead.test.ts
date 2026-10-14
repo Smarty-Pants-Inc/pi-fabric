@@ -1,6 +1,11 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MainAgentController, type FabricMainProviderDeadEvent } from "../src/main-agent.js";
+import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
+import { providerDeadAlarms } from "../src/topology/stall-alarms.js";
 
 // smarty-dev#8742: a non-retryable provider error is never provider-backoff.
 type Handler = (event: unknown, ctx: ExtensionContext) => unknown;
@@ -10,7 +15,7 @@ const errorTurn = (errorMessage: string) => ({ message: { role: "assistant", sto
 const okTurn = { message: { role: "assistant", stopReason: "stop" } };
 const from = (name: string) => ({ id: `agent-${name}`, name, kind: "agent" as const });
 
-const setup = (flushMs = 120_000) => {
+const setup = (flushMs = 120_000, onProviderDead?: (event: FabricMainProviderDeadEvent) => void) => {
   const handlers = new Map<string, Handler[]>();
   const sent: Array<{ message: { customType: string; content: string }; options: { deliverAs: string; triggerTurn: boolean } }> = [];
   const pi = {
@@ -22,11 +27,12 @@ const setup = (flushMs = 120_000) => {
     sendUserMessage: vi.fn(),
     getThinkingLevel: () => "off",
   } as unknown as ExtensionAPI;
-  const state = { idle: false };
+  const state = { idle: false, settling: false };
   const compactions: CompactOptions[] = [];
   const notify = vi.fn();
   const ctx = {
     isIdle: () => state.idle,
+    isSettling: () => state.settling,
     hasPendingMessages: () => false,
     signal: { aborted: false },
     hasUI: true,
@@ -36,7 +42,7 @@ const setup = (flushMs = 120_000) => {
   const alarms: FabricMainProviderDeadEvent[] = [];
   const released: unknown[] = [];
   const main = new MainAgentController(pi, "session:root", true, "/tmp/project", "root", true,
-    (event) => { released.push(event); }, {}, (event) => { alarms.push(event); });
+    (event) => { released.push(event); }, {}, (event) => { alarms.push(event); onProviderDead?.(event); });
   main.attachFollowUpDrain(ctx, flushMs);
   const emit = (name: string, event: unknown) => { for (const handler of handlers.get(name) ?? []) handler(event, ctx); };
   /** The failed run ends: Pi settles with an error outcome and goes idle. */
@@ -49,7 +55,10 @@ const setup = (flushMs = 120_000) => {
   return { main, sent, state, ctx, emit, compactions, notify, alarms, released, settleError, compactOk };
 };
 
-beforeEach(() => { vi.useFakeTimers(); vi.setSystemTime(new Date("2026-10-11T08:00:00Z")); });
+beforeEach(() => {
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
+  vi.setSystemTime(new Date("2026-10-11T08:00:00Z"));
+});
 afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); });
 
 describe.each([120_000, 0])("Main non-retryable provider recovery (flushMs=%s, smarty-dev#8742)", (flushMs) => {
@@ -234,24 +243,25 @@ describe.each([120_000, 0])("Main non-retryable provider recovery (flushMs=%s, s
     h.main.closeFollowUpDrain();
   });
 
-  it("waits for idle on lifecycle edges, with no timer running while Main is busy (review P2)", () => {
+  it("waits for idle on lifecycle edges with only one last-resort deadline, never polling while busy (review P2)", () => {
     const h = setup(flushMs);
     h.emit("turn_end", errorTurn(affinity));            // the failed run is still active
     vi.advanceTimersByTime(0);                          // the one deferred tick samples busy
     expect(h.compactions).toHaveLength(0);
-    expect(vi.getTimerCount()).toBe(0);                 // nothing polls while Main is busy
-    vi.advanceTimersByTime(60 * 60_000);
+    expect(vi.getTimerCount()).toBeLessThanOrEqual(1);  // at most one five-minute deadline, never a poll
+    vi.advanceTimersByTime(4 * 60_000);
     expect(h.compactions).toHaveLength(0);
-    h.settleError();                                    // the run's settle is the idle edge
+    expect(vi.getTimerCount()).toBeLessThanOrEqual(1);
+    h.settleError();                                    // the run's settle is the idle edge, before deadline
     vi.advanceTimersByTime(0);
     expect(h.compactions).toHaveLength(1);
-    // session_compact runs while Pi is still compacting: the attempt waits, again without a timer.
+    expect(h.alarms).toHaveLength(0);
+    // session_compact runs while Pi is still compacting: the attempt waits, event-driven.
     h.state.idle = false;
     h.emit("session_compact", { reason: "manual" });
     expect(h.main.providerDeadState?.phase).toBe("probation");
-    vi.advanceTimersByTime(60 * 60_000);
+    vi.advanceTimersByTime(30_000);
     expect(h.sent).toHaveLength(0);
-    expect(vi.getTimerCount()).toBe(0);
     h.state.idle = true;
     h.compactions[0]!.onComplete?.({});                 // Pi cleared its compaction state: the idle edge
     vi.advanceTimersByTime(0);
@@ -261,13 +271,14 @@ describe.each([120_000, 0])("Main non-retryable provider recovery (flushMs=%s, s
     expect(h.compactions).toHaveLength(1);
     expect(h.alarms).toHaveLength(0);
     h.main.closeFollowUpDrain();
+    expect(vi.getTimerCount()).toBe(0);
   });
 
   it.each(["agent_end", "peer delivery"])("re-arms a recovery step that found Main busy on %s (review P2)", (edge) => {
     const h = setup(flushMs);
     h.emit("turn_end", errorTurn(affinity));
     vi.advanceTimersByTime(0);
-    expect(vi.getTimerCount()).toBe(0);
+    expect(vi.getTimerCount()).toBeLessThanOrEqual(1);  // only the bounded deadline may remain; no polling
     h.state.idle = true;                                // e.g. a host whose settle carried no edge
     if (edge === "agent_end") h.emit("agent_end", { messages: [] });
     else expect(h.main.deliverAgent({ from: from("lead"), message: "x", delivery: "followUp" }).triggered).toBe(false);
@@ -568,5 +579,140 @@ describe.each([120_000, 0])("Main provider-dead delayed work after dispose (flus
     expect(h.alarms).toHaveLength(0);
     h.main.closeFollowUpDrain();
     expect(vi.getTimerCount()).toBe(0);
+  });
+});
+
+describe("Main provider recovery deadline and final settle fallback (smarty-dev#9057)", () => {
+  it.each([
+    ["busy", false, false],
+    ["settling", true, true],
+  ] as const)("alarms once at five minutes while Main is %s; lifecycle edges do not extend its deadline", (_label, idle, settling) => {
+    const h = setup();
+    h.state.idle = idle;
+    h.state.settling = settling;
+    h.emit("turn_end", errorTurn(affinity));
+    h.main.deliverAgent({ from: from("lead"), message: "held through recovery timeout", delivery: "followUp" });
+    vi.advanceTimersByTime(0);                          // recovery tick sees Main busy/settling
+    expect(h.compactions).toHaveLength(0);
+    expect(vi.getTimerCount()).toBe(1);                 // one deadline, no polling interval
+    for (let minute = 1; minute <= 4; minute++) {
+      vi.advanceTimersByTime(60_000);
+      h.emit(minute % 2 ? "agent_end" : "agent_before_settle", {});
+      vi.advanceTimersByTime(0);                        // the lifecycle edge schedules a zero-tick probe
+      expect(h.compactions).toHaveLength(0);
+      expect(vi.getTimerCount()).toBe(1);               // probe is consumed; deadline is not re-armed/extended
+    }
+    vi.advanceTimersByTime(60_000);
+    expect(h.compactions).toHaveLength(0);
+    expect(h.alarms).toHaveLength(1);
+    expect(h.alarms[0]).toMatchObject({ kind: "non-retryable", cause: "recovery-timeout", status: 409,
+      held: [expect.objectContaining({ from: "agent-lead" })] });
+    expect(h.sent).toHaveLength(0);                      // timed-out held work is not handed to Pi
+    expect(vi.getTimerCount()).toBe(0);
+    vi.advanceTimersByTime(60 * 60_000);
+    expect(h.alarms).toHaveLength(1);
+    expect(h.compactions).toHaveLength(0);
+    h.emit("input", { source: "interactive" });
+    expect(vi.getTimerCount()).toBe(0);
+    h.main.closeFollowUpDrain();
+  });
+
+  it("does not time out the admitted post-compaction retry while its run is in flight", () => {
+    const h = setup();
+    h.state.idle = true;
+    h.emit("turn_end", errorTurn(affinity));
+    vi.advanceTimersByTime(0);
+    expect(h.compactions).toHaveLength(1);
+    h.compactOk();
+    vi.advanceTimersByTime(0);
+    expect(h.sent).toHaveLength(1);
+    expect(h.sent[0]!.message.customType).toBe("pi-fabric-provider-retry");
+    h.state.idle = false;
+    h.emit("agent_start", {});
+    expect(h.main.providerDeadState?.phase).toBe("probation");
+    h.main.deliverAgent({ from: from("peer"), message: "wait for retry", delivery: "followUp" });
+    h.emit("session_tree", {});
+    h.emit("agent_end", {});
+    vi.advanceTimersByTime(5 * 60_000);
+    expect(h.alarms).toHaveLength(0);
+    expect(h.sent).toHaveLength(1);
+    expect(h.compactions).toHaveLength(1);
+    h.main.closeFollowUpDrain();
+  });
+
+  it("counts a missing outcome once at final agent_settled, resets after a same-run success, and ignores legacy aborts", () => {
+    const h = setup();
+    // Same-run success must clear the failed turn before an outcome-less final boundary.
+    h.state.idle = false;
+    h.emit("agent_start", {});
+    h.emit("turn_end", errorTurn("Connection error."));
+    h.emit("turn_end", okTurn);
+    h.emit("agent_before_settle", {});
+    expect(h.alarms).toHaveLength(0);
+    h.state.idle = true;
+    h.emit("agent_settled", {});
+    expect(h.alarms).toHaveLength(0);
+
+    // Legacy aborts must not count the pending unclassified failure.
+    h.state.idle = false;
+    h.emit("agent_start", {});
+    h.emit("turn_end", errorTurn("Connection error."));
+    h.state.idle = true;
+    h.emit("agent_settled", { aborted: true });
+    expect(h.alarms).toHaveLength(0);
+    h.emit("input", { source: "interactive" });
+
+    for (let run = 1; run <= 3; run++) {
+      h.state.idle = false;
+      h.emit("agent_start", {});
+      h.emit("turn_end", errorTurn("Connection error."));
+      h.emit("agent_before_settle", {});
+      expect(h.alarms).toHaveLength(0);                  // never count before the final boundary
+      h.state.idle = true;
+      h.emit("agent_settled", {});
+      expect(h.alarms).toHaveLength(run === 3 ? 1 : 0);
+    }
+    expect(h.alarms[0]).toMatchObject({ kind: "unclassified", cause: "unclassified-repeated", failures: 3 });
+    h.main.closeFollowUpDrain();
+  });
+
+  it("keeps a healthy idle Main timer-free and does not alarm after five minutes", () => {
+    const h = setup();
+    h.state.idle = true;
+    expect(vi.getTimerCount()).toBe(0);
+    vi.advanceTimersByTime(5 * 60_000);
+    expect(vi.getTimerCount()).toBe(0);
+    expect(h.alarms).toHaveLength(0);
+    expect(h.compactions).toHaveLength(0);
+    expect(h.sent).toHaveLength(0);
+    h.main.closeFollowUpDrain();
+  });
+
+  it("routes one recovery-timeout from Main to the configured ops.owner session with allowlisted data", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "main-recovery-alarm-"));
+    const mesh = new MeshStore(root, 64 * 1024, 500);
+    const identity: MeshIdentity = { id: "session:root", sessionId: "root", name: "root", kind: "main" };
+    const owner = "session:configured-owner";
+    let publish!: Promise<void>;
+    const h = setup(120_000, event => { publish = providerDeadAlarms(mesh, identity, identity.id, event, owner); });
+    try {
+      h.emit("turn_end", errorTurn(affinity));
+      vi.advanceTimersByTime(0);
+      vi.advanceTimersByTime(5 * 60_000);
+      await publish;
+      h.emit("agent_end", {});
+      h.emit("session_tree", {});
+      vi.advanceTimersByTime(60 * 60_000);
+      const alarms = mesh.read({ topic: "ops.owner" });
+      const addressed = alarms.filter(item => item.kind === "fabric.main.provider-dead" && item.to === owner);
+      expect(addressed).toHaveLength(1);
+      expect(addressed[0]!.data).toMatchObject({ cause: "recovery-timeout", status: 409, error: "409 invalid_request_error: compaction_affinity_missing" });
+      expect(Object.keys(addressed[0]!.data as object).sort()).toEqual(["cause", "code", "error", "held", "heldCount", "kind", "rootId", "since", "status", "type"]);
+      expect(h.alarms).toHaveLength(1);
+      expect(alarms.filter(item => item.kind === "fabric.main.provider-dead")).toHaveLength(2);
+    } finally {
+      h.main.closeFollowUpDrain();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   });
 });

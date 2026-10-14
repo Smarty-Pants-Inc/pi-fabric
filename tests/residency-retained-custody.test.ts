@@ -45,11 +45,12 @@ async function fixture() {
 // settlement, permit retention/release, resident subscriptions and idle decisions are real.
 describe("resident retained native custody", () => {
   it.skipIf(process.platform !== "linux").each(["idle-exit", "dormant"] as const)(
-    "prevents %s through bounded unconfirmed finishing, then resumes after exact custody release", async mode => {
+    "holds no-proof %s through bounded unconfirmed finishing, then resumes after exact custody release", async mode => {
     const f = await fixture();
     let releaseClosed!: () => void;
     const closed = new Promise<void>(resolve => { releaseClosed = resolve; });
     let confirmed = false;
+    let drainAttempted = false;
     const sessionId = "2147483647"; // Absent PID: no real process tree is launched or signalled.
     vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async (request: AgentTransportLaunch) => {
       const statusFile = request.workerArguments[request.workerArguments.indexOf("--status-file") + 1]!;
@@ -58,7 +59,7 @@ describe("resident retained native custody", () => {
         startedAt: f.now(), updatedAt: f.now(), turns: 1, toolCalls: 0, text: "finishing",
         usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 } }));
       return { kind: "process", sessionId, closed, finishingGraceMs: 20,
-        stop: async () => { if (!confirmed) throw new Error("fixture cleanup did not confirm exit"); },
+        stop: async () => { drainAttempted = true; if (!confirmed) throw new Error("fixture cleanup did not confirm exit"); },
         isAlive: async () => !confirmed };
     });
     const inRunTree = (target: fs.PathLike) => String(target).startsWith(path.join(f.config.residencyRoot, "runs") + path.sep);
@@ -83,6 +84,7 @@ describe("resident retained native custody", () => {
       const handle = await f.host.agents.spawn({ task: "custody fixture", transport: "process" });
       await vi.waitFor(() => expect(f.host.agents.isSettled(handle.id)).toBe(true), { timeout: 5_000 });
       expect(await f.host.agents.wait(handle.id)).toMatchObject({ status: "failed", errorCode: "CUSTODY_UNCONFIRMED" });
+      await vi.waitFor(() => expect(drainAttempted).toBe(true), { timeout: 5_000 });
       expect(f.host.agents.heldPermits()).toBe(1);
       expect(f.host.agents.hasRetainedCustody()).toBe(true);
       const actor = mode === "dormant"
@@ -118,6 +120,74 @@ describe("resident retained native custody", () => {
       expect(removed).toContain(marker);
       expect(fs.existsSync(marker)).toBe(true); // The recorder, not a real deletion, discharged the call.
       expect(fs.existsSync(runDirectory)).toBe(true);
+    } finally {
+      confirmed = true;
+      releaseClosed();
+      await f.host.close();
+    }
+  });
+
+  it("releases an ordinary no-ENODEV finishing permit after a successful drain and resumes residency", async () => {
+    const f = await fixture();
+    let releaseClosed!: () => void;
+    const closed = new Promise<void>(resolve => { releaseClosed = resolve; });
+    let confirmed = false;
+    const sessionId = "2147483647"; // Absent PID: no real process tree is launched or signalled.
+    vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async (request: AgentTransportLaunch) => {
+      const statusFile = request.workerArguments[request.workerArguments.indexOf("--status-file") + 1]!;
+      fs.writeFileSync(statusFile, JSON.stringify({ id: request.id, name: request.name, task: "ordinary custody fixture",
+        status: "finishing", runner: "pi", transport: "process", sessionId, cwd: request.cwd,
+        startedAt: f.now(), updatedAt: f.now(), turns: 1, toolCalls: 0, text: "finishing",
+        usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 } }));
+      return { kind: "process", sessionId, closed, finishingGraceMs: 20,
+        stop: async () => { if (!confirmed) throw new Error("fixture cleanup did not confirm exit"); },
+        isAlive: async () => !confirmed };
+    });
+    const inRunTree = (target: fs.PathLike) => String(target).startsWith(path.join(f.config.residencyRoot, "runs") + path.sep);
+    const removed: string[] = [];
+    const rmSync = fs.rmSync.bind(fs);
+    const unlinkSync = fs.unlinkSync.bind(fs);
+    const promisesRm = fs.promises.rm.bind(fs.promises);
+    // Recorded-call proof: no product run-tree deletion is executed locally.
+    vi.spyOn(fs, "rmSync").mockImplementation(((target: fs.PathLike, options?: fs.RmOptions) => {
+      if (inRunTree(target)) { removed.push(String(target)); return; }
+      return rmSync(target, options);
+    }) as typeof fs.rmSync);
+    vi.spyOn(fs, "unlinkSync").mockImplementation(((target: fs.PathLike) => {
+      if (inRunTree(target)) { removed.push(String(target)); return; }
+      return unlinkSync(target);
+    }) as typeof fs.unlinkSync);
+    vi.spyOn(fs.promises, "rm").mockImplementation((async (target: fs.PathLike, options?: fs.RmOptions) => {
+      if (inRunTree(target)) { removed.push(String(target)); return; }
+      return promisesRm(target, options);
+    }) as typeof fs.promises.rm);
+    try {
+      const handle = await f.host.agents.spawn({ task: "ordinary custody fixture", transport: "process" });
+      await vi.waitFor(() => expect(f.host.agents.isSettled(handle.id)).toBe(true), { timeout: 5_000 });
+      expect(await f.host.agents.wait(handle.id)).toMatchObject({ status: "failed", errorCode: "CUSTODY_UNCONFIRMED" });
+      expect(f.host.agents.heldPermits()).toBe(1);
+      expect(f.host.agents.hasRetainedCustody()).toBe(true);
+
+      const runDirectory = f.host.agents.runDirectory(handle.id)!;
+      const marker = path.join(runDirectory, "unresolved-worker.json");
+      expect(fs.readFileSync(marker, "utf8")).not.toContain("ENODEV");
+      confirmed = true;
+      releaseClosed();
+      await f.host.agents.stop(handle.id);
+      expect(f.host.agents.heldPermits()).toBe(0);
+      expect(f.host.agents.hasRetainedCustody()).toBe(false);
+      expect(removed).toContain(marker);
+      expect(fs.existsSync(marker)).toBe(true); // The recorder, not a real deletion, discharged the call.
+
+      // A second stop sees the same retained terminal run and must not release again.
+      await f.host.agents.stop(handle.id);
+      expect(f.host.agents.heldPermits()).toBe(0);
+      await sleep(150); // The existing UI subscription starts a fresh idle window.
+      await f.advance(1_999);
+      expect(f.idle).not.toHaveBeenCalled();
+      await f.advance(1);
+      expect(f.idle).toHaveBeenCalledExactlyOnceWith("idle-exit");
+      expect(fs.existsSync(residentIdleExitPath(f.config.residencyRoot))).toBe(true);
     } finally {
       confirmed = true;
       releaseClosed();

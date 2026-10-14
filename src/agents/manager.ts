@@ -2320,6 +2320,18 @@ export class AgentManager {
       ));
   }
 
+  /** Release a retained admission permit once, deleting it before its callback. */
+  #releaseHeldPermit(owner: { heldPermit?: () => void }): boolean {
+    const permit = owner.heldPermit;
+    if (!permit) return false;
+    delete owner.heldPermit;
+    this.#retentionRevision++;
+    permit();
+    if (this.heldPermits() * 2 < this.config.maxConcurrent) this.#admissionAlarmAt = undefined;
+    this.#invalidateUiList();
+    return true;
+  }
+
   /**
    * smarty-dev#9855 part A: a held permit whose run is now proven gone (ENODEV-unconfirmed exit, worker gone, pid-reuse
    * safe; settleGoneEnodevLaunch) is released in the same step as the settle, exactly once (the permit is taken off the
@@ -2362,11 +2374,7 @@ export class AgentManager {
       if (!markerSettled) { this.#retryRecoveredAnswer(queued.info.id, queued); continue; }
       delete queued.cleanupPending;
       this.#stopRecoveryRetry(queued);
-      const permit = queued.heldPermit;
-      delete queued.heldPermit;
-      this.#retentionRevision++;
-      permit();
-      released++;
+      if (this.#releaseHeldPermit(queued)) released++;
     }
     for (const managed of this.#runs.values()) {
       if (!managed.heldPermit || !managed.settled) continue;
@@ -2380,16 +2388,10 @@ export class AgentManager {
       if (!this.#deliverRecoveredAnswer(managed, record)) { this.#retryRecoveredAnswer(managed.id, managed); continue; }
       if (!settleGoneEnodevLaunch(managed.runDirectory, managed.ownProcess)) continue;
       this.#stopRecoveryRetry(managed);
-      const permit = managed.heldPermit;
-      delete managed.heldPermit;
       delete managed.lostContact;
       managed.executionExited = true;
-      this.#retentionRevision++;
-      permit();
-      released++;
+      if (this.#releaseHeldPermit(managed)) released++;
     }
-    if (released) this.#invalidateUiList();
-    if (this.heldPermits() * 2 < this.config.maxConcurrent) this.#admissionAlarmAt = undefined; // the episode ended
     return released;
   }
 
@@ -4269,7 +4271,12 @@ export class AgentManager {
     // callers can each spend a grace when the first drain expires during join.
     if (managed.executionDrain) return managed.executionDrain;
     if (managed.processStop) await managed.processStop;
-    if (managed.executionExited) return;
+    if (managed.executionExited) {
+      if (!managed.processStopPending && managed.lostContact === undefined && managed.transport.lostContact?.() === undefined) {
+        this.#releaseHeldPermit(managed);
+      }
+      return;
+    }
     if (managed.executionDrain) return managed.executionDrain;
     const pending = (async () => {
       // Receipt-bound publication precedes native discard ACKs. Give the worker
@@ -4304,10 +4311,12 @@ export class AgentManager {
         throw new Error(`Agent ${managed.id} execution exit unconfirmed; custody retained: ${managed.lostContact}`);
       }
       managed.executionExited = true;
-      this.#retentionRevision++;
       delete managed.lostContact;
       fs.rmSync(path.join(managed.runDirectory, "unresolved-worker.json"), { force: true });
-      managed.executionRelease?.();
+      if (!this.#releaseHeldPermit(managed)) {
+        this.#retentionRevision++;
+        managed.executionRelease?.();
+      }
       delete managed.executionRelease;
     })();
     managed.executionDrain = pending;

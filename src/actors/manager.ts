@@ -80,6 +80,7 @@ import { MAX_ACTOR_BASH_TIMEOUT_S } from "../guards/actor-bash-timeout.js";
 import { ModelRoutePinError } from "../core/model-refresh.js";
 import type { FabricMessageSender, FabricScope } from "../protocol.js";
 import { launchScope, normalizeScope, processSender, senderStamp, senderTrusted } from "../scope.js";
+import { WARNING_RETENTION_CAP } from "../worker/provider-error.js";
 import { activationBlockClass, classifyActivationFailure, TRANSIENT_ACTIVATION_BLOCK_CODES, type ActivationBlockClass } from "./activation-failure.js";
 
 export interface ActorModelRouteInput {
@@ -591,7 +592,10 @@ type ActivationBlock = { reason: string; code: string; class: ActivationBlockCla
  * older host blocked for good on a transient cause recovers after an upgrade without a re-create. */
 const REDERIVED_BLOCK_CODES: ReadonlySet<string> = new Set(["unknown", "failing-preparation"]);
 /** Recognisable contradictory causes override an overflow tag, never weaken permanent failures. */
-const CONTRADICTORY_OVERFLOW_CODES: ReadonlySet<string> = new Set(["provider-transient", "auth", "permission", "security-policy", "quota", "invalid-request"]);
+const CONTRADICTORY_OVERFLOW_CODES: ReadonlySet<string> = new Set(["provider-transient", "auth", "permission", "security-policy", "quota", "invalid-request", "incomplete-evidence"]);
+// Saturated worker warnings cannot prove that permanent evidence was not evicted.
+const saturatedWarningEvidence = (warnings: readonly string[] | undefined): boolean =>
+  (warnings?.length ?? 0) >= WARNING_RETENTION_CAP;
 // Context-only wording must not hide an independent permanent cause, nor turn a
 // correctly typed provider overflow ("prompt is too long") into invalid configuration.
 const OVERFLOW_WORDING = /Context exceeds window|prompt (?:is )?too long|maximum context length|context(?:[ _-]+(?:window|length))?[ _-]+(?:overflow|exceeded|too long)|too many tokens/gi;
@@ -602,6 +606,8 @@ const classifyManagerActivationFailure = (input: Parameters<typeof classifyActiv
     const failure = classifyActivationFailure({ lastError: remaining, error: remaining });
     if (!failure.transient && CONTRADICTORY_OVERFLOW_CODES.has(failure.code)) return failure;
   }
+  if (saturatedWarningEvidence(input.evidence)) return { code: "incomplete-evidence", transient: false,
+    classification: "fail-closed: saturated worker warnings may have evicted permanent evidence; explicit session reset required" };
   const failure = classifyActivationFailure(input);
   return typedOverflow && contextWording && failure.code === "invalid-request"
     ? { code: "context-overflow", transient: false, classification: "permanent: context window exceeded (typed run with context-only wording)" }
@@ -631,7 +637,8 @@ const restoredActivationBlock = (stored: { reason: string; code: string; since: 
     const failure = authoritative && run ? classifyManagerActivationFailure({ lastError: run.error!, error: run.error, evidence: run.warnings }, run.errorCode === "CONTEXT_OVERFLOW") : undefined;
     const pureStream = failure?.code === "provider-transient" && failure.classification.startsWith("transient: model stream disconnect");
     const genuineOverflow = failure?.code === "context-overflow" && run?.errorCode === "CONTEXT_OVERFLOW";
-    const complete = markedComplete || pureStream || genuineOverflow;
+    // A version-1 complete marker cannot override available saturated retained evidence.
+    const complete = !saturatedWarningEvidence(run?.warnings) && (markedComplete || pureStream || genuineOverflow);
     overflowEvidence = { version: 1, ...(typeof runId === "string" ? { runId } : {}), complete };
     legacyOverflow = failure && !failure.transient && CONTRADICTORY_OVERFLOW_CODES.has(failure.code) ? failure
       : pureStream ? failure : { code: "context-overflow", transient: false,
@@ -4500,7 +4507,7 @@ export class ActorManager {
     actor.activationBlocked = {
       reason, code, class: activationBlockClass(code), since: previous?.code === code ? previous.since : now, blockedAt: now, count,
       classification, ...(transient ? { retryAt: now + backoffMs, backoffMs } : {}),
-      ...(code === "context-overflow" ? { overflowEvidence: { version: 1 as const, ...(typeof runId === "string" ? { runId } : {}), complete: contextOverflowCode && typeof runId === "string" } } : {}),
+      ...(code === "context-overflow" ? { overflowEvidence: { version: 1 as const, ...(typeof runId === "string" ? { runId } : {}), complete: contextOverflowCode && typeof runId === "string" && !saturatedWarningEvidence(evidence) } } : {}),
     };
     this.#armActivationBlockExpiry(actor, now);
     actor.updatedAt = now;

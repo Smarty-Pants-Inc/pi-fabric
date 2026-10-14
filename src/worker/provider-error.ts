@@ -1,3 +1,6 @@
+/** A saturated warning list cannot prove that no earlier permanent cause was evicted. */
+export const WARNING_RETENTION_CAP = 20;
+
 /** Same regex family as Pi 0.87's pi-ai/utils/retry, without importing provider
  * engines into the standalone worker. Authentication, policy, account limits, and context errors are terminal. */
 const nonRetryable = /GoUsageLimitError|FreeUsageLimitError|Monthly usage limit reached|available balance|insufficient_quota|out of budget|quota|billing|maximum context length|context.{0,20}(?:overflow|exceeded|too long)|too many tokens|prompt is too long|\b(?:auth(?:entication|orization)?(?:[-_\s]?(?:error|failure|failed|denied|refused))?|unauthorized|unauthenticated)\b|security.{0,20}policy|policy.{0,40}(?:refus|deni|block|reject)|permission|access.{0,20}(?:deni|forbidden|refus)|forbidden|400\b|401\b|403\b/i;

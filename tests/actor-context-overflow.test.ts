@@ -654,14 +654,18 @@ describe("actor context overflow (smarty-dev#3238, offline Pi child)", () => {
   }, TEST_GUARD_MS);
 
   it.each([
-    ["STREAM_DISCONNECT_ONCE", "Refused by security policy", "security-policy"],
-    ["OVERFLOW_ALWAYS", "Refused by security policy", "security-policy"],
-    ["OVERFLOW_ALWAYS", "Authentication failed", "auth"],
-    ["OVERFLOW_ALWAYS", "Context exceeds window; Authentication failed", "auth"],
-    ["OVERFLOW_ALWAYS", "Context exceeds window; Refused by security policy", "security-policy"],
-    ["OVERFLOW_ALWAYS", "prompt is too long; unsupported model", "invalid-request"],
-    ["OVERFLOW_ALWAYS", "prompt is too long; Authentication failed", "auth"],
-  ] as const)("keeps complete same-run evidence hard for %s with warning %s", async (marker, warning, code) => {
+    ["STREAM_DISCONNECT_ONCE", "Refused by security policy", "security-policy", 1],
+    ["OVERFLOW_ALWAYS", "Refused by security policy", "security-policy", 1],
+    ["OVERFLOW_ALWAYS", "Authentication failed", "auth", 1],
+    ["OVERFLOW_ALWAYS", "Context exceeds window; Authentication failed", "auth", 1],
+    ["OVERFLOW_ALWAYS", "Context exceeds window; Refused by security policy", "security-policy", 1],
+    ["OVERFLOW_ALWAYS", "prompt is too long; unsupported model", "invalid-request", 1],
+    ["OVERFLOW_ALWAYS", "prompt is too long; Authentication failed", "auth", 1],
+    ["STREAM_DISCONNECT_ONCE", "Authentication failed", "incomplete-evidence", 20],
+    ["OVERFLOW_ALWAYS", "Authentication failed", "incomplete-evidence", 20],
+    ["STREAM_DISCONNECT_ONCE", "benign diagnostic", "provider-transient", 19],
+    ["OVERFLOW_ALWAYS", "benign diagnostic", "context-overflow", 19],
+  ] as const)("classifies same-run %s with warning %s as %s at count %s", async (marker, warning, code, count) => {
     const s = setup();
     const actor = await s.create("stream-security");
     await s.actors.ask(actor.id, "FIRST_REVIEW");
@@ -671,13 +675,34 @@ describe("actor context overflow (smarty-dev#3238, offline Pi child)", () => {
       const result = await run(...args);
       if (result.status === "failed") {
         result.errorCode = "CONTEXT_OVERFLOW";
-        result.warnings = [warning];
+        // The real process result passes through the worker's capped append sequence.
+        const benign = Array.from({ length: count }, (_, index) => `benign diagnostic ${index}`);
+        result.warnings = count === 1 ? [warning] : count === 20 ? [warning, ...benign].slice(-20) : benign;
+        expect(result.warnings).toHaveLength(count);
+        if (count === 20) expect(result.warnings).not.toContain("Authentication failed");
       }
       return result;
     });
     await expect(s.actors.ask(actor.id, marker)).rejects.toThrow(marker === "STREAM_DISCONNECT_ONCE"
       ? /stream disconnected before completion/ : /Context exceeds window/);
     await waitFor(() => s.actors.inFlightCount() === 0);
+    if (count === 19) {
+      if (code === "provider-transient") {
+        const blocked = s.actors.status(actor.id).activationBlocked!;
+        expect(blocked).toMatchObject({ code, class: "transient" });
+        const realNow = Date.now.bind(Date);
+        const skew = blocked.retryAt! + 1 - realNow();
+        vi.spyOn(Date, "now").mockImplementation(() => realNow() + skew);
+      } else {
+        await waitFor(() => s.actors.status(actor.id).activationBlocked === undefined);
+        expect(resets(s.actors, actor.id)).toHaveLength(2);
+      }
+      await expect(s.actors.ask(actor.id, "NEXT_REVIEW")).resolves.toMatchObject({ text: "verdict: ok" });
+      await waitFor(() => s.actors.inFlightCount() === 0);
+      expect(s.prompts().at(-1)).toMatchObject({ marker: "NEXT_REVIEW" });
+      expect(s.actors.status(actor.id).activationBlocked).toBeUndefined();
+      return;
+    }
     expect(s.actors.status(actor.id).activationBlocked).toMatchObject({ code, class: "hard" });
     expect(s.actors.status(actor.id).activationBlocked).not.toHaveProperty("retryAt");
     expect(s.prompts()).toHaveLength(2);
@@ -688,7 +713,7 @@ describe("actor context overflow (smarty-dev#3238, offline Pi child)", () => {
   // Trust-boundary/data-safety check: old blocks omitted warnings. Use the actual process
   // worker's retained status, then model old metadata and missing/corrupt/mismatched evidence.
   it.each((["stream", "overflow"] as const).flatMap(cause =>
-    (["pure", "auth", "security", "missing", "unreadable", "mismatched"] as const).map(evidence => ({ cause, evidence }))))
+    (["pure", "nineteen", "saturated", "marked-saturated", "auth", "security", "missing", "unreadable", "mismatched"] as const).map(evidence => ({ cause, evidence }))))
   ("restores legacy $cause with $evidence complete-run evidence, never replaying the settled item", async ({ cause, evidence }) => {
     const s = setup();
     const actor = await s.create("legacy");
@@ -708,6 +733,12 @@ describe("actor context overflow (smarty-dev#3238, offline Pi child)", () => {
     await s.actors.close();
     // Legacy worker mistagged pure stream failures, but the complete record retained warnings.
     status.errorCode = "CONTEXT_OVERFLOW";
+    if (evidence === "nineteen") status.warnings = Array.from({ length: 19 }, (_, index) => `benign diagnostic ${index}`);
+    if (evidence === "saturated" || evidence === "marked-saturated") {
+      status.warnings = ["Authentication failed", ...Array.from({ length: 20 }, (_, index) => `benign diagnostic ${index}`)].slice(-20);
+      expect(status.warnings).toHaveLength(20);
+      expect(status.warnings).not.toContain("Authentication failed");
+    }
     if (evidence === "auth") status.warnings = ["Authentication failed"];
     if (evidence === "security") status.warnings = ["Refused by security policy"];
     if (evidence === "mismatched") status.id = "not-the-blocked-run";
@@ -719,39 +750,43 @@ describe("actor context overflow (smarty-dev#3238, offline Pi child)", () => {
     row.activationBlocked = { code: "context-overflow", class: "hard", reason: status.error.slice(0, 300),
       since: Date.now() - 24 * 60 * 60 * 1000, count: 3,
       classification: "permanent: context window exceeded (typed CONTEXT_OVERFLOW run code)" };
+    if (evidence === "marked-saturated") row.activationBlocked.overflowEvidence = { version: 1, runId, complete: true };
     row.failureStreak = { count: 3, notified: true };
     fs.writeFileSync(file, JSON.stringify(registry));
     let restarted = s.makeActors();
     managers.push(restarted);
     const presence = () => s.mesh.get(`actors/overflow-test/${actor.id}`)?.value as
       { activationBlocked?: { code: string }; activationBlockExpired?: { code: string } } | undefined;
-    if (evidence === "pure" && cause === "stream") {
+    const recoverable = evidence === "pure" || evidence === "nineteen";
+    if (recoverable && cause === "stream") {
       await waitFor(() => presence()?.activationBlockExpired?.code === "provider-transient");
       expect(presence()?.activationBlocked).toBeUndefined();
       expect(header(actor.sessionFile!)).toBe(carried);
       expect(resets(restarted, actor.id)).toHaveLength(resetCount);
-    } else if (evidence === "pure") {
+    } else if (recoverable) {
       await waitFor(() => resets(restarted, actor.id).length === resetCount + 1 && presence()?.activationBlocked === undefined);
       expect(header(actor.sessionFile!)).not.toBe(carried);
       expect(resets(restarted, actor.id).at(-1)).toMatchObject({ overflow: true, retry: false });
     } else {
-      const code = evidence === "auth" ? "auth" : evidence === "security" ? "security-policy" : "context-overflow";
+      const code = evidence === "auth" ? "auth" : evidence === "security" ? "security-policy" : evidence === "saturated" ? "incomplete-evidence" : "context-overflow";
       await waitFor(() => presence()?.activationBlocked?.code === code);
       expect(restarted.status(actor.id).activationBlocked).toMatchObject({ code, class: "hard" });
       expect(restarted.status(actor.id).activationBlocked).not.toHaveProperty("retryAt");
       expect(header(actor.sessionFile!)).toBe(carried);
       expect(resets(restarted, actor.id)).toHaveLength(resetCount);
-      if (code === "context-overflow") {
+      if (code === "context-overflow" || code === "incomplete-evidence") {
         expect(restarted.status(actor.id).activationBlocked).toMatchObject({ overflowEvidence: { version: 1, complete: false } });
         // A later readable record must not let a re-save re-derive the incomplete reason.
         await restarted.close();
         status.id = runId;
+        status.warnings = []; // Re-save/reload must not upgrade incomplete evidence.
         fs.writeFileSync(statusFile, JSON.stringify(status));
         restarted = s.makeActors();
         managers.push(restarted);
         await waitFor(() => presence()?.activationBlocked?.code === code);
-        expect(restarted.status(actor.id).activationBlocked).toMatchObject({ code, class: "hard",
-          overflowEvidence: { version: 1, complete: false } });
+        expect(restarted.status(actor.id).activationBlocked).toMatchObject({ code, class: "hard" });
+        if (code === "context-overflow") expect(restarted.status(actor.id).activationBlocked)
+          .toMatchObject({ overflowEvidence: { version: 1, complete: false } });
         expect(header(actor.sessionFile!)).toBe(carried);
         expect(resets(restarted, actor.id)).toHaveLength(resetCount);
       }

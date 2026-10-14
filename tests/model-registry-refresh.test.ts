@@ -25,8 +25,8 @@ const withRuntime = async (
     vi.stubEnv("PI_FABRIC_MAIN_AGENT_ID", "session:remote-parent");
     vi.stubEnv("PI_FABRIC_PARENT_RUN", "parent-run");
     vi.stubEnv("PI_FABRIC_ACTOR_ID", options.parentKind === "actor" ? "parent-actor" : "");
-    // #2490 tests inheritance from a delegating parent, not a #12187 leaf task.
-    // Model the parent's own recursive launch grant; a child's flag cannot grant it.
+    // #2490 tests spawn inheritance from a delegating parent, not a #12187 leaf task.
+    // The parent's own recursive launch grant permits spawn, never actor creation.
     vi.stubEnv("PI_FABRIC_GRANTED_RISKS", options.parentKind === "agent" && (options.recursive ?? true) ? "agent" : "");
   }
   const models = [{ provider: "dest", id: "old", name: "Old", contextWindow: 48_000 },
@@ -68,8 +68,15 @@ it.each(["actor", "agent"] as const)("#2490 inherits the actual %s host binding 
     expect(handle).toMatchObject({ model: "dest/old", thinking: "max" });
     expect(refresh).not.toHaveBeenCalled();
     await runtime.agents.stop(handle.id);
-    const actor = await invoke(runtime, context, "agents.create", { name: "nested", instructions: "Review." }) as { id: string };
-    expect(runtime.actors.definition(actor.id)).toMatchObject({ model: "dest/old", thinking: "max" });
+    const createArgs = { name: "nested", instructions: "Review." };
+    if (parentKind === "agent") {
+      await expect(invoke(runtime, context, "agents.create", createArgs)).rejects.toThrow(TaskSpawnDeniedError);
+      expect(runtime.actors.list()).toEqual([]);
+    } else {
+      const actor = await invoke(runtime, context, "agents.create", createArgs) as { id: string };
+      expect(runtime.actors.definition(actor.id)).toMatchObject({ model: "dest/old", thinking: "max" });
+    }
+    expect(refresh).not.toHaveBeenCalled();
   }, [], {}, { parentKind, thinking: "max", agents: { model: "dest/denied", thinking: "low", deniedModels: ["dest/denied"], deniedModelReplacement: "dest/old" } });
 });
 

@@ -24,7 +24,8 @@ import { assertTaskRunPathUnaliased, assertTaskRunRootAdmissible } from "../work
 
 /** DELTA-SEC-02: errors from the run-path alias guard; never followed by a run-path outcome write. */
 const unsafeRunPathErrors = new WeakSet<object>();
-const isUnsafeRunPathError = (error: unknown): boolean => typeof error === "object" && error !== null && unsafeRunPathErrors.has(error);
+const isUnsafeRunPathError = (error: unknown): boolean => typeof error === "object" && error !== null &&
+  (unsafeRunPathErrors.has(error) || ["FABRIC_RUN_IDENTITY_REFUSED", "FABRIC_CONTROL_PUBLISH_UNSUPPORTED_PLATFORM"].includes(String((error as { code?: unknown }).code)));
 const assertRunPathSafe = (runDirectory: string, inheritedRoot: boolean): void => {
   const makeError = (message: string): Error => {
     const error = new FabricTaskControlDirectoryError(message); // same error type as before (imported below; hoisted)
@@ -41,27 +42,31 @@ const runIdentityRefusal = (message: string): Error => {
   unsafeRunPathErrors.add(error);
   return error;
 };
+const unsupportedControlPublication = (run: string): Error => {
+  const error = Object.assign(new FabricTaskControlDirectoryError(
+    `FABRIC_CONTROL_PUBLISH_UNSUPPORTED_PLATFORM: routed dispatch control publication is unsupported on this platform until smarty-dev#12444 lands; non-routed spawns are unaffected (${run})`,
+  ), { code: "FABRIC_CONTROL_PUBLISH_UNSUPPORTED_PLATFORM" });
+  unsafeRunPathErrors.add(error);
+  return error;
+};
 const NOFOLLOW_DIRECTORY = fs.constants.O_RDONLY | (fs.constants.O_DIRECTORY ?? 0) | (fs.constants.O_NOFOLLOW ?? 0);
 /**
  * DELTA-SEC-02: bind the freshly allocated run directory's dev+ino ONCE, right after createHostTaskRun and before any
  * yield. The bound identity must equal both the no-follow opened directory and the central v2 binding the exclusive
  * allocation published, so a replacement cannot be recaptured. `use` reopens no-follow and rechecks dev+ino immediately
- * before each write; on Linux the write goes through the held fd (`/proc/self/fd/N`), elsewhere through the checked
- * path (Windows: lstat-checked; named check-to-use residual off Linux).
+ * before each write; publication requires a traversable held fd (`/proc/self/fd/N` or equivalent). Platforms without
+ * one refuse routed control publication before opening a temp file; plain non-routed task spawns are unaffected.
  */
 const pinRunDirectory = (runDirectory: string): RunDirectoryPin => {
   const run = path.resolve(runDirectory);
-  const win32 = process.platform === "win32";
-  const base = win32 ? undefined : fdBase();
-  if (!win32 && base === undefined && process.platform === "linux") throw runIdentityRefusal(`Cannot pin run directory ${run}: /proc/self/fd does not resolve a held directory`);
-  const open = (): { fd: number | undefined; dev: bigint; ino: bigint } => {
-    if (win32) {
-      let stat: fs.BigIntStats;
-      try { stat = fs.lstatSync(run, { bigint: true }); }
-      catch (error) { throw runIdentityRefusal(`Run directory ${run} is gone (${(error as NodeJS.ErrnoException).code}); refusing route write`); }
-      if (stat.isSymbolicLink() || !stat.isDirectory()) throw runIdentityRefusal(`Run directory ${run} was replaced by a link or non-directory; refusing route write`);
-      return { fd: undefined, dev: stat.dev, ino: stat.ino };
-    }
+  const platform = managerRunTestHooks.platform ?? process.platform;
+  const base = platform === "win32"
+    ? undefined
+    : managerRunTestHooks.resolveFdBase
+      ? managerRunTestHooks.resolveFdBase()
+      : fdBase();
+  if (base === undefined) throw unsupportedControlPublication(run);
+  const open = (): { fd: number; dev: bigint; ino: bigint } => {
     let fd: number;
     try { fd = fs.openSync(run, NOFOLLOW_DIRECTORY); }
     catch (error) { throw runIdentityRefusal(`Run directory ${run} cannot be opened without following links (${(error as NodeJS.ErrnoException).code}); refusing route write`); }
@@ -86,13 +91,19 @@ const pinRunDirectory = (runDirectory: string): RunDirectoryPin => {
       const current = open();
       try {
         if (current.dev !== bound.dev || current.ino !== bound.ino) throw runIdentityRefusal(`Run directory ${run} is no longer the allocated directory; refusing route write (nothing written)`);
-        return operation(current.fd !== undefined && base !== undefined ? `${base}/${current.fd}` : run, current.fd);
-      } finally { if (current.fd !== undefined) fs.closeSync(current.fd); }
+        return operation(`${base}/${current.fd}`, current.fd);
+      } finally { fs.closeSync(current.fd); }
     },
   };
 };
 /** Test seam only: awaited (when set) at the post-allocation yield, before route-module import and receipt write. */
-export const managerRunTestHooks: { afterRunAllocation?: (runDirectory: string) => void | Promise<void> } = {};
+export const managerRunTestHooks: {
+  afterRunAllocation?: (runDirectory: string) => void | Promise<void>;
+  /** Test-only platform override for the fail-closed no-fd publication boundary. */
+  platform?: NodeJS.Platform;
+  /** Test-only override for the held-directory traversal capability used by routed publication. */
+  resolveFdBase?: () => string | undefined;
+} = {};
 
 import { fileURLToPath } from "node:url";
 import { assertFabricModelAllowed, FabricModelDeniedError } from "../core/model-policy.js";
@@ -1581,10 +1592,12 @@ export class AgentManager {
     // Count accepted requests, including queued ones, exactly once.
     this.#semaphore.admit(this.#currentDepth + 1);
     // Exclusive fresh allocation is the host witness; publish current-only authority before route/custody/task writes.
-    createHostTaskRun(path.join(this.#runRoot, id));
-    // DELTA-SEC-02: bind the ORIGINAL allocation identity before any yield; every later route write reverifies it.
-    const runPin = pinRunDirectory(path.join(this.#runRoot, id));
-    if (managerRunTestHooks.afterRunAllocation) await managerRunTestHooks.afterRunAllocation(runPin.run);
+    const runDirectory = path.join(this.#runRoot, id);
+    createHostTaskRun(runDirectory);
+    // Routed dispatch is the only path that publishes route controls in C. Plain
+    // task spawns keep working on platforms without a traversable directory fd.
+    const runPin = request.routeDecision ? pinRunDirectory(runDirectory) : undefined;
+    if (managerRunTestHooks.afterRunAllocation) await managerRunTestHooks.afterRunAllocation(runDirectory);
     const name = safeName(request.name ?? request.task.split("\n", 1)[0] ?? "Fabric agent");
     const callerSignal = signal;
     const assertAuthorized = (): void => {
@@ -1598,7 +1611,7 @@ export class AgentManager {
     let routeDispatch: ReturnType<typeof import("./model-route.js")["prepareRouteDispatch"]> | undefined;
     if (request.routeDecision) {
       const { prepareRouteDispatch } = await import("./model-route.js");
-      routeDispatch = prepareRouteDispatch(request.routeDecision, undefined, path.join(this.#runRoot, id), id, { ...request.routeRecord, runPin });
+      routeDispatch = prepareRouteDispatch(request.routeDecision, undefined, runDirectory, id, { ...request.routeRecord, runPin: runPin! });
       // Failed decision storage demotes before admission: no unlogged candidate.
       routePin = Object.freeze({ ...(request.routeDecision.mode === "live"
         ? { model: request.routeDecision.model, effort: request.routeDecision.effort } : request.routeDecision.pin) });
@@ -1626,12 +1639,11 @@ export class AgentManager {
         release();
         throw refusal ?? error;
       }
-      const runDirectory = path.join(this.#runRoot, id);
       // DELTA-SEC-02: recheck after async preparation (an alias may have changed) BEFORE the first mkdir/custody/task write.
       // Refusal releases admission but never invokes the route outcome saver through the aliased path.
       assertRunPathSafe(runDirectory, this.#inheritedRunRoot);
       // A real replacement directory is not an alias: require the original allocation identity too.
-      runPin.use(() => undefined);
+      runPin?.use(() => undefined);
       // 0700 whatever the umask (smarty-dev#9016): a login shell's umask 002 made run directories 0775, which
       // verified retention refuses (group-writable). Only directories it creates are changed.
       mkdirPrivate(runDirectory, this.#trustRoot());

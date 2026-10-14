@@ -338,30 +338,32 @@ function saveRouteOutcome(decision: ModelRouteDecision, result: { status: string
 
 /** DELTA-SEC-02: typed refusal code for a run directory whose bound allocation identity changed. */
 export const RUN_IDENTITY_REFUSED = "FABRIC_RUN_IDENTITY_REFUSED";
+/** No portable openat-equivalent is available when the held directory fd cannot be traversed. */
+export const CONTROL_PUBLISH_UNSUPPORTED_PLATFORM = "FABRIC_CONTROL_PUBLISH_UNSUPPORTED_PLATFORM";
 /** The allocated run directory, bound once (dev+ino, no-follow). `use` reverifies the identity immediately before
- * each in-run write and passes the directory to write through: the held fd path on Linux, else the checked path.
- * A mismatch throws an error whose `code` is RUN_IDENTITY_REFUSED, before the operation runs. */
+ * each in-run write and passes the held directory fd path through. A mismatch throws an error whose `code` is
+ * RUN_IDENTITY_REFUSED, before the operation runs. Platforms without a traversable fd fail closed. */
 export interface RunDirectoryPin { readonly run: string; use<T>(operation: (directory: string, fd: number | undefined) => T): T }
-const isRunIdentityRefusal = (error: unknown): boolean => (error as { code?: unknown } | undefined)?.code === RUN_IDENTITY_REFUSED;
-/** Atomic publication inside the pinned run: O_EXCL|O_NOFOLLOW temp, then rename within the same directory. */
+const isRunIdentityRefusal = (error: unknown): boolean => [RUN_IDENTITY_REFUSED, CONTROL_PUBLISH_UNSUPPORTED_PLATFORM]
+  .includes(String((error as { code?: unknown } | undefined)?.code));
+const unsupportedControlPublication = (run: string): Error => Object.assign(new Error(
+  `${CONTROL_PUBLISH_UNSUPPORTED_PLATFORM}: routed dispatch control publication is unsupported on this platform until smarty-dev#12444 lands; non-routed spawns are unaffected (${run})`,
+), { code: CONTROL_PUBLISH_UNSUPPORTED_PLATFORM });
+/** Atomic publication inside the pinned run: O_EXCL|O_NOFOLLOW temp, then rename within the directory fd. */
 const publishInRun = (pin: RunDirectoryPin, name: string, contents: string, durable: boolean): string => pin.use((directory, directoryFd) => {
+  if (directory === pin.run || directoryFd === undefined) throw unsupportedControlPublication(pin.run);
   const temporary = path.join(directory, `.${name}.${process.pid}.${randomUUID()}.tmp`);
   let renamed = false;
   try {
     const fd = fs.openSync(temporary, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | (fs.constants.O_NOFOLLOW ?? 0), 0o600);
     try { fs.writeFileSync(fd, contents, "utf8"); if (durable) fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
-    // No traversable fd base on this platform: recheck the allocation again at
-    // publication, after the potentially blocking file fsync. Linux stays fd-relative.
-    if (directory === pin.run) pin.use(current => fs.renameSync(temporary, path.join(current, name)));
-    else fs.renameSync(temporary, path.join(directory, name));
+    fs.renameSync(temporary, path.join(directory, name));
     renamed = true;
-    if (durable && directoryFd !== undefined && process.platform !== "win32") fs.fsyncSync(directoryFd);
+    if (durable) fs.fsyncSync(directoryFd);
   } finally {
     if (!renamed) {
-      try {
-        if (directory === pin.run) pin.use(current => fs.unlinkSync(path.join(current, path.basename(temporary))));
-        else fs.unlinkSync(temporary);
-      } catch (error) { if (isRunIdentityRefusal(error)) throw error; /* never created or already gone */ }
+      try { fs.unlinkSync(temporary); }
+      catch { /* never created or already gone */ }
     }
   }
   return path.join(pin.run, name);

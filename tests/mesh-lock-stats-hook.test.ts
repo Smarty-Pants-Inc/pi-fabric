@@ -136,7 +136,7 @@ describe("MeshStore lock-timing hook", () => {
     }
   });
 
-  it("counts one failed try per bounded attempt of a cold protocol-2 store, and no timeout", async () => {
+  it("records no failed try or timeout for a cold protocol-2 pending incarnation", async () => {
     const root = temp();
     const seed = new store.MeshStore(root, 64 * 1024, 100);
     await seed.put({ key: "presence/a", value: 0, identity }); // state exists: the snapshot path
@@ -148,18 +148,18 @@ describe("MeshStore lock-timing hook", () => {
       const cold = new store.MeshStore(root, 64 * 1024, 100, { lockProtocol: 2 });
       for (let attempt = 0; attempt < 2; attempt++) {
         await expect(cold.withTryLock(() => cold.put({ key: "presence/a", value: 1, identity }), 0))
-          .rejects.toBeInstanceOf(store.MeshLockTimeoutError);
+          .rejects.toBeInstanceOf(store.MeshIncarnationPendingError);
       }
-      await expect(cold.withTryLock(() => cold.confirmWritable(), 0)).rejects.toBeInstanceOf(store.MeshLockTimeoutError);
+      await expect(cold.withTryLock(() => cold.confirmWritable(), 0)).rejects.toBeInstanceOf(store.MeshIncarnationPendingError);
       let recorded = classes(root);
-      expect(recorded["put/delete"]).toMatchObject({ n: 1, tries: 2, timeouts: 0 });
-      expect(recorded["heartbeat/confirm"]).toMatchObject({ n: 0, tries: 1, timeouts: 0 });
+      expect(recorded["put/delete"]).toMatchObject({ n: 1, tries: 0, timeouts: 0 });
+      expect(recorded["heartbeat/confirm"]).toBeUndefined();
       resolve(undefined);
       await cold.put({ key: "presence/a", value: 2, identity });
       await cold.confirmWritable();
       recorded = classes(root);
-      expect(recorded["put/delete"]).toMatchObject({ n: 2, tries: 2, timeouts: 0 });
-      expect(recorded["heartbeat/confirm"]).toMatchObject({ n: 1, tries: 1, timeouts: 0 });
+      expect(recorded["put/delete"]).toMatchObject({ n: 2, tries: 0, timeouts: 0 });
+      expect(recorded["heartbeat/confirm"]).toMatchObject({ n: 1, tries: 0, timeouts: 0 });
     } finally {
       resolve(undefined);
       spy.mockRestore();

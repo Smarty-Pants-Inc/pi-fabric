@@ -31,9 +31,14 @@ describe("PI_FABRIC_COMMIT_STATS", () => {
     const { root, file } = setup();
     vi.useFakeTimers();
     const baselineExitListeners = process.listenerCount("exit");
-    const source = fileURLToPath(new URL("../src/mesh/commit-stats.ts", import.meta.url));
-    const copies = ["release-a.ts", "release-b.ts"].map(name => path.join(root, name));
-    for (const copy of copies) fs.copyFileSync(source, copy);
+    // Each generation is a full installed tree: mesh/commit-stats.ts imports ../storage/verified-remove.js.
+    const copies = ["release-a", "release-b"].map(release => {
+      for (const module of ["mesh/commit-stats.ts", "storage/verified-remove.ts"]) {
+        fs.mkdirSync(path.dirname(path.join(root, release, module)), { recursive: true });
+        fs.copyFileSync(fileURLToPath(new URL(`../src/${module}`, import.meta.url)), path.join(root, release, module));
+      }
+      return path.join(root, release, "mesh/commit-stats.ts");
+    });
     const firstModule = await import(/* @vite-ignore */ pathToFileURL(copies[0]!).href);
     const first = firstModule.createCommitStats(file)!;
     first.record(123, ["sessions/a"]);

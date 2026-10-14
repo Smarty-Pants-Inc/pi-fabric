@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -28,6 +29,50 @@ describe("worker bootstrap diagnostics", () => {
     expect(record.stderr.length).toBeLessThanOrEqual(20000);
     expect(record.finishedAt).toBeGreaterThanOrEqual(record.startedAt);
     if (process.platform !== "win32") expect(fs.statSync(file).mode & 0o777).toBe(0o600);
+  });
+
+  it("persists validated prompt and current-input metadata before manager close", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "worker-startup-"));
+    roots.push(root);
+    const statusFile = path.join(root, "status.json");
+    const taskFile = path.join(root, "task.txt");
+    const currentTask = "café\ncurrent task";
+    fs.writeFileSync(taskFile, currentTask, "utf8");
+    const digest = (value: string): string => createHash("sha256").update(value, "utf8").digest("hex");
+    const originalPrompt = "original prompt";
+    writeWorkerStartupFailure([
+      "node", "worker.js", "--status-file", statusFile, "--task-file", taskFile,
+      "--prompt-sha256", digest(originalPrompt), "--prompt-bytes", String(Buffer.byteLength(originalPrompt)),
+      "--prompt-path", taskFile, "--input-sha256", digest(currentTask),
+      "--input-bytes", String(Buffer.byteLength(currentTask)),
+    ], new Error("startup failed"));
+
+    const record = JSON.parse(fs.readFileSync(statusFile, "utf8"));
+    expect(record).toMatchObject({
+      task: currentTask,
+      promptSha256: digest(originalPrompt),
+      promptBytes: Buffer.byteLength(originalPrompt),
+      promptPath: taskFile,
+      inputSha256: digest(currentTask),
+      inputBytes: Buffer.byteLength(currentTask),
+    });
+    expect(record.promptSha256).not.toBe(record.inputSha256);
+  });
+
+  it("omits malformed startup prompt metadata", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "worker-startup-"));
+    roots.push(root);
+    const statusFile = path.join(root, "status.json");
+    writeWorkerStartupFailure([
+      "node", "worker.js", "--status-file", statusFile,
+      "--prompt-sha256", "A".repeat(64), "--prompt-bytes", "1.5",
+      "--input-sha256", "not-a-digest", "--input-bytes", "9007199254740992",
+    ], new Error("startup failed"));
+    const record = JSON.parse(fs.readFileSync(statusFile, "utf8"));
+    expect(record).not.toHaveProperty("promptSha256");
+    expect(record).not.toHaveProperty("promptBytes");
+    expect(record).not.toHaveProperty("inputSha256");
+    expect(record).not.toHaveProperty("inputBytes");
   });
 
   it("does not invent a destination when no status path is available", () => {

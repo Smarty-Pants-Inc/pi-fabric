@@ -17,6 +17,7 @@ const stable = [
   "jev.js",
   "protocol.js",
   "judge-cli.js",
+  "resident-drain-cli.js",
   "scope.js",
   "core/provider-operations.js",
   "worker.js",

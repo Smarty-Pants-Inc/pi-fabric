@@ -58,6 +58,7 @@
     "mesh-bridge": "./bin/mesh-bridge",
     "fabric-releases": "./bin/fabric-releases",
     "fabric-actors": "./bin/fabric-actors",
+    "fabric-resident-drain": "./bin/fabric-resident-drain",
     "fabric-mesh-lock-stats": "./bin/fabric-mesh-lock-stats",
     "fabric-mesh-backend": "./bin/fabric-mesh-backend"
   },
@@ -86,6 +87,7 @@
     "proof:dist": "node scripts/smoke-verified-kernels.mjs",
     "build": "bun run proof:artifact && node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.build.json --emitDeclarationOnly && node scripts/build.mjs && bun run assert:build-artifacts",
     "typecheck": "tsc --noEmit",
+    "test": "node scripts/run-tests.mjs",
     "test:pi1": "bun run build && vitest run tests/pi1-sdk.test.ts tests/pi1-public-contract.test.ts tests/pi110-compaction-contract.test.ts",
     "test:jev:live": "PI_FABRIC_JEV_LIVE=1 vitest run tests/jev-live.test.ts",
     "test:jev:dist": "node scripts/smoke-jev.mjs",

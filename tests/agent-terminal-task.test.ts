@@ -244,7 +244,7 @@ describe("ordinary process-task final answer boundary", () => {
   it("retries a failed sender route on status and retains an acknowledged notice for collection", async () => {
     let attempts = 0, acknowledged = 0;
     const routed: AgentTerminalNotice[] = [];
-    const { manager, root, close, finish } = harness(notice => {
+    const { manager, root, launch, close, finish } = harness(notice => {
       routed.push(notice);
       attempts++;
       if (attempts === 1) throw new Error("sender temporarily unavailable");
@@ -258,7 +258,10 @@ describe("ordinary process-task final answer boundary", () => {
       id: queued.messageId, delivery: "steer", state: "refused", forwarded: true, provenance,
     });
     const receipt = finish(handle.id, "done");
-    await manager.wait(handle.id, { timeoutMs: 1000 }); close(handle.id);
+    await manager.wait(handle.id, { timeoutMs: 1000 });
+    const next = await manager.spawn({ task: "native-close barrier", transport: "process" });
+    expect(next.status).toBe("queued");
+    close(handle.id);
     const outbox = path.join(root, handle.id, "terminal-notices", `${queued.messageId}.json`);
     await waitUntil(() => attempts === 1 && fs.existsSync(outbox));
     expect(canRemoveTerminalRun(path.join(root, handle.id))).toBe(false);
@@ -273,8 +276,9 @@ describe("ordinary process-task final answer boundary", () => {
     expect(attempts).toBe(2);
     expect(canRemoveTerminalRun(path.join(root, handle.id))).toBe(true);
     // Sender routing can complete before the independently owned native drain.
-    // A route ACK is not an execution-close receipt; join the custody barrier.
-    await waitUntil(() => !manager.hasRunCustody(handle.id));
+    // The queued next launch proves the first run released native admission.
+    await waitUntil(() => launch.mock.calls.length === 2);
+    close(next.id);
     expect((await manager.cleanup(handle.id)).cleaned).toBe(false); // retained run, no worktree
   });
 

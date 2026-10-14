@@ -243,6 +243,11 @@ describe("task spawn admission through the real worker process transport (#12187
     const turn = JSON.parse(report.guest.reply.text);
     expect(turn.label).toBe("actor-turn");
     expect(turn.identity.kind).toBe("actor");
+    // A completed actor worker can still report a failed guest. Keep its actual
+    // refusal/timeout visible instead of hiding it behind an undefined-property error.
+    expect(turn.error, JSON.stringify(turn)).toBeUndefined();
+    expect(turn.guestError, JSON.stringify(turn)).toBeUndefined();
+    expect(turn.guest, JSON.stringify(turn)).toBeDefined();
     expect(turn.guest.status).toBe("completed");
     expect(turn.children).toEqual([{ id: turn.guest.id, status: "completed" }]);
     const child = JSON.parse(turn.guest.text);

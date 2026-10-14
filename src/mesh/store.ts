@@ -4,7 +4,8 @@ import { createHash, randomBytes, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { MeshLock, type MeshStoreContext } from "./mesh-lock.js";
+import { delay, MeshLock, type MeshStoreContext } from "./mesh-lock.js";
+import { isNamespaceRace } from "../core/atomic-write.js";
 import { acquireMeshCustodyLock, withMeshCustody } from "./custody-lock.js";
 import type { MeshReadOptions, MeshStateEntry, MeshBatchResult, MeshBatchView } from "./state-file.js";
 import { createStateBackend, isMeshStateWalCap, type MeshStateBackendKind, type StateBackend, type StateBackendBatchInput,
@@ -15,6 +16,7 @@ import { writeFileAtomic } from "../core/atomic-write.js";
 import type { FabricMessageSender } from "../protocol.js";
 import { copyFabricPrincipal, type FabricPrincipal } from "../fabric-provenance.js";
 import { processSender } from "../scope.js";
+import { verifiedRemove } from "../storage/verified-remove.js";
 export { MeshLockTimeoutError } from "../core/atomic-write.js";
 export { MeshLockIdentityNotReadyError, MeshLockSnapshotNotReadyError } from "./mesh-lock.js";
 export type { MeshIdentity, MeshEvent, MeshPublishInput, MeshTailResult } from "./event-log.js";
@@ -184,7 +186,14 @@ export const pruneDeadCensusRecords = (root: string): void => {
     if (!/^\d+-\d+\.json$/.test(name.slice(prefix.length))) continue;
     const file = path.join(directory, name);
     try {
-      if (censusRecordPrunable(JSON.parse(fs.readFileSync(file, "utf8")), host)) fs.rmSync(file, { force: true });
+      // smarty-dev#8907: the stat and the judged content come from one fd, so only that judged inode is removed
+      // (a record swapped in after the judgment stays); off Linux main's removal (smarty-dev#7858).
+      const fd = fs.openSync(file, "r");
+      let judged: fs.Stats, text: string;
+      try { judged = fs.fstatSync(fd); text = fs.readFileSync(fd, "utf8"); } finally { fs.closeSync(fd); }
+      if (censusRecordPrunable(JSON.parse(text), host)) {
+        verifiedRemove(file, judged, { deleter: "censusRecordPrune", fallback: () => { fs.rmSync(file, { force: true }); return true; } });
+      }
     } catch { /* unreadable or already gone: left to the next prune */ }
   }
 };
@@ -209,6 +218,9 @@ const censusDirectoryIdentity = (directory: string, create = true): string => {
 const prunedCensusRoots = new Set<string>();
 /** This process's census records by directory identity: the file and its stores still open. */
 const ownCensusRecords = new Map<string, { file: string; stores: number }>();
+// ponytail: no judgment precedes these two removals: the name <hostSlug>-<pid>-<startedAt>.json is this live process's
+// own record, written only by it (writeMeshWriterRecord refuses any other content), and no other process prunes it
+// while this incarnation is alive (censusRecordPrunable), so no aged or judged inode can be swapped in.
 const removeOwnCensusRecords = (): void => {
   for (const { file } of ownCensusRecords.values()) try { fs.rmSync(file, { force: true }); } catch { /* best effort */ }
 };
@@ -268,6 +280,7 @@ const writeMeshWriterRecord = (directory: string, file: string, host: string, lo
       const temporary = `${file}.${randomBytes(8).toString("hex")}.tmp`;
       fs.writeFileSync(temporary, serialized, { flag: "w", mode: 0o600 });
       try { fs.renameSync(temporary, file); }
+      // ponytail: our own unpublished temporary (random name, created just above), removed only after its rename failed.
       catch (error) { fs.rmSync(temporary, { force: true }); throw error; }
     }
     if (ownCensusRecords.size === 0) process.once("exit", removeOwnCensusRecords);
@@ -445,6 +458,11 @@ export class MeshStore {
   /** The backend itself, for maintenance tools (shadow verify/repair, the L3 projector, L4 census). */
   get stateBackendHandle(): StateBackend {
     return this.#state;
+  }
+
+  /** Projection-applied state change hints (see `StateBackend.subscribeStateChanges`); a no-op where the backend has none. */
+  subscribeStateChanges(listener: () => void): () => void {
+    return this.#state.subscribeStateChanges?.(listener) ?? (() => undefined);
   }
 
   stateDiagnostics(): StateBackendDiagnostics {
@@ -733,6 +751,8 @@ export class MeshStore {
 
   #writeSchedules(schedules: MeshSchedule[]): void {
     if (schedules.length === 0) {
+      // ponytail: not an expiry judgment: a locked state write (callers re-read under the mesh lock), the empty
+      // schedule list, exactly as writeFileAtomic below replaces the name; no other writer changes it unlocked.
       fs.rmSync(this.#schedulesPath, { force: true });
       this.#scheduleCache = undefined;
       return;
@@ -747,6 +767,40 @@ export class MeshStore {
 
   read(input: { after?: number; topic?: string; to?: string; limit?: number } = {}): MeshEvent[] {
     return this.#events.read(input);
+  }
+
+  /**
+   * Durability barrier (smarty-dev#9313): resolves once every event AND every keyed-state commit
+   * made on this root before the call, by any process, is on disk; otherwise it throws, for SQLite
+   * state within about `budgetMs`. A trusted producer awaits it before it fsyncs its own cursor or
+   * delivered mark, so an OS crash can never keep a cursor past an event or state record it covers.
+   * No writer lock is held while it syncs: events use the group-commit barrier of a durable publish
+   * (fsync of events.jsonl and its namespace after `.lock`); SQLite state uses the PASSIVE
+   * checkpoint barrier (smarty-dev#6100: no copy or fsync under SQLite's writer lock); file state
+   * fsyncs state.json and its namespace. On Windows (no directory barrier) the event barrier fails
+   * closed first with MeshEventsNotDurableError, and file state would with MeshStateFileNotDurableError;
+   * every refusal is a MeshSyncNotDurableError. A caller must not advance its external record on a throw.
+   *
+   * It resolves with `through`, the highest event sequence committed to the log (a complete line)
+   * before this barrier's fsync, so every event at or below it that is still live is now on disk.
+   * Callers must advance an event cursor only to `through`, never to latestSequence(): that
+   * includes the reservation counter, which a publisher advances under `.lock` before it appends,
+   * so a cursor past `through` could skip an event appended after the barrier (pi-fabric#894).
+   */
+  async sync(budgetMs = 1_000): Promise<{ through: number }> {
+    if (!Number.isFinite(budgetMs) || budgetMs < 0) throw new Error("Mesh sync budgetMs must be a finite number >= 0");
+    const deadline = Date.now() + budgetMs;
+    let through: number;
+    for (;;) {
+      try { through = await this.#events.sync(); break; }
+      catch (error) {
+        // A compaction renamed the live log during the namespace check; the next barrier covers it.
+        if (!isNamespaceRace(error) || Date.now() >= deadline) throw error;
+        await delay(1 + Math.random() * 3);
+      }
+    }
+    await this.#state.sync(Math.max(0, deadline - Date.now()));
+    return { through };
   }
 
   nextEventAfter(after: number): MeshEvent | undefined {

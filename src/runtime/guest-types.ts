@@ -92,7 +92,9 @@ interface FabricAgentRequest {
   /** Pi only. branch: fork this conversation (last completed turn); snippet: prefix recent messages. */
   seed?: "task" | "branch" | "snippet";
   seedMessages?: number;
-  /** Pi only write confinement; bash needs shell: "unconfined". */
+  /** Audited opt-out of the process task write default; cannot escape inherited confinement. */
+  writePolicy?: "unrestricted";
+  /** Pi only write confinement; explicit policies deny bash unless shell: "unconfined". */
   readOnly?: boolean;
   writableRoots?: string[];
   shell?: "deny" | "unconfined";
@@ -320,6 +322,15 @@ interface FabricAgentHandle {
   routeClass?: string;
   routeClassSource?: "explicit" | "derived";
   protected?: boolean;
+  /** Original spawn brief metadata. task.txt may later contain a continuation. */
+  promptSha256?: string;
+  promptBytes?: number;
+  promptPath?: string;
+  /** Current task.txt bytes, updated on same-run continuation. */
+  inputSha256?: string;
+  inputBytes?: number;
+  promptRetentionDropped?: boolean;
+  promptRetentionMismatch?: boolean;
   /** Immediate spawning participant, distinct from rootId. */
   spawner?: { id: string; kind: "main" | "agent" | "actor"; runId?: string };
   /** Present on terminal status snapshots when the full log was retained. */

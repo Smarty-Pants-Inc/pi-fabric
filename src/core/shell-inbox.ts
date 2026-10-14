@@ -1,6 +1,7 @@
 import type { ContextEvent, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { FabricShellJobEvent, FabricShellJobStore } from "./shell-jobs.js";
 import { fabricProvenanceSupported, sendFabricMessage } from "../fabric-provenance.js";
+import { extensionContextLive } from "../session-liveness.js";
 
 export const SHELL_MESSAGE_TYPE = "pi-fabric-shell-event";
 export const SHELL_AWARENESS_MESSAGE_TYPE = "pi-fabric-shell-awareness";
@@ -147,6 +148,13 @@ export class ShellEventInbox {
     if (this.#closed || this.#suspended || this.#failed || this.#timer || !this.#pending.size) return;
     this.#timer = setTimeout(() => {
       this.#timer = undefined;
+      // smarty-dev#8881: a disposed or replaced session invalidates this ctx without session_shutdown.
+      // Close as a shutdown does; the outcomes stay in their task logs (tasks.list/tasks.get).
+      if (!extensionContextLive(this.#context)) {
+        try { this.close(); } catch { /* the host already invalidated these subscriptions */ }
+        this.#closed = true;
+        return;
+      }
       if (this.#context.signal?.aborted) { this.#suspend(); return; }
       if (this.#context.isIdle() && !this.#context.hasPendingMessages()) this.#flush();
       // Manual compaction can return to idle without a turn/settled event.

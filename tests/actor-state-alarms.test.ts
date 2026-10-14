@@ -72,8 +72,24 @@ describe("actor state alarms (smarty-dev#9332)", () => {
     expect(s.alarms("actor-stopped", other.id)).toHaveLength(0);
     s.clock.skew += 6 * HOUR;
     await waitFor(() => s.alarms("actor-stopped", actor.id).length === 2); // re-alarm in the next slot
-    await s.actors.remove(actor.id);
-    expect(s.mesh.get(actorAlarmKey(actor.id, "actor-stopped"))).toBeUndefined();
+    const alarmKey = actorAlarmKey(actor.id, "actor-stopped");
+    const alarm = s.mesh.get(alarmKey);
+    const sentinel = path.join(path.dirname(actor.sessionFile!), "kept-11335.txt");
+    if (process.platform !== "linux") {
+      expect(alarm).toBeDefined();
+      fs.writeFileSync(sentinel, "history\n");
+    }
+    const removal = await s.actors.remove(actor.id);
+    if (process.platform === "linux") {
+      expect(s.mesh.get(actorAlarmKey(actor.id, "actor-stopped"))).toBeUndefined();
+    } else {
+      // smarty-dev#8090 / follow-up smarty-dev#11335: registry revocation commits, but the guarded tree delete refuses
+      // before alarm-key cleanup. The cleanup obligation remains pending while no new alarms are eligible.
+      expect(removal).toEqual({ removed: true, cleaned: false,
+        pending: `removal cleanup failed: Root actor tree deletion needs the Main publication fence, which this platform (${process.platform}) lacks (smarty-dev#8090); follow-up smarty-dev#11335; the root session:test actor tree is kept (a later remove or host start finishes it)` });
+      expect(fs.readFileSync(sentinel, "utf8")).toBe("history\n");
+      expect(s.mesh.get(alarmKey)).toEqual(alarm);
+    }
     s.clock.skew += 6 * HOUR;
     await settle();
     expect(s.alarms("actor-stopped", actor.id)).toHaveLength(2);

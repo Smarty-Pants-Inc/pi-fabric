@@ -95,6 +95,63 @@ describe("participant heartbeat with a stale ctx after reload (smarty-dev#10004)
     expect(staleFailures(warn)).toEqual([]);
   }, 15_000);
 
+  it("smarty-dev#8881: an owner retired during an in-flight change refresh suspends quietly, with no degraded notice", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-8881-dir-"));
+    roots.push(root);
+    const identity: MeshIdentity = { id: "session:sd8881", sessionId: "sd8881", name: "Main", kind: "main" };
+    let ownerLive = true;
+    let retireDuringNextRead = false;
+    let staleReads = 0;
+    const notices: number[] = [];
+    const record = (): FabricParticipantRecord => ({
+      format: 1, id: identity.id, rootId: identity.id, ownerHostId: identity.id, ownerIdentityId: identity.id,
+      kind: "root", name: "main", status: "idle", capabilities: ["steer", "followUp", "fabric"],
+      runner: "pi", transport: "host", controlProtocol: "v1", sessionId: "sd8881", cwd: process.cwd(), startedAt: 1, updatedAt: Date.now(),
+    });
+    const directory = new ParticipantDirectory(new MeshStore(path.join(root, "mesh"), 64 * 1024, 1_000), {
+      enabled: true, hostId: identity.id, rootId: identity.id, identity, heartbeatMs: 100, leaseMs: 10_000,
+      reapDeadHosts: false, live: () => ownerLive, onLifecycleLost: (ticks) => { notices.push(ticks); },
+    });
+    directory.registerSource(() => {
+      // The refresh passed its pre-await liveness check; the SDK then disposes the session and the
+      // source reaches its invalidated ctx. The owner lifecycle already reads retired.
+      if (retireDuringNextRead) {
+        retireDuringNextRead = false;
+        ownerLive = false;
+        staleReads += 1;
+        throw new Error(STALE);
+      }
+      return [record()];
+    });
+    cleanup.push(() => directory.close());
+    const warn = vi.spyOn(console, "warn");
+    await directory.start();
+    const renewedAt = (): number => readHostLeases(path.join(root, "mesh")).get(identity.id)?.updatedAt ?? 0;
+    expect(renewedAt()).toBeGreaterThan(0);
+
+    retireDuringNextRead = true;
+    directory.scheduleRefresh();
+    await vi.waitFor(() => expect(staleReads).toBe(1), { timeout: 3_000 });
+    await sleep(500);
+    // A retired owner is not a degraded one: no notice, no generic failure, no lifecycle-lost op.
+    expect(staleFailures(warn)).toEqual([]);
+    expect(lines(warn).filter((line) => /degraded|background operation failed/.test(line))).toEqual([]);
+    expect(notices).toEqual([]);
+    expect(directory.degraded).toBe(false);
+    expect(directory.heartbeatArmed).toBe(false);
+    const stoppedAt = renewedAt();
+    await sleep(300);
+    expect(renewedAt()).toBe(stoppedAt);
+
+    // A fresh live owner rebinds: one timer again and presence renews.
+    ownerLive = true;
+    directory.resume();
+    expect(directory.heartbeatArmed).toBe(true);
+    await vi.waitFor(() => expect(renewedAt()).toBeGreaterThan(stoppedAt), { timeout: 3_000 });
+    expect(lines(warn).filter((line) => /degraded|background operation failed|ctx is stale/.test(line))).toEqual([]);
+    expect(notices).toEqual([]);
+  }, 15_000);
+
   it("re-initialize stops the retired epoch's heartbeat at once; only the successor's timer runs and renews", async () => {
     const { FabricRuntimeState } = await import("../src/fabric-runtime-state.js");
     const { CapturedToolCatalog } = await import("../src/capture/catalog.js");

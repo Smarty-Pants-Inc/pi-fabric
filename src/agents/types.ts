@@ -11,6 +11,7 @@ import type { FabricScope, FabricScopeGrant } from "../protocol.js";
 import type { ThinkingTransferInput } from "./thinking-transfer.js";
 import type { FabricThinking, FabricThinkingBounds } from "../thinking.js";
 import type { FabricParticipantResidency } from "../topology/types.js";
+import type { AgentWriteReceipt } from "./write-receipt.js";
 import type { InheritedSessionPin } from "./session-pins.js";
 import type { AgentWorktreeResult } from "./worktree-manager.js";
 
@@ -117,6 +118,8 @@ export interface AgentRunRequest {
   worktree?: boolean;
   /** Shell command run in a new worktree before launch; overrides agents.worktree.setup. */
   worktreeSetup?: string;
+  /** Explicit opt-out of the process task write default, audited at launch. */
+  writePolicy?: "unrestricted";
   /** Write confinement enforced in the Pi child; see child-env.ts. */
   readOnly?: boolean;
   writableRoots?: string[];
@@ -212,6 +215,17 @@ export interface AgentRunRecord {
   id: string;
   name: string;
   task: string;
+  /** Exact original spawn brief, retained separately from mutable continuation task text. */
+  promptSha256?: string;
+  promptBytes?: number;
+  promptPath?: string;
+  /** Current task.txt bytes; changes when a same-run continuation rewrites the input. */
+  inputSha256?: string;
+  inputBytes?: number;
+  /** True when close/retention dropped the current input file. */
+  promptRetentionDropped?: boolean;
+  /** True when the current input failed stable digest verification. */
+  promptRetentionMismatch?: boolean;
   status: AgentRunStatus;
   /** One-based FIFO admission position; present only while queued. */
   queuePosition?: number;
@@ -236,6 +250,8 @@ export interface AgentRunRecord {
   finishedAt?: number;
   currentTool?: string;
   currentToolStartedAt?: number;
+  /** smarty-dev#8758: tool-generated receipt of the paths written and shell commands run (write-receipt.ts). */
+  writeReceipt?: AgentWriteReceipt;
   followUpDeliveries?: AgentFollowUpDelivery[];
   turns: number;
   /** Actual model output/tool execution, not worker startup or an error-only turn. */
@@ -334,6 +350,15 @@ export interface AgentHandleInfo {
   compactionSkipped?: string;
   id: string;
   name: string;
+  /** Exact original spawn brief metadata; never contains prompt text. */
+  promptSha256?: string;
+  promptBytes?: number;
+  promptPath?: string;
+  /** Current task.txt bytes, updated for a same-run continuation. */
+  inputSha256?: string;
+  inputBytes?: number;
+  promptRetentionDropped?: boolean;
+  promptRetentionMismatch?: boolean;
   status: AgentRunStatus;
   /** One-based FIFO admission position; present only while queued. */
   queuePosition?: number;
@@ -374,6 +399,12 @@ export interface AgentWorkerOptions {
   pythonRuntime?: FabricPythonRuntime;
   name: string;
   taskFile: string;
+  /** Exact original spawn brief metadata. The task file may later contain a continuation. */
+  promptSha256?: string;
+  promptBytes?: number;
+  promptPath?: string;
+  inputSha256?: string;
+  inputBytes?: number;
   imagesFile?: string;
   statusFile: string;
   lifecycleFile: string;
@@ -440,6 +471,8 @@ export interface AgentWorkerOptions {
   /** Observed native Pi session history carried across a same-run worker relaunch. Not a resume target. */
   runnerSessionIds?: string[];
   carryOver?: AgentRunCarryOver;
+  /** Default process task's own private scratch; exported as TMPDIR. */
+  tmpdir?: string;
   /** Serialized PI_FABRIC_WRITE_POLICY; Pi children also load the write guard. */
   writePolicy?: string;
   /** Serialized PI_FABRIC_LINEAGE. */
@@ -470,6 +503,8 @@ export interface AgentTransportLaunch {
   requires?: string[];
   /** Host-derived incompatibility, never accepted from guest arguments. */
   placementLocalReason?: string | undefined;
+  /** Report the default policy's actual local/remote launch boundary once; host-owned audit only. */
+  onWritePolicyDisposition?: (disposition: "local" | "remote") => void;
   /** Manager close or explicit run/actor revocation, never a returned queued receipt's guest deadline. */
   signal?: AbortSignal | undefined;
   /** Host activation generation check. Recheck after preparation, immediately before worker creation. */

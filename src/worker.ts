@@ -55,6 +55,7 @@ import { finalAssistantText, readFinalAnswerReceipt, type FinalAnswerReceipt } f
 import { queuedTerminalControls, settleTerminalControl, trackTerminalControl } from "./worker/terminal-controls.js";
 import { DEFAULT_BASH_IDLE_S } from "./guards/actor-bash-timeout.js";
 import { senderHeaderHookPath } from "./guards/sender-headers.js";
+import { WriteReceiptRecorder } from "./agents/write-receipt.js";
 
 let crossSpawn: typeof import("cross-spawn");
 
@@ -299,7 +300,8 @@ const terminateChild = (child: ChildProcess, signal: NodeJS.Signals): void => {
 
 
 
-let crashContext: { statusFile: string; record: AgentRunRecord } | undefined;
+// receipt: pi-fabric#1034 round 7, the live write receipt (pending calls and dropped lines marked truncated).
+let crashContext: { statusFile: string; record: AgentRunRecord; receipt?: () => AgentRunRecord["writeReceipt"] } | undefined;
 let runRecordHelpers: WorkerRunRecordModule | undefined;
 let terminalWritten = false;
 let flushRunLog: (() => void) | undefined;
@@ -309,7 +311,7 @@ const writeCrashStatus = (error: unknown): void => {
   if (terminalWritten) return;
   try {
     if (crashContext && runRecordHelpers) {
-      runRecordHelpers.writeCrashRunRecord(crashContext.statusFile, crashContext.record, error);
+      runRecordHelpers.writeCrashRunRecord(crashContext.statusFile, crashContext.record, error, crashContext.receipt?.());
     } else {
       writeWorkerStartupFailure(process.argv, error);
     }
@@ -387,6 +389,9 @@ const main = async (): Promise<void> => {
   mkdirPrivate(deliveryDirectory, runRoot);
   const images = readImages(options.imagesFile);
   const record = createRunningRecord(options, task, thinking, Date.now());
+  // pi-fabric#1034: every Pi child's record carries a receipt from its creation, so an early refusal or failure
+  // record has the empty one too (round-2 review P2).
+  if (isPi) record.writeReceipt = { paths: [], commands: [] };
   if (options.runner === "pi") {
     // The manager removes the old status to fence terminal verdicts on relaunch.
     // History is explicitly handed across that boundary, not a Pi resume target.
@@ -777,11 +782,15 @@ const main = async (): Promise<void> => {
         : {}),
       ...(options.runRoot ? { PI_FABRIC_RUN_ROOT: options.runRoot } : {}),
       // Supported child contract (docs/agents.md "Child environment contract").
+      ...(options.tmpdir ? { TMPDIR: options.tmpdir, TMP: options.tmpdir, TEMP: options.tmpdir } : {}),
       ...(options.lineage ? { PI_FABRIC_LINEAGE: options.lineage } : {}),
-      ...(options.writePolicy ? { PI_FABRIC_WRITE_POLICY: options.writePolicy } : {}),
+      PI_FABRIC_WRITE_POLICY: options.writePolicy,
       // Exactly the manager's derived scope; undefined drops an inherited value.
       PI_FABRIC_SCOPE: options.scope,
       PI_FABRIC_SCOPE_FILE: undefined,
+      // Disabled extensions must not regain ambient authority via provider discovery.
+      // Also drop an inherited target for an explicitly loaded bridge.
+      PI_FABRIC_EXTENSION_MODEL: undefined,
     },
     stdio: piRetrySdk ? ["pipe", "pipe", "pipe", "ipc"] : ["pipe", "pipe", "pipe"],
   });
@@ -873,6 +882,16 @@ const main = async (): Promise<void> => {
   let hasCompletedToolTurn = false;
   let streamingToolCallInTurn = false;
   const unresolvedToolCalls = new Set<string>();
+  // smarty-dev#8758 item 2: what the child's write/edit/shell tools actually did, from Pi's own tool events.
+  const writeReceipt = new WriteReceiptRecorder(options.cwd);
+  // pi-fabric#1034 round 6 (Astra P1): an event line over MAX_EVENT_LINE_CHARS is dropped unread, so the recorder
+  // may miss a tool start or end in it. Rule chosen, the simplest that never under-reports: EVERY dropped line of a
+  // Pi child marks the receipt truncated, whatever the line was (the line is not parsed for its type).
+  let receiptLineDropped = false;
+  // A call still pending (started, never ended: cancelled, failed or cut off) may have had its effect: also truncated.
+  const receiptNow = (): NonNullable<typeof record.writeReceipt> =>
+    receiptLineDropped || writeReceipt.pending > 0 ? { ...writeReceipt.receipt, truncated: true } : writeReceipt.receipt;
+  if (isPi && crashContext) crashContext.receipt = receiptNow;
 
   // Only ordinary tasks with real, completed tool work and retained prose can
   // expose an interrupted report without claiming success. Never suppress
@@ -1610,6 +1629,8 @@ const main = async (): Promise<void> => {
     validateCompletedResult();
     terminalStatus = record.status;
     terminalError = record.error;
+    // pi-fabric#1034: the final receipt, including a truncation no end event reported.
+    if (isPi) record.writeReceipt = receiptNow();
     saveWorkerCompletion(options.statusFile, record);
     writeRunRecord(options.statusFile, record);
     terminalWritten = true;
@@ -1632,6 +1653,13 @@ const main = async (): Promise<void> => {
       event = parsed as Record<string, unknown>;
     } catch {
       runLog.event(line, undefined);
+      // pi-fabric#1034 round 6: an unparsable Pi frame (cut at close, or a projection sentinel) may have been a tool
+      // start or end; the receipt cannot vouch for it.
+      if (isPi && line.trim() && !receiptLineDropped) {
+        receiptLineDropped = true;
+        record.writeReceipt = receiptNow();
+        update(); // persist the first transition, so a checkpoint read by the manager shows it
+      }
       return;
     }
     runLog.event(line, event);
@@ -1907,6 +1935,9 @@ const main = async (): Promise<void> => {
       return;
     }
     if (event.type === "tool_execution_start") {
+      writeReceipt.start(event);
+      // Stored at once: a checkpoint read by the manager (timeout, stop, lost worker) shows the pending call.
+      if (isPi) record.writeReceipt = receiptNow();
       unresolvedToolCalls.add(stringField(event.toolCallId) ?? "unknown-tool-call");
       record.inferenceStarted = true;
       record.toolCalls++;
@@ -1919,6 +1950,7 @@ const main = async (): Promise<void> => {
       return;
     }
     if (event.type === "tool_execution_end") {
+      if (writeReceipt.end(event)) record.writeReceipt = receiptNow();
       unresolvedToolCalls.delete(stringField(event.toolCallId) ?? "unknown-tool-call");
       completedToolInTurn = true;
       if (event.isError === true) {
@@ -2267,6 +2299,10 @@ const main = async (): Promise<void> => {
   let oversizedCount = 0;
   const startOversizedEvent = (text: string): void => {
     toolCallStreamGuard.discardedEvent();
+    if (isPi) {
+      receiptLineDropped = true;
+      record.writeReceipt = receiptNow(); // stored now too, in case no later end or terminal write comes
+    }
     oversized = { chars: text.length, prefix: text.slice(0, MAX_EVENT_LINE_CHARS) };
   };
   const finishOversizedEvent = (): void => {
@@ -2702,6 +2738,8 @@ const main = async (): Promise<void> => {
     record.status = "failed";
     record.error = `${record.error ? record.error + "\n" : ""}Activation journal retention failed: ${String(error)}`;
   }
+  // pi-fabric#1034: the final receipt, including a truncation no end event reported (a child that exits mid-call).
+  if (isPi) record.writeReceipt = receiptNow();
   // The owning Main may already be dead. Publish through its immutable launch return address.
   saveWorkerCompletion(options.statusFile, record);
   writeRunRecord(options.statusFile, record);

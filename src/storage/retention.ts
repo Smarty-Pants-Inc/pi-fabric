@@ -3,6 +3,7 @@ import { retentionV2Enabled } from "./retention-platform.js";
 import path from "node:path";
 import { writeFileAtomic, writeJsonAtomic } from "../core/atomic-write.js";
 import { ownedStat, processAlive } from "./scratch.js";
+import { boundedRunTree } from "./reference-scan.js";
 import { countRefusal, removalTallyOn, verifiedRemove } from "./verified-remove.js";
 import { processStartTime } from "../residency/process-identity.js";
 import { FileLockBusy, lockFile } from "../residency/file-lock.js";
@@ -341,6 +342,22 @@ const safeTerminalArtifacts = (root: string, expired: Deadline): boolean => {
   }
   return true;
 };
+const DURABLE_KEY = /^(?:initial|[0-9a-f]{64})$/;
+const DURABLE_LEASE_FILES = new Set(["lease.sqlite", "lease.sqlite-journal"]);
+const DURABLE_STORE_FILE = /^(?:main|(?:doc|task)-(?:0|[1-9]\d*))\.jsonl(?:\.reclaim)?$/;
+const onlyOwnedFiles = (directory: string, allowed: (name: string) => boolean, expired: Deadline): boolean =>
+  !expired() && fs.readdirSync(directory).every((name) => !expired() && allowed(name) && ownedStat(path.join(directory, name))?.isFile() === true) && !expired();
+/** Only the known pi-durable journal layout is an artifact; custody still decides removal. */
+const safeDurableTree = (directory: string, expired: Deadline): boolean => !expired() && fs.readdirSync(directory).every((key) => {
+  const conversation = path.join(directory, key);
+  if (expired() || !DURABLE_KEY.test(key) || !ownedStat(conversation)?.isDirectory()) return false;
+  return fs.readdirSync(conversation).every((name) => {
+    if (expired()) return false;
+    const file = path.join(conversation, name);
+    if (name === "store") return ownedStat(file)?.isDirectory() === true && onlyOwnedFiles(file, (child) => DURABLE_STORE_FILE.test(child), expired);
+    return DURABLE_LEASE_FILES.has(name) && ownedStat(file)?.isFile() === true;
+  });
+}) && !expired();
 /** Unknown transports/contents and live descendants veto removal, even under a dead host. */
 const safeRunTree = (root: string, childrenStopped: boolean, depth = 0, expired: Deadline = noDeadline, acceptPidReuse = false): boolean => {
   if (expired() || depth > 32 || !ownedStat(root)?.isDirectory()) return false;
@@ -369,6 +386,12 @@ const safeRunTree = (root: string, childrenStopped: boolean, depth = 0, expired:
       if (!stat) return false;
       if (stat.isFile() && (runFile(name) || name === "final-answer.json" || (name === "queued-result.json" && record?.queuedArchiveCommitted === true))) continue;
       if (stat.isDirectory() && (name === "terminal-controls" || name === "terminal-notices")) continue;
+      if (stat.isDirectory() && name === "tmp") {
+        // Manager-created task scratch belongs to this run. Reuse the owned,
+        // bounded walk: links, hardlinks, special files or incomplete scans veto.
+        if (!boundedRunTree(file, expired)) return false;
+        continue;
+      }
       if (stat.isDirectory() && name === "handoff-session") {
         // This directory is exclusively populated by Fabric's session fork writer.
         if (fs.readdirSync(file).some((child) => !child.endsWith(".jsonl") || !ownedStat(path.join(file, child))?.isFile())) return false;
@@ -394,6 +417,10 @@ const safeRunTree = (root: string, childrenStopped: boolean, depth = 0, expired:
         }
         continue;
       }
+      if (stat.isDirectory() && name === "durable") {
+        if (!safeDurableTree(file, expired)) return false;
+        continue;
+      }
       if (stat.isDirectory() && name === "nested") {
         for (const child of fs.readdirSync(file)) if (!safeRunTree(path.join(file, child), false, depth + 1, expired, acceptPidReuse)) return false;
         continue;
@@ -416,8 +443,11 @@ const runTreeRefusal = (root: string, acceptPidReuse: boolean): string => {
     for (const name of fs.readdirSync(root)) {
       const stat = ownedStat(path.join(root, name));
       if (!stat) return "an entry is a link, hard-linked or not ours";
+      if (name === "tmp" && stat.isDirectory() && !boundedRunTree(path.join(root, name), noDeadline)) {
+        return "task scratch subtree is unsafe or exceeds scan bounds";
+      }
       const known = stat.isFile() ? runFile(name) || name === "final-answer.json" || name === "queued-result.json"
-        : ["terminal-controls", "terminal-notices", "handoff-session", "follow-ups", "deliveries", "nested"].includes(name);
+        : ["terminal-controls", "terminal-notices", "handoff-session", "follow-ups", "deliveries", "nested", "tmp"].includes(name);
       if (!known) return `unknown entry ${name.replace(/[0-9a-f-]{8,}/gi, "<id>")}`;
     }
   } catch { return "run tree unreadable"; }

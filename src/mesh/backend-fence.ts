@@ -19,6 +19,7 @@ import path from "node:path";
 import { storageRevision } from "../verified/storage.js";
 import type { SqliteConnection, SqliteOpener } from "./state-sqlite.js";
 import { openPrivateStateDb } from "./state-gate.js";
+import type { MeshStateBackendKind } from "./state-backend-kinds.js";
 
 export interface MeshBackendAlarm {
   code: "FABRIC_MESH_BACKEND_FENCE" | "FABRIC_MESH_BACKEND_LATE_WRITER";
@@ -197,6 +198,13 @@ export const readMeshStateNatsMarker = (root: string): MeshStateNatsMarker | und
     return isMeshStateNatsMarker(parsed) ? parsed : undefined;
   } catch { return undefined; }
 };
+
+/** Select the backend implied by a cutover marker, preserving the configured fallback otherwise. */
+export function meshStateBackendFromMarker(root: string, fallback: MeshStateBackendKind): MeshStateBackendKind;
+export function meshStateBackendFromMarker(root: string, fallback?: MeshStateBackendKind): MeshStateBackendKind | undefined;
+export function meshStateBackendFromMarker(root: string, fallback?: MeshStateBackendKind): MeshStateBackendKind | undefined {
+  return readMeshStateNatsMarker(root) ? "nats" : readMeshStateMovedMarker(root) ? "sqlite" : fallback;
+}
 
 /** The epoch recorded in state.json (the marker's epoch for a moved marker) and whether it is that marker. */
 const readStateFileMark = (root: string, options: Pick<MeshBackendFenceOptions, "maxStateBytes" | "decodeFileEpoch">):

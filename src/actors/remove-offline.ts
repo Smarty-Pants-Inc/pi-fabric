@@ -13,6 +13,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { writeFileAtomic, writeJsonAtomic } from "../core/atomic-write.js";
+import { meshStateBackendFromMarker } from "../mesh/backend-fence.js";
 import { MeshStore } from "../mesh/store.js";
 import { lockFile } from "../residency/file-lock.js";
 import { ownProcessIncarnation } from "../core/atomic-write.js";
@@ -349,7 +350,7 @@ export const removeActorOffline = async (directory: string, config: ResidentHost
       throw new Error("Resident root identity changed under the fence");
     }
     mesh = new MeshStore(config.meshRoot, config.mesh.maxEventBytes, config.mesh.maxReadEvents,
-      { lockProtocol: config.mesh.lockProtocol, stateBackend: config.mesh.stateBackend });
+      { lockProtocol: config.mesh.lockProtocol, stateBackend: meshStateBackendFromMarker(config.meshRoot, config.mesh.stateBackend) });
     // Input errors first: resolve the actor before any liveness or identity check.
     // Exact id/name within this root's durable actors only, as the live operator path.
     const matches: Array<{ store: ActorRegistryStore; root: string; row: Row }> = [];

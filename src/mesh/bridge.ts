@@ -1054,10 +1054,31 @@ export class StoreBridgeSide implements BridgeSide {
             else if (early) throw new MirrorPlanStale();
             else result = compute(view, sameFiles ? files : participantFileSnapshot(this.store.root));
             if (!result) return plan.stage([], []);
-            ({ leases, removed } = result);
+            // The pass-latency shift ends HERE, after the write-lock wait, not at #mirror entry: a wait longer
+            // than a sample's remaining life committed an already-expired lease (independent audit F1). Only
+            // the sampled deadlines move, from the plan's own source sample, with the same caps as compute;
+            // mirror.observedAt is unchanged, so a delayed commit never freshens the sample (#10068).
+            const prepareAt = this.now();
+            const deadlines = new Map<string, number>();
+            leases = result.leases.map((lease) => {
+              const sample = lease.mirror;
+              if (!sample) return lease;
+              const at = Math.max(prepareAt, sample.observedAt);
+              const origin = sample.observedAt + Math.min(BRIDGE_LEASE_MS, sample.sourceExpiresAt - sample.sourceObservedAt);
+              const until = Math.min(origin + Math.min(at - sample.observedAt, BRIDGE_LEASE_MS), at + BRIDGE_LEASE_MS);
+              deadlines.set(keyFor(HOST_PREFIX, lease.id), until);
+              return { ...lease, expiresAt: until };
+            });
+            removed = result.removed;
+            // The changed host row, when this pass writes one, carries the lease's own deadline.
+            const ops = deadlines.size === 0 ? result.ops : result.ops.map((op) => {
+              const until = op.kind === "put" ? deadlines.get(op.key) : undefined;
+              return op.kind === "put" && until !== undefined && isObject(op.value)
+                ? { ...op, value: { ...op.value, expiresAt: until } } : op;
+            });
             // A changing commit records its lease effects in the same commit; a lease-only renewal
             // commits nothing, records nothing and loses nothing in a crash (the next pass redoes it).
-            return plan.stage(result.ops, effects());
+            return plan.stage(ops, effects());
           },
           // After the commit, on the committed owner, never a fresh per-record state read.
           afterCommit: (view) => { plan.run(view, halted); },

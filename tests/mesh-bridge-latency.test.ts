@@ -177,6 +177,47 @@ describe("bridge presence latency (smarty-dev#6477)", () => {
     }
   });
 
+  // Audit F1: the shift stopped at #mirror entry, so a write-lock wait longer than the sample's remaining
+  // life committed an already-expired lease. The deadline is taken at the authoritative prepare, after
+  // the wait, on both the cold (in-transaction) and warm (early preplan, #10391) paths; observedAt stays.
+  it.each([
+    ["cold", 1_000], ["warm", 1_000], ["cold", 16_000], ["warm", 16_000],
+  ] as const)("takes the lease deadline after a blocked state write (%s, %i ms wait)", async (path_, wait) => {
+    let now = 1_800_000_000_000;
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-latency-"));
+    roots.push(root);
+    const hub = new MeshStore(path.join(root, "hub"), 64 * 1024, 100);
+    const far = new MeshStore(path.join(root, "spoke"), 64 * 1024, 100);
+    const lane = await liveMain(far, "lane", now);
+    const hubSide = new StoreBridgeSide(hub, "ryzen3", () => now);
+    // Warm: one committed pass ends recovery, so the next plans early, before the write lock.
+    if (path_ === "warm") await hubSide.mirror({ hosts: [], participants: [] }, now);
+    // 500 ms of source-clock life remaining when sampled at t0.
+    const lease0 = readHostLeases(far.root).get(lane.id)!;
+    writeHostLease(far.root, { ...lease0, expiresAt: now + 500 });
+    const t0 = now;
+    const snapshot = await new StoreBridgeSide(far, "dev1", () => now).presence();
+    const write = hub.writeBatch.bind(hub);
+    const batches = vi.spyOn(hub, "writeBatch").mockImplementation(async (input) => {
+      now += wait; // the write lock is held elsewhere for `wait` ms; no real sleep
+      return write(input);
+    });
+    const stateViews = vi.spyOn(hub, "stateView");
+    await hubSide.mirror(snapshot, t0);
+    expect(batches).toHaveBeenCalledTimes(1);
+    expect(stateViews).toHaveBeenCalledTimes(path_ === "warm" ? 1 : 0);
+    const until = Math.min(t0 + 500 + Math.min(wait, BRIDGE_LEASE_MS), now + BRIDGE_LEASE_MS);
+    const lease = readHostLeases(hub.root).get(lane.id)!;
+    expect(lease.expiresAt).toBe(until);
+    expect(hub.get(key("topology/hosts/", lane.id))?.value).toMatchObject({ expiresAt: until, remoteHost: "ryzen3" });
+    expect(lease.mirror?.observedAt).toBe(t0);
+    const fresh = wait < BRIDGE_LEASE_MS;
+    expect(hubSide.holds(lane.id)).toBe(fresh);
+    expect(mirroredLeaseStatus("ryzen3", lease.mirror, now)).toBe(fresh ? "live" : "bridge-stale");
+    if (!fresh) expect(until).toBeLessThanOrEqual(now);
+  });
+
   // Independent review P2: observedAt was used unchecked. NaN admitted every lapsed host (and wrote
   // a NaN lease); -Infinity resurrected one for a full BRIDGE_LEASE_MS. Non-finite counts as now.
   it.each([Number.NaN, Number.NEGATIVE_INFINITY, Number.POSITIVE_INFINITY])("treats a non-finite observedAt (%s) as now", async (observedAt) => {

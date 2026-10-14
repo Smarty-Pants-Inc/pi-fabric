@@ -10,6 +10,8 @@ import path from "node:path";
 import { build } from "esbuild";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { AgentManager } from "../src/agents/manager.js";
+import { ActorManager } from "../src/actors/manager.js";
+import { GlobalActorRegistry } from "../src/actors/global-registry.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
@@ -92,6 +94,12 @@ const expectDenied = (outcome: any) => {
   expect(outcome, JSON.stringify(outcome)).toMatchObject({ ok: false, name: DENIED_NAME, code: DENIED_CODE });
   expect(outcome.message.startsWith(DENIED_RULE)).toBe(true);
   expect(outcome.message).toContain("recursive: true");
+};
+
+const expectActorDenied = (outcome: any) => {
+  expect(outcome, JSON.stringify(outcome)).toMatchObject({ ok: false, name: DENIED_NAME, code: DENIED_CODE });
+  expect(outcome.message).toContain("Task-to-actor two-hop rule");
+  expect(outcome.message).toContain("even with recursive: true");
 };
 
 describe("task spawn admission through the real worker process transport (#12187)", () => {
@@ -182,10 +190,12 @@ describe("task spawn admission through the real worker process transport (#12187
   ])("%s: a leaf task is refused create/createActor/import/ask/handoff and direct executeHandoff (SEC-1/SEC-2)", async (_l, launchOptions) => {
     const f = await fixture();
     const guest = `return { probes: ${delegationProbes}, final: "leaf-final-answer" };`;
-    const { handle, report } = await f.launch(guest, "leaf-delegation", launchOptions, { directHandoff: true });
+    const { handle, report } = await f.launch(guest, "leaf-delegation", launchOptions,
+      { directHandoff: true, realActorFlow: true, existingActors: true });
     expect(report.identity).toEqual({ id: handle.id, kind: "agent" });
     expect(report.grantedRisks).toBe("");
-    for (const key of DELEGATION_KEYS) expectDenied(report.guest.probes[key]);
+    for (const key of ["create", "createActor", "importActor", "ask"]) expectActorDenied(report.guest.probes[key]);
+    for (const key of ["handoff", "handoffRecursive"]) expectDenied(report.guest.probes[key]);
     expect(report.guest.final).toBe("leaf-final-answer");
     // Direct host executeHandoff at the modeled outer boundary: refused with the same typed error.
     expect(report.handoff).toMatchObject({ ok: false, name: DENIED_NAME, code: DENIED_CODE });
@@ -202,35 +212,61 @@ describe("task spawn admission through the real worker process transport (#12187
     ["explicit actor", { actorId: "actor-12187-h", actorName: "admission-actor-h" }],
   ])("%s: delegation actions pass admission, and a deferred handoff launches a real child to a terminal result", async (_l, launchOptions) => {
     const f = await fixture();
-    const guest = `const probes = ${delegationProbes}; return { probes };`;
+    const handoffChild = `return { spawn: await ${probe(`agents.spawn(${leafChild("handoff-grandchild-must-not-launch")})`)} };`;
+    const guest = `return { handoff: await ${probe(`agents.handoff({ model: "fake/fake", recursive: true,
+      task: ${guestTask(handoffChild, "handoff-leaf")} })`)} };`;
     const { handle, report } = await f.launch(guest, "permitted-delegation", launchOptions, { runDeferredHandoff: true });
-    for (const key of DELEGATION_KEYS) {
-      // Admission passed; any failure is downstream (modeled actor stand-in / registry), never the leaf rule.
-      expect(report.guest.probes[key].name, JSON.stringify(report.guest.probes[key])).not.toBe(DENIED_NAME);
-    }
-    expect(report.guest.probes.handoff).toMatchObject({ ok: true, value: { scheduled: true } });
-    expect(report.deferredHandoffs).toBe(2);
-    // ask reached the (modeled) actor lifecycle.
-    expect(report.actorCalls).toContain("validateDirectMessage");
+    expect(report.guest.handoff).toMatchObject({ ok: true, value: { scheduled: true } });
+    expect(report.deferredHandoffs).toBe(1);
     // Real handoff child: launched by the task's real manager, terminal, own final result.
     expect(report.handoff, JSON.stringify(report.handoff)).toMatchObject({ ok: true, status: "completed" });
     expect(report.handoff.id).not.toBe(handle.id);
     expect(report.children).toContainEqual({ id: report.handoff.id, status: "completed" });
     const child = JSON.parse(report.handoff.text);
     expect(child.identity).toEqual({ id: report.handoff.id, kind: "agent" });
-    // The handoff child was not requested recursive: it is a leaf.
+    // Both the guest scheduling request and direct boundary execution supplied recursive: true.
     expect(child.grantedRisks).toBe("");
+    expectDenied(child.guest.spawn);
+    expect(child.children).toEqual([]);
   }, 90_000);
+
+  it("recursive task cannot create, ask, or message real existing/dormant actors, including generic calls and aliases", async () => {
+    const f = await fixture();
+    const actorTurn = `return { escaped: await agents.spawn(${leafChild("two-hop-grandchild-must-not-launch")}) };`;
+    const message = guestTask(actorTurn, "must-not-activate-actor");
+    const guest = `const outcomes = {
+      create: await ${probe(`agents.create({ name: "escape-actor", instructions: "x", recursive: true })`)},
+      createActor: await ${probe(`agents.createActor({ name: "escape-actor-2", instructions: "x" })`)},
+      importActor: await ${probe(`agents.import({ id: "missing-template" })`)},
+    };
+    for (const id of ["actor-existing-12187", "actor-dormant-12187"]) {
+      for (const verb of ["ask", "tell", "followUp", "steer", "send"]) {
+        outcomes[id + ":" + verb] = await ${probe(`tools.call({ ref: "agents." + verb, args: { to: id, message: ${message} } })`)};
+      }
+    }
+    return outcomes;`;
+    const { handle, report } = await f.launch(guest, "recursive-actor-refusal", { recursive: true, extensions: true },
+      { realActorFlow: true, existingActors: true, tamperIdentity: true });
+    expect(report.grantedRisks.split(",")).toContain("agent");
+    expect(Object.keys(report.guest)).toHaveLength(13);
+    for (const outcome of Object.values(report.guest)) expectActorDenied(outcome);
+    expect(report.actorsBefore).toHaveLength(2);
+    expect(report.actorsBefore.find((actor: any) => actor.name === "actor-dormant-12187").status).toBe("dormant");
+    expect(report.actorsAfter).toEqual(report.actorsBefore);
+    expect(report.children).toEqual([]);
+    expect(f.nestedRuns(handle.id)).toEqual([]);
+  }, 60_000);
 
   // Real actor lifecycle (Decision C limits modeling to registry/session/context inference only):
   // the task's fixture builds an actual ActorManager + GlobalActorRegistry, so create -> ask -> actor
   // worker bootstrap -> actor-turn spawn -> leaf child terminal runs through real code end to end.
-  it.each([
-    ["recursive: true task", { recursive: true, extensions: true }],
-    ["explicit actor", { actorId: "actor-12187-r", actorName: "admission-actor-r" }],
-  ])("%s: real actor create -> ask -> actor turn spawns a leaf child to a terminal result", async (_l, launchOptions) => {
+  it("explicit actor: real actor create -> ask -> actor turn spawns a leaf child that reports to its bound actor", async () => {
     const f = await fixture();
-    const actorTurn = `const handle = await agents.spawn(${leafChild("actor-turn-child")});
+    const launchOptions = { actorId: "actor-12187-r", actorName: "admission-actor-r" };
+    const reportGuest = `const spawner = await agents.main();
+      const delivered = await agents.followUp({ id: "spawner", message: "bound-spawner-report" });
+      return { spawnerId: spawner.id, delivered, spawn: await ${probe(`agents.spawn(${leafChild("actor-grandchild-must-not-launch")})`)} };`;
+    const actorTurn = `const handle = await agents.spawn({ task: ${guestTask(reportGuest, "actor-turn-child")}, transport: "process", extensions: false });
       const waited = await agents.wait({ id: handle.id });
       return { id: handle.id, status: waited.status, text: waited.text };`;
     const guest = `const actor = await agents.create({ name: "delegation-proof", instructions: "Do deterministic task",
@@ -252,7 +288,15 @@ describe("task spawn admission through the real worker process transport (#12187
     expect(turn.children).toEqual([{ id: turn.guest.id, status: "completed" }]);
     const child = JSON.parse(turn.guest.text);
     expect(child).toMatchObject({ label: "actor-turn-child", identity: { id: turn.guest.id, kind: "agent" }, grantedRisks: "" });
-    expect(child.guest).toEqual({ leaf: true });
+    expectDenied(child.guest.spawn);
+    expect(child.children).toEqual([]);
+    expect(child.guest.spawnerId).toBe(report.guest.actorId);
+    expect(child.guest.delivered).toMatchObject({ queued: true });
+    // The real owner acknowledged publication into the actual ActorManager mailbox.
+    expect(report.routedReports).toHaveLength(1);
+    expect(report.routedReports[0]).toMatchObject({ targetId: report.guest.actorId, accepted: true,
+      mailbox: { id: report.guest.actorId } });
+    expect(report.routedReports[0].mailbox.queued).toBeGreaterThan(0);
   }, 120_000);
 
   it("Main still spawns through its real AgentsProvider from a QuickJS guest", async () => {
@@ -265,7 +309,11 @@ describe("task spawn admission through the real worker process transport (#12187
     closers.push(() => control.close()); control.start(() => ({ accepted: false }));
     const main = new MainAgentController({} as any, MAIN, true, f.root);
     closers.push(() => main.closeFollowUpDrain());
-    const provider = new AgentsProvider(f.manager, { identity, mesh: f.mesh } as any, {} as any, main, directory, control, {} as any);
+    const actors = new ActorManager(MAIN.slice(8), identity, f.mesh, { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 }, f.manager,
+      () => {}, { actorRoot: path.join(f.root, "main-actors"), persistent: true, mainAgent: main, rootId: MAIN });
+    closers.push(() => actors.close());
+    const provider = new AgentsProvider(f.manager, actors, new GlobalActorRegistry(path.join(f.root, "global-actors"), 64 * 1024),
+      main, directory, control, {} as any);
     const context = { cwd: f.root, update() {}, activity() {},
       extensionContext: { cwd: f.root, model: undefined, modelRegistry: { getAvailable: () => [], getAll: () => [], find: () => undefined },
         sessionManager: { getEntries: () => [], getSessionId: () => MAIN.slice(8) } } } as any;
@@ -287,12 +335,16 @@ describe("task spawn admission through the real worker process transport (#12187
       extensionContext: { ...context.extensionContext, model: fake,
         modelRegistry: { getAvailable: () => [fake], getAll: () => [fake], find: (p: string, m: string) => p === "fake" && m === "fake" ? fake : undefined } } };
     const delegated = await new QuickJsRuntime().execute(`return {
-      create: await ${probe(`agents.create({ name: "main-actor", instructions: "x" })`)},
-      handoff: await ${probe(`agents.handoff({ model: "fake/fake" })`)} };`,
+      create: await ${probe(`agents.create({ name: "main-actor", instructions: "x", residency: "session", extensions: false })`)},
+      handoff: await ${probe(`agents.handoff({ model: "fake/fake", recursive: true,
+        task: ${guestTask(`return { spawn: await ${probe(`agents.spawn(${leafChild("main-handoff-grandchild-must-not-launch")})`)} };`, "main-handoff-leaf")} })`)} };`,
       async (ref, args) => provider.invoke(ref.slice("agents.".length), args, handoffContext),
       { timeoutMs: 30_000, memoryLimitBytes: 64 * 1024 * 1024 });
     const probes = delegated.value as any;
-    expect(probes.create.name, JSON.stringify(probes.create)).not.toBe(DENIED_NAME);
+    expect(probes.create).toMatchObject({ ok: true });
+    const actorReply = await provider.invoke("ask", { id: probes.create.value.id,
+      message: taskText("return { actorTurn: true };", "main-actor-turn") }, handoffContext) as any;
+    expect(JSON.parse(actorReply.text)).toMatchObject({ label: "main-actor-turn", identity: { kind: "actor" }, guest: { actorTurn: true } });
     expect(probes.handoff).toMatchObject({ ok: true, value: { scheduled: true } });
     expect(deferred).toHaveLength(1);
     const seed = { sourceSessionId: MAIN.slice(8), sourceBranchLeafId: "seed-leaf",
@@ -302,11 +354,13 @@ describe("task spawn admission through the real worker process transport (#12187
       outerToolResult: { role: "toolResult", toolCallId: "seed-call", toolName: "fabric_exec",
         content: [{ type: "text", text: "handoff scheduled" }], isError: false, timestamp: 0 } } as any;
     const before = new Set(f.manager.list().map(record => record.id));
-    await provider.executeHandoff(deferred[0]!, handoffContext, seed);
+    await provider.executeHandoff({ ...deferred[0]!, recursive: true }, handoffContext, seed);
     const handoff = { id: f.manager.list().map(record => record.id).find(candidate => !before.has(candidate))! };
     expect(handoff.id).toBeDefined();
     const handoffResult = await f.manager.wait(handoff.id);
     expect(handoffResult.status, handoffResult.error ?? handoffResult.text).toBe("completed");
-    expect(JSON.parse(handoffResult.text)).toMatchObject({ identity: { id: handoff.id, kind: "agent" }, grantedRisks: "" });
+    const handoffChild = JSON.parse(handoffResult.text);
+    expect(handoffChild).toMatchObject({ identity: { id: handoff.id, kind: "agent" }, grantedRisks: "", children: [] });
+    expectDenied(handoffChild.guest.spawn);
   }, 90_000);
 });

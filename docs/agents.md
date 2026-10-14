@@ -272,8 +272,7 @@ A process task's `agents.send`, `agents.steer`, `agents.followUp`, or `agents.te
 address only its bound spawner, that spawner's ancestor chain, or an explicitly
 allowlisted exact Main session. Other Main-bound sends fail before publication
 with `TaskEscalationTargetError` (`FABRIC_TASK_ESCALATION_TARGET_DENIED`), naming
-all allowed ids. Task-to-task/actor sends retain existing routing; Mains, explicit
-actor activations, and other transports are not subject to this guard. A task
+all allowed ids. The task-to-actor two-hop rule refuses actor creation/import and actor-directed ask/tell/followUp/steer/send even with `recursive: true`, except result-report messages to the task's immutable exact bound spawner; task-to-task sends, Main callers, and explicit actor callers retain their existing behavior. A task
 spawned by an actor remains a task (the inherited actor id is cleared), while the
 actor name remains available for existing fleet write attribution.
 

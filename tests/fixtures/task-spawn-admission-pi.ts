@@ -26,7 +26,8 @@ let model = { provider: "fake", id: "fake" };
 let thinkingLevel = "off";
 
 // The manager may decorate the prompt; the deterministic program is one marked JSON line.
-type Task = { guest: string; label?: string; directHandoff?: boolean; runDeferredHandoff?: boolean; realActorFlow?: boolean };
+type Task = { guest: string; label?: string; directHandoff?: boolean; runDeferredHandoff?: boolean;
+  realActorFlow?: boolean; existingActors?: boolean; tamperIdentity?: boolean };
 const FAKE_MODEL = { provider: "fake", id: "fake", api: "openai-completions", name: "fake", reasoning: false,
   input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 8192, maxTokens: 1024 };
 // Minimal AgentSessionSeed for the modeled outer fabric_exec result boundary (no paid inference).
@@ -91,6 +92,7 @@ input.on("line", async line => {
       actorCalls.push(key);
       if (key === "owns") return false;
       if (key === "validateDirectMessage") return undefined;
+      if (key === "status") throw new Error(`Unknown Fabric actor: ${_args[0]}`);
       throw new Error(`modeled actor stand-in: ${key}`);
     };
   } });
@@ -103,12 +105,23 @@ input.on("line", async line => {
     const actorRoot = path.join(process.env.PI_FABRIC_MESH_ROOT!, "..", `actors-${process.pid}-${Date.now()}`);
     fs.mkdirSync(actorRoot, { recursive: true });
     realActors = new ActorManager(sessionId, identity, mesh, { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 }, manager,
-      () => {}, { actorRoot, persistent: true, mainAgent: main as any, rootId: mainAgentId });
+      () => {}, { actorRoot, persistent: true, actorScope: "project", mainAgent: main as any, rootId: mainAgentId });
     globalActors = new GlobalActorRegistry(actorRoot, 64 * 1024);
+    if (task.existingActors) {
+      await realActors.create({ name: "actor-existing-12187", instructions: "Do deterministic task", residency: "session", extensions: false });
+      await realActors.create({ name: "actor-dormant-12187", instructions: "Do deterministic task", residency: "durable", extensions: false }, { asRegistryOwner: true });
+      await realActors.dormantIdleActors();
+      outcome.actorsBefore = realActors.list();
+    }
   }
   const provider = new AgentsProvider(manager, (realActors ?? actors) as any, globalActors, main, directory, control, {} as any);
   // A task cannot grant itself spawning after launch: the admission snapshot was taken above.
   process.env.PI_FABRIC_GRANTED_RISKS = "agent";
+  if (task.tamperIdentity) {
+    process.env.PI_FABRIC_ACTOR_ID = "forged-actor";
+    delete process.env.PI_FABRIC_PARENT_RUN;
+    process.env.PI_FABRIC_SPAWNER_ID = "actor-existing-12187";
+  }
   const deferred: Array<Record<string, unknown>> = [];
   const context = { cwd: process.cwd(), update() {}, activity() {},
     deferHandoff: async (args: Record<string, unknown>) => { deferred.push(args); return { scheduled: true }; },
@@ -117,11 +130,24 @@ input.on("line", async line => {
       sessionManager: { getEntries: () => [], getSessionId: () => sessionId } } } as any;
   try {
     await directory.start();
-    control.start(() => ({ accepted: false }));
+    outcome.routedReports = [];
+    control.start(async (command, from, signal, verification) => {
+      const accepted = await provider.acceptControl(command, from, signal, verification);
+      if (command.message === "bound-spawner-report") {
+        outcome.routedReports.push({ targetId: command.targetId, from: from.id, ...accepted,
+          ...(realActors ? { mailbox: realActors.status(command.targetId) } : {}) });
+      }
+      return accepted;
+    });
     const result = await new QuickJsRuntime().execute(task.guest,
       async (ref, args) => {
+        if (ref === "fabric.$call") {
+          ref = String(args.ref);
+          args = (args.args ?? {}) as Record<string, unknown>;
+        }
         if (!ref.startsWith("agents.")) throw new Error(`fixture exposes only agents.*, not ${ref}`);
-        return provider.invoke(ref.slice("agents.".length), args, context);
+        const action = ref.slice("agents.".length);
+        return provider.invoke(action, provider.guardArguments(action, args), context);
       }, { timeoutMs: 40_000, memoryLimitBytes: 64 * 1024 * 1024 });
     outcome.guest = result.value;
     if (result.error) outcome.guestError = result.error;
@@ -134,7 +160,7 @@ input.on("line", async line => {
       try {
         const before = new Set(manager.list().map((record: any) => record.id));
         // executeHandoff waits for the child internally; the child id is taken from the real manager.
-        const compact: any = await provider.executeHandoff(boundary[0]!, context, seed(sessionId));
+        const compact: any = await provider.executeHandoff({ ...boundary[0]!, recursive: true }, context, seed(sessionId));
         const id = manager.list().map((record: any) => record.id).find((candidate: string) => !before.has(candidate));
         const waited: any = id ? await manager.wait(id) : {};
         outcome.handoff = { ok: true, id, compactStatus: compact?.status, status: waited.status, text: waited.text, error: waited.error };
@@ -142,6 +168,7 @@ input.on("line", async line => {
     }
     // Host-side observation of children this task's real manager actually created.
     outcome.children = manager.list().map((record: any) => ({ id: record.id, status: record.status }));
+    if (realActors) outcome.actorsAfter = realActors.list();
   } catch (error) { outcome.error = (error as Error).message; }
   finally {
     if (realActors) await realActors.close();

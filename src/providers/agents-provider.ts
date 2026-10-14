@@ -7,7 +7,7 @@ import type { JevRequest, JevResponse } from "../jev/types.js";
 import { formatAge, residentHostId, RESIDENT_HOST_FORMAT, ResidentOutcomeUnknownError, ResidentActorAuthorizationError, assertResidentActorMain, assertResidentActorToolCeiling, type ResidentActorCaller, type ResidentActorMutation } from "../residency/protocol.js";
 import { readChildToolAllowlist } from "../core/child-tool-allowlist.js";
 import { ActorManager, ActorRegistryOwnershipError, parseBashTimeoutSeconds } from "../actors/manager.js";
-import { assertTaskSpawnAdmitted, captureTaskSpawnAdmission, TASK_DELEGATION_ACTIONS } from "../agents/spawn-admission.js";
+import { assertTaskActorAdmitted, assertTaskSpawnAdmitted, captureTaskSpawnAdmission, TASK_DELEGATION_ACTIONS } from "../agents/spawn-admission.js";
 import { participantProject, recordedProjectLead, repositoryOf, resolveProjectAgent } from "../topology/project-identity.js";
 import { GlobalActorRegistry } from "../actors/global-registry.js";
 import { isFabricActorHostEvent, normalizeActorActivation, validateActorCoalesceKey, validateActorDedupeKey, validateActorInferenceContext } from "../actors/types.js";
@@ -750,6 +750,8 @@ export class AgentsProvider implements FabricProvider {
       runner,
       false,
     );
+    // Handoff is always a leaf, even when generic callers supply an undeclared recursive flag.
+    handoffArgs.recursive = false;
     delete handoffArgs.cwd;
     const request = runRequest({ ...handoffArgs, runner }, context, this.manager, this.modelsConfig());
     const kernel = this.manager.resolveKernel(request);
@@ -794,6 +796,7 @@ export class AgentsProvider implements FabricProvider {
       { allowCwd: false },
     );
     request.runner = runner;
+    request.recursive = false;
     if (args.pythonRuntime !== undefined) {
       // Only host-created deferred handoffs carry this internal policy snapshot.
       request.pythonRuntime = this.manager.resolvePythonRuntime(args.pythonRuntime as AgentRunRequest["pythonRuntime"]);
@@ -869,8 +872,10 @@ export class AgentsProvider implements FabricProvider {
   ): Promise<unknown> {
     const checkCommit = (): void => throwIfExecutionExpired(context);
     checkCommit();
-    // Leaf-by-default tasks: refuse every delegation (run/spawn/create/createActor/import/ask/
-    // handoff) before model policy, routing, cwd, residency or global template resolution.
+    // Creation has no reporting exception; actor messages are admitted at resolved-target routing.
+    if (actionName === "create" || actionName === "createActor" || actionName === "import") {
+      assertTaskActorAdmitted(this.#spawnAdmission, actionName);
+    }
     // The request's own recursive flag describes the child, never the caller's grant.
     if (TASK_DELEGATION_ACTIONS.has(actionName)) assertTaskSpawnAdmitted(this.#spawnAdmission, actionName);
     // Only explicit public selections: inherited/default models and existing actors are untouched.
@@ -1894,8 +1899,8 @@ export class AgentsProvider implements FabricProvider {
   }
 
   async #createActor(request: FabricActorCreateRequest, context: FabricInvocationContext): Promise<FabricActorInfo> {
-    // Defense in depth: every local/resident actor realization path requires task admission.
-    assertTaskSpawnAdmitted(this.#spawnAdmission, "createActor");
+    // Defense in depth: tasks cannot realize actors, regardless of recursive grants.
+    assertTaskActorAdmitted(this.#spawnAdmission, "createActor");
     const { signal } = context;
     const checkCommit = (): void => throwIfExecutionExpired(context);
     checkCommit();

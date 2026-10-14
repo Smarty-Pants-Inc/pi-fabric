@@ -1,6 +1,7 @@
 import { appendDeliveryOutcome } from "../mesh/delivery-outcomes.js";
 import { interruptErrorCode } from "../interrupt-authority.js";
 import { boundAgentSpawner } from "../agents/spawner.js";
+import { assertTaskActorAdmitted, captureTaskSpawnAdmission } from "../agents/spawn-admission.js";
 import { FabricTargetTerminalError, terminalRejectionFields } from "../agents/terminal-target.js";
 import { terminalAgentStatuses } from "../agents/lifecycle.js";
 import { invocationFabricPrincipal, snapshotFabricInvocation, fabricTurnProvenance, copyFabricWakeCause, copyFabricWakeAdmission, type FabricWakeCause, type FabricPrincipal } from "../fabric-provenance.js";
@@ -124,6 +125,8 @@ class LeaseResolutionRequired extends Error {
 
 export class AgentMessageRouter {
   readonly #taskReturnAddress = readTaskReturnAddress();
+  readonly #spawnAdmission = captureTaskSpawnAdmission();
+  readonly #boundSpawnerId: string | undefined;
   #legacyDeliveryCount = 0;
   /** Retained dormant wake routes this router resolved; only they may take the one wake resend. */
   readonly #dormantRoutes = new WeakSet<FabricParticipantInfo>();
@@ -136,7 +139,9 @@ export class AgentMessageRouter {
     readonly resolvePiRunBinding: (binding: FabricActorRunBinding, runner: FabricAgentRunner, context: FabricInvocationContext, requiredPin?: boolean) => FabricActorRunBinding | Promise<FabricActorRunBinding>,
     readonly residency?: Pick<ResidencyClient, "ensureActor" | "hostId"> & { options: { config: { rootId: string; meshRoot: string } } },
     readonly spawner = boundAgentSpawner(),
-  ) {}
+  ) {
+    this.#boundSpawnerId = this.#taskReturnAddress?.spawnerId || spawner?.id;
+  }
   #get(id: string, fresh = false): FabricParticipantInfo | undefined {
     // Discovery can use its cached view, but sender admission must refresh positive records
     // too: a cached epoch cannot authorize control after a target reloads or downgrades.
@@ -649,7 +654,7 @@ export class AgentMessageRouter {
     this.actorManager.validateDirectMessage(message, data);
     let target: { actor?: FabricActorInfo; participant?: FabricParticipantInfo };
     try {
-      target = await this.#resolveActorMessageTarget(id, recoverLease);
+      target = await this.#resolveActorMessageTarget(id, recoverLease, kind, true);
     } catch (error) {
       if (error instanceof Error && /Unknown Fabric actor/.test(error.message)) {
         throw this.participants.writeStalled?.() ?? this.#unknownParticipant(id);
@@ -754,7 +759,7 @@ export class AgentMessageRouter {
       let current: FabricParticipantInfo | undefined;
       let fresh: string | undefined;
       try {
-        current = (await this.resolveActorMessageTarget(addressed.id)).participant;
+        current = (await this.resolveActorMessageTarget(addressed.id, "followUp", true)).participant;
         fresh = current ? controlOwnerIncarnation(current) : undefined;
       } catch { throw error; }
       if (!current || fresh === undefined || fresh === controlOwnerIncarnation(addressed) ||
@@ -914,14 +919,18 @@ export class AgentMessageRouter {
 
   /** A lease can still look fresh after SIGKILL. For this root's non-owned durable
    * actors, check the real owner before delivery, not just participant freshness. */
-  async resolveActorMessageTarget(id: string): Promise<ReturnType<AgentMessageRouter["resolveActorTarget"]>> {
-    return this.#withDirectory(() => this.#resolveActorMessageTarget(id), id);
+  async resolveActorMessageTarget(id: string, action = "ask", reporting = false): Promise<ReturnType<AgentMessageRouter["resolveActorTarget"]>> {
+    return this.#withDirectory(() => this.#resolveActorMessageTarget(id, true, action, reporting), id);
   }
 
-  async #resolveActorMessageTarget(id: string, recoverLease = true): Promise<ReturnType<AgentMessageRouter["resolveActorTarget"]>> {
+  async #resolveActorMessageTarget(id: string, recoverLease = true, action = "ask", reporting = false): Promise<ReturnType<AgentMessageRouter["resolveActorTarget"]>> {
     if (id.trim().startsWith("session:")) throw this.#unknownParticipant(id, "Fabric Main participant");
     const meshRoot = this.residency?.options.config.meshRoot ?? this.actorManager.mesh?.root;
     const definition = this.resolveActorTarget(id, false);
+    // One resolved-target boundary covers local, remote, alias and dormant actor routes,
+    // before retained wake lookup, residency ensureActor, binding or mailbox publication.
+    assertTaskActorAdmitted(this.#spawnAdmission, action,
+      definition.actor?.id ?? definition.participant?.id, this.#boundSpawnerId, reporting);
     if (meshRoot && definition.actor?.residency === "durable" &&
         ["dormant", "failed", "failing-preparation"].includes(definition.actor.status) &&
         !this.actorManager.owns?.(definition.actor.id) && !definition.participant) {

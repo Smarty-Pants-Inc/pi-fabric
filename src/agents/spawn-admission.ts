@@ -3,11 +3,10 @@
  *
  * A Fabric task agent (identity kind "agent": PI_FABRIC_PARENT_RUN without
  * PI_FABRIC_ACTOR_ID) may not delegate unless its own launch was `recursive:
- * true`. Delegation covers every creation and continuation surface: agents.run,
- * spawn, create/createActor, import (realizing a global actor), handoff
- * (scheduling and boundary execution), and ask (an actor turn run on the
- * task's behalf). Addressed reporting (followUp/steer/tell/send) is not
- * delegation and stays allowed. That launch grant is the manager's `--granted-risks
+ * true`. The grant permits agents.run/spawn and handoff, never actor creation
+ * or task-to-actor delegation: the two-hop rule refuses actor-directed calls
+ * except addressed reporting to the task's exact bound spawner. That launch
+ * grant is the manager's `--granted-risks
  * ["agent"]`, which worker.ts writes into PI_FABRIC_GRANTED_RISKS, replacing
  * any inherited value. The decision is snapshotted once, host-side, so a task
  * cannot grant itself spawning by mutating its environment later, by asking
@@ -23,9 +22,11 @@ export const TASK_SPAWN_DENIED_RULE = "task agents do not spawn; return your res
 /** Fixed, guest-visible refusal: name and code are allowlisted by the QuickJS error bridge. */
 export class TaskSpawnDeniedError extends Error {
   readonly code = TASK_SPAWN_DENIED_CODE;
-  constructor(action: string, taskId: string) {
-    super(`${TASK_SPAWN_DENIED_RULE} (agents.${action} refused for task ${taskId}; ` +
-      "launch the task with recursive: true to grant spawning).");
+  constructor(action: string, taskId: string, twoHop = false) {
+    super(twoHop
+      ? `Task-to-actor two-hop rule: agents.${action} refused for task ${taskId}; tasks cannot create or delegate to actors, even with recursive: true; only reporting to their exact bound spawner is allowed.`
+      : `${TASK_SPAWN_DENIED_RULE} (agents.${action} refused for task ${taskId}; ` +
+        "launch the task with recursive: true to grant spawning).");
     this.name = "TaskSpawnDeniedError";
   }
 }
@@ -50,11 +51,23 @@ export const captureTaskSpawnAdmission = (environment: NodeJS.ProcessEnv = proce
 
 /** agents.* action names that delegate work and therefore require task admission. */
 export const TASK_DELEGATION_ACTIONS: ReadonlySet<string> = new Set([
-  "run", "spawn", "create", "createActor", "import", "ask", "handoff",
+  "run", "spawn", "create", "createActor", "import", "handoff",
 ]);
 
 /** Throws the fixed TaskSpawnDeniedError for a non-recursive task agent. */
 export const assertTaskSpawnAdmitted = (admission: TaskSpawnAdmission, action: string): void => {
   if (admission.spawnAllowed) return;
   throw new TaskSpawnDeniedError(action, admission.id ?? "unknown");
+};
+
+/** Actor creation/asks are never granted to tasks; only exact spawn-bound reporting is exempt. */
+export const assertTaskActorAdmitted = (
+  admission: TaskSpawnAdmission,
+  action: string,
+  targetId?: string,
+  spawnerId?: string,
+  reporting = false,
+): void => {
+  if (admission.kind !== "agent" || (reporting && spawnerId && targetId === spawnerId)) return;
+  throw new TaskSpawnDeniedError(action, admission.id ?? "unknown", true);
 };

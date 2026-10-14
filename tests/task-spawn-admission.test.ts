@@ -7,6 +7,8 @@ import type { AgentHandleInfo, AgentRunResult } from "../src/agents/types.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import type { FabricInvocationContext } from "../src/protocol.js";
 import { AgentsProvider } from "../src/providers/agents-provider.js";
+import { AgentMessageRouter } from "../src/providers/agents-message-router.js";
+import * as wake from "../src/residency/wake.js";
 import {
   TASK_SPAWN_DENIED_CODE,
   TaskSpawnDeniedError,
@@ -110,7 +112,7 @@ describe("AgentsProvider launch admission (smarty-dev#12187)", () => {
     const deferHandoff = vi.fn(async (args: Record<string, unknown>) => ({ deferred: true, model: args.model }));
     const provider = new AgentsProvider(
       manager, actorManager as unknown as ProviderArgs[1], templates as unknown as ProviderArgs[2], {} as ProviderArgs[3],
-      { scheduleRefresh: spies.refresh, async refresh() {} } as unknown as ProviderArgs[4],
+      { get: () => undefined, scheduleRefresh: spies.refresh, async refresh() {} } as unknown as ProviderArgs[4],
       undefined, {} as ProviderArgs[6], () => false, residency as unknown as ProviderArgs[8], false,
     );
     const context = {
@@ -197,13 +199,21 @@ describe("AgentsProvider launch admission (smarty-dev#12187)", () => {
     expect(caught).toBeInstanceOf(TaskSpawnDeniedError);
     expect(caught).toMatchObject({ name: "TaskSpawnDeniedError", code: TASK_SPAWN_DENIED_CODE });
     const message = (caught as Error).message;
-    expect(message.startsWith("task agents do not spawn; return your result to your spawner")).toBe(true);
+    expect(message).toContain(action && ["create", "createActor", "import", "ask"].includes(action)
+      ? "Task-to-actor two-hop rule" : "task agents do not spawn; return your result to your spawner");
     expect(message).toContain("task-run-1");
     if (action) expect(message).toContain(`agents.${action} refused`);
     for (const group of [result.spies, result.residency, result.actors, result.templates]) {
-      for (const spy of Object.values(group)) expect(spy).not.toHaveBeenCalled();
+      for (const [name, spy] of Object.entries(group)) {
+        // Actor lookup/validation precede resolved-target admission; neither can activate or publish.
+        if (action === "ask" && group === result.actors && ["status", "validateDirectMessage"].includes(name)) continue;
+        expect(spy).not.toHaveBeenCalled();
+      }
     }
     expect(result.deferHandoff).not.toHaveBeenCalled();
+    // Keep subsequent probes independent; read-only actor resolution is not a side effect.
+    result.actors.status.mockClear();
+    result.actors.validateDirectMessage.mockClear();
   };
   const seed = { sourceModel: "test/model" } as unknown as Parameters<AgentsProvider["executeHandoff"]>[2];
 
@@ -242,7 +252,6 @@ describe("AgentsProvider launch admission (smarty-dev#12187)", () => {
   };
   it.each([
     ["Main", {}],
-    ["recursive task (agent grant)", { parent: "task-run-1", risks: "agent" }],
     ["actor (identity wins over PI_FABRIC_PARENT_RUN)", { parent: "task-run-1", actor: "actor-1" }],
   ] as const)("admits %s through actor creation, import, ask and handoff", async (_label, env) => {
     stubCaller(env);
@@ -264,6 +273,25 @@ describe("AgentsProvider launch admission (smarty-dev#12187)", () => {
     await notRefused(() => provider.executeHandoff({ model: "test/model", task: "t" }, context, seed));
   });
 
+  it.each(delegationAttempts.filter(([action]) => action !== "handoff"))(
+    "refuses a recursively granted task's %s %j at the actor boundary", async (action, args) => {
+      stubCaller({ parent: "task-run-1", risks: "agent" });
+      const result = setup();
+      stubCaller({ actor: "forged-actor", risks: "agent" });
+      await expectDelegationRefused(result, () => result.provider.invoke(action, args, result.context), action);
+    });
+
+  it("forces recursive:false at handoff scheduling and execution despite guest recursive:true", async () => {
+    stubCaller({});
+    const { provider, handoffContext, context, spies, deferHandoff } = setup();
+    spies.find.mockImplementation(((providerName: string, id: string) =>
+      providerName === "test" && id === "model" ? { provider: "test", id: "model" } : undefined) as never);
+    await provider.handoff({ model: "test/model", recursive: true }, handoffContext);
+    expect(deferHandoff.mock.calls[0]![0].recursive).toBe(false);
+    await provider.executeHandoff({ model: "test/model", task: "t", recursive: true }, context, seed);
+    expect(spies.spawn.mock.calls[0]![0].recursive).toBe(false);
+  });
+
   it.each([
     ["Main", {}],
     ["recursive task (agent grant)", { parent: "task-run-1", risks: "read, agent" }],
@@ -277,5 +305,48 @@ describe("AgentsProvider launch admission (smarty-dev#12187)", () => {
     await expect(provider.invoke("run", { task: "t" }, context)).resolves.toMatchObject({ id: "child", status: "completed", text: "done" });
     expect(spies.spawn).toHaveBeenCalledTimes(2);
     expect(spies.modelReason).toHaveBeenCalledTimes(2);
+  });
+});
+
+// Trust-boundary supplement for Astra P1: real-process tests cover actual ActorManager state;
+// these two route shapes pin refusal before the dormant wake lookup or residency activation.
+describe("task actor routing admission", () => {
+  afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); });
+  it.each(["dormant", "remote"] as const)("refuses a recursive task's %s actor route before wake/ensure/publication after env tampering", async mode => {
+    vi.stubEnv("PI_FABRIC_PARENT_RUN", "task-run-1");
+    vi.stubEnv("PI_FABRIC_ACTOR_ID", undefined);
+    vi.stubEnv("PI_FABRIC_GRANTED_RISKS", "agent");
+    vi.stubEnv("PI_FABRIC_TASK_PROCESS_CHILD", "1");
+    vi.stubEnv("PI_FABRIC_SPAWNER_ID", "actor-own-spawner");
+    vi.stubEnv("PI_FABRIC_SPAWNER_CHAIN", undefined);
+    vi.stubEnv("PI_FABRIC_TASK_ESCALATION_TARGETS", undefined);
+    const actor = { id: "actor-other", name: "other", rootId: "main-1", residency: "durable", status: "dormant", runner: "pi" };
+    const participant = mode === "remote" ? { ...actor, kind: "actor", local: false, ownerHostId: "host-1",
+      ownerIdentityId: "owner-1", capabilities: ["ask", "followUp", "steer"], remoteHost: "peer-1" } : undefined;
+    const dormant = vi.spyOn(wake, "dormantActorRoute");
+    const ensureActor = vi.fn();
+    const tell = vi.fn();
+    const ask = vi.fn();
+    const publish = vi.fn();
+    const router = new AgentMessageRouter(
+      { status: () => { throw new Error("Unknown Fabric agent"); } } as any,
+      { identity: { kind: "agent", id: "task-run-1" }, mesh: { root: "/unused-mesh" },
+        status: () => actor, owns: () => false, validateDirectMessage() {}, tell, ask, steerRemote: publish } as any,
+      { id: "main-1", matches: () => false } as any,
+      { get: () => participant, lastKnown: () => undefined } as any,
+      { request: publish } as any, binding => binding,
+      { ensureActor, hostId: "host-1", options: { config: { rootId: "main-1", meshRoot: "/unused-mesh" } } } as any,
+    );
+    vi.stubEnv("PI_FABRIC_ACTOR_ID", "forged-actor");
+    vi.stubEnv("PI_FABRIC_PARENT_RUN", undefined);
+    vi.stubEnv("PI_FABRIC_SPAWNER_ID", actor.id);
+    for (const run of [
+      () => router.resolveActorMessageTarget("other"),
+      () => router.routeMessage("other", "report", undefined, "followUp"),
+      () => router.routeMessage("other", "report", undefined, "steer"),
+    ]) {
+      await expect(run()).rejects.toMatchObject({ name: "TaskSpawnDeniedError", code: TASK_SPAWN_DENIED_CODE });
+    }
+    for (const sideEffect of [dormant, ensureActor, tell, ask, publish]) expect(sideEffect).not.toHaveBeenCalled();
   });
 });

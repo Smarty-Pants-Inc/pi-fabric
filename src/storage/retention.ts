@@ -3,6 +3,7 @@ import { retentionV2Enabled } from "./retention-platform.js";
 import path from "node:path";
 import { writeFileAtomic, writeJsonAtomic } from "../core/atomic-write.js";
 import { ownedStat, processAlive } from "./scratch.js";
+import { boundedRunTree } from "./reference-scan.js";
 import { countRefusal, removalTallyOn, verifiedRemove } from "./verified-remove.js";
 import { processStartTime } from "../residency/process-identity.js";
 import { FileLockBusy, lockFile } from "../residency/file-lock.js";
@@ -11,7 +12,6 @@ import { recoverEnodevTaskRun } from "../agents/enodev-recovery.js";
 import { copyFabricProvenance } from "../fabric-provenance.js";
 import { readFinalAnswerReceipt, openTaskControlFile, MAX_TASK_CONTROL_BYTES, taskControlDirectory, taskControlReadDirectory, withTaskControlDirectory, withTaskControlReadDirectory, withLegacyTaskControlDirectory } from "../worker/terminal-answer.js";
 import { MAX_STEER_CONTROLS, MAX_STEER_BYTES, MAX_STEER_ENTRY_BYTES, terminalAdmissionFromEntry, terminalControlMatchesAdmission, terminalSenderMatches, type TerminalAdmission } from "../agents/terminal-notices.js";
-import { boundedRunTree } from "./reference-scan.js";
 
 export const FABRIC_RUN_ROOT_PREFIX = "pi-fabric-runs-";
 const RUN_ROOT_OWNER_FILE = ".fabric-owner.json";
@@ -493,6 +493,8 @@ const safeRunTree = (root: string, childrenStopped: boolean, depth = 0, expired:
       // complete original-admission/receipt checks above, never as arbitrary trees.
       if (stat.isDirectory() && terminalArtifactDirectories.has(name)) continue;
       if (stat.isDirectory() && name === "tmp") {
+        // Manager-created task scratch belongs to this run. Reuse the owned,
+        // bounded walk: links, hardlinks, special files or incomplete scans veto.
         if (!boundedRunTree(file, expired)) return false;
         continue;
       }
@@ -565,6 +567,9 @@ const runTreeRefusal = (root: string, acceptPidReuse: boolean): string => {
     for (const name of fs.readdirSync(root)) {
       const stat = ownedStat(path.join(root, name));
       if (!stat) return "an entry is a link, hard-linked or not ours";
+      if (name === "tmp" && stat.isDirectory() && !boundedRunTree(path.join(root, name), noDeadline)) {
+        return "task scratch subtree is unsafe or exceeds scan bounds";
+      }
       const known = stat.isFile() ? runFile(name) || name === "final-answer.json" || name === "queued-result.json"
         : ["terminal-controls", "terminal-notices", "handoff-session", "follow-ups", "deliveries", "nested", "tmp", "durable"].includes(name);
       if (!known) return `unknown entry ${name.replace(/[0-9a-f-]{8,}/gi, "<id>")}`;

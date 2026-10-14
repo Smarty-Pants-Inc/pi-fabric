@@ -2,6 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
+import { spawnSync } from "node:child_process";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AgentRunResult } from "../src/agents/types.js";
 import { AgentManager } from "../src/agents/manager.js";
@@ -68,6 +69,61 @@ describe.skipIf(!hasWorker)("AgentManager real worker e2e", () => {
     const record = JSON.parse(fs.readFileSync(path.join(root, "runs", handle.id, "status.json"), "utf8"));
     expect(record.fabricRelease).toBe(installed); // On disk, not manager-only enrichment.
   }, 15_000);
+
+  it.skipIf(process.platform !== "linux").each(["term-ignore", "orphan", "cooperative", "orphan-fallback", "independent-fallback"])("native proof joins its owned detached descendants (%s)", { timeout: 20_000 }, mode => {
+    const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-proof-exit-")));
+    roots.push(root);
+    const cwd = path.join(root, "cwd"), ready = path.join(root, "ready.json"), pids = path.join(root, "pids.json");
+    fs.mkdirSync(cwd);
+    const native = path.join(root, "native.mjs");
+    const procReads = path.join(root, "proc-reads.jsonl"), privacyProbe = path.join(root, "proc-privacy.mjs");
+    fs.writeFileSync(privacyProbe, `import fs from 'node:fs'; import {syncBuiltinESMExports} from 'node:module';
+const read=fs.readFileSync,mkdir=fs.mkdirSync;
+fs.readFileSync=function(file,...args){const name=String(file);if(name.startsWith('/proc/'))fs.appendFileSync(${JSON.stringify(procReads)},JSON.stringify(name)+'\\n');
+if(/^\\/proc\\/[^/]+\\/environ$/.test(name))throw new Error('Proof must not read process environments');return read.call(this,file,...args)};
+fs.mkdirSync=function(file,...args){if(${mode.endsWith("-fallback")}&&String(file).startsWith('/sys/fs/cgroup/'))throw Object.assign(new Error('Recorded cgroup unavailability'),{code:'EACCES'});return mkdir.call(this,file,...args)};
+syncBuiltinESMExports();`);
+    fs.writeFileSync(native, `import fs from 'node:fs'; import {spawn} from 'node:child_process';
+const mode=${JSON.stringify(mode === "orphan-fallback" ? "orphan" : mode === "independent-fallback" ? "term-ignore" : mode)};
+process.on('SIGTERM', () => { if (mode === 'cooperative') process.exit(0); });
+setInterval(() => {}, 1000);
+if (process.argv.includes('--descendant')) {
+  fs.writeFileSync(${JSON.stringify(ready)}, JSON.stringify({pid:process.pid}));
+} else {
+  process.stdin.resume();
+  const watcher=fs.watch(${JSON.stringify(root)}, () => {
+    if (!fs.existsSync(${JSON.stringify(ready)})) return;
+    watcher.close();
+    fs.writeFileSync(${JSON.stringify(pids)}, JSON.stringify({parent:process.pid, descendant:descendant.pid}));
+    process.stdout.write('INVALID_RPC_FRAME\\n', () => { if (mode === 'orphan') process.exit(0); });
+  });
+  const descendant=spawn(process.execPath, [${JSON.stringify(native)}, '--descendant'], {detached:true, stdio:'ignore', ...(mode === 'term-ignore' ? {env:{}} : {})});
+}`);
+    const proof = spawnSync(process.execPath, ["scripts/prove-task-write-scope.mjs", "--fabric-root", process.cwd(),
+      "--workspace", cwd, "--evidence-dir", path.join(cwd, "evidence"), "--pi-binary", native], {
+      encoding: "utf8", timeout: 15_000, env: { ...process.env, TMPDIR: root, TMP: root, TEMP: root,
+        NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ""} --import=${JSON.stringify(pathToFileURL(privacyProbe).href)}` },
+    });
+    expect(proof.status, proof.stderr).toBe(1); // Invalid RPC remains a proof failure, even when cleanup succeeds.
+    const line = proof.stderr.split("\n").find(value => value.startsWith("OWNED_NATIVE_EXIT: "));
+    expect(line, proof.stderr).toBeDefined();
+    const receipt = JSON.parse(line!.slice("OWNED_NATIVE_EXIT: ".length));
+    const launched = JSON.parse(fs.readFileSync(pids, "utf8"));
+    expect(receipt.pgid).toBe(launched.parent);
+    expect(receipt.remaining).toEqual([]);
+    if (mode.endsWith("-fallback")) expect(receipt.ownership).toBe("stat-and-spawn-receipts");
+    const reads = fs.readFileSync(procReads, "utf8").trim().split("\n").map(line => JSON.parse(line) as string);
+    expect(reads.some(file => /^\/proc\/[^/]+\/environ$/.test(file))).toBe(false); // No owned or unrelated environment reads.
+    expect(reads).toContain(`/proc/${launched.descendant}/stat`);
+    expect(receipt.identities.map((value: { pid: number }) => value.pid)).toContain(launched.descendant);
+    expect(receipt.signals.map((value: { signal: string }) => value.signal)).toEqual(mode === "cooperative" ? ["SIGTERM"] : ["SIGTERM", "SIGKILL"]);
+    for (const pid of Object.values(launched)) {
+      let stat: string | undefined;
+      try { stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8"); }
+      catch (error) { expect(error).toMatchObject({ code: "ENOENT" }); }
+      expect(stat === undefined || ["Z", "X"].includes(stat.split(") ").at(-1)!.split(" ")[0] ?? "")).toBe(true);
+    }
+  });
 
   it.each(["reject", "error-only-turn", "success", "terminated-recover"])("records actual inference consumption, not startup/error-only turns (%s)", async (behavior) => {
     const previous = process.env.FAKE_PI_BEHAVIOR;

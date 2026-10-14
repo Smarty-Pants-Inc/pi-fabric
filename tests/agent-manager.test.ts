@@ -2381,6 +2381,7 @@ describe("AgentManager", () => {
       path.resolve("src/worker/principal-delivery.ts"),
       path.resolve("src/worker/session-id.ts"),
       senderHeaderHookPath(pathToFileURL(path.resolve("src/worker.ts")).href),
+      path.resolve("src/agents/write-guard.ts"),
     ]);
     expect(JSON.parse(native.text)).toMatchObject({
       extensions: false,

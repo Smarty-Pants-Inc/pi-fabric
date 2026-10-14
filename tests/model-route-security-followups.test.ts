@@ -27,8 +27,9 @@ afterEach(async () => {
 
 async function setup(network: FabricConfig["approvals"]["network"] = "allow", attributed = false, jev?: { credentialCommand: string[] }, approvalModel?: string) {
   expect(fs.existsSync(workerPath), "Build the real worker before running these regressions").toBe(true);
-  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-route-followups-")); roots.push(cwd);
-  const runRoot = path.join(cwd, FABRIC_RUN_ROOT_PREFIX + "followups");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-route-followups-")); roots.push(root);
+  const cwd = path.join(root, "work"); fs.mkdirSync(cwd);
+  const runRoot = path.join(root, FABRIC_RUN_ROOT_PREFIX + "followups");
   const agentDir = path.join(cwd, "agent");
   fs.mkdirSync(path.join(cwd, ".pi"));
   const scenario = path.join(cwd, "scenario"); fs.writeFileSync(scenario, "success");
@@ -335,7 +336,7 @@ describe("SR-7 Windows command-backed credential scope cut through the real regi
 const deliveryId = "01234567-89ab-4cde-8fab-0123456789ab.json";
 function expire(fixture: Awaited<ReturnType<typeof setup>>) {
   const now = Date.now(); markRunRootActive(fixture.runRoot, now - 10000); markRunRootClosed(fixture.runRoot, now, true);
-  return sweepTempRunRoots({ tempRoot: fixture.cwd, now: now + 20000, oneShotRunRetentionMs: 10000, orphanedTempRunRetentionMs: 10000 });
+  return sweepTempRunRoots({ tempRoot: path.dirname(fixture.runRoot), now: now + 20000, oneShotRunRetentionMs: 10000, orphanedTempRunRetentionMs: 10000 });
 }
 describe("SR-6 real routed worker artifacts are safely retained or collected", () => {
   it.each(["empty", "nonempty"])("collects a closed expired successful run with provenance and %s deliveries", async contents => {

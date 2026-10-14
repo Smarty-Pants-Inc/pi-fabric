@@ -130,6 +130,7 @@ export const parseWorkerOptions = (
   }
   const branch = optional(args, "branch");
   const worktree = optional(args, "worktree");
+  const tmpdir = optional(args, "tmpdir");
   const writePolicy = optional(args, "write-policy");
   const scope = optional(args, "scope");
   const lineage = optional(args, "lineage");
@@ -280,6 +281,7 @@ export const parseWorkerOptions = (
     ...(childQuestionTimeoutMs !== undefined ? { childQuestionTimeoutMs } : {}),
     ...(branch ? { branch } : {}),
     ...(worktree ? { worktree } : {}),
+    ...(tmpdir ? { tmpdir } : {}),
     ...(writePolicy ? { writePolicy } : {}),
     ...(scope ? { scope } : {}),
     ...(lineage ? { lineage } : {}),

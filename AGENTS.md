@@ -81,8 +81,10 @@ riding in on a change the selection did not cover.
 change is about dead exports or the lazy startup graph, never as a routine
 gate.
 
-Publishing runs `prepack`, which is `proof:check && typecheck && build`, never the
-suite. `proof:check` requires the pinned Bend 2.0.36 compiler; normal builds verify
+Publishing runs `prepack`, which is `proof:check && typecheck && build` followed by
+`scripts/bundle-pi-packages.mjs`, never the suite. That script turns each
+`bundledDependencies` symlink (Bun's isolated linker) into a real copy so `bun pm
+pack` does not silently drop it, and prunes Pi host packages from it. `proof:check` requires the pinned Bend 2.0.36 compiler; normal builds verify
 the checked-in artifact hashes without requiring Bend. After a version bump the artifact is verified through
 `dist-tags` and `time["<version>"]` in the packument.
 
@@ -105,6 +107,15 @@ and explicit host/adapter assumptions. Always finish with `bun run build`.
 This repo is bun-managed (`bun.lock`; scripts invoke `bun run` internally).
 Do not use pnpm/npm — pnpm's pre-run dependency check fails against the bun
 lockfile.
+
+## Bundled Pi packages
+
+`pi-coralbricks-provider` ships inside the tarball (`dependencies` plus
+`bundledDependencies`, exact version) and loads through its
+`./node_modules/pi-coralbricks-provider/index.ts` entry in `pi.extensions`. It is
+not part of Fabric's compiled startup graph; `assert:build-artifacts` checks the
+entry, the exact pin and that the package keeps Pi hosts as peers. To bump it,
+change the pin, run `bun install`, and check `tests/bundled-provider-package.test.ts`.
 
 ## Commits
 

@@ -109,25 +109,36 @@ describe("test temporary-storage isolation", () => {
       expect(run.first).not.toBe(forged); // 2432cef9..906efce0: adopted as the guard's delete root
       expect(dirname(run.first)).toBe(join(forged, "pi-fabric-vitest-job"));
       expect(basename(run.first)).toMatch(/^pi-fabric-vitest-run-[A-Za-z0-9]{6}$/);
-      expect(statSync(run.first).mode & 0o777).toBe(0o700);
+      if (process.platform !== "win32") expect(statSync(run.first).mode & 0o777).toBe(0o700); // no mode bits on Windows
       expect(readFileSync(join(forged, "victim"), "utf8")).toBe("keep");
     } finally {
       rmSync(fixture, { recursive: true, force: true });
     }
   });
 
-  it("never adopts a run-named directory with another mode, or the job root itself", () => {
-    const fixture = mkdtempSync(join(tmpdir(), "forged-run-"));
+  it("never adopts the shared job root itself, even when the marker names it", () => {
+    const fixture = mkdtempSync(join(tmpdir(), "forged-root-"));
     try {
       const jobRoot = join(fixture, "pi-fabric-vitest-job");
-      const lookalike = join(jobRoot, "pi-fabric-vitest-run-AbCdEf");
+      mkdirSync(jobRoot);
+      const run = windowsTemp({ RUNNER_TEMP: fixture, TMPDIR: jobRoot, TMP: jobRoot, TEMP: jobRoot, PI_TEST_TEMP_JOB_DIR: jobRoot });
+      expect(run.first).not.toBe(jobRoot);
+      expect(basename(run.first)).toMatch(/^pi-fabric-vitest-run-[A-Za-z0-9]{6}$/);
+    } finally {
+      rmSync(fixture, { recursive: true, force: true });
+    }
+  });
+
+  // POSIX only: Windows has no uid or mode bits, so there the name and type checks stand alone.
+  it.skipIf(process.platform === "win32")("never adopts a run-named directory with another mode", () => {
+    const fixture = mkdtempSync(join(tmpdir(), "forged-run-"));
+    try {
+      const lookalike = join(fixture, "pi-fabric-vitest-job", "pi-fabric-vitest-run-AbCdEf");
       mkdirSync(lookalike, { recursive: true, mode: 0o755 });
       chmodSync(lookalike, 0o755);
-      for (const forged of [lookalike, jobRoot]) {
-        const run = windowsTemp({ RUNNER_TEMP: fixture, TMPDIR: forged, TMP: forged, TEMP: forged, PI_TEST_TEMP_JOB_DIR: forged });
-        expect(run.first).not.toBe(forged);
-        expect(basename(run.first)).toMatch(/^pi-fabric-vitest-run-[A-Za-z0-9]{6}$/);
-      }
+      const run = windowsTemp({ RUNNER_TEMP: fixture, TMPDIR: lookalike, TMP: lookalike, TEMP: lookalike, PI_TEST_TEMP_JOB_DIR: lookalike });
+      expect(run.first).not.toBe(lookalike);
+      expect(basename(run.first)).toMatch(/^pi-fabric-vitest-run-[A-Za-z0-9]{6}$/);
     } finally {
       rmSync(fixture, { recursive: true, force: true });
     }

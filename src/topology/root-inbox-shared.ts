@@ -131,17 +131,16 @@ export const eventReceipts = (event: MeshEvent): string[] => {
 /**
  * Display-only shadow metadata for an inbox carrier's receipt group (smarty-dev#12140): an event
  * with an explicit identity carries the other-kind receipt too, because native carriers record
- * deliveryId as "delivery" while mesh shadows record messageId as "id" (and vice versa). An event
- * without an explicit identity names its sender/topic key (else ref) under the retired "topic-*"
- * kind, which the incoming-message renderer matches against delivered native carriers. Root-inbox
- * dedup never consults "topic-*" (only "native-topic-*"), so these display hashes cannot collapse
- * distinct durable events; explicit identity still outranks the key/ref fallback.
+ * deliveryId as "delivery" while mesh shadows record messageId as "id" (and vice versa). Factory
+ * shadows carry commandId instead: acceptControl gives the native carrier that same deliveryId.
+ * A key or ref is only a work claim, not a notification identity, so key/ref-only shadows fail
+ * open when a distinct event reuses the same work key. An explicit deliveryId/messageId still
+ * outranks commandId; sender-qualified shared identity alone proves the carrier delivered it.
  */
 const shadowDisplayReceipts = (event: MeshEvent): string[] => {
   if (deliveryIdentity(event.data)) return crossIdentityReceipts(event.from.id, event.data);
-  const key = workKey(event.data), ref = workRef(event.data);
-  const legacy = (kind: "key" | "ref", value: string) => receipt(event.from.id, `topic-${kind}`, JSON.stringify([event.topic, value]));
-  return key ? [legacy("key", key)] : ref ? [legacy("ref", ref)] : [];
+  const commandId = event.data && typeof event.data === "object" ? (event.data as { commandId?: unknown }).commandId : undefined;
+  return typeof commandId === "string" && commandId ? [receipt(event.from.id, "delivery", commandId)] : [];
 };
 /** What the session's own entries say it holds. */
 export interface RootInboxSession {

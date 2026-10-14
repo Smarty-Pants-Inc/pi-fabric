@@ -42,7 +42,7 @@ vi.mock("../src/mesh/nats-auth/server-config.js", () => ({
 import { runNatsCli } from "../src/mesh/nats-auth/cli.js";
 
 const TARGET = "/virtual/output";
-const FILES = ["one.jwt", "two.key"];
+const FILES = ["one.jwt", "two.key"] as const;
 const DATA = [new Uint8Array([11, 22]), new Uint8Array([33, 44])];
 const OWN_UID = process.getuid?.() ?? 1234;
 

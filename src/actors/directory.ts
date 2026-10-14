@@ -27,6 +27,8 @@ export class ActorDirectory extends ActorManager {
   readonly #secondary: ActorManager;
   readonly #defaultScope: FabricActorStorageScope;
   readonly #sessionOrphans: SessionActorOrphans | undefined;
+  #orphanReconcilePending: Promise<number> | undefined;
+  #releaseCheckpointReady = false;
 
   constructor(
     base: ConstructorParameters<typeof ActorManager>,
@@ -127,7 +129,14 @@ export class ActorDirectory extends ActorManager {
       : this.#secondary.create(request, fencedOptions);
   }
   #localActors(): FabricActorInfo[] { return [...super.list(), ...this.#secondary.list()]; }
-  override reconcileSessionOrphans(): Promise<number> { return this.#sessionOrphans?.reconcile() ?? Promise.resolve(0); }
+  override reconcileSessionOrphans(): Promise<number> {
+    if (this.releaseAdmissionHeld || !this.#sessionOrphans) return Promise.resolve(0);
+    if (this.#orphanReconcilePending) return this.#orphanReconcilePending;
+    const pending = this.#sessionOrphans.reconcile().finally(() => {
+      if (this.#orphanReconcilePending === pending) this.#orphanReconcilePending = undefined;
+    });
+    return this.#orphanReconcilePending = pending;
+  }
   override list(): FabricActorInfo[] {
     // Synchronous internal/UI reads schedule work; public provider reads await it.
     void this.reconcileSessionOrphans().catch(() => undefined);
@@ -196,7 +205,7 @@ export class ActorDirectory extends ActorManager {
   /** Both scopes: a reload stops a session-scope actor's run as well (review/astra round 2 on #158). */
   override inFlightActorIds(): string[] { return [...super.inFlightActorIds(), ...this.#secondary.inFlightActorIds()]; }
   override reportStuckPreparing(...args: Parameters<ActorManager["reportStuckPreparing"]>): number { return super.reportStuckPreparing(...args) + this.#secondary.reportStuckPreparing(...args); }
-  override inFlightCount(): number { return super.inFlightCount() + this.#secondary.inFlightCount(); }
+  override inFlightCount(): number { return super.inFlightCount() + this.#secondary.inFlightCount() + (this.#orphanReconcilePending ? 1 : 0); }
   override haltAll(): { halted: number } {
     return { halted: haltEvery([() => super.haltAll().halted, () => this.#secondary.haltAll().halted]) };
   }
@@ -212,9 +221,33 @@ export class ActorDirectory extends ActorManager {
     if (this.#secondary.cleanupObligation(args[0])) return this.#secondary.remove(...args);
     return this.#isPrimary(args[0]) ? super.remove(...args) : this.#secondary.remove(...args);
   }
-  override pauseForRelease(): void { super.pauseForRelease(); this.#secondary.pauseForRelease(); }
-  override resumeAfterRelease(): void { super.resumeAfterRelease(); this.#secondary.resumeAfterRelease(); }
-  override async checkpointForRelease(): Promise<void> { await super.checkpointForRelease(); await this.#secondary.checkpointForRelease(); }
+  override get releaseAdmissionHeld(): boolean { return super.releaseAdmissionHeld && this.#secondary.releaseAdmissionHeld; }
+  override pauseForRelease(options: Parameters<ActorManager["pauseForRelease"]>[0] = {}): void {
+    this.#releaseCheckpointReady = false;
+    super.pauseForRelease(options); this.#secondary.pauseForRelease(options);
+  }
+  override resumeAfterRelease(): void {
+    this.#releaseCheckpointReady = false;
+    super.resumeAfterRelease(); this.#secondary.resumeAfterRelease();
+  }
+  override withReleaseAdmission<T>(admit: () => T): T {
+    return super.withReleaseAdmission(() => this.#secondary.withReleaseAdmission(admit));
+  }
+  override async checkpointForRelease(assertHeld?: () => void): Promise<void> {
+    this.#releaseCheckpointReady = false;
+    assertHeld?.();
+    await super.checkpointForRelease(assertHeld);
+    assertHeld?.();
+    await this.#secondary.checkpointForRelease(assertHeld);
+    assertHeld?.();
+    this.#releaseCheckpointReady = true;
+    this.releaseCheckpointReceipt();
+  }
+  override releaseCheckpointReceipt(): unknown {
+    if (!this.#releaseCheckpointReady) throw new Error("Both actor scopes have not checkpointed");
+    const primary = super.releaseCheckpointReceipt(), secondary = this.#secondary.releaseCheckpointReceipt();
+    return this.#defaultScope === "project" ? { project: primary, session: secondary } : { project: secondary, session: primary };
+  }
   override async close(): Promise<void> {
     await this.#sessionOrphans?.close();
     await Promise.all([super.close(), this.#secondary.close()]);

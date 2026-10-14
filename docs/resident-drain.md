@@ -1,10 +1,15 @@
-# Resident drain preflight
+# Cooperative resident drain
 
-`fabric-resident-drain` is a **fail-closed preflight**, not a working legacy
-release migration. It selects one resident, checks its expected release and
-native identity, and prints one JSON refusal receipt with a nonzero exit status.
-It never stops an actor or host, dispatches a resident request, starts a target,
-changes a cursor, removes a custody marker, or changes the resident's files.
+`fabric-resident-drain` negotiates a **reversible hold and checkpoint** with a
+compatible loaded resident. It is not a working release migration. A healthy
+operation holds admission, lets accepted work finish naturally, checkpoints and
+reads back custody, then resumes the same old resident. It returns nonzero JSON
+`containment-unavailable`: complete attempt exit and rollback remain disabled.
+It never stops an actor or host, starts a target, or removes a custody marker.
+
+Legacy or uncertain roots retain the read-only preflight: they refuse without
+request dispatch or changes to resident files. New source cannot retrofit the
+endpoint or containment into an already-loaded legacy host.
 
 ```sh
 fabric-resident-drain \
@@ -17,12 +22,18 @@ fabric-resident-drain \
 All four arguments are required. The mesh root has no implicit fleet default.
 Release arguments name retained package directories, not abbreviated Git SHAs or
 mutable profile selectors. An expected-release mismatch or unverifiable owner
-refuses before any transition. An older host without launch attestation also
-refuses; its immutable extension path can identify a mismatch but cannot prove
-launcher custody.
+refuses before any transition. An older host without the immutable birth-bound
+launcher identity also refuses; its extension path can identify a mismatch but
+cannot prove launcher custody.
 
-Even an attested current host refuses. No supported resident operation closes
-all admission while preserving accepted queues and outcomes:
+A cooperative host must advertise `fabric-resident-drain-1` and `releaseDrain`.
+The CLI validates its immutable launch snapshot, target artifact and unchanged
+topology, plus the existing live owning Main process, session and generation.
+It never creates a Main attestation or starts a host to satisfy these checks.
+A finite timeout resumes A without aborting accepted work; unreadable or
+uncorrelated terminal evidence reports `needs-operator`, not successful service.
+
+These legacy operations are not substitutes for cooperative PREPARE:
 
 - `setActivationFilter` skips matching events; it is not a queue-preserving hold.
   Matching mesh events can be consumed, not retained behind the cursor.
@@ -43,11 +54,19 @@ disabled; this command does not bypass them.
 
 ## Read-back and rollback
 
-The receipt reports a refusal in `preflight`, with the observed resident identity,
-a reason, elapsed time, and rollback status `not-needed`: no transition was
-attempted. Read-back of the owner and actor queue should still show the old
-serving generation. The native regression checks this with acknowledged queued
-work and then observes that work complete exactly once on the old release.
+Legacy refusal reports `preflight`, `unchanged:true` and rollback `not-needed`.
+A negotiated operation reports its resident-generated ID, held/checkpointed
+state, actual resume and checked read-back. `containment-unavailable` is partial
+progress, never release success. It has `unchanged:false` because PREPARE changed
+admission briefly, and rollback `not-attempted` because no target started.
+
+Public JSON contains only allowlisted evidence. Paths are relative to the explicit
+mesh root. Authentication tokens use short SHA-256 fingerprints; private config,
+Main nonce and complete checkpoint contents are not printed. Durable root-local
+receipts retain private correlation data and must not be copied into public logs.
+Native regressions check the same serving owner, unchanged accepted retry evidence
+and exactly-once work completion after resume; concurrent input stays behind its
+cursor while held.
 
 Do not launch the old release as a rollback while any target may still execute.
 A future cooperative drain may roll back only after it proves target startup
@@ -55,8 +74,14 @@ admitted no work **and** the complete target attempt exited. After target work
 admission, a read-back failure needs an operator; it cannot authorize a competing
 old resident.
 
-The remaining implementation is a preserving resident-owned admission/drain
-endpoint plus complete attempt custody and exit receipts. It cannot be retrofitted
-into an already-loaded legacy host by running this CLI. Until those prerequisites
-exist, leave the old resident serving and arrange any manual maintenance window
-through its owner; a quiet window alone is not a machine-verified drain.
+The remaining dependency is complete attempt-owned containment and exit receipts
+(smarty-dev#11962). The frozen containment interface defaults to refusal. A real
+adapter must run in launcher custody with its retained native handles; neither
+the CLI nor the endpoint reopens a scope path from `owner.json`. The launcher alone
+writes the immutable `attempt-launch-<attemptId>.json` beside `owner.json`, before
+releasing the host. Its full receipt must match the launch environment and native
+IPC receipt field for field. Readers use an owned, no-follow descriptor boundary;
+a missing or different receipt never grants containment. A free lock, missing
+owner or direct-child exit cannot authorize B or an A fallback. Leave
+legacy residents serving and arrange any manual maintenance through their owner;
+a quiet window alone is not a machine-verified drain.

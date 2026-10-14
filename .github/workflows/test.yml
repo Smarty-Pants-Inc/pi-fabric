@@ -316,6 +316,10 @@ jobs:
           NATS_SERVER_URL: nats://127.0.0.1:4222
           NATS_MONITOR_URL: http://127.0.0.1:8222
         run: bunx vitest run --retry=0 tests/mesh-state-backend.test.ts tests/mesh-state-backend-multiprocess.test.ts tests/mesh-backend-migration-nats.test.ts
+      - name: State backend through a forced metadata-leader election
+        if: matrix.profile == 'cluster'
+        # The fixture owns another three-node cluster on unique ports, so only its own leader is paused.
+        run: bunx vitest run --retry=0 tests/state-backend-nats-election.test.ts
       - name: Server logs (all nodes)
         if: failure()
         shell: bash

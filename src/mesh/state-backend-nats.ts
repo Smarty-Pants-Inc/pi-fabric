@@ -39,7 +39,7 @@ export class NatsWrongLastSequenceError extends Error {
 }
 
 /** One stored stream message. */
-export interface NatsStreamMessage { seq: number; data: Uint8Array }
+export interface NatsStreamMessage { seq: number; data: Uint8Array; msgID?: string }
 
 /**
  * The JetStream operations this backend uses. The real implementation wraps the official nats.js v3 client

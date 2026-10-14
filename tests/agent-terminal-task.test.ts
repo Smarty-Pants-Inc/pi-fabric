@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agents/manager.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
+import { writeModelExceptions } from "./helpers/model-exceptions.js";
 import { writeJsonAtomic } from "../src/core/atomic-write.js";
 import { saveFinalAnswerReceipt } from "../src/worker/terminal-answer.js";
 import type { AgentRunRecord } from "../src/agents/types.js";
@@ -42,7 +43,8 @@ const harness = (onTerminalNotice?: (notice: AgentTerminalNotice) => void | Prom
       waitForClose: () => closed, isAlive: async () => alive, stop: async () => { await closed; } };
   });
   const settled = vi.fn();
-  const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, maxConcurrent: 1, budgetUsd: 0, retainRuns: true },
+  const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, maxConcurrent: 1, budgetUsd: 0, retainRuns: true,
+    modelExceptionsPath: writeModelExceptions(root, ["claude/<backend-default>"]) },
     { workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root, onSettled: settled, ...(onTerminalNotice ? { onTerminalNotice } : {}) });
   managers.push(manager);
   const finish = (id: string, text: string) => {

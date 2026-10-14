@@ -1148,7 +1148,7 @@ export class ActorManager {
       model: requestedModel || this.agents.defaultModel(runner), modelReason: request.modelReason,
       thinking: request.thinking, modelPolicyOriginalModel: request.modelPolicyOriginalModel,
       modelSource: request.modelSource ?? (request.routeClass !== undefined ? "route" : requestedModel ? "explicit" : "default"),
-    }, request.routeClass !== undefined);
+    }, request.routeClass !== undefined, false, `actor:${name}`);
     const admittedModel = admitted.model;
     // Unchanged defaults stay dynamic; a substituted target/thinking must travel together.
     const model = requestedModel || admitted.modelPolicyOriginalModel ? admittedModel : undefined;
@@ -1520,7 +1520,8 @@ export class ActorManager {
       (actor.runner === "pi" || actor.runner === "pi-durable") && next.includes("/") &&
       !this.agents.modelReasonRequired(next, actor.runner);
     const resolved = next
-      ? (await this.#resolvedRunBindingFor(actor.runner, { model: next, modelReason, modelSource: "explicit" }, actor.routeClass !== undefined, policyOnly)).model
+      ? (await this.#resolvedRunBindingFor(actor.runner, { model: next, modelReason, modelSource: "explicit" }, actor.routeClass !== undefined, policyOnly,
+        `actor:${actor.name}`)).model
       : undefined;
     this.agents.assertModelAllowed(resolved);
     if (!resolved) {
@@ -1530,8 +1531,8 @@ export class ActorManager {
       if (fallback) await this.#resolvedRunBindingFor(actor.runner, {
         model: fallback, modelReason: reason,
         modelSource: inherited ? "explicit" : "default",
-      }, actor.routeClass !== undefined);
-      else await this.agents.prepareModelWithReason(undefined, reason, actor.runner, { modelSource: "default" });
+      }, actor.routeClass !== undefined, false, `actor:${actor.name}`);
+      else await this.agents.prepareModelWithReason(undefined, reason, actor.runner, { modelSource: "default", role: `actor:${actor.name}` });
     }
     // Validate both the effective view and duplicated binding/default metadata before commit.
     const preview = scope === "project"
@@ -7170,6 +7171,7 @@ export class ActorManager {
     binding: FabricActorRunBinding,
     requiredPin = false,
     policyOnly = false,
+    role?: string,
   ): FabricActorRunBinding | Promise<FabricActorRunBinding> {
     const reason = binding.modelReason ?? binding.opusReason;
     const source = binding.modelSource ?? (requiredPin ? "route" : binding.model ? "explicit" : "default");
@@ -7179,6 +7181,7 @@ export class ActorManager {
       const admission = this.agents.resolveModelReasonPolicy(model, reason, runner, {
         modelSource: source, thinking: binding.thinking,
         resolveFallback: key => this.#resolvedModel(runner, key, true),
+        ...(role !== undefined ? { role } : {}),
       });
       const finish = (admitted: { model?: string | undefined; thinking?: FabricThinking | undefined; fallback: boolean }): FabricActorRunBinding => {
         const result: FabricActorRunBinding = { ...binding,
@@ -7210,7 +7213,7 @@ export class ActorManager {
     actor: ManagedActor,
     binding: FabricActorRunBinding,
   ): FabricActorRunBinding | Promise<FabricActorRunBinding> {
-    return this.#resolvedRunBindingFor(actor.runner, binding, actor.routeClass !== undefined);
+    return this.#resolvedRunBindingFor(actor.runner, binding, actor.routeClass !== undefined, false, `actor:${actor.name}`);
   }
 
   #validatedRunBinding(binding: FabricActorRunBinding): FabricActorRunBinding {

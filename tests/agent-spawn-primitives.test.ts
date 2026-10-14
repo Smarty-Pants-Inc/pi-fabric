@@ -14,6 +14,7 @@ import { AgentsProvider } from "../src/providers/agents-provider.js";
 import { GUEST_TYPE_DECLARATIONS } from "../src/runtime/guest-types.js";
 import { typeCheckFabricCode } from "../src/runtime/type-checker.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
+import { writeModelExceptions } from "./helpers/model-exceptions.js";
 import { AgentManager } from "../src/agents/manager.js";
 import { checkedSeed, completedBranchPrefix, snippetTask } from "../src/agents/fork-seed.js";
 import { writeForkSession } from "../src/agents/handoff.js";
@@ -308,7 +309,8 @@ const createManager = (
   const root = tempRoot("pi-fabric-wp7-runs-");
   const workerPath = path.join(root, "worker.mjs");
   fs.writeFileSync(workerPath, workerSource);
-  const manager = new AgentManager(cwd, { ...DEFAULT_FABRIC_CONFIG.agents, timeoutMs: 10_000, ...config }, {
+  const manager = new AgentManager(cwd, { ...DEFAULT_FABRIC_CONFIG.agents, timeoutMs: 10_000,
+    modelExceptionsPath: writeModelExceptions(root, ["claude/<backend-default>"]), ...config }, {
     workerPath,
     runRoot: path.join(root, "runs"),
     fullCodeMode: false,

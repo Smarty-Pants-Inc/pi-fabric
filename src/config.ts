@@ -254,6 +254,13 @@ export interface FabricAgentConfig {
     fallbackThinking?: FabricThinking;
   };
   deniedModelReplacement?: string;
+  /**
+   * Internal trusted host path of `model-exceptions.json` (host/installer owned).
+   * Never read from any config file: normalize drops it and resolveFabricConfig
+   * injects `<agentDir>/model-exceptions.json`. Direct embedders may set it.
+   * Unset means no Claude/Opus exception can be admitted (fail closed).
+   */
+  modelExceptionsPath?: string;
   /** Host-only file instructions root. Unset = ~/.local/share/smarty-dev/factory/current/. */
   instructionsRoot?: string;
   claude: FabricClaudeRunnerConfig;
@@ -2279,6 +2286,8 @@ const resolveFabricConfig = (
     merged.fullCodeMode = inheritedFullCodeMode === "true";
   }
   const normalized = normalizeFabricConfig(merged);
+  // Host-owned exceptions: no host/project config layer can supply or redirect them.
+  normalized.agents.modelExceptionsPath = path.resolve(options.agentDir, "model-exceptions.json");
   if (applyEnvironmentOverrides && process.env[FABRIC_THINKING_BOUNDS_ENV] !== undefined) {
     // A child only narrows its own bounds by the parent's; never widens them.
     const inherited = inheritedThinkingBounds();

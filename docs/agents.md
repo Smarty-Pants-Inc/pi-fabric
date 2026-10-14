@@ -385,6 +385,24 @@ that names an issue (`#N`) or includes an issue URL. The `run.spawned` lifecycle
 event is emitted after actual worker registration (not queue admission) with
 `data.model` and, when supplied, `data.modelReason` for metering.
 
+A valid reason is not itself authority to use Claude/Opus. Before worker or
+actor-binding admission, Fabric freshly reads the host-owned
+`<agentDir>/model-exceptions.json`; only an unexpired matching issue reference,
+model prefix, and optional exact role (`task` or `actor:<name>`) admits the
+exception. Missing, malformed, expired, wrong-model, or wrong-role entries
+raise `FabricModelExceptionDeniedError` (`FABRIC_MODEL_EXCEPTION_DENIED`) before
+side effects. `#N` canonicalizes to `smarty-dev#N`; GitHub URLs count only for
+Smarty-Pants-Inc's repository issue URLs, not arbitrary URL fragments. Main's
+own model selection is unchanged. The path is internally derived from the
+normalized agent directory and cannot be supplied by either profile or project
+`fabric.json`. Test coverage keeps a separate finite host fixture for legacy
+`#11864` compatibility controls; it does not admit `#1`.
+
+Decision C keeps the process-backed fake-worker integration: it proves a denied
+request produces no worker launch and a matching host exception completes the
+real manager/provider admission path, without contacting a model provider. It
+is a native-process admission integration, not a live model end-to-end test.
+
 Protected explicit selections refuse when the required reason is absent. An
 indirect/default selection first uses a configured non-protected `agents.model`
 when available, otherwise the host/profile

@@ -22,6 +22,7 @@ import { ActionRegistry } from "../src/core/action-registry.js";
 import { createMainExecutionCeilingError } from "../src/async-settlement.js";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
+import { writeModelExceptions } from "./helpers/model-exceptions.js";
 import type { FabricMainAgentDeliveryRequest, FabricMainAgentTarget } from "../src/main-agent.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { ResidencyClient } from "../src/residency/client.js";
@@ -2860,6 +2861,12 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
     writeModels(["claude-late-5-5"]);
     vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
     const state = await rootHarness("resident-late-model");
+    state.config.agents.modelExceptionsPath = writeModelExceptions(agentDir, [
+      "probe-late/claude-late-5-5",
+      "probe-late/claude-late-5-6",
+      "probe-late/claude-late-5-7",
+      "probe-missing/claude-late-5-9", // Preserve the unavailable-model rejection below.
+    ]);
     state.config.piModels = {
       available: [{ provider: "probe-late", id: "claude-late-5-5" }],
       aliases: {},

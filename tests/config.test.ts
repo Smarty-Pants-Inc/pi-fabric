@@ -118,6 +118,29 @@ describe("fleet model policy configuration (#2490)", () => {
   });
 });
 
+describe("host-only model exception file location", () => {
+  it("derives the host exception file only from the normalized agent directory", () => {
+    const cwd = temporaryDirectory();
+    const agentDir = temporaryDirectory();
+    const redirected = temporaryDirectory();
+    fs.mkdirSync(path.join(cwd, ".pi"));
+    fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({ agents: { modelExceptionsPath: redirected } }));
+    fs.writeFileSync(path.join(cwd, ".pi", "fabric.json"), JSON.stringify({ agents: {
+      modelExceptionsPath: redirected,
+      modelExceptions: [{ ref: "#1", models: ["claude"] }],
+    } }));
+
+    for (const projectTrusted of [true, false]) {
+      const loaded = loadFabricConfig({ cwd, agentDir, projectTrusted });
+      expect(loaded.agents.modelExceptionsPath).toBe(path.resolve(agentDir, "model-exceptions.json"));
+      expect(loaded.agents).not.toHaveProperty("modelExceptions");
+      expect(normalizeFabricConfig({ agents: { modelExceptionsPath: redirected } }).agents.modelExceptionsPath)
+        .toBeUndefined();
+    }
+    expect(DEFAULT_FABRIC_CONFIG.agents).not.toHaveProperty("modelExceptionsPath");
+  });
+});
+
 describe("host-only actor instruction root (#3819)", () => {
   it("leaves the default implicit and normalizes the configured root", () => {
     expect(normalizeFabricConfig({}).agents.instructionsRoot).toBeUndefined();

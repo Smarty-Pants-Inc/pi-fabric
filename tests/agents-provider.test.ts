@@ -10,7 +10,7 @@ import { deliveryRoot, projectOf } from "../src/topology/project-identity.js";
 import os from "node:os";
 import path from "node:path";
 import { SessionManager, type ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ActorManager } from "../src/actors/manager.js";
 import { ActorBindingStore } from "../src/actors/binding-store.js";
 import { ActorRegistryStore } from "../src/actors/registry-store.js";
@@ -72,6 +72,18 @@ const roots: string[] = [];
 const actorManagers: ActorManager[] = [];
 const agentManagers: AgentManager[] = [];
 const controlPlanes: FabricControlPlane[] = [];
+// Private legacy-control fixture for direct managers in this suite: #11864 only.
+const legacyExceptionRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-provider-exceptions-"));
+const legacyExceptionPath = path.join(legacyExceptionRoot, "model-exceptions.json");
+fs.writeFileSync(legacyExceptionPath, JSON.stringify([{ ref: "smarty-dev#11864",
+  models: ["anthropic/claude", "cliproxyapi-anthropic/claude", "private/claude", "claude/", "sonnet", "opus", "veda/claude-code"], expires: "2999-01-01T00:00:00.000Z" }]));
+const originalModelExceptionsPath = DEFAULT_FABRIC_CONFIG.agents.modelExceptionsPath;
+DEFAULT_FABRIC_CONFIG.agents.modelExceptionsPath = legacyExceptionPath;
+afterAll(() => {
+  if (originalModelExceptionsPath === undefined) delete DEFAULT_FABRIC_CONFIG.agents.modelExceptionsPath;
+  else DEFAULT_FABRIC_CONFIG.agents.modelExceptionsPath = originalModelExceptionsPath;
+  fs.rmSync(legacyExceptionRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+});
 
 const usage = {
   input: 0,
@@ -287,6 +299,203 @@ describe("explicit Astra launch guard (#3134)", () => {
   });
 });
 
+describe("public actor model-exception roles", () => {
+  const model = "cliproxyapi-anthropic/claude-opus-5-5";
+  const safeModel = "cliproxyapi/gpt-6.1-sol";
+  const reason = "Actor-only exception #1";
+  const writeActorGrant = (exceptionPath: string): void => {
+    fs.writeFileSync(exceptionPath, JSON.stringify([{
+      ref: "smarty-dev#1", models: ["cliproxyapi-anthropic/claude-opus"],
+      roles: ["actor:reviewer"], expires: "2999-01-01T00:00:00.000Z",
+    }]));
+  };
+
+  it("uses actor:<name> rather than task when admitting an actor-only host grant", async () => {
+    const state = setup();
+    writeActorGrant(state.agents.config.modelExceptionsPath!);
+    const actor = await state.provider.invoke("create", {
+      name: "reviewer", instructions: "Review.", model, modelReason: reason,
+    }, context) as FabricActorInfo;
+    expect(actor).toMatchObject({ model, modelReason: reason });
+  });
+
+  it("uses the same host row to refuse wrong actor names and task roles before side effects", async () => {
+    const state = setup();
+    writeActorGrant(state.agents.config.modelExceptionsPath!);
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    try {
+      await expect(state.provider.invoke("create", {
+        name: "wrong-name", instructions: "Review.", model, modelReason: reason,
+      }, context)).rejects.toMatchObject({
+        name: "FabricModelExceptionDeniedError", code: "FABRIC_MODEL_EXCEPTION_DENIED",
+        denial: "role-mismatch", ref: "smarty-dev#1", role: "actor:wrong-name",
+      });
+      await expect(state.provider.invoke("run", {
+        task: "Task role must not borrow an actor grant", model, modelReason: reason, transport: "process",
+      }, context)).rejects.toMatchObject({
+        name: "FabricModelExceptionDeniedError", code: "FABRIC_MODEL_EXCEPTION_DENIED",
+        denial: "role-mismatch", ref: "smarty-dev#1", role: "task",
+      });
+      expect(state.actors.list()).toEqual([]);
+      expect(state.agents.list()).toEqual([]);
+      expect(launch).not.toHaveBeenCalled();
+    } finally { launch.mockRestore(); }
+  });
+
+  it("admits reviewer bindings and refuses a wrong-role setter through public setModel", async () => {
+    const state = setup();
+    writeActorGrant(state.agents.config.modelExceptionsPath!);
+    const reviewer = await state.provider.invoke("create", {
+      name: "reviewer", instructions: "Review.", model: safeModel,
+    }, context) as FabricActorInfo;
+    const selected = await state.provider.invoke("setModel", {
+      id: reviewer.id, model, modelReason: reason,
+    }, context) as FabricActorInfo;
+    expect(selected).toMatchObject({ id: reviewer.id, model, modelReason: reason });
+
+    const wrong = await state.provider.invoke("create", {
+      name: "wrong-name", instructions: "Review.", model: safeModel,
+    }, context) as FabricActorInfo;
+    const wrongDefinition = structuredClone(state.actors.definition(wrong.id));
+    await expect(state.provider.invoke("setModel", {
+      id: wrong.id, model, modelReason: reason,
+    }, context)).rejects.toMatchObject({
+      name: "FabricModelExceptionDeniedError", code: "FABRIC_MODEL_EXCEPTION_DENIED",
+      denial: "role-mismatch", ref: "smarty-dev#1", role: "actor:wrong-name",
+    });
+    expect(state.actors.definition(wrong.id)).toEqual(wrongDefinition);
+    expect(state.actors.status(wrong.id)).toMatchObject({ id: wrong.id, model: safeModel });
+  });
+
+  it.each(["ask", "tell"] as const)("applies the receiver actor role to %s bindings", async action => {
+    const state = setup();
+    writeActorGrant(state.agents.config.modelExceptionsPath!);
+    const reviewer = await state.provider.invoke("create", {
+      name: "reviewer", instructions: "Review.", model: safeModel,
+    }, context) as FabricActorInfo;
+    const wrong = await state.provider.invoke("create", {
+      name: "wrong-name", instructions: "Review.", model: safeModel,
+    }, context) as FabricActorInfo;
+    const args = (id: string) => ({ id, message: `role-bound ${action}`, model, modelReason: reason });
+
+    if (action === "ask") {
+      await expect(state.provider.invoke(action, args(reviewer.id), context)).resolves.toBeDefined();
+    } else {
+      await expect(state.provider.invoke(action, args(reviewer.id), context)).resolves.toMatchObject({ queued: true });
+    }
+    await expect(state.provider.invoke(action, args(wrong.id), context)).rejects.toMatchObject({
+      name: "FabricModelExceptionDeniedError", code: "FABRIC_MODEL_EXCEPTION_DENIED",
+      denial: "role-mismatch", ref: "smarty-dev#1", role: "actor:wrong-name",
+    });
+  });
+
+  it.each(["empty host exception list", "missing host exception file"] as const)(
+    "leaves Main switchModel unaffected with a %s",
+    async label => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-main-model-exception-"));
+      roots.push(root);
+      const exceptionPath = path.join(root, "model-exceptions.json");
+      if (label.startsWith("empty")) fs.writeFileSync(exceptionPath, "[]");
+      const switchModel = vi.fn(async () => ({ ok: true }));
+      const state = setup([], [], undefined, {
+        switchModel,
+        agentsConfig: {
+          modelExceptionsPath: exceptionPath,
+          modelPolicy: { requireReason: ["opus", "claude"] },
+        },
+      });
+      const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+      try {
+        await expect(state.provider.invoke("switchModel", { model }, context)).resolves.toMatchObject({
+          switched: true, model,
+        });
+        expect(switchModel).toHaveBeenCalledOnce();
+        expect(state.agents.list()).toEqual([]);
+        expect(launch).not.toHaveBeenCalled();
+      } finally { launch.mockRestore(); }
+    },
+  );
+
+  it("bridges a denied bogus #1 to the public guest with only safe error fields", async () => {
+    const state = setup();
+    writeActorGrant(state.agents.config.modelExceptionsPath!);
+    const registry = new ActionRegistry(); registry.register(state.provider);
+    const config = structuredClone(DEFAULT_FABRIC_CONFIG);
+    config.agents = structuredClone(state.agents.config);
+    config.approvals.agent = "allow";
+    const service = new FabricExecutionService(registry, config);
+    const result = await service.execute({
+      code: `try {
+        await agents.create(${JSON.stringify({ name: "wrong-name", instructions: "Review.", model, modelReason: reason })});
+        return { admitted: true };
+      } catch (error) {
+        return { name: error.name, code: error.code, message: error.message };
+      }`,
+      signal: undefined, parentToolCallId: "model-exception-guest", context: {
+        ...context.extensionContext, cwd: process.cwd(), hasUI: false,
+      } as ExtensionContext, onPartial() {},
+    });
+    expect(result.success).toBe(true);
+    expect(result.value).toEqual({
+      name: "FabricModelExceptionDeniedError",
+      code: "FABRIC_MODEL_EXCEPTION_DENIED",
+      message: expect.stringContaining("smarty-dev#1"),
+    });
+    expect(state.actors.list()).toEqual([]);
+    expect(state.agents.list()).toEqual([]);
+  });
+
+  it("bridges schema-valid missing reasons and unlisted refs, while schema-invalid inputs remain refused", async () => {
+    const state = setup();
+    writeActorGrant(state.agents.config.modelExceptionsPath!);
+    const registry = new ActionRegistry(); registry.register(state.provider);
+    const config = structuredClone(DEFAULT_FABRIC_CONFIG);
+    config.agents = structuredClone(state.agents.config);
+    config.approvals.agent = "allow";
+    const service = new FabricExecutionService(registry, config);
+    const executeCreate = (args: Record<string, unknown>) => service.execute({
+      code: `try {
+        const request = JSON.parse(${JSON.stringify(JSON.stringify(args))});
+        await agents.create(request);
+        return { admitted: true };
+      } catch (error) {
+        return { name: error.name, code: error.code, message: error.message };
+      }`,
+      signal: undefined, parentToolCallId: "model-exception-invalid-reason", context: {
+        ...context.extensionContext, cwd: process.cwd(), hasUI: false,
+      } as ExtensionContext, onPartial() {},
+    });
+    for (const modelReason of [undefined, "", "  "] as const) {
+      const args = { name: "reviewer", instructions: "Review.", model,
+        ...(modelReason === undefined ? {} : { modelReason }) };
+      const result = await executeCreate(args);
+      expect(result.success).toBe(true);
+      expect(result.value).toEqual({
+        name: "FabricModelExceptionDeniedError",
+        code: "FABRIC_MODEL_EXCEPTION_DENIED",
+        message: expect.stringContaining("requires"),
+      });
+    }
+    for (const modelReason of [false, "x".repeat(201)] as const) {
+      const result = await executeCreate({ name: "reviewer", instructions: "Review.", model, modelReason });
+      expect(result.success).toBe(true);
+      expect(result.value).toMatchObject({ message: expect.stringContaining("Invalid arguments for agents.create") });
+      expect(state.actors.list()).toEqual([]);
+      expect(state.agents.list()).toEqual([]);
+    }
+    fs.rmSync(state.agents.config.modelExceptionsPath!, { force: true });
+    const unlisted = await executeCreate({ name: "reviewer", instructions: "Review.", model, modelReason: reason });
+    expect(unlisted.success).toBe(true);
+    expect(unlisted.value).toEqual({
+      name: "FabricModelExceptionDeniedError",
+      code: "FABRIC_MODEL_EXCEPTION_DENIED",
+      message: expect.stringMatching(/smarty-dev#1.*(?:file-unavailable|unlisted)/),
+    });
+    expect(state.actors.list()).toEqual([]);
+    expect(state.agents.list()).toEqual([]);
+  });
+});
+
 describe("model reason policy boundary (#11864)", () => {
   const opus = "cliproxyapi-anthropic/claude-opus-5-5";
   const luna = "cliproxyapi/gpt-6-luna";
@@ -365,7 +574,7 @@ describe("model reason policy boundary (#11864)", () => {
       const matched = rows.filter(row => row.reason === exception);
       expect(matched).toHaveLength(1);
       expect(Object.keys(matched[0]!).sort()).toHaveLength(7);
-      expect(matched[0]).toMatchObject({ reason: exception, ref: "#11864", role: "task" });
+      expect(matched[0]).toMatchObject({ reason: exception, ref: "smarty-dev#11864", role: "task" });
       expect(matched[0]!.model).toEqual(expect.stringMatching(/veda\/claude-code\/sonnet/));
 
       const otherBackend = setup([], [], undefined, { agentsConfig: {
@@ -966,9 +1175,13 @@ const setup = (
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-agents-provider-"));
   roots.push(root);
   const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
+  // Private legacy-control fixture: #11864 is explicitly listed; #1 remains unlisted.
+  const modelExceptionsPath = options?.agentsConfig?.modelExceptionsPath ?? path.join(root, "model-exceptions.json");
+  if (!options?.agentsConfig?.modelExceptionsPath) fs.writeFileSync(modelExceptionsPath, JSON.stringify([{ ref: "smarty-dev#11864",
+    models: ["anthropic/claude", "cliproxyapi-anthropic/claude", "private/claude", "claude/", "sonnet", "opus", "veda/claude-code"], expires: "2999-01-01T00:00:00.000Z" }]));
   const agents = new AgentManager(
     options?.cwd ?? process.cwd(),
-    { ...DEFAULT_FABRIC_CONFIG.agents, ...options?.agentsConfig },
+    { ...DEFAULT_FABRIC_CONFIG.agents, ...options?.agentsConfig, modelExceptionsPath },
     {
       workerPath: options?.workerPath ?? path.resolve("tests/fixtures/fake-worker.mjs"),
       claudeBinary: path.resolve("tests/fixtures/fake-claude.mjs"),

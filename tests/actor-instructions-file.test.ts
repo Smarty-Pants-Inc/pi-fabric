@@ -35,6 +35,9 @@ const fixture = async (durable = false) => {
   const identity = { id: "session:instructions", name: "Main", kind: "main" as const, sessionId: "instructions" };
   const meshRoot = path.join(root, "mesh");
   const meshConfig = { ...DEFAULT_FABRIC_CONFIG.mesh, maxEventBytes: 1024 * 1024, actorPollMs: 20 };
+  const modelExceptionsPath = path.join(root, "model-exceptions.json");
+  fs.writeFileSync(modelExceptionsPath, JSON.stringify([{ ref: "smarty-dev#11864",
+    models: ["cliproxyapi-anthropic/claude", "anthropic/claude", "claude/", "opus"], expires: "2999-01-01T00:00:00.000Z" }]));
   const mesh = new MeshStore(meshRoot, meshConfig.maxEventBytes, 100);
   const participants = new ParticipantDirectory(mesh, { enabled: true, hostId: identity.id, rootId: identity.id, identity });
   participants.registerSource(() => [{
@@ -43,7 +46,7 @@ const fixture = async (durable = false) => {
     cwd: root, sessionId: identity.sessionId, startedAt: 1, updatedAt: Date.now(), controlProtocol: "v1",
   }]);
   await participants.start();
-  const agents = new AgentManager(root, { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, instructionsRoot: localRoot }, {
+  const agents = new AgentManager(root, { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, instructionsRoot: localRoot, modelExceptionsPath }, {
     runRoot: path.join(root, "runs"), workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
   });
   const localActorRoot = path.join(root, "main-actors");
@@ -51,7 +54,7 @@ const fixture = async (durable = false) => {
   const config: ResidentHostConfig = {
     format: 1, rootId: identity.id, sessionId: identity.sessionId, cwd: root, projectRoot: root, meshRoot,
     actorRoot: path.join(root, "resident-actors"), residencyRoot: residentRoot(meshRoot, identity.id), fullCodeMode: true,
-    agents: { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, instructionsRoot: factory }, mesh: meshConfig,
+    agents: { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, instructionsRoot: factory, modelExceptionsPath }, mesh: meshConfig,
     retention: DEFAULT_FABRIC_CONFIG.retention, workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
     fabricExtensionPath: path.resolve("dist/index.js"), piBinary: "pi", claudeBinary: "claude", vedaBinary: "veda",
     piModels: { available: [

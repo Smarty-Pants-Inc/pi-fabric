@@ -8,6 +8,7 @@ import { AgentManager } from "../src/agents/manager.js";
 import { ActorManager } from "../src/actors/manager.js";
 import { GlobalActorRegistry } from "../src/actors/global-registry.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
+import { writeModelExceptions } from "./helpers/model-exceptions.js";
 import { AgentsProvider } from "../src/providers/agents-provider.js";
 import { FabricControlPlane } from "../src/topology/control-plane.js";
 import { GUEST_TYPE_DECLARATIONS } from "../src/runtime/guest-types.js";
@@ -67,7 +68,10 @@ const createProvider = () => {
   roots.push(rootDir);
   const mesh = new MeshStore(path.join(rootDir, "mesh"), 64 * 1024, 100);
   const agents = new AgentManager(
-    process.cwd(), DEFAULT_FABRIC_CONFIG.agents,
+    process.cwd(), {
+      ...DEFAULT_FABRIC_CONFIG.agents,
+      modelExceptionsPath: writeModelExceptions(rootDir, ["claude/<backend-default>"]),
+    },
     {
       workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
       claudeBinary: path.resolve("tests/fixtures/fake-claude.mjs"),
@@ -172,7 +176,10 @@ describe("persistSession: AgentManager runner guard", () => {
   it("allows persistSession:true for the Claude runner", async () => {
     const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-persist-"));
     roots.push(rootDir);
-    const manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+    const manager = new AgentManager(process.cwd(), {
+      ...DEFAULT_FABRIC_CONFIG.agents,
+      modelExceptionsPath: writeModelExceptions(rootDir, ["claude/<backend-default>"]),
+    }, {
       workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
       claudeBinary: path.resolve("tests/fixtures/fake-claude.mjs"),
       runRoot: rootDir,

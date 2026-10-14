@@ -467,7 +467,7 @@ export class AgentsProvider implements FabricProvider {
     this.#projectLeadId = recordedProjectLead(manager.cwd ?? process.cwd());
     this.#router = new AgentMessageRouter(
       manager, actorManager, mainAgent, participants, control,
-      (binding, runner, context, requiredPin) => this.#resolvePiRunBinding(binding, runner, context, requiredPin),
+      (binding, runner, context, requiredPin, role) => this.#resolvePiRunBinding(binding, runner, context, requiredPin, role),
       residency,
     );
     this.#lifecycleScheduler = new LifecycleDeliveryScheduler(
@@ -563,6 +563,7 @@ export class AgentsProvider implements FabricProvider {
     context: FabricInvocationContext,
     runnerOverride?: FabricAgentRunner,
     closest = true,
+    role = "task",
   ): Promise<Record<string, unknown>> {
     const runner = runnerOverride ?? checkedRunner(args.runner, this.manager.config.runner);
     const model = typeof args.model === "string" ? args.model.trim() : "";
@@ -580,7 +581,7 @@ export class AgentsProvider implements FabricProvider {
     const thinking = isFabricThinking(args.thinking) ? args.thinking
       : aliasThinking(this.modelsConfig().aliases, model);
     const admitted = await this.manager.resolveModelReasonPolicy(resolved.model, args.modelReason, runner, {
-      modelSource: source, thinking,
+      modelSource: source, thinking, role,
       resolveFallback: selector => runner === "pi" || runner === "pi-durable"
         ? this.#resolvePiModelSelection(selector, context, false).then(selection => selection.model)
         : this.manager.prepareModelForAdmission(selector, runner, key => this.#resolvePiModelSelection(key, context, false).then(selection => selection.model)),
@@ -608,11 +609,12 @@ export class AgentsProvider implements FabricProvider {
   }
 
   async #admitActorRequest(request: FabricActorCreateRequest, context: FabricInvocationContext, closest = true): Promise<FabricActorCreateRequest & { via?: string }> {
+    const role = `actor:${request.name.trim()}`;
     const source = request.modelSource
       ?? (request.routeClass !== undefined ? "route" : request.model ? "explicit" : "default");
     if (request.routeClass !== undefined) {
       if (!request.model || !isFabricThinking(request.thinking)) throw new ModelRoutePinError(request.model ?? "");
-      const binding = await this.#resolvePiRunBinding(request, request.runner ?? this.manager.config.runner, context, true);
+      const binding = await this.#resolvePiRunBinding(request, request.runner ?? this.manager.config.runner, context, true, role);
       const admitted: FabricActorCreateRequest = { ...request, modelSource: "route",
         ...(binding.model ? { model: binding.model } : {}),
         ...(binding.thinking ? { thinking: binding.thinking } : {}),
@@ -624,7 +626,7 @@ export class AgentsProvider implements FabricProvider {
     const model = request.model ?? this.manager.defaultModel(request.runner);
     const resolved = await this.#resolvePiModelArgs(
       { model, modelReason: request.modelReason, thinking: request.thinking, modelSource: source },
-      context, request.runner, closest || request.model === undefined,
+      context, request.runner, closest || request.model === undefined, role,
     );
     // Keep dynamic defaults only when policy did not substitute the launch target.
     if (!request.model && resolved.via !== "model-policy-fallback") return request;
@@ -683,7 +685,8 @@ export class AgentsProvider implements FabricProvider {
     });
     if (!selected) return request;
     // Routing is an indirect selection, not an explicit public model override.
-    const admitted = await this.#resolvePiModelArgs({ ...request, ...selected, modelSource: "route" }, context, runner, false);
+    const admitted = await this.#resolvePiModelArgs({ ...request, ...selected, modelSource: "route" }, context, runner, false,
+      kind === "actor" ? `actor:${(request.name ?? "").trim()}` : "task");
     return { ...request, ...selected, ...admitted } as T;
   }
 
@@ -725,6 +728,7 @@ export class AgentsProvider implements FabricProvider {
     runner: FabricAgentRunner,
     context: FabricInvocationContext,
     requiredPin = false,
+    role = "task",
   ): Promise<FabricActorRunBinding> {
     if (!binding.model) return binding;
     const resolve = async (selector: string, pin = false): Promise<string | undefined> => {
@@ -738,7 +742,7 @@ export class AgentsProvider implements FabricProvider {
       return (await this.#resolvePiModelSelection(selector, context, false)).model;
     };
     const admitted = await this.manager.resolveModelReasonPolicy(await resolve(binding.model, requiredPin), binding.modelReason, runner, {
-      modelSource: requiredPin ? "route" : binding.modelSource ?? "explicit", thinking: binding.thinking,
+      modelSource: requiredPin ? "route" : binding.modelSource ?? "explicit", thinking: binding.thinking, role,
       resolveFallback: selector => resolve(selector, requiredPin),
     });
     const result = { ...binding, model: admitted.model, ...(admitted.thinking ? { thinking: admitted.thinking } : {}) };
@@ -1378,7 +1382,7 @@ export class AgentsProvider implements FabricProvider {
         const ownsActor = actor ? this.actorManager.owns(actor.id) : false;
         const requestedOverrides = actorRunBinding(args);
         const overrides = ownsActor
-          ? await this.#resolvePiRunBinding(requestedOverrides, actor!.runner, context, actor!.routeClass !== undefined)
+          ? await this.#resolvePiRunBinding(requestedOverrides, actor!.runner, context, actor!.routeClass !== undefined, `actor:${actor!.name}`)
           : requestedOverrides;
         context.activity?.({
           type: "entity",
@@ -1570,13 +1574,14 @@ export class AgentsProvider implements FabricProvider {
           const template = this.globalActors.resolve(id);
           if (!template) throw new Error(`Unknown global actor: ${id}`);
           const resolved = model
-            ? await this.#resolvePiModelArgs({ model, modelReason: args.modelReason, modelSource: "explicit" }, context, template.runner)
+            ? await this.#resolvePiModelArgs({ model, modelReason: args.modelReason, modelSource: "explicit" }, context, template.runner, true, `actor:${template.name}`)
             : { model };
           checkCommit();
           return { ...this.globalActors.update(template.id, { model: resolved.model as string, ...(typeof args.modelReason === "string" ? { modelReason: args.modelReason } : {}) }), ...modelResolutionMetadata(resolved) };
         }
         const target = await this.#resolveActorTarget(id);
         const runner = target.actor?.runner ?? target.participant!.runner ?? this.manager.config.runner;
+        const role = `actor:${target.actor?.name ?? target.participant!.name}`;
         const resident = await this.#residentActorOwner(id);
         const ownsActor = target.actor ? this.actorManager.owns(target.actor.id) : false;
         const opaquePassiveKey = model.includes("/") && !Object.hasOwn(this.modelsConfig().aliases, model.toLowerCase()) &&
@@ -1584,10 +1589,10 @@ export class AgentsProvider implements FabricProvider {
           (runner === "pi" || runner === "pi-durable") && this.manager.config.deniedModels.length === 0 &&
           !this.manager.modelReasonRequired(model, runner);
         const resolved = model && target.actor?.routeClass !== undefined
-          ? await this.#resolvePiRunBinding({ model, modelReason: typeof args.modelReason === "string" ? args.modelReason : undefined }, runner, context, true)
+          ? await this.#resolvePiRunBinding({ model, modelReason: typeof args.modelReason === "string" ? args.modelReason : undefined }, runner, context, true, role)
           : model && !opaquePassiveKey
-            ? await this.#resolvePiModelArgs({ model, modelReason: args.modelReason, modelSource: "explicit" }, context, runner)
-            : model ? await this.manager.resolveModelReasonPolicy(model, args.modelReason, runner, { modelSource: "explicit" })
+            ? await this.#resolvePiModelArgs({ model, modelReason: args.modelReason, modelSource: "explicit" }, context, runner, true, role)
+            : model ? await this.manager.resolveModelReasonPolicy(model, args.modelReason, runner, { modelSource: "explicit", role })
               : { model: undefined };
         const resolvedModel = resolved.model as string | undefined;
         if (resident) {

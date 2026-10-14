@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { appendOpusPolicyLog, isClaudeModel, opusIssueReference } from "../src/agents/model-policy-log.js";
+import { appendOpusPolicyLog, canonicalIssueReferences, isClaudeModel, opusIssueReference } from "../src/agents/model-policy-log.js";
 
 const probe = vi.hoisted(() => ({
   mkdirSync: vi.fn(), openSync: vi.fn(), writeSync: vi.fn(), closeSync: vi.fn(),
@@ -32,7 +32,9 @@ beforeEach(() => {
 });
 
 // Decision C keep reasons: issue-reference trust boundary, data-safe single append,
-// and storage failures/short writes that a real user flow cannot cheaply induce.
+// listed-host-exception canonical audit ref, and storage failures/short writes that
+// a real user flow cannot cheaply induce. Process admission is separately covered
+// with a fake worker; it is not a live model end-to-end test.
 describe("Opus policy issue-reference trust boundary", () => {
   it.each([
     ["#1", "#1"], ["Review #123 before shipping", "#123"], ["Review (#42).", "#42"],
@@ -53,6 +55,22 @@ describe("Opus policy issue-reference trust boundary", () => {
     "https://example.com/?redirect=/issues/12", "https:///issues/12", "file:///repo/issues/12",
   ])("returns the refusal signal for arbitrary/non-issue reasons: %j", reason => {
     expect(opusIssueReference(reason)).toBeUndefined();
+  });
+});
+
+describe("canonical host-exception issue references", () => {
+  it.each([
+    ["#1", ["smarty-dev#1"]],
+    ["bounded reason #11864", ["smarty-dev#11864"]],
+    ["smarty-dev#42", ["smarty-dev#42"]],
+    ["pi-fabric#7", ["pi-fabric#7"]],
+    ["https://github.com/Smarty-Pants-Inc/smarty-dev/issues/314", ["smarty-dev#314"]],
+    ["https://github.com/Smarty-Pants-Inc/pi-fabric/issues/314#discussion", ["pi-fabric#314"]],
+    ["https://tracker.example/docs/#123", []],
+    ["https://github.com/other-org/smarty-dev/issues/314", []],
+    ["https://github.com/Smarty-Pants-Inc/smarty-dev/pull/314", []],
+  ])("canonicalizes only admitted issue references in %s", (reason, expected) => {
+    expect(canonicalIssueReferences(reason)).toEqual(expected);
   });
 });
 

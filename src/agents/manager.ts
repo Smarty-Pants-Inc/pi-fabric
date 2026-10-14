@@ -3,7 +3,7 @@ import { copyFabricPrincipal, copyFabricProvenance, type FabricPrincipal, type F
 import { createHash, randomUUID } from "node:crypto";
 import { taskReturnAddressArguments, type TaskReturnAddress } from "./task-return-address.js";
 import { AgentWaitBoundError, describeWaitBound } from "./wait-bound.js";
-import { appendOpusPolicyLog, isClaudeModel, opusIssueReference } from "./model-policy-log.js";
+import { admitModelException, appendOpusPolicyLog, FabricModelExceptionDeniedError, isClaudeModel } from "./model-policy-log.js";
 import { normalizeAgentRequires } from "./input-validation.js";
 import { AgentInputError, normalizeAgentCapabilityTokens } from "../host-compatibility.js";
 import {
@@ -309,6 +309,8 @@ export interface AgentModelAdmission {
   thinking?: FabricThinking | undefined;
   fallback: boolean;
   originalModel?: string | undefined;
+  /** Canonical exception ref approved by this admission, never reparsed for audit. */
+  approvedRef?: string | undefined;
 }
 
 export const effectiveAgentTimeoutMs = (
@@ -1242,16 +1244,38 @@ export class AgentManager {
     return this.#modelRequiresReason(model) || this.#nativeClaudeRequiresReason(runner);
   }
 
+  /** Resolved selector plus native backend provenance, matched against exception prefixes. */
+  #exceptionModels(selector: string | undefined, runner: FabricAgentRunner): string[] {
+    const model = selector?.trim() || undefined;
+    if (runner === "veda" && isClaudeModel(undefined, runner, this.config.veda.backend)) {
+      return [`veda/claude-code/${model ? normalizeVedaModel(model) : "<backend-default>"}`, ...(model ? [model] : [])];
+    }
+    if (runner === "claude") return model ? [model, `claude/${model}`] : ["claude/<backend-default>"];
+    return [model ?? `${runner}/<backend-default>`];
+  }
+
+  /**
+   * Host-owned exception admission (fails closed). Reads `<agentDir>/model-exceptions.json`
+   * now; returns the canonical approved ref. Fabric-created children are never `lead`.
+   */
+  admitModelException(model: string | undefined, modelReason: unknown, runner: FabricAgentRunner = this.config.runner, role = "task"): string {
+    return admitModelException({
+      path: this.config.modelExceptionsPath, reason: modelReason,
+      models: this.#exceptionModels(model, runner), role,
+    }).ref;
+  }
+
   /** Compatibility API. Call with the RESOLVED selector, never an unresolved alias. */
-  assertExplicitModelReason(model: unknown, modelReason: unknown, runner: FabricAgentRunner = this.config.runner, inheritedDefault?: string): void {
+  assertExplicitModelReason(model: unknown, modelReason: unknown, runner: FabricAgentRunner = this.config.runner, inheritedDefault?: string, role = "task"): string | undefined {
     const selector = typeof model === "string" ? model.trim() : undefined;
     if (!this.modelReasonRequired(selector, runner)) return;
     if (this.#validModelReason(modelReason)) {
-      if (isClaudeModel(selector, runner, this.config.veda.backend) && !opusIssueReference(modelReason)) {
-        throw new Error(`model ${selector || runner} requires modelReason (named exception) with an issue reference (#N or issue URL); ` +
-          "Paul's Opus-only org/leads rule (smarty-dev#2264); no worker started");
-      }
+      if (isClaudeModel(selector, runner, this.config.veda.backend)) return this.admitModelException(selector, modelReason, runner, role);
       return;
+    }
+    if (isClaudeModel(selector, runner, this.config.veda.backend)) {
+      throw new FabricModelExceptionDeniedError({ denial: "invalid-reason", model: this.#exceptionModels(selector, runner)[0]!, role,
+        detail: "modelReason must be nonblank and ≤200 chars" });
     }
     const fallback = inheritedDefault ?? this.defaultModel(runner) ?? `${runner} default (inherited session model)`;
     throw new Error(`model ${selector || `${runner}/<backend-default>`} requires modelReason (named exception); ` +
@@ -1273,24 +1297,27 @@ export class AgentManager {
     options: AgentModelSelection & {
       thinking?: FabricThinking | undefined;
       resolveFallback?: (model: string) => string | Promise<string | undefined> | undefined;
+      /** Trusted host role: `task` (default) or `actor:<name>`; never caller-supplied. */
+      role?: string | undefined;
     } = {},
   ): AgentModelAdmission | Promise<AgentModelAdmission> {
+    const role = options.role ?? "task";
     this.assertModelAllowed(model, runner);
     if (this.#nativeClaudeRequiresReason(runner)) {
-      this.assertExplicitModelReason(model, modelReason, runner);
-      return { model, thinking: options.thinking, fallback: false };
+      const approvedRef = this.assertExplicitModelReason(model, modelReason, runner, undefined, role);
+      return { model, thinking: options.thinking, fallback: false, approvedRef };
     }
     if (!this.#modelRequiresReason(model)) return { model, thinking: options.thinking, fallback: false };
     if (this.#validModelReason(modelReason)) {
-      this.assertExplicitModelReason(model, modelReason, runner);
-      return { model, thinking: options.thinking, fallback: false };
+      const approvedRef = this.assertExplicitModelReason(model, modelReason, runner, undefined, role);
+      return { model, thinking: options.thinking, fallback: false, approvedRef };
     }
     // A supplied but malformed Claude exception refuses, never silently switches.
     if (isClaudeModel(model, runner, this.config.veda.backend) && typeof modelReason === "string" && modelReason.trim()) {
-      this.assertExplicitModelReason(model, modelReason, runner);
+      this.assertExplicitModelReason(model, modelReason, runner, undefined, role);
     }
     if ((options.modelSource ?? "explicit") === "explicit") {
-      this.assertExplicitModelReason(model, modelReason, runner);
+      this.assertExplicitModelReason(model, modelReason, runner, undefined, role);
     }
     return (async (): Promise<AgentModelAdmission> => {
       // Config is extended by the config owner; support older embed configs without
@@ -1320,6 +1347,10 @@ export class AgentManager {
         return { model: resolved, thinking: isFabricThinking(policy.fallbackThinking) ? policy.fallbackThinking : "high",
           fallback: true, originalModel: model };
       }
+      if (isClaudeModel(model, runner, this.config.veda.backend)) {
+        throw new FabricModelExceptionDeniedError({ denial: "invalid-reason", model: this.#exceptionModels(model, runner)[0]!, role,
+          detail: "no admitted nonprotected agents.model or agents.modelPolicy.fallbackModel is available" });
+      }
       throw new Error(`model ${model} requires modelReason (named exception); Paul's Opus-only org/leads rule ` +
         "(smarty-dev#2264): no admitted nonprotected agents.model or agents.modelPolicy.fallbackModel is available; no worker started");
     })();
@@ -1332,11 +1363,12 @@ export class AgentManager {
     runner: FabricAgentRunner = this.config.runner,
     options: AgentModelSelection & {
       thinking?: FabricThinking | undefined; requiredPin?: boolean; signal?: AbortSignal | undefined; timeoutMs?: number | undefined;
+      role?: string | undefined;
     } = {},
   ): Promise<AgentModelAdmission> {
     // Native Claude-capable backends cannot prove a safe model or use a GPT fallback.
     // Refuse before catalog/network work, without rewriting their opaque selectors.
-    if (this.#nativeClaudeRequiresReason(runner)) this.assertExplicitModelReason(model, modelReason, runner);
+    if (this.#nativeClaudeRequiresReason(runner)) this.assertExplicitModelReason(model, modelReason, runner, undefined, options.role);
     const prepare = (selector: string | undefined, requiredPin = false) => this.prepareModelForAdmission(
       selector, runner, undefined, requiredPin, options.signal, options.timeoutMs);
     const resolved = await prepare(model, options.requiredPin);
@@ -1743,8 +1775,10 @@ export class AgentManager {
       if (model && runnerAdapter.normalizeModel) model = await runnerAdapter.normalizeModel(model);
     }
     const modelSource = routePin ? "route" : request.modelSource ?? (request.model?.trim() ? "explicit" : "default");
+    let admittedRef: string | undefined;
     const applyAdmission = (admitted: AgentModelAdmission): void => {
       model = admitted.model;
+      admittedRef = admitted.approvedRef;
       if (!admitted.fallback) return;
       const original = request.modelPolicyOriginalModel ?? admitted.originalModel;
       request = { ...request, ...(model ? { model } : {}),
@@ -1769,13 +1803,15 @@ export class AgentManager {
     this.assertModelAllowed(model, runner);
     // Native Claude cannot demonstrate a non-Claude backend. Pi aliases must
     // resolve before the reason check, even when the alias itself says "claude".
-    if (this.#nativeClaudeRequiresReason(runner)) this.assertExplicitModelReason(model, request.modelReason, runner);
+    // Trusted role snapshot: Fabric-created children are task or actor:<name>, never lead.
+    const policyRole = request.actorName ? `actor:${request.actorName}` : "task";
+    if (this.#nativeClaudeRequiresReason(runner)) admittedRef = this.assertExplicitModelReason(model, request.modelReason, runner, undefined, policyRole);
     // Alternate runners retain their pre-queue catalog/backend admission. Pi
     // model/auth preparation stays post-permit unless a durable route needs it.
     const alternatePrepared = runner === "claude" || runner === "veda";
     if (alternatePrepared) {
       applyAdmission(await this.prepareModelWithReason(model, request.modelReason, runner, {
-        modelSource, thinking: request.thinking, signal, timeoutMs: preparation?.timeoutMs,
+        modelSource, thinking: request.thinking, signal, timeoutMs: preparation?.timeoutMs, role: policyRole,
       }));
     }
     // Strict route pins cannot resolve to another selector. Admit their reason
@@ -1784,17 +1820,19 @@ export class AgentManager {
     const resolveRouteFallback = (selector: string): Promise<string | undefined> =>
       this.#prepareModel(selector, true, signal, preparation?.timeoutMs, true);
     let policyPinOriginalModel: string | undefined;
+    let policyPinAdmission: AgentModelAdmission | undefined;
     if (routePin) {
       applyAdmission(await this.resolveModelReasonPolicy(model, request.modelReason, runner, {
-        modelSource: "route", thinking: routePin.effort, resolveFallback: resolveRouteFallback,
+        modelSource: "route", thinking: routePin.effort, resolveFallback: resolveRouteFallback, role: policyRole,
       }));
       // LIVE storage/admission may demote to its pin. Admit that alternative
       // before recording either branch, so a safe live choice cannot conceal an
       // unreasoned protected pin that storage repair later reinstates.
       if (request.routeDecision?.mode === "live" && request.routeDecision.pin.model !== model) {
         const pin = await this.resolveModelReasonPolicy(request.routeDecision.pin.model, request.modelReason, runner, {
-          modelSource: "route", thinking: request.routeDecision.pin.effort, resolveFallback: resolveRouteFallback,
+          modelSource: "route", thinking: request.routeDecision.pin.effort, resolveFallback: resolveRouteFallback, role: policyRole,
         });
+        policyPinAdmission = pin;
         if (pin.fallback && pin.model && pin.thinking) {
           policyPinOriginalModel = pin.originalModel;
           request.routeDecision = { ...request.routeDecision, pin: { model: pin.model, effort: pin.thinking } };
@@ -1812,8 +1850,8 @@ export class AgentManager {
       const warnings = request.modelPolicyOriginalModel && model
         ? [`model: inherited ${request.modelPolicyOriginalModel} -> ${model} ${routePin?.effort ?? request.thinking ?? this.config.thinking} (#11863)`] : [];
       if (runner === "veda" && isClaudeModel(undefined, runner, this.config.veda.backend) &&
-          this.#validModelReason(request.modelReason) && opusIssueReference(request.modelReason)) {
-        warnings.push(`model: named exception ${auditModel()} (${opusIssueReference(request.modelReason)})`);
+          this.#validModelReason(request.modelReason)) {
+        if (admittedRef) warnings.push(`model: named exception ${auditModel()} (${admittedRef})`);
       }
       return warnings;
     };
@@ -1822,13 +1860,12 @@ export class AgentManager {
     const logPolicyAdmission = (): void => {
       if (policyLogged) return;
       policyLogged = true;
-      const role = request.actorName ? `actor:${request.actorName}` : "task";
+      const role = policyRole;
       let warning: string | undefined;
       if (request.modelPolicyOriginalModel && isClaudeModel(request.modelPolicyOriginalModel)) {
         warning = appendOpusPolicyLog({ role, model: request.modelPolicyOriginalModel, ref: null, reason: "inherited-switch" });
       } else if (isClaudeModel(model, runner, this.config.veda.backend) && this.#validModelReason(request.modelReason)) {
-        const ref = opusIssueReference(request.modelReason);
-        if (ref) warning = appendOpusPolicyLog({ role, model: auditModel(), ref, reason: request.modelReason });
+        if (admittedRef) warning = appendOpusPolicyLog({ role, model: auditModel(), ref: admittedRef, reason: request.modelReason });
       }
       if (warning) policyWarnings.push(warning);
     };
@@ -1864,6 +1901,7 @@ export class AgentManager {
       routePin = Object.freeze({ ...(request.routeDecision.mode === "live"
         ? { model: request.routeDecision.model, effort: request.routeDecision.effort } : request.routeDecision.pin) });
       model = routePin.model;
+      if (request.routeDecision.mode !== "live" && policyPinAdmission) admittedRef = policyPinAdmission.approvedRef;
       if (request.routeDecision.mode !== "live" && policyPinOriginalModel) {
         request = { ...request, modelSource: "default", modelPolicyOriginalModel: policyPinOriginalModel };
         delete request.modelReason;
@@ -1884,10 +1922,11 @@ export class AgentManager {
           ? await this.resolveModelReasonPolicy(selected, request.modelReason, runner, {
             modelSource: request.modelSource ?? modelSource, thinking: routePin?.effort ?? request.thinking,
             resolveFallback: key => this.prepareModelForAdmission(key, runner, undefined, false, signal, preparation?.timeoutMs),
+            role: policyRole,
           })
           : await this.prepareModelWithReason(selected, request.modelReason, runner, {
             modelSource: routePin ? "route" : request.modelSource ?? modelSource, thinking: routePin?.effort ?? request.thinking,
-            requiredPin: Boolean(routePin), signal, timeoutMs: preparation?.timeoutMs,
+            requiredPin: Boolean(routePin), signal, timeoutMs: preparation?.timeoutMs, role: policyRole,
           });
         // Do not rewrite an already recorded route dispatch/header if policy changed.
         if (routeDispatch && admitted.fallback) throw new Error("Model reason policy changed after route admission; no worker started (smarty-dev#2264)");
@@ -4603,13 +4642,15 @@ export class AgentManager {
   ): Promise<boolean> {
     try {
       if (managed.runner !== "pi" && managed.runner !== "pi-durable") {
-        await this.prepareModelWithReason(managed.model, managed.modelReason, managed.runner, { modelSource: "explicit" });
+        await this.prepareModelWithReason(managed.model, managed.modelReason, managed.runner, { modelSource: "explicit",
+          role: managed.actorName ? `actor:${managed.actorName}` : "task" });
       }
       if (managed.runner === "pi" || managed.runner === "pi-durable") {
         // A retry cannot silently retarget an already launched session. Re-admit
         // its concrete selector as explicit; refuse a newly protected alias/default.
         const admitted = await this.prepareModelWithReason(managed.routePin?.model ?? managed.model, managed.modelReason,
-          managed.runner, { modelSource: "explicit", thinking: managed.thinking, requiredPin: Boolean(managed.routePin) });
+          managed.runner, { modelSource: "explicit", thinking: managed.thinking, requiredPin: Boolean(managed.routePin),
+            role: managed.actorName ? `actor:${managed.actorName}` : "task" });
         const model = admitted.model;
         if (managed.routePin) setWorkerArgument(managed.launch.workerArguments, "thinking", managed.routePin.effort);
         const modelIndex = managed.launch.workerArguments.indexOf("--model");

@@ -28,6 +28,13 @@ import { buildVedaArguments } from "../src/agents/veda-cli.js";
 
 const managers: AgentManager[] = [];
 const roots: string[] = [];
+// Private legacy-control fixture: only #11864 is listed; #1 remains unlisted.
+const legacyExceptionRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-agent-manager-exceptions-"));
+const legacyExceptionPath = path.join(legacyExceptionRoot, "model-exceptions.json");
+fs.writeFileSync(legacyExceptionPath, JSON.stringify([{ ref: "smarty-dev#11864",
+  models: ["anthropic/claude", "cliproxyapi-anthropic/claude", "private/claude", "claude/", "sonnet", "opus", "veda/claude-code"], expires: "2999-01-01T00:00:00.000Z" }]));
+const originalModelExceptionsPath = DEFAULT_FABRIC_CONFIG.agents.modelExceptionsPath;
+DEFAULT_FABRIC_CONFIG.agents.modelExceptionsPath = legacyExceptionPath;
 type FabricSurfaceResult = AgentRunResult & {
   fullCodeMode?: string;
   tools?: string[];
@@ -100,6 +107,9 @@ afterAll(() => {
     if (value === undefined) delete process.env[key];
     else process.env[key] = value;
   }
+  if (originalModelExceptionsPath === undefined) delete DEFAULT_FABRIC_CONFIG.agents.modelExceptionsPath;
+  else DEFAULT_FABRIC_CONFIG.agents.modelExceptionsPath = originalModelExceptionsPath;
+  fs.rmSync(legacyExceptionRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 });
 
 describe("effectiveAgentTimeoutMs", () => {
@@ -466,7 +476,7 @@ describe("resolved manager policy (#11864)", () => {
       expect(accepted).toMatchObject({ status: "completed", model: opus, modelReason: issueReason });
       expect(launch).toHaveBeenCalledOnce();
       expect(launch.mock.calls[0]![0].workerArguments).toEqual(expect.arrayContaining(["--model", opus, "--model-reason", issueReason]));
-      expect(readAudit(issueReason)).toMatchObject({ model: opus, ref: "#11864", reason: issueReason, role: expect.any(String), ts: expect.stringMatching(/^\d{4}-\d\d-\d\dT/) });
+      expect(readAudit(issueReason)).toMatchObject({ model: opus, ref: "smarty-dev#11864", reason: issueReason, role: expect.any(String), ts: expect.stringMatching(/^\d{4}-\d\d-\d\dT/) });
     } finally { launch.mockRestore(); }
   });
 
@@ -496,7 +506,7 @@ describe("resolved manager policy (#11864)", () => {
       const result = await manager.run({ task: "Claude with issue", runner: "claude", modelReason: reason, transport: "process" });
       expect(result).toMatchObject({ status: "completed", runner: "claude", modelReason: reason });
       expect(launch).toHaveBeenCalledOnce();
-      expect(readAudit(reason)).toMatchObject({ model: expect.stringContaining("claude"), ref: "#11864", reason, role: expect.any(String), ts: expect.stringMatching(/^\d{4}-\d\d-\d\dT/) });
+      expect(readAudit(reason)).toMatchObject({ model: expect.stringContaining("claude"), ref: "smarty-dev#11864", reason, role: expect.any(String), ts: expect.stringMatching(/^\d{4}-\d\d-\d\dT/) });
     } finally { launch.mockRestore(); }
   });
 
@@ -547,7 +557,7 @@ describe("resolved manager policy (#11864)", () => {
       expect(matching).toHaveLength(1);
       expect(defaultRows).toHaveLength(1);
       expect(Object.keys(matching[0]!).sort()).toHaveLength(7);
-      expect(matching[0]).toMatchObject({ ref: "#11864", reason, role: expect.any(String), ts: expect.stringMatching(/^\d{4}-\d\d-\d\dT/) });
+      expect(matching[0]).toMatchObject({ ref: "smarty-dev#11864", reason, role: expect.any(String), ts: expect.stringMatching(/^\d{4}-\d\d-\d\dT/) });
       expect(matching[0]!.model).toEqual(expect.stringMatching(/veda\/claude-code\/sonnet/));
       expect(defaultRows[0]!.model).toEqual(expect.stringMatching(/veda\/claude-code\/<backend-default>/));
     } finally { launch.mockRestore(); homedir.mockRestore(); }
@@ -569,14 +579,14 @@ describe("resolved manager policy (#11864)", () => {
     const reason = `F-01-D1 selector attribution #11864 (${model})`;
     try {
       const handle = await manager.spawn({ task: "Veda selector attribution", model, modelReason: reason, transport: "process" });
-      expect(handle.warnings).toContain(`model: named exception veda/claude-code/${cliModel} (#11864)`);
+      expect(handle.warnings).toContain(`model: named exception veda/claude-code/${cliModel} (smarty-dev#11864)`);
       const workerArgs = launch.mock.calls[0]![0].workerArguments;
       expect(workerArgs).toEqual(expect.arrayContaining(["--model", model]));
       const cliArgs = buildVedaArguments({ backend: "claude-code", persona: "default", model, tools: [], session: "d1" });
       expect(cliArgs[cliArgs.indexOf("-m") + 1]).toBe(cliModel);
 
       const result = await manager.wait(handle.id);
-      expect(result.warnings).toContain(`model: named exception veda/claude-code/${cliModel} (#11864)`);
+      expect(result.warnings).toContain(`model: named exception veda/claude-code/${cliModel} (smarty-dev#11864)`);
       const audit = readAudit(reason);
       expect(Object.keys(audit)).toHaveLength(7);
       expect(audit.model).toBe(`veda/claude-code/${cliModel}`);

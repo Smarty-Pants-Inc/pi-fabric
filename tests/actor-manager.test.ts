@@ -4,7 +4,7 @@ import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 import { ACTOR_FAILURE_NOTICE_AFTER, ACTOR_TRANSIENT_BLOCK_BACKOFF_MAX_MS, ACTOR_TRANSIENT_BLOCK_BACKOFF_MS, FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC,
   activationBlockBackoffMs, actorRealarmKey, ActorManager, ActorRegistryOwnershipError } from "../src/actors/manager.js";
 import { classifyActivationFailure } from "../src/actors/activation-failure.js";
@@ -38,6 +38,19 @@ const refusedRemoval = (rootId = "session:test") => ({
 const roots: string[] = [];
 const actorManagers: ActorManager[] = [];
 const agentManagers: AgentManager[] = [];
+// Private legacy-control fixture for this suite: #11864 is listed; #1 is not.
+const legacyExceptionRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-actor-manager-exceptions-"));
+const legacyExceptionPath = path.join(legacyExceptionRoot, "model-exceptions.json");
+fs.writeFileSync(legacyExceptionPath, JSON.stringify([{ ref: "smarty-dev#11864",
+  models: ["anthropic/claude", "cliproxyapi-anthropic/claude", "private/claude", "claude/", "sonnet", "opus", "veda/claude-code"], expires: "2999-01-01T00:00:00.000Z" }]));
+const originalModelExceptionsPath = DEFAULT_FABRIC_CONFIG.agents.modelExceptionsPath;
+DEFAULT_FABRIC_CONFIG.agents.modelExceptionsPath = legacyExceptionPath;
+
+afterAll(() => {
+  if (originalModelExceptionsPath === undefined) delete DEFAULT_FABRIC_CONFIG.agents.modelExceptionsPath;
+  else DEFAULT_FABRIC_CONFIG.agents.modelExceptionsPath = originalModelExceptionsPath;
+  fs.rmSync(legacyExceptionRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+});
 
 const DEFAULT_WAIT_MS = process.env.CI ? 10_000 : 2_000;
 
@@ -67,7 +80,11 @@ const setup = (
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-actor-test-"));
   roots.push(root);
   const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
-  const agents = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, ...agentOverrides }, {
+  // Private legacy-control fixture: #11864 is explicitly listed; #1 remains unlisted.
+  const modelExceptionsPath = agentOverrides.modelExceptionsPath ?? path.join(root, "model-exceptions.json");
+  if (!agentOverrides.modelExceptionsPath) fs.writeFileSync(modelExceptionsPath, JSON.stringify([{ ref: "smarty-dev#11864",
+    models: ["anthropic/claude", "cliproxyapi-anthropic/claude", "private/claude", "claude/", "sonnet", "opus", "veda/claude-code"], expires: "2999-01-01T00:00:00.000Z" }]));
+  const agents = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, ...agentOverrides, modelExceptionsPath }, {
     workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
     runRoot: path.join(root, "runs"),
     ...(modelValidation?.preparePiModel
@@ -5083,6 +5100,31 @@ describe("ActorManager", () => {
       (line) => (line.parsed as { type?: string } | undefined)?.type,
     );
     expect(eventTypes).toContain("agent_start");
+  });
+
+  it("requires the exact actor role for an issue grant before persistent admission", async () => {
+    const state = setup();
+    const exceptionPath = state.agents.config.modelExceptionsPath!;
+    const opus = "anthropic/claude-opus-5-5";
+    const reason = "Role-scoped actor test #1";
+    const writeGrant = (roles: string[]) => fs.writeFileSync(exceptionPath, JSON.stringify([{
+      ref: "smarty-dev#1", models: ["anthropic/claude-opus"], roles, expires: "2999-01-01T00:00:00.000Z",
+    }]));
+    writeGrant(["task"]);
+
+    const taskReceipt = await state.agents.run({ task: "task role control", model: opus, modelReason: reason, transport: "process" });
+    expect(taskReceipt).toMatchObject({ status: "completed", model: opus, modelReason: reason });
+    const auditFile = path.join(os.homedir(), ".local", "state", "smarty", "route", "opus-exceptions.jsonl");
+    const auditRows = fs.readFileSync(auditFile, "utf8").trim().split("\n").filter(Boolean)
+      .map(line => JSON.parse(line) as Record<string, unknown>);
+    expect(auditRows.find(row => row.reason === reason)).toMatchObject({ ref: "smarty-dev#1", role: "task", model: opus });
+    await expect(state.actors.create({ name: "reviewer", instructions: "Review.", model: opus, modelReason: reason }))
+      .rejects.toMatchObject({ code: "FABRIC_MODEL_EXCEPTION_DENIED", denial: "role-mismatch", role: "actor:reviewer" });
+    expect(state.actors.list()).toEqual([]);
+
+    writeGrant(["actor:reviewer"]);
+    const actor = await state.actors.create({ name: "reviewer", instructions: "Review.", model: opus, modelReason: reason });
+    expect(state.actors.status(actor.id)).toMatchObject({ model: opus, modelReason: reason });
   });
 
   it("model-policy boundary (#11864) guards direct actor create, binding rebind, and safe reset", async () => {

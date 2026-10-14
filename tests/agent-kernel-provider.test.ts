@@ -7,6 +7,7 @@ import { AgentManager } from "../src/agents/manager.js";
 import type { AgentHandleInfo, AgentRunRequest, AgentRunResult, AgentSessionSeed } from "../src/agents/types.js";
 import type { FabricActorRequest } from "../src/actors/types.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
+import { writeModelExceptions } from "./helpers/model-exceptions.js";
 import type { FabricInvocationContext } from "../src/protocol.js";
 import { AGENTS_ACTION_DESCRIPTORS } from "../src/providers/agents-actions.js";
 import { AgentsProvider } from "../src/providers/agents-provider.js";
@@ -32,7 +33,10 @@ type ProviderArgs = ConstructorParameters<typeof AgentsProvider>;
 const setup = () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-agent-kernel-provider-"));
   roots.push(root);
-  const manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+  const manager = new AgentManager(process.cwd(), {
+    ...DEFAULT_FABRIC_CONFIG.agents,
+    modelExceptionsPath: writeModelExceptions(root, ["claude/<backend-default>"]),
+  }, {
     runRoot: root, kernel: () => "python", pythonRuntime: () => "monty",
   });
   managers.push(manager);

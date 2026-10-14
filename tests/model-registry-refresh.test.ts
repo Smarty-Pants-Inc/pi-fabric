@@ -177,26 +177,26 @@ const similar = ["claude-opus-5-5"];
 
 it("resolves an exact model added next to a similar one after one refresh, on every path", async () => {
   await withRuntime(["claude-opus-5-6"], async (runtime, refresh) => {
-    const handle = await runtime.agents.spawn({ task: "HANG", model: "dest/claude-opus-5-6" });
+    const handle = await runtime.agents.spawn({ task: "HANG", model: "dest/claude-opus-5-6", modelReason: "Test exception for #11864" });
     expect(refresh).toHaveBeenCalledTimes(1);
     expect(runtime.agents.status(handle.id)).toMatchObject({ model: "dest/claude-opus-5-6" });
     await runtime.agents.stop(handle.id);
   }, similar);
   await withRuntime(["claude-opus-5-6"], async (runtime, refresh, context) => {
-    const handle = await invoke(runtime, context, "agents.spawn", { task: "HANG", model: "dest/claude-opus-5-6" }) as { id: string };
+    const handle = await invoke(runtime, context, "agents.spawn", { task: "HANG", model: "dest/claude-opus-5-6", modelReason: "Test exception for #11864" }) as { id: string };
     expect(refresh).toHaveBeenCalledTimes(1);
     expect(runtime.agents.status(handle.id)).toMatchObject({ model: "dest/claude-opus-5-6" });
     await runtime.agents.stop(handle.id);
   }, similar);
   await withRuntime(["claude-opus-5-6"], async (runtime, refresh, context) => {
     const actor = await invoke(runtime, context, "agents.create", {
-      name: "similar-actor", instructions: "Reply.", runner: "pi", model: "dest/claude-opus-5-6",
+      name: "similar-actor", instructions: "Reply.", runner: "pi", model: "dest/claude-opus-5-6", modelReason: "Test exception for #11864",
     }) as { model?: string };
     expect(refresh).toHaveBeenCalledTimes(1);
     expect(actor.model).toBe("dest/claude-opus-5-6");
   }, similar);
   await withRuntime(["claude-opus-5-6"], async (runtime, refresh) => {
-    const actor = await runtime.actors.create({ name: "bare-actor", instructions: "Reply.", runner: "pi", model: "claude-opus-5-6" });
+    const actor = await runtime.actors.create({ name: "bare-actor", instructions: "Reply.", runner: "pi", model: "claude-opus-5-6", modelReason: "Test exception for #11864" });
     expect(refresh).toHaveBeenCalledTimes(1);
     expect(actor.model).toBe("dest/claude-opus-5-6");
   }, similar);
@@ -212,8 +212,8 @@ it("keeps the same error for a truly unknown exact id next to similar models aft
 
 it("resolves an alias or a fuzzy query that matches today without a refresh", async () => {
   await withRuntime(["claude-opus-5-6"], async (runtime, refresh, context) => {
-    const aliased = await invoke(runtime, context, "agents.spawn", { task: "HANG", model: "big" }) as { id: string };
-    const fuzzy = await runtime.agents.spawn({ task: "HANG", model: "opus" });
+    const aliased = await invoke(runtime, context, "agents.spawn", { task: "HANG", model: "big", modelReason: "Test exception for #11864" }) as { id: string };
+    const fuzzy = await runtime.agents.spawn({ task: "HANG", model: "opus", modelReason: "Test exception for #11864" });
     expect(refresh).not.toHaveBeenCalled();
     expect(runtime.agents.status(aliased.id)).toMatchObject({ model: "dest/claude-opus-5-5" });
     expect(runtime.agents.status(fuzzy.id)).toMatchObject({ model: "dest/claude-opus-5-5" });

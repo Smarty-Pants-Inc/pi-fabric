@@ -7106,7 +7106,9 @@ export class ActorManager {
       });
       const finish = (admitted: { model?: string | undefined; thinking?: FabricThinking | undefined; fallback: boolean }): FabricActorRunBinding => {
         const result: FabricActorRunBinding = { ...binding,
-          ...(admitted.model ? { model: admitted.model } : {}),
+          // Validate dynamic defaults without turning an unbound mailbox item
+          // into a model override. Only a policy substitution must freeze it.
+          ...(admitted.model && (binding.model || admitted.fallback) ? { model: admitted.model } : {}),
           ...(reason !== undefined ? { modelReason: reason } : {}),
           ...(admitted.thinking ? { thinking: admitted.thinking } : {}) };
         delete result.opusReason;

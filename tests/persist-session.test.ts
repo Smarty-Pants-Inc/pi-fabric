@@ -181,6 +181,7 @@ describe("persistSession: AgentManager runner guard", () => {
     const result = await manager.run({
       task: "test",
       runner: "claude",
+      modelReason: "Test exception for #11864",
       persistSession: true,
       transport: "process",
     });
@@ -251,6 +252,7 @@ describe("persistSession: provider invoke integration", () => {
     const result = (await provider.invoke("run", {
       task: "test",
       runner: "claude",
+      modelReason: "Test exception for #11864",
       persistSession: true,
     }, ctx)) as { status: string };
     expect(capturedRequest.persistSession).toBe(true);
@@ -269,6 +271,7 @@ describe("persistSession: provider invoke integration", () => {
     const handle = (await provider.invoke("spawn", {
       task: "test",
       runner: "claude",
+      modelReason: "Test exception for #11864",
       persistSession: true,
     }, ctx)) as { id: string };
     expect(capturedRequest.persistSession).toBe(true);
@@ -287,6 +290,7 @@ describe("persistSession: provider invoke integration", () => {
     await provider.invoke("run", {
       task: "test",
       runner: "claude",
+      modelReason: "Test exception for #11864",
     }, ctx);
     expect(capturedRequest.persistSession).toBeUndefined();
   });

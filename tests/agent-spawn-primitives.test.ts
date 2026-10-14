@@ -480,21 +480,13 @@ describe("worker child environment contract", () => {
 describe("agents provider seeds and confinement", () => {
   const createProvider = () => {
     const requests: AgentRunRequest[] = [];
-    const manager = {
-      config: DEFAULT_FABRIC_CONFIG.agents,
-      resolveKernel: () => undefined,
-      resolvePythonRuntime: () => "monty",
-      resolveCwd: (cwd: string) => cwd,
-      childThinkingBounds: () => ({}),
-      // Fork model-policy hooks the provider consults before admission.
-      assertModelAllowed() {},
-      defaultModel: () => undefined,
-      detachSignal() {},
-      spawn: async (request: AgentRunRequest) => {
-        requests.push(request);
-        return { id: "child", name: "child", status: "running", runner: "pi", transport: "process", cwd: "/" };
-      },
-    } as unknown as AgentManager;
+    const { manager } = createManager(process.cwd());
+    vi.spyOn(manager, "spawn").mockImplementation(async (request: AgentRunRequest) => {
+      requests.push(request);
+      return { id: "child", name: "child", status: "running", runner: "pi", transport: "process", cwd: "/" };
+    });
+    // The spawn spy returns a fixture handle, not a manager-owned execution.
+    vi.spyOn(manager, "detachSignal").mockImplementation(() => {});
     const participants = {
       scheduleRefresh() {},
       self: () => ({ id: "self-participant" }),
@@ -547,7 +539,7 @@ describe("agents provider seeds and confinement", () => {
 
   it("refuses seeds without Pi, without a session, or with durable branch forks", async () => {
     const { provider, requests } = createProvider();
-    await expect(provider.invoke("spawn", { task: "x", seed: "branch", runner: "claude" }, context(callerBranch())))
+    await expect(provider.invoke("spawn", { task: "x", seed: "branch", runner: "claude", modelReason: "Test exception for #11864" }, context(callerBranch())))
       .rejects.toThrow(/requires the Pi runner/);
     await expect(provider.invoke("run", { task: "x", seed: "snippet" }, context(undefined)))
       .rejects.toThrow(/requires a Pi session/);

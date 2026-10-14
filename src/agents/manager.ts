@@ -1636,21 +1636,22 @@ export class AgentManager {
         modelSource, thinking: request.thinking, signal, timeoutMs: preparation?.timeoutMs,
       }));
     }
-    // A routed decision must be policy-admitted before its durable dispatch/header
-    // can name a target. Normal Pi launches do not prepare before permits.
+    // Strict route pins cannot resolve to another selector. Admit their reason
+    // policy before recording a target, but leave model/auth preparation under
+    // permit custody so its timeout and failed outcome retain the normal lifecycle.
+    const resolveRouteFallback = (selector: string): Promise<string | undefined> =>
+      this.#prepareModel(selector, true, signal, preparation?.timeoutMs, true);
     let policyPinOriginalModel: string | undefined;
     if (routePin) {
-      applyAdmission(await this.prepareModelWithReason(model, request.modelReason, runner, {
-        modelSource: "route", thinking: routePin.effort, requiredPin: true,
-        signal, timeoutMs: preparation?.timeoutMs,
+      applyAdmission(await this.resolveModelReasonPolicy(model, request.modelReason, runner, {
+        modelSource: "route", thinking: routePin.effort, resolveFallback: resolveRouteFallback,
       }));
       // LIVE storage/admission may demote to its pin. Admit that alternative
       // before recording either branch, so a safe live choice cannot conceal an
       // unreasoned protected pin that storage repair later reinstates.
       if (request.routeDecision?.mode === "live" && request.routeDecision.pin.model !== model) {
-        const pin = await this.prepareModelWithReason(request.routeDecision.pin.model, request.modelReason, runner, {
-          modelSource: "route", thinking: request.routeDecision.pin.effort, requiredPin: true,
-          signal, timeoutMs: preparation?.timeoutMs,
+        const pin = await this.resolveModelReasonPolicy(request.routeDecision.pin.model, request.modelReason, runner, {
+          modelSource: "route", thinking: request.routeDecision.pin.effort, resolveFallback: resolveRouteFallback,
         });
         if (pin.fallback && pin.model && pin.thinking) {
           policyPinOriginalModel = pin.originalModel;
@@ -1660,7 +1661,7 @@ export class AgentManager {
       }
     }
     const preparedModel = model;
-    const modelPrepared = Boolean(routePin) || alternatePrepared;
+    const modelPrepared = alternatePrepared;
     // Backend provenance is not a resolved account model; preserve raw CLI selectors.
     const auditModel = (): string => runner === "veda" && isClaudeModel(undefined, runner, this.config.veda.backend)
       ? `veda/claude-code/${model ? normalizeVedaModel(model) : "<backend-default>"}`

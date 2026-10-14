@@ -494,14 +494,20 @@ describe("durable route dispatch", () => {
   });
   it("records a queued decision and its stopped outcome even when it never dispatches", async () => {
     const dir = root();
+    const preparePiModel = vi.fn(async (model: string | undefined) => model);
     const manager = new AgentManager(dir, { ...DEFAULT_FABRIC_CONFIG.agents, maxConcurrent: 1 }, {
-      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(dir, "runs"),
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(dir, "runs"), preparePiModel,
     });
     managers.push(manager);
     const blocker = await manager.spawn({ task: "HANG", transport: "process" });
     const decision = await decideModelRoute(input, async () => response());
-    const queued = await manager.spawn({ task: "harmless lookup", transport: "process", routeDecision: decision });
+    const onPreparing = vi.fn();
+    const queued = await manager.spawn({ task: "harmless lookup", transport: "process", routeDecision: decision },
+      undefined, undefined, undefined, undefined, undefined, { timeoutMs: 40, onPreparing });
     expect(queued).toMatchObject({ status: "queued", model: pin.model, thinking: pin.effort });
+    // Waiting for a native permit must not authenticate the pin or spend its setup budget.
+    expect(preparePiModel).toHaveBeenCalledExactlyOnceWith(undefined);
+    expect(onPreparing).not.toHaveBeenCalled();
     await manager.stop(queued.id); await manager.stop(blocker.id);
     const rows = fs.readFileSync(ledgerFile(), "utf8").trim().split("\n").map(line => JSON.parse(line));
     expect(rows).toHaveLength(2);

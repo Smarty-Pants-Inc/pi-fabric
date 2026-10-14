@@ -147,7 +147,7 @@ describe("provider kernel forwarding", () => {
     expect(spawn).not.toHaveBeenCalled();
   });
 
-  it.each([{ runner: "claude" }, { runner: "veda" }, { extensions: false }])("rejects concrete incompatible durable kernel before contacting resident: %j", async (request) => {
+  it.each([{ runner: "claude", modelReason: "Test exception for #11864" }, { runner: "veda" }, { extensions: false }])("rejects concrete incompatible durable kernel before contacting resident: %j", async (request) => {
     const { provider, residency } = setup();
     await expect(provider.invoke("spawn", { task: "task", residency: "durable", kernel: "python", ...request }, context)).rejects.toThrow("Fabric extensions");
     expect(residency.spawnAgent).not.toHaveBeenCalled();

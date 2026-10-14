@@ -252,7 +252,7 @@ describe("ordinary process-task final answer boundary", () => {
 
   it("does not change non-Pi process terminal semantics", async () => {
     const { manager, root, close } = harness();
-    const handle = await manager.spawn({ task: "Claude", runner: "claude", transport: "process" });
+    const handle = await manager.spawn({ task: "Claude", runner: "claude", modelReason: "Test exception for #11864", transport: "process" });
     saveFinalAnswerReceipt(path.join(root, handle.id), handle.id, "not a native Pi receipt");
     expect(manager.status(handle.id).status).toBe("running");
     expect(manager.isSettled(handle.id)).toBe(false);

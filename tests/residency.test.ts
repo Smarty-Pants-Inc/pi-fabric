@@ -2888,6 +2888,7 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
         residency: "durable",
         runner: "pi",
         model: "probe-late/claude-late-5-5",
+        modelReason: "Test exception for #11864",
       });
       const pid = ownerPid();
       writeModels(["claude-late-5-5", "claude-late-5-6"]);
@@ -2896,7 +2897,7 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
         client.hostId,
         actor.id,
         "ask",
-        { message: "ECHO_MODEL ping", ownerIncarnation: await liveControlOwnerIncarnation(state.participants, actor.id), binding: { model: "probe-late/claude-late-5-6" } },
+        { message: "ECHO_MODEL ping", ownerIncarnation: await liveControlOwnerIncarnation(state.participants, actor.id), binding: { model: "probe-late/claude-late-5-6", modelReason: "Test exception for #11864" } },
         client.hostId,
         { timeoutMs: 20_000 },
       );
@@ -2908,7 +2909,7 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
         client.hostId,
         actor.id,
         "followUp",
-        { message: "ECHO_MODEL pong", ownerIncarnation: await liveControlOwnerIncarnation(state.participants, actor.id), binding: { model: "probe-late/claude-late-5-7" } },
+        { message: "ECHO_MODEL pong", ownerIncarnation: await liveControlOwnerIncarnation(state.participants, actor.id), binding: { model: "probe-late/claude-late-5-7", modelReason: "Test exception for #11864" } },
         client.hostId,
       );
       await waitFor(() => state.mesh.read({ topic: "fabric.actor.output", limit: 50 })
@@ -2919,7 +2920,7 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
         client.hostId,
         actor.id,
         "followUp",
-        { message: "nope", ownerIncarnation: await liveControlOwnerIncarnation(state.participants, actor.id), binding: { model: "probe-missing/claude-late-5-9" } },
+        { message: "nope", ownerIncarnation: await liveControlOwnerIncarnation(state.participants, actor.id), binding: { model: "probe-missing/claude-late-5-9", modelReason: "Test exception for #11864" } },
         client.hostId,
       )).rejects.toThrow(/not available to this Pi session/);
       expect(ownerPid()).toBe(pid);

@@ -516,7 +516,8 @@ const actorRemoveSuites = (fs.readdirSync(testsDir, { recursive: true }) as stri
 const ownSuite = "tests/test-deletion-guard.test.ts";
 // Imports only the real vitest.config.ts (type-only Vitest edge erased); no test file or callback runs. The child
 // also writes a pseudo tests root under the private TMPDIR whose nested suite carries the config's first marker
-// (taken from the config at runtime) and asks the scanner.
+// (taken from the config at runtime) plus a suite with only a direct receiver.removeActor() call (no deletion import),
+// and asks the scanner; comment/string mentions of that call stay eligible.
 const configChild = `
 import fs from "node:fs";
 import { registerHooks } from "node:module";
@@ -542,8 +543,9 @@ if (out.exported) {
     const entry = "import { main } from " + JSON.stringify("../src/" + text + ".js") + ";\\n";
     fs.writeFileSync(fixtureRoot + "/nested/marker.test.ts", entry);
     fs.writeFileSync(fixtureRoot + "/nested/helper.ts", entry);
-    fs.writeFileSync(fixtureRoot + "/comment.test.ts", "/* " + text + " */\\n");
-    fs.writeFileSync(fixtureRoot + "/string.test.ts", "const marker = " + JSON.stringify(text) + ";\\n");
+    fs.writeFileSync(fixtureRoot + "/comment.test.ts", "/* " + text + " main.removeActor(id) */\\n");
+    fs.writeFileSync(fixtureRoot + "/string.test.ts", "const marker = " + JSON.stringify(text) + "; const call = 'main.removeActor(id)';\\n");
+    fs.writeFileSync(fixtureRoot + "/receiver-remove-actor.test.ts", "export const run = (main, id) => main.removeActor(id);\\n");
     fs.writeFileSync(fixtureRoot + "/mesh-import.test.ts", 'import { MeshStore } from "../src/mesh/store.js";\\n');
     fs.writeFileSync(fixtureRoot + "/type-import.test.ts", "import type { Options } from " + JSON.stringify("../src/" + text + ".js") + ";\\n");
     fs.writeFileSync(fixtureRoot + "/type-specifier.test.ts", "import { type Options } from " + JSON.stringify("../src/" + text + ".js") + ";\\n");
@@ -585,7 +587,7 @@ it.each([[undefined, false], ["false", false], ["true", true]] as const)(
       expect(suites).not.toContain("tests/test-fleet-isolation.test.ts");
       for (const suite of suites) expect(suite).toMatch(/^tests\/(?:[^/\\]+\/)*[^/\\]+\.test\.ts$/);
       expect(suites.filter((suite) => !output.exclude.includes(suite))).toEqual([]);
-      expect(output.fixture).toEqual(["tests/nested/marker.test.ts"]);
+      expect(output.fixture).toEqual(["tests/nested/marker.test.ts", "tests/receiver-remove-actor.test.ts"]);
     }
   });
 

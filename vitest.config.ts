@@ -18,12 +18,13 @@ const ci = process.env.CI === "true";
 
 // smarty-dev#4664/#11145: suites whose source references a product-deletion entrypoint are excluded before collection
 // outside hosted CI. Syntactic (TypeScript AST; comments and plain string mentions do not count), not a proof.
-// A suite qualifies by importing/requiring a deletion entry module, calling a deletion function, calling .remove with
+// A suite qualifies by importing/requiring a deletion entry module, calling a deletion function (including the resident
+// removeActor request, which deletes the actor directory), calling .remove with
 // an actor-manager import (or on a .actors/manager receiver), calling .publishBatch/.prune/.compact with a mesh
 // store/bridge import, or spawning/executing fabric-win-remove or a retention CLI with --apply.
 export const productDeletionMarkers: readonly string[] = ["actors-cli", "actors/remove-offline",
   "storage/verified-remove", "storage/retention", "storage/scratch", "mesh/event-log"];
-const deletionCalls = new Set(["verifiedRemove", "removeActorOffline", "removeEmptyRunRoot", "sweepTempRunRoots",
+const deletionCalls = new Set(["verifiedRemove", "removeActorOffline", "removeActor", "removeEmptyRunRoot", "sweepTempRunRoots",
   "removeUnreferencedRun", "compactTerminalRunEvents", "pruneActorRunArchives", "pruneActorSessionBackups",
   "sweepScratch", "closeScratch", "deleteRootActorTree", "pruneDeadCensusRecords"]);
 const meshCalls = new Set(["publishBatch", "prune", "compact"]);

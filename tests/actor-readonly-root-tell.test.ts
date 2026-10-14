@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { beforeEach, expect, it } from "vitest";
+import { beforeEach, expect, it, vi } from "vitest";
 import { installInProcessResidentFence } from "./helpers/in-process-resident-fence.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { ResidencyClient } from "../src/residency/client.js";
@@ -12,7 +12,9 @@ import type { FabricMainAgentTarget } from "../src/main-agent.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { MeshStore } from "../src/mesh/store.js";
 
-// smarty-dev#6729 canary check 5: tell to a durable actor while its root's actor directory is read-only.
+// smarty-dev#6729 canary check 5: live-only tell to a durable actor while its root's actor directory is read-only.
+// ResidentHost routes both steer and followUp to actors.tell. Only steer remains expiry-refusable;
+// a followUp timeout now preserves queueable work and cannot truthfully promise a safe fresh resend.
 const mainParticipants = (config: ResidentHostConfig) => {
   const identity = { id: config.rootId, name: "live Main", kind: "main" as const, sessionId: config.sessionId };
   const mesh = new MeshStore(config.meshRoot, config.mesh.maxEventBytes, config.mesh.maxReadEvents);
@@ -32,7 +34,7 @@ beforeEach(() => installInProcessResidentFence());
 
 const rootUser = process.getuid?.() === 0;
 
-it.skipIf(process.platform === "win32" || rootUser)("a tell to a durable actor whose root actor directory is read-only is queued or definitely refused", async () => {
+it.skipIf(process.platform === "win32" || rootUser)("a live-only tell to a durable actor whose root actor directory is read-only is queued or definitely refused", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-readonly-tell-"));
   const sessionId = "readonly-tell";
   const rootId = `session:${sessionId}`;
@@ -69,7 +71,7 @@ it.skipIf(process.platform === "win32" || rootUser)("a tell to a durable actor w
     let outcome: { ok: true; value: unknown } | { ok: false; error: Error };
     const started = Date.now();
     try {
-      outcome = { ok: true, value: await control.request(client.hostId, actor.id, "followUp", { message: "PR 1000 head def", ownerIncarnation: participants.get(actor.id, undefined, { fresh: true })!.ownerIncarnation }, client.hostId) };
+      outcome = { ok: true, value: await control.request(client.hostId, actor.id, "steer", { message: "PR 1000 head def", ownerIncarnation: participants.get(actor.id, undefined, { fresh: true })!.ownerIncarnation }, client.hostId) };
     } catch (error) {
       outcome = { ok: false, error: error as Error };
     }
@@ -97,7 +99,16 @@ it.skipIf(process.platform === "win32" || rootUser)("a tell to a durable actor w
       // and the resend the error calls safe is queued exactly once.
       fs.chmodSync(sessionActorRoot, 0o700);
       chmodded = false;
-      const resent = await control.request(client.hostId, actor.id, "followUp", { message: "PR 1000 head def", ownerIncarnation: participants.get(actor.id, undefined, { fresh: true })!.ownerIncarnation }, client.hostId, { timeoutMs: 20_000 });
+      const original = host.mesh.read({ topic: "fabric.control.command", limit: 100 }).find(event => event.kind === "steer")!;
+      const commandId = (original.data as { commandId: string }).commandId;
+      await host.participants.refresh();
+      const originalAck = () => host.mesh.read({ topic: "fabric.control.ack", limit: 100 })
+        .find(event => (event.data as { commandId?: string })?.commandId === commandId)?.data;
+      await vi.waitFor(() => expect(originalAck()).toMatchObject({
+        commandId, accepted: false, error: "Fabric control command expired", notRun: true,
+      }), { timeout: 5_000, interval: 20 });
+      expect(host.actors.messages(actor.id).slice(before).filter(message => message.direction === "in")).toHaveLength(0);
+      const resent = await control.request(client.hostId, actor.id, "steer", { message: "PR 1000 head def", ownerIncarnation: participants.get(actor.id, undefined, { fresh: true })!.ownerIncarnation }, client.hostId, { timeoutMs: 20_000 });
       expect(resent).toMatchObject({ acknowledged: true });
       const delivered = host.actors.messages(actor.id).slice(before)
         .filter(message => message.direction === "in" && JSON.stringify(message.data).includes("PR 1000 head def"));

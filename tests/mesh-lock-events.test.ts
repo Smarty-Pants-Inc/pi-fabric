@@ -16,8 +16,8 @@ import type { MeshIdentity } from "../src/mesh/store.js";
 const lockKey = Symbol.for("pi-fabric.mesh.lock-stats");
 const eventsKey = Symbol.for("pi-fabric.mesh.lock-events");
 const registry = globalThis as typeof globalThis & {
-  [lockKey]?: { dispose(): void };
-  [eventsKey]?: { dispose(): void; events: LockEvents | undefined };
+  [lockKey]?: { dispose(): void; flush(): void };
+  [eventsKey]?: { version?: number; dispose(): void; events: LockEvents | undefined };
 };
 const reset = (): void => {
   registry[lockKey]?.dispose();
@@ -390,6 +390,269 @@ describe("lock events: rotation across processes", () => {
 });
 
 describe("lock events in one process", () => {
+  it.each([false, true])("FIFO expiry (bounded=%s) is counted separately, while real contention still fails the timeout gate", async (bounded) => {
+    const { events, MeshLock } = await load();
+    const { meshLockQueueDirectory, MeshLockTicket } = await import("../src/mesh/lock-queue.js");
+    const { MeshLockTimeoutError } = await import("../src/core/atomic-write.js");
+    const { lockStats } = await import("../src/mesh/mesh-lock.js");
+    const { main } = await import("../src/mesh-lock-stats-cli.js");
+    const root = temp();
+    const lock = new MeshLock(root, { lockTimeoutMs: 2_000 }, () => undefined);
+    await lock.withLock(() => undefined); // seed the real stats file; no event for a quick acquisition
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+    const directory = meshLockQueueDirectory(root);
+    fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+    const head = path.join(directory, `${"0".repeat(24)}-${process.pid}-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa`);
+    fs.writeFileSync(head, "");
+    const failed = vi.spyOn(lockStats!, "failed");
+    const waitTimeout = vi.spyOn(events, "waitTimeout");
+    const queueExpired = vi.spyOn(events, "queueExpired");
+    const close = vi.spyOn(MeshLockTicket.prototype, "close");
+    const operation = vi.fn();
+    const pending = Array.from({ length: 3 }, () => lock.withLock(operation, 2_000, "publish", bounded).catch((error: unknown) => error));
+    for (let elapsed = 0; elapsed < 2_000; elapsed += 50) {
+      const now = Date.now() / 1000;
+      fs.utimesSync(head, now, now); // live admission head, but canonical .lock is free
+      await vi.advanceTimersByTimeAsync(50);
+    }
+    for (const error of await Promise.all(pending)) {
+      expect(error).toBeInstanceOf(MeshLockTimeoutError); // caller compatibility, not diagnostic attribution
+      expect(error).toMatchObject({ name: "MeshLockQueueExpiredError", code: "FABRIC_MESH_LOCK_TIMEOUT", attempts: 0 });
+    }
+    expect(operation).not.toHaveBeenCalled();
+    expect(failed).not.toHaveBeenCalled();
+    expect(waitTimeout).not.toHaveBeenCalled();
+    expect(queueExpired).toHaveBeenCalledTimes(3);
+    expect(close.mock.invocationCallOrder[0]!).toBeLessThan(queueExpired.mock.invocationCallOrder[0]!);
+    expect(readEvents(eventsFile(root))).toHaveLength(3);
+    for (const event of readEvents(eventsFile(root))) {
+      expect(event).toMatchObject({ v: 1, kind: "pre-lock", preLockCode: "FABRIC_MESH_LOCK_QUEUE_EXPIRED", store: "mesh-lock", class: "publish",
+        waitedMs: 2_000, holder: { pid: null, process: null, op: null }, waiter: { pid: process.pid, op: "publish" } });
+      expect(event.waitersAhead).toBeGreaterThanOrEqual(1);
+    }
+    const meter = () => {
+      registry[lockKey]!.flush();
+      let json = "";
+      const exit = main(["--mesh", root, "--json", "--max-timeouts", "0"],
+        { now: Date.now() + 60_000, stdout: text => { json += text; } });
+      return { exit, summary: JSON.parse(json) as { n: number; timeouts: number; tries: number } };
+    };
+    expect(meter()).toMatchObject({ exit: 0, summary: { n: 1, timeouts: 0, tries: 0 } });
+
+    // Counterexample: an eligible head really probes a held canonical lock. It must still count as contention.
+    fs.renameSync(head, path.join(root, "fixture-previous-head"));
+    fs.mkdirSync(path.join(root, ".lock"));
+    fs.writeFileSync(path.join(root, ".lock", "owner"), `held\n${process.pid}\n${Date.now()}\n`);
+    const contended = lock.withLock(operation, 100, "publish").catch((error: unknown) => error);
+    await vi.advanceTimersByTimeAsync(150);
+    const timeout = await contended;
+    expect(timeout).toBeInstanceOf(MeshLockTimeoutError);
+    expect(timeout).toMatchObject({ name: "MeshLockTimeoutError" });
+    expect((timeout as InstanceType<typeof MeshLockTimeoutError>).attempts).toBeGreaterThan(0);
+    expect(failed).toHaveBeenCalledTimes(1);
+    expect(waitTimeout).toHaveBeenCalledTimes(1);
+    expect(queueExpired).toHaveBeenCalledTimes(3);
+    expect(readEvents(eventsFile(root)).filter(event => event.kind === "wait-timeout")).toHaveLength(1);
+    expect(meter()).toMatchObject({ exit: 3, summary: { n: 1, timeouts: 1, tries: 0 } });
+  });
+
+  it.each([0, 5_000])("SQLite FIFO setup taking %s ms leaves the full budget and a separate zero-attempt refusal", async (setupMs) => {
+    const { events, SqliteStateStore: Store } = await load();
+    const { meshLockQueueDirectory } = await import("../src/mesh/lock-queue.js");
+    const { MeshLockQueueExpiredError } = await import("../src/mesh/mesh-lock.js");
+    const { openNodeSqlite } = await import("../src/mesh/state-sqlite.js");
+    const root = temp();
+    const statements: string[] = [];
+    const store = await Store.open(root, 64 * 1024, 1_000, { lockTimeoutMs: 2_000, fifoAfterMs: 0,
+      open: file => {
+        const connection = openNodeSqlite(file);
+        return { exec(sql) { statements.push(sql); connection.exec(sql); }, prepare: sql => connection.prepare(sql),
+          close: () => connection.close(), get isTransaction() { return connection.isTransaction; } };
+      } });
+    const queue = meshLockQueueDirectory(store.file);
+    fs.mkdirSync(queue, { recursive: true, mode: 0o700 });
+    const head = path.join(queue, `${"0".repeat(24)}-${process.pid}-bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb`);
+    fs.writeFileSync(head, "");
+    const generic = vi.spyOn(events, "waitTimeout");
+    const separate = vi.spyOn(events, "queueExpired");
+    statements.length = 0;
+    vi.useFakeTimers({ toFake: ["Date", "performance", "setTimeout", "clearTimeout"] });
+    const write = fs.writeFileSync;
+    let slow = true;
+    vi.spyOn(fs, "writeFileSync").mockImplementation(((file: fs.PathOrFileDescriptor, ...rest: unknown[]) => {
+      const result = (write as (...args: unknown[]) => void)(file, ...rest);
+      if (slow && path.dirname(String(file)) === queue && String(file) !== head) {
+        slow = false;
+        vi.advanceTimersByTime(setupMs); // consume the old pre-constructor deadline deterministically
+        const now = Date.now() / 1000;
+        fs.utimesSync(head, now, now);
+      }
+      return result;
+    }) as typeof fs.writeFileSync);
+    let settled = false;
+    const pending = store.put({ key: "queue/refused", value: 1, identity }).catch((error: unknown) => error)
+      .finally(() => { settled = true; });
+    const advance = async (ms: number) => {
+      for (let elapsed = 0; elapsed < ms; elapsed += 50) {
+        const now = Date.now() / 1000;
+        fs.utimesSync(head, now, now);
+        await vi.advanceTimersByTimeAsync(Math.min(50, ms - elapsed));
+      }
+    };
+    try {
+      await advance(1_900);
+      expect(settled).toBe(false);
+      expect(statements.filter(sql => sql === "BEGIN IMMEDIATE")).toEqual([]);
+      await advance(200);
+      const error = await pending;
+      expect(error).toBeInstanceOf(MeshLockQueueExpiredError);
+      expect(error).toMatchObject({ attempts: 0, waitedMs: 2_000, waitersAhead: 1,
+        code: "FABRIC_MESH_LOCK_TIMEOUT", preLockCode: "FABRIC_MESH_LOCK_QUEUE_EXPIRED" });
+      expect(store.stats()).toMatchObject({ lockTimeouts: 0, fifoJoins: 1, writesWaiting: 0 });
+      expect(store.get("queue/refused")).toBeUndefined();
+      expect(generic).not.toHaveBeenCalled();
+      expect(separate).toHaveBeenCalledTimes(1);
+      expect(readEvents(eventsFile(root))).toMatchObject([{ kind: "pre-lock", preLockCode: "FABRIC_MESH_LOCK_QUEUE_EXPIRED", store: "sqlite", class: "put/delete",
+        waitedMs: 2_000, waitersAhead: 1, holder: { pid: null }, waiter: { pid: process.pid } }]);
+      expect(readEvents(eventsFile(root))).toHaveLength(1);
+      expect(statements.filter(sql => sql === "BEGIN IMMEDIATE")).toEqual([]);
+
+      // Counterexample: a genuine BEGIN IMMEDIATE race still counts and emits exactly one generic timeout.
+      fs.renameSync(head, path.join(root, "fixture-sqlite-previous-head"));
+      const holder = openNodeSqlite(store.file);
+      holder.exec("BEGIN IMMEDIATE");
+      try {
+        const contended = store.exclusive(() => undefined, 100).catch((error: unknown) => error);
+        await vi.advanceTimersByTimeAsync(150);
+        const timeout = await contended;
+        expect(timeout).toMatchObject({ name: "MeshLockTimeoutError", code: "FABRIC_MESH_LOCK_TIMEOUT" });
+        expect((timeout as { attempts: number }).attempts).toBeGreaterThan(0);
+        expect(store.stats()).toMatchObject({ lockTimeouts: 1, writesWaiting: 0 });
+        expect(generic).toHaveBeenCalledTimes(1);
+        expect(separate).toHaveBeenCalledTimes(1);
+        expect(readEvents(eventsFile(root)).filter(event => event.kind === "wait-timeout")).toHaveLength(1);
+        expect(statements.filter(sql => sql === "BEGIN IMMEDIATE").length).toBeGreaterThan(0);
+      } finally { holder.exec("ROLLBACK"); holder.close(); }
+    } finally { store.close(); }
+  });
+
+  it("MeshStore's SQLite receiver preserves FIFO refusal, but still wraps and counts a real BEGIN timeout", async () => {
+    const { events, MeshStore, SqliteStateStore: Store } = await load();
+    const { meshLockQueueDirectory } = await import("../src/mesh/lock-queue.js");
+    const { MeshLockQueueExpiredError } = await import("../src/mesh/mesh-lock.js");
+    const { MeshStateBusyError, isMeshRetryableBusy } = await import("../src/mesh/state-backend.js");
+    const { openNodeSqlite } = await import("../src/mesh/state-sqlite.js");
+    // The real backend/driver remain in use. The factory seam selects the existing strict-admission option,
+    // which MeshStore does not expose as a public option; no BEGIN or error is mocked.
+    const open = Store.open;
+    const openSync = Store.openSync;
+    vi.spyOn(Store, "open").mockImplementation((root, maxEventBytes, maxReadEvents, options, budget) =>
+      open.call(Store, root, maxEventBytes, maxReadEvents, { ...options, fifoAfterMs: 0 }, budget));
+    vi.spyOn(Store, "openSync").mockImplementation((root, maxEventBytes, maxReadEvents, options) =>
+      openSync.call(Store, root, maxEventBytes, maxReadEvents, { ...options, fifoAfterMs: 0 }));
+    const root = temp();
+    const mesh = new MeshStore(root, 64 * 1024, 1_000, { stateBackend: "sqlite", lockTimeoutMs: 2_000 });
+    await mesh.put({ key: "receiver/seed", value: 0, identity });
+    const file = path.join(root, "state.db");
+    const queue = meshLockQueueDirectory(file);
+    fs.mkdirSync(queue, { recursive: true, mode: 0o700 });
+    const head = path.join(queue, `${"0".repeat(24)}-${process.pid}-cccccccc-cccc-cccc-cccc-cccccccccccc`);
+    fs.writeFileSync(head, "");
+    const generic = vi.spyOn(events, "waitTimeout");
+    vi.useFakeTimers({ toFake: ["Date", "performance", "setTimeout", "clearTimeout"] });
+    try {
+      const pending = mesh.put({ key: "receiver/refused", value: 1, identity }).catch((error: unknown) => error);
+      for (let elapsed = 0; elapsed < 2_100; elapsed += 50) {
+        const now = Date.now() / 1000;
+        fs.utimesSync(head, now, now);
+        await vi.advanceTimersByTimeAsync(50);
+      }
+      const refusal = await pending;
+      expect(refusal).toBeInstanceOf(MeshLockQueueExpiredError);
+      expect(refusal).not.toBeInstanceOf(MeshStateBusyError);
+      expect(refusal).toMatchObject({ kind: "pre-lock", preLockCode: "FABRIC_MESH_LOCK_QUEUE_EXPIRED", attempts: 0 });
+      expect((refusal as Error).message).not.toMatch(/Timed out|0 attempts/);
+      expect(mesh.stateDiagnostics().busyTimeouts).toBe(0);
+      expect(isMeshRetryableBusy(refusal)).toBe(true);
+      expect(generic).not.toHaveBeenCalled();
+      expect(readEvents(eventsFile(root))).toMatchObject([{ kind: "pre-lock", preLockCode: "FABRIC_MESH_LOCK_QUEUE_EXPIRED", store: "sqlite" }]);
+      expect(readEvents(eventsFile(root))).toHaveLength(1);
+      expect(mesh.get("receiver/refused")).toBeUndefined();
+
+      fs.renameSync(head, path.join(root, "fixture-receiver-head"));
+      vi.useRealTimers(); // real 2-second writer budget, real SQLite busy lock
+      const holder = openNodeSqlite(file);
+      holder.exec("BEGIN IMMEDIATE");
+      try {
+        const timeout = await mesh.put({ key: "receiver/contended", value: 1, identity }).catch((error: unknown) => error);
+        expect(timeout).toBeInstanceOf(MeshStateBusyError);
+        expect((timeout as { attempts: number }).attempts).toBeGreaterThan(0);
+        expect(mesh.stateDiagnostics().busyTimeouts).toBe(1);
+        expect(generic).toHaveBeenCalledTimes(1);
+        expect(readEvents(eventsFile(root)).filter(event => event.kind === "wait-timeout")).toHaveLength(1);
+      } finally { holder.exec("ROLLBACK"); holder.close(); }
+    } finally { mesh.closeState(); }
+  });
+
+  it.each(["kind", "preLockCode"] as const)("the SQLite receiver preserves a caller-compatible refusal identified only by %s", async (field) => {
+    const { MeshStore, SqliteStateStore: Store } = await load();
+    const { MeshLockTimeoutError } = await import("../src/core/atomic-write.js");
+    const root = temp();
+    const mesh = new MeshStore(root, 64 * 1024, 1_000, { stateBackend: "sqlite" });
+    try {
+      await mesh.put({ key: "marker/seed", value: 0, identity });
+      const refusal = Object.assign(new MeshLockTimeoutError("", 0, 0),
+        { [field]: field === "kind" ? "pre-lock" : "FABRIC_MESH_LOCK_QUEUE_EXPIRED" });
+      refusal.message = "pre-lock compatibility marker probe: acquisition not attempted";
+      vi.spyOn(Store.prototype, "put").mockRejectedValue(refusal);
+      await expect(mesh.put({ key: "marker/refused", value: 1, identity })).rejects.toBe(refusal);
+      expect(mesh.stateDiagnostics().busyTimeouts).toBe(0);
+    } finally { mesh.closeState(); }
+  });
+
+  it("adds pre-lock events to a captured legacy appender without replacing its existing sink or losing append errors", async () => {
+    const original = createLockEvents("1", { warn: () => undefined })!;
+    const legacy = { held: original.held, waitTimeout: original.waitTimeout, get errors() { return original.errors; } };
+    registry[eventsKey] = { dispose() {}, events: legacy as LockEvents }; // pre-queue-event runtime generation
+    const upgraded = createLockEvents("0", { warn: () => undefined })!; // first owner's opt-in stays in force
+    expect(upgraded.held).toBe(legacy.held);
+    expect(upgraded.waitTimeout).toBe(legacy.waitTimeout);
+    const root = temp();
+    upgraded.queueExpired(root, "mesh-lock", "bridge", 2_000, 1);
+    upgraded.waitTimeout(root, "mesh-lock", "publish", 100, process.pid);
+    expect(readEvents(eventsFile(root)).map(event => [event.kind, event.preLockCode])).toEqual([
+      ["pre-lock", "FABRIC_MESH_LOCK_QUEUE_EXPIRED"], ["wait-timeout", undefined],
+    ]);
+    vi.resetModules();
+    const reloaded = await import("../src/mesh/commit-stats.js");
+    expect(reloaded.createLockEvents("0")).toBe(upgraded);
+    const open = fs.openSync;
+    vi.spyOn(fs, "openSync").mockImplementation(((file: fs.PathLike, ...rest: unknown[]) => {
+      if (String(file) === eventsFile(root)) throw Object.assign(new Error("EIO: injected"), { code: "EIO" });
+      return (open as (...args: unknown[]) => number)(file, ...rest);
+    }) as typeof fs.openSync);
+    upgraded.held(root, "mesh-lock", "publish", 1_001);
+    upgraded.queueExpired(root, "mesh-lock", "bridge", 2_000, undefined);
+    expect(original.errors).toBe(1);
+    expect(upgraded.errors).toBe(2); // both old and new appender failures remain visible
+  });
+
+  it("upgrades a captured v2 queue event writer to the full refusal code, while preserving its contention sink", () => {
+    const original = createLockEvents("1")!;
+    const obsoleteQueueWriter = vi.fn();
+    registry[eventsKey] = { version: 2, dispose() {}, events: { held: original.held, waitTimeout: original.waitTimeout,
+      queueExpired: obsoleteQueueWriter, get errors() { return original.errors; } } };
+    const current = createLockEvents("1")!;
+    expect(current.waitTimeout).toBe(original.waitTimeout);
+    const root = temp();
+    current.queueExpired(root, "sqlite", "publish", 2_000, 2);
+    expect(obsoleteQueueWriter).not.toHaveBeenCalled();
+    expect(readEvents(eventsFile(root))).toMatchObject([{ kind: "pre-lock", preLockCode: "FABRIC_MESH_LOCK_QUEUE_EXPIRED",
+      store: "sqlite", waitersAhead: 2 }]);
+    expect(readEvents(eventsFile(root))).toHaveLength(1);
+    expect(createLockEvents("0")).toBe(current);
+  });
+
   // smarty-dev#12036: pending incarnation is not contention. A shorter-budget cold acquisition
   // has its own retry code before it ever tries .lock, with no wait-timeout event.
   it("a cold protocol-2 pending acquisition records no wait-timeout event", async () => {

@@ -57,7 +57,7 @@ const now=Date.now(); fs.writeFileSync(args.get('--status-file'),JSON.stringify(
     fs.writeFileSync(launcher, `import fs from 'node:fs'; import path from 'node:path';
 const [mode,id]=process.argv.slice(2); if(mode==='launch'){const dir=path.join(${JSON.stringify(results)},id);fs.mkdirSync(dir,{recursive:true});fs.writeFileSync(path.join(dir,'result.md'),'REMOTE');fs.writeFileSync(path.join(dir,'rc'),'0');console.log('RYZEN2_TASK_ACCEPTED '+id+' on testhost');}`);
     remote = normalizeFabricConfig({ agents: { placement: {
-      default: "remote", command: [process.execPath, launcher, "launch", "{id}", "{task}"],
+      default: "remote", sharedMounts: [cwd], command: [process.execPath, launcher, "launch", "{id}", "{task}"],
       resultDirectory: path.join(results, "{id}"), cancelCommand: [process.execPath, launcher, "cancel", "{id}"],
       commandTimeoutMs: 5_000, pollIntervalMs: 10,
     } } }).agents.placement;

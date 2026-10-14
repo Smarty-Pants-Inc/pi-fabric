@@ -1,8 +1,11 @@
-import { getMarkdownTheme, type ExtensionAPI, type MessageRenderer } from "@earendil-works/pi-coding-agent";
-import { Box, Markdown, Spacer, Text, truncateToWidth } from "@earendil-works/pi-tui";
+// Type-only: Pi loads this startup graph as native ESM, where a runtime SDK
+// import evaluates a second, unbundled SDK (assert-build-artifacts.mjs).
+import type { ExtensionAPI, MessageRenderer } from "@earendil-works/pi-coding-agent";
+import { Box, Markdown, Spacer, Text, truncateToWidth, type MarkdownTheme } from "@earendil-works/pi-tui";
 import { createHash } from "node:crypto";
 import type { FabricIncomingMessageMode } from "../config.js";
 import { safeText } from "./format.js";
+import { highlightCode } from "./highlight.js";
 
 export const INCOMING_MESSAGE_TYPES = [
   "pi-fabric-agent-message", // Includes mail.inbound follow-up notices.
@@ -164,6 +167,29 @@ const withoutRows = (text: string, hidden: readonly Row[]): string => hidden
   }, text);
 
 /**
+ * Pi's markdown theme built from the host-supplied renderer Theme (as in
+ * dashboard-detail.ts), not the SDK's runtime getMarkdownTheme().
+ */
+const incomingMarkdownTheme = (theme: Parameters<MessageRenderer>[2], invalidate: () => void): MarkdownTheme => ({
+  heading: text => theme.fg("mdHeading", text),
+  link: text => theme.fg("mdLink", text),
+  linkUrl: text => theme.fg("mdLinkUrl", text),
+  code: text => theme.fg("mdCode", text),
+  codeBlock: text => theme.fg("mdCodeBlock", text),
+  codeBlockBorder: text => theme.fg("mdCodeBlockBorder", text),
+  quote: text => theme.fg("mdQuote", text),
+  quoteBorder: text => theme.fg("mdQuoteBorder", text),
+  hr: text => theme.fg("mdHr", text),
+  listBullet: text => theme.fg("mdListBullet", text),
+  bold: text => theme.bold(text),
+  italic: text => theme.italic(text),
+  underline: text => theme.underline(text),
+  strikethrough: text => theme.strikethrough(text),
+  highlightCode: (code, lang) => highlightCode(code, lang ?? "", invalidate) ??
+    code.split("\n").map(line => theme.fg("mdCodeBlock", line)),
+});
+
+/**
  * Mirrors Pi's native custom-message rendering (label + full markdown body) for a
  * carrier from which already-delivered rows were removed. Nothing is collapsed or clipped.
  */
@@ -171,9 +197,11 @@ const fullCarrier = (message: IncomingMessage, hidden: readonly Row[], theme: Pa
   const box = new Box(1, 1, text => theme.bg("customMessageBg", text));
   box.addChild(new Text(theme.fg("customMessageLabel", `\x1b[1m[${message.customType}]\x1b[22m`), 0, 0));
   box.addChild(new Spacer(1));
-  box.addChild(new Markdown(withoutRows(contentText(message), hidden), 0, 0, getMarkdownTheme(), {
-    color: text => theme.fg("customMessageText", text),
-  }));
+  // The first fenced block with a language starts the shared highlighter; once
+  // it is ready, drop the cached lines so the next host render colors the code.
+  const markdown: Markdown = new Markdown(withoutRows(contentText(message), hidden), 0, 0,
+    incomingMarkdownTheme(theme, () => markdown.invalidate()), { color: text => theme.fg("customMessageText", text) });
+  box.addChild(markdown);
   return box;
 };
 

@@ -794,6 +794,12 @@ export class ActorManager {
   #closing = false;
   #closePromise: Promise<void> | undefined;
   #releasePaused = false;
+  #releaseStrict = false;
+  #releaseEpoch = 0;
+  #releaseAdmissionDepth = 0;
+  #pendingCreates = 0;
+  #releaseCheckpoint: { epoch: number; files: Map<string, string | undefined>; queues: unknown[]; cursor: unknown } | undefined;
+  readonly #releaseQueueSnapshots = new Map<string, { file: string; snapshot: Record<string, unknown> }>();
   readonly #closeGraceMs: number;
   // Stop-the-world gate armed by haltAll() (ESC): while true, host-event and
   // mesh dispatch are frozen so interrupted actors are not re-armed by the
@@ -970,10 +976,13 @@ export class ActorManager {
       outageAlarm: meshOutageAlarmSink(() => ({ mesh: this.mesh, from: this.identity })),
       cursorPath: options.meshCursorPath,
       canConsumeMesh: options.canConsumeMesh,
+      // Legacy/staged pauses gate worker activation, not relay/mesh ingress.
+      // Only the cooperative strict hold may leave input behind the cursor.
+      canAdmit: () => !this.#releaseStrict,
       maxReplayAgeMs: options.meshReplayAgeMs,
       replayAll: options.claimResidency === "durable",
       beforePoll: () => {
-        if (this.#releasePaused || options.canConsumeMesh?.() === false) return false;
+        if (this.#releaseStrict || options.canConsumeMesh?.() === false) return false;
         // Initial publication may have outlived the first deferred slice (or
         // failed and later recovered). Retry once ready, never on the constructor.
         if (this.#initialRetentionPending) this.#startRetentionSweep();
@@ -989,6 +998,7 @@ export class ActorManager {
         return !this.#halted;
       },
       onEvent: (event) => {
+        if (this.#releaseStrict) return false;
         for (const [id, records] of this.#records) {
           if (this.#actors.has(id)) records.accept(event);
           else this.#records.delete(id);
@@ -998,6 +1008,7 @@ export class ActorManager {
         for (const listener of this.#meshListeners) {
           try { listener(); } catch { /* Observers must not interrupt delivery. */ }
         }
+        if (this.#releaseStrict) return false;
         if (event.topic === "fabric.steer") this.#relaySteer(event);
         else if (!event.topic.startsWith("fabric.control.")) return this.#dispatchMeshEvent(event);
         return event.topic === "fabric.steer" ? true : "ignored";
@@ -1040,7 +1051,7 @@ export class ActorManager {
 
   /** Re-admit restored work after the host's providers and ownership directory are ready. */
   resumeQueued(): void {
-    if (this.#closing || this.#halted) return;
+    if (this.#closing || this.#halted || this.#releaseStrict) return;
     this.#settledRestoreReady = true;
     this.#syncActorsFromRegistry();
     this.#refreshOwnership();
@@ -1073,6 +1084,9 @@ export class ActorManager {
       onCommit?: (id: string) => void;
     } = {},
   ): Promise<FabricActorInfo> {
+    this.#assertReleaseAdmission();
+    ++this.#pendingCreates;
+    try {
     this.#refreshOwnership();
     const registryOwnerCreate = asRegistryOwner && request.residency === "durable";
     const sessionMainCreate = (request.residency ?? "session") === "session" &&
@@ -1244,6 +1258,7 @@ export class ActorManager {
       })
       .catch(() => undefined);
     return this.#publicInfo(actor);
+    } finally { --this.#pendingCreates; }
   }
 
   /** ActorDirectory supplies foreign-session discovery; a single registry has none. */
@@ -2010,6 +2025,7 @@ export class ActorManager {
     data?: unknown,
     bindingOptions: ActorMessageBindingOptions = {},
   ): { queued: true; messageId: string } {
+    this.#assertReleaseAdmission(true);
     this.validateDirectMessage(message, data);
     const actor = this.#requireOwnedActiveActor(id);
     const item = this.#enqueue(
@@ -2066,6 +2082,7 @@ export class ActorManager {
     signal?: AbortSignal,
     bindingOptions: ActorMessageBindingOptions = {},
   ): Promise<FabricActorMessage> {
+    this.#assertReleaseAdmission();
     this.validateDirectMessage(message, data);
     const actor = this.#requireOwnedActiveActor(id);
     if (signal?.aborted) {
@@ -2271,6 +2288,7 @@ export class ActorManager {
   }
 
   noteMainActivity(idle = false): void {
+    if (this.#releaseStrict) return;
     this.#mainRevision++;
     this.#persistRevisions();
     this.#mainIdle = idle;
@@ -2306,6 +2324,7 @@ export class ActorManager {
     payload: unknown,
     images: readonly ImageContent[] = [],
   ): number {
+    if (this.#releaseStrict) return 0;
     let delivered = 0;
     for (const actor of this.#actors.values()) {
       if (!this.#observesHostEvent(actor, event)) continue;
@@ -2410,6 +2429,7 @@ export class ActorManager {
     pendingSourceId?: string,
     sender?: FabricMessageSender | null,
   ): boolean {
+    if (this.#releaseStrict) return false;
     if (this.#skipOnArrival(actor, `host:${event}`, payload)) return true;
     const interval = event === "agent_settled" ? actor.activation?.minIntervalMs ?? 0 : 0;
     let sourceId = pendingSourceId;
@@ -2481,7 +2501,7 @@ export class ActorManager {
   #resumeSettledWindows(onlyActorId?: string): void {
     // The host calls resumeQueued/resumeAfterRelease after providers and ownership
     // bootstrap. Registry construction/polls must only retain, not activate, work.
-    if (!this.#settledRestoreReady || this.#closing || this.#settledClosePending || this.#halted || this.#canConsumeMesh?.() === false) return;
+    if (!this.#settledRestoreReady || this.#releaseStrict || this.#closing || this.#settledClosePending || this.#halted || this.#canConsumeMesh?.() === false) return;
     for (const [actorId, sources] of this.#settledWindows) {
       if ((onlyActorId !== undefined && actorId !== onlyActorId) || !this.#canManageCached(actorId)) continue;
       for (const [sourceId, window] of sources) {
@@ -2493,7 +2513,7 @@ export class ActorManager {
   }
 
   #armSettledWindow(actorId: string, sourceId: string, window: SettledWindow): void {
-    if (this.#settledClosePending) return;
+    if (this.#settledClosePending || this.#releaseStrict) return;
     // Node clamps delays above signed int32 to 1 ms. Chunk long valid intervals instead.
     const remaining = Math.max(0, window.intervalMs - (Date.now() - window.acceptedAt));
     window.timer = setTimeout(() => this.#flushSettledWindow(actorId, sourceId, window), Math.min(remaining, 2_147_483_647));
@@ -2503,7 +2523,7 @@ export class ActorManager {
   #flushSettledWindow(actorId: string, sourceId: string, window: SettledWindow): void {
     if (this.#settledWindows.get(actorId)?.get(sourceId) !== window) return;
     delete window.timer;
-    if (!window.pending || this.#closing || this.#settledClosePending || this.#halted || this.#canConsumeMesh?.() === false) return;
+    if (!window.pending || this.#releaseStrict || this.#closing || this.#settledClosePending || this.#halted || this.#canConsumeMesh?.() === false) return;
     this.#syncActorsFromRegistry();
     this.#refreshOwnership(actorId);
     // Reload/reacquisition can replace every registry object. Resolve only after fencing.
@@ -2572,7 +2592,7 @@ export class ActorManager {
   }
 
   #beginHostEvent(event: FabricActorHostEvent, idle: boolean, source?: string): boolean {
-    if (this.#closing || !this.meshConfig.enabled) return false;
+    if (this.#releaseStrict || this.#closing || !this.meshConfig.enabled) return false;
     // Streaming/message/provider hooks are frequent. The actor registry watcher
     // keeps this in-memory roster current, so events that do not participate in
     // Main freshness revisions can return without per-update filesystem work
@@ -2677,10 +2697,18 @@ export class ActorManager {
       .map(actor => actor.id);
   }
 
-  /** Actors whose runs or drains a reload would stop (smarty-dev#1830, #2160). */
-  inFlightCount(): number {
+  #inFlightRunCount(): number {
     return [...new Set([...this.#actors.values(), ...this.#draining.values()])]
       .filter((actor) => actor.abortController !== undefined || actor.draining).length;
+  }
+
+  /** Actors whose runs or drains a reload would stop (smarty-dev#1830, #2160). */
+  inFlightCount(): number { return this.#inFlightRunCount(); }
+
+  /** Release custody also includes accepted setup and ownership work, not additional runs. */
+  releaseCustodyCount(): number {
+    // Use the scope-local count: ActorDirectory aggregates both managers separately.
+    return this.#inFlightRunCount() + this.#pendingCreates + this.#adoptionPending.size;
   }
 
   /**
@@ -3160,35 +3188,181 @@ export class ActorManager {
     return this.#finishCleanup(cleanup);
   }
 
-  /** Reversible activation gate. It never aborts a worker or consumes mesh input. */
-  pauseForRelease(): void { this.#releasePaused = true; }
+  get releaseAdmissionHeld(): boolean { return this.#releaseStrict; }
+
+  /** No worker abort. Legacy/staged startup keeps its activation-only behavior. */
+  pauseForRelease(options: { strict?: boolean } = {}): void {
+    ++this.#releaseEpoch;
+    this.#releaseCheckpoint = undefined;
+    this.#releasePaused = true;
+    this.#releaseStrict ||= options.strict === true;
+    if (this.#releaseStrict) {
+      // Suspend deadlines, not windows: acceptedAt, payload and delivery IDs stay intact.
+      for (const sources of this.#settledWindows.values()) for (const window of sources.values()) {
+        if (window.timer) clearTimeout(window.timer);
+        delete window.timer;
+      }
+    }
+  }
   resumeAfterRelease(): void {
-    this.#releasePaused = false;
+    ++this.#releaseEpoch;
+    this.#releaseCheckpoint = undefined;
+    this.#releasePaused = this.#releaseStrict = false;
+    this.#syncActorsFromRegistry();
+    this.#refreshOwnership();
     this.#settledRestoreReady = true;
+    this.#scheduleRestoreParked();
     this.#resumeSettledWindows();
     if (this.#initialRetentionPending) this.#startRetentionSweep();
     for (const actor of this.#actors.values()) if (actor.queue.length) this.#ensureDrain(actor);
     this.#meshMonitor.schedule();
   }
-  /** Save accepted queues (including empty completion fences) BEFORE either cursor advances. */
-  async checkpointForRelease(): Promise<void> {
-    if (!this.#releasePaused || this.inFlightCount() || this.#pendingResets.size ||
-        this.#removals.size || this.#removeCalls.size || this.#finishCalls.size || this.pendingRemovals().length) {
-      throw new Error("Actor release boundary is not quiescent");
+
+  /** Trusted host ONLY: finish synchronous tell ingress for a pre-cut accepted handler.
+   * No activation authority, no asynchronous propagation, no provider/user exposure. */
+  withReleaseAdmission<T>(admit: () => T): T {
+    ++this.#releaseAdmissionDepth;
+    try {
+      const value = admit();
+      if (value && typeof (value as { then?: unknown }).then === "function") {
+        void Promise.resolve(value).catch(() => undefined); // observe misuse, never propagate authority
+        throw new Error("Release admission wrapper must be synchronous");
+      }
+      return value;
+    } finally { --this.#releaseAdmissionDepth; }
+  }
+
+  #assertReleaseAdmission(trustedTell = false): void {
+    if (this.#releaseStrict && !(trustedTell && this.#releaseAdmissionDepth > 0)) {
+      throw new Error("Fabric actor release admission held; retry unchanged");
     }
+  }
+
+  #assertReleaseQuiet(epoch: number, assertHeld?: () => void): void {
+    assertHeld?.();
+    if (!this.#releasePaused || epoch !== this.#releaseEpoch || this.releaseCustodyCount() || this.#pendingResets.size ||
+        this.#removals.size || this.#removeCalls.size || this.#finishCalls.size || this.pendingRemovals().length ||
+        [...this.#pendingHandoffConsumption.values()].some(ids => ids.size) ||
+        [...this.#pendingRunArchives.values()].some(ids => ids.size)) {
+      throw new Error("Actor release boundary is not quiescent or is stale");
+    }
+    // Callback-backed asks belong to A memory, not a serializable successor queue.
+    const held = [...this.#actors.values()].flatMap(actor => actor.queue).concat(
+      ...this.#overflow.values(), ...this.#parked.values(), ...this.#deferredHandoffs.values());
+    if (held.some(item => item.resolve || item.reject)) throw new Error("Actor release has queued callback asks retained in A");
+  }
+
+  #readReleaseFile(file: string): string | undefined {
+    try {
+      const stat = fs.lstatSync(file);
+      if (!stat.isFile() || stat.isSymbolicLink()) throw new Error(`Actor release file is not regular: ${file}`);
+      if (stat.size > 16 * 1024 * 1024) throw new Error(`Actor release readback exceeds bounded file size: ${file}`);
+      return fs.readFileSync(file, "utf8");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+      throw error;
+    }
+  }
+
+  #releaseFiles(assertHeld?: () => void, durable = false): Map<string, string | undefined> {
+    const files = new Map<string, string | undefined>();
+    let bytes = 0;
+    const add = (file: string) => {
+      assertHeld?.();
+      const contents = this.#readReleaseFile(file);
+      bytes += contents === undefined ? 0 : Buffer.byteLength(contents);
+      if (files.size >= 10_000 || bytes > 16 * 1024 * 1024) throw new Error("Actor release readback exceeds bounded custody snapshot");
+      if (durable && contents !== undefined) {
+        // FlushFileBuffers requires write access on Windows; a read-only handle
+        // fails before wake-config admission even though the saved bytes are valid.
+        const access = process.platform === "win32" ? fs.constants.O_RDWR : fs.constants.O_RDONLY;
+        const fd = fs.openSync(file, access | (fs.constants.O_NOFOLLOW ?? 0));
+        try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+        syncDirectoryChain(path.dirname(file));
+      }
+      assertHeld?.();
+      files.set(file, contents);
+    };
+    add(path.join(this.#actorRoot, "actors.json"));
+    for (const actor of this.#actors.values()) {
+      if (!this.#ownershipDecision(actor.id)) continue;
+      add(this.#ownQueueFile(actor));
+      const directory = path.dirname(actor.sessionFile);
+      // Completion receipts, source obligations and registry payload heads are part of custody.
+      for (const subdir of [directory, path.join(directory, "registry"), path.join(directory, "child-completions")]) {
+        let names: string[];
+        try { names = fs.readdirSync(subdir).sort(); }
+        catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") continue; throw error; }
+        for (const name of names) {
+          if (subdir === directory && !/^(queue-|dead-letter)/.test(name)) continue;
+          const file = path.join(subdir, name);
+          if (!fs.lstatSync(file).isFile()) throw new Error(`Actor release obligation is not regular: ${file}`);
+          add(file);
+        }
+      }
+    }
+    return files;
+  }
+
+  /** Queues + registry + completion fences/readback precede the safe cursor. */
+  async checkpointForRelease(assertHeld?: () => void): Promise<void> {
+    const epoch = this.#releaseEpoch;
+    const check = () => this.#assertReleaseQuiet(epoch, assertHeld);
+    this.#releaseCheckpoint = undefined;
+    this.#releaseQueueSnapshots.clear();
+    check();
+    await this.#retentionSweep;
+    check();
     await Promise.all([...this.#presenceChains.values()]);
+    check();
+    await this.#notifications.checkpointForRelease();
+    check();
+    await this.#filterStateSave;
+    check();
     await this.#registrySavePending;
+    check();
     await this.#registrySaveChain;
+    check();
     let checkpointedActor = false;
     for (const actor of this.#actors.values()) {
+      check();
       if (!this.#ownershipDecision(actor.id)) continue;
       checkpointedActor = true;
       if (!this.#persistQueue(actor.id, true, true)) throw new Error(`Actor ${actor.id} queue did not checkpoint`);
     }
-    // An untouched empty secondary scope has no registry inode to checkpoint.
-    // Do not turn its proven absence into a rollback-read of a nonexistent file.
-    if (checkpointedActor || this.#registry.records().length) await this.#saveActors(new Set(), { durable: true });
-    this.#meshMonitor.checkpointForRelease();
+    // Proven absence of an untouched empty secondary scope remains absence.
+    if (checkpointedActor || this.#registry.records().length) {
+      await this.#saveActors(new Set(), { durable: true, assertHeld: check });
+      check();
+    }
+    const files = this.#releaseFiles(check, true);
+    const queues: unknown[] = [];
+    for (const [actorId, { file, snapshot }] of this.#releaseQueueSnapshots) {
+      if (JSON.stringify(JSON.parse(files.get(file) ?? "null")) !== JSON.stringify(snapshot)) {
+        throw new Error(`Actor ${actorId} queue release readback differs`);
+      }
+      queues.push({ actorId, file, ...snapshot });
+    }
+    check();
+    this.#meshMonitor.checkpointForRelease(check);
+    check();
+    this.#releaseCheckpoint = { epoch, files, queues, cursor: this.#meshMonitor.releaseCheckpointReceipt() };
+  }
+
+  /** Synchronous exact disk readback, not a cached successful-write claim. */
+  releaseCheckpointReceipt(): unknown {
+    const checkpoint = this.#releaseCheckpoint;
+    if (!checkpoint) throw new Error("Actor release checkpoint is absent or invalidated");
+    this.#assertReleaseQuiet(checkpoint.epoch);
+    const files = this.#releaseFiles(() => this.#assertReleaseQuiet(checkpoint.epoch));
+    if (files.size !== checkpoint.files.size || [...checkpoint.files].some(([file, bytes]) => files.get(file) !== bytes)) {
+      throw new Error("Actor release checkpoint disk readback differs");
+    }
+    const cursor = this.#meshMonitor.releaseCheckpointReceipt();
+    if (JSON.stringify(cursor) !== JSON.stringify(checkpoint.cursor)) throw new Error("Actor release cursor readback differs");
+    return { scope: this.#actorScope, epoch: checkpoint.epoch, queues: checkpoint.queues, cursor,
+      files: [...files].map(([file, bytes]) => ({ file, present: bytes !== undefined,
+        ...(bytes !== undefined ? { sha256: createHash("sha256").update(bytes).digest("hex"), bytes: Buffer.byteLength(bytes) } : {}) })) };
   }
 
   /**
@@ -3386,7 +3560,7 @@ export class ActorManager {
   // Once its spawning activation ends, an unread child result belongs to the
   // actor's next activation. Stopped/removed actors keep the spool; never reroute to Main.
   #reconcileChildCompletions(completed?: ManagedActor): void {
-    if (!this.#persistent || this.#closing) return;
+    if (!this.#persistent || this.#closing || this.#releaseStrict) return;
     for (const actor of completed ? [completed] : this.#actors.values()) {
       if (actor.status === "stopped" || actor.removal || !this.#canManageCached(actor.id)) {
         void this.#releaseChildCompletionStore(actor);
@@ -3511,7 +3685,9 @@ export class ActorManager {
       onAccepted?: () => void;
     } = {},
   ): ActorQueueItem {
+    this.#assertReleaseAdmission(source === "direct");
     if (this.#closing) throw new Error("Fabric actor manager is closing; retry");
+    this.#releaseCheckpoint = undefined;
     const canManage = options.ownershipChecked
       ? this.#canManageCached(actor.id)
       : this.#canManage(actor.id);
@@ -3707,7 +3883,7 @@ export class ActorManager {
       // replaced the object an older drain still runs on (smarty-dev#442).
       this.#draining.has(actor.id) ||
       actor.status === "stopped" ||
-      (this.#releasePaused && !actor.queue.some((item) => item.resolve || item.reject)) ||
+      (this.#releasePaused && (this.#releaseStrict || !actor.queue.some((item) => item.resolve || item.reject))) ||
       this.#closing ||
       !this.#canManage(actor.id)
     ) {
@@ -3802,14 +3978,15 @@ export class ActorManager {
     try {
       while (
         actor.queue.length > 0 &&
-        (!this.#releasePaused || actor.queue.some((item) => item.resolve || item.reject)) &&
+        (!this.#releasePaused || (!this.#releaseStrict && actor.queue.some((item) => item.resolve || item.reject))) &&
         actor.status !== "stopped" &&
         !this.#closing &&
         this.#canManage(actor.id)
       ) {
         const reset = this.#resetAtBoundary(actor);
         if (reset) await reset;
-        if (actor.queue.length === 0 || (actor.status as string) === "stopped" || this.#closing) break;
+        if (actor.queue.length === 0 || (actor.status as string) === "stopped" || this.#closing ||
+            (this.#releasePaused && (this.#releaseStrict || !actor.queue.some(item => item.resolve || item.reject)))) break;
         // A persisted completion cannot run before its handoff receipt commits.
         // If receipt I/O failed, even an unrelated new message must not drain it;
         // the next poll retries the same queued id before opening this gate.
@@ -5321,7 +5498,7 @@ export class ActorManager {
   // held in memory, or met twice in one batch, is skipped, so each dead letter runs once. Entries
   // leave the file only after the queue file durably holds what they replayed.
   #replayDeadLetters(actor: ManagedActor): void {
-    if (!this.#persistent || this.#closing || this.#halted || actor.status === "stopped" || actor.removal ||
+    if (!this.#persistent || this.#closing || this.#halted || this.#releaseStrict || actor.status === "stopped" || actor.removal ||
       this.#parked.get(actor.id)?.length || !this.#canManageCached(actor.id) || this.#deadLetterCount(actor.id) === 0) return;
     const limit = this.meshConfig.actorQueueLimit;
     if (actor.queue.length * 2 >= limit || this.#overflow.get(actor.id)?.length) return;
@@ -5412,11 +5589,11 @@ export class ActorManager {
     const script = this.#meshRetentionSweepPath;
     const meshRoot = this.mesh.root;
     const relative = path.relative(path.join(meshRoot, "actors"), this.#actorRoot);
-    if (!script || relative.startsWith("..") || path.isAbsolute(relative) || process.platform !== "linux" || this.#closing) return;
+    if (!script || relative.startsWith("..") || path.isAbsolute(relative) || process.platform !== "linux" || this.#closing || this.#releaseStrict) return;
     try {
       const [runtime, ...args] = await scriptSpawnArgs(script,
         meshRetentionSweepArgs(meshRoot, this.#logs.retention.actorRunArchiveMs));
-      if (this.#closing) return;
+      if (this.#closing || this.#releaseStrict) return;
       const now = Date.now();
       const outcome = await startLockedMeshRetentionSweep(meshRoot, MESH_RETENTION_SWEEP_INTERVAL_MS, (lock) => {
         // The sweep inherits the locked descriptor as fd 3 and holds the lock until it exits.
@@ -5428,7 +5605,7 @@ export class ActorManager {
           try { os.setPriority(child.pid, 19); } catch { /* best effort */ }
         }
         child.unref();
-      }, now, () => !this.#closing);
+      }, now, () => !this.#closing && !this.#releaseStrict);
       if (typeof outcome === "object") this.#alarmSweepLock(meshRoot, outcome.uncertain);
       // smarty-dev#9508: only a successful acquire proves the lock works again; "busy" proves nothing about it.
       else if (outcome === "started" || outcome === "claimed") this.#sweepLockAlarmed = false;
@@ -5628,7 +5805,7 @@ export class ActorManager {
   }
 
   #startRetentionSweep(): void {
-    if (this.#retentionSweep || this.#closing) return;
+    if (this.#retentionSweep || this.#closing || this.#releaseStrict) return;
     const sweep = this.#sweepRetainedRuns().catch(() => undefined);
     this.#retentionSweep = sweep;
     void sweep.finally(() => { if (this.#retentionSweep === sweep) this.#retentionSweep = undefined; });
@@ -5644,10 +5821,10 @@ export class ActorManager {
     // but re-enter the publication/ownership fences between Windows actors.
     const batchSize = ACTOR_RETENTION_BATCH_SIZE[process.platform === "win32" ? "win32" : "other"];
     for (let offset = 0; offset < actors.length; offset += batchSize) {
-      if (this.#closing || this.#canConsumeMesh?.() === false) return;
+      if (this.#closing || this.#releaseStrict || this.#canConsumeMesh?.() === false) return;
       this.#withOwnershipRead(() => {
         for (const actor of actors.slice(offset, offset + batchSize)) {
-          if (this.#closing || this.#canConsumeMesh?.() === false) return;
+          if (this.#closing || this.#releaseStrict || this.#canConsumeMesh?.() === false) return;
           // Reload/removal, cede and a newly published owner all veto maintenance.
           if (this.#actors.get(actor.id) !== actor || !this.#ownershipDecision(actor.id)) continue;
           this.#realarmBlockedActivation(actor, now);
@@ -5675,11 +5852,11 @@ export class ActorManager {
       });
       await new Promise<void>((resolve) => setImmediate(resolve));
     }
-    if (this.#closing || this.#canConsumeMesh?.() === false) return;
+    if (this.#closing || this.#releaseStrict || this.#canConsumeMesh?.() === false) return;
     // smarty-dev#9508: joined, so close's await of #retentionSweep covers script preparation and a pending acquire.
     if (this.#persistent && this.meshConfig.enabled) {
       await this.#startMeshRetentionSweep();
-      if (this.#closing) return;
+      if (this.#closing || this.#releaseStrict) return;
     }
     if (this.#deadSessionReap && this.#persistent && this.meshConfig.enabled) {
       void this.#notifications.enqueue(() => reapDeadSessionPresence(this.mesh, this.identity, {
@@ -6143,7 +6320,7 @@ export class ActorManager {
 
   #saveActors(removedIds: ReadonlySet<string> = new Set(), options?: {
     durable?: boolean; flush?: boolean; removedLineages?: ReadonlyMap<string, string>; requiredActor?: ManagedActor;
-    operatorRow?: true;
+    operatorRow?: true; assertHeld?: () => void;
   }): Promise<void> {
     ++this.#registrySaveRevision;
     // Serialization is process-local and OUTSIDE custody. A later preparation
@@ -6158,6 +6335,7 @@ export class ActorManager {
     });
     const operation = this.#registrySaveChain.then(() => {
       if (controller.signal.aborted) throw controller.signal.reason;
+      options?.assertHeld?.();
       return this.#saveActorsNow(removedIds, options, controller.signal);
     });
     const saved = Promise.race([operation, cancelled]).finally(() => {
@@ -6170,13 +6348,14 @@ export class ActorManager {
 
   async #saveActorsNow(removedIds: ReadonlySet<string> = new Set(), options?: {
     durable?: boolean; flush?: boolean; removedLineages?: ReadonlyMap<string, string>; requiredActor?: ManagedActor;
-    operatorRow?: true;
+    operatorRow?: true; assertHeld?: () => void;
   }, signal?: AbortSignal): Promise<void> {
     if (!this.#persistent || !this.meshConfig.enabled) return;
     if (this.#registrySaveDurable) options = { ...options, durable: true };
     let committed;
     try {
       committed = await this.#registry.update(current => {
+      options?.assertHeld?.();
       if (signal?.aborted) return undefined;
       const revision = this.#registrySaveRevision;
       // smarty-dev#6829: observe only the ownership inputs of this manager's actors (their
@@ -6219,7 +6398,7 @@ export class ActorManager {
         const states = owned.map(actor => ({ actor, updatedAt: actor.updatedAt, status: actor.status,
           append: this.#unarchivedMessages.get(actor), count: this.#unarchivedMessages.get(actor)?.length }));
         return { actors, durable: removedIds.size > 0 || options?.durable === true || this.#registrySaveDurable,
-          validate: () => !signal?.aborted && revision === this.#registrySaveRevision && ownership.unchanged() &&
+          validate: () => (options?.assertHeld?.(), !signal?.aborted) && revision === this.#registrySaveRevision && ownership.unchanged() &&
             states.every(({ actor, updatedAt, status, append, count }) => this.#actors.get(actor.id) === actor &&
               actor.updatedAt === updatedAt && actor.status === status && !this.#ceded.has(actor.id) &&
               !this.#finishCalls.has(actor.id) && append === this.#unarchivedMessages.get(actor) && append?.length === count),
@@ -6235,7 +6414,19 @@ export class ActorManager {
       }
       throw error;
     }
+    options?.assertHeld?.();
     if (!committed) return;
+    if (options?.assertHeld) {
+      const readback = JSON.parse(this.#readReleaseFile(path.join(this.#actorRoot, "actors.json")) ?? "null") as { format?: number; actors?: Array<Record<string, unknown>> } | null;
+      if (readback?.format !== 1 || !Array.isArray(readback.actors) ||
+          JSON.stringify(readback.actors.map(row => row.id)) !== JSON.stringify(committed.actors.map(row => (row as Record<string, unknown>).id)) ||
+          committed.owned.some(actor => {
+            const row = readback.actors!.find(row => row.id === actor.id);
+            return !row || row.rootId !== actor.rootId || row.residency !== actor.residency || row.status !== actor.status ||
+              row.instructions !== actor.instructions || this.#lineage(row) !== this.#lineage(actor);
+          })) throw new Error("Actor registry release readback differs");
+      options.assertHeld();
+    }
     // Accepted: set synchronously, before the next queued save serializes this row.
     if (options?.operatorRow && options.requiredActor?.removal &&
         committed.owned.includes(options.requiredActor)) options.requiredActor.removal.operator = true;
@@ -6279,7 +6470,7 @@ export class ActorManager {
   #syncActorsFromRegistry(): void {
     // An unchanged registry needs no ownership read; idle polls share the
     // coalesced directory view in #refreshOwnership instead.
-    if (!this.#persistent || this.#closing || this.#reloadingOwnership) return;
+    if (!this.#persistent || this.#closing || this.#releaseStrict || this.#reloadingOwnership) return;
     const fingerprint = this.#registry.fingerprint();
     if (!fingerprint || fingerprint === this.#registryFingerprint) return;
     this.#withOwnershipRead(() => this.#syncActorsFromRegistryNow());
@@ -6689,6 +6880,7 @@ export class ActorManager {
     sourceId: string; window: SettledWindow; pending: NonNullable<SettledWindow["pending"]>; item: ActorQueueItem;
   }, cancellationFallback = false): boolean {
     if (!this.#persistent || this.#closing || !this.#ownQueueRead.has(actorId)) return false;
+    if (!release) this.#releaseCheckpoint = undefined;
     const actor = this.#actors.get(actorId);
     if (!actor) return false;
     // Ordinary pending saves remain soft. Cancellation and predecessor deletion,
@@ -6788,6 +6980,12 @@ export class ActorManager {
         }
       }
       return false;
+    }
+    if (release && snapshot) {
+      if (JSON.stringify(JSON.parse(this.#readReleaseFile(file) ?? "null")) !== JSON.stringify(snapshot)) {
+        throw new Error(`Actor ${actorId} queue release readback differs`);
+      }
+      this.#releaseQueueSnapshots.set(actorId, { file, snapshot });
     }
     if (durable) {
       for (const { sourceId, window, pending } of savedPendingWindows) {
@@ -7536,6 +7734,7 @@ export class ActorManager {
     if (
       !this.#persistent ||
       this.#closing ||
+      this.#releaseStrict ||
       !this.#canManageActor ||
       this.#claimResidency === undefined ||
       this.#adoptionPending.has(actor.id)
@@ -7585,12 +7784,15 @@ export class ActorManager {
 
   async #confirmAdoption(actor: ManagedActor): Promise<void> {
     try {
-      if (this.#closing) return;
+      if (this.#closing || this.#releaseStrict) return;
+      const epoch = this.#releaseEpoch;
+      const held = () => this.#closing || this.#releaseStrict || epoch !== this.#releaseEpoch;
       const expectedRootId = actor.rootId;
       const participantKey = `topology/participants/${createHash("sha256").update(actor.id).digest("hex")}`;
       const incarnation = await ownProcessIncarnation();
+      if (held()) return;
       await prepareParticipantFileLock(this.mesh, participantKey);
-      if (this.#closing || this.#actors.get(actor.id) !== actor) return;
+      if (held() || this.#actors.get(actor.id) !== actor) return;
       // Prepare the claim without custody; no actor object changes until commit.
       const snapshot = this.#registry.snapshot();
       const current = snapshot.actors.find(record => record.id === actor.id);
@@ -7613,10 +7815,10 @@ export class ActorManager {
         // writes nothing; the registry commit inside it is the R11 exception (plan, A1 X15).
         adopted = await ActorRegistryStore.withLocks([this.#registry], () => withStateFence(this.mesh, this.identity, () =>
           withParticipantFileTryLock(this.mesh, participantKey, incarnation, () => {
-            if (this.#closing || !prepared.valid() || actor.updatedAt !== previousUpdatedAt || actor.rootId !== expectedRootId) return false;
+            if (held() || !prepared.valid() || actor.updatedAt !== previousUpdatedAt || actor.rootId !== expectedRootId) return false;
             if (this.#canManageActor?.(actor.id) !== undefined || this.#lineageMayBeAlive(expectedRootId)) return false;
             if (typeof current.adoptedAt === "number" && Date.now() - current.adoptedAt < this.#adoptionGraceMs) return false;
-            if (this.#closing) return false;
+            if (held()) return false;
             prepared.commit();
             actor.adoptedFrom = adoptedFrom;
             actor.rootId = this.#rootId;
@@ -7626,6 +7828,7 @@ export class ActorManager {
             return true;
           }), 0), "manager-adoption");
       } finally { prepared.dispose(); }
+      if (held() && !adopted) return;
       this.#adoptionRetryAt.delete(actor.id);
       // Close can also begin after the synchronous claim, before lock release
       // resumes us. Do not take over queues or resync/notify a disposed owner.
@@ -7655,7 +7858,7 @@ export class ActorManager {
     } finally {
       this.#adoptionPending.delete(actor.id);
     }
-    if (this.#closing) return;
+    if (this.#closing || this.#releaseStrict) return;
     this.#refreshOwnership();
     this.#emitChange();
   }
@@ -7677,6 +7880,7 @@ export class ActorManager {
     for (const actor of actors) {
       const previous = this.#ownership.get(actor.id) ?? false;
       const next = this.#ownershipDecision(actor.id, fresh);
+      if (this.#releaseStrict && !previous && next) continue; // reacquisition is new admission
       this.#ownership.set(actor.id, next);
       if (previous && !next) {
         void this.#releaseChildCompletionStore(actor);
@@ -7929,10 +8133,11 @@ export class ActorManager {
   }
 
   #scheduleRestoreParked(): void {
-    if (this.#parked.size === 0 || this.#closing) return;
+    if (this.#parked.size === 0 || this.#closing || this.#releaseStrict) return;
+    const epoch = this.#releaseEpoch;
     queueMicrotask(() => {
-      // An interrupt holds parked work until the user resumes (the halt gate).
-      if (this.#halted || this.#closing) return;
+      // The wake itself grants no admission across a release cut, even if A resumed.
+      if (this.#halted || this.#closing || this.#releaseStrict || epoch !== this.#releaseEpoch) return;
       for (const [id, items] of [...this.#parked]) {
         const actor = this.#actors.get(id);
         if (!actor || actor.status === "stopped" || !this.#canManageCached(id)) continue;

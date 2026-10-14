@@ -1,7 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
 import { resolveAgentDir } from "../core/agent-dir.js";
-import * as piConversationHost from "@earendil-works/pi-coding-agent";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { TUI } from "@earendil-works/pi-tui";
 import type { CodePreviewSettings } from "./code-preview.js";
@@ -252,10 +251,13 @@ export class FabricUiController {
     this.#conversationOpen = true;
     const epoch = this.#epoch;
     try {
-      // Native lazy imports cannot see Pi's extension-loader aliases/virtual modules.
-      const { initializeConversationHost } = await import("./conversation-host.js");
+      // Fabric is native ESM, so Pi's jiti virtual modules never apply: resolve
+      // the running CLI's own SDK rather than a bare (unbundled) package import.
+      const [{ initializeConversationHost }, { loadHostSdk }] =
+        await Promise.all([import("./conversation-host.js"), import("../core/host-sdk.js")]);
+      const conversationHost = await loadHostSdk();
       if (epoch !== this.#epoch) return;
-      initializeConversationHost(piConversationHost);
+      initializeConversationHost(conversationHost);
       const [{ FabricConversationView, FabricConversationState }, { conversationTargets, resolveConversationTarget }, { readConversationAppearance }, { NativeConversationReader }, { imageSafeCustom }] =
         await Promise.all([import("./conversation.js"), import("./conversation-targets.js"), import("./conversation-chrome.js"), import("./conversation-native-reader.js"), import("./image-overlays.js")]);
       if (epoch !== this.#epoch) return;

@@ -4641,17 +4641,18 @@ export class AgentManager {
     resume?: { task: string; carryOver: AgentRunCarryOver },
   ): Promise<boolean> {
     try {
+      const policyRole = managed.actorName ? `actor:${managed.actorName}` : "task";
+      let admission: AgentModelAdmission;
       if (managed.runner !== "pi" && managed.runner !== "pi-durable") {
-        await this.prepareModelWithReason(managed.model, managed.modelReason, managed.runner, { modelSource: "explicit",
-          role: managed.actorName ? `actor:${managed.actorName}` : "task" });
-      }
-      if (managed.runner === "pi" || managed.runner === "pi-durable") {
+        admission = await this.prepareModelWithReason(managed.model, managed.modelReason, managed.runner, { modelSource: "explicit",
+          role: policyRole });
+      } else {
         // A retry cannot silently retarget an already launched session. Re-admit
         // its concrete selector as explicit; refuse a newly protected alias/default.
-        const admitted = await this.prepareModelWithReason(managed.routePin?.model ?? managed.model, managed.modelReason,
+        admission = await this.prepareModelWithReason(managed.routePin?.model ?? managed.model, managed.modelReason,
           managed.runner, { modelSource: "explicit", thinking: managed.thinking, requiredPin: Boolean(managed.routePin),
-            role: managed.actorName ? `actor:${managed.actorName}` : "task" });
-        const model = admitted.model;
+            role: policyRole });
+        const model = admission.model;
         if (managed.routePin) setWorkerArgument(managed.launch.workerArguments, "thinking", managed.routePin.effort);
         const modelIndex = managed.launch.workerArguments.indexOf("--model");
         if (model) {
@@ -4741,6 +4742,16 @@ export class AgentManager {
       // pi-fabric#939 round 3: the old attempt's pid proves nothing about the replacement. No attempt's pid is known
       // until the launch resolves, so nothing can be proven gone in between (or ever, if the launch is unknown).
       delete managed.ownProcess;
+      // Audit this attempt's actual approval, never a ref reparsed from its reason.
+      // A safe inherited fallback has no approvedRef; its initial null-ref switch row remains authoritative.
+      if (admission.approvedRef && isClaudeModel(admission.model, managed.runner, this.config.veda.backend) &&
+          this.#validModelReason(managed.modelReason)) {
+        const model = managed.runner === "veda" && isClaudeModel(undefined, managed.runner, this.config.veda.backend)
+          ? `veda/claude-code/${admission.model ? normalizeVedaModel(admission.model) : "<backend-default>"}`
+          : admission.model ?? "claude/<backend-default>";
+        const warning = appendOpusPolicyLog({ role: policyRole, model, ref: admission.approvedRef, reason: managed.modelReason });
+        if (warning) (managed.modelPolicyWarnings ??= []).push(warning);
+      }
       const transport = await this.#launchTransport(managed.adapter, managed.launch);
       // Stop receipts belong to one transport attempt, not the run id. Install
       // the replacement and its fresh custody together, after launch resolves.

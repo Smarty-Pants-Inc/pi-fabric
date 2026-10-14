@@ -1542,6 +1542,76 @@ describe("AgentManager", () => {
     expect(fs.readdirSync(root)).toEqual([]);
   });
 
+  it.each(["changed-ref", "same-ref", "missing", "expired", "inherited-fallback"] as const)(
+    "relaunch audits the fresh exception before worker launch (%s)", async (mode) => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-relaunch-exception-"));
+      roots.push(root);
+      const home = path.join(root, "home");
+      const homedir = vi.spyOn(os, "homedir").mockReturnValue(home);
+      const exceptionsPath = path.join(root, "model-exceptions.json");
+      const auditFile = path.join(home, ".local", "state", "smarty", "route", "opus-exceptions.jsonl");
+      const model = "anthropic/claude-opus-5-5";
+      const safeModel = "openai-codex/gpt-5.4";
+      const inherited = mode === "inherited-fallback";
+      const reason = `relaunch ${mode} ${path.basename(root)} #12000 #11864`;
+      const entry = (ref: string, expires = "2999-01-01T00:00:00.000Z") => ({
+        ref, models: [model], roles: ["task"], expires,
+      });
+      fs.writeFileSync(exceptionsPath, JSON.stringify([entry("smarty-dev#12000")]));
+      const readAudit = (): Record<string, unknown>[] => fs.readFileSync(auditFile, "utf8")
+        .trim().split("\n").filter(Boolean).map(line => JSON.parse(line) as Record<string, unknown>)
+        .filter(row => row.reason === (inherited ? "inherited-switch" : reason));
+      const actualLaunch = ProcessTransport.prototype.launch;
+      let launches = 0;
+      const launch = vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async function (this: ProcessTransport, request) {
+        const attempt = ++launches;
+        // These assertions run before the real process starts, not after the run settles.
+        const rows = readAudit();
+        const refs = inherited ? [null] : attempt === 1 ? ["smarty-dev#12000"]
+          : ["smarty-dev#12000", mode === "changed-ref" ? "smarty-dev#11864" : "smarty-dev#12000"];
+        expect(rows.map(row => row.ref)).toEqual(refs);
+        for (const row of rows) {
+          expect(Object.keys(row).sort()).toEqual(["host", "launcher", "model", "reason", "ref", "role", "ts"]);
+          expect(row).toMatchObject({ role: "task", model, reason: inherited ? "inherited-switch" : reason,
+            launcher: "fabric", host: os.hostname(), ts: expect.stringMatching(/^\d{4}-\d\d-\d\dT/) });
+        }
+        expect(request.workerArguments).toEqual(expect.arrayContaining(["--model", inherited ? safeModel : model]));
+        const handle = await actualLaunch.call(this, request);
+        if (attempt === 1) {
+          if (mode === "changed-ref") fs.writeFileSync(exceptionsPath, JSON.stringify([entry("smarty-dev#11864")]));
+          else if (mode === "missing") fs.writeFileSync(exceptionsPath, "[]");
+          else if (mode === "expired") fs.writeFileSync(exceptionsPath, JSON.stringify([entry("smarty-dev#12000", "2000-01-01T00:00:00.000Z")]));
+        }
+        return handle;
+      });
+      try {
+        const preparePiModel = vi.fn(async (selector: string | undefined) => selector);
+        const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents,
+          modelExceptionsPath: exceptionsPath,
+          modelPolicy: { ...DEFAULT_FABRIC_CONFIG.agents.modelPolicy, fallbackModel: safeModel },
+        }, { workerPath: path.resolve("tests/fixtures/fake-worker-startup-retry.mjs"), runRoot: root, preparePiModel });
+        managers.push(manager);
+        const result = await manager.run({ task: `Recover startup ${mode}`, model, transport: "process",
+          ...(inherited ? { modelSource: "inherited" as const } : { modelReason: reason }) });
+        const refused = mode === "missing" || mode === "expired";
+        expect(launches).toBe(refused ? 1 : 2);
+        expect(result.status).toBe(refused ? "failed" : "completed");
+        expect(fs.readFileSync(path.join(manager.runDirectory(result.id)!, "startup-attempts"), "utf8"))
+          .toBe(refused ? "1" : "2");
+        expect(readAudit().map(row => row.ref)).toEqual(inherited ? [null] : refused ? ["smarty-dev#12000"]
+          : ["smarty-dev#12000", mode === "changed-ref" ? "smarty-dev#11864" : "smarty-dev#12000"]);
+        if (refused) {
+          expect(result.error).toMatch(/relaunch failed:.*(?:unlisted|expired)/);
+        } else {
+          expect(result.text).toBe("startup retry recovered");
+          expect(result.model).toBe(inherited ? safeModel : model);
+          expect(result.modelReason).toBe(inherited ? undefined : reason);
+          expect(preparePiModel).toHaveBeenLastCalledWith(inherited ? safeModel : model);
+        }
+      } finally { launch.mockRestore(); homedir.mockRestore(); }
+    }, 30_000,
+  );
+
   it("retries a Pi child that fails before its first turn", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
     roots.push(root);

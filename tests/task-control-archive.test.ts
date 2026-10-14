@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { ActorLogStore } from "../src/actors/log-store.js";
 import { canRemoveTerminalRun, pruneActorRunArchives, runTreeExitVeto } from "../src/storage/retention.js";
 import { verifiedRemove } from "../src/storage/verified-remove.js";
-import { initializeTaskControlDirectory, legacyTaskControlSibling, MAX_FINAL_ANSWER_BYTES, MAX_TASK_CONTROL_BYTES, readFinalAnswerReceipt, taskControlDirectory, withLegacyTaskControlDirectory } from "../src/worker/terminal-answer.js";
+import { createHostTaskRun, initializeTaskControlDirectory, legacyTaskControlSibling, saveFinalAnswerReceipt, MAX_FINAL_ANSWER_BYTES, MAX_TASK_CONTROL_BYTES, readFinalAnswerReceipt, taskControlDirectory, withLegacyTaskControlDirectory } from "../src/worker/terminal-answer.js";
 import { queuedTerminalControls, settleTerminalControl } from "../src/worker/terminal-controls.js";
 
 // Keep reason: trust boundary / data safety. Exercise the actual archive and
@@ -491,5 +491,54 @@ describe("actor archive paired task controls", () => {
     expect(fs.existsSync(path.join(t.archive, "status.json"))).toBe(false);
     expect(t.snapshot(t.source)).toEqual(before);
     expect(removalPaths()).toEqual([]);
+  });
+});
+
+// DELTA-SEC-01 cutoff (#12214): existing raw old/v1 history is ALWAYS unknown.
+// No generic seed producer is assumed here; only current-only v2 and refusal.
+const bytesOf = (...directories: string[]) => directories.filter(directory => fs.existsSync(directory)).flatMap(directory =>
+  fs.readdirSync(directory, { recursive: true, withFileTypes: true }).filter(entry => entry.isFile())
+    .map(entry => [path.join(entry.parentPath, entry.name), fs.readFileSync(path.join(entry.parentPath, entry.name)).toString("base64")]))
+  .sort(([a], [b]) => a!.localeCompare(b!));
+describe("raw legacy cutoff: unknown history refuses, every byte preserved", () => {
+  it.each(["sibling-v1", "legacy"] as const)("refuses %s raw history at bootstrap, read, archive and collection", async layout => {
+    const f = setup(layout);
+    const before = bytesOf(f.source, legacyTaskControlSibling(f.source), taskControlDirectory(f.source));
+    expect(() => initializeTaskControlDirectory(f.source)).toThrow("FABRIC_LEGACY_SNAPSHOT_REQUIRED");
+    expect(() => readFinalAnswerReceipt(f.source, f.record.id)).toThrow();
+    await expect(f.store.retainRun(f.actor, f.alias, f.source)).rejects.toThrow();
+    expect(fs.existsSync(path.join(f.archive, "status.json"))).toBe(false);
+    expect(canRemoveTerminalRun(f.source)).toBe(false);
+    expect(removalPaths()).toEqual([]);
+    expect(bytesOf(f.source, legacyTaskControlSibling(f.source), taskControlDirectory(f.source))).toEqual(before);
+  });
+  it("refuses a pre-existing central with a v1 binding instead of publishing its single answer", async () => {
+    const f = setup("legacy");
+    const central = taskControlDirectory(f.source);
+    fs.mkdirSync(central, { recursive: true, mode: 0o700 });
+    const stat = fs.lstatSync(f.source, { bigint: true });
+    json(path.join(central, ".legacy-read.json"), { version: 1, runId: "source-run", dev: String(stat.dev), ino: String(stat.ino) });
+    const before = bytesOf(f.source, central);
+    expect(() => readFinalAnswerReceipt(f.source, f.record.id)).toThrow();
+    await expect(f.store.retainRun(f.actor, f.alias, f.source)).rejects.toThrow();
+    expect(canRemoveTerminalRun(f.source)).toBe(false);
+    expect(removalPaths()).toEqual([]);
+    expect(bytesOf(f.source, central)).toEqual(before);
+  });
+  it("archive publishes its own v2 current-only binding, never the source binding or a snapshot", async () => {
+    const root = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "task-control-archive-v2-")); roots.push(root);
+    const source = path.join(root, "source-run");
+    createHostTaskRun(source); // exclusive fresh run + null central at the final lexical path
+    const receipt = saveFinalAnswerReceipt(source, "source-run", "current answer");
+    json(path.join(source, "status.json"), { id: "source-run", runner: "pi", status: "completed", transport: "process", sessionId: "2147483647",
+      finishedAt: day, taskControlLayout: "central-v1", finalAnswerReceipt: { id: receipt.id, recordedAt: receipt.recordedAt } });
+    const store = new ActorLogStore({ maxEventBytes: 8192 }, { eventContextChars: 1000 }, { actorRunArchiveMs: day });
+    const actor = { sessionFile: path.join(root, "actor", "session.jsonl"), lastRunId: "archive" }, archive = path.join(root, "actor", "runs", "archive");
+    await store.retainRun(actor, "archive", source);
+    const held = fs.lstatSync(archive, { bigint: true });
+    expect(JSON.parse(fs.readFileSync(path.join(taskControlDirectory(archive), ".legacy-read.json"), "utf8"))).toEqual({
+      version: 2, runId: "archive", dev: String(held.dev), ino: String(held.ino), snapshot: null });
+    expect(fs.existsSync(path.join(taskControlDirectory(archive), ".legacy-snapshot"))).toBe(false);
+    expect(readFinalAnswerReceipt(archive, "source-run")).toEqual(receipt);
   });
 });

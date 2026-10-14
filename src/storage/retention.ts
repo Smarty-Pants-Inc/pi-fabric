@@ -309,15 +309,19 @@ const terminalArtifactDirectories = new Set(["terminal-controls", "terminal-noti
 /** A refusal journal is not a sender route receipt. Unconsumed admissions need
  * their own settled tracked follow-up or delivered notice; unsafe artifacts veto. */
 const safeTerminalArtifacts = (root: string, expired: Deadline): boolean => withTaskControlReadDirectory(root, (selected, fd) => {
-  const runStat = ownedStat(root), selectedStat = fs.fstatSync(fd);
-  const selectedLegacy = !!runStat && runStat.dev === selectedStat.dev && runStat.ino === selectedStat.ino;
-  if (selectedLegacy) return safeSelectedTerminalArtifacts(root, selected, true, [], expired);
-  // Status is task-writable. Only the shared host-owned inode-bound eligibility
-  // check may expose old artifacts after recovery creates a protected sibling.
-  // Every legacy layer (tri-layout: old sibling AND in-run) is judged together.
-  return withLegacyTaskControlDirectories(root, sources => safeSelectedTerminalArtifacts(root, selected, false, sources.map(source => source.directory), expired));
+  const runStat = ownedStat(root) ? fs.lstatSync(root, { bigint: true }) : undefined, selectedStat = fs.fstatSync(fd, { bigint: true });
+  // Protected-only: a raw run selection is never control authority.
+  if (!runStat || runStat.dev === selectedStat.dev && runStat.ino === selectedStat.ino) return false;
+  // Status is task-writable. Only kernel-validated protected snapshot layers
+  // carry history; keep their origin through the custody judgment.
+  return withLegacyTaskControlDirectories(root, sources => {
+    const inRunLayers = sources.filter(source => source.origin.kind === "in-run");
+    if (inRunLayers.some(source => source.origin.dev !== String(runStat.dev) || source.origin.ino !== String(runStat.ino))) return false;
+    return safeSelectedTerminalArtifacts(root, selected, sources, inRunLayers.length > 0, expired);
+  });
 });
-const safeSelectedTerminalArtifacts = (root: string, selected: string, selectedLegacy: boolean, legacy: string[], expired: Deadline): boolean => {
+const safeSelectedTerminalArtifacts = (root: string, selected: string, sources: ReadonlyArray<{ directory: string; origin: { kind: "in-run" | "sibling" } }>, inRunOrigin: boolean, expired: Deadline): boolean => {
+  const legacy = sources.map(source => source.directory);
   const namespaces = [selected, ...legacy];
   const artifactPaths = (name: string): string[] => namespaces.map(directory => path.join(directory, name))
     .filter(file => !!fs.lstatSync(file, { throwIfNoEntry: false }));
@@ -325,15 +329,20 @@ const safeSelectedTerminalArtifacts = (root: string, selected: string, selectedL
   if (answers.length > 1) return false; // Conflicting result namespaces never establish finality.
   const answerFile = answers[0];
   const controlDirectories = artifactPaths("terminal-controls"), noticeDirectories = artifactPaths("terminal-notices");
-  if (!selectedLegacy) {
-    if (!legacy.length && [...terminalArtifactFiles, ...terminalArtifactDirectories].some(name => fs.lstatSync(path.join(root, name), { throwIfNoEntry: false }))) return false;
+  {
+    // Raw in-run controls are custody evidence only: without a validated in-run
+    // origin layer they are unknown and veto; with one they are never read.
+    if (!inRunOrigin && [...terminalArtifactFiles, ...terminalArtifactDirectories].some(name => fs.lstatSync(path.join(root, name), { throwIfNoEntry: false }))) return false;
+    // Raw old sibling likewise needs a validated sibling-origin layer.
+    if (!sources.some(source => source.origin.kind === "sibling") && fs.lstatSync(legacyTaskControlSibling(root), { throwIfNoEntry: false })) return false;
     // A private sibling is not an unlimited artifact allowlist. Interrupted
     // staging/locks, unknown names, links and nonregular artifacts retain custody.
     for (const name of fs.readdirSync(selected)) {
       if (expired()) return false;
       const stat = ownedStat(path.join(selected, name));
       if (!stat || !(terminalArtifactFiles.has(name) && stat.isFile() || terminalArtifactDirectories.has(name) && stat.isDirectory() ||
-          name === ".legacy-read.json" && legacy.length > 0 && stat.isFile())) return false;
+          // Reserved names only after kernel validation of binding and snapshot.
+          name === ".legacy-read.json" && stat.isFile() || name === ".legacy-snapshot" && sources.length > 0 && stat.isDirectory())) return false;
     }
   }
   // Sender views may omit malformed/duplicate rows; omission is never retention
@@ -574,6 +583,8 @@ const runControlRemovals = (directory: string): ControlRemoval[] | undefined => 
     if (stat) {
       if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("Refusing linked or non-directory task control path");
       withTaskControlDirectory(run, () => undefined);
+      // Snapshot children go with the central removal; validate them, never plan them separately.
+      withLegacyTaskControlDirectories(run, () => undefined);
       removals.push({ path: central, stat });
     }
     if (!nested) {
@@ -1235,7 +1246,7 @@ export const removeUnreferencedRun = (
   if (check()) { countRefusal(deleter, "referenced at the final check", directory, bytes); return false; }
   // Validate selection even when no sibling exists: only an existing legacy
   // record may authorize its absence; a protected run must never lose its fence.
-  try { taskControlReadDirectory(directory); }
+  try { taskControlReadDirectory(directory); withLegacyTaskControlDirectories(directory, () => undefined); }
   catch (error) {
     console.warn(`[pi-fabric] FABRIC_TASK_CONTROL_UNSAFE cleanup refused for ${directory}: ${String(error)}`);
     return false;

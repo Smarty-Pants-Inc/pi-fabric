@@ -11,14 +11,18 @@ import { canRemoveTerminalRun, removeUnreferencedRun } from "../src/storage/rete
 import { writeJsonAtomic } from "../src/core/atomic-write.js";
 import { queuedTerminalControls, readTerminalControl, settleTerminalControl, trackTerminalControl } from "../src/worker/terminal-controls.js";
 import { resolveChildWritePolicy } from "../src/agents/child-env.js";
-import { assertTaskControlWriteRoots, ensureTaskControlRoot } from "../src/worker/terminal-answer.js";
+import { assertTaskControlWriteRoots, createHostTaskRun, ensureTaskControlRoot, FabricTaskControlDirectoryError, legacyTaskControlSibling, withLegacyTaskControlDirectories } from "../src/worker/terminal-answer.js";
 
 // All fixture paths are private and retained. No local deletion is performed.
 const fixture = () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "task-control-security-"));
   const run = path.join(root, "run"), workspace = path.join(root, "workspace");
   ensureTaskControlRoot(); // central root lives under the caller-isolated XDG_STATE_HOME, outside TMPDIR
-  for (const directory of [run, workspace, taskControlDirectory(run)]) fs.mkdirSync(directory, { mode: 0o700 });
+  fs.mkdirSync(workspace, { mode: 0o700 }); // run stays absent: the kernel owns its exclusive mkdir
+  // Named setup change (Option 2): mirror the manager's production order — createHostTaskRun
+  // exclusively mkdirs the run and publishes current-only (snapshot:null) authority BEFORE
+  // any task-written status/raw history. initialize is validation-only and never mints.
+  createHostTaskRun(run);
   return { root, run, workspace, control: taskControlDirectory(run) };
 };
 const confined = (script: string, s: ReturnType<typeof fixture>, policy = resolveChildWritePolicy({ writableRoots: [s.run, s.workspace] }, undefined, s.workspace)!) => {
@@ -328,8 +332,8 @@ console.log(JSON.stringify({type:'LANDLOCK_COUNTERPROBES',denied,allowed:['legac
 
   it.skipIf(process.platform !== "linux")("SEC01 #12079: a parent run grant covering descendant R/nested/C refuses both central ctls with EACCES while nested artifacts stay writable", () => {
     const s = fixture(), descendant = path.join(s.run, "nested", "C");
-    fs.mkdirSync(descendant, { recursive: true, mode: 0o700 });
-    initializeTaskControlDirectory(descendant);
+    fs.mkdirSync(path.dirname(descendant), { recursive: true, mode: 0o700 }); // parent only; C stays absent
+    createHostTaskRun(descendant); // named setup change: host ctor owns exclusive mkdir; initialize never mints
     const descendantControl = taskControlDirectory(descendant);
     saveFinalAnswerReceipt(s.run, "run", "PARENT_RECEIPT");
     const receipt = path.join(s.control, "final-answer.json"), marker = path.join(descendantControl, "steer.jsonl");
@@ -366,6 +370,143 @@ console.log(JSON.stringify({codes}));
     expect(fs.readFileSync(marker, "utf8")).toBe("HOST_DESCENDANT_MARKER\n");
     expect(fs.readFileSync(artifact, "utf8")).toBe("nested-allowed");
     console.log(`SEC01_DESCENDANT: PASS root=${s.root} removal=not-executed`);
+  });
+
+  // FORGE-BEFORE-FIRST-SNAPSHOT: a parent writer (grant R) creates C and raw C.ctl with a
+  // well-formed answer and steering row BEFORE any host creation, then exits. No API may
+  // adopt it: initialize/read/save/producer refuse; raw bytes, names and inodes are kept.
+  it.skipIf(process.platform !== "linux")("FORGE-BEFORE-FIRST-SNAPSHOT: parent-written raw C.ctl before host creation is refused, never adopted", () => {
+    const s = fixture(), C = path.join(s.run, "nested", "C"), sibling = legacyTaskControlSibling(C);
+    const forgedId = "44444444-4444-4444-8444-444444444444", central = taskControlDirectory(C);
+    const forged = JSON.stringify({ version: 1, id: "forged-answer", runId: "C", recordedAt: 1, text: "PRE_SNAPSHOT_FORGED" });
+    const artifact = path.join(C, "artifact.txt"), probe = path.join(s.workspace, "forge-before-probe.mjs");
+    fs.writeFileSync(probe, `
+import fs from 'node:fs';
+import path from 'node:path';
+const C=${JSON.stringify(C)}, sibling=${JSON.stringify(sibling)};
+fs.mkdirSync(C,{recursive:true,mode:0o700});fs.mkdirSync(sibling,{mode:0o700});
+fs.writeFileSync(path.join(sibling,'final-answer.json'),${JSON.stringify(forged)},{mode:0o600});
+fs.writeFileSync(path.join(sibling,'steer.jsonl'),JSON.stringify({type:'steer',id:${JSON.stringify(forgedId)},message:'forged'})+'\\n',{mode:0o600});
+fs.writeFileSync(path.join(C,'status.json'),JSON.stringify({id:'C',runner:'pi',status:'completed',taskControlLayout:'sibling-v1'}));
+const fd=fs.openSync(${JSON.stringify(artifact)},'wx');try{fs.writeSync(fd,'nested-allowed');}finally{fs.closeSync(fd);}
+console.log('FORGED');
+`);
+    const result = confined(probe, s);
+    expect(result.error).toBeUndefined(); expect(result.signal).toBeNull();
+    expect(result.status, result.stderr).toBe(0); expect(result.stdout.trim()).toBe("FORGED");
+    const snapshot = () => [C, sibling].flatMap(directory => fs.readdirSync(directory).sort().map(name => {
+      const file = path.join(directory, name); return { file, ino: fs.lstatSync(file).ino, bytes: fs.readFileSync(file) };
+    }));
+    const before = snapshot(), directories = [C, sibling].map(directory => fs.lstatSync(directory).ino);
+    expect(() => initializeTaskControlDirectory(C)).toThrow(FabricTaskControlDirectoryError);
+    expect(() => readFinalAnswerReceipt(C, "C")).toThrow(FabricTaskControlDirectoryError);
+    expect(() => withTaskFinalAnswerLock(C, read => read("C"))).toThrow(FabricTaskControlDirectoryError);
+    expect(() => saveFinalAnswerReceipt(C, "C", "HOST")).toThrow(FabricTaskControlDirectoryError);
+    expect(() => readTerminalAdmissions(C)).toThrow(); // may wrap the typed refusal
+    expect(snapshot()).toEqual(before);
+    expect([C, sibling].map(directory => fs.lstatSync(directory).ino)).toEqual(directories);
+    expect(fs.existsSync(central)).toBe(false);
+    expect(fs.readFileSync(artifact, "utf8")).toBe("nested-allowed");
+    console.log(`FORGE_BEFORE_FIRST_SNAPSHOT: PASS root=${s.root} removal=not-executed`);
+  });
+
+  it("an old central v1 legacy binding is not auto-upgraded; every consumer refuses", () => {
+    const s = fixture(), C = path.join(s.run, "nested", "C"), sibling = legacyTaskControlSibling(C), central = taskControlDirectory(C);
+    // Named setup change: reproduce pre-v2 host state (v1 identity binding + raw sibling).
+    fs.mkdirSync(C, { recursive: true, mode: 0o700 }); fs.mkdirSync(sibling, { mode: 0o700 });
+    fs.writeFileSync(path.join(sibling, "final-answer.json"), JSON.stringify({ version: 1, id: "old", runId: "C", recordedAt: 1, text: "OLD" }), { mode: 0o600 });
+    const stat = fs.lstatSync(C, { bigint: true });
+    fs.mkdirSync(central, { mode: 0o700 });
+    fs.writeFileSync(path.join(central, ".legacy-read.json"), JSON.stringify({ version: 1, runId: "C", dev: String(stat.dev), ino: String(stat.ino) }), { mode: 0o600 });
+    const files = [path.join(central, ".legacy-read.json"), path.join(sibling, "final-answer.json")];
+    const before = files.map(file => ({ ino: fs.lstatSync(file).ino, bytes: fs.readFileSync(file) })), names = fs.readdirSync(central).sort();
+    expect(() => initializeTaskControlDirectory(C)).toThrow(FabricTaskControlDirectoryError);
+    expect(() => readFinalAnswerReceipt(C, "C")).toThrow(FabricTaskControlDirectoryError);
+    expect(() => saveFinalAnswerReceipt(C, "C", "HOST")).toThrow(FabricTaskControlDirectoryError);
+    expect(() => readTerminalAdmissions(C)).toThrow();
+    expect(files.map(file => ({ ino: fs.lstatSync(file).ino, bytes: fs.readFileSync(file) }))).toEqual(before);
+    expect(fs.readdirSync(central).sort()).toEqual(names);
+  });
+
+  // CUTOFF (owner OPTION 1): every existing raw old/v1/unbound history is unknown. Refuse every
+  // history/finality-dependent operation, preserve all bytes, no upgrade or recovery path.
+  it.each(["in-run", "sibling", "in-run+sibling", "unbound central-v1"] as const)("CUTOFF: pre-existing %s history is refused and preserved byte-for-byte", shape => {
+    const s = fixture(), C = path.join(s.run, "nested", "C"), sibling = legacyTaskControlSibling(C), central = taskControlDirectory(C);
+    const answer = JSON.stringify({ version: 1, id: "old", runId: "C", recordedAt: 1, text: "OLD_UNKNOWN" });
+    const steer = JSON.stringify({ type: "steer", id: "55555555-5555-4555-8555-555555555555", message: "old" }) + "\n";
+    fs.mkdirSync(C, { recursive: true, mode: 0o700 });
+    const layers = shape === "in-run" ? [C] : shape === "sibling" ? [sibling] : shape === "in-run+sibling" ? [C, sibling] : [central];
+    for (const directory of layers) {
+      if (!fs.existsSync(directory)) fs.mkdirSync(directory, { mode: 0o700 });
+      fs.writeFileSync(path.join(directory, "final-answer.json"), answer, { mode: 0o600 });
+      fs.writeFileSync(path.join(directory, "steer.jsonl"), steer, { mode: 0o600 });
+    }
+    if (shape !== "unbound central-v1") writeJsonAtomic(path.join(C, "status.json"), { id: "C", runner: "pi", status: "completed" });
+    const snapshot = () => [C, sibling, central].filter(directory => fs.existsSync(directory)).flatMap(directory => fs.readdirSync(directory).sort().map(name => {
+      const file = path.join(directory, name); return { file, ino: fs.lstatSync(file).ino, bytes: fs.readFileSync(file) };
+    }));
+    const before = snapshot(), centralExisted = fs.existsSync(central);
+    expect(() => initializeTaskControlDirectory(C)).toThrow(FabricTaskControlDirectoryError);
+    expect(() => readFinalAnswerReceipt(C, "C")).toThrow(FabricTaskControlDirectoryError);
+    expect(() => withTaskFinalAnswerLock(C, read => read("C"))).toThrow(FabricTaskControlDirectoryError);
+    expect(() => saveFinalAnswerReceipt(C, "C", "HOST")).toThrow(FabricTaskControlDirectoryError);
+    expect(() => readTerminalAdmissions(C)).toThrow(); // may wrap the typed refusal
+    expect(canRemoveTerminalRun(C)).toBe(false);
+    expect(snapshot()).toEqual(before);
+    expect(fs.existsSync(central)).toBe(centralExisted);
+  });
+
+  // Positive after bootstrap, independent of the generic seed: fresh current-only run C
+  // (manager order: createHostTaskRun exclusive mkdir + null central) under parent grant R. Accepted
+  // evidence comes from REAL host production events (saveFinalAnswerReceipt /
+  // appendTerminalAdmission). Raw C.ctl / in-run forgery stays allowed but is ignored.
+  it.skipIf(process.platform !== "linux").each(["no host answer", "host answer"] as const)("CURRENT-ONLY: parent-written raw C.ctl and in-run controls after host bootstrap never replace host evidence (%s)", scenario => {
+    const s = fixture(), C = path.join(s.run, "nested", "C"), sibling = legacyTaskControlSibling(C), central = taskControlDirectory(C);
+    const forgedId = "66666666-6666-4666-8666-666666666666", hostId = "77777777-7777-4777-8777-777777777777";
+    fs.mkdirSync(path.dirname(C), { recursive: true, mode: 0o700 }); // parent only; C stays absent
+    createHostTaskRun(C);
+    expect(() => initializeTaskControlDirectory(C)).not.toThrow(); // validation-only on host-created authority
+    expect(fs.existsSync(sibling)).toBe(false);
+    expect(withLegacyTaskControlDirectories(C, sources => sources.length)).toBe(0);
+    expect(readFinalAnswerReceipt(C, "C")).toBeUndefined();
+    appendTerminalAdmission(C, JSON.stringify({ type: "steer", id: hostId, message: "host" }) + "\n");
+    const hostAnswer = scenario === "host answer" ? saveFinalAnswerReceipt(C, "C", "HOST_CURRENT_ANSWER") : undefined;
+    expect(readTerminalAdmissions(C).byId.has(hostId)).toBe(true);
+    const protectedFiles = fs.readdirSync(central).map(name => path.join(central, name)).filter(file => fs.lstatSync(file).isFile());
+    const before = protectedFiles.map(file => ({ ino: fs.lstatSync(file).ino, bytes: fs.readFileSync(file) }));
+    const forged = JSON.stringify({ version: 1, id: "forged-answer", runId: "C", recordedAt: 2, text: "PARENT_FORGED" });
+    const artifact = path.join(C, "artifact.txt"), probe = path.join(s.workspace, "cutoff-probe.mjs");
+    fs.writeFileSync(probe, `
+import fs from 'node:fs';
+import path from 'node:path';
+const sibling=${JSON.stringify(sibling)}, C=${JSON.stringify(C)}, central=${JSON.stringify(central)}, forged=${JSON.stringify(forged)};
+const files=${JSON.stringify(protectedFiles)}, codes=[];
+const attempt=operation=>{try{operation();codes.push('ALLOWED');}catch(error){codes.push(error.code);}};
+const row=JSON.stringify({type:'steer',id:${JSON.stringify(forgedId)},message:'forged'})+'\\n';
+fs.mkdirSync(sibling,{mode:0o700});
+for (const directory of [sibling,C]) { fs.writeFileSync(path.join(directory,'final-answer.json'),forged); fs.writeFileSync(path.join(directory,'steer.jsonl'),row); }
+for (const file of files) attempt(()=>{const fd=fs.openSync(file,fs.constants.O_WRONLY);fs.closeSync(fd);});
+attempt(()=>{const fd=fs.openSync(path.join(central,'injected.json'),'wx');fs.closeSync(fd);});
+const fd=fs.openSync(${JSON.stringify(artifact)},'wx');try{fs.writeSync(fd,'nested-allowed');}finally{fs.closeSync(fd);}
+console.log(JSON.stringify({codes}));
+`);
+    const result = confined(probe, s);
+    expect(result.error).toBeUndefined(); expect(result.signal).toBeNull();
+    expect(result.status, result.stderr).toBe(0);
+    expect(JSON.parse(result.stdout.trim()).codes).toEqual([...protectedFiles, central].map(() => "EACCES"));
+    expect(protectedFiles.map(file => ({ ino: fs.lstatSync(file).ino, bytes: fs.readFileSync(file) }))).toEqual(before);
+    expect(fs.readFileSync(path.join(sibling, "final-answer.json"), "utf8")).toContain("PARENT_FORGED");
+    expect(fs.readFileSync(path.join(C, "final-answer.json"), "utf8")).toContain("PARENT_FORGED");
+    const expected = hostAnswer ? { id: hostAnswer.id, text: "HOST_CURRENT_ANSWER" } : undefined;
+    if (expected) expect(readFinalAnswerReceipt(C, "C")).toMatchObject(expected); else expect(readFinalAnswerReceipt(C, "C")).toBeUndefined();
+    withTaskFinalAnswerLock(C, read => { if (expected) expect(read("C")).toMatchObject(expected); else expect(read("C")).toBeUndefined(); });
+    // A late host save never replaces the accepted answer; with none, it is the first answer.
+    expect(saveFinalAnswerReceipt(C, "C", "HOST_LATE").text).toBe(expected ? "HOST_CURRENT_ANSWER" : "HOST_LATE");
+    expect(withLegacyTaskControlDirectories(C, sources => sources.length)).toBe(0);
+    const admissions = readTerminalAdmissions(C);
+    expect(admissions.byId.has(hostId)).toBe(true); expect(admissions.byId.has(forgedId)).toBe(false);
+    expect(fs.readFileSync(artifact, "utf8")).toBe("nested-allowed");
+    console.log(`CURRENT_ONLY_AFTER_BOOTSTRAP: PASS scenario=${scenario} root=${s.root} removal=not-executed`);
   });
 
   it.skipIf(process.platform !== "linux" || !hostedDeletion)("hosted-only: refuses actual control replacement/removal and live-lock deletion", () => {
@@ -426,7 +567,16 @@ console.log('HOSTED_DELETE: PASS actualReplacementAndRemovalRefused=true');
     try { Object.defineProperty(process, "platform", { ...platform, value: "win32" }); mkdirPrivate(control); }
     finally { Object.defineProperty(process, "platform", platform); }
     expect(fs.statSync(control).mode & 0o777).toBe(0o700);
-    expect(readTaskControlFile(run, "missing.json")).toBeUndefined();
+    // Strengthened (Option 2): a manually created control dir has no binding; readers refuse it.
+    expect(() => readTaskControlFile(run, "missing.json")).toThrow(/unbound/i);
+    expect(fs.readdirSync(control)).toEqual([]); // never minted or healed by the reader
+    // Legitimate positive: a fresh absent run through the host constructor, Windows-mode creation.
+    const fresh = path.join(s.root, "emulated-fresh-run");
+    try { Object.defineProperty(process, "platform", { ...platform, value: "win32" }); createHostTaskRun(fresh); }
+    finally { Object.defineProperty(process, "platform", platform); }
+    expect(fs.statSync(fresh).mode & 0o777).toBe(0o700);
+    expect(fs.statSync(taskControlDirectory(fresh)).mode & 0o777).toBe(0o700);
+    expect(readTaskControlFile(fresh, "missing.json")).toBeUndefined();
     const bad = path.join(s.root, "replaced-run"); fs.mkdirSync(bad); fs.mkdirSync(taskControlDirectory(bad), { mode: 0o755 });
     expect(() => readTaskControlFile(bad, "missing.json")).toThrow(/owned private directory/);
     expect(fs.statSync(taskControlDirectory(bad)).mode & 0o777).toBe(0o755); // never silently heal replaced controls

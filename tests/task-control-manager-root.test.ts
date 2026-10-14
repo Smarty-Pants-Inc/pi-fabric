@@ -20,6 +20,15 @@ afterEach(async () => {
 });
 const agents = { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, deniedModels: [] };
 const options = { workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), preparePiModel: async (model: string | undefined) => model, fullCodeMode: false };
+/** Shadow route decision: execution keeps the pin; the ledger lives in the fixture, so receipts are observable. */
+const routed = (ledger: string) => {
+  const pin = { model: "test/fake", effort: "low" };
+  return {
+    routeDecision: { decisionId: `d${Date.now()}`, mode: "shadow", routeClass: "bounded-lookup", parentSessionId: "parent", pin, candidates: [pin],
+      shadowChoice: pin, confidence: null, probability: null, reasonCode: "shadow-choice", latencyMs: 0, ...pin },
+    routeRecord: { ledger, decisionRecorded: true },
+  } as Record<string, unknown>;
+};
 const aliasFixture = () => {
   const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "manager-root-")));
   const real = path.join(base, "real"), alias = path.join(base, "alias");
@@ -27,7 +36,7 @@ const aliasFixture = () => {
   return { base, real, alias };
 };
 
-describe.skipIf(!usable)("manager bootstrap canonicalizes the trusted host run root once", () => {
+describe.skipIf(!usable)("manager bootstrap canonicalizes only its host-created default root once", () => {
   it("launches an ordinary spawn under a symlinked default tmpdir (macOS /var -> /private/var shape)", async () => {
     ensureTaskControlRoot();
     const { real, alias } = aliasFixture();
@@ -44,17 +53,14 @@ describe.skipIf(!usable)("manager bootstrap canonicalizes the trusted host run r
     expect(fs.statSync(taskControlDirectory(runDirectory)).isDirectory()).toBe(true);
   });
 
-  it("launches under an explicit not-yet-existing host root reached through a symlinked ancestor without creating extra paths", async () => {
+  it("refuses an explicit host root reached through a user-owned symlink before creating any paths", async () => {
     ensureTaskControlRoot();
     const { real, alias } = aliasFixture();
     const launch = vi.spyOn(ProcessTransport.prototype, "launch");
     const manager = new AgentManager(process.cwd(), agents, { ...options, runRoot: path.join(alias, "runs") }); managers.push(manager);
-    const result = await manager.run({ task: "ordinary spawn", transport: "process" });
-    expect(result.status).toBe("completed");
-    expect(launch).toHaveBeenCalledOnce();
-    expect(fs.readdirSync(real)).toEqual(["runs"]);
-    const runDirectory = path.join(real, "runs", result.id);
-    expect(fs.statSync(taskControlDirectory(runDirectory)).isDirectory()).toBe(true);
+    await expect(manager.run({ task: "must not launch", transport: "process" })).rejects.toThrow(/link alias/);
+    expect(launch).not.toHaveBeenCalled();
+    expect(fs.readdirSync(real)).toEqual([]);
   });
 
   it("still refuses a child-planted alias BELOW the trusted root (inherited nested root) and leaves the victim untouched", async () => {
@@ -74,5 +80,34 @@ describe.skipIf(!usable)("manager bootstrap canonicalizes the trusted host run r
     const afterStat = fs.lstatSync(path.join(victim, "nested"));
     expect([afterStat.ino, afterStat.mtimeMs]).toEqual([beforeStat.ino, beforeStat.mtimeMs]);
     expect(fs.readFileSync(path.join(victim, "nested", "marker"), "utf8")).toBe("VICTIM");
+  });
+
+  it("ROUTED inherited root through a symlink fails before the route receipt, first write or launch (repeatable)", async () => {
+    ensureTaskControlRoot();
+    const { base, real } = aliasFixture();
+    const victim = path.join(base, "victim"); fs.mkdirSync(victim, { mode: 0o700 });
+    fs.symlinkSync(victim, path.join(real, "planted"), "dir");
+    vi.stubEnv("PI_FABRIC_RUN_ROOT", path.join(real, "planted"));
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    const manager = new AgentManager(process.cwd(), { ...agents, maxConcurrent: 1 }, options); managers.push(manager);
+    for (let attempt = 0; attempt < 2; attempt++) {
+      await expect(manager.run({ task: "must not launch", transport: "process", ...routed(path.join(base, "ledger.jsonl")) } as never))
+        .rejects.toThrow(/link alias/);
+    }
+    expect(launch).not.toHaveBeenCalled();
+    expect(fs.readdirSync(victim)).toEqual([]);
+    expect(fs.existsSync(path.join(base, "ledger.jsonl"))).toBe(false);
+  });
+
+  it("ROUTED spawn under a legitimate trusted host root still launches and writes its route receipt there", async () => {
+    ensureTaskControlRoot();
+    const { base, real } = aliasFixture();
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    const manager = new AgentManager(process.cwd(), agents, { ...options, runRoot: path.join(real, "runs") }); managers.push(manager);
+    const result = await manager.run({ task: "ordinary spawn", transport: "process", ...routed(path.join(base, "ledger.jsonl")) } as never);
+    expect(result.status).toBe("completed");
+    expect(launch).toHaveBeenCalledOnce();
+    const runDirectory = path.join(real, "runs", result.id);
+    expect(fs.statSync(taskControlDirectory(runDirectory)).isDirectory()).toBe(true);
   });
 });

@@ -7,6 +7,7 @@ import type { FabricWritePolicy } from "../agents/write-guard.js";
 import { createHash, randomUUID } from "node:crypto";
 import { withExclusiveFileLock } from "../core/atomic-write.js";
 import { openPrivateDir, writeArchiveFile } from "../storage/private-dir.js";
+import { assertTaskRunPathUnaliased } from "./task-run-path.js";
 
 export interface FinalAnswerReceipt {
   version: 1;
@@ -24,7 +25,7 @@ export class FabricTaskControlDirectoryError extends Error {
 
 /** Current layout marker written by hosts into run status (advisory downgrade fence only). */
 export const TASK_CONTROL_LAYOUT = "central-v1" as const;
-/** Old layout: `<run>.ctl` sibling. Read-only compatibility. */
+/** Old layout: `<run>.ctl` sibling. Never an authority source; protected snapshots only. */
 export const legacyTaskControlSibling = (runDirectory: string): string => path.resolve(runDirectory) + ".ctl";
 
 const inside = (root: string, target: string): boolean => target === root || target.startsWith(root.endsWith(path.sep) ? root : root + path.sep);
@@ -105,30 +106,14 @@ export const ensureTaskControlRoot = (): string => {
   return root;
 };
 /**
- * Refuse a run path with ANY symlink component (leaf or nested ancestor), by an lstat
- * walk from `/`. Missing trailing components (a future run path) are accepted: they
- * cannot alias until created, and every existing prefix is a real directory/entry.
- */
-const assertNoLinkComponent = (lexical: string): void => {
-  const parts = lexical.split(path.sep).filter(Boolean);
-  let current = path.parse(lexical).root;
-  for (const part of parts) {
-    current = path.join(current, part);
-    let stat: fs.Stats;
-    try { stat = fs.lstatSync(current); }
-    catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return; throw error; }
-    if (stat.isSymbolicLink()) throw new FabricTaskControlDirectoryError(`Task run path ${lexical} must not traverse a link alias at ${current}`);
-  }
-};
-/**
  * Stable contract: the central control destination for a run. Deterministic: the
  * lexical run id (basename) plus a digest of the UNRESOLVED lexical run path (never
  * realpath), so archives that reuse a run id under another path never collide, and a
- * planted symlink alias cannot map onto another run's controls (it is refused).
+ * planted alias (symlink/junction/reparse) cannot map onto another run's controls.
  */
 export const taskControlDirectory = (runDirectory: string): string => {
   const lexical = path.resolve(runDirectory);
-  assertNoLinkComponent(lexical);
+  assertTaskRunPathUnaliased(lexical, message => new FabricTaskControlDirectoryError(message));
   const id = path.basename(lexical).replace(/[^A-Za-z0-9._-]/g, "_").replace(/^\.+/, "_").slice(0, 96) || "_";
   const digest = createHash("sha256").update(lexical).digest("hex").slice(0, 32);
   return path.join(taskControlRoot(), `${id}--${digest}`);
@@ -182,94 +167,90 @@ const entryExists = (entry: string): boolean => {
 };
 const centralExists = (runDirectory: string): boolean => entryExists(taskControlDirectory(runDirectory));
 const oldSiblingExists = (runDirectory: string): boolean => entryExists(legacyTaskControlSibling(runDirectory));
-/** Old sibling-v1 controls: validated private, read-only (never a write/lock namespace). */
+/** Old sibling-v1 directory shape check (archive discovery only); NEVER a read source. */
 const withOldSibling = <T>(runDirectory: string, operation: (directory: string, fd: number) => T): T =>
   withDirectory(legacyTaskControlSibling(runDirectory), true, operation);
-const runLayout = (runDirectory: string): unknown => {
-  try {
-    const value = readTaskRunStatus<Record<string, unknown>>(runDirectory);
-    return value && typeof value === "object" && !Array.isArray(value) ? value.taskControlLayout : undefined;
-  } catch { return undefined; }
-};
 export const readTaskRunStatus = <T>(runDirectory: string): T => withDirectory(path.resolve(runDirectory), false,
   directory => JSON.parse(readBoundedControlFile(path.join(directory, "status.json"), 1024 * 1024)) as T);
-/** Status is advisory: it may EXCLUDE old runs, never authorize fallback under a sibling. */
-const legacyRecord = (runDirectory: string): boolean => {
-  const value = readTaskRunStatus<Record<string, unknown>>(runDirectory);
-  // Old retention records may omit route identity, and archives keep the
-  // original id under an alias. This selects READ compatibility only; native
-  // exit/identity predicates still decide collection. A layout field always
-  // excludes fallback, and an existing sibling requires host-owned authority.
-  return !!value && typeof value === "object" && !Array.isArray(value) &&
-    ["running", "completed", "failed", "stopped", "timed_out"].includes(String(value.status)) && !("taskControlLayout" in value);
+
+// ---- Protected v2 authority (DELTA-SEC-01) ----------------------------------------------
+type Identity = Readonly<{ dev: string; ino: string }>;
+export type LegacyKind = "in-run" | "sibling";
+/** A protected snapshot layer (NEVER a raw directory) plus its host-captured origin. */
+export type ProtectedLegacySource = { directory: string; fd: number; origin: { kind: LegacyKind; dev: string; ino: string } };
+/** Option 2: current-only authority. `snapshot` is ALWAYS null; any other value refuses. */
+type BindingV2 = { version: 2; runId: string; dev: string; ino: string; snapshot: null };
+const BINDING = ".legacy-read.json", SNAPSHOT = ".legacy-snapshot";
+const unsafe = (message: string): never => { throw new FabricTaskControlDirectoryError(`FABRIC_LEGACY_SNAPSHOT_REQUIRED: ${message}`); };
+/** Reserved protected metadata: public write/remove never touches these names. */
+const assertPublicControlName = (relative: string): void => {
+  const first = relative.split(/[\\/]/)[0];
+  if (first === BINDING || first === SNAPSHOT) unsafe("Protected task control metadata is not publicly writable");
 };
-const legacyIdentity = (runDirectory: string): { version: 1; runId: string; dev: string; ino: string } => {
-  const stat = fs.lstatSync(runDirectory, { bigint: true });
-  return { version: 1, runId: path.basename(runDirectory), dev: String(stat.dev), ino: String(stat.ino) };
+const identityOf = (stat: fs.BigIntStats): Identity => ({ dev: String(stat.dev), ino: String(stat.ino) });
+const canonicalId = (value: unknown): value is string => typeof value === "string" && /^(0|[1-9][0-9]*)$/.test(value);
+const exactKeys = (value: unknown, keys: string[]): value is Record<string, unknown> =>
+  !!value && typeof value === "object" && !Array.isArray(value) && Object.keys(value).sort().join() === [...keys].sort().join();
+const sameId = (a: Identity, b: Identity): boolean => a.dev === b.dev && a.ino === b.ino;
+/** Strict v2 current-only: v1, unknown versions/keys and ANY non-null snapshot refuse. */
+const parseBinding = (text: string): BindingV2 => {
+  let value: unknown;
+  try { value = JSON.parse(text); } catch { return unsafe("Malformed protected task control binding"); }
+  if (!exactKeys(value, ["version", "runId", "dev", "ino", "snapshot"]) || value.version !== 2 || typeof value.runId !== "string" ||
+      !canonicalId(value.dev) || !canonicalId(value.ino)) return unsafe("Unsupported or unbound task control binding; legacy history refused");
+  if (value.snapshot !== null) return unsafe("Non-null legacy snapshot binding is not supported; refusing (bytes preserved)");
+  return value as unknown as BindingV2;
 };
-const hasLegacyAuthority = (runDirectory: string, directory: string): boolean => {
+const pinnedPath = (fd: number, fallback: string): string => process.platform === "linux" ? `/proc/self/fd/${fd}` : fallback;
+/** Open a protected private child directory under a held parent; check exact identity. */
+const openHeldChild = (parent: string, name: string, expected?: Identity): number => {
+  const fd = fs.openSync(path.join(parent, name), fs.constants.O_RDONLY | (fs.constants.O_DIRECTORY ?? 0) | (fs.constants.O_NOFOLLOW ?? 0));
   try {
-    const value = JSON.parse(readBoundedControlFile(path.join(directory, ".legacy-read.json"), MAX_TASK_CONTROL_BYTES));
-    return JSON.stringify(value) === JSON.stringify(legacyIdentity(runDirectory));
-  } catch { return false; }
+    const stat = fs.fstatSync(fd, { bigint: true });
+    if (!stat.isDirectory() || (process.getuid && stat.uid !== BigInt(process.getuid())) || (process.platform !== "win32" && (stat.mode & 0o077n) !== 0n) ||
+        (expected && !sameId(identityOf(stat), expected))) unsafe("Protected task control directory identity mismatch");
+    return fd;
+  } catch (error) { fs.closeSync(fd); throw error; }
 };
-/** Exported selection for retention. Validate even when the selected file is missing. */
+const runIdentity = (runDirectory: string): Identity => identityOf(fs.lstatSync(path.resolve(runDirectory), { bigint: true }));
+const fsyncFd = (fd: number | undefined): void => { if (fd !== undefined && process.platform !== "win32") fs.fsyncSync(fd); };
+const closeAll = (fds: number[]): void => { for (const fd of fds) { try { fs.closeSync(fd); } catch { /* closing a partial batch */ } } };
 /**
- * Read selection, central first. Then, only for runs NOT marked central-v1, a
- * validated old sibling-v1 directory, then the in-run legacy layout. Fallback is
- * read-only and never authorizes writes; a marked run with missing controls refuses.
+ * The ONLY historical source selection: a validated current central v2 `snapshot:null`
+ * binding for the current run lifetime. Missing, v1, unsupported, non-null or damaged
+ * binding, or a stray `.legacy-snapshot`, is an unsafe error (bytes preserved), never
+ * "no sources". Valid -> always `[]` (the typed origin shape is retained for readers).
+ * Validation only: no per-read fsync.
  */
+export const withLegacyTaskControlDirectories = <T>(runDirectory: string, operation: (sources: ProtectedLegacySource[]) => T): T => {
+  if (!centralExists(runDirectory)) unsafe("Missing protected task control directory; legacy fallback refused");
+  return withTaskControlDirectory(runDirectory, central => {
+    let text: string;
+    try { text = readBoundedControlFile(path.join(central, BINDING), MAX_TASK_CONTROL_BYTES); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return unsafe("Unbound central task controls; refusing (bytes preserved)");
+      throw error;
+    }
+    const binding = parseBinding(text);
+    if (binding.runId !== path.basename(path.resolve(runDirectory)) || !sameId(binding, runIdentity(runDirectory))) unsafe("Task control binding does not match the current run lifetime");
+    if (entryExists(path.join(central, SNAPSHOT))) unsafe("Stray protected legacy snapshot present; refusing (bytes preserved)");
+    return operation([]);
+  });
+};
+/** Read selection: the validated current central directory ONLY; never a raw fallback. */
 export const taskControlReadDirectory = (runDirectory: string): string => {
-  if (centralExists(runDirectory)) return withTaskControlDirectory(runDirectory, () => taskControlDirectory(runDirectory));
-  if (runLayout(runDirectory) !== TASK_CONTROL_LAYOUT && oldSiblingExists(runDirectory)) {
-    return withOldSibling(runDirectory, () => legacyTaskControlSibling(runDirectory));
-  }
-  if (legacyRecord(runDirectory)) return path.resolve(runDirectory);
-  throw new FabricTaskControlDirectoryError("Missing protected task control directory; legacy fallback refused");
+  if (!centralExists(runDirectory)) unsafe("Missing protected task control directory; legacy fallback refused");
+  withLegacyTaskControlDirectories(runDirectory, () => undefined);
+  return taskControlDirectory(runDirectory);
 };
 export const withTaskControlReadDirectory = <T>(runDirectory: string, operation: (directory: string, fd: number) => T): T => {
-  const directory = taskControlReadDirectory(runDirectory);
-  return withDirectory(directory, directory !== path.resolve(runDirectory), operation);
+  taskControlReadDirectory(runDirectory);
+  return withTaskControlDirectory(runDirectory, operation);
 };
-/**
- * Read-only legacy source for a run whose central controls were bootstrapped from an
- * old layout: the validated old sibling if present, else the in-run directory.
- * Authority comes from the host-written central `.legacy-read.json`, never status.
- */
-type LegacySource = { directory: string; privateMode: boolean };
-/**
- * Ordered read-only legacy sources, NEWEST first (overlay order after the selected
- * directory): old sibling-v1, then in-run. Each step needs host-written inode-bound
- * `.legacy-read.json` authority from the layer above it; status never authorizes it.
- */
-const legacySources = (runDirectory: string): LegacySource[] => {
-  const run = path.resolve(runDirectory);
-  const sibling = { directory: legacyTaskControlSibling(run), privateMode: true }, inRun = { directory: run, privateMode: false };
-  const siblingAdmitsInRun = (): boolean => withOldSibling(run, directory => hasLegacyAuthority(run, directory));
-  if (centralExists(run)) {
-    if (!withTaskControlDirectory(run, directory => hasLegacyAuthority(run, directory))) return [];
-    // Bootstrapped from sibling-v1: the old sibling, plus the in-run rows it was itself
-    // bootstrapped over (tri-layout); else bootstrapped directly from in-run legacy.
-    if (!oldSiblingExists(run)) return [inRun];
-    return siblingAdmitsInRun() ? [sibling, inRun] : [sibling];
-  }
-  if (runLayout(run) === TASK_CONTROL_LAYOUT) return [];
-  // Un-bootstrapped old sibling is the primary read source; its own host-written
-  // legacy binding (old sibling-over-legacy bootstrap) still admits in-run rows.
-  if (oldSiblingExists(run)) return siblingAdmitsInRun() ? [inRun] : [];
-  return legacyRecord(run) ? [inRun] : [];
-};
-/** Shared ordered-source helper: hold every eligible legacy source pinned at once (newest first). */
-export const withLegacyTaskControlDirectories = <T>(runDirectory: string, operation: (sources: Array<{ directory: string; fd: number }>) => T): T => {
-  const sources = legacySources(runDirectory);
-  const hold = (index: number, held: Array<{ directory: string; fd: number }>): T => index === sources.length ? operation(held)
-    : withDirectory(sources[index]!.directory, sources[index]!.privateMode, (directory, fd) => hold(index + 1, [...held, { directory, fd }]));
-  return hold(0, []);
-};
-/** Visit every eligible legacy source in order; returns one result per visited source. */
+/** Visit every protected source in order; returns one result per visited source. */
 export const visitLegacyTaskControlDirectories = <T>(runDirectory: string, operation: (directory: string, fd: number) => T): T[] =>
   withLegacyTaskControlDirectories(runDirectory, sources => sources.map(source => operation(source.directory, source.fd)));
-/** First source where `operation` does not raise ENOENT (single-file lookups). */
+/** First protected source where `operation` does not raise ENOENT (single-file lookups). */
 const firstLegacy = <T>(runDirectory: string, operation: (directory: string) => T): T | undefined =>
   withLegacyTaskControlDirectories(runDirectory, sources => {
     let missing: unknown;
@@ -280,65 +261,145 @@ const firstLegacy = <T>(runDirectory: string, operation: (directory: string) => 
     if (missing) throw missing;
     return undefined;
   });
-/** Compatibility: the newest legacy source only. Prefer the ordered visitor. */
+/** Compatibility: the newest protected source only. Prefer the ordered visitor. */
 export const withLegacyTaskControlDirectory = <T>(runDirectory: string, operation: (directory: string, fd: number) => T): T | undefined =>
   withLegacyTaskControlDirectories(runDirectory, sources => sources.length ? operation(sources[0]!.directory, sources[0]!.fd) : undefined);
-const createCentral = (runDirectory: string, legacy: boolean): void => {
+
+/**
+ * Whole-namespace publication. Under the per-destination lock in the held protected root,
+ * exclusively create ONE deterministic `<dest>.stage` (an existing stage is stale custody:
+ * refused, never adopted or deleted), let `build` fill it, write the v2 binding LAST,
+ * fsync, recheck the run identity, rename into the ABSENT destination, fsync the root,
+ * then revalidate. Any failure preserves the stage and every raw byte.
+ */
+const publishCentral = (runDirectory: string, build: (stage: string) => BindingV2): void => {
   ensureTaskControlRoot();
-  const control = taskControlDirectory(runDirectory), parent = openPrivateDir(path.dirname(control), path.dirname(control));
+  const control = taskControlDirectory(runDirectory), base = path.basename(control), stageName = `${base}.stage`;
+  const root = openPrivateDir(path.dirname(control), path.dirname(control));
   try {
-    const child = path.join(parent.path, path.basename(control));
-    let created = false;
-    try { fs.mkdirSync(child, { mode: 0o700 }); created = true; fs.chmodSync(child, 0o700); }
-    catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
-    withTaskControlDirectory(runDirectory, (_directory, fd) => { if (process.platform !== "win32") fs.fsyncSync(fd); });
-    if (created && legacy) writeTaskControlJson(runDirectory, ".legacy-read.json", legacyIdentity(runDirectory));
-    if (parent.fd !== undefined) fs.fsyncSync(parent.fd);
-  } finally { parent.close(); }
+    withExclusiveFileLock({ directory: root.path, lockName: `.${base}.lock`, attempts: 200, delayMs: 5, timeoutMessage: "Task control publication lock timed out" }, () => {
+      if (entryExists(path.join(root.path, base))) unsafe("Task control destination already exists; refusing to replace");
+      try { fs.mkdirSync(path.join(root.path, stageName), { mode: 0o700 }); }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "EEXIST") unsafe("Outstanding task control stage exists; refusing (custody preserved)");
+        throw error;
+      }
+      const stageFd = openHeldChild(root.path, stageName);
+      try {
+        const stage = pinnedPath(stageFd, path.join(root.path, stageName));
+        const binding = build(stage);
+        const bytes = Buffer.from(JSON.stringify(binding));
+        if (bytes.length > MAX_TASK_CONTROL_BYTES) unsafe("Task control binding exceeds its byte bound");
+        if (!writeArchiveFile({ path: stage, fd: stageFd, close() {} }, BINDING, { bytes }, true)) unsafe("Refusing unsafe binding publication");
+        fsyncFd(stageFd);
+        if (!sameId(binding, runIdentity(runDirectory))) unsafe("Run identity changed during task control publication");
+        if (entryExists(path.join(root.path, base))) unsafe("Task control destination appeared during publication");
+        fs.renameSync(path.join(root.path, stageName), path.join(root.path, base));
+      } finally { fs.closeSync(stageFd); }
+      fsyncFd(root.fd);
+    });
+  } finally { root.close(); }
+  withLegacyTaskControlDirectories(runDirectory, () => undefined);
+};
+const nullBinding = (runDirectory: string): BindingV2 =>
+  ({ version: 2, runId: path.basename(path.resolve(runDirectory)), ...runIdentity(runDirectory), snapshot: null });
+/** Raw entries that make an uninitialized run "unknown legacy" rather than fresh blank. */
+const RAW_HISTORY = ["status.json", "steer.jsonl", "final-answer.json", "terminal-controls", "terminal-notices", BINDING, SNAPSHOT];
+/** PRIVATE: null authority, called ONLY by createHostTaskRun after its exclusive mkdir. */
+const createHostTaskControlDirectory = (run: string, allocated: Identity): void => {
+  if (centralExists(run)) unsafe("Task control destination already exists; fresh host allocation refused");
+  withDirectory(run, false, () => undefined);
+  if (oldSiblingExists(run) || RAW_HISTORY.some(name => entryExists(path.join(run, name)))) {
+    unsafe("Unknown legacy task history; refusing (bytes preserved)");
+  }
+  publishCentral(run, () => {
+    const binding = nullBinding(run);
+    if (!sameId(binding, allocated)) unsafe("Run identity changed after exclusive host allocation");
+    return binding;
+  });
 };
 /**
- * Host bootstrap only, into the central namespace. Never recreate missing controls for
- * a central-v1-marked run, nor for a sibling-v1 run whose old sibling is missing.
- * An unmarked legacy run or an intact sibling-v1 run gains central controls plus a
- * host-owned `.legacy-read.json` binding so its old rows stay readable.
+ * Named host producer for the manager's allocation seam: call it right after the early
+ * path guard and BEFORE prepareRouteDispatch or any route/status/custody/task write.
+ * Authority comes from THIS process's successful EXCLUSIVE mkdir of the leaf through the
+ * held parent (Linux: the held /proc fd path; macOS: checked baseline walk; Windows: the
+ * inherited fail-closed boundary outside), not from the directory looking blank. EEXIST
+ * (or any existing sibling/central/stage) refuses and preserves bytes. Held vs named
+ * parent dev/ino and the named run identity are verified before publishing current-only
+ * `snapshot:null` central controls. A later EEXIST-tolerant mkdirPrivate is harmless.
+ */
+export const createHostTaskRun = (runDirectory: string): void => {
+  const run = path.resolve(runDirectory), parent = path.dirname(run), leaf = path.basename(run);
+  taskControlDirectory(run); // shared alias walk before any write
+  // A trusted explicit or nested root may not exist yet; create its validated
+  // ancestry, then exclusively allocate only the run leaf through the held parent.
+  openPrivateDir(parent, parent).close();
+  const allocated = withDirectory(parent, false, (held, parentFd): Identity => {
+    const target = path.join(held, leaf);
+    try { fs.mkdirSync(target, { mode: 0o700 }); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") unsafe("Run directory already exists; exclusive host allocation refused");
+      throw error;
+    }
+    fs.chmodSync(target, 0o700);
+    const leafFd = fs.openSync(target, fs.constants.O_RDONLY | (fs.constants.O_DIRECTORY ?? 0) | (fs.constants.O_NOFOLLOW ?? 0));
+    try {
+      const created = fs.fstatSync(leafFd, { bigint: true });
+      if (!created.isDirectory() || (process.getuid && created.uid !== BigInt(process.getuid()))) unsafe("Allocated run is not an owned directory");
+      fsyncFd(parentFd);
+      if (!sameId(identityOf(fs.fstatSync(parentFd, { bigint: true })), identityOf(fs.lstatSync(parent, { bigint: true })))) {
+        unsafe("Run parent changed during exclusive host allocation");
+      }
+      const identity = identityOf(created);
+      if (!sameId(identity, runIdentity(run))) unsafe("Named run does not match the exclusively allocated directory");
+      return identity;
+    } finally { fs.closeSync(leafFd); }
+  });
+  createHostTaskControlDirectory(run, allocated);
+};
+/**
+ * Validation ONLY: existing central with a valid v2 binding. Missing central, unbound,
+ * v1 or unsupported binding refuses with every byte preserved; never mints authority.
  */
 export const initializeTaskControlDirectory = (runDirectory: string): void => {
-  if (centralExists(runDirectory)) { withTaskControlDirectory(runDirectory, () => undefined); return; }
-  let legacy = false;
-  try {
-    const layout = readTaskRunStatus<Record<string, unknown>>(runDirectory)?.taskControlLayout;
-    if (layout === "sibling-v1" && oldSiblingExists(runDirectory)) { withOldSibling(runDirectory, () => undefined); legacy = true; }
-    else {
-      legacy = legacyRecord(runDirectory);
-      if (!legacy) throw new FabricTaskControlDirectoryError("Missing protected task control directory; refusing recreation");
-    }
-  } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
-  createCentral(runDirectory, legacy);
+  if (!centralExists(runDirectory)) unsafe("Missing protected task control directory; refusing recreation (bytes preserved)");
+  withLegacyTaskControlDirectories(runDirectory, () => undefined);
 };
 /**
- * Archive publication ONLY: create (0700) or validate existing central controls for an
- * archive destination, ignoring its copied (possibly central-v1-marked) status. The
- * archive path identity differs from the live run's, so this never revives or aliases
- * a live run's missing controls. Live runs must use initializeTaskControlDirectory.
+ * Archive publication ONLY: the archive's OWN fresh `snapshot:null` authority (copied
+ * status allowed); never copies a live binding. Existing destination: validation only.
  */
-export const createArchiveTaskControlDirectory = (archiveRunDirectory: string): void => createCentral(archiveRunDirectory, false);
-/** Atomic publication stays on the held namespace; no realpath escape or /proc ancestor fsync. */
-export const writeTaskControlJson = (runDirectory: string, relative: string, value: unknown): void => withTaskControlDirectory(runDirectory, directory =>
-  withControlPath(directory, relative, true, (_file, parent, fd) => {
-    const bytes = Buffer.from(JSON.stringify(value));
-    if (bytes.length > MAX_TASK_CONTROL_BYTES) throw new FabricTaskControlDirectoryError("Task control file exceeds its byte bound");
-    if (!writeArchiveFile({ path: parent, fd, close() {} }, path.basename(relative), { bytes }, true)) {
-      throw new FabricTaskControlDirectoryError("Refusing replacement of unsafe task control file");
-    }
-  }));
+export const createArchiveTaskControlDirectory = (archiveRunDirectory: string): void => {
+  if (centralExists(archiveRunDirectory)) { withLegacyTaskControlDirectories(archiveRunDirectory, () => undefined); return; }
+  withDirectory(path.resolve(archiveRunDirectory), false, () => undefined);
+  publishCentral(archiveRunDirectory, () => nullBinding(archiveRunDirectory));
+};
 
-/** Cleanup never mutates a legacy source and never follows a linked subdirectory. */
-export const removeTaskControlFile = (runDirectory: string, relative: string): void => withTaskControlDirectory(runDirectory, directory => {
-  try { withControlPath(directory, relative, false, file => {
-    const fd = openTaskControlFile(file); fs.closeSync(fd);
-    fs.rmSync(file);
-  }); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
-});
+/** Atomic publication stays on the held namespace; no realpath escape or /proc ancestor fsync. */
+export const writeTaskControlJson = (runDirectory: string, relative: string, value: unknown): void => {
+  assertPublicControlName(relative);
+  withLegacyTaskControlDirectories(runDirectory, () => undefined);
+  withTaskControlDirectory(runDirectory, directory =>
+    withControlPath(directory, relative, true, (_file, parent, fd) => {
+      const bytes = Buffer.from(JSON.stringify(value));
+      if (bytes.length > MAX_TASK_CONTROL_BYTES) throw new FabricTaskControlDirectoryError("Task control file exceeds its byte bound");
+      if (!writeArchiveFile({ path: parent, fd, close() {} }, path.basename(relative), { bytes }, true)) {
+        throw new FabricTaskControlDirectoryError("Refusing replacement of unsafe task control file");
+      }
+    }));
+};
+
+/** Cleanup never mutates protected metadata/snapshots and never follows a linked subdirectory. */
+export const removeTaskControlFile = (runDirectory: string, relative: string): void => {
+  assertPublicControlName(relative);
+  withLegacyTaskControlDirectories(runDirectory, () => undefined);
+  withTaskControlDirectory(runDirectory, directory => {
+    try { withControlPath(directory, relative, false, file => {
+      const fd = openTaskControlFile(file); fs.closeSync(fd);
+      fs.rmSync(file);
+    }); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+  });
+};
 
 /**
  * Compatibility filter ONLY for validated old sibling-v1 `.ctl` entries in run trees.
@@ -424,7 +485,7 @@ export const withTaskControlSubdirectory = <T>(directory: string, relative: stri
 /** The returned FILE fd remains valid after the directory callback closes; no fd path escapes. */
 export const openLegacyTaskControlFile = (runDirectory: string, relative: string): number | undefined =>
   firstLegacy(runDirectory, directory => withControlPath(directory, relative, false, openTaskControlFile));
-/** Every legacy source's copy of `relative` (newest first); missing copies are skipped. */
+/** Every protected source's copy of `relative` (newest first); missing copies are skipped. */
 export const openLegacyTaskControlFiles = (runDirectory: string, relative: string): number[] => {
   // A later source may fail (unsafe/FIFO/etc.) after earlier fds opened: close them
   // all before rethrowing; on success every fd is owned by the caller.
@@ -438,7 +499,7 @@ export const openLegacyTaskControlFiles = (runDirectory: string, relative: strin
     });
     return fds;
   } catch (error) {
-    for (const fd of fds) { try { fs.closeSync(fd); } catch { /* best-effort cleanup */ } }
+    closeAll(fds);
     throw error;
   }
 };
@@ -469,47 +530,28 @@ export const readTaskControlJson = <T>(runDirectory: string, relative: string, m
   const contents = readTaskControlFile(runDirectory, relative, maxBytes);
   return contents === undefined ? undefined : JSON.parse(contents) as T;
 };
-const readReceipt = (directory: string, runId: string, legacyRun?: string): FinalAnswerReceipt | undefined => {
-  let value: FinalAnswerReceipt | undefined;
+const parseReceipt = (directory: string, runId: string): FinalAnswerReceipt | undefined => {
   try {
     const parsed = JSON.parse(readBoundedControlFile(path.join(directory, "final-answer.json"), MAX_FINAL_ANSWER_BYTES));
     if (parsed?.version === 1 && parsed.runId === runId && typeof parsed.id === "string" && parsed.id.length > 0 &&
-        Number.isSafeInteger(parsed.recordedAt) && parsed.recordedAt > 0 && typeof parsed.text === "string") value = parsed;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT" && legacyRun && hasLegacyAuthority(legacyRun, directory)) {
-      // Exactly one legacy result may establish finality; conflicting copies never do.
-      return withLegacyTaskControlDirectories(legacyRun, sources => {
-        const present = legacyAnswerDirectories(sources);
-        return present.length === 1 ? readReceipt(present[0]!, runId) : undefined;
-      });
-    }
-    /* Missing or invalid bounded receipts never establish finality. */
-  }
-  // Central answer plus ANY eligible legacy answer is a duplicate: never final.
-  // Checked outside the try so a legacy-source ENOENT cannot reach the fallback.
-  if (value && legacyRun && withLegacyTaskControlDirectories(legacyRun, sources => legacyAnswerDirectories(sources).length) > 0) return undefined;
-  return value;
+        Number.isSafeInteger(parsed.recordedAt) && parsed.recordedAt > 0 && typeof parsed.text === "string") return parsed;
+  } catch { /* Missing or invalid bounded receipts never establish finality. */ }
+  return undefined;
 };
-/** Distinct directories (by dev/ino, so selected in-run == legacy in-run counts once) holding an answer. */
-const answerSourceCount = (runDirectory: string): number => {
-  const keys = new Set<string>();
-  const add = (directory: string, fd: number): void => {
-    if (!fs.lstatSync(path.join(directory, "final-answer.json"), { throwIfNoEntry: false })) return;
-    const stat = fs.fstatSync(fd, { bigint: true });
-    keys.add(`${stat.dev}:${stat.ino}`);
-  };
-  withTaskControlReadDirectory(runDirectory, add);
-  withLegacyTaskControlDirectories(runDirectory, sources => { for (const source of sources) add(source.directory, source.fd); });
-  return keys.size;
-};
+const hasAnswerEntry = (directory: string): boolean => !!fs.lstatSync(path.join(directory, "final-answer.json"), { throwIfNoEntry: false });
+/**
+ * Finality over the held central directory plus validated protected sources: exactly ONE
+ * source may hold an answer entry (identical/malformed duplicates refuse); a malformed
+ * single entry never falls back to another source.
+ */
+const readReceipt = (directory: string, runId: string, runDirectory: string): FinalAnswerReceipt | undefined =>
+  withLegacyTaskControlDirectories(runDirectory, sources => {
+    const present = [directory, ...sources.map(source => source.directory)].filter(hasAnswerEntry);
+    return present.length === 1 ? parseReceipt(present[0]!, runId) : undefined;
+  });
 export const readFinalAnswerReceipt = (runDirectory: string, runId: string): FinalAnswerReceipt | undefined => {
   try {
-    const value = readTaskControlJson<FinalAnswerReceipt>(runDirectory, "final-answer.json", MAX_FINAL_ANSWER_BYTES);
-    if (value?.version === 1 && value.runId === runId && typeof value.id === "string" && value.id.length > 0 &&
-        Number.isSafeInteger(value.recordedAt) && value.recordedAt > 0 && typeof value.text === "string" &&
-        // Exactly ONE distinct source (selected + eligible legacy layers) may hold an
-        // answer; central+legacy or sibling+in-run duplicates never establish finality.
-        answerSourceCount(runDirectory) === 1) return value;
+    return withTaskControlReadDirectory(runDirectory, directory => readReceipt(directory, runId, runDirectory));
   } catch (error) {
     if (error instanceof FabricTaskControlDirectoryError && !/byte bound|regular file/.test(error.message)) throw error;
     // Malformed/unsafe receipts never establish finality or authorize fallback.
@@ -517,17 +559,15 @@ export const readFinalAnswerReceipt = (runDirectory: string, runId: string): Fin
   return undefined;
 };
 
-/** Pinned legacy sources (all layers) that hold a final-answer entry. */
-const legacyAnswerDirectories = (sources: Array<{ directory: string }>): string[] => sources
-  .filter(source => !!fs.lstatSync(path.join(source.directory, "final-answer.json"), { throwIfNoEntry: false }))
-  .map(source => source.directory);
 const locked = <T>(directory: string, operation: () => T): T => withExclusiveFileLock({
   directory, lockName: ".task-final-answer.lock", attempts: 200, delayMs: 5,
   timeoutMessage: "Task final-answer publication/injection lock timed out",
 }, operation);
 /** Reader and lock use the SAME pinned host-owned directory. */
-export const withTaskFinalAnswerLock = <T>(runDirectory: string, operation: (read: (runId: string) => FinalAnswerReceipt | undefined) => T): T =>
-  withTaskControlDirectory(runDirectory, directory => locked(directory, () => operation(runId => readReceipt(directory, runId, runDirectory))));
+export const withTaskFinalAnswerLock = <T>(runDirectory: string, operation: (read: (runId: string) => FinalAnswerReceipt | undefined) => T): T => {
+  withLegacyTaskControlDirectories(runDirectory, () => undefined);
+  return withTaskControlDirectory(runDirectory, directory => locked(directory, () => operation(runId => readReceipt(directory, runId, runDirectory))));
+};
 
 /** Serialize, size-check and fsync staging BEFORE the publication/injection lock. */
 export const saveFinalAnswerReceipt = (runDirectory: string, runId: string, text: string): FinalAnswerReceipt => {
@@ -535,6 +575,7 @@ export const saveFinalAnswerReceipt = (runDirectory: string, runId: string, text
   const receipt: FinalAnswerReceipt = { version: 1, id: randomUUID(), runId, recordedAt: Date.now(), text };
   const contents = JSON.stringify(receipt);
   if (Buffer.byteLength(contents) > MAX_FINAL_ANSWER_BYTES) throw new RangeError("Final answer exceeds the 8 MiB receipt bound");
+  withLegacyTaskControlDirectories(runDirectory, () => undefined);
   return withTaskControlDirectory(runDirectory, (directory, directoryFd) => {
     const temporary = path.join(directory, `.final-answer.${process.pid}.${receipt.id}.tmp`);
     const fd = fs.openSync(temporary, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | (fs.constants.O_NOFOLLOW ?? 0), 0o600);
@@ -542,9 +583,8 @@ export const saveFinalAnswerReceipt = (runDirectory: string, runId: string, text
     try {
       const published = locked(directory, () => {
         const file = path.join(directory, "final-answer.json");
-        // Never replace an existing result in ANY legacy layer (old sibling and in-run).
-        if (fs.lstatSync(file, { throwIfNoEntry: false }) || (hasLegacyAuthority(runDirectory, directory) &&
-            withLegacyTaskControlDirectories(runDirectory, sources => legacyAnswerDirectories(sources).length > 0))) return false;
+        // Never replace an existing result in central or ANY protected snapshot layer.
+        if (hasAnswerEntry(directory) || withLegacyTaskControlDirectories(runDirectory, sources => sources.some(source => hasAnswerEntry(source.directory)))) return false;
         fs.renameSync(temporary, file); // no serialization, payload read or fsync under this lock
         return true;
       });

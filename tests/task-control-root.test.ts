@@ -3,13 +3,14 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
-  TASK_CONTROL_LAYOUT, assertTaskControlWriteRoots, createArchiveTaskControlDirectory, ensureTaskControlRoot, initializeTaskControlDirectory,
+  TASK_CONTROL_LAYOUT, assertTaskControlWriteRoots, createArchiveTaskControlDirectory, createHostTaskRun, ensureTaskControlRoot, initializeTaskControlDirectory,
   isTaskControlDirectoryEntry, legacyTaskControlSibling, openLegacyTaskControlFiles, readFinalAnswerReceipt, saveFinalAnswerReceipt, taskControlDirectory,
   taskControlReadDirectory, taskControlRoot, writeTaskControlJson,
 } from "../src/worker/terminal-answer.js";
 import { writeJsonAtomic } from "../src/core/atomic-write.js";
 import { resolveChildWritePolicy } from "../src/agents/child-env.js";
 import { queuedTerminalControls } from "../src/worker/terminal-controls.js";
+import { appendTerminalAdmission, readTerminalAdmissions } from "../src/agents/terminal-notices.js";
 
 // The parent supplies an isolated XDG_STATE_HOME outside TMPDIR. Fixtures are
 // retained; nothing is deleted. Without that isolation, never touch real state.
@@ -24,8 +25,31 @@ const stateCase = () => fs.mkdtempSync(path.join(isolatedState!, "control-root-c
 const runFixture = () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "task-control-root-"));
   const run = path.join(root, "run"), workspace = path.join(root, "workspace");
-  fs.mkdirSync(run, { mode: 0o700 }); fs.mkdirSync(workspace, { mode: 0o700 });
+  // Option 2: the run path stays ABSENT so createHostTaskRun owns its exclusive mkdir.
+  // Raw/unknown cases mkdir the run explicitly themselves (rawRun) before writing history.
+  fs.mkdirSync(workspace, { mode: 0o700 });
   return { root, run, workspace };
+};
+const rawRun = (fixture: ReturnType<typeof runFixture>) => { fs.mkdirSync(fixture.run, { mode: 0o700 }); return fixture; };
+// Recursive byte/inode/mode snapshot used to prove refusals preserve every original byte.
+const tree = (target: string): unknown[] => {
+  if (!fs.existsSync(target)) return [[target, "absent"]];
+  const out: unknown[] = [];
+  const walk = (file: string) => {
+    const stat = fs.lstatSync(file);
+    out.push([path.relative(target, file), stat.mode, stat.ino, stat.nlink, stat.isFile() ? fs.readFileSync(file).toString("base64") : stat.isSymbolicLink() ? fs.readlinkSync(file) : "dir"]);
+    if (stat.isDirectory()) for (const name of fs.readdirSync(file).sort()) walk(path.join(file, name));
+  };
+  walk(target);
+  return out;
+};
+// Typed unsafe refusal (owner OPTION 1): unknown raw/v1 history is refused, never imported.
+const expectUnsafe = (operation: () => unknown) => {
+  let error: unknown;
+  try { operation(); } catch (caught) { error = caught; }
+  expect(error, "expected unsafe legacy refusal").toBeInstanceOf(Error);
+  const { code, message } = error as Error & { code?: string };
+  expect(code === "FABRIC_LEGACY_SNAPSHOT_REQUIRED" || /FABRIC_LEGACY_SNAPSHOT_REQUIRED|unsafe/i.test(message), message).toBe(true);
 };
 
 describe.skipIf(!usable)("central task control root", () => {
@@ -64,7 +88,7 @@ describe.skipIf(!usable)("central task control root", () => {
   it("refuses grants on the root, its rename-capable ancestors and parent controls (SEC01); admits normal run/workspace grants", () => {
     process.env.XDG_STATE_HOME = stateCase();
     const s = runFixture(), parentRun = runFixture();
-    initializeTaskControlDirectory(s.run); initializeTaskControlDirectory(parentRun.run);
+    createHostTaskRun(s.run); createHostTaskRun(parentRun.run);
     const grant = (...roots: string[]) => resolveChildWritePolicy({ writableRoots: roots }, undefined, s.workspace)!;
     expect(() => assertTaskControlWriteRoots(s.run, s.workspace, grant(s.run, s.workspace))).not.toThrow();
     for (const root of [process.env.XDG_STATE_HOME, taskControlRoot(), path.dirname(taskControlRoot()), taskControlDirectory(s.run), taskControlDirectory(parentRun.run)]) {
@@ -79,7 +103,7 @@ describe.skipIf(!usable)("central task control root", () => {
   it("keys the lexical path, refusing a child-planted nested alias onto a victim run without touching its controls", () => {
     process.env.XDG_STATE_HOME = stateCase();
     const victim = runFixture(), child = runFixture();
-    initializeTaskControlDirectory(victim.run);
+    createHostTaskRun(victim.run);
     expect(saveFinalAnswerReceipt(victim.run, "run", "VICTIM").text).toBe("VICTIM");
     writeTaskControlJson(victim.run, "marker.json", { owner: "victim" });
     const victimControl = taskControlDirectory(victim.run);
@@ -95,6 +119,7 @@ describe.skipIf(!usable)("central task control root", () => {
     const leaf = path.join(child.workspace, "nest", "run"); fs.symlinkSync(victim.run, leaf, "dir");
     for (const alias of [path.join(link, "run"), leaf, path.join(link, "missing", "run")]) {
       expect(() => taskControlDirectory(alias)).toThrow(/link alias/);
+      expect(() => createHostTaskRun(alias)).toThrow(/link alias/);
       expect(() => initializeTaskControlDirectory(alias)).toThrow(/link alias/);
       expect(() => saveFinalAnswerReceipt(alias, "run", "FORGED")).toThrow(/link alias/);
       expect(() => writeTaskControlJson(alias, "marker.json", { owner: "child" })).toThrow(/link alias/);
@@ -104,8 +129,8 @@ describe.skipIf(!usable)("central task control root", () => {
     expect([afterDir.ino, afterDir.mode, afterDir.mtimeMs]).toEqual([beforeDir.ino, beforeDir.mode, beforeDir.mtimeMs]);
     expect(readFinalAnswerReceipt(victim.run, "run")?.text).toBe("VICTIM");
     // Counterexample: a real nested child run with the same basename works in its own namespace.
-    const real = path.join(child.workspace, "nest", "deep", "real", "run"); fs.mkdirSync(real, { recursive: true, mode: 0o700 });
-    initializeTaskControlDirectory(real);
+    const real = path.join(child.workspace, "nest", "deep", "real", "run"); fs.mkdirSync(path.dirname(real), { recursive: true, mode: 0o700 }); // parent only
+    createHostTaskRun(real);
     expect(saveFinalAnswerReceipt(real, "run", "CHILD").text).toBe("CHILD");
     expect(path.basename(taskControlDirectory(real))).toMatch(/^run--[0-9a-f]{32}$/);
     expect(taskControlDirectory(real)).not.toBe(victimControl);
@@ -119,10 +144,11 @@ describe.skipIf(!usable)("central task control root", () => {
 
   it("never recreates missing controls of a central-v1 run, while archive creation admits a fresh destination", () => {
     process.env.XDG_STATE_HOME = stateCase();
-    const s = runFixture();
+    const s = rawRun(runFixture());
     writeJsonAtomic(path.join(s.run, "status.json"), { id: "run", status: "completed", taskControlLayout: TASK_CONTROL_LAYOUT });
     writeJsonAtomic(path.join(s.run, "final-answer.json"), { version: 1, id: "forged", runId: "run", recordedAt: 1, text: "untrusted" });
     expect(() => initializeTaskControlDirectory(s.run)).toThrow(/refusing recreation/);
+    expect(() => createHostTaskRun(s.run)).toThrow(); // host ctor never mints over an existing marked run
     expect(() => taskControlReadDirectory(s.run)).toThrow(/legacy fallback refused/);
     expect(fs.existsSync(taskControlDirectory(s.run))).toBe(false);
     const archive = path.join(s.root, "archive"); fs.mkdirSync(path.join(archive, "run"), { recursive: true, mode: 0o700 });
@@ -133,120 +159,144 @@ describe.skipIf(!usable)("central task control root", () => {
     expect(fs.existsSync(taskControlDirectory(s.run))).toBe(false);
   });
 
-  it("keeps old sibling-v1 controls readable read-only and writes new controls only centrally", () => {
+  // CUTOFF (owner OPTION 1, #12214): every existing raw old/v1 layout is unknown history.
+  // Initialize/read/save/queue refuse with a typed unsafe error; every original byte stays.
+  // Owner OPTION 2: the generic seed producer and protected legacy positives are an explicit
+  // cut (#12214), not unresolved todos. The only positive constructor is createHostTaskRun.
+  const rawLayout = (options: { siblingAnswer?: string; inRunAnswer?: string; bound?: boolean; sibling?: boolean; layout?: string; queued?: boolean }) => {
     process.env.XDG_STATE_HOME = stateCase();
-    const s = runFixture(), sibling = legacyTaskControlSibling(s.run);
-    fs.mkdirSync(sibling, { mode: 0o700 });
-    writeJsonAtomic(path.join(s.run, "status.json"), { id: "run", status: "running", taskControlLayout: "sibling-v1" });
-    writeJsonAtomic(path.join(sibling, "final-answer.json"), { version: 1, id: "old", runId: "run", recordedAt: 1, text: "OLD_SIBLING" });
-    expect(taskControlReadDirectory(s.run)).toBe(sibling);
-    expect(readFinalAnswerReceipt(s.run, "run")?.text).toBe("OLD_SIBLING");
-    expect(isTaskControlDirectoryEntry(s.root, "run.ctl")).toBe(true);
-    initializeTaskControlDirectory(s.run);
-    expect(taskControlReadDirectory(s.run)).toBe(taskControlDirectory(s.run));
-    expect(readFinalAnswerReceipt(s.run, "run")?.text).toBe("OLD_SIBLING");
-    expect(saveFinalAnswerReceipt(s.run, "run", "NEW").text).toBe("OLD_SIBLING"); // never replaces an old result
-    expect(fs.existsSync(path.join(taskControlDirectory(s.run), "final-answer.json"))).toBe(false);
-    expect(fs.readdirSync(s.root).sort()).toEqual(["run", "run.ctl", "workspace"]);
-  });
-
-  // Tri-layout: in-run legacy rows -> old sibling-v1 bound to them by inode -> central bootstrap.
-  const triLayout = (options: { siblingAnswer?: string; inRunAnswer?: string; bound?: boolean }) => {
-    process.env.XDG_STATE_HOME = stateCase();
-    const s = runFixture(), sibling = legacyTaskControlSibling(s.run), id = "0b6f4c1e-1f0a-4c55-9a51-2f6a0d1e7c11";
-    fs.mkdirSync(path.join(s.run, "terminal-controls"), { mode: 0o700 });
-    writeJsonAtomic(path.join(s.run, "terminal-controls", `${id}.json`), { id, delivery: "steer", state: "queued" });
+    const s = rawRun(runFixture()), sibling = legacyTaskControlSibling(s.run), id = "0b6f4c1e-1f0a-4c55-9a51-2f6a0d1e7c11";
+    if (options.queued !== false) {
+      fs.mkdirSync(path.join(s.run, "terminal-controls"), { mode: 0o700 });
+      writeJsonAtomic(path.join(s.run, "terminal-controls", `${id}.json`), { id, delivery: "steer", state: "queued" });
+    }
     if (options.inRunAnswer) writeJsonAtomic(path.join(s.run, "final-answer.json"), { version: 1, id: "in", runId: "run", recordedAt: 1, text: options.inRunAnswer });
-    fs.mkdirSync(sibling, { mode: 0o700 });
-    const stat = fs.lstatSync(s.run, { bigint: true });
-    if (options.bound !== false) writeJsonAtomic(path.join(sibling, ".legacy-read.json"), { version: 1, runId: "run", dev: String(stat.dev), ino: String(stat.ino) });
-    if (options.siblingAnswer) writeJsonAtomic(path.join(sibling, "final-answer.json"), { version: 1, id: "old", runId: "run", recordedAt: 1, text: options.siblingAnswer });
-    writeJsonAtomic(path.join(s.run, "status.json"), { id: "run", status: "completed", taskControlLayout: "sibling-v1" });
-    initializeTaskControlDirectory(s.run);
-    return { ...s, id };
+    if (options.sibling !== false) {
+      fs.mkdirSync(sibling, { mode: 0o700 });
+      const stat = fs.lstatSync(s.run, { bigint: true });
+      if (options.bound !== false) writeJsonAtomic(path.join(sibling, ".legacy-read.json"), { version: 1, runId: "run", dev: String(stat.dev), ino: String(stat.ino) });
+      if (options.siblingAnswer) writeJsonAtomic(path.join(sibling, "final-answer.json"), { version: 1, id: "old", runId: "run", recordedAt: 1, text: options.siblingAnswer });
+    }
+    writeJsonAtomic(path.join(s.run, "status.json"), options.layout === undefined ? { id: "run", status: "completed" } : { id: "run", status: "completed", taskControlLayout: options.layout });
+    const before = { run: tree(s.run), sibling: tree(sibling), central: tree(taskControlDirectory(s.run)) };
+    const preserved = () => {
+      expect(tree(s.run)).toEqual(before.run);
+      expect(tree(sibling)).toEqual(before.sibling);
+      expect(tree(taskControlDirectory(s.run))).toEqual(before.central); // never auto-upgraded
+    };
+    return { ...s, sibling, id, preserved };
+  };
+  const expectRefusedEverywhere = (t: ReturnType<typeof rawLayout>) => {
+    expectUnsafe(() => readFinalAnswerReceipt(t.run, "run"));          // before bootstrap: old public read refuses
+    expectUnsafe(() => queuedTerminalControls(t.run));
+    expectUnsafe(() => initializeTaskControlDirectory(t.run));         // validation-only: no import/auto-upgrade
+    expect(() => createHostTaskRun(t.run)).toThrow();                  // host ctor never mints over pre-existing history
+    expectUnsafe(() => readFinalAnswerReceipt(t.run, "run"));          // still refused afterwards
+    expectUnsafe(() => saveFinalAnswerReceipt(t.run, "run", "NEW"));   // no NEW save, no public finality
+    expectUnsafe(() => queuedTerminalControls(t.run));
+    t.preserved();
   };
 
-  it("tri-layout keeps in-run rows and in-run results readable after central bootstrap and never replaces them", () => {
-    const t = triLayout({ inRunAnswer: "IN_RUN" });
-    expect(queuedTerminalControls(t.run).map(control => control.id)).toEqual([t.id]);
-    expect(readFinalAnswerReceipt(t.run, "run")?.text).toBe("IN_RUN");
-    expect(saveFinalAnswerReceipt(t.run, "run", "NEW").text).toBe("IN_RUN");
-    expect(fs.existsSync(path.join(taskControlDirectory(t.run), "final-answer.json"))).toBe(false);
-    expect(fs.readdirSync(legacyTaskControlSibling(t.run)).sort()).toEqual([".legacy-read.json"]); // never written
+  it("CUTOFF: raw sibling-v1 (single genuine-looking answer) refuses initialize/read/save and preserves bytes", () => {
+    const t = rawLayout({ siblingAnswer: "OLD_SIBLING", bound: false, queued: false, layout: "sibling-v1" });
+    expectUnsafe(() => taskControlReadDirectory(t.run));
+    expect(isTaskControlDirectoryEntry(t.root, "run.ctl")).toBe(true); // still a control entry, never collected as artifact
+    expectRefusedEverywhere(t);
+    expect(fs.readdirSync(t.root).sort()).toEqual(["run", "run.ctl", "workspace"]);
   });
 
-  it("tri-layout OLD_SIBLING result is not replaced, and conflicting legacy results never establish finality", () => {
-    const t = triLayout({ siblingAnswer: "OLD_SIBLING" });
-    expect(saveFinalAnswerReceipt(t.run, "run", "NEW").text).toBe("OLD_SIBLING");
-    expect(fs.existsSync(path.join(taskControlDirectory(t.run), "final-answer.json"))).toBe(false);
-    const c = triLayout({ siblingAnswer: "OLD_SIBLING", inRunAnswer: "IN_RUN" });
-    expect(readFinalAnswerReceipt(c.run, "run")).toBeUndefined();
-    expect(() => saveFinalAnswerReceipt(c.run, "run", "NEW")).toThrow(/already exists/);
-    expect(fs.existsSync(path.join(taskControlDirectory(c.run), "final-answer.json"))).toBe(false);
+  it("CUTOFF: inode-bound v1 tri-layout (in-run, sibling, both, empty-looking) is unknown history, never final", () => {
+    for (const options of [{ inRunAnswer: "IN_RUN" }, { siblingAnswer: "OLD_SIBLING" }, { siblingAnswer: "OLD_SIBLING", inRunAnswer: "IN_RUN" }, {}]) {
+      expectRefusedEverywhere(rawLayout({ ...options, layout: "sibling-v1" }));
+    }
   });
 
-  it("a central answer plus one eligible legacy answer is a duplicate and never final (locked and unlocked)", () => {
-    const t = triLayout({ siblingAnswer: "OLD_SIBLING" });
-    writeJsonAtomic(path.join(taskControlDirectory(t.run), "final-answer.json"), { version: 1, id: "dup", runId: "run", recordedAt: 2, text: "CENTRAL" });
-    expect(readFinalAnswerReceipt(t.run, "run")).toBeUndefined();
-    expect(() => saveFinalAnswerReceipt(t.run, "run", "NEW")).toThrow(/already exists/);
-    const i = triLayout({ inRunAnswer: "IN_RUN" });
-    writeJsonAtomic(path.join(taskControlDirectory(i.run), "final-answer.json"), { version: 1, id: "dup", runId: "run", recordedAt: 2, text: "CENTRAL" });
-    expect(readFinalAnswerReceipt(i.run, "run")).toBeUndefined();
-    expect(() => saveFinalAnswerReceipt(i.run, "run", "NEW")).toThrow(/already exists/);
+  it("CUTOFF: un-bootstrapped bound sibling plus in-run answer refuses before any bootstrap", () => {
+    const t = rawLayout({ siblingAnswer: "OLD_SIBLING", inRunAnswer: "IN_RUN", queued: false, layout: "sibling-v1" });
+    expectUnsafe(() => readFinalAnswerReceipt(t.run, "run"));
+    t.preserved();
   });
 
-  it("an un-bootstrapped old-sibling primary plus an admitted in-run answer is a duplicate", () => {
+  it("CUTOFF: unbound old sibling no longer ignores in-run rows and saves NEW; it refuses, bytes preserved (#12214)", () => {
+    expectRefusedEverywhere(rawLayout({ inRunAnswer: "SPOOF", bound: false, layout: "sibling-v1" }));
+  });
+
+  it("CUTOFF: in-run-only legacy record with no layout marker refuses (was IN_RUN)", () => {
+    expectRefusedEverywhere(rawLayout({ inRunAnswer: "IN_RUN", sibling: false, queued: false }));
+  });
+
+  it("CUTOFF: raw history with v1 binding cannot be bootstrapped, and a central write cannot launder it", () => {
+    const t = rawLayout({ siblingAnswer: "OLD_SIBLING", layout: "sibling-v1" });
+    expectUnsafe(() => initializeTaskControlDirectory(t.run));
+    expect(() => writeTaskControlJson(t.run, "final-answer.json", { version: 1, id: "dup", runId: "run", recordedAt: 2, text: "CENTRAL" })).toThrow();
+    expectUnsafe(() => readFinalAnswerReceipt(t.run, "run"));
+    t.preserved();
+  });
+
+  it("single-source current-only answer stays final (host ctor writes the null-snapshot binding; initialize only validates)", () => {
     process.env.XDG_STATE_HOME = stateCase();
-    const s = runFixture(), sibling = legacyTaskControlSibling(s.run), stat = fs.lstatSync(s.run, { bigint: true });
-    fs.mkdirSync(sibling, { mode: 0o700 });
-    writeJsonAtomic(path.join(sibling, ".legacy-read.json"), { version: 1, runId: "run", dev: String(stat.dev), ino: String(stat.ino) });
-    writeJsonAtomic(path.join(sibling, "final-answer.json"), { version: 1, id: "old", runId: "run", recordedAt: 1, text: "OLD_SIBLING" });
-    writeJsonAtomic(path.join(s.run, "final-answer.json"), { version: 1, id: "in", runId: "run", recordedAt: 1, text: "IN_RUN" });
-    writeJsonAtomic(path.join(s.run, "status.json"), { id: "run", status: "completed", taskControlLayout: "sibling-v1" });
-    expect(readFinalAnswerReceipt(s.run, "run")).toBeUndefined();
-  });
-
-  it("single-source answers stay final: current-only, in-run-only legacy record (selected == legacy counted once)", () => {
-    process.env.XDG_STATE_HOME = stateCase();
-    const c = runFixture();
-    initializeTaskControlDirectory(c.run);
+    const blank = rawRun(runFixture()); // existing blank-looking run is unknown, not fresh
+    expect(() => initializeTaskControlDirectory(blank.run)).toThrow(); // validation-only: never mints for a blank existing run
+    expect(fs.existsSync(taskControlDirectory(blank.run))).toBe(false);
+    const c = runFixture(); // NEW distinct run path, still absent
+    expect(fs.existsSync(c.run)).toBe(false);
+    createHostTaskRun(c.run); // exclusive mkdir + null central
+    expect(fs.statSync(c.run).mode & 0o777).toBe(0o700);
+    expect(() => createHostTaskRun(c.run)).toThrow(/already exists/); // EEXIST is never idempotent success
+    initializeTaskControlDirectory(c.run); // validates the published authority
+    expect(fs.existsSync(path.join(taskControlDirectory(c.run), ".legacy-read.json"))).toBe(true);
     expect(saveFinalAnswerReceipt(c.run, "run", "CURRENT").text).toBe("CURRENT");
     expect(readFinalAnswerReceipt(c.run, "run")?.text).toBe("CURRENT");
-    expect(saveFinalAnswerReceipt(c.run, "run", "AGAIN").text).toBe("CURRENT");
-    const l = runFixture();
-    writeJsonAtomic(path.join(l.run, "status.json"), { id: "run", status: "completed" });
-    writeJsonAtomic(path.join(l.run, "final-answer.json"), { version: 1, id: "in", runId: "run", recordedAt: 1, text: "IN_RUN" });
-    expect(readFinalAnswerReceipt(l.run, "run")?.text).toBe("IN_RUN");
+    expect(saveFinalAnswerReceipt(c.run, "run", "AGAIN").text).toBe("CURRENT"); // never overwrite
+    expect(queuedTerminalControls(c.run)).toEqual([]);
+    expect(fs.existsSync(legacyTaskControlSibling(c.run))).toBe(false);
   });
 
-  it.skipIf(process.platform !== "linux")("openLegacyTaskControlFiles closes earlier fds when a later source is unsafe, and returns all on success", () => {
-    const t = triLayout({});
-    const sibling = legacyTaskControlSibling(t.run), probe = path.join(sibling, "probe.json");
-    fs.writeFileSync(probe, "{}", { mode: 0o600 });
-    fs.writeFileSync(path.join(t.run, "probe.json"), "{}", { mode: 0o600 });
-    const ok = openLegacyTaskControlFiles(t.run, "probe.json");
-    expect(ok).toHaveLength(2);
-    for (const fd of ok) expect(fs.fstatSync(fd).isFile()).toBe(true); // returned fds stay open
-    for (const fd of ok) fs.closeSync(fd);
-    // Fresh fixture (nothing deleted): safe sibling copy opens first, in-run copy has nlink 2.
-    const u = triLayout({}), probeU = path.join(legacyTaskControlSibling(u.run), "probe.json");
-    fs.writeFileSync(probeU, "{}", { mode: 0o600 });
+  it.skipIf(process.platform !== "linux")("openLegacyTaskControlFiles: current-only yields no fds; raw layers refuse without leaking any fd", () => {
+    process.env.XDG_STATE_HOME = stateCase();
+    const c = runFixture(); createHostTaskRun(c.run);
+    expect(openLegacyTaskControlFiles(c.run, "terminal-controls/probe.json")).toEqual([]);
+    const u = rawLayout({ layout: "sibling-v1", queued: false });
+    const probeU = path.join(u.sibling, "probe.json"); fs.writeFileSync(probeU, "{}", { mode: 0o600 });
     const other = path.join(u.root, "elsewhere.json"); fs.writeFileSync(other, "{}", { mode: 0o600 });
     fs.linkSync(other, path.join(u.run, "probe.json"));
+    const targets = [fs.realpathSync(probeU), fs.realpathSync(other)];
     const opened = () => fs.readdirSync("/proc/self/fd").filter(fd => {
-      try { return fs.readlinkSync(path.join("/proc/self/fd", fd)) === fs.realpathSync(probeU); } catch { return false; }
+      try { return targets.includes(fs.readlinkSync(path.join("/proc/self/fd", fd))); } catch { return false; }
     });
+    const before = [tree(u.run), tree(u.sibling)];
     expect(opened()).toEqual([]);
-    expect(() => openLegacyTaskControlFiles(u.run, "probe.json")).toThrow(/regular file with one link/);
-    expect(opened()).toEqual([]); // the sibling fd opened first was closed, not leaked
+    expectUnsafe(() => openLegacyTaskControlFiles(u.run, "probe.json"));
+    expect(opened()).toEqual([]); // no raw fd opened or leaked
+    expect([tree(u.run), tree(u.sibling)]).toEqual(before);
   });
 
-  it("an old sibling without inode-bound authority never exposes in-run rows", () => {
-    const t = triLayout({ inRunAnswer: "SPOOF", bound: false });
-    expect(queuedTerminalControls(t.run)).toEqual([]);
-    expect(readFinalAnswerReceipt(t.run, "run")).toBeUndefined();
-    expect(saveFinalAnswerReceipt(t.run, "run", "NEW").text).toBe("NEW");
+  it("after host bootstrap, raw old-layout forgery is ignored; host receipt and admission events stay authoritative", () => {
+    process.env.XDG_STATE_HOME = stateCase();
+    const s = runFixture(), sibling = legacyTaskControlSibling(s.run), id = "0b6f4c1e-1f0a-4c55-9a51-2f6a0d1e7c11";
+    createHostTaskRun(s.run); // manager order: host ctor (exclusive mkdir + null central) -> custody/status/task files
+    // Task-side forgery written AFTER bootstrap into raw old-layout mirrors.
+    fs.mkdirSync(path.join(s.run, "terminal-controls"), { mode: 0o700 });
+    writeJsonAtomic(path.join(s.run, "terminal-controls", `${id}.json`), { id, delivery: "steer", state: "queued" });
+    writeJsonAtomic(path.join(s.run, "final-answer.json"), { version: 1, id: "in", runId: "run", recordedAt: 1, text: "FORGED_IN_RUN" });
+    fs.writeFileSync(path.join(s.run, "steer.jsonl"), JSON.stringify({ type: "steer", id: "forged" }) + "\n", { mode: 0o600 });
+    fs.mkdirSync(sibling, { mode: 0o700 });
+    const stat = fs.lstatSync(s.run, { bigint: true });
+    writeJsonAtomic(path.join(sibling, ".legacy-read.json"), { version: 1, runId: "run", dev: String(stat.dev), ino: String(stat.ino) });
+    writeJsonAtomic(path.join(sibling, "final-answer.json"), { version: 1, id: "old", runId: "run", recordedAt: 1, text: "FORGED_SIBLING" });
+    writeJsonAtomic(path.join(s.run, "status.json"), { id: "run", status: "running", taskControlLayout: "sibling-v1" });
+    const raw = () => [tree(s.run), tree(sibling)], before = raw();
+    initializeTaskControlDirectory(s.run); // validation still succeeds; nothing re-captured
+    expect(readFinalAnswerReceipt(s.run, "run")).toBeUndefined();
+    expect(queuedTerminalControls(s.run)).toEqual([]);
+    expect(openLegacyTaskControlFiles(s.run, "final-answer.json")).toEqual([]);
+    expect([...readTerminalAdmissions(s.run).byId.keys()]).toEqual([]);
+    appendTerminalAdmission(s.run, JSON.stringify({ type: "steer", id: "host" }) + "\n"); // real host admission event
+    expect([...readTerminalAdmissions(s.run).byId.keys()]).toEqual(["host"]);
+    expect(saveFinalAnswerReceipt(s.run, "run", "CURRENT").text).toBe("CURRENT"); // real host receipt event
+    expect(readFinalAnswerReceipt(s.run, "run")?.text).toBe("CURRENT");
+    expect(saveFinalAnswerReceipt(s.run, "run", "AGAIN").text).toBe("CURRENT");
+    expect(raw()).toEqual(before); // raw mirrors never written, read back or repaired
   });
 
   it("creates a deeply nonexistent absolute XDG state home privately", () => {
@@ -258,7 +308,7 @@ describe.skipIf(!usable)("central task control root", () => {
 
   it("missing old sibling for a sibling-v1 run refuses fallback and recreation", () => {
     process.env.XDG_STATE_HOME = stateCase();
-    const s = runFixture();
+    const s = rawRun(runFixture());
     writeJsonAtomic(path.join(s.run, "status.json"), { id: "run", status: "completed", taskControlLayout: "sibling-v1" });
     expect(() => taskControlReadDirectory(s.run)).toThrow();
     expect(() => initializeTaskControlDirectory(s.run)).toThrow();

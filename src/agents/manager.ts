@@ -19,6 +19,21 @@ import os from "node:os";
 import { fabricDataRoot } from "../storage/temp-root.js";
 import path from "node:path";
 import { mkdirPrivate } from "../storage/private-dir.js";
+import { assertTaskRunPathUnaliased, assertTaskRunRootAdmissible } from "../worker/task-run-path.js";
+
+/** DELTA-SEC-02: errors from the run-path alias guard; never followed by a run-path outcome write. */
+const unsafeRunPathErrors = new WeakSet<object>();
+const isUnsafeRunPathError = (error: unknown): boolean => typeof error === "object" && error !== null && unsafeRunPathErrors.has(error);
+const assertRunPathSafe = (runDirectory: string, inheritedRoot: boolean): void => {
+  const makeError = (message: string): Error => {
+    const error = new FabricTaskControlDirectoryError(message); // same error type as before (imported below; hoisted)
+    unsafeRunPathErrors.add(error);
+    return error;
+  };
+  // Owner OPTION1 (#12214 recursion cut): Windows refuses an inherited PI_FABRIC_RUN_ROOT before any write.
+  assertTaskRunRootAdmissible(inheritedRoot, makeError);
+  assertTaskRunPathUnaliased(runDirectory, makeError);
+};
 
 import { fileURLToPath } from "node:url";
 import { assertFabricModelAllowed, FabricModelDeniedError } from "../core/model-policy.js";
@@ -102,7 +117,7 @@ import type {
 import { FOLLOW_UP_RUNNING_TASK_MESSAGE, type AgentAdmissionAlarm, type AgentFollowUpAlarm, type AgentFollowUpDelivery } from "./types.js";
 import { followUpFile, followUpState, settleFollowUp, releaseFollowUpPayload } from "./follow-up-delivery.js";
 import { createRunRouteMetadata } from "../worker/run-record.js";
-import { readFinalAnswerReceipt, readTaskControlJson, taskControlDirectory, taskSteerFile, withTaskControlDirectory, initializeTaskControlDirectory, assertTaskControlWriteRoots, isTaskControlDirectoryEntry, legacyTaskControlSibling, taskControlReadDirectory, FabricTaskControlDirectoryError, type FinalAnswerReceipt } from "../worker/terminal-answer.js";
+import { readFinalAnswerReceipt, readTaskControlJson, taskControlDirectory, taskSteerFile, withTaskControlDirectory, createHostTaskRun, initializeTaskControlDirectory, assertTaskControlWriteRoots, isTaskControlDirectoryEntry, legacyTaskControlSibling, taskControlReadDirectory, FabricTaskControlDirectoryError, type FinalAnswerReceipt } from "../worker/terminal-answer.js";
 import { FabricTargetTerminalError, FabricSteerAdmissionLimitError, type AgentTerminalNotice } from "./terminal-target.js";
 import { TerminalNoticeOutbox, appendTerminalAdmission, readTerminalAdmission, readTerminalAdmissions, readUndeliveredMessage, readUndeliveredMessageView, MAX_STEER_CONTROLS, MAX_STEER_BYTES, MAX_STEER_ENTRY_BYTES, terminalControlMatchesAdmission, terminalSenderMatches } from "./terminal-notices.js";
 import type { AgentRunRouteMetadata } from "./types.js";
@@ -488,6 +503,8 @@ interface QueuedAgent {
   completionRecipient?: CompletionRecipient;
   routeSaveFailure?: string;
   outcomeSaved?: boolean;
+  /** DELTA-SEC-02: its run path was refused as aliased; no run-path outcome/custody write may follow. */
+  runPathUnsafe?: boolean;
   routeOutcome?: (result: AgentRunResult) => void;
   /** Also guard cleanup if writing the persistent unresolved marker failed. */
   cleanupPending?: string;
@@ -828,6 +845,8 @@ export class AgentManager {
   readonly #worktrees = new WorktreeManager();
   readonly #runRoot: string;
   readonly #managedTempRoot: boolean;
+  /** Run root came from an inherited PI_FABRIC_RUN_ROOT, not a trusted host option or host-created temp root. */
+  readonly #inheritedRunRoot: boolean;
   readonly #parentOwnedRunRoot: boolean;
   readonly #retention: FabricRetentionConfig;
   readonly #workerPath: string;
@@ -987,9 +1006,10 @@ export class AgentManager {
   ) {
     this.#semaphore = new AgentAdmission(config.maxConcurrent, Infinity, config.maxDepth);
     this.#managedTempRoot = options.runRoot === undefined && process.env.PI_FABRIC_RUN_ROOT === undefined;
-    // Trusted host root canonicalized ONCE here, before any run id: realpath of the host-created temp root, or of the
-    // deepest existing ancestor of an explicit host root (no mkdir). Inherited PI_FABRIC_RUN_ROOT stays lexical (strict refusal).
-    this.#runRoot = options.runRoot !== undefined ? ((root: string) => { let base = root; while (!fs.existsSync(base) && path.dirname(base) !== base) base = path.dirname(base); return path.join(fs.realpathSync(base), path.relative(base, root)); })(path.resolve(options.runRoot))
+    this.#inheritedRunRoot = options.runRoot === undefined && process.env.PI_FABRIC_RUN_ROOT !== undefined;
+    // Canonicalize only the host-created default root, before allocating any run id.
+    // Explicit and inherited roots stay lexical: user-owned aliases must still refuse.
+    this.#runRoot = options.runRoot !== undefined ? path.resolve(options.runRoot)
       : process.env.PI_FABRIC_RUN_ROOT ?? fs.realpathSync(fs.mkdtempSync(path.join(fabricDataRoot(), "pi-fabric-runs-")));
     // Nested run artifacts belong to the enclosing run, not the short-lived Pi
     // child. Its owner removes them on cleanup/retention/root shutdown.
@@ -1495,9 +1515,14 @@ export class AgentManager {
     }
     const admissionSignal = signal ? AbortSignal.any([signal, this.#closeAbort.signal]) : this.#closeAbort.signal;
     if (admissionSignal.aborted) throw new Error("Operation aborted");
+    const id = randomUUID().replaceAll("-", "");
+    // DELTA-SEC-02: refuse an aliased (or Windows-inherited) run path BEFORE admission and BEFORE prepareRouteDispatch
+    // can write its receipt there; refusing before admit() leaves no admission count to leak.
+    assertRunPathSafe(path.join(this.#runRoot, id), this.#inheritedRunRoot);
     // Count accepted requests, including queued ones, exactly once.
     this.#semaphore.admit(this.#currentDepth + 1);
-    const id = randomUUID().replaceAll("-", "");
+    // Exclusive fresh allocation is the host witness; publish current-only authority before route/custody/task writes.
+    createHostTaskRun(path.join(this.#runRoot, id));
     const name = safeName(request.name ?? request.task.split("\n", 1)[0] ?? "Fabric agent");
     const callerSignal = signal;
     const assertAuthorized = (): void => {
@@ -1538,6 +1563,9 @@ export class AgentManager {
         throw error;
       }
       const runDirectory = path.join(this.#runRoot, id);
+      // DELTA-SEC-02: recheck after async preparation (an alias may have changed) BEFORE the first mkdir/custody/task write.
+      // Refusal releases admission but never invokes the route outcome saver through the aliased path.
+      assertRunPathSafe(runDirectory, this.#inheritedRunRoot);
       // 0700 whatever the umask (smarty-dev#9016): a login shell's umask 002 made run directories 0775, which
       // verified retention refuses (group-writable). Only directories it creates are changed.
       mkdirPrivate(runDirectory, this.#trustRoot());
@@ -2077,7 +2105,7 @@ export class AgentManager {
         // Cover preparation writes and worktree creation as well as transport failures,
         // without releasing admission while an unconfirmed worker retains custody.
         if ((error as { launchOutcome?: string } | undefined)?.launchOutcome !== "unknown") release();
-        if ((error as { launchOutcome?: string } | undefined)?.launchOutcome !== "unknown" && !this.#queued.has(id)) {
+        if ((error as { launchOutcome?: string } | undefined)?.launchOutcome !== "unknown" && !this.#queued.has(id) && !isUnsafeRunPathError(error)) {
           try { routeDispatch?.outcome({ status: signal?.aborted ? "stopped" : "failed" }); }
           catch (saveError) { console.warn(`[pi-fabric] Pre-worker route outcome save failed; files retained at ${path.join(this.#runRoot, id)}: ${String(saveError)}`); }
         }
@@ -2141,6 +2169,7 @@ export class AgentManager {
           return;
         }
         release?.();
+        if (isUnsafeRunPathError(error)) queued.runPathUnsafe = true;
         this.#settleQueued(queued, signal.aborted ? "stopped" : "failed", error);
       }
     })();
@@ -2340,6 +2369,12 @@ export class AgentManager {
   #saveQueuedRouteOutcome(queued: QueuedAgent): boolean {
     if (queued.outcomeSaved) return true;
     if (!queued.terminal) return !queued.routeSaveFailure;
+    if (queued.runPathUnsafe) {
+      // Deliver the in-memory receipt only: queued-result, archive and route saves would write through the alias.
+      try { this.#onSettled?.(queued.terminal, queued.completionRecipient); } catch { /* receipt stays on the waiter */ }
+      queued.outcomeSaved = true;
+      return true;
+    }
     let failure: unknown;
     // Finite retries only; persistent failure keeps the full terminal receipt and run files.
     for (let attempt = 0; attempt < 3; attempt++) {

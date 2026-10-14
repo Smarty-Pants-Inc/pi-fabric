@@ -18,9 +18,11 @@ const controlDirectories = new Set(["terminal-controls", "terminal-notices"]);
  * Journals stay legacy-first; only matching delivered overlays replace old debt.
  * Duplicate final answers always refuse, even when their bytes are identical. */
 const archiveControls = (runDirectory: string): Map<string, Buffer> | undefined => {
-  // Protected controls are central (central-v1) or an old sibling-v1 directory.
-  const sibling = !!fs.lstatSync(taskControlDirectory(runDirectory), { throwIfNoEntry: false }) ||
-    !!fs.lstatSync(legacyControlSibling(runDirectory), { throwIfNoEntry: false });
+  // Protected controls are central only. Raw old-sibling or in-run controls are
+  // custody evidence: they may veto, but are never read as control authority.
+  const central = !!fs.lstatSync(taskControlDirectory(runDirectory), { throwIfNoEntry: false });
+  const rawSibling = !!fs.lstatSync(legacyControlSibling(runDirectory), { throwIfNoEntry: false });
+  const sibling = central || rawSibling;
   const local = [...controlFiles, ...controlDirectories].some(name => fs.lstatSync(path.join(runDirectory, name), { throwIfNoEntry: false }));
   // The shared status reader also proves the source root owned and unaliased.
   // Keep the older receipt-only / opaque-status archive behavior when there are
@@ -63,7 +65,10 @@ const archiveControls = (runDirectory: string): Map<string, Buffer> | undefined 
       } else result.set(relative, content);
     } finally { fs.closeSync(fd); }
   };
-  const scan = (directory: string, legacy: boolean, markerAllowed: boolean): void => {
+  // `snapshot`: a kernel-validated protected layer, strict control namespace.
+  // `central`: the validated binding is always reserved; `.legacy-snapshot` only
+  // when the kernel yielded snapshot layers (snapshot:null has none).
+  const scan = (directory: string, mode: "central" | "snapshot", snapshotAllowed = false): void => {
     const cursor = fs.opendirSync(directory, { bufferSize: 32 });
     try {
       let seen = 0;
@@ -71,7 +76,8 @@ const archiveControls = (runDirectory: string): Map<string, Buffer> | undefined 
         const entry = cursor.readSync();
         if (!entry) break;
         if (++seen > MAX_TASK_CONTROL_ROWS * 3 + 32) throw new Error("Archive control namespace bound exceeded");
-        if (entry.name === ".legacy-read.json" && !legacy && markerAllowed) continue;
+        if (mode === "central" && entry.name === ".legacy-read.json" && entry.isFile()) continue;
+        if (mode === "central" && snapshotAllowed && entry.name === ".legacy-snapshot" && entry.isDirectory()) continue;
         if (controlFiles.has(entry.name)) { read(directory, entry.name); continue; }
         if (controlDirectories.has(entry.name)) {
           withTaskControlSubdirectory(directory, entry.name, child => {
@@ -88,30 +94,36 @@ const archiveControls = (runDirectory: string): Map<string, Buffer> | undefined 
           });
           continue;
         }
-        if (!legacy) throw new Error(`Unknown archive control artifact ${entry.name}`);
+        throw new Error(`Unknown archive control artifact ${entry.name}`);
       }
     } finally { cursor.closeSync(); }
   };
-  // Hold the run root for the whole read; a held source proves in-run by fd
-  // identity (st_dev/st_ino), never by comparing pinned /proc paths to lexical ones.
+  // Hold the run root for the whole read. A protected snapshot layer is a
+  // different inode by design: in-run is proven by its kernel-validated origin
+  // matching this held run, never by layer FD identity or by reopening raw controls.
   const runFd = fs.openSync(runDirectory, fs.constants.O_RDONLY | (fs.constants.O_DIRECTORY ?? 0) | (fs.constants.O_NOFOLLOW ?? 0));
   try {
   const run = fs.fstatSync(runFd, { bigint: true }), named = fs.lstatSync(runDirectory, { bigint: true });
   if (!run.isDirectory() || named.isSymbolicLink() || named.dev !== run.dev || named.ino !== run.ino) throw new Error("Archive run directory changed while held");
-  withTaskControlReadDirectory(runDirectory, selected => {
-    if (!sibling) { scan(selected, true, false); return; }
-    // Chronological: in-run, then old sibling, then central. Journals append
+  withTaskControlReadDirectory(runDirectory, (selected, selectedFd) => {
+    // Protected-only: the raw run (or any non-central selection) is never authority.
+    const held = fs.fstatSync(selectedFd, { bigint: true });
+    if (!central || held.dev === run.dev && held.ino === run.ino) throw new Error("Unprotected archive control selection");
+    // Chronological: in-run, then sibling, then central. Journals append
     // oldest first; an overlay pairs older queued debt with newer delivery.
-    const [legacy, inRun] = withLegacyTaskControlDirectories(runDirectory, sources => {
-      for (const source of [...sources].reverse()) scan(source.directory, true, false);
-      return [sources.length > 0, sources.some(source => {
-        const held = fs.fstatSync(source.fd, { bigint: true });
-        return held.dev === run.dev && held.ino === run.ino;
-      })];
+    const [snapshot, inRun, siblingLayer] = withLegacyTaskControlDirectories(runDirectory, sources => {
+      const inRunLayers = sources.filter(source => source.origin.kind === "in-run");
+      if (inRunLayers.some(source => source.origin.dev !== String(run.dev) || source.origin.ino !== String(run.ino))) {
+        throw new Error("Archive in-run snapshot origin does not match the held run");
+      }
+      for (const source of [...sources].reverse()) scan(source.directory, "snapshot");
+      return [sources.length > 0, inRunLayers.length > 0, sources.some(source => source.origin.kind === "sibling")];
     });
-    // In-run controls the archive copy excludes must be a proven layer, never dropped.
+    // Raw controls the archive copy excludes are mirrors only of a proven
+    // protected layer; unknown raw evidence refuses rather than being dropped.
     if (local && !inRun) throw new Error("Unproven legacy archive controls");
-    scan(selected, false, legacy);
+    if (rawSibling && !siblingLayer) throw new Error("Unproven legacy archive control sibling");
+    scan(selected, "central", snapshot);
   });
   } finally { fs.closeSync(runFd); }
   if (overlays.size || result.has("steer.jsonl")) {

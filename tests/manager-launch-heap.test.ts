@@ -179,7 +179,7 @@ describe("stored manager callback custody and authority", () => {
     } finally { held.release(); }
   });
 
-  it("keeps the same authority callback on resume and refuses a revoked replacement worker", async () => {
+  it("preserves authority across per-launch release wrappers and refuses a revoked replacement worker", async () => {
     const { manager } = callbackManager();
     let authorized = true, firstLaunched = false, saved!: AgentTransportLaunch;
     const prepare = manager.prepareModelForAdmission.bind(manager);
@@ -190,7 +190,9 @@ describe("stored manager callback custody and authority", () => {
     let attempts = 0, workers = 0;
     vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async request => {
       attempts++;
-      if (attempts > 1) expect(request.authorize).toBe(saved.authorize);
+      // Main's release-admission fence wraps authorize anew per launch. Both
+      // stored wrappers must still consult the same current owner predicate.
+      if (attempts > 1) expect(() => saved.authorize!()).toThrow("Agent activation no longer authorized");
       expect(request.authorize!()).toBe(true); // revoked retry throws before worker creation
       workers++;
       saved = request;

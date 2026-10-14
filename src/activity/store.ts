@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { headlineArg } from "../core/call-preview.js";
+import { detachedPreview } from "../core/preview.js";
 import type { FabricInvocationActivityUpdate } from "../protocol.js";
 import type {
   FabricActivityCall,
@@ -25,6 +26,17 @@ const MAX_DETAIL_CHARS = 1_000;
 const MAX_DATA_CHARS = 8_000;
 const MAX_CALL_PAYLOAD_CHARS = 64_000;
 const MAX_CALL_SUMMARY_CHARS = 120;
+// A global budget, not MAX_RUNS * MAX_CALLS * per-field caps. Charge at least
+// UTF-16 storage or UTF-8 JSON bytes, whichever is larger.
+export const MAX_ACTIVITY_PAYLOAD_BYTES = 2 * 1024 * 1024;
+const PAYLOAD_KEYS = ["args", "result", "preview", "data"] as const;
+type PayloadEntry = {
+  run: FabricActivityRun;
+  row: Record<string, unknown>;
+  values: unknown[];
+  bytes: number;
+};
+type InvalidateView = (run?: FabricActivityRun, row?: object) => void;
 
 const terminalStatuses = new Set<FabricActivityStatus>([
   "completed",
@@ -36,7 +48,7 @@ const cleanText = (value: unknown, maxChars: number): string | undefined => {
   if (typeof value !== "string") return undefined;
   const text = value.replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g, " ").trim();
   if (!text) return undefined;
-  return text.slice(0, maxChars);
+  return detachedPreview(text, maxChars);
 };
 
 export const WORKFLOW_ITEM_ID_MAX_CHARS = 128;
@@ -67,7 +79,7 @@ const boundedData = (value: unknown, maxChars = MAX_DATA_CHARS): unknown => {
     return {
       fabricTruncated: true,
       originalChars: serialized.length,
-      preview: serialized.slice(0, Math.max(1, maxChars - 100)),
+      preview: detachedPreview(serialized, Math.max(1, maxChars - 100)),
     };
   } catch {
     return cleanText(String(value), maxChars);
@@ -153,7 +165,7 @@ const createRowProjection = (detailed: boolean, revisions: WeakMap<object, numbe
     value: Record<string, unknown>;
     revision: number;
   }>();
-  return <T extends object>(row: T): T => {
+  const project = <T extends object>(row: T): T => {
     const revision = revisions.get(row) ?? 0;
     const previous = cache.get(row);
     if (previous?.revision === revision) return previous.value as T;
@@ -182,6 +194,7 @@ const createRowProjection = (detailed: boolean, revisions: WeakMap<object, numbe
     cache.set(row, { source, value, revision });
     return value as T;
   };
+  return { project, invalidate: (row: object) => cache.delete(row) };
 };
 
 export class FabricActivityStore {
@@ -191,6 +204,9 @@ export class FabricActivityStore {
   #revision = 0;
   readonly #runRevisions = new WeakMap<FabricActivityRun, number>();
   readonly #rowRevisions = new WeakMap<object, number>();
+  readonly #payloads = new Map<object, PayloadEntry>();
+  #payloadBytes = 0;
+  readonly #views = new Set<WeakRef<InvalidateView>>();
 
   revision(): number {
     return this.#revision;
@@ -205,6 +221,9 @@ export class FabricActivityStore {
     if (this.#runs.size === 0) return;
     this.#runs.clear();
     this.#callIndex.clear();
+    this.#payloads.clear();
+    this.#payloadBytes = 0;
+    this.#invalidateViews();
     this.#emit();
   }
 
@@ -227,6 +246,8 @@ export class FabricActivityStore {
       updatedAt: now,
       ...(description ? { description } : {}),
     };
+    const replaced = this.#runs.get(id);
+    if (replaced) this.#releaseRunPayloads(replaced);
     this.#runs.delete(id);
     this.#runs.set(id, run);
     this.#callIndex.set(id, new Map());
@@ -338,7 +359,11 @@ export class FabricActivityStore {
     const data = boundedData(input.data);
 
     if (!item) {
-      if (run.items.length >= MAX_ITEMS) run.items.splice(0, run.items.length - MAX_ITEMS + 1);
+      if (run.items.length >= MAX_ITEMS) {
+        for (const removed of run.items.splice(0, run.items.length - MAX_ITEMS + 1)) {
+          this.#releasePayloads(run, removed);
+        }
+      }
       item = {
         id,
         label,
@@ -387,7 +412,11 @@ export class FabricActivityStore {
       createdAt: Date.now(),
       ...(data !== undefined ? { data } : {}),
     });
-    if (run.events.length > MAX_EVENTS) run.events.splice(0, run.events.length - MAX_EVENTS);
+    if (run.events.length > MAX_EVENTS) {
+      for (const removed of run.events.splice(0, run.events.length - MAX_EVENTS)) {
+        this.#releasePayloads(run, removed);
+      }
+    }
     run.updatedAt = Date.now();
     this.#emit(run, run.events.at(-1));
   }
@@ -416,6 +445,7 @@ export class FabricActivityStore {
       existing.updatedAt = now;
       delete existing.finishedAt;
       delete existing.result;
+      delete existing.preview;
       delete existing.error;
       delete existing.detail;
       delete existing.progress;
@@ -425,7 +455,10 @@ export class FabricActivityStore {
     }
     if (run.calls.length >= MAX_CALLS) {
       const removed = run.calls.splice(0, run.calls.length - MAX_CALLS + 1);
-      for (const call of removed) index.delete(call.id);
+      for (const call of removed) {
+        index.delete(call.id);
+        this.#releasePayloads(run, call);
+      }
     }
     const call: FabricActivityCall = {
       id: input.callId,
@@ -578,12 +611,23 @@ export class FabricActivityStore {
     let ordered: FabricActivityRun[] = [];
     let runs = new WeakMap<FabricActivityRun, { revision: number; value: FabricActivityRun }>();
     let rows = createRowProjection(false, this.#rowRevisions);
+    // Weak observers do not make abandoned reader closures live forever. Clear
+    // obsolete run snapshots immediately, even when a reader is paused.
+    const invalidate: InvalidateView = (run, row) => {
+      ordered = [];
+      revision = -1;
+      if (run) runs.delete(run);
+      else {
+        runs = new WeakMap();
+        rows = createRowProjection(detailed, this.#rowRevisions);
+      }
+      if (row) rows.invalidate(row);
+    };
+    this.#views.add(new WeakRef(invalidate));
     return (nextDetailed = false) => {
       if (detailed !== nextDetailed) {
         detailed = nextDetailed;
-        runs = new WeakMap();
-        rows = createRowProjection(detailed, this.#rowRevisions);
-        revision = -1;
+        invalidate();
       }
       if (revision !== this.#revision) {
         ordered = this.#orderedRuns().map((run) => {
@@ -592,10 +636,10 @@ export class FabricActivityStore {
           if (cached?.revision === runRevision) return cached.value;
           const value: FabricActivityRun = {
             ...run,
-            phases: Object.freeze(run.phases.map(rows)) as FabricActivityPhase[],
-            calls: Object.freeze(run.calls.map(rows)) as FabricActivityCall[],
-            items: Object.freeze(run.items.map(rows)) as FabricActivityItem[],
-            events: Object.freeze(run.events.map(rows)) as FabricActivityRun["events"],
+            phases: Object.freeze(run.phases.map(rows.project)) as FabricActivityPhase[],
+            calls: Object.freeze(run.calls.map(rows.project)) as FabricActivityCall[],
+            items: Object.freeze(run.items.map(rows.project)) as FabricActivityItem[],
+            events: Object.freeze(run.events.map(rows.project)) as FabricActivityRun["events"],
           };
           Object.freeze(value);
           runs.set(run, { revision: runRevision, value });
@@ -652,17 +696,82 @@ export class FabricActivityStore {
     while (this.#runs.size > MAX_RUNS && removable.length > 0) {
       const run = removable.shift();
       if (!run) break;
+      this.#releaseRunPayloads(run);
       this.#runs.delete(run.id);
       this.#callIndex.delete(run.id);
     }
   }
 
+  #invalidateViews(run?: FabricActivityRun, row?: object): void {
+    for (const ref of this.#views) {
+      const invalidate = ref.deref();
+      if (invalidate) invalidate(run, row);
+      else this.#views.delete(ref);
+    }
+  }
+
+  #releasePayloads(run: FabricActivityRun, row: object): void {
+    const previous = this.#payloads.get(row);
+    if (previous) {
+      this.#payloadBytes -= previous.bytes;
+      this.#payloads.delete(row);
+    }
+    this.#invalidateViews(run, row);
+  }
+
+  #releaseRunPayloads(run: FabricActivityRun): void {
+    for (const row of [...run.calls, ...run.items, ...run.events]) this.#releasePayloads(run, row);
+    this.#invalidateViews(run);
+  }
+
+  #trackPayloads(run: FabricActivityRun, row: object): void {
+    const record = row as Record<string, unknown>;
+    const values = PAYLOAD_KEYS.map(key => record[key]);
+    const previous = this.#payloads.get(row);
+    if (previous && values.every((value, index) => Object.is(value, previous.values[index]))) return;
+    if (previous) this.#payloadBytes -= previous.bytes;
+    let bytes = 0;
+    for (const value of values) {
+      if (value === undefined) continue;
+      // boundedData has already produced owned, capped JSON with no hooks.
+      const json = JSON.stringify(value);
+      if (json !== undefined) bytes += Math.max(json.length * 2, Buffer.byteLength(json, "utf8"));
+    }
+    if (bytes) {
+      this.#payloads.set(row, { run, row: record, values, bytes });
+      this.#payloadBytes += bytes;
+    } else this.#payloads.delete(row);
+    if (previous) this.#invalidateViews(run, row);
+  }
+
+  #boundPayloads(): void {
+    while (this.#payloadBytes > MAX_ACTIVITY_PAYLOAD_BYTES) {
+      const oldest = this.#payloads.entries().next().value;
+      if (!oldest) break;
+      const [row, entry] = oldest;
+      for (const key of PAYLOAD_KEYS) delete entry.row[key];
+      this.#releasePayloads(entry.run, row);
+      this.#rowRevisions.set(row, this.#revision);
+      this.#runRevisions.set(entry.run, this.#revision);
+    }
+  }
+
   #emit(run?: FabricActivityRun, changed?: object): void {
     this.#revision++;
-    if (run) this.#runRevisions.set(run, this.#revision);
+    if (run) {
+      this.#runRevisions.set(run, this.#revision);
+      this.#invalidateViews(run);
+    }
     if (Array.isArray(changed)) {
-      for (const row of changed) this.#rowRevisions.set(row, this.#revision);
-    } else if (changed) this.#rowRevisions.set(changed, this.#revision);
+      for (const row of changed) {
+        this.#rowRevisions.set(row, this.#revision);
+        if (run) this.#trackPayloads(run, row);
+      }
+    } else if (changed) {
+      this.#rowRevisions.set(changed, this.#revision);
+      if (run) this.#trackPayloads(run, changed);
+    }
+    this.#boundPayloads();
     for (const listener of this.#listeners) {
       try {
         listener();

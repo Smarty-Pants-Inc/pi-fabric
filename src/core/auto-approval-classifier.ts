@@ -1,3 +1,4 @@
+import { detachedPreview } from "./preview.js";
 import type { Usage } from "@earendil-works/pi-ai/compat";
 import { Type } from "typebox";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -95,10 +96,10 @@ const boundedJson = (value: unknown, maxChars: number, onTruncated?: () => void)
     const encoded = JSON.stringify(value);
     if (encoded === undefined) return "null";
     if (encoded.length > maxChars) onTruncated?.();
-    return encoded.length <= maxChars ? encoded : `${encoded.slice(0, maxChars)}…`;
+    return encoded.length <= maxChars ? encoded : `${detachedPreview(encoded, maxChars)}…`;
   } catch {
     onTruncated?.();
-    return JSON.stringify(String(value).slice(0, maxChars));
+    return JSON.stringify(detachedPreview(String(value), maxChars));
   }
 };
 
@@ -137,7 +138,7 @@ const transcriptEvidence = (context: ExtensionContext, currentTurnOnly = false) 
       if (text) {
         hasUser = true;
         truncated ||= text.length > 6_000;
-        evidence.push(`USER: ${text.slice(0, 6_000)}`);
+        evidence.push(`USER: ${detachedPreview(text, 6_000)}`);
       }
       continue;
     }
@@ -158,7 +159,7 @@ const transcriptEvidence = (context: ExtensionContext, currentTurnOnly = false) 
   }
   const joined = evidence.join("\n\n");
   return {
-    text: joined.length <= MAX_TRANSCRIPT_CHARS ? joined : joined.slice(joined.length - MAX_TRANSCRIPT_CHARS),
+    text: joined.length <= MAX_TRANSCRIPT_CHARS ? joined : detachedPreview(joined.slice(-MAX_TRANSCRIPT_CHARS), MAX_TRANSCRIPT_CHARS),
     hasUser,
     truncated: truncated || joined.length > MAX_TRANSCRIPT_CHARS,
   };
@@ -388,7 +389,7 @@ export class FabricAutoApprovalClassifier {
     }
     return {
       decision,
-      reason: reason.trim().slice(0, MAX_REASON_CHARS),
+      reason: detachedPreview(reason.trim(), MAX_REASON_CHARS),
       model: `${model.provider}/${model.id}`,
       usage: response.usage,
     };

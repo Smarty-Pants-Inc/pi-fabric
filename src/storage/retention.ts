@@ -225,6 +225,9 @@ const recordAgeReference = (record: RunRecordSummary, fallback: number): number 
 // unremovable forever: 54k expired actor runs with reply.json piled up in /tmp (smarty-dev#2010).
 const runFiles = new Set([
   "task.txt", "task.txt.provenance.json", "status.json", "events.jsonl", "lifecycle.jsonl", "steer.jsonl", "schema.json", "images.json",
+  // Manager-owned exact settlement and byte-evicted legacy nested history.
+  // Neither artifact substitutes for the worker status/receipt/exit proof.
+  "manager-result.json", "manager-nested.json",
   "reply.json", "relaunches.jsonl", "completion-recipient.json", "route-session.jsonl", "route-dispatch-receipt.json",
   // Native session of an unrouted process Pi task (worker.ts persistentPiTask); owned file only.
   "session.jsonl",

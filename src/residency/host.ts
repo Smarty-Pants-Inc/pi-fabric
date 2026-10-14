@@ -2,6 +2,7 @@
 
 import { fabricTurnProvenance, fabricWakeCause, copyFabricWakeCause, type FabricWakeCause, type FabricPrincipal } from "../fabric-provenance.js";
 import { randomUUID } from "node:crypto";
+import { detachedPreview } from "../core/preview.js";
 import { resolveActorInstructions, assertActorInstructionReplacement } from "../actors/instructions-file.js";
 import {
   RESIDENT_HANDOVER_ABI, HANDOVER_DRAIN_MS, exactResidentProcess, assertAutomaticReleaseRecovery,
@@ -595,7 +596,7 @@ export class ResidentHost {
       onBackgroundComplete: (result) => {
         if (!config.agents.notifyOnComplete) return;
         const durationMs = Math.max(0, (result.finishedAt ?? Date.now()) - result.startedAt);
-        const summary = (result.text || result.error || "no result").slice(0, COMPLETION_MAX_CHARS);
+        const summary = detachedPreview(result.text || result.error || "no result", COMPLETION_MAX_CHARS);
         this.#trackPublication(this.#queueDelivery(
           { id: result.id, name: result.name, kind: "agent" },
           `Fabric agent ${result.id.slice(0, 8)} ${result.status} after ${Math.round(durationMs / 1_000)}s: ${summary}`,
@@ -1320,7 +1321,7 @@ export class ResidentHost {
         if (!(error instanceof Error && error.message.startsWith(`Mesh compare-and-swap failed for ${key}: expected version 0,`))) {
           if (isMeshWriteDeferred(error)) throw error; // no truncated rewrite for a refused write
           await this.mesh.put({
-            key, value: { ...publish, message: publish.message.slice(0, Math.max(1, this.config.mesh.eventContextChars)), data: { fabricTruncated: true } },
+            key, value: { ...publish, message: detachedPreview(publish.message, Math.max(1, this.config.mesh.eventContextChars)), data: { fabricTruncated: true } },
             identity: this.identity, ifVersion: 0,
           });
         }

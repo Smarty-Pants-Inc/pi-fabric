@@ -1,6 +1,7 @@
 import { getMarkdownTheme, type ExtensionAPI, type MessageRenderer } from "@earendil-works/pi-coding-agent";
 import { Box, Markdown, Spacer, Text, truncateToWidth } from "@earendil-works/pi-tui";
 import { createHash } from "node:crypto";
+import { detachedPreview } from "../core/preview.js";
 import type { FabricIncomingMessageMode } from "../config.js";
 import { safeText } from "./format.js";
 
@@ -67,15 +68,41 @@ const receipt = (from: string, kind: string, value: string): string =>
 
 /** A display-only index, separate from the authoritative delivery/inbox state. */
 class DeliveredDisplayIndex {
-  #seen: readonly unknown[] = [];
+  // Keep only stable scalar branch metadata. In particular, never retain the branch array or
+  // any entry object. V8 slices retain their parent strings, so scalar IDs are detached first.
+  #seenIds: readonly string[] = [];
+  #seenLength = 0;
+  #sessionVersion: string | number | undefined;
+  #fallbackIds = new WeakMap<object, string>();
+  #nextFallbackId = 0;
   #receipts = new Set<string>();
-  update(entries: readonly unknown[]): ReadonlySet<string> {
-    const previous = this.#seen;
-    if (entries.length < previous.length || (previous.length && entries[previous.length - 1] !== previous.at(-1))) {
-      this.#receipts.clear();
-      this.#seen = [];
+
+  #entryId(entry: unknown, index: number): string {
+    const value = record(entry).id;
+    if (typeof value === "string" && value) return detachedPreview(`id:${value}`, value.length + 3);
+    if (entry !== null && typeof entry === "object") {
+      const object = entry as object;
+      const existing = this.#fallbackIds.get(object);
+      if (existing) return existing;
+      const generated = `object:${++this.#nextFallbackId}`;
+      this.#fallbackIds.set(object, generated);
+      return generated;
     }
-    for (let index = this.#seen.length; index < entries.length; index++) {
+    return `index:${index}`;
+  }
+
+  update(entries: readonly unknown[], sessionVersion?: string | number): ReadonlySet<string> {
+    const currentIds = entries.map((entry, index) => this.#entryId(entry, index));
+    const versionChanged = this.#sessionVersion !== undefined && sessionVersion !== undefined &&
+      this.#sessionVersion !== sessionVersion;
+    const samePrefix = currentIds.length >= this.#seenLength &&
+      this.#seenIds.every((id, index) => currentIds[index] === id);
+    if (versionChanged || !samePrefix) {
+      this.#receipts.clear();
+      this.#seenIds = [];
+      this.#seenLength = 0;
+    }
+    for (let index = this.#seenLength; index < entries.length; index++) {
       const entry = record(entries[index]);
       if (entry.type !== "custom_message" || entry.customType !== "pi-fabric-agent-message") continue;
       const details = record(entry.details);
@@ -97,7 +124,9 @@ class DeliveredDisplayIndex {
         else if (typeof data.ref === "string" && data.ref.trim() && topic) add("topic-ref", JSON.stringify([topic, data.ref.trim()]));
       }
     }
-    this.#seen = entries;
+    this.#seenIds = currentIds;
+    this.#seenLength = currentIds.length;
+    this.#sessionVersion = sessionVersion ?? this.#sessionVersion;
     return this.#receipts;
   }
 }
@@ -183,9 +212,24 @@ export const registerIncomingMessageRenderers = (
   mode: () => FabricIncomingMessageMode,
 ): void => {
   let entries: () => readonly unknown[] = () => [];
+  let sessionVersion: () => string | number | undefined = () => undefined;
   const delivered = new DeliveredDisplayIndex();
   pi.on("session_start", (_event, context) => {
-    entries = () => context.sessionManager.getBranch();
+    const manager = context.sessionManager as unknown as {
+      getBranch: () => readonly unknown[];
+      getHeader?: () => unknown;
+      getSessionId?: () => unknown;
+    };
+    entries = () => manager.getBranch();
+    sessionVersion = () => {
+      const headerVersion = record(manager.getHeader?.()).version;
+      const sessionId = manager.getSessionId?.();
+      if (typeof headerVersion === "string" || typeof headerVersion === "number") {
+        const version = `${typeof sessionId === "string" ? sessionId : ""}:${headerVersion}`;
+        return detachedPreview(version, version.length);
+      }
+      return typeof sessionId === "string" ? detachedPreview(sessionId, sessionId.length) : undefined;
+    };
   });
   for (const type of INCOMING_MESSAGE_TYPES) {
     pi.registerMessageRenderer(type, (message, options, theme) => {
@@ -198,7 +242,7 @@ export const registerIncomingMessageRenderers = (
         const repeated = repeatedInboxRows(all, prior);
         return repeated.length ? fullCarrier(message, repeated, theme) : undefined;
       }
-      const receipts = new Set(type === "pi-fabric-inbox" ? delivered.update(history) : []);
+      const receipts = new Set(type === "pi-fabric-inbox" ? delivered.update(history, sessionVersion()) : []);
       for (const id of prior) receipts.add(id);
       const visible = unseenRows(message, all, receipts);
       if (!visible.length) return { render: () => [], invalidate() {} };

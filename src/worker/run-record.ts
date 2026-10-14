@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { detachedPreview } from "../core/preview.js";
 import path from "node:path";
 import { mkdirPrivate } from "../storage/private-dir.js";
 import type {
@@ -159,7 +160,7 @@ export const writeCrashRunRecord = (
     ...record,
     ...(writeReceipt ? { writeReceipt } : {}),
     status: "failed",
-    error: `Worker crashed before reporting a result: ${reason}`.slice(0, MAX_RUN_ERROR_CHARS),
+    error: detachedPreview(`Worker crashed before reporting a result: ${reason}`, MAX_RUN_ERROR_CHARS),
     finishedAt: Date.now(),
     updatedAt: Date.now(),
   };

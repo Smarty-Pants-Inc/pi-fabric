@@ -1,4 +1,6 @@
 import fs from "node:fs";
+import { readJsonlRecords } from "./jsonl.js";
+import { detachedPreview } from "../core/preview.js";
 import type { FabricExecutionOutcomeV1, FabricTraceJsonValue } from "../audit/trace.js";
 import {
   readFabricBranchSummaryDetails,
@@ -117,15 +119,17 @@ export interface SessionHeaderInfo {
 
 const truncate = (text: string, max: number): { text: string; truncated: boolean } => {
   const scalarLimit = Math.max(0, Math.floor(max));
-  if (scalarLimit >= text.length) return { text, truncated: false };
+  if (scalarLimit >= text.length) return { text: detachedPreview(text, text.length), truncated: false };
   let scalarCount = 0;
   let utf16End = 0;
   for (const scalar of text) {
-    if (scalarCount >= scalarLimit) return { text: text.slice(0, utf16End), truncated: true };
+    if (scalarCount >= scalarLimit) {
+      return { text: detachedPreview(text, utf16End), truncated: true };
+    }
     utf16End += scalar.length;
     scalarCount += 1;
   }
-  return { text, truncated: false };
+  return { text: detachedPreview(text, utf16End), truncated: false };
 };
 
 const asString = (value: unknown): string =>
@@ -554,7 +558,7 @@ const parseTimestamp = (raw: unknown): number | null => {
  * the header; otherwise the explicit `identity` fallbacks apply.
  */
 export const normalizeRecords = (
-  records: readonly unknown[],
+  records: Iterable<unknown>,
   identity: { sessionFile: string; sessionId?: string; cwd?: string },
   maxEntryChars: number,
   options: NormalizeSessionOptions = {},
@@ -695,23 +699,11 @@ export const normalizeSession = (
   maxEntryChars: number,
   options: NormalizeSessionOptions = {},
 ): { entries: NormalizedEntry[]; header: SessionHeaderInfo | null; indexCoverage: NormalizationCoverage } => {
-  let content: string;
   try {
-    content = fs.readFileSync(sessionFile, "utf8");
+    return normalizeRecords(readJsonlRecords(sessionFile), { sessionFile }, maxEntryChars, options);
   } catch {
     return { entries: [], header: null, indexCoverage: { complete: false, reasons: ["source_unavailable"] } };
   }
-  const records: unknown[] = [];
-  for (const line of content.split("\n")) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-    try {
-      records.push(JSON.parse(trimmed));
-    } catch {
-      continue;
-    }
-  }
-  return normalizeRecords(records, { sessionFile }, maxEntryChars, options);
 };
 
 /** Read only the session header (first JSONL line). */

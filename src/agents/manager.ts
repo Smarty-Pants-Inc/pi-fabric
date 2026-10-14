@@ -1,4 +1,5 @@
 import { childProcessEnvironment } from "../core/atomic-write.js";
+import { detachedPreview } from "../core/preview.js";
 import { copyFabricPrincipal, copyFabricProvenance, type FabricPrincipal, type FabricTurnProvenance } from "../fabric-provenance.js";
 import { randomUUID } from "node:crypto";
 import { taskReturnAddressArguments, type TaskReturnAddress } from "./task-return-address.js";
@@ -204,7 +205,15 @@ const MAX_UI_TEXT_CHARS = 16_000;
 const MAX_UI_ERROR_CHARS = 8_000;
 const MAX_UI_VALUE_CHARS = 64_000;
 const MAX_RETAINED_UI_RUNS = 240;
+// Split the payload budget between internal snapshots and the public UI-list cache.
+const MAX_RETAINED_UI_BYTES = 2 * 1024 * 1024;
+const MAX_RETAINED_UI_SNAPSHOT_BYTES = MAX_RETAINED_UI_BYTES / 2;
 const MAX_RETAINED_RUN_HANDLES = 1_000;
+const MAX_PREVIOUS_RUN_BYTES = 2 * 1024 * 1024;
+// Manager-owned immutable terminal outcome; worker status can still be rewritten
+// during native close, after host schema validation has already settled the task.
+const MANAGER_RESULT_FILE = "manager-result.json";
+const MANAGER_NESTED_FILE = "manager-nested.json";
 const MAX_LOG_SUMMARY_CHARS = 7_000;
 const MAX_LOG_DETAIL_CHARS = 900;
 const RETENTION_SWEEP_INTERVAL_MS = 15 * 60 * 1_000;
@@ -411,6 +420,8 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
   stopRequested: boolean;
   finalAnswer?: FinalAnswerReceipt;
   finalAnswerResult?: AgentRunResult;
+  /** Full immutable published outcome, demand-loaded after settlement. */
+  settledResultFile?: string;
   finalAnswerCompletion?: Promise<void>;
   terminalNoticeSeen?: Set<string>;
   /** Process teardown is an ownership obligation, even after logical settlement. */
@@ -463,6 +474,8 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
   worktreeResult?: AgentWorktreeResult;
   nestedSnapshot?: AgentRunRecord[];
   nestedSnapshotAt?: number;
+  /** A UI eviction preserved legacy descendants outside their removed source tree. */
+  nestedSnapshotSaved?: true;
   /** Routed child dialogs in flight; aborted at settlement. */
   questions?: AbortController;
   questionDecisionId?: string;
@@ -478,6 +491,14 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
    *  is identical whether the stream arrived live or only at settle. */
   usageEmitted: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number };
 }
+
+// Construct outside spawn/preparation: deferred native custody must not keep
+// the request-bearing launch context alive through a shared lexical context.
+const executionFencedRelease = (managed: ManagedAgent, release: () => void): (() => void) =>
+  () => {
+    if (managed.executionExited) release();
+    else managed.executionRelease = release;
+  };
 
 interface QueuedAgent {
   /** Host-owned admission address, including terminal outcomes with no launch manifest. */
@@ -563,7 +584,7 @@ const resumeTask = (
     "Inspect the current state first, do not redo work that is already done, and carry the task through to completion.",
     ...(summary ? [`Last observed run activity: ${summary}`] : []),
   ].join(" ");
-  return `${note.slice(0, MAX_RESUME_NOTE_CHARS)}\n\n${task}`;
+  return `${detachedPreview(note, MAX_RESUME_NOTE_CHARS)}\n\n${task}`;
 };
 
 const retryablePiStartupError = (error: string | undefined): boolean =>
@@ -573,10 +594,7 @@ const retryablePiStartupError = (error: string | undefined): boolean =>
   );
 
 const safeName = (value: string): string =>
-  value
-    .replace(/[\r\n\t]+/g, " ")
-    .trim()
-    .slice(0, MAX_NAME_LENGTH) || "Fabric agent";
+  detachedPreview(value.replace(/[\r\n\t]+/g, " ").trim(), MAX_NAME_LENGTH) || "Fabric agent";
 
 const readRecord = (filePath: string): AgentRunRecord | undefined => {
   try {
@@ -589,44 +607,79 @@ const readRecord = (filePath: string): AgentRunRecord | undefined => {
   }
 };
 
+const uiText = (text: string, max: number): string =>
+  detachedPreview(text, max) + (text.length > max ? "…" : "");
+
 const boundedUiValue = (value: unknown): unknown => {
   if (value === undefined) return undefined;
   try {
     const serialized = JSON.stringify(value);
-    if (serialized.length <= MAX_UI_VALUE_CHARS) return JSON.parse(serialized) as unknown;
+    if (serialized.length <= MAX_UI_VALUE_CHARS) {
+      return JSON.parse(detachedPreview(serialized, MAX_UI_VALUE_CHARS)) as unknown;
+    }
     return {
       fabricTruncated: true,
       originalChars: serialized.length,
-      preview: serialized.slice(0, MAX_UI_VALUE_CHARS - 100),
+      preview: detachedPreview(serialized, MAX_UI_VALUE_CHARS - 100),
     };
   } catch {
-    return String(value).slice(0, MAX_UI_VALUE_CHARS);
+    return uiText(String(value), MAX_UI_VALUE_CHARS);
   }
 };
 
-const compactUiRecord = (record: AgentRunRecord): AgentRunRecord => {
+// Copy metadata too: even a short path/label may itself be a slice of a large
+// worker buffer. Keep object/array shapes for dashboard consumers; full API
+// results always come from the disk record, never this projection.
+const detachedUiMetadata = (value: unknown, depth = 0): unknown => {
+  if (typeof value === "string") return uiText(value, MAX_UI_TEXT_CHARS);
+  if (value === null || typeof value !== "object") return value;
+  if (depth >= 8) return undefined;
+  if (Array.isArray(value)) return value.slice(0, 256).map(item => detachedUiMetadata(item, depth + 1));
+  return Object.fromEntries(Object.entries(value).slice(0, 64)
+    .map(([key, item]) => [detachedPreview(key, MAX_UI_TEXT_CHARS), detachedUiMetadata(item, depth + 1)]));
+};
+
+const compactUiRecord = (record: AgentRunRecord, depth = 0): AgentRunRecord => {
   const { task, text, error, value, nestedAgents, ...rest } = record;
   return {
-    ...rest,
-    task:
-      task.length <= MAX_UI_TEXT_CHARS
-        ? task
-        : `${task.slice(0, MAX_UI_TEXT_CHARS)}…`,
-    text: text.length <= MAX_UI_TEXT_CHARS ? text : `${text.slice(0, MAX_UI_TEXT_CHARS)}…`,
-    ...(error
-      ? {
-          error:
-            error.length <= MAX_UI_ERROR_CHARS
-              ? error
-              : `${error.slice(0, MAX_UI_ERROR_CHARS)}…`,
-        }
-      : {}),
+    ...Object.fromEntries(Object.entries(rest).map(([key, item]) =>
+      [detachedPreview(key, MAX_UI_TEXT_CHARS), detachedUiMetadata(item)])) as typeof rest,
+    task: uiText(task, MAX_UI_TEXT_CHARS),
+    text: uiText(text, MAX_UI_TEXT_CHARS),
+    ...(error !== undefined ? { error: uiText(error, MAX_UI_ERROR_CHARS) } : {}),
     ...(value !== undefined ? { value: boundedUiValue(value) } : {}),
-    ...(nestedAgents && nestedAgents.length > 0
-      ? { nestedAgents: nestedAgents.map((nested) => compactUiRecord(nested)) }
+    ...(depth < 8 && nestedAgents && nestedAgents.length > 0
+      ? { nestedAgents: nestedAgents.slice(0, 200).map((nested) => compactUiRecord(nested, depth + 1)) }
       : {}),
   };
 };
+
+// Conservative UTF-16 payload accounting (including JSON keys/escapes). The
+// weak memo is safe for immutable projections and does not own their lifetime.
+const uiPayloadSizes = new WeakMap<object, number>();
+const uiPayloadBytes = (value: object): number => {
+  const known = uiPayloadSizes.get(value);
+  if (known !== undefined) return known;
+  const bytes = JSON.stringify(value).length * 2;
+  uiPayloadSizes.set(value, bytes);
+  return bytes;
+};
+
+interface PreviousRunSummary {
+  id: string;
+  name: string;
+  status: AgentRunResult["status"];
+  runner: AgentRunResult["runner"];
+  actorId?: string;
+  finalAnswerReceipt?: AgentRunResult["finalAnswerReceipt"];
+  error?: string;
+}
+
+interface PreviousRun {
+  summary: PreviousRunSummary;
+  resultFile: string;
+  bytes: number;
+}
 
 // A terminal owner no longer hosts its session children. Preserve genuine final
 // results, but do not present its last running snapshot as live execution. Durable
@@ -858,7 +911,8 @@ export class AgentManager {
   readonly #onStoppedAtClose: ((results: AgentRunResult[]) => void) | undefined;
   readonly #onSettled: ((result: AgentRunResult, admittedRecipient?: CompletionRecipient) => void) | undefined;
   /** Results of runs a previous runtime of this session stopped at reload/shutdown. */
-  readonly #previousRuns = new Map<string, AgentRunResult>();
+  readonly #previousRuns = new Map<string, PreviousRun>();
+  #previousRunBytes = 0;
   #enodevRuns: string[] | undefined;
   readonly #enodevCommits = new Map<string, { directory: string; actorId: string; activationId: string }>();
   /** pi-fabric#939 round 3: runs THIS manager settled through #912's recovery (it removed their markers itself). */
@@ -1308,6 +1362,26 @@ export class AgentManager {
     return childThinkingBounds(this.#thinkingBounds?.() ?? {}, requested);
   }
 
+  // Stored launch callbacks bind only custody/authority facts, never a spawn
+  // closure whose lexical ancestors also contain the full task request.
+  #handleUnconfirmedExit(id: string, runDirectory: string, transport: AgentTransportAdapter["kind"], reason: string): void {
+    const managed = this.#runs.get(id);
+    if (managed) this.#markLost(managed, reason);
+    else {
+      // Cancelled/in-flight launches have no registered owner yet.
+      try { markUnresolvedWorker(runDirectory, reason, { runId: id, transport }); } catch { /* launch cleanup remains pending */ }
+    }
+  }
+
+  #assertLaunchAuthorized(id: string, authorize?: () => boolean): true {
+    if (authorize && !authorize()) {
+      // Preserve queued revocation as stopped rather than a launch failure.
+      this.#queued.get(id)?.abort.abort();
+      throw new Error("Agent activation no longer authorized");
+    }
+    return true;
+  }
+
   async #spawn(request: AgentRunRequest, signal?: AbortSignal, authorize?: () => boolean, beforeCommit?: (id: string) => void, onOutputPrincipalDowngrade?: () => void, onLaunched?: (handle: AgentHandleInfo) => void, preparation?: AgentLaunchPreparationOptions, callerReturnAddress?: TaskReturnAddress): Promise<AgentHandleInfo> {
     if (!this.config.enabled) throw new Error("Agents are disabled in Fabric configuration");
     if (this.#currentDepth >= this.config.maxDepth) {
@@ -1469,14 +1543,7 @@ export class AgentManager {
     const id = randomUUID().replaceAll("-", "");
     const name = safeName(request.name ?? request.task.split("\n", 1)[0] ?? "Fabric agent");
     const callerSignal = signal;
-    const assertAuthorized = (): void => {
-      if (authorize && !authorize()) {
-        // Mark revocation before throwing so a queued receipt settles as stopped,
-        // not a launch failure, even if only the generation/state check changed.
-        this.#queued.get(id)?.abort.abort();
-        throw new Error("Agent activation no longer authorized");
-      }
-    };
+    const assertAuthorized = this.#assertLaunchAuthorized.bind(this, id, authorize);
     let routeDispatch: ReturnType<typeof import("./model-route.js")["prepareRouteDispatch"]> | undefined;
     if (request.routeDecision) {
       const { prepareRouteDispatch } = await import("./model-route.js");
@@ -1838,15 +1905,8 @@ export class AgentManager {
                     ? "requested worker features cannot be preserved by one-shot placement"
                     : timeoutMs > 240 * 60_000 ? "launcher supports at most 240 minutes" : undefined,
           signal,
-          onUnconfirmedExit: (reason) => {
-            const managed = this.#runs.get(id);
-            if (managed) this.#markLost(managed, reason);
-            else {
-              // Cancelled/in-flight launches have no registered owner yet.
-              try { markUnresolvedWorker(runDirectory, reason, { runId: id, transport: adapter.kind }); } catch { /* launch cleanup remains pending */ }
-            }
-          },
-          ...(authorize ? { authorize: () => { assertAuthorized(); return true; } } : {}),
+          onUnconfirmedExit: this.#handleUnconfirmedExit.bind(this, id, runDirectory, adapter.kind),
+          ...(authorize ? { authorize: assertAuthorized } : {}),
         };
         if (this.#closing) throw new Error("Fabric agent manager is closing");
         if (signal?.aborted) throw new Error("Agent launch aborted");
@@ -1898,10 +1958,6 @@ export class AgentManager {
           launch: { ...launch, signal: authorize ? signal : undefined },
           startupAttempts: 1,
           ...lifecycle,
-          release: () => {
-            if (managed.executionExited) release();
-            else managed.executionRelease = release;
-          },
           abortSignal: queued && !authorize ? undefined : signal,
           abortHandler: undefined,
           ...(model ? { model } : {}),
@@ -1933,8 +1989,11 @@ export class AgentManager {
           },
           usageEmitted: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
         };
+        // lifecycle.release avoids referencing managed in its own initializer;
+        // install the fence synchronously before listeners or external registration.
+        managed.release = executionFencedRelease(managed, release);
         if (signal && (!queued || authorize)) {
-          managed.abortHandler = () => this.#handleCallerAbort(id);
+          managed.abortHandler = this.#handleCallerAbort.bind(this, id);
           signal.addEventListener("abort", managed.abortHandler, { once: true });
         }
         this.#runs.set(id, managed);
@@ -2578,7 +2637,7 @@ export class AgentManager {
 
   /** Side-effect-free settlement join for preparation before a durable mutation fence. */
   async join(id: string): Promise<void> {
-    if (this.#previousRun(id)) return;
+    if (this.#hasPreviousRun(id)) return;
     const managed = this.#requireRun(id);
     if (!managed.settled) {
       if (!managed.result) throw new Error(`Agent ${id} has no pending result`);
@@ -2629,9 +2688,18 @@ export class AgentManager {
     return result;
   }
 
+  #readResult(managed: ManagedAgent): AgentRunRecord | undefined {
+    if (!managed.settledResultFile) return readRecord(managed.statusFile);
+    const result = readRecord(managed.settledResultFile);
+    if (!result || result.id !== managed.id || !terminalStatuses.has(result.status)) {
+      throw new Error(`Fabric agent ${managed.id} has no saved terminal result at ${managed.settledResultFile}`);
+    }
+    return result;
+  }
+
   /** Observe a settled outcome, independently of foreground consumption receipts. */
   #settledResult(managed: ManagedAgent): AgentRunResult {
-    const record = managed.finalAnswerResult ?? readRecord(managed.statusFile) ?? managed.latestRecord;
+    const record = managed.finalAnswerResult ?? this.#readResult(managed) ?? managed.latestRecord;
     if (!record || !terminalStatuses.has(record.status)) {
       throw new Error(`Agent ${managed.id} settled without a result`);
     }
@@ -2670,7 +2738,7 @@ export class AgentManager {
 
   /** A terminal worker status is provisional until its retry supervisor settles the run. */
   isSettled(id: string): boolean {
-    if (this.#previousRun(id)) return true;
+    if (this.#hasPreviousRun(id)) return true;
     const queued = this.#queued.get(id);
     return queued ? queued.terminal !== undefined : this.#requireRun(id).settled;
   }
@@ -2682,15 +2750,20 @@ export class AgentManager {
   }
 
   markForeground(id: string): void {
-    if (!this.isSettled(id)) return;
+    // A deferred publication can outlive bounded summary/handle retention. Its
+    // preparation receipt already certified settlement; never drop that debt.
+    if (!this.#foregroundPrepared.has(id) && !this.isSettled(id)) return;
     if (!this.#foregroundPrepared.has(id)) this.prepareForeground(id);
     this.#foregroundDelivered.add(id); // Publication happened; cleanup cannot make a later abandon unread.
-    if (!this.#previousRun(id)) {
-      const queued = this.#queued.get(id);
-      if (queued) queued.background = false;
-      else this.#requireRun(id).background = false;
-    }
+    const queued = this.#queued.get(id);
+    if (queued) queued.background = false;
+    const managed = this.#runs.get(id);
+    if (managed) managed.background = false;
     this.#onResultConsumed?.(id);
+    if (!managed && !queued && !this.#hasPreviousRun(id)) {
+      this.#foregroundPrepared.delete(id);
+      this.#foregroundDelivered.delete(id);
+    }
   }
 
   abandonForeground(id: string): void {
@@ -2699,7 +2772,7 @@ export class AgentManager {
       this.#pendingAbandonment.add(id);
       this.#retryAbandonment(id);
     }
-    if (!this.#previousRun(id)) this.detachSignal(id);
+    if (!this.#hasPreviousRun(id) && (this.#runs.has(id) || this.#queued.has(id))) this.detachSignal(id);
   }
 
   #retryAbandonment(id: string): void {
@@ -2763,7 +2836,7 @@ export class AgentManager {
     managed.background = true;
     // A fast worker may settle before agents.spawn returns and detaches it.
     if (managed.settled) {
-      const record = readRecord(managed.statusFile) ?? managed.latestRecord;
+      const record = this.#readResult(managed) ?? managed.latestRecord;
       if (record && terminalStatuses.has(record.status)) {
         this.#notifyBackgroundComplete(managed, this.#withTransportMetadata(record, managed) as AgentRunResult);
       }
@@ -2797,26 +2870,24 @@ export class AgentManager {
   status(id: string): AgentRunRecord | AgentHandleInfo {
     const queued = this.#queued.get(id);
     if (queued) return queued.terminal ? structuredClone(queued.terminal) : this.#queuedInfo(queued);
-    const previous = this.#previousRuns.get(id);
-    if (previous && !this.#runs.has(id)) {
-      this.#terminalNoticeOutbox.recover(path.join(this.#runRoot, previous.id));
-      return structuredClone(previous);
+    const previous = this.#previousRun(id);
+    if (previous) {
+      this.#terminalNoticeOutbox.recover(path.dirname(this.#previousRuns.get(id)!.resultFile));
+      return previous;
     }
     const managed = this.#requireRun(id);
     this.#observeFinalAnswer(managed);
     this.#routeTerminalNotices(managed);
-    const record = managed.finalAnswerResult ?? (managed.settled
-      ? readRecord(managed.statusFile) ?? managed.latestRecord
-      : managed.latestRecord ?? readRecord(managed.statusFile));
+    const record = managed.finalAnswerResult ?? this.#readResult(managed) ?? managed.latestRecord;
     if (!record) {
       const info = this.#handleInfo(managed, "running");
       const deliveries = this.#checkFollowUps(managed);
       if (deliveries.length) info.followUpDeliveries = deliveries;
       return info;
     }
-    managed.latestRecord = record;
+    managed.latestRecord = compactUiRecord(record);
     if (!managed.latestUiRecord) {
-      managed.latestUiRecord = compactUiRecord(record);
+      managed.latestUiRecord = managed.latestRecord;
       this.#invalidateUiList();
     }
     const result = structuredClone(this.#withTransportMetadata(record, managed));
@@ -2837,27 +2908,46 @@ export class AgentManager {
     const runs = [...this.#runs.values()];
     const active = runs.filter((managed) => !managed.settled);
     const settled = runs.filter((managed) => managed.settled);
-    const retainedSettledCount = Math.max(0, MAX_RETAINED_UI_RUNS - active.length);
-    const retainedSettled =
-      retainedSettledCount > 0 ? settled.slice(-retainedSettledCount) : [];
-    const visible = new Set([...active, ...retainedSettled]);
-    const value = runs
-      .filter((managed) => visible.has(managed))
-      .map((managed) => {
-        let record = managed.latestUiRecord;
-        if (!record) {
-          const latest = managed.latestRecord ?? readRecord(managed.statusFile);
-          if (!latest) return this.#handleInfo(managed, "running");
-          managed.latestRecord = latest;
-          record = compactUiRecord(latest);
-          managed.latestUiRecord = record;
-        }
-        return structuredClone(
-          compactUiRecord(this.#withTransportMetadata(record, managed)),
-        );
-      });
-    value.push(...[...this.#queued.keys()].map((id) => this.status(id)));
-    this.#uiListCache = { revision: this.#uiListRevision, value };
+    const listBudget = MAX_RETAINED_UI_BYTES - MAX_RETAINED_UI_SNAPSHOT_BYTES;
+    const selected = new Map<string, AgentRunRecord | AgentHandleInfo>();
+    let bytes = 4;
+    const projection = (managed: ManagedAgent): AgentRunRecord | AgentHandleInfo => {
+      let record = managed.latestUiRecord;
+      if (!record) {
+        const latest = managed.latestRecord ?? this.#readResult(managed);
+        if (!latest) return this.#handleInfo(managed, "running");
+        record = compactUiRecord(latest);
+        managed.latestRecord = record;
+        managed.latestUiRecord = record;
+      }
+      return compactUiRecord(this.#withTransportMetadata(record, managed));
+    };
+    // Live ownership always stays visible. If its detailed snapshot cannot fit,
+    // display the handle; never omit an active agent in favour of old results.
+    for (const managed of active) {
+      let record = projection(managed);
+      if (bytes + uiPayloadBytes(record) + 2 > listBudget) record = this.#handleInfo(managed, "running");
+      selected.set(managed.id, record);
+      bytes += uiPayloadBytes(record) + 2;
+    }
+    const queuedValue = [...this.#queued.values()].map(queued =>
+      queued.terminal ? compactUiRecord(queued.terminal) : this.#queuedInfo(queued));
+    for (const record of queuedValue) bytes += uiPayloadBytes(record) + 2;
+    const settledCount = Math.max(0, MAX_RETAINED_UI_RUNS - active.length - queuedValue.length);
+    for (const managed of (settledCount > 0 ? settled.slice(-settledCount) : []).reverse()) {
+      if (selected.size - active.length >= settledCount) break;
+      const record = projection(managed);
+      const size = uiPayloadBytes(record) + 2;
+      if (bytes + size > listBudget) break;
+      selected.set(managed.id, record);
+      bytes += size;
+    }
+    const value = runs.flatMap(managed => selected.has(managed.id) ? [selected.get(managed.id)!] : []);
+    value.push(...queuedValue);
+    this.#pruneRetainedUiRecords();
+    // An unusually large live/queued handle set remains queryable, but is not
+    // retained as an over-budget UI-list cache.
+    this.#uiListCache = bytes <= listBudget ? { revision: this.#uiListRevision, value } : undefined;
     return value;
   }
 
@@ -3141,11 +3231,67 @@ export class AgentManager {
     return structuredClone(value);
   }
 
-  /** Runs a previous runtime of this session stopped; wait/status return them, not Unknown. */
+  /** Runs a previous runtime stopped; keep exact outcomes on disk, not in the index. */
   restorePreviousRuns(results: AgentRunResult[]): void {
     for (const result of results) {
-      if (!this.#runs.has(result.id)) this.#previousRuns.set(result.id, structuredClone(result));
+      if (this.#runs.has(result.id)) continue;
+      // Session-carried results may outlive their original temporary run root.
+      // Validate the path component before creating a new private disk backing.
+      if (!/^[A-Za-z0-9_-]{1,256}$/.test(result.id)) throw new Error("Invalid restored Fabric agent id");
+      const directory = path.join(this.#runRoot, result.id);
+      mkdirPrivate(directory, this.#trustRoot());
+      const statusFile = path.join(directory, "status.json");
+      // Publish BEFORE dropping any full in-memory result. A failed save throws,
+      // leaving the old index/result intact and the caller's archive unconsumed.
+      writeJsonAtomic(statusFile, result, { space: 2, durable: true });
+      const resultFile = path.join(directory, MANAGER_RESULT_FILE);
+      writeJsonAtomic(resultFile, result, { space: 2, durable: true });
+      this.#rememberPreviousRun(result, resultFile);
     }
+  }
+
+  #rememberPreviousRun(result: AgentRunResult, resultFile: string): void {
+    const summary: PreviousRunSummary = {
+      id: detachedPreview(result.id, result.id.length),
+      name: uiText(result.name, MAX_NAME_LENGTH),
+      status: result.status,
+      runner: result.runner,
+      ...(result.actorId ? { actorId: uiText(result.actorId, MAX_UI_TEXT_CHARS) } : {}),
+      ...(result.finalAnswerReceipt ? { finalAnswerReceipt: {
+        id: detachedPreview(result.finalAnswerReceipt.id, result.finalAnswerReceipt.id.length),
+        recordedAt: result.finalAnswerReceipt.recordedAt,
+      } } : {}),
+      ...(result.error !== undefined ? { error: uiText(result.error, MAX_UI_ERROR_CHARS) } : {}),
+    };
+    this.#dropPreviousRun(result.id);
+    const bytes = uiPayloadBytes(summary) + resultFile.length * 2;
+    this.#previousRuns.set(summary.id, { summary, resultFile, bytes });
+    this.#previousRunBytes += bytes;
+    while (this.#previousRuns.size > MAX_RETAINED_RUN_HANDLES || this.#previousRunBytes > MAX_PREVIOUS_RUN_BYTES) {
+      this.#forgetRunMetadata(this.#previousRuns.keys().next().value!);
+    }
+  }
+
+  #dropPreviousRun(id: string): void {
+    const previous = this.#previousRuns.get(id);
+    if (!previous) return;
+    this.#previousRunBytes -= previous.bytes;
+    this.#previousRuns.delete(id);
+  }
+
+  #forgetRunMetadata(id: string): void {
+    this.#dropPreviousRun(id);
+    if (this.#runs.has(id) || this.#queued.has(id)) return;
+    if (!this.#foregroundPrepared.has(id) || this.#foregroundDelivered.has(id)) {
+      this.#foregroundPrepared.delete(id);
+      this.#foregroundDelivered.delete(id);
+    }
+    for (const messageId of this.#followUps.get(id)?.keys() ?? []) this.#clearFollowUpTimer(messageId);
+    this.#followUps.delete(id);
+  }
+
+  #hasPreviousRun(id: string): boolean {
+    return !this.#runs.has(id) && this.#previousRuns.has(id);
   }
 
   /** Running (not settled) task agents: what a reload or shutdown would stop. */
@@ -3194,7 +3340,7 @@ export class AgentManager {
     if (result) this.#enodevSettledHere.add(runId);
     if (!result) return false;
     this.#enodevRuns = (this.#enodevRuns ?? []).filter(other => other !== pending.directory);
-    this.#previousRuns.set(result.id, structuredClone(result));
+    this.#rememberPreviousRun(result, path.join(pending.directory, "status.json"));
     this.#retentionRevision++;
     this.#releaseProvenGone(); // smarty-dev#9855: same step as the settle
     return true;
@@ -3235,7 +3381,11 @@ export class AgentManager {
   #previousRun(id: string): AgentRunResult | undefined {
     const previous = this.#runs.has(id) ? undefined : this.#previousRuns.get(id);
     if (!previous) return undefined;
-    return structuredClone(previous);
+    const record = readRecord(previous.resultFile);
+    if (!record || record.id !== id || !terminalStatuses.has(record.status)) {
+      throw new Error(`Fabric agent ${id} has no saved terminal result at ${previous.resultFile}`);
+    }
+    return record as AgentRunResult;
   }
 
   async stop(id: string, options: { consume?: boolean } = {}): Promise<AgentRunResult> {
@@ -3255,8 +3405,8 @@ export class AgentManager {
       if (queued.cleanupPending) throw new Error(`Agent ${id} execution exit unconfirmed; custody retained: ${queued.cleanupPending}`);
       return queued.result;
     }
-    const previous = this.#previousRuns.get(id);
-    if (previous && !this.#runs.has(id)) return structuredClone(previous);
+    const previous = this.#previousRun(id);
+    if (previous) return previous;
     const managed = this.#requireRun(id);
     // A requested stop is terminal: record the intent before any transport work
     // so recovery never restarts a run the operator, a tool, or shutdown ended.
@@ -3283,7 +3433,7 @@ export class AgentManager {
     // before synthesizing a terminal result.
     const observed = terminal ?? existing;
     if (observed) {
-      managed.latestRecord = observed;
+      managed.latestRecord = compactUiRecord(observed);
       if (observed.runnerSessionId) managed.runnerSessionId = observed.runnerSessionId;
     }
     // Stop intent and tree custody are separate: uncertainty keeps the worker's
@@ -3314,6 +3464,7 @@ export class AgentManager {
       const cleaned = await this.#worktrees.cleanup(id, deleteBranch);
       if (!this.config.retainRuns) await removeTree(runDirectory);
       this.#queued.delete(id);
+      this.#forgetRunMetadata(id);
       this.#invalidateUiList();
       return { cleaned: cleaned || !fs.existsSync(runDirectory) };
     }
@@ -3350,8 +3501,7 @@ export class AgentManager {
       await removeTree(managed.runDirectory);
     }
     this.#runs.delete(id);
-    for (const messageId of this.#followUps.get(id)?.keys() ?? []) this.#clearFollowUpTimer(messageId);
-    this.#followUps.delete(id);
+    this.#forgetRunMetadata(id);
     this.#pruneRetainedUiRecords();
     this.#invalidateUiList();
     return { cleaned: cleaned || !fs.existsSync(managed.runDirectory) };
@@ -3363,7 +3513,7 @@ export class AgentManager {
     const logFile = path.join(runDirectory, "events.jsonl");
     const lines = Math.max(1, Math.min(opts.lines ?? 200, 5000));
     const page = readJsonlPage(logFile, lines, opts.before, undefined, opts.beforeGeneration);
-    const statusRecord = readRecord(path.join(runDirectory, "status.json"));
+    const statusRecord = this.#readResult(managed);
     return {
       id,
       runDirectory,
@@ -3467,7 +3617,7 @@ export class AgentManager {
   // turn channel to steer into. Reject steer/follow-up here so callers learn
   // at call time instead of the command being silently dropped by the worker.
   #requireSteerable(id: string, kind: "steer" | "followUp" = "steer"): void {
-    const previous = this.#previousRun(id);
+    const previous = this.#runs.has(id) ? undefined : this.#previousRuns.get(id)?.summary;
     if (previous?.runner === "pi" && previous.finalAnswerReceipt && !previous.actorId) throw new FabricTargetTerminalError(previous.id, previous.finalAnswerReceipt.id);
     const managed = this.#requireRun(id);
     this.#observeFinalAnswer(managed);
@@ -3816,7 +3966,10 @@ export class AgentManager {
       // Retry settlement saves first; pending deliveries and unsafe contents still veto expiry.
       if (!canRemoveTerminalRun(managed.runDirectory)) continue;
       await removeTree(managed.runDirectory).catch(() => undefined);
-      if (!fs.existsSync(managed.runDirectory)) this.#runs.delete(managed.id);
+      if (!fs.existsSync(managed.runDirectory)) {
+        this.#runs.delete(managed.id);
+        this.#forgetRunMetadata(managed.id);
+      }
     }
     if (expired.length > 0) {
       this.#pruneRetainedUiRecords();
@@ -4268,7 +4421,7 @@ export class AgentManager {
       };
       Object.assign(failed, managed.runRoute);
       writeRecord(managed.statusFile, failed);
-      managed.latestRecord = failed;
+      managed.latestRecord = compactUiRecord(failed);
       managed.relaunchFailure = failed;
       return false;
     }
@@ -4280,7 +4433,7 @@ export class AgentManager {
     if (managed.finalAnswer) return true;
     const receipt = readFinalAnswerReceipt(managed.runDirectory, managed.id);
     if (!receipt) return false;
-    managed.finalAnswer = receipt; // Fence synchronous ingress before any validation yields.
+    managed.finalAnswer = { ...receipt, text: "" }; // Fence ingress; the receipt's full text stays on disk.
     managed.finalAnswerCompletion = (async () => {
       let snapshot = readRecord(managed.statusFile) ?? managed.latestRecord;
       {
@@ -4301,6 +4454,9 @@ export class AgentManager {
         finishedAt: receipt.recordedAt,
       } as AgentRunResult;
       if (record.status === "completed") record.text = receipt.text;
+      // Native-close continuations share this receipt's lexical context. They
+      // need its identity, not a second full answer while custody is pending.
+      receipt.text = "";
       const schemaIndex = managed.launch.workerArguments.indexOf("--schema-file");
       if (schemaIndex >= 0 && record.status === "completed") {
         if (managed.launch.workerArguments.includes("--reply-tool") &&
@@ -4433,7 +4589,7 @@ export class AgentManager {
       if (record) {
         this.#observeProgress(managed, record);
         const previous = managed.latestRecord;
-        managed.latestRecord = record;
+        managed.latestRecord = compactUiRecord(record);
         if (
           !previous ||
           previous.updatedAt !== record.updatedAt ||
@@ -4441,11 +4597,12 @@ export class AgentManager {
           previous.runnerSessionId !== record.runnerSessionId ||
           previous.currentTool !== record.currentTool
         ) {
-          managed.latestUiRecord = compactUiRecord(record);
+          managed.latestUiRecord = managed.latestRecord;
           this.#invalidateUiList();
         }
       }
       if (managed.recursive) this.#nestedAgents(managed);
+      this.#pruneRetainedUiRecords();
       if (record?.runnerSessionId) {
         managed.runnerSessionId = record.runnerSessionId;
       }
@@ -4676,6 +4833,8 @@ export class AgentManager {
     const reported = this.#withTransportMetadata(result, managed) as AgentRunResult;
     finishAgentSettlement(managed, reported);
     managed.task = "";
+    delete managed.lastRetriedTransportFailure;
+    delete managed.relaunchFailure;
     this.#notifyBackgroundComplete(managed, reported);
   }
 
@@ -4834,6 +4993,12 @@ export class AgentManager {
   #saveSettledResult(managed: ManagedAgent, result: AgentRunResult): boolean {
     try {
       const full = this.#withTransportMetadata(result, managed, false) as AgentRunResult;
+      // The worker can still rewrite status.json during native teardown. Publish
+      // our exact validated outcome to a manager-only file before dropping full
+      // completion caches; a failed save retains the full retry/custody debt.
+      const resultFile = path.join(managed.runDirectory, MANAGER_RESULT_FILE);
+      writeJsonAtomic(resultFile, full, { space: 2, durable: true });
+      managed.settledResultFile = resultFile;
       if (managed.routeOutcome || this.#onSettled) this.#stageArchive(managed.runDirectory, full, "settlement", undefined, !managed.routeOutcome);
       managed.routeOutcome?.(result);
       this.#onSettled?.(full);
@@ -4841,6 +5006,7 @@ export class AgentManager {
       else if (this.#onStoppedAtClose && !this.#closing) commitRunArchive(managed.runDirectory);
       if (managed.settlementSaveFailure) this.#retentionRevision++;
       delete managed.settlementSaveFailure;
+      delete managed.finalAnswerResult;
       return true;
     } catch (error) {
       managed.settlementSaveFailure = {
@@ -5118,19 +5284,55 @@ export class AgentManager {
 
   #pruneRetainedUiRecords(): void {
     const settled = [...this.#runs.values()].filter((managed) => managed.settled);
-    const evicted = settled.slice(0, -MAX_RETAINED_RUN_HANDLES);
-    for (const managed of evicted) {
+    let handlesChanged = false;
+    for (const managed of settled.slice(0, -MAX_RETAINED_RUN_HANDLES)) {
       if (managed.executionExited && !managed.settlementSaveFailure && !managed.processStopPending &&
-          !managed.nativeReleasePending && !managed.lostContact && !hasUnresolvedWorker(managed.runDirectory)) this.#runs.delete(managed.id);
+          !managed.nativeReleasePending && !managed.lostContact && !hasUnresolvedWorker(managed.runDirectory) &&
+          !this.#terminalNoticeOutbox.hasPending(managed.runDirectory) &&
+          !this.#pendingAbandonment.has(managed.id) &&
+          (!this.#foregroundPrepared.has(managed.id) || this.#foregroundDelivered.has(managed.id))) {
+        this.#runs.delete(managed.id);
+        this.#forgetRunMetadata(managed.id);
+        handlesChanged = true;
+      }
     }
-    const retained = evicted.length > 0 ? settled.slice(evicted.length) : settled;
-    if (retained.length <= MAX_RETAINED_UI_RUNS) return;
-    for (const managed of retained.slice(0, -MAX_RETAINED_UI_RUNS)) {
+    const runs = [...this.#runs.values()];
+    const recent = [
+      ...runs.filter(managed => !managed.settled).reverse(),
+      ...runs.filter(managed => managed.settled).reverse(),
+    ];
+    let bytes = 0, count = 0;
+    for (const managed of recent) {
+      const snapshots = new Set<object>([managed.latestRecord, managed.latestUiRecord, managed.nestedSnapshot]
+        .filter((value): value is AgentRunRecord | AgentRunRecord[] => value !== undefined));
+      const size = [...snapshots].reduce((total, record) => total + uiPayloadBytes(record), 0);
+      if (size > 0 && count < MAX_RETAINED_UI_RUNS && bytes + size <= MAX_RETAINED_UI_SNAPSHOT_BYTES) {
+        bytes += size;
+        count++;
+        continue;
+      }
+      // Legacy nested workers can remove their source directories. Preserve
+      // that historical tree on disk before evicting its last cached copy.
+      if (managed.nestedSnapshot && !managed.settledResultFile) {
+        try {
+          writeJsonAtomic(path.join(managed.runDirectory, MANAGER_NESTED_FILE),
+            { id: managed.id, nestedAgents: managed.nestedSnapshot }, { durable: true });
+          managed.nestedSnapshotSaved = true;
+        } catch {
+          // A failed preservation is a data/custody debt, not eviction authority.
+          delete managed.latestRecord;
+          delete managed.latestUiRecord;
+          continue;
+        }
+      }
+      // Snapshot eviction is not handle/execution eviction. API reads reload
+      // disk records; admission, receipt fences and save/teardown debts stay owned.
       delete managed.latestRecord;
       delete managed.latestUiRecord;
       delete managed.nestedSnapshot;
       delete managed.nestedSnapshotAt;
     }
+    if (handlesChanged) this.#invalidateUiList();
   }
 
   #invalidateUiList(): void {
@@ -5148,7 +5350,7 @@ export class AgentManager {
   #requireRun(id: string): ManagedAgent {
     const managed = this.#runs.get(id);
     if (!managed) {
-      const previous = this.#previousRuns.get(id);
+      const previous = this.#previousRuns.get(id)?.summary;
       if (previous) {
         throw new Error(`Fabric agent ${previous.name} (${id}) is ${previous.status}: ${previous.error ?? "no error"}; it has no running target`);
       }
@@ -5196,6 +5398,12 @@ export class AgentManager {
   // Retain a bounded tree even when legacy workers removed their nested run
   // directories. Terminal-owner reconciliation prevents cached active ghosts.
   #nestedAgents(managed: ManagedAgent, force = false): AgentRunRecord[] {
+    if (managed.nestedSnapshot === undefined && managed.nestedSnapshotSaved) {
+      const saved = readRecord(managed.settledResultFile ?? path.join(managed.runDirectory, MANAGER_NESTED_FILE));
+      if (saved?.id === managed.id && Array.isArray(saved.nestedAgents) && saved.nestedAgents.length > 0) {
+        managed.nestedSnapshot = saved.nestedAgents.map(record => compactUiRecord(record));
+      }
+    }
     const now = Date.now();
     const needsInitialDiscovery =
       managed.nestedSnapshot === undefined &&
@@ -5206,7 +5414,9 @@ export class AgentManager {
       managed.nestedSnapshotAt !== undefined &&
       now - managed.nestedSnapshotAt < NESTED_SNAPSHOT_POLL_MS
     ) {
-      return managed.nestedSnapshot ? structuredClone(managed.nestedSnapshot) : [];
+      const snapshot = managed.nestedSnapshot;
+      this.#pruneRetainedUiRecords();
+      return snapshot ? structuredClone(snapshot) : [];
     }
     managed.nestedSnapshotAt = now;
     const discovered = readNestedAgents(managed.runDirectory);
@@ -5214,14 +5424,15 @@ export class AgentManager {
       managed.nestedSnapshot = discovered;
       this.#invalidateUiList();
     }
-    return managed.nestedSnapshot ? structuredClone(managed.nestedSnapshot) : [];
+    const snapshot = managed.nestedSnapshot;
+    this.#pruneRetainedUiRecords();
+    return snapshot ? structuredClone(snapshot) : [];
   }
 
   #withTransportMetadata(record: AgentRunRecord, managed: ManagedAgent, includeSaveFailure = true): AgentRunRecord {
-    const nestedAgents = reconcileNestedAgents(this.#nestedAgents(
-      managed,
-      terminalStatuses.has(record.status) && !managed.settled,
-    ), record);
+    const observedNested = this.#nestedAgents(managed,
+      terminalStatuses.has(record.status) && !managed.settled);
+    const nestedAgents = reconcileNestedAgents(observedNested.length > 0 ? observedNested : record.nestedAgents ?? [], record);
     const budget = this.#budgetSummary();
     const { logFile: _logFile, nestedAgents: _nestedAgents, ...safeRecord } = record;
     const model = record.model ?? managed.model;

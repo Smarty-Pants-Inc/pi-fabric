@@ -1,4 +1,5 @@
 import type { RecordEnvelope, RecordsOps } from "./store.js";
+import { detachedPreview } from "../core/preview.js";
 
 /**
  * A consumer's reconcile by processing cursor (C4), for a root session: the records addressed to
@@ -76,7 +77,7 @@ const escapeXml = (value: string): string => value.replaceAll("&", "&amp;").repl
 
 const bounded = (record: RecordEnvelope): string => {
   const text = record.text ?? "";
-  if (Buffer.byteLength(text) <= MAX_RECORD_TEXT_BYTES) return text;
+  if (Buffer.byteLength(text) <= MAX_RECORD_TEXT_BYTES) return detachedPreview(text, text.length);
   const cut = Buffer.from(text).subarray(0, MAX_RECORD_TEXT_BYTES).toString("utf8").replace(/\uFFFD$/u, "");
   return `${cut}\n[cut at ${MAX_RECORD_TEXT_BYTES} bytes; read it with records.get({ ref: ${JSON.stringify(record.ref)} })]`;
 };
@@ -93,7 +94,7 @@ export const recordsInboxMessage = (records: readonly RecordEnvelope[]) => ({
         `from=${JSON.stringify(record.from)}`, ...(record.fromName ? [`from_name=${JSON.stringify(record.fromName)}`] : []),
         `at="${new Date(record.createdAt).toISOString()}"`,
       ];
-      const data = Object.keys(record.data).length ? `\n<data>${escapeXml(JSON.stringify(record.data).slice(0, 2048))}</data>` : "";
+      const data = Object.keys(record.data).length ? `\n<data>${escapeXml(detachedPreview(JSON.stringify(record.data), 2048))}</data>` : "";
       return `<record ${attributes.join(" ")}>${escapeXml(bounded(record))}${data}</record>`;
     }),
     "</fabric-records>",

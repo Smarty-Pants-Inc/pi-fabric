@@ -178,14 +178,17 @@ describe("resident control admission versus accepted receipt custody", () => {
     expect(calls).toEqual(["first", "second"]);
   });
 
-  it("vetoes unconfirmed ACK publication, retaining the exact outcome for repair without a second handler", async () => {
+  it.each([
+    ["known no-write", () => Object.assign(new Error("ACK lock timeout"), { code: "FABRIC_MESH_LOCK_TIMEOUT" })],
+    ["indeterminate", () => new Error("ACK failed, publication outcome unknown")],
+  ] as const)("vetoes unconfirmed %s ACK publication, retaining the exact outcome for repair without a second handler", async (kind, makeError) => {
     const mesh = meshFixture(), plane = control(mesh);
     await command(plane);
     const publication = deferred();
     const publish = mesh.publish.bind(mesh);
     let fault = true;
     vi.spyOn(mesh, "publish").mockImplementation(async input => {
-      if (input.topic === "fabric.control.ack" && fault) { publication.resolve(); throw Object.assign(new Error("ACK lock timeout"), { code: "FABRIC_MESH_LOCK_TIMEOUT" }); }
+      if (input.topic === "fabric.control.ack" && fault) { publication.resolve(); throw makeError(); }
       return publish(input);
     });
     const handler = vi.fn(() => ({ accepted: true, messageId: "accepted-original" }));
@@ -199,9 +202,18 @@ describe("resident control admission versus accepted receipt custody", () => {
     vi.spyOn(mesh, "publish").mockImplementation(async input => {
       const result = await publish(input); if (input.topic === "fabric.control.ack") acknowledged.resolve(); return result;
     });
-    plane.resume(); await acknowledged.promise; plane.pause(true);
-    // Publication failure remains an explicit conservative veto; never fake a successful quiet receipt.
-    await expect(plane.checkpointForRelease()).rejects.toThrow(/unsettled publication/);
+    // A known no-write outcome is retained and retried; an indeterminate one is not, so a later
+    // duplicate command repairs its ACK. Neither re-runs the completed handler.
+    plane.resume();
+    if (kind === "indeterminate") await command(plane);
+    await acknowledged.promise; plane.pause(true);
+    if (kind === "known no-write") {
+      await plane.checkpointForRelease();
+      expect(plane.releaseCheckpointReceipt()).toMatchObject({ admissionHeld: true });
+    } else {
+      // One later success cannot reconcile an earlier unknown publication; release stays vetoed.
+      await expect(plane.checkpointForRelease()).rejects.toThrow(/unsettled publication/);
+    }
     expect(handler).toHaveBeenCalledOnce();
     expect(mesh.read({ topic: "fabric.control.ack" })[0]?.data).toMatchObject({ accepted: true, messageId: "accepted-original" });
   });

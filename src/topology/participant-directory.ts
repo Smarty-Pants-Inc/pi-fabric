@@ -1001,7 +1001,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
         reason = `delete skipped on a version conflict: ${skipped.join(", ")}`;
       } catch (error) {
         reason = text(error);
-        if (!isMeshLockTimeout(error) || ++lockWaits >= CLOSE_WITHDRAW_LOCK_WAITS) return { ok: false, reason };
+        if (!(isMeshWriteDeferred(error) || isMeshLockTimeout(error)) || ++lockWaits >= CLOSE_WITHDRAW_LOCK_WAITS) return { ok: false, reason };
       }
     }
     try {
@@ -2665,7 +2665,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     } catch (error) {
       // A busy shared mesh is not a single-key fault. Abort this fenced round,
       // rather than multiplying acquisition attempts while retaining registries.
-      if (isMeshLockTimeout(error) || error instanceof FabricHostLeaseSupersededError) throw error;
+      if (isMeshWriteDeferred(error) || isMeshLockTimeout(error) || error instanceof FabricHostLeaseSupersededError) throw error;
       return undefined; /* retry this key on the next refresh */
     }
     finally {

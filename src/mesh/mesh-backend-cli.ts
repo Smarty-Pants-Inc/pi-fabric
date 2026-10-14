@@ -300,6 +300,8 @@ const makeScratchCopy = (stateJson: string, parent: string | undefined): Scratch
   catch (error) {
     // smarty-dev#9637: no fd (EMFILE, say), so no pin. Remove the directory just made, by name and only while it is
     // still empty (rmdir, never recursive), then surface the open's error.
+    // ponytail: smarty-dev#8907: no judgment, a fresh mkdtemp of ours; assertSafeChain(base) means no other uid can
+    // rename it, and rmdir removes only an empty directory, so a swap cannot cost data.
     const warnings: string[] = [];
     try { fs.rmdirSync(root); }
     catch (cleanup) { warnings.push(`could not remove the scratch directory ${root}: ${(cleanup as Error).message}`); }
@@ -326,12 +328,18 @@ const makeScratchCopy = (stateJson: string, parent: string | undefined): Scratch
  */
 const removeScratch = (scratch: Scratch, warnings: string[]): boolean => {
   try {
+    // ponytail: smarty-dev#8907: no expiry judgment, so no verifiedRemove. Each path starts at `pinned`
+    // (/proc/self/fd/<fd> or /dev/fd/<fd>), so the held fd resolves the parent and a swap of `root` cannot redirect
+    // it. The directory is our fresh 0700 mkdtemp: only this process's copy and import write in it, and rmSync
+    // unlinks a symlink entry rather than following it.
     for (const name of fs.readdirSync(scratch.pinned)) {
       try { fs.rmSync(path.join(scratch.pinned, name), { recursive: true, force: true }); }
       catch (error) { warnings.push(`could not remove ${scratch.root}/${name}: ${(error as Error).message}`); }
     }
     if (!sameScratch(scratch.root, scratch.fd)) warnings.push(`did not remove ${scratch.root}: the path no longer names the scratch directory this process made`);
     else {
+      // ponytail: smarty-dev#8907: rmdir by name right after sameScratch. It removes only an empty directory, and
+      // assertSafeChain bars any other uid from renaming it, so a swap in this window cannot cost data.
       try { fs.rmdirSync(scratch.root); }
       catch (error) { warnings.push(`could not remove the scratch directory ${scratch.root}: ${(error as Error).message}`); }
     }

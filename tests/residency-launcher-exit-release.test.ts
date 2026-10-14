@@ -71,6 +71,7 @@ it.skipIf(!posix)("an idle exit leaves one resident-exit idle-exit line, written
   try {
     const run = runResidentHostFromConfigPath(h.configPath);
     await waitFor(() => fs.existsSync(h.ownerPath), 30_000);
+    const generation = (JSON.parse(fs.readFileSync(h.ownerPath, "utf8")) as { token: string }).token;
     // Skip the 30 s idle window: the host's idle check reads Date.now().
     const now = Date.now.bind(Date);
     vi.spyOn(Date, "now").mockImplementation(() => now() + 60_000);
@@ -78,6 +79,10 @@ it.skipIf(!posix)("an idle exit leaves one resident-exit idle-exit line, written
     expect(h.atRelease.lines).toEqual([expect.objectContaining({ event: "resident-exit", reason: "idle-exit", pid: process.pid })]);
     expect(exitLines(h.residencyRoot)).toHaveLength(1);
     expect(h.late()).toEqual([]);
+    // smarty-dev#7950: the durable per-generation record, written by the host before the release.
+    expect(fs.readdirSync(path.join(h.residencyRoot, "generations"))).toEqual([`${generation}.exit.json`]);
+    expect(JSON.parse(fs.readFileSync(path.join(h.residencyRoot, "generations", `${generation}.exit.json`), "utf8")))
+      .toMatchObject({ format: 1, generation, writer: "host", reason: "idle-exit", pid: process.pid });
   } finally {
     vi.restoreAllMocks();
     fs.rmSync(h.root, { recursive: true, force: true });
@@ -181,6 +186,7 @@ it.each(posix ? ["launch-context", "lock-busy"] as const : ["launch-context"] as
       await expect(run).resolves.toBeUndefined(); // Already running: a silent return, as on main.
     }
     for (const [file, bytes] of Object.entries(files)) expect(fs.readFileSync(file, "utf8")).toBe(bytes);
+    expect(fs.existsSync(path.join(h.residencyRoot, "generations"))).toBe(false); // no exit record for a non-owner
   } finally {
     if (previous === undefined) delete process.env.PI_FABRIC_RESIDENT_LAUNCHER; else process.env.PI_FABRIC_RESIDENT_LAUNCHER = previous;
     holder?.kill("SIGKILL");

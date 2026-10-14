@@ -2,9 +2,12 @@
  * smarty-dev#9501: the files an import or cutover run creates in the mesh root, and their quarantine when the switch is
  * refused before its importing commit. The root is held by a no-follow directory fd for the whole fenced section.
  * Every create and every move goes through `/proc/self/fd/<fd>/<name>`, so renaming or swapping the root path
- * cannot redirect either one. A file counts as this run's only when this run created it with O_EXCL, and its dev/ino
- * comes from an fstat of that very descriptor. A name counts as this run's file only while its lstat still shows that
- * inode.
+ * cannot redirect either one. A file counts as this run's only when this run created it with O_EXCL. That FILE
+ * descriptor stays open from the create through the database close and the cleanup, and is released by `close`, except
+ * after a failed database close: then it stays open until the process exits (see `keepAfterFailure`). A name
+ * counts as this run's file only while its lstat matches the CURRENT fstat of the held descriptor: dev/ino, size, and
+ * birth time where the held descriptor reports one. Before any move, every held descriptor and every name is checked:
+ * any mismatch or lost descriptor keeps every file and reports once.
  * Only a working `/proc/self/fd` traversal of the held fd pins the root. It is probed on every platform; there is no
  * platform-name gate and no `/dev/fd` fallback (fabric-store, #9501; macOS residual smarty-dev#11066, Windows
  * smarty-dev#7858). Without it nothing is removed: the run reports what it kept (reason `no-held-dir-fd`), never a
@@ -20,6 +23,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { randomBytes } from "node:crypto";
+import { registerStateFileOwnershipPin } from "./state-gate.js";
 
 const STATE_DB = "state.db";
 /** Move order: the sidecars first. A WAL kept without its database could otherwise meet a new state.db. */
@@ -51,19 +55,31 @@ export interface OwnedImportFiles {
   removeAfterRefusal(): RefusalCleanupReport;
   /**
    * Fail closed: remove nothing and report the state.db names actually present (listed through the held root when
-   * pinned), with `reason` and the cause. Never throws.
+   * pinned), with `reason` and the cause. Never throws. `close-failed` also keeps every created-file descriptor open
+   * until the process exits: `close` then releases only the root.
    */
   keepAfterFailure(reason: "close-failed" | "cleanup-failed", cause: unknown): RefusalCleanupReport;
+  /**
+   * Release every held created-file descriptor, then the root fd. Idempotent. The caller calls it after it has ended
+   * its use of the database. After `keepAfterFailure("close-failed")` it releases only the root fd.
+   */
   close(): void;
 }
 
 interface Identity { dev: number; ino: number }
+/** A created file's descriptor, held from its O_EXCL create through `close`; `fd` is undefined once released. */
+interface Held extends Identity {
+  fd: number | undefined;
+  /** Drops `fd` from the state gate's ownership pins (idempotent); called when this run stops owning the number. */
+  unregister: () => void;
+}
 
 const messageOf = (error: unknown): string => error instanceof Error ? error.message : String(error);
 
 /** Hold `root` for the fenced section. Never throws: a root it cannot hold is unpinned (nothing will be removed). */
 export const pinImportRoot = (root: string): OwnedImportFiles => {
   let fd: number | undefined;
+  let rootId: Identity | undefined;
   let pinnedDir: string | undefined;
   try {
     // O_DIRECTORY/O_NOFOLLOW are absent where the platform lacks them; the /proc/self/fd probe then decides.
@@ -72,11 +88,30 @@ export const pinImportRoot = (root: string): OwnedImportFiles => {
     const named = fs.lstatSync(root);
     if (held.isDirectory() && named.isDirectory() && named.dev === held.dev && named.ino === held.ino) {
       const through = fs.statSync(`${PROC_FD}/${fd}/.`, { throwIfNoEntry: false });
-      if (through?.isDirectory() && through.dev === held.dev && through.ino === held.ino) pinnedDir = `${PROC_FD}/${fd}`;
+      if (through?.isDirectory() && through.dev === held.dev && through.ino === held.ino) {
+        pinnedDir = `${PROC_FD}/${fd}`;
+        rootId = { dev: held.dev, ino: held.ino };
+      }
     }
   } catch { /* unpinned */ }
   if (pinnedDir === undefined && fd !== undefined) { try { fs.closeSync(fd); } catch { /* closed */ } fd = undefined; }
-  const owned = new Map<string, Identity | undefined>();
+  const owned = new Map<string, Held>();
+  /** Sticky: set by keepAfterFailure("close-failed"); `close` then never closes a created-file descriptor. */
+  let keepPins = false;
+  /** The held descriptor's CURRENT fstat; throws when it is released, gone, or no longer the inode this run created. */
+  const current = (held: Held): fs.Stats => {
+    if (held.fd === undefined) throw new Error("this run's descriptor was already released");
+    const now = fs.fstatSync(held.fd);
+    if (!now.isFile() || now.dev !== held.dev || now.ino !== held.ino) throw new Error(`descriptor ${held.fd} no longer holds the file this run created`);
+    return now;
+  };
+  /**
+   * The held CURRENT fstat against the name's CURRENT lstat: same inode, same size, and, when the held birth time is
+   * known (> 0), the same birth time (a named 0 then fails). Both unknown (0) is allowed.
+   */
+  const sameFile = (held: fs.Stats, named: fs.Stats | undefined): boolean => !!named && named.isFile()
+    && named.dev === held.dev && named.ino === held.ino && named.size === held.size
+    && (!(held.birthtimeMs > 0) || named.birthtimeMs === held.birthtimeMs);
   /** The state.db names present now, through the held root when pinned. Throws when a name cannot be checked. */
   const present = (): string[] => [STATE_DB, ...SIDECARS]
     .filter(name => fs.lstatSync(path.join(pinnedDir ?? root, name), { throwIfNoEntry: false }) !== undefined);
@@ -84,23 +119,28 @@ export const pinImportRoot = (root: string): OwnedImportFiles => {
     get createdDb() { return owned.has(STATE_DB); },
     get pinned() { return pinnedDir !== undefined; },
     create(name) {
+      let descriptor: number;
       try {
-        if (pinnedDir === undefined) {
-          fs.closeSync(fs.openSync(path.join(root, name), "wx", 0o600));
-          owned.set(name, undefined);
-          return true;
-        }
-        const descriptor = fs.openSync(path.join(pinnedDir, name),
-          fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o600);
-        try {
-          const stat = fs.fstatSync(descriptor);
-          owned.set(name, { dev: stat.dev, ino: stat.ino });
-        } finally { fs.closeSync(descriptor); }
-        return true;
+        descriptor = pinnedDir === undefined
+          ? fs.openSync(path.join(root, name), "wx", 0o600)
+          : fs.openSync(path.join(pinnedDir, name),
+            fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o600);
       } catch (error) {
+        // EEXIST: not this run's file, and no descriptor of ours to close.
         if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
         throw error;
       }
+      // ponytail: held until close(), pinned or not (libuv opens with FILE_SHARE_READ|WRITE|DELETE on Windows, so SQLite's
+      // own open is unaffected). On POSIX, closing any fd of an inode drops this process's fcntl locks on it, so close()
+      // runs only after the caller ended its database use. If the database close threw, the connection may still be
+      // open: keepAfterFailure("close-failed") then keeps these fds open until the process exits.
+      // The state gate's fd proof skips this pin: it is not a parked SQLite descriptor (smarty-dev#9501).
+      try {
+        const stat = fs.fstatSync(descriptor);
+        owned.set(name, { fd: descriptor, dev: stat.dev, ino: stat.ino, unregister: registerStateFileOwnershipPin(descriptor) });
+      }
+      catch (error) { try { fs.closeSync(descriptor); } catch { /* closed */ } throw error; }
+      return true;
     },
     createSidecars() {
       // ponytail: only after the WAL pragma (state.db is then non-empty and SQLite adopts these inodes; a zero-page
@@ -120,6 +160,21 @@ export const pinImportRoot = (root: string): OwnedImportFiles => {
         }
         return { cleanupWarnings, retained, reason };
       }
+      // Preflight before any move: every held descriptor still holds its inode, and every present name is that inode.
+      // One bad name keeps EVERYTHING with one warning, so no sidecar moves first. A throw here (a gone descriptor, a
+      // failed lstat) reaches the caller's keepAfterFailure("cleanup-failed"): one warning, nothing moved either.
+      const mismatched: string[] = [];
+      for (const name of [...SIDECARS, STATE_DB]) {
+        const held = owned.get(name);
+        const now = held && current(held);
+        const named = fs.lstatSync(path.join(pinnedDir!, name), { throwIfNoEntry: false });
+        if (named && !(now && sameFile(now, named))) mismatched.push(`${root}/${name} (${held ? "replaced" : "it existed before"})`);
+      }
+      if (mismatched.length > 0) {
+        const kept = present();
+        return { cleanupWarnings: [`kept ${kept.length > 0 ? kept.join(", ") : "no state.db files"} in ${root} after the refusal, moved nothing: `
+          + `not the file this run created: ${mismatched.join(", ")}`], retained: kept, reason: "not-this-runs-file" };
+      }
       let failed = false;
       let foreign = false;
       const removeOne = (name: string): void => {
@@ -129,7 +184,8 @@ export const pinImportRoot = (root: string): OwnedImportFiles => {
         catch (error) { failed = true; retained.push(name); cleanupWarnings.push(`could not check ${root}/${name}: ${messageOf(error)}`); return; }
         if (!found) return; // SQLite's own close removes its sidecars
         const mine = owned.get(name);
-        const isMine = (stat: fs.Stats): boolean => !!mine && stat.isFile() && stat.dev === mine.dev && stat.ino === mine.ino;
+        // Per check, the held descriptor's CURRENT fstat; a descriptor gone mid-cleanup counts as not this run's (kept).
+        const isMine = (stat: fs.Stats): boolean => { try { return !!mine && sameFile(current(mine), stat); } catch { return false; } };
         if (!isMine(found)) {
           foreign = true;
           retained.push(name);
@@ -195,13 +251,41 @@ export const pinImportRoot = (root: string): OwnedImportFiles => {
       }
       const what = retained.length > 0 ? retained.join(", ") : "no state.db files";
       const step = reason === "close-failed" ? "the database close failed" : "the cleanup failed";
-      return { cleanupWarnings: [`kept ${what} in ${root} after the refusal, removed nothing: ${step} (${reason}): ${messageOf(cause)}${unlisted}`],
+      let pins = "";
+      if (reason === "close-failed") {
+        // ponytail: intentional fd retention, on the failed-close path only. The connection may still be open, and on
+        // POSIX closing ANY descriptor of an inode drops every fcntl lock this process holds on it, SQLite's included.
+        // So the created-file descriptors stay open until the process exits; the kernel releases them then.
+        keepPins = true;
+        const held = [...SIDECARS, STATE_DB].filter(name => owned.get(name)?.fd !== undefined).map(name => `${root}/${name}`);
+        if (held.length > 0) {
+          pins = `; this run's descriptors on ${held.join(", ")} stay open until the process exits (closing one would drop `
+            + "this process's POSIX fcntl locks on that inode, which the unclosed connection may hold)";
+        }
+      }
+      return { cleanupWarnings: [`kept ${what} in ${root} after the refusal, removed nothing: ${step} (${reason}): ${messageOf(cause)}${unlisted}${pins}`],
         retained, reason };
     },
     close() {
-      if (fd === undefined) return;
-      try { fs.closeSync(fd); } catch { /* closed */ }
+      // Idempotent; children before the root; every close is tried even when another fails. A number whose fstat no
+      // longer shows the captured inode is never closed: it may now be another owner's descriptor (SQLite's), and
+      // closing it would break that owner or drop its POSIX locks. Leaking an already-lost descriptor is the safe side.
+      const release = (descriptor: number, id: Identity): void => {
+        try { const now = fs.fstatSync(descriptor); if (now.dev === id.dev && now.ino === id.ino) fs.closeSync(descriptor); }
+        catch { /* gone or already closed */ }
+      };
+      // After a failed database close the created-file descriptors are kept on purpose (keepAfterFailure).
+      if (!keepPins) {
+        for (const held of owned.values()) {
+          if (held.fd !== undefined) release(held.fd, held);
+          held.fd = undefined;
+          // Released, or lost to another owner: either way this run no longer owns the number.
+          held.unregister();
+        }
+      }
+      if (fd !== undefined && rootId) release(fd, rootId);
       fd = undefined;
+      rootId = undefined;
       pinnedDir = undefined;
     },
   };

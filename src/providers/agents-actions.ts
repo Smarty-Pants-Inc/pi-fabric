@@ -252,7 +252,6 @@ const handoffSchema = {
     tools: runProperties.tools,
     timeoutMs: runProperties.timeoutMs,
     extensions: runProperties.extensions,
-    recursive: runProperties.recursive,
     schema: runProperties.schema,
     compact: handoffCompactionSchema,
   },

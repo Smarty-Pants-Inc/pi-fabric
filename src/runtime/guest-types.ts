@@ -138,7 +138,6 @@ interface FabricHandoffRequest {
   tools?: string[];
   timeoutMs?: number;
   extensions?: boolean;
-  recursive?: boolean;
   schema?: Record<string, unknown>;
   prompt?: string;
   instructions?: string;

@@ -3149,7 +3149,10 @@ describe("AgentsProvider runner support", () => {
       (descriptor?.inputSchema as { properties: Record<string, unknown> }).properties;
 
     expect(properties(run)).toHaveProperty("cwd", expect.objectContaining({ type: "string" }));
-    expect(properties(run)).toHaveProperty("recursive", { type: "boolean" });
+    expect(properties(run)).toHaveProperty("recursive", {
+      type: "boolean",
+      description: "Grant the child agents.run/spawn. Tasks are leaf by default: a task not launched recursive: true is refused with TaskSpawnDeniedError (FABRIC_TASK_SPAWN_DENIED). Setting it on your own child grants the caller nothing.",
+    });
     expect(properties(spawn)).toHaveProperty("cwd");
     expect(properties(handoff)).not.toHaveProperty("cwd");
     expect(properties(create)).not.toHaveProperty("cwd");

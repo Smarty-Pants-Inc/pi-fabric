@@ -4,6 +4,7 @@ import path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { expect, it, vi } from "vitest";
 import { CapturedToolCatalog } from "../src/capture/catalog.js";
+import { TaskSpawnDeniedError } from "../src/agents/spawn-admission.js";
 import { normalizeFabricConfig, type FabricAgentConfig } from "../src/config.js";
 import type { FabricThinking } from "../src/thinking.js";
 import { FabricRuntimeState } from "../src/fabric-runtime-state.js";
@@ -15,7 +16,7 @@ const withRuntime = async (
   run: (runtime: FabricRuntimeState, refresh: ReturnType<typeof vi.fn>, context: ExtensionContext) => Promise<void>,
   initial: string[] = [],
   aliases: Record<string, string> = {},
-  options: { parentKind?: "actor" | "agent"; thinking?: FabricThinking; agents?: Partial<FabricAgentConfig> } = {},
+  options: { parentKind?: "actor" | "agent"; recursive?: boolean; thinking?: FabricThinking; agents?: Partial<FabricAgentConfig> } = {},
 ) => {
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-model-refresh-"));
   vi.stubEnv("PI_FABRIC_PROJECT_ROOT", cwd);
@@ -23,7 +24,10 @@ const withRuntime = async (
   if (options.parentKind) {
     vi.stubEnv("PI_FABRIC_MAIN_AGENT_ID", "session:remote-parent");
     vi.stubEnv("PI_FABRIC_PARENT_RUN", "parent-run");
-    if (options.parentKind === "actor") vi.stubEnv("PI_FABRIC_ACTOR_ID", "parent-actor");
+    vi.stubEnv("PI_FABRIC_ACTOR_ID", options.parentKind === "actor" ? "parent-actor" : "");
+    // #2490 tests inheritance from a delegating parent, not a #12187 leaf task.
+    // Model the parent's own recursive launch grant; a child's flag cannot grant it.
+    vi.stubEnv("PI_FABRIC_GRANTED_RISKS", options.parentKind === "agent" && (options.recursive ?? true) ? "agent" : "");
   }
   const models = [{ provider: "dest", id: "old", name: "Old", contextWindow: 48_000 },
     ...initial.map((id) => ({ provider: "dest", id, name: id, contextWindow: 48_000 }))];
@@ -67,6 +71,22 @@ it.each(["actor", "agent"] as const)("#2490 inherits the actual %s host binding 
     const actor = await invoke(runtime, context, "agents.create", { name: "nested", instructions: "Review." }) as { id: string };
     expect(runtime.actors.definition(actor.id)).toMatchObject({ model: "dest/old", thinking: "max" });
   }, [], {}, { parentKind, thinking: "max", agents: { model: "dest/denied", thinking: "low", deniedModels: ["dest/denied"], deniedModelReplacement: "dest/old" } });
+});
+
+it("#12187 denies an ungranted remote-parent leaf before spawn/create model refresh even when spawn requests recursion", async () => {
+  await withRuntime(["fresh"], async (runtime, refresh, context) => {
+    expect(runtime.agents.list()).toEqual([]);
+    expect(runtime.actors.list()).toEqual([]);
+    await expect(invoke(runtime, context, "agents.spawn", {
+      task: "HANG", model: "dest/fresh", recursive: true,
+    })).rejects.toThrow(TaskSpawnDeniedError);
+    await expect(invoke(runtime, context, "agents.create", {
+      name: "forbidden-nested", instructions: "Review.", model: "dest/fresh",
+    })).rejects.toThrow(TaskSpawnDeniedError);
+    expect(refresh).not.toHaveBeenCalled();
+    expect(runtime.agents.list()).toEqual([]);
+    expect(runtime.actors.list()).toEqual([]);
+  }, [], {}, { parentKind: "agent", recursive: false, thinking: "max", agents: { model: "dest/denied", thinking: "low", deniedModels: ["dest/denied"], deniedModelReplacement: "dest/old" } });
 });
 
 it("spawns with a model added to models.json after one registry refresh", async () => {

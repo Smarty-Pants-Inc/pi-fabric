@@ -32,7 +32,9 @@ const field = (name: string): string => JSON.parse(task.match(new RegExp(`"${nam
 const crash = field("primaryCrashPath");
 const release = field("nestedReleasePath");
 const observation = field("nestedObservationPath");
-const manager = new AgentManager(args.get("cwd")!, { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0 }, {
+const childCwd = path.join(args.get("cwd")!, "nested-task-cwd");
+fs.mkdirSync(childCwd, { recursive: true, mode: 0o700 });
+const manager = new AgentManager(childCwd, { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0 }, {
   runRoot: args.get("run-root")!, workerPath: fileURLToPath(import.meta.url),
   fabricExtensionPath: args.get("fabric-extension")!,
 });

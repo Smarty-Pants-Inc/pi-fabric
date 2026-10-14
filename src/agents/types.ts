@@ -118,6 +118,8 @@ export interface AgentRunRequest {
   worktree?: boolean;
   /** Shell command run in a new worktree before launch; overrides agents.worktree.setup. */
   worktreeSetup?: string;
+  /** Explicit opt-out of the process task write default, audited at launch. */
+  writePolicy?: "unrestricted";
   /** Write confinement enforced in the Pi child; see child-env.ts. */
   readOnly?: boolean;
   writableRoots?: string[];
@@ -443,6 +445,8 @@ export interface AgentWorkerOptions {
   /** Observed native Pi session history carried across a same-run worker relaunch. Not a resume target. */
   runnerSessionIds?: string[];
   carryOver?: AgentRunCarryOver;
+  /** Default process task's own private scratch; exported as TMPDIR. */
+  tmpdir?: string;
   /** Serialized PI_FABRIC_WRITE_POLICY; Pi children also load the write guard. */
   writePolicy?: string;
   /** Serialized PI_FABRIC_LINEAGE. */
@@ -473,6 +477,8 @@ export interface AgentTransportLaunch {
   requires?: string[];
   /** Host-derived incompatibility, never accepted from guest arguments. */
   placementLocalReason?: string | undefined;
+  /** Report the default policy's actual local/remote launch boundary once; host-owned audit only. */
+  onWritePolicyDisposition?: (disposition: "local" | "remote") => void;
   /** Manager close or explicit run/actor revocation, never a returned queued receipt's guest deadline. */
   signal?: AbortSignal | undefined;
   /** Host activation generation check. Recheck after preparation, immediately before worker creation. */

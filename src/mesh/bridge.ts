@@ -1101,7 +1101,23 @@ export class StoreBridgeSide implements BridgeSide {
     // renews the lease of whichever mirror is held then (pi-fabric#640 review round 3).
     if (typeof lease.startedAt !== "number" || lease.startedAt !== held.startedAt ||
       lease.incarnationToken !== held.incarnationToken) return;
+    // Every effect, including a pre-fix outbox replay, keeps the original sampled deadline.
+    const sample = lease.mirror;
+    const sourceDeadline = sample ? sample.observedAt +
+      Math.min(BRIDGE_LEASE_MS, sample.sourceExpiresAt - sample.sourceObservedAt) : undefined;
+    if (sourceDeadline !== undefined) lease = { ...lease, expiresAt: Math.min(lease.expiresAt, sourceDeadline) };
     const onDisk = readHostLease(this.store.root, lease.id);
+    // Dedup must not preserve an inflated deadline for this EXACT owner and sample. A newer
+    // observation (even of the same source renewal) still goes through the guards below.
+    if (sample && sourceDeadline !== undefined && onDisk && onDisk.startedAt === lease.startedAt &&
+      onDisk.incarnationToken === lease.incarnationToken && onDisk.identityId === lease.identityId &&
+      onDisk.rootId === lease.rootId && onDisk.mirror?.remoteHost === sample.remoteHost &&
+      onDisk.mirror.observedAt === sample.observedAt && onDisk.mirror.sourceObservedAt === sample.sourceObservedAt &&
+      onDisk.mirror.sourceUpdatedAt === sample.sourceUpdatedAt && onDisk.mirror.sourceExpiresAt === sample.sourceExpiresAt &&
+      onDisk.expiresAt > sourceDeadline) {
+      writeHostLease(this.store.root, lease);
+      return;
+    }
     // A replayed row never shortens a lease that a later pass already renewed.
     if (replay && (onDisk?.mirror?.observedAt ?? onDisk?.expiresAt ?? -Infinity) >=
       (lease.mirror?.observedAt ?? lease.expiresAt)) return;

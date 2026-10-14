@@ -6,9 +6,10 @@ import { PassThrough } from "node:stream";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { BridgeMirrorDeferredError, MeshBridge, RemoteBridgeSide, serveBridgeAgent, StoreBridgeSide, type BridgePresence } from "../src/mesh/bridge.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
+import { CommitOutbox } from "../src/mesh/commit-outbox.js";
 import { FabricControlPlane } from "../src/topology/control-plane.js";
 import { AgentMessageRouter } from "../src/providers/agents-message-router.js";
-import { FabricBridgeStaleError, hostMirrorLease, mirroredLeaseStatus, MIRROR_FRESH_MS, hostLeasePath, readHostLease, writeHostLease, type FabricMirrorLease } from "../src/topology/host-leases.js";
+import { FabricBridgeStaleError, hostMirrorLease, mirroredLeaseStatus, mirroredOwnerRoutingStatus, MIRROR_FRESH_MS, hostLeasePath, readHostLease, writeHostLease, type FabricMirrorLease } from "../src/topology/host-leases.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { deadHostRecords, DEAD_HOST_RECORDS_MS } from "../src/topology/host-reaper.js";
 
@@ -217,6 +218,118 @@ describe("source-clock root liveness (#10068)", () => {
     expect(f.directory.get(rootId, f.now())).toMatchObject({ remoteHost: "ryzen4", stale: false });
     expect(f.directory.get(rootId, f.now())?.bridgeStale).toBeUndefined();
     for (const operation of ["steer", "followUp"] as const) await admit(operation);
+  });
+
+  // LUNA-DELTA-1: a legacy outbox effect runs INSIDE cold prepare, before the new
+  // correction/removal commit. Final-state-only assertions miss this authority window.
+  it.each(["missing", "same-sample inflated"] as const)("cold legacy outbox replay cannot publish expired authority at the prepare checkpoint (%s lease)", async disk => {
+    const f = await fixture(-60_000, 500, "cold");
+    vi.spyOn(Date, "now").mockImplementation(f.now);
+    const t0 = f.now();
+    const bridgeIdentity: MeshIdentity = { id: "bridge:ryzen4", name: "ryzen4", kind: "main" };
+    const dead = new CommitOutbox(f.store, "bridge/ryzen4", bridgeIdentity, {});
+    const host = f.presence.hosts[0]!.record;
+    const inflated = { id: rootId, rootId, identityId: rootId, startedAt: host.startedAt,
+      incarnationToken: host.incarnationToken, updatedAt: t0 + 1_000, expiresAt: t0 + 1_500,
+      mirrorLease: 1 as const, mirror: mirror(t0, { sourceUpdatedAt: host.updatedAt,
+        sourceExpiresAt: t0 - 60_000 + 500 }) };
+    // Reproduce a pre-fix COMMIT whose effects never ran, including retained attribution.
+    await f.store.writeBatch({ identity: bridgeIdentity, ops: [], prepare: () => dead.plan().stage([
+      { kind: "put", key: key("topology/hosts/", rootId), identity,
+        value: { ...host, remoteHost: "ryzen4", mirrorLease: 1, updatedAt: inflated.updatedAt, expiresAt: inflated.expiresAt } },
+      { kind: "put", key: key("topology/participants/", rootId), identity,
+        value: { ...f.presence.participants[0]!, remoteHost: "ryzen4" } },
+    ], [{ kind: "lease", key: `lease:${rootId}`, payload: inflated }]) });
+    expect(f.store.listAll(dead.prefix, { fresh: true })).toHaveLength(1);
+    expect(readHostLease(f.store.root, rootId)).toBeUndefined();
+    if (disk === "same-sample inflated") writeHostLease(f.store.root, inflated);
+    f.advance(1_000);
+    const sender = { id: senderId, name: "lead", kind: "main" as const };
+    const steerRemote = vi.fn(async () => ({ queued: true }));
+    const router = new AgentMessageRouter({} as any, { identity: sender, steerRemote } as any,
+      { local: true, id: senderId, matches: (id: string) => id === senderId } as any,
+      f.directory, f.control, binding => binding);
+    // Record attempted publication, never wait on a nested write lock or mask admission
+    // with the subsequent corrected state. The sentinel terminates an admitted old-head call.
+    const admitted: string[] = [];
+    vi.spyOn(f.store, "publish").mockImplementation(async input => {
+      admitted.push(`${input.topic}:${input.kind}`);
+      throw new Error("recorded prepare-checkpoint publication attempt");
+    });
+    const refusals: Array<ReturnType<typeof settle>> = [];
+    let checkpoint: { expiresAt: number; observedAt: number | undefined; rowExpiry: unknown;
+      participant: unknown; routing: string; commands: number } | undefined;
+    const write = f.store.writeBatch.bind(f.store);
+    vi.spyOn(f.store, "writeBatch").mockImplementation(input => write({ ...input, prepare: view => {
+      const ops = input.prepare!(view); // Original prepare replays the pending lease here.
+      checkpoint = { expiresAt: f.lease().expiresAt, observedAt: f.lease().mirror?.observedAt,
+        rowExpiry: (view.get(key("topology/hosts/", rootId))!.value as { expiresAt: number }).expiresAt,
+        participant: f.directory.get(rootId, f.now()),
+        routing: mirroredOwnerRoutingStatus({ ...f.lease(), remoteHost: "ryzen4" }, f.now()),
+        commands: commands(f).length };
+      for (const operation of ["steer", "followUp"] as const) {
+        refusals.push(settle(f.control.request(rootId, rootId, operation, {
+          ownerIncarnation: "activation-1", message: "legacy replay checkpoint" }, rootId, { routedRemoteHost: "ryzen4" })));
+        refusals.push(settle(router.routeMessage(rootId, "legacy replay checkpoint", undefined, operation)));
+      }
+      return ops;
+    } }));
+    await new StoreBridgeSide(f.store, "ryzen4", f.now).mirror(f.presence, t0);
+    const recorded = await Promise.all(refusals);
+    expect(checkpoint).toMatchObject({ expiresAt: t0 + 500, observedAt: t0, rowExpiry: t0 + 1_500,
+      participant: { id: rootId, remoteHost: "ryzen4", bridgeStale: true }, routing: "bridge-stale", commands: 0 });
+    expect(recorded).toHaveLength(4);
+    for (const result of recorded) expect(result.error).toMatchObject({ code: "FABRIC_BRIDGE_STALE", remoteHost: "ryzen4",
+      message: expect.stringContaining("this attempt was not published") });
+    expect(admitted).toEqual([]);
+    expect(steerRemote).not.toHaveBeenCalled();
+    expect(commands(f)).toHaveLength(0);
+  });
+
+  it("cold legacy replay is live only to its original deadline and preserves a newer same-incarnation sample", async () => {
+    for (const newer of [false, true]) {
+      const f = await fixture(-60_000, 500, "cold");
+      vi.spyOn(Date, "now").mockImplementation(f.now);
+      const t0 = f.now();
+      const bridgeIdentity: MeshIdentity = { id: "bridge:ryzen4", name: "ryzen4", kind: "main" };
+      const dead = new CommitOutbox(f.store, "bridge/ryzen4", bridgeIdentity, {});
+      const host = f.presence.hosts[0]!.record;
+      const inflated = { id: rootId, rootId, identityId: rootId, startedAt: host.startedAt,
+        incarnationToken: host.incarnationToken, updatedAt: t0 + 1_000, expiresAt: t0 + 1_500,
+        mirrorLease: 1 as const, mirror: mirror(t0, { sourceUpdatedAt: host.updatedAt,
+          sourceExpiresAt: t0 - 60_000 + 500 }) };
+      await f.store.writeBatch({ identity: bridgeIdentity, ops: [], prepare: () => dead.plan().stage([
+        { kind: "put", key: key("topology/hosts/", rootId), identity,
+          value: { ...host, remoteHost: "ryzen4", mirrorLease: 1, expiresAt: inflated.expiresAt } },
+        { kind: "put", key: key("topology/participants/", rootId), identity,
+          value: { ...f.presence.participants[0]!, remoteHost: "ryzen4" } },
+      ], [{ kind: "lease", key: `lease:${rootId}`, payload: inflated }]) });
+      if (newer) writeHostLease(f.store.root, { ...inflated, updatedAt: t0 + 100, expiresAt: t0 + 600,
+        mirror: mirror(t0 + 100, { sourceObservedAt: t0 - 60_000 + 100, sourceUpdatedAt: host.updatedAt + 100,
+          sourceExpiresAt: t0 - 60_000 + 600 }) });
+      f.advance(250);
+      const snapshots: Array<{ expiresAt: number; observedAt: number | undefined; at: number; routing: string; participant: unknown }> = [];
+      const write = f.store.writeBatch.bind(f.store);
+      vi.spyOn(f.store, "writeBatch").mockImplementation(input => write({ ...input, prepare: view => {
+        const ops = input.prepare!(view);
+        const capture = () => snapshots.push({ expiresAt: f.lease().expiresAt, observedAt: f.lease().mirror?.observedAt,
+          at: f.now(), routing: mirroredOwnerRoutingStatus({ ...f.lease(), remoteHost: "ryzen4" }, f.now()),
+          participant: f.directory.get(rootId, f.now()) });
+        capture();
+        f.advance(250); // Equality at the OLD deadline; a genuinely newer sample stays live.
+        capture();
+        if (newer) { f.advance(100); capture(); }
+        return ops;
+      } }));
+      await new StoreBridgeSide(f.store, "ryzen4", f.now).mirror(f.presence, t0);
+      expect(snapshots[0]).toMatchObject({ expiresAt: t0 + (newer ? 600 : 500), observedAt: t0 + (newer ? 100 : 0),
+        at: t0 + 250, routing: "live", participant: { remoteHost: "ryzen4" } });
+      expect((snapshots[0]!.participant as { bridgeStale?: true }).bridgeStale).toBeUndefined();
+      expect(snapshots[1]).toMatchObject({ at: t0 + 500, routing: newer ? "live" : "bridge-stale" });
+      expect(snapshots.at(-1)).toMatchObject({ at: t0 + (newer ? 600 : 500), routing: "bridge-stale",
+        participant: { remoteHost: "ryzen4", bridgeStale: true } });
+      vi.restoreAllMocks();
+    }
   });
 
   it.each(["v1", "legacy"] as const)("the %s router refuses short-TTL authority before control or legacy delivery and names a freshly proven lapse", async protocol => {

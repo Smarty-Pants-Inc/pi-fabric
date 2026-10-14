@@ -1663,7 +1663,7 @@ export class AgentManager {
     const modelPrepared = Boolean(routePin) || alternatePrepared;
     // Backend provenance is not a resolved account model; preserve raw CLI selectors.
     const auditModel = (): string => runner === "veda" && isClaudeModel(undefined, runner, this.config.veda.backend)
-      ? `veda/claude-code/${model?.replace(/^veda\//i, "") || "<backend-default>"}`
+      ? `veda/claude-code/${model ? normalizeVedaModel(model) : "<backend-default>"}`
       : model ?? "claude/<backend-default>";
     const switchWarnings = (): string[] => {
       const warnings = request.modelPolicyOriginalModel && model

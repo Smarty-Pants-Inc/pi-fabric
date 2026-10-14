@@ -23,6 +23,7 @@ import {
 } from "../src/agents/budget-ledger.js";
 import type { AgentRunRecord, AgentRunResult } from "../src/agents/types.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
+import { buildVedaArguments } from "../src/agents/veda-cli.js";
 
 const managers: AgentManager[] = [];
 const roots: string[] = [];
@@ -404,6 +405,37 @@ describe("resolved manager policy (#11864)", () => {
       expect(matching[0]).toMatchObject({ ref: "#11864", reason, role: expect.any(String), ts: expect.stringMatching(/^\d{4}-\d\d-\d\dT/) });
       expect(matching[0]!.model).toEqual(expect.stringMatching(/veda\/claude-code\/sonnet/));
       expect(defaultRows[0]!.model).toEqual(expect.stringMatching(/veda\/claude-code\/<backend-default>/));
+    } finally { launch.mockRestore(); homedir.mockRestore(); }
+  });
+
+  it.each([
+    ["veda/sonnet", "sonnet"],
+    ["VEDA/sonnet", "VEDA/sonnet"],
+  ])("F-01-D1 keeps Veda selector attribution aligned with CLI normalization (%s)", async (model, cliModel) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-veda-d1-")); roots.push(root);
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-veda-d1-home-")); roots.push(home);
+    const homedir = vi.spyOn(os, "homedir").mockReturnValue(home);
+    const manager = makeManager(root, {
+      runner: "veda",
+      veda: { ...DEFAULT_FABRIC_CONFIG.agents.veda, backend: "claude-code" },
+      modelPolicy: { requireReason: ["claude", "opus"] },
+    });
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    const reason = `F-01-D1 selector attribution #11864 (${model})`;
+    try {
+      const handle = await manager.spawn({ task: "Veda selector attribution", model, modelReason: reason, transport: "process" });
+      expect(handle.warnings).toContain(`model: named exception veda/claude-code/${cliModel} (#11864)`);
+      const workerArgs = launch.mock.calls[0]![0].workerArguments;
+      expect(workerArgs).toEqual(expect.arrayContaining(["--model", model]));
+      const cliArgs = buildVedaArguments({ backend: "claude-code", persona: "default", model, tools: [], session: "d1" });
+      expect(cliArgs[cliArgs.indexOf("-m") + 1]).toBe(cliModel);
+
+      const result = await manager.wait(handle.id);
+      expect(result.warnings).toContain(`model: named exception veda/claude-code/${cliModel} (#11864)`);
+      const audit = readAudit(reason);
+      expect(Object.keys(audit)).toHaveLength(7);
+      expect(audit.model).toBe(`veda/claude-code/${cliModel}`);
+      expect(audit.reason).toBe(reason);
     } finally { launch.mockRestore(); homedir.mockRestore(); }
   });
 

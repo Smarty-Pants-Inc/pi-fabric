@@ -527,6 +527,9 @@ export interface AgentTransportHandle {
   stopDebt?(): string | undefined;
   /** Bounded join of the captured process worker's native close (not PID absence). */
   waitForClose?(): Promise<void>;
+  /** Captured primary-worker exit notification, NOT native close or tree-exit proof.
+   * Windows uses this only to begin its bounded native-close join after natural exit. */
+  primaryExit?: Promise<void>;
   /** Passive native close notification; wakes monitoring, never itself grants collection. */
   closed?: Promise<void>;
   /** Scoped-only tree-empty receipt: the live PID and admission record agree

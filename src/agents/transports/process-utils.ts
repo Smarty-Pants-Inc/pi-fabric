@@ -298,7 +298,7 @@ export const spawnDetached = async (
   /** Ordinary workers need time to run their five-second execution-child cleanup. */
   termGraceMs = STOP_TERM_MS,
   executionCustodian = false,
-): Promise<{ pid: number; closed: Promise<void>; treeClosed?: Promise<void>; stop(): Promise<void>; isAlive(): Promise<boolean>; lostContact(): string | undefined; stopDebt?(): string | undefined; forcedCleanupCount?(): number; remainingDescendantCount?(): number; waitForClose(): Promise<void> }> => {
+): Promise<{ pid: number; closed: Promise<void>; primaryExit?: Promise<void>; treeClosed?: Promise<void>; stop(): Promise<void>; isAlive(): Promise<boolean>; lostContact(): string | undefined; stopDebt?(): string | undefined; forcedCleanupCount?(): number; remainingDescendantCount?(): number; waitForClose(): Promise<void> }> => {
   // No PR observer or timer is created on the unscoped/unsupported path.
   const scopedLinux = Boolean(scope && process.platform === "linux");
   if (!scopedLinux) {

@@ -287,7 +287,7 @@ export const spawnDetached = async (
   /** Ordinary workers need time to run their five-second execution-child cleanup. */
   termGraceMs = STOP_TERM_MS,
   executionCustodian = false,
-): Promise<{ pid: number; closed: Promise<void>; stop(): Promise<void>; isAlive(): Promise<boolean>; lostContact(): string | undefined; stopDebt?(): string | undefined; forcedCleanupCount?(): number; remainingDescendantCount?(): number; waitForClose(): Promise<void> }> => {
+): Promise<{ pid: number; closed: Promise<void>; primaryExit?: Promise<void>; stop(): Promise<void>; isAlive(): Promise<boolean>; lostContact(): string | undefined; stopDebt?(): string | undefined; forcedCleanupCount?(): number; remainingDescendantCount?(): number; waitForClose(): Promise<void> }> => {
   const runtime = await resolveScriptRuntime(runtimeOptionsForWorker(workerPath));
   const treeOwner = process.platform === "linux" ? await import("../../residency/launcher-owner.js") : undefined;
   assertTransportLaunchAllowed(authority);
@@ -321,11 +321,14 @@ export const spawnDetached = async (
   // Exit is latched: after the worker/group empties its numeric id is not identity.
   let exited = false;
   let force: ReturnType<typeof setTimeout> | undefined;
-  child.once("exit", () => { exited = true; clearTimeout(force); });
+  const primaryExit = new Promise<void>(resolve => child.once("exit", () => {
+    exited = true; clearTimeout(force); resolve();
+  }));
   let nativeClosed = false;
   const closed = new Promise<void>((resolve) => child.once("close", () => { nativeClosed = true; resolve(); }));
   const forcedDescendants = new Set<string>();
   let stopping: Promise<void> | undefined;
+  const passiveCloseWakeups = new Set<() => void>();
   let lost: string | undefined;
   const unconfirmed = (reason: string): void => {
     if (lost !== undefined) return;
@@ -500,6 +503,7 @@ export const spawnDetached = async (
   const handle = {
     pid,
     closed,
+    ...(process.platform === "win32" ? { primaryExit } : {}),
     lostContact: () => lost,
     stopDebt: () => stopFailed ? undefined : lost,
     forcedCleanupCount: () => forcedDescendants.size,
@@ -509,15 +513,24 @@ export const spawnDetached = async (
       catch { return Math.max(1, owned.size - 1); }
     },
     async waitForClose() {
+      if (stopping) { await stopping; return; }
       let deadline: ReturnType<typeof setTimeout> | undefined;
+      let wake: (() => void) | undefined;
       try {
         await Promise.race([closed, new Promise<void>(resolve => {
+          // Exact stop owns its own close/tree bound. Yield passive observers
+          // without latching debt; the manager joins its managed.processStop.
+          wake = () => { clearTimeout(deadline); resolve(); };
+          passiveCloseWakeups.add(wake);
           deadline = setTimeout(() => {
             unconfirmed("Owned process worker did not confirm native close within 7000ms");
             resolve();
           }, 7_000);
         })]);
-      } finally { clearTimeout(deadline); }
+      } finally {
+        clearTimeout(deadline);
+        if (wake) passiveCloseWakeups.delete(wake);
+      }
     },
     stop() {
       if (stopping) return stopping;
@@ -581,6 +594,10 @@ export const spawnDetached = async (
       stopping = pending;
       // POSIX ownership/exit failures remain retryable on the exact same handle.
       void pending.catch(() => { stopFailed = true; if (stopping === pending) stopping = undefined; });
+      // Publish the exact join before waking observers, and cancel their
+      // deadlines synchronously before any passive timeout can establish debt.
+      for (const wake of passiveCloseWakeups) wake();
+      passiveCloseWakeups.clear();
       return pending;
     },
     async isAlive() {

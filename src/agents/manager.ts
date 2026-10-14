@@ -3291,6 +3291,19 @@ export class AgentManager {
       if (managed.transport.kind === "process" && managed.executionExited &&
           (managed.processStop || managed.transport.lostContact?.() === undefined)) await this.#stopManagedTransport(managed);
       await this.#drainExecution(managed);
+      // Passive exit proof during the drain can race the monitor's exact stop
+      // retry. Join that hook before publishing, even if execution already exited.
+      if (managed.transport.kind === "process" && managed.executionExited) {
+        try { await this.#stopManagedTransport(managed); }
+        catch (error) {
+          // Execution proof cannot turn a repeatedly failed explicit hook into
+          // success. Publish failure with its custody mark, not a rejected stop.
+          this.#settle(managed, {
+            ...(readRecord(managed.statusFile) ?? managed.latestRecord ?? failedRecord(managed, "failed", String(error))),
+            status: "failed", error: String(error),
+          });
+        }
+      }
     } catch (error) {
       // A failed explicit drain still owns the terminal publication. The
       // monitor may already have yielded to this stop's exact native join.
@@ -4067,16 +4080,21 @@ export class AgentManager {
     const deadline = transport.kind === "process" && transport.closed && Number.isFinite(outerDeadline)
       ? outerDeadline : Math.min(outerDeadline, Date.now() + TRANSPORT_EXIT_GRACE_MS * 7);
     if (transport.kind === "process" && transport.closed) {
-      // Legacy adapters capture descendant births in isAlive(). Seed custody
-      // while the leader can still attest parentage, before waiting for close.
-      // One entry probe is not a finishing poll; scoped receipts need no scan.
-      if (!transport.treeClosed) await this.#transportAliveUntil(transport, deadline).catch(() => true);
+      // Legacy POSIX adapters capture descendant births in isAlive(). Seed
+      // custody while the leader can attest parentage, before waiting for close.
+      // Windows has no descendant capture; never probe before its native close.
+      if (!transport.treeClosed && process.platform !== "win32") {
+        await this.#transportAliveUntil(transport, deadline).catch(() => true);
+      }
       const receipt = transport.treeClosed
         ? Promise.all([transport.closed, transport.treeClosed]).then(() => undefined)
         : transport.closed;
       if (!await this.#transportClosedUntil({ ...transport, closed: receipt }, deadline)) return;
+      // The stop owner joins/retries its exact hook. Passive close must not
+      // inherit a transient rejection and freeze it as a terminal failure.
+      if (managed.processStopPending) return;
       if (transport.treeClosed) {
-        if (transport.lostContact?.() !== undefined || managed.processStopPending) return;
+        if (transport.lostContact?.() !== undefined) return;
         managed.executionExited = true;
         this.#retentionRevision++;
         delete managed.lostContact;
@@ -4602,12 +4620,18 @@ export class AgentManager {
           await this.#waitForTransportExit(managed, Date.now() + graceMs);
         }
         if (nativeWindowsClose) {
-          // Preserve a bounded natural-close window; if it expires, the exact
-          // stop runs first and only then is the native close joined.
+          // A live worker gets natural grace, then exact stop before the close
+          // bound starts. Captured primary exit instead starts that bound now:
+          // it is not close/tree proof and never bypasses an explicit stop join.
           const graceMs = record.status === "completed"
             ? managed.transport.finishingGraceMs ?? TRANSPORT_EXIT_GRACE_MS : TRANSPORT_EXIT_GRACE_MS;
-          const closed = await this.#transportClosedUntil(managed.transport, Date.now() + graceMs);
-          if (!closed) await this.#stopManagedTransport(managed);
+          const transport = managed.transport;
+          const exitedOrClosed = await this.#transportClosedUntil({
+            ...transport,
+            ...(transport.primaryExit && transport.closed
+              ? { closed: Promise.race([transport.closed, transport.primaryExit]) } : {}),
+          }, Date.now() + graceMs);
+          if (!exitedOrClosed) await this.#stopManagedTransport(managed);
           await managed.transport.waitForClose!();
           await managed.processStop;
           if (!managed.executionExited) await this.#noteUnconfirmedExit(managed);

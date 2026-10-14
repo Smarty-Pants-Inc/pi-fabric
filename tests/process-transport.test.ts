@@ -12,6 +12,9 @@ import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { WORKER_PROTOCOL_VERSION } from "../src/agents/worker-protocol.js";
 import type { AgentHandleInfo } from "../src/agents/types.js";
 
+// Capture before any test spy. Re-spying the fixture mock must never delegate to itself.
+const nativeReadFileSync = fs.readFileSync;
+
 const roots: string[] = [];
 const managers: AgentManager[] = [];
 afterEach(async () => {
@@ -395,7 +398,7 @@ const isV2 = (() => { try { return fs.statfsSync("/sys/fs/cgroup").type === 0x63
  * delegation to this UID's user manager, simulated by answering ONLY its subtree_control read. */
 const fixture = async (bus: "live" | "none", delegated = true) => {
   const uid = process.getuid!();
-  const readFileSync = fs.readFileSync;
+  const readFileSync = nativeReadFileSync;
   vi.spyOn(fs, "readFileSync").mockImplementation(((file: fs.PathOrFileDescriptor, ...rest: unknown[]) =>
     String(file).endsWith(`/user@${uid}.service/cgroup.subtree_control`)
       ? (delegated ? "cpu io memory pids\n" : "cpu io pids\n")
@@ -446,12 +449,13 @@ describe.skipIf(process.platform !== "linux" || !isV2)("ProcessTransport task me
       ["EIO", "EACCES"].map(errno => ({ probe, errno, slice, operation: probe === "bus socket" ? "stat" : "read" })))),
     ...["stat", "read"].flatMap(operation => ["EIO", "EACCES"].flatMap(errno =>
       [undefined, "batch.slice"].map(slice => ({ probe: "cgroup controllers", errno, slice, operation })))),
-    ...["EIO", "EACCES"].map(errno => ({ probe: "systemd-run executable", errno, slice: "batch.slice", operation: "stat" })),
+    ...["EIO", "EACCES"].flatMap(errno => [undefined, "batch.slice"].map(slice =>
+      ({ probe: "systemd-run executable", errno, slice, operation: "stat" }))),
   ];
   it.each(probeCases)("astra-p2: $probe $operation $errno refuses before any spawn (slice=$slice)", async ({ probe, errno, slice, operation }) => {
     const f = await fixture("live"); // restore both bus variables after smarty-test-env scrubs them
     const statSync = fs.statSync;
-    const readFileSync = fs.readFileSync;
+    const readFileSync = nativeReadFileSync;
     const target = probe === "bus socket" ? path.join(f.root, "run/bus")
       : probe === "cgroup controllers" ? "/sys/fs/cgroup/cgroup.controllers"
       : probe === "systemd-run executable" ? path.join(f.root, "systemd-run")
@@ -487,11 +491,12 @@ describe.skipIf(process.platform !== "linux" || !isV2)("ProcessTransport task me
     { probe: "cgroup controllers", operation: "stat", slice: undefined },
     { probe: "cgroup controllers", operation: "read", slice: undefined },
     { probe: "memory delegation", operation: "read", slice: undefined },
+    { probe: "systemd-run executable", operation: "stat", slice: undefined },
     { probe: "systemd-run executable", operation: "stat", slice: "batch.slice" },
   ])("astra-p2: $probe $operation ENOENT remains verified-unsupported and launches directly", async ({ probe, operation, slice }) => {
     const f = await fixture("live");
     const statSync = fs.statSync;
-    const readFileSync = fs.readFileSync;
+    const readFileSync = nativeReadFileSync;
     const target = probe === "bus socket" ? path.join(f.root, "run/bus")
       : probe === "cgroup controllers" ? "/sys/fs/cgroup/cgroup.controllers"
       : probe === "systemd-run executable" ? path.join(f.root, "systemd-run")

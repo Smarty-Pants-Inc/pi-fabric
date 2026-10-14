@@ -204,7 +204,12 @@ it("releases completion watches on stop, transfer and 200 recorded actor removal
     expect(live.size).toBe(0); // stop joins native close, manager stays open
     for (let index = 0; index < 200; index++) {
       const actor = await create(`churn-${index}`);
-      expect(await owner.remove(actor.id)).toMatchObject({ removed: true });
+      const result = await owner.remove(actor.id);
+      expect(result).toMatchObject({ removed: true });
+      if (process.platform !== "linux") {
+        expect(result).toMatchObject({ cleaned: false, pending: expect.stringContaining(
+          `Main publication fence, which this platform (${process.platform}) lacks`) });
+      }
       expect(live.size).toBe(0);
     }
     // A real foreign opinion intentionally blocks further registry creation, so
@@ -214,7 +219,12 @@ it("releases completion watches on stop, transfer and 200 recorded actor removal
     owner.listOwned();
     await vi.waitFor(() => expect(live.size).toBe(0), { timeout: 5000, interval: 10 });
     expect(armed).toBeGreaterThanOrEqual(202);
-    expect(removals.filter(file => /^[a-f0-9]{32}$/.test(path.basename(file)))).toHaveLength(200);
+    // Windows (like every non-Linux platform) revokes the registry and closes the
+    // watch, but the Main publication fence cut keeps the tree and cleanup marker
+    // for a later remove/host start; it never reaches the product-data delete.
+    // Linux reaches all 200 actor-directory deletes, recorded here, never executed.
+    expect(removals.filter(file => /^[a-f0-9]{32}$/.test(path.basename(file))))
+      .toHaveLength(process.platform === "linux" ? 200 : 0);
     expect(owner.status(stopped.id).status).toBe("stopped"); // not manager shutdown
   } finally {
     await owner.close();

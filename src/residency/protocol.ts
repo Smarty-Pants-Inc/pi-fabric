@@ -3,6 +3,8 @@ import type { FabricParticipantInfo } from "../topology/types.js";
 import type { FabricPrincipal, FabricWakeCause } from "../fabric-provenance.js";
 import { createHash, randomUUID } from "node:crypto";
 import type { ResidentReleaseIntent, ResidentLauncherIdentity } from "./handover.js";
+import type { ResidentDrainIntent, ResidentDrainReceipt } from "./drain.js";
+import type { AttemptLaunchReceipt } from "./attempt-containment-contract.js";
 import { recordResidentOutcome, registerCancellationEffect } from "../async-settlement.js";
 import { readFileRetrying } from "../core/atomic-write.js";
 import fs from "node:fs";
@@ -414,6 +416,10 @@ export interface ResidentHostOwner {
   releaseRoot?: string;
   configDigest?: string;
   handover?: { abi: "fabric-resident-1"; launcher: ResidentLauncherIdentity };
+  /** Loaded owner supports reversible cooperative drain, NOT automatic containment/exit. */
+  drain?: { abi: "fabric-resident-drain-1" };
+  /** Launcher-custody receipt for this exact native generation, not permission to reopen the scope. */
+  launchAttestation?: AttemptLaunchReceipt;
   /** A staged successor has proved worker startup but admits no business work yet. */
   attempt?: { id: string; kind: "target" | "fallback" };
 }
@@ -587,6 +593,8 @@ type LegacyResidentCommand =
   | ResidentActorStatusCommand
   | ResidentOperatorActorCommand
   | (ResidentReleaseIntent & { format: typeof RESIDENT_ACTOR_COMMAND_FORMAT; operation: "releaseChange";
+      requestId: string; rootId: string; createdAt: number })
+  | (ResidentDrainIntent & { format: typeof RESIDENT_ACTOR_COMMAND_FORMAT; operation: "releaseDrain";
       requestId: string; rootId: string; createdAt: number });
 
 type ExpiringResidentCommand<T> = T extends unknown ? Omit<T, "format"> & { format: typeof RESIDENT_EXPIRING_COMMAND_FORMAT } : never;
@@ -602,7 +610,7 @@ export const residentCommandForOwner = (command: ResidentCommand, owner: Residen
 const LEGACY_RESIDENT_COMMANDS = ["spawn", "foreground", "cleanup", "createActor", "removeActor"] as const;
 export const RESIDENT_COMMANDS = [
   "spawnBound", "foreground", "cleanup", "createActor", "removeActor", "actors", "actorStatus", "setInstructions", "setModel",
-  "setThinking", "setTools", "setActivationFilter", "resetSession", "stop", "releaseChange", "operatorActor",
+  "setThinking", "setTools", "setActivationFilter", "resetSession", "stop", "releaseChange", "releaseDrain", "operatorActor",
 ] as const satisfies readonly ResidentCommand["operation"][];
 
 export const isResidentCommandOperation = (operation: unknown): operation is ResidentCommand["operation"] =>
@@ -659,6 +667,7 @@ export interface ResidentCommandResponse {
   actor?: FabricActorInfo;
   actors?: FabricActorInfo[];
   operatorEvidence?: import("./operator-safety.js").ResidentOperatorEvidence;
+  drain?: ResidentDrainReceipt;
   /** A removeActor that returned before the actor's in-flight run ended: the pending state. */
   pending?: string;
   cleaned?: boolean;

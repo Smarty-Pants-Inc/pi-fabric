@@ -1,6 +1,9 @@
 import { randomUUID } from "node:crypto";
 import { MeshBackgroundQueue, MeshBackgroundRetry } from "../core/atomic-write.js";
 import { rethrowMeshLockTimeout } from "../core/atomic-write.js";
+import { isWatchLimitError } from "../core/watch-fallback.js";
+import { DegradedObservation } from "../core/observation-watch.js";
+import { watchBridgeStore } from "../mesh/change-notifier.js";
 import { MeshStore, meshOutageAlarmSink, type MeshIdentity, type MeshStateEntry } from "../mesh/store.js";
 import type { FabricParticipantInfo, FabricParticipantSource } from "../topology/types.js";
 import {
@@ -30,6 +33,13 @@ export type FabricLifecycleDeliveryHandler = (
 const subscriptionKey = (id: string): string =>
   FABRIC_LIFECYCLE_SUBSCRIPTION_PREFIX + id;
 
+/** Failed-drain retry ceiling: unresolved work is retried by one-shot timers, never an interval. */
+const DRAIN_RETRY_MAX_MS = 30_000;
+/** Watcher re-arm backoff: bounded attempts, then a degraded-only minute carrier. */
+const WATCH_REARM_BASE_MS = 1_000;
+const WATCH_REARM_MAX_MS = 60_000;
+const WATCH_REARM_ATTEMPTS = 6;
+
 export class LifecycleBroker {
   readonly #backgroundPoll = new MeshBackgroundRetry("lifecycle cursor poll")
     .alarmsTo(meshOutageAlarmSink(() => ({ mesh: this.mesh, from: this.identity })));
@@ -40,10 +50,31 @@ export class LifecycleBroker {
   }
   readonly #pollMs: number;
   readonly #maxReadEvents: number;
-  #timer: NodeJS.Timeout | undefined;
+  #started = false;
+  #stopWatch: (() => void) | undefined;
+  /** Unsubscribes the state-projection wake (a NATS projector applying a change no watched file shows). */
+  #stopStateChanges: (() => void) | undefined;
+  #rearmTimer: NodeJS.Timeout | undefined;
+  #rearmAttempts = 0;
+  #watchWarned = false;
+  readonly #observation = new DegradedObservation("lifecycle", () => this.#wake(), () => {
+    this.#armWatch();
+    if (!this.#stopWatch) return false;
+    this.#rearmAttempts = 0;
+    return true;
+  });
+  observationHealth(): string[] { return this.#observation.health ? [this.#observation.health] : []; }
+  #retryTimer: NodeJS.Timeout | undefined;
+  #retryDelay = 0;
   #polling: Promise<void> | undefined;
   #publishTail: Promise<void> = Promise.resolve();
   #pollScheduled = false;
+  /** A wake arrived that no completed drain has served yet (notification, failed or gated drain). */
+  #dirty = false;
+  /** The drain loop is active; a wake during it only sets #dirty and the loop runs again. */
+  #draining = false;
+  /** The current drain swallowed a failure (delivery, cursor or receipt write) and left work behind. */
+  #drainFailed = false;
   #closed = false;
   #paused = false;
   #strictPause = false;
@@ -66,11 +97,64 @@ export class LifecycleBroker {
     this.#maxReadEvents = Math.max(1, options.maxReadEvents);
   }
 
+  /** Drains at once, then on mesh notifications. Healthy idle has no timer;
+   * failed work retries, and exhausted watches use the degraded-only minute carrier. */
   start(): void {
-    if (!this.options.enabled || this.#timer) return;
+    if (!this.options.enabled || this.#started) return;
+    this.#started = true;
     this.#closed = false;
-    this.#timer = setInterval(() => this.#schedulePoll(), this.#pollMs);
-    this.#timer.unref();
+    this.#observation.open();
+    this.#armWatch();
+    // A subscription may become visible here only when the state projector catches up, after its event's
+    // file wake was already drained against the stale view: that projection wakes a fresh drain.
+    this.#stopStateChanges ??= this.mesh.subscribeStateChanges(() => this.#wake());
+    this.#wake();
+  }
+
+  #armWatch(): void {
+    if (this.#closed || this.#stopWatch) return;
+    try {
+      this.#stopWatch = watchBridgeStore(this.mesh.root, () => {
+        this.#rearmAttempts = 0; // a delivered notification proves the watch works
+        this.#wake();
+      }, (error) => this.#watchFailed(error));
+    } catch (error) {
+      this.#watchFailed(error);
+    }
+  }
+
+  // One rescan plus bounded re-arms; exhaustion retains the shared degraded-only carrier.
+  #watchFailed(error: unknown): void {
+    this.#stopWatch?.();
+    this.#stopWatch = undefined;
+    if (this.#closed || this.#observation.degraded) return;
+    const delay = Math.min(WATCH_REARM_MAX_MS, WATCH_REARM_BASE_MS * 2 ** this.#rearmAttempts);
+    if (!this.#watchWarned) {
+      this.#watchWarned = true;
+      const cause = isWatchLimitError(error)
+        ? "ENOSPC: inotify watch limit, not disk space (raise fs.inotify.max_user_watches)"
+        : error instanceof Error ? error.message : String(error);
+      try {
+        console.warn(`[pi-fabric] lifecycle broker: mesh notifications failed for ${this.mesh.root} (${cause}); ` +
+          `rescanned once, re-arming in ${delay} ms with bounded retries. Normal operation has no polling; ` +
+          "exhausted watches scan and re-arm once per minute.");
+      } catch {}
+    }
+    this.#wake();
+    if (this.#rearmTimer) return;
+    if (this.#rearmAttempts >= WATCH_REARM_ATTEMPTS) { this.#observation.enter(); return; }
+    this.#rearmAttempts++;
+    this.#rearmTimer = setTimeout(() => {
+      this.#rearmTimer = undefined;
+      if (this.#closed) return;
+      this.#armWatch();
+      if (this.#stopWatch) this.#wake(); // notifications may have been missed while unarmed
+    }, delay);
+    this.#rearmTimer.unref?.();
+  }
+
+  #wake(): void {
+    this.#dirty = true;
     this.#schedulePoll();
   }
 
@@ -98,7 +182,7 @@ export class LifecycleBroker {
           ...(request.data === undefined ? {} : { payload: request.data }),
         },
       });
-      this.#schedulePoll();
+      this.#wake();
       return lifecycleEventFromMesh(event);
     });
     this.#publishTail = operation.then(
@@ -156,7 +240,7 @@ export class LifecycleBroker {
       this.#assertSubscriptionAdmission();
       return [{ kind: "put", key: subscriptionKey(subscription.id), value: subscription, ifVersion: 0 }];
     } });
-    this.#schedulePoll();
+    this.#wake();
     return structuredClone(subscription);
   }
 
@@ -194,9 +278,10 @@ export class LifecycleBroker {
     this.#strictPause ||= strict;
   }
   resume(): void {
-    if (!this.#paused) return;
-    this.#paused = false; this.#strictPause = false; this.#releaseEpoch++;
-    this.#schedulePoll();
+    if (this.#paused) {
+      this.#paused = false; this.#strictPause = false; this.#releaseEpoch++;
+    }
+    this.#wake();
   }
   async checkpointForRelease(valid?: () => boolean): Promise<void> {
     const epoch = this.#releaseEpoch;
@@ -247,8 +332,16 @@ export class LifecycleBroker {
   async close(): Promise<void> {
     if (this.#closed) return;
     this.#closed = true;
-    if (this.#timer) clearInterval(this.#timer);
-    this.#timer = undefined;
+    this.#started = false;
+    this.#observation.close();
+    this.#stopWatch?.();
+    this.#stopWatch = undefined;
+    this.#stopStateChanges?.();
+    this.#stopStateChanges = undefined;
+    clearTimeout(this.#rearmTimer);
+    this.#rearmTimer = undefined;
+    clearTimeout(this.#retryTimer);
+    this.#retryTimer = undefined;
     await this.#backgroundPublish.close();
     await this.#publishTail;
     await this.#polling?.catch(() => undefined);
@@ -264,12 +357,64 @@ export class LifecycleBroker {
     queueMicrotask(() => {
       this.#pollScheduled = false;
       if (this.#closed) return;
-      void this.#backgroundPoll.run(() => this.#poll());
+      void this.#runDrains();
     });
   }
 
+  #gated(): boolean {
+    return this.#closed || this.#paused || !this.options.enabled || this.options.canConsumeMesh?.() === false;
+  }
+
+  // Serial drain loop. A wake while a drain runs sets #dirty, so the loop drains again rather
+  // than dropping it. A gated drain keeps #dirty for resume() or the next notification.
+  async #runDrains(): Promise<void> {
+    if (this.#draining) return;
+    this.#draining = true;
+    try {
+      while (this.#dirty && !this.#gated()) {
+        if (this.#retryTimer) { clearTimeout(this.#retryTimer); this.#retryTimer = undefined; }
+        this.#dirty = false;
+        this.#drainFailed = false;
+        const outcome = await this.#backgroundPoll.run(() => this.#poll());
+        if (outcome === "done" && !this.#drainFailed && this.#delivered.size === 0) {
+          this.#retryDelay = 0;
+          continue;
+        }
+        // Failed, deferred or left an unconfirmed receipt: retry once after backoff, no event needed.
+        this.#dirty = true;
+        this.#scheduleRetry(outcome);
+        return;
+      }
+    } finally {
+      this.#draining = false;
+    }
+  }
+
+  #scheduleRetry(outcome: "done" | "retry" | "failed" | "skipped"): void {
+    if (this.#closed) return;
+    let delay: number;
+    if (outcome === "retry" || outcome === "skipped") {
+      delay = Math.max(1, this.#backgroundPoll.waitMs);
+    } else {
+      this.#retryDelay = Math.min(DRAIN_RETRY_MAX_MS, this.#retryDelay ? this.#retryDelay * 2 : this.#pollMs);
+      delay = this.#retryDelay;
+    }
+    clearTimeout(this.#retryTimer);
+    this.#retryTimer = setTimeout(() => {
+      this.#retryTimer = undefined;
+      this.#wake();
+    }, delay);
+    this.#retryTimer.unref?.();
+  }
+
+  /** Contains a swallowed drain-step failure but records it, so the drain is retried. */
+  readonly #contain = (error: unknown): undefined => {
+    this.#drainFailed = true;
+    return rethrowMeshLockTimeout(error);
+  };
+
   async #poll(): Promise<void> {
-    if (this.#closed || this.#paused || !this.options.enabled || this.options.canConsumeMesh?.() === false) return;
+    if (this.#gated()) { this.#dirty = true; return; }
     if (this.#polling) return this.#polling;
     const operation = this.#drain();
     this.#polling = operation;
@@ -288,13 +433,13 @@ export class LifecycleBroker {
     // needs a target lookup (upstream ee2b27b85).
     let directory: Map<string, FabricParticipantInfo> | undefined;
     for (const entry of entries) {
-      if (this.options.canConsumeMesh?.() === false) return;
+      if (this.options.canConsumeMesh?.() === false) { this.#dirty = true; return; }
       const subscription = lifecycleSubscriptionFromValue(entry.value);
       if (!subscription || entry.key !== subscriptionKey(subscription.id)) continue;
       listed.add(subscription.id);
       if (this.#delivered.has(subscription.id)) {
         // Retry only the cursor/delete receipt; use a fresh poll after success.
-        await this.#confirmDelivered(subscription.id).catch(rethrowMeshLockTimeout);
+        await this.#confirmDelivered(subscription.id).catch(this.#contain);
         continue;
       }
       // Only the target's host drains a subscription. Pass over other hosts' targets (from
@@ -339,7 +484,7 @@ export class LifecycleBroker {
   ): Promise<void> {
     let entry = initialEntry;
     let subscription = initial;
-    while (!this.#closed && !this.#paused && this.options.canConsumeMesh?.() !== false) {
+    while (!this.#gated()) {
       const latestSequence = this.mesh.latestSequence();
       const from = this.#cursor(subscription);
       if (latestSequence <= from) return;
@@ -353,7 +498,7 @@ export class LifecycleBroker {
           ...subscription,
           afterSequence: latestSequence,
           updatedAt: Date.now(),
-        }, () => { if (this.#paused) throw new Error("Lifecycle input cursor is held for release"); }).then(() => this.#unsaved.delete(subscription.id), rethrowMeshLockTimeout);
+        }, () => { if (this.#paused) throw new Error("Lifecycle input cursor is held for release"); }).then(() => this.#unsaved.delete(subscription.id), this.#contain);
         return;
       }
 
@@ -362,7 +507,7 @@ export class LifecycleBroker {
       let lastDeliveredAt = subscription.lastDeliveredAt;
       let lastEventId = subscription.lastEventId;
       for (const meshEvent of events) {
-        if (this.#paused || this.options.canConsumeMesh?.() === false) return;
+        if (this.#paused || this.options.canConsumeMesh?.() === false) { this.#dirty = true; return; }
         const lifecycle = lifecycleEventFromMesh(meshEvent);
         if (!lifecycle) {
           cursor = Math.max(cursor, meshEvent.sequence);
@@ -379,6 +524,8 @@ export class LifecycleBroker {
         try {
           await this.deliver(subscription, lifecycle);
         } catch (error) {
+          // The handler failed: the event stays unconsumed and must be retried without another event.
+          this.#drainFailed = true;
           if (this.options.canConsumeMesh?.() === false) return;
           const failed: FabricLifecycleSubscription = {
             ...subscription,
@@ -386,7 +533,7 @@ export class LifecycleBroker {
             updatedAt: Date.now(),
             lastError: error instanceof Error ? error.message : String(error),
           };
-          await this.#replace(entry, failed).then(() => this.#unsaved.delete(subscription.id), rethrowMeshLockTimeout);
+          await this.#replace(entry, failed).then(() => this.#unsaved.delete(subscription.id), this.#contain);
           return;
         }
         cursor = lifecycle.sequence;
@@ -397,8 +544,8 @@ export class LifecycleBroker {
         delete delivered.lastError;
         this.#delivered.set(subscription.id, { entry, subscription: delivered });
         // Preserve the delivery receipt, not the cursor, across lease loss.
-        if (this.options.canConsumeMesh?.() === false) return;
-        const confirmed = await this.#confirmDelivered(subscription.id).catch(rethrowMeshLockTimeout);
+        if (this.options.canConsumeMesh?.() === false) { this.#dirty = true; return; }
+        const confirmed = await this.#confirmDelivered(subscription.id).catch(this.#contain);
         if (subscription.once || !confirmed) return;
         entry = confirmed; subscription = delivered;
         if (this.#paused) return;
@@ -423,13 +570,14 @@ export class LifecycleBroker {
       }
       const next = await this.#replace(entry, updated, () => {
         if (this.#paused) throw new Error("Lifecycle input cursor is held for release");
-      }).catch(rethrowMeshLockTimeout);
+      }).catch(this.#contain);
       if (!next) return;
       this.#unsaved.delete(subscription.id);
       entry = next;
       subscription = updated;
       if (events.length < this.#maxReadEvents) return;
     }
+    this.#dirty = true; // a gate closed mid-drain: resume() or the next notification finishes it
   }
 
   // Both answers are final: a skipped event is skipped for good (the cursor moves past it), and

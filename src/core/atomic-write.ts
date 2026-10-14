@@ -932,11 +932,27 @@ export class MeshBackgroundRetry {
   #lastReportedAt: number | undefined;
   #suppressed = 0;
   #running = false;
+  // Opt-in (backoffFailures) state for non-transient failures; the default boundary never sets it.
+  #failureBackoff: { minMs: number; maxMs: number } | undefined;
+  #failureDelay = 0;
+  #failureMessage: string | undefined;
+  #failureReportedAt: number | undefined;
+  #failureSuppressed = 0;
   constructor(readonly label: string, readonly minMs = 100, readonly maxMs = 5_000,
     readonly warningWindowMs = meshRetryWarningWindowMs()) {}
 
+  /** Opt-in for a self-retriggering path (a periodic refresh, not a queue): a non-transient failure stays
+   * `failed` but waits out a deterministic exponential backoff (minMs doubling to maxMs) before run() tries
+   * again, and the same repeated message is printed at most once per warning window. A confirmed success()
+   * clears the backoff. Default instances keep the immediate-retry semantics. */
+  backoffFailures(minMs: number, maxMs: number): this {
+    const min = Math.max(1, Math.floor(minMs));
+    this.#failureBackoff = { minMs: min, maxMs: Math.max(min, Math.floor(maxMs)) };
+    return this;
+  }
+
   get waitMs(): number { return Math.max(0, this.#retryAt - Date.now()); }
-  #resetBackoff(): void { this.#delay = 0; this.#retryAt = 0; }
+  #resetBackoff(): void { this.#delay = 0; this.#retryAt = 0; this.#failureDelay = 0; }
   /** A confirmed acquisition: reset backoff, never the warning window (smarty-dev#8305). `final`: the path's work is
    * done (a one-shot write such as one actor's presence), so its outage ends now, with no further writes to wait for. */
   success(final = false): void {
@@ -967,8 +983,13 @@ export class MeshBackgroundRetry {
       // Contain the owned callback, but surface unrelated bugs and preserve its existing
       // retry cadence. Only a typed acquisition failure earns lock backoff/deduplication.
       // Not proof that the lock is free: no recovery summary, suppression is kept.
+      const message = error instanceof Error ? error.message : String(error);
+      if (this.#failureBackoff) {
+        this.#failBackoff(message);
+        return false;
+      }
       this.#resetBackoff();
-      console.warn(`[pi-fabric] ${this.label}: background operation failed: ${error instanceof Error ? error.message : String(error)}`);
+      console.warn(`[pi-fabric] ${this.label}: background operation failed: ${message}`);
       return false;
     }
     this.#delay = Math.min(this.maxMs, Math.max(this.minMs, this.#delay * 2));
@@ -999,6 +1020,24 @@ export class MeshBackgroundRetry {
       this.#suppressed++;
     }
     return transient;
+  }
+
+  #failBackoff(message: string): void {
+    const { minMs, maxMs } = this.#failureBackoff!;
+    this.#failureDelay = Math.min(maxMs, Math.max(minMs, this.#failureDelay * 2));
+    const now = Date.now();
+    this.#retryAt = now + this.#failureDelay;
+    const elapsedMs = this.#failureReportedAt === undefined ? Infinity : now - this.#failureReportedAt;
+    if (message === this.#failureMessage && elapsedMs < this.warningWindowMs) {
+      this.#failureSuppressed++;
+      return;
+    }
+    const summary = this.#failureSuppressed > 0
+      ? ` (${this.#failureSuppressed} similar failures suppressed in the last ${Math.floor(elapsedMs / 1_000)}s)` : "";
+    console.warn(`[pi-fabric] ${this.label}: background operation failed: ${message}; retrying in ${this.#failureDelay} ms${summary}`);
+    this.#failureMessage = message;
+    this.#failureReportedAt = now;
+    this.#failureSuppressed = 0;
   }
 
   /** Polls retry unchanged state on a later tick after backoff; contains sync handlers too.

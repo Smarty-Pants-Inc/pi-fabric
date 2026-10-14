@@ -230,6 +230,13 @@ export interface StateBackend {
 
   /** Drops parsed caches (called after a failed operation under the mesh lock). */
   dropCache(): void;
+  /**
+   * Optional (pi-fabric#7978): calls `listener` after this process's read projection has applied a whole committed
+   * change that arrived without a watched mesh-root file write (nats: the stream consumer). A hint, never authority:
+   * consumers re-read state. Backends whose commits already touch watched files (file, sqlite, shadow) omit it.
+   * Returns the unsubscribe function.
+   */
+  subscribeStateChanges?(listener: () => void): () => void;
   diagnostics(): StateBackendDiagnostics;
   /** Releases database handles; reads and writes after close throw (file: no-op). */
   close(): void;

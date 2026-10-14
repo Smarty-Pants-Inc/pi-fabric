@@ -1707,13 +1707,14 @@ export class ParticipantDirectory implements FabricParticipantSource {
       const stale = (current: { expiresAt: number }): never => {
         throw new FabricPeerLeaseStaleError(id, initial.remoteHost, Math.max(0, now() - current.expiresAt));
       };
-      // A renewed same-owner mirror, or a changed validated owner, re-runs ordinary routing and its
-      // fences; a removed/invalid/ended record falls back to the ordinary refusal.
+      // Only a renewal of the SAME owner/identity/root/remoteHost captured before waiting re-runs
+      // ordinary routing. A different valid owner/link gets a typed stale refusal; removed,
+      // invalid or ended mirrors keep the ordinary refusal (R1: never redirect the retry).
       const decide = (final: boolean): boolean | undefined => {
         const current = this.#remoteMirrorLease(id);
         if (current.state === "none" || current.state === "ended") return false;
+        if (!sameOwner(current)) return stale(initial);
         if (current.state === "live") return true;
-        if (!sameOwner(current)) return false;
         return final ? stale(current) : undefined;
       };
       const check = (): void => {

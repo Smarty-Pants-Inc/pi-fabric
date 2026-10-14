@@ -211,6 +211,100 @@ describe("remote mirror lease wait (smarty-dev#11703)", () => {
     expect(w.sendMessage).not.toHaveBeenCalled();
   }, 30_000);
 
+  // R1: a live re-read of a DIFFERENT authority while waiting must never be accepted as the renewal.
+  it.each(["remoteHost change", "owner host/identity replacement"] as const)("R1 refuses, never publishing, when a valid live %s replaces the expired mirror while waiting", async variant => {
+    const w = await world();
+    const pending = w.sending.routeMessage(w.target.identity.id, `no redirect ${variant}`, undefined, "followUp", undefined, { idempotencyKey: `r1-${variant}` });
+    const state = settle(pending);
+    await sleep(300);
+    if (state.done?.error) throw state.done.error;
+    expect(state.done).toBeUndefined();
+    const now = Date.now();
+    const pKey = `topology/participants/${hash(w.target.hostId)}`;
+    const mirrored = w.hub.get(pKey, { fresh: true })!;
+    const participant = mirrored.value as Record<string, unknown>;
+    let owner: string, ownerIdentity: string, remoteHost: string;
+    if (variant === "remoteHost change") {
+      const hKey = `topology/hosts/${hash(w.target.hostId)}`, host = w.hub.get(hKey, { fresh: true })!;
+      await w.hub.writeBatch({ identity: mirrored.updatedBy, ops: [
+        { kind: "put", key: hKey, value: { ...(host.value as object), remoteHost: "ryzen2", updatedAt: now, expiresAt: now + 60_000 } },
+        { kind: "put", key: pKey, value: { ...participant, remoteHost: "ryzen2", updatedAt: now } },
+      ] });
+      owner = w.target.hostId; ownerIdentity = w.target.identity.id; remoteHost = "ryzen2";
+    } else {
+      const b = sid("replacement"), identity: MeshIdentity = { id: b, name: "main", kind: "main", sessionId: "replacement" };
+      await w.hub.put({ key: `topology/hosts/${hash(b)}`, identity, value: { format: 1, id: b, rootId: w.target.hostId, identity,
+        remoteHost: "forge", startedAt: now, updatedAt: now, expiresAt: now + 60_000 } });
+      await w.hub.put({ key: pKey, identity, value: { ...participant, ownerHostId: b, ownerIdentityId: b,
+        ownerIncarnation: `fixture:${b}`, updatedAt: now } });
+      owner = b; ownerIdentity = b; remoteHost = "forge";
+    }
+    // The replacement is genuinely VALID and LIVE in a fresh directory read.
+    const replacement = w.hubDirectory.mirroredControlOwner(owner, ownerIdentity, w.target.identity.id);
+    expect(replacement).toMatchObject({ remoteHost });
+    expect(replacement!.expiresAt).toBeGreaterThan(Date.now());
+    await waitFor(() => state.done !== undefined, 5_000);
+    expect(state.done!.error).toMatchObject({ code: "FABRIC_PEER_LEASE_STALE", retryable: true });
+    await w.bridge.step();
+    await sleep(100);
+    expect(on(w.hub, "fabric.control.command")).toEqual([]);
+    expect(on(w.far, "fabric.control.command")).toEqual([]);
+    expect(w.sendMessage).not.toHaveBeenCalled();
+  }, 30_000);
+
+  // R1 post-decision: the original same-owner renewal resolves the wait, then a VALID LIVE replacement is installed
+  // before the router retries. The retry must stay pinned to the pre-wait root authority (never its own recache).
+  // Decision C seams: vi.spyOn(directory.resolveRoutingLease) wraps the real wait; vi.spyOn(directory.get) makes the
+  // non-fresh cached view re-cache the replacement (fresh reads stay real). Stores, bridge and control are real.
+  it.each(["remoteHost change", "owner host/identity replacement"] as const)("R1 refuses a %s installed after the same-owner renewal decision, never publishing", async variant => {
+    const w = await world();
+    const realResolve = w.hubDirectory.resolveRoutingLease.bind(w.hubDirectory);
+    const realGet = w.hubDirectory.get.bind(w.hubDirectory);
+    let replaced = false;
+    // Let the real renewal pass finish before installing B, so it cannot overwrite the replacement.
+    let finishPresence!: () => void;
+    const presenceFinished = new Promise<void>(resolve => { finishPresence = resolve; });
+    vi.spyOn(w.hubDirectory, "resolveRoutingLease").mockImplementation(async (id: string) => {
+      const renewed = await realResolve(id);
+      expect(renewed).toBe(true);
+      await presenceFinished;
+      const now = Date.now();
+      const pKey = `topology/participants/${hash(w.target.hostId)}`;
+      const mirrored = w.hub.get(pKey, { fresh: true })!;
+      const participant = mirrored.value as Record<string, unknown>;
+      if (variant === "remoteHost change") {
+        const hKey = `topology/hosts/${hash(w.target.hostId)}`, host = w.hub.get(hKey, { fresh: true })!;
+        await w.hub.put({ key: hKey, identity: host.updatedBy, value: { ...(host.value as object), remoteHost: "ryzen2", updatedAt: now, expiresAt: now + 60_000 } });
+        await w.hub.put({ key: pKey, identity: mirrored.updatedBy, value: { ...participant, remoteHost: "ryzen2", updatedAt: now } });
+        expect(w.hubDirectory.mirroredControlOwner(w.target.hostId, w.target.identity.id, w.target.identity.id)).toMatchObject({ remoteHost: "ryzen2" });
+      } else {
+        const b = sid("replacement"), identity: MeshIdentity = { id: b, name: "main", kind: "main", sessionId: "replacement" };
+        await w.hub.put({ key: `topology/hosts/${hash(b)}`, identity, value: { format: 1, id: b, rootId: w.target.hostId, identity,
+          remoteHost: "forge", startedAt: now, updatedAt: now, expiresAt: now + 60_000 } });
+        await w.hub.put({ key: pKey, identity, value: { ...participant, ownerHostId: b, ownerIdentityId: b,
+          ownerIncarnation: `fixture:${b}`, updatedAt: now } });
+        expect(w.hubDirectory.mirroredControlOwner(b, b, w.target.identity.id)).toMatchObject({ remoteHost: "forge" });
+      }
+      replaced = true;
+      return true;
+    });
+    // Cache-positive seam: after the decision the cached view re-caches the replacement (as a fresh read would).
+    vi.spyOn(w.hubDirectory, "get").mockImplementation(((id: string, kind?: unknown, options?: { fresh?: boolean }) =>
+      replaced && !options?.fresh ? realGet(id, kind as never, { fresh: true }) : realGet(id, kind as never, options as never)) as typeof w.hubDirectory.get);
+    const pending = w.sending.routeMessage(w.target.identity.id, `no post-decision redirect ${variant}`, undefined, "followUp", undefined, { idempotencyKey: `r1-post-${variant}` });
+    const state = settle(pending);
+    await sleep(300);
+    if (state.done?.error) throw state.done.error;
+    expect(state.done).toBeUndefined();
+    await w.bridge.syncPresence();
+    finishPresence();
+    await waitFor(() => state.done !== undefined, 5_000);
+    expect(replaced).toBe(true);
+    expect(state.done!.error).toMatchObject({ code: "FABRIC_ROUTE_AUTHORITY_CHANGED" });
+    expect(on(w.hub, "fabric.control.command")).toEqual([]);
+    expect(w.sendMessage).not.toHaveBeenCalled();
+  }, 30_000);
+
   it("a truly absent record stays Unknown without waiting", async () => {
     const w = await world();
     const started = performance.now();

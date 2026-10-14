@@ -69,7 +69,6 @@ export const acquireMeshCustodyLock = async (root: string, timeoutMs = CUSTODY_L
   fs.mkdirSync(root, { recursive: true, mode: 0o700 });
   const lock = path.join(root, MESH_CUSTODY_LOCK_NAME);
   const ownerPath = path.join(lock, "owner");
-  const deadline = Date.now() + Math.max(0, timeoutMs);
   const token = randomUUID();
   // Keep full UUID ownership receipts; only transient filesystem names need a short token.
   const pathToken = randomBytes(4).toString("hex");
@@ -93,6 +92,9 @@ export const acquireMeshCustodyLock = async (root: string, timeoutMs = CUSTODY_L
     catch (error) { if (errorCode(error) === "ENOENT") return undefined; throw error; }
   };
   const blocked: StaleLockNote = {};
+  // The relative wait budget starts at the first acquisition attempt, after setup (incarnation and PID-namespace
+  // reads): slow setup must not spend it before the lock was tried.
+  const deadline = Date.now() + Math.max(0, timeoutMs);
   let attempts = 0;
   let maxGapMs = 0;
   let lastAttemptAt = Date.now();

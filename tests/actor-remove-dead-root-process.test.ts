@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 import { offlineMarkerPath } from "../src/actors/remove-offline.js";
 import { mainPublicationFencePath, mainPublicationFenced } from "../src/topology/main-publication-fence.js";
 import { readParticipantFile } from "../src/topology/participant-files.js";
+import { ROOT_PARTICIPANT_FRESH_MS } from "../src/residency/operator-safety.js";
 import { fixture, rootParticipantKey, type DeadRootFixture } from "./helpers/dead-root-fixture.js";
 import { processHarness } from "./helpers/process-harness.js";
 
@@ -135,8 +136,16 @@ describe.skipIf(process.platform !== "linux")("dead-root removal across processe
       expect(JSON.parse(fs.readFileSync(fence, "utf8"))).toMatchObject({ pid: killed.pid });
       expect(fenced(f)).toBe(false);
       expect(fs.existsSync(actor!.dir)).toBe(true); // killed before the move: the tree is kept
-      // The Main stops again before the operator reruns; the rerun resumes from the pending record.
-      await main.stop();
+      // No expiry: the Main publishes at once after the kill.
+      expect(await main.publish()).toMatchObject({ ok: true });
+      expect(participantPid(f)).toBe(main.pid);
+      // While the Main is alive and fresh, a rerun refuses and keeps the tree.
+      const early = h.remover("none", removeArgs(f, actor!.id));
+      expect(await early.next("exit")).toMatchObject({ code: 1, err: expect.stringMatching(/Main is live|Main has a live root lease/) });
+      expect(fs.readFileSync(path.join(actor!.dir, "session.jsonl"), "utf8")).toBe("history\n");
+      await main.stop(); // clean stop withdraws the Main's participant and lease
+      // Seed the stopped Main's stale dead-pid record so the rerun can resume from the pending record.
+      f.mainParticipant(Date.now() - 2 * ROOT_PARTICIPANT_FRESH_MS);
       const rerun = h.remover("none", removeArgs(f, actor!.id));
       expect(await rerun.next("exit")).toMatchObject({ code: 0, err: "" });
       expect(archivedTree(f, actor!.id)).toBe(true);

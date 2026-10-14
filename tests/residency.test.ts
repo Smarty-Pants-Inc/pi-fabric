@@ -686,9 +686,19 @@ describe("#169 round 2 public cleanup outcome", () => {
       });
       expect(fs.existsSync(marker)).toBe(true);
       failing.mockRestore();
+      if (process.platform === "linux") {
       await expect(provider.invoke("remove", { id: actor.id }, context)).resolves.toEqual({ removed: true });
       expect(fs.existsSync(dir)).toBe(false);
       expect(fs.existsSync(marker)).toBe(false);
+      } else {
+        // Off Linux the retry is refused before any delete (smarty-dev#8090; follow-up smarty-dev#11335): tree and marker kept.
+        await expect(provider.invoke("remove", { id: actor.id }, context)).resolves.toMatchObject({
+          removed: true, cleaned: false,
+          pending: `removal cleanup failed: Root actor tree deletion needs the Main publication fence, which this platform (${process.platform}) lacks (smarty-dev#8090); follow-up smarty-dev#11335; the root ${state.identity.id} actor tree is kept (a later remove or host start finishes it)`,
+        });
+        expect(fs.existsSync(dir)).toBe(true);
+        expect(fs.existsSync(marker)).toBe(true);
+      }
     } finally {
       failing?.mockRestore();
       controller.abort(); await running;
@@ -741,11 +751,21 @@ describe("#169 round 1 resident cleanup routing", () => {
       const retried = await request({ operation: "removeActor", id: actor.id });
       expect(retried).toMatchObject({ ok: true });
       expect(first.cleaned).toBe(false);
+      if (process.platform === "linux") {
       expect(retried.pending).toBeUndefined();
       expect(fs.existsSync(dir)).toBe(false);
       expect(fs.existsSync(marker)).toBe(false);
       expect(fs.existsSync(removalsPath)).toBe(false);
       expect(fs.readFileSync(successor.sessionFile, "utf8")).toBe("successor history\n");
+      } else {
+        // Off Linux no root actor tree deletion runs (smarty-dev#8090; follow-up smarty-dev#11335): still pending, all kept.
+        expect(retried.cleaned).toBe(false);
+        expect(retried.pending).toBe(`removal cleanup failed: Root actor tree deletion needs the Main publication fence, which this platform (${process.platform}) lacks (smarty-dev#8090); follow-up smarty-dev#11335; the root ${state.identity.id} actor tree is kept (a later remove or host start finishes it)`);
+        expect(fs.existsSync(dir)).toBe(true);
+        expect(fs.existsSync(marker)).toBe(true);
+        expect(fs.existsSync(removalsPath)).toBe(true);
+        expect(fs.readFileSync(successor.sessionFile, "utf8")).toBe("successor history\n");
+      }
     } finally {
       failing?.mockRestore();
       controller.abort();
@@ -2282,7 +2302,19 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
       mainAgent: state.mainAgent,
       hostPath,
     });
-    await expect(reconnect.removeActor(actor.id)).resolves.toEqual({ removed: true });
+    if (process.platform === "linux") {
+      await expect(reconnect.removeActor(actor.id)).resolves.toEqual({ removed: true });
+    } else {
+      const historyFile = path.join(state.config.actorRoot, actor.id, "session.jsonl");
+      fs.appendFileSync(historyFile, `${JSON.stringify({ testHistory: "resident reconnect removal" })}\n`);
+      const historyBeforeRemoval = fs.readFileSync(historyFile, "utf8");
+      // Off Linux the fence refusal follows registry revocation but precedes tree deletion; follow-up smarty-dev#11335.
+      const removal = await reconnect.removeActor(actor.id);
+      expect(removal).toEqual({ removed: true, cleaned: false,
+        pending: `removal cleanup failed: Root actor tree deletion needs the Main publication fence, which this platform (${process.platform}) lacks (smarty-dev#8090); follow-up smarty-dev#11335; the root ${state.identity.id} actor tree is kept (a later remove or host start finishes it)` });
+      expect(fs.existsSync(path.join(state.config.actorRoot, actor.id))).toBe(true);
+      expect(fs.readFileSync(historyFile, "utf8")).toBe(historyBeforeRemoval);
+    }
     // review/astra on pi-fabric#136: actor activations leave no saved durable task result.
     const resultsDir = path.join(state.config.residencyRoot, "results");
     expect(fs.existsSync(resultsDir) ? fs.readdirSync(resultsDir) : []).toEqual([]);

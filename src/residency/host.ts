@@ -939,7 +939,10 @@ export class ResidentHost {
       this.#scheduleIdleCheck();
       this.#writeWakeRoutes();
       if (this.#wakeRecovery) {
-        this.#wakeRecoveryPending = this.#continueWakeRecovery().finally(() => { this.#wakeRecoveryPending = undefined; });
+        this.#wakeRecoveryPending = this.#continueWakeRecovery().finally(() => {
+          this.#wakeRecoveryPending = undefined;
+          this.#scheduleIdleCheck();
+        });
       }
       this.#startStateProjector();
       // Retention is not part of request admission/heartbeat/claim. A bounded
@@ -978,7 +981,7 @@ export class ResidentHost {
       const recovery = { config: this.config, ownedActors: this.actors.listOwned(true), batch, ignored: 0 };
       await wakeResidentActors(this.mesh, [], undefined, recovery);
       this.#wakeRecoveryIgnored += recovery.ignored;
-    } finally { this.#admissions--; }
+    } finally { this.#admissions--; this.#scheduleIdleCheck(); }
   }
 
   async #continueWakeRecovery(): Promise<void> {
@@ -1103,7 +1106,7 @@ export class ResidentHost {
     this.#admissions++;
     this.#businessAdmissions++;
     try { return await this.#handleControl(command, from, signal, verification); }
-    finally { this.#admissions--; }
+    finally { this.#admissions--; this.#scheduleIdleCheck(); }
   }
 
   async #handleControl(command: FabricControlCommand, from: MeshIdentity, signal?: AbortSignal, verification?: "mesh" | "bridge"): Promise<FabricControlAcceptance> {
@@ -1248,7 +1251,7 @@ export class ResidentHost {
     this.#admissions++;
     this.#businessAdmissions++;
     try { await this.#handleLifecycle(subscription, event); }
-    finally { this.#admissions--; }
+    finally { this.#admissions--; this.#scheduleIdleCheck(); }
   }
 
   async #handleLifecycle(subscription: FabricLifecycleSubscription, event: FabricLifecycleEvent): Promise<void> {
@@ -1451,7 +1454,10 @@ export class ResidentHost {
           this.#boundaryRequests.set(processing, response);
           // Shutdown/handover retains custody until the terminal response is durable.
           this.#trackPublication(response);
-          void response.finally(() => this.#boundaryRequests.delete(processing)).catch(() => undefined);
+          void response.finally(() => {
+            this.#boundaryRequests.delete(processing);
+            this.#scheduleIdleCheck();
+          }).catch(() => undefined);
         }
       }
     } finally {
@@ -1676,9 +1682,12 @@ export class ResidentHost {
     return protectedIds;
   }
 
-  #hasHostWork(): boolean {
+  // Creation/adoption/reconciliation retain release custody, but must not consume
+  // an actor's eligibility event. Ordinary dormancy revalidates each actor's
+  // activation work; every idle-exit boundary still uses the full custody count.
+  #hasHostWork(includeActorCustody = true): boolean {
     return this.#wakeRecoveryPending !== undefined || residentProcessWorkPending(this.processWorkSessionId) || this.#admissions > 0 || this.#boundaryRequests.size > 0 ||
-      this.#publicationFailed || this.actors.inFlightCount() > 0 ||
+      this.#publicationFailed || (includeActorCustody ? this.actors.inFlightCount() > 0 : this.actors.inFlightActorIds().length > 0) ||
       this.agents.listForUi().some(agent => agent.status === "queued" || agent.status === "running") ||
       [this.#requestsPath, this.#processingPath].some(directory => {
         try { return fs.readdirSync(directory).some(entry => entry.endsWith(".json")); }
@@ -1695,7 +1704,9 @@ export class ResidentHost {
     const now = Date.now();
     // Startup/reload and open process calls are work even when all actors look idle.
     // Dormant release restarts its window now; dead-root retirement at its next idle sample.
-    if (!this.#ready || this.#hasHostWork()) { this.#idleSince = this.#idleWakeable ? now : undefined; return; }
+    // Only event-owned eligibility distinguishes actor activation from release
+    // custody. Request polling and all final boundaries retain the exact veto.
+    if (!this.#ready || this.#hasHostWork(!includeDormancy)) { this.#idleSince = this.#idleWakeable ? now : undefined; return; }
     if (!includeDormancy && this.#idleCheckPending) return;
     if (includeDormancy) {
       if (this.#wakeWatchNeedsReprobe && !await this.#ensureWakeWatch()) return;
@@ -1710,7 +1721,7 @@ export class ResidentHost {
           return;
         }
         if (this.#closed || !this.#ready || this.#staged || this.#handover || this.#drain || this.#sleeping ||
-            this.#hasHostWork() || !this.#hasWakeConfig()) { this.#idleSince = Date.now(); return; }
+            this.#hasHostWork(false) || !this.#hasWakeConfig()) { this.#idleSince = Date.now(); return; }
         try {
           // The watcher proof may yield to delivery or presence changes. Refresh
           // expected participants; dormantIdleActors rechecks current work custody.
@@ -2403,6 +2414,9 @@ export class ResidentHost {
     }
     fs.rmSync(filePath, { force: true });
     this.participants.scheduleRefresh();
+    // Actor events during create/setters preceded the durable response and
+    // processing-file release. Recheck when this exchange actually settles.
+    this.#scheduleIdleCheck();
   }
 
   #pruneCreations(): void {

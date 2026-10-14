@@ -3866,10 +3866,12 @@ describe("ActorManager", () => {
     }
     expect(actors.status(actor.id).activationBlocked).toMatchObject({ reason, code, count: ACTOR_FAILURE_NOTICE_AFTER, since: expect.any(Number) });
     await waitFor(() => mesh.read({ topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, limit: 20 }).length === 1);
-    // smarty-dev#10067 P2-2: the owner alarm carries the fixed code, not the error text; the Main notice keeps the text.
+    // smarty-dev#12512: both the mesh alarm and Main notice carry fixed codes, never the raw error.
     expect(mesh.read({ topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, limit: 20 })[0]!.data).toMatchObject({ reason: code, code });
     expect(deliveries.filter(text => text.startsWith("Fabric host notice:"))).toHaveLength(1);
-    expect(deliveries.find(text => text.startsWith("Fabric host notice:"))).toContain(`Last error: ${reason}`);
+    const notice = deliveries.find(text => text.startsWith("Fabric host notice:"));
+    expect(notice).toContain(`Failure code: ${code}`);
+    expect(notice).not.toContain(reason);
   });
 
   it("settles restored failed activation asks and callerless work without stranded in-flight items", async () => {
@@ -4131,13 +4133,15 @@ describe("ActorManager", () => {
       expect(restored.status(actor.id)).not.toHaveProperty("activationBlockExpired");
     }, 60_000);
 
-    it("records the classification on the owner alarm", async () => {
+    it("keeps the raw classification off the owner alarm", async () => {
       const s = setup(true);
       const actor = await s.actors.create({ name: "alarmed", instructions: "Respond.", responseMode: "text" });
       for (let run = 0; run < ACTOR_FAILURE_NOTICE_AFTER; run++) await failOnce(s.actors, s.agents, actor.id);
       await waitFor(() => s.mesh.read({ topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, limit: 20 }).length === 1);
-      expect(s.mesh.read({ topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, limit: 20 })[0]!.data).toMatchObject({
-        code: "provider-transient", classification: 'transient: provider 5xx or overload (matched ": 502")' });
+      const data = s.mesh.read({ topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, limit: 20 })[0]!.data;
+      expect(data).toMatchObject({ code: "provider-transient", reason: "provider-transient" });
+      expect(data).not.toHaveProperty("classification");
+      expect(JSON.stringify(data)).not.toContain('transient: provider 5xx or overload (matched ": 502")');
     }, 60_000);
 
     it.each([

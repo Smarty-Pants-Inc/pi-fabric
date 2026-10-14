@@ -514,7 +514,8 @@ export interface FabricActorDirective {
 }
 
 export interface FabricActorDeliveryRequest {
-  actor: FabricActorInfo;
+  /** Routing identity only: host alarms must not carry the diagnostic actor view. */
+  actor: Pick<FabricActorInfo, "id" | "name"> & Partial<Pick<FabricActorInfo, "status" | "rootId" | "ownerSessionId" | "project">>;
   message: FabricActorMessage;
   delivery: Exclude<FabricActorDelivery, "mailbox">;
   triggerTurn: boolean;

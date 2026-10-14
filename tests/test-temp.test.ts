@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -162,6 +162,40 @@ describe("test temporary-storage isolation", () => {
       expect(worker.again).toBe(run.first);
     } finally {
       rmSync(fixture, { recursive: true, force: true });
+    }
+  });
+
+  it.skipIf(process.platform === "win32").each([0, 7])("runs registered teardown before process exit %i without deleting its caller", (exitCode) => {
+    const caller = mkdtempSync(join(tmpdir(), "teardown-probe-"));
+    try {
+      const config = new URL("../vitest.config.ts", import.meta.url).href;
+      const result = spawnSync("bun", ["-e", `
+        import assert from "node:assert/strict";
+        import fs from "node:fs";
+        import path from "node:path";
+        const caller = process.env.TMPDIR;
+        const { default: config } = await import(${JSON.stringify(config)});
+        const root = config.test.env.TMPDIR;
+        assert.equal(path.dirname(root), caller);
+        assert.deepEqual(config.test.globalSetup, ["./scripts/test-temp-global-setup.ts"]);
+        for (const project of config.test.projects) assert.equal(project.test.globalSetup, undefined);
+        const { default: setup } = await import(path.resolve(config.test.globalSetup[0]));
+        const teardown = setup();
+        try { fs.writeFileSync(path.join(root, "artifact"), "temporary"); }
+        finally { teardown(); }
+        assert(!fs.existsSync(root));
+        teardown();
+        assert(fs.existsSync(caller));
+        console.log(JSON.stringify({root}));
+        process.exit(${exitCode});
+      `], { cwd: repo, env: { ...process.env, RUNNER_TEMP: "", TMPDIR: caller, TMP: caller, TEMP: caller }, encoding: "utf8", timeout: 15_000 });
+      expect(result.error).toBeUndefined();
+      expect(result.status, result.stderr).toBe(exitCode);
+      const paths = JSON.parse(result.stdout.trim()) as { root: string };
+      expect(existsSync(paths.root)).toBe(false);
+      expect(readdirSync(caller)).toEqual([]);
+    } finally {
+      rmSync(caller, { recursive: true, force: true });
     }
   });
 

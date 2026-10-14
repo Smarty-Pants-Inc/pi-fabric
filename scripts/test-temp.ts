@@ -74,6 +74,24 @@ const stableRoot = (prefix: string): string | undefined => {
   return directory;
 };
 
+// Config bundles and global setup are separate modules in the same process. Keep their
+// pinned cleanup callbacks on process so teardown and the exit fallback share ownership.
+const tempCleanupsKey = Symbol.for("pi-fabric.test-owned-temp-cleanups");
+const ownedTempCleanups = (): Set<() => void> => {
+  const owner = process as typeof process & { [tempCleanupsKey]?: Set<() => void> };
+  if (!owner[tempCleanupsKey]) {
+    owner[tempCleanupsKey] = new Set();
+    process.once("exit", cleanupIsolatedTestTemp);
+  }
+  return owner[tempCleanupsKey]!;
+};
+
+/** Remove only roots this process created, using their inode-pinned, currently guarded remover. */
+export function cleanupIsolatedTestTemp(): void {
+  // Keep pins for the exit fallback: a teardown blocked by a child handle can retry on exit.
+  for (const cleanup of ownedTempCleanups()) cleanup();
+}
+
 /** Tests must never prune a real session's caches or leave their own behind. */
 export function isolatedTestTemp(prefix: string): Record<"TMPDIR" | "TMP" | "TEMP", string> {
   if (!prefix || prefix === "." || prefix === ".." || /[/\\]/.test(prefix)) {
@@ -87,7 +105,7 @@ export function isolatedTestTemp(prefix: string): Record<"TMPDIR" | "TMP" | "TEM
   // Outside Windows runner jobs, long paths stay private. Socket fixtures that need shorter
   // paths must use a shorter caller TMPDIR or refuse explicitly; never use a shared /tmp fallback.
   const directory = mkdtempSync(join(resolve(tmpdir()), prefix));
-  process.once("exit", ownedRootCleanup(directory));
+  ownedTempCleanups().add(ownedRootCleanup(directory));
   return { TMPDIR: directory, TMP: directory, TEMP: directory };
 }
 

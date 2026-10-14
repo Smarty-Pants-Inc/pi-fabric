@@ -2315,7 +2315,8 @@ export class AgentManager {
     return this.heldPermits() > 0 ||
       [...this.#queued.values()].some(queued => queued.cleanupPending !== undefined) ||
       [...this.#runs.values()].some(managed => managed.transport.kind === "process" && (
-        managed.processStopPending || managed.lostContact !== undefined ||
+        // Normal finishing still owns its tree until exact exit and settlement.
+        !managed.settled || managed.processStopPending || managed.lostContact !== undefined ||
         (managed.settled && managed.executionExited !== true)
       ));
   }

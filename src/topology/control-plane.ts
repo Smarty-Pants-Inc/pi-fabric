@@ -140,6 +140,8 @@ import type { FabricInterruptErrorCode } from "../interrupt-authority.js";
 export interface FabricControlAcceptance {
   code?: "FABRIC_TARGET_TERMINAL";
   finalAnswerReceiptId?: string;
+  deliveryStatus?: "undelivered";
+  runState?: import("../agents/terminal-target.js").FabricTargetRunState;
   targetId?: string;
   warning?: AgentFollowUpRunningWarning;
   accepted: boolean;
@@ -838,7 +840,7 @@ export class FabricControlPlane {
       const acknowledged = await acceptance;
       if (!acknowledged.accepted) {
         const terminal = terminalRejectionFields(acknowledged);
-        if (terminal && terminal.targetId === targetId) throw new FabricTargetTerminalError(targetId, terminal.finalAnswerReceiptId);
+        if (terminal && terminal.targetId === targetId) throw new FabricTargetTerminalError(targetId, terminal.finalAnswerReceiptId, terminal.runState);
         const error = acknowledged.error || "Remote Fabric owner rejected command for " + targetId;
         if (acknowledged.errorCode === CONTROL_STALE_INCARNATION) {
           throw new FabricControlStaleIncarnationError(targetId);

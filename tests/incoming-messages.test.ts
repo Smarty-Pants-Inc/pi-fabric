@@ -195,9 +195,11 @@ describe("incoming Fabric display projection", () => {
   });
 
   it("hides only already-delivered shadows, including mixed and delivery-id-only batches", () => {
-    const h = harness(); h.setBranch([entry(message())]);
-    expect(h.render(inbox([event("shadow-1", "duplicate")]))).toEqual([]);
-    const mixed = inbox([event("shadow-1", "duplicate"), event("unseen", "new work", { key: "different" })]);
+    const delivered = { ...message(), details: { id: "native-1", deliveryId: "native-command-1", from: sender,
+      data: { key: "same-work", topic: "fleet.work" } } };
+    const h = harness(); h.setBranch([entry(delivered)]);
+    expect(h.render(inbox([event("shadow-1", "duplicate", { key: "same-work", commandId: "native-command-1" })]))).toEqual([]);
+    const mixed = inbox([event("shadow-1", "duplicate", { key: "same-work", commandId: "native-command-1" }), event("unseen", "new work", { key: "different" })]);
     expect(plain(h.render(mixed)![0]!)).toBe(" ↳ Build & Test: [1 work] new work");
     // Same sender and key on another topic is unrelated work (#852 security P1): shown.
     expect(plain(h.render(inbox([{ ...event("other-topic", "other topic work"), topic: "fleet.alarm" }]))![0]!)).toContain("other topic work");
@@ -239,9 +241,11 @@ describe("incoming Fabric display projection", () => {
     ["org-labeled", (text: string) => text, { id: "session:org", name: "org", kind: "main" as const }],
   ])("keeps a delivered shadow suppressed when an unseen %s row renders in full", (_name, mark, from) => {
     initTheme("dark", false);
-    const h = harness(); h.setBranch([entry(message())]);
+    const delivered = { ...message(), details: { id: "native-1", deliveryId: "native-command-1", from: sender,
+      data: { key: "same-work", topic: "fleet.work" } } };
+    const h = harness(); h.setBranch([entry(delivered)]);
     const exempt = { ...event("unseen", "Reply for Paul\nFULL_EXEMPT_REPLY", { key: "different" }), from };
-    const base = inbox([event("shadow-1", "SHADOW_DUPLICATE"), exempt]);
+    const base = inbox([event("shadow-1", "SHADOW_DUPLICATE", { key: "same-work", commandId: "native-command-1" }), exempt]);
     const burst = { ...base, content: mark(String(base.content)) };
     const bytes = JSON.stringify(burst);
     const lines = new CustomMessageComponent(burst, h.renderers.get(burst.customType)).render(120).map(plain);

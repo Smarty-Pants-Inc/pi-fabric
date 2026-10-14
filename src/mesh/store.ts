@@ -1,10 +1,11 @@
 import type { MeshLockProtocol } from "../config.js";
-import { meshJournalAlarmLine, type MeshOutageAlarm } from "../core/atomic-write.js";
+import { MeshIncarnationPendingError, meshJournalAlarmLine, type MeshOutageAlarm } from "../core/atomic-write.js";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { MeshLock, type MeshStoreContext } from "./mesh-lock.js";
+import { delay, MeshLock, type MeshStoreContext } from "./mesh-lock.js";
+import { isNamespaceRace } from "../core/atomic-write.js";
 import { acquireMeshCustodyLock, withMeshCustody } from "./custody-lock.js";
 import type { MeshReadOptions, MeshStateEntry, MeshBatchResult, MeshBatchView } from "./state-file.js";
 import { createStateBackend, isMeshStateWalCap, type MeshStateBackendKind, type StateBackend, type StateBackendBatchInput,
@@ -16,7 +17,9 @@ import type { FabricMessageSender } from "../protocol.js";
 import { copyFabricPrincipal, type FabricPrincipal } from "../fabric-provenance.js";
 import { processSender } from "../scope.js";
 import { verifiedRemove } from "../storage/verified-remove.js";
-export { MeshLockTimeoutError } from "../core/atomic-write.js";
+export { MeshIncarnationPendingError, MESH_INCARNATION_PENDING_CODE, isMeshIncarnationPending,
+  MeshSnapshotRetriesExhaustedError, MESH_SNAPSHOT_RETRIES_EXHAUSTED_CODE, isMeshSnapshotRetriesExhausted,
+  MeshLockTimeoutError } from "../core/atomic-write.js";
 export type { MeshIdentity, MeshEvent, MeshPublishInput, MeshTailResult } from "./event-log.js";
 export { meshCursorGeneration, meshCursorAtStart, MeshDedupeRecoveryError, MeshDedupeStoreFullError } from "./event-log.js";
 export type { MeshStateEntry, MeshReadOptions, MeshBatchOperation, MeshBatchView, MeshBatchResult } from "./state-file.js";
@@ -458,6 +461,11 @@ export class MeshStore {
     return this.#state;
   }
 
+  /** Projection-applied state change hints (see `StateBackend.subscribeStateChanges`); a no-op where the backend has none. */
+  subscribeStateChanges(listener: () => void): () => void {
+    return this.#state.subscribeStateChanges?.(listener) ?? (() => undefined);
+  }
+
   stateDiagnostics(): StateBackendDiagnostics {
     return this.#state.diagnostics();
   }
@@ -762,6 +770,40 @@ export class MeshStore {
     return this.#events.read(input);
   }
 
+  /**
+   * Durability barrier (smarty-dev#9313): resolves once every event AND every keyed-state commit
+   * made on this root before the call, by any process, is on disk; otherwise it throws, for SQLite
+   * state within about `budgetMs`. A trusted producer awaits it before it fsyncs its own cursor or
+   * delivered mark, so an OS crash can never keep a cursor past an event or state record it covers.
+   * No writer lock is held while it syncs: events use the group-commit barrier of a durable publish
+   * (fsync of events.jsonl and its namespace after `.lock`); SQLite state uses the PASSIVE
+   * checkpoint barrier (smarty-dev#6100: no copy or fsync under SQLite's writer lock); file state
+   * fsyncs state.json and its namespace. On Windows (no directory barrier) the event barrier fails
+   * closed first with MeshEventsNotDurableError, and file state would with MeshStateFileNotDurableError;
+   * every refusal is a MeshSyncNotDurableError. A caller must not advance its external record on a throw.
+   *
+   * It resolves with `through`, the highest event sequence committed to the log (a complete line)
+   * before this barrier's fsync, so every event at or below it that is still live is now on disk.
+   * Callers must advance an event cursor only to `through`, never to latestSequence(): that
+   * includes the reservation counter, which a publisher advances under `.lock` before it appends,
+   * so a cursor past `through` could skip an event appended after the barrier (pi-fabric#894).
+   */
+  async sync(budgetMs = 1_000): Promise<{ through: number }> {
+    if (!Number.isFinite(budgetMs) || budgetMs < 0) throw new Error("Mesh sync budgetMs must be a finite number >= 0");
+    const deadline = Date.now() + budgetMs;
+    let through: number;
+    for (;;) {
+      try { through = await this.#events.sync(); break; }
+      catch (error) {
+        // A compaction renamed the live log during the namespace check; the next barrier covers it.
+        if (!isNamespaceRace(error) || Date.now() >= deadline) throw error;
+        await delay(1 + Math.random() * 3);
+      }
+    }
+    await this.#state.sync(Math.max(0, deadline - Date.now()));
+    return { through };
+  }
+
   nextEventAfter(after: number): MeshEvent | undefined {
     return this.#events.nextEventAfter(after);
   }
@@ -908,6 +950,15 @@ export class MeshStore {
   }
 
   // The lock (mesh-lock.ts).
+
+  /** Settle constructor-owned identity before opening a bridge or entering custody. UNKNOWN is allowed.
+   * A cold caller already in a bounded scope must release custody, never wait for native preparation. */
+  async prepareLock(): Promise<void> {
+    if (this.#lock.ownIncarnation && !this.#lock.ownIncarnationReady && this.tryLockBudgetMs !== undefined) {
+      throw new MeshIncarnationPendingError();
+    }
+    await this.#lock.ownIncarnation;
+  }
 
   withTryLock<T>(operation: () => Promise<T>, timeoutMs = 0): Promise<T> {
     return this.#lock.withTryLock(operation, timeoutMs);

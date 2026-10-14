@@ -1476,10 +1476,11 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     // before the ack: later copies are cut, and acked events whose consuming copy was compacted away.
     const filter = inboxContext;
     const inbox = filter ? filter.filterRootInboxContext(planning.messages, {
+      verifier: verifyIssuedInbox,
       acked: (id, sequence) => state.initialized && state.rootInboxAcked(id, sequence),
       compactedCopies: () => {
         try {
-          return filter.rootInboxCompactedCopies(context.sessionManager.getBranch?.() ?? []);
+          return filter.rootInboxCompactedCopies(context.sessionManager.getBranch?.() ?? [], verifyIssuedInbox);
         } catch {
           return new Map();
         }

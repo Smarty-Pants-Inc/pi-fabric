@@ -39,6 +39,12 @@ const setup = () => {
   const publish = (kind: string, text: string, data?: unknown) => mesh.publish({
     topic: TOPIC, kind, from: peer, to: me.id, text, ...(data === undefined ? {} : { data }),
   });
+  const publishMany = async (inputs: Parameters<MeshStore["publish"]>[0][]) => {
+    const events: MeshEvent[] = [];
+    // Single publication does not reach publishBatch's product-retention deletion path (#4664).
+    for (const input of inputs) events.push(await mesh.publish(input));
+    return events;
+  };
   const inject = async (inbox: RootInbox, events: readonly MeshEvent[]) => {
     sent.length = 0;
     deliverRootInbox(pi, events);
@@ -50,7 +56,7 @@ const setup = () => {
     return messages;
   };
   return {
-    root, mesh, entries, sent, pi, box, publish, inject,
+    root, mesh, entries, sent, pi, box, publish, publishMany, inject,
     session: () => rootInboxSession(entries),
     now: () => Date.now(),
   };
@@ -58,6 +64,15 @@ const setup = () => {
 
 const ids = (events: readonly MeshEvent[]) => events.map(event => event.id);
 const messageIds = (messages: readonly InboxMessage[]) => messages.flatMap(message => message.details.ids);
+const expectAckHeadroom = (mesh: MeshStore, inbox: RootInbox) => {
+  const state = mesh.get(inbox.key, { fresh: true })!.value as {
+    after: number; pending?: { ids: string[] }; acked?: Array<[string, number]>;
+  };
+  const acked = new Set(state.acked?.map(([id]) => id));
+  const reserved = state.pending?.ids.filter(id => !acked.has(id)).length ?? 0;
+  expect(acked.size + reserved).toBeLessThanOrEqual(256);
+  return state;
+};
 const wakeIds = (messages: readonly InboxMessage[]) => messages.flatMap(message => {
   const details = message.details as Record<string, unknown>;
   const causes = [details.wakeCause, ...(Array.isArray(details.wakeCauses) ? details.wakeCauses : [])];
@@ -208,6 +223,120 @@ describe("root inbox priority and displayed-only overflow (smarty-dev#12356)", (
     expect(new Set(delivered).size).toBe(21);
     expect(new Set(delivered)).toEqual(new Set([...ids(info), fresh.id]));
     expect((await h.box().next(h.session())).events).toEqual([]);
+  });
+
+  it("drains more than 1024 actions across reloads without reoffering consumed work or starving the prefix", async () => {
+    const h = setup();
+    let inbox = h.box();
+    inbox.start();
+    const info = await h.publishMany(Array.from({ length: 20 }, (_, index) => ({
+      topic: TOPIC, kind: "info", from: peer, to: me.id, text: `pinned info ${index + 1}`,
+    })));
+    const actions = await h.publishMany(Array.from({ length: 1_100 }, (_, index) => ({
+      topic: TOPIC, kind: "blocked", from: peer, to: me.id, text: `burst action ${index + 1}`,
+    })));
+    const consumed = new Set<string>();
+    const prefixIds = new Set(ids(info));
+
+    for (let turn = 0; turn < 32; turn++) {
+      // No session receipt history: persisted acks/cursor must suffice after each reload.
+      const batch = await inbox.next(notHeld);
+      expectAckHeadroom(h.mesh, inbox);
+      for (const id of ids(batch.events)) expect(consumed.has(id)).toBe(false);
+      if (!batch.events.length) break;
+      if (turn === 0) {
+        expect(batch.events.filter(event => !prefixIds.has(event.id))).toHaveLength(236);
+        expect(batch.events.filter(event => event.kind === "blocked")).toHaveLength(236);
+      } else if (turn <= 3) {
+        // The first carrier filled the tail window, so the pinned prefix gets three turns.
+        expect(batch.events.every(event => prefixIds.has(event.id))).toBe(true);
+      }
+      const shown = messageIds(await h.inject(inbox, batch.events));
+      expect(shown.length).toBeGreaterThan(0);
+      for (const id of shown) {
+        expect(consumed.has(id)).toBe(false);
+        consumed.add(id);
+      }
+      expectAckHeadroom(h.mesh, inbox);
+      await inbox.close();
+      inbox = h.box();
+    }
+
+    expect(consumed.size).toBe(1_120);
+    expect(consumed).toEqual(new Set([...ids(info), ...ids(actions)]));
+    expect((await inbox.next(notHeld)).events).toEqual([]);
+    expect((await h.box().next(notHeld)).events).toEqual([]);
+  }, 30_000);
+
+  it("shares cumulative ack slots with done/wait/answer lookahead and reserves the whole pending prefix", async () => {
+    const h = setup();
+    let inbox = h.box();
+    inbox.start();
+    const info = await h.publishMany(Array.from({ length: 20 }, (_, index) => ({
+      topic: TOPIC, kind: "info", from: peer, to: me.id, text: `reserved info ${index + 1}`,
+    })));
+    const actions = await h.publishMany(Array.from({ length: 230 }, (_, index) => ({
+      topic: TOPIC, kind: "ask", from: peer, to: me.id, text: `reserved action ${index + 1}`,
+    })));
+    const priorities = await h.publishMany(Array.from({ length: 60 }, (_, index) => ({
+      topic: TOPIC, kind: ["done", "wait", "answer"][index % 3]!, from: peer, to: me.id,
+      text: `nonaction priority ${index + 1}`,
+    })));
+    const consumed = new Set<string>();
+    const prefixIds = new Set(ids(info));
+    const priorityIds = new Set(ids(priorities));
+
+    for (let turn = 0; turn < 32; turn++) {
+      const batch = await inbox.next(notHeld);
+      expectAckHeadroom(h.mesh, inbox);
+      for (const id of ids(batch.events)) expect(consumed.has(id)).toBe(false);
+      if (!batch.events.length) break;
+      if (turn === 0) {
+        expect(batch.events.filter(event => !prefixIds.has(event.id))).toHaveLength(236);
+        expect(batch.events.filter(event => priorityIds.has(event.id))).toHaveLength(6);
+      } else if (turn === 1) {
+        // 230 outstanding action acks + 20 pending ids leave six slots, not another top 20.
+        expect(batch.events.filter(event => priorityIds.has(event.id))).toHaveLength(6);
+        expect(batch.events).toHaveLength(26);
+      } else if (turn <= 4) {
+        // Six priorities plus two infos were shown on turn 1; the other 18 infos must progress.
+        expect(batch.events.every(event => prefixIds.has(event.id))).toBe(true);
+      }
+      const shown = messageIds(await h.inject(inbox, batch.events));
+      expect(shown.length).toBeGreaterThan(0);
+      if (turn === 0) expect(shown).toEqual(ids(actions));
+      if (turn === 1) {
+        expect(shown.filter(id => priorityIds.has(id))).toHaveLength(6);
+        expect(shown.filter(id => prefixIds.has(id))).toEqual(ids(info.slice(0, 2)));
+      }
+      for (const id of shown) {
+        expect(consumed.has(id)).toBe(false);
+        consumed.add(id);
+      }
+      expectAckHeadroom(h.mesh, inbox);
+      await inbox.close();
+      inbox = h.box();
+    }
+
+    expect(consumed).toEqual(new Set([...ids(info), ...ids(actions), ...ids(priorities)]));
+    expect((await inbox.next(notHeld)).events).toEqual([]);
+    expect((await h.box().next(notHeld)).events).toEqual([]);
+  }, 30_000);
+
+  it("prioritizes a blocked action beyond the bounded handoff lookahead", async () => {
+    const h = setup();
+    const inbox = h.box();
+    inbox.start();
+    await h.publishMany(Array.from({ length: 20 }, (_, index) => ({
+      topic: TOPIC, kind: "info", from: peer, to: me.id, text: `prefix ${index}`,
+    })));
+    await h.publishMany(Array.from({ length: 300 }, (_, index) => ({
+      topic: TOPIC, kind: "handoff", from: peer, to: me.id, text: `handoff ${index}`,
+    })));
+    const blocked = await h.publish("blocked", "highest-priority action after handoff burst");
+    const batch = await inbox.next(notHeld);
+    expectAckHeadroom(h.mesh, inbox);
+    expect(messageIds(await h.inject(inbox, batch.events))[0]).toBe(blocked.id);
   });
 
   it("keeps FIFO within blocker, answer, and ordinary classes", async () => {

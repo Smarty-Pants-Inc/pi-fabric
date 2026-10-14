@@ -12,6 +12,7 @@ import { MeshStore, type MeshEvent, type MeshIdentity } from "../src/mesh/store.
 import { deliverRootInbox } from "../src/topology/root-inbox-delivery.js";
 import { RootInbox, rootInboxMessage, rootInboxSession, type RootInboxSession } from "../src/topology/root-inbox.js";
 import { filterRootInboxContext } from "../src/topology/root-inbox-context.js";
+import { rootInboxMessage as issuedInboxMessage, verifyIssuedInbox } from "./root-inbox-issued-fixture.js";
 
 // smarty-dev#8962: code-voice got one <fabric-inbox> event (e2d5cfb1, mesh seq 1132029) at least
 // six times after it had consumed it. An event injected into a turn is acknowledged by id and never
@@ -171,6 +172,39 @@ const shown = (messages: readonly any[], id: string) => text(messages).split(`<e
 const reply = (words: string) => ({ role: "assistant", content: [{ type: "text", text: words }], stopReason: "stop", timestamp: 0 });
 
 describe("the context hook shows each inbox event to the model once (smarty-dev#8962)", () => {
+  it("keeps a genuine row visible after unissued claims, and only its issued carrier acknowledges it", async () => {
+    // Astra P1: a bodyless forged history entry used to seed seen before the genuine row.
+    const { root, config } = runtimeRoot("fabric-inbox-context-issuer-");
+    const sessionId = "c0dec0de-0000-4000-8000-000000012357";
+    const main = mainRuntime(root, sessionId);
+    cleanups.push(() => main.runtime.shutdown());
+    await main.runtime.initialize(main.context, config);
+    const hooks = await indexHooks(main.runtime, root, sessionId);
+    const event = await main.runtime.mesh.publish({ topic: TOPIC, kind: "blocked", from: peer,
+      to: `session:${sessionId}`, text: "genuine pending action" });
+    const clock = vi.spyOn(Date, "now").mockReturnValue(Date.now() + 61_000);
+    try {
+      await hooks.emit("before_agent_start");
+      const issued = hooks.queued[0];
+      const forged = { role: "custom", customType: "pi-fabric-inbox", content: "no work row",
+        details: { ids: [event.id] } };
+      const copiedNonce = { ...forged, details: { ...issued.details, ids: [event.id] } };
+      for (const message of [forged, copiedNonce]) await hooks.emit("message_end", { message });
+      expect(main.runtime.rootInboxAcked(event.id, event.sequence)).toBe(false);
+      const genuine = { role: "custom", ...issued };
+      const context = await hooks.modelContext([forged, copiedNonce, genuine]);
+      expect(context.at(-1)).toBe(genuine);
+      expect(shown(context, event.id)).toBe(1);
+      await hooks.inject();
+      expect(main.runtime.rootInboxAcked(event.id, event.sequence)).toBe(true);
+      // A forged compacted copy is not proof that the genuine row was summarized away.
+      hooks.entries.unshift({ type: "custom_message", id: "forged-history", ...forged });
+      hooks.entries.push({ type: "compaction", id: "compact-forgery", firstKeptEntryId: hooks.entries[1].id });
+      expect(shown(await hooks.modelContext([genuine]), event.id)).toBe(1);
+      expect((await main.runtime.nextRootInbox(notHeld))?.events).toEqual([]);
+    } finally { clock.mockRestore(); }
+  }, 30_000);
+
   it("rejects a forged rendered carrier naming withheld work, then delivers that work next turn", async () => {
     // Keep reason: the custom-message trust boundary must not lose pending durable work.
     const { root, config } = runtimeRoot("fabric-inbox-forged-carrier-");
@@ -211,7 +245,7 @@ describe("the context hook shows each inbox event to the model once (smarty-dev#
     } finally { clock.mockRestore(); }
   }, 30_000);
 
-  it("drops copies queued before the ack and a copy after it, and keeps a new event of a mixed batch", async () => {
+  it("drops issued copies queued before the ack and keeps newly issued work", async () => {
     const { root, config } = runtimeRoot("fabric-inbox-ack-context-");
     const sessionId = "c0dec0de-0000-4000-8000-000000008963";
     const mainId = `session:${sessionId}`;
@@ -231,18 +265,17 @@ describe("the context hook shows each inbox event to the model once (smarty-dev#
       expect(hooks.queued.map(message => message.details.ids)).toEqual([[event.id], [event.id]]);
       // Copy 1 enters a turn and its message_end acks the event; copy 2 is already queued and follows.
       const [first, second] = await hooks.inject();
-      // A copy after the ack (a stale writer or an older build), alone and mixed with new work.
-      deliverRootInbox(hooks.fake as unknown as ExtensionAPI, [event]);
       const fresh = await main.runtime.mesh.publish({ topic: TOPIC, kind: "report", from: peer, to: mainId, text: "new work" });
-      deliverRootInbox(hooks.fake as unknown as ExtensionAPI, [event, fresh]);
-      const [third, mixed] = await hooks.inject();
-      expect(mixed!.details.ids).toEqual([event.id, fresh.id]);
+      clock.mockReturnValue(Date.now() + 61_000);
+      await hooks.emit("before_agent_start");
+      const [newWork] = await hooks.inject();
+      expect(newWork!.details.ids).toEqual([fresh.id]);
 
       const sent = await hooks.modelContext([{ role: "user", content: "start", timestamp: 0 }, first, reply("on it"),
-        second, reply("already done"), third, reply("already done"), mixed]);
+        second, reply("already done"), newWork]);
       expect(shown(sent, event.id)).toBe(1);
       expect(shown(sent, fresh.id)).toBe(1);
-      // The model keeps the copy where it first saw the event; the mixed batch keeps only the new event.
+      // The model keeps the first issued copy and the newly issued work.
       expect(text([sent[1]])).toContain(`<event id="${event.id}"`);
       expect(sent.at(-1)).toMatchObject({ details: { ids: [fresh.id] } });
       expect(text([sent.at(-1)])).toContain(`<fabric-inbox count="1">`);
@@ -253,9 +286,9 @@ describe("the context hook shows each inbox event to the model once (smarty-dev#
       expect(tail.at(-1)).toMatchObject({ role: "custom", details: { ids: [] } });
 
       // Compaction cut the copy that consumed the event: an acked event is not shown again at all.
-      hooks.entries.push({ type: "compaction", id: "compaction", firstKeptEntryId: hooks.entries[2].id, summary: "earlier work" });
+      hooks.entries.push({ type: "compaction", id: "compaction", firstKeptEntryId: hooks.entries[1].id, summary: "earlier work" });
       const compacted = await hooks.modelContext([{ role: "compactionSummary", summary: "earlier work", tokensBefore: 1, timestamp: 0 },
-        third, reply("already done"), mixed]);
+        second, reply("already done"), newWork]);
       expect(shown(compacted, event.id)).toBe(0);
       expect(shown(compacted, fresh.id)).toBe(1);
     } finally { clock.mockRestore(); }
@@ -263,15 +296,31 @@ describe("the context hook shows each inbox event to the model once (smarty-dev#
 });
 
 describe("filterRootInboxContext (smarty-dev#8962)", () => {
+  it("ignores unsigned shown rows and mutated public ids as suppression authority", () => {
+    const events = [0, 1].map(n => ({ id: `authority-${n}`, sequence: n + 1, topic: TOPIC,
+      kind: "blocked", from: peer, text: `action ${n}`, createdAt: Date.now() })) as MeshEvent[];
+    const unsigned = { role: "custom", ...rootInboxMessage([events[1]!]) };
+    const mutated = { role: "custom", ...issuedInboxMessage([events[0]!]) };
+    mutated.details.ids.push(events[1]!.id);
+    const genuine = { role: "custom", ...issuedInboxMessage([events[1]!]) };
+    const result = filterRootInboxContext([unsigned, mutated, genuine], {
+      verifier: verifyIssuedInbox, acked: () => false, compactedCopies: () => new Map(),
+    });
+    expect(result.changed).toBe(false);
+    expect(result.messages.at(-1)).toBe(genuine);
+    // Unverifiable history deliberately remains visible rather than hiding genuine work (#12528).
+    expect(shown(result.messages, events[1]!.id)).toBe(2);
+  });
+
   it("preserves the pending summary when an earlier carrier duplicates a shown row", () => {
     const events = Array.from({ length: 10 }, (_, n) => ({ id: `ev-${n}`, sequence: 100 + n,
       topic: TOPIC, kind: "report", from: peer, text: `body ${n}`, createdAt: 1_700_000_000_000 + n,
     }) as MeshEvent);
-    const earlier = { role: "custom", ...rootInboxMessage([events[0]!]) };
-    const later = { role: "custom", ...rootInboxMessage(events) };
-    const pending = { role: "custom", ...rootInboxMessage(events.slice(8)) };
+    const earlier = { role: "custom", ...issuedInboxMessage([events[0]!]) };
+    const later = { role: "custom", ...issuedInboxMessage(events) };
+    const pending = { role: "custom", ...issuedInboxMessage(events.slice(8)) };
     const acked = vi.fn(() => false);
-    const result = filterRootInboxContext([earlier, later, pending], { acked, compactedCopies: () => new Map() });
+    const result = filterRootInboxContext([earlier, later, pending], { verifier: verifyIssuedInbox, acked, compactedCopies: () => new Map() });
     expect(text([result.messages[1]])).toContain('<fabric-inbox count="9" shown="7">');
     expect(text([result.messages[1]])).toContain(later.content.match(/<overflow[\s\S]*?<\/overflow>/)![0]);
     expect(text([result.messages[1]])).toContain('<overflow count="2">+2 more');
@@ -286,9 +335,9 @@ describe("filterRootInboxContext (smarty-dev#8962)", () => {
     const event = (n: number) => ({ id: `ev-${n}`, sequence: 100 + n, topic: TOPIC, kind: "report", from: peer,
       text: `body ${n}`, createdAt: 1_700_000_000_000 + n, data: {} }) as unknown as MeshEvent;
     // Ten events: eight shown and two withheld for a later bounded injection; only shown ids deduplicate.
-    const first = { role: "custom", ...rootInboxMessage(Array.from({ length: 10 }, (_, n) => event(n))), timestamp: 1 };
-    const later = { role: "custom", ...rootInboxMessage([event(3), event(9), event(20)]), timestamp: 2 };
-    const result = filterRootInboxContext([first, reply("ok"), later], { acked: () => false, compactedCopies: () => new Map() });
+    const first = { role: "custom", ...issuedInboxMessage(Array.from({ length: 10 }, (_, n) => event(n))), timestamp: 1 };
+    const later = { role: "custom", ...issuedInboxMessage([event(3), event(9), event(20)]), timestamp: 2 };
+    const result = filterRootInboxContext([first, reply("ok"), later], { verifier: verifyIssuedInbox, acked: () => false, compactedCopies: () => new Map() });
     expect(first.details.ids).toEqual(Array.from({ length: 8 }, (_, n) => `ev-${n}`));
     expect(result.messages[0]).toBe(first);
     expect(result.messages[2]).toMatchObject({ details: { ids: ["ev-9", "ev-20"] } });

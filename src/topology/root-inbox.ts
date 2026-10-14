@@ -319,9 +319,9 @@ export class RootInbox {
   #acked(event: MeshEvent): boolean { return event.sequence <= this.#mark() || this.#acks.has(event.id); }
 
   /**
-   * Keep the ordinary 20-event/32-KiB durable prefix, plus a bounded priority window from the
-   * whole mature tail and every action. Retry the lookahead even while that prefix is pending:
-   * done/wait/answer must not wait behind lower classes, nor actions behind a full batch.
+   * Keep the ordinary 20-event/32-KiB durable prefix, plus a priority window from the mature
+   * tail that fits the remaining persisted ack slots. Retry lookahead while the prefix is
+   * pending, but reserve its unacked ids too: a full ack window must let the prefix progress.
    * Only the prefix is pending state; no cursor crosses any intervening undisplayed work.
    */
   #offer(batch: RootInboxBatch, session: RootInboxSession): RootInboxBatch {
@@ -331,8 +331,11 @@ export class RootInbox {
       const receipts = eventReceipts(event);
       if (receipts.some((id) => seen.has(id))) return;
       for (const id of receipts) seen.add(id);
-      if (ROOT_INBOX_ACTION_KINDS.has(event.kind)) actions.push(event);
-      else {
+      if (ROOT_INBOX_ACTION_KINDS.has(event.kind)) {
+        actions.push(event);
+        actions.sort(compareRootInboxEvents);
+        if (actions.length > MAX_ACKED_IDS) actions.pop();
+      } else {
         candidates.push(event);
         candidates.sort(compareRootInboxEvents);
         if (candidates.length > MAX_BATCH_EVENTS) candidates.pop();
@@ -349,10 +352,19 @@ export class RootInbox {
       window.push(event);
       bytes += size;
     }
-    const ids = new Set<string>();
-    // Keep the pinned prefix visible as pending overflow even when higher classes displace it.
-    const events = [...batch.events, ...actions, ...window].filter((event) => !ids.has(event.id) && !!ids.add(event.id));
-    return this.#unacked({ ...batch, events });
+    const ids = new Set(batch.events.map((event) => event.id));
+    const pendingSlots = this.#state!.pending?.ids.filter((id) => !this.#acks.has(id)).length ?? 0;
+    // Count cumulative acks, not just this carrier's actions. Nonaction lookahead consumes the
+    // same slots, and even a missing pending id needs headroom until the prefix can commit.
+    let remaining = Math.max(0, MAX_ACKED_IDS - this.#acks.size - pendingSlots);
+    const lookahead = [...actions, ...window].filter((event) => {
+      if (ids.has(event.id) || remaining === 0) return false;
+      ids.add(event.id);
+      remaining--;
+      return true;
+    });
+    // Keep the pinned prefix visible even at capacity: without lookahead it gets the next turn.
+    return this.#unacked({ ...batch, events: [...batch.events, ...lookahead] });
   }
 
   /** Drop what an ack recorded while this read awaited the mesh. */

@@ -1,4 +1,5 @@
 import { childProcessEnvironment } from "../core/atomic-write.js";
+import { fabricWarn } from "../core/diagnostics.js";
 import { copyFabricPrincipal, copyFabricProvenance, type FabricPrincipal, type FabricTurnProvenance } from "../fabric-provenance.js";
 import { randomUUID } from "node:crypto";
 import { taskReturnAddressArguments, type TaskReturnAddress } from "./task-return-address.js";
@@ -2015,7 +2016,7 @@ export class AgentManager {
         if ((error as { launchOutcome?: string } | undefined)?.launchOutcome !== "unknown") release();
         if ((error as { launchOutcome?: string } | undefined)?.launchOutcome !== "unknown" && !this.#queued.has(id)) {
           try { routeDispatch?.outcome({ status: signal?.aborted ? "stopped" : "failed" }); }
-          catch (saveError) { console.warn(`[pi-fabric] Pre-worker route outcome save failed; files retained at ${path.join(this.#runRoot, id)}: ${String(saveError)}`); }
+          catch (saveError) { fabricWarn(`[pi-fabric] Pre-worker route outcome save failed; files retained at ${path.join(this.#runRoot, id)}: ${String(saveError)}`); }
         }
         throw error;
       }
@@ -2220,7 +2221,7 @@ export class AgentManager {
         heldPermits: this.heldPermits(), maxConcurrent: this.config.maxConcurrent, at: Date.now(),
         message: `run ${runId}: its recovered answer could not be saved for its spawner; its admission permit stays held ` +
           "while the save is retried (smarty-dev#9855)" };
-      console.warn(`[pi-fabric] ${alarm.message}`);
+      fabricWarn(`[pi-fabric] ${alarm.message}`);
       try { this.#onAdmissionAlarm?.(structuredClone(alarm)); } catch { /* the stderr line stands */ }
     }
     const tries = managed.recoveryRetries ?? 0;
@@ -2248,7 +2249,7 @@ export class AgentManager {
     const alarm: AgentAdmissionAlarm = { heldPermits: held, maxConcurrent: this.config.maxConcurrent, at: now,
       message: `${held} of ${this.config.maxConcurrent} agent admission permits are held by launches whose exit is ` +
         "unconfirmed; new spawns queue behind them (smarty-dev#9855)" };
-    console.warn(`[pi-fabric] ${alarm.message}`);
+    fabricWarn(`[pi-fabric] ${alarm.message}`);
     try { this.#onAdmissionAlarm?.(structuredClone(alarm)); } catch { /* the stderr line stands */ }
   }
 
@@ -2311,7 +2312,7 @@ export class AgentManager {
       } catch (error) { failure = error; }
     }
     const warning = `Routing outcome save failed; queued run retained: ${String(failure)}`;
-    if (!queued.routeSaveFailure) console.warn(`[pi-fabric] ${warning}`);
+    if (!queued.routeSaveFailure) fabricWarn(`[pi-fabric] ${warning}`);
     queued.terminal.warnings = [...(queued.terminal.warnings ?? []).filter(item => item !== queued.routeSaveFailure), warning];
     queued.routeSaveFailure = warning;
     this.#invalidateUiList();
@@ -3215,11 +3216,11 @@ export class AgentManager {
       this.#enodevRuns = this.#enodevRuns.filter(other => other !== directory);
       this.#retentionRevision++;
       if (enodevDelivered(directory, path.basename(directory), activationId)) {
-        console.warn(`[pi-fabric] actor ${actorId}: run ${path.basename(directory)} settled as delivered: its activation ` +
+        fabricWarn(`[pi-fabric] actor ${actorId}: run ${path.basename(directory)} settled as delivered: its activation ` +
           `${activationId} was delivered and acknowledged before a restart (ENODEV, smarty-dev#8935)`);
         continue;
       }
-      console.warn(`[pi-fabric] actor ${actorId}: run ${path.basename(directory)} settled as lost: its activation ${activationId} ` +
+      fabricWarn(`[pi-fabric] actor ${actorId}: run ${path.basename(directory)} settled as lost: its activation ${activationId} ` +
         "is no longer pending and its worker exit was unconfirmed (ENODEV, smarty-dev#8935)");
     }
     this.#releaseProvenGone(); // smarty-dev#9855: a run this settle proved gone frees its held permit in the same step

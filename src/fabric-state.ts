@@ -1,6 +1,7 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { RootInboxBatch, RootInboxSession, RootInboxReconcileOptions } from "./topology/root-inbox-shared.js";
 import { resolveAgentDir } from "./core/agent-dir.js";
+import { fabricWarn } from "./core/diagnostics.js";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import fs from "node:fs";
 import path from "node:path";
@@ -567,7 +568,7 @@ export class FabricState {
     const line = probe.reason
       ? `[pi-fabric] agents.placement startup probe: ${probe.reason}; falling back to local`
       : `[pi-fabric] agents.placement startup probe: executable ${probe.executable}; default=${placement.default}`;
-    if (startup || line !== this.#placementProbeLine) console.warn(line);
+    if (startup || line !== this.#placementProbeLine) fabricWarn(line);
     this.#placementProbeLine = line;
   }
 

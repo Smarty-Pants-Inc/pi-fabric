@@ -1,4 +1,5 @@
 import { childProcessEnvironment } from "../core/atomic-write.js";
+import { fabricWarn } from "../core/diagnostics.js";
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
@@ -244,7 +245,7 @@ export const recordedProjectLead = (cwd: string, env: NodeJS.ProcessEnv = proces
     }
     if (invalid) {
       // Never echo marker contents or filesystem errors: either can contain secrets.
-      console.warn(`[pi-fabric] Ignoring invalid or unreadable project lead marker ${JSON.stringify(marker)}: expected session:<uuid>.`);
+      fabricWarn(`[pi-fabric] Ignoring invalid or unreadable project lead marker ${JSON.stringify(marker)}: expected session:<uuid>.`);
       return undefined;
     }
     if (lead) return lead;

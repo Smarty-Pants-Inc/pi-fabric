@@ -1,4 +1,5 @@
 import { execFile, spawn } from "node:child_process";
+import { fabricWarn } from "../core/diagnostics.js";
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
 import { lstat, mkdir, open, rename } from "node:fs/promises";
@@ -263,7 +264,7 @@ export const routeAgentCreation = async (options: {
     await writeDecision(dir, `${JSON.stringify(decision)}\n`);
   } catch {
     // A read-only/full mesh must not change launch selection or fail the spawn.
-    console.warn("[pi-fabric] spawn router decision log unavailable");
+    fabricWarn("[pi-fabric] spawn router decision log unavailable");
   }
   return selected;
 };

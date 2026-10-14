@@ -109,6 +109,7 @@
  * pass `open` to plug in another driver (for example `bun:sqlite`) through `SqliteConnection`.
  */
 import { AsyncLocalStorage } from "node:async_hooks";
+import { fabricStderr } from "../core/diagnostics.js";
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
@@ -580,7 +581,7 @@ const checkpointLogLevel = (option: CheckpointLogLevel | undefined): CheckpointL
   return process.stderr.isTTY ? "off" : "info";
 };
 const writeCheckpointLog = (line: string): void => {
-  try { process.stderr.write(`${line}\n`); } catch { /* observability only */ }
+  try { fabricStderr(`${line}\n`); } catch { /* observability only */ }
 };
 const round1 = (ms: number): number => Math.round(ms * 10) / 10;
 // ponytail: 96 MiB, not 256: with a pinned reader every commit above 64 MiB stalls ~400 ms, so the cap must act

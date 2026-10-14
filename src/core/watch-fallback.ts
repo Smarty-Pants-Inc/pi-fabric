@@ -9,6 +9,8 @@
  */
 
 /** True for an fs.watch error caused by the inotify watch limit rather than storage. */
+import { fabricWarn } from "./diagnostics.js";
+
 export function isWatchLimitError(error: unknown): boolean {
   if (!error || typeof error !== "object") return false;
   const { code, syscall, message } = error as NodeJS.ErrnoException;
@@ -44,7 +46,7 @@ export function warnWatchFallback(label: string, target: string, error: unknown,
   const key = `${label}\0${isWatchLimitError(error) ? "limit" : "other"}`;
   if (warned.has(key)) return false;
   warned.add(key);
-  try { console.warn(watchFallbackMessage(label, target, error, pollMs)); } catch {}
+  try { fabricWarn(watchFallbackMessage(label, target, error, pollMs)); } catch {}
   return true;
 }
 

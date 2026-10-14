@@ -1,0 +1,3 @@
+// Public diagnostic seam; colocated with agent-dir so the eager graph gains no facade-only chunk.
+// scripts/build.mjs resolves this facade to its implementation.
+export { configureFabricDiagnostics, fabricDiagnosticsHaveTerminalUI, fabricWarn, fabricError, fabricInfo, fabricDebug, fabricStderr } from "./agent-dir.js";

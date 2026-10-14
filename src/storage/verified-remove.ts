@@ -5,6 +5,11 @@ import { spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 
+// Native Node type-stripping callers need a real .ts path; warnings must remain synchronous.
+// ponytail: import the same sink directly, not a second fallback or an async warning queue.
+// @ts-expect-error TS5097: tsc emits declarations only; esbuild resolves this source into the shared sink chunk.
+import { fabricWarn } from "../core/agent-dir.ts";
+
 /**
  * The one removal path of every retention and scratch deleter (smarty-dev#7916). A deleter judges a target by
  * path (its stat, age and contents) and then hands that judged stat here. This removes only that inode:
@@ -96,7 +101,7 @@ export const reportRemovalSkip = (deleter: string, reason: string, target: strin
   const key = `${deleter}: ${reason}`;
   const count = skipCounts[key] = (skipCounts[key] ?? 0) + 1;
   // ponytail: log only at exact powers of ten (1, 10, 100, ...), so a key warns O(log n) times.
-  if (count === 10 ** Math.floor(Math.log10(count))) console.warn(`[pi-fabric] cleanup skipped (smarty-dev#7858): ${key} x${count} (e.g. ${target})`);
+  if (count === 10 ** Math.floor(Math.log10(count))) fabricWarn(`[pi-fabric] cleanup skipped (smarty-dev#7858): ${key} x${count} (e.g. ${target})`);
 };
 
 /** Test seam: runs after the judgment, right before the first open (a swap between judgment and delete). */

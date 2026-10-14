@@ -5,9 +5,9 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 const calls = vi.hoisted(() => ({ loads: 0, launches: 0, local: 0 }));
-vi.mock("../src/agents/transports/placement.js", () => {
+vi.mock("../src/agents/transports/placement.js", async importOriginal => {
   calls.loads++;
-  return { launchPlacedTask: async () => {
+  return { ...await importOriginal<typeof import("../src/agents/transports/placement.js")>(), launchPlacedTask: async () => {
     calls.launches++;
     return { kind: "process", isAlive: async () => false, stop: async () => {} };
   } };
@@ -61,6 +61,13 @@ describe("placement import/registration/idle boundary", () => {
     expect(calls).toEqual({ loads: 1, launches: 1, local: 0 });
     expect(handle.kind).toBe("process");
     await handle.stop();
+  });
+  it("normalizes literal shared roots and rejects roots that cannot safely prove affinity", () => {
+    const shared = root();
+    expect(normalizeAgentPlacement({ ...raw(), sharedMounts: [shared, path.join(shared, ".")] })?.sharedMounts).toEqual([shared]);
+    for (const sharedMounts of [[path.parse(shared).root], ["relative/root"], [`${shared}\ncontrol`], ["/literal/{cwd}"]]) {
+      expect(() => normalizeAgentPlacement({ ...raw(), sharedMounts })).toThrow("sharedMounts");
+    }
   });
   it("validates the documented Ryzen 1 --src flags and the work-host alias map", () => {
     const placement = documentedPlacement();

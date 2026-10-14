@@ -127,6 +127,19 @@ export const eventReceipts = (event: MeshEvent): string[] => {
     ...(identity ? [receipt(event.from.id, identity.kind, identity.value)] : []),
   ];
 };
+/**
+ * Display-only shadow metadata for an inbox carrier's receipt group (smarty-dev#12140): an event
+ * without its own messageId/deliveryId names its sender/topic key (else ref) under the retired
+ * "topic-*" kind, which the incoming-message renderer matches against delivered native carriers.
+ * Root-inbox dedup never consults "topic-*" (only "native-topic-*"), so a canonical inbox/cursor
+ * that stores these hashes cannot collapse distinct durable events. An explicit identity outranks it.
+ */
+const shadowDisplayReceipts = (event: MeshEvent): string[] => {
+  if (deliveryIdentity(event.data)) return [];
+  const key = workKey(event.data), ref = workRef(event.data);
+  const legacy = (kind: "key" | "ref", value: string) => receipt(event.from.id, `topic-${kind}`, JSON.stringify([event.topic, value]));
+  return key ? [legacy("key", key)] : ref ? [legacy("ref", ref)] : [];
+};
 /** What the session's own entries say it holds. */
 export interface RootInboxSession {
   /** Inbox messages collectively holding all of these event ids. */
@@ -347,6 +360,7 @@ export const rootInboxMessage = (input: readonly MeshEvent[], extra?: readonly M
     "</fabric-inbox>",
   ].join("\n"),
   display: true,
-  details: { ids: all.map((event) => event.id), receipts: all.flatMap(eventReceipts) },
+  // Each group starts with the event receipt (the renderer's boundary); display metadata trails it.
+  details: { ids: all.map((event) => event.id), receipts: all.flatMap((event) => [...eventReceipts(event), ...shadowDisplayReceipts(event)]) },
   };
 };

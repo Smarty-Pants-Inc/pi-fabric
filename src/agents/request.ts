@@ -124,6 +124,7 @@ export const normalizeAgentRunRequest = (
     ...(typeof args.idempotencyKey === "string" ? { idempotencyKey: args.idempotencyKey } : {}),
     ...(args.worktreeSetup !== undefined ? { worktreeSetup: args.worktreeSetup as string } : {}),
     // Shapes are checked fail-closed by the manager before launch.
+    ...(args.writePolicy !== undefined ? { writePolicy: args.writePolicy as "unrestricted" } : {}),
     ...(args.readOnly !== undefined ? { readOnly: args.readOnly as boolean } : {}),
     ...(args.writableRoots !== undefined ? { writableRoots: args.writableRoots as string[] } : {}),
     ...(args.shell !== undefined ? { shell: args.shell as "deny" | "unconfined" } : {}),

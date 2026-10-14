@@ -408,3 +408,39 @@ jobs:
           path: idle-wakes-*
           if-no-files-found: warn
           retention-days: 14
+
+  nats-auth:
+    # Hosted smarty-dev#7504 T2 role matrix and configured 1/1 T8 auth slice; this does not claim init --local or adapter coverage.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: package.json
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      - name: Install pinned NATS server
+        # The same pinned download as the JetStream event-log job (feat/nats-event-log).
+        shell: bash
+        run: |
+          version=2.14.7
+          archive="nats-server-v${version}-linux-amd64.tar.gz"
+          release="https://github.com/nats-io/nats-server/releases/download/v${version}"
+          stage="$RUNNER_TEMP/nats-release"
+          mkdir -p "$stage"
+          curl --proto '=https' --tlsv1.2 -fsSL -o "$stage/SHA256SUMS" "$release/SHA256SUMS"
+          curl --proto '=https' --tlsv1.2 -fsSL -o "$stage/$archive" "$release/$archive"
+          (
+            cd "$stage"
+            awk -v archive="$archive" '$2 == archive { print }' SHA256SUMS | sha256sum --check --strict -
+            # Also bind the release asset to the locally qualified v2.14.7 bytes.
+            printf 'e5c20b1cb2c0566b54c544312e91e011f9e130c5c80f16a14f4cf28ef30b8be2  %s\n' "$archive" | sha256sum --check --strict -
+            tar -xzf "$archive"
+          )
+          echo "NATS_BIN=$stage/nats-server-v${version}-linux-amd64/nats-server" >> "$GITHUB_ENV"
+      - name: Hosted authenticated NATS T2/T8 slice
+        env:
+          NATS_AUTH_REQUIRED: '1'
+        run: bunx vitest run tests/nats-auth-server.test.ts --retry=0

@@ -1,5 +1,6 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { RootInbox, type RootInboxBatch, type RootInboxSession, type RootInboxReconcileOptions } from "./topology/root-inbox.js";
+import { RootInboxWatch } from "./topology/root-inbox-wake.js";
 import { MainInboxMaintenance, registerMainInbox, recordMainSuccessor, mainInboxOwns, mainInboxActive, rootPresenceAlarms, stageMainSuccessor, confirmMainSuccessor, providerDeadAlarms, providerDeadAlarmFields, admissionAlarmRecipient } from "./topology/stall-alarms.js";
 import type { RecordsService } from "./records/service.js";
 import { recordsInboxMessage, recordsInboxSession, type RecordsInboxBatch, type RecordsInboxSession } from "./records/inbox.js";
@@ -401,8 +402,58 @@ export class FabricRuntimeState {
     await this.#inboxRetry.run(async () => {
       if (!this.#meshActivationReady()) return;
       batch = await (idle ? this.#rootInbox?.wake(session, idle) : this.#rootInbox?.next(session, options));
+      this.#inboxReads++;
     });
     return batch;
+  }
+
+  /**
+   * The host's gated idle inbox wake (smarty-dev#4313, replaces the 15 s interval), called
+   * after the host's idle/preflight/cancel gates. A local Main
+   * with a root inbox runs it from mesh-root file events and one exact-deadline timer, armed only
+   * once this runtime is current and its mesh activation (RootInbox.start) completed.
+   */
+  #rootInboxWake: (() => Promise<void>) | undefined;
+  #inboxWatch: RootInboxWatch | undefined;
+  #inboxReads = 0;
+  set rootInboxWake(wake: (() => Promise<void>) | undefined) {
+    this.#rootInboxWake = wake;
+    this.#syncInboxWatch();
+  }
+  get rootInboxWake(): (() => Promise<void>) | undefined { return this.#rootInboxWake; }
+  /** One coalesced idle read through the watch (after a settle); false when none is armed. */
+  requestRootInboxWake(): boolean {
+    this.#inboxWatch?.request();
+    return this.#inboxWatch !== undefined;
+  }
+  #syncInboxWatch(): void {
+    const inbox = this.#rootInbox;
+    if (!this.#rootInboxWake || !inbox || this.#managedHost || !this.#meshActivationReady()) {
+      this.#closeInboxWatch();
+      return;
+    }
+    if (this.#inboxWatch) return;
+    const watch = new RootInboxWatch(inbox.mesh.root, async () => {
+      if (this.#inboxWatch !== watch || !this.#meshActivationReady()) return undefined;
+      const reads = this.#inboxReads;
+      await this.#rootInboxWake?.();
+      if (this.#inboxWatch !== watch) return undefined;
+      const now = Date.now();
+      const deadlines: number[] = [];
+      // Only a read made by this call reports a deadline: a skipped read must not rearm a timer.
+      const due = this.#inboxReads !== reads ? inbox.wakeDueAt : undefined;
+      if (due !== undefined) deadlines.push(due);
+      // A typed mesh lock failure: the existing bounded backoff owns the explicit retry.
+      if (this.#inboxRetry.waitMs > 0) deadlines.push(now + this.#inboxRetry.waitMs);
+      return deadlines.length ? Math.min(...deadlines) : undefined;
+    });
+    this.#inboxWatch = watch;
+    watch.start();
+  }
+  /** Synchronous: every teardown path calls it before its first await. */
+  #closeInboxWatch(): void {
+    this.#inboxWatch?.close();
+    this.#inboxWatch = undefined;
   }
 
   /**
@@ -455,6 +506,7 @@ export class FabricRuntimeState {
       ...(this.#lifecycle?.observationHealth() ?? []),
       ...(this.#control?.observationHealth() ?? []),
       ...(this.#residency?.observationHealth() ?? []),
+      ...(this.#inboxWatch?.failure ? [this.#inboxWatch.failure] : []),
     ];
   }
 
@@ -572,6 +624,7 @@ export class FabricRuntimeState {
     // successor's; the successor lease is installed only once the old runtime is torn down.
     this.#epoch += 1;
     this.#meshActivationReady = () => false;
+    this.#closeInboxWatch();
     const epoch = this.#epoch;
     this.#binding = undefined;
     // The retired epoch's heartbeat stops now, before teardown awaits: it never ticks again,
@@ -926,6 +979,8 @@ export class FabricRuntimeState {
       // Custody admission and succession succeeded: only now open inbox reads/drains.
       rootInbox?.start();
       meshActivationReady = true;
+      // A delayed activation (initial lock timeout) arms the idle wake once a current runtime set it.
+      this.#syncInboxWatch();
       mainAgent.attachFollowUpDrain(
         activationContext,
         followUpDrainSupported() ? meshConfig.followUpFlushMs : 0,
@@ -2058,6 +2113,7 @@ export class FabricRuntimeState {
 
   async shutdown(reason?: string, targetSessionFile?: string): Promise<void> {
     this.#meshActivationReady = () => false;
+    this.#closeInboxWatch();
     // The session lifecycle retired: stop the background heartbeat before any teardown await.
     this.#participants?.suspend();
     try {

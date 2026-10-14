@@ -223,8 +223,9 @@ const reportInboxExpiry = async (pi: ExtensionAPI, inbox: RootInboxBatch | undef
   sendFabricMessage(pi, rootInboxSummary(inbox), { deliverAs: "followUp", triggerTurn: false });
 };
 
-// An idle Main reads its inbox this often (smarty-dev#1595). With the 60 s steer grace, an event
-// published to an idle Main starts a turn about 60-75 s later. PI_FABRIC_INBOX_WAKE_MS overrides it.
+// An idle Main reads its inbox on mesh-root file events and at the exact next grace/cooldown/lock
+// retry deadline (smarty-dev#1595, #4313), never on an interval: an event addressed to its exact
+// session id starts a turn at once; alias-addressed shadows keep the 60 s steer grace.
 // The idle wake needs a Pi that queues a triggered message behind a live prompt preflight;
 // otherwise a wake can start a run that makes a prompt in its preflight fail (#107 review F2).
 // Pi declares it on the extension API (pi.hostCapabilities, Smarty-Pants-Inc/pi#74 and #76), not through
@@ -238,11 +239,6 @@ const hostQueuesTriggeredBehindPreflight = (pi: ExtensionAPI): boolean => {
   const declared = (pi as { hostCapabilities?: HostCapabilities }).hostCapabilities;
   const capabilities = injected ?? declared;
   return capabilities?.triggeredMessageQueuesBehindPreflight === true && capabilities.promptPendingVisible === true;
-};
-
-const inboxWakeMs = (): number => {
-  const value = Number(process.env.PI_FABRIC_INBOX_WAKE_MS);
-  return Number.isFinite(value) && value > 0 ? value : 15_000;
 };
 
 return async function piFabric(pi: ExtensionAPI, options: { managedHost?: FabricManagedHostOptions } = {}): Promise<void> {
@@ -784,14 +780,15 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
   };
 
   // smarty-dev#1595: an idle Main takes the work events addressed to it without waiting for a
-  // turn, with the same call as a completed settle. The timer keeps the latest handler's context.
+  // turn, with the same call as a completed settle. The wake keeps the latest handler's context.
   // `settling` covers the settle handler: its own read and follow-up win, so a batch goes once.
   // A prompt in preflight (ctx.isPromptPending(), #111 review) takes the batch at its own turn
-  // start, so the timer never sends one then: each batch has one owner, the turn or the timer.
+  // start, so the wake never sends one then: each batch has one owner, the turn or the wake.
+  // `again` keeps a wake that arrived during a read (records and inbox share this reader).
   const inboxWake: {
-    timer?: ReturnType<typeof setInterval> | undefined; context?: ExtensionContext | undefined;
-    armed: boolean; reading: boolean; settling: boolean;
-  } = { armed: true, reading: false, settling: false };
+    context?: ExtensionContext | undefined;
+    armed: boolean; reading: boolean; settling: boolean; again: boolean;
+  } = { armed: true, reading: false, settling: false, again: false };
   // A host that declares promptPendingVisible has isPromptPending(); only a test's injected
   // capability on an older Pi lacks it.
   const hostSettling = (context: ExtensionContext): boolean =>
@@ -853,21 +850,24 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     for (const event of events) queuedRootInboxIds.set(event.id, rootInboxTurn);
   };
   const stopInboxWake = (): void => {
-    if (inboxWake.timer) clearInterval(inboxWake.timer);
-    inboxWake.timer = undefined;
+    // Closes the runtime's mesh-root watch and deadline timer; session_start arms them anew.
+    state.setRootInboxWake(undefined);
     inboxWake.context = undefined;
+    inboxWake.again = false;
     queuedRootInboxIds.clear();
     rootInboxRunSignal = undefined;
   };
+  // A busy, settling, preflight or cancelled Main is owned by its boundary, never timer-polled.
   const wakeIdleMain = async (): Promise<void> => {
     const context = inboxWake.context;
-    if (!context || !inboxWake.armed || inboxWake.reading || !state.initialized) return;
+    if (!context || !inboxWake.armed || !state.initialized) return undefined;
+    if (inboxWake.reading) { inboxWake.again = true; return undefined; }
     try {
       context.isIdle();
     } catch {
-      // A stale context (Pi disposed or replaced the session): this timer has no session left.
+      // A stale context (Pi disposed or replaced the session): this wake has no session left.
       if (inboxWake.context === context) stopInboxWake();
-      return;
+      return undefined;
     }
     // The host's whole settle counts, not only Fabric's handler (#111 review F4): a turn requested
     // then is deferred past every agent_settled handler, where neither the transcript nor
@@ -882,17 +882,23 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
       // A turn that started meanwhile takes the pending batch at its own start: never a second run.
       if (inbox?.events.length && idle()) {
         await deliverRootInbox(pi, inbox.events);
-        return;
+        return undefined;
       }
       // Records: the same gate, re-checked after the read (F21).
-      if (!idle()) return;
+      if (!idle()) return undefined;
       const records = await state.nextRecordsInboxMessage(context.sessionManager.getEntries()).catch(() => undefined);
       if (records && idle()) sendFabricMessage(pi, records, { deliverAs: "followUp", triggerTurn: true });
     } catch {
-      // A stale context (reload, session replacement) or a mesh error: the next tick or turn retries.
+      // A stale context (reload, session replacement) or a mesh error: the next event or turn retries.
     } finally {
       inboxWake.reading = false;
+      if (inboxWake.again) {
+        inboxWake.again = false;
+        // Through the watch, so it coalesces; without one (no capable host), nothing is armed.
+        state.requestRootInboxWake();
+      }
     }
+    return undefined;
   };
 
   pi.on("session_start", async (event, context) => {
@@ -929,11 +935,9 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     await state.bootstrap(context);
     principalView.start(context);
     // Inert until Pi queues a triggered message behind a live prompt preflight (also for records, F21).
-    state.setRecordsWake(hostQueuesTriggeredBehindPreflight(pi) ? () => wakeIdleMain() : undefined);
-    if (hostQueuesTriggeredBehindPreflight(pi)) {
-      inboxWake.timer = setInterval(() => void wakeIdleMain(), inboxWakeMs());
-      inboxWake.timer.unref?.();
-    }
+    state.setRecordsWake(hostQueuesTriggeredBehindPreflight(pi) ? wakeIdleMain : undefined);
+    // Event-driven: armed by the runtime only once it is current and its mesh activation completed.
+    state.setRootInboxWake(hostQueuesTriggeredBehindPreflight(pi) ? wakeIdleMain : undefined);
     // A Fabric child narrows its level into the parent's inherited bounds.
     if (process.env[FABRIC_THINKING_BOUNDS_ENV] !== undefined && state.bootstrapped) {
       try {
@@ -1054,9 +1058,12 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
       try {
         // All outcomes acknowledge confirmed work, even if another settle operation threw.
         // Only a successful completed settle may admit new work and trigger a continuation.
-        await reconcileRootInbox(context, { commitOnly: !completed });
+        await reconcileRootInbox(context, { commitOnly: !completed, priority: completed });
       } finally {
         inboxWake.settling = false;
+        // One event-driven post-handler request, not repeated checks of the host's settle flag.
+        // A new turn/preflight/cancel still owns its boundary; the callback rechecks all gates.
+        setImmediate(() => { if (state.initialized && inboxWake.context === context) state.requestRootInboxWake(); });
       }
     }
   });
@@ -1592,7 +1599,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     inboxWake.context = context;
     inboxWake.armed = true;
     if (!state.initialized) return;
-    const inbox = await state.nextRootInbox(await inboxHeldBy(context)).catch(() => undefined);
+    const inbox = await state.nextRootInbox(await inboxHeldBy(context), undefined, { priority: true }).catch(() => undefined);
     await reportInboxExpiry(pi, inbox);
     if (!inbox) return;
     const events = inboxEventsToQueue(inbox);

@@ -4,7 +4,7 @@ import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
-import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ACTOR_FAILURE_NOTICE_AFTER, ACTOR_TRANSIENT_BLOCK_BACKOFF_MAX_MS, ACTOR_TRANSIENT_BLOCK_BACKOFF_MS, FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC,
   activationBlockBackoffMs, actorRealarmKey, ActorManager, ActorRegistryOwnershipError } from "../src/actors/manager.js";
 import { classifyActivationFailure } from "../src/actors/activation-failure.js";
@@ -25,6 +25,7 @@ import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { actorParticipantRecord } from "../src/topology/records.js";
 import { writeParticipantFile } from "../src/topology/participant-files.js";
 import { LIVENESS_POLICY_KEY, writeHostLease } from "../src/topology/host-leases.js";
+import { modelExceptionGrant, withRootExceptionMetadata } from "./helpers/model-exceptions.js";
 
 // smarty-dev#1031: off Linux no root actor tree deletion runs (no Main publication fence, smarty-dev#8090;
 // follow-up smarty-dev#11335). An accepted removal resolves pending with this refusal and keeps the tree.
@@ -40,11 +41,42 @@ const actorManagers: ActorManager[] = [];
 const agentManagers: AgentManager[] = [];
 // Private legacy-control fixture for this suite: #11864 is listed; #1 is not.
 const legacyExceptionRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-actor-manager-exceptions-"));
+const boundLegacyRootRecord = Object.freeze({ cwd: legacyExceptionRoot });
 const legacyExceptionPath = path.join(legacyExceptionRoot, "model-exceptions.json");
-fs.writeFileSync(legacyExceptionPath, JSON.stringify([{ ref: "smarty-dev#11864",
-  models: ["anthropic/claude", "cliproxyapi-anthropic/claude", "private/claude", "claude/", "sonnet", "opus", "veda/claude-code"], expires: "2999-01-01T00:00:00.000Z" }]));
+const emptyLegacyGrantDocument = JSON.stringify({ version: 1, grants: [] });
+fs.writeFileSync(legacyExceptionPath, emptyLegacyGrantDocument);
+const legacyFixtureRoots = new Map<string, Readonly<{ cwd: string }>>();
+const legacyCanonicalModels = new Set([
+  "anthropic/claude-opus-5-5", "anthropic/claude-sonnet-4-5", "claude-haiku-test",
+]);
 const originalModelExceptionsPath = DEFAULT_FABRIC_CONFIG.agents.modelExceptionsPath;
 DEFAULT_FABRIC_CONFIG.agents.modelExceptionsPath = legacyExceptionPath;
+const hasPosixTrustMetadata = process.platform !== "win32" && typeof process.getuid === "function";
+const trustedExceptionFixturePaths = new Set<string>();
+const realAdmitModelException = AgentManager.prototype.admitModelException;
+let restoreAdmissionFixture: (() => void) | undefined;
+beforeEach(() => {
+  trustedExceptionFixturePaths.clear();
+  trustedExceptionFixturePaths.add(legacyExceptionPath);
+  legacyFixtureRoots.clear();
+  legacyFixtureRoots.set(legacyExceptionPath, boundLegacyRootRecord);
+  const admission = vi.spyOn(AgentManager.prototype, "admitModelException").mockImplementation(function (this: AgentManager, ...args) {
+    const file = this.config.modelExceptionsPath;
+    if (!file || !trustedExceptionFixturePaths.has(file)) return realAdmitModelException.apply(this, args);
+    const rootRecord = legacyFixtureRoots.get(file);
+    const previous = fs.readFileSync(file, "utf8");
+    const canonicalModel = args[0]?.trim();
+    // Only the registered, otherwise-empty legacy fixture gets an exact call-scoped row.
+    // Explicit role/model/issue-negative documents are NEVER replaced, nor is #1 allowed.
+    const materialize = rootRecord && canonicalModel && legacyCanonicalModels.has(canonicalModel) && previous === emptyLegacyGrantDocument;
+    if (materialize) fs.writeFileSync(file, JSON.stringify({ version: 1, grants: [modelExceptionGrant({
+      model: canonicalModel, lane: path.basename(rootRecord.cwd), role: args[3] ?? "task", thinking: args[4] ?? this.config.thinking,
+    })] }));
+    try { return withRootExceptionMetadata(file, () => realAdmitModelException.apply(this, args)); }
+    finally { if (materialize) fs.writeFileSync(file, previous); }
+  });
+  restoreAdmissionFixture = () => admission.mockRestore();
+});
 
 afterAll(() => {
   if (originalModelExceptionsPath === undefined) delete DEFAULT_FABRIC_CONFIG.agents.modelExceptionsPath;
@@ -81,10 +113,16 @@ const setup = (
   roots.push(root);
   const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
   // Private legacy-control fixture: #11864 is explicitly listed; #1 remains unlisted.
+  const boundRootRecord = Object.freeze({ cwd: root });
   const modelExceptionsPath = agentOverrides.modelExceptionsPath ?? path.join(root, "model-exceptions.json");
-  if (!agentOverrides.modelExceptionsPath) fs.writeFileSync(modelExceptionsPath, JSON.stringify([{ ref: "smarty-dev#11864",
-    models: ["anthropic/claude", "cliproxyapi-anthropic/claude", "private/claude", "claude/", "sonnet", "opus", "veda/claude-code"], expires: "2999-01-01T00:00:00.000Z" }]));
+  if (!agentOverrides.modelExceptionsPath) {
+    fs.writeFileSync(modelExceptionsPath, emptyLegacyGrantDocument);
+    trustedExceptionFixturePaths.add(modelExceptionsPath);
+    legacyFixtureRoots.set(modelExceptionsPath, boundRootRecord);
+  }
   const agents = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, ...agentOverrides, modelExceptionsPath }, {
+    rootSessionCwd: () => boundRootRecord.cwd,
+    claudeBinary: path.resolve("tests/fixtures/fake-claude.mjs"),
     workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
     runRoot: path.join(root, "runs"),
     ...(modelValidation?.preparePiModel
@@ -129,6 +167,7 @@ const setup = (
 afterEach(async () => {
   await Promise.all(actorManagers.splice(0).map((manager) => manager.close()));
   await Promise.all(agentManagers.splice(0).map((manager) => manager.close()));
+  restoreAdmissionFixture?.();
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 
@@ -294,7 +333,7 @@ describe("ActorManager bound registry metadata (#7682)", () => {
     return registry.actors.find((actor: { id: string }) => actor.id === id);
   };
 
-  it("round 2 preserves project defaults through an old-runtime save that strips unknown fields", async () => {
+  it.runIf(hasPosixTrustMetadata)("round 2 preserves project defaults through an old-runtime save that strips unknown fields", async () => {
     const state = setup(true);
     const defaults = { model: "anthropic/claude-opus-5-5", modelReason: "#11864 project policy", thinking: "medium" as const };
     const actor = await state.actors.create({ name: "rollback-defaults", instructions: "Observe.", ...defaults });
@@ -402,7 +441,7 @@ describe("ActorManager bound registry metadata (#7682)", () => {
     return restarted;
   };
 
-  it("republishes an idle actor's last resolved binding after a host restart without a run (#8487)", async () => {
+  it.runIf(hasPosixTrustMetadata)("republishes an idle actor's last resolved binding after a host restart without a run (#8487)", async () => {
     const state = setup(true);
     const actor = await state.actors.create({ name: "restart-binding", instructions: "Observe.",
       model: "anthropic/claude-opus-5-5", modelReason: "#11864 restart binding", thinking: "medium" });
@@ -598,7 +637,7 @@ describe("ActorManager bound registry metadata (#7682)", () => {
     expect(row(state.root, recreated.id)).toMatchObject({ model: "provider/new", thinking: "low" });
   });
 
-  it("replaces the Opus stamp with each admitted run binding without extra writes or wakes", async () => {
+  it.runIf(hasPosixTrustMetadata)("replaces the Opus stamp with each admitted run binding without extra writes or wakes", async () => {
     const state = setup(true);
     const actor = await state.actors.create({ name: "bound-registry", instructions: "Observe.",
       model: "anthropic/claude-opus-5-5", modelReason: "#11864 bound registry", thinking: "medium" });
@@ -4635,14 +4674,17 @@ describe("ActorManager", () => {
     });
   });
 
-  it("resumes a Claude Code session after a persistent actor is restored", async () => {
+  it.runIf(hasPosixTrustMetadata)("resumes a Claude Code session after a persistent actor is restored", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-claude-actor-"));
     roots.push(root);
     const invocationLog = path.join(root, "claude-args.jsonl");
     process.env.FAKE_CLAUDE_LOG = invocationLog;
     try {
       const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
-      const agents = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+      const agents = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents,
+        claude: { ...DEFAULT_FABRIC_CONFIG.agents.claude, model: "claude/haiku" },
+      }, {
+        rootSessionCwd: () => boundLegacyRootRecord.cwd,
         workerPath: path.resolve("src/worker.ts"),
         claudeBinary: path.resolve("tests/fixtures/fake-claude.mjs"),
         runRoot: path.join(root, "runs"),
@@ -5107,17 +5149,24 @@ describe("ActorManager", () => {
     const exceptionPath = state.agents.config.modelExceptionsPath!;
     const opus = "anthropic/claude-opus-5-5";
     const reason = "Role-scoped actor test #1";
-    const writeGrant = (roles: string[]) => fs.writeFileSync(exceptionPath, JSON.stringify([{
-      ref: "smarty-dev#1", models: ["anthropic/claude-opus"], roles, expires: "2999-01-01T00:00:00.000Z",
-    }]));
+    const writeGrant = (roles: string[]) => fs.writeFileSync(exceptionPath, JSON.stringify({ version: 1, grants: roles.map(role => modelExceptionGrant({
+      issue: "Smarty-Pants-Inc/smarty-dev#1", model: opus, lane: path.basename(state.root), role,
+    })) }));
     writeGrant(["task"]);
+    if (!hasPosixTrustMetadata) {
+      await expect(state.actors.create({ name: "reviewer", instructions: "Review.", model: opus, modelReason: reason }))
+        .rejects.toMatchObject({ code: "FABRIC_MODEL_EXCEPTION_DENIED", denial: "untrusted-source", role: "actor:reviewer" });
+      expect(state.actors.list()).toEqual([]);
+      return; // Trust fails earlier on Windows; never skip the no-mutation refusal.
+    }
 
     const taskReceipt = await state.agents.run({ task: "task role control", model: opus, modelReason: reason, transport: "process" });
     expect(taskReceipt).toMatchObject({ status: "completed", model: opus, modelReason: reason });
     const auditFile = path.join(os.homedir(), ".local", "state", "smarty", "route", "opus-exceptions.jsonl");
     const auditRows = fs.readFileSync(auditFile, "utf8").trim().split("\n").filter(Boolean)
       .map(line => JSON.parse(line) as Record<string, unknown>);
-    expect(auditRows.find(row => row.reason === reason)).toMatchObject({ ref: "smarty-dev#1", role: "task", model: opus });
+    expect(auditRows.find(row => row.reason === reason)).toMatchObject({ ref: "Smarty-Pants-Inc/smarty-dev#1", role: "task", model: opus,
+      grant_id: expect.any(String), issue: "Smarty-Pants-Inc/smarty-dev#1", lane: path.basename(state.root), host: os.hostname().split(".")[0], thinking: expect.any(String), run_id: taskReceipt.id, time: expect.any(String) });
     await expect(state.actors.create({ name: "reviewer", instructions: "Review.", model: opus, modelReason: reason }))
       .rejects.toMatchObject({ code: "FABRIC_MODEL_EXCEPTION_DENIED", denial: "role-mismatch", role: "actor:reviewer" });
     expect(state.actors.list()).toEqual([]);
@@ -5136,6 +5185,17 @@ describe("ActorManager", () => {
     });
     await expect(state.actors.create({ name: "bare-opus", instructions: "Review.", model: opus }))
       .rejects.toThrow(/#2264|named exception/);
+    if (!hasPosixTrustMetadata) {
+      const safe = await state.actors.create({ name: "safe-binding", instructions: "Review.", model: luna });
+      await expect(state.actors.resolveActivationBinding(safe.id, { overrides: { model: opus } })).rejects.toThrow(/#2264|named exception/);
+      for (const scope of ["session", "project"] as const) {
+        await expect(state.actors.setModel(safe.id, opus, scope)).rejects.toThrow(/#2264|named exception/);
+        expect(state.actors.status(safe.id)).toMatchObject({ model: luna });
+        await state.actors.resetSession(safe.id);
+        expect(state.actors.status(safe.id)).toMatchObject({ model: luna });
+      }
+      return;
+    }
     const actor = await state.actors.create({ name: "named-opus", instructions: "Review.", model: opus, opusReason: reason });
     expect(state.actors.status(actor.id)).toMatchObject({ model: opus, modelReason: reason });
 
@@ -5157,7 +5217,7 @@ describe("ActorManager", () => {
     }
   });
 
-  it("setModel updates and clears an actor's model and it takes effect on the next run", async () => {
+  it.runIf(hasPosixTrustMetadata)("setModel updates and clears an actor's model and it takes effect on the next run", async () => {
     const { actors } = setup();
     const actor = await actors.create({
       name: "reviewer",
@@ -5198,7 +5258,7 @@ describe("ActorManager", () => {
     );
   });
 
-  it("persists a session model binding without changing the project default", async () => {
+  it.runIf(hasPosixTrustMetadata)("persists a session model binding without changing the project default", async () => {
     const setupState = setup(true);
     const actor = await setupState.actors.create({
       name: "reviewer",

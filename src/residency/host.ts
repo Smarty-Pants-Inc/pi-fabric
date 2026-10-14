@@ -550,6 +550,12 @@ export class ResidentHost {
       kernel: () => currentConfig().kernel ?? config.kernel ?? "typescript",
       pythonRuntime: () => currentConfig().pythonRuntime ?? config.pythonRuntime ?? "monty",
       mainAgentId: config.rootId,
+      rootSessionCwd: () => {
+        const root = this.participants.get(config.rootId, undefined, { fresh: true });
+        return root?.kind === "root" && root.id === config.rootId && typeof root.cwd === "string" && root.cwd.trim().length > 0
+          ? root.cwd
+          : undefined;
+      },
       fabricSessionId: config.sessionId,
       meshRoot: config.meshRoot,
       projectRoot: config.projectRoot,

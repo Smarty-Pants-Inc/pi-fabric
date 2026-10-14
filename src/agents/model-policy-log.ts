@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { isFabricThinking, thinkingRank, type FabricThinking } from "../thinking.js";
 
 /** Model identifiers or a known Claude-capable native backend, not substrings. */
 export function isClaudeModel(model: string | undefined, runner?: string, backend?: string): boolean {
@@ -28,14 +29,24 @@ export function opusIssueReference(reason: unknown): string | undefined {
 export const MODEL_EXCEPTION_DENIED_CODE = "FABRIC_MODEL_EXCEPTION_DENIED" as const;
 
 export type ModelExceptionDenial =
-  | "invalid-reason" | "missing-reference" | "file-unavailable" | "malformed" | "unlisted" | "expired" | "model-mismatch" | "role-mismatch";
+  | "invalid-reason" | "missing-reference" | "file-unavailable" | "untrusted-source" | "malformed"
+  | "unlisted" | "expired" | "revoked" | "expiry-too-long" | "model-mismatch" | "role-mismatch"
+  | "lane-mismatch" | "host-mismatch" | "thinking-exceeds";
 
-/** Host-owned `<agentDir>/model-exceptions.json` entry. */
+/** Version 1 grant from the fixed root-owned host source. */
 export interface ModelExceptionEntry {
-  ref: string;
-  models: string[];
-  roles?: string[];
-  expires: string;
+  id: string;
+  issue: string;
+  reason_url: string;
+  role: string;
+  lane: string;
+  host: string;
+  model: string;
+  thinking: FabricThinking;
+  granted_by: string;
+  granted_at: string;
+  expires_at: string;
+  status: "active" | "revoked";
 }
 
 /** Typed refusal: a Claude/Opus selection lacks a trusted, current, matching exception. */
@@ -58,28 +69,31 @@ export class FabricModelExceptionDeniedError extends Error {
   }
 }
 
-const REF_PATTERN = /^([a-z0-9._-]+)#([1-9]\d*)$/;
+const REF_PATTERN = /^smarty-pants-inc\/([a-z0-9._-]+)#([1-9]\d*)$/i;
+const canonicalRef = (repo: string, number: string): string => `Smarty-Pants-Inc/${repo.toLowerCase()}#${number}`;
 
 /**
- * Canonical `<repo>#N` references in order. Bare `#N` means smarty-dev#N; GitHub
- * Smarty-Pants-Inc issue URLs map to their repo; any other URL is consumed whole
- * so its fragment can never grant.
+ * Canonical `Smarty-Pants-Inc/<repo>#N` references in order. Bare `#N` means
+ * smarty-dev; foreign owner refs and arbitrary URL fragments never grant.
  */
 export function canonicalIssueReferences(reason: unknown): string[] {
   if (typeof reason !== "string") return [];
   const refs: string[] = [];
-  const candidates = /https?:\/\/[^\s<>"']+|(?:^|[\s([])([A-Za-z0-9._-]+)?#([1-9]\d*)(?![\w#/])/gi;
+  const candidates = /https?:\/\/[^\s<>"']+|(?:^|[\s([])((?:[A-Za-z0-9._-]+\/)?[A-Za-z0-9._-]+)?#([1-9]\d*)(?![\w#/])/gi;
   for (const match of reason.matchAll(candidates)) {
     let ref: string | undefined;
     if (match[2]) {
-      ref = `${(match[1] ?? "smarty-dev").toLowerCase()}#${match[2]}`;
+      const parts = (match[1] ?? "smarty-dev").split("/");
+      if (parts.length === 1 || parts[0]!.toLowerCase() === "smarty-pants-inc") {
+        ref = canonicalRef(parts.at(-1)!, match[2]);
+      }
     } else {
       const candidate = match[0].replace(/[.,;:)\]}]+$/, "");
       try {
         const url = new URL(candidate);
         const issue = /^\/smarty-pants-inc\/([a-z0-9._-]+)\/issues\/([1-9]\d*)\/?$/i.exec(url.pathname);
         if (url.protocol === "https:" && url.hostname.toLowerCase() === "github.com" && !url.username && !url.password && !url.port && issue) {
-          ref = `${issue[1]!.toLowerCase()}#${issue[2]}`;
+          ref = canonicalRef(issue[1]!, issue[2]!);
         }
       } catch { /* Malformed URLs are not issue references. */ }
     }
@@ -89,42 +103,184 @@ export function canonicalIssueReferences(reason: unknown): string[] {
 }
 
 const MAX_EXCEPTIONS_BYTES = 1024 * 1024;
-const ISO_PATTERN = /^\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:\d{2})?)?$/;
+const MAX_GRANT_TTL_MS = 72 * 60 * 60 * 1_000;
+const ISO_PATTERN = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(?:Z|([+-])(\d{2}):(\d{2}))$/;
+
+/** Date.parse alone accepts rolled-over dates such as February 30. */
+const validTimestamp = (value: unknown): value is string => {
+  if (typeof value !== "string") return false;
+  const parts = ISO_PATTERN.exec(value);
+  if (!parts) return false;
+  const year = Number(parts[1]), month = Number(parts[2]), day = Number(parts[3]);
+  const leap = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const days = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  return month >= 1 && month <= 12 && day >= 1 && day <= days[month - 1]! &&
+    Number(parts[4]) <= 23 && Number(parts[5]) <= 59 && Number(parts[6]) <= 59 &&
+    (!parts[7] || (Number(parts[8]) <= 23 && Number(parts[9]) <= 59)) && Number.isFinite(Date.parse(value));
+};
+
+class UntrustedModelExceptionSourceError extends Error {
+  readonly code = "FABRIC_MODEL_EXCEPTION_UNTRUSTED_SOURCE";
+  constructor(detail: string) {
+    super(detail);
+    this.name = "UntrustedModelExceptionSourceError";
+  }
+}
+
+const trustedMetadata = (stat: fs.Stats): boolean =>
+  stat.uid === 0 && (stat.mode & 0o022) === 0;
+
+const sourceUnsafe = (detail: string): never => {
+  throw new UntrustedModelExceptionSourceError(detail);
+};
+
+const errorCode = (error: unknown): string | undefined =>
+  error instanceof Error && "code" in error && typeof error.code === "string" ? error.code : undefined;
+
+/** Validate every existing ancestor before opening the grant source. */
+const validateTrustedParents = (file: string): void => {
+  const parent = path.dirname(file);
+  const root = path.parse(parent).root;
+  const directories: string[] = [];
+  for (let directory = parent;; directory = path.dirname(directory)) {
+    directories.push(directory);
+    if (directory === root) break;
+  }
+  for (let index = directories.length - 1; index >= 0; index -= 1) {
+    let stat: fs.Stats;
+    try {
+      stat = fs.lstatSync(directories[index]!);
+    } catch {
+      sourceUnsafe(`cannot validate model exceptions directory ${directories[index]}`);
+    }
+    if (stat!.isSymbolicLink() || !stat!.isDirectory() || !trustedMetadata(stat!)) {
+      sourceUnsafe(`unsafe model exceptions directory ${directories[index]}`);
+    }
+  }
+};
+
+const validateTrustedFile = (stat: fs.Stats): void => {
+  if (stat.isSymbolicLink() || !stat.isFile() || !trustedMetadata(stat) ||
+      !Number.isSafeInteger(stat.size) || stat.size < 0 || stat.size > MAX_EXCEPTIONS_BYTES) {
+    sourceUnsafe("model exceptions source is not a bounded root-owned regular file");
+  }
+};
 
 const validEntry = (value: unknown): value is ModelExceptionEntry => {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const entry = value as Record<string, unknown>;
-  if (typeof entry.ref !== "string" || !REF_PATTERN.test(entry.ref.trim().toLowerCase())) return false;
-  if (!Array.isArray(entry.models) || entry.models.length === 0 ||
-      entry.models.some(model => typeof model !== "string" || !model.trim())) return false;
-  if (entry.roles !== undefined && (!Array.isArray(entry.roles) || entry.roles.length === 0 ||
-      entry.roles.some(role => typeof role !== "string" || !role.trim()))) return false;
-  return typeof entry.expires === "string" && ISO_PATTERN.test(entry.expires.trim()) &&
-    Number.isFinite(Date.parse(entry.expires.trim()));
+  const fields = ["id", "issue", "reason_url", "role", "lane", "host", "model", "granted_by"];
+  if (fields.some(field => typeof entry[field] !== "string" || !entry[field] ||
+      (entry[field] as string).trim() !== entry[field])) return false;
+  if (!REF_PATTERN.test(entry.issue as string) || !/^(?:task|lane|actor:[^\s]+)$/.test(entry.role as string) ||
+      !/^[^\s/\\]+$/.test(entry.lane as string) || entry.lane === "." || entry.lane === ".." ||
+      !/^[^\s./\\]+$/.test(entry.host as string) || /[\s*<>]/.test(entry.model as string) ||
+      !isFabricThinking(entry.thinking) || (entry.status !== "active" && entry.status !== "revoked")) return false;
+  // The linked issue/comment is the record, not an alternate admission key.
+  const issue = REF_PATTERN.exec(entry.issue as string)!;
+  try {
+    const url = new URL(entry.reason_url as string);
+    const linked = /^\/smarty-pants-inc\/([a-z0-9._-]+)\/issues\/([1-9]\d*)\/?$/i.exec(url.pathname);
+    if (url.protocol !== "https:" || url.hostname.toLowerCase() !== "github.com" ||
+        url.username || url.password || url.port || !linked ||
+        canonicalRef(linked[1]!, linked[2]!) !== canonicalRef(issue[1]!, issue[2]!)) return false;
+  } catch { return false; }
+  return validTimestamp(entry.granted_at) && validTimestamp(entry.expires_at) &&
+    Date.parse(entry.expires_at) > Date.parse(entry.granted_at);
 };
 
 /** Read the host-owned exception list now. Throws on any missing/unreadable/malformed state. */
 export function readModelExceptions(file: string): ModelExceptionEntry[] {
-  const stat = fs.statSync(file);
-  if (!stat.isFile() || stat.size > MAX_EXCEPTIONS_BYTES) throw new Error("model exceptions file is not a bounded regular file");
-  const parsed: unknown = JSON.parse(fs.readFileSync(file, "utf8"));
-  if (!Array.isArray(parsed) || !parsed.every(validEntry)) throw new SyntaxError("model exceptions file is malformed");
-  return parsed.map(entry => ({
-    ref: entry.ref.trim().toLowerCase(),
-    models: entry.models.map(model => model.trim().toLowerCase()),
-    ...(entry.roles ? { roles: entry.roles.map(role => role.trim()) } : {}),
-    expires: entry.expires.trim(),
-  }));
+  if (process.platform === "win32" || typeof process.getuid !== "function") {
+    sourceUnsafe("model exceptions source ownership cannot be proven on this platform");
+  }
+  const noFollow = fs.constants.O_NOFOLLOW;
+  const nonBlock = fs.constants.O_NONBLOCK;
+  if (typeof noFollow !== "number" || noFollow === 0 || typeof nonBlock !== "number" || nonBlock === 0) {
+    sourceUnsafe("model exceptions source requires O_NOFOLLOW and O_NONBLOCK");
+  }
+  if (!path.isAbsolute(file)) sourceUnsafe("model exceptions source must be an absolute path");
+
+  // A missing grant remains an ordinary unavailable-file denial. Any present
+  // source must prove its metadata before its parent chain is trusted.
+  let before: fs.Stats;
+  try {
+    before = fs.lstatSync(file);
+  } catch (error) {
+    if (errorCode(error) === "ENOENT") throw error;
+    sourceUnsafe("model exceptions source metadata is unreadable");
+  }
+  validateTrustedFile(before!);
+  validateTrustedParents(file);
+
+  let descriptor: number | undefined;
+  let source: string;
+  try {
+    try {
+      descriptor = fs.openSync(file, fs.constants.O_RDONLY | noFollow | nonBlock);
+    } catch (error) {
+      if (errorCode(error) === "ENOENT") throw error;
+      if (errorCode(error) === "ELOOP" || errorCode(error) === "ENOTDIR") {
+        sourceUnsafe("model exceptions source changed to a symlink or non-directory path");
+      }
+      throw error;
+    }
+    let opened: fs.Stats;
+    try {
+      opened = fs.fstatSync(descriptor);
+    } catch {
+      sourceUnsafe("model exceptions source metadata cannot be verified after open");
+    }
+    validateTrustedFile(opened!);
+
+    const bytes = Buffer.alloc(opened!.size);
+    let count = 0;
+    while (count < bytes.length) {
+      const read = fs.readSync(descriptor, bytes, count, bytes.length - count, count);
+      if (read <= 0) break;
+      count += read;
+    }
+    let after: fs.Stats;
+    try {
+      after = fs.fstatSync(descriptor);
+    } catch {
+      sourceUnsafe("model exceptions source metadata cannot be verified after read");
+    }
+    validateTrustedFile(after!);
+    if (count !== opened!.size || after!.size !== opened!.size || after!.dev !== opened!.dev ||
+        after!.ino !== opened!.ino || after!.uid !== opened!.uid || after!.mode !== opened!.mode ||
+        after!.mtimeMs !== opened!.mtimeMs || after!.ctimeMs !== opened!.ctimeMs) {
+      sourceUnsafe("model exceptions source changed while reading");
+    }
+    source = bytes.toString("utf8");
+  } finally {
+    if (descriptor !== undefined) fs.closeSync(descriptor);
+  }
+
+  const parsed: unknown = JSON.parse(source);
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new SyntaxError("model exceptions file is malformed");
+  const document = parsed as Record<string, unknown>;
+  if (document.version !== 1 || !Array.isArray(document.grants) || !document.grants.every(validEntry)) {
+    throw new SyntaxError("model exceptions file is malformed");
+  }
+  const entries = document.grants as ModelExceptionEntry[];
+  if (new Set(entries.map(entry => entry.id)).size !== entries.length) throw new SyntaxError("duplicate model exception grant id");
+  return entries.map(entry => {
+    const issue = REF_PATTERN.exec(entry.issue)!;
+    return {
+      id: entry.id, issue: canonicalRef(issue[1]!, issue[2]!), reason_url: entry.reason_url,
+      role: entry.role, lane: entry.lane, host: entry.host, model: entry.model, thinking: entry.thinking,
+      granted_by: entry.granted_by, granted_at: entry.granted_at, expires_at: entry.expires_at, status: entry.status,
+    };
+  });
 }
 
-/**
- * Admit only a reason citing a host-listed, unexpired ref whose model prefixes match
- * one of the candidate (resolved/provenance) models and whose roles include `role`.
- */
+/** Admit one active grant matching the complete host-bound key and effort ceiling. */
 export function admitModelException(input: {
-  path: string | undefined; reason: unknown; models: string[]; role: string; now?: number;
-}): { ref: string; entry: ModelExceptionEntry } {
-  const model = input.models[0] ?? "<unknown>";
+  path: string | undefined; reason: unknown; model: string; role: string;
+  lane?: string | undefined; host: string; thinking: FabricThinking; now?: number;
+}): { ref: string; entry: Readonly<ModelExceptionEntry> } {
+  const model = input.model;
   const refs = canonicalIssueReferences(input.reason);
   const deny = (denial: ModelExceptionDenial, ref?: string, detail?: string): never => {
     throw new FabricModelExceptionDeniedError({ denial, ref, model, role: input.role, ...(detail ? { detail } : {}) });
@@ -134,20 +290,29 @@ export function admitModelException(input: {
   let entries: ModelExceptionEntry[] = [];
   try { entries = readModelExceptions(input.path!); }
   catch (error) {
-    deny(error instanceof SyntaxError ? "malformed" : "file-unavailable", refs[0]);
+    deny(error instanceof UntrustedModelExceptionSourceError ? "untrusted-source" :
+      error instanceof SyntaxError ? "malformed" : "file-unavailable", refs[0]);
   }
   const now = input.now ?? Date.now();
-  const candidates = input.models.map(value => value.trim().toLowerCase()).filter(Boolean);
-  const rank: ModelExceptionDenial[] = ["unlisted", "expired", "model-mismatch", "role-mismatch"];
+  if (!input.lane) deny("lane-mismatch", refs[0], "no bound ROOT session worktree");
+  if (!isFabricThinking(input.thinking)) deny("thinking-exceeds", refs[0], "effective thinking is unknown");
+  if (!Number.isFinite(now)) deny("expired", refs[0], "current time is unknown");
+  const rank: ModelExceptionDenial[] = ["unlisted", "lane-mismatch", "host-mismatch", "role-mismatch",
+    "model-mismatch", "thinking-exceeds", "expired", "revoked", "expiry-too-long"];
   let best: { denial: ModelExceptionDenial; ref: string } | undefined;
   for (const ref of refs) {
     for (const entry of entries) {
-      if (entry.ref !== ref) continue;
+      if (entry.issue !== ref) continue;
       let denial: ModelExceptionDenial | undefined;
-      if (Date.parse(entry.expires) <= now) denial = "expired";
-      else if (!entry.models.some(prefix => candidates.some(candidate => candidate.startsWith(prefix)))) denial = "model-mismatch";
-      else if (entry.roles && !entry.roles.includes(input.role)) denial = "role-mismatch";
-      if (!denial) return { ref, entry };
+      if (entry.lane !== input.lane) denial = "lane-mismatch";
+      else if (entry.host !== input.host) denial = "host-mismatch";
+      else if (entry.role !== input.role) denial = "role-mismatch";
+      else if (entry.model !== model) denial = "model-mismatch";
+      else if (thinkingRank(input.thinking) > thinkingRank(entry.thinking)) denial = "thinking-exceeds";
+      else if (Date.parse(entry.expires_at) - Date.parse(entry.granted_at) > MAX_GRANT_TTL_MS) denial = "expiry-too-long";
+      else if (entry.status === "revoked") denial = "revoked";
+      else if (Date.parse(entry.expires_at) <= now) denial = "expired";
+      if (!denial) return { ref, entry: Object.freeze({ ...entry }) };
       if (!best || rank.indexOf(denial) > rank.indexOf(best.denial)) best = { denial, ref };
     }
   }
@@ -157,14 +322,24 @@ export function admitModelException(input: {
 /** Best-effort host-local audit: one append write, no retries or global output. */
 export function appendOpusPolicyLog(input: {
   role: string; model: string; ref: string | null; reason: string;
+  grant?: Readonly<ModelExceptionEntry> | undefined; thinking?: FabricThinking | undefined; runId?: string | undefined;
 }): string | undefined {
   let fd: number | undefined;
   let warning: string | undefined;
   try {
+    if (input.grant && (!isFabricThinking(input.thinking) || !input.runId)) {
+      throw new Error("exception audit requires actual thinking and run id");
+    }
     const directory = path.join(os.homedir(), ".local", "state", "smarty", "route");
+    const time = new Date().toISOString();
     const line = Buffer.from(`${JSON.stringify({
-      ts: new Date().toISOString(), role: input.role, model: input.model,
+      ts: time, role: input.role, model: input.model,
       ref: input.ref, reason: input.reason, launcher: "fabric", host: os.hostname(),
+      ...(input.grant ? {
+        grant_id: input.grant.id, issue: input.grant.issue, lane: input.grant.lane,
+        host: input.grant.host, role: input.grant.role, model: input.grant.model,
+        thinking: input.thinking, run_id: input.runId, time,
+      } : {}),
     })}\n`, "utf8");
     fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
     const flags = fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_APPEND |

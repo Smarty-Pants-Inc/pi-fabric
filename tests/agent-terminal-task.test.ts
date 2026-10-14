@@ -1,11 +1,11 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agents/manager.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
-import { writeModelExceptions } from "./helpers/model-exceptions.js";
+import { withRootExceptionMetadata, writeModelExceptions } from "./helpers/model-exceptions.js";
 import { writeJsonAtomic } from "../src/core/atomic-write.js";
 import { saveFinalAnswerReceipt } from "../src/worker/terminal-answer.js";
 import type { AgentRunRecord } from "../src/agents/types.js";
@@ -15,9 +15,23 @@ import { canRemoveTerminalRun } from "../src/storage/retention.js";
 const roots: string[] = [];
 const managers: AgentManager[] = [];
 const exits: (() => void)[] = [];
+const hasPosixTrustMetadata = process.platform !== "win32" && typeof process.getuid === "function";
+const trustedExceptionFixturePaths = new Set<string>();
+const realAdmitModelException = AgentManager.prototype.admitModelException;
+let restoreAdmissionFixture: (() => void) | undefined;
+beforeEach(() => {
+  trustedExceptionFixturePaths.clear();
+  const admission = vi.spyOn(AgentManager.prototype, "admitModelException").mockImplementation(function (this: AgentManager, ...args) {
+    const file = this.config.modelExceptionsPath;
+    if (!file || !trustedExceptionFixturePaths.has(file)) return realAdmitModelException.apply(this, args);
+    return withRootExceptionMetadata(file, () => realAdmitModelException.apply(this, args));
+  });
+  restoreAdmissionFixture = () => admission.mockRestore();
+});
 afterEach(async () => {
   for (const exit of exits.splice(0)) exit();
   await Promise.all(managers.splice(0).map(manager => manager.close()));
+  restoreAdmissionFixture?.();
   vi.restoreAllMocks();
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
@@ -43,9 +57,12 @@ const harness = (onTerminalNotice?: (notice: AgentTerminalNotice) => void | Prom
       waitForClose: () => closed, isAlive: async () => alive, stop: async () => { await closed; } };
   });
   const settled = vi.fn();
+  const boundRootRecord = Object.freeze({ cwd: root });
+  const modelExceptionsPath = writeModelExceptions(root, ["claude-haiku-test"], boundRootRecord.cwd);
+  trustedExceptionFixturePaths.add(modelExceptionsPath);
   const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, maxConcurrent: 1, budgetUsd: 0, retainRuns: true,
-    modelExceptionsPath: writeModelExceptions(root, ["claude/<backend-default>"]) },
-    { workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root, onSettled: settled, ...(onTerminalNotice ? { onTerminalNotice } : {}) });
+    modelExceptionsPath, claude: { ...DEFAULT_FABRIC_CONFIG.agents.claude, model: "claude/haiku" } },
+    { rootSessionCwd: () => boundRootRecord.cwd, claudeBinary: path.resolve("tests/fixtures/fake-claude.mjs"), workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root, onSettled: settled, ...(onTerminalNotice ? { onTerminalNotice } : {}) });
   managers.push(manager);
   const finish = (id: string, text: string) => {
     const receipt = saveFinalAnswerReceipt(path.join(root, id), id, text);
@@ -252,7 +269,7 @@ describe("ordinary process-task final answer boundary", () => {
     expect((await manager.cleanup(handle.id)).cleaned).toBe(false); // retained run, no worktree
   });
 
-  it("does not change non-Pi process terminal semantics", async () => {
+  it.runIf(hasPosixTrustMetadata)("does not change non-Pi process terminal semantics", async () => {
     const { manager, root, close } = harness();
     const handle = await manager.spawn({ task: "Claude", runner: "claude", modelReason: "Test exception for #11864", transport: "process" });
     saveFinalAnswerReceipt(path.join(root, handle.id), handle.id, "not a native Pi receipt");

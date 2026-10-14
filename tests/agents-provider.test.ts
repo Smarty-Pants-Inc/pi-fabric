@@ -24,6 +24,7 @@ import type {
 } from "../src/lifecycle/types.js";
 import {
   DEFAULT_FABRIC_CONFIG,
+  MODEL_EXCEPTIONS_PATH,
   loadFabricConfig,
   normalizeFabricConfig,
   type FabricAgentConfig,
@@ -62,6 +63,8 @@ import { captureRuntimeDeadline } from "./helpers/early-runtime-deadline.js";
 import { captureMontyTransport } from "./helpers/monty-transport.js";
 import { executeAfterAdmission } from "./helpers/admission-clock.js";
 import { createMainExecutionCeilingError } from "../src/async-settlement.js";
+import { modelExceptionGrant, withRootExceptionMetadata } from "./helpers/model-exceptions.js";
+import type { FabricThinking } from "../src/thinking.js";
 
 vi.mock("node:child_process", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:child_process")>();
@@ -72,13 +75,40 @@ const roots: string[] = [];
 const actorManagers: ActorManager[] = [];
 const agentManagers: AgentManager[] = [];
 const controlPlanes: FabricControlPlane[] = [];
-// Private legacy-control fixture for direct managers in this suite: #11864 only.
+// Private finite v1 controls: exact resolved model and role, #11864 only.
+// Root-metadata controls are POSIX-only; unsupported hosts must fail closed in production.
+const boundRootCwd = path.resolve("provider-fixtures", "bound-provider-root");
+const boundRootLane = path.basename(boundRootCwd);
+const writeProviderGrants = (file: string): void => {
+  const taskModels = ["cliproxyapi-anthropic/claude-opus-5-5", "claude-haiku-test"];
+  fs.writeFileSync(file, JSON.stringify({ version: 1, grants: [
+    ...taskModels.map(model => modelExceptionGrant({ model, lane: boundRootLane })),
+    modelExceptionGrant({ model: "cliproxyapi-anthropic/claude-opus-5-5", lane: boundRootLane, role: "actor:named-opus" }),
+    modelExceptionGrant({ model: "anthropic/claude-opus-5-5", lane: boundRootLane, role: "actor:registry-member" }),
+  ] }));
+};
 const legacyExceptionRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-provider-exceptions-"));
 const legacyExceptionPath = path.join(legacyExceptionRoot, "model-exceptions.json");
-fs.writeFileSync(legacyExceptionPath, JSON.stringify([{ ref: "smarty-dev#11864",
-  models: ["anthropic/claude", "cliproxyapi-anthropic/claude", "private/claude", "claude/", "sonnet", "opus", "veda/claude-code"], expires: "2999-01-01T00:00:00.000Z" }]));
+writeProviderGrants(legacyExceptionPath);
 const originalModelExceptionsPath = DEFAULT_FABRIC_CONFIG.agents.modelExceptionsPath;
 DEFAULT_FABRIC_CONFIG.agents.modelExceptionsPath = legacyExceptionPath;
+const trustedExceptionFixturePaths = new Set<string>([legacyExceptionPath]);
+const realAdmitModelException = AgentManager.prototype.admitModelException;
+let restoreAdmissionFixture: (() => void) | undefined;
+
+beforeEach(testContext => {
+  trustedExceptionFixturePaths.clear();
+  trustedExceptionFixturePaths.add(legacyExceptionPath);
+  // Call-through only: never replace the real policy result or inject a production trust adapter.
+  const admission = vi.spyOn(AgentManager.prototype, "admitModelException").mockImplementation(function (this: AgentManager, ...args) {
+    const file = this.config.modelExceptionsPath;
+    if (!file || !trustedExceptionFixturePaths.has(file)) return realAdmitModelException.apply(this, args);
+    if (process.platform === "win32" || typeof process.getuid !== "function") testContext.skip();
+    return withRootExceptionMetadata(file, () => realAdmitModelException.apply(this, args));
+  });
+  restoreAdmissionFixture = () => admission.mockRestore();
+});
+
 afterAll(() => {
   if (originalModelExceptionsPath === undefined) delete DEFAULT_FABRIC_CONFIG.agents.modelExceptionsPath;
   else DEFAULT_FABRIC_CONFIG.agents.modelExceptionsPath = originalModelExceptionsPath;
@@ -303,12 +333,97 @@ describe("public actor model-exception roles", () => {
   const model = "cliproxyapi-anthropic/claude-opus-5-5";
   const safeModel = "cliproxyapi/gpt-6.1-sol";
   const reason = "Actor-only exception #1";
-  const writeActorGrant = (exceptionPath: string): void => {
-    fs.writeFileSync(exceptionPath, JSON.stringify([{
-      ref: "smarty-dev#1", models: ["cliproxyapi-anthropic/claude-opus"],
-      roles: ["actor:reviewer"], expires: "2999-01-01T00:00:00.000Z",
-    }]));
+  const writeActorGrant = (exceptionPath: string, thinking: FabricThinking = "max"): void => {
+    fs.writeFileSync(exceptionPath, JSON.stringify({ version: 1, grants: [modelExceptionGrant({
+      issue: "Smarty-Pants-Inc/smarty-dev#1", model, role: "actor:reviewer",
+      lane: boundRootLane, thinking,
+    })] }));
   };
+
+  it.each(["run", "spawn", "create", "createActor", "setModel", "ask", "tell"] as const)(
+    "does not expose caller-selectable lane, host or root binding on %s", async action => {
+      const state = setup();
+      const descriptor = await state.provider.describe(action, context);
+      const properties = (descriptor?.inputSchema as { properties: Record<string, unknown> }).properties;
+      expect(properties).not.toHaveProperty("lane");
+      expect(properties).not.toHaveProperty("host");
+      expect(properties).not.toHaveProperty("rootSessionCwd");
+    },
+  );
+
+  it("denies an unbound ROOT despite forged caller lane/host/cwd and environment", async () => {
+    const state = setup([], [], undefined, { rootSessionCwd: () => undefined });
+    writeActorGrant(state.agents.config.modelExceptionsPath!);
+    vi.stubEnv("PI_FABRIC_LANE", boundRootLane);
+    vi.stubEnv("SMARTY_LANE", boundRootLane);
+    vi.stubEnv("PI_FABRIC_ROOT_CWD", boundRootCwd);
+    vi.stubEnv("HOSTNAME", os.hostname().split(".")[0]!);
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    try {
+      await expect(state.provider.invoke("create", { name: "reviewer", instructions: "Review.",
+        model, modelReason: reason, lane: boundRootLane, host: os.hostname().split(".")[0],
+        cwd: boundRootCwd, rootSessionCwd: boundRootCwd,
+      }, { ...context, cwd: boundRootCwd })).rejects.toMatchObject({
+        code: "FABRIC_MODEL_EXCEPTION_DENIED", denial: "lane-mismatch",
+      });
+      expect(state.actors.list()).toEqual([]);
+      expect(state.agents.list()).toEqual([]);
+      expect(launch).not.toHaveBeenCalled();
+    } finally { launch.mockRestore(); vi.unstubAllEnvs(); }
+  });
+
+  it.each(["low", "medium", "high"] as const)("applies the requested %s actor effort against a medium ceiling", async thinking => {
+    const state = setup();
+    writeActorGrant(state.agents.config.modelExceptionsPath!, "medium");
+    const create = () => state.provider.invoke("create", {
+      name: "reviewer", instructions: "Review.", model, modelReason: reason, thinking,
+    }, context);
+    if (thinking === "high") {
+      await expect(create()).rejects.toMatchObject({ code: "FABRIC_MODEL_EXCEPTION_DENIED", denial: "thinking-exceeds" });
+      expect(state.actors.list()).toEqual([]);
+      expect(state.agents.list()).toEqual([]);
+    } else {
+      await expect(create()).resolves.toMatchObject({ model, thinking, modelReason: reason });
+    }
+  });
+
+  it.each(["ask", "tell"] as const)("checks %s binding effort, not the manager default", async action => {
+    const state = setup([], [], undefined, { agentsConfig: { thinking: "low" } });
+    writeActorGrant(state.agents.config.modelExceptionsPath!, "medium");
+    const actor = await state.provider.invoke("create", {
+      name: "reviewer", instructions: "Review.", model: safeModel, thinking: "high",
+    }, context) as FabricActorInfo;
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    try {
+      await expect(state.provider.invoke(action, { id: actor.id, message: "Above-ceiling binding",
+        model, modelReason: reason, thinking: "high",
+      }, context)).rejects.toMatchObject({ code: "FABRIC_MODEL_EXCEPTION_DENIED", denial: "thinking-exceeds" });
+      expect(state.agents.list()).toEqual([]);
+      expect(launch).not.toHaveBeenCalled();
+      await expect(state.provider.invoke(action, { id: actor.id, message: "Below-ceiling binding",
+        model, modelReason: reason, thinking: "low",
+      }, context)).resolves.toBeDefined();
+    } finally { launch.mockRestore(); }
+  });
+
+  it.each(["session", "project", "global"] as const)("setModel checks existing high %s effort before mutation", async scope => {
+    const state = setup([], [], undefined, { agentsConfig: { thinking: "low" } });
+    writeActorGrant(state.agents.config.modelExceptionsPath!, "medium");
+    const actor = await state.provider.invoke("create", {
+      name: "reviewer", instructions: "Review.", model: safeModel, thinking: "high",
+      ...(scope === "global" ? { scope } : {}),
+    }, context) as FabricActorInfo;
+    const before = scope === "global"
+      ? structuredClone(state.globalActors.resolve(actor.id))
+      : structuredClone(state.actors.definition(actor.id));
+    await expect(state.provider.invoke("setModel", { id: actor.id, scope, model, modelReason: reason }, context))
+      .rejects.toMatchObject({ code: "FABRIC_MODEL_EXCEPTION_DENIED", denial: "thinking-exceeds" });
+    expect(scope === "global" ? state.globalActors.resolve(actor.id) : state.actors.definition(actor.id)).toEqual(before);
+    expect(state.agents.list()).toEqual([]);
+    await state.provider.invoke("setThinking", { id: actor.id, scope, thinking: "low" }, context);
+    await expect(state.provider.invoke("setModel", { id: actor.id, scope, model, modelReason: reason }, context))
+      .resolves.toMatchObject({ model, thinking: "low", modelReason: reason });
+  });
 
   it("uses actor:<name> rather than task when admitting an actor-only host grant", async () => {
     const state = setup();
@@ -328,13 +443,13 @@ describe("public actor model-exception roles", () => {
         name: "wrong-name", instructions: "Review.", model, modelReason: reason,
       }, context)).rejects.toMatchObject({
         name: "FabricModelExceptionDeniedError", code: "FABRIC_MODEL_EXCEPTION_DENIED",
-        denial: "role-mismatch", ref: "smarty-dev#1", role: "actor:wrong-name",
+        denial: "role-mismatch", ref: "Smarty-Pants-Inc/smarty-dev#1", role: "actor:wrong-name",
       });
       await expect(state.provider.invoke("run", {
         task: "Task role must not borrow an actor grant", model, modelReason: reason, transport: "process",
       }, context)).rejects.toMatchObject({
         name: "FabricModelExceptionDeniedError", code: "FABRIC_MODEL_EXCEPTION_DENIED",
-        denial: "role-mismatch", ref: "smarty-dev#1", role: "task",
+        denial: "role-mismatch", ref: "Smarty-Pants-Inc/smarty-dev#1", role: "task",
       });
       expect(state.actors.list()).toEqual([]);
       expect(state.agents.list()).toEqual([]);
@@ -361,7 +476,7 @@ describe("public actor model-exception roles", () => {
       id: wrong.id, model, modelReason: reason,
     }, context)).rejects.toMatchObject({
       name: "FabricModelExceptionDeniedError", code: "FABRIC_MODEL_EXCEPTION_DENIED",
-      denial: "role-mismatch", ref: "smarty-dev#1", role: "actor:wrong-name",
+      denial: "role-mismatch", ref: "Smarty-Pants-Inc/smarty-dev#1", role: "actor:wrong-name",
     });
     expect(state.actors.definition(wrong.id)).toEqual(wrongDefinition);
     expect(state.actors.status(wrong.id)).toMatchObject({ id: wrong.id, model: safeModel });
@@ -385,7 +500,7 @@ describe("public actor model-exception roles", () => {
     }
     await expect(state.provider.invoke(action, args(wrong.id), context)).rejects.toMatchObject({
       name: "FabricModelExceptionDeniedError", code: "FABRIC_MODEL_EXCEPTION_DENIED",
-      denial: "role-mismatch", ref: "smarty-dev#1", role: "actor:wrong-name",
+      denial: "role-mismatch", ref: "Smarty-Pants-Inc/smarty-dev#1", role: "actor:wrong-name",
     });
   });
 
@@ -395,7 +510,7 @@ describe("public actor model-exception roles", () => {
       const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-main-model-exception-"));
       roots.push(root);
       const exceptionPath = path.join(root, "model-exceptions.json");
-      if (label.startsWith("empty")) fs.writeFileSync(exceptionPath, "[]");
+      if (label.startsWith("empty")) fs.writeFileSync(exceptionPath, JSON.stringify({ version: 1, grants: [] }));
       const switchModel = vi.fn(async () => ({ ok: true }));
       const state = setup([], [], undefined, {
         switchModel,
@@ -483,7 +598,7 @@ describe("public actor model-exception roles", () => {
       expect(state.actors.list()).toEqual([]);
       expect(state.agents.list()).toEqual([]);
     }
-    fs.rmSync(state.agents.config.modelExceptionsPath!, { force: true });
+    fs.writeFileSync(state.agents.config.modelExceptionsPath!, JSON.stringify({ version: 1, grants: [] }));
     const unlisted = await executeCreate({ name: "reviewer", instructions: "Review.", model, modelReason: reason });
     expect(unlisted.success).toBe(true);
     expect(unlisted.value).toEqual({
@@ -535,11 +650,12 @@ describe("model reason policy boundary (#11864)", () => {
   it("F-01 guards Claude-code Veda defaults and aliases at the provider and actor boundary", async () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-veda-claude-home-")); roots.push(home);
     const homedir = vi.spyOn(os, "homedir").mockReturnValue(home);
-    const state = setup([], [], undefined, { agentsConfig: {
+    const state = setup([], [], undefined, { preparePiModel: prepareVisiblePiModel, agentsConfig: {
       runner: "veda",
       modelPolicy: { requireReason: ["claude", "opus"] },
       veda: { ...DEFAULT_FABRIC_CONFIG.agents.veda, backend: "claude-code" },
     } });
+    const concreteModel = "cliproxyapi-anthropic/claude-opus-5-5";
     const launch = vi.spyOn(ProcessTransport.prototype, "launch");
     const exception = "#11864 bounded Veda Claude-code compatibility exception";
     try {
@@ -563,19 +679,21 @@ describe("model reason policy boundary (#11864)", () => {
         name: "unsupported-veda-actor", instructions: "Review.", model: "sonnet", modelReason: exception,
       }, context)).rejects.toThrow(/The Veda runner does not support persistent actors/);
       const result = await state.provider.invoke("run", {
-        task: "reasoned Claude-code task", model: "sonnet", opusReason: exception, transport: "process",
+        task: "reasoned Claude-code task", model: concreteModel, opusReason: exception, transport: "process",
       }, context) as AgentRunRecord;
-      expect(result).toMatchObject({ status: "completed", model: "sonnet", modelReason: exception,
-        warnings: expect.arrayContaining([expect.stringMatching(/veda\/claude-code\/sonnet/)]) });
+      expect(result).toMatchObject({ status: "completed", model: concreteModel, modelReason: exception,
+        warnings: expect.arrayContaining([expect.stringMatching(/veda\/claude-code\/cliproxyapi-anthropic\/claude-opus-5-5/)]) });
       const workerArguments = launch.mock.calls.at(-1)?.[0].workerArguments;
-      expect(workerArguments).toEqual(expect.arrayContaining(["--runner", "veda", "--model", "sonnet", "--model-reason", exception]));
+      expect(workerArguments).toEqual(expect.arrayContaining(["--runner", "veda", "--model", concreteModel, "--model-reason", exception]));
       const auditFile = path.join(home, ".local", "state", "smarty", "route", "opus-exceptions.jsonl");
       const rows = fs.readFileSync(auditFile, "utf8").trim().split("\n").filter(Boolean).map(line => JSON.parse(line) as Record<string, unknown>);
       const matched = rows.filter(row => row.reason === exception);
       expect(matched).toHaveLength(1);
-      expect(Object.keys(matched[0]!).sort()).toHaveLength(7);
-      expect(matched[0]).toMatchObject({ reason: exception, ref: "smarty-dev#11864", role: "task" });
-      expect(matched[0]!.model).toEqual(expect.stringMatching(/veda\/claude-code\/sonnet/));
+      expect(matched[0]).toMatchObject({ reason: exception,
+        ref: "Smarty-Pants-Inc/smarty-dev#11864", issue: "Smarty-Pants-Inc/smarty-dev#11864",
+        role: "task", model: concreteModel, lane: boundRootLane, host: os.hostname().split(".")[0],
+        grant_id: expect.any(String), thinking: result.thinking, run_id: result.id, time: expect.any(String),
+      });
 
       const otherBackend = setup([], [], undefined, { agentsConfig: {
         runner: "veda", modelPolicy: { requireReason: ["claude", "opus"] },
@@ -658,10 +776,10 @@ describe("model reason policy boundary (#11864)", () => {
       await expect(state.provider.invoke("run", { task: "Claude refusal", runner: "claude", model: "claude/haiku", transport: "process" }, context))
         .rejects.toThrow(/#2264|named exception/);
       expect(launch).not.toHaveBeenCalled();
-      const result = await state.provider.invoke("run", { task: "Claude exception", runner: "claude", model: "claude/haiku", opusReason: issueReason, transport: "process" }, context) as AgentRunRecord;
+      const result = await state.provider.invoke("run", { task: "Claude exception", runner: "claude", model: "claude-haiku-test", opusReason: issueReason, transport: "process" }, context) as AgentRunRecord;
       expect(result).toMatchObject({ status: "completed", model: expect.stringContaining("haiku"), modelReason: issueReason });
       expect(launch.mock.calls[0]![0].workerArguments).toEqual(expect.arrayContaining([
-        "--runner", "claude", "--model", "claude/haiku", "--model-reason", issueReason,
+        "--runner", "claude", "--model", "claude-haiku-test", "--model-reason", issueReason,
       ]));
     } finally { launch.mockRestore(); }
   });
@@ -1154,6 +1272,7 @@ const setup = (
   control?: FabricControlPlane,
   options?: {
     cwd?: string;
+    rootSessionCwd?: () => string | undefined;
     identity?: MeshIdentity;
     ownsRuntime?: boolean;
     hostId?: string;
@@ -1175,10 +1294,16 @@ const setup = (
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-agents-provider-"));
   roots.push(root);
   const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
-  // Private legacy-control fixture: #11864 is explicitly listed; #1 remains unlisted.
-  const modelExceptionsPath = options?.agentsConfig?.modelExceptionsPath ?? path.join(root, "model-exceptions.json");
-  if (!options?.agentsConfig?.modelExceptionsPath) fs.writeFileSync(modelExceptionsPath, JSON.stringify([{ ref: "smarty-dev#11864",
-    models: ["anthropic/claude", "cliproxyapi-anthropic/claude", "private/claude", "claude/", "sonnet", "opus", "veda/claude-code"], expires: "2999-01-01T00:00:00.000Z" }]));
+  const rootSessionRecord = { cwd: boundRootCwd };
+  // Private exact-key v1 controls: #11864 is listed; #1 remains unlisted.
+  // Only fixtures created here receive the test-only root-metadata seam.
+  const configuredExceptionPath = options?.agentsConfig?.modelExceptionsPath;
+  const useExceptionFixture = !configuredExceptionPath || configuredExceptionPath === MODEL_EXCEPTIONS_PATH;
+  const modelExceptionsPath = useExceptionFixture ? path.join(root, "model-exceptions.json") : configuredExceptionPath;
+  if (useExceptionFixture) {
+    writeProviderGrants(modelExceptionsPath);
+    trustedExceptionFixturePaths.add(modelExceptionsPath);
+  }
   const agents = new AgentManager(
     options?.cwd ?? process.cwd(),
     { ...DEFAULT_FABRIC_CONFIG.agents, ...options?.agentsConfig, modelExceptionsPath },
@@ -1188,6 +1313,7 @@ const setup = (
       vedaBinary: path.resolve("tests/fixtures/fake-veda.mjs"),
       runRoot: path.join(root, "runs"),
       hostId: options?.hostId ?? options?.identity?.id ?? "session:test",
+      rootSessionCwd: options?.rootSessionCwd ?? (() => rootSessionRecord.cwd),
       ...(options?.preparePiModel ? { preparePiModel: options.preparePiModel } : {}),
       ...(options?.onBackgroundComplete ? { onBackgroundComplete: options.onBackgroundComplete } : {}),
       ...(options?.onResultConsumed ? { onResultConsumed: options.onResultConsumed } : {}),
@@ -1262,7 +1388,7 @@ const setup = (
       runner: "pi",
       transport: "host",
       capabilities: ["steer", "followUp", "fabric"],
-      cwd: process.cwd(),
+      cwd: rootSessionRecord.cwd,
       sessionId: "test",
       startedAt: 1,
       updatedAt: 1,
@@ -2502,6 +2628,8 @@ afterEach(async () => {
   await Promise.all(controlPlanes.splice(0).map((control) => control.close()));
   await Promise.all(actorManagers.splice(0).map((manager) => manager.close()));
   await Promise.all(agentManagers.splice(0).map((manager) => manager.close()));
+  restoreAdmissionFixture?.();
+  restoreAdmissionFixture = undefined;
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 });
 
@@ -5356,10 +5484,12 @@ describe("AgentsProvider shared actor definitions", () => {
     const workerPath = path.resolve("tests/fixtures/fake-worker.mjs");
     const ownerAgents = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
       workerPath,
+      rootSessionCwd: () => boundRootCwd,
       runRoot: path.join(root, "owner-runs"),
     });
     const peerAgents = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
       workerPath,
+      rootSessionCwd: () => boundRootCwd,
       runRoot: path.join(root, "peer-runs"),
     });
     agentManagers.push(ownerAgents, peerAgents);
@@ -6728,8 +6858,9 @@ describe("AgentsProvider switchModel", () => {
     ).rejects.toThrow(/not available to this Pi session/);
   });
 
-  it("passes Claude and Veda model strings through unchanged", async () => {
-    const { provider, agents } = setup();
+  it("passes Claude and Veda model strings through unchanged with the reason-policy rollback", async () => {
+    // Opaque native strings are not grant keys; this compatibility control has no exception policy.
+    const { provider, agents } = setup([], [], undefined, { agentsConfig: { modelPolicy: { requireReason: [] } } });
     const spawn = vi.spyOn(agents, "spawn");
 
     await provider.invoke(

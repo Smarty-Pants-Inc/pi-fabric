@@ -1519,8 +1519,9 @@ export class ActorManager {
       this.agents.config.deniedModels.length === 0 && actor.routeClass === undefined &&
       (actor.runner === "pi" || actor.runner === "pi-durable") && next.includes("/") &&
       !this.agents.modelReasonRequired(next, actor.runner);
+    const thinking = scope === "session" ? this.#runBinding(actor).thinking : actor.thinking;
     const resolved = next
-      ? (await this.#resolvedRunBindingFor(actor.runner, { model: next, modelReason, modelSource: "explicit" }, actor.routeClass !== undefined, policyOnly,
+      ? (await this.#resolvedRunBindingFor(actor.runner, { model: next, modelReason, thinking, modelSource: "explicit" }, actor.routeClass !== undefined, policyOnly,
         `actor:${actor.name}`)).model
       : undefined;
     this.agents.assertModelAllowed(resolved);
@@ -1529,10 +1530,12 @@ export class ActorManager {
       const reason = scope === "session" ? actor.modelReason : this.#bindings.get(actor.id)?.modelReason;
       const fallback = inherited ?? this.agents.defaultModel(actor.runner);
       if (fallback) await this.#resolvedRunBindingFor(actor.runner, {
-        model: fallback, modelReason: reason,
+        model: fallback, modelReason: reason, thinking,
         modelSource: inherited ? "explicit" : "default",
       }, actor.routeClass !== undefined, false, `actor:${actor.name}`);
-      else await this.agents.prepareModelWithReason(undefined, reason, actor.runner, { modelSource: "default", role: `actor:${actor.name}` });
+      else await this.agents.prepareModelWithReason(undefined, reason, actor.runner, {
+        modelSource: "default", thinking, requiredPin: actor.routeClass !== undefined, role: `actor:${actor.name}`,
+      });
     }
     // Validate both the effective view and duplicated binding/default metadata before commit.
     const preview = scope === "project"
@@ -3510,7 +3513,9 @@ export class ActorManager {
     // Preflight only supplied overrides. Resolving an empty owner-defaults
     // override here would pin agents.model and shadow the stored session/project
     // binding (and its admitted exception reason) when drain layers the defaults.
-    const resolving = unresolved.model ? this.#resolvedRunBinding(actor, unresolved) : unresolved;
+    const admissionBinding = options.binding !== undefined ? unresolved
+      : { ...unresolved, thinking: unresolved.thinking ?? this.#runBinding(actor).thinking };
+    const resolving = unresolved.model ? this.#resolvedRunBinding(actor, admissionBinding) : unresolved;
     const binding = resolving instanceof Promise ? (resolving.catch(() => undefined), unresolved) : resolving;
     const sender = options.sender === null ? undefined : options.sender ?? processSender();
     const createdAt = Date.now();
@@ -7161,7 +7166,12 @@ export class ActorManager {
 
   #resolvedModel(runner: FabricAgentRunner, model: string, requiredPin = false): string | Promise<string> {
     this.agents.assertModelAllowed(model, runner);
-    const resolved = (runner === "pi" || runner === "pi-durable") && this.#resolvePiModel ? this.#resolvePiModel(model, requiredPin) : model;
+    const resolved = runner !== "pi" && runner !== "pi-durable"
+      ? this.agents.prepareModelForAdmission(model, runner).then(key => {
+        if (!key) throw new ModelRoutePinError(model);
+        return key;
+      })
+      : this.#resolvePiModel ? this.#resolvePiModel(model, requiredPin) : model;
     const admit = (key: string): string => { this.agents.assertModelAllowed(key, runner); return key; };
     return resolved instanceof Promise ? resolved.then(admit) : admit(resolved);
   }
@@ -7179,7 +7189,7 @@ export class ActorManager {
     const resolve = (key: string): string | Promise<string> => this.#resolvedModel(runner, key, requiredPin);
     const admit = (model: string | undefined): FabricActorRunBinding | Promise<FabricActorRunBinding> => {
       const admission = this.agents.resolveModelReasonPolicy(model, reason, runner, {
-        modelSource: source, thinking: binding.thinking,
+        modelSource: source, thinking: binding.thinking, requiredPin,
         resolveFallback: key => this.#resolvedModel(runner, key, true),
         ...(role !== undefined ? { role } : {}),
       });

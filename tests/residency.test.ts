@@ -22,7 +22,7 @@ import { ActionRegistry } from "../src/core/action-registry.js";
 import { createMainExecutionCeilingError } from "../src/async-settlement.js";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
-import { writeModelExceptions } from "./helpers/model-exceptions.js";
+import { modelExceptionGrant, withRootExceptionMetadata } from "./helpers/model-exceptions.js";
 import type { FabricMainAgentDeliveryRequest, FabricMainAgentTarget } from "../src/main-agent.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { ResidencyClient } from "../src/residency/client.js";
@@ -60,7 +60,19 @@ const fakeWorker = path.resolve("tests/fixtures/fake-worker.mjs");
 const hasResidentHost = fs.existsSync(hostPath);
 const roots: string[] = [];
 
-beforeEach(() => installInProcessResidentFence());
+const trustedExceptionFixturePaths = new Set<string>();
+const realAdmitModelException = AgentManager.prototype.admitModelException;
+let restoreAdmissionFixture: (() => void) | undefined;
+beforeEach(() => {
+  installInProcessResidentFence();
+  trustedExceptionFixturePaths.clear();
+  const admission = vi.spyOn(AgentManager.prototype, "admitModelException").mockImplementation(function (this: AgentManager, ...args) {
+    const file = this.config.modelExceptionsPath;
+    if (!file || !trustedExceptionFixturePaths.has(file)) return realAdmitModelException.apply(this, args);
+    return withRootExceptionMetadata(file, () => realAdmitModelException.apply(this, args));
+  });
+  restoreAdmissionFixture = () => admission.mockRestore();
+});
 
 const delay = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
@@ -309,6 +321,7 @@ afterEach(async () => {
     // writes: retry ENOTEMPTY briefly instead of failing the suite on a loaded runner.
     fs.rmSync(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
   }
+  restoreAdmissionFixture?.();
   if (stopFailures.length > 0) throw stopFailures[0];
 });
 
@@ -2843,8 +2856,9 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
   });
 
   it("resolves a model added to models.json after the resident host started, with no restart", { timeout: 60_000 }, async () => {
-    // pi-fabric#138: the resident host runs in its own Pi process; its registry, not the
-    // session's snapshot from host start, must discover the new exact id on ask and tell.
+    // pi-fabric#138: the resident host's own registry, not the session snapshot from
+    // host start, must discover the new exact id on ask and tell. The host is in-process
+    // solely to scope the metadata-only trust seam; registry/commands/worker execution are real.
     const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-resident-models-"));
     roots.push(agentDir);
     const modelsPath = path.join(agentDir, "models.json");
@@ -2861,12 +2875,17 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
     writeModels(["claude-late-5-5"]);
     vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
     const state = await rootHarness("resident-late-model");
-    state.config.agents.modelExceptionsPath = writeModelExceptions(agentDir, [
+    const boundRootRecord = state.participants.get(state.identity.id)!;
+    expect(boundRootRecord.kind).toBe("root");
+    expect(boundRootRecord.cwd).toBe(repo);
+    state.config.agents.modelExceptionsPath = path.join(agentDir, "model-exceptions.json");
+    fs.writeFileSync(state.config.agents.modelExceptionsPath, JSON.stringify({ version: 1, grants: [
       "probe-late/claude-late-5-5",
       "probe-late/claude-late-5-6",
       "probe-late/claude-late-5-7",
       "probe-missing/claude-late-5-9", // Preserve the unavailable-model rejection below.
-    ]);
+    ].map(model => modelExceptionGrant({ model, lane: path.basename(boundRootRecord.cwd), role: "actor:late-model-witness" })) }));
+    trustedExceptionFixturePaths.add(state.config.agents.modelExceptionsPath);
     state.config.piModels = {
       available: [{ provider: "probe-late", id: "claude-late-5-5" }],
       aliases: {},
@@ -2888,9 +2907,12 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
     control.start(() => ({ accepted: false }));
     const ownerPid = () =>
       (JSON.parse(fs.readFileSync(path.join(state.config.residencyRoot, "owner.json"), "utf8")) as ResidentHostOwner).pid;
+    // The private root-metadata seam is deliberately process-local, never a child override.
+    const host = new ResidentHost(state.config);
     try {
+      await host.start();
       const actor = await client.createActor({
-        name: "late model witness",
+        name: "late-model-witness",
         instructions: "Reply with the model of each run.",
         residency: "durable",
         runner: "pi",
@@ -2935,6 +2957,7 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
     } finally {
       await control.close();
       await client.close();
+      await host.close();
       await state.participants.close();
       await stopResident(state.config);
     }

@@ -79,6 +79,9 @@ type FabricActorScope = "project" | "session";
 
 export type FabricPythonRuntime = "cpython" | "monty";
 
+/** Fixed root-owned grant source; no config, environment, workspace, or agent directory may redirect it. */
+export const MODEL_EXCEPTIONS_PATH = "/etc/smarty/model-exceptions.json";
+
 /** Whether pi.powershell and extension powershell overrides may run (smarty-dev#9826). */
 export type FabricPowerShellPolicy = "refuse" | "allow";
 
@@ -255,10 +258,9 @@ export interface FabricAgentConfig {
   };
   deniedModelReplacement?: string;
   /**
-   * Internal trusted host path of `model-exceptions.json` (host/installer owned).
-   * Never read from any config file: normalize drops it and resolveFabricConfig
-   * injects `<agentDir>/model-exceptions.json`. Direct embedders may set it.
-   * Unset means no Claude/Opus exception can be admitted (fail closed).
+   * Internal trusted host path of `model-exceptions.json` (root-owned host source).
+   * Never read from any config file: normalization always uses MODEL_EXCEPTIONS_PATH.
+   * Direct embedders may set it, but every read validates the trusted source.
    */
   modelExceptionsPath?: string;
   /** Host-only file instructions root. Unset = ~/.local/share/smarty-dev/factory/current/. */
@@ -759,6 +761,7 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
     runner: "pi",
     transport: "process",
     deniedModels: [],
+    modelExceptionsPath: MODEL_EXCEPTIONS_PATH,
     modelPolicy: {
       requireReason: ["gpt-6-astra", "opus", "claude"],
       fallbackThinking: "high",
@@ -1565,6 +1568,7 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
             };
           })() }
         : {}),
+      modelExceptionsPath: MODEL_EXCEPTIONS_PATH,
       modelPolicy: {
         requireReason: [...new Set((Array.isArray(modelPolicy.requireReason)
           ? modelPolicy.requireReason as unknown[]
@@ -2287,7 +2291,7 @@ const resolveFabricConfig = (
   }
   const normalized = normalizeFabricConfig(merged);
   // Host-owned exceptions: no host/project config layer can supply or redirect them.
-  normalized.agents.modelExceptionsPath = path.resolve(options.agentDir, "model-exceptions.json");
+  normalized.agents.modelExceptionsPath = MODEL_EXCEPTIONS_PATH;
   if (applyEnvironmentOverrides && process.env[FABRIC_THINKING_BOUNDS_ENV] !== undefined) {
     // A child only narrows its own bounds by the parent's; never widens them.
     const inherited = inheritedThinkingBounds();

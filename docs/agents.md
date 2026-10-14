@@ -372,9 +372,9 @@ trusted profile may also set `modelPolicy.fallbackModel` and
 `fallbackThinking`; these are not root-policy rollback fields and the fallback
 model is not package-defaulted. Omitted `model`, inherited role or project
 defaults, Sol and other unlisted models are unaffected unless indirect
-resolution needs the configured fallback. Existing actors continue unchanged;
-an explicit `setModel` request needs its own exception. Aliases are tested as
-the explicitly requested selector, not their resolved target.
+resolution needs the configured fallback. Existing actors recheck grants on launch/resume;
+an explicit `setModel` request needs its own exception. Aliases resolve before
+exception admission; only the exact canonical target can match a grant.
 
 The reason is retained verbatim on run records and actor definitions/session
 bindings, and follows the effective binding into activation run records. Clearing
@@ -385,18 +385,88 @@ that names an issue (`#N`) or includes an issue URL. The `run.spawned` lifecycle
 event is emitted after actual worker registration (not queue admission) with
 `data.model` and, when supplied, `data.modelReason` for metering.
 
-A valid reason is not itself authority to use Claude/Opus. Before worker or
-actor-binding admission, Fabric freshly reads the host-owned
-`<agentDir>/model-exceptions.json`; only an unexpired matching issue reference,
-model prefix, and optional exact role (`task` or `actor:<name>`) admits the
-exception. Missing, malformed, expired, wrong-model, or wrong-role entries
-raise `FabricModelExceptionDeniedError` (`FABRIC_MODEL_EXCEPTION_DENIED`) before
-side effects. `#N` canonicalizes to `smarty-dev#N`; GitHub URLs count only for
-Smarty-Pants-Inc's repository issue URLs, not arbitrary URL fragments. Main's
-own model selection is unchanged. The path is internally derived from the
-normalized agent directory and cannot be supplied by either profile or project
-`fabric.json`. Test coverage keeps a separate finite host fixture for legacy
-`#11864` compatibility controls; it does not admit `#1`.
+A valid reason is the record, not authority to use Claude/Opus. The switch is
+one matching grant in the fixed host source `/etc/smarty/model-exceptions.json`:
+
+```json
+{
+  "version": 1,
+  "grants": [{
+    "id": "g-20261014-0001",
+    "issue": "Smarty-Pants-Inc/smarty-dev#12140",
+    "reason_url": "https://github.com/Smarty-Pants-Inc/smarty-dev/issues/12140#issuecomment-123",
+    "role": "task",
+    "lane": "fv2-1127fix",
+    "host": "intel1",
+    "model": "cliproxyapi-anthropic/claude-opus-5-5",
+    "thinking": "medium",
+    "granted_by": "model-economics-lead",
+    "granted_at": "2026-10-14T14:20:00Z",
+    "expires_at": "2026-10-17T14:20:00Z",
+    "status": "active"
+  }]
+}
+```
+
+Before worker or actor-binding admission, Fabric freshly reads this file. ONE
+active, unexpired grant must match the issue inside `modelReason`, the lane,
+short host name, exact role and exact canonical model, with effective thinking
+at or below the grant's ceiling. There are no model prefixes or alternate
+backend/provenance matches. Roles are `task`, `actor:<name>`, or `lane`; Fabric
+children are never leads. The lane is the cwd basename of the ROOT session's
+bound participant record, supplied by the host, not an environment variable,
+child cwd, request argument, manager cwd or project root. Missing root binding
+refuses with `lane-mismatch`. The host is `os.hostname().split('.')[0]`.
+Omitted thinking resolves to the actual effective host default, not low/off;
+child bounds clamp ordinary launches, while route-pin effort remains exact.
+
+The file must be a root-owned regular file of at most 1 MiB (normally mode
+`0644`), with no group/world write; every parent through `/` must also be
+root-owned and not group/world writable. The reader preserves `O_NOFOLLOW |
+O_NONBLOCK`, opened-fd `fstat`, bounded reads and stability checks. Provision
+only through the reviewed root runner (`smarty-rootops`); no config, agent
+directory, workspace or environment variable can redirect it. Unsupported
+Windows/ownership platforms admit no exceptions. Missing files use
+`file-unavailable`; unsafe metadata/symlinks use `untrusted-source`. Unknown
+versions, duplicate ids, ANY malformed entry, unknown status, invalid ISO
+date-time or non-increasing timestamps invalidate the whole file (`malformed`).
+TTL above 72 hours refuses with `expiry-too-long`; exactly 72 hours is valid.
+Set `status: "revoked"` to revoke (`revoked`). Expiration needs no file edit or
+sweep (`expired`). Other mismatch denials are `unlisted`, `lane-mismatch`,
+`host-mismatch`, `role-mismatch`, `model-mismatch` and `thinking-exceeds`, all
+through `FabricModelExceptionDeniedError` (`FABRIC_MODEL_EXCEPTION_DENIED`)
+before a worker is launched.
+
+Bare `#N` means `Smarty-Pants-Inc/smarty-dev#N`; `repo#N`,
+`Smarty-Pants-Inc/repo#N`, and that organization's GitHub issue URLs normalize
+to the same canonical issue. Foreign-owner references and arbitrary URL
+fragments cannot authorize. Leads and Main's own model selection are unchanged;
+the fleet default remains GPT-6.
+
+Each admitted launch appends once to
+`~/.local/state/smarty/route/opus-exceptions.jsonl`: `grant_id`, `issue`, `lane`,
+short `host`, `role`, canonical `model`, effective `thinking`, `run_id` and
+`time`. Audit uses the immutable approved grant, not another parse/read. Legacy
+`ts`, `ref`, `reason` and `launcher` remain; nonexception inherited-switch rows
+retain their old format. Audit failure is a warning, never an authority source.
+
+**Operator/lead request flow (event-driven, target under 10 minutes):** the
+launching lead publishes a mesh `ask` on `fleet.models.exception-request`,
+addressed to model-economics-lead's CURRENT session, with
+`{issue, reason_url, role, lane, host, model, thinking, requested_by}`.
+The lead reads the newest `kind: "announce"` on that topic immediately before
+sending; model-economics-lead publishes `data: {session}` at every start.
+Main cannot subscribe to a topic on this Fabric, and an unaddressed event
+wakes no one. Until [smarty-dev#11077](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/11077)
+installs name addressing, use that announced session, NOT
+`to: "model-economics-lead"`; after installation the name replaces the lookup.
+No extra actor is needed. model-economics-lead replies on the same topic with `kind: "answer"`,
+`to: requested_by`, and `{grant_id}` or `{refused: reason}`. A lane waiting more
+than 10 minutes alarms chief-of-staff. This is the lead/operator workflow, not
+an automatic denial transport or a new actor. The band file
+`~/.local/state/smarty/models/claude-band.json` is an untrusted meter, NEVER an
+admission authority. The launcher reader of this same v1 format is tracked in
+[smarty-dev#12389](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/12389).
 
 Decision C keeps the process-backed fake-worker integration: it proves a denied
 request produces no worker launch and a matching host exception completes the
@@ -748,7 +818,7 @@ return agents.run({
 
 With no active host policy, Fabric forwards Veda model values unchanged to the selected backend. Use `agents.veda.model` to set a backend-specific default. An explicit `agents.run({ model })` value has priority. If you omit both values and the host deny-list is empty, Veda selects its own backend default. Under an active host deny policy, Fabric refuses unknown defaults, aliases and bare selectors before queueing or durable submission; select `agents.veda.backend: "pi"` and configure `agents.veda.model` or pass an exact allowed `provider/model` present in the Pi registry. Other Veda backends are refused because their actual target cannot be established. The admitted concrete selection is forwarded to Veda. Personas do not depend on models.
 
-When `agents.veda.backend` is `claude-code`, the Claude/Opus `modelPolicy.requireReason` guard also applies to Veda's backend default and opaque selectors such as `sonnet`; this is independent of the host deny-list. An absent model or a selector Fabric cannot resolve is not evidence that the backend's eventual target is safe: supply an issue-bearing `modelReason` or choose a backend/model whose target can be verified. Veda still receives admitted aliases unchanged. The exception receipt/notice and seven-field audit row identify the backend-qualified selector (`veda/claude-code/<backend-default>` when no selector was supplied, otherwise the normalized selector) and issue/reason; they do not claim a model ID resolved inside Claude Code. This is evidence of the exception decision, not proof of the concrete model used. Other and unrecognized Veda backends retain their existing pass-through behavior; Fabric must not imply it knows what model their own defaults select. Add custom personas at `~/.config/veda/personas/<name>/AGENTS.md`. Set the global default with `agents.veda.persona`, or select a persona for one run with `agents.run({ persona })`. `agents.models({ runner: "veda" })` currently returns an empty advisory list. Fabric normalizes usage (`inputTokens`/`outputTokens`/`cachedTokens`), backend conversation ID, turns, and errors from the Veda `--json` envelope. The data appears in the standard Fabric result, dashboard, lifecycle events, and budget ledger.
+When `agents.veda.backend` is `claude-code`, the Claude/Opus `modelPolicy.requireReason` guard applies independently of the deny-list. A reason alone cannot admit a backend default or opaque selector such as `sonnet`: exception admission requires one exact concrete `provider/model` confirmed by the host registry and a matching v1 grant. Native Claude requires a known concrete catalog target. Workers receive the canonical admitted selector; neither a backend-qualified provenance alternate nor a model prefix can match the grant. Audit records the approved canonical selector and effective thinking, not an inferred backend default. Other and unrecognized Veda backends retain their existing pass-through behavior; Fabric must not imply it knows what model their own defaults select. Add custom personas at `~/.config/veda/personas/<name>/AGENTS.md`. Set the global default with `agents.veda.persona`, or select a persona for one run with `agents.run({ persona })`. `agents.models({ runner: "veda" })` currently returns an empty advisory list. Fabric normalizes usage (`inputTokens`/`outputTokens`/`cachedTokens`), backend conversation ID, turns, and errors from the Veda `--json` envelope. The data appears in the standard Fabric result, dashboard, lifecycle events, and budget ledger.
 
 For each run, Fabric passes `--tools <allowlist>`. It passes `--no-tools` for an empty allowlist. This setting has priority over tool frontmatter in the persona. The built-in read-only personas specify `tools: none`. The `worker` persona specifies `tools: all` with `sandbox: workspace-write`. Fabric does not pass `--sandbox`, so persona frontmatter defines the sandbox, and `worker` agents can change files. The `navigator-plan` persona also requires a `<program>` design block, and `worker` requires a `<worker_report>`. A failure in either protocol appears as a run error, so `navigator-chat` is the default for free-form tasks.
 

@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { appendOpusPolicyLog, canonicalIssueReferences, isClaudeModel, opusIssueReference } from "../src/agents/model-policy-log.js";
+import { modelExceptionGrant } from "./helpers/model-exceptions.js";
 
 const probe = vi.hoisted(() => ({
   mkdirSync: vi.fn(), openSync: vi.fn(), writeSync: vi.fn(), closeSync: vi.fn(),
@@ -60,12 +61,15 @@ describe("Opus policy issue-reference trust boundary", () => {
 
 describe("canonical host-exception issue references", () => {
   it.each([
-    ["#1", ["smarty-dev#1"]],
-    ["bounded reason #11864", ["smarty-dev#11864"]],
-    ["smarty-dev#42", ["smarty-dev#42"]],
-    ["pi-fabric#7", ["pi-fabric#7"]],
-    ["https://github.com/Smarty-Pants-Inc/smarty-dev/issues/314", ["smarty-dev#314"]],
-    ["https://github.com/Smarty-Pants-Inc/pi-fabric/issues/314#discussion", ["pi-fabric#314"]],
+    ["#1", ["Smarty-Pants-Inc/smarty-dev#1"]],
+    ["bounded reason #11864", ["Smarty-Pants-Inc/smarty-dev#11864"]],
+    ["smarty-dev#42", ["Smarty-Pants-Inc/smarty-dev#42"]],
+    ["pi-fabric#7", ["Smarty-Pants-Inc/pi-fabric#7"]],
+    ["Smarty-Pants-Inc/pi-fabric#7", ["Smarty-Pants-Inc/pi-fabric#7"]],
+    ["https://github.com/Smarty-Pants-Inc/smarty-dev/issues/314", ["Smarty-Pants-Inc/smarty-dev#314"]],
+    ["https://github.com/Smarty-Pants-Inc/pi-fabric/issues/314#discussion", ["Smarty-Pants-Inc/pi-fabric#314"]],
+    ["#1 then smarty-dev#1 then Smarty-Pants-Inc/pi-fabric#2", ["Smarty-Pants-Inc/smarty-dev#1", "Smarty-Pants-Inc/pi-fabric#2"]],
+    ["Other-Org/smarty-dev#314", []],
     ["https://tracker.example/docs/#123", []],
     ["https://github.com/other-org/smarty-dev/issues/314", []],
     ["https://github.com/Smarty-Pants-Inc/smarty-dev/pull/314", []],
@@ -120,6 +124,50 @@ describe("Opus exception data-safe audit call probe", () => {
     expect(Date.parse(record.ts)).toBeGreaterThanOrEqual(before);
     expect(Date.parse(record.ts)).toBeLessThanOrEqual(after);
     expect(probe.closeSync).toHaveBeenCalledExactlyOnceWith(41);
+  });
+
+  it("records the approved grant snapshot and actual launch effort in one append", () => {
+    const grant = Object.freeze(modelExceptionGrant({
+      id: "g-audit-approved", issue: "Smarty-Pants-Inc/smarty-dev#123",
+      model: input.model, lane: "bound-root-lane", role: "actor:reviewer",
+      host: "admitted-host", thinking: "high",
+    }));
+    probe.hostname.mockReturnValue("current-host.changed.invalid");
+    const before = Date.now();
+    expect(appendOpusPolicyLog({ ...input, ref: grant.issue, role: grant.role,
+      grant, thinking: "medium", runId: "run-approved-123",
+    })).toBeUndefined();
+    const after = Date.now();
+    expect(calls).toEqual(["mkdir", "open", "write", "close"]);
+    expect(probe.writeSync).toHaveBeenCalledTimes(1);
+    const [fd, line, ...extra] = probe.writeSync.mock.calls[0]!;
+    expect(fd).toBe(41);
+    expect(extra).toEqual([]);
+    expect(Buffer.isBuffer(line)).toBe(true);
+    const text = (line as Buffer).toString("utf8");
+    expect(text.split("\n")).toHaveLength(2);
+    const record = JSON.parse(text);
+    expect(record).toEqual({
+      ts: expect.any(String), time: expect.any(String), launcher: "fabric",
+      ref: grant.issue, issue: grant.issue, reason: input.reason, grant_id: grant.id,
+      lane: grant.lane, host: grant.host, role: grant.role, model: grant.model,
+      thinking: "medium", run_id: "run-approved-123",
+    });
+    expect(record.time).toBe(record.ts);
+    expect(Date.parse(record.time)).toBeGreaterThanOrEqual(before);
+    expect(Date.parse(record.time)).toBeLessThanOrEqual(after);
+    expect(probe.closeSync).toHaveBeenCalledExactlyOnceWith(41);
+  });
+
+  it.each([
+    {}, { thinking: "medium" as const }, { runId: "run-without-effort" },
+    { thinking: "medium" as const, runId: "" },
+  ])("refuses an incomplete exception audit before opening a file (%j)", launch => {
+    const grant = modelExceptionGrant({ model: input.model, lane: "bound-root-lane" });
+    expect(appendOpusPolicyLog({ ...input, grant, ...launch })).toMatch(/Opus policy audit log .*failed/);
+    expect(calls).toEqual([]);
+    expect(probe.openSync).not.toHaveBeenCalled();
+    expect(probe.writeSync).not.toHaveBeenCalled();
   });
 
   it("records refusal context with null ref and safely escapes newlines/Unicode", () => {

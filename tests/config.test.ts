@@ -1,9 +1,10 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   DEFAULT_FABRIC_CONFIG,
+  MODEL_EXCEPTIONS_PATH,
   MAX_EXECUTOR_MEMORY_LIMIT_BYTES,
   MAX_EXECUTOR_TIMEOUT_MS,
   QUICKJS_MAX_MEMORY_LIMIT_BYTES,
@@ -14,6 +15,7 @@ import {
   normalizeFabricConfig,
   saveFabricConfig,
 } from "../src/config.js";
+import { modelExceptionGrant } from "./helpers/model-exceptions.js";
 
 const temporaryDirectories: string[] = [];
 const originalCompactionEngineEnv = process.env.PI_FABRIC_COMPACTION_ENGINE;
@@ -25,6 +27,7 @@ const temporaryDirectory = (): string => {
 };
 
 afterEach(() => {
+  vi.unstubAllEnvs();
   for (const directory of temporaryDirectories.splice(0)) {
     fs.rmSync(directory, { recursive: true, force: true });
   }
@@ -119,25 +122,50 @@ describe("fleet model policy configuration (#2490)", () => {
 });
 
 describe("host-only model exception file location", () => {
-  it("derives the host exception file only from the normalized agent directory", () => {
+  it.each(["user", "profile"] as const)("pins the root-owned exception file regardless of %s directory, config, workspace or environment", source => {
     const cwd = temporaryDirectory();
-    const agentDir = temporaryDirectory();
-    const redirected = temporaryDirectory();
+    const root = temporaryDirectory();
+    const agentDir = source === "profile" ? path.join(root, "profiles", "work") : root;
+    fs.mkdirSync(agentDir, { recursive: true });
+    const redirected = path.join(temporaryDirectory(), "attacker-grants.json");
+    vi.stubEnv("PI_FABRIC_MODEL_EXCEPTIONS_PATH", redirected);
+    vi.stubEnv("MODEL_EXCEPTIONS_PATH", redirected);
     fs.mkdirSync(path.join(cwd, ".pi"));
-    fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({ agents: { modelExceptionsPath: redirected } }));
+    const attackerDocument = { version: 1, grants: [modelExceptionGrant({
+      issue: "Smarty-Pants-Inc/smarty-dev#1", model: "cliproxyapi-anthropic/claude-opus-5-5",
+      lane: path.basename(cwd),
+    })] };
+    fs.writeFileSync(path.join(agentDir, "model-exceptions.json"), JSON.stringify(attackerDocument));
+    fs.writeFileSync(redirected, JSON.stringify(attackerDocument));
+    fs.writeFileSync(path.join(cwd, ".pi", "model-exceptions.json"), JSON.stringify(attackerDocument));
+    fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({ agents: {
+      modelExceptionsPath: redirected,
+      modelExceptions: attackerDocument.grants,
+      rootSessionCwd: cwd, lane: path.basename(cwd), host: os.hostname().split(".")[0],
+    } }));
     fs.writeFileSync(path.join(cwd, ".pi", "fabric.json"), JSON.stringify({ agents: {
       modelExceptionsPath: redirected,
-      modelExceptions: [{ ref: "#1", models: ["claude"] }],
+      modelExceptions: attackerDocument.grants,
+      rootSessionCwd: cwd, lane: path.basename(cwd), host: os.hostname().split(".")[0],
     } }));
 
     for (const projectTrusted of [true, false]) {
-      const loaded = loadFabricConfig({ cwd, agentDir, projectTrusted });
-      expect(loaded.agents.modelExceptionsPath).toBe(path.resolve(agentDir, "model-exceptions.json"));
-      expect(loaded.agents).not.toHaveProperty("modelExceptions");
+      const options = { cwd, agentDir, projectTrusted };
+      const loadedConfigs = [loadFabricConfig(options), loadGlobalFabricConfig(agentDir),
+        loadFabricConfigForScope(options, "global"),
+        ...(projectTrusted ? [loadFabricConfigForScope(options, "project")] : [])];
+      loadedConfigs.map(loaded => {
+        expect(loaded.agents.modelExceptionsPath).toBe("/etc/smarty/model-exceptions.json");
+        expect(loaded.agents).not.toHaveProperty("modelExceptions");
+        expect(loaded.agents).not.toHaveProperty("rootSessionCwd");
+        expect(loaded.agents).not.toHaveProperty("lane");
+        expect(loaded.agents).not.toHaveProperty("host");
+      });
       expect(normalizeFabricConfig({ agents: { modelExceptionsPath: redirected } }).agents.modelExceptionsPath)
-        .toBeUndefined();
+        .toBe("/etc/smarty/model-exceptions.json");
     }
-    expect(DEFAULT_FABRIC_CONFIG.agents).not.toHaveProperty("modelExceptionsPath");
+    expect(MODEL_EXCEPTIONS_PATH).toBe("/etc/smarty/model-exceptions.json");
+    expect(DEFAULT_FABRIC_CONFIG.agents.modelExceptionsPath).toBe(MODEL_EXCEPTIONS_PATH);
   });
 });
 

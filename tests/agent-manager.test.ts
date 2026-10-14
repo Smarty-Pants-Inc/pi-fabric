@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
-import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { senderHeaderHookPath } from "../src/guards/sender-headers.js";
 import type { FabricLifecyclePublishRequest } from "../src/lifecycle/types.js";
@@ -25,16 +25,37 @@ import {
 import type { AgentRunRecord, AgentRunResult } from "../src/agents/types.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 import { buildVedaArguments } from "../src/agents/veda-cli.js";
+import { modelExceptionGrant, withRootExceptionMetadata, writeModelExceptions } from "./helpers/model-exceptions.js";
 
+const ProductionAgentManager = AgentManager;
 const managers: AgentManager[] = [];
 const roots: string[] = [];
 // Private legacy-control fixture: only #11864 is listed; #1 remains unlisted.
 const legacyExceptionRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-agent-manager-exceptions-"));
-const legacyExceptionPath = path.join(legacyExceptionRoot, "model-exceptions.json");
-fs.writeFileSync(legacyExceptionPath, JSON.stringify([{ ref: "smarty-dev#11864",
-  models: ["anthropic/claude", "cliproxyapi-anthropic/claude", "private/claude", "claude/", "sonnet", "opus", "veda/claude-code"], expires: "2999-01-01T00:00:00.000Z" }]));
+const boundRootRecord = Object.freeze({ cwd: legacyExceptionRoot });
+const legacyExceptionPath = writeModelExceptions(legacyExceptionRoot, [
+  "anthropic/claude-opus-5-5",
+  "cliproxyapi-anthropic/claude-opus-5-5",
+  "claude-haiku-test",
+  "claude-sonnet-test",
+  "anthropic/claude-sonnet-4-5",
+]);
 const originalModelExceptionsPath = DEFAULT_FABRIC_CONFIG.agents.modelExceptionsPath;
 DEFAULT_FABRIC_CONFIG.agents.modelExceptionsPath = legacyExceptionPath;
+const hasPosixTrustMetadata = process.platform !== "win32" && typeof process.getuid === "function";
+const trustedExceptionFixturePaths = new Set<string>();
+const realAdmitModelException = AgentManager.prototype.admitModelException;
+let restoreAdmissionFixture: (() => void) | undefined;
+beforeEach(() => {
+  trustedExceptionFixturePaths.clear();
+  trustedExceptionFixturePaths.add(legacyExceptionPath);
+  const admission = vi.spyOn(AgentManager.prototype, "admitModelException").mockImplementation(function (this: AgentManager, ...args) {
+    const file = this.config.modelExceptionsPath;
+    if (!file || !trustedExceptionFixturePaths.has(file)) return realAdmitModelException.apply(this, args);
+    return withRootExceptionMetadata(file, () => realAdmitModelException.apply(this, args));
+  });
+  restoreAdmissionFixture = () => admission.mockRestore();
+});
 type FabricSurfaceResult = AgentRunResult & {
   fullCodeMode?: string;
   tools?: string[];
@@ -129,6 +150,7 @@ describe("effectiveAgentTimeoutMs", () => {
 
 afterEach(async () => {
   await Promise.all(managers.splice(0).map((manager) => manager.close()));
+  restoreAdmissionFixture?.();
   // ponytail: on Windows a just-exited child can still hold its cwd (EBUSY on rmdir);
   // Node retries EBUSY/ENOTEMPTY/EPERM with backoff when maxRetries is set (smarty-dev#883).
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
@@ -314,10 +336,11 @@ describe("AgentManager fleet model admission (#2490)", () => {
     const preparePiModel = vi.fn(async (model: string | undefined) => model);
     const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, deniedModels: ["cliproxyapi/gpt-6-astra"],
       veda: { ...DEFAULT_FABRIC_CONFIG.agents.veda, backend: "pi" },
-    }, { workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), claudeBinary: path.resolve("tests/fixtures/fake-claude.mjs"), runRoot: root, preparePiModel }); managers.push(manager);
+    }, { rootSessionCwd: () => boundRootRecord.cwd, workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), claudeBinary: path.resolve("tests/fixtures/fake-claude.mjs"), runRoot: root, preparePiModel }); managers.push(manager);
     const veda = await manager.run({ task: "allowed concrete", runner: "veda", model: "veda/cliproxyapi/gpt-6.1-sol", transport: "process" });
     expect(veda).toMatchObject({ status: "completed", model: "cliproxyapi/gpt-6.1-sol" });
     expect(preparePiModel).toHaveBeenCalledWith("cliproxyapi/gpt-6.1-sol");
+    if (!hasPosixTrustMetadata) return; // Only the positive Claude compatibility control is POSIX-only.
     const claude = await manager.run({ task: "allowed alias", runner: "claude", model: "claude/haiku", modelReason: "Named Claude backend compatibility probe #11864", transport: "process" });
     expect(claude).toMatchObject({ status: "completed", model: "claude-haiku-test" });
   });
@@ -337,14 +360,21 @@ describe("AgentManager fleet model admission (#2490)", () => {
     } finally { launch.mockRestore(); catalog.mockRestore(); }
   });
 
-  it.each(["veda", "claude"] as const)("round 5 F5 leaves %s backend aliases unchanged with no policy", async runner => {
+  it.each(["veda", "claude"] as const)("round 5 F5 keeps Veda aliases unchanged but refuses an unresolvable Claude alias", async runner => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-f5-no-policy-")); roots.push(root);
     const preparePiModel = vi.fn(async (model: string | undefined) => model);
-    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, deniedModels: [] }, { workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root, preparePiModel }); managers.push(manager);
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, deniedModels: [] }, { rootSessionCwd: () => boundRootRecord.cwd, claudeBinary: path.resolve("tests/fixtures/fake-claude.mjs"), workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root, preparePiModel }); managers.push(manager);
     const catalog = vi.spyOn(manager, "claudeModels");
     try {
-      expect(await manager.run({ task: "legacy alias", runner, model: "backend-shortcut", ...(runner === "claude" ? { modelReason: "Named Claude backend compatibility probe #11864" } : {}), transport: "process" })).toMatchObject({ status: "completed", model: "backend-shortcut" });
-      expect(preparePiModel).not.toHaveBeenCalled(); expect(catalog).not.toHaveBeenCalled();
+      if (runner === "claude") {
+        await expect(manager.run({ task: "legacy alias", runner, model: "backend-shortcut", modelReason: "Named Claude backend compatibility probe #11864", transport: "process" }))
+          .rejects.toMatchObject({ code: "FABRIC_MODEL_EXCEPTION_DENIED", denial: "model-mismatch" });
+        expect(catalog).toHaveBeenCalledOnce();
+      } else {
+        expect(await manager.run({ task: "legacy alias", runner, model: "backend-shortcut", transport: "process" })).toMatchObject({ status: "completed", model: "backend-shortcut" });
+        expect(catalog).not.toHaveBeenCalled();
+      }
+      expect(preparePiModel).not.toHaveBeenCalled();
     } finally { catalog.mockRestore(); }
   });
 
@@ -374,7 +404,7 @@ describe("AgentManager fleet model admission (#2490)", () => {
     const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, runner, deniedModels: [denied], budgetUsd: 0, maxConcurrent: 1,
       claude: { ...DEFAULT_FABRIC_CONFIG.agents.claude, ...(runner === "claude" ? { model: selector } : {}) },
       veda: { ...DEFAULT_FABRIC_CONFIG.agents.veda, backend: "pi", ...(runner === "veda" ? { model: selector } : {}) },
-    }, { workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root, preparePiModel: async model => model, claudeBinary: path.resolve("tests/fixtures/fake-claude.mjs") });
+    }, { rootSessionCwd: () => boundRootRecord.cwd, workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root, preparePiModel: async model => model, claudeBinary: path.resolve("tests/fixtures/fake-claude.mjs") });
     managers.push(manager);
     const launch = vi.spyOn(ProcessTransport.prototype, "launch");
     try {
@@ -384,6 +414,7 @@ describe("AgentManager fleet model admission (#2490)", () => {
       expect(manager.list()).toEqual([]);
       expect(launch).not.toHaveBeenCalled();
       expect(fs.readdirSync(root).filter((entry) => fs.statSync(path.join(root, entry)).isDirectory())).toEqual([]);
+      if (runner === "claude" && !hasPosixTrustMetadata) return; // All deny assertions above remain unconditional.
       const allowed = await manager.run({ task: "allowed control", model: runner === "veda" ? "veda/cliproxyapi/gpt-6.1-sol" : "claude/haiku", ...(runner === "claude" ? { modelReason: "Named Claude control for deny-policy probe #11864" } : {}), transport: "process" });
       expect(allowed.status).toBe("completed");
       expect(launch).toHaveBeenCalledTimes(1);
@@ -413,7 +444,9 @@ describe("resolved manager policy (#11864)", () => {
   const luna = "cliproxyapi/gpt-6-luna";
   const issueReason = "Named exception for the direct manager boundary #11864";
   const makeManager = (root: string, overrides: Partial<typeof DEFAULT_FABRIC_CONFIG.agents> = {}, preparePiModel?: (model: string | undefined) => Promise<string | void>) => {
-    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, ...overrides }, {
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0,
+      claude: { ...DEFAULT_FABRIC_CONFIG.agents.claude, model: "claude/haiku" }, ...overrides }, {
+      rootSessionCwd: () => boundRootRecord.cwd,
       workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
       claudeBinary: path.resolve("tests/fixtures/fake-claude.mjs"),
       runRoot: root,
@@ -472,11 +505,13 @@ describe("resolved manager policy (#11864)", () => {
         .rejects.toThrow(/issue reference|#11864|#2264/i);
       expect(manager.list()).toEqual([]);
       expect(launch).not.toHaveBeenCalled();
+      if (!hasPosixTrustMetadata) return; // Preserve the negative alias assertions on every platform.
       const accepted = await manager.run({ task: "issue-bearing alias", model: "provider/harmless-shortcut", opusReason: issueReason, transport: "process" });
       expect(accepted).toMatchObject({ status: "completed", model: opus, modelReason: issueReason });
       expect(launch).toHaveBeenCalledOnce();
       expect(launch.mock.calls[0]![0].workerArguments).toEqual(expect.arrayContaining(["--model", opus, "--model-reason", issueReason]));
-      expect(readAudit(issueReason)).toMatchObject({ model: opus, ref: "smarty-dev#11864", reason: issueReason, role: expect.any(String), ts: expect.stringMatching(/^\d{4}-\d\d-\d\dT/) });
+      expect(readAudit(issueReason)).toMatchObject({ model: opus, ref: "Smarty-Pants-Inc/smarty-dev#11864", reason: issueReason, role: expect.any(String), ts: expect.stringMatching(/^\d{4}-\d\d-\d\dT/),
+        grant_id: expect.any(String), issue: "Smarty-Pants-Inc/smarty-dev#11864", lane: path.basename(boundRootRecord.cwd), host: os.hostname().split(".")[0], thinking: expect.any(String), run_id: accepted.id, time: expect.any(String) });
     } finally { launch.mockRestore(); }
   });
 
@@ -502,15 +537,31 @@ describe("resolved manager policy (#11864)", () => {
         .rejects.toThrow(/requires (?:modelReason|opusReason).*#2264/);
       expect(manager.list()).toEqual([]);
       expect(launch).not.toHaveBeenCalled();
+      if (!hasPosixTrustMetadata) return; // The missing-reason refusal above still runs.
       const reason = "Named Claude-runner exception #11864";
       const result = await manager.run({ task: "Claude with issue", runner: "claude", modelReason: reason, transport: "process" });
       expect(result).toMatchObject({ status: "completed", runner: "claude", modelReason: reason });
       expect(launch).toHaveBeenCalledOnce();
-      expect(readAudit(reason)).toMatchObject({ model: expect.stringContaining("claude"), ref: "smarty-dev#11864", reason, role: expect.any(String), ts: expect.stringMatching(/^\d{4}-\d\d-\d\dT/) });
+      expect(readAudit(reason)).toMatchObject({ model: expect.stringContaining("claude"), ref: "Smarty-Pants-Inc/smarty-dev#11864", reason, role: expect.any(String), ts: expect.stringMatching(/^\d{4}-\d\d-\d\dT/),
+        grant_id: expect.any(String), issue: "Smarty-Pants-Inc/smarty-dev#11864", lane: path.basename(boundRootRecord.cwd), host: os.hostname().split(".")[0], thinking: expect.any(String), run_id: result.id, time: expect.any(String) });
     } finally { launch.mockRestore(); }
   });
 
-  it("F-01 guards Veda Claude-code defaults and short aliases through manager admission and receipts", async () => {
+  it("refuses an unspecified Claude backend whose catalog cannot establish a canonical target", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-claude-opaque-default-")); roots.push(root);
+    const manager = makeManager(root, { claude: { binary: DEFAULT_FABRIC_CONFIG.agents.claude.binary } });
+    const catalog = vi.spyOn(manager, "claudeModels").mockResolvedValue([
+      { value: "default", resolvedModel: "default", resolvedModelKnown: false, displayName: "Unknown account default", description: "Unresolved" },
+    ]);
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    try {
+      await expect(manager.spawn({ task: "unknown native default", runner: "claude", modelReason: "Unknown Claude default #11864", transport: "process" }))
+        .rejects.toMatchObject({ code: "FABRIC_MODEL_EXCEPTION_DENIED", denial: "model-mismatch" });
+      expect(manager.list()).toEqual([]); expect(launch).not.toHaveBeenCalled();
+    } finally { launch.mockRestore(); catalog.mockRestore(); }
+  });
+
+  it("F-01 refuses opaque Veda defaults/aliases and admits registry-confirmed concrete selectors", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-veda-claude-policy-")); roots.push(root);
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-veda-claude-home-")); roots.push(home);
     const homedir = vi.spyOn(os, "homedir").mockReturnValue(home);
@@ -518,8 +569,9 @@ describe("resolved manager policy (#11864)", () => {
       runner: "veda",
       veda: { ...DEFAULT_FABRIC_CONFIG.agents.veda, backend: "claude-code" },
       modelPolicy: { requireReason: ["claude", "opus"] },
-    });
+    }, async model => model);
     const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    const concrete = "anthropic/claude-sonnet-4-5";
     const reason = "#11864 bounded Veda Claude-code exception";
     try {
       for (const request of [
@@ -534,20 +586,24 @@ describe("resolved manager policy (#11864)", () => {
       expect(launch).not.toHaveBeenCalled();
       expect(fs.readdirSync(root)).toEqual([]);
 
-      const defaultReason = "#11864 named exception for Veda's backend default";
-      const acceptedDefault = await manager.run({ task: "issue-bearing Veda backend default", modelReason: defaultReason, transport: "process" });
-      expect(acceptedDefault).toMatchObject({ status: "completed", runner: "veda", modelReason: defaultReason,
-        warnings: expect.arrayContaining([expect.stringMatching(/veda\/claude-code\/<backend-default>/)]) });
+      for (const model of [undefined, "sonnet"]) await expect(manager.spawn({ task: "unsafe issue-bearing opaque selector", ...(model ? { model } : {}), modelReason: reason, transport: "process" }))
+        .rejects.toMatchObject({ code: "FABRIC_MODEL_EXCEPTION_DENIED", denial: "model-mismatch" });
+      if (!hasPosixTrustMetadata) return; // All missing-reason/default/alias refusals above still run.
+      const defaultReason = "#11864 named exception for a concrete Veda backend target";
+      manager.config.veda.model = concrete;
+      const acceptedDefault = await manager.run({ task: "issue-bearing concrete Veda configured default", modelReason: defaultReason, transport: "process" });
+      expect(acceptedDefault).toMatchObject({ status: "completed", runner: "veda", model: concrete, modelReason: defaultReason,
+        warnings: expect.arrayContaining([expect.stringContaining(`veda/claude-code/${concrete}`)]) });
       const defaultArgv = launch.mock.calls[0]![0].workerArguments;
       expect(defaultArgv).toEqual(expect.arrayContaining(["--runner", "veda", "--model-reason", defaultReason]));
-      expect(defaultArgv).not.toContain("--model");
+      expect(defaultArgv).toEqual(expect.arrayContaining(["--model", concrete]));
 
-      const accepted = await manager.run({ task: "issue-bearing Veda alias", model: "sonnet", modelReason: reason, transport: "process" });
-      expect(accepted).toMatchObject({ status: "completed", runner: "veda", model: "sonnet", modelReason: reason,
-        warnings: expect.arrayContaining([expect.stringMatching(/veda\/claude-code\/sonnet/)]) });
+      const accepted = await manager.run({ task: "issue-bearing Veda concrete selector", model: concrete, modelReason: reason, transport: "process" });
+      expect(accepted).toMatchObject({ status: "completed", runner: "veda", model: concrete, modelReason: reason,
+        warnings: expect.arrayContaining([expect.stringContaining(`veda/claude-code/${concrete}`)]) });
       expect(launch).toHaveBeenCalledTimes(2);
       expect(launch.mock.calls[1]![0].workerArguments).toEqual(expect.arrayContaining([
-        "--runner", "veda", "--model", "sonnet", "--model-reason", reason,
+        "--runner", "veda", "--model", concrete, "--model-reason", reason,
       ]));
       expect(manager.status(accepted.id).modelReason).toBe(reason);
       const auditFile = path.join(home, ".local", "state", "smarty", "route", "opus-exceptions.jsonl");
@@ -556,15 +612,16 @@ describe("resolved manager policy (#11864)", () => {
       const defaultRows = rows.filter(row => row.reason === defaultReason);
       expect(matching).toHaveLength(1);
       expect(defaultRows).toHaveLength(1);
-      expect(Object.keys(matching[0]!).sort()).toHaveLength(7);
-      expect(matching[0]).toMatchObject({ ref: "smarty-dev#11864", reason, role: expect.any(String), ts: expect.stringMatching(/^\d{4}-\d\d-\d\dT/) });
-      expect(matching[0]!.model).toEqual(expect.stringMatching(/veda\/claude-code\/sonnet/));
-      expect(defaultRows[0]!.model).toEqual(expect.stringMatching(/veda\/claude-code\/<backend-default>/));
+      expect(Object.keys(matching[0]!).sort()).toEqual(["grant_id", "host", "issue", "lane", "launcher", "model", "reason", "ref", "role", "run_id", "thinking", "time", "ts"]);
+      expect(matching[0]).toMatchObject({ ref: "Smarty-Pants-Inc/smarty-dev#11864", reason, role: expect.any(String), ts: expect.stringMatching(/^\d{4}-\d\d-\d\dT/),
+        grant_id: expect.any(String), issue: "Smarty-Pants-Inc/smarty-dev#11864", lane: path.basename(boundRootRecord.cwd), host: os.hostname().split(".")[0], thinking: expect.any(String), run_id: accepted.id, time: expect.any(String) });
+      expect(matching[0]!.model).toBe(concrete);
+      expect(defaultRows[0]!.model).toBe(concrete);
     } finally { launch.mockRestore(); homedir.mockRestore(); }
   });
 
   it.each([
-    ["veda/sonnet", "sonnet"],
+    ["veda/anthropic/claude-sonnet-4-5", "anthropic/claude-sonnet-4-5"],
     ["VEDA/sonnet", "VEDA/sonnet"],
   ])("F-01-D1 keeps Veda selector attribution aligned with CLI normalization (%s)", async (model, cliModel) => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-veda-d1-")); roots.push(root);
@@ -574,27 +631,35 @@ describe("resolved manager policy (#11864)", () => {
       runner: "veda",
       veda: { ...DEFAULT_FABRIC_CONFIG.agents.veda, backend: "claude-code" },
       modelPolicy: { requireReason: ["claude", "opus"] },
-    });
+    }, async selector => selector);
     const launch = vi.spyOn(ProcessTransport.prototype, "launch");
     const reason = `F-01-D1 selector attribution #11864 (${model})`;
     try {
+      if (model === "VEDA/sonnet") {
+        await expect(manager.spawn({ task: "opaque Veda selector", model, modelReason: reason, transport: "process" }))
+          .rejects.toMatchObject({ code: "FABRIC_MODEL_EXCEPTION_DENIED", denial: "model-mismatch" });
+        expect(launch).not.toHaveBeenCalled();
+        return;
+      }
+      if (!hasPosixTrustMetadata) return; // The unsafe-selector case above is never skipped.
       const handle = await manager.spawn({ task: "Veda selector attribution", model, modelReason: reason, transport: "process" });
-      expect(handle.warnings).toContain(`model: named exception veda/claude-code/${cliModel} (smarty-dev#11864)`);
+      expect(handle.warnings).toContain(`model: named exception veda/claude-code/${cliModel} (Smarty-Pants-Inc/smarty-dev#11864)`);
       const workerArgs = launch.mock.calls[0]![0].workerArguments;
-      expect(workerArgs).toEqual(expect.arrayContaining(["--model", model]));
+      expect(workerArgs).toEqual(expect.arrayContaining(["--model", cliModel]));
       const cliArgs = buildVedaArguments({ backend: "claude-code", persona: "default", model, tools: [], session: "d1" });
       expect(cliArgs[cliArgs.indexOf("-m") + 1]).toBe(cliModel);
 
       const result = await manager.wait(handle.id);
-      expect(result.warnings).toContain(`model: named exception veda/claude-code/${cliModel} (smarty-dev#11864)`);
+      expect(result.warnings).toContain(`model: named exception veda/claude-code/${cliModel} (Smarty-Pants-Inc/smarty-dev#11864)`);
       const audit = readAudit(reason);
-      expect(Object.keys(audit)).toHaveLength(7);
-      expect(audit.model).toBe(`veda/claude-code/${cliModel}`);
+      expect(Object.keys(audit).sort()).toEqual(["grant_id", "host", "issue", "lane", "launcher", "model", "reason", "ref", "role", "run_id", "thinking", "time", "ts"]);
+      expect(audit).toMatchObject({ grant_id: expect.any(String), issue: "Smarty-Pants-Inc/smarty-dev#11864", lane: path.basename(boundRootRecord.cwd), host: os.hostname().split(".")[0], thinking: expect.any(String), run_id: handle.id, time: expect.any(String) });
+      expect(audit.model).toBe(cliModel);
       expect(audit.reason).toBe(reason);
     } finally { launch.mockRestore(); homedir.mockRestore(); }
   });
 
-  it("completes an issue-bearing Claude exception when its audit append fails and warns in both receipts", async () => {
+  it.runIf(hasPosixTrustMetadata)("completes an issue-bearing Claude exception when its audit append fails and warns in both receipts", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-claude-audit-failure-")); roots.push(root);
     const home = path.join(root, "home");
     const auditFile = path.join(home, ".local", "state", "smarty", "route", "opus-exceptions.jsonl");
@@ -1554,10 +1619,13 @@ describe("AgentManager", () => {
       const safeModel = "openai-codex/gpt-5.4";
       const inherited = mode === "inherited-fallback";
       const reason = `relaunch ${mode} ${path.basename(root)} #12000 #11864`;
-      const entry = (ref: string, expires = "2999-01-01T00:00:00.000Z") => ({
-        ref, models: [model], roles: ["task"], expires,
+      const boundRelaunchRootRecord = Object.freeze({ cwd: root });
+      const entry = (issue: string, expires_at?: string) => modelExceptionGrant({
+        issue, model, lane: path.basename(boundRelaunchRootRecord.cwd), role: "task",
+        ...(expires_at ? { granted_at: "1999-12-31T23:00:00.000Z", expires_at } : {}),
       });
-      fs.writeFileSync(exceptionsPath, JSON.stringify([entry("smarty-dev#12000")]));
+      fs.writeFileSync(exceptionsPath, JSON.stringify({ version: 1, grants: [entry("Smarty-Pants-Inc/smarty-dev#12000")] }));
+      trustedExceptionFixturePaths.add(exceptionsPath);
       const readAudit = (): Record<string, unknown>[] => fs.readFileSync(auditFile, "utf8")
         .trim().split("\n").filter(Boolean).map(line => JSON.parse(line) as Record<string, unknown>)
         .filter(row => row.reason === (inherited ? "inherited-switch" : reason));
@@ -1567,20 +1635,23 @@ describe("AgentManager", () => {
         const attempt = ++launches;
         // These assertions run before the real process starts, not after the run settles.
         const rows = readAudit();
-        const refs = inherited ? [null] : attempt === 1 ? ["smarty-dev#12000"]
-          : ["smarty-dev#12000", mode === "changed-ref" ? "smarty-dev#11864" : "smarty-dev#12000"];
+        const refs = inherited ? [null] : attempt === 1 ? ["Smarty-Pants-Inc/smarty-dev#12000"]
+          : ["Smarty-Pants-Inc/smarty-dev#12000", mode === "changed-ref" ? "Smarty-Pants-Inc/smarty-dev#11864" : "Smarty-Pants-Inc/smarty-dev#12000"];
         expect(rows.map(row => row.ref)).toEqual(refs);
         for (const row of rows) {
-          expect(Object.keys(row).sort()).toEqual(["host", "launcher", "model", "reason", "ref", "role", "ts"]);
+          expect(Object.keys(row).sort()).toEqual(inherited ? ["host", "launcher", "model", "reason", "ref", "role", "ts"]
+            : ["grant_id", "host", "issue", "lane", "launcher", "model", "reason", "ref", "role", "run_id", "thinking", "time", "ts"]);
           expect(row).toMatchObject({ role: "task", model, reason: inherited ? "inherited-switch" : reason,
-            launcher: "fabric", host: os.hostname(), ts: expect.stringMatching(/^\d{4}-\d\d-\d\dT/) });
+            launcher: "fabric", host: inherited ? os.hostname() : os.hostname().split(".")[0], ts: expect.stringMatching(/^\d{4}-\d\d-\d\dT/) });
+          if (!inherited) expect(row).toMatchObject({ grant_id: expect.any(String), issue: row.ref,
+            lane: path.basename(boundRelaunchRootRecord.cwd), thinking: expect.any(String), run_id: request.id, time: expect.any(String) });
         }
         expect(request.workerArguments).toEqual(expect.arrayContaining(["--model", inherited ? safeModel : model]));
         const handle = await actualLaunch.call(this, request);
         if (attempt === 1) {
-          if (mode === "changed-ref") fs.writeFileSync(exceptionsPath, JSON.stringify([entry("smarty-dev#11864")]));
-          else if (mode === "missing") fs.writeFileSync(exceptionsPath, "[]");
-          else if (mode === "expired") fs.writeFileSync(exceptionsPath, JSON.stringify([entry("smarty-dev#12000", "2000-01-01T00:00:00.000Z")]));
+          if (mode === "changed-ref") fs.writeFileSync(exceptionsPath, JSON.stringify({ version: 1, grants: [entry("Smarty-Pants-Inc/smarty-dev#11864")] }));
+          else if (mode === "missing") fs.writeFileSync(exceptionsPath, JSON.stringify({ version: 1, grants: [] }));
+          else if (mode === "expired") fs.writeFileSync(exceptionsPath, JSON.stringify({ version: 1, grants: [entry("Smarty-Pants-Inc/smarty-dev#12000", "2000-01-01T00:00:00.000Z")] }));
         }
         return handle;
       });
@@ -1589,7 +1660,7 @@ describe("AgentManager", () => {
         const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents,
           modelExceptionsPath: exceptionsPath,
           modelPolicy: { ...DEFAULT_FABRIC_CONFIG.agents.modelPolicy, fallbackModel: safeModel },
-        }, { workerPath: path.resolve("tests/fixtures/fake-worker-startup-retry.mjs"), runRoot: root, preparePiModel });
+        }, { rootSessionCwd: () => boundRelaunchRootRecord.cwd, workerPath: path.resolve("tests/fixtures/fake-worker-startup-retry.mjs"), runRoot: root, preparePiModel });
         managers.push(manager);
         const result = await manager.run({ task: `Recover startup ${mode}`, model, transport: "process",
           ...(inherited ? { modelSource: "inherited" as const } : { modelReason: reason }) });
@@ -1598,8 +1669,8 @@ describe("AgentManager", () => {
         expect(result.status).toBe(refused ? "failed" : "completed");
         expect(fs.readFileSync(path.join(manager.runDirectory(result.id)!, "startup-attempts"), "utf8"))
           .toBe(refused ? "1" : "2");
-        expect(readAudit().map(row => row.ref)).toEqual(inherited ? [null] : refused ? ["smarty-dev#12000"]
-          : ["smarty-dev#12000", mode === "changed-ref" ? "smarty-dev#11864" : "smarty-dev#12000"]);
+        expect(readAudit().map(row => row.ref)).toEqual(inherited ? [null] : refused ? ["Smarty-Pants-Inc/smarty-dev#12000"]
+          : ["Smarty-Pants-Inc/smarty-dev#12000", mode === "changed-ref" ? "Smarty-Pants-Inc/smarty-dev#11864" : "Smarty-Pants-Inc/smarty-dev#12000"]);
         if (refused) {
           expect(result.error).toMatch(/relaunch failed:.*(?:unlisted|expired)/);
         } else {
@@ -3363,8 +3434,18 @@ describe("AgentManager multimodal prompts", () => {
 
 describe("AgentManager Claude runner", () => {
   const fakeClaude = path.resolve("tests/fixtures/fake-claude.mjs");
+  // Every constructor in this native-only block binds to the stable ROOT fixture,
+  // pins a known catalog selector, and still executes the real manager/admission.
+  const NativeAgentManager = ProductionAgentManager;
+  const AgentManager = class extends NativeAgentManager {
+    constructor(cwd: string, config: ConstructorParameters<typeof NativeAgentManager>[1], options: ConstructorParameters<typeof NativeAgentManager>[2]) {
+      super(cwd, { ...config, claude: { ...config.claude, model: config.claude.model ?? "claude/haiku" } }, {
+        rootSessionCwd: () => boundRootRecord.cwd, claudeBinary: fakeClaude, ...options,
+      });
+    }
+  };
 
-  it("uses the independent configured Claude runner and model defaults", async () => {
+  it.runIf(hasPosixTrustMetadata)("uses the independent configured Claude runner and model defaults", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-claude-"));
     roots.push(root);
     const config = {
@@ -3383,11 +3464,11 @@ describe("AgentManager Claude runner", () => {
     expect(result).toMatchObject({
       status: "completed",
       runner: "claude",
-      model: "claude/haiku",
+      model: "claude-haiku-test",
     });
   });
 
-  it("runs Claude stream-json with mapped tools, native schema output, and usage", async () => {
+  it.runIf(hasPosixTrustMetadata)("runs Claude stream-json with mapped tools, native schema output, and usage", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-claude-"));
     roots.push(root);
     const invocationLog = path.join(root, "claude-args.jsonl");
@@ -3418,7 +3499,7 @@ describe("AgentManager Claude runner", () => {
       expect(result).toMatchObject({
         status: "completed",
         runner: "claude",
-        model: "claude/haiku",
+        model: "claude-haiku-test",
         thinking: "minimal",
         turns: 2,
         toolCalls: 1,
@@ -3432,7 +3513,7 @@ describe("AgentManager Claude runner", () => {
       expect(invocation.argv).toEqual(
         expect.arrayContaining([
           "--model",
-          "haiku",
+          "claude-haiku-test",
           "--effort",
           "low",
           "--tools",
@@ -3448,7 +3529,7 @@ describe("AgentManager Claude runner", () => {
     }
   });
 
-  it("preserves Claude result diagnostics on a failed run", async () => {
+  it.runIf(hasPosixTrustMetadata)("preserves Claude result diagnostics on a failed run", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-claude-"));
     roots.push(root);
     const manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
@@ -3473,7 +3554,7 @@ describe("AgentManager Claude runner", () => {
     });
   });
 
-  it("delivers Claude steering and follow-up messages on later turns", async () => {
+  it.runIf(hasPosixTrustMetadata)("delivers Claude steering and follow-up messages on later turns", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-claude-"));
     roots.push(root);
     const manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
@@ -3787,7 +3868,10 @@ describe("AgentManager steering", () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-compact-"));
     roots.push(root);
     const fakeClaude = path.resolve("tests/fixtures/fake-claude.mjs");
-    const manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents,
+      claude: { ...DEFAULT_FABRIC_CONFIG.agents.claude, model: "claude/haiku" },
+    }, {
+      rootSessionCwd: () => boundRootRecord.cwd,
       workerPath: path.resolve("src/worker.ts"),
       claudeBinary: fakeClaude,
       runRoot: root,

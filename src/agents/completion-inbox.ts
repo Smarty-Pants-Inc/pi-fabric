@@ -4,6 +4,7 @@ import { syncPathNamespace } from "../core/atomic-write.js";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { AgentRunResult } from "./types.js";
 import { fabricProvenanceSupported, sendFabricMessage } from "../fabric-provenance.js";
+import { extensionContextLive } from "../session-liveness.js";
 
 export const AGENT_COMPLETION_MESSAGE_TYPE = "pi-fabric-agent-complete";
 const SUMMARY_CHARS = 4_000;
@@ -108,7 +109,7 @@ export class AgentCompletionInbox {
   }
 
   enqueue(result: Completion, delivered?: () => void, prepare?: () => void): void {
-    if (this.#closed) return;
+    if (this.#closed || this.#retired()) return;
     if (this.#acknowledged.has(result.id)) {
       if (this.#handed.has(result.id)) {
         this.#handed.set(result.id, delivered ?? this.#handed.get(result.id));
@@ -166,6 +167,18 @@ export class AgentCompletionInbox {
     this.#acknowledged.clear();
     this.#handed.clear();
     this.#receiptRetries.clear();
+  }
+
+  /**
+   * smarty-dev#8881: AgentSession.dispose() and session replacement invalidate the bound ctx without
+   * session_shutdown, so nothing closes this inbox. Delayed work that finds it stale closes as a
+   * shutdown does: undelivered outcomes stay unread in their journal for the next owner.
+   */
+  #retired(): boolean {
+    if (extensionContextLive(this.#context)) return false;
+    try { this.close(); } catch { /* the host already invalidated these subscriptions */ }
+    this.#closed = true;
+    return true;
   }
 
   #confirmHeld(): void {
@@ -261,6 +274,7 @@ export class AgentCompletionInbox {
     // A check that finds Main busy does not re-arm itself; idleSignal() does, on an event.
     this.#timer = setTimeout(() => {
       this.#timer = undefined;
+      if (this.#retired()) return;
       for (const receipt of this.#receiptRetries) this.#confirmDelivery(receipt);
       if (this.#context.signal?.aborted) { this.#suspended = true; return; }
       if (this.#context.isIdle() && !this.#context.hasPendingMessages()) this.#flush();

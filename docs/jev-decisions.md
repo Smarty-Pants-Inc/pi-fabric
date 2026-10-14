@@ -121,7 +121,7 @@ Declare `jev.decide` in a program's exact `requires`; the offline methods also
 require their exact refs when used. Legacy `jev.evaluate` and `jev.decide` share
 the program's evaluation/token limits. Zero evaluations prohibit both. Usage is
 accounted even for malformed/refused provider responses; unknown usage blocks
-later inference; it is never treated as free. The final lossless response
+later inference and is never treated as free. The final lossless response
 remains inspectable when its reported tokens exceed the limit. No automatic
 HTTP retries occur.
 

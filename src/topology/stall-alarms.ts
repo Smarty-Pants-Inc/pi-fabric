@@ -46,10 +46,17 @@ export const registerMainInbox = (meshRoot: string, identity: MeshIdentity, sess
   writeJsonAtomic(successorFile(meshRoot, identity.id), { oldRoot: identity.id, activationId } satisfies Successor, { durable: true });
   return activationId;
 };
+/** smarty-dev#8881 F-01: optional activation liveness, checked inside the custody critical section
+ * before any write. Custody acquisition awaits; a session disposed in that wait must commit nothing. */
+const fenceActivation = (live?: () => boolean): void => {
+  if (live && !live()) throw new Error("Pi Fabric mesh activation lifecycle retired");
+};
 /** Called only after the old Main/control drainer has closed on an actual native session change. */
-export const recordMainSuccessor = async (mesh: MeshStore, oldRoot: string, oldSessionId: string, newRoot: string): Promise<void> => {
+export const recordMainSuccessor = async (mesh: MeshStore, oldRoot: string, oldSessionId: string, newRoot: string,
+  live?: () => boolean): Promise<void> => {
   if (oldRoot === newRoot) return;
   await mesh.custody(() => {
+    fenceActivation(live);
     const owner = read<InboxOwner>(ownerFile(mesh.root, oldSessionId));
     if (!owner || owner.rootId !== oldRoot || owner.pid !== process.pid) throw new Error("Cannot rotate an unowned Main inbox");
     const prior = read<Successor>(successorFile(mesh.root, oldRoot));
@@ -73,9 +80,11 @@ export const stageMainSuccessor = async (mesh: MeshStore, oldRoot: string, sessi
     writeJsonAtomic(file, { ...owner, retired: true }, { durable: true });
   });
 };
-export const confirmMainSuccessor = async (mesh: MeshStore, newRoot: string, sessionFile?: string): Promise<boolean> => {
+export const confirmMainSuccessor = async (mesh: MeshStore, newRoot: string, sessionFile?: string,
+  live?: () => boolean): Promise<boolean> => {
   if (!sessionFile) return false;
   return mesh.custody(() => {
+    fenceActivation(live);
     const intentFile = path.join(mailbox(mesh.root), "rotations", `${hash(path.resolve(sessionFile))}.json`);
     const intent = read<{ oldRoot: string; sessionId: string; activationId?: string; targetSessionFile: string }>(intentFile);
     if (!intent) return false;

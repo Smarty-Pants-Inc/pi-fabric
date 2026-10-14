@@ -1,0 +1,317 @@
+import fs from "node:fs";
+import fsp from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import childProcess from "node:child_process";
+import { createHash } from "node:crypto";
+import { describe, expect, it, vi } from "vitest";
+import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
+import { ActorRegistryStore } from "../src/actors/registry-store.js";
+import { ResidentHost } from "../src/residency/host.js";
+import type { ResidentHostConfig } from "../src/residency/protocol.js";
+import type { FabricParticipantRecord } from "../src/topology/types.js";
+import { LIVENESS_POLICY_KEY, readHostLease } from "../src/topology/host-leases.js";
+import { readParticipantFile } from "../src/topology/participant-files.js";
+import * as fileLock from "../src/residency/file-lock.js";
+import * as removal from "../src/storage/verified-remove.js";
+
+const participantKey = (id: string) => "topology/participants/" + createHash("sha256").update(id).digest("hex");
+const fixtureRemove = fs.rmSync.bind(fs); // Only the freshly allocated fixture root may actually be removed.
+
+/** #4664: every product deletion is recorded BEFORE emulation by rename. No
+ * original delete is delegated, even for lock receipts or already absent files.
+ * /proc/self/fd paths are resolved while their directory descriptor is held. */
+const recordDeletes = (root: string) => {
+  const grave = path.join(root, "delete-emulation");
+  fs.mkdirSync(grave, { mode: 0o700 });
+  const records: Array<{ api: string; target: string; present: boolean }> = [];
+  const violations: string[] = [];
+  const emulate = (api: string, target: fs.PathLike, force = false) => {
+    const raw = String(target);
+    const directory = path.dirname(raw);
+    let resolved: string;
+    try { resolved = path.join(fs.realpathSync(directory), path.basename(raw)); }
+    catch { resolved = path.resolve(raw); }
+    const present = fs.lstatSync(resolved, { throwIfNoEntry: false }) !== undefined;
+    records.push({ api, target: resolved, present });
+    if (process.env.FAST_PATH_EVIDENCE_DIR) fs.appendFileSync(path.join(process.env.FAST_PATH_EVIDENCE_DIR, "deletes.jsonl"),
+      JSON.stringify(records.at(-1)) + "\n");
+    if (!resolved.startsWith(root + path.sep) || resolved.startsWith(grave + path.sep)) {
+      violations.push(resolved);
+      throw new Error(`Deletion outside this fixture: ${resolved}`);
+    }
+    if (!present) {
+      if (force) return;
+      throw Object.assign(new Error(`Missing emulated deletion: ${resolved}`), { code: "ENOENT" });
+    }
+    if (api.includes("rmdir") && fs.readdirSync(resolved).length > 0) {
+      throw Object.assign(new Error("Emulated rmdir refuses nonempty directories"), { code: "ENOTEMPTY" });
+    }
+    fs.renameSync(resolved, path.join(grave, String(records.length)));
+  };
+  vi.spyOn(fs, "rmSync").mockImplementation((target, options) => emulate("rmSync", target, options?.force));
+  vi.spyOn(fs, "unlinkSync").mockImplementation(target => emulate("unlinkSync", target));
+  vi.spyOn(fs, "rmdirSync").mockImplementation(target => emulate("rmdirSync", target));
+  vi.spyOn(fsp, "rm").mockImplementation(async (target, options) => emulate("promises.rm", target, options?.force));
+  vi.spyOn(fsp, "unlink").mockImplementation(async target => emulate("promises.unlink", target));
+  vi.spyOn(fsp, "rmdir").mockImplementation(async target => emulate("promises.rmdir", target));
+  // fs.promises and the default node:fs/promises import share these methods.
+  expect(fs.promises.rm).toBe(fsp.rm);
+  vi.spyOn(fs, "rm").mockImplementation((target, options, callback) => {
+    try { emulate("rm", target, options.force); callback(null); } catch (error) { callback(error as NodeJS.ErrnoException); }
+  });
+  vi.spyOn(fs, "unlink").mockImplementation((target, callback) => {
+    try { emulate("unlink", target); callback(null); } catch (error) { callback(error as NodeJS.ErrnoException); }
+  });
+  vi.spyOn(fs, "rmdir").mockImplementation(((target: fs.PathLike, options: unknown, callback?: fs.NoParamCallback) => {
+    const done = typeof options === "function" ? options as fs.NoParamCallback : callback!;
+    try { emulate("rmdir", target); done(null); } catch (error) { done(error as NodeJS.ErrnoException); }
+  }) as typeof fs.rmdir);
+  const verify = removal.verifiedRemove;
+  vi.spyOn(removal, "verifiedRemove").mockImplementation((target, judged, options) => {
+    // Force the real verifier's non-destructive branch; never invoke a product fallback/helper delete.
+    const result = verify(target, judged, { ...options, dryRun: true,
+      fallback: () => { throw new Error("Real deletion fallback forbidden"); } });
+    if (result.removed) emulate("verifiedRemove.dryRun", target);
+    return result;
+  });
+  for (const api of ["spawn", "spawnSync", "exec", "execSync", "execFile", "execFileSync", "fork"] as const) {
+    vi.spyOn(childProcess, api).mockImplementation(() => { violations.push(`child:${api}`); throw new Error(`No child processes: ${api}`); });
+  }
+  return { records, violations };
+};
+
+const fixture = async (files = false, backend: "file" | "sqlite" = "file") => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "effect-free-publication-"));
+  const safety = recordDeletes(root);
+  // This probe does not test the unrelated native host-startup flock helper.
+  // Keep its real descriptor/inode checks, but avoid launching a child process.
+  vi.spyOn(fileLock, "lockFile").mockImplementation(async file => {
+    if (!file.startsWith(root + path.sep)) throw new Error("Foreign host lock");
+    return fs.openSync(file, fs.constants.O_RDWR | fs.constants.O_CREAT | fs.constants.O_NOFOLLOW, 0o600);
+  });
+  const config: ResidentHostConfig = {
+    format: 1, rootId: "session:effect-free", sessionId: "effect-free", cwd: root, projectRoot: root,
+    meshRoot: path.join(root, "mesh"), actorRoot: path.join(root, "actors"), sessionActorRoot: path.join(root, "session-actors"),
+    residencyRoot: path.join(root, "resident"), fullCodeMode: true,
+    agents: { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0 },
+    mesh: { ...DEFAULT_FABRIC_CONFIG.mesh, stateBackend: backend },
+    retention: { ...DEFAULT_FABRIC_CONFIG.retention, legacyRunArchiveEnabled: false },
+    workerPath: path.join(root, "unused-worker.js"), fabricExtensionPath: path.join(root, "unused-index.js"),
+    piBinary: "unused", claudeBinary: "unused", vedaBinary: "unused",
+  };
+  const host = new ResidentHost(config);
+  const actorRoots = [config.actorRoot, config.sessionActorRoot!];
+  const acquired = vi.spyOn(fs, "writeFileSync"); // Call-through: count actual registry owner publications, not wrapper calls.
+  const acquisitions = () => acquired.mock.calls.filter(([target]) => actorRoots.some(actorRoot =>
+    String(target) === path.join(actorRoot, "actors.json.lock", "owner"))).map(([target]) => String(target));
+  const custody = () => actorRoots.filter(actorRoot => fs.existsSync(path.join(actorRoot, "actors.json.lock", "owner")));
+  const clear = () => acquired.mockClear();
+  const observers: Array<{ mockRestore(): void }> = [];
+  const observe = <T extends { mockRestore(): void }>(spy: T): T => { observers.push(spy); return spy; };
+  const close = async () => {
+    try {
+      // Stop assertion-only observers before withdrawal (which is a different path).
+      for (const spy of observers) spy.mockRestore();
+      await host.close();
+      expect(safety.violations).toEqual([]);
+      expect(safety.records.length).toBeGreaterThan(0);
+    } finally {
+      vi.restoreAllMocks();
+      fixtureRemove(root, { recursive: true, force: true });
+    }
+  };
+  try {
+    if (files) {
+      const { MeshStore } = await import("../src/mesh/store.js");
+      const policy = new MeshStore(config.meshRoot, 65536, 100, { stateBackend: backend });
+      try { await policy.put({ key: LIVENESS_POLICY_KEY, value: { version: 1, hostLeases: "files", participants: "files" },
+        identity: { id: "policy", name: "policy", kind: "agent" } }); }
+      finally { policy.closeState(); }
+    }
+    await host.start();
+    expect(host.mesh.stateBackend).toBe(backend); // Never count a silent backend fallback as SQLite coverage.
+    // Default 5-second timer is armed by real startup. Manual refresh executes
+    // the same full heartbeat, without background races in the acquisition count.
+    expect(host.participants.heartbeatArmed).toBe(true);
+    expect(host.participants.options.heartbeatMs).toBeUndefined();
+    host.participants.suspend();
+    return { root, config, host, actorRoots, acquired, acquisitions, custody, clear, observe, close };
+  } catch (error) { await close(); throw error; }
+};
+
+const participant = (f: Awaited<ReturnType<typeof fixture>>, id: string): FabricParticipantRecord =>
+  readParticipantFile(f.config.meshRoot, participantKey(id))!.value as FabricParticipantRecord;
+
+const modes = (["file", "sqlite"] as const).flatMap(backend => [false, true].map(files => ({ backend, files })));
+describe("effect-free resident publication (#8526)", () => {
+  it.each(modes)("idle heartbeat takes zero registries and retains lease/confirmation ($backend files=$files)", async ({ files, backend }) => {
+    const f = await fixture(files, backend);
+    try {
+      const confirmed = f.host.participants.confirmedAt();
+      const lease = readHostLease(f.config.meshRoot, f.host.hostId)!;
+      const now = Date.now() + 5_000;
+      vi.spyOn(Date, "now").mockReturnValue(now);
+      const writable = vi.spyOn(f.host.mesh, "confirmWritable");
+      const batch = vi.spyOn(f.host.mesh, "writeBatch");
+      const fence = vi.spyOn(f.host.participants.options, "withPublicationFence"); // Call-through, no replacement fence.
+      const locks = vi.spyOn(ActorRegistryStore, "withLocks");
+      f.clear();
+      await f.host.participants.refresh();
+      console.info(JSON.stringify({ probe: "idle-heartbeat", backend, files, registryAcquisitions: f.acquisitions().length,
+        actorIds: fence.mock.calls[0]?.[1] === undefined ? "uncertain" : [...fence.mock.calls[0][1]!],
+        leaseRenewed: readHostLease(f.config.meshRoot, f.host.hostId)!.updatedAt > lease.updatedAt,
+        meshConfirmed: f.host.participants.confirmedAt() > confirmed }));
+      expect(readHostLease(f.config.meshRoot, f.host.hostId)?.updatedAt).toBeGreaterThan(lease.updatedAt);
+      expect(f.host.participants.confirmedAt()).toBeGreaterThan(confirmed);
+      expect(f.host.participants.canConsumeMesh()).toBe(true);
+      expect(writable.mock.calls.length + batch.mock.calls.length).toBeGreaterThan(0);
+      expect(f.acquisitions()).toEqual([]);
+      expect(fence).toHaveBeenCalledOnce();
+      expect(fence.mock.calls[0]?.[1]).toEqual(new Set());
+      expect(Array.from(locks.mock.calls[0]!)[2]).toBe("presence-fence");
+    } finally { await f.close(); }
+  });
+
+  it.each(modes)("effect-free heartbeat does not confirm a failed mesh ($backend files=$files)", async ({ files, backend }) => {
+    const f = await fixture(files, backend);
+    try {
+      const confirmed = f.host.participants.confirmedAt();
+      const lease = readHostLease(f.config.meshRoot, f.host.hostId)!;
+      vi.spyOn(Date, "now").mockReturnValue(Date.now() + 5_000);
+      const unavailable = new Error("mesh confirmation unavailable");
+      const writable = f.observe(vi.spyOn(f.host.mesh, "confirmWritable").mockRejectedValue(unavailable));
+      f.observe(vi.spyOn(f.host.mesh, "writeBatch").mockRejectedValue(unavailable));
+      const fence = vi.spyOn(f.host.participants.options, "withPublicationFence");
+      f.clear();
+      await expect(f.host.participants.refresh()).rejects.toThrow(unavailable.message);
+      expect(writable).toHaveBeenCalledOnce();
+      expect(readHostLease(f.config.meshRoot, f.host.hostId)!.updatedAt).toBeGreaterThan(lease.updatedAt);
+      expect(f.host.participants.confirmedAt()).toBe(confirmed);
+      expect(f.host.participants.canConsumeMesh()).toBe(false);
+      expect(f.acquisitions()).toEqual([]);
+      expect(fence.mock.calls[0]?.[1]).toEqual(new Set());
+    } finally { await f.close(); }
+  });
+
+  it.each(modes)("empty preparation replacement still revalidates generation ($backend files=$files)", async ({ files, backend }) => {
+    const f = await fixture(files, backend);
+    try {
+      const registry = new ActorRegistryStore(f.config.actorRoot);
+      const lock = ActorRegistryStore.withLocks;
+      const fence = vi.spyOn(f.host.participants.options, "withPublicationFence");
+      const prepare = vi.spyOn(f.host.participants.options, "preparePublicationFence");
+      vi.spyOn(ActorRegistryStore, "withLocks").mockImplementationOnce(async (stores, operation) => {
+        await registry.withLock(() => registry.write([])); // A new atomic registry generation after effect classification.
+        return lock(stores, operation);
+      });
+      f.clear();
+      await f.host.participants.refresh();
+      expect(prepare).toHaveBeenCalledTimes(2);
+      expect(fence).toHaveBeenCalledTimes(2);
+      expect(fence.mock.calls.every(([, ids]) => ids !== undefined && ids.size === 0)).toBe(true);
+      // Only the injected real replacement needs a registry; both idle attempts bypass it.
+      expect(f.acquisitions()).toEqual([path.join(f.config.actorRoot, "actors.json.lock", "owner")]);
+      expect(f.host.participants.canConsumeMesh()).toBe(true);
+    } finally { await f.close(); }
+  });
+
+  it.each(modes)("actor put retains its real holding registry ($backend files=$files)", async ({ files, backend }) => {
+    const f = await fixture(files, backend);
+    try {
+      const actor = await f.host.actors.create({ name: "fenced-actor", instructions: "wait", residency: "durable" });
+      await f.host.participants.refresh();
+      const record = { ...participant(f, actor.id), name: "changed actor" };
+      f.host.participants.registerSource(() => [record]);
+      const publish = f.host.mesh.writeBatch.bind(f.host.mesh);
+      f.observe(vi.spyOn(f.host.mesh, "writeBatch").mockImplementation(async input => {
+        if (input.ops.some(op => op.key === participantKey(actor.id))) expect(f.custody()).toEqual([f.config.actorRoot]);
+        return publish(input);
+      }));
+      const fence = vi.spyOn(f.host.participants.options, "withPublicationFence");
+      f.clear();
+      await f.host.participants.refreshPresence();
+      expect(participant(f, actor.id).name).toBe(record.name);
+      expect(f.acquisitions()).toEqual([path.join(f.config.actorRoot, "actors.json.lock", "owner")]);
+      expect(fence.mock.calls[0]?.[1]).toEqual(new Set([actor.id]));
+    } finally { await f.close(); }
+  });
+
+  it.each([{ actorIds: undefined }, { actorIds: ["unknown-actor"] }])("uncertain/unheld batch remains fenced (ids=$actorIds)", async ({ actorIds }) => {
+    const f = await fixture();
+    try {
+      f.host.participants.options.publicationBatch = () => ({
+        ops: [{ kind: "put", key: "actors/effect-free/unknown-actor", value: { status: "idle" } }],
+        ...(actorIds === undefined ? {} : { actorIds }), committed: () => {},
+      });
+      const publish = f.host.mesh.writeBatch.bind(f.host.mesh);
+      f.observe(vi.spyOn(f.host.mesh, "writeBatch").mockImplementation(async input => {
+        expect(f.custody()).toEqual(f.actorRoots);
+        return publish(input);
+      }));
+      const fence = vi.spyOn(f.host.participants.options, "withPublicationFence");
+      f.clear();
+      await f.host.participants.refreshPresence();
+      expect(f.acquisitions().sort()).toEqual(f.actorRoots.map(root => path.join(root, "actors.json.lock", "owner")).sort());
+      expect(fence.mock.calls[0]?.[1]).toEqual(actorIds === undefined ? undefined : new Set(actorIds));
+    } finally { await f.close(); }
+  });
+
+  it.each(modes)("adoption after preparation discards the generation before publication ($backend files=$files)", async ({ files, backend }) => {
+    const f = await fixture(files, backend);
+    try {
+      const actor = await f.host.actors.create({ name: "adopted-actor", instructions: "wait", residency: "durable" });
+      await f.host.participants.refresh();
+      const stale = { ...participant(f, actor.id), name: "stale prepared actor" };
+      f.host.participants.registerSource(() => [stale]);
+      const registry = new ActorRegistryStore(f.config.actorRoot);
+      const lock = ActorRegistryStore.withLocks;
+      const fence = vi.spyOn(f.host.participants.options, "withPublicationFence");
+      vi.spyOn(ActorRegistryStore, "withLocks").mockImplementationOnce(async (stores, operation) => {
+        // Atomic adoption between preparation and the genuine fence acquisition.
+        await registry.withLock(() => registry.write(registry.records().map(row => row.id === actor.id
+          ? { ...row, rootId: "session:successor", adoptedAt: Date.now(), adoptedFrom: [f.config.rootId] } : row)));
+        return lock(stores, operation);
+      });
+      const publish = f.host.mesh.writeBatch.bind(f.host.mesh);
+      f.observe(vi.spyOn(f.host.mesh, "writeBatch").mockImplementation(async input => {
+        expect(input.ops.some(op => op.kind === "put" && op.key === participantKey(actor.id))).toBe(false);
+        expect(f.custody()).toEqual(f.actorRoots); // Own-record removal is uncertain, so it keeps the all-registry fence.
+        return publish(input);
+      }));
+      f.clear();
+      await f.host.participants.refreshPresence();
+      expect(fence.mock.calls[0]?.[1]).toEqual(new Set([actor.id]));
+      expect(fence.mock.calls.some(([, ids]) => ids === undefined)).toBe(true);
+      expect(registry.records().find(row => row.id === actor.id)?.rootId).toBe("session:successor");
+      expect(readParticipantFile(f.config.meshRoot, participantKey(actor.id))).toBeUndefined();
+      expect(f.host.mesh.get(participantKey(actor.id), { fresh: true })).toBeUndefined();
+      expect(f.acquisitions().length).toBeGreaterThanOrEqual(4); // Adoption, vetoed publication, conservative retry.
+    } finally { await f.close(); }
+  });
+
+  it("an effect-free files heartbeat still independently renews a stopped actor's matching lineage", async () => {
+    const f = await fixture(true);
+    try {
+      const actor = await f.host.actors.create({ name: "stopped-actor", instructions: "wait", residency: "durable" });
+      await f.host.actors.stop(actor.id);
+      await f.host.participants.refresh();
+      const key = participantKey(actor.id), before = readParticipantFile(f.config.meshRoot, key)!;
+      const token = (before.value as FabricParticipantRecord).actorOwnershipToken;
+      // The ordinary stopped-actor renewal cadence, not a relaxed lease/lineage gate.
+      vi.spyOn(Date, "now").mockReturnValue(Date.now() + 60 * 60 * 1_000 + 5_000);
+      const fence = vi.spyOn(f.host.participants.options, "withPublicationFence");
+      f.clear();
+      await f.host.participants.refresh();
+      expect(readParticipantFile(f.config.meshRoot, key)?.updatedAt).toBeGreaterThan(before.updatedAt);
+      expect((readParticipantFile(f.config.meshRoot, key)?.value as FabricParticipantRecord).actorOwnershipToken).toBe(token);
+      // presenceBatch may renew stopped legacy presence at the hour boundary;
+      // use the next stable full heartbeat to prove its exact empty actor set.
+      f.clear(); fence.mockClear();
+      await f.host.participants.refresh();
+      expect(f.acquisitions()).toEqual([]);
+      expect(fence.mock.calls[0]?.[1]).toEqual(new Set());
+      expect(f.host.participants.canConsumeMesh()).toBe(true);
+    } finally { await f.close(); }
+  });
+});

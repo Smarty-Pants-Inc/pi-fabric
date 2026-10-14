@@ -1,3 +1,4 @@
+import { isAddressedHubFactoryEvent } from "../mesh/bridge-topics.js";
 import { recordUnknownTarget } from "../mesh/delivery-outcomes.js";
 import type {
   FabricActionDescriptor,
@@ -427,6 +428,8 @@ export class MeshProvider implements FabricProvider {
     context: FabricInvocationContext,
   ): Record<string, unknown> {
     this.guardArguments(actionName, args, context);
+    // Public optional nullish fields (including `to`) intentionally normalize to omission.
+    // Raw bridge publication frames receive no argument repair and still require a string recipient.
     const normalized = (fabricHostCallerId(context) === undefined ? normalizeMeshArgs : normalizeHostMeshArgs)(actionName, args);
     this.guardArguments(actionName, normalized, context);
     return normalized;
@@ -448,7 +451,10 @@ export class MeshProvider implements FabricProvider {
         const dueAt = meshScheduleDueAt(args);
         // An immediate addressed publish needs a known target. A scheduled one (#864) is released
         // later, when its target may exist; its presence now proves nothing either way.
-        if (dueAt === undefined && typeof args.to === "string" && !this.participants.get(args.to, undefined, { fresh: true }) &&
+        // The hub factory role address (`factory`, any host) owns no participant record; only its
+        // exact work/owner routes skip the directory check (smarty-dev#9352).
+        if (dueAt === undefined && typeof args.to === "string" &&
+          !isAddressedHubFactoryEvent({ topic, kind: args.kind, to: args.to }) && !this.participants.get(args.to, undefined, { fresh: true }) &&
           !this.participants.list({ scope: "project", includeStale: true, fresh: true })
             .some(member => member.id === args.to || member.name === args.to)) {
           const reason = `Unknown Fabric target: ${args.to}`;

@@ -49,8 +49,11 @@ export interface NatsStreamMessage { seq: number; data: Uint8Array }
 export interface JetStreamPort {
   /** Server facts for the refusals: its version and whether it fsyncs every write (`/varz` sync_always). */
   server(): Promise<{ version: string; syncAlways: boolean | undefined; maxPayload?: number; authRequired?: boolean }>;
-  /** Creates the stream if absent (file storage, these subjects; an existing stream gains missing ones); returns its last sequence. */
-  ensureStream(stream: string, subjects: string[], options: { maxMsgSize: number }): Promise<{ lastSeq: number; maxMsgSize?: number }>;
+  /** Creates the stream if absent (file storage, these subjects; an existing stream gains missing ones); returns its last sequence.
+   * `replicas` (smarty-dev#11373): the stream's num_replicas on create; an existing stream whose num_replicas differs is
+   * refused (MeshStateNatsRefusedError) before anything is changed, never lowered or raised. Omitted: the real client
+   * uses the replicas it was connected with (explicit, else the agent fabric.json layer's mesh.nats.replicas). */
+  ensureStream(stream: string, subjects: string[], options: { maxMsgSize: number; replicas?: number }): Promise<{ lastSeq: number; maxMsgSize?: number }>;
   /** The stream's last sequence now (leader). */
   lastSequence(stream: string): Promise<number>;
   /** The stream's first stored sequence now (above 1 after a purge). */
@@ -277,11 +280,21 @@ const lifecycle = (snapshot: NatsSnapshot, record: LifecycleRecord, seq: number)
 /** Thrown by reads and writes once the stream is retired (rolled back to sqlite or file), or while it is importing. */
 export class MeshStateNatsRefusedError extends Error {
   readonly code = "FABRIC_MESH_STATE_NATS_REFUSED";
-  constructor(message: string) {
+  /** A replicas refusal only (smarty-dev#11373): flat numbers, so they survive redactNatsError (guardNatsPort). */
+  declare readonly configuredReplicas?: number;
+  declare readonly observedReplicas?: number;
+  constructor(message: string, replicas?: { configured: number; observed: number }) {
     super(`FABRIC_MESH_STATE_NATS_REFUSED: ${message}`);
     this.name = "MeshStateNatsRefusedError";
+    if (replicas) Object.assign(this, { configuredReplicas: replicas.configured, observedReplicas: replicas.observed });
   }
 }
+
+/** smarty-dev#11373: a stream replicas value must be a positive integer; anything else is refused before any connect. */
+export const assertNatsReplicas = (value: unknown, source: string): number => {
+  if (typeof value === "number" && Number.isSafeInteger(value) && value >= 1) return value;
+  throw new MeshStateNatsRefusedError(`${source} must be a positive integer (got ${typeof value === "number" ? String(value) : typeof value})`);
+};
 
 /** A `fresh` read while the projector lags the stream, or a write that ran out of its retry budget: retryable. */
 export class MeshStateNatsBusyError extends MeshLockTimeoutError {
@@ -406,6 +419,8 @@ export interface NatsStateBackendOptions {
   maxStateBytes?: number;
   /** At most this many messages are replayed after the snapshot (or from 1) at open. Default 100 000. */
   maxReplay?: number;
+  /** The stream's replicas, passed to the port's ensureStream (smarty-dev#11373). Omitted: the port decides. */
+  replicas?: number;
 }
 
 const DEFAULT_TOMBSTONES = 2_048;
@@ -483,7 +498,7 @@ export class NatsStateBackend implements StateBackend {
   static async open(options: NatsStateBackendOptions): Promise<NatsStateBackend> {
     const backend = new NatsStateBackend(options);
     const { lastSeq, maxMsgSize } = await options.port.ensureStream(options.stream, [options.subject, options.snapshotSubject],
-      { maxMsgSize: backend.#limits.maxMessageBytes });
+      { maxMsgSize: backend.#limits.maxMessageBytes, ...(options.replicas === undefined ? {} : { replicas: options.replicas }) });
     // The server enforces the message cap too (pi-fabric#907): a stream with no limit, or a larger one, is refused.
     if (maxMsgSize === undefined || maxMsgSize <= 0 || maxMsgSize > backend.#limits.maxMessageBytes) {
       throw new MeshStateNatsLimitError(`the stream ${options.stream} allows messages of ${maxMsgSize === undefined || maxMsgSize <= 0 ? "any size" : `${maxMsgSize} bytes`} (limit ${backend.#limits.maxMessageBytes}); set its max_msg_size`);
@@ -1030,6 +1045,9 @@ export interface OpenNatsStateBackendOptions {
   acceptPeriodicSync?: boolean;
   /** Host-only: the client's TLS files (PEM paths), for a `tls://` server. */
   tls?: NatsTlsFiles;
+  /** The stream's replicas (positive integer; smarty-dev#11373). Omitted: the real client reads only the agent-layer
+   * fabric.json mesh.nats.replicas (default 1) at first use; an injected `port` decides for itself. */
+  replicas?: number;
 }
 
 export interface NatsTlsFiles { caFile?: string; certFile?: string; keyFile?: string }
@@ -1251,6 +1269,9 @@ export interface NatsEndpointOptions {
   port?: JetStreamPort;
   /** Tests: the resolver for the loopback check (default dns.promises.lookup). */
   lookup?: NatsLookup;
+  /** The stream's replicas for the real client (positive integer, validated before anything is resolved or connected).
+   * Omitted: the real client reads the agent fabric.json layer's mesh.nats.replicas at first use. */
+  replicas?: number;
 }
 
 /**
@@ -1262,6 +1283,7 @@ export interface NatsEndpointOptions {
  */
 export const connectNatsEndpoint = async (options: NatsEndpointOptions): Promise<{ port: JetStreamPort; owned: boolean;
   server: Awaited<ReturnType<JetStreamPort["server"]>> }> => {
+  const replicas = options.replicas === undefined ? undefined : assertNatsReplicas(options.replicas, "replicas");
   const lookup = options.lookup ?? systemLookup;
   const servers: string[] = [];
   for (const server of options.servers ?? []) servers.push(await assertNatsTransportSecure(server, "tls:", lookup));
@@ -1273,7 +1295,8 @@ export const connectNatsEndpoint = async (options: NatsEndpointOptions): Promise
   const owned = options.port === undefined;
   const port = options.port ?? await (await import("./state-backend-nats-client.js")).connectJetStream(servers, {
     ...(monitoringUrl === undefined ? {} : { monitoringUrl }),
-    ...(tls === undefined ? {} : { tls }) });
+    ...(tls === undefined ? {} : { tls }),
+    ...(replicas === undefined ? {} : { replicas }) });
   try {
     const server = await port.server();
     // What a client CAN see of the server's access control is whether it requires authentication at all (INFO
@@ -1331,7 +1354,9 @@ export const openNatsStateBackend = async (options: OpenNatsStateBackendOptions)
       ...(options.maxStateBytes === undefined ? {} : { maxStateBytes: options.maxStateBytes }),
       ...(options.maxReplay === undefined ? {} : { maxReplay: options.maxReplay }),
       ...(options.maxStateTombstones === undefined ? {} : { maxStateTombstones: options.maxStateTombstones }),
-      ...(options.lockTimeoutMs === undefined ? {} : { lockTimeoutMs: options.lockTimeoutMs }), syncAlways: server.syncAlways });
+      ...(options.lockTimeoutMs === undefined ? {} : { lockTimeoutMs: options.lockTimeoutMs }),
+      ...(options.replicas === undefined ? {} : { replicas: options.replicas }),
+      syncAlways: server.syncAlways });
     if (backend.diagnostics().nats?.status === "retired") { backend.close(); throw new MeshStateNatsRefusedError(`the stream ${stream} is retired`); }
     prepared.get(root)?.close();
     prepared.set(root, backend);

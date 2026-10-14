@@ -117,3 +117,60 @@ describe("Fabric Escape ownership", () => {
     expect(onTerminalInput).not.toHaveBeenCalled();
   });
 });
+
+// smarty-dev#8881: AgentSession.dispose() invalidates the captured ctx without session_shutdown.
+// Every ctx getter then throws Pi's stale-ctx error; the TUI (and its input listener) can outlive it.
+describe("Fabric Escape after session disposal", () => {
+  function disposable() {
+    vi.useFakeTimers();
+    let stale = false;
+    const touched: string[] = [];
+    let input: ((data: string) => unknown) | undefined;
+    const unsubscribe = vi.fn();
+    const notify = vi.fn();
+    const ui = { notify, onTerminalInput: (handler: (data: string) => unknown) => { input = handler; return unsubscribe; } };
+    const context = {} as ExtensionContext;
+    for (const [key, value] of Object.entries({ mode: "tui", hasUI: true, ui })) {
+      Object.defineProperty(context, key, { get() {
+        if (stale) { touched.push(key); throw new Error("This extension ctx is stale after session replacement or reload."); }
+        return value;
+      } });
+    }
+    const options = { enabled: vi.fn(() => true), ownsInput: vi.fn(() => false), halted: vi.fn(() => false), halt: vi.fn(() => 2) };
+    const remove = installFabricEscapeHalt(context, options);
+    return { options, notify, unsubscribe, remove, touched, input: (data: string) => input?.(data), dispose: () => { stale = true; } };
+  }
+
+  it("a pending Escape halts nothing and touches no stale UI once the session is disposed", () => {
+    const h = disposable();
+    h.input("\x1b"); // live at the key press: enabled/ownsInput are read synchronously
+    vi.clearAllMocks();
+    h.dispose();
+    expect(() => vi.advanceTimersByTime(100)).not.toThrow();
+    for (const option of Object.values(h.options)) expect(option).not.toHaveBeenCalled();
+    expect(h.notify).not.toHaveBeenCalled();
+    expect(h.touched.filter(key => key !== "hasUI")).toEqual([]);
+    expect(h.unsubscribe).toHaveBeenCalledOnce(); // retired locally
+    h.remove();
+    expect(h.unsubscribe).toHaveBeenCalledOnce();
+  });
+
+  it("Escape reaching a surviving TUI listener after disposal arms nothing", () => {
+    const h = disposable();
+    h.dispose();
+    expect(h.input("\x1b")).toBeUndefined();
+    expect(vi.getTimerCount()).toBe(0);
+    vi.advanceTimersByTime(100);
+    for (const option of Object.values(h.options)) expect(option).not.toHaveBeenCalled();
+    expect(h.unsubscribe).toHaveBeenCalledOnce();
+  });
+
+  it("a live session still halts after the debounce", () => {
+    const h = disposable();
+    h.input("\x1b");
+    vi.advanceTimersByTime(60);
+    expect(h.options.halt).toHaveBeenCalledOnce();
+    expect(h.notify).toHaveBeenCalledWith(expect.stringContaining("halted 2 background workers"), "warning");
+    h.remove();
+  });
+});

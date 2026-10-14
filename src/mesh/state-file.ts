@@ -10,6 +10,7 @@ import { readFileRetrying, writeFileAtomic, renameAtomic, MeshLockTimeoutError, 
   requireNamespaceBarrier, syncPathNamespaceDurable } from "../core/atomic-write.js";
 import { MeshSyncNotDurableError } from "./not-durable.js";
 import { captureStoragePut, captureStorageDelete, storageRevision } from "../verified/storage.js";
+import { verifiedRemove } from "../storage/verified-remove.js";
 import { delay, describeLockHolder, errorCode, lockStats, type MeshLock, type MeshStoreContext } from "./mesh-lock.js";
 import { assertFileStateWritable, isMeshStateMovedMarker, isMeshStateNatsMarker, meshStateMovedError, meshStateMovedToNatsError, readMeshStateMovedMarker,
   type MeshStateMovedMarker, type MeshStateNatsMarker } from "./backend-fence.js";
@@ -685,6 +686,10 @@ export class StateFile implements StateBackend {
         if (!Number.isSafeInteger(pid) || pid === process.pid) continue;
         const file = path.join(this.root, entry.name);
         try {
+          // smarty-dev#8907: the judged stat, taken before the pid and age judgment; verifiedRemove removes only this
+          // inode (a successor swapped in since stays). Off Linux: main's unlink (#7858 fallback).
+          const stat = fs.lstatSync(file);
+          if (!stat.isFile()) continue;
           let dead = false;
           try { process.kill(pid, 0); }
           catch (error) {
@@ -692,10 +697,11 @@ export class StateFile implements StateBackend {
             dead = true;
           }
           if (!dead) {
-            const modifiedAt = fs.statSync(file).mtimeMs;
+            const modifiedAt = stat.mtimeMs;
             if (now - modifiedAt <= PREPARED_REUSE_AGE_MS || !processStartedAfter(pid, modifiedAt)) continue;
           }
-          fs.unlinkSync(file);
+          if (!verifiedRemove(file, stat, { deleter: "meshPreparedStateSweep",
+            fallback: () => { fs.unlinkSync(file); return true; } }).removed) continue;
           removed++;
         } catch { /* A sibling sweep/rename or unavailable evidence never blocks the store. */ }
       }
@@ -979,6 +985,8 @@ export class StateFile implements StateBackend {
         const release = trackTemporary(temporary);
         try { writeFileAtomic(temporary, prepared.encoded.serialized); }
         catch (error) {
+          // ponytail: no judgment precedes this: our own unique unpublished staging name (live pid + uuid, so no sweep
+          // claims it) in the private mesh root, only ever created by this write (smarty-dev#8907 inventory).
           try { fs.rmSync(temporary, { force: true }); } catch { /* Best-effort private staging cleanup. */ }
           release();
           throw error;
@@ -993,6 +1001,7 @@ export class StateFile implements StateBackend {
       return result;
     }, ({ prepared }) => {
       if (prepared?.temporary) {
+        // ponytail: as above, our own unique staging name; after the commit's rename it is absent (force: no-op).
         try { fs.rmSync(prepared.temporary, { force: true }); } catch { /* Best-effort private staging cleanup. */ }
         prepared.releaseTemporary?.();
       }

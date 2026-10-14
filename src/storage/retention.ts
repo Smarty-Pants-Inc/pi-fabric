@@ -341,6 +341,22 @@ const safeTerminalArtifacts = (root: string, expired: Deadline): boolean => {
   }
   return true;
 };
+const DURABLE_KEY = /^(?:initial|[0-9a-f]{64})$/;
+const DURABLE_LEASE_FILES = new Set(["lease.sqlite", "lease.sqlite-journal"]);
+const DURABLE_STORE_FILE = /^(?:main|(?:doc|task)-(?:0|[1-9]\d*))\.jsonl(?:\.reclaim)?$/;
+const onlyOwnedFiles = (directory: string, allowed: (name: string) => boolean, expired: Deadline): boolean =>
+  !expired() && fs.readdirSync(directory).every((name) => !expired() && allowed(name) && ownedStat(path.join(directory, name))?.isFile() === true) && !expired();
+/** Only the known pi-durable journal layout is an artifact; custody still decides removal. */
+const safeDurableTree = (directory: string, expired: Deadline): boolean => !expired() && fs.readdirSync(directory).every((key) => {
+  const conversation = path.join(directory, key);
+  if (expired() || !DURABLE_KEY.test(key) || !ownedStat(conversation)?.isDirectory()) return false;
+  return fs.readdirSync(conversation).every((name) => {
+    if (expired()) return false;
+    const file = path.join(conversation, name);
+    if (name === "store") return ownedStat(file)?.isDirectory() === true && onlyOwnedFiles(file, (child) => DURABLE_STORE_FILE.test(child), expired);
+    return DURABLE_LEASE_FILES.has(name) && ownedStat(file)?.isFile() === true;
+  });
+}) && !expired();
 /** Unknown transports/contents and live descendants veto removal, even under a dead host. */
 const safeRunTree = (root: string, childrenStopped: boolean, depth = 0, expired: Deadline = noDeadline, acceptPidReuse = false): boolean => {
   if (expired() || depth > 32 || !ownedStat(root)?.isDirectory()) return false;
@@ -392,6 +408,10 @@ const safeRunTree = (root: string, childrenStopped: boolean, depth = 0, expired:
               typeof item.message !== "string" || !copyFabricProvenance(item.provenance) ||
               Object.keys(item).some(key => !["message", "delivery", "followUpId", "provenance"].includes(key))) return false;
         }
+        continue;
+      }
+      if (stat.isDirectory() && name === "durable") {
+        if (!safeDurableTree(file, expired)) return false;
         continue;
       }
       if (stat.isDirectory() && name === "nested") {

@@ -9,6 +9,7 @@ import { readJsonlPage } from "../log-tail.js";
 import { MeshArchive, MeshArchiveLookupUnavailableError, MeshArchiveRecoveryChanged, type MeshArchiveEntry, type MeshArchiveRecoveryPlan } from "./archive.js";
 import { delay, errorCode, type MeshLock, type MeshStoreContext } from "./mesh-lock.js";
 import { jsonClone } from "./state-file.js";
+import { verifiedRemove } from "../storage/verified-remove.js";
 
 // Mesh events (smarty-dev#6477 L0): publish, publishBatch, dedupe receipts, the live log, its
 // compaction, archive coupling and recovery, and cursor reads.
@@ -1385,21 +1386,26 @@ export class EventLog {
     if (reserve && count <= limit) return count;
     const candidates = receipts.filter(name => !pending.has(name.slice(0, -".json".length))).map(name => {
       const file = path.join(directory, name);
+      // The judged receipt's identity, captured before its age is read (smarty-dev#8907).
+      const stat = fs.lstatSync(file);
       const event = JSON.parse(fs.readFileSync(file, "utf8")) as MeshEvent;
       if (typeof event.dedupeKey !== "string" || this.#dedupePath(event.dedupeKey, ".json") !== file ||
           typeof event.id !== "string" || !Number.isSafeInteger(event.sequence) ||
           !Number.isFinite(event.createdAt)) {
         throw new Error("Invalid event publication receipt");
       }
-      return { file, createdAt: event.createdAt, sequence: event.sequence };
+      return { file, stat, createdAt: event.createdAt, sequence: event.sequence };
     });
     candidates.sort((a, b) => a.createdAt - b.createdAt || a.sequence - b.sequence || a.file.localeCompare(b.file));
     const now = Date.now();
     try {
       for (const receipt of candidates) {
         if (now - receipt.createdAt < this.#dedupeReceiptTtlMs && count <= limit) break;
-        fs.rmSync(receipt.file, { force: true });
-        count--;
+        // A replaced or refreshed receipt is refused and still counts: admission fails closed.
+        // File-only (main's non-recursive rmSync); the names above are exact hex patterns, so verifiedRemove's
+        // `.retention-graveyard-<pid>` directory (and a refused entry left inside it) is never enumerated or counted.
+        if (receipt.stat.isFile() && verifiedRemove(receipt.file, receipt.stat, { deleter: "meshDedupeReceiptPrune",
+          fallback: () => { fs.rmSync(receipt.file, { force: true }); return true; } }).removed) count--;
       }
     } finally {
       // Persist removals once per pass, including any completed before a later unlink failed.

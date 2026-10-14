@@ -26,8 +26,10 @@ The actor is never deleted: its directory is moved by ONE `rename(2)` into a fre
 `<residency>/archives/<id>.<time>.<random>/tree` (created by `mkdir`, so an existing name refuses; never
 overwritten or merged). `rename` follows no link; the moved entry must be the pinned directory (same inode, this
 user), or it is moved back and the removal refuses. A cross-filesystem archive (EXDEV) refuses; there is no copy.
-Deleting archives is left to retention (smarty-dev#7916). A live resident's own `remove` path is unchanged
-(no `--main-stopped`; smarty-dev#8090).
+Deleting archives is left to retention (smarty-dev#7916). A live resident's operator `remove` path also holds
+the root's Main publication fence across its final liveness check and actor-tree deletion (smarty-dev#8090).
+It does not require `--main-stopped`. A normal removal by the root's own Main uses the same fence without
+the dead-Main liveness check.
 
 With `--main-stopped` the tool verifies every root participant record's Main process (pid, host, start time):
 the pid must be gone from this host, or reused with a different start time. A record without that identity,
@@ -37,7 +39,9 @@ startup claim (`host-fence-establish.lock`) and `host.lock` throughout, so no re
 The offline remover holds the root's Main publication fence (an exclusive flock on
 `main-publication-fences/<sha256(root)>.json`) across its checks and every destructive step: the root Main
 does not publish its participant while it is held. The kernel drops it when the remover dies; there is no
-time-based expiry. The live host path's equivalent is smarty-dev#8090.
+time-based expiry. The live host's final operator check refuses a fresh, reloading, invalid or unreadable root
+participant record. Accepted operator removals keep this requirement through pending runs and host restarts.
+Where the kernel fence is unavailable, deletion refuses and keeps the actor tree; there is no PID or clock fallback.
 
 The attestation never overrides an observation: a live root lease, a fresh, reloading or unreadable root participant, or a participant process alive on this host refuses. When
 the resident host itself is dead, `remove` runs offline under its `host.lock` fence (dead holders, a claimable
@@ -48,7 +52,11 @@ A bare directory prefix searches `$PI_FABRIC_MESH_ROOT/residency`; alternatively
 pass `--mesh-root`. Without either, the default is
 `$PI_FABRIC_PROJECT_ROOT/.pi/fabric/mesh` (or the current directory).
 Explicit paths must be direct children of that residency directory; selector and
-channel symlinks are refused. Ambiguous resident prefixes and actor names are
+channel symlinks are refused. The resident directory and its channel files must
+be owned by the invoking OS user: on POSIX by uid; on Windows by owner SID
+(queried with PowerShell `Get-Acl`). If the Windows owner SID cannot be read,
+or any owner differs from the current user's SID, the command refuses before it
+sends a request. Ambiguous resident prefixes and actor names are
 refused. Actor IDs and names are exact and scoped to the selected host's root,
 not the caller's root.
 

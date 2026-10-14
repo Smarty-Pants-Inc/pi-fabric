@@ -5,7 +5,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
-import { main, resolveResidentDirectory } from "../src/actors-cli.js";
+import { assertResidentChannelOwned, main, resolveResidentDirectory, windowsOwnerSids } from "../src/actors-cli.js";
 import { ResidentHost } from "../src/residency/host.js";
 import { ResidentActorClient } from "../src/residency/actor-client.js";
 import { residentRoot, type ResidentHostConfig } from "../src/residency/protocol.js";
@@ -15,6 +15,9 @@ import { hostLeasePath, readHostLease, writeHostLease } from "../src/topology/ho
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { MeshStore } from "../src/mesh/store.js";
 import { installInProcessResidentFence } from "./helpers/in-process-resident-fence.js";
+import { ROOT_PARTICIPANT_FRESH_MS } from "../src/residency/operator-safety.js";
+import { writeParticipantFile } from "../src/topology/participant-files.js";
+import { rootParticipantKey } from "./helpers/dead-root-fixture.js";
 
 beforeEach(() => installInProcessResidentFence());
 const waitFor = (predicate: () => boolean) => vi.waitFor(() => expect(predicate()).toBe(true), { timeout: 15_000, interval: 30 });
@@ -43,7 +46,13 @@ const fixture = async () => {
   };
   const create = (name: string) => host.actors.create({ name, instructions: "Run", model: "fixture/visible",
     residency: "durable", transport: "process", extensions: false });
-  return { root, host, config, cli, create, confirm, close: async () => {
+  // pi-fabric#1031: an allowed live operator remove needs explicit Linux proof that the root's Main is gone: a stale
+  // root participant whose recorded pid (above pid_max) and start time are gone. Seeded per allowed test, never globally.
+  const deadMain = () => writeParticipantFile(meshRoot, { key: rootParticipantKey(config.rootId),
+    value: { id: config.rootId, rootId: config.rootId, kind: "root", ownerHostId: config.rootId, ownerIdentityId: config.rootId,
+      mainProcess: { pid: 2147483647, host: os.hostname(), startTime: "1" } },
+    version: 1, updatedAt: Date.now() - 2 * ROOT_PARTICIPANT_FRESH_MS, updatedBy: { id: config.rootId, name: "main", kind: "main" } });
+  return { root, host, config, cli, create, confirm, deadMain, close: async () => {
     for (const actor of host.actors.listOwned()) await host.actors.stop(actor.id, undefined, true);
     await host.close(); fs.rmSync(root, { recursive: true, force: true });
   } };
@@ -73,6 +82,7 @@ describe("same-user resident actor operator", () => {
       expect(f.host.actors.status(victim.id).inFlightRun).toBeUndefined();
       expect(residentProcessAlive(runPid)).toBe(false);
       expect(f.host.actors.status(survivor.id).status).toBe("running");
+      f.deadMain();
       const removed = await f.cli("remove", victim.id, f.confirm);
       expect(removed).toMatchObject({ code: 0, err: "" });
       await waitFor(() => !new ActorRegistryStore(f.config.actorRoot).records().some(actor => actor.id === victim.id));
@@ -94,6 +104,7 @@ describe("same-user resident actor operator", () => {
       await waitFor(() => ("turns" in f.host.agents.status(runId) && Number((f.host.agents.status(runId) as { turns?: number }).turns) > 0));
       const runPid = Number(f.host.agents.status(runId).sessionId);
 
+      f.deadMain();
       expect(await f.cli("remove", victim.name, f.confirm)).toMatchObject({ code: 0, err: "" });
       await f.host.actors.removalSettled(victim.id);
       await f.host.participants.refresh();
@@ -312,11 +323,97 @@ describe("same-user resident actor operator", () => {
       await expect(run(process.execPath, argv("remove", actor.id))).rejects.toMatchObject({ code: 1, stderr: expect.stringContaining("Missing --confirm-dead-root") });
       const dry = await run(process.execPath, [...argv("remove", actor.name), "--dry-run", ...f.confirm]);
       expect(JSON.parse(dry.stdout).operatorEvidence).toMatchObject({ rootId: f.config.rootId, mainSessionId: f.config.sessionId, lastLeaseTime: null });
+      f.deadMain();
       const result = await run(process.execPath, [...argv("remove", actor.name), ...f.confirm]);
       expect(JSON.parse(result.stdout)).toMatchObject({ ok: true, action: "remove", resident: f.config.residencyRoot });
       await f.host.participants.refresh();
       expect(f.host.participants.get(actor.id, Date.now(), { fresh: true })).toBeUndefined();
       await expect(run(process.execPath, [...argv("stop", "unknown-id"), ...f.confirm])).rejects.toMatchObject({ code: 1, stderr: expect.stringContaining("Unknown Fabric actor") });
+    } finally { await f.close(); }
+  }, 30_000);
+});
+
+describe("resident channel owner check", () => {
+  const userSid = "S-1-5-21-1-2-3-1001", otherSid = "S-1-5-21-1-2-3-1002";
+  const channel = () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-owner-"));
+    const files = [root, path.join(root, "config.json"), path.join(root, "requests")];
+    fs.writeFileSync(files[1]!, "{}"); fs.mkdirSync(files[2]!);
+    return { root, files, close: () => fs.rmSync(root, { recursive: true, force: true }) };
+  };
+
+  it("win32 fails closed when the owner SID query is unavailable, even with a matching uid", () => {
+    const c = channel();
+    try {
+      const uid = () => fs.statSync(c.root).uid;
+      for (const probe of [{ platform: "win32" as const, getuid: uid },
+        { platform: "win32" as const, getuid: uid, windowsOwnerSids: () => { throw new Error("spawn powershell.exe ENOENT"); } },
+        // The real query on a host without powershell.exe must refuse too.
+        ...(process.platform === "win32" ? [] : [{ platform: "win32" as const, getuid: uid, windowsOwnerSids }])]) {
+        expect(() => assertResidentChannelOwned(c.files, probe)).toThrow(/Cannot verify that the resident channel is owned by this Windows user.*refusing stop\/remove/);
+      }
+    } finally { c.close(); }
+  });
+
+  it("win32 refuses foreign or malformed owner SIDs and accepts all current-user SIDs", () => {
+    const c = channel();
+    try {
+      const win = (owners: string[], user = userSid) => ({ platform: "win32" as const,
+        windowsOwnerSids: () => ({ owners, user, isAdministrator: false }) });
+      expect(() => assertResidentChannelOwned(c.files, win([userSid, otherSid, userSid]))).toThrow(`not owned by this OS user: ${c.files[1]}`);
+      expect(() => assertResidentChannelOwned(c.files, win([userSid, "BUILTIN\\Administrators", userSid]))).toThrow("not owned by this OS user");
+      expect(() => assertResidentChannelOwned(c.files, win([userSid, userSid]))).toThrow("malformed SID query result");
+      expect(() => assertResidentChannelOwned(c.files, win(["", "", ""], ""))).toThrow("malformed SID query result");
+      expect(() => assertResidentChannelOwned(c.files, win([userSid, userSid, userSid]))).not.toThrow();
+    } finally { c.close(); }
+  });
+
+  it.each([
+    { name: "Administrators owner with an admin token", owner: "S-1-5-32-544", isAdministrator: true, accepted: true },
+    { name: "Administrators owner with a non-admin token", owner: "S-1-5-32-544", isAdministrator: false, accepted: false },
+    { name: "SYSTEM owner with a non-admin token", owner: "S-1-5-18", isAdministrator: false, accepted: true },
+    { name: "another user owner even with an admin token", owner: otherSid, isAdministrator: true, accepted: false },
+  ])("win32 checks $name", ({ owner, isAdministrator, accepted }) => {
+    const c = channel();
+    try {
+      const check = () => assertResidentChannelOwned(c.files, { platform: "win32",
+        windowsOwnerSids: () => ({ owners: c.files.map(() => owner), user: userSid, isAdministrator }) });
+      if (accepted) expect(check).not.toThrow();
+      else expect(check).toThrow(`not owned by this OS user: ${c.root}`);
+    } finally { c.close(); }
+  });
+
+  it("posix behavior is unchanged: uid match passes, mismatch and symlinks refuse; a missing uid fails closed", () => {
+    const c = channel();
+    try {
+      const uid = fs.statSync(c.root).uid;
+      expect(() => assertResidentChannelOwned(c.files, { platform: "linux", getuid: () => uid })).not.toThrow();
+      expect(() => assertResidentChannelOwned(c.files, { platform: "darwin", getuid: () => uid + 1 })).toThrow(`not owned by this OS user: ${c.root}`);
+      expect(() => assertResidentChannelOwned(c.files, { platform: "linux" })).toThrow("no uid available");
+      if (process.platform !== "win32") {
+        expect(() => assertResidentChannelOwned(c.files)).not.toThrow();
+        const link = path.join(c.root, "link"); fs.symlinkSync(c.files[2]!, link, "dir");
+        expect(() => assertResidentChannelOwned([link], { platform: "linux", getuid: () => uid })).toThrow("not owned by this OS user");
+      }
+    } finally { c.close(); }
+  });
+
+  it("simulated win32 stop/remove refuse before dispatch when ownership cannot be proven", async () => {
+    const f = await fixture();
+    try {
+      const actor = await f.create("win32-target");
+      for (const action of ["stop", "remove"] as const) {
+        for (const flags of [f.confirm, ["--dry-run"]]) {
+          let err = "";
+          const code = await main([action, "--resident", f.config.residencyRoot, "--actor", actor.id, "--mesh-root", f.config.meshRoot, ...flags],
+            { out: () => {}, err: text => { err += text; } },
+            { platform: "win32", getuid: () => fs.statSync(f.config.residencyRoot).uid, windowsOwnerSids: () => { throw new Error("Get-Acl failed"); } });
+          expect(code).toBe(1);
+          expect(err).toContain("Cannot verify that the resident channel is owned by this Windows user (Get-Acl failed); refusing stop/remove");
+        }
+      }
+      expect(fs.readdirSync(path.join(f.config.residencyRoot, "requests"))).toHaveLength(0);
+      expect(f.host.actors.status(actor.id).status).toBe("idle");
     } finally { await f.close(); }
   }, 30_000);
 });

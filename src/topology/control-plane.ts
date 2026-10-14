@@ -1342,7 +1342,7 @@ export class FabricControlPlane {
     this.#retryTimer = setTimeout(() => {
       this.#retryTimer = undefined;
       this.#wake();
-    }, Math.max(1, expiresAt - Date.now() + 1));
+    }, Math.min(2_147_483_647, Math.max(1, expiresAt - Date.now() + 1)));
     this.#retryTimer.unref();
   }
 

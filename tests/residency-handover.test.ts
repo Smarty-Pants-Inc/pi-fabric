@@ -17,7 +17,8 @@ import {
   residentLaunchSpec, validateLaunchSpec, assertHandoverTopology, assertPreviousLaunchSpec, ownHandoverPlan,
   handoverPath, handoverCustodyPath, handoverOutcomePath, mainGenerationPath, readHandoverJson,
   writeHandoverImmutable, writeHandoverState, writeLaunchSnapshot, decideHandover,
-  type ResidentHandoverState, type ResidentLauncherIdentity,
+  handoverStagedReadyPath, assertResidentStagedReady,
+  type ResidentStagedReadyReceipt, type ResidentHandoverState, type ResidentLauncherIdentity,
 } from "../src/residency/handover.js";
 import type { FabricMainAgentTarget } from "../src/main-agent.js";
 import type { ResidentHostConfig, ResidentHostOwner } from "../src/residency/protocol.js";
@@ -90,7 +91,23 @@ async function fixture(protocolOnly = true) {
     hostPath: path.join(b, "dist/residency/launcher.js"), mainAgent: { id: identity.id, local: true } as FabricMainAgentTarget });
   const state = () => readHandoverJson<ResidentHandoverState>(handoverPath(config.residencyRoot));
   let successor: ResidentHost | undefined;
-  return { root, config, previous, target, launcher, host, client, idle, state, participants,
+  function assertStagedReady(kind: "target" | "fallback"): ResidentStagedReadyReceipt {
+    const plan = state()!.plan;
+    const owner = readHandoverJson<ResidentHostOwner>(path.join(config.residencyRoot, "owner.json"))!;
+    const receipt = readHandoverJson<ResidentStagedReadyReceipt>(handoverStagedReadyPath(config.residencyRoot, plan.id))!;
+    expect(receipt).toMatchObject({ id: plan.id, rootId: config.rootId, kind,
+      owner: { pid: owner.pid, processStartTime: owner.processStartTime, token: owner.token, hostId: owner.hostId },
+      launcher, digest: kind === "target" ? target.digest : previous.digest,
+      businessAdmissions: 0, admissionHeld: true, checkpointReadback: true });
+    expect(() => assertResidentStagedReady(config.residencyRoot, receipt)).not.toThrow();
+    const readback = (manager: unknown) => (manager as { releaseCheckpointReceipt(): unknown }).releaseCheckpointReceipt();
+    expect(receipt.checkpoint).toEqual({ actors: readback(successor!.actors), agents: readback(successor!.agents),
+      control: readback(successor!.control), lifecycle: readback(successor!.lifecycle) });
+    expect(successor!.actors.releaseAdmissionHeld).toBe(true);
+    expect(successor!.actors.inFlightCount()).toBe(0);
+    return receipt;
+  }
+  return { root, config, previous, target, launcher, host, client, idle, state, participants, assertStagedReady,
     successor: () => successor,
     startSuccessor: async () => {
       const plan = state()!.plan;
@@ -352,6 +369,7 @@ describe.skipIf(process.platform !== "linux")("resident release plan and idle-po
       await f.host.close();
       expect(fs.statSync(path.join(f.config.residencyRoot, "host.lock")).ino).toBe(inode);
       const b = await f.startSuccessor();
+      f.assertStagedReady("target"); // real held/readback receipt, never fixture-authored readiness
       expect(b.actors.inFlightCount()).toBe(0); // restored backlog remains gated during startup probe
       for (const actor of actors) expect(b.actors.status(actor.id).id).toBe(actor.id);
       expect(b.mesh.read({ topic: "host.reloaded" })).toEqual([]);
@@ -365,6 +383,13 @@ describe.skipIf(process.platform !== "linux")("resident release plan and idle-po
       // A later reversible transaction must not hide the serving B generation.
       writeHandoverState(f.config.residencyRoot, { ...plan, id: "later-c" }, "cancelled");
       expect((await f.client.ensureHost()).token).toBe(serving.token);
+      for (const [index, actor] of actors.entries()) {
+        const messages = b.actors.messages(actor.id);
+        expect(messages.filter(message => message.direction === "in" && message.id === queued[index])).toHaveLength(1);
+        const runId = b.actors.status(actor.id).lastRunId;
+        expect(runId).not.toBe(runs[index]);
+        expect(messages.filter(message => message.direction === "out" && message.runId === runId)).toHaveLength(1);
+      }
       for (const [index, scope] of ["project", "session"].entries()) {
         const now = JSON.parse(fs.readFileSync(path.join(f.config.residencyRoot, `actor-mesh-cursor.json.${scope}`), "utf8"));
         expect(now.cursor).toBeGreaterThanOrEqual(cursors[index].cursor);
@@ -405,13 +430,20 @@ describe.skipIf(process.platform !== "linux")("resident release plan and idle-po
       writeHandoverImmutable(handoverCustodyPath(f.config.residencyRoot, plan.id), { id: plan.id, launcher: f.launcher });
       await until(() => f.idle.mock.calls.length === 1); await f.host.close();
       await f.startSuccessor();
+      const stagedB = f.assertStagedReady("target");
       const fallback = await f.startFallback();
+      const stagedA = f.assertStagedReady("fallback");
+      expect(stagedA.owner.token).not.toBe(stagedB.owner.token); // B's same-operation receipt cannot authorize A
       const dir = path.join(f.config.sessionActorRoot!, actor.id);
       const file = fs.readdirSync(dir).find((name) => name.startsWith("queue-") && name.endsWith(".json"))!;
       expect(JSON.parse(fs.readFileSync(path.join(dir, file), "utf8"))).toMatchObject({ cleanHandover: true, items: [{ id: receipt.messageId, attempts: 0 }] });
       expect(fallback.actors.inFlightCount()).toBe(0);
       writeHandoverState(f.config.residencyRoot, plan, "fallback");
       await until(() => fallback.actors.messages(actor.id).filter((m) => m.direction === "out").length === 2);
+      const messages = fallback.actors.messages(actor.id);
+      expect(messages.filter(message => message.direction === "in" && message.id === receipt.messageId)).toHaveLength(1);
+      expect(messages.filter(message => message.direction === "out" && message.runId === fallback.actors.status(actor.id).lastRunId)).toHaveLength(1);
+      expect(new Set(messages.filter(message => message.direction === "out").map(message => message.runId)).size).toBe(2);
       expect(fallback.mesh.read({ topic: "host.reloaded" })).toHaveLength(0);
     } finally { await f.close(); }
   }, 20_000);

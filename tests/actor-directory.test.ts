@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ActorDirectory } from "../src/actors/directory.js";
+import { SessionActorOrphans } from "../src/actors/session-orphans.js";
 import { AgentManager } from "../src/agents/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
@@ -221,6 +222,58 @@ describe("ActorDirectory", () => {
     await vi.waitFor(() => expect(alpha.directory.status(project.id).status).toBe("running"), { timeout: 5_000 });
     expect(alpha.directory.status(supervisor.id).status).toBe("running");
     expect(alpha.directory.inFlightCount()).toBe(2);
+  });
+
+  it("retains both scopes' accepted creates as release custody without reporting extra actor runs", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-directory-custody-"));
+    roots.push(root);
+    const { directory } = open(root, "alpha");
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const reached = new Set<string>();
+    const creating = (["project", "session"] as const).map(scope => directory.create({
+      scope, name: `${scope} setup`, instructions: "Wait.",
+    }, { beforeCommit: async () => { reached.add(scope); await gate; } }));
+    try {
+      await vi.waitFor(() => expect(reached.size).toBe(2));
+      expect(directory.inFlightCount()).toBe(0);
+      expect(directory.releaseCustodyCount()).toBe(2);
+      release();
+      await Promise.all(creating);
+      expect(directory.inFlightCount()).toBe(0);
+      expect(directory.releaseCustodyCount()).toBe(0);
+    } finally { release(); await Promise.allSettled(creating); }
+  });
+
+  it.each([false, true])("joins read-triggered orphan custody and prevents checkpoint re-entry (strict: %s)", async strict => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-directory-orphan-checkpoint-"));
+    roots.push(root);
+    const { directory } = open(root, "alpha");
+    const actor = await directory.create({ name: "checkpoint idle", instructions: "Wait." });
+    let release!: (value: number) => void;
+    const gate = new Promise<number>(resolve => { release = resolve; });
+    const reconcile = vi.spyOn(SessionActorOrphans.prototype, "reconcile").mockImplementationOnce(() => gate);
+    let checkpoint: Promise<void> | undefined;
+    try {
+      directory.status(actor.id);
+      expect(directory.inFlightCount()).toBe(0);
+      expect(directory.releaseCustodyCount()).toBe(1);
+      directory.pauseForRelease({ strict });
+      let finished = false;
+      checkpoint = directory.checkpointForRelease().then(() => { finished = true; });
+      directory.status(actor.id);
+      directory.list();
+      await new Promise<void>(resolve => setImmediate(resolve));
+      expect(finished).toBe(false);
+      expect(reconcile).toHaveBeenCalledOnce();
+      release(0);
+      await checkpoint;
+      directory.status(actor.id);
+      directory.list();
+      expect(reconcile).toHaveBeenCalledOnce();
+      expect(directory.releaseCustodyCount()).toBe(0);
+      expect(directory.releaseCheckpointReceipt()).toMatchObject({ project: { scope: "project" }, session: { scope: "session" } });
+    } finally { release(0); await checkpoint?.catch(() => undefined); reconcile.mockRestore(); }
   });
 
   it("does not write to or delete durable roots from a transient participant runtime", async () => {

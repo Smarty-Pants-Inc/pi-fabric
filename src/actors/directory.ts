@@ -236,6 +236,9 @@ export class ActorDirectory extends ActorManager {
   override async checkpointForRelease(assertHeld?: () => void): Promise<void> {
     this.#releaseCheckpointReady = false;
     assertHeld?.();
+    if (this.#orphanReconcilePending) {
+      assertHeld?.(); await this.#orphanReconcilePending; assertHeld?.();
+    }
     await super.checkpointForRelease(assertHeld);
     assertHeld?.();
     await this.#secondary.checkpointForRelease(assertHeld);

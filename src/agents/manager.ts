@@ -231,6 +231,11 @@ const promptMetadata = (task: string, promptPath: string): AgentPromptMetadata =
   };
 };
 
+/** The physical filesystem host, captured once at import: production never changes
+ * process.platform, while tests may mock it after load. Windows has no POSIX mode bits
+ * and no directory fsync. */
+const NATIVE_WINDOWS_FILESYSTEM = process.platform === "win32";
+
 /** Write private task/provenance bytes without ever following a planted link. */
 const writePrivateFileAtomic = (filePath: string, bytes: Uint8Array): void => {
   const temporary = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
@@ -248,7 +253,7 @@ const writePrivateFileAtomic = (filePath: string, bytes: Uint8Array): void => {
     fs.closeSync(fd);
     fd = undefined;
     renameAtomic(temporary, filePath);
-    syncDirectoryChain(path.dirname(filePath));
+    if (!NATIVE_WINDOWS_FILESYSTEM) syncDirectoryChain(path.dirname(filePath));
   } finally {
     if (fd !== undefined) fs.closeSync(fd);
     try { fs.rmSync(temporary, { force: true }); } catch { /* The committed file is already authoritative. */ }
@@ -264,7 +269,8 @@ const promptFileMatches = (filePath: string, expectedSha256: string, expectedByt
   try {
     fd = fs.openSync(filePath, fs.constants.O_RDONLY | noFollow);
     const before = fs.fstatSync(fd);
-    if (!before.isFile() || before.nlink !== 1 || (before.mode & 0o777) !== 0o600 || before.size !== expectedBytes) return false;
+    if (!before.isFile() || before.nlink !== 1 ||
+        (!NATIVE_WINDOWS_FILESYSTEM && (before.mode & 0o777) !== 0o600) || before.size !== expectedBytes) return false;
     const hash = createHash("sha256");
     const chunk = Buffer.allocUnsafe(Math.min(64 * 1024, expectedBytes));
     for (let offset = 0; offset < expectedBytes;) {
@@ -3835,9 +3841,9 @@ export class AgentManager {
     if (!this.config.retainRuns && !this.#parentOwnedRunRoot) {
       await Promise.all(all.filter(managed => this.#canCollect(managed))
         .map(async (managed) => {
-          // Failed/cancelled/timed-out prompts remain beside their terminal
-          // status for the normal 24 h sweep; successful runs keep today's
-          // deletion behavior. Oversized prompts are dropped and marked in the
+          // Only failed prompts remain beside their terminal status for the
+          // normal 24 h sweep; successful, stopped and timed-out runs keep
+          // today's whole-tree deletion behavior. Oversized prompts are dropped and marked in the
           // terminal result by #withTransportMetadata.
           // A failed prompt retention error is a custody failure: keep the whole
           // tree rather than falling back to destructive cleanup.
@@ -4993,7 +4999,7 @@ export class AgentManager {
 
   async #retainFailedPromptRecord(managed: ManagedAgent): Promise<boolean> {
     const record = readRecord(managed.statusFile) ?? managed.latestRecord;
-    if (!record || !["failed", "stopped", "timed_out"].includes(record.status)) return false;
+    if (!record || record.status !== "failed") return false;
     const promptFile = path.join(managed.runDirectory, "task.txt");
     const stat = ownedStat(promptFile);
     const expectedSha256 = managed.inputSha256 ?? record.inputSha256;

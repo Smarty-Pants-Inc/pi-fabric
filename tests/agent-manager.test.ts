@@ -157,8 +157,11 @@ describe("Agent prompt retention (#11663)", () => {
     });
     const promptPath = (failedStatus as AgentRunRecord).promptPath!;
     expect(fs.readFileSync(promptPath, "utf8")).toBe(prompt);
-    expect(fs.statSync(promptPath).mode & 0o777).toBe(0o600);
-    expect(fs.statSync(path.dirname(promptPath)).mode & 0o777).toBe(0o700);
+    // Windows has no POSIX modes: exact private modes are POSIX-only.
+    if (process.platform !== "win32") {
+      expect(fs.statSync(promptPath).mode & 0o777).toBe(0o600);
+      expect(fs.statSync(path.dirname(promptPath)).mode & 0o777).toBe(0o700);
+    }
     const successfulDirectory = path.join(root, successfulHandle.id);
     await manager.close();
     expect(fs.existsSync(successfulDirectory)).toBe(false);

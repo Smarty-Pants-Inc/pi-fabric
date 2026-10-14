@@ -24,15 +24,16 @@ import { AgentManager } from "../src/agents/manager.js";
 import type { AgentRunRecord } from "../src/agents/types.js";
 import { sweepTempRunRoots } from "../src/storage/retention.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
+import { processAlive } from "../src/storage/scratch.js";
 
 const managers: AgentManager[] = [];
 const roots: string[] = [];
 const workerPath = path.resolve("tests/fixtures/fake-worker.mjs");
 
-const fixture = () => {
+const fixture = (agents: Partial<typeof DEFAULT_FABRIC_CONFIG.agents> = {}) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "agent-prompt-retention-"));
   roots.push(root);
-  const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, retainRuns: false }, { workerPath, runRoot: root });
+  const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, ...agents, retainRuns: false }, { workerPath, runRoot: root });
   managers.push(manager);
   return { root, manager };
 };
@@ -68,8 +69,12 @@ describe("Agent prompt retention at manager close (#11663)", () => {
     const successDirectory = path.join(root, successful.id);
     expect(failedRecord).toMatchObject({ promptSha256: hash(prompt), promptBytes: Buffer.byteLength(prompt), promptPath: expect.any(String) });
     expect(fs.readFileSync(taskPath, "utf8")).toBe(prompt);
-    expect(fs.statSync(taskPath).mode & 0o777).toBe(0o600);
-    expect(fs.statSync(failedDirectory).mode & 0o777).toBe(0o700);
+    // Windows has no POSIX modes (repository private-dir convention): exact
+    // mode bits are POSIX-only; every digest/bytes/artifact assertion remains.
+    if (process.platform !== "win32") {
+      expect(fs.statSync(taskPath).mode & 0o777).toBe(0o600);
+      expect(fs.statSync(failedDirectory).mode & 0o777).toBe(0o700);
+    }
 
     removalIntents.splice(0);
     await manager.close();
@@ -81,6 +86,74 @@ describe("Agent prompt retention at manager close (#11663)", () => {
       status: "failed", promptSha256: hash(prompt), promptBytes: Buffer.byteLength(prompt), promptPath: taskPath,
       inputSha256: hash(prompt), inputBytes: Buffer.byteLength(prompt),
     });
+  });
+
+  // Counterexample: retention is for failed runs ONLY. A stopped or timed-out
+  // run must keep today's whole-tree removal when retainRuns is false, while a
+  // failed run in the same manager is still retained. removeTree is mocked, so
+  // this inspects the recorded removal plan without executing product deletion.
+  it.each(["stopped", "timed_out"] as const)("plans whole-tree removal for a %s run while retaining a failed run", async (terminal) => {
+    const { manager } = fixture(terminal === "timed_out" ? { timeoutMs: 1_500 } : {});
+    const prompt = "FAIL_DIRECTIVE\ncontrol failed brief\n";
+    const failed = await manager.spawn({ task: prompt, transport: "process" });
+    await expect(manager.wait(failed.id)).resolves.toMatchObject({ status: "failed" });
+    const failedTask = (manager.status(failed.id) as AgentRunRecord).promptPath!;
+    const failedDirectory = path.dirname(failedTask);
+
+    const handle = await manager.spawn({ task: `HANG until ${terminal}`, transport: "process" });
+    if (terminal === "stopped") await expect(manager.stop(handle.id)).resolves.toMatchObject({ status: "stopped" });
+    else await expect(manager.wait(handle.id)).resolves.toMatchObject({ status: "timed_out" });
+    const directory = manager.runDirectory(handle.id)!;
+    expect(fs.existsSync(path.join(directory, "status.json"))).toBe(true);
+
+    removalIntents.splice(0);
+    await manager.close();
+    // Exactly one whole-tree intent for the non-failed run; no per-entry
+    // retention plan (which would keep status.json/task.txt) for it.
+    expect(removalIntents.filter(target => target === directory || target.startsWith(directory + path.sep))).toEqual([directory]);
+    expect(savedStatus(path.join(directory, "task.txt")).promptRetentionDropped).toBeUndefined();
+    // The failed control is still retained beside its status record.
+    expect(removalIntents).not.toContain(failedDirectory);
+    expect(removalIntents).not.toContain(failedTask);
+    expect(removalIntents).not.toContain(path.join(failedDirectory, "status.json"));
+    expect(fs.readFileSync(failedTask, "utf8")).toBe(prompt);
+    expect(savedStatus(failedTask)).toMatchObject({ status: "failed", promptSha256: hash(prompt), promptBytes: Buffer.byteLength(prompt) });
+  });
+
+  // Close with one running worker and one queued admission: the queued receipt
+  // settles stopped without launching, the real primary exits (checked ESRCH),
+  // and only the active run's whole tree gets a (mocked) removal intent.
+  it("closes a running worker with queued admission, removing only the active tree", async () => {
+    const { manager } = fixture({ maxConcurrent: 1 });
+    const prompt = "FAIL_DIRECTIVE\nqueued-close failed control\n";
+    const failed = await manager.spawn({ task: prompt, transport: "process" });
+    await expect(manager.wait(failed.id)).resolves.toMatchObject({ status: "failed" });
+    const failedTask = (manager.status(failed.id) as AgentRunRecord).promptPath!;
+    const failedDirectory = path.dirname(failedTask);
+
+    const active = await manager.spawn({ task: "HANG_WITH_PROGRESS", transport: "process" });
+    await vi.waitFor(() => expect(manager.status(active.id)).toMatchObject({ status: "running", turns: 3 }), { timeout: 5_000 });
+    const pid = Number((manager.status(active.id) as AgentRunRecord).sessionId);
+    expect(Number.isSafeInteger(pid) && pid > 0 && processAlive(pid)).toBe(true);
+    const directory = manager.runDirectory(active.id)!;
+    const launchSpy = vi.spyOn(ProcessTransport.prototype, "launch"); // observer only: passes through
+    try {
+      const queued = await manager.spawn({ task: "queued successful task", transport: "process" });
+      expect(manager.status(queued.id)).toMatchObject({ status: "queued" });
+      const queuedWait = manager.wait(queued.id);
+
+      removalIntents.splice(0);
+      await manager.close();
+      await expect(queuedWait).resolves.toMatchObject({ status: "stopped" });
+      expect(launchSpy).not.toHaveBeenCalled();
+      expect(processAlive(pid), "checked ESRCH for the captured primary").toBe(false);
+      expect(removalIntents.filter(target => target === directory || target.startsWith(directory + path.sep))).toEqual([directory]);
+      expect(removalIntents.filter(target => target === failedDirectory || target.startsWith(failedDirectory + path.sep))).toEqual([]);
+      expect(fs.readFileSync(failedTask, "utf8")).toBe(prompt);
+      expect(savedStatus(failedTask)).toMatchObject({ status: "failed", promptSha256: hash(prompt) });
+    } finally {
+      launchSpy.mockRestore();
+    }
   });
 
   it("records task.txt drop on tamper and persists mismatch metadata", async () => {

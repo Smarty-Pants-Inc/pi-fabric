@@ -168,7 +168,8 @@ const expectDetachedGrandchild = (report: Report, procs: Proc[]): void => {
 // Stop-observation mechanism: real fs.watch and a recording cgroup.kill file, not a kernel cgroup.
 // No process is signalled. Trust-boundary regression: only populated=0 can confirm subtree stop;
 // unchanged populated=1, malformed receipts and watcher failure must keep typed custody debt.
-describe("owned cgroup.events stop confirmation (smarty-dev#8257)", () => {
+// Linux only: the retained /proc descriptor path and cgroup.events have no non-Linux counterpart.
+describe.skipIf(process.platform !== "linux")("owned cgroup.events stop confirmation (smarty-dev#8257)", () => {
   const fds: number[] = [];
   afterEach(() => { for (const fd of fds.splice(0)) fs.closeSync(fd); });
   const fixture = () => {

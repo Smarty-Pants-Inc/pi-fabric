@@ -8,6 +8,7 @@ import { RecordsProvider } from "./providers/records-provider.js";
 import { closeWithActors } from "./actors/close-order.js";
 import { OutputArtifactStore } from "./output-budget.js";
 import { resolveAgentDir } from "./core/agent-dir.js";
+import { fabricWarn } from "./core/diagnostics.js";
 import { recordMainRelease } from "./lifecycle/release-process.js";
 import { loadedFabricRoot } from "./core/agent-dir.js";
 import type { FabricModelCandidate } from "./core/model-resolution.js";
@@ -915,7 +916,7 @@ export class FabricRuntimeState {
       identity,
       onRootCollision: collision => {
         const warning = `Duplicate live Fabric root (${collision.reason}): ${collision.name}; ${collision.ids.join(", ")}. Fixture forks must use PI_FABRIC_FIXTURE=1.`;
-        console.warn(`[pi-fabric] ${warning}`);
+        fabricWarn(`[pi-fabric] ${warning}`);
         live.read(ctx => { if (ctx.hasUI) ctx.ui.notify(warning, "warning"); });
       },
       live: live.current,
@@ -1010,7 +1011,7 @@ export class FabricRuntimeState {
           if (!ctx.hasUI) return false;
           ctx.ui.notify(message, "warning");
           return true;
-        }) !== true) console.warn(`[pi-fabric] ${message}`);
+        }) !== true) fabricWarn(`[pi-fabric] ${message}`);
       },
       // Both gates: this activation's custody/succession completed (main) AND its
       // directory epoch is committed under a live, renewed lease (#709).
@@ -1199,7 +1200,7 @@ export class FabricRuntimeState {
         // Always addressed (pi-fabric#939 P2-b): the owner identity, else this Main itself; never a broadcast.
         const to = admissionAlarmRecipient(process.env.PI_FABRIC_OWNER_IDENTITY_ID, from);
         if (!to) {
-          console.warn("[pi-fabric] agent-admission alarm not published: no owner session address (the stderr line stands)");
+          fabricWarn("[pi-fabric] agent-admission alarm not published: no owner session address (the stderr line stands)");
           return;
         }
         // A named run's failed recovery save is an ops.owner alarm (pi-fabric#939 round 4); the held count stays a fabric.alarm.
@@ -1526,7 +1527,7 @@ export class FabricRuntimeState {
       await this.#participants.start();
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
-      console.warn(
+      fabricWarn(
         `[pi-fabric] Initial mesh publish failed (${detail}); the participant heartbeat will keep retrying.`,
       );
       if (context.hasUI) {
@@ -2258,7 +2259,7 @@ export class FabricRuntimeState {
     const mesh = this.#mesh, identity = this.#identity;
     const owner = process.env.PI_FABRIC_OWNER_IDENTITY_ID?.trim() || undefined;
     void this.#backgroundMesh.enqueue(() => providerDeadAlarms(mesh, identity, rootId, event, owner)).catch((error: unknown) => {
-      console.warn("[pi-fabric] provider-dead ops.owner alarm failed", error);
+      fabricWarn("[pi-fabric] provider-dead ops.owner alarm failed", error);
     });
   }
 

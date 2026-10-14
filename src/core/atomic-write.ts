@@ -11,6 +11,7 @@ export const bashProcessEnvironment = (environment: NodeJS.ProcessEnv = process.
     ? { PI_FABRIC_LANDLOCK_WRITES: environment.PI_FABRIC_LANDLOCK_WRITES } : {}),
 });
 import { retryDelayMs } from "./retry-backoff.js";
+import { fabricDiagnosticsHaveTerminalUI, fabricWarn } from "./diagnostics.js";
 import { randomUUID } from "node:crypto";
 import childProcess from "node:child_process";
 import fs from "node:fs";
@@ -725,7 +726,7 @@ export const alarmForeignHolder = (error: MeshLockForeignHolderError): void => {
   const key = `${error.lockPath}\n${error.holderToken}`;
   if (alarmedHolders.has(key)) return;
   alarmedHolders.add(key);
-  try { console.warn(`[pi-fabric] ALARM ${error.foreignCode}: ${error.message}`); } catch { /* an alarm never masks the refusal */ }
+  try { fabricWarn(`[pi-fabric] ALARM ${error.foreignCode}: ${error.message}`); } catch { /* an alarm never masks the refusal */ }
 };
 
 // Compatible with older stores and the bridge's deliberately narrow error wire.
@@ -797,7 +798,9 @@ export const meshJournalMirrorFailures = (): number => journalMirrorFailures;
 const mirrorMeshJournalLine = (line: string): void => {
   if (process.platform !== "linux" || journalToolUnavailable) return;
   const stream = process.env.JOURNAL_STREAM;
-  if (stream && /^\d+:\d+$/.test(stream)) {
+  // A TUI-active diagnostic goes to the private log, not fd 2. Even a journal-backed
+  // stderr therefore needs the independent native mirror in this mode.
+  if (!fabricDiagnosticsHaveTerminalUI() && stream && /^\d+:\d+$/.test(stream)) {
     try {
       const stat = fs.fstatSync(2, { bigint: true });
       if (stream === `${stat.dev}:${stat.ino}`) return;
@@ -824,7 +827,7 @@ const mirrorMeshJournalLine = (line: string): void => {
 };
 const emitMeshJournalAlarm = (alarm: Parameters<typeof meshJournalAlarmLine>[0]): void => {
   const line = meshJournalAlarmLine(alarm);
-  console.warn(line);
+  fabricWarn(line);
   mirrorMeshJournalLine(line);
 };
 
@@ -956,7 +959,7 @@ export class MeshBackgroundRetry {
     // Final summary: retries suppressed after the last line are reported once the window
     // has passed, so an outage that ends inside a window is not silently dropped. It takes
     // that window's single line; a later outage inside it is counted, not printed.
-    console.warn(`[pi-fabric] ${this.label}: mesh lock recovered (${this.#suppressed} similar retries suppressed in the last ${Math.floor(elapsedMs / 1_000)}s)`);
+    fabricWarn(`[pi-fabric] ${this.label}: mesh lock recovered (${this.#suppressed} similar retries suppressed in the last ${Math.floor(elapsedMs / 1_000)}s)`);
     this.#lastReportedAt = now;
     this.#suppressed = 0;
   }
@@ -968,7 +971,7 @@ export class MeshBackgroundRetry {
       // retry cadence. Only a typed acquisition failure earns lock backoff/deduplication.
       // Not proof that the lock is free: no recovery summary, suppression is kept.
       this.#resetBackoff();
-      console.warn(`[pi-fabric] ${this.label}: background operation failed: ${error instanceof Error ? error.message : String(error)}`);
+      fabricWarn(`[pi-fabric] ${this.label}: background operation failed: ${error instanceof Error ? error.message : String(error)}`);
       return false;
     }
     this.#delay = Math.min(this.maxMs, Math.max(this.minMs, this.#delay * 2));
@@ -992,7 +995,7 @@ export class MeshBackgroundRetry {
     if (elapsedMs >= this.warningWindowMs) {
       const summary = this.#suppressed > 0
         ? ` (${this.#suppressed} similar retries suppressed in the last ${Math.floor(elapsedMs / 1_000)}s)` : "";
-      console.warn(`[pi-fabric] ${this.label}: ${isMeshLockTimeout(error) ? "mesh lock timeout; retrying" : "mesh WAL cap; retrying"} in ${delayMs} ms: ${meshDeferredSummary(error)}${summary}`);
+      fabricWarn(`[pi-fabric] ${this.label}: ${isMeshLockTimeout(error) ? "mesh lock timeout; retrying" : "mesh WAL cap; retrying"} in ${delayMs} ms: ${meshDeferredSummary(error)}${summary}`);
       this.#lastReportedAt = now;
       this.#suppressed = 0;
     } else {
@@ -1035,7 +1038,7 @@ export class MeshBackgroundQueue {
     // Bounded best-effort notifications. Durable protocol cursors are not stored here.
     if (this.#pending.length >= 1_000) {
       this.#failed = true;
-      console.warn("[pi-fabric] background mesh notification queue full; dropping newest notification");
+      fabricWarn("[pi-fabric] background mesh notification queue full; dropping newest notification");
       return Promise.resolve();
     }
     const admission = new Promise<void>(resolve => this.#pending.push({ operation, attempted: resolve }));

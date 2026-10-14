@@ -1,4 +1,5 @@
 import { appendDeliveryOutcome, type DeliverySend } from "../mesh/delivery-outcomes.js";
+import { fabricWarn } from "../core/diagnostics.js";
 import type { MeshControlIncarnationFence } from "../config.js";
 import { FabricParticipantStaleError, participantLeaseGraceMs } from "./host-leases.js";
 import { retryDelayMs } from "../core/retry-backoff.js";
@@ -64,7 +65,7 @@ export const controlOwnerIncarnation = (participant: {
 };
 /** One-line counted diagnostic; a legacy route remains authorized by its existing checks. */
 export const warnUnfencedControlDelivery = (operation: FabricControlOperation, targetId: string, count: number): void => {
-  console.warn(`[pi-fabric] Unfenced legacy control delivery count=${count} operation=${operation} target=${JSON.stringify(targetId)}`);
+  fabricWarn(`[pi-fabric] Unfenced legacy control delivery count=${count} operation=${operation} target=${JSON.stringify(targetId)}`);
 };
 const DEFAULT_RESULT_TIMEOUT_MS = 60 * 60 * 1_000;
 const MAX_CONTROL_TIMEOUT_MS = 24 * 60 * 60 * 1_000 + 60_000;
@@ -317,7 +318,7 @@ export interface FabricControlPlaneOptions {
   controlIncarnationFence?: MeshControlIncarnationFence;
   /** Must match this activation's participant directory. */
   ownerIncarnation?: string;
-  /** Told each rate-limited unfenced legacy sender warning (default: console.warn). */
+  /** Told each rate-limited unfenced legacy sender warning (default: fabricWarn). */
   onUnfencedSenderWarning?: (message: string) => void;
   enabled: boolean;
   hostId: string;
@@ -1373,7 +1374,7 @@ export class FabricControlPlane {
     const message = `Unfenced legacy sender delivery count=${count} sender=${JSON.stringify(from.id)} operation=${command.operation} target=${JSON.stringify(command.targetId)} mesh.controlIncarnationFence=warn`;
     try {
       if (this.options.onUnfencedSenderWarning) this.options.onUnfencedSenderWarning(message);
-      else console.warn(`[pi-fabric] ${message}`);
+      else fabricWarn(`[pi-fabric] ${message}`);
     } catch { /* A diagnostic sink never fails an admitted delivery. */ }
   }
 

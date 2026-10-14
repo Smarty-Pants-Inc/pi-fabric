@@ -1,3 +1,4 @@
+import { fabricWarn } from "../core/diagnostics.js";
 import {
   FABRIC_WORKFLOW_ITEM_EVENT,
   type FabricWorkflowItemEventV1,
@@ -148,7 +149,7 @@ export class FabricWorkflowItemTransitions {
     try {
       this.emit(FABRIC_WORKFLOW_ITEM_EVENT, event);
     } catch (error) {
-      console.warn(
+      fabricWarn(
         `[pi-fabric] workflow item event listener failed: ${error instanceof Error ? error.message : String(error)}`,
       );
     }

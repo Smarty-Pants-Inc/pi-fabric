@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { fabricWarn } from "../core/diagnostics.js";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
@@ -381,7 +382,7 @@ export async function wakeResidentActors(mesh: Pick<MeshStore, "root" | "listAll
           await acknowledge(root, delivery);
         } catch { /* Double failure: write nothing else. The archive-coupled index remains pending. */ }
       }
-      console.warn(`[pi-fabric] resident wake deferred for ${root}: ${String(error)}`);
+      fabricWarn(`[pi-fabric] resident wake deferred for ${root}: ${String(error)}`);
     }
   }
 }

@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { fabricWarn } from "../core/diagnostics.js";
 import path from "node:path";
 import { writeJsonAtomic } from "../core/atomic-write.js";
 import { processStartTime } from "../residency/process-identity.js";
@@ -80,7 +81,7 @@ export const countUnknownEnodevStarts = (directories: readonly string[], actorId
     highest = Math.max(highest, next);
     if (next !== prior) {
       try { writeJsonAtomic(file, { ...marker, unknownStarts: next }, { durable: true }); } catch (error) {
-        console.warn(`[pi-fabric] actor ${actorId}: could not save unknownStarts ${next} in ${file}: ${String(error)} (smarty-dev#8935)`);
+        fabricWarn(`[pi-fabric] actor ${actorId}: could not save unknownStarts ${next} in ${file}: ${String(error)} (smarty-dev#8935)`);
         if (unknown) { highest = Math.max(highest, UNKNOWN_STARTS_ALARM); alarm = true; }
       }
     }

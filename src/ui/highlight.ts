@@ -1,4 +1,5 @@
 import { readFileSync, statSync } from "node:fs";
+import { fabricWarn } from "../core/diagnostics.js";
 import { basename, extname } from "node:path";
 import { shikiLanguages, shikiThemeType } from "./shiki-catalog.js";
 import type { GrammarState, Highlighter } from "shiki";
@@ -385,7 +386,7 @@ export async function initHighlighting(theme: string, syntaxEnabled = true): Pro
   } catch (error) {
     if (version !== initVersion) return;
     initializingTheme = undefined;
-    console.warn("[pi-fabric] Shiki failed to initialize; previews will be plain text.", error);
+    fabricWarn("[pi-fabric] Shiki failed to initialize; previews will be plain text.", error);
     highlighter?.dispose();
     highlighter = undefined;
     readyTheme = undefined;

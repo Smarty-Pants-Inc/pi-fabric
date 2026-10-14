@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { fabricStderr } from "../core/diagnostics.js";
 import type { ChildProcess } from "node:child_process";
 
 /** Background observation cadence for a live execution group. Each tick walks
@@ -28,7 +29,7 @@ const descendantWalkAvailable = (): boolean => {
   if (childrenAvailable !== undefined) return childrenAvailable;
   childrenAvailable = fs.existsSync(`/proc/${process.pid}/task/${process.pid}/children`);
   if (!childrenAvailable) {
-    process.stderr.write("[pi-fabric] /proc/<pid>/task/<tid>/children unavailable; execution-group custody falls back to a full /proc scan\n");
+    fabricStderr("[pi-fabric] /proc/<pid>/task/<tid>/children unavailable; execution-group custody falls back to a full /proc scan\n");
   }
   return childrenAvailable;
 };

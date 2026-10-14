@@ -11,6 +11,7 @@ import { ProcessTransport } from "../src/agents/transports/process-transport.js"
 import { normalizeAgentRunRequest } from "../src/agents/request.js";
 import { normalizeFabricConfig, DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import type { JevResponse } from "../src/jev/types.js";
+import { taskControlDirectory } from "../src/worker/terminal-answer.js";
 
 // Keep native spawn, but own its exact child/close event before launch returns.
 // Transport liveness can report exit before Windows releases the cwd handle.
@@ -376,10 +377,12 @@ describe("durable route dispatch", () => {
   });
 
   it("R2 retains and retries a failed queued outcome before cleanup", async () => {
-    const dir = root(); const manager = new AgentManager(dir, { ...DEFAULT_FABRIC_CONFIG.agents, maxConcurrent: 1 }, { workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(dir, "runs") }); managers.push(manager);
+    const dir = root(); const manager = new AgentManager(dir, { ...DEFAULT_FABRIC_CONFIG.agents, maxConcurrent: 1, retainRuns: true }, { workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(dir, "runs") }); managers.push(manager);
     const blocker = await manager.spawn({ task: "HANG", transport: "process" });
     const decision = await decideModelRoute(input, async () => response());
     const queued = await manager.spawn({ task: "lookup", routeDecision: decision, transport: "process" });
+    // The manager's host producer publishes the current-only protected binding before queueing.
+    expect(fs.existsSync(taskControlDirectory(path.join(dir, "runs", queued.id)))).toBe(true);
     const open = fs.openSync; let broken = true;
     vi.spyOn(fs, "openSync").mockImplementation((file, flags, mode) => { if (String(file).endsWith("model-routing.jsonl") && broken) throw new Error("temporary ledger outage"); return open(file, flags, mode); });
     const result = await manager.stop(queued.id);
@@ -395,10 +398,12 @@ describe("durable route dispatch", () => {
   });
 
   it("R2 retries the first queued append failure and writes exactly one outcome", async () => {
-    const dir = root(); const manager = new AgentManager(dir, { ...DEFAULT_FABRIC_CONFIG.agents, maxConcurrent: 1 }, { workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(dir, "runs") }); managers.push(manager);
+    const dir = root(); const manager = new AgentManager(dir, { ...DEFAULT_FABRIC_CONFIG.agents, maxConcurrent: 1, retainRuns: true }, { workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(dir, "runs") }); managers.push(manager);
     const blocker = await manager.spawn({ task: "HANG", transport: "process" });
     const decision = await decideModelRoute(input, async () => response());
     const queued = await manager.spawn({ task: "lookup", routeDecision: decision, transport: "process" });
+    // The manager's host producer publishes the current-only protected binding before queueing.
+    expect(fs.existsSync(taskControlDirectory(path.join(dir, "runs", queued.id)))).toBe(true);
     const open = fs.openSync; let attempts = 0;
     vi.spyOn(fs, "openSync").mockImplementation((file, flags, mode) => { if (String(file).endsWith("model-routing.jsonl") && ++attempts === 1) throw new Error("first append failed"); return open(file, flags, mode); });
     const result = await manager.stop(queued.id); expect(result.warnings).toBeUndefined(); expect(attempts).toBe(2);

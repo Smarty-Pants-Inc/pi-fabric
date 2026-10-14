@@ -1,4 +1,3 @@
-import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -8,8 +7,9 @@ import { ProcessTransport } from "../src/agents/transports/process-transport.js"
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { TaskCgroupStopUnconfirmedError, TaskScopeAdmissionError } from "../src/agents/transports/task-cgroup.js";
 import type { AgentHandleInfo, AgentTransportHandle } from "../src/agents/types.js";
+import { taskCgroupUnavailableReason } from "./helpers/task-cgroup-capability.js";
 
-// smarty-dev#8257: REAL native E2E. A process task gets a capped systemd --user scope
+// smarty-dev#8257: real OS/process integration (custom worker, not native Pi E2E). A process task gets a capped systemd --user scope
 // (fabric-task-<unique>.scope, MemoryMax + MemorySwapMax=0), and stopping it ends EVERY process
 // born in that cgroup, including a setsid grandchild in its own session/PGID and an orphan that
 // was reparented away from the worker before stop. No systemd, cgroup or process mocks, except
@@ -17,17 +17,7 @@ import type { AgentHandleInfo, AgentTransportHandle } from "../src/agents/types.
 // The suite wrapper may strip the user bus: then this file skips, unless
 // FABRIC_TASK_CGROUP_E2E_REQUIRED=1, where a missing prerequisite is a failure.
 const GIB = 1024 ** 3;
-const skipReason = ((): string | undefined => {
-  if (process.platform !== "linux") return "not Linux";
-  try { if (fs.statfsSync("/sys/fs/cgroup").type !== 0x63677270) return "/sys/fs/cgroup is not cgroup v2"; }
-  catch { return "no /sys/fs/cgroup"; }
-  // Delegation probe: a capped scope must show its own memory.max (memory controller delegated).
-  const probe = spawnSync("systemd-run", ["--user", "--scope", "--quiet", "--collect", "-p", "MemoryMax=1G", "-p", "MemorySwapMax=0", "--",
-    "/bin/sh", "-c", 'cat "/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup)/memory.max"'], { encoding: "utf8", timeout: 10_000 });
-  if (probe.error || probe.status !== 0) return `no usable systemd-run --user (${probe.error?.message ?? (probe.stderr.trim() || probe.status)})`;
-  if (probe.stdout.trim() !== String(GIB)) return `memory controller not delegated (memory.max=${probe.stdout.trim()})`;
-  return undefined;
-})();
+const skipReason = taskCgroupUnavailableReason();
 const required = process.env.FABRIC_TASK_CGROUP_E2E_REQUIRED === "1";
 if (skipReason && !required) console.log(`task-cgroup e2e skipped: ${skipReason}`);
 

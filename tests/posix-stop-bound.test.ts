@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { launchLog, same, stopOwned, type Owned } from "./helpers/owned-processes.js";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agents/manager.js";
 import { spawnDetached } from "../src/agents/transports/process-utils.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
@@ -15,6 +15,12 @@ import * as launcherOwner from "../src/residency/launcher-owner.js";
 vi.mock("node:child_process", async importOriginal => {
   const actual = await importOriginal<typeof import("node:child_process")>();
   return { ...actual, spawn: vi.fn(actual.spawn) };
+});
+// This suite asserts the legacy process-group deadline/debt contract. An eligible
+// host's new default task cgroup has a different positive whole-tree receipt.
+beforeEach(() => {
+  vi.stubEnv("DBUS_SESSION_BUS_ADDRESS", undefined);
+  vi.stubEnv("XDG_RUNTIME_DIR", undefined);
 });
 afterEach(async () => {
   vi.useRealTimers(); vi.restoreAllMocks(); vi.unstubAllEnvs();

@@ -165,11 +165,28 @@ describe("host/root-only processMemoryMaxBytes (smarty-dev#8257)", () => {
     }) as typeof fs.fstatSync);
     try { return run(); } finally { vi.restoreAllMocks(); fs.rmSync(path.dirname(HOST_POLICY_PATH), { recursive: true, force: true }); }
   };
+  // The fixture simulates root ownership only, never kernel capability. readHostPolicy needs O_NOFOLLOW to prove
+  // root policy (absent on Windows) and otherwise fails closed to the default; that is asserted, not skipped.
+  const rootPolicyProvable = typeof fs.constants.O_NOFOLLOW === "number";
   it("takes a custom value from the root host policy only", () => {
     const cwd = temporaryDirectory(); const agentDir = temporaryDirectory(); fs.mkdirSync(path.join(cwd, ".pi"));
     fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({ agents: { processMemoryMaxBytes: 1024 ** 4 } }));
     expect(withRootPolicy({ agents: { processMemoryMaxBytes: 8 * 1024 ** 3 } },
-      () => loadFabricConfig({ cwd, agentDir, projectTrusted: true }).agents.processMemoryMaxBytes)).toBe(8 * 1024 ** 3);
+      () => loadFabricConfig({ cwd, agentDir, projectTrusted: true }).agents.processMemoryMaxBytes))
+      .toBe(rootPolicyProvable ? 8 * 1024 ** 3 : DEFAULT);
+  });
+  it.runIf(rootPolicyProvable)("fails closed to the default without O_NOFOLLOW, even with root-owned policy", async () => {
+    // Proxy the test's fs so withRootPolicy's root-owner spies still apply; only O_NOFOLLOW is removed.
+    const { O_NOFOLLOW: _omitted, ...constants } = fs.constants;
+    const noNofollow = new Proxy({} as typeof fs, { get: (_, key) => key === "constants" ? constants : Reflect.get(fs, key) });
+    vi.doMock("node:fs", () => ({ ...fs, default: noNofollow, constants }));
+    vi.resetModules();
+    try {
+      const { loadFabricConfig: load } = await import("../src/config.js");
+      const cwd = temporaryDirectory(); const agentDir = temporaryDirectory();
+      expect(withRootPolicy({ agents: { processMemoryMaxBytes: 8 * 1024 ** 3 } },
+        () => load({ cwd, agentDir, projectTrusted: true }).agents.processMemoryMaxBytes)).toBe(DEFAULT);
+    } finally { vi.doUnmock("node:fs"); vi.resetModules(); }
   });
 });
 

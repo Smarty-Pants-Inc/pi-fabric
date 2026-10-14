@@ -9,6 +9,7 @@ import { AgentManager } from "../src/agents/manager.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 import { ProcessTreeCustodyUnconfirmedError, spawnDetached } from "../src/agents/transports/process-utils.js";
 import type { AgentTransportHandle } from "../src/agents/types.js";
+import { taskCgroupUnavailableReason } from "./helpers/task-cgroup-capability.js";
 
 vi.mock("node:child_process", async importOriginal => {
   const actual = await importOriginal<typeof import("node:child_process")>();
@@ -22,6 +23,7 @@ afterEach(async () => {
   // this after useRealTimers would reinstall a detached fake setTimeout.
   vi.restoreAllMocks();
   vi.useRealTimers();
+  vi.unstubAllEnvs();
   for (const manager of managers.splice(0)) await manager.close().catch(() => undefined);
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
   vi.mocked(spawn).mockReset();
@@ -34,7 +36,13 @@ const root = () => {
 };
 const tick = () => new Promise<void>(resolve => setImmediate(resolve));
 
+const legacyUserEnvironment = (): void => {
+  vi.stubEnv("DBUS_SESSION_BUS_ADDRESS", undefined);
+  vi.stubEnv("XDG_RUNTIME_DIR", undefined);
+};
+
 async function nativeWorker(run: (handle: AgentTransportHandle, child: ChildProcess) => Promise<void>) {
+  legacyUserEnvironment(); // receipt/timer assertions name the uncapped legacy route
   const directory = root();
   const workerPath = path.join(directory, "worker.mjs");
   fs.writeFileSync(workerPath, "setInterval(() => {}, 1000);\n");
@@ -440,6 +448,13 @@ async function fixtureTree(termGraceMs = 7_000, scoped = false, initialPopulated
   });
   const unconfirmed = vi.fn();
   const scope = scoped ? { executable: "/fixture-systemd-run", slice: "fixture.slice", warn: vi.fn() } : undefined;
+  if (viaTransport) {
+    // This is an uncapped receipt mechanism, with fake children/files/clock. Do
+    // not select the capped admission protocol or depend on a host executable.
+    legacyUserEnvironment();
+    fs.writeFileSync(path.join(directory, "systemd-run"), "#!/bin/sh\nexit 125\n", { mode: 0o700 });
+    vi.stubEnv("PATH", `${directory}${path.delimiter}${process.env.PATH ?? ""}`);
+  }
   const transport = viaTransport ? await new ProcessTransport("fixture.slice").launch({
     id: "receipt-fixture", name: "receipt-fixture", cwd: directory, workerPath, workerArguments: [], onUnconfirmedExit: unconfirmed,
   }) : undefined;
@@ -634,16 +649,11 @@ describe.skipIf(process.platform !== "linux")("scoped tree-empty event delivery"
   });
 });
 
-// smarty-dev#8257: a bus socket on disk is not a usable bus; systemd-run --user needs it in THIS
-// environment (the no-bus suite wrapper scrubs it). A delegated host now admits a capped task scope.
-const userBusUsable = (): boolean => {
-  const runtime = process.env.XDG_RUNTIME_DIR;
-  const bus = process.env.DBUS_SESSION_BUS_ADDRESS?.match(/^unix:path=([^,;]+)/)?.[1];
-  const socket = (file: string | undefined) => { try { return Boolean(file) && fs.statSync(file!).isSocket(); } catch { return false; } };
-  return socket(runtime ? path.join(runtime, "bus") : undefined) || socket(bus);
-};
-describe.skipIf(process.platform !== "linux")("real owned systemd user scope", () => {
-  it.skipIf(!userBusUsable())("waits for a real cgroup-v2 descendant after primary native close", async () => {
+// A socket on disk does not prove a working user manager or delegated memory.
+// Only this real integration skips for a failed real, owned capped-scope probe.
+const realScopeUnavailable = taskCgroupUnavailableReason();
+describe("real owned systemd user scope", () => {
+  it.skipIf(realScopeUnavailable !== undefined)("waits for a real cgroup-v2 descendant after primary native close", async () => {
     const directory = root();
     const workerPath = path.join(directory, "scoped-worker.mjs");
     const descendant = `const fs = require("node:fs");
@@ -690,6 +700,7 @@ describe.skipIf(process.platform !== "linux")("real owned systemd user scope", (
 
 describe.skipIf(process.platform !== "linux")("unscoped native descendant legacy delivery", () => {
   it("keeps the legacy cadence and settles a real unscoped descendant without a PR deadline", async () => {
+    legacyUserEnvironment();
     const directory = root();
     const workerPath = path.join(directory, "descendant-worker.mjs");
     const descendant = `const fs = require("node:fs");

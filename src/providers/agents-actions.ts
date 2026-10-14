@@ -81,7 +81,10 @@ const runProperties = {
       "Optional longer wall-clock limit in milliseconds. Omit to use agents.timeoutMs (60 minutes by default); values below the configured default are ignored.",
   },
   extensions: { type: "boolean" },
-  recursive: { type: "boolean" },
+  recursive: {
+    type: "boolean",
+    description: "Grant the child agents.run/spawn. Tasks are leaf by default: a task not launched recursive: true is refused with TaskSpawnDeniedError (FABRIC_TASK_SPAWN_DENIED). Setting it on your own child grants the caller nothing.",
+  },
   cwd: {
     type: "string",
     description: "Filesystem execution directory for leaf or recursive Pi runs; relative paths resolve from the caller cwd. Does not change project/mesh ownership or grant target project trust.",

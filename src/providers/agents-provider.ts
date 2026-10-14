@@ -7,6 +7,7 @@ import type { JevRequest, JevResponse } from "../jev/types.js";
 import { formatAge, residentHostId, RESIDENT_HOST_FORMAT, ResidentOutcomeUnknownError, ResidentActorAuthorizationError, assertResidentActorMain, assertResidentActorToolCeiling, type ResidentActorCaller, type ResidentActorMutation } from "../residency/protocol.js";
 import { readChildToolAllowlist } from "../core/child-tool-allowlist.js";
 import { ActorManager, ActorRegistryOwnershipError, parseBashTimeoutSeconds } from "../actors/manager.js";
+import { assertTaskSpawnAdmitted, captureTaskSpawnAdmission } from "../agents/spawn-admission.js";
 import { participantProject, recordedProjectLead, repositoryOf, resolveProjectAgent } from "../topology/project-identity.js";
 import { GlobalActorRegistry } from "../actors/global-registry.js";
 import { isFabricActorHostEvent, normalizeActorActivation, validateActorCoalesceKey, validateActorDedupeKey, validateActorInferenceContext } from "../actors/types.js";
@@ -441,6 +442,8 @@ export class AgentsProvider implements FabricProvider {
   readonly #router: AgentMessageRouter;
   readonly #projectLeadId: string | undefined;
   readonly #taskReturnAddress = readTaskReturnAddress();
+  /** Immutable launch-time admission (smarty-dev#12187): later env mutation cannot grant spawning. */
+  readonly #spawnAdmission = captureTaskSpawnAdmission();
   readonly name = "agents";
   /** Session registry of `provider:` participants; stop/steer/followUp route there. */
   providerParticipants: ProviderParticipantRegistry | undefined;
@@ -862,6 +865,9 @@ export class AgentsProvider implements FabricProvider {
   ): Promise<unknown> {
     const checkCommit = (): void => throwIfExecutionExpired(context);
     checkCommit();
+    // Leaf-by-default tasks: refuse before model policy, routing, cwd or residency resolution.
+    // The request's own recursive flag describes the child, never the caller's grant.
+    if (actionName === "run" || actionName === "spawn") assertTaskSpawnAdmitted(this.#spawnAdmission, actionName);
     // Only explicit public selections: inherited/default models and existing actors are untouched.
     if (actionName === "run" || actionName === "spawn" || actionName === "create" || actionName === "createActor") {
       const runner = checkedRunner(args.runner, this.manager.config.runner);

@@ -112,6 +112,7 @@ export interface AgentRunRequest {
   tools?: string[];
   timeoutMs?: number;
   extensions?: boolean;
+  /** Launch grant for the child's own agents.run/spawn (--granted-risks ["agent"]); tasks are leaf by default (smarty-dev#12187). */
   recursive?: boolean;
   /** Leaf or recursive execution cwd; relative to the immediate caller, independent of project/mesh lineage. */
   cwd?: string;

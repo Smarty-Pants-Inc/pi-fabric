@@ -83,6 +83,11 @@ interface FabricAgentRequest {
   /** Unix niceness 0-19 for the child and its tools; only raises agents.nice. */
   nice?: number;
   extensions?: boolean;
+  /**
+   * Grant this child agents.run/spawn. Tasks are leaf by default: a task not itself launched
+   * recursive: true gets TaskSpawnDeniedError (code FABRIC_TASK_SPAWN_DENIED, "task agents do not
+   * spawn; return your result to your spawner"). Setting it on your own child grants you nothing.
+   */
   recursive?: boolean;
   /** Filesystem execution directory; relative paths resolve from the parent agent cwd. */
   cwd?: string;

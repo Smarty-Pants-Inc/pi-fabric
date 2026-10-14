@@ -264,7 +264,7 @@ export class FabricRuntimeState {
   #componentLoader: FabricComponentLoader | undefined;
   #componentControl: FabricComponentControl | undefined;
   #componentConfiguration: FabricComponentConfiguration | undefined;
-  #stopComponentWatch: (() => void) | undefined;
+  #stopComponentWatch: ReturnType<typeof watchComponentConfiguration> | undefined;
   readonly #componentTransitionSignatures = new Map<string, string>();
   readonly #componentTransitionPublications = new Set<Promise<void>>();
   #sessionCapabilityLease: FabricCapabilityViewLease | undefined;
@@ -448,6 +448,16 @@ export class FabricRuntimeState {
   /** Why peer visibility is unknown (a stalled mesh writer), or undefined when healthy. */
   writeStalled(): Error | undefined {
     return this.#participants?.writeStalled();
+  }
+
+  /** Per-instance observation faults, separate from mesh-write/peer-visibility health. */
+  observationHealth(): string[] {
+    return [
+      ...(this.#stopComponentWatch?.observationHealth() ?? []),
+      ...(this.#lifecycle?.observationHealth() ?? []),
+      ...(this.#control?.observationHealth() ?? []),
+      ...(this.#residency?.observationHealth() ?? []),
+    ];
   }
 
   /** When this host last committed its mesh heartbeat, if it has a directory. */
@@ -1277,10 +1287,8 @@ export class FabricRuntimeState {
       const participant = this.#participants?.get(actorId, undefined, { fresh });
       return participant ? participant.ownerHostId === hostId : undefined;
     };
-    const snapshotActorOwnership = (fresh = true): ReadonlyMap<string, boolean> => new Map(
-      (this.#participants?.list({ scope: "project", fresh }) ?? [])
-        .map((participant) => [participant.id, participant.ownerHostId === hostId]),
-    );
+    const snapshotActorOwnership = (fresh = true, actorIds?: readonly string[]): ReadonlyMap<string, boolean> =>
+      this.#participants?.actorOwnership(hostId, { fresh, ...(fresh ? {} : { actorIds }) }) ?? new Map();
     // Capture this generation's directory: replacement/quiesce must veto old
     // deferred slices, and new actors cannot maintain archives before publication.
     const actorParticipants = this.#participants;

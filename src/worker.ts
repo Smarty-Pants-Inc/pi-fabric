@@ -782,8 +782,9 @@ const main = async (): Promise<void> => {
         : {}),
       ...(options.runRoot ? { PI_FABRIC_RUN_ROOT: options.runRoot } : {}),
       // Supported child contract (docs/agents.md "Child environment contract").
+      ...(options.tmpdir ? { TMPDIR: options.tmpdir, TMP: options.tmpdir, TEMP: options.tmpdir } : {}),
       ...(options.lineage ? { PI_FABRIC_LINEAGE: options.lineage } : {}),
-      ...(options.writePolicy ? { PI_FABRIC_WRITE_POLICY: options.writePolicy } : {}),
+      PI_FABRIC_WRITE_POLICY: options.writePolicy,
       // Exactly the manager's derived scope; undefined drops an inherited value.
       PI_FABRIC_SCOPE: options.scope,
       PI_FABRIC_SCOPE_FILE: undefined,

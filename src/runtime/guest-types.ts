@@ -92,7 +92,9 @@ interface FabricAgentRequest {
   /** Pi only. branch: fork this conversation (last completed turn); snippet: prefix recent messages. */
   seed?: "task" | "branch" | "snippet";
   seedMessages?: number;
-  /** Pi only write confinement; bash needs shell: "unconfined". */
+  /** Audited opt-out of the process task write default; cannot escape inherited confinement. */
+  writePolicy?: "unrestricted";
+  /** Pi only write confinement; explicit policies deny bash unless shell: "unconfined". */
   readOnly?: boolean;
   writableRoots?: string[];
   shell?: "deny" | "unconfined";

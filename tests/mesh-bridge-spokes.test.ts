@@ -36,6 +36,18 @@ const key = (prefix: string, id: string) => prefix + createHash("sha256").update
 const hostKey = (id: string) => key("topology/hosts/", id);
 const participantKey = (id: string) => key("topology/participants/", id);
 const events = (store: MeshStore, topic: string) => store.read({ topic, after: 0, limit: 100 });
+// PR#1076 trust boundary (pi-fabric#928 SEC P1): the hub's shared log may hold only these outcome fields of an
+// ACK it merely relays between spokes, plus its own bridge stamp. Mirrors bridge.ts RELAYED_ACK_FIELDS.
+// Lead decision (split-only, no private spool): the destination spoke receives exactly the same outcome-only copy.
+const RELAYED_ACK_FIELDS = new Set(["version", "commandId", "targetId", "ownerIncarnation", "accepted", "messageId", "error", "errorCode", "notRun", "bridge"]);
+const expectRelayedOnly = (store: MeshStore, secret: string, to: string) => {
+  const acks = events(store, "fabric.control.ack").filter(event => event.to === to);
+  expect(acks.length).toBeGreaterThan(0);
+  for (const ack of acks) {
+    expect(Object.keys(ack.data as object).filter(field => !RELAYED_ACK_FIELDS.has(field))).toEqual([]);
+    expect(JSON.stringify(ack)).not.toContain(secret);
+  }
+};
 
 const native = async (store: MeshStore, name: string, ttl = 60_000) => {
   const now = Date.now();
@@ -206,13 +218,111 @@ describe("spoke-to-spoke roots and addressed control through the hub", () => {
     await f.drain(); await f.drain();
     expect(events(a, "fabric.control.ack").map(event => (event.data as { commandId: string }).commandId)).toEqual(commands);
     expect(events(a, "fabric.control.ack").every(event => {
-      const data = event.data as { triggered: boolean; pendingFollowUps: number; bridge: { from: string; via: string } };
-      return data.triggered && data.pendingFollowUps === 1 && data.bridge.from === "ryzen2" && data.bridge.via === "ryzen1";
+      const data = event.data as { accepted: boolean; bridge: { from: string; via: string } };
+      return data.accepted && data.bridge.from === "ryzen2" && data.bridge.via === "ryzen1";
     })).toBe(true);
+    // A cross-spoke ACK arrives outcome-only: the relaying hub drops the advisory fields for A too.
+    for (const event of events(a, "fabric.control.ack")) {
+      expect(event.data).not.toHaveProperty("triggered");
+      expect(event.data).not.toHaveProperty("pendingFollowUps");
+    }
     expect(events(b, "fleet.work.smarty-dev.10068")).toHaveLength(0);
     await f.drain();
     expect(events(b, "fabric.control.command")).toHaveLength(3);
     expect(events(a, "fabric.control.ack")).toHaveLength(3);
+  });
+
+  it("PR#1076 counterprobe: a cross-spoke result ACK B -> A is outcome-only in the hub log and at A's root", async () => {
+    const f = await fixture();
+    const a = f.stores.ryzen3!, b = f.stores.ryzen2!, hub = f.stores.ryzen1!;
+    const source = f.mains.ryzen3!, target = f.mains.ryzen2!, local = f.mains.ryzen1!;
+    const secret = "pr1076-result-secret-singleton";
+    const directory = new ParticipantDirectory(a, { enabled: true, hostId: source.identity.id, rootId: source.identity.id, identity: source.identity });
+    const hubDirectory = new ParticipantDirectory(hub, { enabled: true, hostId: local.identity.id, rootId: local.identity.id, identity: local.identity });
+    const sender = new FabricControlPlane(a, source.identity, { enabled: true, hostId: source.identity.id, pollMs: 5,
+      readMirroredOwner: (...args) => directory.mirroredControlOwner(...args) });
+    const hubSender = new FabricControlPlane(hub, local.identity, { enabled: true, hostId: local.identity.id, ownerIncarnation: local.ownerIncarnation, pollMs: 5,
+      readMirroredOwner: (...args) => hubDirectory.mirroredControlOwner(...args) });
+    const receiver = new FabricControlPlane(b, target.identity, { enabled: true, hostId: target.identity.id, ownerIncarnation: target.ownerIncarnation, pollMs: 5 });
+    const receive = vi.fn((command: { message?: string }) => ({ accepted: true, messageId: `on-B-${command.message}`, triggered: true,
+      pendingFollowUps: 1, oldestAgeS: 0, result: { secret, for: command.message } }));
+    sender.start(() => ({ accepted: false })); hubSender.start(() => ({ accepted: false })); receiver.start(receive as any);
+    closers.push(async () => { await sender.close(); await hubSender.close(); await receiver.close(); });
+    const pending = sender.request(target.identity.id, target.identity.id, "followUp",
+      { message: "to-A" }, target.identity.id, { routedRemoteHost: "ryzen2" });
+    void pending.catch(() => undefined);
+    await vi.waitFor(() => expect(events(a, "fabric.control.command")).toHaveLength(1));
+    await f.drain(); await f.drain();
+    await vi.waitFor(() => expect(events(b, "fabric.control.ack")).toHaveLength(1));
+    await f.drain(); await f.drain();
+    // The hub only relays the B -> A ACK: its shared log holds no result and no non-relayed field.
+    expectRelayedOnly(hub, secret, source.identity.id);
+    // Spoke A's root gets the real FabricControlPlane outcome: accepted with B's messageId, no advisory fields.
+    await expect(pending).resolves.toEqual({ queued: true, messageId: "on-B-to-A", routed: "mesh", acknowledged: true });
+    expect(receive).toHaveBeenCalledOnce();
+    expect(receive.mock.calls[0]).toEqual(expect.arrayContaining([expect.objectContaining({ id: source.identity.id, verified: "bridge" })]));
+    // Origin authentication still holds at A: B's presence identity, stamped from ryzen2 via ryzen1.
+    expect(events(a, "fabric.control.ack")).toHaveLength(1);
+    expect(events(a, "fabric.control.ack")[0]).toMatchObject({ from: target.identity, to: source.identity.id,
+      data: { accepted: true, messageId: "on-B-to-A", bridge: { from: "ryzen2", via: "ryzen1" } } });
+    // A receives RELAYED_ACK_FIELDS only: no result, triggered, pendingFollowUps or oldestAgeS.
+    expectRelayedOnly(a, secret, source.identity.id);
+    // Target validation: an ACK whose target is not bound to B's link reaches neither the hub nor A.
+    await b.publish({ topic: "fabric.control.ack", kind: "accepted", from: target.identity, to: source.identity.id,
+      data: { version: 1, commandId: "forged-target", targetId: local.identity.id, accepted: true, result: { secret } } });
+    await f.drain(); await f.drain();
+    expect(events(hub, "fabric.control.ack").map(event => (event.data as { commandId: string }).commandId)).not.toContain("forged-target");
+    expect(events(a, "fabric.control.ack")).toHaveLength(1);
+    // Counterexample: an ACK addressed to the hub's own native root is hub-local and stays full there.
+    const hubLocal = hubSender.requestResult<{ secret: string; for: string }>(target.identity.id, target.identity.id, "followUp",
+      { message: "to-hub" }, target.identity.id, { routedRemoteHost: "ryzen2" });
+    void hubLocal.catch(() => undefined);
+    await vi.waitFor(() => expect(events(hub, "fabric.control.command").length).toBeGreaterThanOrEqual(1));
+    await f.drain();
+    await vi.waitFor(() => expect(events(b, "fabric.control.ack")).toHaveLength(3));
+    await f.drain();
+    await expect(hubLocal).resolves.toEqual({ secret, for: "to-hub" });
+    expect(events(hub, "fabric.control.ack").find(event => event.to === local.identity.id)).toMatchObject({
+      data: { triggered: true, result: { secret, for: "to-hub" }, bridge: { from: "ryzen2" } } });
+    expect(events(a, "fabric.control.ack")).toHaveLength(1); // spoke A never sees the hub-local result
+    // After the forged and hub-local ACKs, the hub's B -> A copy and A's copy both stay outcome-only.
+    expectRelayedOnly(hub, secret, source.identity.id);
+    expectRelayedOnly(a, secret, source.identity.id);
+  });
+
+  it("PR#1076 counterprobe: an actual publishBatch of cross-spoke result ACKs B -> A is outcome-only in the hub log and at A", async () => {
+    const f = await fixture();
+    const a = f.stores.ryzen3!, b = f.stores.ryzen2!, hub = f.stores.ryzen1!;
+    const source = f.mains.ryzen3!, target = f.mains.ryzen2!;
+    const secret = "pr1076-result-secret-batch";
+    await Promise.all(f.links.map(link => link.remote.hello())); // actual publishBatch RPC capability
+    const batches = vi.spyOn(StoreBridgeSide.prototype, "publishBatch");
+    const commands = ["one", "two", "three"];
+    for (const commandId of commands) {
+      await a.publish({ topic: "fabric.control.command", kind: "followUp", from: source.identity, to: target.identity.id,
+        data: { version: 1, commandId, targetId: target.identity.id, operation: "followUp", replyTo: source.identity.id,
+          message: commandId, destinationRemoteHost: "ryzen2" } });
+    }
+    await f.drain(); await f.drain();
+    expect(events(b, "fabric.control.command")).toHaveLength(3);
+    batches.mockClear();
+    for (const commandId of commands) {
+      await b.publish({ topic: "fabric.control.ack", kind: "accepted", from: target.identity, to: source.identity.id,
+        data: { version: 1, commandId, targetId: target.identity.id, accepted: true, triggered: true, pendingFollowUps: 1,
+          result: { secret, commandId } } });
+    }
+    await f.drain(); await f.drain();
+    // Both hops really batched: B -> hub (local side) and hub -> A (served over the RPC).
+    expect(batches.mock.calls.filter(([batch]) => batch.length === 3)).toHaveLength(2);
+    // The hub only relays: its shared log holds no result and no non-relayed field.
+    expectRelayedOnly(hub, secret, source.identity.id);
+    expect(events(a, "fabric.control.ack").map(event => (event.data as { commandId: string }).commandId)).toEqual(commands);
+    for (const event of events(a, "fabric.control.ack")) {
+      expect(event).toMatchObject({ from: target.identity, data: { accepted: true, targetId: target.identity.id,
+        bridge: { from: "ryzen2", via: "ryzen1" } } });
+    }
+    // A receives RELAYED_ACK_FIELDS only: no result, triggered or pendingFollowUps.
+    expectRelayedOnly(a, secret, source.identity.id);
   });
 
   it("does not retarget a captured native or other-host control, but still carries the correctly captured destination", async () => {

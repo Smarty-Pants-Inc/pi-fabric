@@ -1692,7 +1692,10 @@ const sameIdentity = (a: MeshIdentity, b: MeshIdentity): boolean =>
 
 /** What one direction's forwarding is checked against: the link's authority for that page. */
 interface BridgeRules {
+  /** Direct native addresses: hub-local natives inbound, the peer's records outbound. Only these may hold a full ACK at the hub. */
   recipients: Set<string>;
+  /** Inbound only: other links' canonical addresses (remoteAddresses(relays)); routable through the hub, never hub-local. */
+  relayRecipients?: Set<string>;
   senders?: Set<string>;
   /** Inbound only: each admitted sender's canonical identity (senderIdentities). */
   identities?: Map<string, MeshIdentity>;
@@ -2035,7 +2038,7 @@ export class MeshBridge {
         const { local, remote } = await this.#authority(refreshIfStale);
         // The remote is untrusted: its sender (and an ack's target) must be bound to this link.
         const relays = await this.options.local.relayPresence?.();
-        return { recipients: new Set([...addresses(local), ...remoteAddresses(relays ?? { hosts: [], participants: [] })]),
+        return { recipients: addresses(local), relayRecipients: remoteAddresses(relays ?? { hosts: [], participants: [] }),
           senders: senders(remote), identities: senderIdentities(remote), reserved: new Set(local.reserved),
           relayOrigins: new Map(relays?.hosts.map(host => [host.record.id, host.record.remoteHost!])) };
       });
@@ -2338,7 +2341,8 @@ export class MeshBridge {
     // The hub (local) side is the factory's: a remote work event (parsed fleet.work.<repo>.<n>) or
     // owner wake addressed to its role crosses to the hub on the same topic, `to` unchanged
     // (smarty-dev#9352), within the link's factory rate. Never hub to remote.
-    if (!event.to || !(rules.recipients.has(event.to) || (direction === "toLocal" && (isHubFactoryEvent(event) || this.#awaitedAck(event))))) {
+    if (!event.to || !(rules.recipients.has(event.to) || rules.relayRecipients?.has(event.to) ||
+        (direction === "toLocal" && (isHubFactoryEvent(event) || this.#awaitedAck(event))))) {
       return "not addressed across";
     }
     if (event.data !== undefined && !isObject(event.data)) return "data is not an object";

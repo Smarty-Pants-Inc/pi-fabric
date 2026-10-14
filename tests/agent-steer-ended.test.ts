@@ -34,9 +34,9 @@ const harness = () => {
     workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root, onTerminalNotice: notice => { notices.push(notice); },
   });
   managers.push(manager);
-  const finish = (id: string) => {
+  const finish = (id: string, publishStatus = true) => {
     const receipt = saveFinalAnswerReceipt(path.join(root, id), id, "done");
-    writeJsonAtomic(path.join(root, id, "status.json"), { ...record, status: "completed", text: "done",
+    if (publishStatus) writeJsonAtomic(path.join(root, id, "status.json"), { ...record, status: "completed", text: "done",
       finalAnswerReceipt: { id: receipt.id, recordedAt: receipt.recordedAt } });
     return receipt;
   };
@@ -44,20 +44,24 @@ const harness = () => {
 };
 
 describe("manager final-answer admission race", () => {
-  it.each(["steer", "followUp"] as const)("%s reports an undelivered receipt when final is published during append", async delivery => {
+  it.each([
+    { delivery: "steer", runState: "completed" }, { delivery: "followUp", runState: "completed" },
+    { delivery: "steer", runState: "final-answer-pending" }, { delivery: "followUp", runState: "final-answer-pending" },
+  ] as const)("$delivery reports the real $runState when final is published during append", async ({ delivery, runState }) => {
     const h = harness();
     const handle = await h.manager.spawn({ task: "ordinary", transport: "process" });
     const journal = path.join(h.root, handle.id, "steer.jsonl");
     const append = fs.appendFileSync;
     let final: ReturnType<typeof h.finish> | undefined;
     vi.spyOn(fs, "appendFileSync").mockImplementation(((file: fs.PathOrFileDescriptor, data: string | Uint8Array, options?: fs.WriteFileOptions) => {
-      if (file === journal && !final) final = h.finish(handle.id);
+      if (file === journal && !final) final = h.finish(handle.id, runState === "completed");
       return append(file, data, options);
     }) as typeof fs.appendFileSync);
     const sent = delivery === "steer" ? h.manager.steer(handle.id, "racing input", undefined, provenance)
       : h.manager.followUp(handle.id, "racing input", undefined, { ...provenance, via: "followUp" }, { deadlineMs: 60_000 });
     expect(sent.undelivered).toEqual({ code: "FABRIC_TARGET_TERMINAL", reason: "run-ended", deliveryStatus: "undelivered",
-      messageId: sent.messageId, delivery, finalAnswerReceiptId: final!.id, sender: provenance.sender });
+      messageId: sent.messageId, delivery, finalAnswerReceiptId: final!.id, runState, sender: provenance.sender });
+    h.finish(handle.id); // Publish the delayed associated status after inspecting the pending receipt.
     if (delivery === "followUp") expect(h.manager.status(handle.id).followUpDeliveries).toMatchObject([{ state: "cancelled" }]);
     expect(await h.manager.wait(handle.id)).toMatchObject({ status: "completed", text: "done", turns: 1 });
     await h.manager.close();

@@ -64,6 +64,11 @@ export const terminalControlRefusalProven = (directory: string, admission: Termi
     if (!terminalControlMatchesAdmission(control, admission) ||
         Object.keys(control).some(key => !["id", "delivery", "state", "provenance", "forwarded"].includes(key)) ||
         control.forwarded !== undefined && typeof control.forwarded !== "boolean") return false;
+    // Legacy shape: pre-`forwarded` workers wrote stdin, then marked queued rows
+    // refused at final answer while the frame could still be buffered. Neither a
+    // legacy queued nor a legacy refused row proves refusal; they stay uncertain.
+    if (control.forwarded === undefined) return false;
+    // Current shape: false is a locked host refusal, true a child discard ACK.
     if (control.state === "refused") return true;
     if (control.state !== "queued" || control.forwarded !== false) return false;
     // The receipt blocks every later injection under this same lock. Recovery

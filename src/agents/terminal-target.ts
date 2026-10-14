@@ -22,6 +22,8 @@ export interface AgentUndeliveredMessage {
   messageId: string;
   delivery: "steer" | "followUp";
   finalAnswerReceiptId: string;
+  /** The target's real run state when the append lost the race; carried to remote errors. */
+  runState: FabricTargetRunState;
   sender?: FabricTurnProvenance["sender"];
 }
 

@@ -356,6 +356,9 @@ const safeTerminalArtifacts = (root: string, expired: Deadline): boolean => {
       // A previously fabricated route receipt cannot discharge an ambiguous
       // forwarded frame, nor a still-queued legacy row without transport proof.
       if (control.state === "queued") return false;
+      // Legacy shape (no `forwarded`): a refused row may hide a buffered, consumed
+      // frame, so even an old route receipt cannot retire it. Delivered stays allowed.
+      if (control.forwarded === undefined && control.state !== "delivered") return false;
       if (control.state === "delivered" && terminalControlMatchesAdmission(control, admission)) consumed.add(id);
       else if (!routed.has(id)) return false; // Only the original-attributed refusal discharges mismatched rows.
     }

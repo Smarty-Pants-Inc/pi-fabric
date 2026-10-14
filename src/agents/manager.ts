@@ -3559,7 +3559,7 @@ export class AgentManager {
     this.#retainTerminalNotice(managed, { code: "FABRIC_TARGET_TERMINAL", targetId: managed.id,
       messageId, delivery, finalAnswerReceiptId: managed.finalAnswer.id });
     return { code: "FABRIC_TARGET_TERMINAL", reason: "run-ended", deliveryStatus: "undelivered",
-      messageId, delivery, finalAnswerReceiptId: managed.finalAnswer.id,
+      messageId, delivery, finalAnswerReceiptId: managed.finalAnswer.id, runState: this.#terminalError(managed).runState,
       ...(admission.sender ? { sender: admission.sender } : {}) };
   }
 

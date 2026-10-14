@@ -883,7 +883,7 @@ export class AgentMessageRouter {
         command.operation === "steer"
           ? this.manager.steer(command.targetId, message, command.data, provenance)
           : this.manager.followUp(command.targetId, message, command.data, provenance);
-      if (result.undelivered) throw new FabricTargetTerminalError(command.targetId, result.undelivered.finalAnswerReceiptId);
+      if (result.undelivered) throw new FabricTargetTerminalError(command.targetId, result.undelivered.finalAnswerReceiptId, result.undelivered.runState);
       return { accepted: true, messageId: result.messageId,
         ...(result.warning ? { warning: result.warning } : {}) };
     } catch (error) {

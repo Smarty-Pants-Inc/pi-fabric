@@ -1029,6 +1029,7 @@ interface FabricMessageDelivery {
   undelivered?: {
     code: "FABRIC_TARGET_TERMINAL"; reason: "run-ended"; deliveryStatus: "undelivered";
     messageId: string; delivery: "steer" | "followUp"; finalAnswerReceiptId: string;
+    runState: FabricTargetTerminalError["runState"];
     sender?: FabricTargetTerminalNotice["sender"];
   };
   /** Local Pi task: absolute delivery deadline; expiry alarms but does not dequeue. */

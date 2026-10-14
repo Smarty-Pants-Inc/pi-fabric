@@ -24,7 +24,7 @@ const fixture = () => {
   const provenance = { v: 1 as const, channel: "fabric" as const, via: "steer" as const, sender };
   const id = "11111111-1111-4111-8111-111111111111";
   const notice = { code: "FABRIC_TARGET_TERMINAL", targetId: "run", finalAnswerReceiptId: receipt.id, delivery: "steer", messageId: id, sender };
-  const control = { id, delivery: "steer", state: "refused", provenance };
+  const control = { id, delivery: "steer", state: "refused", forwarded: false, provenance };
   fs.writeFileSync(path.join(run, "steer.jsonl"), JSON.stringify({ id, type: "steer", message: "stale", provenance }) + "\n");
   return { root, run, receipt, record, id, notice, control };
 };
@@ -261,7 +261,7 @@ describe("terminal-answer retention custody", () => {
   });
 
   it.each([
-    { state: "queued", forwarded: true }, { state: "queued" },
+    { state: "queued", forwarded: true }, { state: "queued", forwarded: undefined },
     { state: "delivered", forwarded: true }, { state: "delivered", forwarded: false },
   ])("never turns uncertain or consumed $state/$forwarded into undelivered during recovery", async transport => {
     const f = fixture();

@@ -67,6 +67,26 @@ describe("terminal task topology", () => {
       reason: "run-ended", deliveryStatus: "undelivered", runState: "completed" });
   });
 
+  // Decision C: the owner manager's append-race receipt is mocked (the precise
+  // final-publication interleaving); the router, both control planes, mesh ACK
+  // and sender error are real. E2E: residency E-steer-final (final-answer-pending).
+  it.each(["completed", "final-answer-pending", "stopped"] as const)("carries the real %s run state of an append-race receipt to the remote error", async runState => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "terminal-topology-race-")); roots.push(root);
+    const targetId = "task-race", receiptId = "race-receipt";
+    const ownerIdentity = identity("session:owner"), senderIdentity = identity("session:sender");
+    const manager = { status: () => ({ id: targetId, name: targetId, status: "running" }), stop: vi.fn(),
+      steer: () => ({ queued: true, messageId: "m-race", undelivered: { code: "FABRIC_TARGET_TERMINAL", reason: "run-ended",
+        deliveryStatus: "undelivered", messageId: "m-race", delivery: "steer", finalAnswerReceiptId: receiptId, runState } }) } as unknown as Ports[0];
+    const ownerRouter = router(manager, ownerIdentity);
+    const owner = plane(root, ownerIdentity), sender = plane(root, senderIdentity);
+    owner.start((command, from, signal, verification) => ownerRouter.acceptControl(command, from, signal, verification));
+    sender.start(() => ({ accepted: false }));
+    await expect(sender.request(ownerIdentity.id, targetId, "steer", { message: "racing" }, ownerIdentity.id)).rejects.toMatchObject({
+      code: "FABRIC_TARGET_TERMINAL", targetId, finalAnswerReceiptId: receiptId, deliveryStatus: "undelivered", runState,
+      message: expect.stringContaining(`run ended (${runState})`) });
+    expect(sender.mesh.read({ topic: "fabric.control.ack", limit: 10 })[0]!.data).toMatchObject({ accepted: false, runState });
+  });
+
   it("does not publish to a stale terminal owner", async () => {
     const control = { request: vi.fn() } as unknown as Ports[4];
     const unknown = { status: (id: string) => { throw new Error(`Unknown Fabric agent: ${id}`); } } as unknown as Ports[0];

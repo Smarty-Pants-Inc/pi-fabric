@@ -158,7 +158,12 @@ describe("owner incarnation admission and durable receipts", () => {
       { message: "old session only", ownerIncarnation: previous.incarnation }, "session:old", { timeoutMs: 100 }).catch(error => error);
     await vi.waitFor(() => expect(commands(mesh)).toHaveLength(1)); await previous.close();
     const replacement = plane(mesh, "session:new"); const handler = vi.fn(() => ({ accepted: true })); replacement.start(handler);
-    expect(await pending).toMatchObject({ notDelivered: true });
+    const failure = await pending;
+    if (operation === "followUp") {
+      // Its observation timeout cannot withdraw durable work or retarget it to the new Main.
+      expect(failure.message).toContain("the outcome is unknown and it may still be delivered");
+      expect(failure).not.toHaveProperty("notDelivered");
+    } else expect(failure).toMatchObject({ notDelivered: true });
     expect(handler).not.toHaveBeenCalled();
     expect(acks(mesh)).toEqual([]);
     expect(commands(mesh)[0]).toMatchObject({ to: "session:old", data: { targetId: "session:old" } });

@@ -214,7 +214,8 @@ return { recalled, authoritative, walked, followed, visited, current, mode: stat
 const captured = await extensions.project_status({ verbose: true });
 console.log(captured.text);
 const main = await agents.main();
-await agents.followUp({ id: main.id, message: "review the result" });
+const receipt = await agents.followUp({ id: main.id, message: "review the result" });
+const deferred: true | undefined = receipt.deferred;
 const watcher = await agents.create({
   name: "advisor",
   instructions: "Review each turn",

@@ -68,10 +68,11 @@ export const warnUnfencedControlDelivery = (operation: FabricControlOperation, t
 };
 const DEFAULT_RESULT_TIMEOUT_MS = 60 * 60 * 1_000;
 const MAX_CONTROL_TIMEOUT_MS = 24 * 60 * 60 * 1_000 + 60_000;
-// The sender keeps waiting this long past the command deadline. The owner admits a
-// command only before its deadline, but its acknowledgement can queue for the mesh lock:
+// The sender keeps waiting this long past the command deadline. Live-only work must
+// be admitted before its deadline, but its acknowledgement can queue for the mesh lock:
 // without this grace a delivered command was reported as timed out and then retried
-// (smarty-dev#367). A command not admitted by the deadline is acknowledged as expired.
+// (smarty-dev#367). Live-only commands not admitted by the deadline are expired;
+// followUps remain queueable work and are durably deferred instead.
 const MAX_CONTROL_ACK_GRACE_MS = 15_000;
 // A bridged request must cover queueing on both hosts and the transport, not just a local poll.
 const MIN_BRIDGE_CONTROL_TIMEOUT_MS = 30_000;
@@ -122,6 +123,8 @@ export interface FabricControlCommand {
   /** Commit time: preserves the existing full delivery/ACK budget after lock waits. */
   requestedAt: number;
   deadlineAt?: number;
+  /** Receiver-owned expiry deferral; never admitted from command data. */
+  deferred?: true;
   /** The command event's host stamp, copied by the receiving owner; never read from command data. */
   sender?: FabricMessageSender;
 }
@@ -134,6 +137,8 @@ export interface FabricControlAcceptance {
   targetId?: string;
   warning?: AgentFollowUpRunningWarning;
   accepted: boolean;
+  /** Expired followUp retained for the target's next turn, not refused as notRun. */
+  deferred?: true;
   messageId?: string;
   /** Main requested a new turn at admission; absent on older owners or non-Main targets. */
   triggered?: boolean;
@@ -171,6 +176,7 @@ export interface FabricControlResult {
   messageId: string;
   routed: "mesh";
   acknowledged: true;
+  deferred?: true;
   triggered?: boolean;
   /** Main held a requested wake; includes the provider retry deadline when applicable. */
   reason?: string;
@@ -255,10 +261,10 @@ const commandFromEvent = (event: MeshEvent): FabricControlCommand | undefined =>
       data.operation !== "setModel" &&
       data.operation !== "setThinking") ||
     typeof data.replyTo !== "string" ||
-    typeof data.requestedAt !== "number" ||
+    (typeof data.requestedAt !== "number" || !Number.isFinite(data.requestedAt)) ||
     (data.requestCreatedAt !== undefined &&
       (typeof data.requestCreatedAt !== "number" || !Number.isFinite(data.requestCreatedAt))) ||
-    (data.deadlineAt !== undefined && typeof data.deadlineAt !== "number") ||
+    (data.deadlineAt !== undefined && (typeof data.deadlineAt !== "number" || !Number.isFinite(data.deadlineAt))) ||
     (data.destinationRemoteHost !== undefined && data.destinationRemoteHost !== null &&
       typeof data.destinationRemoteHost !== "string") ||
     (data.operation === "cancel" && typeof data.cancelCommandId !== "string") ||
@@ -276,11 +282,21 @@ const commandFromEvent = (event: MeshEvent): FabricControlCommand | undefined =>
   }
   // Sender diagnostics are never evidence. Derive only from the admitted envelope.
   // A sender stamp is host-set on the event; a payload-supplied one is forged and dropped.
-  const { sender: _forged, ...command } = data;
+  const { sender: _forged, deferred: _forgedDeferred, ...command } = data;
   const wakeCause = data.operation === "steer" || data.operation === "followUp"
     ? fabricWakeCause(event.from, data.operation, event.topic, event.id) : undefined;
   return withFabricWakeAdmission({ ...command, eventId: event.id, wakeCause, principal: event.verification === "mesh" || event.verification === "bridge"
     ? copyFabricPrincipal(event.principal) : undefined, ...(event.sender ? { sender: event.sender } : {}) } as unknown as FabricControlCommand, wakeCause ? [wakeCause] : []);
+};
+
+/** Only a verified bridge's local commit stamp changes the clock, never payload bridge metadata. */
+const commandDeadlineAt = (command: FabricControlCommand, event: MeshEvent, acknowledgementTimeoutMs: number): number => {
+  if (event.verification !== "bridge") return Math.min(
+    command.deadlineAt ?? command.requestedAt + acknowledgementTimeoutMs, command.requestedAt + MAX_CONTROL_TIMEOUT_MS,
+  );
+  const ttl = Math.min(command.deadlineAt === undefined ? acknowledgementTimeoutMs : command.deadlineAt - command.requestedAt,
+    MAX_CONTROL_TIMEOUT_MS);
+  return event.createdAt + Math.max(0, ttl);
 };
 
 interface FabricControlSeenRecord {
@@ -291,7 +307,7 @@ interface FabricControlSeenRecord {
   expiresAt: number;
   /** Activation that owns the durable claim/outcome, not the process publishing a replay ACK. */
   ownerIncarnation?: string | undefined;
-  /** The command carried its own deadlineAt, so every receiver computes the same deadline. */
+  /** The command carried its own deadlineAt, so its TTL is explicit. */
   explicitDeadline?: boolean;
   /** The command event's sequence, or an upper bound for a record moved from the shared state. */
   sequence?: number;
@@ -570,6 +586,7 @@ export class FabricControlPlane {
       messageId: acceptance.messageId ?? commandId,
       routed: "mesh",
       acknowledged: true,
+      ...(acceptance.deferred === true ? { deferred: true as const } : {}),
       ...queueDepthOf(acceptance as unknown as Record<string, unknown>),
       ...coalescedOf(acceptance as unknown as Record<string, unknown>),
       ...runningTaskWarningOf(acceptance as unknown as Record<string, unknown>, targetId),
@@ -857,7 +874,9 @@ export class FabricControlPlane {
       timedOut.reject(error);
     };
     // A bridged owner's claims live in another mesh: only a native owner can be fenced here.
-    if (timedOut.mirroredOwner || typeof timedOut.destinationRemoteHost === "string" || !timedOut.commandPublished) {
+    // A followUp's timeout ends observation, not the durable queued work. Withdrawing its
+    // unclaimed command here would defeat owner-side expiry deferral on a later turn.
+    if (timedOut.operation === "followUp" || timedOut.mirroredOwner || typeof timedOut.destinationRemoteHost === "string" || !timedOut.commandPublished) {
       unknown();
       return;
     }
@@ -1141,6 +1160,7 @@ export class FabricControlPlane {
     this.#clearPending(event.data.commandId);
     pending.resolve({
       accepted: event.data.accepted === true,
+      ...(event.data.accepted === true && event.data.deferred === true ? { deferred: true as const } : {}),
       ...(event.data.accepted !== true && terminalRejectionFields(event.data)?.targetId === pending.targetId
         ? terminalRejectionFields(event.data) : {}),
       ...(typeof event.data.messageId === "string" ? { messageId: event.data.messageId } : {}),
@@ -1186,22 +1206,25 @@ export class FabricControlPlane {
     // during warn-mode rollout; timestamps cannot substitute for an epoch in enforce.
     const incarnationMatches = command.ownerIncarnation === this.incarnation ||
       (command.ownerIncarnation === undefined && this.options.controlIncarnationFence !== "enforce");
+    const now = Date.now();
+    const deadlineAt = commandDeadlineAt(command, event, this.#ackTimeoutMs);
+    const futureRequest = event.verification !== "bridge" && command.requestedAt - now > this.#ackTimeoutMs;
     if (command.operation === "cancel") {
-      if (incarnationMatches) this.#acceptCancellation(command, event.from);
+      if (incarnationMatches) {
+        if (now > deadlineAt || futureRequest) await this.#publishAcknowledgement(command, {
+          accepted: false, error: CONTROL_COMMAND_EXPIRED, notRun: true,
+        });
+        else this.#acceptCancellation(command, event.from);
+      }
       return;
     }
-    const now = Date.now();
-    const deadlineAt = Math.min(
-      command.deadlineAt ?? command.requestedAt + this.#ackTimeoutMs,
-      command.requestedAt + MAX_CONTROL_TIMEOUT_MS,
-    );
     const key = ownedKey;
-    // Historical replay has no waiting sender; keep relaunches free of redundant ACK writes. A command a
-    // bridge delivered late (its bridged copy was published here just now, smarty-dev#9751) is not history:
-    // it gets the expired answer below, never a silent skip, so its sender and the fleet see it.
+    // Historical live-only work has no waiting sender; avoid redundant ACK writes on relaunch.
+    // A newly committed legacy bridge copy still gets an expiry answer (smarty-dev#9751).
+    // FollowUps are never skipped as history: retained unclaimed work must enter the target's inbox.
     const lateDelivery = isObject(event.data) && isObject(event.data.bridge) &&
       now - event.createdAt <= MAX_CONTROL_ACK_GRACE_MS + this.#pollMs * 4;
-    if (now > deadlineAt + MAX_CONTROL_ACK_GRACE_MS + this.#pollMs * 4 && !lateDelivery) return;
+    if (command.operation !== "followUp" && now > deadlineAt + MAX_CONTROL_ACK_GRACE_MS + this.#pollMs * 4 && !lateDelivery) return;
     // Dedupe precedes the new-admission fence: completed earlier outcomes remain observable,
     // but their ACK names the claiming activation, never this publisher's new activation.
     const duplicate = this.#sharedClaims.has(ownedKey)
@@ -1223,7 +1246,7 @@ export class FabricControlPlane {
       }, this.incarnation, command.ownerIncarnation ?? null);
       return; // no claim, handler, or automatic notRun resend
     }
-    if (now > deadlineAt || command.requestedAt - now > this.#ackTimeoutMs) {
+    if ((command.operation !== "followUp" && now > deadlineAt) || futureRequest) {
       this.#sharedClaims.delete(key);
       // A sender waits at most MAX_CONTROL_ACK_GRACE_MS past the deadline. An older command
       // is history: a restarting owner replays the retained log from its start, and
@@ -1290,13 +1313,13 @@ export class FabricControlPlane {
           commandId: command.commandId,
           targetId: command.targetId,
           ownerIncarnation: this.incarnation,
-          expiresAt: deadlineAt + this.#ackTimeoutMs,
+          expiresAt: Math.max(deadlineAt, now) + this.#ackTimeoutMs,
           ...(command.deadlineAt !== undefined ? { explicitDeadline: true } : {}),
         } satisfies FabricControlSeenRecord,
         identity: this.identity,
         ifVersion: 0,
       });
-      this.#sharedClaims.set(key, deadlineAt + MAX_CONTROL_ACK_GRACE_MS + this.#pollMs * 4);
+      this.#sharedClaims.set(key, Math.max(deadlineAt, now) + MAX_CONTROL_ACK_GRACE_MS + this.#pollMs * 4);
       claim = await this.#putFenced(this.#seen, {
         key,
         value: {
@@ -1305,7 +1328,7 @@ export class FabricControlPlane {
           commandId: command.commandId,
           targetId: command.targetId,
           ownerIncarnation: this.incarnation,
-          expiresAt: deadlineAt + this.#ackTimeoutMs,
+          expiresAt: Math.max(deadlineAt, now) + this.#ackTimeoutMs,
         } satisfies FabricControlSeenRecord,
         identity: this.identity,
         ifVersion: 0,
@@ -1340,7 +1363,7 @@ export class FabricControlPlane {
   async #runOwnedCommand(key: string, owned: OwnedControlCommand): Promise<void> {
     assertMeshConsumption(this.options.canConsumeMesh);
     const command = commandFromEvent(owned.event)!;
-    const deadlineAt = Math.min(command.deadlineAt ?? command.requestedAt + this.#ackTimeoutMs, command.requestedAt + MAX_CONTROL_TIMEOUT_MS);
+    const deadlineAt = commandDeadlineAt(command, owned.event, this.#ackTimeoutMs);
     owned.running = true;
     const execution = this.#executeClaimedCommand(command, owned.event.from, key, owned, deadlineAt, owned.event.sequence, owned.event.verification)
       .catch(error => {
@@ -1405,23 +1428,26 @@ export class FabricControlPlane {
       requesterId: from.id,
       targetId: command.targetId,
     });
-    const deadlineTimer = setTimeout(
+    // Queueable work is not cancelled just because its live-admission window ended.
+    const deadlineTimer = command.operation === "followUp" ? undefined : setTimeout(
       () => controller.abort(),
       Math.max(1, deadlineAt - Date.now()),
     );
-    deadlineTimer.unref();
+    deadlineTimer?.unref();
     try {
       let acceptance: FabricControlAcceptance;
       try {
         // The claim can wait for a lock, or this process can pause after it commits: the deadline
-        // may have passed since admission. An expired command is recorded, not run: notRun, as
-        // this runtime holds the claim and the handler did not run.
+        // may have passed since admission. Live-only work is refused notRun; a followUp
+        // still enters the target's inbox with receiver-owned deferral metadata.
         assertMeshConsumption(this.options.canConsumeMesh);
         if (owned.acceptance) acceptance = owned.acceptance;
-        else if (Date.now() > deadlineAt) acceptance = { accepted: false, error: CONTROL_COMMAND_EXPIRED, notRun: true };
+        else if (command.operation !== "followUp" && Date.now() > deadlineAt) acceptance = { accepted: false, error: CONTROL_COMMAND_EXPIRED, notRun: true };
         else if (this.#handler) {
+          if (command.operation === "followUp" && Date.now() > deadlineAt) command.deferred = true;
           this.#warnUnfencedSenderDelivery(command, from);
           acceptance = await this.#handler(command, from, controller.signal, verification);
+          if (command.deferred && acceptance.accepted) acceptance = { ...acceptance, deferred: true };
         } else acceptance = { accepted: false, error: "Fabric owner has no control handler" };
       } catch (error) {
         if (error instanceof MeshConsumptionPausedError) throw error;
@@ -1609,6 +1635,7 @@ export class FabricControlPlane {
           ...(ownerIncarnation !== null ? { ownerIncarnation } : {}),
           ...(staleIncarnation !== undefined ? { staleIncarnation } : {}),
           accepted: acceptance.accepted,
+          ...(acceptance.accepted && acceptance.deferred === true ? { deferred: true } : {}),
           ...(acceptance.messageId ? { messageId: acceptance.messageId } : {}),
           ...queueDepthOf(acceptance as unknown as Record<string, unknown>),
           ...coalescedOf(acceptance as unknown as Record<string, unknown>),

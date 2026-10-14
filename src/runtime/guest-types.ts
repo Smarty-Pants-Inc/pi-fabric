@@ -1038,6 +1038,8 @@ interface FabricMessageDelivery {
   messageId: string;
   routed?: "local" | "main" | "mesh";
   acknowledged?: boolean;
+  /** Owner durably retained an expired followUp for the next turn without an immediate wake. */
+  deferred?: true;
   /** Whether this delivery started an idle Main turn; absent when the route cannot prove it. */
   triggered?: boolean;
   /** Why a requested wake was held, including provider-backoff until an ISO timestamp. */

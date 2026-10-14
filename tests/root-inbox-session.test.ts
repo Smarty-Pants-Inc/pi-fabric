@@ -316,7 +316,7 @@ describe.skipIf(!built)("the root inbox in a real Pi session", () => {
     } finally { delete globals[cancelKey]; mesh.closeState(); }
   }, 60_000);
 
-  it("turn start never re-inserts an aggregate after split inbox receipts", async () => {
+  it("does not consume unsigned split carriers, then delivers the same IDs once through the extension", async () => {
     const { session, faux, inboxMessages, missedWork } = await start(1_000, false, { warm: false });
     const identityId = `session:${session.sessionManager.getSessionId()}`;
     const { createHash } = await import("node:crypto");
@@ -326,27 +326,39 @@ describe.skipIf(!built)("the root inbox in a real Pi session", () => {
     const key = "topology/inbox/" + createHash("sha256").update(identityId).digest("hex").slice(0, 32);
     const previous = mesh.get(key);
     const after = (previous?.value as { after?: number } | undefined)?.after ?? 0;
+    const through = mesh.latestSequence();
     await mesh.put({ key, identity: { id: identityId, name: "main", kind: "main" }, value: {
-      after, pending: { through: mesh.latestSequence(), ids },
+      after, pending: { through, ids },
     } });
     for (const id of ids) await session.sendCustomMessage({
       customType: "pi-fabric-inbox", content: `recorded ${id}`, display: true, details: { ids: [id] },
     }, { triggerTurn: false });
     expect(inboxMessages()).toHaveLength(2);
-    // Load the persisted pending batch into Fabric's real inbox. Even an unsuccessful
-    // warm run commits confirmed work at its turn/settle boundaries, without redelivery.
+    expect((mesh.get(key, { fresh: true })!.value as { after: number; pending?: { ids: string[] } })).toMatchObject({ after, pending: { ids } });
+    const issuedIds = () => inboxMessages().flatMap(message => {
+      const details = (message as { details?: { nonce?: string; ids?: string[] } }).details;
+      return typeof details?.nonce === "string" ? details.ids ?? [] : [];
+    });
+    expect(issuedIds()).toEqual([]);
+    // Raw native messages are not extension-issued receipts. The real runtime must
+    // inject these same IDs, even when its warm run ends unsuccessfully.
     faux.setResponses([fauxAssistantMessage(fauxToolCall("fabric_exec", { code: "return 1" })),
       { ...fauxAssistantMessage("warm failed"), stopReason: "error", errorMessage: "test warm failure" }]);
     await session.prompt("warm");
     expect((mesh.get(key, { fresh: true })!.value as { pending?: unknown }).pending).toBeUndefined();
-    expect(inboxMessages()).toHaveLength(2);
+    expect(inboxMessages()).toHaveLength(3);
+    expect(issuedIds()).toEqual(ids);
+    expect(new Set(issuedIds()).size).toBe(ids.length);
+    expect((mesh.get(key, { fresh: true })!.value as { after: number }).after).toBeGreaterThanOrEqual(through);
     faux.setResponses([fauxAssistantMessage("noted")]);
     await session.prompt("next");
-    expect(inboxMessages()).toHaveLength(2);
+    expect(inboxMessages()).toHaveLength(3);
+    expect(issuedIds()).toEqual(ids);
     expect((mesh.get(key, { fresh: true })!.value as { pending?: unknown }).pending).toBeUndefined();
     faux.setResponses([fauxAssistantMessage("still noted")]);
     await session.prompt("again");
-    expect(inboxMessages()).toHaveLength(2);
+    expect(inboxMessages()).toHaveLength(3);
+    expect(issuedIds()).toEqual(ids);
   }, 60_000);
 
   // review F3: stopping the Main must not start it again.

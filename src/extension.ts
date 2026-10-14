@@ -1,9 +1,13 @@
 import type { Usage } from "@earendil-works/pi-ai";
+import { randomUUID } from "node:crypto";
 import { registerMainProviderRecovery } from "./main-provider-recovery.js";
 import { extensionContextLive } from "./session-liveness.js";
 import { registerIncomingMessageRenderers } from "./ui/incoming-messages.js";
 import { principalViewIncomingMode, registerPrincipalView } from "./ui/principal-view.js";
-import { rootInboxMessage, confirmedRootInboxSession, rootInboxSummary, ROOT_INBOX_CUSTOM_TYPE, type RootInboxBatch, type RootInboxReconcileOptions } from "./topology/root-inbox-shared.js";
+import {
+  rootInboxMessage, confirmedRootInboxSession, rootInboxSummary, ROOT_INBOX_CUSTOM_TYPE,
+  type RootInboxBatch, type RootInboxReceiptSnapshot, type RootInboxReceiptVerifier, type RootInboxReconcileOptions,
+} from "./topology/root-inbox-shared.js";
 import { deliverRootInbox } from "./topology/root-inbox-delivery.js";
 import { boundModelOutput, formatResidentOutcomePriority, modelOutputBudget } from "./output-budget.js";
 import { registerFabricPrincipalCapture, registerFabricWakeCapture, fabricHostIdentity, fabricProvenanceSupported, sendFabricMessage } from "./fabric-provenance.js";
@@ -216,7 +220,8 @@ const settledCompleted = (event: unknown, context: ExtensionContext): boolean =>
 
 // Whether the session already holds an inbox batch: its cursor moves only then (smarty-dev#754).
 // Static, as on main: the build admits package-local dynamic imports only for stable entries.
-const inboxHeldBy = (context: ExtensionContext) => confirmedRootInboxSession(context.sessionManager);
+const inboxHeldBy = (context: ExtensionContext, verifier: RootInboxReceiptVerifier) =>
+  confirmedRootInboxSession(context.sessionManager, verifier);
 
 /** Expiry is observational: one line, never a triggered continuation. */
 const reportInboxExpiry = async (pi: ExtensionAPI, inbox: RootInboxBatch | undefined): Promise<void> => {
@@ -810,12 +815,34 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
   // Native Pi preserves details by reference from sendMessage / the legacy hook result to
   // message_end. Serialized fields, queue leases and wake metadata are not consumption authority.
   // Snapshot shown-only ids/receipts so even mutation of an issued object cannot ack withheld work.
-  let issuedRootInboxDetails = new WeakMap<object, { ids: string[]; receipts: string[] }>();
+  // The nonce registry is private to this extension instance: a canonical entry is authoritative
+  // only while this generation can resolve the exact carrier it issued. Eviction fails open and
+  // causes a duplicate, never a lost event.
+  const MAX_ISSUED_ROOT_INBOX_RECEIPTS = 2_048;
+  let issuedRootInboxDetails = new WeakMap<object, RootInboxReceiptSnapshot>();
+  const issuedRootInboxReceipts = new Map<string, RootInboxReceiptSnapshot>();
   const inboxStrings = (value: unknown): string[] => Array.isArray(value)
     ? value.filter((item): item is string => typeof item === "string") : [];
+  const verifyIssuedInbox: RootInboxReceiptVerifier = (details) => {
+    if (!details || typeof details !== "object") return undefined;
+    const nonce = (details as { nonce?: unknown }).nonce;
+    return typeof nonce === "string" ? issuedRootInboxReceipts.get(nonce) : undefined;
+  };
   const registerIssuedInbox = (details: object): void => {
-    const fields = details as { ids?: unknown; receipts?: unknown };
-    issuedRootInboxDetails.set(details, { ids: inboxStrings(fields.ids), receipts: inboxStrings(fields.receipts) });
+    const fields = details as { ids?: unknown; receipts?: unknown; nonce?: unknown };
+    const snapshot: RootInboxReceiptSnapshot = Object.freeze({
+      ids: Object.freeze(inboxStrings(fields.ids)),
+      receipts: Object.freeze(inboxStrings(fields.receipts)),
+    });
+    const nonce = randomUUID();
+    fields.nonce = nonce;
+    issuedRootInboxReceipts.set(nonce, snapshot);
+    while (issuedRootInboxReceipts.size > MAX_ISSUED_ROOT_INBOX_RECEIPTS) {
+      const oldest = issuedRootInboxReceipts.keys().next().value;
+      if (typeof oldest !== "string") break;
+      issuedRootInboxReceipts.delete(oldest);
+    }
+    issuedRootInboxDetails.set(details, snapshot);
   };
   type InboxQueueMessage = { role?: string; customType?: string; details?: unknown };
   const inboxEventsToQueue = (inbox: RootInboxBatch, pendingMessages?: readonly InboxQueueMessage[]) => {
@@ -856,7 +883,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     // Invalidate cancelled/unreceived leases even if the durable cursor read fails.
     if (options.commitOnly) queuedRootInboxIds.clear();
     if (!state.initialized) return;
-    const inbox = await state.nextRootInbox(await inboxHeldBy(context), undefined, options).catch(() => undefined);
+    const inbox = await state.nextRootInbox(await inboxHeldBy(context, verifyIssuedInbox), undefined, options).catch(() => undefined);
     reportInboxExpiry(pi, inbox);
     if (!inbox) return;
     // Commit-only returns no deliverable events, including for an unheld pending batch.
@@ -872,6 +899,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     inboxWake.context = undefined;
     queuedRootInboxIds.clear();
     issuedRootInboxDetails = new WeakMap();
+    issuedRootInboxReceipts.clear();
     rootInboxRunSignal = undefined;
   };
   const wakeIdleMain = async (): Promise<void> => {
@@ -891,7 +919,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     inboxWake.reading = true;
     try {
       if (!idle()) return;
-      const inbox = await state.nextRootInbox(await inboxHeldBy(context), idle);
+      const inbox = await state.nextRootInbox(await inboxHeldBy(context, verifyIssuedInbox), idle);
       await reportInboxExpiry(pi, inbox);
       // A turn that started meanwhile takes the pending batch at its own start: never a second run.
       if (inbox?.events.length && idle()) {
@@ -1618,7 +1646,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     inboxWake.context = context;
     inboxWake.armed = true;
     if (!state.initialized) return;
-    const inbox = await state.nextRootInbox(await inboxHeldBy(context)).catch(() => undefined);
+    const inbox = await state.nextRootInbox(await inboxHeldBy(context, verifyIssuedInbox)).catch(() => undefined);
     await reportInboxExpiry(pi, inbox);
     if (!inbox) return;
     const events = inboxEventsToQueue(inbox);

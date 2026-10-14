@@ -50,6 +50,15 @@ export interface RootInboxReconcileOptions {
   turnEnd?: boolean;
 }
 
+/** Authoritative shown-only receipt data supplied by the live extension issuer. */
+export interface RootInboxReceiptSnapshot {
+  readonly ids: readonly string[];
+  readonly receipts: readonly string[];
+}
+
+/** A private extension-instance verifier for a projected canonical details object. */
+export type RootInboxReceiptVerifier = (details: unknown) => RootInboxReceiptSnapshot | undefined;
+
 export const workKey = (data: unknown): string | undefined => {
   const key = data && typeof data === "object" ? (data as { key?: unknown }).key : undefined;
   return typeof key === "string" && key.trim() ? key.trim() : undefined;
@@ -177,7 +186,9 @@ export const projectRootInboxReceipt = (value: unknown): unknown => {
   return {
     type: entry.type, id: entry.id, timestamp: entry.timestamp, customType: entry.customType,
     ...(details ? { details: {
-      ...carried(details), ids: details.ids, receipts: details.receipts,
+      ...carried(details),
+      ...(typeof details.nonce === "string" ? { nonce: details.nonce } : {}),
+      ids: details.ids, receipts: details.receipts,
       // Keep malformed shapes unchanged: consumers retain their existing
       // validation/failure behavior; projection must not manufacture a receipt.
       items: Array.isArray(details.items) ? details.items.map(carried) : details.items,
@@ -211,21 +222,49 @@ export const confirmedMainInboxIds = (manager: SessionReceiptManager, sessionId:
 
 /** Persisted sessions must use confirmed file receipts, never Pi's pre-write memory index.
  * A failed barrier supplies no positive delivery evidence, so shadows remain recoverable. */
-export const confirmedRootInboxSession = (manager: SessionReceiptManager): RootInboxSession => {
+const verifiedInboxReceipt = (
+  details: unknown, verifier: RootInboxReceiptVerifier | undefined,
+): RootInboxReceiptSnapshot | undefined => {
+  if (!verifier) return undefined;
+  const snapshot = verifier(details);
+  if (!snapshot || !Array.isArray(snapshot.ids) || !Array.isArray(snapshot.receipts)) return undefined;
+  // Do not let a verifier's mutable return value become shared reader state.
+  return Object.freeze({
+    ids: Object.freeze(snapshot.ids.filter((id): id is string => typeof id === "string")),
+    receipts: Object.freeze(snapshot.receipts.filter((id): id is string => typeof id === "string")),
+  });
+};
+
+export const confirmedRootInboxSession = (
+  manager: SessionReceiptManager, verifier?: RootInboxReceiptVerifier,
+): RootInboxSession => {
   try {
     const snapshot = confirmedSessionReceiptSnapshot(manager, matchesInboxReceipt, projectRootInboxReceipt);
-    return inboxReceiptSession(snapshot.entries, snapshot.count);
+    return inboxReceiptSession(snapshot.entries, snapshot.count, 500, verifier);
   } catch {
     return rootInboxSession([]);
   }
 };
 
 /** A receipt snapshot of canonical entries; async inbox reads must not retain the history.
- * Batch presence retains its compatibility lookback; delivery identity does not. */
-export const rootInboxSession = (entries: readonly unknown[], lookback = 500): RootInboxSession =>
-  inboxReceiptSession(Object.keys(entries).map((key): [number, unknown] => [Number(key), entries[Number(key)]]), entries.length, lookback);
+ * Batch presence retains its compatibility lookback; delivery identity does not. Unsigned inbox
+ * carriers are intentionally fail-open: only the live issuer verifier may grant inbox authority. */
+export const rootInboxSession = (
+  entries: readonly unknown[], lookbackOrVerifier: number | RootInboxReceiptVerifier = 500,
+  verifier?: RootInboxReceiptVerifier,
+): RootInboxSession => {
+  const lookback = typeof lookbackOrVerifier === "number" ? lookbackOrVerifier : 500;
+  const receiptVerifier = typeof lookbackOrVerifier === "function" ? lookbackOrVerifier : verifier;
+  return inboxReceiptSession(
+    Object.keys(entries).map((key): [number, unknown] => [Number(key), entries[Number(key)]]),
+    entries.length, lookback, receiptVerifier,
+  );
+};
 
-const inboxReceiptSession = (entries: Iterable<readonly [number, unknown]>, count: number, lookback = 500): RootInboxSession => {
+const inboxReceiptSession = (
+  entries: Iterable<readonly [number, unknown]>, count: number, lookback = 500,
+  verifier?: RootInboxReceiptVerifier,
+): RootInboxSession => {
   const batchIds = new Set<string>();
   let hasBatch = false;
   const steers = new Map<string, Set<string>>();
@@ -243,15 +282,16 @@ const inboxReceiptSession = (entries: Iterable<readonly [number, unknown]>, coun
     if (entry?.type !== "custom_message") continue;
     const parsedAt = Date.parse(entry.timestamp ?? "");
     const at = Number.isFinite(parsedAt) ? parsedAt : Date.now();
-    if (entry.customType === ROOT_INBOX_CUSTOM_TYPE && Array.isArray(entry.details?.ids)) {
-      if (index >= Math.max(0, count - lookback)) {
-        hasBatch = true;
-        for (const id of entry.details.ids) if (typeof id === "string") batchIds.add(id);
-      }
-      // Mixed-version inbox messages carried only globally unique mesh event ids.
-      for (const id of entry.details.ids) if (typeof id === "string") remember(eventReceipt(id), at);
-      if (Array.isArray(entry.details.receipts)) {
-        for (const id of entry.details.receipts) if (typeof id === "string") remember(id, at);
+    if (entry.customType === ROOT_INBOX_CUSTOM_TYPE) {
+      const receipt = verifiedInboxReceipt(entry.details, verifier);
+      if (receipt) {
+        if (index >= Math.max(0, count - lookback)) {
+          hasBatch = true;
+          for (const id of receipt.ids) batchIds.add(id);
+        }
+        // Mixed-version inbox messages carried only globally unique mesh event ids.
+        for (const id of receipt.ids) remember(eventReceipt(id), at);
+        for (const id of receipt.receipts) remember(id, at);
       }
     }
     if (entry.customType !== AGENT_MESSAGE_CUSTOM_TYPE) continue;
@@ -280,15 +320,19 @@ const inboxReceiptSession = (entries: Iterable<readonly [number, unknown]>, coun
 };
 
 /** Whether a session's recent entries hold the inbox message for these event ids. */
-export const sessionHoldsInboxBatch = (entries: readonly unknown[], ids: readonly string[], lookback = 500): boolean => {
+export const sessionHoldsInboxBatch = (
+  entries: readonly unknown[], ids: readonly string[], lookback = 500,
+  verifier?: RootInboxReceiptVerifier,
+): boolean => {
+  if (!verifier) return false;
   const missing = new Set(ids);
   for (let index = entries.length - 1; index >= Math.max(0, entries.length - lookback); index--) {
-    const entry = entries[index] as { type?: string; customType?: string; details?: { ids?: unknown } } | undefined;
+    const entry = entries[index] as { type?: string; customType?: string; details?: unknown } | undefined;
     if (entry?.type !== "custom_message" || entry.customType !== ROOT_INBOX_CUSTOM_TYPE) continue;
-    if (Array.isArray(entry.details?.ids)) {
-      for (const id of entry.details.ids) if (typeof id === "string") missing.delete(id);
-      if (missing.size === 0) return true;
-    }
+    const receipt = verifiedInboxReceipt(entry.details, verifier);
+    if (!receipt) continue;
+    for (const id of receipt.ids) missing.delete(id);
+    if (missing.size === 0) return true;
   }
   return false;
 };

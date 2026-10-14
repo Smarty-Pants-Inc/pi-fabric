@@ -5,7 +5,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { deliverRootInbox } from "../src/topology/root-inbox-delivery.js";
 import { MeshStore, type MeshEvent, type MeshIdentity } from "../src/mesh/store.js";
-import { RootInbox, rootInboxMessage, rootInboxSession, sessionHoldsInboxBatch, type RootInboxSession } from "../src/topology/root-inbox.js";
+import { RootInbox, projectRootInboxReceipt, rootInboxSession as unsignedSession, type RootInboxSession } from "../src/topology/root-inbox.js";
+import { registerIssuedInbox, rootInboxMessage, rootInboxSession, sessionHoldsInboxBatch } from "./root-inbox-issued-fixture.js";
 
 // smarty-dev#754 §3.2 step 3: a Main reconciles the work events addressed to it that no steer
 // delivered. A batch stays pending until the session holds it; the cursor moves only then.
@@ -156,7 +157,7 @@ describe("RootInbox", () => {
     const entries: Array<{ type: string } & ReturnType<typeof rootInboxMessage>> = [];
     deliverRootInbox({ hostCapabilities: { turnProvenance: 1 },
       sendMessage: (message: ReturnType<typeof rootInboxMessage>) => entries.push({ type: "custom_message", ...message }),
-    } as unknown as ExtensionAPI, batch.events);
+    } as unknown as ExtensionAPI, batch.events, undefined, registerIssuedInbox);
     expect(entries).toHaveLength(2);
     const ids = batch.events.map(event => event.id);
     expect(sessionHoldsInboxBatch(entries, ids)).toBe(true);
@@ -172,9 +173,27 @@ describe("RootInbox", () => {
 
   it("finds the batch message among a session's recent entries", () => {
     const entry = { type: "custom_message", customType: "pi-fabric-inbox", details: { ids: ["a", "b"] } };
+    registerIssuedInbox(entry.details);
     expect(sessionHoldsInboxBatch([{ type: "message" }, entry], ["a", "b"])).toBe(true);
     expect(sessionHoldsInboxBatch([entry], ["a", "c"])).toBe(false);
     expect(sessionHoldsInboxBatch([], ["a"])).toBe(false);
+  });
+
+  it("uses private issued snapshots after cold JSON projection, not copied public claims", () => {
+    const entry = { type: "custom_message", customType: "pi-fabric-inbox", details: { ids: ["shown"], receipts: ["shown-receipt"] } };
+    registerIssuedInbox(entry.details);
+    const cold = JSON.parse(JSON.stringify(entry));
+    cold.details.ids = ["withheld"];
+    cold.details.receipts = ["withheld-receipt"];
+    const projected = projectRootInboxReceipt(cold);
+    const view = rootInboxSession([projected]);
+    expect(view.holdsBatch(["shown"])).toBe(true);
+    expect(view.holdsBatch(["withheld"])).toBe(false);
+    expect(view.delivered?.has("shown-receipt")).toBe(true);
+    expect(view.delivered?.has("withheld-receipt")).toBe(false);
+    expect(unsignedSession([projected]).holdsBatch(["shown"])).toBe(false);
+    cold.details.nonce = "unissued";
+    expect(rootInboxSession([projectRootInboxReceipt(cold)]).holdsBatch(["shown"])).toBe(false);
   });
 });
 
@@ -217,7 +236,7 @@ describe("RootInbox.wake", () => {
     const pi = { sendMessage: (message: ReturnType<typeof rootInboxMessage>, delivery: Parameters<ExtensionAPI["sendMessage"]>[1]) => {
       entries.push({ type: "custom_message", ...message }); options.push(delivery);
     } } as unknown as ExtensionAPI;
-    deliverRootInbox(pi, pending!.events);
+    deliverRootInbox(pi, pending!.events, undefined, registerIssuedInbox);
     expect(entries.map(entry => entry.details.ids)).toEqual([[late.id]]);
     expect(options).toEqual([{ deliverAs: "followUp", triggerTurn: false }]);
     expect(await box.wake(rootInboxSession(entries), idle)).toBeUndefined();
@@ -227,7 +246,7 @@ describe("RootInbox.wake", () => {
     const fresh = await work("fresh work"); now++;
     const mixed = await box.wake(rootInboxSession(entries), idle);
     expect(mixed!.events.map(event => event.id)).toEqual([another.id, fresh.id]);
-    deliverRootInbox(pi, mixed!.events);
+    deliverRootInbox(pi, mixed!.events, undefined, registerIssuedInbox);
     expect(entries.map(entry => entry.details.ids)).toEqual([[late.id], [another.id], [fresh.id]]);
     expect(options.slice(1)).toEqual([
       { deliverAs: "followUp", triggerTurn: false }, { deliverAs: "followUp", triggerTurn: true },

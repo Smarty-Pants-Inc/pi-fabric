@@ -1445,8 +1445,23 @@ export class ActorManager {
     this.#syncActorsFromRegistry();
     // The obligation loads lazily from disk: read the map after cleanupObligation() (named pass N3-1).
     if (this.cleanupObligation(id)) return this.#ownsCleanup(this.#removalCleanup.get(id)!);
+    // smarty-dev#11105: an exact id whose commit is in flight (actor map hole, revocation not yet committed).
+    if (this.finishingRemoval(id)) return true;
     const actor = this.#requireActor(id);
     return this.#canManage(actor.id);
+  }
+
+  /**
+   * Exact-id admission metadata for a removal whose commit is in flight in this manager: the actor already left
+   * the actor map, its registry revocation has not committed. Backed by #finishCalls and the prepared marker
+   * under this host's custody; never resolves a name or prefix and is not a status/live actor.
+   */
+  finishingRemoval(id: string): { id: string; name: string; rootId: string; residency: "session" | "durable" } | undefined {
+    // Revoked: the cleanup obligation (cleanupObligation) is the record, not this transient admission.
+    if (!this.#finishCalls.has(id) || this.#actors.has(id) || this.#revoked.has(id)) return undefined;
+    const cleanup = this.#removalCleanup.get(id);
+    if (!cleanup?.owner || !this.#ownsCleanup(cleanup)) return undefined;
+    return { id, name: cleanup.owner.name, rootId: cleanup.owner.rootId, residency: cleanup.owner.residency };
   }
 
   /** Resolve a caller-local view for foreign routing; own-root defaults stay dynamic. */
@@ -2725,11 +2740,16 @@ export class ActorManager {
     { wait = true, operator }: { wait?: boolean; operator?: true } = {},
   ): Promise<RemovalResult> {
     // Resolve aliases only against registered actors; cleanup retries require the exact full id.
-    const actorId = this.cleanupObligation(id) || this.#removeCalls.has(id) ? id : this.#requireOwnedActor(id).id;
+    const actorId = this.cleanupObligation(id) || this.#removeCalls.has(id) || this.finishingRemoval(id)
+      ? id : this.#requireOwnedActor(id).id;
+    // Capture the admitted commit before persistence yields: later progress must not lose this caller's join.
+    const finishing = this.finishingRemoval(actorId) ? this.#finishCalls.get(actorId) : undefined;
     // Sticky before joining any call in progress; durable before an accepted removal reports it.
     if (operator) await this.#escalateOperator(actorId);
     // Share acceptance, not the first caller's wait policy. Every caller joins the same finisher.
-    const call = this.#removeCalls.get(actorId) ?? this.#remove(actorId);
+    // A commit in its map hole (smarty-dev#11105) is joined, never restarted: its result is the answer. Once
+    // revoked, the existing cleanup-obligation path answers its pending state without waiting on the finisher.
+    const call = this.#removeCalls.get(actorId) ?? finishing ?? this.#remove(actorId);
     this.#removeCalls.set(actorId, call);
     let result: RemovalResult;
     try { result = await call; } finally {

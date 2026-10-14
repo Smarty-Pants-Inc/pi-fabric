@@ -85,6 +85,7 @@ import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { renameAtomic } from "../core/atomic-write.js";
+import { verifiedRemove } from "../storage/verified-remove.js";
 import { storageRevision } from "../verified/storage.js";
 import { assertFileStateWritable, encodeMeshStateMovedMarker, encodeMeshStateNatsMarker, MeshBackendFenceError, meshFenceAlarm, meshStateSourceOf,
   readMeshStateMovedMarker, readMeshStateNatsMarker, readStateFileEpoch as readEpochHeader, type MeshBackendAlarm, type MeshStateMovedMarker,
@@ -427,6 +428,11 @@ class FenceDb {
     } catch (error) {
       // A refused state root is a fence failure for the operator too (#846 SEC P2): alarm, then rethrow it as is.
       if (error instanceof MeshStateUnsupportedError) meshFenceAlarm(options, root, error.message);
+      // smarty-dev#11466: the gate's failed close (sqliteCloseError) keeps this run's file pins; the report rides on it.
+      if (owned?.createdDb && error instanceof Error && "sqliteCloseError" in error) {
+        const { cleanupWarnings, retained, reason } = owned.keepAfterFailure("close-failed", error.sqliteCloseError);
+        Object.assign(error, { cleanupWarnings, ...(retained.length > 0 ? { retained } : {}), ...(reason ? { reason } : {}) });
+      }
       throw error;
     }
     try {
@@ -450,7 +456,19 @@ class FenceDb {
       }
       return fence;
     } catch (error) {
-      try { db.close(); } catch { /* closing anyway */ }
+      // smarty-dev#9501: a WAL setup refusal on a state.db this run created gets the refusal cleanup; this catch owns the
+      // connection, so it knows whether the close succeeded. Anything else keeps the files, as before.
+      if (owned?.createdDb && error instanceof MeshStateUnsupportedError) cleanupAfterRefusal(error, owned, () => db.close());
+      else {
+        try { db.close(); }
+        catch (closeError) {
+          // smarty-dev#11466: a failed close keeps this run's file pins (close-failed); the report rides on the original error.
+          if (owned?.createdDb && error instanceof Error) {
+            const { cleanupWarnings, retained, reason } = owned.keepAfterFailure("close-failed", closeError);
+            Object.assign(error, { cleanupWarnings, ...(retained.length > 0 ? { retained } : {}), ...(reason ? { reason } : {}) });
+          } else if (owned?.createdDb) owned.keepAfterFailure("close-failed", closeError);
+        }
+      }
       throw error;
     }
   }
@@ -602,9 +620,20 @@ const readFile = (root: string, options: MeshBackendOptions): FencedFile =>
  */
 const dropBlankStateFile = (root: string): void => {
   const file = path.join(root, STATE_JSON);
-  const stat = fs.statSync(file, { throwIfNoEntry: false });
-  if (!stat?.isFile() || stat.size > 4096 || fs.readFileSync(file, "utf8").trim() !== "") return;
-  fs.rmSync(file, { force: true });
+  // smarty-dev#8907: judged by this lstat; the content is read through a descriptor proven to be that inode, and only
+  // that inode is removed. A successor swapped in since is kept and the import refused. pi-fabric#1036 round 3 P2: no
+  // path fallback here (smarty-dev#7858): where the verified path is unavailable (darwin, Windows without the helper)
+  // nothing is deleted, the file is kept and the import refused, so a successor swapped in after the blank judgment
+  // is never removed by name. The Windows helper, where switched on, still verifies the judged inode.
+  const stat = fs.lstatSync(file, { throwIfNoEntry: false });
+  if (!stat?.isFile() || stat.size > 4096) return;
+  const descriptor = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+  try {
+    const opened = fs.fstatSync(descriptor);
+    if (opened.dev !== stat.dev || opened.ino !== stat.ino || fs.readFileSync(descriptor, "utf8").trim() !== "") return;
+  } finally { fs.closeSync(descriptor); }
+  const result = verifiedRemove(file, stat, { deleter: "meshBlankStateFile" });
+  if (!result.removed) throw new MeshBackendRefusedError(`Fabric mesh blank state.json was not dropped (${result.reason}); import refused`);
 };
 
 const fileEpochOf = (state: FencedFile): number => (state.backendEpoch === undefined ? 0 : storageRevision(state.backendEpoch));
@@ -649,9 +678,21 @@ const fsyncDirectory = (directory: string): void => {
   try { fs.fsyncSync(descriptor); } finally { fs.closeSync(descriptor); }
 };
 
+/** smarty-dev#8907: a migration or rollback temp judged by its name, then this lstat; only that inode is removed.
+ * A refusal throws, as a failed rmSync did: a successor swapped in since stays in place and is never renamed or
+ * overwritten (the export opens its temp "wx"). Off Linux: main's rmSync (#7858 fallback). */
+const removeTemp = (root: string, name: string): void => {
+  const file = path.join(root, name);
+  const stat = fs.lstatSync(file, { throwIfNoEntry: false });
+  if (!stat) return;
+  if (!stat.isFile()) throw new MeshBackendRefusedError(`Fabric mesh temp ${file} is not a regular file; left in place`);
+  const result = verifiedRemove(file, stat, { deleter: "meshMigrationTemp", fallback: () => { fs.rmSync(file, { force: true }); return true; } });
+  if (!result.removed) throw new MeshBackendRefusedError(`Fabric mesh temp ${file} was not removed (${result.reason}); left in place`);
+};
+
 const removeStaleTemps = (root: string): void => {
   for (const name of fs.readdirSync(root)) {
-    if (name.startsWith(TEMP_PREFIX) && name.endsWith(".tmp")) fs.rmSync(path.join(root, name), { force: true });
+    if (name.startsWith(TEMP_PREFIX) && name.endsWith(".tmp")) removeTemp(root, name);
   }
 };
 
@@ -836,6 +877,26 @@ const fencedCutover = async (root: string, options: MeshBackendOptions): Promise
 };
 
 /**
+ * smarty-dev#9501: the one refusal cleanup. `close` is called exactly once; a close that throws keeps every file
+ * (close-failed), never retried and nothing moved. Only after a successful close are this run's files quarantined.
+ * The report is attached to the same error object; the caller rethrows it unchanged.
+ */
+const cleanupAfterRefusal = (error: Error, owned: OwnedImportFiles, close: () => void): void => {
+  // Nothing here masks the refusal: a cleanup that cannot run keeps the files and says so.
+  // First the close: SQLite's own close may checkpoint and remove its sidecars. A close that throws fails closed:
+  // the connection may still hold the files, so nothing is unlinked, and the close is not retried.
+  let report: RefusalCleanupReport | undefined;
+  try { close(); }
+  catch (closeError) { report = owned.keepAfterFailure("close-failed", closeError); }
+  if (!report) {
+    try { report = owned.removeAfterRefusal(); }
+    catch (cleanup) { report = owned.keepAfterFailure("cleanup-failed", cleanup); }
+  }
+  const { cleanupWarnings, retained, reason } = report;
+  if (cleanupWarnings.length > 0) Object.assign(error, { cleanupWarnings, ...(retained.length > 0 ? { retained } : {}), ...(reason ? { reason } : {}) });
+};
+
+/**
  * smarty-dev#9501: a refusal (MeshBackendRefusedError, MeshBackendFenceError: exit 3) BEFORE the importing commit
  * leaves the root as it was. The state.db, -wal and -shm this run created are removed, still under the fence, after
  * the connection is closed. The removal runs only through the held root fd and only while each name still names the
@@ -886,23 +947,22 @@ const cutoverWithFence = (root: string, options: MeshBackendOptions, lock: MeshL
         + (conflictFile ? `; the conflicting state.json is kept at ${conflictFile}` : ""), rollback, conflictFile);
     } catch (error) {
       if (owned.createdDb && !fence.importCommitting && (error instanceof MeshBackendRefusedError || error instanceof MeshBackendFenceError)) {
-        // Nothing here masks the refusal: a cleanup that cannot run keeps the files and says so.
-        // First the close: SQLite's own close may checkpoint and remove its sidecars. A close that throws fails closed:
-        // the connection may still hold the files, so nothing is unlinked, and the close is not retried (FenceDb.close
-        // marks itself closed before it calls db.close, so the outer finally is a no-op and cannot mask the refusal).
-        let report: RefusalCleanupReport | undefined;
-        try { fence.close(); }
-        catch (closeError) { report = owned.keepAfterFailure("close-failed", closeError); }
-        if (!report) {
-          try { report = owned.removeAfterRefusal(); }
-          catch (cleanup) { report = owned.keepAfterFailure("cleanup-failed", cleanup); }
-        }
-        const { cleanupWarnings, retained, reason } = report;
-        if (cleanupWarnings.length > 0) Object.assign(error, { cleanupWarnings, ...(retained.length > 0 ? { retained } : {}), ...(reason ? { reason } : {}) });
+        // FenceDb.close marks itself closed before it calls db.close, so the outer finally is a no-op and cannot mask the refusal.
+        cleanupAfterRefusal(error, owned, () => fence.close());
       }
       throw error;
     }
-  } finally { fence.close(); }
+  } finally {
+    try { fence.close(); }
+    catch (closeError) {
+      // smarty-dev#11466: a failed close keeps this run's file pins (close-failed); the same close error is rethrown.
+      if (owned.createdDb && closeError instanceof Error) {
+        const { cleanupWarnings, retained, reason } = owned.keepAfterFailure("close-failed", closeError);
+        Object.assign(closeError, { cleanupWarnings, ...(retained.length > 0 ? { retained } : {}), ...(reason ? { reason } : {}) });
+      } else if (owned.createdDb) owned.keepAfterFailure("close-failed", closeError);
+      throw closeError;
+    }
+  }
 };
 
 /**
@@ -954,6 +1014,8 @@ const writeMovedMarker = (root: string, epoch: number): void => {
     fs.writeSync(descriptor, encodeMeshStateMovedMarker(epoch));
     fs.fsyncSync(descriptor);
   } finally { fs.closeSync(descriptor); }
+  // ponytail: replacement, not cleanup: under the fence (custody.lock, .lock) the marker replaces state.json by design
+  // (retireStateFile keeps a copy first; a cutover conflict is copied aside); legacy writers serialize on .lock.
   renameAtomic(temporary, path.join(root, STATE_JSON));
   fsyncDirectory(root);
 };
@@ -980,7 +1042,7 @@ const ROLLBACK_TEMP = /^state\.json\.rollback-\d+\.tmp$/;
 
 const removeRollbackTemps = (root: string, keep?: string): void => {
   for (const name of fs.readdirSync(root)) {
-    if (ROLLBACK_TEMP.test(name) && name !== keep) fs.rmSync(path.join(root, name), { force: true });
+    if (ROLLBACK_TEMP.test(name) && name !== keep) removeTemp(root, name);
   }
 };
 
@@ -1102,6 +1164,8 @@ const rollbackSwitch = (root: string, options: MeshBackendOptions, fence: FenceD
 
 /** Step 5, the very last: the verified temp replaces the marker (atomic rename, directory fsync). */
 const rollbackReplace = (root: string, options: MeshBackendOptions, temporary: string): void => {
+  // ponytail: replacement, not cleanup: under the fence the verified export replaces the marker, which no writer
+  // can commit over (legacy strict reads fail on it; sqlite writers are fenced by the flag).
   renameAtomic(temporary, path.join(root, STATE_JSON));
   fsyncDirectory(root);
   options.onStep?.("rollback-replace");

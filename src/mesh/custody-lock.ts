@@ -2,6 +2,7 @@ import { createHash, randomBytes, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { FOREIGN_LOCK, pinFenceLock, releaseFenceLock } from "./fence-lock.js";
+import { verifiedRemove } from "../storage/verified-remove.js";
 import {
   alarmForeignHolder, MeshLockForeignHolderError, MeshLockTimeoutError, ownProcessIncarnation, processIncarnation, validProcessIncarnation,
   readPhysicalHostIdentity, readPhysicalMachineId, validBootId, type StaleLockNote,
@@ -68,7 +69,6 @@ export const acquireMeshCustodyLock = async (root: string, timeoutMs = CUSTODY_L
   fs.mkdirSync(root, { recursive: true, mode: 0o700 });
   const lock = path.join(root, MESH_CUSTODY_LOCK_NAME);
   const ownerPath = path.join(lock, "owner");
-  const deadline = Date.now() + Math.max(0, timeoutMs);
   const token = randomUUID();
   // Keep full UUID ownership receipts; only transient filesystem names need a short token.
   const pathToken = randomBytes(4).toString("hex");
@@ -92,6 +92,9 @@ export const acquireMeshCustodyLock = async (root: string, timeoutMs = CUSTODY_L
     catch (error) { if (errorCode(error) === "ENOENT") return undefined; throw error; }
   };
   const blocked: StaleLockNote = {};
+  // The relative wait budget starts at the first acquisition attempt, after setup (incarnation and PID-namespace
+  // reads): slow setup must not spend it before the lock was tried.
+  const deadline = Date.now() + Math.max(0, timeoutMs);
   let attempts = 0;
   let maxGapMs = 0;
   let lastAttemptAt = Date.now();
@@ -114,6 +117,9 @@ export const acquireMeshCustodyLock = async (root: string, timeoutMs = CUSTODY_L
       const code = errorCode(error);
       if (code !== "EEXIST" && code !== "ENOTEMPTY" && code !== "EPERM" && code !== "EACCES") throw error;
     } finally {
+      // ponytail: no judgment precedes this. `staging` is this attempt's own unpublished mkdtemp name (random suffix,
+      // never published under it, never a recovery or rename target); after a successful publish the name is empty
+      // and `force` makes this a no-op. smarty-dev#8907 inventory.
       fs.rmSync(staging, { recursive: true, force: true });
     }
     try {
@@ -142,11 +148,17 @@ export const acquireMeshCustodyLock = async (root: string, timeoutMs = CUSTODY_L
   // Main's release by name. Non-Linux keeps it; the stalled-holder race there is tracked in smarty-dev#9569.
   const releaseByName = (): void => {
     try {
+      // smarty-dev#8907: the stat captured before the owner judgment; only that inode is removed (detached into
+      // verifiedRemove's graveyard first). A swapped-in successor is refused, never removed.
+      const judged = fs.lstatSync(lock);
       if (readOwner() !== record) return;
-      // Detach before removal: never recursively delete through the canonical name.
-      const released = `${lock}.released.${pathToken}`;
-      fs.renameSync(lock, released);
-      fs.rmSync(released, { recursive: true, force: true });
+      verifiedRemove(lock, judged, { deleter: "meshCustodyLockRelease", fallback: () => {
+        // Off Linux, main's release. Detach before removal: never recursively delete through the canonical name.
+        const released = `${lock}.released.${pathToken}`;
+        fs.renameSync(lock, released);
+        fs.rmSync(released, { recursive: true, force: true });
+        return true;
+      } });
     } catch {
       // Already recovered or replaced: never delete a successor.
     }

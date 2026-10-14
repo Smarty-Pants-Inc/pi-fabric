@@ -61,6 +61,11 @@ export const createRunningRecord = (
   name: options.name,
   ...(options.spawner ? { spawner: options.spawner } : {}),
   task,
+  ...(options.promptSha256 ? { promptSha256: options.promptSha256 } : {}),
+  ...(options.promptBytes !== undefined ? { promptBytes: options.promptBytes } : {}),
+  ...(options.promptPath ? { promptPath: options.promptPath } : {}),
+  ...(options.inputSha256 ? { inputSha256: options.inputSha256 } : {}),
+  ...(options.inputBytes !== undefined ? { inputBytes: options.inputBytes } : {}),
   status: "running",
   runner: options.runner,
   ...(options.mainAgentId ? { mainAgentId: options.mainAgentId } : {}),
@@ -151,10 +156,13 @@ export const writeCrashRunRecord = (
   filePath: string,
   record: AgentRunRecord,
   error: unknown,
+  // pi-fabric#1034 round 7: the worker's live receipt, so a crash keeps pending calls marked truncated.
+  writeReceipt?: AgentRunRecord["writeReceipt"],
 ): void => {
   const reason = error instanceof Error ? error.message : String(error);
   const crashed: AgentRunRecord = {
     ...record,
+    ...(writeReceipt ? { writeReceipt } : {}),
     status: "failed",
     error: `Worker crashed before reporting a result: ${reason}`.slice(0, MAX_RUN_ERROR_CHARS),
     finishedAt: Date.now(),

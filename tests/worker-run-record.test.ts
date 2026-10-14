@@ -59,6 +59,17 @@ describe("record-only run classes", () => {
     expect(createRunRouteMetadata({ runner: "pi", transport: "process", handoff: true, routeClass: "custom-handoff" }))
       .toEqual({ routeClass: "custom-handoff", routeClassSource: "explicit" });
   });
+  it("carries original and current input metadata through the worker record", () => {
+    const options = parseWorkerOptions(argv({
+      "prompt-sha256": "a".repeat(64), "prompt-bytes": "12", "prompt-path": "/runs/id/task.txt",
+      "input-sha256": "b".repeat(64), "input-bytes": "13",
+    }));
+    expect(createRunningRecord(options, "current task", undefined, 1)).toMatchObject({
+      promptSha256: "a".repeat(64), promptBytes: 12, promptPath: "/runs/id/task.txt",
+      inputSha256: "b".repeat(64), inputBytes: 13,
+    });
+  });
+
   it("rejects malformed host metadata without inventing a protection value", () => {
     expect(() => parseWorkerOptions(argv({ "route-class-source": "prompt" }))).toThrow("Invalid worker route class source");
     expect(() => parseWorkerOptions(argv({ protected: "unknown" }))).toThrow("Invalid worker protection snapshot");

@@ -841,6 +841,127 @@ model/effort; the public calls retain their ordinary Fabric execution audit.
 Native artifact proof (keyless, offline real Pi RPC; no external inference):
 `nice -n 19 node scripts/prove-main-bindings.mjs dist/index.js "$TASK_OUT"`.
 
+### Per-task memory cap (Linux, smarty-dev#8257)
+
+On a host where the check passes, each process **task** runs in its own transient
+systemd user scope with `memory.max` set to `agents.processMemoryMaxBytes` and
+swap capped at 0. The default is 24 GiB, and only root policy can change it (see
+[configuration](configuration.md)). A runaway task then hits its own OOM boundary,
+which prevents it from exhausting the host. Stopping the task stops its whole scope.
+
+To be eligible, a launch must be a task: the worker arguments carry no exact
+`--actor-id` flag. The host must also pass these checks:
+
+- Linux with unified cgroup v2.
+- An explicit, usable user-bus environment (`$XDG_RUNTIME_DIR/bus` or a
+  `unix:path=` `DBUS_SESSION_BUS_ADDRESS` socket).
+- The `memory` controller delegated to the user manager.
+- `systemd-run` on `PATH`.
+
+These checks only stat or read files; Fabric runs no D-Bus command. The scope goes
+in `agents.processSlice` when root policy sets it, and in `app.slice` otherwise.
+
+Pre-admission ineligibility keeps the legacy launch. This covers actors,
+non-Linux hosts, and scrubbed environments such as CI or `smarty-test-env`.
+Without an explicit `processSlice` they do not run `systemd-run`, and an explicit
+slice still gives an uncapped scope as before. A backend executable proven
+missing also permits legacy launch. Once capped admission starts, a scope
+rejection, failed cap request, timeout or unverified receipt raises
+`TaskScopeAdmissionError`; the task is never replayed uncapped.
+
+Task environments drop inherited `FABRIC_TASK_MEMORY_MAX`,
+`FABRIC_TASK_CGROUP` and `FABRIC_TASK_SYSTEMD_RUN_WRAPPER`. The launcher
+exports them into the task's worker only after it admits a capped receipt. The
+worker passes those same values to its own native agent (same run), which is how
+that agent's bash hook and `PATH` see the cap. They never come from a parent. The admitted path appears as
+`cgroup` on the run record and handle. A missing `cgroup` means the task ran
+uncapped.
+
+#### Task-local `systemd-run`
+
+Tasks often run `systemd-run --user --scope ... -- CMD`. A real scope would leave
+the task's capped cgroup leaf, and stopping the task would not stop it. After the
+boundary is verified, the launcher writes a task-local shim to
+`<scope root>/bin/systemd-run` (mode 0700). It puts that directory first on
+`PATH` and exports its path as `FABRIC_TASK_SYSTEMD_RUN_WRAPPER`. The shim is a
+self-contained POSIX `sh` script, so it needs no Node or Bun features.
+
+- **`--user --scope` from inside the task leaf** (or a cgroup nested under it):
+  the shim parses the options strictly and then `exec`s `CMD` in place. The pid
+  is the same, the cgroup leaf is the same, and argv is passed through byte for
+  byte. Nothing is evaluated, and `${VAR}` is not expanded. A task stop therefore
+  stops `CMD` too.
+  - Accepted options: `--user`, `--scope`, `-q`/`--quiet`, `-G`/`--collect`,
+    `--no-ask-password`, `--description` and `-u`/`--unit`. Unit names are
+    validated, then ignored. `-p`/`--property` accepts `MemoryMax=` and
+    `MemorySwapMax=` only. Separate, `=` and attached (`-pX`) forms all work.
+    Sizes are `N`, `NK`, `NM`, `NG`, `NT` or `infinity`.
+  - Any other option or property in this mode (`--slice`, `--setenv`,
+    `--machine`, `CPUQuota=`, `1.5G` and so on) exits 1 with a message. It never
+    falls through to the real binary, which would create an escaping scope.
+- **Other `--user` modes inside the task leaf** (services, timers, path units
+  or shell mode without `--scope`) are refused under rule smarty-dev#8257:
+  user-manager units must not escape the task memory cap or `agents.stop`.
+  Unique long-option abbreviations resolve to their full names before policy
+  checks. Ambiguous or unknown options that cannot prove a safe mode are refused.
+- **Known non-user modes and information commands** (`--version`, `--help`, a
+  system-manager `--scope` without `--user`) run the absolute real binary with
+  the original arguments. So does a process outside the task leaf.
+
+Stop confirmation watches the retained owned leaf's `cgroup.events` for
+`populated 0`, which covers the whole subtree. It subscribes before the first
+read and uses one bounded deadline, not membership polling. Watch/read failures
+or a still-populated subtree raise `TaskCgroupStopUnconfirmedError` with the
+remaining pids and do not report success.
+
+**Tighter limits apply to the whole task (ponytail tradeoff).** A process in a
+leaf cgroup that holds processes cannot get its own memory sub-cgroup (cgroup v2
+has a no-internal-processes rule), and a real separate scope would escape. So
+`MemoryMax=X` lowers the **whole task leaf's** `memory.max` to
+`min(X, current memory.max, agents.processMemoryMaxBytes)`, and that lower cap
+lasts for the rest of the task. The shim refuses the request, without changing
+anything, unless all of these hold:
+
+- the leaf's swap is 0;
+- `memory.max` is a byte cap;
+- the new cap is above the task's current `memory.current`.
+
+It never raises the cap. `MemorySwapMax=` is only validated, because swap is
+already 0. A later `systemctl --user daemon-reload` can reset `memory.max` to the
+scope's own `MemoryMax` (the root cap), which is never higher than the root cap.
+
+Inside a capped task, the native `bash` tool's hook allows plain `systemd-run` on
+`PATH` only when all of these hold:
+
+- `FABRIC_TASK_SYSTEMD_RUN_WRAPPER` is truthful: the first executable
+  `systemd-run` on `PATH` resolves to it.
+- The command does not rewrite lookup. That rules out `PATH` assignments or
+  `unset`/`read PATH`, `hash`/`alias`, `sudo`/`doas`/`busybox`, `command -p`, and
+  `env -i`/`-u`/`-S`/`-`.
+
+PATH-preserving wrappers such as `nice`, `timeout`, `env X=1` and `bash -c` work,
+and so does the shim's own absolute path. Any other absolute or path-qualified
+spelling, such as `/usr/bin/systemd-run` or `./systemd-run`, is refused, as are
+plain spellings when the shim is not truthful. The reason says the cap is
+already applied. Uncapped fallbacks and Mains still allow the same commands.
+
+This guard covers supported agent tools. It is **not a security sandbox**:
+
+- Scripts, other tools and same-UID native code can still call the real binary
+  or the user manager.
+- The check reads command words only. A `bash -c` that merely mentions an
+  absolute `systemd-run` is refused too.
+- Pi's bash tool may prepend its own bin directory to `PATH`, and the check does
+  not model that directory.
+
+The shim and its scratch directory live until the task boundary is confirmed
+closed.
+
+Ponytail tradeoff: Fabric gives each task its own cap. It does not scan or
+account for other user units, so it does not enforce a host-wide total, and a
+host running many tasks can still commit more than its RAM. Set aggregate limits
+on the slice itself.
+
 ### Transports
 
 **Execution-custody scope cut (smarty-dev#2566 / pi-fabric#218):** agent
@@ -913,15 +1034,34 @@ Set `agents.worktree.setup` in [configuration](configuration.md#agents) or `work
 
 ### Write confinement
 
-`agents.run()` and `agents.spawn()` accept `readOnly?: boolean`, `writableRoots?: string[]`, and `shell?: "deny" | "unconfined"` for Pi children. Setting any of them creates a write policy:
+Local process-transport Pi task agents launched by `agents.spawn()` (including `agents.run()` and durable tasks) now default to `writableRoots: [effectiveCwd, privateScratch]` with `shell: "unconfined"` when their host run root lies outside the task cwd. The private scratch is the run's dedicated `tmp/`, not its run root: host-owned completion routing, status, event, control and session records remain outside the model's write roots. No shared mesh, export or profile root is added. If the canonical host run root is inside the cwd (including the existing durable resident layout), Fabric skips only the implicit default, preserves the previous unscoped launch, and logs one `write_policy.default_overlap_unconfined` notice naming smarty-dev#11705, which tracks moving resident runs outside cwd. This is an accepted residual, not confinement; explicit `writableRoots` and inherited policies are unchanged. Manager and worker internal filesystem writes are unaffected by this tool policy. Fabric creates the scratch directory inside that task's run directory and exports it as the child's `TMPDIR`, `TMP`, and `TEMP`. Actors, resident startup probes, hosted runners, and the Main are unchanged. A runner without the `writePolicy` capability (including Claude and Veda) keeps its previous unrestricted behavior and logs `write_policy.unsupported` once per task run.
+
+An explicit `readOnly`, `writableRoots`, or `shell` request replaces the task default, subject to inherited confinement below. `writePolicy: "unrestricted"` opts out, writes a `write_policy.unrestricted` event before launch, and cannot be combined with those explicit fields. It cannot escape a caller's existing confinement.
+
+`agents.run()` and `agents.spawn()` accept `readOnly?: boolean`, `writableRoots?: string[]`, and `shell?: "deny" | "unconfined"` for Pi children. Setting any of them creates an explicit write policy:
 
 - `readOnly: true` refuses every `write` and `edit`.
 - `writableRoots` (at most 32) resolve against the child's cwd, including a generated worktree. Omitted roots default to that cwd. A root must exist or be creatable inside the cwd; Fabric creates missing ones. `write` and `edit` outside the roots fail. Fabric checks the lexical absolute path and the real path of the nearest existing ancestor, so a symlink cannot escape a root, and an unresolvable path fails closed.
-- `bash` and `powershell` are refused under any write policy unless the request sets `shell: "unconfined"`. Fabric does not parse shell commands: an unconfined shell can write anywhere the process can, so it is not a sandbox.
+- Explicit policies refuse `bash` and `powershell` unless the request sets `shell: "unconfined"`. The task default allows shells so coding and test commands keep working. Fabric does not parse shell commands and has no shell deny list for package installation or service/unit control.
+
+The default confines native `write`/`edit` and nested `pi.write`/`pi.edit`, **not shell writes**. Native `bash` runs outside Fabric Landlock. Nested `pi.bash` uses Landlock only when the host independently enables `executor.landlock` on Linux; its role grants also include shared caches and the Git common directory, not just these task roots. Each default run logs `write_policy.default` once with the effective policy and a warning that shell writes are unconfined by this policy, including on hosts without Landlock. This is tool-level protection, not an OS sandbox.
+
+An explicit or inherited write policy pins the task to the local worker: one-shot remote placement does not forward policy or scratch arguments and must not silently drop an explicit policy. Default tasks keep normal remote placement; such a launch remains unrestricted and logs `write_policy.remote_unconfined` once and does not claim that the local default applies. Remote policy forwarding is a separate launcher integration (smarty-dev#10544). An unrestricted opt-out also keeps normal placement behavior.
 
 The child Pi process enforces the policy. The worker passes it as `PI_FABRIC_WRITE_POLICY` and loads a small guard extension with `-e`, so it applies even with `extensions: false`. The guard blocks top-level tool calls through Pi's `tool_call` hook and nested `pi.write`, `pi.edit`, and `pi.bash` calls inside `fabric_exec`. It covers tools named `write`, `edit`, `bash`, and `powershell`, including captured overrides with those names; other extension tools and MCP servers are outside it. Native Fabric executors (CPython, `node-process`, `bun-process`) run outside the hook: a confined launch that would use one fails before launch, and a confined child refuses to run one, unless `shell: "unconfined"`. QuickJS and Monty stay available.
 
 Confinement is inherited and only narrows. A confined agent's own children inherit its policy when they request none; an explicit request must keep `readOnly`, cannot switch to `shell: "unconfined"`, and must name roots inside the caller's roots. Claude and Veda runners fail before launch under any policy because Fabric cannot enforce it there. A confined agent cannot start durable agents or actors, since the shared resident host does not inherit its confinement.
+
+### Write receipt
+
+The result of every Pi child carries `writeReceipt: { paths, commands, truncated? }`, empty (`{ paths: [], commands: [] }`) when it changed nothing. Fabric records it from the child's own tool events, not from the child's report:
+
+- `paths`: every absolute path a `write` or `edit` call completed on, in first-touch order. A blocked or failed call is not listed.
+- `commands`: the text of every `bash` or `powershell` call the child made, whether it ran or the guard refused it. Some end events do not say which (a nested `pi.bash`, a durable run), so the receipt can also list a refused command; it never misses one that ran.
+
+The content a `write` or `edit` call carries is never recorded. A shell command's text is recorded as given, so data written inline in a command (a heredoc, for example) is kept in the receipt. The receipt holds at most 256 paths and 64 commands of at most 4,096 characters, 64 KiB in all, and `truncated: true` marks one that dropped or cut anything.
+
+A spawner should check the receipt, not the child's prose. The receipt catches a child whose report is wrong. It is not an authenticated audit log: the events come from the child's Pi process output, so code running as the child (an extension, or a shell that writes to that output) can add or hide entries.
 
 ### Scope narrowing
 

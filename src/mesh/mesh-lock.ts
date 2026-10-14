@@ -1,5 +1,5 @@
-import { createLockEvents, createLockStats, lockHeldEventThreshold, type MeshLockClass } from "./commit-stats.js";
-import { MeshLockTicket } from "./lock-queue.js";
+import { createLockEvents, createLockStats, lockHeldEventThreshold, type LockEventStore, type MeshLockClass } from "./commit-stats.js";
+import { meshLockQueueDirectory, MeshLockTicket } from "./lock-queue.js";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { retryDelayMs } from "../core/retry-backoff.js";
 import type { MeshLockProtocol } from "../config.js";
@@ -7,9 +7,10 @@ import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import {
-  alarmForeignHolder, MeshLockForeignHolderError, MeshLockTimeoutError, ownProcessIncarnation, processIncarnation, validProcessIncarnation, type StaleLockNote,
+  alarmForeignHolder, MeshIncarnationPendingError, MeshLockForeignHolderError, MeshLockTimeoutError, ownProcessIncarnation, processIncarnation, validProcessIncarnation, type StaleLockNote,
 } from "../core/atomic-write.js";
 import { FOREIGN_LOCK, pinFenceLock, releaseFenceLock } from "./fence-lock.js";
+import { verifiedRemove } from "../storage/verified-remove.js";
 
 // The mesh `.lock` domain (smarty-dev#6477 L0): acquisition (withLock, withTryLock), lock tickets,
 // timeouts, the L8 timing hook and recovery of stale owners. State (state-file.ts) and events
@@ -40,6 +41,46 @@ export const lockOwnerPid = (ownerPath: string): number | undefined => {
 
 const LOCK_TIMEOUT_MS = 10_000;
 const STALE_LOCK_MS = 30_000;
+
+/** A wait budget exhausted before FIFO admission, not a failed acquisition of the canonical lock. */
+export class MeshLockQueueExpiredError extends MeshLockTimeoutError {
+  readonly preLockCode = "FABRIC_MESH_LOCK_QUEUE_EXPIRED";
+  readonly kind = "pre-lock";
+  readonly retryable = true;
+  constructor(readonly lockPath: string, readonly waitersAhead: number | undefined, readonly waitedMs: number) {
+    super("", 0, 0);
+    this.name = "MeshLockQueueExpiredError";
+    this.message = `${this.preLockCode} (code ${this.code}): Fabric mesh lock ${lockPath} expired in the FIFO queue before its turn, ` +
+      `${waitersAhead === undefined ? "waiter count unavailable" : `${waitersAhead} waiters ahead`}, waited ${waitedMs} ms`;
+  }
+}
+
+// Diagnostic snapshot only: admission remains MeshLockTicket's decision. Count matching receipts before our exact
+// token; a concurrent removal or an unreadable directory makes the count unavailable, never an invented number.
+const queueWaitersAhead = (root: string, token: string): number | undefined => {
+  try {
+    const receipts = fs.readdirSync(meshLockQueueDirectory(root)).filter(name => /^\d{24}-\d+-[a-f0-9-]+$/.test(name)).sort();
+    const index = receipts.findIndex(name => name.endsWith(`-${process.pid}-${token}`));
+    return index < 0 ? undefined : index;
+  } catch { return undefined; }
+};
+
+/** Both canonical mesh and SQLite writers start relative waits after ticket setup. Expiry before any acquisition
+ * stays a FIFO refusal: close admission before emitting its separate event, never a contention counter/event. */
+export const createMeshLockAdmission = (root: string, token: string, budgetMs: number,
+  options: { passStalledHead?: boolean } = {}, now: () => number = Date.now) => {
+  const ticket = new MeshLockTicket(root, token, budgetMs, options);
+  const startedAt = now();
+  return {
+    ticket, startedAt, deadline: startedAt + Math.max(0, budgetMs),
+    expire(lockPath: string, eventRoot: string, store: LockEventStore, lockClass: MeshLockClass): MeshLockQueueExpiredError {
+      const refusal = new MeshLockQueueExpiredError(lockPath, queueWaitersAhead(root, token), Math.max(0, now() - startedAt));
+      ticket.close();
+      lockEvents?.queueExpired(eventRoot, store, lockClass, refusal.waitedMs, refusal.waitersAhead);
+      return refusal;
+    },
+  };
+};
 
 // Keep the normal global timer seam (including diagnostic/test clocks). An
 // aborted lifetime clears its referenced retry timer instead of awaiting the lock.
@@ -179,7 +220,7 @@ export class MeshLock {
 
   /** Bound every mesh acquisition in this async step via the existing FIFO/try path.
    * Registry -> mesh publication retains custody through source selection and copies,
-   * but a busy mesh throws its typed timeout after a short try so the caller can
+   * but a busy or unprepared mesh throws its typed refusal after a short try so the caller can
    * release registry fences and retry the whole step. This acquires NO lock itself.
    * Reset the shared scope receipt on exit: escaped async work must not inherit it. */
   async withTryLock<T>(operation: () => Promise<T>, timeoutMs = 0): Promise<T> {
@@ -196,7 +237,7 @@ export class MeshLock {
   // Global actor-custody order: actor registries (sorted path), then mesh.
   // Mesh critical sections are synchronous: never await a registry mutation
   // here or wrap resident async controls in this second/innermost lock.
-  // `bounded` marks an explicit try (lock stats only); a scoped withTryLock is one too. A
+  // `bounded` marks an explicit try (preparation refusal and lock stats); a scoped withTryLock is one too. A
   // reduced remaining budget from an ordinary caller is never a try.
   withLock<T>(operation: () => T, lockTimeoutMs = this.#lockTimeoutMs, lockClass: MeshLockClass = "other",
     bounded = false): Promise<T> {
@@ -220,23 +261,22 @@ export class MeshLock {
     let holdMs = -1;
     let failedWaitMs = -1;
     this.#writeAbortSignal?.throwIfAborted();
-    fs.mkdirSync(this.root, { recursive: true, mode: 0o700 });
     // A registry-fenced publisher gets only a short try, never the ordinary wait.
     // Async-local scope leaves concurrent ordinary callers on their own budget.
     const scope = this.#tryLockScope.getStore();
     const budget = scope?.active ? Math.min(scope.timeoutMs, lockTimeoutMs) : lockTimeoutMs;
-    const ownerPath = path.join(this.#lockPath, "owner");
     if (this.#lockProtocol >= 2 && !this.#ownIncarnationReady &&
-      (scope?.active || lockTimeoutMs < this.#lockTimeoutMs)) {
-      // Fails closed before the common accounting below: count it once here. It never tried .lock,
-      // so it is no wait-timeout event (and reads no owner record for one): nobody made it wait.
-      lockStats?.failed(this.root, lockClass, performance.now() - lockWaitStart, Boolean(scope?.active) || bounded);
-      throw new MeshLockTimeoutError(describeLockHolder(ownerPath), 0, 0);
+      (bounded || scope?.active || lockTimeoutMs < this.#lockTimeoutMs)) {
+      // Fail closed without awaiting native preparation under custody. This never tried .lock:
+      // no owner probe, failed-acquisition stats, or wait-timeout event belongs to it.
+      throw new MeshIncarnationPendingError();
     }
+    fs.mkdirSync(this.root, { recursive: true, mode: 0o700 });
+    const ownerPath = path.join(this.#lockPath, "owner");
     const startTime = this.#lockProtocol >= 2
       ? this.#ownIncarnationReady ? this.#ownStartTime : await this.#ownIncarnation
       : undefined;
-    const deadline = Date.now() + Math.min(this.#lockTimeoutMs, Math.max(0, budget));
+    const waitMs = Math.min(this.#lockTimeoutMs, Math.max(0, budget));
     const token = randomUUID();
     // Protocol 3 (smarty-dev#9569): the start line is always present (empty: unknown) and the PID namespace follows
     // on its own line (empty: unknown, which no reclaimer may treat as its own). Six fields: a reader from before
@@ -255,18 +295,26 @@ export class MeshLock {
       if (held !== undefined) { releaseFenceLock(this.#lockPath, ownerRecord, {}, held); return; }
       // Non-Linux keeps main's release; the stalled-holder race there is tracked in smarty-dev#9569.
       try {
+        // smarty-dev#8907: the directory judged by its owner record, stat captured before that read; only that inode
+        // is removed (detached into verifiedRemove's graveyard first). A swapped-in successor is refused, never removed.
+        const judged = fs.lstatSync(this.#lockPath);
         if (fs.readFileSync(ownerPath, "utf8") === ownerRecord) {
-          // Detach the complete owned directory before unlinking anything inside it.
-          // Interrupted/resumed recursive cleanup must never follow the canonical name.
-          const released = `${this.#lockPath}.released.${token}`;
-          fs.renameSync(this.#lockPath, released);
-          fs.rmSync(released, { recursive: true, force: true });
+          verifiedRemove(this.#lockPath, judged, { deleter: "meshLockRelease", fallback: () => {
+            // Off Linux, main's release: detach the complete owned directory before unlinking anything inside it.
+            // Interrupted/resumed recursive cleanup must never follow the canonical name.
+            const released = `${this.#lockPath}.released.${token}`;
+            fs.renameSync(this.#lockPath, released);
+            fs.rmSync(released, { recursive: true, force: true });
+            return true;
+          } });
         }
       } catch {
         // Already replaced/removed, unreadable, or cleanup failed: never delete canonical.
       }
     };
-    const ticket = new MeshLockTicket(this.root, token, deadline - Date.now());
+    const admission = createMeshLockAdmission(this.root, token, waitMs);
+    const { ticket, deadline } = admission;
+    // The shared admission helper fixes the relative budget only after setup; expiry cannot grant admission.
     try {
       // Attempts and the largest gap between two of them: a large gap means this waiter stalled
       // (no CPU); many attempts with small gaps mean it kept losing the race (smarty-dev#816).
@@ -277,10 +325,14 @@ export class MeshLock {
       while (true) {
         this.#writeAbortSignal?.throwIfAborted();
         if (!ticket.mayContend()) {
-          if (Date.now() >= deadline) throw new MeshLockTimeoutError(describeLockHolder(ownerPath), attempts, maxGapMs);
-          // Woken when the predecessor's receipt goes; the short poll is only a safety net.
-          await ticket.wait(Math.min(20, Math.max(0, deadline - Date.now())), this.#writeAbortSignal);
-          continue;
+          if (Date.now() < deadline) {
+            // Woken when the predecessor's receipt goes; the short poll is only a safety net.
+            await ticket.wait(Math.min(20, Math.max(0, deadline - Date.now())), this.#writeAbortSignal);
+            continue;
+          }
+          // Expiry never grants FIFO admission: only an eligible head may probe at its deadline. Keep the legacy
+          // retry code, but report this zero-acquisition refusal separately from real lock contention.
+          throw admission.expire(this.#lockPath, this.root, "mesh-lock", lockClass);
         }
         const attemptAt = Date.now();
         if (attempts > 0) maxGapMs = Math.max(maxGapMs, attemptAt - lastAttemptAt);
@@ -333,6 +385,9 @@ export class MeshLock {
               // old-format writers that create an empty canonical after the absence check.
               fs.renameSync(staging, this.#lockPath);
             } finally {
+              // ponytail: no judgment precedes this. `staging` is this attempt's own unpublished mkdtemp name (random
+              // suffix, never published under it, never a recovery or rename target); after a successful publish the
+              // name is empty and `force` makes this a no-op. smarty-dev#8907 inventory.
               fs.rmSync(staging, { recursive: true, force: true });
             }
           }
@@ -385,7 +440,9 @@ export class MeshLock {
         if (timed) holdMs = performance.now() - lockHeldAt;
       }
     } catch (error) {
-      if (timed && lockHeldAt < 0 && error instanceof MeshLockTimeoutError) failedWaitMs = performance.now() - lockWaitStart;
+      if (timed && lockHeldAt < 0 && error instanceof MeshLockTimeoutError && !(error instanceof MeshLockQueueExpiredError)) {
+        failedWaitMs = performance.now() - lockWaitStart;
+      }
       throw error;
     } finally {
       ticket.close();
@@ -426,6 +483,10 @@ export class MeshLock {
           current.mtimeMs !== stat.mtimeMs || readOwner() !== undefined) return false;
         // Native emptiness is the final fence, including against an initializer that
         // publishes and enters while this recoverer is paused at the removal syscall.
+        // ponytail (smarty-dev#8907): atomic rmdir, not verifiedRemove. It removes only an EMPTY directory, so a
+        // directory swapped in after this judgment loses no data and no custody: an ownerless directory grants none,
+        // and a protocol-1 initializer enters only after its `wx` owner write and its lstat identity recheck of its own
+        // mkdir, which fail (ENOENT / identity) if this rmdir took its directory. Any published owner makes it ENOTEMPTY.
         fs.rmdirSync(this.#lockPath);
         // Retain a nonempty recovery receipt, without ever renaming a live canonical.
         // Inode reuse may revisit the same receipt; that must not undo successful recovery.

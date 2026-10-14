@@ -13,14 +13,18 @@ it("one platform gate enables POSIX V2 and keeps Windows retirement silent and i
     Object.defineProperty(process, "platform", { ...nativePlatform, value: "win32" });
     expect(retentionV2Enabled()).toBe(false);
     const timer = vi.spyOn(globalThis, "setInterval");
+    const timeout = vi.spyOn(globalThis, "setTimeout");
+    const immediate = vi.spyOn(globalThis, "setImmediate");
+    const watch = vi.spyOn(fs, "watch");
     const audit = vi.spyOn(console, "info");
     const open = vi.spyOn(fsp, "opendir");
     const syncOpen = vi.spyOn(fs, "opendirSync");
     const move = vi.spyOn(fsp, "rename");
     const mkdir = vi.spyOn(fsp, "mkdir");
     const remove = vi.spyOn(fsp, "rm");
+    const warn = vi.spyOn(console, "warn");
     archive.start(); await archive.sweep(); await archive.sweep();
-    for (const probe of [timer, audit, open, syncOpen, move, mkdir, remove]) expect(probe).not.toHaveBeenCalled();
+    for (const probe of [timer, timeout, immediate, watch, audit, warn, open, syncOpen, move, mkdir, remove]) expect(probe).not.toHaveBeenCalled();
     expect(archive.health).toEqual({ checked: 0, archived: 0, skipped: 0, error: "" });
   } finally {
     await archive.close(); vi.restoreAllMocks(); Object.defineProperty(process, "platform", nativePlatform);

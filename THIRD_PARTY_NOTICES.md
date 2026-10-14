@@ -8,6 +8,13 @@ Haydn Paterson, licensed under MIT. This private artifact is not loaded by the
 Pi extension, which continues to use Pi's host-provided TypeBox. The complete
 license is distributed at [docs/licenses/typebox-mit.txt](docs/licenses/typebox-mit.txt).
 
+## pi-coralbricks-provider
+
+The package bundles [`pi-coralbricks-provider`](https://github.com/monotykamary/pi-coralbricks-provider)
+unmodified under `node_modules/pi-coralbricks-provider`, at the exact version
+pinned in `package.json`. It is licensed under MIT, and its complete license is
+distributed beside it at `node_modules/pi-coralbricks-provider/LICENSE`.
+
 ## Bend 2.0.36
 
 The generated policy kernel includes Bend's emitted JavaScript trampoline and

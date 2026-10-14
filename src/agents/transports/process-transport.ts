@@ -11,7 +11,7 @@ import { activeFabricRoot, loadedFabricRoot, resolveAgentDir } from "../../core/
 import { fabricResourceRoot } from "../../core/fabric-resource.js";
 import { WORKER_PROTOCOL_VERSION } from "../worker-protocol.js";
 import { executeFile, findExecutable, spawnDetached } from "./process-utils.js";
-import { taskAgentEnvironment } from "../task-environment.js";
+import { taskAgentEnvironment, withoutTaskBoundary } from "../task-environment.js";
 import { applyTaskReturnAddress } from "../task-return-address.js";
 import type { AgentPlacementConfig } from "../placement-config.js";
 import { agentPlacementProbe, liveAgentPlacement } from "../placement-config.js";
@@ -50,20 +50,133 @@ const selectWorkerRelease = (workerPath: string): { workerPath: string; fabricRe
   return fallback;
 };
 
+/** Default per-task memory.max (24 GiB, swap 0), mirrored from config to keep this module light. */
+const DEFAULT_TASK_MEMORY_MAX_BYTES = 24 * 1024 ** 3;
+
+type ProbeOutcome = "supported" | "unsupported";
+
+const errorCode = (error: unknown): string => {
+  if (error && typeof error === "object" && "code" in error && typeof error.code === "string") return error.code;
+  return error instanceof Error && error.message ? error.message : "unknown";
+};
+
+/** A host capability probe failed closed: it was neither present nor absent. */
+export class TaskScopeProbeError extends Error {
+  readonly code = "TASK_SCOPE_PROBE_UNKNOWN" as const;
+  constructor(readonly probe: string, readonly errno: string, readonly cause: unknown) {
+    super(`Task scope probe ${probe} returned unknown error ${errno}`);
+    this.name = "TaskScopeProbeError";
+  }
+}
+
+const probeStat = (file: string, predicate: (stats: fs.Stats) => boolean, probe: string): ProbeOutcome => {
+  try { return predicate(fs.statSync(file)) ? "supported" : "unsupported"; }
+  catch (error) {
+    const errno = errorCode(error);
+    if (errno === "ENOENT") return "unsupported";
+    throw new TaskScopeProbeError(probe, errno, error);
+  }
+};
+
+const probeSocket = (file: string, probe: string): ProbeOutcome => probeStat(file, stats => stats.isSocket(), probe);
+
+const probeFileText = (file: string, predicate: (text: string) => boolean, probe: string): ProbeOutcome => {
+  try { return predicate(fs.readFileSync(file, "utf8")) ? "supported" : "unsupported"; }
+  catch (error) {
+    const errno = errorCode(error);
+    if (errno === "ENOENT") return "unsupported";
+    throw new TaskScopeProbeError(probe, errno, error);
+  }
+};
+
+const busAvailable = (environment: NodeJS.ProcessEnv): ProbeOutcome => {
+  const candidates: string[] = [];
+  const runtime = environment.XDG_RUNTIME_DIR;
+  const bus = environment.DBUS_SESSION_BUS_ADDRESS?.match(/^unix:path=([^,;]+)/)?.[1];
+  if (runtime && path.isAbsolute(runtime)) candidates.push(path.join(runtime, "bus"));
+  if (bus && path.isAbsolute(bus)) candidates.push(bus);
+  if (candidates.length === 0) return "unsupported";
+  let unknown: TaskScopeProbeError | undefined;
+  for (const candidate of candidates) {
+    try {
+      if (probeSocket(candidate, "bus socket") === "supported") return "supported";
+    } catch (error) {
+      if (error instanceof TaskScopeProbeError) unknown ??= error;
+      else throw error;
+    }
+  }
+  if (unknown) throw unknown;
+  return "unsupported";
+};
+
+/**
+ * smarty-dev#8257/#11898: D-Bus-free proof that `systemd-run --user --scope`
+ * can create a memory-capped scope. ENOENT and positive absence are legacy
+ * eligibility results; an unreadable probe is a typed refusal, never permission
+ * to launch the worker uncapped.
+ */
+export const delegatedUserCgroupAvailable = (
+  environment: NodeJS.ProcessEnv = process.env,
+  cgroupRoot = "/sys/fs/cgroup",
+): boolean => {
+  if (process.platform !== "linux") return false;
+  const uid = process.getuid?.();
+  if (uid === undefined) return false;
+  if (busAvailable(environment) !== "supported") return false;
+  const controllers = path.join(cgroupRoot, "cgroup.controllers");
+  if (probeStat(controllers, stats => stats.isFile(), "cgroup controllers") !== "supported") return false;
+  if (probeFileText(controllers, text => text.split(/\s+/).includes("memory"), "cgroup controllers") !== "supported") return false;
+  const manager = path.join(cgroupRoot, "user.slice", `user-${uid}.slice`, `user@${uid}.service`);
+  return probeFileText(path.join(manager, "cgroup.subtree_control"), text => text.split(/\s+/).includes("memory"), "memory delegation") === "supported";
+};
+
+const findExecutableStrict = (command: string, environment: NodeJS.ProcessEnv): string | undefined => {
+  let unknown: TaskScopeProbeError | undefined;
+  const executable = findExecutable(command, environment, candidate => {
+    try {
+      const stats = fs.statSync(candidate);
+      return stats.isFile() && (process.platform === "win32" || (stats.mode & 0o111) !== 0);
+    } catch (error) {
+      const errno = errorCode(error);
+      if (errno !== "ENOENT") unknown ??= new TaskScopeProbeError("systemd-run executable", errno, error);
+      return false;
+    }
+  });
+  if (executable) return executable;
+  if (unknown) throw unknown;
+  return undefined;
+};
+
+/** Exact flag-position `--actor-id` only; a flag-shaped value is not an actor identity. */
+const isActorLaunch = (workerArguments: readonly string[]): boolean =>
+  workerArguments.some((arg, index) => index % 2 === 0 && arg === "--actor-id");
+
 export class ProcessTransport implements AgentTransportAdapter {
   readonly kind = "process" as const;
   #scopeWarningLogged = false;
 
   readonly #placement: () => AgentPlacementConfig | undefined;
 
-  constructor(private readonly processSlice?: string, placement?: AgentPlacementConfig, placementConfigPath?: string) {
+  readonly #memoryMaxBytes: number;
+
+  constructor(
+    private readonly processSlice?: string,
+    placement?: AgentPlacementConfig,
+    placementConfigPath?: string,
+    memoryMaxBytes: number = DEFAULT_TASK_MEMORY_MAX_BYTES,
+  ) {
     this.#placement = placementConfigPath ? liveAgentPlacement(placementConfigPath, placement) : () => placement;
+    if (!Number.isSafeInteger(memoryMaxBytes) || memoryMaxBytes <= 0) {
+      throw new Error("ProcessTransport memoryMaxBytes must be a positive safe integer");
+    }
+    this.#memoryMaxBytes = memoryMaxBytes;
   }
 
   #warnScope = (reason: string): void => {
     if (this.#scopeWarningLogged) return;
     this.#scopeWarningLogged = true;
-    console.warn(`[pi-fabric] agents.processSlice=${this.processSlice}: ${reason}; launching worker normally`);
+    const source = this.processSlice ? `agents.processSlice=${this.processSlice}` : "default task memory cap (app.slice)";
+    console.warn(`[pi-fabric] ${source}: ${reason}; launching worker normally`);
   };
 
   async available(): Promise<boolean> {
@@ -77,12 +190,17 @@ export class ProcessTransport implements AgentTransportAdapter {
     request = { ...request, ...(needs !== undefined ? { needs } : {}), ...(requires !== undefined ? { requires } : {}) };
     const placement = this.#placement();
     if (placement) {
+      const preflightDeadline = Date.now() + Math.min(placement.commandTimeoutMs, 8_000);
       const capabilities = normalizeAgentCapabilityTokens(placement.capabilities, "agents.placement.capabilities")!;
       const unmet = (needs ?? []).filter(need => !capabilities.includes(need));
       let reason = request.needs?.includes("local") ? "reserved need: local pins to the Main host"
         : placement.default === "local" ? "placement default is local"
         : unmet.length ? `unmet needs: ${unmet.join(", ")}` : request.placementLocalReason;
       if (!reason) reason = agentPlacementProbe(placement, request.cwd).reason;
+      if (!reason) {
+        const { placementLocalPathReason } = await import("./placement.js");
+        reason = placementLocalPathReason(request.cwd, placement);
+      }
       // --src ships the Main's workspace, unlike --cwd which names a target-local
       // lane. Require the launcher's tracked/unignored manifest branch; home,
       // non-Git and ignored roots must never enter its recursive-copy branch.
@@ -91,7 +209,7 @@ export class ProcessTransport implements AgentTransportAdapter {
           const cwd = fs.realpathSync(request.cwd);
           if (cwd === path.parse(cwd).root || cwd === fs.realpathSync(os.homedir())) throw new Error("home or root source");
           const git = await executeFile("git", ["-C", cwd, "rev-parse", "--is-inside-work-tree"], {
-            timeoutMs: Math.min(placement.commandTimeoutMs, 5_000), killSignal: "SIGKILL",
+            timeoutMs: Math.max(1, Math.min(5_000, preflightDeadline - Date.now())), killSignal: "SIGKILL",
           });
           if (git.stdout.trim() !== "true") throw new Error("not a Git work tree");
           // check-ignore -q exits 0 for ignored, 1 for definitely unignored,
@@ -99,7 +217,7 @@ export class ProcessTransport implements AgentTransportAdapter {
           let unignored = false;
           try {
             await executeFile("git", ["-C", cwd, "check-ignore", "-q", "--", cwd], {
-              timeoutMs: Math.min(placement.commandTimeoutMs, 5_000), killSignal: "SIGKILL",
+              timeoutMs: Math.max(1, Math.min(5_000, preflightDeadline - Date.now())), killSignal: "SIGKILL",
             });
           } catch (error) {
             const exit = error as { code?: unknown; signal?: unknown; killed?: unknown; stdout?: unknown; stderr?: unknown } | null;
@@ -110,8 +228,10 @@ export class ProcessTransport implements AgentTransportAdapter {
         } catch { reason = "cwd-not-shippable"; }
       }
       if (!reason) {
-        const { launchPlacedTask } = await import("./placement.js");
-        return launchPlacedTask(request, placement);
+        const { launchPlacedTask, selectFleetPlacement } = await import("./placement.js");
+        const selection = await selectFleetPlacement(placement, request.cwd, request.signal, preflightDeadline);
+        if (selection && "localReason" in selection) reason = selection.localReason;
+        else return launchPlacedTask(request, placement, preflightDeadline, selection?.host);
       }
       const args = new Map<string, string>();
       for (let i = 0; i < request.workerArguments.length; i += 2) args.set(request.workerArguments[i]!, request.workerArguments[i + 1]!);
@@ -121,8 +241,29 @@ export class ProcessTransport implements AgentTransportAdapter {
     }
     // Check on Main only after the remote decision; required paths may exist solely on the target.
     assertAgentRequiredInputsExist(requires, file => fs.existsSync(file));
-    const executable = this.processSlice && process.platform === "linux" ? findExecutable("systemd-run") : undefined;
+    request.onWritePolicyDisposition?.("local");
+    const actor = isActorLaunch(request.workerArguments);
+    // smarty-dev#8257: tasks get their own memory-capped scope only on a proven
+    // delegated v2 user manager. Actors and unproven hosts keep the legacy path:
+    // explicit processSlice still scopes them uncapped; otherwise no systemd-run.
+    const capEligible = !actor && process.platform === "linux" && delegatedUserCgroupAvailable();
+    const slice = this.processSlice ?? (capEligible ? "app.slice" : undefined);
+    // A nested Fabric launch needs the real backend, not its parent's command
+    // shim: the shim keeps ordinary suites in the parent leaf and cannot admit
+    // a new task scope. Preserve PATH for task commands; exclude only that exact
+    // launcher-owned wrapper from this backend lookup.
+    const wrapper = process.env.FABRIC_TASK_SYSTEMD_RUN_WRAPPER;
+    const backendEnvironment = wrapper ? {
+      ...process.env,
+      PATH: (process.env.PATH ?? "").split(path.delimiter)
+        .filter(directory => path.resolve(directory, "systemd-run") !== wrapper).join(path.delimiter),
+    } : process.env;
+    const executable = slice && process.platform === "linux" ? findExecutableStrict("systemd-run", backendEnvironment) : undefined;
     if (this.processSlice && process.platform === "linux" && !executable) this.#warnScope("systemd-run unavailable");
+    const scope: { executable: string; slice: string; warn: (reason: string) => void; memoryMaxBytes?: number } | undefined =
+      executable && slice
+        ? { executable, slice, warn: this.#warnScope, ...(capEligible ? { memoryMaxBytes: this.#memoryMaxBytes } : {}) }
+        : undefined;
     const selected = selectWorkerRelease(request.workerPath);
     const workerArguments = [...request.workerArguments];
     if (selected.extensionPath) {
@@ -153,17 +294,21 @@ export class ProcessTransport implements AgentTransportAdapter {
       // Worker arguments are flag/value pairs. A flag-shaped value is not an
       // actor identity; explicit actor ids alone retain the parent's role env.
       applyTaskReturnAddress(
-        workerArguments.some((arg, index) => index % 2 === 0 && arg === "--actor-id")
-          ? { ...process.env } : taskAgentEnvironment(),
+        // Actors keep their roles, never their caller's capped-task receipt (SRC-1).
+        isActorLaunch(workerArguments) ? withoutTaskBoundary(process.env) : taskAgentEnvironment(),
         workerArguments,
       ),
-      executable ? { executable, slice: this.processSlice!, warn: this.#warnScope } : undefined,
+      scope,
       7_000, // allow the worker's five-second execution-child cleanup
       process.platform !== "win32", // Windows retains its native-close/helper contract
     );
+    // Core sets cgroup only after admitting a capped receipt; structural read keeps
+    // this compatible with handles that never carry one.
+    const { cgroup } = processHandle as typeof processHandle & { cgroup?: string };
     return {
       kind: this.kind,
       ...(selected.fabricRelease ? { fabricRelease: selected.fabricRelease } : {}),
+      ...(cgroup ? { cgroup } : {}),
       sessionId: String(processHandle.pid),
       ...(processHandle.treeClosed ? { liveness: "events" as const } : {}),
       isAlive: processHandle.isAlive,

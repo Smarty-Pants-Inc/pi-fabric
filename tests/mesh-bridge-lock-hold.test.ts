@@ -2,11 +2,11 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterAll, afterEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 import { MESH_ARCHIVE_CONFIG } from "../src/mesh/archive.js";
 import { MeshBridge, StoreBridgeSide } from "../src/mesh/bridge.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
-import { readHostLease, writeHostLease, type FabricHostLease } from "../src/topology/host-leases.js";
+import { hostLeasePath, readHostLease, writeHostLease, type FabricHostLease } from "../src/topology/host-leases.js";
 import { writeParticipantFile } from "../src/topology/participant-files.js";
 
 // smarty-dev#10391: a bridge catch-up must never hold state.db's SQLite write lock above 100 ms.
@@ -250,9 +250,19 @@ describe("bridge catch-up SQLite write-lock holds (smarty-dev#10391), real store
     };
     const hash = (id: string) => createHash("sha256").update(id).digest("hex");
 
-    it("no change: one fence, committed on the proof", async () => {
+    it("no change: one fence, committed on the proof, reading no unrelated fleet lease", async () => {
       const f = await held();
-      await f.send("plain");
+      // With no handoff row, the held check reads only the held id's own lease file, never the fleet's.
+      const now = Date.now(), other = "session:race-unrelated";
+      writeHostLease(f.hub.root, { id: other, rootId: other, identityId: other, updatedAt: now, expiresAt: now + 600000, startedAt: now });
+      const unrelated = hostLeasePath(f.hub.root, other);
+      const statSync = vi.spyOn(fs, "statSync");
+      let statted: string[];
+      try { await f.send("plain"); } finally {
+        statted = statSync.mock.calls.map(([file]) => String(file));
+        statSync.mockRestore();
+      }
+      expect(statted.filter(file => file === unrelated)).toEqual([]);
       expect(f.fences()).toBe(1);
       expect(f.hub.read({ after: 0, limit: 100 }).map(e => e.text)).toContain("plain");
       await f.bridge.stop();

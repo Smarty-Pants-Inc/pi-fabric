@@ -840,7 +840,11 @@ export class StoreBridgeSide implements BridgeSide {
     const host = hostOf(hostEntry.key, hostEntry.value);
     if (!host || host.id !== id || host.identity.id !== id || host.rootId !== id || hostEntry.updatedBy.id !== id) return 0;
     if (identity && !sameIdentity(host.identity, identity)) return 0;
-    const until = hostLeaseExpiry(readHostLeases(this.store.root), host);
+    // hostLeaseExpiry consults only leases.get(host.id) (host.id === id above), and a lease file is
+    // valid only under its own id's name: read that one file, not the whole lease directory (a
+    // readdir plus a stat per fleet lease, per held event, on Windows where listings are never cached).
+    const lease = readHostLease(this.store.root, id);
+    const until = hostLeaseExpiry(new Map<string, FabricHostLease>(lease ? [[id, lease]] : []), host);
     if (until <= now) return 0;
     if (participantEntry) {
       const participant = participantOf(participantEntry.key, participantEntry.value);

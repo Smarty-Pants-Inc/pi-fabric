@@ -454,6 +454,8 @@ export const createLockStats = (setting = process.env.PI_FABRIC_LOCK_STATS,
 // themselves, to `<root>/lock-stats/events.jsonl`: the holder when it releases after holding
 // longer than a threshold (`held`), the waiter when it gives up with the typed lock timeout
 // (`wait-timeout`, FABRIC_MESH_STATE_BUSY at the bridge), naming the holder it could identify.
+// A FIFO refusal before canonical acquisition is a separate `pre-lock` event (FABRIC_MESH_LOCK_QUEUE_EXPIRED), never a
+// real-contention timeout in these events or the minute counters. It has no identified lock holder.
 // It is a local append, never a mesh publish: publishing would need the very lock that is
 // contended. One O_APPEND write() per line, each line at most PIPE_BUF (4096) bytes, so concurrent
 // appenders never interleave. At 1 MiB the file is renamed to `events.jsonl.1` (one old file kept),
@@ -480,17 +482,21 @@ export interface LockEventHolder {
 export interface LockEventWaiter { pid: number; process: string; op: MeshLockClass }
 export interface LockEvent {
   v: 1;
-  /** Epoch ms of the release (`held`) or of giving up (`wait-timeout`). */
+  /** Epoch ms of the release (`held`), contention timeout, or pre-lock refusal. */
   at: number;
-  kind: "held" | "wait-timeout";
+  kind: "held" | "wait-timeout" | "pre-lock";
   store: LockEventStore;
   class: MeshLockClass;
   /** `held` only. */
   heldMs?: number;
-  /** `wait-timeout` only. */
+  /** `wait-timeout` or `pre-lock`. */
   waitedMs?: number;
+  /** `pre-lock` only: a refusal before canonical lock acquisition, never contention. */
+  preLockCode?: "FABRIC_MESH_LOCK_QUEUE_EXPIRED";
+  /** `pre-lock` only: observed FIFO receipts ahead, if available. */
+  waitersAhead?: number;
   holder: LockEventHolder;
-  /** `wait-timeout` only. */
+  /** `wait-timeout` or `pre-lock`. */
   waiter?: LockEventWaiter;
 }
 export interface LockEvents {
@@ -499,6 +505,9 @@ export interface LockEvents {
   /** A full-budget acquisition that gave up; `holderPid` from the lock's owner record, if readable. */
   waitTimeout(root: string, store: LockEventStore, lockClass: MeshLockClass, waitedMs: number,
     holderPid: number | undefined): void;
+  /** FIFO refusal before admission; separate from the real-contention event and minute counters. */
+  queueExpired(root: string, store: LockEventStore, lockClass: MeshLockClass, waitedMs: number,
+    waitersAhead: number | undefined): void;
   /** Appends that failed (never thrown into the lock path). */
   readonly errors: number;
 }
@@ -539,7 +548,7 @@ export const LOCK_EVENTS_APPEND_RETRY_MS = 10;
 const sleepSync = (ms: number): void => { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); };
 
 interface ProcessLockEvents {
-  /** Registry generation. Keep the event API and line shape stable; hand over before changing them. */
+  /** Registry generation. Keep existing methods/line shapes stable; explicitly hand over additive APIs. */
   version: number;
   events: LockEvents | undefined;
   dispose(): void;
@@ -583,8 +592,8 @@ export const createLockEvents = (setting = process.env.PI_FABRIC_LOCK_STATS,
     sleep?: (ms: number) => void;
   } = {}): LockEvents | undefined => {
   const existing = eventsGlobals[eventsKey];
-  if (existing) return existing.events;
-  if (lockStatsDisabled(setting)) {
+  if (existing && (!existing.events || (existing.version >= 3 && typeof existing.events.queueExpired === "function"))) return existing.events;
+  if (!existing && lockStatsDisabled(setting)) {
     eventsGlobals[eventsKey] = { version: 1, events: undefined, dispose() {} };
     return undefined;
   }
@@ -736,10 +745,20 @@ export const createLockEvents = (setting = process.env.PI_FABRIC_LOCK_STATS,
       append(root, { v: 1, at: Date.now(), kind: "wait-timeout", store, class: lockClass, waitedMs: Math.round(waitedMs),
         holder: { pid, process: name, op: null, host }, waiter: { pid: process.pid, process: self(), op: lockClass } });
     },
+    queueExpired(root, store, lockClass, waitedMs, waitersAhead) {
+      append(root, { v: 1, at: Date.now(), kind: "pre-lock", preLockCode: "FABRIC_MESH_LOCK_QUEUE_EXPIRED", store, class: lockClass,
+        waitedMs: Math.round(waitedMs), ...(waitersAhead === undefined ? {} : { waitersAhead }),
+        holder: { pid: null, process: null, op: null, host }, waiter: { pid: process.pid, process: self(), op: lockClass } });
+    },
     get errors() { return errors; },
   };
-  eventsGlobals[eventsKey] = { version: 1, events, dispose() {} };
-  return events;
+  // Additive handover from captured v1/v2 appenders: retain existing methods/sink/error count. The queue event
+  // uses this generation's full code, so reload cannot retain the older abbreviated field or a missing method.
+  const legacy = existing?.events;
+  const shared: LockEvents = legacy ? { held: legacy.held, waitTimeout: legacy.waitTimeout,
+    queueExpired: events.queueExpired, get errors() { return legacy.errors + events.errors; } } : events;
+  eventsGlobals[eventsKey] = { version: 3, events: shared, dispose: existing?.dispose ?? (() => {}) };
+  return shared;
 };
 
 

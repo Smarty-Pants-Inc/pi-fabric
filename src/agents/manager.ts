@@ -1136,6 +1136,41 @@ export class AgentManager {
     | { revision: number; value: Array<AgentRunRecord | AgentHandleInfo> }
     | undefined;
   #closing = false;
+  #releasePaused = false;
+  #releaseEpoch = 0;
+  #releaseCheckpoint: { epoch: number; disk: string; workers: unknown } | undefined;
+  readonly #releaseWaiters = new Set<() => void>();
+
+  /** Admission hold only: existing workers and their finalizers retain custody. */
+  pauseForRelease(_strict = false): void {
+    if (!this.#releasePaused) this.#releaseEpoch++;
+    this.#releasePaused = true;
+  }
+
+  resumeAfterRelease(): void {
+    if (!this.#releasePaused) return;
+    this.#releasePaused = false;
+    this.#releaseEpoch++;
+    for (const resume of [...this.#releaseWaiters]) resume();
+  }
+
+  /** Call in a while loop at the mutation boundary: a resolved wait is not authority. */
+  #waitForRelease(signal?: AbortSignal): Promise<void> {
+    if (this.#closing) return Promise.reject(new Error("Fabric agent manager is closing"));
+    if (!this.#releasePaused) return Promise.resolve();
+    return new Promise<void>((resolve, reject) => {
+      const signals = [this.#closeAbort.signal, ...(signal ? [signal] : [])];
+      const finish = () => {
+        this.#releaseWaiters.delete(resume);
+        for (const signal of signals) signal.removeEventListener("abort", abort);
+      };
+      const resume = () => { finish(); resolve(); };
+      const abort = () => { finish(); reject(new Error(this.#closing ? "Fabric agent manager is closing" : "Agent launch aborted")); };
+      this.#releaseWaiters.add(resume);
+      for (const signal of signals) signal.addEventListener("abort", abort, { once: true });
+      if (signals.some(signal => signal.aborted)) abort();
+    });
+  }
   #closePromise: Promise<void> | undefined;
   readonly #closeAbort = new AbortController();
   readonly #spawns = new Set<Promise<AgentHandleInfo>>();
@@ -1481,7 +1516,17 @@ export class AgentManager {
     this.#releaseProvenGone();
     // pi-fabric#939 P2-a: the 6 h re-alarm is also due on every admission attempt, where a stuck state is felt.
     this.#checkHeldPermits();
-    const pending = this.#spawn(request, signal, authorize, beforeCommit, onOutputPrincipalDowngrade, onLaunched, preparation, callerReturnAddress && structuredClone(callerReturnAddress));
+    // This is a host-only no-inference worker flag, never a guest admission override.
+    const probe = request.residentStartupProbe === true && (request.runner ?? this.config.runner) === "pi" &&
+      (request.transport ?? this.config.transport) === "process" && !request.sessionSeed && !request.actorId;
+    if (request.residentStartupProbe && !probe) return Promise.reject(new Error("Invalid resident startup probe"));
+    request = { ...request };
+    const returnAddress = callerReturnAddress && structuredClone(callerReturnAddress);
+    const pending = (async () => {
+      while (this.#releasePaused && !probe) await this.#waitForRelease(signal);
+      if (this.#closing) throw new Error("Fabric agent manager is closing");
+      return this.#spawn(request, signal, authorize, beforeCommit, onOutputPrincipalDowngrade, onLaunched, preparation, returnAddress);
+    })();
     this.#spawns.add(pending);
     void pending.then(() => this.#spawns.delete(pending), () => this.#spawns.delete(pending));
     return pending;
@@ -1502,10 +1547,31 @@ export class AgentManager {
     return { pid: identity.pid, startTime: identity.startTime, open };
   }
 
-  async #launchTransport(adapter: AgentTransportAdapter, request: AgentTransportLaunch): Promise<AgentTransportHandle> {
+  async #launchTransport(adapter: AgentTransportAdapter, request: AgentTransportLaunch, probe = false): Promise<AgentTransportHandle> {
+    while (this.#releasePaused && !probe) await this.#waitForRelease(request.signal);
     if (this.#closing) throw new Error("Fabric agent manager is closing");
     const signal = request.signal ? AbortSignal.any([request.signal, this.#closeAbort.signal]) : this.#closeAbort.signal;
-    const pending = adapter.launch({ ...request, signal });
+    const pending = (async () => {
+      for (;;) {
+        while (this.#releasePaused && !probe) await this.#waitForRelease(signal);
+        if (this.#closing) throw new Error("Fabric agent manager is closing");
+        // Built-in adapters recheck this synchronously at worker creation, after
+        // runtime/placement awaits. Only our exact pre-admission hold is retried;
+        // unknown launches and caller revocation never become another attempt.
+        const held = new Error("Agent transport release admission is held");
+        let admitted = false;
+        try {
+          return await adapter.launch({ ...request, signal, authorize: () => {
+            if (!admitted && this.#releasePaused && !probe) throw held;
+            const authorized = request.authorize?.() !== false;
+            if (authorized) admitted = true;
+            return authorized;
+          } });
+        } catch (error) {
+          if (error !== held) throw error;
+        }
+      }
+    })();
     this.#launches.add(pending);
     try {
       const transport = await pending;
@@ -1596,6 +1662,7 @@ export class AgentManager {
     // Validate explicit execution targets before any model preparation or budget side effects.
     // With no override this deliberately preserves the manager cwd without canonicalizing it.
     const selectedCwd = await this.resolveCwd(request.cwd, signal);
+    while (this.#releasePaused && !request.residentStartupProbe) await this.#waitForRelease(signal);
     const residency = request.residency ?? "session";
     if (residency !== "session" && residency !== "durable") {
       throw new Error(`Invalid Fabric agent residency: ${String(request.residency)}`);
@@ -1728,6 +1795,7 @@ export class AgentManager {
     }
     const admissionSignal = signal ? AbortSignal.any([signal, this.#closeAbort.signal]) : this.#closeAbort.signal;
     if (admissionSignal.aborted) throw new Error("Operation aborted");
+    while (this.#releasePaused && !request.residentStartupProbe) await this.#waitForRelease(admissionSignal);
     // Count accepted requests, including queued ones, exactly once.
     this.#semaphore.admit(this.#currentDepth + 1);
     const id = randomUUID().replaceAll("-", "");
@@ -1746,6 +1814,7 @@ export class AgentManager {
     }
     const startPrepared = async (release: () => void, signal = admissionSignal): Promise<AgentHandleInfo> => {
       try {
+        while (this.#releasePaused && !request.residentStartupProbe) await this.#waitForRelease(signal);
         // A permit is no longer a queue wait. Only model/auth preparation is raced;
         // transport launch and its unknown-worker obligations must never be retried
         // just because a setup timer expired.
@@ -1753,6 +1822,7 @@ export class AgentManager {
         if (queued) { queued.preparing = true; this.#invalidateUiList(); }
         preparation?.onPreparing?.();
         model = await this.prepareModelForAdmission(routePin?.model ?? model, runner, undefined, Boolean(routePin), signal, preparation?.timeoutMs);
+        while (this.#releasePaused && !request.residentStartupProbe) await this.#waitForRelease(signal);
         if (this.#closing) throw new Error("Fabric agent manager is closing");
         if (signal?.aborted) throw new Error("Agent launch aborted");
         assertAuthorized();
@@ -2138,7 +2208,9 @@ export class AgentManager {
         // Preparation/transport resolution may have yielded since admission. Check the
         // current owner and activation generation at the final launch boundary too.
         assertAuthorized();
-        const transport = await this.#launchTransport(adapter, launch);
+        while (this.#releasePaused && !request.residentStartupProbe) await this.#waitForRelease(signal);
+        assertAuthorized();
+        const transport = await this.#launchTransport(adapter, launch, request.residentStartupProbe === true);
         const queued = this.#queued.get(id);
         const lifecycle = createAgentLifecycle<AgentRunResult>(release);
         if (queued) {
@@ -2354,6 +2426,7 @@ export class AgentManager {
       let release: (() => void) | undefined;
       try {
         release = await admission;
+        while (this.#releasePaused) await this.#waitForRelease(signal);
         if (signal.aborted) throw new Error("Agent launch aborted");
         await start(release, signal);
       } catch (error) {
@@ -2653,6 +2726,7 @@ export class AgentManager {
       ...(launch.worktree ? { worktree: launch.worktree } : {}),
     };
     let managed: ManagedAgent | undefined;
+    while (this.#releasePaused) await this.#waitForRelease(launch.signal);
     const hosted = await HostedRun.prepare(
       adapter,
       { ...context, idempotencyKey: context.id },
@@ -2660,6 +2734,7 @@ export class AgentManager {
       record,
       this.#hostedHooks(() => managed),
     );
+    while (this.#releasePaused) await this.#waitForRelease(launch.signal);
     if (launch.signal?.aborted || this.#closing) {
       hosted.abandon("Agent launch aborted before the hosted run was submitted");
       throw new Error("Agent launch aborted");
@@ -2776,6 +2851,7 @@ export class AgentManager {
     }
     const recovered: string[] = [];
     for (const entry of entries) {
+      while (this.#releasePaused) await this.#waitForRelease();
       if (this.#closing || this.#runs.has(entry) || !/^[0-9a-f]{32}$/.test(entry)) continue;
       const runDirectory = path.join(this.#runRoot, entry);
       const statusFile = path.join(runDirectory, "status.json");
@@ -2830,6 +2906,7 @@ export class AgentManager {
       );
       managed = this.#adoptHosted(hosted, { release: () => {}, recovered: true });
       await hosted.attach();
+      while (this.#releasePaused) await this.#waitForRelease();
       void this.#monitor(managed, Math.max(0, state.context.deadlineAt - Date.now()));
       recovered.push(entry);
     }
@@ -2842,6 +2919,7 @@ export class AgentManager {
   }
 
   async wake(id: string): Promise<void> {
+    while (this.#releasePaused) await this.#waitForRelease();
     await this.#requireHosted(id, "sleep").park("wake");
   }
 
@@ -2860,6 +2938,7 @@ export class AgentManager {
     onQueued?: (handle: AgentHandleInfo) => void,
     preparation?: AgentLaunchPreparationOptions,
   ): Promise<AgentRunResult> {
+    while (this.#releasePaused && !request.residentStartupProbe) await this.#waitForRelease(signal);
     const recovered = this.#recoverEnodevRun(request, signal, authorize);
     if (recovered) return recovered;
     const handle = await this.spawn(request, signal, authorize, undefined, onOutputPrincipalDowngrade, onSpawned, preparation);
@@ -4022,10 +4101,15 @@ export class AgentManager {
   /** Non-destructive receipt for a paused resident release boundary. A terminal
    * UI record is not a worker exit. Unknown launches or saved trees veto custody.
    */
-  async checkpointForRelease(deadline = Date.now() + TRANSPORT_EXIT_GRACE_MS * 7): Promise<void> {
-    const obligations = (): boolean => this.#closing || this.#spawns.size > 0 || this.#launches.size > 0 ||
+  async checkpointForRelease(deadline = Date.now() + TRANSPORT_EXIT_GRACE_MS * 7, valid?: () => boolean): Promise<void> {
+    const epoch = this.#releaseEpoch;
+    const check = () => {
+      if (epoch !== this.#releaseEpoch || valid?.() === false) throw new Error("Agent release checkpoint is stale");
+    };
+    check();
+    const obligations = (): boolean => this.#closing || this.#releaseWaiters.size > 0 || this.#spawns.size > 0 || this.#launches.size > 0 ||
       this.#queuedStarts.size > 0 || [...this.#queued.values()].some(q => !q.terminal || q.cleanupPending !== undefined) ||
-      [...this.#runs.values()].some(run => run.processStopPending || run.nativeReleasePending);
+      [...this.#runs.values()].some(run => run.processStopPending || run.nativeReleasePending || run.relaunchPending);
     if (obligations()) throw new Error("Agent release quiescence has pending launch/cleanup obligations");
     const runs = [...this.#runs.values()];
     if (runs.some(run => !run.settled || run.lostContact || run.settlementSaveFailure || hasUnresolvedWorker(run.runDirectory))) {
@@ -4036,10 +4120,13 @@ export class AgentManager {
       throw new Error("Agent release quiescence has no checked tmux/screen worker exit contract; retain A and worker files");
     }
     // Bound the observation itself, not just the interval between polls.
-    await Promise.all(runs.map(run => this.#waitForTransportExit(run, deadline)));
+    await Promise.all(runs.map(run => this.#waitForTransportExit(run, deadline, check)));
+    check();
     if (runs.some(run => run.lostContact)) throw new Error("Agent release quiescence has an unconfirmed worker exit observation");
     for (const transport of transports) {
-      if (await this.#transportAliveUntil(transport, deadline) || transport.lostContact?.() !== undefined) {
+      const alive = await this.#transportAliveUntil(transport, deadline);
+      check();
+      if (alive || transport.lostContact?.() !== undefined) {
         throw new Error("Agent release quiescence cannot confirm worker exit");
       }
     }
@@ -4072,7 +4159,52 @@ export class AgentManager {
       if (!entry.isDirectory()) throw new Error("Agent release quiescence has unknown run-root contents");
       inspect(path.join(this.#runRoot, entry.name), this.#runs.has(entry.name));
     }
+    check();
     if (obligations()) throw new Error("Agent release quiescence changed while checking workers");
+    const disk = JSON.stringify(this.#readReleaseDisk());
+    check();
+    this.#releaseCheckpoint = { epoch, disk, workers: transports.map(transport => ({
+      kind: transport.kind, sessionId: transport.sessionId, checkedExit: true,
+    })) };
+  }
+
+  /** Hash the actual retained run inputs/journals/fences, never a UI status list.
+   * Large/unknown trees fail closed rather than produce a partial receipt. */
+  #readReleaseDisk(): unknown {
+    const files: Array<{ path: string; bytes: number; sha256: string }> = [];
+    let bytes = 0, count = 0;
+    const started = performance.now();
+    const walk = (directory: string): void => {
+      for (const entry of fs.readdirSync(directory, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+        if (++count > 10_000 || performance.now() - started > 250) throw new Error("Agent release disk readback exceeds bounded receipt scan; retain A");
+        const file = path.join(directory, entry.name);
+        if (entry.isDirectory()) { walk(file); continue; }
+        if (!entry.isFile()) throw new Error("Agent release disk readback has an unknown file identity");
+        const size = fs.statSync(file).size;
+        if ((bytes += size) > 16 * 1024 * 1024) throw new Error("Agent release disk readback exceeds bounded byte budget; retain A");
+        const content = fs.readFileSync(file);
+        files.push({ path: path.relative(this.#runRoot, file), bytes: content.length,
+          sha256: createHash("sha256").update(content).digest("hex") });
+      }
+    };
+    try { walk(this.#runRoot); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT" || fs.existsSync(this.#runRoot) || this.#runs.size || this.#unregisteredTransports.size) throw error;
+    }
+    return { runRoot: this.#runRoot, files };
+  }
+
+  releaseCheckpointReceipt(): unknown {
+    const saved = this.#releaseCheckpoint;
+    if (!this.#releasePaused || !saved || saved.epoch !== this.#releaseEpoch || this.#closing || this.#releaseWaiters.size ||
+        this.#spawns.size || this.#launches.size || this.#queuedStarts.size || [...this.#queued.values()].some(run => !run.terminal || run.cleanupPending) ||
+        [...this.#runs.values()].some(run => !run.settled || run.relaunchPending || run.processStopPending || run.nativeReleasePending || run.lostContact || run.settlementSaveFailure)) {
+      throw new Error("Agent release checkpoint receipt is unavailable or unsettled");
+    }
+    const disk = this.#readReleaseDisk();
+    if (JSON.stringify(disk) !== saved.disk) throw new Error("Agent release checkpoint disk readback changed");
+    return { admissionHeld: true, disk, workers: saved.workers,
+      receiptScope: "retained run input/journal/fence bytes and bounded transport observations, not UI quiet or whole-attempt containment" };
   }
 
   close(): Promise<void> {
@@ -4465,16 +4597,22 @@ export class AgentManager {
     } finally { if (timer) clearTimeout(timer); }
   }
 
-  async #waitForTransportExit(managed: ManagedAgent, outerDeadline = Infinity): Promise<void> {
+  async #waitForTransportExit(managed: ManagedAgent, outerDeadline = Infinity, check?: () => void): Promise<void> {
     // Never issue a potentially hung query that cannot supply exit proof.
     if (uncheckedExternalExit(managed.transport)) return;
     const deadline = Math.min(outerDeadline, Date.now() + TRANSPORT_EXIT_GRACE_MS * 7);
     const pollIntervalMs = managed.transport.livenessPollIntervalMs ?? AGENT_STATUS_POLL_INTERVAL_MS;
     try {
-      while (Date.now() < deadline && await this.#transportAliveUntil(managed.transport, deadline)) {
+      check?.();
+      while (Date.now() < deadline) {
+        const alive = await this.#transportAliveUntil(managed.transport, deadline);
+        check?.();
+        if (!alive) break;
         await delay(Math.min(pollIntervalMs, Math.max(0, deadline - Date.now())));
+        check?.();
       }
     } catch (error) {
+      check?.(); // a stale checkpoint must not mark a resumed worker lost
       this.#markLost(managed, error instanceof Error ? error.message : String(error));
     }
   }
@@ -4515,12 +4653,15 @@ export class AgentManager {
     }
     const retryDelayMs =
       AGENT_STARTUP_RETRY_BASE_DELAY_MS * 2 ** (managed.startupAttempts - 1);
+    while (this.#releasePaused) await this.#waitForRelease(managed.abortSignal);
     if (Date.now() + retryDelayMs >= deadline) return false;
     await this.#waitForTransportExit(managed);
+    while (this.#releasePaused) await this.#waitForRelease(managed.abortSignal);
     await delay(retryDelayMs);
-    if (managed.settled || this.#closing || managed.abortSignal?.aborted || managed.abandoned) return false;
+    while (this.#releasePaused) await this.#waitForRelease(managed.abortSignal);
+    if (managed.settled || this.#closing || managed.abortSignal?.aborted || managed.abandoned || Date.now() >= deadline) return false;
     managed.startupAttempts++;
-    return this.#relaunch(managed, record);
+    return this.#relaunch(managed, record, undefined, deadline);
   }
 
   /**
@@ -4555,10 +4696,13 @@ export class AgentManager {
       return false;
     }
     const retryDelayMs = AGENT_RESUME_RETRY_BASE_DELAY_MS * 2 ** managed.resumeAttempts;
+    while (this.#releasePaused) await this.#waitForRelease(managed.abortSignal);
     if (Date.now() + retryDelayMs >= deadline) return false;
     await this.#waitForTransportExit(managed);
+    while (this.#releasePaused) await this.#waitForRelease(managed.abortSignal);
     await delay(retryDelayMs);
-    if (managed.settled || this.#closing || managed.stopRequested || managed.abandoned) return false;
+    while (this.#releasePaused) await this.#waitForRelease(managed.abortSignal);
+    if (managed.settled || this.#closing || managed.stopRequested || managed.abandoned || Date.now() >= deadline) return false;
     managed.resumeAttempts += 1;
     const { turns, toolCalls, usage } = managed.observedProgress;
     return this.#relaunch(managed, record, {
@@ -4568,7 +4712,7 @@ export class AgentManager {
         ? managed.task
         : resumeTask(managed.task, record, { turns, toolCalls }, managed.runDirectory),
       carryOver: { turns, toolCalls, usage: { ...usage } },
-    });
+    }, deadline);
   }
 
   /**
@@ -4581,9 +4725,10 @@ export class AgentManager {
     managed: ManagedAgent,
     record: AgentRunRecord,
     resume?: { task: string; carryOver: AgentRunCarryOver },
+    deadline = Infinity,
   ): Promise<boolean> {
     // Publish the join before preparation or stop can re-enter public stop().
-    const pending = Promise.resolve().then(() => this.#relaunchAttempt(managed, record, resume));
+    const pending = Promise.resolve().then(() => this.#relaunchAttempt(managed, record, resume, deadline));
     managed.relaunchPending = pending;
     try { return await pending; }
     finally { delete managed.relaunchPending; }
@@ -4593,10 +4738,16 @@ export class AgentManager {
     managed: ManagedAgent,
     record: AgentRunRecord,
     resume?: { task: string; carryOver: AgentRunCarryOver },
+    deadline = Infinity,
   ): Promise<boolean> {
     try {
+      const cancelled = () => managed.settled || this.#closing || managed.stopRequested || managed.abandoned || Date.now() >= deadline;
+      while (this.#releasePaused) await this.#waitForRelease(managed.abortSignal);
+      if (cancelled()) return false;
       if (managed.runner === "pi" || managed.runner === "pi-durable") {
         const model = await this.prepareModelForAdmission(managed.routePin?.model ?? managed.model, managed.runner, undefined, Boolean(managed.routePin));
+        while (this.#releasePaused) await this.#waitForRelease(managed.abortSignal);
+        if (cancelled()) return false;
         if (managed.routePin) setWorkerArgument(managed.launch.workerArguments, "thinking", managed.routePin.effort);
         const modelIndex = managed.launch.workerArguments.indexOf("--model");
         if (model) {
@@ -4635,12 +4786,20 @@ export class AgentManager {
       // case it exists for. A process worker that really exited is not signalled: its
       // transport saw the exit and never signals a numeric id that may be reused.
       const previousSession = managed.transport.sessionId;
+      while (this.#releasePaused) await this.#waitForRelease(managed.abortSignal);
+      if (cancelled()) return false;
       await this.#stopManagedTransport(managed).catch(() => undefined);
+      while (this.#releasePaused) await this.#waitForRelease(managed.abortSignal);
+      if (cancelled()) return false;
       await this.#waitForTransportExit(managed);
-      if (managed.settled || this.#closing || managed.stopRequested || managed.abandoned) return false;
+      while (this.#releasePaused) await this.#waitForRelease(managed.abortSignal);
+      if (cancelled()) return false;
       // Relaunch only when the previous worker is gone for certain. A worker that did
       // not stop, or whose transport cannot say, fails the run instead of running twice.
-      if (managed.lostContact || managed.transport.lostContact?.() !== undefined || await managed.transport.isAlive().catch(() => true)) {
+      const previousAlive = await managed.transport.isAlive().catch(() => true);
+      while (this.#releasePaused) await this.#waitForRelease(managed.abortSignal);
+      if (cancelled()) return false;
+      if (managed.lostContact || managed.transport.lostContact?.() !== undefined || previousAlive) {
         const reason = `the previous worker ${previousSession ? `(${previousSession}) ` : ""}did not stop, so it was not relaunched`;
         this.#markLost(managed, reason);                       // it may still use its files
         throw new Error(reason);
@@ -4682,7 +4841,12 @@ export class AgentManager {
       }
 
       fs.rmSync(managed.statusFile, { force: true });
-      if (managed.settled || this.#closing || managed.stopRequested || managed.abandoned) return false;
+      // Reset the superseded journal before launching its replacement. A launch
+      // already accepted before PREPARE may finish without deleting new output.
+      managed.lifecycleOffset = 0;
+      managed.lifecycleRemainder = Buffer.alloc(0);
+      fs.rmSync(managed.lifecycleFile, { force: true });
+      if (cancelled()) return false;
       // pi-fabric#939 round 3: the old attempt's pid proves nothing about the replacement. No attempt's pid is known
       // until the launch resolves, so nothing can be proven gone in between (or ever, if the launch is unknown).
       delete managed.ownProcess;
@@ -4709,9 +4873,6 @@ export class AgentManager {
       delete managed.latestRecord;
       delete managed.latestUiRecord;
       managed.lastLivenessCheckAt = 0;
-      managed.lifecycleOffset = 0;
-      managed.lifecycleRemainder = Buffer.alloc(0);
-      fs.rmSync(managed.lifecycleFile, { force: true });
       if (resume) {
         this.#emitLifecycle(managed, "run.resumed", Date.now(), {
           data: {
@@ -4727,6 +4888,7 @@ export class AgentManager {
       this.#invalidateUiList();
       return true;
     } catch (error) {
+      while (this.#releasePaused && !this.#closing && !managed.abortSignal?.aborted) await this.#waitForRelease(managed.abortSignal);
       const retryError = error instanceof Error ? error.message : String(error);
       try {
         fs.appendFileSync(

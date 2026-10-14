@@ -504,7 +504,7 @@ it("keeps native Windows deletion hosted-only without invoking its test callback
 
 // smarty-dev#11145 / #4664: product suites that delete real paths run only hosted. The config derives them by
 // scanning test sources for its exported markers; this file keeps the original six plus every actor-remove suite
-// as an independent floor. Comment/string-only mentions and a non-deleting import remain eligible locally.
+// and ActorDirectory's deleting suite as an independent floor. Non-deleting imports stay eligible locally.
 const originalSuites = ["tests/residency-operator-actors.test.ts", "tests/mesh-publish-batch-hold.test.ts",
   "tests/verified-remove-windows.test.ts", "tests/verified-remove.test.ts", "tests/verified-remove-secondary.test.ts",
   "tests/scratch-platform-retention.test.ts"];
@@ -516,8 +516,9 @@ const actorRemoveSuites = (fs.readdirSync(testsDir, { recursive: true }) as stri
 const ownSuite = "tests/test-deletion-guard.test.ts";
 // Imports only the real vitest.config.ts (type-only Vitest edge erased); no test file or callback runs. The child
 // also writes a pseudo tests root under the private TMPDIR whose nested suite carries the config's first marker
-// (taken from the config at runtime) plus a suite with only a direct receiver.removeActor() call (no deletion import),
-// and asks the scanner; comment/string mentions of that call stay eligible.
+// (taken from the config at runtime), a direct receiver.removeActor() call (no deletion import), and an arbitrarily
+// named ActorDirectory receiver.remove() call. Fixtures remain source text, never imported/executed; read-only uses,
+// type-only imports, comment/string mentions and an unrelated directory.remove() stay eligible.
 const configChild = `
 import fs from "node:fs";
 import { registerHooks } from "node:module";
@@ -546,6 +547,11 @@ if (out.exported) {
     fs.writeFileSync(fixtureRoot + "/comment.test.ts", "/* " + text + " main.removeActor(id) */\\n");
     fs.writeFileSync(fixtureRoot + "/string.test.ts", "const marker = " + JSON.stringify(text) + "; const call = 'main.removeActor(id)';\\n");
     fs.writeFileSync(fixtureRoot + "/receiver-remove-actor.test.ts", "export const run = (main, id) => main.removeActor(id);\\n");
+    fs.writeFileSync(fixtureRoot + "/directory-remove.test.ts", 'import { ActorDirectory } from "../src/actors/directory.js";\\nexport const run = (base, roots) => { const catalog = new ActorDirectory(base, roots, "project"); return catalog.remove("id"); };\\n');
+    fs.writeFileSync(fixtureRoot + "/directory-read.test.ts", 'import { ActorDirectory } from "../src/actors/directory.js";\\nexport const read = (base, roots) => { const catalog = new ActorDirectory(base, roots, "project"); return [catalog.status("id"), catalog.list()]; }; /* catalog.remove("id") */ const mention = "catalog.remove(id)";\\n');
+    fs.writeFileSync(fixtureRoot + "/directory-type-import.test.ts", 'import type { ActorDirectory } from "../src/actors/directory.js";\\nexport const run = (catalog: ActorDirectory) => catalog.remove("id");\\n');
+    fs.writeFileSync(fixtureRoot + "/directory-type-specifier.test.ts", 'import { type ActorDirectory } from "../src/actors/directory.js";\\nexport const run = (catalog: ActorDirectory) => catalog.remove("id");\\n');
+    fs.writeFileSync(fixtureRoot + "/unrelated-directory-remove.test.ts", 'export const run = (directory) => directory.remove("id");\\n');
     fs.writeFileSync(fixtureRoot + "/mesh-import.test.ts", 'import { MeshStore } from "../src/mesh/store.js";\\n');
     fs.writeFileSync(fixtureRoot + "/type-import.test.ts", "import type { Options } from " + JSON.stringify("../src/" + text + ".js") + ";\\n");
     fs.writeFileSync(fixtureRoot + "/type-specifier.test.ts", "import { type Options } from " + JSON.stringify("../src/" + text + ".js") + ";\\n");
@@ -575,7 +581,7 @@ it.each([[undefined, false], ["false", false], ["true", true]] as const)(
       .toBe(true);
     expect(output.markerFound, "first deletion marker must be usable as fixture source").toBe(true);
     expect(actorRemoveSuites).toContain("tests/actor-remove-dead-root.test.ts");
-    const required = [...originalSuites, ...actorRemoveSuites];
+    const required = [...originalSuites, ...actorRemoveSuites, "tests/actor-directory.test.ts"];
     if (selected) {
       expect(output.suites).toEqual([]);
       expect(output.fixture).toEqual([]);
@@ -587,7 +593,8 @@ it.each([[undefined, false], ["false", false], ["true", true]] as const)(
       expect(suites).not.toContain("tests/test-fleet-isolation.test.ts");
       for (const suite of suites) expect(suite).toMatch(/^tests\/(?:[^/\\]+\/)*[^/\\]+\.test\.ts$/);
       expect(suites.filter((suite) => !output.exclude.includes(suite))).toEqual([]);
-      expect(output.fixture).toEqual(["tests/nested/marker.test.ts", "tests/receiver-remove-actor.test.ts"]);
+      expect(output.fixture).toEqual(["tests/directory-remove.test.ts", "tests/nested/marker.test.ts",
+        "tests/receiver-remove-actor.test.ts"]);
     }
   });
 
@@ -714,6 +721,7 @@ for (const mode of ["long", "short"]) {
   Object.assign(process.env, { TMPDIR: envTemp, TMP: envTemp, TEMP: envTemp });
   delete process.env.RUNNER_TEMP;
   delete process[Symbol.for("pi-fabric.test-owned-fleet-roots")];
+  delete process[Symbol.for("pi-fabric.test-owned-temp-cleanups")];
   hooks = []; early = []; guarded = []; outside = [];
   const temp = helper.isolatedTestTemp("owned-");
   // Sibling roots let us replace each identity independently without moving the other fixture.

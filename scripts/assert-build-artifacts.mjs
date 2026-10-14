@@ -64,6 +64,7 @@ const lazy = [
   "agents/veda-cli.js",
   "agents/transports/placement.js",
   "agents/provider-bridge.js",
+  "core/host-sdk.js",
   "fabric-runtime-state.js",
   "components/configuration.js",
   "providers/jev-provider.js",
@@ -180,10 +181,40 @@ if (!manifest.files?.includes("config/landlock-roles.json") || !existsSync(join(
 }
 const targets = (value) => typeof value === "string" ? [value]
   : value && typeof value === "object" ? Object.values(value).flatMap(targets) : [];
+// Pi packages Fabric bundles load through their node_modules resource paths
+// (Pi's packages.md); they are not part of Fabric's compiled graph.
+const hostPackages = ["@earendil-works/pi-ai", "@earendil-works/pi-agent-core", "@earendil-works/pi-coding-agent", "@earendil-works/pi-tui", "typebox"];
+const bundled = manifest.bundledDependencies ?? [];
+const bundledEntry = (target) => /^\.\/node_modules\/((?:@[^/]+\/)?[^/]+)\/(.+)$/.exec(target);
+const ownExtensions = (manifest.pi?.extensions ?? []).filter((target) => !bundledEntry(target));
+for (const name of bundled) {
+  if (!/^\d+\.\d+\.\d+$/.test(manifest.dependencies?.[name] ?? "")) {
+    throw new Error(`Bundled Pi package ${name} must be an exact runtime dependency`);
+  }
+  const bundledManifestPath = join(root, "node_modules", name, "package.json");
+  if (!existsSync(bundledManifestPath)) throw new Error(`Bundled Pi package is not installed: ${name}`);
+  const bundledManifest = JSON.parse(readFileSync(bundledManifestPath, "utf8"));
+  for (const host of hostPackages) {
+    if (bundledManifest.dependencies?.[host] !== undefined) {
+      throw new Error(`Bundled Pi package ${name} must declare host package ${host} as a peer, not a dependency`);
+    }
+  }
+}
+for (const target of manifest.pi?.extensions ?? []) {
+  const match = bundledEntry(target);
+  if (!match) continue;
+  const [, name, file] = match;
+  if (!bundled.includes(name)) throw new Error(`Extension entry ${target} is not a bundled dependency`);
+  const declared = (JSON.parse(readFileSync(join(root, "node_modules", name, "package.json"), "utf8")).pi?.extensions ?? [])
+    .map((entry) => entry.replace(/^\.\//, ""));
+  if (!declared.includes(file) || !existsSync(join(root, target))) {
+    throw new Error(`Bundled extension entry ${target} is not declared by ${name}`);
+  }
+}
 // Our operator bins ship as checked-in ./bin wrappers (package "files" includes bin/); the
 // upstream pi-fabric CLI ships from ./dist. Every other public entry must be built output.
 const binTargets = new Set(targets([manifest.bin]));
-for (const target of targets([manifest.main, manifest.types, manifest.exports, manifest.pi?.extensions, manifest.bin])) {
+for (const target of targets([manifest.main, manifest.types, manifest.exports, ownExtensions, manifest.bin])) {
   const packagedBin = binTargets.has(target) && target.startsWith("./bin/") && manifest.files?.includes("bin/");
   if ((!target.startsWith("./dist/") && !packagedBin) || target.split("/").includes("..") || !existsSync(join(root, target))) {
     throw new Error(`Missing or unpackaged public entrypoint: ${target}`);
@@ -249,7 +280,7 @@ if ([...validator.matchAll(staticImport)].length || /\bimport\s*\(/.test(validat
   throw new Error("Worker validator must be self-contained");
 }
 // Measure the entry Pi actually loads, including every shared static chunk.
-const startupFiles = staticClosure(manifest.pi.extensions.map(file => resolve(root, file)));
+const startupFiles = staticClosure(ownExtensions.map(file => resolve(root, file)));
 const startupBytes = [...startupFiles].reduce((sum, file) => sum + Buffer.byteLength(readFileSync(file)), 0);
 // 45 files: src/topology/participant-files.ts is eager (the directory and the dashboard) and also
 // imported by the lazy mesh bridge, so it is a shared chunk instead of part of index.js; the bytes
@@ -267,6 +298,16 @@ for (const file of startupFiles) {
   for (const match of readFileSync(file, "utf8").matchAll(staticImport)) {
     if (optionalPackages.some(name => match[1] === name || match[1]?.startsWith(`${name}/`))) {
       throw new Error(`Startup eagerly imports optional dependency ${match[1]} from ${file}`);
+    }
+  }
+}
+// Pi loads this graph as native ESM, where jiti's virtual host modules never
+// apply: a runtime SDK import (including the bare `import "pkg"` left by an
+// inline `type` specifier) evaluates a second, unbundled SDK in the bundled CLI.
+for (const file of startupFiles) {
+  for (const match of readFileSync(file, "utf8").matchAll(staticImport)) {
+    if (match[1] === "@earendil-works/pi-coding-agent" || match[1]?.startsWith("@earendil-works/pi-coding-agent/")) {
+      throw new Error(`Startup imports the Pi SDK at runtime from ${file}; use import type or src/core/host-sdk.ts`);
     }
   }
 }

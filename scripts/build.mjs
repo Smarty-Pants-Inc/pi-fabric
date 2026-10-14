@@ -57,6 +57,10 @@ const lazyEntryPoints = [
   // The resident's first operator cleanup reuses the offline final-check helper (smarty-dev#8090).
   "src/actors/remove-offline.ts",
   "src/residency/launcher-owner.ts",
+  // The actor proxy loads the cooperative drain protocol only at first drain use.
+  "src/residency/drain.ts",
+  // Native host IPC is loaded only for a launch with trusted containment attestation.
+  "src/residency/launcher-containment-control.ts",
   "src/residency/wake.ts",
   "src/residency/process-work.ts",
   "src/agents/transports/process-utils.ts",
@@ -98,6 +102,8 @@ const lazyEntryPoints = [
   // Also loaded by the worker (-e) so extensions: false children keep
   // extension-registered model providers.
   "src/agents/provider-bridge.ts",
+  // The running Pi CLI's own SDK entry, for the bridge and the conversation UI.
+  "src/core/host-sdk.ts",
   "src/fabric-runtime-state.ts",
   "src/provider-error-class.ts",
   "src/topology/root-inbox-context.ts",

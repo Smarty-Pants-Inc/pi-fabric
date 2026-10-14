@@ -133,7 +133,10 @@ try {
       await session.prompt("Verify initial loadout.");
       assert.ok(session.getAllTools().some((t) => t.name === "mcp__fixture__echo"), "native MCP connected");
       api.registerTool(fixtureTool("fixture_late"));
-      api.setActiveTools(["read", "fixture_echo", "fixture_late", "codemode", "tool_search", "mcp__fixture__echo", ...(!fullCodeMode && schemaMode !== "enforce" ? ["fabric_exec"] : [])]);
+      // smarty-dev#11350: fixture_prepare is a direct tool. Pi 1.1 calls only ACTIVE direct tools (plus registered
+      // codemode/deferred ones), and Fabric's hidden-tool contract matches it, so a replacement that drops it makes the
+      // later fixture_prepare call below correctly denied. Keep it active here.
+      api.setActiveTools(["read", "fixture_echo", "fixture_late", "fixture_prepare", "codemode", "tool_search", "mcp__fixture__echo", ...(!fullCodeMode && schemaMode !== "enforce" ? ["fabric_exec"] : [])]);
       await session.prompt("Verify explicit replacement without fabric_exec is repaired.");
       if (fullCodeMode) {
         nextCode = 'const a = await extensions.fixture_echo({value:"rewrite"}); const b = await extensions.fixture_deferred({value:"deferred"}); const c = await extensions.mcp__fixture__echo({value:"native"}); const d = await extensions.tool_search({query:"fixture_deferred"}); const e = await extensions.codemode({code:"return 42;"}); return {a,b,c,d,e};';
@@ -238,7 +241,10 @@ try {
   }
   await writeFile(path.join(scratch, "fabric.json"), JSON.stringify({ fullCodeMode: true, approvals: { read: "allow", write: "allow", execute: "allow" }, mcp: { enabled: false }, mesh: { enabled: false }, memory: { enabled: false }, agents: { enabled: false }, entropy: { compile: false }, ui: { enabled: false } }));
   const cli = path.resolve(path.dirname(hostEntry), "..", hostManifest.bin.pi);
-  const cliRun = promisify(execFile)(process.execPath, [cli, "--mode", "json", "--no-session", "--no-extensions", "-e", path.join(root, "dist/index.js"), "-e", path.join(root, "tests/fixtures/pi1-cli-extension.mjs"), "-e", "builtin:codemode", "-e", "builtin:tool-search", "-e", "builtin:mcp", "--tools", "read,bash,fabric_exec,codemode,tool_search,fixture_cli_start,mcp__fixture__echo", "--provider", "offline-cli", "--model", "fixture", "-p", "Offline smoke"], { cwd: scratch, timeout: 30_000, maxBuffer: 4_000_000, env: process.env });
+  // smarty-dev#11350: fixture_cli is a direct tool that fabric_exec calls; the --tools allowlist must keep it, or
+  // Pi filters it out and the hidden-tool contract (correctly) denies the call.
+
+  const cliRun = promisify(execFile)(process.execPath, [cli, "--mode", "json", "--no-session", "--no-extensions", "-e", path.join(root, "dist/index.js"), "-e", path.join(root, "tests/fixtures/pi1-cli-extension.mjs"), "-e", "builtin:codemode", "-e", "builtin:tool-search", "-e", "builtin:mcp", "--tools", "read,bash,fabric_exec,codemode,tool_search,fixture_cli,fixture_cli_start,mcp__fixture__echo", "--provider", "offline-cli", "--model", "fixture", "-p", "Offline smoke"], { cwd: scratch, timeout: 30_000, maxBuffer: 4_000_000, env: process.env });
   // Print mode reads piped stdin before starting; close it (no fixture input).
   cliRun.child.stdin.end();
   const { stdout, stderr } = await cliRun;

@@ -14,6 +14,7 @@ import type { FabricParticipantResidency } from "../topology/types.js";
 import type { AgentWriteReceipt } from "./write-receipt.js";
 import type { InheritedSessionPin } from "./session-pins.js";
 import type { AgentWorktreeResult } from "./worktree-manager.js";
+import type { AgentUndeliveredMessage } from "./terminal-target.js";
 
 /** Fabric run transports plus adapter-owned ("hosted") runs. */
 export type AgentRunTransport = FabricAgentTransport | "hosted";
@@ -678,6 +679,8 @@ export type AgentChildQuestionResponse =
   | { cancelled: true };
 
 export interface AgentSteerResult {
+  /** Explicit receipt when the final answer won the admission/append race. */
+  undelivered?: AgentUndeliveredMessage;
   deadlineAt?: number;
   warning?: AgentFollowUpRunningWarning;
   queued: true;

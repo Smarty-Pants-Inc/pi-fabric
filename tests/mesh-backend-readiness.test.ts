@@ -543,6 +543,28 @@ sys.stdin.readline()`;
     return { child, release };
   };
 
+  it.skipIf(leaseSkip !== "")(`keeps held-file override alarms path-free without changing local output${leaseSkip ? ` (skipped: ${leaseSkip})` : ""}`, async () => {
+    vi.stubEnv("PI_FABRIC_MESH_ALARM_TO", SWITCH_OWNER);
+    const root = await crashedImport();
+    const db = path.join(root, "state.db");
+    const holder = await pythonHolder(db, "fd");
+    try {
+      const accepted = await run(["cutover", "--root", root, "--json", "--accept-unready", "holder@lease:state.db"], {
+        procScan: { listPids: () => [] } });
+      expect(accepted.code, accepted.err).toBe(0);
+      const json = JSON.parse(accepted.out) as { readers: { acceptedUnready: Array<{ name: string; reason: string }> } };
+      expect(json.readers.acceptedUnready).toEqual([{ name: "holder@lease:state.db", reason: expect.stringContaining(db) }]);
+      expect(accepted.err).toContain(db);
+      const alarms = switchOverrideAlarms(root);
+      expect(alarms).toHaveLength(1);
+      const event = alarms[0]!;
+      expect(JSON.stringify(event)).not.toContain(root);
+      expect(event.data).not.toHaveProperty("root");
+      expect(event).toMatchObject({ data: { acceptedUnready: [{ name: "holder@lease:state.db", reason: expect.stringContaining(path.basename(db)) }] } });
+      expect(event.text).toContain("unidentified holder of state.db");
+    } finally { await holder.release(); }
+  });
+
   for (const mode of ["fd", "nondumpable", "mmap"] as const) {
     it.skipIf(leaseSkip !== "")(`refuses a lock-free ${mode} holder of state.db through the lease probe alone${leaseSkip ? ` (skipped: ${leaseSkip})` : ""}`, async () => {
       const root = await crashedImport();

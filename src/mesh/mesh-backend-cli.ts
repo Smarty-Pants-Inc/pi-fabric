@@ -400,10 +400,17 @@ export const MESH_SWITCH_OVERRIDE_ALARM_TOPIC = "fabric.alarm.mesh-switch-overri
 const distinctReaders = (readers: ReaderReadiness["unready"]): ReaderReadiness["unready"] =>
   [...new Map(readers.map(reader => [reader.name, reader])).values()];
 
+// ponytail: basenames keep the cause readable; directories are the sensitive part of shared alarm reasons.
+const pathFreeAlarmReason = (reason: string): string =>
+  reason.replace(/(^|[\s()[\];,"'])((?:\/|[A-Za-z]:[\\/])[^\s()[\];,"']*)/g, (_match, prefix: string, token: string) => {
+    const file = token.replace(/[:.]+$/, "");
+    return prefix + path.win32.basename(file) + token.slice(file.length);
+  });
+
 const publishSwitchOverrideAlarm = async (options: Options, gate: Gate, accepted: ReaderReadiness["unready"], epoch: number): Promise<void> => {
   const { MeshStore, meshAlarmRecipient } = await import("./store.js");
   const to = meshAlarmRecipient();
-  const uniqueAccepted = distinctReaders(accepted);
+  const uniqueAccepted = distinctReaders(accepted).map(reader => ({ ...reader, reason: pathFreeAlarmReason(reader.reason) }));
   const names = uniqueAccepted.map(reader => `${reader.name} (${reader.reason})`).join("; ");
   if (!to) throw new Error("no owning-lead alarm recipient (PI_FABRIC_MESH_ALARM_TO or SMARTY_LEAD_SESSION must be session:<uuid>)");
   const store = new MeshStore(options.root, 256 * 1024, 500, { lockProtocol: options.lockProtocol, canWakeResidents: () => false });

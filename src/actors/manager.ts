@@ -601,11 +601,12 @@ const saturatedWarningEvidence = (warnings: readonly string[] | undefined): bool
 const OVERFLOW_WORDING = /Context exceeds window|prompt (?:is )?too long|maximum context length|context(?:[ _-]+(?:window|length))?[ _-]+(?:overflow|exceeded|too long)|too many tokens/gi;
 const classifyManagerActivationFailure = (input: Parameters<typeof classifyActivationFailure>[0], typedOverflow = false): ReturnType<typeof classifyActivationFailure> => {
   let contextWording = false;
-  for (const text of [input.lastError, input.error ?? "", ...(input.evidence ?? [])]) {
-    const remaining = text.replace(OVERFLOW_WORDING, () => { contextWording = true; return ""; });
-    const failure = classifyActivationFailure({ lastError: remaining, error: remaining });
-    if (!failure.transient && CONTRADICTORY_OVERFLOW_CODES.has(failure.code)) return failure;
-  }
+  const strip = (text: string): string => text.replace(OVERFLOW_WORDING, () => { contextWording = true; return ""; });
+  // Strip each field independently but keep the input structure (terminal line, full error,
+  // worker warnings, preparation flags), so a permanent cause keeps its provenance suffix.
+  const contradiction = classifyActivationFailure({ ...input, lastError: strip(input.lastError),
+    error: input.error === undefined ? undefined : strip(input.error), evidence: input.evidence?.map(strip) });
+  if (!contradiction.transient && CONTRADICTORY_OVERFLOW_CODES.has(contradiction.code)) return contradiction;
   if (saturatedWarningEvidence(input.evidence)) return { code: "incomplete-evidence", transient: false,
     classification: "fail-closed: saturated worker warnings may have evicted permanent evidence; explicit session reset required" };
   const failure = classifyActivationFailure(input);

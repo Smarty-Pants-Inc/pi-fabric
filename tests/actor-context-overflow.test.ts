@@ -710,6 +710,47 @@ describe("actor context overflow (smarty-dev#3238, offline Pi child)", () => {
     expect(s.overflowEvents()).toEqual([]);
   }, TEST_GUARD_MS);
 
+  // Provenance contract: overflow-wording stripping must keep the terminal line, the full error and
+  // worker warnings apart, so an earlier 401/403 line or a warning keeps its attribution durably.
+  it.each([
+    ["STREAM_DISCONNECT_ONCE", "error", "Error: 401 Unauthorized", "auth", / in another failure line\)$/],
+    ["STREAM_DISCONNECT_ONCE", "error", "Error: 403 Forbidden", "permission", / in another failure line\)$/],
+    ["STREAM_DISCONNECT_ONCE", "warning", "Error: 401 Unauthorized", "auth", / in a worker warning\)$/],
+    ["OVERFLOW_ALWAYS", "warning", "Error: 403 Forbidden", "permission", / in a worker warning\)$/],
+  ] as const)("attributes same-run %s %s evidence %s as %s with provenance across reload", async (marker, where, text, code, provenance) => {
+    const s = setup();
+    const actor = await s.create("provenance");
+    await s.actors.ask(actor.id, "FIRST_REVIEW");
+    await waitFor(() => s.actors.inFlightCount() === 0);
+    const run = s.agents.run.bind(s.agents);
+    vi.spyOn(s.agents, "run").mockImplementation(async (...args: Parameters<AgentManager["run"]>) => {
+      const result = await run(...args);
+      if (result.status === "failed") {
+        result.errorCode = "CONTEXT_OVERFLOW";
+        // The terminal line stays the transient/overflow one; the permanent cause is earlier or a warning.
+        if (where === "error") result.error = `${text}\n${result.error}`;
+        else result.warnings = [text];
+      }
+      return result;
+    });
+    await expect(s.actors.ask(actor.id, marker)).rejects.toThrow(marker === "STREAM_DISCONNECT_ONCE"
+      ? /stream disconnected before completion/ : /Context exceeds window/);
+    await waitFor(() => s.actors.inFlightCount() === 0);
+    const blocked = s.actors.status(actor.id).activationBlocked!;
+    expect(blocked).toMatchObject({ code, class: "hard" });
+    expect(blocked).not.toHaveProperty("retryAt");
+    expect(blocked.classification).toMatch(provenance);
+    expect(resets(s.actors, actor.id)).toEqual([]);
+    expect(s.overflowEvents()).toEqual([]);
+    await s.actors.close();
+    const restarted = s.makeActors();
+    managers.push(restarted);
+    await waitFor(() => restarted.status(actor.id).activationBlocked?.code === code);
+    expect(restarted.status(actor.id).activationBlocked).toMatchObject({ code, class: "hard", classification: blocked.classification });
+    expect(restarted.status(actor.id).activationBlocked).not.toHaveProperty("retryAt");
+    expect(s.prompts()).toHaveLength(2);
+  }, TEST_GUARD_MS);
+
   // Trust-boundary/data-safety check: old blocks omitted warnings. Use the actual process
   // worker's retained status, then model old metadata and missing/corrupt/mismatched evidence.
   it.each((["stream", "overflow"] as const).flatMap(cause =>

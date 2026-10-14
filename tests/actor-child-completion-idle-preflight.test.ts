@@ -207,8 +207,10 @@ it("releases completion watches on stop, transfer and 200 recorded actor removal
       const result = await owner.remove(actor.id);
       expect(result).toMatchObject({ removed: true });
       if (process.platform !== "linux") {
-        expect(result).toMatchObject({ cleaned: false, pending: expect.stringContaining(
-          `Main publication fence, which this platform (${process.platform}) lacks`) });
+        expect(result).toMatchObject({ cleaned: false, pending:
+          "removal cleanup failed: Root actor tree deletion needs the Main publication fence, " +
+          `which this platform (${process.platform}) lacks (smarty-dev#8090); follow-up smarty-dev#11335; ` +
+          `the root ${actor.rootId} actor tree is kept (a later remove or host start finishes it)` });
       }
       expect(live.size).toBe(0);
     }
@@ -219,10 +221,7 @@ it("releases completion watches on stop, transfer and 200 recorded actor removal
     owner.listOwned();
     await vi.waitFor(() => expect(live.size).toBe(0), { timeout: 5000, interval: 10 });
     expect(armed).toBeGreaterThanOrEqual(202);
-    // Windows (like every non-Linux platform) revokes the registry and closes the
-    // watch, but the Main publication fence cut keeps the tree and cleanup marker
-    // for a later remove/host start; it never reaches the product-data delete.
-    // Linux reaches all 200 actor-directory deletes, recorded here, never executed.
+    // Non-Linux keeps trees/cleanup markers by design (smarty-dev#8090, smarty-dev#11335); Linux records 200 deletes.
     expect(removals.filter(file => /^[a-f0-9]{32}$/.test(path.basename(file))))
       .toHaveLength(process.platform === "linux" ? 200 : 0);
     expect(owner.status(stopped.id).status).toBe("stopped"); // not manager shutdown

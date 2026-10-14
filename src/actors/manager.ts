@@ -3530,12 +3530,10 @@ export class ActorManager {
     // A synchronous resolver (the resident owner) rejects a hidden model here, so the caller
     // learns at once. A resolver that may refresh the registry is async: #drain resolves the
     // model again when the activation runs, and enqueue stays synchronous (smarty-dev#1830).
-    // Preflight only supplied overrides. Resolving an empty owner-defaults
-    // override here would pin agents.model and shadow the stored session/project
-    // binding (and its admitted exception reason) when drain layers the defaults.
-    const admissionBinding = options.binding !== undefined ? unresolved
-      : { ...unresolved, thinking: unresolved.thinking ?? this.#runBinding(actor).thinking };
-    const resolving = unresolved.model ? this.#resolvedRunBinding(actor, admissionBinding) : unresolved;
+    // Resolve only supplied overrides. In owner-defaults mode, adding the
+    // current session thinking here would persist a synthetic override and shadow
+    // a later owner default when drain layers the queued binding.
+    const resolving = unresolved.model ? this.#resolvedRunBinding(actor, unresolved) : unresolved;
     const binding = resolving instanceof Promise ? (resolving.catch(() => undefined), unresolved) : resolving;
     const sender = options.sender === null ? undefined : options.sender ?? processSender();
     const createdAt = Date.now();

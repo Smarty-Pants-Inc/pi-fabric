@@ -230,7 +230,7 @@ describe("source-clock root liveness (#10068)", () => {
     const dead = new CommitOutbox(f.store, "bridge/ryzen4", bridgeIdentity, {});
     const host = f.presence.hosts[0]!.record;
     const inflated = { id: rootId, rootId, identityId: rootId, startedAt: host.startedAt,
-      incarnationToken: host.incarnationToken, updatedAt: t0 + 1_000, expiresAt: t0 + 1_500,
+      ...(host.incarnationToken ? { incarnationToken: host.incarnationToken } : {}), updatedAt: t0 + 1_000, expiresAt: t0 + 1_500,
       mirrorLease: 1 as const, mirror: mirror(t0, { sourceUpdatedAt: host.updatedAt,
         sourceExpiresAt: t0 - 60_000 + 500 }) };
     // Reproduce a pre-fix COMMIT whose effects never ran, including retained attribution.
@@ -262,6 +262,7 @@ describe("source-clock root liveness (#10068)", () => {
     const write = f.store.writeBatch.bind(f.store);
     vi.spyOn(f.store, "writeBatch").mockImplementation(input => write({ ...input, prepare: view => {
       const ops = input.prepare!(view); // Original prepare replays the pending lease here.
+      if (checkpoint) return ops; // prepare may rerun; capture the first precommit replay only.
       checkpoint = { expiresAt: f.lease().expiresAt, observedAt: f.lease().mirror?.observedAt,
         rowExpiry: (view.get(key("topology/hosts/", rootId))!.value as { expiresAt: number }).expiresAt,
         participant: f.directory.get(rootId, f.now()),
@@ -295,7 +296,7 @@ describe("source-clock root liveness (#10068)", () => {
       const dead = new CommitOutbox(f.store, "bridge/ryzen4", bridgeIdentity, {});
       const host = f.presence.hosts[0]!.record;
       const inflated = { id: rootId, rootId, identityId: rootId, startedAt: host.startedAt,
-        incarnationToken: host.incarnationToken, updatedAt: t0 + 1_000, expiresAt: t0 + 1_500,
+        ...(host.incarnationToken ? { incarnationToken: host.incarnationToken } : {}), updatedAt: t0 + 1_000, expiresAt: t0 + 1_500,
         mirrorLease: 1 as const, mirror: mirror(t0, { sourceUpdatedAt: host.updatedAt,
           sourceExpiresAt: t0 - 60_000 + 500 }) };
       await f.store.writeBatch({ identity: bridgeIdentity, ops: [], prepare: () => dead.plan().stage([

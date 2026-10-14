@@ -40,6 +40,7 @@ const GUEST_FABRIC_ERROR_NAMES: Readonly<Record<string, string>> = Object.freeze
   FABRIC_INTERRUPT_RATE_LIMITED: "FabricInterruptRateLimitedError",
   FABRIC_PARTICIPANT_STALE: "FabricParticipantStaleError",
   FABRIC_PARTICIPANT_NOT_YET_MIRRORED: "FabricParticipantNotYetMirroredError",
+  FABRIC_PEER_LEASE_STALE: "FabricPeerLeaseStaleError",
   FABRIC_PARTICIPANT_NON_INTERACTIVE: "FabricParticipantNonInteractiveError",
   FABRIC_TASK_ESCALATION_TARGET_DENIED: "TaskEscalationTargetError",
   FABRIC_PROJECT_AGENT_UNRESOLVED: "FabricProjectAgentUnresolvedError",

@@ -54,6 +54,8 @@ import { HostLeaseLockBusyError, withHostLeaseLock } from "./host-lease-lock.js"
 import { peerLabelPrefix } from "./peer-settle.js";
 import { rootParticipantName } from "./participant-name.js";
 import { ownProcessIncarnation } from "../core/atomic-write.js";
+import { watchBridgeStore } from "../mesh/change-notifier.js";
+import { FabricPeerLeaseStaleError, PEER_LEASE_WAIT_MS } from "../agents/peer-lease-stale.js";
 import {
   ParticipantFileLockBusyError,
   prepareParticipantFileLocks,
@@ -669,6 +671,10 @@ export const isStaleExtensionContextError = (error: unknown): boolean =>
   error instanceof Error && /extension ctx is stale after session replacement or reload/.test(error.message);
 
 export type ParticipantSnapshotSource = () => FabricParticipantRecord[];
+
+type RemoteMirrorLease = { state: "none" } | { state: "ended" } | {
+  state: "live" | "expired"; ownerHostId: string; ownerIdentityId: string; rootId: string; remoteHost: string; expiresAt: number;
+};
 
 export class ParticipantDirectory implements FabricParticipantSource {
   /** Distinct from PID incarnation and actor lineage; rotates on every activation/reload. */
@@ -1611,7 +1617,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
   /** Recovery is resolution-only: no mesh write, ownership transfer, or delivery retry here. */
   async resolveRoutingLease(id: string): Promise<boolean> {
     const record = this.#routingOwner(id);
-    if (!record) return true; // Unknown/mirrored ids retain the ordinary resolver and bridge rules.
+    if (!record) return this.#resolveRemoteMirrorLease(id); // Unknown ids retain the ordinary resolver.
     const { participant, owner } = record;
     const options = this.options.routingLease ?? {};
     const now = (options.now ?? Date.now)();
@@ -1645,6 +1651,91 @@ export class ParticipantDirectory implements FabricParticipantSource {
       !["stopping", "reloading"].includes(refreshed.status) && currentOwner !== undefined &&
       (owner.incarnationToken !== undefined ? currentOwner.incarnationToken === owner.incarnationToken : currentOwner.startedAt === owner.startedAt) &&
       currentOwner.identity.id === owner.identity.id && currentOwner.rootId === owner.rootId && !this.#routeEnded(refreshed);
+  }
+
+  /** fv2-11703: a validated remote Main mirror, read fresh. Malformed, colliding, missing-owner or
+   * mismatched-owner mirrors are "none": they never authorize a wait nor become routable here. */
+  #remoteMirrorLease(id: string): RemoteMirrorLease {
+    if (!this.options.enabled) return { state: "none" };
+    const target = id === "main" ? this.options.rootId : id;
+    const read = { fresh: true };
+    const entry = this.#participantEntry(keyFor(PARTICIPANT_PREFIX, target), read);
+    const participant = entry ? participantFromEntry(entry) : undefined;
+    if (!participant?.remoteHost || participant.id !== target || participant.kind !== "root" ||
+      participant.rootId !== target) return { state: "none" };
+    const hosts = this.#liveHosts(this.mesh.listAll(HOST_PREFIX, read));
+    const owner = hosts.get(participant.ownerHostId);
+    if (!owner || !ownerMatches(participant, owner, this.options.hostId) ||
+      owner.identity.id !== participant.ownerIdentityId || owner.rootId !== participant.rootId ||
+      !Number.isFinite(owner.expiresAt) || this.#collides(participant, hosts, false)) return { state: "none" };
+    if (participant.status === "stopping" || this.#routeEnded(participant, read)) return { state: "ended" };
+    const now = (this.options.routingLease?.now ?? Date.now)();
+    return {
+      state: owner.expiresAt >= now ? "live" : "expired",
+      ownerHostId: owner.id, ownerIdentityId: owner.identity.id, rootId: owner.rootId,
+      remoteHost: participant.remoteHost, expiresAt: owner.expiresAt,
+    };
+  }
+
+  /** Resolution only: one notification-driven wait (no polling) of at most PEER_LEASE_WAIT_MS for
+   * an EXPIRED validated remote mirror. true lets the caller re-run ordinary fresh routing; it never
+   * routes the expired mirror. The watcher is armed before the re-read so a renewal cannot be lost. */
+  async #resolveRemoteMirrorLease(id: string): Promise<boolean> {
+    const initial = this.#remoteMirrorLease(id);
+    if (initial.state === "none" || initial.state === "live") return true;
+    if (initial.state === "ended") return false;
+    const configured = this.options.routingLease?.waitMs ?? PEER_LEASE_WAIT_MS;
+    const waitMs = Number.isFinite(configured) ? Math.min(PEER_LEASE_WAIT_MS, Math.max(0, configured)) : PEER_LEASE_WAIT_MS;
+    const now = this.options.routingLease?.now ?? Date.now;
+    const sameOwner = (current: RemoteMirrorLease): boolean =>
+      current.state !== "none" && current.state !== "ended" && current.ownerHostId === initial.ownerHostId &&
+      current.ownerIdentityId === initial.ownerIdentityId && current.rootId === initial.rootId &&
+      current.remoteHost === initial.remoteHost;
+    return await new Promise<boolean>((resolve, reject) => {
+      let settled = false;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      let unwatch: (() => void) | undefined;
+      const settle = (outcome: () => boolean): void => {
+        if (settled) return;
+        settled = true;
+        if (timer !== undefined) clearTimeout(timer);
+        timer = undefined;
+        try { unwatch?.(); } catch { /* best effort */ }
+        unwatch = undefined;
+        try { resolve(outcome()); } catch (error) { reject(error); }
+      };
+      const stale = (current: { expiresAt: number }): never => {
+        throw new FabricPeerLeaseStaleError(id, initial.remoteHost, Math.max(0, now() - current.expiresAt));
+      };
+      // A renewed same-owner mirror, or a changed validated owner, re-runs ordinary routing and its
+      // fences; a removed/invalid/ended record falls back to the ordinary refusal.
+      const decide = (final: boolean): boolean | undefined => {
+        const current = this.#remoteMirrorLease(id);
+        if (current.state === "none" || current.state === "ended") return false;
+        if (current.state === "live") return true;
+        if (!sameOwner(current)) return false;
+        return final ? stale(current) : undefined;
+      };
+      const check = (): void => {
+        if (settled) return;
+        try {
+          const outcome = decide(false);
+          if (outcome !== undefined) settle(() => outcome);
+        } catch (error) { settle(() => { throw error; }); }
+      };
+      const timeout = (): void => settle(() => decide(true) ?? stale(initial));
+      try {
+        unwatch = watchBridgeStore(this.mesh.root, check, () => {
+          // Notifications unavailable: no polling fallback; one canonical read, else refuse typed.
+          settle(() => decide(true) ?? stale(initial));
+        });
+      } catch {
+        settle(() => decide(true) ?? stale(initial));
+        return;
+      }
+      timer = setTimeout(timeout, waitMs);
+      check();
+    });
   }
 
   lastKnown(id: string, now = Date.now()): { participant: FabricParticipantInfo; lapsedMs: number } | undefined {

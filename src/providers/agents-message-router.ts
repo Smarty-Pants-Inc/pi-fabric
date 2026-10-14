@@ -71,7 +71,10 @@ export const unknownParticipant = (
   label = "Fabric participant",
 ): Error => {
   const known = participants.lastKnown?.(id);
-  const peer = participants.peers?.().find((candidate) => candidate.id === id);
+  // fv2-11703: an existing remote mirror whose validated owner lease lapsed is not discovery-only;
+  // it keeps the "Unknown " lapse classification so lease resolution can wait for its renewal.
+  const lapsedMirror = known?.participant.remoteHost !== undefined && Number.isFinite(known.lapsedMs);
+  const peer = lapsedMirror ? undefined : participants.peers?.().find((candidate) => candidate.id === id);
   if (peer) return new FabricParticipantNotYetMirroredError(id, peer.host);
   if (!known) {
     const hint = SESSION_UUID.test(id.trim()) ? `; use 'session:${id.trim()}' for a Main session` : "";
@@ -107,6 +110,7 @@ export class FabricRouteAuthorityError extends Error {
 const PRE_PUBLICATION_REFUSALS = new Set([
   "FABRIC_ROUTE_AUTHORITY_CHANGED", "FABRIC_CONTROL_INCARNATION_REQUIRED",
   "FABRIC_PARTICIPANT_NOT_YET_MIRRORED", "FABRIC_PARTICIPANT_NON_INTERACTIVE",
+  "FABRIC_PEER_LEASE_STALE",
 ]);
 const prePublicationRefusal = (error: unknown, reason: string): string | undefined => {
   const code = error instanceof Error && "code" in error && typeof error.code === "string" ? error.code : undefined;
@@ -246,6 +250,18 @@ export class AgentMessageRouter {
     const cached = this.#directoryRead(() => this.participants.get(id));
     const fresh = this.#directoryRead(() => this.participants.get(id, undefined, { fresh: true })) ?? this.#lapsedRoot(id);
     if (cached?.kind === "root") {
+      // fv2-11703: a cached remote root whose mirror lapsed is a lapse, not an authority change:
+      // classify it so pre-publication lease resolution waits once and re-runs this fence.
+      // Only the same validated link and owner; a removed or replaced mirror stays an authority change.
+      if (!fresh && cached.remoteHost !== undefined) {
+        const known = this.#directoryRead(() => this.participants.lastKnown?.(id));
+        const lapsed = known?.participant;
+        if (known && lapsed && Number.isFinite(known.lapsedMs) && lapsed.kind === "root" && lapsed.id === cached.id &&
+          lapsed.remoteHost === cached.remoteHost && lapsed.rootId === cached.rootId &&
+          lapsed.ownerHostId === cached.ownerHostId && lapsed.ownerIdentityId === cached.ownerIdentityId) {
+          throw this.#unknownParticipant(id);
+        }
+      }
       // Refresh the epoch only under the same authority and link. A replacement mirror
       // must never turn a native send into bridge publication, or redirect an existing link.
       if (!fresh || fresh.kind !== "root" || fresh.remoteHost !== cached.remoteHost || fresh.id !== cached.id ||

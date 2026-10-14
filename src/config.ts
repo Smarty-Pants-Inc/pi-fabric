@@ -246,7 +246,13 @@ export interface FabricAgentConfig {
   /** Root deny baseline unioned with agent-dir additions; workspace lists are ignored. */
   deniedModels: string[];
   /** Root/default reason baseline unioned with agent-dir additions; only root may relax. */
-  modelPolicy: { requireReason: string[] };
+  modelPolicy: {
+    requireReason: string[];
+    /** Model used for indirect/default resolution when the configured model is unavailable or denied. */
+    fallbackModel?: string;
+    /** Thinking level paired with the indirect fallback model. */
+    fallbackThinking?: FabricThinking;
+  };
   deniedModelReplacement?: string;
   /** Host-only file instructions root. Unset = ~/.local/share/smarty-dev/factory/current/. */
   instructionsRoot?: string;
@@ -746,7 +752,10 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
     runner: "pi",
     transport: "process",
     deniedModels: [],
-    modelPolicy: { requireReason: ["gpt-6-astra"] },
+    modelPolicy: {
+      requireReason: ["gpt-6-astra", "opus", "claude"],
+      fallbackThinking: "high",
+    },
     claude: { binary: "claude" },
     veda: { binary: "veda", backend: "agy", persona: "navigator-chat" },
     thinking: DEFAULT_FABRIC_THINKING,
@@ -1261,6 +1270,11 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
   const prewalkModel = stringValue(prewalk.model);
   const prewalkThinking = isFabricThinking(prewalk.thinking) ? prewalk.thinking : undefined;
   const agentModel = stringValue(agents.model);
+  const modelPolicy = objectValue(agents.modelPolicy);
+  const fallbackModel = stringValue(modelPolicy.fallbackModel)?.trim();
+  const fallbackThinking = isFabricThinking(modelPolicy.fallbackThinking)
+    ? modelPolicy.fallbackThinking
+    : undefined;
   const wakeText = normalizeWakeTextConfig(agents.wakeText);
   const router = normalizeAgentRouterConfig(agents.router);
   const deniedModelReplacement = stringValue(agents.deniedModelReplacement)?.trim();
@@ -1545,11 +1559,13 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
           })() }
         : {}),
       modelPolicy: {
-        requireReason: [...new Set((Array.isArray(objectValue(agents.modelPolicy).requireReason)
-          ? objectValue(agents.modelPolicy).requireReason as unknown[]
+        requireReason: [...new Set((Array.isArray(modelPolicy.requireReason)
+          ? modelPolicy.requireReason as unknown[]
           : DEFAULT_FABRIC_CONFIG.agents.modelPolicy.requireReason)
           .filter((model): model is string => typeof model === "string" && !!model.trim())
           .map(model => model.trim().toLowerCase()))],
+        ...(fallbackModel ? { fallbackModel } : {}),
+        fallbackThinking: fallbackThinking ?? "high",
       },
       deniedModels: [...new Set((Array.isArray(agents.deniedModels) ? agents.deniedModels : [])
         .filter((model): model is string => typeof model === "string" && !!model.trim())

@@ -74,6 +74,7 @@ export const createRunningRecord = (
   cwd: options.cwd,
   ...(options.model ? { model: options.model, requestedModel: options.model } : {}),
   ...(options.modelReason !== undefined ? { modelReason: options.modelReason } : {}),
+  ...(options.modelPolicyWarnings?.length ? { warnings: [...options.modelPolicyWarnings] } : {}),
   ...(thinking ? { thinking } : {}),
   ...(options.actorId ? { actorId: options.actorId } : {}),
   ...(options.actorName ? { actorName: options.actorName } : {}),

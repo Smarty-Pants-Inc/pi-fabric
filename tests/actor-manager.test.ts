@@ -253,7 +253,7 @@ describe("ActorManager bound registry metadata (#7682)", () => {
 
   it("round 2 preserves project defaults through an old-runtime save that strips unknown fields", async () => {
     const state = setup(true);
-    const defaults = { model: "anthropic/claude-opus-5-5", modelReason: "project policy", thinking: "medium" as const };
+    const defaults = { model: "anthropic/claude-opus-5-5", modelReason: "#11864 project policy", thinking: "medium" as const };
     const actor = await state.actors.create({ name: "rollback-defaults", instructions: "Observe.", ...defaults });
     await state.actors.ask(actor.id, "foreign run", undefined, undefined, {
       binding: { model: "provider/foreign", modelReason: "one run only", thinking: "low" },
@@ -362,7 +362,7 @@ describe("ActorManager bound registry metadata (#7682)", () => {
   it("republishes an idle actor's last resolved binding after a host restart without a run (#8487)", async () => {
     const state = setup(true);
     const actor = await state.actors.create({ name: "restart-binding", instructions: "Observe.",
-      model: "anthropic/claude-opus-5-5", thinking: "medium" });
+      model: "anthropic/claude-opus-5-5", modelReason: "#11864 restart binding", thinking: "medium" });
     await state.actors.setModel(actor.id, "cliproxyapi/gpt-6-luna");
     await state.actors.setThinking(actor.id, "xhigh");
     await state.actors.ask(actor.id, "first");
@@ -558,7 +558,7 @@ describe("ActorManager bound registry metadata (#7682)", () => {
   it("replaces the Opus stamp with each admitted run binding without extra writes or wakes", async () => {
     const state = setup(true);
     const actor = await state.actors.create({ name: "bound-registry", instructions: "Observe.",
-      model: "anthropic/claude-opus-5-5", thinking: "medium" });
+      model: "anthropic/claude-opus-5-5", modelReason: "#11864 bound registry", thinking: "medium" });
     await state.actors.setModel(actor.id, "cliproxyapi/gpt-6-luna");
     await state.actors.setThinking(actor.id, "xhigh");
     const saves = vi.spyOn(ActorRegistryStore.prototype, "prepare");
@@ -4627,6 +4627,7 @@ describe("ActorManager", () => {
         name: "claude-reviewer",
         instructions: "Review each mailbox item.",
         runner: "claude",
+        modelReason: "Native Claude session persistence probe #11864",
         tools: ["read"],
       });
 
@@ -5058,6 +5059,36 @@ describe("ActorManager", () => {
     expect(eventTypes).toContain("agent_start");
   });
 
+  it("model-policy boundary (#11864) guards direct actor create, binding rebind, and safe reset", async () => {
+    const opus = "anthropic/claude-opus-5-5";
+    const luna = "cliproxyapi/gpt-6-luna";
+    const reason = "#11864 direct actor exception";
+    const state = setup(false, undefined, undefined, undefined, {}, {
+      modelPolicy: { requireReason: ["gpt-6-astra", "opus", "claude"], fallbackModel: luna, fallbackThinking: "high" },
+    });
+    await expect(state.actors.create({ name: "bare-opus", instructions: "Review.", model: opus }))
+      .rejects.toThrow(/#2264|named exception/);
+    const actor = await state.actors.create({ name: "named-opus", instructions: "Review.", model: opus, opusReason: reason });
+    expect(state.actors.status(actor.id)).toMatchObject({ model: opus, modelReason: reason });
+
+    const safe = await state.actors.create({ name: "safe-binding", instructions: "Review.", model: luna });
+    await expect(state.actors.resolveActivationBinding(safe.id, { overrides: { model: opus } }))
+      .rejects.toThrow(/#2264|named exception/);
+    await expect(state.actors.resolveActivationBinding(safe.id, { overrides: { model: opus, modelReason: reason } }))
+      .resolves.toMatchObject({ model: opus, modelReason: reason });
+
+    for (const scope of ["session", "project"] as const) {
+      if (scope === "project") await state.actors.setModel(safe.id, undefined, "session");
+      await expect(state.actors.setModel(safe.id, opus, scope))
+        .rejects.toThrow(/#2264|named exception/);
+      expect(state.actors.status(safe.id)).toMatchObject({ model: luna });
+      await state.actors.resetSession(safe.id);
+      expect(state.actors.status(safe.id)).toMatchObject({ model: luna });
+      await state.actors.setModel(safe.id, opus, scope, undefined, reason);
+      expect(state.actors.status(safe.id)).toMatchObject({ model: opus, modelReason: reason });
+    }
+  });
+
   it("setModel updates and clears an actor's model and it takes effect on the next run", async () => {
     const { actors } = setup();
     const actor = await actors.create({
@@ -5067,16 +5098,16 @@ describe("ActorManager", () => {
     });
     expect(actors.status(actor.id).model).toBeUndefined();
 
-    await actors.setModel(actor.id, "anthropic/claude-sonnet-4-5", "session", undefined, "Named setter metering probe");
+    await actors.setModel(actor.id, "anthropic/claude-sonnet-4-5", "session", undefined, "#11864 Named setter metering probe");
     expect(actors.status(actor.id).model).toBe("anthropic/claude-sonnet-4-5");
-    expect(actors.status(actor.id).modelReason).toBe("Named setter metering probe");
+    expect(actors.status(actor.id).modelReason).toBe("#11864 Named setter metering probe");
 
     // The new model is forwarded to the agent run launched for the next message.
     await actors.ask(actor.id, "Inspect auth");
     await waitFor(() => actors.status(actor.id).status === "idle");
     const run = actors.readLog(actor.id, { type: "run" });
     expect(run.run?.status?.model).toBe("anthropic/claude-sonnet-4-5");
-    expect(run.run?.status?.modelReason).toBe("Named setter metering probe");
+    expect(run.run?.status?.modelReason).toBe("#11864 Named setter metering probe");
 
     // Clearing the override falls back to the Fabric default (no stored model).
     await actors.setModel(actor.id, undefined);
@@ -5106,7 +5137,7 @@ describe("ActorManager", () => {
       instructions: "Review messages and reply concisely.",
       responseMode: "text",
     });
-    await setupState.actors.setModel(actor.id, "anthropic/claude-sonnet-4-5");
+    await setupState.actors.setModel(actor.id, "anthropic/claude-sonnet-4-5", "session", undefined, "Session binding persistence probe #11864");
     const registry = JSON.parse(
       fs.readFileSync(path.join(setupState.root, "actors", "actors.json"), "utf8"),
     ) as { actors: Array<{ id: string; model?: string }> };

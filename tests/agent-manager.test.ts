@@ -146,7 +146,7 @@ describe("AgentManager fleet model admission (#2490)", () => {
     const before = fs.readdirSync(root); const launch = vi.spyOn(ProcessTransport.prototype, "launch");
     const beforeCommit = vi.fn();
     try {
-      await expect(manager.spawn({ task: "must not queue", runner, ...(source === "explicit" ? { model: selector } : {}) }, undefined, undefined, beforeCommit)).rejects.toMatchObject({ name: "FabricModelDeniedError", code: "FABRIC_MODEL_DENIED" });
+      await expect(manager.spawn({ task: "must not queue", runner, ...(source === "explicit" ? { model: selector } : {}), ...(runner === "claude" ? { modelReason: "Named exception to isolate Claude deny policy #11864" } : {}) }, undefined, undefined, beforeCommit)).rejects.toMatchObject({ name: "FabricModelDeniedError", code: "FABRIC_MODEL_DENIED" });
       expect(manager.list().map(agent => agent.id)).toEqual([occupied.id]);
       expect(fs.readdirSync(root)).toEqual(before);
       expect(launch).not.toHaveBeenCalled(); expect(beforeCommit).not.toHaveBeenCalled();
@@ -162,7 +162,7 @@ describe("AgentManager fleet model admission (#2490)", () => {
     const veda = await manager.run({ task: "allowed concrete", runner: "veda", model: "veda/cliproxyapi/gpt-6.1-sol", transport: "process" });
     expect(veda).toMatchObject({ status: "completed", model: "cliproxyapi/gpt-6.1-sol" });
     expect(preparePiModel).toHaveBeenCalledWith("cliproxyapi/gpt-6.1-sol");
-    const claude = await manager.run({ task: "allowed alias", runner: "claude", model: "claude/haiku", transport: "process" });
+    const claude = await manager.run({ task: "allowed alias", runner: "claude", model: "claude/haiku", modelReason: "Named Claude backend compatibility probe #11864", transport: "process" });
     expect(claude).toMatchObject({ status: "completed", model: "claude-haiku-test" });
   });
 
@@ -176,7 +176,7 @@ describe("AgentManager fleet model admission (#2490)", () => {
     const catalog = vi.spyOn(manager, "claudeModels").mockResolvedValue([{ value: "shortcut", resolvedModel: "shortcut", resolvedModelKnown: false, displayName: "Shortcut", description: "No native target" }]);
     const launch = vi.spyOn(ProcessTransport.prototype, "launch");
     try {
-      await expect(manager.spawn({ task: "no proof", runner: mode === "unresolved-catalog" ? "claude" : "veda", model: mode === "unresolved-catalog" ? "shortcut" : "cliproxyapi/gpt-6.1-sol" })).rejects.toMatchObject({ code: "FABRIC_MODEL_DENIED" });
+      await expect(manager.spawn({ task: "no proof", runner: mode === "unresolved-catalog" ? "claude" : "veda", model: mode === "unresolved-catalog" ? "shortcut" : "cliproxyapi/gpt-6.1-sol", ...(mode === "unresolved-catalog" ? { modelReason: "Named exception to isolate Claude catalog denial #11864" } : {}) })).rejects.toMatchObject({ code: "FABRIC_MODEL_DENIED" });
       expect(manager.list()).toEqual([]); expect(launch).not.toHaveBeenCalled(); expect(fs.readdirSync(root)).toEqual([]);
     } finally { launch.mockRestore(); catalog.mockRestore(); }
   });
@@ -187,7 +187,7 @@ describe("AgentManager fleet model admission (#2490)", () => {
     const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, deniedModels: [] }, { workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root, preparePiModel }); managers.push(manager);
     const catalog = vi.spyOn(manager, "claudeModels");
     try {
-      expect(await manager.run({ task: "legacy alias", runner, model: "backend-shortcut", transport: "process" })).toMatchObject({ status: "completed", model: "backend-shortcut" });
+      expect(await manager.run({ task: "legacy alias", runner, model: "backend-shortcut", ...(runner === "claude" ? { modelReason: "Named Claude backend compatibility probe #11864" } : {}), transport: "process" })).toMatchObject({ status: "completed", model: "backend-shortcut" });
       expect(preparePiModel).not.toHaveBeenCalled(); expect(catalog).not.toHaveBeenCalled();
     } finally { catalog.mockRestore(); }
   });
@@ -223,12 +223,12 @@ describe("AgentManager fleet model admission (#2490)", () => {
     const launch = vi.spyOn(ProcessTransport.prototype, "launch");
     try {
       for (const model of [selector, undefined]) {
-        await expect(manager.spawn({ task: "HANG", ...(model ? { model } : {}) })).rejects.toMatchObject({ code: "FABRIC_MODEL_DENIED" });
+        await expect(manager.spawn({ task: "HANG", ...(model ? { model } : {}), ...(runner === "claude" ? { modelReason: "Named exception to isolate Claude deny policy #11864" } : {}) })).rejects.toMatchObject({ code: "FABRIC_MODEL_DENIED" });
       }
       expect(manager.list()).toEqual([]);
       expect(launch).not.toHaveBeenCalled();
       expect(fs.readdirSync(root).filter((entry) => fs.statSync(path.join(root, entry)).isDirectory())).toEqual([]);
-      const allowed = await manager.run({ task: "allowed control", model: runner === "veda" ? "veda/cliproxyapi/gpt-6.1-sol" : "claude/haiku", transport: "process" });
+      const allowed = await manager.run({ task: "allowed control", model: runner === "veda" ? "veda/cliproxyapi/gpt-6.1-sol" : "claude/haiku", ...(runner === "claude" ? { modelReason: "Named Claude control for deny-policy probe #11864" } : {}), transport: "process" });
       expect(allowed.status).toBe("completed");
       expect(launch).toHaveBeenCalledTimes(1);
     } finally { launch.mockRestore(); }
@@ -249,6 +249,133 @@ describe("AgentManager fleet model admission (#2490)", () => {
       expect(launch).not.toHaveBeenCalled();
       expect(fs.readdirSync(root).filter((entry) => fs.statSync(path.join(root, entry)).isDirectory())).toEqual([]);
     } finally { launch.mockRestore(); }
+  });
+});
+
+describe("resolved manager policy (#11864)", () => {
+  const opus = "anthropic/claude-opus-5-5";
+  const luna = "cliproxyapi/gpt-6-luna";
+  const issueReason = "Named exception for the direct manager boundary #11864";
+  const makeManager = (root: string, overrides: Partial<typeof DEFAULT_FABRIC_CONFIG.agents> = {}, preparePiModel?: (model: string | undefined) => Promise<string | void>) => {
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, ...overrides }, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
+      claudeBinary: path.resolve("tests/fixtures/fake-claude.mjs"),
+      runRoot: root,
+      ...(preparePiModel ? { preparePiModel } : {}),
+    });
+    managers.push(manager);
+    return manager;
+  };
+  const policyFallback = { fallbackModel: luna };
+  const readAudit = (reason: string): Record<string, unknown> => {
+    const file = path.join(os.homedir(), ".local", "state", "smarty", "route", "opus-exceptions.jsonl");
+    const rows = fs.readFileSync(file, "utf8").trim().split("\n").filter(Boolean).map(line => JSON.parse(line) as Record<string, unknown>);
+    const matches = rows.filter(row => row.reason === reason);
+    expect(matches, "a named model exception is appended once to the private test HOME audit").toHaveLength(1);
+    return matches[0]!;
+  };
+
+  it("prepares inherited session Opus to the configured safe fallback before constructing worker args", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-opus-inherited-fallback-")); roots.push(root);
+    const preparePiModel = vi.fn(async (model: string | undefined) => model === undefined ? opus : model);
+    const manager = makeManager(root, { modelPolicy: { ...DEFAULT_FABRIC_CONFIG.agents.modelPolicy, ...policyFallback } }, preparePiModel);
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    try {
+      const handle = await manager.spawn({ task: "inherited model fallback", modelSource: "inherited", transport: "process" });
+      expect(handle).toMatchObject({ model: luna, thinking: "high", warnings: [expect.stringContaining(`model: inherited ${opus} -> ${luna} high (#11863)`)] });
+      expect(launch).toHaveBeenCalledOnce();
+      expect(launch.mock.calls[0]![0].workerArguments).toEqual(expect.arrayContaining(["--model", luna, "--thinking", "high"]));
+      const result = await manager.wait(handle.id);
+      expect(result).toMatchObject({ status: "completed", model: luna, thinking: "high", warnings: [expect.stringContaining(`model: inherited ${opus} -> ${luna} high (#11863)`)] });
+    } finally { launch.mockRestore(); }
+  });
+
+  it("refuses inherited Opus when no explicit agents.modelPolicy.fallbackModel exists", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-opus-no-fallback-")); roots.push(root);
+    const preparePiModel = vi.fn(async (model: string | undefined) => model === undefined ? opus : model);
+    const manager = makeManager(root, {}, preparePiModel);
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    try {
+      await expect(manager.spawn({ task: "no implicit fleet fallback", modelSource: "inherited", transport: "process" }))
+        .rejects.toThrow(/agents\.modelPolicy\.fallbackModel.*no worker started/);
+      expect(manager.list()).toEqual([]);
+      expect(launch).not.toHaveBeenCalled();
+      expect(fs.readdirSync(root)).toEqual([]);
+    } finally { launch.mockRestore(); }
+  });
+
+  it("refuses an innocuous explicit alias resolved to Opus without an issue and admits the opusReason alias with one audit write", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-opus-alias-")); roots.push(root);
+    const preparePiModel = vi.fn(async (model: string | undefined) => model === "provider/harmless-shortcut" ? opus : model);
+    const manager = makeManager(root, {}, preparePiModel);
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    try {
+      await expect(manager.spawn({ task: "alias without issue", model: "provider/harmless-shortcut", transport: "process" }))
+        .rejects.toThrow(/requires (?:modelReason|opusReason).*#2264/);
+      await expect(manager.spawn({ task: "alias reason without issue reference", model: "provider/harmless-shortcut", modelReason: "Opus would be useful for this task", transport: "process" }))
+        .rejects.toThrow(/issue reference|#11864|#2264/i);
+      expect(manager.list()).toEqual([]);
+      expect(launch).not.toHaveBeenCalled();
+      const accepted = await manager.run({ task: "issue-bearing alias", model: "provider/harmless-shortcut", opusReason: issueReason, transport: "process" });
+      expect(accepted).toMatchObject({ status: "completed", model: opus, modelReason: issueReason });
+      expect(launch).toHaveBeenCalledOnce();
+      expect(launch.mock.calls[0]![0].workerArguments).toEqual(expect.arrayContaining(["--model", opus, "--model-reason", issueReason]));
+      expect(readAudit(issueReason)).toMatchObject({ model: opus, ref: "#11864", reason: issueReason, role: expect.any(String), ts: expect.stringMatching(/^\d{4}-\d\d-\d\dT/) });
+    } finally { launch.mockRestore(); }
+  });
+
+  it("falls back from a configured Opus default to its explicitly configured Luna policy target", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-opus-default-fallback-")); roots.push(root);
+    const preparePiModel = vi.fn(async (model: string | undefined) => model);
+    const manager = makeManager(root, { model: opus, modelPolicy: { ...DEFAULT_FABRIC_CONFIG.agents.modelPolicy, ...policyFallback } }, preparePiModel);
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    try {
+      const result = await manager.run({ task: "configured protected default", transport: "process" });
+      expect(result).toMatchObject({ status: "completed", model: luna, thinking: "high", warnings: [expect.stringContaining(`model: inherited ${opus} -> ${luna} high (#11863)`)] });
+      expect(launch).toHaveBeenCalledOnce();
+      expect(launch.mock.calls[0]![0].workerArguments).toEqual(expect.arrayContaining(["--model", luna, "--thinking", "high"]));
+    } finally { launch.mockRestore(); }
+  });
+
+  it("refuses the Claude runner without an issue and records an issue-bearing exception", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-claude-reason-")); roots.push(root);
+    const manager = makeManager(root, { claude: { ...DEFAULT_FABRIC_CONFIG.agents.claude, model: "claude/haiku" } });
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    try {
+      await expect(manager.spawn({ task: "Claude without issue", runner: "claude", transport: "process" }))
+        .rejects.toThrow(/requires (?:modelReason|opusReason).*#2264/);
+      expect(manager.list()).toEqual([]);
+      expect(launch).not.toHaveBeenCalled();
+      const reason = "Named Claude-runner exception #11864";
+      const result = await manager.run({ task: "Claude with issue", runner: "claude", modelReason: reason, transport: "process" });
+      expect(result).toMatchObject({ status: "completed", runner: "claude", modelReason: reason });
+      expect(launch).toHaveBeenCalledOnce();
+      expect(readAudit(reason)).toMatchObject({ model: expect.stringContaining("claude"), ref: "#11864", reason, role: expect.any(String), ts: expect.stringMatching(/^\d{4}-\d\d-\d\dT/) });
+    } finally { launch.mockRestore(); }
+  });
+
+  it("completes an issue-bearing Claude exception when its audit append fails and warns in both receipts", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-claude-audit-failure-")); roots.push(root);
+    const home = path.join(root, "home");
+    const auditFile = path.join(home, ".local", "state", "smarty", "route", "opus-exceptions.jsonl");
+    fs.mkdirSync(auditFile, { recursive: true });
+    const homedir = vi.spyOn(os, "homedir").mockReturnValue(home);
+    const manager = makeManager(root);
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    const reason = "Named Claude audit failure exception #11864";
+    const warning = "Opus policy audit log failed; exception not fully recorded.";
+    const model = "claude/haiku";
+    try {
+      const receipt = await manager.spawn({ task: "Claude survives audit failure", runner: "claude", model, modelReason: reason, transport: "process" });
+      expect(receipt).toMatchObject({ model, modelReason: reason, warnings: [warning] });
+      expect(launch).toHaveBeenCalledOnce();
+      expect(launch.mock.calls[0]![0].workerArguments).toEqual(expect.arrayContaining(["--runner", "claude", "--model", model, "--model-reason", reason]));
+      const result = await manager.wait(receipt.id);
+      expect(result).toMatchObject({ status: "completed", runner: "claude", model, modelReason: reason, warnings: [warning] });
+      expect(result.model).toBe(receipt.model);
+      expect(result.modelReason).toBe(receipt.modelReason);
+      expect(fs.statSync(auditFile).isDirectory()).toBe(true);
+    } finally { launch.mockRestore(); homedir.mockRestore(); }
   });
 });
 
@@ -2563,7 +2690,7 @@ describe("AgentManager", () => {
   it("forwards the configured default model when a call omits one", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
     roots.push(root);
-    const config = { ...DEFAULT_FABRIC_CONFIG.agents, model: "claude-sonnet-4-5" };
+    const config = { ...DEFAULT_FABRIC_CONFIG.agents, model: "provider/default" };
     const manager = new AgentManager(process.cwd(), config, {
       workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
       runRoot: root,
@@ -2572,7 +2699,7 @@ describe("AgentManager", () => {
     managers.push(manager);
     const result = await manager.run({ task: "Use the default model", transport: "process" });
     expect(result.status).toBe("completed");
-    expect(result.model).toBe("claude-sonnet-4-5");
+    expect(result.model).toBe("provider/default");
   });
 
   it("lets a per-call model override the configured default", async () => {
@@ -2941,7 +3068,7 @@ describe("AgentManager Claude runner", () => {
     });
     managers.push(manager);
 
-    const result = await manager.run({ task: "Use Claude defaults", transport: "process" });
+    const result = await manager.run({ task: "Use Claude defaults", modelReason: "Named Claude default compatibility probe #11864", transport: "process" });
     expect(result).toMatchObject({
       status: "completed",
       runner: "claude",
@@ -2966,6 +3093,7 @@ describe("AgentManager Claude runner", () => {
         runner: "claude",
         transport: "process",
         model: "claude/haiku",
+        modelReason: "Named Claude stream-json compatibility probe #11864",
         thinking: "minimal",
         tools: ["read", "grep", "find", "ls"],
         schema: {
@@ -3022,6 +3150,7 @@ describe("AgentManager Claude runner", () => {
     const result = await manager.run({
       task: "CLAUDE_FAIL",
       runner: "claude",
+      modelReason: "Named Claude failure diagnostic probe #11864",
       transport: "process",
       tools: ["read"],
     });
@@ -3046,6 +3175,7 @@ describe("AgentManager Claude runner", () => {
     const handle = await manager.spawn({
       task: "Initial Claude task",
       runner: "claude",
+      modelReason: "Named Claude steering compatibility probe #11864",
       transport: "process",
       tools: ["read"],
     });
@@ -3355,6 +3485,7 @@ describe("AgentManager steering", () => {
     const handle = await manager.spawn({
       task: "Initial Claude task",
       runner: "claude",
+      modelReason: "Named Claude compaction compatibility probe #11864",
       transport: "process",
       tools: ["read"],
     });

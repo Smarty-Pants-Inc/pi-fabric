@@ -485,6 +485,7 @@ describe("agent scope narrowing", () => {
       // Our model-policy hooks (requireReason, denied models): no policy in this fixture.
       assertExplicitModelReason() {},
       assertModelAllowed() {},
+      resolveModelReasonPolicy: async (model: string | undefined) => ({ model, fallback: false }),
       prepareModelForAdmission: async (model: string | undefined) => model,
       defaultModel: () => undefined,
       spawn: async (request: unknown) => {

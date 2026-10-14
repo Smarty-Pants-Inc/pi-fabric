@@ -63,7 +63,16 @@ export const parseWorkerOptions = (
 ): AgentWorkerOptions => {
   const args = argumentMap(argv);
   const model = optional(args, "model");
-  const modelReason = args.get("model-reason");
+  const modelReason = args.get("model-reason") ?? args.get("opus-reason");
+  const policyWarningsSource = optional(args, "model-policy-warnings");
+  let modelPolicyWarnings: string[] | undefined;
+  if (policyWarningsSource) {
+    const warnings: unknown = JSON.parse(policyWarningsSource);
+    if (!Array.isArray(warnings) || warnings.length > 8 || warnings.some(warning => typeof warning !== "string" || warning.length > 4096)) {
+      throw new Error("Invalid worker model policy warnings");
+    }
+    modelPolicyWarnings = warnings;
+  }
   const routeHeader = optional(args, "route-header");
   const routeClass = args.get("route-class");
   const routeClassSource = optional(args, "route-class-source");
@@ -249,6 +258,7 @@ export const parseWorkerOptions = (
     ...(fabricExtensionPath ? { fabricExtensionPath } : {}),
     ...(model ? { model } : {}),
     ...(modelReason !== undefined ? { modelReason } : {}),
+    ...(modelPolicyWarnings?.length ? { modelPolicyWarnings } : {}),
     ...(routeHeader ? { routeHeader } : {}),
     ...(routeClass !== undefined ? { routeClass } : {}),
     ...(routeClassSource ? { routeClassSource } : {}),

@@ -54,7 +54,12 @@ const fixture = async (durable = false) => {
     agents: { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, instructionsRoot: factory }, mesh: meshConfig,
     retention: DEFAULT_FABRIC_CONFIG.retention, workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
     fabricExtensionPath: path.resolve("dist/index.js"), piBinary: "pi", claudeBinary: "claude", vedaBinary: "veda",
-    piModels: { available: [{ provider: "fixture", id: "visible" }, { provider: "cliproxyapi", id: "gpt-6-astra" }], aliases: {}, defaultModel: "fixture/visible" },
+    piModels: { available: [
+      { provider: "fixture", id: "visible" },
+      { provider: "cliproxyapi", id: "gpt-6-astra" },
+      { provider: "cliproxyapi", id: "gpt-6-luna" },
+      { provider: "cliproxyapi-anthropic", id: "claude-opus-5-5" },
+    ], aliases: {}, defaultModel: "fixture/visible" },
   };
   const mainAgent = { id: identity.id, local: true, matches: (id: string) => id === identity.id } as FabricMainAgentTarget;
   const host = durable ? new ResidentHost(config, () => {}) : undefined;
@@ -98,7 +103,7 @@ for (const durable of [false, true]) describe(`${durable ? "resident" : "Main"} 
         const service = new FabricExecutionService(registry, config);
         // #436 unifies #389's createActor guard with run/spawn/setModel policy.
         // Keep the complete instructions/scope/route matrix on the shared refusal.
-        const refusal = "model cliproxyapi/gpt-6-astra requires modelReason (named exception); omit model to use the role default pi default (inherited session model), see smarty-dev#3134";
+        const refusal = /model cliproxyapi\/gpt-6-astra requires modelReason.*#2264/;
         for (const modelReason of [undefined, "", " \t\n "]) {
           const args = {
             name: "refused-astra", scope, residency: durable ? "durable" : "session",
@@ -106,14 +111,14 @@ for (const durable of [false, true]) describe(`${durable ? "resident" : "Main"} 
             ...(source === "file" ? fileSource(file) : { instructions: text }),
           };
           if (route === "direct") {
-            await expect(state.provider.invoke("createActor", args, state.context)).rejects.toMatchObject({ message: refusal });
+            await expect(state.provider.invoke("createActor", args, state.context)).rejects.toMatchObject({ message: expect.stringMatching(refusal) });
           } else {
             const result = await service.execute({
               code: `try { await agents.createActor(${JSON.stringify(args)}); return "unexpected admission"; } catch (error) { return error.message; }`,
               signal: undefined, parentToolCallId: "guest-astra-file-guard", context: state.context.extensionContext, onPartial() {},
             });
             expect(result.success, result.error).toBe(true);
-            expect(result.value).toBe(refusal);
+            expect(result.value).toEqual(expect.stringMatching(refusal));
           }
           expect(state.actors.listOwned()).toEqual([]);
           expect(state.owner.listOwned()).toEqual([]);
@@ -133,6 +138,21 @@ for (const durable of [false, true]) describe(`${durable ? "resident" : "Main"} 
         ...(source === "file" ? fileSource(file) : { instructions: text }) });
       expect(state.owner.definition(actor.id)).toMatchObject({ model: "cliproxyapi/gpt-6-astra", modelReason });
       expect(state.owner.instructions(actor.id)).toBe(text);
+    } finally { await state.close(); }
+  });
+});
+
+for (const durable of [false, true]) describe(`${durable ? "resident" : "Main"} actor file boundary (#11864)`, () => {
+  it("refuses a direct Opus actor without a reason, then accepts and records an issue-bearing opusReason", async () => {
+    const state = await fixture(durable);
+    try {
+      await expect(state.create({ model: "cliproxyapi-anthropic/claude-opus-5-5", instructions: text }))
+        .rejects.toThrow(/#2264|named exception/);
+      const reason = "#11864 actor instructions exception";
+      const actor = await state.create({ model: "cliproxyapi-anthropic/claude-opus-5-5", opusReason: reason, instructions: text });
+      expect(state.owner.definition(actor.id)).toMatchObject({
+        model: "cliproxyapi-anthropic/claude-opus-5-5", modelReason: reason,
+      });
     } finally { await state.close(); }
   });
 });

@@ -46,19 +46,46 @@ describe("transient actor activation block cooldown (smarty-dev#6509)", () => {
 });
 
 describe("host-only explicit model exceptions (#3134)", () => {
-  it("defaults to Astra and supports an empty rollback or normalized override", () => {
-    expect(normalizeFabricConfig({}).agents.modelPolicy.requireReason).toEqual(["gpt-6-astra"]);
+  it("defaults to the fleet reason prefixes and supports an empty rollback or normalized override", () => {
+    expect(normalizeFabricConfig({}).agents.modelPolicy).toEqual({
+      requireReason: ["gpt-6-astra", "opus", "claude"],
+      fallbackThinking: "high",
+    });
     expect(normalizeFabricConfig({ agents: { modelPolicy: { requireReason: [] } } }).agents.modelPolicy.requireReason).toEqual([]);
     expect(normalizeFabricConfig({ agents: { modelPolicy: { requireReason: [" CLIPROXYAPI/GPT-6-ASTRA ", "cliproxyapi/gpt-6-astra"] } } }).agents.modelPolicy.requireReason).toEqual(["cliproxyapi/gpt-6-astra"]);
   });
-  it.each([true, false])("project cannot disable the host reason gate (trusted=%s)", projectTrusted => {
+  it("normalizes the indirect fallback model and thinking level", () => {
+    expect(normalizeFabricConfig({ agents: { modelPolicy: {
+      fallbackModel: " cliproxyapi/custom ", fallbackThinking: "medium",
+    } } }).agents.modelPolicy).toMatchObject({
+      fallbackModel: "cliproxyapi/custom",
+      fallbackThinking: "medium",
+    });
+    expect(normalizeFabricConfig({ agents: { modelPolicy: {
+      fallbackModel: " ", fallbackThinking: "invalid",
+    } } }).agents.modelPolicy).toEqual({
+      requireReason: ["gpt-6-astra", "opus", "claude"],
+      fallbackThinking: "high",
+    });
+  });
+  it.each([true, false])("project cannot disable the host reason gate or change fallback (trusted=%s)", projectTrusted => {
     const cwd = temporaryDirectory(); const agentDir = temporaryDirectory();
     fs.mkdirSync(path.join(cwd, ".pi"));
-    fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({ agents: { modelPolicy: { requireReason: ["provider/expensive"] } } }));
-    fs.writeFileSync(path.join(cwd, ".pi", "fabric.json"), JSON.stringify({ agents: { modelPolicy: { requireReason: [] } } }));
-    expect(loadFabricConfig({ cwd, agentDir, projectTrusted }).agents.modelPolicy.requireReason).toEqual(["gpt-6-astra", "provider/expensive"]);
+    fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({ agents: { modelPolicy: {
+      requireReason: ["provider/expensive"], fallbackModel: "cliproxyapi/host-fallback", fallbackThinking: "low",
+    } } }));
+    fs.writeFileSync(path.join(cwd, ".pi", "fabric.json"), JSON.stringify({ agents: { modelPolicy: {
+      requireReason: [], fallbackModel: "provider/workspace-fallback", fallbackThinking: "off",
+    } } }));
+    const loaded = loadFabricConfig({ cwd, agentDir, projectTrusted });
+    expect(loaded.agents.modelPolicy.requireReason).toEqual(["gpt-6-astra", "opus", "claude", "provider/expensive"]);
+    expect(loaded.agents.modelPolicy.fallbackModel).toBe("cliproxyapi/host-fallback");
+    expect(loaded.agents.modelPolicy.fallbackThinking).toBe("low");
     fs.unlinkSync(path.join(agentDir, "fabric.json"));
-    expect(loadFabricConfig({ cwd, agentDir, projectTrusted }).agents.modelPolicy.requireReason).toEqual(["gpt-6-astra"]);
+    const withoutHostPolicy = loadFabricConfig({ cwd, agentDir, projectTrusted }).agents.modelPolicy;
+    expect(withoutHostPolicy.requireReason).toEqual(["gpt-6-astra", "opus", "claude"]);
+    expect(withoutHostPolicy.fallbackModel).toBeUndefined();
+    expect(withoutHostPolicy.fallbackThinking).toBe("high");
   });
 });
 describe("fleet model policy configuration (#2490)", () => {

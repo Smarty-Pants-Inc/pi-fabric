@@ -81,6 +81,29 @@ describe("test temporary-storage isolation", () => {
       rmSync(runnerTemp, { recursive: true, force: true });
     }
   });
+  it("isolates os.homedir and model-policy audit logs from the original home", () => {
+    const helper = new URL("../scripts/test-temp.ts", import.meta.url).href;
+    const result = spawnSync(process.execPath, ["--experimental-transform-types", "--input-type=module", "-e", `
+      import { homedir } from "node:os";
+      import { dirname, join, sep } from "node:path";
+      import { isolateTestFleetEnvironment } from ${JSON.stringify(helper)};
+      const originalHome = homedir();
+      const env = isolateTestFleetEnvironment();
+      const home = homedir();
+      const fleetRoot = dirname(env.PI_CODING_AGENT_DIR);
+      const auditLog = join(home, ".local/state/smarty/route/opus-exceptions.jsonl");
+      process.stdout.write(JSON.stringify({ originalHome, home, fleetRoot, auditLog, sep, env }));
+    `], { env: { ...process.env, RUNNER_TEMP: "" }, encoding: "utf8", timeout: 10_000 });
+    expect(result.error).toBeUndefined();
+    expect(result.status, result.stderr).toBe(0);
+    const probe = JSON.parse(result.stdout) as { originalHome: string; home: string; fleetRoot: string; auditLog: string; sep: string; env: Record<string, string> };
+    expect(probe.home).toBe(join(probe.fleetRoot, "home"));
+    expect(probe.home).not.toBe(probe.originalHome);
+    expect(probe.auditLog.startsWith(probe.fleetRoot + probe.sep)).toBe(true);
+    if (process.platform === "win32") expect(probe.env.USERPROFILE).toBe(probe.home);
+    else expect(probe.env.HOME).toBe(probe.home);
+  });
+
   it("keeps workers and inherited child tools away from real session caches", () => {
     expect(tmpdir()).toBe(process.env.TMPDIR);
     expect(process.env.TMP).toBe(tmpdir());

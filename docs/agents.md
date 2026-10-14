@@ -343,11 +343,15 @@ These policy keys are ignored in project/workspace `.pi/fabric.json`, even in tr
 ### Explicit model exceptions (#3134)
 
 `agents.spawn`, `agents.run`, `agents.create` (including `createActor`) and actor
-`agents.setModel` refuse an explicit Astra selector unless `modelReason` is a
-non-blank string of at most 200 JavaScript characters. The default match is
-`/(^|\/)gpt-6-astra/`: bare IDs and provider-qualified Astra variants are covered.
-No model is silently substituted. The error names the configured runner role
-default and tells the caller to omit `model` or supply a named exception:
+`agents.setModel` refuse an explicit selector matching the configured
+`requireReason` prefixes unless `modelReason` (or its `opusReason` alias) is a
+non-blank string of at most 200 JavaScript characters. The package default is
+`["gpt-6-astra", "opus", "claude"]`; bare entries match any provider and
+provider-qualified entries restrict the provider/model prefix. Claude models
+and the `claude` runner additionally require the reason to name `#N` or an
+issue URL. No explicit model is silently substituted; only indirect/default
+resolution may use the optional host fallback. The error names the configured
+runner role default and tells the caller to omit `model` or supply a named exception:
 
 ```ts
 await agents.spawn({ task: "Bounded compatibility probe", model: "cliproxyapi/gpt-6-astra",
@@ -362,17 +366,40 @@ Only the trusted host's `<agentDir>/fabric.json` may override the list:
 
 Bare entries match a model-ID prefix on any provider; provider-qualified entries
 match that provider/model prefix. Matching is case-insensitive. The default list
-is `["gpt-6-astra"]`; `[]` disables the gate (rollback). Project/workspace policy
-entries are ignored even in trusted projects. Omitted `model`, inherited role or
-project defaults, Sol and other unlisted models are unaffected. Existing actors
-continue unchanged; an explicit `setModel` request needs its own exception.
-Aliases are tested as the explicitly requested selector, not their resolved target.
+is `["gpt-6-astra", "opus", "claude"]`; `[]` disables the gate (rollback).
+Project/workspace policy entries are ignored even in trusted projects. The
+trusted profile may also set `modelPolicy.fallbackModel` and
+`fallbackThinking`; these are not root-policy rollback fields and the fallback
+model is not package-defaulted. Omitted `model`, inherited role or project
+defaults, Sol and other unlisted models are unaffected unless indirect
+resolution needs the configured fallback. Existing actors continue unchanged;
+an explicit `setModel` request needs its own exception. Aliases are tested as
+the explicitly requested selector, not their resolved target.
 
 The reason is retained verbatim on run records and actor definitions/session
 bindings, and follows the effective binding into activation run records. Clearing
-or replacing a binding clears its old reason. The `run.spawned` lifecycle event
-is emitted after actual worker registration (not queue admission) with
+or replacing a binding clears its old reason. `opusReason` is accepted as an
+alias for request-level `modelReason`; this does not add a configuration key or
+change the config API. A Claude model or the `claude` runner requires a reason
+that names an issue (`#N`) or includes an issue URL. The `run.spawned` lifecycle
+event is emitted after actual worker registration (not queue admission) with
 `data.model` and, when supplied, `data.modelReason` for metering.
+
+Protected explicit selections refuse when the required reason is absent. An
+indirect/default selection first uses a configured non-protected `agents.model`
+when available, otherwise the host/profile
+`agents.modelPolicy.fallbackModel`, paired with `fallbackThinking` (default
+`high`); this fallback is optional and has no package-wide model default. If the
+fallback is unset or unavailable, an inherited Claude binding is refused with
+`agents.modelPolicy.fallbackModel` named, rather than silently selecting a
+provider that may not be installed on a non-fleet host. A successful fallback
+receipt/result uses the exact transition label:
+`model: inherited <old> -> <new> <thinking> (#11863)`.
+
+Each allowed exception or inherited switch is appended as one JSON object to
+`~/.local/state/smarty/route/opus-exceptions.jsonl` using one `O_APPEND` write:
+`{ts: ISO UTC, role: task | actor:<name>, model: original Claude, ref: issue | null, reason: supplied | inherited-switch, launcher: fabric, host}`.
+A receipt/logging failure is surfaced to the caller but does not block the run.
 
 ### Requested models are authoritative
 

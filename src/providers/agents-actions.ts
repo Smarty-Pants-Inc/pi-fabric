@@ -43,7 +43,12 @@ const runProperties = {
   modelReason: {
     type: "string",
     maxLength: 200,
-    description: "Named exception for an explicit model selection, recorded on the run/actor and spawn event. Required and non-blank for agents.modelPolicy.requireReason (default gpt-6-astra on any provider); omit model to use the role default. See smarty-dev#3134.",
+    description: "Named exception for an explicit model selection, recorded on the run/actor and spawn event. Required and non-blank for agents.modelPolicy.requireReason (defaults: gpt-6-astra, opus, claude on any provider). Claude/Opus exceptions must name an issue (#N or an http(s) /issues/N URL); arbitrary reasons do not grant an exception. Omit model to use the role default. See smarty-dev#3134.",
+  },
+  opusReason: {
+    type: "string",
+    maxLength: 200,
+    description: "Compatibility alias for modelReason; modelReason wins when both are supplied. Claude/Opus exceptions must name an issue (#N or an http(s) /issues/N URL).",
   },
   persona: {
     type: "string",
@@ -531,6 +536,7 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
         kernel: runProperties.kernel,
         model: strictModelProperty,
         modelReason: runProperties.modelReason,
+        opusReason: runProperties.opusReason,
         thinking: runProperties.thinking,
         tools: runProperties.tools,
         transport: runProperties.transport,
@@ -760,6 +766,7 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
         id: { type: "string" },
         model: { type: "string" },
         modelReason: runProperties.modelReason,
+        opusReason: runProperties.opusReason,
         scope: actorBindingScopeSchema,
       },
       required: ["id"],

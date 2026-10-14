@@ -72,8 +72,10 @@ interface FabricAgentRequest {
   runner?: FabricAgentRunner;
   transport?: FabricTransport;
   model?: string;
-  /** Named exception: non-blank and ≤200 chars for explicit models in the host requireReason list. */
+  /** Named exception: non-blank and ≤200 chars. Defaults require reasons for gpt-6-astra, opus and claude; Claude/Opus must name an issue (#N or an http(s) /issues/N URL). */
   modelReason?: string;
+  /** Compatibility alias for modelReason; modelReason wins. Claude/Opus exceptions require an issue reference. */
+  opusReason?: string;
   persona?: string;
   thinking?: FabricThinking;
   /** Child thinking bounds; must lie inside this session's bounds. Levels outside are clamped. */
@@ -312,6 +314,8 @@ interface FabricTargetTerminalNotice {
   sender?: { id: string; kind: "main" | "actor" | "agent" | "remote"; name?: string; verified: "mesh" | "bridge" };
 }
 interface FabricAgentHandle {
+  /** Policy switch/audit diagnostics; warnings never override the run status. */
+  warnings?: string[];
   /** Durable answer boundary; does not confirm native worker/tree exit. */
   finalAnswerReceipt?: { id: string; recordedAt: number };
   /** Canonical Fabric release actually selected for this process child. */
@@ -795,8 +799,10 @@ interface FabricActorRequestBase {
   protected?: boolean;
   runner?: FabricAgentRunner;
   model?: string;
-  /** Named exception: non-blank and ≤200 chars for explicit models in the host requireReason list. */
+  /** Named exception: non-blank and ≤200 chars. Defaults require reasons for gpt-6-astra, opus and claude; Claude/Opus must name an issue (#N or an http(s) /issues/N URL). */
   modelReason?: string;
+  /** Compatibility alias for modelReason; modelReason wins. Claude/Opus exceptions require an issue reference. */
+  opusReason?: string;
   thinking?: FabricThinking;
   tools?: string[];
   transport?: FabricTransport;
@@ -1093,7 +1099,7 @@ interface FabricAgentsApi {
   createActor(args: FabricActorRequest): Promise<FabricActorInfo>;
   /** Main setModel (own or remote) is refused; deferred to smarty-dev#4153. Actor bindings are unchanged. */
   setModel(args: { id: \`session:\${string}\`; model?: string; scope?: "session" }): Promise<never>;
-  setModel<Id extends string>(args: { id: Id; model?: string; modelReason?: string; scope?: FabricActorBindingScope | "global" }): Promise<Id extends \`session:\${string}\` ? never : FabricActorInfo>;
+  setModel<Id extends string>(args: { id: Id; model?: string; modelReason?: string; opusReason?: string; scope?: FabricActorBindingScope | "global" }): Promise<Id extends \`session:\${string}\` ? never : FabricActorInfo>;
   switchModel(args: FabricModelSwitchRequest): Promise<FabricModelSwitchResult>;
   /** Only this session's own Main is supported; remote Main targets are refused. */
   setThinking(args: { id: \`session:\${string}\`; thinking: FabricThinking; scope?: "session" }): Promise<FabricMainAgentBindingResult>;

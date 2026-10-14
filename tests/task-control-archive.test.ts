@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { canRemoveTerminalRun, pruneActorRunArchives, runTreeExitVeto } from "../src/storage/retention.js";
-import { initializeTaskControlDirectory, legacyTaskControlSibling, MAX_FINAL_ANSWER_BYTES, readFinalAnswerReceipt, taskControlDirectory, withLegacyTaskControlDirectory } from "../src/worker/terminal-answer.js";
+import { initializeTaskControlDirectory, legacyTaskControlSibling, MAX_FINAL_ANSWER_BYTES, readFinalAnswerReceipt, routeControlFile, taskControlDirectory, withLegacyTaskControlDirectory, withRouteControlDirectory } from "../src/worker/terminal-answer.js";
 import { bytesOf, day, json, originalFiles, registerArchiveCleanup, removalPaths, setup, setupCurrent } from "./task-control-archive-fixtures.js";
 
 // Keep reason: trust boundary / data safety. Exercise the actual archive and
@@ -140,16 +140,40 @@ describe("actor archive paired task controls", () => {
     expect(removalPaths()).toEqual([]);
   });
 
-  it("keeps the durable route receipt and untouched source when archival completes", async () => {
+  it("keeps the durable central route receipt and untouched source when archival completes", async () => {
+    const f = setupCurrent("source-run");
+    const dispatch = { runId: f.alias, ledger: path.join(f.root, "ledger.jsonl"), decision: { decisionId: "dispatch", routeClass: "bounded-lookup", mode: "live" } };
+    withRouteControlDirectory(f.source, directory => fs.writeFileSync(path.join(directory, "route-dispatch-receipt.json"), JSON.stringify(dispatch), { mode: 0o600 }));
+    const sync = vi.spyOn(fs, "fsyncSync");
+    await f.store.retainRun(f.actor, f.alias, f.source);
+    expect(JSON.parse(fs.readFileSync(routeControlFile(f.archive, "route-dispatch-receipt.json"), "utf8"))).toEqual(dispatch);
+    expect(fs.existsSync(path.join(f.archive, "route-dispatch-receipt.json"))).toBe(false);
+    expect(JSON.parse(fs.readFileSync(routeControlFile(f.source, "route-dispatch-receipt.json"), "utf8"))).toEqual(dispatch);
+    expect(sync).toHaveBeenCalled();
+    expect(canRemoveTerminalRun(f.archive)).toBe(true);
+    expect(canRemoveTerminalRun(f.source)).toBe(true);
+  });
+  it("archives legacy in-run route evidence read-only into the archive central route/", async () => {
     const f = setupCurrent("source-run");
     const dispatch = { runId: f.alias, ledger: path.join(f.root, "ledger.jsonl"), decision: { decisionId: "dispatch", routeClass: "bounded-lookup", mode: "live" } };
     json(path.join(f.source, "route-dispatch-receipt.json"), dispatch);
-    const sync = vi.spyOn(fs, "fsyncSync");
+    const before = fs.readFileSync(path.join(f.source, "route-dispatch-receipt.json"));
     await f.store.retainRun(f.actor, f.alias, f.source);
-    expect(JSON.parse(fs.readFileSync(path.join(f.archive, "route-dispatch-receipt.json"), "utf8"))).toEqual(dispatch);
-    expect(JSON.parse(fs.readFileSync(path.join(f.source, "route-dispatch-receipt.json"), "utf8"))).toEqual(dispatch);
-    expect(sync).toHaveBeenCalled();
+    expect(JSON.parse(fs.readFileSync(routeControlFile(f.archive, "route-dispatch-receipt.json"), "utf8"))).toEqual(dispatch);
+    expect(fs.readFileSync(path.join(f.source, "route-dispatch-receipt.json"))).toEqual(before);
+    expect(fs.existsSync(path.join(taskControlDirectory(f.source), "route"))).toBe(false);
     expect(canRemoveTerminalRun(f.archive)).toBe(true);
+  });
+  it("preserves central pending outcome debt in both archive and source", async () => {
+    const f = setupCurrent("source-run");
+    const pending = JSON.stringify({ ledger: "/ledger.jsonl", record: { type: "outcome", decisionId: "dispatch" } });
+    withRouteControlDirectory(f.source, directory => fs.writeFileSync(path.join(directory, "pending-route-outcome.json"), pending, { mode: 0o600 }));
+    expect(canRemoveTerminalRun(f.source)).toBe(false);
+    await f.store.retainRun(f.actor, f.alias, f.source);
+    expect(fs.readFileSync(routeControlFile(f.archive, "pending-route-outcome.json"), "utf8")).toBe(pending);
+    expect(canRemoveTerminalRun(f.archive)).toBe(false);
+    expect(pruneActorRunArchives({ runsDirectory: path.dirname(f.archive), retentionMs: day, now: 10 * day, dryRun: true })).toEqual([]);
+    expect(removalPaths()).toEqual([]);
   });
 
   it("counts runs once: skips only validated old siblings and keeps unknown .ctl entries visible", async () => {

@@ -32,6 +32,21 @@ describe("CI Node runtime prerequisites", () => {
     expect(prerequisites.run).toContain("mkdir -p /tmp");
   });
 
+  it("requires isolated routed-control coverage on all three platforms", () => {
+    const workflow = parse(fs.readFileSync(new URL(".github/workflows/test.yml", root), "utf8"));
+    for (const name of ["check", "route-control-macos"]) {
+      const steps = workflow.jobs[name].steps as Step[];
+      const at = steps.findIndex(step => step.run?.includes("tests/task-control-*.test.ts"));
+      expect(at).toBeGreaterThan(steps.findIndex(step => step.run === "bun run build"));
+      expect(steps[at]!.run).toContain("tests/model-route*.test.ts");
+      expect(steps[at]!.run).toContain("tests/run-directory-mode.test.ts");
+      expect(steps[at]!.run).toContain("XDG_STATE_HOME must be an existing absolute directory");
+      expect(steps[at]!.run).toContain("XDG_STATE_HOME must be outside temp roots");
+      expect(steps[at]!.run).toContain("scripts/assert-route-test-skips.mjs");
+      expect(steps[at]!.env).toMatchObject({ XDG_STATE_HOME: "${{ github.workspace }}/.state", FABRIC_ROUTE_RESIDUAL_REQUIRED: "1" });
+    }
+    expect(workflow.jobs["route-control-macos"]["runs-on"]).toBe("macos-latest");
+  });
   it("runs the real-Pi extension-hidden-tools acceptance on Linux after the build (smarty-dev#5492)", () => {
     const { steps } = parse(fs.readFileSync(new URL(".github/workflows/test.yml", root), "utf8")).jobs.check as { steps: Step[] };
     const build = steps.findIndex((step) => step.run === "bun run build");

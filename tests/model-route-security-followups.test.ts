@@ -12,6 +12,7 @@ import { FabricRuntimeState } from "../src/fabric-runtime-state.js";
 import { registerFabricPrincipalCapture } from "../src/fabric-provenance.js";
 import { JevClient, JevCredentials } from "../src/jev/client.js";
 import { FABRIC_RUN_ROOT_PREFIX, markRunRootActive, markRunRootClosed, markUnresolvedWorker, sweepTempRunRoots } from "../src/storage/retention.js";
+import { routeControlFile } from "../src/worker/terminal-answer.js";
 
 const workerPath = path.resolve("dist/worker.js");
 const pin = { model: "openai-codex/gpt-5.6-sol", effort: "high" as const };
@@ -364,11 +365,13 @@ describe("SR-6 real routed worker artifacts are safely retained or collected", (
     expect(result.removedRuns).toEqual([run]); expect(result.removedRoots).toEqual([fixture.runRoot]);
     expect(fs.existsSync(run)).toBe(false);
   });
-  it.each(["pending", "live", "unresolved", "unknown", "unknown-sidecar", "delivery-unknown", "delivery-directory", "delivery-symlink", "delivery-hardlink", "deliveries-symlink", "provenance-symlink", "provenance-hardlink", "provenance-directory"])("keeps the %s veto with known artifacts present", async veto => {
+  it.each(["pending", "central-pending", "live", "unresolved", "unknown", "unknown-sidecar", "delivery-unknown", "delivery-directory", "delivery-symlink", "delivery-hardlink", "deliveries-symlink", "provenance-symlink", "provenance-hardlink", "provenance-directory"])("keeps the %s veto with known artifacts present", async veto => {
     const fixture = await setup(); const { run } = await fixture.spawn(); await fixture.runtime.shutdown();
     const deliveries = path.join(run, "deliveries"); const provenance = path.join(run, "task.txt.provenance.json");
     const target = path.join(fixture.cwd, "unowned-content"); fs.writeFileSync(target, "must survive");
+    // Deliberate legacy custody negative, plus the current central pending outcome.
     if (veto === "pending") fs.writeFileSync(path.join(run, "pending-route-outcome.json"), "{}");
+    if (veto === "central-pending") { const pending = routeControlFile(run, "pending-route-outcome.json"); fs.mkdirSync(path.dirname(pending), { recursive: true, mode: 0o700 }); fs.writeFileSync(pending, "{}", { mode: 0o600 }); }
     if (veto === "live") { const file = path.join(run, "status.json"); const record = JSON.parse(fs.readFileSync(file, "utf8")); fs.writeFileSync(file, JSON.stringify({ ...record, transport: "process", sessionId: String(process.pid) })); }
     if (veto === "unresolved") markUnresolvedWorker(run, "worker not joined");
     if (veto === "unknown") fs.writeFileSync(path.join(run, "unknown.txt"), "keep");

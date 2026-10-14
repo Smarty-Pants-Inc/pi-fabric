@@ -11,7 +11,7 @@ import { recoverActorRunArchives } from "../actors/child-completions.js";
 import { recoverEnodevTaskRun } from "../agents/enodev-recovery.js";
 import { copyFabricProvenance } from "../fabric-provenance.js";
 import { readTerminalControl } from "../worker/terminal-controls.js";
-import { readFinalAnswerReceipt, openTaskControlFile, statDir, MAX_TASK_CONTROL_BYTES, isTaskControlDirectoryEntry, legacyTaskControlSibling, taskControlDirectory, taskControlReadDirectory, withTaskControlDirectory, withTaskControlReadDirectory, withLegacyTaskControlDirectories } from "../worker/terminal-answer.js";
+import { readFinalAnswerReceipt, openTaskControlFile, statDir, MAX_TASK_CONTROL_BYTES, ROUTE_CONTROL_FILES, ROUTE_CONTROL_SUBDIR, routeControlFile, withTaskControlSubdirectory, isTaskControlDirectoryEntry, legacyTaskControlSibling, taskControlDirectory, taskControlReadDirectory, withTaskControlDirectory, withTaskControlReadDirectory, withLegacyTaskControlDirectories } from "../worker/terminal-answer.js";
 import { MAX_STEER_CONTROLS, MAX_STEER_BYTES, MAX_STEER_ENTRY_BYTES, readTerminalAdmission, terminalAdmissionFromEntry, terminalControlMatchesAdmission, terminalSenderMatches, type TerminalAdmission } from "../agents/terminal-notices.js";
 
 export const FABRIC_RUN_ROOT_PREFIX = "pi-fabric-runs-";
@@ -324,6 +324,43 @@ const readPinnedTerminalFile = (file: string, maxBytes: number, expired: Deadlin
     }
   } finally { fs.closeSync(fd); }
 };
+/** Central route controls are bounded custody evidence, not independent retention roots. */
+const routeControlNames: ReadonlySet<string> = new Set<string>(ROUTE_CONTROL_FILES);
+// Mirror readRouteDispatchReceipt's shape without importing model-route into retention's eager graph.
+const validRouteReceipt = (text: string | undefined, runId: string): boolean => {
+  const rows = text?.split("\n").filter(line => line.trim());
+  if (rows?.length !== 1) return false;
+  type Receipt = { runId?: unknown; ledger?: unknown; decision?: { decisionId?: unknown; routeClass?: unknown; mode?: unknown; revertReset?: unknown } | null } | null;
+  const receipt = JSON.parse(rows[0]!) as Receipt, decision = receipt?.decision;
+  return !!receipt && typeof receipt === "object" && !Array.isArray(receipt) && receipt.runId === runId && typeof receipt.ledger === "string" &&
+    !!decision && typeof decision === "object" && typeof decision.decisionId === "string" &&
+    typeof decision.routeClass === "string" && /^[a-z][a-z0-9:-]{0,63}$/.test(decision.routeClass) &&
+    ["live", "shadow", "judgment"].includes(String(decision.mode)) &&
+    (decision.revertReset === undefined || typeof decision.revertReset === "string" && decision.revertReset.length <= 128);
+};
+const routeSelection = (run: string): "central" | "legacy" => {
+  const receipt = routeControlFile(run, "route-dispatch-receipt.json", { legacyReadOnly: true });
+  const session = routeControlFile(run, "route-session.jsonl", { legacyReadOnly: true });
+  if (path.dirname(receipt) !== path.dirname(session)) throw new Error("Inconsistent route control selection");
+  return path.dirname(receipt) === path.resolve(run) ? "legacy" : "central";
+};
+const safeRouteControls = (parent: string, runId: string, expired: Deadline): boolean => withTaskControlSubdirectory(parent, ROUTE_CONTROL_SUBDIR, (route, fd) => {
+  const held = statDir(fd, route);
+  if (!held.isDirectory() || process.platform !== "win32" && (held.mode & 0o077n) !== 0n) return false;
+  const cursor = fs.opendirSync(route, { bufferSize: 8 });
+  try {
+    let count = 0;
+    for (;;) {
+      if (expired()) return false;
+      const entry = cursor.readSync();
+      if (!entry) return !expired();
+      if (++count > routeControlNames.size || !routeControlNames.has(entry.name) || entry.name === "pending-route-outcome.json") return false;
+      fs.closeSync(openTaskControlFile(path.join(route, entry.name)));
+      if (entry.name === "route-session.jsonl") continue;
+      if (!validRouteReceipt(readPinnedTerminalFile(path.join(route, entry.name), MAX_TASK_CONTROL_BYTES, expired), runId)) return false;
+    }
+  } finally { cursor.closeSync(); }
+});
 const terminalArtifactFiles = new Set(["steer.jsonl", "final-answer.json"]);
 const terminalArtifactDirectories = new Set(["terminal-controls", "terminal-notices"]);
 /** A refusal journal is not a sender route receipt. Unconsumed admissions need
@@ -360,16 +397,24 @@ const safeSelectedTerminalArtifacts = (root: string, selected: string, sources: 
     // A private sibling is not an unlimited artifact allowlist. Interrupted
     // staging/locks, unknown names, links and nonregular artifacts retain custody.
     // A raw pre-v2 run's other entries are judged by safeRunTree's run-root allowlist.
+    const routeSelected = routeSelection(root), runId = path.basename(path.resolve(root));
+    if (routeSelected === "legacy") {
+      const legacyReceipt = path.join(root, "route-dispatch-receipt.json");
+      if (fs.lstatSync(legacyReceipt, { throwIfNoEntry: false }) && !validRouteReceipt(readPinnedTerminalFile(legacyReceipt, MAX_TASK_CONTROL_BYTES, expired), runId)) return false;
+    } else if (rawRun) return false;
+    let sawRoute = false;
     if (!rawRun) for (const name of fs.readdirSync(selected)) {
       if (expired()) return false;
       const stat = ownedStat(path.join(selected, name));
       if (!stat || !(terminalArtifactFiles.has(name) && stat.isFile() || terminalArtifactDirectories.has(name) && stat.isDirectory() ||
+          name === ROUTE_CONTROL_SUBDIR && stat.isDirectory() && routeSelected === "central" && (sawRoute = true) && safeRouteControls(selected, runId, expired) ||
           // Main's stale-lock proof, applied where the protected writer now holds the lock.
           name === TASK_FINAL_ANSWER_LOCK && stat.isDirectory() && TERMINAL_STATUSES.has(readJson<RunRecordSummary>(path.join(root, "status.json"))?.status ?? "") &&
             safeStaleFinalAnswerLock(path.join(selected, name)) ||
           // Reserved names only after kernel validation of binding and snapshot.
           name === ".legacy-read.json" && stat.isFile() || name === ".legacy-snapshot" && sources.length > 0 && stat.isDirectory())) return false;
     }
+    if (!rawRun && (routeSelected === "central") !== sawRoute) return false;
   }
   // Sender views may omit malformed/duplicate rows; omission is never retention
   // authority. Preserve main's strict original-admission judgment with the same
@@ -635,7 +680,11 @@ const runControlRemovals = (directory: string): ControlRemoval[] | undefined => 
     const stat = fs.lstatSync(central, { throwIfNoEntry: false });
     if (stat) {
       if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("Refusing linked or non-directory task control path");
-      withTaskControlDirectory(run, () => undefined);
+      withTaskControlDirectory(run, directory => {
+        if (routeSelection(run) === "central" && !safeRouteControls(directory, path.basename(path.resolve(run)), noDeadline)) {
+          throw new Error("Unsafe, unknown or pending route controls");
+        }
+      });
       // Snapshot children go with the central removal; validate them, never plan them separately.
       withLegacyTaskControlDirectories(run, () => undefined);
       removals.push({ path: central, stat });

@@ -9,14 +9,14 @@ import { ProcessTransport } from "../src/agents/transports/process-transport.js"
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import {
   FabricTaskControlDirectoryError, createHostTaskRun, ensureTaskControlRoot, readFinalAnswerReceipt, readTaskControlJson,
-  removeTaskControlFile, saveFinalAnswerReceipt, taskControlDirectory, withLegacyTaskControlDirectories, writeTaskControlJson,
+  removeTaskControlFile, routeControlFile, saveFinalAnswerReceipt, taskControlDirectory, withLegacyTaskControlDirectories, writeTaskControlJson,
 } from "../src/worker/terminal-answer.js";
 
 // Fresh grant after the 115079e62 audit (smarty-dev#11772). Real filesystem only, no mocked fs:
 //  P1  A routed `bindSession` returns the published route-session path plus the file identity ({dev,ino}).
 //      The real built worker (dist/worker.js, launched by a real AgentManager through ProcessTransport) gets
-//      `--session-file-identity` and `--session-directory-fd 4`. It must refuse with a typed error when the
-//      session name was swapped (symlink or rename/swap) after bind and before worker validation, and every
+//      `--session-file-identity` and the central path (no manager directory-fd handoff). It refuses when the
+//      central session leaf or run binding was swapped before worker validation, and every
 //      swapped-in target must stay byte-for-byte unchanged. The ProcessTransport.launch spy only passes the
 //      call through: it applies the parent-granted swap and then calls the real launch.
 //  P2  Public control write/remove refuse every colon-bearing (Win32 NTFS alternate-data-stream) name around
@@ -28,8 +28,8 @@ const isolatedState = process.env.XDG_STATE_HOME;
 const insideTemp = (value: string) => [os.tmpdir(), process.env.TMPDIR].filter(Boolean)
   .some(temp => path.resolve(value) === path.resolve(temp!) || path.resolve(value).startsWith(path.resolve(temp!) + path.sep));
 const usableState = !!isolatedState && path.isAbsolute(isolatedState) && !insideTemp(isolatedState);
-// Routed publication needs a traversable held directory fd. On Linux that is /proc/self/fd, as in the manager.
-const usableRoute = process.platform === "linux" && fs.existsSync("/proc/self/fd");
+// Central publication is platform-neutral; Linux alone keeps the checked file-fd handoff to Pi.
+const usableRoute = usableState;
 const originalState = process.env.XDG_STATE_HOME;
 const managers: AgentManager[] = [];
 afterEach(async () => {
@@ -74,12 +74,12 @@ const pinFor = (run: string): RunDirectoryPin => {
   return {
     run,
     use(operation) {
-      const fd = fs.openSync(run, NOFOLLOW_DIRECTORY);
+      const fd = process.platform === "win32" ? undefined : fs.openSync(run, NOFOLLOW_DIRECTORY);
       try {
-        const current = fs.fstatSync(fd, { bigint: true });
-        if (current.dev !== bound.dev || current.ino !== bound.ino) throw Object.assign(new Error("run identity changed"), { code: RUN_IDENTITY_REFUSED });
-        return operation(`/proc/self/fd/${fd}`, fd);
-      } finally { fs.closeSync(fd); }
+        const current = fd === undefined ? fs.lstatSync(run, { bigint: true }) : fs.fstatSync(fd, { bigint: true });
+        if (current.isSymbolicLink() || fs.realpathSync(run) !== path.resolve(run) || current.dev !== bound.dev || current.ino !== bound.ino) throw Object.assign(new Error("run identity changed"), { code: RUN_IDENTITY_REFUSED });
+      } finally { if (fd !== undefined) fs.closeSync(fd); }
+      return operation();
     },
   };
 };
@@ -90,13 +90,14 @@ const decisionFor = () => {
     shadowChoice: pin, confidence: null, probability: null, reasonCode: "shadow-choice", latencyMs: 0, ...pin };
 };
 const bindFixture = () => {
+  stateCase();
   const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "route-session-identity-")));
   const run = path.join(base, "granted", "run");
-  fs.mkdirSync(run, { recursive: true, mode: 0o700 });
+  createHostTaskRun(run);
   return { base, run, ledger: path.join(base, "ledger.jsonl"), cwd: path.join(base, "worktree") };
 };
 const expectBinding = (bound: Binding, run: string, cwd: string) => {
-  expect(bound).toMatchObject({ path: path.join(run, SESSION), identity: { dev: expect.stringMatching(DECIMAL), ino: expect.stringMatching(DECIMAL) } });
+  expect(bound).toMatchObject({ path: routeControlFile(run, SESSION), identity: { dev: expect.stringMatching(DECIMAL), ino: expect.stringMatching(DECIMAL) } });
   const stat = fs.lstatSync(bound.path, { bigint: true });
   expect(stat.isFile() && !stat.isSymbolicLink()).toBe(true);
   expect(stat.nlink).toBe(1n);
@@ -104,7 +105,15 @@ const expectBinding = (bound: Binding, run: string, cwd: string) => {
   expect(sameIdentity(bound.identity, stat), "identity is the published inode, not the temp's or the directory's").toBe(true);
   const header = JSON.parse(fs.readFileSync(bound.path, "utf8").split("\n")[0]!) as Record<string, unknown>;
   expect(header).toMatchObject({ type: "session", id: "child-id", cwd });
-  expect(fs.readdirSync(run).some(name => name.endsWith(".tmp"))).toBe(false);
+  expect(fs.readdirSync(path.dirname(bound.path)).some(name => name.endsWith(".tmp"))).toBe(false);
+  expect(routeFilesIn(run)).toEqual([]);
+};
+const routeFilesIn = (root: string): string[] => {
+  if (!fs.existsSync(root)) return [];
+  return fs.readdirSync(root, { withFileTypes: true }).flatMap(entry => {
+    const full = path.join(root, entry.name);
+    return [...(/route-(dispatch-receipt|session)|pending-route-outcome/.test(entry.name) ? [full] : []), ...(entry.isDirectory() && !entry.isSymbolicLink() ? routeFilesIn(full) : [])];
+  });
 };
 
 describe.skipIf(!usableRoute)("P1: bindSession returns the routed session path plus its file identity", () => {
@@ -133,6 +142,11 @@ const argv = process.argv.slice(2);
 const at = argv.indexOf("--session");
 const file = at >= 0 ? argv[at + 1] : undefined;
 let record = { type: "fake_pi_session", file: file ?? null };
+const leaf = process.env.FAKE_PI_LEAF_SWAP;
+if (file && leaf) {
+  fs.renameSync(leaf, leaf + ".aside");
+  fs.writeFileSync(leaf, "FORGED-SESSION\\n", { mode: 0o600, flag: "wx" });
+}
 if (file) {
   try {
     fs.appendFileSync(file, JSON.stringify({ type: "fake_pi_session_probe" }) + "\\n");
@@ -144,7 +158,7 @@ if (process.env.FAKE_SESSION_PROBE) fs.appendFileSync(process.env.FAKE_SESSION_P
 await import(${JSON.stringify(pathToFileURL(FAKE_PI_ROUTE).href)});
 `;
 type SwapContext = { run: string; victimFile: string; victimDir: string };
-type Swap = { kind: string; scope: "leaf" | "directory"; apply: (context: SwapContext, file: string) => { target: string } };
+type Swap = { kind: string; scope: "leaf" | "directory" | "planted"; apply: (context: SwapContext, file: string) => { target: string } };
 /** Parent-granted mutations after bindSession and before the worker validates. `target` is what the swapped name now points at. */
 const swaps: Swap[] = [
   { kind: "session file replaced by a symlink to a victim file outside the grant", scope: "leaf", apply: (c, file) => {
@@ -159,7 +173,7 @@ const swaps: Swap[] = [
     fs.linkSync(file, `${file}.moved`); fs.renameSync(staged, file); return { target: file };
   } },
   { kind: "run directory replaced by a symlink to a victim directory that has a session name", scope: "directory", apply: (c) => {
-    fs.renameSync(c.run, `${c.run}.moved`); fs.symlinkSync(c.victimDir, c.run, "dir"); return { target: path.join(c.victimDir, SESSION) };
+    fs.renameSync(c.run, `${c.run}.moved`); fs.symlinkSync(c.victimDir, c.run, process.platform === "win32" ? "junction" : "dir"); return { target: path.join(c.victimDir, SESSION) };
   } },
   { kind: "run directory replaced by a real directory holding a fresh session file", scope: "directory", apply: (c) => {
     fs.renameSync(c.run, `${c.run}.moved`); fs.mkdirSync(c.run, { mode: 0o700 });
@@ -168,6 +182,7 @@ const swaps: Swap[] = [
 ];
 type Launch = Parameters<ProcessTransport["launch"]>[0];
 const workerFixture = () => {
+  stateCase();
   ensureTaskControlRoot();
   const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "route-session-worker-")));
   const { victimFile, victimDir } = victims(base);
@@ -191,13 +206,13 @@ const workerFixture = () => {
     : [];
   return { base, victimFile, victimDir, manager, request, probes };
 };
-type Seen = { args: string[]; sessionFile: string; identityArgument: string | undefined; directoryFdArgument: string | undefined; inheritFds: number[] | undefined;
+type Seen = { args: string[]; run: string; sessionFile: string; identityArgument: string | undefined; directoryFdArgument: string | undefined; inheritFds: number[] | undefined;
   bound: fs.BigIntStats; bytes: Buffer; target?: string; watched?: string[]; before?: unknown[] };
 /**
  * Pass-through launch seam: it records the real launch request, applies the swap (if any) after the manager's
  * bind and before the worker starts, snapshots the victims, and then calls the real ProcessTransport.launch.
  */
-const interceptLaunch = (f: ReturnType<typeof workerFixture>, swap?: Swap, writer: "pi" | "claude" = "pi") => {
+const interceptLaunch = (f: ReturnType<typeof workerFixture>, swap?: Swap, writer: "pi" | "claude" = "pi", leafSwap = false) => {
   const seen: { value?: Seen } = {};
   const original = ProcessTransport.prototype.launch;
   vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async function (this: ProcessTransport, request: Launch) {
@@ -209,13 +224,17 @@ const interceptLaunch = (f: ReturnType<typeof workerFixture>, swap?: Swap, write
     const value = (flag: string) => { const index = args.indexOf(flag); return index >= 0 ? args[index + 1] : undefined; };
     const sessionFile = value("--session-file")!;
     expect(sessionFile, "routed launch carries --session-file").toBeTruthy();
-    const record: Seen = { args: [...args], sessionFile, identityArgument: value("--session-file-identity"), directoryFdArgument: value("--session-directory-fd"),
+    const run = path.dirname(value("--status-file")!);
+    expect(sessionFile).toBe(routeControlFile(run, SESSION));
+    expect(routeFilesIn(run)).toEqual([]);
+    if (leafSwap) vi.stubEnv("FAKE_PI_LEAF_SWAP", sessionFile);
+    const record: Seen = { args: [...args], run, sessionFile, identityArgument: value("--session-file-identity"), directoryFdArgument: value("--session-directory-fd"),
       inheritFds: (request as Launch & { inheritFds?: number[] }).inheritFds, bound: fs.lstatSync(sessionFile, { bigint: true }), bytes: fs.readFileSync(sessionFile) };
     seen.value = record;
     if (swap) {
-      const { target } = swap.apply({ run: path.dirname(sessionFile), victimFile: f.victimFile, victimDir: f.victimDir }, sessionFile);
+      const { target } = swap.apply({ run, victimFile: f.victimFile, victimDir: f.victimDir }, sessionFile);
       record.target = target;
-      record.watched = [target, f.victimFile, path.join(f.victimDir, SESSION), path.join(f.victimDir, "marker"), `${sessionFile}.moved`, path.join(`${path.dirname(sessionFile)}.moved`, SESSION)];
+      record.watched = [target, f.victimFile, path.join(f.victimDir, SESSION), path.join(f.victimDir, "marker"), `${sessionFile}.moved`, path.join(`${run}.moved`, SESSION)];
       record.before = record.watched.map(snapshot);
     }
     return original.call(this, request);
@@ -231,7 +250,7 @@ const settle = async (f: ReturnType<typeof workerFixture>) => {
 };
 /** Where the original bound session now lives: renamed aside, or inside the moved run directory. */
 const movedOriginal = (sessionFile: string) =>
-  fs.existsSync(`${sessionFile}.moved`) ? `${sessionFile}.moved` : path.join(`${path.dirname(sessionFile)}.moved`, SESSION);
+  fs.existsSync(`${sessionFile}.moved`) ? `${sessionFile}.moved` : sessionFile;
 
 describe.skipIf(!usableRoute || !usableState || !fs.existsSync(WORKER))("P1: the real built worker revalidates the bound route session before use", () => {
   it("counterexample: an unswapped routed session passes worker validation and the runner appends to the bound inode", { timeout: 60_000 }, async () => {
@@ -241,10 +260,11 @@ describe.skipIf(!usableRoute || !usableState || !fs.existsSync(WORKER))("P1: the
     expect(error, text).toBeUndefined();
     expect(result!.status, text).toBe("completed");
     const launch = seen.value!;
-    // The manager passed the bound identity and the inherited run-directory fd slot.
+    // The worker opens central route/ itself; the manager only sends identity.
     expect(JSON.parse(launch.identityArgument!)).toEqual({ dev: String(launch.bound.dev), ino: String(launch.bound.ino) });
-    expect(launch.directoryFdArgument).toBe("4");
-    expect(launch.inheritFds).toHaveLength(1);
+    expect(launch.directoryFdArgument).toBeUndefined();
+    expect(launch.inheritFds ?? []).toEqual([]);
+    expect(routeFilesIn(launch.run)).toEqual([]);
     // The runner's append landed in the bound inode, after the intact header.
     const records = f.probes();
     expect(records).toHaveLength(1);
@@ -277,28 +297,24 @@ describe.skipIf(!usableRoute || !usableState || !fs.existsSync(WORKER))("P1: the
     expect(f.probes()).toHaveLength(1);
   });
 
-  it("startup retry re-pins and opens a live descriptor for each launch; plain spawns inherit none", { timeout: 60_000 }, async () => {
+  it("startup retry checks identity for every launch without manager directory fds", { timeout: 60_000 }, async () => {
+    stateCase();
     const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "route-session-retry-")));
     const manager = new AgentManager(base, { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, deniedModels: [], retainRuns: true }, {
       workerPath: path.resolve("tests/fixtures/fake-worker-startup-retry.mjs"), runRoot: path.join(base, "runs"), fullCodeMode: false,
     });
     managers.push(manager);
     const original = ProcessTransport.prototype.launch;
-    const routedDescriptors: number[] = [];
+    let routedLaunches = 0;
     vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async function (this: ProcessTransport, request: Launch) {
-      if (request.workerArguments.includes("--session-file-identity")) {
-        expect(request.inheritFds).toHaveLength(1);
-        const fd = request.inheritFds![0]!;
-        expect(fs.fstatSync(fd).isDirectory()).toBe(true);
-        routedDescriptors.push(fd);
-      } else expect(request.inheritFds).toBeUndefined();
+      expect(request.inheritFds).toBeUndefined();
+      expect(request.workerArguments).not.toContain("--session-directory-fd");
+      if (request.workerArguments.includes("--session-file-identity")) routedLaunches++;
       return original.call(this, request);
     });
     const result = await manager.run({ task: "Recover startup", transport: "process", routeDecision: decisionFor() } as never);
     expect(result.status).toBe("completed");
-    expect(routedDescriptors).toHaveLength(2);
-    // Every manager-owned copy was closed when its spawn returned.
-    for (const fd of new Set(routedDescriptors)) expect(() => fs.fstatSync(fd)).toThrow();
+    expect(routedLaunches).toBe(2);
     expect((await manager.run({ task: "plain", transport: "process" })).status).toBe("completed");
   });
 
@@ -322,9 +338,7 @@ describe.skipIf(!usableRoute || !usableState || !fs.existsSync(WORKER))("P1: the
     });
   }
 
-  // When the run DIRECTORY is swapped, the worker validates the leaf through the inherited fd of the ORIGINAL
-  // directory. A typed refusal is therefore not required. What is required, in the session scope, is that no
-  // session byte reaches the swapped-in target: any runner append lands only in the bound inode.
+  // A pre-open C swap invalidates the strict central binding: typed refusal, no runner start.
   for (const writer of ["pi", "claude"] as const) for (const swap of swaps.filter(candidate => candidate.scope === "directory")) {
     it(`${writer}: never writes the session through a swapped run directory: ${swap.kind}`, { timeout: 60_000 }, async () => {
       const f = workerFixture();
@@ -339,12 +353,35 @@ describe.skipIf(!usableRoute || !usableState || !fs.existsSync(WORKER))("P1: the
         expect(record.error, `runner session open failed instead of using the bound inode: ${JSON.stringify(record)}`).toBeUndefined();
         expect(sameIdentity(record as { dev: string; ino: string }, launch.bound), `runner appended outside the bound inode: ${JSON.stringify(record)}`).toBe(true);
       }
-      if (result?.status !== "completed") expect(text).toMatch(REFUSED);
+      expect(result?.status, text).not.toBe("completed");
+      expect(text).toMatch(/FABRIC_(ROUTE_SESSION|RUN)_IDENTITY_REFUSED|RouteSessionIdentityRefused/);
+      expect(f.probes()).toEqual([]);
       const original = movedOriginal(launch.sessionFile);
       expect(fs.readFileSync(original).subarray(0, launch.bytes.length).equals(launch.bytes)).toBe(true);
       expect(sameIdentity({ dev: launch.bound.dev, ino: launch.bound.ino }, fs.lstatSync(original, { bigint: true }))).toBe(true);
     });
   }
+});
+
+// Linux keeps the verified session-file fd through Pi's open. W-1 explicitly waives this on macOS/Windows.
+describe.skipIf(!usableRoute || !fs.existsSync(WORKER))("P1b: central route session handoff", () => {
+  it.skipIf(process.platform !== "linux")("post-verification leaf swap: original inode receives Pi marker; forged leaf unchanged (waiver W-1 (design §3); Pi gets the plain central path off Linux)", { timeout: 60_000 }, async () => {
+    const f = workerFixture();
+    const seen = interceptLaunch(f, undefined, "pi", true);
+    const { text } = await settle(f);
+    const launch = seen.value!;
+    const aside = `${launch.sessionFile}.aside`;
+    expect(fs.existsSync(aside), `fake Pi performed the swap: ${text}`).toBe(true);
+    expect(sameIdentity({ dev: launch.bound.dev, ino: launch.bound.ino }, fs.lstatSync(aside, { bigint: true }))).toBe(true);
+    const original = fs.readFileSync(aside, "utf8");
+    expect(original.startsWith(launch.bytes.toString("utf8"))).toBe(true);
+    expect(original).toContain("fake_pi_session_probe");
+    expect(fs.readFileSync(launch.sessionFile, "utf8")).toBe("FORGED-SESSION\n");
+    const records = f.probes();
+    expect(records).toHaveLength(1);
+    expect(sameIdentity(records[0]! as { dev: string; ino: string }, launch.bound)).toBe(true);
+    expect(routeFilesIn(launch.run)).toEqual([]);
+  });
 });
 
 // ---- P2: colon-bearing (NTFS ADS) public control names -----------------------------------------------

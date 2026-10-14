@@ -11,7 +11,7 @@ import { ProcessTransport } from "../src/agents/transports/process-transport.js"
 import { normalizeAgentRunRequest } from "../src/agents/request.js";
 import { normalizeFabricConfig, DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import type { JevResponse } from "../src/jev/types.js";
-import { taskControlDirectory } from "../src/worker/terminal-answer.js";
+import { createHostTaskRun, routeControlFile, taskControlDirectory } from "../src/worker/terminal-answer.js";
 
 // Keep native spawn, but own its exact child/close event before launch returns.
 // Transport liveness can report exit before Windows releases the cwd handle.
@@ -295,7 +295,8 @@ describe("durable route dispatch", () => {
     const result = await manager.run({ task: "lookup", routeDecision: await decideModelRoute(input, async () => response()) });
     const runRoot = path.dirname(manager.runDirectory(result.id)!);
     roots.push(runRoot);
-    expect(fs.existsSync(path.join(runRoot, result.id, "route-session.jsonl"))).toBe(true);
+    expect(fs.existsSync(routeControlFile(path.join(runRoot, result.id), "route-session.jsonl"))).toBe(true);
+    expect(fs.existsSync(path.join(runRoot, result.id, "route-session.jsonl")), "never in the run directory").toBe(false);
     await manager.close();
     expect(fs.existsSync(runRoot)).toBe(false);
   });
@@ -395,7 +396,8 @@ describe("durable route dispatch", () => {
     expect(result.warnings?.join(" ")).toContain("retained");
     await expect(manager.cleanup(queued.id)).rejects.toThrow("retained");
     expect(manager.list().some(run => run.id === queued.id)).toBe(true);
-    const pendingFile = path.join(dir, "runs", queued.id, "pending-route-outcome.json");
+    const pendingFile = routeControlFile(path.join(dir, "runs", queued.id), "pending-route-outcome.json");
+    expect(fs.existsSync(path.join(dir, "runs", queued.id, "pending-route-outcome.json")), "never in the run directory").toBe(false);
     expect(JSON.parse(fs.readFileSync(pendingFile, "utf8")).record).toMatchObject({ decisionId: decision.decisionId, status: "stopped" });
     broken = false; await manager.cleanup(queued.id); await manager.stop(blocker.id);
     expect(fs.existsSync(pendingFile)).toBe(false);
@@ -425,7 +427,8 @@ describe("durable route dispatch", () => {
     vi.spyOn(fs, "openSync").mockImplementation((file, flags, mode) => { if (String(file).endsWith("model-routing.jsonl")) { attempts++; throw new Error("persistent append failure"); } return open(file, flags, mode); });
     await manager.stop(queued.id); expect(attempts).toBe(3);
     await manager.close(); expect(attempts).toBe(6);
-    expect(JSON.parse(fs.readFileSync(path.join(dir, "runs", queued.id, "pending-route-outcome.json"), "utf8"))).toMatchObject({ ledger: ledgerFile(), record: { decisionId: decision.decisionId, status: "stopped" } });
+    expect(fs.existsSync(path.join(dir, "runs", queued.id, "pending-route-outcome.json")), "never in the run directory").toBe(false);
+    expect(JSON.parse(fs.readFileSync(routeControlFile(path.join(dir, "runs", queued.id), "pending-route-outcome.json"), "utf8"))).toMatchObject({ ledger: ledgerFile(), record: { decisionId: decision.decisionId, status: "stopped" } });
     await expect(manager.cleanup(queued.id)).rejects.toThrow("retained");
   });
   it("writes and fsyncs decision before launch, seeds child identity and appends terminal outcome once", async () => {
@@ -521,23 +524,37 @@ describe("durable route dispatch", () => {
   it("never passes a partially written seed session after record failure", async () => {
     const dir = root();
     const decision = await decideModelRoute(input, async () => response());
-    const write = fs.writeFileSync;
+    const run = path.join(dir, "run");
+    createHostTaskRun(run);
+    const open = fs.openSync, write = fs.writeFileSync;
+    const sessionTemps = new Set<number>();
+    vi.spyOn(fs, "openSync").mockImplementation(((file: fs.PathLike, flags?: fs.OpenMode, mode?: fs.Mode) => {
+      const fd = open(file, flags ?? "r", mode);
+      if (/\.route-session\.jsonl\.[^/\\]*\.tmp$/.test(String(file))) sessionTemps.add(fd);
+      return fd;
+    }) as typeof fs.openSync);
+    let faulted = 0;
     vi.spyOn(fs, "writeFileSync").mockImplementation((file, data, options) => {
-      if (typeof file === "string" && file.endsWith("route-session.jsonl")) {
-        write(file, "partial"); throw new Error("disk full");
+      if (typeof file === "number" && sessionTemps.has(file)) {
+        faulted++; write(file, "partial"); throw new Error("disk full");
       }
       return write(file, data, options);
     });
-    const prepared = prepareRouteDispatch(decision, dir, path.join(dir, "run"), "child");
+    const prepared = prepareRouteDispatch(decision, dir, run, "child");
+    expect(faulted, "the fault hit the numeric-fd central publisher").toBe(1);
     expect(prepared.sessionFile).toBeUndefined();
+    const route = path.dirname(routeControlFile(run, "route-session.jsonl"));
+    expect(fs.existsSync(route) ? fs.readdirSync(route) : []).toEqual([]);
+    expect(fs.readdirSync(run)).toEqual([]);
     expect(prepared.header).toContain("record-failed:");
     expect(decision).toMatchObject({ ...pin, reasonCode: "record-failed" });
   });
   it("supports late outcome joins after a failed record, and idempotent terminal append", async () => {
     const dir = root();
-    const runDir = path.join(dir, "run"); fs.mkdirSync(runDir);
+    const runDir = path.join(dir, "run"); createHostTaskRun(runDir);
     const decision = await decideModelRoute(input, async () => response());
     const prepared = prepareRouteDispatch(decision, dir, runDir, "child-id");
+    expect(fs.readdirSync(runDir), "no route control in the run directory").toEqual([]);
     prepared.outcome({ status: "failed" }); prepared.outcome({ status: "failed" });
     const rows = fs.readFileSync(ledgerFile(), "utf8").trim().split("\n");
     expect(rows).toHaveLength(2);

@@ -18,7 +18,7 @@ import {
 import { markUnresolvedWorker } from "../src/storage/retention.js";
 import * as retentionStorage from "../src/storage/retention.js";
 import { writeJsonAtomic } from "../src/core/atomic-write.js";
-import { taskSteerFile } from "../src/worker/terminal-answer.js";
+import { routeControlFile, taskSteerFile } from "../src/worker/terminal-answer.js";
 import {
   clearOwnedBudgetEnv,
   readBudgetLedgerDetailed,
@@ -403,7 +403,7 @@ describe("AgentManager fleet model admission (#2490)", () => {
 });
 
 describe("AgentManager", () => {
-  it.each(["pending", "empty", "outcome", "live", "link", "unknown"] as const)("R-1 active-manager expiry applies the terminal-tree gate (%s)", async (contents) => {
+  it.each(["pending", "empty", "outcome", "central-outcome", "live", "link", "unknown"] as const)("R-1 active-manager expiry applies the terminal-tree gate (%s)", async (contents) => {
     let sweep: (() => void) | undefined;
     const interval = globalThis.setInterval;
     const timer = vi.spyOn(globalThis, "setInterval").mockImplementation(((callback: () => void, ms?: number, ...args: unknown[]) => {
@@ -432,7 +432,13 @@ describe("AgentManager", () => {
       const deliveries = path.join(run, "deliveries");
       fs.mkdirSync(deliveries);
       if (contents === "pending") fs.writeFileSync(path.join(deliveries, "ingress.json"), JSON.stringify({ message: "not consumed" }));
+      // Deliberate legacy custody negative: a pre-#12444 in-run pending outcome still vetoes.
       if (contents === "outcome") fs.writeFileSync(path.join(run, "pending-route-outcome.json"), "{}");
+      if (contents === "central-outcome") {
+        const pending = routeControlFile(run, "pending-route-outcome.json");
+        fs.mkdirSync(path.dirname(pending), { mode: 0o700 });
+        fs.writeFileSync(pending, "{}", { mode: 0o600, flag: "wx" });
+      }
       if (contents === "live") {
         const child = path.join(run, "nested", "live-child");
         fs.mkdirSync(child, { recursive: true });

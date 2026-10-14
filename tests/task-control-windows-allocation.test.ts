@@ -2,11 +2,9 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { AgentManager, managerRunTestHooks } from "../src/agents/manager.js";
-import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
+import { prepareRouteDispatch } from "../src/agents/model-route.js";
 import { privateDirTestHooks } from "../src/storage/private-dir.js";
-import { ProcessTransport } from "../src/agents/transports/process-transport.js";
-import { createHostTaskRun, ensureTaskControlRoot, readFinalAnswerReceipt, readTaskControlJson, saveFinalAnswerReceipt, taskControlDirectory, taskControlRoot, writeTaskControlJson } from "../src/worker/terminal-answer.js";
+import { createHostTaskRun, ensureTaskControlRoot, readFinalAnswerReceipt, readTaskControlJson, routeControlFile, ROUTE_CONTROL_FILES, saveFinalAnswerReceipt, taskControlDirectory, taskControlRoot, writeTaskControlJson } from "../src/worker/terminal-answer.js";
 
 // pi-fabric#1150 Astra P1: Windows cannot open a directory, so ordinary task control
 // allocation, publication, reads and writes must use the checked no-follow path there.
@@ -19,23 +17,22 @@ const inside = (root: string, value: string) => value === root || value.startsWi
 const temp = fs.realpathSync(os.tmpdir());
 const shared = ["/tmp", "/var/tmp", "/dev/shm", "/private/tmp"].flatMap(root => { try { return [fs.realpathSync(root)]; } catch { return []; } });
 const configuredState = process.env.XDG_STATE_HOME;
-const stateParent = configuredState && path.isAbsolute(configuredState) ? configuredState : path.dirname(temp);
-const state = path.join(stateParent, `task-control-windows-state-${process.pid}-${Date.now()}`);
-const usable = process.platform !== "win32" && !inside(temp, state) && !shared.some(root => inside(root, state));
-const managers: AgentManager[] = [];
-beforeEach(() => { vi.stubEnv("XDG_STATE_HOME", state); });
-afterEach(async () => {
+const platformDescriptor = Object.getOwnPropertyDescriptor(process, "platform")!;
+const tempRoots = [temp, ...(process.env.TMPDIR ? [path.resolve(process.env.TMPDIR)] : []), ...shared];
+const usable = process.platform !== "win32" && !!configuredState && path.isAbsolute(configuredState) && !tempRoots.some(root => inside(root, path.resolve(configuredState)));
+const state = usable ? path.join(configuredState!, `task-control-windows-state-${process.pid}-${Date.now()}`) : undefined;
+beforeEach(() => { if (state) vi.stubEnv("XDG_STATE_HOME", state); });
+afterEach(() => {
+  Object.defineProperty(process, "platform", platformDescriptor);
   delete privateDirTestHooks.platform;
-  delete managerRunTestHooks.platform;
-  delete managerRunTestHooks.afterRunAllocation;
-  await Promise.all(managers.splice(0).map(manager => manager.close()));
   vi.unstubAllEnvs(); vi.restoreAllMocks();
 });
 
 const simulateWindows = () => {
   privateDirTestHooks.platform = "win32";
-  const realOpen = fs.openSync.bind(fs), realRename = fs.renameSync.bind(fs), realRemove = fs.rmSync.bind(fs);
-  const refusedDirectoryOpens: string[] = [], renames: [string, string][] = [], removals: string[] = [];
+  const realOpen = fs.openSync.bind(fs), realRename = fs.renameSync.bind(fs), realRemove = fs.rmSync.bind(fs), realUnlink = fs.unlinkSync.bind(fs);
+  const refusedDirectoryOpens: string[] = [], renames: [string, string][] = [], removals: string[] = [], unlinks: string[] = [];
+  const writtenSessionIdentities: Array<{ source: string; dev: string; ino: string }> = [];
   vi.spyOn(fs, "openSync").mockImplementation(((file: fs.PathLike, flags?: fs.OpenMode, mode?: fs.Mode) => {
     if (fs.statSync(file, { throwIfNoEntry: false })?.isDirectory()) {
       refusedDirectoryOpens.push(String(file));
@@ -46,6 +43,10 @@ const simulateWindows = () => {
   vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
     if (inside(temp, String(from)) && inside(temp, String(to))) return realRename(from, to);
     renames.push([String(from), String(to)]);
+    if (String(to).endsWith(`${path.sep}route${path.sep}route-session.jsonl`)) {
+      const stat = fs.lstatSync(from, { bigint: true });
+      writtenSessionIdentities.push({ source: String(from), dev: String(stat.dev), ino: String(stat.ino) });
+    }
     // Copy-only emulation of the recorded rename: the source stays (no deletion outside temp).
     if (fs.lstatSync(from).isDirectory()) {
       fs.mkdirSync(to, { mode: 0o700 });
@@ -58,7 +59,11 @@ const simulateWindows = () => {
     if (inside(temp, String(target))) return realRemove(target, options);
     removals.push(String(target));
   });
-  return { refusedDirectoryOpens, renames, removals };
+  vi.spyOn(fs, "unlinkSync").mockImplementation(target => {
+    if (inside(temp, String(target))) return realUnlink(target);
+    unlinks.push(String(target));
+  });
+  return { refusedDirectoryOpens, renames, removals, unlinks, writtenSessionIdentities };
 };
 const freshRun = () => path.join(fs.realpathSync(fs.mkdtempSync(path.join(temp, "win-alloc-"))), "nested", "run-1");
 
@@ -129,29 +134,78 @@ describe.skipIf(!usable)("Windows task control allocation uses the checked path,
     expect(swaps).toBe(1);
   });
 
-  it("routed manager dispatch still fails closed on Windows before route publication", async () => {
+  it("refuses a foreign central route/ without repairing it or writing any route file", () => {
     ensureTaskControlRoot();
-    const base = fs.realpathSync(fs.mkdtempSync(path.join(temp, "win-route-")));
-    fs.mkdirSync(path.join(base, "granted"), { mode: 0o700 });
     simulateWindows();
-    managerRunTestHooks.platform = "win32";
-    const allocated: string[] = [];
-    managerRunTestHooks.afterRunAllocation = directory => { allocated.push(directory); };
-    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
-    vi.stubEnv("PI_FABRIC_RUN_ROOT", path.join(base, "granted", "nested"));
-    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, deniedModels: [] },
-      { workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), preparePiModel: async model => model, fullCodeMode: false });
-    managers.push(manager);
+    const run = freshRun();
+    createHostTaskRun(run);
+    const route = path.dirname(routeControlFile(run, "route-session.jsonl"));
+    fs.mkdirSync(route, { mode: 0o700 });
+    const before = fs.lstatSync(route, { bigint: true });
+    const original = fs.lstatSync;
+    vi.spyOn(fs, "lstatSync").mockImplementation(((file: fs.PathLike, options?: fs.StatOptions) => {
+      const stat = original(file, options as never);
+      if (String(file) !== route || !stat) return stat;
+      return Object.assign(Object.create(Object.getPrototypeOf(stat)), stat, { uid: options?.bigint ? BigInt(process.getuid!() + 1) : process.getuid!() + 1 });
+    }) as typeof fs.lstatSync);
+    expect(() => routeControlFile(run, "route-session.jsonl", { legacyReadOnly: true })).toThrow(/owned private/);
     const pin = { model: "test/fake", effort: "low" };
-    const routeDecision = { decisionId: `d${Date.now()}`, mode: "shadow", routeClass: "bounded-lookup", parentSessionId: "parent", pin, candidates: [pin],
-      shadowChoice: pin, confidence: null, probability: null, reasonCode: "shadow-choice", latencyMs: 0, ...pin };
-    await expect(manager.run({ task: "must not launch", transport: "process", routeDecision,
-      routeRecord: { ledger: path.join(base, "ledger.jsonl"), decisionRecorded: true } } as never))
-      .rejects.toMatchObject({ code: "FABRIC_CONTROL_PUBLISH_UNSUPPORTED_PLATFORM" });
-    expect(allocated).toEqual([]);
-    expect(launch).not.toHaveBeenCalled();
-    // No route control bytes anywhere in central state (ordinary allocation may precede the pin).
-    const names = fs.readdirSync(taskControlRoot(), { recursive: true }).map(name => path.basename(String(name)));
-    expect(names.filter(name => /route-dispatch-receipt|pending-route-outcome|route-session/.test(name))).toEqual([]);
+    const decision = { decisionId: "foreign-route", mode: "shadow", routeClass: "bounded-lookup", pin, candidates: [pin], shadowChoice: pin, ...pin };
+    prepareRouteDispatch(decision as never, undefined, run, "child-id", { ledger: path.join(path.dirname(run), "ledger.jsonl"), decisionRecorded: true });
+    expect(decision).toMatchObject({ reasonCode: "record-failed" });
+    expect(fs.readdirSync(route)).toEqual([]);
+    expect(original(route, { bigint: true }).ino).toBe(before.ino);
+    expect(original(route, { bigint: true }).mode).toBe(before.mode);
+    for (const name of ROUTE_CONTROL_FILES) expect(fs.existsSync(path.join(run, name))).toBe(false);
+  });
+
+  it("publishes all route controls centrally and records pending recovery unlink without touching the run", () => {
+    ensureTaskControlRoot();
+    const run = freshRun(), base = path.dirname(path.dirname(run));
+    const seen = simulateWindows();
+    // Routing's ledger durability branch uses the real platform, not the private-dir seam.
+    Object.defineProperty(process, "platform", { ...platformDescriptor, value: "win32" });
+    createHostTaskRun(run);
+    const decisionPin = { model: "test/fake", effort: "low" };
+    const decision = { decisionId: `d${Date.now()}-${Math.random()}`, mode: "shadow", routeClass: "bounded-lookup", parentSessionId: "parent", pin: decisionPin,
+      candidates: [decisionPin], shadowChoice: decisionPin, confidence: null, probability: null, reasonCode: "shadow-choice", latencyMs: 0, ...decisionPin };
+    const ledger = path.join(base, "ledger.jsonl");
+    const dispatch = prepareRouteDispatch(decision as never, undefined, run, "child-id", { ledger, decisionRecorded: true });
+    const binding = dispatch.bindSession(path.join(base, "worktree"));
+    const receiptFile = routeControlFile(run, "route-dispatch-receipt.json");
+    const sessionFile = routeControlFile(run, "route-session.jsonl");
+    const pendingFile = routeControlFile(run, "pending-route-outcome.json");
+    const central = taskControlDirectory(run);
+    expect(ROUTE_CONTROL_FILES).toEqual(["route-dispatch-receipt.json", "pending-route-outcome.json", "route-session.jsonl"]);
+    expect(receiptFile).toBe(path.join(central, "route", "route-dispatch-receipt.json"));
+    expect(sessionFile).toBe(path.join(central, "route", "route-session.jsonl"));
+    expect(pendingFile).toBe(path.join(central, "route", "pending-route-outcome.json"));
+    expect(JSON.parse(fs.readFileSync(receiptFile, "utf8"))).toMatchObject({ runId: "child-id", decision: { decisionId: decision.decisionId } });
+    expect(binding.path).toBe(sessionFile);
+    const writtenIdentity = seen.writtenSessionIdentities[0]!;
+    const sourceStat = fs.lstatSync(writtenIdentity.source, { bigint: true });
+    expect(binding.identity).toEqual({ dev: writtenIdentity.dev, ino: writtenIdentity.ino });
+    expect({ dev: String(sourceStat.dev), ino: String(sourceStat.ino) }).toEqual({ dev: writtenIdentity.dev, ino: writtenIdentity.ino });
+    // Copy-only emulation cannot prove destination inode retention; hosted worker tests prove that.
+    expect(fs.lstatSync(sessionFile, { bigint: true }).ino).not.toBe(sourceStat.ino);
+
+    const open = vi.mocked(fs.openSync).getMockImplementation()!;
+    vi.mocked(fs.openSync).mockImplementation(((file: fs.PathLike, flags?: fs.OpenMode, mode?: fs.Mode) => {
+      if (String(file) === ledger) throw new Error("injected ledger append failure");
+      return open(file, flags ?? "r", mode);
+    }) as typeof fs.openSync);
+    expect(() => dispatch.outcome({ status: "failed" })).toThrow("injected ledger append failure");
+    vi.mocked(fs.openSync).mockImplementation(open);
+    expect(fs.existsSync(pendingFile)).toBe(true);
+    expect(JSON.parse(fs.readFileSync(pendingFile, "utf8"))).toMatchObject({ ledger, record: { type: "outcome", runId: "child-id", decisionId: decision.decisionId } });
+    for (const name of ROUTE_CONTROL_FILES) expect(fs.existsSync(path.join(run, name))).toBe(false);
+
+    dispatch.outcome({ status: "failed" });
+    expect(fs.readFileSync(ledger, "utf8")).toContain('"runId":"child-id"');
+    expect(seen.unlinks).toContain(pendingFile);
+    // Unlink is recorded, never executed outside private temp.
+    expect(fs.existsSync(pendingFile)).toBe(true);
+    expect(seen.refusedDirectoryOpens).toEqual([]);
+    expect(seen.removals.every(entry => inside(taskControlRoot(), entry))).toBe(true);
   });
 });

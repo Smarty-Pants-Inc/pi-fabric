@@ -1728,6 +1728,24 @@ describe("durable completion receipts", () => {
     }
   });
 
+  it("exposes a raw running worker's native finishing milestone without settling its result", async () => {
+    const state = await rootHarness("worker-finishing-milestone");
+    const seeded = await seedCompletion(state, "running");
+    const statusFile = path.join(seeded.runDirectory, "status.json");
+    fs.writeFileSync(statusFile, JSON.stringify({ ...seeded.result, finishingAt: Date.now() }));
+    const client = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: state.mainAgent });
+    try {
+      expect(client.statusAgent(seeded.id)).toMatchObject({ status: "finishing", text: "authoritative full result" });
+      expect(client.completionSettled(seeded.id)).toBe(false);
+      await expect(client.waitAgent(seeded.id, AbortSignal.timeout(30))).rejects.toThrow(/aborted/);
+      fs.writeFileSync(statusFile, JSON.stringify({ ...seeded.result, status: "completed" }));
+      expect((await client.waitAgent(seeded.id)).status).toBe("completed");
+    } finally {
+      await client.close();
+      await state.participants.close();
+    }
+  });
+
   it("masks an orphan terminal process candidate while persisted tree custody still sees a live writer", async () => {
     const state = await rootHarness("orphan-finishing-tree");
     const seeded = await seedCompletion(state);

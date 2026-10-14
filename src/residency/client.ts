@@ -28,7 +28,7 @@ import {
 } from "./handover.js";
 import { kernelFenceAvailable } from "./file-lock.js";
 import { assertNoWatchdogCustody } from "./watchdog-custody.js";
-import { runTreeExitVeto } from "../storage/retention.js";
+import { runTreeExitVeto, runTreeResourceVeto } from "../storage/retention.js";
 import type { FabricOwnedModelGuidance } from "../components/model-guidance.js";
 import type { FabricMainAgentTarget } from "../main-agent.js";
 import { MeshStore, meshOutageAlarmSink, type MeshStateEntry } from "../mesh/store.js";
@@ -959,8 +959,10 @@ export class ResidencyClient {
     if (committed && "text" in committed && "startedAt" in committed && terminal(committed.status)) return committed;
     const live = readJson<AgentRunRecord>(path.join(metadata.runDirectory, "status.json"));
     if (live?.id === metadata.id) {
-      if (live.transport === "process" && terminal(live.status) &&
-          (this.#attemptMayRetry(metadata.id) || runTreeExitVeto(metadata.runDirectory, 0, undefined, true))) {
+      if (live.transport === "process" && ((live.status === "running" && live.finishingAt !== undefined) ||
+          (terminal(live.status) && (this.#attemptMayRetry(metadata.id) || runTreeResourceVeto(metadata.runDirectory, 0, undefined, true, true))))) {
+        // Result visibility needs checked tree exit, not successful archival.
+        // A failed archive still vetoes deletion, never delivery after exit.
         // A worker candidate is not the resident supervisor's tree-exit outcome.
         // Preserve its final text, but keep status and wait/join non-terminal.
         const { finishedAt: _finishedAt, ...pending } = live;

@@ -402,8 +402,9 @@ describe("Windows tree-stop owner custody (#360 security R1)", () => {
         // Keep Windows active through the later admission/close probe too;
         // restoring Linux here used to hide that launch's captured-close debt.
         const result = await manager.wait(handle.id);
-        expect(result.status).toBe(outcome === "confirmed" ? "stopped" : "failed");
-        if (outcome !== "confirmed") expect(result.errorCode).toBe("CUSTODY_UNCONFIRMED");
+        const failedCandidate = outcome === "terminal-before-error" || outcome === "failed-before-error";
+        expect(result.status).toBe(failedCandidate ? "failed" : "stopped");
+        if (failedCandidate) expect(result.errorCode).toBe("CUSTODY_UNCONFIRMED");
         if (outcome === "confirmed") {
           expect(hasUnresolvedWorker(run)).toBe(false);
           expect(manager.retentionReferences().has(handle.id)).toBe(false);

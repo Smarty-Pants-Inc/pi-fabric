@@ -235,6 +235,8 @@ export interface AgentRunRecord {
   startedAt: number;
   updatedAt: number;
   finishedAt?: number;
+  /** Native final settlement; raw worker status stays running until drain/validation. */
+  finishingAt?: number;
   currentTool?: string;
   currentToolStartedAt?: number;
   followUpDeliveries?: AgentFollowUpDelivery[];

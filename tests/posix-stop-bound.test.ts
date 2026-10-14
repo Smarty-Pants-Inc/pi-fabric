@@ -90,7 +90,7 @@ describe.skipIf(process.platform === "win32")("POSIX stop deadline (#360 Astra R
       let done = false;
       pending = (action === "stop" ? manager.stop(handle.id) : action === "deadline" ? manager.wait(handle.id) : manager.close())
         .then(result => {
-          if (action !== "close") expect(result).toMatchObject({ status: "failed", errorCode: "CUSTODY_UNCONFIRMED" });
+          if (action !== "close") expect(result).toMatchObject({ status: action === "stop" ? "stopped" : "timed_out" });
           done = true; return result;
         });
       await vi.advanceTimersByTimeAsync(30_000);

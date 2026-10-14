@@ -96,6 +96,9 @@ switch (behavior) {
   }
   case "finishing-child":
   case "finishing-child-stubborn": {
+    // This fixture isolates descendant cleanup; the separate root-stubborn
+    // behavior covers a native Pi root that refuses EOF.
+    process.stdin.on("end", () => process.exit(0));
     const pidFile = process.env.FAKE_PI_FINISHING_PID;
     const release = process.env.FAKE_PI_FINISHING_RELEASE;
     const settle = process.env.FAKE_PI_FINISHING_SETTLE;

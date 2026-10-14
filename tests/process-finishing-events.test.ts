@@ -19,7 +19,7 @@ afterEach(async () => {
   vi.restoreAllMocks();
 });
 
-async function fixture(options: { finalAnswer?: boolean; killOnStop?: boolean; legacy?: boolean; legacyNoEvents?: boolean; workerFinishing?: boolean } = {}) {
+async function fixture(options: { finalAnswer?: boolean; killOnStop?: boolean; legacy?: boolean; legacyNoEvents?: boolean; workerFinishing?: boolean; milestone?: boolean } = {}) {
   vi.useFakeTimers();
   vi.spyOn(fs, "rmSync").mockImplementation(() => {});
   vi.spyOn(fs.promises, "rm").mockResolvedValue();
@@ -51,7 +51,8 @@ async function fixture(options: { finalAnswer?: boolean; killOnStop?: boolean; l
     fs.writeFileSync(statusFile, JSON.stringify({ id: request.id, name: request.name, task: "probe", runner: "pi", transport: "process", cwd: request.cwd,
       startedAt: Date.now(), updatedAt: Date.now(), finishedAt: Date.now(), turns: 1, toolCalls: 0,
       usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
-      status: options.workerFinishing ? "finishing" : "completed", text: "QUIESCENT", exitCode: 0,
+      status: options.workerFinishing ? options.milestone ? "running" : "finishing" : "completed",
+      ...(options.milestone ? { finishingAt: Date.now() } : {}), text: "QUIESCENT", exitCode: 0,
       ...(receipt ? { finalAnswerReceipt: { id: receipt.id, recordedAt: receipt.recordedAt } } : {}) }));
     return { kind: "process", liveness: options.legacy ? "poll" : "events",
       ...(options.legacyNoEvents ? {} : { closed }),
@@ -95,6 +96,7 @@ it.each([
   { workerFinishing: false, finalAnswer: false },
   { workerFinishing: true, finalAnswer: false },
   { workerFinishing: true, finalAnswer: true },
+  { workerFinishing: true, finalAnswer: true, milestone: true },
 ])("does not poll liveness or arm a repeating status timer while finishing (worker $workerFinishing, receipt $finalAnswer)", async options => {
   const f = await fixture(options);
   await vi.advanceTimersByTimeAsync(0);
@@ -171,14 +173,14 @@ it.each([false, true])("retains failed custody and cannot revive from a late ter
   managers.splice(managers.indexOf(f.manager), 1);
 });
 
-it("preserves legacy checked exit without polling before native close", async () => {
+it("captures legacy custody once before native close without polling", async () => {
   const f = await fixture({ legacy: true });
   await vi.advanceTimersByTimeAsync(1_000);
-  expect(f.isAlive).not.toHaveBeenCalled();
+  expect(f.isAlive).toHaveBeenCalledOnce();
   expect(f.manager.status(f.handle.id).status).toBe("finishing");
   f.exit();
   await vi.advanceTimersByTimeAsync(0);
   expect((await f.manager.wait(f.handle.id)).status).toBe("completed");
-  expect(f.isAlive).toHaveBeenCalledOnce();
+  expect(f.isAlive).toHaveBeenCalledTimes(2);
   expect(f.stop).not.toHaveBeenCalled();
 });

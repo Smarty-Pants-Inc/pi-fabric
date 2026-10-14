@@ -436,7 +436,6 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
   /** Terminal results do not discharge execution custody or admission permits. */
   executionExited?: boolean;
   launchCancelled?: boolean;
-  joinedStopDebt?: string;
   executionRelease?: () => void;
   executionDrain?: Promise<void>;
   /** Set when the run failed because its transport lost contact: its worker may still run. */
@@ -2618,6 +2617,10 @@ export class AgentManager {
 
   /** A lost worker may keep writing status; it cannot replace the supervisor failure. */
   #settledRecord(managed: ManagedAgent): AgentRunRecord | undefined {
+    // Exact-owner ENODEV recovery proves exit and saves the retained answer
+    // before setting this flag. Only that supervisor action can supersede the
+    // custody failure; a late worker status write alone still cannot revive it.
+    if (managed.recoveredAnswer) return readRecord(managed.statusFile) ?? managed.latestRecord;
     return readRecord(path.join(managed.runDirectory, "custody-failure.json")) ??
       managed.finalAnswerResult ?? readRecord(managed.statusFile) ?? managed.latestRecord;
   }
@@ -3265,7 +3268,22 @@ export class AgentManager {
     // Even a settled/terminal run may still own a detached execution group.
     // Only an exact native deadline receipt permits logical completion with
     // retained debt. Platform or process kind alone is never such a receipt.
-    await this.#drainExecution(managed);
+    // Exit observation does not discharge an explicit stop/close hook. Its
+    // captured helper/native join remains mandatory even after natural exit.
+    try {
+      if (managed.transport.kind === "process" && managed.executionExited &&
+          (managed.processStop || managed.transport.lostContact?.() === undefined)) await this.#stopManagedTransport(managed);
+      await this.#drainExecution(managed);
+    } catch (error) {
+      // A failed explicit drain still owns the terminal publication. The
+      // monitor may already have yielded to this stop's exact native join.
+      const failure = new Error(`Agent ${id} execution exit unconfirmed; custody retained: ${error instanceof Error ? error.message : String(error)}`);
+      if (!managed.launchCancelled) this.#settle(managed, {
+        ...(readRecord(managed.statusFile) ?? managed.latestRecord ?? failedRecord(managed, "failed", failure.message)),
+        status: "failed", error: failure.message,
+      });
+      throw failure;
+    }
     if (managed.settled) return consumeSettled ? this.wait(id) : this.#settledResult(managed);
     managed.background = false;
     const terminal = readRecord(managed.statusFile);
@@ -3284,7 +3302,7 @@ export class AgentManager {
     const record =
       terminal && terminalStatuses.has(terminal.status)
         ? (this.#withTransportMetadata(terminal, managed) as AgentRunResult)
-        : failedRecord(managed, "stopped", "Agent stopped");
+        : this.#withTransportMetadata(failedRecord(managed, "stopped", "Agent stopped"), managed) as AgentRunResult;
     if (!terminal || !terminalStatuses.has(terminal.status)) writeRecord(managed.statusFile, record);
     await this.#captureWorktree(managed);
     this.#settle(managed, record);
@@ -3325,7 +3343,7 @@ export class AgentManager {
     if (managed.lostContact || hasUnresolvedWorker(managed.runDirectory)) {
       throw new Error(
         `Cannot clean up agent ${id}: Fabric lost track of its worker (${managed.lostContact ?? "see its run directory"}), ` +
-        `which may still use ${managed.runDirectory}. Check the worker, then remove its files by hand.`,
+        `a running agent may still use ${managed.runDirectory}. Check the worker, then remove its files by hand.`,
       );
     }
     if (managed.settlementSaveFailure && !this.#saveSettledResult(managed, managed.settlementSaveFailure.result)) {
@@ -3538,7 +3556,7 @@ export class AgentManager {
     if (managed.finalAnswer) throw new FabricTargetTerminalError(managed.id, managed.finalAnswer.id);
     if (managed.transport.controls === false) throw new Error("Remote placement has no steering, follow-up, or compaction channel; start a new task");
     const record = readRecord(managed.statusFile);
-    if (record && (terminalStatuses.has(record.status) || record.status === "finishing")) {
+    if (record && (terminalStatuses.has(record.status) || record.status === "finishing" || record.finishingAt !== undefined)) {
       throw new Error(
         `Fabric agent ${id} already finished (${record.status}); steering has no target`,
       );
@@ -3860,7 +3878,7 @@ export class AgentManager {
         const alive = await bounded(() => transport.isAlive());
         if (transport.lostContact?.() !== undefined) return false;
         if (!alive) return true;
-        if (transport.kind === "process" || stopFailed) return false; // a fresh exact receipt may discharge this on retry
+        if (stopFailed) return false; // a fresh exact receipt may discharge this on retry
         await delay(Math.min(transport.livenessPollIntervalMs ?? AGENT_STATUS_POLL_INTERVAL_MS, deadline - Date.now()));
       }
     } catch { /* failed or hung liveness never authorizes deletion */ }
@@ -3890,17 +3908,13 @@ export class AgentManager {
             await Promise.race([managed.transport.closed, new Promise<void>(done => { timer = setTimeout(done, remaining); })]);
           } finally { if (timer) clearTimeout(timer); }
         }
-        // Legacy Windows adapters can join their helper and captured primary
-        // without implementing stopDebt. Checked primary absence after that
-        // successful join permits bounded host shutdown only, never task settlement or tree exit/release.
-        const lost = managed.transport.lostContact?.();
-        const session = managed.transport.sessionId;
-        if (process.platform === "win32" && !managed.actorId && lost !== undefined &&
-            session && /^\d+$/.test(session) && Number.isSafeInteger(Number(session)) && Number(session) > 0) {
-          try { process.kill(Number(session), 0); }
-          catch (error) { if ((error as NodeJS.ErrnoException).code === "ESRCH") managed.joinedStopDebt = lost; }
+        // Joining a hook after proven exit must not erase a later failed
+        // release observation. That marker is a separate retention obligation.
+        if (!managed.executionExited) await this.#noteUnconfirmedExit(managed, false, true);
+        else {
+          const lost = managed.transport.lostContact?.();
+          if (lost !== undefined) this.#markLost(managed, lost);
         }
-        await this.#noteUnconfirmedExit(managed);
         managed.processStopPending = false;
         this.#retentionRevision++;
         resolve();
@@ -3917,7 +3931,13 @@ export class AgentManager {
 
   // After a stop: a worker whose exit is not confirmed (lost contact, or still reported
   // alive) may keep using its files, so the run is marked unresolved (never cleaned up).
-  async #noteUnconfirmedExit(managed: ManagedAgent, exitObserved = false): Promise<void> {
+  async #noteUnconfirmedExit(managed: ManagedAgent, exitObserved = false, stopJoined = false): Promise<void> {
+    // Passive absence/close must not release custody through an outstanding
+    // stop helper. The stop owner calls back only after its exact join returns.
+    if (managed.processStopPending && !stopJoined) {
+      await managed.processStop;
+      return;
+    }
     const lost = uncheckedExternalExit(managed.transport) ? "external transport has no checked exit contract" : managed.transport.lostContact?.();
     const deadline = Date.now() + TRANSPORT_EXIT_GRACE_MS * 7;
     const alive = lost === undefined && !exitObserved && await this.#transportAliveUntil(managed.transport, deadline).catch(() => true);
@@ -3937,13 +3957,17 @@ export class AgentManager {
   }
 
   #hasNativeStopDebt(managed: ManagedAgent): boolean {
-    const debt = managed.transport.stopDebt?.() ?? managed.joinedStopDebt;
+    const debt = managed.transport.stopDebt?.();
     return managed.transport.kind === "process" && debt !== undefined &&
       debt === managed.transport.lostContact?.() && !managed.launchCancelled &&
       (!managed.actorId || process.platform === "win32");
   }
 
   async #drainExecution(managed: ManagedAgent): Promise<void> {
+    // Capture the existing bounded drain before joining stop: otherwise two
+    // callers can each spend a grace when the first drain expires during join.
+    if (managed.executionDrain) return managed.executionDrain;
+    if (managed.processStop) await managed.processStop;
     if (managed.executionExited) return;
     if (managed.executionDrain) return managed.executionDrain;
     const pending = (async () => {
@@ -3965,8 +3989,8 @@ export class AgentManager {
       if (transport.lostContact?.() !== undefined || !await this.#stopUnregisteredTransport(transport)) {
         this.#markLost(managed, managed.transport.lostContact?.() ?? "worker execution exit unconfirmed; custody retained");
         // An exact bounded native stop receipt can end the logical attempt, but
-        // #settle must publish custody failure, never success, while holding the
-        // execution permit and persisted uncertainty fence.
+        // #settle preserves explicit stopped/timed_out only, never success,
+        // while holding the execution permit and persisted uncertainty fence.
         if (this.#hasNativeStopDebt(managed)) return;
         throw new Error(`Agent ${managed.id} execution exit unconfirmed; custody retained: ${managed.lostContact}`);
       }
@@ -4016,11 +4040,16 @@ export class AgentManager {
   async #waitForTransportExit(managed: ManagedAgent, outerDeadline = Infinity): Promise<void> {
     // Native notifications drive finishing. The existing bounded grace is the
     // only safety timer; a worker close alone never certifies a scoped tree.
-    if (managed.executionExited || uncheckedExternalExit(managed.transport)) return;
+    if (managed.executionExited || uncheckedExternalExit(managed.transport) ||
+        managed.transport.lostContact?.() !== undefined) return;
     const transport = managed.transport;
     const deadline = transport.kind === "process" && transport.closed && Number.isFinite(outerDeadline)
       ? outerDeadline : Math.min(outerDeadline, Date.now() + TRANSPORT_EXIT_GRACE_MS * 7);
     if (transport.kind === "process" && transport.closed) {
+      // Legacy adapters capture descendant births in isAlive(). Seed custody
+      // while the leader can still attest parentage, before waiting for close.
+      // One entry probe is not a finishing poll; scoped receipts need no scan.
+      if (!transport.treeClosed) await this.#transportAliveUntil(transport, deadline).catch(() => true);
       const receipt = transport.treeClosed
         ? Promise.all([transport.closed, transport.treeClosed]).then(() => undefined)
         : transport.closed;
@@ -4277,7 +4306,6 @@ export class AgentManager {
       managed.executionExited = false;
       delete managed.processStop;
       delete managed.processStopPending;
-      delete managed.joinedStopDebt;
       this.#unregisteredTransports.delete(transport);
       // A later launch succeeded: an earlier relaunch failure no longer describes this run.
       delete managed.relaunchFailure;
@@ -4349,7 +4377,8 @@ export class AgentManager {
         // Draining sooner can kill the receipt frame before queued refusals land.
         const deadline = Date.now() + TRANSPORT_EXIT_GRACE_MS * 7;
         while ((!snapshot || snapshot.id !== managed.id || !terminalStatuses.has(snapshot.status) || snapshot.finalAnswerReceipt?.id !== receipt.id) && Date.now() < deadline) {
-          if (snapshot?.status === "finishing" && snapshot.finalAnswerReceipt?.id === receipt.id) {
+          if ((snapshot?.status === "finishing" || (snapshot?.status === "running" && snapshot.finishingAt !== undefined)) &&
+              snapshot.finalAnswerReceipt?.id === receipt.id) {
             await this.#waitForTransportExit(managed, deadline);
             snapshot = readRecord(managed.statusFile);
             break;
@@ -4510,7 +4539,9 @@ export class AgentManager {
         this.#routeTerminalNotices(managed);
         return;
       }
-      const record = readRecord(managed.statusFile);
+      const snapshot = readRecord(managed.statusFile);
+      const record = snapshot?.status === "running" && snapshot.finishingAt !== undefined
+        ? { ...snapshot, status: "finishing" as const } : snapshot;
       this.#checkFollowUps(managed, record);
       if (record) {
         this.#observeProgress(managed, record);
@@ -4545,7 +4576,9 @@ export class AgentManager {
           managed.transport.waitForClose && !managed.launchCancelled &&
           !managed.transport.lostContact?.() && !managed.lostContact;
         if (managed.transport.kind === "process" && !nativeWindowsClose) {
-          await this.#waitForTransportExit(managed, Date.now() + (managed.transport.finishingGraceMs ?? TRANSPORT_EXIT_GRACE_MS));
+          const graceMs = record.status === "completed"
+            ? managed.transport.finishingGraceMs ?? TRANSPORT_EXIT_GRACE_MS : TRANSPORT_EXIT_GRACE_MS;
+          await this.#waitForTransportExit(managed, Date.now() + graceMs);
         }
         if (nativeWindowsClose) {
           await managed.transport.waitForClose!();
@@ -4565,6 +4598,18 @@ export class AgentManager {
         await this.#waitForTransportExit(managed, finishingDeadline);
         const candidate = readRecord(managed.statusFile);
         if (candidate && terminalStatuses.has(candidate.status)) continue;
+        // A worker can die after journaling native completion but before its
+        // status write. Proven exit still takes the existing durable recovery
+        // path; finishing is not a terminal result or a reason to skip it.
+        if (managed.executionExited && !managed.stopRequested) {
+          const failed = failedRecord(managed, "failed", "Agent transport exited without a result");
+          if (await this.#resumeStopped(managed, failed, deadline)) { finishingDeadline = undefined; continue; }
+          if (!managed.relaunchFailure && await this.#retryStartup(managed, failed, deadline)) {
+            managed.lastRetriedTransportFailure = failed;
+            finishingDeadline = undefined;
+            continue;
+          }
+        }
         this.#markLost(managed, "finishing ended without a terminal worker outcome and execution-tree exit proof");
         this.#settle(managed, { ...record, status: "failed" });
         await this.#drainExecution(managed).catch(() => undefined);
@@ -4714,8 +4759,9 @@ export class AgentManager {
     // A successful native result requires tree-exit proof. Unconfirmed custody
     // is a TERMINAL failure, not an indefinitely pending result. release() keeps
     // the execution permit, and the unresolved marker still vetoes collection.
-    if ((managed.transport.kind === "process" && (!managed.executionExited || managed.processStopPending ||
-        managed.lostContact || managed.transport.lostContact?.())) || (managed.actorId && !managed.executionExited)) {
+    const boundedStop = (result.status === "stopped" || result.status === "timed_out") && this.#hasNativeStopDebt(managed);
+    if (!boundedStop && ((managed.transport.kind === "process" && (!managed.executionExited || managed.processStopPending ||
+        managed.lostContact || managed.transport.lostContact?.())) || (managed.actorId && !managed.executionExited))) {
       const reason = managed.lostContact ?? managed.transport.lostContact?.() ?? "owned execution exit was not confirmed";
       this.#markLost(managed, reason);
       let descendantsMayRemain = 1; // no census is not evidence of an empty tree
@@ -4743,9 +4789,15 @@ export class AgentManager {
       writeRecord(path.join(managed.runDirectory, "custody-failure.json"), result);
     }
     if (managed.transport.kind === "process") {
-      // Persist the supervisor outcome (including cleanup warnings) for readers
-      // that inspect the current status directly. It is not an exit receipt.
-      writeRecord(managed.statusFile, result);
+      // Keep the worker's complete original record when its outcome agrees.
+      // Supervisor-only attribution must not mutate the last retained result
+      // when archival fails. Persist only a changed outcome or cleanup warning.
+      const current = readRecord(managed.statusFile);
+      if (!current || current.status !== result.status || result.errorCode === "CUSTODY_UNCONFIRMED") {
+        writeRecord(managed.statusFile, result);
+      } else if (forcedCleanup > 0) {
+        writeRecord(managed.statusFile, { ...current, warnings: result.warnings ?? [] });
+      }
     }
     if (managed.transport.kind === "process" && managed.lostContact) {
       // Reporting a terminal result is allowed; releasing native admission is not.
@@ -5336,7 +5388,8 @@ export class AgentManager {
 
   /** Public terminal status is a supervisor outcome, never a worker candidate. */
   #publicRecord(record: AgentRunRecord, managed: ManagedAgent): AgentRunRecord {
-    if (managed.transport.kind !== "process" || managed.settled || !terminalStatuses.has(record.status)) return record;
+    if (managed.transport.kind !== "process" || managed.settled ||
+        !(terminalStatuses.has(record.status) || (record.status === "running" && record.finishingAt !== undefined))) return record;
     const { finishedAt: _finishedAt, ...pending } = record;
     return { ...pending, status: "finishing" };
   }

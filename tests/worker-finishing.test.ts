@@ -53,7 +53,7 @@ describe.skipIf(process.platform !== "linux" || !fs.existsSync(workerPath))("nat
       const pid = Number(fs.readFileSync(f.pidFile, "utf8"));
       expect(live(pid)).toBe(true);
       const saved = JSON.parse(fs.readFileSync(path.join(f.manager.runDirectory(handle.id)!, "status.json"), "utf8"));
-      expect(saved).toMatchObject({ status: "finishing", text: "QUIESCENT" });
+      expect(saved).toMatchObject({ status: "running", finishingAt: expect.any(Number), text: "QUIESCENT" });
       await new Promise(resolve => setTimeout(resolve, 800));
       expect(live(pid)).toBe(true);
       expect(waited).toBe(false);
@@ -99,7 +99,7 @@ fs.writeFileSync = (file, data, ...args) => {
   if (String(file).includes("status.json") && typeof data === "string") {
     try {
       const record = JSON.parse(data);
-      if (record.status === "finishing") {
+      if (record.status === "running" && typeof record.finishingAt === "number") {
         finishing = true;
         log({ event: "finishing", membershipIntervals: [...intervals.values()].filter(ms => ms === 100).length });
       }
@@ -124,7 +124,7 @@ fs.writeFileSync = (file, data, ...args) => {
     } finally { fs.writeFileSync(f.release, "exit"); }
   }, 20_000);
 
-  it("counts a refusing native Pi root as an owned descendant when closeChild escalates", async () => {
+  it("preserves the result and one exit-grace warning when closeChild escalates a refusing native Pi root", async () => {
     const f = fixture(true, true);
     fs.writeFileSync(f.settle, "native completion");
     const handle = await f.manager.spawn({ task: "native final then refusing Pi root", transport: "process" });
@@ -135,7 +135,7 @@ fs.writeFileSync = (file, data, ...args) => {
       const result = await f.manager.wait(handle.id);
       expect(result).toMatchObject({ status: "completed", text: "QUIESCENT" });
       expect(live(pid)).toBe(false);
-      expect(result.warnings).toContain("finished with forced cleanup of 1 descendants");
+      expect(result.warnings).toEqual([expect.stringContaining("did not exit after stdin closed for 5000ms")]);
     } finally { await f.manager.stop(handle.id); }
   }, 25_000);
 

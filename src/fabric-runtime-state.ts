@@ -85,7 +85,7 @@ import { actionApprovalOverride } from "./core/approval-overrides.js";
 import type { FabricSpeculationStreamTap } from "./speculation/stream-tap.js";
 import { MeshStore, meshOutageAlarmSink, type MeshIdentity } from "./mesh/store.js";
 import { acquireMeshCustodyLock, meshCustodyMode } from "./mesh/custody-lock.js";
-import { MeshBackgroundQueue, MeshBackgroundRetry, isMeshLockTimeout } from "./core/atomic-write.js";
+import { MeshBackgroundQueue, MeshBackgroundRetry, isMeshWriteDeferred } from "./core/atomic-write.js";
 import { DecisionStore } from "./decisions/store.js";
 import { requestHeadlessApproval, routeChildQuestion } from "./decisions/host.js";
 import { LifecycleBroker } from "./lifecycle/broker.js";
@@ -1006,7 +1006,7 @@ export class FabricRuntimeState {
     try {
       await initializeMeshActivation();
     } catch (error) {
-      if (!isMeshLockTimeout(error)) throw error;
+      if (!isMeshWriteDeferred(error)) throw error;
       initialMeshError = error;
     }
     // Capture this activation's directory: no control may claim/run before its epoch

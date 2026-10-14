@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import type { MeshBatchOperation, MeshBatchView, MeshIdentity, MeshStateEntry, MeshStore } from "../mesh/store.js";
 import { type FabricHostLease, hostEntryLiveness, hostLeasePath, hostLeasePredecessor,
   readHostLeases, removeHostLeaseVersionUnderCustody, sameHostLeaseVersion } from "./host-leases.js";
-import { isMeshLockTimeout } from "../core/atomic-write.js";
+import { isMeshWriteDeferred } from "../core/atomic-write.js";
 import { participantFilePresent, readParticipantFiles, removeParticipantFileIf, sweepParticipantLockLeftovers } from "./participant-files.js";
 import { isLiveLegacyRootEntry } from "./legacy-root-liveness.js";
 import { effectiveLiveness } from "./liveness.js";
@@ -229,7 +229,7 @@ export const reapDeadHostRecords = async (
       },
     })));
   } catch (error) {
-    if (error === changed || isMeshLockTimeout(error)) return 0;
+    if (error === changed || isMeshWriteDeferred(error)) return 0;
     throw error;
   }
   let removed = results.filter(result => result.applied).length;

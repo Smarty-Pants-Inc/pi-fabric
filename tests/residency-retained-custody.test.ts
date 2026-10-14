@@ -27,7 +27,8 @@ async function fixture() {
     agents: { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, retainRuns: true, maxConcurrent: 1 },
     mesh: { ...DEFAULT_FABRIC_CONFIG.mesh, residentIdleExitMs: 2_000 }, retention: DEFAULT_FABRIC_CONFIG.retention,
     workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), fabricExtensionPath: path.resolve("dist/index.js"),
-    piBinary: "pi", claudeBinary: "claude", vedaBinary: "veda" };
+    piBinary: "pi", claudeBinary: "claude", vedaBinary: "veda",
+    piModels: { available: [{ provider: "fixture", id: "visible" }], aliases: {}, defaultModel: "fixture/visible" } };
   fs.mkdirSync(config.residencyRoot, { recursive: true });
   fs.writeFileSync(path.join(config.residencyRoot, "config.json"), JSON.stringify(config));
   let now = Date.now();
@@ -93,6 +94,9 @@ describe("resident retained native custody", () => {
       expect(fs.existsSync(residentIdleExitPath(f.config.residencyRoot))).toBe(false);
       expect(fs.existsSync(residentSleepingPath(f.config.residencyRoot))).toBe(false);
 
+      // The larger dormant window also crosses the already-started cleanup join's
+      // 7s bound. Let that old join finish before publishing a later exact receipt.
+      if (actor) await sleep(7_100);
       // Model the kernel ENODEV receipt; the real manager proves its exact owned PID absent,
       // releases the permit, and notifies the resident through its existing UI subscription.
       const runDirectory = f.host.agents.runDirectory(handle.id)!;

@@ -409,6 +409,9 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
   /** Set by an explicit stop — tool, dashboard, or session shutdown. A requested
    *  stop is terminal and must never be resumed behind the operator's back. */
   stopRequested: boolean;
+  /** Set only by `#stop()`: explicit operator/tool/close stop intent. Unlike
+   *  `stopRequested`, a monitor deadline never sets it. */
+  explicitStopRequested?: boolean;
   finalAnswer?: FinalAnswerReceipt;
   finalAnswerResult?: AgentRunResult;
   finalAnswerCompletion?: Promise<void>;
@@ -436,6 +439,10 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
   /** Terminal results do not discharge execution custody or admission permits. */
   executionExited?: boolean;
   launchCancelled?: boolean;
+  /** The monitor returned so the explicit stop owns terminal publication. */
+  monitorYieldedToStop?: boolean;
+  /** An explicit stop drain failed while the monitor still owned publication. */
+  stopDrainFailure?: string;
   executionRelease?: () => void;
   executionDrain?: Promise<void>;
   /** Set when the run failed because its transport lost contact: its worker may still run. */
@@ -1926,7 +1933,16 @@ export class AgentManager {
           // remains joined to this exact attempt until a retry confirms exit.
           void this.stop(id).catch(() => undefined);
         } else {
-          void this.#monitor(managed, timeoutMs).catch((error) => {
+          void this.#monitor(managed, timeoutMs).catch(async (error) => {
+            // One transparent exact retry for an explicit process stop whose
+            // first stop attempt rejected with contact intact; no loop.
+            if (managed.explicitStopRequested && managed.transport.kind === "process" &&
+              managed.transport.lostContact?.() === undefined && !managed.launchCancelled && !managed.settled) {
+              try {
+                await this.#stop(managed.id, false);
+                return;
+              } catch { /* fall through to generic custody settlement */ }
+            }
             // Publication and execution custody are independent: a failed drain
             // must resolve wait/join, without releasing the native permit/files.
             this.#markLost(managed, String(error));
@@ -3256,6 +3272,7 @@ export class AgentManager {
     // A requested stop is terminal: record the intent before any transport work
     // so recovery never restarts a run the operator, a tool, or shutdown ended.
     managed.stopRequested = true;
+    managed.explicitStopRequested = true;
     // Stop retracts notices; guest publication still uses its deferred receipt.
     managed.background = false;
     // A retry may already be launching its replacement. The previous attempt's
@@ -3278,10 +3295,14 @@ export class AgentManager {
       // A failed explicit drain still owns the terminal publication. The
       // monitor may already have yielded to this stop's exact native join.
       const failure = new Error(`Agent ${id} execution exit unconfirmed; custody retained: ${error instanceof Error ? error.message : String(error)}`);
-      if (!managed.launchCancelled) this.#settle(managed, {
+      // Publish only once the monitor yielded. While it still observes the
+      // live worker, a transient stop failure is retryable custody: settling
+      // here would freeze CUSTODY_UNCONFIRMED before the exact exit retry.
+      if (!managed.launchCancelled && managed.monitorYieldedToStop) this.#settle(managed, {
         ...(readRecord(managed.statusFile) ?? managed.latestRecord ?? failedRecord(managed, "failed", failure.message)),
         status: "failed", error: failure.message,
       });
+      else managed.stopDrainFailure = failure.message;
       throw failure;
     }
     if (managed.settled) return consumeSettled ? this.wait(id) : this.#settledResult(managed);
@@ -4581,9 +4602,15 @@ export class AgentManager {
           await this.#waitForTransportExit(managed, Date.now() + graceMs);
         }
         if (nativeWindowsClose) {
+          // Preserve a bounded natural-close window; if it expires, the exact
+          // stop runs first and only then is the native close joined.
+          const graceMs = record.status === "completed"
+            ? managed.transport.finishingGraceMs ?? TRANSPORT_EXIT_GRACE_MS : TRANSPORT_EXIT_GRACE_MS;
+          const closed = await this.#transportClosedUntil(managed.transport, Date.now() + graceMs);
+          if (!closed) await this.#stopManagedTransport(managed);
           await managed.transport.waitForClose!();
           await managed.processStop;
-          await this.#noteUnconfirmedExit(managed);
+          if (!managed.executionExited) await this.#noteUnconfirmedExit(managed);
         }
         await this.#drainExecution(managed);
         await this.#captureWorktree(managed);
@@ -4690,6 +4717,10 @@ export class AgentManager {
             // still mandatory, but absence during teardown is not run failure.
             if (managed.stopRequested && managed.transport.kind === "process") {
               await this.#stopManagedTransport(managed);
+              managed.monitorYieldedToStop = true;
+              // A stop that failed before this yield skipped publication; rerun
+              // its exact drain so it settles stopped or failed, never hangs.
+              if (managed.stopDrainFailure !== undefined && !managed.settled) void this.#stop(managed.id, false).catch(() => undefined);
               return;
             }
             const lost = managed.transport.lostContact?.();

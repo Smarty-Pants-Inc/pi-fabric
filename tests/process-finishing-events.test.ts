@@ -11,15 +11,27 @@ import { saveFinalAnswerReceipt } from "../src/worker/terminal-answer.js";
 // Recorded-call probe: never launch, signal, or delete a real process/tree locally.
 const managers: AgentManager[] = [];
 const exits: (() => void)[] = [];
+// Existing process.platform descriptor seam (tests/agent-manager.test.ts): the
+// fixture pins the platform whose real ProcessTransport handle it represents,
+// so hosted Windows and Linux runs exercise the same contract.
+const nativePlatform = Object.getOwnPropertyDescriptor(process, "platform")!;
 afterEach(async () => {
   exits.splice(0).forEach(exit => exit());
   await vi.advanceTimersByTimeAsync(500);
-  await Promise.all(managers.splice(0).map(manager => manager.close()));
-  vi.useRealTimers();
-  vi.restoreAllMocks();
+  try { await Promise.all(managers.splice(0).map(manager => manager.close())); }
+  finally {
+    Object.defineProperty(process, "platform", nativePlatform);
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  }
 });
 
-async function fixture(options: { finalAnswer?: boolean; killOnStop?: boolean; legacy?: boolean; legacyNoEvents?: boolean; workerFinishing?: boolean; milestone?: boolean } = {}) {
+async function fixture(options: { finalAnswer?: boolean; killOnStop?: boolean; legacy?: boolean; legacyNoEvents?: boolean; workerFinishing?: boolean; milestone?: boolean; platform?: "linux" | "win32"; stopFailures?: number; workerRunning?: boolean; timeoutMs?: number } = {}) {
+  // Only Linux scoped launches publish treeClosed/events liveness. Real Windows
+  // ProcessTransport keeps its native-close contract: closed plus a bounded
+  // waitForClose, never a tree receipt (process-transport.ts launch()).
+  const win32 = options.platform === "win32";
+  Object.defineProperty(process, "platform", { ...nativePlatform, value: win32 ? "win32" : "linux" });
   vi.useFakeTimers();
   vi.spyOn(fs, "rmSync").mockImplementation(() => {});
   vi.spyOn(fs.promises, "rm").mockResolvedValue();
@@ -41,7 +53,12 @@ async function fixture(options: { finalAnswer?: boolean; killOnStop?: boolean; l
     }
     alive = false; close(); treeExit();
   };
-  const stop = vi.fn(async () => { if (options.killOnStop) exit(); await treeClosed; });
+  let stopAttempts = 0;
+  const stop = vi.fn(async () => {
+    if (options.killOnStop) exit();
+    if (++stopAttempts <= (options.stopFailures ?? 0)) throw new Error("injected transient stop failure");
+    await treeClosed;
+  });
   exits.push(exit);
   vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async request => {
     const args = new Map<string, string>();
@@ -51,17 +68,26 @@ async function fixture(options: { finalAnswer?: boolean; killOnStop?: boolean; l
     fs.writeFileSync(statusFile, JSON.stringify({ id: request.id, name: request.name, task: "probe", runner: "pi", transport: "process", cwd: request.cwd,
       startedAt: Date.now(), updatedAt: Date.now(), finishedAt: Date.now(), turns: 1, toolCalls: 0,
       usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
-      status: options.workerFinishing ? options.milestone ? "running" : "finishing" : "completed",
+      status: options.workerRunning ? "running" : options.workerFinishing ? options.milestone ? "running" : "finishing" : "completed",
       ...(options.milestone ? { finishingAt: Date.now() } : {}), text: "QUIESCENT", exitCode: 0,
       ...(receipt ? { finalAnswerReceipt: { id: receipt.id, recordedAt: receipt.recordedAt } } : {}) }));
-    return { kind: "process", liveness: options.legacy ? "poll" : "events",
-      ...(options.legacyNoEvents ? {} : { closed }),
-      ...(options.legacy ? {} : { treeClosed }), isAlive, stop, finishingGraceMs: 7_000,
+    // An older adapter without close events has neither closed nor waitForClose.
+    const nativeClose = options.legacyNoEvents ? {} : { closed, waitForClose: async () => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([closed, new Promise<void>(resolve => {
+          timer = setTimeout(() => { lost ??= "Owned process worker did not confirm native close within 7000ms"; resolve(); }, 7_000);
+        })]);
+      } finally { clearTimeout(timer); }
+    } };
+    return { kind: "process",
+      ...(options.legacy ? { liveness: "poll" as const } : win32 ? {} : { liveness: "events" as const }),
+      ...nativeClose,
+      ...(options.legacy || win32 ? {} : { treeClosed }), isAlive, stop, finishingGraceMs: 7_000,
       forcedCleanupCount: () => options.killOnStop && !alive ? 1 : 0,
-      lostContact: () => lost,
-      waitForClose: () => closed } satisfies AgentTransportHandle;
+      lostContact: () => lost } satisfies AgentTransportHandle;
   });
-  const manager = new AgentManager(root, { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, deniedModels: [], timeoutMs: 30_000, maxConcurrent: 1 }, { workerPath: path.join(root, "worker.mjs"), runRoot: path.join(root, "runs") });
+  const manager = new AgentManager(root, { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, deniedModels: [], timeoutMs: 30_000, maxConcurrent: 1, ...(options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}) }, { workerPath: path.join(root, "worker.mjs"), runRoot: path.join(root, "runs") });
   managers.push(manager);
   const handle = await manager.spawn({ task: "child outlives worker", transport: "process" });
   return { manager, handle, isAlive, stop, close, exit, statusFile: statusFile!,
@@ -139,8 +165,8 @@ it("joins the killed child-tree receipt after the existing bounded cleanup grace
   expect(await f.manager.wait(f.handle.id)).toMatchObject({ status: "completed", warnings: ["finished with forced cleanup of 1 descendants"] });
 });
 
-it("uses one bounded safety check, not periodic scans, for an older adapter without close events", async () => {
-  const f = await fixture({ legacy: true, legacyNoEvents: true });
+it.each(["linux", "win32"] as const)("uses one bounded safety check, not periodic scans, for an older adapter without close events (%s)", async platform => {
+  const f = await fixture({ legacy: true, legacyNoEvents: true, platform });
   await vi.advanceTimersByTimeAsync(0);
   expect(f.manager.status(f.handle.id).status).toBe("finishing");
   expect(f.isAlive).toHaveBeenCalledOnce();
@@ -182,5 +208,63 @@ it("captures legacy custody once before native close without polling", async () 
   await vi.advanceTimersByTimeAsync(0);
   expect((await f.manager.wait(f.handle.id)).status).toBe("completed");
   expect(f.isAlive).toHaveBeenCalledTimes(2);
+  expect(f.stop).not.toHaveBeenCalled();
+});
+
+it("joins Windows stop before a native-close wait can latch timeout debt", async () => {
+  const f = await fixture({ platform: "win32", killOnStop: true });
+  await vi.advanceTimersByTimeAsync(6_999);
+  expect(f.stop).not.toHaveBeenCalled();
+  expect(f.isAlive).not.toHaveBeenCalled();
+  expect(f.manager.status(f.handle.id).status).toBe("finishing");
+  await vi.advanceTimersByTimeAsync(1);
+  expect(f.stop).toHaveBeenCalledOnce();
+  expect(await f.manager.wait(f.handle.id)).toMatchObject({ status: "completed", warnings: ["finished with forced cleanup of 1 descendants"] });
+});
+
+it("retries exact transient stop custody after close without freezing an early failure", async () => {
+  const f = await fixture({ workerFinishing: true, killOnStop: true, stopFailures: 1 });
+  await vi.advanceTimersByTimeAsync(0);
+  await expect(f.manager.stop(f.handle.id)).resolves.toMatchObject({ status: "completed", text: "QUIESCENT" });
+  await vi.advanceTimersByTimeAsync(0);
+  expect(await f.manager.wait(f.handle.id)).toMatchObject({ status: "completed", text: "QUIESCENT" });
+  expect(f.stop).toHaveBeenCalledTimes(2);
+});
+
+it("keeps repeated stop failure terminal even when the primary worker closed", async () => {
+  const f = await fixture({ workerFinishing: true, killOnStop: true, stopFailures: Infinity });
+  await vi.advanceTimersByTimeAsync(0);
+  await expect(f.manager.stop(f.handle.id)).resolves.toMatchObject({ status: "failed", errorCode: "CUSTODY_UNCONFIRMED" });
+  await vi.advanceTimersByTimeAsync(0);
+  const result = await f.manager.wait(f.handle.id);
+  expect(result).toMatchObject({ status: "failed", errorCode: "CUSTODY_UNCONFIRMED" });
+  fs.writeFileSync(f.statusFile, JSON.stringify({ ...result, status: "completed" }));
+  expect(f.manager.status(f.handle.id)).toMatchObject({ status: "failed", errorCode: "CUSTODY_UNCONFIRMED" });
+  await f.manager.close(); // Exact native exit can clear custody, not revive the outcome.
+  expect(f.manager.status(f.handle.id)).toMatchObject({ status: "failed", errorCode: "CUSTODY_UNCONFIRMED" });
+  managers.splice(managers.indexOf(f.manager), 1);
+});
+
+it("never retries a deadline stop through #stop: a transient timeout stop failure stays failed, not stopped", async () => {
+  const f = await fixture({ workerRunning: true, timeoutMs: 100, killOnStop: true, stopFailures: 1 });
+  await vi.advanceTimersByTimeAsync(2_000);
+  const result = await f.manager.wait(f.handle.id);
+  expect(result).toMatchObject({ status: "failed", errorCode: "CUSTODY_UNCONFIRMED" });
+  expect(f.stop).toHaveBeenCalledOnce();
+  await f.manager.close(); // Exact native exit (second stop succeeds) cannot revive the outcome.
+  expect(f.manager.status(f.handle.id)).toMatchObject({ status: "failed", errorCode: "CUSTODY_UNCONFIRMED" });
+  managers.splice(managers.indexOf(f.manager), 1);
+});
+
+it("keeps the Windows native-close contract: no pre-close probe, one checked probe after close", async () => {
+  const f = await fixture({ platform: "win32" });
+  await vi.advanceTimersByTimeAsync(1_000);
+  // Windows isAlive() does not enumerate descendants, so there is nothing to seed.
+  expect(f.isAlive).not.toHaveBeenCalled();
+  expect(f.manager.status(f.handle.id).status).toBe("finishing");
+  f.exit();
+  await vi.advanceTimersByTimeAsync(0);
+  expect((await f.manager.wait(f.handle.id)).status).toBe("completed");
+  expect(f.isAlive).toHaveBeenCalledOnce();
   expect(f.stop).not.toHaveBeenCalled();
 });

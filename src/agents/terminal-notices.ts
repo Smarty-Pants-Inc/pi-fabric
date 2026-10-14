@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { writeJsonAtomic } from "../core/atomic-write.js";
+import { syncPathNamespace, writeJsonAtomic } from "../core/atomic-write.js";
 import { readFinalAnswerReceipt, withTaskFinalAnswerLock } from "../worker/terminal-answer.js";
 import type { AgentTerminalNotice } from "./terminal-target.js";
 import { followUpFile, releaseFollowUpPayload, settleFollowUp } from "./follow-up-delivery.js";
@@ -47,7 +47,8 @@ export const terminalControlMatchesAdmission = (value: unknown, admission: Termi
  * Legacy queued rows without transport evidence remain uncertain. */
 export const terminalControlRefusalProven = (directory: string, admission: TerminalAdmission, runId: string): boolean =>
   withTaskFinalAnswerLock(directory, () => {
-    if (!readFinalAnswerReceipt(directory, runId)) return false;
+    const receipt = readFinalAnswerReceipt(directory, runId);
+    if (!receipt) return false;
     const file = path.join(directory, "terminal-controls", `${admission.id}.json`);
     let control: { state?: string; forwarded?: unknown };
     try { control = JSON.parse(fs.readFileSync(file, "utf8")); }
@@ -65,7 +66,20 @@ export const terminalControlRefusalProven = (directory: string, admission: Termi
         control.forwarded !== undefined && typeof control.forwarded !== "boolean") return false;
     if (control.state === "refused") return true;
     if (control.state !== "queued" || control.forwarded !== false) return false;
-    // The receipt blocks every later injection under this same lock.
+    // The receipt blocks every later injection under this same lock. Recovery
+    // must publish the same lifecycle evidence as the worker BEFORE the registry
+    // transition; a failed barrier leaves the unforwarded row queued for retry.
+    const lifecycleFile = path.join(directory, "lifecycle.jsonl");
+    const data = { code: "FABRIC_TARGET_TERMINAL", targetId: runId, messageId: admission.id,
+      delivery: admission.delivery, finalAnswerReceiptId: receipt.id,
+      ...(admission.sender ? { sender: admission.sender } : {}) };
+    const descriptor = fs.openSync(lifecycleFile, "a", 0o600);
+    try {
+      fs.appendFileSync(descriptor, JSON.stringify({ version: 1, event: "message.refused",
+        runId, occurredAt: Date.now(), data }) + "\n", "utf8");
+      fs.fsyncSync(descriptor);
+    } finally { fs.closeSync(descriptor); }
+    syncPathNamespace(lifecycleFile);
     writeJsonAtomic(file, { ...control, state: "refused" }, { durable: true });
     return true;
   });

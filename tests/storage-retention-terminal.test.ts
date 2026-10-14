@@ -9,6 +9,7 @@ import { TerminalNoticeOutbox, readTerminalAdmission, terminalControlMatchesAdmi
 import { writeJsonAtomic } from "../src/core/atomic-write.js";
 import { canRemoveTerminalRun, pruneActorRunArchives } from "../src/storage/retention.js";
 import { saveFinalAnswerReceipt } from "../src/worker/terminal-answer.js";
+import { markTerminalControlForwarded, settleTerminalControl, trackTerminalControl } from "../src/worker/terminal-controls.js";
 
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
@@ -19,8 +20,8 @@ const fixture = () => {
   const record = { id: "run", runner: "pi", status: "completed", transport: "process", sessionId: "99999999", updatedAt: Date.now(),
     finalAnswerReceipt: { id: receipt.id, recordedAt: receipt.recordedAt } };
   writeJsonAtomic(path.join(run, "status.json"), record);
-  const sender = { id: "session:sender", kind: "main", verified: "mesh" };
-  const provenance = { v: 1, channel: "fabric", via: "steer", sender };
+  const sender = { id: "session:sender", kind: "main" as const, verified: "mesh" as const };
+  const provenance = { v: 1 as const, channel: "fabric" as const, via: "steer" as const, sender };
   const id = "11111111-1111-4111-8111-111111111111";
   const notice = { code: "FABRIC_TARGET_TERMINAL", targetId: "run", finalAnswerReceiptId: receipt.id, delivery: "steer", messageId: id, sender };
   const control = { id, delivery: "steer", state: "refused", provenance };
@@ -133,6 +134,176 @@ describe("terminal-answer retention custody", () => {
     expect(delivered).toHaveLength(1);
     expect(canRemoveTerminalRun(f.run)).toBe(true);
   });
+  // Recovery has no live worker: use the real admission, receipt, native registry,
+  // outbox and route ACK files. Microtasks drain the outbox's Promise chain only.
+  const drainNoticeRoute = async (): Promise<void> => {
+    for (let i = 0; i < 8; i++) await Promise.resolve();
+  };
+  const queuedRecoveryFixture = () => {
+    const f = fixture();
+    trackTerminalControl(f.run, { id: f.id, delivery: "steer", provenance: f.control.provenance });
+    expect(fs.existsSync(path.join(f.run, "lifecycle.jsonl"))).toBe(false);
+    return f;
+  };
+  const refusalEvents = (file: string): { event: string; data: unknown }[] =>
+    fs.existsSync(file) ? fs.readFileSync(file, "utf8").split("\n").filter(Boolean).map(line => JSON.parse(line)) : [];
+  const sameInode = (a: fs.Stats, b: fs.Stats): boolean => a.dev === b.dev && a.ino === b.ino;
+  const matchesRefusal = (event: { event: string; data: unknown }, notice: ReturnType<typeof fixture>["notice"]): boolean => {
+    const data = event.data as typeof notice | undefined;
+    return event.event === "message.refused" && data?.code === notice.code && data.targetId === notice.targetId &&
+      data.messageId === notice.messageId && data.delivery === notice.delivery && data.finalAnswerReceiptId === notice.finalAnswerReceiptId &&
+      data.sender?.id === notice.sender.id && data.sender.kind === notice.sender.kind && data.sender.verified === notice.sender.verified;
+  };
+
+  it("rehydrates an unforwarded refusal with lifecycle file and namespace barriers before registry publication, then routes once", async () => {
+    const f = queuedRecoveryFixture();
+    const registry = path.join(f.run, "terminal-controls", `${f.id}.json`);
+    const lifecycle = path.join(f.run, "lifecycle.jsonl");
+    const pending = path.join(f.run, "terminal-notices", `${f.id}.json`);
+    const namespaces: fs.Stats[] = [];
+    for (let directory = f.run; ; directory = path.dirname(directory)) {
+      namespaces.push(fs.statSync(directory));
+      if (path.dirname(directory) === directory) break;
+    }
+    let lifecycleSynced = false;
+    const syncedNamespaces: fs.Stats[] = [];
+    const publications: { queuedBefore: boolean; matchingEvent: boolean; fileSynced: boolean; namespaceSynced: boolean }[] = [];
+    const nativeSync = fs.fsyncSync;
+    const sync = vi.spyOn(fs, "fsyncSync").mockImplementation(fd => {
+      const inode = fs.fstatSync(fd);
+      nativeSync(fd);
+      if (fs.existsSync(lifecycle) && sameInode(inode, fs.statSync(lifecycle)) &&
+          refusalEvents(lifecycle).some(event => matchesRefusal(event, f.notice))) {
+        lifecycleSynced = true;
+        syncedNamespaces.length = 0; // Only namespace barriers AFTER the matching file fsync count.
+      } else if (lifecycleSynced && inode.isDirectory()) syncedNamespaces.push(inode);
+    });
+    const nativeRename = fs.renameSync;
+    const rename = vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+      if (String(to) === registry && JSON.parse(fs.readFileSync(from, "utf8")).state === "refused") {
+        // Observe synchronously BEFORE the actual registry rename, not after recover
+        // returns. Assertions stay outside recover's intentionally fail-closed catch.
+        publications.push({
+          queuedBefore: JSON.parse(fs.readFileSync(registry, "utf8")).state === "queued",
+          matchingEvent: refusalEvents(lifecycle).some(event => matchesRefusal(event, f.notice)),
+          fileSynced: lifecycleSynced,
+          namespaceSynced: process.platform === "win32" || namespaces.every(expected => syncedNamespaces.some(actual => sameInode(expected, actual))),
+        });
+      }
+      nativeRename(from, to);
+    });
+    const delivered: unknown[] = [];
+    const successor = new TerminalNoticeOutbox(notice => { delivered.push(notice); });
+    try {
+      successor.recover(f.run);
+      await drainNoticeRoute();
+    } finally { rename.mockRestore(); sync.mockRestore(); }
+    expect(publications).toEqual([{ queuedBefore: true, matchingEvent: true, fileSynced: true, namespaceSynced: true }]);
+    expect(JSON.parse(fs.readFileSync(registry, "utf8"))).toEqual({ ...f.control, forwarded: false });
+    expect(delivered).toEqual([f.notice]);
+    expect(JSON.parse(fs.readFileSync(`${pending}.delivered`, "utf8"))).toEqual(f.notice);
+    expect(fs.existsSync(pending)).toBe(false);
+    successor.recover(f.run);
+    new TerminalNoticeOutbox(notice => { delivered.push(notice); }).recover(f.run);
+    await drainNoticeRoute();
+    expect(delivered).toEqual([f.notice]);
+    expect(canRemoveTerminalRun(f.run)).toBe(true);
+  });
+
+  it.each(["append", "fsync"] as const)("keeps queued custody and no sender ACK on lifecycle %s failure, then retries recovery", async fault => {
+    const f = queuedRecoveryFixture();
+    const registry = path.join(f.run, "terminal-controls", `${f.id}.json`);
+    const before = fs.readFileSync(registry, "utf8");
+    const lifecycle = path.join(f.run, "lifecycle.jsonl");
+    const pending = path.join(f.run, "terminal-notices", `${f.id}.json`);
+    const isLifecycle = (file: fs.PathLike | number): boolean => typeof file === "number"
+      ? fs.existsSync(lifecycle) && sameInode(fs.fstatSync(file), fs.statSync(lifecycle))
+      : String(file) === lifecycle;
+    let faults = 0;
+    const nativeAppend = fs.appendFileSync;
+    const append = vi.spyOn(fs, "appendFileSync").mockImplementation((file, data, options) => {
+      if (fault === "append" && isLifecycle(file)) {
+        faults++;
+        throw Object.assign(new Error("lifecycle append unavailable"), { code: "EIO" });
+      }
+      nativeAppend(file, data, options);
+    });
+    const nativeSync = fs.fsyncSync;
+    const sync = vi.spyOn(fs, "fsyncSync").mockImplementation(fd => {
+      if (fault === "fsync" && isLifecycle(fd)) {
+        faults++;
+        throw Object.assign(new Error("lifecycle fsync unavailable"), { code: "EIO" });
+      }
+      nativeSync(fd);
+    });
+    const delivered: unknown[] = [];
+    const successor = new TerminalNoticeOutbox(notice => { delivered.push(notice); });
+    try {
+      successor.recover(f.run);
+      await drainNoticeRoute();
+      expect(faults).toBeGreaterThan(0);
+      expect(fs.readFileSync(registry, "utf8")).toBe(before);
+      expect(fs.existsSync(path.dirname(pending))).toBe(false);
+      expect(fs.existsSync(`${pending}.delivered`)).toBe(false);
+      expect(delivered).toEqual([]);
+      expect(canRemoveTerminalRun(f.run)).toBe(false);
+    } finally { append.mockRestore(); sync.mockRestore(); }
+    successor.recover(f.run);
+    await drainNoticeRoute();
+    expect(JSON.parse(fs.readFileSync(registry, "utf8"))).toEqual({ ...f.control, forwarded: false });
+    expect(refusalEvents(lifecycle)).toContainEqual(expect.objectContaining({ event: "message.refused", data: f.notice }));
+    expect(delivered).toEqual([f.notice]);
+    expect(JSON.parse(fs.readFileSync(`${pending}.delivered`, "utf8"))).toEqual(f.notice);
+    successor.recover(f.run);
+    await drainNoticeRoute();
+    expect(delivered).toEqual([f.notice]);
+    expect(canRemoveTerminalRun(f.run)).toBe(true);
+  });
+
+  it.each([
+    { state: "queued", forwarded: true }, { state: "queued" },
+    { state: "delivered", forwarded: true }, { state: "delivered", forwarded: false },
+  ])("never turns uncertain or consumed $state/$forwarded into undelivered during recovery", async transport => {
+    const f = fixture();
+    const registry = path.join(f.run, "terminal-controls", `${f.id}.json`);
+    writeJsonAtomic(registry, { ...f.control, ...transport }, { durable: true });
+    const before = fs.readFileSync(registry, "utf8");
+    const delivered: unknown[] = [];
+    const successor = new TerminalNoticeOutbox(notice => { delivered.push(notice); });
+    successor.recover(f.run);
+    successor.recover(f.run);
+    await drainNoticeRoute();
+    expect(fs.readFileSync(registry, "utf8")).toBe(before);
+    expect(fs.existsSync(path.join(f.run, "lifecycle.jsonl"))).toBe(false);
+    expect(fs.existsSync(path.join(f.run, "terminal-notices"))).toBe(false);
+    expect(delivered).toEqual([]);
+    expect(canRemoveTerminalRun(f.run)).toBe(transport.state === "delivered");
+  });
+
+  it("routes an actual forwarded native discard ACK without fabricating a worker protocol event", async () => {
+    const f = queuedRecoveryFixture();
+    // These are the native child's real durable registry APIs, not a synthetic
+    // lifecycle claim. A forwarded queued row is still uncertain until this ACK.
+    expect(markTerminalControlForwarded(f.run, f.id)).toBe(true);
+    const delivered: unknown[] = [];
+    const successor = new TerminalNoticeOutbox(notice => { delivered.push(notice); });
+    successor.recover(f.run);
+    await drainNoticeRoute();
+    expect(delivered).toEqual([]);
+    expect(settleTerminalControl(f.run, f.id, "refused")).toMatchObject({ state: "refused", forwarded: true });
+    const registry = path.join(f.run, "terminal-controls", `${f.id}.json`);
+    const acknowledged = fs.readFileSync(registry, "utf8");
+    successor.recover(f.run);
+    await drainNoticeRoute();
+    expect(delivered).toEqual([f.notice]);
+    expect(JSON.parse(fs.readFileSync(path.join(f.run, "terminal-notices", `${f.id}.json.delivered`), "utf8"))).toEqual(f.notice);
+    successor.recover(f.run);
+    await drainNoticeRoute();
+    expect(delivered).toEqual([f.notice]);
+    expect(fs.readFileSync(registry, "utf8")).toBe(acknowledged);
+    expect(canRemoveTerminalRun(f.run)).toBe(true);
+  });
+
   it.each(["delivery", "sender", "id", "kind", "name", "verified", "missing-provenance"])("retains mismatched delivered %s uncertainty without fabricating a refusal during recovery", async mismatch => {
     const f = fixture();
     const sender = f.control.provenance.sender;

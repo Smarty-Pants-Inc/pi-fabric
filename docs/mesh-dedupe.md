@@ -61,6 +61,56 @@ Choose a stable key covering the source store ID, route, delivery ID, and topic;
 key reuse for unrelated deliveries suppresses them. This is publication dedupe,
 not exactly-once arbitrary consumer or external side effects.
 
+## Durability barrier before an external cursor (smarty-dev#9313)
+
+A producer that keeps its own cursor or delivered mark outside the mesh (an
+fsynced JSON file, a mailbox state file) must not let that record survive an OS
+crash that drops the mesh events or state it covers. A plain `publish` does not
+fsync the live log (only a keyed, `durable` or batch publication does), and
+SQLite state commits with `synchronous=NORMAL`. The barrier is:
+
+- `MeshStore.sync(budgetMs = 1000)` resolves once every event **and** every
+  keyed-state write made on the root before the call, by any process, is on
+  disk. Events: the same group-committed fsync of `events.jsonl` and its
+  namespace as a durable publish, after `.lock` is released (archived events are
+  already fdatasynced per publish). SQLite state: the store's PASSIVE checkpoint
+  barrier (no copy or fsync under SQLite's writer lock, smarty-dev#6100), retried
+  within `budgetMs`. File state: an fsync of `state.json` and its namespace.
+  On Windows there is no directory fsync, so every namespace step of the
+  barrier fails closed before any I/O: the event log rejects with
+  `MeshEventsNotDurableError` (`FABRIC_MESH_EVENTS_NOT_DURABLE`), which
+  `mesh.sync` therefore surfaces on Windows whatever the state backend, and
+  file state rejects with `MeshStateFileNotDurableError`
+  (`FABRIC_MESH_STATE_FILE_NOT_DURABLE`). All refusals are one shape,
+  `MeshSyncNotDurableError` (`code` per backend, `retryable: false`): not durable.
+  Shadow state syncs its authority, `state.json`, and so rejects the same way. NATS state resolves at once
+  when the server reported `sync_always` at open; a backend opened with
+  `acceptPeriodicSync` cannot confirm durability, so the barrier rejects with
+  `MeshStateNatsNotDurableError` (`FABRIC_MESH_STATE_NATS_NOT_DURABLE`). It
+  throws otherwise.
+- Host `mesh.sync` (`{ budgetMs?: 0..60000 }`) is the provider action for
+  trusted components that have no `MeshStore` of their own. It is in the same
+  trust class as `dedupeKey` and `publishBatch`: declare `mesh.sync` in
+  `requires`; public catalogs, QuickJS guests and forged contexts get
+  `MeshHostPublishError` (`FABRIC_MESH_HOST_PUBLISH_REQUIRED`). It returns
+  `{ synced: true, through }`; `MeshStore.sync()` resolves with `{ through }`.
+- `through` is the highest sequence committed to the log (a complete line)
+  before the barrier's fsync, so every live event at or below it is on disk.
+  Advance an event cursor only to `through`. It is never `latestSequence()`:
+  that includes the reservation counter, which a publisher advances under
+  `.lock` before its append, so a cursor fsynced past `through` could skip an
+  event after a crash (pi-fabric#894).
+
+```ts host
+await context.call("mesh.publish", { topic: "github.delivery", data });
+await context.call("mesh.put", { key: `${cursorKey}/failed/${seq}`, value: record });
+await context.call("mesh.sync", {});   // throws: leave the cursor where it was
+writeCursorDurably(cursorFile, next);  // only now
+```
+
+A failed fsync is never retried inside the barrier (its dirty pages may already
+be gone); only a concurrent rename seen by the namespace check is retried.
+
 ## Locked protocol
 
 Admission, append, recovery, and compaction hold the existing mesh lock. Without

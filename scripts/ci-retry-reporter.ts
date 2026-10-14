@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import path from "node:path";
 import type { Reporter, TestCase } from "vitest/node";
 
 // Lists every test that CI retried (smarty-dev#7651), on stdout and in the GitHub step summary. A retried test
@@ -15,14 +16,16 @@ export default class CiRetryReporter implements Reporter {
     const error = result.errors?.[0];
     if (error) {
       const root = process.cwd().replace(/\\/g, "/") + "/";
-      const frame = error.stack?.split("\n").find(line => {
-        const normalized = line.replace(/\\/g, "/");
-        return line.trimStart().startsWith("at ") && normalized.includes(root) && !normalized.includes("/node_modules/");
-      });
-      const message = error.message.split(/\r?\n/).slice(0, 2).map(line => `    ${line.slice(0, 240)}`).join("\n");
-      detail = `  first failure (${error.name ?? "Error"}):\n${message}${frame ? `\n    ${frame.trim().slice(0, 300)}` : ""}`;
+      const location = error.stack?.split("\n").map(line => {
+        const normalized = line.replace(/\\/g, "/").trim();
+        if (!normalized.startsWith("at ") || !normalized.includes(root) || normalized.includes("/node_modules/")) return undefined;
+        return normalized.slice(normalized.lastIndexOf(root) + root.length).match(/^([^()\r\n]+:\d+:\d+)\)?$/)?.[1];
+      }).find(location => location !== undefined && location.length <= 300);
+      // Error messages can contain credentials or private records. Emit only the class and source location.
+      if (location) detail = `  first failure (${error.name ?? "Error"}): ${location}`;
     }
-    this.#retried.push(`${test.module.moduleId} > ${test.fullName} (retried ${retries}x, final ${result.state})\n${detail}`);
+    const moduleId = path.relative(process.cwd(), test.module.moduleId).replace(/\\/g, "/");
+    this.#retried.push(`${moduleId} > ${test.fullName} (retried ${retries}x, final ${result.state})\n${detail}`);
   }
 
   onTestRunEnd(): void {

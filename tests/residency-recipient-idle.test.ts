@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { EventEmitter } from "node:events";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -46,9 +47,14 @@ const setup = (metadata: Pick<ResidentHostConfig, "mainName" | "mainStartedAt">,
 // A live-name journal derives its recipient even when pending() finds no results.
 // That metadata must not invoke lastKnown's fresh full-fleet scan every idle poll.
 describe("ResidencyClient completion recipient metadata", () => {
-  it("limits empty delivery state scans to 1 s despite actorPollMs 20, and closes both timers", async () => {
+  it("scans only on delivery events despite actorPollMs 20, and closes notification/retry timers", async () => {
     vi.useFakeTimers();
-    const { client } = setup({ mainName: "fixed lane", mainStartedAt: 456 });
+    let notify!: (event: string, name: string) => void;
+    const { client, meshRoot } = setup({ mainName: "fixed lane", mainStartedAt: 456 });
+    vi.spyOn(fs, "watch").mockImplementation(((directory: string, callback: typeof notify) => {
+      if (directory === meshRoot) notify = callback;
+      return Object.assign(new EventEmitter(), { close: vi.fn(), unref: vi.fn() }) as unknown as fs.FSWatcher;
+    }) as unknown as typeof fs.watch);
     const reads = vi.spyOn(client.options.mesh, "listAll");
     const polls = () => reads.mock.calls.filter(([prefix]) => prefix === "residency/deliveries/").length;
     try {
@@ -58,8 +64,14 @@ describe("ResidencyClient completion recipient metadata", () => {
       await vi.advanceTimersByTimeAsync(999);
       expect(polls()).toBe(1);
       await vi.advanceTimersByTimeAsync(1);
+      expect(polls()).toBe(1); // elapsed idle time has no delivery duty
+      notify("change", "state.json");
+      await vi.advanceTimersByTimeAsync(25);
       expect(polls()).toBe(2);
-      await vi.advanceTimersByTimeAsync(2_000);
+      notify("change", "state.json");
+      await vi.advanceTimersByTimeAsync(1_000);
+      notify("change", "state.json");
+      await vi.advanceTimersByTimeAsync(1_000);
       expect(polls()).toBe(4);
       await client.close();
       await vi.advanceTimersByTimeAsync(2_000);

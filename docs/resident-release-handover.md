@@ -29,7 +29,11 @@ This replaces round 2's post-B `blocked` scope cut. We do **not** accept loss of
 service on healthy storage with usable A, claim complete descendant cleanup, or
 claim the old failed-B recovery matrix applies to this head. B failure and Main
 loss *after B spawn* are unreachable on this policy: no B attempt is authorized.
-Use the existing explicit installer drain/exit-proof path to change releases.
+There is no implemented installer drain/exit-proof command that can safely move
+an already-loaded legacy resident. The [`fabric-resident-drain` preflight](resident-drain.md)
+returns a JSON refusal and leaves it serving: current resident operations do not
+provide a preserving admission fence. Do not substitute actor stop (it cancels
+accepted queues), launcher exit, or an empty process group for that missing proof.
 
 Launcher shutdown tracks its directly spawned child through native process exit.
 A missing Linux birth observation cannot suppress native TERM/KILL, and inherited

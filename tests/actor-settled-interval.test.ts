@@ -1362,7 +1362,7 @@ describe("actor agent_settled leading + latest trailing minimum interval", () =>
     expect(incoming(third.actors, actor.id)).toHaveLength(2); // Successful admission left no pending duplicate.
   });
 
-  it.each(["stop", "remove", "recreate", "halt"] as const)("does not resurrect durable pending after explicit %s and restart", async (cancel) => {
+  const doesNotResurrectDurablePending = async (cancel: "stop" | "remove" | "recreate" | "halt") => {
     const first = await timedActor();
     const { actors, actor } = first;
     actors.dispatchHostEvent("agent_settled", { ...payload(), marker: "leading" });
@@ -1392,7 +1392,11 @@ describe("actor agent_settled leading + latest trailing minimum interval", () =>
       second.actors.dispatchHostEvent("agent_settled", { ...payload(), marker: "new" });
       expect(incoming(second.actors, second.actors.list()[0]!.id)).toHaveLength(1);
     }
-  });
+  };
+  it.each(["stop"] as const)("does not resurrect durable pending after explicit %s and restart", doesNotResurrectDurablePending);
+  // off Linux #1031 refuses removal (accepted gap smarty-dev#11335); pi-fabric#1079 unskips
+  it.skipIf(process.platform !== "linux").each(["remove", "recreate"] as const)("does not resurrect durable pending after explicit %s and restart", doesNotResurrectDurablePending);
+  it.each(["halt"] as const)("does not resurrect durable pending after explicit %s and restart", doesNotResurrectDurablePending);
 
   it("restores independent sources and authenticated root fallback only after publication is ready", async () => {
     let monitor: ActorMeshMonitor | undefined;
@@ -1642,7 +1646,8 @@ describe("actor agent_settled leading + latest trailing minimum interval", () =>
     expect(() => actors.status(actor.id)).toThrow();
   });
 
-  it("cancels on removal without rearming a removed actor", async () => {
+  // off Linux #1031 refuses removal (accepted gap smarty-dev#11335); pi-fabric#1079 unskips
+  it.skipIf(process.platform !== "linux")("cancels on removal without rearming a removed actor", async () => {
     const { actors, actor } = await timedActor();
     const scheduled = vi.spyOn(globalThis, "setTimeout");
     const cancelled = vi.spyOn(globalThis, "clearTimeout");

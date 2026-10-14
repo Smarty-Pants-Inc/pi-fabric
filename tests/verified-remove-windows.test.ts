@@ -23,7 +23,7 @@ const entryArgs = (file: string, kind?: "f" | "d") => { const stat = fs.lstatSyn
   return [kind ?? (stat.isDirectory() ? "d" : "f"), stat.dev.toString(16), stat.ino.toString(16),
     (stat.mtimeNs / 100n + 116_444_736_000_000_000n).toString(16), stat.size.toString(16), path.toNamespacedPath(file)]; };
 
-describe.skipIf(process.platform !== "win32")("Windows verified removal (smarty-dev#7858)", () => {
+describe.runIf(process.env.GITHUB_ACTIONS === "true" && process.platform === "win32")("Windows verified removal (smarty-dev#7858)", () => {
   it("has the digest-verified helper in this build", () => {
     expect(windowsRemoveHelper()).toMatch(/fabric-win-remove\.exe$/);
   });

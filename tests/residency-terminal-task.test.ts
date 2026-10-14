@@ -79,6 +79,77 @@ describe("resident ordinary-task terminal notices", () => {
     } finally { f.close(); await sender.close(); await f.host.close(); f.launch.mockRestore(); fs.rmSync(f.root, { recursive: true, force: true }); }
   });
 
+  it("E-steer-final resident owner refuses an append-race ACK and still admits pre-final input", async () => {
+    const f = fixture();
+    const who: MeshIdentity = { id: f.config.rootId, name: "Root sender", kind: "main" };
+    const sender = new FabricControlPlane(new MeshStore(f.config.meshRoot, 65536, 1000), who,
+      { enabled: true, hostId: who.id, pollMs: 20, acknowledgementTimeoutMs: 2000 });
+    let appendSpy: ReturnType<typeof vi.spyOn> | undefined;
+    try {
+      await f.host.start(); sender.start(() => ({ accepted: false }));
+      const task = await f.host.agents.spawn({ task: "HANG", transport: "process" });
+      const run = f.host.agents.runDirectory(task.id)!;
+      const journal = path.join(run, "steer.jsonl");
+      const allowed = await sender.request(f.host.hostId, task.id, "steer", { message: "before final" }, f.host.identity.id);
+      expect(allowed).toMatchObject({ acknowledged: true });
+      // The fake child does not consume controls. Mark the exact original
+      // admission consumed, as native context delivery does in E-steer-final.
+      const admission = JSON.parse(fs.readFileSync(journal, "utf8").trim());
+      writeJsonAtomic(path.join(run, "terminal-controls", `${allowed.messageId}.json`), {
+        id: allowed.messageId, delivery: "steer", state: "delivered", provenance: admission.provenance,
+      });
+      const append = fs.appendFileSync;
+      let receipt: ReturnType<typeof saveFinalAnswerReceipt> | undefined;
+      let racingId = "";
+      appendSpy = vi.spyOn(fs, "appendFileSync").mockImplementation(((file: fs.PathOrFileDescriptor, data: string | Uint8Array, options?: fs.WriteFileOptions) => {
+        if (file === journal && !receipt) {
+          racingId = JSON.parse(String(data)).id;
+          const snapshot = JSON.parse(fs.readFileSync(path.join(run, "status.json"), "utf8"));
+          receipt = saveFinalAnswerReceipt(run, task.id, "durable final answer");
+          writeJsonAtomic(path.join(run, "status.json"), { ...snapshot, status: "completed", text: receipt.text,
+            finalAnswerReceipt: { id: receipt.id, recordedAt: receipt.recordedAt }, finishedAt: receipt.recordedAt });
+        }
+        return append(file, data, options);
+      }) as typeof fs.appendFileSync);
+      await expect(sender.request(f.host.hostId, task.id, "steer", { message: "racing final" }, f.host.identity.id))
+        .rejects.toMatchObject({ code: "FABRIC_TARGET_TERMINAL", deliveryStatus: "undelivered", targetId: task.id,
+          reason: "run-ended", runState: "completed", message: expect.stringContaining("undelivered: task already finished") });
+      expect(receipt).toBeDefined();
+      expect(await f.host.agents.wait(task.id, { timeoutMs: 3000 })).toMatchObject({ status: "completed", text: receipt!.text });
+      await vi.waitFor(() => {
+        const deliveries = f.host.mesh.listAll(residentDeliveryPrefix(who.id)).map(row => row.value as any);
+        expect(deliveries.filter(row => row.data?.code === "FABRIC_TARGET_TERMINAL")).toEqual([expect.objectContaining({
+          rootId: who.id, triggerTurn: false, message: expect.stringContaining("undelivered: task already finished"),
+          data: expect.objectContaining({ messageId: racingId, finalAnswerReceiptId: receipt!.id, sender: expect.objectContaining({ id: who.id }) }),
+        })]);
+      });
+      const bytes = fs.readFileSync(journal, "utf8");
+      await expect(sender.request(f.host.hostId, task.id, "steer", { message: "after final" }, f.host.identity.id))
+        .rejects.toMatchObject({ code: "FABRIC_TARGET_TERMINAL", deliveryStatus: "undelivered", runState: "completed" });
+      expect(fs.readFileSync(journal, "utf8")).toBe(bytes);
+    } finally {
+      appendSpy?.mockRestore(); await sender.close(); await f.host.close();
+      // Retain this race proof; no real fixture deletion in the local path.
+    }
+  });
+
+  // Decision C: only the manager's append-race receipt is mocked to pin a resolved
+  // run state; the resident host, control planes and sender error are real.
+  it.each(["completed", "failed"] as const)("resident owner carries the real %s run state of an append-race receipt", async runState => {
+    const f = fixture();
+    const who: MeshIdentity = { id: f.config.rootId, name: "Root sender", kind: "main" };
+    const sender = new FabricControlPlane(new MeshStore(f.config.meshRoot, 65536, 1000), who,
+      { enabled: true, hostId: who.id, pollMs: 20, acknowledgementTimeoutMs: 2000 });
+    try {
+      await f.host.start(); sender.start(() => ({ accepted: false }));
+      const task = await f.host.agents.spawn({ task: "HANG", transport: "process" });
+      vi.spyOn(f.host.agents, "steer").mockReturnValueOnce({ queued: true, messageId: "m-race", undelivered: { code: "FABRIC_TARGET_TERMINAL",
+        reason: "run-ended", deliveryStatus: "undelivered", messageId: "m-race", delivery: "steer", finalAnswerReceiptId: "race-receipt", runState } });
+      await expect(sender.request(f.host.hostId, task.id, "steer", { message: "racing" }, f.host.identity.id))
+        .rejects.toMatchObject({ code: "FABRIC_TARGET_TERMINAL", targetId: task.id, finalAnswerReceiptId: "race-receipt", runState });
+    } finally { vi.restoreAllMocks(); await sender.close(); await f.host.close(); }
+  });
+
   it("retains an unavailable peer sender and retries through its exact restored owner on status", async () => {
     const f = fixture();
     const who: MeshIdentity = { id: "session:peer-sender", name: "Peer sender", kind: "main" };

@@ -42,7 +42,7 @@ export const isInside = (root: string, target: string): boolean => {
 };
 
 // Mirrors Pi's write/edit resolution (unicode spaces, @ prefix, ~, file://).
-const resolveToolPath = (input: string, cwd: string): string => {
+export const resolveToolPath = (input: string, cwd: string): string => {
   let value = input.replace(/[  -   　]/g, " ");
   if (value.startsWith("@")) value = value.slice(1);
   if (value === "~") return os.homedir();

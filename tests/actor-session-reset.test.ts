@@ -430,7 +430,14 @@ describe("actor session reset (smarty-dev#1439)", () => {
     const dir = path.dirname(actor.sessionFile!);
     fs.mkdirSync(dir, { recursive: true });
     const stamp = "20260927T150000000Z";
-    for (const name of [`session.jsonl.${stamp}.bak`, `session.jsonl.${stamp}-1.bak`]) fs.writeFileSync(path.join(dir, name), "{}\n");
+    // smarty-dev#11300: the prune orders by trusted mtime/ctime/inode and also keeps the newest by name. Written within
+    // one coarse clock tick (windows-latest), all three backups tied on time and NTFS inode order made the unsuffixed
+    // one "newest by age". Give the pre-existing backups distinct, older mtimes, as real earlier rotations have.
+    const older = Date.now() / 1000 - 120;
+    [`session.jsonl.${stamp}.bak`, `session.jsonl.${stamp}-1.bak`].forEach((name, n) => {
+      fs.writeFileSync(path.join(dir, name), "{}\n");
+      fs.utimesSync(path.join(dir, name), older + n, older + n);
+    });
     fs.writeFileSync(actor.sessionFile!, JSON.stringify({ type: "session", version: 3, id: "valid", timestamp: new Date().toISOString(), cwd: process.cwd() }) + "\n");
     vi.useFakeTimers({ toFake: ["Date"] });
     vi.setSystemTime(new Date("2026-09-27T15:00:00.000Z"));

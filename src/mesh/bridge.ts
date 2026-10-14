@@ -1,6 +1,7 @@
 import { copyFabricPrincipal, type FabricPrincipal } from "../fabric-provenance.js";
 import { createHash } from "node:crypto";
-import { isMeshLockTimeout, MESH_LOCK_TIMEOUT_CODE, meshDeferredSummary } from "../core/atomic-write.js";
+import { isMeshIncarnationPending, isMeshSnapshotRetriesExhausted, isMeshLockTimeout,
+  MESH_INCARNATION_PENDING_CODE, MESH_SNAPSHOT_RETRIES_EXHAUSTED_CODE, MESH_LOCK_TIMEOUT_CODE, meshDeferredSummary } from "../core/atomic-write.js";
 import fs from "node:fs";
 import path from "node:path";
 import type { Readable, Writable } from "node:stream";
@@ -15,6 +16,8 @@ import { CommitOutbox, type CommitOutboxEffect } from "./commit-outbox.js";
 import { assertBridgeStateBackend, isMeshRetryableBusy, isMeshStateBusy, isMeshStateWalCap } from "./state-backend.js";
 import { watchBridgeStore, type BridgeChange } from "./change-notifier.js";
 import { BRIDGE_BATCH_MAX_EVENTS } from "./event-log.js";
+import { HUB_FACTORY_RECIPIENT, isAddressedHubFactoryEvent, isWorkTopic, parseWorkTopic } from "./bridge-topics.js";
+export { HUB_FACTORY_RECIPIENT, isWorkTopic, parseWorkTopic } from "./bridge-topics.js";
 
 /**
  * Fabric mesh bridge v1 (smarty-dev#2004). Each host keeps its own mesh; one bridge process on the
@@ -25,7 +28,8 @@ import { BRIDGE_BATCH_MAX_EVENTS } from "./event-log.js";
  * Trust: the hub side is trusted; the remote side is not. An event from the remote crosses only
  * when its sender is a live participant native to the remote (and no hub record uses its id), and
  * its recipient is native to the hub, or is the hub factory's role address `factory` on a work
- * event or owner wake (smarty-dev#9352). Mirrored records never replace a native record. The one
+ * event or owner wake (smarty-dev#9352). Unaddressed WAIT/ETA issue records also cross to the
+ * factory (smarty-dev#9349), not other broadcasts. Mirrored records never replace a native record. The one
  * exception to "no hub record uses its id" is a hub-written handoff (smarty-dev#9074, below).
  */
 
@@ -65,6 +69,10 @@ const WAL_CAP_RETRY_MAX_MS = 30_000;
 /** The next wait after a WAL-cap refusal: `min` first, then doubling, at most 30 s. */
 export const walCapRetryDelay = (previous: number | undefined, min = WAL_CAP_RETRY_MIN_MS): number =>
   previous === undefined ? min : Math.min(Math.max(previous * 2, min), WAL_CAP_RETRY_MAX_MS);
+const meshBusyLabel = (error: unknown): string =>
+  isMeshIncarnationPending(error) ? "mesh incarnation pending"
+    : isMeshSnapshotRetriesExhausted(error) ? "mesh snapshot retries exhausted"
+      : isMeshStateWalCap(error) ? "mesh state WAL cap" : "mesh lock timeout";
 const MAX_RPC_LINE_BYTES = 16 * 1024 * 1024;
 /** A read page's event bytes stay under this, well inside one frame with its JSON envelope. */
 export const BRIDGE_PAGE_BYTES = 8 * 1024 * 1024;
@@ -95,31 +103,6 @@ const isIdentity = (value: unknown): value is MeshIdentity =>
 
 export const validBridgeName = (name: string): boolean => NAME_PATTERN.test(name);
 
-/** A mesh topic is at most this long (the event log's topic pattern); the parsers read no further. */
-const MAX_TOPIC_LENGTH = 128;
-const WORK_TOPIC_PREFIX = "fleet.work.";
-const WORK_SEGMENT = /^[A-Za-z0-9_-]+$/;
-const WORK_REPO = /^[A-Za-z0-9._-]+$/;
-const WORK_NUMBER = /^[1-9][0-9]{0,15}$/;
-
-/**
- * A well-formed work topic, `fleet.work.<name>` (pi-fabric#876 security pass, (a)): dot-separated,
- * non-empty ASCII segments of [A-Za-z0-9_-], at most 128 characters in all. Every work topic the
- * bridge allows, to any recipient, therefore also passes the mesh event log's and mesh_answers'
- * topic pattern. The one empty segment allowed is a dot-led repo name such as `.github`
- * (`fleet.work..github.7`), and only before two more segments. No `fleet.work.`, `fleet.work..1`,
- * `fleet.work.a..b.1`, trailing dot, NUL, space, lookalike or other non-ASCII character. Linear: a
- * length cap, one split and a character class per segment, never a backtracking pattern.
- */
-export const isWorkTopic = (topic: unknown): topic is string => {
-  if (typeof topic !== "string" || topic.length > MAX_TOPIC_LENGTH || !topic.startsWith(WORK_TOPIC_PREFIX)) return false;
-  const segments = topic.slice(WORK_TOPIC_PREFIX.length).split(".");
-  for (let index = segments[0] === "" && segments.length > 2 ? 1 : 0; index < segments.length; index++) {
-    if (!WORK_SEGMENT.test(segments[index]!)) return false;
-  }
-  return true;
-};
-
 /** v1 allow-list: control commands and acks, well-formed work events (isWorkTopic), owner wakes, and a work host's
  * mesh-outage alarm and its recovery, only when addressed to one `session:<uuid>` (pi-fabric#893 rounds 4-5). */
 export const isBridgedTopic = (event: Pick<MeshEvent, "topic" | "kind"> & { to?: unknown }): boolean =>
@@ -131,44 +114,14 @@ export const isBridgedTopic = (event: Pick<MeshEvent, "topic" | "kind"> & { to?:
     isMeshAlarmTarget(event.to));
 
 /**
- * The hub factory's role address (smarty-dev#9352). The factory on the hub reads work events and
- * owner wakes by topic, addressed to this literal name rather than to a participant id, so no hub
- * record answers to it. Only from the remote to the hub, only this exact name, and only on a
- * parsed `fleet.work.<repo>.<n>` topic (parseWorkTopic) or the allow-listed `ops.owner` kinds is it
- * an address across; every other check (allow-list, sender identity, reserved ids, live sender at
- * commit, frame budget) still holds, and the link's factory rate bound (factoryRate) applies.
- */
-export const HUB_FACTORY_RECIPIENT = "factory";
-
-/**
- * A work topic as work-host Mains name it, `fleet.work.<repo>.<n>` (pi-fabric#876 review, P1-1): a
- * non-empty repo segment of [A-Za-z0-9._-] (never `.` or `..`, which name no repo) and a decimal
- * issue or PR number without a sign or leading zero. The number is the segment after the last
- * dot, so a dotted repo name still parses. It is a well-formed work topic first (isWorkTopic).
- * Linear in the topic: an untrusted remote's string meets no backtracking pattern. Anything else
- * (`fleet.work.`, `fleet.work.<repo>`, `fleet.work.inbox-receipts`, `fleet.work..1`,
- * `fleet.work.<repo>.1.extra`, `fleet.work.a:b.1`, a lookalike or a NUL) is undefined.
- */
-export const parseWorkTopic = (topic: unknown): { repo: string; number: number } | undefined => {
-  if (!isWorkTopic(topic)) return undefined;
-  const rest = topic.slice(WORK_TOPIC_PREFIX.length);
-  const dot = rest.lastIndexOf(".");
-  if (dot <= 0) return undefined;
-  const repo = rest.slice(0, dot);
-  const digits = rest.slice(dot + 1);
-  if (!WORK_REPO.test(repo) || repo === "." || repo === ".." || !WORK_NUMBER.test(digits)) return undefined;
-  const number = Number(digits);
-  return Number.isSafeInteger(number) ? { repo, number } : undefined;
-};
-
-/**
- * Whether a remote event is addressed to the hub factory's role (see HUB_FACTORY_RECIPIENT): `to`
- * is exactly `factory`, and the topic is a parsed `fleet.work.<repo>.<n>` or `ops.owner` with an
- * allow-listed kind.
+ * Whether a remote event belongs on the hub factory's topic: literal `to: factory` on a parsed
+ * work topic or allow-listed owner wake, or an unaddressed WAIT/ETA issue record (the kinds
+ * setup/factory/mesh_answers.py consumes, smarty-dev#9349). Other broadcasts and explicit
+ * recipients retain their existing routing; this exception is only used toward the hub.
  */
 export const isHubFactoryEvent = (event: Pick<MeshEvent, "topic" | "kind" | "to">): boolean =>
-  event.to === HUB_FACTORY_RECIPIENT &&
-  (parseWorkTopic(event.topic) !== undefined || (event.topic === "ops.owner" && isBridgedTopic(event)));
+  isAddressedHubFactoryEvent(event) ||
+  (event.to === undefined && (event.kind === "wait" || event.kind === "eta") && parseWorkTopic(event.topic) !== undefined);
 
 /**
  * Two per-link token buckets: `perMinute` events refill each minute, up to `burst` held, and
@@ -184,8 +137,8 @@ export interface FactoryRate {
 /**
  * The default per-link bound on the factory exception (pi-fabric#876 review, P1-2, and security
  * pass, (c)): 30 events a minute, burst 60, and 512 KiB a minute, burst 1 MiB, of the events as
- * published. Only events that cross because they are addressed to the factory's role spend from
- * either bucket; events to a hub-native recipient do not.
+ * published. Only events that cross through the factory exception (addressed to its role or
+ * unaddressed WAIT/ETA issue records) spend from either bucket; hub-native recipients do not.
  */
 export const DEFAULT_FACTORY_RATE: Readonly<Required<FactoryRate>> = Object.freeze({
   perMinute: 30, burst: 60, bytesPerMinute: 512 * 1024, byteBurst: 1024 * 1024,
@@ -714,11 +667,13 @@ export class StoreBridgeSide implements BridgeSide {
   }
 
   async publish(event: BridgePublish, held: string[] = []): Promise<{ sequence: number }> {
+    await this.store.prepareLock();
     const published = await this.#fenceRetry(() => this.store.publish(this.#publication(event, held)));
     return { sequence: published.sequence };
   }
 
   async publishBatch(events: Array<{ event: BridgePublish; held?: string[] }>): Promise<Array<{ sequence: number }>> {
+    await this.store.prepareLock();
     const published = await this.#fenceRetry(() => this.store.publishBatch(events.map(({ event, held }) => this.#publication(event, held ?? []))));
     return published.map(({ sequence }) => ({ sequence }));
   }
@@ -959,6 +914,7 @@ export class StoreBridgeSide implements BridgeSide {
   }
 
   async #mirror(presence: Pick<BridgePresence, "hosts" | "participants">, final: boolean, observedAt?: number): Promise<void> {
+    await this.store.prepareLock();
     const halted = (): boolean => this.#fenced && !final;
     const now = this.now();
     // A host live when the snapshot was requested stays admissible: a pass (slow presence read,
@@ -1251,6 +1207,10 @@ export const serveBridgeAgent = (side: StoreBridgeSide, input: Readable, output:
             return;
           }
           try {
+            // Attach stdin listeners immediately, but prepare before the first hello/snapshot/write.
+            // The store refuses rather than waits if a library caller already owns a bounded scope.
+            await side.store.prepareLock();
+            if (closed) { finish(); return; }
             if (request.op === "hello" && isObject(request.args) && request.args.changes === true && !unsubscribe) {
               // Unsolicited frames, never a hanging wait RPC ahead of publish in this FIFO.
               // Install before hello's response and all subsequent snapshot requests.
@@ -1266,7 +1226,9 @@ export const serveBridgeAgent = (side: StoreBridgeSide, input: Readable, output:
           } catch (error) {
             reply({
               id: request.id, ok: false, error: error instanceof Error ? error.message : String(error),
-              ...(isMeshRetryableBusy(error) ? { code: MESH_LOCK_TIMEOUT_CODE } : {}),
+              ...(isMeshIncarnationPending(error) ? { code: MESH_INCARNATION_PENDING_CODE }
+                : isMeshSnapshotRetriesExhausted(error) ? { code: MESH_SNAPSHOT_RETRIES_EXHAUSTED_CODE }
+                  : isMeshRetryableBusy(error) ? { code: MESH_LOCK_TIMEOUT_CODE } : {}),
             });
           }
         });
@@ -1374,8 +1336,9 @@ export class RemoteBridgeSide implements BridgeSide {
         if (response.ok === true) pending.resolve(response.result);
         else {
           const error = new Error(`Bridge agent: ${String(response.error)}`);
-          // The protocol carries just this safe store code, not arbitrary peer error properties.
-          if (response.code === MESH_LOCK_TIMEOUT_CODE) Object.assign(error, { code: MESH_LOCK_TIMEOUT_CODE });
+          // Only allow-listed store refusal codes, never arbitrary peer error properties.
+          if (response.code === MESH_LOCK_TIMEOUT_CODE || response.code === MESH_INCARNATION_PENDING_CODE ||
+            response.code === MESH_SNAPSHOT_RETRIES_EXHAUSTED_CODE) Object.assign(error, { code: response.code });
           pending.reject(error);
         }
       },
@@ -1510,7 +1473,7 @@ export interface MeshBridgeOptions {
   /** Debug lines (each event not addressed across); off when absent. */
   debug?: (message: string) => void;
   /**
-   * The per-link bound on remote events that cross only as addressed to the hub factory's role
+   * The per-link bound on remote events that cross only through the hub factory exception
    * (default DEFAULT_FACTORY_RATE). Over it, the inbound drain stops at that event with the cursor
    * before it, and resumes when its token is due: the event waits, it is never dropped.
    */
@@ -1770,7 +1733,9 @@ export class MeshBridge {
       from = identity;
     }
     return {
-      topic: event.topic, kind: event.kind, from, to: event.to!,
+      topic: event.topic, kind: event.kind, from,
+      // ponytail: keep the required-recipient wire schema; only an admitted inbound record needs a role address.
+      to: direction === "toLocal" && event.to === undefined && isHubFactoryEvent(event) ? HUB_FACTORY_RECIPIENT : event.to!,
       ...(event.verification === "mesh" || event.verification === "bridge" ? { principal: event.principal } : {}),
       ...(event.text !== undefined ? { text: event.text } : {}),
       // An ACK that crosses only through the relay (its address is no hub recipient) carries just the outcome
@@ -2005,7 +1970,7 @@ export class MeshBridge {
         else delay = retryMs;
         retryMs = Math.min(retryMs * 2, LOCK_RETRY_MAX_MS);
         if (!reported) {
-          this.#log(`${isMeshStateWalCap(error) ? "mesh state WAL cap" : "mesh lock timeout"} (${direction}); retrying in ${delay} ms: ${(error as Error).message}`);
+          this.#log(`${meshBusyLabel(error)} (${direction}); retrying in ${delay} ms: ${(error as Error).message}`);
           reported = true;
         }
       }
@@ -2255,10 +2220,11 @@ export class MeshBridge {
 
   #refusal(event: MeshEvent, rules: BridgeRules, direction: "toRemote" | "toLocal"): string | undefined {
     if (!isBridgedTopic(event) || hasBridgeField(event)) return "not allowed";
-    // The hub (local) side is the factory's: a remote work event (parsed fleet.work.<repo>.<n>) or
-    // owner wake addressed to its role crosses to the hub on the same topic, `to` unchanged
-    // (smarty-dev#9352), within the link's factory rate. Never hub to remote.
-    if (!event.to || !(rules.recipients.has(event.to) || (direction === "toLocal" && (isHubFactoryEvent(event) || this.#awaitedAck(event))))) {
+    // The hub factory reads by topic: addressed work/owner wakes and unaddressed WAIT/ETA issue
+    // records cross within its rate bound. The latter gain `to: factory` only on the hub copy
+    // (smarty-dev#9349); no other broadcast does, and never hub to remote.
+    if (!((typeof event.to === "string" && rules.recipients.has(event.to)) ||
+      (direction === "toLocal" && (isHubFactoryEvent(event) || this.#awaitedAck(event))))) {
       return "not addressed across";
     }
     if (event.data !== undefined && !isObject(event.data)) return "data is not an object";
@@ -2375,7 +2341,7 @@ export class MeshBridge {
               walCapLoggedAt = now;
             }
           } else if (!reportedTimeout) {
-            this.#log(`mesh lock timeout; retrying in ${delay} ms: ${(error as Error).message}`);
+            this.#log(`${meshBusyLabel(error)}; retrying in ${delay} ms: ${(error as Error).message}`);
             reportedTimeout = true;
           }
         }
@@ -2446,5 +2412,6 @@ const allBridgedIds = async (side: BridgeSide, after: number): Promise<Set<strin
 };
 
 const isPermanent = (error: unknown): boolean =>
+  !isMeshIncarnationPending(error) && !isMeshSnapshotRetriesExhausted(error) &&
   !isMeshLockTimeout(error) && (error instanceof BridgeOwnershipError ||
     error instanceof Error && /exceeds|not allowed|no bridge stamp|no recipient|no sender|Invalid mesh topic/i.test(error.message));

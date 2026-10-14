@@ -21,6 +21,9 @@ beforeAll(async () => {
   deadPid = child.pid!;
   await once(child, "exit");
 });
+// smarty-dev#8090, follow-up smarty-dev#11335: off Linux root actor tree deletion refuses (no Main publication fence); the
+// removal resolves with the named refusal pending and the tree kept. Linux assertions are unchanged.
+const OFF_LINUX_PENDING = new RegExp(`^removal cleanup failed: Root actor tree deletion needs the Main publication fence, which this platform \\(${process.platform}\\) lacks \\(smarty-dev#8090\\); follow-up smarty-dev#11335; the root session:old actor tree is kept \\(a later remove or host start finishes it\\)$`);
 const cleanups: Array<() => Promise<void> | void> = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
 
@@ -62,7 +65,7 @@ const fixture = () => {
     try { return await peer.reconcile(); } finally { await peer.close(); }
   };
   const persisted = (id: string) => store.records().find(record => record.id === id)!;
-  return { store, row, start, hostExit, persisted };
+  return { actorRoot, store, row, start, hostExit, persisted };
 };
 
 describe("same-session restart of host-exit-stopped session actors (smarty-dev#9241)", () => {
@@ -87,7 +90,7 @@ describe("same-session restart of host-exit-stopped session actors (smarty-dev#9
   });
 
   it("keeps an explicitly stopped actor stopped across a host exit and restart; its owner can remove it", async () => {
-    const { store, row, start, hostExit, persisted } = fixture();
+    const { actorRoot, store, row, start, hostExit, persisted } = fixture();
     const kept = row("b", "kept");
     store.write([kept]);
     const first = start();
@@ -98,7 +101,15 @@ describe("same-session restart of host-exit-stopped session actors (smarty-dev#9
     const second = start();
     expect(second.status(kept.id)).toMatchObject({ status: "stopped", stopReason: "explicit" });
     expect(() => second.tell(kept.id, "still stopped")).toThrow(/is stopped/);
-    expect(await second.remove(kept.id)).toMatchObject({ removed: true });
+    if (process.platform === "linux") {
+      expect(await second.remove(kept.id)).toMatchObject({ removed: true });
+    } else {
+      const dir = path.join(actorRoot, kept.id);
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, "kept-11335.txt"), "history\n");
+      expect(await second.remove(kept.id)).toMatchObject({ removed: true, cleaned: false, pending: expect.stringMatching(OFF_LINUX_PENDING) });
+      expect(fs.readFileSync(path.join(dir, "kept-11335.txt"), "utf8")).toBe("history\n");
+    }
     expect(store.records().map(record => record.id)).not.toContain(kept.id);
   });
 

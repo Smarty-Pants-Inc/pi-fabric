@@ -9,6 +9,7 @@ import { writeJsonAtomic } from "../src/core/atomic-write.js";
 import { saveFinalAnswerReceipt } from "../src/worker/terminal-answer.js";
 import type { AgentRunRecord } from "../src/agents/types.js";
 import type { AgentTerminalNotice } from "../src/agents/terminal-target.js";
+import { TerminalNoticeOutbox, readTerminalAdmission } from "../src/agents/terminal-notices.js";
 import { canRemoveTerminalRun } from "../src/storage/retention.js";
 
 const roots: string[] = [];
@@ -21,7 +22,7 @@ afterEach(async () => {
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 
-const harness = (onTerminalNotice?: (notice: AgentTerminalNotice) => void | Promise<void>) => {
+const harness = (onTerminalNotice?: (notice: AgentTerminalNotice) => void | Promise<void>, sessionId = "99999999") => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "terminal-manager-")); roots.push(root);
   const records = new Map<string, AgentRunRecord>();
   const closures = new Map<string, () => void>();
@@ -31,14 +32,14 @@ const harness = (onTerminalNotice?: (notice: AgentTerminalNotice) => void | Prom
     const now = Date.now();
     const record: AgentRunRecord = { id: request.id, name: request.name, task: "task", status: "running", runner: "pi", transport: "process",
       cwd: request.cwd, startedAt: now, updatedAt: now, turns: 1, toolCalls: 0, text: "intermediate prose",
-      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 }, sessionId: "99999999" };
+      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 }, sessionId };
     records.set(request.id, record);
     writeJsonAtomic(args.get("--status-file")!, record);
     let alive = true;
     let close!: () => void;
     const closed = new Promise<void>(resolve => { close = () => { alive = false; resolve(); }; });
     closures.set(request.id, close); exits.push(close);
-    return { kind: "process", sessionId: "99999999", closed, stopDebt: () => undefined,
+    return { kind: "process", sessionId, closed, stopDebt: () => undefined,
       waitForClose: () => closed, isAlive: async () => alive, stop: async () => { await closed; } };
   });
   const settled = vi.fn();
@@ -76,6 +77,21 @@ describe("ordinary process-task final answer boundary", () => {
     expect(settled).toHaveBeenCalledOnce();
     await waitUntil(() => launch.mock.calls.length === 2);
     close(next.id);
+  });
+
+  it("retains a terminal answer whose saved PID is still live despite mocked native close", async () => {
+    // Main's persisted live-PID fence is independent of the PR's finishing join.
+    // The transport is mocked; it must never certify collection of this process.
+    const { manager, root, finish, close } = harness(undefined, String(process.pid));
+    const handle = await manager.spawn({ task: "live saved PID", transport: "process" });
+    const directory = path.join(root, handle.id);
+    finish(handle.id, "answer is not an exit receipt");
+    expect(manager.status(handle.id).status).toBe("finishing");
+    expect(canRemoveTerminalRun(directory)).toBe(false);
+    close(handle.id);
+    expect(await manager.wait(handle.id, { timeoutMs: 1000 })).toMatchObject({ status: "completed" });
+    expect(JSON.parse(fs.readFileSync(path.join(directory, "status.json"), "utf8")).sessionId).toBe(String(process.pid));
+    expect(canRemoveTerminalRun(directory)).toBe(false);
   });
 
   it("run returns only after the receipt and owned execution close", async () => {
@@ -156,9 +172,9 @@ describe("ordinary process-task final answer boundary", () => {
   it.each([
     ["delivery", "lifecycle"], ["sender", "lifecycle"], ["id", "lifecycle"],
     ["delivery", "unread"], ["sender", "unread"], ["id", "unread"],
-  ])("refuses a mismatched delivered %s row through %s exactly once to the original sender", async (mismatch, source) => {
+  ])("retains uncertainty without refusing a mismatched delivered %s row through %s", async (mismatch, source) => {
     const notices: AgentTerminalNotice[] = [];
-    const { manager, root, close, finish } = harness(notice => { notices.push(notice); });
+    const { manager, root, launch, close, finish } = harness(notice => { notices.push(notice); });
     const handle = await manager.spawn({ task: "ordinary", transport: "process" });
     const sender = { id: "session:senderA", name: "Sender A", kind: "main" as const, verified: "mesh" as const };
     const provenance = { v: 1 as const, channel: "fabric" as const, via: "steer" as const, sender };
@@ -175,24 +191,36 @@ describe("ordinary process-task final answer boundary", () => {
       fs.appendFileSync(path.join(directory, "lifecycle.jsonl"), JSON.stringify({ version: 1, event: "message.refused", occurredAt: Date.now(), data: {
         code: "FABRIC_TARGET_TERMINAL", targetId: handle.id, messageId: queued.messageId, delivery: "steer", finalAnswerReceiptId: receipt.id, sender,
       } }) + "\n");
-      // Prove the lifecycle skip site independently, before the unread exit scan.
-      await waitUntil(() => notices.length === 1);
+      // The lifecycle claim cannot override an unattributed consumption ACK.
+      manager.status(handle.id);
+      expect(notices).toEqual([]);
       expect(manager.hasRunCustody(handle.id)).toBe(true);
     }
+    expect(manager.status(handle.id).status).toBe("finishing");
+    await expect(manager.wait(handle.id, { timeoutMs: 20 })).rejects.toThrow(/still running|timed out/i);
+    const next = await manager.spawn({ task: "native-close barrier", transport: "process" });
+    expect(next.status).toBe("queued");
     close(handle.id);
     await manager.wait(handle.id, { timeoutMs: 1000 });
-    const delivered = path.join(directory, "terminal-notices", `${queued.messageId}.json.delivered`);
-    await waitUntil(() => fs.existsSync(delivered));
+    await waitUntil(() => launch.mock.calls.length === 2);
+    close(next.id);
     manager.status(handle.id);
+    const recovery = new TerminalNoticeOutbox(notice => { notices.push(notice); });
+    recovery.recover(directory);
+    recovery.recover(directory);
     await new Promise(resolve => setTimeout(resolve, 10));
-    expect(notices).toEqual([{ code: "FABRIC_TARGET_TERMINAL", targetId: handle.id,
-      finalAnswerReceiptId: receipt.id, messageId: queued.messageId, delivery: "steer", sender }]);
-    expect(canRemoveTerminalRun(directory)).toBe(true);
+    const pending = path.join(directory, "terminal-notices", `${queued.messageId}.json`);
+    expect(notices).toEqual([]);
+    expect(fs.existsSync(pending)).toBe(false);
+    expect(fs.existsSync(`${pending}.delivered`)).toBe(false);
+    expect(fs.existsSync(path.join(directory, "terminal-controls", `${queued.messageId}.json`))).toBe(true);
+    expect(readTerminalAdmission(directory, queued.messageId)).toEqual({ id: queued.messageId, delivery: "steer", sender });
+    expect(canRemoveTerminalRun(directory)).toBe(false);
   });
 
-  it("preserves the original followUp kind when the delivered row wrongly names steer", async () => {
+  it("retains the original followUp without cancellation when the delivered row wrongly names steer", async () => {
     const notices: AgentTerminalNotice[] = [];
-    const { manager, root, close, finish } = harness(notice => { notices.push(notice); });
+    const { manager, root, launch, close, finish } = harness(notice => { notices.push(notice); });
     const handle = await manager.spawn({ task: "ordinary", transport: "process" });
     const sender = { id: "session:followUp-sender", kind: "main" as const, verified: "mesh" as const };
     const provenance = { v: 1 as const, channel: "fabric" as const, via: "followUp" as const, sender };
@@ -201,13 +229,27 @@ describe("ordinary process-task final answer boundary", () => {
     writeJsonAtomic(path.join(directory, "terminal-controls", `${queued.messageId}.json`), {
       id: queued.messageId, delivery: "steer", state: "delivered", provenance,
     });
-    const receipt = finish(handle.id, "done");
-    close(handle.id); await manager.wait(handle.id, { timeoutMs: 1000 });
-    await waitUntil(() => fs.existsSync(path.join(directory, "terminal-notices", `${queued.messageId}.json.delivered`)));
-    expect(notices).toEqual([{ code: "FABRIC_TARGET_TERMINAL", targetId: handle.id,
-      finalAnswerReceiptId: receipt.id, messageId: queued.messageId, delivery: "followUp", sender }]);
-    expect(manager.status(handle.id).followUpDeliveries).toContainEqual(expect.objectContaining({ messageId: queued.messageId, state: "cancelled" }));
-    expect(canRemoveTerminalRun(directory)).toBe(true);
+    finish(handle.id, "done");
+    expect(manager.status(handle.id).status).toBe("finishing");
+    await expect(manager.wait(handle.id, { timeoutMs: 20 })).rejects.toThrow(/still running|timed out/i);
+    const next = await manager.spawn({ task: "native-close barrier", transport: "process" });
+    expect(next.status).toBe("queued");
+    close(handle.id);
+    await manager.wait(handle.id, { timeoutMs: 1000 });
+    await waitUntil(() => launch.mock.calls.length === 2);
+    close(next.id);
+    const recovery = new TerminalNoticeOutbox(notice => { notices.push(notice); });
+    recovery.recover(directory);
+    recovery.recover(directory);
+    await new Promise(resolve => setTimeout(resolve, 10));
+    expect(notices).toEqual([]);
+    const pending = path.join(directory, "terminal-notices", `${queued.messageId}.json`);
+    expect(fs.existsSync(pending)).toBe(false);
+    expect(fs.existsSync(`${pending}.delivered`)).toBe(false);
+    expect(manager.status(handle.id).followUpDeliveries).toContainEqual(expect.objectContaining({ messageId: queued.messageId, state: "queued" }));
+    expect(fs.existsSync(path.join(directory, "terminal-controls", `${queued.messageId}.json`))).toBe(true);
+    expect(readTerminalAdmission(directory, queued.messageId)).toEqual({ id: queued.messageId, delivery: "followUp", sender });
+    expect(canRemoveTerminalRun(directory)).toBe(false);
   });
 
   it("cannot use a forged worker refusal to notify a different sender", async () => {
@@ -229,7 +271,9 @@ describe("ordinary process-task final answer boundary", () => {
 
   it("retries a failed sender route on status and retains an acknowledged notice for collection", async () => {
     let attempts = 0, acknowledged = 0;
-    const { manager, root, close, finish } = harness(() => {
+    const routed: AgentTerminalNotice[] = [];
+    const { manager, root, launch, close, finish } = harness(notice => {
+      routed.push(notice);
       attempts++;
       if (attempts === 1) throw new Error("sender temporarily unavailable");
       acknowledged++;
@@ -239,10 +283,11 @@ describe("ordinary process-task final answer boundary", () => {
       sender: { id: "session:sender", kind: "main" as const, verified: "mesh" as const } };
     const queued = manager.steer(handle.id, "queued", undefined, provenance);
     writeJsonAtomic(path.join(root, handle.id, "terminal-controls", `${queued.messageId}.json`), {
-      id: queued.messageId, delivery: "followUp", state: "delivered",
-      provenance: { ...provenance, sender: { ...provenance.sender, id: "session:wrong-sender" } },
+      id: queued.messageId, delivery: "steer", state: "refused", forwarded: true, provenance,
     });
-    finish(handle.id, "done");
+    const receipt = finish(handle.id, "done");
+    const next = await manager.spawn({ task: "native-close barrier", transport: "process" });
+    expect(next.status).toBe("queued");
     const outbox = path.join(root, handle.id, "terminal-notices", `${queued.messageId}.json`);
     manager.status(handle.id);
     await waitUntil(() => attempts === 1 && fs.existsSync(outbox));
@@ -251,10 +296,17 @@ describe("ordinary process-task final answer boundary", () => {
     await waitUntil(() => fs.existsSync(`${outbox}.delivered`));
     close(handle.id); await manager.wait(handle.id, { timeoutMs: 1000 });
     expect(acknowledged).toBe(1); expect(attempts).toBe(2);
+    const expectedNotice = { code: "FABRIC_TARGET_TERMINAL", targetId: handle.id,
+      finalAnswerReceiptId: receipt.id, messageId: queued.messageId, delivery: "steer", sender: provenance.sender };
+    expect(routed).toEqual([expectedNotice, expectedNotice]);
     manager.status(handle.id);
     await new Promise(resolve => setTimeout(resolve, 10));
     expect(attempts).toBe(2);
     expect(canRemoveTerminalRun(path.join(root, handle.id))).toBe(true);
+    // Sender routing can complete before the independently owned native drain.
+    // The queued next launch proves the first run released native admission.
+    await waitUntil(() => launch.mock.calls.length === 2);
+    close(next.id);
     expect((await manager.cleanup(handle.id)).cleaned).toBe(false); // retained run, no worktree
   });
 

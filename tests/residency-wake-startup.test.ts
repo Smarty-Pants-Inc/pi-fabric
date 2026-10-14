@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { spawn, type ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
+import { randomUUID } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
 import { waitResidentChange } from "../src/residency/wake.js";
 import { canonicalResidentWakeConfig } from "../src/residency/wake-index.js";
@@ -19,7 +20,8 @@ describe("resident native startup outcomes", () => {
     fs.writeFileSync(path.join(root, "wake-routes.json"), JSON.stringify({ format: 1, rootId: config.rootId,
       hostId: "host:fenced", configJson: canonicalResidentWakeConfig(config), actors: [] }));
     fs.writeFileSync(path.join(root, "config.json"), JSON.stringify({ ...config, actorRoot: path.join(root, "foreign-actors") }));
-    const child = spawn(process.execPath, [path.resolve("dist/residency/launcher.js"), "--config", path.join(root, "config.json"), "--wake"],
+    const launchToken = randomUUID();
+    const child = spawn(process.execPath, [path.resolve("dist/residency/launcher.js"), "--config", path.join(root, "config.json"), "--wake", "--launch-token", launchToken],
       { stdio: ["ignore", "ignore", "ignore", "ipc"] });
     try {
       await expect(waitResidentChange(root, () => false, 10_000, "pending", child)).rejects.toMatchObject({
@@ -27,7 +29,8 @@ describe("resident native startup outcomes", () => {
       });
       await exit(child);
       expect(child.exitCode).toBe(1);
-      expect(JSON.parse(fs.readFileSync(path.join(root, "error.json"), "utf8"))).toMatchObject({ code: "RESIDENT_WAKE_CONFIG_MISMATCH" });
+      expect(JSON.parse(fs.readFileSync(path.join(root, "generations", `${launchToken}.error.json`), "utf8")))
+        .toMatchObject({ generation: launchToken, code: "RESIDENT_WAKE_CONFIG_MISMATCH" });
       expect(fs.existsSync(path.join(root, "owner.json"))).toBe(false);
       expect(fs.existsSync(path.join(root, "foreign-actors"))).toBe(false);
     } finally { await exit(child); fs.rmSync(root, { recursive: true, force: true }); }

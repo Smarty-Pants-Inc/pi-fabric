@@ -722,6 +722,7 @@ describe("actor context overflow (smarty-dev#3238, offline Pi child)", () => {
     ["STREAM_DISCONNECT_ONCE", "warning", "Error: 401 Unauthorized", "auth", / in a worker warning\)$/],
     ["OVERFLOW_ALWAYS", "warning", "Error: 403 Forbidden", "permission", / in a worker warning\)$/],
     ["OVERFLOW_ALWAYS", "error", "Error: unclassified activation failure", "unknown", /^fail-closed: no transient cause recognised/],
+    ["OVERFLOW_ALWAYS", "error", "Error: 42", "unknown", /^fail-closed: no transient cause recognised/],
     ["OVERFLOW_ALWAYS", "warning", "Warning: unclassified activation warning", "unknown", /^fail-closed: no transient cause recognised/],
   ] as const)("attributes same-run %s %s evidence %s as %s with provenance across reload", async (marker, where, text, code, provenance) => {
     const s = setup();
@@ -765,7 +766,7 @@ describe("actor context overflow (smarty-dev#3238, offline Pi child)", () => {
   // worker's retained status, then model old metadata and missing/corrupt/mismatched evidence.
   it.each((["stream", "overflow"] as const).flatMap(cause => {
     const evidence = ["pure", "nineteen", "saturated", "marked-saturated", "auth", "security", "missing", "unreadable", "mismatched"] as const;
-    return [...evidence, ...(cause === "overflow" ? ["unknown"] as const : [])].map(evidence => ({ cause, evidence }));
+    return [...evidence, ...(cause === "overflow" ? ["unknown", "marked-unknown"] as const : [])].map(evidence => ({ cause, evidence }));
   }))
   ("restores legacy $cause with $evidence complete-run evidence, never replaying the settled item", async ({ cause, evidence }) => {
     const s = setup();
@@ -794,7 +795,7 @@ describe("actor context overflow (smarty-dev#3238, offline Pi child)", () => {
     }
     if (evidence === "auth") status.warnings = ["Authentication failed"];
     if (evidence === "security") status.warnings = ["Refused by security policy"];
-    if (evidence === "unknown") status.warnings = ["Warning: unclassified activation warning"];
+    if (evidence === "unknown" || evidence === "marked-unknown") status.warnings = ["Warning: unclassified activation warning"];
     if (evidence === "mismatched") status.id = "not-the-blocked-run";
     if (evidence === "missing") fs.renameSync(statusFile, `${statusFile}.missing`);
     else fs.writeFileSync(statusFile, evidence === "unreadable" ? "{" : JSON.stringify(status));
@@ -804,7 +805,7 @@ describe("actor context overflow (smarty-dev#3238, offline Pi child)", () => {
     row.activationBlocked = { code: "context-overflow", class: "hard", reason: status.error.slice(0, 300),
       since: Date.now() - 24 * 60 * 60 * 1000, count: 3,
       classification: "permanent: context window exceeded (typed CONTEXT_OVERFLOW run code)" };
-    if (evidence === "marked-saturated") row.activationBlocked.overflowEvidence = { version: 1, runId, complete: true };
+    if (evidence === "marked-saturated" || evidence === "marked-unknown") row.activationBlocked.overflowEvidence = { version: 1, runId, complete: true };
     row.failureStreak = { count: 3, notified: true };
     fs.writeFileSync(file, JSON.stringify(registry));
     let restarted = s.makeActors();
@@ -823,8 +824,8 @@ describe("actor context overflow (smarty-dev#3238, offline Pi child)", () => {
       expect(resets(restarted, actor.id).at(-1)).toMatchObject({ overflow: true, retry: false });
     } else {
       const code = evidence === "auth" ? "auth" : evidence === "security" ? "security-policy"
-        : evidence === "unknown" || (evidence === "nineteen" && cause === "overflow") ? "unknown"
-        : evidence === "saturated" ? "incomplete-evidence" : "context-overflow";
+        : evidence === "unknown" || evidence === "marked-unknown" || (evidence === "nineteen" && cause === "overflow") ? "unknown"
+        : evidence === "saturated" || evidence === "marked-saturated" ? "incomplete-evidence" : "context-overflow";
       await waitFor(() => presence()?.activationBlocked?.code === code);
       expect(restarted.status(actor.id).activationBlocked).toMatchObject({ code, class: "hard" });
       expect(restarted.status(actor.id).activationBlocked).not.toHaveProperty("retryAt");

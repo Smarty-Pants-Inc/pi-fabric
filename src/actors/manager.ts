@@ -604,7 +604,7 @@ const OVERFLOW_WORDING = /Context exceeds window|prompt (?:is )?too long|maximum
 // residual cannot authorize overflow recovery while genuine overflow-only runs still recover.
 const OVERFLOW_MARKER = "\u0000";
 const residualText = (text: string): string => text.replace(/^\s*(?:Error|Warning)\s*:?\s*/i, "")
-  .replace(/[\s:;,./()<>+="'_-]|\d/g, "");
+  .replace(/[\s:;,./()<>+="'_-]/g, "");
 const hasUnknownResidual = (texts: readonly string[]): boolean => texts.some(text => text.split(/\r?\n/).some(line => {
   const marker = line.indexOf(OVERFLOW_MARKER);
   if (marker >= 0) {
@@ -650,15 +650,17 @@ const restoredActivationBlock = (stored: { reason: string; code: string; since: 
     const marker = refRecord(stored.overflowEvidence);
     // An incomplete migration is sticky across re-saves/reloads: only an explicit reset releases it.
     const markedComplete = marker?.version === 1 && marker.complete === true && marker.runId === runId && typeof runId === "string";
-    const authoritative = marker === undefined && run !== undefined && retainedOverflowRunId(runId) &&
-      run.id === runId && run.actorId === actorId && run.status === "failed" &&
-      typeof run.error === "string" && stored.reason.length > 0 && run.error.includes(stored.reason) &&
+    const matchingRun = run !== undefined && retainedOverflowRunId(runId) && run.id === runId &&
+      run.actorId === actorId && run.status === "failed";
+    const inspectableRun = matchingRun && typeof run.error === "string" && stored.reason.length > 0 &&
+      run.error.includes(stored.reason) &&
       (run.warnings === undefined || (Array.isArray(run.warnings) && run.warnings.every(warning => typeof warning === "string")));
-    const failure = authoritative && run ? classifyManagerActivationFailure({ lastError: run.error!, error: run.error, evidence: run.warnings }, run.errorCode === "CONTEXT_OVERFLOW") : undefined;
+    const failure = inspectableRun && run ? classifyManagerActivationFailure({ lastError: run.error!, error: run.error, evidence: run.warnings }, run.errorCode === "CONTEXT_OVERFLOW") : undefined;
     const pureStream = failure?.code === "provider-transient" && failure.classification.startsWith("transient: model stream disconnect");
     const genuineOverflow = failure?.code === "context-overflow" && run?.errorCode === "CONTEXT_OVERFLOW";
-    // A version-1 complete marker cannot override available saturated retained evidence.
-    const complete = !saturatedWarningEvidence(run?.warnings) && (markedComplete || pureStream || genuineOverflow);
+    // A retained run is authoritative even when an older writer marked it complete: reclassify
+    // its full error and warnings, and only complete the proof when that record proves overflow alone.
+    const complete = !saturatedWarningEvidence(run?.warnings) && (matchingRun ? genuineOverflow : markedComplete);
     overflowEvidence = { version: 1, ...(typeof runId === "string" ? { runId } : {}), complete };
     legacyOverflow = failure && !failure.transient && CONTRADICTORY_OVERFLOW_CODES.has(failure.code) ? failure
       : pureStream ? failure : { code: "context-overflow", transient: false,

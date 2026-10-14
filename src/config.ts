@@ -477,6 +477,18 @@ const meshControlIncarnationFence = (value: unknown): MeshControlIncarnationFenc
   throw new Error("mesh.controlIncarnationFence must be warn or enforce");
 };
 
+/** JetStream stream num_replicas for the NATS state backend; an explicit invalid value is refused, never defaulted. */
+const meshNatsReplicas = (value: unknown): number => {
+  if (value === undefined) return 1;
+  if (typeof value === "number" && Number.isSafeInteger(value) && value >= 1) return value;
+  throw new Error("mesh.nats.replicas must be a positive integer");
+};
+
+export interface FabricMeshNatsConfig {
+  /** Stream num_replicas on create; an existing stream with a different count is refused (default 1). */
+  replicas: number;
+}
+
 export const RESIDENT_IDLE_EXIT_MS = 10 * 60_000;
 
 export interface FabricMeshConfig {
@@ -486,6 +498,8 @@ export interface FabricMeshConfig {
   lockProtocol: MeshLockProtocol;
   /** Keyed-state backend: "file" (default), "shadow", "sqlite" or "nats" (refused until built); env PI_FABRIC_MESH_STATE_BACKEND overrides. */
   stateBackend: MeshStateBackend;
+  /** NATS state-backend settings; only read when stateBackend is "nats". */
+  nats: FabricMeshNatsConfig;
   enabled: boolean;
   root?: string;
   /** Publish the Main participant at session start instead of on first Fabric use. */
@@ -815,6 +829,7 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
     controlIncarnationFence: "warn",
     lockProtocol: 1,
     stateBackend: "file",
+    nats: { replicas: 1 },
     enabled: true,
     announce: false,
     actorScope: "project",
@@ -914,6 +929,41 @@ const readJsonObjectFile = (filePath: string): JsonObjectFile | undefined => {
 
 const readJsonObject = (filePath: string): Record<string, unknown> | undefined =>
   readJsonObjectFile(filePath)?.document;
+
+const isJsonObject = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
+
+/**
+ * smarty-dev#11373: the NATS stream replicas from the agent layer only (`<agentDir>/fabric.json` mesh.nats.replicas),
+ * validated by meshNatsReplicas (default 1). A missing file or an absent value is 1. Read-only: no project layer,
+ * host policy, migration, quarantine, warning or write. An unreadable file, malformed JSON, a non-object document or
+ * mesh/nats section, or an invalid value is refused (throws), never defaulted to a lower replica count.
+ */
+export const loadAgentNatsReplicas = (agentDir: string): number => {
+  const filePath = path.join(agentDir, "fabric.json");
+  let source: string;
+  try {
+    source = fs.readFileSync(filePath, "utf8");
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") return meshNatsReplicas(undefined);
+    throw new Error(`mesh.nats.replicas: cannot read ${filePath}`, { cause: error });
+  }
+  let document: unknown;
+  try {
+    document = JSON.parse(source);
+  } catch {
+    // Parser diagnostics can quote config contents; expose only the path, never the raw cause.
+    throw new Error(`mesh.nats.replicas: ${filePath} is not valid JSON`);
+  }
+  if (!isJsonObject(document)) throw new Error(`mesh.nats.replicas: ${filePath} must be a JSON object`);
+  const { mesh } = document;
+  if (mesh === undefined) return meshNatsReplicas(undefined);
+  if (!isJsonObject(mesh)) throw new Error("mesh must be an object");
+  const { nats } = mesh;
+  if (nats === undefined) return meshNatsReplicas(undefined);
+  if (!isJsonObject(nats)) throw new Error("mesh.nats must be an object");
+  return meshNatsReplicas(nats.replicas);
+};
 
 const mergeObjects = (
   base: Record<string, unknown>,
@@ -1721,6 +1771,7 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
       controlIncarnationFence: meshControlIncarnationFence(mesh.controlIncarnationFence),
       lockProtocol: meshLockProtocol(mesh.lockProtocol),
       stateBackend: meshStateBackend(mesh.stateBackend),
+      nats: { replicas: meshNatsReplicas(objectValue(mesh.nats).replicas) },
       enabled: booleanValue(mesh.enabled, DEFAULT_FABRIC_CONFIG.mesh.enabled),
       ...(meshRoot ? { root: meshRoot } : {}),
       announce: booleanValue(mesh.announce, DEFAULT_FABRIC_CONFIG.mesh.announce),

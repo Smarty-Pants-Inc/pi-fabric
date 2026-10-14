@@ -496,16 +496,34 @@ Credentials stay with Pi. Fabric hands a child agent only the model key, and the
 
 With `extensions: false` (per call, or as `agents.extensions`), a Pi child loads none of the user's extensions, including their provider-registration code. Built-in models and models declared in Pi's `models.json` remain available. An extension-only provider requires an explicit `extensions: true` request and Pi's normal project-trust checks. Fabric does not probe provider-named paths or load other enabled extensions to find it: an isolated registration runtime is not a sandbox for module code. Unknown models fail before the task is sent, without a fallback model. Restricted judgment workers keep their fixed host-hook allowlist and never load a provider bridge. This covers both Pi runners (`pi-durable` and `pi`); strict model admission is unchanged. Claude, Veda, and custom runners use their own model catalogs and are unaffected.
 
-### Example: Coral Bricks
+### Bundled Coral Bricks provider
 
-Coral Bricks models come from the separate `pi-coralbricks-provider` extension. It is one example; every provider extension works the same way.
+Fabric bundles the Coral Bricks provider extension, [`pi-coralbricks-provider`](https://www.npmjs.com/package/pi-coralbricks-provider), so `coralbricks/*` models are available after installing Fabric alone. Disclosure: Fabric's maintainers work at Coral Bricks.
+
+Add a key once, in either form:
 
 ```sh
-pi install npm:pi-coralbricks-provider
-export CORALBRICKS_API_KEY=...   # or run /login coralbricks once in Pi
+/login coralbricks                # inside Pi; stores the key in auth.json
+export CORALBRICKS_API_KEY=...    # or in the environment
 ```
 
-The extension registers keys such as `coralbricks/glm-5.3-fast` and `coralbricks/deepseek-v4.1-flash-fast`. Use them wherever Fabric takes a model, for example in aliases that mix providers:
+The provider registers keys such as `coralbricks/glm-5.3-fast` and `coralbricks/deepseek-v4.1-flash-fast`. Without a key it serves the model list shipped in the package and makes no network request. With a key it refreshes that list from Coral's API at session start and after `/login`. It loads as its own entry in Fabric's package (`node_modules/pi-coralbricks-provider/index.ts`), outside Fabric's startup graph, so `extensions: false` children resolve `coralbricks/*` models through the bridge above without loading Fabric's main extension.
+
+You can also install `pi-coralbricks-provider` yourself, for example to pick up a newer release before Fabric bundles it. When both copies load, the newest version registers the provider and the other one stays idle, so `/model` lists each model once.
+
+To leave the bundled provider out, replace the plain `npm:pi-fabric` entry in `~/.pi/agent/settings.json` (or a project's `.pi/settings.json`) with the package object form and exclude its path:
+
+```json
+{
+  "packages": [
+    { "source": "npm:pi-fabric", "extensions": ["!node_modules/pi-coralbricks-provider/**"] }
+  ]
+}
+```
+
+Fabric's own extension keeps loading. Use the same `source` you installed from (`git:github.com/fabric-runtime/pi-fabric` or a local path). After opting out, `coralbricks/*` models resolve only if you install the provider separately, and an `extensions: false` child that asks for one fails before the task is sent.
+
+Use the Coral Bricks keys wherever Fabric takes a model, for example in aliases that mix providers:
 
 ```json
 {
@@ -528,6 +546,10 @@ const [coral, gemini] = await Promise.all([
 ]);
 return { coral: coral.text, gemini: gemini.text };
 ```
+
+### Other providers
+
+Every other provider works the same way. Install its Pi extension with `pi install`, or define it in Pi's `models.json`, and its `provider/id` keys work in each place listed at the start of this section, including `extensions: false` children.
 
 ## Result formatting
 

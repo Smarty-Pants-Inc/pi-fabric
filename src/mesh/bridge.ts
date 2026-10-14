@@ -526,6 +526,9 @@ export class StoreBridgeSide implements BridgeSide {
     let active = true;
     let queued = false;
     let retryTimer: ReturnType<typeof setTimeout> | undefined;
+    let burst: ReturnType<typeof setImmediate> | undefined;
+    let scanNext = false;
+    let eventsNext = false;
     let retryMs = LOCK_RETRY_MIN_MS;
     let baseline: ReturnType<typeof snapshot>;
     const snapshot = () => {
@@ -588,15 +591,35 @@ export class StoreBridgeSide implements BridgeSide {
         } else failed(error instanceof Error ? error : new Error(String(error)));
       }
     };
+    // One check-phase tick per notification burst: the burst's scan (if any) first, then its event wake.
+    // A lease renewal followed by routed work arrives as one burst; classifying the lease before the
+    // directions wake lets their authority check see the pending lease and refresh it now, instead of
+    // forwarding under the old mirror and leaving the renewal to the half-lease flush.
+    const tick = (): void => {
+      burst = undefined;
+      if (!active) return;
+      if (scanNext) { scanNext = false; flush(); }
+      if (eventsNext && active) { eventsNext = false; changed("events"); }
+    };
     const close = watchBridgeStore(this.store.root, (kind) => {
-      if (kind === "events") { changed(kind); return; }
-      if (queued) return;
-      queued = true;
-      queueMicrotask(flush);
+      // Coalesce one notification burst into one scan. Each fs.watch callback is its own native callback
+      // (microtasks drain between them), so a microtask flush scanned once per notification. setImmediate
+      // runs after the whole poll phase has delivered its notifications; any arriving while one is queued or
+      // a busy retry waits join it, and a later burst queues at most one trailing scan. Events never scan
+      // and never wait for a busy retry: they wait at most for this tick's own scan.
+      if (kind === "events") eventsNext = true;
+      else if (queued) return;
+      else { queued = true; scanNext = true; }
+      burst ??= setImmediate(tick);
     }, failed);
     try { baseline = capture(); }
     catch (error) { close(); throw error; }
-    return () => { active = false; if (retryTimer !== undefined) clearTimeout(retryTimer); close(); };
+    return () => {
+      active = false;
+      if (retryTimer !== undefined) clearTimeout(retryTimer);
+      if (burst !== undefined) clearImmediate(burst);
+      close();
+    };
   }
 
   #presence(hostEntries: MeshStateEntry[], participantEntries: MeshStateEntry[], handoffEntries: readonly MeshStateEntry[]): BridgePresence {

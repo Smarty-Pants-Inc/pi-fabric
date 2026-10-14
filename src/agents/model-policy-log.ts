@@ -2,9 +2,10 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-/** Model identifiers, not arbitrary substrings; also cover native Claude runners. */
-export function isClaudeModel(model: string | undefined, runner?: string): boolean {
+/** Model identifiers or a known Claude-capable native backend, not substrings. */
+export function isClaudeModel(model: string | undefined, runner?: string, backend?: string): boolean {
   return runner?.toLowerCase() === "claude" ||
+    (runner?.toLowerCase() === "veda" && backend?.trim().toLowerCase() === "claude-code") ||
     (typeof model === "string" && /(?:^|[/:._-])(?:claude|opus)(?=$|[/:._-])/i.test(model));
 }
 

@@ -1108,21 +1108,25 @@ export class AgentManager {
     });
   }
 
+  #nativeClaudeRequiresReason(runner: FabricAgentRunner): boolean {
+    return isClaudeModel(undefined, runner, this.config.veda.backend) && this.#claudeRequiresReason();
+  }
+
   #validModelReason(reason: unknown): reason is string {
     return typeof reason === "string" && Boolean(reason.trim()) && reason.length <= 200;
   }
 
   /** Classification only: a protected-looking alias must resolve before refusal. */
   modelReasonRequired(model: string | undefined, runner: FabricAgentRunner = this.config.runner): boolean {
-    return this.#modelRequiresReason(model) || (runner === "claude" && this.#claudeRequiresReason());
+    return this.#modelRequiresReason(model) || this.#nativeClaudeRequiresReason(runner);
   }
 
   /** Compatibility API. Call with the RESOLVED selector, never an unresolved alias. */
   assertExplicitModelReason(model: unknown, modelReason: unknown, runner: FabricAgentRunner = this.config.runner, inheritedDefault?: string): void {
     const selector = typeof model === "string" ? model.trim() : undefined;
-    if (!this.#modelRequiresReason(selector) && !(runner === "claude" && this.#claudeRequiresReason())) return;
+    if (!this.modelReasonRequired(selector, runner)) return;
     if (this.#validModelReason(modelReason)) {
-      if (isClaudeModel(selector, runner) && !opusIssueReference(modelReason)) {
+      if (isClaudeModel(selector, runner, this.config.veda.backend) && !opusIssueReference(modelReason)) {
         throw new Error(`model ${selector || runner} requires modelReason (named exception) with an issue reference (#N or issue URL); ` +
           "Paul's Opus-only org/leads rule (smarty-dev#2264); no worker started");
       }
@@ -1151,7 +1155,7 @@ export class AgentManager {
     } = {},
   ): AgentModelAdmission | Promise<AgentModelAdmission> {
     this.assertModelAllowed(model, runner);
-    if (runner === "claude" && this.#claudeRequiresReason()) {
+    if (this.#nativeClaudeRequiresReason(runner)) {
       this.assertExplicitModelReason(model, modelReason, runner);
       return { model, thinking: options.thinking, fallback: false };
     }
@@ -1161,7 +1165,7 @@ export class AgentManager {
       return { model, thinking: options.thinking, fallback: false };
     }
     // A supplied but malformed Claude exception refuses, never silently switches.
-    if (isClaudeModel(model, runner) && typeof modelReason === "string" && modelReason.trim()) {
+    if (isClaudeModel(model, runner, this.config.veda.backend) && typeof modelReason === "string" && modelReason.trim()) {
       this.assertExplicitModelReason(model, modelReason, runner);
     }
     if ((options.modelSource ?? "explicit") === "explicit") {
@@ -1209,8 +1213,9 @@ export class AgentManager {
       thinking?: FabricThinking | undefined; requiredPin?: boolean; signal?: AbortSignal | undefined; timeoutMs?: number | undefined;
     } = {},
   ): Promise<AgentModelAdmission> {
-    // Refuse the native Claude runner before catalog/network work.
-    if (runner === "claude" && this.#claudeRequiresReason()) this.assertExplicitModelReason(model, modelReason, runner);
+    // Native Claude-capable backends cannot prove a safe model or use a GPT fallback.
+    // Refuse before catalog/network work, without rewriting their opaque selectors.
+    if (this.#nativeClaudeRequiresReason(runner)) this.assertExplicitModelReason(model, modelReason, runner);
     const prepare = (selector: string | undefined, requiredPin = false) => this.prepareModelForAdmission(
       selector, runner, undefined, requiredPin, options.signal, options.timeoutMs);
     const resolved = await prepare(model, options.requiredPin);
@@ -1622,7 +1627,7 @@ export class AgentManager {
     this.assertModelAllowed(model, runner);
     // Native Claude cannot demonstrate a non-Claude backend. Pi aliases must
     // resolve before the reason check, even when the alias itself says "claude".
-    if (runner === "claude") this.assertExplicitModelReason(model, request.modelReason, runner);
+    if (this.#nativeClaudeRequiresReason(runner)) this.assertExplicitModelReason(model, request.modelReason, runner);
     // Alternate runners retain their pre-queue catalog/backend admission. Pi
     // model/auth preparation stays post-permit unless a durable route needs it.
     const alternatePrepared = runner === "claude" || runner === "veda";
@@ -1656,8 +1661,19 @@ export class AgentManager {
     }
     const preparedModel = model;
     const modelPrepared = Boolean(routePin) || alternatePrepared;
-    const switchWarnings = (): string[] => request.modelPolicyOriginalModel && model
-      ? [`model: inherited ${request.modelPolicyOriginalModel} -> ${model} ${routePin?.effort ?? request.thinking ?? this.config.thinking} (#11863)`] : [];
+    // Backend provenance is not a resolved account model; preserve raw CLI selectors.
+    const auditModel = (): string => runner === "veda" && isClaudeModel(undefined, runner, this.config.veda.backend)
+      ? `veda/claude-code/${model?.replace(/^veda\//i, "") || "<backend-default>"}`
+      : model ?? "claude/<backend-default>";
+    const switchWarnings = (): string[] => {
+      const warnings = request.modelPolicyOriginalModel && model
+        ? [`model: inherited ${request.modelPolicyOriginalModel} -> ${model} ${routePin?.effort ?? request.thinking ?? this.config.thinking} (#11863)`] : [];
+      if (runner === "veda" && isClaudeModel(undefined, runner, this.config.veda.backend) &&
+          this.#validModelReason(request.modelReason) && opusIssueReference(request.modelReason)) {
+        warnings.push(`model: named exception ${auditModel()} (${opusIssueReference(request.modelReason)})`);
+      }
+      return warnings;
+    };
     let policyWarnings = switchWarnings();
     let policyLogged = false;
     const logPolicyAdmission = (): void => {
@@ -1667,9 +1683,9 @@ export class AgentManager {
       let warning: string | undefined;
       if (request.modelPolicyOriginalModel && isClaudeModel(request.modelPolicyOriginalModel)) {
         warning = appendOpusPolicyLog({ role, model: request.modelPolicyOriginalModel, ref: null, reason: "inherited-switch" });
-      } else if (isClaudeModel(model, runner) && this.#validModelReason(request.modelReason)) {
+      } else if (isClaudeModel(model, runner, this.config.veda.backend) && this.#validModelReason(request.modelReason)) {
         const ref = opusIssueReference(request.modelReason);
-        if (ref) warning = appendOpusPolicyLog({ role, model: model ?? "claude/<backend-default>", ref, reason: request.modelReason });
+        if (ref) warning = appendOpusPolicyLog({ role, model: auditModel(), ref, reason: request.modelReason });
       }
       if (warning) policyWarnings.push(warning);
     };
@@ -2070,7 +2086,7 @@ export class AgentManager {
           workerArguments: [...runnerLaunch.workerArguments],
           ...(request.needs ? { needs: [...request.needs] } : {}),
           ...(request.requires ? { requires: [...request.requires] } : {}),
-          placementLocalReason: model && isClaudeModel(model, runner) && request.modelReason
+          placementLocalReason: isClaudeModel(model, runner, this.config.veda.backend) && request.modelReason
             ? "Claude exception reason requires the local worker"
             : this.#spawner?.kind === "actor" || this.#spawner?.kind === "agent" || this.#currentDepth > 0
             ? "not a Main task spawn"

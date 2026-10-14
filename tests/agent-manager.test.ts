@@ -354,6 +354,59 @@ describe("resolved manager policy (#11864)", () => {
     } finally { launch.mockRestore(); }
   });
 
+  it("F-01 guards Veda Claude-code defaults and short aliases through manager admission and receipts", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-veda-claude-policy-")); roots.push(root);
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-veda-claude-home-")); roots.push(home);
+    const homedir = vi.spyOn(os, "homedir").mockReturnValue(home);
+    const manager = makeManager(root, {
+      runner: "veda",
+      veda: { ...DEFAULT_FABRIC_CONFIG.agents.veda, backend: "claude-code" },
+      modelPolicy: { requireReason: ["claude", "opus"] },
+    });
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    const reason = "#11864 bounded Veda Claude-code exception";
+    try {
+      for (const request of [
+        { task: "Veda backend default" },
+        { task: "configured absent Veda model" },
+        { task: "Veda sonnet alias", model: "sonnet" },
+      ]) {
+        await expect(manager.spawn({ ...request, transport: "process" }))
+          .rejects.toThrow(/requires (?:modelReason|opusReason).*#2264|named exception/i);
+      }
+      expect(manager.list()).toEqual([]);
+      expect(launch).not.toHaveBeenCalled();
+      expect(fs.readdirSync(root)).toEqual([]);
+
+      const defaultReason = "#11864 named exception for Veda's backend default";
+      const acceptedDefault = await manager.run({ task: "issue-bearing Veda backend default", modelReason: defaultReason, transport: "process" });
+      expect(acceptedDefault).toMatchObject({ status: "completed", runner: "veda", modelReason: defaultReason,
+        warnings: expect.arrayContaining([expect.stringMatching(/veda\/claude-code\/<backend-default>/)]) });
+      const defaultArgv = launch.mock.calls[0]![0].workerArguments;
+      expect(defaultArgv).toEqual(expect.arrayContaining(["--runner", "veda", "--model-reason", defaultReason]));
+      expect(defaultArgv).not.toContain("--model");
+
+      const accepted = await manager.run({ task: "issue-bearing Veda alias", model: "sonnet", modelReason: reason, transport: "process" });
+      expect(accepted).toMatchObject({ status: "completed", runner: "veda", model: "sonnet", modelReason: reason,
+        warnings: expect.arrayContaining([expect.stringMatching(/veda\/claude-code\/sonnet/)]) });
+      expect(launch).toHaveBeenCalledTimes(2);
+      expect(launch.mock.calls[1]![0].workerArguments).toEqual(expect.arrayContaining([
+        "--runner", "veda", "--model", "sonnet", "--model-reason", reason,
+      ]));
+      expect(manager.status(accepted.id).modelReason).toBe(reason);
+      const auditFile = path.join(home, ".local", "state", "smarty", "route", "opus-exceptions.jsonl");
+      const rows = fs.readFileSync(auditFile, "utf8").trim().split("\n").filter(Boolean).map(line => JSON.parse(line) as Record<string, unknown>);
+      const matching = rows.filter(row => row.reason === reason);
+      const defaultRows = rows.filter(row => row.reason === defaultReason);
+      expect(matching).toHaveLength(1);
+      expect(defaultRows).toHaveLength(1);
+      expect(Object.keys(matching[0]!).sort()).toHaveLength(7);
+      expect(matching[0]).toMatchObject({ ref: "#11864", reason, role: expect.any(String), ts: expect.stringMatching(/^\d{4}-\d\d-\d\dT/) });
+      expect(matching[0]!.model).toEqual(expect.stringMatching(/veda\/claude-code\/sonnet/));
+      expect(defaultRows[0]!.model).toEqual(expect.stringMatching(/veda\/claude-code\/<backend-default>/));
+    } finally { launch.mockRestore(); homedir.mockRestore(); }
+  });
+
   it("completes an issue-bearing Claude exception when its audit append fails and warns in both receipts", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-claude-audit-failure-")); roots.push(root);
     const home = path.join(root, "home");

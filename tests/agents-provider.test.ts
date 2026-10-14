@@ -323,6 +323,72 @@ describe("model reason policy boundary (#11864)", () => {
     } finally { launch.mockRestore(); }
   });
 
+  it("F-01 guards Claude-code Veda defaults and aliases at the provider and actor boundary", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-veda-claude-home-")); roots.push(home);
+    const homedir = vi.spyOn(os, "homedir").mockReturnValue(home);
+    const state = setup([], [], undefined, { agentsConfig: {
+      runner: "veda",
+      modelPolicy: { requireReason: ["claude", "opus"] },
+      veda: { ...DEFAULT_FABRIC_CONFIG.agents.veda, backend: "claude-code" },
+    } });
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    const exception = "#11864 bounded Veda Claude-code compatibility exception";
+    try {
+      for (const args of [
+        { task: "absent Veda model" },
+        { task: "configured undefined Veda model", model: undefined },
+        { task: "short Veda alias", model: "sonnet" },
+      ]) {
+        await expect(state.provider.invoke("run", { ...args, transport: "process" }, context))
+          .rejects.toThrow(/requires (?:modelReason|opusReason).*#2264|named exception/i);
+      }
+      expect(launch).not.toHaveBeenCalled();
+      expect(state.agents.list()).toEqual([]);
+
+      await expect(state.provider.invoke("create", { name: "unreasoned-claude-default", instructions: "Review." }, context))
+        .rejects.toThrow(/The Veda runner does not support persistent actors/);
+      expect(state.actors.list()).toEqual([]);
+
+      // Veda is a task runner, not an actor runner: a reason must not expand that API.
+      await expect(state.provider.invoke("create", {
+        name: "unsupported-veda-actor", instructions: "Review.", model: "sonnet", modelReason: exception,
+      }, context)).rejects.toThrow(/The Veda runner does not support persistent actors/);
+      const result = await state.provider.invoke("run", {
+        task: "reasoned Claude-code task", model: "sonnet", opusReason: exception, transport: "process",
+      }, context) as AgentRunRecord;
+      expect(result).toMatchObject({ status: "completed", model: "sonnet", modelReason: exception,
+        warnings: expect.arrayContaining([expect.stringMatching(/veda\/claude-code\/sonnet/)]) });
+      const workerArguments = launch.mock.calls.at(-1)?.[0].workerArguments;
+      expect(workerArguments).toEqual(expect.arrayContaining(["--runner", "veda", "--model", "sonnet", "--model-reason", exception]));
+      const auditFile = path.join(home, ".local", "state", "smarty", "route", "opus-exceptions.jsonl");
+      const rows = fs.readFileSync(auditFile, "utf8").trim().split("\n").filter(Boolean).map(line => JSON.parse(line) as Record<string, unknown>);
+      const matched = rows.filter(row => row.reason === exception);
+      expect(matched).toHaveLength(1);
+      expect(Object.keys(matched[0]!).sort()).toHaveLength(7);
+      expect(matched[0]).toMatchObject({ reason: exception, ref: "#11864", role: "task" });
+      expect(matched[0]!.model).toEqual(expect.stringMatching(/veda\/claude-code\/sonnet/));
+
+      const otherBackend = setup([], [], undefined, { agentsConfig: {
+        runner: "veda", modelPolicy: { requireReason: ["claude", "opus"] },
+        veda: { ...DEFAULT_FABRIC_CONFIG.agents.veda, backend: "agy" },
+      } });
+      expect(await otherBackend.provider.invoke("run", { task: "non-Claude Veda compatibility", model: "sonnet", transport: "process" }, context))
+        .toMatchObject({ status: "completed", runner: "veda", model: "sonnet" });
+      const rollback = setup([], [], undefined, { agentsConfig: {
+        runner: "veda", modelPolicy: { requireReason: [] },
+        veda: { ...DEFAULT_FABRIC_CONFIG.agents.veda, backend: "claude-code" },
+      } });
+      expect(await rollback.provider.invoke("run", { task: "empty requireReason rollback", model: "sonnet", transport: "process" }, context))
+        .toMatchObject({ status: "completed", model: "sonnet" });
+      const customBackend = setup([], [], undefined, { agentsConfig: {
+        runner: "veda", modelPolicy: { requireReason: ["claude", "opus"] },
+        veda: { ...DEFAULT_FABRIC_CONFIG.agents.veda, backend: "private-custom-backend" },
+      } });
+      expect(await customBackend.provider.invoke("run", { task: "unknown backend uses its default", transport: "process" }, context))
+        .toMatchObject({ status: "completed", runner: "veda" });
+    } finally { launch.mockRestore(); homedir.mockRestore(); }
+  });
+
   it("requires an explicit configured fallback for inherited Opus, with a safe absent-fallback countercase", async () => {
     const inherited = { ...context, extensionContext: { ...context.extensionContext,
       model: { provider: "cliproxyapi-anthropic", id: "claude-opus-5-5" },

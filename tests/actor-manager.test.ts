@@ -115,6 +115,32 @@ afterEach(async () => {
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 
+describe("F-01 Veda Claude-code actor admission", () => {
+  it("keeps unsupported Veda actors refused and allows a safe Pi override", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-actor-veda-home-")); roots.push(home);
+    const homedir = vi.spyOn(os, "homedir").mockReturnValue(home);
+    const { actors, agents } = setup(false, undefined, undefined, undefined, {}, {
+      runner: "veda",
+      modelPolicy: { requireReason: ["claude", "opus"] },
+      veda: { ...DEFAULT_FABRIC_CONFIG.agents.veda, backend: "claude-code" },
+    });
+    const reason = "#11864 actor Claude-code exception";
+    try {
+      for (const modelReason of [undefined, reason]) {
+        await expect(actors.create({ name: "unsupported-veda", instructions: "Review.", ...(modelReason !== undefined ? { modelReason } : {}) }))
+          .rejects.toThrow(/Invalid Fabric actor runner/);
+      }
+      expect(actors.list()).toEqual([]);
+      const actor = await actors.create({ name: "safe-pi-actor", instructions: "Review.", runner: "pi", model: "cliproxyapi/gpt-6-luna" });
+      await actors.ask(actor.id, "Review the fixture.");
+      const run = agents.list().find(entry => entry.actorName === actor.name);
+      expect(run).toMatchObject({ status: "completed", runner: "pi", model: "cliproxyapi/gpt-6-luna", actorName: actor.name });
+      expect(run?.modelReason).toBeUndefined();
+      expect(fs.existsSync(path.join(home, ".local", "state", "smarty", "route", "opus-exceptions.jsonl"))).toBe(false);
+    } finally { homedir.mockRestore(); }
+  });
+});
+
 describe("owner-minted supervisor interrupt binding (#7452)", () => {
   it("persists the binding only for an owning Main's native supervisor", async () => {
     const { actors, root, identity, mesh, meshConfig, agents } = setup(true);

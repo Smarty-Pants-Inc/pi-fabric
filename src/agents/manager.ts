@@ -102,7 +102,7 @@ import { followUpFile, followUpState, settleFollowUp, releaseFollowUpPayload } f
 import { createRunRouteMetadata } from "../worker/run-record.js";
 import { readFinalAnswerReceipt, type FinalAnswerReceipt } from "../worker/terminal-answer.js";
 import { FabricTargetTerminalError, type AgentTerminalNotice, type AgentUndeliveredMessage } from "./terminal-target.js";
-import { TerminalNoticeOutbox, readTerminalAdmission, terminalControlMatchesAdmission, terminalSenderMatches } from "./terminal-notices.js";
+import { TerminalNoticeOutbox, readTerminalAdmission, terminalControlRefusalProven, terminalSenderMatches } from "./terminal-notices.js";
 import type { AgentRunRouteMetadata } from "./types.js";
 import { WorktreeManager, type AgentWorktreeResult } from "./worktree-manager.js";
 import { writeForkSession, writeHandoffSession } from "./handoff.js";
@@ -3319,7 +3319,9 @@ export class AgentManager {
     }
     const managed = this.#requireRun(id);
     if (!managed.settled) throw new Error("Cannot clean up a running agent");
-    if (managed.processStopPending) {
+    // Receipt-bound drains own teardown during EOF grace, before stop starts.
+    // Reject that existing obligation instead of joining a held native close.
+    if (managed.processStopPending || (managed.finalAnswer && managed.executionDrain)) {
       throw new Error(`Cannot clean up agent ${id}: process teardown is pending`);
     }
     // A normal Windows terminal result can precede captured native close.
@@ -3553,10 +3555,7 @@ export class AgentManager {
     if (!this.#observeFinalAnswer(managed) || !managed.finalAnswer) return;
     const admission = readTerminalAdmission(managed.runDirectory, messageId);
     if (!admission || admission.delivery !== delivery) return;
-    try {
-      const control = JSON.parse(fs.readFileSync(path.join(managed.runDirectory, "terminal-controls", `${messageId}.json`), "utf8"));
-      if (control?.state === "delivered" && terminalControlMatchesAdmission(control, admission)) return;
-    } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+    if (!terminalControlRefusalProven(managed.runDirectory, admission, managed.id)) return;
     this.#retainTerminalNotice(managed, { code: "FABRIC_TARGET_TERMINAL", targetId: managed.id,
       messageId, delivery, finalAnswerReceiptId: managed.finalAnswer.id });
     return { code: "FABRIC_TARGET_TERMINAL", reason: "run-ended", deliveryStatus: "undelivered",
@@ -3969,6 +3968,9 @@ export class AgentManager {
     if (managed.executionExited) return;
     if (managed.executionDrain) return managed.executionDrain;
     const pending = (async () => {
+      // Receipt-bound publication precedes native discard ACKs. Give the worker
+      // its EOF drain before a destructive transport stop (especially Windows).
+      if (managed.finalAnswer) await this.#waitForTransportExit(managed, Date.now() + TRANSPORT_EXIT_GRACE_MS * 5);
       // The same bounded stop/probe contract covers launches promoted solely
       // for custody. A hung liveness RPC must not make public stop hang forever.
       // Native transports own a finite close/tree deadline. Do not race that
@@ -4354,6 +4356,10 @@ export class AgentManager {
     // Observation from status/late ingress can settle outside the monitor. It
     // still owns this exact transport until checked native/tree close.
     void managed.finalAnswerCompletion.then(async () => {
+      // Locked non-forwarding proofs and existing discard ACKs need no native
+      // close. Route them now; forwarded uncertainty stays pending through EOF.
+      this.#refuseUnreadTerminalControls(managed);
+      this.#routeTerminalNotices(managed);
       await this.#drainExecution(managed);
       this.#drainLifecycle(managed);
       this.#refuseUnreadTerminalControls(managed);
@@ -4372,10 +4378,7 @@ export class AgentManager {
     if (managed.terminalNoticeSeen?.has(notice.messageId)) return;
     const admission = readTerminalAdmission(managed.runDirectory, notice.messageId);
     if (!admission || admission.delivery !== notice.delivery) return;
-    try {
-      const control = JSON.parse(fs.readFileSync(path.join(managed.runDirectory, "terminal-controls", `${notice.messageId}.json`), "utf8"));
-      if (control?.state === "delivered" && terminalControlMatchesAdmission(control, admission)) return;
-    } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+    if (!terminalControlRefusalProven(managed.runDirectory, admission, managed.id)) return;
     // Worker event fields cannot select the recipient. Verify supplied attribution
     // against the original trusted admission, then route only that admitted sender.
     if (notice.sender !== undefined && !terminalSenderMatches(notice.sender, admission.sender)) return;
@@ -4408,12 +4411,9 @@ export class AgentManager {
       if ((entry.type !== "steer" && entry.type !== "follow_up") || !/^[a-zA-Z0-9_-]{1,200}$/.test(entry.id)) continue;
       const admission = readTerminalAdmission(managed.runDirectory, entry.id);
       if (!admission) continue;
-      let state: { state?: string } | undefined;
-      try { state = JSON.parse(fs.readFileSync(path.join(managed.runDirectory, "terminal-controls", `${entry.id}.json`), "utf8")); }
-      catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
-      if (state?.state === "delivered" && terminalControlMatchesAdmission(state, admission)) continue;
-      // Refused registry entries may already have emitted a worker notice. The
-      // original admission id deduplicates both paths, including an unread tail.
+      if (!terminalControlRefusalProven(managed.runDirectory, admission, managed.id)) continue;
+      // Close does not prove non-consumption. Only child discard ACKs and locked
+      // unforwarded/absent-row proofs qualify; ambiguous forwarded rows survive.
       this.#retainTerminalNotice(managed, {
         code: "FABRIC_TARGET_TERMINAL", targetId: managed.id, messageId: entry.id,
         delivery: admission.delivery,

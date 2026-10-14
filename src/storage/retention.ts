@@ -10,7 +10,7 @@ import { recoverActorRunArchives } from "../actors/child-completions.js";
 import { recoverEnodevTaskRun } from "../agents/enodev-recovery.js";
 import { copyFabricProvenance } from "../fabric-provenance.js";
 import { readFinalAnswerReceipt } from "../worker/terminal-answer.js";
-import { terminalAdmissionFromEntry, terminalControlMatchesAdmission, terminalSenderMatches, type TerminalAdmission } from "../agents/terminal-notices.js";
+import { readTerminalAdmission, terminalAdmissionFromEntry, terminalControlMatchesAdmission, terminalSenderMatches, type TerminalAdmission } from "../agents/terminal-notices.js";
 
 export const FABRIC_RUN_ROOT_PREFIX = "pi-fabric-runs-";
 const RUN_ROOT_OWNER_FILE = ".fabric-owner.json";
@@ -306,9 +306,10 @@ const safeTerminalArtifacts = (root: string, expired: Deadline): boolean => {
     // controls remain known collectible artifacts; queued/unknown ones do not.
     return fs.readdirSync(controls).every(name => {
       if (expired() || !/^[a-zA-Z0-9_-]{1,200}\.json$/.test(name)) return false;
-      const control = readJson<{ id?: string; state?: string; delivery?: string; provenance?: unknown }>(path.join(controls, name));
+      const control = readJson<{ id?: string; state?: string; delivery?: string; provenance?: unknown; forwarded?: unknown }>(path.join(controls, name));
       return !!control && control.state === "delivered" &&
-        Object.keys(control).every(key => ["id", "state", "delivery", "provenance"].includes(key)) &&
+        (control.forwarded === undefined || typeof control.forwarded === "boolean") &&
+        Object.keys(control).every(key => ["id", "state", "delivery", "provenance", "forwarded"].includes(key)) &&
         terminalControlMatchesAdmission(control, admissions.get(name.slice(0, -5)));
     });
   }
@@ -345,12 +346,16 @@ const safeTerminalArtifacts = (root: string, expired: Deadline): boolean => {
     if (!ownedStat(controls)?.isDirectory()) return false;
     for (const name of fs.readdirSync(controls)) {
       if (expired() || !/^[a-zA-Z0-9_-]{1,200}\.json$/.test(name)) return false;
-      const control = readJson<{ id?: string; state?: string; delivery?: string; provenance?: unknown }>(path.join(controls, name));
+      const control = readJson<{ id?: string; state?: string; delivery?: string; provenance?: unknown; forwarded?: unknown }>(path.join(controls, name));
       const id = name.slice(0, -5), admission = admissions.get(id);
       if (!control || !admission || typeof control.id !== "string" || !/^[a-zA-Z0-9_-]{1,200}$/.test(control.id) ||
           !["steer", "followUp"].includes(control.delivery ?? "") || !["queued", "refused", "delivered"].includes(control.state ?? "") ||
-          Object.keys(control).some(key => !["id", "state", "delivery", "provenance"].includes(key)) ||
+          Object.keys(control).some(key => !["id", "state", "delivery", "provenance", "forwarded"].includes(key)) ||
+          control.forwarded !== undefined && typeof control.forwarded !== "boolean" ||
           control.provenance !== undefined && !copyFabricProvenance(control.provenance)) return false;
+      // A previously fabricated route receipt cannot discharge an ambiguous
+      // forwarded frame, nor a still-queued legacy row without transport proof.
+      if (control.state === "queued") return false;
       if (control.state === "delivered" && terminalControlMatchesAdmission(control, admission)) consumed.add(id);
       else if (!routed.has(id)) return false; // Only the original-attributed refusal discharges mismatched rows.
     }
@@ -423,13 +428,24 @@ const safeRunTree = (root: string, childrenStopped: boolean, depth = 0, expired:
         // Anonymous, pending, uncertain, malformed or linked content still vetoes.
         const children = fs.readdirSync(file);
         const followUps = path.join(root, "follow-ups");
-        if (children.length && (!ownedStat(followUps)?.isDirectory() || !safeFollowUps(followUps, expired))) return false;
         for (const child of children) {
-          if (expired() || !followUpName.test(child) || !ownedStat(path.join(followUps, child))?.isFile()) return false;
-          const item = readJson<{ message?: unknown; delivery?: unknown; followUpId?: unknown; provenance?: unknown }>(path.join(file, child));
-          if (!item || item.delivery !== "followUp" || item.followUpId !== child.slice(0, -5) ||
-              typeof item.message !== "string" || !copyFabricProvenance(item.provenance) ||
-              Object.keys(item).some(key => !["message", "delivery", "followUpId", "provenance"].includes(key))) return false;
+          if (expired() || !followUpName.test(child)) return false;
+          const id = child.slice(0, -5);
+          const item = readJson<{ message?: unknown; delivery?: unknown; followUpId?: unknown; controlId?: unknown; images?: unknown; provenance?: unknown }>(path.join(file, child));
+          if (!item || typeof item.message !== "string" ||
+              item.images !== undefined && !Array.isArray(item.images) ||
+              Object.keys(item).some(key => !["message", "delivery", "followUpId", "controlId", "images", "provenance"].includes(key))) return false;
+          if (item.controlId === id) {
+            const admission = readTerminalAdmission(root, id);
+            const control = readJson<{ state?: string }>(path.join(root, "terminal-controls", child));
+            if (!control || !["delivered", "refused"].includes(control.state ?? "") ||
+                !terminalControlMatchesAdmission(control, admission) ||
+                !terminalControlMatchesAdmission({ id, delivery: item.delivery, provenance: item.provenance }, admission)) return false;
+          } else if (item.controlId !== undefined || item.delivery !== "followUp" || !copyFabricProvenance(item.provenance)) return false;
+          if (item.followUpId !== undefined || item.controlId === undefined) {
+            if (item.delivery !== "followUp" || item.followUpId !== id || !ownedStat(path.join(followUps, child))?.isFile() ||
+                !ownedStat(followUps)?.isDirectory() || !safeFollowUps(followUps, expired)) return false;
+          }
         }
         continue;
       }

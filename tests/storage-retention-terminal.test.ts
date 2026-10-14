@@ -89,9 +89,19 @@ describe("terminal-answer retention custody", () => {
     const lock = finalAnswerLock(f.run, `11111111-1111-4111-8111-111111111111\n99999999\n${Date.now()}\n`);
     expect(canRemoveTerminalRun(f.run)).toBe(false);
     fs.writeFileSync(path.join(lock, "owner"), `11111111-1111-4111-8111-111111111111\n99999999\n${Date.now() - 60_000}\n`);
-    const probe = vi.spyOn(process, "kill").mockImplementation(() => { throw Object.assign(new Error("denied"), { code: "EPERM" }); });
-    try { expect(canRemoveTerminalRun(f.run)).toBe(false); }
-    finally { probe.mockRestore(); }
+    const workerPid = 99999998, lockPid = 99999999;
+    writeJsonAtomic(path.join(f.run, "status.json"), { ...f.record, sessionId: String(workerPid) });
+    const nativeKill = process.kill.bind(process);
+    const probe = vi.spyOn(process, "kill").mockImplementation((pid, signal) => {
+      if (pid === lockPid) throw Object.assign(new Error("denied"), { code: "EPERM" });
+      if (pid === workerPid) throw Object.assign(new Error("exited worker"), { code: "ESRCH" });
+      return nativeKill(pid, signal);
+    });
+    try {
+      expect(canRemoveTerminalRun(f.run)).toBe(false);
+      expect(probe).toHaveBeenCalledWith(workerPid, 0);
+      expect(probe).toHaveBeenCalledWith(lockPid, 0);
+    } finally { probe.mockRestore(); }
   });
   it("keeps emitted but unrouted refusals and unread steering sources", () => {
     const f = fixture();
@@ -123,7 +133,7 @@ describe("terminal-answer retention custody", () => {
     expect(delivered).toHaveLength(1);
     expect(canRemoveTerminalRun(f.run)).toBe(true);
   });
-  it.each(["delivery", "sender", "id", "kind", "name", "verified", "missing-provenance"])("reconstructs original-sender debt for mismatched delivered %s and collects only after its refusal ACK", async mismatch => {
+  it.each(["delivery", "sender", "id", "kind", "name", "verified", "missing-provenance"])("retains mismatched delivered %s uncertainty without fabricating a refusal during recovery", async mismatch => {
     const f = fixture();
     const sender = f.control.provenance.sender;
     const control = { ...f.control, state: "delivered",
@@ -140,18 +150,22 @@ describe("terminal-answer retention custody", () => {
     writeJsonAtomic(path.join(f.run, "terminal-controls", `${f.id}.json`), control);
     expect(canRemoveTerminalRun(f.run)).toBe(false);
     const pending = path.join(f.run, "terminal-notices", `${f.id}.json`);
-    new TerminalNoticeOutbox().recover(f.run); // Unavailable route retains the original debt.
-    expect(JSON.parse(fs.readFileSync(pending, "utf8"))).toEqual(f.notice);
+    new TerminalNoticeOutbox().recover(f.run); // No route cannot turn uncertainty into refusal debt.
+    expect(fs.existsSync(pending)).toBe(false);
     expect(canRemoveTerminalRun(f.run)).toBe(false);
     const delivered: unknown[] = [];
     const successor = new TerminalNoticeOutbox(notice => { delivered.push(notice); });
     successor.recover(f.run);
-    await vi.waitFor(() => expect(fs.existsSync(`${pending}.delivered`)).toBe(true));
-    expect(delivered).toEqual([f.notice]);
     successor.recover(f.run);
     await new Promise(resolve => setTimeout(resolve, 10));
-    expect(delivered).toHaveLength(1);
-    expect(canRemoveTerminalRun(f.run)).toBe(true);
+    expect(delivered).toEqual([]);
+    expect(fs.existsSync(pending)).toBe(false);
+    expect(fs.existsSync(`${pending}.delivered`)).toBe(false);
+    expect(JSON.parse(fs.readFileSync(path.join(f.run, "terminal-controls", `${f.id}.json`), "utf8"))).toEqual(JSON.parse(JSON.stringify(control)));
+    expect(readTerminalAdmission(f.run, f.id)).toEqual({ id: f.id, delivery: "steer", sender });
+    expect(canRemoveTerminalRun(f.run)).toBe(false);
+    expect(pruneActorRunArchives({ runsDirectory: f.root, retentionMs: 0, now: Date.now() + 1, dryRun: true })).toEqual([]);
+    expect(fs.existsSync(f.run)).toBe(true);
   });
   it.each(["delivery", "sender", "kind", "name", "verified"])("does not discharge a mismatched row with an incorrectly attributed refusal %s", mismatch => {
     const f = fixture();

@@ -52,7 +52,7 @@ import { readPiSessionHeader } from "./core/pi-session-header.js";
 import { savePiSettlementReceipt } from "./worker/settlement-receipt.js";
 import { syncPathNamespace } from "./core/atomic-write.js";
 import { finalAssistantText, readFinalAnswerReceipt, withTaskFinalAnswerLock, type FinalAnswerReceipt } from "./worker/terminal-answer.js";
-import { queuedTerminalControls, readTerminalControl, settleTerminalControl, trackTerminalControl, type TerminalControl } from "./worker/terminal-controls.js";
+import { terminalControls, markTerminalControlForwarded, readTerminalControl, settleTerminalControl, trackTerminalControl, type TerminalControl } from "./worker/terminal-controls.js";
 import { DEFAULT_BASH_IDLE_S } from "./guards/actor-bash-timeout.js";
 import { senderHeaderHookPath } from "./guards/sender-headers.js";
 import { WriteReceiptRecorder } from "./agents/write-receipt.js";
@@ -819,6 +819,12 @@ const main = async (): Promise<void> => {
         do { if (exited()) return true; await new Promise(resolve => setTimeout(resolve, 20)); } while (Date.now() < deadline);
         return exited();
       };
+      if (!exited() && persistentPiTask && piRetrySdk && readFinalAnswerReceipt(path.dirname(options.statusFile), options.id)) {
+        // EOF drains buffered RPC frames through the native discard fence. TERM
+        // here would kill that reader before its durable per-frame ACKs land.
+        execution.stdin?.end();
+        await wait(KILL_GRACE_MS);
+      }
       if (!exited()) {
         group.signal("SIGTERM");
         execution.stdin?.end();
@@ -1038,7 +1044,11 @@ const main = async (): Promise<void> => {
     const directory = path.dirname(options.statusFile);
     const ended = withTaskFinalAnswerLock(directory, () => {
       const receipt = finalAnswerReceipt ?? readFinalAnswerReceipt(directory, options.id);
-      if (!receipt) child.stdin?.write(frame);
+      if (!receipt && child.stdin && !child.stdin.writableEnded && !child.stdin.destroyed) {
+        // Write-ahead evidence survives a crash/partial write. Never downgrade
+        // an attempted write to unforwarded on a callback error or native close.
+        if (!controlId || markTerminalControlForwarded(directory, controlId)) child.stdin.write(frame);
+      }
       return receipt;
     });
     if (ended && controlId) {
@@ -1599,20 +1609,35 @@ const main = async (): Promise<void> => {
       }
     }
   };
-  // Unlike progress telemetry, refusal emission must precede its registry
-  // transition. The manager's validated-status scan is the publication fence.
+  const refusalEmitted = new Set<string>();
+  // Forwarded rows need the child's durable discard ACK. Only a row whose
+  // write-ahead transport bit is false can be refused without child consumption.
   const refuseTerminalControl = (control: TerminalControl, receiptId: string): void => {
-    const data = { code: "FABRIC_TARGET_TERMINAL", targetId: options.id, messageId: control.id,
-      delivery: control.delivery, finalAnswerReceiptId: receiptId,
-      ...(control.provenance?.sender ? { sender: control.provenance.sender } : {}) };
-    const descriptor = fs.openSync(options.lifecycleFile, "a", 0o600);
-    try {
-      fs.appendFileSync(descriptor, JSON.stringify({ version: 1, event: "message.refused",
-        runId: options.id, occurredAt: Date.now(), data }) + "\n", "utf8");
-      fs.fsyncSync(descriptor);
-    } finally { fs.closeSync(descriptor); }
-    syncPathNamespace(options.lifecycleFile);
-    settleTerminalControl(path.dirname(options.statusFile), control.id, "refused");
+    if (refusalEmitted.has(control.id)) return;
+    let published = false;
+    const publishRefusal = (current: TerminalControl): void => {
+      const data = { code: "FABRIC_TARGET_TERMINAL", targetId: options.id, messageId: current.id,
+        delivery: current.delivery, finalAnswerReceiptId: receiptId,
+        ...(current.provenance?.sender ? { sender: current.provenance.sender } : {}) };
+      const descriptor = fs.openSync(options.lifecycleFile, "a", 0o600);
+      try {
+        fs.appendFileSync(descriptor, JSON.stringify({ version: 1, event: "message.refused",
+          runId: options.id, occurredAt: Date.now(), data }) + "\n", "utf8");
+        fs.fsyncSync(descriptor);
+      } finally { fs.closeSync(descriptor); }
+      syncPathNamespace(options.lifecycleFile);
+      published = true;
+    };
+    // Host unforwarded refusals publish BEFORE the registry transition, while
+    // the same lock excludes injection/consumption. Do not nest lock acquisition.
+    const current = settleTerminalControl(path.dirname(options.statusFile), control.id, "refused", true, publishRefusal);
+    if (current?.state !== "refused") return;
+    // A child's durable discard ACK already transitioned the row independently.
+    if (!published) publishRefusal(current);
+    refusalEmitted.add(current.id);
+  };
+  const drainTerminalControlAcks = (receipt: FinalAnswerReceipt): void => {
+    for (const control of terminalControls(path.dirname(options.statusFile))) refuseTerminalControl(control, receipt.id);
   };
   const acceptFinalAnswer = (receipt: FinalAnswerReceipt): void => {
     if (finalAnswerReceipt || !persistentPiTask) return;
@@ -1635,7 +1660,7 @@ const main = async (): Promise<void> => {
       emitLifecycle("pi.turn_end", { terminalAnswer: true });
     }
     record.finalAnswerReceipt = { id: receipt.id, recordedAt: receipt.recordedAt };
-    for (const control of queuedTerminalControls(path.dirname(options.statusFile))) refuseTerminalControl(control, receipt.id);
+    drainTerminalControlAcks(receipt);
     // Lines the worker never read are refused now, not at manager native close.
     pollSteer();
     // Preserve any earlier admission/limit/stop failure; the receipt never blesses
@@ -2319,6 +2344,7 @@ const main = async (): Promise<void> => {
   };
   const steerTimer = options.steerFile ? setInterval(() => {
     pollSteer();
+    if (finalAnswerReceipt) drainTerminalControlAcks(finalAnswerReceipt);
     if (deferredFollowUpSettle && !nativeActivity && !hasUnsettledFollowUps()) {
       deferredFollowUpSettle = false;
       compactControl.childSettled();
@@ -2611,7 +2637,10 @@ const main = async (): Promise<void> => {
 
   if (crash.pending) return; // finishCrash owns result publication after the drain.
   if (steerTimer) clearInterval(steerTimer);
-  if (finalAnswerReceipt) pollSteer(); // Last worker-side run-end fence pass.
+  if (finalAnswerReceipt) {
+    pollSteer(); // Last worker-side run-end fence pass.
+    drainTerminalControlAcks(finalAnswerReceipt);
+  }
   clearTimeout(recordedResultTimer);
   if (recordedResultPending && !terminalStatus) {
     terminalStatus = "failed";

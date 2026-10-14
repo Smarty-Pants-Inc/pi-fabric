@@ -7,7 +7,7 @@ import { pathToFileURL } from "node:url";
 import type { CreateAgentSessionRuntimeFactory } from "@earendil-works/pi-coding-agent";
 import { applyTaskRetryDefaults } from "./retry-profile.js";
 import { installFabricResourcePin } from "./resource-pin.js";
-import { installTerminalAnswerBoundary } from "./terminal-boundary.js";
+import { installTerminalAnswerBoundary, installTerminalControlFrameFence } from "./terminal-boundary.js";
 import { registerHostExtensionRunner } from "./host-runner-registration.js";
 
 const [sdkDirectory, scale, ...args] = process.argv.slice(2);
@@ -114,6 +114,7 @@ if (process.env.PI_FABRIC_TERMINAL_TASK === "1") {
   const directory = process.env.PI_FABRIC_AGENT_RUN_DIR;
   const runId = process.env.PI_FABRIC_PARENT_RUN;
   if (!directory || !runId) throw new Error("Terminal task has no owned run identity");
+  installTerminalControlFrameFence(process.stdin, directory, runId);
   const totals = { turns: 0, toolCalls: 0, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 } };
   // IPC can overtake stdout during a large final answer. Keep native attempt
   // accounting ahead of the terminal listener so its immutable status remains

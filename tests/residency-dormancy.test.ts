@@ -567,9 +567,12 @@ describe("resident dormancy (smarty-dev#6782 / #2264)", () => {
       prove();
       await host.participants.refreshPresence();
       expect(host.actors.status(actor.id).status).not.toBe("dormant");
+      // status() starts owned orphan reconciliation; join it before checking the actor-run count.
+      await host.actors.reconcileSessionOrphans();
       expect(host.actors.inFlightCount()).toBe(1);
       finish();
       await until(() => host.actors.status(actor.id).status === "dormant");
+      await host.actors.reconcileSessionOrphans();
       expect(host.actors.inFlightCount()).toBe(0);
       expect(runs).toHaveBeenCalledTimes(1);
       expect(runs.mock.calls[0]![0].task).toContain("exactly one racing delivery");

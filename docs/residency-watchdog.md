@@ -85,7 +85,9 @@ lease again. An unexpected exit during report capture must not reopen startup.
 Clients and new launcher CLIs refuse startup while this marker exists, even after the old launcher dies; merely
 expiring its PID would not fence escaped workers. A healthy current generation
 may still be attached. The explicit installer drain must prove all old work is
-gone before removing the marker; no automated removal is provided.
+gone before removing the marker; no automated removal is provided. There is no
+implemented safe legacy drain command: [`fabric-resident-drain`](resident-drain.md)
+reports the missing admission/exit proof without changing the resident or marker.
 
 The launcher therefore logs `watchdog-deferred`, never starts a replacement and
 keeps custody and SIGINT/SIGTERM handlers. It retries the exit proof at most 30

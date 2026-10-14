@@ -8,6 +8,8 @@ import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { activeBudgetState, appendBudgetLedger, readBudgetLedger } from "../src/agents/budget-ledger.js";
 import { hasUnresolvedWorker, runTreeExitVeto } from "../src/storage/retention.js";
 import { processAlive } from "../src/storage/scratch.js";
+import * as agentRemoval from "../src/agents/rm.js";
+import * as retention from "../src/storage/retention.js";
 
 const managers: AgentManager[] = [];
 const roots: string[] = [];
@@ -161,6 +163,37 @@ describe("AgentManager close storage", () => {
     await manager.close();
     expect(attempts).toBe(2);
     expect(fs.readFileSync(path.join(root, "unrelated"), "utf8")).toBe("not an agent artifact");
+  });
+
+  it("records durable-journal close collection without deleting the run (#11199)", async () => {
+    // Exercise the actual close decision, but record its removal request. The
+    // existing real-delete tests below belong to hosted CI, not a fleet lane.
+    vi.spyOn(retention, "claimTempRunSweep").mockReturnValue(false);
+    const remove = vi.spyOn(agentRemoval, "removeTree").mockResolvedValue(undefined);
+    const { manager, root } = setup(false);
+    const result = await manager.run({ task: "hello", runner: "pi", extensions: false });
+    const directory = path.join(root, result.id);
+    const store = path.join(directory, "durable", "initial", "store");
+    fs.mkdirSync(store, { recursive: true });
+    fs.writeFileSync(path.join(store, "..", "lease.sqlite"), "");
+    fs.writeFileSync(path.join(store, "main.jsonl"), "{}\n");
+    expect(retention.canRemoveTerminalRun(directory)).toBe(true);
+    await manager.close();
+    expect(remove).toHaveBeenCalledWith(directory);
+    expect(fs.readFileSync(path.join(store, "main.jsonl"), "utf8")).toBe("{}\n");
+    expect(fs.existsSync(root)).toBe(true);
+  });
+
+  it("removes a managed root holding a finished run's pi-durable journal (#229)", async () => {
+    const { manager, root } = setup(false);
+    const result = await manager.run({ task: "hello", runner: "pi", extensions: false });
+    // The pi-durable runner journals beside status.json in the run directory.
+    const store = path.join(root, result.id, "durable", "initial", "store");
+    fs.mkdirSync(store, { recursive: true });
+    fs.writeFileSync(path.join(store, "..", "lease.sqlite"), "");
+    fs.writeFileSync(path.join(store, "main.jsonl"), "{}\n");
+    await manager.close();
+    expect(fs.existsSync(root)).toBe(false);
   });
 
   it("retains closed managed run artifacts by default", async () => {

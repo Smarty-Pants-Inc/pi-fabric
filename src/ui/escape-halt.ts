@@ -1,4 +1,5 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { extensionContextLive } from "../session-liveness.js";
 
 interface EscapeHaltOptions {
   enabled: () => boolean;
@@ -18,13 +19,24 @@ export function installFabricEscapeHalt(
     if (timer) clearTimeout(timer);
     timer = undefined;
   };
-  const unsubscribe = context.ui.onTerminalInput((data) => {
+  let unsubscribe: (() => void) | undefined;
+  // smarty-dev#8881: the TUI and this listener can outlive a disposed session's ctx. Retire
+  // locally (the unsubscribe closure is TUI-owned, not a ctx getter) before any option or effect.
+  const retire = (): void => {
     cancel();
+    const release = unsubscribe;
+    unsubscribe = undefined;
+    release?.();
+  };
+  unsubscribe = context.ui.onTerminalInput((data) => {
+    cancel();
+    if (!extensionContextLive(context)) { retire(); return undefined; }
     // Check before the overlay handles Escape and closes: a delayed check alone
     // would mistake that navigation key for a native Main interrupt.
     if (data !== "\x1b" || options.ownsInput() || !options.enabled()) return undefined;
     timer = setTimeout(() => {
       timer = undefined;
+      if (!extensionContextLive(context)) { retire(); return; }
       if (!options.enabled() || options.ownsInput()) return;
       let count: number;
       try {
@@ -52,8 +64,5 @@ export function installFabricEscapeHalt(
     timer.unref?.();
     return undefined;
   });
-  return () => {
-    cancel();
-    unsubscribe();
-  };
+  return retire;
 }

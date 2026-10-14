@@ -913,15 +913,34 @@ Set `agents.worktree.setup` in [configuration](configuration.md#agents) or `work
 
 ### Write confinement
 
-`agents.run()` and `agents.spawn()` accept `readOnly?: boolean`, `writableRoots?: string[]`, and `shell?: "deny" | "unconfined"` for Pi children. Setting any of them creates a write policy:
+Local process-transport Pi task agents launched by `agents.spawn()` (including `agents.run()` and durable tasks) now default to `writableRoots: [effectiveCwd, privateScratch]` with `shell: "unconfined"` when their host run root lies outside the task cwd. The private scratch is the run's dedicated `tmp/`, not its run root: host-owned completion routing, status, event, control and session records remain outside the model's write roots. No shared mesh, export or profile root is added. If the canonical host run root is inside the cwd (including the existing durable resident layout), Fabric skips only the implicit default, preserves the previous unscoped launch, and logs one `write_policy.default_overlap_unconfined` notice naming smarty-dev#11705, which tracks moving resident runs outside cwd. This is an accepted residual, not confinement; explicit `writableRoots` and inherited policies are unchanged. Manager and worker internal filesystem writes are unaffected by this tool policy. Fabric creates the scratch directory inside that task's run directory and exports it as the child's `TMPDIR`, `TMP`, and `TEMP`. Actors, resident startup probes, hosted runners, and the Main are unchanged. A runner without the `writePolicy` capability (including Claude and Veda) keeps its previous unrestricted behavior and logs `write_policy.unsupported` once per task run.
+
+An explicit `readOnly`, `writableRoots`, or `shell` request replaces the task default, subject to inherited confinement below. `writePolicy: "unrestricted"` opts out, writes a `write_policy.unrestricted` event before launch, and cannot be combined with those explicit fields. It cannot escape a caller's existing confinement.
+
+`agents.run()` and `agents.spawn()` accept `readOnly?: boolean`, `writableRoots?: string[]`, and `shell?: "deny" | "unconfined"` for Pi children. Setting any of them creates an explicit write policy:
 
 - `readOnly: true` refuses every `write` and `edit`.
 - `writableRoots` (at most 32) resolve against the child's cwd, including a generated worktree. Omitted roots default to that cwd. A root must exist or be creatable inside the cwd; Fabric creates missing ones. `write` and `edit` outside the roots fail. Fabric checks the lexical absolute path and the real path of the nearest existing ancestor, so a symlink cannot escape a root, and an unresolvable path fails closed.
-- `bash` and `powershell` are refused under any write policy unless the request sets `shell: "unconfined"`. Fabric does not parse shell commands: an unconfined shell can write anywhere the process can, so it is not a sandbox.
+- Explicit policies refuse `bash` and `powershell` unless the request sets `shell: "unconfined"`. The task default allows shells so coding and test commands keep working. Fabric does not parse shell commands and has no shell deny list for package installation or service/unit control.
+
+The default confines native `write`/`edit` and nested `pi.write`/`pi.edit`, **not shell writes**. Native `bash` runs outside Fabric Landlock. Nested `pi.bash` uses Landlock only when the host independently enables `executor.landlock` on Linux; its role grants also include shared caches and the Git common directory, not just these task roots. Each default run logs `write_policy.default` once with the effective policy and a warning that shell writes are unconfined by this policy, including on hosts without Landlock. This is tool-level protection, not an OS sandbox.
+
+An explicit or inherited write policy pins the task to the local worker: one-shot remote placement does not forward policy or scratch arguments and must not silently drop an explicit policy. Default tasks keep normal remote placement; such a launch remains unrestricted and logs `write_policy.remote_unconfined` once and does not claim that the local default applies. Remote policy forwarding is a separate launcher integration (smarty-dev#10544). An unrestricted opt-out also keeps normal placement behavior.
 
 The child Pi process enforces the policy. The worker passes it as `PI_FABRIC_WRITE_POLICY` and loads a small guard extension with `-e`, so it applies even with `extensions: false`. The guard blocks top-level tool calls through Pi's `tool_call` hook and nested `pi.write`, `pi.edit`, and `pi.bash` calls inside `fabric_exec`. It covers tools named `write`, `edit`, `bash`, and `powershell`, including captured overrides with those names; other extension tools and MCP servers are outside it. Native Fabric executors (CPython, `node-process`, `bun-process`) run outside the hook: a confined launch that would use one fails before launch, and a confined child refuses to run one, unless `shell: "unconfined"`. QuickJS and Monty stay available.
 
 Confinement is inherited and only narrows. A confined agent's own children inherit its policy when they request none; an explicit request must keep `readOnly`, cannot switch to `shell: "unconfined"`, and must name roots inside the caller's roots. Claude and Veda runners fail before launch under any policy because Fabric cannot enforce it there. A confined agent cannot start durable agents or actors, since the shared resident host does not inherit its confinement.
+
+### Write receipt
+
+The result of every Pi child carries `writeReceipt: { paths, commands, truncated? }`, empty (`{ paths: [], commands: [] }`) when it changed nothing. Fabric records it from the child's own tool events, not from the child's report:
+
+- `paths`: every absolute path a `write` or `edit` call completed on, in first-touch order. A blocked or failed call is not listed.
+- `commands`: the text of every `bash` or `powershell` call the child made, whether it ran or the guard refused it. Some end events do not say which (a nested `pi.bash`, a durable run), so the receipt can also list a refused command; it never misses one that ran.
+
+The content a `write` or `edit` call carries is never recorded. A shell command's text is recorded as given, so data written inline in a command (a heredoc, for example) is kept in the receipt. The receipt holds at most 256 paths and 64 commands of at most 4,096 characters, 64 KiB in all, and `truncated: true` marks one that dropped or cut anything.
+
+A spawner should check the receipt, not the child's prose. The receipt catches a child whose report is wrong. It is not an authenticated audit log: the events come from the child's Pi process output, so code running as the child (an extension, or a shell that writes to that output) can add or hide entries.
 
 ### Scope narrowing
 

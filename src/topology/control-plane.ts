@@ -326,6 +326,8 @@ export interface FabricControlPlaneOptions {
   controlIncarnationFence?: MeshControlIncarnationFence;
   /** Must match this activation's participant directory. */
   ownerIncarnation?: string;
+  /** Told each rate-limited unfenced legacy sender warning (default: console.warn). */
+  onUnfencedSenderWarning?: (message: string) => void;
   enabled: boolean;
   hostId: string;
   pollMs?: number;
@@ -1559,7 +1561,11 @@ export class FabricControlPlane {
       if (now - record.warnedAt >= UNFENCED_SENDER_WARNING_MS) this.#unfencedSenders.delete(id);
     }
     this.#unfencedSenders.set(from.id, { count, warnedAt: now });
-    console.warn(`[pi-fabric] Unfenced legacy sender delivery count=${count} sender=${JSON.stringify(from.id)} operation=${command.operation} target=${JSON.stringify(command.targetId)} mesh.controlIncarnationFence=warn`);
+    const message = `Unfenced legacy sender delivery count=${count} sender=${JSON.stringify(from.id)} operation=${command.operation} target=${JSON.stringify(command.targetId)} mesh.controlIncarnationFence=warn`;
+    try {
+      if (this.options.onUnfencedSenderWarning) this.options.onUnfencedSenderWarning(message);
+      else console.warn(`[pi-fabric] ${message}`);
+    } catch { /* A diagnostic sink never fails an admitted delivery. */ }
   }
 
   #acceptCancellation(command: FabricControlCommand, from: MeshIdentity): void {

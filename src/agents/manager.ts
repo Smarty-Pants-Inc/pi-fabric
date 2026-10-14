@@ -107,6 +107,8 @@ import type { AgentRunRouteMetadata } from "./types.js";
 import { WorktreeManager, type AgentWorktreeResult } from "./worktree-manager.js";
 import { writeForkSession, writeHandoffSession } from "./handoff.js";
 import {
+  AgentWriteRootOverlapError,
+  assertDefaultTaskWriteRoots,
   checkWritePolicyRequest,
   readAgentLineage,
   readWritePolicy,
@@ -641,6 +643,8 @@ const reconcileNestedAgents = (records: AgentRunRecord[], owner: AgentRunRecord)
         ...rest,
         status: "failed",
         error: `Nested agent owner ${owner.id} finished (${owner.status}) before a terminal result was retained`,
+        // pi-fabric#1034 round 7: a running checkpoint made terminal here; later effects are unknown.
+        ...carriedWriteReceipt(record.runner, record),
         finishedAt,
         updatedAt: Math.max(record.updatedAt, finishedAt),
       };
@@ -707,6 +711,20 @@ const writeRecord = (filePath: string, record: AgentRunRecord): void => {
   writeJsonAtomic(filePath, record, { space: 2 });
 };
 
+// pi-fabric#1034 round 7: a manager-made result (timeout, stop, lost worker) keeps the child's last stored write
+// receipt. Unless the worker itself wrote a terminal record, what ran after that checkpoint is unknown, so the receipt
+// is marked truncated; a Pi child with no stored receipt gets an empty truncated one, never none.
+const carriedWriteReceipt = (
+  runner: string,
+  previous: AgentRunRecord | undefined,
+): { writeReceipt?: NonNullable<AgentRunRecord["writeReceipt"]> } => {
+  if (runner !== "pi" && runner !== "pi-durable") return {}; // only Pi children have a receipt
+  const receipt = previous?.writeReceipt;
+  const known = previous !== undefined && previous.status !== "queued" && previous.status !== "running";
+  if (receipt) return { writeReceipt: known ? receipt : { ...receipt, truncated: true } };
+  return { writeReceipt: { paths: [], commands: [], truncated: true } };
+};
+
 const failedRecord = (
   managed: Omit<
     ManagedAgent,
@@ -750,6 +768,7 @@ const failedRecord = (
     ...(previous?.lastCompleteText !== undefined ? { lastCompleteText: previous.lastCompleteText } : {}),
     error,
     usage,
+    ...carriedWriteReceipt(managed.runner, previous),
     ...(managed.model ? { model: managed.model } : {}),
     ...(managed.modelReason !== undefined ? { modelReason: managed.modelReason } : {}),
     ...(managed.thinking ? { thinking: managed.thinking } : {}),
@@ -1387,8 +1406,29 @@ export class AgentManager {
     }
     // Write confinement is enforced by the child (the Pi tool_call guard, or
     // a runner that declares writePolicy and receives the policy at launch).
-    if (requestsWritePolicy(request)) checkWritePolicyRequest(request);
-    const confined = requestsWritePolicy(request) || this.#parentWritePolicy !== undefined;
+    checkWritePolicyRequest(request);
+    if (request.writePolicy === "unrestricted" && this.#parentWritePolicy) {
+      throw new Error("A write-confined agent cannot launch an unrestricted child");
+    }
+    const defaultTaskWritePolicy = !hostedAdapter && (transport === "auto" || transport === "process") &&
+      !request.actorId && !request.actorName && !request.residentStartupProbe &&
+      !requestsWritePolicy(request) && this.#parentWritePolicy === undefined;
+    // Existing resident layouts keep main's unscoped behavior until #11705 relocates
+    // their host runs outside cwd. Explicit and inherited policies stay unchanged.
+    let defaultWriteScopeOverlap: AgentWriteRootOverlapError | undefined;
+    const defaultWriteScopeFits = (cwd: string): boolean => {
+      try { assertDefaultTaskWriteRoots(this.#runRoot, [cwd]); return true; }
+      catch (error) {
+        if (!(error instanceof AgentWriteRootOverlapError)) throw error;
+        defaultWriteScopeOverlap = error;
+        return false;
+      }
+    };
+    // Runners without write-policy support keep their historical behavior; log the gap below.
+    let applyTaskWriteDefault = defaultTaskWritePolicy && capabilities.writePolicy &&
+      (Boolean(request.worktree) || defaultWriteScopeFits(selectedCwd));
+    const confined = applyTaskWriteDefault ||
+      (requestsWritePolicy(request) && request.writePolicy !== "unrestricted") || this.#parentWritePolicy !== undefined;
     if (confined && !capabilities.writePolicy) {
       throw new Error(
         BUILT_IN_RUNNER_IDS.has(runner)
@@ -1398,7 +1438,7 @@ export class AgentManager {
     }
     if (
       confined &&
-      (request.shell ?? this.#parentWritePolicy?.shell ?? "deny") !== "unconfined" &&
+      (request.shell ?? this.#parentWritePolicy?.shell ?? (applyTaskWriteDefault ? "unconfined" : "deny")) !== "unconfined" &&
       ((kernel === "python" && pythonRuntime === "cpython") ||
         (kernel === "typescript" && /^(node|bun)-process$/.test(this.#executorRuntime?.() ?? "")))
     ) {
@@ -1557,9 +1597,36 @@ export class AgentManager {
 
       try {
         if (worktree && worktreeSetup?.trim()) await this.#worktrees.setup(id, worktreeSetup);
+        if (applyTaskWriteDefault && worktree) applyTaskWriteDefault = defaultWriteScopeFits(agentCwd);
+        const tmpdir = applyTaskWriteDefault ? path.join(runDirectory, "tmp") : undefined;
+        if (tmpdir) mkdirPrivate(tmpdir, this.#trustRoot());
         const writePolicy = capabilities.writePolicy
-          ? resolveChildWritePolicy(request, this.#parentWritePolicy, agentCwd)
+          ? resolveChildWritePolicy(applyTaskWriteDefault
+              ? { writableRoots: [agentCwd, tmpdir!], shell: "unconfined" }
+              : request, this.#parentWritePolicy, agentCwd)
           : undefined;
+        if (applyTaskWriteDefault) assertDefaultTaskWriteRoots(this.#runRoot, writePolicy!.writableRoots);
+        const auditWritePolicy = (type: string, warning?: string, policy?: FabricWritePolicy): void => {
+          fs.appendFileSync(logFile, JSON.stringify({ type, ts: Date.now(), id, runner,
+            ...(policy ? { policy } : {}), ...(warning ? { warning } : {}),
+          }) + "\n", { mode: 0o600 });
+        };
+        if (request.writePolicy === "unrestricted") auditWritePolicy("write_policy.unrestricted");
+        else if (defaultWriteScopeOverlap) {
+          auditWritePolicy("write_policy.default_overlap_unconfined",
+            `smarty-dev#11705: cwd ${defaultWriteScopeOverlap.writableRoot} contains host-owned run root ${defaultWriteScopeOverlap.runRoot}; no implicit write scope is imposed on this layout (accepted residual smarty-dev#11308).`);
+        } else if (defaultTaskWritePolicy && !applyTaskWriteDefault) {
+          auditWritePolicy("write_policy.unsupported", `${runnerAdapter.label} does not enforce task write roots; launch remains unrestricted.`);
+        }
+        let dispositionLogged = false;
+        const onWritePolicyDisposition = (disposition: "local" | "remote"): void => {
+          if (dispositionLogged) return;
+          dispositionLogged = true;
+          if (disposition === "local") auditWritePolicy("write_policy.default",
+            "Shell writes are unconfined by the task write policy (native bash/powershell and nested pi.bash); any Fabric Landlock settings are independent and may grant wider roots.", writePolicy);
+          else auditWritePolicy("write_policy.remote_unconfined",
+            "Remote one-shot placement cannot forward task write roots or scratch yet; remote task remains unrestricted.");
+        };
         const parentSessionId = this.#sessionId?.();
         const parentRunId = this.#parentLineage?.runId ?? (this.#currentDepth > 0 ? process.env.PI_FABRIC_PARENT_RUN : undefined);
         const lineage: FabricAgentLineage = {
@@ -1735,6 +1802,7 @@ export class AgentManager {
           ...(this.config.childQuestions === "route" && capabilities.questions
             ? ["--child-questions", String(this.config.childQuestionTimeoutMs ?? DEFAULT_CHILD_QUESTION_TIMEOUT_MS)]
             : []),
+          ...(tmpdir ? ["--tmpdir", tmpdir] : []),
           ...(writePolicy ? ["--write-policy", JSON.stringify(writePolicy)] : []),
           ...(scope ? ["--scope", JSON.stringify(scope)] : []),
           "--lineage",
@@ -1809,7 +1877,10 @@ export class AgentManager {
           workerArguments: [...runnerLaunch.workerArguments],
           ...(request.needs ? { needs: [...request.needs] } : {}),
           ...(request.requires ? { requires: [...request.requires] } : {}),
-          placementLocalReason: this.#spawner?.kind === "actor" || this.#spawner?.kind === "agent" || this.#currentDepth > 0
+          ...(applyTaskWriteDefault ? { onWritePolicyDisposition } : {}),
+          placementLocalReason: writePolicy && !applyTaskWriteDefault
+            ? "explicit or inherited write policy requires the local worker; one-shot placement cannot forward confinement"
+            : this.#spawner?.kind === "actor" || this.#spawner?.kind === "agent" || this.#currentDepth > 0
             ? "not a Main task spawn"
             : request.actorId || request.actorName || request.sessionFile || request.sessionSeed || request.routeDecision || request.residentStartupProbe
               ? "actor, routed, or inherited session requires the local worker"

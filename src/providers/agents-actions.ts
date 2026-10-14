@@ -98,6 +98,11 @@ const runProperties = {
     description: "Child context (Pi only). task (default): the task alone. branch: a non-blocking fork of this conversation up to its last completed turn, then the task. snippet: the last seedMessages user/assistant texts prefixed to the task.",
   },
   seedMessages: { type: "integer", minimum: 1, maximum: 50, description: "snippet only; default 12" },
+  writePolicy: {
+    type: "string",
+    enum: ["unrestricted"],
+    description: "Audited opt-out of the process task default on non-overlapping layouts (write/edit restricted to cwd and run/tmp; host-owned run records excluded; shells allowed). A run dir inside cwd skips only the implicit default and logs #11705; explicit writableRoots are unchanged. Cannot be combined with readOnly/writableRoots/shell or escape inherited confinement.",
+  },
   readOnly: { type: "boolean", description: "Pi only: refuse write/edit (and shell unless shell: \"unconfined\") in the child" },
   writableRoots: {
     type: "array",

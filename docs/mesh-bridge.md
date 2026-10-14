@@ -20,8 +20,18 @@ existing events and mirrors root presence. There is no new store or protocol.
   lands on the hub's mesh on the same topic with `to` unchanged. `fleet.work.`, `fleet.work.<repo>`,
   `fleet.work.inbox-receipts`, `factory-lead`, `factory` with a NUL or space, and a non-string `to`
   do not cross. No other recipient name, no other topic, and nothing from the hub to the remote is
-  widened.
-- These factory-addressed events are rate bound per link, in events and in bytes: a token bucket
+  widened. `mesh.publish` accepts this literal role address for those topics on any host even
+  though it is not a participant: the hub factory reads it locally, and a spoke's bridge carries
+  it to the hub. Other unknown targets still fail before publication.
+- From the remote to the hub only: unaddressed `wait` and `eta` records on a parsed
+  `fleet.work.<repo>.<n>` topic also reach the factory (smarty-dev#9349). The hub copy gains
+  `to: "factory"` to keep the existing bridge wire format. Public `mesh.publish` argument preparation
+  keeps its existing optional-null behavior: `to: null` means omission, just like leaving out `to`.
+  Non-null malformed recipients still fail public schema validation. The raw bridge publication
+  wire has no argument repair: `to: null` or another non-string recipient is invalid and is not
+  converted into the unaddressed route. Unaddressed `progress`, acknowledgments and other chatter
+  stay local; an explicit unrelated recipient does not gain this exception.
+- These factory events are rate bound per link, in events and in bytes: a token bucket
   of 30 events a minute, burst 60 (`--factory-rate PER_MINUTE`, `--factory-burst N`), and one of
   512 KiB a minute, burst 1 MiB, of the events as published (`--factory-bytes BYTES_PER_MINUTE`,
   `--factory-byte-burst BYTES`). An event bigger than the byte burst waits for a full bucket and
@@ -47,7 +57,8 @@ existing events and mirrors root presence. There is no new store or protocol.
 
 ## Rules
 
-- Each bridged event keeps its `to`, `kind` and `text`. An event from the hub keeps its `from`. An
+- Each bridged event keeps its `kind` and `text`, and its `to` except for the unaddressed factory
+  records above. An event from the hub keeps its `from`. An
   event from the remote carries, as `from`, its sender's identity (name, kind, session id) from
   the presence record this link admitted it by, never the one its body claims; under the commit
   lock the hub also refuses one whose identity is not that sender's mirrored record (pi-fabric#876). It carries
@@ -75,9 +86,9 @@ existing events and mirrors root presence. There is no new store or protocol.
   - its sender is a live native participant or host identity of the remote;
   - no hub record, live or not, uses that id;
   - its recipient is native to the hub, or it is a `fleet.work.*` or allow-listed `ops.owner`
-    event addressed exactly to `factory`, with a parsed `fleet.work.<repo>.<n>` topic (the sender
-    checks above, the per-link factory rate bound, the commit-time ownership
-    fence and the frame budget still apply to it).
+    event addressed exactly to `factory`, or an unaddressed `wait`/`eta` issue record on a parsed
+    `fleet.work.<repo>.<n>` topic (the sender checks above, the per-link factory rate bound,
+    the commit-time ownership fence and the frame budget still apply to it).
 - A remote identity is bound to the one link that mirrored it first (the `remoteHost` on its record).
   Each link reserves every id it did not mirror: native records (live or not) and other links'
   mirrors. It reserves host ids, identity ids, root ids, participant ids and session ids, but not

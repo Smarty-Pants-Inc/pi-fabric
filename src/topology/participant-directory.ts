@@ -19,6 +19,7 @@ import type {
 } from "./types.js";
 
 import { reapDeadHostRecords } from "./host-reaper.js";
+import { observeActorOwnership, ownershipPointReads, type ActorOwnershipObservation } from "./publication-generation.js";
 import { compactExpiredHostRecords } from "./host-record-compaction.js";
 import { withStateFence } from "../mesh/commit-outbox.js";
 import { effectiveLiveness } from "./liveness.js";
@@ -616,8 +617,10 @@ export interface ParticipantDirectoryOptions {
   preparePublicationFence?: () => () => boolean;
   /** Explicit legacy list observation TTL, without a floor. Authority must request fresh. */
   listReadCacheMs?: number;
-  /** Registry -> mesh/key order for shared publication. Accepted actor file copies
-   * may follow outside custody with exact token validation under their key lock. */
+  /** Registry -> mesh/key order for shared publication. An exact empty actor set
+   * proves no actor effects; undefined retains the conservative all-registry fence.
+   * Accepted actor file copies may follow outside custody with exact token validation
+   * under their key lock. */
   withPublicationFence?: <T>(publish: () => Promise<T>, actorIds?: ReadonlySet<string>) => Promise<T>;
   /** Wait for mesh admission WITHOUT registry custody, then retry under a fresh fence.
    * Resident hosts supply a bounded FIFO wait; no snapshot/commit receipt crosses it. */
@@ -688,6 +691,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
   readonly #localRecords = new Map<string, FabricParticipantRecord>();
   #parsedCache: { token: object; files: readonly MeshStateEntry[]; value: ParsedDirectory } | undefined;
   #parsedEntries = new Map<string, { source: Readonly<MeshStateEntry>; entry: MeshStateEntry }>();
+  /** fv2-11107: the last poll ownership map, reusable only while its observation of the managed actors holds. */
+  #pollOwnership: { hostId: string; ids: ReadonlySet<string>; map: ReadonlyMap<string, boolean>; observation: ActorOwnershipObservation } | undefined;
   readonly #reportedCollisions = new Set<string>();
   readonly #reportedRootCollisions = new Set<string>();
   #timer: NodeJS.Timeout | undefined;
@@ -837,11 +842,18 @@ export class ParticipantDirectory implements FabricParticipantSource {
   }
 
   #retiredDuring(error: unknown): boolean {
+    // smarty-dev#8881: the owner lifecycle decides first. When it already retired (SDK dispose,
+    // reload, replacement) any failure is that retirement's side effect: suspend quietly, with no
+    // degraded notice. Only a stale SOURCE under a still-live OWNER is a degraded directory.
+    if (!this.#closed && !this.#live()) {
+      this.suspend();
+      return true;
+    }
     if (isStaleExtensionContextError(error)) {
       this.#lifecycleRetired();
       return true;
     }
-    return !this.#closed && !this.#live();
+    return false;
   }
 
   #lifecycleRetired(): void {
@@ -1654,6 +1666,77 @@ export class ParticipantDirectory implements FabricParticipantSource {
   // refresh here, counts as not published; it is removed or republished on that refresh.
   publishes(id: string): boolean {
     return this.#localRecords.has(id === "main" ? this.options.rootId : id);
+  }
+
+  /**
+   * fv2-11107: actor ownership by participant id (owner host === `localHostId`) from a full project list.
+   * A fresh read, or a call without `actorIds`, is exactly `list({ scope: "project", fresh })` and never
+   * touches the reuse below. A non-fresh (poll) call that names its managed actors reuses the previous
+   * non-fresh map only while observeActorOwnership() of exactly those ids holds: their participant
+   * record (file and shared), owner host record and lease, root closure, and every lease/reload
+   * deadline. Unrelated commits or peer heartbeats therefore do not rebuild the fleet directory. A new
+   * managed id, any changed fact or a reached deadline lists afresh. Reuse is armed only when every
+   * managed id was answered by its own unmirrored participant record (no mirror collision, no legacy
+   * or stale fallback), so the observation covers each input of that answer. A key whose file and
+   * shared copies disagree is answered by updatedAt arbitration, which the facts ignore: the strict
+   * observation then never validates, so such a poll always lists. Validation, not authority:
+   * admission, custody and commit fences call with fresh=true.
+   */
+  actorOwnership(localHostId: string, options: { fresh?: boolean; actorIds?: Iterable<string> | undefined } = {}): ReadonlyMap<string, boolean> {
+    const fresh = options.fresh === true;
+    const ids = !fresh && options.actorIds ? new Set(options.actorIds) : undefined;
+    const cached = this.#pollOwnership;
+    if (ids && cached && cached.hostId === localHostId && [...ids].every((id) => cached.ids.has(id))) {
+      let valid = false;
+      try { cached.observation.scope(ids); valid = cached.observation.unchanged(); } catch { valid = false; }
+      // Only the validated (scoped) ids: an unscoped entry of the old map is unobserved and could
+      // resurrect ownership that moved; absent ids have no directory opinion.
+      if (valid) return new Map([...ids].flatMap((id) => cached.map.has(id) ? [[id, cached.map.get(id)!] as const] : []));
+    }
+    if (!fresh) this.#pollOwnership = undefined;
+    // Observe BEFORE the decision (observeActorOwnership contract): a change in between invalidates.
+    let observation: ActorOwnershipObservation | undefined;
+    if (ids && ids.size > 0 && this.options.enabled) {
+      try {
+        observation = observeActorOwnership(this.mesh, ids, ownershipPointReads(this.mesh), {
+          strict: { participant: (entry) => participantFromEntry(entry) !== undefined, host: (entry) => hostFromEntry(entry) !== undefined },
+        });
+      } catch { observation = undefined; }
+    }
+    const toMap = (listed: readonly FabricParticipantInfo[]): Map<string, boolean> =>
+      new Map(listed.map((participant) => [participant.id, participant.ownerHostId === localHostId]));
+    const exactFor = (listed: readonly FabricParticipantInfo[], read: MeshReadOptions): boolean => {
+      const byId = new Map(listed.map((participant) => [participant.id, participant]));
+      let parsed: ParsedDirectory | undefined;
+      try { parsed = this.#parse(read, this.options.listReadCacheMs); } catch { parsed = undefined; }
+      if (!parsed) return false;
+      const own = new Map(parsed.participants.map((participant) => [participant.id, participant]));
+      const mirrored = new Set(parsed.shadowed.map((participant) => participant.id));
+      return [...ids!].every((id) => {
+        const listedRecord = byId.get(id);
+        const record = own.get(id);
+        return listedRecord !== undefined && !listedRecord.stale && listedRecord.remoteHost === undefined &&
+          record !== undefined && record.remoteHost === undefined && record.ownerHostId === listedRecord.ownerHostId &&
+          !mirrored.has(id);
+      });
+    };
+    const listed = this.list({ scope: "project", ...(fresh ? { fresh: true } : {}) });
+    const map = toMap(listed);
+    if (!ids || !observation) return map;
+    if (!exactFor(listed, { fresh: false })) return map;
+    // The non-fresh list may come from a parse cached BEFORE the observation (listReadCacheMs):
+    // its map need not correspond to the observed facts. Arm only from a list read AFTER the
+    // observation (fresh), re-checked for exactness on a fresh parse, and only if the observed
+    // facts still hold afterwards, so the armed map provably answers the observed inputs.
+    // Cost: one extra fresh read per arming (about once per owner lease period), none while armed.
+    let armed: Map<string, boolean> | undefined;
+    try {
+      const freshListed = this.list({ scope: "project", fresh: true });
+      if (exactFor(freshListed, { fresh: true }) && observation.unchanged()) armed = toMap(freshListed);
+    } catch { armed = undefined; }
+    if (!armed) return map;
+    this.#pollOwnership = { hostId: localHostId, ids, map: armed, observation };
+    return armed;
   }
 
   get(id: string, now = Date.now(), options: { fresh?: boolean } = {}): FabricParticipantInfo | undefined {
@@ -2525,8 +2608,10 @@ export class ParticipantDirectory implements FabricParticipantSource {
       return committedAt;
     };
     // smarty-dev#8526: the actors this round can write, so the fence locks only their registries.
-    // undefined (every registry, as before) when the round also writes a root/legacy record,
-    // removes an own record, or carries a batch op not attributed to an actor id.
+    // An exact empty set means no actor effects; undefined keeps every registry, as before,
+    // when the round also writes a root/legacy record, removes an own record, or carries
+    // a batch op not attributed to an actor id. Later additions in commitPrepared are
+    // host/session-only; actor removals and migration/copy writes are covered here.
     const fencedActors = ((): ReadonlySet<string> | undefined => {
       const ids = new Set(publication?.actorIds ?? []);
       if (publication && publication.ops.length > 0 && publication.actorIds === undefined) return undefined;
@@ -2538,7 +2623,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
         if (record.kind !== "actor") return undefined;
         ids.add(record.id);
       }
-      return ids.size > 0 ? ids : undefined;
+      return ids;
     })();
     // smarty-dev#8880: a publication retry waits for its admission here, after selection, so only the
     // registry fences stand between the free mesh window and the 50 ms try. The decision stays under the

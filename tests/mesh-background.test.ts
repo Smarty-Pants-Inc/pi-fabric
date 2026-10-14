@@ -1,6 +1,9 @@
 import os from "node:os";
-import { afterEach, describe, expect, it, vi } from "vitest";
-import { MESH_ALARM_MAX_ATTEMPTS, MESH_JOURNAL_ALARM_TAG, MESH_OUTAGE_ALARM_AFTER_MS, MESH_OUTAGE_ALARM_TAG, MESH_OUTAGE_RECOVERY_SUCCESSES, MeshBackgroundQueue, MeshBackgroundRetry, type MeshOutageAlarm } from "../src/core/atomic-write.js";
+import childProcess from "node:child_process";
+import fs from "node:fs";
+import { PassThrough } from "node:stream";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { MESH_ALARM_ATTEMPT_MS, MESH_ALARM_MAX_ATTEMPTS, MESH_JOURNAL_ALARM_TAG, MESH_OUTAGE_ALARM_AFTER_MS, MESH_OUTAGE_ALARM_TAG, MESH_OUTAGE_RECOVERY_SUCCESSES, MeshBackgroundQueue, MeshBackgroundRetry, type MeshOutageAlarm } from "../src/core/atomic-write.js";
 import { FABRIC_MESH_OUTAGE_ALARM_TOPIC, meshAlarmRecipient, meshOutageAlarmSink } from "../src/mesh/store.js";
 
 const CHIEF = "session:0a1b2c3d-0000-4000-8000-00000000c0f5";
@@ -8,7 +11,15 @@ import { parse9729 } from "./helpers/alarm-contract.js";
 import { MeshLockTimeoutError } from "../src/mesh.js";
 
 const busy = () => new MeshLockTimeoutError(" held by pid 123 (alive, running)", 6, 8020);
-afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); });
+// Safety gate: ALL alarm tests use an inert child. No unit test writes live journal alarms.
+beforeEach(() => {
+  vi.spyOn(childProcess, "execFile").mockImplementation(() => {
+    const child = new childProcess.ChildProcess();
+    child.stdin = new PassThrough();
+    return child;
+  });
+});
+afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); vi.unstubAllGlobals(); vi.useRealTimers(); });
 
 describe("background mesh retry boundary", () => {
   it("backs off only typed timeouts, caps delay, logs holder once and resets backoff after recovery", async () => {
@@ -243,11 +254,12 @@ describe("background outage alarm (smarty-dev#8825)", () => {
   it("keeps at most 32 queued events, dropping the oldest, with one fabric-alarm journal line", async () => {
     vi.useFakeTimers();
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    // A publish that never settles (a hung mesh): nothing is delivered or retried, so only the cap bounds the queue.
-    const retry = new MeshBackgroundRetry("inbox", 100, 400).alarmsTo(() => new Promise(() => {}));
+    // A publish that never settles (a hung mesh), inside one attempt deadline: nothing is delivered or retried yet, so
+    // only the cap bounds the queue. A 1 ms outage bound keeps the whole run far inside MESH_ALARM_ATTEMPT_MS.
+    const retry = new MeshBackgroundRetry("inbox", 100, 400).alarmsTo(() => new Promise(() => {}), 1);
     for (let outage = 0; outage < 20; outage++) { // 20 outages: 40 events (alarm and recovery), none delivered
       retry.failure(busy());
-      await vi.advanceTimersByTimeAsync(MESH_OUTAGE_ALARM_AFTER_MS);
+      await vi.advanceTimersByTimeAsync(2);
       retry.failure(busy());
       retry.success(true);
       await vi.advanceTimersByTimeAsync(0);
@@ -269,15 +281,16 @@ describe("background outage alarm (smarty-dev#8825)", () => {
     const attempted: string[] = [];
     let release!: () => void;
     const first = new Promise<void>((resolve) => { release = resolve; });
+    // A 1 ms outage bound keeps the whole run inside one attempt deadline (smarty-dev#9848), so event 1 stays in flight.
     const retry = new MeshBackgroundRetry("inbox", 100, 400).alarmsTo((alarm) => {
       attempted.push(JSON.stringify(alarm));
       return attempted.length === 1 ? first : Promise.resolve(); // a delayed sink: the first publish hangs
-    });
+    }, 1);
     // 16 outages (alarm and recovery) and one more alarm: 33 events, one over the cap of 32, while event 1 is in
     // flight. The overflow drops event 1 itself (attempted, and counted).
     for (let outage = 0; outage <= 16; outage++) {
       retry.failure(busy());
-      await vi.advanceTimersByTimeAsync(MESH_OUTAGE_ALARM_AFTER_MS);
+      await vi.advanceTimersByTimeAsync(2);
       retry.failure(busy());
       if (outage < 16) retry.success(true);
       await vi.advanceTimersByTimeAsync(0);
@@ -297,6 +310,44 @@ describe("background outage alarm (smarty-dev#8825)", () => {
     expect(attempted).toEqual(raised);
     for (let i = 0; i < MESH_OUTAGE_RECOVERY_SUCCESSES; i++) retry.success(true);
     await retry.flushAlarms();
+  });
+
+  // smarty-dev#9848: a publish that never settles counts as a failed attempt at MESH_ALARM_ATTEMPT_MS, so the attempt
+  // limit still drains the queue; a late settle changes nothing. pi-fabric#979 Astra P2: with NO other trigger (no
+  // flushAlarms(), failure() or success() call), advancing the deadlines alone reaches the bounded drop.
+  it("a sink that never settles still runs the attempt limit: the event is dropped once and the queue drains", async () => {
+    vi.useFakeTimers();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    let attempts = 0;
+    const retry = new MeshBackgroundRetry("inbox", 100, 400).alarmsTo(() => { attempts++; return new Promise(() => {}); });
+    retry.failure(busy());
+    await vi.advanceTimersByTimeAsync(MESH_OUTAGE_ALARM_AFTER_MS);
+    retry.failure(busy()); // the alarm: attempt 1, which never settles
+    for (let i = 0; i < MESH_ALARM_MAX_ATTEMPTS; i++) await vi.advanceTimersByTimeAsync(MESH_ALARM_ATTEMPT_MS);
+    expect(attempts).toBe(MESH_ALARM_MAX_ATTEMPTS);
+    expect(retry.idle).toBe(false); // the outage itself is still open; only the alarm queue drained
+    await vi.advanceTimersByTimeAsync(MESH_ALARM_ATTEMPT_MS * 4);
+    expect(attempts).toBe(MESH_ALARM_MAX_ATTEMPTS); // dropped: no further attempt
+    const journal = warn.mock.calls.map(([line]) => parse9729(String(line))).filter((alarm) => alarm?.reason === "mesh-alarm-undeliverable");
+    expect(journal).toHaveLength(1);
+    expect(journal[0]).toMatchObject({ droppedAfterRetries: 1, queued: 0 });
+    retry.success(true);
+    await vi.advanceTimersByTimeAsync(MESH_ALARM_ATTEMPT_MS);
+  });
+
+  it("close() clears the retry a timed-out attempt scheduled: no attempt after close", async () => {
+    vi.useFakeTimers();
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    let attempts = 0;
+    const retry = new MeshBackgroundRetry("inbox", 100, 400).alarmsTo(() => { attempts++; return new Promise(() => {}); });
+    retry.failure(busy());
+    await vi.advanceTimersByTimeAsync(MESH_OUTAGE_ALARM_AFTER_MS);
+    retry.failure(busy()); // attempt 1, which never settles
+    await vi.advanceTimersByTimeAsync(MESH_ALARM_ATTEMPT_MS); // attempt 1 times out and schedules one retry
+    expect(attempts).toBe(1);
+    retry.close(); // clears that retry before it runs
+    await vi.advanceTimersByTimeAsync(MESH_ALARM_ATTEMPT_MS * 4);
+    expect(attempts).toBe(1);
   });
 
   it("drops an event after 8 failed attempts with one final journal line, and the queue empties", async () => {
@@ -365,5 +416,201 @@ describe("background outage alarm (smarty-dev#8825)", () => {
     await vi.advanceTimersByTimeAsync(0);
     expect(alarms.map((alarm) => alarm.state)).toEqual(["outage", "recovered"]);
     expect(retry.idle).toBe(true);
+  });
+});
+
+// smarty-dev#9657: drive the real emitter, but never run the native journal tool.
+describe("pane outage journal mirror (smarty-dev#9657)", () => {
+  type Callback = (error: childProcess.ExecFileException | null, stdout: string, stderr: string) => void;
+  let journal: typeof import("../src/core/atomic-write.js");
+  let writes: string[];
+  let callbacks: Callback[];
+  let children: childProcess.ChildProcess[];
+  let fault: string;
+  const stderrLines = () => vi.mocked(console.warn).mock.calls.map(([line]) => String(line))
+    .filter((line) => line.startsWith(`${MESH_OUTAGE_ALARM_TAG} {`));
+  const nativeError = (code: string | number) => Object.assign(new Error("journal unavailable"), { code, cmd: "systemd-cat" });
+  const raiseOutage = async (retry: MeshBackgroundRetry) => {
+    expect(retry.failure(busy())).toBe(true);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(retry.failure(busy())).toBe(true);
+  };
+  beforeEach(async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("process", { ...process, platform: "linux" });
+    vi.stubEnv("JOURNAL_STREAM", undefined);
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    writes = []; callbacks = []; children = []; fault = "";
+    vi.mocked(childProcess.execFile).mockImplementation(((_file: string, _args: string[], options: childProcess.ExecFileOptions,
+      callback: Callback) => {
+      if (fault === "spawn-throw") throw nativeError("EACCES");
+      if (fault === "ENOENT-throw") throw nativeError("ENOENT");
+      const child = new childProcess.ChildProcess();
+      child.stdin = fault === "missing-stdin" ? null : new PassThrough();
+      child.stdin?.on("data", (chunk) => writes.push(String(chunk)));
+      if (fault === "stdin-throw") vi.spyOn(child.stdin!, "end").mockImplementation(() => { throw nativeError("EPIPE"); });
+      if (fault === "timeout") setTimeout(() => callback(Object.assign(nativeError("ETIMEDOUT"), { killed: true }), "", ""), options.timeout);
+      callbacks.push(callback); children.push(child);
+      return child;
+    }) as typeof childProcess.execFile);
+    // Fresh private memo/counter for each test, without a production reset/config seam.
+    vi.resetModules();
+    journal = await import("../src/core/atomic-write.js");
+  });
+
+  it("does no journal subprocess or fstat work on import, idle or an ordinary retry warning", async () => {
+    const stat = vi.spyOn(fs, "fstatSync");
+    vi.stubEnv("JOURNAL_STREAM", "1:2");
+    vi.resetModules();
+    const cold = await import("../src/core/atomic-write.js");
+    const retry = new cold.MeshBackgroundRetry("idle");
+    await vi.advanceTimersByTimeAsync(10);
+    retry.failure(busy()); retry.success(true);
+    expect(childProcess.execFile).not.toHaveBeenCalled();
+    expect(stat).not.toHaveBeenCalled();
+  });
+
+  it("mirrors each outage and recovery line when JOURNAL_STREAM is unset, without searching hostile PATH", async () => {
+    vi.stubEnv("PATH", "/writable-project-bin");
+    vi.stubEnv("PI_FABRIC_LANDLOCK_TEST", "reserved");
+    vi.stubEnv("PI_FABRIC_TEST_SECRET", "round2-test-sentinel");
+    const stat = vi.spyOn(fs, "fstatSync");
+    const accepted: MeshOutageAlarm[] = [];
+    const retry = new journal.MeshBackgroundRetry("pane").alarmsTo((alarm) => { accepted.push(alarm); }, 1);
+    await raiseOutage(retry);
+    retry.success(true); await retry.flushAlarms();
+    expect(accepted.map((alarm) => alarm.state)).toEqual(["outage", "recovered"]);
+    expect(childProcess.execFile).toHaveBeenCalledTimes(2);
+    expect(writes).toEqual(stderrLines().map((line) => `${line}\n`));
+    expect(writes).toHaveLength(2);
+    expect(stat).not.toHaveBeenCalled();
+    for (const [file, args, options] of vi.mocked(childProcess.execFile).mock.calls) {
+      expect(file).toBe("/usr/bin/systemd-cat");
+      expect(args).toEqual(["--identifier", MESH_OUTAGE_ALARM_TAG]);
+      expect(options).toMatchObject({ timeout: 2_000, maxBuffer: 4_096 });
+      expect(options).not.toHaveProperty("shell");
+      expect((options as childProcess.ExecFileOptions).env).toEqual({ PATH: "/usr/bin:/bin" });
+    }
+    for (const callback of callbacks) callback(null, "", "");
+    expect(journal.meshJournalMirrorFailures()).toBe(0);
+  });
+
+  it.each(["", "garbage", "1", "1:", "1:2:3", " 1:2", "1:2\n", "1:2", "9007199254740992:9007199254740996"])
+    ("mirrors identical lines for malformed or mismatched JOURNAL_STREAM %j", async (stream) => {
+      vi.stubEnv("JOURNAL_STREAM", stream);
+      vi.spyOn(fs, "fstatSync").mockReturnValue({ dev: 9007199254740993n, ino: 9007199254740995n } as fs.BigIntStats);
+      const retry = new journal.MeshBackgroundRetry("pane").alarmsTo(() => {}, 1);
+      await raiseOutage(retry); retry.success(true); await retry.flushAlarms();
+      expect(writes).toEqual(stderrLines().map((line) => `${line}\n`));
+      expect(writes).toHaveLength(2);
+    });
+
+  it("does not duplicate stderr already bound to the exact journal dev:ino, using bigint fstat", async () => {
+    vi.stubEnv("JOURNAL_STREAM", "9007199254740993:9007199254740995");
+    const stat = vi.spyOn(fs, "fstatSync").mockReturnValue({ dev: 9007199254740993n, ino: 9007199254740995n } as fs.BigIntStats);
+    const accepted: MeshOutageAlarm[] = [];
+    const retry = new journal.MeshBackgroundRetry("pane").alarmsTo((alarm) => { accepted.push(alarm); }, 1);
+    await raiseOutage(retry); retry.success(true); await retry.flushAlarms();
+    expect(stat).toHaveBeenCalledTimes(2);
+    expect(stat).toHaveBeenCalledWith(2, { bigint: true });
+    expect(stderrLines()).toHaveLength(2);
+    expect(accepted.map((alarm) => alarm.state)).toEqual(["outage", "recovered"]);
+    expect(childProcess.execFile).not.toHaveBeenCalled();
+    expect(journal.meshJournalMirrorFailures()).toBe(0);
+  });
+
+  it("mirrors when fd 2 identity cannot be read", async () => {
+    vi.stubEnv("JOURNAL_STREAM", "1:2");
+    vi.spyOn(fs, "fstatSync").mockImplementation(() => { throw nativeError("EBADF"); });
+    const retry = new journal.MeshBackgroundRetry("pane").alarmsTo(() => {}, 1);
+    await raiseOutage(retry);
+    expect(writes).toEqual(stderrLines().map((line) => `${line}\n`));
+    expect(writes).toHaveLength(1);
+  });
+
+  it.each(["darwin", "win32", "freebsd"])("skips native journal work on %s without blocking the alarm sink", async (platform) => {
+    vi.stubGlobal("process", { ...process, platform });
+    vi.stubEnv("JOURNAL_STREAM", "1:2");
+    const stat = vi.spyOn(fs, "fstatSync");
+    const accepted: MeshOutageAlarm[] = [];
+    const retry = new journal.MeshBackgroundRetry("pane").alarmsTo((alarm) => { accepted.push(alarm); }, 1);
+    await raiseOutage(retry); retry.success(true); await retry.flushAlarms();
+    expect(accepted.map((alarm) => alarm.state)).toEqual(["outage", "recovered"]);
+    expect(stderrLines()).toHaveLength(2);
+    expect(childProcess.execFile).not.toHaveBeenCalled(); expect(stat).not.toHaveBeenCalled();
+    expect(journal.meshJournalMirrorFailures()).toBe(0);
+  });
+
+  it.each(["ENOENT-callback", "ENOENT-throw"])("counts %s once and skips the absent tool thereafter, across paths", async (mode) => {
+    fault = mode;
+    const accepted: MeshOutageAlarm[] = [];
+    const retry = new journal.MeshBackgroundRetry("pane").alarmsTo((alarm) => { accepted.push(alarm); }, 1);
+    await raiseOutage(retry);
+    if (mode === "ENOENT-callback") {
+      // EPIPE may arrive before the spawn callback: still remember ENOENT and count once.
+      expect(() => children[0]!.stdin!.emit("error", nativeError("EPIPE"))).not.toThrow();
+      expect(() => callbacks[0]!(nativeError("ENOENT"), "", "")).not.toThrow();
+    }
+    retry.success(true); await retry.flushAlarms();
+    const other = new journal.MeshBackgroundRetry("other").alarmsTo(() => {}, 1);
+    await raiseOutage(other);
+    expect(accepted.map((alarm) => alarm.state)).toEqual(["outage", "recovered"]);
+    expect(childProcess.execFile).toHaveBeenCalledOnce();
+    expect(journal.meshJournalMirrorFailures()).toBe(1);
+  });
+
+  it.each(["nonzero", "maxBuffer", "stdin", "stdin-throw", "spawn-throw", "missing-stdin"])
+    ("contains and counts %s failures without preventing mesh alarm delivery or future attempts", async (mode) => {
+      fault = mode;
+      const accepted: MeshOutageAlarm[] = [];
+      const retry = new journal.MeshBackgroundRetry("pane").alarmsTo((alarm) => { accepted.push(alarm); }, 1);
+      await raiseOutage(retry);
+      if (mode === "nonzero") expect(() => callbacks[0]!(nativeError(1), "", "")).not.toThrow();
+      if (mode === "maxBuffer") expect(() => callbacks[0]!(nativeError("ERR_CHILD_PROCESS_STDIO_MAXBUFFER"), "", "")).not.toThrow();
+      if (mode === "stdin") {
+        expect(() => children[0]!.stdin!.emit("error", nativeError("EPIPE"))).not.toThrow();
+        expect(() => children[0]!.stdin!.emit("error", nativeError("EPIPE"))).not.toThrow();
+        expect(() => callbacks[0]!(nativeError(1), "", "")).not.toThrow();
+      }
+      expect(journal.meshJournalMirrorFailures()).toBe(1);
+      fault = "";
+      expect(() => retry.success(true)).not.toThrow(); await retry.flushAlarms();
+      expect(accepted.map((alarm) => alarm.state)).toEqual(["outage", "recovered"]);
+      expect(childProcess.execFile).toHaveBeenCalledTimes(2);
+      callbacks.at(-1)!(null, "", "");
+      expect(journal.meshJournalMirrorFailures()).toBe(1);
+    });
+
+  it("bounds a timed-out child without delaying timers, recovery or mesh alarm delivery", async () => {
+    fault = "timeout";
+    const accepted: MeshOutageAlarm[] = [];
+    const retry = new journal.MeshBackgroundRetry("pane").alarmsTo((alarm) => { accepted.push(alarm); }, 1);
+    await raiseOutage(retry);
+    const tick = vi.fn(); setTimeout(tick, 1);
+    fault = ""; retry.success(true); await retry.flushAlarms();
+    expect(accepted.map((alarm) => alarm.state)).toEqual(["outage", "recovered"]);
+    expect(journal.meshJournalMirrorFailures()).toBe(0);
+    await vi.advanceTimersByTimeAsync(1); expect(tick).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(1_999);
+    expect(journal.meshJournalMirrorFailures()).toBe(1);
+  });
+
+  it.each(["attempts", "overflow"])("mirrors every structured emitter path including undeliverable by %s", async (limit) => {
+    const retry = new journal.MeshBackgroundRetry("pane").alarmsTo(
+      limit === "attempts" ? () => { throw busy(); } : () => new Promise(() => {}), 1);
+    await raiseOutage(retry);
+    if (limit === "attempts") {
+      for (let i = 1; i < MESH_ALARM_MAX_ATTEMPTS; i++) await retry.flushAlarms();
+      retry.success(true); await retry.flushAlarms();
+    } else {
+      retry.success(true);
+      for (let i = 0; i < 16; i++) { await raiseOutage(retry); retry.success(true); }
+    }
+    const lines = stderrLines();
+    expect(lines.map(parse9729).filter((alarm) => alarm?.reason === "mesh-alarm-undeliverable")).toHaveLength(1);
+    expect(lines.some((line) => parse9729(line)?.state === "recovered")).toBe(true);
+    expect(writes).toEqual(lines.map((line) => `${line}\n`));
+    expect(childProcess.execFile).toHaveBeenCalledTimes(lines.length);
+    retry.close();
   });
 });

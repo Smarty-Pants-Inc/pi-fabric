@@ -137,6 +137,50 @@ describe("actor archive paired task controls", () => {
     expect(removalPaths()).toEqual([f.archive, taskControlDirectory(f.archive)]);
   });
 
+  it("preserves opaque nested bytes alongside a genuine protected run pair", async () => {
+    const f = setup("legacy"), child = setup();
+    const nested = path.join(f.source, "nested", "child");
+    fs.mkdirSync(path.dirname(nested), { mode: 0o700 });
+    fs.renameSync(child.source, nested);
+    fs.renameSync(taskControlDirectory(child.source), taskControlDirectory(nested));
+    const opaque = Buffer.from([0, 255, 10, 128, 65]);
+    fs.writeFileSync(path.join(f.source, "nested", "plain.txt"), opaque, { mode: 0o600 });
+    await f.store.retainRun(f.actor, f.alias, f.source);
+    expect(fs.readFileSync(path.join(f.archive, "nested", "plain.txt"))).toEqual(opaque);
+    expect(fs.readFileSync(path.join(f.source, "nested", "plain.txt"))).toEqual(opaque);
+    const archivedChild = path.join(f.archive, "nested", "child");
+    for (const relative of originalFiles) {
+      expect(fs.readFileSync(path.join(taskControlDirectory(archivedChild), relative))).toEqual(fs.readFileSync(path.join(taskControlDirectory(nested), relative)));
+    }
+    expect(fs.readFileSync(path.join(archivedChild, "status.json"))).toEqual(fs.readFileSync(path.join(nested, "status.json")));
+    expect(readFinalAnswerReceipt(archivedChild, child.record.id)).toEqual(child.receipt);
+    expect(fs.existsSync(path.join(taskControlDirectory(archivedChild), ".legacy-read.json"))).toBe(false);
+    expect(canRemoveTerminalRun(archivedChild)).toBe(true);
+    // Opaque content is archive data, not new authority to collect its parent.
+    expect(canRemoveTerminalRun(f.archive)).toBe(false);
+    expect(removalPaths()).toEqual([]);
+  });
+
+  it.each(["root", "nested"] as const)("rejects copy failure when %s protected evidence must transfer", async location => {
+    const f = setup(location === "nested" ? "legacy" : "sibling-v1"), child = setup();
+    const nested = path.join(f.source, "nested", "child");
+    fs.mkdirSync(path.dirname(nested), { mode: 0o700 });
+    if (location === "nested") {
+      // Isolate the nested transfer veto: this legacy root has no controls.
+      for (const name of ["final-answer.json", "steer.jsonl", "terminal-controls", "terminal-notices"]) {
+        fs.renameSync(path.join(f.source, name), path.join(f.root, "saved-" + name));
+      }
+      fs.renameSync(child.source, nested);
+      fs.renameSync(taskControlDirectory(child.source), taskControlDirectory(nested));
+    } else fs.writeFileSync(path.join(f.source, "nested", "plain.txt"), "opaque");
+    const prune = vi.spyOn(f.store, "pruneRuns");
+    vi.spyOn(fs, "cpSync").mockImplementation(() => { throw new Error("nested unavailable"); });
+    await expect(f.store.retainRun(f.actor, f.alias, f.source)).rejects.toThrow("nested unavailable");
+    expect(prune).not.toHaveBeenCalled();
+    expect(fs.existsSync(f.source)).toBe(true);
+    expect(removalPaths()).toEqual([]);
+  });
+
   it("normalizes mixed journals legacy-first and only the matching delivered overlay", async () => {
     const f = setup("migrated"), mixed = addMigrationOverlay(f);
     const oldJournal = fs.readFileSync(path.join(f.source, "steer.jsonl"));

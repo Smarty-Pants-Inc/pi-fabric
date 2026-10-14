@@ -160,6 +160,13 @@ const archiveNestedControls = (runDirectory: string): Map<string, Map<string, Bu
           // Use the canonical path only after the held, no-follow parent check;
           // the shared reader rejects aliases through any source symlink.
           if (isTaskControlDirectoryEntry(nested, entry.name)) continue;
+          if (entry.isFile() && entry.name !== ".legacy-read.json") {
+            // Legacy nested files are opaque bytes, not run/control evidence.
+            // Prove owned, single-link and no-follow through the held parent.
+            const fd = openTaskControlFile(path.join(directory, entry.name));
+            fs.closeSync(fd);
+            continue;
+          }
           if (!entry.isDirectory()) throw new Error("Unsafe nested archive run");
           const child = path.join(nested, entry.name);
           readTaskRunStatus(child);
@@ -361,16 +368,25 @@ export class ActorLogStore {
             excluded.add(taskControlDirectory(source));
             for (const name of [...controlFiles, ...controlDirectories]) excluded.add(path.join(source, name));
           }
-          fs.cpSync(nested, path.join(held.path, "nested"), { recursive: true, filter: source => {
-            if (excluded.has(path.resolve(source))) return false;
-            // A marker outside a validated/excluded sibling is unknown evidence,
-            // not a grant to silently drop or transplant into another inode.
-            if (path.basename(source) === ".legacy-read.json") throw new Error("Unproven nested legacy grant");
-            const stat = fs.lstatSync(source);
-            if (stat.isSymbolicLink() || process.getuid && stat.uid !== process.getuid() ||
-                !stat.isDirectory() && (!stat.isFile() || stat.nlink !== 1)) throw new Error("Unsafe nested archive artifact");
-            return true;
-          } });
+          let unsafeArtifact = false;
+          try {
+            fs.cpSync(nested, path.join(held.path, "nested"), { recursive: true, filter: source => {
+              if (excluded.has(path.resolve(source))) return false;
+              try {
+                // Never transport an unproven inode-bound host grant.
+                if (path.basename(source) === ".legacy-read.json") throw new Error("Unproven nested legacy grant");
+                const stat = fs.lstatSync(source);
+                if (stat.isSymbolicLink() || process.getuid && stat.uid !== process.getuid() ||
+                    !stat.isDirectory() && (!stat.isFile() || stat.nlink !== 1)) throw new Error("Unsafe nested archive artifact");
+                return true;
+              } catch (error) { unsafeArtifact = true; throw error; }
+            } });
+          } catch (error) {
+            // Preserve best-effort opaque legacy copies ONLY: validation and
+            // any root/nested control transfer must still fail closed.
+            if (unsafeArtifact || controls !== undefined || [...nestedControls.values()].some(value => value !== undefined)) throw error;
+            console.warn(`[pi-fabric] actor run ${runId}: legacy nested/ not copied: ${(error as Error).message}`);
+          }
           // Copied directories may have permissive modes; make fresh archives
           // private before publishing protected siblings through held descriptors.
           if (process.platform !== "win32") closeDirectories(path.join(held.path, "nested"));

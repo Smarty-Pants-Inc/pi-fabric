@@ -101,6 +101,29 @@ describe("ActorLogStore", () => {
     expect(JSON.parse(fs.readFileSync(file, "utf8"))).toEqual(receipt);
   });
 
+  it.each(["symlink", "hardlink", "grant", "foreign"] as const)("rejects unsafe opaque nested %s even without protected transfers", async bad => {
+    const { root, actor, store } = setup();
+    const source = path.join(root, "source"), nested = path.join(source, "nested");
+    fs.mkdirSync(nested, { recursive: true, mode: 0o700 });
+    const file = path.join(nested, bad === "grant" ? ".legacy-read.json" : "plain.txt");
+    fs.writeFileSync(path.join(source, "status.json"), "opaque status");
+    if (bad === "symlink") fs.symlinkSync(path.join(source, "status.json"), file);
+    else fs.writeFileSync(file, "opaque bytes");
+    if (bad === "hardlink") fs.linkSync(file, path.join(root, "extra-link"));
+    if (bad === "foreign") {
+      const native = fs.lstatSync;
+      vi.spyOn(fs, "lstatSync").mockImplementation(((...args: Parameters<typeof native>) => {
+        const stat = native(...args);
+        return String(args[0]) === file && stat ? Object.assign(Object.create(Object.getPrototypeOf(stat)), stat, { uid: (process.getuid?.() ?? 0) + 1 }) : stat;
+      }) as typeof native);
+    }
+    const prune = vi.spyOn(store, "pruneRuns");
+    await expect(store.retainRun(actor, "latest", source)).rejects.toThrow();
+    expect(prune).not.toHaveBeenCalled();
+    expect(fs.existsSync(source)).toBe(true);
+    expect(fs.existsSync(path.join(root, "actor", "runs", "latest", "nested", path.basename(file)))).toBe(false);
+  });
+
   it("copies the archive protocol and nested runs, tolerating missing sources and nested-copy failure", async () => {
     const { root, actor, store } = setup();
     await store.retainRun(actor, "missing", undefined);

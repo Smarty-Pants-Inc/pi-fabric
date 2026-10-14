@@ -1186,7 +1186,7 @@ export class FabricRuntimeState {
       },
       onTerminalNotice: async (notice) => {
         if (!notice.sender?.id) throw new Error("Terminal refusal has no attributed sender; retain native receipt");
-        const message = `FABRIC_TARGET_TERMINAL: ${notice.delivery} ${notice.messageId} was not delivered to task ${notice.targetId}; ` +
+        const message = `FABRIC_TARGET_TERMINAL: undelivered: task already finished; ${notice.delivery} ${notice.messageId} was not delivered to task ${notice.targetId}; ` +
           `its final answer receipt is ${notice.finalAnswerReceiptId}. Start a new task; this input cannot revive the old one.`;
         if (notice.sender.id === identity.id || mainAgent.matches(notice.sender.id) && mainAgent.local) {
           this.pi.sendMessage({ customType: "pi-fabric-target-terminal", content: message, display: true, details: notice },

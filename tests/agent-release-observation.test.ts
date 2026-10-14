@@ -132,7 +132,8 @@ describe("checked agent release observations", () => {
 
   it("bounds a hung process-handle query by the reversible release deadline and retains the unresolved worker", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "release-query-deadline-"));
-    const manager = new AgentManager(root, { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, notifyOnComplete: false, retainRuns: false, nice: 19 },
+    const cwd = path.join(root, "cwd"); fs.mkdirSync(cwd);
+    const manager = new AgentManager(cwd, { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, notifyOnComplete: false, retainRuns: false, nice: 19 },
       { workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(root, "runs"), piBinary: process.execPath });
     let worker: ChildProcess | undefined; let exited: Promise<void> | undefined;
     let handle: Awaited<ReturnType<ProcessTransport["launch"]>> | undefined;

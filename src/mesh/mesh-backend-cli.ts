@@ -52,6 +52,13 @@ release. Required: each distinct release of a live Fabric writer (host leases an
 the built-in installed readers (factory) and each --require-reader. --accept-unready NAME,... is the
 only override. The intent is written to <root>/backend-switches.jsonl before the switch; the check
 runs again under the fence right before each flag commit (importing, sqlite), crash reruns included.
+A refusal before the importing commit moves the state.db, -wal and -shm that run created into a reported
+quarantine directory (smarty-dev#9501), through a root directory fd held via /proc/self/fd. Cleanup deletes
+nothing; inspect the quarantine and remove it manually once its contents are not needed. Kept paths are
+reported on stderr and in JSON ("cleanupWarnings", "retained", "reason"). Reasons: quarantined-after-refusal,
+no-held-dir-fd (no working /proc/self/fd: nothing is moved), close-failed (the database close failed: nothing
+is moved), cleanup-failed, not-this-runs-file. Refusal exit 3 is unchanged. Errors (exit 1) keep the files
+so a rerun converges.
 
 --scratch-proof-from STATE_JSON (import only, smarty-dev#9404): a reader's proof step. The CLI itself
 creates a fresh 0700 scratch directory (mkdtemp in --scratch-parent, default the OS temp directory; its
@@ -293,6 +300,8 @@ const makeScratchCopy = (stateJson: string, parent: string | undefined): Scratch
   catch (error) {
     // smarty-dev#9637: no fd (EMFILE, say), so no pin. Remove the directory just made, by name and only while it is
     // still empty (rmdir, never recursive), then surface the open's error.
+    // ponytail: smarty-dev#8907: no judgment, a fresh mkdtemp of ours; assertSafeChain(base) means no other uid can
+    // rename it, and rmdir removes only an empty directory, so a swap cannot cost data.
     const warnings: string[] = [];
     try { fs.rmdirSync(root); }
     catch (cleanup) { warnings.push(`could not remove the scratch directory ${root}: ${(cleanup as Error).message}`); }
@@ -319,12 +328,18 @@ const makeScratchCopy = (stateJson: string, parent: string | undefined): Scratch
  */
 const removeScratch = (scratch: Scratch, warnings: string[]): boolean => {
   try {
+    // ponytail: smarty-dev#8907: no expiry judgment, so no verifiedRemove. Each path starts at `pinned`
+    // (/proc/self/fd/<fd> or /dev/fd/<fd>), so the held fd resolves the parent and a swap of `root` cannot redirect
+    // it. The directory is our fresh 0700 mkdtemp: only this process's copy and import write in it, and rmSync
+    // unlinks a symlink entry rather than following it.
     for (const name of fs.readdirSync(scratch.pinned)) {
       try { fs.rmSync(path.join(scratch.pinned, name), { recursive: true, force: true }); }
       catch (error) { warnings.push(`could not remove ${scratch.root}/${name}: ${(error as Error).message}`); }
     }
     if (!sameScratch(scratch.root, scratch.fd)) warnings.push(`did not remove ${scratch.root}: the path no longer names the scratch directory this process made`);
     else {
+      // ponytail: smarty-dev#8907: rmdir by name right after sameScratch. It removes only an empty directory, and
+      // assertSafeChain bars any other uid from renaming it, so a swap in this window cannot cost data.
       try { fs.rmdirSync(scratch.root); }
       catch (error) { warnings.push(`could not remove the scratch directory ${scratch.root}: ${(error as Error).message}`); }
     }
@@ -383,7 +398,43 @@ const scratchProofImport = async (options: Options, io: { census?: MeshWriterCen
   }
 };
 
-interface Gate { stop?: () => void; ownStateDbFds?: string[]; switchId: string; required: RequiredReader[]; readiness: ReaderReadiness; final?: ReaderReadiness; checked: string[] }
+interface Gate { stop?: () => void; ownStateDbFds?: string[]; switchId: string; required: RequiredReader[]; readiness: ReaderReadiness; final?: ReaderReadiness;
+  accepted: ReaderReadiness["unready"]; checked: string[] }
+
+/** The one post-commit alarm for a switch that accepted unready readers (smarty-dev#9436). */
+export const MESH_SWITCH_OVERRIDE_ALARM_TOPIC = "fabric.alarm.mesh-switch-override";
+
+/** Publish outside the migration fence, using the same MeshStore alarm path as mesh health alarms. */
+const distinctReaders = (readers: ReaderReadiness["unready"]): ReaderReadiness["unready"] =>
+  [...new Map(readers.map(reader => [reader.name, reader])).values()];
+
+// ponytail: basenames keep the cause readable; directories are the sensitive part of shared alarm reasons.
+const pathFreeAlarmReason = (reason: string): string =>
+  reason.replace(/(^|[\s()[\];,"'])((?:\/|[A-Za-z]:[\\/])[^\s()[\];,"']*)/g, (_match, prefix: string, token: string) => {
+    const file = token.replace(/[:.]+$/, "");
+    return prefix + path.win32.basename(file) + token.slice(file.length);
+  });
+
+const publishSwitchOverrideAlarm = async (options: Options, gate: Gate, accepted: ReaderReadiness["unready"], epoch: number): Promise<void> => {
+  const { MeshStore, meshAlarmRecipient } = await import("./store.js");
+  const to = meshAlarmRecipient();
+  const uniqueAccepted = distinctReaders(accepted).map(reader => ({ ...reader, reason: pathFreeAlarmReason(reader.reason) }));
+  const names = uniqueAccepted.map(reader => `${reader.name} (${reader.reason})`).join("; ");
+  if (!to) throw new Error("no owning-lead alarm recipient (PI_FABRIC_MESH_ALARM_TO or SMARTY_LEAD_SESSION must be session:<uuid>)");
+  const store = new MeshStore(options.root, 256 * 1024, 500, { lockProtocol: options.lockProtocol, canWakeResidents: () => false });
+  try {
+    await store.publish({
+      topic: MESH_SWITCH_OVERRIDE_ALARM_TOPIC,
+      kind: "mesh-switch-override",
+      dedupeKey: `mesh-switch-override:${gate.switchId}`,
+      to,
+      from: { id: `fabric-mesh-backend:${process.pid}`, name: "fabric-mesh-backend", kind: "agent" },
+      text: `fabric-mesh-backend ${options.command} accepted unready reader(s) after switch ${gate.switchId}: ${names}`,
+      data: { switchId: gate.switchId, command: options.command, epoch,
+        acceptedUnready: uniqueAccepted.map(reader => ({ name: reader.name, reason: reader.reason })), checkedUnderFence: gate.checked },
+    });
+  } finally { store.closeState(); }
+};
 
 /**
  * The readiness gate of a switch to sqlite (smarty-dev#7815). The required readers come from the
@@ -448,7 +499,7 @@ const openGate = async (options: Options, library: MeshBackendOptions, builtins:
     warn(`fabric-mesh-backend: reader ${reader.name} not ready: ${reader.reason}${options.acceptUnready.includes(reader.name) ? " (accepted by --accept-unready)" : ""}\n`);
   }
   const readiness = evaluate(window, "", required);
-  const gate: Gate = { switchId: randomUUID(), required, readiness, checked: [], stop: () => fencedWatch?.stop() };
+  const gate: Gate = { switchId: randomUUID(), required, readiness, accepted: [], checked: [], stop: () => fencedWatch?.stop() };
   try {
     recordSwitch(options.root, { switchId: gate.switchId, phase: "intent", command: options.command, backend: "sqlite", from: backend, ...window,
       required, requireReader: options.requireReaders, acceptUnready: options.acceptUnready, readersReady: readiness.ready, acceptedUnready: readiness.unready });
@@ -475,6 +526,7 @@ const openGate = async (options: Options, library: MeshBackendOptions, builtins:
     underFence = true;
     outer?.(commit);
     gate.final = evaluate(commit, ` (under the fence, before the ${commit.phase} commit)`);
+    gate.accepted.push(...gate.final.unready);
     gate.checked.push(commit.phase);
     if (ownFds) gate.ownStateDbFds = ownFds;
   };
@@ -581,11 +633,30 @@ export const main = async (argv: string[], io: {
       : options.command === "cutover" ? cutoverMeshState(options.root, library)
         : options.command === "rollback" ? rollbackMeshState(options.root, library)
           : abortMeshRollback(options.root, library))) };
+    let overrideAlarmFailure: string | undefined;
     if (gate) {
       const final = gate.final ?? gate.readiness;
       result.readers = { switchId: gate.switchId, ready: final.ready, acceptedUnready: final.unready, checkedUnderFence: gate.checked };
+      // Outcome append attempted, then alarm; the alarm does not depend on the append succeeding.
+      // A post-commit alarm failure never changes the switch record.
       result.switchRecord = closeGate(options.root, gate, warn, { ok: true, epoch: result.epoch, converged: result.converged,
         checkedUnderFence: gate.checked, ownStateDbFds: gate.ownStateDbFds, required: gate.final?.required ?? gate.required, readersReady: final.ready, acceptedUnready: final.unready });
+      const accepted = distinctReaders(gate.accepted);
+      if (accepted.length > 0) {
+        try {
+          await publishSwitchOverrideAlarm(options, gate, accepted, Number(result.epoch));
+        } catch (error) {
+          overrideAlarmFailure = error instanceof Error ? error.message : String(error);
+          const names = accepted.map(reader => `${reader.name} (${reader.reason})`).join("; ");
+          warn(`fabric-mesh-backend: ${MESH_SWITCH_OVERRIDE_ALARM_TOPIC} publish failed after committed switch ${gate.switchId}; `
+            + `accepted readers: ${names}; switch remains committed: ${overrideAlarmFailure}\n`);
+        }
+      }
+    }
+    if (overrideAlarmFailure !== undefined) {
+      if (options.json) write(`${JSON.stringify({ command: options.command, ok: false, committed: true, error: overrideAlarmFailure, ...result, alarms }, null, 2)}\n`);
+      else write(`${options.command} committed, but ${MESH_SWITCH_OVERRIDE_ALARM_TOPIC} failed: ${overrideAlarmFailure}\n`);
+      return 1;
     }
     write(`${options.json ? JSON.stringify({ command: options.command, ok: true, ...result, alarms }, null, 2) : formatResult(options.command, result)}\n`);
     return 0;
@@ -593,8 +664,15 @@ export const main = async (argv: string[], io: {
     const refused = error instanceof MeshBackendRefusedError || error instanceof MeshBackendFenceError;
     const message = error instanceof Error ? error.message : String(error);
     if (gate) closeGate(options.root, gate, warn, { ok: false, refused, error: message });
+    // smarty-dev#9501: what a refused import could not remove (the library attaches it to the refusal itself).
+    const carried = (error ?? {}) as { cleanupWarnings?: unknown; retained?: unknown; reason?: unknown };
+    const cleanupWarnings = Array.isArray(carried.cleanupWarnings) ? carried.cleanupWarnings as string[] : [];
+    const cleanup = cleanupWarnings.length === 0 ? {} : { cleanupWarnings, ...(Array.isArray(carried.retained) ? { retained: carried.retained } : {}),
+      ...(typeof carried.reason === "string" ? { reason: carried.reason } : {}) };
+    for (const text of cleanupWarnings) warn(`fabric-mesh-backend: ${text}\n`);
     if (options.json) {
-      write(`${JSON.stringify({ command: options.command, ok: false, refused, code: (error as { code?: unknown }).code, error: message, alarms }, null, 2)}\n`);
+      write(`${JSON.stringify({ command: options.command, ok: false, refused, code: (error as { code?: unknown }).code, error: message,
+        ...cleanup, alarms }, null, 2)}\n`);
     }
     warn(`fabric-mesh-backend: ${options.command} ${refused ? "refused" : "failed"}: ${message}\n`);
     return refused ? 3 : 1;

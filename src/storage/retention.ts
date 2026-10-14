@@ -3,6 +3,7 @@ import { retentionV2Enabled } from "./retention-platform.js";
 import path from "node:path";
 import { writeFileAtomic, writeJsonAtomic } from "../core/atomic-write.js";
 import { ownedStat, processAlive } from "./scratch.js";
+import { boundedRunTree } from "./reference-scan.js";
 import { countRefusal, removalTallyOn, verifiedRemove } from "./verified-remove.js";
 import { processStartTime } from "../residency/process-identity.js";
 import { FileLockBusy, lockFile } from "../residency/file-lock.js";
@@ -10,7 +11,7 @@ import { recoverActorRunArchives } from "../actors/child-completions.js";
 import { recoverEnodevTaskRun } from "../agents/enodev-recovery.js";
 import { copyFabricProvenance } from "../fabric-provenance.js";
 import { readFinalAnswerReceipt } from "../worker/terminal-answer.js";
-import { terminalAdmissionFromEntry, terminalControlMatchesAdmission, terminalSenderMatches, type TerminalAdmission } from "../agents/terminal-notices.js";
+import { readTerminalAdmission, terminalAdmissionFromEntry, terminalControlMatchesAdmission, terminalSenderMatches, type TerminalAdmission } from "../agents/terminal-notices.js";
 
 export const FABRIC_RUN_ROOT_PREFIX = "pi-fabric-runs-";
 const RUN_ROOT_OWNER_FILE = ".fabric-owner.json";
@@ -97,6 +98,25 @@ export const UNRESOLVED_WORKER_FILE = "unresolved-worker.json";
 /** A sweep's wall-clock budget; walks stop when it returns true (smarty-dev#2010). */
 type Deadline = () => boolean;
 const noDeadline: Deadline = () => false;
+const TASK_FINAL_ANSWER_LOCK = ".task-final-answer.lock";
+const TASK_FINAL_ANSWER_LOCK_STALE_MS = 30_000;
+/** The final-answer writer's exact mkdir-lock shape. Ownerless, malformed, young, linked, or live locks veto retention. */
+const safeStaleFinalAnswerLock = (directory: string): boolean => {
+  if (!ownedStat(directory)?.isDirectory()) return false;
+  try {
+    const entries = fs.readdirSync(directory);
+    if (entries.length !== 1 || entries[0] !== "owner") return false;
+    const ownerFile = path.join(directory, "owner");
+    const stat = ownedStat(ownerFile);
+    if (!stat?.isFile() || stat.size > 256) return false;
+    const text = fs.readFileSync(ownerFile, "utf8");
+    const match = /^([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\n([1-9][0-9]*)\n([0-9]+)\n$/i.exec(text);
+    if (!match) return false;
+    const pid = Number(match[2]), createdAt = Number(match[3]);
+    return Number.isSafeInteger(pid) && pid > 0 && Number.isSafeInteger(createdAt) && createdAt >= 0 &&
+      Date.now() - createdAt > TASK_FINAL_ANSWER_LOCK_STALE_MS && !processAlive(pid);
+  } catch { return false; }
+};
 /**
  * True when this run, or any nested child run below it, is marked. A walk cut short by the
  * deadline also answers true: an unfinished check never authorizes deletion.
@@ -287,9 +307,10 @@ const safeTerminalArtifacts = (root: string, expired: Deadline): boolean => {
     // controls remain known collectible artifacts; queued/unknown ones do not.
     return fs.readdirSync(controls).every(name => {
       if (expired() || !/^[a-zA-Z0-9_-]{1,200}\.json$/.test(name)) return false;
-      const control = readJson<{ id?: string; state?: string; delivery?: string; provenance?: unknown }>(path.join(controls, name));
+      const control = readJson<{ id?: string; state?: string; delivery?: string; provenance?: unknown; forwarded?: unknown }>(path.join(controls, name));
       return !!control && control.state === "delivered" &&
-        Object.keys(control).every(key => ["id", "state", "delivery", "provenance"].includes(key)) &&
+        (control.forwarded === undefined || typeof control.forwarded === "boolean") &&
+        Object.keys(control).every(key => ["id", "state", "delivery", "provenance", "forwarded"].includes(key)) &&
         terminalControlMatchesAdmission(control, admissions.get(name.slice(0, -5)));
     });
   }
@@ -326,12 +347,19 @@ const safeTerminalArtifacts = (root: string, expired: Deadline): boolean => {
     if (!ownedStat(controls)?.isDirectory()) return false;
     for (const name of fs.readdirSync(controls)) {
       if (expired() || !/^[a-zA-Z0-9_-]{1,200}\.json$/.test(name)) return false;
-      const control = readJson<{ id?: string; state?: string; delivery?: string; provenance?: unknown }>(path.join(controls, name));
+      const control = readJson<{ id?: string; state?: string; delivery?: string; provenance?: unknown; forwarded?: unknown }>(path.join(controls, name));
       const id = name.slice(0, -5), admission = admissions.get(id);
       if (!control || !admission || typeof control.id !== "string" || !/^[a-zA-Z0-9_-]{1,200}$/.test(control.id) ||
           !["steer", "followUp"].includes(control.delivery ?? "") || !["queued", "refused", "delivered"].includes(control.state ?? "") ||
-          Object.keys(control).some(key => !["id", "state", "delivery", "provenance"].includes(key)) ||
+          Object.keys(control).some(key => !["id", "state", "delivery", "provenance", "forwarded"].includes(key)) ||
+          control.forwarded !== undefined && typeof control.forwarded !== "boolean" ||
           control.provenance !== undefined && !copyFabricProvenance(control.provenance)) return false;
+      // A previously fabricated route receipt cannot discharge an ambiguous
+      // forwarded frame, nor a still-queued legacy row without transport proof.
+      if (control.state === "queued") return false;
+      // Legacy shape (no `forwarded`): a refused row may hide a buffered, consumed
+      // frame, so even an old route receipt cannot retire it. Delivered stays allowed.
+      if (control.forwarded === undefined && control.state !== "delivered") return false;
       if (control.state === "delivered" && terminalControlMatchesAdmission(control, admission)) consumed.add(id);
       else if (!routed.has(id)) return false; // Only the original-attributed refusal discharges mismatched rows.
     }
@@ -341,6 +369,22 @@ const safeTerminalArtifacts = (root: string, expired: Deadline): boolean => {
   }
   return true;
 };
+const DURABLE_KEY = /^(?:initial|[0-9a-f]{64})$/;
+const DURABLE_LEASE_FILES = new Set(["lease.sqlite", "lease.sqlite-journal"]);
+const DURABLE_STORE_FILE = /^(?:main|(?:doc|task)-(?:0|[1-9]\d*))\.jsonl(?:\.reclaim)?$/;
+const onlyOwnedFiles = (directory: string, allowed: (name: string) => boolean, expired: Deadline): boolean =>
+  !expired() && fs.readdirSync(directory).every((name) => !expired() && allowed(name) && ownedStat(path.join(directory, name))?.isFile() === true) && !expired();
+/** Only the known pi-durable journal layout is an artifact; custody still decides removal. */
+const safeDurableTree = (directory: string, expired: Deadline): boolean => !expired() && fs.readdirSync(directory).every((key) => {
+  const conversation = path.join(directory, key);
+  if (expired() || !DURABLE_KEY.test(key) || !ownedStat(conversation)?.isDirectory()) return false;
+  return fs.readdirSync(conversation).every((name) => {
+    if (expired()) return false;
+    const file = path.join(conversation, name);
+    if (name === "store") return ownedStat(file)?.isDirectory() === true && onlyOwnedFiles(file, (child) => DURABLE_STORE_FILE.test(child), expired);
+    return DURABLE_LEASE_FILES.has(name) && ownedStat(file)?.isFile() === true;
+  });
+}) && !expired();
 /** Unknown transports/contents and live descendants veto removal, even under a dead host. */
 const safeRunTree = (root: string, childrenStopped: boolean, depth = 0, expired: Deadline = noDeadline, acceptPidReuse = false): boolean => {
   if (expired() || depth > 32 || !ownedStat(root)?.isDirectory()) return false;
@@ -368,7 +412,17 @@ const safeRunTree = (root: string, childrenStopped: boolean, depth = 0, expired:
       const stat = ownedStat(file);
       if (!stat) return false;
       if (stat.isFile() && (runFile(name) || name === "final-answer.json" || (name === "queued-result.json" && record?.queuedArchiveCommitted === true))) continue;
+      if (stat.isDirectory() && name === TASK_FINAL_ANSWER_LOCK) {
+        if (!record?.status || !TERMINAL_STATUSES.has(record.status) || !safeStaleFinalAnswerLock(file)) return false;
+        continue;
+      }
       if (stat.isDirectory() && (name === "terminal-controls" || name === "terminal-notices")) continue;
+      if (stat.isDirectory() && name === "tmp") {
+        // Manager-created task scratch belongs to this run. Reuse the owned,
+        // bounded walk: links, hardlinks, special files or incomplete scans veto.
+        if (!boundedRunTree(file, expired)) return false;
+        continue;
+      }
       if (stat.isDirectory() && name === "handoff-session") {
         // This directory is exclusively populated by Fabric's session fork writer.
         if (fs.readdirSync(file).some((child) => !child.endsWith(".jsonl") || !ownedStat(path.join(file, child))?.isFile())) return false;
@@ -384,14 +438,29 @@ const safeRunTree = (root: string, childrenStopped: boolean, depth = 0, expired:
         // Anonymous, pending, uncertain, malformed or linked content still vetoes.
         const children = fs.readdirSync(file);
         const followUps = path.join(root, "follow-ups");
-        if (children.length && (!ownedStat(followUps)?.isDirectory() || !safeFollowUps(followUps, expired))) return false;
         for (const child of children) {
-          if (expired() || !followUpName.test(child) || !ownedStat(path.join(followUps, child))?.isFile()) return false;
-          const item = readJson<{ message?: unknown; delivery?: unknown; followUpId?: unknown; provenance?: unknown }>(path.join(file, child));
-          if (!item || item.delivery !== "followUp" || item.followUpId !== child.slice(0, -5) ||
-              typeof item.message !== "string" || !copyFabricProvenance(item.provenance) ||
-              Object.keys(item).some(key => !["message", "delivery", "followUpId", "provenance"].includes(key))) return false;
+          if (expired() || !followUpName.test(child)) return false;
+          const id = child.slice(0, -5);
+          const item = readJson<{ message?: unknown; delivery?: unknown; followUpId?: unknown; controlId?: unknown; images?: unknown; provenance?: unknown }>(path.join(file, child));
+          if (!item || typeof item.message !== "string" ||
+              item.images !== undefined && !Array.isArray(item.images) ||
+              Object.keys(item).some(key => !["message", "delivery", "followUpId", "controlId", "images", "provenance"].includes(key))) return false;
+          if (item.controlId === id) {
+            const admission = readTerminalAdmission(root, id);
+            const control = readJson<{ state?: string }>(path.join(root, "terminal-controls", child));
+            if (!control || !["delivered", "refused"].includes(control.state ?? "") ||
+                !terminalControlMatchesAdmission(control, admission) ||
+                !terminalControlMatchesAdmission({ id, delivery: item.delivery, provenance: item.provenance }, admission)) return false;
+          } else if (item.controlId !== undefined || item.delivery !== "followUp" || !copyFabricProvenance(item.provenance)) return false;
+          if (item.followUpId !== undefined || item.controlId === undefined) {
+            if (item.delivery !== "followUp" || item.followUpId !== id || !ownedStat(path.join(followUps, child))?.isFile() ||
+                !ownedStat(followUps)?.isDirectory() || !safeFollowUps(followUps, expired)) return false;
+          }
         }
+        continue;
+      }
+      if (stat.isDirectory() && name === "durable") {
+        if (!safeDurableTree(file, expired)) return false;
         continue;
       }
       if (stat.isDirectory() && name === "nested") {
@@ -414,10 +483,18 @@ const runTreeRefusal = (root: string, acceptPidReuse: boolean): string => {
   try {
     if (!safeTerminalArtifacts(root, noDeadline)) return "terminal answer, notices or controls not proven consumed";
     for (const name of fs.readdirSync(root)) {
-      const stat = ownedStat(path.join(root, name));
+      const file = path.join(root, name);
+      const stat = ownedStat(file);
       if (!stat) return "an entry is a link, hard-linked or not ours";
+      if (stat.isDirectory() && name === TASK_FINAL_ANSWER_LOCK &&
+          (!record?.status || !TERMINAL_STATUSES.has(record.status) || !safeStaleFinalAnswerLock(file))) {
+        return "terminal-answer lock owner is live, malformed, or not proven stale";
+      }
+      if (name === "tmp" && stat.isDirectory() && !boundedRunTree(file, noDeadline)) {
+        return "task scratch subtree is unsafe or exceeds scan bounds";
+      }
       const known = stat.isFile() ? runFile(name) || name === "final-answer.json" || name === "queued-result.json"
-        : ["terminal-controls", "terminal-notices", "handoff-session", "follow-ups", "deliveries", "nested"].includes(name);
+        : [TASK_FINAL_ANSWER_LOCK, "terminal-controls", "terminal-notices", "handoff-session", "follow-ups", "deliveries", "nested", "tmp"].includes(name);
       if (!known) return `unknown entry ${name.replace(/[0-9a-f-]{8,}/gi, "<id>")}`;
     }
   } catch { return "run tree unreadable"; }

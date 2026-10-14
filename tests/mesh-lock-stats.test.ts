@@ -335,6 +335,46 @@ describe("mesh lock stats recorder", () => {
     expect(fs.readdirSync(directory).filter(name => !name.startsWith(lockStatsHost()))).toEqual(["racer-5.json"]);
   });
 
+  it("keeps a refreshed graveyard when relinking fails, but drops it on EEXIST (smarty-dev#8954)", () => {
+    const stats = createLockStats("1")!;
+    for (const code of ["EPERM", "EEXIST"]) {
+      const root = path.join(temp(), "mesh");
+      const directory = path.join(root, "lock-stats");
+      fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+      const file = path.join(directory, "racer-5.json");
+      const grave = `${file}.prune-${process.pid}`;
+      const old = (Date.now() - 25 * 60 * 60_000) / 1000;
+      fs.writeFileSync(file, "{}");
+      fs.utimesSync(file, old, old);
+      const renameSync = fs.renameSync, linkSync = fs.linkSync;
+      vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+        if (String(from) === file) {
+          // A writer replaces the aged inode just before the pruner moves it aside.
+          fs.writeFileSync(`${file}.next`, "{\"fresh\":1}");
+          renameSync(`${file}.next`, file);
+        }
+        renameSync(from, to);
+      });
+      const link = vi.spyOn(fs, "linkSync").mockImplementationOnce((from, to) => {
+        if (code === "EPERM") throw Object.assign(new Error("relink denied"), { code });
+        fs.writeFileSync(file, "{\"fresh\":2}");
+        linkSync(from, to); // The newer file makes the real no-replace link fail with EEXIST.
+      });
+      stats.acquired(root, "custody", 1, 1);
+      registry[lockKey]!.flush();
+      expect(link).toHaveBeenCalledExactlyOnceWith(grave, file);
+      if (code === "EPERM") {
+        expect(fs.existsSync(grave)).toBe(true);
+        expect(fs.readFileSync(grave, "utf8")).toBe("{\"fresh\":1}");
+        expect(fs.existsSync(file)).toBe(false);
+      } else {
+        expect(fs.existsSync(grave)).toBe(false);
+        expect(fs.readFileSync(file, "utf8")).toBe("{\"fresh\":2}");
+      }
+      vi.restoreAllMocks();
+    }
+  });
+
   it("prunes a quiet root opportunistically on explicit flush and drops a removed root", () => {
     vi.useFakeTimers();
     vi.setSystemTime(T0);
@@ -435,9 +475,14 @@ describe("mesh lock stats recorder", () => {
 
   it("shares one recorder across module generations", async () => {
     const root = temp();
-    const source = fileURLToPath(new URL("../src/mesh/commit-stats.ts", import.meta.url));
-    const copies = ["release-a.ts", "release-b.ts"].map(name => path.join(root, name));
-    for (const copy of copies) fs.copyFileSync(source, copy);
+    // Each generation is a full installed tree: mesh/commit-stats.ts imports ../storage/verified-remove.js.
+    const copies = ["release-a", "release-b"].map(release => {
+      for (const module of ["mesh/commit-stats.ts", "storage/verified-remove.ts"]) {
+        fs.mkdirSync(path.dirname(path.join(root, release, module)), { recursive: true });
+        fs.copyFileSync(fileURLToPath(new URL(`../src/${module}`, import.meta.url)), path.join(root, release, module));
+      }
+      return path.join(root, release, "mesh/commit-stats.ts");
+    });
     const first = await import(/* @vite-ignore */ pathToFileURL(copies[0]!).href);
     const second = await import(/* @vite-ignore */ pathToFileURL(copies[1]!).href);
     expect(second.createLockStats).not.toBe(first.createLockStats);

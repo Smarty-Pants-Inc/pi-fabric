@@ -386,12 +386,26 @@ describe("#4383 resident host presence batch", () => {
     const { host, config, records } = await fixture();
     const id = records[0]!.id;
     expect(host.mesh.get(`actors/${config.sessionId}/${id}`, { fresh: true })).toBeDefined();
+    if (process.platform === "linux") {
     expect(await host.actors.remove(id, { wait: true })).toMatchObject({ removed: true });
     expect(host.actors.cleanupObligation(id)).toBeUndefined();
     expect(host.mesh.get(`actors/${config.sessionId}/${id}`, { fresh: true })).toBeUndefined();
     expect(readParticipantFile(config.meshRoot, participantKey(id))).toBeUndefined();
     expect(new ActorRegistryStore(config.actorRoot).records().some(row => row.id === id)).toBe(false);
     expect(host.actors.listOwned()).toHaveLength(39);
+    } else {
+      // Off Linux no root actor tree deletion runs (smarty-dev#8090; follow-up smarty-dev#11335): the registry
+      // revocation commits, the tree is kept and the cleanup obligation stays pending with the named refusal.
+      const dir = path.join(config.actorRoot, id);
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, "kept-11335.txt"), "history\n");
+      const removed = await host.actors.remove(id, { wait: true });
+      expect(removed).toEqual({ removed: true, cleaned: false,
+        pending: `removal cleanup failed: Root actor tree deletion needs the Main publication fence, which this platform (${process.platform}) lacks (smarty-dev#8090); follow-up smarty-dev#11335; the root ${config.rootId} actor tree is kept (a later remove or host start finishes it)` });
+      expect(fs.readFileSync(path.join(dir, "kept-11335.txt"), "utf8")).toBe("history\n");
+      expect(host.actors.cleanupObligation(id)).toBeDefined();
+      expect(new ActorRegistryStore(config.actorRoot).records().some(row => row.id === id)).toBe(false);
+    }
   });
 
   it("uses fresh registry custody before batching legacy actor presence", async () => {

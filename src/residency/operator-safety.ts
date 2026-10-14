@@ -136,6 +136,11 @@ const checkPid = (pid: number, host: string, startedAt: number | undefined): Mai
   return { pid, host, onThisHost, alive, startMatches };
 };
 
+/** A /proc/<pid>/stat field 22 start time as the kernel prints it: canonical unsigned decimal (%llu), no sign, space,
+ * fraction, exponent, hex or leading zero, at most 2^64-1. Compared as strings, so no Number precision loss. */
+const procStartTick = (value: unknown): value is string => typeof value === "string" && /^(?:0|[1-9][0-9]{0,19})$/.exec(value)?.[0] === value &&
+  BigInt(value) <= BigInt("18446744073709551615");
+
 /** The recorded Main process is gone from this host ("gone: ..."), or why that cannot be verified. */
 const mainProcessGone = (main: { pid?: unknown; host?: unknown; startTime?: unknown } | undefined): string => {
   if (process.platform !== "linux") return "unknown: Main process identity unavailable (non-Linux; smarty-dev#7956)";
@@ -143,6 +148,14 @@ const mainProcessGone = (main: { pid?: unknown; host?: unknown; startTime?: unkn
     return "unknown: Main process identity unavailable (no pid in the root participant record)";
   }
   if (main.host !== os.hostname()) return `unknown: Main process identity unavailable (recorded on host ${String(main.host)}, not this host)`;
+  // pi-fabric#1031: a pid without its start time is no identity; an absent pid alone never proves this Main dead.
+  if (typeof main.startTime !== "string" || !main.startTime) {
+    return `unknown: Main process identity unavailable (no start time for pid ${main.pid} in the root participant record)`;
+  }
+  // pi-fabric#1031 round 3: a malformed start time is no identity either, before pid-absence or reuse can prove anything.
+  if (!procStartTick(main.startTime)) {
+    return `unknown: Main process identity unavailable (malformed start time ${JSON.stringify(main.startTime)} for pid ${main.pid} in the root participant record)`;
+  }
   if (processStartTime(process.pid) === undefined) return "unknown: Main process identity unavailable (/proc is unreadable)";
   let exists: boolean;
   try { fs.statSync(`/proc/${main.pid}`); exists = true; }
@@ -151,9 +164,8 @@ const mainProcessGone = (main: { pid?: unknown; host?: unknown; startTime?: unkn
     exists = false;
   }
   if (!exists) return `gone: Main pid ${main.pid} does not exist on this host`;
-  if (typeof main.startTime !== "string") return `unknown: Main pid ${main.pid} exists and the record has no start time`;
   const current = processStartTime(main.pid);
-  if (current === undefined) return "unknown: Main process identity unavailable (/proc is unreadable)";
+  if (!procStartTick(current)) return "unknown: Main process identity unavailable (/proc is unreadable)";
   if (current === main.startTime) return `live: Main process ${main.pid} is alive on this host`;
   return `gone: Main pid ${main.pid} was reused (start time ${current}, recorded ${main.startTime})`;
 };
@@ -220,6 +232,31 @@ function rootParticipantVerdict(config: ResidentHostConfig, mesh: Pick<MeshStore
   // No root participant record means no recorded Main identity to verify: unknown, never "gone".
   return done(verdict ?? (entries.length ? "stale: root participant is stale and its owner lease expired"
     : "unknown: Main process identity unavailable (no root participant record; automatic proof for roots whose records are gone: smarty-dev#7956)"));
+}
+
+/** The live operator removal's final check of the root participant (smarty-dev#8090), file and state record: a fresh,
+ * reloading, unreadable or invalid record refuses. No record at all is allowed, as at acceptance. */
+export function assertRootParticipantQuiet(config: ResidentHostConfig, mesh: Pick<MeshStore, "get">): void {
+  const key = "topology/participants/" + createHash("sha256").update(config.rootId).digest("hex");
+  const deny = (reason: string): never => {
+    throw new ResidentActorAuthorizationError(`Root ${config.rootId} participant ${reason}; the actor tree is kept`);
+  };
+  let entries: MeshStateEntry[] = [];
+  try {
+    const file = readParticipantFile(config.meshRoot, key);
+    if (!file && participantFilePresent(config.meshRoot, key)) deny("record is unreadable");
+    const state = mesh.get(key, { fresh: true });
+    entries = [file, state].filter((entry): entry is MeshStateEntry => entry !== undefined);
+  } catch (error) {
+    if (error instanceof ResidentActorAuthorizationError) throw error;
+    deny(`record is unreadable (${error instanceof Error ? error.message : String(error)})`);
+  }
+  for (const entry of entries) {
+    const value = entry.value as { id?: unknown; status?: unknown } | null;
+    if (!value || typeof value !== "object" || value.id !== config.rootId || !Number.isFinite(entry.updatedAt)) deny("record is invalid");
+    if (value!.status === "reloading") deny("is reloading");
+    if (Date.now() - entry.updatedAt <= ROOT_PARTICIPANT_FRESH_MS) deny("is fresh: its Main is live");
+  }
 }
 
 export const MAIN_STOPPED_REQUIRED = "the root's Main may be running; confirm it is stopped and pass --main-stopped (automatic proof: smarty-dev#7956)";

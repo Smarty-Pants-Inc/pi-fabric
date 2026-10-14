@@ -239,9 +239,13 @@ describe("foreign session actor registry truth", () => {
       { persistent: true, releasePaused: true, claimResidency: "durable", rootId: "session:old", canManageActor: () => false }],
       { project: path.join(root, "actors"), session: path.join(root, "actors", "old") }, "project");
     try {
-      expect(await resident.reconcileSessionOrphans()).toBe(1);
+      const reconciliation = resident.reconcileSessionOrphans();
+      expect(resident.inFlightCount()).toBe(0);
+      expect(resident.releaseCustodyCount()).toBe(1);
+      expect(await reconciliation).toBe(1);
       expect(store.records().find(row => row.id === actor.id)?.status).toBe("stopped");
       expect(store.records().find(row => row.id === durable.id)).toEqual(durable);
+      expect(resident.releaseCustodyCount()).toBe(0);
       expect(resident.list().filter(row => row.id === actor.id)).toHaveLength(1);
       expect(resident.status(actor.id)).toMatchObject({ status: "stopped", sessionOrphan: { oldRoot: "session:old" } });
       expect(alarms(mesh)).toHaveLength(1);

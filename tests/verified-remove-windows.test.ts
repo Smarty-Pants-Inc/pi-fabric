@@ -87,7 +87,7 @@ const setOwner = (file: string, sid: string): { changed: boolean; trace: string[
   return { changed: now === sid, trace };
 };
 
-describe.skipIf(process.platform !== "win32")("Windows verified removal (smarty-dev#7858)", () => {
+describe.runIf(process.env.GITHUB_ACTIONS === "true" && process.platform === "win32")("Windows verified removal (smarty-dev#7858)", () => {
   it("has the digest-verified helper in this build", () => {
     expect(windowsRemoveHelper()).toMatch(/fabric-win-remove\.exe$/);
   });

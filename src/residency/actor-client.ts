@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import type { ResidentDrainIntent } from "./drain.js";
 import { ResidentRequestExpiredError } from "./request-expiry.js";
 import { FabricModelDeniedError } from "../core/model-policy.js";
 import { ActorSessionResetCancelledError } from "../actors/session-reset-error.js";
@@ -144,11 +145,30 @@ export class ResidentActorClient {
       action, id, ...options, requestId: randomUUID(), rootId: this.#rootId, createdAt: Date.now() }, signal);
   }
 
+  /** Cooperative release control of an already-running resident; never starts a host. */
+  async releaseDrain(intent: ResidentDrainIntent, signal?: AbortSignal): Promise<ResidentCommandResponse> {
+    return this.#send({ ...intent, format: RESIDENT_ACTOR_COMMAND_FORMAT, operation: "releaseDrain",
+      requestId: randomUUID(), rootId: this.#rootId, createdAt: Date.now() }, signal);
+  }
+
   async #send(command: ResidentCommand, signal?: AbortSignal): Promise<ResidentCommandResponse> {
+    // Do not pull the optional handover/artifact engine into idle proxy startup.
+    const drainProtocol = command.operation === "releaseDrain" ? await import("./drain.js") : undefined;
     if (!this.isLive()) throw new Error("Root resident host is not live");
     const owner = readJson<ResidentHostOwner>(this.#ownerPath);
     if (!owner) throw new Error("Root resident host is not live");
     assertResidentCommandSupported(owner, command.operation);
+    if (command.operation === "releaseDrain") {
+      if (owner.drain?.abi !== drainProtocol!.RESIDENT_DRAIN_ABI) throw new ResidentCommandUnsupportedError("The loaded resident lacks cooperative drain support; no request was dispatched");
+      const expected = command.expected;
+      if (owner.releaseRoot !== expected.releaseRoot || owner.configDigest !== expected.configDigest ||
+          owner.fabricExtensionPath !== path.join(expected.releaseRoot, "dist/index.js") ||
+          owner.pid !== expected.owner.pid || owner.processStartTime !== expected.owner.processStartTime ||
+          owner.token !== expected.owner.token || owner.hostId !== expected.owner.hostId ||
+          owner.handover?.abi !== "fabric-resident-1" || !drainProtocol!.sameDrainLauncher(owner.handover.launcher, expected.launcher)) {
+        throw new Error("Resident drain owner/launch fence changed; no request was dispatched");
+      }
+    }
     if (owner.requestFence !== 1) {
       throw new Error("Root resident host lacks the abandonment fence; restart the resident host before retrying. No request was dispatched.");
     }

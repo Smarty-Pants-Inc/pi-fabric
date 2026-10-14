@@ -156,13 +156,57 @@ describe("project identity", () => {
     return lane;
   };
 
-  it.each(["ghp_sensitive_marker_secret", "session:not-a-uuid"])("#201 rejects invalid sensitive launch-marker contents without echoing them: %s", (contents) => {
+  // Decision C: unit tests, NOT E2E. Named E2E: a new Pi session in a checkout whose
+  // .local/lead is malformed starts and warns. Owner: fabric-v2, after install.
+  const expectIgnoredMarker = (lane: string) => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    expect(recordedProjectLead(lane, {})).toBeUndefined();
+    expect(warn).toHaveBeenCalledExactlyOnceWith(
+      `[pi-fabric] Ignoring invalid or unreadable project lead marker ${JSON.stringify(path.join(lane, ".local", "lead"))}: expected session:<uuid>.`,
+    );
+  };
+
+  it.each(["ghp_sensitive_marker_secret", "session:not-a-uuid", "", " \n"])("ignores invalid or empty launch-marker contents without echoing them: %j", (contents) => {
     const lane = markerLane();
     fs.writeFileSync(path.join(lane, ".local", "lead"), contents);
-    expect(() => recordedProjectLead(lane, {})).toThrow(expect.objectContaining({
-      name: "FabricProjectLeadInvalidError", code: "FABRIC_PROJECT_LEAD_INVALID",
-      message: "Invalid project lead launch metadata: expected a regular, bounded marker containing session:<UUID>.",
-    }));
+    expectIgnoredMarker(lane);
+  });
+
+  it.each(["11111111-1111-4111-8111-111111111111", "ABCDEF01-2345-6789-ABCD-EF0123456789"])("normalizes and uses a bare UUID without rewriting it: %s", (uuid) => {
+    const lane = markerLane();
+    const marker = path.join(lane, ".local", "lead");
+    const contents = ` ${uuid}\n`;
+    fs.writeFileSync(marker, contents);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const leadId = recordedProjectLead(lane, {})!;
+    expect(leadId).toBe(`session:${uuid}`);
+    const lead = { id: leadId, startedAt: 1, project: projectOf(lane), role: "project-agent" };
+    expect(resolveProjectAgent([lead], projectOf(lane), { leadId })).toBe(lead);
+    expect(fs.readFileSync(marker, "utf8")).toBe(contents);
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("ignores a directory marker", () => {
+    const lane = markerLane();
+    fs.mkdirSync(path.join(lane, ".local", "lead"));
+    expectIgnoredMarker(lane);
+  });
+
+  it("ignores an unreadable marker without exposing the filesystem error", () => {
+    const lane = markerLane();
+    fs.writeFileSync(path.join(lane, ".local", "lead"), "session:11111111-1111-4111-8111-111111111111");
+    const open = vi.spyOn(fs, "openSync").mockImplementation(() => {
+      throw Object.assign(new Error("sensitive filesystem detail"), { code: "EACCES" });
+    });
+    try { expectIgnoredMarker(lane); } finally { open.mockRestore(); }
+  });
+
+  it("does not warn for an absent marker", () => {
+    const lane = markerLane();
+    fs.mkdirSync(path.join(lane, ".git"));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    expect(recordedProjectLead(lane, {})).toBeUndefined();
+    expect(warn).not.toHaveBeenCalled();
   });
 
   it("#201 bounds marker reads even when a large file begins with a valid id", () => {
@@ -170,7 +214,7 @@ describe("project identity", () => {
     fs.writeFileSync(path.join(lane, ".local", "lead"), `session:11111111-1111-4111-8111-111111111111${" ".repeat(4096)}`);
     const read = vi.spyOn(fs, "readSync");
     try {
-      expect(() => recordedProjectLead(lane, {})).toThrow(expect.objectContaining({ code: "FABRIC_PROJECT_LEAD_INVALID" }));
+      expectIgnoredMarker(lane);
       expect(read).not.toHaveBeenCalled(); // reject by fstat before reading an oversized file
     } finally {
       read.mockRestore();
@@ -182,24 +226,36 @@ describe("project identity", () => {
       .toThrow(expect.objectContaining({ code: "FABRIC_PROJECT_LEAD_INVALID" }));
   });
 
-  it.skipIf(process.platform === "win32")("#201 refuses marker and .local symlinks without opening their targets", () => {
+  it.skipIf(process.platform === "win32")("ignores marker and .local symlinks without opening their targets", () => {
     const lane = markerLane();
     const secret = path.join(lane, "host-secret");
     fs.writeFileSync(secret, "ghp_sensitive_symlink_secret");
     fs.symlinkSync(secret, path.join(lane, ".local", "lead"));
     const open = vi.spyOn(fs, "openSync");
     try {
-      expect(() => recordedProjectLead(lane, {})).toThrow(expect.objectContaining({ code: "FABRIC_PROJECT_LEAD_INVALID" }));
+      expectIgnoredMarker(lane);
       expect(open).not.toHaveBeenCalled();
-      fs.rmSync(path.join(lane, ".local"), { recursive: true });
-      fs.mkdirSync(path.join(lane, "outside"));
-      fs.writeFileSync(path.join(lane, "outside", "lead"), "session:11111111-1111-4111-8111-111111111111");
-      fs.symlinkSync(path.join(lane, "outside"), path.join(lane, ".local"));
-      expect(() => recordedProjectLead(lane, {})).toThrow(expect.objectContaining({ code: "FABRIC_PROJECT_LEAD_INVALID" }));
+      vi.mocked(console.warn).mockRestore();
+      const other = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-marker-"));
+      roots.push(other);
+      fs.mkdirSync(path.join(other, "outside"));
+      fs.writeFileSync(path.join(other, "outside", "lead"), "session:11111111-1111-4111-8111-111111111111");
+      fs.symlinkSync(path.join(other, "outside"), path.join(other, ".local"));
+      expectIgnoredMarker(other);
       expect(open).not.toHaveBeenCalled();
     } finally {
       open.mockRestore();
     }
+  });
+
+  it.skipIf(process.platform === "win32")("ignores a marker symlink to /dev/null without opening the device", () => {
+    const lane = markerLane();
+    fs.symlinkSync("/dev/null", path.join(lane, ".local", "lead"));
+    const open = vi.spyOn(fs, "openSync");
+    try {
+      expectIgnoredMarker(lane);
+      expect(open).not.toHaveBeenCalled();
+    } finally { open.mockRestore(); }
   });
 
   it.each([

@@ -46,6 +46,20 @@ beforeEach(() => { vi.useFakeTimers(); vi.clearAllMocks(); });
 afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); });
 
 describe("Main provider recovery waiting for settlement compaction", () => {
+  it("a successor session_start gets its own retry budget", async () => {
+    const h = harness(); h.idle();
+    await h.emit("agent_settled");
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(sendFabricMessage).toHaveBeenCalledTimes(1);
+    await h.emit("session_start");
+    await h.emit("agent_settled");
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(sendFabricMessage).toHaveBeenCalledTimes(2);
+    expect(sendFabricMessage).toHaveBeenLastCalledWith(expect.anything(),
+      expect.objectContaining({ customType: "pi-fabric-provider-retry" }), { deliverAs: "followUp", triggerTurn: true });
+    expect(h.report).not.toHaveBeenCalled();
+  });
+
   it("drops a late report failure after session shutdown without touching the stale ctx (#5962)", async () => {
     const h = harness(); h.idle();
     await h.emit("agent_settled"); await vi.advanceTimersByTimeAsync(1_000);
@@ -95,7 +109,7 @@ describe("Main provider recovery waiting for settlement compaction", () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
-  it.each(["input", "agent_start", "session_before_switch", "session_tree", "session_shutdown", "owner-abort", "owner-halt"])(
+  it.each(["input", "agent_start", "session_start", "session_before_switch", "session_tree", "session_shutdown", "owner-abort", "owner-halt"])(
     "%s cancels a busy wake without consuming the recovery budget", async fence => {
       const h = harness();
       await h.emit("agent_settled");

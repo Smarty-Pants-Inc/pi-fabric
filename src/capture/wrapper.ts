@@ -57,11 +57,14 @@ export const wrapRegisteredToolForCapture = (
   runner: ExtensionRunner,
   onToolsRemoved?: (names: string[]) => void,
 ): WrappedRegisteredTool => {
+  // Host wrapper.js uses createToolContext(id, signal) (provides ctx.tools);
+  // createContext() is only the legacy fallback for older runners.
+  const ctxFactory = (id: unknown, signal: unknown) => runner.createToolContext
+    ? runner.createToolContext(id as string, signal as AbortSignal | undefined)
+    : runner.createContext();
   const tool = wrapToolDefinition(
     registeredTool.definition as ToolDefinition<any, any, any>,
-    (id, signal) => runner.createToolContext
-      ? runner.createToolContext(id as string, signal as AbortSignal | undefined)
-      : runner.createContext(),
+    ctxFactory,
   );
   const execute = tool.execute;
   return {
@@ -72,7 +75,8 @@ export const wrapRegisteredToolForCapture = (
       const { retainResidentProcessWork } = await loadProcessWork();
       // Never start a tool whose caller aborted while the ledger loaded.
       invocationSignal?.throwIfAborted();
-      const context = (ctx ?? runner.createContext()) as ExtensionContext;
+      // Explicit caller ctx wins; otherwise the per-call native tool context.
+      const context = (ctx ?? ctxFactory(toolCallId, signal)) as ExtensionContext;
       const releaseWork = retainResidentProcessWork(context.sessionManager?.getSessionId?.());
       try {
         const activeBefore = runner.getActiveTools();

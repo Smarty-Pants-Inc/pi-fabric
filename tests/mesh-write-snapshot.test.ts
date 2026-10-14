@@ -115,7 +115,7 @@ describe("cold optimistic protocol-2 writes", () => {
     const store = new MeshStore(root, 65536, 100, { lockProtocol: 2 });
     try {
       await expect(store.withTryLock(() => store.put({ key: "test/cold/a", value: 0, identity }), 0))
-        .rejects.toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT" });
+        .rejects.toMatchObject({ code: "FABRIC_MESH_INCARNATION_PENDING" });
       const pending = store.put({ key: "test/cold/a", value: 1, identity });
       resolve(undefined);
       await pending;

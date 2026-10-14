@@ -19,13 +19,14 @@ const answer = (confidence = .95): JevResponse => ({ model: "jev", answers: { ro
 const input = { routeClass: "status-groom", protected: false, pinModel: pin.model, pinThinking: pin.effort,
   registry, aliases: {}, config, assertModelAllowed() {}, parentSessionId: "main", evaluate: async () => answer() };
 let root: string;
+let cwd: string;
 const managers: AgentManager[] = [];
-beforeEach(() => { root = fs.mkdtempSync(path.join(os.tmpdir(), "route-live-")); vi.stubEnv("PI_CODING_AGENT_DIR", path.join(root, "agent")); });
+beforeEach(() => { root = fs.mkdtempSync(path.join(os.tmpdir(), "route-live-")); cwd = path.join(root, "work"); fs.mkdirSync(cwd); vi.stubEnv("PI_CODING_AGENT_DIR", path.join(root, "agent")); });
 afterEach(async () => { vi.useRealTimers(); await Promise.all(managers.splice(0).map(manager => manager.close())); vi.restoreAllMocks(); vi.unstubAllEnvs(); fs.rmSync(root, { recursive: true, force: true }); });
 const ledger = () => path.join(process.env.PI_CODING_AGENT_DIR!, "fabric/model-routing.jsonl");
 const state = () => path.join(process.env.PI_CODING_AGENT_DIR!, "fabric/model-routing-state.jsonl");
 const rows = () => fs.readFileSync(ledger(), "utf8").trim().split("\n").map(line => JSON.parse(line));
-const manager = () => { const m = new AgentManager(root, { ...DEFAULT_FABRIC_CONFIG.agents, retainRuns: true }, {
+const manager = () => { const m = new AgentManager(cwd, { ...DEFAULT_FABRIC_CONFIG.agents, retainRuns: true }, {
   workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(root, `runs-${managers.length}`), preparePiModel: async model => model,
 }); managers.push(m); return m; };
 const dispatch = async () => { const decision = await prepareModelRoute(input); return { decision,
@@ -212,7 +213,7 @@ describe("live model routing", () => {
         return write(file, ...args);
       };
       const results = [];
-      const m = new AgentManager(${JSON.stringify(root)}, {...DEFAULT_FABRIC_CONFIG.agents,retainRuns:true}, {
+      const m = new AgentManager(${JSON.stringify(cwd)}, {...DEFAULT_FABRIC_CONFIG.agents,retainRuns:true}, {
         workerPath:${JSON.stringify(path.resolve("tests/fixtures/fake-worker.mjs"))},runRoot:${JSON.stringify(path.join(root, "fresh-runs"))},preparePiModel:async model=>model});
       try {
         for (const owner of ["fresh-main", "fresh-actor"]) {

@@ -31,6 +31,33 @@ describe.skipIf(!fs.existsSync("dist/worker.js"))("resident startup worker loade
     expect(events.filter(e => e.type === "probe_received").some(e => e.frame.type === "prompt")).toBe(false);
   }, 25_000);
 
+  it.each([true, false])("does not load the provider bridge during a resident startup probe (extensions:%s)", async extensions => {
+    const root = directory();
+    vi.stubEnv("RESIDENT_PROBE_SCENARIO", "ok");
+    vi.stubEnv("PI_FABRIC_EXTENSION_MODEL", "stale/model");
+    const manager = new AgentManager(root, { ...DEFAULT_FABRIC_CONFIG.agents, timeoutMs: 15_000 }, {
+      workerPath: path.resolve("dist/worker.js"), piBinary: path.resolve("tests/fixtures/resident-probe-pi.mjs"),
+      fabricExtensionPath: path.resolve("dist/index.js"), runRoot: path.join(root, "runs"),
+      preparePiModel: async () => "probe/model",
+    }); managers.push(manager);
+    const result = await manager.run({ task: "never infer", transport: "process", extensions,
+      recursive: extensions, tools: [], model: "probe/model", residentStartupProbe: true });
+    // Main's existing parser rejects an extension-free residency probe before
+    // constructing any CLI arguments or running an extension registration hook.
+    if (!extensions) {
+      expect(result.status).toBe("failed");
+      expect(result.error).toContain("Resident startup probe must be an isolated Pi worker");
+      expect(result.toolCalls).toBe(0);
+      return;
+    }
+    expect(result.status, result.error).toBe("completed");
+    const events = fs.readFileSync(path.join(root, "runs", result.id, "events.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+    const argv = events.find(event => event.type === "probe_argv")?.args as string[];
+    expect(argv).toContain("--no-extensions");
+    expect(argv.some(arg => arg.includes("provider-bridge"))).toBe(false);
+    expect(events.filter(event => event.type === "probe_received").some(event => event.frame.type === "prompt")).toBe(false);
+  }, 25_000);
+
   it("fails when real Pi swallows an explicit extension session_start exception", async () => {
     const root = directory(), profile = path.join(root, "profile"), extension = path.join(root, "broken.mjs");
     fs.mkdirSync(profile); fs.writeFileSync(path.join(profile, "settings.json"), "{}");

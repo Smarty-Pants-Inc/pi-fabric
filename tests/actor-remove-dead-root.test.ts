@@ -98,7 +98,7 @@ describe.skipIf(process.platform !== "linux")("fabric-actors remove on a dead ro
     ["alive with the recorded start time", "same", os.hostname(), "Main is live: Main process"],
     ["reused (a different start time)", "other", os.hostname(), undefined],
     ["recorded on a foreign host", "same", "other-host", "recorded on host other-host, not this host"],
-    ["alive with no recorded start time", "none", os.hostname(), "exists and the record has no start time"],
+    ["alive with no recorded start time", "none", os.hostname(), "Main process identity unavailable (no start time for pid"],
     ["missing from the record", "nopid", os.hostname(), "no pid in the root participant record"],
   ] as const)("--main-stopped verifies the Main process identity: a pid %s", async (_name, start, host, refusal) => {
     const f = await fixture();
@@ -365,7 +365,9 @@ describe.skipIf(process.platform !== "linux")("fabric-actors remove on a dead ro
       (process as { getuid?: unknown }).getuid = undefined;
       let result: Awaited<ReturnType<typeof f.cli>>;
       try { result = await f.cli(actor.id); } finally { (process as { getuid?: unknown }).getuid = getuid; }
-      expect(result.code).toBe(1); expect(result.err).toContain("file ownership cannot be proven (smarty-dev#7858)");
+      // The CLI's channel owner check (smarty-dev#6001) refuses before offline removal without getuid.
+      expect(result.code).toBe(1);
+      expect(result.err).toContain("Cannot verify that the resident channel is owned by this OS user (no uid available); refusing stop/remove");
       expect(f.registered(actor.id)).toBe(true); expect(f.archives()).toEqual([]);
       expect(fs.readFileSync(path.join(actorDir, "session.jsonl"), "utf8")).toBe("history\n");
     } finally { (process as { getuid?: unknown }).getuid = getuid; await f.close(); }

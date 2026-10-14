@@ -31,22 +31,44 @@ const ownedRootCleanup = (directory: string): (() => void) => {
 // RUNNER_TEMP selects job lifetime only; caller TMPDIR remains the allocation boundary.
 // Not PI_FABRIC_-prefixed: isolateTestFleetEnvironment keeps it, so workers and children inherit it.
 const jobTempMarker = "PI_TEST_TEMP_JOB_DIR";
+const escapeRegExp = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+/** True only for a run directory this helper's mkdtemp could have made: a direct, pattern-named child of a
+ * `<prefix>job` root, a real directory (not a link), and on POSIX owned by this uid with mode 0700. Windows has no
+ * meaningful uid or mode bits; there the name and type checks stand alone. There is no vitest globalSetup creation
+ * record, so no job-start time check is made (smarty-dev#11145 r5). */
+const ownRunDirectory = (candidate: string, prefix: string): boolean => {
+  const jobRoot = dirname(candidate);
+  if (basename(jobRoot) !== `${prefix}job`) return false;
+  if (!new RegExp(`^${escapeRegExp(prefix)}run-[A-Za-z0-9]{6}$`).test(basename(candidate))) return false;
+  try {
+    const root = lstatSync(jobRoot);
+    const run = lstatSync(candidate);
+    if (!root.isDirectory() || root.isSymbolicLink() || !run.isDirectory() || run.isSymbolicLink()) return false;
+    if (typeof process.getuid === "function" && (run.uid !== process.getuid() || (run.mode & 0o777) !== 0o700)) return false;
+    return true;
+  } catch {
+    return false;
+  }
+};
+
 const stableRoot = (prefix: string): string | undefined => {
   const runnerTemp = process.env.RUNNER_TEMP;
   if (process.platform !== "win32" || !runnerTemp) return;
-  // Idempotent: vitest.config exports this directory as TMPDIR, so a later call in that process or an inheriting
-  // child (a config probe, a worker) already stands in it and must not nest a second `<prefix>job` below it.
-  // Reuse only the directory this helper allocated (its inherited marker), never a caller directory that merely
-  // shares the name.
+  // Never adopt a directory this run did not create (smarty-dev#11145 r5). The first call makes a fresh private
+  // mkdtemp child of `<caller TMPDIR>/<prefix>job` and exports it as the marker; vitest.config makes it TMPDIR, so
+  // a later call in that process or an inheriting child (a config probe, a worker) stands in it and reuses it
+  // without nesting. A marker that is not such a child, or not the current TMPDIR, is ignored: a new child is made.
+  // The shared `<prefix>job` root itself is never a run directory, so it never becomes the deletion guard's root.
   const base = resolve(tmpdir());
-  const name = `${prefix}job`;
   const inherited = process.env[jobTempMarker];
-  const allocated = inherited !== undefined && resolve(inherited) === base && basename(base) === name;
-  const directory = allocated ? base : join(base, name);
-  mkdirSync(directory, { recursive: true });
-  if (!lstatSync(directory).isDirectory()) {
-    throw new Error(`Windows job temp must be a real directory inside caller TMPDIR: ${directory}`);
+  if (inherited !== undefined && resolve(inherited) === base && ownRunDirectory(base, prefix)) return base;
+  const jobRoot = join(base, `${prefix}job`);
+  mkdirSync(jobRoot, { recursive: true });
+  if (!lstatSync(jobRoot).isDirectory()) {
+    throw new Error(`Windows job temp must be a real directory inside caller TMPDIR: ${jobRoot}`);
   }
+  const directory = mkdtempSync(join(jobRoot, `${prefix}run-`));
   process.env[jobTempMarker] = directory;
   return directory;
 };

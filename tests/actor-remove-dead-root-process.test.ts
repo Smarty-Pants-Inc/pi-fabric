@@ -6,11 +6,21 @@ import { mainPublicationFencePath, mainPublicationFenced } from "../src/topology
 import { readParticipantFile } from "../src/topology/participant-files.js";
 import { ROOT_PARTICIPANT_FRESH_MS } from "../src/residency/operator-safety.js";
 import { fixture, rootParticipantKey, type DeadRootFixture } from "./helpers/dead-root-fixture.js";
-import { processHarness } from "./helpers/process-harness.js";
+import { processHarness, type ProcessHarness } from "./helpers/process-harness.js";
 
 // smarty-dev#8082: the dead-root removal and its Main publication fence across real processes. The root's Main and
 // the `fabric-actors remove` operator are separate processes; the remover is paused at a chosen point and killed
 // with a real SIGKILL. The in-process suite (actor-remove-dead-root.test.ts) keeps the step-level races.
+/** Set up the fixture, then the harness; each is closed even when a later step throws (its setup, the test,
+ * or the harness's own close). */
+const withProcessFixture = async (body: (f: DeadRootFixture, h: ProcessHarness) => Promise<void>): Promise<void> => {
+  const f = await fixture();
+  try {
+    const h = processHarness();
+    try { await body(f, h); } finally { await h.close(); }
+  } finally { await f.close(); }
+};
+
 describe.skipIf(process.platform !== "linux")("dead-root removal across processes (smarty-dev#8082)", () => {
   const seed = async (f: DeadRootFixture, ...names: string[]) => {
     const actors = [];
@@ -34,9 +44,7 @@ describe.skipIf(process.platform !== "linux")("dead-root removal across processe
     // The refused Main still renews its host lease (only the root participant is fenced). The remover's checks
     // after the tree move see that live lease and stop: the tree is archived, the registry row and the pending
     // record are kept for a rerun once the Main is stopped (remove-offline.ts step 4).
-    const f = await fixture();
-    const h = processHarness();
-    try {
+    await withProcessFixture(async (f, h) => {
       const [actor, guarded] = await seed(f, "raced", "guarded");
       const main = await h.main(f.config.meshRoot, f.config.rootId);
       const remover = h.remover("beforeTreeMove", removeArgs(f, actor!.id));
@@ -65,13 +73,11 @@ describe.skipIf(process.platform !== "linux")("dead-root removal across processe
       expect(refused.err).toMatch(/Main is live|Main has a live root lease/);
       expect(fs.readFileSync(path.join(guarded!.dir, "session.jsonl"), "utf8")).toBe("history\n");
       expect(f.registered(guarded!.id)).toBe(true);
-    } finally { await h.close(); await f.close(); }
+    });
   }, 120_000);
 
   it("a remover killed between the fence's temp write and its link leaves no fence; the Main publishes and a rerun removes", async () => {
-    const f = await fixture();
-    const h = processHarness();
-    try {
+    await withProcessFixture(async (f, h) => {
       const [actor] = await seed(f, "killed-before-link");
       const fence = mainPublicationFencePath(f.config.meshRoot, f.config.rootId);
       const remover = h.remover("fence-temp", removeArgs(f, actor!.id));
@@ -89,13 +95,11 @@ describe.skipIf(process.platform !== "linux")("dead-root removal across processe
       const main = await h.main(f.config.meshRoot, f.config.rootId);
       expect(await main.publish()).toMatchObject({ ok: true });
       expect(participantPid(f)).toBe(main.pid);
-    } finally { await h.close(); await f.close(); }
+    });
   }, 120_000);
 
   it("a remover killed after the fence's link leaves a fence no one holds; the next remover replaces it and holds it", async () => {
-    const f = await fixture();
-    const h = processHarness();
-    try {
+    await withProcessFixture(async (f, h) => {
       const [actor] = await seed(f, "killed-after-link");
       const fence = mainPublicationFencePath(f.config.meshRoot, f.config.rootId);
       const killed = h.remover("fence-link", removeArgs(f, actor!.id));
@@ -118,13 +122,11 @@ describe.skipIf(process.platform !== "linux")("dead-root removal across processe
       expect(fs.existsSync(fence)).toBe(false);
       const restarted = await h.main(f.config.meshRoot, f.config.rootId);
       expect(await restarted.publish()).toMatchObject({ ok: true });
-    } finally { await h.close(); await f.close(); }
+    });
   }, 120_000);
 
   it("a remover killed while it holds the fence: the kernel releases it at once, the Main publishes, and a rerun resumes the removal", async () => {
-    const f = await fixture();
-    const h = processHarness();
-    try {
+    await withProcessFixture(async (f, h) => {
       const [actor] = await seed(f, "killed-holding");
       const fence = mainPublicationFencePath(f.config.meshRoot, f.config.rootId);
       const main = await h.main(f.config.meshRoot, f.config.rootId);
@@ -151,6 +153,6 @@ describe.skipIf(process.platform !== "linux")("dead-root removal across processe
       expect(archivedTree(f, actor!.id)).toBe(true);
       expect(f.registered(actor!.id)).toBe(false);
       expect(fs.existsSync(fence)).toBe(false);
-    } finally { await h.close(); await f.close(); }
+    });
   }, 120_000);
 });

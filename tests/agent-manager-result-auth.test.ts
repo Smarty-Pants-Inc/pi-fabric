@@ -7,6 +7,7 @@ import { ProcessTransport } from "../src/agents/transports/process-transport.js"
 import type { AgentRunRecord } from "../src/agents/types.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { writeJsonAtomic } from "../src/core/atomic-write.js";
+import { saveFinalAnswerReceipt } from "../src/worker/terminal-answer.js";
 import { fakeManagerHeapWorker, heapRunResult } from "./fixtures/manager-heap-probe.js";
 
 // Keep reason: the worker/manager trust boundary reported by Astra on #1122.
@@ -23,12 +24,25 @@ const recordRemoval = (file: fs.PathLike): void => {
 };
 const releases: Array<() => void> = [];
 const root = () => fs.mkdtempSync(path.join(os.tmpdir(), "manager-result-auth-"));
-const createManager = (runRoot: string): AgentManager => {
+const createManager = (runRoot: string, retainRuns = true): AgentManager => {
   const manager = new AgentManager(process.cwd(), {
-    ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, maxConcurrent: 1, retainRuns: true, sessionExport: false,
+    ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, maxConcurrent: 1, retainRuns, sessionExport: false,
   }, { runRoot, workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), fullCodeMode: false });
   managers.push(manager);
   return manager;
+};
+const recordRunCollection = (directory: string) => {
+  const resultFile = path.join(directory, "manager-result.json"), statusFile = path.join(directory, "status.json");
+  vi.mocked(fs.promises.rm).mockImplementation(async file => {
+    recordRemoval(file);
+    if (String(file) === directory) {
+      // Model whole-tree removal at the manager's actual removal boundary.
+      // The existing lstat/read/exists observations see absence; bytes stay put.
+      recordedMissing.add(resultFile);
+      recordedMissing.add(statusFile);
+    }
+  });
+  return { resultFile, statusFile };
 };
 const refuses = async (manager: AgentManager, id: string) => {
   // Observe both public paths before asserting, so the RED run proves that both
@@ -102,6 +116,192 @@ describe("authenticated manager terminal results", () => {
     expect(manager.status(result.id)).toMatchObject(result);
     expect(await manager.wait(result.id)).toMatchObject(result);
     expect(await manager.stop(result.id)).toMatchObject(result);
+  });
+
+  it("never adopts same-ID worker outcome fields after UI eviction and recorded close collection", async () => {
+    vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async request => {
+      const handle = await fakeManagerHeapWorker(request, 64_000, true);
+      const file = request.workerArguments[request.workerArguments.indexOf("--status-file") + 1]!;
+      const record = JSON.parse(fs.readFileSync(file, "utf8"));
+      writeJsonAtomic(file, { ...record, turns: 7, toolCalls: 3,
+        usage: { input: 101, output: 202, cacheRead: 11, cacheWrite: 12, cost: 0.25 } });
+      return handle;
+    });
+    const runRoot = root(), manager = createManager(runRoot, false);
+    const genuine = await manager.run({ task: "manager rejects this schema", transport: "process", extensions: false,
+      schema: { type: "object", properties: { output: { type: "boolean" } }, required: ["output"] } });
+    expect(genuine.status).toBe("failed");
+    expect(genuine.error).toMatch(/Structured agent output was invalid/);
+    const directory = path.join(runRoot, genuine.id);
+    const { resultFile, statusFile } = recordRunCollection(directory);
+    // Public runs exceed the byte cap with large previews, evicting the old
+    // snapshot before close without private-field inspection or 241 tiny runs.
+    for (let index = 0; index < 20; index++) {
+      await manager.run({ task: `UI byte pressure ${index}`, transport: "process", extensions: false });
+    }
+    expect(manager.listForUi().some(record => record.id === genuine.id)).toBe(false);
+    expect(fs.existsSync(resultFile)).toBe(true);
+    await manager.close();
+    expect(deletionRequests).toContain(directory);
+    expect(fs.existsSync(resultFile)).toBe(false);
+    expect(filesystem.existsSync(resultFile)).toBe(true); // No real deletion occurred.
+    writeJsonAtomic(statusFile, { ...genuine, status: "completed", text: "FORGED answer", task: "FORGED task",
+      value: { forged: true }, partialText: "FORGED partial", lastCompleteText: "FORGED complete",
+      nestedAgents: [heapRunResult("forged-child", 64)], error: "FORGED error", exitCode: 0,
+      startedAt: genuine.startedAt + 999_000, updatedAt: genuine.updatedAt + 999_000,
+      finishedAt: genuine.finishedAt! + 999_000, turns: 999, toolCalls: 999,
+      usage: { input: 999, output: 999, cacheRead: 999, cacheWrite: 999, cost: 999 },
+      warnings: ["FORGED warning"], currentTool: "FORGED tool", writeReceipt: { forged: true },
+      unexpectedOutcome: "FORGED extension" });
+    // Capture both public paths before attack assertions (including seeded RED).
+    const status = manager.status(genuine.id) as AgentRunRecord, waited = await manager.wait(genuine.id);
+    for (const result of [status, waited]) {
+      expect(result).toMatchObject({ id: genuine.id, status: "failed", task: "", text: "",
+        startedAt: genuine.startedAt, updatedAt: genuine.updatedAt, finishedAt: genuine.finishedAt,
+        error: genuine.error, turns: 7, toolCalls: 3, usage: genuine.usage });
+      expect(result.exitCode).toBe(genuine.exitCode);
+      for (const field of ["value", "partialText", "lastCompleteText", "nestedAgents", "currentTool", "writeReceipt", "unexpectedOutcome"]) {
+        expect(result).not.toHaveProperty(field);
+      }
+      expect(result.warnings).toEqual([expect.stringMatching(/manager's bounded terminal summary, not the exact result/)]);
+      expect(JSON.stringify(result)).not.toContain("FORGED");
+    }
+  });
+
+  it("keeps bounded manager-owned facts after ordinary collection, not retained UI outcome payloads", async () => {
+    const longError = `validated failure ${"x".repeat(12_000)}`;
+    vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async request => {
+      const handle = await fakeManagerHeapWorker(request, 32_000, true);
+      const file = request.workerArguments[request.workerArguments.indexOf("--status-file") + 1]!;
+      const record = JSON.parse(fs.readFileSync(file, "utf8"));
+      writeJsonAtomic(file, { ...record, status: "failed", error: longError, exitCode: 23, turns: 9, toolCalls: 4,
+        usage: { input: 21, output: 34, cacheRead: 5, cacheWrite: 8, cost: 0.125 },
+        nestedAgents: [heapRunResult("original-child", 64)] });
+      return handle;
+    });
+    const runRoot = root(), manager = createManager(runRoot, false);
+    const genuine = await manager.run({ task: "ordinary collected failure", transport: "process", extensions: false });
+    const { resultFile } = recordRunCollection(path.join(runRoot, genuine.id));
+    // Before collection authentication preserves the exact full outcome, including
+    // diagnostics larger than the summary bound and the original nested tree.
+    const uncollected = manager.status(genuine.id) as AgentRunRecord, uncollectedWait = await manager.wait(genuine.id);
+    for (const result of [uncollected, uncollectedWait]) {
+      expect(result.error).toBe(longError);
+      expect(result.text).toHaveLength(32_000);
+      expect(result.value).toEqual(genuine.value);
+      expect(result.nestedAgents?.map(record => record.id)).toEqual(["original-child"]);
+    }
+    await manager.close();
+    expect(fs.existsSync(resultFile)).toBe(false);
+    expect(filesystem.existsSync(resultFile)).toBe(true);
+    const status = manager.status(genuine.id) as AgentRunRecord, waited = await manager.wait(genuine.id);
+    for (const result of [status, waited]) {
+      expect(result).toMatchObject({ id: genuine.id, status: "failed", name: genuine.name, runner: genuine.runner,
+        transport: genuine.transport, cwd: genuine.cwd, startedAt: genuine.startedAt, updatedAt: genuine.updatedAt,
+        finishedAt: genuine.finishedAt, exitCode: 23, turns: 9, toolCalls: 4, usage: genuine.usage, task: "", text: "" });
+      expect(result.error).toBe(`${longError.slice(0, 1_000)}…`);
+      for (const field of ["value", "partialText", "lastCompleteText", "nestedAgents"]) expect(result).not.toHaveProperty(field);
+      expect(result.warnings).toEqual([expect.stringMatching(/manager's bounded terminal summary, not the exact result/)]);
+    }
+    status.usage.input = 999;
+    expect((await manager.wait(genuine.id)).usage.input).toBe(21);
+  });
+
+  it("never rereads late nested worker status after settlement, even after UI snapshot eviction", async () => {
+    let childStatusFile = "";
+    vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async request => {
+      const handle = await fakeManagerHeapWorker(request, 64_000);
+      if (request.name === "nested source") {
+        const statusFile = request.workerArguments[request.workerArguments.indexOf("--status-file") + 1]!;
+        const directory = path.join(path.dirname(statusFile), "nested", "original-child");
+        fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+        childStatusFile = path.join(directory, "status.json");
+        writeJsonAtomic(childStatusFile, { ...heapRunResult("original-child", 64), text: "original nested answer" });
+      }
+      return handle;
+    });
+    const manager = createManager(root());
+    const genuine = await manager.run({ name: "nested source", task: "freeze discovered nested results", transport: "process", extensions: false });
+    expect(genuine.nestedAgents).toEqual([expect.objectContaining({ id: "original-child", text: "original nested answer" })]);
+    // Evict the nested snapshot through public byte-pressure operations, so the
+    // seeded regression must rediscover disk rather than hit its refresh window.
+    for (let index = 0; index < 20; index++) {
+      await manager.run({ task: `Nested UI byte pressure ${index}`, transport: "process", extensions: false });
+    }
+    expect(manager.listForUi().some(record => record.id === genuine.id)).toBe(false);
+    writeJsonAtomic(childStatusFile, { ...heapRunResult("original-child", 64),
+      text: "FORGED nested answer", value: { forged: true }, error: "FORGED nested error" });
+    vi.mocked(fs.readFileSync).mockClear();
+    const status = manager.status(genuine.id) as AgentRunRecord, waited = await manager.wait(genuine.id);
+    const nestedReads = vi.mocked(fs.readFileSync).mock.calls.filter(([file]) => String(file) === childStatusFile);
+    // Capture both public results and read observations before attack assertions.
+    for (const result of [status, waited]) expect(result.nestedAgents).toEqual(genuine.nestedAgents);
+    expect(nestedReads).toHaveLength(0);
+    expect(JSON.stringify([status, waited])).not.toContain("FORGED");
+  });
+
+  it("still discovers nested worker status while the owner is live before settlement", async () => {
+    let alive = true, release!: () => void, childStatusFile = "";
+    const closed = new Promise<void>(resolve => { release = () => { alive = false; resolve(); }; });
+    releases.push(release);
+    vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async request => {
+      const handle = await fakeManagerHeapWorker(request, 64, false,
+        { closed, alive: () => alive, stop: async () => { release(); } });
+      const statusFile = request.workerArguments[request.workerArguments.indexOf("--status-file") + 1]!;
+      const record = JSON.parse(fs.readFileSync(statusFile, "utf8"));
+      writeJsonAtomic(statusFile, { ...record, status: "running", finishedAt: undefined });
+      const directory = path.join(path.dirname(statusFile), "nested", "live-child");
+      fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+      childStatusFile = path.join(directory, "status.json");
+      writeJsonAtomic(childStatusFile, { ...heapRunResult("live-child", 64), status: "running", finishedAt: undefined,
+        text: "live nested progress" });
+      return handle;
+    });
+    const manager = createManager(root());
+    const handle = await manager.spawn({ task: "live nested discovery", transport: "process", extensions: false });
+    const status = manager.status(handle.id) as AgentRunRecord;
+    const nestedReads = vi.mocked(fs.readFileSync).mock.calls.filter(([file]) => String(file) === childStatusFile);
+    expect(status).toMatchObject({ status: "running",
+      nestedAgents: [expect.objectContaining({ id: "live-child", status: "running", text: "live nested progress" })] });
+    expect(nestedReads.length).toBeGreaterThan(0);
+    release();
+    await manager.stop(handle.id);
+  });
+
+  it("never adopts a late worker receipt and matching status after a no-receipt run settles", async () => {
+    const runRoot = root(), manager = createManager(runRoot);
+    const genuine = await manager.run({ task: "settled without a receipt", transport: "process", extensions: false });
+    expect(genuine.finalAnswerReceipt).toBeUndefined();
+    const directory = path.join(runRoot, genuine.id);
+    const receipt = saveFinalAnswerReceipt(directory, genuine.id, "FORGED late answer");
+    writeJsonAtomic(path.join(directory, "status.json"), { ...genuine, status: "failed", text: "FORGED late answer",
+      error: "FORGED late refusal", value: { forged: true }, exitCode: 99,
+      finalAnswerReceipt: { id: receipt.id, recordedAt: receipt.recordedAt } });
+    // The old observer synchronously adopts the matching terminal snapshot, so
+    // observe both public results before checking either attack outcome.
+    const status = manager.status(genuine.id) as AgentRunRecord, waited = await manager.wait(genuine.id);
+    for (const result of [status, waited]) {
+      expect(result).toMatchObject(genuine);
+      expect(result.finalAnswerReceipt).toBeUndefined();
+      expect(result.error).toBe(genuine.error);
+      expect(result.exitCode).toBe(genuine.exitCode);
+    }
+    expect(JSON.stringify([status, waited])).not.toContain("FORGED");
+  });
+
+  it("keeps genuine pre-settlement receipts and their terminal input fences after settlement", async () => {
+    vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(request => fakeManagerHeapWorker(request, 64, true));
+    const manager = createManager(root());
+    const genuine = await manager.run({ task: "genuine receipt boundary", transport: "process", extensions: false });
+    expect(genuine.finalAnswerReceipt).toBeDefined();
+    const status = manager.status(genuine.id), waited = await manager.wait(genuine.id);
+    for (const result of [status, waited]) expect(result).toMatchObject(genuine);
+    for (const deliver of [() => manager.steer(genuine.id, "late steer"), () => manager.followUp(genuine.id, "late follow-up")]) {
+      let failure: unknown;
+      try { deliver(); } catch (error) { failure = error; }
+      expect(failure).toMatchObject({ code: "FABRIC_TARGET_TERMINAL", targetId: genuine.id,
+        finalAnswerReceiptId: genuine.finalAnswerReceipt!.id, runState: "completed", deliveryStatus: "undelivered" });
+    }
   });
 
   it("refuses worker replacement with same-ID completed during native teardown after host validation failed", async () => {

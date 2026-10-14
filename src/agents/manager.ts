@@ -3122,24 +3122,16 @@ export class AgentManager {
       { code: "FABRIC_MISSING_RESULT" as const });
   }
 
-  /** The manager's own validated terminal facts over its bounded last snapshot, once close collected the exact file. */
+  /** Only manager-owned bounded facts survive owned collection, never worker status or UI snapshots. */
   #collectedResult(managed: ManagedAgent, summary: SettledSummary): AgentRunRecord {
-    const retained = readRecord(managed.statusFile);
-    const base: AgentRunRecord = managed.latestRecord ?? (retained?.id === managed.id ? retained : undefined) ?? {
+    return {
       ...managed.runRoute, id: managed.id, name: managed.name, task: "", status: summary.status, runner: managed.runner,
       transport: managed.transport.kind, cwd: managed.cwd, startedAt: summary.startedAt, updatedAt: summary.updatedAt,
       turns: summary.turns, toolCalls: summary.toolCalls, text: "", usage: { ...summary.usage },
-    };
-    const { error: _error, exitCode: _exitCode, finishedAt: _finishedAt, ...rest } = base;
-    return {
-      ...rest,
-      status: summary.status,
-      updatedAt: Math.max(rest.updatedAt, summary.updatedAt),
       ...(summary.finishedAt !== undefined ? { finishedAt: summary.finishedAt } : {}),
       ...(summary.exitCode !== undefined ? { exitCode: summary.exitCode } : {}),
       ...(summary.error !== undefined ? { error: summary.error } : {}),
-      warnings: [...(rest.warnings ?? []),
-        "Run files were collected at close; this is the manager's bounded terminal summary, not the exact result"],
+      warnings: ["Run files were collected at close; this is the manager's bounded terminal summary, not the exact result"],
     };
   }
 
@@ -5035,6 +5027,9 @@ export class AgentManager {
   #observeFinalAnswer(managed: ManagedAgent): boolean {
     if (managed.actorId || managed.runner !== "pi" || managed.transport.kind !== "process") return false;
     if (managed.finalAnswer) return true;
+    // Settlement already authenticated its outcome; a later worker receipt
+    // cannot create a new finalAnswerResult or replace that terminal boundary.
+    if (managed.settled) return false;
     const receipt = readFinalAnswerReceipt(managed.runDirectory, managed.id);
     if (!receipt) return false;
     managed.finalAnswer = { ...receipt, text: "" }; // Fence ingress; the receipt's full text stays on disk.
@@ -6099,8 +6094,10 @@ export class AgentManager {
   }
 
   #withTransportMetadata(record: AgentRunRecord, managed: ManagedAgent, includeSaveFailure = true): AgentRunRecord {
-    const observedNested = this.#nestedAgents(managed,
-      terminalStatuses.has(record.status) && !managed.settled);
+    // Settlement freezes the authenticated nested tree. Later worker snapshots
+    // cannot enrich it, and collected summaries deliberately carry no tree.
+    const observedNested = managed.settled ? [] : this.#nestedAgents(managed,
+      terminalStatuses.has(record.status));
     const nestedAgents = reconcileNestedAgents(observedNested.length > 0 ? observedNested : record.nestedAgents ?? [], record);
     const budget = this.#budgetSummary();
     const { logFile: _logFile, nestedAgents: _nestedAgents, ...safeRecord } = record;

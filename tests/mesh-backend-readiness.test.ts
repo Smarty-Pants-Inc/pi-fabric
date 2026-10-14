@@ -132,6 +132,7 @@ describe.skipIf(process.platform === "win32")("fabric-mesh-backend readiness gat
     expect(alarms).toHaveLength(1);
     expect(alarms[0]).toMatchObject({ topic: MESH_SWITCH_OVERRIDE_ALARM_TOPIC, kind: "mesh-switch-override", to: SWITCH_OWNER,
       data: { switchId: json.readers.switchId, acceptedUnready: [{ name: "holder@lease-probe", reason: expect.stringContaining("not Linux") }] } });
+    expect(alarms[0]!.data).not.toHaveProperty("root");
     expect(alarms[0]!.text).toContain(json.readers.switchId);
 
     const readyRoot = await fileRoot();

@@ -415,7 +415,7 @@ const publishSwitchOverrideAlarm = async (options: Options, gate: Gate, accepted
       to,
       from: { id: `fabric-mesh-backend:${process.pid}`, name: "fabric-mesh-backend", kind: "agent" },
       text: `fabric-mesh-backend ${options.command} accepted unready reader(s) after switch ${gate.switchId}: ${names}`,
-      data: { switchId: gate.switchId, command: options.command, root: options.root, epoch,
+      data: { switchId: gate.switchId, command: options.command, epoch,
         acceptedUnready: uniqueAccepted.map(reader => ({ name: reader.name, reason: reader.reason })), checkedUnderFence: gate.checked },
     });
   } finally { store.closeState(); }

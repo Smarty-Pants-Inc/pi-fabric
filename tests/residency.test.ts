@@ -20,7 +20,8 @@ import { AgentCompletionInbox } from "../src/agents/completion-inbox.js";
 import { ActorRegistryStore } from "../src/actors/registry-store.js";
 import { ActionRegistry } from "../src/core/action-registry.js";
 import { createMainExecutionCeilingError } from "../src/async-settlement.js";
-import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { ModelRegistry, ModelRuntime, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { InMemoryCredentialStore, InMemoryModelsStore } from "@earendil-works/pi-ai";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { modelExceptionGrant, withRootExceptionMetadata } from "./helpers/model-exceptions.js";
 import type { FabricMainAgentDeliveryRequest, FabricMainAgentTarget } from "../src/main-agent.js";
@@ -2874,6 +2875,17 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
     }));
     writeModels(["claude-late-5-5"]);
     vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
+    vi.stubEnv("PI_OFFLINE", "1");
+    // Normal bootstrap supplies ctx.modelRegistry; this in-process host needs it too.
+    const modelRegistry = new ModelRegistry(await ModelRuntime.create({
+      modelsPath,
+      credentials: new InMemoryCredentialStore(),
+      modelsStore: new InMemoryModelsStore(),
+      allowModelNetwork: false,
+    }));
+    expect(modelRegistry.getAvailable()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ provider: "probe-late", id: "claude-late-5-5" }),
+    ]));
     const state = await rootHarness("resident-late-model");
     const boundRootRecord = state.participants.get(state.identity.id)!;
     expect(boundRootRecord.kind).toBe("root");
@@ -2908,7 +2920,8 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
     const ownerPid = () =>
       (JSON.parse(fs.readFileSync(path.join(state.config.residencyRoot, "owner.json"), "utf8")) as ResidentHostOwner).pid;
     // The private root-metadata seam is deliberately process-local, never a child override.
-    const host = new ResidentHost(state.config);
+    const refreshModels = vi.spyOn(modelRegistry, "refresh");
+    const host = new ResidentHost(state.config, undefined, modelRegistry);
     try {
       await host.start();
       const actor = await client.createActor({
@@ -2931,6 +2944,10 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
         { timeoutMs: 20_000 },
       );
       expect(asked).toMatchObject({ text: "model probe-late/claude-late-5-6" });
+      expect(refreshModels).toHaveBeenCalledOnce();
+      expect(modelRegistry.getAvailable()).toEqual(expect.arrayContaining([
+        expect.objectContaining({ provider: "probe-late", id: "claude-late-5-6" }),
+      ]));
 
       writeModels(["claude-late-5-5", "claude-late-5-6", "claude-late-5-7"]);
       await new Promise((resolve) => setTimeout(resolve, 10_500)); // past the shared refresh throttle
@@ -2943,6 +2960,10 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
       );
       await waitFor(() => state.mesh.read({ topic: "fabric.actor.output", limit: 50 })
         .some((event) => event.text?.includes("model probe-late/claude-late-5-7")), 15_000);
+      expect(refreshModels).toHaveBeenCalledTimes(2);
+      expect(modelRegistry.getAvailable()).toEqual(expect.arrayContaining([
+        expect.objectContaining({ provider: "probe-late", id: "claude-late-5-7" }),
+      ]));
 
       // A model that is still not configured fails after the refresh, not with a fuzzy stand-in.
       await expect(control.request(

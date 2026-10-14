@@ -328,7 +328,8 @@ describe("AgentManager fleet model admission (#2490)", () => {
     const before = fs.readdirSync(root); const launch = vi.spyOn(ProcessTransport.prototype, "launch");
     const beforeCommit = vi.fn();
     try {
-      const denial = runner === "claude" && selector === "unknown-runtime-alias" && !hasPosixTrustMetadata
+      // An unknown alias has no canonical backend target for exception admission.
+      const denial = runner === "claude" && selector === "unknown-runtime-alias"
         ? { code: "FABRIC_MODEL_EXCEPTION_DENIED", denial: "model-mismatch" }
         : { name: "FabricModelDeniedError", code: "FABRIC_MODEL_DENIED" };
       await expect(manager.spawn({ task: "must not queue", runner, ...(source === "explicit" ? { model: selector } : {}), ...(runner === "claude" ? { modelReason: "Named exception to isolate Claude deny policy #11864" } : {}) }, undefined, undefined, beforeCommit)).rejects.toMatchObject(denial);
@@ -362,7 +363,7 @@ describe("AgentManager fleet model admission (#2490)", () => {
     const catalog = vi.spyOn(manager, "claudeModels").mockResolvedValue([{ value: "shortcut", resolvedModel: "shortcut", resolvedModelKnown: false, displayName: "Shortcut", description: "No native target" }]);
     const launch = vi.spyOn(ProcessTransport.prototype, "launch");
     try {
-      const denial = mode === "unresolved-catalog" && !hasPosixTrustMetadata
+      const denial = mode === "unresolved-catalog"
         ? { code: "FABRIC_MODEL_EXCEPTION_DENIED", denial: "model-mismatch" }
         : { code: "FABRIC_MODEL_DENIED" };
       await expect(manager.spawn({ task: "no proof", runner: mode === "unresolved-catalog" ? "claude" : "veda", model: mode === "unresolved-catalog" ? "shortcut" : "cliproxyapi/gpt-6.1-sol", ...(mode === "unresolved-catalog" ? { modelReason: "Named exception to isolate Claude catalog denial #11864" } : {}) })).rejects.toMatchObject(denial);
@@ -681,13 +682,14 @@ describe("resolved manager policy (#11864)", () => {
     const reason = "Named Claude audit failure exception #11864";
     const warning = "Opus policy audit log failed; exception not fully recorded.";
     const model = "claude/haiku";
+    const canonicalModel = "claude-haiku-test";
     try {
       const receipt = await manager.spawn({ task: "Claude survives audit failure", runner: "claude", model, modelReason: reason, transport: "process" });
-      expect(receipt).toMatchObject({ model, modelReason: reason, warnings: [warning] });
+      expect(receipt).toMatchObject({ model: canonicalModel, modelReason: reason, warnings: [warning] });
       expect(launch).toHaveBeenCalledOnce();
-      expect(launch.mock.calls[0]![0].workerArguments).toEqual(expect.arrayContaining(["--runner", "claude", "--model", model, "--model-reason", reason]));
+      expect(launch.mock.calls[0]![0].workerArguments).toEqual(expect.arrayContaining(["--runner", "claude", "--model", canonicalModel, "--model-reason", reason]));
       const result = await manager.wait(receipt.id);
-      expect(result).toMatchObject({ status: "completed", runner: "claude", model, modelReason: reason, warnings: [warning] });
+      expect(result).toMatchObject({ status: "completed", runner: "claude", model: canonicalModel, modelReason: reason, warnings: [warning] });
       expect(result.model).toBe(receipt.model);
       expect(result.modelReason).toBe(receipt.modelReason);
       expect(fs.statSync(auditFile).isDirectory()).toBe(true);
@@ -3529,9 +3531,16 @@ describe("AgentManager Claude runner", () => {
         runnerSessionId: "11111111-1111-4111-8111-111111111111",
         usage: { input: 10, output: 7, cacheRead: 2, cacheWrite: 3, cost: 0.001 },
       });
-      const invocation = JSON.parse(fs.readFileSync(invocationLog, "utf8").trim()) as {
+      const invocations = fs.readFileSync(invocationLog, "utf8").trim().split("\n").map(line => JSON.parse(line) as {
         argv: string[];
-      };
+      });
+      // Admission discovers the native catalog before launching the task.
+      expect(invocations).toHaveLength(2);
+      expect(invocations[0]!.argv).toEqual(expect.arrayContaining([
+        "--input-format", "stream-json", "--output-format", "stream-json", "--tools", "",
+      ]));
+      expect(invocations[0]!.argv).not.toContain("--help");
+      const invocation = invocations[1]!;
       expect(invocation.argv).toEqual(
         expect.arrayContaining([
           "--model",

@@ -77,7 +77,7 @@ const [mode,id]=process.argv.slice(2); if(mode==='launch'){const dir=path.join($
   const manager = new AgentManager(cwd, { ...DEFAULT_FABRIC_CONFIG.agents, timeoutMs: 10_000, retainRuns: true,
     ...(remote ? { placement: remote } : {}), ...(modelExceptionsPath ? { modelExceptionsPath } : {}),
   }, { workerPath: worker, ...(overlap === "environment" ? {} : { runRoot }), fullCodeMode: false, meshRoot, completionRecipient: recipient,
-    ...(exceptionModel ? { rootSessionCwd: () => cwd } : {}),
+    ...(exceptionModel ? { rootSessionCwd: () => cwd, claudeBinary: path.resolve("tests/fixtures/fake-claude.mjs") } : {}),
   });
   managers.push(manager);
   const events = (id: string) => fs.readFileSync(path.join(manager.runDirectory(id)!, "events.jsonl"), "utf8")
@@ -255,15 +255,23 @@ describe("local process task write default", () => {
   const assertUnsupportedRunner = async (runner: "claude" | "veda") => {
     // Use an explicitly named fake canonical model and a real v1 grant so this policy test
     // remains about write-policy behavior, not ambient host exception configuration.
-    const model = "claude/fake-claude-model";
-    const f = fixture(false, undefined, runner === "claude" ? model : undefined);
+    const model = "claude/haiku";
+    const canonicalModel = "claude-haiku-test";
+    // Catalog aliases resolve first; grants name the exact backend model.
+    const f = fixture(false, undefined, runner === "claude" ? canonicalModel : undefined);
     const originalAdmit = AgentManager.prototype.admitModelException;
     const admission = runner === "claude" ? vi.spyOn(AgentManager.prototype, "admitModelException").mockImplementation(function (this: AgentManager, ...args) {
       if (this !== f.manager || this.config.modelExceptionsPath !== path.join(f.root, "model-exceptions.json")) return originalAdmit.apply(this, args);
       return withRootExceptionMetadata(this.config.modelExceptionsPath, () => originalAdmit.apply(this, args));
     }) : undefined;
     try {
-      const { result, value } = await report(f, { runner, ...(runner === "claude" ? { model, modelReason: "Unsupported-runner write-policy fixture #11864" } : {}) });
+      const modelReason = "Unsupported-runner write-policy fixture #11864";
+      const { result, value } = await report(f, { runner, ...(runner === "claude" ? { model, modelReason } : {}) });
+      if (runner === "claude") {
+        expect(value.args["--model"]).toBe(canonicalModel);
+        expect(value.args["--model-reason"]).toBe(modelReason);
+        expect(result).toMatchObject({ model: canonicalModel, modelReason });
+      }
       expect(value.policy).toBeNull();
       expect(value.tmpdir).toBeNull();
       expect(f.events(result.id).filter(event => event.type.startsWith("write_policy.")))

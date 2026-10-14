@@ -479,7 +479,7 @@ when available, otherwise the host/profile
 `agents.modelPolicy.fallbackModel`, paired with `fallbackThinking` (default
 `high`); this fallback is optional and has no package-wide model default. If the
 fallback is unset or unavailable, an inherited Claude binding is refused with
-`agents.modelPolicy.fallbackModel` named, rather than silently selecting a
+`agents.modelPolicy.fallbackModel` named. Fabric does not silently select a
 provider that may not be installed on a non-fleet host. A successful fallback
 receipt/result uses the exact transition label:
 `model: inherited <old> -> <new> <thinking> (#11863)`.

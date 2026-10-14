@@ -4737,14 +4737,27 @@ describe("ActorManager", () => {
       const secondReply = await restored.ask(actor.id, "second message");
       expect(secondReply.text).toContain("fake claude complete");
 
-      const invocations = fs
+      const calls = fs
         .readFileSync(invocationLog, "utf8")
         .trim()
         .split("\n")
         .map((line) => JSON.parse(line) as { argv: string[] });
+      // Catalog discovery is separate from the two persistent actor activations.
+      const discovery = calls.filter(({ argv }) => !argv.includes("--model"));
+      expect(discovery).toHaveLength(1);
+      expect(discovery[0]!.argv).toEqual(expect.arrayContaining([
+        "--safe-mode", "--no-session-persistence", "--tools", "",
+      ]));
+      expect(discovery[0]!.argv).not.toContain("--resume");
+      const invocations = calls.filter(({ argv }) => argv.includes("--model"));
       expect(invocations).toHaveLength(2);
+      for (const { argv } of invocations) {
+        expect(argv[argv.indexOf("--model") + 1]).toBe("claude-haiku-test");
+        expect(argv).not.toContain("--no-session-persistence");
+      }
       expect(invocations[0]!.argv).not.toContain("--resume");
       const resumeAt = invocations[1]!.argv.indexOf("--resume");
+      expect(resumeAt).toBeGreaterThanOrEqual(0);
       expect(invocations[1]!.argv[resumeAt + 1]).toBe(
         "11111111-1111-4111-8111-111111111111",
       );

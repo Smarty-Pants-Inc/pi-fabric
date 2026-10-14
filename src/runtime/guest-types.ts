@@ -306,6 +306,9 @@ interface FabricLifecycleSubscription {
   lastError?: string;
 }
 interface FabricTargetTerminalError extends Error {
+  readonly reason: "run-ended";
+  readonly deliveryStatus: "undelivered";
+  readonly runState: "final-answer-pending" | "final-answer-recorded" | "completed" | "failed" | "stopped" | "timed_out";
   readonly code: "FABRIC_TARGET_TERMINAL";
   readonly targetId: string;
   readonly finalAnswerReceiptId: string;
@@ -1038,6 +1041,13 @@ interface FabricFollowUpDelivery {
   alarm?: FabricFollowUpAlarm;
 }
 interface FabricMessageDelivery {
+  /** Local task admission raced its final answer; this input was not consumed. */
+  undelivered?: {
+    code: "FABRIC_TARGET_TERMINAL"; reason: "run-ended"; deliveryStatus: "undelivered";
+    messageId: string; delivery: "steer" | "followUp"; finalAnswerReceiptId: string;
+    runState: FabricTargetTerminalError["runState"];
+    sender?: FabricTargetTerminalNotice["sender"];
+  };
   /** Local Pi task: absolute delivery deadline; expiry alarms but does not dequeue. */
   deadlineAt?: number;
   /** Sender-only: owner observed a running task when it admitted this followUp. Delivery is unchanged. */

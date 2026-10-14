@@ -144,8 +144,8 @@ describe("native identity cannot retain registry custody past a bounded mesh try
     const mesh = new MeshStore(path.join(base, "mesh"), 65536, 100, { lockProtocol: 2 });
     const begin = performance.now();
     await registry.withLock(async () => {
-      await expect(mesh.withTryLock(() => mesh.confirmWritable(), 50)).rejects.toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT" });
-      await expect(mesh.exclusive(() => undefined, 0)).rejects.toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT" });
+      await expect(mesh.withTryLock(() => mesh.confirmWritable(), 50)).rejects.toMatchObject({ code: "FABRIC_MESH_INCARNATION_PENDING" });
+      await expect(mesh.exclusive(() => undefined, 0)).rejects.toMatchObject({ code: "FABRIC_MESH_INCARNATION_PENDING" });
     });
     const registryHeldMs = performance.now() - begin;
     expect(registryHeldMs).toBeLessThan(150);

@@ -152,6 +152,10 @@ describe.skipIf(process.platform !== "linux")("process task finishing exit barri
       expect(f.manager.status(handle.id)).toMatchObject({ status: "failed", text: "QUIESCENT" });
       expect(await f.manager.wait(handle.id)).toMatchObject({ status: "failed", text: "QUIESCENT", errorCode: "CUSTODY_UNCONFIRMED" });
       expect(f.manager.listForUi().find(run => run.id === handle.id)?.status).toBe("failed");
+      // Finishing publishes the bounded failure before its owned teardown joins.
+      // Join that exact stop first: cleanup may otherwise correctly reject the
+      // earlier pending-teardown guard instead of reaching the retained debt.
+      await expect(f.manager.stop(handle.id)).rejects.toThrow(/custody|unconfirmed/);
       await expect(f.manager.cleanup(handle.id)).rejects.toThrow(/custody|unconfirmed/);
       expect(fs.existsSync(directory)).toBe(true);
       const queued = await f.manager.spawn({ task: "must not overlap unresolved custody", transport: "process" });

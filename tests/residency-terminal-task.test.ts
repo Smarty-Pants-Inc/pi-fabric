@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { installInProcessResidentFence } from "./helpers/in-process-resident-fence.js";
 import { ResidentHost } from "../src/residency/host.js";
 import { RESIDENT_HOST_FORMAT, residentDeliveryPrefix, type ResidentHostConfig } from "../src/residency/protocol.js";
@@ -14,8 +14,30 @@ import { saveFinalAnswerReceipt } from "../src/worker/terminal-answer.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 
 beforeEach(() => installInProcessResidentFence());
+const removalRecords: Array<{ root: string; calls: string[] }> = [];
+afterEach(() => {
+  for (const { root, calls } of removalRecords.splice(0)) console.log(`resident-terminal retained root=${root} recordedProductRemovals=${calls.length}`);
+  vi.restoreAllMocks();
+});
+const recordProductRemovals = (root: string): void => {
+  const calls: string[] = [];
+  removalRecords.push({ root, calls });
+  const product = (target: fs.PathLike): boolean => {
+    if (typeof target !== "string") return true;
+    const relative = path.relative(root, path.resolve(target));
+    return (relative === "" || relative !== ".." && !relative.startsWith(".." + path.sep) && !path.isAbsolute(relative)) &&
+      !relative.split(path.sep).some(part => part === ".locks" || part.endsWith("-locks") || part.endsWith(".lock") || part.startsWith(".pi-fabric-mesh-lock-"));
+  };
+  // Only this fixture's ephemeral locks and FIFO admission tickets release.
+  // Product run/notice/root removals are recorded, never collector evidence.
+  const remove = fs.rmSync.bind(fs), unlink = fs.unlinkSync.bind(fs), removeAsync = fs.promises.rm.bind(fs.promises);
+  vi.spyOn(fs, "rmSync").mockImplementation((target, options) => { if (product(target)) calls.push(String(target)); else remove(target, options); });
+  vi.spyOn(fs, "unlinkSync").mockImplementation(target => { if (product(target)) calls.push(String(target)); else unlink(target); });
+  vi.spyOn(fs.promises, "rm").mockImplementation(async (target, options) => { if (product(target)) calls.push(String(target)); else await removeAsync(target, options); });
+};
 const fixture = () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "resident-terminal-"));
+  recordProductRemovals(root);
   const config: ResidentHostConfig = { format: RESIDENT_HOST_FORMAT, rootId: "session:terminal-root", sessionId: "terminal-root",
     cwd: process.cwd(), projectRoot: process.cwd(), meshRoot: path.join(root, "mesh"), actorRoot: path.join(root, "actors"), residencyRoot: path.join(root, "resident"),
     fullCodeMode: true, agents: { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, retainRuns: true }, mesh: DEFAULT_FABRIC_CONFIG.mesh,
@@ -115,7 +137,13 @@ describe("resident ordinary-task terminal notices", () => {
         .rejects.toMatchObject({ code: "FABRIC_TARGET_TERMINAL", deliveryStatus: "undelivered", targetId: task.id,
           reason: "run-ended", runState: "completed", message: expect.stringContaining("undelivered: task already finished") });
       expect(receipt).toBeDefined();
-      expect(await f.host.agents.wait(task.id, { timeoutMs: 3000 })).toMatchObject({ status: "completed", text: receipt!.text });
+      const pending = f.host.agents.wait(task.id, { timeoutMs: 3000 });
+      void pending.catch(() => undefined);
+      expect(f.host.agents.status(task.id)).toMatchObject({ status: "finishing", finalAnswerReceipt: { id: receipt!.id } });
+      expect(f.host.agents.isSettled(task.id)).toBe(false);
+      expect(JSON.parse(fs.readFileSync(path.join(run, "terminal-controls", `${allowed.messageId}.json`), "utf8"))).toMatchObject({ state: "delivered", provenance: admission.provenance });
+      // The exact original sender's refusal is routable while execution is
+      // still finishing; an answer receipt must not stand in for native close.
       await vi.waitFor(() => {
         const deliveries = f.host.mesh.listAll(residentDeliveryPrefix(who.id)).map(row => row.value as any);
         expect(deliveries.filter(row => row.data?.code === "FABRIC_TARGET_TERMINAL")).toEqual([expect.objectContaining({
@@ -123,12 +151,14 @@ describe("resident ordinary-task terminal notices", () => {
           data: expect.objectContaining({ messageId: racingId, finalAnswerReceiptId: receipt!.id, sender: expect.objectContaining({ id: who.id }) }),
         })]);
       });
+      f.close(task.id);
+      expect(await pending).toMatchObject({ status: "completed", text: receipt!.text });
       const bytes = fs.readFileSync(journal, "utf8");
       await expect(sender.request(f.host.hostId, task.id, "steer", { message: "after final" }, f.host.identity.id))
         .rejects.toMatchObject({ code: "FABRIC_TARGET_TERMINAL", deliveryStatus: "undelivered", runState: "completed" });
       expect(fs.readFileSync(journal, "utf8")).toBe(bytes);
     } finally {
-      appendSpy?.mockRestore(); await sender.close(); await f.host.close();
+      appendSpy?.mockRestore(); f.close(); await sender.close(); await f.host.close(); f.launch.mockRestore();
       // Retain this race proof; no real fixture deletion in the local path.
     }
   });
@@ -147,7 +177,7 @@ describe("resident ordinary-task terminal notices", () => {
         reason: "run-ended", deliveryStatus: "undelivered", messageId: "m-race", delivery: "steer", finalAnswerReceiptId: "race-receipt", runState } });
       await expect(sender.request(f.host.hostId, task.id, "steer", { message: "racing" }, f.host.identity.id))
         .rejects.toMatchObject({ code: "FABRIC_TARGET_TERMINAL", targetId: task.id, finalAnswerReceiptId: "race-receipt", runState });
-    } finally { vi.restoreAllMocks(); await sender.close(); await f.host.close(); }
+    } finally { f.close(); await sender.close(); await f.host.close(); }
   });
 
   it("retains an unavailable peer sender and retries through its exact restored owner on status", async () => {

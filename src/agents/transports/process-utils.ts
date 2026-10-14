@@ -9,7 +9,7 @@ import { terminateWindowsTree } from "../../child-process-tree.js";
 import { spawnDetached as spawnDetachedLegacy } from "./process-utils-legacy.js";
 import { randomBytes } from "node:crypto";
 import {
-  TASK_SCOPE_ENVIRONMENT, TASK_SCOPE_PREFIX, TaskScopeAdmissionError, assertMemoryMaxBytes, stopTaskCgroup, taskScopeProperties, taskScopeShim, verifiedTaskMemoryMax,
+  TASK_SCOPE_ENVIRONMENT, TASK_SCOPE_PREFIX, TaskScopeAdmissionError, assertMemoryMaxBytes, stopTaskCgroup, taskCgroupPids, taskScopeProperties, taskScopeShim, verifiedTaskMemoryMax,
   type TaskCgroupBoundary,
 } from "./task-cgroup.js";
 import { taskScopeWrapperSource } from "./task-scope-wrapper.js";
@@ -805,6 +805,17 @@ export const spawnDetached = async (
               await Promise.race([workerExited, new Promise<void>(resolve => { grace = setTimeout(resolve, termGraceMs); })]);
               clearTimeout(grace);
             }
+            // Count live descendant births at the owned kill, not during natural grace.
+            // Diagnostics must never prevent or replace the verified subtree stop.
+            try {
+              for (const descendant of taskCgroupPids(verified) ?? []) {
+                if (descendant === pid) continue;
+                const member = linuxGroupMember(descendant);
+                if (member && member.state !== "Z" && member.state !== "X") {
+                  forcedDescendants.add(`${member.pid}:${member.started}`);
+                }
+              }
+            } catch { /* diagnostic census failure cannot skip owned cleanup */ }
             await stopTaskCgroup(verified, { termMs: STOP_TERM_MS, killMs: STOP_KILL_MS });
           }
           // Successful teardown proves emptiness even if finishTree(error)

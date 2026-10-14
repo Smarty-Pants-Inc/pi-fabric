@@ -3627,6 +3627,9 @@ export class AgentManager {
         status: "failed", error: failure.message,
       });
       else managed.stopDrainFailure = failure.message;
+      // Preserve the owned cgroup's typed PID failure after recording custody,
+      // just as #drainExecution does; generic drain failures keep the wrapper.
+      if ((error as { name?: unknown } | null)?.name === "TaskCgroupStopUnconfirmedError") throw error;
       throw failure;
     }
     if (managed.settled) return consumeSettled ? this.wait(id) : this.#settledResult(managed);

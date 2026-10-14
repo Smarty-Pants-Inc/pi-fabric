@@ -263,6 +263,31 @@ describe("fv2-11107 actor poll ownership stamp gate on a real ParticipantDirecto
     } finally { await actors.close(); rm.mockRestore(); replace.mockRestore(); }
   });
 
+  it.skipIf(process.platform === "win32")("never recovers a queue symlink for a stale owner or successor generation", async () => {
+    const { actors, putActor } = await setup();
+    const actor = await actors.create({ name: "stale-link", instructions: "Wait", triggerTurn: false });
+    await putActor(actor.id, SELF); actors.listOwned(); actors.pauseForRelease();
+    actors.tell(actor.id, "accepted before transfer");
+    const file = path.join(path.dirname(actor.sessionFile!), `queue-${digest([SELF.id, actor.residency].join("\0")).slice(0, 16)}.json`);
+    const target = `${file}.unrelated`, bytes = "unrelated target must survive";
+    fs.writeFileSync(target, bytes); fs.renameSync(file, `${file}.fixture`); fs.symlinkSync(target, file);
+    await putActor(actor.id, OTHER);
+    const attempts: string[] = [], rename = fs.renameSync;
+    const replace = vi.spyOn(fs, "renameSync").mockImplementation((source, destination) => {
+      if (String(destination) === file) { attempts.push(file); return; }
+      return rename(source, destination);
+    });
+    const opened = vi.spyOn(fs, "openSync");
+    try {
+      expect(actors.listOwned()).toEqual([]);
+      expect(() => actors.haltAll()).toThrow(/queue custody changed/);
+      expect(attempts).toEqual([]);
+      expect(opened.mock.calls.some(([input]) => String(input) === file)).toBe(false);
+      expect(fs.lstatSync(file).isSymbolicLink()).toBe(true);
+      expect(fs.readFileSync(target, "utf8")).toBe(bytes);
+    } finally { await actors.close(); opened.mockRestore(); replace.mockRestore(); }
+  });
+
   it("single-owner persistence takes one zero-wait registry fence per mutation and saves every accepted item", async () => {
     const { actors, putActor } = await setup();
     const actor = await actors.create({ name: "lock-meter", instructions: "Wait", triggerTurn: false });

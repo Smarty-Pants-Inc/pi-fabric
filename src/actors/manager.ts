@@ -664,6 +664,7 @@ export class ActorManager {
   readonly #queueRevisions = new Map<string, string>();
   readonly #queueOwnerGenerations = new Map<string, string>();
   readonly #queueReadReceipts = new WeakMap<ManagedActor, string>();
+  readonly #queueLinkRecoveryNoticed = new WeakSet<ManagedActor>();
   // smarty-dev#1065: callerless work past an actor's queue limit waits here, in order, instead of
   // holding the mesh cursor for every actor of this manager (or being lost in live mode).
   readonly #overflow = new Map<string, ActorQueueItem[]>();
@@ -6436,7 +6437,12 @@ export class ActorManager {
       if (!this.#ownQueueRead.has(actor.id)) {
         const file = this.#ownQueueFile(actor);
         const saved = this.#readQueue(file, actor);
-        if (this.#queueReadReceipts.get(actor) !== file) continue; // busy/unknown: retry acquisition on the next wake
+        if (this.#queueReadReceipts.get(actor) !== file) {
+          // Unknown is not empty. It still participates in the ENODEV retention
+          // veto/alarm below, but cannot grant queue mutation authority.
+          firstLoads.push(actor);
+          continue;
+        }
         this.#ownQueueRead.add(actor.id);
         this.#restoreQueue(actor, saved, false);
         this.#seedDeadLetterDeliveries(actor);
@@ -6590,7 +6596,7 @@ export class ActorManager {
         return true;
       });
     const file = this.#ownQueueFile(actor);
-    const mayPersistQueue = (): boolean => {
+    const mayPersistQueue = (atomicReplacement = false): boolean => {
       // A park can run inside a held poll snapshot. Every queue mutation needs
       // fresh authority, not that snapshot's permission (same check as ownership refresh).
       const cached = this.#directoryOwnership;
@@ -6603,8 +6609,27 @@ export class ActorManager {
       const expected = this.#queueOwnerGenerations.get(actorId);
       const firstPublication = expected !== undefined && expected !== generation &&
         this.#isFirstQueuePublication(actor, expected, generation);
-      if (!owned || (expected !== undefined && expected !== generation && !firstPublication) ||
-          this.#queueRevision(file) !== this.#queueRevisions.get(file)) throw new ActorQueueCustodyLostError(actorId);
+      // Admission may be vetoed without a custody transfer (halt/close must still
+      // checkpoint accepted work). Only a fresh, unchanged lineage/generation and
+      // descriptor-bound content receipt authorize that checkpoint.
+      if ((expected === undefined && !owned) ||
+          (expected !== undefined && expected !== generation && !firstPublication)) throw new ActorQueueCustodyLostError(actorId);
+      const revision = this.#queueRevision(file);
+      if (revision === undefined) {
+        // The current owner's cancellation/close recovery may replace a link
+        // atomically, never open/follow it. The in-place fallback stays forbidden.
+        const link = fs.lstatSync(file).isSymbolicLink();
+        const lineage = JSON.parse(generation) as unknown[];
+        if (!owned || expected !== generation || lineage[0] !== this.#rootId ||
+            lineage[1] !== (this.#claimResidency ?? actor.residency)) throw new ActorQueueCustodyLostError(actorId);
+        if (!link || !atomicReplacement || (!release && !this.#queueCancellationDirty.has(actorId))) {
+          throw new Error("Cancellation queue receipt is not a regular file");
+        }
+        if (!this.#queueLinkRecoveryNoticed.has(actor)) {
+          this.#queueLinkRecoveryNoticed.add(actor);
+          console.warn(`[pi-fabric] actor ${actorId}: cancellation queue recovery replaces a symbolic link without following it`);
+        }
+      } else if (revision !== this.#queueRevisions.get(file)) throw new ActorQueueCustodyLostError(actorId);
       this.#queueOwnerGenerations.set(actorId, generation);
       return true;
     };
@@ -6672,7 +6697,7 @@ export class ActorManager {
         if (!mayPersistQueue()) return false;
         fs.rmSync(file, { force: true });
       } else {
-        if (!mayPersistQueue()) return false;
+        if (!mayPersistQueue(true)) return false;
         canonicalWrite = true;
         writeJsonAtomic(file, snapshot, { durable });
       }
@@ -6764,8 +6789,10 @@ export class ActorManager {
         if (writing) {
           const held = fs.fstatSync(fd, { bigint: true });
           const revision = this.#queueRevision(file);
-          const digest = held.ino === 0n ? `:${createHash("sha256").update(fs.readFileSync(fd)).digest("hex")}` : "";
-          if (revision === `${held.dev}:${held.ino}:${held.size}:${held.mtimeNs}:${held.ctimeNs}${digest}`) this.#queueRevisions.set(file, revision);
+          const digest = createHash("sha256").update(fs.readFileSync(fd)).digest("hex");
+          const after = fs.fstatSync(fd, { bigint: true });
+          if (held.dev === after.dev && held.ino === after.ino && held.size === after.size &&
+              held.mtimeNs === after.mtimeNs && held.ctimeNs === after.ctimeNs && revision === digest) this.#queueRevisions.set(file, revision);
         }
       } finally { fs.closeSync(fd); }
     }
@@ -6880,7 +6907,7 @@ export class ActorManager {
     });
   }
 
-  /** Descriptor-bound identity, including in-place changes; absent is a receipt,
+  /** Descriptor-bound content, including in-place changes; absent is a receipt,
    * unknown/non-regular is not. Queue mutation and acquisition share registry custody. */
   #queueRevision(file: string): string | undefined {
     let fd: number | undefined;
@@ -6892,11 +6919,12 @@ export class ActorManager {
       const held = fs.fstatSync(fd, { bigint: true });
       const current = fs.lstatSync(file, { bigint: true });
       if (!held.isFile() || revision(endpoint) !== revision(held) || revision(held) !== revision(current)) return undefined;
-      // Some Windows volumes report inode 0 and coarse timestamps. Equal metadata
-      // there is not a revision receipt; include the exact descriptor bytes.
-      const bytes = held.ino === 0n ? fs.readFileSync(fd) : undefined;
+      // ponytail: a byte-identical atomic rewrite is not a custody change. Bind
+      // the read to its descriptor, but compare content on every platform; a
+      // successor's different bytes or ownership generation still refuse writes.
+      const bytes = fs.readFileSync(fd);
       if (revision(held) !== revision(fs.fstatSync(fd, { bigint: true })) || revision(held) !== revision(fs.lstatSync(file, { bigint: true }))) return undefined;
-      return revision(held) + (bytes ? `:${createHash("sha256").update(bytes).digest("hex")}` : "");
+      return createHash("sha256").update(bytes).digest("hex");
     } catch (error) { return (error as NodeJS.ErrnoException).code === "ENOENT" ? "absent" : undefined; }
     finally { if (fd !== undefined) fs.closeSync(fd); }
   }
@@ -6909,7 +6937,7 @@ export class ActorManager {
 
   /** A newly created lineage can accept work before its first participant commit.
    * Bind that first SELF publication only under the existing queue/registry fence;
-   * a known owner transition or a same-lineage file replacement is never rebased. */
+   * a known owner transition or different same-lineage queue bytes are never rebased. */
   #isFirstQueuePublication(actor: ManagedActor, expected: string, generation: string): boolean {
     const before = JSON.parse(expected) as unknown[], after = JSON.parse(generation) as unknown[];
     return before.slice(4).every(value => value === null) &&
@@ -6940,7 +6968,14 @@ export class ActorManager {
     if (actor) this.#queueReadReceipts.delete(actor);
     const read = (): unknown => {
       if (!actor) {
-        try { return JSON.parse(fs.readFileSync(file, "utf8")); } catch { return undefined; }
+        let fd: number | undefined;
+        try {
+          if (fs.lstatSync(file).isSymbolicLink()) return undefined;
+          fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0));
+          if (!fs.fstatSync(fd).isFile()) return undefined;
+          return JSON.parse(fs.readFileSync(fd, "utf8"));
+        } catch { return undefined; }
+        finally { if (fd !== undefined) fs.closeSync(fd); }
       }
       let fd: number | undefined, before: string | undefined, parsed: unknown;
       const stamp = (stat: fs.BigIntStats): string => `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
@@ -6950,7 +6985,7 @@ export class ActorManager {
         const held = fs.fstatSync(fd, { bigint: true });
         if (!held.isFile()) return undefined;
         const bytes = fs.readFileSync(fd, "utf8"); // bytes and receipt name the SAME descriptor
-        before = stamp(held) + (held.ino === 0n ? `:${createHash("sha256").update(bytes).digest("hex")}` : "");
+        before = createHash("sha256").update(bytes).digest("hex");
         parsed = JSON.parse(bytes);
         if (stamp(held) !== stamp(fs.fstatSync(fd, { bigint: true }))) return undefined;
       } catch (error) {
@@ -7648,10 +7683,27 @@ export class ActorManager {
         // Acquisition reads/merges successor bytes under the same fence as its
         // first write; a stale manager may never simply rebase its write receipt.
         const file = this.#ownQueueFile(actor);
-        const saved = this.#readQueue(file, actor);
-        if (this.#queueReadReceipts.get(actor) !== file) { this.#ownership.set(actor.id, false); continue; }
-        this.#ownQueueRead.add(actor.id);
-        this.#restoreQueue(actor, saved, false);
+        let unchanged = false;
+        try {
+          unchanged = this.#ownQueueRead.has(actor.id) && this.#registry.withTryLockSync(() =>
+            this.#queueOwnerGenerations.get(actor.id) === this.#queueOwnershipGeneration(actor) &&
+            this.#queueRevisions.get(file) === this.#queueRevision(file));
+        } catch (error) {
+          if (!(error instanceof ActorRegistryBusyError)) throw error;
+          this.#retryChildCompletions(actor.id);
+          this.#ownership.set(actor.id, false);
+          continue;
+        }
+        if (unchanged) {
+          // A temporary admission veto did not hand this lineage's queue to a
+          // successor. Its live pending/revision state is newer than its checkpoint.
+          this.#queuePersistenceRefused.delete(actor);
+        } else {
+          const saved = this.#readQueue(file, actor);
+          if (this.#queueReadReceipts.get(actor) !== file) { this.#ownership.set(actor.id, false); continue; }
+          this.#ownQueueRead.add(actor.id);
+          this.#restoreQueue(actor, saved, false);
+        }
         acquired = true;
       }
       if (!next) this.#maybeAdoptOrphan(actor);

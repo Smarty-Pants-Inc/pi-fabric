@@ -34,6 +34,20 @@ it("reuses the adoption/publication registry receipt for synchronous nested queu
   } finally { mkdir.mockRestore(); fs.rmSync(root, { recursive: true, force: true }); }
 });
 
+it("releases a synchronous registry save before same-turn queue checkpoint work", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "queue-synchronous-save-"));
+  const store = new ActorRegistryStore(root), peer = new ActorRegistryStore(root);
+  let checkpointed = false, error: unknown;
+  try {
+    const save = store.withLock(() => undefined);
+    try { peer.withTryLockSync(() => { checkpointed = true; }); }
+    catch (failure) { error = failure; }
+    await save;
+    expect(error).toBeUndefined();
+    expect(checkpointed).toBe(true);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 it("the real orphan adoption path writes the successor queue and removes its predecessor only inside the same registry fence", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "queue-adoption-fence-"));
   const actorRoot = path.join(root, "actors");
@@ -170,6 +184,41 @@ it.each([false, true])("binds a rightful first publication only if the accepted 
       expect(agents.list()).toEqual([]);
     } finally { await manager.close(); replace.mockRestore(); }
   } finally { await manager.close(); await agents.close(); recorder.mockRestore(); fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+it.each([false, true])("keeps a byte-identical queue receipt across an atomic rewrite and admission veto (veto: %s)", async veto => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "queue-content-receipt-"));
+  const actorRoot = path.join(root, "actors"), mesh = new MeshStore(path.join(root, "mesh"), 65536, 100);
+  const agents = new AgentManager(root, DEFAULT_FABRIC_CONFIG.agents, { runRoot: path.join(root, "runs") });
+  let admitted = true;
+  const manager = new ActorManager("receipt", { id: "session:receipt", name: "owner", kind: "main" }, mesh,
+    { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 600000 }, agents, () => {},
+    { persistent: true, actorRoot, releasePaused: true, retentionSweepMs: 600000, canManageActor: () => admitted });
+  const remove = fs.rmSync;
+  const recorder = vi.spyOn(fs, "rmSync").mockImplementation((file, options) => {
+    if (/^queue-[a-f0-9]{16}\.json$/.test(path.basename(String(file)))) return;
+    return remove(file, options);
+  });
+  try {
+    const actor = await manager.create({ name: "same-content", instructions: "Wait", triggerTurn: false });
+    manager.tell(actor.id, "first accepted item");
+    const file = path.join(path.dirname(actor.sessionFile!), fs.readdirSync(path.dirname(actor.sessionFile!)).find(file => /^queue-/.test(file))!);
+    const bytes = fs.readFileSync(file);
+    fs.writeFileSync(`${file}.fixture`, bytes); fs.renameSync(`${file}.fixture`, file);
+    if (veto) {
+      admitted = false;
+      expect(manager.listOwned()).toEqual([]);
+      expect(await manager.haltAll()).toEqual({ halted: 0 });
+      expect(JSON.parse(fs.readFileSync(file, "utf8")).items).toEqual([]);
+    } else {
+      manager.tell(actor.id, "second accepted item");
+      expect(JSON.parse(fs.readFileSync(file, "utf8")).items).toHaveLength(2);
+    }
+    expect(manager.status(actor.id).lastError).toBeUndefined();
+    expect(agents.list()).toEqual([]);
+  } finally {
+    await manager.close(); await agents.close(); recorder.mockRestore(); fs.rmSync(root, { recursive: true, force: true });
+  }
 });
 
 it("a cross-process holder gives one zero-wait busy refusal with no mutation or stale recovery", async () => {

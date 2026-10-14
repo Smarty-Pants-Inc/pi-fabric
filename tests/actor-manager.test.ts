@@ -32,6 +32,20 @@ const agentManagers: AgentManager[] = [];
 
 const DEFAULT_WAIT_MS = process.env.CI ? 10_000 : 2_000;
 
+// The queue now reads through a pinned descriptor. Inject the same EIO at the
+// predecessor read, whether its caller supplies a path or that file's descriptor.
+const readDescriptorPaths = new Map<number, string>();
+const trackQueueReads = (): void => {
+  readDescriptorPaths.clear();
+  const open = fs.openSync, close = fs.closeSync;
+  vi.spyOn(fs, "openSync").mockImplementation((...args: Parameters<typeof fs.openSync>) => {
+    const fd = open(...args); readDescriptorPaths.set(fd, String(args[0])); return fd;
+  });
+  vi.spyOn(fs, "closeSync").mockImplementation(fd => { readDescriptorPaths.delete(fd); close(fd); });
+};
+const readsFile = (input: fs.PathOrFileDescriptor, file: string): boolean =>
+  input === file || (typeof input === "number" && readDescriptorPaths.get(input) === file);
+
 const waitFor = async (predicate: () => boolean, timeoutMs = DEFAULT_WAIT_MS): Promise<void> => {
   const deadline = Date.now() + timeoutMs;
   while (!predicate()) {
@@ -1608,10 +1622,11 @@ describe("ActorManager across a session reload", () => {
     const ownerFile = path.join(root, "actors", actor.id, queueFiles(root, actor.id)[0]!.name);
     const readFileSync = fs.readFileSync;
     const renameSync = fs.renameSync;
+    if (fault === "read") trackQueueReads();
     const fail = (code: string) => Object.assign(new Error(`${code}: injected`), { code });
     const spy = fault === "read"
       ? vi.spyOn(fs, "readFileSync").mockImplementation(((file: fs.PathOrFileDescriptor, options?: unknown) => {
-          if (file === ownerFile) throw fail("EIO");
+          if (readsFile(file, ownerFile)) throw fail("EIO");
           return (readFileSync as (file: fs.PathOrFileDescriptor, options?: unknown) => string | Buffer)(file, options);
         }) as typeof fs.readFileSync)
       : vi.spyOn(fs, "renameSync").mockImplementation((source, target) => {
@@ -1676,8 +1691,9 @@ describe("ActorManager across a session reload", () => {
     // An adopter whose copy of the backlog fails (the file cannot be read), and which then dies.
     const interruptedAdoption = async (file: string, rootId: string, claim: "session" | "durable", actorId: string) => {
       const readFileSync = fs.readFileSync;
+      trackQueueReads();
       const spy = vi.spyOn(fs, "readFileSync").mockImplementation(((target: fs.PathOrFileDescriptor, options?: unknown) => {
-        if (target === file) throw Object.assign(new Error("EIO: injected"), { code: "EIO" });
+        if (readsFile(target, file)) throw Object.assign(new Error("EIO: injected"), { code: "EIO" });
         return (readFileSync as (target: fs.PathOrFileDescriptor, options?: unknown) => string | Buffer)(target, options);
       }) as typeof fs.readFileSync);
       const adopter = host(`adopter-${claim}`, rootId, claim, () => undefined);
@@ -1738,8 +1754,9 @@ describe("ActorManager across a session reload", () => {
     h.alive.set("session:a", false);
     const ownerFile = path.join(h.root, "actors", actor.id, queueFiles(h.root, actor.id)[0]!.name);
     const readFileSync = fs.readFileSync;
+    trackQueueReads();
     const spy = vi.spyOn(fs, "readFileSync").mockImplementation(((target: fs.PathOrFileDescriptor, options?: unknown) => {
-      if (target === ownerFile) throw Object.assign(new Error("EIO: injected"), { code: "EIO" });
+      if (readsFile(target, ownerFile)) throw Object.assign(new Error("EIO: injected"), { code: "EIO" });
       return (readFileSync as (target: fs.PathOrFileDescriptor, options?: unknown) => string | Buffer)(target, options);
     }) as typeof fs.readFileSync);
     const adopter = h.host("adopter", "session:b", "session", () => undefined);

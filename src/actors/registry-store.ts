@@ -543,7 +543,11 @@ export class ActorRegistryStore {
     const scope = { token, active: true };
     const inherited = registryCustody.getStore();
     try {
-      return await registryCustody.run(new Map([...(inherited ?? []), [this.#registryPath, scope]]), operation);
+      const result = registryCustody.run(new Map([...(inherited ?? []), [this.#registryPath, scope]]), operation);
+      // Synchronous registry saves finish custody synchronously too. An artificial
+      // await here stranded a same-turn queue checkpoint behind our own finished
+      // save; real asynchronous adoption/publication keeps the fence until settled.
+      return result && typeof (result as Promise<T>).then === "function" ? await result : result;
     } finally {
       scope.active = false;
       try {

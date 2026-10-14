@@ -5,7 +5,8 @@ import ts from "typescript";
 import type { ViteUserConfig as UserConfig } from "vitest/config";
 import { isolatedTestTemp, isolateTestFleetEnvironment } from "./scripts/test-temp.js";
 
-// Mutate the parent before Vitest snapshots its environment or forks any workers.
+// Assign the caller-owned run root before Vitest snapshots its environment, forks workers,
+// or allocates fleet state. Every later fixture temp directory stays beneath this root.
 const temp = isolatedTestTemp("pi-fabric-vitest-");
 Object.assign(process.env, temp);
 const fleet = isolateTestFleetEnvironment();
@@ -130,6 +131,9 @@ export default {
   test: {
     ...sharedTests,
     reporters: ci ? ["default", "./scripts/ci-retry-reporter.ts"] : ["default"],
+    // Root config only: teardown removes this process's created root on pass and failure.
+    // The exit fallback keeps the same inode pins; Windows job temp stays runner-owned.
+    globalSetup: ["./scripts/test-temp-global-setup.ts"],
     maxWorkers: 2,
     // Expose GC only for retention tests: application worker_threads reject this flag.
     // Explicit shared options avoid extends merging the broad include into the GC project.

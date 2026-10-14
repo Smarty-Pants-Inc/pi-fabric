@@ -56,6 +56,7 @@ const lazyEntryPoints = [
   // The resident's first operator cleanup reuses the offline final-check helper (smarty-dev#8090).
   "src/actors/remove-offline.ts",
   "src/residency/launcher-owner.ts",
+  "src/residency/attempt-containment.ts",
   "src/residency/wake.ts",
   "src/residency/process-work.ts",
   "src/agents/transports/process-utils.ts",

@@ -17,6 +17,8 @@ import type { AgentPlacementConfig } from "../placement-config.js";
 import { agentPlacementProbe, liveAgentPlacement } from "../placement-config.js";
 import { normalizeAgentCapabilityTokens } from "../../host-compatibility.js";
 import { assertAgentRequiredInputsExist, normalizeAgentRequires } from "../input-validation.js";
+import { delegatedUserCgroupAvailable } from "./cgroup-eligibility.js";
+export { delegatedUserCgroupAvailable } from "./cgroup-eligibility.js";
 
 const regularFile = (file: string): boolean => {
   try { return fs.statSync(file).isFile(); } catch { return false; }
@@ -52,37 +54,6 @@ const selectWorkerRelease = (workerPath: string): { workerPath: string; fabricRe
 
 /** Default per-task memory.max (24 GiB, swap 0), mirrored from config to keep this module light. */
 const DEFAULT_TASK_MEMORY_MAX_BYTES = 24 * 1024 ** 3;
-
-const isSocket = (file: string): boolean => {
-  try { return fs.statSync(file).isSocket(); } catch { return false; }
-};
-
-/**
- * smarty-dev#8257: cheap, D-Bus-free proof that `systemd-run --user --scope` can
- * create a memory-capped scope. All of: Linux, unified cgroup v2, an explicit and
- * usable user-bus environment (XDG_RUNTIME_DIR/bus or a unix:path=
- * DBUS_SESSION_BUS_ADDRESS socket; a bare /run/user socket is not enough, so
- * scrubbed test environments stay legacy), and the memory controller delegated
- * to this UID's user manager. Any doubt answers false: the launch stays legacy.
- */
-export const delegatedUserCgroupAvailable = (
-  environment: NodeJS.ProcessEnv = process.env,
-  cgroupRoot = "/sys/fs/cgroup",
-): boolean => {
-  if (process.platform !== "linux") return false;
-  const uid = process.getuid?.();
-  if (uid === undefined) return false;
-  const runtime = environment.XDG_RUNTIME_DIR;
-  const bus = environment.DBUS_SESSION_BUS_ADDRESS?.match(/^unix:path=([^,;]+)/)?.[1];
-  const busUsable = (runtime && path.isAbsolute(runtime) && isSocket(path.join(runtime, "bus")))
-    || (bus && path.isAbsolute(bus) && isSocket(bus));
-  if (!busUsable) return false;
-  try {
-    if (!fs.statSync(path.join(cgroupRoot, "cgroup.controllers")).isFile()) return false;
-    const manager = path.join(cgroupRoot, "user.slice", `user-${uid}.slice`, `user@${uid}.service`);
-    return fs.readFileSync(path.join(manager, "cgroup.subtree_control"), "utf8").split(/\s+/).includes("memory");
-  } catch { return false; }
-};
 
 /** Exact flag-position `--actor-id` only; a flag-shaped value is not an actor identity. */
 const isActorLaunch = (workerArguments: readonly string[]): boolean =>
@@ -172,25 +143,28 @@ export class ProcessTransport implements AgentTransportAdapter {
     // Check on Main only after the remote decision; required paths may exist solely on the target.
     assertAgentRequiredInputsExist(requires, file => fs.existsSync(file));
     const actor = isActorLaunch(request.workerArguments);
-    // smarty-dev#8257: tasks get their own memory-capped scope only on a proven
-    // delegated v2 user manager. Actors and unproven hosts keep the legacy path:
-    // explicit processSlice still scopes them uncapped; otherwise no systemd-run.
-    const capEligible = !actor && process.platform === "linux" && delegatedUserCgroupAvailable();
-    const slice = this.processSlice ?? (capEligible ? "app.slice" : undefined);
-    // A nested Fabric launch needs the real backend, not its parent's command
-    // shim: the shim keeps ordinary suites in the parent leaf and cannot admit
-    // a new task scope. Preserve PATH for task commands; exclude only that exact
-    // launcher-owned wrapper from this backend lookup.
+    // A resident launch's attempt cgroup is the outer ownership boundary. Nested
+    // ProcessTransport workers inherit it directly; creating a fresh sibling
+    // systemd scope would let supported resident work outlive its attempt.
+    const residentAttempt = typeof process.env.PI_FABRIC_RESIDENT_ATTEMPT_CGROUP === "string"
+      && process.env.PI_FABRIC_RESIDENT_ATTEMPT_CGROUP.length > 0;
+    // smarty-dev#8257: ordinary tasks get their own memory-capped scope only on
+    // a proven delegated v2 user manager. Resident descendants never create one.
+    const capEligible = !residentAttempt && !actor && process.platform === "linux" && delegatedUserCgroupAvailable();
+    const slice = residentAttempt ? undefined : this.processSlice ?? (capEligible ? "app.slice" : undefined);
+    // Outside a resident attempt, a nested Fabric launch needs the real backend,
+    // not its parent's task-local command shim. Resident tasks stay in their outer
+    // attempt cgroup, so their wrapper remains in PATH and no scope backend is used.
     const wrapper = process.env.FABRIC_TASK_SYSTEMD_RUN_WRAPPER;
-    const backendEnvironment = wrapper ? {
+    const backendEnvironment = wrapper && !residentAttempt ? {
       ...process.env,
       PATH: (process.env.PATH ?? "").split(path.delimiter)
         .filter(directory => path.resolve(directory, "systemd-run") !== wrapper).join(path.delimiter),
     } : process.env;
     const executable = slice && process.platform === "linux" ? findExecutable("systemd-run", backendEnvironment) : undefined;
-    if (this.processSlice && process.platform === "linux" && !executable) this.#warnScope("systemd-run unavailable");
+    if (!residentAttempt && this.processSlice && process.platform === "linux" && !executable) this.#warnScope("systemd-run unavailable");
     const scope: { executable: string; slice: string; warn: (reason: string) => void; memoryMaxBytes?: number } | undefined =
-      executable && slice
+      !residentAttempt && executable && slice
         ? { executable, slice, warn: this.#warnScope, ...(capEligible ? { memoryMaxBytes: this.#memoryMaxBytes } : {}) }
         : undefined;
     const selected = selectWorkerRelease(request.workerPath);
@@ -223,8 +197,11 @@ export class ProcessTransport implements AgentTransportAdapter {
       // Worker arguments are flag/value pairs. A flag-shaped value is not an
       // actor identity; explicit actor ids alone retain the parent's role env.
       applyTaskReturnAddress(
-        // Actors keep their roles, never their caller's capped-task receipt (SRC-1).
-        isActorLaunch(workerArguments) ? withoutTaskBoundary(process.env) : taskAgentEnvironment(),
+        // Same-attempt descendants keep the attempt's wrapper and cgroup receipt,
+        // including actors; ordinary actors still never inherit a caller task cap.
+        residentAttempt
+          ? isActorLaunch(workerArguments) ? { ...process.env } : taskAgentEnvironment(process.env, true)
+          : isActorLaunch(workerArguments) ? withoutTaskBoundary(process.env) : taskAgentEnvironment(),
         workerArguments,
       ),
       scope,

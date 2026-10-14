@@ -18,6 +18,7 @@ import type { AgentHandleInfo, AgentRunRequest, FabricRunOutcome } from "../agen
 import type { FabricKernel, FabricResidentOutcomeReceipt } from "../runtime/kernel.js";
 import type { MeshIdentity } from "../mesh/store.js";
 import type { FabricScope } from "../protocol.js";
+import type { AttemptLaunchReceipt } from "./attempt-containment.js";
 export const sleepUnlessAborted = (ms: number, signal?: AbortSignal): Promise<void> =>
   // Executor form: the configured lib is ES2022, which has no
   // Promise.withResolvers, and an abort listener plus a timer need shared
@@ -295,6 +296,26 @@ export const residentHostStateNote = (residencyRoot: string, now = Date.now()): 
 };
 
 export const RESIDENT_HOST_FORMAT = 1 as const;
+
+/** Strictly validate the gated env envelope against the exclusive lead record. */
+export const parseResidentAttemptAttestation = (
+  recordValue: unknown, envValue: unknown, attemptId: string, scope: string,
+): AttemptLaunchReceipt => {
+  const valid = (value: unknown): value is Record<string, unknown> =>
+    !!value && typeof value === "object" && !Array.isArray(value) &&
+    Object.keys(value).sort().join(",") === "at,attemptId,cgroupPath,launchedInScope,scope";
+  if (!valid(recordValue) || !valid(envValue)) throw new Error("Resident attempt attestation envelope mismatch");
+  const value = recordValue;
+  const env = envValue;
+  for (const key of ["attemptId", "scope", "cgroupPath", "launchedInScope", "at"] as const) {
+    if (value[key] !== env[key]) throw new Error("Resident attempt attestation field mismatch");
+  }
+  if (value.attemptId !== attemptId || value.scope !== scope ||
+      value.cgroupPath !== scope || value.launchedInScope !== true || typeof value.at !== "number" || !Number.isFinite(value.at)) {
+    throw new Error("Resident attempt attestation fields are invalid");
+  }
+  return recordValue as unknown as AttemptLaunchReceipt;
+};
 // Only command envelopes for post-B70 registry operations use format 2.
 // B70 validates format before dispatch and otherwise treats unknown operations
 // as removeActor: an unclaimed request MUST remain safe across crash/rollback.
@@ -410,6 +431,8 @@ export interface ResidentHostOwner {
   requestExpiry?: 1;
   /** Operation-scoped retry keys implemented by this loaded host, not desired config. */
   creationIdempotency?: 1;
+  /** Exact launcher-issued pre-release admission receipt; absent means legacy/uncontained launch. */
+  launchAttestation?: AttemptLaunchReceipt;
   /** Attestation from the loaded host, never desired config.json. */
   releaseRoot?: string;
   configDigest?: string;

@@ -38,6 +38,7 @@ const stable = [
 const lazy = [
   "storage/verified-remove.js",
   "residency/launcher-owner.js",
+  "residency/attempt-containment.js",
   "judge/agent.js",
   "core/landlock.js",
   "core/pattern-kill.js",

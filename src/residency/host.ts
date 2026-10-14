@@ -15,6 +15,7 @@ interface ResidentHostLaunchContext {
   launcher: ResidentLauncherIdentity;
   spec: ResidentLaunchSpec;
   attempt?: { id: string; kind: "target" | "fallback" };
+  launchAttestation?: AttemptLaunchReceipt;
 }
 import { lockFile, FileLockBusy } from "./file-lock.js";
 import { assertNoWatchdogCustody } from "./watchdog-custody.js";
@@ -61,6 +62,7 @@ import { rootPresenceAlarms } from "../topology/stall-alarms.js";
 import { actorParticipantRecord, agentParticipantRecords } from "../topology/records.js";
 import {
   RESIDENT_HOST_FORMAT,
+  parseResidentAttemptAttestation,
   RESIDENT_ACTOR_COMMAND_FORMAT,
   ResidentActorAuthorizationError,
   ResidentCommandUnsupportedError,
@@ -90,6 +92,7 @@ import { ResidentRequestRetention } from "./retention.js";
 import { retentionV2Enabled } from "../storage/retention-platform.js";
 import { ResidentLegacyRunArchive } from "./legacy-run-archive.js";
 import { assertResidentRequestNotExpired, residentRequestGeneration, ResidentRequestExpiredError, RESIDENT_EXPIRING_COMMAND_FORMAT } from "./request-expiry.js";
+import type { AttemptLaunchReceipt } from "./attempt-containment.js";
 
 // Moved to ./retention.js so the mesh-wide sweep (storage/retention-cli.ts) can run it under the
 // dead host's fence without loading the host (smarty-dev#3252).
@@ -820,8 +823,10 @@ export class ResidentHost {
         REQUEST_POLL_MS,
       );
       const now = Date.now();
+      const launchAttestation = residentAttemptLaunchAttestation(this.config);
       const owner: ResidentHostOwner = {
         format: RESIDENT_HOST_FORMAT,
+        ...(launchAttestation ? { launchAttestation } : {}),
         hostId: this.hostId,
         pid: process.pid,
         processStartTime: processStartTime(process.pid),
@@ -2469,6 +2474,45 @@ export class ResidentHost {
   }
 }
 
+function residentAttemptLaunchAttestation(config: ResidentHostConfig): AttemptLaunchReceipt | undefined {
+  const attemptId = process.env.PI_FABRIC_RESIDENT_ATTEMPT_ID;
+  const scope = process.env.PI_FABRIC_RESIDENT_ATTEMPT_CGROUP;
+  const backend = process.env.PI_FABRIC_RESIDENT_LAUNCHED_IN_SCOPE;
+  const rawAttestation = process.env.PI_FABRIC_RESIDENT_LAUNCH_ATTESTATION;
+  if (!attemptId && !scope && !backend && !rawAttestation) return undefined;
+  if (!attemptId || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(attemptId) || !scope || backend !== "linux-cgroup-v2" || !rawAttestation) {
+    throw new Error("Resident attempt launch attestation environment is incomplete");
+  }
+  let rootFd: number | undefined, fd: number | undefined;
+  try {
+    const envelopeValue: unknown = JSON.parse(rawAttestation);
+    rootFd = fs.openSync(config.residencyRoot, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW);
+    const rootStat = fs.fstatSync(rootFd);
+    if (!rootStat.isDirectory() || rootStat.uid !== process.getuid?.()) throw new Error("Resident attempt root is not same-UID directory");
+    const fileName = `attempt-launch-${attemptId}.json`;
+    const recordPath = `/proc/self/fd/${rootFd}/${fileName}`;
+    const before = fs.lstatSync(recordPath);
+    if (!before.isFile() || before.uid !== process.getuid?.() || (before.mode & 0o777) !== 0o600) throw new Error("Resident attempt attestation is not an owned mode-0600 regular file");
+    fd = fs.openSync(recordPath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    const opened = fs.fstatSync(fd);
+    if (!opened.isFile() || opened.uid !== before.uid || opened.dev !== before.dev || opened.ino !== before.ino) throw new Error("Resident attempt attestation changed while opening");
+    const record: unknown = JSON.parse(fs.readFileSync(fd, "utf8"));
+    const receipt = parseResidentAttemptAttestation(record, envelopeValue, attemptId, scope);
+    if (receipt.at > Date.now()) throw new Error("Resident attempt attestation timestamp is from the future");
+    const actual = fs.readFileSync(`/proc/${process.pid}/cgroup`, "utf8").split("\n").find(line => line.startsWith("0::"))?.slice(3);
+    if (actual !== receipt.scope) throw new Error("Resident host cgroup does not match its launcher-issued attempt attestation");
+    const rawLauncher = process.env.PI_FABRIC_RESIDENT_LAUNCHER;
+    if (!rawLauncher) throw new Error("Scoped resident launch lacks its source launcher identity");
+    const launcher = JSON.parse(rawLauncher) as ResidentLauncherIdentity;
+    if (launcher.pid !== process.ppid || !exactResidentProcess(launcher) || fs.realpathSync(`/proc/${launcher.pid}/exe`) !== launcher.runtime) {
+      throw new Error("Resident attempt attestation source launcher identity is uncertain");
+    }
+    return receipt;
+  } catch (error) {
+    throw new Error(`Resident attempt launch attestation unavailable or invalid: ${String(error)}`);
+  } finally { if (fd !== undefined) fs.closeSync(fd); if (rootFd !== undefined) fs.closeSync(rootFd); }
+}
+
 function residentHostLaunchContext(config: ResidentHostConfig): ResidentHostLaunchContext | undefined {
   const raw = process.env.PI_FABRIC_RESIDENT_LAUNCHER;
   if (!raw) return undefined;
@@ -2482,6 +2526,7 @@ function residentHostLaunchContext(config: ResidentHostConfig): ResidentHostLaun
     throw new Error("Resident launcher runtime identity is uncertain");
   }
   const attempt = process.env.PI_FABRIC_RESIDENT_ATTEMPT ? JSON.parse(process.env.PI_FABRIC_RESIDENT_ATTEMPT) as ResidentHostLaunchContext["attempt"] : undefined;
+  const launchAttestation = residentAttemptLaunchAttestation(config);
   let pinned: ResidentLaunchSpec | undefined;
   if (attempt) {
     const state = readHandoverJson<ResidentHandoverState>(handoverPath(config.residencyRoot));
@@ -2496,7 +2541,7 @@ function residentHostLaunchContext(config: ResidentHostConfig): ResidentHostLaun
   if (spec.digest !== process.env.PI_FABRIC_RESIDENT_SPEC_DIGEST || (pinned && pinned.digest !== spec.digest)) {
     throw new Error("Resident loaded release does not match launcher snapshot");
   }
-  return { launcher, spec, ...(attempt ? { attempt } : {}) };
+  return { launcher, spec, ...(attempt ? { attempt } : {}), ...(launchAttestation ? { launchAttestation } : {}) };
 }
 
 /** Why a resident host exits (smarty-dev#7770). */

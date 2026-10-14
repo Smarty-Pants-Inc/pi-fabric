@@ -29,6 +29,7 @@ export const taskScopeWrapperSource = (
   realSystemdRun: string,
   cgroupRelative: string,
   memoryMaxBytes: number,
+  residentShared = false,
 ): string => {
   assertSafe("realSystemdRun (absolute path)", realSystemdRun, /^\/[^\0]*$/);
   if (realSystemdRun.split("/").some((part) => part === "..")) {
@@ -50,6 +51,7 @@ export const taskScopeWrapperSource = (
 real=${shellQuote(realSystemdRun)}
 leaf=${shellQuote(cgroupRelative)}
 root_max=${memoryMaxBytes}
+resident_shared=${residentShared ? 1 : 0}
 
 fail() {
   printf 'fabric task systemd-run: %s\\n' "$1" >&2
@@ -217,6 +219,10 @@ if [ -n "$want" ]; then
   limit=$want
   [ "$limit" -le "$root_max" ] || limit=$root_max
   if [ "$limit" -lt "$current" ]; then
+    if [ "$resident_shared" = 1 ]; then
+      printf 'fabric-resident-shared-scope: code=RESIDENT_SHARED_CAP_TIGHTENING requested=%s current=%s\\n' "$limit" "$current" >&2
+      exit 125
+    fi
     IFS= read -r used < "$dir/memory.current" || fail "cannot read $dir/memory.current"
     [ "$limit" -gt "$used" ] || fail "MemoryMax=$limit is not above the whole task's current usage ($used bytes)"
     printf '%s\\n' "$limit" > "$dir/memory.max" || fail "cannot lower $dir/memory.max to $limit"

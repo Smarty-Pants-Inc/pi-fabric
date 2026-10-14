@@ -57,18 +57,25 @@ export const taskScopeProperties = (bytes: number): string[] =>
  * explicit parent release exports FABRIC_TASK_* and execs the worker; EOF,
  * parent death or any other line exits 125 before the worker is executed.
  */
-export const taskScopeShim = (gateFd: number): string => [
+export const taskScopeShim = (gateFd: number, residentAttemptId?: string): string => [
   'while IFS= read -r line; do printf "%s\\n" "$line"; done < /proc/self/cgroup > "$1.cgroup" || exit 125',
   'printf "admitted %s" "$2" > "$1" || exit 125',
   // systemd-run expands ${NAME} in its command line: this script must never use braces.
-  // Gate line: release <memory.max> <cgroup> <wrapper bin dir (last: may contain spaces)>.
-  `IFS=" " read -r verb FABRIC_TASK_MEMORY_MAX FABRIC_TASK_CGROUP wrapperbin <&${gateFd} || exit 125`,
+  // The final wrapperbin field intentionally remains greedy so TMPDIR paths with spaces stay valid.
+  // The compact, whitespace-free resident receipt precedes that trailing path field.
+  `IFS=" " read -r verb FABRIC_TASK_MEMORY_MAX FABRIC_TASK_CGROUP PI_FABRIC_RESIDENT_LAUNCH_ATTESTATION wrapperbin <&${gateFd} || exit 125`,
   `exec ${gateFd}<&-`,
   '[ "$verb" = release ] && [ -n "$FABRIC_TASK_MEMORY_MAX" ] && [ -n "$FABRIC_TASK_CGROUP" ] && [ -x "$wrapperbin/systemd-run" ] || exit 125',
   // Task-local systemd-run wrapper first on PATH: nested scopes run inside this capped boundary.
   'PATH="$wrapperbin:$PATH"',
   'FABRIC_TASK_SYSTEMD_RUN_WRAPPER="$wrapperbin/systemd-run"',
-  'export FABRIC_TASK_MEMORY_MAX FABRIC_TASK_CGROUP FABRIC_TASK_SYSTEMD_RUN_WRAPPER PATH',
+  ...(residentAttemptId ? [
+    `PI_FABRIC_RESIDENT_ATTEMPT_ID='${residentAttemptId.replaceAll("'", "'\\''")}'`,
+    'PI_FABRIC_RESIDENT_ATTEMPT_CGROUP="$FABRIC_TASK_CGROUP"',
+    'PI_FABRIC_RESIDENT_LAUNCHED_IN_SCOPE=linux-cgroup-v2',
+  ] : []),
+  '[ "$PI_FABRIC_RESIDENT_LAUNCH_ATTESTATION" != - ] || unset PI_FABRIC_RESIDENT_LAUNCH_ATTESTATION',
+  'export FABRIC_TASK_MEMORY_MAX FABRIC_TASK_CGROUP FABRIC_TASK_SYSTEMD_RUN_WRAPPER PI_FABRIC_RESIDENT_ATTEMPT_ID PI_FABRIC_RESIDENT_ATTEMPT_CGROUP PI_FABRIC_RESIDENT_LAUNCHED_IN_SCOPE PI_FABRIC_RESIDENT_LAUNCH_ATTESTATION PATH',
   'shift 2',
   'exec "$@"',
 ].join("\n");

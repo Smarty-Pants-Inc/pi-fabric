@@ -7,6 +7,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import type { ChildProcess } from "node:child_process";
 import crossSpawn from "cross-spawn";
+import { launchResidentInScope, ContainmentUnavailableError, attemptContainment, writeResidentAttestation, residentAttestationPath, releaseAttemptBoundary, type AttemptContainment, type AttemptLaunchReceipt, type AttemptMembership, type AttemptExitReceipt } from "./attempt-containment.js";
 import { observeResidentOwner, captureDescendants, stopObservedDescendants, checkResidentSessionExit, type OwnedProcess } from "./launcher-owner.js";
 import { watchResidentChild, type ResidentChildLifetime } from "./child-lifetime.js";
 import { processStartTime, residentProcessAlive } from "./process-identity.js";
@@ -24,6 +25,7 @@ import {
   type ResidentLaunchSpec, type ResidentLauncherIdentity, type ResidentHandoverPlan, type ResidentHandoverState,
 } from "./handover.js";
 import type { ResidentHostConfig, ResidentHostOwner } from "./protocol.js";
+import type { ResidentProcessIdentity } from "./handover.js";
 import { ownedStat } from "../storage/scratch.js";
 import { verifiedRemove } from "../storage/verified-remove.js";
 import type { FabricHostLease } from "../topology/host-leases.js";
@@ -70,9 +72,47 @@ interface Attempt {
   closingInput: boolean;
   processes: Map<number, OwnedProcess>;
   stderr: string;
+  attemptId?: string;
+  containment?: Awaited<ReturnType<typeof launchResidentInScope>>["handle"];
+  launchAttestation?: AttemptLaunchReceipt;
+  launchReceipt?: AttemptLaunchReceipt;
+  containmentControlAttempted?: boolean;
+  containmentControlServer?: ResidentContainmentControlServer;
+  containmentControlDisposed?: boolean;
+}
+interface ResidentContainmentControlServer {
+  attemptMembership(): Promise<AttemptMembership>;
+  joinAttemptExit(deadlineAtMs: number): Promise<AttemptExitReceipt>;
+  readonly pending: number;
+  dispose(): void;
+}
+interface ResidentContainmentControlOptions {
+  child: ChildProcess;
+  native: { exited: boolean };
+  binding: {
+    launchAttestation: AttemptLaunchReceipt;
+    launcher: ResidentLauncherIdentity;
+    child: ResidentProcessIdentity;
+    generation: string;
+  };
+  isCurrent(): boolean;
+  containment?: AttemptContainment;
 }
 const numberSetting = (value: number | undefined, fallback: number, minimum = 0): number =>
   Number.isFinite(value) ? Math.max(minimum, value!) : fallback;
+
+const disposeContainmentControl = (attempt: Attempt | undefined): void => {
+  if (!attempt?.containmentControlServer || attempt.containmentControlDisposed) return;
+  attempt.containmentControlDisposed = true;
+  // Server disposal detaches its receiver only; in-flight receipt promises keep
+  // their adapter/native custody until their own event promises settle.
+  try { attempt.containmentControlServer.dispose(); } catch { /* retirement is best effort */ }
+};
+
+const containmentControlAdapter: AttemptContainment = {
+  ...attemptContainment,
+  launchInScope: async (_spec, _attemptId) => { throw new ContainmentUnavailableError("launcher containment control is observation-only; successor launch is not authorized"); },
+};
 
 // Canonical host-leases.ts filename contract; intentionally read raw bytes rather than
 // sharing peers' cached reader. The integration tests write through writeHostLease.
@@ -225,7 +265,8 @@ function stopAttempt(attempt: Attempt): Promise<void> {
     // also be stopped through its native handle, even when its birth could not
     // be observed. Exclude it from PID-based cleanup and join both operations.
     const observed = stopObservedDescendants(attempt, attempt.child.pid);
-    const results = await Promise.allSettled([attempt.native.stop(), observed]);
+    const stopped = attempt.containment ? attempt.containment.stop() : attempt.native.stop();
+    const results = await Promise.allSettled([stopped, observed]);
     // All cleanup has settled before an error is reported to the supervisor.
     for (const result of results) if (result.status === "rejected") throw result.reason;
   })();
@@ -257,7 +298,8 @@ export const pruneResidentChildLogs = (root: string, keep: string, now = Date.no
 };
 
 /** Timing injection is only for deterministic launcher tests; production uses fixed signal deadlines. */
-export async function supervise(configPath: string, options: { signal?: AbortSignal; reportWaitMs?: number; termMs?: number; killWaitMs?: number; proofRetryMs?: number; proofChecks?: number; wakeOnly?: boolean } = {}): Promise<void> {
+export async function supervise(configPath: string, options: { signal?: AbortSignal; reportWaitMs?: number; termMs?: number; killWaitMs?: number; proofRetryMs?: number; proofChecks?: number; wakeOnly?: boolean;
+  containmentControl?: (options: ResidentContainmentControlOptions) => ResidentContainmentControlServer } = {}): Promise<void> {
   const root = path.dirname(configPath);
   const ownerPath = path.join(root, "owner.json");
   const trace = (event: string, extra: Record<string, unknown> = {}): void => {
@@ -295,11 +337,12 @@ export async function supervise(configPath: string, options: { signal?: AbortSig
   let stopping = false;
   const stop = (): void => {
     stopping = true;
+    disposeContainmentControl(current);
     if (current) void stopAttempt(current).catch((error) => writeFailure(root, error));
   };
   for (const signal of ["SIGINT", "SIGTERM"] as const) process.on(signal, stop);
   options.signal?.addEventListener("abort", stop, { once: true });
-  const start = (spec?: ResidentLaunchSpec, plan?: ResidentHandoverPlan, kind?: "target" | "fallback", frozenConfigPath?: string): Attempt => {
+  const start = async (spec?: ResidentLaunchSpec, plan?: ResidentHandoverPlan, kind?: "target" | "fallback", frozenConfigPath?: string): Promise<Attempt> => {
     const launchConfig = spec?.config ?? config;
     if (options.wakeOnly) assertResidentWakeConfig(root, launchConfig);
     const launchEntry = spec?.entry ?? entry;
@@ -326,29 +369,70 @@ export async function supervise(configPath: string, options: { signal?: AbortSig
 
     // No shell/string argv. Runtime, entry and binary were resolved in the immutable snapshot.
     const script = NODE_SCRIPT_EXTENSIONS.has(path.extname(launchConfig.piBinary).toLowerCase());
-    const child = crossSpawn(script ? runtime : launchConfig.piBinary, script ? [launchConfig.piBinary, ...args] : args, {
-      cwd: launchConfig.cwd, detached: process.platform !== "win32", stdio: ["pipe", "pipe", "pipe", "ipc"],
-      env: childProcessEnvironment({ ...process.env, NODE_OPTIONS: nodeOptions, PI_FABRIC_RESIDENT_CONFIG: snapshot,
-        PI_FABRIC_RESIDENT_LAUNCHER: spec ? JSON.stringify(launcher) : "",
-        PI_FABRIC_RESIDENT_SPEC_DIGEST: spec?.digest ?? "",
-        PI_FABRIC_RESIDENT_ATTEMPT: attemptInfo ? JSON.stringify(attemptInfo) : "",
-        // Per-attempt argument, never shared config another client may rewrite.
-        PI_FABRIC_RESIDENT_LAUNCH_TOKEN: process.argv.includes("--launch-token")
-          ? process.argv[process.argv.indexOf("--launch-token") + 1] ?? "" : "" }),
-    });
+    const attemptId = randomUUID();
+    const launchEnvironment = { ...process.env };
+    // A launcher may itself be a scoped task. Never let its parent attempt's
+    // attestation be borrowed by this child when this launch is unscoped.
+    for (const key of ["PI_FABRIC_RESIDENT_ATTEMPT_ID", "PI_FABRIC_RESIDENT_ATTEMPT_CGROUP", "PI_FABRIC_RESIDENT_LAUNCHED_IN_SCOPE", "PI_FABRIC_RESIDENT_ATTEMPT_RECEIPT", "PI_FABRIC_RESIDENT_LAUNCH_ATTESTATION"]) delete launchEnvironment[key];
+    const residentEnvironment = childProcessEnvironment({ ...launchEnvironment, NODE_OPTIONS: nodeOptions, PI_FABRIC_RESIDENT_CONFIG: snapshot,
+      PI_FABRIC_RESIDENT_LAUNCHER: spec ? JSON.stringify(launcher) : "",
+      PI_FABRIC_RESIDENT_SPEC_DIGEST: spec?.digest ?? "",
+      PI_FABRIC_RESIDENT_ATTEMPT: attemptInfo ? JSON.stringify(attemptInfo) : "",
+      PI_FABRIC_RESIDENT_LAUNCH_TOKEN: process.argv.includes("--launch-token")
+        ? process.argv[process.argv.indexOf("--launch-token") + 1] ?? "" : "" });
+    const command = script ? runtime : launchConfig.piBinary;
+    const commandArgs = script ? [launchConfig.piBinary, ...args] : args;
     const logFile = path.join(root, plan ? `child-${plan.id}-${kind}.log` : "child-stderr.log");
     pruneResidentChildLogs(root, logFile);
-    const attempt: Attempt = { ...(spec ? { spec } : {}), child, native: watchResidentChild(child),
-      startedAt: Date.now(), logFile, seenOwner: false, claimedOwner: false, closingInput: false, processes: new Map(), stderr: "" };
-    child.once("error", (error) => { trace("child-error", { message: error.message, kind }); writeFailure(root, error); });
+    let child: ChildProcess | undefined;
+    let native: ResidentChildLifetime | undefined;
+    let capturedStderr = "";
+    let attempt: Attempt | undefined;
+    const prepareChild = (spawned: ChildProcess): void => {
+      child = spawned;
+      native = watchResidentChild(spawned); // latch native exit before gated release
+      spawned.once("error", error => { trace("child-error", { message: error.message, kind }); writeFailure(root, error); });
+      for (const stream of [spawned.stdout, spawned.stderr]) stream?.on("data", (chunk: Buffer) => {
+        capturedStderr = `${capturedStderr}${chunk}`.slice(-4_000);
+        if (attempt) attempt.stderr = capturedStderr;
+        try { appendResidentLog(logFile, chunk); } catch { /* best effort */ }
+      });
+    };
+    let scoped: Awaited<ReturnType<typeof launchResidentInScope>> | undefined;
+    if (spec) {
+      residentAttestationPath(root, attemptId); // validate identity before any launch-side effect
+      try {
+        scoped = await launchResidentInScope(spec, attemptId, { env: residentEnvironment, configPath: snapshot, launcher,
+          attempt: attemptInfo, stdio: ["pipe", "pipe", "pipe", "ipc"], onSpawn: prepareChild,
+          onAdmitted: receipt => { writeResidentAttestation(root, receipt); } });
+      } catch (error) {
+        if (!(error instanceof ContainmentUnavailableError) || error.attemptStarted) throw error;
+        trace("attempt-containment-unavailable", { reason: error.reason, attemptId });
+      }
+    }
+    if (!child) {
+      const legacy = crossSpawn(command, commandArgs, { cwd: launchConfig.cwd, detached: process.platform !== "win32",
+        stdio: ["pipe", "pipe", "pipe", "ipc"], env: residentEnvironment });
+      prepareChild(legacy);
+    }
+    if (!child || !native) throw new Error("Resident launcher did not capture its child process before launch");
+    const hostChild = child;
+    const hostNative = native;
+    const activeAttempt: Attempt = { ...(spec ? { spec } : {}), child: hostChild, native: hostNative, ...(scoped ? { containment: scoped.handle,
+      launchReceipt: scoped.receipt, launchAttestation: scoped.receipt } : {}),
+      ...(scoped ? { attemptId: scoped.receipt.attemptId } : {}), startedAt: Date.now(), logFile, seenOwner: false,
+      claimedOwner: false, closingInput: false, processes: new Map(), stderr: capturedStderr };
+    attempt = activeAttempt;
+    const birth = hostChild.pid ? processStartTime(hostChild.pid) : undefined;
+    if (hostChild.pid && birth) activeAttempt.processes.set(hostChild.pid, { pid: hostChild.pid, processStartTime: birth, ppid: process.pid, state: "S" });
     if (process.connected && process.send) {
       // Report startup from this exact spawned host. Do not poll owner/readiness files.
       void waitResidentChange(root, () => {
         const owner = readOwner();
         const receipt = readWakeJson<{ token?: string }>(path.join(root, "maintenance-ready.json"));
-        return !!owner && owner.pid === child.pid && residentOwnerLive(root) && !residentOwnerSleeping(root) &&
+        return !!owner && owner.pid === hostChild.pid && residentOwnerLive(root) && !residentOwnerSleeping(root) &&
           (owner.maintenanceReady !== 1 || receipt?.token === owner.token);
-      }, 90_000, "Resident host startup pending", child).then(() => {
+      }, 90_000, "Resident host startup pending", hostChild).then(() => {
         const owner = readOwner();
         if (process.connected && process.send) process.send({ event: "resident-ready", root, token: owner?.token ?? launcher.token }, () => {});
       }, error => {
@@ -357,26 +441,25 @@ export async function supervise(configPath: string, options: { signal?: AbortSig
         trace("startup-outcome", { reason: String(error), pending: error instanceof ResidentWakePending });
       });
     }
-    void attempt.native.exit.then(({ code, signal }) => {
+    void activeAttempt.native.exit.then(({ code, signal }) => {
+      disposeContainmentControl(activeAttempt);
+      if (activeAttempt.attemptId) {
+        void attemptContainment.joinAttemptExit(activeAttempt.attemptId, Date.now() + 60_000)
+          .then(() => releaseAttemptBoundary(activeAttempt.attemptId!), error => trace("attempt-exit-unconfirmed", { attemptId: activeAttempt.attemptId, reason: String(error) }));
+      }
       // #2010: after a clean owned release this directory may already belong
       // to the next generation. Do not make a late diagnostic mutation there.
       // A very short configured idle window can release before our first owner sample.
       const idleExit = readResidentIdleExit(root, launchConfig.rootId);
-      if (code === 0 && !signal && idleExit?.pid === child.pid &&
-          (!attempt.ownerToken || idleExit?.token === attempt.ownerToken)) return;
-      if (!attempt.seenOwner || code !== 0 || signal) trace("child-exit", { pid: child.pid, code, signal, kind, seenOwner: attempt.seenOwner });
+      if (code === 0 && !signal && idleExit?.pid === hostChild.pid &&
+          (!activeAttempt.ownerToken || idleExit?.token === activeAttempt.ownerToken)) return;
+      if (!activeAttempt.seenOwner || code !== 0 || signal) trace("child-exit", { pid: hostChild.pid, code, signal, kind, seenOwner: activeAttempt.seenOwner });
     });
-    child.once("spawn", () => {
-      const birth = child.pid ? processStartTime(child.pid) : undefined;
-      if (child.pid && birth) attempt.processes.set(child.pid, { pid: child.pid, processStartTime: birth, ppid: process.pid, state: "S" });
-    });
-    for (const stream of [child.stdout, child.stderr]) stream?.on("data", (chunk: Buffer) => {
-      attempt.stderr = `${attempt.stderr}${chunk}`.slice(-4_000);
-      try { appendResidentLog(logFile, chunk); } catch { /* best effort */ }
-    });
-    trace("child-spawned", { pid: child.pid, entry: launchEntry, configPath: snapshot, digest: spec?.digest, transaction: plan?.id, kind });
-    current = attempt;
-    return attempt;
+    trace("child-spawned", { pid: hostChild.pid, entry: launchEntry, configPath: snapshot, digest: spec?.digest, transaction: plan?.id, kind,
+      ...(activeAttempt.launchAttestation ? { attemptId: activeAttempt.launchAttestation.attemptId, scope: activeAttempt.launchAttestation.scope } : {}) });
+    if (current && current !== activeAttempt) disposeContainmentControl(current);
+    current = activeAttempt;
+    return activeAttempt;
   };
   const observe = (attempt: Attempt): void => {
     const owner = readOwner();
@@ -384,6 +467,36 @@ export async function supervise(configPath: string, options: { signal?: AbortSig
     const observation = observeResidentOwner(live, attempt.child.pid, attempt.claimedOwner);
     attempt.claimedOwner = observation.claimed; attempt.seenOwner ||= observation.observedOwner;
     if (owner && owner.pid === attempt.child.pid && observation.observedOwner) attempt.ownerToken = owner.token;
+    const launchReceipt = attempt.launchReceipt;
+    const birth = attempt.child.pid ? attempt.processes.get(attempt.child.pid)?.processStartTime : undefined;
+    if (options.containmentControl && launchReceipt && birth && attempt.ownerToken && !attempt.containmentControlAttempted &&
+        owner?.token === attempt.ownerToken && owner.pid === attempt.child.pid && owner.processStartTime === birth &&
+        owner.launchAttestation?.attemptId === launchReceipt.attemptId && owner.launchAttestation.scope === launchReceipt.scope &&
+        owner.launchAttestation.cgroupPath === launchReceipt.cgroupPath && owner.launchAttestation.launchedInScope === true &&
+        owner.launchAttestation.at === launchReceipt.at) {
+      attempt.containmentControlAttempted = true;
+      const generation = attempt.ownerToken;
+      const childObject = attempt.child;
+      const binding = { launchAttestation: launchReceipt, launcher, child: { pid: childObject.pid!, processStartTime: birth }, generation };
+      try {
+        attempt.containmentControlServer = options.containmentControl({ child: attempt.child, native: attempt.native, binding,
+          isCurrent: () => {
+            if (current !== attempt || attempt.child !== childObject || attempt.launchReceipt !== launchReceipt ||
+                attempt.ownerToken !== generation || launcher.token !== binding.launcher.token ||
+                binding.launchAttestation !== launchReceipt || binding.child.pid !== childObject.pid) return false;
+            let latest: ResidentHostOwner | undefined;
+            try { latest = readOwner(); } catch { return false; }
+            // Owner absence is tolerated only after the exact native child exit;
+            // the retained private attempt object/receipt still anchors cgroup custody.
+            if (!latest) return attempt.native.exited;
+            return latest.token === generation && latest.pid === binding.child.pid &&
+              latest.processStartTime === binding.child.processStartTime && latest.launchAttestation?.attemptId === launchReceipt.attemptId &&
+              latest.launchAttestation.scope === launchReceipt.scope && latest.launchAttestation.cgroupPath === launchReceipt.cgroupPath &&
+              latest.launchAttestation.launchedInScope === launchReceipt.launchedInScope && latest.launchAttestation.at === launchReceipt.at &&
+              latest.handover?.launcher.token === binding.launcher.token;
+          }, containment: containmentControlAdapter });
+      } catch (error) { trace("attempt-containment-control-error", { attemptId: launchReceipt.attemptId, reason: String(error).slice(0, 500) }); }
+    }
     if (observation.closeInput && !attempt.closingInput) { attempt.closingInput = true; attempt.child.stdin?.end(); }
   };
   const assertFenceFree = async (inode: fs.Stats): Promise<void> => {
@@ -411,7 +524,7 @@ export async function supervise(configPath: string, options: { signal?: AbortSig
     }
     throw new Error(attempt.stderr.trim() || `Resident ${kind} did not prove worker startup`);
   };
-  let attempt = start(initial);
+  let attempt = await start(initial);
   let nextWatchdogAt = 0;
   const evidenceError = (stage: string, error: unknown): void => {
     trace("watchdog-evidence-error", { stage, reason: String(error).slice(0, 500) });
@@ -624,7 +737,7 @@ export async function supervise(configPath: string, options: { signal?: AbortSig
             validateLaunchSpec(plan.target);
             writeHandoverState(root, plan, "starting");
             targetAttempted = true;
-            attempt = start(plan.target, plan, "target");
+            attempt = await start(plan.target, plan, "target");
             await ready(attempt, plan, plan.target, "target");
             if (!mainGenerationCurrent(root, plan.main)) throw new Error("Main lost at terminal release boundary");
             terminalPublicationAttempted = true;
@@ -658,7 +771,7 @@ export async function supervise(configPath: string, options: { signal?: AbortSig
         if (stopping) { if (custodyFd !== undefined) fs.closeSync(custodyFd); return; }
         // Exactly one coherent A fallback. Never read config.json here.
         validateLaunchSpec(plan.previous);
-        attempt = start(plan.previous, plan, "fallback");
+        attempt = await start(plan.previous, plan, "fallback");
         await ready(attempt, plan, plan.previous, "fallback");
         fallbackPublicationAttempted = true;
         writeHandoverState(root, plan, "fallback", failure instanceof Error ? failure.message : String(failure));

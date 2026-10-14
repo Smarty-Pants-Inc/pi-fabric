@@ -846,8 +846,8 @@ Native artifact proof (keyless, offline real Pi RPC; no external inference):
 On a host where the check passes, each process **task** runs in its own transient
 systemd user scope with `memory.max` set to `agents.processMemoryMaxBytes` and
 swap capped at 0. The default is 24 GiB, and only root policy can change it (see
-[configuration](configuration.md)). A runaway task then hits its own OOM boundary
-instead of exhausting the host. Stopping the task stops its whole scope.
+[configuration](configuration.md)). A runaway task then hits its own OOM boundary,
+which prevents it from exhausting the host. Stopping the task stops its whole scope.
 
 To be eligible, a launch must be a task: the worker arguments carry no exact
 `--actor-id` flag. The host must also pass these checks:
@@ -912,7 +912,7 @@ Stop confirmation watches the retained owned leaf's `cgroup.events` for
 `populated 0`, which covers the whole subtree. It subscribes before the first
 read and uses one bounded deadline, not membership polling. Watch/read failures
 or a still-populated subtree raise `TaskCgroupStopUnconfirmedError` with the
-remaining pids instead of claiming success.
+remaining pids and do not report success.
 
 **Tighter limits apply to the whole task (ponytail tradeoff).** A process in a
 leaf cgroup that holds processes cannot get its own memory sub-cgroup (cgroup v2
@@ -954,7 +954,7 @@ This guard covers supported agent tools. It is **not a security sandbox**:
 - Pi's bash tool may prepend its own bin directory to `PATH`, and the check does
   not model that directory.
 
-The shim and its scratch directory live until the task boundary is really
+The shim and its scratch directory live until the task boundary is confirmed
 closed.
 
 Ponytail tradeoff: Fabric gives each task its own cap. It does not scan or

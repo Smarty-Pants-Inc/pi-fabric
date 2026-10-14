@@ -246,13 +246,33 @@ const run = async <T>(root: string, options: MeshNatsMigrationOptions, gateVersi
   } finally { if (owned) await port.close().catch(() => undefined); }
 };
 
+const MIGRATION_PUBLISH_ATTEMPTS = 3;
 const publish = async (port: JetStreamPort, subject: string, data: Uint8Array, expectLastSequence: number, msgID: string): Promise<number> => {
-  try { return (await port.publish(subject, data, { expectLastSequence, msgID })).seq; }
-  catch (error) {
-    if (error instanceof NatsWrongLastSequenceError) {
-      throw new MeshBackendRefusedError(`Fabric mesh NATS stream moved during the migration (expected last sequence ${expectLastSequence}): another writer; rerun`);
+  let outcomeUnknown = false;
+  for (let attempt = 1; attempt <= MIGRATION_PUBLISH_ATTEMPTS; attempt++) {
+    try {
+      const ack = await port.publish(subject, data, { expectLastSequence, msgID });
+      if (outcomeUnknown && ack.duplicate) return await reconcile();
+      return ack.seq;
+    } catch (error) {
+      if (error instanceof NatsWrongLastSequenceError) {
+        if (outcomeUnknown) return await reconcile();
+        throw new MeshBackendRefusedError(`Fabric mesh NATS stream moved during the migration (expected last sequence ${expectLastSequence}): another writer; rerun`);
+      }
+      if ((error as { transient?: boolean } | null)?.transient !== true) throw error;
+      outcomeUnknown = true;
+      if (attempt === MIGRATION_PUBLISH_ATTEMPTS) throw error;
     }
-    throw error;
+  }
+  throw new Error("unreachable migration publish retry state");
+
+  async function reconcile(): Promise<number> {
+    const sequence = expectLastSequence + 1;
+    const stored = await port.getMessage(subject.slice(0, subject.lastIndexOf(".")), sequence);
+    if (!stored || stored.seq !== sequence || stored.msgID !== msgID || Buffer.compare(Buffer.from(stored.data), Buffer.from(data)) !== 0) {
+      throw new MeshBackendRefusedError(`Fabric mesh NATS stream moved during the migration (expected last sequence ${expectLastSequence}): ambiguous publish at sequence ${sequence} does not exactly match; refusing`);
+    }
+    return sequence;
   }
 };
 

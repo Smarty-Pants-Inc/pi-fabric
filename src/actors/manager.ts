@@ -2666,11 +2666,18 @@ export class ActorManager {
       .map(actor => actor.id);
   }
 
-  /** Actors whose runs or drains a reload would stop (smarty-dev#1830, #2160). */
-  inFlightCount(): number {
+  #inFlightRunCount(): number {
     return [...new Set([...this.#actors.values(), ...this.#draining.values()])]
-      .filter((actor) => actor.abortController !== undefined || actor.draining).length +
-      this.#pendingCreates + this.#adoptionPending.size;
+      .filter((actor) => actor.abortController !== undefined || actor.draining).length;
+  }
+
+  /** Actors whose runs or drains a reload would stop (smarty-dev#1830, #2160). */
+  inFlightCount(): number { return this.#inFlightRunCount(); }
+
+  /** Release custody also includes accepted setup and ownership work, not additional runs. */
+  releaseCustodyCount(): number {
+    // Use the scope-local count: ActorDirectory aggregates both managers separately.
+    return this.#inFlightRunCount() + this.#pendingCreates + this.#adoptionPending.size;
   }
 
   /**
@@ -3202,7 +3209,7 @@ export class ActorManager {
 
   #assertReleaseQuiet(epoch: number, assertHeld?: () => void): void {
     assertHeld?.();
-    if (!this.#releasePaused || epoch !== this.#releaseEpoch || this.inFlightCount() || this.#pendingResets.size ||
+    if (!this.#releasePaused || epoch !== this.#releaseEpoch || this.releaseCustodyCount() || this.#pendingResets.size ||
         this.#removals.size || this.#removeCalls.size || this.#finishCalls.size || this.pendingRemovals().length ||
         [...this.#pendingHandoffConsumption.values()].some(ids => ids.size) ||
         [...this.#pendingRunArchives.values()].some(ids => ids.size)) {
@@ -3235,7 +3242,10 @@ export class ActorManager {
       bytes += contents === undefined ? 0 : Buffer.byteLength(contents);
       if (files.size >= 10_000 || bytes > 16 * 1024 * 1024) throw new Error("Actor release readback exceeds bounded custody snapshot");
       if (durable && contents !== undefined) {
-        const fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+        // FlushFileBuffers requires write access on Windows; a read-only handle
+        // fails before wake-config admission even though the saved bytes are valid.
+        const access = process.platform === "win32" ? fs.constants.O_RDWR : fs.constants.O_RDONLY;
+        const fd = fs.openSync(file, access | (fs.constants.O_NOFOLLOW ?? 0));
         try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
         syncDirectoryChain(path.dirname(file));
       }

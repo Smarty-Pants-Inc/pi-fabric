@@ -28,6 +28,7 @@ export class ActorDirectory extends ActorManager {
   readonly #defaultScope: FabricActorStorageScope;
   readonly #sessionOrphans: SessionActorOrphans | undefined;
   #orphanReconcilePending: Promise<number> | undefined;
+  #orphanReconcileHeld = false;
   #releaseCheckpointReady = false;
 
   constructor(
@@ -69,6 +70,7 @@ export class ActorDirectory extends ActorManager {
       actorScope: secondaryScope,
     });
     this.#defaultScope = defaultScope;
+    this.#orphanReconcileHeld = options.releasePaused === true;
     this.#sessionOrphans = persistent && base[3].enabled
       // A resident host outlives Main and must also observe Main's own private
       // session registry. A Main never repairs its current session's records.
@@ -130,7 +132,7 @@ export class ActorDirectory extends ActorManager {
   }
   #localActors(): FabricActorInfo[] { return [...super.list(), ...this.#secondary.list()]; }
   override reconcileSessionOrphans(): Promise<number> {
-    if (this.releaseAdmissionHeld || !this.#sessionOrphans) return Promise.resolve(0);
+    if (this.#orphanReconcileHeld || this.releaseAdmissionHeld || !this.#sessionOrphans) return Promise.resolve(0);
     if (this.#orphanReconcilePending) return this.#orphanReconcilePending;
     const pending = this.#sessionOrphans.reconcile().finally(() => {
       if (this.#orphanReconcilePending === pending) this.#orphanReconcilePending = undefined;
@@ -221,7 +223,10 @@ export class ActorDirectory extends ActorManager {
   /** Both scopes: a reload stops a session-scope actor's run as well (review/astra round 2 on #158). */
   override inFlightActorIds(): string[] { return [...super.inFlightActorIds(), ...this.#secondary.inFlightActorIds()]; }
   override reportStuckPreparing(...args: Parameters<ActorManager["reportStuckPreparing"]>): number { return super.reportStuckPreparing(...args) + this.#secondary.reportStuckPreparing(...args); }
-  override inFlightCount(): number { return super.inFlightCount() + this.#secondary.inFlightCount() + (this.#orphanReconcilePending ? 1 : 0); }
+  override inFlightCount(): number { return super.inFlightCount() + this.#secondary.inFlightCount(); }
+  override releaseCustodyCount(): number {
+    return super.releaseCustodyCount() + this.#secondary.releaseCustodyCount() + (this.#orphanReconcilePending ? 1 : 0);
+  }
   override haltAll(): { halted: number } {
     return { halted: haltEvery([() => super.haltAll().halted, () => this.#secondary.haltAll().halted]) };
   }
@@ -242,10 +247,14 @@ export class ActorDirectory extends ActorManager {
   override get releaseAdmissionHeld(): boolean { return super.releaseAdmissionHeld && this.#secondary.releaseAdmissionHeld; }
   override pauseForRelease(options: Parameters<ActorManager["pauseForRelease"]>[0] = {}): void {
     this.#releaseCheckpointReady = false;
+    // Even an activation-only pause must prevent read-triggered reconciliation
+    // from opening fresh custody while the directory joins its prior checkpoint work.
+    this.#orphanReconcileHeld = true;
     super.pauseForRelease(options); this.#secondary.pauseForRelease(options);
   }
   override resumeAfterRelease(): void {
     this.#releaseCheckpointReady = false;
+    this.#orphanReconcileHeld = false;
     super.resumeAfterRelease(); this.#secondary.resumeAfterRelease();
   }
   override withReleaseAdmission<T>(admit: () => T): T {

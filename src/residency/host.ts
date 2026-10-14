@@ -1685,7 +1685,7 @@ export class ResidentHost {
   // activation work; every idle-exit boundary still uses the full custody count.
   #hasHostWork(includeActorCustody = true): boolean {
     return this.#wakeRecoveryPending !== undefined || residentProcessWorkPending(this.processWorkSessionId) || this.#admissions > 0 || this.#boundaryRequests.size > 0 ||
-      this.#publicationFailed || (includeActorCustody ? this.actors.inFlightCount() > 0 : this.actors.inFlightActorIds().length > 0) ||
+      this.#publicationFailed || (includeActorCustody ? this.actors.releaseCustodyCount() > 0 : this.actors.inFlightActorIds().length > 0) ||
       this.agents.listForUi().some(agent => agent.status === "queued" || agent.status === "running") ||
       [this.#requestsPath, this.#processingPath].some(directory => {
         try { return fs.readdirSync(directory).some(entry => entry.endsWith(".json")); }
@@ -2132,7 +2132,7 @@ export class ResidentHost {
     if (this.#pollingRequests || this.#drainCheckpointPending) return;
     try {
       this.#drainStillCurrent(held);
-      if (this.#admissions || this.#boundaryRequests.size || this.actors.inFlightCount() || this.actors.pendingRemovals().length ||
+      if (this.#admissions || this.#boundaryRequests.size || this.actors.releaseCustodyCount() || this.actors.pendingRemovals().length ||
           residentProcessWorkPending(this.processWorkSessionId) || this.#publications.size || this.#flushingDeliveries ||
           this.agents.listForUi().some(agent => agent.status === "queued" || agent.status === "running") ||
           fs.readdirSync(this.#processingPath).some(entry => entry.endsWith(".json"))) return;
@@ -2178,7 +2178,7 @@ export class ResidentHost {
     this.#drainStillCurrent(held);
     // Quiet is evidence after real synchronous gates and joins, never a replacement admission boundary.
     if (this.#admissions || this.#boundaryRequests.size || this.#publications.size || this.#flushingDeliveries ||
-        this.actors.inFlightCount() || this.actors.pendingRemovals().length ||
+        this.actors.releaseCustodyCount() || this.actors.pendingRemovals().length ||
         this.agents.listForUi().some(agent => agent.status === "queued" || agent.status === "running")) throw new Error("Resident drain quiet changed during checkpoint");
     held.receipt = { ...held.receipt, phase: "checkpointed", outcome: "checkpointed", code: "DRAIN_CHECKPOINTED",
       reason: "Held queues, registry and receipt obligations checkpointed and read back", at: Date.now(),
@@ -2327,7 +2327,7 @@ export class ResidentHost {
         this.#cancelRelease(plan, "Release drain timed out without cutting a run"); return;
       }
       if (fs.readdirSync(this.#processingPath).some((entry) => entry.endsWith(".json"))) return;
-      if (this.#admissions || this.actors.inFlightCount() || this.actors.pendingRemovals().length ||
+      if (this.#admissions || this.actors.releaseCustodyCount() || this.actors.pendingRemovals().length ||
           this.agents.listForUi().some((agent) => agent.status === "queued" || agent.status === "running")) return;
       const state = readHandoverJson<ResidentHandoverState>(handoverPath(this.config.residencyRoot));
       if (state?.plan.id !== plan.id) throw new Error("Resident release transaction changed");

@@ -1,6 +1,5 @@
 import fs from "node:fs";
 import http from "node:http";
-import os from "node:os";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
@@ -17,6 +16,7 @@ import type { ResidentMainGeneration, ResidentLaunchSpec } from "../src/residenc
 import { RESIDENT_DRAIN_ABI, residentDrainReceiptPath, type ResidentDrainReceipt } from "../src/residency/drain.js";
 import type { ResidentDrainReceipt as CliReceipt } from "../src/resident-drain-cli.js";
 import { launchLog, same } from "./helpers/owned-processes.js";
+import { residentDrainTemp } from "./helpers/resident-drain-temp.js";
 
 // Keep: native trust boundary and accepted-work data safety (#11962). This is
 // deliberately NOT an A->B success test. B is a separately retained real build,
@@ -193,7 +193,8 @@ describe.skipIf(process.platform !== "linux")("compiled cooperative drain preser
     const oldInput = process.env.OLD_RELEASE ?? process.env.FABRIC_DRAIN_TEST_OLD_RELEASE;
     const newInput = process.env.NEW_RELEASE ?? process.env.FABRIC_DRAIN_TEST_NEW_RELEASE;
     const oldRelease = fs.realpathSync(oldInput ?? repo);
-    const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), `resident-drain-cooperative-${mode}-`)));
+    const privateTemp = residentDrainTemp(`resident-drain-cooperative-${mode}-`);
+    const { root } = privateTemp;
     // Hosted CI has one fresh build. Its target is a physically separate retained
     // copy of that real build, not dummy JS, hardlinks or a symlinked dist. Main's
     // explicit proof instead supplies TWO independently rebuilt frozen roots.
@@ -219,8 +220,9 @@ describe.skipIf(process.platform !== "linux")("compiled cooperative drain preser
     }
     const aWorker = fs.statSync(realWorker); const bWorker = fs.statSync(path.join(targetRelease, "dist/worker.js"));
     expect(`${aWorker.dev}:${aWorker.ino}`, "B must be a separate retained artifact, not A hard-linked/aliased").not.toBe(`${bWorker.dev}:${bWorker.ino}`);
-    // Preserve Main's supplied local recording preload; never erase it to run a
-    // native child. The scope wrapper's TMPDIR and this exact owned root are allowed.
+    // Preserve every inherited preload, including an explicitly supplied recorder.
+    // Only main's guard ceiling is narrowed to this fixture's mutable work root;
+    // its private HOME is a sibling, never part of the permitted deletion tree.
     const inheritedOptions = process.env.NODE_OPTIONS ?? "";
     const recording = process.env.FABRIC_DRAIN_RECORDING_PATH ??
       inheritedOptions.match(/--import(?:=|\s+)([^\s]*record-removals\.mjs)/)?.[1];
@@ -267,14 +269,18 @@ describe.skipIf(process.platform !== "linux")("compiled cooperative drain preser
     };
     const observation = observeFixture(root, capture); const until = observation.until;
     const registry = new ActorRegistryStore(config.actorRoot);
-    const env: NodeJS.ProcessEnv = Object.fromEntries(["PATH", "TMPDIR", "LANG", "LC_ALL"].flatMap(key =>
+    const env: NodeJS.ProcessEnv = Object.fromEntries(["PATH", "LANG", "LC_ALL", "GITHUB_ACTIONS", "CI"].flatMap(key =>
       process.env[key] === undefined ? [] : [[key, process.env[key]]]));
-    Object.assign(env, owned.env, { HOME: root, PI_OFFLINE: "1", PI_CODING_AGENT_DIR: agentDir,
+    const childIsolation = privateTemp.childEnvironment(owned.env.NODE_OPTIONS!);
+    Object.assign(env, owned.env, childIsolation, { PI_OFFLINE: "1", PI_CODING_AGENT_DIR: agentDir,
       FABRIC_DRAIN_RECORD_ROOT: root, PI_FABRIC_MESH_ROOT: meshRoot, PI_FABRIC_PROJECT_ROOT: root,
       PI_FABRIC_RUN_ROOT: path.join(root, "runs"), PI_FABRIC_AGENT_DIR: path.join(root, "exports"),
       PI_FABRIC_PI_BINARY: piBinary, PI_FABRIC_NODE_BINARY: node });
-    // launchLog.env already combines inherited NODE_OPTIONS with its own preload.
-    if (inheritedOptions) expect(env.NODE_OPTIONS).toContain(inheritedOptions);
+    // No report-mode spoofing or dropped guard/recording preload. The helper
+    // verifies the original physical ceiling before making it strictly narrower.
+    expect(env.GITHUB_ACTIONS).toBe(process.env.GITHUB_ACTIONS);
+    expect(env.NODE_OPTIONS).toContain("test-deletion-guard.mjs");
+    if (recording) expect(env.NODE_OPTIONS).toContain(recording);
     expect(env.NODE_OPTIONS).toContain("launch-preload.mjs");
     const requests: Array<{ index: number; at: number; method: string | undefined; url: string | undefined; model: string; messages: unknown; tools: unknown }> = [];
     const responses = new Map<number, http.ServerResponse>(); const pending = new Set<http.ServerResponse>();
@@ -369,7 +375,11 @@ describe.skipIf(process.platform !== "linux")("compiled cooperative drain preser
       mainChild = spawn(node!, [mainEntry, setupFile], { cwd: root, env, stdio: ["ignore", "ignore", "pipe", "ipc"] });
       mainLifetime = watchResidentChild(mainChild); const rpc = mainRpc(mainChild, observation.wake);
       mainChild.stderr!.on("data", chunk => { stderr = `${stderr}\nMain: ${chunk}`.slice(-18000); });
-      await until(() => fs.existsSync(path.join(root, "main-ready.json")), "real Main participant/control readiness");
+      void mainLifetime.exit.then(observation.wake);
+      await until(() => {
+        if (mainLifetime!.exited) throw new Error(`Real Main exited before readiness: ${stderr}`);
+        return fs.existsSync(path.join(root, "main-ready.json"));
+      }, "real Main participant/control readiness");
       const mainReady = readJson<{ main: ResidentMainGeneration }>(path.join(root, "main-ready.json"));
       await until(() => owned.owned().some(record => record.pid === mainChild!.pid), "Main self-recorded birth");
       const mainBirth = owned.owned().find(record => record.pid === mainChild!.pid)!;
@@ -621,11 +631,14 @@ describe.skipIf(process.platform !== "linux")("compiled cooperative drain preser
           localRecording: !!recording, recordedRemovals };
         observation.close(); fs.writeFileSync(path.join(root, "cleanup.json"), JSON.stringify(cleanup, null, 2));
         for (const name of ["proof.json", "cleanup.json", "failure.json", "actor-history.json", "drain-snapshots.json", "main-ready.json",
-          "main-compile.json", "provider-requests.jsonl", "launches.jsonl", "queue-before.json", "held-producer.json", "recorded-removals.json"]) preserve(path.join(root, name), name);
+          "main-compile.json", "provider-requests.jsonl", "launches.jsonl", "queue-before.json", "held-producer.json", "recorded-removals.json",
+          "deletion-guard-audit.jsonl"]) preserve(path.join(root, name), name);
         commands.forEach((_, index) => preserve(path.join(root, `cli-${index + 1}.json`), `cli-${index + 1}.json`));
         preserve(path.join(config.residencyRoot, "launcher.log"), "launcher.log");
         preserve(path.join(config.residencyRoot, "child-stderr.log"), "child-stderr.log");
         expect(liveFixturePids, "fixture-owned native processes must be quiescent after cleanup").toEqual([]);
+        if (mainChild) expect(fs.existsSync(path.join(root, "deletion-guard-audit.jsonl")), "real children must validate and audit the standard guard").toBe(true);
+        privateTemp.assertNoOutsideDeletion(); // Hosted reports fail too, not just local refusals.
         if (fs.existsSync(path.join(root, "proof.json"))) {
           const finalProof = { ...readJson<Record<string, unknown>>(path.join(root, "proof.json")), cleanup };
           fs.writeFileSync(path.join(root, "proof.json"), JSON.stringify(finalProof, null, 2)); preserve(path.join(root, "proof.json"), "proof.json");

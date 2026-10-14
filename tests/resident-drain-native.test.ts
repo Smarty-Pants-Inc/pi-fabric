@@ -1,6 +1,5 @@
 import fs from "node:fs";
 import http from "node:http";
-import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -19,6 +18,7 @@ import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import type { ResidentDrainReceipt } from "../src/resident-drain-cli.js";
 import { liveControlOwnerIncarnation } from "./helpers/live-control-owner.js";
 import { launchLog, same } from "./helpers/owned-processes.js";
+import { residentDrainTemp } from "./helpers/resident-drain-temp.js";
 
 const repo = fileURLToPath(new URL("../", import.meta.url));
 const live = (pid: number): boolean => {
@@ -79,7 +79,8 @@ const cases = [
 describe.skipIf(process.platform !== "linux")("compiled resident-drain refuses missing Main authority or legacy attestation without disturbing accepted work", () => {
   it.each(cases)("$mode real worker refuses $code and remains serving", async ({ mode, code }) => {
     const oldRelease = fs.realpathSync(process.env.FABRIC_DRAIN_TEST_OLD_RELEASE ?? process.env.OLD_RELEASE ?? repo);
-    const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), `resident-drain-native-${mode}-`)));
+    const privateTemp = residentDrainTemp(`resident-drain-native-${mode}-`);
+    const { root } = privateTemp;
     const targetInput = process.env.FABRIC_DRAIN_TEST_NEW_RELEASE ?? process.env.NEW_RELEASE;
     const defaultTarget = path.join(root, "target-release");
     if (!targetInput) {
@@ -187,14 +188,16 @@ describe.skipIf(process.platform !== "linux")("compiled resident-drain refuses m
     // Positive allowlist: unrelated API credentials and SMARTY/fleet state are
     // absent, not merely filtered by a namespace. The only provider credential
     // is the ephemeral loopback key in this fixture's models.json.
-    const env: NodeJS.ProcessEnv = Object.fromEntries(["PATH", "TMPDIR", "LANG", "LC_ALL"].flatMap(key =>
+    const env: NodeJS.ProcessEnv = Object.fromEntries(["PATH", "LANG", "LC_ALL", "GITHUB_ACTIONS", "CI"].flatMap(key =>
       process.env[key] === undefined ? [] : [[key, process.env[key]]]));
-    // launchLog combines Main's local recording NODE_OPTIONS with its own preload.
-    // Preserve both; do not turn a local native proof into real deletion execution.
-    Object.assign(env, owned.env, { FABRIC_DRAIN_RECORD_ROOT: root,
-      HOME: root, PI_OFFLINE: "1", PI_CODING_AGENT_DIR: agentDir, PI_FABRIC_MESH_ROOT: meshRoot,
+    // Preserve all preloads; narrow only the standard guard's physical ceiling.
+    // HOME is a private sibling of the mutable work/temp tree, never inside it.
+    Object.assign(env, owned.env, privateTemp.childEnvironment(owned.env.NODE_OPTIONS!), { FABRIC_DRAIN_RECORD_ROOT: root,
+      PI_OFFLINE: "1", PI_CODING_AGENT_DIR: agentDir, PI_FABRIC_MESH_ROOT: meshRoot,
       PI_FABRIC_PROJECT_ROOT: root, PI_FABRIC_RUN_ROOT: path.join(root, "runs"), PI_FABRIC_AGENT_DIR: path.join(root, "exports"),
       PI_FABRIC_PI_BINARY: piBinary, PI_FABRIC_NODE_BINARY: node });
+    expect(env.GITHUB_ACTIONS).toBe(process.env.GITHUB_ACTIONS);
+    expect(env.NODE_OPTIONS).toContain("test-deletion-guard.mjs");
     let launcher: ReturnType<typeof spawn> | undefined;
     let lifetime: ReturnType<typeof watchResidentChild> | undefined;
     let stderr = "";
@@ -392,6 +395,8 @@ describe.skipIf(process.platform !== "linux")("compiled resident-drain refuses m
         fs.writeFileSync(path.join(root, "cleanup.json"), JSON.stringify(cleanup, null, 2));
         preserve(path.join(root, "cleanup.json"), "cleanup.json");
         expect(liveFixturePids, "only fixture-owned processes must be quiescent after native cleanup").toEqual([]);
+        if (launcher) expect(fs.existsSync(path.join(root, "deletion-guard-audit.jsonl")), "native children must validate and audit the standard guard").toBe(true);
+        privateTemp.assertNoOutsideDeletion(); // Hosted reports fail too, not just local refusals.
         if (fs.existsSync(path.join(root, "proof.json"))) {
           const finalProof = { ...readJson<Record<string, unknown>>(path.join(root, "proof.json")), cleanup };
           fs.writeFileSync(path.join(root, "proof.json"), JSON.stringify(finalProof, null, 2));
@@ -408,7 +413,7 @@ describe.skipIf(process.platform !== "linux")("compiled resident-drain refuses m
             fs.appendFileSync(proofOut, JSON.stringify(finalProof) + "\n");
           }
         }
-        for (const name of ["proof.json", "cleanup.json", "failure.json", "provider-requests.jsonl", "launches.jsonl", "queue-before.json"]) {
+        for (const name of ["proof.json", "cleanup.json", "failure.json", "provider-requests.jsonl", "launches.jsonl", "queue-before.json", "deletion-guard-audit.jsonl"]) {
           preserve(path.join(root, name), name);
         }
         preserve(path.join(config.residencyRoot, "launcher.log"), "launcher.log");

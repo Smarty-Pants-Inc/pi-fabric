@@ -14,13 +14,13 @@ import { residentLaunchSpec, mainGenerationPath, assertAutomaticReleaseRecovery,
   handoverStagedReadyPath, writeResidentStagedReadyReceipt, type ResidentStagedReadyReceipt, type ResidentMainGeneration } from "../src/residency/handover.js";
 import { RESIDENT_DRAIN_ABI, readResidentDrainReceipt, residentDrainReceiptPath, type ResidentDrainIntent, type ResidentDrainReceipt } from "../src/residency/drain.js";
 import { failClosedContainment, ContainmentUnavailableError, AttemptExitUnconfirmedError, type AttemptContainment, type AttemptLaunchReceipt } from "../src/residency/attempt-containment-contract.js";
+import { residentDrainTemp } from "./helpers/resident-drain-temp.js";
 
 // Keep reason: trust boundaries and data safety. These use the real host/file command
 // path with live birth-bound Main publication and retained artifacts. No B/worker is
 // launched, no live root is touched, and no native removal implementation is called.
-if (process.platform === "linux" && !process.env.NODE_OPTIONS?.includes("record-removals.mjs")) {
-  throw new Error("Endpoint safety tests require the recording removal preload; native deletion is forbidden");
-}
+// Main's setup installs the deletion guard before imports; fixtures below require
+// its pinned private temp, not a bespoke recording preload or external root.
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); });
 
 function recordLaunchAttestation(root: string, receipt: AttemptLaunchReceipt): void {
@@ -57,7 +57,8 @@ const deferred = () => {
 };
 async function fixture(containment: AttemptContainment = failClosedContainment, launchAttestation?: AttemptLaunchReceipt,
   recordedAttestation: AttemptLaunchReceipt | null | undefined = launchAttestation) {
-  const root = fs.realpathSync(fs.mkdtempSync(path.join(process.env.FABRIC_DRAIN_RECORD_ROOT ?? os.tmpdir(), "fabric-drain-endpoint-")));
+  const privateTemp = residentDrainTemp("fabric-drain-endpoint-");
+  const { root } = privateTemp;
   const a = path.join(root, "A"), b = path.join(root, "B");
   for (const release of [a, b]) {
     fs.mkdirSync(path.join(release, "dist/residency"), { recursive: true });
@@ -117,7 +118,10 @@ async function fixture(containment: AttemptContainment = failClosedContainment, 
     return watchJson<ResidentDrainReceipt>(residentDrainReceiptPath(config.residencyRoot, receipt.id), value => value.terminal === true);
   }
   return { root, a, b, config, host, participants, mesh, previous, target, owner, ownerPath, intent, main, idle, sentinel,
-    send, drain, terminal, close: async () => { await host.close(); await participants.close(); mesh.closeState(); } };
+    send, drain, terminal, close: async () => {
+      try { await host.close(); await participants.close(); mesh.closeState(); }
+      finally { privateTemp.assertNoOutsideDeletion(); }
+    } };
 }
 
 describe.skipIf(process.platform !== "linux")("owner-authenticated cooperative resident endpoint", () => {

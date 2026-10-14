@@ -127,6 +127,30 @@ describe("resident dormancy (smarty-dev#6782 / #2264)", () => {
     } finally { await host.close(); vi.restoreAllMocks(); fs.rmSync(root, { recursive: true, force: true }); }
   });
 
+  it("checkpoints the dormant wake receiver with a Windows-compatible file flush handle", async () => {
+    const { root, config, host } = fixture();
+    try {
+      await host.start();
+      const actor = await host.actors.create({ name: "flush-receiver", instructions: "wait", residency: "durable" });
+      await until(() => host.actors.status(actor.id).status === "dormant");
+      const opened = vi.spyOn(fs, "openSync");
+      host.actors.pauseForRelease();
+      await host.actors.checkpointForRelease();
+      const registry = path.join(config.actorRoot, "actors.json");
+      const access = process.platform === "win32" ? fs.constants.O_RDWR : fs.constants.O_RDONLY;
+      expect(opened.mock.calls.filter(([file]) => file === registry).map(([, flags]) => flags))
+        .toContain(access | (fs.constants.O_NOFOLLOW ?? 0));
+      expect(host.actors.releaseCheckpointReceipt()).toMatchObject({ project: {
+        files: expect.arrayContaining([expect.objectContaining({ file: registry, present: true })]),
+      } });
+      expect(new ActorRegistryStore(config.actorRoot).records().find(row => row.id === actor.id)?.status).toBe("dormant");
+      await host.close();
+      const launch = vi.fn(async () => {});
+      await requestResidentWake(config.residencyRoot, { id: "after-flush" }, launch);
+      expect(launch).toHaveBeenCalledOnce();
+    } finally { vi.restoreAllMocks(); await host.close(); fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
   it.skipIf(process.platform === "win32")("rechecks exact config before every delivery-owned successor", async () => {
     const { root, config, host } = fixture();
     const file = path.join(config.residencyRoot, "config.json");
@@ -567,12 +591,9 @@ describe("resident dormancy (smarty-dev#6782 / #2264)", () => {
       prove();
       await host.participants.refreshPresence();
       expect(host.actors.status(actor.id).status).not.toBe("dormant");
-      // status() starts owned orphan reconciliation; join it before checking the actor-run count.
-      await host.actors.reconcileSessionOrphans();
       expect(host.actors.inFlightCount()).toBe(1);
       finish();
       await until(() => host.actors.status(actor.id).status === "dormant");
-      await host.actors.reconcileSessionOrphans();
       expect(host.actors.inFlightCount()).toBe(0);
       expect(runs).toHaveBeenCalledTimes(1);
       expect(runs.mock.calls[0]![0].task).toContain("exactly one racing delivery");

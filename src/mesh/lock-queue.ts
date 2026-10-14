@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { verifiedRemove } from "../storage/verified-remove.js";
 
 /** Advisory receipts live beside, never inside, the mesh's data namespace.
  * Canonical paths make symlink aliases share admission; the mesh's parent (not
@@ -127,13 +128,19 @@ export class MeshLockTicket {
   }
 
   /** False when the receipt is gone; a dead or stale one is reaped. Names are unique and never
-   * reused, so unlink cannot remove a successor. */
+   * reused, so unlink cannot remove a successor. smarty-dev#8907: only the receipt inode judged here, with its judged
+   * mtime, is removed: one refreshed (a head's heartbeat) or replaced since stays, and is still waited on. */
   #waitingOn(name: string): boolean {
     const file = path.join(this.#directory, name);
     try {
-      const stat = fs.statSync(file);
+      const stat = fs.lstatSync(file);
       if (pidAlive(name) && Date.now() - stat.mtimeMs <= this.#staleMs) return true;
-      fs.unlinkSync(file);
+      // A receipt is a regular file (main unlinked it; an unlink never removes a directory): anything else is kept and
+      // waited on, never handed to a recursive removal. verifiedRemove's `.retention-graveyard-*` never matches TICKET.
+      if (!stat.isFile()) return true;
+      if (!verifiedRemove(file, stat, { deleter: "meshLockQueueReceipt", fallback: () => { fs.unlinkSync(file); return true; } }).removed) {
+        return fs.lstatSync(file, { throwIfNoEntry: false }) !== undefined;
+      }
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     }
@@ -247,6 +254,8 @@ export class MeshLockTicket {
     if (this.#closed) return;
     this.#closed = true;
     // Never throws (pi-fabric#936 round 3): a writer's cleanup must always finish; an unremovable receipt goes stale.
+    // ponytail (smarty-dev#8907): no judgment precedes this. `#file` is this ticket's own receipt (hrtime-pid-uuid,
+    // created `wx` by this ticket, never reused or renamed); no other writer can put another inode at that name.
     try { fs.rmSync(this.#file, { force: true }); } catch { /* left to stale reaping */ }
     // Keep the empty directory OUTSIDE the mesh: removing/recreating it races enqueue.
   }

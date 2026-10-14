@@ -17,6 +17,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { performance } from "node:perf_hooks";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -135,9 +136,18 @@ const settle = <T>(promise: Promise<T>) => {
 
 // Keep reason: #1136 cancellation at the pre-publication trust boundary. Observe genuine
 // fs watches/timers, not fake notifications or clocks; no extra polling drives these checks.
-const observeLeaseWait = (root: string, controller: AbortController, abortDuringArm = false) => {
+const observeLeaseWait = (directory: ParticipantDirectory, controller: AbortController, abortDuringArm = false) => {
+  const root = directory.mesh.root;
   const realWatch = fs.watch;
+  const realResolve = directory.resolveRoutingLease.bind(directory);
+  // Existing control-plane watches share this root, and Windows can deliver their
+  // mkdir notifications after the lease wait is armed. Track ownership, not the
+  // path alone: async context also includes children rebound by this wait's watch.
+  const ownership = new AsyncLocalStorage<boolean>();
+  vi.spyOn(directory, "resolveRoutingLease").mockImplementation((...args) =>
+    ownership.run(true, () => realResolve(...args)));
   const watchers: fs.FSWatcher[] = [];
+  const foreignWatchers: fs.FSWatcher[] = [];
   const timers: Array<ReturnType<typeof setTimeout>> = [];
   let armed!: () => void;
   const ready = new Promise<void>(resolve => { armed = resolve; });
@@ -145,8 +155,10 @@ const observeLeaseWait = (root: string, controller: AbortController, abortDuring
     const watcher = Reflect.apply(realWatch, fs, args) as fs.FSWatcher;
     if (String(args[0]) === root || String(args[0]).startsWith(root + path.sep)) {
       vi.spyOn(watcher, "close");
-      watchers.push(watcher);
-      if (abortDuringArm && !controller.signal.aborted) controller.abort("cancel during watch setup");
+      if (ownership.getStore()) {
+        watchers.push(watcher);
+        if (abortDuringArm && !controller.signal.aborted) controller.abort("cancel during watch setup");
+      } else foreignWatchers.push(watcher);
     }
     return watcher;
   }) as typeof fs.watch);
@@ -159,13 +171,14 @@ const observeLeaseWait = (root: string, controller: AbortController, abortDuring
   const added = vi.spyOn(controller.signal, "addEventListener");
   const removed = vi.spyOn(controller.signal, "removeEventListener");
   const assertClean = () => {
+    if (timers.length > 0) expect(watchers.length).toBeGreaterThan(0);
     for (const watcher of watchers) expect(watcher.close).toHaveBeenCalledOnce();
     for (const timer of timers) expect(cleared).toHaveBeenCalledWith(timer);
     for (const [event, listener] of added.mock.calls) {
       if (event === "abort") expect(removed).toHaveBeenCalledWith("abort", listener);
     }
   };
-  return { ready, watchers, timers, assertClean };
+  return { ready, watchers, foreignWatchers, timers, assertClean };
 };
 const invocation = (signal: AbortSignal) => ({ signal } as FabricInvocationContext);
 
@@ -181,6 +194,42 @@ const invokingProvider = (w: Awaited<ReturnType<typeof world>>, mainMatch = fals
 };
 
 describe("F-001 provider invocation mirror wait", () => {
+  it("observes only lease-wait cleanup when an existing control watch binds a child after renewal", async () => {
+    const realWatch = fs.watch;
+    const delayed: Array<{ root: string; notify: () => void }> = [];
+    // Windows may deliver the initial host-leases mkdir notification only during
+    // renewal. Hold that genuine watcher callback to reproduce the ordering on Linux.
+    const pendingNotices = vi.spyOn(fs, "watch").mockImplementation(((...args: unknown[]) => {
+      const callback = args.at(-1) as (event: string, name: string | Buffer | null) => void;
+      const root = String(args[0]);
+      const held = (event: string, name: string | Buffer | null) => {
+        if (String(name) === "host-leases") delayed.push({ root, notify: () => callback(event, name) });
+        else callback(event, name);
+      };
+      return Reflect.apply(realWatch, fs, [...args.slice(0, -1), held]) as fs.FSWatcher;
+    }) as typeof fs.watch);
+    const w = await world();
+    await waitFor(() => delayed.some(notice => notice.root === w.hub.root));
+    pendingNotices.mockRestore();
+    const controller = new AbortController();
+    const resources = observeLeaseWait(w.hubDirectory, controller);
+    const pending = invokingProvider(w).invoke("status", { id: w.target.identity.id }, invocation(controller.signal));
+    await resources.ready;
+    for (const notice of delayed.filter(notice => notice.root === w.hub.root)) notice.notify();
+    expect(resources.foreignWatchers.length).toBeGreaterThan(0);
+    // Also require ownership to follow a child created AFTER arming, rather than
+    // merely snapshotting the initial watchers and missing a real wait-owned leak.
+    const initiallyOwned = resources.watchers.length;
+    fs.mkdirSync(path.join(w.hub.root, "participants"));
+    await waitFor(() => resources.watchers.length > initiallyOwned);
+    await w.bridge.syncPresence();
+    await expect(pending).resolves.toMatchObject({ id: w.target.identity.id, remoteHost: "forge" });
+    resources.assertClean();
+    // The lease wait must not close the sender's long-lived control watches.
+    for (const watcher of resources.foreignWatchers) expect(watcher.close).not.toHaveBeenCalled();
+    expect(on(w.hub, "fabric.control.command")).toEqual([]);
+  }, 20_000);
+
   it.each([
     ["status-main", "status", true, "bootstrap"],
     ["status-main", "status", true, "lookup"],
@@ -194,7 +243,7 @@ describe("F-001 provider invocation mirror wait", () => {
     if (entry === "lookup") await w.hubDirectory.refreshRoutingView();
     const provider = invokingProvider(w, mainMatch);
     const controller = new AbortController();
-    const resources = observeLeaseWait(w.hub.root, controller);
+    const resources = observeLeaseWait(w.hubDirectory, controller);
     const pending = provider.invoke(action, { id: w.target.identity.id, thinking: "high", message: "never publish" }, invocation(controller.signal));
     const state = settle(pending); // Attach rejection observation before abort, including on old source.
     await resources.ready;
@@ -213,7 +262,7 @@ describe("F-001 provider invocation mirror wait", () => {
   it.each([true, false])("F-001 non-cancelled status mainMatch=%s returns the same-owner renewed root", async mainMatch => {
     const w = await world();
     const controller = new AbortController();
-    const resources = observeLeaseWait(w.hub.root, controller);
+    const resources = observeLeaseWait(w.hubDirectory, controller);
     const pending = invokingProvider(w, mainMatch).invoke("status", { id: w.target.identity.id }, invocation(controller.signal));
     const state = settle(pending);
     await resources.ready;
@@ -230,7 +279,7 @@ describe("F-001 provider invocation mirror wait", () => {
   it("F-001 actor mismatch still refuses a Main target after same-owner renewal", async () => {
     const w = await world();
     const controller = new AbortController();
-    const resources = observeLeaseWait(w.hub.root, controller);
+    const resources = observeLeaseWait(w.hubDirectory, controller);
     const pending = invokingProvider(w).invoke("resetSession", { id: w.target.identity.id }, invocation(controller.signal));
     const state = settle(pending);
     await resources.ready;
@@ -251,7 +300,7 @@ describe("remote mirror lease wait (smarty-dev#11703)", () => {
     if (entry !== "bootstrap") await w.hubDirectory.refreshRoutingView();
     if (entry === "late-read") vi.spyOn(w.hubDirectory, "get").mockImplementationOnce(() => { throw new Error("late routing read"); });
     const controller = new AbortController();
-    const resources = observeLeaseWait(w.hub.root, controller);
+    const resources = observeLeaseWait(w.hubDirectory, controller);
     const pending = w.sending.routeMessage(w.target.identity.id, "cancel before publication", undefined, kind, invocation(controller.signal));
     const state = settle(pending);
     await resources.ready;
@@ -270,7 +319,7 @@ describe("remote mirror lease wait (smarty-dev#11703)", () => {
     const w = await world();
     const controller = new AbortController();
     if (entry === "preaborted") controller.abort("already cancelled");
-    const resources = observeLeaseWait(w.hub.root, controller, entry === "watch-setup");
+    const resources = observeLeaseWait(w.hubDirectory, controller, entry === "watch-setup");
     const pending = w.sending.routeMessage(w.target.identity.id, "never arm after cancellation", undefined, "steer", invocation(controller.signal));
     const error = await pending.catch((reason: unknown) => reason);
     expect(error).toBe(controller.signal.reason);

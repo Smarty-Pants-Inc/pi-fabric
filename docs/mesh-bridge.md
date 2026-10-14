@@ -128,7 +128,7 @@ existing events and mirrors root presence. There is no new store or protocol.
   the source set is unchanged. Host file leases renew separately; compatibility state lease
   checkpoints remain bounded to their existing cadence.
 - Each remote call has a deadline (`--call-timeout-ms`, default 30 s). A missed mirror answer
-  degrades that link instead of closing the bridge. One mirror response slot stays in flight;
+  degrades that link and keeps the bridge open. One mirror response slot stays in flight;
   the bridge queues no additional RPCs behind it and retries with 1 s to 30 s exponential
   backoff. A late answer opens the gate for a new presence snapshot; it does not renew the old
   snapshot's freshness. The agent stamps mirror arrival time before its serial dispatch wait.

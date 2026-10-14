@@ -428,6 +428,11 @@ class FenceDb {
     } catch (error) {
       // A refused state root is a fence failure for the operator too (#846 SEC P2): alarm, then rethrow it as is.
       if (error instanceof MeshStateUnsupportedError) meshFenceAlarm(options, root, error.message);
+      // smarty-dev#11466: the gate's failed close (sqliteCloseError) keeps this run's file pins; the report rides on it.
+      if (owned?.createdDb && error instanceof Error && "sqliteCloseError" in error) {
+        const { cleanupWarnings, retained, reason } = owned.keepAfterFailure("close-failed", error.sqliteCloseError);
+        Object.assign(error, { cleanupWarnings, ...(retained.length > 0 ? { retained } : {}), ...(reason ? { reason } : {}) });
+      }
       throw error;
     }
     try {
@@ -451,7 +456,19 @@ class FenceDb {
       }
       return fence;
     } catch (error) {
-      try { db.close(); } catch { /* closing anyway */ }
+      // smarty-dev#9501: a WAL setup refusal on a state.db this run created gets the refusal cleanup; this catch owns the
+      // connection, so it knows whether the close succeeded. Anything else keeps the files, as before.
+      if (owned?.createdDb && error instanceof MeshStateUnsupportedError) cleanupAfterRefusal(error, owned, () => db.close());
+      else {
+        try { db.close(); }
+        catch (closeError) {
+          // smarty-dev#11466: a failed close keeps this run's file pins (close-failed); the report rides on the original error.
+          if (owned?.createdDb && error instanceof Error) {
+            const { cleanupWarnings, retained, reason } = owned.keepAfterFailure("close-failed", closeError);
+            Object.assign(error, { cleanupWarnings, ...(retained.length > 0 ? { retained } : {}), ...(reason ? { reason } : {}) });
+          } else if (owned?.createdDb) owned.keepAfterFailure("close-failed", closeError);
+        }
+      }
       throw error;
     }
   }
@@ -860,6 +877,26 @@ const fencedCutover = async (root: string, options: MeshBackendOptions): Promise
 };
 
 /**
+ * smarty-dev#9501: the one refusal cleanup. `close` is called exactly once; a close that throws keeps every file
+ * (close-failed), never retried and nothing moved. Only after a successful close are this run's files quarantined.
+ * The report is attached to the same error object; the caller rethrows it unchanged.
+ */
+const cleanupAfterRefusal = (error: Error, owned: OwnedImportFiles, close: () => void): void => {
+  // Nothing here masks the refusal: a cleanup that cannot run keeps the files and says so.
+  // First the close: SQLite's own close may checkpoint and remove its sidecars. A close that throws fails closed:
+  // the connection may still hold the files, so nothing is unlinked, and the close is not retried.
+  let report: RefusalCleanupReport | undefined;
+  try { close(); }
+  catch (closeError) { report = owned.keepAfterFailure("close-failed", closeError); }
+  if (!report) {
+    try { report = owned.removeAfterRefusal(); }
+    catch (cleanup) { report = owned.keepAfterFailure("cleanup-failed", cleanup); }
+  }
+  const { cleanupWarnings, retained, reason } = report;
+  if (cleanupWarnings.length > 0) Object.assign(error, { cleanupWarnings, ...(retained.length > 0 ? { retained } : {}), ...(reason ? { reason } : {}) });
+};
+
+/**
  * smarty-dev#9501: a refusal (MeshBackendRefusedError, MeshBackendFenceError: exit 3) BEFORE the importing commit
  * leaves the root as it was. The state.db, -wal and -shm this run created are removed, still under the fence, after
  * the connection is closed. The removal runs only through the held root fd and only while each name still names the
@@ -910,23 +947,22 @@ const cutoverWithFence = (root: string, options: MeshBackendOptions, lock: MeshL
         + (conflictFile ? `; the conflicting state.json is kept at ${conflictFile}` : ""), rollback, conflictFile);
     } catch (error) {
       if (owned.createdDb && !fence.importCommitting && (error instanceof MeshBackendRefusedError || error instanceof MeshBackendFenceError)) {
-        // Nothing here masks the refusal: a cleanup that cannot run keeps the files and says so.
-        // First the close: SQLite's own close may checkpoint and remove its sidecars. A close that throws fails closed:
-        // the connection may still hold the files, so nothing is unlinked, and the close is not retried (FenceDb.close
-        // marks itself closed before it calls db.close, so the outer finally is a no-op and cannot mask the refusal).
-        let report: RefusalCleanupReport | undefined;
-        try { fence.close(); }
-        catch (closeError) { report = owned.keepAfterFailure("close-failed", closeError); }
-        if (!report) {
-          try { report = owned.removeAfterRefusal(); }
-          catch (cleanup) { report = owned.keepAfterFailure("cleanup-failed", cleanup); }
-        }
-        const { cleanupWarnings, retained, reason } = report;
-        if (cleanupWarnings.length > 0) Object.assign(error, { cleanupWarnings, ...(retained.length > 0 ? { retained } : {}), ...(reason ? { reason } : {}) });
+        // FenceDb.close marks itself closed before it calls db.close, so the outer finally is a no-op and cannot mask the refusal.
+        cleanupAfterRefusal(error, owned, () => fence.close());
       }
       throw error;
     }
-  } finally { fence.close(); }
+  } finally {
+    try { fence.close(); }
+    catch (closeError) {
+      // smarty-dev#11466: a failed close keeps this run's file pins (close-failed); the same close error is rethrown.
+      if (owned.createdDb && closeError instanceof Error) {
+        const { cleanupWarnings, retained, reason } = owned.keepAfterFailure("close-failed", closeError);
+        Object.assign(closeError, { cleanupWarnings, ...(retained.length > 0 ? { retained } : {}), ...(reason ? { reason } : {}) });
+      } else if (owned.createdDb) owned.keepAfterFailure("close-failed", closeError);
+      throw closeError;
+    }
+  }
 };
 
 /**

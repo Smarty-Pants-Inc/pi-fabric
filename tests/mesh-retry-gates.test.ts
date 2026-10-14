@@ -236,6 +236,7 @@ it("actor preparation cause chains keep pending/snapshot work automatically retr
   for (const [index, error] of cases().entries()) {
     const agents = {
       config: DEFAULT_FABRIC_CONFIG.agents, resolveKernel: () => undefined, defaultModel: () => undefined,
+      resolveModelReasonPolicy: vi.fn(() => ({ model: undefined, thinking: undefined, fallback: false })),
       actorArchiveSources: () => new Map(), run: vi.fn(),
     } as unknown as AgentManager;
     const prepare = vi.fn(async () => { throw new Error("recorded custody refusal", { cause: error }); });

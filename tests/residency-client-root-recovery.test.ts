@@ -158,7 +158,9 @@ describe("resident client: root materialized by a sibling client after an idle s
         while (vi.mocked(spawnDetached).mock.calls.length === 0 || !fs.existsSync(path.join(f.root, "actors", "actors.json"))) await f.pump(100);
         await expect(created).resolves.toMatchObject({ id: f.actorId });
         expect(fs.existsSync(residencyRoot)).toBe(true);
-        expect(f.deletions).toEqual(expect.arrayContaining(["error.json", "idle-exit.json"]));
+        expect(f.deletions).toContain("idle-exit.json");
+        // #9627 retains legacy shared errors; recovery only revokes the intentional idle stop.
+        expect(f.deletions).not.toContain("error.json");
         await f.settle();
         expect(spawnDetached).toHaveBeenCalledOnce();
         // A adopted B's owner: one 60 s deadline.

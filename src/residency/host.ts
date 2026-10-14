@@ -86,7 +86,7 @@ import {
 import { completionRecipientFromRun, saveCompletion } from "../agents/completion-journal.js";
 import { projectOf } from "../topology/project-identity.js";
 import { processStartTime, residentProcessAlive } from "./process-identity.js";
-import { ensureResidentGenerations, recordResidentGenerationExit } from "./generation-exit.js";
+import { ensureResidentGenerations, recordResidentGenerationError, recordResidentGenerationExit } from "./generation-exit.js";
 import { ResidentRequestRetention } from "./retention.js";
 import { retentionV2Enabled } from "../storage/retention-platform.js";
 import { ResidentLegacyRunArchive } from "./legacy-run-archive.js";
@@ -256,7 +256,6 @@ export class ResidentHost {
    */
   beforeRelease: ((failure: unknown, owned: () => boolean) => void) | undefined;
   readonly #lockPath: string;
-  readonly #errorPath: string;
   readonly #requestsPath: string;
   readonly #processingPath: string;
   readonly #responsesPath: string;
@@ -339,7 +338,6 @@ export class ResidentHost {
     this.identity = { id: this.hostId, name: "Fabric resident host", kind: "agent" };
     this.#ownerPath = path.join(config.residencyRoot, "owner.json");
     this.#lockPath = path.join(config.residencyRoot, "host.lock");
-    this.#errorPath = path.join(config.residencyRoot, "error.json");
     this.#requestsPath = path.join(config.residencyRoot, "requests");
     this.#processingPath = path.join(config.residencyRoot, "processing");
     this.#responsesPath = path.join(config.residencyRoot, "responses");
@@ -845,7 +843,6 @@ export class ResidentHost {
       // Where this generation's exit record goes (smarty-dev#7950), made while this host owns the root.
       ensureResidentGenerations(this.config.residencyRoot);
       atomicWrite(this.#ownerPath, owner);
-      fs.rmSync(this.#errorPath, { force: true });
       // A publisher can die after commit but before writing any root-local wake request.
       // Before readiness, stream at most 256 entries / 4 MiB. Own-root recovery
       // cannot launch another host; restored actor queues remain paused here.
@@ -2605,21 +2602,21 @@ export const runResidentHostFromConfigPath = async (
   processWorkSessionId?: string,
 ): Promise<void> => {
   let config: ResidentHostConfig | undefined;
+  // Capture before ResidentHost's constructor consumes the launcher env; the
+  // startup catch still reports against the exact generation that was chosen.
+  const generation = process.env.PI_FABRIC_RESIDENT_GENERATION;
   try {
     config = validateResidentHostConfig(readJson<unknown>(configPath), configPath);
     await runResidentHost(config, signal, modelRegistry, processWorkSessionId);
   } catch (error) {
     if (error instanceof ResidentHostAlreadyRunning) return;
     const residencyRoot = config?.residencyRoot ?? path.dirname(configPath);
-    try {
-      atomicWrite(path.join(residencyRoot, "error.json"), {
-        error: errorMessage(error),
-        occurredAt: Date.now(),
-        launcherPid: process.env.PI_FABRIC_RESIDENT_LAUNCHER ? process.ppid : undefined,
-        launcherBirth: process.env.PI_FABRIC_RESIDENT_LAUNCHER ? processStartTime(process.ppid) : undefined,
-      });
-    } catch {
-      // Startup diagnostics are best-effort.
+    // The launcher prepares generations/ before spawning us. Startup diagnostics are generation-private,
+    // so ownership of owner.json is irrelevant; direct hosts never create the directory on failure.
+    if (generation && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(generation)) {
+      const launcherBirth = process.env.PI_FABRIC_RESIDENT_LAUNCHER ? processStartTime(process.ppid) : undefined;
+      recordResidentGenerationError(residencyRoot, { format: 1, generation, writer: "host", error: errorMessage(error),
+        occurredAt: Date.now(), pid: process.pid, ...(launcherBirth ? { launcherBirth } : {}) });
     }
     throw error;
   }

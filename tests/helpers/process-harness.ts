@@ -113,6 +113,8 @@ export const processHarness = () => {
     /** A host writing its generation exit record, paused before or after the publishing link (smarty-dev#7950). */
     generationExit: (residencyRoot: string, generation: string, pauseAt: "before-link" | "after-link") =>
       start(["generation-exit", residencyRoot, generation, pauseAt]),
+    /** The real launcher and child, paused just before its generation-private startup-error link. */
+    launcherError: (configPath: string, generation: string) => start(["launcher-error", configPath, generation]),
     close: async () => {
       try {
         for (const child of children) child.stdin?.destroy();

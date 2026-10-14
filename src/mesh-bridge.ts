@@ -109,6 +109,7 @@ const log = (message: string): void => void process.stderr.write(`mesh-bridge: $
 const runAgent = async (flags: Map<string, string>): Promise<void> => {
   const peer = required(flags, "peer");
   const side = new StoreBridgeSide(openBridgeStore(required(flags, "mesh"), flags), peer);
+  await side.store.prepareLock();
   await serveBridgeAgent(side, process.stdin, process.stdout);
 };
 
@@ -151,6 +152,10 @@ export const runBridge = async (
   if (!(Number.isSafeInteger(factoryRate.byteBurst) && factoryRate.byteBurst > 0)) throw new Error("--factory-byte-burst must be a positive integer");
   const local = new StoreBridgeSide(openBridgeStore(required(flags, "mesh"), flags), remoteName);
   const argv = transportCommand(flags, command);
+  if (signal.aborted) return 0;
+  // Prepare before starting the link, not inside a short registry/mesh try. Readiness is
+  // immutable for this store; an unknown identity still permits conservative publication.
+  await local.store.prepareLock();
   if (signal.aborted) return 0;
 
   const child = spawn(argv[0]!, argv.slice(1), { env: childProcessEnvironment(), stdio: ["pipe", "pipe", "inherit"] });

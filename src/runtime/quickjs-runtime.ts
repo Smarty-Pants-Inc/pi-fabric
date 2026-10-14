@@ -2,7 +2,8 @@ import releaseSyncVariant from "@jitl/quickjs-singlefile-mjs-release-sync";
 import { newQuickJSWASMModuleFromVariant } from "quickjs-emscripten-core";
 import ts from "typescript";
 import { ExecutionDeadline } from "./execution-deadline.js";
-import { isMeshLockTimeout } from "../core/atomic-write.js";
+import { MESH_INCARNATION_PENDING_CODE, MESH_LOCK_TIMEOUT_CODE, MESH_SNAPSHOT_RETRIES_EXHAUSTED_CODE } from "../core/atomic-write.js";
+import { isMeshRetryableBusy } from "../mesh/state-backend.js";
 import { cancellationError, preserveCancellationOutcome, runAbortable, settleWithin, shareCancellationEffects } from "../async-settlement.js";
 import { piBashExitMetadata } from "../core/pi-bash-error.js";
 import { FabricModelDeniedError } from "../core/model-policy.js";
@@ -28,6 +29,14 @@ export type {
 } from "./kernel.js";
 
 type QuickJsModule = Awaited<ReturnType<typeof newQuickJSWASMModuleFromVariant>>;
+
+// The shared retry predicate also accepts WAL-cap and raw SQLite errors: only
+// these three mesh families have a guest code contract, with canonical names.
+const GUEST_MESH_RETRYABLE_ERROR_NAMES: Readonly<Record<string, string>> = Object.freeze({
+  [MESH_LOCK_TIMEOUT_CODE]: "MeshLockTimeoutError",
+  [MESH_INCARNATION_PENDING_CODE]: "MeshIncarnationPendingError",
+  [MESH_SNAPSHOT_RETRIES_EXHAUSTED_CODE]: "MeshSnapshotRetriesExhaustedError",
+});
 
 // Explicit safe contracts, not Error serialization: never bridge stacks, causes, arbitrary
 // properties or getters. Keep this dependency-free so runtime loading cannot pull in providers.
@@ -1173,10 +1182,11 @@ export class QuickJsRuntime {
                 error instanceof Error ? error.message : String(error),
               );
               try {
-                // The host-issued lock code wins over a legacy or overridden name.
-                // Both contracts supply only vetted metadata; each key is assigned once.
-                const safeMetadata = isMeshLockTimeout(error)
-                  ? { name: "MeshLockTimeoutError", code: error.code }
+                // Known host-issued mesh codes win over legacy or overridden names.
+                // Retryability alone never authorizes exporting arbitrary error codes.
+                const meshCode = error instanceof Error && "code" in error ? error.code : undefined;
+                const safeMetadata = typeof meshCode === "string" && Object.hasOwn(GUEST_MESH_RETRYABLE_ERROR_NAMES, meshCode) && isMeshRetryableBusy(error)
+                  ? { name: GUEST_MESH_RETRYABLE_ERROR_NAMES[meshCode]!, code: meshCode }
                   : guestFabricErrorMetadata(error);
                 // Fabric metadata includes its vetted name. Otherwise transfer only
                 // a host Error's string classification, never arbitrary properties

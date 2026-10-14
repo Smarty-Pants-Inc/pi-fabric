@@ -2310,6 +2310,16 @@ export class AgentManager {
       [...this.#runs.values()].filter(managed => managed.heldPermit).length;
   }
 
+  /** True while retained execution custody or its admission permit remains unresolved. */
+  hasRetainedCustody(): boolean {
+    return this.heldPermits() > 0 ||
+      [...this.#queued.values()].some(queued => queued.cleanupPending !== undefined) ||
+      [...this.#runs.values()].some(managed => managed.transport.kind === "process" && (
+        managed.processStopPending || managed.lostContact !== undefined ||
+        (managed.settled && managed.executionExited !== true)
+      ));
+  }
+
   /**
    * smarty-dev#9855 part A: a held permit whose run is now proven gone (ENODEV-unconfirmed exit, worker gone, pid-reuse
    * safe; settleGoneEnodevLaunch) is released in the same step as the settle, exactly once (the permit is taken off the

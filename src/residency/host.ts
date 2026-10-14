@@ -1593,6 +1593,7 @@ export class ResidentHost {
     return this.#wakeRecoveryPending !== undefined || residentProcessWorkPending(this.processWorkSessionId) || this.#admissions > 0 || this.#boundaryRequests.size > 0 ||
       this.#publicationFailed || this.actors.inFlightCount() > 0 ||
       this.agents.listForUi().some(agent => agent.status === "queued" || agent.status === "running") ||
+      this.agents.hasRetainedCustody() ||
       [this.#requestsPath, this.#processingPath].some(directory => {
         try { return fs.readdirSync(directory).some(entry => entry.endsWith(".json")); }
         catch { return false; }
@@ -1647,7 +1648,8 @@ export class ResidentHost {
     const activeActor = this.#hasActiveActor(now);
     const activeAgent = this.agents
       .listForUi()
-      .some((agent) => agent.status === "queued" || agent.status === "running");
+      .some((agent) => agent.status === "queued" || agent.status === "running") ||
+      this.agents.hasRetainedCustody();
     // Host work (admissions, requests, publications, outbox, process custody, wake recovery)
     // is the dormant-wake superset of main's pending-request check.
     const pendingRequest = this.#hasHostWork() || this.#hasPendingRequest();

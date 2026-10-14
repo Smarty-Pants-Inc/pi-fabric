@@ -6,6 +6,7 @@
 // ActorDirectory with the actor in the primary and in the secondary scope.
 // Every actor-tree delete is guarded: beforeDelete throws (controlled), any actor-tree rmSync is recorded, not run;
 // metadata.lock passes normally.
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -20,7 +21,9 @@ import { MeshStore } from "../src/mesh/store.js";
 import { actorTreeDeletionHooks } from "../src/topology/main-publication-fence.js";
 import { ResidentActorClient } from "../src/residency/actor-client.js";
 import { ResidentHost } from "../src/residency/host.js";
+import { ROOT_PARTICIPANT_FRESH_MS } from "../src/residency/operator-safety.js";
 import { residentRoot, type ResidentHostConfig } from "../src/residency/protocol.js";
+import { writeParticipantFile } from "../src/topology/participant-files.js";
 import { installInProcessResidentFence } from "./helpers/in-process-resident-fence.js";
 
 type Shape = "manager" | "directory-primary" | "directory-secondary" | "manager-revocation-fails" | "directory-revocation-fails";
@@ -228,6 +231,15 @@ describe.skipIf(process.platform !== "linux")("resident remove during the commit
     let actorId = "";
     try {
       await host.start();
+      // pi-fabric#1031 requires a stale record with a gone Main pid+start identity; operator only, ordinary unchanged.
+      if (receiver === "operator") {
+        const rootId = config.rootId;
+        writeParticipantFile(meshRoot, { key: "topology/participants/" + createHash("sha256").update(rootId).digest("hex"),
+          value: { id: rootId, rootId, kind: "root", ownerHostId: rootId, ownerIdentityId: rootId,
+            mainProcess: { pid: 2147483647, host: os.hostname(), startTime: "1" } },
+          version: 1, updatedAt: Date.now() - 2 * ROOT_PARTICIPANT_FRESH_MS,
+          updatedBy: { id: rootId, name: "main", kind: "main" } });
+      }
       const actor = await host.actors.create({ name: "finish-op", instructions: "Run", model: "fixture/visible",
         residency: "durable", transport: "process", extensions: false });
       actorId = actor.id;

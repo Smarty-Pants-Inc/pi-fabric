@@ -119,7 +119,7 @@ describe("MeshStore lock-timing hook", () => {
     expect(recorded.custody).toMatchObject({ n: 0, timeouts: 0, tries: 1 });
   });
 
-  it.each(["before the lock", "under the lock"])("a snapshot that keeps changing %s is a typed snapshot refusal with honest admissions, not a 0-attempt lock timeout", async (where) => {
+  it.each(["before the lock", "under the lock"])("a snapshot that keeps changing %s exhausts validation retries without a failed-acquisition count", async (where) => {
     const root = temp();
     const mesh = new store.MeshStore(root, 64 * 1024, 100, { lockTimeoutMs: 100 });
     await mesh.put({ key: "presence/a", value: 0, identity }); // state exists: the snapshot path
@@ -151,17 +151,16 @@ describe("MeshStore lock-timing hook", () => {
       staging.mockRestore();
       clock.mockRestore();
     }
-    expect(error).toBeInstanceOf(store.MeshLockSnapshotNotReadyError);
-    expect(error).toBeInstanceOf(store.MeshLockTimeoutError); // safe callers keep their retry handling
-    const refusal = error as InstanceType<typeof store.MeshLockSnapshotNotReadyError>;
-    expect(refusal).toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT", preLockCode: "FABRIC_MESH_STATE_SNAPSHOT_NOT_READY", bounded: false });
-    expect(refusal.message.startsWith("FABRIC_MESH_STATE_SNAPSHOT_NOT_READY (code FABRIC_MESH_LOCK_TIMEOUT): ")).toBe(true);
+    expect(error).toBeInstanceOf(store.MeshSnapshotRetriesExhaustedError);
+    expect(error).not.toBeInstanceOf(store.MeshLockTimeoutError);
+    const refusal = error as InstanceType<typeof store.MeshSnapshotRetriesExhaustedError>;
+    expect(refusal).toMatchObject({ code: "FABRIC_MESH_SNAPSHOT_RETRIES_EXHAUSTED" });
+    expect(refusal.message.startsWith("FABRIC_MESH_SNAPSHOT_RETRIES_EXHAUSTED: ")).toBe(true);
     expect(refusal.message).not.toMatch(/Timed out|0 attempts/);
-    expect(refusal.preparations).toBeGreaterThan(1);
-    // Admissions are counted, never invented: none when the snapshot went stale before .lock, one per preparation after.
-    expect(refusal.attempts).toBe(where === "before the lock" ? 0 : refusal.preparations);
+    expect(refusal.attempts).toBeGreaterThan(1); // validation attempts, not lock contention
+    // Only snapshots invalidated under custody add successful admissions; neither path adds a timeout.
     const recorded = classes(root)["put/delete"]!;
-    expect(recorded).toMatchObject({ n: 1 + (where === "before the lock" ? 0 : refusal.preparations), timeouts: 1, tries: 0 });
+    expect(recorded).toMatchObject({ n: 1 + (where === "before the lock" ? 0 : refusal.attempts), timeouts: 0, tries: 0 });
     expect(JSON.parse(fs.readFileSync(state, "utf8")).entries["presence/a"].value).toBe(0);
   });
 
@@ -182,7 +181,7 @@ describe("MeshStore lock-timing hook", () => {
     }
   });
 
-  it("counts one failed try per bounded attempt of a cold protocol-2 store, and no timeout", async () => {
+  it("records no failed try or timeout for a cold protocol-2 pending incarnation", async () => {
     const root = temp();
     const seed = new store.MeshStore(root, 64 * 1024, 100);
     await seed.put({ key: "presence/a", value: 0, identity }); // state exists: the snapshot path
@@ -194,18 +193,18 @@ describe("MeshStore lock-timing hook", () => {
       const cold = new store.MeshStore(root, 64 * 1024, 100, { lockProtocol: 2 });
       for (let attempt = 0; attempt < 2; attempt++) {
         await expect(cold.withTryLock(() => cold.put({ key: "presence/a", value: 1, identity }), 0))
-          .rejects.toBeInstanceOf(store.MeshLockTimeoutError);
+          .rejects.toBeInstanceOf(store.MeshIncarnationPendingError);
       }
-      await expect(cold.withTryLock(() => cold.confirmWritable(), 0)).rejects.toBeInstanceOf(store.MeshLockTimeoutError);
+      await expect(cold.withTryLock(() => cold.confirmWritable(), 0)).rejects.toBeInstanceOf(store.MeshIncarnationPendingError);
       let recorded = classes(root);
-      expect(recorded["put/delete"]).toMatchObject({ n: 1, tries: 2, timeouts: 0 });
-      expect(recorded["heartbeat/confirm"]).toMatchObject({ n: 0, tries: 1, timeouts: 0 });
+      expect(recorded["put/delete"]).toMatchObject({ n: 1, tries: 0, timeouts: 0 });
+      expect(recorded["heartbeat/confirm"]).toBeUndefined();
       resolve(undefined);
       await cold.put({ key: "presence/a", value: 2, identity });
       await cold.confirmWritable();
       recorded = classes(root);
-      expect(recorded["put/delete"]).toMatchObject({ n: 2, tries: 2, timeouts: 0 });
-      expect(recorded["heartbeat/confirm"]).toMatchObject({ n: 1, tries: 1, timeouts: 0 });
+      expect(recorded["put/delete"]).toMatchObject({ n: 2, tries: 0, timeouts: 0 });
+      expect(recorded["heartbeat/confirm"]).toMatchObject({ n: 1, tries: 0, timeouts: 0 });
     } finally {
       resolve(undefined);
       spy.mockRestore();

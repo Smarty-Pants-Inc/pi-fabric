@@ -4,10 +4,10 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import * as atomic from "../src/core/atomic-write.js";
-import { MeshLockTimeoutError } from "../src/core/atomic-write.js";
+import { MeshIncarnationPendingError, MeshLockTimeoutError } from "../src/core/atomic-write.js";
 import { acquireMeshCustodyLock, MESH_CUSTODY_LOCK_NAME } from "../src/mesh/custody-lock.js";
 import { meshLockQueueDirectory, MeshLockTicket } from "../src/mesh/lock-queue.js";
-import { MeshLock, MeshLockIdentityNotReadyError, MeshLockQueueExpiredError } from "../src/mesh/mesh-lock.js";
+import { MeshLock, MeshLockQueueExpiredError } from "../src/mesh/mesh-lock.js";
 
 // Relative waits start after setup. Only eligible tickets attempt acquisition; FIFO expiry and cold identity
 // are distinct pre-lock refusals, never contention timeouts with fabricated attempts.
@@ -276,15 +276,12 @@ describe("cold lock identity is a distinct pre-lock refusal", () => {
     const tried = await lock.withTryLock(() => lock.withLock(operation), 50).catch((error: unknown) => error);
     const reduced = await lock.withLock(operation, 50).catch((error: unknown) => error);
     for (const error of [tried, reduced]) {
-      expect(error).toBeInstanceOf(MeshLockIdentityNotReadyError);
-      // Safe callers keep their release-and-retry handling: still the typed timeout family and code.
-      expect(error).toBeInstanceOf(MeshLockTimeoutError);
-      expect(error).toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT", preLockCode: "FABRIC_MESH_LOCK_IDENTITY_NOT_READY",
-        kind: "pre-lock", attempts: 0, lockProtocol: protocol });
-      // It never claims a contention timeout.
-      expect((error as Error).message.startsWith("FABRIC_MESH_LOCK_IDENTITY_NOT_READY (code FABRIC_MESH_LOCK_TIMEOUT): ")).toBe(true);
+      expect(error).toBeInstanceOf(MeshIncarnationPendingError);
+      expect(error).not.toBeInstanceOf(MeshLockTimeoutError);
+      expect(error).toMatchObject({ code: "FABRIC_MESH_INCARNATION_PENDING" });
+      // Identity preparation is retryable, but never attributed to lock contention.
+      expect((error as Error).message.startsWith("FABRIC_MESH_INCARNATION_PENDING: ")).toBe(true);
       expect((error as Error).message).not.toMatch(/Timed out|0 attempts/);
-      expect((error as Error).message).toContain("not attempted");
     }
     expect(operation).not.toHaveBeenCalled();
     expect(fs.existsSync(path.join(root, ".lock"))).toBe(false);

@@ -1,5 +1,5 @@
 import type { MeshLockProtocol } from "../config.js";
-import { meshJournalAlarmLine, type MeshOutageAlarm } from "../core/atomic-write.js";
+import { MeshIncarnationPendingError, meshJournalAlarmLine, type MeshOutageAlarm } from "../core/atomic-write.js";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
@@ -17,8 +17,9 @@ import type { FabricMessageSender } from "../protocol.js";
 import { copyFabricPrincipal, type FabricPrincipal } from "../fabric-provenance.js";
 import { processSender } from "../scope.js";
 import { verifiedRemove } from "../storage/verified-remove.js";
-export { MeshLockTimeoutError } from "../core/atomic-write.js";
-export { MeshLockIdentityNotReadyError, MeshLockSnapshotNotReadyError } from "./mesh-lock.js";
+export { MeshIncarnationPendingError, MESH_INCARNATION_PENDING_CODE, isMeshIncarnationPending,
+  MeshSnapshotRetriesExhaustedError, MESH_SNAPSHOT_RETRIES_EXHAUSTED_CODE, isMeshSnapshotRetriesExhausted,
+  MeshLockTimeoutError } from "../core/atomic-write.js";
 export type { MeshIdentity, MeshEvent, MeshPublishInput, MeshTailResult } from "./event-log.js";
 export { meshCursorGeneration, meshCursorAtStart, MeshDedupeRecoveryError, MeshDedupeStoreFullError } from "./event-log.js";
 export type { MeshStateEntry, MeshReadOptions, MeshBatchOperation, MeshBatchView, MeshBatchResult } from "./state-file.js";
@@ -949,6 +950,15 @@ export class MeshStore {
   }
 
   // The lock (mesh-lock.ts).
+
+  /** Settle constructor-owned identity before opening a bridge or entering custody. UNKNOWN is allowed.
+   * A cold caller already in a bounded scope must release custody, never wait for native preparation. */
+  async prepareLock(): Promise<void> {
+    if (this.#lock.ownIncarnation && !this.#lock.ownIncarnationReady && this.tryLockBudgetMs !== undefined) {
+      throw new MeshIncarnationPendingError();
+    }
+    await this.#lock.ownIncarnation;
+  }
 
   withTryLock<T>(operation: () => Promise<T>, timeoutMs = 0): Promise<T> {
     return this.#lock.withTryLock(operation, timeoutMs);

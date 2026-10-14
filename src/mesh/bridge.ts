@@ -1,6 +1,7 @@
 import { copyFabricPrincipal, type FabricPrincipal } from "../fabric-provenance.js";
 import { createHash } from "node:crypto";
-import { isMeshLockTimeout, MESH_LOCK_TIMEOUT_CODE, meshDeferredSummary } from "../core/atomic-write.js";
+import { isMeshIncarnationPending, isMeshSnapshotRetriesExhausted, isMeshLockTimeout,
+  MESH_INCARNATION_PENDING_CODE, MESH_SNAPSHOT_RETRIES_EXHAUSTED_CODE, MESH_LOCK_TIMEOUT_CODE, meshDeferredSummary } from "../core/atomic-write.js";
 import fs from "node:fs";
 import path from "node:path";
 import type { Readable, Writable } from "node:stream";
@@ -68,6 +69,10 @@ const WAL_CAP_RETRY_MAX_MS = 30_000;
 /** The next wait after a WAL-cap refusal: `min` first, then doubling, at most 30 s. */
 export const walCapRetryDelay = (previous: number | undefined, min = WAL_CAP_RETRY_MIN_MS): number =>
   previous === undefined ? min : Math.min(Math.max(previous * 2, min), WAL_CAP_RETRY_MAX_MS);
+const meshBusyLabel = (error: unknown): string =>
+  isMeshIncarnationPending(error) ? "mesh incarnation pending"
+    : isMeshSnapshotRetriesExhausted(error) ? "mesh snapshot retries exhausted"
+      : isMeshStateWalCap(error) ? "mesh state WAL cap" : "mesh lock timeout";
 const MAX_RPC_LINE_BYTES = 16 * 1024 * 1024;
 /** A read page's event bytes stay under this, well inside one frame with its JSON envelope. */
 export const BRIDGE_PAGE_BYTES = 8 * 1024 * 1024;
@@ -685,11 +690,13 @@ export class StoreBridgeSide implements BridgeSide {
   }
 
   async publish(event: BridgePublish, held: string[] = []): Promise<{ sequence: number }> {
+    await this.store.prepareLock();
     const published = await this.#fenceRetry(() => this.store.publish(this.#publication(event, held)));
     return { sequence: published.sequence };
   }
 
   async publishBatch(events: Array<{ event: BridgePublish; held?: string[] }>): Promise<Array<{ sequence: number }>> {
+    await this.store.prepareLock();
     const published = await this.#fenceRetry(() => this.store.publishBatch(events.map(({ event, held }) => this.#publication(event, held ?? []))));
     return published.map(({ sequence }) => ({ sequence }));
   }
@@ -930,6 +937,7 @@ export class StoreBridgeSide implements BridgeSide {
   }
 
   async #mirror(presence: Pick<BridgePresence, "hosts" | "participants">, final: boolean, observedAt?: number): Promise<void> {
+    await this.store.prepareLock();
     const halted = (): boolean => this.#fenced && !final;
     const now = this.now();
     // A host live when the snapshot was requested stays admissible: a pass (slow presence read,
@@ -1222,6 +1230,10 @@ export const serveBridgeAgent = (side: StoreBridgeSide, input: Readable, output:
             return;
           }
           try {
+            // Attach stdin listeners immediately, but prepare before the first hello/snapshot/write.
+            // The store refuses rather than waits if a library caller already owns a bounded scope.
+            await side.store.prepareLock();
+            if (closed) { finish(); return; }
             if (request.op === "hello" && isObject(request.args) && request.args.changes === true && !unsubscribe) {
               // Unsolicited frames, never a hanging wait RPC ahead of publish in this FIFO.
               // Install before hello's response and all subsequent snapshot requests.
@@ -1237,7 +1249,9 @@ export const serveBridgeAgent = (side: StoreBridgeSide, input: Readable, output:
           } catch (error) {
             reply({
               id: request.id, ok: false, error: error instanceof Error ? error.message : String(error),
-              ...(isMeshRetryableBusy(error) ? { code: MESH_LOCK_TIMEOUT_CODE } : {}),
+              ...(isMeshIncarnationPending(error) ? { code: MESH_INCARNATION_PENDING_CODE }
+                : isMeshSnapshotRetriesExhausted(error) ? { code: MESH_SNAPSHOT_RETRIES_EXHAUSTED_CODE }
+                  : isMeshRetryableBusy(error) ? { code: MESH_LOCK_TIMEOUT_CODE } : {}),
             });
           }
         });
@@ -1345,8 +1359,9 @@ export class RemoteBridgeSide implements BridgeSide {
         if (response.ok === true) pending.resolve(response.result);
         else {
           const error = new Error(`Bridge agent: ${String(response.error)}`);
-          // The protocol carries just this safe store code, not arbitrary peer error properties.
-          if (response.code === MESH_LOCK_TIMEOUT_CODE) Object.assign(error, { code: MESH_LOCK_TIMEOUT_CODE });
+          // Only allow-listed store refusal codes, never arbitrary peer error properties.
+          if (response.code === MESH_LOCK_TIMEOUT_CODE || response.code === MESH_INCARNATION_PENDING_CODE ||
+            response.code === MESH_SNAPSHOT_RETRIES_EXHAUSTED_CODE) Object.assign(error, { code: response.code });
           pending.reject(error);
         }
       },
@@ -1978,7 +1993,7 @@ export class MeshBridge {
         else delay = retryMs;
         retryMs = Math.min(retryMs * 2, LOCK_RETRY_MAX_MS);
         if (!reported) {
-          this.#log(`${isMeshStateWalCap(error) ? "mesh state WAL cap" : "mesh lock timeout"} (${direction}); retrying in ${delay} ms: ${(error as Error).message}`);
+          this.#log(`${meshBusyLabel(error)} (${direction}); retrying in ${delay} ms: ${(error as Error).message}`);
           reported = true;
         }
       }
@@ -2349,7 +2364,7 @@ export class MeshBridge {
               walCapLoggedAt = now;
             }
           } else if (!reportedTimeout) {
-            this.#log(`mesh lock timeout; retrying in ${delay} ms: ${(error as Error).message}`);
+            this.#log(`${meshBusyLabel(error)}; retrying in ${delay} ms: ${(error as Error).message}`);
             reportedTimeout = true;
           }
         }
@@ -2420,5 +2435,6 @@ const allBridgedIds = async (side: BridgeSide, after: number): Promise<Set<strin
 };
 
 const isPermanent = (error: unknown): boolean =>
+  !isMeshIncarnationPending(error) && !isMeshSnapshotRetriesExhausted(error) &&
   !isMeshLockTimeout(error) && (error instanceof BridgeOwnershipError ||
     error instanceof Error && /exceeds|not allowed|no bridge stamp|no recipient|no sender|Invalid mesh topic/i.test(error.message));

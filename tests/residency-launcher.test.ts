@@ -107,9 +107,9 @@ describe.skipIf(!hasLauncher || process.platform === "win32")("resident launcher
 });
 
 // smarty-dev#7770 / #2010: the host names its exit itself while it owns the
-// root; after a clean owned exit the launcher writes nothing into the root.
+// root; after a clean owned exit the launcher writes no shared-root files (only its generation-private record).
 describe.skipIf(!hasLauncher || process.platform === "win32")("resident launcher after a clean owned exit", () => {
-  it("writes nothing new into the root after the child exits", { timeout: 30_000 }, async () => {
+  it("writes no shared-root files after the child exits", { timeout: 30_000 }, async () => {
     const base = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-launcher-exit-"));
     const root = path.join(base, "root");
     fs.mkdirSync(root);
@@ -118,7 +118,7 @@ describe.skipIf(!hasLauncher || process.platform === "win32")("resident launcher
     const hostBinary = path.join(base, "fake-host.mjs");
     fs.writeFileSync(hostBinary, `import fs from 'node:fs'; import path from 'node:path';
 const root = ${JSON.stringify(root)};
-const snapshot = () => Object.fromEntries(fs.readdirSync(root).map(name => { const s = fs.statSync(path.join(root, name)); return [name, s.size + ':' + s.mtimeMs]; }));
+const snapshot = () => Object.fromEntries(fs.readdirSync(root).filter(name => name !== 'generations').map(name => { const s = fs.statSync(path.join(root, name)); return [name, s.size + ':' + s.mtimeMs]; }));
 fs.writeFileSync(${JSON.stringify(owner)}, JSON.stringify({ pid: process.pid }));
 setTimeout(() => {
   // Like the real host: its line, then the release, then exit 0.
@@ -137,11 +137,13 @@ setInterval(() => {}, 1000);
       });
       await new Promise(resolve => setTimeout(resolve, 500));
       const before = JSON.parse(fs.readFileSync(released, "utf8")) as Record<string, string>;
-      const after = Object.fromEntries(fs.readdirSync(root).map(name => {
+      const after = Object.fromEntries(fs.readdirSync(root).filter(name => name !== "generations").map(name => {
         const stat = fs.statSync(path.join(root, name));
         return [name, `${stat.size}:${stat.mtimeMs}`];
       }));
       expect(after).toEqual(before);
+      const records = fs.readdirSync(path.join(root, "generations"));
+      expect(records).toEqual(process.platform === "linux" ? [expect.stringMatching(/^[0-9a-f-]{36}\.exit\.json$/)] : []);
       const rows = fs.readFileSync(path.join(root, "launcher.log"), "utf8").trim().split("\n").map(line => JSON.parse(line) as Record<string, unknown>);
       expect(rows.at(-1)).toMatchObject({ event: "resident-exit", reason: "idle-exit" });
     } finally {
@@ -187,7 +189,7 @@ const stat = fs.readFileSync('/proc/self/stat', 'utf8');
 const processStartTime = stat.slice(stat.lastIndexOf(')') + 2).split(' ')[19];
 ${report === "die-after-publish" ? `fs.writeFileSync(path.join(base, 'ready'), String(process.pid));
 while (!fs.existsSync(path.join(base, 'go'))) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);` : ""}
-fs.mkdirSync(path.join(root, 'generations'), { mode: 0o700 });
+fs.mkdirSync(path.join(root, 'generations'), { mode: 0o700, recursive: true });
 fs.writeFileSync(path.join(root, 'owner.json'), JSON.stringify({ pid: process.pid, processStartTime, token: generation }));
 ${report === "die-after-publish" ? "process.kill(process.pid, 'SIGKILL');" : ""}
 ${report === "complete" || report === "partial" ? `fs.writeFileSync(path.join(root, 'generations', generation + '.exit.json'), ${report === "complete"

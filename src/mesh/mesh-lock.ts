@@ -7,7 +7,7 @@ import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import {
-  alarmForeignHolder, MeshLockForeignHolderError, MeshLockTimeoutError, ownProcessIncarnation, processIncarnation, validProcessIncarnation, type StaleLockNote,
+  alarmForeignHolder, MeshIncarnationPendingError, MeshLockForeignHolderError, MeshLockTimeoutError, ownProcessIncarnation, processIncarnation, validProcessIncarnation, type StaleLockNote,
 } from "../core/atomic-write.js";
 import { FOREIGN_LOCK, pinFenceLock, releaseFenceLock } from "./fence-lock.js";
 import { verifiedRemove } from "../storage/verified-remove.js";
@@ -41,45 +41,6 @@ export const lockOwnerPid = (ownerPath: string): number | undefined => {
 
 const LOCK_TIMEOUT_MS = 10_000;
 const STALE_LOCK_MS = 30_000;
-
-/**
- * A bounded protocol-2/3 acquisition refused BEFORE any `.lock` attempt because this process's lock identity (start
- * time, PID namespace) is still being prepared. Not contention: nobody held the lock and no budget was spent waiting.
- * Still a MeshLockTimeoutError with the same `code` so every safe caller keeps its release-fences-and-retry handling;
- * `preLockCode`/`kind` tell the two apart, and the message never claims a timeout.
- */
-export class MeshLockIdentityNotReadyError extends MeshLockTimeoutError {
-  readonly preLockCode = "FABRIC_MESH_LOCK_IDENTITY_NOT_READY";
-  readonly kind = "pre-lock";
-  readonly retryable = true;
-  constructor(readonly lockPath: string, readonly lockProtocol: MeshLockProtocol) {
-    super("", 0, 0);
-    this.name = "MeshLockIdentityNotReadyError";
-    this.message = `${this.preLockCode} (code ${this.code}): Fabric mesh lock ${lockPath} not attempted: this process's protocol-${lockProtocol} lock ` +
-      "identity is still being prepared (a bounded try fails closed); retry outside the bounded try";
-  }
-}
-
-/**
- * An optimistic state write whose snapshot never became committable within its total deadline (or within a bounded
- * try): the state file kept changing between off-lock preparation and the identity check. Not lock contention.
- * `attempts` counts only real `.lock` admissions this write obtained (each one found the snapshot stale), never a
- * fabricated count; 0 means `.lock` was not tried. Same retryable `code` as a lock timeout, for safe callers.
- */
-export class MeshLockSnapshotNotReadyError extends MeshLockTimeoutError {
-  readonly preLockCode = "FABRIC_MESH_STATE_SNAPSHOT_NOT_READY";
-  readonly kind = "pre-lock";
-  readonly retryable = true;
-  constructor(readonly statePath: string, readonly preparations: number, lockAdmissions: number, readonly bounded: boolean,
-    options?: { cause?: unknown }) {
-    super("", lockAdmissions, 0);
-    if (options && "cause" in options) (this as { cause?: unknown }).cause = options.cause;
-    this.name = "MeshLockSnapshotNotReadyError";
-    this.message = `${this.preLockCode} (code ${this.code}): Fabric mesh state ${statePath} changed under every optimistic write snapshot ` +
-      `(${preparations} preparations, ${lockAdmissions} .lock admissions) ${bounded ? "within the bounded try" : "before the write deadline"}; ` +
-      "not lock contention, retry the write";
-  }
-}
 
 /** A wait budget exhausted before FIFO admission, not a failed acquisition of the canonical lock. */
 export class MeshLockQueueExpiredError extends MeshLockTimeoutError {
@@ -259,7 +220,7 @@ export class MeshLock {
 
   /** Bound every mesh acquisition in this async step via the existing FIFO/try path.
    * Registry -> mesh publication retains custody through source selection and copies,
-   * but a busy mesh throws its typed timeout after a short try so the caller can
+   * but a busy or unprepared mesh throws its typed refusal after a short try so the caller can
    * release registry fences and retry the whole step. This acquires NO lock itself.
    * Reset the shared scope receipt on exit: escaped async work must not inherit it. */
   async withTryLock<T>(operation: () => Promise<T>, timeoutMs = 0): Promise<T> {
@@ -276,7 +237,7 @@ export class MeshLock {
   // Global actor-custody order: actor registries (sorted path), then mesh.
   // Mesh critical sections are synchronous: never await a registry mutation
   // here or wrap resident async controls in this second/innermost lock.
-  // `bounded` marks an explicit try (lock stats only); a scoped withTryLock is one too. A
+  // `bounded` marks an explicit try (preparation refusal and lock stats); a scoped withTryLock is one too. A
   // reduced remaining budget from an ordinary caller is never a try.
   withLock<T>(operation: () => T, lockTimeoutMs = this.#lockTimeoutMs, lockClass: MeshLockClass = "other",
     bounded = false): Promise<T> {
@@ -300,19 +261,18 @@ export class MeshLock {
     let holdMs = -1;
     let failedWaitMs = -1;
     this.#writeAbortSignal?.throwIfAborted();
-    fs.mkdirSync(this.root, { recursive: true, mode: 0o700 });
     // A registry-fenced publisher gets only a short try, never the ordinary wait.
     // Async-local scope leaves concurrent ordinary callers on their own budget.
     const scope = this.#tryLockScope.getStore();
     const budget = scope?.active ? Math.min(scope.timeoutMs, lockTimeoutMs) : lockTimeoutMs;
-    const ownerPath = path.join(this.#lockPath, "owner");
     if (this.#lockProtocol >= 2 && !this.#ownIncarnationReady &&
-      (scope?.active || lockTimeoutMs < this.#lockTimeoutMs)) {
-      // Fails closed before the common accounting below: count it once here. It never tried .lock,
-      // so it is no wait-timeout event (and reads no owner record for one): nobody made it wait.
-      lockStats?.failed(this.root, lockClass, performance.now() - lockWaitStart, Boolean(scope?.active) || bounded);
-      throw new MeshLockIdentityNotReadyError(this.#lockPath, this.#lockProtocol);
+      (bounded || scope?.active || lockTimeoutMs < this.#lockTimeoutMs)) {
+      // Fail closed without awaiting native preparation under custody. This never tried .lock:
+      // no owner probe, failed-acquisition stats, or wait-timeout event belongs to it.
+      throw new MeshIncarnationPendingError();
     }
+    fs.mkdirSync(this.root, { recursive: true, mode: 0o700 });
+    const ownerPath = path.join(this.#lockPath, "owner");
     const startTime = this.#lockProtocol >= 2
       ? this.#ownIncarnationReady ? this.#ownStartTime : await this.#ownIncarnation
       : undefined;

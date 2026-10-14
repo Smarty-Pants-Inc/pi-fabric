@@ -22,7 +22,8 @@
 //     beforeTreeMove   inside the fenced check-plus-delete, after the final check (stdin "continue" resumes)
 //     none             no pause
 //   generation-exit <root> <generation> before-link|after-link   a host's exit record, paused around its link
-// A synchronous pause blocks the thread (Atomics.wait), so only a signal ends it.
+//   launcher-error <config> <generation>                        real launcher/child; pauses before its error link
+// Synchronous pauses block the thread (Atomics.wait); launcher-error uses an externally created resume file.
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -133,6 +134,21 @@ if (role === "main") {
       process.exit(0);
     }
   }
+} else if (role === "launcher-error") {
+  const [configPath, generation] = args;
+  const link = fs.linkSync;
+  fs.linkSync = (from, to) => {
+    if (String(to).endsWith(`${generation}.error.json`)) {
+      emit({ event: "paused", at: "error-link", generation });
+      const resumeFile = path.join(path.dirname(configPath), `resume-${generation}`);
+      while (!fs.existsSync(resumeFile)) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
+    }
+    return link(from, to);
+  };
+  const { supervise } = await jiti.import("./src/residency/launcher.ts");
+  process.argv.push("--launch-token", generation);
+  await supervise(configPath);
+  emit({ event: "done" });
 } else if (role === "generation-exit") {
   // A host writing its generation exit record (src/residency/generation-exit.ts), paused around the publishing
   // link: before-link (the complete temp file is written, not linked) or after-link (published).

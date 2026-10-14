@@ -12,6 +12,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { readResidentIdleExit, residentIdleExitPath } from "./idle-exit.js";
+import { readResidentGenerationError } from "./generation-exit.js";
 import { readFileRetrying, writeJsonAtomic } from "../core/atomic-write.js";
 import type { FabricActorInfo, FabricActorCreateRequest } from "../actors/types.js";
 import type { FabricAgentLog, AgentHandleInfo, AgentRunRecord, AgentRunRequest, AgentRunResult } from "../agents/types.js";
@@ -187,7 +188,6 @@ export class ResidencyClient {
   readonly hostId: string;
   readonly #configPath: string;
   readonly #ownerPath: string;
-  readonly #errorPath: string;
   readonly #requestsPath: string;
   readonly #responsesPath: string;
   readonly #agentsPath: string;
@@ -249,7 +249,6 @@ export class ResidencyClient {
     this.hostId = residentHostId(options.config.rootId);
     this.#configPath = path.join(options.config.residencyRoot, "config.json");
     this.#ownerPath = path.join(options.config.residencyRoot, "owner.json");
-    this.#errorPath = path.join(options.config.residencyRoot, "error.json");
     this.#requestsPath = path.join(options.config.residencyRoot, "requests");
     this.#responsesPath = path.join(options.config.residencyRoot, "responses");
     this.#agentsPath = path.join(options.config.residencyRoot, "agents");
@@ -413,7 +412,6 @@ export class ResidencyClient {
     // Recheck after the attachment wait: the old launcher may have entered
     // destructive watchdog custody while we still saw its live owner.
     assertNoWatchdogCustody(this.options.config.residencyRoot);
-    fs.rmSync(this.#errorPath, { force: true });
     // This explicit business startup, not a launcher recovery loop, revokes the idle stop.
     fs.rmSync(residentIdleExitPath(this.options.config.residencyRoot), { force: true });
     const launchToken = randomUUID();
@@ -425,7 +423,6 @@ export class ResidencyClient {
     this.#startupLauncher = launcher;
     // The budget counts from the launcher's first sign of life (its
     // launcher-started trace), so its own boot does not consume it.
-    const launcherBirth = processStartTime(launcher.pid);
     const budget = startupBudgetMs(this.options.startupTimeoutMs ?? HOST_READY_TIMEOUT_MS);
     let deadline = Date.now() + budget;
     let started = false;
@@ -446,11 +443,10 @@ export class ResidencyClient {
         }
         return owner;
       }
-      const failure = readJson<{ error?: unknown; launcherPid?: number; launcherBirth?: string }>(this.#errorPath);
-      // An exiting prior launcher can race this start after error.json was
-      // cleared. Its root diagnostic is not evidence about our owned attempt.
-      if (typeof failure?.error === "string" && (failure.launcherPid === undefined ||
-          (failure.launcherPid === launcher.pid && failure.launcherBirth === launcherBirth))) {
+      // Select only the error record whose filename is this call's launch token;
+      // a predecessor or earlier start cannot provide stale startup diagnostics.
+      const failure = readResidentGenerationError(this.options.config.residencyRoot, launchToken);
+      if (failure) {
         await this.#stopStartingLauncher();
         throw new Error(`Fabric resident host failed to start: ${failure.error}`);
       }

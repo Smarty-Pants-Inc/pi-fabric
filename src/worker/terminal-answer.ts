@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import { readFileRetrying, writeFileAtomic } from "../core/atomic-write.js";
+import { readFileRetrying, writeFileAtomic, withExclusiveFileLock } from "../core/atomic-write.js";
 
 export interface FinalAnswerReceipt {
   version: 1;
@@ -20,8 +20,14 @@ export const readFinalAnswerReceipt = (runDirectory: string, runId: string): Fin
   return undefined;
 };
 
+/** Publication and stdin injection share one run-local cross-process ordering. */
+export const withTaskFinalAnswerLock = <T>(runDirectory: string, operation: () => T): T => withExclusiveFileLock({
+  directory: runDirectory, lockName: ".task-final-answer.lock", attempts: 200, delayMs: 5,
+  timeoutMessage: "Task final-answer publication/injection lock timed out",
+}, operation);
+
 /** One native writer owns this run. A retry/late frame can never replace its answer. */
-export const saveFinalAnswerReceipt = (runDirectory: string, runId: string, text: string): FinalAnswerReceipt => {
+export const saveFinalAnswerReceipt = (runDirectory: string, runId: string, text: string): FinalAnswerReceipt => withTaskFinalAnswerLock(runDirectory, () => {
   const existing = readFinalAnswerReceipt(runDirectory, runId);
   if (existing) return existing;
   const file = path.join(runDirectory, "final-answer.json");
@@ -29,7 +35,7 @@ export const saveFinalAnswerReceipt = (runDirectory: string, runId: string, text
   const receipt: FinalAnswerReceipt = { version: 1, id: randomUUID(), runId, recordedAt: Date.now(), text };
   writeFileAtomic(file, JSON.stringify(receipt), { durable: true });
   return receipt;
-};
+});
 
 /** Text alongside tool calls is progress, not a final answer; truncation/retry isn't success. */
 export const finalAssistantText = (message: unknown): string | undefined => {

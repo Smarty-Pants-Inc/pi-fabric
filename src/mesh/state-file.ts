@@ -6,12 +6,13 @@ import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import childProcess from "node:child_process";
-import { readFileRetrying, writeFileAtomic, renameAtomic, MeshLockTimeoutError, trackTemporary, isNamespaceRace,
+import { readFileRetrying, writeFileAtomic, renameAtomic, isMeshIncarnationPending, MeshLockTimeoutError,
+  MeshSnapshotRetriesExhaustedError, trackTemporary, isNamespaceRace,
   requireNamespaceBarrier, syncPathNamespaceDurable } from "../core/atomic-write.js";
 import { MeshSyncNotDurableError } from "./not-durable.js";
 import { captureStoragePut, captureStorageDelete, storageRevision } from "../verified/storage.js";
 import { verifiedRemove } from "../storage/verified-remove.js";
-import { delay, errorCode, lockStats, MeshLockSnapshotNotReadyError, type MeshLock, type MeshStoreContext } from "./mesh-lock.js";
+import { delay, errorCode, type MeshLock, type MeshStoreContext } from "./mesh-lock.js";
 import { assertFileStateWritable, isMeshStateMovedMarker, isMeshStateNatsMarker, meshStateMovedError, meshStateMovedToNatsError, readMeshStateMovedMarker,
   type MeshStateMovedMarker, type MeshStateNatsMarker } from "./backend-fence.js";
 import type { MeshIdentity } from "./event-log.js";
@@ -931,11 +932,10 @@ export class StateFile implements StateBackend {
     if (this.#lock.lockProtocol >= 2 && !this.#lock.ownIncarnationReady && !scope?.active) {
       await this.#lock.ownIncarnation;
     }
-    // Honest counts for a snapshot refusal: optimistic preparations, and real .lock admissions (each found it stale).
-    let preparations = 0;
-    let lockAdmissions = 0;
+    let attempts = 0;
     for (;;) {
       this.#lock.writeAbortSignal?.throwIfAborted();
+      attempts += 1;
       const identity = this.#stateWriteIdentity();
       if (identity === undefined) {
         return this.#lock.withLock(() => {
@@ -946,16 +946,19 @@ export class StateFile implements StateBackend {
       let admitted = false;
       let prepared: P | undefined;
       try {
-        preparations += 1;
         prepared = prepare(this.#readStateForWrite());
         if (this.#stateWriteIdentity() !== identity) throw WRITE_SNAPSHOT_CHANGED;
         return await this.#lock.withLock(() => {
-          lockAdmissions += 1;
           if (this.#stateWriteIdentity() !== identity) throw WRITE_SNAPSHOT_CHANGED;
           admitted = true;
           return commit(prepared!);
         }, Math.max(0, deadline - Date.now()), lockClass);
       } catch (error) {
+        // Acquisition refusals retain their origin, even if the snapshot changed while waiting.
+        if (error instanceof MeshLockTimeoutError || isMeshIncarnationPending(error)) {
+          this.#stateCache = undefined;
+          throw error;
+        }
         // A stale CAS/parse/size error belongs to the snapshot, not the current file.
         if (error !== WRITE_SNAPSHOT_CHANGED && (admitted || this.#stateWriteIdentity() === identity)) {
           this.#stateCache = undefined;
@@ -964,12 +967,7 @@ export class StateFile implements StateBackend {
         // Never retry inside an actor registry fence: its caller releases custody and
         // retries the whole admission step, just as for a busy mesh.
         if (scope?.active || Date.now() >= deadline) {
-          // A real lock refusal (contention, or a cold-identity pre-lock refusal) was already counted by #withLock
-          // and carries its true attempts: surface it unchanged, never as a fabricated 0-attempt timeout.
-          if (error instanceof MeshLockTimeoutError) throw error;
-          lockStats?.failed(this.root, lockClass, 0, Boolean(scope?.active));
-          throw new MeshLockSnapshotNotReadyError(this.#statePath, preparations, lockAdmissions, Boolean(scope?.active),
-            error === WRITE_SNAPSHOT_CHANGED ? undefined : { cause: error });
+          throw new MeshSnapshotRetriesExhaustedError(attempts);
         }
         await delay(0, this.#lock.writeAbortSignal);
       } finally {

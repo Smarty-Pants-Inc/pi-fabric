@@ -653,9 +653,9 @@ describe("lock events in one process", () => {
     expect(createLockEvents("0")).toBe(current);
   });
 
-  // Review P2: a protocol-2 store whose incarnation is still pending fails closed for a shorter
-  // budget before it ever tries .lock: no wait-timeout event (and no owner-record read for one).
-  it("a cold protocol-2 fail-closed acquisition records no wait-timeout event", async () => {
+  // smarty-dev#12036: pending incarnation is not contention. A shorter-budget cold acquisition
+  // has its own retry code before it ever tries .lock, with no wait-timeout event.
+  it("a cold protocol-2 pending acquisition records no wait-timeout event", async () => {
     const { MeshLock } = await load();
     const root = temp();
     const holder = new MeshLock(root, {}, () => undefined);
@@ -667,7 +667,7 @@ describe("lock events in one process", () => {
     await inside;
     const cold = new MeshLock(root, { lockProtocol: 2 }, () => undefined);
     expect(cold.ownIncarnationReady).toBe(false);
-    await expect(cold.withLock(() => 1, 50, "publish")).rejects.toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT", attempts: 0 });
+    await expect(cold.withLock(() => 1, 50, "publish")).rejects.toMatchObject({ code: "FABRIC_MESH_INCARNATION_PENDING" });
     release();
     await holding;
     expect(readEvents(eventsFile(root))).toEqual([]);

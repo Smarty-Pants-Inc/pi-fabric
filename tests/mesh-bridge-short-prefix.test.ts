@@ -161,3 +161,17 @@ it.each([1, 4])("revoking source holds after prefix %s refuses every subsequent 
   expect(source.holdsCalls.length).toBeGreaterThan(BATCH_MAX);
   expect(target.singles).toBe(0);
 });
+
+it("a full receipt of a refusal-stopped list keeps 32 candidates later in the same pass (smarty-dev#12416)", async () => {
+  const { bridge, source, target } = await setup("toRemote", BATCH_MAX);
+  // Admission stops after two events, but the target commits that whole candidate list.
+  source.events[2]!.topic = "fabric.control.private";
+  const expected = source.events.filter((_, index) => index !== 2);
+  expect(await bridge.step()).toEqual({ toRemote: EVENTS - 1, toLocal: 0, dropped: 1 });
+  expect(target.candidateSizes).toEqual([2, BATCH_MAX - 3, BATCH_MAX]);
+  expect(outputIds(target)).toEqual(expected.map(event => event.id));
+  expect(target.output.map(item => item.event.text)).toEqual(expected.map(event => event.text));
+  expect(target.output).toHaveLength(EVENTS - 1);
+  expect(new Set(outputIds(target)).size).toBe(EVENTS - 1);
+  expect(target.singles).toBe(1);
+});

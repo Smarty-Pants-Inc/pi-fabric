@@ -49,11 +49,47 @@ export function checkRequest(value: unknown, maxBytes: number): asserts value is
   }
 }
 const probability = (v: unknown): v is number => typeof v === "number" && Number.isFinite(v) && v >= 0 && v <= 1;
+export interface JevUsage { input_tokens: number; output_tokens: number }
+/** Well-formed reported usage, or undefined. Never treats missing usage as zero. */
+export function reportedUsage(value: unknown): JevUsage | undefined {
+  if (!object(value) || !object(value.usage)) return undefined;
+  const { input_tokens, output_tokens } = value.usage;
+  return [input_tokens, output_tokens].every(v => Number.isSafeInteger(v) && (v as number) >= 0)
+    ? { input_tokens: input_tokens as number, output_tokens: output_tokens as number } : undefined;
+}
+/**
+ * A failed evaluation whose cost is known. A program bills `usage` and may
+ * keep evaluating; every other failure is unknown usage and closes inference.
+ */
+export class JevBilledError extends Error {
+  constructor(message: string, readonly usage: JevUsage) { super(message); }
+}
+/**
+ * A typed response whose answers are unusable but whose usage is well formed.
+ * The answers are never surfaced; the reported usage is still billed against
+ * the caller's budget. Responses without valid usage throw a plain Error.
+ */
+export class JevInvalidResponseError extends JevBilledError {}
+/** HTTP statuses a received Jev response may carry that justify a later retry. */
+export const JEV_TRANSIENT_HTTP_STATUSES: readonly number[] = [408, 429, 500, 502, 503, 504, 529];
+/**
+ * A received transient HTTP error with authoritative, validated reported usage.
+ * Missing or invalid usage throws a plain Error and closes later inference.
+ * Only this trusted error's numeric status/retry delay cross into the program;
+ * the response body never does.
+ */
+export class JevTransientHttpError extends JevBilledError {
+  constructor(message: string, usage: JevUsage, readonly status: number, readonly retryAfterMs: number | undefined) { super(message, usage); }
+  get guestFields(): Record<string, number> {
+    return { status: this.status, ...(this.retryAfterMs === undefined ? {} : { retryAfterMs: this.retryAfterMs }) };
+  }
+}
 export function checkResponse(value: unknown, request: JevRequest): JevResponse {
-  const invalid = (): never => { throw new Error("TypeSafe returned an invalid typed response"); };
-  if (!object(value) || typeof value.model !== "string" || value.model.length > 128 || !object(value.answers) || !object(value.usage)) return invalid();
-  const usage = value.usage;
-  if (![usage.input_tokens, usage.output_tokens].every(v => Number.isSafeInteger(v) && (v as number) >= 0)) return invalid();
+  const message = "TypeSafe returned an invalid typed response";
+  const reported = reportedUsage(value);
+  if (!reported || !object(value)) throw new Error(message);
+  const invalid = (): never => { throw new JevInvalidResponseError(message, reported); };
+  if (typeof value.model !== "string" || value.model.length > 128 || !object(value.answers)) return invalid();
   if (Object.keys(value.answers).length !== Object.keys(request.questions).length) return invalid();
   const entries: Array<[string, JevAnswer]> = [];
   for (const [id, question] of Object.entries(request.questions)) {
@@ -80,9 +116,7 @@ export function checkResponse(value: unknown, request: JevRequest): JevResponse 
       entries.push([id, { type: "score", score: a.score, confidence: a.confidence, probabilities, legend }]);
     }
   }
-  return { model: value.model, answers: Object.fromEntries(entries), usage: {
-    input_tokens: usage.input_tokens as number, output_tokens: usage.output_tokens as number,
-  } };
+  return { model: value.model, answers: Object.fromEntries(entries), usage: reported };
 }
 
 const schemaKeys = new Set(["type", "properties", "required", "additionalProperties", "items", "enum", "const", "anyOf", "oneOf", "allOf", "minimum", "maximum", "minLength", "maxLength", "minItems", "maxItems", "minProperties", "maxProperties", "description", "title"]);

@@ -115,7 +115,7 @@ const inspect = (directory: string, actorId: string): EnodevRun | undefined => {
 
 /** Writes the terminal record, discharges the archive custody, and removes the marker LAST (so it runs once). */
 const settle = (directory: string, run: EnodevRun, terminal: Record<string, unknown>): AgentRunResult => {
-  const result = { ...run.record, id: run.id, ...terminal,
+  const result = { ...run.record, id: run.id, ...terminal, ...uncleanReceipt(run.record),
     finishedAt: typeof run.record.finishedAt === "number" ? run.record.finishedAt : Date.now() } as unknown as AgentRunResult;
   writeJsonAtomic(run.statusFile, result, { durable: true });
   try { commitRunArchive(directory, "settlement"); } catch { /* no awaiting archive: nothing to discharge */ }
@@ -172,6 +172,18 @@ export const provenGoneEnodevLaunch = (directory: string, owned: OwnedProcess | 
   return record && record.id === id && record.transport === "process" ? record : undefined;
 };
 
+/**
+ * pi-fabric#1034 round 7: a Pi run promoted here from a running checkpoint did not end cleanly; what ran after the
+ * checkpoint is unknown, so its receipt (or an empty one) is marked truncated. A terminal record keeps its own.
+ */
+export const uncleanReceipt = (record: Record<string, unknown>): { writeReceipt?: Record<string, unknown> } => {
+  if (record.runner !== "pi" && record.runner !== "pi-durable") return {};
+  if (record.status !== "running" && record.status !== "queued") return {};
+  const receipt = typeof record.writeReceipt === "object" && record.writeReceipt !== null
+    ? record.writeReceipt as Record<string, unknown> : { paths: [], commands: [] };
+  return { writeReceipt: { ...receipt, truncated: true } };
+};
+
 /** The terminal record settleGoneEnodevLaunch writes for a proven-gone run, WITHOUT writing it (round 5: save first). */
 export const goneEnodevOutcome = (directory: string, record: Record<string, unknown>): AgentRunResult => {
   const id = path.basename(directory);
@@ -179,7 +191,7 @@ export const goneEnodevOutcome = (directory: string, record: Record<string, unkn
   const terminal = record.status !== "running" && record.status !== "queued" ? {}
     : text !== undefined ? { status: "completed", text }
     : { status: "failed", settledLost: true, error: "lost: the worker exit was unconfirmed (ENODEV) and no answer was saved" };
-  return { ...record, id, ...terminal, finishedAt: typeof record.finishedAt === "number" ? record.finishedAt : Date.now() } as unknown as AgentRunResult;
+  return { ...record, id, ...terminal, ...uncleanReceipt(record), finishedAt: typeof record.finishedAt === "number" ? record.finishedAt : Date.now() } as unknown as AgentRunResult;
 };
 
 /**
@@ -213,7 +225,7 @@ export const settleGoneEnodevLaunch = (directory: string, owned: OwnedProcess | 
 export const peekEnodevRun = (directory: string, actorId: string, activationId: string): AgentRunResult | undefined => {
   const run = inspect(directory, actorId);
   if (!run || run.activationId !== activationId || run.text === undefined) return undefined;
-  return { ...run.record, id: run.id, status: "completed", text: run.text,
+  return { ...run.record, id: run.id, status: "completed", text: run.text, ...uncleanReceipt(run.record),
     finishedAt: typeof run.record.finishedAt === "number" ? run.record.finishedAt : Date.now() } as unknown as AgentRunResult;
 };
 
@@ -222,6 +234,34 @@ export const settleEnodevRun = (directory: string, actorId: string, activationId
   const run = inspect(directory, actorId);
   if (!run || run.activationId !== activationId || run.text === undefined) return undefined;
   return settle(directory, run, { status: "completed", enodevDelivered: true, text: run.text });
+};
+
+/**
+ * smarty-dev#9855: an ENODEV-unconfirmed TASK-AGENT run (no actorId; #912 recovers actor runs) found by offline
+ * retention, whose manager is gone. The same facts as #912: the exact ENODEV marker, this run's own process status
+ * record, its worker proven gone (pid-reuse safe). Then it settles the run LOST, once, and delivers nothing: a
+ * record its manager already made terminal keeps its outcome and gains settledLost; a running one becomes completed
+ * when its worker saved an answer (a settlement.json receipt for exactly this run), or failed with none. Recovery never
+ * writes answer text into status.json: a saved answer stays only in settlement.json. The marker goes last, so retention can collect the run. Nothing is deleted here. Undefined keeps the
+ * veto. Delivery was removed in pi-fabric#1027 review round 1 (principal-data P1): a same-uid worker can rewrite the
+ * run's recipient manifest and its exit proof, so no answer recovered here may cross to another session.
+ */
+export const recoverEnodevTaskRun = (directory: string): "lost" | undefined => {
+  const id = path.basename(directory);
+  if (!RUN_ID.test(id)) return undefined;
+  const marker = readJson(path.join(directory, UNRESOLVED_WORKER_FILE));
+  if (typeof marker?.reason !== "string" || !marker.reason.startsWith(ENODEV_UNRESOLVED_REASON)) return undefined;
+  const statusFile = path.join(directory, "status.json");
+  const record = readJson(statusFile);
+  if (!record || record.id !== id || record.transport !== "process" || record.actorId !== undefined) return undefined;
+  if (!enodevWorkerGone(record)) return undefined;
+  const saved = savedEnodevAnswer(directory) !== undefined;
+  const terminal = record.status !== "running" && record.status !== "queued";
+  // settle() writes the record plus these fields only: no answer text is added (or removed).
+  settle(directory, { id, statusFile, record, activationId: "" }, terminal ? { settledLost: true } : !saved
+    ? { status: "failed", settledLost: true, error: "lost: the worker exit was unconfirmed (ENODEV), no answer was saved and its manager is gone" }
+    : { status: "completed", settledLost: true });
+  return "lost";
 };
 
 /**

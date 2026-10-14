@@ -246,6 +246,58 @@ describe("FabricState lazy bootstrap", () => {
     }
   });
 
+  it("smarty-dev#8881: a runtime import that resolves after an SDK dispose never initializes the stale ctx", async () => {
+    const cwd = project({ prewalk: { alwaysRearm: false }, mesh: { enabled: false } });
+    const harness = runtimeHarness();
+    let releaseImport: (() => void) | undefined;
+    let gated = true;
+    const loader = vi.fn(async () => {
+      if (gated) await new Promise<void>((resolve) => { releaseImport = resolve; });
+      return (harness.loader as unknown as () => Promise<unknown>)();
+    }) as never;
+    const state = createState(loader);
+    // AgentSession.dispose() invalidates the ctx (every read throws) but emits no session_shutdown.
+    let stale = false;
+    const base = contextAt(cwd);
+    const disposed = new Proxy(base as object, {
+      get(object, key, receiver) {
+        if (stale) throw new Error("This extension ctx is stale after session replacement or reload.");
+        return Reflect.get(object, key, receiver);
+      },
+    }) as ExtensionContext;
+    const hook = vi.fn();
+    state.setActivationHook(hook);
+    try {
+      await state.bootstrap(disposed);
+      const pending = state.ensure(disposed);
+      await vi.waitFor(() => expect(releaseImport).toBeTypeOf("function"));
+      stale = true;
+      gated = false;
+      releaseImport!();
+      await expect(pending).rejects.toThrow(/disposed/);
+      // No stale initialize, hook, or runtime left installed.
+      for (const instance of harness.instances) expect(instance.initialize).not.toHaveBeenCalled();
+      expect(hook).not.toHaveBeenCalled();
+      expect(state.initialized).toBe(false);
+
+      // A live successor session still activates normally.
+      const successor = contextAt(cwd, "session-2");
+      await state.bootstrap(successor);
+      const lease = await state.ensure(successor);
+      expect(lease.current()).toBe(true);
+      expect(state.initialized).toBe(true);
+      expect(hook).toHaveBeenCalledTimes(1);
+      expect(hook).toHaveBeenCalledWith(successor);
+      const live = harness.instances.filter((instance) => instance.initialize.mock.calls.length > 0);
+      expect(live).toHaveLength(1);
+      expect((live[0]!.initialize.mock.calls[0] as unknown[])[0]).toBe(successor);
+    } finally {
+      gated = false; releaseImport?.();
+      await state.shutdown();
+      fs.rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
   it("uses one activation for concurrent callers and never reloads after activation", async () => {
     const cwd = project({ prewalk: { alwaysRearm: false }, mesh: { enabled: false } });
     const harness = runtimeHarness();

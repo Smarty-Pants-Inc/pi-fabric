@@ -70,7 +70,7 @@ export function isolateTestFleetEnvironment(): Record<string, string> {
   }
   for (const key of [
     "PI_CODING_AGENT_DIR", "PI_CODING_AGENT", "PI_SESSION_ID", "PI_SESSION_FILE",
-    "SMARTY_ROLE", "SMARTY_LEAD_SESSION", "MCPORTER_CONFIG",
+    "SMARTY_ROLE", "SMARTY_AGENT", "SMARTY_LEAD_SESSION", "MCPORTER_CONFIG",
   ]) delete process.env[key];
 
   // Keep Windows' stable TMP policy, but never share fleet state between workers/files.

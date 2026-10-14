@@ -18,7 +18,7 @@ interface ResidentHostLaunchContext {
 }
 import { lockFile, FileLockBusy } from "./file-lock.js";
 import { assertNoWatchdogCustody } from "./watchdog-custody.js";
-import { readResidentOperatorEvidence, assertResidentOperatorConfirmed } from "./operator-safety.js";
+import { readResidentOperatorEvidence, assertResidentOperatorConfirmed, assertRootParticipantQuiet } from "./operator-safety.js";
 import { closeWithActors } from "../actors/close-order.js";
 import { residentProcessWorkPending, subscribeResidentProcessWork } from "./process-work.js";
 import fs from "node:fs";
@@ -378,10 +378,11 @@ export class ResidentHost {
     // smarty-dev#8526: lock only the registries holding the rows of the actors this round writes.
     // The project registry is ONE lock shared by every resident host of the project; a round that
     // publishes none of its rows no longer serializes behind (or blocks) other hosts on it.
-    // Any id held by no registry, or a round without an exact actor set, locks every registry.
-    // validPublication still checks every registry's generation under the fence.
+    // An exact empty set proves no actor effects and needs no registry. Any id held by no
+    // registry, or a round without an exact actor set, still locks every registry.
+    // validPublication still checks every registry's generation before committing.
     const publishFenced = <T>(publish: () => Promise<T>, actorIds?: ReadonlySet<string>): Promise<T> => {
-      let scoped: ActorRegistryStore[] | undefined;
+      let scoped: ActorRegistryStore[] | undefined = actorIds?.size === 0 ? [] : undefined;
       if (actorIds && actorIds.size > 0) {
         // ponytail: an unreadable snapshot only loses the scoping; the full fence (and its own reads) decide.
         try {
@@ -389,7 +390,7 @@ export class ResidentHost {
           if (holders.every(store => store !== undefined)) scoped = registries.filter(store => holders.includes(store));
         } catch { scoped = undefined; }
       }
-      return ActorRegistryStore.withLocks(scoped ?? registries, () => this.mesh.withTryLock(publish, 50));
+      return ActorRegistryStore.withLocks(scoped ?? registries, () => this.mesh.withTryLock(publish, 50), "presence-fence");
     };
     const knownRegistries = registries.map(store => ({ store, snapshot: store.snapshot(), byId: new Map(store.snapshot().actors.map(row => [row.id, row])) }));
     const current = (known: typeof knownRegistries[number]): typeof knownRegistries[number] => {
@@ -684,6 +685,31 @@ export class ResidentHost {
         ...(typeof config.actors?.transientBlockCooldownMs === "number" ? { transientBlockCooldownMs: config.actors.transientBlockCooldownMs } : {}),
         ...(typeof config.actors?.transientBlockMaxMs === "number" ? { transientBlockMaxMs: config.actors.transientBlockMaxMs } : {}),
         wakeText: currentWakeText,
+        // smarty-dev#8090: an operator removal's tree goes only after this check, run under the root's Main
+        // publication fence (held by the caller), the state transaction and the root participant key lock.
+        beforeOperatorCleanup: async (rootId) => {
+          if (rootId !== config.rootId) throw new Error(`Operator cleanup for foreign root ${rootId}; tree kept`);
+          const { fencedOperatorCheck } = await import("../actors/remove-offline.js");
+          await fencedOperatorCheck(this.mesh, this.identity as { id: string; name: string; kind: "agent" }, rootId, get => {
+            if (process.platform !== "linux") {
+              // pi-fabric#1014: off Linux this is main's existing path on this platform (no kernel fence, no Main
+              // identity primitive): the lease veto and the participant quiet check only.
+              assertResidentOperatorConfirmed(readResidentOperatorEvidence(config, { get }), rootId);
+              assertRootParticipantQuiet(config, { get });
+              return;
+            }
+            // pi-fabric#1031: the same Main-identity verdict as the offline removal. A stale record needs its Main
+            // pid+start identity independently gone and no live lease file; no record or no identity is unknown.
+            try {
+              assertResidentOperatorConfirmed(readResidentOperatorEvidence(config, { get }, undefined, { mainStopped: true }),
+                rootId, false, true);
+              assertRootParticipantQuiet(config, { get });
+            } catch (error) {
+              if (!(error instanceof ResidentActorAuthorizationError)) throw error;
+              throw new ResidentActorAuthorizationError(`${error.message}; the actor tree is kept: stop the Main, or let a host start finish it`);
+            }
+          });
+        },
         resolvePiModel: (model, requiredPin) => resolveResidentPiModel(model, { requiredPin: requiredPin ?? false, closest: false }),
         prepareModelRoute: async (input, signal) => {
           const { prepareModelRoute } = await import("../agents/model-route-prepare.js");
@@ -2166,7 +2192,7 @@ export class ResidentHost {
           const stopped = await pending;
           response = command.action === "stop"
             ? { format: RESIDENT_HOST_FORMAT, requestId, ok: true, actor: stopped, completedAt: Date.now() }
-            : await this.#removeResidentActor(actor.id, requestId, () => check());
+            : await this.#removeResidentActor(actor.id, requestId, () => check(), true);
         }
       } else if (command.operation === "actors") {
         response = {
@@ -2236,14 +2262,14 @@ export class ResidentHost {
     return response;
   }
 
-  async #removeResidentActor(id: string, requestId: string, commit: (id: string) => void): Promise<ResidentCommandResponse> {
+  async #removeResidentActor(id: string, requestId: string, commit: (id: string) => void, operator = false): Promise<ResidentCommandResponse> {
     const cleanup = this.actors.cleanupObligation(id);
     if (!this.actors.owns(id) || (cleanup && cleanup.residency !== "durable")) {
       throw new Error(`Resident host does not own ${id}`);
     }
     // smarty-dev#2184 item 8: stop now and return; the removal finishes behind its run.
     commit(id);
-    const removed = await this.actors.remove(id, { wait: false });
+    const removed = await this.actors.remove(id, { wait: false, ...(operator ? { operator: true as const } : {}) });
     this.#writeRemovals();
     if (removed.pending) {
       void this.actors.removalSettled(id)?.finally(() => {

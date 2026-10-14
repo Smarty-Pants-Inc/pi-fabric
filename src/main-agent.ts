@@ -10,6 +10,7 @@ import type { MeshIdentity } from "./mesh/store.js";
 import { takeCompactionDecline } from "./compaction/cancellation.js";
 import { fabricProvenanceOptions, fabricProvenanceSupported, fabricTurnProvenance, fabricWakeCause, copyFabricProvenance, fabricWakeMessage, admittedFabricWakeCauses, sendFabricMessage, sendFabricUserMessage, type FabricWakeCause, type FabricTurnProvenance, type FabricPrincipal } from "./fabric-provenance.js";
 import { classifyProviderError, type ProviderErrorClass } from "./provider-error-class.js";
+import { extensionContextLive } from "./session-liveness.js";
 
 import { FabricInterruptNotAuthorizedError, FabricInterruptRateLimitedError, type FabricInterruptAuthority } from "./interrupt-authority.js";
 
@@ -1581,6 +1582,7 @@ export class MainAgentController implements FabricMainAgentTarget {
     const operation = this.#operation;
     // Retain cancellation evidence while later completion handlers still run.
     this.#wake = setInterval(() => {
+      if (this.#contextRetired()) return;
       // Drain-off uses #closed to stop holding, not to end a manual operation. Close
       // itself cancels this timer; only the real idle boundary retires its signal.
       if (!this.#context || !operation || operation.aborted) {
@@ -1601,6 +1603,7 @@ export class MainAgentController implements FabricMainAgentTarget {
     // leave FIFO delivery to its boundaries; halt/reload/close cancel this waiter too.
     if (this.#preflightWake) return;
     this.#preflightWake = setInterval(() => {
+      if (this.#contextRetired()) return;
       const ctx = this.#context;
       // A no-run preflight may also leave an async compaction handler finishing. Busy
       // alone is not proof of agent_start; that event explicitly cancels this waiter.
@@ -1610,6 +1613,21 @@ export class MainAgentController implements FabricMainAgentTarget {
       this.#armProviderDeadTimer();                        // the preflight's idle edge; no-op unless pending
     }, 25);
     this.#preflightWake.unref?.();
+  }
+
+  /**
+   * smarty-dev#8881: AgentSession.dispose() and session replacement invalidate the bound ctx without
+   * session_shutdown, and every getter then throws. A timer that finds it stale suspends the drain as
+   * a native session switch does (prepareReload: admission only journals) and stops every loop; a
+   * later live attachFollowUpDrain resumes from the journal.
+   */
+  #contextRetired(): boolean {
+    const ctx = this.#context;
+    if (!ctx || extensionContextLive(ctx)) return false;
+    this.prepareReload();
+    this.#stopOperation();
+    this.#stopProviderDeadTimer();
+    return true;
   }
 
   #stopOperation(): void {
@@ -1662,6 +1680,7 @@ export class MainAgentController implements FabricMainAgentTarget {
     this.#providerReleaseUntil = until;
     this.#providerWake = setTimeout(() => {
       this.#providerWake = undefined;
+      if (this.#contextRetired()) return;
       if (!this.#context || this.#reloading || this.#halted || this.#context.signal?.aborted) return;
       this.#release(true);
     }, Math.max(0, until - Date.now()));
@@ -1750,6 +1769,7 @@ export class MainAgentController implements FabricMainAgentTarget {
     if (this.#providerDeadTimer || (phase !== "recovering" && phase !== "probation")) return;
     this.#providerDeadTimer = setTimeout(() => {
       this.#providerDeadTimer = undefined;
+      if (this.#contextRetired()) return;
       const dead = this.#providerDead;
       const ctx = this.#context;
       if (!dead || !ctx || !this.#bindingsLive || this.#reloading || this.#halted || ctx.signal?.aborted) return;
@@ -1774,13 +1794,20 @@ export class MainAgentController implements FabricMainAgentTarget {
   /** The same path a human /compact takes; compaction extensions may drop provider-bound blocks. */
   #compactForRecovery(dead: ProviderDeadState, ctx: ExtensionContext): void {
     dead.phase = "compacting";
+    // smarty-dev#8881: Pi may deliver these callbacks after dispose() or session replacement. Only the
+    // incident they were started for, through the still-live ctx they were started on, may advance it;
+    // a stale ctx retires only a stale current binding (#contextRetired), never a live successor.
+    const fresh = (): boolean => {
+      if (!extensionContextLive(ctx)) { this.#contextRetired(); return false; }
+      return this.#providerDead === dead && this.#bindingsLive && !this.#reloading;
+    };
     const failed = (): void => {
-      if (this.#providerDead !== dead || dead.phase !== "compacting") return;
+      if (!fresh() || dead.phase !== "compacting") return;
       this.#raiseProviderDead("compaction-failed");
     };
     try {
       // Pi calls onComplete after its compaction state is cleared: the idle edge for the one attempt.
-      ctx.compact({ onComplete: () => { if (this.#providerDead === dead) { this.#providerCompacted(); this.#armProviderDeadTimer(); } }, onError: failed });
+      ctx.compact({ onComplete: () => { if (fresh()) { this.#providerCompacted(); this.#armProviderDeadTimer(); } }, onError: failed });
     } catch {
       failed();
     }

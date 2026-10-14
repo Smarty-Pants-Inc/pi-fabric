@@ -7,14 +7,15 @@
  * root's Main refuses to publish its root participant record, in the same atomic step as that write
  * (under the participant key lock, or inside the state transaction). The remover checks under those
  * same fences while holding the lock, so a Main that published first is seen and a Main that publishes
- * later is refused.
+ * later is refused. Where the fence cannot be held (every non-Linux platform, smarty-dev#8090; follow-up
+ * smarty-dev#11335), no root actor tree deletion runs at all.
  */
 import { spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { FileLockBusy, lockFile } from "../residency/file-lock.js";
+import { FileLockBusy, kernelFenceAvailable, lockFile } from "../residency/file-lock.js";
 
 export class MainPublicationFencedError extends Error {
   readonly code = "FABRIC_MAIN_PUBLICATION_FENCED";
@@ -31,19 +32,13 @@ export const mainPublicationFencePath = (meshRoot: string, rootId: string): stri
 /** Cheap and synchronous, for the Main's publish step. No fence file: not fenced. A fence file: held
  * exactly while its exclusive flock is held (a non-blocking shared flock test fails). Unknown: fenced. */
 export const mainPublicationFenced = (meshRoot: string, rootId: string): boolean => {
+  // Linux-only fence (smarty-dev#8090): off Linux no fence can be taken, and deleteRootActorTree refuses there, so
+  // no root actor tree deletion can run that a Main publication would race; nothing there is fenced.
+  if (process.platform !== "linux") return false;
   const file = mainPublicationFencePath(meshRoot, rootId);
   try { fs.lstatSync(file); }
   catch (error) { return (error as NodeJS.ErrnoException).code !== "ENOENT"; }
-  if (process.platform === "win32") {
-    // ponytail: no flock on Windows; a same-host pid check stands in (kill 0: ESRCH means stale). The offline
-    // remover itself refuses on Windows (smarty-dev#7858), so this only keeps a stray record from blocking forever.
-    try {
-      const record = JSON.parse(fs.readFileSync(file, "utf8")) as Partial<FenceRecord>;
-      if (typeof record.pid !== "number" || record.host !== os.hostname()) return true;
-      process.kill(record.pid, 0);
-      return true;
-    } catch (error) { return (error as NodeJS.ErrnoException).code !== "ESRCH"; }
-  }
+  // No pid or time guess stands in for the kernel lock (smarty-dev#8090).
   const probe = spawnSync("flock", ["-s", "-n", file, "true"], { stdio: "ignore", timeout: 5_000 });
   return probe.status !== 0; // 1: held; anything else (no flock, error): fail closed
 };
@@ -59,10 +54,22 @@ const ensureFenceFile = (file: string, record: FenceRecord): void => {
   } finally { fs.rmSync(tmp, { force: true }); }
 };
 
+/** Refuse where this platform cannot hold the Main publication fence (every non-Linux platform): no root actor
+ * tree deletion runs there (smarty-dev#8090; follow-up smarty-dev#11335). Callers run it before any claim or mutation. */
+export const assertMainPublicationFencePlatform = (rootId: string): void => {
+  if (process.platform !== "linux") {
+    throw new Error(`Root actor tree deletion needs the Main publication fence, which this platform (${process.platform}) lacks ` +
+      `(smarty-dev#8090); follow-up smarty-dev#11335; the root ${rootId} actor tree is kept`);
+  }
+};
+
 /** Take the fence: an exclusive flock on the fence file, held until release. A held fence refuses; a stale
  * one (its holder died, so the kernel dropped its lock) is taken over by locking it, then rewriting it. */
 export const takeMainPublicationFence = async (meshRoot: string, rootId: string): Promise<() => void> => {
-  if (process.platform === "win32") throw new Error("The Main publication fence needs flock (smarty-dev#7858)");
+  // Before any file is made: without a kernel lock there is no fence, and nothing is deleted (smarty-dev#8090).
+  const kept = `the root ${rootId} actor tree is kept`;
+  assertMainPublicationFencePlatform(rootId);
+  if (!kernelFenceAvailable()) throw new Error(`The Main publication fence needs flock(1) and setpriv, not found; ${kept}`);
   const file = mainPublicationFencePath(meshRoot, rootId);
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
   const record: FenceRecord = { format: 1, pid: process.pid, host: os.hostname(), createdAt: new Date().toISOString() };
@@ -72,23 +79,25 @@ export const takeMainPublicationFence = async (meshRoot: string, rootId: string)
     try { fd = await lockFile(file, 0, true); }
     catch (error) {
       if (error instanceof FileLockBusy) throw new Error("Another operator actor removal holds this root's Main publication fence");
-      throw error;
+      throw new Error(`The Main publication fence could not be locked (${error instanceof Error ? error.message : String(error)}); ${kept}`);
     }
-    // The lock must be on the file at the path: a releasing holder may have unlinked it meanwhile.
-    let current: fs.Stats | undefined;
-    try { current = fs.lstatSync(file); } catch { /* unlinked: retry */ }
-    const locked = fs.fstatSync(fd);
-    if (current && current.ino === locked.ino && current.dev === locked.dev) {
-      const bytes = Buffer.from(JSON.stringify(record));
-      fs.ftruncateSync(fd, 0); fs.writeSync(fd, bytes, 0, bytes.length, 0); fs.fsyncSync(fd);
-      let released = false;
-      return () => {
-        if (released) return;
-        released = true;
-        fs.rmSync(file, { force: true }); // unlink while still locked, then drop the lock
-        fs.closeSync(fd);
-      };
-    }
+    try {
+      // The lock must be on the file at the path: a releasing holder may have unlinked it meanwhile.
+      let current: fs.Stats | undefined;
+      try { current = fs.lstatSync(file); } catch { /* unlinked: retry */ }
+      const locked = fs.fstatSync(fd);
+      if (current && current.ino === locked.ino && current.dev === locked.dev) {
+        const bytes = Buffer.from(JSON.stringify(record));
+        fs.ftruncateSync(fd, 0); fs.writeSync(fd, bytes, 0, bytes.length, 0); fs.fsyncSync(fd);
+        let released = false;
+        return () => {
+          if (released) return;
+          released = true;
+          // Unlink while still locked, then drop the lock; the descriptor closes even when the unlink fails.
+          try { fs.rmSync(file, { force: true }); } finally { fs.closeSync(fd); }
+        };
+      }
+    } catch (error) { fs.closeSync(fd); throw error; }
     fs.closeSync(fd);
     if (attempt >= 3) throw new Error("The root's Main publication fence kept changing; retry the removal");
   }
@@ -104,7 +113,8 @@ export const acquireMainPublicationFence = async (meshRoot: string, rootId: stri
   else {
     entry = { count: 1, release: takeMainPublicationFence(meshRoot, rootId) };
     held.set(key, entry);
-    entry.release.catch(() => held.delete(key));
+    const failed = entry;
+    entry.release.catch(() => { if (held.get(key) === failed) held.delete(key); });
   }
   const releaseFence = await entry.release;
   let released = false;
@@ -115,16 +125,27 @@ export const acquireMainPublicationFence = async (meshRoot: string, rootId: stri
   };
 };
 
+/** Test seam only: awaited under the held fence, before the final check and between it and the delete. */
+export const actorTreeDeletionHooks: {
+  beforeCheck?: () => void | Promise<void>;
+  beforeDelete?: () => void | Promise<void>;
+} = {};
+
 /**
- * THE path that removes (moves to its archive) a root's actor tree in an offline removal (smarty-dev#7817): hold the root's
- * Main publication fence, run the final check under it, delete, release in finally. A Main cannot publish
- * its root participant between the check and the delete. The live host path is smarty-dev#8090.
+ * THE path that deletes (or moves to its archive) a root's whole actor tree (smarty-dev#7817, smarty-dev#8090): the
+ * offline archive move, the live host's ActorManager cleanup, and a non-persistent manager's close. Hold the
+ * root's Main publication fence, run the final check under it, delete, release in finally. A Main cannot
+ * publish its root participant between the check and the delete. The fence is taken unconditionally, before the
+ * hooks, the check and the delete: where it cannot be held (no flock, or any non-Linux platform, smarty-dev#8090;
+ * follow-up smarty-dev#11335) this throws and nothing is checked or deleted; the tree is kept.
  */
 export const deleteRootActorTree = async (meshRoot: string, rootId: string, remove: () => void | Promise<void>,
   check?: () => void | Promise<void>): Promise<void> => {
   const release = await acquireMainPublicationFence(meshRoot, rootId);
   try {
+    await actorTreeDeletionHooks.beforeCheck?.();
     await check?.();
+    await actorTreeDeletionHooks.beforeDelete?.();
     await remove();
   } finally { release(); }
 };

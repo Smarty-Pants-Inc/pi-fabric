@@ -313,7 +313,7 @@ export class SessionActorOrphans {
                       !this.#actorAbsent(sessionId, id)) return false;
                   prepared.commit();
                   return true;
-                })), 0));
+                })), 0), "session-orphans-reconcile");
           } finally { prepared.dispose(); }
           if (!committed) continue;
           stopped++;
@@ -361,7 +361,7 @@ export class SessionActorOrphans {
           orphan.oldRoot !== marker.oldRoot || orphan.orphanedAt !== marker.orphanedAt || orphan.alarmPublishedAt !== undefined) return undefined;
       return { actors: current.map(candidate => candidate.id === row.id
         ? { ...candidate, sessionOrphan: { ...orphan, alarmPublishedAt: Date.now() } } : candidate), durable: true, value: true };
-    });
+    }, "session-orphans-ack");
   }
 
   async close(): Promise<void> { this.#closed = true; await this.#pending; }

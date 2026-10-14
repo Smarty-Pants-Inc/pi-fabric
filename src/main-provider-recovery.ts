@@ -1,6 +1,7 @@
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { resolveFabricIdentity, sendFabricMessage } from "./fabric-provenance.js";
+import { extensionContextLive } from "./session-liveness.js";
 
 /** Final settlement is after Pi's own retry/overflow recovery, unlike agent_end (#4012). */
 export const registerMainProviderRecovery = (pi: ExtensionAPI, options: {
@@ -21,6 +22,7 @@ export const registerMainProviderRecovery = (pi: ExtensionAPI, options: {
   const reset = (): void => { cancel(); retried = false; reported = false; };
   pi.on("agent_start", cancel);
   pi.on("input", cancel);
+  pi.on("session_start", reset);
   pi.on("session_shutdown", reset);
   pi.on("session_before_switch", reset);
   pi.on("session_tree", reset);
@@ -42,15 +44,20 @@ export const registerMainProviderRecovery = (pi: ExtensionAPI, options: {
     if (!last || last.stopReason === "aborted") return;
     if (last.stopReason !== "error") { reset(); return; }
     const current = generation;
+    // smarty-dev#10718: dispose/replacement invalidates this ctx and emits no session_shutdown here.
+    // Every continuation below (await, backoff, idle poll) retires quietly on a stale ctx instead of
+    // throwing Pi's stale-ctx error out of a timer, which is uncaught and exits Pi. No timer of this
+    // settle is pending when live() runs (wakeWhenIdle clears it first), so retiring is just returning.
+    const live = (): boolean => generation === current && extensionContextLive(context);
     // The classifier loads at the first failed settle: it is shared with the lazy Main drain and
     // would otherwise split into its own eager startup chunk.
     const { classifyProviderError } = await import("./provider-error-class.js");
-    if (generation !== current) return;
+    if (!live()) return;
     // A blind retry of a request the provider rejects as non-retryable fails the same way.
     if (classifyProviderError(last)?.retryable === false && options.ownsNonRetryable?.() === true) { reset(); return; }
     // Optional provider utilities must not enter registration's eager graph.
     const { isContextOverflow } = await import("@earendil-works/pi-ai/compat");
-    if (generation !== current || context.signal?.aborted || options.halted() ||
+    if (!live() || context.signal?.aborted || options.halted() ||
       isContextOverflow(last, context.model?.contextWindow ?? 0)) return;
     if (retried) {
       if (reported) return;
@@ -65,7 +72,7 @@ export const registerMainProviderRecovery = (pi: ExtensionAPI, options: {
       context.ui.notify(message, "error");
       try { await options.report(message, context); }
       catch (error) {
-        if (generation === current) context.ui.notify(`Provider error report delivery failed: ${String(error)}`, "error");
+        if (live()) context.ui.notify(`Provider error report delivery failed: ${String(error)}`, "error");
       }
       return;
     }
@@ -74,7 +81,7 @@ export const registerMainProviderRecovery = (pi: ExtensionAPI, options: {
     // until Pi is idle; a busy sample is not a triggered retry and spends no budget.
     const wakeWhenIdle = (): void => {
       timer = undefined;
-      if (generation !== current || context.signal?.aborted || options.halted()) return;
+      if (!live() || context.signal?.aborted || options.halted()) return;
       if (!context.isIdle() || (context as { isSettling?: () => boolean }).isSettling?.()) {
         timer = setTimeout(wakeWhenIdle, 100);
         timer.unref?.();

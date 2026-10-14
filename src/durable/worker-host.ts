@@ -3,7 +3,7 @@ import path from "node:path";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import {
   AgentSessionRuntime, createAgentSessionServices, createCodemodeExtension,
-  createMcpExtension, createToolSearchExtension, getAgentDir,
+  createMcpExtension, createToolSearchExtension, ExtensionRunner, getAgentDir,
   hasTrustRequiringProjectResources, ProjectTrustStore, resolveCliModel,
   runRpcMode, SessionManager, SettingsManager,
   type CreateAgentSessionRuntimeFactory, type LoadExtensionsResult,
@@ -41,8 +41,19 @@ export async function resolveDurableProjectTrust(options: {
   return store.get(options.cwd) ?? options.defaultProjectTrust === "always";
 }
 
+// The pinned worker SDK has its own ExtensionRunner identity. Use the fork's
+// existing, strictly validated task-entry registration before extensions load.
+// Keep the symbol inline: the extension's startup graph must not gain a chunk
+// shared with this worker-only module.
+const advertiseHostExtensionRunner = (): void => {
+  Object.defineProperty(globalThis, Symbol.for("pi-fabric.host-extension-runner.v1"), {
+    value: ExtensionRunner, configurable: true,
+  });
+};
+
 /** A full native Pi runtime host whose Agent scheduling is owned by pi-durable. */
 export async function createDurableWorkerRuntime(options: DurableWorkerOptions): Promise<AgentSessionRuntime> {
+  advertiseHostExtensionRunner();
   const cwd = process.cwd();
   const agentDir = getAgentDir();
   const manager = options.sessionFile ? SessionManager.open(options.sessionFile, undefined, cwd) : SessionManager.inMemory(cwd);

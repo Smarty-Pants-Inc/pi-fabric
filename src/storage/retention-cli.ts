@@ -197,16 +197,21 @@ const sweep = async (meshRoot: string, options: {
   const residents = new Map<string, string>();
   const ambiguous = new Set<string>();
   const registries: string[] = [];
-  // Strict (pi-fabric#850 round 4): any entry that is not ours, a link, hard-linked, or gone between the listing and its
-  // lstat makes the registry roots uncertain. Tolerating such entries on a live mesh is smarty-dev#9058.
+  // Any entry that is not ours, a link or hard-linked makes the registry roots uncertain. An entry that is gone between
+  // the listing and its lstat is skipped (smarty-dev#9058) but counted: a walk that skipped one vetoes the candidate whose
+  // check it serves, and the next check walks again (see checkedFresh).
+  let vanished = 0;
   const discover = (root: string, depth = 0, found = registries): void => {
-    if (absent(root)) return;
+    if (absent(root)) { if (depth > 0) vanished++; return; }
     if (depth > 4 || !ownedStat(root)?.isDirectory()) throw new Error(`Actor references are uncertain: ${root}`);
     if (!absent(path.join(root, "actors.json"))) found.push(root);
-    for (const name of fs.readdirSync(root)) {
+    let names: string[];
+    try { names = fs.readdirSync(root); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") { vanished++; return; } throw error; }
+    for (const name of names) {
       if (["runs", "handoff-session", "child-completions"].includes(name)) continue;
       const child = path.join(root, name); const stat = ownedStat(child);
-      if (!stat) throw new Error(`Actor references are uncertain: ${child}`);
+      if (!stat) { if (absent(child)) { vanished++; continue; } throw new Error(`Actor references are uncertain: ${child}`); }
       if (stat.isDirectory()) discover(child, depth + 1, found);
     }
   };
@@ -225,10 +230,71 @@ const sweep = async (meshRoot: string, options: {
   // #9160: each direct actors/ entry's lstat type, dev and ino (never mtime: actor activity must not stop the sweep),
   // taken before discovery so a swap during or after the walk differs. undefined: unknown listing or stat (fail closed).
   const entryKind = (stat: fs.Stats): string => stat.isDirectory() ? "directory" : stat.isFile() ? "file" : stat.isSymbolicLink() ? "symlink" : "other";
+  // CODE-P1 (smarty-dev#9058): the project registry actors/actors.json is saved by ActorRegistryStore's renameAtomic, so a
+  // normal save is a new inode. While it is a regular, single-link file owned by this uid, not writable by others, its identity is kind+dev+uid
+  // (not the inode): such a generation is not a replacement. This proves no writer provenance; it accepts a safe regular
+  // generation per the registry's own contract, and the stamp in every final check still vetoes an overlapping save. Any
+  // other kind, owner or link count (or no getuid) keeps the exact inode identity, so that flip is a sticky replacement.
+  // Windows: no uid/mode, so any registry change stops planning (fail closed); smarty-dev#7858
+  // smarty-dev#976 B1: the project store's withLock dir actors/actors.json.lock is a new inode per generation. Only an
+  // owned private actual directory, empty or holding only an owned private single-link regular `owner` with a valid
+  // token/pid/time(/start[/label]) record read through O_NOFOLLOW, earns the kind+dev+uid role. Safe shape with missing, torn or
+  // malformed content: undefined (unknown, no identity recorded). Any physically unsafe shape: the exact raw identity.
+  const lockIdentity = (stat: fs.Stats): string | undefined | false => {
+    const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
+    const lockDir = path.join(actorsRoot, "actors.json.lock");
+    if (process.platform === "win32" || uid === undefined || !stat.isDirectory() || stat.uid !== uid || (stat.mode & 0o077) !== 0) return false;
+    const names = fs.readdirSync(lockDir);
+    if (names.some(name => name !== "owner")) return false;
+    let record = "";
+    if (names.length === 1) {
+      const owner = fs.lstatSync(path.join(lockDir, "owner"), { throwIfNoEntry: false });
+      if (owner !== undefined) {
+        if (!owner.isFile() || owner.nlink !== 1 || owner.uid !== uid || (owner.mode & 0o077) !== 0) return false;
+        let fd: number;
+        try { fd = fs.openSync(path.join(lockDir, "owner"), fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK); }
+        catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw error; }
+        try {
+          const held = fs.fstatSync(fd);
+          if (!held.isFile() || held.nlink !== 1 || held.uid !== uid || (held.mode & 0o077) !== 0) return false;
+          if (held.dev !== owner.dev || held.ino !== owner.ino) return undefined;
+          if (held.size > 256) return undefined;
+          const buffer = Buffer.alloc(257), bytes = fs.readSync(fd, buffer, 0, buffer.length, 0);
+          if (bytes !== held.size) return undefined; // a short read or a growth is unknown; never trust a prefix
+          record = buffer.subarray(0, bytes).toString("utf8");
+          const canonical = fs.lstatSync(path.join(lockDir, "owner"), { throwIfNoEntry: false });
+          if (canonical && (!canonical.isFile() || canonical.nlink !== 1 || canonical.uid !== uid || (canonical.mode & 0o077) !== 0)) return false;
+          if (!canonical || canonical.dev !== held.dev || canonical.ino !== held.ino || canonical.size !== held.size ||
+              canonical.mtimeMs !== held.mtimeMs || canonical.ctimeMs !== held.ctimeMs || canonical.mode !== held.mode ||
+              canonical.uid !== held.uid || canonical.nlink !== held.nlink) return undefined;
+        } finally { fs.closeSync(fd); }
+      }
+    }
+    const after = fs.lstatSync(lockDir, { throwIfNoEntry: false });
+    if (after && (!after.isDirectory() || after.uid !== uid || (after.mode & 0o077) !== 0)) return false;
+    if (!after || after.dev !== stat.dev || after.ino !== stat.ino || after.mode !== stat.mode || after.uid !== stat.uid ||
+        after.mtimeMs !== stat.mtimeMs || after.ctimeMs !== stat.ctimeMs || after.nlink !== stat.nlink) return undefined;
+    // ponytail (#8526): exact legacy 3/4 fields or 5 with a bounded ASCII label; empty start needs that label.
+    // Absolute EOF keeps extra fields, including an extra empty field, unknown.
+    const fields = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\n([1-9]\d*)\n(0|[1-9]\d*)\n(?:\d+\n|\d*\n[\x20-\x7e]{1,64}\n)?(?![\s\S])/.exec(record);
+    return fields && Number.isSafeInteger(Number(fields[1])) && Number.isSafeInteger(Number(fields[2]))
+      ? `directory\0${stat.dev}\0uid:${uid}\0project-registry-lock` : undefined;
+  };
+  const entryIdentity = (name: string, stat: fs.Stats): string | undefined => {
+    if (name === "actors.json.lock") { const role = lockIdentity(stat); if (role !== false) return role; }
+    return entryIdentityRaw(name, stat);
+  };
+  const entryIdentityRaw = (name: string, stat: fs.Stats): string =>
+    name === "actors.json" && stat.isFile() && stat.nlink === 1 && (stat.mode & 0o022) === 0 &&
+      typeof process.getuid === "function" && stat.uid === process.getuid()
+      ? `file\0${stat.dev}\0uid:${stat.uid}\0project-registry`
+      : `${entryKind(stat)}\0${stat.dev}\0${stat.ino}`;
   // #10635: a listed entry gone at its lstat (ENOENT) re-lists, at most 3 listings per call. Gone and staying gone is a
   // benign removal. Every identity seen within this call is kept and compared with all later reads: a different one is
-  // a replacement (undefined). A name that vanished before any identity was seen and comes back is judged by `replaced`
+  // a replacement (sticky `stop`, then undefined). A name that vanished before any identity was seen and comes back is judged by `replaced`
   // against the sweep's first-ever identities. Any other error, or a third listing with a vanished entry, is unknown.
+  let stop: string | undefined; // sticky: set only by a replacement
+  const readable = (identity: string): string => identity.split("\0").join("/");
   const entries = (): Map<string, string> | undefined => {
     const seen = new Map<string, string>();
     for (let attempt = 0; attempt < 3; attempt++) {
@@ -243,8 +309,9 @@ const sweep = async (meshRoot: string, options: {
             if ((error as NodeJS.ErrnoException).code !== "ENOENT") return undefined;
             vanished = true; continue;
           }
-          const identity = `${entryKind(stat)}\0${stat.dev}\0${stat.ino}`;
-          if (seen.has(name) && seen.get(name) !== identity) return undefined;
+          const identity = entryIdentity(name, stat);
+          if (identity === undefined) return undefined; // a lock generation in progress: unknown, nothing recorded
+          if (seen.has(name) && seen.get(name) !== identity) { stop ??= `an actors entry changed type or identity: ${name} ${readable(seen.get(name)!)} -> ${readable(identity)}`; return undefined; }
           seen.set(name, identity); current.set(name, identity);
         }
         if (!vanished) return current;
@@ -252,63 +319,119 @@ const sweep = async (meshRoot: string, options: {
     }
     return undefined;
   };
-  let listing = entries();
-  if (!listing) throw new Error(`Actor references are uncertain: ${actorsRoot}`);
+  // smarty-dev#9058: every candidate is decided at its own final check, `checkedFresh` below, which surrounds the actual
+  // refs.fresh() read. Only a replaced entry or a replaced/moved actors/ is sticky (#9160, #10635); any other change or
+  // uncertainty keeps only the candidate whose check it overlaps, and the next check re-walks and recovers.
+  // Canonical runtime registry roots are actors/actors.json and actors/<session>/actors.json (fabric-runtime-state.ts
+  // `actorRoots`). This is not an exhaustive ownership claim: registries under supported non-canonical config/run-root
+  // overrides are not attributed here, which stays unresolved under smarty-dev#10678 (this dry run frees nothing; apply
+  // is refused). Over the canonical roots an observation is: actors/'s own identity, every direct entry's type/dev/ino, and an exact lstat stamp (or absence) of
+  // actors.json in actors/ and in EVERY current direct directory. Directory timestamps are not used (a coarse tick hides a
+  // create). It never stats the ~10k actor homes below (smarty-dev#7916); only a changed name or presence re-walks.
+  const rootIdentity = (): string | undefined => {
+    try {
+      const stat = fs.lstatSync(actorsRoot, { throwIfNoEntry: false });
+      return stat === undefined ? "absent" : ownedStat(actorsRoot)?.isDirectory() ? `${stat.dev}\0${stat.ino}` : undefined;
+    } catch { return undefined; }
+  };
+  let firstRoot = rootIdentity();
+  const listing = entries();
+  if (!listing || firstRoot === undefined) throw new Error(`Actor references are uncertain: ${actorsRoot}`);
   // First identity ever seen per name, never dropped: a same-named entry that differs (even after a removal the
   // re-walk accepted) stops the sweep. Only new names may be absorbed by a re-walk.
   const identities = new Map(listing);
-  const replaced = (current: Map<string, string>): boolean =>
-    [...current].some(([name, identity]) => identities.has(name) && identities.get(name) !== identity);
+  const replaced = (current: Map<string, string>): string | undefined => {
+    const found = [...current].find(([name, identity]) => identities.has(name) && identities.get(name) !== identity);
+    return found && `an actors entry changed type or identity: ${found[0]} ${readable(identities.get(found[0])!)} -> ${readable(found[1])}`;
+  };
+  const stampOf = (file: string): string | undefined => {
+    const stat = fs.lstatSync(file, { throwIfNoEntry: false });
+    return stat && `${entryKind(stat)}:${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}:${stat.nlink}:${stat.uid}`;
+  };
+  /** The observation, or why it is unknown (with `stop` set when that is a replacement). */
+  const observe = (): { key: string; full: string; current: Map<string, string> } | string => {
+    const root = rootIdentity();
+    if (root !== undefined && firstRoot !== "absent" && root !== firstRoot) return stop ??= "the actors directory was replaced or moved";
+    const current = entries();
+    if (root === undefined || !current) return "the actors listing is unknown";
+    const change = replaced(current);
+    if (change !== undefined) return stop ??= change;
+    if (firstRoot === "absent" && root !== "absent") firstRoot = root;
+    try {
+      const sorted = [...current].sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0);
+      const probes = [actorsRoot, ...sorted.filter(([, identity]) => identity.startsWith("directory\0")).map(([name]) => path.join(actorsRoot, name))]
+        .map(directory => [directory, stampOf(path.join(directory, "actors.json"))] as const);
+      const key = [root, ...sorted.map(entry => entry.join("\0")), ...probes.map(([directory, stamp]) => `${directory}\0${stamp !== undefined}`)].join("\n");
+      // The raw lock-dir and owner generation (B1): the role key never hides a physical replacement within a bracket.
+      const lock = path.join(actorsRoot, "actors.json.lock");
+      const raw = current.has("actors.json.lock") ? `\n${stampOf(lock) ?? ""}\n${stampOf(path.join(lock, "owner")) ?? ""}` : "";
+      return { key, full: `${key}\n${probes.map(([, stamp]) => stamp ?? "").join("\n")}${raw}`, current };
+    } catch (error) { return `an actors.json probe failed: ${(error as Error).message}`; }
+  };
+  const first = observe();
   discover(actorsRoot);
-  // pi-fabric#645 review round 4: every final pre-delete check re-discovers the registry roots. A root
-  // created (or removed) since discovery may hold a cross-root reference the reread of `registries`
-  // cannot see: every later delete fails closed and the sweep reports it. Sticky once changed.
-  // pi-fabric#850 round 4: strict again. Any change in the registry roots, an actors.json appearing in a watched
-  // directory, or an uncertain walk stops every later delete of this sweep. Continuing on a live mesh is smarty-dev#9058.
-  // ponytail: the per-delete check relies on one invariant: an actor registry lives only at actors/actors.json (the
-  // project registry) or actors/<session>/actors.json (a session registry). Enforced where every registry is created:
-  // fabric-runtime-state.ts `actorRoots` ({ project: <mesh>/actors, session: <mesh>/actors/<session id> }) feeds
-  // ActorManager's registry store, and fabric-state.ts reads exactly those two. So a new root is either a new name in
-  // actors/ or an actors.json appearing in actors/ or in one of its directories that had none. The check lists actors/
-  // (one readdir) and probes actors.json in those directories (one lstat each); it never stats the ~10k actor homes
-  // below, which cost minutes per sweep on Ryzen 1 (smarty-dev#7916). Names, not mtimes: within one coarse clock tick
-  // a directory's mtime need not change. A changed listing re-walks the whole tree, as before (pi-fabric#645 round 4).
-  const rootSet = (roots: readonly string[]) => [...roots].sort().join("\0");
-  const discovered = rootSet(registries);
-  const nameSet = (map: Map<string, string>): string => [...map.keys()].sort().join("\0");
-  const unregistered = (): string[] => [actorsRoot, ...(() => { try { return fs.readdirSync(actorsRoot); } catch { return []; } })()
-    .map(name => path.join(actorsRoot, name))].filter(directory => !registries.includes(directory) && ownedStat(directory)?.isDirectory());
-  let watch = unregistered();
-  let rootsChanged = false;
-  const registryRootsChanged = (): boolean => {
-    if (rootsChanged) return true;
-    let changed: string | undefined = watch.some(directory => fs.lstatSync(path.join(directory, "actors.json"), { throwIfNoEntry: false }) !== undefined)
-      ? "an actors.json appeared" : undefined;
-    const current = changed ? undefined : entries();
-    if (!changed && !current) changed = "the actors listing is unknown";
-    else if (!changed && replaced(current!)) changed = "an actors entry changed type or identity";
-    else if (!changed && nameSet(current!) !== nameSet(listing!)) {
-      // A name came or went: re-walk, and accept it only when the registry roots are exactly the discovered ones.
-      // The listing is taken before the walk: a name added during it differs again at the next check.
-      const before = entries();
-      if (!before) changed = "the actors listing is unknown";
-      else if (replaced(before)) changed = "an actors entry changed type or identity";
-      else {
-        try {
-          const found: string[] = []; discover(actorsRoot, 0, found);
-          if (rootSet(found) !== discovered) changed = "a registry root came or went";
-        } catch (error) { changed = `uncertain: ${(error as Error).message}`; }
-        if (!changed) {
-          listing = before; watch = unregistered(); registryRewalks++;
-          for (const [name, identity] of before) if (!identities.has(name)) identities.set(name, identity);
-        }
+  // Registries ever read: one whose directory is still present but whose actors.json is missing stays in the read set,
+  // so requireRegistries vetoes instead of reading it as empty.
+  const known = new Set(registries);
+  // Every registry parsed once for the whole sweep (smarty-dev#7916); a final check re-stats each registry and
+  // re-parses only one whose actors.json changed. The early-skip snapshot is the first read's ids without "*": never a
+  // later read, so one uncertain check cannot skip later candidates before their own final check.
+  const refs = registryReferences(registries, { requireRegistries: true });
+  const early = new Set([...refs.snapshot()].filter(id => id !== "*"));
+  // The tree the read set was discovered from; undefined forces a re-walk (unknown, or a walk that skipped a vanished entry).
+  let adopted = typeof first === "string" || vanished > 0 ? undefined : first.key;
+  const reported = new Set<string>();
+  const veto = (reason: string): Set<string> => {
+    if (!reported.has(reason)) { reported.add(reason); skipped.push({ path: actorsRoot, reason }); }
+    return new Set(["*"]);
+  };
+  /** The final check of one candidate: the closed world before, the read, the same world after. `owner`: the registry that
+   * must be in the read set and unchanged throughout (the candidate's own). */
+  const unknown = (reason: string): Set<string> => stop !== undefined
+    ? veto(`actor registry roots changed during the sweep (${stop}); no further run is deleted`)
+    : veto(`actor registry roots are uncertain (${reason}); that candidate is kept`);
+  // smarty-dev#976 A: an own registry that is our regular, single-link, private file.
+  const ownerSafe = (file: string): boolean => {
+    const stat = ownedStat(file);
+    return stat?.isFile() === true && stat.nlink === 1 &&
+      (typeof process.getuid !== "function" || (stat.mode & 0o022) === 0);
+  };
+  // smarty-dev#976 A: at most 3 complete observations; only an otherwise-safe raw overlap (post.full !== pre.full) retries.
+  // Every concrete id read on any attempt is kept (a reference removed before a stable attempt still keeps).
+  const checkedFresh = (owner?: string): Set<string> => {
+    const union = new Set<string>();
+    for (let attempt = 0; attempt < 3; attempt++) {
+    if (stop !== undefined) return unknown(stop);
+    const pre = observe();
+    if (typeof pre === "string") return unknown(pre);
+    try {
+      if (pre.key !== adopted) {
+        adopted = undefined;
+        const found: string[] = [], before = vanished;
+        try { discover(actorsRoot, 0, found); }
+        catch (error) { return unknown((error as Error).message); }
+        if (vanished !== before) return veto("an actors entry vanished during the registry walk; that candidate is kept");
+        for (const root of known) if (!found.includes(root) && !absent(root)) found.push(root);
+        for (const root of found) known.add(root);
+        registries.splice(0, registries.length, ...found); registryRewalks++;
+        for (const [name, identity] of pre.current) if (!identities.has(name)) identities.set(name, identity);
+        adopted = pre.key;
       }
+      const ownFile = owner === undefined ? undefined : path.join(owner, "actors.json");
+      const ownMissing = "a candidate's own actor registry is missing or changed; that candidate is kept";
+      const ownerBefore = ownFile === undefined ? undefined : stampOf(ownFile);
+      if (ownFile !== undefined && (!registries.includes(owner!) || ownerBefore === undefined || !ownerSafe(ownFile))) return veto(ownMissing);
+      const ids = refs.fresh();
+      if (ids.has("*")) return ids;
+      for (const id of ids) union.add(id);
+      const post = observe();
+      if (typeof post === "string") return unknown(post);
+      const ownerAfter = ownFile === undefined ? undefined : stampOf(ownFile);
+      if (ownFile !== undefined && (!registries.includes(owner!) || ownerAfter === undefined || !ownerSafe(ownFile))) return veto(ownMissing);
+      if (post.full === pre.full) return ownerAfter !== ownerBefore ? veto(ownMissing) : union;
+    } catch (error) { return veto(`actor registry check failed (${(error as Error).message}); that candidate is kept`); }
     }
-    if (changed) {
-      rootsChanged = true;
-      skipped.push({ path: actorsRoot, reason: `actor registry roots changed during the sweep (${changed}); no further run is deleted` });
-    }
-    return rootsChanged;
+    return veto("actor registries changed during a final check; that candidate is kept");
   };
   // The dead host's flock fence on one residency root: claimed, re-proven and released around
   // that root's own work only (smarty-dev#7766). Holding every idle root's host.lock for the
@@ -367,16 +490,11 @@ const sweep = async (meshRoot: string, options: {
         residents.set(rootId, root);
       } catch (error) { skipped.push({ path: root, reason: String(error) }); }
     }
-    // Every registry parsed once for the whole sweep (smarty-dev#7916); a final check re-stats each registry and
-    // re-parses only one whose actors.json changed.
-    const refs = registryReferences(registries, { requireRegistries: true });
     registryParses = refs.parses;
-    const retained = refs.snapshot();
-    if (retained.has("*")) return { dryRun, changes, removedRuns, bytesBefore: 0, bytesAfter: 0, skipped: [...skipped, { path: meshRoot, reason: "unknown actor run references" }] };
-    // Roots first: a root that appeared is in the list before refs.fresh() reads every registry.
-    const referencedNow = (id: string): boolean => {
-      if (registryRootsChanged()) return true;
-      const current = refs.fresh();
+    // The one wrapped reference set, shared by the actor pass and sweepResidentRuns (whose isRetained precedes its fresh()).
+    const checked = { ...refs, snapshot: () => early, fresh: () => checkedFresh() };
+    const referencedNow = (id: string, owner?: string): boolean => {
+      const current = checkedFresh(owner);
       return current.has("*") || current.has(id);
     };
     const registryRows = (registryRoot: string): Record<string, any>[] => {
@@ -384,11 +502,10 @@ const sweep = async (meshRoot: string, options: {
       if (!rows) throw new Error("unreadable actor registry");
       return rows;
     };
-    const compactRuns = (runs: string, veto: () => boolean = gate) => {
-      if (retained.has("*")) return;
-      for (const run of directories(runs)) if (!retained.has(path.basename(run))) {
+    const compactRuns = (runs: string, veto: () => boolean = gate, owner?: string) => {
+      for (const run of directories(runs)) if (!early.has(path.basename(run))) {
         compactTerminalRunEvents(run, { ...options, dryRun, onCompact: change => changes.push(change),
-          isRetained: () => veto() || referencedNow(path.basename(run)),
+          isRetained: () => veto() || referencedNow(path.basename(run), owner),
         });
       }
     };
@@ -396,14 +513,14 @@ const sweep = async (meshRoot: string, options: {
       // The dead host's own startup sweep, under its flock fence: the same exit, tree,
       // preserved-result and latest-run fences as a live host's removal (smarty-dev#3252).
       if (options.runRetentionMs !== undefined) {
-        // Same final pre-delete check as the actor-run pass below: every discovered registry is
-        // re-read uncached before each delete; a vanished or unreadable one vetoes (review round 2).
+        // Same final pre-delete check as the actor-run pass below: before each delete every discovered registry's
+        // stamp is re-validated against the cached references and a changed registry is re-parsed; a vanished or unreadable one vetoes (review round 2).
         // A dry run takes the same selection and fences without mutating, so its preview lists
         // the runs --apply deletes (review round 3). Sizes are taken before the final check, which also
         // re-discovers the registry roots, and the check and delete run back to back (review round 4).
         removedRuns.push(...sweepResidentRuns(path.join(root, "runs"), now, 10 * 60 * 1_000, {
-          actorRoots: registries, references: refs, retainRuns: false, requireRegistries: true, dryRun, acceptPidReuse: true,
-          isRetained: () => veto() || registryRootsChanged(), measure: treeBytes,
+          actorRoots: registries, references: checked, retainRuns: false, requireRegistries: true, dryRun, acceptPidReuse: true,
+          isRetained: () => veto(), measure: treeBytes,
           onRemove: (run, bytes) => changes.push({ path: run, beforeBytes: bytes, afterBytes: 0 }),
           onCompact: change => changes.push(change),
           ...(options.residentRunRetentionMs !== undefined ? { retentionMs: options.residentRunRetentionMs } : {}),
@@ -411,7 +528,7 @@ const sweep = async (meshRoot: string, options: {
       } else compactRuns(path.join(root, "runs"), veto);
     });
     // With runRetentionMs the mesh-wide pass below covers these actors (and every other one).
-    // Copies: registryRootsChanged replaces the list's contents during the sweep.
+    // Copies: checkedFresh replaces the list's contents during the sweep.
     for (const registryRoot of residents.size && options.runRetentionMs === undefined ? [...registries] : []) {
       // One resident root at a time, under that root's own brief fence (smarty-dev#7766).
       const prune = (rootId: string, veto: () => boolean) => {
@@ -424,7 +541,7 @@ const sweep = async (meshRoot: string, options: {
               path.resolve(actor.sessionFile) !== path.join(path.resolve(registryRoot), actor.id, "session.jsonl")) continue;
           const actorRoot = path.dirname(actor.sessionFile);
           if (!ownedStat(actorRoot)?.isDirectory()) continue;
-          compactRuns(path.join(actorRoot, "runs"), veto);
+          compactRuns(path.join(actorRoot, "runs"), veto, registryRoot);
           // Pending launch/drain/removal is not a joined writer receipt for session history.
           if (actor.inFlightRun !== undefined || actor.preparing !== undefined || !["idle", "stopped"].includes(actor.status)) continue;
           pruneActorSessionBackups(actor.sessionFile, { dryRun, stop: veto, onPrune: change => changes.push({ path: change.path, beforeBytes: change.bytes, afterBytes: 0 }) });
@@ -438,7 +555,7 @@ const sweep = async (meshRoot: string, options: {
       for (const rootId of rootIds) await fenced(rootId, residents.get(rootId)!, async veto => {
         try {
           if (!absent(path.join(registryRoot, "actors.json.lock"))) throw new Error("actor registry has a holder or uncertain lock");
-          if (dryRun) prune(rootId, veto); else await new ActorRegistryStore(registryRoot).withLock(() => prune(rootId, veto));
+          if (dryRun) prune(rootId, veto); else await new ActorRegistryStore(registryRoot).withLock(() => prune(rootId, veto), undefined, "retention");
         } catch (error) { skipped.push({ path: registryRoot, reason: String(error) }); }
       });
     }
@@ -446,23 +563,25 @@ const sweep = async (meshRoot: string, options: {
       // Mesh-wide, independent of any owner being alive (smarty-dev#3252, #5652): the owning
       // manager's own pruneRuns rule (terminal, safe exit-proven tree, not the latest run),
       // plus every registry's latest, in-flight, preparing and pending-removal runs, re-read when a
-      // registry changes. The final pre-delete check re-reads every discovered registry uncached;
+      // registry changes. The final pre-delete check stamp-validates the cached references and re-parses changed registries;
       // an unreadable or vanished registry is a wildcard veto (pi-fabric#645 review round 1).
-      // Early skips judge from the sweep's snapshot; the final pre-delete check is referencedNow (smarty-dev#7916).
-      const referenced = (id: string): boolean => { const ids = refs.snapshot(); return ids.has("*") || ids.has(id); };
+      // Early skips judge only from the first read's ids; the final pre-delete check is referencedNow with this registry
+      // as the candidate's own (smarty-dev#7916, #9058).
       for (const registryRoot of [...registries]) {
         try {
           const rows = new Map<string, Record<string, any>>();
           for (const actor of registryRows(registryRoot)) if (actor && typeof actor.id === "string") rows.set(actor.id, actor);
           for (const actorRoot of directories(registryRoot)) {
             const id = path.basename(actorRoot), row = rows.get(id);
-            // Removal (pending or accepted) owns its runs until it finishes.
-            if (!/^[A-Za-z0-9_-]+$/.test(id) || row?.removal !== undefined || !absent(path.join(registryRoot, `removal-${id}.json`))) continue;
+            // Removal (pending or accepted) owns its runs until it finishes; so does an offline removal, which moves the
+            // whole actor directory into its archive (smarty-dev#9058: its runs leave actors/ with it).
+            if (!/^[A-Za-z0-9_-]+$/.test(id) || row?.removal !== undefined || !absent(path.join(registryRoot, `removal-${id}.json`)) ||
+                !absent(path.join(registryRoot, `offline-removal-${id}.json`))) continue;
             const inFlight = typeof row?.inFlightRun?.id === "string" ? row.inFlightRun.id : undefined;
             pruneActorRunArchives({
               runsDirectory: path.join(actorRoot, "runs"), retentionMs: options.runRetentionMs, now, dryRun, acceptPidReuse: true,
               ...(typeof row?.lastRunId === "string" ? { latestRunId: row.lastRunId } : {}),
-              isRetained: (run, final) => gate() || run === inFlight || (final ? referencedNow(run) : referenced(run)),
+              isRetained: (run, final) => gate() || run === inFlight || (final ? referencedNow(run, registryRoot) : early.has(run)),
               // Sized before the final check; check and delete back to back (review round 4).
               measure: treeBytes,
               onRemove: (run, bytes) => { changes.push({ path: run, beforeBytes: bytes, afterBytes: 0 }); removedRuns.push(run); },

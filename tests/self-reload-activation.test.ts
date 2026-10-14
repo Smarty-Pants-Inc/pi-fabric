@@ -77,7 +77,12 @@ const fixture = async () => {
     registerCommand: vi.fn(), registerTool: vi.fn(), registerMessageRenderer: vi.fn(),
     on: (name: string, handler: any) => handlers.set(name, [...(handlers.get(name) ?? []), handler]) };
   await piFabric(freshPi as unknown as ExtensionAPI);
-  const activation = () => handlers.get("session_start")![0]!({ reason: "reload" }, first.context as unknown as ExtensionContext);
+  const activation = async () => {
+    // Pi dispatches every registered lifecycle handler in order, not only the first.
+    for (const handler of handlers.get("session_start") ?? []) {
+      await handler({ reason: "reload" }, first.context as unknown as ExtensionContext);
+    }
+  };
   fs.writeFileSync(settingsPath, JSON.stringify({ packages: [next] }));
   const date = new Date(Date.now() + 1000); fs.utimesSync(settingsPath, date, date);
   return { first, second, activation, slots };

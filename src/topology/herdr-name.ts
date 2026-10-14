@@ -11,6 +11,73 @@ export const herdrPaneId = (environment: NodeJS.ProcessEnv = process.env): strin
 };
 
 /**
+ * Two bounded one-shot retry offsets from start, at 60 s and 5 min (smarty-dev#11172). No retry
+ * fires sooner than a minute after start: R-no-polling forbids faster-than-minute retries.
+ */
+export const HERDR_NAME_RETRY_MS: readonly number[] = [60_000, 300_000];
+
+/**
+ * Bounded, single-flight Herdr name lookup. `start()` performs the initial read and arms the
+ * fixed one-shot retry schedule. Each retry checks that the Main is still unnamed and live;
+ * finding a name, retirement, or an explicit name clears every remaining timer.
+ */
+export const herdrNameLookup = (options: {
+  read: () => Promise<string | undefined>;
+  live: () => boolean;
+  eligible: () => boolean;
+  onName: (name: string) => void;
+}): { start(): void; stop(): void; readonly pending: boolean } => {
+  let busy = false;
+  let done = false;
+  let started = false;
+  const timers = new Set<ReturnType<typeof setTimeout>>();
+  const stop = (): void => {
+    if (done) return;
+    done = true;
+    for (const timer of timers) clearTimeout(timer);
+    timers.clear();
+  };
+  const run = (): void => {
+    if (done || busy) return;
+    if (!options.live()) { stop(); return; }
+    busy = true;
+    void options.read().catch(() => undefined).then((name) => {
+      busy = false;
+      if (done) return;
+      if (!options.live() || !options.eligible()) { stop(); return; }
+      if (name) {
+        stop();
+        options.onName(name);
+      } else if (timers.size === 0) stop();
+    });
+  };
+  const arm = (): void => {
+    for (const delay of HERDR_NAME_RETRY_MS) {
+      let timer: ReturnType<typeof setTimeout>;
+      timer = setTimeout(() => {
+        timers.delete(timer);
+        if (done) return;
+        if (!options.live() || !options.eligible()) { stop(); return; }
+        run();
+      }, delay);
+      timer.unref?.();
+      timers.add(timer);
+    }
+  };
+  return {
+    start: () => {
+      if (started || done) return;
+      started = true;
+      if (!options.live()) { stop(); return; }
+      arm();
+      run();
+    },
+    stop,
+    get pending() { return !done; },
+  };
+};
+
+/**
  * The Herdr agent name of this pane (smarty-dev#6758), read once with `herdr agent get <pane>`.
  * No shell, a hard timeout, and any failure (no pane, missing binary, slow, bad JSON, invalid
  * name) yields undefined so the caller keeps "main". Names are unauthenticated display

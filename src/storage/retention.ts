@@ -7,6 +7,7 @@ import { countRefusal, removalTallyOn, verifiedRemove } from "./verified-remove.
 import { processStartTime } from "../residency/process-identity.js";
 import { FileLockBusy, lockFile } from "../residency/file-lock.js";
 import { recoverActorRunArchives } from "../actors/child-completions.js";
+import { recoverEnodevTaskRun } from "../agents/enodev-recovery.js";
 import { copyFabricProvenance } from "../fabric-provenance.js";
 import { readFinalAnswerReceipt } from "../worker/terminal-answer.js";
 import { terminalAdmissionFromEntry, terminalControlMatchesAdmission, terminalSenderMatches, type TerminalAdmission } from "../agents/terminal-notices.js";
@@ -227,6 +228,9 @@ const runFiles = new Set([
   "reply.json", "relaunches.jsonl", "completion-recipient.json", "route-session.jsonl", "route-dispatch-receipt.json",
   // Native session of an unrouted process Pi task (worker.ts persistentPiTask); owned file only.
   "session.jsonl",
+  // The Pi worker's settlement receipt (worker.ts savePiSettlementReceipt), written for every completed process run:
+  // without it no such run was ever collected (smarty-dev#9855).
+  "settlement.json",
 ]);
 const runFile = (name: string): boolean => runFiles.has(name) || /^oversized-event-prefix(-\d+)?\.txt$/.test(name);
 const followUpName = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.json$/;
@@ -337,6 +341,22 @@ const safeTerminalArtifacts = (root: string, expired: Deadline): boolean => {
   }
   return true;
 };
+const DURABLE_KEY = /^(?:initial|[0-9a-f]{64})$/;
+const DURABLE_LEASE_FILES = new Set(["lease.sqlite", "lease.sqlite-journal"]);
+const DURABLE_STORE_FILE = /^(?:main|(?:doc|task)-(?:0|[1-9]\d*))\.jsonl(?:\.reclaim)?$/;
+const onlyOwnedFiles = (directory: string, allowed: (name: string) => boolean, expired: Deadline): boolean =>
+  !expired() && fs.readdirSync(directory).every((name) => !expired() && allowed(name) && ownedStat(path.join(directory, name))?.isFile() === true) && !expired();
+/** Only the known pi-durable journal layout is an artifact; custody still decides removal. */
+const safeDurableTree = (directory: string, expired: Deadline): boolean => !expired() && fs.readdirSync(directory).every((key) => {
+  const conversation = path.join(directory, key);
+  if (expired() || !DURABLE_KEY.test(key) || !ownedStat(conversation)?.isDirectory()) return false;
+  return fs.readdirSync(conversation).every((name) => {
+    if (expired()) return false;
+    const file = path.join(conversation, name);
+    if (name === "store") return ownedStat(file)?.isDirectory() === true && onlyOwnedFiles(file, (child) => DURABLE_STORE_FILE.test(child), expired);
+    return DURABLE_LEASE_FILES.has(name) && ownedStat(file)?.isFile() === true;
+  });
+}) && !expired();
 /** Unknown transports/contents and live descendants veto removal, even under a dead host. */
 const safeRunTree = (root: string, childrenStopped: boolean, depth = 0, expired: Deadline = noDeadline, acceptPidReuse = false): boolean => {
   if (expired() || depth > 32 || !ownedStat(root)?.isDirectory()) return false;
@@ -390,6 +410,10 @@ const safeRunTree = (root: string, childrenStopped: boolean, depth = 0, expired:
         }
         continue;
       }
+      if (stat.isDirectory() && name === "durable") {
+        if (!safeDurableTree(file, expired)) return false;
+        continue;
+      }
       if (stat.isDirectory() && name === "nested") {
         for (const child of fs.readdirSync(file)) if (!safeRunTree(path.join(file, child), false, depth + 1, expired, acceptPidReuse)) return false;
         continue;
@@ -434,6 +458,11 @@ export const canRemoveManagedRunRoot = (root: string): boolean => {
   const owner = readJson<RunRootOwner>(ownerPath(root));
   return validOwner(owner) && owner.pid === process.pid && safeRootContents(root, true);
 };
+/** smarty-dev#9855: offline recovery of a dead root's ENODEV-unconfirmed task-agent run (delivers or settles it
+ * once and clears its marker); a failure keeps the veto, as for recoverActorRunArchives. */
+const recoverEnodevTask = (directory: string): void => {
+  try { recoverEnodevTaskRun(directory); } catch { /* the marker stays: the run stays vetoed */ }
+};
 /** Main's path-based recursive removal: the non-Linux fallback of verifiedRemove only (smarty-dev#7858). */
 const rmTree = (target: string) => (): boolean => { fs.rmSync(target, { recursive: true, force: true }); return true; };
 export const removeEmptyRunRoot = (root: string): boolean => {
@@ -466,7 +495,7 @@ const pruneClosedRunRoot = (
       compactTerminalRunEvents(directory, { ...eventsRetention, now, expired });
       continue;
     }
-    if (!processAlive(owner.pid)) recoverActorRunArchives(directory, expired);
+    if (!processAlive(owner.pid)) { recoverActorRunArchives(directory, expired); recoverEnodevTask(directory); }
     // The judged stat: taken after recovery, before the safety walk; the removal requires it unchanged.
     const judged = ownedStat(directory);
     if (!safeRunTree(directory, owner.childrenStopped === true, 0, expired)) { countRefusal("pruneClosedRunRoot", "run tree is not proven safe", directory); continue; }
@@ -639,6 +668,7 @@ export const sweepTempRunRoots = (options: TempRunSweepRequest & {
       if (run.name === RUN_ROOT_OWNER_FILE || !run.isDirectory()) continue;
       const directory = path.join(root, run.name);
       recoverActorRunArchives(directory, expired);
+      recoverEnodevTask(directory);
       const judged = ownedStat(directory);
       if (!safeRunTree(directory, false, 0, expired)) { countRefusal("sweepTempRunRoots", "run tree is not proven safe", directory); continue; }
       // Reported as the root's removal once it is empty, as before.

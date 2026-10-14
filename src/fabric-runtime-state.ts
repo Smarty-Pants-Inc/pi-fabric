@@ -89,11 +89,12 @@ import { MeshBackgroundQueue, MeshBackgroundRetry, isMeshLockTimeout } from "./c
 import { DecisionStore } from "./decisions/store.js";
 import { requestHeadlessApproval, routeChildQuestion } from "./decisions/host.js";
 import { LifecycleBroker } from "./lifecycle/broker.js";
+import { extensionContextLive } from "./session-liveness.js";
 import type { FabricLifecycleEventType } from "./lifecycle/types.js";
 import { FabricControlPlane } from "./topology/control-plane.js";
 import { ParticipantDirectory } from "./topology/participant-directory.js";
-import { rootParticipantName } from "./topology/participant-name.js";
-import { herdrPaneId, readHerdrAgentName } from "./topology/herdr-name.js";
+import { rootParticipantName, validName } from "./topology/participant-name.js";
+import { herdrNameLookup, herdrPaneId, readHerdrAgentName } from "./topology/herdr-name.js";
 import type {
   FabricParticipantInfo,
   FabricParticipantListOptions,
@@ -297,6 +298,7 @@ export class FabricRuntimeState {
   #epoch = 0;
   /** The initialize() epoch that built #participants. */
   #participantsEpoch = -1;
+  #stopHerdrLookup: (() => void) | undefined;
 
   constructor(
     readonly pi: ExtensionAPI,
@@ -506,14 +508,59 @@ export class FabricRuntimeState {
     this.#binding = { context, current };
     // A live successor binding re-arms this epoch's own single heartbeat; a retired epoch's
     // suspended directory is never resumed (smarty-dev#10004).
-    if (this.#participantsEpoch === this.#epoch && this.lifecycleCurrent) this.#participants?.resume();
+    if (this.#participantsEpoch === this.#epoch && this.lifecycleCurrent) {
+      this.#participants?.resume();
+      // smarty-dev#8881: reopen only the control poll that a disposed ctx paused, never one a
+      // reload/shutdown paused (those reset this flag and replace or close the plane).
+      if (this.#controlPausedByDispose) {
+        this.#controlPausedByDispose = false;
+        this.#control?.resume();
+      }
+    }
+  }
+
+  /** smarty-dev#8881: control paused because its bound ctx was disposed; a live rebind resumes it. */
+  #controlPausedByDispose = false;
+
+  // A disposed bound ctx retires that binding: stop the heartbeat and the control poll now, without
+  // a warning or teardown I/O. Durable workers, owned commands and unconfirmed ACK obligations stay
+  // retained in the paused plane; only new receiver admission stops until a live rebind.
+  #retireDisposedBinding(): void {
+    this.#binding = undefined;
+    this.#participants?.suspend();
+    if (!this.#controlPausedByDispose && this.#control) {
+      this.#controlPausedByDispose = true;
+      this.#control.pause();
+    }
+  }
+
+  /**
+   * Receiver admission freshness: false once the bound ctx was disposed. Unlike live.current() it
+   * stays true through a graceful shutdown whose ctx is still live, so close/quiesce publication and
+   * in-flight outcomes keep their existing lease-only fence.
+   */
+  #bindingFresh(): boolean {
+    const binding = this.#binding;
+    if (binding && !extensionContextLive(binding.context)) this.#retireDisposedBinding();
+    return !this.#controlPausedByDispose;
   }
 
   /** False once the bound lifecycle retired: background ticks must skip, not read a stale ctx. */
   get lifecycleCurrent(): boolean {
     const binding = this.#binding;
     if (!binding) return false;
-    try { return binding.current(); } catch { return false; }
+    if (extensionContextLive(binding.context)) {
+      try { return binding.current(); } catch { return false; }
+    }
+    // smarty-dev#8881: AgentSession.dispose() invalidates the bound ctx but emits no session_shutdown,
+    // so the lease token alone still reads current. A stale bound ctx is that session's retirement:
+    // drop the binding and stop the heartbeat now, the same first step shutdown() takes, without a
+    // warning (a disposed session is not a degraded one) and without teardown I/O on a dead session.
+    // A later live bindLifecycle()/initialize() rebinds and resumes as after any suspension.
+    // #meshActivationReady keeps its own freshness-gated closure, so a same-epoch live rebind
+    // reopens root reads; shutdown/initialize still assign it false permanently.
+    if (this.#binding === binding) this.#retireDisposedBinding();
+    return false;
   }
 
   /**
@@ -562,6 +609,7 @@ export class FabricRuntimeState {
     // successor's; the successor lease is installed only once the old runtime is torn down.
     this.#epoch += 1;
     this.#meshActivationReady = () => false;
+    this.#controlPausedByDispose = false;
     const epoch = this.#epoch;
     this.#binding = undefined;
     // The retired epoch's heartbeat stops now, before teardown awaits: it never ticks again,
@@ -794,18 +842,26 @@ export class FabricRuntimeState {
       meshRoot,
     );
     this.#mainAgent = mainAgent;
-    // smarty-dev#6758: an unnamed interactive Main publishes its Herdr agent name. One lookup per
-    // start or reload (no polling); any failure keeps "main". Print/JSON roots and children inherit
-    // HERDR_PANE_ID but are not the pane's agent, so they never ask.
-    const herdr: { pane: string | undefined; name?: string } = { pane: herdrPaneId() };
-    if (identity.kind === "main" && mainAgent.local && mainAgent.interactive && herdr.pane) {
-      void readHerdrAgentName().then((name) => {
-        if (!name || !live.current()) return;
+    // SMARTY_AGENT is the primary name (smarty-dev#11146). An unnamed interactive Main falls
+    // back to Herdr with one-shot re-reads at 60 s and 5 min after start, best effort
+    // (smarty-dev#11172). Print/JSON roots and children
+    // inherit HERDR_PANE_ID and SMARTY_AGENT but are not the pane's agent, so they never use them.
+    const namedMain = identity.kind === "main" && mainAgent.local && mainAgent.interactive;
+    const smartyAgent = namedMain ? process.env.SMARTY_AGENT : undefined;
+    const herdrEnvironment = { ...process.env };
+    const herdr: { pane: string | undefined; name?: string } = { pane: herdrPaneId(herdrEnvironment) };
+    const mainName = (): string => rootParticipantName(live.sessionName(), herdr.name, smartyAgent);
+    const herdrLookup = namedMain && herdr.pane ? herdrNameLookup({
+      read: () => readHerdrAgentName(herdrEnvironment),
+      live: live.current,
+      eligible: () => mainName() === "main" && !validName(live.sessionName()) && !validName(smartyAgent),
+      onName: (name) => {
         herdr.name = name;
         this.#participants?.scheduleRefresh();
-      });
-    }
-    const mainName = (): string => rootParticipantName(live.sessionName(), herdr.name);
+      },
+    }) : undefined;
+    this.#stopHerdrLookup = herdrLookup?.stop;
+    herdrLookup?.start();
     this.#backgroundMesh = new MeshBackgroundQueue("runtime lifecycle/compaction");
     this.#disposableMeshWrites = identity.kind === "actor" || identity.kind === "agent"
       ? new AbortController() : undefined;
@@ -827,7 +883,8 @@ export class FabricRuntimeState {
     if (this.#config.mesh.enabled) this.#registry.setResidentProcessWorkSession(sessionId);
     // A Main on the shared mesh reconciles the work events a steer missed (smarty-dev#754).
     this.#rootInbox = identity.kind === "main" && mainAgent.local && this.#config.mesh.enabled
-      ? new RootInbox(this.#mesh, identity, () => [mainAgentId, live.sessionName() ?? ""])
+      ? new RootInbox(this.#mesh, identity, () => [mainAgentId,
+          validName(live.sessionName()) ?? validName(smartyAgent) ?? herdr.name ?? ""])
       : undefined;
     const hostId = identity.kind === "main" ? mainAgentId : `runtime:${sessionId}`;
     const mesh = this.#mesh;
@@ -903,12 +960,17 @@ export class FabricRuntimeState {
           inboxActivation = meshCustodyMode() === "own" ? register() : await mesh.exclusive(register);
         } finally { releaseCustody(); }
       } else await participants.resumeLineage();
+      // smarty-dev#8881: resumeLineage awaited a mesh write; an SDK dispose in that window stales
+      // `context` with no session_shutdown. Fence on the live lifecycle before succession and compare
+      // against the plain cwd captured at construction, never a ctx getter after the await.
+      if (!live.current()) throw new Error("Pi Fabric mesh activation lifecycle retired");
       if (meshConfig.enabled && mainAgent.local && predecessor && predecessor.id !== mainAgentId &&
-        predecessor.meshRoot === meshRoot && predecessor.cwd === context.cwd) {
-        await recordMainSuccessor(mesh, predecessor.id, predecessor.sessionId, mainAgentId);
+        predecessor.meshRoot === meshRoot && predecessor.cwd === mainAgent.cwd) {
+        // F-01: custody acquisition awaits; recheck liveness inside the critical section before writes.
+        await recordMainSuccessor(mesh, predecessor.id, predecessor.sessionId, mainAgentId, live.current);
       }
       const recordedRotation = meshConfig.enabled && mainAgent.local
-        ? await confirmMainSuccessor(mesh, mainAgentId, sessionFile) : false;
+        ? await confirmMainSuccessor(mesh, mainAgentId, sessionFile, live.current) : false;
       // An in-flight retry may outlive its ctx. Attach only to the latest live binding,
       // never reopen a retired activation during close/reload.
       const activationContext = live.read(ctx => ctx);
@@ -943,9 +1005,18 @@ export class FabricRuntimeState {
     this.#control = new FabricControlPlane(this.#mesh, identity, {
       ownerIncarnation: controlParticipants.ownerIncarnation,
       controlIncarnationFence: this.#config.mesh.controlIncarnationFence,
+      onUnfencedSenderWarning: message => {
+        if (live.read(ctx => {
+          if (!ctx.hasUI) return false;
+          ctx.ui.notify(message, "warning");
+          return true;
+        }) !== true) console.warn(`[pi-fabric] ${message}`);
+      },
       // Both gates: this activation's custody/succession completed (main) AND its
       // directory epoch is committed under a live, renewed lease (#709).
-      canConsumeMesh: () => meshActivationReady && controlParticipants.canConsumeMesh(),
+      // smarty-dev#8881: plus bound-ctx freshness, so a disposed Main stops admitting before its
+      // first heartbeat would notice.
+      canConsumeMesh: () => meshActivationReady && this.#bindingFresh() && controlParticipants.canConsumeMesh(),
       enabled: this.#config.mesh.enabled,
       hostId,
       pollMs: this.#config.mesh.actorPollMs,
@@ -1054,7 +1125,7 @@ export class FabricRuntimeState {
       hostId,
       identityId: identity.id,
       ...(ownsPersistentActorRegistry ? { completionRecipient: () => ({
-        rootId: mainAgentId, sessionId, cwd: context.cwd, projectRoot, name: rootParticipantName(this.pi.getSessionName?.(), herdr.name), role,
+        rootId: mainAgentId, sessionId, cwd: context.cwd, projectRoot, name: rootParticipantName(this.pi.getSessionName?.(), herdr.name, smartyAgent), role,
         startedAt: mainAgent.info(context).startedAt ?? Date.now(),
       }) } : {}),
       spawnerSessionId: sessionId,
@@ -1328,7 +1399,7 @@ export class FabricRuntimeState {
             sessionId,
             cwd: context.cwd,
             projectRoot,
-            mainName: rootParticipantName(this.pi.getSessionName?.(), herdr.name),
+            mainName: rootParticipantName(this.pi.getSessionName?.(), herdr.name, smartyAgent),
             mainStartedAt: mainAgent.info(context).startedAt ?? Date.now(),
             ...(role ? { role } : {}),
             project: participantProject(context.cwd),
@@ -2045,7 +2116,10 @@ export class FabricRuntimeState {
   }
 
   async shutdown(reason?: string, targetSessionFile?: string): Promise<void> {
+    this.#stopHerdrLookup?.();
+    this.#stopHerdrLookup = undefined;
     this.#meshActivationReady = () => false;
+    this.#controlPausedByDispose = false;
     // The session lifecycle retired: stop the background heartbeat before any teardown await.
     this.#participants?.suspend();
     try {
@@ -2235,6 +2309,8 @@ export class FabricRuntimeState {
   }
 
   async #closeInternal(): Promise<void> {
+    this.#stopHerdrLookup?.();
+    this.#stopHerdrLookup = undefined;
     // /fabric reload and bootstrap replacement rebuild Fabric, not the creating
     // Main's lineage. Preserve its mailbox/address even if replacement fails.
     this.#mainAgent?.prepareReload();

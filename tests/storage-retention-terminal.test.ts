@@ -8,14 +8,14 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { TerminalNoticeOutbox, readTerminalAdmission, terminalControlMatchesAdmission } from "../src/agents/terminal-notices.js";
 import { writeJsonAtomic } from "../src/core/atomic-write.js";
 import { canRemoveTerminalRun, pruneActorRunArchives } from "../src/storage/retention.js";
-import { saveFinalAnswerReceipt, taskControlDirectory, taskSteerFile } from "../src/worker/terminal-answer.js";
+import { createHostTaskRun, saveFinalAnswerReceipt, taskControlDirectory, taskSteerFile } from "../src/worker/terminal-answer.js";
 import { markTerminalControlForwarded, settleTerminalControl, trackTerminalControl } from "../src/worker/terminal-controls.js";
 
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
 const fixture = () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "terminal-retention-")); roots.push(root);
-  const run = path.join(root, "run"); fs.mkdirSync(run); fs.mkdirSync(taskControlDirectory(run), { mode: 0o700 });
+  const run = path.join(root, "run"); createHostTaskRun(run);
   const receipt = saveFinalAnswerReceipt(run, "run", "final answer");
   const record = { id: "run", runner: "pi", status: "completed", transport: "process", sessionId: "99999999", updatedAt: Date.now(),
     finalAnswerReceipt: { id: receipt.id, recordedAt: receipt.recordedAt } };
@@ -56,9 +56,9 @@ describe("terminal-answer retention custody", () => {
     expect(Number(pid)).toBe(child.pid);
     // Advance only the saved timestamp, not a sleep or the live-process fence.
     fs.writeFileSync(owner, `${token}\n${pid}\n${Date.now() - 60_000}\n`);
-    // Interrupted staging/locks inside the protected namespace retain custody.
-    expect(canRemoveTerminalRun(f.run)).toBe(false);
-    // Main behavior for the run-root lock name: a proven-stale exited holder is collected.
+    // The real writer's protected lock is collectible under main's exact stale-owner proof.
+    expect(canRemoveTerminalRun(f.run)).toBe(true);
+    // The legacy run-root lock name keeps the same proven-stale collection behavior.
     fs.renameSync(protectedLock, path.join(f.run, ".task-final-answer.lock"));
     expect(canRemoveTerminalRun(f.run)).toBe(true);
     const collected = pruneActorRunArchives({ runsDirectory: f.root, retentionMs: 0, now: Date.now() + 1, dryRun: true });

@@ -242,22 +242,39 @@ export const withLegacyTaskControlDirectories = <T>(runDirectory: string, operat
     return operation([]);
   });
 };
-/** Read selection: the validated current central directory ONLY; never a raw fallback. */
+/**
+ * READ-ONLY pre-v2 selection: no central entry (even dangling) or stage, no old sibling,
+ * no in-run protected metadata, and an owned bounded status WITHOUT any taskControlLayout
+ * claim. Write/publication helpers never consult this; they stay central-only.
+ */
+const legacyReadOnly = (runDirectory: string): boolean => {
+  const control = taskControlDirectory(runDirectory), run = path.resolve(runDirectory);
+  if (entryExists(control) || entryExists(`${control}.stage`) || oldSiblingExists(run) ||
+      entryExists(path.join(run, BINDING)) || entryExists(path.join(run, SNAPSHOT))) return false;
+  let record: unknown;
+  try { record = readTaskRunStatus<unknown>(run); } catch { return false; }
+  return !!record && typeof record === "object" && !Array.isArray(record) && !("taskControlLayout" in record);
+};
+/** Read-only source list: `[]` for an unmarked pre-v2 run (the run itself is selected), else strict. */
+const withReadSources = <T>(runDirectory: string, operation: (sources: ProtectedLegacySource[]) => T): T =>
+  legacyReadOnly(runDirectory) ? operation([]) : withLegacyTaskControlDirectories(runDirectory, operation);
+/** Read selection: the validated current central directory, or the held run of an unmarked pre-v2 run. */
 export const taskControlReadDirectory = (runDirectory: string): string => {
+  if (legacyReadOnly(runDirectory)) return path.resolve(runDirectory);
   if (!centralExists(runDirectory)) unsafe("Missing protected task control directory; legacy fallback refused");
   withLegacyTaskControlDirectories(runDirectory, () => undefined);
   return taskControlDirectory(runDirectory);
 };
 export const withTaskControlReadDirectory = <T>(runDirectory: string, operation: (directory: string, fd: number) => T): T => {
-  taskControlReadDirectory(runDirectory);
-  return withTaskControlDirectory(runDirectory, operation);
+  const selected = taskControlReadDirectory(runDirectory);
+  return selected === path.resolve(runDirectory) ? withDirectory(selected, false, operation) : withTaskControlDirectory(runDirectory, operation);
 };
 /** Visit every protected source in order; returns one result per visited source. */
 export const visitLegacyTaskControlDirectories = <T>(runDirectory: string, operation: (directory: string, fd: number) => T): T[] =>
   withLegacyTaskControlDirectories(runDirectory, sources => sources.map(source => operation(source.directory, source.fd)));
 /** First protected source where `operation` does not raise ENOENT (single-file lookups). */
 const firstLegacy = <T>(runDirectory: string, operation: (directory: string) => T): T | undefined =>
-  withLegacyTaskControlDirectories(runDirectory, sources => {
+  withReadSources(runDirectory, sources => {
     let missing: unknown;
     for (const source of sources) {
       try { return operation(source.directory); }
@@ -496,7 +513,7 @@ export const openLegacyTaskControlFiles = (runDirectory: string, relative: strin
   // all before rethrowing; on success every fd is owned by the caller.
   const fds: number[] = [];
   try {
-    withLegacyTaskControlDirectories(runDirectory, sources => {
+    withReadSources(runDirectory, sources => {
       for (const source of sources) {
         try { fds.push(withControlPath(source.directory, relative, false, openTaskControlFile)); }
         catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
@@ -550,7 +567,7 @@ const hasAnswerEntry = (directory: string): boolean => !!fs.lstatSync(path.join(
  * single entry never falls back to another source.
  */
 const readReceipt = (directory: string, runId: string, runDirectory: string): FinalAnswerReceipt | undefined =>
-  withLegacyTaskControlDirectories(runDirectory, sources => {
+  withReadSources(runDirectory, sources => {
     const present = [directory, ...sources.map(source => source.directory)].filter(hasAnswerEntry);
     return present.length === 1 ? parseReceipt(present[0]!, runId) : undefined;
   });

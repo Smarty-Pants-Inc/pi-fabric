@@ -330,8 +330,10 @@ const terminalArtifactDirectories = new Set(["terminal-controls", "terminal-noti
  * their own settled tracked follow-up or delivered notice; unsafe artifacts veto. */
 const safeTerminalArtifacts = (root: string, expired: Deadline): boolean => withTaskControlReadDirectory(root, (selected, fd) => {
   const runStat = ownedStat(root) ? fs.lstatSync(root, { bigint: true }) : undefined, selectedStat = fs.fstatSync(fd, { bigint: true });
-  // Protected-only: a raw run selection is never control authority.
-  if (!runStat || runStat.dev === selectedStat.dev && runStat.ino === selectedStat.ino) return false;
+  if (!runStat) return false;
+  // The shared read selector holds the run itself ONLY for an unmarked pre-v2 run;
+  // judge its raw artifacts read-only with no protected layers (queued still vetoes).
+  if (runStat.dev === selectedStat.dev && runStat.ino === selectedStat.ino) return safeSelectedTerminalArtifacts(root, selected, [], true, expired, true);
   // Status is task-writable. Only kernel-validated protected snapshot layers
   // carry history; keep their origin through the custody judgment.
   return withLegacyTaskControlDirectories(root, sources => {
@@ -340,7 +342,7 @@ const safeTerminalArtifacts = (root: string, expired: Deadline): boolean => with
     return safeSelectedTerminalArtifacts(root, selected, sources, inRunLayers.length > 0, expired);
   });
 });
-const safeSelectedTerminalArtifacts = (root: string, selected: string, sources: ReadonlyArray<{ directory: string; origin: { kind: "in-run" | "sibling" } }>, inRunOrigin: boolean, expired: Deadline): boolean => {
+const safeSelectedTerminalArtifacts = (root: string, selected: string, sources: ReadonlyArray<{ directory: string; origin: { kind: "in-run" | "sibling" } }>, inRunOrigin: boolean, expired: Deadline, rawRun = false): boolean => {
   const legacy = sources.map(source => source.directory);
   const namespaces = [selected, ...legacy];
   const artifactPaths = (name: string): string[] => namespaces.map(directory => path.join(directory, name))
@@ -357,10 +359,14 @@ const safeSelectedTerminalArtifacts = (root: string, selected: string, sources: 
     if (!sources.some(source => source.origin.kind === "sibling") && fs.lstatSync(legacyTaskControlSibling(root), { throwIfNoEntry: false })) return false;
     // A private sibling is not an unlimited artifact allowlist. Interrupted
     // staging/locks, unknown names, links and nonregular artifacts retain custody.
-    for (const name of fs.readdirSync(selected)) {
+    // A raw pre-v2 run's other entries are judged by safeRunTree's run-root allowlist.
+    if (!rawRun) for (const name of fs.readdirSync(selected)) {
       if (expired()) return false;
       const stat = ownedStat(path.join(selected, name));
       if (!stat || !(terminalArtifactFiles.has(name) && stat.isFile() || terminalArtifactDirectories.has(name) && stat.isDirectory() ||
+          // Main's stale-lock proof, applied where the protected writer now holds the lock.
+          name === TASK_FINAL_ANSWER_LOCK && stat.isDirectory() && TERMINAL_STATUSES.has(readJson<RunRecordSummary>(path.join(root, "status.json"))?.status ?? "") &&
+            safeStaleFinalAnswerLock(path.join(selected, name)) ||
           // Reserved names only after kernel validation of binding and snapshot.
           name === ".legacy-read.json" && stat.isFile() || name === ".legacy-snapshot" && sources.length > 0 && stat.isDirectory())) return false;
     }
@@ -1298,7 +1304,8 @@ export const removeUnreferencedRun = (
   if (check()) { countRefusal(deleter, "referenced at the final check", directory, bytes); return false; }
   // Validate selection even when no sibling exists: only an existing legacy
   // record may authorize its absence; a protected run must never lose its fence.
-  try { taskControlReadDirectory(directory); withLegacyTaskControlDirectories(directory, () => undefined); }
+  // The selector itself strictly validates central; a raw selection is read-only pre-v2.
+  try { taskControlReadDirectory(directory); }
   catch (error) {
     console.warn(`[pi-fabric] FABRIC_TASK_CONTROL_UNSAFE cleanup refused for ${directory}: ${String(error)}`);
     return false;

@@ -10,7 +10,7 @@ import { ActorMeshMonitor } from "./mesh-monitor.js";
 import { ActorSessionResetCancelledError } from "./session-reset-error.js";
 import { MeshBackgroundQueue, MeshBackgroundRetry, ownProcessIncarnation } from "../core/atomic-write.js";
 import { prepareParticipantFileLock, withParticipantFileTryLock } from "../topology/participant-files.js";
-import { isMeshLockTimeout } from "../core/atomic-write.js";
+import { isMeshLockTimeout, isMeshWriteDeferred } from "../core/atomic-write.js";
 import { reapDeadSessionPresence } from "./presence-reaper.js";
 import { fabricDataRoot } from "../storage/temp-root.js";
 import path from "node:path";
@@ -622,11 +622,11 @@ export class ActorPreparationTimeoutError extends ActorPreparationError {
   }
 }
 
-/** smarty-dev#6509: a preparation failure that only ran out of time (its own deadline, the
- * model/auth launch deadline, or a mesh lock wait) blocks as transient, never for good. */
-const preparationTimedOut = (error: unknown): boolean => {
+/** smarty-dev#6509: a preparation deadline or deferred mesh write blocks as transient,
+ * never for good. The existing preparation-timeout block is the retryable category. */
+const preparationRetryable = (error: unknown): boolean => {
   for (let cause: unknown = error, depth = 0; cause instanceof Error && depth < 4; cause = cause.cause, depth++) {
-    if (cause instanceof ActorPreparationTimeoutError || cause instanceof AgentLaunchPreparationTimeoutError || isMeshLockTimeout(cause)) return true;
+    if (cause instanceof ActorPreparationTimeoutError || cause instanceof AgentLaunchPreparationTimeoutError || Boolean(isMeshWriteDeferred(cause))) return true;
   }
   return false;
 };
@@ -4216,7 +4216,7 @@ export class ActorManager {
                 Math.min(item.preparationAttempts, ACTOR_PREPARATION_BACKOFF.length) - 1]!;
               if (item.preparationAttempts > ACTOR_PREPARATION_MAX_RETRIES) {
                 this.#noteFailedActivation(actor, message, runId, false, ACTOR_FAILURE_NOTICE_AFTER,
-                  preparationTimedOut(error) ? "timeout" : true);
+                  preparationRetryable(error) ? "timeout" : true);
               }
             }
             retryDrain = true;

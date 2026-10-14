@@ -903,6 +903,7 @@ export class FabricRuntimeState {
       },
       (event) => { this.#alarmProviderDead(mainAgentId, event); },
       meshRoot,
+      role === "project-agent",
     );
     this.#mainAgent = mainAgent;
     // SMARTY_AGENT is the primary name (smarty-dev#11146). An unnamed interactive Main falls

@@ -6,7 +6,8 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { fabricWakeCause, withFabricWakeAdmission } from "../src/fabric-provenance.js";
 import { MainAgentController, type FabricMainAgentDeliveryRequest } from "../src/main-agent.js";
 
-const makeHarness = (idle = true, aborted = false, durable = false) => {
+// resume models the trusted launch-role capability (project-agent); false is a principal or unknown root.
+const makeHarness = (idle = true, aborted = false, durable = false, resume = true, flushMs = 0) => {
   const handlers = new Map<string, Array<(event: unknown, ctx: ExtensionContext) => unknown>>();
   const sent: Array<{ content: string; deliverAs: string; triggerTurn: boolean }> = [];
   const pi = {
@@ -27,9 +28,9 @@ const makeHarness = (idle = true, aborted = false, durable = false) => {
     hasPendingMessages: () => false,
     signal: { get aborted() { return state.aborted; } },
   } as unknown as ExtensionContext;
-  const main = new MainAgentController(pi, "session:root", true, "/project", "root");
+  const main = new MainAgentController(pi, "session:root", true, "/project", "root", true, undefined, {}, undefined, undefined, resume);
   const journal = durable ? join(tmpdir(), `main-agent-abort-wake-${randomUUID()}.json`) : undefined;
-  main.attachFollowUpDrain(ctx, 0, journal);
+  main.attachFollowUpDrain(ctx, flushMs, journal);
   const emit = (name: string, event: unknown) => {
     for (const handler of handlers.get(name) ?? []) handler(event, ctx);
   };
@@ -52,7 +53,59 @@ const directSteer = (extra: SteerOverrides = {}): FabricMainAgentDeliveryRequest
 // Keep: incident smarty-dev#12774; native abort parked fresh escalations indefinitely.
 // Recorded Pi calls exercise the receiver's halt/attribution trust boundary without deletion.
 describe("Main operator-halt peer wake admission", () => {
-  it("keeps followUps passive and typed while halted, then a fresh direct peer steer wakes", () => {
+  it("keeps a principal or unmarked Main halted for a verified peer steer", () => {
+    const { main, sent } = makeHarness(true, false, false, false);
+    main.halt();
+    expect(main.deliverAgent(directSteer())).toMatchObject({ triggered: false, halted: true, reason: "operator-halt" });
+    expect(sent.every(item => !item.triggerTurn)).toBe(true);
+    main.closeFollowUpDrain();
+  });
+
+  it.each([0, 120_000].flatMap(flushMs => ["completed", "error", "aborted"].map(outcome => ({ flushMs, outcome }))))(
+    "grants exactly one resumed run that ends at $outcome settle (flushMs=$flushMs)", ({ outcome, flushMs }) => {
+    const { main, sent, state, emit } = makeHarness(true, false, false, true, flushMs);
+    main.halt();
+    expect(main.deliverAgent(directSteer())).toMatchObject({ triggered: true });
+    // A second fresh steer before that run settles gets no further permit.
+    expect(main.deliverAgent(directSteer())).toMatchObject({ triggered: false, halted: true, reason: "operator-halt" });
+    state.idle = false;
+    for (const extra of [{ delivery: "followUp" as const }, { source: "actor-output" as const }, { source: "fabric-host" as const }]) {
+      expect(main.deliverAgent(directSteer(extra))).toMatchObject({ triggered: false, halted: true, reason: "operator-halt" });
+    }
+    emit("agent_before_settle", { outcome });
+    expect(main.deliverAgent({ from: peer, verification: "mesh", message: "before settle", delivery: "followUp" }))
+      .toMatchObject({ triggered: false, halted: true });
+    state.idle = true;
+    emit("agent_settled", { outcome });
+    for (const extra of [{ delivery: "followUp" as const }, { source: "actor-output" as const },
+      { source: "fabric-host" as const }, { admissionTopic: "pi.agent_settled" }]) {
+      expect(main.deliverAgent(directSteer(extra)))
+        .toMatchObject({ triggered: false, halted: true, reason: "operator-halt" });
+    }
+    expect(sent.filter(item => item.triggerTurn)).toHaveLength(1);
+    main.closeFollowUpDrain();
+  });
+
+  it("lets a later fresh peer steer resume once more; only human input lifts the halt", () => {
+    const { main, sent, emit } = makeHarness();
+    main.halt();
+    expect(main.deliverAgent(directSteer())).toMatchObject({ triggered: true });
+    emit("agent_settled", { outcome: "completed" });
+    expect(main.deliverAgent(directSteer())).toMatchObject({ triggered: true });
+    expect(main.deliverAgent(directSteer())).toMatchObject({ triggered: false, halted: true });
+    emit("agent_settled", { outcome: "completed" });
+    emit("input", { source: "extension" });
+    expect(main.deliverAgent({ from: peer, verification: "mesh", message: "ext", delivery: "followUp" }))
+      .toMatchObject({ triggered: false, halted: true });
+    emit("input", { source: "interactive" });
+    const resumed = main.deliverAgent({ from: peer, verification: "mesh", message: "human", delivery: "followUp" });
+    expect(resumed.triggered).toBe(true);
+    expect(resumed).not.toHaveProperty("halted");
+    expect(sent.filter(item => item.triggerTurn)).toHaveLength(3);
+    main.closeFollowUpDrain();
+  });
+
+  it("keeps followUps passive and typed while halted, then a fresh direct peer steer wakes once", () => {
     const { main, sent } = makeHarness();
     main.halt(); // Escape's Main-local stop latch.
 
@@ -67,7 +120,7 @@ describe("Main operator-halt peer wake admission", () => {
     expect(sent.at(-1)).toMatchObject({ deliverAs: "steer", triggerTurn: true });
 
     const subsequent = main.deliverAgent({ from: peer, verification: "mesh", message: "after wake", delivery: "followUp" });
-    expect(subsequent.triggered).toBe(true);
+    expect(subsequent).toMatchObject({ triggered: false, halted: true, reason: "operator-halt" });
     main.closeFollowUpDrain();
   });
 

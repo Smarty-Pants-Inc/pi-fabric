@@ -406,6 +406,25 @@ describe.skipIf(process.platform !== "linux")("owner-authenticated cooperative r
     } finally { release.resolve(); await f.close(); }
   });
 
+  it("wall deadline classifies a checkpoint edge before its timeout callback", async () => {
+    const f = await fixture(); const entered = deferred(), release = deferred();
+    const original = f.host.actors.checkpointForRelease.bind(f.host.actors) as (assertHeld?: () => void) => Promise<void>;
+    vi.spyOn(f.host.actors, "checkpointForRelease").mockImplementation(async (...args: unknown[]) => {
+      const assertHeld = args[0] as (() => void) | undefined;
+      await original(assertHeld); entered.resolve(); await release.promise; assertHeld?.();
+    });
+    let clock: ReturnType<typeof vi.spyOn> | undefined;
+    try {
+      const response = await f.drain({ timeoutMs: 10_000 }); await entered.promise;
+      clock = vi.spyOn(Date, "now").mockReturnValue(response.drain!.deadlineAt);
+      release.resolve();
+      const receipt = await f.terminal(response.drain!);
+      expect(receipt).toMatchObject({ outcome: "resumed", code: "DRAIN_TIMEOUT", admissionHeld: false, terminal: true,
+        reason: expect.stringMatching(/deadline|timed out|timeout/i) });
+      expect(fs.readFileSync(f.sentinel, "utf8")).toContain('"preparationAttempts":2'); expect(f.idle).not.toHaveBeenCalled();
+    } finally { clock?.mockRestore(); release.resolve(); await f.close(); }
+  });
+
   it("lost current Main while held resumes A without custody or a late complete receipt", async () => {
     const f = await fixture(); const entered = deferred(), release = deferred();
     const original = f.host.actors.checkpointForRelease.bind(f.host.actors) as (assertHeld?: () => void) => Promise<void>;

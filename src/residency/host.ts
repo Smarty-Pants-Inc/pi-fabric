@@ -2048,7 +2048,7 @@ export class ResidentHost {
     const resumed = new Promise<void>(resolve => { resolveResumed = resolve; });
     const checkpointAbort = new AbortController();
     const timer = setTimeout(() => {
-      if (this.#drain === held) this.#finishDrain(held, "resumed", "DRAIN_TIMEOUT", "Drain deadline elapsed; A resumed without aborting accepted work");
+      if (this.#drain === held) this.#finishDrainTimeout(held);
     }, Math.max(0, deadlineAt - Date.now()));
     const held: ResidentHeldDrain = { receipt, caller: structuredClone(command.caller), checkpointAbort, timer, resumed, resolveResumed };
     // Single synchronous boundary: no await between resident state and manager gates.
@@ -2081,6 +2081,10 @@ export class ResidentHost {
     if (JSON.stringify(readResidentDrainReceipt(this.config.residencyRoot, held.receipt.id, held.receipt)) !== JSON.stringify(held.receipt)) {
       throw new Error("Resident held drain receipt changed");
     }
+  }
+
+  #finishDrainTimeout(held: ResidentHeldDrain): void {
+    this.#finishDrain(held, "resumed", "DRAIN_TIMEOUT", "Drain deadline elapsed; A resumed without aborting accepted work");
   }
 
   #finishDrain(held: ResidentHeldDrain, outcome: "resumed" | "containment-unavailable" | "needs-operator", code: string, reason: string): void {
@@ -2141,7 +2145,12 @@ export class ResidentHost {
       try { await pending; }
       finally { if (this.#drainCheckpointPending === pending) this.#drainCheckpointPending = undefined; }
     } catch (error) {
-      if (this.#drain === held) this.#finishDrain(held, "resumed", error instanceof ResidentDrainRefusedError ? error.code : "DRAIN_UNCERTAIN", errorMessage(error));
+      if (this.#drain === held) {
+        // The wall deadline owns terminal timeout classification even when this
+        // continuation wins the event edge just before the setTimeout callback.
+        if (Date.now() >= held.receipt.deadlineAt) this.#finishDrainTimeout(held);
+        else this.#finishDrain(held, "resumed", error instanceof ResidentDrainRefusedError ? error.code : "DRAIN_UNCERTAIN", errorMessage(error));
+      }
     }
   }
 

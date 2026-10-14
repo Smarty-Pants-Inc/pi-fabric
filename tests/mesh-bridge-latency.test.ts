@@ -6,11 +6,11 @@ import { PassThrough } from "node:stream";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { BRIDGE_LEASE_MS, MeshBridge, RemoteBridgeSide, serveBridgeAgent, StoreBridgeSide } from "../src/mesh/bridge.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
-import { LIVENESS_POLICY_KEY, mirroredLeaseStatus, readHostLeases, writeHostLease } from "../src/topology/host-leases.js";
+import { LIVENESS_POLICY_KEY, mirroredLeaseStatus, mirroredOwnerRoutingStatus, readHostLeases, writeHostLease } from "../src/topology/host-leases.js";
 import { writeParticipantFile } from "../src/topology/participant-files.js";
 
-// smarty-dev#6477: a spoke's live Main (15 s file lease, renewed every 5 s) was never mirrored
-// on the hub when one presence pass took longer than the lease's remaining life.
+// smarty-dev#6477: slow presence passes must retain spoke attribution within bounded latency,
+// without resurrecting source authority whose original translated deadline has passed.
 const roots: string[] = [];
 const closers: Array<() => Promise<void>> = [];
 afterEach(async () => {
@@ -40,7 +40,7 @@ const liveMain = async (store: MeshStore, name: string, now: number) => {
 };
 
 describe("bridge presence latency (smarty-dev#6477)", () => {
-  it("mirrors a spoke root observed live even when the pass outlasts its remaining lease", async () => {
+  it("retains a spoke root's attribution after a slow pass without reviving its expired authority", async () => {
     let now = 1_800_000_000_000;
     vi.spyOn(Date, "now").mockImplementation(() => now);
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-latency-"));
@@ -69,15 +69,16 @@ describe("bridge presence latency (smarty-dev#6477)", () => {
     await bridge.syncPresence();
     expect(hub.get(key("topology/participants/", lane.id))?.value).toMatchObject({ id: lane.id, kind: "root", remoteHost: "ryzen3" });
     expect(hub.get(key("topology/hosts/", lane.id))?.value).toMatchObject({ id: lane.id, remoteHost: "ryzen3" });
-    // The mirror lives one bounded TTL from the hub's commit, never past it.
+    // Attribution survives (#6477/#2004), but the commit cannot add its latency to authority.
     const lease = readHostLeases(hub.root).get(lane.id)!;
-    expect(lease.expiresAt).toBeGreaterThan(now);
-    expect(lease.expiresAt).toBeLessThanOrEqual(now + 15_000);
-    // Bridge authority survives the slow commit, but freshness stays anchored at the request
-    // (#10068): the delayed commit never makes the sample look newer.
-    expect(hubSide.holds(lane.id)).toBe(true);
+    expect(lease.expiresAt).toBe(requestedAt + 10_000);
+    expect(lease.expiresAt).toBeLessThan(now);
+    expect(lease.expiresAt).toBeLessThanOrEqual(now + BRIDGE_LEASE_MS);
+    // Source evidence remains fresh (#10068); that is not permission to extend its deadline.
+    expect(hubSide.holds(lane.id)).toBe(false);
     expect(lease.mirror?.observedAt).toBe(requestedAt);
     expect(mirroredLeaseStatus("ryzen3", lease.mirror, now)).toBe("live");
+    expect(mirroredOwnerRoutingStatus({ ...lease, remoteHost: "ryzen3" }, now)).toBe("bridge-stale");
   });
 
   it("still refuses a host whose lease had already lapsed when the hub asked", async () => {
@@ -110,8 +111,8 @@ describe("bridge presence latency (smarty-dev#6477)", () => {
     expect(hub.get(key("topology/hosts/", lane.id))).toBeUndefined();
   });
 
-  // Independent review P2: the pass-delay shift was uncapped, so a pass that stalled 60 s kept a
-  // dead origin's mirror alive 60 s past the origin. The shift is capped at one BRIDGE_LEASE_MS.
+  // Independent review P2: an uncapped delay kept a dead origin alive 60 s past its expiry.
+  // Preserve the bounded ceiling, and require the stronger original-deadline trust boundary.
   it("keeps a dead origin's mirror at most one BRIDGE_LEASE_MS past it, even after a 60 s stall", async () => {
     let now = 1_800_000_000_000;
     vi.spyOn(Date, "now").mockImplementation(() => now);
@@ -141,6 +142,7 @@ describe("bridge presence latency (smarty-dev#6477)", () => {
     // Uncapped, the mirror lived until now + 10 s, i.e. 60 s past the origin's own expiry.
     expect(originExpiry + BRIDGE_LEASE_MS).toBeLessThan(now);
     const lease = readHostLeases(hub.root).get(lane.id);
+    expect(lease === undefined || lease.expiresAt === originExpiry).toBe(true);
     expect(lease === undefined || lease.expiresAt <= originExpiry + BRIDGE_LEASE_MS).toBe(true);
     // #10068 may retain the root for a precise bridge-stale routing error, but grants it no
     // authority: its lease lapsed before the commit and the stalled sample is bridge-stale.
@@ -149,7 +151,7 @@ describe("bridge presence latency (smarty-dev#6477)", () => {
     if (lease) expect(mirroredLeaseStatus("ryzen3", lease.mirror, now)).toBe("bridge-stale");
   });
 
-  it("bounds the shift of a slow pass's still-live mirror by one BRIDGE_LEASE_MS past its origin", async () => {
+  it("keeps slow-pass authority at the original deadline within the #6477 bounded latency ceiling", async () => {
     for (const stall of [11_000, 20_000, 30_000]) {
       let now = 1_800_000_000_000;
       vi.spyOn(Date, "now").mockImplementation(() => now);
@@ -165,24 +167,27 @@ describe("bridge presence latency (smarty-dev#6477)", () => {
       const hubSide = new StoreBridgeSide(hub, "ryzen3");
       await hubSide.mirror(snapshot, observedAt);
       const lease = readHostLeases(hub.root).get(lane.id);
-      const until = Math.min(originExpiry + Math.min(stall, BRIDGE_LEASE_MS), now + BRIDGE_LEASE_MS);
-      // Past `until`, a sampled mirror is at most retained as bridge-stale (#10068), never held.
-      if (until > now || lease) expect(lease?.expiresAt, `stall ${stall}`).toBe(until);
+      const until = originExpiry;
+      // A sampled mirror retains attribution (#2004), never expired authority.
+      expect(lease?.expiresAt, `stall ${stall}`).toBe(until);
       // Authority also needs a fresh sample: a stall of one BRIDGE_LEASE_MS or more is bridge-stale.
       const fresh = now - observedAt < BRIDGE_LEASE_MS;
       expect(hubSide.holds(lane.id), `stall ${stall}`).toBe(until > now && fresh);
-      if (lease) expect(mirroredLeaseStatus("ryzen3", lease.mirror, now), `stall ${stall}`).toBe(fresh ? "live" : "bridge-stale");
+      if (lease) {
+        expect(mirroredLeaseStatus("ryzen3", lease.mirror, now), `stall ${stall}`).toBe(fresh ? "live" : "bridge-stale");
+        expect(mirroredOwnerRoutingStatus({ ...lease, remoteHost: "ryzen3" }, now), `stall ${stall}`).toBe("bridge-stale");
+      }
       expect(lease === undefined || lease.expiresAt - originExpiry <= BRIDGE_LEASE_MS, `stall ${stall}`).toBe(true);
       vi.restoreAllMocks();
     }
   });
 
-  // Audit F1: the shift stopped at #mirror entry, so a write-lock wait longer than the sample's remaining
-  // life committed an already-expired lease. The deadline is taken at the authoritative prepare, after
-  // the wait, on both the cold (in-transaction) and warm (early preplan, #10391) paths; observedAt stays.
+  // Recorded Astra catch / a6d1154f: moving the deadline after the write-lock wait resurrected
+  // expired remote authority. Keep this unit at the trust boundary: cold recovery and warm early
+  // plans (#10391) may commit retained attribution, never an expired lease AS LIVE.
   it.each([
     ["cold", 1_000], ["warm", 1_000], ["cold", 16_000], ["warm", 16_000],
-  ] as const)("takes the lease deadline after a blocked state write (%s, %i ms wait)", async (path_, wait) => {
+  ] as const)("never commits expired authority as live after a blocked state write (%s, %i ms wait)", async (path_, wait) => {
     let now = 1_800_000_000_000;
     vi.spyOn(Date, "now").mockImplementation(() => now);
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-latency-"));
@@ -207,15 +212,16 @@ describe("bridge presence latency (smarty-dev#6477)", () => {
     await hubSide.mirror(snapshot, t0);
     expect(batches).toHaveBeenCalledTimes(1);
     expect(stateViews).toHaveBeenCalledTimes(path_ === "warm" ? 1 : 0);
-    const until = Math.min(t0 + 500 + Math.min(wait, BRIDGE_LEASE_MS), now + BRIDGE_LEASE_MS);
+    const until = t0 + 500;
     const lease = readHostLeases(hub.root).get(lane.id)!;
     expect(lease.expiresAt).toBe(until);
     expect(hub.get(key("topology/hosts/", lane.id))?.value).toMatchObject({ expiresAt: until, remoteHost: "ryzen3" });
     expect(lease.mirror?.observedAt).toBe(t0);
     const fresh = wait < BRIDGE_LEASE_MS;
-    expect(hubSide.holds(lane.id)).toBe(fresh);
+    expect(hubSide.holds(lane.id)).toBe(false);
     expect(mirroredLeaseStatus("ryzen3", lease.mirror, now)).toBe(fresh ? "live" : "bridge-stale");
-    if (!fresh) expect(until).toBeLessThanOrEqual(now);
+    expect(mirroredOwnerRoutingStatus({ ...lease, remoteHost: "ryzen3" }, now)).toBe("bridge-stale");
+    expect(until).toBeLessThanOrEqual(now);
   });
 
   // Independent review P2: observedAt was used unchecked. NaN admitted every lapsed host (and wrote

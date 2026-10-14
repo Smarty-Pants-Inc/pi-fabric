@@ -22,7 +22,7 @@ const identity: MeshIdentity = { id: rootId, name: "lane", kind: "main", session
 const mirror = (at: number, patch: Partial<FabricMirrorLease> = {}): FabricMirrorLease => ({ remoteHost: "ryzen4",
   observedAt: at, sourceObservedAt: at - 60_000, sourceUpdatedAt: at - 62_000, sourceExpiresAt: at - 47_000, ...patch });
 
-const fixture = async (sourceOffset = -60_000, sourceTtl = 13_000) => {
+const fixture = async (sourceOffset = -60_000, sourceTtl = 13_000, path_: "cold" | "warm" = "warm") => {
   let now = Date.now();
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mirror-liveness-"));
   const store = new MeshStore(path.join(dir, "hub"), 64 * 1024, 100);
@@ -35,7 +35,7 @@ const fixture = async (sourceOffset = -60_000, sourceTtl = 13_000) => {
     startedAt: record.startedAt, updatedAt: record.updatedAt };
   const presence: BridgePresence = { hosts: [{ record, expiresAt: record.expiresAt, observedAt: now + sourceOffset }],
     participants: [participant], reserved: [] };
-  await local.mirror(presence, now);
+  if (path_ === "warm") await local.mirror(presence, now);
   const directory = new ParticipantDirectory(store, { enabled: true, hostId: senderId, rootId: senderId,
     identity: { id: senderId, name: "lead", kind: "main" } });
   const control = new FabricControlPlane(store, { id: senderId, name: "lead", kind: "main" }, {
@@ -135,6 +135,88 @@ describe("source-clock root liveness (#10068)", () => {
       data: { version: 1, commandId, targetId: rootId, ownerIncarnation: "activation-1", accepted: true,
         messageId: "renewed-accepted", bridge: { from: "ryzen4" } } });
     await expect(renewed).resolves.toMatchObject({ acknowledged: true, routed: "mesh" });
+  });
+
+  // Remote-authority trust boundary; retained for the recorded Astra catch, not a timing smoke.
+  it.each([
+    ["cold", 1_000], ["warm", 1_000], ["cold", 250], ["warm", 250],
+  ] as const)("a blocked mirror preserves the original 500 ms authority deadline (%s, %i ms wait)", async (path_, wait) => {
+    const f = await fixture(-60_000, 500, path_);
+    vi.spyOn(Date, "now").mockImplementation(f.now);
+    const observedAt = f.now();
+    const originalDeadline = observedAt + 500;
+    const write = f.store.writeBatch.bind(f.store);
+    const blocked = vi.spyOn(f.store, "writeBatch").mockImplementation(async input => {
+      f.advance(wait); // Recorded lock wait, not a real sleep or a renewed source observation.
+      return write(input);
+    });
+    const stateViews = vi.spyOn(f.store, "stateView");
+    await f.local.mirror(f.presence, observedAt);
+    expect(blocked).toHaveBeenCalledTimes(1);
+    expect(stateViews).toHaveBeenCalledTimes(path_ === "warm" ? 1 : 0);
+    blocked.mockRestore();
+    stateViews.mockRestore();
+    expect(f.lease().expiresAt).toBe(originalDeadline);
+    expect(f.lease().mirror).toMatchObject({ observedAt, remoteHost: "ryzen4",
+      sourceObservedAt: observedAt - 60_000, sourceExpiresAt: observedAt - 60_000 + 500 });
+    expect(mirroredLeaseStatus("ryzen4", f.lease().mirror, f.now())).toBe("live");
+
+    const sender = { id: senderId, name: "lead", kind: "main" as const };
+    const steerRemote = vi.fn(async () => ({ queued: true }));
+    const router = new AgentMessageRouter({} as any, { identity: sender, steerRemote } as any,
+      { local: true, id: senderId, matches: (id: string) => id === senderId } as any,
+      f.directory, f.control, binding => binding);
+    const admit = async (operation: "steer" | "followUp") => {
+      const before = commands(f).length;
+      const outcome = router.routeMessage(rootId, "within original source life", undefined, operation);
+      void outcome.catch(() => undefined);
+      await vi.waitFor(() => expect(commands(f)).toHaveLength(before + 1));
+      const commandId = (commands(f)[before]!.data as { commandId: string }).commandId;
+      await f.store.publish({ topic: "fabric.control.ack", kind: "accepted", from: identity, to: senderId,
+        data: { version: 1, commandId, targetId: rootId, ownerIncarnation: "activation-1", accepted: true,
+          messageId: `${operation}-accepted`, bridge: { from: "ryzen4" } } });
+      await expect(outcome).resolves.toMatchObject({ acknowledged: true, routed: "mesh" });
+    };
+    if (wait < 500) {
+      expect(f.local.holds(rootId)).toBe(true);
+      expect(f.directory.get(rootId, f.now())?.bridgeStale).toBeUndefined();
+      // Positive counterexample: even one millisecond before the ORIGINAL deadline is admissible.
+      f.advance(originalDeadline - f.now() - 1);
+      for (const operation of ["steer", "followUp"] as const) await admit(operation);
+      f.advance(1);
+    }
+    expect(f.now()).toBeGreaterThanOrEqual(originalDeadline);
+    expect(f.now()).toBeLessThan(observedAt + 1_500); // Never wait for the old extended deadline.
+    expect(f.local.holds(rootId)).toBe(false);
+    expect(f.directory.get(rootId, f.now())).toMatchObject({ remoteHost: "ryzen4", bridgeStale: true });
+    expect(f.directory.list({ scope: "project", fresh: true }, f.now()).find(p => p.id === rootId))
+      .toMatchObject({ remoteHost: "ryzen4", bridgeStale: true });
+    const before = commands(f).length;
+    for (const operation of ["steer", "followUp"] as const) {
+      const refusal = settle(f.control.request(rootId, rootId, operation, {
+        ownerIncarnation: "activation-1", message: "expired original source deadline" }, rootId, { routedRemoteHost: "ryzen4" }));
+      let settled = false;
+      void refusal.then(() => { settled = true; });
+      await vi.waitFor(() => expect(settled || commands(f).length > before).toBe(true));
+      expect(commands(f)).toHaveLength(before);
+      expect((await refusal).error).toMatchObject({ code: "FABRIC_BRIDGE_STALE", remoteHost: "ryzen4", targetId: rootId,
+        message: expect.stringContaining("this attempt was not published") });
+      await expect(router.routeMessage(rootId, "expired original source deadline", undefined, operation))
+        .rejects.toMatchObject({ code: "FABRIC_BRIDGE_STALE", remoteHost: "ryzen4",
+          message: expect.stringContaining("this attempt was not published") });
+    }
+    expect(commands(f)).toHaveLength(before);
+    expect(steerRemote).not.toHaveBeenCalled();
+
+    const sourceAt = f.now() - 60_000;
+    await f.local.mirror({ ...f.presence, hosts: [{ ...f.presence.hosts[0]!, observedAt: sourceAt,
+      record: { ...f.presence.hosts[0]!.record, updatedAt: sourceAt, expiresAt: sourceAt + 500 },
+      expiresAt: sourceAt + 500 }] }, f.now());
+    expect(f.lease().expiresAt).toBe(f.now() + 500);
+    expect(f.local.holds(rootId)).toBe(true);
+    expect(f.directory.get(rootId, f.now())).toMatchObject({ remoteHost: "ryzen4", stale: false });
+    expect(f.directory.get(rootId, f.now())?.bridgeStale).toBeUndefined();
+    for (const operation of ["steer", "followUp"] as const) await admit(operation);
   });
 
   it.each(["v1", "legacy"] as const)("the %s router refuses short-TTL authority before control or legacy delivery and names a freshly proven lapse", async protocol => {

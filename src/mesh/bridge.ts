@@ -951,12 +951,12 @@ export class StoreBridgeSide implements BridgeSide {
           if (!Number.isFinite(expiresAt) || expiresAt <= (sampled ? sourceObservedAt : liveAt)) continue;
           // A sampled origin's remaining life is a SOURCE-clock duration, anchored at liveAt (this
           // clock, before the source read it), so liveAt + remaining never overstates the origin.
-          // A slow pass shifts that deadline by its own latency, capped at one BRIDGE_LEASE_MS and
-          // at now + BRIDGE_LEASE_MS (smarty-dev#6477; independent review P2). The shift extends
-          // authority only: mirror.observedAt stays liveAt, and readers cap authority at
-          // observedAt + MIRROR_FRESH_MS, so a delayed commit never makes the sample fresher.
+          // Never extend sampled authority for pass latency: retain an expired projection for
+          // routing attribution, but readers judge its translated deadline bridge-stale. Older
+          // unsampled peers retain the bounded latency allowance (smarty-dev#6477).
           const origin = sampled ? liveAt + Math.min(BRIDGE_LEASE_MS, expiresAt - sourceObservedAt) : expiresAt;
-          const until = Math.min(origin + Math.min(now - liveAt, BRIDGE_LEASE_MS), now + BRIDGE_LEASE_MS);
+          const until = sampled ? origin
+            : Math.min(origin + Math.min(now - liveAt, BRIDGE_LEASE_MS), now + BRIDGE_LEASE_MS);
           if (!sampled && until <= now) continue;
           const renewedAt = sampled ? record.updatedAt : Math.min(record.updatedAt, now);
           const mirror: FabricMirrorLease | undefined = sampled ? { remoteHost: this.peer, observedAt: liveAt,
@@ -1054,18 +1054,15 @@ export class StoreBridgeSide implements BridgeSide {
             else if (early) throw new MirrorPlanStale();
             else result = compute(view, sameFiles ? files : participantFileSnapshot(this.store.root));
             if (!result) return plan.stage([], []);
-            // The pass-latency shift ends HERE, after the write-lock wait, not at #mirror entry: a wait longer
-            // than a sample's remaining life committed an already-expired lease (independent audit F1). Only
-            // the sampled deadlines move, from the plan's own source sample, with the same caps as compute;
-            // mirror.observedAt is unchanged, so a delayed commit never freshens the sample (#10068).
-            const prepareAt = this.now();
+            // Cap sampled authority at its ORIGINAL translated source deadline after the lock wait.
+            // A sample that expired during the wait stays expired; neither its observation nor its
+            // authority is renewed by committing it (#10068; independent review P2).
             const deadlines = new Map<string, number>();
             leases = result.leases.map((lease) => {
               const sample = lease.mirror;
               if (!sample) return lease;
-              const at = Math.max(prepareAt, sample.observedAt);
               const origin = sample.observedAt + Math.min(BRIDGE_LEASE_MS, sample.sourceExpiresAt - sample.sourceObservedAt);
-              const until = Math.min(origin + Math.min(at - sample.observedAt, BRIDGE_LEASE_MS), at + BRIDGE_LEASE_MS);
+              const until = Math.min(lease.expiresAt, origin);
               deadlines.set(keyFor(HOST_PREFIX, lease.id), until);
               return { ...lease, expiresAt: until };
             });

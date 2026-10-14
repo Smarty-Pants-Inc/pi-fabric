@@ -59,17 +59,20 @@ describe("resident watchdog", () => {
     vi.useFakeTimers();
     try {
       client.start();
-      await vi.advanceTimersByTimeAsync(50);
+      // Startup catch-up recovers at once; no host appears, so unchanged work backs off 5 s, 10 s.
+      await vi.advanceTimersByTimeAsync(0);
       expect(start).toHaveBeenCalledOnce();
       await vi.advanceTimersByTimeAsync(5_000);
       expect(start).toHaveBeenCalledTimes(2);
-      await vi.advanceTimersByTimeAsync(5_000);
+      await vi.advanceTimersByTimeAsync(9_999);
       expect(start).toHaveBeenCalledTimes(2);
-      await vi.advanceTimersByTimeAsync(5_000);
+      await vi.advanceTimersByTimeAsync(1);
       expect(start).toHaveBeenCalledTimes(3);
       fs.rmSync(file);
       await vi.advanceTimersByTimeAsync(120_000);
       expect(start).toHaveBeenCalledTimes(3);
+      // Work gone: idle arms no deadline at all.
+      expect(vi.getTimerCount()).toBe(0);
     } finally { await client.close(); vi.useRealTimers(); fs.rmSync(root, { recursive: true, force: true }); }
   });
 
@@ -110,22 +113,29 @@ describe("resident watchdog", () => {
     vi.useFakeTimers();
     try {
       client.start();
-      await vi.advanceTimersByTimeAsync(50);
+      await vi.advanceTimersByTimeAsync(0);
+      // Watchdog startup catch-up is independent of the delivery outage.
       expect(start).toHaveBeenCalledOnce();
       expect(read).toHaveBeenCalledOnce();
-      await vi.advanceTimersByTimeAsync(949);
+      // Failed delivery retries on its own one-shot backoff (1 s, 2 s, 4 s), never an interval.
+      await vi.advanceTimersByTimeAsync(999);
       expect(read).toHaveBeenCalledOnce();
       await vi.advanceTimersByTimeAsync(1);
       expect(read).toHaveBeenCalledTimes(2);
-      await vi.advanceTimersByTimeAsync(1_000);
+      await vi.advanceTimersByTimeAsync(1_999);
+      expect(read).toHaveBeenCalledTimes(2);
+      await vi.advanceTimersByTimeAsync(1);
       expect(read).toHaveBeenCalledTimes(3);
       expect(warn).toHaveBeenCalledOnce();
       read.mockReturnValue([]);
-      await vi.advanceTimersByTimeAsync(1_000);
+      await vi.advanceTimersByTimeAsync(4_000);
       // Successor completion reconciliation also scans claims after a successful delivery pass.
-      // Count delivery polls, not that separate scan, to keep the backoff assertion unchanged.
-      expect(read.mock.calls.filter(([prefix]) => prefix?.startsWith("residency/deliveries/"))).toHaveLength(4);
+      const deliveryReads = () => read.mock.calls.filter(([prefix]) => prefix?.startsWith("residency/deliveries/")).length;
+      expect(deliveryReads()).toBe(4);
       expect(warn).toHaveBeenCalledOnce();
+      // Recovered: no further delivery reads without an event.
+      await vi.advanceTimersByTimeAsync(600_000);
+      expect(deliveryReads()).toBe(4);
       await client.close();
       expect(vi.getTimerCount()).toBe(0);
     } finally {
@@ -167,19 +177,19 @@ describe("resident watchdog", () => {
     vi.useFakeTimers();
     try {
       client.start();
-      await vi.advanceTimersByTimeAsync(50);
+      await vi.advanceTimersByTimeAsync(0);
       expect(start).toHaveBeenCalledTimes(1);
-      await vi.advanceTimersByTimeAsync(9_950);
+      await vi.advanceTimersByTimeAsync(9_999);
       expect(start).toHaveBeenCalledTimes(1);
-      await vi.advanceTimersByTimeAsync(50);
+      await vi.advanceTimersByTimeAsync(1);
       expect(start).toHaveBeenCalledTimes(2);
       await vi.advanceTimersByTimeAsync(20_000);
       expect(start).toHaveBeenCalledTimes(3);
       await vi.advanceTimersByTimeAsync(40_000);
       expect(start).toHaveBeenCalledTimes(4);
-      await vi.advanceTimersByTimeAsync(59_950);
+      await vi.advanceTimersByTimeAsync(59_999);
       expect(start).toHaveBeenCalledTimes(4);
-      await vi.advanceTimersByTimeAsync(50);
+      await vi.advanceTimersByTimeAsync(1);
       expect(start).toHaveBeenCalledTimes(5);
     } finally {
       await client.close();
@@ -212,14 +222,16 @@ describe("resident watchdog", () => {
     vi.useFakeTimers();
     try {
       client.start();
-      await vi.advanceTimersByTimeAsync(5_050);
-      expect(start).toHaveBeenCalledTimes(2);
       await vi.advanceTimersByTimeAsync(5_000);
       expect(start).toHaveBeenCalledTimes(2);
-      await vi.advanceTimersByTimeAsync(5_000);
+      await vi.advanceTimersByTimeAsync(9_999);
+      expect(start).toHaveBeenCalledTimes(2);
+      await vi.advanceTimersByTimeAsync(1);
       expect(start).toHaveBeenCalledTimes(3);
-      await vi.advanceTimersByTimeAsync(19_950);
+      await vi.advanceTimersByTimeAsync(19_999);
       expect(start).toHaveBeenCalledTimes(3);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(start).toHaveBeenCalledTimes(4);
     } finally { await client.close(); vi.useRealTimers(); fs.rmSync(root, { recursive: true, force: true }); }
   });
 

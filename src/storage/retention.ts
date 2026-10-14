@@ -3,6 +3,7 @@ import { retentionV2Enabled } from "./retention-platform.js";
 import path from "node:path";
 import { writeFileAtomic, writeJsonAtomic } from "../core/atomic-write.js";
 import { ownedStat, processAlive } from "./scratch.js";
+import { boundedRunTree } from "./reference-scan.js";
 import { countRefusal, removalTallyOn, verifiedRemove } from "./verified-remove.js";
 import { processStartTime } from "../residency/process-identity.js";
 import { FileLockBusy, lockFile } from "../residency/file-lock.js";
@@ -385,6 +386,12 @@ const safeRunTree = (root: string, childrenStopped: boolean, depth = 0, expired:
       if (!stat) return false;
       if (stat.isFile() && (runFile(name) || name === "final-answer.json" || (name === "queued-result.json" && record?.queuedArchiveCommitted === true))) continue;
       if (stat.isDirectory() && (name === "terminal-controls" || name === "terminal-notices")) continue;
+      if (stat.isDirectory() && name === "tmp") {
+        // Manager-created task scratch belongs to this run. Reuse the owned,
+        // bounded walk: links, hardlinks, special files or incomplete scans veto.
+        if (!boundedRunTree(file, expired)) return false;
+        continue;
+      }
       if (stat.isDirectory() && name === "handoff-session") {
         // This directory is exclusively populated by Fabric's session fork writer.
         if (fs.readdirSync(file).some((child) => !child.endsWith(".jsonl") || !ownedStat(path.join(file, child))?.isFile())) return false;
@@ -436,8 +443,11 @@ const runTreeRefusal = (root: string, acceptPidReuse: boolean): string => {
     for (const name of fs.readdirSync(root)) {
       const stat = ownedStat(path.join(root, name));
       if (!stat) return "an entry is a link, hard-linked or not ours";
+      if (name === "tmp" && stat.isDirectory() && !boundedRunTree(path.join(root, name), noDeadline)) {
+        return "task scratch subtree is unsafe or exceeds scan bounds";
+      }
       const known = stat.isFile() ? runFile(name) || name === "final-answer.json" || name === "queued-result.json"
-        : ["terminal-controls", "terminal-notices", "handoff-session", "follow-ups", "deliveries", "nested"].includes(name);
+        : ["terminal-controls", "terminal-notices", "handoff-session", "follow-ups", "deliveries", "nested", "tmp"].includes(name);
       if (!known) return `unknown entry ${name.replace(/[0-9a-f-]{8,}/gi, "<id>")}`;
     }
   } catch { return "run tree unreadable"; }

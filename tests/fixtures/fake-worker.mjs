@@ -82,7 +82,7 @@ if (task.includes("HANG_WITH_PROGRESS")) {
   stay();
   process.on("SIGTERM", () => process.exit(0));
   process.on("SIGINT", () => process.exit(0));
-} else if (task.includes("RESUME_AFTER_STOP") || task.includes("RESUME_AFTER_CRASH")) {
+} else if (task.includes("RESUME_AFTER_STOP") || task.includes("RESUME_AFTER_CRASH") || task.includes("RESUME_FAIL_AFTER_STOP")) {
   // Simulates a long participant losing its first attempt mid-run: either the
   // worker caught an external signal (a terminal "stopped" record, as SIGTERM
   // produces) or its transport simply died with work already done. Attempts are
@@ -119,7 +119,7 @@ if (task.includes("HANG_WITH_PROGRESS")) {
   fs.mkdirSync(path.dirname(statusFile), { recursive: true });
   writeStatus(JSON.stringify(running));
   await new Promise((resolve) => setTimeout(resolve, 100));
-  if (attempt === 1 && task.includes("RESUME_AFTER_STOP")) {
+  if (attempt === 1 && (task.includes("RESUME_AFTER_STOP") || task.includes("RESUME_FAIL_AFTER_STOP"))) {
     const stoppedAt = Date.now();
     writeStatus(
       JSON.stringify({
@@ -136,6 +136,17 @@ if (task.includes("HANG_WITH_PROGRESS")) {
     process.exit(1);
   }
   if (attempt === 1) process.exit(3);
+  if (attempt > 1 && task.includes("RESUME_FAIL_AFTER_STOP")) {
+    const failedAt = Date.now();
+    writeStatus(JSON.stringify({
+      ...running,
+      status: "failed",
+      error: "continuation failed",
+      updatedAt: failedAt,
+      finishedAt: failedAt,
+    }));
+    process.exit(1);
+  }
   const finishedAt = Date.now();
   writeStatus(
     JSON.stringify({

@@ -337,7 +337,10 @@ describe("agent manager spawning primitives", () => {
       runId: first.id, depth: 1, childIndex: 0, worker: true,
     });
     const secondArgs = launchArgs(runRoot, second.id);
-    expect(secondArgs["write-policy"]).toBeUndefined();
+    expect(JSON.parse(secondArgs["write-policy"]!)).toEqual({
+      readOnly: false, writableRoots: [cwd, path.join(runRoot, second.id, "tmp")].sort(), shell: "unconfined",
+    });
+    expect(secondArgs.tmpdir).toBe(path.join(runRoot, second.id, "tmp"));
     expect(readAgentLineage(secondArgs.lineage)).toMatchObject({ runId: second.id, childIndex: 1 });
   });
 
@@ -568,7 +571,7 @@ describe("guest declarations", () => {
     const result = typeCheckFabricCode(
       [
         'const r = await agents.run({ task: "t", seed: "branch", readOnly: true, writableRoots: ["src"], shell: "deny", worktree: true, worktreeSetup: "true" });',
-        'const s = await agents.run({ task: "t", seed: "snippet", seedMessages: 4 });',
+        'const s = await agents.run({ task: "t", seed: "snippet", seedMessages: 4, writePolicy: "unrestricted" });',
         "const files: string[] = r.worktreeResult?.changedFiles ?? [];",
         "const self = await agents.self();",
         "return { files, inserted: r.worktreeResult?.diffstat.insertions, index: self.lineage?.childIndex, s: s.status };",

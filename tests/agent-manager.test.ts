@@ -1,4 +1,5 @@
 import { execFileSync, spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -127,6 +128,150 @@ const expectUnconfirmedClose = async (manager: AgentManager) => {
   await expect(manager.close()).rejects.toThrow(/execution exit unconfirmed/);
   managers.splice(managers.indexOf(manager), 1);
 };
+describe("Agent prompt retention (#11663)", () => {
+  const managedFixture = (prefix: string) => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), prefix)); roots.push(tempRoot);
+    // Retention belongs to managed OS-temp roots, not explicit caller roots.
+    vi.spyOn(os, "tmpdir").mockReturnValue(tempRoot);
+    vi.stubEnv("PI_FABRIC_TMPDIR", undefined);
+    vi.stubEnv("PI_FABRIC_RUN_ROOT", undefined);
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, retainRuns: false }, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
+    });
+    managers.push(manager);
+    return manager;
+  };
+  afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); });
+
+  it("keeps a failed prompt and metadata across manager close while successful trees are removed", async () => {
+    const manager = managedFixture("pi-fabric-prompt-retention-");
+    const prompt = "FAIL_DIRECTIVE\nprivate brief with exact bytes: π\n";
+    const failedHandle = await manager.spawn({ task: prompt, transport: "process" });
+    expect(failedHandle).toMatchObject({
+      promptSha256: createHash("sha256").update(Buffer.from(prompt, "utf8")).digest("hex"),
+      promptBytes: Buffer.byteLength(prompt, "utf8"),
+      promptPath: expect.any(String),
+    });
+    const failed = await manager.wait(failedHandle.id);
+    expect(failed.status).toBe("failed");
+    expect(failed).toMatchObject({
+      promptSha256: createHash("sha256").update(Buffer.from(prompt, "utf8")).digest("hex"),
+      promptBytes: Buffer.byteLength(prompt, "utf8"),
+      promptPath: expect.any(String),
+    });
+    const successfulHandle = await manager.spawn({ task: "successful task", transport: "process" });
+    await expect(manager.wait(successfulHandle.id)).resolves.toMatchObject({ status: "completed" });
+    const failedStatus = manager.status(failedHandle.id);
+    expect(failedStatus).toMatchObject({
+      promptSha256: createHash("sha256").update(Buffer.from(prompt, "utf8")).digest("hex"),
+      promptBytes: Buffer.byteLength(prompt, "utf8"),
+    });
+    const promptPath = (failedStatus as AgentRunRecord).promptPath!;
+    expect(fs.readFileSync(promptPath, "utf8")).toBe(prompt);
+    // Windows has no POSIX modes: exact private modes are POSIX-only.
+    if (process.platform !== "win32") {
+      expect(fs.statSync(promptPath).mode & 0o777).toBe(0o600);
+      expect(fs.statSync(path.dirname(promptPath)).mode & 0o777).toBe(0o700);
+    }
+    const successfulDirectory = manager.runDirectory(successfulHandle.id)!;
+    await manager.close();
+    expect(fs.existsSync(successfulDirectory)).toBe(false);
+    expect(fs.existsSync(promptPath)).toBe(true);
+    expect(fs.readdirSync(path.dirname(promptPath)).sort()).toEqual(["status.json", "task.txt"]);
+    const persisted = JSON.parse(fs.readFileSync(path.join(path.dirname(promptPath), "status.json"), "utf8")) as AgentRunRecord;
+    expect(persisted).toMatchObject({
+      status: "failed",
+      promptSha256: failedStatus.promptSha256,
+      promptBytes: failedStatus.promptBytes,
+      promptPath,
+      inputSha256: createHash("sha256").update(fs.readFileSync(promptPath)).digest("hex"),
+      inputBytes: fs.readFileSync(promptPath).byteLength,
+    });
+    expect(persisted).not.toHaveProperty("task");
+    const afterClose = manager.status(failedHandle.id) as AgentRunRecord;
+    expect(afterClose.promptSha256).toBe(failedStatus.promptSha256);
+    expect(createHash("sha256").update(fs.readFileSync(afterClose.promptPath!)).digest("hex")).toBe(afterClose.inputSha256);
+  });
+
+  it("retains a failed continuation under its current digest while preserving the original metadata", async () => {
+    const manager = managedFixture("pi-fabric-prompt-continuation-");
+    const original = "RESUME_FAIL_AFTER_STOP\noriginal brief π\n";
+    const handle = await manager.spawn({ task: original, transport: "process" });
+    const result = await manager.wait(handle.id);
+    expect(result.status).toBe("failed");
+    const beforeClose = manager.status(handle.id) as AgentRunRecord;
+    expect(beforeClose.promptSha256).toBe(createHash("sha256").update(Buffer.from(original, "utf8")).digest("hex"));
+    expect(beforeClose.inputSha256).not.toBe(beforeClose.promptSha256);
+    const taskPath = beforeClose.promptPath!;
+    const currentBytes = fs.readFileSync(taskPath);
+    expect(createHash("sha256").update(currentBytes).digest("hex")).toBe(beforeClose.inputSha256);
+    expect(Buffer.byteLength(currentBytes)).toBe(beforeClose.inputBytes);
+    await manager.close();
+    expect(fs.readdirSync(path.dirname(taskPath)).sort()).toEqual(["status.json", "task.txt"]);
+    const persisted = JSON.parse(fs.readFileSync(path.join(path.dirname(taskPath), "status.json"), "utf8")) as AgentRunRecord;
+    expect(persisted.promptSha256).toBe(beforeClose.promptSha256);
+    expect(persisted.promptBytes).toBe(beforeClose.promptBytes);
+    expect(persisted.inputSha256).toBe(beforeClose.inputSha256);
+    expect(persisted.inputBytes).toBe(beforeClose.inputBytes);
+    expect(persisted.promptPath).toBe(taskPath);
+    expect(persisted.status).toBe("failed");
+    expect(persisted).not.toHaveProperty("task");
+    expect(fs.readFileSync(taskPath)).toEqual(currentBytes);
+    expect(persisted.promptRetentionDropped).toBeUndefined();
+  });
+
+  it("drops a tampered task file but retains a mismatch status record", async () => {
+    const manager = managedFixture("pi-fabric-prompt-tamper-");
+    const handle = await manager.spawn({ task: "FAIL_DIRECTIVE\noriginal bytes\n", transport: "process" });
+    await manager.wait(handle.id);
+    const taskPath = (manager.status(handle.id) as AgentRunRecord).promptPath!;
+    fs.writeFileSync(taskPath, "tampered bytes\n", { mode: 0o600 });
+    await manager.close();
+    expect(fs.readdirSync(path.dirname(taskPath)).sort()).toEqual(["status.json"]);
+    const persisted = JSON.parse(fs.readFileSync(path.join(path.dirname(taskPath), "status.json"), "utf8")) as AgentRunRecord;
+    expect(persisted.promptRetentionDropped).toBe(true);
+    expect(persisted.promptRetentionMismatch).toBe(true);
+    expect(persisted.inputSha256).toBeDefined();
+    expect(persisted.status).toBe("failed");
+    expect(persisted).not.toHaveProperty("task");
+  });
+
+  it("marks a managed root closed for the configured one-shot sweep age", async () => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-prompt-sweep-")); roots.push(tempRoot);
+    // Match agent-manager-close's private OS-temp fixture; an explicit override
+    // requires a safe Windows volume ancestor, which CI's D:\ does not prove.
+    const tmpdir = vi.spyOn(os, "tmpdir").mockReturnValue(tempRoot);
+    vi.stubEnv("PI_FABRIC_TMPDIR", undefined);
+    vi.stubEnv("PI_FABRIC_RUN_ROOT", undefined);
+    try {
+      const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, retainRuns: false }, {
+        workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
+      });
+      managers.push(manager);
+      const handle = await manager.spawn({ task: "FAIL_DIRECTIVE\nmanaged root\n", transport: "process" });
+      const result = await manager.wait(handle.id);
+      const taskPath = (manager.status(handle.id) as AgentRunRecord).promptPath!;
+      const runRoot = path.dirname(path.dirname(taskPath));
+      expect(path.dirname(runRoot)).toBe(tempRoot);
+      await manager.close();
+      const owner = JSON.parse(fs.readFileSync(path.join(runRoot, ".fabric-owner.json"), "utf8")) as { closedAt?: number };
+      expect(owner.closedAt).toBeTypeOf("number");
+      const sweepOptions = {
+        tempRoot,
+        orphanedTempRunRetentionMs: DEFAULT_FABRIC_CONFIG.retention.orphanedTempRunMs,
+        oneShotRunRetentionMs: DEFAULT_FABRIC_CONFIG.retention.oneShotRunMs,
+      };
+      expect(retentionStorage.sweepTempRunRoots({ ...sweepOptions,
+        now: result.finishedAt! + DEFAULT_FABRIC_CONFIG.retention.oneShotRunMs - 1,
+      }).removedRuns).toEqual([]);
+      const swept = retentionStorage.sweepTempRunRoots({ ...sweepOptions,
+        now: result.finishedAt! + DEFAULT_FABRIC_CONFIG.retention.oneShotRunMs + 1,
+      });
+      expect(swept.removedRuns).toContain(path.dirname(taskPath));
+    } finally { tmpdir.mockRestore(); vi.unstubAllEnvs(); }
+  });
+});
+
 describe("AgentManager fleet model admission (#2490)", () => {
   it.each([
     ["veda", "backend-shortcut", "explicit"],
@@ -2592,6 +2737,7 @@ describe("AgentManager", () => {
       path.resolve("src/worker/principal-delivery.ts"),
       path.resolve("src/worker/session-id.ts"),
       senderHeaderHookPath(pathToFileURL(path.resolve("src/worker.ts")).href),
+      path.resolve("src/agents/write-guard.ts"),
     ]);
     expect(JSON.parse(native.text)).toMatchObject({
       extensions: false,

@@ -24,6 +24,7 @@ import {
 } from "./state-file.js";
 import { validateMeshStateKey } from "./state-sqlite.js";
 import { MeshLockTimeoutError } from "../core/atomic-write.js";
+import { MeshSyncNotDurableError } from "./not-durable.js";
 
 // ------------------------------------------------------------------ the JetStream port
 
@@ -39,7 +40,7 @@ export class NatsWrongLastSequenceError extends Error {
 }
 
 /** One stored stream message. */
-export interface NatsStreamMessage { seq: number; data: Uint8Array }
+export interface NatsStreamMessage { seq: number; data: Uint8Array; msgID?: string }
 
 /**
  * The JetStream operations this backend uses. The real implementation wraps the official nats.js v3 client
@@ -315,6 +316,18 @@ export class MeshStateNatsOutcomeUnknownError extends Error {
 }
 
 /**
+ * `sync()` on a backend opened with `acceptPeriodicSync` (the server does not fsync every write): an acked commit
+ * is on disk only after the server's sync interval, so durability cannot be confirmed. Not retryable: the caller must
+ * not advance an external cursor or delivered mark on it (smarty-dev#9313).
+ */
+export class MeshStateNatsNotDurableError extends MeshSyncNotDurableError {
+  constructor(readonly syncAlways: boolean | undefined) {
+    super("FABRIC_MESH_STATE_NATS_NOT_DURABLE", "state", `nats-server reported sync_always ${String(syncAlways)} at open and the backend was opened with acceptPeriodicSync, so an acked commit may not survive a power loss until the server's sync interval`);
+    this.name = "MeshStateNatsNotDurableError";
+  }
+}
+
+/**
  * Applies one stream message to a snapshot. Deterministic and idempotent: a message at or below the snapshot's
  * sequence is ignored; a batch whose `base` is not the snapshot's sequence cannot have passed the publish CAS, so
  * it is a protocol violation and refuses (the model never guesses).
@@ -395,6 +408,11 @@ export interface NatsStateBackendOptions {
   maxStateTombstones?: number;
   /** The budget of one write's CAS retries, then `MeshStateNatsBusyError`. Default 5 s. */
   lockTimeoutMs?: number;
+  /**
+   * The server's `/varz` sync_always as read at open. Only `true` lets `sync()` resolve; anything else (a server
+   * accepted through `acceptPeriodicSync`, or not stated) makes it reject with `MeshStateNatsNotDurableError`.
+   */
+  syncAlways?: boolean | undefined;
   /** Take a snapshot (and purge below it) once this many messages follow the last one; 0 never. Default 10 000. */
   snapshotEvery?: number;
   /** The state bound (the file backend's `maxStateBytes`, default 32 MiB): a snapshot body larger than it refuses. */
@@ -499,7 +517,8 @@ export class NatsStateBackend implements StateBackend {
   async #startProjector(): Promise<void> {
     for (let attempt = 1; ; attempt++) {
       const loaded = await this.#loadSnapshot();
-      if (loaded && loaded.seq > this.#snapshot.seq) { this.#snapshot = loaded; this.#settle(); }
+      // A newer snapshot replaces the model: one state-change hint per install (none at open: no listener yet).
+      if (loaded && loaded.seq > this.#snapshot.seq) { this.#snapshot = loaded; this.#settle(); this.#notifyStateChanged(); }
       const last = await this.#options.port.lastSequence(this.#options.stream);
       this.#knownSeq = Math.max(this.#knownSeq, last);
       const backlog = last - this.#snapshot.seq;
@@ -704,9 +723,36 @@ export class NatsStateBackend implements StateBackend {
     this.#knownSeq = Math.max(this.#knownSeq, message.seq);
     // Stream sequences are contiguous until a purge: a gap means a snapshot purged what this model still needed.
     if (message.seq > this.#snapshot.seq + 1) { this.#resync(); return; }
+    const before = this.#snapshot;
     try { this.#snapshot = applyNatsMessage(this.#snapshot, message, this.#options.maxStateTombstones ?? DEFAULT_TOMBSTONES, this.#limits); }
     catch (error) { this.#fail(error); return; }
     this.#settle();
+    if (this.#snapshot !== before) this.#notifyStateChanged();
+  }
+
+  readonly #stateListeners = new Set<() => void>();
+  #notifyPending = false;
+
+  /** pi-fabric#7978: hints after the projector applied a whole stream message (no mesh-root file changes for it). */
+  subscribeStateChanges(listener: () => void): () => void {
+    const own = (): void => listener();
+    this.#stateListeners.add(own);
+    return () => { this.#stateListeners.delete(own); };
+  }
+
+  // Coalesced to one microtask per burst of applied messages, after the snapshot is assigned and waiters settled.
+  // A throwing listener never reaches the projector or another listener.
+  #notifyStateChanged(): void {
+    if (this.#notifyPending || this.#stateListeners.size === 0) return;
+    this.#notifyPending = true;
+    queueMicrotask(() => {
+      this.#notifyPending = false;
+      if (this.#closed || this.#failure !== undefined) return;
+      for (const listener of [...this.#stateListeners]) {
+        if (!this.#stateListeners.has(listener)) continue; // unsubscribed by an earlier listener
+        try { listener(); } catch {}
+      }
+    });
   }
 
   /** Resolves once the model has applied `seq`; a projector that does not get there within the write budget is busy. */
@@ -933,6 +979,17 @@ export class NatsStateBackend implements StateBackend {
   withWriteFence<T>(operation: () => T): T {
     this.#readable();
     return operation();
+  }
+
+  /**
+   * Durability barrier (smarty-dev#9313). Nothing is buffered client side: every commit, by this process or any other
+   * on the stream, returned only after JetStream acked its publish. On a server that reported `sync_always` at open
+   * the ack follows the server's fsync, so this resolves at once (no JetStream call). On a server accepted through
+   * `acceptPeriodicSync` the ack does not mean disk and the client has no flush to request, so this rejects with
+   * `MeshStateNatsNotDurableError`: a caller must never claim durability the server does not give.
+   */
+  async sync(_budgetMs: number): Promise<void> {
+    if (this.#options.syncAlways !== true) throw new MeshStateNatsNotDurableError(this.#options.syncAlways);
   }
 
   dropCache(): void { /* the model is the stream's projection: nothing to drop */ }
@@ -1326,7 +1383,8 @@ export const openNatsStateBackend = async (options: OpenNatsStateBackendOptions)
       ...(options.maxReplay === undefined ? {} : { maxReplay: options.maxReplay }),
       ...(options.maxStateTombstones === undefined ? {} : { maxStateTombstones: options.maxStateTombstones }),
       ...(options.lockTimeoutMs === undefined ? {} : { lockTimeoutMs: options.lockTimeoutMs }),
-      ...(options.replicas === undefined ? {} : { replicas: options.replicas }) });
+      ...(options.replicas === undefined ? {} : { replicas: options.replicas }),
+      syncAlways: server.syncAlways });
     if (backend.diagnostics().nats?.status === "retired") { backend.close(); throw new MeshStateNatsRefusedError(`the stream ${stream} is retired`); }
     prepared.get(root)?.close();
     prepared.set(root, backend);

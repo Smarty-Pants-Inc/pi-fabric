@@ -1,7 +1,7 @@
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
@@ -25,7 +25,9 @@ Object.defineProperty(process, "platform", { value: "win32" });
 const { default: config } = await import(pathToFileURL(path.resolve("vitest.config.ts")).href);
 const { isolatedTestTemp, isolateTestFleetEnvironment } = await import(pathToFileURL(path.resolve("scripts/test-temp.ts")).href);
 const root = config.test.env.TMPDIR;
-assert.equal(root, path.join(process.env.RUNNER_TEMP, "pi-fabric-vitest-job"));
+// smarty-dev#11145 r5: a private run child of the job root, never the shared job root itself.
+assert.equal(path.dirname(root), path.join(process.env.RUNNER_TEMP, "pi-fabric-vitest-job"));
+assert.match(path.basename(root), /^pi-fabric-vitest-run-[A-Za-z0-9]{6}$/);
 assert.deepEqual(isolatedTestTemp("pi-fabric-vitest-"), { TMPDIR: root, TMP: root, TEMP: root });
 const configFleet = path.dirname(process.env.PI_CODING_AGENT_DIR);
 const fileFleet = path.dirname(isolateTestFleetEnvironment().PI_CODING_AGENT_DIR);
@@ -102,6 +104,88 @@ describe("test temporary-storage isolation", () => {
     expect(probe.auditLog.startsWith(probe.fleetRoot + probe.sep)).toBe(true);
     if (process.platform === "win32") expect(probe.env.USERPROFILE).toBe(probe.home);
     else expect(probe.env.HOME).toBe(probe.home);
+  });
+
+  // smarty-dev#11145 r5: the Windows job temp adopts only a run directory this helper created.
+  const helper = new URL("../scripts/test-temp.ts", import.meta.url).href;
+  const windowsTemp = (env: Record<string, string>) => {
+    const result = spawnSync("bun", ["-e", `
+      Object.defineProperty(process, "platform", { value: "win32" });
+      const { isolatedTestTemp } = await import(${JSON.stringify(helper)});
+      const first = isolatedTestTemp("pi-fabric-vitest-");
+      Object.assign(process.env, first); // as vitest.config does
+      const again = isolatedTestTemp("pi-fabric-vitest-");
+      process.stdout.write(JSON.stringify({ first: first.TMPDIR, again: again.TMPDIR, marker: process.env.PI_TEST_TEMP_JOB_DIR }));
+    `], { env: { ...process.env, ...env }, encoding: "utf8", timeout: 10_000 });
+    expect(result.error).toBeUndefined();
+    expect(result.status, result.stderr).toBe(0);
+    return JSON.parse(result.stdout) as { first: string; again: string; marker: string };
+  };
+
+  it("never adopts a pre-existing job-named directory named by a forged marker", () => {
+    const fixture = mkdtempSync(join(tmpdir(), "forged-job-"));
+    try {
+      const forged = join(fixture, "pi-fabric-vitest-job");
+      mkdirSync(forged);
+      writeFileSync(join(forged, "victim"), "keep");
+      const run = windowsTemp({ RUNNER_TEMP: fixture, TMPDIR: forged, TMP: forged, TEMP: forged, PI_TEST_TEMP_JOB_DIR: forged });
+      expect(run.first).not.toBe(forged); // 2432cef9..906efce0: adopted as the guard's delete root
+      expect(dirname(run.first)).toBe(join(fixture, "pi-fabric-vitest-job"));
+      expect(basename(run.first)).toMatch(/^pi-fabric-vitest-run-[A-Za-z0-9]{6}$/);
+      if (process.platform !== "win32") expect(statSync(run.first).mode & 0o777).toBe(0o700); // no mode bits on Windows
+      expect(readFileSync(join(forged, "victim"), "utf8")).toBe("keep");
+    } finally {
+      rmSync(fixture, { recursive: true, force: true });
+    }
+  });
+
+  it("never adopts the shared job root itself, even when the marker names it", () => {
+    const fixture = mkdtempSync(join(tmpdir(), "forged-root-"));
+    try {
+      const jobRoot = join(fixture, "pi-fabric-vitest-job");
+      mkdirSync(jobRoot);
+      const run = windowsTemp({ RUNNER_TEMP: fixture, TMPDIR: jobRoot, TMP: jobRoot, TEMP: jobRoot, PI_TEST_TEMP_JOB_DIR: jobRoot });
+      expect(run.first).not.toBe(jobRoot);
+      expect(basename(run.first)).toMatch(/^pi-fabric-vitest-run-[A-Za-z0-9]{6}$/);
+    } finally {
+      rmSync(fixture, { recursive: true, force: true });
+    }
+  });
+
+  // POSIX only: Windows has no uid or mode bits, so there the name and type checks stand alone.
+  it.skipIf(process.platform === "win32")("never adopts a run-named directory with another mode", () => {
+    const fixture = mkdtempSync(join(tmpdir(), "forged-run-"));
+    try {
+      const lookalike = join(fixture, "pi-fabric-vitest-job", "pi-fabric-vitest-run-AbCdEf");
+      mkdirSync(lookalike, { recursive: true, mode: 0o755 });
+      chmodSync(lookalike, 0o755);
+      const run = windowsTemp({ RUNNER_TEMP: fixture, TMPDIR: lookalike, TMP: lookalike, TEMP: lookalike, PI_TEST_TEMP_JOB_DIR: lookalike });
+      expect(run.first).not.toBe(lookalike);
+      expect(basename(run.first)).toMatch(/^pi-fabric-vitest-run-[A-Za-z0-9]{6}$/);
+    } finally {
+      rmSync(fixture, { recursive: true, force: true });
+    }
+  });
+
+  it("reuses its own run directory across re-entry and an inheriting worker", () => {
+    const fixture = mkdtempSync(join(tmpdir(), "own-run-"));
+    try {
+      const runner = join(fixture, "runner");
+      const caller = join(fixture, "caller");
+      mkdirSync(runner);
+      mkdirSync(caller);
+      const run = windowsTemp({ RUNNER_TEMP: runner, TMPDIR: caller, TMP: caller, TEMP: caller, PI_TEST_TEMP_JOB_DIR: "" });
+      expect(dirname(run.first)).toBe(join(runner, "pi-fabric-vitest-job"));
+      expect(existsSync(join(caller, "pi-fabric-vitest-job"))).toBe(false);
+      expect(run.again).toBe(run.first); // no job/job or run/run nesting on re-entry
+      expect(run.marker).toBe(run.first);
+      // A worker inherits TMPDIR and the marker from the config process.
+      const worker = windowsTemp({ RUNNER_TEMP: runner, TMPDIR: run.first, TMP: run.first, TEMP: run.first, PI_TEST_TEMP_JOB_DIR: run.first });
+      expect(worker.first).toBe(run.first);
+      expect(worker.again).toBe(run.first);
+    } finally {
+      rmSync(fixture, { recursive: true, force: true });
+    }
   });
 
   it("keeps workers and inherited child tools away from real session caches", () => {

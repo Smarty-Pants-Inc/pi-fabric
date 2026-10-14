@@ -115,22 +115,28 @@ function privateStatMatches(stat: fs.Stats, uid: number, mode: number, kind: "di
   );
 }
 
-function verifyPrivateDirectory(outDir: string, uid: number) {
+type Identity = { dev: number; ino: number };
+
+const CLEANUP_FAILED = "artifact cleanup failed: private output may remain";
+
+function verifyPrivateDirectory(outDir: string, uid: number): Identity {
   try {
     const stat = fs.lstatSync(outDir);
     if (!stat.isDirectory() || stat.isSymbolicLink() || stat.uid !== uid) {
       throw new CliRefusal("private output verification failed");
     }
     fs.chmodSync(outDir, 0o700);
-    if (!privateStatMatches(fs.lstatSync(outDir), uid, 0o700, "directory")) {
+    const verified = fs.lstatSync(outDir);
+    if (!privateStatMatches(verified, uid, 0o700, "directory")) {
       throw new CliRefusal("private output verification failed");
     }
+    return { dev: verified.dev, ino: verified.ino };
   } catch {
     throw new CliRefusal("private output verification failed");
   }
 }
 
-function verifyPrivateFile(file: string, fd: number, uid: number) {
+function verifyPrivateFile(file: string, fd: number, uid: number): Identity {
   try {
     const descriptor = fs.fstatSync(fd);
     const entry = fs.lstatSync(file);
@@ -142,31 +148,123 @@ function verifyPrivateFile(file: string, fd: number, uid: number) {
     ) {
       throw new CliRefusal("private output verification failed");
     }
+    return { dev: descriptor.dev, ino: descriptor.ino };
   } catch {
     throw new CliRefusal("private output verification failed");
   }
 }
 
-function writePrivateFile(file: string, bytes: Uint8Array, ownerUid?: number) {
+/** Returns the verified inode identity when `ownerUid` is given (mint staging); config output passes none. */
+function writePrivateFile(file: string, bytes: Uint8Array, ownerUid?: number): Identity | undefined {
   const flags = fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | (fs.constants.O_NOFOLLOW ?? 0);
   const fd = fs.openSync(file, flags, 0o600);
   try {
     fs.fchmodSync(fd, 0o600);
-    if (ownerUid !== undefined) verifyPrivateFile(file, fd, ownerUid);
+    const identity = ownerUid === undefined ? undefined : verifyPrivateFile(file, fd, ownerUid);
     for (let offset = 0; offset < bytes.length; ) offset += fs.writeSync(fd, bytes, offset);
+    fs.fsyncSync(fd);
+    return identity;
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+/** A renamed artifact must still be the exact private inode that was staged. */
+function verifyPublishedFile(file: string, staged: Identity, uid: number) {
+  try {
+    const entry = fs.lstatSync(file);
+    if (!privateStatMatches(entry, uid, 0o600, "file") || entry.dev !== staged.dev || entry.ino !== staged.ino) {
+      throw new CliRefusal("private output verification failed");
+    }
+  } catch {
+    throw new CliRefusal("private output verification failed");
+  }
+}
+
+function syncDirectory(dir: string) {
+  const flags = (fs.constants.O_RDONLY ?? 0) | (fs.constants.O_DIRECTORY ?? 0) | (fs.constants.O_NOFOLLOW ?? 0);
+  const fd = fs.openSync(dir, flags);
+  try {
     fs.fsyncSync(fd);
   } finally {
     fs.closeSync(fd);
   }
 }
 
-/** New 0700 directory (non-recursive, so an existing path, link or missing parent fails), then exclusive files. */
+/**
+ * Unlinks only target paths that still hold the inode we staged and renamed there. The match is dev/ino only (not
+ * link/mode), so a path whose metadata failed post-rename verification is still removed if it is ours. A different
+ * inode is a foreign replacement and is preserved; an already-missing path is already gone. Any other error is
+ * recorded and the remaining paths are still attempted. Returns false if any of our paths may remain.
+ */
+function rollbackPublished(published: ReadonlyArray<Identity & { file: string }>): boolean {
+  let complete = true;
+  for (const entry of published) {
+    try {
+      const current = fs.lstatSync(entry.file);
+      if (current.dev === entry.dev && current.ino === entry.ino) fs.unlinkSync(entry.file);
+    } catch (error) {
+      if ((error as { code?: unknown } | null)?.code !== "ENOENT") complete = false;
+    }
+  }
+  return complete;
+}
+
+/** Recursive removal only of the staging directory we created, re-checked against its captured identity first. */
+function removeStage(stage: string, identity: Identity): boolean {
+  try {
+    const current = fs.lstatSync(stage);
+    if (!current.isDirectory() || current.isSymbolicLink() || current.dev !== identity.dev || current.ino !== identity.ino) {
+      return false;
+    }
+    fs.rmSync(stage, { recursive: true });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Per-file staged publication (smarty-dev#11682). Ordering is the trust argument:
+ * 1. a private sibling mkdtemp directory (0700, this UID, not a link) is verified before any secret byte is written;
+ * 2. every artifact is staged there exclusively (O_EXCL|O_NOFOLLOW, 0600, fd/path owner+mode+inode checks), fully
+ *    written, fsynced and closed, and its staged dev/ino recorded;
+ * 3. only after all succeed is the target created non-recursively at 0700 (an existing path fails) and verified; each
+ *    file is then renamed individually, recorded, and verified at its final path as the same private inode; the target
+ *    directory is fsynced; the empty stage is removed.
+ * On any failure only recorded, still-identical target inodes are unlinked and only our verified stage is removed; a
+ * pre-existing target is never touched, and an empty target created here may remain. If cleanup cannot be completed
+ * the refusal says so instead of reporting the original error. Same-UID trust boundary is unchanged (#11465).
+ */
 function writeArtifacts(outDir: string, artifacts: readonly NatsMintArtifact[]) {
   const uid = privateOutputUid();
-  fs.mkdirSync(outDir, { mode: 0o700 });
-  verifyPrivateDirectory(outDir, uid);
-  // A failure part-way keeps what was written: nothing here deletes product artifacts.
-  for (const artifact of artifacts) writePrivateFile(path.join(outDir, artifact.name), artifact.bytes, uid);
+  const stage = fs.mkdtempSync(path.join(path.dirname(outDir), ".pi-fabric-nats-stage-"));
+  // If the fresh stage cannot be verified as ours it is not removed; nothing secret has been written into it yet.
+  const stageIdentity = verifyPrivateDirectory(stage, uid);
+  const published: Array<Identity & { file: string }> = [];
+  try {
+    const staged = artifacts.map((artifact) => {
+      const file = path.join(stage, artifact.name);
+      const identity = writePrivateFile(file, artifact.bytes, uid);
+      if (!identity) throw new CliRefusal("private output verification failed");
+      return { name: artifact.name, file, identity };
+    });
+    fs.mkdirSync(outDir, { mode: 0o700 });
+    verifyPrivateDirectory(outDir, uid);
+    for (const entry of staged) {
+      const file = path.join(outDir, entry.name);
+      fs.renameSync(entry.file, file);
+      published.push({ file, ...entry.identity });
+      verifyPublishedFile(file, entry.identity, uid);
+    }
+    syncDirectory(outDir);
+    if (!removeStage(stage, stageIdentity)) throw new CliRefusal(CLEANUP_FAILED);
+  } catch (error) {
+    const rolledBack = rollbackPublished(published);
+    const stageRemoved = removeStage(stage, stageIdentity);
+    if (!rolledBack || !stageRemoved) throw new CliRefusal(CLEANUP_FAILED);
+    throw error;
+  }
 }
 
 function mint(kind: Exclude<Command["kind"], "config">, input: unknown): NatsMintOutput<object> {

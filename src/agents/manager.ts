@@ -1,6 +1,6 @@
 import { childProcessEnvironment } from "../core/atomic-write.js";
 import { copyFabricPrincipal, copyFabricProvenance, type FabricPrincipal, type FabricTurnProvenance } from "../fabric-provenance.js";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { taskReturnAddressArguments, type TaskReturnAddress } from "./task-return-address.js";
 import { AgentWaitBoundError, describeWaitBound } from "./wait-bound.js";
 import { normalizeAgentRequires } from "./input-validation.js";
@@ -21,7 +21,7 @@ import { mkdirPrivate } from "../storage/private-dir.js";
 import { fileURLToPath } from "node:url";
 import { assertFabricModelAllowed, FabricModelDeniedError } from "../core/model-policy.js";
 import { readChildToolAllowlist } from "../core/child-tool-allowlist.js";
-import { readFileRetrying, syncDirectoryChain, writeJsonAtomic } from "../core/atomic-write.js";
+import { readFileRetrying, renameAtomic, syncDirectoryChain, trackTemporary, writeJsonAtomic } from "../core/atomic-write.js";
 import { discardWorkerCompletion, type CompletionRecipient } from "./completion-journal.js";
 import { processStartTime } from "../residency/process-identity.js";
 import { countUnknownEnodevStarts, enodevDelivered, enodevUnresolvedRuns, noteEnodevDelivered, peekEnodevRun, settleEnodevRun,
@@ -208,6 +208,86 @@ const MAX_RETAINED_RUN_HANDLES = 1_000;
 const MAX_LOG_SUMMARY_CHARS = 7_000;
 const MAX_LOG_DETAIL_CHARS = 900;
 const RETENTION_SWEEP_INTERVAL_MS = 15 * 60 * 1_000;
+/** Failed prompts are retained with their status record only up to the existing UI text bound. */
+const FAILED_PROMPT_RETENTION_MAX_BYTES = MAX_UI_TEXT_CHARS;
+
+type AgentPromptMetadata = {
+  promptSha256: string;
+  promptBytes: number;
+  promptPath: string;
+  inputSha256: string;
+  inputBytes: number;
+};
+
+const promptMetadata = (task: string, promptPath: string): AgentPromptMetadata => {
+  const bytes = Buffer.from(task, "utf8");
+  const sha256 = createHash("sha256").update(bytes).digest("hex");
+  return {
+    promptSha256: sha256,
+    promptBytes: bytes.byteLength,
+    promptPath,
+    inputSha256: sha256,
+    inputBytes: bytes.byteLength,
+  };
+};
+
+/** Write private task/provenance bytes without ever following a planted link. */
+const writePrivateFileAtomic = (filePath: string, bytes: Uint8Array): void => {
+  const temporary = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
+  const releaseTemporary = trackTemporary(temporary);
+  const noFollow = fs.constants.O_NOFOLLOW ?? 0;
+  let fd: number | undefined;
+  try {
+    fd = fs.openSync(temporary, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | noFollow, 0o600);
+    for (let offset = 0; offset < bytes.byteLength;) {
+      const written = fs.writeSync(fd, bytes, offset, bytes.byteLength - offset);
+      if (written <= 0) throw new Error(`Could not write ${filePath}`);
+      offset += written;
+    }
+    fs.fsyncSync(fd);
+    fs.closeSync(fd);
+    fd = undefined;
+    renameAtomic(temporary, filePath);
+    syncDirectoryChain(path.dirname(filePath));
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+    try { fs.rmSync(temporary, { force: true }); } catch { /* The committed file is already authoritative. */ }
+    releaseTemporary();
+  }
+};
+
+/** Verify the retained task is still the exact admitted brief. The open descriptor,
+ * not a path read, is authoritative; the second stat catches replacement while hashing. */
+const promptFileMatches = (filePath: string, expectedSha256: string, expectedBytes: number): boolean => {
+  const noFollow = fs.constants.O_NOFOLLOW ?? 0;
+  let fd: number | undefined;
+  try {
+    fd = fs.openSync(filePath, fs.constants.O_RDONLY | noFollow);
+    const before = fs.fstatSync(fd);
+    if (!before.isFile() || before.nlink !== 1 || (before.mode & 0o777) !== 0o600 || before.size !== expectedBytes) return false;
+    const hash = createHash("sha256");
+    const chunk = Buffer.allocUnsafe(Math.min(64 * 1024, expectedBytes));
+    for (let offset = 0; offset < expectedBytes;) {
+      const read = fs.readSync(fd, chunk, 0, Math.min(chunk.byteLength, expectedBytes - offset), offset);
+      if (read <= 0) return false;
+      hash.update(chunk.subarray(0, read));
+      offset += read;
+    }
+    const after = fs.fstatSync(fd);
+    const current = ownedStat(filePath);
+    if (!current || before.dev !== after.dev || before.ino !== after.ino || before.uid !== after.uid ||
+        before.mode !== after.mode || before.nlink !== after.nlink || before.size !== after.size ||
+        before.mtimeMs !== after.mtimeMs || before.ctimeMs !== after.ctimeMs ||
+        current.dev !== after.dev || current.ino !== after.ino || current.uid !== after.uid ||
+        current.mode !== after.mode || current.nlink !== after.nlink || current.size !== after.size ||
+        current.mtimeMs !== after.mtimeMs || current.ctimeMs !== after.ctimeMs) return false;
+    return hash.digest("hex") === expectedSha256;
+  } catch {
+    return false;
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+  }
+};
 
 export const effectiveAgentTimeoutMs = (
   configuredTimeoutMs: number,
@@ -382,6 +462,13 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
   id: string;
   name: string;
   task: string;
+  promptSha256?: string;
+  promptBytes?: number;
+  promptPath?: string;
+  inputSha256?: string;
+  inputBytes?: number;
+  promptRetentionDropped?: boolean;
+  promptRetentionMismatch?: boolean;
   /** Conservative activation lineage: foreign/UNKNOWN admitted input clears it forever. */
   outputPrincipal: FabricPrincipal | undefined;
   /** Host-only activation persistence fence, invoked before conflicting input is admitted. */
@@ -743,6 +830,13 @@ const failedRecord = (
     id: managed.id,
     name: managed.name,
     task: managed.task,
+    ...(managed.promptSha256 ? { promptSha256: managed.promptSha256 } : {}),
+    ...(managed.promptBytes !== undefined ? { promptBytes: managed.promptBytes } : {}),
+    ...(managed.promptPath ? { promptPath: managed.promptPath } : {}),
+    ...(managed.inputSha256 ? { inputSha256: managed.inputSha256 } : {}),
+    ...(managed.inputBytes !== undefined ? { inputBytes: managed.inputBytes } : {}),
+    ...(managed.promptRetentionDropped ? { promptRetentionDropped: true } : {}),
+    ...(managed.promptRetentionMismatch ? { promptRetentionMismatch: true } : {}),
     status,
     runner: managed.runner,
     ...(managed.mainAgentId ? { mainAgentId: managed.mainAgentId } : {}),
@@ -1468,6 +1562,7 @@ export class AgentManager {
     this.#semaphore.admit(this.#currentDepth + 1);
     const id = randomUUID().replaceAll("-", "");
     const name = safeName(request.name ?? request.task.split("\n", 1)[0] ?? "Fabric agent");
+    const prompt = promptMetadata(request.task, path.join(this.#runRoot, id, "task.txt"));
     const callerSignal = signal;
     const assertAuthorized = (): void => {
       if (authorize && !authorize()) {
@@ -1542,8 +1637,8 @@ export class AgentManager {
       const imagesFile = request.images && request.images.length > 0
         ? path.join(runDirectory, "images.json")
         : undefined;
-      fs.writeFileSync(taskFile, request.task, { encoding: "utf8", mode: 0o600 });
-      if (request.provenance) fs.writeFileSync(taskFile + ".provenance.json", JSON.stringify(request.provenance), { mode: 0o600 });
+      writePrivateFileAtomic(taskFile, Buffer.from(request.task, "utf8"));
+      if (request.provenance) writePrivateFileAtomic(taskFile + ".provenance.json", Buffer.from(JSON.stringify(request.provenance), "utf8"));
       if (imagesFile) {
         fs.writeFileSync(imagesFile, JSON.stringify(request.images), {
           encoding: "utf8",
@@ -1669,6 +1764,7 @@ export class AgentManager {
             signal,
             timeoutMs,
             files: { statusFile, lifecycleFile, logFile },
+            prompt,
             ...(clampedFrom ? { requestedThinking: clampedFrom } : {}),
             ...(branch ? { branch } : {}),
             ...(worktree ? { worktree } : {}),
@@ -1690,6 +1786,16 @@ export class AgentManager {
           ...(pythonRuntime ? ["--python-runtime", pythonRuntime] : []),
           "--task-file",
           taskFile,
+          "--prompt-sha256",
+          prompt.promptSha256,
+          "--prompt-bytes",
+          String(prompt.promptBytes),
+          "--prompt-path",
+          prompt.promptPath,
+          "--input-sha256",
+          prompt.inputSha256,
+          "--input-bytes",
+          String(prompt.inputBytes),
           ...(imagesFile ? ["--images-file", imagesFile] : []),
           "--status-file",
           statusFile,
@@ -1874,6 +1980,7 @@ export class AgentManager {
           id,
           name,
           task: request.task,
+          ...prompt,
           // pi-fabric#939: the manager's own pid and birth record, read at launch from the transport handle.
           ...((owned => owned ? { ownProcess: owned } : {})(transport.kind === "process" ? ownedProcess(transport.sessionId) : undefined)),
           ...(this.#mainAgentId ? { mainAgentId: this.#mainAgentId } : {}),
@@ -1971,6 +2078,7 @@ export class AgentManager {
             queued = {
               info: { id, name, status: "queued", runner, transport: request.transport ?? this.config.transport,
                 cwd: agentCwd, residency, recursive: request.recursive === true,
+                ...prompt,
                 ...(request.actorId ? { actorId: request.actorId } : {}),
                 ...(request.actorName ? { actorName: request.actorName } : {}) },
               task: request.task, enqueuedAt: Date.now(), abort: new AbortController(), result, resolve, background: false,
@@ -2031,6 +2139,7 @@ export class AgentManager {
       ...createRunRouteMetadata({ ...routeFacts, runner, transport: request.transport ?? this.config.transport }),
       id, name, status: "queued", runner, transport: request.transport ?? this.config.transport,
       cwd: selectedCwd, residency, recursive: request.recursive === true,
+      ...prompt,
       ...(kernel ? { kernel } : {}),
       ...(model ? { model } : {}),
       ...(request.modelReason !== undefined ? { modelReason: request.modelReason } : {}),
@@ -2335,6 +2444,7 @@ export class AgentManager {
       signal: AbortSignal | undefined;
       timeoutMs: number;
       files: { statusFile: string; lifecycleFile: string; logFile: string };
+      prompt: AgentPromptMetadata;
       requestedThinking?: AgentRunRequest["thinking"];
       branch?: string;
       worktree?: string;
@@ -2345,6 +2455,7 @@ export class AgentManager {
       id: context.id,
       name: context.name,
       task: context.task,
+      ...launch.prompt,
       status: "running",
       runner: adapter.id,
       transport: "hosted",
@@ -2426,6 +2537,11 @@ export class AgentManager {
       id: record.id,
       name: record.name,
       task: record.task,
+      ...(record.promptSha256 ? { promptSha256: record.promptSha256 } : {}),
+      ...(record.promptBytes !== undefined ? { promptBytes: record.promptBytes } : {}),
+      ...(record.promptPath ? { promptPath: record.promptPath } : {}),
+      ...(record.inputSha256 ? { inputSha256: record.inputSha256 } : {}),
+      ...(record.inputBytes !== undefined ? { inputBytes: record.inputBytes } : {}),
       runner: record.runner,
       runnerAdapter: hosted.adapter,
       hosted,
@@ -3718,7 +3834,16 @@ export class AgentManager {
     // owner removes them on cleanup/retention/root shutdown, not this child.
     if (!this.config.retainRuns && !this.#parentOwnedRunRoot) {
       await Promise.all(all.filter(managed => this.#canCollect(managed))
-        .map(managed => removeTree(managed.runDirectory).catch(() => undefined)));
+        .map(async (managed) => {
+          // Failed/cancelled/timed-out prompts remain beside their terminal
+          // status for the normal 24 h sweep; successful runs keep today's
+          // deletion behavior. Oversized prompts are dropped and marked in the
+          // terminal result by #withTransportMetadata.
+          // A failed prompt retention error is a custody failure: keep the whole
+          // tree rather than falling back to destructive cleanup.
+          if (await this.#retainFailedPromptRecord(managed).catch(() => true)) return;
+          await removeTree(managed.runDirectory).catch(() => undefined);
+        }));
     }
     // A failed stop is not authority to delete a child's working files.
     if (detached.length === 0 && !alive.some(Boolean) && !unresolved) {
@@ -3726,6 +3851,12 @@ export class AgentManager {
       const storageSafe = !this.#managedTempRoot || canRemoveManagedRunRoot(this.#runRoot);
       if (!this.config.retainRuns) {
         if (storageSafe && !this.#parentOwnedRunRoot) {
+          // The closed marker hands retained failed records to the normal one-shot
+          // sweep. Without it, a live manager owner makes the root invisible to
+          // the 24 h retention pass after close.
+          if (this.#managedTempRoot) {
+            try { markRunRootClosed(this.#runRoot, Date.now(), true); } catch { /* keep the safer owner state */ }
+          }
           // A recovered manager does not own workers left by an earlier host.
           // All tracked transports are confirmed exited above; untracked runs stay put.
           await Promise.all([...this.#queued.values()]
@@ -4139,10 +4270,15 @@ export class AgentManager {
         }
       }
       if (resume) {
-        fs.writeFileSync(path.join(managed.runDirectory, "task.txt"), resume.task, {
-          encoding: "utf8",
-          mode: 0o600,
-        });
+        // A continuation rewrites the run's input in place. The prompt metadata
+        // stays bound to the original spawn brief; it is never recomputed from
+        // this same-run continuation (smarty-dev#11663).
+        writePrivateFileAtomic(path.join(managed.runDirectory, "task.txt"), Buffer.from(resume.task, "utf8"));
+        const currentInput = promptMetadata(resume.task, managed.promptPath ?? path.join(managed.runDirectory, "task.txt"));
+        managed.inputSha256 = currentInput.inputSha256;
+        managed.inputBytes = currentInput.inputBytes;
+        setWorkerArgument(managed.launch.workerArguments, "input-sha256", currentInput.inputSha256);
+        setWorkerArgument(managed.launch.workerArguments, "input-bytes", String(currentInput.inputBytes));
         setWorkerArgument(
           managed.launch.workerArguments,
           "carry-over",
@@ -4853,6 +4989,35 @@ export class AgentManager {
     }
   }
 
+  async #retainFailedPromptRecord(managed: ManagedAgent): Promise<boolean> {
+    const record = readRecord(managed.statusFile) ?? managed.latestRecord;
+    if (!record || !["failed", "stopped", "timed_out"].includes(record.status)) return false;
+    const promptFile = path.join(managed.runDirectory, "task.txt");
+    const stat = ownedStat(promptFile);
+    const expectedSha256 = managed.inputSha256 ?? record.inputSha256;
+    const expectedBytes = managed.inputBytes ?? record.inputBytes;
+    const oversized = expectedBytes !== undefined && expectedBytes > FAILED_PROMPT_RETENTION_MAX_BYTES;
+    const currentMatches = !oversized && stat?.isFile() === true && expectedSha256 !== undefined && expectedBytes !== undefined &&
+      stat.size <= FAILED_PROMPT_RETENTION_MAX_BYTES && promptFileMatches(promptFile, expectedSha256, expectedBytes);
+    if (!currentMatches) {
+      managed.promptRetentionDropped = true;
+      // A small file that fails its current-input digest is not safe to retain.
+      // Keep the mismatch visible in status.json, but drop the unverified bytes.
+      managed.promptRetentionMismatch = !oversized;
+    }
+    // Persist the manager's authoritative metadata before removing every other
+    // artifact. A verified current task.txt and status.json are the complete
+    // retained proof; a mismatch retains status.json only.
+    writeRecord(managed.statusFile, compactUiRecord(this.#withTransportMetadata(record, managed, false)));
+    for (const entry of fs.readdirSync(managed.runDirectory)) {
+      if (entry === "status.json" || (entry === "task.txt" && currentMatches)) continue;
+      await removeTree(path.join(managed.runDirectory, entry));
+    }
+    // Once a failure has a retained status, never fall back to deleting its
+    // whole tree. Any cleanup error propagates to the close custody fence.
+    return true;
+  }
+
   #canCollect(managed: ManagedAgent): boolean {
     if (!managed.executionExited || managed.processStopPending || managed.nativeReleasePending ||
         this.#terminalNoticeOutbox.hasPending(managed.runDirectory) || managed.lostContact || hasUnresolvedWorker(managed.runDirectory)) return false;
@@ -5164,6 +5329,11 @@ export class AgentManager {
       ...managed.runRoute,
       id: managed.id,
       name: managed.name,
+      ...(managed.promptSha256 ? { promptSha256: managed.promptSha256 } : {}),
+      ...(managed.promptBytes !== undefined ? { promptBytes: managed.promptBytes } : {}),
+      ...(managed.promptPath ? { promptPath: managed.promptPath } : {}),
+      ...(managed.inputSha256 ? { inputSha256: managed.inputSha256 } : {}),
+      ...(managed.inputBytes !== undefined ? { inputBytes: managed.inputBytes } : {}),
       status,
       runner: managed.runner,
       ...(managed.kernel ? { kernel: managed.kernel } : {}),
@@ -5240,6 +5410,17 @@ export class AgentManager {
       ...(includeSaveFailure && managed.settlementSaveFailure
         ? { warnings: [...(record.warnings ?? []), managed.settlementSaveFailure.warning] }
         : {}),
+      ...(managed.promptSha256 ?? record.promptSha256 ? { promptSha256: managed.promptSha256 ?? record.promptSha256 } : {}),
+      ...((managed.promptBytes ?? record.promptBytes) !== undefined
+        ? { promptBytes: managed.promptBytes ?? record.promptBytes } : {}),
+      ...(managed.promptPath ?? record.promptPath ? { promptPath: managed.promptPath ?? record.promptPath } : {}),
+      ...(managed.inputSha256 ?? record.inputSha256 ? { inputSha256: managed.inputSha256 ?? record.inputSha256 } : {}),
+      ...((managed.inputBytes ?? record.inputBytes) !== undefined
+        ? { inputBytes: managed.inputBytes ?? record.inputBytes } : {}),
+      ...((managed.promptRetentionDropped || record.promptRetentionDropped)
+        ? { promptRetentionDropped: true } : {}),
+      ...((managed.promptRetentionMismatch || record.promptRetentionMismatch)
+        ? { promptRetentionMismatch: true } : {}),
       cwd: managed.cwd,
       runner: managed.runner,
       ...(managed.kernel ? { kernel: managed.kernel } : {}),

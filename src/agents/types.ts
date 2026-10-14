@@ -213,6 +213,17 @@ export interface AgentRunRecord {
   id: string;
   name: string;
   task: string;
+  /** Exact original spawn brief, retained separately from mutable continuation task text. */
+  promptSha256?: string;
+  promptBytes?: number;
+  promptPath?: string;
+  /** Current task.txt bytes; changes when a same-run continuation rewrites the input. */
+  inputSha256?: string;
+  inputBytes?: number;
+  /** True when close/retention dropped the current input file. */
+  promptRetentionDropped?: boolean;
+  /** True when the current input failed stable digest verification. */
+  promptRetentionMismatch?: boolean;
   status: AgentRunStatus;
   /** One-based FIFO admission position; present only while queued. */
   queuePosition?: number;
@@ -337,6 +348,15 @@ export interface AgentHandleInfo {
   compactionSkipped?: string;
   id: string;
   name: string;
+  /** Exact original spawn brief metadata; never contains prompt text. */
+  promptSha256?: string;
+  promptBytes?: number;
+  promptPath?: string;
+  /** Current task.txt bytes, updated for a same-run continuation. */
+  inputSha256?: string;
+  inputBytes?: number;
+  promptRetentionDropped?: boolean;
+  promptRetentionMismatch?: boolean;
   status: AgentRunStatus;
   /** One-based FIFO admission position; present only while queued. */
   queuePosition?: number;
@@ -377,6 +397,12 @@ export interface AgentWorkerOptions {
   pythonRuntime?: FabricPythonRuntime;
   name: string;
   taskFile: string;
+  /** Exact original spawn brief metadata. The task file may later contain a continuation. */
+  promptSha256?: string;
+  promptBytes?: number;
+  promptPath?: string;
+  inputSha256?: string;
+  inputBytes?: number;
   imagesFile?: string;
   statusFile: string;
   lifecycleFile: string;

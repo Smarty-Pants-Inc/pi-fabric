@@ -1,6 +1,6 @@
 import { appendDeliveryOutcome, type DeliverySend } from "../mesh/delivery-outcomes.js";
 import type { MeshControlIncarnationFence } from "../config.js";
-import { FabricBridgeStaleError, FabricParticipantStaleError, mirroredLeaseStatus, participantLeaseGraceMs, type FabricMirrorLease } from "./host-leases.js";
+import { FabricBridgeStaleError, FabricParticipantStaleError, mirroredOwnerRoutingStatus, participantLeaseGraceMs, type FabricMirrorLease } from "./host-leases.js";
 import { retryDelayMs } from "../core/retry-backoff.js";
 import { assertSteerPriority, type FabricSteerPriority } from "../main-agent.js";
 import { copyFabricPrincipal, copyFabricWakeCause, fabricWakeCause, withFabricWakeAdmission, type FabricWakeCause, type FabricPrincipal } from "../fabric-provenance.js";
@@ -319,11 +319,6 @@ export interface MirroredControlOwner {
   /** Observation exists but does not belong to this owner/link. Never fall back to legacy expiry. */
   bridgeStale?: true;
 }
-
-const mirrorStatus = (owner: MirroredControlOwner, now: number) => owner.bridgeStale ? "bridge-stale" : owner.mirror
-  ? mirroredLeaseStatus(owner.remoteHost, owner.mirror, now)
-  // An older bridge can prove only its unexpired projection, never an origin's death.
-  : owner.expiresAt > now ? "live" : "bridge-stale";
 
 export interface FabricControlPlaneOptions {
   /** Missing epochs are admitted with sender warnings by default during mixed-release rollout. */
@@ -680,7 +675,7 @@ export class FabricControlPlane {
     }
     const destinationRemoteHost = destination.remoteHost;
     if (mirroredOwner) {
-      const status = mirrorStatus(mirroredOwner, (this.options.now ?? Date.now)());
+      const status = mirroredOwnerRoutingStatus(mirroredOwner, (this.options.now ?? Date.now)());
       if (status === "bridge-stale") throw new FabricBridgeStaleError(mirroredOwner.remoteHost, targetId, false);
       if (status === "lease-stale") throw new Error(
         `Fabric lease observed on remote host ${mirroredOwner.remoteHost} lapsed for ${targetId}; this attempt was not published.`);
@@ -970,7 +965,7 @@ export class FabricControlPlane {
         }
         // Never adopt a different link's label. Missing ownership cannot renew this lease.
         if (current?.remoteHost === captured.remoteHost) Object.assign(captured, { ...current, mirror: current.mirror, bridgeStale: current.bridgeStale });
-        const status = mirrorStatus(captured, (this.options.now ?? Date.now)());
+        const status = mirroredOwnerRoutingStatus(captured, (this.options.now ?? Date.now)());
         if (status === "live") continue;
         const lapsed = this.#clearPending(commandId);
         if (!lapsed) continue;

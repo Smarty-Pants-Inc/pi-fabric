@@ -22,13 +22,13 @@ const identity: MeshIdentity = { id: rootId, name: "lane", kind: "main", session
 const mirror = (at: number, patch: Partial<FabricMirrorLease> = {}): FabricMirrorLease => ({ remoteHost: "ryzen4",
   observedAt: at, sourceObservedAt: at - 60_000, sourceUpdatedAt: at - 62_000, sourceExpiresAt: at - 47_000, ...patch });
 
-const fixture = async (sourceOffset = -60_000) => {
+const fixture = async (sourceOffset = -60_000, sourceTtl = 13_000) => {
   let now = Date.now();
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mirror-liveness-"));
   const store = new MeshStore(path.join(dir, "hub"), 64 * 1024, 100);
   const local = new StoreBridgeSide(store, "ryzen4", () => now);
   const record = { format: 1 as const, id: rootId, rootId, identity, incarnationToken: "incarnation-1",
-    startedAt: now - 120_000, updatedAt: now + sourceOffset - 2_000, expiresAt: now + sourceOffset + 13_000 };
+    startedAt: now - 120_000, updatedAt: now + sourceOffset - 2_000, expiresAt: now + sourceOffset + sourceTtl };
   const participant = { format: 1 as const, id: rootId, rootId, kind: "root" as const, name: "lane", ownerHostId: rootId,
     ownerIdentityId: rootId, ownerIncarnation: "activation-1", status: "idle", runner: "pi" as const, transport: "host" as const,
     capabilities: ["steer" as const, "followUp" as const], controlProtocol: "v1" as const, sessionId: identity.sessionId!,
@@ -97,6 +97,72 @@ describe("source-clock root liveness (#10068)", () => {
     await expect(router.routeMessage(rootId, "no fresh bridge", undefined, "followUp"))
       .rejects.toMatchObject({ code: "FABRIC_BRIDGE_STALE" });
     expect(commands(f)).toHaveLength(1);
+    expect(steerRemote).not.toHaveBeenCalled();
+  });
+
+  it.each(["steer", "followUp"] as const)("refuses %s at the translated short source TTL while its observation is fresh, then admits a renewed sample", async operation => {
+    const f = await fixture(-60_000, 1_000);
+    vi.spyOn(Date, "now").mockImplementation(f.now);
+    expect(f.directory.get(rootId, f.now())?.bridgeStale).toBeUndefined();
+    const expiresAt = f.lease().expiresAt;
+    expect(expiresAt).toBe(f.now() + 1_000);
+    f.advance(1_000); // Equality is expired authority, even inside the 15 s freshness window.
+    expect(mirroredLeaseStatus("ryzen4", f.lease().mirror, f.now())).toBe("live");
+    expect(f.local.holds(rootId)).toBe(false);
+    const refusal = settle(f.control.request(rootId, rootId, operation, {
+      ownerIncarnation: "activation-1", message: "expired translated authority" }, rootId, { routedRemoteHost: "ryzen4" }));
+    let settled = false;
+    void refusal.then(() => { settled = true; });
+    await vi.waitFor(() => expect(settled || commands(f).length > 0).toBe(true));
+    expect(commands(f)).toHaveLength(0); // The old head publishes here: this is the negative control.
+    expect((await refusal).error).toMatchObject({ code: "FABRIC_BRIDGE_STALE", remoteHost: "ryzen4", targetId: rootId,
+      message: expect.stringContaining("this attempt was not published") });
+    expect(f.directory.get(rootId, f.now())).toMatchObject({ remoteHost: "ryzen4", bridgeStale: true });
+    expect(f.directory.list({ scope: "project", fresh: true }, f.now()).find(p => p.id === rootId))
+      .toMatchObject({ remoteHost: "ryzen4", bridgeStale: true });
+
+    const sourceAt = f.now() - 60_000;
+    await f.local.mirror({ ...f.presence, hosts: [{ ...f.presence.hosts[0]!, observedAt: sourceAt,
+      record: { ...f.presence.hosts[0]!.record, updatedAt: sourceAt, expiresAt: sourceAt + 1_000 },
+      expiresAt: sourceAt + 1_000 }] }, f.now());
+    expect(f.directory.get(rootId, f.now())?.bridgeStale).toBeUndefined();
+    const renewed = f.control.request(rootId, rootId, operation, { ownerIncarnation: "activation-1", message: "renewed" },
+      rootId, { routedRemoteHost: "ryzen4" });
+    void renewed.catch(() => undefined);
+    await vi.waitFor(() => expect(commands(f)).toHaveLength(1));
+    const commandId = (commands(f)[0]!.data as { commandId: string }).commandId;
+    await f.store.publish({ topic: "fabric.control.ack", kind: "accepted", from: identity, to: senderId,
+      data: { version: 1, commandId, targetId: rootId, ownerIncarnation: "activation-1", accepted: true,
+        messageId: "renewed-accepted", bridge: { from: "ryzen4" } } });
+    await expect(renewed).resolves.toMatchObject({ acknowledged: true, routed: "mesh" });
+  });
+
+  it.each(["v1", "legacy"] as const)("the %s router refuses short-TTL authority before control or legacy delivery and names a freshly proven lapse", async protocol => {
+    const f = await fixture(-60_000, 1_000);
+    vi.spyOn(Date, "now").mockImplementation(f.now);
+    await f.local.mirror({ ...f.presence, participants: f.presence.participants.map(({ ownerIncarnation, ...p }) => ({ ...p,
+      controlProtocol: protocol, ...(protocol === "v1" && ownerIncarnation ? { ownerIncarnation } : {}) })) }, f.now());
+    const sender = { id: senderId, name: "lead", kind: "main" as const };
+    const steerRemote = vi.fn(async () => ({ queued: true }));
+    const router = new AgentMessageRouter({} as any, { identity: sender, steerRemote } as any,
+      { local: true, id: senderId, matches: (id: string) => id === senderId } as any,
+      f.directory, f.control, binding => binding);
+    f.advance(1_001);
+    for (const operation of ["steer", "followUp"] as const) {
+      await expect(router.routeMessage(rootId, "expired translated authority", undefined, operation))
+        .rejects.toMatchObject({ code: "FABRIC_BRIDGE_STALE", remoteHost: "ryzen4",
+          message: expect.stringContaining("this attempt was not published") });
+    }
+    expect(commands(f)).toHaveLength(0);
+    expect(steerRemote).not.toHaveBeenCalled();
+    // A new expired SOURCE sample is different: it proves lapse and keeps immediate host attribution (#2004).
+    f.advertise(mirror(f.now(), { sourceExpiresAt: f.now() - 60_001 }));
+    expect(f.directory.get(rootId, f.now())).toBeUndefined();
+    for (const operation of ["steer", "followUp"] as const) {
+      await expect(router.routeMessage(rootId, "freshly proven source lapse", undefined, operation))
+        .rejects.toThrow("its lease mirrored from remote host ryzen4 lapsed");
+    }
+    expect(commands(f)).toHaveLength(0);
     expect(steerRemote).not.toHaveBeenCalled();
   });
 

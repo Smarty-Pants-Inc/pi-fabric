@@ -30,7 +30,7 @@ import {
   hostLeasePredecessor,
   hostLiveness,
   hostMirrorLease,
-  mirroredLeaseStatus,
+  mirroredOwnerRoutingStatus,
   type FabricMirrorLease,
   LIVENESS_POLICY_KEY,
   readHostLease,
@@ -1451,8 +1451,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
   }
 
   #mirrorStatus(owner: FabricHostRecord & { mirror?: FabricMirrorLease }, now: number) {
-    if (!owner.mirror && owner.mirrorLease !== 1) return owner.expiresAt > now ? "live" : "bridge-stale";
-    return mirroredLeaseStatus(owner.remoteHost!, owner.mirror, now);
+    return mirroredOwnerRoutingStatus({ ...owner, remoteHost: owner.remoteHost! }, now);
   }
 
   // A mirrored record never shadows a local target (smarty-dev#2004): it is refused when its id

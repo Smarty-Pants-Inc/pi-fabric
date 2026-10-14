@@ -127,6 +127,19 @@ export const mirroredLeaseStatus = (
   return mirror.sourceExpiresAt <= mirror.sourceObservedAt ? "lease-stale" : "live";
 };
 
+/** Routing needs both source evidence and unexpired translated authority. A translated
+ * deadline passing alone cannot prove source death; only a fresh expired sample can. */
+export const mirroredOwnerRoutingStatus = (
+  owner: { remoteHost: string; expiresAt: number; mirror?: FabricMirrorLease; mirrorLease?: 1; bridgeStale?: true },
+  now = Date.now(),
+): MirroredLeaseStatus => {
+  if (owner.bridgeStale) return "bridge-stale";
+  // An older bridge proves only its unexpired projection, never the source's death.
+  const status = owner.mirror || owner.mirrorLease === 1
+    ? mirroredLeaseStatus(owner.remoteHost, owner.mirror, now) : "live";
+  return status === "live" && !(owner.expiresAt > now) ? "bridge-stale" : status;
+};
+
 export class FabricBridgeStaleError extends Error {
   override readonly name = "FabricBridgeStaleError";
   readonly code = "FABRIC_BRIDGE_STALE";
@@ -621,9 +634,9 @@ export const hostLiveness = (
 ): Liveness => {
   const lease = matchingHostLease(leases, host);
   if (lease && host.remoteHost && lease.mirror?.remoteHost === host.remoteHost) {
-    // Routing judges the source sample with mirroredLeaseStatus, never the hub clock.
-    // Bridge traffic authority keeps the stricter translated TTL, so short-lease origins
-    // are reobserved before forwarding. Expired authority is not proof of a dead Main.
+    // mirroredOwnerRoutingStatus requires a fresh source sample AND this translated TTL,
+    // so short-lease origins are reobserved before forwarding. Expired translated authority
+    // is not proof of a dead Main; mirroredLeaseStatus alone judges source-death evidence.
     return { updatedAt: lease.mirror.observedAt, expiresAt: lease.mirror.sourceExpiresAt > lease.mirror.sourceObservedAt
       ? Math.min(lease.expiresAt, lease.mirror.observedAt + MIRROR_FRESH_MS) : lease.mirror.observedAt - 1 };
   }

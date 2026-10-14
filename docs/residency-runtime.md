@@ -253,6 +253,7 @@ resident `ownerHostId`.
 
 ## Known Windows limitation
 
+Generation-private startup errors use `generations/<uuid>.error.json` (seven-day retention preview only; apply remains disabled under smarty-dev#10678); publication stays closed on Windows because Node exposes no verified `O_NOFOLLOW` create/open path there.
 Durable residency E2E is POSIX-only today. On Windows, the launcher's spawn of
 the `pi` binary through the installed `node_modules/.bin` shims hangs before
 the child starts, so the resident host never starts.

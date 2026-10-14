@@ -1,6 +1,6 @@
 import { childProcessEnvironment } from "../core/atomic-write.js";
 import { copyFabricPrincipal, copyFabricProvenance, type FabricPrincipal, type FabricTurnProvenance } from "../fabric-provenance.js";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { taskReturnAddressArguments, type TaskReturnAddress } from "./task-return-address.js";
 import { AgentWaitBoundError, describeWaitBound } from "./wait-bound.js";
 import { normalizeAgentRequires } from "./input-validation.js";
@@ -21,7 +21,7 @@ import { mkdirPrivate } from "../storage/private-dir.js";
 import { fileURLToPath } from "node:url";
 import { assertFabricModelAllowed, FabricModelDeniedError } from "../core/model-policy.js";
 import { readChildToolAllowlist } from "../core/child-tool-allowlist.js";
-import { readFileRetrying, syncDirectoryChain, writeJsonAtomic } from "../core/atomic-write.js";
+import { readFileRetrying, renameAtomic, syncDirectoryChain, trackTemporary, writeJsonAtomic } from "../core/atomic-write.js";
 import { discardWorkerCompletion, type CompletionRecipient } from "./completion-journal.js";
 import { processStartTime } from "../residency/process-identity.js";
 import { countUnknownEnodevStarts, enodevDelivered, enodevUnresolvedRuns, noteEnodevDelivered, peekEnodevRun, settleEnodevRun,
@@ -101,12 +101,14 @@ import { FOLLOW_UP_RUNNING_TASK_MESSAGE, type AgentAdmissionAlarm, type AgentFol
 import { followUpFile, followUpState, settleFollowUp, releaseFollowUpPayload } from "./follow-up-delivery.js";
 import { createRunRouteMetadata } from "../worker/run-record.js";
 import { readFinalAnswerReceipt, type FinalAnswerReceipt } from "../worker/terminal-answer.js";
-import { FabricTargetTerminalError, type AgentTerminalNotice } from "./terminal-target.js";
-import { TerminalNoticeOutbox, readTerminalAdmission, terminalControlMatchesAdmission, terminalSenderMatches } from "./terminal-notices.js";
+import { FabricTargetTerminalError, type AgentTerminalNotice, type AgentUndeliveredMessage } from "./terminal-target.js";
+import { TerminalNoticeOutbox, readTerminalAdmission, terminalControlRefusalProven, terminalSenderMatches } from "./terminal-notices.js";
 import type { AgentRunRouteMetadata } from "./types.js";
 import { WorktreeManager, type AgentWorktreeResult } from "./worktree-manager.js";
 import { writeForkSession, writeHandoffSession } from "./handoff.js";
 import {
+  AgentWriteRootOverlapError,
+  assertDefaultTaskWriteRoots,
   checkWritePolicyRequest,
   readAgentLineage,
   readWritePolicy,
@@ -208,6 +210,92 @@ const MAX_RETAINED_RUN_HANDLES = 1_000;
 const MAX_LOG_SUMMARY_CHARS = 7_000;
 const MAX_LOG_DETAIL_CHARS = 900;
 const RETENTION_SWEEP_INTERVAL_MS = 15 * 60 * 1_000;
+/** Unsuccessful managed prompts are retained only up to the existing UI bound, in bytes. */
+const TERMINAL_PROMPT_RETENTION_MAX_BYTES = MAX_UI_TEXT_CHARS;
+
+type AgentPromptMetadata = {
+  promptSha256: string;
+  promptBytes: number;
+  promptPath: string;
+  inputSha256: string;
+  inputBytes: number;
+};
+
+const promptMetadata = (task: string, promptPath: string): AgentPromptMetadata => {
+  const bytes = Buffer.from(task, "utf8");
+  const sha256 = createHash("sha256").update(bytes).digest("hex");
+  return {
+    promptSha256: sha256,
+    promptBytes: bytes.byteLength,
+    promptPath,
+    inputSha256: sha256,
+    inputBytes: bytes.byteLength,
+  };
+};
+
+/** The physical filesystem host, captured once at import: production never changes
+ * process.platform, while tests may mock it after load. Windows has no POSIX mode bits
+ * and no directory fsync. */
+const NATIVE_WINDOWS_FILESYSTEM = process.platform === "win32";
+
+/** Write private task/provenance bytes without ever following a planted link. */
+const writePrivateFileAtomic = (filePath: string, bytes: Uint8Array): void => {
+  const temporary = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
+  const releaseTemporary = trackTemporary(temporary);
+  const noFollow = fs.constants.O_NOFOLLOW ?? 0;
+  let fd: number | undefined;
+  try {
+    fd = fs.openSync(temporary, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | noFollow, 0o600);
+    for (let offset = 0; offset < bytes.byteLength;) {
+      const written = fs.writeSync(fd, bytes, offset, bytes.byteLength - offset);
+      if (written <= 0) throw new Error(`Could not write ${filePath}`);
+      offset += written;
+    }
+    fs.fsyncSync(fd);
+    fs.closeSync(fd);
+    fd = undefined;
+    renameAtomic(temporary, filePath);
+    if (!NATIVE_WINDOWS_FILESYSTEM) syncDirectoryChain(path.dirname(filePath));
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+    try { fs.rmSync(temporary, { force: true }); } catch { /* The committed file is already authoritative. */ }
+    releaseTemporary();
+  }
+};
+
+/** Verify the retained task is still the exact admitted brief. The open descriptor,
+ * not a path read, is authoritative; the second stat catches replacement while hashing. */
+const promptFileMatches = (filePath: string, expectedSha256: string, expectedBytes: number): boolean => {
+  const noFollow = fs.constants.O_NOFOLLOW ?? 0;
+  let fd: number | undefined;
+  try {
+    fd = fs.openSync(filePath, fs.constants.O_RDONLY | noFollow);
+    const before = fs.fstatSync(fd);
+    if (!before.isFile() || before.nlink !== 1 ||
+        (!NATIVE_WINDOWS_FILESYSTEM && (before.mode & 0o777) !== 0o600) || before.size !== expectedBytes) return false;
+    const hash = createHash("sha256");
+    const chunk = Buffer.allocUnsafe(Math.min(64 * 1024, expectedBytes));
+    for (let offset = 0; offset < expectedBytes;) {
+      const read = fs.readSync(fd, chunk, 0, Math.min(chunk.byteLength, expectedBytes - offset), offset);
+      if (read <= 0) return false;
+      hash.update(chunk.subarray(0, read));
+      offset += read;
+    }
+    const after = fs.fstatSync(fd);
+    const current = ownedStat(filePath);
+    if (!current || before.dev !== after.dev || before.ino !== after.ino || before.uid !== after.uid ||
+        before.mode !== after.mode || before.nlink !== after.nlink || before.size !== after.size ||
+        before.mtimeMs !== after.mtimeMs || before.ctimeMs !== after.ctimeMs ||
+        current.dev !== after.dev || current.ino !== after.ino || current.uid !== after.uid ||
+        current.mode !== after.mode || current.nlink !== after.nlink || current.size !== after.size ||
+        current.mtimeMs !== after.mtimeMs || current.ctimeMs !== after.ctimeMs) return false;
+    return hash.digest("hex") === expectedSha256;
+  } catch {
+    return false;
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+  }
+};
 
 export const effectiveAgentTimeoutMs = (
   configuredTimeoutMs: number,
@@ -382,6 +470,13 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
   id: string;
   name: string;
   task: string;
+  promptSha256?: string;
+  promptBytes?: number;
+  promptPath?: string;
+  inputSha256?: string;
+  inputBytes?: number;
+  promptRetentionDropped?: boolean;
+  promptRetentionMismatch?: boolean;
   /** Conservative activation lineage: foreign/UNKNOWN admitted input clears it forever. */
   outputPrincipal: FabricPrincipal | undefined;
   /** Host-only activation persistence fence, invoked before conflicting input is admitted. */
@@ -578,12 +673,20 @@ const safeName = (value: string): string =>
     .trim()
     .slice(0, MAX_NAME_LENGTH) || "Fabric agent";
 
+// Retained disk records omit task fields; public/UI readers still receive strings.
+// Never reconstruct a prompt from provenance or another retained field.
+const normalizeRecordTasks = (record: AgentRunRecord): AgentRunRecord => ({
+  ...record,
+  task: record.task ?? "",
+  ...(record.nestedAgents ? { nestedAgents: record.nestedAgents.map(normalizeRecordTasks) } : {}),
+});
+
 const readRecord = (filePath: string): AgentRunRecord | undefined => {
   try {
     const parsed: unknown = JSON.parse(readFileRetrying(filePath));
     if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return undefined;
     const record = parsed as AgentRunRecord;
-    return { ...record, runner: isFabricRunnerId(record.runner) ? record.runner : "pi" };
+    return { ...normalizeRecordTasks(record), runner: isFabricRunnerId(record.runner) ? record.runner : "pi" };
   } catch {
     return undefined;
   }
@@ -628,6 +731,17 @@ const compactUiRecord = (record: AgentRunRecord): AgentRunRecord => {
   };
 };
 
+type RetainedPromptRecord = Omit<AgentRunRecord, "task" | "nestedAgents"> & {
+  nestedAgents?: RetainedPromptRecord[];
+};
+
+// Disk-only task omission, including copied nested snapshots. Live names,
+// diagnostic output and UI compaction keep their existing policy (#11712).
+const omitRetainedTasks = (record: AgentRunRecord): RetainedPromptRecord => {
+  const { task: _task, nestedAgents, ...rest } = record;
+  return { ...rest, ...(nestedAgents ? { nestedAgents: nestedAgents.map(omitRetainedTasks) } : {}) };
+};
+
 // A terminal owner no longer hosts its session children. Preserve genuine final
 // results, but do not present its last running snapshot as live execution. Durable
 // descendants have independent owners and must not inherit this terminal state.
@@ -641,6 +755,8 @@ const reconcileNestedAgents = (records: AgentRunRecord[], owner: AgentRunRecord)
         ...rest,
         status: "failed",
         error: `Nested agent owner ${owner.id} finished (${owner.status}) before a terminal result was retained`,
+        // pi-fabric#1034 round 7: a running checkpoint made terminal here; later effects are unknown.
+        ...carriedWriteReceipt(record.runner, record),
         finishedAt,
         updatedAt: Math.max(record.updatedAt, finishedAt),
       };
@@ -707,6 +823,20 @@ const writeRecord = (filePath: string, record: AgentRunRecord): void => {
   writeJsonAtomic(filePath, record, { space: 2 });
 };
 
+// pi-fabric#1034 round 7: a manager-made result (timeout, stop, lost worker) keeps the child's last stored write
+// receipt. Unless the worker itself wrote a terminal record, what ran after that checkpoint is unknown, so the receipt
+// is marked truncated; a Pi child with no stored receipt gets an empty truncated one, never none.
+const carriedWriteReceipt = (
+  runner: string,
+  previous: AgentRunRecord | undefined,
+): { writeReceipt?: NonNullable<AgentRunRecord["writeReceipt"]> } => {
+  if (runner !== "pi" && runner !== "pi-durable") return {}; // only Pi children have a receipt
+  const receipt = previous?.writeReceipt;
+  const known = previous !== undefined && previous.status !== "queued" && previous.status !== "running";
+  if (receipt) return { writeReceipt: known ? receipt : { ...receipt, truncated: true } };
+  return { writeReceipt: { paths: [], commands: [], truncated: true } };
+};
+
 const failedRecord = (
   managed: Omit<
     ManagedAgent,
@@ -727,6 +857,13 @@ const failedRecord = (
     id: managed.id,
     name: managed.name,
     task: managed.task,
+    ...(managed.promptSha256 ? { promptSha256: managed.promptSha256 } : {}),
+    ...(managed.promptBytes !== undefined ? { promptBytes: managed.promptBytes } : {}),
+    ...(managed.promptPath ? { promptPath: managed.promptPath } : {}),
+    ...(managed.inputSha256 ? { inputSha256: managed.inputSha256 } : {}),
+    ...(managed.inputBytes !== undefined ? { inputBytes: managed.inputBytes } : {}),
+    ...(managed.promptRetentionDropped ? { promptRetentionDropped: true } : {}),
+    ...(managed.promptRetentionMismatch ? { promptRetentionMismatch: true } : {}),
     status,
     runner: managed.runner,
     ...(managed.mainAgentId ? { mainAgentId: managed.mainAgentId } : {}),
@@ -735,6 +872,7 @@ const failedRecord = (
     ...(managed.kernel ? { kernel: managed.kernel } : {}),
     transport: managed.transport.kind,
     ...(managed.transport.fabricRelease ? { fabricRelease: managed.transport.fabricRelease } : {}),
+    ...(managed.transport.cgroup ? { cgroup: managed.transport.cgroup } : {}),
     cwd: managed.cwd,
     ...(managed.residency === "durable" ? { residency: "durable" as const } : {}),
     startedAt: now,
@@ -750,6 +888,7 @@ const failedRecord = (
     ...(previous?.lastCompleteText !== undefined ? { lastCompleteText: previous.lastCompleteText } : {}),
     error,
     usage,
+    ...carriedWriteReceipt(managed.runner, previous),
     ...(managed.model ? { model: managed.model } : {}),
     ...(managed.modelReason !== undefined ? { modelReason: managed.modelReason } : {}),
     ...(managed.thinking ? { thinking: managed.thinking } : {}),
@@ -1031,7 +1170,7 @@ export class AgentManager {
     this.#budgetOwned =
       !inheritedBudget && this.#currentDepth === 0 && config.budgetUsd > 0;
     const adapters: AgentTransportAdapter[] = [
-      new ProcessTransport(config.processSlice, config.placement, options.placementConfigPath),
+      new ProcessTransport(config.processSlice, config.placement, options.placementConfigPath, config.processMemoryMaxBytes),
       new TmuxTransport(),
       new ScreenTransport(),
       new LocaltermTransport(),
@@ -1387,8 +1526,29 @@ export class AgentManager {
     }
     // Write confinement is enforced by the child (the Pi tool_call guard, or
     // a runner that declares writePolicy and receives the policy at launch).
-    if (requestsWritePolicy(request)) checkWritePolicyRequest(request);
-    const confined = requestsWritePolicy(request) || this.#parentWritePolicy !== undefined;
+    checkWritePolicyRequest(request);
+    if (request.writePolicy === "unrestricted" && this.#parentWritePolicy) {
+      throw new Error("A write-confined agent cannot launch an unrestricted child");
+    }
+    const defaultTaskWritePolicy = !hostedAdapter && (transport === "auto" || transport === "process") &&
+      !request.actorId && !request.actorName && !request.residentStartupProbe &&
+      !requestsWritePolicy(request) && this.#parentWritePolicy === undefined;
+    // Existing resident layouts keep main's unscoped behavior until #11705 relocates
+    // their host runs outside cwd. Explicit and inherited policies stay unchanged.
+    let defaultWriteScopeOverlap: AgentWriteRootOverlapError | undefined;
+    const defaultWriteScopeFits = (cwd: string): boolean => {
+      try { assertDefaultTaskWriteRoots(this.#runRoot, [cwd]); return true; }
+      catch (error) {
+        if (!(error instanceof AgentWriteRootOverlapError)) throw error;
+        defaultWriteScopeOverlap = error;
+        return false;
+      }
+    };
+    // Runners without write-policy support keep their historical behavior; log the gap below.
+    let applyTaskWriteDefault = defaultTaskWritePolicy && capabilities.writePolicy &&
+      (Boolean(request.worktree) || defaultWriteScopeFits(selectedCwd));
+    const confined = applyTaskWriteDefault ||
+      (requestsWritePolicy(request) && request.writePolicy !== "unrestricted") || this.#parentWritePolicy !== undefined;
     if (confined && !capabilities.writePolicy) {
       throw new Error(
         BUILT_IN_RUNNER_IDS.has(runner)
@@ -1398,7 +1558,7 @@ export class AgentManager {
     }
     if (
       confined &&
-      (request.shell ?? this.#parentWritePolicy?.shell ?? "deny") !== "unconfined" &&
+      (request.shell ?? this.#parentWritePolicy?.shell ?? (applyTaskWriteDefault ? "unconfined" : "deny")) !== "unconfined" &&
       ((kernel === "python" && pythonRuntime === "cpython") ||
         (kernel === "typescript" && /^(node|bun)-process$/.test(this.#executorRuntime?.() ?? "")))
     ) {
@@ -1451,6 +1611,7 @@ export class AgentManager {
     this.#semaphore.admit(this.#currentDepth + 1);
     const id = randomUUID().replaceAll("-", "");
     const name = safeName(request.name ?? request.task.split("\n", 1)[0] ?? "Fabric agent");
+    const prompt = promptMetadata(request.task, path.join(this.#runRoot, id, "task.txt"));
     const callerSignal = signal;
     const assertAuthorized = (): void => {
       if (authorize && !authorize()) {
@@ -1525,8 +1686,8 @@ export class AgentManager {
       const imagesFile = request.images && request.images.length > 0
         ? path.join(runDirectory, "images.json")
         : undefined;
-      fs.writeFileSync(taskFile, request.task, { encoding: "utf8", mode: 0o600 });
-      if (request.provenance) fs.writeFileSync(taskFile + ".provenance.json", JSON.stringify(request.provenance), { mode: 0o600 });
+      writePrivateFileAtomic(taskFile, Buffer.from(request.task, "utf8"));
+      if (request.provenance) writePrivateFileAtomic(taskFile + ".provenance.json", Buffer.from(JSON.stringify(request.provenance), "utf8"));
       if (imagesFile) {
         fs.writeFileSync(imagesFile, JSON.stringify(request.images), {
           encoding: "utf8",
@@ -1557,9 +1718,36 @@ export class AgentManager {
 
       try {
         if (worktree && worktreeSetup?.trim()) await this.#worktrees.setup(id, worktreeSetup);
+        if (applyTaskWriteDefault && worktree) applyTaskWriteDefault = defaultWriteScopeFits(agentCwd);
+        const tmpdir = applyTaskWriteDefault ? path.join(runDirectory, "tmp") : undefined;
+        if (tmpdir) mkdirPrivate(tmpdir, this.#trustRoot());
         const writePolicy = capabilities.writePolicy
-          ? resolveChildWritePolicy(request, this.#parentWritePolicy, agentCwd)
+          ? resolveChildWritePolicy(applyTaskWriteDefault
+              ? { writableRoots: [agentCwd, tmpdir!], shell: "unconfined" }
+              : request, this.#parentWritePolicy, agentCwd)
           : undefined;
+        if (applyTaskWriteDefault) assertDefaultTaskWriteRoots(this.#runRoot, writePolicy!.writableRoots);
+        const auditWritePolicy = (type: string, warning?: string, policy?: FabricWritePolicy): void => {
+          fs.appendFileSync(logFile, JSON.stringify({ type, ts: Date.now(), id, runner,
+            ...(policy ? { policy } : {}), ...(warning ? { warning } : {}),
+          }) + "\n", { mode: 0o600 });
+        };
+        if (request.writePolicy === "unrestricted") auditWritePolicy("write_policy.unrestricted");
+        else if (defaultWriteScopeOverlap) {
+          auditWritePolicy("write_policy.default_overlap_unconfined",
+            `smarty-dev#11705: cwd ${defaultWriteScopeOverlap.writableRoot} contains host-owned run root ${defaultWriteScopeOverlap.runRoot}; no implicit write scope is imposed on this layout (accepted residual smarty-dev#11308).`);
+        } else if (defaultTaskWritePolicy && !applyTaskWriteDefault) {
+          auditWritePolicy("write_policy.unsupported", `${runnerAdapter.label} does not enforce task write roots; launch remains unrestricted.`);
+        }
+        let dispositionLogged = false;
+        const onWritePolicyDisposition = (disposition: "local" | "remote"): void => {
+          if (dispositionLogged) return;
+          dispositionLogged = true;
+          if (disposition === "local") auditWritePolicy("write_policy.default",
+            "Shell writes are unconfined by the task write policy (native bash/powershell and nested pi.bash); any Fabric Landlock settings are independent and may grant wider roots.", writePolicy);
+          else auditWritePolicy("write_policy.remote_unconfined",
+            "Remote one-shot placement cannot forward task write roots or scratch yet; remote task remains unrestricted.");
+        };
         const parentSessionId = this.#sessionId?.();
         const parentRunId = this.#parentLineage?.runId ?? (this.#currentDepth > 0 ? process.env.PI_FABRIC_PARENT_RUN : undefined);
         const lineage: FabricAgentLineage = {
@@ -1652,6 +1840,7 @@ export class AgentManager {
             signal,
             timeoutMs,
             files: { statusFile, lifecycleFile, logFile },
+            prompt,
             ...(clampedFrom ? { requestedThinking: clampedFrom } : {}),
             ...(branch ? { branch } : {}),
             ...(worktree ? { worktree } : {}),
@@ -1673,6 +1862,16 @@ export class AgentManager {
           ...(pythonRuntime ? ["--python-runtime", pythonRuntime] : []),
           "--task-file",
           taskFile,
+          "--prompt-sha256",
+          prompt.promptSha256,
+          "--prompt-bytes",
+          String(prompt.promptBytes),
+          "--prompt-path",
+          prompt.promptPath,
+          "--input-sha256",
+          prompt.inputSha256,
+          "--input-bytes",
+          String(prompt.inputBytes),
           ...(imagesFile ? ["--images-file", imagesFile] : []),
           "--status-file",
           statusFile,
@@ -1735,6 +1934,7 @@ export class AgentManager {
           ...(this.config.childQuestions === "route" && capabilities.questions
             ? ["--child-questions", String(this.config.childQuestionTimeoutMs ?? DEFAULT_CHILD_QUESTION_TIMEOUT_MS)]
             : []),
+          ...(tmpdir ? ["--tmpdir", tmpdir] : []),
           ...(writePolicy ? ["--write-policy", JSON.stringify(writePolicy)] : []),
           ...(scope ? ["--scope", JSON.stringify(scope)] : []),
           "--lineage",
@@ -1809,7 +2009,10 @@ export class AgentManager {
           workerArguments: [...runnerLaunch.workerArguments],
           ...(request.needs ? { needs: [...request.needs] } : {}),
           ...(request.requires ? { requires: [...request.requires] } : {}),
-          placementLocalReason: this.#spawner?.kind === "actor" || this.#spawner?.kind === "agent" || this.#currentDepth > 0
+          ...(applyTaskWriteDefault ? { onWritePolicyDisposition } : {}),
+          placementLocalReason: writePolicy && !applyTaskWriteDefault
+            ? "explicit or inherited write policy requires the local worker; one-shot placement cannot forward confinement"
+            : this.#spawner?.kind === "actor" || this.#spawner?.kind === "agent" || this.#currentDepth > 0
             ? "not a Main task spawn"
             : request.actorId || request.actorName || request.sessionFile || request.sessionSeed || request.routeDecision || request.residentStartupProbe
               ? "actor, routed, or inherited session requires the local worker"
@@ -1857,6 +2060,7 @@ export class AgentManager {
           id,
           name,
           task: request.task,
+          ...prompt,
           // pi-fabric#939: the manager's own pid and birth record, read at launch from the transport handle.
           ...((owned => owned ? { ownProcess: owned } : {})(transport.kind === "process" ? ownedProcess(transport.sessionId) : undefined)),
           ...(this.#mainAgentId ? { mainAgentId: this.#mainAgentId } : {}),
@@ -1954,6 +2158,7 @@ export class AgentManager {
             queued = {
               info: { id, name, status: "queued", runner, transport: request.transport ?? this.config.transport,
                 cwd: agentCwd, residency, recursive: request.recursive === true,
+                ...prompt,
                 ...(request.actorId ? { actorId: request.actorId } : {}),
                 ...(request.actorName ? { actorName: request.actorName } : {}) },
               task: request.task, enqueuedAt: Date.now(), abort: new AbortController(), result, resolve, background: false,
@@ -2014,6 +2219,7 @@ export class AgentManager {
       ...createRunRouteMetadata({ ...routeFacts, runner, transport: request.transport ?? this.config.transport }),
       id, name, status: "queued", runner, transport: request.transport ?? this.config.transport,
       cwd: selectedCwd, residency, recursive: request.recursive === true,
+      ...prompt,
       ...(kernel ? { kernel } : {}),
       ...(model ? { model } : {}),
       ...(request.modelReason !== undefined ? { modelReason: request.modelReason } : {}),
@@ -2318,6 +2524,7 @@ export class AgentManager {
       signal: AbortSignal | undefined;
       timeoutMs: number;
       files: { statusFile: string; lifecycleFile: string; logFile: string };
+      prompt: AgentPromptMetadata;
       requestedThinking?: AgentRunRequest["thinking"];
       branch?: string;
       worktree?: string;
@@ -2328,6 +2535,7 @@ export class AgentManager {
       id: context.id,
       name: context.name,
       task: context.task,
+      ...launch.prompt,
       status: "running",
       runner: adapter.id,
       transport: "hosted",
@@ -2409,6 +2617,11 @@ export class AgentManager {
       id: record.id,
       name: record.name,
       task: record.task,
+      ...(record.promptSha256 ? { promptSha256: record.promptSha256 } : {}),
+      ...(record.promptBytes !== undefined ? { promptBytes: record.promptBytes } : {}),
+      ...(record.promptPath ? { promptPath: record.promptPath } : {}),
+      ...(record.inputSha256 ? { inputSha256: record.inputSha256 } : {}),
+      ...(record.inputBytes !== undefined ? { inputBytes: record.inputBytes } : {}),
       runner: record.runner,
       runnerAdapter: hosted.adapter,
       hosted,
@@ -3302,7 +3515,9 @@ export class AgentManager {
     }
     const managed = this.#requireRun(id);
     if (!managed.settled) throw new Error("Cannot clean up a running agent");
-    if (managed.processStopPending) {
+    // Receipt-bound drains own teardown during EOF grace, before stop starts.
+    // Reject that existing obligation instead of joining a held native close.
+    if (managed.processStopPending || (managed.finalAnswer && managed.executionDrain)) {
       throw new Error(`Cannot clean up agent ${id}: process teardown is pending`);
     }
     // A normal Windows terminal result can precede captured native close.
@@ -3389,9 +3604,9 @@ export class AgentManager {
     try { receipt = this.#appendSteer(id, { type: "follow_up", message, data, provenance, followUpId: messageId, deadlineAt }); }
     catch (error) { fs.unlinkSync(file); throw error; }
     const entries = this.#followUps.get(id) ?? new Map<string, AgentFollowUpDelivery>();
-    entries.set(messageId, { messageId, deadlineAt, state: "queued" });
+    entries.set(messageId, { messageId, deadlineAt, state: receipt.undelivered ? "cancelled" : "queued" });
     this.#followUps.set(id, entries);
-    this.#armFollowUpDeadline(managed, entries.get(messageId)!);
+    if (!receipt.undelivered) this.#armFollowUpDeadline(managed, entries.get(messageId)!);
     return { ...receipt, messageId, deadlineAt };
   }
 
@@ -3451,10 +3666,13 @@ export class AgentManager {
   // at call time instead of the command being silently dropped by the worker.
   #requireSteerable(id: string, kind: "steer" | "followUp" = "steer"): void {
     const previous = this.#previousRun(id);
-    if (previous?.runner === "pi" && previous.finalAnswerReceipt && !previous.actorId) throw new FabricTargetTerminalError(previous.id, previous.finalAnswerReceipt.id);
+    if (previous?.runner === "pi" && previous.finalAnswerReceipt && !previous.actorId) {
+      throw new FabricTargetTerminalError(previous.id, previous.finalAnswerReceipt.id,
+        terminalStatuses.has(previous.status) ? previous.status as AgentRunResult["status"] : "final-answer-recorded");
+    }
     const managed = this.#requireRun(id);
     this.#observeFinalAnswer(managed);
-    if (managed.finalAnswer) throw new FabricTargetTerminalError(managed.id, managed.finalAnswer.id);
+    if (managed.finalAnswer) throw this.#terminalError(managed);
     if (!managed.runnerAdapter.capabilities[kind]) {
       throw new Error(
         managed.runner === "veda"
@@ -3523,10 +3741,28 @@ export class AgentManager {
     });
   }
 
+  #terminalError(managed: ManagedAgent): FabricTargetTerminalError {
+    return new FabricTargetTerminalError(managed.id, managed.finalAnswer!.id,
+      managed.finalAnswerResult?.status ?? "final-answer-pending");
+  }
+
+  /** Close the receipt-publication race between ingress preflight and append. */
+  #appendRaceRefusal(managed: ManagedAgent, messageId: string, delivery: "steer" | "followUp"): AgentUndeliveredMessage | undefined {
+    if (!this.#observeFinalAnswer(managed) || !managed.finalAnswer) return;
+    const admission = readTerminalAdmission(managed.runDirectory, messageId);
+    if (!admission || admission.delivery !== delivery) return;
+    if (!terminalControlRefusalProven(managed.runDirectory, admission, managed.id)) return;
+    this.#retainTerminalNotice(managed, { code: "FABRIC_TARGET_TERMINAL", targetId: managed.id,
+      messageId, delivery, finalAnswerReceiptId: managed.finalAnswer.id });
+    return { code: "FABRIC_TARGET_TERMINAL", reason: "run-ended", deliveryStatus: "undelivered",
+      messageId, delivery, finalAnswerReceiptId: managed.finalAnswer.id, runState: this.#terminalError(managed).runState,
+      ...(admission.sender ? { sender: admission.sender } : {}) };
+  }
+
   #appendSteer(id: string, entry: Omit<AgentSteerEntry, "id" | "ts">): AgentSteerResult {
     const managed = this.#requireRun(id);
     this.#observeFinalAnswer(managed);
-    if (managed.finalAnswer) throw new FabricTargetTerminalError(managed.id, managed.finalAnswer.id);
+    if (managed.finalAnswer) throw this.#terminalError(managed);
     if (managed.transport.controls === false) throw new Error("Remote placement has no steering, follow-up, or compaction channel; start a new task");
     const record = readRecord(managed.statusFile);
     if (record && terminalStatuses.has(record.status)) {
@@ -3547,9 +3783,12 @@ export class AgentManager {
       }
     }
     fs.appendFileSync(steerFile, line, { encoding: "utf8", mode: 0o600 });
+    const undelivered = entry.type === "steer" || entry.type === "follow_up"
+      ? this.#appendRaceRefusal(managed, messageId, entry.type === "steer" ? "steer" : "followUp") : undefined;
     return {
       queued: true,
       messageId,
+      ...(undelivered ? { undelivered } : {}),
       ...(entry.type === "follow_up" && record?.status === "running" ? { warning: {
         code: "FABRIC_FOLLOW_UP_RUNNING_TASK" as const,
         targetId: managed.id,
@@ -3701,7 +3940,13 @@ export class AgentManager {
     // owner removes them on cleanup/retention/root shutdown, not this child.
     if (!this.config.retainRuns && !this.#parentOwnedRunRoot) {
       await Promise.all(all.filter(managed => this.#canCollect(managed))
-        .map(managed => removeTree(managed.runDirectory).catch(() => undefined)));
+        .map(async (managed) => {
+          // Only sweep-owned managed roots retain unsuccessful terminal prompts.
+          // Explicit roots (including judge runs) and completed runs keep whole-tree
+          // deletion. Retention errors preserve custody rather than authorize deletion.
+          if (await this.#retainTerminalPromptRecord(managed).catch(() => true)) return;
+          await removeTree(managed.runDirectory).catch(() => undefined);
+        }));
     }
     // A failed stop is not authority to delete a child's working files.
     if (detached.length === 0 && !alive.some(Boolean) && !unresolved) {
@@ -3709,6 +3954,12 @@ export class AgentManager {
       const storageSafe = !this.#managedTempRoot || canRemoveManagedRunRoot(this.#runRoot);
       if (!this.config.retainRuns) {
         if (storageSafe && !this.#parentOwnedRunRoot) {
+          // The closed marker hands retained terminal records to the normal one-shot
+          // sweep. Without it, a live manager owner makes the root invisible to
+          // the 24 h retention pass after close.
+          if (this.#managedTempRoot) {
+            try { markRunRootClosed(this.#runRoot, Date.now(), true); } catch { /* keep the safer owner state */ }
+          }
           // A recovered manager does not own workers left by an earlier host.
           // All tracked transports are confirmed exited above; untracked runs stay put.
           await Promise.all([...this.#queued.values()]
@@ -3925,15 +4176,23 @@ export class AgentManager {
     if (managed.executionExited) return;
     if (managed.executionDrain) return managed.executionDrain;
     const pending = (async () => {
+      // Receipt-bound publication precedes native discard ACKs. Give the worker
+      // its EOF drain before a destructive transport stop (especially Windows).
+      if (managed.finalAnswer) await this.#waitForTransportExit(managed, Date.now() + TRANSPORT_EXIT_GRACE_MS * 5);
       // The same bounded stop/probe contract covers launches promoted solely
       // for custody. A hung liveness RPC must not make public stop hang forever.
       // Native transports own a finite close/tree deadline. Do not race that
       // join against the generic RPC grace: its escalation can start at the
       // grace boundary, and the captured child must still be reaped afterwards.
       if (managed.transport.stopDebt && managed.transport.waitForClose &&
-          managed.transport.lostContact?.() === undefined) {
+          (managed.transport.cgroup !== undefined || managed.transport.lostContact?.() === undefined)) {
+        // A capped scope must still join its actual subtree after a prior watcher
+        // failure. Do not let immutable observation debt swallow a typed PID stop
+        // failure or substitute logical stop for the live boundary's teardown.
         try { await this.#stopManagedTransport(managed); }
-        catch {
+        catch (error) {
+          // smarty-dev#8257: keep core's typed capped-cgroup stop failure (and its code) visible at agents.stop.
+          if ((error as { name?: unknown } | null)?.name === "TaskCgroupStopUnconfirmedError") throw error;
           throw new Error(`Agent ${managed.id} execution exit unconfirmed; custody retained: ${managed.lostContact}`);
         }
       }
@@ -4122,10 +4381,18 @@ export class AgentManager {
         }
       }
       if (resume) {
-        fs.writeFileSync(path.join(managed.runDirectory, "task.txt"), resume.task, {
-          encoding: "utf8",
-          mode: 0o600,
-        });
+        // A continuation rewrites the run's input in place. The prompt metadata
+        // stays bound to the original spawn brief; it is never recomputed from
+        // this same-run continuation (smarty-dev#11663).
+        const currentInput = promptMetadata(resume.task, managed.promptPath ?? path.join(managed.runDirectory, "task.txt"));
+        managed.inputSha256 = currentInput.inputSha256;
+        managed.inputBytes = currentInput.inputBytes;
+        // Publish the new input identity before replacing the bytes. A host death
+        // between these writes leaves a detectable mismatch, never a false match.
+        writeRecord(managed.statusFile, this.#withTransportMetadata(record, managed, false));
+        writePrivateFileAtomic(path.join(managed.runDirectory, "task.txt"), Buffer.from(resume.task, "utf8"));
+        setWorkerArgument(managed.launch.workerArguments, "input-sha256", currentInput.inputSha256);
+        setWorkerArgument(managed.launch.workerArguments, "input-bytes", String(currentInput.inputBytes));
         setWorkerArgument(
           managed.launch.workerArguments,
           "carry-over",
@@ -4242,14 +4509,13 @@ export class AgentManager {
       } catch {
         // The status record below still carries the failure.
       }
-      const failed = {
+      const failed = this.#withTransportMetadata({
         ...record,
         // Keep the run's real progress: the relaunch failed, not the attempt.
         turns: Math.max(record.turns, managed.observedProgress.turns),
         toolCalls: Math.max(record.toolCalls, managed.observedProgress.toolCalls),
         error: `${record.error ?? "Agent run failed"} · relaunch failed: ${retryError}`,
-      };
-      Object.assign(failed, managed.runRoute);
+      }, managed, false);
       writeRecord(managed.statusFile, failed);
       managed.latestRecord = failed;
       managed.relaunchFailure = failed;
@@ -4310,6 +4576,10 @@ export class AgentManager {
     // Observation from status/late ingress can settle outside the monitor. It
     // still owns this exact transport until checked native/tree close.
     void managed.finalAnswerCompletion.then(async () => {
+      // Locked non-forwarding proofs and existing discard ACKs need no native
+      // close. Route them now; forwarded uncertainty stays pending through EOF.
+      this.#refuseUnreadTerminalControls(managed);
+      this.#routeTerminalNotices(managed);
       await this.#drainExecution(managed);
       this.#drainLifecycle(managed);
       this.#refuseUnreadTerminalControls(managed);
@@ -4328,10 +4598,7 @@ export class AgentManager {
     if (managed.terminalNoticeSeen?.has(notice.messageId)) return;
     const admission = readTerminalAdmission(managed.runDirectory, notice.messageId);
     if (!admission || admission.delivery !== notice.delivery) return;
-    try {
-      const control = JSON.parse(fs.readFileSync(path.join(managed.runDirectory, "terminal-controls", `${notice.messageId}.json`), "utf8"));
-      if (control?.state === "delivered" && terminalControlMatchesAdmission(control, admission)) return;
-    } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+    if (!terminalControlRefusalProven(managed.runDirectory, admission, managed.id)) return;
     // Worker event fields cannot select the recipient. Verify supplied attribution
     // against the original trusted admission, then route only that admitted sender.
     if (notice.sender !== undefined && !terminalSenderMatches(notice.sender, admission.sender)) return;
@@ -4364,12 +4631,9 @@ export class AgentManager {
       if ((entry.type !== "steer" && entry.type !== "follow_up") || !/^[a-zA-Z0-9_-]{1,200}$/.test(entry.id)) continue;
       const admission = readTerminalAdmission(managed.runDirectory, entry.id);
       if (!admission) continue;
-      let state: { state?: string } | undefined;
-      try { state = JSON.parse(fs.readFileSync(path.join(managed.runDirectory, "terminal-controls", `${entry.id}.json`), "utf8")); }
-      catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
-      if (state?.state === "delivered" && terminalControlMatchesAdmission(state, admission)) continue;
-      // Refused registry entries may already have emitted a worker notice. The
-      // original admission id deduplicates both paths, including an unread tail.
+      if (!terminalControlRefusalProven(managed.runDirectory, admission, managed.id)) continue;
+      // Close does not prove non-consumption. Only child discard ACKs and locked
+      // unforwarded/absent-row proofs qualify; ambiguous forwarded rows survive.
       this.#retainTerminalNotice(managed, {
         code: "FABRIC_TARGET_TERMINAL", targetId: managed.id, messageId: entry.id,
         delivery: admission.delivery,
@@ -4836,6 +5100,36 @@ export class AgentManager {
     }
   }
 
+  async #retainTerminalPromptRecord(managed: ManagedAgent): Promise<boolean> {
+    if (!this.#managedTempRoot) return false;
+    const record = readRecord(managed.statusFile) ?? managed.latestRecord;
+    if (!record || (record.status !== "failed" && record.status !== "stopped" && record.status !== "timed_out")) return false;
+    const promptFile = path.join(managed.runDirectory, "task.txt");
+    const stat = ownedStat(promptFile);
+    const expectedSha256 = managed.inputSha256 ?? record.inputSha256;
+    const expectedBytes = managed.inputBytes ?? record.inputBytes;
+    const oversized = expectedBytes !== undefined && expectedBytes > TERMINAL_PROMPT_RETENTION_MAX_BYTES;
+    const currentMatches = !oversized && stat?.isFile() === true && expectedSha256 !== undefined && expectedBytes !== undefined &&
+      stat.size <= TERMINAL_PROMPT_RETENTION_MAX_BYTES && promptFileMatches(promptFile, expectedSha256, expectedBytes);
+    if (!currentMatches) {
+      managed.promptRetentionDropped = true;
+      // A small file that fails its current-input digest is not safe to retain.
+      // Keep the mismatch visible in status.json, but drop the unverified bytes.
+      managed.promptRetentionMismatch = !oversized;
+    }
+    // Persist the manager's authoritative metadata before removing every other
+    // artifact. A verified current task.txt and status.json are the complete
+    // retained proof; a mismatch retains status.json only.
+    writeJsonAtomic(managed.statusFile, omitRetainedTasks(compactUiRecord(this.#withTransportMetadata(record, managed, false))), { space: 2 });
+    for (const entry of fs.readdirSync(managed.runDirectory)) {
+      if (entry === "status.json" || (entry === "task.txt" && currentMatches)) continue;
+      await removeTree(path.join(managed.runDirectory, entry));
+    }
+    // Once an unsuccessful run has a retained status, never fall back to deleting its
+    // whole tree. Any cleanup error propagates to the close custody fence.
+    return true;
+  }
+
   #canCollect(managed: ManagedAgent): boolean {
     if (!managed.executionExited || managed.processStopPending || managed.nativeReleasePending ||
         this.#terminalNoticeOutbox.hasPending(managed.runDirectory) || managed.lostContact || hasUnresolvedWorker(managed.runDirectory)) return false;
@@ -5147,11 +5441,17 @@ export class AgentManager {
       ...managed.runRoute,
       id: managed.id,
       name: managed.name,
+      ...(managed.promptSha256 ? { promptSha256: managed.promptSha256 } : {}),
+      ...(managed.promptBytes !== undefined ? { promptBytes: managed.promptBytes } : {}),
+      ...(managed.promptPath ? { promptPath: managed.promptPath } : {}),
+      ...(managed.inputSha256 ? { inputSha256: managed.inputSha256 } : {}),
+      ...(managed.inputBytes !== undefined ? { inputBytes: managed.inputBytes } : {}),
       status,
       runner: managed.runner,
       ...(managed.kernel ? { kernel: managed.kernel } : {}),
       transport: managed.transport.kind,
       ...(managed.transport.fabricRelease ? { fabricRelease: managed.transport.fabricRelease } : {}),
+      ...(managed.transport.cgroup ? { cgroup: managed.transport.cgroup } : {}),
       cwd: managed.cwd,
       ...(managed.residency === "durable" ? { residency: "durable" as const } : {}),
       ...(model ? { model } : {}),
@@ -5223,10 +5523,22 @@ export class AgentManager {
       ...(includeSaveFailure && managed.settlementSaveFailure
         ? { warnings: [...(record.warnings ?? []), managed.settlementSaveFailure.warning] }
         : {}),
+      ...(managed.promptSha256 ?? record.promptSha256 ? { promptSha256: managed.promptSha256 ?? record.promptSha256 } : {}),
+      ...((managed.promptBytes ?? record.promptBytes) !== undefined
+        ? { promptBytes: managed.promptBytes ?? record.promptBytes } : {}),
+      ...(managed.promptPath ?? record.promptPath ? { promptPath: managed.promptPath ?? record.promptPath } : {}),
+      ...(managed.inputSha256 ?? record.inputSha256 ? { inputSha256: managed.inputSha256 ?? record.inputSha256 } : {}),
+      ...((managed.inputBytes ?? record.inputBytes) !== undefined
+        ? { inputBytes: managed.inputBytes ?? record.inputBytes } : {}),
+      ...((managed.promptRetentionDropped || record.promptRetentionDropped)
+        ? { promptRetentionDropped: true } : {}),
+      ...((managed.promptRetentionMismatch || record.promptRetentionMismatch)
+        ? { promptRetentionMismatch: true } : {}),
       cwd: managed.cwd,
       runner: managed.runner,
       ...(managed.kernel ? { kernel: managed.kernel } : {}),
       ...(managed.transport.fabricRelease ? { fabricRelease: managed.transport.fabricRelease } : {}),
+      ...(managed.transport.cgroup ? { cgroup: managed.transport.cgroup } : {}),
       ...(managed.residency === "durable" ? { residency: "durable" as const } : {}),
       logFile: path.join(managed.runDirectory, "events.jsonl"),
       ...(nestedAgents.length > 0 ? { nestedAgents } : {}),

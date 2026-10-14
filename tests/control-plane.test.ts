@@ -685,11 +685,22 @@ describe("FabricControlPlane", () => {
           sequence: events.length + 1, createdAt: committedAt,
         };
         events.push(event);
+        // The modeled log lives in memory, so model its append notification: the real mesh
+        // watcher (change-notifier) receives "events.jsonl" exactly as from an fs append.
+        for (const watcher of rootWatchers) watcher.emit("change", "change", "events.jsonl");
         return event;
       });
       const tail = vi.spyOn(sender.mesh, "tail").mockImplementation((offset) => ({
         events: events.filter((event) => event.sequence > offset), nextOffset: events.length,
       }));
+      // Idle has no poll (fv2-7978): log consumption wakes on the mesh root's real FSWatcher.
+      const realWatch = fs.watch;
+      const rootWatchers: fs.FSWatcher[] = [];
+      const watch = vi.spyOn(fs, "watch").mockImplementation(((...args: Parameters<typeof fs.watch>) => {
+        const watcher = (realWatch as (...values: unknown[]) => fs.FSWatcher)(...args);
+        if (args[0] === sender.mesh.root) rootWatchers.push(watcher);
+        return watcher;
+      }) as typeof fs.watch);
       sender.start(() => ({ accepted: false }));
       const commands = () => events.filter((event) => event.topic === "fabric.control.command");
       const ack = async (remoteHost: string | undefined = mirror ? "forge" : undefined) => {
@@ -707,6 +718,7 @@ describe("FabricControlPlane", () => {
         await sender.close();
         publish.mockRestore();
         tail.mockRestore();
+        watch.mockRestore();
         vi.useRealTimers();
       };
       return { sender, admittedAt, publish, commands, ack, release, dispose, readMirroredOwner,
@@ -1399,6 +1411,9 @@ describe("FabricControlPlane", () => {
       const batches = vi.spyOn(MeshStore.prototype, "writeBatch");
       const now = Date.now;
       vi.spyOn(Date, "now").mockImplementation(() => now() - start + later);
+      // A wall-clock jump does not fire already-armed real timers. Trigger the
+      // event-driven maintenance drain; the product also keeps its real sweep deadline.
+      await store.publish({ topic: "test.maintenance", from: identity("host:owner") });
       await vi.waitFor(() => expect(store.get(seenKey("host:other", "command:flagged"))).toBeUndefined(),
         { timeout: 3_000, interval: 20 });
       expect(store.get(seenKey("host:other", "command:grace"))).toBeDefined();

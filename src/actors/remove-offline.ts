@@ -17,7 +17,7 @@ import { MeshStore } from "../mesh/store.js";
 import { lockFile } from "../residency/file-lock.js";
 import { ownProcessIncarnation } from "../core/atomic-write.js";
 import { withStateFence } from "../mesh/commit-outbox.js";
-import { acquireMainPublicationFence, deleteRootActorTree } from "../topology/main-publication-fence.js";
+import { acquireMainPublicationFence, assertMainPublicationFencePlatform, deleteRootActorTree } from "../topology/main-publication-fence.js";
 import { withParticipantFileTryLock } from "../topology/participant-files.js";
 import { assertResidentOperatorConfirmed, readResidentOperatorEvidence, type MainToolEvidence } from "../residency/operator-safety.js";
 import { residentActorRoots, residentHostId, residentRoot, type ResidentHostConfig } from "../residency/protocol.js";
@@ -323,6 +323,8 @@ const readOfflineMarker = (actorRoot: string, id: string, rootId: string): Offli
 export const removeActorOffline = async (directory: string, config: ResidentHostConfig, selector: string,
   options: { dryRun?: boolean; confirmDeadRoot?: string; mainStoppedAudit?: MainStoppedAudit } = {}): Promise<OfflineRemoveResult> => {
   const dryRun = options.dryRun === true;
+  // First, before the startup claim or anything else: no Main publication fence on this platform, no removal.
+  assertMainPublicationFencePlatform(config.rootId);
   assertOwnershipProvable(); // before the fence, any record or any mutation
   // The root's existing resident startup claim, held for the whole removal, in the host's own order
   // (startup claim, then host.lock): no resident host can start on this root meanwhile; it gets
@@ -498,7 +500,7 @@ export const removeActorOffline = async (directory: string, config: ResidentHost
         const current = store.snapshot().actors;
         if (!current.some(actor => actor.id === id)) return;
         store.write(current.filter(actor => actor.id !== id), { durable: true });
-      });
+      }, undefined, "remove-offline");
       if (store.snapshot().actors.some(actor => actor.id === id)) throw new Error(`Fabric actor ${id}: registry revocation did not commit`);
       await offlineRemovalHooks.afterStep?.("revoke");
       await check();

@@ -1,6 +1,6 @@
 {
   "name": "pi-fabric",
-  "version": "0.110.1",
+  "version": "0.110.3",
   "description": "A programmable tool and agent runtime for Pi",
   "type": "module",
   "main": "./dist/index.js",
@@ -58,6 +58,7 @@
     "mesh-bridge": "./bin/mesh-bridge",
     "fabric-releases": "./bin/fabric-releases",
     "fabric-actors": "./bin/fabric-actors",
+    "fabric-resident-drain": "./bin/fabric-resident-drain",
     "fabric-mesh-lock-stats": "./bin/fabric-mesh-lock-stats",
     "fabric-mesh-backend": "./bin/fabric-mesh-backend"
   },

@@ -21,17 +21,32 @@ export const writeWorkerStartupFailure = (argv: readonly string[], error: unknow
   let carried: Record<string, unknown> = {};
   try { carried = JSON.parse(args.get("--carry-over") ?? "{}"); } catch { /* invalid options still get a failure */ }
   const number = (value: unknown): number => typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : 0;
+  const promptSha256 = args.get("--prompt-sha256");
+  const promptBytesSource = args.get("--prompt-bytes");
+  const promptBytes = promptBytesSource === undefined ? undefined : Number(promptBytesSource);
+  const promptPath = args.get("--prompt-path");
+  const inputSha256 = args.get("--input-sha256");
+  const inputBytesSource = args.get("--input-bytes");
+  const inputBytes = inputBytesSource === undefined ? undefined : Number(inputBytesSource);
   const usage = carried?.usage as Record<string, unknown> | undefined;
   const record: AgentRunRecord = {
     id: args.get("--id") ?? "unknown",
     name: args.get("--name") ?? "Fabric worker",
-    task, status: "failed", runner: args.get("--runner") ?? "pi",
+    task,
+    ...(promptSha256 && /^[a-f0-9]{64}$/.test(promptSha256) ? { promptSha256 } : {}),
+    ...(promptBytes !== undefined && Number.isSafeInteger(promptBytes) && promptBytes >= 0 ? { promptBytes } : {}),
+    ...(promptPath ? { promptPath } : {}),
+    ...(inputSha256 && /^[a-f0-9]{64}$/.test(inputSha256) ? { inputSha256 } : {}),
+    ...(inputBytes !== undefined && Number.isSafeInteger(inputBytes) && inputBytes >= 0 ? { inputBytes } : {}),
+    status: "failed", runner: args.get("--runner") ?? "pi",
     transport: (args.get("--transport") ?? "process") as AgentRunRecord["transport"],
     cwd: args.get("--cwd") ?? process.cwd(), startedAt: now, updatedAt: now,
     turns: number(carried?.turns), toolCalls: number(carried?.toolCalls), text: "",
     usage: { input: number(usage?.input), output: number(usage?.output), cacheRead: number(usage?.cacheRead), cacheWrite: number(usage?.cacheWrite), cost: number(usage?.cost) },
     stderr: (error instanceof Error ? error.stack ?? error.message : String(error)).slice(0, 20_000),
     ...(args.get("--log-file") ? { logFile: args.get("--log-file")! } : {}),
+    // pi-fabric#1034 round 7: a startup failure comes before any Pi event is read, so the receipt is empty and complete.
+    ...(["pi", "pi-durable"].includes(args.get("--runner") ?? "pi") ? { writeReceipt: { paths: [], commands: [] } } : {}),
   };
   writeCrashRunRecord(statusFile, record, error);
 };

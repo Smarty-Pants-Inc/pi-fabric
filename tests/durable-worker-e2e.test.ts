@@ -20,6 +20,7 @@ beforeAll(async () => {
   fs.writeFileSync(path.join(root, "package.json"), '{"type":"module"}');
   await build({
     entryPoints: ["src/worker.ts", "src/durable/worker.ts", "src/agents/write-guard.ts", "src/guards/sender-headers.ts",
+      "src/agents/provider-bridge.ts", "src/guards/actor-bash-hook.ts",
       "src/agents/compact-control.ts", "src/agents/claude-cli.ts", "src/agents/veda-cli.ts",
       ...fs.readdirSync("src/worker").filter(name => name.endsWith(".ts")).map(name => `src/worker/${name}`)],
     outdir: path.join(root, "build"), outbase: "src", bundle: true, packages: "external",
@@ -67,7 +68,7 @@ beforeAll(() => {
   `);
 });
 
-function setup(inherited = false, entry = workerPath) {
+function setup(inherited = false, entry = workerPath, runner: "pi" | "pi-durable" = "pi-durable") {
   const cwd = path.join(root, `case-${++sequence}`);
   const agentDir = path.join(cwd, "agent");
   fs.mkdirSync(agentDir, { recursive: true });
@@ -83,15 +84,27 @@ function setup(inherited = false, entry = workerPath) {
   vi.stubEnv("DURABLE_TEST_FILE", path.join(cwd, "fixture.txt"));
   fs.writeFileSync(path.join(cwd, "fixture.txt"), "private fixture");
   const manager = new AgentManager(cwd, {
-    ...DEFAULT_FABRIC_CONFIG.agents, runner: "pi-durable", transport: "process", extensions: true,
+    ...DEFAULT_FABRIC_CONFIG.agents, runner, transport: "process", extensions: true,
     timeoutMs: 20000, maxConcurrent: 1,
   }, { workerPath: entry, runRoot: path.join(cwd, "runs"), fullCodeMode: false,
     // Must never fall back to the native CLI, even on startup/replay failures.
-    piBinary: path.join(cwd, "forbidden-native-fallback"),
+    piBinary: runner === "pi" ? path.resolve("node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js") : path.join(cwd, "forbidden-native-fallback"),
     ...(inherited ? { preparePiModel: async () => "durable-offline/test" } : {}),
   });
   managers.push(manager);
-  return { manager, cwd };
+  return { manager, cwd, agentDir };
+}
+
+function providerLoadProbe(cwd: string, agentDir: string) {
+  const provider = path.join(cwd, "pi-durable-offline-provider.mjs");
+  const unrelated = path.join(cwd, "unrelated.mjs");
+  const marker = path.join(cwd, "extension-modules-loaded.txt");
+  fs.writeFileSync(provider, `import fs from "node:fs";\nfs.appendFileSync(${JSON.stringify(marker)}, "provider evaluated\\n");\nexport { default } from ${JSON.stringify(path.resolve("tests/fixtures/durable-pi-extension.ts"))};\n`);
+  fs.writeFileSync(unrelated, `import fs from "node:fs";\nfs.appendFileSync(${JSON.stringify(marker)}, "unrelated evaluated\\n");\nexport default function () { fs.appendFileSync(${JSON.stringify(marker)}, "unrelated registered\\n"); }\n`);
+  const settingsFile = path.join(agentDir, "settings.json");
+  const settings = JSON.parse(fs.readFileSync(settingsFile, "utf8"));
+  fs.writeFileSync(settingsFile, JSON.stringify({ ...settings, extensions: [provider, unrelated] }));
+  return marker;
 }
 
 async function restart(directory: string, first: Pick<AgentRunRecord, "id" | "name" | "cwd" | "requestedModel">, extra: Record<string, string> = {}, entry = workerPath) {
@@ -187,6 +200,38 @@ describe("AgentManager real durable parent worker", () => {
     expect(log.some(event => event.type === "response" && event.command === "get_messages" && event.id === `fabric-recorded-result:${first.id}`)).toBe(true);
     expect(events(path.join(directory, "replay-lifecycle.jsonl")).some(event => event.event === "tokens.usage")).toBe(false);
   }, 60000);
+
+  it.each(["pi-durable", "pi"] as const)("keeps provider and unrelated module code disabled before task send with extensions: false (%s)", async runner => {
+    const { manager, cwd, agentDir } = setup(false, workerPath, runner);
+    const marker = providerLoadProbe(cwd, agentDir);
+    vi.stubEnv("PI_FABRIC_EXTENSION_MODEL", "durable-offline/test");
+    const result = await manager.run({ task: "never sent", tools: ["read"], extensions: false, model: "durable-offline/test" });
+    expect(result.status).toBe("failed");
+    expect(result.error).toMatch(/task was not sent/);
+    expect(result.error).toContain("durable-offline/test");
+    expect(result.toolCalls).toBe(0);
+    expect(fs.existsSync(marker)).toBe(false);
+  }, 30000);
+
+  it.each(["pi-durable", "pi"] as const)("resolves an extension-registered provider when extensions are explicitly enabled (%s)", async runner => {
+    const { manager, cwd, agentDir } = setup(false, workerPath, runner);
+    const marker = providerLoadProbe(cwd, agentDir);
+    const result = await manager.run({ task: "read fixture", tools: ["read"], extensions: true, model: "durable-offline/test" });
+    expect(result.status, result.error).toBe("completed");
+    expect(result.model).toBe("durable-offline/test");
+    expect(result.text).toBe("result:private fixture");
+    expect(result.toolCalls).toBe(1);
+    expect(fs.readFileSync(marker, "utf8")).toContain("provider evaluated");
+  }, 30000);
+
+  it("fails an extensions: false child closed when no declarative model defines the provider", async () => {
+    const { manager } = setup();
+    const result = await manager.run({ task: "never sent", extensions: false, model: "absent-provider/model" });
+    expect(result.status).toBe("failed");
+    expect(result.error).toMatch(/task was not sent/);
+    expect(result.error).toContain("absent-provider/model");
+    expect(result.toolCalls).toBe(0);
+  }, 30000);
 
   it("enforces write confinement through the real parent and durable host", async () => {
     const { manager, cwd } = setup();

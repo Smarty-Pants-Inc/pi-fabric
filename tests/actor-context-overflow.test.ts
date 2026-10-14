@@ -132,27 +132,81 @@ describe("actor context overflow (smarty-dev#3238, offline Pi child)", () => {
     expect(s.alarms[0]!.message.text).not.toContain("not retried");
   }, TEST_GUARD_MS);
 
-  it("9486 restores durable context usage on host reload and proactively resets the next activation", async () => {
+  it("9486 restores 85% durable context usage on host reload and proactively resets the next activation", async () => {
     const s = setup();
     const actor = await s.create("reloaded-usage");
-    await s.actors.ask(actor.id, "FILL_CONTEXT");
+    await s.actors.ask(actor.id, "FILL_CONTEXT_85");
     await waitFor(() => s.actors.inFlightCount() === 0 && storedUsage(s.dir, actor.id) !== undefined);
     const carried = header(actor.sessionFile!);
-    expect(storedUsage(s.dir, actor.id)).toEqual({ tokens: 244_810, contextWindow: 272_000 });
+    const usage = { tokens: 231_210, contextWindow: 272_000, measuredAt: expect.any(Number), sessionId: carried };
+    // Written before close() can save anything: a manager restart needs no graceful shutdown save.
+    expect(storedUsage(s.dir, actor.id)).toEqual(usage);
     await s.actors.close();
     const restarted = s.makeActors();
     managers.push(restarted);
     await expect(restarted.ask(actor.id, "NEXT_REVIEW")).resolves.toMatchObject({ text: "verdict: ok" });
     await waitFor(() => restarted.inFlightCount() === 0);
     expect(s.prompts().map(({ history, marker }) => ({ history, marker }))).toEqual([
-      { history: false, marker: "FILL_CONTEXT" }, { history: false, marker: "NEXT_REVIEW" },
+      { history: false, marker: "FILL_CONTEXT_85" }, { history: false, marker: "NEXT_REVIEW" },
     ]);
     expect(header(actor.sessionFile!)).not.toBe(carried);
     expect(resets(restarted, actor.id)).toEqual([expect.objectContaining({ trigger: "context", overflow: false,
-      contextUsage: { tokens: 244_810, contextWindow: 272_000 } })]);
-    expect(storedUsage(s.dir, actor.id)).toEqual({ tokens: 1010, contextWindow: 272_000 });
+      contextUsage: { tokens: 231_210, contextWindow: 272_000 } })]);
+    expect(storedUsage(s.dir, actor.id)).toEqual({ tokens: 1010, contextWindow: 272_000,
+      measuredAt: expect.any(Number), sessionId: header(actor.sessionFile!) });
     expect(s.ownerAlarms()).toEqual([]);
   }, TEST_GUARD_MS);
+
+  it.each(["another-session", "legacy-unbound", "below-threshold"])("9486 does not reset for restored usage that is %s", async (mode) => {
+    const s = setup();
+    const actor = await s.create("stale-usage");
+    await s.actors.ask(actor.id, mode === "below-threshold" ? "FIRST_REVIEW" : "FILL_CONTEXT_85");
+    await waitFor(() => s.actors.inFlightCount() === 0);
+    const carried = header(actor.sessionFile!);
+    await s.actors.close();
+    const file = path.join(s.dir, "actors", "actors.json");
+    const registry = JSON.parse(fs.readFileSync(file, "utf8"));
+    const record = registry.actors.find((candidate: { id: string }) => candidate.id === actor.id);
+    if (mode === "another-session") record.lastContextUsage.sessionId = "different-native-session";
+    else if (mode === "legacy-unbound") delete record.lastContextUsage.sessionId;
+    fs.writeFileSync(file, JSON.stringify(registry));
+    const restarted = s.makeActors();
+    managers.push(restarted);
+    await expect(restarted.ask(actor.id, "NEXT_REVIEW")).resolves.toMatchObject({ text: "verdict: ok" });
+    await waitFor(() => restarted.inFlightCount() === 0);
+    expect(header(actor.sessionFile!)).toBe(carried);
+    expect(s.prompts().at(-1)).toMatchObject({ history: true, marker: "NEXT_REVIEW" });
+    expect(resets(restarted, actor.id)).toEqual([]);
+    expect(storedUsage(s.dir, actor.id)).toMatchObject({ tokens: 1010, sessionId: carried });
+  }, TEST_GUARD_MS);
+
+  it("9486 keeps unchanged measurements without adding registry writes", async () => {
+    const s = setup();
+    const actor = await s.create("unchanged-usage");
+    await s.actors.ask(actor.id, "FIRST_REVIEW");
+    await waitFor(() => s.actors.inFlightCount() === 0);
+    const usage = storedUsage(s.dir, actor.id);
+    const writes = vi.spyOn(fs, "renameSync");
+    const registryWrites = () => writes.mock.calls.filter(([, destination]) =>
+      destination === path.join(s.dir, "actors", "actors.json")).length;
+    await s.actors.ask(actor.id, "NEXT_REVIEW");
+    await waitFor(() => s.actors.inFlightCount() === 0);
+    expect(storedUsage(s.dir, actor.id)).toEqual(usage); // measuredAt is stable too
+    const withUnchangedUsage = registryWrites();
+    expect(withUnchangedUsage).toBeGreaterThan(0); // baseline activation bookkeeping still writes
+    writes.mockClear();
+    const run = s.agents.run.bind(s.agents);
+    vi.spyOn(s.agents, "run").mockImplementation(async (...args: Parameters<AgentManager["run"]>) => {
+      const result = await run(...args);
+      delete result.contextUsage;
+      return result;
+    });
+    await s.actors.ask(actor.id, "LAST_REVIEW");
+    await waitFor(() => s.actors.inFlightCount() === 0);
+    expect(registryWrites()).toBe(withUnchangedUsage); // same writes as a turn with no measurement
+    expect(storedUsage(s.dir, actor.id)).toEqual(usage); // kept until a new real measurement
+  }, TEST_GUARD_MS);
+
   it("resets a carried session and retries the overflowing event once, which then succeeds", async () => {
     const s = setup();
     const actor = await s.create("reviewer");

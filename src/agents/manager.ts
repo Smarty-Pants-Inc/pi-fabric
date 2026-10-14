@@ -3101,7 +3101,14 @@ export class AgentManager {
   }
 
   #readResult(managed: ManagedAgent): AgentRunRecord | undefined {
-    if (!managed.settledResultFile) return readRecord(managed.statusFile);
+    // A failed publication retains the manager's validated full outcome for retry.
+    // Worker status remains progress only: it cannot replace a settled outcome.
+    if (managed.settlementSaveFailure) return structuredClone(managed.settlementSaveFailure.result);
+    if (!managed.settledResultFile) {
+      if (!managed.settled) return readRecord(managed.statusFile);
+      throw Object.assign(new Error(`Fabric agent ${managed.id} has no published terminal result`),
+        { code: "FABRIC_MISSING_RESULT" as const });
+    }
     const expectedFile = path.join(managed.runDirectory, MANAGER_RESULT_FILE);
     const result = readAuthenticatedRecord(managed.settledResultFile, expectedFile, managed.resultFingerprint);
     if (result && result.id === managed.id && terminalStatuses.has(result.status)) return result;
@@ -3781,14 +3788,21 @@ export class AgentManager {
   commitEnodevRecovery(runId: string): boolean {
     const pending = this.#enodevCommits.get(runId);
     if (!pending) return false;
-    this.#enodevCommits.delete(runId);
-    const result = settleEnodevRun(pending.directory, pending.actorId, pending.activationId);
-    if (result) this.#enodevSettledHere.add(runId);
-    if (!result) return false;
-    this.#enodevRuns = (this.#enodevRuns ?? []).filter(other => other !== pending.directory);
+    const recovered = peekEnodevRun(pending.directory, pending.actorId, pending.activationId);
+    if (!recovered) return false;
+    // Keep the original recovery authority and obligation until both publication
+    // and its bounded authenticated index exist. Disk-only results are never adopted.
+    const result = { ...recovered, enodevDelivered: true };
     const resultFile = path.join(pending.directory, MANAGER_RESULT_FILE);
     const fingerprint = writePrivateJsonAtomic(resultFile, result);
     this.#rememberPreviousRun(result, resultFile, fingerprint);
+    // Pin peek's finishedAt and truncated receipt in the secondary status record
+    // so settle's later observation cannot select a different terminal timestamp.
+    writeJsonAtomic(path.join(pending.directory, "status.json"), result, { durable: true });
+    if (!settleEnodevRun(pending.directory, pending.actorId, pending.activationId)) return false;
+    this.#enodevSettledHere.add(runId);
+    this.#enodevCommits.delete(runId);
+    this.#enodevRuns = (this.#enodevRuns ?? []).filter(other => other !== pending.directory);
     this.#retentionRevision++;
     this.#releaseProvenGone(); // smarty-dev#9855: same step as the settle
     return true;

@@ -66,6 +66,14 @@ class ObservedSide extends StoreBridgeSide {
   afterPrefix?: () => void;
   failBefore = Infinity;
   failAfter = Infinity;
+  override async publish(event: BridgePublish, held?: string[]) {
+    if (this.prefixes.length === this.failBefore) throw new Error("simulated crash between batches");
+    const receipt = await super.publish(event, held);
+    this.prefixes.push(1);
+    this.afterPrefix?.();
+    if (this.prefixes.length === this.failAfter) throw new Error("simulated lost reply before checkpoint");
+    return receipt;
+  }
   override async publishBatch(inputs: Array<{ event: BridgePublish; held?: string[] }>) {
     if (this.prefixes.length === this.failBefore) throw new Error("simulated crash between batches");
     const receipt = await super.publishBatch(inputs);
@@ -123,7 +131,7 @@ describe("bridge transaction cap (smarty-dev#10391), real SQLite stores", () => 
     try { result = await f.bridge.step(); }
     finally { await writing; }
     const events = holds(f.target).slice(before);
-    const meshHolds = events.filter(e => e.kind === "held" && e.store === "mesh-lock" && e.class === "bridge");
+    const meshHolds = events.filter(e => e.kind === "held" && e.store === "mesh-lock" && (e.class === "bridge" || e.class === "publish"));
     const stateHolds = events.filter(e => e.kind === "held" && e.store === "sqlite");
     const maxMeshHoldMs = Math.max(0, ...meshHolds.map(e => e.heldMs));
     const maxStateHoldMs = Math.max(0, ...stateHolds.map(e => e.heldMs));

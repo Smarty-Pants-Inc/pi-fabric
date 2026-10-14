@@ -1,10 +1,13 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { spawnSync } from "node:child_process";
+import { pathToFileURL } from "node:url";
+import { buildSync } from "esbuild";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { TerminalNoticeOutbox, readTerminalAdmission, terminalControlMatchesAdmission } from "../src/agents/terminal-notices.js";
 import { writeJsonAtomic } from "../src/core/atomic-write.js";
-import { canRemoveTerminalRun } from "../src/storage/retention.js";
+import { canRemoveTerminalRun, pruneActorRunArchives } from "../src/storage/retention.js";
 import { saveFinalAnswerReceipt } from "../src/worker/terminal-answer.js";
 
 const roots: string[] = [];
@@ -26,6 +29,70 @@ const fixture = () => {
 };
 
 describe("terminal-answer retention custody", () => {
+  const acknowledgeFinalNotice = (f: ReturnType<typeof fixture>): void => {
+    writeJsonAtomic(path.join(f.run, "terminal-notices", `${f.id}.json.delivered`), f.notice);
+  };
+  const finalAnswerLock = (run: string, owner: string): string => {
+    const lock = path.join(run, ".task-final-answer.lock");
+    fs.mkdirSync(lock);
+    fs.writeFileSync(path.join(lock, "owner"), owner);
+    return lock;
+  };
+  it("collects a stale final-answer lock left by an exited holder, through the collector dry-run", () => {
+    const f = fixture();
+    acknowledgeFinalNotice(f);
+    const helper = path.join(f.root, "terminal-answer.mjs");
+    buildSync({ entryPoints: [path.resolve("src/worker/terminal-answer.ts")], outfile: helper, bundle: true, platform: "node", format: "esm" });
+    // process.exit bypasses finally: the real lock holder leaves its native owner record behind.
+    const child = spawnSync(process.execPath, ["--input-type=module", "--eval",
+      `import { withTaskFinalAnswerLock } from ${JSON.stringify(pathToFileURL(helper).href)}; withTaskFinalAnswerLock(${JSON.stringify(f.run)}, () => process.exit(0));`], { encoding: "utf8", timeout: 10_000 });
+    expect(child.error).toBeUndefined();
+    expect(child.status, child.stderr).toBe(0);
+    const owner = path.join(f.run, ".task-final-answer.lock", "owner");
+    const [token, pid] = fs.readFileSync(owner, "utf8").trim().split("\n");
+    expect(Number(pid)).toBe(child.pid);
+    // Advance only the saved timestamp, not a sleep or the live-process fence.
+    fs.writeFileSync(owner, `${token}\n${pid}\n${Date.now() - 60_000}\n`);
+    expect(canRemoveTerminalRun(f.run)).toBe(true);
+    const collected = pruneActorRunArchives({ runsDirectory: f.root, retentionMs: 0, now: Date.now() + 1, dryRun: true });
+    expect(collected).toEqual([f.run]);
+    expect(fs.existsSync(f.run)).toBe(true);
+  });
+  it("keeps a live old lock and fails closed for ownerless, malformed, extra, and linked lock contents", () => {
+    const live = fixture();
+    acknowledgeFinalNotice(live);
+    finalAnswerLock(live.run, `11111111-1111-4111-8111-111111111111\n${process.pid}\n${Date.now() - 60_000}\n`);
+    expect(canRemoveTerminalRun(live.run)).toBe(false);
+    expect(pruneActorRunArchives({ runsDirectory: live.root, retentionMs: 0, now: Date.now() + 1, dryRun: true })).toEqual([]);
+
+    for (const kind of ["ownerless", "malformed", "extra", "linked"] as const) {
+      const f = fixture();
+      acknowledgeFinalNotice(f);
+      const lock = path.join(f.run, ".task-final-answer.lock");
+      fs.mkdirSync(lock);
+      if (kind === "malformed") fs.writeFileSync(path.join(lock, "owner"), `not-an-owner\n99999999\n${Date.now() - 60_000}\n`);
+      if (kind === "extra") {
+        fs.writeFileSync(path.join(lock, "owner"), `11111111-1111-4111-8111-111111111111\n99999999\n${Date.now() - 60_000}\n`);
+        fs.writeFileSync(path.join(lock, "unexpected"), "no");
+      }
+      if (kind === "linked") {
+        const outside = path.join(f.root, "outside-owner");
+        fs.writeFileSync(outside, `11111111-1111-4111-8111-111111111111\n99999999\n${Date.now() - 60_000}\n`);
+        try { fs.symlinkSync(outside, path.join(lock, "owner")); } catch { continue; }
+      }
+      expect(canRemoveTerminalRun(f.run), kind).toBe(false);
+    }
+  });
+  it("keeps young dead-holder locks and treats uncertain owner liveness as live", () => {
+    const f = fixture();
+    acknowledgeFinalNotice(f);
+    const lock = finalAnswerLock(f.run, `11111111-1111-4111-8111-111111111111\n99999999\n${Date.now()}\n`);
+    expect(canRemoveTerminalRun(f.run)).toBe(false);
+    fs.writeFileSync(path.join(lock, "owner"), `11111111-1111-4111-8111-111111111111\n99999999\n${Date.now() - 60_000}\n`);
+    const probe = vi.spyOn(process, "kill").mockImplementation(() => { throw Object.assign(new Error("denied"), { code: "EPERM" }); });
+    try { expect(canRemoveTerminalRun(f.run)).toBe(false); }
+    finally { probe.mockRestore(); }
+  });
   it("keeps emitted but unrouted refusals and unread steering sources", () => {
     const f = fixture();
     writeJsonAtomic(path.join(f.run, "terminal-controls", `${f.id}.json`), f.control);

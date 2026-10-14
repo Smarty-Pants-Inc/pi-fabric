@@ -48,7 +48,7 @@ const setup = () => {
   fs.writeFileSync(path.join(sdk, "package.json"), JSON.stringify({ name: "@earendil-works/pi-coding-agent", version: "0.99.0", type: "module" }));
   fs.writeFileSync(path.join(sdk, "dist", "index.js"), `import ${JSON.stringify(pathToFileURL(path.resolve("tests/fixtures/fake-pi-steer-ended.mjs")).href)};\nawait new Promise(() => {});\n`);
   const notices: AgentTerminalNotice[] = [];
-  const manager = new AgentManager(root, { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, timeoutMs: 30_000, nice: 19 }, {
+  const manager = new AgentManager(root, { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, timeoutMs: 30_000, nice: 19, retainRuns: true }, {
     workerPath: path.resolve("dist/worker.js"), piBinary: path.join(sdk, "dist", "cli.js"), runRoot: path.join(root, "runs"),
     fullCodeMode: false, onTerminalNotice: notice => { notices.push(notice); },
   });

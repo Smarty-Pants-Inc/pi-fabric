@@ -97,6 +97,25 @@ export const UNRESOLVED_WORKER_FILE = "unresolved-worker.json";
 /** A sweep's wall-clock budget; walks stop when it returns true (smarty-dev#2010). */
 type Deadline = () => boolean;
 const noDeadline: Deadline = () => false;
+const TASK_FINAL_ANSWER_LOCK = ".task-final-answer.lock";
+const TASK_FINAL_ANSWER_LOCK_STALE_MS = 30_000;
+/** The final-answer writer's exact mkdir-lock shape. Ownerless, malformed, young, linked, or live locks veto retention. */
+const safeStaleFinalAnswerLock = (directory: string): boolean => {
+  if (!ownedStat(directory)?.isDirectory()) return false;
+  try {
+    const entries = fs.readdirSync(directory);
+    if (entries.length !== 1 || entries[0] !== "owner") return false;
+    const ownerFile = path.join(directory, "owner");
+    const stat = ownedStat(ownerFile);
+    if (!stat?.isFile() || stat.size > 256) return false;
+    const text = fs.readFileSync(ownerFile, "utf8");
+    const match = /^([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\n([1-9][0-9]*)\n([0-9]+)\n$/i.exec(text);
+    if (!match) return false;
+    const pid = Number(match[2]), createdAt = Number(match[3]);
+    return Number.isSafeInteger(pid) && pid > 0 && Number.isSafeInteger(createdAt) && createdAt >= 0 &&
+      Date.now() - createdAt > TASK_FINAL_ANSWER_LOCK_STALE_MS && !processAlive(pid);
+  } catch { return false; }
+};
 /**
  * True when this run, or any nested child run below it, is marked. A walk cut short by the
  * deadline also answers true: an unfinished check never authorizes deletion.
@@ -384,6 +403,10 @@ const safeRunTree = (root: string, childrenStopped: boolean, depth = 0, expired:
       const stat = ownedStat(file);
       if (!stat) return false;
       if (stat.isFile() && (runFile(name) || name === "final-answer.json" || (name === "queued-result.json" && record?.queuedArchiveCommitted === true))) continue;
+      if (stat.isDirectory() && name === TASK_FINAL_ANSWER_LOCK) {
+        if (!record?.status || !TERMINAL_STATUSES.has(record.status) || !safeStaleFinalAnswerLock(file)) return false;
+        continue;
+      }
       if (stat.isDirectory() && (name === "terminal-controls" || name === "terminal-notices")) continue;
       if (stat.isDirectory() && name === "handoff-session") {
         // This directory is exclusively populated by Fabric's session fork writer.
@@ -434,10 +457,15 @@ const runTreeRefusal = (root: string, acceptPidReuse: boolean): string => {
   try {
     if (!safeTerminalArtifacts(root, noDeadline)) return "terminal answer, notices or controls not proven consumed";
     for (const name of fs.readdirSync(root)) {
-      const stat = ownedStat(path.join(root, name));
+      const file = path.join(root, name);
+      const stat = ownedStat(file);
       if (!stat) return "an entry is a link, hard-linked or not ours";
+      if (stat.isDirectory() && name === TASK_FINAL_ANSWER_LOCK &&
+          (!record?.status || !TERMINAL_STATUSES.has(record.status) || !safeStaleFinalAnswerLock(file))) {
+        return "terminal-answer lock owner is live, malformed, or not proven stale";
+      }
       const known = stat.isFile() ? runFile(name) || name === "final-answer.json" || name === "queued-result.json"
-        : ["terminal-controls", "terminal-notices", "handoff-session", "follow-ups", "deliveries", "nested"].includes(name);
+        : [TASK_FINAL_ANSWER_LOCK, "terminal-controls", "terminal-notices", "handoff-session", "follow-ups", "deliveries", "nested"].includes(name);
       if (!known) return `unknown entry ${name.replace(/[0-9a-f-]{8,}/gi, "<id>")}`;
     }
   } catch { return "run tree unreadable"; }

@@ -215,14 +215,34 @@ const archiveNestedControls = (runDirectory: string): Map<string, Map<string, Bu
   return result;
 };
 
-const assertArchiveRunIdentity = (dest: string, held: PrivateDirectory): void => {
-  const named = fs.lstatSync(dest), opened = held.fd === undefined ? fs.statSync(held.path) : fs.fstatSync(held.fd);
-  if (!named.isDirectory() || named.isSymbolicLink() || named.dev !== opened.dev || named.ino !== opened.ino || fs.realpathSync(dest) !== path.resolve(dest)) {
+/** Archive-only pin: Windows has no held directory fd, so reopening the path
+ * cannot establish the identity of the directory originally opened. */
+interface ArchiveDirectory extends PrivateDirectory {
+  readonly original: Readonly<{ dev: bigint; ino: bigint }>;
+}
+
+const assertArchiveRunIdentity = (dest: string, held: ArchiveDirectory): void => {
+  const named = fs.lstatSync(dest, { bigint: true });
+  const opened = held.fd === undefined ? held.original : fs.fstatSync(held.fd, { bigint: true });
+  if (!named.isDirectory() || named.isSymbolicLink() ||
+      opened.dev !== held.original.dev || opened.ino !== held.original.ino ||
+      named.dev !== held.original.dev || named.ino !== held.original.ino || fs.realpathSync(dest) !== path.resolve(dest)) {
     throw new Error(`Archive directory ${dest} changed while it was held`);
   }
 };
 
-const writeArchivedControls = (dest: string, anchor: string, controls: Map<string, Buffer>, run: PrivateDirectory): void => {
+const openArchiveDirectory = (dest: string, anchor: string): ArchiveDirectory => {
+  const held = openPrivateDir(dest, anchor);
+  try {
+    const stat = held.fd === undefined ? fs.lstatSync(held.path, { bigint: true }) : fs.fstatSync(held.fd, { bigint: true });
+    if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error(`Archive directory ${dest} is not a real directory`);
+    const run: ArchiveDirectory = { ...held, original: Object.freeze({ dev: stat.dev, ino: stat.ino }) };
+    assertArchiveRunIdentity(dest, run);
+    return run;
+  } catch (error) { held.close(); throw error; }
+};
+
+const writeArchivedControls = (dest: string, anchor: string, controls: Map<string, Buffer>, run: ArchiveDirectory): void => {
   assertArchiveRunIdentity(dest, run);
   if (fs.lstatSync(taskControlDirectory(dest), { throwIfNoEntry: false })) withTaskControlDirectory(dest, () => undefined);
   // Publish into the CENTRAL namespace keyed by the archive path, never a raw
@@ -346,13 +366,13 @@ export class ActorLogStore {
     // trusted descriptor walk (private-dir.ts), and every copy goes through the held descriptor's path. A symlinked,
     // foreign or group/other-writable step anywhere in the chain refuses the archive: the run stays unarchived (its
     // source is untouched) and one line says why.
-    let held: PrivateDirectory;
+    let held: ArchiveDirectory;
     // The anchor is the mesh root (the parent of the `actors` directory the session file lies in), else the actor's own
     // directory: our own group-writable containers below it are tightened on first use (pi-fabric#875 round 3).
     const sessionDirectory = path.dirname(path.resolve(actor.sessionFile));
     const actorsAt = sessionDirectory.lastIndexOf(`${path.sep}actors${path.sep}`);
     const anchor = actorsAt > 0 ? sessionDirectory.slice(0, actorsAt) : sessionDirectory;
-    try { held = openPrivateDir(dest, anchor); }
+    try { held = openArchiveDirectory(dest, anchor); }
     catch (error) {
       console.warn(`[pi-fabric] actor run ${runId} not archived: ${(error as Error).message}`);
       return;
@@ -426,7 +446,7 @@ export class ActorLogStore {
           assertArchiveRunIdentity(dest, held);
           for (const [source, childControls] of nestedControls) {
             if (!childControls) continue;
-            const child = path.join(dest, path.relative(runDirectory, source)), childHeld = openPrivateDir(child, anchor);
+            const child = path.join(dest, path.relative(runDirectory, source)), childHeld = openArchiveDirectory(child, anchor);
             try { writeArchivedControls(child, anchor, childControls, childHeld); }
             finally { childHeld.close(); }
           }

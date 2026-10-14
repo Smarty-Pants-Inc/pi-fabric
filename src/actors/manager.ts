@@ -6093,7 +6093,7 @@ export class ActorManager {
           value: { owned, revoked, actors, saved, revision,
             appends: new Map(owned.map(actor => [actor, [...(this.#unarchivedMessages.get(actor) ?? [])]])) } };
       });
-      });
+      }, "manager-update");
     } catch (error) {
       // A persistent veto committed nothing: keep the state dirty, retry it in the
       // background with backoff, and still fail the awaited save.
@@ -7425,7 +7425,7 @@ export class ActorManager {
             actor.updatedAt = adoptedAt;
             this.#registryFingerprint = this.#registry.fingerprint();
             return true;
-          }), 0));
+          }), 0), "manager-adoption");
       } finally { prepared.dispose(); }
       this.#adoptionRetryAt.delete(actor.id);
       // Close can also begin after the synchronous claim, before lock release

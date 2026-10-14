@@ -208,6 +208,19 @@ const tracked = (db: SqliteConnection, identity: string, root: string): SqliteCo
   return db;
 };
 
+// smarty-dev#9501: descriptor numbers this process holds on purpose on state files it created (owned-import-files.ts
+// keeps each O_EXCL create open through the run). They are never SQLite's, so they are not parked descriptors: the
+// snapshots below leave them out. The token makes the disposer idempotent and harmless after the number was released
+// and registered again. Internal: this trusts the caller to register ONLY its own ownership pins, and to unregister
+// a number once it stops owning it; a registered number is invisible to the descriptor proof.
+const ownershipPins = new Map<number, object>();
+/** Exclude `fd` from openPinned's descriptor proof while it is pinned; the returned disposer never throws. */
+export const registerStateFileOwnershipPin = (fd: number): (() => void) => {
+  const token = {};
+  ownershipPins.set(fd, token);
+  return () => { if (ownershipPins.get(fd) === token) ownershipPins.delete(fd); };
+};
+
 // fd -> "dev:ino" of each open regular file. Compared by identity as well as number: the listing's own directory fd
 // is closed again at once, so SQLite may get that very number.
 const fdSnapshot = (): Map<string, string> | undefined => {
@@ -215,6 +228,7 @@ const fdSnapshot = (): Map<string, string> | undefined => {
   try { names = fs.readdirSync("/proc/self/fd"); } catch { return undefined; }
   const identities = new Map<string, string>();
   for (const fd of names) {
+    if (ownershipPins.has(Number(fd))) continue; // an ownership pin, not a SQLite descriptor (smarty-dev#9501)
     try { const stat = fs.fstatSync(Number(fd)); if (stat.isFile()) identities.set(fd, `${stat.dev}:${stat.ino}`); }
     catch { /* closed meanwhile (the listing's own fd) */ }
   }

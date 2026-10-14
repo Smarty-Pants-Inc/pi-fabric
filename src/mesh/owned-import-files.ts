@@ -23,6 +23,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { randomBytes } from "node:crypto";
+import { registerStateFileOwnershipPin } from "./state-gate.js";
 
 const STATE_DB = "state.db";
 /** Move order: the sidecars first. A WAL kept without its database could otherwise meet a new state.db. */
@@ -67,7 +68,11 @@ export interface OwnedImportFiles {
 
 interface Identity { dev: number; ino: number }
 /** A created file's descriptor, held from its O_EXCL create through `close`; `fd` is undefined once released. */
-interface Held extends Identity { fd: number | undefined }
+interface Held extends Identity {
+  fd: number | undefined;
+  /** Drops `fd` from the state gate's ownership pins (idempotent); called when this run stops owning the number. */
+  unregister: () => void;
+}
 
 const messageOf = (error: unknown): string => error instanceof Error ? error.message : String(error);
 
@@ -129,7 +134,11 @@ export const pinImportRoot = (root: string): OwnedImportFiles => {
       // own open is unaffected). On POSIX, closing any fd of an inode drops this process's fcntl locks on it, so close()
       // runs only after the caller ended its database use. If the database close threw, the connection may still be
       // open: keepAfterFailure("close-failed") then keeps these fds open until the process exits.
-      try { const stat = fs.fstatSync(descriptor); owned.set(name, { fd: descriptor, dev: stat.dev, ino: stat.ino }); }
+      // The state gate's fd proof skips this pin: it is not a parked SQLite descriptor (smarty-dev#9501).
+      try {
+        const stat = fs.fstatSync(descriptor);
+        owned.set(name, { fd: descriptor, dev: stat.dev, ino: stat.ino, unregister: registerStateFileOwnershipPin(descriptor) });
+      }
       catch (error) { try { fs.closeSync(descriptor); } catch { /* closed */ } throw error; }
       return true;
     },
@@ -270,6 +279,8 @@ export const pinImportRoot = (root: string): OwnedImportFiles => {
         for (const held of owned.values()) {
           if (held.fd !== undefined) release(held.fd, held);
           held.fd = undefined;
+          // Released, or lost to another owner: either way this run no longer owns the number.
+          held.unregister();
         }
       }
       if (fd !== undefined && rootId) release(fd, rootId);

@@ -951,6 +951,33 @@ describe.runIf(process.env.CI === "true" && process.platform === "linux")("hoste
     expect(done.code, done.err).toBe(0);
     expect((await meshBackendStatus(root)).backend).toBe("sqlite");
   });
+
+  // smarty-dev#11466 (r3): the real opener through the gate while this run's O_EXCL ownership pin on state.db is held.
+  // Nothing is removed or renamed; the test teardown of the mkdtemp root is hosted only.
+  it("the real opener passes the checked-inode gate while the ownership pin is held through close", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "r3-11466-"));
+    try {
+      const owned = pinImportRoot(root);
+      expect(owned.pinned).toBe(true);
+      expect(owned.create("state.db")).toBe(true);
+      const file = path.join(root, "state.db");
+      const pinned = fs.lstatSync(file);
+      try {
+        const db = openPrivateStateDb(file, openNodeSqlite);
+        try {
+          db.exec("CREATE TABLE t (v INTEGER)");
+          db.prepare("INSERT INTO t (v) VALUES (?)").run(7);
+          expect(db.prepare("SELECT v FROM t").get()).toEqual({ v: 7 });
+        } finally {
+          // The product's rule: a failed database close keeps the created-file pins (close-failed) before owned.close.
+          try { db.close(); } catch (error) { owned.keepAfterFailure("close-failed", error); throw error; }
+        }
+        const after = fs.lstatSync(file);
+        expect([after.dev, after.ino], "the pinned inode still names state.db").toEqual([pinned.dev, pinned.ino]);
+      } finally { owned.close(); }
+      expect(fs.readdirSync(root).filter(name => name.startsWith(".import-quarantine-")), "no cleanup moves").toEqual([]);
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  });
 });
 
 // smarty-dev#11466: a pure in-memory emulation of pinImportRoot's root (no real files, no SQLite, no removal). Every
@@ -966,11 +993,14 @@ describe.runIf(process.platform === "linux")("emulated held-file ownership", () 
   const WAL = "state.db-wal";
   const SHM = "state.db-shm";
   const FD0 = 9_000;
+  // Unique fake fds across model instances: a retained (sticky failed-close) pin never meets a reused number.
+  let fdCursor = FD0;
   const errno = (code: string): Error => Object.assign(new Error(`${code}: emulated`), { code });
   const emulate = (pre: Record<string, Partial<Node>> = {}) => {
     let nextIno = 200;
     let clock = 1_000;
-    let nextFd = FD0;
+    const firstFd = fdCursor;
+    let nextFd = firstFd;
     const node = (over: Partial<Node> = {}): Node => ({ dev: 7, ino: nextIno++, size: 0, birth: clock++, dir: false, ...over });
     const rootNode = node({ dir: true });
     const names = new Map<string, Node>(Object.entries(pre).map(([name, over]) => [name, node(over)]));
@@ -1012,6 +1042,7 @@ describe.runIf(process.platform === "linux")("emulated held-file ownership", () 
         n = node(); names.set(name, n);
       }
       const fd = nextFd++;
+      fdCursor = nextFd;
       fds.set(fd, n);
       return fd;
     }) as typeof fs.openSync);
@@ -1023,7 +1054,7 @@ describe.runIf(process.platform === "linux")("emulated held-file ownership", () 
       return statOf(n);
     }) as typeof fs.fstatSync);
     vi.spyOn(fs, "closeSync").mockImplementation((fd: number) => {
-      if (fd < FD0 || fd >= nextFd) throw errno("EBADF"); // never issued by the model: no real descriptor is touched
+      if (fd < firstFd || fd >= nextFd) throw errno("EBADF"); // never issued by the model: no real descriptor is touched
       closes.set(fd, (closes.get(fd) ?? 0) + 1);
       if (!fds.delete(fd)) throw errno("EBADF");
     });
@@ -1063,6 +1094,24 @@ describe.runIf(process.platform === "linux")("emulated held-file ownership", () 
       if (names.has(b)) throw errno("EEXIST");
       names.set(b, n);
     });
+    // The Linux gate (state-gate.ts filesystemRefusal, fdSnapshot, openPinned's link check), no real fallback.
+    vi.spyOn(fs, "readFileSync").mockImplementation(((target: fs.PathOrFileDescriptor) => {
+      if (String(target) === "/proc/self/mountinfo") return "22 1 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw\n";
+      throw errno("EACCES");
+    }) as typeof fs.readFileSync);
+    vi.spyOn(fs, "readdirSync").mockImplementation(((target: fs.PathLike) => {
+      if (String(target) === "/proc/self/fd") return [...fds.keys()].map(String);
+      throw errno("EACCES");
+    }) as typeof fs.readdirSync);
+    vi.spyOn(fs, "readlinkSync").mockImplementation(((target: fs.PathLike) => {
+      const proc = /^\/proc\/self\/fd\/(\d+)$/.exec(String(target));
+      const n = proc ? fds.get(Number(proc[1])) : undefined;
+      if (!n) throw errno("EBADF");
+      if (n === rootNode) return ROOT;
+      const name = [...names.entries()].find(([, v]) => v === n)?.[0];
+      if (name === undefined) throw errno("EACCES");
+      return `${ROOT}/${name}`;
+    }) as typeof fs.readlinkSync);
     return m;
   };
   type Model = ReturnType<typeof emulate>;
@@ -1282,5 +1331,87 @@ describe.runIf(process.platform === "linux")("emulated held-file ownership", () 
     expect(m.renames).toEqual([]);
     expect(m.mkdtemps).toBe(0);
     expect(m.removals).toEqual([]);
+  });
+
+  // smarty-dev#11466 r3: the Linux checked-inode gate (/proc/self/fd snapshots) while this run's O_EXCL ownership pin
+  // on state.db is held. The pin predates both snapshots and is not a SQLite descriptor: it must never count as parked.
+  const fakeDb = (m: Model, opensFile: boolean) => {
+    const log = { closes: 0, sql: [] as string[], fd: undefined as number | undefined };
+    const open = ((file: string) => {
+      if (opensFile) log.fd = fs.openSync(file, "r");
+      return {
+        exec: (sql: string) => { log.sql.push(sql); },
+        prepare: (sql: string) => { log.sql.push(sql); throw new Error("no SQL in the emulation"); },
+        close: () => { log.closes += 1; if (log.fd !== undefined) fs.closeSync(log.fd); },
+      } as unknown as SqliteConnection;
+    }) as SqliteOpener;
+    return { open, log, m };
+  };
+  const pinnedDb = (m: Model) => {
+    const owned = pinImportRoot(ROOT);
+    expect(owned.pinned).toBe(true);
+    expect(owned.create("state.db")).toBe(true);
+    return owned;
+  };
+
+  it("the Linux gate refuses an opener that never opened the checked file while the ownership pin is held", () => {
+    const m = emulate();
+    const owned = pinnedDb(m);
+    const fake = fakeDb(m, false);
+    let accepted: SqliteConnection | undefined;
+    let error: unknown;
+    try { accepted = openPrivateStateDb(`${ROOT}/state.db`, fake.open); } catch (caught) { error = caught; }
+    if (accepted) accepted.close(); // release the product's live count before asserting
+    expect(accepted, "the gate accepted a non-opening opener (the ownership pin counted as parked)").toBeUndefined();
+    expect(error).toBeInstanceOf(MeshStateUnsupportedError);
+    expect((error as Error).message).toBe(`Fabric mesh SQLite state refuses ${ROOT}/state.db: the connection's own descriptor `
+      + "on it is not proven (0 new, 0 other, 0 parked here)");
+    expect(fake.log.closes, "the fake is closed once").toBe(1);
+    expect(fake.log.sql).toEqual([]);
+    // The rejection does not poison the live count: a connection opening its own new descriptor then passes.
+    const next = fakeDb(m, true);
+    const db = openPrivateStateDb(`${ROOT}/state.db`, next.open);
+    db.close();
+    expect(next.log.closes).toBe(1);
+    expect(next.log.sql).toEqual([]);
+    expect(m.renames).toEqual([]);
+    finish(m, owned);
+  });
+
+  it("the Linux gate passes an opener whose own new descriptor names the checked file while the ownership pin is held", () => {
+    const m = emulate();
+    const owned = pinnedDb(m);
+    const fake = fakeDb(m, true);
+    const db = openPrivateStateDb(`${ROOT}/state.db`, fake.open);
+    expect(m.fds.get(fake.log.fd!)).toBe(m.names.get("state.db"));
+    db.close();
+    expect(fake.log.closes, "the fake is closed once").toBe(1);
+    expect(fake.log.sql).toEqual([]);
+    expect(m.renames).toEqual([]);
+    expect(m.mkdtemps).toBe(0);
+    finish(m, owned);
+  });
+
+  it("after a failed close the kept pin is still not gate evidence: a non-opening opener is refused", () => {
+    const m = emulate();
+    const owned = pinnedDb(m);
+    owned.keepAfterFailure("close-failed", new Error("emulated close failure"));
+    owned.close();
+    expect(heldFiles(m), "the pin stays open").toEqual([m.names.get("state.db")]);
+    const fake = fakeDb(m, false);
+    expect(() => openPrivateStateDb(`${ROOT}/state.db`, fake.open)).toThrow(/not proven \(0 new, 0 other, 0 parked here\)/);
+    expect(fake.log.closes).toBe(1);
+  });
+
+  it("after a normal owned.close the freed pin number, reused by a new opener, is seen (unregistered)", () => {
+    const m = emulate();
+    const owned = pinnedDb(m);
+    const [pinFd] = [...m.fds.entries()].find(([, n]) => !n.dir)!;
+    owned.close();
+    const db = m.names.get("state.db")!;
+    const open = (() => { m.fds.set(pinFd, db); // the kernel hands the freed number to SQLite
+      return { close: () => { m.fds.delete(pinFd); } } as unknown as SqliteConnection; }) as SqliteOpener;
+    openPrivateStateDb(`${ROOT}/state.db`, open).close();
+    expect(m.fds.size).toBe(0);
   });
 });

@@ -213,29 +213,45 @@ it.each(["dual", "own"])("keeps lineage and every inbox pending under foreign cu
 
 it("fences inbox reads and wakes before initialization and after shutdown", async () => {
   const f = fixture();
-  const session: RootInboxSession = { holdsBatch: () => false, holdsSteer: () => false };
-  const next = vi.spyOn(RootInbox.prototype, "next");
-  const wake = vi.spyOn(RootInbox.prototype, "wake");
+  // Observable effect only: real addressed work is never delivered through the fence.
+  const held = new Set<string>();
+  const session: RootInboxSession = { holdsBatch: ids => ids.every(id => held.has(id)), holdsSteer: () => false };
+  const identity = { id: `session:${f.sessionId}`, name: "custody-main", kind: "main" as const };
+  const sender = { id: "fence-sender", name: "fence-sender", kind: "main" as const };
+  const mesh = new MeshStore(f.meshRoot, f.config.mesh.maxEventBytes, f.config.mesh.maxReadEvents);
+  // Age each event past production's steer grace so it is due at once.
+  const publish = async (key: string) => {
+    const timestamp = vi.spyOn(Date, "now").mockReturnValue(Date.now() - 61_000);
+    try {
+      return await mesh.publish({ topic: "fleet.custody-fence", kind: "message", from: sender, to: identity.id,
+        text: `fenced root work ${key}`, data: { key } });
+    } finally { timestamp.mockRestore(); }
+  };
   try {
+    const backlog = await publish("before-init");
     await expect(f.runtime.nextRootInbox(session)).resolves.toBeUndefined();
     await expect(f.runtime.nextRootInbox(session, () => true)).resolves.toBeUndefined();
-    expect(next).not.toHaveBeenCalled();
-    expect(wake).not.toHaveBeenCalled();
 
+    // A root with no saved cursor starts at the present: the pre-init backlog is skipped.
     await f.runtime.initialize(f.context, f.config);
-    expect((await f.runtime.nextRootInbox(session))?.events).toEqual([]);
-    await expect(f.runtime.nextRootInbox(session, () => true)).resolves.toBeUndefined();
-    expect(next).toHaveBeenCalledTimes(2);
-    expect(wake).toHaveBeenCalledOnce();
+    const first = await publish("after-init-read");
+    const read = await f.runtime.nextRootInbox(session);
+    expect(read?.events.map(value => value.id)).toEqual([first.id]);
+    held.add(first.id);
+    const second = await publish("after-init-wake");
+    const woke = await f.runtime.nextRootInbox(session, () => true);
+    expect(woke?.events.map(value => value.id)).toEqual([second.id]);
+    held.add(second.id);
 
     await f.runtime.shutdown();
-    next.mockClear();
-    wake.mockClear();
+    const late = await publish("after-shutdown");
     await expect(f.runtime.nextRootInbox(session)).resolves.toBeUndefined();
     await expect(f.runtime.nextRootInbox(session, () => true)).resolves.toBeUndefined();
-    expect(next).not.toHaveBeenCalled();
-    expect(wake).not.toHaveBeenCalled();
-  } finally { await f.cleanup(); }
+    const queued = mesh.read({ to: identity.id }).map(value => value.id);
+    expect(queued).toEqual(expect.arrayContaining([backlog.id, first.id, second.id, late.id]));
+  } finally {
+    try { mesh.closeState(); } finally { await f.cleanup(); }
+  }
 });
 
 it("still rejects non-contention inbox activation errors", async () => {

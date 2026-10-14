@@ -102,6 +102,8 @@ const lazyEntryPoints = [
   // Also loaded by the worker (-e) so extensions: false children keep
   // extension-registered model providers.
   "src/agents/provider-bridge.ts",
+  // The running Pi CLI's own SDK entry, for the bridge and the conversation UI.
+  "src/core/host-sdk.ts",
   "src/fabric-runtime-state.ts",
   "src/provider-error-class.ts",
   "src/topology/root-inbox-context.ts",

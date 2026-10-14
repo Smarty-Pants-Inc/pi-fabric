@@ -6,6 +6,7 @@ import { FabricControlStaleIncarnationError, STALE_INCARNATION_ERROR } from "../
 import { classifyPiBashError } from "../src/core/pi-bash-error.js";
 import { MeshLockTimeoutError, MESH_LOCK_TIMEOUT_CODE } from "../src/core/atomic-write.js";
 import { transpileFabricCodeWithSourceMap } from "../src/runtime/type-checker.js";
+import { JevTransientHttpError } from "../src/jev/validation.js";
 import * as typeChecker from "../src/runtime/type-checker.js";
 import { ExecutionDeadline } from "../src/runtime/execution-deadline.js";
 import { executeAfterAdmission } from "./helpers/admission-clock.js";
@@ -70,6 +71,47 @@ catch (error) { return { name: error.name, code: typeof error.code, extra: typeo
       const result = await new QuickJsRuntime().execute('try { await agents.spawn({ task: "review" }); } catch (error) { return { name: error.name, code: error.code, secret: error.secret }; }', async () => { throw error; }, options);
       expect(result.value).toEqual(error instanceof FabricModelDeniedError ? { name: "FabricModelDeniedError", code: "FABRIC_MODEL_DENIED" } : { name: "FabricModelDeniedError" });
     }
+  });
+  it("never lets host guestFields replace or add to vetted Fabric error metadata", async () => {
+    const error = Object.assign(new FabricModelDeniedError("provider/denied"), { guestFields: { code: 7, status: 403 } });
+    const result = await new QuickJsRuntime().execute('try { await agents.spawn({ task: "review" }); } catch (error) { return { name: error.name, code: error.code, status: typeof error.status }; }', async () => { throw error; }, options);
+    expect(result.value).toEqual({ name: "FabricModelDeniedError", code: "FABRIC_MODEL_DENIED", status: "undefined" });
+  });
+  const numericProbe = "try { await tools.call({ ref: 'fixture.fail' }); } catch (error) { const e = error as Record<string, unknown>; return [e.message, e.status, e.retryAfterMs, e.secret, Object.hasOwn(e, 'retryAfterMs')]; } return null;";
+  it("copies finite status and retryAfterMs only from the trusted Jev transient error", async () => {
+    const usage = { input_tokens: 1, output_tokens: 0 };
+    const withRetry = Object.assign(new JevTransientHttpError("HTTP 429", usage, 429, 1500), { secret: 1 });
+    const first = await new QuickJsRuntime().execute(numericProbe, async () => { throw withRetry; }, options);
+    expect(first.terminationReason, first.error).toBe("completed");
+    expect(first.value).toEqual(["HTTP 429", 429, 1500, null, true]);
+    const second = await new QuickJsRuntime().execute(numericProbe, async () => { throw new JevTransientHttpError("HTTP 503", usage, 503, undefined); }, options);
+    expect(second.value).toEqual(["HTTP 503", 503, null, null, false]);
+  });
+  it("never copies numeric metadata from an ordinary host error spoof", async () => {
+    const spoof = Object.assign(new Error("denied"), { status: 200, retryAfterMs: 0, guestFields: { status: 200, retryAfterMs: 0 } });
+    const result = await new QuickJsRuntime().execute(numericProbe, async () => { throw spoof; }, options);
+    expect(result.terminationReason, result.error).toBe("completed");
+    expect(result.value).toEqual(["denied", null, null, null, false]);
+  });
+  it("never invokes getters while reading host error metadata", async () => {
+    const getter = vi.fn(() => ({ status: 200, retryAfterMs: 0 }));
+    const plain = new Error("getter");
+    Object.defineProperty(plain, "guestFields", { get: getter });
+    Object.defineProperty(plain, "status", { get: getter });
+    const trusted = new JevTransientHttpError("HTTP 502", { input_tokens: 1, output_tokens: 0 }, 502, undefined);
+    Object.defineProperty(trusted, "retryAfterMs", { get: getter });
+    const statusGetter = vi.fn(() => 200);
+    const accessorStatus = new JevTransientHttpError("HTTP 500", { input_tokens: 1, output_tokens: 0 }, 500, 10);
+    Object.defineProperty(accessorStatus, "status", { get: statusGetter });
+    const values: unknown[] = [];
+    for (const error of [plain, trusted, accessorStatus]) {
+      const result = await new QuickJsRuntime().execute(numericProbe, async () => { throw error; }, options);
+      expect(result.terminationReason, result.error).toBe("completed");
+      values.push(result.value);
+    }
+    expect(values).toEqual([["getter", null, null, null, false], ["HTTP 502", 502, null, null, false], ["HTTP 500", null, 10, null, true]]);
+    expect(getter).not.toHaveBeenCalled();
+    expect(statusGetter).not.toHaveBeenCalled();
   });
   it("rejects memory limits that overflow the WASM32 size_t", async () => {
     const result = await new QuickJsRuntime().execute(

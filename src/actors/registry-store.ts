@@ -13,6 +13,13 @@ const ACTOR_REGISTRY_VETO_BACKOFF_MIN_MS = 10;
 const ACTOR_REGISTRY_VETO_BACKOFF_MAX_MS = 200;
 const VETOED: unique symbol = Symbol("vetoed");
 
+// Diagnostic only: keep owner field5 bounded and unable to inject identity slots.
+const assertLockLabel = (label: string): void => {
+  if (typeof label !== "string" || label.length === 0 || label.length > 64 || /[^\x20-\x7e]/.test(label)) {
+    throw new TypeError("Actor registry lock label must be 1-64 printable ASCII characters");
+  }
+};
+
 /** A caller validate() veto that persisted under custody: nothing was committed; retry. */
 export class ActorRegistryUpdateVetoedError extends Error {
   readonly code = "FABRIC_ACTOR_REGISTRY_UPDATE_VETOED";
@@ -278,14 +285,15 @@ export class ActorRegistryStore {
               try { rollback(); } finally { this.#snapshot = undefined; registryReadCache.delete(this.#registryPath); }
               throw again;
             }
-          });
+          }, undefined, "barrier");
         }
       },
       dispose: () => fs.rmSync(temporary, { force: true }),
     };
   }
 
-  async update<T>(select: (current: ActorRegistrySnapshot["actors"]) => ActorRegistryMutation<T> | undefined): Promise<T | undefined> {
+  async update<T>(select: (current: ActorRegistrySnapshot["actors"]) => ActorRegistryMutation<T> | undefined, label = "update"): Promise<T | undefined> {
+    assertLockLabel(label);
     // ONE monotonic deadline for the whole update, computed once: no attempt starts,
     // and nothing validates or commits, after it (smarty-dev#816, pi-fabric#577).
     const retryUntil = this.#now() + ACTOR_REGISTRY_VETO_RETRY_MS;
@@ -298,7 +306,7 @@ export class ActorRegistryStore {
       const remaining = retryUntil - this.#now();
       if (remaining <= 0) expire();
       try {
-        return await this.withLock(() => { live(); return operation(); }, remaining);
+        return await this.withLock(() => { live(); return operation(); }, remaining, label);
       } catch (error) {
         if (vetoed && error instanceof ActorRegistryLockTimeoutError) expire();
         throw error;
@@ -429,31 +437,34 @@ export class ActorRegistryStore {
         registryReadCache.delete(this.#registryPath);
       }
       return actors.length;
-    });
+    }, undefined, "downgrade");
   }
 
   /** Acquire all registry fences in one global order before any mesh lock.
    * Deduplicate normalized paths: project/session roots may name the same store.
    * The callback retains every fence through source selection and publication;
    * it must never be invoked while the caller already holds mesh custody. */
-  static withLocks<T>(registries: readonly ActorRegistryStore[], operation: () => T | Promise<T>): Promise<T> {
+  static withLocks<T>(registries: readonly ActorRegistryStore[], operation: () => T | Promise<T>, label = "external"): Promise<T> {
+    assertLockLabel(label);
     const stores = new Map(registries.map((store) => [path.resolve(store.#registryPath), store]));
     const ordered = [...stores.keys()].sort().map((key) => stores.get(key)!);
     const acquire = (index: number): Promise<T> => index === ordered.length
       ? Promise.resolve().then(operation)
-      : ordered[index]!.withLock(() => acquire(index + 1));
+      : ordered[index]!.withLock(() => acquire(index + 1), undefined, label);
     return acquire(0);
   }
 
   /** Global order: actor registries (sorted path), then mesh; never the reverse.
    * Retains registry custody while adoption/publication acquires the mesh fence. */
-  async withLock<T>(operation: () => T | Promise<T>, timeoutMs = ACTOR_REGISTRY_LOCK_TIMEOUT_MS): Promise<T> {
+  async withLock<T>(operation: () => T | Promise<T>, timeoutMs = ACTOR_REGISTRY_LOCK_TIMEOUT_MS, label = "external"): Promise<T> {
+    assertLockLabel(label);
     const lockPath = `${this.#registryPath}.lock`;
     const ownerPath = path.join(lockPath, "owner");
     const deadline = Date.now() + Math.min(timeoutMs, ACTOR_REGISTRY_LOCK_TIMEOUT_MS);
     const token = randomUUID();
     const started = this.#ownProcessStart;
-    const ownerRecord = `${token}\n${process.pid}\n${Date.now()}\n${started ? `${started}\n` : ""}`;
+    // Preserve the historical first four slots, including an empty incarnation.
+    const ownerRecord = `${token}\n${process.pid}\n${Date.now()}\n${started ?? ""}\n${label}\n`;
     fs.mkdirSync(this.#actorRoot, { recursive: true, mode: 0o700 });
     while (true) {
       try {

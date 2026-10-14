@@ -53,6 +53,8 @@ const primaryEntryPoints = [
 const lazyEntryPoints = [
   // First-use scratch removal: a stable entry keeps the shared verifier out of the startup graph.
   "src/storage/verified-remove.ts",
+  // The resident's first operator cleanup reuses the offline final-check helper (smarty-dev#8090).
+  "src/actors/remove-offline.ts",
   "src/residency/launcher-owner.ts",
   "src/residency/wake.ts",
   "src/residency/process-work.ts",
@@ -73,6 +75,7 @@ const lazyEntryPoints = [
   "src/memory/extractive-history.ts",
   "src/cli/mesh.ts",
   "src/cli/decisions.ts",
+  "src/mesh/nats-auth/cli.ts",
   "src/thinking-control.ts",
   "src/compaction/owner.ts",
   "src/compaction/orphan-repair.ts",
@@ -91,6 +94,9 @@ const lazyEntryPoints = [
   "src/agents/transports/placement.ts",
   // Also loaded by the worker as a Pi extension (-e) for confined children.
   "src/agents/write-guard.ts",
+  // Also loaded by the worker (-e) so extensions: false children keep
+  // extension-registered model providers.
+  "src/agents/provider-bridge.ts",
   "src/fabric-runtime-state.ts",
   "src/provider-error-class.ts",
   "src/topology/root-inbox-context.ts",
@@ -152,6 +158,8 @@ const lazyEntryPoints = [
   "src/worker/session-export.ts",
   // smarty-dev#7504: the NATS state backend's official client, loaded only by openNatsStateBackend.
   "src/mesh/state-backend-nats-client.ts",
+  "src/config.ts",
+  "src/core/agent-dir.ts",
 ];
 
 // smarty-dev#7936: the native helpers' sha256 values become a constant of the bundle (reader-proof.ts).

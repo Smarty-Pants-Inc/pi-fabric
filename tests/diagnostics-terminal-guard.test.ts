@@ -18,6 +18,7 @@ const allowlist: Record<string, { reason: string; calls: Record<string, number> 
   "src/guards/fixture-mode.ts": { reason: "Fatal unsupported-host refusal during extension registration, before the UI exists; exits immediately.", calls: { "console.error": 1 } },
   "src/judge-cli.ts": { reason: "Standalone JSON judge CLI, not a Main diagnostic.", calls: { "process.stdout.write": 1 } },
   "src/mesh/mesh-backend-cli.ts": { reason: "Standalone migration CLI's explicit stdout/stderr IO defaults.", calls: { "process.stdout.write": 1, "process.stderr.write": 1 } },
+  "src/mesh/nats-auth/cli.ts": { reason: "Standalone pi-fabric nats subcommand, loaded only by cli/index.ts: help, usage/refusal diagnostics and requested public config/mint metadata; never Pi Main's TUI.", calls: { "process.stdout.write": 3, "process.stderr.write": 2 } },
   "src/mesh-bridge.ts": { reason: "Standalone bridge/stdio protocol process, never imported by the Main extension.", calls: { "process.stderr.write": 2, "process.stdout.write": 1 } },
   "src/mesh-lock-stats-cli.ts": { reason: "Standalone lock-statistics CLI IO defaults.", calls: { "process.stdout.write": 1, "process.stderr.write": 1 } },
   "src/participants-cli.ts": { reason: "Standalone fabric-participants CLI IO defaults.", calls: { "process.stdout.write": 1, "process.stderr.write": 1 } },

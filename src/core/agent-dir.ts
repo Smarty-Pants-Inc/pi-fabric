@@ -96,6 +96,9 @@ export const configureFabricDiagnostics = (context?: DiagnosticContext): void =>
   interactive = next;
 };
 
+/** Native journal mirrors cannot rely on stderr when diagnostics protect an active editor. */
+export const fabricDiagnosticsHaveTerminalUI = (): boolean => interactive !== undefined;
+
 /** No host imports, timers or log I/O until a diagnostic occurs with an active terminal UI. */
 const fabricDiagnostic = (level: DiagnosticLevel, args: unknown[]): void => {
   if (!interactive) {

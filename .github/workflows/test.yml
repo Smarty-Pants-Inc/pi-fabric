@@ -196,8 +196,15 @@ jobs:
     # sync_interval always (the backend refuses a server that does not fsync every write) and an http
     # monitor port (read for /varz). NATS_SERVER_REQUIRED=1 fails the job if the server is missing, so it
     # never passes by skipping. Separate from `check`; not a required check.
+    # smarty-dev#11373: the same three suites run against both NATS_STATE_PROFILE values. `single` is one server;
+    # `cluster` is three routed loopback nodes (replicas 3). NATS_SERVER_URL/NATS_MONITOR_URL stay the single seed
+    # inputs; the profile only selects the replica count the test helper writes into the private fixture config.
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [single, cluster]
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
@@ -225,27 +232,100 @@ jobs:
             tar -xzf "$archive"
           )
           echo "NATS_BIN=$stage/nats-server-v${version}-linux-amd64/nats-server" >> "$GITHUB_ENV"
-      - name: Start nats-server (loopback, JetStream sync always, monitor port)
+      - name: Start nats-server ${{ matrix.profile }} (loopback, JetStream sync always, monitor ports)
         shell: bash
+        env:
+          NATS_STATE_PROFILE: ${{ matrix.profile }}
         run: |
-          mkdir -p "$RUNNER_TEMP/nats-store"
-          printf 'listen: 127.0.0.1:4222\nhttp: 127.0.0.1:8222\njetstream {\n  store_dir: "%s"\n  sync_interval: always\n}\n' \
-            "$RUNNER_TEMP/nats-store" > "$RUNNER_TEMP/nats.conf"
-          nohup "$NATS_BIN" -c "$RUNNER_TEMP/nats.conf" > "$RUNNER_TEMP/nats.log" 2>&1 &
-          for _ in $(seq 1 50); do
-            curl -fsS 'http://127.0.0.1:8222/healthz?js-enabled-only=true' > /dev/null 2>&1 && break
+          set -euo pipefail
+          case "$NATS_STATE_PROFILE" in
+            single) nodes=1 ;;
+            cluster) nodes=3 ;;
+            *) echo "unknown NATS profile: $NATS_STATE_PROFILE" >&2; exit 1 ;;
+          esac
+          for i in $(seq 1 "$nodes"); do
+            store="$RUNNER_TEMP/nats-store-$i"
+            mkdir -p "$store"
+            conf="$RUNNER_TEMP/nats-$i.conf"
+            {
+              printf 'server_name: n%s\nlisten: 127.0.0.1:%s\nhttp: 127.0.0.1:%s\n' "$i" $((4221 + i)) $((8221 + i))
+              printf 'jetstream {\n  store_dir: "%s"\n  sync_interval: always\n}\n' "$store"
+              if [ "$nodes" -gt 1 ]; then
+                routes=""
+                for j in $(seq 1 "$nodes"); do
+                  [ "$j" -eq "$i" ] || routes="${routes:+$routes, }nats-route://127.0.0.1:$((6221 + j))"
+                done
+                printf 'cluster {\n  name: fabric-state-ci\n  listen: 127.0.0.1:%s\n  routes: [%s]\n}\n' $((6221 + i)) "$routes"
+              fi
+            } > "$conf"
+            nohup "$NATS_BIN" -c "$conf" > "$RUNNER_TEMP/nats-$i.log" 2>&1 &
+          done
+          # Bounded readiness: every node healthy (full /healthz: JetStream current, meta leader known),
+          # fsync on every write, every peer routed and one JetStream meta leader agreed by every node.
+          # NATS 2.10+ route pooling opens several connections per peer, so routes are checked as
+          # num_routes >= nodes-1 and >= nodes-1 distinct remote server IDs, parsed as JSON (not regex).
+          # One wall-clock deadline bounds the whole wait, including every curl.
+          deadline=$((SECONDS + 30))
+          fetch() {
+            local left=$((deadline - SECONDS))
+            [ "$left" -gt 0 ] || return 1
+            curl -fsS --max-time $((left < 2 ? left : 2)) "$1"
+          }
+          check() {
+            node -e '
+              const [mode, nodes] = [process.argv[1], Number(process.argv[2])];
+              let d;
+              try { d = JSON.parse(require("fs").readFileSync(0, "utf8")); } catch { process.exit(1); }
+              if (mode === "sync") process.exit(d?.jetstream?.config?.sync_always === true ? 0 : 1);
+              if (mode === "routes") {
+                const peers = new Set((d.routes ?? []).map((r) => r.remote_id).filter(Boolean));
+                process.exit(d.num_routes >= nodes - 1 && peers.size >= nodes - 1 ? 0 : 1);
+              }
+              if (mode === "leader") {
+                const leader = d?.meta_cluster?.leader;
+                if (typeof leader !== "string" || leader === "") process.exit(1);
+                console.log(leader);
+                process.exit(0);
+              }
+              process.exit(2);
+            ' "$@"
+          }
+          ready() {
+            local leader="" i port node_leader
+            for i in $(seq 1 "$nodes"); do
+              port=$((8221 + i))
+              fetch "http://127.0.0.1:$port/healthz" > /dev/null 2>&1 || return 1
+              fetch "http://127.0.0.1:$port/varz" | check sync || return 1
+              [ "$nodes" -eq 1 ] && continue
+              fetch "http://127.0.0.1:$port/routez" | check routes "$nodes" || return 1
+              node_leader=$(fetch "http://127.0.0.1:$port/jsz" | check leader) || return 1
+              if [ -z "$leader" ]; then leader="$node_leader"; elif [ "$leader" != "$node_leader" ]; then return 1; fi
+            done
+            echo "NATS $NATS_STATE_PROFILE ready: $nodes node(s)${leader:+, meta leader $leader}"
+          }
+          while [ "$SECONDS" -lt "$deadline" ]; do
+            ready && exit 0
             sleep 0.2
           done
-          curl -fsS http://127.0.0.1:8222/varz | grep -q '"sync_always": *true'
-      - name: StateBackend conformance on nats
+          echo "NATS $NATS_STATE_PROFILE did not become ready within 30s" >&2
+          exit 1
+      - name: StateBackend conformance on nats (${{ matrix.profile }})
         env:
           NATS_SERVER_REQUIRED: '1'
+          NATS_STATE_PROFILE: ${{ matrix.profile }}
           NATS_SERVER_URL: nats://127.0.0.1:4222
           NATS_MONITOR_URL: http://127.0.0.1:8222
-        run: bunx vitest run tests/mesh-state-backend.test.ts tests/mesh-state-backend-multiprocess.test.ts tests/mesh-backend-migration-nats.test.ts
-      - name: Server log
+        run: bunx vitest run --retry=0 tests/mesh-state-backend.test.ts tests/mesh-state-backend-multiprocess.test.ts tests/mesh-backend-migration-nats.test.ts
+      - name: Server logs (all nodes)
         if: failure()
-        run: cat "$RUNNER_TEMP/nats.log"
+        shell: bash
+        run: |
+          for log in "$RUNNER_TEMP"/nats-*.log; do
+            [ -e "$log" ] || continue
+            echo "::group::$log"
+            cat "$log"
+            echo "::endgroup::"
+          done
 
   mesh-lock-bench:
     # The mesh lock benchmark ratchet (smarty-dev#6676, docs/mesh-lock-bench.md): fails a >10%
@@ -328,3 +408,39 @@ jobs:
           path: idle-wakes-*
           if-no-files-found: warn
           retention-days: 14
+
+  nats-auth:
+    # Hosted smarty-dev#7504 T2 role matrix and configured 1/1 T8 auth slice; this does not claim init --local or adapter coverage.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: package.json
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      - name: Install pinned NATS server
+        # The same pinned download as the JetStream event-log job (feat/nats-event-log).
+        shell: bash
+        run: |
+          version=2.14.7
+          archive="nats-server-v${version}-linux-amd64.tar.gz"
+          release="https://github.com/nats-io/nats-server/releases/download/v${version}"
+          stage="$RUNNER_TEMP/nats-release"
+          mkdir -p "$stage"
+          curl --proto '=https' --tlsv1.2 -fsSL -o "$stage/SHA256SUMS" "$release/SHA256SUMS"
+          curl --proto '=https' --tlsv1.2 -fsSL -o "$stage/$archive" "$release/$archive"
+          (
+            cd "$stage"
+            awk -v archive="$archive" '$2 == archive { print }' SHA256SUMS | sha256sum --check --strict -
+            # Also bind the release asset to the locally qualified v2.14.7 bytes.
+            printf 'e5c20b1cb2c0566b54c544312e91e011f9e130c5c80f16a14f4cf28ef30b8be2  %s\n' "$archive" | sha256sum --check --strict -
+            tar -xzf "$archive"
+          )
+          echo "NATS_BIN=$stage/nats-server-v${version}-linux-amd64/nats-server" >> "$GITHUB_ENV"
+      - name: Hosted authenticated NATS T2/T8 slice
+        env:
+          NATS_AUTH_REQUIRED: '1'
+        run: bunx vitest run tests/nats-auth-server.test.ts --retry=0

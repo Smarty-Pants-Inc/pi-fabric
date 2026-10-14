@@ -1,9 +1,11 @@
 import fs from "node:fs";
+import childProcess from "node:child_process";
 import { Console } from "node:console";
+import { PassThrough } from "node:stream";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { configureFabricDiagnostics, fabricWarn, fabricError, fabricInfo, fabricDebug, fabricStderr } from "../src/core/diagnostics.js";
+import { configureFabricDiagnostics, fabricDiagnosticsHaveTerminalUI, fabricWarn, fabricError, fabricInfo, fabricDebug, fabricStderr } from "../src/core/diagnostics.js";
 import { MeshBackgroundRetry, MeshLockTimeoutError } from "../src/core/atomic-write.js";
 
 const scratch: string[] = [];
@@ -62,6 +64,7 @@ describe("Fabric diagnostics protect Pi's editor", () => {
     const { log } = profile();
     const notify = vi.fn();
     configureFabricDiagnostics(context && { ...context, ui: { notify } });
+    expect(fabricDiagnosticsHaveTerminalUI()).toBe(false);
     const { stderr, stdout } = streams();
     new MeshBackgroundRetry("headless heartbeat").failure(timeout());
     expect(stderr).toHaveBeenCalledOnce();
@@ -69,6 +72,48 @@ describe("Fabric diagnostics protect Pi's editor", () => {
     expect(stdout).not.toHaveBeenCalled();
     expect(fs.existsSync(log)).toBe(false);
     expect(notify).not.toHaveBeenCalled();
+  });
+
+  it.each([undefined, "bound"])("keeps outage/recovery off the TUI and mirrors both alarms even with %s journal stderr", async (binding) => {
+    const { log } = profile();
+    const notify = vi.fn();
+    configureFabricDiagnostics({ hasUI: true, mode: "tui", ui: { notify } });
+    expect(fabricDiagnosticsHaveTerminalUI()).toBe(true);
+    // The real emitter runs; only its external journal child is inert. Never send test alarms to the host.
+    const writes: string[] = [];
+    const exec = vi.spyOn(childProcess, "execFile").mockImplementation(() => {
+      const child = new childProcess.ChildProcess();
+      child.stdin = new PassThrough();
+      child.stdin.on("data", (chunk) => writes.push(String(chunk)));
+      return child;
+    });
+    const stat = fs.fstatSync(2, { bigint: true });
+    vi.stubEnv("JOURNAL_STREAM", binding ? `${stat.dev}:${stat.ino}` : undefined);
+    const { stderr, stdout } = streams();
+    vi.useFakeTimers();
+    const accepted: string[] = [];
+    const retry = new MeshBackgroundRetry("TUI outage").alarmsTo((alarm) => { accepted.push(alarm.state); }, 1);
+    try {
+      retry.failure(timeout());
+      await vi.advanceTimersByTimeAsync(1);
+      retry.failure(timeout());
+      retry.success(true);
+      await retry.flushAlarms();
+      expect(accepted).toEqual(["outage", "recovered"]);
+      expect(stderr).not.toHaveBeenCalled();
+      expect(stdout).not.toHaveBeenCalled();
+      const lines = fs.readFileSync(log, "utf8").trim().split("\n");
+      const alarms = lines.filter((line) => line.includes("fabric.alarm.mesh-outage "));
+      expect(alarms).toHaveLength(2);
+      expect(alarms[0]).toContain('"state":"outage"');
+      expect(alarms[1]).toContain('"state":"recovered"');
+      if (process.platform === "linux") {
+        expect(exec).toHaveBeenCalledTimes(2);
+        expect(writes).toEqual(alarms.map((line) => `${line.slice(line.indexOf("fabric.alarm.mesh-outage "))}\n`));
+      } else {
+        expect(exec).not.toHaveBeenCalled();
+      }
+    } finally { retry.close(); }
   });
 
   it("preserves each console method and raw stderr bytes without a UI; raw stderr stays off an active TUI", () => {

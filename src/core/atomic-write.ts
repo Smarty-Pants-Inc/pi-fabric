@@ -11,7 +11,7 @@ export const bashProcessEnvironment = (environment: NodeJS.ProcessEnv = process.
     ? { PI_FABRIC_LANDLOCK_WRITES: environment.PI_FABRIC_LANDLOCK_WRITES } : {}),
 });
 import { retryDelayMs } from "./retry-backoff.js";
-import { fabricWarn } from "./diagnostics.js";
+import { fabricDiagnosticsHaveTerminalUI, fabricWarn } from "./diagnostics.js";
 import { randomUUID } from "node:crypto";
 import childProcess from "node:child_process";
 import fs from "node:fs";
@@ -789,6 +789,48 @@ export const meshJournalAlarmLine = (alarm: { label: string; state: "outage" | "
   `${MESH_JOURNAL_ALARM_TAG} ${JSON.stringify(alarm)}`;
 export interface MeshOutageAlarm { label: string; state: "outage" | "recovered"; sinceMs: number; durationMs: number; reason?: string }
 
+let journalToolUnavailable = false;
+let journalMirrorFailures = 0;
+/** Diagnostic count of failed native journal attempts (each child counts at most once). */
+export const meshJournalMirrorFailures = (): number => journalMirrorFailures;
+
+/** Pane stderr is not necessarily journal-backed (smarty-dev#9657). Only probe at alarm time. */
+const mirrorMeshJournalLine = (line: string): void => {
+  if (process.platform !== "linux" || journalToolUnavailable) return;
+  const stream = process.env.JOURNAL_STREAM;
+  // A TUI-active diagnostic goes to the private log, not fd 2. Even a journal-backed
+  // stderr therefore needs the independent native mirror in this mode.
+  if (!fabricDiagnosticsHaveTerminalUI() && stream && /^\d+:\d+$/.test(stream)) {
+    try {
+      const stat = fs.fstatSync(2, { bigint: true });
+      if (stream === `${stat.dev}:${stat.ino}`) return;
+    } catch { /* Unknown stderr identity needs the independent journal sink. */ }
+  }
+  let failed = false;
+  const fail = (error: unknown): void => {
+    if (errorCode(error) === "ENOENT") journalToolUnavailable = true;
+    if (!failed) { failed = true; journalMirrorFailures++; }
+  };
+  try {
+    // No shell/tool lookup, no await: a broken journal never blocks mesh delivery. execFile
+    // owns child errors and its kill deadline; stdin needs its own local error boundary.
+    // Fixed trusted system path: a pane's PATH may start with a writable project directory.
+    const child = childProcess.execFile("/usr/bin/systemd-cat", ["--identifier", MESH_OUTAGE_ALARM_TAG], {
+      // systemd-cat also resolves its default cat child: both executable paths must be trusted.
+      timeout: 2_000, maxBuffer: 4_096, env: { PATH: "/usr/bin:/bin" },
+    }, (error) => { if (error) fail(error); });
+    child.unref();
+    if (!child.stdin) { fail(undefined); return; }
+    child.stdin.on("error", fail);
+    child.stdin.end(`${line}\n`);
+  } catch (error) { fail(error); }
+};
+const emitMeshJournalAlarm = (alarm: Parameters<typeof meshJournalAlarmLine>[0]): void => {
+  const line = meshJournalAlarmLine(alarm);
+  fabricWarn(line);
+  mirrorMeshJournalLine(line);
+};
+
 /** A log-safe description of a deferred write (pi-fabric#893 round 3). A WAL-cap refusal's message embeds the pinning
  * readers' pids and command lines, which can carry secrets: only its sizes and reader count are logged. */
 export const meshDeferredSummary = (error: unknown): string => {
@@ -839,7 +881,7 @@ export class MeshBackgroundRetry {
   }
   #raise(alarm: MeshOutageAlarm): void {
     // The independent sink: one structured line, written at alarm time whatever the mesh does.
-    fabricWarn(meshJournalAlarmLine({ ...alarm }));
+    emitMeshJournalAlarm({ ...alarm });
     if (this.#alarm) {
       this.#pendingAlarms.push({ alarm, attempts: 0, firstAt: performance.now() });
       while (this.#pendingAlarms.length > MESH_ALARM_QUEUE_MAX) { this.#pendingAlarms.shift(); this.#droppedOverflow++; this.#reportUndeliverable(); }
@@ -850,8 +892,8 @@ export class MeshBackgroundRetry {
   #reportUndeliverable(): void {
     if (this.#undeliverableReported) return;
     this.#undeliverableReported = true;
-    fabricWarn(meshJournalAlarmLine({ label: this.label, state: "outage", sinceMs: Date.now(), reason: "mesh-alarm-undeliverable",
-      droppedOverflow: this.#droppedOverflow, droppedAfterRetries: this.#droppedExhausted, queued: this.#pendingAlarms.length }));
+    emitMeshJournalAlarm({ label: this.label, state: "outage", sinceMs: Date.now(), reason: "mesh-alarm-undeliverable",
+      droppedOverflow: this.#droppedOverflow, droppedAfterRetries: this.#droppedExhausted, queued: this.#pendingAlarms.length });
   }
   /** Remove `head` by identity (pi-fabric#893 Astra P1): while its publish was awaited, an overflow in #raise may
    * already have dropped (and counted) it, and the queue's first entry is then the NEXT, unattempted event. */

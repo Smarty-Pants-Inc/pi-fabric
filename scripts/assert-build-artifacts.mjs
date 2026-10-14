@@ -36,6 +36,8 @@ const stable = [
   "cli/index.js",
 ];
 const lazy = [
+  "config.js",
+  "core/agent-dir.js",
   "storage/verified-remove.js",
   "residency/launcher-owner.js",
   "judge/agent.js",
@@ -54,11 +56,13 @@ const lazy = [
   "memory/extractive-history.js",
   "cli/mesh.js",
   "cli/decisions.js",
+  "mesh/nats-auth/cli.js",
   "agents/claude-cli.js",
   "agents/compact-control.js",
   "agents/result.js",
   "agents/veda-cli.js",
   "agents/transports/placement.js",
+  "agents/provider-bridge.js",
   "fabric-runtime-state.js",
   "components/configuration.js",
   "providers/jev-provider.js",
@@ -305,7 +309,7 @@ const cliEntry = join(dist, "cli/index.js");
 if (!readFileSync(cliEntry, "utf8").startsWith("#!/usr/bin/env node\n")) {
   throw new Error("pi-fabric CLI entry lost its node shebang");
 }
-for (const file of [...staticClosure([cliEntry]), ...staticClosure([join(dist, "cli/mesh.js")]), ...staticClosure([join(dist, "cli/decisions.js")])]) {
+for (const file of [...staticClosure([cliEntry]), ...staticClosure([join(dist, "cli/mesh.js")]), ...staticClosure([join(dist, "cli/decisions.js")]), ...staticClosure([join(dist, "mesh/nats-auth/cli.js")])]) {
   if (file === join(dist, "index.js") || readFileSync(file, "utf8").includes("src/fabric-runtime-state.ts")) {
     throw new Error(`pi-fabric CLI statically reaches the extension graph: ${file}`);
   }

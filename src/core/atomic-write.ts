@@ -811,8 +811,10 @@ const mirrorMeshJournalLine = (line: string): void => {
   try {
     // No shell/tool lookup, no await: a broken journal never blocks mesh delivery. execFile
     // owns child errors and its kill deadline; stdin needs its own local error boundary.
-    const child = childProcess.execFile("systemd-cat", ["--identifier", MESH_OUTAGE_ALARM_TAG], {
-      timeout: 2_000, maxBuffer: 4_096, env: childProcessEnvironment(),
+    // Fixed trusted system path: a pane's PATH may start with a writable project directory.
+    const child = childProcess.execFile("/usr/bin/systemd-cat", ["--identifier", MESH_OUTAGE_ALARM_TAG], {
+      // systemd-cat also resolves its default cat child: both executable paths must be trusted.
+      timeout: 2_000, maxBuffer: 4_096, env: { ...childProcessEnvironment(), PATH: "/usr/bin:/bin" },
     }, (error) => { if (error) fail(error); });
     child.unref();
     if (!child.stdin) { fail(undefined); return; }

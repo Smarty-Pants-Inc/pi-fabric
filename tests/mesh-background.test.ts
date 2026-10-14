@@ -470,7 +470,8 @@ describe("pane outage journal mirror (smarty-dev#9657)", () => {
     expect(stat).not.toHaveBeenCalled();
   });
 
-  it("mirrors each outage and recovery line when JOURNAL_STREAM is unset", async () => {
+  it("mirrors each outage and recovery line when JOURNAL_STREAM is unset, without searching hostile PATH", async () => {
+    vi.stubEnv("PATH", "/writable-project-bin");
     vi.stubEnv("PI_FABRIC_LANDLOCK_TEST", "reserved");
     const stat = vi.spyOn(fs, "fstatSync");
     const accepted: MeshOutageAlarm[] = [];
@@ -483,11 +484,12 @@ describe("pane outage journal mirror (smarty-dev#9657)", () => {
     expect(writes).toHaveLength(2);
     expect(stat).not.toHaveBeenCalled();
     for (const [file, args, options] of vi.mocked(childProcess.execFile).mock.calls) {
-      expect(file).toBe("systemd-cat");
+      expect(file).toBe("/usr/bin/systemd-cat");
       expect(args).toEqual(["--identifier", MESH_OUTAGE_ALARM_TAG]);
       expect(options).toMatchObject({ timeout: 2_000, maxBuffer: 4_096 });
       expect(options).not.toHaveProperty("shell");
       expect((options as childProcess.ExecFileOptions).env).not.toHaveProperty("PI_FABRIC_LANDLOCK_TEST");
+      expect((options as childProcess.ExecFileOptions).env?.PATH).toBe("/usr/bin:/bin");
     }
     for (const callback of callbacks) callback(null, "", "");
     expect(journal.meshJournalMirrorFailures()).toBe(0);

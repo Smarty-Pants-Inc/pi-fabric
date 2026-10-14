@@ -1335,7 +1335,9 @@ export class FabricControlPlane {
     // A spent claim may outlive its compacted input; keep custody but reconcile it on cadence.
     const claimDeadlines = [...this.#sharedClaims.values()].map((deadline) =>
       deadline > now ? deadline : now + LEGACY_SEEN_CLEANUP_MS);
-    const expiresAt = Math.min(legacyDeadline, ...claimDeadlines);
+    // An overdue deadline must wait until cleanup can act, not spin through its throttle.
+    const expiresAt = Math.max(this.#seenCleanupAt + this.#ackTimeoutMs,
+      Math.min(legacyDeadline, ...claimDeadlines));
     if (!Number.isFinite(expiresAt)) return;
     this.#retryTimer = setTimeout(() => {
       this.#retryTimer = undefined;

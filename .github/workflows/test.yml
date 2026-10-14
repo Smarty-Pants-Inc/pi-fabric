@@ -83,6 +83,16 @@ jobs:
         env:
           FABRIC_NATIVE_CC_PINNED: ${{ runner.os == 'Linux' && '1' || '' }}
         run: bun run build
+      - name: Routed task-control and private-directory regressions
+        env:
+          XDG_STATE_HOME: ${{ github.workspace }}/.state
+          FABRIC_ROUTE_RESIDUAL_REQUIRED: '1'
+        shell: bash
+        run: |
+          mkdir -p "$XDG_STATE_HOME"
+          node -e 'const fs=require("node:fs"),os=require("node:os"),path=require("node:path"); const state=process.env.XDG_STATE_HOME; if(!state||!path.isAbsolute(state)||!fs.statSync(state).isDirectory()) throw Error("XDG_STATE_HOME must be an existing absolute directory"); const real=fs.realpathSync(state); for(const temp of [os.tmpdir(),process.env.TMPDIR].filter(Boolean).map(value=>path.resolve(value))) if(real===temp||real.startsWith(temp+path.sep)) throw Error("XDG_STATE_HOME must be outside temp roots");'
+          bunx vitest run tests/task-control-*.test.ts tests/model-route*.test.ts tests/run-directory-mode.test.ts --reporter=json --outputFile="$RUNNER_TEMP/route-test-results.json"
+          node scripts/assert-route-test-skips.mjs "$RUNNER_TEMP/route-test-results.json"
       # Pi installs packages without peer or dev dependencies; the agent and memory
       # workers run outside Pi's module aliases, so their imports must resolve there.
       - name: Package install smoke (no peers, as pi install)
@@ -190,6 +200,31 @@ jobs:
           path: ${{ runner.temp }}/fabric-artifact/
           if-no-files-found: error
           retention-days: 7
+
+  route-control-macos:
+    # macOS proves path layout, not Linux Landlock confinement.
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: package.json
+      - uses: oven-sh/setup-bun@v2
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      - name: Build
+        run: bun run build
+      - name: Routed task-control and private-directory regressions
+        env:
+          XDG_STATE_HOME: ${{ github.workspace }}/.state
+          FABRIC_ROUTE_RESIDUAL_REQUIRED: '1'
+        shell: bash
+        run: |
+          mkdir -p "$XDG_STATE_HOME"
+          node -e 'const fs=require("node:fs"),os=require("node:os"),path=require("node:path"); const state=process.env.XDG_STATE_HOME; if(!state||!path.isAbsolute(state)||!fs.statSync(state).isDirectory()) throw Error("XDG_STATE_HOME must be an existing absolute directory"); const real=fs.realpathSync(state); for(const temp of [os.tmpdir(),process.env.TMPDIR].filter(Boolean).map(value=>path.resolve(value))) if(real===temp||real.startsWith(temp+path.sep)) throw Error("XDG_STATE_HOME must be outside temp roots");'
+          bunx vitest run tests/task-control-*.test.ts tests/model-route*.test.ts tests/run-directory-mode.test.ts --reporter=json --outputFile="$RUNNER_TEMP/route-test-results.json"
+          node scripts/assert-route-test-skips.mjs "$RUNNER_TEMP/route-test-results.json"
 
   nats-state-conformance:
     # The StateBackend contract suites on a real nats-server (smarty-dev#7504 phase 2): JetStream with

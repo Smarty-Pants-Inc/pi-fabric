@@ -18,6 +18,13 @@ import { JevClient } from "../src/jev/client.js";
 import type { FabricMainAgentTarget } from "../src/main-agent.js";
 import type { FabricInvocationContext } from "../src/protocol.js";
 import type { FabricActorInfo, FabricActorMessage } from "../src/actors/types.js";
+import { routeControlFile } from "../src/worker/terminal-answer.js";
+
+const RECEIPT = "route-dispatch-receipt.json" as const;
+const centralReceipt = (run: string) => {
+  expect(fs.existsSync(path.join(run, RECEIPT)), `no in-run receipt in ${run}`).toBe(false);
+  return fs.existsSync(routeControlFile(run, RECEIPT));
+};
 
 const pin = { model: "test/sol", effort: "high" as const };
 const cheap = { model: "test/luna", effort: "medium" as const };
@@ -95,12 +102,12 @@ describe("resident LIVE custody and manual config rollback", () => {
     await state.activate(); await state.activate();
     expect(archive.mock.calls.filter(([, runId]) => runId === first.runId)).toHaveLength(3);
     const source = state.host.agents.runDirectory(first.runId!)!;
-    expect(fs.existsSync(path.join(source, "route-dispatch-receipt.json"))).toBe(true);
+    expect(centralReceipt(source)).toBe(true);
     expect((await state.activate()).text).toContain(cheap.model);
     expect(state.host.agents.runDirectory(first.runId!)).toBe(source);
     archive.mockRestore(); expect((await state.activate()).text).toContain(cheap.model);
     expect(state.host.agents.runDirectory(first.runId!)).toBeUndefined();
-    expect(fs.existsSync(path.join(state.actor.logDir!, first.runId!, "route-dispatch-receipt.json"))).toBe(true);
+    expect(centralReceipt(path.join(state.actor.logDir!, first.runId!))).toBe(true);
   }, 20000);
 
   it("keeps denied A archive custody through normal host close/restart and repairs before source collection", async () => {
@@ -119,9 +126,9 @@ describe("resident LIVE custody and manual config rollback", () => {
     expect(fs.existsSync(marker)).toBe(true);
     await state.activate(); // B succeeds; A's only receipt remains in its source.
     await state.host.close();
-    expect(fs.existsSync(path.join(source, "route-dispatch-receipt.json"))).toBe(true);
+    expect(centralReceipt(source)).toBe(true);
     expect(fs.existsSync(marker)).toBe(true);
-    expect(fs.existsSync(path.join(state.actor.logDir!, a.runId!, "route-dispatch-receipt.json"))).toBe(false);
+    expect(centralReceipt(path.join(state.actor.logDir!, a.runId!))).toBe(false);
     const restored = new ResidentHost(state.config, () => {}, { getAvailable: () => available });
     closers.push(() => restored.close()); await restored.start();
     expect(restored.agents.runDirectory(a.runId!)).toBeUndefined(); // No old live handle/map.
@@ -131,7 +138,7 @@ describe("resident LIVE custody and manual config rollback", () => {
     // #752 reviewed contract: docs/residency-runtime.md:64-69, 87-92 at 2f6838c3.
     // Once repair discharges archive custody, eligibility commits dormancy immediately.
     await vi.waitFor(() => expect(restored.actors.status(state.actor.id).status).toBe("dormant"));
-    expect(fs.existsSync(path.join(state.actor.logDir!, a.runId!, "route-dispatch-receipt.json"))).toBe(true);
+    expect(centralReceipt(path.join(state.actor.logDir!, a.runId!))).toBe(true);
     expect(fs.existsSync(source)).toBe(false);
     expect(rows().filter(row => row.type === "decision").at(-1)).toMatchObject({ mode: "live", reasonCode: "live-choice" });
   }, 20000);

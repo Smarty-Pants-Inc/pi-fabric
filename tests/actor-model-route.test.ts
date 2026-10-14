@@ -16,6 +16,7 @@ import type { FabricLifecyclePublishRequest } from "../src/lifecycle/types.js";
 import { MeshStore } from "../src/mesh/store.js";
 import { ResidentHost } from "../src/residency/host.js";
 import { RESIDENT_HOST_FORMAT, type ResidentHostConfig } from "../src/residency/protocol.js";
+import { routeControlFile } from "../src/worker/terminal-answer.js";
 
 const pin = { model: "test/sol", effort: "high" as const };
 const cheap = { model: "test/luna", effort: "medium" as const };
@@ -127,6 +128,7 @@ describe("actor status-groom shadow routing", () => {
         tokens: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0, cost: 0 },
       });
       expect(fs.existsSync(path.join(dir, "runs", decision.runId, "route-session.jsonl"))).toBe(false);
+      expect(fs.existsSync(routeControlFile(path.join(dir, "runs", decision.runId), "route-session.jsonl"))).toBe(false);
     }
     for (const decision of decisions) {
       const archive = path.join(dir, "actors", actor.id, "runs", decision.runId, "status.json");

@@ -4,15 +4,42 @@ import { syncDirectoryChain } from "../core/atomic-write.js";
 import type { FabricMeshConfig, FabricRetentionConfig } from "../config.js";
 import type { MeshStore } from "../mesh/store.js";
 import { pruneActorRunArchives, pruneActorSessionBackups } from "../storage/retention.js";
-import { closeDirectory, openPrivateDir, writeArchiveFile, type PrivateDirectory } from "../storage/private-dir.js";
+import { closeDirectory, openPrivateDir, privateDirTestHooks, writeArchiveFile, type PrivateDirectory } from "../storage/private-dir.js";
 import { MAX_STEER_BYTES, MAX_STEER_ENTRY_BYTES, terminalAdmissionFromEntry, terminalControlMatchesAdmission, terminalSenderMatches, type TerminalAdmission } from "../agents/terminal-notices.js";
-import { MAX_FINAL_ANSWER_BYTES, MAX_TASK_CONTROL_BYTES, MAX_TASK_CONTROL_ROWS, createArchiveTaskControlDirectory, isTaskControlDirectoryEntry, legacyTaskControlSibling, openTaskControlFile, readFinalAnswerReceipt, readTaskRunStatus, statDir, taskControlDirectory, withLegacyTaskControlDirectories, withTaskControlDirectory, withTaskControlReadDirectory, withTaskControlSubdirectory } from "../worker/terminal-answer.js";
+import { MAX_FINAL_ANSWER_BYTES, MAX_TASK_CONTROL_BYTES, MAX_TASK_CONTROL_ROWS, ROUTE_CONTROL_FILES, ROUTE_CONTROL_SUBDIR, createArchiveTaskControlDirectory, isTaskControlDirectoryEntry, legacyTaskControlSibling, openTaskControlFile, readFinalAnswerReceipt, readTaskRunStatus, routeControlFile, statDir, taskControlDirectory, withLegacyTaskControlDirectories, withTaskControlDirectory, withTaskControlReadDirectory, withTaskControlSubdirectory, withRouteControlDirectory, type RouteControlFile } from "../worker/terminal-answer.js";
 import type { FabricActorMessage } from "./types.js";
 
 const controlFiles = new Set(["steer.jsonl", "final-answer.json"]);
 /** Read-only sibling-v1 location; new controls live in the central namespace. */
 const legacyControlSibling = legacyTaskControlSibling;
 const controlDirectories = new Set(["terminal-controls", "terminal-notices"]);
+const routeControlNames: ReadonlySet<string> = new Set<string>(ROUTE_CONTROL_FILES);
+const ROUTE_RECEIPT: RouteControlFile = "route-dispatch-receipt.json";
+const ROUTE_SESSION: RouteControlFile = "route-session.jsonl";
+const ROUTE_PENDING: RouteControlFile = "pending-route-outcome.json";
+const openRunDirectory = (directory: string): number | undefined => (privateDirTestHooks.platform ?? process.platform) === "win32" ? undefined :
+  fs.openSync(directory, fs.constants.O_RDONLY | (fs.constants.O_DIRECTORY ?? 0) | (fs.constants.O_NOFOLLOW ?? 0));
+/** Bounded no-follow owned regular-file read, including growth after fstat. */
+const readBoundedControl = (file: string, max: number): Buffer => {
+  const fd = openTaskControlFile(file);
+  try {
+    if (fs.fstatSync(fd).size > max) throw new Error("Archive route control byte bound exceeded");
+    const buffer = Buffer.alloc(max + 1);
+    let length = 0;
+    while (length < buffer.length) {
+      const count = fs.readSync(fd, buffer, length, buffer.length - length, length);
+      if (!count) break;
+      length += count;
+    }
+    if (length > max) throw new Error("Archive route control byte bound exceeded");
+    return Buffer.from(buffer.subarray(0, length));
+  } finally { fs.closeSync(fd); }
+};
+const singleRow = (bytes: Buffer): unknown => {
+  const rows = bytes.toString("utf8").split("\n").filter(line => line.trim());
+  if (rows.length !== 1) throw new Error("Malformed route dispatch receipt");
+  return JSON.parse(rows[0]!);
+};
 /** Preserve bounded original bytes, never copy the inode-bound legacy grant.
  * Eligible legacy evidence is promoted into the protected archive namespace.
  * Journals stay legacy-first; only matching delivered overlays replace old debt.
@@ -52,8 +79,10 @@ const archiveControls = (runDirectory: string): Map<string, Buffer> | undefined 
       if (length > max || (bytes += length) > MAX_FINAL_ANSWER_BYTES + MAX_STEER_BYTES * 5) throw new Error("Archive control byte bound exceeded");
       // Count both copies BEFORE normalization: collapsing whitespace or old
       // debt must not turn retention's oversized source into new authority.
-      if (path.dirname(relative) !== "." && (artifactBytes += length) > MAX_STEER_BYTES * 4) throw new Error("Archive terminal artifact byte bound exceeded");
+      const route = path.dirname(relative) === ROUTE_CONTROL_SUBDIR;
+      if (path.dirname(relative) !== "." && !route && (artifactBytes += length) > MAX_STEER_BYTES * 4) throw new Error("Archive terminal artifact byte bound exceeded");
       const content = Buffer.from(buffer.subarray(0, length)), existing = result.get(relative);
+      if (existing && route) throw new Error(`Conflicting archive route control ${relative}`);
       if (existing) {
         if (relative === "steer.jsonl") {
           if (existing.length && existing.at(-1) !== 10 || content.length && content.at(-1) !== 10 || existing.length + content.length > MAX_STEER_BYTES) {
@@ -79,6 +108,25 @@ const archiveControls = (runDirectory: string): Map<string, Buffer> | undefined 
         if (mode === "central" && entry.name === ".legacy-read.json" && entry.isFile()) continue;
         if (mode === "central" && snapshotAllowed && entry.name === ".legacy-snapshot" && entry.isDirectory()) continue;
         if (controlFiles.has(entry.name)) { read(directory, entry.name); continue; }
+        if (mode === "central" && entry.name === ROUTE_CONTROL_SUBDIR) {
+          withTaskControlSubdirectory(directory, entry.name, (child, childFd) => {
+            const held = statDir(childFd, child);
+            if (!held.isDirectory() || process.platform !== "win32" && (held.mode & 0o077n) !== 0n) throw new Error("Unsafe archive route control directory");
+            const children = fs.opendirSync(child, { bufferSize: 8 });
+            try {
+              let known = 0;
+              for (;;) {
+                const item = children.readSync();
+                if (!item) break;
+                if (++known > routeControlNames.size || !routeControlNames.has(item.name)) throw new Error(`Unknown archive route control artifact ${item.name}`);
+                // Validate the live session inode, but never read its unbounded log.
+                if (item.name === ROUTE_SESSION) { fs.closeSync(openTaskControlFile(path.join(child, item.name))); continue; }
+                read(child, item.name, path.join(entry.name, item.name));
+              }
+            } finally { children.closeSync(); }
+          });
+          continue;
+        }
         if (controlDirectories.has(entry.name)) {
           withTaskControlSubdirectory(directory, entry.name, child => {
             const children = fs.opendirSync(child, { bufferSize: 32 });
@@ -101,9 +149,10 @@ const archiveControls = (runDirectory: string): Map<string, Buffer> | undefined 
   // Hold the run root for the whole read. A protected snapshot layer is a
   // different inode by design: in-run is proven by its kernel-validated origin
   // matching this held run, never by layer FD identity or by reopening raw controls.
-  const runFd = fs.openSync(runDirectory, fs.constants.O_RDONLY | (fs.constants.O_DIRECTORY ?? 0) | (fs.constants.O_NOFOLLOW ?? 0));
+  // Windows has no directory fd: statDir checks lstat + realpath instead (identity, not confinement).
+  const runFd = openRunDirectory(runDirectory);
   try {
-  const run = fs.fstatSync(runFd, { bigint: true }), named = fs.lstatSync(runDirectory, { bigint: true });
+  const run = statDir(runFd, runDirectory), named = fs.lstatSync(runDirectory, { bigint: true });
   if (!run.isDirectory() || named.isSymbolicLink() || named.dev !== run.dev || named.ino !== run.ino) throw new Error("Archive run directory changed while held");
   withTaskControlReadDirectory(runDirectory, (selected, selectedFd) => {
     // Protected-only: the raw run (or any non-central selection) is never authority.
@@ -125,7 +174,7 @@ const archiveControls = (runDirectory: string): Map<string, Buffer> | undefined 
     if (rawSibling && !siblingLayer) throw new Error("Unproven legacy archive control sibling");
     scan(selected, "central", snapshot);
   });
-  } finally { fs.closeSync(runFd); }
+  } finally { if (runFd !== undefined) fs.closeSync(runFd); }
   if (overlays.size || result.has("steer.jsonl")) {
     const admissions = new Map<string, TerminalAdmission>(), journal = result.get("steer.jsonl")?.toString("utf8") ?? "";
     if (journal && !journal.endsWith("\n")) throw new Error("Incomplete archive steering journal");
@@ -174,6 +223,30 @@ const archiveControls = (runDirectory: string): Map<string, Buffer> | undefined 
     }
   }
   return result;
+};
+
+/** Preserve central or legacy read-only route custody, always for a central destination. */
+const archiveRouteControls = async (run: string, runId: string, controls: Map<string, Buffer> | undefined): Promise<Map<string, Buffer> | undefined> => {
+  let routed = controls;
+  const key = (name: RouteControlFile): string => path.join(ROUTE_CONTROL_SUBDIR, name);
+  const select = (name: RouteControlFile): { file: string; bytes: Buffer } | undefined => {
+    const file = routeControlFile(run, name, { legacyReadOnly: true });
+    if (!fs.lstatSync(file, { throwIfNoEntry: false })) return;
+    if (path.dirname(file) !== run) return { file, bytes: controls?.get(key(name)) ?? (() => { throw new Error(`Unproven central route control ${name}`); })() };
+    return { file, bytes: readBoundedControl(file, MAX_TASK_CONTROL_BYTES) };
+  };
+  const receipt = select(ROUTE_RECEIPT);
+  if (receipt) {
+    const { readRouteDispatchReceipt } = await import("../agents/model-route.js");
+    const source = readRouteDispatchReceipt(receipt.file);
+    if (!source || source.runId !== runId) throw new Error("Mismatched route dispatch receipt");
+    if (JSON.stringify(source) !== JSON.stringify(singleRow(receipt.bytes))) throw new Error("Route dispatch receipt changed while archived");
+    (routed ??= new Map()).set(key(ROUTE_RECEIPT), Buffer.from(JSON.stringify(source)));
+  }
+  // Pending is unsettled ledger debt, including legacy nested runs.
+  const pending = select(ROUTE_PENDING);
+  if (pending) (routed ??= new Map()).set(key(ROUTE_PENDING), pending.bytes);
+  return routed;
 };
 
 /** Validate every nested pair before publication. The copy excludes ALL source
@@ -240,6 +313,7 @@ const writeArchivedControls = (dest: string, anchor: string, controls: Map<strin
           if (!writeArchiveFile({ path: at, fd: parentFd, close() {} }, path.basename(relative), { bytes }, true)) throw new Error(`Unsafe archive control ${relative}`);
         };
         if (parent === ".") write(directory, fd);
+        else if (parent === ROUTE_CONTROL_SUBDIR) withRouteControlDirectory(dest, write);
         else {
           try { fs.mkdirSync(path.join(directory, parent), { mode: 0o700 }); fs.chmodSync(path.join(directory, parent), 0o700); }
           catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
@@ -359,22 +433,12 @@ export class ActorLogStore {
     }
     try {
       runDirectory = path.resolve(runDirectory);
-      const controls = archiveControls(runDirectory), nestedControls = archiveNestedControls(runDirectory);
-      const receipt = path.join(runDirectory, "route-dispatch-receipt.json");
-      if (fs.existsSync(receipt)) {
-        const { readRouteDispatchReceipt } = await import("../agents/model-route.js");
-        const source = readRouteDispatchReceipt(receipt);
-        if (!source || source.runId !== runId) throw new Error("Mismatched route dispatch receipt");
-        // Durable archive confirmation precedes source cleanup (F2 custody): the file and the held directory are
-        // fsynced through their fds, then the chain above by path, which must still name the held directory.
-        if (!writeArchiveFile(held, "route-dispatch-receipt.json", { bytes: Buffer.from(JSON.stringify(source)) }, true)) {
-          throw new Error(`Archive entry ${path.join(dest, "route-dispatch-receipt.json")} exists and is not our regular file`);
-        }
-        assertArchiveRunIdentity(dest, held);
-        syncDirectoryChain(dest);
+      const controls = await archiveRouteControls(runDirectory, runId, archiveControls(runDirectory));
+      const nestedControls = archiveNestedControls(runDirectory);
+      for (const [source, childControls] of nestedControls) {
+        nestedControls.set(source, await archiveRouteControls(source, path.basename(source), childControls));
       }
-      // The source was validated before publication. Never transport
-      // .legacy-read.json: its source inode is not the archive's.
+      // Never transport .legacy-read.json: its source inode is not the archive's.
       assertArchiveRunIdentity(dest, held);
       if (controls) writeArchivedControls(dest, anchor, controls, held);
       assertArchiveRunIdentity(dest, held);
@@ -399,7 +463,7 @@ export class ActorLogStore {
           for (const source of nestedControls.keys()) {
             // Source trees only contain OLD sibling-v1 controls; central ones are outside the tree.
             excluded.add(legacyControlSibling(source));
-            for (const name of [...controlFiles, ...controlDirectories]) excluded.add(path.join(source, name));
+            for (const name of [...controlFiles, ...controlDirectories, ...ROUTE_CONTROL_FILES]) excluded.add(path.join(source, name));
           }
           let unsafeArtifact = false;
           try {

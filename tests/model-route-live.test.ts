@@ -9,6 +9,7 @@ import { AgentManager } from "../src/agents/manager.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 import { DEFAULT_FABRIC_CONFIG, loadFabricConfig, normalizeFabricConfig } from "../src/config.js";
 import type { JevResponse } from "../src/jev/types.js";
+import { createHostTaskRun, routeControlFile } from "../src/worker/terminal-answer.js";
 
 const pin = { model: "test/sol", effort: "high" as const };
 const candidate = { model: "test/luna", effort: "max" as const };
@@ -29,8 +30,13 @@ const rows = () => fs.readFileSync(ledger(), "utf8").trim().split("\n").map(line
 const manager = () => { const m = new AgentManager(cwd, { ...DEFAULT_FABRIC_CONFIG.agents, retainRuns: true }, {
   workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(root, `runs-${managers.length}`), preparePiModel: async model => model,
 }); managers.push(m); return m; };
-const dispatch = async () => { const decision = await prepareModelRoute(input); return { decision,
-  dispatch: prepareRouteDispatch(decision, undefined, path.join(root, decision.decisionId), decision.decisionId) }; };
+/** Direct-call fixture: host allocation uses isolated XDG_STATE_HOME outside temp. */
+const hostRun = (name: string) => { const run = path.join(root, name); createHostTaskRun(run); return run; };
+const routeFilesInRun = (run: string) => fs.readdirSync(run).filter(name => /route-(dispatch-receipt|session)|pending-route-outcome/.test(name));
+const dispatch = async () => { const decision = await prepareModelRoute(input); const run = hostRun(decision.decisionId);
+  const prepared = prepareRouteDispatch(decision, undefined, run, decision.decisionId);
+  expect(routeFilesInRun(run), "no route control in the run directory").toEqual([]);
+  return { decision, run, dispatch: prepared }; };
 
 // This is a fresh process with no module/cache state: the host journal alone restores admission safety.
 const restartedSwitch = (blocked = true) => {
@@ -238,13 +244,16 @@ describe("live model routing", () => {
     const journal = path.join(path.dirname(state()), "model-routing-pending.jsonl");
     fs.mkdirSync(path.dirname(journal), { recursive: true, mode: 0o700 });
     fs.writeFileSync(journal, "", { mode: 0o600 });
+    const run = hostRun(decision.decisionId); // Allocate before the admission fsync fault.
     const sync = fs.fsyncSync;
     const fault = vi.spyOn(fs, "fsyncSync").mockImplementation(fd => {
       if (fs.fstatSync(fd).isFile() && fs.fstatSync(fd).size > 0) throw new Error("EIO admission fsync");
       return sync(fd);
     });
-    prepareRouteDispatch(decision, undefined, path.join(root, decision.decisionId), decision.decisionId, { decisionRecorded: true });
+    prepareRouteDispatch(decision, undefined, run, decision.decisionId, { decisionRecorded: true });
     expect(decision).toMatchObject({ ...pin, mode: "shadow", reasonCode: "record-failed" });
+    expect(routeFilesInRun(run)).toEqual([]);
+    expect(fs.existsSync(routeControlFile(run, "route-dispatch-receipt.json")), "demoted before the receipt").toBe(false);
     fault.mockRestore();
     expect(JSON.parse(fs.readFileSync(journal, "utf8").trim())).toMatchObject({ type: "admission", decisionId: decision.decisionId });
   });

@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentManager, managerRunTestHooks } from "../src/agents/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
-import { ensureTaskControlRoot } from "../src/worker/terminal-answer.js";
+import { ensureTaskControlRoot, routeControlFile } from "../src/worker/terminal-answer.js";
 
 // DELTA-SEC-02 residual: a parent with a writable grant swaps the freshly allocated run directory C
 // (symlink to a victim, or a real replacement directory) at the post-allocation yield or during model
@@ -14,7 +14,8 @@ import { ensureTaskControlRoot } from "../src/worker/terminal-answer.js";
 const isolatedState = process.env.XDG_STATE_HOME;
 const insideTemp = (value: string) => [os.tmpdir(), process.env.TMPDIR].filter(Boolean)
   .some(temp => path.resolve(value) === path.resolve(temp!) || path.resolve(value).startsWith(path.resolve(temp!) + path.sep));
-const usable = process.platform !== "win32" && !!isolatedState && path.isAbsolute(isolatedState) && !insideTemp(isolatedState);
+// Linux uses a Landlock-confined swapper; macOS/Windows prove path layout only.
+const usable = !!isolatedState && path.isAbsolute(isolatedState) && !insideTemp(isolatedState);
 const managers: AgentManager[] = [];
 afterEach(async () => {
   delete managerRunTestHooks.afterRunAllocation;
@@ -30,7 +31,18 @@ const routed = (ledger: string) => {
     routeRecord: { ledger, decisionRecorded: true },
   } as Record<string, unknown>;
 };
-const RECEIPT = "route-dispatch-receipt.json", PENDING = "pending-route-outcome.json";
+const RECEIPT = "route-dispatch-receipt.json", PENDING = "pending-route-outcome.json", SESSION = "route-session.jsonl";
+const ROUTE_NAMES = [RECEIPT, PENDING, SESSION];
+const routeFilesIn = (root: string): string[] => {
+  let stat: fs.Stats;
+  try { stat = fs.lstatSync(root); } catch { return []; }
+  if (!stat.isDirectory() || stat.isSymbolicLink()) return [];
+  return fs.readdirSync(root, { withFileTypes: true }).flatMap(entry => {
+    const full = path.join(root, entry.name);
+    return [...(ROUTE_NAMES.some(name => entry.name.includes(name)) ? [full] : []), ...(entry.isDirectory() && !entry.isSymbolicLink() ? routeFilesIn(full) : [])];
+  });
+};
+const windowsHost = process.platform === "win32";
 // Parent mutation runs in an ACTUAL Landlock-confined process granted only root R; the victim is a sibling OUTSIDE R.
 // Fixtures are private and retained; nothing is deleted.
 const LANDLOCK = path.resolve("dist/native/fabric-landlock");
@@ -63,7 +75,7 @@ type Swap = "symlink" | "replacement";
 const swap = (f: Fixture, run: string, kind: Swap): void => {
   if (!confinedParent) {
     fs.renameSync(run, `${run}.moved`);
-    if (kind === "symlink") fs.symlinkSync(f.victim, run, "dir");
+    if (kind === "symlink") fs.symlinkSync(f.victim, run, windowsHost ? "junction" : "dir");
     else fs.mkdirSync(run, { mode: 0o700 });
     return;
   }
@@ -82,31 +94,33 @@ const swap = (f: Fixture, run: string, kind: Swap): void => {
   expect(["EACCES", "EPERM", "EROFS"]).toContain(evidence.escape);
 };
 const managerFor = (runRoot: string, preparePiModel: (model: string | undefined) => Promise<string | undefined> = async model => model) => {
-  // Real nested-manager path: the run root R/nested is INHERITED via PI_FABRIC_RUN_ROOT, not a trusted host option.
-  vi.stubEnv("PI_FABRIC_RUN_ROOT", runRoot);
-  const manager = new AgentManager(process.cwd(), agents, { workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), preparePiModel, fullCodeMode: false });
+  // Windows refuses inherited nested roots; use an explicit trusted host root there.
+  if (windowsHost) vi.stubEnv("PI_FABRIC_RUN_ROOT", undefined); else vi.stubEnv("PI_FABRIC_RUN_ROOT", runRoot);
+  const manager = new AgentManager(process.cwd(), agents, { workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), preparePiModel, fullCodeMode: false,
+    ...(windowsHost ? { runRoot } : {}) });
   managers.push(manager);
   return manager;
 };
 const ledgerText = (ledger: string) => fs.existsSync(ledger) ? fs.readFileSync(ledger, "utf8") : "";
 
-describe.skipIf(!usable)("DELTA-SEC-02: route writes stay bound to the original allocated run directory", () => {
+describe.skipIf(!usable)(`DELTA-SEC-02: central route writes [${confinedParent ? "Linux Landlock-confined parent" : "path-layout only; unconfined swapper"}]`, () => {
   for (const kind of ["symlink", "replacement"] as const) {
     it(`refuses the route receipt (typed, nothing written) when C becomes a ${kind} at the post-allocation yield`, async () => {
       ensureTaskControlRoot();
       const f = fixture(), { victim, ledger, runRoot, snapshot } = f;
       const before = snapshot();
-      let run: string | undefined;
-      managerRunTestHooks.afterRunAllocation = async (directory) => { run = directory; await Promise.resolve(); swap(f, directory, kind); };
+      let run: string | undefined, central: string | undefined;
+      managerRunTestHooks.afterRunAllocation = async (directory) => { run = directory; central = routeControlFile(directory, RECEIPT); await Promise.resolve(); swap(f, directory, kind); };
       const launch = vi.spyOn(ProcessTransport.prototype, "launch");
       const manager = managerFor(runRoot);
       await expect(manager.run({ task: "must not launch", transport: "process", ...routed(ledger) } as never))
         .rejects.toMatchObject({ code: "FABRIC_RUN_IDENTITY_REFUSED" });
       expect(launch).not.toHaveBeenCalled();
       expect(snapshot()).toEqual(before);
-      expect(fs.existsSync(path.join(victim, RECEIPT))).toBe(false);
+      expect(routeFilesIn(victim)).toEqual([]);
       expect(fs.readdirSync(run!).filter(name => name !== "marker")).toEqual([]);
-      expect(fs.existsSync(path.join(`${run}.moved`, RECEIPT))).toBe(false);
+      expect(routeFilesIn(`${run}.moved`)).toEqual([]);
+      expect(fs.existsSync(central!)).toBe(false);
       expect(ledgerText(ledger)).not.toContain("\"outcome\"");
     });
 
@@ -114,8 +128,8 @@ describe.skipIf(!usable)("DELTA-SEC-02: route writes stay bound to the original 
       ensureTaskControlRoot();
       const f = fixture(), { victim, ledger, runRoot, snapshot } = f;
       const before = snapshot();
-      let run: string | undefined;
-      managerRunTestHooks.afterRunAllocation = (directory) => { run = directory; };
+      let run: string | undefined, central: string | undefined, centralPending: string | undefined;
+      managerRunTestHooks.afterRunAllocation = (directory) => { run = directory; central = routeControlFile(directory, RECEIPT); centralPending = routeControlFile(directory, PENDING); };
       const launch = vi.spyOn(ProcessTransport.prototype, "launch");
       const manager = managerFor(runRoot, async () => {
         await Promise.resolve();
@@ -126,11 +140,11 @@ describe.skipIf(!usable)("DELTA-SEC-02: route writes stay bound to the original 
         .rejects.toMatchObject({ code: "FABRIC_RUN_IDENTITY_REFUSED" });
       expect(launch).not.toHaveBeenCalled();
       expect(snapshot()).toEqual(before);
-      for (const name of [RECEIPT, PENDING]) expect(fs.existsSync(path.join(victim, name))).toBe(false);
+      expect(routeFilesIn(victim)).toEqual([]);
       if (kind === "replacement") expect(fs.readdirSync(run!)).toEqual([]);
-      // The receipt landed in the ORIGINAL allocation before the swap; no outcome or pending record anywhere.
-      expect(fs.existsSync(path.join(`${run}.moved`, RECEIPT))).toBe(true);
-      expect(fs.existsSync(path.join(`${run}.moved`, PENDING))).toBe(false);
+      expect(routeFilesIn(`${run}.moved`)).toEqual([]);
+      expect(fs.existsSync(central!)).toBe(true);
+      expect(fs.existsSync(centralPending!)).toBe(false);
       expect(ledgerText(ledger)).not.toContain("\"outcome\"");
     });
   }
@@ -156,8 +170,8 @@ describe.skipIf(!usable)("DELTA-SEC-02: route writes stay bound to the original 
       ensureTaskControlRoot();
       const f = fixture(), { victim, ledger, runRoot, snapshot } = f;
       const before = snapshot();
-      let run: string | undefined;
-      managerRunTestHooks.afterRunAllocation = (directory) => { run = directory; };
+      let run: string | undefined, central: string | undefined, centralPending: string | undefined;
+      managerRunTestHooks.afterRunAllocation = (directory) => { run = directory; central = routeControlFile(directory, RECEIPT); centralPending = routeControlFile(directory, PENDING); };
       const launch = vi.spyOn(ProcessTransport.prototype, "launch");
       const open = ledgerFault(ledger, () => swap(f, run!, kind));
       const manager = managerFor(runRoot, async () => { throw new Error("model preparation failed"); });
@@ -167,10 +181,11 @@ describe.skipIf(!usable)("DELTA-SEC-02: route writes stay bound to the original 
       expect(launch).not.toHaveBeenCalled();
       expect(fs.existsSync(`${run}.moved`)).toBe(true); // the fault fired and swapped
       expect(snapshot()).toEqual(before);
-      for (const name of [RECEIPT, PENDING]) expect(fs.existsSync(path.join(victim, name))).toBe(false);
+      expect(routeFilesIn(victim)).toEqual([]);
       if (kind === "replacement") expect(fs.readdirSync(run!)).toEqual([]);
-      expect(fs.existsSync(path.join(`${run}.moved`, RECEIPT))).toBe(true);
-      expect(fs.existsSync(path.join(`${run}.moved`, PENDING))).toBe(false);
+      expect(routeFilesIn(`${run}.moved`)).toEqual([]);
+      expect(fs.existsSync(central!)).toBe(true);
+      expect(fs.existsSync(centralPending!)).toBe(false);
       expect(ledgerText(ledger)).not.toContain("\"outcome\"");
     });
   }
@@ -189,12 +204,13 @@ describe.skipIf(!usable)("DELTA-SEC-02: route writes stay bound to the original 
     expect((error as { code?: string }).code).not.toBe("FABRIC_RUN_IDENTITY_REFUSED");
     expect(faulted).toBe(true);
     expect(fs.existsSync(`${run}.moved`)).toBe(false);
-    expect(fs.existsSync(path.join(run!, PENDING))).toBe(false);
-    expect(fs.existsSync(path.join(run!, RECEIPT))).toBe(true);
+    expect(fs.existsSync(routeControlFile(run!, PENDING))).toBe(false);
+    expect(fs.existsSync(routeControlFile(run!, RECEIPT))).toBe(true);
+    expect(routeFilesIn(run!)).toEqual([]);
     expect(ledgerText(ledger)).toMatch(/\"outcome\"/);
   });
 
-  it("permits a normal routed spawn: receipt and session land in the allocated run directory", async () => {
+  it("permits a normal routed spawn: receipt and session land only in central route/",  async () => {
     ensureTaskControlRoot();
     const { ledger, runRoot } = fixture();
     let run: string | undefined;
@@ -203,14 +219,15 @@ describe.skipIf(!usable)("DELTA-SEC-02: route writes stay bound to the original 
     const result = await manager.run({ task: "routed spawn", transport: "process", ...routed(ledger) } as never);
     expect(result.status).toBe("completed");
     expect(run).toBe(path.join(runRoot, result.id));
-    const receipt = JSON.parse(fs.readFileSync(path.join(run!, RECEIPT), "utf8")) as { runId: string };
+    const receipt = JSON.parse(fs.readFileSync(routeControlFile(run!, RECEIPT), "utf8")) as { runId: string };
     expect(receipt.runId).toBe(result.id);
-    // Ordinary bindSession path: the session header was published atomically inside the pinned C.
-    const session = JSON.parse(fs.readFileSync(path.join(run!, "route-session.jsonl"), "utf8").split("\n")[0]!) as { type: string; id: string; cwd: string };
+    const sessionFile = routeControlFile(run!, SESSION);
+    const session = JSON.parse(fs.readFileSync(sessionFile, "utf8").split("\n")[0]!) as { type: string; id: string; cwd: string };
     expect(session).toMatchObject({ type: "session", id: result.id });
     expect(typeof session.cwd).toBe("string");
-    expect((fs.statSync(path.join(run!, "route-session.jsonl")).mode & 0o777)).toBe(0o600);
-    expect(fs.readdirSync(run!).some(name => name.endsWith(".tmp"))).toBe(false);
+    if (!windowsHost) expect((fs.statSync(sessionFile).mode & 0o777)).toBe(0o600);
+    expect(fs.readdirSync(path.dirname(sessionFile)).some(name => name.endsWith(".tmp"))).toBe(false);
+    expect(routeFilesIn(run!)).toEqual([]);
     expect(ledgerText(ledger)).toContain("\"outcome\"");
   });
 
@@ -221,9 +238,10 @@ describe.skipIf(!usable)("DELTA-SEC-02: route writes stay bound to the original 
     managerRunTestHooks.afterRunAllocation = (directory) => { run = directory; };
     const manager = managerFor(runRoot, async () => { throw new Error("model preparation failed"); });
     await expect(manager.run({ task: "prep fails", transport: "process", ...routed(ledger) } as never)).rejects.toThrow(/model preparation failed/);
-    // The valid outcome committed to the ledger; the receipt is in the original C and no pending fallback remains.
-    expect(fs.existsSync(path.join(run!, RECEIPT))).toBe(true);
-    expect(fs.existsSync(path.join(run!, PENDING))).toBe(false);
+    // The valid outcome committed; only the central receipt remains.
+    expect(fs.existsSync(routeControlFile(run!, RECEIPT))).toBe(true);
+    expect(fs.existsSync(routeControlFile(run!, PENDING))).toBe(false);
+    expect(routeFilesIn(run!)).toEqual([]);
     expect(ledgerText(ledger)).toMatch(/"outcome".*"status":"failed"|"status":"failed".*"outcome"/);
   });
 
@@ -234,5 +252,20 @@ describe.skipIf(!usable)("DELTA-SEC-02: route writes stay bound to the original 
     const result = await manager.run({ task: "plain spawn", transport: "process" });
     expect(result.status).toBe("completed");
     expect(fs.existsSync(path.join(runRoot, result.id, RECEIPT))).toBe(false);
+    expect(fs.existsSync(routeControlFile(path.join(runRoot, result.id), RECEIPT))).toBe(false);
+  });
+
+  if (windowsHost) it("win32 inherited PI_FABRIC_RUN_ROOT stays refused for routed dispatch", async () => {
+    ensureTaskControlRoot();
+    const { ledger, runRoot } = fixture();
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    vi.stubEnv("PI_FABRIC_RUN_ROOT", runRoot);
+    await expect((async () => {
+      const manager = new AgentManager(process.cwd(), agents, { workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), fullCodeMode: false });
+      managers.push(manager);
+      return manager.run({ task: "must not launch", transport: "process", ...routed(ledger) } as never);
+    })()).rejects.toThrow();
+    expect(launch).not.toHaveBeenCalled();
+    expect(routeFilesIn(runRoot)).toEqual([]);
   });
 });

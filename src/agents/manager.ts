@@ -18,14 +18,14 @@ import os from "node:os";
 
 import { fabricDataRoot } from "../storage/temp-root.js";
 import path from "node:path";
-import { fdBase, mkdirPrivate } from "../storage/private-dir.js";
+import { mkdirPrivate, privateDirTestHooks } from "../storage/private-dir.js";
 import type { RunDirectoryPin } from "./model-route.js";
 import { assertTaskRunPathUnaliased, assertTaskRunRootAdmissible } from "../worker/task-run-path.js";
 
 /** DELTA-SEC-02: errors from the run-path alias guard; never followed by a run-path outcome write. */
 const unsafeRunPathErrors = new WeakSet<object>();
 const isUnsafeRunPathError = (error: unknown): boolean => typeof error === "object" && error !== null &&
-  (unsafeRunPathErrors.has(error) || ["FABRIC_RUN_IDENTITY_REFUSED", "FABRIC_CONTROL_PUBLISH_UNSUPPORTED_PLATFORM"].includes(String((error as { code?: unknown }).code)));
+  (unsafeRunPathErrors.has(error) || String((error as { code?: unknown }).code) === "FABRIC_RUN_IDENTITY_REFUSED");
 const assertRunPathSafe = (runDirectory: string, inheritedRoot: boolean): void => {
   const makeError = (message: string): Error => {
     const error = new FabricTaskControlDirectoryError(message); // same error type as before (imported below; hoisted)
@@ -42,39 +42,29 @@ const runIdentityRefusal = (message: string): Error => {
   unsafeRunPathErrors.add(error);
   return error;
 };
-const unsupportedControlPublication = (run: string): Error => {
-  const error = Object.assign(new FabricTaskControlDirectoryError(
-    `FABRIC_CONTROL_PUBLISH_UNSUPPORTED_PLATFORM: routed model dispatch is unavailable on ${managerRunTestHooks.platform ?? process.platform} until smarty-dev#12444 lands; pass an explicit model (for example model: "cliproxyapi/gpt-6.1-sol") instead of model: "auto" (${run})`,
-  ), { code: "FABRIC_CONTROL_PUBLISH_UNSUPPORTED_PLATFORM" });
-  unsafeRunPathErrors.add(error);
-  return error;
-};
 const NOFOLLOW_DIRECTORY = fs.constants.O_RDONLY | (fs.constants.O_DIRECTORY ?? 0) | (fs.constants.O_NOFOLLOW ?? 0);
 /**
  * DELTA-SEC-02: bind the freshly allocated run directory's dev+ino ONCE, right after createHostTaskRun and before any
  * yield. The bound identity must equal both the no-follow opened directory and the central v2 binding the exclusive
- * allocation published, so a replacement cannot be recaptured. `use` reopens no-follow and rechecks dev+ino immediately
- * before each write; publication requires a traversable held fd (`/proc/self/fd/N` or equivalent). Platforms without
- * one refuse routed control publication before opening a temp file; plain non-routed task spawns are unaffected.
+ * allocation published, so a replacement cannot be recaptured. `use` is an identity CHECK only: it reopens no-follow
+ * (Windows: the checked no-fd path) and rechecks dev+ino before running its operation. It is never a write channel;
+ * route controls live in the central `route/` namespace (smarty-dev#12444).
  */
 const pinRunDirectory = (runDirectory: string): RunDirectoryPin => {
   const run = path.resolve(runDirectory);
-  const platform = managerRunTestHooks.platform ?? process.platform;
-  const base = platform === "win32"
-    ? undefined
-    : managerRunTestHooks.resolveFdBase
-      ? managerRunTestHooks.resolveFdBase()
-      : fdBase();
-  if (base === undefined) throw unsupportedControlPublication(run);
-  const open = (): { fd: number; dev: bigint; ino: bigint } => {
-    let fd: number;
-    try { fd = fs.openSync(run, NOFOLLOW_DIRECTORY); }
+  const open = (): { fd: number | undefined; dev: bigint; ino: bigint } => {
+    // Windows cannot open a directory: use the checked no-follow path (lstat + realpath equality), no fd.
+    const noFd = (privateDirTestHooks.platform ?? process.platform) === "win32";
+    let fd: number | undefined;
+    try { if (!noFd) fd = fs.openSync(run, NOFOLLOW_DIRECTORY); }
     catch (error) { throw runIdentityRefusal(`Run directory ${run} cannot be opened without following links (${(error as NodeJS.ErrnoException).code}); refusing route write`); }
     try {
-      const stat = fs.fstatSync(fd, { bigint: true });
+      let stat: fs.BigIntStats;
+      try { stat = statDir(fd, run); }
+      catch (error) { throw runIdentityRefusal(`Run directory ${run} cannot be checked without following links (${(error as NodeJS.ErrnoException).code ?? (error as Error).message}); refusing route write`); }
       if (!stat.isDirectory()) throw runIdentityRefusal(`Run directory ${run} is not a directory; refusing route write`);
       return { fd, dev: stat.dev, ino: stat.ino };
-    } catch (error) { fs.closeSync(fd); throw error; }
+    } catch (error) { if (fd !== undefined) fs.closeSync(fd); throw error; }
   };
   const first = open();
   let bound: { dev: bigint; ino: bigint };
@@ -84,25 +74,30 @@ const pinRunDirectory = (runDirectory: string): RunDirectoryPin => {
     const named = fs.lstatSync(run, { bigint: true });
     if (named.dev !== first.dev || named.ino !== first.ino) throw runIdentityRefusal(`Run directory ${run} changed while its allocation identity was bound`);
     bound = { dev: first.dev, ino: first.ino };
+  } catch (error) {
+    if (isUnsafeRunPathError(error)) throw error;
+    throw runIdentityRefusal(`Run directory ${run} allocation binding failed validation; refusing route write (${(error as Error)?.message ?? String(error)})`);
   } finally { if (first.fd !== undefined) fs.closeSync(first.fd); }
   return {
     run,
-    use<T>(operation: (directory: string, fd: number | undefined) => T): T {
+    use<T>(operation: () => T): T {
       const current = open();
       try {
         if (current.dev !== bound.dev || current.ino !== bound.ino) throw runIdentityRefusal(`Run directory ${run} is no longer the allocated directory; refusing route write (nothing written)`);
-        return operation(`${base}/${current.fd}`, current.fd);
-      } finally { fs.closeSync(current.fd); }
+        // While the checked run is still held: the central v2 binding must still name this lifetime.
+        try { withLegacyTaskControlDirectories(run, () => undefined); }
+        catch (error) { throw runIdentityRefusal(`Run directory ${run} central task-control binding failed validation; refusing route write (${(error as Error)?.message ?? String(error)})`); }
+      } finally { if (current.fd !== undefined) fs.closeSync(current.fd); }
+      return operation();
     },
   };
 };
-/** Test seam only: awaited (when set) at the post-allocation yield, before route-module import and receipt write. */
+/** Test seams only; each is awaited only when set (no production yield when absent). */
 export const managerRunTestHooks: {
+  /** At the post-allocation yield, before route-module import and receipt write. */
   afterRunAllocation?: (runDirectory: string) => void | Promise<void>;
-  /** Test-only platform override for the fail-closed no-fd publication boundary. */
-  platform?: NodeJS.Platform;
-  /** Test-only override for the held-directory traversal capability used by routed publication. */
-  resolveFdBase?: () => string | undefined;
+  /** After the late run-path guard and identity recheck, BEFORE the first pathname write in the run (F1/F0 residual tests). */
+  afterLateRunCheck?: (runDirectory: string) => void | Promise<void>;
 } = {};
 
 import { fileURLToPath } from "node:url";
@@ -187,7 +182,7 @@ import type {
 import { FOLLOW_UP_RUNNING_TASK_MESSAGE, type AgentAdmissionAlarm, type AgentFollowUpAlarm, type AgentFollowUpDelivery } from "./types.js";
 import { followUpFile, followUpState, settleFollowUp, releaseFollowUpPayload } from "./follow-up-delivery.js";
 import { createRunRouteMetadata } from "../worker/run-record.js";
-import { readFinalAnswerReceipt, readTaskControlJson, taskControlDirectory, taskSteerFile, withTaskControlDirectory, withLegacyTaskControlDirectories, createHostTaskRun, initializeTaskControlDirectory, assertTaskControlWriteRoots, isTaskControlDirectoryEntry, legacyTaskControlSibling, taskControlReadDirectory, FabricTaskControlDirectoryError, type FinalAnswerReceipt } from "../worker/terminal-answer.js";
+import { statDir, readFinalAnswerReceipt, readTaskControlJson, taskControlDirectory, taskSteerFile, withTaskControlDirectory, withLegacyTaskControlDirectories, createHostTaskRun, initializeTaskControlDirectory, assertTaskControlWriteRoots, isTaskControlDirectoryEntry, legacyTaskControlSibling, taskControlReadDirectory, FabricTaskControlDirectoryError, type FinalAnswerReceipt } from "../worker/terminal-answer.js";
 import { FabricTargetTerminalError, FabricSteerAdmissionLimitError, type AgentTerminalNotice, type AgentUndeliveredMessage } from "./terminal-target.js";
 import { TerminalNoticeOutbox, appendTerminalAdmission, readTerminalAdmission, readTerminalAdmissions, readUndeliveredMessage, readUndeliveredMessageView, MAX_STEER_CONTROLS, MAX_STEER_BYTES, MAX_STEER_ENTRY_BYTES, terminalControlMatchesAdmission, terminalControlRefusalProven, terminalSenderMatches } from "./terminal-notices.js";
 import type { AgentRunRouteMetadata } from "./types.js";
@@ -1548,18 +1543,6 @@ export class AgentManager {
     while (this.#releasePaused && !probe) await this.#waitForRelease(request.signal);
     if (this.#closing) throw new Error("Fabric agent manager is closing");
     const signal = request.signal ? AbortSignal.any([request.signal, this.#closeAbort.signal]) : this.#closeAbort.signal;
-    // Re-pin for EVERY launch, including startup/provider retries and held-admission
-    // re-attempts. Only one adapter.launch invocation owns each duplicate; the stored
-    // retry request never retains a closed descriptor number. The worker receives its
-    // own inherited copy.
-    let pinnedRunDirectory: string | undefined;
-    if (request.workerArguments.some((value, index) => index % 2 === 0 && value === "--session-file-identity")) {
-      if (adapter.kind !== "process") throw runIdentityRefusal("Pinned routed sessions require the local process transport");
-      const statusIndex = request.workerArguments.indexOf("--status-file");
-      const statusFile = request.workerArguments[statusIndex + 1];
-      if (statusIndex < 0 || !statusFile) throw runIdentityRefusal("Pinned routed session has no run directory");
-      pinnedRunDirectory = path.dirname(statusFile);
-    }
     const pending = (async () => {
       for (;;) {
         while (this.#releasePaused && !probe) await this.#waitForRelease(signal);
@@ -1569,10 +1552,8 @@ export class AgentManager {
         // unknown launches and caller revocation never become another attempt.
         const held = new Error("Agent transport release admission is held");
         let admitted = false;
-        const sessionDirectoryFd = pinnedRunDirectory === undefined ? undefined : pinRunDirectory(pinnedRunDirectory).use(directory =>
-          fs.openSync(directory, fs.constants.O_RDONLY | (fs.constants.O_DIRECTORY ?? 0)));
         try {
-          return await adapter.launch({ ...request, signal, ...(sessionDirectoryFd !== undefined ? { inheritFds: [sessionDirectoryFd] } : {}), authorize: () => {
+          return await adapter.launch({ ...request, signal, authorize: () => {
             if (!admitted && this.#releasePaused && !probe) throw held;
             const authorized = request.authorize?.() !== false;
             if (authorized) admitted = true;
@@ -1580,9 +1561,6 @@ export class AgentManager {
           } });
         } catch (error) {
           if (error !== held) throw error;
-        } finally {
-          // This attempt's launch resolved or rejected (sync or async): its duplicate is done.
-          if (sessionDirectoryFd !== undefined) fs.closeSync(sessionDirectoryFd);
         }
       }
     })();
@@ -1799,8 +1777,7 @@ export class AgentManager {
     // Exclusive fresh allocation is the host witness; publish current-only authority before route/custody/task writes.
     const runDirectory = path.join(this.#runRoot, id);
     createHostTaskRun(runDirectory);
-    // Routed dispatch is the only path that publishes route controls in C. Plain
-    // task spawns keep working on platforms without a traversable directory fd.
+    // Routed dispatch binds the allocated identity once; route controls themselves are central (smarty-dev#12444).
     const runPin = request.routeDecision ? pinRunDirectory(runDirectory) : undefined;
     if (managerRunTestHooks.afterRunAllocation) await managerRunTestHooks.afterRunAllocation(runDirectory);
     const name = safeName(request.name ?? request.task.split("\n", 1)[0] ?? "Fabric agent");
@@ -1852,6 +1829,7 @@ export class AgentManager {
       assertRunPathSafe(runDirectory, this.#inheritedRunRoot);
       // A real replacement directory is not an alias: require the original allocation identity too.
       runPin?.use(() => undefined);
+      if (managerRunTestHooks.afterLateRunCheck) await managerRunTestHooks.afterLateRunCheck(runDirectory);
       // 0700 whatever the umask (smarty-dev#9016): a login shell's umask 002 made run directories 0775, which
       // verified retention refuses (group-writable). Only directories it creates are changed.
       mkdirPrivate(runDirectory, this.#trustRoot());
@@ -2147,7 +2125,7 @@ export class AgentManager {
           ...(request.routeDecision?.mode === "judgment" ? ["--judgment", "true"] : []),
           ...(systemPrompt ? ["--system-prompt", systemPrompt] : []),
           ...(sessionFile ? ["--session-file", sessionFile] : []),
-          ...(routeSession ? ["--session-file-identity", JSON.stringify(routeSession.identity), "--session-directory-fd", "4"] : []),
+          ...(routeSession ? ["--session-file-identity", JSON.stringify(routeSession.identity)] : []),
           ...(request.inferenceContext ? ["--inference-context", request.inferenceContext] : []),
           ...(sessionExportFile ? ["--session-export-file", sessionExportFile] : []),
           ...(inheritedSessionPins && inheritedSessionPins.length > 0

@@ -51,7 +51,7 @@ import type { ActorContextReseed } from "./worker/context-admission.js";
 import { readPiSessionHeader } from "./core/pi-session-header.js";
 import { savePiSettlementReceipt } from "./worker/settlement-receipt.js";
 import { syncPathNamespace } from "./core/atomic-write.js";
-import { finalAssistantText, readFinalAnswerReceipt, openTaskControlFile, openLegacyTaskControlFiles, withTaskControlDirectory, taskControlFileStat, withTaskFinalAnswerLock, initializeTaskControlDirectory, assertTaskControlWriteRoots, taskSteerFile, type FinalAnswerReceipt } from "./worker/terminal-answer.js";
+import { finalAssistantText, readFinalAnswerReceipt, openTaskControlFile, openLegacyTaskControlFiles, withTaskControlDirectory, taskControlFileStat, withTaskFinalAnswerLock, initializeTaskControlDirectory, assertTaskControlWriteRoots, taskSteerFile, routeControlFile, withRouteControlDirectory, type FinalAnswerReceipt } from "./worker/terminal-answer.js";
 import { readWritePolicy } from "./agents/child-env.js";
 import { MAX_STEER_BYTES, MAX_STEER_CONTROLS } from "./agents/terminal-notices.js";
 import { terminalControls, markTerminalControlForwarded, readTerminalControl, settleTerminalControl, trackTerminalControl, type TerminalControl } from "./worker/terminal-controls.js";
@@ -384,35 +384,29 @@ const main = async (): Promise<void> => {
   } = loadedRunRecordHelpers;
   const options = optionHelpers.parseWorkerOptions();
   const routeSessionIdentity = routeSessionIdentityArgument();
-  let routeSessionDirectoryFd: number | undefined;
+  const ownRunDirectory = path.dirname(options.statusFile);
   let routeSessionFileFd: number | undefined;
   if (routeSessionIdentity) {
     if (!options.sessionFile) throw new RouteSessionIdentityRefusedError("session-file identity has no session file");
     try {
-      if (process.platform !== "linux") throw new RouteSessionIdentityRefusedError("pinned route-session handoff requires Linux");
-      const inheritedFd = Number(routeSessionArgument("--session-directory-fd") ?? NaN);
-      if (!Number.isSafeInteger(inheritedFd) || inheritedFd < 3) throw new RouteSessionIdentityRefusedError("missing inherited route-session directory descriptor");
-      const held = fs.fstatSync(inheritedFd, { bigint: true });
-      const named = fs.lstatSync(path.dirname(options.sessionFile), { bigint: true });
-      if (!held.isDirectory() || !named.isDirectory() || named.isSymbolicLink() || named.dev !== held.dev || named.ino !== held.ino) {
-        throw new RouteSessionIdentityRefusedError("route-session directory changed before worker open");
+      // The worker opens this run's central route session itself; no manager directory fd exists.
+      if (options.sessionFile !== routeControlFile(ownRunDirectory, "route-session.jsonl")) {
+        throw new RouteSessionIdentityRefusedError("session file is not this run's central route-session");
       }
-      routeSessionDirectoryFd = inheritedFd;
-      const routeSessionPath = `/proc/self/fd/${routeSessionDirectoryFd}/${path.basename(options.sessionFile)}`;
-      routeSessionFileFd = fs.openSync(routeSessionPath,
-        fs.constants.O_RDWR | fs.constants.O_APPEND | (fs.constants.O_NOFOLLOW ?? 0));
-      const stat = fs.fstatSync(routeSessionFileFd, { bigint: true });
+      withRouteControlDirectory(ownRunDirectory, directory => {
+        routeSessionFileFd = fs.openSync(path.join(directory, "route-session.jsonl"),
+          fs.constants.O_RDWR | fs.constants.O_APPEND | (fs.constants.O_NOFOLLOW ?? 0));
+      });
+      const stat = fs.fstatSync(routeSessionFileFd!, { bigint: true });
       if (!stat.isFile() || String(stat.dev) !== routeSessionIdentity.dev || String(stat.ino) !== routeSessionIdentity.ino) {
         throw new RouteSessionIdentityRefusedError("route-session identity changed before worker open");
       }
     } catch (error) {
       if (routeSessionFileFd !== undefined) { fs.closeSync(routeSessionFileFd); routeSessionFileFd = undefined; }
-      if (routeSessionDirectoryFd !== undefined) { fs.closeSync(routeSessionDirectoryFd); routeSessionDirectoryFd = undefined; }
       if (error instanceof RouteSessionIdentityRefusedError) throw error;
       throw new RouteSessionIdentityRefusedError(`route-session cannot be opened safely (${(error as NodeJS.ErrnoException).code ?? "unknown"})`);
     }
   }
-  const ownRunDirectory = path.dirname(options.statusFile);
   // Direct activation/ephemeral workers bypass AgentManager. Bootstrap before
   // any child, status replacement, steering read or final-answer lock.
   assertTaskControlWriteRoots(ownRunDirectory, options.cwd, readWritePolicy(options.writePolicy));
@@ -512,9 +506,11 @@ const main = async (): Promise<void> => {
       : fs.createWriteStream(options.sessionFile, { flags: "a", mode: 0o600 })
     : undefined;
   sessionStream?.on("error", () => {});
-  // Keep the checked file fd too: passing the file descriptor, rather than its
-  // leaf name, prevents a later leaf replacement from redirecting Pi's reopen.
-  if (routeSessionFileFd !== undefined && options.runner === "pi") piSessionFile = `/proc/self/fd/${routeSessionFileFd}`;
+  // Linux keeps the checked file fd for Pi so a later leaf replacement cannot redirect its reopen.
+  // darwin/win32 have no portable fd path: Pi gets the plain central path (waiver W-1).
+  const routeSessionFdHandoff = routeSessionFileFd !== undefined && options.runner === "pi" && process.platform === "linux";
+  if (routeSessionFdHandoff) piSessionFile = `/proc/self/fd/${routeSessionFileFd}`;
+  else if (routeSessionFileFd !== undefined && !sessionStream) { fs.closeSync(routeSessionFileFd); routeSessionFileFd = undefined; }
   let piRetrySdk: string | undefined;
   // Activation windows stay on the CLI, which owns their process-wide native
   // compaction fence. The SDK entry customizes only ordinary task retries.
@@ -547,7 +543,7 @@ const main = async (): Promise<void> => {
   }
   const piArguments = ["--mode", "rpc"];
   const routeChildSessionFd = piRetrySdk ? 4 : 3;
-  if (piSessionFile) piArguments.push("--session", routeSessionFileFd !== undefined && options.runner === "pi"
+  if (piSessionFile) piArguments.push("--session", routeSessionFdHandoff
     ? `/proc/self/fd/${routeChildSessionFd}` : activationSession?.file ?? piSessionFile);
   else piArguments.push("--no-session");
   // Opaque launchers have no supplied native discovery API. Keep discovery
@@ -860,7 +856,7 @@ const main = async (): Promise<void> => {
       // Also drop an inherited target for an explicitly loaded bridge.
       PI_FABRIC_EXTENSION_MODEL: undefined,
     },
-    stdio: routeSessionFileFd !== undefined && options.runner === "pi"
+    stdio: routeSessionFdHandoff && routeSessionFileFd !== undefined
       ? piRetrySdk ? ["pipe", "pipe", "pipe", "ipc", routeSessionFileFd] : ["pipe", "pipe", "pipe", routeSessionFileFd]
       : piRetrySdk ? ["pipe", "pipe", "pipe", "ipc"] : ["pipe", "pipe", "pipe"],
   });

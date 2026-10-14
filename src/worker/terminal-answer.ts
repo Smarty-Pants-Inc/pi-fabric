@@ -179,6 +179,49 @@ const entryExists = (entry: string): boolean => {
 };
 const centralExists = (runDirectory: string): boolean => entryExists(taskControlDirectory(runDirectory));
 const oldSiblingExists = (runDirectory: string): boolean => entryExists(legacyTaskControlSibling(runDirectory));
+
+// ---- Routed model controls (smarty-dev#12444): central `route/`, never in the run ----
+/** Stable contract: the central subdirectory holding the routed model controls. */
+export const ROUTE_CONTROL_SUBDIR = "route";
+/** Stable contract: the exact routed control names; nothing else is admitted under `route/`. */
+export const ROUTE_CONTROL_FILES = ["route-dispatch-receipt.json", "pending-route-outcome.json", "route-session.jsonl"] as const;
+export type RouteControlFile = typeof ROUTE_CONTROL_FILES[number];
+const unsafeRoute = (): never => { throw new FabricTaskControlDirectoryError("Route control directory must be an owned private real directory"); };
+/**
+ * Validated v2 binding, then create (0700, fresh only) or open the PRIVATE central
+ * `route/` through the checked control walk. An existing non-private, foreign,
+ * symlink, junction or reparse `route/` refuses; it is never repaired. On Linux
+ * `operation` receives the held `/proc/self/fd/<fd>` path (synchronous use only).
+ */
+export const withRouteControlDirectory = <T>(runDirectory: string, operation: (directory: string, fd: number | undefined) => T): T => {
+  withLegacyTaskControlDirectories(runDirectory, () => undefined);
+  return withTaskControlDirectory(runDirectory, central =>
+    withControlPath(central, `${ROUTE_CONTROL_SUBDIR}/.entry`, true, (_file, route, fd) => {
+      const stat = statDir(fd, route);
+      if (!stat.isDirectory() || (process.platform !== "win32" && (stat.mode & 0o077n) !== 0n)) unsafeRoute();
+      return operation(route, fd);
+    }));
+};
+/**
+ * Stable contract, pure (never creates). Default: the central WRITER path. With
+ * `legacyReadOnly`, a present central route/ is selected (unsafe refuses); only an
+ * ABSENT one selects the run's in-run name, as read-only custody evidence for old runs.
+ * Never a writer fallback, never authority.
+ */
+export const routeControlFile = (runDirectory: string, name: RouteControlFile, options: { legacyReadOnly?: boolean } = {}): string => {
+  if (!(ROUTE_CONTROL_FILES as readonly string[]).includes(name)) throw new FabricTaskControlDirectoryError(`Unknown route control file ${String(name)}`);
+  const route = path.join(taskControlDirectory(runDirectory), ROUTE_CONTROL_SUBDIR);
+  if (!options.legacyReadOnly) return path.join(route, name);
+  let stat: fs.BigIntStats;
+  try { stat = fs.lstatSync(route, { bigint: true }); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return path.join(path.resolve(runDirectory), name);
+    throw error;
+  }
+  if (stat.isSymbolicLink() || !stat.isDirectory() || fs.realpathSync(route) !== route || (process.getuid && stat.uid !== BigInt(process.getuid())) ||
+      (process.platform !== "win32" && (stat.mode & 0o077n) !== 0n)) unsafeRoute();
+  return path.join(route, name);
+};
 /** Old sibling-v1 directory shape check (archive discovery only); NEVER a read source. */
 const withOldSibling = <T>(runDirectory: string, operation: (directory: string, fd: number | undefined) => T): T =>
   withDirectory(legacyTaskControlSibling(runDirectory), true, operation);
@@ -338,7 +381,7 @@ const publishCentral = (runDirectory: string, build: (stage: string) => BindingV
 const nullBinding = (runDirectory: string): BindingV2 =>
   ({ version: 2, runId: path.basename(path.resolve(runDirectory)), ...runIdentity(runDirectory), snapshot: null });
 /** Raw entries that make an uninitialized run "unknown legacy" rather than fresh blank. */
-const RAW_HISTORY = ["status.json", "steer.jsonl", "final-answer.json", "terminal-controls", "terminal-notices", BINDING, SNAPSHOT];
+const RAW_HISTORY = ["status.json", "steer.jsonl", "final-answer.json", "terminal-controls", "terminal-notices", ROUTE_CONTROL_SUBDIR, BINDING, SNAPSHOT];
 /** PRIVATE: null authority, called ONLY by createHostTaskRun after its exclusive mkdir. */
 const createHostTaskControlDirectory = (run: string, allocated: Identity): void => {
   if (centralExists(run)) unsafe("Task control destination already exists; fresh host allocation refused");

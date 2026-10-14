@@ -108,6 +108,18 @@ describe("AgentManager run-path guard order (static source, DELTA-SEC-02)", () =
     expect(late).toBeLessThan(mkdir);
     expect(source.slice(late, mkdir)).not.toMatch(/writeJsonAtomic|routeDispatch\?\.outcome|mkdirPrivate\(/);
   });
+  it("central route dispatch follows allocation and the identity-only pin", () => {
+    const allocate = at("createHostTaskRun(runDirectory);");
+    const pin = at("const runPin = request.routeDecision ? pinRunDirectory(runDirectory) : undefined;");
+    const dispatch = at("routeDispatch = prepareRouteDispatch(request.routeDecision,");
+    expect(allocate).toBeLessThan(pin);
+    expect(pin).toBeLessThan(dispatch);
+    const late = at("assertRunPathSafe(runDirectory, this.#inheritedRunRoot);");
+    const check = source.indexOf("runPin?.use(() => undefined);", late);
+    expect(check).toBeGreaterThan(late);
+    expect(check).toBeLessThan(at("mkdirPrivate(runDirectory, this.#trustRoot());"));
+    for (const gone of ["inheritFds", "--session-directory-fd", "resolveFdBase", "CONTROL_PUBLISH_UNSUPPORTED_PLATFORM", "unsupportedControlPublication"]) expect(source.includes(gone), gone).toBe(false);
+  });
   it("refusal never invokes the run-path outcome saver (direct and queued paths)", () => {
     expect(source).toMatch(/!this\.#queued\.has\(id\) && !isUnsafeRunPathError\(error\)\)/);
     expect(source).toMatch(/if \(isUnsafeRunPathError\(error\)\) queued\.runPathUnsafe = true;\n\s*this\.#settleQueued/);

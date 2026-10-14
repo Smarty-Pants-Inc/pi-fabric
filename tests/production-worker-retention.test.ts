@@ -11,7 +11,7 @@ import { RESIDENT_RUN_RETENTION_MS, sweepResidentRuns } from "../src/residency/h
 import { findExecutable } from "../src/agents/transports/process-utils.js";
 import { decideModelRoute } from "../src/agents/model-route.js";
 import { ActorLogStore } from "../src/actors/log-store.js";
-import { TASK_CONTROL_LAYOUT, taskControlDirectory } from "../src/worker/terminal-answer.js";
+import { ROUTE_CONTROL_SUBDIR, TASK_CONTROL_LAYOUT, routeControlFile, taskControlDirectory } from "../src/worker/terminal-answer.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { fabricTurnProvenance } from "../src/fabric-provenance.js";
 import { FABRIC_RUN_ROOT_PREFIX, canRemoveTerminalRun, markRunRootActive, markRunRootClosed, runTreeExitVeto, sweepTempRunRoots } from "../src/storage/retention.js";
@@ -106,7 +106,9 @@ const productionRun = async (principal: boolean, retainRuns = true, nestedRunRoo
   expect(fs.statSync(taskControlDirectory(run)).isDirectory()).toBe(true);
   expect(fs.existsSync(path.join(taskControlDirectory(run), ".legacy-read.json"))).toBe(false);
   expect(fs.existsSync(path.join(run, "task.txt.provenance.json"))).toBe(principal);
-  expect(fs.existsSync(path.join(run, "route-session.jsonl"))).toBe(routed);
+  expect(fs.existsSync(routeControlFile(run, "route-session.jsonl"))).toBe(routed);
+  expect(fs.existsSync(routeControlFile(run, "route-dispatch-receipt.json"))).toBe(routed);
+  for (const name of ["route-session.jsonl", "route-dispatch-receipt.json", "pending-route-outcome.json"]) expect(fs.existsSync(path.join(run, name))).toBe(false);
   expect(fs.existsSync(path.join(run, "session.jsonl"))).toBe(!routed);
   if (routed) {
     const rows = fs.readFileSync(path.join(agent, "fabric/model-routing.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
@@ -116,7 +118,7 @@ const productionRun = async (principal: boolean, retainRuns = true, nestedRunRoo
   return { manager, result, run, runRoot };
 };
 
-const unsafeKinds = ["unknown-delivery", "pending-delivery", "delivery-link", "sidecar-link", "directory-link", "hardlink", "pending-outcome", "live", "unresolved", "unknown-json", "unknown-directory"] as const;
+const unsafeKinds = ["unknown-delivery", "pending-delivery", "delivery-link", "sidecar-link", "directory-link", "hardlink", "pending-outcome", "route-pending-outcome", "route-unknown", "live", "unresolved", "unknown-json", "unknown-directory"] as const;
 type UnsafeKind = typeof unsafeKinds[number];
 const makeUnsafe = (run: string, kind: UnsafeKind) => {
   const delivery = path.join(run, "deliveries");
@@ -132,6 +134,8 @@ const makeUnsafe = (run: string, kind: UnsafeKind) => {
   }
   if (kind === "directory-link") { fs.rmdirSync(delivery); fs.symlinkSync(path.join(run, "handoff-session"), delivery, "dir"); }
   if (kind === "pending-outcome") fs.writeFileSync(path.join(run, "pending-route-outcome.json"), "{}");
+  if (kind === "route-pending-outcome") fs.writeFileSync(routeControlFile(run, "pending-route-outcome.json"), "{}", { mode: 0o600 });
+  if (kind === "route-unknown") fs.writeFileSync(path.join(path.dirname(routeControlFile(run, "route-session.jsonl")), "route-session.jsonl.tmp"), "{}", { mode: 0o600 });
   if (kind === "live") {
     // Replace the full identity: keeping the exited worker's birth time models PID reuse.
     const file = path.join(run, "status.json");
@@ -143,7 +147,7 @@ const makeUnsafe = (run: string, kind: UnsafeKind) => {
 };
 
 // Copy genuine emitted pairs, never bootstrap/rebind legacy authority under aliases.
-const assertPairCopy = (source: string, destination: string) => {
+const assertPairCopy = (source: string, destination: string, archived = false) => {
   expect(fs.readFileSync(path.join(destination, "status.json"))).toEqual(fs.readFileSync(path.join(source, "status.json")));
   const controls = taskControlDirectory(source);
   if (!fs.existsSync(controls)) {
@@ -152,14 +156,21 @@ const assertPairCopy = (source: string, destination: string) => {
     return;
   }
   expect(fs.existsSync(path.join(controls, ".legacy-read.json"))).toBe(false);
+  const routeSession = path.join(controls, ROUTE_CONTROL_SUBDIR, "route-session.jsonl");
+  const listed = (from: string) => fs.readdirSync(from).filter(name => !archived || path.join(from, name) !== routeSession).sort();
   const compare = (from: string, to: string): void => {
-    expect(fs.readdirSync(to).sort()).toEqual(fs.readdirSync(from).sort());
+    expect(fs.readdirSync(to).sort()).toEqual(listed(from));
     if (process.platform !== "win32") expect(fs.statSync(to).mode & 0o777).toBe(0o700);
     for (const entry of fs.readdirSync(from, { withFileTypes: true })) {
       const original = path.join(from, entry.name), copied = path.join(to, entry.name);
+      if (archived && original === routeSession) continue;
       if (entry.isDirectory()) compare(original, copied);
       else {
-        expect(fs.readFileSync(copied)).toEqual(fs.readFileSync(original));
+        if (original === path.join(controls, ROUTE_CONTROL_SUBDIR, "route-dispatch-receipt.json")) {
+          const unbound = (file: string) => ({ ...JSON.parse(fs.readFileSync(file, "utf8")), runId: undefined });
+          expect(unbound(copied)).toEqual(unbound(original));
+          expect(JSON.parse(fs.readFileSync(copied, "utf8")).runId).toBe(path.basename(destination));
+        } else expect(fs.readFileSync(copied)).toEqual(fs.readFileSync(original));
         if (process.platform !== "win32") expect(fs.statSync(copied).mode & 0o777).toBe(0o600);
       }
     }
@@ -182,6 +193,8 @@ const copyRun = (source: string, destination: string) => {
     if (fs.existsSync(controls)) {
       fs.cpSync(controls, taskControlDirectory(to), { recursive: true });
       makePrivate(taskControlDirectory(to));
+      const receipt = routeControlFile(to, "route-dispatch-receipt.json");
+      if (fs.existsSync(receipt)) fs.writeFileSync(receipt, JSON.stringify({ ...JSON.parse(fs.readFileSync(receipt, "utf8")), runId: path.basename(to) }));
     }
     assertPairCopy(from, to);
     const nested = path.join(from, "nested");
@@ -287,8 +300,8 @@ describe("I-2 production-worker ingress retention", () => {
       // Each renamed top-level fixture represents a distinct actor run. Keep its
       // execution receipt bound to that run, just as the production manager does;
       // nested copies retain their original identities and all unsafe controls.
-      const receiptFile = path.join(source, "route-dispatch-receipt.json");
-      const receipt = JSON.parse(fs.readFileSync(receiptFile, "utf8"));
+      const receiptFile = routeControlFile(source, "route-dispatch-receipt.json");
+      const receipt = JSON.parse(fs.readFileSync(routeControlFile(plain.run, "route-dispatch-receipt.json"), "utf8"));
       expect(receipt.runId).toBe(plain.result.id);
       fs.writeFileSync(receiptFile, JSON.stringify({ ...receipt, runId: kind }));
       copyRun(plain.run, path.join(source, "nested", "plain"));
@@ -299,9 +312,11 @@ describe("I-2 production-worker ingress retention", () => {
       const archive = path.join(root, "runs", kind);
       expect(fs.readdirSync(path.join(archive, "nested", "attributed")).sort()).toEqual(fs.readdirSync(nested).sort());
       expect(fs.existsSync(path.join(archive, "deliveries"))).toBe(false);
-      expect(JSON.parse(fs.readFileSync(path.join(archive, "route-dispatch-receipt.json"), "utf8"))).toEqual({ ...receipt, runId: kind });
-      assertPairCopy(source, archive);
-      for (const name of ["plain", "attributed"]) assertPairCopy(path.join(source, "nested", name), path.join(archive, "nested", name));
+      expect(JSON.parse(fs.readFileSync(routeControlFile(archive, "route-dispatch-receipt.json"), "utf8"))).toEqual({ ...receipt, runId: kind });
+      expect(fs.existsSync(path.join(archive, "route-dispatch-receipt.json"))).toBe(false);
+      expect(fs.existsSync(routeControlFile(archive, "route-session.jsonl"))).toBe(false);
+      assertPairCopy(source, archive, true);
+      for (const name of ["plain", "attributed"]) assertPairCopy(path.join(source, "nested", name), path.join(archive, "nested", name), true);
       // The original host controls remain byte-for-byte intact, with original IDs.
       assertPairCopy(plain.run, source);
       assertPairCopy(attributed.run, nested);
@@ -311,7 +326,7 @@ describe("I-2 production-worker ingress retention", () => {
         if (["delivery-link", "sidecar-link", "directory-link", "hardlink"].includes(kind)) {
           const refusedId = kind + "-refused";
           const refusedSource = copyRun(source, path.join(root, "sources", refusedId));
-          fs.writeFileSync(path.join(refusedSource, "route-dispatch-receipt.json"), JSON.stringify({ ...receipt, runId: refusedId }));
+          fs.writeFileSync(routeControlFile(refusedSource, "route-dispatch-receipt.json"), JSON.stringify({ ...receipt, runId: refusedId }));
           makeUnsafe(path.join(refusedSource, "nested", "attributed"), kind);
           expect(canRemoveTerminalRun(refusedSource), kind).toBe(false);
           await expect(store.retainRun(actor, refusedId, refusedSource), kind).rejects.toThrow("Unsafe nested archive artifact");

@@ -8,6 +8,7 @@ import { ProcessTransport } from "../src/agents/transports/process-transport.js"
 import { judge, type JudgeDependencies } from "../src/judge/runtime.js";
 import { runJudgmentAgent } from "../src/judge/agent.js";
 import { VERDICTS } from "../src/judge/contract.js";
+import { routeControlFile } from "../src/worker/terminal-answer.js";
 
 const input = () => ({ questionClass: "item-stalled", itemRef: "org/repo#1", evidenceRefs: [{ url: "https://example.test/evidence", revision: "v1", observedAt: "2026-10-01T00:00:00Z" }], evidence: { facts: { complete: true }, excerpts: ["test"] }, allowedVerdicts: [...VERDICTS], timeboxMs: 5000, budget: { maxEvaluations: 1, maxAgents: 1, maxTokens: 1000 }, requestKey: "bounded-worker-probe" });
 let root: string;
@@ -84,9 +85,10 @@ describe("retained owned judgment receipts", () => {
     ownedRoots.push(path.dirname(path.dirname(run)));
     expect(result).toMatchObject({ verdict: "unknown", reasonCode: "agent_cleanup_unresolved", cost: { tokens: 5 } });
     expect(attempt.error).toContain(ownedRoots[0]);
-    expect(fs.existsSync(path.join(run, "route-session.jsonl"))).toBe(true);
+    expect(fs.existsSync(routeControlFile(run, "route-session.jsonl"))).toBe(true);
+    for (const name of ["route-session.jsonl", "pending-route-outcome.json", "route-dispatch-receipt.json"]) expect(fs.existsSync(path.join(run, name)), `${name} never in C`).toBe(false);
     expect(JSON.parse(fs.readFileSync(path.join(run, "status.json"), "utf8"))).toMatchObject({ usage: { input: 1, output: 2 } });
-    expect(JSON.parse(fs.readFileSync(path.join(run, "pending-route-outcome.json"), "utf8"))).toMatchObject({ ledger: deps.ledger, record: { decisionId: result.decisionId, status: "completed", tokens: { input: 1, output: 2 } } });
+    expect(JSON.parse(fs.readFileSync(routeControlFile(run, "pending-route-outcome.json"), "utf8"))).toMatchObject({ ledger: deps.ledger, record: { decisionId: result.decisionId, status: "completed", tokens: { input: 1, output: 2 } } });
     fault.mockRestore();
     await owner.cleanup(attempt.childAgentId);
     expect(fs.existsSync(run)).toBe(false);
@@ -117,7 +119,8 @@ describe("retained owned judgment receipts", () => {
     expect(fs.existsSync(path.join(run, "unresolved-worker.json"))).toBe(!markerFailure);
     expect(result).toMatchObject({ verdict: "unknown", reasonCode: "agent_cleanup_unresolved", cost: { tokens: 5 } });
     expect(fs.existsSync(path.join(run, "status.json"))).toBe(true);
-    expect(fs.existsSync(path.join(run, "route-session.jsonl"))).toBe(true);
+    expect(fs.existsSync(routeControlFile(run, "route-session.jsonl"))).toBe(true);
+    expect(fs.existsSync(path.join(run, "route-session.jsonl")), "never in C").toBe(false);
     expect(attempt.error).toContain(ownedRoots[0]);
     expect(rows.at(-1)).toMatchObject({ type: "judgment-outcome", reasonCode: "agent_cleanup_unresolved", cost: { tokens: 5 } });
     // Returning a failed diagnostic receipt must not settle or discharge the

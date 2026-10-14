@@ -4,6 +4,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ActorLogStore, ACTOR_MESSAGE_HISTORY_LIMIT } from "../src/actors/log-store.js";
 import type { FabricActorMessage } from "../src/actors/types.js";
+import { routeControlFile } from "../src/worker/terminal-answer.js";
 
 const roots: string[] = [];
 afterEach(() => {
@@ -95,9 +96,9 @@ describe("ActorLogStore", () => {
     const file = path.join(source, "route-dispatch-receipt.json");
     fs.writeFileSync(file, JSON.stringify(receipt), { mode: 0o600 });
     await store.retainRun(actor, "latest", source);
-    expect(JSON.parse(fs.readFileSync(path.join(root, "actor", "runs", "latest", "route-dispatch-receipt.json"), "utf8"))).toEqual(receipt);
+    expect(JSON.parse(fs.readFileSync(routeControlFile(path.join(root, "actor", "runs", "latest"), "route-dispatch-receipt.json"), "utf8"))).toEqual(receipt);
     await expect(store.retainRun(actor, "other", source)).rejects.toThrow("Mismatched route dispatch receipt");
-    expect(fs.existsSync(path.join(root, "actor", "runs", "other", "route-dispatch-receipt.json"))).toBe(false);
+    expect(fs.existsSync(routeControlFile(path.join(root, "actor", "runs", "other"), "route-dispatch-receipt.json"))).toBe(false);
     expect(JSON.parse(fs.readFileSync(file, "utf8"))).toEqual(receipt);
   });
 

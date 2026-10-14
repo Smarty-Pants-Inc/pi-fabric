@@ -387,7 +387,8 @@ describe("safe run roots", () => {
       const directory = path.join(root, name);
       writeStatus(directory, { status: "completed", finishedAt: 1, transport: "process", sessionId: name === "live" ? String(process.pid) : "2147483647" });
       fs.writeFileSync(path.join(directory, "route-session.jsonl"), '{"type":"session"}\n');
-      fs.writeFileSync(path.join(directory, "route-dispatch-receipt.json"), '{"runId":"owned-receipt"}');
+      // Deliberately legacy in-run receipt, bound to this run.
+      fs.writeFileSync(path.join(directory, "route-dispatch-receipt.json"), JSON.stringify({ runId: name, ledger: "/ledger.jsonl", decision: { decisionId: "d", routeClass: "bounded-lookup", mode: "live" } }));
       if (name === "pending") fs.writeFileSync(path.join(directory, "pending-route-outcome.json"), "{}");
       if (name === "unresolved") markUnresolvedWorker(directory, "not joined");
     }

@@ -11,7 +11,7 @@ import { findExecutable } from "../src/agents/transports/process-utils.js";
 import { decideModelRoute } from "../src/agents/model-route.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { processStartTime } from "../src/residency/process-identity.js";
-import { createHostTaskRun } from "../src/worker/terminal-answer.js";
+import { createHostTaskRun, routeControlFile } from "../src/worker/terminal-answer.js";
 import { FABRIC_RUN_ROOT_PREFIX, markRunRootActive, markRunRootClosed, runTreeExitVeto, sweepTempRunRoots } from "../src/storage/retention.js";
 
 const decision = (model = "test/sol") => decideModelRoute({ routeClass: "bounded-lookup", protected: true,
@@ -144,7 +144,8 @@ describe("R3 routed session boundaries", () => {
     try {
       const result = await manager.run({ task: "lookup", routeDecision: await decision(), transport: "process" });
       expect(result.status).toBe("completed"); runRoot = path.dirname(path.dirname(result.logFile!));
-      expect(fs.existsSync(path.join(runRoot, result.id, "route-session.jsonl"))).toBe(true);
+      expect(fs.existsSync(routeControlFile(path.join(runRoot, result.id), "route-session.jsonl"))).toBe(true);
+      expect(fs.existsSync(path.join(runRoot, result.id, "route-session.jsonl")), "never in the run directory").toBe(false);
       const rows = fs.readFileSync(path.join(root, "agent/fabric/model-routing.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
       expect(rows.map(row => row.type)).toEqual(["decision", "outcome"]);
       await manager.close(); expect(fs.existsSync(runRoot)).toBe(false);
@@ -171,7 +172,7 @@ describe("R3 routed session boundaries", () => {
       if (process.platform === "linux") expect(absentIdentity.processStartTime).toMatch(/^\d+$/);
       expect(() => process.kill(Number(absentIdentity.sessionId), 0)).toThrow(expect.objectContaining({ code: "ESRCH" }));
       markRunRootActive(runRoot, 1);
-      for (const kind of ["successful", "pending", "live", "link", "unknown", "unresolved"]) {
+      for (const kind of ["successful", "pending", "central-pending", "live", "link", "unknown", "unresolved"]) {
         const run = path.join(runRoot, kind);
         // Current-v2 host seeding: publish the protected binding before status and artifacts.
         createHostTaskRun(run);
@@ -184,7 +185,13 @@ describe("R3 routed session boundaries", () => {
         else expect(runTreeExitVeto(run)).toBeUndefined();
         if (kind === "link") fs.symlinkSync(path.join(run, "status.json"), path.join(run, "route-session.jsonl"));
         else fs.writeFileSync(path.join(run, "route-session.jsonl"), "private native session");
+        // Keep the legacy in-run custody negative; current central debt vetoes too.
         if (kind === "pending") fs.writeFileSync(path.join(run, "pending-route-outcome.json"), "{}");
+        if (kind === "central-pending") {
+          const pending = routeControlFile(run, "pending-route-outcome.json");
+          fs.mkdirSync(path.dirname(pending), { mode: 0o700 });
+          fs.writeFileSync(pending, "{}", { mode: 0o600, flag: "wx" });
+        }
         if (kind === "unknown") fs.writeFileSync(path.join(run, "route-session.jsonl.bak"), "private unknown");
         if (kind === "unresolved") fs.writeFileSync(path.join(run, "unresolved-worker.json"), "{}");
       }
@@ -194,7 +201,7 @@ describe("R3 routed session boundaries", () => {
       expect(sweep(99).removedRuns).toEqual([]); expect(fs.existsSync(path.join(runRoot, "successful"))).toBe(true);
       sweep(202);
       expect(fs.existsSync(path.join(runRoot, "successful"))).toBe(false);
-      for (const kind of ["pending", "live", "link", "unknown", "unresolved"]) expect(fs.existsSync(path.join(runRoot, kind))).toBe(true);
+      for (const kind of ["pending", "central-pending", "live", "link", "unknown", "unresolved"]) expect(fs.existsSync(path.join(runRoot, kind))).toBe(true);
     } finally { fs.rmSync(tempRoot, { recursive: true, force: true }); }
   });
 });

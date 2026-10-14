@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { ResidentRequestRetention, sweepResidentRuns } from "../src/residency/retention.js";
 import { canRemoveManagedRunRoot, canRemoveTerminalRun, isPairedTaskControlEntry, markRunRootClosed, pruneActorRunArchives, removeUnreferencedRun, runTreeExitVeto, sweepTempRunRoots } from "../src/storage/retention.js";
 import { verifiedRemove } from "../src/storage/verified-remove.js";
-import { createHostTaskRun, initializeTaskControlDirectory, legacyTaskControlSibling, saveFinalAnswerReceipt, taskControlDirectory, taskSteerFile, TASK_CONTROL_LAYOUT } from "../src/worker/terminal-answer.js";
+import { createHostTaskRun, initializeTaskControlDirectory, legacyTaskControlSibling, routeControlFile, withRouteControlDirectory, saveFinalAnswerReceipt, taskControlDirectory, taskSteerFile, TASK_CONTROL_LAYOUT } from "../src/worker/terminal-answer.js";
 import { settleTerminalControl, trackTerminalControl } from "../src/worker/terminal-controls.js";
 
 // Keep reason: trust-boundary and data-safety coverage of the real selection /
@@ -350,6 +350,48 @@ const filesOf = (...directories: string[]) => directories.filter(directory => fs
   fs.readdirSync(directory, { recursive: true, withFileTypes: true }).filter(entry => entry.isFile())
     .map(entry => [path.join(entry.parentPath, entry.name), fs.readFileSync(path.join(entry.parentPath, entry.name)).toString("base64")]))
   .sort(([a], [b]) => a!.localeCompare(b!));
+describe("central route/ retention (smarty-dev#12444)", () => {
+  const receipt = (id: string) => JSON.stringify({ runId: id, ledger: "/ledger.jsonl", decision: { decisionId: "d", routeClass: "bounded-lookup", mode: "live" } });
+  const seed = () => {
+    const f = seedCurrentRun(scratch());
+    withRouteControlDirectory(f.run, directory => {
+      fs.writeFileSync(path.join(directory, "route-dispatch-receipt.json"), receipt(f.id), { mode: 0o600 });
+      fs.writeFileSync(path.join(directory, "route-session.jsonl"), '{"type":"session"}\n'.repeat(8192), { mode: 0o600 });
+    });
+    fs.utimesSync(f.run, day / 1000, day / 1000);
+    return { ...f, route: path.dirname(routeControlFile(f.run, "route-session.jsonl")) };
+  };
+  it("collects route controls only with the whole central tree", () => {
+    const f = seed();
+    expect(canRemoveTerminalRun(f.run)).toBe(true);
+    expect(pruneActorRunArchives({ runsDirectory: f.root, retentionMs: day, now, dryRun: true })).toEqual([f.run]);
+    expect(removePaths()).toEqual([f.run, f.sibling]);
+    expect(removePaths()).not.toContain(f.route);
+  });
+  it.each(["pending", "unknown", "temp", "linked receipt", "hardlinked session", "malformed", "two rows", "linked route", "route file", "wrong run", "shapeless", ...(process.platform === "win32" ? [] : ["open route"])])("vetoes %s without recording a removal", bad => {
+    const f = seed();
+    const file = path.join(f.route, "route-dispatch-receipt.json"), session = path.join(f.route, "route-session.jsonl");
+    if (bad === "pending") fs.writeFileSync(path.join(f.route, "pending-route-outcome.json"), "{}");
+    if (bad === "unknown" || bad === "temp") fs.writeFileSync(path.join(f.route, bad === "temp" ? ".route-session.jsonl.tmp" : "other.json"), "{}");
+    if (bad === "linked receipt") { fs.unlinkSync(file); fs.symlinkSync(path.join(f.run, "status.json"), file); }
+    if (bad === "hardlinked session") fs.linkSync(session, path.join(f.root, "outside-session"));
+    if (bad === "malformed") fs.writeFileSync(file, "{broken");
+    if (bad === "two rows") fs.appendFileSync(file, "\n" + receipt(f.id));
+    if (bad === "wrong run") fs.writeFileSync(file, receipt("other"));
+    if (bad === "shapeless") fs.writeFileSync(file, JSON.stringify({ runId: f.id }));
+    if (bad === "open route") fs.chmodSync(f.route, 0o755);
+    if (bad === "linked route" || bad === "route file") {
+      const moved = path.join(f.root, "moved-route"); fs.renameSync(f.route, moved);
+      if (bad === "linked route") fs.symlinkSync(moved, f.route, "junction");
+      else fs.writeFileSync(f.route, "");
+    }
+    expect(canRemoveTerminalRun(f.run), bad).toBe(false);
+    expect(pruneActorRunArchives({ runsDirectory: f.root, retentionMs: day, now, dryRun: true })).toEqual([]);
+    expect(removeUnreferencedRun(f.run, fs.statSync(f.run), undefined, true)).toBe(false);
+    expect(removePaths()).toEqual([]);
+  });
+});
+
 describe("raw legacy retention cutoff", () => {
   it.each(["legacy", "sibling-v1"] as const)("vetoes unknown %s controls, records no removal and preserves bytes", layout => {
     const f = seedRun(scratch(), "run", layout);

@@ -917,6 +917,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
   };
 
   pi.on("session_start", async (event, context) => {
+    await state.claimSessionStart(context);
     await sealScope();
     // Retire the previous session's delayed work, then reopen entropy for this one.
     retireSessionTimers();

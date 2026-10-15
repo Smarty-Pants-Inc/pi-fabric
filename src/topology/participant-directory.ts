@@ -56,6 +56,7 @@ import {
   meshWriterLeaseRecord,
 } from "./host-leases.js";
 import { HostLeaseLockBusyError, withHostLeaseLock } from "./host-lease-lock.js";
+import { assertStartupOwner, type StartingHostClaim } from "./starting-host.js";
 import { peerLabelPrefix } from "./peer-settle.js";
 import { rootParticipantName } from "./participant-name.js";
 import { ownProcessIncarnation } from "../core/atomic-write.js";
@@ -611,6 +612,8 @@ class ParticipantPublicationChangedError extends Error {
 
 export interface ParticipantDirectoryOptions {
   enabled: boolean;
+  /** Exact early session_start receipt, not a second lease claim. */
+  startingHost?: StartingHostClaim;
   /** Resident owners keep actor envelope timestamps fresh for lease-unaware routing readers. */
   renewActorParticipants?: boolean;
   /** Existing actor file renewal only; validate the last known lineage against
@@ -684,14 +687,15 @@ type RemoteMirrorLease = { state: "none" } | { state: "ended" } | {
 
 export class ParticipantDirectory implements FabricParticipantSource {
   /** Distinct from PID incarnation and actor lineage; rotates on every activation/reload. */
-  readonly ownerIncarnation = randomUUID();
+  readonly ownerIncarnation: string;
   readonly #backgroundRefresh = new MeshBackgroundRetry("participant heartbeat/change refresh")
     .alarmsTo(meshOutageAlarmSink(() => ({ mesh: this.mesh, from: this.options.identity })));
   readonly #notifications = new MeshBackgroundQueue("participant refusal/reap");
   readonly #sources = new Set<ParticipantSnapshotSource>();
   #startedAt = Date.now();
-  #incarnationToken = randomUUID();
+  #incarnationToken: string = randomUUID();
   #leasePredecessor: FabricHostLease | undefined;
+  #startupFinished = false;
   readonly #ownIncarnation: Promise<string | undefined>;
   #ownIncarnationValue: string | undefined;
   #prepareFileLocks = false;
@@ -783,7 +787,18 @@ export class ParticipantDirectory implements FabricParticipantSource {
     readonly mesh: MeshStore,
     readonly options: ParticipantDirectoryOptions,
   ) {
+    this.ownerIncarnation = options.startingHost?.lease.ownerIncarnation ?? randomUUID();
     this.#leasePredecessor = options.enabled ? hostLeasePredecessor(mesh.root, options.hostId) : undefined;
+    if (options.startingHost) {
+      const claim = options.startingHost;
+      if (claim.meshRoot !== mesh.root || claim.lease.id !== options.hostId || claim.lease.rootId !== options.rootId ||
+        claim.lease.identityId !== options.identity.id || !claim.lease.incarnationToken) throw new Error("Invalid startup lease adoption scope");
+      assertStartupOwner(mesh.root, claim.lease);
+      this.#startupFinished = (claim.lease.startup?.until ?? 0) <= Date.now();
+      this.#incarnationToken = claim.lease.incarnationToken;
+      this.#startedAt = claim.lease.startedAt!;
+      this.#leaseClaimed = true;
+    }
     // Prepare the participant-file lock receipt before any publication fence. A cold
     // Darwin/Windows native identity read must never be awaited while registries are held.
     this.#ownIncarnation = options.withPublicationFence
@@ -959,6 +974,13 @@ export class ParticipantDirectory implements FabricParticipantSource {
       this.#installExitHook();
     }
     await this.refresh();
+  }
+
+  /** Once ordinary publication/control is ready, retire only the bounded starting marker. */
+  async finishStartup(): Promise<void> {
+    if (!this.options.startingHost || this.#startupFinished) return;
+    this.#startupFinished = true;
+    await this.#renewFileLease();
   }
 
   // An exit before close() finished withdrawing (a /quit or SIGTERM that ends the process
@@ -2912,11 +2934,15 @@ export class ParticipantDirectory implements FabricParticipantSource {
 
   #fileLease(leaseAt: number): FabricHostLease {
     const root = this.#localRecords.get(this.options.rootId);
+    const startupUntil = !this.#startupFinished ? this.options.startingHost?.lease.startup?.until : undefined;
     return {
       id: this.options.hostId,
       rootId: this.options.rootId,
       identityId: this.options.identity.id,
       incarnationToken: this.#incarnationToken,
+      ownerIncarnation: this.ownerIncarnation,
+      ...(this.options.startingHost?.lease.process ? { process: this.options.startingHost.lease.process } : {}),
+      ...(!this.#startupFinished && this.options.startingHost?.lease.startup ? { startup: this.options.startingHost.lease.startup } : {}),
       startedAt: this.#startedAt,
       // The census record's exact start time: identity is (host, pid, startedAt) (pi-fabric#638).
       writer: meshWriterLeaseRecord(this.mesh.lockProtocol, this.mesh.stateBackend, meshProcessStartedAt),
@@ -2926,11 +2952,11 @@ export class ParticipantDirectory implements FabricParticipantSource {
           id: root.sessionId,
           startedAt: root.startedAt,
           updatedAt: leaseAt,
-          expiresAt: this.#reloadUntil ?? leaseAt + PARTICIPANT_LEASE_MS,
+          expiresAt: startupUntil ?? this.#reloadUntil ?? leaseAt + PARTICIPANT_LEASE_MS,
         },
       } : {}),
       updatedAt: leaseAt,
-      expiresAt: this.#reloadUntil ?? leaseAt + this.#leaseMs,
+      expiresAt: startupUntil ?? this.#reloadUntil ?? leaseAt + this.#leaseMs,
     };
   }
 

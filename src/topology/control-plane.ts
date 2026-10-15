@@ -1,9 +1,11 @@
 import { appendDeliveryOutcome, type DeliverySend } from "../mesh/delivery-outcomes.js";
 import type { MeshControlIncarnationFence } from "../config.js";
-import { FabricBridgeStaleError, FabricParticipantStaleError, mirroredOwnerRoutingStatus, participantLeaseGraceMs, waitForMirroredLeaseRenewal, type FabricMirrorLease, type MirrorLeaseWaitBudget } from "./host-leases.js";
+import { FabricBridgeStaleError, FabricParticipantStaleError, mirroredOwnerRoutingStatus, participantLeaseGraceMs, waitForMirroredLeaseRenewal, readHostLeaseCurrent, sameHostLeaseOwner, withOwnedHostLease, type FabricHostLease, type FabricMirrorLease, type MirrorLeaseWaitBudget } from "./host-leases.js";
+import { assertStartingHost, startingHost, localStartTime } from "./starting-host.js";
+import os from "node:os";
 import { retryDelayMs } from "../core/retry-backoff.js";
 import { FabricPeerLeaseStaleError } from "../agents/peer-lease-stale.js";
-import { assertSteerPriority, type FabricSteerPriority } from "../main-agent.js";
+import { assertSteerPriority, type FabricSteerPriority, type FabricAgentMessageResult } from "../main-agent.js";
 import { copyFabricPrincipal, copyFabricWakeCause, fabricWakeCause, withFabricWakeAdmission, type FabricWakeCause, type FabricPrincipal } from "../fabric-provenance.js";
 import { FOLLOW_UP_RUNNING_TASK_MESSAGE, type AgentFollowUpRunningWarning } from "../agents/types.js";
 import { FabricTargetTerminalError, terminalRejectionFields } from "../agents/terminal-target.js";
@@ -23,6 +25,8 @@ import type { FabricMessageSender } from "../protocol.js";
 const CONTROL_TOPIC = "fabric.control.command";
 const ACK_TOPIC = "fabric.control.ack";
 const CONTROL_SEEN_PREFIX = "topology/control-seen/";
+const STARTING_QUEUE_PREFIX = "topology/starting-followups/";
+interface StartingFollowUp { format: 1; lease: FabricHostLease; event: MeshEvent; acceptance?: FabricControlAcceptance; }
 // The participant directory's host records (topology/participant-directory.ts).
 const HOST_PREFIX = "topology/hosts/";
 const DEFAULT_POLL_MS = 100;
@@ -590,6 +594,68 @@ export class FabricControlPlane {
     this.#armWatch();
     this.#subscribeStateChanges();
     this.#wake(); // a microtask: a synchronous pause() right after start() still gates it
+  }
+
+  /** Native startup admission is inbox durability, NOT an owner ACK or a model wake. */
+  async queueStartingFollowUp(targetId: string, input: FabricControlInput,
+    idempotencyKey: string, signal?: AbortSignal, from: MeshIdentity = this.identity): Promise<FabricAgentMessageResult | undefined> {
+    const lease = startingHost(this.mesh.root, targetId);
+    if (!lease) {
+      const current = readHostLeaseCurrent(this.mesh.root, targetId);
+      // A failed local creation witness cannot fall back to its future startup TTL.
+      // Foreign physical hosts retain their existing remote routing contract.
+      if (current && !current.mirror && !current.mirrorLease && current.rootId === targetId &&
+        current.identityId === targetId && (current.startup?.host === os.hostname() ||
+          current.process?.host === os.hostname() && localStartTime(current.process.pid) !== current.process.startTime))
+        throw new FabricParticipantStaleError(targetId, 0, idempotencyKey);
+      return undefined;
+    }
+    const commandId = createHash("sha256").update(JSON.stringify([
+      this.options.hostId, from.id, targetId, "startup-followUp", idempotencyKey,
+    ])).digest("hex");
+    const key = STARTING_QUEUE_PREFIX + commandId;
+    await withOwnedHostLease(this.mesh, lease, async () => {
+      signal?.throwIfAborted();
+      assertStartingHost(this.mesh.root, lease);
+      const existing = this.mesh.get(key, { fresh: true });
+      if (existing) {
+        const row = existing.value as StartingFollowUp;
+        if (!sameHostLeaseOwner(row.lease, lease) || row.lease.ownerIncarnation !== lease.ownerIncarnation)
+          throw new FabricParticipantStaleError(targetId, 0, idempotencyKey);
+        if (row.event?.from.id !== from.id || !row.event?.data ||
+          (row.event.data as FabricControlCommand).targetId !== targetId) throw new Error("Startup followUp idempotency collision");
+        await this.mesh.sync();
+        assertStartingHost(this.mesh.root, lease);
+        return;
+      }
+      // The host's real mesh publication stamps the sender/principal envelope. Never
+      // reconstruct authority from data, including on replay after the sender closes.
+      const event = await this.mesh.publish({ topic: CONTROL_TOPIC, kind: "followUp", from,
+        principal: input.principal, to: targetId, signal,
+        data: (committedAt: number) => {
+          assertStartingHost(this.mesh.root, lease);
+          return { version: 1, commandId, targetId, operation: "followUp", replyTo: this.options.hostId,
+            ownerIncarnation: lease.ownerIncarnation, destinationRemoteHost: null,
+            startupLeaseToken: lease.incarnationToken, message: input.message, data: input.data,
+            ...(input.wakeCause ? { wakeCause: copyFabricWakeCause(input.wakeCause) } : {}),
+            triggerTurn: input.triggerTurn ?? true, requestedAt: committedAt, requestCreatedAt: committedAt,
+            deadlineAt: lease.startup!.until };
+        },
+      });
+      await this.mesh.writeBatch({ identity: this.identity, ops: [], prepare: () => {
+        signal?.throwIfAborted();
+        assertStartingHost(this.mesh.root, lease);
+        return [{ kind: "put", key, ifVersion: 0, value: { format: 1, lease, event } satisfies StartingFollowUp }];
+      } });
+      await this.mesh.sync();
+      assertStartingHost(this.mesh.root, lease);
+      // The original command may have woken a ready receiver before its queue row
+      // existed. Publish a post-commit hint; the durable row (not this hint) owns work.
+      await this.mesh.publish({ topic: "fabric.control.startup-inbox", kind: "committed", from,
+        to: targetId, data: { commandId } });
+    });
+    return { queued: true, messageId: commandId, routed: "mesh", triggered: false,
+      reason: "startup-inbox-durable" };
   }
 
   async request(
@@ -1178,6 +1244,11 @@ export class FabricControlPlane {
     this.#retryTimer = undefined;
   }
 
+  /** Lifecycle ready edge: rescan durable startup rows even if an earlier event was drained. */
+  notifyStartupReady(): void {
+    if (!this.#closed) this.#wake();
+  }
+
   resume(): void {
     if (this.#closed || !this.#paused) return;
     this.#paused = false;
@@ -1490,6 +1561,7 @@ export class FabricControlPlane {
       if (tail.events.length < 100) break;
     }
     if (this.#paused || this.options.canConsumeMesh?.() === false) return false;
+    await this.#drainStartingFollowUps();
     await this.#cleanupSeen(Date.now()).catch(rethrowMeshLockTimeout);
     return true;
   }
@@ -1556,7 +1628,41 @@ export class FabricControlPlane {
     return remoteHost !== undefined && isObject(data.bridge) && data.bridge.from === remoteHost;
   }
 
+  async #drainStartingFollowUps(): Promise<void> {
+    if (!this.#handler) return;
+    for (const entry of this.mesh.listAll(STARTING_QUEUE_PREFIX, { fresh: true })) {
+      this.#assertAdmission();
+      const row = entry.value as StartingFollowUp;
+      if (row?.format !== 1 || row.acceptance || row.event?.to !== this.options.hostId ||
+        row.lease?.ownerIncarnation !== this.incarnation || row.lease.id !== this.options.hostId) continue;
+      const command = commandFromEvent(row.event);
+      if (!command || command.operation !== "followUp" || command.ownerIncarnation !== this.incarnation ||
+        command.targetId !== this.options.hostId || row.event.verification !== "mesh" ||
+        !isObject(row.event.data) || row.event.data.startupLeaseToken !== row.lease.incarnationToken) continue;
+      // One owner writes the Main journal. No pre-delivery control-seen claim: a
+      // crash after journal admission replays the SAME deliveryId into Main's receipt dedup.
+      await withOwnedHostLease(this.mesh, row.lease, async () => {
+        this.#assertAdmission();
+        const current = readHostLeaseCurrent(this.mesh.root, this.options.hostId);
+        if (!current || !sameHostLeaseOwner(current, row.lease) || current.ownerIncarnation !== this.incarnation ||
+          current.rootId !== command.targetId || current.identityId !== this.identity.id ||
+          current.process?.startTime !== row.lease.startup?.startTime ||
+          localStartTime(row.lease.startup!.pid) !== row.lease.startup!.startTime) return;
+        const fresh = this.mesh.get(entry.key, { fresh: true });
+        if (!fresh || (fresh.value as StartingFollowUp).acceptance) return;
+        // The startup deadline bounded admission, not already durable work.
+        const acceptance = await this.#handler!(command, row.event.from, new AbortController().signal, row.event.verification);
+        await this.#putFenced(this.mesh, { key: entry.key, ifVersion: fresh.version,
+          identity: this.identity, value: { ...row, acceptance } }, true);
+        await this.mesh.sync();
+      });
+    }
+  }
+
   async #acceptCommand(event: MeshEvent): Promise<void> {
+    // Startup events are drained ONLY from their durable queue row by its exact
+    // lease/epoch. In particular a predecessor must not publish a stale rejection.
+    if (isObject(event.data) && event.data.startupLeaseToken !== undefined) return;
     assertMeshConsumption(this.options.canConsumeMesh);
     const command = commandFromEvent(event);
     if (!command) return;

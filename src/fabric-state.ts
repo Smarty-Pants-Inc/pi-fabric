@@ -28,7 +28,6 @@ import { NO_FOREGROUND, resolveForegroundTools, type FabricForegroundResolution 
 import { PrewalkController } from "./prewalk/controller.js";
 import { PrewalkDriftTracker } from "./prewalk/fs-drift.js";
 import type { FabricThinkingController } from "./thinking-control.js";
-import { FABRIC_THINKING_ENTRY_TYPE } from "./thinking.js";
 import type { PendingFabricHandoff } from "./prewalk/handoff.js";
 import type { AgentToolResultMessage } from "./agents/types.js";
 import type { FabricExecutionResult } from "./execution-service.js";
@@ -57,6 +56,7 @@ import type { FabricRuntimePaths } from "./runtime-paths.js";
 import type { FabricLoadedFileIdentity } from "./build-identity.js";
 
 import { FabricManagedHost, type FabricManagedHostOptions } from "./managed-host.js";
+import type { StartingHostClaim } from "./topology/starting-host.js";
 import { probeAgentPlacement } from "./agents/placement-config.js";
 
 /**
@@ -98,6 +98,7 @@ export class FabricState {
   #provisionalConfig: FabricConfig | undefined;
   #kernelReloadRequired = false;
   #placementProbeLine: string | undefined;
+  #startingHost: StartingHostClaim | undefined;
 
   readonly #roleGrant = new ParticipantRoleGrant();
   #cwd: string | undefined;
@@ -235,6 +236,17 @@ export class FabricState {
     this.#deactivationHook = onDeactivate;
   }
 
+  /** The first session_start operation, before restore, runtime import, or MCP. */
+  async claimSessionStart(context: ExtensionContext): Promise<void> {
+    this.#startingHost = undefined;
+    if (this.#managedHost || !context.isProjectTrusted() || context.mode === "print" || context.mode === "json") return;
+    const sessionId = context.sessionManager.getSessionId();
+    const { identity, mainAgentId } = resolveFabricIdentity(sessionId);
+    if (identity.kind !== "main" || identity.id !== mainAgentId || process.env.PI_FABRIC_OWNER_HOST_ID) return;
+    const { claimNativeSessionHost } = await import("./runtime-preparation.js");
+    this.#startingHost = await claimNativeSessionHost(context, mainAgentId, sessionId);
+  }
+
   async bootstrap(context: ExtensionContext): Promise<void> {
     this.#shutDown = false;
     const generation = ++this.#generation;
@@ -319,7 +331,7 @@ export class FabricState {
     if (resolveFabricIdentity(sessionId).identity.kind !== "main") return false;
     // Publish this Main in the shared participant directory at startup, so
     // peers can find and steer an idle session before it first uses Fabric.
-    if (this.config.mesh.announce) return true;
+    if (this.config.mesh.announce || this.#startingHost) return true;
     const meshRoot = this.#meshRoot(context);
     // Re-arm on session_start (smarty-dev#5962/#4313): a Main this process already published
     // keeps its presence across /reload and session replacement. Its old heartbeat retired with
@@ -667,23 +679,15 @@ export class FabricState {
         // Bootstrap stays cheap and may precede first use by minutes. Refresh only
         // the component plane here; executor/language policy remains bootstrapped.
         if (!this.#managedHost && !reinitialize) {
-          const { FabricComponentConfiguration } = await import("./components/configuration.js");
-          assertCurrent();
-          try {
-            config.components = new FabricComponentConfiguration({
-              cwd: context.cwd, agentDir: resolveAgentDir(), projectTrusted: () => context.isProjectTrusted(),
-            }).read().entries;
-          } catch (error) {
-            // Keep the bootstrapped manifest usable for repair. The live control
-            // plane records this read failure and watches for a corrected file.
-            if (context.hasUI) context.ui.notify(`Pi Fabric component configuration not applied: ${error instanceof Error ? error.message : String(error)}`, "error");
-          }
+          const { reconcileActivationComponents } = await import("./runtime-preparation.js");
+          await reconcileActivationComponents(context, config, resolveAgentDir(), assertCurrent);
         }
         // Background timers read this ctx only while this activation's lifecycle holds. The
         // runtime installs it only after the predecessor's teardown: old sources never see
         // the successor ctx during session replacement (smarty-dev#5962).
         await candidate.initialize(context, config, {
           lifecycle: () => generation === this.#generation && !this.#shutDown && extensionContextLive(context),
+          ...(this.#startingHost ? { startingHost: this.#startingHost } : {}),
         });
         assertCurrent();
         for (const provider of this.#externalProviders.values()) {
@@ -764,18 +768,6 @@ export class FabricState {
 
 type ThinkingHookContext = Pick<ExtensionContext, "sessionManager" | "model">;
 
-/** True when the active branch's latest Fabric thinking entry holds an override. */
-const branchHasThinkingOverride = (context: ThinkingHookContext): boolean => {
-  const branch = context.sessionManager.getBranch();
-  for (let index = branch.length - 1; index >= 0; index -= 1) {
-    const entry = branch[index];
-    if (entry?.type !== "custom" || entry.customType !== FABRIC_THINKING_ENTRY_TYPE) continue;
-    const data = entry.data as { override?: unknown } | undefined;
-    return data?.override !== null && data?.override !== undefined;
-  }
-  return false;
-};
-
 /**
  * Lazy front for the host thinking controller. Before first use an override
  * can only come from a persisted session entry, so lifecycle hooks scan the
@@ -800,7 +792,7 @@ export class FabricThinkingHost {
   }
 
   async agentEnded(context: ThinkingHookContext): Promise<void> {
-    if (!this.#controller && !branchHasThinkingOverride(context)) return;
+    if (!this.#controller && !(await import("./runtime-preparation.js")).branchHasThinkingOverride(context)) return;
     (await this.load()).agentEnded(context);
   }
 

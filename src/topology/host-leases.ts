@@ -224,6 +224,17 @@ export class FabricBridgeStaleError extends Error {
   }
 }
 
+/** Bounded local startup authority. Never mirrored or inferred from PID alone. */
+export interface FabricHostStartup {
+  ownerIncarnation: string;
+  sessionId: string;
+  cwd: string;
+  host: string;
+  pid: number;
+  startTime: string;
+  until: number;
+}
+
 export interface FabricHostLease {
   id: string;
   rootId: string;
@@ -234,6 +245,10 @@ export interface FabricHostLease {
   startedAt?: number;
   /** Unique incarnation fence; absent only on historical writers. */
   incarnationToken?: string;
+  /** Control epoch and local process identity survive adoption by the full runtime. */
+  ownerIncarnation?: string;
+  process?: { pid: number; host: string; startTime: string };
+  startup?: FabricHostStartup;
   /** Root Main's bounded reload lease; absent on ordinary heartbeats and older writers. */
   reloadUntil?: number;
   /** Main session has a fixed 15 s TTL, independent of the host TTL. */
@@ -471,6 +486,17 @@ const parseLease = (file: string, name: string): { read: boolean; lease?: Fabric
   return { read: true, lease: leaseOf(text, name) };
 };
 
+const validProcess = (value: unknown): value is NonNullable<FabricHostLease["process"]> => {
+  const p = value as NonNullable<FabricHostLease["process"]> | undefined;
+  return !!p && Number.isSafeInteger(p.pid) && p.pid > 0 && typeof p.host === "string" &&
+    typeof p.startTime === "string" && p.startTime.length > 0;
+};
+const validStartup = (value: unknown): value is FabricHostStartup => {
+  const s = value as FabricHostStartup | undefined;
+  return validProcess(s) && typeof s?.ownerIncarnation === "string" && s.ownerIncarnation.length > 0 &&
+    typeof s.sessionId === "string" && typeof s.cwd === "string" && Number.isFinite(s.until);
+};
+
 const leaseOf = (text: string, name: string): FabricHostLease | undefined => {
   try {
     const value = JSON.parse(text) as Record<string, unknown>;
@@ -491,6 +517,9 @@ const leaseOf = (text: string, name: string): FabricHostLease | undefined => {
       updatedAt: value.updatedAt, expiresAt: value.expiresAt,
       ...(typeof value.startedAt === "number" && Number.isFinite(value.startedAt) ? { startedAt: value.startedAt } : {}),
       ...(typeof value.incarnationToken === "string" ? { incarnationToken: value.incarnationToken } : {}),
+      ...(typeof value.ownerIncarnation === "string" ? { ownerIncarnation: value.ownerIncarnation } : {}),
+      ...(validStartup(value.startup) ? { startup: value.startup } : {}),
+      ...(validProcess(value.process) ? { process: value.process } : {}),
       ...(typeof value.reloadUntil === "number" ? { reloadUntil: value.reloadUntil } : {}),
       ...(validSession(value.session) ? { session: value.session } : {}),
       ...(validMirrorLease(value.mirror) ? { mirror: value.mirror } : {}),

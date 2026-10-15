@@ -105,6 +105,8 @@ const lazyEntryPoints = [
   // The running Pi CLI's own SDK entry, for the bridge and the conversation UI.
   "src/core/host-sdk.ts",
   "src/fabric-runtime-state.ts",
+  "src/topology/starting-host.ts",
+  "src/runtime-preparation.ts",
   "src/provider-error-class.ts",
   "src/topology/root-inbox-context.ts",
   "src/components/configuration.ts",

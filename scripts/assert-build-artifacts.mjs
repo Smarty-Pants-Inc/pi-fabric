@@ -66,6 +66,8 @@ const lazy = [
   "agents/provider-bridge.js",
   "core/host-sdk.js",
   "fabric-runtime-state.js",
+  "topology/starting-host.js",
+  "runtime-preparation.js",
   "components/configuration.js",
   "providers/jev-provider.js",
   "jev/client.js",

@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import type { ConsumerAPI } from "@nats-io/jetstream";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { importMeshStateToNats } from "../src/mesh/backend-migration-nats.js";
 import { closeNatsStateBackend, MeshStateNatsUnavailableError, natsStreamName, openNatsStateBackend } from "../src/mesh/state-backend-nats.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
@@ -59,17 +60,90 @@ describe("real three-node NATS metadata-leader election", () => {
     const root = path.join(cluster.root, "mesh-state");
     fs.mkdirSync(root);
     const options = { servers: [cluster.seedUrl], monitoringUrl: cluster.seedMonitorUrl, replicas: 3 };
-    const seedBackend = await openNatsStateBackend({ root, ...options, maxEventBytes: 64 * 1024 });
-    try { await seedBackend.put({ key: "election/seed", value: { durable: true }, identity }); }
-    finally { closeNatsStateBackend(root); }
     const initial = { stream: natsStreamName(root), entries: 1 };
+    const faultRoots = Array.from({ length: 5 }, (_, index) => path.join(cluster.root, `fault-open-${index + 1}`));
+    const migrationRoot = path.join(cluster.root, "fault-migration");
+    const unavailableRoot = path.join(cluster.root, "placement-unavailable");
+    const ownStreams = new Set([root, ...faultRoots, migrationRoot, unavailableRoot].map(natsStreamName));
+    const [{ connect }, { jetstreamManager }] = await Promise.all([import("@nats-io/transport-node"), import("@nats-io/jetstream")]);
+    const successfulCreates: { stream: string; ms: number; healthy: boolean }[] = [];
+    const qualifiedOpens: string[] = [];
+    const correlationErrors: string[] = [];
+    let pausedNode: string | undefined;
+    let observer: Awaited<ReturnType<typeof connect>> | undefined;
+    let restoreCreateSpy: (() => void) | undefined;
+    try {
+    observer = await connect({ servers: [cluster.seedUrl], ignoreClusterUpdates: true, reconnect: false, timeout: 1_000 });
+    const manager = await jetstreamManager(observer, { timeout: 1_000 });
+    // The public manager exposes the same SDK prototype used by real product ordered-consumer opens.
+    const consumerPrototype = Object.getPrototypeOf(manager.consumers) as ConsumerAPI;
+    const originalAdd = consumerPrototype.add;
+    const createSpy = vi.spyOn(consumerPrototype, "add").mockImplementation(async function (this: ConsumerAPI, ...args: Parameters<ConsumerAPI["add"]>) {
+      const [stream, config] = args;
+      const measured = ownStreams.has(stream) && config.ack_policy === "none" && config.num_replicas === 1
+        && config.mem_storage === true && !config.durable_name && !config.deliver_subject;
+      const name = config.name;
+      const requestPausedNode = pausedNode;
+      const started = performance.now();
+      // Recording only: always execute the real API with its original receiver, arguments, errors and ACK.
+      const ack = await originalAdd.apply(this, args);
+      const ms = performance.now() - started;
+      if (measured) {
+        const leader = cluster.nodes.find(node => node.name === ack.cluster?.leader || node.metaId === ack.cluster?.leader);
+        if (!name || ack.stream_name !== stream || ack.name !== name || ack.config?.name !== name
+          || ack.config.num_replicas !== 1 || ack.config.mem_storage !== true || !leader || !Number.isFinite(ms) || ms < 0) {
+          correlationErrors.push("real CREATE request/ACK identity, placement or timestamp mismatch");
+        } else {
+          // A request assigned to the paused node stays excluded even if its ACK arrives after SIGCONT.
+          successfulCreates.push({ stream, ms, healthy: requestPausedNode !== leader.name });
+        }
+      }
+      return ack;
+    });
+    restoreCreateSpy = () => createSpy.mockRestore();
+    const seedBackend = await openNatsStateBackend({ root, ...options, maxEventBytes: 64 * 1024 });
+    qualifiedOpens.push(initial.stream);
+    try {
+      await seedBackend.put({ key: "election/seed", value: { durable: true }, identity });
+      const consumers = await manager.consumers.list(initial.stream).next();
+      expect(consumers).toHaveLength(1);
+      const original = consumers[0]!;
+      expect(original.config.inactive_threshold).toBe(10_000_000_000);
+      // consume() drives NEXT requests; INFO polling is only a bounded safety net for pull registration.
+      await expect.poll(async () => (await manager.consumers.info(initial.stream, original.name)).num_waiting,
+        { timeout: 2_000, interval: 100 }).toBeGreaterThan(0);
+      const before = await manager.consumers.info(initial.stream, original.name);
+      expect(before.num_waiting).toBeGreaterThan(0);
+      const lastSequence = (await manager.streams.info(initial.stream)).state.last_seq;
+      const idleStarted = performance.now();
+      await sleep(15_000); // No publishes: exceed the initial consumer's 10s inactive threshold with active pulls.
+      const idleMs = performance.now() - idleStarted;
+      const afterIdle = await manager.consumers.info(initial.stream, original.name);
+      expect(idleMs).toBeGreaterThan(10_000);
+      expect(afterIdle.name).toBe(original.name);
+      expect(afterIdle.created).toBe(original.created);
+      expect(afterIdle.config.inactive_threshold).toBe(10_000_000_000);
+      expect(afterIdle.num_waiting).toBeGreaterThan(0);
+      expect(afterIdle.delivered.consumer_seq).toBe(before.delivered.consumer_seq);
+      expect(afterIdle.delivered.stream_seq).toBe(before.delivered.stream_seq);
+      expect((await manager.streams.info(initial.stream)).state.last_seq).toBe(lastSequence);
+      // put resolves only after the real projector applies the publish; overwrite keeps entries at one.
+      await seedBackend.put({ key: "election/seed", value: { durable: true, idle: true }, identity });
+      expect(seedBackend.get("election/seed")?.value).toEqual({ durable: true, idle: true });
+      const afterDelivery = await manager.consumers.info(initial.stream, original.name);
+      const receivedAfterIdle = afterDelivery.delivered.stream_seq > afterIdle.delivered.stream_seq;
+      const sameConsumer = afterDelivery.name === original.name && afterDelivery.created === original.created;
+      expect(receivedAfterIdle).toBe(true);
+      expect(sameConsumer).toBe(true);
+      expect(afterDelivery.config.inactive_threshold).toBe(10_000_000_000);
+      expect((await manager.consumers.list(initial.stream).next()).map(info => info.name)).toEqual([original.name]);
+      console.log(`NATS_CONSUMER_IDLE ${JSON.stringify({ name: original.name, configuredMs: afterIdle.config.inactive_threshold! / 1_000_000,
+        idleMs, receivedAfterIdle, sameConsumer, waitingBefore: before.num_waiting, waitingAfter: afterIdle.num_waiting })}`);
+    } finally { closeNatsStateBackend(root); }
     const readyLeader = cluster.nodes.find(node => node.name === cluster.metaLeader || node.metaId === cluster.metaLeader);
     console.log(`NATS_ELECTION_READY ${JSON.stringify({ nodeNames: cluster.nodes.map(node => node.name), routes: 2, agreedMetaLeader: cluster.metaLeader, leaderNode: readyLeader?.name, seed: cluster.seedUrl, stream: initial.stream, preFaultSeedTransaction: "passed" })}`);
 
     const { connectJetStream } = await import("../src/mesh/state-backend-nats-client.js");
-    const faultRoots = Array.from({ length: 5 }, (_, index) => path.join(cluster.root, `fault-open-${index + 1}`));
-    const migrationRoot = path.join(cluster.root, "fault-migration");
-    const unavailableRoot = path.join(cluster.root, "placement-unavailable");
     const unavailableStore = new MeshStore(unavailableRoot, 64 * 1024, 1_000, { stateBackend: "file" });
     try { await unavailableStore.put({ key: "election/unavailable", value: { durable: true }, identity }); }
     finally { unavailableStore.closeState(); }
@@ -94,6 +168,7 @@ describe("real three-node NATS metadata-leader election", () => {
       leader = await cluster.pauseMetaLeader(paused => {
         leader = paused;
         pausedAt = Date.now();
+        pausedNode = paused.name;
         resumePromise = new Promise<boolean>(resolve => {
           let resumed = false;
           const resume = () => {
@@ -101,6 +176,7 @@ describe("real three-node NATS metadata-leader election", () => {
             resumed = true;
             clearTimeout(safetyTimer);
             resumedAt = Date.now();
+            pausedNode = undefined;
             resolve(paused.child.kill("SIGCONT"));
           };
           const safetyTimer = setTimeout(resume, 70_000);
@@ -135,10 +211,14 @@ describe("real three-node NATS metadata-leader election", () => {
         expect(placement.error).toBeInstanceOf(MeshStateNatsUnavailableError);
         expect(placement.error).toMatchObject({ code: "FABRIC_MESH_STATE_NATS_UNAVAILABLE", reason: "placement-unavailable", natsErrCode: 10005 });
         expect(elapsedMs).toBeGreaterThanOrEqual(placementTimeoutMs);
-        expect(await raw!.streamExists(natsStreamName(unavailableRoot))).toBe(false);
+        // A late CREATE or post-create leader-wait expiry may leave a stream; it must still be R3.
+        if (await raw!.streamExists(natsStreamName(unavailableRoot))) {
+          expect(await streamReplicas(cluster.seedUrl, natsStreamName(unavailableRoot))).toBe(3);
+        }
       } else {
         expect(await streamReplicas(cluster.seedUrl, placement.value.stream)).toBe(3);
         const duringPause = await openNatsStateBackend({ root: unavailableRoot, ...migrationOptions! });
+        qualifiedOpens.push(natsStreamName(unavailableRoot));
         try { await duringPause.put({ key: "election/during-pause", value: { durable: true }, identity }); }
         finally { closeNatsStateBackend(unavailableRoot); }
         expect(resumedAt, "the R3 write must commit before SIGCONT").toBe(0);
@@ -158,6 +238,7 @@ describe("real three-node NATS metadata-leader election", () => {
           return info.cluster?.leader === leader!.name || info.cluster?.replicas?.some(peer => peer.name === leader!.name && peer.current) === true;
         }, { timeout: 10_000, interval: 100 }).toBe(true);
         const caughtUp = await openNatsStateBackend({ root: unavailableRoot, servers: [leader.clientUrl], monitoringUrl: leader.monitorUrl, replicas: 3 });
+        qualifiedOpens.push(natsStreamName(unavailableRoot));
         try { expect(caughtUp.get("election/during-pause")?.value).toEqual({ durable: true }); }
         finally { closeNatsStateBackend(unavailableRoot); }
       }
@@ -174,6 +255,7 @@ describe("real three-node NATS metadata-leader election", () => {
       expect(replicas).toBe(3);
       expect(await Promise.all(faultRoots.map(rootPath => streamReplicas(cluster.seedUrl, natsStreamName(rootPath))))).toEqual([3, 3, 3, 3, 3]);
       expect(openResults.map(result => result.status), `all five new-root backend opens must work during the bounded election: ${JSON.stringify(details(openResults))}`).toEqual(["fulfilled", "fulfilled", "fulfilled", "fulfilled", "fulfilled"]);
+      qualifiedOpens.push(...faultRoots.map(natsStreamName));
       const freshConverged = await importMeshStateToNats(migrationRoot, migrationOptions!);
       expect(freshConverged).toMatchObject({ stream: natsStreamName(migrationRoot), entries: 1, converged: true });
       const recoveryReads = await Promise.all([
@@ -211,5 +293,30 @@ describe("real three-node NATS metadata-leader election", () => {
       expect(await casRaw.lastSequence(stream)).toBe(seq + 1);
       console.log(`NATS_ELECTION_CAS ${JSON.stringify({ startSequence: seq, fulfilled: 1, rejected: 1, finalSequence: seq + 1 })}`);
     } finally { await casRaw.close(); }
+    expect(correlationErrors, "real CREATE call/ACK measurement must be valid").toEqual([]);
+    expect(successfulCreates.filter(sample => sample.healthy).length).toBeGreaterThan(0);
+    for (const stream of new Set(qualifiedOpens)) {
+      expect(successfulCreates.filter(sample => sample.stream === stream).length,
+        `missing real CREATE call/ACK samples for qualified opens of ${stream}`).toBeGreaterThanOrEqual(qualifiedOpens.filter(name => name === stream).length);
+    }
+    } finally {
+      restoreCreateSpy?.();
+      // close() tears down the local socket without a protocol drain. Bound even an unexpected SDK stall.
+      let closeTimer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([observer?.close(), new Promise<never>((_, reject) => {
+          closeTimer = setTimeout(() => reject(new Error("consumer observer close exceeded 1s")), 1_000);
+        })]);
+      } finally {
+        clearTimeout(closeTimer);
+        closeNatsStateBackend(root);
+        const samplesMs = successfulCreates.filter(sample => sample.healthy).map(sample => sample.ms);
+        const sorted = [...samplesMs].sort((a, b) => a - b);
+        const percentile = (p: number) => sorted.length ? sorted[Math.ceil(sorted.length * p) - 1]! : null;
+        console.log(`NATS_CONSUMER_CREATE_LATENCY ${JSON.stringify({ unit: "ms", samplesMs, count: samplesMs.length,
+          p50Ms: percentile(0.5), p99Ms: percentile(0.99), maxMs: sorted.at(-1) ?? null,
+          excludedPaused: successfulCreates.length - samplesMs.length, correlationErrors, qualifiedOpens: qualifiedOpens.length })}`);
+      }
+    }
   }, 90_000);
 });

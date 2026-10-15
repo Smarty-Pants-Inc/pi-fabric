@@ -224,17 +224,20 @@ export class MeshStateNatsLimitError extends Error {
   }
 }
 
-/** A projector stopped after repeated purges, or JetStream could not place a stream's replicas within its budget. */
+/** A projector stopped, or stream placement / a just-created stream's first consumer exceeded its readiness budget. */
 export class MeshStateNatsUnavailableError extends Error {
   readonly code = "FABRIC_MESH_STATE_NATS_UNAVAILABLE";
   /** Flat numeric metadata and the prototype reason getter survive redactNatsError / guardNatsPort. */
   declare readonly natsErrCode?: number;
-  constructor(detail: string, placement?: { natsErrCode: number; cause?: unknown }) {
-    super(`FABRIC_MESH_STATE_NATS_UNAVAILABLE: ${detail}`, placement?.cause === undefined ? undefined : { cause: placement.cause });
+  declare readonly consumerBootstrap?: boolean;
+  constructor(detail: string, context?: { natsErrCode?: number; consumerBootstrap?: boolean; cause?: unknown }) {
+    super(`FABRIC_MESH_STATE_NATS_UNAVAILABLE: ${detail}`, context?.cause === undefined ? undefined : { cause: context.cause });
     this.name = "MeshStateNatsUnavailableError";
-    if (placement) Object.assign(this, { natsErrCode: placement.natsErrCode });
+    if (context?.natsErrCode !== undefined) Object.assign(this, { natsErrCode: context.natsErrCode });
+    if (context?.consumerBootstrap === true) Object.assign(this, { consumerBootstrap: true });
   }
-  get reason(): "placement-unavailable" | "projector-unavailable" {
+  get reason(): "placement-unavailable" | "projector-unavailable" | "consumer-bootstrap-unavailable" {
+    if (this.consumerBootstrap === true) return "consumer-bootstrap-unavailable";
     return typeof this.natsErrCode === "number" ? "placement-unavailable" : "projector-unavailable";
   }
 }

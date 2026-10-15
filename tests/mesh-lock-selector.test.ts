@@ -6,6 +6,7 @@ import { DEFAULT_FABRIC_CONFIG, loadFabricConfig, normalizeFabricConfig, saveFab
 import { MeshStore, type MeshStoreOptions } from "../src/mesh/store.js";
 import { FabricControlPlane } from "../src/topology/control-plane.js";
 import { main, runBridge } from "../src/mesh-bridge.js";
+import { windowsMeshReleaseTestHooks, type WindowsMeshReleaseChildSample } from "../src/storage/windows-mesh-release.js";
 
 const roots: string[] = [];
 const root = (): string => {
@@ -15,6 +16,7 @@ const root = (): string => {
 };
 const store = (options: MeshStoreOptions = {}): MeshStore => new MeshStore(root(), 65536, 100, options);
 afterEach(() => {
+  delete windowsMeshReleaseTestHooks.afterChild;
   vi.restoreAllMocks();
   vi.useRealTimers();
   for (const value of roots.splice(0)) fs.rmSync(value, { recursive: true, force: true });
@@ -28,6 +30,8 @@ describe("startup mesh lock selector", () => {
     const rename = vi.spyOn(fs, "renameSync");
     const remove = vi.spyOn(fs, "rmSync");
     const write = vi.spyOn(fs, "writeFileSync");
+    const nativeChildren: WindowsMeshReleaseChildSample[] = [];
+    windowsMeshReleaseTestHooks.afterChild = sample => { nativeChildren.push(sample); };
     let token = "";
     await mesh.exclusive(() => {
       const owner = fs.readFileSync(path.join(lock, "owner"), "utf8");
@@ -45,12 +49,20 @@ describe("startup mesh lock selector", () => {
       expect(token).not.toBe("");
       expect(rename).not.toHaveBeenCalledWith(lock, expect.anything());
       expect(remove).not.toHaveBeenCalledWith(lock, expect.anything());
-    } else {
-      // Non-Linux keeps main's detached release.
+    } else if (process.platform === "darwin") {
+      // macOS retains the documented weaker pathname-detached release, not Windows parity.
       const released = `${lock}.released.${token}`;
       expect(rename).toHaveBeenCalledWith(lock, released);
       expect(remove).toHaveBeenCalledWith(released, { recursive: true, force: true });
       expect(remove).not.toHaveBeenCalledWith(lock, { recursive: true, force: true });
+    } else if (process.platform === "win32") {
+      // Observe the real joined native release, never a pathname fallback that merely looks successful.
+      expect(nativeChildren).toHaveLength(1);
+      expect(nativeChildren[0]).toMatchObject({ outcome: "released", attempt: 1 });
+      expect(path.isAbsolute(nativeChildren[0]!.absolutePath)).toBe(true);
+      expect(nativeChildren[0]!.digest).toMatch(/^[0-9a-f]{64}$/);
+      expect(rename).not.toHaveBeenCalledWith(lock, expect.anything());
+      expect(remove).not.toHaveBeenCalledWith(lock, expect.anything());
     }
     expect(fs.existsSync(lock)).toBe(false);
   });

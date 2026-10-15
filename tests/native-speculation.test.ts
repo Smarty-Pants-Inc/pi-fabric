@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import fs, { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionContext, MessageUpdateEvent, ToolDefinition } from "@earendil-works/pi-coding-agent";
@@ -30,7 +30,7 @@ function fixture(profile:"additive"|"native", mcp=false) {
   const service=new FabricExecutionService(registry,config);
   const speculation=new RuntimeStateSpeculation(registry,()=>config.speculation,()=>undefined,()=>config.approvals[mcp?"network":"read"]==="allow","typescript",()=>definitions,()=>profile==="native");
   speculation.tap!.setScannerFactory(()=>new LiteralCallScanner(name=>speculativeNativeRef(name,definitions,nativeMcpIdentity)));
-  cleanups.push(()=>{speculation.reset();rmSync(cwd,{recursive:true,force:true});});
+  cleanups.push(()=>{speculation.reset();fs.rmSync(cwd,{recursive:true,force:true});});
   const args=JSON.stringify({path});
   const native=`tools.${mcp?"mcp__docs__read":"read"}(${args})`;
   const ordinary=`${ref}(${args})`;

@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import os from "node:os";
-import fsp, { rm, stat } from "node:fs/promises";
+import fsp, { stat } from "node:fs/promises";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import {
@@ -122,7 +122,7 @@ describe("boundModelOutput", () => {
     if (process.platform !== "win32") {
       expect(info.mode & 0o777).toBe(0o600);
     }
-    await rm(path.dirname(result.artifactPath!), { recursive: true, force: true });
+    await fsp.rm(path.dirname(result.artifactPath!), { recursive: true, force: true });
   });
 
   it("removes the allocated directory when the real artifact write fails", async () => {

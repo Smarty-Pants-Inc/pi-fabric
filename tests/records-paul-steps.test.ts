@@ -1,5 +1,5 @@
 import { spawn, spawnSync } from "node:child_process";
-import { chmodSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import fs, { chmodSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir, userInfo } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
@@ -61,7 +61,7 @@ const lines = (text: string) => text.split("\n").filter((l) => l.trim() !== "" &
 // The real-path runs take several seconds each under nice (#1600): allow them a minute.
 describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout: 60_000 }, () => {
 	const fake = mkdtempSync(join(tmpdir(), "records-paul-steps-"));
-	afterAll(() => rmSync(fake, { recursive: true, force: true }));
+	afterAll(() => fs.rmSync(fake, { recursive: true, force: true }));
 
 	it("passes bash -n", () => {
 		expect(spawnSync("bash", ["-n", script]).status).toBe(0);
@@ -363,7 +363,7 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 			expect(calls).toHaveLength(1);
 			expect(calls[0]).toMatch(/^useradd --system /);
 		} finally {
-			rmSync(failing, { recursive: true, force: true });
+			fs.rmSync(failing, { recursive: true, force: true });
 		}
 	});
 
@@ -406,7 +406,7 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 			expect(r.out).toBe(`bundle-sha256 ${fileSha(src.bundle)}  ${src.bundle}\nnode-sha256 ${fileSha(src.node)}  ${src.node}\n`);
 			expect(run(["--print-digests", "--node", src.node]).code).toBe(1);
 		} finally {
-			rmSync(t, { recursive: true, force: true });
+			fs.rmSync(t, { recursive: true, force: true });
 		}
 	});
 
@@ -435,7 +435,7 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 				expect(existsSync(join(root, "opt"))).toBe(false);
 			}
 		} finally {
-			rmSync(t, { recursive: true, force: true });
+			fs.rmSync(t, { recursive: true, force: true });
 		}
 	});
 
@@ -462,7 +462,7 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 			const src2 = readFileSync(script, "utf8");
 			expect(src2).not.toMatch(/BASH_SOURCE|dirname|\$0\b|\$\{0[^#]/);
 		} finally {
-			rmSync(t, { recursive: true, force: true });
+			fs.rmSync(t, { recursive: true, force: true });
 		}
 	});
 
@@ -485,12 +485,12 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 			expect(r.out).toContain(`= ${root}/etc/postgresql-common/createcluster.conf kept as is; the drop-in below overrides`);
 			expect(r.out.indexOf(dropIn)).toBeLessThan(r.out.indexOf("+ apt-get install -y postgresql\n"));
 			// With PostgreSQL present, apt is not run and no drop-in is written.
-			rmSync(join(root, "etc"), { recursive: true });
+			fs.rmSync(join(root, "etc"), { recursive: true });
 			pgTree(root, ["16"]);
 			r = run([...dryBase, "--dry-run"], env);
 			expect(r.out).not.toMatch(/createcluster\.d|apt-get install/);
 		} finally {
-			rmSync(t, { recursive: true, force: true });
+			fs.rmSync(t, { recursive: true, force: true });
 		}
 	});
 
@@ -503,7 +503,7 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 			expect(r.code).not.toBe(0);
 			expect(r.err).toMatch(/no apt candidate for the distro package postgresql/);
 		} finally {
-			rmSync(noCand, { recursive: true, force: true });
+			fs.rmSync(noCand, { recursive: true, force: true });
 		}
 	});
 
@@ -544,14 +544,14 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 			expect(r.out).toContain(`+ runuser -u test-org-records -- ${root}/usr/lib/postgresql/17/bin/initdb -D `);
 			r = run(["--help", "--org", "test-org", "--org-user", "nobodyuser"], env);
 			expect(r.out).toContain("cluster=17/test-org-records");
-			rmSync(join(root, "usr/lib/postgresql/17"), { recursive: true });
+			fs.rmSync(join(root, "usr/lib/postgresql/17"), { recursive: true });
 			r = run([...dryBase, "--dry-run"], env);
 			expect(r.code, r.err).toBe(0);
 			expect(r.out).toContain(`= PostgreSQL 16 found at ${root}/usr/lib/postgresql/16/bin `);
 			expect(r.out).toContain("apt-get remove postgresql postgresql-16");
 			expect(r.out).not.toMatch(/postgresql-17|\/17\/|PGDG/i);
 		} finally {
-			rmSync(t, { recursive: true, force: true });
+			fs.rmSync(t, { recursive: true, force: true });
 		}
 	});
 
@@ -566,7 +566,7 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 			expect(r.out).not.toContain("## 1. ");
 			expect(readFileSync(log, "utf8")).toBe("");
 		} finally {
-			rmSync(t, { recursive: true, force: true });
+			fs.rmSync(t, { recursive: true, force: true });
 		}
 	});
 
@@ -582,7 +582,7 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 			expect(r.out).not.toMatch(/postgresql-17|PGDG|add-apt-repository|sources\.list|\/17\//i);
 			expect(readFileSync(log, "utf8")).toBe("");
 		} finally {
-			rmSync(t, { recursive: true, force: true });
+			fs.rmSync(t, { recursive: true, force: true });
 		}
 	});
 
@@ -626,7 +626,7 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 			expect([ok.status, ok.stdout.trim()]).toEqual([0, "ok"]);
 			expect(readFileSync(file, "utf8")).toBe(before);
 		} finally {
-			rmSync(dir, { recursive: true, force: true });
+			fs.rmSync(dir, { recursive: true, force: true });
 		}
 	});
 
@@ -681,7 +681,7 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 			expect(r.code).toBe(1);
 			expect(r.err).toContain("service-main.mjs is a symlink: refused");
 		} finally {
-			rmSync(dir, { recursive: true, force: true });
+			fs.rmSync(dir, { recursive: true, force: true });
 		}
 	});
 
@@ -859,9 +859,9 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 			} finally {
 				for (const close of closers.reverse()) await close().catch(() => undefined);
 				proxy.kill();
-				rmSync(proxyDir, { recursive: true, force: true });
+				fs.rmSync(proxyDir, { recursive: true, force: true });
 				await server.stop();
-				if (t) rmSync(t, { recursive: true, force: true });
+				if (t) fs.rmSync(t, { recursive: true, force: true });
 			}
 		},
 		120_000,
@@ -902,7 +902,7 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 				expect(JSON.parse(readFileSync(file, "utf8")).token).toBe("tok-relay:fabric");
 			}
 		} finally {
-			rmSync(t, { recursive: true, force: true });
+			fs.rmSync(t, { recursive: true, force: true });
 		}
 	});
 
@@ -929,7 +929,7 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 			expect(log2).not.toMatch(/runuser sh -c/);
 			expect(second.out).not.toMatch(/relay\.json|credentials\/[0-9a-f]{64}|issue --config/);
 		} finally {
-			rmSync(t, { recursive: true, force: true });
+			fs.rmSync(t, { recursive: true, force: true });
 		}
 	});
 
@@ -948,7 +948,7 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 	const pgBase = (root: string) => join(root, "usr/lib/postgresql");
 	const cloneMajor = (root: string, n: string, move = false) => {
 		cpSync(join(pgBase(root), "16"), join(pgBase(root), n), { recursive: true });
-		if (move) rmSync(join(pgBase(root), "16"), { recursive: true });
+		if (move) fs.rmSync(join(pgBase(root), "16"), { recursive: true });
 		protect(root);
 	};
 	const dataDir = (root: string) => join(root, "var/lib/test-org-records/pg");
@@ -974,7 +974,7 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 			expect(r.out).not.toContain("/17/bin");
 			expect(r.out.trimEnd().split("\n").at(-1)).toBe("C10_RECORDS_INSTALLED org=test-org user=test-org-records cluster=16/test-org-records unit=active peer-audit=ok");
 		} finally {
-			rmSync(t, { recursive: true, force: true });
+			fs.rmSync(t, { recursive: true, force: true });
 		}
 	});
 
@@ -1015,7 +1015,7 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 			expect(readFileSync(L, "utf8")).toBe("");
 			expect(digest(root)).toEqual(before);
 		} finally {
-			rmSync(t, { recursive: true, force: true });
+			fs.rmSync(t, { recursive: true, force: true });
 		}
 	});
 
@@ -1031,7 +1031,7 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 			// A symlinked binary is refused too, without following it.
 			chmodSync(join(root, "usr/lib"), 0o755);
 			const bin16 = join(pgBase(root), "16/bin");
-			rmSync(join(bin16, "psql"));
+			fs.rmSync(join(bin16, "psql"));
 			symlinkSync("/bin/true", join(bin16, "psql"));
 			writeFileSync(L, "");
 			const linked = again();
@@ -1039,7 +1039,7 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 			expect(linked.err).toContain(`refused: ${bin16}/psql is not root-owned and protected; nothing was changed`);
 			expect(readFileSync(L, "utf8")).toBe("");
 		} finally {
-			rmSync(t, { recursive: true, force: true });
+			fs.rmSync(t, { recursive: true, force: true });
 		}
 	});
 
@@ -1053,7 +1053,7 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 			expect(r.out).toContain(`+ runuser -u test-org-records -- ${pgBase(root)}/17/bin/initdb -D `);
 			expect(r.out.trimEnd().split("\n").at(-1)).toBe("C10_RECORDS_INSTALLED org=test-org user=test-org-records cluster=17/test-org-records unit=active peer-audit=ok");
 		} finally {
-			rmSync(t, { recursive: true, force: true });
+			fs.rmSync(t, { recursive: true, force: true });
 		}
 	});
 
@@ -1065,7 +1065,7 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 			expect(r.out.trimEnd().split("\n").at(-1)).toBe("C10_RECORDS_INSTALLED org=test-org user=test-org-records cluster=16/test-org-records unit=active peer-audit=ok");
 			expect(r.out).not.toMatch(/postgresql-17|PGDG/i);
 		} finally {
-			rmSync(t, { recursive: true, force: true });
+			fs.rmSync(t, { recursive: true, force: true });
 		}
 	});
 
@@ -1100,7 +1100,7 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 			expect(calls2).not.toContain("systemctl restart test-org-records.service");
 			expect(calls2).toContain("systemctl reload test-org-records.service");
 		} finally {
-			rmSync(t, { recursive: true, force: true });
+			fs.rmSync(t, { recursive: true, force: true });
 		}
 	});
 
@@ -1117,7 +1117,7 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 			expect(readFileSync(marker, "utf8")).toBe("test-org-records.service\n");
 			expect(statSync(marker).mode & 0o777).toBe(0o600);
 			// Rerun with identical inputs: node, bundle and units now match, but the marker forces the restart.
-			rmSync(join(t, "fail-restart"));
+			fs.rmSync(join(t, "fail-restart"));
 			writeFileSync(L, "");
 			const second = again();
 			expect(second.code, second.err + second.out).toBe(0);
@@ -1143,7 +1143,7 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 			expect(bad.out).not.toContain("## 1. ");
 			expect(readFileSync(marker, "utf8")).toBe("test-org-records.service\n/etc/shadow\n");
 		} finally {
-			rmSync(t, { recursive: true, force: true });
+			fs.rmSync(t, { recursive: true, force: true });
 		}
 	});
 
@@ -1165,7 +1165,7 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 			expect(readFileSync(marker, "utf8")).toBe("test-org-records-pg.service\n");
 			expect(readFileSync(hba, "utf8")).not.toBe("# older pg_hba.conf\n");
 			// Rerun with identical inputs: the config now matches, but the marker forces the restart and is cleared.
-			rmSync(join(t, "fail-restart"));
+			fs.rmSync(join(t, "fail-restart"));
 			writeFileSync(L, "");
 			const second = again();
 			expect(second.code, second.err + second.out).toBe(0);
@@ -1179,7 +1179,7 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 			expect(readFileSync(L, "utf8")).not.toContain("systemctl restart test-org-records-pg.service");
 			expect(existsSync(marker)).toBe(false);
 		} finally {
-			rmSync(t, { recursive: true, force: true });
+			fs.rmSync(t, { recursive: true, force: true });
 		}
 	});
 
@@ -1214,7 +1214,7 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 			expect(readdirSync(state)).toEqual(["restart-pending"]);
 			expect(failed.out).toMatch(new RegExp(`^\\+ sync -- ${reEsc(state)}/restart-pending\\.\\w{6}$`, "m"));
 			// The fault is gone: the rerun still restarts the service (bytes now match) before its receipt.
-			rmSync(join(t, "fail-marker"));
+			fs.rmSync(join(t, "fail-marker"));
 			writeFileSync(L, "");
 			const second = again();
 			expect(second.code, second.err + second.out).toBe(0);
@@ -1226,7 +1226,7 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 			expect(existsSync(marker)).toBe(false);
 			expect(readdirSync(state)).toEqual([]);
 		} finally {
-			rmSync(t, { recursive: true, force: true });
+			fs.rmSync(t, { recursive: true, force: true });
 		}
 	});
 
@@ -1248,7 +1248,7 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 			// The rename happened (the marker lists the unit), the bundle was not replaced.
 			expect(readFileSync(marker, "utf8")).toBe("test-org-records.service\n");
 			expect(readFileSync(main, "utf8")).toBe("// older bundle\n");
-			rmSync(join(t, "fail-sync"));
+			fs.rmSync(join(t, "fail-sync"));
 			const second = again();
 			expect(second.code, second.err + second.out).toBe(0);
 			const synced = second.out.search(new RegExp(`^\\+ sync -- ${reEsc(state)}$`, "m"));
@@ -1260,7 +1260,7 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 			expect(second.out.indexOf("+ systemctl restart test-org-records.service")).toBeLessThan(second.out.indexOf("C10_RECORDS_INSTALLED"));
 			expect(existsSync(marker)).toBe(false);
 		} finally {
-			rmSync(t, { recursive: true, force: true });
+			fs.rmSync(t, { recursive: true, force: true });
 		}
 	});
 
@@ -1278,7 +1278,7 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 			writeFileSync(canary, "16\n");
 			const refused = `refused: ${data}/PG_VERSION is not a regular file in a real directory (a symlink?); nothing was changed`;
 			// The version file is a symlink to a canary.
-			rmSync(join(data, "PG_VERSION"));
+			fs.rmSync(join(data, "PG_VERSION"));
 			symlinkSync(canary, join(data, "PG_VERSION"));
 			writeFileSync(L, "");
 			const link = again();
@@ -1287,18 +1287,18 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 			expect(link.out).not.toContain("## 1. ");
 			expect(readFileSync(L, "utf8")).toBe("");
 			// The data dir itself is redirected to a directory holding a plain PG_VERSION.
-			rmSync(join(data, "PG_VERSION"));
+			fs.rmSync(join(data, "PG_VERSION"));
 			const moved = join(t, "outside/pg");
 			cpSync(data, moved, { recursive: true });
 			writeFileSync(join(moved, "PG_VERSION"), "16\n");
-			rmSync(data, { recursive: true });
+			fs.rmSync(data, { recursive: true });
 			symlinkSync(moved, data);
 			const dir = again();
 			expect(dir.code).toBe(1);
 			expect(dir.err).toContain(refused);
 			expect(dir.out).not.toContain("## 1. ");
 		} finally {
-			rmSync(t, { recursive: true, force: true });
+			fs.rmSync(t, { recursive: true, force: true });
 		}
 	});
 
@@ -1333,7 +1333,7 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 				expect(calls).toEqual(expect.arrayContaining([expect.stringMatching(new RegExp(`^install -m ${mode} ${owner} ${state}\\w{6} ${reEsc(target)}$`))]));
 			expect(readdirSync(join(root, "var/lib/test-org-records-installer"))).toEqual([]);
 		} finally {
-			rmSync(t, { recursive: true, force: true });
+			fs.rmSync(t, { recursive: true, force: true });
 		}
 	});
 
@@ -1349,13 +1349,13 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 				expect(r.out).not.toContain("C10_RECORDS_INSTALLED org=");
 			}
 		} finally {
-			rmSync(t, { recursive: true, force: true });
+			fs.rmSync(t, { recursive: true, force: true });
 		}
 	});
 
 	it.skipIf(process.getuid?.() === 0)("die inside a step names the step (apt left no PostgreSQL); the drop-in came first", () => {
 		writeFileSync(log, "");
-		const { t, r } = relayRun("plain", "tree16", (root) => rmSync(pgBase(root), { recursive: true }));
+		const { t, r } = relayRun("plain", "tree16", (root) => fs.rmSync(pgBase(root), { recursive: true }));
 		try {
 			expect(r.code).toBe(1);
 			expect(r.err).toMatch(/^records-paul-steps: FAILED at step 2 \(Prerequisites: .*\) \(line \d+\): apt-get install postgresql left no /m);
@@ -1364,7 +1364,7 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 			expect(readdirSync(join(t, "root/etc/postgresql-common/createcluster.d"))).toEqual(["zz-test-org-records.conf"]);
 		} finally {
 			writeFileSync(log, "");
-			rmSync(t, { recursive: true, force: true });
+			fs.rmSync(t, { recursive: true, force: true });
 		}
 	});
 
@@ -1395,7 +1395,7 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 			expect(existsSync(join(root, "etc/test-org-records"))).toBe(false);
 			expect(readFileSync(L, "utf8")).toContain("systemctl disable test-org-records.service test-org-records-pg.service\n");
 		} finally {
-			rmSync(t, { recursive: true, force: true });
+			fs.rmSync(t, { recursive: true, force: true });
 		}
 	});
 
@@ -1491,7 +1491,7 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 			expect(down.out).not.toContain("C10_RECORDS_INSTALLED org=");
 			expect(down.out).not.toContain("## ROLLBACK");
 		} finally {
-			rmSync(t, { recursive: true, force: true });
+			fs.rmSync(t, { recursive: true, force: true });
 		}
 	});
 
@@ -1553,7 +1553,7 @@ FAKE_AS_USER=1 exec "$@"
 				expect(calls).not.toContain("systemctl reload");
 				if (context === "restart") expect(readFileSync(marker, "utf8")).toBe("test-org-records.service\n");
 			} finally {
-				rmSync(t, { recursive: true, force: true });
+				fs.rmSync(t, { recursive: true, force: true });
 			}
 		});
 
@@ -1587,7 +1587,7 @@ process.stdout.write("starting\\n");
 			const exited = new Promise<void>((resolve) => listener.once("exit", () => resolve()));
 			listener.kill();
 			await exited;
-			rmSync(t, { recursive: true, force: true });
+			fs.rmSync(t, { recursive: true, force: true });
 		}
 	});
 
@@ -1607,7 +1607,7 @@ process.stdout.write("starting\\n");
 			expect(denied.out).not.toContain("## ROLLBACK");
 			expect(readFileSync(L, "utf8")).toContain("runuser python3 -c import socket, sys;");
 		} finally {
-			rmSync(t, { recursive: true, force: true });
+			fs.rmSync(t, { recursive: true, force: true });
 		}
 	});
 
@@ -1631,14 +1631,14 @@ process.stdout.write("starting\\n");
 		} finally {
 			chmodSync(dir, 0o700);
 			await new Promise<void>((resolve) => server.close(() => resolve()));
-			rmSync(dir, { recursive: true, force: true });
+			fs.rmSync(dir, { recursive: true, force: true });
 		}
 	});
 
 	it.skipIf(process.getuid?.() === 0)("a missing service socket fails the success checks", () => {
 		const { t, again } = relayRun("plain");
 		try {
-			rmSync(join(t, "root/run/test-org-records/records.sock"));
+			fs.rmSync(join(t, "root/run/test-org-records/records.sock"));
 			writeFileSync(join(t, "root/run/test-org-records/records.sock"), "not a socket");
 			// No --operator: the step 8 reload (which also waits for the socket) is not reached.
 			const r = again([]);
@@ -1646,7 +1646,7 @@ process.stdout.write("starting\\n");
 			expect(r.err).toMatch(/FAILED at step 9 \(Verification\) .*check failed \(service socket\): test -S \S+\/root\/run\/test-org-records\/records\.sock$/m);
 			expect(r.out).not.toContain("C10_RECORDS_INSTALLED org=");
 		} finally {
-			rmSync(t, { recursive: true, force: true });
+			fs.rmSync(t, { recursive: true, force: true });
 		}
 	});
 
@@ -1668,7 +1668,7 @@ process.stdout.write("starting\\n");
 				]);
 				expect(readdirSync(outside).sort()).toEqual(layout === "dest-link" ? ["keep", "relay.json"] : ["keep", "test-org-records"]);
 			} finally {
-				rmSync(t, { recursive: true, force: true });
+				fs.rmSync(t, { recursive: true, force: true });
 			}
 		});
 });

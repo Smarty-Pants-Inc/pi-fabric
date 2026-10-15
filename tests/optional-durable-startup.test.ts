@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync, symlinkSync } from "node:fs";
+import fs, { mkdtempSync, symlinkSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { build } from "esbuild";
@@ -60,7 +60,7 @@ describe("lazy durable Pi startup", () => {
       `], { encoding: "utf8", timeout: 30_000 });
       expect(output).toContain("durable engines stay lazy even with the built-in runner registered");
     } finally {
-      rmSync(directory, { recursive: true, force: true });
+      fs.rmSync(directory, { recursive: true, force: true });
     }
   }, 40_000);
 });

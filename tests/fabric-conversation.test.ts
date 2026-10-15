@@ -1,7 +1,7 @@
 import "./fixtures/conversation-host.js";
 import type { KeybindingsManager, Theme } from "@earendil-works/pi-coding-agent";
 import type { TUI } from "@earendil-works/pi-tui";
-import { appendFileSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import fs, { appendFileSync, mkdtempSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { NativeConversationReader } from "../src/ui/conversation-native-reader.js";
@@ -214,7 +214,7 @@ describe.each(["regular", "fullscreen"] as const)("native conversation dock in %
       expect(latest).toContain("Working");
       expect(latest).not.toContain("newer activity available");
     } finally {
-      rmSync(directory, { recursive: true, force: true });
+      fs.rmSync(directory, { recursive: true, force: true });
     }
   });
 

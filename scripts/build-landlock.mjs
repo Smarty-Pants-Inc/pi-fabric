@@ -7,7 +7,7 @@
 // expected sha256 for that toolchain. Without it the host's gcc or clang builds them, marked unpinned.
 // Either way the flags are fixed (CFLAGS, LDFLAGS and compiler search variables are ignored).
 import { createHash } from "node:crypto";
-import { chmodSync, copyFileSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import fs, { chmodSync, copyFileSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -115,7 +115,7 @@ function buildHelpers(compiler, pinned, recordedFlags, build, arch, windows, lin
         throw new Error(`${helper} sha256 ${hashes[0]} is not the expected ${expected} for ${compiler} (native/toolchain.json)`);
       }
       copyFileSync(join(outputs[0], helper), `dist/native/${helper}`);
-    } finally { for (const dir of outputs) rmSync(dir, { recursive: true, force: true }); }
+    } finally { for (const dir of outputs) fs.rmSync(dir, { recursive: true, force: true }); }
     helpers[helper] = hashes[0];
   }
   // For assert-build-artifacts.mjs only; the runtime trusts the digests embedded into the bundle.

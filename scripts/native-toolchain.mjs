@@ -5,7 +5,7 @@
 // into the cache is trusted (pi-fabric#879 review). Without a usable tarball the build falls back to the
 // host's gcc/clang, marked unpinned.
 import { createHash } from "node:crypto";
-import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import fs, { chmodSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -70,7 +70,7 @@ export const withPinnedZig = (tarball, use) => {
     // zig's global and local caches hold compiled runtime pieces: keep them private to this build too.
     const env = { ZIG_GLOBAL_CACHE_DIR: join(work, "cache"), ZIG_LOCAL_CACHE_DIR: join(work, "cache") };
     return use(join(work, "zig", "zig"), env);
-  } finally { rmSync(work, { recursive: true, force: true }); }
+  } finally { fs.rmSync(work, { recursive: true, force: true }); }
 };
 
 export async function fetchPinnedZig() {

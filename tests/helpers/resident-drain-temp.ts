@@ -78,7 +78,9 @@ process.stderr.write = function(chunk, ...args) {
 process.once("exit", () => record({ event: "exit", count: guard.count, root: guard.root }));
 `, { mode: 0o600 });
       return {
-        NODE_OPTIONS: `${narrowed} --import=${pathToFileURL(preload).href}`, HOME: home, USERPROFILE: home,
+        NODE_OPTIONS: `${narrowed} --import=${pathToFileURL(preload).href}`,
+        BUN_OPTIONS: process.env.BUN_OPTIONS, TEST_DELETION_GUARD_ROOT: root,
+        HOME: home, USERPROFILE: home,
         TMPDIR: root, TMP: root, TEMP: root,
         XDG_CACHE_HOME: path.join(root, "cache"), XDG_CONFIG_HOME: path.join(root, "config"),
         XDG_DATA_HOME: path.join(root, "data"), XDG_STATE_HOME: path.join(root, "state"),

@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import fsp, { mkdtemp } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -116,7 +116,7 @@ describe.each(["shell", "agent"] as const)("%s completion with the real Pi SDK",
     } finally {
       shellInbox?.close(); agentInbox?.close();
       await jobs.close();
-      await rm(cwd, { recursive: true, force: true });
+      await fsp.rm(cwd, { recursive: true, force: true });
     }
   }, 15000);
 });

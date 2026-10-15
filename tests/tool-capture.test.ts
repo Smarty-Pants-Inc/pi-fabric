@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import fsp, { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -340,10 +340,10 @@ describe("registered extension tool capture", () => {
       try {
         expect(await bundleExtensionRunnerConstructors(plainDir)).toEqual([]);
       } finally {
-        await rm(plainDir, { recursive: true, force: true });
+        await fsp.rm(plainDir, { recursive: true, force: true });
       }
     } finally {
-      await rm(bundleDir, { recursive: true, force: true });
+      await fsp.rm(bundleDir, { recursive: true, force: true });
     }
   });
 
@@ -423,7 +423,7 @@ describe("registered extension tool capture", () => {
       expect(catalog.list().map((entry) => entry.name)).toEqual(["box_list"]);
     } finally {
       process.argv[1] = savedArgv1;
-      await rm(hostDir, { recursive: true, force: true });
+      await fsp.rm(hostDir, { recursive: true, force: true });
     }
   });
 

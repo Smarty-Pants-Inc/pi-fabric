@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import fsp, { mkdtemp } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { createAssistantMessageEventStream, getCurrentTools, type AssistantMessage } from "@earendil-works/pi-ai";
@@ -106,5 +106,5 @@ it("uses native prepareLoadout to hide historical and late declarations without 
       await session.prompt("Restore the native optional loadout.");
       expect(requests.at(-1)?.slice().sort()).toEqual(["fabric_exec", "fixture_direct", "fixture_late"]);
     } finally { session.dispose(); }
-  } finally { await rm(cwd, { recursive: true, force: true }); }
+  } finally { await fsp.rm(cwd, { recursive: true, force: true }); }
 }, 30_000);

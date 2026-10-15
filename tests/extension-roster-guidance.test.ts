@@ -1,4 +1,4 @@
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import fs, { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
@@ -55,7 +55,7 @@ describe("extensionToolRosterGuidance", () => {
       );
       expect(roster).toContain("- pi-manifest-ext: tool_one");
     } finally {
-      rmSync(root, { recursive: true, force: true });
+      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 

@@ -1,5 +1,5 @@
 import { execFileSync, spawnSync } from "node:child_process";
-import { mkdir, mkdtemp, rm, stat, utimes, writeFile } from "node:fs/promises";
+import fsp, { mkdir, mkdtemp, stat, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -24,7 +24,7 @@ const tempRoot = async (): Promise<string> => {
 
 afterEach(async () => {
   await Promise.all(
-    tempRoots.splice(0).map((root) => rm(root, { recursive: true, force: true })),
+    tempRoots.splice(0).map((root) => fsp.rm(root, { recursive: true, force: true })),
   );
 });
 
@@ -74,7 +74,7 @@ describe("PrewalkDriftTracker", () => {
     expect(drift?.deleted).toBe(0);
     expect(drift?.files.slice().sort()).toEqual(["a.txt", "b.txt"]);
 
-    await rm(path.join(root, "a.txt"));
+    await fsp.rm(path.join(root, "a.txt"));
     const second = await tracker.evaluate("session-1", root);
     expect(second?.deleted).toBe(1);
     expect(second?.files).toEqual(["a.txt"]);
@@ -147,7 +147,7 @@ describe("PrewalkDriftTracker", () => {
       await tracker.captureBaseline("session-2", root);
       await touch();
       expect(await tracker.evaluate("session-2", root)).toMatchObject({ modified: 1 });
-      await rm(file);
+      await fsp.rm(file);
       expect(await tracker.evaluate("session-1", root)).toMatchObject({ deleted: 1 });
       await writeFile(file, "bravo");
       expect(await tracker.evaluate("session-1", root)).toMatchObject({ added: 1 });

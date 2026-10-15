@@ -45,7 +45,7 @@ const executionSettled = (): Promise<void> => new Promise(resolve => {
   if (process.platform !== "win32" && process.connected && process.send) process.send({ type: "fabric-execution-settled" }, () => resolve());
   else resolve();
 });
-import { interruptedModelStreamError, retryableProviderError } from "./worker/provider-error.js";
+import { interruptedModelStreamError, retryableProviderError, WARNING_RETENTION_CAP } from "./worker/provider-error.js";
 import { copyFabricProvenance, type FabricTurnProvenance } from "./fabric-provenance.js";
 import { ActivationSession } from "./worker/activation-session.js";
 import type { ActorContextReseed } from "./worker/context-admission.js";
@@ -960,7 +960,7 @@ const main = async (): Promise<void> => {
       recoveryWatchdog.suspend();
       if (closeTimer) clearTimeout(closeTimer);
       closeTimer = undefined;
-      record.warnings = [...(record.warnings ?? []), `${error.message}; aborting turn for one same-model retry`].slice(-20);
+      record.warnings = [...(record.warnings ?? []), `${error.message}; aborting turn for one same-model retry`].slice(-WARNING_RETENTION_CAP);
       update();
       // Native abort waits for the assistant to finalize/persist. Close stdin
       // only after its acknowledgement; SIGTERM + EOF together can race two
@@ -1023,7 +1023,7 @@ const main = async (): Promise<void> => {
       if (piSettledSuccessfully && (hasFinalResult || piSettlementDurable) && modelControl.ready && !terminalStatus &&
           !terminalError && !sawAgentError && !lostResult) {
         const warning = `${error}; preserving final result and terminating child`;
-        record.warnings = [...(record.warnings ?? []), warning].slice(-20);
+        record.warnings = [...(record.warnings ?? []), warning].slice(-WARNING_RETENTION_CAP);
         appendLog(`${JSON.stringify({ type: "worker_warning", warning })}\n`);
         process.stderr.write(`[pi-fabric] ${warning}\n`);
         // Persist the result and warning BEFORE signalling the owned group.
@@ -2396,7 +2396,7 @@ const main = async (): Promise<void> => {
       (artifactPath ? `; first ${prefix.length} characters saved to: ${artifactPath}` : "");
     appendLog(`${JSON.stringify({ type: "worker_warning", warning })}\n`);
     process.stderr.write(`[pi-fabric] ${warning}\n`);
-    record.warnings = [...(record.warnings ?? []), warning].slice(-20);
+    record.warnings = [...(record.warnings ?? []), warning].slice(-WARNING_RETENTION_CAP);
     // Never strand a correlated admission response behind the event-line cap.
     // Only its bounded envelope is inspected; the history remains discarded.
     contextAdmission?.observeOversizedResponse(prefix, chars);
@@ -2619,7 +2619,7 @@ const main = async (): Promise<void> => {
       recoveryWatchdog.observe({ type: "auto_retry_start", delayMs: waitMs, errorMessage });
       const resume = { attempt: providerResumeAttempts + 1, maxAttempts: PI_PROVIDER_RESUME_DELAYS_MS.length,
         delayMs: waitMs, error: errorMessage, sessionFile: piSessionFile };
-      record.warnings = [...(record.warnings ?? []), `Pi provider recovery: same-session resume ${resume.attempt}/${resume.maxAttempts} scheduled after ${waitMs}ms`].slice(-20);
+      record.warnings = [...(record.warnings ?? []), `Pi provider recovery: same-session resume ${resume.attempt}/${resume.maxAttempts} scheduled after ${waitMs}ms`].slice(-WARNING_RETENTION_CAP);
       update();
       emitLifecycle("run.resumed", { ...resume, phase: "scheduled" });
       appendLog(`${JSON.stringify({ type: "fabric_provider_resume", ...resume, phase: "scheduled" })}\n`);
@@ -2787,7 +2787,7 @@ const main = async (): Promise<void> => {
     // valid JSON prefix) must never pass completed-only consumers.
     record.partialText = interruptedText;
     record.text = interruptedText;
-    record.warnings = [...(record.warnings ?? []), warning].slice(-20);
+    record.warnings = [...(record.warnings ?? []), warning].slice(-WARNING_RETENTION_CAP);
     appendLog(`${JSON.stringify({ type: "worker_warning", warning })}\n`);
   }
   validateCompletedResult();

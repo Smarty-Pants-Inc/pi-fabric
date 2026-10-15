@@ -154,6 +154,12 @@ export const readFabricToolPlacementRequestV1 = (
   }
   return value as FabricToolPlacementRequestV1;
 };
+/** Asks trace-context listeners for the W3C trace context of a child about to launch. */
+export const FABRIC_CHILD_TRACE_CONTEXT_EVENT = "pi-fabric:child-trace-context:v1";
+export type {
+  FabricChildTraceContextRequestV1,
+  FabricTraceContextV1,
+} from "./agents/trace-context.js";
 export const FABRIC_COMPONENT_REGISTER_EVENT = "pi-fabric:component:register:v1";
 export const FABRIC_COMPONENT_DISCOVER_EVENT = "pi-fabric:component:discover:v1";
 export const FABRIC_PREWALK_REQUEST_EVENT = "pi-fabric:prewalk:request:v1";

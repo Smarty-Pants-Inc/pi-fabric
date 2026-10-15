@@ -275,7 +275,7 @@ export const buildApprovalsSection = (
       () => [
         setting("approvals.model", "Auto model", config.approvals.model || INHERIT_VALUE, {
           description:
-            "Pi or Jev model used as the auto-mode safety classifier. Inherit uses the active session model. Jev requires /login jev (TypeSafe), the existing openrouter credential (OpenRouter), or the existing vercel-ai-gateway credential (Vercel AI Gateway) and the configured minimum safety probability (default 0.50); lower scores and errors require explicit approval. No executable classifier tools.",
+            "Pi or Jev model used as the auto-mode safety classifier. Inherit uses the active session model. Jev requires /login jev (TypeSafe), the existing openrouter credential (OpenRouter), the existing vercel-ai-gateway credential (Vercel AI Gateway), or /login subq (SubQ Snap) and the configured minimum safety probability (default 0.50); lower scores and errors require explicit approval. No executable classifier tools.",
           submenu: modelPickerSubmenu(
             theme,
             {
@@ -287,7 +287,7 @@ export const buildApprovalsSection = (
             },
             {
               headerText:
-                "Safety classifier for auto approval policies. Inherit uses the active Pi model. Jev uses typed judgments, not chat; authenticate with /login jev for TypeSafe, /login openrouter for OpenRouter, or /login vercel-ai-gateway for Vercel AI Gateway.",
+                "Safety classifier for auto approval policies. Inherit uses the active Pi model. Jev uses typed judgments, not chat; authenticate with /login jev for TypeSafe, /login openrouter for OpenRouter, /login vercel-ai-gateway for Vercel AI Gateway, or /login subq for SubQ Snap.",
               inheritName: "Use the active Pi session model",
             },
           ),

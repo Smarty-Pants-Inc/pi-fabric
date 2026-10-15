@@ -1,11 +1,8 @@
 import { accessSync, constants, statSync } from "node:fs";
 import path from "node:path";
-import * as PiCodingAgent from "@earendil-works/pi-coding-agent";
-import {
-  createBashToolDefinition,
-  type ToolDefinition,
-} from "@earendil-works/pi-coding-agent";
+import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type, type TSchema } from "typebox";
+import { PiCodingAgent } from "../core/host-sdk-runtime.js";
 import type { PiShellToolName } from "../core/pi-tools.js";
 
 // Per-call execution directory for Pi's shell tools.
@@ -178,7 +175,7 @@ class ShellCwdDefinitions {
 
 export class BashCwdDefinitions extends ShellCwdDefinitions {
   constructor() {
-    super(createBashToolDefinition);
+    super(PiCodingAgent.createBashToolDefinition);
   }
 }
 

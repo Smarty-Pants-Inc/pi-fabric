@@ -208,7 +208,7 @@ bun run benchmark:provider-dispatch
 bun run benchmark:startup . ../pi-fovea ../pi-contour
 ```
 
-The contributor toolchain pins Bend 2.0.36. `BEND_BIN` can select a trusted
+The contributor toolchain pins Bend 2.0.37. `BEND_BIN` can select a trusted
 compiler executable. Normal builds verify artifact hashes without Bend.
 
 The dispatch benchmark measures first use and warm full-registry read calls

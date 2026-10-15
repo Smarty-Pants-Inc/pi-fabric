@@ -212,17 +212,23 @@ describe("CapturedToolsProvider", () => {
     });
     const registeredTool: RegisteredTool = { definition, sourceInfo };
     const lifecycleEvents: string[] = [];
+    const parents: Record<string, unknown> = {};
     const runner = {
       createContext: () => ({ cwd: "/captured-context" }),
       getActiveTools: () => [],
-      emit: vi.fn(async (event: { type: string }) => {
+      emit: vi.fn(async (event: { type: string; parentToolCallId?: string }) => {
         lifecycleEvents.push(event.type);
+        parents[event.type] = event.parentToolCallId;
       }),
-      emitToolCall: vi.fn(async (event: { input: Record<string, unknown> }) => {
+      emitToolCall: vi.fn(async (event: { type: string; parentToolCallId?: string; input: Record<string, unknown> }) => {
+        parents[event.type] = event.parentToolCallId;
         event.input.value = `${String(event.input.value)}!`;
         return undefined;
       }),
-      emitToolResult: vi.fn(async () => ({ details: { hooked: true } })),
+      emitToolResult: vi.fn(async (event: { type: string; parentToolCallId?: string }) => {
+        parents[event.type] = event.parentToolCallId;
+        return { details: { hooked: true } };
+      }),
     } as unknown as ExtensionRunner;
     const catalog = new CapturedToolCatalog();
     catalog.replace(
@@ -270,6 +276,14 @@ describe("CapturedToolsProvider", () => {
       "tool_execution_update",
       "tool_execution_end",
     ]);
+    // Every replayed event names the call that issued it.
+    expect(parents).toEqual({
+      tool_call: "parent",
+      tool_execution_start: "parent",
+      tool_execution_update: "parent",
+      tool_result: "parent",
+      tool_execution_end: "parent",
+    });
   });
 
   it("removes tools from discovery when a captured tool deactivates them (#113)", async () => {

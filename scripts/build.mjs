@@ -112,6 +112,8 @@ const lazyEntryPoints = [
   "src/fabric-runtime-state.ts",
   "src/provider-error-class.ts",
   "src/topology/root-inbox-context.ts",
+  // Advisory peer notices load only at the first real input boundary.
+  "src/topology/peer-presence.ts",
   "src/components/configuration.ts",
   "src/providers/jev-provider.ts",
   "src/records/service.ts",
@@ -136,6 +138,8 @@ const lazyEntryPoints = [
   "src/speculation/scanner.ts",
   "src/speculation/python-scanner.ts",
   "src/ui/dashboard.ts",
+  // Actual first widget focus/click; keep activity rendering off the idle graph.
+  "src/ui/widget-interaction.ts",
   "src/ui/shell-tasks.ts",
   "src/ui/image-overlays.ts",
   "src/ui/languages/bend.ts",

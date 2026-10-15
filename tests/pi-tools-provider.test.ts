@@ -92,6 +92,32 @@ describe("PiToolsProvider lifecycle", () => {
     expect(toolResult.toolCallId.startsWith(NESTED_TOOL_CALL_ID_PREFIX)).toBe(true);
   });
 
+  it("names the calling tool call on every replayed event", async () => {
+    const events: { type: string; toolCallId: string; parentToolCallId?: string }[] = [];
+    const record = (result?: unknown) => vi.fn(async (event: (typeof events)[number]) => {
+      events.push(event);
+      return result;
+    });
+    const runner = makeRunner({ emit: record(), emitToolCall: record(), emitToolResult: record() });
+    const operations: BashOperations = {
+      exec: async (_command, _cwd, { onData }) => {
+        onData(Buffer.from("streamed\n"));
+        return { exitCode: 0 };
+      },
+    };
+
+    await registerWithRunner(runner, operations).invoke("pi.bash", { command: "echo streamed" }, baseContext);
+
+    expect(new Set(events.map(event => event.type))).toEqual(
+      new Set(["tool_call", "tool_execution_start", "tool_execution_update", "tool_result", "tool_execution_end"]),
+    );
+    // Parallel fabric_exec calls are told apart by this id, not by which one is open.
+    for (const event of events) {
+      expect(event.parentToolCallId, event.type).toBe("parent");
+      expect(event.toolCallId.startsWith(NESTED_TOOL_CALL_ID_PREFIX), event.type).toBe(true);
+    }
+  });
+
   it("stops waiting for a hanging lifecycle handler when the invocation is aborted", async () => {
     const controller = new AbortController();
     const runner = makeRunner({

@@ -1089,6 +1089,31 @@ Fabric children may read these environment variables. They are stable and versio
 | `PI_FABRIC_SCOPE` | JSON `FabricScope` `{ version: 1, principal, grants, digest, parentDigest? }`. Present only when the parent is scoped: the inherited or narrowed scope. The worker always clears `PI_FABRIC_SCOPE_FILE`. A child Fabric reads it as its root scope and fails closed when it is malformed. See [principal and scope](providers.md#principal-and-scope). |
 | `PI_FABRIC_DEPTH` | Recursion depth of the child (the root is 0). |
 | `PI_FABRIC_AGENT_NAME` | The child's display name. |
+| `TRACEPARENT`, `TRACESTATE` | W3C Trace Context headers an extension supplied for this launch; see [child trace context](#child-trace-context). Without a reply the child keeps the values its worker inherited. |
+
+### Child trace context
+
+A child agent is its own process, so its telemetry joins the parent's trace only when the parent's trace context reaches its environment. Before each child launch and each relaunch (startup retry, resume), Fabric emits `FABRIC_CHILD_TRACE_CONTEXT_EVENT` (`pi-fabric:child-trace-context:v1`) on Pi's event bus, so a tracing extension can answer for that launch alone:
+
+```ts host
+import {
+  FABRIC_CHILD_TRACE_CONTEXT_EVENT,
+  type FabricChildTraceContextRequestV1,
+} from "pi-fabric/protocol";
+
+pi.events.on(FABRIC_CHILD_TRACE_CONTEXT_EVENT, (value) => {
+  const request = value as FabricChildTraceContextRequestV1;
+  // parentToolCallId: the outer fabric_exec call. nestedToolCallId: the agents.* call.
+  const span = spanForToolCall(request.nestedToolCallId ?? request.parentToolCallId);
+  if (span) request.reply({ traceparent: traceparentOf(span), tracestate: tracestateOf(span) });
+});
+```
+
+The request is `{ version: 1, parentToolCallId?, nestedToolCallId?, runId?, runner, name, reply }`. `nestedToolCallId` is the id the call's [audit](audit-trace.md) and proxied `tool_result` carry. Actor turns have neither call id. A durable `agents.spawn` has no `runId`: the session asks before it hands the request to the resident host, which mints the id and reuses the answer for its own relaunches.
+
+`reply` must be called synchronously, before the listener's first `await`. The first valid reply wins. Fabric carries it to the worker beside the lineage (`--trace-context`), and the worker exports `TRACEPARENT` and `TRACESTATE` to the child, replacing both inherited values. That reaches the local worker transports, including tmux, screen, LocalTerm, and Herdr sessions that start from the multiplexer's environment, and deferred handoffs that launch after `fabric_exec` returns. The fork's remote one-shot fleet placement launcher does not yet forward the supplied headers over SSH; that path retains its existing launcher environment. A relaunch that gets no reply keeps the context of the launch before it.
+
+A reply can set only those two headers. `traceparent` must be a lowercase W3C `version-traceid-parentid-flags` value with non-zero ids; `tracestate` is optional printable ASCII of at most 512 characters. `reply` throws on anything else, and on a call after the launch, so the mistake surfaces in the listener. A listener that throws never blocks a launch. With no reply Fabric sets nothing, and the child keeps whatever `TRACEPARENT` its worker inherited. Custom [runner adapters](#custom-runners) receive the context as `context.traceContext`.
 
 [Model-guidance components](components.md#model-facing-guidance-components) can target participants by canonical provider/model. Direct agents and actors retain their role prompt and receive matching append guidance after it. Recursive Pi children load the project components and resolve their own replaceable Fabric execution slot, so the parent does not duplicate guidance. Durable owners use the latest atomically committed guidance snapshot for each launch. Guidance changes prompts only; it cannot widen tools, approvals, or committed capabilities. Task text, message envelopes, run IDs, and timestamps stay out of the guidance system prompt, so repeated runs with the same role, model, and component projection retain a byte-stable prefix.
 
@@ -1175,6 +1200,30 @@ Two host-local, versioned events on `pi.events` let queue extensions coordinate 
 - `pi-fabric:peer:await-settle:v1` claims and resolves once every watched peer (a `selector` label/id, or all peers when omitted) has been quiet for `settledForMs` (default 3s) since its last observed run. Peers that vanish from the mesh count as settled. The request accepts an `AbortSignal` for cancellation, and an optional `update` callback reports per-peer waiting status. Requests fail when the mesh is disabled.
 
 [pi-queue-steer](https://github.com/monotykamary/pi-queue-steer-factory) uses both: its `/fabric await LABEL` gate row holds queued rows until the target peers settle.
+
+### Peer presence notices
+
+A root session's model learns that other root Pi sessions are working in the same project without calling `agents.peers()` first. When the set of peers changes, Fabric adds one `pi-fabric-peer-presence` message to the transcript:
+
+```text
+<fabric-peers>
+Other Pi sessions are working in this project and share its files with you:
+- FAB-2 (id session:6f1c…)
+- FAB-3 (id session:a09e…), just joined
+No longer present: FAB-1.
+File or git changes you did not make may be theirs: do not revert or overwrite them. Before a wide edit, a branch switch, a reset, or a dependency install, use `agents.peers` inside `fabric_exec` to see who is running and `agents.steer` to message one by id.
+</fabric-peers>
+```
+
+- **When.** At the start of a prompt, and at the end of any turn that continues into another model call, so a peer that joins during a long run is noticed before the next request. A final turn adds nothing; the next prompt folds every change made while idle into one notice.
+- **Cache safety.** The notice is a persistent transcript message appended at a turn boundary. The system prompt, tool declarations, and every earlier message stay byte-identical, so the provider's cached prefix remains valid and only the notice itself is new input. The mid-run notice is a native `turn_end` boundary entry: it rides the request the run was about to make and never triggers an extra one. The text is deterministic for a given change. It carries labels, participant ids, and a working directory when that differs from the caller's, and no clock, run status, or model.
+- **Once per change.** Fabric rebuilds what the model was told from the notices on the active branch, so resuming or navigating a session does not repeat one. A compaction may drop earlier notices from the context, so the current peers are stated again at the next boundary.
+- **Departures are debounced.** A peer is reported gone only after it has been absent for 20 seconds, longer than the 15-second host lease, so a missed heartbeat or a wake from sleep is not reported as a departure and a rejoin. Arrivals are reported at once.
+- **Scope.** Only root sessions receive notices. Child agents and actors are coordinated by their parent. A notice shares what the participant directory already shares: prompts, results, and errors stay local.
+
+**Limitation:** a session joins the participant directory when its Fabric runtime activates, which is normally its first `fabric_exec` call. Before that it neither sees peers nor is seen by them, so the first notice of a fresh session arrives after that first call, before the next model request. A session that never runs `fabric_exec` stays invisible.
+
+The notice is advisory. It does not lock files or block edits: use [`mesh.put` compare-and-swap claims](#durable-mesh-coordination), or give each session its own Git worktree, when two sessions must not touch the same files. Set `mesh.peerNotices` to `false` to turn notices off.
 
 ### Participant lifecycle subscriptions
 

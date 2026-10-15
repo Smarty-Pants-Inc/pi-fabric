@@ -2,11 +2,11 @@
   "footprintFits": [
     [
       "count",
-      "bigint"
+      "number"
     ],
     [
       "limit",
-      "bigint"
+      "number"
     ],
     [
       "valid",
@@ -97,7 +97,7 @@
     ],
     [
       "boundary",
-      "bigint"
+      "number"
     ],
     "boolean"
   ],
@@ -222,38 +222,38 @@
   "summaryWithin": [
     [
       "bytes",
-      "bigint"
+      "number"
     ],
     [
       "byteLimit",
-      "bigint"
+      "number"
     ],
     [
       "projected",
-      "bigint"
+      "number"
     ],
     [
       "target",
-      "bigint"
+      "number"
     ],
     "boolean"
   ],
   "sampleWithin": [
     [
       "total",
-      "bigint"
+      "number"
     ],
     [
       "retained",
-      "bigint"
+      "number"
     ],
     [
       "omitted",
-      "bigint"
+      "number"
     ],
     [
       "limit",
-      "bigint"
+      "number"
     ],
     "boolean"
   ],

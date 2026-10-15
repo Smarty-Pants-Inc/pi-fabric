@@ -24,11 +24,11 @@ export { boundedEffectResources } from "./resources.js";
 
 export const acceptSummaryBounds = (bytes: number, byteLimit: number, projected: number, target: number): boolean =>
   [bytes, byteLimit, projected, target].every(isNatural) &&
-  summaryWithin(BigInt(bytes), BigInt(byteLimit), BigInt(projected), BigInt(target));
+  summaryWithin(bytes, byteLimit, projected, target);
 
 export const acceptSampleAccounting = (total: number, retained: number, omitted: number, limit: number): boolean =>
   [total, retained, omitted, limit].every(isArithmeticNatural) && retained + omitted <= BEND_NAT_MAX &&
-  sampleWithin(BigInt(total), BigInt(retained), BigInt(omitted), BigInt(limit));
+  sampleWithin(total, retained, omitted, limit);
 
 export interface CutSpan {
   first: number;
@@ -52,14 +52,14 @@ export const acceptCompactionCut = (candidate: CutCandidate, spans: Iterable<Cut
       typeof candidate.eligible !== "boolean" || typeof candidate.afterPrevious !== "boolean") return false;
   const base = {
     $: "Cut" as const, eligible: candidate.eligible, afterPrevious: candidate.afterPrevious,
-    retained: BigInt(candidate.retained), budget: BigInt(candidate.budget), boundary: BigInt(candidate.boundary),
+    retained: candidate.retained, budget: candidate.budget, boundary: candidate.boundary,
   };
   if (!cutAccepted({ ...base, spans: { $: "Nil" } })) return false;
   let batch: Span[] = [];
   for (const span of spans) {
     if (!isNatural(span.first) || !isNatural(span.last) || span.first > span.last ||
         typeof span.hasCall !== "boolean" || typeof span.hasResult !== "boolean") return false;
-    batch.push({ $: "Span", first: BigInt(span.first), last: BigInt(span.last), paired: span.hasCall && span.hasResult });
+    batch.push({ $: "Span", first: span.first, last: span.last, paired: span.hasCall && span.hasResult });
     if (batch.length === 128) {
       if (!cutAccepted({ ...base, spans: bendList(batch) })) return false;
       batch = [];
@@ -75,8 +75,8 @@ export const acceptMemoryChunk = (
   if (![range.start, range.end, range.total, length, expectedStart, expectedTotal].every(isArithmeticNatural) || range.start + length > BEND_NAT_MAX ||
       typeof range.complete !== "boolean") return false;
   return chunkAccepted({
-    $: "Chunk", start: BigInt(range.start), end: BigInt(range.end), total: BigInt(range.total),
-    length: BigInt(length), expectedStart: BigInt(expectedStart), expectedTotal: BigInt(expectedTotal),
+    $: "Chunk", start: range.start, end: range.end, total: range.total,
+    length: length, expectedStart: expectedStart, expectedTotal: expectedTotal,
     complete: range.complete,
   });
 };

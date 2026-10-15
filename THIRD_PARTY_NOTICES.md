@@ -15,10 +15,10 @@ unmodified under `node_modules/pi-coralbricks-provider`, at the exact version
 pinned in `package.json`. It is licensed under MIT, and its complete license is
 distributed beside it at `node_modules/pi-coralbricks-provider/LICENSE`.
 
-## Bend 2.0.36
+## Bend 2.0.37
 
 The generated policy kernel includes Bend's emitted JavaScript trampoline and
-compiled Base primitives from [Bend 2.0.36](https://github.com/bendlang/bend/tree/v2.0.36),
+compiled Base primitives from [Bend 2.0.37](https://github.com/bendlang/bend/tree/v2.0.37),
 Copyright 2026 HigherOrderCO, licensed under Apache-2.0. Pi Fabric selects the
 ABI library exports, adapts constructor tags at the boundary, and tree-shakes
 unused runtime code.

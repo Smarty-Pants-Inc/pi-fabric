@@ -10,6 +10,7 @@ import { restoreBorrowedInPlaceMain } from "../prewalk/return.js";
 import { truncateMiddle } from "../util.js";
 import type { FabricUiController } from "../ui/controller.js";
 import { FABRIC_CONVERSATION_SHORTCUT } from "../ui/conversation-shortcut.js";
+import { FABRIC_WIDGET_FOCUS_SHORTCUT } from "../ui/widget.js";
 import { safeText } from "../ui/format.js";
 import {
   FABRIC_PEER_AWAIT_SETTLE_EVENT,
@@ -298,6 +299,14 @@ export function registerFabricCommand(pi: ExtensionAPI, deps: FabricCommandDeps)
     },
   });
 
+  pi.registerShortcut?.(FABRIC_WIDGET_FOCUS_SHORTCUT, {
+    description: "Focus the Fabric widget to expand an agent's live activity",
+    handler: async (context) => {
+      if (context.mode !== "tui") return;
+      fabricUi.focusWidget(context);
+    },
+  });
+
   pi.registerShortcut?.("ctrl+alt+t", {
     description: "Inspect Fabric background shell tasks",
     handler: async (context) => {
@@ -315,6 +324,7 @@ export function registerFabricCommand(pi: ExtensionAPI, deps: FabricCommandDeps)
         "dashboard",
         "tasks",
         "chat",
+        "focus",
         "settings",
         "schema",
         "prewalk",
@@ -596,6 +606,10 @@ export function registerFabricCommand(pi: ExtensionAPI, deps: FabricCommandDeps)
       }
       if (command === "chat") {
         await fabricUi.openConversation(context, argumentsList.join(" ") || undefined);
+        return;
+      }
+      if (command === "focus") {
+        fabricUi.focusWidget(context);
         return;
       }
       if (command === "decisions") {
@@ -1209,7 +1223,7 @@ export function registerFabricCommand(pi: ExtensionAPI, deps: FabricCommandDeps)
       }
       if (command !== "status") {
         context.ui.notify(
-          "Usage: /fabric [status|dashboard|chat [id-or-name]|prewalk [task]|prewalk --off|--disable|--enable|reload|providers|agents|actors|global|import <name> [as <new>]|export <id> [--overwrite]|messages <id>|clear-messages <id>|events <id> [event...]|log <id>|export-log <id>|attach <id>|stop <id>|remove <id>|kill <id>|repairs|entropy|decisions [id]|programs [promote|retire <ref>]|run <ref> [json]]",
+          "Usage: /fabric [status|dashboard|chat [id-or-name]|focus|prewalk [task]|prewalk --off|--disable|--enable|reload|providers|agents|actors|global|import <name> [as <new>]|export <id> [--overwrite]|messages <id>|clear-messages <id>|events <id> [event...]|log <id>|export-log <id>|attach <id>|stop <id>|remove <id>|kill <id>|repairs|entropy|decisions [id]|programs [promote|retire <ref>]|run <ref> [json]]",
           "warning",
         );
         return;

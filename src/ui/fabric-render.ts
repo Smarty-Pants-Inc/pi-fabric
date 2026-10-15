@@ -12,7 +12,8 @@ import {
 import { highlightCode, languageFromPath } from "./highlight.js";
 import { headlineArg } from "../core/call-preview.js";
 import { coreToolTitle, renderCoreToolBody } from "./core-tool-render.js";
-import { isFabricAgentToolPreview, type FabricAgentToolPreviewNode, type FabricTranscriptEntry } from "./transcript.js";
+import type { FabricAgentToolPreviewNode, FabricTranscriptEntry } from "./transcript.js";
+import { isFabricAgentToolPreview } from "./transcript-sanitization.js";
 import { fabricStringLiterals, fabricWriteBindings, type FabricWriteBinding } from "./fabric-code-parser.js";
 export { fabricWriteBindings, type FabricWriteBinding } from "./fabric-code-parser.js";
 import {

@@ -10,7 +10,7 @@ import { resolveJevModelRoute } from "./routes.js";
 const canonical = (provider: string): string => provider === "vercel-ai-gateway" ? "vercel" : provider === "jev" ? "typesafe" : provider;
 const authProvider = (provider: string): string => ["vercel", "vercel-evaluate", "vercel-decisions"].includes(provider) ? "vercel-ai-gateway" : provider;
 const envKeys: Record<string, string[]> = {
-  typesafe: ["TYPESAFE_API_KEY"], openrouter: ["OPENROUTER_API_KEY", "TYPESAFE_OPENROUTER_API_KEY"],
+  typesafe: ["TYPESAFE_API_KEY"], subq: ["SUBQ_API_KEY"], openrouter: ["OPENROUTER_API_KEY", "TYPESAFE_OPENROUTER_API_KEY"],
   "vercel-ai-gateway": ["AI_GATEWAY_API_KEY"], openai: ["OPENAI_API_KEY"],
   "cloudflare-workers-ai": ["CLOUDFLARE_API_TOKEN", "CLOUDFLARE_API_KEY"], opencode: ["OPENCODE_API_KEY"],
   "llama.cpp": ["LLAMA_API_KEY"], "llama-system-one": ["LLAMA_API_KEY"],

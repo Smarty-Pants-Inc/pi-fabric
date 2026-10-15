@@ -79,6 +79,28 @@ describe("pi.bash auto-spill", () => {
     expect(await job.outputText()).toContain("failed");
   });
 
+  it("hands off a background command that exits before its pid is read", async () => {
+    // A loaded host can finish a short command before the pid poll's next tick.
+    const begin = FabricShellJobStore.prototype.begin;
+    vi.spyOn(FabricShellJobStore.prototype, "begin").mockImplementation(function (this: FabricShellJobStore, ...args) {
+      const job = begin.apply(this, args);
+      const readPid = job.readPid.bind(job);
+      job.readPid = async () => {
+        await new Promise((resolve) => setTimeout(resolve, 400));
+        return readPid();
+      };
+      return job;
+    });
+    const { result, jobs } = await invokeBash("printf start; exit 7", 0, undefined, { background: true, description: "Quick failure" });
+    expect(result.ok).toBe(true);
+    expect(result.details).toMatchObject({ taskId: expect.any(String), running: false });
+    const job = jobs.get(result.details!.taskId!)!;
+    expect(job.info()).toMatchObject({ status: "failed", exitCode: 7, description: "Quick failure" });
+    expect(await job.outputText()).toContain("start");
+    expect(result.output).toContain("Exited with code 7");
+    expect(result.output).not.toContain("Still running");
+  });
+
   it("starts an opt-in monitor on the protected shell path and stops it at its deadline", async () => {
     const { result, jobs } = await invokeBash("printf 'CI: waiting\\n'; sleep 8", 0, undefined, { monitor: { delivery: "ui", timeoutMs: 1000, intervalMs: 1000 } });
     const job = jobs.get(result.details!.taskId!)!;

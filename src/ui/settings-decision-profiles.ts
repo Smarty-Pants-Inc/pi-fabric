@@ -62,7 +62,7 @@ export const decisionProfileSelection = (config: DecisionSettings, value: string
 export const decisionTargetInfo = (target: DecisionTarget): { probability: string; images: string } => {
   // Provider-family hints are informational, not runtime target resolution.
   const familyApi: Record<string, DecisionTarget["api"]> = {
-    typesafe: "system-one", openrouter: "system-one",
+    typesafe: "system-one", subq: "system-one", openrouter: "system-one",
     vercel: "system-one", "vercel-ai-gateway": "system-one",
     "vercel-evaluate": "vercel-evaluate", "vercel-decisions": "openai-decisions",
     openai: "openai-decisions", "cloudflare-workers-ai": "cloudflare",

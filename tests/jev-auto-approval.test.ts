@@ -238,6 +238,21 @@ describe("Jev auto-approval classifier", () => {
     expect(fetcher).toHaveBeenCalledTimes(1);
   });
 
+  it("classifies through SubQ Snap with the subq credential", async () => {
+    fetcher.mockImplementation(async () => Response.json({ ...response(), model: "subq-snap-preview" }));
+    const ctx = context();
+    const result = await new FabricAutoApprovalClassifier().classify(action, { command: "bun run typecheck" }, ctx, "pi-fabric/subq/subq-snap-preview");
+    expect(result).toMatchObject({ decision: "allow", model: "pi-fabric/subq/subq-snap-preview" });
+    expect(ctx.modelRegistry.getApiKeyForProvider).toHaveBeenCalledWith("subq");
+    const [url, options] = fetcher.mock.calls[0]!;
+    expect(url).toBe("https://api.subq.ai/v1/systemone");
+    expect(options).toMatchObject({ redirect: "error", headers: { Authorization: "Bearer fixture-only-key" } });
+    expect(JSON.parse(options!.body as string).model).toBe("subq-snap-preview");
+    expect(options!.body).not.toMatch(/PRIVATE|HOSTILE|fixture-only-key/);
+    await expect(new FabricAutoApprovalClassifier().classify(action, {}, context(), "pi-fabric/subq/jev-latest")).rejects.toThrow("SubQ serves");
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+
   it("rejects OpenRouter aliases the service does not expose before credentials or network", async () => {
     await expect(new FabricAutoApprovalClassifier().classify(action, {}, context(), "pi-fabric/openrouter/jev-preview")).rejects.toThrow("OpenRouter serves");
     await expect(new FabricAutoApprovalClassifier().classify(action, {}, context(), "pi-fabric/openrouter/../bad")).rejects.toThrow("not available");

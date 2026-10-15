@@ -9,14 +9,14 @@ const provider = (): FabricProvider => ({ name: "owned", description: "Owned res
 // Fixed ABI vectors retain phase tags, unequal counters and real JS immutability.
 describe("compiled binding lifecycle", () => {
   it("encodes close reservation and independent blockers without mutating input", () => {
-    const life: BindingLife = { $: "Life", phase: { $: "Retiring" }, owner: false, revoked: true, holds: 0n, calls: 0n };
+    const life: BindingLife = { $: "Life", phase: { $: "Retiring" }, owner: false, revoked: true, holds: 0, calls: 0 };
     const before = structuredClone(life);
     const closing = bindingStep(life, { $: "Shut" });
     expect(closing).toEqual({ $: "Outcome", next: { ...life, phase: { $: "Closing" } }, command: { $: "StartClose" } });
     expect(bindingStep(closing.next, { $: "Shut" })).toEqual({ $: "Outcome", next: closing.next, command: { $: "Denied" } });
     expect(life).toEqual(before);
     const blocked: BindingLife[] = [
-      { ...life, owner: true }, { ...life, holds: 4n }, { ...life, calls: 7n },
+      { ...life, owner: true }, { ...life, holds: 4 }, { ...life, calls: 7 },
       { ...life, phase: { $: "Active" } }, { ...life, phase: { $: "Closed" } }, { ...life, phase: { $: "Failed" } },
     ];
     for (const input of blocked) {
@@ -34,9 +34,9 @@ describe("compiled binding lifecycle", () => {
       ["Active", true, false, false], ["Closing", false, true, false], ["Closed", false, true, false],
     ] as const;
     for (const [phase, revoked, cleanup, accepted] of cases) {
-      const life: BindingLife = { $: "Life", phase: { $: phase }, owner: true, revoked, holds: 4n, calls: 7n };
+      const life: BindingLife = { $: "Life", phase: { $: phase }, owner: true, revoked, holds: 4, calls: 7 };
       const before = structuredClone(life);
-      for (const [start, end, count, nextCount] of [["Begin", "End", "calls", 8n], ["Retain", "Release", "holds", 5n]] as const) {
+      for (const [start, end, count, nextCount] of [["Begin", "End", "calls", 8], ["Retain", "Release", "holds", 5]] as const) {
         const result = bindingStep(life, { $: start, cleanup });
         expect(result).toEqual({ $: "Outcome", next: accepted ? { ...before, [count]: nextCount } : before, command: { $: accepted ? "Granted" : "Denied" } });
         if (accepted) expect(bindingStep(result.next, { $: end })).toEqual({ $: "Outcome", next: before, command: { $: "Granted" } });
@@ -46,7 +46,7 @@ describe("compiled binding lifecycle", () => {
   });
 
   it("preserves record fields across event tags and refuses underflow/terminal reopening", () => {
-    const life: BindingLife = { $: "Life", phase: { $: "Staged" }, owner: true, revoked: false, holds: 4n, calls: 7n };
+    const life: BindingLife = { $: "Life", phase: { $: "Staged" }, owner: true, revoked: false, holds: 4, calls: 7 };
     const cases: Array<{ event: BindingEvent; next: BindingLife }> = [
       { event: { $: "Inspect" }, next: life },
       { event: { $: "Activate" }, next: { ...life, phase: { $: "Active" } } },
@@ -56,7 +56,7 @@ describe("compiled binding lifecycle", () => {
       { event: { $: "Abort" }, next: { ...life, phase: { $: "Failed" }, owner: false, revoked: true } },
     ];
     for (const { event, next } of cases) expect(bindingStep(life, event)).toEqual({ $: "Outcome", next, command: { $: "Granted" } });
-    const empty: BindingLife = { ...life, phase: { $: "Failed" }, holds: 0n, calls: 0n };
+    const empty: BindingLife = { ...life, phase: { $: "Failed" }, holds: 0, calls: 0 };
     expect(bindingStep(empty, { $: "End" })).toEqual({ $: "Outcome", next: empty, command: { $: "Denied" } });
     expect(bindingStep(empty, { $: "Release" })).toEqual({ $: "Outcome", next: empty, command: { $: "Denied" } });
     for (const phase of ["Closing", "Closed", "Failed"] as const) {

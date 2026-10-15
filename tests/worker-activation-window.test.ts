@@ -43,6 +43,12 @@ afterEach(async () => {
 // the timeout itself.
 const HANG_GUARD_MS = 120_000;
 const TEST_GUARD_MS = HANG_GUARD_MS + 30_000;
+// Native Node cannot resolve source .js specifiers from a directly loaded .ts
+// hook. These child probes exercise the actual compiled artifact instead.
+const activationProbeHook = process.env.PI_FABRIC_ACTIVATION_TEST_WORKER
+  ? path.join(path.dirname(path.resolve(process.env.PI_FABRIC_ACTIVATION_TEST_WORKER)), "worker/activation-window.js")
+  : path.resolve("dist/worker/activation-window.js");
+const compiledActivationAvailable = fs.existsSync(activationProbeHook);
 const user = (text: string) => ({ role: "user" as const, content: text, timestamp: 1 });
 const assistant = (content: string, input = 10) => ({
   role: "assistant" as const, content: [{ type: "text" as const, text: content }],
@@ -115,10 +121,10 @@ describe("activation projection", () => {
     expect(new ActivationWindow(old).project([...old, current])).toEqual([current]);
   });
 
-  it.each(["context", "boundary", "setup", "manual", "threshold", "overflow", "registration"])("exits the disposable child before a request despite native-style swallowed exceptions: %s", mode => {
+  it.skipIf(!compiledActivationAvailable).each(["context", "boundary", "setup", "manual", "threshold", "overflow", "registration"])("[requires compiled activation hook: bun run build] exits the disposable child before a request despite native-style swallowed exceptions: %s", mode => {
     const dir = root();
     const requestCounter = path.join(dir, "requests");
-    const hook = path.resolve("src/worker/activation-window.ts");
+    const hook = activationProbeHook;
     const child = path.join(dir, "probe.mjs");
     fs.writeFileSync(child, `
       import fs from 'node:fs';
@@ -159,15 +165,13 @@ describe("activation projection", () => {
     expect(fs.existsSync(requestCounter)).toBe(false);
   }, TEST_GUARD_MS);
 
-  it.each(["stream", "streamSimple"].flatMap(method =>
+  it.skipIf(!compiledActivationAvailable).each(["stream", "streamSimple"].flatMap(method =>
     ["expand", "shrink", "unsupported", "binary", "serialized-primitive", "snapshot", "no-callback"].map(mode => [method, mode]),
-  ))("guards the final JSON boundary via %s (%s)", (method, mode) => {
+  ))("[requires compiled activation hook: bun run build] guards the final JSON boundary via %s (%s)", (method, mode) => {
     const dir = root();
     const requestFile = path.join(dir, "requests");
     const callbackFile = path.join(dir, "callback");
-    const hook = fs.realpathSync(process.env.PI_FABRIC_ACTIVATION_TEST_WORKER
-      ? path.join(path.dirname(path.resolve(process.env.PI_FABRIC_ACTIVATION_TEST_WORKER)), "worker/activation-window.js")
-      : path.resolve("src/worker/activation-window.ts"));
+    const hook = fs.realpathSync(activationProbeHook);
     const child = path.join(dir, "dispatch.mjs");
     fs.writeFileSync(child, `
       import fs from 'node:fs';
@@ -222,11 +226,11 @@ describe("activation projection", () => {
     else expect(fs.readFileSync(callbackFile, "utf8")).toBe("callback\n");
   }, TEST_GUARD_MS);
 
-  it("restores shared native provider methods and fences a late payload callback across real actor reload (#5962)", () => {
+  it.skipIf(!compiledActivationAvailable)("[requires compiled activation hook: bun run build] restores shared native provider methods and fences a late payload callback across real actor reload (#5962)", () => {
     const dir = root();
     fs.symlinkSync(path.resolve("node_modules"), path.join(dir, "node_modules"), "junction");
     const evidence = path.join(dir, "evidence.json");
-    const hook = fs.realpathSync(path.resolve("src/worker/activation-window.ts"));
+    const hook = fs.realpathSync(activationProbeHook);
     const child = path.join(dir, "reload.mjs");
     fs.writeFileSync(child, `
       import fs from 'node:fs';

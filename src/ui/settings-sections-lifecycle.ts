@@ -193,6 +193,11 @@ export const buildMeshSection = (
             'Default storage for newly created actors. Each agents.create call may choose project or session independently; project actors are shared, while session actors follow the root Pi session and its participant agents.',
           values: ACTOR_SCOPES,
         }),
+        setting("mesh.peerNotices", "Peer notices", config.mesh.peerNotices ? "true" : "false", {
+          description:
+            "Tell this session's model when another root Pi session joins or leaves the project. Appended to the transcript at a turn boundary, never to the system prompt.",
+          values: BOOLEANS,
+        }),
         setting("mesh.maxReadEvents", "Max read events", String(config.mesh.maxReadEvents), {
           description: "Maximum events returned by a single mesh read.",
           submenu: numericSubmenu(

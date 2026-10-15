@@ -16,6 +16,10 @@ Fabric keeps its orchestration-specific behavior around those previews. Multi-ca
 
 See [Background tasks and monitors](background-tasks.md) for completion delivery, task controls, opt-in UI-only versus agent-waking monitors, limits, and cancellation.
 
+## Widget activity
+
+The bottom widget lists running agents and actors. Press **ctrl+shift+e**, run **`/fabric focus`**, or click a row to focus it. Then **↑↓** or **j/k** selects a row and **Enter** or **Space** expands it: the participant's live activity opens inside the widget, below the list, not in a floating window. It shows streamed thinking, each tool call with its arguments and status, replies, and errors, newest at the bottom. While a pane is open, **↑↓** switches participants, **PgUp/PgDn** or the mouse wheel scrolls, and **G** returns to the newest line. **Enter** or a second click collapses the pane. **Esc** collapses first, then returns focus to the editor; while the widget has focus, Esc does not halt background workers. Any other key returns focus to the editor and reaches it, so typing, Ctrl+C, and shortcuts keep working; only a click on a participant row takes focus. An expanded widget stays within half of the terminal height. With Pi's `hideThinkingBlock` setting, the pane shows the thinking marker without the reasoning text. The dashboard transcript does not show reasoning.
+
 ## Focused conversations
 
 Press **ctrl+shift+a** or run **`/fabric chat`** to open a full-screen conversation without going through the dashboard. `/fabric chat <id-or-name>` opens a specific agent or actor; Tab completes exact participant IDs, including nested agents. Ambiguous names or ID prefixes are rejected; use an exact participant ID to select the intended target. In the dashboard, **Shift+C** opens the selected participant.

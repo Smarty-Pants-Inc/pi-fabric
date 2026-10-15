@@ -9,6 +9,7 @@ import type { FabricAgentRunner, FabricAgentTransport, FabricPythonRuntime } fro
 import type { FabricKernel } from "../runtime/kernel.js";
 import type { FabricScope, FabricScopeGrant } from "../protocol.js";
 import type { ThinkingTransferInput } from "./thinking-transfer.js";
+import type { FabricTraceContextV1 } from "./trace-context.js";
 import type { FabricThinking, FabricThinkingBounds } from "../thinking.js";
 import type { FabricParticipantResidency } from "../topology/types.js";
 import type { AgentWriteReceipt } from "./write-receipt.js";
@@ -162,6 +163,13 @@ export interface AgentRunRequest {
   bashTimeoutSeconds?: number;
   /** Pi runs: seconds without output before a bash call without a timeout is killed (default 180); 0 = none. */
   bashIdleSeconds?: number;
+  /** Host-only tool calls that started this run, offered to trace-context listeners; never a provider argument. */
+  traceOrigin?: { parentToolCallId?: string; nestedToolCallId?: string };
+  /**
+   * Host-only W3C trace context a session resolved for a host without its
+   * extensions (resident host); never a provider argument.
+   */
+  traceContext?: FabricTraceContextV1;
   /** Host-created fork of the caller branch ending at its last completed turn (seed: "branch"). */
   forkSeed?: AgentForkSeed;
 }
@@ -482,6 +490,8 @@ export interface AgentWorkerOptions {
   writePolicy?: string;
   /** Serialized PI_FABRIC_LINEAGE. */
   lineage?: string;
+  /** Exported to the child as TRACEPARENT and TRACESTATE; absent keeps the inherited environment. */
+  traceContext?: FabricTraceContextV1;
   /** Serialized PI_FABRIC_SCOPE; absent clears any inherited scope variables. */
   scope?: string;
 }

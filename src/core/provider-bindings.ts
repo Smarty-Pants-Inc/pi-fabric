@@ -115,7 +115,7 @@ export class FabricProviderBindings {
       );
     }
     this.#all.set(binding.id, binding);
-    this.#lifecycles.set(binding.id, { $: "Life", phase: { $: options.staged ? "Staged" : "Active" }, owner: true, holds: 0n, calls: 0n, revoked: false });
+    this.#lifecycles.set(binding.id, { $: "Life", phase: { $: options.staged ? "Staged" : "Active" }, owner: true, holds: 0, calls: 0, revoked: false });
     this.#signals.set(binding.id, new AbortController());
     if (options.staged) {
       this.#staged.set(binding.name, binding);
@@ -357,17 +357,17 @@ export class FabricProviderBindings {
 
   #canBegin(id: string, cleanup: boolean): boolean {
     const life = this.#lifecycles.get(id);
-    return !!life && life.calls < BigInt(BEND_NAT_MAX) && bindingStep(life, { $: "Begin", cleanup }).command.$ === "Granted";
+    return !!life && life.calls < BEND_NAT_MAX && bindingStep(life, { $: "Begin", cleanup }).command.$ === "Granted";
   }
 
   #step(binding: FabricProviderBinding, event: BindingEvent): BindingOutcome["command"]["$"] {
     const life = this.#lifecycles.get(binding.id);
     if (!life) return "Denied";
-    if ((event.$ === "Begin" && life.calls >= BigInt(BEND_NAT_MAX)) || (event.$ === "Retain" && life.holds >= BigInt(BEND_NAT_MAX))) {
+    if ((event.$ === "Begin" && life.calls >= BEND_NAT_MAX) || (event.$ === "Retain" && life.holds >= BEND_NAT_MAX)) {
       throw new Error("Provider lifecycle accounting overflow");
     }
     const outcome = bindingStep(life, event);
-    if (outcome.next.holds > BigInt(BEND_NAT_MAX) || outcome.next.calls > BigInt(BEND_NAT_MAX)) {
+    if (outcome.next.holds > BEND_NAT_MAX || outcome.next.calls > BEND_NAT_MAX) {
       throw new Error("Provider lifecycle accounting overflow");
     }
     this.#lifecycles.set(binding.id, outcome.next);

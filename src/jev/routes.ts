@@ -1,5 +1,6 @@
 import {
   JEV_OPENROUTER_MODEL_PREFIX,
+  JEV_SUBQ_MODEL_PREFIX,
   JEV_TYPESAFE_MODEL_PREFIX,
   JEV_VERCEL_MODEL_PREFIX,
   parseJevApprovalModel,
@@ -76,14 +77,33 @@ export const JEV_VERCEL_ROUTE: JevRoute = {
   aliases: Object.keys(JEV_VERCEL_MODELS),
 };
 
+/** SubQ's System One models. Their IDs are their own: SubQ has no Jev aliases. */
+export const JEV_SUBQ_MODELS: readonly string[] = ["subq-snap-preview"];
+
+/**
+ * SubQ Snap is a System One model served by SubQ itself, with TypeSafe's request
+ * and response shapes at its own base URL. `/login subq` or `SUBQ_API_KEY`
+ * authenticates it.
+ */
+export const JEV_SUBQ_ROUTE: JevRoute = {
+  id: "subq",
+  label: "SubQ",
+  endpoint: "https://api.subq.ai/v1/systemone",
+  providerId: "subq",
+  envKeys: ["SUBQ_API_KEY"],
+  modelPrefix: JEV_SUBQ_MODEL_PREFIX,
+  aliases: JEV_SUBQ_MODELS,
+};
+
 const JEV_ROUTES: Readonly<Record<JevClassifierRoute, JevRoute>> = {
   "typesafe": JEV_TYPESAFE_ROUTE,
   "openrouter": JEV_OPENROUTER_ROUTE,
   "vercel-ai-gateway": JEV_VERCEL_ROUTE,
+  "subq": JEV_SUBQ_ROUTE,
 };
 
-/** Picker order: direct TypeSafe aliases, then OpenRouter, then Vercel AI Gateway. */
-const JEV_ROUTE_ORDER: readonly JevRoute[] = [JEV_TYPESAFE_ROUTE, JEV_OPENROUTER_ROUTE, JEV_VERCEL_ROUTE];
+/** Picker order: direct TypeSafe aliases, then OpenRouter, Vercel AI Gateway, and SubQ. */
+const JEV_ROUTE_ORDER: readonly JevRoute[] = [JEV_TYPESAFE_ROUTE, JEV_OPENROUTER_ROUTE, JEV_VERCEL_ROUTE, JEV_SUBQ_ROUTE];
 
 const JEV_PROVIDER_PREFIX = "pi-fabric/";
 
@@ -97,7 +117,10 @@ export const isJevOpenRouterModelId = (model: string): boolean =>
 /** Vercel AI Gateway model IDs are `typesafe-ai/<family>`. */
 export const isJevVercelModelId = (model: string): boolean =>
   /^typesafe-ai\/[a-zA-Z0-9._-]{1,120}$/.test(model);
-/** A bare TypeSafe alias or a routable OpenRouter/Vercel AI Gateway model ID. */
+/** SubQ model IDs are `subq-<name>`. They also fit a bare alias, so they are checked first. */
+export const isJevSubqModelId = (model: string): boolean =>
+  /^subq-[a-zA-Z0-9._-]{1,120}$/.test(model);
+/** A bare TypeSafe alias or a routable OpenRouter/Vercel AI Gateway/SubQ model ID. */
 export const isJevModelId = (model: string): boolean =>
   TYPESAFE_MODEL.test(model) || isJevOpenRouterModelId(model) || isJevVercelModelId(model);
 
@@ -110,6 +133,7 @@ export interface JevRouteTarget {
 export const resolveJevModelRoute = (model: string): JevRouteTarget => {
   if (isJevOpenRouterModelId(model)) return { route: JEV_OPENROUTER_ROUTE, model };
   if (isJevVercelModelId(model)) return { route: JEV_VERCEL_ROUTE, model };
+  if (isJevSubqModelId(model)) return { route: JEV_SUBQ_ROUTE, model };
   return { route: JEV_TYPESAFE_ROUTE, model };
 };
 
@@ -117,6 +141,7 @@ export const resolveJevModelRoute = (model: string): JevRouteTarget => {
 export const resolveJevUpstreamModel = (route: JevRoute, model: string): string | undefined => {
   if (route.id === "openrouter") return JEV_OPENROUTER_MODELS[model] ?? (isJevOpenRouterModelId(model) ? model : undefined);
   if (route.id === "vercel-ai-gateway") return JEV_VERCEL_MODELS[model] ?? (isJevVercelModelId(model) ? model : undefined);
+  if (route.id === "subq") return isJevSubqModelId(model) ? model : undefined;
   return TYPESAFE_MODEL.test(model) ? model : undefined;
 };
 
@@ -127,6 +152,7 @@ export type JevClassifierTarget =
 const unavailableModelMessage = (route: JevRoute, model: string): string => {
   if (route.id === "openrouter") return `OpenRouter serves ${Object.keys(JEV_OPENROUTER_MODELS).join(", ")}; "${model}" is not available`;
   if (route.id === "vercel-ai-gateway") return `Vercel AI Gateway serves ${Object.keys(JEV_VERCEL_MODELS).join(", ")}; "${model}" is not available`;
+  if (route.id === "subq") return `SubQ serves ${JEV_SUBQ_MODELS.join(", ")}; "${model}" is not a SubQ model ID`;
   return `Invalid Jev auto-approval model; use ${JEV_TYPESAFE_MODEL_PREFIX}<model-id>`;
 };
 
@@ -136,7 +162,7 @@ export const resolveJevClassifierTarget = (key: string): JevClassifierTarget => 
   if (!parsed) {
     return {
       ok: false,
-      message: `Invalid Jev auto-approval model; use ${JEV_TYPESAFE_MODEL_PREFIX}<model-id>, ${JEV_OPENROUTER_MODEL_PREFIX}<model-id>, or ${JEV_VERCEL_MODEL_PREFIX}<model-id>`,
+      message: `Invalid Jev auto-approval model; use ${JEV_TYPESAFE_MODEL_PREFIX}<model-id>, ${JEV_OPENROUTER_MODEL_PREFIX}<model-id>, ${JEV_VERCEL_MODEL_PREFIX}<model-id>, or ${JEV_SUBQ_MODEL_PREFIX}<model-id>`,
     };
   }
   const route = JEV_ROUTES[parsed.route];

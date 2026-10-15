@@ -3,6 +3,7 @@ import type { FabricScope } from "../protocol.js";
 import type { FabricKernel } from "../runtime/kernel.js";
 import type { FabricThinking } from "../thinking.js";
 import type { FabricAgentLineage, FabricWritePolicy } from "./child-env.js";
+import type { FabricTraceContextV1 } from "./trace-context.js";
 import type { AgentChildQuestionResponse, AgentUsage } from "./types.js";
 
 export type BuiltInFabricAgentRunner = "pi" | "pi-durable" | "claude" | "veda";
@@ -75,6 +76,8 @@ export interface FabricRunnerLaunchContext {
   deadlineAt: number;
   depth: number;
   lineage: FabricAgentLineage;
+  /** W3C trace context an extension supplied for this run; export it as TRACEPARENT/TRACESTATE. */
+  traceContext?: FabricTraceContextV1;
   tools: readonly string[];
   model?: string;
   thinking?: FabricThinking;

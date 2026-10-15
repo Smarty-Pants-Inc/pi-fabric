@@ -9,12 +9,12 @@ import type { MeshIdentity } from "../mesh/store.js";
 
 // Bend Nat arithmetic is capped at 2^48-1. Canonical radix-2^32 limbs
 // represent the entire JS safe-integer range without crossing that runtime cap.
-const RADIX = 4294967296n;
+const RADIX = 4294967296;
 
 const encode = (text: string): StorageText => {
   let result: StorageText = { $: "Nil" };
   for (let index = text.length - 1; index >= 0; index--) {
-    result = { $: "Con", head: BigInt(text.charCodeAt(index)), tail: result };
+    result = { $: "Con", head: text.charCodeAt(index), tail: result };
   }
   return result;
 };
@@ -22,8 +22,8 @@ const encode = (text: string): StorageText => {
 const decode = (text: StorageText): string => {
   const units: string[] = [];
   for (let node = text; node.$ === "Con"; node = node.tail) {
-    if (node.head < 0n || node.head > 65535n) throw new Error("Invalid storage code unit");
-    units.push(String.fromCharCode(Number(node.head)));
+    if (node.head < 0 || node.head > 65535) throw new Error("Invalid storage code unit");
+    units.push(String.fromCharCode(node.head));
   }
   return units.join("");
 };
@@ -36,17 +36,17 @@ export const storageRevision = (value: unknown): number => {
 };
 
 const encodeRevision = (value: number): StorageRevision => {
-  const exact = BigInt(storageRevision(value));
-  return { $: "Revision", high: exact / RADIX, low: exact % RADIX };
+  const exact = storageRevision(value);
+  return { $: "Revision", high: Math.floor(exact / RADIX), low: exact % RADIX };
 };
 
 const decodeRevision = (value: StorageRevision): number => {
-  if (value.high < 0n || value.high > 2097151n || value.low < 0n || value.low >= RADIX) {
+  if (!Number.isInteger(value.high) || !Number.isInteger(value.low) || value.high < 0 || value.high > 2097151 || value.low < 0 || value.low >= RADIX) {
     throw new Error("Invalid verified storage revision limbs");
   }
   // Representation conversion only; CAS, overflow and successor/carry decisions
   // are performed by the executable proved reducer, not reproduced here.
-  return storageRevision(Number(value.high * RADIX + value.low));
+  return storageRevision(value.high * RADIX + value.low);
 };
 
 const serialize = (value: unknown): string => {

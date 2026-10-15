@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 const root = fileURLToPath(new URL("../", import.meta.url));
 const env = { ...process.env, BEND_NO_TELEMETRY: "1" };
 const bend = process.env.BEND_BIN || "bend";
-if (execFileSync(bend, ["version"], { encoding: "utf8", env }).trim() !== "bend 2.0.36") throw new Error("Bend 2.0.36 required");
+if (execFileSync(bend, ["version"], { encoding: "utf8", env }).trim() !== "bend 2.0.37") throw new Error("Bend 2.0.37 required");
 const inputs = JSON.parse(readFileSync(join(root, "src/verified/generated/manifest.json"), "utf8")).inputs;
 const originals = Object.fromEntries(Object.keys(inputs).filter((path) => path.endsWith(".bend")).map((path) => [path, readFileSync(join(root, path), "utf8")]));
 const mutations = [

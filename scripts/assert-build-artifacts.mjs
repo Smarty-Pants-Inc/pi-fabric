@@ -69,6 +69,7 @@ const lazy = [
   "agents/provider-bridge.js",
   "core/host-sdk.js",
   "fabric-runtime-state.js",
+  "topology/peer-presence.js",
   "components/configuration.js",
   "providers/jev-provider.js",
   "jev/client.js",
@@ -86,6 +87,7 @@ const lazy = [
   "speculation/scanner.js",
   "speculation/python-scanner.js",
   "ui/dashboard.js",
+  "ui/widget-interaction.js",
   "ui/shell-tasks.js",
   "ui/image-overlays.js",
   "ui/languages/bend.js",
@@ -314,6 +316,27 @@ for (const file of startupFiles) {
     }
   }
 }
+// The same holds after startup. Managed installs omit host peers, so a bare SDK
+// import in a natively loaded lazy module has nothing on disk to resolve: the
+// first fabric_exec failed with "Cannot find package". Only the durable worker,
+// whose resolution hook maps the SDK, may import it by name.
+const sdkSpecifier = (specifier) =>
+  specifier === "@earendil-works/pi-coding-agent" || specifier?.startsWith("@earendil-works/pi-coding-agent/");
+const dynamicImport = /\bimport\(\s*["']([^"']+)["']\s*\)/g;
+const hostGraph = staticClosure(entries
+  .filter((file) => file !== "durable/worker.js" && file !== "durable/worker-host.js")
+  .map((file) => join(dist, file)));
+for (const file of hostGraph) {
+  const source = readFileSync(file, "utf8");
+  if ([...source.matchAll(staticImport)].some((match) => sdkSpecifier(match[1]))) {
+    throw new Error(`${file} imports the Pi SDK by name at runtime; use import type or src/core/host-sdk-runtime.ts`);
+  }
+  // The loader's own mapped-host fallback, and tool capture's inert one.
+  if ([...source.matchAll(dynamicImport)].some((match) => sdkSpecifier(match[1])) &&
+    !source.includes("// src/core/host-sdk.ts") && !source.includes("// src/capture/interceptor.ts")) {
+    throw new Error(`${file} imports the Pi SDK by name at runtime; use loadHostSdk from src/core/host-sdk.ts`);
+  }
+}
 // The operation interpreter must load only when an action is dispatched.
 if ([...startupFiles].some(file => /class ProviderOperations|Fabric provider operation denied/.test(readFileSync(file, "utf8")))) {
   throw new Error("Provider operation interpreter escaped into the startup graph");
@@ -322,9 +345,10 @@ if ([...startupFiles].some(file => /class ProviderOperations|Fabric provider ope
 const initialSource = [...startupFiles]
   .map((file) => readFileSync(file, "utf8"))
   .join("\n");
-// file-lock, entropy/compiler and entropy/trial are eager while Pi loads dist/index.js (pi-fabric#982): its
-// re-exported entropy barrel imports them. Restore these 3 markers with the bootstrap entry, smarty-dev#10373.
-for (const forbidden of ["src/storage/verified-remove.ts", "src/bash-idle-watchdog.ts", "src/guards/foreground-wait.ts", "src/lifecycle/reload-slots.ts", "src/core/landlock.ts", "src/core/pattern-kill.ts", "src/compaction/hook.ts", "src/compaction/branch-summary.ts", "src/compaction/projections.ts", "src/coordination/unverified-ids.ts", "src/core/auto-approval-classifier-impl.ts", "src/main-agent.ts", "src/providers/agents-message-router.ts", "src/fabric-runtime-state.ts", "src/topology/root-inbox.ts", "src/topology/root-inbox-context.ts", "src/prewalk/handoff.ts", "src/jev/client.ts", "src/ui/languages/bend.ts", "src/ui/settings.ts", "src/ui/conversation.ts", "src/ui/conversation-chrome.ts", 'from "mcporter"', "src/native-discovery.ts", "src/memory/extractive-history.ts", "src/memory/extractive-index.ts", "src/ui/image-overlays.ts", "src/ui/kitty-viewport.ts"]) {
+// Keep every fork-only lazy fence and upstream's host SDK fence. Entropy compiler/trial
+// remain eager through the public dist/index.js entry (pi-fabric#982); restore those
+// markers only with the bootstrap-entry cutover (smarty-dev#10373).
+for (const forbidden of ["src/storage/verified-remove.ts", "src/bash-idle-watchdog.ts", "src/guards/foreground-wait.ts", "src/lifecycle/reload-slots.ts", "src/core/landlock.ts", "src/core/pattern-kill.ts", "src/compaction/hook.ts", "src/compaction/branch-summary.ts", "src/compaction/projections.ts", "src/coordination/unverified-ids.ts", "src/core/auto-approval-classifier-impl.ts", "src/main-agent.ts", "src/providers/agents-message-router.ts", "src/fabric-runtime-state.ts", "src/topology/root-inbox.ts", "src/topology/root-inbox-context.ts", "src/prewalk/handoff.ts", "src/jev/client.ts", "src/ui/languages/bend.ts", "src/ui/settings.ts", "src/ui/conversation.ts", "src/ui/conversation-chrome.ts", 'from "mcporter"', "src/native-discovery.ts", "src/memory/extractive-history.ts", "src/memory/extractive-index.ts", "src/ui/image-overlays.ts", "src/ui/kitty-viewport.ts", "src/core/host-sdk-runtime.ts", "src/topology/peer-presence.ts", "src/ui/widget-interaction.ts", "src/ui/widget-activity.ts", "src/ui/transcript-reader.ts", "src/ui/transcript-parser.ts"]) {
   if (initialSource.includes(forbidden)) {
     throw new Error(`Startup static graph contains lazy module marker: ${forbidden}`);
   }

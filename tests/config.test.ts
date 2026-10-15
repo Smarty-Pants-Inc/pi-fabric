@@ -709,6 +709,12 @@ describe("Fabric configuration", () => {
     expect(nonString.mesh.actorScope).toBe("project");
   });
 
+  it("enables peer notices by default and accepts only a boolean", () => {
+    expect(DEFAULT_FABRIC_CONFIG.mesh.peerNotices).toBe(true);
+    expect(normalizeFabricConfig({ mesh: { peerNotices: false } }).mesh.peerNotices).toBe(false);
+    expect(normalizeFabricConfig({ mesh: { peerNotices: "no" } }).mesh.peerNotices).toBe(true);
+  });
+
   it("normalizes the ESC halt toggle for actors", () => {
     expect(DEFAULT_FABRIC_CONFIG.ui.haltOnEscape).toBe(true);
     const disabled = normalizeFabricConfig({ ui: { haltOnEscape: false } });

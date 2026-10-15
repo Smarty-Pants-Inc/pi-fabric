@@ -1,10 +1,24 @@
-import type { Component } from "@earendil-works/pi-tui";
-import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import type { Component, Focusable, TuiMouseEvent, TuiMouseEventResult } from "@earendil-works/pi-tui";
+import { matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import type { FabricUiWidgetMode } from "../config.js";
 import { spinnerFrame } from "./spinner.js";
 import { FabricWidgetRetention, isRecentWidgetCompletion } from "./retention.js";
 import { FABRIC_CONVERSATION_HINT } from "./conversation-shortcut.js";
+import type { AgentTranscriptReader, FabricAgentTranscript } from "./transcript.js";
+import type { WidgetInteraction } from "./widget-interaction.js";
+
+export const FABRIC_WIDGET_FOCUS_SHORTCUT = "ctrl+shift+e";
+export const FABRIC_WIDGET_FOCUS_HINT = "ctrl+shift+e expand";
+export const WIDGET_ACTIVITY_ROWS = 12;
+export const WIDGET_ACTIVITY_LOG_LINES = 600;
+
+let interactionModule: typeof import("./widget-interaction.js") | undefined;
+let interactionLoad: Promise<void> | undefined;
+/** Explicit first-use preload; standalone callers may await this before constructing a widget. */
+export const loadWidgetInteraction = (): Promise<void> => interactionLoad ??= import("./widget-interaction.js")
+  .then((module) => { interactionModule = module; })
+  .catch((error) => { interactionLoad = undefined; throw error; });
 import type {
   FabricActivityRun,
   FabricActivityStatus,
@@ -72,6 +86,29 @@ const totalCost = (
   ownAgents(snapshot)
     .filter((agent) => (run ? agent.runId === run.id : isActiveStatus(agent.status)))
     .reduce((sum, agent) => sum + (agent.usage?.cost ?? 0), 0);
+
+/** A widget row that can be selected and expanded to show its live activity. */
+export interface FabricWidgetRow {
+  /** Agent id, or actor id for an actor's worker row. */
+  id: string;
+  kind: "agent" | "actor";
+  name: string;
+}
+
+/** Optional interaction wiring; without it the widget stays a passive status box. */
+export interface FabricWidgetInteraction {
+  /** Live activity for an expanded row, read from the participant's event log. */
+  activity: (row: FabricWidgetRow, reader?: AgentTranscriptReader) => FabricAgentTranscript | undefined;
+  /**
+   * Return focus to the editor. `forward` is a key the widget does not use; the
+   * editor receives it, because Pi handles Ctrl+C and extension shortcuts there.
+   */
+  release: (forward?: string) => void;
+  /** Pi's hideThinkingBlock: the pane keeps the thinking marker and drops its text. */
+  hideThinking?: () => boolean;
+  /** Ask the host to redraw (selection and expansion change without a snapshot change). */
+  requestRender: () => void;
+}
 
 const agentLines = (
   theme: Theme,
@@ -144,7 +181,20 @@ export const widgetRowLimit = (maxRows: number, terminalRows?: number): number =
   return Math.max(1, Math.min(configured, paneShare));
 };
 
-export class FabricWidget implements Component {
+/**
+ * Row budget while an activity pane is open. Expanding is an explicit request
+ * for more room, so the widget may use its whole terminal share instead of
+ * `maxRows`, but never more than that share.
+ */
+export const widgetExpandedRowLimit = (maxRows: number, terminalRows?: number): number => {
+  const limit = widgetRowLimit(maxRows, terminalRows);
+  if (terminalRows === undefined || !Number.isFinite(terminalRows) || terminalRows <= 0) {
+    return limit + 2 + WIDGET_ACTIVITY_ROWS;
+  }
+  return Math.max(limit, Math.floor(terminalRows * WIDGET_TERMINAL_ROW_SHARE));
+};
+
+export class FabricWidget implements Component, Focusable {
   constructor(
     readonly theme: Theme,
     readonly snapshot: () => FabricDashboardSnapshot,
@@ -156,7 +206,86 @@ export class FabricWidget implements Component {
     // Standalone renderers keep the historical compact behavior.
     readonly stableWhileStreaming = false,
     readonly retention = new FabricWidgetRetention(),
-  ) {}
+    readonly interaction?: FabricWidgetInteraction,
+  ) {
+    if (interactionModule && interaction) this.#installInteraction();
+  }
+
+  /** Set by the TUI when the widget gains or loses keyboard focus. */
+  focused = false;
+  #engine: WidgetInteraction | undefined;
+  #renderedFocus = false;
+  #renderedExpansion: string | undefined;
+  #interactionKey(): string { return this.#engine?.key ?? String(this.focused); }
+
+  #installInteraction(): void {
+    if (this.#engine || !interactionModule) return;
+    this.#engine = new interactionModule.WidgetInteraction({
+      widget: this, content: () => this.#content(this.snapshot()), rowLimit: () => this.#rowLimit(),
+      bound: (lines, width, limit) => this.#boundContent(lines, width, limit),
+      hint: (lines, hasRows) => this.#withFocusHint(lines, hasRows),
+    });
+    this.invalidate();
+  }
+
+  /** Controller awaits this at keyboard focus; mouse focus queues its first click. */
+  #pendingActions: Array<(engine: WidgetInteraction) => void> = [];
+  #passiveRows: Array<FabricWidgetRow & { line: number }> = [];
+  async prepareInteraction(): Promise<void> {
+    await loadWidgetInteraction();
+    this.#installInteraction();
+    if (this.focused) {
+      this.#engine!.selectDefault();
+      while (this.focused && this.#pendingActions.length > 0) this.#pendingActions.shift()!(this.#engine!);
+    }
+    this.#pendingActions = [];
+  }
+
+  /** Id of the row whose activity pane is open, if any. */
+  get expandedId(): string | undefined {
+    return this.#engine?.expandedId;
+  }
+
+  /** Select the first participant row; used when focus arrives from the keyboard. */
+  selectDefault(): void {
+    this.#engine?.selectDefault();
+  }
+
+  handleInput(data: string): void {
+    if (this.#engine) { this.#engine.handleInput(data); return; }
+    // Escape and unrelated keys must still return to the editor immediately
+    // while the first-use import is pending. Preserve ordered widget keys.
+    if (matchesKey(data, FABRIC_WIDGET_FOCUS_SHORTCUT) || (matchesKey(data, "escape") && this.#pendingActions.length === 0)) {
+      this.#pendingActions = [];
+      this.interaction?.release();
+    } else if ((["up", "down", "enter", "escape", "pageUp", "pageDown", "end"] as const).some((key) => matchesKey(data, key)) || ["k", "j", " ", "K", "J", "G"].includes(data)) {
+      this.#pendingActions.push((engine) => engine.handleInput(data));
+      void this.prepareInteraction().then(() => this.interaction?.requestRender()).catch(() => {
+        this.#pendingActions = [];
+        if (this.focused) this.interaction?.release();
+      });
+    } else {
+      this.#pendingActions = [];
+      this.interaction?.release(data);
+    }
+  }
+
+  handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
+    if (!this.interaction) return undefined;
+    if (this.#engine) return this.#engine.handleMouse(event);
+    if (event.type === "press") return { handled: true };
+    if (event.type !== "click" || event.button !== "left") return undefined;
+    const row = this.#passiveRows.find((candidate) => candidate.line === event.y);
+    if (!row) return undefined;
+    this.#pendingActions.push((engine) => engine.activateRow(row.id));
+    // The host grants focus synchronously from the result below. A late load
+    // must not steal it back from the editor or another view.
+    void this.prepareInteraction().then(() => this.interaction?.requestRender()).catch(() => {
+      this.#pendingActions = [];
+      if (this.focused) this.interaction?.release();
+    });
+    return { focus: true, render: true };
+  }
 
   #rowLimit(): number {
     return widgetRowLimit(this.maxRows, this.terminalRows?.());
@@ -188,18 +317,28 @@ export class FabricWidget implements Component {
     // when the pane is expanded again.
     if (streaming) this.#turnRowLimit = Math.min(this.#turnRowLimit!, limit);
     const renderLimit = streaming ? this.#turnRowLimit! : limit;
+    const interactionChanged =
+      this.#renderedFocus !== this.focused ||
+      this.#renderedExpansion !== this.#interactionKey();
+    if (interactionChanged) this.#pending = undefined;
+    // An open pane reads a live log: reuse only the lines hasChanged() just
+    // built, never the last frame, whose snapshot key says nothing about the log.
     const lines =
+      !interactionChanged &&
       this.#pending?.width === width &&
       this.#pending.limit === renderLimit &&
       this.#pending.snapshot === snapshot
         ? this.#pending.lines
-        : this.#lastWidth === width &&
+        : !interactionChanged && !this.expandedId &&
+            this.#lastWidth === width &&
             this.#lastLimit === renderLimit &&
             this.#lastSnapshot === snapshot &&
             this.#lastLines
           ? this.#lastLines
           : this.#renderLines(snapshot, width, renderLimit, streaming);
     this.#pending = undefined;
+    this.#renderedFocus = this.focused;
+    this.#renderedExpansion = this.#interactionKey();
     this.#lastWidth = width;
     this.#lastLimit = renderLimit;
     this.#lastSnapshot = snapshot;
@@ -219,10 +358,13 @@ export class FabricWidget implements Component {
     // when the pane is expanded again.
     if (streaming) this.#turnRowLimit = Math.min(this.#turnRowLimit!, limit);
     const renderLimit = streaming ? this.#turnRowLimit! : limit;
+    const interactionChanged =
+      this.#renderedFocus !== this.focused ||
+      this.#renderedExpansion !== this.#interactionKey();
     const lines = this.#renderLines(snapshot, this.#lastWidth, renderLimit, streaming);
     this.#pending = { width: this.#lastWidth, limit: renderLimit, snapshot, lines };
     if (lines.length === this.#lastLines.length &&
-        lines.every((line, index) => line === this.#lastLines?.[index])) return false;
+        lines.every((line, index) => line === this.#lastLines?.[index])) return interactionChanged;
     // Spinner-only differences are allowed to ride on the next Pi render.
     // Calling requestRender for every animation tick defeats Pi's render
     // coalescing and is especially noisy for above-editor widgets.
@@ -241,13 +383,29 @@ export class FabricWidget implements Component {
   }
 
   #renderLines(snapshot: FabricDashboardSnapshot, width: number, limit: number, streaming: boolean): string[] {
-    const lines = this.#boundContent(this.#buildContent(snapshot), width, limit);
-    if (!streaming) return lines;
-    while (lines.length < limit) lines.push("");
-    return lines;
+    const { lines, rows } = this.#content(snapshot);
+    this.#passiveRows = rows.filter((row) => row.line < limit);
+    const rendered = this.#engine
+      ? this.#engine.render(lines, rows, width, limit)
+      : this.#boundContent(this.#withFocusHint(lines, rows.length > 0), width, limit);
+    if (streaming) while (rendered.length < limit) rendered.push("");
+    return rendered;
   }
 
-  #buildContent(snapshot: FabricDashboardSnapshot): string[] {
+  /** Advertise the expand shortcut on the header while participant rows exist. */
+  #withFocusHint(lines: string[], hasRows: boolean): string[] {
+    if (!this.interaction || lines.length === 0 || !hasRows) return lines;
+    const hint = this.focused ? "↑↓ select · ⏎ expand · esc back" : FABRIC_WIDGET_FOCUS_HINT;
+    return [`${lines[0]} · ${this.theme.fg("dim", hint)}`, ...lines.slice(1)];
+  }
+
+  #content(snapshot: FabricDashboardSnapshot): { lines: string[]; rows: Array<FabricWidgetRow & { line: number }> } {
+    const rows: Array<FabricWidgetRow & { line: number }> = [];
+    const lines = this.#buildContent(snapshot, rows);
+    return { lines, rows };
+  }
+
+  #buildContent(snapshot: FabricDashboardSnapshot, rows: Array<FabricWidgetRow & { line: number }> = []): string[] {
     const candidateRun = snapshot.runs[0];
     const candidateFinishedAt = candidateRun?.finishedAt ?? candidateRun?.updatedAt ?? 0;
     const run =
@@ -272,10 +430,10 @@ export class FabricWidget implements Component {
     const visibleActors = snapshot.actors.filter((actor) => actor.status !== "stopped");
     const activeActorWorkers = visibleActors
       .filter((actor) => actor.worker && isActiveStatus(actor.worker.status))
-      .map((actor) => ({ ...actor.worker!, name: actor.name }));
+      .map((actor) => ({ ...actor.worker!, name: actor.name, actorId: actor.id }));
     const terminalActorWorkers = visibleActors
       .filter((actor) => actor.worker && !isActiveStatus(actor.worker.status))
-      .map((actor) => ({ ...actor.worker!, name: actor.name }));
+      .map((actor) => ({ ...actor.worker!, name: actor.name, actorId: actor.id }));
     const nestedCalls =
       run?.calls.filter((call) => call.kind !== "agent" && call.kind !== "actor") ?? [];
     const title = run?.name ?? "Fabric session";
@@ -340,16 +498,15 @@ export class FabricWidget implements Component {
     }
     if (liveShells.length + recentShells.length > 3) lines.push(this.theme.fg("dim", `  +${liveShells.length + recentShells.length - 3} more shell tasks`));
 
-    lines.push(
-      ...activeAgents.flatMap((agent) => agentLines(this.theme, agent)),
-      ...activeActorWorkers.flatMap((agent) =>
-        agentLines(this.theme, agent),
-      ),
-      ...terminalActorWorkers.flatMap((agent) =>
-        agentLines(this.theme, agent),
-      ),
-      ...terminalAgents.flatMap((agent) => agentLines(this.theme, agent)),
-    );
+    const pushParticipant = (agent: FabricUiAgent, kind: "agent" | "actor"): void => {
+      const id = kind === "actor" ? agent.actorId ?? agent.id : agent.id;
+      rows.push({ id, kind, name: agent.name, line: lines.length });
+      lines.push(...agentLines(this.theme, agent));
+    };
+    for (const agent of activeAgents) pushParticipant(agent, "agent");
+    for (const agent of activeActorWorkers) pushParticipant(agent, "actor");
+    for (const agent of terminalActorWorkers) pushParticipant(agent, "actor");
+    for (const agent of terminalAgents) pushParticipant(agent, "agent");
     return lines;
   }
 

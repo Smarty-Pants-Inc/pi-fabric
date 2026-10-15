@@ -11,6 +11,8 @@ import { OutputArtifactStore } from "./output-budget.js";
 import { resolveAgentDir } from "./core/agent-dir.js";
 import { recordMainRelease } from "./lifecycle/release-process.js";
 import { loadedFabricRoot } from "./core/agent-dir.js";
+import { loadHostSdk } from "./core/host-sdk.js";
+import { requestChildTraceContext } from "./agents/trace-context-request.js";
 import type { FabricModelCandidate } from "./core/model-resolution.js";
 import { resolvePiModel, resolvePiRoutePin } from "./core/model-refresh.js";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -158,6 +160,7 @@ import { AgentCompletionInbox } from "./agents/completion-inbox.js";
 import { ActorChildCompletionStore } from "./actors/child-completions.js";
 import { resolveAgentSpawner } from "./agents/spawner.js";
 import { rememberStoppedAtClose, restoreStoppedRuns, STOPPED_AGENTS_ENTRY, type StoppedAgentsEntryData } from "./agents/stopped-runs.js";
+import type { PeerPresenceNotifier } from "./topology/peer-presence.js";
 import { ShellEventInbox } from "./core/shell-inbox.js";
 import { FabricShellTimingBridge } from "./core/shell-timing.js";
 import { readFabricBashMiddleware } from "./core/shell-middleware.js";
@@ -234,6 +237,9 @@ export class FabricRuntimeState {
   #speculation: RuntimeStateSpeculation | undefined;
   #agents: AgentManager | undefined;
   #completionInbox: AgentCompletionInbox | undefined;
+  #peerPresence: PeerPresenceNotifier | undefined;
+  #stopPeerPresenceArm: (() => void) | undefined;
+  #peerPresenceLoad: Promise<void> | undefined;
   #shellInbox: ShellEventInbox | undefined;
   #shellTiming: FabricShellTimingBridge | undefined;
   #actors: ActorDirectory | undefined;
@@ -1229,7 +1235,7 @@ export class FabricRuntimeState {
         const { model } = await resolveParticipantPiModel(modelKey);
         // Load host settings only for an actual compacted handoff. Project
         // trust does not transfer implicitly to a different working directory.
-        const { SettingsManager } = await import("@earendil-works/pi-coding-agent");
+        const { SettingsManager } = await loadHostSdk();
         const settings = SettingsManager.create(cwd, resolveAgentDir(), {
           projectTrusted: !this.#managedHost && cwd === context.cwd && context.isProjectTrusted(),
         }).getCompactionSettings(model);
@@ -1334,6 +1340,8 @@ export class FabricRuntimeState {
       },
       onChildQuestion: (request) =>
         routeChildQuestion(request, { context, ...(this.#decisions ? { store: this.#decisions } : {}) }),
+      resolveChildTraceContext: (launch) =>
+        requestChildTraceContext((event, value) => this.pi.events?.emit(event, value), launch),
     });
     // Runs a previous runtime of this session stopped at reload/shutdown (smarty-dev#1602):
     // wait/status answer from the record, and with notices on each result reaches the spawner once.
@@ -1612,6 +1620,10 @@ export class FabricRuntimeState {
         );
       }
     }
+    // Children are coordinated by their parent; only a root is told about peers.
+    // Arm the tiny input hook now, but load the notifier only at the first real
+    // model boundary. Peer presence is advisory and must not enlarge activation.
+    if (mainAgent.local && this.#config.mesh.enabled) this.#armPeerPresence(context);
     this.#lifecycle.start();
     this.#residency?.start();
     await builtins.install(createProviderComponent({
@@ -1636,7 +1648,7 @@ export class FabricRuntimeState {
               fabricWakeCause({ id: advice.runId, name: advice.name, kind: "agent" }, "host-event", "jev.advice", advice.eventId));
           }) : undefined;
           this.#jevObservationHost = observationHost;
-          // A bare `jev.model` alias stays on TypeSafe; `typesafe/...` / `~typesafe/...` uses OpenRouter decisions, and `typesafe-ai/...` uses Vercel AI Gateway.
+          // A bare `jev.model` alias stays on TypeSafe; `typesafe/...` / `~typesafe/...` uses OpenRouter decisions, `typesafe-ai/...` uses Vercel AI Gateway, and `subq-...` uses SubQ.
           const jevRoute = resolveJevModelRoute(this.#config!.jev.model).route;
           const provider = new JevProvider({
             registry: this.#registry!, config: this.#config!, observationHost,
@@ -2193,9 +2205,41 @@ export class FabricRuntimeState {
     await this.#componentLoader?.settle();
   }
 
+  #armPeerPresence(context: ExtensionContext): void {
+    this.#stopPeerPresenceArm?.();
+    this.#stopPeerPresenceArm = undefined;
+    this.#peerPresenceLoad = undefined;
+    this.#peerPresenceArmToken = undefined;
+    if (!this.#mainAgent?.local || !this.#config?.mesh.enabled) return;
+    const epoch = this.#epoch;
+    const token = Symbol("peer-presence-arm");
+    const handler = async (_event: unknown, inputContext: ExtensionContext): Promise<void> => {
+      if (epoch !== this.#epoch || token !== this.#peerPresenceArmToken || this.#peerPresence ||
+        !this.#mainAgent?.local || !this.#config?.mesh.enabled || this.#config.mesh.peerNotices !== true) return;
+      this.#peerPresenceLoad ??= import("./topology/peer-presence.js").then(({ PeerPresenceNotifier }) => {
+        if (epoch !== this.#epoch || token !== this.#peerPresenceArmToken ||
+          !this.#mainAgent?.local || !this.#config?.mesh.enabled) return;
+        this.#peerPresence = new PeerPresenceNotifier(this.pi, inputContext ?? context, {
+          peers: () => this.peerInfos(),
+          enabled: () => this.#config?.mesh.peerNotices === true,
+          cwd: context.cwd,
+        });
+        this.#stopPeerPresenceArm?.();
+        this.#stopPeerPresenceArm = undefined;
+      }).catch(() => undefined);
+      await this.#peerPresenceLoad;
+    };
+    this.#peerPresenceArmToken = token;
+    this.#stopPeerPresenceArm = this.pi.on("input", handler);
+  }
+
+  #peerPresenceArmToken: symbol | undefined;
+
   async shutdown(reason?: string, targetSessionFile?: string): Promise<void> {
     this.#stopHerdrLookup?.();
     this.#stopHerdrLookup = undefined;
+    this.#stopPeerPresenceArm?.();
+    this.#stopPeerPresenceArm = undefined;
     this.#meshActivationReady = () => false;
     this.#closeInboxWatch();
     this.#controlPausedByDispose = false;
@@ -2226,6 +2270,10 @@ export class FabricRuntimeState {
     }
     this.#completionInbox?.close();
     this.#completionInbox = undefined;
+    this.#peerPresence?.close();
+    this.#peerPresence = undefined;
+    this.#peerPresenceLoad = undefined;
+    this.#peerPresenceArmToken = undefined;
     this.#shellInbox?.close();
     this.#shellInbox = undefined;
     // Stop the resident drainer (and await its drain) before the Main journal closes: a delivery
@@ -2390,6 +2438,12 @@ export class FabricRuntimeState {
   async #closeInternal(): Promise<void> {
     this.#stopHerdrLookup?.();
     this.#stopHerdrLookup = undefined;
+    this.#stopPeerPresenceArm?.();
+    this.#stopPeerPresenceArm = undefined;
+    this.#peerPresenceArmToken = undefined;
+    this.#peerPresenceLoad = undefined;
+    this.#peerPresence?.close();
+    this.#peerPresence = undefined;
     // /fabric reload and bootstrap replacement rebuild Fabric, not the creating
     // Main's lineage. Preserve its mailbox/address even if replacement fails.
     this.#mainAgent?.prepareReload();

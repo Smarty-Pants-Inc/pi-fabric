@@ -51,7 +51,18 @@ export const createJevAuthProvider = () => createProvider({
   models: [],
   api: JEV_LOGIN_ONLY_API,
 });
+/** The same auth-only contract for SubQ's System One route: `/login subq`. */
+export const createSubqAuthProvider = () => createProvider({
+  id: "subq",
+  name: "SubQ Snap (System One)",
+  baseUrl: "https://api.subq.ai/v1",
+  auth: { apiKey: envApiKeyAuth("SubQ API key", ["SUBQ_API_KEY"]) },
+  models: [],
+  api: JEV_LOGIN_ONLY_API,
+});
 export function registerJevAuth(pi: ExtensionAPI): void {
   // Keep lightweight test/managed adapters without provider registration usable.
-  if (typeof pi.registerProvider === "function") pi.registerProvider(createJevAuthProvider());
+  if (typeof pi.registerProvider !== "function") return;
+  pi.registerProvider(createJevAuthProvider());
+  pi.registerProvider(createSubqAuthProvider());
 }

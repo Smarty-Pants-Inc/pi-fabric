@@ -2,11 +2,8 @@
 import { homedir } from "node:os";
 import { dirname, isAbsolute, resolve } from "node:path";
 import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
-import {
-  createWriteToolDefinition,
-  type ToolDefinition,
-  withFileMutationQueue,
-} from "@earendil-works/pi-coding-agent";
+import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { PiCodingAgent } from "../core/host-sdk-runtime.js";
 import { MAX_WRITE_DIFF_BYTES, writeContentForPreview } from "./write-diff-limits.js";
 
 type ExistingFilePreview =
@@ -76,7 +73,7 @@ const readExistingFileForPreview = async (
 export const createPreviewWriteToolDefinition = (
   cwd: string,
 ): ToolDefinition<any, any, any> => {
-  const original = createWriteToolDefinition(cwd);
+  const original = PiCodingAgent.createWriteToolDefinition(cwd);
   return {
     ...original,
     async execute(
@@ -86,7 +83,7 @@ export const createPreviewWriteToolDefinition = (
     ) {
       const { path, content } = params;
       const absolutePath = resolvePreviewPath(path, cwd);
-      return withFileMutationQueue(absolutePath, async () => {
+      return PiCodingAgent.withFileMutationQueue(absolutePath, async () => {
         const throwIfAborted = (): void => {
           if (signal?.aborted) throw new Error("Operation aborted");
         };

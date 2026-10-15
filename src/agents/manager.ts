@@ -66,6 +66,11 @@ import {
   type InheritedSessionPin,
 } from "./session-pins.js";
 import { tokenUsagePayloadFromValue } from "../lifecycle/types.js";
+import {
+  readTraceContext,
+  type FabricChildTraceContextLaunch,
+  type FabricTraceContextV1,
+} from "./trace-context.js";
 import type { FabricTokenUsagePayload } from "../lifecycle/types.js";
 import { AgentAdmission, assertAgentTask, beginAgentSettlement, createAgentLifecycle, finishAgentSettlement, terminalAgentStatuses, type AgentLifecycleState } from "./lifecycle.js";
 import { removeTree } from "./rm.js";
@@ -531,6 +536,8 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
   recoveryAlarmed?: boolean;
   id: string;
   name: string;
+  /** Tool calls that started the run, offered again to trace-context listeners on relaunch. */
+  traceOrigin?: AgentRunRequest["traceOrigin"];
   task: string;
   promptSha256?: string;
   promptBytes?: number;
@@ -748,6 +755,21 @@ const retryablePiStartupError = (error: string | undefined): boolean =>
   /\b(?:no|missing)\s+(?:api key|credentials?)\b|\b(?:api key|credentials?)\s+(?:was\s+)?not found\b/i.test(
     error,
   );
+
+const checkedTraceContext = (request: AgentRunRequest): FabricTraceContextV1 | undefined => {
+  if (request.traceContext === undefined) return undefined;
+  const forwarded = readTraceContext(request.traceContext);
+  if (!forwarded) throw new Error("Invalid forwarded trace context");
+  return forwarded;
+};
+
+const traceOrigin = (origin: AgentRunRequest["traceOrigin"]): NonNullable<AgentRunRequest["traceOrigin"]> => ({
+  ...(typeof origin?.parentToolCallId === "string" ? { parentToolCallId: origin.parentToolCallId } : {}),
+  ...(typeof origin?.nestedToolCallId === "string" ? { nestedToolCallId: origin.nestedToolCallId } : {}),
+});
+
+const runName = (request: AgentRunRequest): string =>
+  safeName(request.name ?? request.task.split("\n", 1)[0] ?? "Fabric agent");
 
 const safeName = (value: string): string =>
   detachedPreview(value.replace(/[\r\n\t]+/g, " ").trim(), MAX_NAME_LENGTH) || "Fabric agent";
@@ -1217,6 +1239,9 @@ export class AgentManager {
   readonly #resolveInheritedSessionPins: (() => InheritedSessionPin[] | undefined) | undefined;
   readonly #thinkingBounds: (() => FabricThinkingBounds) | undefined;
   readonly #sessionId: (() => string | undefined) | undefined;
+  readonly #resolveChildTraceContext:
+    | ((launch: FabricChildTraceContextLaunch) => FabricTraceContextV1 | undefined)
+    | undefined;
   readonly #executorRuntime: (() => string | undefined) | undefined;
   /** This process's own confinement; children may only narrow it. */
   readonly #parentWritePolicy: FabricWritePolicy | undefined = readWritePolicy();
@@ -1341,6 +1366,8 @@ export class AgentManager {
       thinkingBounds?: () => FabricThinkingBounds;
       /** Caller Pi session id recorded as lineage parentSessionId. */
       sessionId?: () => string | undefined;
+      /** Asks the session's extensions for a child's W3C trace context before each launch and relaunch. */
+      resolveChildTraceContext?: (launch: FabricChildTraceContextLaunch) => FabricTraceContextV1 | undefined;
       /** Caller TypeScript executor runtime; native runtimes escape write confinement. */
       executorRuntime?: () => string | undefined;
     } = {},
@@ -1385,6 +1412,7 @@ export class AgentManager {
     this.#resolveInheritedSessionPins = options.resolveInheritedSessionPins;
     this.#thinkingBounds = options.thinkingBounds;
     this.#sessionId = options.sessionId;
+    this.#resolveChildTraceContext = options.resolveChildTraceContext;
     this.#executorRuntime = options.executorRuntime;
     this.#currentDepth = Math.max(0, Number(process.env.PI_FABRIC_DEPTH ?? "0") || 0);
     this.#fullCodeMode = options.fullCodeMode ?? true;
@@ -1683,6 +1711,23 @@ export class AgentManager {
     return runtime;
   }
 
+  /**
+   * The trace context for a run this session hands to a host without its
+   * extensions. That host mints the run id, so listeners see none.
+   */
+  forwardedTraceContext(request: AgentRunRequest): FabricTraceContextV1 | undefined {
+    return this.#traceContext(request, { runner: request.runner ?? this.config.runner, name: runName(request) });
+  }
+
+  /** A forwarded context is used as is; otherwise the session's extensions are asked. */
+  #traceContext(
+    request: AgentRunRequest,
+    launch: Pick<FabricChildTraceContextLaunch, "runId" | "runner" | "name">,
+  ): FabricTraceContextV1 | undefined {
+    return checkedTraceContext(request) ??
+      this.#resolveChildTraceContext?.({ ...launch, ...traceOrigin(request.traceOrigin) });
+  }
+
   /** authorize is host-only activation authority; unlike a guest deadline it survives queuing.
    * beforeCommit is a separate resident-host mutation fence, checked after model preparation.
    * callerReturnAddress is a validated resident caller snapshot, never a task request field.
@@ -1937,6 +1982,7 @@ export class AgentManager {
     }
     // Fail closed before admission or budget side effects.
     const scope = launchScope(request.scope, request.inheritedScope);
+    checkedTraceContext(request);
     const thinkingBounds = this.childThinkingBounds(request.thinkingBounds);
     const requiresFabricKernel = kernel === "python" || request.kernel === "typescript";
     let tools = this.#childTools(request, runnerAdapter, requiresFabricKernel);
@@ -1976,7 +2022,7 @@ export class AgentManager {
     // Count accepted requests, including queued ones, exactly once.
     this.#semaphore.admit(this.#currentDepth + 1);
     const id = randomUUID().replaceAll("-", "");
-    const name = safeName(request.name ?? request.task.split("\n", 1)[0] ?? "Fabric agent");
+    const name = runName(request);
     const prompt = promptMetadata(request.task, path.join(this.#runRoot, id, "task.txt"));
     const callerSignal = signal;
     const assertAuthorized = this.#assertLaunchAuthorized.bind(this, id, authorize);
@@ -2162,6 +2208,7 @@ export class AgentManager {
         const systemPrompt = [request.systemPrompt?.trim(), componentGuidance, spawnerGuidance]
           .filter((section): section is string => Boolean(section))
           .join("\n\n") || undefined;
+        const traceContext = this.#traceContext(request, { runId: id, runner, name });
         const launchContext: FabricRunnerLaunchContext = {
           id,
           name,
@@ -2172,6 +2219,7 @@ export class AgentManager {
           deadlineAt: Date.now() + timeoutMs,
           depth: this.#currentDepth + 1,
           lineage,
+          ...(traceContext ? { traceContext } : {}),
           tools,
           ...(model ? { model } : {}),
           ...(thinking ? { thinking } : {}),
@@ -2292,6 +2340,7 @@ export class AgentManager {
           ...(scope ? ["--scope", JSON.stringify(scope)] : []),
           "--lineage",
           JSON.stringify(lineage),
+          ...(traceContext ? ["--trace-context", JSON.stringify(traceContext)] : []),
           ...(routeDispatch ? ["--route-header", routeDispatch.header] : []),
           ...(request.routeDecision?.mode === "judgment" ? ["--judgment", "true"] : []),
           ...(systemPrompt ? ["--system-prompt", systemPrompt] : []),
@@ -2449,6 +2498,7 @@ export class AgentManager {
             : {}),
           ...(request.capabilityDigest ? { capabilityDigest: request.capabilityDigest } : {}),
           ...(request.runnerSessionId ? { runnerSessionId: request.runnerSessionId } : {}),
+          ...(request.traceOrigin ? { traceOrigin: request.traceOrigin } : {}),
           ...(branch ? { branch } : {}),
           ...(worktree ? { worktree } : {}),
           settled: false,
@@ -5034,6 +5084,17 @@ export class AgentManager {
         })}\n`,
         { encoding: "utf8", mode: 0o600 },
       );
+      // A relaunch is a new process: ask again, and keep the launch's context
+      // when nobody answers (a resident host has no listeners). A custom
+      // worker's argv is its own, so only Fabric's worker is updated.
+      if (BUILT_IN_RUNNER_IDS.has(managed.runner)) {
+        const traceContext = this.#resolveChildTraceContext?.({
+          runId: managed.id, runner: managed.runner, name: managed.name, ...traceOrigin(managed.traceOrigin),
+        });
+        if (traceContext) {
+          setWorkerArgument(managed.launch.workerArguments, "trace-context", JSON.stringify(traceContext));
+        }
+      }
       // The relaunched child owns a fresh status/lifecycle pair, so drain what
       // the previous attempt published (token usage above all) before discarding
       // the journal it landed in.

@@ -1,6 +1,6 @@
 # Fabric execution trace V1
 
-The final `fabric_exec` result details form a bounded durable envelope that holds `success`, `trace`, the rich render `audits`, `phases`, and `error`. The privacy-projected trace stays the functional record for compaction, memory, and tool ownership. The audits persist verbatim with full arguments, results, and previews. A resumed transcript re-renders and expands the same way as the live one. Collapsed cards provide the visual boundary. The record itself keeps the full data. Final session JSONL details never contain logs, return values, type errors, media payloads, or in-memory media notes.
+The final `fabric_exec` result details form a bounded durable envelope that holds `success`, `trace`, the rich render `audits`, `phases`, and `error`. The privacy-projected trace stays the functional record for compaction, memory, and tool ownership. The audits persist verbatim with full arguments, results, previews, and each call's `nestedToolCallId`. A resumed transcript re-renders and expands the same way as the live one. Collapsed cards provide the visual boundary. The record itself keeps the full data. Final session JSONL details never contain logs, return values, type errors, media payloads, or in-memory media notes.
 
 The serialized final details object never exceeds 512 KiB. Consumers use current traces structurally. The chat renderer allows one compatibility exception. It can match a pre-change bash digest against string literals or named strings already visible in the outer `fabric_exec` arguments, so old previews can show the original command.
 
@@ -139,6 +139,8 @@ Usage and model come only from what an operation already reports: agent run resu
 ## Reading and rendering traces
 
 The package exports `isFabricExecutionTraceV1`, `isFabricExecutionTraceOperationV1`, `readFabricExecutionTraceV1`, `createFabricPersistedExecutionDetails`, and `readFabricExecutionRenderDetails`. Its guards reject malformed envelopes, extra fields, oversized data, and unknown versions.
+
+Each persisted audit keeps its `nestedToolCallId`, the same opaque id a [proxied `tool_result`](providers.md#nested-tool_result-proxy) carries as `toolCallId`, with `startedAt` and `endedAt`. A tracing extension can join an audit to the live event by that id, and build a span for a call that failed before any `tool_result`. The field is optional: transcripts written before it persisted, and audits reconstructed from the trace, have none.
 
 Current sessions render resumed cards from the persisted `details.audits`. These audits win over the trace, and they restore full nested read bodies, edit diffs, bash output, and previews on expand. Sessions written before audit persistence hold the trace alone. Their audits come from operation metadata, which keeps bash command text. Each reconstructed audit carries a trace-derived marker, and its missing payloads show `not retained across reload`. The renderer shows no fabricated content. Old sessions that contain `details.audits` and `details.phases` still render through the legacy adapter. For old digest-only bash traces, the renderer matches the digest against literal and named strings that the outer `fabric_exec` arguments already expose. When the renderer finds no exact command, it drops the digest and shows no hash.
 

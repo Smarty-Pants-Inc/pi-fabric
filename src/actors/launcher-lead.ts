@@ -4,6 +4,7 @@ import path from "node:path";
 import type { MeshIdentity } from "../mesh/store.js";
 import { residentProcessAlive } from "../residency/process-identity.js";
 import { readHostLeaseCurrent } from "../topology/host-leases.js";
+import { registeredMainActivation } from "../topology/stall-alarms.js";
 
 const object = (value: unknown): Record<string, unknown> | undefined =>
   value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
@@ -32,10 +33,13 @@ export function assertNativeObserver(meshRoot: string, identity: MeshIdentity, o
   const old = typeof row.rootId === "string" ? nativeRootGrant(meshRoot, row.rootId) : undefined;
   const sameProject = typeof row.project === "string" && row.project.length > 0 && current?.nativeProject === row.project;
   const sameLauncher = !!old && launchName(old.nativeLauncher) && old.nativeLauncher === current?.nativeLauncher;
+  const registrationToken = registeredMainActivation(meshRoot, identity.id);
+  const processIdentityValid = current !== undefined && (current.processStartedAt === undefined && process.platform !== "linux"
+    ? typeof registrationToken === "string" && current.activationId === registrationToken && residentProcessAlive(process.pid)
+    : typeof current.processStartedAt === "string" && /^\d+$/.test(current.processStartedAt) && residentProcessAlive(process.pid, current.processStartedAt));
   if (identity.kind !== "main" || !ownSessionId || identity.id !== `session:${ownSessionId}` || identity.sessionId !== ownSessionId ||
       identity.id === row.rootId || !current || current.retired || current.pid !== process.pid ||
-      typeof current.activationId !== "string" || typeof current.processStartedAt !== "string" || !/^\d+$/.test(current.processStartedAt) ||
-      !residentProcessAlive(process.pid, current.processStartedAt) || !lease || lease.rootId !== identity.id || lease.identityId !== identity.id ||
+      typeof current.activationId !== "string" || !processIdentityValid || !lease || lease.rootId !== identity.id || lease.identityId !== identity.id ||
       lease.expiresAt < Date.now() || lease.writer?.pid !== process.pid || lease.writer.host !== os.hostname() ||
       (retire ? !sameLauncher : !sameProject && !sameLauncher)) {
     throw new Error("Orphan settlement requires a live native project root; retirement requires the same trusted native launcher (not a display name)");

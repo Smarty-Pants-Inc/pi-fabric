@@ -116,18 +116,22 @@ const providerFor = (f: Awaited<ReturnType<typeof fixture>>) => {
 };
 
 describe("persistent old-root settlement (#12785)", () => {
-  it("repairs raw legacy, native state and participant file; keeps history and host-exit restart reason", async () => {
-    const f = await fixture();
-    await f.repair.reconcile();
-    expect(f.store.records()[0]).toMatchObject({ status: "stopped", stopReason: "host-exit" });
-    expect(f.mesh.get(f.legacy, { fresh: true })?.value).toMatchObject({ status: "stopped", stopReason: "owner-root-gone", capabilities: [] });
-    expect(f.mesh.get(keyOf(f.id), { fresh: true })?.value).toMatchObject({ status: "stopped", capabilities: [] });
-    const file = JSON.parse(fs.readFileSync(path.join(f.root, "participants", `${hash(f.id)}.json`), "utf8"));
-    expect(file.value).toMatchObject({ status: "stopped", capabilities: [] });
-    expect(file.value.actorRun).toBeUndefined(); expect(file.value.actorQueued).toBeUndefined();
-    expect(fs.readFileSync(f.history, "utf8")).toBe("private history sentinel\n");
-    await f.repair.reconcile();
-    expect(f.directory.list({ includeStale: true, fresh: true }).find(p => p.id === f.id)).toMatchObject({ status: "stopped", capabilities: [] });
+  it.each(["native", "win32"] as const)("repairs raw legacy, native state and participant file on %s; keeps history and host-exit restart reason", async platform => {
+    const original = Object.getOwnPropertyDescriptor(process, "platform")!;
+    if (platform === "win32") Object.defineProperty(process, "platform", { ...original, value: "win32" });
+    try {
+      const f = await fixture();
+      await f.repair.reconcile();
+      expect(f.store.records()[0]).toMatchObject({ status: "stopped", stopReason: "host-exit" });
+      expect(f.mesh.get(f.legacy, { fresh: true })?.value).toMatchObject({ status: "stopped", stopReason: "owner-root-gone", capabilities: [] });
+      expect(f.mesh.get(keyOf(f.id), { fresh: true })?.value).toMatchObject({ status: "stopped", capabilities: [] });
+      const file = JSON.parse(fs.readFileSync(path.join(f.root, "participants", `${hash(f.id)}.json`), "utf8"));
+      expect(file.value).toMatchObject({ status: "stopped", capabilities: [] });
+      expect(file.value.actorRun).toBeUndefined(); expect(file.value.actorQueued).toBeUndefined();
+      expect(fs.readFileSync(f.history, "utf8")).toBe("private history sentinel\n");
+      await f.repair.reconcile();
+      expect(f.directory.list({ includeStale: true, fresh: true }).find(p => p.id === f.id)).toMatchObject({ status: "stopped", capabilities: [] });
+    } finally { Object.defineProperty(process, "platform", original); }
   });
 
   it("refuses an observer-forged tombstone for a LIVE owner; normal live ownership stays unchanged", async () => {
@@ -147,25 +151,29 @@ describe("persistent old-root settlement (#12785)", () => {
     expect(JSON.parse(fs.readFileSync(path.join(f.root, "participants", `${hash(f.id)}.json`), "utf8"))).toEqual({ format: 1, ...running });
   });
 
-  it("ignores forged capabilities/transient/routing payloads even on an authenticated terminal generation", async () => {
-    const f = await fixture(); await f.repair.reconcile();
-    const entry = f.mesh.get(keyOf(f.id), { fresh: true })!;
-    const poison = { ...(entry.value as object), capabilities: ["steer", "followUp", "fabric", "stop"],
-      actorRun: { id: "fake", startedAt: Date.now() }, actorPreparing: { id: "fake" }, actorQueued: 99,
-      inFlightRun: { id: "fake" }, preparing: { id: "fake" }, pendingMessages: true, remoteHost: "fake-router",
-      name: "forged-display", retiredAt: Date.now(), retiredBy: "forged-retirer" };
-    await f.mesh.put({ identity: f.current, key: entry.key, value: poison });
-    writeParticipantFile(f.root, { ...f.mesh.get(entry.key)!, updatedAt: Date.now() + 1 });
-    const view = f.directory.list({ includeStale: true, fresh: true }).find(p => p.id === f.id)!;
-    expect(view).toMatchObject({ status: "stopped", capabilities: [], ownerIdentityId: f.old.id, name: f.actor.name });
-    expect(view).not.toHaveProperty("retiredAt");
-    expect(view).not.toHaveProperty("retiredBy");
-    for (const field of ["actorRun", "actorPreparing", "actorQueued", "inFlightRun", "preparing", "pendingMessages", "remoteHost"]) {
-      expect(view).not.toHaveProperty(field);
-    }
-    await f.repair.reconcile();
-    expect(f.mesh.get(entry.key, { fresh: true })?.value).toMatchObject({ capabilities: [] });
-    expect(f.mesh.get(entry.key)?.value).not.toHaveProperty("actorRun");
+  it.each(["native", "win32"] as const)("ignores forged capabilities/transient/routing payloads on %s even on an authenticated terminal generation", async platform => {
+    const original = Object.getOwnPropertyDescriptor(process, "platform")!;
+    if (platform === "win32") Object.defineProperty(process, "platform", { ...original, value: "win32" });
+    try {
+      const f = await fixture(); await f.repair.reconcile();
+      const entry = f.mesh.get(keyOf(f.id), { fresh: true })!;
+      const poison = { ...(entry.value as object), capabilities: ["steer", "followUp", "fabric", "stop"],
+        actorRun: { id: "fake", startedAt: Date.now() }, actorPreparing: { id: "fake" }, actorQueued: 99,
+        inFlightRun: { id: "fake" }, preparing: { id: "fake" }, pendingMessages: true, remoteHost: "fake-router",
+        name: "forged-display", retiredAt: Date.now(), retiredBy: "forged-retirer" };
+      await f.mesh.put({ identity: f.current, key: entry.key, value: poison });
+      writeParticipantFile(f.root, { ...f.mesh.get(entry.key)!, updatedAt: Date.now() + 1 });
+      const view = f.directory.list({ includeStale: true, fresh: true }).find(p => p.id === f.id)!;
+      expect(view).toMatchObject({ status: "stopped", capabilities: [], ownerIdentityId: f.old.id, name: f.actor.name });
+      expect(view).not.toHaveProperty("retiredAt");
+      expect(view).not.toHaveProperty("retiredBy");
+      for (const field of ["actorRun", "actorPreparing", "actorQueued", "inFlightRun", "preparing", "pendingMessages", "remoteHost"]) {
+        expect(view).not.toHaveProperty(field);
+      }
+      await f.repair.reconcile();
+      expect(f.mesh.get(entry.key, { fresh: true })?.value).toMatchObject({ capabilities: [] });
+      expect(f.mesh.get(entry.key)?.value).not.toHaveProperty("actorRun");
+    } finally { Object.defineProperty(process, "platform", original); }
   });
 
   it("does not trust a public orphan marker or observer attribution without its private receipt", async () => {

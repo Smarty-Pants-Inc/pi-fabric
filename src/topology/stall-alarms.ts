@@ -21,6 +21,9 @@ const mailbox = (meshRoot: string): string => path.join(meshRoot, "main-followup
 const ownerFile = (meshRoot: string, sessionId: string): string => path.join(mailbox(meshRoot), `${encodeURIComponent(sessionId)}.owner.json`);
 const routeFile = (meshRoot: string, id: string): string => path.join(mailbox(meshRoot), "routes", `${hash(id)}.json`);
 const successorFile = (meshRoot: string, rootId: string): string => path.join(mailbox(meshRoot), "successors", `${hash(rootId)}.json`);
+// Current-process proof on platforms without /proc birth evidence. Never reconstruct from disk.
+const registeredMainActivations = new Map<string, string>();
+const registrationKey = (meshRoot: string, rootId: string): string => `${meshRoot}\u0000${rootId}`;
 const read = <T>(file: string): T | undefined => {
   try { return JSON.parse(fs.readFileSync(file, "utf8")) as T; }
   catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw error; }
@@ -47,8 +50,11 @@ export const registerMainInbox = (meshRoot: string, identity: MeshIdentity, sess
   writeJsonAtomic(ownerFile(meshRoot, sessionId), { rootId: identity.id, sessionId, sessionFile, activationId, nativeLauncher, nativeProject,
     ownerIdentityId: identity.id, pid: process.pid, host: os.hostname(), name: identity.name, processStartedAt: processStartTime(process.pid) } satisfies InboxOwner, { durable: true });
   writeJsonAtomic(successorFile(meshRoot, identity.id), { oldRoot: identity.id, activationId } satisfies Successor, { durable: true });
+  registeredMainActivations.set(registrationKey(meshRoot, identity.id), activationId);
   return activationId;
 };
+export const registeredMainActivation = (meshRoot: string, rootId: string): string | undefined =>
+  registeredMainActivations.get(registrationKey(meshRoot, rootId));
 /** smarty-dev#8881 F-01: optional activation liveness, checked inside the custody critical section
  * before any write. Custody acquisition awaits; a session disposed in that wait must commit nothing. */
 const fenceActivation = (live?: () => boolean): void => {

@@ -49,11 +49,14 @@ const BRIDGE_FENCE_RETRY_MS = 5_000;
 const DEFAULT_PRESENCE_MS = 5_000;
 /** A retained source event revalidates after this delay; this is NOT an event/authority TTL. */
 const DEFAULT_MEMBERSHIP_RETRY_MS = 1_000;
+/** A missed change notification is only a safety net: its retry backs off to this bound. */
+const MEMBERSHIP_RETRY_MAX_MS = 30_000;
 /** Transitional mixed-version exception only: remove after all fleet agents support changes. */
 const LEGACY_POLL_MS = 250;
 /** Commands whose ACK this link relays back to a non-participant hub sender (smarty-dev#9751). */
 const MAX_AWAITING_ACKS = 4_096;
 type Direction = "toRemote" | "toLocal";
+type DirectionWakeReason = "real" | "safety" | "grace" | "sync" | "other";
 /** How long a carried command's ACK may still be relayed back (smarty-dev#9751). */
 const AWAITING_ACK_MS = 15 * 60_000;
 /** A relayed ACK goes back only to one session or factory host: never an org, topic or broadcast name. */
@@ -1734,7 +1737,7 @@ export interface MeshBridgeOptions {
   presenceMs?: number;
   /** Bound on each wait in stop(); the remote cannot hold a stop longer. */
   stopMs?: number;
-  /** Retry retained stale-membership events after this many ms (default 1 s). Never expires/drops the event. */
+  /** Initial missed-notification safety delay (default 1 s), doubled up to 30 s. Never expires/drops the event. */
   membershipRetryMs?: number;
   /** First wait after a WAL-cap refusal (then doubling to 30 s). Default 1 s; tests lower it. */
   walCapRetryMinMs?: number;
@@ -1912,14 +1915,19 @@ export class MeshBridge {
   readonly #directionPending: Record<Direction, boolean> = { toRemote: false, toLocal: false };
   readonly #directionBackoff: Record<Direction, boolean> = { toRemote: false, toLocal: false };
   readonly #directionMirrorBackoff: Record<Direction, boolean> = { toRemote: false, toLocal: false };
-  readonly #directionWake: Partial<Record<Direction, () => void>> = {};
+  readonly #directionWake: Partial<Record<Direction, (reason?: DirectionWakeReason) => void>> = {};
+  readonly #directionWakeReason: Partial<Record<Direction, DirectionWakeReason>> = {};
+  /** The retained-boundary retry kind currently being consumed by a direction pass. */
+  readonly #membershipAttempt: Partial<Record<Direction, "safety" | "grace">> = {};
+  /** Next missed-notification delay; a real notification clears it, sync completion does not. */
+  readonly #membershipSafetyDelay: Partial<Record<Direction, number>> = {};
   /** Last sampled, admitted source deadlines: evidence to WAIT only, never authority to publish. */
   #sampledDeadlines = new Map<string, number>();
   /** At most one pending boundary per direction. Bodies stay in the durable source, before its cursor. */
   readonly #membershipRetryAt: Partial<Record<Direction, number>> = {};
   readonly #membershipSequence: Partial<Record<Direction, number>> = {};
   /** Events not addressed across since the last count line (smarty-dev#9352). */
-  #unaddressed = { count: 0, toRemote: 0, toLocal: 0, factory: 0, topics: new Set<string>(), more: false };
+  #unaddressed = { count: 0, toRemote: 0, toLocal: 0, factory: 0, safety: 0, topics: new Set<string>(), more: false };
   #unaddressedLoggedAt = Number.NEGATIVE_INFINITY;
   /** The factory exception's token buckets (pi-fabric#876 review, P1-2; security pass, (c)). */
   readonly #factoryRate: Required<FactoryRate>;
@@ -2094,13 +2102,14 @@ export class MeshBridge {
    */
   #reportUnaddressed(): void {
     const unaddressed = this.#unaddressed;
-    if (unaddressed.count === 0) return;
+    if (unaddressed.count === 0 && unaddressed.safety === 0) return;
     const now = this.#now();
     if (now - this.#unaddressedLoggedAt < UNADDRESSED_LOG_MS) return;
     this.#unaddressedLoggedAt = now;
-    this.#unaddressed = { count: 0, toRemote: 0, toLocal: 0, factory: 0, topics: new Set<string>(), more: false };
+    this.#unaddressed = { count: 0, toRemote: 0, toLocal: 0, factory: 0, safety: 0, topics: new Set<string>(), more: false };
     this.#log(`bridge: ${unaddressed.count} events not addressed across (topics: ${[...unaddressed.topics].join(", ")}${
-      unaddressed.more ? ", ..." : ""}; toRemote ${unaddressed.toRemote}, toLocal ${unaddressed.toLocal} (to factory ${unaddressed.factory}))`);
+      unaddressed.more ? ", ..." : ""}; toRemote ${unaddressed.toRemote}, toLocal ${unaddressed.toLocal} (to factory ${unaddressed.factory})${
+        unaddressed.safety > 0 ? `; safety wakes advancing retained boundaries ${unaddressed.safety}` : ""})`);
   }
 
   async #reconcileSeen(): Promise<void> {
@@ -2242,12 +2251,14 @@ export class MeshBridge {
     this.#expiryAt = Math.min(Infinity, ...expiries,
       ...(expiries.some(expiry => expiry > syncedAt + BRIDGE_LEASE_MS) ? [syncedAt + BRIDGE_LEASE_MS - 1_000] : []));
     // A completed mirror invalidates pending membership observations immediately, even when
-    // no new event arrives. The source cursor, not a second body queue, owns the retry.
+    // no new event arrives. It releases the boundary, but is not itself a real wake: keep the
+    // missed-notification safety backoff and do not bypass an existing direction backoff.
     for (const direction of ["toRemote", "toLocal"] as const) {
       if (this.#membershipRetryAt[direction] === undefined) continue;
       delete this.#membershipRetryAt[direction];
       this.#directionPending[direction] = true;
-      this.#directionWake[direction]?.();
+      if (this.#directionWakeReason[direction] !== "real") this.#directionWakeReason[direction] = "sync";
+      if (!this.#directionBackoff[direction]) this.#directionWake[direction]?.("sync");
     }
   }
 
@@ -2269,13 +2280,27 @@ export class MeshBridge {
   }
 
   #deferMembership(direction: Direction, event: MeshEvent): void {
-    this.#membershipRetryAt[direction] = Date.now() + (this.options.membershipRetryMs ?? DEFAULT_MEMBERSHIP_RETRY_MS);
-    if (this.#membershipSequence[direction] !== event.sequence) {
+    const previous = this.#membershipSequence[direction];
+    const initial = Math.min(this.options.membershipRetryMs ?? DEFAULT_MEMBERSHIP_RETRY_MS, MEMBERSHIP_RETRY_MAX_MS);
+    const current = this.#membershipSafetyDelay[direction] ?? initial;
+    const delay = this.#membershipAttempt[direction] === "safety"
+      ? Math.min(current * 2, MEMBERSHIP_RETRY_MAX_MS) : current;
+    this.#membershipRetryAt[direction] = Date.now() + delay;
+    // A safety wake doubles only after it actually gets a retained pass. A grace wake and
+    // sync completion preserve the current safety delay; a real wake clears it before here.
+    this.#membershipSafetyDelay[direction] = delay;
+    if (previous !== event.sequence) {
       this.options.debug?.(`${direction}: bridge membership pending for ${event.topic} ${event.id}; source cursor retained, nothing dropped`);
     }
     // Expiry alone never consumes the event. The next successful source sample decides
     // anew: stale evidence waits again; current absence or a proven foreign identity refuses.
     this.#membershipSequence[direction] = event.sequence;
+  }
+
+  #wakeRetainedMembership(direction: Direction): void {
+    if (this.#membershipRetryAt[direction] === undefined && this.#membershipSequence[direction] === undefined) return;
+    delete this.#membershipSafetyDelay[direction];
+    this.#membershipRetryAt[direction] = Date.now();
   }
 
   #presenceDue(): boolean {
@@ -2342,21 +2367,46 @@ export class MeshBridge {
     let walCapDelay: number | undefined;
     let reported = false; // one log line per busy streak, as run() logs its own
     while (running()) {
+      const wakeReason = this.#directionWakeReason[direction];
+      delete this.#directionWakeReason[direction];
+      // A notification can arrive during a pass, before the direction has a wait callback.
+      // Reapply its release after that pass's deferral rather than losing it to a new timer.
+      if (wakeReason === "real") this.#wakeRetainedMembership(direction);
+      else if (wakeReason === "sync") delete this.#membershipRetryAt[direction];
+      const retainedBefore = this.#membershipSequence[direction];
+      const cursorBefore = this.#cursor?.[direction].after ?? 0;
+      if (wakeReason === "safety" || wakeReason === "grace") this.#membershipAttempt[direction] = wakeReason;
+      else delete this.#membershipAttempt[direction];
       this.#directionPending[direction] = false;
       this.#directionBackoff[direction] = false;
       this.#directionMirrorBackoff[direction] = false;
       const presenceVersion = this.#presenceVersion;
       let delay: number | undefined;
+      let delayReason: DirectionWakeReason = "other";
       try {
         await this.#direction(direction);
+        if (wakeReason === "safety" && retainedBefore !== undefined && retainedBefore > cursorBefore &&
+            (this.#cursor?.[direction].after ?? cursorBefore) >= retainedBefore) {
+          this.#unaddressed.safety += 1;
+          this.#reportUnaddressed();
+        }
         retryMs = LOCK_RETRY_MIN_MS;
         walCapDelay = undefined;
         reported = false;
-        // Pending boundaries arm one retry timer each, only while actual work is retained.
+        // ponytail: back off only retained work to recover a missed notification without idle polling.
         const membershipRetryAt = this.#membershipRetryAt[direction];
-        if (membershipRetryAt !== undefined) delay = Math.max(0, membershipRetryAt - Date.now());
-        if (direction === "toLocal" && this.#factoryWaiting) delay = Math.min(delay ?? Infinity, Math.max(0, this.#factoryRetryAt - this.#now()));
-        if (this.#legacyPolling) delay = Math.min(delay ?? Infinity, this.options.pollMs ?? LEGACY_POLL_MS);
+        if (membershipRetryAt !== undefined) {
+          delay = Math.max(0, membershipRetryAt - Date.now());
+          delayReason = "safety";
+        }
+        if (direction === "toLocal" && this.#factoryWaiting) {
+          const factoryDelay = Math.max(0, this.#factoryRetryAt - this.#now());
+          if (delay === undefined || factoryDelay < delay) { delay = factoryDelay; delayReason = "other"; }
+        }
+        if (this.#legacyPolling) {
+          const pollDelay = this.options.pollMs ?? LEGACY_POLL_MS;
+          if (delay === undefined || pollDelay < delay) { delay = pollDelay; delayReason = "other"; }
+        }
       } catch (error) {
         if (!running()) return;
         if (isIdempotencyKeyReused(error) || !isBridgeRetryable(error)) {
@@ -2377,16 +2427,25 @@ export class MeshBridge {
           reported = true;
         }
       }
+      delete this.#membershipAttempt[direction];
       if (!running()) return;
       if (this.#directionPending[direction] && !this.#directionBackoff[direction]) continue;
       await new Promise<void>((resolve) => {
         let timer: ReturnType<typeof setTimeout> | undefined;
-        this.#directionWake[direction] = () => {
+        let graceTimer: ReturnType<typeof setTimeout> | undefined;
+        const wake = (reason: DirectionWakeReason = "other"): void => {
           if (timer !== undefined) clearTimeout(timer);
+          if (graceTimer !== undefined) clearTimeout(graceTimer);
           delete this.#directionWake[direction];
+          this.#directionWakeReason[direction] = reason;
           resolve();
         };
-        if (delay !== undefined) timer = setTimeout(() => this.#directionWake[direction]?.(), Math.min(delay, 2_147_483_647));
+        this.#directionWake[direction] = wake;
+        if (delay !== undefined) timer = setTimeout(() => this.#directionWake[direction]?.(delayReason), Math.min(delay, 2_147_483_647));
+        // RELAY-1 owns an exact persisted deadline, separate from the safety/lock backoff.
+        // An expired grace is never rearmed when its source sender still lacks authority.
+        const graceAt = this.#relayGraceAt(direction);
+        if (graceAt !== undefined) graceTimer = setTimeout(() => wake("grace"), Math.min(Math.max(0, graceAt - Date.now()), 2_147_483_647));
       });
     }
   }
@@ -2401,6 +2460,8 @@ export class MeshBridge {
     const seen = this.#seen[direction];
     let forwarded = 0;
     let dropped = 0;
+    const retainedBoundary = this.#membershipSequence[direction];
+    let passRefreshed = false;
     if (cursor.relayGrace && Number.isSafeInteger(cursor.relayGrace.sequence) && cursor.relayGrace.sequence <= cursor.after) {
       delete cursor.relayGrace;
       this.#save();
@@ -2408,14 +2469,17 @@ export class MeshBridge {
     if ((this.#membershipSequence[direction] ?? Infinity) <= cursor.after) {
       delete this.#membershipSequence[direction];
       delete this.#membershipRetryAt[direction];
+      delete this.#membershipSafetyDelay[direction];
     }
     const membershipRetryAt = this.#membershipRetryAt[direction];
     if (membershipRetryAt !== undefined) {
-      if (Date.now() < membershipRetryAt) return { forwarded, dropped };
+      const graceDue = this.#relayGraceExpired(direction);
+      if (Date.now() < membershipRetryAt && !graceDue) return { forwarded, dropped };
       delete this.#membershipRetryAt[direction];
       // Expiration invalidates the observation, never the event: sample again before rereading
       // its unchanged source boundary. Failed/deferred mirrors retain that boundary too.
       await this.syncPresence();
+      passRefreshed = true;
     }
     if (direction === "toLocal" && this.#factoryWaiting) {
       // A factory-rate deferral holds this link's inbound drain, in order, until its token is due;
@@ -2433,10 +2497,15 @@ export class MeshBridge {
       const page = await (source.tail?.(start, startOffset) ?? source.read(start));
       // Even filtered/skip-only reads can carry this drain past the mirrors' lease.
       // Reconcile latched origin changes/expiry even on a filtered page.
-      if (this.#presenceDue()) await this.syncPresence();
-      // Authority reads are deliberately canonical (copied-marker ABA), so idle pages
-      // avoid them; every page with events retains the same fresh authority checks.
-      let rules: BridgeRules = page.events.length ? await authority() : { recipients: new Set<string>() };
+      const retainedRefresh = passRefreshed && retainedBoundary !== undefined && cursor.after < retainedBoundary &&
+        this.#presenceVersion === this.#syncedPresenceVersion && this.#leaseVersion === this.#syncedLeaseVersion;
+      if (!retainedRefresh && this.#presenceDue()) {
+        await this.syncPresence();
+        passRefreshed = true;
+      }
+      // Reuse only this retained boundary's completed sample; real changes and later pages
+      // still refresh normally. Canonical owned()/holds() checks are never skipped.
+      let rules: BridgeRules = page.events.length ? await authority(!retainedRefresh) : { recipients: new Set<string>() };
       for (const skip of Array.isArray(page.skipped) ? page.skipped : []) {
         dropped += 1;
         this.#log(`${direction}: skipped ${skip.topic} ${skip.id} (sequence ${skip.sequence}): ${skip.bytes} bytes pass the ${BRIDGE_PAGE_BYTES}-byte frame budget`);
@@ -2451,6 +2520,7 @@ export class MeshBridge {
           !isRelayReceipt(event) && !this.#isRelayCommand(event, rules, direction)) {
           if (this.#presenceDue()) {
             await this.syncPresence();
+            passRefreshed = true;
             rules = await authority(false);
           }
           if (this.#stopped) return { forwarded, dropped };
@@ -2516,9 +2586,10 @@ export class MeshBridge {
             }
           }
         }
-        let refreshed = false;
+        let refreshed = passRefreshed && retainedBoundary === event.sequence;
         const refresh = async (): Promise<void> => {
           refreshed = true;
+          passRefreshed = true;
           await this.syncPresence();
           // This event gets one refresh, even if that pass itself waited on a lock.
           rules = await authority(false);
@@ -2530,7 +2601,7 @@ export class MeshBridge {
         // A file notification may still be queued when a later event append is already
         // readable. Refresh a newly observed canonical address once before dropping it;
         // admission/holds still use the committed projection, never the sender's claim.
-        if (lapsedId && (this.options.local.mirrored?.(lapsedId) ||
+        if (!refreshed && lapsedId && (this.options.local.mirrored?.(lapsedId) ||
           (this.#notificationMode && CANONICAL_ID.test(lapsedId)))) {
           await refresh();
           reason = this.#refusal(event, rules, direction);
@@ -2583,7 +2654,10 @@ export class MeshBridge {
         } else if (!seen.has(event.id)) {
           // A long backlog still reconciles origin updates; a lapsed held mirror gets the
           // existing one-refresh commit refusal path, never an idle renewal timer.
-          if (this.#presenceDue()) await this.syncPresence();
+          if (this.#presenceDue()) {
+            await this.syncPresence();
+            passRefreshed = true;
+          }
           if (this.#stopped) return { forwarded, dropped };
           let factorySpend = 0;
           if (this.#viaFactory(event, rules, direction)) {
@@ -2696,6 +2770,24 @@ export class MeshBridge {
         (!this.#relaySenderAllowed(event, rules) && !this.#staleRelaySender(event, rules))) return false;
     const origin = this.options.local.relayStaleOrigin?.(event.to);
     return origin !== undefined && event.data.destinationRemoteHost === origin;
+  }
+
+  #relayGraceAt(direction: Direction): number | undefined {
+    if (direction !== "toLocal") return undefined;
+    const retained = this.#cursor?.toLocal.relayGrace;
+    if (!isObject(retained) || !Number.isSafeInteger(retained.sequence) || retained.sequence <= (this.#cursor?.toLocal.after ?? 0) ||
+        !Number.isFinite(retained.startedAt) || retained.startedAt < 0) return undefined;
+    const deadline = retained.startedAt + BRIDGE_LEASE_MS;
+    return Number.isFinite(deadline) && Date.now() < deadline ? deadline : undefined;
+  }
+
+  #relayGraceExpired(direction: Direction): boolean {
+    if (direction !== "toLocal") return false;
+    const retained = this.#cursor?.toLocal.relayGrace;
+    if (!isObject(retained) || !Number.isSafeInteger(retained.sequence) || retained.sequence <= (this.#cursor?.toLocal.after ?? 0) ||
+        !Number.isFinite(retained.startedAt) || retained.startedAt < 0) return false;
+    const deadline = retained.startedAt + BRIDGE_LEASE_MS;
+    return Number.isFinite(deadline) && Date.now() >= deadline;
   }
 
   #relayGracePending(event: MeshEvent): boolean {
@@ -2836,7 +2928,7 @@ export class MeshBridge {
 
   /** Follow notifications until stop() or failure. No timer is armed for empty idle.
    * Timer inventory: source/held-mirror expiry and pending half-lease flush (one shot);
-   * retained stale-membership boundaries (default 1 s, only while actual work is pending);
+   * retained stale-membership safety net (1 s..30 s backoff), plus exact persisted relay grace;
    * actual lock/SQLite busy, including WAL notification commit settlement (100 ms..2 s);
    * WAL-cap refusal (1 s..30 s); explicitly negotiated legacy-only 250 ms polling.
    * Held-publication fence retries, RPC deadlines and stop
@@ -2854,10 +2946,13 @@ export class MeshBridge {
     // which also does that direction's catch-up: no sequential drain first.
     let ended = false;
     const running = (): boolean => !this.#stopped && !ended;
-    const wakeDirections = (): void => {
+    const wakeDirections = (retainedOnly = false): void => {
       for (const direction of ["toRemote", "toLocal"] as const) {
+        if (retainedOnly && (this.#membershipSequence[direction] ?? 0) <= (this.#cursor?.[direction].after ?? 0)) continue;
+        this.#wakeRetainedMembership(direction);
         this.#directionPending[direction] = true;
-        if (!this.#directionBackoff[direction]) this.#directionWake[direction]?.();
+        this.#directionWakeReason[direction] = "real";
+        if (!this.#directionBackoff[direction]) this.#directionWake[direction]?.("real");
       }
     };
     this.#notificationMode = true;
@@ -2868,6 +2963,7 @@ export class MeshBridge {
         // One pending half-lease flush coalesces every lane's heartbeat. Further renewals
         // neither reschedule it nor take a lock; actual routed work refreshes immediately.
         if (firstPending && !backingOff) this.#wake?.();
+        wakeDirections(true);
         return;
       }
       this.#changesPending = true;

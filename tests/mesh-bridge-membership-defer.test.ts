@@ -9,7 +9,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   BRIDGE_LEASE_MS, BridgeMirrorDeferredError, BridgeOwnershipError, MeshBridge, RemoteBridgeSide,
-  serveBridgeAgent, StoreBridgeSide, type BridgePublish,
+  serveBridgeAgent, StoreBridgeSide, type BridgePresence, type BridgePublish, type BridgeSide,
 } from "../src/mesh/bridge.js";
 import { MeshStore, type MeshEvent, type MeshIdentity } from "../src/mesh/store.js";
 import { readHostLease, writeHostLease } from "../src/topology/host-leases.js";
@@ -18,7 +18,7 @@ import { writeParticipantFile } from "../src/topology/participant-files.js";
 const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => {
   try { for (const close of cleanups.splice(0).reverse()) await close(); }
-  finally { vi.restoreAllMocks(); }
+  finally { vi.restoreAllMocks(); vi.useRealTimers(); }
 });
 const key = (kind: string, id: string) => `topology/${kind}/${createHash("sha256").update(id).digest("hex")}`;
 const sid = (name: string) => `session:${name}-00000000`;
@@ -118,6 +118,162 @@ const holdMirror = (side: StoreBridgeSide, matches: (snapshot: Snapshot) => bool
   return { entered: entered.promise, release: () => release.resolve() };
 };
 const stampId = (event: MeshEvent) => (event.data as { bridge?: { id: string } } | undefined)?.bridge?.id;
+
+// Scheduler seam for fixed1s: transport notifications are explicitly captured (and withheld),
+// while run(), both real direction loops, admission and the persisted cursor remain production code.
+// No filesystem watches or host-renewal timers can accidentally rescue a missed notification.
+const retainedRun = async () => {
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-membership-safety-"));
+  const lead: MeshIdentity = { id: sid("safety-lead"), name: "main", kind: "main", sessionId: "safety-lead" };
+  const lane: MeshIdentity = { id: sid("safety-lane"), name: "main", kind: "main", sessionId: "safety-lane" };
+  const presence = (identity: MeshIdentity): BridgePresence => {
+    const now = Date.now(), id = identity.id;
+    return { hosts: [{ record: { format: 1, id, rootId: id, identity, startedAt: 1,
+      updatedAt: now, expiresAt: now + 120_000 }, expiresAt: now + 120_000, observedAt: now }],
+    participants: [{ format: 1, id, kind: "root", rootId: id, ownerHostId: id, ownerIdentityId: id,
+      name: identity.sessionId!, label: identity.sessionId!, status: "idle", runner: "pi", transport: "host",
+      capabilities: [], sessionId: identity.sessionId!, startedAt: 1, updatedAt: now, controlProtocol: "v1" }], reserved: [id] };
+  };
+  type Change = Parameters<NonNullable<BridgeSide["subscribeChanges"]>>[0];
+  const notices: Partial<Record<"local" | "remote", Change>> = {};
+  const queue: MeshEvent[] = [], delivered: BridgePublish[] = [], logs: string[] = [];
+  let sampled = false, stale = true;
+  let held: Pick<BridgePresence, "hosts" | "participants"> = { hosts: [], participants: [] };
+  const boundary = deferred<void>(), readEntered = deferred<void>(), readRelease = deferred<void>();
+  let gateNextRead = false;
+  const empty = async () => ({ hosts: [], participants: [], reserved: [] });
+  const side = (): BridgeSide => ({ latestSequence: async () => 0,
+    read: async after => ({ events: [], through: after }), presence: empty,
+    mirror: async () => undefined, publish: async () => ({ sequence: 1 }),
+    bridgedIds: async after => ({ ids: [], through: after, done: true }) });
+  const local: BridgeSide = { ...side(),
+    // Only addresses matter to this scheduling probe; no local host/expiry is pending.
+    presence: async () => ({ hosts: [], participants: presence(lead).participants, reserved: [lead.id] }),
+    subscribeChanges: changed => { notices.local = changed; return () => { delete notices.local; }; },
+    owned: async () => held, mirrored: id => sampled && id === lane.id,
+    holds: id => held.hosts.some(host => host.record.id === id),
+    mirror: async snapshot => {
+      if (stale && snapshot.hosts.length) {
+        // One genuine late completed sample seeds the real stale-membership evidence.
+        vi.setSystemTime(Date.now() + BRIDGE_LEASE_MS + 1);
+        held = { hosts: [], participants: [] };
+      } else held = snapshot;
+    },
+    publish: async event => { delivered.push(event); return { sequence: delivered.length }; },
+  };
+  const remote: BridgeSide = { ...side(),
+    presence: async () => sampled ? presence(lane) : empty(),
+    subscribeChanges: changed => { notices.remote = changed; return () => { delete notices.remote; }; },
+    read: async after => {
+      if (gateNextRead) { gateNextRead = false; readEntered.resolve(); await readRelease.promise; }
+      return { events: queue.filter(event => event.sequence > after), through: queue.at(-1)?.sequence ?? after };
+    },
+  };
+  const cursorPath = path.join(root, "cursor.json");
+  const bridge = new MeshBridge({ localName: "hub", remoteName: "far", local, remote, cursorPath,
+    log: line => logs.push(line),
+    debug: line => { if (line.includes("membership pending")) boundary.resolve(); } });
+  let failure: unknown;
+  const running = bridge.run().catch(error => { failure = error; });
+  cleanups.push(async () => { readRelease.resolve(); await bridge.stop(); await running; });
+  await vi.advanceTimersByTimeAsync(0);
+  const cursor = () => JSON.parse(fs.readFileSync(cursorPath, "utf8")) as { toLocal: { after: number } };
+  const sync = vi.spyOn(bridge, "syncPresence");
+  const retain = async () => {
+    sampled = true;
+    queue.push({ id: "fixed1s-retained-command", sequence: 1, createdAt: Date.now(), verification: "mesh",
+      topic: "fabric.control.command", kind: "followUp", from: lane, to: lead.id,
+      data: { version: 1, commandId: "fixed1s-retained", targetId: lead.id, replyTo: lane.id,
+        operation: "followUp", destinationRemoteHost: "hub", message: "retained source body" } });
+    gateNextRead = true;
+    notices.remote!("events");
+    await readEntered.promise;
+    // Let the main loop consume the event-only wake and return to its timer-free wait
+    // BEFORE the direction starts its late membership sample. Otherwise its normal
+    // source-expiry timer, rather than the retained-work scheduler, would own this probe.
+    await vi.advanceTimersByTimeAsync(0);
+    expect(vi.getTimerCount()).toBe(0);
+    readRelease.resolve();
+    await boundary.promise;
+    await vi.advanceTimersByTimeAsync(0);
+    // Model an unchanged completed stale observation, not a rejected/busy mirror (which
+    // already has its own exponential backoff). Avoid injecting another 15 s clock jump per
+    // refresh. The production loops still reread and refuse authority at the real boundary.
+    sync.mockResolvedValue(undefined);
+    sync.mockClear();
+    expect(cursor().toLocal.after).toBe(0);
+    expect(delivered).toEqual([]);
+  };
+  const recover = () => { stale = false; sync.mockRestore(); };
+  return { bridge, sync, notices, queue, delivered, logs, cursor, retain, recover, failure: () => failure };
+};
+
+describe("fixed1s retained membership safety wakes", () => {
+  it("bounds refresh calls over 60 s with every notification suppressed, retaining the boundary and body", async () => {
+    const f = await retainedRun();
+    await f.retain();
+    const before = f.cursor().toLocal.after;
+    await vi.advanceTimersByTimeAsync(60_001);
+    // Count calls, not just passes: multiple refresh sites in one direction must not mask a
+    // new high-frequency poll. A retained event is not permission to poll membership at 1 Hz.
+    expect(f.sync.mock.calls.length).toBeGreaterThan(0);
+    expect(f.sync.mock.calls.length).toBeLessThanOrEqual(7);
+    expect(f.cursor().toLocal.after).toBe(before);
+    expect(f.queue).toHaveLength(1);
+    expect(f.queue[0]!.data).toMatchObject({ message: "retained source body" });
+    expect(f.delivered).toEqual([]);
+    expect(f.failure()).toBeUndefined();
+  });
+
+  it.each(["presence", "lease", "completed mirror"] as const)(
+    "delivers retained work immediately on %s without advancing to the safety wake", async wake => {
+      const f = await retainedRun();
+      await f.retain();
+      await vi.advanceTimersByTimeAsync(7_001); // grow the missed-notification safety backoff
+      expect(f.delivered).toEqual([]);
+      const now = Date.now();
+      f.recover();
+      const refreshed = vi.spyOn(f.bridge, "syncPresence");
+      if (wake === "completed mirror") await f.bridge.syncPresence();
+      else f.notices.remote!(wake);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(Date.now()).toBe(now);
+      expect(refreshed).toHaveBeenCalled();
+      expect(f.delivered).toHaveLength(1);
+      expect(f.delivered[0]).toMatchObject({ from: { id: sid("safety-lane") },
+        data: { commandId: "fixed1s-retained", bridge: { from: "far", id: "fixed1s-retained-command" } } });
+      expect(f.cursor().toLocal.after).toBe(1);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(f.delivered).toHaveLength(1);
+      expect(f.failure()).toBeUndefined();
+    });
+
+  it("counts a missed-notification safety wake only when it advances retained work", async () => {
+    const f = await retainedRun();
+    await f.retain();
+    expect(f.logs.some(line => /safety/i.test(line))).toBe(false);
+    f.recover(); // canonical authority recovers, but deliberately send no change notice
+    await vi.advanceTimersByTimeAsync(1_000);
+    await new Promise<void>(resolve => setImmediate(resolve)); // the drain yields after its durable checkpoint
+    expect(f.delivered).toHaveLength(1);
+    expect(f.cursor().toLocal.after).toBe(1);
+    expect(f.logs.some(line => /safety/i.test(line) && /\b1\b/.test(line))).toBe(true);
+    expect(f.failure()).toBeUndefined();
+  });
+
+  it("does not turn an unchanged idle link into a membership safety poll", async () => {
+    const f = await retainedRun();
+    const reads = vi.spyOn(f.bridge.options.remote, "read");
+    await vi.advanceTimersByTimeAsync(60_001);
+    expect(f.sync).not.toHaveBeenCalled();
+    expect(reads).not.toHaveBeenCalled();
+    expect(f.queue).toEqual([]);
+    expect(f.delivered).toEqual([]);
+    expect(vi.getTimerCount()).toBe(0);
+    expect(f.failure()).toBeUndefined();
+  });
+});
 
 describe("canonical membership admission while mirrors are deferred", () => {
   it.each(["hub admission", "degraded stdio"] as const)(

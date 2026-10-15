@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
+import { setTimeout as sleep } from "node:timers/promises";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { BRIDGE_LEASE_MS, MeshBridge, RemoteBridgeSide, serveBridgeAgent, StoreBridgeSide } from "../src/mesh/bridge.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
@@ -28,6 +29,7 @@ const scratchRoots: string[] = [];
 afterEach(async () => {
   for (const close of closers.splice(0)) await close();
   vi.restoreAllMocks();
+  vi.useRealTimers();
   removals.length = 0;
   // #11199 permits hygiene of this test's own mkdtemp fixtures, not product deletion.
   for (const root of scratchRoots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
@@ -301,6 +303,100 @@ describe("spoke-to-spoke roots and addressed control through the hub", () => {
       expect(events(hub, "fabric.control.command")).toEqual([]);
     } finally { await release(); }
   });
+
+  it.each([false, true])("fixed1s RELAY-1 run() ACKs at persisted original + 15 s before a 30 s safety wake (restart=%s)", async restart => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    const f = await fixture();
+    const a = f.stores.ryzen3!, b = f.stores.ryzen2!, hub = f.stores.ryzen1!;
+    const source = f.mains.ryzen3!, target = f.mains.ryzen2!;
+    const link = f.links.find(candidate => candidate.bridge.options.remoteName === "ryzen3")!;
+    // B stays live at its origin, but its hub projection expires without another B pass.
+    // Withhold every notification, including our own mirror and ACK writes: only the
+    // retained-boundary deadline may finish this command at the exact virtual millisecond.
+    vi.spyOn(link.bridge.options.local, "subscribeChanges").mockImplementation(() => () => undefined);
+    vi.spyOn(link.remote, "subscribeChanges").mockImplementation(async () => () => undefined);
+    vi.setSystemTime(Date.now() + BRIDGE_LEASE_MS + 5_000);
+    expect(readHostLease(b.root, target.identity.id)!.expiresAt).toBeGreaterThan(Date.now());
+    expect(readHostLease(hub.root, target.identity.id)!.expiresAt).toBeLessThan(Date.now());
+    const marker = `fixed1s-relay-deadline-private-${restart}`;
+    const command = await a.publish({ topic: "fabric.control.command", kind: "followUp", from: source.identity, to: target.identity.id,
+      data: { version: 1, commandId: `fixed1s-relay-deadline-${restart}`, targetId: target.identity.id,
+        operation: "followUp", replyTo: source.identity.id, requestedAt: Date.now(), deadlineAt: Date.now() + 120_000,
+        destinationRemoteHost: "ryzen2", ownerIncarnation: target.ownerIncarnation, message: marker } });
+    const before = sourceCursor(link.bridge);
+    link.bridge = new MeshBridge({ ...link.bridge.options, membershipRetryMs: 30_000, stopMs: 100 });
+    const cursor = () => JSON.parse(fs.readFileSync(link.bridge.options.cursorPath, "utf8")) as {
+      toLocal: { after: number; relayGrace?: { sequence: number; startedAt: number; id?: string } };
+    };
+    // Real store/stdio completion is observed without advancing fake wall time. vi.waitFor
+    // would advance timers automatically and could conceal an early or late grace ACK.
+    const observe = async (check: () => boolean) => {
+      const deadline = performance.now() + 4_000;
+      while (!check() && performance.now() < deadline) await sleep(2);
+      expect(check(), "bridge completion at fixed virtual time").toBe(true);
+    };
+    let failure: unknown;
+    const launch = () => {
+      const bridge = link.bridge;
+      const running = bridge.run().catch(error => { failure = error; });
+      closers.unshift(async () => { await bridge.stop(); await running; });
+      return { bridge, running };
+    };
+    let live = launch();
+    await observe(() => cursor().toLocal.relayGrace?.sequence === command.sequence || failure !== undefined);
+    expect(failure).toBeUndefined();
+    const original = cursor().toLocal.relayGrace!;
+    expect(original).toMatchObject({ sequence: command.sequence, startedAt: Date.now() });
+    expect(sourceCursor(link.bridge)).toBe(before);
+    expect(events(a, "fabric.control.ack")).toEqual([]);
+    if (restart) {
+      await vi.advanceTimersByTimeAsync(4_000);
+      // Stop closes stdio, so reopen the actual transport against the same durable A
+      // store. Neither the source command nor its persisted grace is rewritten.
+      await live.bridge.stop();
+      await live.running;
+      const input = new PassThrough(), output = new PassThrough();
+      const serving = serveBridgeAgent(new StoreBridgeSide(a, "ryzen1", () => Date.now()), input, output);
+      const remote = new RemoteBridgeSide(output, input);
+      closers.push(async () => { remote.close(); input.end(); await serving; output.end(); });
+      vi.spyOn(remote, "subscribeChanges").mockImplementation(async () => () => undefined);
+      link.remote = remote;
+      // stop() also seals the old local side after withdrawal; a process restart creates
+      // both side objects again rather than reusing that permanently withdrawn instance.
+      const local = new StoreBridgeSide(hub, "ryzen3", () => Date.now());
+      vi.spyOn(local, "subscribeChanges").mockImplementation(() => () => undefined);
+      link.bridge = new MeshBridge({ ...link.bridge.options, local, remote });
+      const reads = vi.spyOn(remote, "read");
+      live = launch();
+      await observe(() => reads.mock.calls.length > 0 || failure !== undefined);
+      expect(failure).toBeUndefined();
+      expect(cursor().toLocal.relayGrace).toEqual(original);
+    }
+    const deadline = original.startedAt + BRIDGE_LEASE_MS;
+    expect(Date.now()).toBeLessThan(deadline);
+    await vi.advanceTimersByTimeAsync(deadline - Date.now() - 1);
+    expect(Date.now()).toBe(deadline - 1);
+    expect(cursor().toLocal.relayGrace).toEqual(original);
+    expect(sourceCursor(link.bridge)).toBe(before);
+    expect(events(a, "fabric.control.ack")).toEqual([]);
+    expect(events(b, "fabric.control.command")).toEqual([]);
+    await vi.advanceTimersByTimeAsync(1);
+    await observe(() => (events(a, "fabric.control.ack").length === 1 && sourceCursor(link.bridge) >= command.sequence) || failure !== undefined);
+    expect(Date.now()).toBe(deadline);
+    expect(failure).toBeUndefined();
+    expect(sourceCursor(link.bridge)).toBeGreaterThanOrEqual(command.sequence);
+    expect(cursor().toLocal.relayGrace).toBeUndefined();
+    expect(events(a, "fabric.control.ack")[0]).toMatchObject({ createdAt: deadline, verification: "bridge",
+      to: source.identity.id, from: { id: "bridge:ryzen1" }, data: { accepted: false, retryable: true,
+        errorCode: "FABRIC_RELAY_DESTINATION_UNAVAILABLE", bridge: { from: "ryzen1", id: command.id } } });
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(events(a, "fabric.control.ack")).toHaveLength(1);
+    expect(events(b, "fabric.control.command")).toEqual([]);
+    expect(events(b, "fabric.control.ack")).toEqual([]);
+    expect(events(hub, "fabric.control.command")).toEqual([]);
+    expect(events(hub, "fabric.control.ack")).toEqual([]);
+    expect(persistedMarkerFiles(hub.root, marker)).toEqual([]);
+  }, 12_000);
 
   it("RELAY-1 immediately refuses a never-seen B destination once rather than granting uncertainty grace", async () => {
     const f = await fixture();

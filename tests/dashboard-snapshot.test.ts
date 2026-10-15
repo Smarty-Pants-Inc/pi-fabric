@@ -3,7 +3,7 @@ import type { FabricActivityRun } from "../src/activity/types.js";
 import type { FabricState } from "../src/fabric-state.js";
 import type { AgentRunRecord } from "../src/agents/types.js";
 import type { FabricParticipantInfo } from "../src/topology/types.js";
-import { createDashboardSnapshot } from "../src/ui/snapshot.js";
+import { createDashboardSnapshot, FabricDashboardSnapshotCache } from "../src/ui/snapshot.js";
 
 const usage = { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, cost: 0 };
 
@@ -90,6 +90,51 @@ const fakeState = (
   }) as unknown as FabricState;
 
 describe("dashboard snapshot agent ownership", () => {
+  it.each(["Ambiguous Fabric actor: actor", "Unknown Fabric actor: another-id", "unreadable actor registry"])(
+    "does not hide an actor enrichment failure: %s",
+    message => {
+      const state = fakeState([], [], [{ id: "actor" }]);
+      state.actors.instructions = () => { throw new Error(message); };
+      expect(() => createDashboardSnapshot(state, [])).toThrow(message);
+    },
+  );
+
+  it("reconciles a cached session-orphan row when details disappear and reappear", () => {
+    const orphan = {
+      id: "session-orphan",
+      name: "foreign stopped actor",
+      status: "stopped",
+      scope: "session",
+      rootId: "session:old",
+      sessionOrphan: { oldRoot: "session:old", reason: "Main owner process is dead" },
+    };
+    const state = fakeState([], [], [orphan]);
+    const cache = new FabricDashboardSnapshotCache();
+    let available = true;
+    state.actors.instructions = id => {
+      if (!available && id === orphan.id) throw new Error(`Unknown Fabric actor: ${id}`);
+      return "Current instructions";
+    };
+    state.actors.messages = id => {
+      if (!available && id === orphan.id) throw new Error(`Unknown Fabric actor: ${id}`);
+      return [];
+    };
+
+    const initial = createDashboardSnapshot(state, [], undefined, undefined, cache);
+    expect(initial.actors.map(actor => actor.id)).toEqual([orphan.id]);
+    expect(initial.actors[0]?.instructions).toBe("Current instructions");
+
+    // All list-derived snapshot inputs stay identical: the cache must not keep
+    // the previous details alive after the backing actor becomes unavailable.
+    available = false;
+    const missing = createDashboardSnapshot(state, [], undefined, undefined, cache);
+    expect(missing.actors).toEqual([]);
+
+    available = true;
+    const returned = createDashboardSnapshot(state, [], undefined, undefined, cache);
+    expect(returned.actors.map(actor => actor.id)).toEqual([orphan.id]);
+    expect(returned.actors[0]?.instructions).toBe("Current instructions");
+  });
   it("always includes the user-facing Main Pi agent", () => {
     const snapshot = createDashboardSnapshot(fakeState([], []), []);
 

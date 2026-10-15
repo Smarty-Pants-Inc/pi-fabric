@@ -235,7 +235,14 @@ describe("native process task temporary directory containment", () => {
     const callerTemp = `${link}${path.sep}..`;
     vi.stubEnv("TMPDIR", callerTemp);
     const { value } = await report(f, { writableRoots: [f.cwd, f.scratch], shell: "unconfined" });
-    expect(value.tmp).not.toBe(callerTemp);
+    if (process.platform === "win32") {
+      // Win32 removes junction\.. lexically before following the junction: this is scratch, not an escape.
+      expect(fs.realpathSync.native(callerTemp)).toBe(f.scratch);
+      expect(inside(f.scratch, fs.realpathSync.native(value.tmp))).toBe(true);
+      expect(fs.readdirSync(nested)).toEqual([]);
+    } else {
+      expect(value.tmp).not.toBe(callerTemp);
+    }
     expect(inside(f.scratch, fs.realpathSync.native(value.output))).toBe(true);
     expect(fs.readdirSync(f.parentTemp)).toEqual(["nested"]);
   });

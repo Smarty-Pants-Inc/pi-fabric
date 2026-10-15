@@ -3166,11 +3166,11 @@ export class ActorManager {
     // Capture the admitted commit before persistence yields: later progress must not lose this caller's join.
     const finishing = this.finishingRemoval(actorId) ? this.#finishCalls.get(actorId) : undefined;
     // Sticky before joining any call in progress; durable before an accepted removal reports it.
-    if (operator) await this.#escalateOperator(actorId);
+    if (operator === true) await this.#escalateOperator(actorId);
     // Share acceptance, not the first caller's wait policy. Every caller joins the same finisher.
     // A commit in its map hole (smarty-dev#11105) is joined, never restarted: its result is the answer. Once
     // revoked, the existing cleanup-obligation path answers its pending state without waiting on the finisher.
-    const call = this.#removeCalls.get(actorId) ?? finishing ?? this.#remove(actorId);
+    const call = this.#removeCalls.get(actorId) ?? finishing ?? this.#remove(actorId, operator === true);
     this.#removeCalls.set(actorId, call);
     let result: RemovalResult;
     try { result = await call; } finally {
@@ -3200,14 +3200,15 @@ export class ActorManager {
     if (joined) return joined;
     const actor = this.#actors.get(id);
     const cleanup = this.#removalCleanup.get(id);
-    const ownedCleanup = cleanup && this.#ownsCleanup(cleanup) ? cleanup : undefined;
+    // An explicit operator request may also select an unowned same-root obligation (#10189).
+    const selectedCleanup = cleanup && (this.#ownsCleanup(cleanup) || this.#operatorMayFinish(cleanup)) ? cleanup : undefined;
     const prior = { flag: this.#operatorRemovals.has(id), removal: actor?.removal?.operator === true,
-      cleanup: ownedCleanup?.operator === true };
+      cleanup: selectedCleanup?.operator === true };
     const rowSave = actor?.removal !== undefined && this.#actors.get(id) === actor && !this.#finishCalls.has(id);
     this.#operatorRemovals.add(id);
     // Pending: another save would persist an in-memory row bit before this escalation is decided.
     if (actor?.removal && !rowSave) actor.removal.operator = true;
-    if (ownedCleanup) ownedCleanup.operator = true;
+    if (selectedCleanup) selectedCleanup.operator = true;
     const escalation = (async () => {
       // Row first: a live accepted removal row is the authority, and #commitRemove copies its bit into the
       // marker it rewrites on every attempt. Writing the marker here too would leave a durable operator
@@ -3216,14 +3217,14 @@ export class ActorManager {
         // The committed save sets actor.removal.operator before any later queued save serializes the row.
         await this.#saveActors(new Set(), { durable: true, requiredActor: actor!, operatorRow: true });
         if (actor!.removal?.operator !== true) throw new Error("the removal row was not saved");
-      } else if (ownedCleanup && this.#persistent && this.meshConfig.enabled) {
+      } else if (selectedCleanup && this.#persistent && this.meshConfig.enabled) {
         // Revoked (or a commit in flight that may already have written its marker): the marker is the record.
-        writeJsonAtomic(this.#cleanupPath(id), ownedCleanup, { durable: true });
+        writeJsonAtomic(this.#cleanupPath(id), selectedCleanup, { durable: true });
       }
     })().catch((error: unknown) => {
       if (!prior.flag) this.#operatorRemovals.delete(id);
       if (!prior.removal && actor?.removal) delete actor.removal.operator;
-      if (ownedCleanup && !prior.cleanup) delete ownedCleanup.operator;
+      if (selectedCleanup && !prior.cleanup) delete selectedCleanup.operator;
       throw new Error(`Fabric actor ${id}: operator removal was not saved: ` +
         `${error instanceof Error ? error.message : String(error)}; remove it again`);
     }).finally(() => {
@@ -3233,9 +3234,21 @@ export class ActorManager {
     return escalation;
   }
 
-  async #remove(id: string): Promise<RemovalResult> {
+  /** Same-root revoked cleanup eligible for an explicit operator request, never authority by itself.
+   * The host's final check remains mandatory under the Main publication fence (#10189).
+   */
+  #operatorMayFinish(cleanup: RemovalCleanup): boolean {
+    return this.#beforeOperatorCleanup !== undefined && !this.#ceded.has(cleanup.id) &&
+      this.#revoked.has(cleanup.id) && !this.#actors.has(cleanup.id) &&
+      cleanup.owner !== undefined && cleanup.owner.rootId === this.#rootId;
+  }
+
+  async #remove(id: string, operator = false): Promise<RemovalResult> {
     if (this.cleanupObligation(id)) {
-      if (!this.#ownsCleanup(this.#removalCleanup.get(id)!)) throw new Error("Only the owning host can finish this actor's cleanup");
+      const cleanup = this.#removalCleanup.get(id)!;
+      if (!this.#ownsCleanup(cleanup) && !(operator && this.#operatorRemovals.has(id) && this.#operatorMayFinish(cleanup))) {
+        throw new Error("Only the owning host can finish this actor's cleanup");
+      }
       const running = this.#runningActor(id);
       if (!this.#removals.has(id) && running?.drain) {
         this.#stopRun(running);

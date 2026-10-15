@@ -193,6 +193,16 @@ export const confirmedRootInboxSession = (manager: SessionReceiptManager): RootI
 export const rootInboxSession = (entries: readonly unknown[], lookback = 500): RootInboxSession =>
   inboxReceiptSession(Object.keys(entries).map((key): [number, unknown] => [Number(key), entries[Number(key)]]), entries.length, lookback);
 
+/** Only canonical native UTC ISO or integer epoch-ms can date a receipt claim. */
+const canonicalReceiptTimestamp = (value: unknown): number | undefined => {
+  const at = typeof value === "number" ? value
+    : typeof value === "string" && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value) ? Date.parse(value)
+    : Number.NaN;
+  if (!Number.isInteger(at) || at <= 0 || at > Date.now() + 60_000) return undefined;
+  if (typeof value === "string" && new Date(at).toISOString() !== value) return undefined;
+  return at;
+};
+
 const inboxReceiptSession = (entries: Iterable<readonly [number, unknown]>, count: number, lookback = 500): RootInboxSession => {
   const batchIds = new Set<string>();
   let hasBatch = false;
@@ -207,13 +217,12 @@ const inboxReceiptSession = (entries: Iterable<readonly [number, unknown]>, coun
   // identities/legacy steers are needed for dedup; only batch presence uses a lookback.
   for (const [index, value] of [...entries].reverse()) {
     type Carried = { from?: { id?: unknown }; data?: unknown; id?: unknown; deliveryId?: unknown };
-    const entry = value as { timestamp?: string; type?: string; customType?: string; details?: Carried & { ids?: unknown; items?: unknown; receipts?: unknown } } | undefined;
+    const entry = value as { timestamp?: unknown; type?: string; customType?: string; details?: Carried & { ids?: unknown; items?: unknown; receipts?: unknown } } | undefined;
     if (entry?.type !== "custom_message") continue;
     // A missing/invalid canonical timestamp is not evidence that a legacy key/ref claim is
     // current. Keep the receipt for exact identity replay checks, but never silently renew its
     // one-use key fallback with the scan time.
-    const parsedAt = Date.parse(entry.timestamp ?? "");
-    const at = Number.isFinite(parsedAt) ? parsedAt : undefined;
+    const at = canonicalReceiptTimestamp(entry.timestamp);
     if (entry.customType === ROOT_INBOX_CUSTOM_TYPE && Array.isArray(entry.details?.ids)) {
       if (index >= Math.max(0, count - lookback)) {
         hasBatch = true;

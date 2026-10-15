@@ -281,6 +281,66 @@ describe("distinct same-key mesh events (smarty-dev#12140)", () => {
     expect(ids((await h.box().next(h.session())).events)).toEqual([later.id]);
   });
 
+  it.each([60_001, 86_400_000, 60_000, -10])("validates persisted native claim age at offset %ims through empty reconciliation and reload", async (offset) => {
+    const h = setup();
+    const claim = createHash("sha256").update(JSON.stringify([watcher.id, "native-topic-key", JSON.stringify([TOPIC, KEY])])).digest("hex");
+    const deliveredAt = Date.now() + offset;
+    const key = h.box().key;
+    await h.mesh.put({ key, identity: me, value: { after: h.mesh.latestSequence(), delivered: [claim], deliveredAt: [deliveredAt] } });
+    expect(h.entries).toEqual([]); // Only the persisted cursor supplies suppression evidence.
+    const initial = h.box();
+    expect((await initial.next(h.session(), { commitOnly: true })).events).toEqual([]);
+    await initial.close();
+    const saved = h.mesh.get(key)!.value as { delivered: string[]; deliveredAt: number[] };
+    const valid = offset <= 60_000;
+    expect(saved.delivered).toEqual(valid ? [claim] : []);
+    expect(saved.deliveredAt).toEqual(valid ? [deliveredAt] : []);
+    const first = await h.publish("first persisted-claim legacy shadow");
+    const second = await h.publish("distinct same-key persisted-claim work");
+    const recovered = h.box();
+    const batch = await recovered.next(h.session());
+    expect(ids(batch.events)).toEqual(valid ? [second.id] : [first.id, second.id]);
+    await h.take(recovered, batch.events);
+    await recovered.close();
+    h.entries.length = 0;
+    const later = await h.publish("same-key work after spent-claim reload");
+    const reloaded = h.box();
+    expect(ids((await reloaded.next(h.session())).events)).toEqual([later.id]);
+    await reloaded.close();
+  });
+
+  it.each<[number, boolean]>([
+    [60_001, false], [86_400_000, false], [60_001, true], [86_400_000, true],
+  ])("never revives a spent persisted claim with future fallbackAt +%ims (empty reconciliation: %s)", async (offset, reconcile) => {
+    const h = setup();
+    const claim = createHash("sha256").update(JSON.stringify([watcher.id, "native-topic-key", JSON.stringify([TOPIC, KEY])])).digest("hex");
+    const now = Date.now();
+    const key = h.box().key;
+    await h.mesh.put({ key, identity: me, value: { after: h.mesh.latestSequence(), delivered: [claim], deliveredAt: [now - 10],
+      fallbacks: [claim], fallbackAt: [now + offset] } });
+    expect(h.entries).toEqual([]);
+    if (reconcile) {
+      const initial = h.box();
+      expect((await initial.next(h.session(), { commitOnly: true })).events).toEqual([]);
+      await initial.close();
+    }
+    // A malformed spent-marker age cannot become suppression authority; simply dropping
+    // that marker is also unsafe if it revives the matching, otherwise fresh native claim.
+    const first = await h.publish("first distinct work after future spent marker");
+    const second = await h.publish("second distinct same-key work after future spent marker");
+    const recovered = h.box();
+    const batch = await recovered.next(h.session());
+    expect(ids(batch.events)).toEqual([first.id, second.id]);
+    await h.take(recovered, batch.events);
+    await recovered.close();
+    h.entries.length = 0;
+    const third = await h.publish("third distinct work after spent-marker reload");
+    const fourth = await h.publish("fourth distinct same-key work after spent-marker reload");
+    const reloaded = h.box();
+    expect(ids((await reloaded.next(h.session())).events)).toEqual([third.id, fourth.id]);
+    await reloaded.close();
+  });
+
   it("fails open for direct holdsSteer evidence without a deliveredAt timestamp", async () => {
     const h = setup(); const inbox = h.box(); inbox.start();
     h.main.deliverAgent({ from: watcher, message: "legacy native work", delivery: "steer", data: { topic: TOPIC, key: KEY } });
@@ -323,6 +383,71 @@ describe("distinct same-key mesh events (smarty-dev#12140)", () => {
     await recovered.close();
     h.entries.length = 0;
     h.replay(first);
+    expect((await h.box().next(h.session())).events).toEqual([]);
+  });
+
+  it.each<[string, (now: number) => unknown]>([
+    ["malformed year", () => "9999"],
+    ["ISO without milliseconds", now => new Date(now).toISOString().replace(/\.\d{3}Z$/, "Z")],
+    ["ISO with offset", now => new Date(now).toISOString().replace("Z", "+00:00")],
+    ["ISO without Z", now => new Date(now).toISOString().slice(0, -1)],
+    ["numeric string", now => String(now)],
+    ["far-future canonical ISO", now => new Date(now + 86_400_000).toISOString()],
+    ["far-future epoch milliseconds", now => now + 86_400_000],
+    ["ISO beyond clock-skew allowance", now => new Date(now + 60_001).toISOString()],
+    ["epoch milliseconds beyond clock-skew allowance", now => now + 60_001],
+    ["noninteger epoch milliseconds", now => now + 0.5],
+    ["zero", () => 0],
+    ["negative", () => -1],
+    ["NaN", () => Number.NaN],
+    ["positive infinity", () => Number.POSITIVE_INFINITY],
+    ["negative infinity", () => Number.NEGATIVE_INFINITY],
+  ])("fails open for %s native timestamps through canonical projection and reload", async (_kind, timestamp) => {
+    const h = setup();
+    h.main.deliverAgent({ from: watcher, message: "untrusted native age", delivery: "steer", data: { topic: TOPIC, key: KEY } });
+    h.entries[0] = { ...(h.entries[0] as object), timestamp: timestamp(Date.now()) };
+    const session = () => rootInboxSession(h.entries.map(projectRootInboxReceipt));
+    const initial = h.box();
+    await initial.next(session(), { commitOnly: true });
+    await initial.close();
+    const first = await h.publish("fresh distinct key-only work");
+    const second = await h.publish("another distinct key-only event");
+    const recovered = h.box();
+    const woke = await recovered.wake(session(), () => true);
+    expect(ids(woke?.events)).toEqual([first.id, second.id]);
+    await h.take(recovered, woke!.events);
+    await recovered.close();
+    h.entries.length = 0;
+    h.replay(first);
+    const later = await h.publish("distinct work after another reload");
+    expect(ids((await h.box().next(h.session())).events)).toEqual([later.id]);
+  });
+
+  it.each<[string, (now: number) => unknown]>([
+    ["fresh canonical ISO", now => new Date(now).toISOString()],
+    ["fresh epoch milliseconds", now => now],
+    ["canonical ISO at clock-skew boundary", now => new Date(now + 60_000).toISOString()],
+    ["epoch milliseconds at clock-skew boundary", now => now + 60_000],
+  ])("accepts %s for exactly one legacy shadow across canonical projection and reload", async (_kind, timestamp) => {
+    const h = setup();
+    h.main.deliverAgent({ from: watcher, message: "dated native work", delivery: "steer", data: { topic: TOPIC, key: KEY } });
+    h.entries[0] = { ...(h.entries[0] as object), timestamp: timestamp(Date.now()) };
+    const session = () => rootInboxSession(h.entries.map(projectRootInboxReceipt));
+    const initial = h.box();
+    await initial.next(session(), { commitOnly: true });
+    await initial.close();
+    await h.publish("first legacy shadow");
+    const recovered = h.box();
+    expect((await recovered.next(session())).events).toEqual([]);
+    await recovered.close();
+    const second = await h.publish("second legacy event is distinct work");
+    const reloaded = h.box();
+    const batch = await reloaded.next(session());
+    expect(ids(batch.events)).toEqual([second.id]);
+    await h.take(reloaded, batch.events);
+    await reloaded.close();
+    h.entries.length = 0;
+    h.replay(second);
     expect((await h.box().next(h.session())).events).toEqual([]);
   });
 

@@ -492,10 +492,10 @@ export class RootInbox {
     if (value === undefined) return false;
     const claim = topicWorkReceipt(event.from.id, kind, event.topic, value);
     const through = this.#state!.fallbackThrough;
-    // A key/ref claim is suppressive only when its canonical observation has a finite time. An
-    // invalid/missing session timestamp must fail open; exact identity receipts were checked above.
+    // A key/ref claim needs a positive integer observation time with at most 60s of future skew.
+    // Invalid/missing/future timestamps are no proof; exact identity receipts were checked above.
     const at = session.delivered?.has(claim) ? session.deliveredAt?.get(claim) : this.#delivered.get(claim);
-    if (typeof at !== "number" || !Number.isFinite(at)) return false;
+    if (typeof at !== "number" || !Number.isFinite(at) || !Number.isInteger(at) || at <= 0 || at > this.#now() + 60_000) return false;
     const claimed = has(claim) || (kind === "key" && session.holdsSteer(event.from.id, value, event.topic));
     // Canonical history can outlive its cursor receipt, even for an unused claim. Expiry
     // and eviction must fail open rather than resurrect that old carrier's suppression.
@@ -660,8 +660,11 @@ export class RootInbox {
     // use the session receipt set directly when its entry is available.
     this.#delivered = new Map((this.#state.delivered ?? []).flatMap((id, index) => {
       const at = value?.deliveredAt?.[index];
-      return typeof at === "number" && Number.isFinite(at) ? [[id, at] as [string, number]] : [];
+      return typeof at === "number" && Number.isFinite(at) && Number.isInteger(at) && at > 0 && at <= this.#now() + 60_000
+        ? [[id, at] as [string, number]] : [];
     }));
+    // Fallbacks are spent markers, not delivery proof. Keep even future-dated markers:
+    // dropping one could resurrect a current key/ref claim; #fallbacks.has must still fail open.
     this.#fallbacks = new Map((this.#state.fallbacks ?? []).flatMap((id, index) => {
       const at = value?.fallbackAt?.[index];
       return typeof at === "number" && Number.isFinite(at) ? [[id, at] as [string, number]] : [];

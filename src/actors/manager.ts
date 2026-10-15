@@ -7937,10 +7937,10 @@ export class ActorManager {
     while (index < pending.length) {
       const record = pending[index]!;
       try {
-        // Restored terminal intent owes FAILED only in the absence of ANY exact
-        // outcome. appendDeliveryOutcome itself deduplicates only equal outcomes.
+        // Only DELIVERED/FAILED are terminal receipts. UNKNOWN is an observation
+        // and must still converge to FAILED after a terminal pre-inference stop.
         const observed = record.outcome === "failed"
-          ? (["delivered", "superseded", "failed", "unknown"] as const).find(outcome => hasDeliveryOutcome(this.mesh.root, record, outcome))
+          ? (["delivered", "failed"] as const).find(outcome => hasDeliveryOutcome(this.mesh.root, record, outcome))
           : undefined;
         // Reconfirm an existing receipt's durability without adding a new line.
         appendDeliveryOutcome(this.mesh.root, record, observed ?? record.outcome, record.reason, record.at);

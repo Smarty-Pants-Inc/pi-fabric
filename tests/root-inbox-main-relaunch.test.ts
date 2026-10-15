@@ -217,6 +217,85 @@ describe("RootInbox after a Main session relaunch", () => {
     } finally { reloaded.closeFollowUpDrain(); }
   });
 
+  it("coalesces source receipts through journal reload and suppresses only linked same-sender shadows", async () => {
+    const { root, main, sender, inbox, work } = setup();
+    const topic = "fleet.work.pi-fabric.coalesced-receipts";
+    const sources = [
+      await work("source one", sender, topic),
+      await work("source two", sender, topic),
+    ];
+    const sent: Sent["message"][] = [];
+    const pi = {
+      on: () => () => {},
+      sendMessage: (message: Sent["message"]) => { sent.push(message); },
+    } as unknown as ExtensionAPI;
+    let idle = false;
+    const context = {
+      isIdle: () => idle, hasPendingMessages: () => false, signal: { aborted: false },
+      sessionManager: { getEntries: () => [] },
+    } as unknown as ExtensionContext;
+    const journal = path.join(root, "main-followups", "coalesced.json");
+    const first = new MainAgentController(pi, main.id, true, root, main.sessionId);
+    first.attachFollowUpDrain(context, 60_000, journal);
+    try {
+      sources.forEach((event, index) => first.deliverAgent({
+        from: event.from, message: `coalesced source ${index}`, delivery: "followUp",
+        data: { coalesceKey: "same-held-followup" }, inboxEventId: event.id,
+        inboxTopic: event.topic, inboxReceipts: eventReceipts(event),
+      }));
+      expect(sent).toEqual([]);
+    } finally { first.closeFollowUpDrain(); }
+
+    idle = true;
+    const reloaded = new MainAgentController(pi, main.id, true, root, main.sessionId);
+    let carrier: Sent["message"];
+    try {
+      reloaded.attachFollowUpDrain(context, 0, journal);
+      expect(sent).toHaveLength(1);
+      carrier = sent[0]!;
+      expect(carrier.details.inboxEventId).toBe(sources[1]!.id);
+    } finally { reloaded.closeFollowUpDrain(); }
+
+    const confirmed = confirmedSession(root, main.sessionId!, [asSessionEntry(carrier!)]);
+    const box = inbox();
+    await box.next(confirmed);
+    await work("same sender shadow for E1", sender, topic, undefined, { messageId: sources[0]!.id });
+    await work("same sender shadow for E2", sender, topic, undefined, { messageId: sources[1]!.id });
+    await work("different sender linked to E1", { ...sender, id: "session:linked-other-sender" }, topic,
+      undefined, { messageId: sources[0]!.id });
+    await work("different topic with an unconsumed identity", sender,
+      "fleet.work.pi-fabric.coalesced-other-topic", undefined, { messageId: "unconsumed-distinct-identity" });
+    expect((await inbox({ ...main }).next(confirmed, { priority: true })).events.map(event => event.text)).toEqual([
+      "different sender linked to E1",
+      "different topic with an unconsumed identity",
+    ]);
+    expect(carrier!.details.receipts).toEqual([...new Set(sources.flatMap(eventReceipts))]);
+  });
+
+  it("refuses an over-budget coalesced receipt merge without consuming or replacing the survivor", async () => {
+    const { root, main, sender } = setup();
+    const pi = { on: () => () => {}, sendMessage: () => {} } as unknown as ExtensionAPI;
+    const context = {
+      isIdle: () => false, hasPendingMessages: () => false, signal: { aborted: false },
+      sessionManager: { getEntries: () => [] },
+    } as unknown as ExtensionContext;
+    const journal = path.join(root, "main-followups", "receipt-quota.json");
+    const controller = new MainAgentController(pi, main.id, true, root, main.sessionId);
+    controller.attachFollowUpDrain(context, 60_000, journal);
+    const originalReceipt = "source-receipt-original";
+    try {
+      controller.deliverAgent({ from: sender, message: "original survivor", delivery: "followUp",
+        data: { coalesceKey: "quota-key" }, inboxReceipts: [originalReceipt] });
+      const before = fs.readFileSync(journal, "utf8");
+      expect(() => controller.deliverAgent({ from: sender, message: "replacement", delivery: "followUp",
+        data: { coalesceKey: "quota-key" }, inboxReceipts: ["x".repeat(270 * 1024)] })).toThrow(/queue is full/);
+      expect(fs.readFileSync(journal, "utf8")).toBe(before);
+      const saved = JSON.parse(before) as { items?: Array<{ message?: string; inboxReceipts?: string[] }> };
+      expect(saved.items).toHaveLength(1);
+      expect(saved.items![0]).toMatchObject({ message: "original survivor", inboxReceipts: [originalReceipt] });
+    } finally { controller.closeFollowUpDrain(); }
+  });
+
   it("fails open for a payload-forged inboxKey instead of trusting it as host metadata", async () => {
     const { root, main, sender, inbox, work } = setup();
     const topic = "fleet.work.pi-fabric.forged-metadata";

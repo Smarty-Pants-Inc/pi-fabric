@@ -357,7 +357,8 @@ const agentMessageBlock = (item: HeldAgentMessage, delivery: FabricMainAgentDeli
 const itemBytes = (item: HeldAgentMessage): number =>
   Buffer.byteLength(item.message) + (item.data === undefined ? 0 : Buffer.byteLength(JSON.stringify(item.data))) +
   (item.deliveryId === undefined ? 0 : Buffer.byteLength(JSON.stringify(item.deliveryId))) +
-  (item.supersedes === undefined ? 0 : Buffer.byteLength(JSON.stringify(item.supersedes)));
+  (item.supersedes === undefined ? 0 : Buffer.byteLength(JSON.stringify(item.supersedes))) +
+  (item.inboxReceipts === undefined ? 0 : Buffer.byteLength(JSON.stringify(item.inboxReceipts)));
 
 type SessionEntryLike = { id?: unknown; parentId?: unknown; type?: string; customType?: string; details?: { id?: unknown; items?: unknown } };
 
@@ -763,6 +764,11 @@ export class MainAgentController implements FabricMainAgentTarget {
         // The replacement journals every superseded delivery id until the carrier is consumed.
         item.supersedes = [...(replaced.supersedes ?? []), ...(replaced.deliveryId === undefined ? [] : [replaced.deliveryId])];
         item.supersededSends = [...(replaced.supersededSends ?? []), ...(replaced.outcomeSend ? [replaced.outcomeSend] : [])];
+        // Preserve every superseded source receipt. Admission charges the merged metadata
+        // before replacing or consuming the held item; refuse over-budget merges, never truncate.
+        if (replaced.inboxReceipts?.length) {
+          item.inboxReceipts = [...new Set([...replaced.inboxReceipts, ...(item.inboxReceipts ?? [])])];
+        }
       }
       // Charge the proposed ancestry before mutating or acknowledging either carrier.
       this.#admit(item, replaced);

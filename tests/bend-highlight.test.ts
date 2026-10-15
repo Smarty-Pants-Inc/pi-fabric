@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import fs, { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { stripVTControlCharacters } from "node:util";
@@ -124,7 +124,7 @@ describe("Bend preview integration", () => {
       expect(highlightFileLines(path, "bend", 2, 5)).toBeNull();
     } finally {
       configureHighlighting("dark-plus", false);
-      rmSync(dir, { recursive: true, force: true });
+      fs.rmSync(dir, { recursive: true, force: true });
     }
   }, 20_000);
 });

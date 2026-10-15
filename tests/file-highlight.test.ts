@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync, utimesSync } from "node:fs";
+import fs, { mkdtempSync, writeFileSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -55,7 +55,7 @@ describe("fabric file highlight coverage", () => {
   });
 
   afterEach(() => {
-    rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(dir, { recursive: true, force: true });
   });
 
   it("returns null before coverage, then matches full-file tokens exactly", async () => {

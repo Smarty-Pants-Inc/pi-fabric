@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import fsp, { mkdtemp } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { createAssistantMessageEventStream, getCurrentTools, type AssistantMessage } from "@earendil-works/pi-ai";
@@ -126,5 +126,5 @@ it.each(["fabric", "external"] as const)("uses native overflow recovery, replay 
       expect(JSON.stringify(requests.at(-1))).not.toContain("ABANDONED_ATTEMPT");
       expect(observedCompactionOwner(restored.getBranch())).toBe(owner);
     } finally { resumed.dispose(); }
-  } finally { await rm(cwd, { recursive: true, force: true }); }
+  } finally { await fsp.rm(cwd, { recursive: true, force: true }); }
 }, 30000);

@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import fs, { mkdtempSync, readFileSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { AgentSession, DefaultResourceLoader, SettingsManager, loadSkillsFromDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -56,7 +56,7 @@ describe("physical kernel skill trees", () => {
           expect(reference).toContain(kernel === "python" ? "```python" : "```ts");
         }
       }
-    } finally { rmSync(temp, { recursive: true, force: true }); }
+    } finally { fs.rmSync(temp, { recursive: true, force: true }); }
   });
 
   it("keeps every marked reference valid and every executable fence in its own language", () => {

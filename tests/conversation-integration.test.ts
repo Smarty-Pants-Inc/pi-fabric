@@ -1,6 +1,6 @@
 import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import type { TUI } from "@earendil-works/pi-tui";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import fsp, { mkdtemp, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -269,7 +269,7 @@ afterEach(() => {
   captures.views.length = 0;
   captures.states.length = 0;
   const dirs = tempDirs.splice(0);
-  return Promise.all(dirs.map((dir) => rm(dir, { recursive: true, force: true })));
+  return Promise.all(dirs.map((dir) => fsp.rm(dir, { recursive: true, force: true })));
 });
 
 describe("/fabric chat command routing", () => {

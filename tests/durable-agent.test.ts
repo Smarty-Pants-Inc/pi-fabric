@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AsyncLocalStorage } from "node:async_hooks";
-import { mkdtemp, readdir, rm, stat } from "node:fs/promises";
+import fsp, { mkdtemp, readdir, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
@@ -14,7 +14,7 @@ import { DurableAgent } from "../src/durable/agent.js";
 
 const agents: DurableAgent[] = [];
 const dirs: string[] = [];
-afterEach(async () => { await Promise.all(agents.splice(0).map(a => a.close().catch(() => {}))); await Promise.all(dirs.splice(0).map(d => rm(d, { recursive: true, force: true }))); });
+afterEach(async () => { await Promise.all(agents.splice(0).map(a => a.close().catch(() => {}))); await Promise.all(dirs.splice(0).map(d => fsp.rm(d, { recursive: true, force: true }))); });
 function deferred() { let resolve!: () => void; const promise = new Promise<void>(r => { resolve = r; }); return { promise, resolve }; }
 function setup(storage: Storage = new MemoryStorage(), tools: AgentTool[] = [], tokenSize?: { min: number; max: number }) {
   const faux = fauxProvider({ tokensPerSecond: Infinity, ...(tokenSize ? { tokenSize } : {}) });

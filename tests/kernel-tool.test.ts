@@ -9,7 +9,7 @@ import { defaultCodePreviewSettings } from "../src/ui/code-preview.js";
 import { hostGlobalsGuidance } from "../src/core/system-guidance.js";
 import { typeErrorRecoveryHint } from "../src/type-error-guidance.js";
 import { guestTypeDeclarations } from "../src/runtime/guest-types.js";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import fs, { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
@@ -203,7 +203,7 @@ describe("exclusive kernel tool surface", () => {
       expect(guestTypeDeclarations(false)).not.toContain("declare const pi:");
     } finally {
       vi.unstubAllEnvs();
-      rmSync(agentDir, { recursive: true, force: true });
+      fs.rmSync(agentDir, { recursive: true, force: true });
     }
   });
 

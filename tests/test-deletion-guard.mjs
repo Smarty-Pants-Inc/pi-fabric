@@ -1,9 +1,10 @@
 // smarty-dev#11145: test-only deletion guard. Importing this module installs it (side effect).
-// Locally (GITHUB_ACTIONS !== "true" at install) deletion and rename operands, and copy/link destinations,
+// Unless RUNNER_ENVIRONMENT === "github-hosted", deletion and rename operands, and copy/link destinations,
 // refuse paths outside the physical TMPDIR pinned at install. cp checks every kept recursive destination.
-// Hosted CI logs TEST_DELETION_REPORT: per outside operand, then delegates. Children inherit NODE_OPTIONS.
+// GitHub-hosted CI logs TEST_DELETION_REPORT: then delegates. Children inherit Node/Bun preloads.
 // ponytail: a JS seam, not native race protection; helpers deleting through their own syscalls are out of reach.
 import fs from "node:fs";
+import childProcess from "node:child_process";
 import { syncBuiltinESMExports } from "node:module";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, parse, sep } from "node:path";
@@ -16,7 +17,9 @@ const stateKey = Symbol.for("pi-fabric.test-deletion-guard");
 const windows = process.platform === "win32";
 
 const selfUrl = new URL(import.meta.url);
-const inheritedRoot = selfUrl.searchParams.get("root");
+// Bun --preload resolves paths literally (no file URL/query support). Node keeps its URL ceiling.
+const inheritedRoot = selfUrl.searchParams.get("root")
+  ?? (process.versions.bun ? process.env.TEST_DELETION_GUARD_ROOT ?? null : null);
 selfUrl.search = "";
 selfUrl.hash = "";
 const guardHref = selfUrl.href;
@@ -115,8 +118,41 @@ function callerFrame() {
     && !line.includes("node:internal") && !line.includes("(node:fs") && !/^at (node:fs|fs\.)/.test(line)) ?? "unknown";
 }
 
+/** Preserve caller options and any narrower ceiling, but never lose the pinned Bun preload/root. */
+export function pinnedBunEnvironment(env, root, preloadPath = guardPath, platform = process.platform) {
+  let cap = root ?? sep;
+  try {
+    if (root && env.TEST_DELETION_GUARD_ROOT) {
+      const requested = realpath(env.TEST_DELETION_GUARD_ROOT);
+      if (within(root, requested)) cap = requested;
+    }
+  } catch { /* retain the pinned ceiling */ }
+  // Bun requires a path, not a file URL, and BUN_OPTIONS does not JSON-decode
+  // preload values. Avoid quoting/doubling Windows separators: Bun accepts
+  // forward-slash drive and UNC paths too. Keep the caller's option order.
+  const preload = platform === "win32" ? preloadPath.replaceAll("\\", "/") : preloadPath;
+  const path = /[\s"\\]/.test(preload) ? JSON.stringify(preload) : preload;
+  const token = `--preload=${path}`;
+  const options = env.BUN_OPTIONS ?? "";
+  return {
+    ...env,
+    BUN_OPTIONS: options.split(/\s+/).includes(token) ? options : [options.trim(), token].filter(Boolean).join(" "),
+    TEST_DELETION_GUARD_ROOT: cap,
+  };
+}
+
+// ponytail: fail closed for every explicit-env child (option a, no exemptions): an
+// executable name/argv cannot prove it will not relay to Bun. Pin only Bun's two
+// guard keys, never credentials or NODE_OPTIONS. The router's exact production-env
+// contract is probed in a clean Node process, outside this test-only instrumentation.
+/** Locate options without shifting arguments or exec/execFile callbacks. */
+function childProcessOptionsIndex(name, args) {
+  if (name === "exec" || name === "execSync") return 1;
+  return Array.isArray(args[1]) || args[1] === undefined || args[1] === null ? 2 : 1;
+}
+
 function install() {
-  const report = process.env.GITHUB_ACTIONS === "true";
+  const report = process.env.RUNNER_ENVIRONMENT === "github-hosted";
   const state = { report, root: pinRoot(), count: 0 };
 
   /** An Error to refuse with, or undefined to delegate. */
@@ -236,6 +272,41 @@ function install() {
   fs.cp = cpCallback("cp", fs.cp);
   fs.cpSync = cpSync("cpSync", fs.cpSync);
   fs.promises.cp = cpPromise("promises.cp", fs.promises.cp);
+  // Explicit environments do not inherit process.env. Every child may be a Bun intermediary.
+  for (const name of ["spawn", "spawnSync", "exec", "execSync", "execFile", "execFileSync"]) {
+    const original = childProcess[name];
+    childProcess[name] = function (...args) {
+      const index = childProcessOptionsIndex(name, args);
+      const options = args[index];
+      if (options?.env) {
+        args[index] = { ...options, env: pinnedBunEnvironment(options.env, state.root) };
+      }
+      return Reflect.apply(original, this, args);
+    };
+    // exec/execFile expose a custom promisifier returning { stdout, stderr } and .child.
+    const custom = Symbol.for("nodejs.util.promisify.custom");
+    if (original[custom]) childProcess[name][custom] = function (...args) {
+      const index = childProcessOptionsIndex(name, args);
+      const options = args[index];
+      if (options?.env) {
+        args[index] = { ...options, env: pinnedBunEnvironment(options.env, state.root) };
+      }
+      return Reflect.apply(original[custom], this, args);
+    };
+  }
+  if (process.versions.bun) {
+    for (const name of ["spawn", "spawnSync"]) {
+      const original = Bun[name];
+      Bun[name] = function (...args) {
+        const index = Array.isArray(args[0]) ? 1 : 0;
+        const options = args[index];
+        if (options?.env) {
+          args[index] = { ...options, env: pinnedBunEnvironment(options.env, state.root) };
+        }
+        return Reflect.apply(original, this, args);
+      };
+    }
+  }
   syncBuiltinESMExports();
 
   process.once("exit", () => {
@@ -249,8 +320,14 @@ function install() {
 const owner = /** @type {Record<symbol, unknown>} */ (process);
 owner[stateKey] ??= install();
 
+// Bun 1.4.0 cannot update named builtin exports or override these builtins with
+// a preload plugin (onResolve is skipped; build.module rejects them). The scoped
+// Bun regression fixtures use object calls; src/ is NOT covered by that contract.
+// The fs deletion-import contract remains separate (smarty-dev#13001).
+
 // Children inherit the guard and its pinned ceiling, not a wider test-mutated TMPDIR.
 {
+  Object.assign(process.env, pinnedBunEnvironment(process.env, owner[stateKey].root));
   const existing = process.env.NODE_OPTIONS ?? "";
   if (!existing.includes(guardHref)) {
     const preload = new URL(guardHref);

@@ -2,7 +2,7 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { mkdir, mkdtemp, readFile, rm, writeFile, realpath } from "node:fs/promises";
+import fsp, { mkdir, mkdtemp, readFile, writeFile, realpath } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -259,4 +259,4 @@ try {
   assert.match(JSON.stringify(cliResult.result), /mcp:cli-native/);
   assert.match(stdout.slice(-4000), /cli-smoke-ok/);
   console.log(JSON.stringify({ version: host.VERSION, hostEntry, scenarios, exclusive: true, proxy: true, reload: true, cli: true }));
-} finally { await rm(scratch, { recursive: true, force: true }); }
+} finally { await fsp.rm(scratch, { recursive: true, force: true }); }

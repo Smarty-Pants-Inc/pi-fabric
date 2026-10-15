@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import fs, { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import fs, { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -87,7 +87,7 @@ describe.skipIf(process.platform === "win32")("launcher stale-root trust", () =>
       expect(recordedSweep(base, (pid) => { seen.push(pid); return null; })).toEqual([root]);
       expect(seen).toEqual([marker.pid]);
       expect(existsSync(root)).toBe(true); // recorder, not a real stale-root deletion
-    } finally { rmSync(base, { recursive: true, force: true }); }
+    } finally { fs.rmSync(base, { recursive: true, force: true }); }
   });
 
   it("requests removal when a reused pid has a different native start identity", () => {
@@ -95,7 +95,7 @@ describe.skipIf(process.platform === "win32")("launcher stale-root trust", () =>
     try {
       const root = markedRoot(base);
       expect(recordedSweep(base, () => "new-boot:456")).toEqual([root]);
-    } finally { rmSync(base, { recursive: true, force: true }); }
+    } finally { fs.rmSync(base, { recursive: true, force: true }); }
   });
 
   it("preserves live-owned and unverifiable roots despite a matching harness marker", () => {
@@ -104,7 +104,7 @@ describe.skipIf(process.platform === "win32")("launcher stale-root trust", () =>
       markedRoot(base);
       expect(recordedSweep(base, () => marker.startIdentity)).toEqual([]);
       expect(recordedSweep(base, () => undefined)).toEqual([]);
-    } finally { rmSync(base, { recursive: true, force: true }); }
+    } finally { fs.rmSync(base, { recursive: true, force: true }); }
   });
 
   it("preserves markerless malformed unsafe-mode and nested lookalike roots", () => {
@@ -123,7 +123,7 @@ describe.skipIf(process.platform === "win32")("launcher stale-root trust", () =>
       markedRoot(container);
       expect(recordedSweep(base, () => null)).toEqual([]);
       expect(readFileSync(join(markerless, "sentinel"), "utf8")).toBe("keep");
-    } finally { rmSync(base, { recursive: true, force: true }); }
+    } finally { fs.rmSync(base, { recursive: true, force: true }); }
   });
 
   it("preserves symlinked roots markers and caller bases", () => {
@@ -140,7 +140,7 @@ describe.skipIf(process.platform === "win32")("launcher stale-root trust", () =>
       // Only target is eligible; neither symlink can become a deletion root.
       expect(recordedSweep(base, () => null)).toEqual([target]);
       expect(recordedSweep(callerLink, () => null)).toEqual([]);
-    } finally { rmSync(base, { recursive: true, force: true }); }
+    } finally { fs.rmSync(base, { recursive: true, force: true }); }
   });
 
   it.each(["root", "marker", "parent"])("refuses a %s replacement after ownership was read", (replacement) => {
@@ -168,8 +168,8 @@ describe.skipIf(process.platform === "win32")("launcher stale-root trust", () =>
       })).toEqual([]);
       expect(replaced).toBe(true);
     } finally {
-      rmSync(base, { recursive: true, force: true });
-      rmSync(savedParent, { recursive: true, force: true });
+      fs.rmSync(base, { recursive: true, force: true });
+      fs.rmSync(savedParent, { recursive: true, force: true });
     }
   });
 
@@ -228,7 +228,7 @@ describe("test temporary-storage isolation", () => {
       for (const fleet of resultPaths.fleets) expect(existsSync(fleet)).toBe(false);
       // Only this fixture's owner removes the simulated runner directory.
     } finally {
-      rmSync(runnerTemp, { recursive: true, force: true });
+      fs.rmSync(runnerTemp, { recursive: true, force: true });
     }
   });
   // smarty-dev#11145 r5: the Windows job temp adopts only a run directory this helper created.
@@ -260,7 +260,7 @@ describe("test temporary-storage isolation", () => {
       if (process.platform !== "win32") expect(statSync(run.first).mode & 0o777).toBe(0o700); // no mode bits on Windows
       expect(readFileSync(join(forged, "victim"), "utf8")).toBe("keep");
     } finally {
-      rmSync(fixture, { recursive: true, force: true });
+      fs.rmSync(fixture, { recursive: true, force: true });
     }
   });
 
@@ -273,7 +273,7 @@ describe("test temporary-storage isolation", () => {
       expect(run.first).not.toBe(jobRoot);
       expect(basename(run.first)).toMatch(/^pi-fabric-vitest-run-[A-Za-z0-9]{6}$/);
     } finally {
-      rmSync(fixture, { recursive: true, force: true });
+      fs.rmSync(fixture, { recursive: true, force: true });
     }
   });
 
@@ -288,7 +288,7 @@ describe("test temporary-storage isolation", () => {
       expect(run.first).not.toBe(lookalike);
       expect(basename(run.first)).toMatch(/^pi-fabric-vitest-run-[A-Za-z0-9]{6}$/);
     } finally {
-      rmSync(fixture, { recursive: true, force: true });
+      fs.rmSync(fixture, { recursive: true, force: true });
     }
   });
 
@@ -309,7 +309,7 @@ describe("test temporary-storage isolation", () => {
       expect(worker.first).toBe(run.first);
       expect(worker.again).toBe(run.first);
     } finally {
-      rmSync(fixture, { recursive: true, force: true });
+      fs.rmSync(fixture, { recursive: true, force: true });
     }
   });
 
@@ -343,7 +343,7 @@ describe("test temporary-storage isolation", () => {
       expect(existsSync(paths.root)).toBe(false);
       expect(readdirSync(caller)).toEqual([]);
     } finally {
-      rmSync(caller, { recursive: true, force: true });
+      fs.rmSync(caller, { recursive: true, force: true });
     }
   });
 

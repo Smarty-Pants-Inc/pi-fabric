@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync, symlinkSync } from "node:fs";
+import fs, { mkdtempSync, symlinkSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { build } from "esbuild";
@@ -78,7 +78,7 @@ describe("conversation host-loader boundary", () => {
       `], { encoding: "utf8", timeout: 30_000 });
       expect(output).toContain("host-free native chat rendered");
     } finally {
-      rmSync(directory, { recursive: true, force: true });
+      fs.rmSync(directory, { recursive: true, force: true });
     }
   }, 40_000);
 });

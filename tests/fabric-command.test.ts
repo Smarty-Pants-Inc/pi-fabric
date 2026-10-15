@@ -1,5 +1,5 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import fsp, { mkdtemp, readFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
@@ -661,7 +661,7 @@ describe("/fabric command", () => {
         "info",
       );
     } finally {
-      await rm(root, { recursive: true, force: true });
+      await fsp.rm(root, { recursive: true, force: true });
     }
   });
 

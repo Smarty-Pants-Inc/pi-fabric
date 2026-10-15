@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { mkdtempSync, writeFileSync, readFileSync, rmSync } from "node:fs";
+import fs, { mkdtempSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { createSyntheticSourceInfo, defineTool, type ExtensionContext, type ExtensionRunner } from "@earendil-works/pi-coding-agent";
@@ -18,7 +18,7 @@ const cleanups: (() => void)[] = [];
 afterEach(() => cleanups.splice(0).forEach(cleanup => cleanup()));
 function fixture(profile: "additive" | "native" = "additive", runtime: "quickjs" | "node-process" | "bun-process" = "quickjs") {
   const cwd = mkdtempSync(join(tmpdir(), "fabric-native-test-"));
-  cleanups.push(() => rmSync(cwd, {recursive: true, force: true}));
+  cleanups.push(() => fs.rmSync(cwd, {recursive: true, force: true}));
   writeFileSync(join(cwd, "input.txt"), "hello");
   const config = structuredClone(DEFAULT_FABRIC_CONFIG);
   Object.assign(config.executor, {codemodeProfile: profile, runtime});
@@ -45,7 +45,7 @@ function fixture(profile: "additive" | "native" = "additive", runtime: "quickjs"
   service.nativeCodemode.setPersistence((customType, data) => branch.push({type:"custom",customType,data}));
   const run = async (code: string) => {
     const result = await service.execute({code, context, signal:undefined, parentToolCallId:`native-${++n}`, onPartial(){}});
-    for (const log of result.logs) if (log.startsWith("Image saved to: ")) cleanups.push(() => rmSync(dirname(log.slice(16)), {recursive:true,force:true}));
+    for (const log of result.logs) if (log.startsWith("Image saved to: ")) cleanups.push(() => fs.rmSync(dirname(log.slice(16)), {recursive:true,force:true}));
     return result;
   };
   return {run, config, echo, runner, branch:()=>branch, setBranch:(value:any[])=>{branch=value;}, cwd, definitions, actions};

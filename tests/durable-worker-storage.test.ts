@@ -1,6 +1,6 @@
 import { execFileSync, spawn } from "node:child_process";
 import { once } from "node:events";
-import { mkdtempSync, rmSync, symlinkSync } from "node:fs";
+import fs, { mkdtempSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -30,7 +30,7 @@ beforeAll(async () => {
     bundle: true, packages: "external", platform: "node", format: "esm", target: "node24" });
   entry = pathToFileURL(join(root, "storage.mjs")).href;
 });
-afterAll(() => { if (root) rmSync(root, { recursive: true, force: true }); });
+afterAll(() => { if (root) fs.rmSync(root, { recursive: true, force: true }); });
 
 describe("durable worker exclusive storage (real Node SQLite)", () => {
   it("rejects same-process and symlink aliases; persists and reopens privately", () => {

@@ -1,5 +1,5 @@
 import { AsyncLocalStorage } from "node:async_hooks";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import fs, { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -20,7 +20,7 @@ afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await c
 
 async function fixture() {
   const cwd = mkdtempSync(join(tmpdir(), "fabric-durable-session-"));
-  cleanup.push(() => rmSync(cwd, { recursive: true, force: true }));
+  cleanup.push(() => fs.rmSync(cwd, { recursive: true, force: true }));
   const modelRuntime = await ModelRuntime.create({ authPath: join(cwd, "auth.json"), modelsPath: null, refreshOnCreate: false });
   const faux = fauxProvider({ provider: "offline", models: [{ id: "test", reasoning: true, input: ["text", "image"] }], tokensPerSecond: 100000 });
   modelRuntime.registerNativeProvider({ ...faux.provider, auth: { apiKey: { name: "Offline", resolve: async () => ({

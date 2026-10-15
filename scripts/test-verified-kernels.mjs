@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { execFileSync, spawnSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from "node:fs";
+import fs, { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -103,5 +103,5 @@ try {
   }
   console.log(`${mutations.length} negative proof probes rejected invalid kernels/open laws without changing the specification.`);
 } finally {
-  rmSync(temp, { recursive: true, force: true });
+  fs.rmSync(temp, { recursive: true, force: true });
 }

@@ -1,5 +1,5 @@
 import fs from "node:fs";
-import { readFile, unlink } from "node:fs/promises";
+import fsp, { readFile } from "node:fs/promises";
 import { closeScratch, processAlive, ScratchScope } from "../storage/scratch.js";
 import { fabricDataRoot } from "../storage/temp-root.js";
 import path from "node:path";
@@ -453,7 +453,7 @@ class FabricShellJob implements FabricShellJobHandle {
 
   /** Only the underlying operations API's successful exit result is cleanup authority. */
   async operationExited(): Promise<void> {
-    try { await unlink(path.join(this.#directory, "operation.pending")); }
+    try { await fsp.unlink(path.join(this.#directory, "operation.pending")); }
     catch { return; } // Housekeeping failure retains the veto, never changes a shell result.
     this.#operationPending = false;
     if (this.finished) {
@@ -504,7 +504,7 @@ class FabricShellJob implements FabricShellJobHandle {
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") return;
     }
-    if (!childAlive) await unlink(this.pidPath).catch(() => undefined);
+    if (!childAlive) await fsp.unlink(this.pidPath).catch(() => undefined);
     if (this.logPath || childAlive) closeScratch(this.#directory);
     else {
       try { fs.rmSync(this.#directory, { recursive: true, force: true }); this.scratch.forget(this.#directory); } catch {}

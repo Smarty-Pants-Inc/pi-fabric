@@ -1,9 +1,9 @@
 import { spawnSync } from "node:child_process";
 import fs, {
-  chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, realpathSync, rmSync as namedRmSync, symlinkSync, writeFileSync,
+  chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, realpathSync, symlinkSync, writeFileSync,
 } from "node:fs";
 import type { PathLike } from "node:fs";
-import { rm as promisesRm } from "node:fs/promises";
+import fsp from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -12,7 +12,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 // smarty-dev#11145: tests/test-deletion-guard.mjs (imported by tests/fleet-isolation-setup.ts, inherited by
 // children through NODE_OPTIONS --import) refuses deletes outside the run's private TMPDIR locally and only
-// reports them under GITHUB_ACTIONS=true. External fixtures here are NEVER deleted by this file: a sibling
+// reports them only under RUNNER_ENVIRONMENT=github-hosted. External fixtures here are NEVER deleted by this file: a sibling
 // mkdtemp under dirname(TMPDIR), inside test-env's private parent but outside Vitest's guard root,
 // left for the owner to clean.
 
@@ -21,7 +21,7 @@ const guardUrl = new URL(`./${guardFile}`, import.meta.url).href;
 const refusal = /test deletion outside private temp \(smarty-dev#11145\)/;
 const privateTemp = tmpdir();
 const posix = process.platform !== "win32";
-const hosted = process.env.GITHUB_ACTIONS === "true";
+const hosted = process.env.RUNNER_ENVIRONMENT === "github-hosted";
 
 // RED first: every outside attempt is gated on the installed guard, so a missing guard fails without deleting.
 const requireGuard = () =>
@@ -53,7 +53,7 @@ const callback = (invoke: (path: PathLike, done: Done) => void) => (path: PathLi
 type Op = { name: string; target: "file" | "dir"; mode: Outcome["kind"]; call: (path: PathLike) => unknown };
 const ops: Op[] = [
   { name: "fs.rmSync", target: "file", mode: "sync", call: (path) => fs.rmSync(path) },
-  { name: "named rmSync", target: "file", mode: "sync", call: (path) => namedRmSync(path) },
+  { name: "named rmSync", target: "file", mode: "sync", call: (path) => fs.rmSync(path) },
   { name: "fs.unlinkSync", target: "file", mode: "sync", call: (path) => fs.unlinkSync(path) },
   { name: "fs.rmdirSync", target: "dir", mode: "sync", call: (path) => fs.rmdirSync(path) },
   { name: "fs.rm callback", target: "file", mode: "async", call: callback((path, done) => fs.rm(path, done)) },
@@ -62,7 +62,7 @@ const ops: Op[] = [
   { name: "fs.promises.rm", target: "file", mode: "async", call: (path) => fs.promises.rm(path) },
   { name: "fs.promises.unlink", target: "file", mode: "async", call: (path) => fs.promises.unlink(path) },
   { name: "fs.promises.rmdir", target: "dir", mode: "async", call: (path) => fs.promises.rmdir(path) },
-  { name: "named fs/promises rm", target: "file", mode: "async", call: (path) => promisesRm(path) },
+  { name: "named fs/promises rm", target: "file", mode: "async", call: (path) => fsp.rm(path) },
 ];
 const forms: Array<[string, (path: string) => PathLike]> = [
   ["string", (path) => path], ["Buffer", (path) => Buffer.from(path)], ["URL", (path) => pathToFileURL(path)],
@@ -186,8 +186,8 @@ describe("deletion guard permits the private temp", () => {
   });
 });
 
-// Same operation names as ops; the parent asserts they match. Runs with GITHUB_ACTIONS=false so it
-// enforces even under a hosted (report-mode) parent.
+// Same operation names as ops; the parent asserts they match. RUNNER_ENVIRONMENT is cleared
+// so the child enforces even under a hosted (report-mode) parent.
 const refusalChild = `
 import fs, { rmSync } from "node:fs";
 import { rm } from "node:fs/promises";
@@ -446,7 +446,8 @@ it.each(recordedCases)("overwrite guard recorded $label", (spec) => {
   expect(nodeOptions).not.toContain(guardFile);
   const result = runChild("overwrite-recorder-child.mjs", overwriteChild,
     [guardUrl, privateTemp, JSON.stringify(spec)],
-    { ...process.env, NODE_OPTIONS: nodeOptions, GITHUB_ACTIONS: spec.report ? "true" : "false" });
+    { ...process.env, NODE_OPTIONS: nodeOptions, GITHUB_ACTIONS: spec.report ? "true" : "false",
+      RUNNER_ENVIRONMENT: spec.report ? "github-hosted" : "" });
   const line = result.stdout.split(/\r?\n/).find((entry) => entry.startsWith("OVERWRITE:"));
   expect(line, result.stdout + result.stderr).toBeDefined();
   const output = JSON.parse(line!.slice("OVERWRITE:".length)) as { caseDir: string; root: string;
@@ -574,9 +575,9 @@ describe("deletion guard in child processes", () => {
         childCases.push({ label, op: op.name, form: typeof toPath("") === "string" ? "string" : "Buffer", path: links[kind] });
       }
     }
-    // Inherited NODE_OPTIONS; only the hosted report switch is forced off so the child enforces.
+    // Inherited NODE_OPTIONS; the hosted runner switch is cleared so the child enforces.
     const result = runChild("refusal-child.mjs", refusalChild, [JSON.stringify(childCases)],
-      { ...process.env, GITHUB_ACTIONS: "false" });
+      { ...process.env, RUNNER_ENVIRONMENT: "", GITHUB_ACTIONS: "false" });
     const output = JSON.parse(result.stdout.trim()) as
       { ops: string[]; results: Array<{ label: string; kind: string; message: string | null }>; nodeOptions: string };
     expect(output.nodeOptions).toContain(guardFile);
@@ -592,7 +593,7 @@ describe("deletion guard in child processes", () => {
     requireGuard();
     const input = [{ label: "changed TMPDIR", op: "fs.rmSync", form: "string", path: externalFile }];
     const result = runChild("wider-root-child.mjs", refusalChild, [JSON.stringify(input)],
-      { ...process.env, GITHUB_ACTIONS: "false", TMPDIR: external, TMP: external, TEMP: external });
+      { ...process.env, RUNNER_ENVIRONMENT: "", GITHUB_ACTIONS: "false", TMPDIR: external, TMP: external, TEMP: external });
     const output = JSON.parse(result.stdout.trim()) as { results: Array<{ message: string | null }> };
     expect(output.results[0]?.message).toMatch(refusal);
     expectExternalIntact();
@@ -605,19 +606,19 @@ describe("deletion guard in child processes", () => {
     writeFileSync(join(root, "cache.json"), "x");
     writeFileSync(sibling, "sibling");
     const result = runChild("run-root-child.mjs", runRootChild, [root, sibling],
-      { ...process.env, GITHUB_ACTIONS: "false", TMPDIR: root, TMP: root, TEMP: root });
+      { ...process.env, RUNNER_ENVIRONMENT: "", GITHUB_ACTIONS: "false", TMPDIR: root, TMP: root, TEMP: root });
     const output = JSON.parse(result.stdout.trim()) as { siblingError: string | null; rootExists: boolean };
     expect(output.siblingError).toMatch(refusal);
     expect(output.rootExists).toBe(false);
     expect(fs.readFileSync(sibling, "utf8")).toBe("sibling");
   });
 
-  it("reports once without throwing under GITHUB_ACTIONS=true and never reaches the real deleter", () => {
+  it("reports once without throwing on github-hosted and never reaches the real deleter", () => {
     requireGuard();
     const nodeOptions = withoutGuard(process.env.NODE_OPTIONS);
     expect(nodeOptions).not.toContain(guardFile);
     const result = runChild("report-caller-marker.mjs", reportChild, [guardUrl, externalFile],
-      { ...process.env, GITHUB_ACTIONS: "true", NODE_OPTIONS: nodeOptions });
+      { ...process.env, GITHUB_ACTIONS: "true", RUNNER_ENVIRONMENT: "github-hosted", NODE_OPTIONS: nodeOptions });
     const lines = `${result.stdout}\n${result.stderr}`.split(/\r?\n/);
     const marker = "TEST_DELETION_REPORT:";
     const reports = lines.filter((line) => line.includes(marker));
@@ -640,7 +641,7 @@ describe("deletion guard in child processes", () => {
     const nodeOptions = withoutGuard(process.env.NODE_OPTIONS);
     expect(nodeOptions).not.toContain(guardFile);
     const result = runChild("backslash-recorder-child.mjs", backslashChild, [guardUrl],
-      { ...process.env, GITHUB_ACTIONS: "false", NODE_OPTIONS: nodeOptions });
+      { ...process.env, RUNNER_ENVIRONMENT: "", GITHUB_ACTIONS: "false", NODE_OPTIONS: nodeOptions });
     const output = JSON.parse(result.stdout.trim()) as
       { root: string; results: Record<string, string | null>; calls: string[] };
     expect(inside(privateTemp, output.root)).toBe(true);

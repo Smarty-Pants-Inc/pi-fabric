@@ -99,6 +99,22 @@ jobs:
       - name: Test Windows type-checker regression
         if: runner.os == 'Windows'
         run: bunx vitest run tests/type-checker.test.ts
+      - name: Windows held-object mesh release and crash partitions (smarty-dev#9569)
+        if: runner.os == 'Windows'
+        run: bunx vitest run --retry=0 tests/mesh-lock-release-windows.test.ts tests/windows-mesh-release.test.ts tests/mesh-lock-release-outcome.test.ts tests/windows-mesh-release-outcomes.test.ts tests/mesh-lock-windows-public-release.test.ts
+      - name: Windows release same-runner baseline and candidate overhead (smarty-dev#9569)
+        if: runner.os == 'Windows'
+        timeout-minutes: 15
+        shell: pwsh
+        run: ./scripts/windows-mesh-release-baseline.ps1
+      - name: Upload Windows release performance receipts (smarty-dev#9569)
+        if: always() && runner.os == 'Windows' && env.FABRIC_9569_PERF_RESULTS != ''
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: windows-mesh-release-perf-${{ github.sha }}
+          path: ${{ env.FABRIC_9569_PERF_RESULTS }}
+          if-no-files-found: error
+          retention-days: 14
       - name: Launcher and Pi host regressions
         run: bunx vitest run tests/worker-e2e.test.ts tests/pi-binary.test.ts tests/script-runtime.test.ts tests/herdr-transport.test.ts tests/prewalk-handoff.test.ts tests/shell-middleware.test.ts
       - name: Real Pi provider-dead path (smarty-dev#8742)

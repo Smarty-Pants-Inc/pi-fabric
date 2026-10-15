@@ -282,15 +282,45 @@ export const windowsRemoveHelper = (): string | undefined => {
   // per CLI removal, not per resident run.
   return findWindowsRemoveHelper();
 };
-const findWindowsRemoveHelper = (): string | undefined => {
+const findWindowsRemoveHelper = (): string | undefined => windowsHelperBootstrap()?.file;
+/** The checked-in digest is the source-run counterpart of the build's embedded value. It is reachable only from
+ * src/; bundled production code must use its literal build define, never a mutable toolchain file. */
+const sourcePinnedWindowsHelperDigest = (): string | undefined => {
+  try {
+    const sourcePath = fileURLToPath(import.meta.url);
+    const sourceDir = path.dirname(sourcePath);
+    // A packaged dist file can be installed below a directory named `src`; require the actual source module shape
+    // and TypeScript extension so a package can never fall back to a sibling toolchain file.
+    if (path.basename(sourceDir) !== "storage" || path.basename(path.dirname(sourceDir)) !== "src" || path.extname(sourcePath) !== ".ts") return undefined;
+    const toolchain = JSON.parse(fs.readFileSync(new URL("../../native/toolchain.json", import.meta.url), "utf8")) as {
+      expected?: { windows?: Record<string, string> };
+    };
+    const expected = toolchain.expected?.windows?.[WIN_HELPER];
+    return typeof expected === "string" && /^[0-9a-f]{64}$/.test(expected) ? expected : undefined;
+  } catch { return undefined; }
+};
+/** smarty-dev#9569: the Windows helper's sha256 embedded at build time (lowercase hex), or the same pinned source
+ * digest for an unbundled src/ child. Both paths still hash the candidate executable before any spawn. */
+export const windowsHelperDigest = (): string | undefined => {
   let expected: string | undefined;
-  try { expected = (JSON.parse(__FABRIC_NATIVE_DIGESTS__ as string) as Record<string, string>)[WIN_HELPER]; } catch { return undefined; }
-  if (typeof expected !== "string" || !/^[0-9a-f]{64}$/.test(expected)) return undefined;
-  for (const relative of ["../../dist/native/", "../dist/native/"]) {
-    const file = fileURLToPath(new URL(`${relative}${WIN_HELPER}`, import.meta.url));
+  try { expected = (JSON.parse(__FABRIC_NATIVE_DIGESTS__ as string) as Record<string, string>)[WIN_HELPER]; } catch { /* source child */ }
+  if (typeof expected !== "string" || !/^[0-9a-f]{64}$/.test(expected)) expected = sourcePinnedWindowsHelperDigest();
+  return typeof expected === "string" && /^[0-9a-f]{64}$/.test(expected) ? expected : undefined;
+};
+/** The packaged helper locations beside the bundle (dist/<dir>/ or dist/) or from src/. */
+export const windowsHelperCandidates = (): string[] =>
+  ["../../dist/native/", "../dist/native/"].map(relative => fileURLToPath(new URL(`${relative}${WIN_HELPER}`, import.meta.url)));
+/** smarty-dev#9569: the trusted packaged bootstrap: the first candidate that is a regular file whose bytes equal the
+ * embedded digest, with exactly the bytes that were hashed (a copy writes those bytes, not a second read). */
+export const windowsHelperBootstrap = (candidates: readonly string[] = windowsHelperCandidates()):
+  { file: string; bytes: Buffer; digest: string } | undefined => {
+  const expected = windowsHelperDigest();
+  if (!expected) return undefined;
+  for (const file of candidates) {
     try {
       if (!fs.lstatSync(file).isFile()) continue;
-      if (createHash("sha256").update(fs.readFileSync(file)).digest("hex") === expected) return file;
+      const bytes = fs.readFileSync(file);
+      if (createHash("sha256").update(bytes).digest("hex") === expected) return { file, bytes, digest: expected };
     } catch { /* next candidate */ }
   }
   return undefined;

@@ -78,7 +78,9 @@ vi.mock("../src/mesh/store.js", async importOriginal => {
 });
 vi.mock("../src/mesh/custody-lock.js", async importOriginal => ({
   ...await importOriginal<typeof import("../src/mesh/custody-lock.js")>(),
-  acquireMeshCustodyLock: vi.fn(async () => { throw io.activationError; }),
+  // Runtime activation acquires a finalizer handle, not the legacy release wrapper.
+  // Refuse before returning a handle: no ownership was acquired and no release is due.
+  acquireMeshCustodyHandle: vi.fn(async () => { throw io.activationError; }),
 }));
 vi.mock("../src/topology/host-lease-lock.js", async importOriginal => ({
   ...await importOriginal<typeof import("../src/topology/host-lease-lock.js")>(),
@@ -131,6 +133,7 @@ import { MeshStore as RecordedStore } from "../src/mesh/store.js";
 import { removeParticipantFileIf } from "../src/topology/participant-files.js";
 import { removeHostLeaseVersionUnderCustody } from "../src/topology/host-leases.js";
 import { RootInbox } from "../src/topology/root-inbox.js";
+import { acquireMeshCustodyHandle } from "../src/mesh/custody-lock.js";
 
 const root = path.join(process.cwd(), ".local", "retry-gates-virtual");
 const identity = { id: "retry-gates", name: "retry-gates", kind: "main" as const };
@@ -212,13 +215,17 @@ it("runtime bootstrap retains pending/snapshot for background activation but pro
     speculation: { enabled: false }, residency: { enabled: false }, agents: { enabled: false } });
   const start = vi.spyOn(RootInbox.prototype, "start");
   const next = vi.spyOn(RootInbox.prototype, "next");
+  const resume = vi.spyOn(ParticipantDirectory.prototype, "resumeLineage");
   for (const error of cases()) {
     io.activationError = error;
+    const priorAcquisitions = vi.mocked(acquireMeshCustodyHandle).mock.calls.length;
     const priorControls = io.control.length;
     const runtime = new FabricRuntimeState(pi, new CapturedToolCatalog());
     cleanups.push(() => runtime.shutdown());
     // Stop at the first post-catch constructor: no downstream workers, watchers or writes.
     await expect(runtime.initialize(context, config)).rejects.toBe(permanent(error) ? error : io.stop);
+    expect(vi.mocked(acquireMeshCustodyHandle).mock.calls.slice(priorAcquisitions)).toEqual([[process.env.PI_FABRIC_MESH_ROOT ?? root]]);
+    expect(resume).not.toHaveBeenCalled(); // fail-before-entry: lineage must remain pending
     expect(io.control.length - priorControls).toBe(permanent(error) ? 0 : 1);
     if (!permanent(error)) {
       const options = io.control.at(-1)![2] as { canConsumeMesh(): boolean };

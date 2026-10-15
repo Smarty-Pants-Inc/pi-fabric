@@ -16,6 +16,11 @@ import {
 } from "../src/mesh/store.js";
 
 const roots: string[] = [];
+const realPlatform = os.platform();
+// Native Windows snapshots the canonical lock for pre-entry/release. Do not count only that directory as history I/O.
+const nonLockDirectoryReads = (calls: readonly (readonly unknown[])[], root: string): string[] =>
+  calls.map(([directory]) => String(directory))
+    .filter(directory => realPlatform !== "win32" || directory !== path.join(root, ".lock"));
 const identity: MeshIdentity = {
   id: "session:test",
   name: "main",
@@ -220,7 +225,7 @@ describe("MeshStore", () => {
     expect(lookup).toHaveBeenCalledExactlyOnceWith(event.sequence);
     expect(scan).not.toHaveBeenCalled();
     expect(reads.mock.calls.some(([file]) => String(file).startsWith(archiveDir) && String(file).endsWith(".jsonl"))).toBe(false);
-    expect(dirs.mock.calls.map(([directory]) => String(directory))).toEqual([meshLockQueueDirectory(store.root)]);
+    expect(nonLockDirectoryReads(dirs.mock.calls, store.root)).toEqual([meshLockQueueDirectory(store.root)]);
     expect(fs.existsSync(base + ".pending.json")).toBe(false);
     expect(await store.publish(packet)).toEqual(event);
     expect(store.latestSequence()).toBe(later.sequence);
@@ -264,7 +269,7 @@ describe("MeshStore", () => {
     const directories = vi.spyOn(fs, "readdirSync");
     const scans = vi.spyOn(MeshArchive.prototype, "readAfter");
     expect(await store.publish(packet)).toEqual(event);
-    expect(directories.mock.calls.map(([directory]) => String(directory))).toEqual([meshLockQueueDirectory(store.root)]);
+    expect(nonLockDirectoryReads(directories.mock.calls, store.root)).toEqual([meshLockQueueDirectory(store.root)]);
     expect(scans).not.toHaveBeenCalled();
     const archive = MeshArchive.fromRoot(store.root)!;
     expect(archive.pending()).toBeUndefined();
@@ -1418,7 +1423,9 @@ describe("MeshStore lock recovery", () => {
     expect(fs.readdirSync(store.root).filter(name => name.startsWith(".lock.released."))).toEqual([]);
   });
 
-  it.each([["write", 1], ["opened", 1], ["write", 2], ["rename", 2]] as const)("a paused native %s publication (protocol %s) preserves exclusion against live owners or successors", async (phase, lockProtocol) => {
+  // This pathname fixture adds legacy-leftover, which native Windows must refuse before entry.
+  // Windows handle interleavings are covered by the hosted native/public-release suites.
+  it.runIf(realPlatform === "linux" || realPlatform === "darwin").each([["write", 1], ["opened", 1], ["write", 2], ["rename", 2]] as const)("a paused native %s publication (protocol %s) preserves exclusion against live owners or successors", async (phase, lockProtocol) => {
     const store = createStore({ lockTimeoutMs: 1_000, ...(lockProtocol === 2 ? { lockProtocol } : {}) });
     const lock = path.join(store.root, ".lock");
     const ownerPath = path.join(lock, "owner");
@@ -1545,8 +1552,8 @@ describe("MeshStore lock recovery", () => {
     expect(successorUnchanged).toBe(true);
   });
 
-  // Non-Linux keeps main's release (rename the whole lock away, then remove it recursively).
-  it.skipIf(process.platform === "linux").each([1, 2] as const)("interrupted release (protocol %s) never exposes an ownerless canonical or cleans a live successor on resume", async (lockProtocol) => {
+  // Darwin retains pathname release; an fs.rmSync interception cannot pause Windows's native handle release.
+  it.runIf(realPlatform === "darwin").each([1, 2] as const)("interrupted release (protocol %s) never exposes an ownerless canonical or cleans a live successor on resume", async (lockProtocol) => {
     vi.useFakeTimers({ now: 1_000_000 });
     const store = createStore({ lockTimeoutMs: 100, lockProtocol });
     const other = new MeshStore(store.root, 64 * 1024, 100, { lockTimeoutMs: 100, lockProtocol });

@@ -58,6 +58,8 @@ const lazyEntryPoints = [
   "src/commands/slot-import.ts",
   // First-use scratch removal: a stable entry keeps the shared verifier out of the startup graph.
   "src/storage/verified-remove.ts",
+  // Exact retained-capability diagnostics and the hosted release benchmark share the lock's implementation.
+  "src/storage/windows-mesh-release.ts",
   // The resident's first operator cleanup reuses the offline final-check helper (smarty-dev#8090).
   "src/actors/remove-offline.ts",
   "src/residency/launcher-owner.ts",

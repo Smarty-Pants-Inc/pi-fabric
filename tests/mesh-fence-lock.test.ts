@@ -1,9 +1,9 @@
-import { spawnSync } from "node:child_process";
+import childProcess, { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { processIncarnation } from "../src/core/atomic-write.js";
 import * as currentCustody from "../src/mesh/custody-lock.js";
 import { FOREIGN_LOCK, holdMeshFenceSync, MeshFenceBusyError, pinFenceLock, releaseFenceLock } from "../src/mesh/fence-lock.js";
@@ -17,10 +17,16 @@ import * as currentMeshLock from "../src/mesh/mesh-lock.js";
 
 const OLD_TREE = process.env.PI_FABRIC_OLD_RELEASE_TREE ?? "/home/paul/lanes/r13d1";
 const oldTree = fs.existsSync(path.join(OLD_TREE, "src/mesh/mesh-lock.ts")) ? OLD_TREE : undefined;
-const linux = process.platform === "linux";
+// Capture the real host before any recorded platform fixture; never emulate Linux fd traversal on Windows.
+const realPlatform = os.platform();
+const linux = realPlatform === "linux";
+const pathnameRelease = linux || realPlatform === "darwin";
 
 const roots: string[] = [];
-afterEach(() => { for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
+afterEach(() => {
+  vi.restoreAllMocks();
+  for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
+});
 const rootIn = (): string => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-fence-lock-"));
   roots.push(root);
@@ -62,10 +68,10 @@ const acquireA = (lock: string): number | undefined => {
 };
 
 describe("releaseFenceLock never detaches a successor (pi-fabric#694 P1)", () => {
-  it("pins the lock directory on Linux and removes the releaser's own lock", () => {
+  it.runIf(linux)("pins the lock directory on Linux and removes the releaser's own lock", () => {
     const lock = lockIn();
     const pin = acquireA(lock);
-    if (linux) expect(pin).toBeGreaterThanOrEqual(0);
+    expect(pin).toBeGreaterThanOrEqual(0);
     releaseFenceLock(lock, "A\n", {}, pin);
     expect(fs.readdirSync(path.dirname(lock))).toEqual([]);
   });
@@ -100,7 +106,8 @@ describe("releaseFenceLock never detaches a successor (pi-fabric#694 P1)", () =>
     });
   }
 
-  it("a paused protocol-1 writer that publishes into the emptied directory alone holds it (rmdir fails closed)", () => {
+  // Linux fd / Darwin pathname hooks; the hosted Windows suite covers native handle interleavings.
+  it.runIf(pathnameRelease)("a paused protocol-1 writer that publishes into the emptied directory alone holds it (rmdir fails closed)", () => {
     const lock = lockIn();
     const root = path.dirname(lock);
     const pin = acquireA(lock);
@@ -131,7 +138,7 @@ describe("releaseFenceLock never detaches a successor (pi-fabric#694 P1)", () =>
     expect(records(root)).toEqual({ ".lock/owner": "B\n" });
   });
 
-  it("unpinned fallback: a successor's record taken inside <lock> goes back and C never enters", () => {
+  it.runIf(pathnameRelease)("unpinned fallback: a successor's record taken inside <lock> goes back and C never enters", () => {
     const lock = lockIn();
     const root = path.dirname(lock);
     hold(lock, "A\n");
@@ -147,6 +154,35 @@ describe("releaseFenceLock never detaches a successor (pi-fabric#694 P1)", () =>
     cHolds ||= tryAcquire(lock, "C\n") || resumeWrite(lock, "C\n");
     expect([bHolds, cHolds]).toEqual([true, false]);
     expect(records(root)).toEqual({ ".lock/owner": "B\n" });
+  });
+
+  it("recorded native Windows branch refuses by-name release before any filesystem access or interleaving hook", () => {
+    const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+    Object.defineProperty(process, "platform", { ...platform, value: "win32" });
+    try {
+      vi.spyOn(os, "type").mockReturnValue("Windows_NT");
+      const forbidden = (): never => { throw new Error("unexpected native or pathname I/O"); };
+      const io = [
+        vi.spyOn(fs, "openSync").mockImplementation(forbidden),
+        vi.spyOn(fs, "readFileSync").mockImplementation(forbidden),
+        vi.spyOn(fs, "lstatSync").mockImplementation(forbidden),
+        vi.spyOn(fs, "mkdirSync").mockImplementation(forbidden),
+        vi.spyOn(fs, "rmSync").mockImplementation(forbidden),
+        vi.spyOn(fs, "renameSync").mockImplementation(forbidden),
+        vi.spyOn(fs, "unlinkSync").mockImplementation(forbidden),
+        vi.spyOn(fs, "rmdirSync").mockImplementation(forbidden),
+        vi.spyOn(childProcess, "spawnSync").mockImplementation(forbidden),
+      ];
+      const hook = vi.fn();
+      const lock = "C:\\recorded-only\\.lock"; // never created; no helper is invoked
+      expect(pinFenceLock(lock, "A\n")).toBeUndefined();
+      expect(() => releaseFenceLock(lock, "A\n", { afterCheck: hook, afterTake: hook }))
+        .toThrow("the unpinned by-name release is not used on Windows");
+      expect(hook).not.toHaveBeenCalled();
+      for (const call of io) expect(call).not.toHaveBeenCalled();
+    } finally {
+      Object.defineProperty(process, "platform", platform);
+    }
   });
 
   it("holdMeshFenceSync excludes a second holder and leaves a lock that replaced its own during the operation", () => {

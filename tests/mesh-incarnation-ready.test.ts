@@ -36,7 +36,11 @@ vi.mock("../src/mesh/lock-queue.js", async (original) => ({
     close(): void {}
   },
 }));
-vi.mock("../src/storage/verified-remove.js", () => ({ verifiedRemove: records.remove }));
+// Preserve non-destructive exports (notably #1191's windowsHelperBootstrap) used by native preflight.
+vi.mock("../src/storage/verified-remove.js", async (original) => ({
+  ...await original<typeof import("../src/storage/verified-remove.js")>(),
+  verifiedRemove: records.remove,
+}));
 vi.mock("node:child_process", async (original) => ({
   ...await original<typeof import("node:child_process")>(),
   spawn: records.spawn,

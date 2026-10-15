@@ -6,7 +6,8 @@ import os from "node:os";
 import path from "node:path";
 import { delay, MeshLock, type MeshStoreContext } from "./mesh-lock.js";
 import { isNamespaceRace } from "../core/atomic-write.js";
-import { acquireMeshCustodyLock, withMeshCustody } from "./custody-lock.js";
+import { acquireMeshCustodyHandle, withMeshCustody } from "./custody-lock.js";
+import { runUnderMeshLocksAsync } from "./lock-release.js";
 import type { MeshReadOptions, MeshStateEntry, MeshBatchResult, MeshBatchView } from "./state-file.js";
 import { createStateBackend, isMeshStateWalCap, type MeshStateBackendKind, type StateBackend, type StateBackendBatchInput,
   type StateBackendDiagnostics } from "./state-backend.js";
@@ -992,8 +993,9 @@ export class MeshStore {
     // only serializes two hosts on the same gate, never bypasses their lease-token checks.
     const domain = fs.existsSync(legacy) ? legacy
       : path.join(this.root, "host-lease-commits", hash.slice(0, 16));
-    const release = await acquireMeshCustodyLock(domain, lockTimeoutMs, { ...options, hostQualified: true, lockProtocol: this.#lock.lockProtocol });
-    try { return await operation(); } finally { release(); }
+    const custody = await acquireMeshCustodyHandle(domain, lockTimeoutMs, { ...options, hostQualified: true, lockProtocol: this.#lock.lockProtocol });
+    // Preserve the await boundary even for synchronous lease commits, and never mask their primary throw on release.
+    return runUnderMeshLocksAsync(() => Promise.resolve(operation()), [custody]);
   }
 
   /** The active withTryLock budget in this async context, if any. */

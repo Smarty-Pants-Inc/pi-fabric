@@ -243,7 +243,7 @@ describe.runIf(process.env.GITHUB_ACTIONS === "true" && process.platform === "wi
     expect(windowsPrivate(file, fs.lstatSync(file, { bigint: true }))).toBe(false);
     const [volume, index] = ids(file);
     const helper = spawnSync(windowsRemoveHelper()!, ["--private", volume!, index!, path.toNamespacedPath(file)], { encoding: "utf8", windowsHide: true });
-    expect(helper.stdout.trim()).toBe("refused 0 writable by another SID");
+    expect(helper.stdout.trim()).toMatch(/^refused 0 writable by another SID; ace=\d+ sid=S-1-[0-9-]+ mask=0x[0-9a-f]+ mapped=0x[0-9a-f]+ flags=0x[0-9a-f]+ sddl=D:/i);
   });
 
   // smarty-dev#7858 / #4664: a real file in our temp dir whose OWNER is a real well-known SID that is neither this

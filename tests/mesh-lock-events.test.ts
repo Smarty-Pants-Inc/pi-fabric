@@ -843,24 +843,33 @@ describe("lock events in one process", () => {
     }) as typeof fs.openSync);
     vi.useFakeTimers({ toFake: ["Date"] });
     vi.setSystemTime(Date.UTC(2026, 9, 11, 12, 0, 0));
+    // #1191 includes native release in MeshLock's held duration. Select exactly two deliberate holds,
+    // not incidental acquire/release or SQLite time. Real locks/releases still run and failures still reject.
+    const realNow = performance.now.bind(performance);
+    let heldClock = 0;
+    vi.spyOn(performance, "now").mockImplementation(() => heldClock);
+    const held = vi.spyOn(events, "held");
     const lock = new MeshLock(root, { lockHeldEventMs: 5 }, () => undefined);
-    expect(await lock.withLock(() => { spin(20); return "held"; }, undefined, "publish")).toBe("held");
+    expect(await lock.withLock(() => { heldClock += 20; return "held"; }, undefined, "publish")).toBe("held");
     expect(events.errors).toBe(1);
     expect(warnings).toHaveLength(1);
     expect(warnings[0]).toContain("EIO: injected");
     // The lock was released normally: an immediate acquisition does not wait.
-    const started = performance.now();
+    const started = realNow();
     expect(await lock.withLock(() => 7, 200, "other")).toBe(7);
-    expect(performance.now() - started).toBeLessThan(150);
+    expect(realNow() - started).toBeLessThan(150);
+    expect(events.errors).toBe(1); // a recorded zero-duration hold emits no additional event
     const store = await Store.open(root, 64 * 1024, 1_000, { lockHeldEventMs: 5 });
     try {
-      expect(await store.exclusive(() => { spin(20); return "sqlite"; })).toBe("sqlite");
+      expect(await store.exclusive(() => { heldClock += 20; return "sqlite"; })).toBe("sqlite");
       expect((await store.put({ key: "k/1", value: 1, identity })).version).toBe(1);
     } finally { store.close(); }
     expect(events.errors).toBe(2);
+    expect(held.mock.calls.map(([, store, lockClass, duration]) => [store, lockClass, duration]))
+      .toEqual([["mesh-lock", "publish", 20], ["sqlite", "custody", 20]]);
     expect(warnings).toHaveLength(1); // within the minute: counted, not warned again
     vi.setSystemTime(Date.UTC(2026, 9, 11, 12, 1, 1));
-    await lock.withLock(() => spin(20), undefined, "publish");
+    await lock.withLock(() => { heldClock += 20; }, undefined, "publish");
     expect(events.errors).toBe(3);
     expect(warnings).toHaveLength(2);
     expect(warnings[1]).toContain("2 append error(s)");

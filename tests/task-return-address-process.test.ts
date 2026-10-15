@@ -17,6 +17,7 @@ import { AgentsProvider } from "../src/providers/agents-provider.js";
 import { MainAgentController } from "../src/main-agent.js";
 import { assertTaskMainTarget, applyTaskReturnAddress, readTaskReturnAddress, taskReturnAddressArguments } from "../src/agents/task-return-address.js";
 import type { FabricParticipantRecord } from "../src/topology/types.js";
+import { pinnedNativeBundle } from "./helpers/pinned-native-bundle.js";
 
 const SPAWNER = "session:aaaaaaaa-1111-4111-8111-111111111111";
 const ORG = "session:bbbbbbbb-2222-4222-8222-222222222222";
@@ -30,8 +31,9 @@ afterEach(async () => {
 const fixture = async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-task-return-"));
   closers.push(() => fs.rmSync(root, { recursive: true, force: true }));
-  const fakePi = path.join(root, "pi.mjs");
-  await build({ entryPoints: [path.resolve("tests/fixtures/task-return-address-pi.ts")], outfile: fakePi,
+  const nativeBundle = pinnedNativeBundle(root, "pi.mjs");
+  const fakePi = nativeBundle.outfile;
+  await build({ entryPoints: [path.resolve("tests/fixtures/task-return-address-pi.ts")], ...nativeBundle,
     bundle: true, platform: "node", format: "esm", packages: "external", banner: { js: "#!/usr/bin/env node" } });
   fs.chmodSync(fakePi, 0o755);
   // External package imports must resolve from this owned temporary executable too.

@@ -4,6 +4,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agents/manager.js";
 import { ActorManager } from "../src/actors/manager.js";
+import { ActorRegistryStore } from "../src/actors/registry-store.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 
@@ -45,6 +46,105 @@ const runTasks = (root: string, actors: ActorManager, actorId: string) =>
     const file = runId ? path.join(root, "actors", actorId, "runs", runId, "task.txt") : undefined;
     return message.direction === "out" && file && fs.existsSync(file) ? [fs.readFileSync(file, "utf8")] : [];
   });
+
+// #6087 admission data safety: changing ingress subscriptions must not cancel
+// accepted mesh work, replace its owner claim, or resurrect finished work on restart.
+describe("actor setTopics", () => {
+  it("unsubscribes new mesh work without cancelling its running item or queued backlog, then resubscribes", async () => {
+    const { root, mesh, actors, agents } = setup();
+    const topic = "topics.work";
+    const actor = await actors.create({
+      name: "topics-worker", instructions: "Work.", topics: [topic],
+      responseMode: "text", coalesce: false, residency: "durable", dedupeKey: "data.key",
+    });
+    const release = path.join(root, "release-topics-worker");
+    const queue = () => fs.readdirSync(path.join(root, "actors", actor.id))
+      .filter(name => /^queue-.+\.json$/.test(name))
+      .map(name => ({ name, ...JSON.parse(fs.readFileSync(path.join(root, "actors", actor.id, name), "utf8")) }));
+    const claim = () => {
+      const row = new ActorRegistryStore(path.join(root, "actors")).snapshot().actors.find(row => row.id === actor.id)!;
+      return { rootId: row.rootId, residency: row.residency, adoptedAt: row.adoptedAt, adoptedFrom: row.adoptedFrom };
+    };
+    const completed = () => actors.messages(actor.id).filter(message => message.direction === "out" && !message.error);
+    const publish = (key: string) => mesh.publish({ topic, from, text: key, data: { key } });
+    try {
+      const first = await mesh.publish({ topic, from, text: "topics-first", data: { key: "first", fakeWorkerFinishGate: release } });
+      await waitFor(() => fs.existsSync(`${release}.entered`) && actors.status(actor.id).inFlightRun !== undefined);
+      const inFlight = actors.status(actor.id).inFlightRun!;
+      expect(agents.status(inFlight.id).status).toBe("running");
+      const second = await publish("topics-backlog-one");
+      const third = await publish("topics-backlog-two");
+      await waitFor(() => actors.status(actor.id).queued === 2);
+      const accepted = queue();
+      expect(accepted).toHaveLength(1);
+      expect(accepted[0].items.map((item: { payload: { id: string } }) => item.payload.id)).toEqual([first.id, second.id, third.id]);
+      const ownership = claim();
+
+      expect(await actors.setTopics(actor.id, [])).toMatchObject({ topics: [], status: "running", queued: 2 });
+      expect(actors.status(actor.id).inFlightRun).toMatchObject({ id: inFlight.id, startedAt: inFlight.startedAt });
+      expect(queue()).toEqual(accepted); // Same lineage file and item IDs, not a cancelled/recreated queue.
+      expect(claim()).toEqual(ownership);
+      const ignored = await publish("topics-ignored");
+      // A later addressed event is a positive monitor barrier: it must pass the
+      // ignored event before this receipt exists. No arbitrary negative sleep.
+      const direct = await mesh.publish({ topic: "topics.direct", to: actor.id, from, text: "topics-direct", data: { key: "direct" } });
+      await waitFor(() => queue().some(snapshot => snapshot.items.some((item: { payload: { id: string } }) => item.payload.id === direct.id)));
+      expect(actors.status(actor.id)).toMatchObject({ status: "running", queued: 3, topics: [] });
+      expect(queue()[0].items.map((item: { payload: { id: string } }) => item.payload.id)).toEqual([first.id, second.id, third.id, direct.id]);
+      expect(JSON.stringify(queue())).not.toContain(ignored.id);
+      expect(claim()).toEqual(ownership);
+      expect(completed()).toEqual([]);
+
+      fs.writeFileSync(release, "finish");
+      await waitFor(() => completed().length === 4 && actors.status(actor.id).status === "idle");
+      expect(actors.status(actor.id)).toMatchObject({ queued: 0, topics: [] });
+      expect(actors.status(actor.id).inFlightRun).toBeUndefined();
+      const tasks = runTasks(root, actors, actor.id);
+      for (const text of ["topics-first", "topics-backlog-one", "topics-backlog-two", "topics-direct"]) {
+        expect(tasks.filter(task => task.includes(text))).toHaveLength(1);
+      }
+      expect(tasks.some(task => task.includes("topics-ignored"))).toBe(false);
+      expect(new Set(completed().map(message => message.runId)).size).toBe(4);
+      expect(queue()[0].items).toEqual([]);
+      expect(queue()[0].processedKeys).toHaveLength(4);
+
+      expect((await actors.setTopics(actor.id, [topic, topic])).topics).toEqual([topic]);
+      await publish("topics-restored");
+      await waitFor(() => completed().length === 5 && actors.status(actor.id).status === "idle");
+      expect(runTasks(root, actors, actor.id).filter(task => task.includes("topics-restored"))).toHaveLength(1);
+      expect(claim()).toEqual(ownership);
+      expect(queue()[0].items).toEqual([]);
+      expect(queue()[0].processedKeys).toHaveLength(5);
+    } finally {
+      fs.writeFileSync(release, "finish");
+    }
+  }, 30_000);
+
+  it.each([{ topics: [] }, { topics: ["topics.replacement"] }])("persists the replacement subscription $topics across restart without replaying completed work", async ({ topics }) => {
+    const first = setup();
+    const actor = await first.actors.create({ name: "topics-restart", instructions: "Work.", topics: ["topics.original"], coalesce: false });
+    await first.mesh.publish({ topic: "topics.original", from, text: "topics-before-restart" });
+    await waitFor(() => first.actors.status(actor.id).status === "idle" && first.actors.messages(actor.id).some(message => message.direction === "out" && !message.error));
+    await first.actors.setTopics(actor.id, topics);
+    await first.actors.close(); await first.agents.close(); closers.length = 0;
+    const second = setup(first.root);
+    expect(second.actors.status(actor.id).topics).toEqual(topics);
+    await second.mesh.publish({ topic: "topics.original", from, text: "topics-obsolete-after-restart" });
+    await second.mesh.publish({ topic: "topics.replacement", from, text: "topics-replacement-after-restart" });
+    // Direct addressing still works for an actor with no subscriptions and
+    // establishes that both preceding topic events have passed the monitor.
+    await second.mesh.publish({ topic: "topics.barrier", to: actor.id, from, text: "topics-restart-barrier" });
+    const expected = topics.length ? 3 : 2;
+    await waitFor(() => second.actors.messages(actor.id).filter(message => message.direction === "out" && !message.error).length >= expected && second.actors.status(actor.id).status === "idle");
+    const tasks = runTasks(first.root, second.actors, actor.id);
+    expect(tasks).toHaveLength(expected);
+    expect(tasks.filter(task => task.includes("topics-before-restart"))).toHaveLength(1);
+    expect(tasks.some(task => task.includes("topics-obsolete-after-restart"))).toBe(false);
+    expect(tasks.filter(task => task.includes("topics-replacement-after-restart"))).toHaveLength(topics.length ? 1 : 0);
+    expect(tasks.filter(task => task.includes("topics-restart-barrier"))).toHaveLength(1);
+    expect(second.actors.status(actor.id)).toMatchObject({ topics, queued: 0 });
+  }, 30_000);
+});
 
 // smarty-dev#705: a review actor queued every pull_request event (12 at once), although its role
 // reviews the current head only.

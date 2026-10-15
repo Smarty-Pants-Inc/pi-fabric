@@ -1775,6 +1775,29 @@ export class ActorManager {
   }
 
   /**
+   * Replace an existing actor's exact mesh-topic subscriptions. Removing topics
+   * stops future topic admission without changing already-accepted work, direct
+   * messages or host-event subscriptions. An empty list enables topic drain-only.
+   */
+  async setTopics(id: string, topics: string[]): Promise<FabricActorInfo> {
+    const actor = this.#requireOwnedActor(id);
+    if (!Array.isArray(topics)) throw new Error("topics must be an array of strings");
+    const next = [...new Set(topics)];
+    for (const topic of next) {
+      if (typeof topic !== "string" || !TOPIC_PATTERN.test(topic)) {
+        throw new Error(`Invalid Fabric actor topic: ${String(topic)}`);
+      }
+    }
+    this.#assertPresenceValue(this.#presencePreview(actor, { topics: next }));
+    actor.topics = next;
+    actor.updatedAt = Date.now();
+    await this.#publishPresence(actor, true);
+    // Dispatch reads actor.topics live; wake the existing reader, never reset its cursor.
+    this.#meshMonitor.schedule();
+    return this.#publicInfo(actor);
+  }
+
+  /**
    * Replace an existing actor's host-event subscriptions. Already-queued work
    * for a removed event still runs, but future dispatches respect the new set.
    * Pass an empty array to pause host-event reactivity while keeping the actor

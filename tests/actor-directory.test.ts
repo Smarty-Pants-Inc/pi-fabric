@@ -4,6 +4,11 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ActorDirectory } from "../src/actors/directory.js";
 import { SessionActorOrphans } from "../src/actors/session-orphans.js";
+import { GlobalActorRegistry } from "../src/actors/global-registry.js";
+import { AgentsProvider } from "../src/providers/agents-provider.js";
+import { LifecycleBroker } from "../src/lifecycle/broker.js";
+import { QuickJsRuntime } from "../src/runtime/quickjs-runtime.js";
+import type { FabricInvocationContext } from "../src/protocol.js";
 import { AgentManager } from "../src/agents/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
@@ -64,6 +69,66 @@ afterEach(async () => {
 });
 
 describe("ActorDirectory", () => {
+  // #6087 admission data safety: session mutations must reach the secondary
+  // manager, not silently change the project registry or lose its subscriptions.
+  it.each(["project", "session"] as const)("forwards setTopics to the %s owner and persists only that registry", async scope => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-directory-topics-"));
+    roots.push(root);
+    const { directory, actorRoots } = open(root, "alpha");
+    const project = await directory.create({ scope: "project", name: "topics-project", instructions: "Work.", topics: ["topics.project"] });
+    const session = await directory.create({ scope: "session", name: "topics-session", instructions: "Work.", topics: ["topics.session"] });
+    const target = scope === "project" ? project : session;
+    const other = scope === "project" ? session : project;
+    expect(await directory.setTopics(target.id, ["topics.replaced", "topics.replaced"])).toMatchObject({ id: target.id, scope, topics: ["topics.replaced"] });
+    expect(directory.status(target.id).topics).toEqual(["topics.replaced"]);
+    expect(directory.status(other.id).topics).toEqual(other.topics);
+    const rows = JSON.parse(fs.readFileSync(path.join(actorRoots[scope], "actors.json"), "utf8")).actors;
+    expect(rows.find((row: { id: string }) => row.id === target.id).topics).toEqual(["topics.replaced"]);
+    expect(await directory.setTopics(target.id, [])).toMatchObject({ id: target.id, scope, topics: [] });
+    expect(directory.status(other.id).topics).toEqual(other.topics);
+    await directory.close();
+    const restored = open(root, "alpha").directory;
+    expect(restored.status(target.id)).toMatchObject({ id: target.id, scope, topics: [] });
+    expect(restored.status(other.id).topics).toEqual(other.topics);
+  });
+  it("#6087 routes guest setTopics through the real provider to a secondary session actor and a global template", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-provider-topics-"));
+    roots.push(root);
+    let owned = true;
+    const { directory, mesh, manager } = open(root, "alpha", { canManageActor: () => owned });
+    const actor = await directory.create({ scope: "session", name: "topics-guest", instructions: "Work.", topics: ["topics.original"] });
+    const globals = new GlobalActorRegistry(root, 64 * 1024);
+    const template = globals.create({ name: "topics-template", instructions: "Work.", topics: ["topics.original"] });
+    // No participant routing or Main delivery is part of a local setter. These
+    // unused ports fail closed if this regression unexpectedly tries either.
+    const unused = (): never => { throw new Error("setTopics unexpectedly routed to Main"); };
+    const participants = { list: () => [], get: () => undefined, self: unused, peers: () => [], refresh: async () => {}, scheduleRefresh() {} };
+    const main = { id: "session:alpha", local: true, matches: (id: string) => id === "session:alpha" || id === "main", info: unused, deliverAgent: unused };
+    const lifecycle = new LifecycleBroker(mesh, directory.identity, participants, { enabled: false, pollMs: 20, maxReadEvents: 100 }, () => {});
+    const provider = new AgentsProvider(manager, directory, globals, main, participants, undefined, lifecycle);
+    const context: FabricInvocationContext = { cwd: root, signal: undefined, parentToolCallId: "topics", nestedToolCallId: "topics",
+      extensionContext: {} as FabricInvocationContext["extensionContext"], update() {} };
+    try {
+      const result = await new QuickJsRuntime().execute(
+        `const local = await agents.setTopics({ id: ${JSON.stringify(actor.id)}, topics: [] });
+         const template = await agents.setTopics({ id: ${JSON.stringify(template.id)}, scope: "global", topics: ["topics.changed"] });
+         let rejected = false;
+         try { await agents.setTopics({ id: ${JSON.stringify(actor.id)}, topics: ["bad topic"] }); } catch { rejected = true; }
+         return { local: local.topics, template: template.topics, rejected };`,
+        (ref, args) => provider.invoke(ref.slice("agents.".length), args as Record<string, unknown>, context),
+        { timeoutMs: 5_000, memoryLimitBytes: 32 * 1024 * 1024 },
+      );
+      expect(result.terminationReason).toBe("completed");
+      expect(result.value).toEqual({ local: [], template: ["topics.changed"], rejected: true });
+      expect(directory.status(actor.id)).toMatchObject({ scope: "session", topics: [], queued: 0 });
+      expect(new GlobalActorRegistry(root, 64 * 1024).resolve(template.id)!.topics).toEqual(["topics.changed"]);
+      owned = false;
+      await expect(provider.invoke("setTopics", { id: actor.id, topics: ["topics.forbidden"] }, context)).rejects.toThrow();
+      expect(directory.status(actor.id).topics).toEqual([]);
+      expect(manager.list()).toEqual([]);
+    } finally { await provider.close(); }
+  });
+
   it("#169 round 2 permits public same-name create while a waiting removal is behind a live run", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-directory-wait-"));
     roots.push(root);

@@ -866,6 +866,21 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
     risk: "agent",
   },
   {
+    name: "setTopics",
+    description: "Replace a locally owned actor's exact mesh-topic subscriptions, or a global template's topics. An empty list stops topic intake while accepted work drains; direct messages, addressed mesh events and host-event subscriptions are unchanged. Restoring a topic accepts new events again, without replaying events already passed by the monitor.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string" },
+        topics: { type: "array", items: { type: "string" } },
+        scope: { type: "string", enum: ["project", "global"] },
+      },
+      required: ["id", "topics"],
+      additionalProperties: false,
+    },
+    risk: "agent",
+  },
+  {
     name: "setEvents",
     description: "Replace a persistent actor's session-bound Pi and synthetic tool_error event subscriptions",
     inputSchema: {

@@ -1254,6 +1254,34 @@ Claude actors can keep context and use mapped Claude Code tools to inspect or ed
 
 In a scoped session, every actor is bound to the principal that created it. Actor info reports `principal: { id, digest }`, and every turn, durable ones included, launches with that scope. Fabric delivers a message whose sender does not cover the actor's scope as untrusted data from a different or narrower principal, so a narrower session cannot borrow the actor's authority. An unscoped actor treats any scoped sender this way. See [principal and scope](providers.md#principal-and-scope) for the trust table.
 
+### Replace mesh topics without stopping an actor
+
+Use `agents.setTopics({ id, topics, scope? })` to replace an actor's exact mesh-topic list. The list is required, duplicate topics are removed, and topic names follow the same validation as `agents.create`: 1–128 characters, beginning with an ASCII letter or digit, followed by letters, digits, `.`, `_`, `:`, `/` or `-`. Wildcards, blank names, non-string entries and malformed lists are rejected rather than silently clearing subscriptions.
+
+For topic **drain-only**, save the subscriptions and replace them with `[]`. This stops new topic-matched admissions while work already accepted by the actor continues under its existing execution policy:
+
+```ts
+const actor = await agents.actorStatus({ id: "work-reviewer" });
+const resumeTopics = actor.topics;
+await agents.setTopics({ id: actor.id, topics: [] });
+return { id: actor.id, resumeTopics }; // Keep this receipt to restore the list later.
+```
+
+This is not `agents.stop`, a queue purge, or an activation filter. The setter does not change the queue, overflow, running activation, claims or filters. Direct `ask`/`tell` messages, mesh events explicitly addressed to the actor's ID or name, and host-event subscriptions remain unchanged. Those sources can still admit work; topic drain-only is not a promise that the actor will become idle. Use `agents.setEvents({ id, events: [] })` separately if host-event intake must also pause.
+
+After the maintenance or drain, restore the saved list. For example, if it contained `org.work.v1`, a fresh broadcast on that topic is eligible for admission again:
+
+```ts
+await agents.setTopics({ id: "work-reviewer", topics: ["org.work.v1"] });
+await mesh.publish({ topic: "org.work.v1", text: "Review the next work item." });
+```
+
+Restoring a topic is the counterexample to treating `[]` as a permanent stop: the actor keeps its identity and accepts new matching events again. Events the monitor already passed while unsubscribed are not replayed. Matching is checked when the monitor dispatches an event, not against its publication time; an event not yet consumed can see the restored list.
+
+Omitted scope and `scope: "project"` target a live actor and require the local manager's ownership, just like `setEvents`; this scope does not move the actor between project and session storage. This action does not forward to a resident or remote owner. `scope: "global"` updates the stored global template through the global actor registry, without changing already-imported live actors.
+
+For persistent live actors, the replacement is saved in the existing registry and published in actor presence. The shared `ActorMeshMonitor` reads the mesh log without per-topic subscriptions; both target selection and the ownership recheck read `actor.topics` live. The setter schedules that existing monitor after persistence. It does not create another subscription reader, reset the shared cursor, or resubscribe through a new abstraction.
+
 ### Shared actors and session bindings
 
 A project-scoped actor stores one definition for the project. Select storage per actor with `agents.create({ scope: "project" | "session", ... })`; omitted scope uses `mesh.actorScope` as a compatibility default. Fabric keeps three pieces of state:

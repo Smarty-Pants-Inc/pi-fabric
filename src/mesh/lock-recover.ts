@@ -23,7 +23,8 @@ import { retireWindowsMeshOwner, windowsMeshRecoveryFence } from "../storage/win
 
 export class MeshLockRecoverRefusedError extends Error {
   readonly code = "FABRIC_MESH_LOCK_RECOVER_REFUSED";
-  constructor(message: string) {
+  // Keep the existing class/code for callers, but never collapse a possibly committed recovery into a refusal.
+  constructor(message: string, readonly recoveryOutcome: "refused" | "helper-unavailable/not-started" | "recovery-outcome-unknown" = "refused") {
     super(`FABRIC_MESH_LOCK_RECOVER_REFUSED: ${message}`);
     this.name = "MeshLockRecoverRefusedError";
   }
@@ -214,7 +215,7 @@ export const recoverMeshLock = async (root: string, options: MeshLockRecoverOpti
     const outcome = retireWindowsMeshOwner(lock, owner, stat, ownerStat, capability);
     if (outcome.outcome !== "recovered") {
       // Unknown is NOT a clean refusal/no-mutation claim. No fallback, retry, reconciliation or new S/R here.
-      throw new MeshLockRecoverRefusedError(`Windows recovery ${outcome.outcome}: ${outcome.reason}; recovery success is not established`);
+      throw new MeshLockRecoverRefusedError(`Windows recovery ${outcome.outcome}: ${outcome.reason}; recovery success is not established`, outcome.outcome);
     }
   } else fs.renameSync(lock, fence);
   const unsafeConsequence = windows

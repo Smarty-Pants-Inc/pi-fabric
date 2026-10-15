@@ -97,6 +97,7 @@ import {
   type FabricModelCandidate,
 } from "../core/model-resolution.js";
 import { resolvePiModel, resolvePiRoutePin, ModelRoutePinError } from "../core/model-refresh.js";
+import { FabricModelNotServedError } from "../core/model-served-error.js";
 import { loadModelUsage } from "../core/model-usage.js";
 import { AGENTS_ACTION_DESCRIPTORS } from "./agents-actions.js";
 import { mainExecutionCeilingAbortReason, recordResidentOutcome, registerCancellationEffect, throwIfExecutionExpired, withoutMainExecutionCeiling } from "../async-settlement.js";
@@ -145,7 +146,7 @@ const displaySafeCwd = (cwd: string): string => {
 };
 
 const agentStartedMessage = (handle: AgentHandleInfo): string =>
-  `Agent ${handle.name} started via ${handle.runner}/${handle.transport}${handle.attachCommand ? ` · ${handle.attachCommand}` : ""} · cwd ${displaySafeCwd(handle.cwd)}`;
+  `Agent ${handle.name} started via ${handle.runner}/${handle.transport}${handle.attachCommand ? ` · ${handle.attachCommand}` : ""} · cwd ${displaySafeCwd(handle.cwd)}${handle.modelVerification === "unverified" ? " · model unverified" : ""}`;
 
 // Resolve source and executor reasoning channels for the trajectory handoff
 // boundary. The executor model must be registered to transfer at all; an
@@ -655,7 +656,21 @@ export class AgentsProvider implements FabricProvider {
   }
 
   async #prepareSpawnRequest(args: Record<string, unknown>, context: FabricInvocationContext): Promise<AgentRunRequest> {
-    if (args.model !== "auto") return this.#runRequest(args, context, false);
+    if (args.model !== "auto") {
+      try { return await this.#runRequest(args, context, false); }
+      catch (error) {
+        const runner = args.runner ?? this.manager.config.runner;
+        const transport = args.transport ?? this.manager.config.transport;
+        if ((runner === "pi" || runner === "pi-durable") && (transport === "process" || transport === "auto") &&
+          error instanceof Error && (error.message.includes("is not available to this Pi session") ||
+            error.message.includes("closest-match resolution is refused"))) {
+          const selector = typeof args.model === "string" ? args.model : this.manager.defaultModel(runner) ??
+            (context.extensionContext.model ? `${context.extensionContext.model.provider}/${context.extensionContext.model.id}` : "unknown");
+          throw new FabricModelNotServedError(selector, context.extensionContext.model?.provider, error.message);
+        }
+        throw error;
+      }
+    }
     const runner = args.runner ?? this.manager.config.runner;
     const transport = args.transport ?? this.manager.config.transport;
     if (runner !== "pi" || transport !== "process" || (args.residency !== undefined && args.residency !== "session") ||
@@ -921,6 +936,15 @@ export class AgentsProvider implements FabricProvider {
           context,
         );
         if (request.residency === "durable") this.#assertUnconfinedDurable();
+        const runner = request.runner ?? this.manager.config.runner;
+        const transport = request.transport ?? this.manager.config.transport;
+        let modelVerification: AgentHandleInfo["modelVerification"];
+        if ((runner === "pi" || runner === "pi-durable") && (transport === "process" || transport === "auto")) {
+          const { verifyPiSpawnModel } = await import("../core/model-served.js");
+          modelVerification = request.model
+            ? await verifyPiSpawnModel(request.model, context.extensionContext.modelRegistry) : "unverified";
+          (isInteractiveMain(context.extensionContext) ? withoutMainExecutionCeiling(context.signal) : context.signal)?.throwIfAborted();
+        }
         const kernel = this.manager.resolveKernel(request);
         const { kernel: _requestedKernel, ...requestWithScope } = request;
         // The resident host has no session scope: send the derived scope in full.
@@ -952,8 +976,10 @@ export class AgentsProvider implements FabricProvider {
           kind: "agent",
           name: handle.name,
         });
-        context.update(agentStartedMessage(handle));
-        return request.routeDecision ? { ...handle, routeDecision: request.routeDecision } : handle;
+        const receipt = { ...handle, ...(modelVerification ? { modelVerification } : {}),
+          ...(request.routeDecision ? { routeDecision: request.routeDecision } : {}) };
+        context.update(agentStartedMessage(receipt));
+        return receipt;
       }
       case "join":
       case "wait": {

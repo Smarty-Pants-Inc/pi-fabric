@@ -1,7 +1,4 @@
-import { readdirSync, readFileSync, statSync } from "node:fs";
-import { join, relative, sep } from "node:path";
-import { fileURLToPath } from "node:url";
-import ts from "typescript";
+import { join } from "node:path";
 import type { ViteUserConfig as UserConfig } from "vitest/config";
 import { isolatedTestTemp, isolateTestFleetEnvironment } from "./scripts/test-temp.js";
 
@@ -17,93 +14,39 @@ if (process.platform !== "win32") process.umask(0o022);
 // GitHub Actions sets CI=true; a local CI=0 or CI=false must not enable retries (review c6081609482).
 const ci = process.env.CI === "true";
 
-// smarty-dev#4664/#11145: suites whose source references a product-deletion entrypoint are excluded before collection
-// outside hosted CI. Syntactic (TypeScript AST; comments and plain string mentions do not count), not a proof.
-// A suite qualifies by importing/requiring a deletion entry module, calling a deletion function (including the resident
-// removeActor request, which deletes the actor directory), calling .remove with
-// an actor-manager/directory value import (or on a .actors/manager receiver), calling .publishBatch/.prune/.compact with a mesh
-// store/bridge import, or spawning/executing fabric-win-remove or a retention CLI with --apply.
-export const productDeletionMarkers: readonly string[] = ["actors-cli", "actors/remove-offline",
-  "storage/verified-remove", "storage/retention", "storage/scratch", "mesh/event-log"];
-const deletionCalls = new Set(["verifiedRemove", "removeActorOffline", "removeActor", "removeEmptyRunRoot", "sweepTempRunRoots",
-  "removeUnreferencedRun", "compactTerminalRunEvents", "pruneActorRunArchives", "pruneActorSessionBackups",
-  "sweepScratch", "closeScratch", "deleteRootActorTree", "pruneDeadCensusRecords"]);
-const meshCalls = new Set(["publishBatch", "prune", "compact"]);
-const execCalls = new Set(["spawn", "spawnSync", "exec", "execSync", "execFile", "execFileSync", "fork", "execa"]);
+// smarty-dev#4664/#11145: fleet-isolation-setup installs the Node fs deletion guard before suite imports;
+// Node children inherit its pinned TMPDIR ceiling via NODE_OPTIONS --import. Native/tool deletion that
+// bypasses that seam stays hosted-only, as do suites restored by the revert rule below. New native
+// deletions or deleting children that drop/ignore NODE_OPTIONS (including Bun, smarty-dev#13001)
+// must be added here. flock/setpriv only lock: their callers still delete through guarded Node fs.
+// Revert rule: any deletion outside TMPDIR by a moved suite restores that suite's exclusion.
+// ponytail: reviewed explicit denylist, not an import-name detector that hides guardable suites.
+const hostedOnlyDeletionSuites = [
+  "tests/actor-child-completion-idle-preflight.test.ts", // Bun enqueue releases a claim lock through unguarded fs.
+  "tests/actor-manager.test.ts", // real src/worker.ts launch selects Bun; its cleanup is not guarded.
+  "tests/actor-remove-dead-root.test.ts", // revert rule: real /dev/shm cross-device fixture lies outside TMPDIR.
+  "tests/agent-manager.test.ts", // worktree cleanup delegates deletion to git worktree remove --force.
+  "tests/agent-release-observation.test.ts", // successful cleanup removes a real worktree through git.
+  "tests/agents-provider.test.ts", // public cleanup's worktree=true cases invoke git worktree remove.
+  "tests/residency-commit-fence.test.ts", // direct Bun owner fixture deletes participant/lock/census state.
+  "tests/residency-stopped-writer-retention.test.ts", // durable cleanup removes a real worktree through git.
+  "tests/residency.test.ts", // restored/tampered worktree cleanup and fixture teardown invoke git removal.
+  "tests/routed-session-boundaries.test.ts", // rollback and successful cleanup invoke git worktree remove.
+  "tests/stall-alarms.test.ts", // nice/bun crash fixture reaches MeshStore/lock cleanup before its crash.
+  "tests/task-write-policy.test.ts", // sentinel run's native proof timed out; unproven slice stays hosted-only (#13018).
+  "tests/temp-run-sweep.test.ts", // scriptSpawnArgs selects Bun for the real .ts sweep entry.
+  "tests/verified-remove-windows.test.ts", // fabric-win-remove.exe deletes by handle, outside Node fs.
+  "tests/windows-temp-root-native.test.ts", // diskpart formats a native NTFS VHD mounted outside TMPDIR.
+];
 
-function literals(node: ts.Node, out: string[] = []): string[] {
-  if (ts.isStringLiteralLike(node)) out.push(node.text);
-  ts.forEachChild(node, (child) => { literals(child, out); });
-  return out;
-}
-
-/** True when the parsed suite syntactically reaches a product-deletion entrypoint. */
-function reachesProductDeletion(path: string, source: string): boolean {
-  const file = ts.createSourceFile(path, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
-  const modules: string[] = [];
-  const calls: { name: string; receiver: string | undefined; args: string[] }[] = [];
-  const visit = (node: ts.Node): void => {
-    if (ts.isImportDeclaration(node)) {
-      const clause = node.importClause, bindings = clause?.namedBindings;
-      const typeOnly = clause?.isTypeOnly || (!clause?.name && bindings && ts.isNamedImports(bindings)
-        && bindings.elements.length > 0 && bindings.elements.every((entry) => entry.isTypeOnly));
-      if (!typeOnly && ts.isStringLiteralLike(node.moduleSpecifier)) modules.push(node.moduleSpecifier.text);
-    } else if (ts.isExportDeclaration(node) && !node.isTypeOnly && node.moduleSpecifier
-      && ts.isStringLiteralLike(node.moduleSpecifier)) modules.push(node.moduleSpecifier.text);
-    if (ts.isCallExpression(node)) {
-      const callee = node.expression;
-      const first = node.arguments[0];
-      if ((callee.kind === ts.SyntaxKind.ImportKeyword || (ts.isIdentifier(callee) && callee.text === "require"))
-        && first && ts.isStringLiteralLike(first)) modules.push(first.text);
-      const name = ts.isIdentifier(callee) ? callee.text : ts.isPropertyAccessExpression(callee) ? callee.name.text : "";
-      const target = ts.isPropertyAccessExpression(callee) ? callee.expression : undefined;
-      const receiver = target && ts.isPropertyAccessExpression(target) ? target.name.text
-        : target && ts.isIdentifier(target) ? target.text : undefined;
-      if (name) calls.push({ name, receiver, args: node.arguments.flatMap((arg) => literals(arg)) });
-    }
-    ts.forEachChild(node, visit);
-  };
-  visit(file);
-  const imports = (...needles: string[]) => modules.some((m) => {
-    const module = m.replace(/\.[cm]?[jt]s$/, "");
-    return needles.some((needle) => module === needle || module.endsWith("/" + needle));
-  });
-  if (imports(...productDeletionMarkers)) return true;
-  const managerImport = imports("actors/manager", "actors/directory", "fabric-actors");
-  const meshImport = imports("mesh/store", "mesh/bridge");
-  return calls.some(({ name, receiver, args }) => deletionCalls.has(name)
-    || (name === "remove" && (managerImport || receiver === "actors" || receiver === "manager"))
-    || (meshImport && meshCalls.has(name))
-    || (execCalls.has(name) && (args.some((arg) => arg.includes("fabric-win-remove"))
-      || (args.includes("--apply") && args.some((arg) => arg.includes("retention"))))));
-}
-
-/** Sorted `tests/<relative>` paths of `.test.ts` files under testRoot reaching product deletion; [] on GitHub Actions. */
-export function productDeletionSuites(testRoot = fileURLToPath(new URL("./tests", import.meta.url))): string[] {
-  if (process.env.GITHUB_ACTIONS === "true") return [];
-  const found: string[] = [];
-  const walk = (dir: string): void => {
-    for (const entry of readdirSync(dir, { withFileTypes: true })) { // Dirent types never follow symlinks
-      const path = join(dir, entry.name);
-      if (entry.isSymbolicLink() && statSync(path).isDirectory()) {
-        throw new Error(`smarty-dev#4664: cannot scan symlinked test directory: ${path}`);
-      }
-      if (entry.isDirectory()) walk(path);
-      else if (entry.name.endsWith(".test.ts") && (entry.isFile() || entry.isSymbolicLink())) {
-        const source = readFileSync(path, "utf8"); // Unreadable sources stop config evaluation, not bypass the scan.
-        if (reachesProductDeletion(path, source)) {
-          found.push(`tests/${relative(testRoot, path).split(sep).join("/")}`);
-        }
-      }
-    }
-  };
-  walk(testRoot);
-  return found.sort();
+/** Unguarded or reverted deletion suites stay hosted-only; GitHub Actions always collects every suite. */
+export function productDeletionSuites(): string[] {
+  return process.env.GITHUB_ACTIONS === "true" ? [] : [...hostedOnlyDeletionSuites];
 }
 
 const localRealDeleteSuites = productDeletionSuites();
 if (localRealDeleteSuites.length > 0) {
-  console.warn(`smarty-dev#4664: local run skips ${localRealDeleteSuites.length} product-deletion suites`);
+  console.warn(`smarty-dev#4664: local run skips ${localRealDeleteSuites.length} native/tool or reverted deletion suites`);
 }
 
 // Separate policy projects avoid writing a fixture read by unrelated config tests.

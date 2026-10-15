@@ -67,7 +67,9 @@ vi.mock("@nats-io/jetstream", () => ({
   DeliverPolicy: { All: "all", StartSequence: "by_start_sequence" },
   JetStreamApiError: fake.FakeJetStreamApiError,
   StorageType: { File: "file" },
-  jetstream: () => ({
+  jetstream: (...args: unknown[]) => {
+    fake.log.push({ op: "jetstream", args });
+    return {
     publish: async (...args: unknown[]) => {
       fake.log.push({ op: "publish", args });
       if (fake.publishErrors.length > 0) throw fake.publishErrors.shift();
@@ -75,16 +77,23 @@ vi.mock("@nats-io/jetstream", () => ({
     },
     consumers: { get: async (...args: unknown[]) => {
       fake.log.push({ op: "consumer", args });
-      fake.consumerOptions.push(structuredClone(args[1]));
+      const options = structuredClone(args[1]);
+      fake.consumerOptions.push(options);
+      // Bind the reply to this request before waiting: an abandoned get must not steal a later get's outcome.
+      const error = fake.consumerErrors.shift();
       const delay = fake.consumerDelays.shift() ?? 0;
       if (delay > 0) await new Promise<void>(resolve => setTimeout(resolve, delay));
-      if (fake.consumerErrors.length > 0) throw fake.consumerErrors.shift();
-      return { consume: async () => ({
-        async *[Symbol.asyncIterator]() { if (fake.consumeIteratorError !== undefined) throw fake.consumeIteratorError; },
-        close: async () => undefined,
-      }) };
+      if (error !== undefined) throw error;
+      return { consume: async () => {
+        fake.log.push({ op: "consumerConsume", args: [options] });
+        return {
+          async *[Symbol.asyncIterator]() { if (fake.consumeIteratorError !== undefined) throw fake.consumeIteratorError; },
+          close: async () => undefined,
+        };
+      } };
     } },
-  }),
+    };
+  },
   jetstreamManager: async () => {
     fake.log.push({ op: "managerInfo", args: [] });
     if (fake.managerErrors.length > 0) throw fake.managerErrors.shift();
@@ -475,9 +484,20 @@ describe("NATS stream placement budget (smarty-dev#12881)", () => {
   });
 });
 
-// smarty-dev#12900: consumer create answered 10059 right after a real-cluster fresh stream was ready.
-describe("NATS fresh-stream consumer bootstrap budget (smarty-dev#12900)", () => {
+// smarty-dev#12900 / #12881: fresh-stream 10059 and an R1 ephemeral assignment stuck on a paused stream peer.
+// Keep reason: recorded cluster catch and data safety; fake time reaches exact budgets/late orphan replies cheaply.
+describe("NATS initial ordered-consumer bootstrap budget (smarty-dev#12900)", () => {
   const notFound = () => new fake.FakeJetStreamApiError(10059);
+  const timeout = () => Object.assign(new Error("consumer create timed out"), { name: "TimeoutError" });
+  const prefixes = () => fake.consumerOptions.map(options => (options as { name_prefix: string }).name_prefix);
+  const activePrefixes = () => fake.log.filter(entry => entry.op === "consumerConsume")
+    .map(entry => (entry.args[0] as { name_prefix: string }).name_prefix);
+  const expectOrderedOptions = (afterSeq: number) => {
+    for (const options of fake.consumerOptions) {
+      expect(options).toEqual({ name_prefix: expect.stringMatching(/^[0-9a-f-]{36}$/), inactive_threshold: 10_000,
+        ...(afterSeq === 0 ? { deliver_policy: "all" } : { deliver_policy: "by_start_sequence", opt_start_seq: afterSeq + 1 }) });
+    }
+  };
   const ensure = (port: Awaited<ReturnType<typeof connectJetStream>>) => port.ensureStream(STREAM, SUBJECTS, { maxMsgSize: 1024 * 1024 });
   const settle = <T>(promise: Promise<T>) => {
     const state = { settled: false };
@@ -569,21 +589,26 @@ describe("NATS fresh-stream consumer bootstrap budget (smarty-dev#12900)", () =>
     expect(fake.consumerOptions).toHaveLength(3);
   });
 
-  it("bounds a pending retry by the shared deadline with stable options and the observed 10059 cause", async () => {
+  it("rotates pending retries within the shared deadline while preserving the observed fresh 10059 cause", async () => {
     vi.useFakeTimers();
     try {
       const port = await connectJetStream(SERVERS, withReplicas(1));
       await ensure(port);
       fake.consumerErrors.push(notFound());
-      fake.consumerDelays.push(0, 60_000);
+      fake.consumerDelays.push(0, ...Array.from({ length: 20 }, () => 60_000));
       const { state, result } = settle(port.consume(STREAM, 4, () => undefined));
       await vi.advanceTimersByTimeAsync(9_999);
       expect(state.settled).toBe(false);
       await vi.advanceTimersByTimeAsync(1);
       expect(await result).toMatchObject({ reason: "consumer-bootstrap-unavailable", natsErrCode: 10059 });
-      expect(fake.consumerOptions).toHaveLength(2);
-      expectStableOptions();
-      expect(fake.consumerOptions[0]).toMatchObject({ deliver_policy: "by_start_sequence", opt_start_seq: 5 });
+      expect(fake.consumerOptions).toHaveLength(10);
+      expect(prefixes()[0]).toBe(prefixes()[1]); // 10059 means no assignment: keep its name.
+      expect(new Set(prefixes())).toHaveProperty("size", 9);
+      expect(activePrefixes()).toEqual([]);
+      expectOrderedOptions(4);
+      await vi.advanceTimersByTimeAsync(60_000); // All abandoned successes arrive after the open has failed.
+      expect(fake.consumerOptions).toHaveLength(10); // No request starts at or after the deadline.
+      expect(activePrefixes()).toEqual([]);
     } finally { vi.useRealTimers(); }
   });
 
@@ -592,7 +617,7 @@ describe("NATS fresh-stream consumer bootstrap budget (smarty-dev#12900)", () =>
     try {
       const port = await connectJetStream(SERVERS, withReplicas(1));
       await ensure(port);
-      fake.consumerDelays.push(60_000);
+      fake.consumerDelays.push(...Array.from({ length: 20 }, () => 60_000));
       const { result } = settle(port.consume(STREAM, 0, () => undefined));
       await vi.advanceTimersByTimeAsync(10_000);
       const error = await result;
@@ -601,11 +626,18 @@ describe("NATS fresh-stream consumer bootstrap budget (smarty-dev#12900)", () =>
       expect((error as { natsErrCode?: unknown }).natsErrCode).toBeUndefined();
       expect((error as Error).message).not.toContain("10059");
       expect((error as Error).cause).toBeUndefined();
-      expect(fake.consumerOptions).toHaveLength(1);
+      expect(fake.consumerOptions).toHaveLength(10);
+      expect(new Set(prefixes())).toHaveProperty("size", 10);
+      expectOrderedOptions(0);
+      expect(activePrefixes()).toEqual([]);
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(fake.consumerOptions).toHaveLength(10); // Neither late replies nor the deadline renew the budget.
+      expect(activePrefixes()).toEqual([]);
     } finally { vi.useRealTimers(); }
   });
 
-  it("does not start a consumer request after its shared deadline has already elapsed", async () => {
+  it.each(["fresh", "existing"] as const)("does not start a consumer request after the %s ensure's shared deadline has elapsed", async source => {
+    if (source === "existing") seedStream(STREAM, 1, SUBJECTS);
     vi.useFakeTimers();
     try {
       const port = await connectJetStream(SERVERS, withReplicas(1));
@@ -661,6 +693,197 @@ describe("NATS fresh-stream consumer bootstrap budget (smarty-dev#12900)", () =>
       expect(fake.consumerOptions).toHaveLength(4);
       expectStableOptions();
     } finally { vi.useRealTimers(); }
+  });
+
+  it.each(["fresh", "existing"] as const)("rotates a first TimeoutError after a %s ensure and succeeds with a new prefix", async source => {
+    if (source === "existing") seedStream(STREAM, 3, SUBJECTS);
+    vi.useFakeTimers();
+    try {
+      const port = await connectJetStream(SERVERS, withReplicas(3));
+      await ensure(port);
+      fake.consumerErrors.push(timeout());
+      const { result } = settle(port.consume(STREAM, 7, () => undefined));
+      await vi.advanceTimersByTimeAsync(100);
+      const consumer = await result as { stop(): Promise<void> };
+      expect(consumer).toMatchObject({ stop: expect.any(Function) });
+      expect(fake.consumerOptions).toHaveLength(2);
+      expect(prefixes()[1]).not.toBe(prefixes()[0]);
+      expect(activePrefixes()).toEqual([prefixes()[1]]);
+      expectOrderedOptions(7);
+      await consumer.stop();
+    } finally { vi.useRealTimers(); }
+  });
+
+  it.each(["fresh", "existing"] as const)("abandons a slow initial get after a %s ensure and never consumes its late reply", async source => {
+    if (source === "existing") seedStream(STREAM, 1, SUBJECTS);
+    vi.useFakeTimers();
+    try {
+      const port = await connectJetStream(SERVERS, withReplicas(1));
+      await ensure(port);
+      fake.consumerDelays.push(1_500);
+      const { state, result } = settle(port.consume(STREAM, 0, () => undefined));
+      await vi.advanceTimersByTimeAsync(999);
+      expect(state.settled).toBe(false);
+      expect(fake.consumerOptions).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(101);
+      expect(state.settled).toBe(true); // Old code must fail RED here, not hang awaiting the 1.5s get.
+      const consumer = await result as { stop(): Promise<void> };
+      expect(consumer).toMatchObject({ stop: expect.any(Function) });
+      expect(fake.consumerOptions).toHaveLength(2);
+      const [abandoned, accepted] = prefixes();
+      expect(accepted).not.toBe(abandoned);
+      expect(activePrefixes()).toEqual([accepted]);
+      await vi.advanceTimersByTimeAsync(400); // The abandoned get now resolves successfully.
+      expect(fake.consumerOptions).toHaveLength(2);
+      expect(prefixes().filter(prefix => prefix === abandoned)).toHaveLength(1);
+      expect(activePrefixes()).toEqual([accepted]);
+      // The actual options objects held by the SDK must also retain their original, distinct names.
+      const requests = fake.log.filter(entry => entry.op === "consumer");
+      expect((requests[0]!.args[1] as { name_prefix: string }).name_prefix).toBe(abandoned);
+      expect(requests[0]!.args[1]).not.toBe(requests[1]!.args[1]);
+      expectOrderedOptions(0);
+      expect(mutations().map(entry => entry.op)).toEqual(source === "fresh" ? ["add"] : []);
+      await consumer.stop();
+    } finally { vi.useRealTimers(); }
+  });
+
+  it.each(["fresh", "existing"] as const)("bounds persistent slow TimeoutErrors after a %s ensure at exactly 10s, not 15.2s", async source => {
+    if (source === "existing") seedStream(STREAM, 1, SUBJECTS);
+    vi.useFakeTimers();
+    try {
+      const port = await connectJetStream(SERVERS, withReplicas(1));
+      const startedAt = Date.now();
+      await ensure(port);
+      fake.consumerErrors.push(...Array.from({ length: 20 }, timeout));
+      fake.consumerDelays.push(...Array.from({ length: 20 }, () => 5_000));
+      const { state, result } = settle(port.consume(STREAM, 0, () => undefined));
+      await vi.advanceTimersByTimeAsync(9_999);
+      expect(state.settled).toBe(false);
+      expect(fake.consumerOptions).toHaveLength(10);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(Date.now() - startedAt).toBe(10_000);
+      expect(await result).toBeInstanceOf(MeshStateNatsUnavailableError);
+      expect(await result).toMatchObject({ reason: "consumer-bootstrap-unavailable", consumerBootstrap: true });
+      expect((await result as { natsErrCode?: unknown }).natsErrCode).toBeUndefined();
+      expect(new Set(prefixes())).toHaveProperty("size", 10);
+      expectOrderedOptions(0);
+      expect(activePrefixes()).toEqual([]);
+      await vi.advanceTimersByTimeAsync(5_200); // Late failures cannot start another request or consumer.
+      expect(fake.consumerOptions).toHaveLength(10);
+      expect(activePrefixes()).toEqual([]);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("does not apply the three-transport-failure bound to its own immediate TimeoutError rotations", async () => {
+    vi.useFakeTimers();
+    try {
+      const port = await connectJetStream(SERVERS, withReplicas(1));
+      await ensure(port);
+      fake.consumerErrors.push(...Array.from({ length: 200 }, timeout));
+      const { state, result } = settle(port.consume(STREAM, 0, () => undefined));
+      await vi.advanceTimersByTimeAsync(9_999);
+      expect(state.settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(await result).toMatchObject({ reason: "consumer-bootstrap-unavailable" });
+      expect(fake.consumerOptions).toHaveLength(100);
+      expect(new Set(prefixes())).toHaveProperty("size", 100);
+      expectOrderedOptions(0);
+      expect(activePrefixes()).toEqual([]);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("carries an existing stream's leader-readiness deadline into its first consumer without renewing it", async () => {
+    seedStream(STREAM, 3, SUBJECTS);
+    fake.leaderPolls = 1;
+    fake.infoDelays.push(0, 6_500);
+    fake.consumerDelays.push(...Array.from({ length: 20 }, () => 60_000));
+    vi.useFakeTimers();
+    try {
+      const port = await connectJetStream(SERVERS, withReplicas(3));
+      const startedAt = Date.now();
+      const { state, result } = settle(ensure(port).then(() => port.consume(STREAM, 0, () => undefined)));
+      await vi.advanceTimersByTimeAsync(6_499);
+      expect(fake.consumerOptions).toHaveLength(0);
+      await vi.advanceTimersByTimeAsync(3_500);
+      expect(state.settled).toBe(false);
+      expect(fake.consumerOptions).toHaveLength(4);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(Date.now() - startedAt).toBe(10_000);
+      expect(await result).toMatchObject({ reason: "consumer-bootstrap-unavailable" });
+      expect(new Set(prefixes())).toHaveProperty("size", 4);
+      expectOrderedOptions(0);
+      expect(activePrefixes()).toEqual([]);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("uses exactly the remaining 350ms placement/leader/consumer budget, not a renewed 1s attempt", async () => {
+    fake.addErrors.push(new fake.FakeJetStreamApiError(10005, 400));
+    fake.createdWithoutLeader = true;
+    fake.infoDelays.push(0, 50);
+    fake.consumerDelays.push(60_000);
+    vi.useFakeTimers();
+    try {
+      const port = await connectJetStream(SERVERS, { replicas: 3, placementTimeoutMs: 350 });
+      const startedAt = Date.now();
+      const { state, result } = settle(ensure(port).then(() => port.consume(STREAM, 0, () => undefined)));
+      await vi.advanceTimersByTimeAsync(349);
+      expect(state.settled).toBe(false);
+      expect(fake.consumerOptions).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(Date.now() - startedAt).toBe(350);
+      expect(await result).toBeInstanceOf(MeshStateNatsUnavailableError);
+      expect(await result).toMatchObject({ reason: "consumer-bootstrap-unavailable" });
+      expect((await result as { natsErrCode?: unknown }).natsErrCode).toBeUndefined();
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(fake.consumerOptions).toHaveLength(1);
+      expectOrderedOptions(0);
+      expect(activePrefixes()).toEqual([]);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("creates only its own options-based ordered ephemeral consumer and leaves the SDK/ordinary-read timeout unchanged", async () => {
+    seedStream(STREAM, 1, SUBJECTS);
+    vi.useFakeTimers();
+    try {
+      const port = await connectJetStream(SERVERS, withReplicas(1));
+      await ensure(port);
+      const consumer = await port.consume(STREAM, 0, () => undefined);
+      expect(fake.log.filter(entry => entry.op === "jetstream")).toHaveLength(1);
+      expect(fake.log.find(entry => entry.op === "jetstream")!.args).toHaveLength(1); // nc only; no timeout override.
+      expect(fake.consumerOptions).toEqual([{ name_prefix: expect.stringMatching(/^[0-9a-f-]{36}$/),
+        inactive_threshold: 10_000, deliver_policy: "all" }]); // No durable/name string or other timeout field.
+      fake.infoDelays.push(1_500);
+      const { state, result } = settle(port.lastSequence(STREAM));
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(state.settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(500);
+      expect(await result).toBe(7);
+      await consumer.stop();
+    } finally { vi.useRealTimers(); }
+  });
+
+  it.each([timeout(), notFound(), fake.wrappedTransient(), fake.permissionDenied()])(
+    "passes running consumer $name failures through without bootstrap retry or rotation", async fatal => {
+      const port = await connectJetStream(SERVERS, withReplicas(1));
+      await ensure(port);
+      fake.consumeIteratorError = fatal;
+      const errors: unknown[] = [];
+      const consumer = await port.consume(STREAM, 0, () => undefined, error => { errors.push(error); });
+      await vi.waitFor(() => expect(errors).toHaveLength(1));
+      expect(errors[0]).toMatchObject({ name: fatal.name, message: fatal.message });
+      expect(fake.consumerOptions).toHaveLength(1);
+      expect(activePrefixes()).toEqual([prefixes()[0]]);
+      await consumer.stop();
+    },
+  );
+
+  it("keeps a TimeoutError wrapping a permission failure fatal without rotating", async () => {
+    const port = await connectJetStream(SERVERS, withReplicas(1));
+    await ensure(port);
+    const fatal = Object.assign(timeout(), { cause: fake.permissionDenied() });
+    fake.consumerErrors.push(fatal);
+    await expect(port.consume(STREAM, 0, () => undefined)).rejects.toMatchObject({ name: fatal.name, message: fatal.message });
+    expect(fake.consumerOptions).toHaveLength(1);
   });
 
   it("keeps the placement reason for 10005 and the projector reason without a code", () => {

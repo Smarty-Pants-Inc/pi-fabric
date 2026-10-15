@@ -52,6 +52,7 @@ const primaryEntryPoints = [
 // path lets a session that loaded the previous index resolve delayed modules
 // after the installed package is replaced, while preserving lazy evaluation.
 const lazyEntryPoints = [
+  "src/actors/registry-payloads.ts",
   // Native installer bootstrap; never exposed as a guest authority grant.
   "src/actors/slot-authority.ts",
   // Import-only per-materialization claim parsing, not idle registration work.

@@ -6973,7 +6973,7 @@ export class ActorManager {
           committed.owned.some(actor => {
             const row = readback.actors!.find(row => row.id === actor.id);
             return !row || row.rootId !== actor.rootId || row.residency !== actor.residency || row.status !== actor.status ||
-              row.instructions !== actor.instructions || this.#lineage(row) !== this.#lineage(actor);
+              this.#registry.instructions(row) !== actor.instructions || this.#lineage(row) !== this.#lineage(actor);
           })) throw new Error("Actor registry release readback differs");
       options.assertHeld();
     }

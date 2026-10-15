@@ -82,7 +82,7 @@ const harness = () => {
   /** index.ts session_start: bootstrap, then activate only when shouldEagerlyActivate says so. */
   const sessionStart = async (state: FabricState, context: ExtensionContext): Promise<void> => {
     await state.bootstrap(context);
-    if (state.shouldEagerlyActivate(context)) await state.ensure(context);
+    if (await state.shouldEagerlyActivate(context)) await state.ensure(context);
   };
   const leaseAge = (hostId: string): number => {
     const updatedAt = readHostLeases(meshRoot).get(hostId)?.updatedAt;
@@ -186,7 +186,7 @@ describe("a Main's own heartbeat across reload and session replacement (smarty-d
 
     expect(state.bootstrapped).toBe(true);
     expect(state.config.mesh.announce).toBe(false);
-    expect(state.shouldEagerlyActivate(context)).toBe(false);
+    expect(await state.shouldEagerlyActivate(context)).toBe(false);
     expect(state.activated).toBe(false);
     expect(state.initialized).toBe(false);
     expect(readHostLeases(h.meshRoot).has(`session:${sessionId}`)).toBe(false);

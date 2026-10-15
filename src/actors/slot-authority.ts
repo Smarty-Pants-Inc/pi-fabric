@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
-import { readHostPolicy } from "../host-policy.js";
+import { readHostPolicy } from "../config.js";
 import type { MeshStore } from "../mesh/store.js";
 // Already in MeshStore's static backend closure; no new optional engine is loaded here.
 import { SqliteStateStore, type SqliteFileIdentity } from "../mesh/state-sqlite.js";

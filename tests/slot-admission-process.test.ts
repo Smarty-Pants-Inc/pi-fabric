@@ -38,7 +38,7 @@ const fixture = async () => {
   await build({ stdin: { contents: 'export { MeshStore } from "./mesh/store.js"; export { slotAdmissionFor } from "./actors/slot-admission.js";',
     resolveDir: sourceRoot, loader: "ts" }, outfile: bundle, bundle: true, format: "esm", platform: "node", target: "node24",
     plugins: [{ name: "installer-policy-fixture", setup(build) {
-      build.onResolve({ filter: /host-policy\.js$/ }, args => args.importer.endsWith("/actors/slot-authority.ts")
+      build.onResolve({ filter: /config\.js$/ }, args => args.importer.endsWith("/actors/slot-authority.ts")
         ? { path: "installer-policy-fixture", namespace: "fixture" } : undefined);
       build.onLoad({ filter: /.*/, namespace: "fixture" }, () => ({ contents:
         'import fs from "node:fs"; export const readHostPolicy = () => ({status:"valid",document:JSON.parse(fs.readFileSync(process.env.SLOT_FIXTURE_POLICY,"utf8"))});' }));

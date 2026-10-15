@@ -19,6 +19,9 @@ const TICKET = /^\d{24}-\d+-[a-f0-9-]+$/;
 const GATED_BUDGET_MS = 2000;
 // The head refreshes its receipt this often; the stall bound is at least four heartbeats.
 const HEARTBEAT_MS = 50;
+// smarty-dev#9805: how long the next waiter must itself see the head's receipt unchanged, with the canonical .lock
+// absent, before one bypass probe (five missed heartbeats; far below the ordinary 80% fallback).
+const FREE_LOCK_BYPASS_MS = 250;
 
 /** Whether any waiter's receipt is queued in `directory` (one readdir; an absent directory has none). A newcomer that
  * finds one queues behind it instead of barging (smarty-dev#9805). */
@@ -57,6 +60,12 @@ export class MeshLockTicket {
   readonly #gated: boolean;
   readonly #stallMs: number;
   readonly #passStalledHead: boolean;
+  readonly #bypassLock: string | undefined;
+  #nextAfterHead = false;
+  #queueHead: string | undefined;
+  #predecessorMtimeMs = 0;
+  #observedBeat: string | undefined;
+  #beatSeenAt = 0;
   #headCheckedAt = 0;
   #closed = false;
   #head = false;
@@ -72,8 +81,13 @@ export class MeshLockTicket {
 
   /** `passStalledHead` (smarty-dev#10516): pass a stalled head at any time, not only past 80% of the budget. Only for
    * a queue whose ticket closes when the lock is taken (SQLite state writes): there a stale head never holds the lock.
-   * A `.lock` holder keeps its receipt through its critical section, so a long hold would look stalled. */
-  constructor(root: string, token: string, budgetMs: number, options: { passStalledHead?: boolean } = {}) {
+   * A `.lock` holder keeps its receipt through its critical section, so a long hold would look stalled.
+   * `stalledHeadBypassLock` (smarty-dev#9805): the canonical `.lock` directory path. Only the waiter directly behind
+   * the head may then probe early, once its own observation of the head's receipt is unchanged for
+   * FREE_LOCK_BYPASS_MS AND that path is absent. Its ticket stays queued (the head's receipt is untouched), so a
+   * lost race returns it to its place and a resumed head keeps its priority; mkdir/rename stays the only exclusion. */
+  constructor(root: string, token: string, budgetMs: number,
+    options: { passStalledHead?: boolean; stalledHeadBypassLock?: string } = {}) {
     this.#directory = meshLockQueueDirectory(root);
     this.#root = root;
     // hrtime is a host-wide monotonic clock, unlike a wall clock that can step backwards.
@@ -84,6 +98,7 @@ export class MeshLockTicket {
     this.#gated = budgetMs >= GATED_BUDGET_MS;
     this.#stallMs = Math.min(2000, Math.max(4 * HEARTBEAT_MS, budgetMs * 0.1));
     this.#passStalledHead = options.passStalledHead === true;
+    this.#bypassLock = options.stalledHeadBypassLock;
     const namespace = path.dirname(this.#directory);
     // No external sibling exists for a filesystem root. Admission is optional: a
     // read-only parent or unsafe namespace must not break otherwise writable meshes.
@@ -111,6 +126,10 @@ export class MeshLockTicket {
     // Short (try) budgets keep the previous unconditional 80% fallback, head included.
     if (!this.#gated && Date.now() >= this.#fallbackAt) { this.close(); return true; }
     if (this.#head) { this.#heartbeat(); return true; }
+    // An earlier head can disappear while our immediate predecessor stays. Rediscover its promotion instead of
+    // caching index > 1 until that predecessor leaves; it may itself now be the stalled head (#9805).
+    if (this.#bypassLock !== undefined && !this.#nextAfterHead && this.#queueHead !== undefined &&
+      !fs.existsSync(path.join(this.#directory, this.#queueHead))) this.#predecessor = undefined;
     if (this.#predecessor !== undefined && this.#waitingOn(this.#predecessor)) return this.#holdBack();
     for (;;) {
       let names: string[];
@@ -122,6 +141,9 @@ export class MeshLockTicket {
       if (index < 0) { this.close(); return true; }
       if (index === 0) { this.#head = true; this.#predecessor = undefined; this.#heartbeat(true); return true; }
       this.#predecessor = names[index - 1]!;
+      // Receipt names are host-monotonic, so a predecessor at index 0 stays head until its receipt goes (watched).
+      this.#nextAfterHead = index === 1;
+      this.#queueHead = names[0];
       if (this.#waitingOn(this.#predecessor)) return this.#holdBack();
       // The predecessor was dead or stale and is now unlinked: look again.
     }
@@ -134,7 +156,7 @@ export class MeshLockTicket {
     const file = path.join(this.#directory, name);
     try {
       const stat = fs.lstatSync(file);
-      if (pidAlive(name) && Date.now() - stat.mtimeMs <= this.#staleMs) return true;
+      if (pidAlive(name) && Date.now() - stat.mtimeMs <= this.#staleMs) { this.#predecessorMtimeMs = stat.mtimeMs; return true; }
       // A receipt is a regular file (main unlinked it; an unlink never removes a directory): anything else is kept and
       // waited on, never handed to a recursive removal. verifiedRemove's `.retention-graveyard-*` never matches TICKET.
       if (!stat.isFile()) return true;
@@ -151,6 +173,7 @@ export class MeshLockTicket {
    * stalled: neither its heartbeat nor our first sight of it as head is within the stall bound. The second term
    * keeps a head that has only just taken over from being judged by its old creation time. */
   #holdBack(): boolean {
+    if (this.#bypassesFreeStalledHead()) return true;
     const now = Date.now();
     if (now < this.#fallbackAt) {
       // smarty-dev#10516: a stalled head otherwise holds every waiter to 80% of its budget, and most then time out in
@@ -170,6 +193,20 @@ export class MeshLockTicket {
     }
     this.close();
     return true;
+  }
+
+  /** smarty-dev#9805: true for one probe by the waiter directly behind the head, when THIS waiter has seen the head's
+   * receipt (name and mtime, from #waitingOn's stat) unchanged for FREE_LOCK_BYPASS_MS and the canonical .lock is
+   * absent. Never closes the ticket or touches the head's receipt. Any .lock entry, or any stat error other than
+   * ENOENT, holds back: a live holder is never bypassed. Evaluated only on the existing wake/poll; no new timer. */
+  #bypassesFreeStalledHead(): boolean {
+    if (this.#bypassLock === undefined || !this.#nextAfterHead || this.#predecessor === undefined) return false;
+    const at = performance.now();
+    const beat = `${this.#predecessor}:${this.#predecessorMtimeMs}`;
+    if (beat !== this.#observedBeat) { this.#observedBeat = beat; this.#beatSeenAt = at; return false; }
+    if (at - this.#beatSeenAt < FREE_LOCK_BYPASS_MS) return false;
+    try { fs.lstatSync(this.#bypassLock); return false; }
+    catch (error) { return (error as NodeJS.ErrnoException).code === "ENOENT"; }
   }
 
   /** The head (and the holder, until it releases) proves progress by its receipt's mtime. */

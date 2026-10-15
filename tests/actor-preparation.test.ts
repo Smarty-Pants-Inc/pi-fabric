@@ -142,13 +142,12 @@ describe("round-three accepted-work regressions (#3167)", () => {
   });
 });
 
-describe("round-four launch-preparation recovery (#3167)", () => {
+describe("terminal launch-preparation settlement (#9031)", () => {
   const scenarios = [false, true].flatMap((queued) => [false, true].flatMap((recreate) =>
-    (["text", "directive"] as const).map((responseMode) => ({ queued, recreate, responseMode }))));
-  it.each(scenarios)("durably retries confirmed-unlaunched auth (queued=$queued, recreate=$recreate, mode=$responseMode) exactly once", async ({ queued, recreate, responseMode }) => {
+    (["text", "directive"] as const).flatMap((responseMode) => [false, true].map(ask => ({ queued, recreate, responseMode, ask })))));
+  it.each(scenarios)("consumes auth timeout without retry (queued=$queued, recreate=$recreate, mode=$responseMode, ask=$ask)", async ({ queued, recreate, responseMode, ask }) => {
     const gate = deferred<void>();
     const authStarted = deferred<void>();
-    const recovered = deferred<void>();
     let calls = 0;
     let resolved = false;
     const { actors: before, agents: oldAgents, mesh, root } = setup({ preparationRetryMs: 1_000 }, 1, {
@@ -164,14 +163,10 @@ describe("round-four launch-preparation recovery (#3167)", () => {
     const blocker = queued ? await oldAgents.spawn({ task: "HANG", model: "provider/healthy" }) : undefined;
     cleanups.push(async () => { if (blocker) await oldAgents.stop(blocker.id); });
     const actor = await before.create({ name: "auth-recovery", model: "provider/stalled", instructions: "Reply", responseMode, coalesce: false });
-    const publish = mesh.publish.bind(mesh);
-    vi.spyOn(mesh, "publish").mockImplementation(async request => {
-      const event = await publish(request);
-      if (request.topic === "fabric.actor.output" && request.from?.id === actor.id) recovered.resolve();
-      return event;
-    });
     const launches = vi.spyOn(oldAgents, "run");
-    const accepted = before.tell(actor.id, "original accepted auth activation");
+    const answer = ask ? before.ask(actor.id, "original accepted auth activation").then(
+      message => message, error => error as Error) : undefined;
+    if (!ask) before.tell(actor.id, "original accepted auth activation");
     let receiptId: string | undefined;
     if (blocker) {
       await waitFor(() => before.status(actor.id).status === "waiting");
@@ -185,21 +180,22 @@ describe("round-four launch-preparation recovery (#3167)", () => {
     expect(before.status(actor.id)).toMatchObject({ status: "preparing", preparing: { phase: "launch" } });
     expect(before.status(actor.id).inFlightRun).toBeUndefined();
     await waitFor(() => before.inFlightCount() === 0);
-    expect(before.status(actor.id)).toMatchObject({ status: "queued", queued: 1 });
+    expect(before.status(actor.id).queued).toBe(0);
     const directory = path.dirname(actor.sessionFile!);
-    const queueFile = path.join(directory, fs.readdirSync(directory).find((file) => file.startsWith("queue-"))!);
-    const snapshot = fs.readFileSync(queueFile, "utf8");
-    expect(JSON.parse(snapshot).items).toEqual([expect.objectContaining({ id: accepted.messageId, attempts: 0, preparationAttempts: 1 })]);
-    expect(JSON.parse(snapshot).items[0].resumed).toBeUndefined();
+    expect(fs.readdirSync(directory).filter(file => file.startsWith("queue-"))).toEqual([]);
+    expect(before.messages(actor.id).filter(message => message.direction === "out" && message.error)).toHaveLength(1);
+    if (answer) {
+      const outcome = await answer;
+      if (queued && responseMode === "directive") expect(outcome).toMatchObject({ action: "silent", error: expect.stringMatching(/timed out/) });
+      else expect(outcome).toBeInstanceOf(Error);
+    }
     expect(resolved).toBe(false);
     expect(launches).toHaveBeenCalledTimes(1);
     if (receiptId) {
-      expect(await oldAgents.wait(receiptId)).toMatchObject({ status: "failed", launchPreparationTimeoutMs: 80 });
+      expect(await oldAgents.wait(receiptId)).toMatchObject({ status: "failed", error: expect.stringMatching(/timed out/) });
       expect(oldAgents.status(receiptId).status).toBe("failed");
     }
-    // Keep the exact timeout snapshot unexecuted while a slow healthy worker
-    // proves permit reuse. Recreation, not a one-second retry race, owns recovery.
-    if (recreate) before.pauseForRelease();
+    // A consumed activation never comes back while its auth promise is unresolved.
     // A fresh admission can use the released permit while the old auth promise is unresolved.
     const healthy = await oldAgents.spawn({ task: "healthy admission", model: "provider/healthy" });
     await oldAgents.wait(healthy.id);
@@ -209,8 +205,6 @@ describe("round-four launch-preparation recovery (#3167)", () => {
     let executions = launches;
     if (recreate) {
       await before.close(); await oldAgents.close();
-      // Recover the exact timeout snapshot, rather than relying on shutdown's memory.
-      fs.writeFileSync(queueFile, snapshot);
       agents = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
         workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(root, "recreated-runs"),
       });
@@ -220,25 +214,19 @@ describe("round-four launch-preparation recovery (#3167)", () => {
         { actorRoot: path.join(root, "actors"), persistent: true });
       cleanups.push(async () => { await actors.close(); await agents.close(); });
     }
-    // Recovery boots a real worker. Join its output event instead of giving a
-    // loaded Windows runner five seconds to finish startup and journal recovery.
-    // Vitest's existing test timeout remains the hang guard.
-    await recovered.promise;
-    await waitFor(() => actors.inFlightCount() === 0 && actors.status(actor.id).queued === 0);
+    await pause(150);
     expect(resolved).toBe(false);
-    expect(executions).toHaveBeenCalledTimes(recreate ? 1 : 2);
-    expect(actors.messages(actor.id).filter((message) => message.direction === "out" && !message.error)).toHaveLength(1);
-    if (receiptId && !recreate) expect(await agents.wait(receiptId)).toMatchObject({ status: "failed", launchPreparationTimeoutMs: 80 });
+    expect(executions).toHaveBeenCalledTimes(recreate ? 0 : 1);
+    expect(actors.messages(actor.id).filter((message) => message.direction === "out" && !message.error)).toHaveLength(0);
     resolved = true; gate.resolve(); await pause(150);
-    expect(executions).toHaveBeenCalledTimes(recreate ? 1 : 2);
-    expect(actors.status(actor.id)).toMatchObject({ status: "idle", queued: 0 });
+    expect(executions).toHaveBeenCalledTimes(recreate ? 0 : 1);
+    expect(actors.status(actor.id).queued).toBe(0);
     expect(actors.status(actor.id).preparing).toBeUndefined();
     expect(fs.readdirSync(directory).filter((file) => file.startsWith("queue-"))).toEqual([]);
     expect(agents.list().filter((run) => run.actorId === actor.id && run.status === "running")).toEqual([]);
-    expect(fs.readdirSync(path.join(root, recreate ? "recreated-runs" : "runs"))).toHaveLength(recreate ? 0 : queued ? 2 : 1);
   });
 
-  it.each([false, true])("exhausts a caller-owned ask preparation budget in one terminal failure and one alarm (queued: %s)", async (queued) => {
+  it.each([false, true])("settles caller-owned auth timeout once without preparation retries (queued: %s)", async (queued) => {
     const gate = deferred<void>();
     let calls = 0;
     const { actors, agents, notices } = setup({ preparationRetryMs: 30 }, 1, { preparePiModel: async (model) => {
@@ -255,29 +243,30 @@ describe("round-four launch-preparation recovery (#3167)", () => {
       await waitFor(() => actors.status(actor.id).status === "waiting");
       await agents.stop(blocker.id);
     }
-    await waitFor(() => calls === 4 && actors.inFlightCount() === 0 && actors.status(actor.id).queued === 0, 2_000);
+    await waitFor(() => calls === 1 && actors.inFlightCount() === 0 && actors.status(actor.id).queued === 0, 2_000);
     const failures = actors.messages(actor.id).filter((message) => message.direction === "out" && message.error);
-    expect(failures).toHaveLength(4); // Three retry diagnostics, followed by exactly one terminal settlement.
-    expect(failures.filter((message) => (message.data as { attempts?: number } | undefined)?.attempts !== undefined)).toHaveLength(3);
-    expect(notices).toHaveLength(1);
-    expect(notices[0]).toContain("Fabric host notice");
-    expect(actors.status(actor.id)).toMatchObject({ status: "failed", queued: 0, lastError: expect.stringMatching(/preparation.*timed out/i) });
+    expect(failures).toHaveLength(1);
+    expect(failures.filter((message) => (message.data as { attempts?: number } | undefined)?.attempts !== undefined)).toHaveLength(0);
+    expect(notices).toHaveLength(0);
+    expect(actors.status(actor.id)).toMatchObject({ queued: 0, lastError: expect.stringMatching(/preparation.*timed out/i) });
     expect(fs.readdirSync(path.dirname(actor.sessionFile!)).filter((file) => file.startsWith("queue-"))).toEqual([]);
     gate.resolve(); await pause(250);
-    expect(calls).toBe(4);
-    expect(run).toHaveBeenCalledTimes(4);
-    expect(notices).toHaveLength(1);
+    expect(calls).toBe(1);
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(notices).toHaveLength(0);
     expect(actors.messages(actor.id).filter((message) => message.direction === "out" && !message.error)).toEqual([]);
   });
 
   it("#816 retains work beyond the preparation budget and alarms once across owner recreation", async () => {
     const gate = deferred<void>();
     let calls = 0;
-    const { actors: before, agents: oldAgents, mesh, root, notices: beforeNotices } = setup({ preparationRetryMs: 20 }, 1, {
-      preparePiModel: async model => { calls++; await gate.promise; return model; },
-    });
+    let stalled = false;
+    const { actors: before, agents: oldAgents, mesh, root, notices: beforeNotices } = setup({ preparationRetryMs: 20,
+      resolvePiModel: async model => { if (stalled) { calls++; await gate.promise; } return model; },
+    }, 1);
     cleanups.push(async () => { gate.resolve(); });
     const actor = await before.create({ name: "pending-recreation", model: "provider/stalled", instructions: "Reply", responseMode: "text", coalesce: false });
+    stalled = true;
     const accepted = before.tell(actor.id, "preserve accepted work beyond preparation budget");
     await waitFor(() => calls >= 4 && before.inFlightCount() === 0);
     // smarty-dev#6509: a preparation that only timed out is a transient block: it expires and gets a probe.
@@ -294,13 +283,13 @@ describe("round-four launch-preparation recovery (#3167)", () => {
     const notices: string[] = [];
     const agents = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
       workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(root, "recreated-runs"),
-      preparePiModel: async model => { calls++; await gate.promise; return model; },
     });
     const run = vi.spyOn(agents, "run");
     const after = new ActorManager("preparation", { id: "session:preparation", name: "main", kind: "main" }, mesh,
       { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 }, agents, delivery => {
         if (delivery.message.source === "fabric-host") notices.push(delivery.message.text ?? "");
-      }, { actorRoot: path.join(root, "actors"), persistent: true, preparationTimeoutMs: 80, preparationRetryMs: 20 });
+      }, { actorRoot: path.join(root, "actors"), persistent: true, preparationTimeoutMs: 80, preparationRetryMs: 20,
+        resolvePiModel: async model => { calls++; await gate.promise; return model; } });
     cleanups.push(async () => { await after.close(); await agents.close(); });
     await waitFor(() => calls >= 5 && after.inFlightCount() === 0);
     expect(after.status(actor.id)).toMatchObject({ status: "failing-preparation", queued: 1 });
@@ -309,7 +298,7 @@ describe("round-four launch-preparation recovery (#3167)", () => {
     expect(mesh.read({ topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, limit: 20 })).toHaveLength(1);
     gate.resolve();
     await waitFor(() => after.inFlightCount() === 0 && after.status(actor.id).queued === 0);
-    expect(run).toHaveBeenCalledTimes(2); // one timed-out setup, one confirmed worker
+    expect(run).toHaveBeenCalledTimes(1); // Only successful host setup reaches AgentManager.
     expect(after.messages(actor.id).filter(message => message.direction === "out" && !message.error)).toHaveLength(1);
     expect(after.status(actor.id)).toMatchObject({ status: "idle", queued: 0 });
     expect(after.status(actor.id).activationBlocked).toBeUndefined();

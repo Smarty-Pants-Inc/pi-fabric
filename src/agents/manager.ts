@@ -2639,8 +2639,6 @@ export class AgentManager {
     const record: AgentRunResult = {
       ...queued.info, task: queued.task, status,
       error: error instanceof Error ? error.message : String(error),
-      ...(status === "failed" && error instanceof AgentLaunchPreparationTimeoutError && error.launchOutcome === "unlaunched"
-        ? { launchPreparationTimeoutMs: error.timeoutMs } : {}),
       startedAt: queued.enqueuedAt, updatedAt: now, finishedAt: now,
       turns: 0, toolCalls: 0, text: "",
       usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },

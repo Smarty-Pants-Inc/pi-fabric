@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agents/manager.js";
+import { ENODEV_UNRESOLVED_REASON } from "../src/agents/enodev-recovery.js";
 import { ActorManager, ACTOR_FAILURE_NOTICE_AFTER } from "../src/actors/manager.js";
 import { ActorLogStore } from "../src/actors/log-store.js";
 import { ActorChildCompletionStore } from "../src/actors/child-completions.js";
@@ -129,8 +130,12 @@ afterEach(async () => {
 function fixture(snapshot = true, options: {
   preparePiModel?: (model: string | undefined) => Promise<string | void>;
   preparationTimeoutMs?: number;
+  preparationRetryMs?: number;
+  resolvePiModel?: (model: string) => string | Promise<string>;
+  seedRun?: (root: string) => void;
 } = {}): Fixture {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "actor-permit-watch-"));
+  options.seedRun?.(root);
   const admission = path.join(root, "actors", "admission.json");
   const agents = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents,
     enabled: true, runner: "pi", transport: "process", maxConcurrent: 1, budgetUsd: 0,
@@ -147,7 +152,9 @@ function fixture(snapshot = true, options: {
     { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 }, agents, delivery => { deliveries.push(delivery); }, {
       actorRoot: path.join(root, "actors"), persistent: true, retentionSweepMs: 20,
       canManageActor: () => ownership.owned,
+      ...(options.resolvePiModel ? { resolvePiModel: options.resolvePiModel } : {}),
       ...(options.preparationTimeoutMs !== undefined ? { preparationTimeoutMs: options.preparationTimeoutMs } : {}),
+      ...(options.preparationRetryMs !== undefined ? { preparationRetryMs: options.preparationRetryMs } : {}),
     });
   const actors = createActors();
   const f = { root, admission, agents, actors, deliveries, createActors, ownership };
@@ -288,12 +295,13 @@ describe("resident actor permit watch (#9031)", () => {
     ["launched-throw", "active"], ["launched-throw", "inherited"],
     ["cleanup-throw", "active"], ["cleanup-throw", "inherited"],
   ] as const)("%s activation consumes its %s child-handoff exactly once", async (outcome, placement) => {
-    let defer = placement === "inherited";
-    const f = fixture(true, { preparePiModel: async model => {
+    let defer = false;
+    const f = fixture(true, { resolvePiModel: async model => {
       if (defer) { defer = false; throw new Error("defer child before inference"); }
       return model;
     } });
-    const actor = await f.actors.create({ name: "child-handoff", instructions: "Respond", responseMode: "text", coalesce: false });
+    const actor = await f.actors.create({ name: "child-handoff", model: "provider/test", instructions: "Respond", responseMode: "text", coalesce: false });
+    defer = placement === "inherited";
     const run = f.agents.run.bind(f.agents);
     let returned: Awaited<ReturnType<typeof run>> | undefined;
     let cleanupThrown = false;
@@ -323,6 +331,7 @@ describe("resident actor permit watch (#9031)", () => {
         expect(store.received(childId)).toBe(true);
       });
       expect(store.handoffConsumed(childId)).toBe(false);
+      expect(f.agents.run).not.toHaveBeenCalled(); // Host-only binding failure retains context before the boundary.
       await f.actors.tell(actor.id, "activation carrying deferred child context");
     }
     const activation = await launched(f, actor.id);
@@ -527,7 +536,41 @@ describe("resident actor permit watch (#9031)", () => {
     expect(f.agents.status(handle.id)).not.toHaveProperty("errorCode", "WORKER_GONE");
   });
 
-  it("queued confirmed-unlaunched auth timeout retains its child handoff across ownership transfer and reload, then executes exactly once", async () => {
+  it("host-only binding timeout keeps its retry and handoff until agents.run owns the activation", async () => {
+    let release!: () => void;
+    const binding = new Promise<void>(resolve => { release = resolve; });
+    let stalled = false;
+    const f = fixture(true, { preparationTimeoutMs: 80, preparationRetryMs: 200, resolvePiModel: async model => {
+      if (stalled) await binding;
+      return model;
+    } });
+    try {
+      const actor = await f.actors.create({ name: "host-only-boundary", model: "provider/test", instructions: "Respond", responseMode: "text", coalesce: false });
+      stalled = true;
+      const runs = vi.spyOn(f.agents, "run");
+      const childId = "9".repeat(32);
+      const store = new ActorChildCompletionStore(actor.sessionFile!);
+      store.enqueue({ id: childId, name: "child", status: "completed", text: "host-only retained context",
+        startedAt: Date.now(), finishedAt: Date.now() } as Parameters<ActorChildCompletionStore["enqueue"]>[0],
+      { id: actor.id, kind: "actor", runId: "8".repeat(32) });
+      await eventually(() => {
+        expect(f.actors.inFlightCount()).toBe(0);
+        expect(f.actors.status(actor.id).queued).toBe(1);
+        expect(f.actors.messages(actor.id).some(message => (message.data as { phase?: string } | undefined)?.phase === "binding")).toBe(true);
+      });
+      expect(runs).not.toHaveBeenCalled();
+      expect(store.handoffConsumed(childId)).toBe(false);
+      expect(fs.existsSync(store.resultFile(childId))).toBe(true);
+      stalled = false; release();
+      const worker = await launched(f, actor.id);
+      expect(worker.record.task).toContain(store.resultFile(childId));
+      complete(worker);
+      await eventually(() => expect(store.handoffConsumed(childId)).toBe(true));
+      expect(runs).toHaveBeenCalledTimes(1);
+    } finally { stalled = false; release(); }
+  });
+
+  it.each([false, true])("auth timeout consumes child handoff across ownership transfer and reload (queued=%s)", async queued => {
     let releaseAuth!: () => void;
     const auth = new Promise<void>(resolve => { releaseAuth = resolve; });
     let authCalls = 0;
@@ -536,55 +579,58 @@ describe("resident actor permit watch (#9031)", () => {
       return model;
     } });
     try {
-      const blocker = await f.agents.spawn({ task: "hold admission", model: "provider/healthy" });
+      const blocker = queued ? await f.agents.spawn({ task: "hold admission", model: "provider/healthy" }) : undefined;
       const actor = await f.actors.create({ name: "unlaunched-owner", model: "provider/stalled",
         instructions: "Respond", responseMode: "text", coalesce: false });
       const run = f.agents.run.bind(f.agents);
       let timeoutReceipt: Awaited<ReturnType<typeof run>> | undefined;
       const runs = vi.spyOn(f.agents, "run").mockImplementation(async (...args) => {
-        const result = await run(...args);
-        if (result.launchPreparationTimeoutMs !== undefined) {
+        try {
+          const result = await run(...args);
           timeoutReceipt = result;
+          return result;
+        } finally {
           f.ownership.owned = false;
-          f.actors.resumeQueued(); // Transfer before ActorManager consumes the real terminal receipt.
+          f.actors.resumeQueued(); // Transfer at the real AgentManager return/throw boundary.
         }
-        return result;
       });
       const childId = "d".repeat(32);
       const store = new ActorChildCompletionStore(actor.sessionFile!);
       store.enqueue({ id: childId, name: "child", status: "completed", text: "original queued activation",
         startedAt: Date.now(), finishedAt: Date.now() } as Parameters<ActorChildCompletionStore["enqueue"]>[0],
       { id: actor.id, kind: "actor", runId: "e".repeat(32) });
-      await eventually(() => expect(f.actors.status(actor.id).status).toBe("waiting"));
-      const receiptId = f.actors.status(actor.id).preparing!.runId!;
-      await eventually(() => expect(snapshot(f).waiting).toHaveLength(1));
-      expect(authCalls).toBe(0);
-      complete([...workers.values()][0]!);
-      await f.agents.wait(blocker.id);
+      let receiptId: string | undefined;
+      if (blocker) {
+        await eventually(() => expect(f.actors.status(actor.id).status).toBe("waiting"));
+        receiptId = f.actors.status(actor.id).preparing!.runId!;
+        await eventually(() => expect(snapshot(f).waiting).toHaveLength(1));
+        expect(authCalls).toBe(0);
+        complete([...workers.values()][0]!);
+        await f.agents.wait(blocker.id);
+      }
       await eventually(() => {
-        expect(timeoutReceipt).toMatchObject({ id: receiptId, status: "failed", toolCalls: 0, launchPreparationTimeoutMs: 80 });
+        expect(authCalls).toBe(1);
         expect(f.actors.inFlightCount()).toBe(0);
+        expect(store.handoffConsumed(childId)).toBe(true);
       });
-      expect([...workers.values()]).toHaveLength(1); // Only the admission blocker launched.
-      expect(store.handoffConsumed(childId)).toBe(false);
-      expect(fs.existsSync(store.resultFile(childId))).toBe(true);
+      if (queued) expect(timeoutReceipt).toMatchObject({ id: receiptId, status: "failed", toolCalls: 0 });
+      else expect(timeoutReceipt).toBeUndefined(); // Direct admission threw before onSpawned.
+      expect([...workers.values()]).toHaveLength(queued ? 1 : 0);
+      expect(fs.existsSync(store.resultFile(childId))).toBe(false);
       await eventually(() => expect(snapshot(f).held).toEqual([]));
       const directory = path.dirname(actor.sessionFile!);
-      const queueFile = path.join(directory, fs.readdirSync(directory).find(file => /^queue-.*\.json$/.test(file))!);
-      expect(JSON.parse(fs.readFileSync(queueFile, "utf8")).items).toEqual([
-        expect.objectContaining({ id: childId, executionStarted: false, attempts: 0 }),
-      ]);
+      for (const file of fs.readdirSync(directory).filter(file => /^queue-.*\.json$/.test(file))) {
+        expect(JSON.parse(fs.readFileSync(path.join(directory, file), "utf8")).items).toEqual([]);
+      }
       await f.actors.close();
       f.actors = f.createActors();
       await ticks();
-      expect([...workers.values()]).toHaveLength(1);
+      expect([...workers.values()]).toHaveLength(queued ? 1 : 0);
       f.ownership.owned = true;
       f.actors.reclaim(actor.id);
       f.actors.resumeQueued();
-      const worker = await launched(f, actor.id);
-      expect(worker.record.task).toContain(store.resultFile(childId));
-      expect(store.handoffConsumed(childId)).toBe(false);
-      complete(worker);
+      await ticks();
+      expect(runs).toHaveBeenCalledTimes(1);
       await eventually(() => {
         expect(f.actors.inFlightCount()).toBe(0);
         expect(f.actors.status(actor.id).queued).toBe(0);
@@ -595,12 +641,81 @@ describe("resident actor permit watch (#9031)", () => {
       await f.actors.close();
       f.actors = f.createActors();
       await ticks();
-      expect(runs).toHaveBeenCalledTimes(2); // One unlaunched receipt, one actual activation.
-      expect([...workers.values()].filter(candidate => candidate.record.task.includes(store.resultFile(childId)))).toHaveLength(1);
-      expect(f.actors.messages(actor.id).filter(message => message.direction === "out" && !message.error)).toHaveLength(1);
+      expect(runs).toHaveBeenCalledTimes(1); // No activation or context replay.
+      expect([...workers.values()].filter(candidate => candidate.record.task.includes(store.resultFile(childId)))).toHaveLength(0);
+      expect(new ActorChildCompletionStore(actor.sessionFile!).handoffConsumed(childId)).toBe(true);
     } finally {
       releaseAuth();
     }
+  });
+
+  it.each(["direct", "enodev"] as const)("worker-written timeout metadata on %s return before onSpawned never retains/replays handoff", async mode => {
+    if (mode === "enodev" && process.platform !== "linux") return; // Linux-only legacy recovery contract.
+    const runId = "a".repeat(32);
+    const childId = "f".repeat(32);
+    const f = fixture(true, { seedRun: mode === "enodev" ? root => {
+      const directory = path.join(root, "runs", runId);
+      fs.mkdirSync(directory, { recursive: true });
+      fs.writeFileSync(path.join(directory, "unresolved-worker.json"), JSON.stringify({ reason: ENODEV_UNRESOLVED_REASON }));
+      fs.writeFileSync(path.join(directory, "status.json"), "{}");
+      fs.writeFileSync(path.join(directory, "task.txt"), `  "id": "${childId}"\n`);
+      fs.writeFileSync(path.join(directory, "settlement.json"), JSON.stringify({ version: 1, runId, outcome: "completed", text: "saved answer" }));
+    } : undefined });
+    const actor = await f.actors.create({ name: "early-timeout-marker", instructions: "Respond", responseMode: "text", coalesce: false });
+    const store = new ActorChildCompletionStore(actor.sessionFile!);
+    if (mode === "enodev") fs.writeFileSync(path.join(f.root, "runs", runId, "status.json"), JSON.stringify({
+      id: runId, actorId: actor.id, name: "legacy", task: "legacy", status: "running", runner: "pi", transport: "process",
+      sessionId: "999999999", cwd: process.cwd(), startedAt: Date.now(), updatedAt: Date.now(), turns: 0, toolCalls: 0,
+      text: "", launchPreparationTimeoutMs: 80, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
+    }));
+    // Withhold only the observer: AgentManager.run/spawn/wait and native custody stay real.
+    const spawn = f.agents.spawn.bind(f.agents);
+    const spawns = vi.spyOn(f.agents, "spawn").mockImplementation((request, signal, authorize, beforeCommit, downgrade, _onSpawned, preparation, address) =>
+      spawn(request, signal, authorize, beforeCommit, downgrade, undefined, preparation, address));
+    const run = f.agents.run.bind(f.agents);
+    let returned: Awaited<ReturnType<typeof run>> | undefined;
+    const runs = vi.spyOn(f.agents, "run").mockImplementation(async (...args) => {
+      // Recovery is eligible only for a restored activation's host request identity.
+      if (mode === "enodev") args[0] = { ...args[0], activationId: childId };
+      const result = await run(...args);
+      returned = result;
+      expect(f.actors.status(actor.id).inFlightRun).toBeUndefined();
+      f.ownership.owned = false;
+      f.actors.resumeQueued();
+      return result;
+    });
+    store.enqueue({ id: childId, name: "child", status: "completed", text: "early-return handoff",
+      startedAt: Date.now(), finishedAt: Date.now() } as Parameters<ActorChildCompletionStore["enqueue"]>[0],
+    { id: actor.id, kind: "actor", runId: "c".repeat(32) });
+    if (mode === "direct") {
+      await eventually(() => expect([...workers.values()]).toHaveLength(1));
+      const worker = [...workers.values()][0]!;
+      complete(worker);
+      save(worker, { launchPreparationTimeoutMs: 80 } as Partial<AgentRunRecord>);
+    }
+    await eventually(() => {
+      expect(returned).toHaveProperty("launchPreparationTimeoutMs", 80);
+      expect(f.actors.inFlightCount()).toBe(0);
+      expect(store.handoffConsumed(childId)).toBe(true);
+    });
+    if (mode === "enodev") { expect(returned).toHaveProperty("enodevRecovered", true); expect(spawns).not.toHaveBeenCalled(); }
+    expect(fs.existsSync(store.resultFile(childId))).toBe(false);
+    f.ownership.owned = true;
+    f.actors.reclaim(actor.id);
+    f.actors.resumeQueued();
+    await f.actors.close();
+    f.actors = f.createActors();
+    await ticks();
+    expect(runs).toHaveBeenCalledTimes(1);
+    expect(f.actors.status(actor.id).queued).toBe(0);
+    expect(new ActorChildCompletionStore(actor.sessionFile!).handoffConsumed(childId)).toBe(true);
+    runs.mockRestore(); spawns.mockRestore();
+    const answer = f.actors.ask(actor.id, "successor after early return");
+    const next = await launched(f, actor.id);
+    expect(next.record.task).not.toContain(store.resultFile(childId));
+    expect(next.record.task).not.toContain("early-return handoff");
+    complete(next);
+    await expect(answer).resolves.toMatchObject({ text: "finished" });
   });
 
   it.each(["running", "failed", "overflow", "overflow-zero", "forged-timeout"] as const)("%s loss/failure and ownership abort is consumed, never replayed on reclaim", async mode => {
@@ -624,7 +739,7 @@ describe("resident actor permit watch (#9031)", () => {
     save(worker, { toolCalls, ...(mode === "running" ? {} : {
       status: "failed", error: overflow ? "Context window exhausted" : "Ordinary terminal failure after side effect",
       ...(overflow ? { errorCode: "CONTEXT_OVERFLOW" } : {}),
-      ...(mode === "forged-timeout" ? { launchPreparationTimeoutMs: 80 } : {}),
+      ...(mode === "forged-timeout" ? { launchPreparationTimeoutMs: 80 } as object : {}),
     }) });
     worker.alive = false;
     worker.nativeClose();

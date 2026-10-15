@@ -27,7 +27,7 @@ import { MeshStore, meshOutageAlarmSink, type MeshBatchOperation, type MeshBatch
 import type { FabricMainAgentTarget } from "../main-agent.js";
 import type { FabricParticipantResidency } from "../topology/types.js";
 import { PARTICIPANT_NAME_PATTERN as ACTOR_NAME_PATTERN } from "../topology/participant-name.js";
-import { AgentLaunchPreparationTimeoutError, AgentManager } from "../agents/manager.js";
+import { AgentManager } from "../agents/manager.js";
 import type { AgentRunRecord, AgentRunRequest, AgentRunResult } from "../agents/types.js";
 import type { ModelRouteDecision } from "../agents/model-route.js";
 
@@ -705,7 +705,7 @@ export class ActorPreparationTimeoutError extends ActorPreparationError {
  * never for good. The existing preparation-timeout block is the retryable category. */
 const preparationRetryable = (error: unknown): boolean => {
   for (let cause: unknown = error, depth = 0; cause instanceof Error && depth < 4; cause = cause.cause, depth++) {
-    if (cause instanceof ActorPreparationTimeoutError || cause instanceof AgentLaunchPreparationTimeoutError || Boolean(isMeshWriteDeferred(cause))) return true;
+    if (cause instanceof ActorPreparationTimeoutError || Boolean(isMeshWriteDeferred(cause))) return true;
   }
   return false;
 };
@@ -4095,16 +4095,14 @@ export class ActorManager {
         const previousRunId = actor.lastRunId;
         let runCompleted = false;
         let runLost = false;
-        let runEffects = false;
-        let runFailed = false;
-        let enodevRecovered = false; // a saved answer handed back, not a run: nothing to protect from a repeat
+        let enodevRecovered = false; // Saved-answer delivery still uses the existing durable receipt protocol.
         let enodevDelivered = false; // its durable delivery receipt is written; commit after the queue ack
-        let handoffConsumed = false;
         // A run ended by a stop (agents.stop, a signal) is interrupted, not failing.
         let runStopped = false;
         let capabilityLease: FabricCapabilityViewLease | undefined;
         let committedRefs: string[] | undefined;
         let preLaunch = true;
+        let handedToAgentManager = false;
         let workerLaunched = false;
         let runEvidence: readonly string[] | undefined;
         const preparationAbort = new AbortController();
@@ -4175,15 +4173,14 @@ export class ActorManager {
           // the native session before handing its path to the process.
           this.#ensurePiSession(actor);
           if (actor.preparing) actor.preparing.phase = "launch";
-          preLaunch = false; // AgentManager bounds model/auth setup after (not during) permit waiting.
+          preLaunch = false; // AgentManager owns this activation, including admission failures before spawn.
+          handedToAgentManager = true;
           const result = await this.agents.run(
             { ...this.#runRequest(actor, item, launchBinding, inferenceContext, committedRefs, actor.capabilityDigest),
               ...(routeDecision ? { routeDecision } : {}) },
             abortController.signal,
             (handle) => {
-              // Host launch consumes the handoff even if this callback or run later throws.
               workerLaunched = true;
-              handoffConsumed = true;
               item.launchEvidenceVersion = 1;
               item.executionStarted = true;
               this.#persistQueue(actor.id);
@@ -4224,18 +4221,10 @@ export class ActorManager {
             } },
           );
           runId = result.id;
-          // Fail closed on every returned run except the audited, confirmed-unlaunched timeout.
-          // Capture this before output classification or ownership checks can throw.
-          handoffConsumed = !(!workerLaunched && result.launchPreparationTimeoutMs !== undefined);
           runCompleted = result.status === "completed";
           enodevRecovered = result.enodevRecovered === true;
           runStopped = result.status === "stopped";
           runLost = result.status === "failed" && result.errorCode === "WORKER_GONE";
-          // Returned activations are terminal without optional worker evidence too.
-          // A recovered ENODEV answer was not executed here and may still need parking.
-          runEffects = workerLaunched || (!enodevRecovered && handoffConsumed);
-          runFailed = result.status === "failed" &&
-            !(!workerLaunched && result.launchPreparationTimeoutMs !== undefined);
           runEvidence = result.warnings;
           // Worker status may diagnose overflow, but neither status nor logs authorize replay.
           const contextOverflow = result.status !== "completed" && result.errorCode === "CONTEXT_OVERFLOW" &&
@@ -4275,20 +4264,8 @@ export class ActorManager {
             this.#drop(actor, [item], `Fabric actor ${actor.name} (${actor.id}) halted by user interrupt`);
             continue;
           }
-          if (actor.ownershipAbort === abortController && result.status !== "completed" && !runEffects && !runFailed) {
-            // An ownership change stopped this run; the event runs again under its owner.
-            delete actor.ownershipAbort;
-            this.#park(actor, [item], `Fabric actor ${actor.name} (${actor.id}) ownership moved during a run`);
-            this.#scheduleRestoreParked();
-            continue;
-          }
           if (!this.#canManage(actor.id) && !contextOverflow) {
             throw new Error(`Fabric actor ownership moved during run: ${actor.id}`);
-          }
-          // A failed queue receipt is terminal, but is not an executed activation.
-          // Preserve typed, confirmed-unlaunched evidence before directive/text handling.
-          if (!workerLaunched && result.status === "failed" && result.launchPreparationTimeoutMs !== undefined) {
-            throw new AgentLaunchPreparationTimeoutError(result.launchPreparationTimeoutMs);
           }
           actor.lastRunId = result.id;
           if (result.contextUsage) {
@@ -4427,8 +4404,6 @@ export class ActorManager {
             );
           }
         } catch (error) {
-          // A thrown transport/cleanup error cannot erase host admission on ownership transfer.
-          runEffects ||= workerLaunched;
           const message = error instanceof Error ? error.message : String(error);
           if (actor.cancelAbort === abortController) {
             delete actor.cancelAbort;
@@ -4443,8 +4418,8 @@ export class ActorManager {
             // An ownership change cut the run off. An event without a caller is kept for
             // the next owner run instead of lost (smarty-dev#442); one whose run already
             // completed is recorded, not rerun, so its side effects do not repeat.
-            // A recovered ENODEV answer was never run here: park it, and the next owner recovers it (marker kept).
-            if (runLost || runEffects || runFailed || (runCompleted && !enodevRecovered)) this.#drop(actor, [item], message);
+            // Returned recovery and pre-spawn admission errors are consumed too.
+            if (handedToAgentManager) this.#drop(actor, [item], message);
             else {
               // #912 round 4: a resumed item refused before any launch spends no restart attempt, so count the
               // refusals: from the cap on it loses its parked-queue exemption, and its owner hears it once.
@@ -4456,10 +4431,8 @@ export class ActorManager {
           }
           // A finite unavailable-model error remains terminal, as before. Only a hung
           // resolver is retried; infrastructure failures have not consumed the activation.
-          const launchPreparationTimeout = !workerLaunched && error instanceof AgentLaunchPreparationTimeoutError &&
-            error.launchOutcome === "unlaunched";
-          const retryPreparation = launchPreparationTimeout || (preLaunch && (error instanceof ActorPreparationTimeoutError ||
-            (error instanceof ActorPreparationError && error.phase !== "binding")));
+          const retryPreparation = preLaunch && (error instanceof ActorPreparationTimeoutError ||
+            (error instanceof ActorPreparationError && error.phase !== "binding"));
           const callerless = !item.resolve && !item.reject;
           if (retryPreparation && (callerless || (item.preparationAttempts ?? 0) < ACTOR_PREPARATION_MAX_RETRIES) &&
             !abortController.signal.aborted && actor.status !== "stopped" && !this.#closing) {
@@ -4547,8 +4520,8 @@ export class ActorManager {
             delete actor.inFlightRun;
             actor.updatedAt = Date.now();
             if (actor.status !== "stopped") actor.status = actor.queue.length > 0 ? "queued" : "idle";
-            // Only positively unlaunched preparation failures may defer handoff context.
-            this.#finishInFlight(actor.id, item, handoffConsumed, runCompleted);
+            // Only host-only preparation before agents.run may retain handoff context.
+            this.#finishInFlight(actor.id, item, handedToAgentManager, runCompleted);
           }
           if (enodevDelivered && (!this.#persistent || this.#persistQueue(actor.id, true))) {
             try { this.agents.commitEnodevRecovery?.(runId!); } catch { /* the receipt settles it at the next start */ }
@@ -7189,11 +7162,11 @@ export class ActorManager {
     const deferred = this.#deferredHandoffs.get(actorId) ?? [];
     if (actor && item.source === "child-completion" && !consumed && !stillPending &&
         !deferred.some((pending) => pending.id === item.id)) {
-      // Retain the original facts and full archive outside the runnable FIFO.
+      // Host-only setup failed before AgentManager could create a worker.
       deferred.push({ ...item, deferredHandoff: true });
     }
     const consumedIds = new Set(consumed ? context.map((handoff) => handoff.id) : []);
-    if (item.source === "child-completion" && consumed && !stillPending) consumedIds.add(item.id);
+    if (item.source === "child-completion" && consumed) consumedIds.add(item.id);
     const kept = deferred.filter((handoff) => !consumedIds.has(handoff.id));
     if (kept.length) this.#deferredHandoffs.set(actorId, kept);
     else this.#deferredHandoffs.delete(actorId);

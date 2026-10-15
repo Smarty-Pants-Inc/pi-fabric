@@ -1,3 +1,4 @@
+import { interruptedModelStreamError } from "./provider-error.js";
 import fs from "node:fs";
 import * as nodeModule from "node:module";
 import path from "node:path";
@@ -75,6 +76,7 @@ export async function loadPiContextOverflow(binary: string): Promise<PiContextOv
       if (typeof native.isContextOverflow === "function") {
         const classify = native.isContextOverflow as (message: unknown, contextWindow?: number) => boolean;
         return (message, contextWindow) => {
+          if (typeof message.errorMessage === "string" && interruptedModelStreamError(message.errorMessage)) return false;
           try { return classify(message, contextWindow) === true; } catch { return false; }
         };
       }

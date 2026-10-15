@@ -8,11 +8,11 @@ import { PassThrough } from "node:stream";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MeshBridge, RemoteBridgeSide, serveBridgeAgent, StoreBridgeSide, type BridgePublish } from "../src/mesh/bridge.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
-import { FabricControlPlane } from "../src/topology/control-plane.js";
+import { FabricControlPlane, FabricControlStaleIncarnationError } from "../src/topology/control-plane.js";
 import { FABRIC_IDEMPOTENCY_KEY_REUSED, FabricIdempotencyKeyReusedError } from "../src/mesh/control-idempotency.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { readHostLease, writeHostLease } from "../src/topology/host-leases.js";
-import { writeParticipantFile } from "../src/topology/participant-files.js";
+import { readParticipantFile, writeParticipantFile } from "../src/topology/participant-files.js";
 
 const removals = vi.hoisted(() => [] as string[]);
 vi.mock("../src/topology/host-leases.js", async importOriginal => {
@@ -108,10 +108,11 @@ const fixture = async (hook?: RelayHook, targetToken?: string) => {
   const drain = async (): Promise<void> => { for (const link of links) await link.bridge.step(); };
   return { dir, stores, mains, links, drain };
 };
-const senderFor = (f: Awaited<ReturnType<typeof fixture>>) => {
+const senderFor = (f: Awaited<ReturnType<typeof fixture>>, mirrorLeaseWaitMs?: number) => {
   const a = f.stores.ryzen3!, source = f.mains.ryzen3!;
   const directory = new ParticipantDirectory(a, { enabled: true, hostId: source.identity.id, rootId: source.identity.id, identity: source.identity });
   const sender = new FabricControlPlane(a, source.identity, { enabled: true, hostId: source.identity.id,
+    ...(mirrorLeaseWaitMs !== undefined ? { mirrorLeaseWaitMs } : {}),
     readMirroredOwner: (...args) => directory.mirroredControlOwner(...args) });
   sender.start(() => ({ accepted: false }));
   closers.push(() => sender.close());
@@ -456,11 +457,11 @@ describe("local singleton relay data safety", () => {
     expect(sender.relayAcknowledgementRecoverySnapshot()).toMatchObject({ retained: 0, acknowledged: 0 });
   });
 
-  it("recovers the real owner ACK consumed at A after refusal but BEFORE same-key retry registration", async () => {
+  it.each(["fresh", "bridge-stale"] as const)("recovers the real owner ACK consumed at A before same-key retry registration (%s mirror)", async mirrorState => {
     let calls = 0;
     const f = await fixture(async deliver => { await deliver(); if (++calls === 1) throw unavailable(); });
     const a = f.stores.ryzen3!, b = f.stores.ryzen2!, hub = f.stores.ryzen1!, target = f.mains.ryzen2!;
-    const sender = senderFor(f), marker = "local-relay-ack-before-retry-private-body";
+    const sender = senderFor(f, 25), marker = "local-relay-ack-before-retry-private-body";
     const input = { message: marker, data: { marker }, ownerIncarnation: target.ownerIncarnation };
     const options = { routedRemoteHost: "ryzen2", idempotencyKey: "ack-before-retry-stable-key" };
     const receiver = new FabricControlPlane(b, target.identity, { enabled: true, hostId: target.identity.id, ownerIncarnation: target.ownerIncarnation });
@@ -479,6 +480,13 @@ describe("local singleton relay data safety", () => {
     await f.drain(); await f.drain();
     await vi.waitFor(() => expect(sender.relayAcknowledgementRecoverySnapshot().acknowledged).toBe(1));
     expect(events(a, "fabric.control.ack")).toHaveLength(2); // refusal + ordinary owner ACK
+    if (mirrorState === "bridge-stale") {
+      const lease = readHostLease(a.root, target.identity.id)!;
+      expect(lease.mirror).toBeDefined();
+      const expiredAt = Date.now() - 1;
+      writeHostLease(a.root, { ...lease, expiresAt: expiredAt,
+        mirror: { ...lease.mirror!, observedAt: expiredAt - 15_000 } });
+    }
     let result: Awaited<ReturnType<typeof sender.request>> | undefined;
     const retry = sender.request(target.identity.id, target.identity.id, "followUp", input, target.identity.id, options)
       .then(value => { result = value; return value; });
@@ -489,6 +497,15 @@ describe("local singleton relay data safety", () => {
     expect(events(b, "fabric.control.command")).toHaveLength(1);
     expect(receive).toHaveBeenCalledOnce();
     expect(calls).toBe(1);
+    if (mirrorState === "bridge-stale") {
+      // A cache miss still needs #1070's fresh mirror admission; no second append or handler run.
+      await expect(sender.request(target.identity.id, target.identity.id, "followUp", input, target.identity.id,
+        { ...options, idempotencyKey: "uncached-stale-mirror-key" }))
+        .rejects.toMatchObject({ name: "FabricPeerLeaseStaleError" });
+      expect(events(a, "fabric.control.command")).toHaveLength(1);
+      expect(events(b, "fabric.control.command")).toHaveLength(1);
+      expect(receive).toHaveBeenCalledOnce();
+    }
     expect(markerFiles(a.root, marker).length).toBeGreaterThan(0);
     expect(markerFiles(b.root, marker).length).toBeGreaterThan(0);
     expect(markerFiles(hub.root, marker)).toEqual([]);
@@ -614,8 +631,20 @@ describe("local singleton relay data safety", () => {
     await expect(sender.request(target.identity.id, target.identity.id, "followUp", input, target.identity.id, options))
       .resolves.toMatchObject({ acknowledged: true, messageId: "genuine-late-owner" });
     expect(events(a, "fabric.control.command")).toHaveLength(1);
-    // Same key with a newly resolved activation must NOT consume the old cached epoch.
     const newEpoch = "fixture:newly-resolved-owner";
+    // An input epoch alone is not authority: #1070 revalidates it against the mirrored directory.
+    await expect(sender.request(target.identity.id, target.identity.id, "followUp", { ...input, ownerIncarnation: newEpoch }, target.identity.id, options))
+      .rejects.toBeInstanceOf(FabricControlStaleIncarnationError);
+    expect(events(a, "fabric.control.command")).toHaveLength(1);
+    // Publish the real replacement activation at its origin, then mirror it through both links.
+    const b = f.stores.ryzen2!, participantKey = key("topology/participants/", target.identity.id);
+    const participant = readParticipantFile(b.root, participantKey)!;
+    const updatedAt = Date.now();
+    writeParticipantFile(b.root, { ...participant, version: participant.version + 1, updatedAt,
+      value: { ...(participant.value as Record<string, unknown>), ownerIncarnation: newEpoch, updatedAt } });
+    await f.drain();
+    expect(a.get(participantKey, { fresh: true })?.value).toMatchObject({ ownerIncarnation: newEpoch });
+    // Same key with this newly resolved activation must NOT consume the old cached epoch.
     const changed = sender.request(target.identity.id, target.identity.id, "followUp", { ...input, ownerIncarnation: newEpoch }, target.identity.id, options);
     void changed.catch(() => undefined);
     await vi.waitFor(() => expect(events(a, "fabric.control.command")).toHaveLength(2));

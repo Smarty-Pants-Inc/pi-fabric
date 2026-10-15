@@ -103,6 +103,8 @@ export interface FabricParticipantRecord {
 export interface FabricParticipantInfo extends FabricParticipantRecord {
   local: boolean;
   stale: boolean;
+  /** Retained remote routing attribution; transport freshness is unknown, not owner death. */
+  bridgeStale?: true;
 }
 
 export interface FabricHostRecord {
@@ -124,6 +126,8 @@ export interface FabricHostRecord {
   remoteHost?: string;
   /** Trusted hub link carrying a re-export; remoteHost still names the origin. */
   bridgeVia?: string;
+  /** This projection requires a matching source-clock mirror lease; no legacy expiry fallback. */
+  mirrorLease?: 1;
 }
 
 export interface FabricParticipantListOptions {

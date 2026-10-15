@@ -960,6 +960,16 @@ export class AgentManager {
   readonly #queued = new Map<string, QueuedAgent>();
   readonly #queuedStarts = new Set<Promise<void>>();
   readonly #semaphore: AgentAdmission;
+  readonly #admissionSnapshotPath: string | undefined;
+  readonly #admissionOwners = new Map<string, {
+    actorId: string | null; actorName: string | null; runId: string;
+    acquiredAt: number; lastProgressAt: number; statusStamp?: string;
+  }>();
+  readonly #admissionWaiting = new Map<string, {
+    actorId: string | null; actorName: string | null; runId: string; since: number;
+  }>();
+  #admissionSnapshotTimer: NodeJS.Timeout | undefined;
+  #admissionSnapshotClosed = false;
   readonly #worktrees = new WorktreeManager();
   readonly #runRoot: string;
   readonly #managedTempRoot: boolean;
@@ -1110,6 +1120,8 @@ export class AgentManager {
       claudeBinary?: string;
       vedaBinary?: string;
       runRoot?: string;
+      /** Host-only, read-only projection of this manager's native admission pool. */
+      admissionSnapshotPath?: string;
       fullCodeMode?: boolean;
       kernel?: () => FabricKernel;
       pythonRuntime?: () => FabricPythonRuntime;
@@ -1155,6 +1167,7 @@ export class AgentManager {
     } = {},
   ) {
     this.#semaphore = new AgentAdmission(config.maxConcurrent, Infinity, config.maxDepth);
+    this.#admissionSnapshotPath = options.admissionSnapshotPath;
     this.#managedTempRoot = options.runRoot === undefined && process.env.PI_FABRIC_RUN_ROOT === undefined;
     this.#runRoot =
       options.runRoot ?? process.env.PI_FABRIC_RUN_ROOT ?? fs.mkdtempSync(path.join(fabricDataRoot(), "pi-fabric-runs-"));
@@ -1236,6 +1249,72 @@ export class AgentManager {
       markRunRootActive(this.#runRoot);
       // Allocate ownership now; scan only on actual agent use or close.
     }
+    // Replace a previous host's projection immediately, not behind a pending debounce.
+    this.#flushAdmissionSnapshot();
+  }
+
+  #scheduleAdmissionSnapshot(): void {
+    if (!this.#admissionSnapshotPath) return;
+    // A late native exit can discharge custody after close returned/failed.
+    if (this.#admissionSnapshotClosed) { this.#flushAdmissionSnapshot(); return; }
+    if (this.#admissionSnapshotTimer) return;
+    // One bounded, coalesced write; observations never create a progress timer.
+    this.#admissionSnapshotTimer = setTimeout(() => this.#flushAdmissionSnapshot(), 25);
+    this.#admissionSnapshotTimer.unref();
+  }
+
+  #flushAdmissionSnapshot(): void {
+    if (this.#admissionSnapshotTimer) clearTimeout(this.#admissionSnapshotTimer);
+    this.#admissionSnapshotTimer = undefined;
+    if (!this.#admissionSnapshotPath) return;
+    try {
+      writeJsonAtomic(this.#admissionSnapshotPath, {
+        format: 1, writtenAt: Date.now(), cap: this.#semaphore.concurrency,
+        held: [...this.#admissionOwners.values()].map(({ statusStamp: _stamp, ...owner }) => owner),
+        waiting: [...this.#admissionWaiting.values()],
+      });
+    } catch { /* Observability must never affect admission or native custody. */ }
+  }
+
+  #ownAdmission(
+    info: { id: string; actorId?: string | undefined; actorName?: string | undefined },
+    release: () => void,
+  ): () => void {
+    if (!this.#admissionSnapshotPath) return release;
+    const now = Date.now();
+    this.#admissionWaiting.delete(info.id);
+    this.#admissionOwners.set(info.id, {
+      actorId: info.actorId ?? null, actorName: info.actorName ?? null,
+      runId: info.id, acquiredAt: now, lastProgressAt: now,
+    });
+    this.#scheduleAdmissionSnapshot();
+    return once(() => {
+      // Follow the actual permit, not logical settlement or actor running state.
+      try { release(); }
+      finally {
+        this.#admissionOwners.delete(info.id);
+        this.#scheduleAdmissionSnapshot();
+      }
+    });
+  }
+
+  #noteAdmissionProgress(id: string): void {
+    const owner = this.#admissionOwners.get(id);
+    if (!owner) return;
+    owner.lastProgressAt = Math.max(owner.lastProgressAt, Date.now());
+    this.#scheduleAdmissionSnapshot();
+  }
+
+  #observeAdmissionStatus(id: string, record: AgentRunRecord): void {
+    const owner = this.#admissionOwners.get(id);
+    if (!owner) return;
+    // Bounded metadata only: no prompt/output retention, and no polling-time stamp.
+    const stamp = JSON.stringify([record.updatedAt, record.status, record.turns, record.toolCalls,
+      record.currentTool, record.currentToolStartedAt, record.runnerSessionId,
+      record.usage.input, record.usage.output, record.usage.cacheRead, record.usage.cacheWrite, record.usage.cost]);
+    if (owner.statusStamp === stamp) return;
+    owner.statusStamp = stamp;
+    this.#noteAdmissionProgress(id);
   }
 
   /** This runtime's creation host, not a child participant's upstream owner. */
@@ -2298,7 +2377,10 @@ export class AgentManager {
       try { routeDispatch?.outcome({ status: admissionSignal.aborted ? "stopped" : "failed" }); } catch { /* storage does not block cancellation */ }
       throw error;
     }
-    if (release) return start(release).catch((error) => { release(); throw error; });
+    if (release) {
+      const ownedRelease = this.#ownAdmission({ id, actorId: request.actorId, actorName: request.actorName }, release);
+      return start(ownedRelease).catch((error) => { ownedRelease(); throw error; });
+    }
     return this.#enqueue({
       ...createRunRouteMetadata({ ...routeFacts, runner, transport: request.transport ?? this.config.transport }),
       id, name, status: "queued", runner, transport: request.transport ?? this.config.transport,
@@ -2335,11 +2417,16 @@ export class AgentManager {
     const queued: QueuedAgent = { info, task, enqueuedAt: Date.now(), abort, result, resolve, background: false,
       ...(routeOutcome ? { routeOutcome } : {}), ...(completionRecipient ? { completionRecipient } : {}) };
     this.#queued.set(info.id, queued);
+    if (this.#admissionSnapshotPath) {
+      this.#admissionWaiting.set(info.id, { actorId: info.actorId ?? null, actorName: info.actorName ?? null,
+        runId: info.id, since: queued.enqueuedAt });
+      this.#scheduleAdmissionSnapshot();
+    }
     const admission = this.#semaphore.acquire("native", signal);
     const pending = (async () => {
       let release: (() => void) | undefined;
       try {
-        release = await admission;
+        release = this.#ownAdmission(info, await admission);
         while (this.#releasePaused) await this.#waitForRelease(signal);
         if (signal.aborted) throw new Error("Agent launch aborted");
         await start(release, signal);
@@ -2527,6 +2614,7 @@ export class AgentManager {
   }
 
   #settleQueued(queued: QueuedAgent, status: "stopped" | "failed", error: unknown): void {
+    if (this.#admissionWaiting.delete(queued.info.id)) this.#scheduleAdmissionSnapshot();
     if (queued.terminal) return;
     this.#retentionRevision++;
     const now = Date.now();
@@ -3073,6 +3161,7 @@ export class AgentManager {
    * host-synthesized stop or transport-death record resets the counters to zero.
    */
   #observeProgress(managed: ManagedAgent, record: AgentRunRecord): void {
+    this.#observeAdmissionStatus(managed.id, record);
     const seen = managed.observedProgress;
     if (record.turns > seen.turns) seen.turns = record.turns;
     if (record.toolCalls > seen.toolCalls) seen.toolCalls = record.toolCalls;
@@ -3101,6 +3190,7 @@ export class AgentManager {
       if (deliveries.length) info.followUpDeliveries = deliveries;
       return info;
     }
+    this.#observeAdmissionStatus(managed.id, record);
     managed.latestRecord = record;
     if (!managed.latestUiRecord) {
       managed.latestUiRecord = compactUiRecord(record);
@@ -3873,7 +3963,17 @@ export class AgentManager {
         managed.onOutputPrincipalDowngrade?.();
       }
     }
-    fs.appendFileSync(steerFile, line, { encoding: "utf8", mode: 0o600 });
+    try {
+      fs.appendFileSync(steerFile, line, { encoding: "utf8", mode: 0o600 });
+    } catch (error) {
+      // Terminal cleanup may remove the journal between the preflight and append.
+      // If the receipt won that race, preserve the typed refusal instead of
+      // leaking the native ENOENT through the owner ACK.
+      if ((error as NodeJS.ErrnoException).code === "ENOENT" && this.#observeFinalAnswer(managed) && managed.finalAnswer) {
+        throw this.#terminalError(managed);
+      }
+      throw error;
+    }
     const undelivered = entry.type === "steer" || entry.type === "follow_up"
       ? this.#appendRaceRefusal(managed, messageId, entry.type === "steer" ? "steer" : "followUp") : undefined;
     return {
@@ -4011,6 +4111,9 @@ export class AgentManager {
     return this.#closePromise ??= this.#close().catch(error => {
       this.#closePromise = undefined; // retain exact custody for a later close retry
       throw error;
+    }).finally(() => {
+      this.#admissionSnapshotClosed = true;
+      this.#flushAdmissionSnapshot();
     });
   }
 
@@ -4704,6 +4807,7 @@ export class AgentManager {
     const receipt = readFinalAnswerReceipt(managed.runDirectory, managed.id);
     if (!receipt) return false;
     managed.finalAnswer = receipt; // Fence synchronous ingress before any validation yields.
+    this.#noteAdmissionProgress(managed.id);
     managed.finalAnswerCompletion = (async () => {
       let snapshot = readRecord(managed.statusFile) ?? managed.latestRecord;
       {
@@ -5358,23 +5462,29 @@ export class AgentManager {
         const parsed = JSON.parse(line) as Record<string, unknown>;
         if (parsed.version !== 1 || typeof parsed.occurredAt !== "number") continue;
         if (parsed.event === "message.refused") {
+          this.#noteAdmissionProgress(managed.id);
           this.#retainTerminalNotice(managed, parsed.data);
           continue;
         }
         if (parsed.event === "question") {
+          this.#noteAdmissionProgress(managed.id);
           this.#routeChildQuestion(managed, parsed.data);
           continue;
         }
         if (parsed.event === "tokens.usage") {
           if (!Object.prototype.hasOwnProperty.call(parsed, "data")) continue;
           const usage = tokenUsagePayloadFromValue(parsed.data);
-          if (usage) this.#onTokenUsage(managed, usage, parsed.occurredAt);
+          if (usage) {
+            this.#noteAdmissionProgress(managed.id);
+            this.#onTokenUsage(managed, usage, parsed.occurredAt);
+          }
           continue;
         }
         if (
           !isFabricLifecycleEventType(parsed.event) ||
           !parsed.event.startsWith("pi.")
         ) continue;
+        this.#noteAdmissionProgress(managed.id);
         this.#emitLifecycle(
           managed,
           parsed.event,
@@ -5486,6 +5596,7 @@ export class AgentManager {
     occurredAt: number,
     options: { status?: string; data?: unknown } = {},
   ): void {
+    if (event === "run.spawned" || event === "run.resumed") this.#noteAdmissionProgress(managed.id);
     if (!this.#onLifecycle) return;
     try {
       this.#onLifecycle({

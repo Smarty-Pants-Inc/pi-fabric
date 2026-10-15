@@ -30,6 +30,7 @@ import { MeshStore, type MeshEvent, type MeshIdentity } from "../src/mesh/store.
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { FabricPeerLeaseStaleError, PEER_LEASE_WAIT_MS } from "../src/agents/peer-lease-stale.js";
 import type { FabricInvocationContext } from "../src/protocol.js";
+import { readHostLease, writeHostLease } from "../src/topology/host-leases.js";
 
 const realSetTimeout = globalThis.setTimeout;
 const realNow = Date.now.bind(Date);
@@ -67,7 +68,7 @@ const addRoot = async (store: MeshStore, name: string, expiresIn = 60_000) => {
 };
 
 /** Hub "dev1" (sender) and far "forge" (live origin), joined by a real bridge that then goes silent. */
-const world = async () => {
+const world = async (waitMs?: number) => {
   let offset = 0;
   vi.spyOn(Date, "now").mockImplementation(() => realNow() + offset);
   const hub = new MeshStore(scratch(), 64 * 1024, 100), far = new MeshStore(scratch(), 64 * 1024, 100);
@@ -79,7 +80,8 @@ const world = async () => {
     log: () => undefined, debug: () => undefined });
   cleanups.push(() => bridge.stop());
   const directory = (store: MeshStore, identity: MeshIdentity) => {
-    const d = new ParticipantDirectory(store, { enabled: true, hostId: identity.id, rootId: identity.id, identity });
+    const d = new ParticipantDirectory(store, { enabled: true, hostId: identity.id, rootId: identity.id, identity,
+      ...(waitMs === undefined ? {} : { routingLease: { waitMs } }) });
     cleanups.push(() => d.close()); return d;
   };
   const hubDirectory = directory(hub, lane.identity), farDirectory = directory(far, target.identity);
@@ -181,6 +183,30 @@ const observeLeaseWait = (directory: ParticipantDirectory, controller: AbortCont
   return { ready, watchers, foreignWatchers, timers, assertClean };
 };
 const invocation = (signal: AbortSignal) => ({ signal } as FabricInvocationContext);
+
+// Fault seam: mutate only the bridge-written lease/checkpoint, not the directory, wait,
+// notifications or receiving path. A real bridge pass below supplies the fresh renewal.
+const indeterminate = async (w: Awaited<ReturnType<typeof world>>, sample: "stale" | "absent" | "source-live expired") => {
+  const lease = readHostLease(w.hub.root, w.target.hostId)!;
+  const now = Date.now(), expiresAt = sample === "source-live expired" ? now - 1 : now + 60_000;
+  const { mirror: old, ...rest } = lease;
+  writeHostLease(w.hub.root, { ...rest, expiresAt, mirrorLease: 1,
+    ...(sample === "absent" ? {} : { mirror: { ...old!,
+      observedAt: sample === "stale" ? now - BRIDGE_LEASE_MS - 1 : now,
+      // Even an old source-clock lapse is not death without a fresh bridge sample.
+      ...(sample === "stale" ? { sourceExpiresAt: old!.sourceObservedAt - 1 } : {}) } }) });
+  const key = `topology/hosts/${hash(w.target.hostId)}`, host = w.hub.get(key, { fresh: true })!;
+  await w.hub.put({ key, identity: host.updatedBy, value: { ...(host.value as object), expiresAt, mirrorLease: 1 } });
+  expect(readHostLease(w.hub.root, w.target.hostId)!.expiresAt).toBe(expiresAt);
+  expect(w.hubDirectory.get(w.target.hostId, undefined, { fresh: true }))
+    .toMatchObject({ remoteHost: "forge", stale: false, bridgeStale: true });
+};
+
+const replacementSample = (w: Awaited<ReturnType<typeof world>>, remoteHost: string) => {
+  const lease = readHostLease(w.hub.root, w.target.hostId)!;
+  writeHostLease(w.hub.root, { ...lease, expiresAt: Date.now() + 60_000,
+    mirror: { ...lease.mirror!, remoteHost, observedAt: Date.now() } });
+};
 
 // F-001 enters the real provider API, retaining the real directory/bridge/control ports.
 // Only process-local managers are inert: these operations address a foreign Main mirror.
@@ -293,6 +319,86 @@ describe("F-001 provider invocation mirror wait", () => {
 });
 
 describe("remote mirror lease wait (smarty-dev#11703)", () => {
+  it.each(["stale", "absent", "source-live expired"] as const)("%s modern sample waits once at known status lookup, cancels cleanly, then the same owner renews", async sample => {
+    const w = await world();
+    await indeterminate(w, sample);
+    await w.hubDirectory.refreshRoutingView(); // Exercise known-positive lookup, not bootstrap.
+    const controller = new AbortController();
+    const resources = observeLeaseWait(w.hubDirectory, controller);
+    const pending = invokingProvider(w).invoke("status", { id: w.target.hostId }, invocation(controller.signal));
+    const state = settle(pending);
+    await resources.ready;
+    expect(state.done).toBeUndefined();
+    expect(resources.timers).toHaveLength(1);
+    expect(on(w.hub, "fabric.control.command")).toEqual([]);
+    const reason = { sample, cancelled: true };
+    controller.abort(reason);
+    await expect(pending).rejects.toBe(reason);
+    resources.assertClean();
+
+    // A separate attempt renews by the actual two-store bridge, then delivers once.
+    const renewed = w.sending.routeMessage(w.target.hostId, `renew ${sample}`, undefined, "followUp");
+    const outcome = settle(renewed);
+    await sleep(100);
+    expect(outcome.done).toBeUndefined();
+    expect(on(w.hub, "fabric.control.command")).toEqual([]);
+    await w.bridge.syncPresence();
+    await waitFor(() => on(w.hub, "fabric.control.command").length === 1 || outcome.done !== undefined);
+    if (outcome.done?.error) throw outcome.done.error;
+    await w.bridge.step();
+    await waitFor(() => on(w.far, "fabric.control.ack").length === 1);
+    await w.bridge.step();
+    await expect(renewed).resolves.toMatchObject({ acknowledged: true, routed: "mesh" });
+    expect(on(w.hub, "fabric.control.command")).toHaveLength(1);
+    expect(on(w.far, "fabric.control.command")).toHaveLength(1);
+    expect(w.sendMessage).toHaveBeenCalledOnce();
+  }, 20_000);
+
+  it.each(["stale", "absent", "source-live expired"] as const)("%s modern sample without renewal waits its configured bound, then fails peer-stale without publication", async sample => {
+    const w = await world(50); // Real-clock bounded seam; production default is tested above.
+    await indeterminate(w, sample);
+    await w.hubDirectory.refreshRoutingView();
+    const started = performance.now();
+    const errors = await Promise.all([
+      w.sending.routeMessage(w.target.hostId, "never publish", undefined, "followUp"),
+      invokingProvider(w).invoke("status", { id: w.target.hostId }, invocation(new AbortController().signal)),
+    ].map(p => p.catch((error: unknown) => error)));
+    expect(performance.now() - started).toBeGreaterThanOrEqual(40);
+    expect(performance.now() - started).toBeLessThan(2_000);
+    for (const error of errors) {
+      expect(error).toMatchObject({ code: "FABRIC_PEER_LEASE_STALE", retryable: true, remoteHost: "forge" });
+      expect((error as Error).message).not.toContain("lapsed");
+      expect((error as Error).message).toContain("this attempt was not published");
+    }
+    expect(on(w.hub, "fabric.control.command")).toEqual([]);
+    await w.bridge.step();
+    expect(on(w.far, "fabric.control.command")).toEqual([]);
+    expect(w.sendMessage).not.toHaveBeenCalled();
+  }, 20_000);
+
+  it("a modern fresh source-lapsed sample refuses both provider status and messages immediately, never arming or publishing", async () => {
+    const w = await world();
+    const lease = readHostLease(w.hub.root, w.target.hostId)!;
+    const now = Date.now();
+    writeHostLease(w.hub.root, { ...lease, expiresAt: now + 60_000, mirror: { ...lease.mirror!,
+      observedAt: now, sourceObservedAt: now - 60_000, sourceExpiresAt: now - 60_001 } });
+    await w.hubDirectory.refreshRoutingView();
+    const controller = new AbortController();
+    const resources = observeLeaseWait(w.hubDirectory, controller);
+    const started = performance.now();
+    for (const kind of ["followUp", "steer"] as const) {
+      await expect(w.sending.routeMessage(w.target.hostId, "fresh lapse", undefined, kind))
+        .rejects.toThrow(`Unknown Fabric participant: ${w.target.hostId} (its lease mirrored from remote host forge lapsed`);
+    }
+    await expect(invokingProvider(w).invoke("status", { id: w.target.hostId }, invocation(controller.signal)))
+      .rejects.toThrow("its lease mirrored from remote host forge lapsed");
+    expect(performance.now() - started).toBeLessThan(2_000);
+    expect(resources.timers).toEqual([]);
+    expect(resources.watchers).toEqual([]);
+    resources.assertClean();
+    expect(on(w.hub, "fabric.control.command")).toEqual([]);
+    expect(w.sendMessage).not.toHaveBeenCalled();
+  }, 20_000);
   it.each([
     ["followUp", "bootstrap"], ["steer", "lookup"], ["followUp", "late-read"],
   ] as const)("%s cancels the %s mirror wait immediately, releasing watches/timer without publication", async (kind, entry) => {
@@ -465,6 +571,7 @@ describe("remote mirror lease wait (smarty-dev#11703)", () => {
         { kind: "put", key: hKey, value: { ...(host.value as object), remoteHost: "ryzen2", updatedAt: now, expiresAt: now + 60_000 } },
         { kind: "put", key: pKey, value: { ...participant, remoteHost: "ryzen2", updatedAt: now } },
       ] });
+      replacementSample(w, "ryzen2"); // A genuinely live sample must match the replacement link.
       owner = w.target.hostId; ownerIdentity = w.target.identity.id; remoteHost = "ryzen2";
     } else {
       const b = sid("replacement"), identity: MeshIdentity = { id: b, name: "main", kind: "main", sessionId: "replacement" };
@@ -511,6 +618,7 @@ describe("remote mirror lease wait (smarty-dev#11703)", () => {
         const hKey = `topology/hosts/${hash(w.target.hostId)}`, host = w.hub.get(hKey, { fresh: true })!;
         await w.hub.put({ key: hKey, identity: host.updatedBy, value: { ...(host.value as object), remoteHost: "ryzen2", updatedAt: now, expiresAt: now + 60_000 } });
         await w.hub.put({ key: pKey, identity: mirrored.updatedBy, value: { ...participant, remoteHost: "ryzen2", updatedAt: now } });
+        replacementSample(w, "ryzen2");
         expect(w.hubDirectory.mirroredControlOwner(w.target.hostId, w.target.identity.id, w.target.identity.id)).toMatchObject({ remoteHost: "ryzen2" });
       } else {
         const b = sid("replacement"), identity: MeshIdentity = { id: b, name: "main", kind: "main", sessionId: "replacement" };

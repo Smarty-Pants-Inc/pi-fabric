@@ -5,7 +5,8 @@
  * activation, but only on a positive "dead" verdict:
  *
  * - the root's own host lease file (the Main's lease, host id = root id) is present, readable,
- *   names that root and expired more than DEAD_ROOT_GRACE_MS ago; and
+ *   names that root and expired more than DEAD_ROOT_GRACE_MS ago; a mirrored root additionally
+ *   requires a fresh bridge observation, with that age measured on the source clock; and
  * - the root has no live participant record (a record whose owner host lease is unexpired).
  *
  * Everything else runs (fail-open): a live lease, a live participant, a lease that expired only
@@ -18,7 +19,7 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import type { FabricDeadRootFilterConfig } from "../config.js";
-import { readHostLease, readHostLeaseSnapshot, type FabricHostLease } from "../topology/host-leases.js";
+import { mirroredLeaseStatus, readHostLease, readHostLeaseSnapshot, type FabricHostLease } from "../topology/host-leases.js";
 import { participantFilePresent, readParticipantFile } from "../topology/participant-files.js";
 
 /** How long one root's "alive" verdict is reused. A "dead" verdict is never cached. */
@@ -56,6 +57,10 @@ const participantState = (meshRoot: string, rootId: string, rootLease: FabricHos
   if (value.status === "reloading" && typeof value.reloadUntil === "number" && value.reloadUntil >= now) return "live";
   const owner = value.ownerHostId === rootId ? rootLease : readHostLease(meshRoot, value.ownerHostId);
   if (!owner) return "doubt";
+  if (owner.mirror || owner.mirrorLease === 1) {
+    const status = mirroredLeaseStatus(owner.mirror?.remoteHost ?? "", owner.mirror, now);
+    return status === "bridge-stale" ? "doubt" : status === "live" ? "live" : "not-live";
+  }
   return liveUntil(owner) >= now ? "live" : "not-live";
 };
 
@@ -72,6 +77,14 @@ export const judgeRoot = (meshRoot: string, rootId: string, now = Date.now()): D
     const lease = snapshot.lease;
     if (!lease) return { dead: false, reason: "root lease unreadable" };
     if (lease.rootId !== rootId) return { dead: false, reason: "root lease names another root" };
+    if (lease.mirror || lease.mirrorLease === 1) {
+      const status = mirroredLeaseStatus(lease.mirror?.remoteHost ?? "", lease.mirror, now);
+      if (status === "bridge-stale") return { dead: false, reason: "bridge-stale; remote root lease unconfirmed" };
+      if (status === "live") return { dead: false, reason: "live remote root lease" };
+      const age = lease.mirror!.sourceObservedAt - lease.mirror!.sourceExpiresAt;
+      if (age <= DEAD_ROOT_GRACE_MS) return { dead: false, reason: "remote root lease expired recently" };
+      return { dead: true, reason: `remote root lease expired ${Math.floor(age / 60_000)} min ago on source clock; fresh bridge; no live participant` };
+    }
     if (lease.updatedAt > now + CLOCK_SKEW_MS) return { dead: false, reason: "root lease is from the future" };
     const until = liveUntil(lease);
     if (until >= now) return { dead: false, reason: "live lease" };

@@ -283,10 +283,25 @@ export const windowsRemoveHelper = (): string | undefined => {
   return findWindowsRemoveHelper();
 };
 const findWindowsRemoveHelper = (): string | undefined => windowsHelperBootstrap()?.file;
-/** smarty-dev#9569: the Windows helper's sha256 embedded at build time (lowercase hex), else undefined. */
+/** The checked-in digest is the source-run counterpart of the build's embedded value. It is reachable only from
+ * src/; bundled production code must use its literal build define, never a mutable toolchain file. */
+const sourcePinnedWindowsHelperDigest = (): string | undefined => {
+  try {
+    const sourcePath = fileURLToPath(import.meta.url);
+    if (!sourcePath.includes(`${path.sep}src${path.sep}`)) return undefined;
+    const toolchain = JSON.parse(fs.readFileSync(new URL("../../native/toolchain.json", import.meta.url), "utf8")) as {
+      expected?: { windows?: Record<string, string> };
+    };
+    const expected = toolchain.expected?.windows?.[WIN_HELPER];
+    return typeof expected === "string" && /^[0-9a-f]{64}$/.test(expected) ? expected : undefined;
+  } catch { return undefined; }
+};
+/** smarty-dev#9569: the Windows helper's sha256 embedded at build time (lowercase hex), or the same pinned source
+ * digest for an unbundled src/ child. Both paths still hash the candidate executable before any spawn. */
 export const windowsHelperDigest = (): string | undefined => {
   let expected: string | undefined;
-  try { expected = (JSON.parse(__FABRIC_NATIVE_DIGESTS__ as string) as Record<string, string>)[WIN_HELPER]; } catch { return undefined; }
+  try { expected = (JSON.parse(__FABRIC_NATIVE_DIGESTS__ as string) as Record<string, string>)[WIN_HELPER]; } catch { /* source child */ }
+  if (typeof expected !== "string" || !/^[0-9a-f]{64}$/.test(expected)) expected = sourcePinnedWindowsHelperDigest();
   return typeof expected === "string" && /^[0-9a-f]{64}$/.test(expected) ? expected : undefined;
 };
 /** The packaged helper locations beside the bundle (dist/<dir>/ or dist/) or from src/. */

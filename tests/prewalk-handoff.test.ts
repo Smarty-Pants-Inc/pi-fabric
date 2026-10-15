@@ -5,6 +5,10 @@ import {
   type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { fabricDiagnosticsFile, flushFabricDiagnostics } from "../src/core/diagnostics.js";
 import { Agent } from "@earendil-works/pi-agent-core";
 import { createAssistantMessageEventStream, type AssistantMessage, type Model } from "@earendil-works/pi-ai";
 import type { AgentToolResultMessage } from "../src/agents/types.js";
@@ -592,6 +596,52 @@ describe("persisted in-place Prewalk recovery", () => {
     expect(await restoreBorrowedInPlaceMain(controller, ext.value, ctx.value)).toBe(true);
     expect(ext.setModel.mock.calls).toEqual([[ctx.sourceModel]]);
     expect(controller.borrowedReturn()).toBeUndefined();
+  });
+
+  it("logs automatic unavailable-return failure without notifying an org pane", async () => {
+    vi.stubEnv("SMARTY_ROLE", "org-agent@x");
+    vi.stubEnv("PI_CODING_AGENT_DIR", fs.mkdtempSync(path.join(os.tmpdir(), "fabric-auto-return-")));
+    try {
+      const ctx = context();
+      const controller = new PrewalkController();
+      controller.hydrateBorrowedMain({ returnModel: "anthropic/retired", executorModel: "anthropic/executor" });
+      ctx.value.model = ctx.target as typeof ctx.value.model;
+      const ext = extension();
+
+      expect(await restoreBorrowedInPlaceMain(controller, ext.value, ctx.value)).toBe(false);
+      await flushFabricDiagnostics();
+      expect(ctx.value.ui.notify).not.toHaveBeenCalled();
+      expect(ext.setModel).not.toHaveBeenCalled();
+      const lines = fs.readFileSync(fabricDiagnosticsFile("session-1"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+      expect(lines).toContainEqual(expect.objectContaining({
+        level: "error", source: "src/prewalk/return.ts",
+        message: "Prewalk left Main on the executor; could not restore unavailable model anthropic/retired.",
+      }));
+    } finally {
+      await flushFabricDiagnostics();
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it.each(["authentication", "policy"] as const)("keeps explicit restore %s failures visible in an org pane", async (failure) => {
+    vi.stubEnv("SMARTY_ROLE", "org-agent@x");
+    try {
+      const ctx = context();
+      const controller = new PrewalkController();
+      controller.hydrateBorrowedMain({ returnModel: "anthropic/frontier", executorModel: "anthropic/executor" });
+      ctx.value.model = ctx.target as typeof ctx.value.model;
+      const ext = extension();
+      ext.setModel.mockResolvedValue(false);
+      const returning = restoreBorrowedInPlaceMain(controller, ext.value, ctx.value,
+        { deniedModels: failure === "policy" ? ["anthropic/frontier"] : [] }, { principalVisible: true });
+      if (failure === "policy") await expect(returning).rejects.toMatchObject({ code: "FABRIC_MODEL_DENIED" });
+      else expect(await returning).toBe(false);
+      expect(ctx.value.ui.notify).toHaveBeenCalledWith(
+        expect.stringContaining(failure === "policy" ? "#2236" : "Check model authentication"), "error",
+      );
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
 
   it("retains the adopted record when the return model is unavailable", async () => {

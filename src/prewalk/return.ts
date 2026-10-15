@@ -16,14 +16,28 @@ import type {
 // continuation, restart-safe recovery from the persisted branch, and the
 // settle-on-return path. Session start and /fabric reload run this eagerly, so it
 // stays free of the boundary engine's executor dependencies.
-const reportReturnRefusal = (context: ExtensionContext, key: string, error: unknown): never => {
+export interface RestoreBorrowedInPlaceMainOptions {
+  principalVisible?: boolean;
+}
+
+const reportReturnRefusal = (
+  context: ExtensionContext,
+  key: string,
+  error: unknown,
+  options?: RestoreBorrowedInPlaceMainOptions,
+): never => {
   if (error instanceof FabricModelDeniedError) {
     context.ui.setStatus("fabric-prewalk", `return refused → ${key}`);
-    notifyDiagnostic(context, "src/prewalk/return.ts", `Prewalk left Main on the executor: ${error.message}`, "error");
+    notifyDiagnostic(context, "src/prewalk/return.ts", `Prewalk left Main on the executor: ${error.message}`, "error", options);
   }
   throw error;
 };
-const modelForReturnKey = (key: string, context: ExtensionContext, policy?: PrewalkModelPolicy) => {
+const modelForReturnKey = (
+  key: string,
+  context: ExtensionContext,
+  policy?: PrewalkModelPolicy,
+  options?: RestoreBorrowedInPlaceMainOptions,
+) => {
   try {
     assertPrewalkModelAllowed(key, policy);
     const separator = key.indexOf("/");
@@ -32,7 +46,7 @@ const modelForReturnKey = (key: string, context: ExtensionContext, policy?: Prew
     if (model) assertPrewalkModelAllowed(`${model.provider}/${model.id}`, policy);
     return model;
   } catch (error) {
-    return reportReturnRefusal(context, key, error);
+    return reportReturnRefusal(context, key, error, options);
   }
 };
 const switchReturnModel = async (
@@ -41,11 +55,12 @@ const switchReturnModel = async (
   context: ExtensionContext,
   key: string,
   policy?: PrewalkModelPolicy,
+  options?: RestoreBorrowedInPlaceMainOptions,
 ): Promise<boolean> => {
   try {
     return await setModelSafely(extension, model, policy, key);
   } catch (error) {
-    return reportReturnRefusal(context, key, error);
+    return reportReturnRefusal(context, key, error, options);
   }
 };
 
@@ -106,6 +121,7 @@ export const restoreBorrowedInPlaceMain = async (
   extension: ExtensionAPI,
   context: ExtensionContext,
   policy?: PrewalkModelPolicy,
+  options?: RestoreBorrowedInPlaceMainOptions,
 ): Promise<boolean> => {
   let borrowed = controller?.borrowedReturn?.();
   let recovered = false;
@@ -130,7 +146,7 @@ export const restoreBorrowedInPlaceMain = async (
 
   let model: ReturnType<typeof modelForReturnKey>;
   try {
-    model = modelForReturnKey(borrowed.returnModel, context, policy);
+    model = modelForReturnKey(borrowed.returnModel, context, policy, options);
   } catch (error) {
     controller.cancel();
     throw error;
@@ -140,13 +156,14 @@ export const restoreBorrowedInPlaceMain = async (
     notifyDiagnostic(context, "src/prewalk/return.ts",
       `Prewalk left Main on the executor; could not restore unavailable model ${borrowed.returnModel}.`,
       "error",
+      options,
     );
     return false;
   }
 
   let restored: boolean;
   try {
-    restored = await switchReturnModel(extension, model, context, borrowed.returnModel, policy);
+    restored = await switchReturnModel(extension, model, context, borrowed.returnModel, policy, options);
   } catch (error) {
     controller.cancel();
     throw error;
@@ -156,12 +173,13 @@ export const restoreBorrowedInPlaceMain = async (
     notifyDiagnostic(context, "src/prewalk/return.ts",
       `Prewalk left Main on the executor; could not return to ${borrowed.returnModel}. Check model authentication.`,
       "error",
+      options,
     );
     return false;
   }
 
   if (recovered) controller.clearBorrowed();
-  notifyDiagnostic(context, "src/prewalk/return.ts", `Restored Main to ${borrowed.returnModel} after in-place prewalk.`, "info");
+  notifyDiagnostic(context, "src/prewalk/return.ts", `Restored Main to ${borrowed.returnModel} after in-place prewalk.`, "info", options);
   return true;
 };
 export const settleInPlacePrewalk = async (

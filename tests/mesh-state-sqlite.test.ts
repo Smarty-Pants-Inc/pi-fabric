@@ -307,6 +307,82 @@ describe("SqliteStateStore", () => {
     expect(store.get("hosts/z")).toBeUndefined();
   });
 
+  it.each([false, true])("snapshots a static put's own key and CAS through MeshStore before toJSON can mutate them (valid=%s)", async valid => {
+    const mesh = new MeshStore(tempRoot("own-descriptor"), 64 * 1024, 1_000, { stateBackend: "sqlite" });
+    try {
+      expect(mesh.stateBackend).toBe("sqlite");
+      const a = await mesh.put({ key: "test/snapshot/a", value: "original A", identity });
+      const b = await mesh.put({ key: "test/snapshot/b", value: "original B", identity });
+      expect(a.version).not.toBe(b.version);
+      let captures = 0;
+      const op: Extract<MeshBatchOperation, { kind: "put" }> = {
+        kind: "put", key: a.key, ifVersion: valid ? a.version : b.version, onConflict: "skip",
+        value: { toJSON() {
+          captures++;
+          op.key = b.key;
+          op.ifVersion = b.version;
+          return "replacement A";
+        } },
+      };
+      const results = await mesh.writeBatch({ identity, ops: [op] });
+      expect(results).toEqual([{ key: a.key, applied: valid, version: a.version + Number(valid) }]);
+      expect(captures).toBe(Number(valid));
+      if (valid) expect(op).toMatchObject({ key: b.key, ifVersion: b.version });
+      expect(mesh.get(a.key)).toMatchObject({
+        key: a.key, value: valid ? "replacement A" : "original A", version: a.version + Number(valid),
+      });
+      expect(mesh.get(b.key)).toEqual(b);
+    } finally { mesh.closeState(); }
+  });
+
+  it.each([false, true])("serializes a static CAS payload through MeshStore only when the operation applies (valid=%s)", async valid => {
+    const mesh = new MeshStore(tempRoot("cas-capture"), 64 * 1024, 1_000, { stateBackend: "sqlite" });
+    try {
+      expect(mesh.stateBackend).toBe("sqlite");
+      const before = await mesh.put({ key: "test/capture/a", value: "old", identity });
+      let captures = 0;
+      const results = await mesh.writeBatch({ identity, ops: [{
+        kind: "put", key: before.key, ifVersion: before.version + Number(!valid), onConflict: "skip",
+        value: { toJSON() { captures++; return "new"; } },
+      }] });
+      expect(results).toEqual([{ key: before.key, applied: valid, version: before.version + Number(valid) }]);
+      expect(captures).toBe(Number(valid));
+      expect(mesh.get(before.key)).toMatchObject({
+        value: valid ? "new" : "old", version: before.version + Number(valid),
+      });
+    } finally { mesh.closeState(); }
+  });
+
+  it("snapshots all descriptors and the ops list through MeshStore before an unconditional payload is serialized", async () => {
+    const mesh = new MeshStore(tempRoot("all-descriptors"), 64 * 1024, 1_000, { stateBackend: "sqlite" });
+    try {
+      expect(mesh.stateBackend).toBe("sqlite");
+      const a = await mesh.put({ key: "test/descriptors/a", value: "original A", identity });
+      const b = await mesh.put({ key: "test/descriptors/b", value: "original B", identity });
+      const later: MeshBatchOperation = { kind: "put", key: a.key, ifVersion: a.version, value: "replacement A" };
+      const input = { identity, ops: [] as MeshBatchOperation[] };
+      let captures = 0;
+      input.ops.push({ kind: "put", key: "test/descriptors/trigger", value: { toJSON() {
+        captures++;
+        later.key = b.key;
+        later.ifVersion = b.version;
+        input.ops.splice(1, 1, { kind: "put", key: "test/descriptors/injected", value: "must not commit" });
+        return "trigger";
+      } } }, later);
+      const results = await mesh.writeBatch(input);
+      expect(captures).toBe(1);
+      expect(later).toMatchObject({ key: b.key, ifVersion: b.version });
+      expect(input.ops[1]?.key).toBe("test/descriptors/injected");
+      expect(results).toEqual([
+        { key: "test/descriptors/trigger", applied: true, version: b.version + 1 },
+        { key: a.key, applied: true, version: a.version + 1 },
+      ]);
+      expect(mesh.get(a.key)).toMatchObject({ value: "replacement A", version: a.version + 1 });
+      expect(mesh.get(b.key)).toEqual(b);
+      expect(mesh.get("test/descriptors/injected")).toBeUndefined();
+    } finally { mesh.closeState(); }
+  });
+
   it("pre-captures static mixed-batch payloads before SQLite custody through MeshStore", async () => {
     const root = tempRoot("static-capture");
     const mesh = new MeshStore(root, 64 * 1024, 1_000, { stateBackend: "sqlite" });
@@ -318,7 +394,7 @@ describe("SqliteStateStore", () => {
       observer.exec("ROLLBACK");
     };
     const inside = () => expect(() => observer.exec("BEGIN IMMEDIATE")).toThrow(/locked|busy/i);
-    let captures = 0, prepares = 0, values = 0, conditions = 0, conflicts = 0, dynamicCaptures = 0;
+    let captures = 0, prepares = 0, values = 0, conditions = 0, conflicts = 0, dynamicCaptures = 0, skippedCaptures = 0;
     try {
       const ops: MeshBatchOperation[] = Array.from({ length: 190 }, (_, actor) => ({
         kind: "put", key: `actors/live/${actor}`, value: { toJSON() {
@@ -329,7 +405,7 @@ describe("SqliteStateStore", () => {
         inside(); values++; return { now };
       } }, { kind: "put", key: "hosts/old", ifVersion: 999,
         onConflict: () => { inside(); conflicts++; return "skip"; },
-        value: { toJSON() { outside(); throw new Error("skipped payload"); } },
+        value: { toJSON() { skippedCaptures++; return "must never serialize"; } },
       });
       const results = await mesh.writeBatch({ identity, ops,
         prepare: view => {
@@ -342,8 +418,9 @@ describe("SqliteStateStore", () => {
         },
         beforeCommit: inside,
       });
-      expect({ captures, prepares, values, conditions, conflicts, dynamicCaptures })
-        .toEqual({ captures: 190, prepares: 1, values: 1, conditions: 1, conflicts: 1, dynamicCaptures: 1 });
+      expect({ captures, prepares, values, conditions, conflicts, dynamicCaptures, skippedCaptures })
+        .toEqual({ captures: 190, prepares: 1, values: 1, conditions: 1, conflicts: 1, dynamicCaptures: 1, skippedCaptures: 0 });
+      expect(results[191]).toEqual({ key: "hosts/old", applied: false, version: 1 });
       expect(results.filter(result => result.applied)).toHaveLength(193);
       expect(mesh.get("actors/live/189")?.value).toEqual({ actor: 189, payload: "x".repeat(512) });
       expect(mesh.get("hosts/old")).toBeUndefined();

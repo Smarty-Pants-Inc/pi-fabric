@@ -4,7 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { MeshStore, type MeshBatchView } from "../src/mesh/store.js";
+import { MeshStore, type MeshBatchOperation, type MeshBatchView } from "../src/mesh/store.js";
 import type { MeshCommitEffects } from "../src/mesh/state-backend.js";
 import { encodeMeshStateNatsMarker, MeshBackendFenceError } from "../src/mesh/backend-fence.js";
 import { MESH_ARCHIVE_CONFIG, MeshArchive } from "../src/mesh/archive.js";
@@ -305,12 +305,82 @@ describe("optimistic mesh write snapshots", () => {
     assertNoStaging(root);
   });
 
+  it.each([false, true])("snapshots a static put's own key and CAS before toJSON can mutate them (valid=%s)", async valid => {
+    const { root, store } = setup();
+    const a = await store.put({ key: "test/snapshot/a", value: "original A", identity });
+    const b = await store.put({ key: "test/snapshot/b", value: "original B", identity });
+    expect(a.version).not.toBe(b.version);
+    let captures = 0;
+    const op: Extract<MeshBatchOperation, { kind: "put" }> = {
+      kind: "put", key: a.key, ifVersion: valid ? a.version : b.version, onConflict: "skip",
+      value: { toJSON() {
+        captures++;
+        op.key = b.key;
+        op.ifVersion = b.version;
+        return "replacement A";
+      } },
+    };
+    const results = await store.writeBatch({ identity, ops: [op] });
+    expect(results).toEqual([{ key: a.key, applied: valid, version: a.version + Number(valid) }]);
+    expect(captures).toBe(Number(valid));
+    if (valid) expect(op).toMatchObject({ key: b.key, ifVersion: b.version });
+    expect(store.get(a.key, { fresh: true })).toMatchObject({
+      key: a.key, value: valid ? "replacement A" : "original A", version: a.version + Number(valid),
+    });
+    expect(store.get(b.key, { fresh: true })).toEqual(b);
+    assertNoStaging(root);
+  });
+
+  it.each([false, true])("serializes a static CAS payload only when the operation applies (valid=%s)", async valid => {
+    const { root, store } = setup();
+    const before = await store.put({ key: "test/capture/a", value: "old", identity });
+    let captures = 0;
+    const results = await store.writeBatch({ identity, ops: [{
+      kind: "put", key: before.key, ifVersion: before.version + Number(!valid), onConflict: "skip",
+      value: { toJSON() { captures++; return "new"; } },
+    }] });
+    expect(results).toEqual([{ key: before.key, applied: valid, version: before.version + Number(valid) }]);
+    expect(captures).toBe(Number(valid));
+    expect(store.get(before.key, { fresh: true })).toMatchObject({
+      value: valid ? "new" : "old", version: before.version + Number(valid),
+    });
+    assertNoStaging(root);
+  });
+
+  it("snapshots all descriptors and the ops list before an unconditional payload is serialized", async () => {
+    const { root, store } = setup();
+    const a = await store.put({ key: "test/descriptors/a", value: "original A", identity });
+    const b = await store.put({ key: "test/descriptors/b", value: "original B", identity });
+    const later: MeshBatchOperation = { kind: "put", key: a.key, ifVersion: a.version, value: "replacement A" };
+    const input = { identity, ops: [] as MeshBatchOperation[] };
+    let captures = 0;
+    input.ops.push({ kind: "put", key: "test/descriptors/trigger", value: { toJSON() {
+      captures++;
+      later.key = b.key;
+      later.ifVersion = b.version;
+      input.ops.splice(1, 1, { kind: "put", key: "test/descriptors/injected", value: "must not commit" });
+      return "trigger";
+    } } }, later);
+    const results = await store.writeBatch(input);
+    expect(captures).toBe(1);
+    expect(later).toMatchObject({ key: b.key, ifVersion: b.version });
+    expect(input.ops[1]?.key).toBe("test/descriptors/injected");
+    expect(results).toEqual([
+      { key: "test/descriptors/trigger", applied: true, version: b.version + 1 },
+      { key: a.key, applied: true, version: a.version + 1 },
+    ]);
+    expect(store.get(a.key, { fresh: true })).toMatchObject({ value: "replacement A", version: a.version + 1 });
+    expect(store.get(b.key, { fresh: true })).toEqual(b);
+    expect(store.get("test/descriptors/injected", { fresh: true })).toBeUndefined();
+    assertNoStaging(root);
+  });
+
   it("pre-captures primary-path static payloads once while mixed callbacks remain authoritative", async () => {
     const { root, lock, store } = setup();
     await store.put({ key: "test/mixed/retained", value: "old", identity });
     await store.put({ key: "test/mixed/expired", value: "expired", identity });
     const raced = raceAtAcquisition(root, state => { state.entries["test/mixed/retained"].value = "new"; });
-    let captures = 0;
+    let captures = 0, skippedCaptures = 0;
     const ops = Array.from({ length: 190 }, (_, actor) => ({ kind: "put" as const, key: `actors/live/${actor}`,
       value: { toJSON() {
         captures++; expect(fs.existsSync(lock)).toBe(false);
@@ -330,10 +400,12 @@ describe("optimistic mesh write snapshots", () => {
     const results = await store.writeBatch({ identity, prepare, ops: [...ops,
       { kind: "put", key: "hosts/live/self", value },
       { kind: "put", key: "test/mixed/retained", ifVersion: 999, onConflict,
-        value: { toJSON() { expect(fs.existsSync(lock)).toBe(false); throw new Error("skipped payload"); } } },
+        value: { toJSON() { skippedCaptures++; return "must never serialize"; } } },
     ] });
     raced();
     expect(captures).toBe(190);
+    expect(skippedCaptures).toBe(0);
+    expect(results[191]).toEqual({ key: "test/mixed/retained", applied: false, version: 1 });
     for (const callback of [prepare, value, condition, onConflict]) expect(callback).toHaveBeenCalledOnce();
     expect(results.filter(result => result.applied)).toHaveLength(192);
     expect(store.get("actors/live/189", { fresh: true })?.value).toEqual({ actor: 189, payload: "x".repeat(512) });

@@ -495,7 +495,49 @@ export type MeshBatchOperation =
       condition?: (current: (key: string) => MeshStateEntry | undefined) => boolean;
     };
 
-type CapturedBatchPuts = Map<MeshBatchOperation, ReturnType<typeof captureStoragePut> | { error: unknown }>;
+type BatchConflictPolicy = "skip" | "abort" | ((current: MeshStateEntry | undefined) => "skip" | "abort");
+type CapturedBatchOperation =
+  | Readonly<{
+      index: number;
+      kind: "put";
+      key: string;
+      value: unknown | ((now: number) => unknown);
+      identity: MeshIdentity;
+      ifVersion: number | undefined;
+      onConflict: BatchConflictPolicy | undefined;
+      condition: undefined;
+    }>
+  | Readonly<{
+      index: number;
+      kind: "delete";
+      key: string;
+      value: undefined;
+      identity: undefined;
+      ifVersion: number | undefined;
+      onConflict: BatchConflictPolicy | undefined;
+      condition: ((current: (key: string) => MeshStateEntry | undefined) => boolean) | undefined;
+    }>;
+
+type CapturedBatchPuts = Map<CapturedBatchOperation, ReturnType<typeof captureStoragePut> | { error: unknown }>;
+
+const snapshotBatchOperation = (operation: MeshBatchOperation, index: number,
+  batchIdentity: MeshIdentity): CapturedBatchOperation => {
+  const kind = operation.kind;
+  const key = operation.key;
+  const ifVersion = operation.ifVersion;
+  const onConflict = operation.onConflict;
+  if (kind === "put") {
+    const value = operation.value;
+    const identity = operation.identity ?? batchIdentity;
+    return Object.freeze({ index, kind, key, value, identity, ifVersion, onConflict, condition: undefined });
+  }
+  const condition = operation.condition;
+  return Object.freeze({ index, kind, key, value: undefined, identity: undefined, ifVersion, onConflict, condition });
+};
+
+const snapshotBatchOperations = (operations: readonly MeshBatchOperation[], batchIdentity: MeshIdentity,
+  offset = 0): CapturedBatchOperation[] => operations.map((operation, index) =>
+  snapshotBatchOperation(operation, offset + index, batchIdentity));
 
 export interface MeshBatchView {
   get(key: string): MeshStateEntry | undefined;
@@ -1288,26 +1330,35 @@ export class StateFile implements StateBackend {
   // state file commit, before afterCommit/commitOutbox, so a throwing callback cannot hide a commit.
   async writeBatch(input: StateBackendBatchInput, committed?: (changed: readonly string[]) => void): Promise<MeshBatchResult[]> {
     const caller = commitTraceCaller();
-    for (const op of input.ops) this.#validateKey(op.key);
-    if (input.ops.length === 0 && !input.prepare && !input.afterCommit && !input.commitOutbox && !input.beforeCommit) return [];
-    // Static input payloads are independent of the authoritative snapshot, including in a
-    // mixed/prepare batch. Capture once, not on optimistic retries. Defer errors until the
-    // operation passes its condition/CAS, so an invalid but skipped value still stays skipped.
+    const batchIdentity = input.identity;
+    const lockClass: MeshLockClass = input.lockClass === "bridge" ? "bridge" : "writeBatch";
+    const prepare = input.prepare;
+    const afterCommit = input.afterCommit;
+    const beforeCommit = input.beforeCommit;
+    const commitOutbox = input.commitOutbox;
+    const fileRead = input.fileRead;
+    // Snapshot every caller operation before any serialization. Later toJSON hooks may mutate
+    // the caller's operations or input.ops; the frozen descriptors are the only operations used below.
+    const callerOps = snapshotBatchOperations(input.ops, batchIdentity);
+    for (const op of callerOps) this.#validateKey(op.key);
+    if (callerOps.length === 0 && !prepare && !afterCommit && !commitOutbox && !beforeCommit) return [];
+    // Static, unconditional caller payloads are captured once, not on optimistic retries. CAS
+    // puts are deliberately absent: their value (and identity) is captured only after the locked
+    // CAS decision, so skipped values never invoke toJSON.
     const captured: CapturedBatchPuts = new Map();
-    for (const op of input.ops) {
-      if (op.kind !== "put" || typeof op.value === "function") continue;
-      try { captured.set(op, captureStoragePut({ key: op.key, value: op.value, ifVersion: op.ifVersion,
-        identity: op.identity ?? input.identity }, this.maxEventBytes)); }
+    for (const op of callerOps) {
+      if (op.kind !== "put" || typeof op.value === "function" || op.ifVersion !== undefined) continue;
+      try { captured.set(op, captureStoragePut({ key: op.key, value: op.value, identity: op.identity }, this.maxEventBytes)); }
       catch (error) { captured.set(op, { error }); }
     }
-    const fileRead = input.fileRead;
     const retries = Math.max(0, Math.floor(fileRead?.retries ?? 3));
     for (let attempt = 0; ; attempt += 1) {
       const bracket = fileRead ? bracketFileRead(fileRead) : undefined;
       let outcome: { results: MeshBatchResult[]; state: MeshStateFile | undefined; stamp: string | undefined };
       try {
         if (fileRead && !bracket) throw FILE_READ_CHANGED;
-        outcome = await this.#writeBatchOnce(input, captured, caller, bracket?.value,
+        outcome = await this.#writeBatchOnce(callerOps, batchIdentity, prepare, afterCommit, beforeCommit,
+          commitOutbox, fileRead, captured, caller, lockClass, bracket?.value,
           fileRead && bracket ? () => fileRead.stamp() === bracket.stamp : undefined, committed);
       } catch (error) {
         if (error !== FILE_READ_CHANGED) throw error;
@@ -1316,7 +1367,7 @@ export class StateFile implements StateBackend {
       }
       // Writers always parse a private snapshot and never mutate it after commit. Retain that
       // exact snapshot across custody release, then detach it here rather than cloning under lock.
-      if (input.commitOutbox && outcome.state) input.commitOutbox({
+      if (commitOutbox && outcome.state) commitOutbox({
         backend: "file", results: outcome.results.map(result => ({ ...result })),
         changed: outcome.results.filter(result => result.applied).map(result => result.key),
         view: detachedView(jsonClone(outcome.state)), stamp: outcome.stamp,
@@ -1325,10 +1376,14 @@ export class StateFile implements StateBackend {
     }
   }
 
-  #writeBatchOnce(input: StateBackendBatchInput, captured: CapturedBatchPuts, caller: string[] | undefined, fileValue: unknown,
-    stampHolds: (() => boolean) | undefined, committed?: (changed: readonly string[]) => void): Promise<{ results: MeshBatchResult[]; state: MeshStateFile | undefined; stamp: string | undefined }> {
-    const locked = input.prepare || input.fileRead || input.ops.some(op => typeof op.onConflict === "function" ||
-      (op.kind === "put" ? typeof op.value === "function" : op.condition));
+  #writeBatchOnce(callerOps: CapturedBatchOperation[], batchIdentity: MeshIdentity,
+    prepare: StateBackendBatchInput["prepare"], afterCommit: StateBackendBatchInput["afterCommit"],
+    beforeCommit: StateBackendBatchInput["beforeCommit"], commitOutbox: StateBackendBatchInput["commitOutbox"],
+    fileRead: StateBackendBatchInput["fileRead"], captured: CapturedBatchPuts, caller: string[] | undefined,
+    lockClass: MeshLockClass, fileValue: unknown, stampHolds: (() => boolean) | undefined,
+    committed?: (changed: readonly string[]) => void): Promise<{ results: MeshBatchResult[]; state: MeshStateFile | undefined; stamp: string | undefined }> {
+    const locked = prepare || fileRead || callerOps.some(op => op.ifVersion !== undefined || typeof op.onConflict === "function" ||
+      (op.kind === "put" ? typeof op.value === "function" : op.condition !== undefined));
     return this.#writeState<{ results: MeshBatchResult[]; view: MeshBatchView; state: MeshStateFile | undefined; stamp: string | undefined }>(state => {
       // Each operation takes the same verified transition as put()/delete(), so a batch
       // advances the persistent clock exactly as the single writes would, and damaged
@@ -1340,7 +1395,11 @@ export class StateFile implements StateBackend {
       const now = Date.now();
       const view = detachedView(state);
       const current = view.get;
-      const ops = [...input.ops, ...(input.prepare?.(view, fileValue) ?? [])];
+      // Prepare is one phase: snapshot every generated descriptor before any of its values or
+      // identities can be serialized. Caller descriptors were captured before entering this method.
+      const prepared = prepare?.(view, fileValue) ?? [];
+      const preparedOps = snapshotBatchOperations(prepared, batchIdentity, callerOps.length);
+      const ops = callerOps.concat(preparedOps);
       for (const op of ops) this.#validateKey(op.key);
       for (const op of ops) {
         const slot = stateSlot(state, op.key);
@@ -1366,8 +1425,8 @@ export class StateFile implements StateBackend {
           : captureStoragePut({
             key: op.key,
             ifVersion: op.ifVersion,
-            value: typeof op.value === "function" ? (op.value as (now: number) => unknown)(now) : op.value,
-            identity: op.identity ?? input.identity,
+            value: typeof op.value === "function" ? op.value(now) : op.value,
+            identity: op.identity,
           }, this.maxEventBytes));
         const plan = request.transition(slot.present, slot.version, slot.highWater);
         if (plan.kind === "unchanged") {
@@ -1395,19 +1454,19 @@ export class StateFile implements StateBackend {
         state.tombstoneOrder = [...tombstones];
         compactStateTombstones(state, this.#maxStateTombstones);
       }
-      return { result: { results, view, state: input.commitOutbox ? state : undefined, stamp: undefined },
+      return { result: { results, view, state: commitOutbox ? state : undefined, stamp: undefined },
         keys: changed ? results.filter(result => result.applied).map(result => result.key) : undefined };
     }, caller, {
-      lockedKeys: locked ? input.ops.map(op => op.key) : undefined,
+      lockedKeys: locked ? callerOps.map(op => op.key) : undefined,
       maxAttempts: locked ? undefined : 2,
       validate: () => { if (stampHolds && !stampHolds()) throw FILE_READ_CHANGED; },
-      beforeCommit: input.beforeCommit,
+      beforeCommit,
       afterCommit: (result, keys) => {
-        if (input.commitOutbox) result.stamp = this.stateStamp();
+        if (commitOutbox) result.stamp = this.stateStamp();
         if (keys) committed?.(keys);
-        input.afterCommit?.(result.view);
+        afterCommit?.(result.view);
       },
-      lockClass: input.lockClass === "bridge" ? "bridge" : "writeBatch",
+      lockClass,
     });
   }
 

@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ActorDirectory } from "../src/actors/directory.js";
+import { failActorTreeRemoval } from "./helpers/actor-tree-removal.js";
 import { SessionActorOrphans } from "../src/actors/session-orphans.js";
 import { AgentManager } from "../src/agents/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
@@ -118,12 +119,8 @@ describe("ActorDirectory", () => {
     await vi.waitFor(() => expect(directory.status(actor.id).inFlightRun?.id).toBe(runId));
     const dir = path.join(actorRoots[scope], actor.id);
     const marker = path.join(actorRoots[scope], `removal-${actor.id}.json`);
-    const rm = fs.rmSync.bind(fs);
     let failures = 0;
-    const fail = vi.spyOn(fs, "rmSync").mockImplementation((target, options) => {
-      if (target === dir) { failures++; throw new Error("persistent cleanup failure"); }
-      return rm(target, options);
-    });
+    const fail = failActorTreeRemoval(dir, () => { failures++; throw new Error("persistent cleanup failure"); });
     if (UNSUPPORTED_PLATFORM) { fs.mkdirSync(dir, { recursive: true }); fs.writeFileSync(path.join(dir, "kept-11335.txt"), "history\n"); }
     try {
       await directory.remove(actor.id, { wait: false });

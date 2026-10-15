@@ -13,6 +13,7 @@ import { ActorRegistryStore } from "../src/actors/registry-store.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { ResidentHost } from "../src/residency/host.js";
 import { ROOT_PARTICIPANT_FRESH_MS } from "../src/residency/operator-safety.js";
+import * as verifiedRemoval from "../src/storage/verified-remove.js";
 import { processStartTime } from "../src/residency/process-identity.js";
 import {
   readResidentRequestDecision, residentRemovalsPath, residentRoot,
@@ -36,6 +37,8 @@ const GUIDANCE = "stop the Main, or let a host start finish it";
 const stale = () => Date.now() - 2 * ROOT_PARTICIPANT_FRESH_MS;
 const gone = { pid: 2147483647, host: os.hostname(), startTime: "1" };
 type Call = { api: string; path: string; tree: boolean };
+const TREE_API = process.platform === "linux" ? "verifiedRemove" : "rmSync";
+const realVerifiedRemove = verifiedRemoval.verifiedRemove;
 
 const restorePlatform = () => Object.defineProperty(process, "platform", nativePlatform);
 afterEach(() => {
@@ -60,7 +63,7 @@ const treeSnapshot = (directory: string): Array<{ name: string; dev: number; ino
   return entries;
 };
 
-const guardDeletions = (root: string, actorRoots: string[], calls: Call[]) => {
+const guardDeletions = (root: string, actorRoots: string[], calls: Call[], fenced: () => boolean, violations: string[]) => {
   const trash = path.join(root, "fixture-trash");
   fs.mkdirSync(trash, { mode: 0o700 });
   let sequence = 0;
@@ -103,6 +106,20 @@ const guardDeletions = (root: string, actorRoots: string[], calls: Call[]) => {
   vi.spyOn(fs.promises, "rmdir").mockImplementation(async (file) => emulate("promises.rmdir", file));
   vi.spyOn(fs.promises, "unlink").mockImplementation(async (file) => emulate("promises.unlink", file));
 
+  // Keep the real verifier's judgment/walk, but use its production dry-run option before any mutation.
+  vi.spyOn(verifiedRemoval, "verifiedRemove").mockImplementation((target, judged, options) => {
+    const file = path.resolve(target);
+    const inActorTree = actorRoots.some(actorRoot => path.dirname(file) === actorRoot && /^[a-f0-9]{32}$/.test(path.basename(file)));
+    if (process.platform !== "linux" || !inActorTree) return realVerifiedRemove(target, judged, options);
+    const now = fs.lstatSync(file, { throwIfNoEntry: false });
+    calls.push({ api: "verifiedRemove", path: file, tree: now?.isDirectory() === true });
+    if (!fenced()) violations.push(`${file}: not under the Main publication fence`);
+    if (!judged || !now || now.dev !== judged.dev || now.ino !== judged.ino) violations.push(`${file}: judged inode is not the current tree`);
+    const result = realVerifiedRemove(target, judged, { ...options, dryRun: true });
+    if (!result.removed) violations.push(`${file}: refused (${result.reason})`);
+    return result;
+  });
+
   // A native delete bypasses fs spies. Record and refuse it (also any unexpected CLI/worker),
   // allowing only the existing Linux lock helpers used by this cleanup route.
   const spawn = childProcess.spawn, spawnSync = childProcess.spawnSync;
@@ -142,8 +159,9 @@ const safeFixture = async () => {
     piBinary: "unused-pi", claudeBinary: "unused-claude", vedaBinary: "unused-veda",
     piModels: { available: [{ provider: "fixture", id: "visible" }], aliases: {}, defaultModel: "fixture/visible" },
   };
-  const calls: Call[] = [];
-  guardDeletions(root, [config.actorRoot, config.sessionActorRoot!], calls);
+  const calls: Call[] = [], violations: string[] = [];
+  guardDeletions(root, [config.actorRoot, config.sessionActorRoot!], calls,
+    () => mainPublicationFenced(meshRoot, rootId), violations);
   fs.mkdirSync(config.residencyRoot, { recursive: true });
   fs.writeFileSync(path.join(config.residencyRoot, "config.json"), JSON.stringify(config));
   const host = new ResidentHost(config, () => {});
@@ -164,7 +182,7 @@ const safeFixture = async () => {
     try { await host.close(); }
     finally { realFixtureTeardown(root, { recursive: true, force: true }); }
   };
-  return { root, config, host, calls, close };
+  return { root, config, host, calls, violations, close };
 };
 type Fixture = Awaited<ReturnType<typeof safeFixture>>;
 
@@ -246,6 +264,7 @@ const probe = async (f: Fixture, platform: "darwin" | "win32" | "linux", operato
   const registry = new ActorRegistryStore(f.config.actorRoot);
   expect(registry.records().some(row => row.id === actor.id)).toBe(false); // accepted/revoked, not an admission failure
   expect(f.calls.some(call => call.api === "native-helper-delete")).toBe(false);
+  expect(f.violations).toEqual([]);
   expect(f.calls.some(call => !call.tree && call.api === "rmSync")).toBe(true); // metadata emulation actually ran
   return { ...result, actor, hooks, verdicts, treeDeletes: f.calls.filter(call => call.tree) };
 };
@@ -284,7 +303,7 @@ describe.skipIf(process.platform !== "linux")("resident operator cleanup uses th
       expect(result.response).toMatchObject({ ok: true });
       expect(result.response.pending).toBeUndefined();
       expect(result.hooks).toEqual([{ at: "beforeCheck", fenced: true }, { at: "beforeDelete", fenced: true }]);
-      expect(result.treeDeletes).toEqual([{ api: "rmSync", path: path.join(f.config.actorRoot, result.actor.id), tree: true }]);
+      expect(result.treeDeletes).toEqual([{ api: TREE_API, path: path.join(f.config.actorRoot, result.actor.id), tree: true }]);
       expect(f.host.actors.cleanupObligation(result.actor.id)).toBeUndefined();
     } finally { await f.close(); }
   }, 30_000);
@@ -297,7 +316,7 @@ describe.skipIf(process.platform !== "linux")("resident operator cleanup uses th
       expect(result.response).toMatchObject({ ok: true });
       expect(result.response.pending).toBeUndefined();
       expect(result.hooks).toEqual([{ at: "beforeCheck", fenced: true }, { at: "beforeDelete", fenced: true }]);
-      expect(result.treeDeletes).toEqual([{ api: "rmSync", path: path.join(f.config.actorRoot, result.actor.id), tree: true }]);
+      expect(result.treeDeletes).toEqual([{ api: TREE_API, path: path.join(f.config.actorRoot, result.actor.id), tree: true }]);
       expect(f.host.actors.cleanupObligation(result.actor.id)).toBeUndefined();
     } finally { await f.close(); }
   }, 30_000);

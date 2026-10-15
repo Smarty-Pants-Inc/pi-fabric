@@ -61,6 +61,7 @@ import type { AgentRunRecord, AgentRunRequest } from "../src/agents/types.js";
 import { captureRuntimeDeadline } from "./helpers/early-runtime-deadline.js";
 import { captureMontyTransport } from "./helpers/monty-transport.js";
 import { executeAfterAdmission } from "./helpers/admission-clock.js";
+import { failActorTreeRemoval } from "./helpers/actor-tree-removal.js";
 import { createMainExecutionCeilingError } from "../src/async-settlement.js";
 
 vi.mock("node:child_process", async (importOriginal) => {
@@ -1365,11 +1366,7 @@ describe("#169 round 1 agents.remove cleanup routing", () => {
     const actor = await owner.create({ name: "resident obligation", instructions: "Work.", residency: "durable" });
     expect(passive.list().map((entry) => entry.id)).toContain(actor.id); // Main had the pre-removal view.
     const dir = path.join(actorRoots.project, actor.id);
-    const rm = fs.rmSync.bind(fs);
-    const failing = vi.spyOn(fs, "rmSync").mockImplementation((target, options) => {
-      if (target === dir) throw new Error("cleanup unavailable");
-      return rm(target, options);
-    });
+    const failing = failActorTreeRemoval(dir, () => { throw new Error("cleanup unavailable"); });
     try { await owner.remove(actor.id); } finally { failing.mockRestore(); }
     const removeActor = vi.fn((id: string) => owner.remove(id));
     const provider = new AgentsProvider(state.agents, passive, state.globalActors, state.mainAgent, state.participants,
@@ -1398,11 +1395,7 @@ describe("#169 round 1 agents.remove cleanup routing", () => {
       state.control, state.lifecycle, undefined, undefined, undefined, () => DEFAULT_FABRIC_CONFIG.models);
     const actor = await directory.create({ scope, name: "retry worker", instructions: "Work." });
     const dir = path.join(actorRoots[scope], actor.id);
-    const rm = fs.rmSync.bind(fs);
-    const failing = vi.spyOn(fs, "rmSync").mockImplementation((target, options) => {
-      if (target === dir) throw new Error("cleanup unavailable");
-      return rm(target, options);
-    });
+    const failing = failActorTreeRemoval(dir, () => { throw new Error("cleanup unavailable"); });
     try {
       await expect(provider.invoke("remove", { id: actor.id }, context)).resolves.toMatchObject({ removed: true, cleaned: false });
       // No participant/presence entry remains. agents.actors must still expose the stopped obligation.

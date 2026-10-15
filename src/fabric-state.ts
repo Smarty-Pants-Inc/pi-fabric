@@ -237,7 +237,7 @@ export class FabricState {
   }
 
   async bootstrap(context: ExtensionContext): Promise<void> {
-    configureFabricDiagnostics(context.sessionManager?.getSessionId?.() ?? "");
+    if (!this.#managedHost) configureFabricDiagnostics(context.sessionManager?.getSessionId?.() ?? "");
     this.#shutDown = false;
     const generation = ++this.#generation;
     this.#cwd = context.cwd;

@@ -162,12 +162,13 @@ describe("shared finalizer (T4, platform independent)", () => {
     const release = recorder(refused as never);
     let caught: unknown = Symbol("not thrown");
     try { runUnderMeshLocks(operation, [{ lock: "L", release }]); } catch (error) { caught = error; }
-    expect(caught).toBe(primary);
+    // Vitest inspects matcher inputs; compare identity before giving it the revoked object.
+    expect(Object.is(caught, primary)).toBe(true);
     expect(operation).toHaveBeenCalledTimes(1);
     expect(release).toHaveBeenCalledTimes(1);
     const secondaries = meshLockSecondaryReleaseErrors(primary);
     expect(secondaries).toHaveLength(1);
-    expect(secondaries[0]!.cause).toBe(primary);
+    expect(Object.is(secondaries[0]!.cause, primary)).toBe(true);
     const expected = new MeshLockReleaseError("L", "threw", refused as never, release, { cause: primary });
     expect(warn.mock.calls).toEqual([
       [`[pi-fabric] ALARM ${expected.kind} (secondary to object): ${expected.message}`],

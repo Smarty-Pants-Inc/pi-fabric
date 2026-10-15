@@ -1424,7 +1424,9 @@ describe("round 6 registered fabric_exec post-completion deadlines", { timeout: 
       const state = await harness(false, undefined, 10_000); const main = mainProvider(state);
       const startedAt = Date.now(); const clock = vi.spyOn(Date, "now").mockReturnValue(startedAt);
       let crossed = false; const closed: Promise<void>[] = [];
-      const crossDeadline = () => { crossed = true; clock.mockReturnValue(startedAt + 60_000); };
+      // Cross the exact 5s runtime/Main deadline without passing unrelated host
+      // 30s dormancy while awaiting CPython reap.
+      const crossDeadline = () => { crossed = true; clock.mockReturnValue(startedAt + 5_001); };
       if (engine === "cpython") {
         const actual = await vi.importActual<typeof import("node:child_process")>("node:child_process");
         vi.mocked(childProcess.spawn).mockImplementation(((...args: Parameters<typeof actual.spawn>) => {

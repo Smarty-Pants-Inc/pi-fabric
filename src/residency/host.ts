@@ -592,6 +592,7 @@ export class ResidentHost {
       claudeBinary: config.claudeBinary,
       vedaBinary: config.vedaBinary,
       runRoot: path.join(config.residencyRoot, "runs"),
+      admissionSnapshotPath: path.join(residentActorRoots(config).session, "admission.json"),
       fullCodeMode: config.fullCodeMode,
       kernel: () => currentConfig().kernel ?? config.kernel ?? "typescript",
       pythonRuntime: () => currentConfig().pythonRuntime ?? config.pythonRuntime ?? "monty",

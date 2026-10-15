@@ -86,7 +86,8 @@ import { schemaRefAllowedInEnforce } from "./schema/policy.js";
 import { actionApprovalOverride } from "./core/approval-overrides.js";
 import type { FabricSpeculationStreamTap } from "./speculation/stream-tap.js";
 import { MeshStore, meshOutageAlarmSink, type MeshIdentity } from "./mesh/store.js";
-import { acquireMeshCustodyLock, meshCustodyMode } from "./mesh/custody-lock.js";
+import { acquireMeshCustodyHandle, meshCustodyMode } from "./mesh/custody-lock.js";
+import { runUnderMeshLocksAsync } from "./mesh/lock-release.js";
 import { MeshBackgroundQueue, MeshBackgroundRetry, isMeshWriteDeferred } from "./core/atomic-write.js";
 import { DecisionStore } from "./decisions/store.js";
 import { requestHeadlessApproval, routeChildQuestion } from "./decisions/host.js";
@@ -1016,9 +1017,11 @@ export class FabricRuntimeState {
       if (meshConfig.enabled && mainAgent.local) {
         // resumeLineage awaits a mesh write. Hold file custody across that await;
         // mesh.custody callbacks are synchronous and would release it too early.
-        const releaseCustody = await acquireMeshCustodyLock(meshRoot);
-        try {
+        const custody = await acquireMeshCustodyHandle(meshRoot);
+        let entered = false;
+        inboxActivation = await runUnderMeshLocksAsync(async () => {
           if (!live.current()) throw new Error("Pi Fabric mesh activation lifecycle retired");
+          entered = true;
           await participants.resumeLineage();
           // In dual mode, exclude legacy file custodians with the mesh lock too.
           const register = () => {
@@ -1027,8 +1030,8 @@ export class FabricRuntimeState {
             // its own root/activation/process identity; only native succession may carry it forward.
             return registerMainInbox(meshRoot, identity, sessionId, sessionFile, undefined, namedMain ? participantProject(context.cwd) : undefined);
           };
-          inboxActivation = meshCustodyMode() === "own" ? register() : await mesh.exclusive(register);
-        } finally { releaseCustody(); }
+          return meshCustodyMode() === "own" ? register() : await mesh.exclusive(register);
+        }, [custody], { started: () => entered });
       } else await participants.resumeLineage();
       // smarty-dev#8881: resumeLineage awaited a mesh write; an SDK dispose in that window stales
       // `context` with no session_shutdown. Fence on the live lifecycle before succession and compare

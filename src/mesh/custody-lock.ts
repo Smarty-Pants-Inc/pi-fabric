@@ -4,6 +4,10 @@ import path from "node:path";
 import { FOREIGN_LOCK, pinFenceLock, releaseFenceLock } from "./fence-lock.js";
 import { verifiedRemove } from "../storage/verified-remove.js";
 import {
+  failBeforeEntry, MeshLockReleaseError, prepareMeshLockRelease, runUnderMeshLocksAsync, windowsMeshReleaser, windowsPreEntryRefusal,
+  type MeshLockOperationState, type MeshLockReleaseHandle, type MeshLockReleaser,
+} from "./lock-release.js";
+import {
   alarmForeignHolder, MeshLockForeignHolderError, MeshLockTimeoutError, ownProcessIncarnation, processIncarnation, validProcessIncarnation,
   readPhysicalHostIdentity, readPhysicalMachineId, validBootId, type StaleLockNote,
 } from "../core/atomic-write.js";
@@ -63,9 +67,26 @@ const processAlive = (pid: number): boolean => {
 
 const delay = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms));
 
-/** Holds the custody lock of a mesh root until the returned release is called. */
+export interface MeshCustodyLockOptions { hostQualified?: boolean; ownIncarnation?: string | undefined; lockProtocol?: 1 | 2 | 3 }
+
+/**
+ * Holds the custody lock of a mesh root until the returned release is called. The release is repeatable. On Windows a
+ * release that did not resolve ownership throws MeshLockReleaseError (`operationState` defaults to "returned"; pass
+ * "threw" from an error path). A caller with a primary error to preserve should prefer the shared finalizer
+ * (withMeshCustody / lock-release.ts) over a bare `finally { release() }`.
+ */
 export const acquireMeshCustodyLock = async (root: string, timeoutMs = CUSTODY_LOCK_TIMEOUT_MS,
-  options: { hostQualified?: boolean; ownIncarnation?: string | undefined; lockProtocol?: 1 | 2 | 3 } = {}): Promise<() => void> => {
+  options: MeshCustodyLockOptions = {}): Promise<(operationState?: MeshLockOperationState) => void> => {
+  const handle = await acquireMeshCustodyHandle(root, timeoutMs, options);
+  return (operationState: MeshLockOperationState = "returned") => {
+    const failure = handle.release();
+    if (failure) throw new MeshLockReleaseError(handle.lock, operationState, failure, handle.release);
+  };
+};
+
+/** The custody lock as a finalizer handle (lock-release.ts); its release is repeatable on every route. */
+export const acquireMeshCustodyHandle = async (root: string, timeoutMs = CUSTODY_LOCK_TIMEOUT_MS,
+  options: MeshCustodyLockOptions = {}): Promise<MeshLockReleaseHandle> => {
   fs.mkdirSync(root, { recursive: true, mode: 0o700 });
   const lock = path.join(root, MESH_CUSTODY_LOCK_NAME);
   const ownerPath = path.join(lock, "owner");
@@ -92,6 +113,9 @@ export const acquireMeshCustodyLock = async (root: string, timeoutMs = CUSTODY_L
     catch (error) { if (errorCode(error) === "ENOENT") return undefined; throw error; }
   };
   const blocked: StaleLockNote = {};
+  // smarty-dev#9569 A: Windows materializes the retained native capability BEFORE any owner publication (throws: none).
+  const capability = prepareMeshLockRelease();
+  const windowsRelease = capability ? windowsMeshReleaser(lock, record, capability) : undefined;
   // The relative wait budget starts at the first acquisition attempt, after setup (incarnation and PID-namespace
   // reads): slow setup must not spend it before the lock was tried.
   const deadline = Date.now() + Math.max(0, timeoutMs);
@@ -146,7 +170,9 @@ export const acquireMeshCustodyLock = async (root: string, timeoutMs = CUSTODY_L
   // smarty-dev#8777: release through the directory pinned now (the publication fence's fd-pinned release),
   // never a check-then-rename by name that a reclaimed, stalled holder could run against its successor.
   // Main's release by name. Non-Linux keeps it; the stalled-holder race there is tracked in smarty-dev#9569.
-  const releaseByName = (): void => {
+  const releaseByName: MeshLockReleaser = () => {
+    // Windows dispatches first: never the by-name branch or its rename fallback below.
+    if (windowsRelease) return windowsRelease();
     try {
       // smarty-dev#8907: the stat captured before the owner judgment; only that inode is removed (detached into
       // verifiedRemove's graveyard first). A swapped-in successor is refused, never removed.
@@ -162,7 +188,9 @@ export const acquireMeshCustodyLock = async (root: string, timeoutMs = CUSTODY_L
     } catch {
       // Already recovered or replaced: never delete a successor.
     }
+    return undefined;
   };
+  const byName: MeshLockReleaseHandle = { lock, release: releaseByName };
   const pin = pinFenceLock(lock, record);
   // ponytail: fence-lock.ts stays main's code, so its verdicts are split here. On Linux the pin must hold:
   // FOREIGN_LOCK also comes from a failed open (EMFILE, EACCES...) and undefined from an unreadable
@@ -175,16 +203,25 @@ export const acquireMeshCustodyLock = async (root: string, timeoutMs = CUSTODY_L
     if (ours) releaseByName();
     throw new MeshLockTimeoutError(` (custody lock ${lock} could not be pinned or was reclaimed before entry)`, attempts, maxGapMs);
   }
+  // Windows pre-entry: exactly {owner} holding our original record, or refuse before the operation.
+  if (windowsRelease) {
+    const refusal = windowsPreEntryRefusal(lock, record);
+    if (refusal) failBeforeEntry(refusal, [byName]);
+    return byName;
+  }
   // The pinned release closes its fd, so it runs once; main's release may be called again after a failure.
   let done = false;
-  return () => {
-    if (pin !== undefined) {
-      if (done) return;
-      done = true;
-      releaseFenceLock(lock, record, {}, pin);
-      return;
-    }
-    releaseByName();
+  return {
+    lock,
+    release: () => {
+      if (pin !== undefined) {
+        if (done) return undefined;
+        done = true;
+        releaseFenceLock(lock, record, {}, pin);
+        return undefined;
+      }
+      return releaseByName();
+    },
   };
 };
 
@@ -270,11 +307,12 @@ const clearDeadCustodyLock = async (lock: string, readOwner: () => string | unde
  */
 export const withMeshCustody = async <T>(mesh: MeshCustodyStore, operation: () => T, timeoutMs?: number): Promise<T> => {
   const budget = Math.min(timeoutMs ?? CUSTODY_LOCK_TIMEOUT_MS, mesh.tryLockBudgetMs ?? Number.POSITIVE_INFINITY);
-  const release = await acquireMeshCustodyLock(mesh.root, budget, { lockProtocol: mesh.lockProtocol ?? 1 });
-  try {
-    if (meshCustodyMode() === "own") return operation();
-    return await (timeoutMs === undefined ? mesh.exclusive(operation) : mesh.exclusive(operation, timeoutMs));
-  } finally {
-    release();
-  }
+  const custody = await acquireMeshCustodyHandle(mesh.root, budget, { lockProtocol: mesh.lockProtocol ?? 1 });
+  // Dual mode: the mesh lock finalizes its own release inside exclusive(); custody is finalized here by the same
+  // utility, so both are released and a primary error (or the inner release error) is never masked.
+  let entered = false;
+  const section = (): T => { entered = true; return operation(); };
+  return runUnderMeshLocksAsync(() => meshCustodyMode() === "own" ? section()
+    : timeoutMs === undefined ? mesh.exclusive(section) : mesh.exclusive(section, timeoutMs), [custody],
+  { started: () => entered });
 };

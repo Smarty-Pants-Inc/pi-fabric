@@ -2,7 +2,11 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { MeshLockTimeoutError } from "../core/atomic-write.js";
-import { acquireMeshCustodyLock, MESH_CUSTODY_LOCK_NAME } from "./custody-lock.js";
+import { acquireMeshCustodyHandle, MESH_CUSTODY_LOCK_NAME } from "./custody-lock.js";
+import {
+  failBeforeEntry, prepareMeshLockRelease, runUnderMeshLocks, runUnderMeshLocksAsync, windowsLockRelease, windowsMeshReleaser,
+  windowsPreEntryRefusal, type MeshLockReleaseHandle, type MeshLockReleaser,
+} from "./lock-release.js";
 import { MeshLock } from "./mesh-lock.js";
 
 /**
@@ -24,11 +28,14 @@ export interface MeshFenceOptions {
 /** Holds the fence across awaits until the operation settles. */
 export const holdMeshFence = async <T>(root: string, options: MeshFenceOptions,
   operation: (lock: MeshLock) => Promise<T> | T): Promise<T> => {
-  const releaseCustody = await acquireMeshCustodyLock(root, options.lockTimeoutMs, { lockProtocol: options.lockProtocol ?? 1 });
-  try {
+  const custody = await acquireMeshCustodyHandle(root, options.lockTimeoutMs, { lockProtocol: options.lockProtocol ?? 1 });
+  // smarty-dev#9569 A: the mesh lock finalizes its own release; custody is finalized by the same shared utility, so
+  // BOTH are released and the primary (operation, inner acquisition or inner release) error is never masked.
+  let entered = false;
+  return runUnderMeshLocksAsync(() => {
     const lock = new MeshLock(root, { lockProtocol: options.lockProtocol ?? 1, lockTimeoutMs: options.lockTimeoutMs }, () => undefined);
-    return await lock.withLockAcrossAwait(async () => operation(lock), options.lockTimeoutMs, "other");
-  } finally { releaseCustody(); }
+    return lock.withLockAcrossAwait(async () => { entered = true; return operation(lock); }, options.lockTimeoutMs, "other");
+  }, [custody], { started: () => entered });
 };
 
 const sleepSync = (ms: number): void => { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); };
@@ -49,11 +56,35 @@ const tryCustody = (lock: string, token: string, record: string): boolean => {
   } finally { fs.rmSync(staging, { recursive: true, force: true }); }
 };
 
-/** One attempt at the mesh `.lock` with the protocol-1 wire (mkdir, then the owner record). */
-const tryMeshLock = (lock: string, record: string): boolean => {
+const ownershipLost = (): Error => Object.assign(new Error("Fabric mesh lock ownership lost during acquisition"), {
+  code: "FABRIC_MESH_LOCK_OWNERSHIP_LOST",
+});
+
+/**
+ * One attempt at the mesh `.lock` with the protocol-1 wire (mkdir, then the owner record). On Windows (smarty-dev#9569
+ * A) the exact bigint directory identity captured after mkdir and the FULL original record are rechecked after the
+ * `wx` publication; on loss only the expected-record Windows release runs and entry is refused.
+ */
+const tryMeshLock = (lock: string, record: string, windowsRelease?: MeshLockReleaser): boolean => {
   try { fs.mkdirSync(lock, { mode: 0o700 }); } catch (error) { if (codeOf(error) === "EEXIST") return false; throw error; }
-  try { fs.writeFileSync(path.join(lock, "owner"), record, { encoding: "utf8", flag: "wx", mode: 0o600 }); return true; }
-  catch (error) {
+  let directory: fs.BigIntStats | undefined;
+  if (windowsRelease) {
+    try { directory = fs.lstatSync(lock, { bigint: true }); } catch { return false; } // reaped before our owner: retry
+  }
+  try {
+    fs.writeFileSync(path.join(lock, "owner"), record, { encoding: "utf8", flag: "wx", mode: 0o600 });
+    if (windowsRelease && directory) {
+      let current: fs.BigIntStats | undefined;
+      let owner: string | undefined;
+      try { current = fs.lstatSync(lock, { bigint: true }); owner = fs.readFileSync(path.join(lock, "owner"), "utf8"); }
+      catch { /* gone or unreadable: not provably ours */ }
+      if (!current?.isDirectory() || current.dev !== directory.dev || current.ino !== directory.ino || owner !== record) {
+        failBeforeEntry(ownershipLost(), [{ lock, release: windowsRelease }]);
+      }
+    }
+    return true;
+  } catch (error) {
+    if (codeOf(error) === "FABRIC_MESH_LOCK_OWNERSHIP_LOST") throw error;
     if (codeOf(error) === "EEXIST") return false; // a recoverer's successor owns it now: never clean it
     // ponytail: atomic rmdir of an EMPTY directory (fails on any owner): a swapped-in directory loses no data or custody,
     // its protocol-1 creator's `wx` owner write then fails (ENOENT) and it never enters. smarty-dev#8907 inventory.
@@ -136,6 +167,8 @@ export const releaseFenceLock = (lock: string, record: string,
     } finally { try { fs.closeSync(pin); } catch { /* already closed */ } }
     return;
   }
+  // smarty-dev#9569 A: never the take/rename-by-name branch on Windows; its releases dispatch to lock-release.ts.
+  if (windowsLockRelease()) throw new Error("releaseFenceLock: the unpinned by-name release is not used on Windows (smarty-dev#9569)");
   const ownerPath = path.join(lock, "owner");
   try { if (fs.readFileSync(ownerPath, "utf8") !== record) return; } catch { return; }
   hooks.afterCheck?.();
@@ -173,10 +206,14 @@ export class MeshFenceBusyError extends MeshLockTimeoutError {
  */
 export const holdMeshFenceSync = <T>(root: string, timeoutMs: number, operation: () => T): T => {
   fs.mkdirSync(root, { recursive: true, mode: 0o700 });
+  // smarty-dev#9569 A: the retained Windows capability exists BEFORE either publication (throws: nothing published).
+  const capability = prepareMeshLockRelease();
   const deadline = Date.now() + Math.max(0, timeoutMs);
-  const acquire = (lock: string, attempt: (token: string, record: string) => boolean): (() => void) => {
+  const acquire = (lock: string,
+    attempt: (token: string, record: string, windowsRelease?: MeshLockReleaser) => boolean): MeshLockReleaseHandle => {
     const token = randomUUID();
     const record = `${token}\n${process.pid}\n${Date.now()}\n`;
+    const windowsRelease = capability ? windowsMeshReleaser(lock, record, capability) : undefined;
     let attempts = 0;
     let maxGapMs = 0;
     let last = Date.now();
@@ -185,9 +222,16 @@ export const holdMeshFenceSync = <T>(root: string, timeoutMs: number, operation:
       if (attempts > 0) maxGapMs = Math.max(maxGapMs, now - last);
       attempts += 1;
       last = now;
-      if (attempt(token, record)) {
+      if (attempt(token, record, windowsRelease)) {
+        if (windowsRelease) {
+          // Windows dispatch precedes the pin/unpinned branch; pre-entry grammar exactly {owner} or refuse.
+          const handle: MeshLockReleaseHandle = { lock, release: windowsRelease };
+          const refusal = windowsPreEntryRefusal(lock, record);
+          if (refusal) failBeforeEntry(refusal, [handle]);
+          return handle;
+        }
         const pin = pinFenceLock(lock, record);
-        if (pin !== FOREIGN_LOCK) return () => releaseFenceLock(lock, record, {}, pin);
+        if (pin !== FOREIGN_LOCK) return { lock, release: () => { releaseFenceLock(lock, record, {}, pin); return undefined; } };
       }
       if (Date.now() >= deadline) {
         let pid: string | undefined;
@@ -198,10 +242,11 @@ export const holdMeshFenceSync = <T>(root: string, timeoutMs: number, operation:
     }
   };
   const custody = path.join(root, MESH_CUSTODY_LOCK_NAME);
-  const releaseCustody = acquire(custody, (token, record) => tryCustody(custody, token, record));
-  try {
-    const mesh = path.join(root, ".lock");
-    const releaseMesh = acquire(mesh, (_token, record) => tryMeshLock(mesh, record));
-    try { return operation(); } finally { releaseMesh(); }
-  } finally { releaseCustody(); }
+  const custodyHandle = acquire(custody, (token, record) => tryCustody(custody, token, record));
+  const mesh = path.join(root, ".lock");
+  let meshHandle: MeshLockReleaseHandle;
+  try { meshHandle = acquire(mesh, (_token, record, windowsRelease) => tryMeshLock(mesh, record, windowsRelease)); }
+  catch (error) { failBeforeEntry(error, [custodyHandle]); }
+  // One shared finalizer releases BOTH (mesh, then custody) and aggregates their failures.
+  return runUnderMeshLocks(operation, [meshHandle, custodyHandle]);
 };

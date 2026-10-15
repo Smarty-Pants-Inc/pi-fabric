@@ -11,6 +11,10 @@ import {
 } from "../core/atomic-write.js";
 import { FOREIGN_LOCK, pinFenceLock, releaseFenceLock } from "./fence-lock.js";
 import { verifiedRemove } from "../storage/verified-remove.js";
+import {
+  failBeforeEntry, finalizeMeshLocks, prepareMeshLockRelease, windowsMeshReleaser, windowsPreEntryRefusal,
+  type MeshLockReleaseHandle, type MeshLockReleaser, type MeshLockSettlement,
+} from "./lock-release.js";
 
 // The mesh `.lock` domain (smarty-dev#6477 L0): acquisition (withLock, withTryLock), lock tickets,
 // timeouts, the L8 timing hook and recovery of stale owners. State (state-file.ts) and events
@@ -285,14 +289,20 @@ export class MeshLock {
       ? `${token}\n${process.pid}\n${Date.now()}\n${startTime ?? ""}\n${this.#ownNamespace ?? ""}\n`
       : `${token}\n${process.pid}\n${Date.now()}\n${startTime ? `${startTime}\n` : ""}`;
     const blocked: StaleLockNote = {};
+    // smarty-dev#9569 A: on Windows the retained native capability is materialized BEFORE any owner publication (a
+    // failure throws here, nothing published), and the release closure captures it with the ORIGINAL record.
+    const capability = prepareMeshLockRelease();
+    const windowsRelease = capability ? windowsMeshReleaser(this.#lockPath, ownerRecord, capability) : undefined;
     // smarty-dev#8777: release through the directory this holder pinned at acquisition (the publication
     // fence's fd-pinned release). A check-then-rename by name let a holder that stalled past staleMs, and was
     // reclaimed, remove its successor's lock. Before a pin exists, and off Linux, the release is main's below.
     let pin: number | undefined;
-    const releaseOwned = (): void => {
+    const releaseOwned: MeshLockReleaser = () => {
+      // Windows dispatches first: never the unpinned by-name branch below, never a take/rename fallback.
+      if (windowsRelease) return windowsRelease();
       const held = pin;
       pin = undefined;
-      if (held !== undefined) { releaseFenceLock(this.#lockPath, ownerRecord, {}, held); return; }
+      if (held !== undefined) { releaseFenceLock(this.#lockPath, ownerRecord, {}, held); return undefined; }
       // Non-Linux keeps main's release; the stalled-holder race there is tracked in smarty-dev#9569.
       try {
         // smarty-dev#8907: the directory judged by its owner record, stat captured before that read; only that inode
@@ -311,7 +321,9 @@ export class MeshLock {
       } catch {
         // Already replaced/removed, unreadable, or cleanup failed: never delete canonical.
       }
+      return undefined;
     };
+    const releaseHandle: MeshLockReleaseHandle = { lock: this.#lockPath, release: releaseOwned };
     // smarty-dev#9805: only the canonical mesh lock opts into the early free-lock bypass of a stalled head.
     const admission = createMeshLockAdmission(this.root, token, waitMs, { stalledHeadBypassLock: this.#lockPath });
     const { ticket, deadline } = admission;
@@ -348,22 +360,22 @@ export class MeshLock {
               code: "FABRIC_MESH_LOCK_OWNERSHIP_LOST",
             });
             try {
-              const directory = fs.lstatSync(this.#lockPath);
+              const directory = fs.lstatSync(this.#lockPath, { bigint: true });
               fs.writeFileSync(ownerPath, ownerRecord, {
                 encoding: "utf8", flag: "wx", mode: 0o600,
               });
               // The exclusive create may itself have paused with an open descriptor to a
               // recovered directory. Prove publication still belongs to the canonical lock
               // before entering the critical section; never clean a successor on failure.
-              const current = fs.lstatSync(this.#lockPath);
+              const current = fs.lstatSync(this.#lockPath, { bigint: true });
               if (!current.isDirectory() || current.dev !== directory.dev || current.ino !== directory.ino ||
                 fs.readFileSync(ownerPath, "utf8") !== ownerRecord) throw ownershipLost();
             } catch (error) {
               // A resumed initializer may have published into an empty replacement before
               // rejecting its directory identity. Remove only that attempt's exact receipt.
-              releaseOwned();
-              if (errorCode(error) === "EEXIST" || errorCode(error) === "ENOENT") throw ownershipLost();
-              throw error;
+              // Its failure is reported as secondary; the acquisition error stays primary (operation not started).
+              failBeforeEntry(errorCode(error) === "EEXIST" || errorCode(error) === "ENOENT" ? ownershipLost() : error,
+                [releaseHandle]);
             }
           } else {
             // Never expose an ownerless canonical directory: a stalled initializer must not
@@ -427,19 +439,41 @@ export class MeshLock {
         if (ours) releaseOwned();
         throw new MeshLockTimeoutError(describeLockHolder(ownerPath), attempts, maxGapMs);
       }
+      // Windows pre-entry: exactly {owner} with our original record, or refuse before the operation.
+      if (windowsRelease) {
+        const refusal = windowsPreEntryRefusal(this.#lockPath, ownerRecord);
+        if (refusal) failBeforeEntry(refusal, [releaseHandle]);
+      }
       if (timed) lockHeldAt = performance.now();
+      let settled: MeshLockSettlement<T> | undefined;
       try {
         this.#writeAbortSignal?.throwIfAborted();
-        return acrossAwait ? await operation() : operation();
       } catch (error) {
-        // A failed write (a version conflict above all) means this store's view is behind: the
-        // next read parses the file again instead of reusing a recent parse.
-        this.#onOperationError();
-        throw error;
-      } finally {
-        releaseOwned();
-        if (timed) holdMs = performance.now() - lockHeldAt;
+        settled = { state: "not-started", error };
       }
+      if (settled === undefined) {
+        try {
+          // No await for a synchronous section: the release still follows it in the same turn.
+          const value = acrossAwait ? await operation() : operation();
+          settled = { state: "returned", value: value as T };
+        } catch (error) {
+          // A failed write (a version conflict above all) means this store's view is behind: the
+          // next read parses the file again instead of reusing a recent parse.
+          settled = { state: "threw", error };
+        }
+      }
+      if (settled.state !== "returned") {
+        try { this.#onOperationError(); }
+        catch (callbackError) {
+          // Invalidation is secondary: it must never skip release or replace the original thrown value.
+          try { console.warn("[pi-fabric] ALARM mesh-lock onOperationError failed (secondary to operation/abort)", callbackError); }
+          catch { /* diagnostics must not mask the primary or prevent release */ }
+        }
+      }
+      // One shared finalizer: the release runs once; a primary throw is preserved, a release failure after a
+      // returned operation is a typed MeshLockReleaseError (never an operation replay).
+      try { return finalizeMeshLocks(settled, [releaseHandle]); }
+      finally { if (timed) holdMs = performance.now() - lockHeldAt; }
     } catch (error) {
       if (timed && lockHeldAt < 0 && error instanceof MeshLockTimeoutError && !(error instanceof MeshLockQueueExpiredError)) {
         failedWaitMs = performance.now() - lockWaitStart;

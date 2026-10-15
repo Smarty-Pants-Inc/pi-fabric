@@ -30,6 +30,7 @@ queue_rules:
     merge_method: merge
     queue_conditions:
       - -label ~= (?i)^(hold|do[ -]?not[ -]?merge|dnm|freeze|frozen)$
+      - -label ~= (?i)^(wip|work[ -]?in[ -]?progress|do[ -]?not[ -]?land|never[ -]?land)$
       - base = main
       - -draft
       - -label = hold

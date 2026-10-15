@@ -9,26 +9,36 @@ import { windowsDataRoot } from "./windows-temp-root.js";
  * anything is created at or below it (the override mkdir walk below, or a caller's mkdtemp such as AgentManager's
  * pi-fabric-runs-). Read-only: lstats the existing chain from `/`, following a symlink (the system aliases
  * /tmp -> private/tmp, /var -> private/var) only to stat what it names; stops at the first missing component.
- * Ownership and symlink policy stay with the existing validators.
+ * Then checks the PHYSICAL chain of the deepest existing directory (realpath), so a symlink lexically outside the
+ * shared directory cannot name a child inside it. A dangling or unresolvable symlink, or any realpath/stat error on
+ * the existing prefix, throws (fail-closed, nothing written); only a missing lexical component (lstat ENOENT/ENOTDIR)
+ * ends the walk, and the missing suffix is never realpath'ed. Ownership and symlink policy stay with the existing validators.
  */
 const refuseDarwinSharedSticky = (directory: string): void => {
   if (process.platform !== "darwin") return;
   const target = path.resolve(directory);
   let walked = path.parse(target).root;
   const names = target.slice(walked.length).split(path.sep).filter(Boolean);
+  let deepest = walked;
   for (let index = 0; ; walked = path.join(walked, names[index++]!)) {
-    let stat: fs.Stats | undefined;
-    try {
-      stat = fs.lstatSync(walked);
-      if (stat.isSymbolicLink()) stat = fs.statSync(walked);
-    } catch (error) {
+    let stat: fs.Stats;
+    try { stat = fs.lstatSync(walked); }
+    catch (error) {
       const errno = (error as NodeJS.ErrnoException).code;
-      if (errno === "ENOENT" || errno === "ENOTDIR") return; // nothing exists below: no shared ancestor left to pass
+      if (errno === "ENOENT" || errno === "ENOTDIR") break; // missing component: nothing exists below
       throw error;
     }
-    if (!stat.isDirectory()) return; // the existing validators refuse it
+    if (stat.isSymbolicLink()) stat = fs.statSync(walked); // dangling/unresolvable link throws: refuse, never create
+    if (!stat.isDirectory()) break; // the existing validators refuse it
     refuseSharedSticky(stat, walked, target);
-    if (index >= names.length) return;
+    deepest = walked;
+    if (index >= names.length) break;
+  }
+  const physical = fs.realpathSync(deepest); // throws on any error: fail-closed before any write
+  let real = path.parse(physical).root;
+  for (const name of ["", ...physical.slice(real.length).split(path.sep).filter(Boolean)]) {
+    real = path.join(real, name);
+    refuseSharedSticky(fs.statSync(real), real, target);
   }
 };
 

@@ -70,6 +70,11 @@ export interface FabricMainAgentDeliveryRequest {
   wakeCause?: FabricWakeCause | undefined;
   /** Receiving route metadata, never hydrated from command/message data. */
   admissionTopic?: string | undefined;
+  /** Host-hydrated origin metadata for a root-inbox event shadow. */
+  inboxEventId?: string | undefined;
+  inboxTopic?: string | undefined;
+  inboxKey?: string | undefined;
+  inboxReceipts?: string[] | undefined;
   data?: unknown;
   /**
    * A stable id of the sender's durable record (a resident actor's delivery record). Main journals
@@ -289,6 +294,11 @@ export interface HeldAgentMessage {
   /** Receiving-envelope route snapshots, never rehydrated from serialized wake causes. */
   admissionTopic?: string;
   admissionKey?: string;
+  /** Host-hydrated origin event identity and receipts; journaled with the native carrier for replay. */
+  inboxEventId?: string;
+  inboxTopic?: string;
+  inboxKey?: string;
+  inboxReceipts?: string[];
   /** A multi-source or differently classified producer has no reconstructable single envelope. */
   unattributedOnReplay?: true;
   message: string;
@@ -652,6 +662,11 @@ export class MainAgentController implements FabricMainAgentTarget {
       ...(unattributedOnReplay ? { unattributedOnReplay: true } : {}),
       ...(admissionTopic ? { admissionTopic } : {}),
       ...(admissionKey ? { admissionKey } : {}),
+      ...(typeof request.inboxEventId === "string" ? { inboxEventId: request.inboxEventId } : {}),
+      ...(typeof request.inboxTopic === "string" ? { inboxTopic: request.inboxTopic } : {}),
+      ...(typeof request.inboxKey === "string" ? { inboxKey: request.inboxKey } : {}),
+      ...(Array.isArray(request.inboxReceipts) && request.inboxReceipts.every((id) => typeof id === "string")
+        ? { inboxReceipts: [...request.inboxReceipts] } : {}),
       ...((request.verification === "mesh" || request.verification === "bridge") &&
         mainSenderClaimAllowed(sender, deliveryId, request.source) ? {
         provenance: fabricTurnProvenance(sender, request.delivery === "nextTurn" ? "actor" : request.delivery, request.verification, request.principal),
@@ -2025,17 +2040,26 @@ export class MainAgentController implements FabricMainAgentTarget {
     // Each item keeps its own delivery mark: a flushed batch goes in as a steer, but it holds followUps.
     const delivery: FabricMainAgentDelivery = flushed ? "followUp" : deliverAs;
     const blocks = items.map((item) => agentMessageBlock(item, delivery));
-    const itemDetails = (item: HeldAgentMessage) => ({
-      id: item.id,
-      from: item.from,
-      delivery,
-      sentAt: new Date(item.sentAt).toISOString(),
-      ...(item.replacedAt === undefined ? {} : { replacedAt: new Date(item.replacedAt).toISOString() }),
-      ...(item.chain === undefined ? {} : { chain: item.chain, generation: item.generation, replaces: item.replaces }),
-      ...(item.data === undefined ? {} : { data: item.data }),
-      ...(item.deliveryId === undefined ? {} : { deliveryId: item.deliveryId }),
-      ...(item.supersedes?.length ? { supersedes: item.supersedes } : {}),
-    });
+    const itemDetails = (item: HeldAgentMessage) => {
+      // Preserve explicit native data claims. When there is no payload, carry the admitted
+      // event's work claim in the existing session-reader shape, outside the startup graph.
+      const data = item.data === undefined && item.inboxKey !== undefined
+        ? { key: item.inboxKey, topic: item.inboxTopic } : item.data;
+      return {
+        id: item.id,
+        from: item.from,
+        delivery,
+        sentAt: new Date(item.sentAt).toISOString(),
+        ...(item.replacedAt === undefined ? {} : { replacedAt: new Date(item.replacedAt).toISOString() }),
+        ...(item.chain === undefined ? {} : { chain: item.chain, generation: item.generation, replaces: item.replaces }),
+        ...(data === undefined ? {} : { data }),
+        ...(item.deliveryId === undefined ? {} : { deliveryId: item.deliveryId }),
+        ...(item.inboxEventId === undefined ? {} : { inboxEventId: item.inboxEventId }),
+        ...(item.inboxTopic === undefined ? {} : { inboxTopic: item.inboxTopic }),
+        ...(item.inboxKey === undefined ? {} : { inboxKey: item.inboxKey }),
+        ...(item.supersedes?.length ? { supersedes: item.supersedes } : {}),
+      };
+    };
     const first = items[0]!;
     const provenance = this.#provenance(first);
     const options = { deliverAs, triggerTurn };
@@ -2055,6 +2079,8 @@ export class MainAgentController implements FabricMainAgentTarget {
         details: {
           ...itemDetails(first),
           ...(items.length > 1 ? { id: randomUUID(), items: items.map(itemDetails) } : {}),
+          ...(items.some((item) => item.inboxReceipts?.length)
+            ? { receipts: items.flatMap((item) => item.inboxReceipts ?? []) } : {}),
           triggerTurn,
           ...(flushed ? { flushed: true } : {}),
         },

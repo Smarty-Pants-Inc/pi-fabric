@@ -928,6 +928,10 @@ export class AgentMessageRouter {
         delivery: command.operation,
         ...(command.priority ? { priority: command.priority } : {}),
         deliveryId: command.commandId,
+        ...(command.eventId === undefined ? {} : { inboxEventId: command.eventId }),
+        ...(command.inboxTopic === undefined ? {} : { inboxTopic: command.inboxTopic }),
+        ...(command.inboxKey === undefined ? {} : { inboxKey: command.inboxKey }),
+        ...(command.inboxReceipts === undefined ? {} : { inboxReceipts: command.inboxReceipts }),
         outcomeSend: { eventId: command.eventId ?? command.commandId, to: this.mainAgent.id, from: from.id, mode: command.operation },
         ...(typeof command.triggerTurn === "boolean"
           ? { triggerTurn: command.triggerTurn }

@@ -8,11 +8,11 @@ import { PassThrough } from "node:stream";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MeshBridge, RemoteBridgeSide, serveBridgeAgent, StoreBridgeSide, type BridgePublish } from "../src/mesh/bridge.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
-import { FabricControlPlane } from "../src/topology/control-plane.js";
+import { FabricControlPlane, FabricControlStaleIncarnationError } from "../src/topology/control-plane.js";
 import { FABRIC_IDEMPOTENCY_KEY_REUSED, FabricIdempotencyKeyReusedError } from "../src/mesh/control-idempotency.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { readHostLease, writeHostLease } from "../src/topology/host-leases.js";
-import { writeParticipantFile } from "../src/topology/participant-files.js";
+import { readParticipantFile, writeParticipantFile } from "../src/topology/participant-files.js";
 
 const removals = vi.hoisted(() => [] as string[]);
 vi.mock("../src/topology/host-leases.js", async importOriginal => {
@@ -614,8 +614,20 @@ describe("local singleton relay data safety", () => {
     await expect(sender.request(target.identity.id, target.identity.id, "followUp", input, target.identity.id, options))
       .resolves.toMatchObject({ acknowledged: true, messageId: "genuine-late-owner" });
     expect(events(a, "fabric.control.command")).toHaveLength(1);
-    // Same key with a newly resolved activation must NOT consume the old cached epoch.
     const newEpoch = "fixture:newly-resolved-owner";
+    // An input epoch alone is not authority: #1070 revalidates it against the mirrored directory.
+    await expect(sender.request(target.identity.id, target.identity.id, "followUp", { ...input, ownerIncarnation: newEpoch }, target.identity.id, options))
+      .rejects.toBeInstanceOf(FabricControlStaleIncarnationError);
+    expect(events(a, "fabric.control.command")).toHaveLength(1);
+    // Publish the real replacement activation at its origin, then mirror it through both links.
+    const b = f.stores.ryzen2!, participantKey = key("topology/participants/", target.identity.id);
+    const participant = readParticipantFile(b.root, participantKey)!;
+    const updatedAt = Date.now();
+    writeParticipantFile(b.root, { ...participant, version: participant.version + 1, updatedAt,
+      value: { ...(participant.value as Record<string, unknown>), ownerIncarnation: newEpoch, updatedAt } });
+    await f.drain();
+    expect(a.get(participantKey, { fresh: true })?.value).toMatchObject({ ownerIncarnation: newEpoch });
+    // Same key with this newly resolved activation must NOT consume the old cached epoch.
     const changed = sender.request(target.identity.id, target.identity.id, "followUp", { ...input, ownerIncarnation: newEpoch }, target.identity.id, options);
     void changed.catch(() => undefined);
     await vi.waitFor(() => expect(events(a, "fabric.control.command")).toHaveLength(2));

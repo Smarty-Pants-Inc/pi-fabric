@@ -104,6 +104,77 @@ describe("dead-letter replay age and current activation filter (#10630)", () => 
     }));
   });
 
+  it.each(["EPERM", "EIO"])("syncs the writable fallback backup before truncating, but refuses other rename failures (%s)", async code => {
+    const w = await backlog();
+    const line = `${JSON.stringify(w.entries[0])}\n`;
+    fs.writeFileSync(w.archive, line.repeat(Math.floor(ACTOR_DEAD_LETTER_ARCHIVE_MAX_BYTES / Buffer.byteLength(line))));
+    const before = fs.readFileSync(w.archive, "utf8");
+    const backup = `${w.archive}.1`;
+    const temporary = `${backup}.${process.pid}.tmp`;
+    const rename = fs.renameSync, open = fs.openSync, sync = fs.fsyncSync, unlink = fs.unlinkSync;
+    const steps: string[] = [];
+    let fallbackFd: number | undefined;
+    vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+      if (String(from) === temporary && String(to) === backup) throw Object.assign(new Error("injected rename refusal"), { code });
+      return rename(from, to);
+    });
+    vi.spyOn(fs, "openSync").mockImplementation((file, flags, mode) => {
+      const fd = open(file, flags, mode);
+      if (String(file) === backup && flags === "r+") { fallbackFd = fd; steps.push("backup-open-writable"); }
+      if (String(file) === w.archive && flags === "w") steps.push("archive-truncate");
+      return fd;
+    });
+    vi.spyOn(fs, "fsyncSync").mockImplementation(fd => {
+      if (fd === fallbackFd) { steps.push("backup-sync"); fallbackFd = undefined; }
+      return sync(fd);
+    });
+    vi.spyOn(fs, "unlinkSync").mockImplementation(file => {
+      if (String(file) === temporary) { steps.push("temporary-unlink-recorded"); return; }
+      return unlink(file);
+    });
+    const manager = w.open();
+    await manager.setActivationFilter(w.actor.id, null);
+    if (code === "EPERM") {
+      await waitFor(() => receipts(manager, w.actor.id).length === 1);
+      expect(steps.slice(0, 4)).toEqual(["backup-open-writable", "backup-sync", "temporary-unlink-recorded", "archive-truncate"]);
+      expect(fs.readFileSync(backup, "utf8")).toBe(before);
+      expect(readLines<Entry>(w.archive)).toEqual(w.entries.slice(0, 6));
+    } else {
+      expect(fs.readFileSync(w.archive, "utf8")).toBe(before);
+      expect(readLines<Entry>(w.file)).toEqual(w.entries);
+      expect(receipts(manager, w.actor.id)).toEqual([]);
+      expect(steps).toEqual([]);
+    }
+  });
+
+  it("keeps only the newest suffix across repeated oversized stale batches", async () => {
+    const w = await backlog();
+    let previous: Entry[] = [];
+    for (let batch = 0; batch < 3; batch++) {
+      const entries: Entry[] = Array.from({ length: 32 }, (_, index) => ({
+        ...w.entries[0]!,
+        event: { ...w.entries[0]!.event, id: `batch-${batch}-${index}`, text: "x".repeat(40_000) },
+      }));
+      fs.writeFileSync(w.file, entries.map(entry => JSON.stringify(entry) + "\n").join(""));
+      const manager = w.open();
+      await waitFor(() => readLines(w.file).length === 0);
+      const newest = readLines<Entry>(w.archive);
+      expect(fs.statSync(w.archive).size).toBeLessThanOrEqual(ACTOR_DEAD_LETTER_ARCHIVE_MAX_BYTES);
+      expect(newest.length).toBeGreaterThan(0);
+      expect(newest.length).toBeLessThan(entries.length);
+      expect(newest.map(entry => entry.event.id)).toEqual(entries.slice(-newest.length).map(entry => entry.event.id));
+      if (batch > 0) {
+        expect(fs.statSync(`${w.archive}.1`).size).toBeLessThanOrEqual(ACTOR_DEAD_LETTER_ARCHIVE_MAX_BYTES);
+        expect(readLines<Entry>(`${w.archive}.1`).map(entry => entry.event.id)).toEqual(previous.map(entry => entry.event.id));
+      }
+      expect(manager.messages(w.actor.id)).toContainEqual(expect.objectContaining({
+        data: expect.objectContaining({ reason: "dead_letter_archive", deadLetterArchiveDropped: expect.any(Number) }),
+      }));
+      previous = newest;
+      await manager.close();
+    }
+  });
+
   it("archives stale entries behind a full replay batch without overtaking remaining fresh work", async () => {
     const w = await backlog({}, 2);
     const freshIds = new Set([0, 3, 6, 9]);

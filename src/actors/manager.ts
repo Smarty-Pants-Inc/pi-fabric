@@ -1071,6 +1071,7 @@ export class ActorManager {
       this.#schedulePresenceRetry();
       this.#scheduleRestoreParked();
       this.#meshMonitor.schedule();
+      for (const actor of this.#actors.values()) this.#replayDeadLetters(actor);
     });
     this.#registry = new ActorRegistryStore(this.#actorRoot);
     this.#slotNameRegistries = options.slotNameRegistries ?? [];
@@ -5945,7 +5946,7 @@ export class ActorManager {
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "EEXIST" && (error as NodeJS.ErrnoException).code !== "EPERM") throw error;
         fs.copyFileSync(temporary, file);
-        const backupFd = fs.openSync(file, "r");
+        const backupFd = fs.openSync(file, "r+");
         try { fs.fsyncSync(backupFd); } finally { fs.closeSync(backupFd); }
         fs.unlinkSync(temporary);
       }

@@ -13,7 +13,9 @@
  * - ancestors: owned by one of those trusted SIDs; a foreign grant that applies to the ancestor itself may add
  *   files or subdirectories (the sticky analogue: C:\ grants Authenticated Users AD) and nothing else, so nobody
  *   else can delete, rename, re-ACL or take over a component. Inherit-only grants (CREATOR OWNER among them) are
- *   skipped on ancestors ONLY: they are not the ancestor's own access, and each component below is judged itself.
+ *   skipped on ordinary ancestors because they are not the ancestor's own access. A directory immediately used to
+ *   create a missing component is stricter: foreign inheritable write/full/modify/delete grants are refused before
+ *   that component is made visible; CREATOR OWNER remains the explicit safe inheritance exception.
  * - a root this process just created (a non-recursive mkdir that succeeded) gets, through the built-in icacls, an
  *   explicit owner (the current user) and a protected DACL: current user and SYSTEM full control, (OI)(CI); it is read
  *   back in the same child. An existing root is never repaired or adopted.
@@ -113,10 +115,10 @@ export interface WindowsStateAclRequest {
   real: string;
   /**
    * What `root` is: the state root (default), or a single private path judged by itself (assertPrivatePath's direct
-   * callers: the flag directory, a state file), with its parent chain as ancestors. `ancestor` is the existing
-   * parent of a missing component, preflighted before creation with the unchanged ancestor policy.
+   * callers: the flag directory, a state file), with its parent chain as ancestors. `ancestor` is an ordinary
+   * existing ancestor; `creation-parent` is the immediate parent preflighted before a missing component is created.
    */
-  role?: "root" | "directory" | "file" | "ancestor";
+  role?: "root" | "directory" | "file" | "ancestor" | "creation-parent";
   /** Strict targets inside the root; a missing one passes (as in assertPrivatePath). */
   files: string[];
   directories: string[];
@@ -156,7 +158,7 @@ const ancestorsOf = (dir: string): string[] => {
   }
 };
 
-type Role = "ancestor" | "root" | "directory" | "file";
+type Role = "ancestor" | "root" | "directory" | "file" | "creation-parent";
 
 /**
  * The refusal for this root, or undefined when it may be opened (including the warned tooling gap).
@@ -214,7 +216,7 @@ export const windowsStateAclRefusal = (request: WindowsStateAclRequest, run: Win
   for (const [index, [target, role]] of [...paths].entries()) {
     const entry: unknown = snapshot.entries[index];
     if (!record(entry) || entry.path !== target) return `${target} has an invalid Windows ACL snapshot entry`;
-    const strict = role !== "ancestor";
+    const strict = role !== "ancestor" && role !== "creation-parent";
     if (entry.missing === true) {
       if (role === "file" || role === "directory") continue;
       return `${target} vanished while its Windows ACL was read`;
@@ -232,11 +234,11 @@ export const windowsStateAclRefusal = (request: WindowsStateAclRequest, run: Win
     if (strict && directory !== (role !== "file")) return `${target} is not a ${role === "file" ? "regular file" : "directory"}`;
     if (typeof entry.owner !== "string" || !SID.test(entry.owner)) return `${target} has an unproven owner`;
     const protectedRoot = role === "root" && request.protect === true;
-    const owned = role === "ancestor" ? trusted(entry.owner)
+    const owned = role === "ancestor" || role === "creation-parent" ? trusted(entry.owner)
       : protectedRoot ? entry.owner === user
       : entry.owner === user || (entry.owner === ADMINISTRATORS && tokenOwner === ADMINISTRATORS);
     if (!owned) {
-      return `${target} is owned by ${entry.owner}, not ${role === "ancestor" ? "the current user, SYSTEM, Administrators or TrustedInstaller"
+      return `${target} is owned by ${entry.owner}, not ${role === "ancestor" || role === "creation-parent" ? "the current user, SYSTEM, Administrators or TrustedInstaller"
         : protectedRoot ? `the current user ${user}, which it was just given` : `the current user ${user} (or Administrators on an elevated run)`}`;
     }
     if (role === "root" && request.protect && (entry.control & SE_DACL_PROTECTED) === 0) return `${target} still inherits its ACL after it was made private`;
@@ -244,10 +246,16 @@ export const windowsStateAclRefusal = (request: WindowsStateAclRequest, run: Win
     for (const ace of entry.dacl as unknown[]) {
       if (!record(ace) || (ace.type !== 0 && ace.type !== 1) || !uint32(ace.flags) || (ace.flags & ~0x1f) !== 0
         || typeof ace.sid !== "string" || !SID.test(ace.sid) || !uint32(ace.mask)) return `${target} has an unsupported or unproven ACE`;
-      if (ace.type === 1 || trusted(ace.sid)) continue; // a deny ACE never cancels another grant: each grant is judged alone
+      if (ace.type === 1 || trusted(ace.sid) || (role === "creation-parent" && ace.sid === "S-1-3-0")) continue;
       // Strict targets judge inherit-only grants too (CREATOR OWNER included): state files and the flag directory
-      // would inherit them, and the creator of a child may be a foreign user.
-      if (!strict && (ace.flags & INHERIT_ONLY) !== 0) continue; // not this ancestor's own access; a child on the chain is judged itself
+      // would inherit them, and the creator of a child may be a foreign user. Ordinary distant ancestors skip
+      // inherit-only access because it is not that ancestor's own access; a creation parent is the boundary at
+      // which the next component would receive it, so every foreign inheritable write grant is unsafe here.
+      const inheritable = (ace.flags & 0x0b) !== 0; // OBJECT_INHERIT | CONTAINER_INHERIT | INHERIT_ONLY
+      if (role === "ancestor" && (ace.flags & INHERIT_ONLY) !== 0) continue;
+      if (role === "creation-parent" && inheritable && (ace.mask & ~READ_ONLY_RIGHTS) !== 0) {
+        return `${target}, the immediate creation parent of ${root}, grants ${ace.sid} inheritable write, delete or permission rights (mask 0x${ace.mask.toString(16)})`;
+      }
       const allowed = strict ? READ_ONLY_RIGHTS : READ_ONLY_RIGHTS | ADD_CHILD_RIGHTS;
       if ((ace.mask & ~allowed) !== 0) {
         return `${target}${strict ? "" : `, an ancestor of ${root},`} grants ${ace.sid} write, delete or permission rights (mask 0x${ace.mask.toString(16)})`;

@@ -164,6 +164,32 @@ describe("Windows mesh state ACL policy (smarty-dev#8920)", () => {
     expect(judge(withEntry(0, { dacl: [...profileDacl(), allow(OTHER, FULL, 0xb)] }))).toMatch(/grants S-1-5-21-1-2-3-1002/);
   });
 
+  it("refuses unsafe foreign inheritance on the immediate creation parent, but keeps CREATOR OWNER and distant IO safe", () => {
+    const parent = "C:\\Users\\me\\.pi";
+    const creationParent: WindowsStateAclRequest = {
+      root: parent, real: parent, role: "creation-parent", files: [], directories: [],
+    };
+    const entries = defaultEntries().slice(1, 5);
+    expect(windowsStateAclRefusal(creationParent, runner([
+      dir(parent, USER, [...profileDacl(), allow(OTHER, FULL, 0xb)]), ...entries.slice(1),
+    ]).run)).toMatch(/immediate creation parent .* grants S-1-5-21-1-2-3-1002 inheritable/);
+    expect(windowsStateAclRefusal(creationParent, runner([
+      dir(parent, USER, [...profileDacl(), allow(OTHER, MODIFY, 0x3)]), ...entries.slice(1),
+    ]).run)).toMatch(/immediate creation parent .* grants S-1-5-21-1-2-3-1002 inheritable/);
+    expect(windowsStateAclRefusal(creationParent, runner([
+      dir(parent, USER, [...profileDacl(), allow(OTHER, 0x40, 0x8)]), ...entries.slice(1),
+    ]).run)).toMatch(/immediate creation parent .* grants S-1-5-21-1-2-3-1002 inheritable/);
+    expect(windowsStateAclRefusal(creationParent, runner([
+      dir(parent, USER, [...profileDacl(), allow(CREATOR_OWNER, FULL, 0xb)]), ...entries.slice(1),
+    ]).run)).toBeUndefined();
+    // C:\\ retains its approved inherit-only Modify grant because it is a distant ancestor, not the creation parent.
+    expect(windowsStateAclRefusal(creationParent, runner(entries).run)).toBeUndefined();
+    // An ordinary, non-inheritable add-child grant remains the approved ancestor control.
+    expect(windowsStateAclRefusal(creationParent, runner([
+      dir(parent, USER, [...profileDacl(), allow(OTHER, 0x6, 0)]), ...entries.slice(1),
+    ]).run)).toBeUndefined();
+  });
+
   it("refuses an ancestor owned by an untrusted account", () => {
     expect(judge(withEntry(3, { owner: OTHER }))).toMatch(/C:\\Users is owned by S-1-5-21-1-2-3-1002/);
   });
@@ -321,7 +347,7 @@ describe("state gate wiring on win32 (smarty-dev#8920)", () => {
       gate.createStateRoot(root);
       gate.createStateRoot(root); // exists now: never re-protected
       expect(calls.map(call => call.protect)).toEqual([false, true]);
-      expect(calls[0]).toMatchObject({ root: path.dirname(root), role: "ancestor", files: [], directories: [] });
+      expect(calls[0]).toMatchObject({ root: path.dirname(root), role: "creation-parent", files: [], directories: [] });
       expect(calls[1]!.files.map(file => path.basename(file))).toEqual(["state.db", "state.db-wal", "state.db-shm"]);
       expect(calls[1]!.directories.map(dir => path.basename(dir))).toEqual(["state-checkpoint.flags"]);
     });
@@ -406,7 +432,7 @@ describe("state gate wiring on win32 (smarty-dev#8920)", () => {
     }
   });
 
-  it("runs a Windows create inside the gate after its one read; a refused root gets no state.db", async () => {
+  it("runs a Windows create inside the gate with a post-create native recheck; a refused root gets no state.db", async () => {
     const order: string[] = [];
     const { gate, calls } = await loadGate(undefined);
     const root = tmp();
@@ -415,7 +441,8 @@ describe("state gate wiring on win32 (smarty-dev#8920)", () => {
       gate.openPrivateStateDb(file, (opened) => { order.push(`open ${calls.length}`); return opener([])(opened); },
         () => { order.push(`create ${calls.length}`); fs.writeFileSync(file, "", { flag: "wx" }); }).close();
     });
-    expect(order).toEqual(["create 1", "open 1"]); // one read, before the create
+    expect(order).toEqual(["create 1", "open 2"]); // the missing-file create is followed by a fresh native read
+    expect(calls).toHaveLength(2);
     const refused = await loadGate("C:\\x grants S-1-1-0 write");
     const other = tmp();
     let created = false;
@@ -427,16 +454,34 @@ describe("state gate wiring on win32 (smarty-dev#8920)", () => {
     expect(fs.readdirSync(other)).toEqual([]);
   });
 
+  it("refuses a database planted after the first snapshot, including an EEXIST create winner", async () => {
+    const planted = "state.db was created after the ACL snapshot and has an untrusted owner";
+    const { gate, calls } = await loadGate(undefined, [undefined, planted]);
+    const root = tmp();
+    const file = path.join(root, "state.db");
+    const opened: string[] = [];
+    await asWindows(async () => {
+      expect(() => gate.openPrivateStateDb(file, opener(opened), () => {
+        // The attacker wins the name before our wx attempt; the production callback ignores this EEXIST.
+        fs.writeFileSync(file, "planted", { flag: "wx" });
+        try { fs.closeSync(fs.openSync(file, "wx")); }
+        catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
+      })).toThrow(planted);
+    });
+    expect(calls).toHaveLength(2);
+    expect(opened).toEqual([]);
+  });
+
   it("opens a store on an existing root with one native read, sync and async", async () => {
     const { calls } = await loadGate(undefined);
     const { SqliteStateStore } = await import("../src/mesh/state-sqlite.js");
     const root = tmp();
     await asWindows(async () => {
       SqliteStateStore.openSync(root, 1024, 16, { initialize: "detached" }).close();
-      expect(calls).toHaveLength(1);
+      expect(calls).toHaveLength(2);
       expect(fs.existsSync(path.join(root, "state.db"))).toBe(true);
       (await SqliteStateStore.open(root, 1024, 16, { initialize: "detached" })).close();
-      expect(calls).toHaveLength(2);
+      expect(calls).toHaveLength(3);
     });
     expect(calls.every(call => call.root === root && call.protect === false && call.directories.length === 1)).toBe(true);
   });
@@ -491,7 +536,7 @@ describe("state gate wiring on win32 (smarty-dev#8920)", () => {
     const mkdir = vi.spyOn(fs, "mkdirSync");
     await asWindows(async () => { expect(() => gate.createStateRoot(root)).toThrow(why); });
     expect(mkdir).not.toHaveBeenCalled();
-    expect(calls).toEqual([expect.objectContaining({ root: base, role: "ancestor", protect: false, files: [], directories: [] })]);
+    expect(calls).toEqual([expect.objectContaining({ root: base, role: "creation-parent", protect: false, files: [], directories: [] })]);
     expect(fs.readdirSync(base)).toEqual([]);
   });
 
@@ -504,7 +549,7 @@ describe("state gate wiring on win32 (smarty-dev#8920)", () => {
     await asWindows(async () => { gate.createStateRoot(root); });
     expect(mkdir.mock.calls).toEqual([[parent, { mode: 0o700 }], [root, { mode: 0o700 }]]);
     expect(calls.map(call => [call.root, call.role, call.protect])).toEqual([
-      [base, "ancestor", false], [parent, "ancestor", false], [root, undefined, true],
+      [base, "creation-parent", false], [parent, "creation-parent", false], [root, undefined, true],
     ]);
     expect(fs.lstatSync(root).isDirectory()).toBe(true);
   });

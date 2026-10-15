@@ -264,14 +264,20 @@ const fdSnapshot = (): Map<string, string> | undefined => {
  * ancestors, a private root and state files, and a connection bound to the checked inode (openPinned, #7784).
  * `create` (smarty-dev#8920, Windows creation paths only): the exclusive create of a missing state.db, run AFTER the
  * root half (filesystem, ancestors, root, state files and flag directory: one native read on Windows) and BEFORE the
- * state files' lstat and the pinned open, so a refused root still gets no file (#846 SEC P2) and the open does not
- * read the descriptors a second time. It skips nothing: every check below runs as without it. A state.db it creates
+ * state files' lstat and the pinned open, so a refused root still gets no file (#846 SEC P2). When state.db was missing
+ * for that first read, a second full native read follows the callback before the open; existing state.db keeps one.
+ * It skips nothing: every check below runs as without it. A state.db it creates
  * inherits the root's DACL, whose inheritable grants the read just judged. POSIX callers keep their own sequence
  * (assertPrivateStateRoot, the create, then this gate without `create`).
  */
 export const openPrivateStateDb = (file: string, open: SqliteOpener, create?: () => void): SqliteConnection => {
+  const missingBeforeGate = process.platform === "win32"
+    && fs.lstatSync(file, { throwIfNoEntry: false }) === undefined;
   assertPrivateStateRoot(path.dirname(file), path.basename(file));
   create?.();
+  // A missing state.db was only covered by the first snapshot. Re-read the native owner/DACL after the create
+  // callback so an EEXIST winner (including a child renamed in after the snapshot) is never adopted by lstat alone.
+  if (missingBeforeGate) assertPrivateStateRoot(path.dirname(file), path.basename(file));
   return openPinned(file, open, assertPrivateStateFiles(file));
 };
 
@@ -314,8 +320,9 @@ export const createStateRoot = (root: string): void => {
   for (let index = firstMissing; index < chain.length; index += 1) {
     const parent = chain[index - 1];
     if (!parent || existing() !== index) throw refuse("its directory chain changed before creation");
-    // `parent` is an ancestor, NOT a strict state root: default profile/volume add-child and inherit-only rules apply.
-    assertWindowsAcl(parent, { role: "ancestor", files: [], directories: [] }, false);
+    // The immediate parent is a creation boundary: its foreign inheritable write grants must not reach the new child.
+    // Distant ancestors retain the ordinary add-child/inherit-only policy (the default profile/volume controls).
+    assertWindowsAcl(parent, { role: "creation-parent", files: [], directories: [] }, false);
     if (existing() !== index) throw refuse("its directory chain changed during the ancestor ACL read");
     try { fs.mkdirSync(chain[index]!, { mode: 0o700 }); }
     catch (error) {
@@ -334,10 +341,10 @@ const stateTargets = (root: string, db: string) => {
   return { files: [file, `${file}-wal`, `${file}-shm`], directories: [path.join(root, CHECKPOINT_FLAGS)] };
 };
 // Every call reads the native descriptors afresh: no proof is cached or shared between calls, so an ACE added
-// between two checks (even in one synchronous turn) is seen. An open reads once (a Windows create path runs its
-// state.db create inside the gate, after this read). Creating N missing directories first costs N ancestor preflight
-// reads (one before each mkdir), plus the root's protect/readback; none of those reads is cached for the open.
-type AclTargets = { role?: "root" | "directory" | "file" | "ancestor"; files: string[]; directories: string[] };
+// between two checks (even in one synchronous turn) is seen. An existing state.db open reads once; a missing one
+// reads before and after its Windows create callback. Creating N missing directories first costs N creation-parent
+// preflight reads (one before each mkdir), plus the root's protect/readback; none of those reads is cached for the open.
+type AclTargets = { role?: "root" | "directory" | "file" | "ancestor" | "creation-parent"; files: string[]; directories: string[] };
 const assertWindowsAcl = (root: string, targets: AclTargets, protect: boolean): void => {
   let real: string;
   // The real chain is the parent's: the target itself is never followed (a reparse point is refused as such).

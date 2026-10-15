@@ -589,6 +589,8 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
   processStopPending?: boolean;
   /** Windows settlement retains native admission until captured close and any stop join. */
   nativeReleasePending?: Promise<void>;
+  /** Native-close settlement owns RUN release, including after its join ends uncertain. */
+  nativeAdmissionFenced?: boolean;
   /**
    * Its owner gave it up (a stopped or removed actor): nobody wants its result, so a worker that
    * dies is not relaunched and the run ends failed (smarty-dev#2184 item 8b). A caller that only
@@ -2673,7 +2675,10 @@ export class AgentManager {
     for (const managed of this.#runs.values()) {
       // A replacement may already be creating a worker while transport still names
       // the old attempt. Its death cannot discharge the replacement's admission.
-      if (!managed.actorId || managed.relaunchPending || !managed.admissionRelease || !this.#actorWorkerGone(managed)) continue;
+      // A normal Windows settlement already assigned release to its native-close/stop
+      // join. Primary death cannot bypass that join, even after it ends uncertain.
+      if (!managed.actorId || managed.relaunchPending || managed.nativeAdmissionFenced ||
+          !managed.admissionRelease || !this.#actorWorkerGone(managed)) continue;
       const permit = managed.admissionRelease;
       delete managed.heldPermit;
       permit();
@@ -5617,6 +5622,8 @@ export class AgentManager {
         managed.transport.waitForClose && !managed.lostContact && !managed.processStop) {
       // The logical result can precede native close. Keep its permit while a
       // later explicit stop may still acquire a Windows tree-helper obligation.
+      // This ownership outlives nativeReleasePending when close is unconfirmed.
+      managed.nativeAdmissionFenced = true;
       const release = managed.release;
       managed.release = () => {
         managed.nativeReleasePending = Promise.resolve().then(async () => {

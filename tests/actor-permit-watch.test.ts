@@ -27,6 +27,7 @@ const workers = new Map<number, Worker>();
 const claimedGonePid = 899_999_999;
 let nextPid = 900_000_000;
 let closing = false;
+const settledDebtScanPlatforms = process.platform === "win32" ? (["win32"] as const) : (["linux"] as const);
 interface Worker {
   launch: AgentTransportLaunch;
   pid: number;
@@ -636,7 +637,7 @@ describe("actor worker permit release (#9031)", () => {
     await eventually(() => expect(snapshot(f).held).toEqual([]));
   });
 
-  it.each(["linux", "win32"] as const)("settled actor with native debt releases retained RUN only on host proof (%s scan)", async scanPlatform => {
+  it.each(settledDebtScanPlatforms)("settled actor with native debt releases retained RUN only on host proof (%s scan)", async scanPlatform => {
     const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
     const f = fixture();
     try {

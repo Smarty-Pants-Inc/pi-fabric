@@ -13,9 +13,9 @@ merge_queue:
 
 # smarty-dev's plain rule (smarty-dev#865): the PR, its required checks and this queue are the
 # review. Mergify queues a ready PR once queue_conditions pass; `hold` and DO NOT LAND
-# titles keep a PR out. merge_conditions require every queue condition again, including the
-# review verdicts and opt-out vetoes, and still require fresh CI on the updated head
-# (smarty-dev#2974).
+# titles keep a PR out. merge_conditions recheck CI and opt-out vetoes on the updated head
+# (smarty-dev#2974), but review statuses only refuse failed reviews: queue updates create
+# a new head with no review statuses (smarty-dev#455).
 queue_rules:
   - name: default
     # ponytail: one Ubuntu+Windows run takes ~30 min under fleet load, so a serial queue of N PRs takes N
@@ -41,22 +41,18 @@ queue_rules:
               - -head ~= ^sync/upstream-
               - -label = needs-security-pass
     merge_conditions:
-      # An opt-out added after queueing must stop the merge.
-      - check-success = review/astra
+      # Label and title opt-outs added after queueing stop the merge.
+      # Review statuses here only refuse a FAILED review: an in-place or batch update
+      # makes a new head with no review statuses (smarty-dev#455).
+      # queue_conditions require the reviews on the reviewed head.
+      - -check-failure = review/astra
       - -label ~= (?i)^(hold|do[ -]?not[ -]?merge|dnm|freeze|frozen)$
       - -label ~= (?i)^(wip|work[ -]?in[ -]?progress|do[ -]?not[ -]?land|never[ -]?land)$
       - base = main
-      - -draft
       - -label = hold
       - -title ~= (?i)do not land
-      - or:
-          - check-success = review/security
-          - and:
-              - -head ~= ^sync/upstream-
-              - -label = needs-security-pass
-      - check-success = check (ubuntu-latest)
-      - -check-failure = review/astra
       - -check-failure = review/security
+      - check-success = check (ubuntu-latest)
 
 # Queue order (smarty-dev#6477, Paul 10-08: the SQLite store is the fleet's top priority and gets the merge
 # queue's top tier). A fleet-top PR is queued ahead of p0, and a p0 PR ahead of the rest. Neither interrupts a

@@ -18,11 +18,11 @@ const held: RootInboxSession = { holdsBatch: () => true, holdsSteer: () => false
 const notHeld: RootInboxSession = { holdsBatch: () => false, holdsSteer: () => false };
 const idle = () => true;
 const steered = (key: string, topic = "fleet.work.pi-fabric.1"): RootInboxSession => ({
-  holdsBatch: () => true,
-  holdsSteer: rootInboxSession([{
-    type: "custom_message", customType: "pi-fabric-agent-message",
+  ...rootInboxSession([{
+    type: "custom_message", timestamp: new Date().toISOString(), customType: "pi-fabric-agent-message",
     details: { from: { id: peer.id }, data: { topic, key } },
-  }]).holdsSteer,
+  }]),
+  holdsBatch: () => true,
 });
 
 const setup = () => {

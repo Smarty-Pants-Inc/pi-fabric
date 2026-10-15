@@ -166,7 +166,9 @@ export class RootInbox {
     const state = this.#load();
     let receiptsChanged = this.#trimReceipts();
     receiptsChanged = JSON.stringify(state) !== this.#saved || receiptsChanged;
-    receiptsChanged = this.#remember(session.delivered ?? [], session.deliveredAt) || receiptsChanged;
+    // Canonical history without a finite timestamp is exact-replay evidence only; do not
+    // renew its ambiguous key/ref claim at read time.
+    receiptsChanged = this.#remember(session.delivered ?? [], session.deliveredAt, true) || receiptsChanged;
     let skippedStale = 0;
     if (state.pending && options.turnEnd) await this.#alarmPending(state).catch(error => {
       // An observational alarm must never keep confirmed work wedged behind publication.
@@ -400,7 +402,9 @@ export class RootInbox {
     if (Array.isArray(value.fallbacks)) value.fallbacks.forEach((id, index) => {
       if (typeof id !== "string") return;
       const time = value.fallbackAt?.[index];
-      const at = typeof time === "number" && Number.isFinite(time) ? time : this.#fallbacks.get(id) ?? this.#now();
+      const at = typeof time === "number" && Number.isFinite(time) ? time : this.#fallbacks.get(id);
+      // A legacy marker without an observation time cannot prove that its one-use claim is current.
+      if (at === undefined) return;
       this.#fallbacks.set(id, Math.max(this.#fallbacks.get(id) ?? Number.NEGATIVE_INFINITY, at));
     });
     this.#syncAcks();
@@ -487,13 +491,16 @@ export class RootInbox {
     const value = key ?? (typeof data?.ref === "string" && data.ref.trim() ? data.ref.trim() : undefined);
     if (value === undefined) return false;
     const claim = topicWorkReceipt(event.from.id, kind, event.topic, value);
-    const claimed = has(claim) || (kind === "key" && session.holdsSteer(event.from.id, value, event.topic));
     const through = this.#state!.fallbackThrough;
+    // A key/ref claim is suppressive only when its canonical observation has a finite time. An
+    // invalid/missing session timestamp must fail open; exact identity receipts were checked above.
     const at = session.delivered?.has(claim) ? session.deliveredAt?.get(claim) : this.#delivered.get(claim);
+    if (typeof at !== "number" || !Number.isFinite(at)) return false;
+    const claimed = has(claim) || (kind === "key" && session.holdsSteer(event.from.id, value, event.topic));
     // Canonical history can outlive its cursor receipt, even for an unused claim. Expiry
     // and eviction must fail open rather than resurrect that old carrier's suppression.
-    if (at !== undefined && at < this.#now() - this.#horizon()) return false;
-    if (through !== undefined && (at === undefined || at <= through)) return false;
+    if (at < this.#now() - this.#horizon()) return false;
+    if (through !== undefined && at <= through) return false;
     if (!claimed || this.#fallbacks.has(claim) || reservations?.has(claim)) return false;
     reservations?.add(claim);
     return true;
@@ -512,12 +519,15 @@ export class RootInbox {
     return true;
   }
 
-  #remember(ids: Iterable<string>, times?: ReadonlyMap<string, number>): boolean {
+  #remember(ids: Iterable<string>, times?: ReadonlyMap<string, number>, canonicalHistory = false): boolean {
     let changed = false;
     const cutoff = this.#now() - this.#horizon();
     for (const id of ids) {
-      // Missing times (legacy/custom callers) retain the original observation time.
-      const at = times?.get(id) ?? this.#delivered.get(id) ?? this.#now();
+      // Timestamp-less canonical history remains available through session.delivered for exact
+      // identity replay checks, but must not be silently renewed into a key/ref claim.
+      const recorded = times?.get(id);
+      if (canonicalHistory && !Number.isFinite(recorded)) continue;
+      const at = Number.isFinite(recorded) ? recorded! : this.#delivered.get(id) ?? this.#now();
       if (at < cutoff) continue;
       const previous = this.#delivered.get(id);
       if (previous === undefined || at > previous) {
@@ -645,13 +655,16 @@ export class RootInbox {
     };
     this.#acks = new Map(parseAcks(value?.acked));
     this.#syncAcks();
-    this.#delivered = new Map((this.#state.delivered ?? []).map((id, index) => {
+    // Missing legacy timestamps are intentionally not upgraded to read/load time: a key/ref
+    // claim without finite observation time must fail open. Exact canonical identity checks still
+    // use the session receipt set directly when its entry is available.
+    this.#delivered = new Map((this.#state.delivered ?? []).flatMap((id, index) => {
       const at = value?.deliveredAt?.[index];
-      return [id, typeof at === "number" && Number.isFinite(at) ? at : this.#now()];
+      return typeof at === "number" && Number.isFinite(at) ? [[id, at] as [string, number]] : [];
     }));
-    this.#fallbacks = new Map((this.#state.fallbacks ?? []).map((id, index) => {
+    this.#fallbacks = new Map((this.#state.fallbacks ?? []).flatMap((id, index) => {
       const at = value?.fallbackAt?.[index];
-      return [id, typeof at === "number" && Number.isFinite(at) ? at : stored?.updatedAt ?? this.#now()];
+      return typeof at === "number" && Number.isFinite(at) ? [[id, at] as [string, number]] : [];
     }));
     if (typeof value?.fallbackThrough === "number" && Number.isFinite(value.fallbackThrough)) {
       this.#state.fallbackThrough = value.fallbackThrough;

@@ -117,7 +117,7 @@ export const eventReceipts = (event: MeshEvent): string[] => {
 export interface RootInboxSession {
   /** Inbox messages collectively holding all of these event ids. */
   holdsBatch(ids: readonly string[]): boolean;
-  /** An agent message (a steer or follow-up) from this sender that carried this work key and topic. */
+  /** An identity-less agent carrier for this work key/topic; suppression also needs a dated receipt. */
   holdsSteer(fromId: string, key: string, topic: string): boolean;
   /** Confirmed native/inbox receipts from the whole history, not the recent-entry window. */
   delivered?: ReadonlySet<string>;
@@ -199,9 +199,9 @@ const inboxReceiptSession = (entries: Iterable<readonly [number, unknown]>, coun
   const steers = new Map<string, Set<string>>();
   const delivered = new Set<string>();
   const deliveredAt = new Map<string, number>();
-  const remember = (id: string, at: number): void => {
+  const remember = (id: string, at: number | undefined): void => {
     delivered.add(id);
-    deliveredAt.set(id, Math.max(deliveredAt.get(id) ?? Number.NEGATIVE_INFINITY, at));
+    if (at !== undefined) deliveredAt.set(id, Math.max(deliveredAt.get(id) ?? Number.NEGATIVE_INFINITY, at));
   };
   // Persisted snapshots contain receipts only, with original history positions. All-history
   // identities/legacy steers are needed for dedup; only batch presence uses a lookback.
@@ -209,8 +209,11 @@ const inboxReceiptSession = (entries: Iterable<readonly [number, unknown]>, coun
     type Carried = { from?: { id?: unknown }; data?: unknown; id?: unknown; deliveryId?: unknown };
     const entry = value as { timestamp?: string; type?: string; customType?: string; details?: Carried & { ids?: unknown; items?: unknown; receipts?: unknown } } | undefined;
     if (entry?.type !== "custom_message") continue;
+    // A missing/invalid canonical timestamp is not evidence that a legacy key/ref claim is
+    // current. Keep the receipt for exact identity replay checks, but never silently renew its
+    // one-use key fallback with the scan time.
     const parsedAt = Date.parse(entry.timestamp ?? "");
-    const at = Number.isFinite(parsedAt) ? parsedAt : Date.now();
+    const at = Number.isFinite(parsedAt) ? parsedAt : undefined;
     if (entry.customType === ROOT_INBOX_CUSTOM_TYPE && Array.isArray(entry.details?.ids)) {
       if (index >= Math.max(0, count - lookback)) {
         hasBatch = true;
@@ -229,12 +232,20 @@ const inboxReceiptSession = (entries: Iterable<readonly [number, unknown]>, coun
       const fromId = item?.from?.id;
       const key = workKey(item?.data);
       const topic = carrierTopic(item?.data);
+      const identity = deliveryIdentity(item?.data);
+      const topLevelDeliveryId = typeof item?.deliveryId === "string" && item.deliveryId ? item.deliveryId : undefined;
       if (typeof fromId !== "string") continue;
-      for (const id of workReceipts(fromId, item.data, topic)) remember(id, at);
+      // A caller-supplied top-level deliveryId is explicit-only too; retain data identity
+      // receipts when present, but do not record a native-topic key/ref for this carrier.
+      for (const id of workReceipts(fromId, item.data, topLevelDeliveryId === undefined ? topic : undefined)) remember(id, at);
       if (typeof item.id === "string") remember(receipt(fromId, "id", item.id), at);
       if (typeof item.deliveryId === "string") remember(receipt(fromId, "delivery", item.deliveryId), at);
+      // An identity-bearing carrier has only its explicit receipt as suppression evidence. It
+      // must not create a key-only holdsSteer claim that could shadow an ambiguous legacy event.
       // A carrier without a topic claims no work key: its shadow is injected (fail open).
-      if (key === undefined || topic === undefined) continue;
+      // item.id is Main's generated envelope id, not a work claim. A caller-supplied
+      // top-level deliveryId is stable identity, however, so it is explicit-only too.
+      if (identity || topLevelDeliveryId !== undefined || key === undefined || topic === undefined) continue;
       const keys = steers.get(fromId) ?? new Set<string>();
       keys.add(JSON.stringify([topic, key]));
       steers.set(fromId, keys);

@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MainAgentController } from "../src/main-agent.js";
 import { MeshStore, type MeshEvent, type MeshIdentity } from "../src/mesh/store.js";
@@ -162,6 +162,168 @@ describe("distinct same-key mesh events (smarty-dev#12140)", () => {
     const otherTopic = await h.mesh.publish({ topic: "fleet.work.other", kind: "answer", from: watcher, to: me.id, text: "other", data: { key: KEY } });
     h.advance(1);
     expect(ids((await h.box().next(h.session())).events)).toEqual([otherTopic.id]);
+  });
+
+  it.each(["commandId", "deliveryId", "messageId"] as const)("fails open for a fresh %s carrier's ambiguous key-only shadow, but suppresses exact identity and envelope replays", async (identity) => {
+    const h = setup(); const inbox = h.box(); inbox.start();
+    h.main.deliverAgent({ from: watcher, message: "native identity-bearing work", delivery: "steer",
+      data: { topic: TOPIC, key: KEY, [identity]: "native-identity" } });
+    await h.publish("exact native identity shadow", { key: KEY, [identity]: "native-identity" });
+    const ambiguous = await h.publish("ambiguous key-only shadow");
+    const distinct = await h.publish("different explicit identity", { key: KEY, [identity]: "distinct-identity" });
+    h.advance(1);
+    const session = rootInboxSession(h.entries.map(projectRootInboxReceipt));
+    // Option (a): key-only shadows and genuinely distinct key-only work are indistinguishable.
+    // Fail open for BOTH; an identity-bearing carrier must never also claim its topic/key.
+    const woke = await inbox.wake(session, () => true);
+    expect(ids(woke?.events)).toEqual([ambiguous.id, distinct.id]);
+    expect(session.holdsSteer(watcher.id, KEY, TOPIC)).toBe(false);
+    await h.take(inbox, woke!.events);
+    await inbox.close();
+
+    // Exact identity evidence and consumed envelope receipts survive losing session history.
+    h.entries.length = 0;
+    h.replay(ambiguous);
+    await h.publish("exact native identity shadow after reload", { key: KEY, [identity]: "native-identity" });
+    await h.publish("exact consumed identity shadow after reload", { key: KEY, [identity]: "distinct-identity" });
+    h.advance(1);
+    const recovered = h.box();
+    expect((await recovered.next(h.session())).events).toEqual([]);
+    expect(await recovered.wake(h.session(), () => true)).toBeUndefined();
+    await recovered.close();
+  });
+
+  it.each(["commandId", "deliveryId", "messageId"] as const)("does not resurrect a %s carrier's topic/key claim after the horizon and cursor reload", async (identity) => {
+    const h = setup(0, { horizonMs: 100 });
+    const inbox = h.box(); inbox.start();
+    h.main.deliverAgent({ from: watcher, message: "native with an explicit identity", delivery: "steer",
+      data: { topic: TOPIC, key: KEY, [identity]: "old-native-identity" } });
+    await inbox.next(h.session(), { commitOnly: true });
+    await inbox.close();
+    h.advance(101);
+    // Keep canonical native history: removing it would hide the holdsSteer resurrection bug.
+    const session = rootInboxSession(h.entries.map(projectRootInboxReceipt));
+    const recovered = h.box();
+    await recovered.next(session, { commitOnly: true });
+    const later = await h.publish("later distinct key-only work");
+    const woke = await recovered.wake(session, () => true);
+    expect(ids(woke?.events)).toEqual([later.id]);
+    expect(session.holdsSteer(watcher.id, KEY, TOPIC)).toBe(false);
+    await h.take(recovered, woke!.events);
+    await recovered.close();
+    h.replay(later);
+    expect((await h.box().next(h.session())).events).toEqual([]);
+  });
+
+  it("records a top-level native deliveryId without a key fallback and suppresses exact shadows after reload", async () => {
+    const h = setup(); const inbox = h.box(); inbox.start();
+    const deliveryId = "native:top-level-delivery";
+    const hash = (kind: string, value: string) => createHash("sha256").update(JSON.stringify([watcher.id, kind, value])).digest("hex");
+    const exact = hash("delivery", deliveryId);
+    const fallback = hash("native-topic-key", JSON.stringify([TOPIC, KEY]));
+    h.main.attachFollowUpDrain({ isIdle: () => true, hasPendingMessages: () => false,
+      sessionManager: { getEntries: () => h.entries }, signal: { aborted: false },
+    } as unknown as ExtensionContext, 0, path.join(path.dirname(h.mesh.root), "followups.json"));
+    try {
+      h.main.deliverAgent({ from: watcher, message: "native with top-level identity", delivery: "followUp",
+        deliveryId, data: { topic: TOPIC, key: KEY } });
+      expect(h.entries).toHaveLength(1);
+      for (const session of [h.session(), rootInboxSession(h.entries.map(projectRootInboxReceipt))]) {
+        expect(session.delivered?.has(exact)).toBe(true);
+        expect(session.delivered?.has(fallback)).toBe(false);
+        expect(session.holdsSteer(watcher.id, KEY, TOPIC)).toBe(false);
+      }
+      await inbox.next(rootInboxSession(h.entries.map(projectRootInboxReceipt)), { commitOnly: true });
+      const saved = h.mesh.get(inbox.key)!.value as { delivered: string[]; fallbacks?: string[] };
+      expect(saved.delivered).toContain(exact);
+      expect(saved.delivered).not.toContain(fallback);
+      expect(saved.fallbacks ?? []).toEqual([]);
+      const ambiguous = await h.publish("key-only work must fail open");
+      await h.publish("exact top-level identity shadow", { key: KEY, deliveryId }); h.advance(1);
+      const batch = await inbox.next(rootInboxSession(h.entries.map(projectRootInboxReceipt)));
+      expect(ids(batch.events)).toEqual([ambiguous.id]);
+      await h.take(inbox, batch.events);
+      h.entries.length = 0;
+      await h.publish("exact shadow after history removal", { key: KEY, deliveryId }); h.advance(1);
+      expect((await h.box().next(h.session())).events).toEqual([]);
+    } finally {
+      h.main.closeFollowUpDrain();
+      await inbox.close();
+    }
+  });
+
+  it.each(["missing", "null", "invalid", "fresh"] as const)("reloads a stored native-topic-key claim with %s deliveredAt without inventing a timestamp", async (timestamp) => {
+    const h = setup(0, { horizonMs: 100 });
+    const claim = createHash("sha256").update(JSON.stringify([watcher.id, "native-topic-key", JSON.stringify([TOPIC, KEY])])).digest("hex");
+    const observedAt = Date.now() - 10;
+    const key = h.box().key;
+    await h.mesh.put({ key, identity: me, value: { after: h.mesh.latestSequence(), delivered: [claim],
+      ...(timestamp === "missing" ? {} : { deliveredAt: [timestamp === "fresh" ? observedAt : timestamp === "null" ? null : "not-a-timestamp"] }),
+    } });
+    // Persist an empty reconciliation, then reload again before any shadow exists.
+    // Legacy/malformed receipt ages must not be upgraded to either load's Date.now().
+    const initial = h.box();
+    await initial.next(h.session(), { commitOnly: true });
+    await initial.close();
+    const saved = h.mesh.get(key)!.value as { delivered: string[]; deliveredAt: number[] };
+    expect(saved.delivered).toEqual(timestamp === "fresh" ? [claim] : []);
+    expect(saved.deliveredAt).toEqual(timestamp === "fresh" ? [observedAt] : []);
+    h.advance(1);
+    const first = await h.publish("first legacy shadow");
+    const second = await h.publish("second legacy shadow"); h.advance(1);
+    const recovered = h.box();
+    const batch = await recovered.next(h.session());
+    expect(ids(batch.events)).toEqual(timestamp === "fresh" ? [second.id] : [first.id, second.id]);
+    await h.take(recovered, batch.events);
+    await recovered.close();
+    h.entries.length = 0;
+    const later = await h.publish("later same-key work after another reload"); h.advance(1);
+    expect(ids((await h.box().next(h.session())).events)).toEqual([later.id]);
+  });
+
+  it("fails open for direct holdsSteer evidence without a deliveredAt timestamp", async () => {
+    const h = setup(); const inbox = h.box(); inbox.start();
+    h.main.deliverAgent({ from: watcher, message: "legacy native work", delivery: "steer", data: { topic: TOPIC, key: KEY } });
+    const canonical = h.session();
+    // A compatibility caller exposes only the boolean, not dated delivery receipts.
+    const undated = { holdsBatch: canonical.holdsBatch, holdsSteer: canonical.holdsSteer };
+    expect(undated.holdsSteer(watcher.id, KEY, TOPIC)).toBe(true);
+    const first = await h.publish("undated claim cannot suppress this event");
+    const second = await h.publish("nor this later same-key event"); h.advance(1);
+    const batch = await inbox.next(undated);
+    expect(ids(batch.events)).toEqual([first.id, second.id]);
+    await h.take(inbox, batch.events);
+    await inbox.close();
+    h.entries.length = 0;
+    h.replay(first);
+    const later = await h.publish("distinct work after undated caller reload"); h.advance(1);
+    const recovered = h.box();
+    expect(ids((await recovered.wake(h.session(), () => true))?.events)).toEqual([later.id]);
+    await recovered.close();
+  });
+
+  it.each([undefined, "not-a-timestamp"])("fails open for canonical key-only native history with timestamp %s instead of renewing it on reload", async (timestamp) => {
+    const h = setup(0, { horizonMs: 100 });
+    h.main.deliverAgent({ from: watcher, message: "undated canonical native", delivery: "steer", data: { topic: TOPIC, key: KEY } });
+    h.entries[0] = { ...(h.entries[0] as object), timestamp };
+    h.advance(101);
+    const session = rootInboxSession(h.entries.map(projectRootInboxReceipt));
+    const inbox = h.box();
+    await inbox.next(session, { commitOnly: true });
+    await inbox.close();
+    h.advance(101);
+    // Reading the same malformed historical entry again must not manufacture a fresh age.
+    const reloadedSession = rootInboxSession(h.entries.map(projectRootInboxReceipt));
+    const first = await h.publish("distinct key-only work after undated history");
+    const second = await h.publish("another distinct key-only event"); h.advance(1);
+    const recovered = h.box();
+    const woke = await recovered.wake(reloadedSession, () => true);
+    expect(ids(woke?.events)).toEqual([first.id, second.id]);
+    await h.take(recovered, woke!.events);
+    await recovered.close();
+    h.entries.length = 0;
+    h.replay(first);
+    expect((await h.box().next(h.session())).events).toEqual([]);
   });
 
   it.each([[4096, 42], [128 * 1024, 1100]])("bounds fallback and delivered receipts together at %i bytes", async (maxEventBytes, count) => {

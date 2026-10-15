@@ -27,8 +27,10 @@ const visibilityErrorLabel = (error: unknown): string => {
 export class CapturedToolCatalog {
   readonly #tools = new Map<string, CapturedToolEntry>();
   #registered: RegisteredTool[] = [];
-  // Pi decides which registered tools it offers: an extension hides a tool by
-  // dropping it from the active set (pi.setActiveTools). The source returns a
+  // Pi decides which registered tools it offers: an extension hides a direct
+  // tool by dropping it from the active set (pi.setActiveTools) or withdraws any
+  // tool by re-registering it `hidden`; registered codemode/deferred tools stay
+  // callable while inactive (see hostToolVisibility). The source returns a
   // per-read snapshot predicate; undefined (or a throwing host that is not yet
   // initialized) means "no host filter". Fabric must not list, describe, prompt
   // for or invoke a tool its owning extension hid (smarty-dev#5492).
@@ -205,7 +207,7 @@ export class CapturedToolCatalog {
       return (name) => offered.has(name);
     } catch (error) {
       // Before the first good read Pi's runtime is still initializing
-      // (getActiveTools throws during extension loading): no host filter yet.
+      // (getActiveTools/getAllTools throw during extension loading): no host filter yet.
       if (!this.#hostVisibilityReady) return undefined;
       if (!this.#visibilityFailureWarned) {
         this.#visibilityFailureWarned = true;

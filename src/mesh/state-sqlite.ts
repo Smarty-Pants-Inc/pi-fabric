@@ -35,8 +35,10 @@
  * attempt) starved next to those barging writers (smarty-dev#10391), so it is opt-in. A waiter passes a head whose
  * heartbeat stalled (its event loop blocked, or it stopped attempting) as soon as the stall bound shows it, not only
  * past 80% of its budget: the ticket closes at BEGIN IMMEDIATE, so a stale head here never holds the lock.
- * The wait honours `writeSignal`, the `withTryLock` budget and `lockTimeoutMs`, and times out with the existing
- * `MeshLockTimeoutError`.
+ * The wait honours `writeSignal`, the `withTryLock` budget and `lockTimeoutMs`. Relative budgets start after initial
+ * admission setup; a still-ineligible ticket with no BEGIN attempt expires separately as MeshLockQueueExpiredError.
+ * Real BEGIN contention keeps the existing MeshLockTimeoutError and timeout counter/event. Later queue joins after
+ * a BEGIN attempt do not extend that operation's deadline.
  *
  * Durability (review-luna P1-3, review-opus P3-3): `synchronous=NORMAL`. A commit is atomic and
  * never torn; a process crash loses nothing committed; an OS crash or power loss can drop the most
@@ -116,8 +118,10 @@ import { MeshLockTimeoutError } from "../core/atomic-write.js";
 import { captureStorageDelete, captureStoragePut, storageRevision, type StorageTransition } from "../verified/storage.js";
 import { encodeMeshStateMovedMarker, isMeshStateMovedMarker, isMeshStateNatsMarker, meshStateMovedToNatsError, readMeshStateMovedMarker } from "./backend-fence.js";
 import { holdMeshFence, holdMeshFenceSync } from "./fence-lock.js";
-import { MeshLockTicket, meshLockQueueBusy, meshLockQueueDirectory } from "./lock-queue.js";
+import { type MeshLockTicket, meshLockQueueBusy, meshLockQueueDirectory } from "./lock-queue.js";
+import { createMeshLockAdmission, lockStats } from "./mesh-lock.js";
 import { processStartTime, residentProcessAlive } from "../residency/process-identity.js";
+import { verifiedRemove } from "../storage/verified-remove.js";
 // From the domain modules, not the store.ts facade: store.ts loads this module through state-backend.ts (L2a).
 import { MeshBatchConflictError, type MeshBatchOperation, type MeshBatchResult, type MeshBatchView,
   type MeshReadOptions, type MeshStateEntry } from "./state-file.js";
@@ -326,18 +330,26 @@ const ensureMovedMarker = (root: string, epoch: number): void => {
         if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
         throw error;
       }
+      // smarty-dev#8907: the claimed inode's stat BEFORE it is judged empty; only that unchanged inode is removed (a
+      // write into it, or a swap, after the judgment keeps the aside). Off Linux: main's rmSync (smarty-dev#7858).
+      const judged = fs.lstatSync(aside, { throwIfNoEntry: false });
       const claimed = classifyStateFile(aside);
+      const removeEmptyAside = (): void => {
+        verifiedRemove(aside, judged, { deleter: "mesh-sqlite-create-aside", fallback: () => { fs.rmSync(aside, { force: true }); return true; } });
+      };
       if (claimed === "empty") {
         try { fs.linkSync(temp, file); } catch (error) {
           if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
+            // ponytail: linked back to state.json just before, so this drops only our unique unpublished aside name
+            // (pid+uuid); the claimed inode itself stays at state.json, whatever it holds.
             try { fs.linkSync(aside, file); fs.rmSync(aside, { force: true }); } catch { /* the aside keeps it */ }
             throw error;
           }
-          fs.rmSync(aside, { force: true }); // it held nothing; the name is a newer writer's now
+          removeEmptyAside(); // it held nothing; the name is a newer writer's now
           if (classifyStateFile(file) === "marker") return;
           throw raced(root, "state.json was written during the marker write");
         }
-        fs.rmSync(aside, { force: true });
+        removeEmptyAside();
         return;
       }
       // Populated (or a marker) arrived between the re-check and the claim: put the same inode back.
@@ -347,11 +359,15 @@ const ensureMovedMarker = (root: string, epoch: number): void => {
         }
         throw error;
       }
+      // ponytail: linked back to state.json just above (EEXIST throws first), so this drops only our unique unpublished
+      // aside name (pid+uuid); the claimed inode stays at state.json.
       fs.rmSync(aside, { force: true });
       if (claimed === "marker") return;
       throw raced(root, "state.json was populated before the marker write");
     }
     throw raced(root, "state.json kept changing during the marker write");
+  // ponytail: our own unpublished temp (wx, pid+uuid name), never judged; once linked as state.json this drops only
+  // the temp name, never the published marker inode.
   } finally { fs.rmSync(temp, { force: true }); }
 };
 
@@ -1603,12 +1619,13 @@ export class SqliteStateStore {
     walCapExempt = false): Promise<T> {
     const scope = this.#tryLockScope.getStore();
     const budget = scope?.active ? Math.min(scope.timeoutMs, lockTimeoutMs) : lockTimeoutMs;
-    const started = performance.now();
-    const deadline = started + Math.max(0, budget);
+    let started = 0;
+    let deadline = 0;
     let attempts = 0;
     let maxGap = 0;
-    let last = started;
+    let last = 0;
     let transient = 0;
+    let admission: ReturnType<typeof createMeshLockAdmission> | undefined;
     let ticket: MeshLockTicket | undefined;
     let yieldedMs = 0;
     let waiting = true;
@@ -1618,9 +1635,14 @@ export class SqliteStateStore {
       // queues behind them, never barging the FIFO head. Inside the try (pi-fabric#936 round 3): the finally always
       // releases the ticket and #writesWaiting.
       if (this.#fifoAfterMs === 0 && this.#queueBusy()) {
-        ticket = this.#ticket(Math.max(0, deadline - started));
+        admission = this.#ticket(Math.max(0, budget));
+        ticket = admission?.ticket;
         if (ticket) this.#stats.fifoJoins += 1;
       }
+      // No acquisition has been attempted: queue lookup/receipt construction cannot spend this relative budget.
+      started = admission?.startedAt ?? performance.now();
+      deadline = admission?.deadline ?? started + Math.max(0, budget);
+      last = started;
       for (;;) {
         const iteration = performance.now();
         let yielding = false;
@@ -1630,8 +1652,10 @@ export class SqliteStateStore {
         if (this.#inTransaction) throw new Error("Fabric mesh state callbacks must not call store writers");
         if (!walCapExempt) this.#refuseAboveWalCap();
         // smarty-dev#6100: a checkpoint flag pauses this writer for at most WRITER_YIELD_BUDGET_MS in total.
-        if (yieldedMs < WRITER_YIELD_BUDGET_MS && this.#checkpointPending()) { this.#stats.checkpoints.writerYields += 1; yielding = true; }
-        else if (!ticket || this.#mayContend(ticket)) {
+        const eligible = !ticket || this.#mayContend(ticket);
+        if (iteration < deadline && yieldedMs < WRITER_YIELD_BUDGET_MS && this.#checkpointPending()) {
+          this.#stats.checkpoints.writerYields += 1; yielding = true;
+        } else if (eligible) {
           const now = performance.now();
           if (attempts > 0) maxGap = Math.max(maxGap, now - last);
           last = now;
@@ -1652,8 +1676,9 @@ export class SqliteStateStore {
             if (headWaitMs > this.#busyTimeoutMs) this.#db.exec(`PRAGMA busy_timeout = ${this.#busyTimeoutMs}`);
           }
           if (begun) {
-            this.#stats.maxWaitMs = Math.max(this.#stats.maxWaitMs, performance.now() - started);
-            this.#window.maxWaitMs = Math.max(this.#window.maxWaitMs, performance.now() - started);
+            const waitMs = performance.now() - started;
+            this.#stats.maxWaitMs = Math.max(this.#stats.maxWaitMs, waitMs);
+            this.#window.maxWaitMs = Math.max(this.#window.maxWaitMs, waitMs);
             // smarty-dev#6100: the SQLite writer lock is the exclusion; the advisory receipt only orders waiters.
             // Leave the queue now, so post-COMMIT work (SQLite's autocheckpoint fsync inside COMMIT, the emergency
             // checkpoint) never keeps the next waiter from contending.
@@ -1661,11 +1686,16 @@ export class SqliteStateStore {
             ticket = undefined;
             this.#writesWaiting -= 1;
             waiting = false;
-            return this.#run(body, lockClass);
+            return this.#run(body, lockClass, waitMs);
           }
         }
         const now = performance.now();
         if (now >= deadline) {
+          if (attempts === 0) {
+            if (!eligible && admission) throw admission.expire(this.file, this.root, "sqlite", lockClass);
+            // A checkpoint yield can consume the last slice, but an eligible waiter still gets a real attempt.
+            continue;
+          }
           this.#stats.lockTimeouts += 1;
           this.#window.lockTimeouts += 1;
           this.#window.maxWaitMs = Math.max(this.#window.maxWaitMs, now - started);
@@ -1676,11 +1706,15 @@ export class SqliteStateStore {
           // ticket at the head (pi-fabric#905 review round 3).
           ticket?.close();
           ticket = undefined;
-          if (!scope?.active && budget > 0) lockEvents?.waitTimeout(this.root, "sqlite", lockClass, now - started, walWriterPid(this.file));
+          const tried = Boolean(scope?.active) || budget <= 0;
+          lockStats?.failed(this.root, lockClass, now - started, tried);
+          if (!tried) lockEvents?.waitTimeout(this.root, "sqlite", lockClass, now - started, walWriterPid(this.file));
           throw new MeshLockTimeoutError(` (SQLite state ${this.file})`, attempts, Math.round(maxGap));
         }
         if (!ticket && now - started >= this.#fifoAfterMs) {
-          ticket = this.#ticket(deadline - now);
+          // This writer already tried BEGIN IMMEDIATE: later queue setup must not reset the operation deadline.
+          admission = this.#ticket(deadline - now);
+          ticket = admission?.ticket;
           if (ticket) this.#stats.fifoJoins += 1;
         }
         const cap = Math.min(4, 2 ** Math.min(attempts - 1, 2));
@@ -1716,13 +1750,13 @@ export class SqliteStateStore {
     catch { ticket.close(); return true; }
   }
 
-  #ticket(budgetMs: number): MeshLockTicket | undefined {
-    try { return new MeshLockTicket(this.file, randomUUID(), budgetMs, { passStalledHead: true }); }
+  #ticket(budgetMs: number): ReturnType<typeof createMeshLockAdmission> | undefined {
+    try { return createMeshLockAdmission(this.file, randomUUID(), budgetMs, { passStalledHead: true }, () => performance.now()); }
     catch { return undefined; } // Advisory only: an unusable queue leaves the plain jittered contest.
   }
 
   // The synchronous body between BEGIN IMMEDIATE (already taken) and COMMIT.
-  #run<T>(body: (tx: Tx) => T, lockClass: MeshLockClass): T {
+  #run<T>(body: (tx: Tx) => T, lockClass: MeshLockClass, waitMs: number): T {
     const began = performance.now();
     this.#inTransaction = true;
     this.#stats.transactions += 1;
@@ -1753,6 +1787,8 @@ export class SqliteStateStore {
       const hold = performance.now() - began;
       this.#stats.totalHoldMs += hold;
       this.#stats.maxHoldMs = Math.max(this.#stats.maxHoldMs, hold);
+      // One sample per actual SQLite transaction, including rollback, after releasing its writer lock.
+      lockStats?.acquired(this.root, lockClass, waitMs, hold);
       this.#heldEvent(lockClass, hold);
       if (committed && changed) {
         // data_version does not change for this connection's own commits. Metadata-only
@@ -1976,7 +2012,9 @@ export const tryLockFile = (file: string, staleMs: number, token: string, hooks:
         try { currentRecord = fs.readFileSync(file, "utf8"); } catch { /* gone: already reclaimed */ }
         if (current === undefined || current.ino !== stat.ino || current.dev !== stat.dev || current.mtimeMs !== stat.mtimeMs
           || currentRecord !== record) return false; // already reclaimed, and maybe held by a successor: never touch it
-        try { fs.unlinkSync(file); } catch { return false; }
+        // smarty-dev#8907: removes only the inode judged dead above (`stat`, taken before the record and the verdict); a
+        // replacement after the re-check is refused and this reclaim fails (false). Off Linux: main's unlink.
+        if (!verifiedRemove(file, stat, { deleter: "mesh-sqlite-lock-reclaim", fallback: () => { fs.unlinkSync(file); return true; } }).removed) return false;
       } finally { removeOwnedFile(claim, token); }
     }
   }
@@ -2011,6 +2049,8 @@ export const raiseCheckpointFlag = (root: string, token: string): string => {
 };
 
 export const lowerCheckpointFlag = (flag: string): void => {
+  // ponytail: no judgment; the flag is named by this request's own token (pid, start ticks, uuid) and only it writes
+  // that name; a reclaimer removes it only after this holder is proven dead (removeDeadFlag).
   if (flag) try { fs.rmSync(flag, { force: true }); } catch { /* stale after CHECKPOINT_FLAG_STALE_MS */ }
 };
 
@@ -2021,6 +2061,7 @@ export const checkpointFlagRaised = (root: string): boolean => {
   const now = Date.now();
   let raised = false;
   for (const name of names) {
+    if (name.startsWith(".retention-graveyard-")) continue; // verifiedRemove's transient graveyard is not a flag
     const flag = path.join(dir, name);
     const stat = fs.lstatSync(flag, { throwIfNoEntry: false });
     if (!stat) continue;
@@ -2044,7 +2085,11 @@ const removeDeadFlag = (dir: string, name: string, stat: fs.Stats): void => {
   try {
     const flag = path.join(dir, name);
     const current = fs.lstatSync(flag, { throwIfNoEntry: false });
-    if (current?.ino === stat.ino && current.dev === stat.dev && current.mtimeMs === stat.mtimeMs) fs.unlinkSync(flag);
+    // smarty-dev#8907: removes only the flag inode judged stale and dead (`stat`, from before the age judgment); a refusal
+    // keeps it (ignored as stale). Off Linux: main's unlink, behind the re-check above.
+    if (current?.ino === stat.ino && current.dev === stat.dev && current.mtimeMs === stat.mtimeMs) {
+      verifiedRemove(flag, stat, { deleter: "mesh-sqlite-checkpoint-flag", fallback: () => { fs.unlinkSync(flag); return true; } });
+    }
   } catch { /* already gone */ } finally { removeOwnedFile(claim, token); }
 };
 
@@ -2053,6 +2098,8 @@ const removeDeadFlag = (dir: string, name: string, stat: fs.Stats): void => {
 // file checked here is still ours at the unlink.
 export const removeOwnedFile = (file: string, token: string): void => {
   if (!ownsFile(file, token)) return; // plainly not ours: never displace it
+  // ponytail: the held object: this live owner's own token-named lock; no reclaimer vacates it while we live (it needs a
+  // dead holder, or an unreadable record for the age rule), so the inode checked here is the one unlinked.
   try { fs.unlinkSync(file); } catch { /* already gone */ }
 };
 

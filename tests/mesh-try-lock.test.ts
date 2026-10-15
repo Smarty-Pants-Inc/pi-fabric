@@ -19,6 +19,7 @@ const identity = { id: "test", name: "test", kind: "agent" as const };
 describe("mesh try-lock async scope", () => {
   it.each([1, 2] as const)("bounds every writer without changing concurrent ordinary callers (protocol=%s)", async protocol => {
     const { mesh, release } = fixture(protocol);
+    await mesh.prepareLock();
     const ordinary = mesh.put({ key: "ordinary", value: 1, identity });
     try {
       const start = performance.now();
@@ -42,6 +43,7 @@ describe("mesh try-lock async scope", () => {
 
   it.each([1, 2] as const)("supports bounded publication tries without nested scope budget expansion (protocol=%s)", async protocol => {
     const { mesh, release } = fixture(protocol);
+    await mesh.prepareLock();
     try {
       const start = performance.now();
       await mesh.withTryLock(async () => {

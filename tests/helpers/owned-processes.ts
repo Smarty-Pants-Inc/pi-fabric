@@ -90,7 +90,9 @@ export const launchLog = (root: string, notBefore = Date.now()): LaunchLog => {
 };
 
 // Revalidated before every signal: false once the pid no longer names the recorded process.
+// Never this test process or its parent (the vitest fork or its pool): signalling them ends the run with no output.
 const signalOwned = (owned: Owned, signal: NodeJS.Signals): boolean => {
+  if (owned.pid === process.pid || owned.pid === process.ppid) return false;
   if (!same(owned)) return false;
   try { process.kill(owned.pid, signal); return true; } catch { return false; }
 };

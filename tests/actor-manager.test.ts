@@ -26,6 +26,15 @@ import { actorParticipantRecord } from "../src/topology/records.js";
 import { writeParticipantFile } from "../src/topology/participant-files.js";
 import { LIVENESS_POLICY_KEY, writeHostLease } from "../src/topology/host-leases.js";
 
+// smarty-dev#1031: off Linux no root actor tree deletion runs (no Main publication fence, smarty-dev#8090;
+// follow-up smarty-dev#11335). An accepted removal resolves pending with this refusal and keeps the tree.
+const rootTreeDeletionRefused = process.platform !== "linux";
+const refusedRemoval = (rootId = "session:test") => ({
+  removed: true,
+  cleaned: false,
+  pending: `removal cleanup failed: Root actor tree deletion needs the Main publication fence, which this platform (${process.platform}) lacks (smarty-dev#8090); follow-up smarty-dev#11335; the root ${rootId} actor tree is kept (a later remove or host start finishes it)`,
+});
+
 const roots: string[] = [];
 const actorManagers: ActorManager[] = [];
 const agentManagers: AgentManager[] = [];
@@ -86,6 +95,8 @@ const setup = (
     {
       actorRoot: path.join(root, "actors"),
       persistent,
+      // #11335 is a deterministic refusal off Linux; bound retries without changing Linux backoff.
+      ...(process.platform !== "linux" ? { removalRetryMs: 1 } : {}),
       ...(canManageActor ? { canManageActor } : {}),
       ...(snapshotActorOwnership ? { snapshotActorOwnership } : {}),
       ...(acquireCapabilityView ? { acquireCapabilityView } : {}),
@@ -680,8 +691,11 @@ describe("ActorManager fleet model policy (#2490)", () => {
     let enter!: () => void; const entered = new Promise<void>(resolve => { enter = resolve; });
     let release!: () => void; const held = new Promise<void>(resolve => { release = resolve; });
     let remove: ReturnType<typeof vi.spyOn> | undefined;
+    let predecessorId: string | undefined;
     if (wait === "predecessor") {
       const previous = await actors.create({ name: "fenced", instructions: "Previous." });
+      predecessorId = previous.id;
+      if (rootTreeDeletionRefused) fs.writeFileSync(path.join(root, "actors", previous.id, "history"), "previous history");
       await actors.stop(previous.id);
       const original = actors.remove.bind(actors);
       remove = vi.spyOn(actors, "remove").mockImplementation(async (...args) => { const result = await original(...args); enter(); await held; return result; });
@@ -695,9 +709,20 @@ describe("ActorManager fleet model policy (#2490)", () => {
       await entered; abort.abort(new Error("cancelled admission")); release();
       expect(await pending).toMatchObject({ message: "cancelled admission" });
       expect(onCommit).not.toHaveBeenCalled();
-      expect(actors.list().filter(actor => actor.name === "fenced")).toEqual([]);
-      const actorRoot = path.join(root, "actors");
-      expect(fs.existsSync(actorRoot) ? fs.readdirSync(actorRoot, { withFileTypes: true }).filter(entry => entry.isDirectory() && entry.name !== "bindings") : []).toEqual([]);
+      if (rootTreeDeletionRefused && wait === "predecessor") {
+        const pending = actors.pendingRemovals();
+        expect(pending).toHaveLength(1);
+        expect(pending[0]!).toMatchObject({ id: predecessorId, name: "fenced", state: refusedRemoval().pending });
+        expect(actors.list().filter(actor => actor.name === "fenced").map(actor => actor.id)).toEqual([predecessorId]);
+        expect((JSON.parse(fs.readFileSync(path.join(root, "actors", "actors.json"), "utf8")) as { actors: Array<{ id: string }> }).actors.map(actor => actor.id)).not.toContain(predecessorId);
+        expect(fs.existsSync(path.join(root, "actors", predecessorId!))).toBe(true);
+        expect(fs.readdirSync(path.join(root, "actors"), { withFileTypes: true }).filter(entry => entry.isDirectory() && entry.name !== "bindings").map(entry => entry.name)).toEqual([predecessorId]);
+        expect(fs.readFileSync(path.join(root, "actors", predecessorId!, "history"), "utf8")).toBe("previous history");
+      } else {
+        expect(actors.list().filter(actor => actor.name === "fenced")).toEqual([]);
+        const actorRoot = path.join(root, "actors");
+        expect(fs.existsSync(actorRoot) ? fs.readdirSync(actorRoot, { withFileTypes: true }).filter(entry => entry.isDirectory() && entry.name !== "bindings") : []).toEqual([]);
+      }
       expect(mesh.read({ topic: "fabric.actor.lifecycle", limit: 100 }).filter(event => event.kind === "created")).toHaveLength(wait === "hook" ? 0 : 1);
       remove?.mockRestore();
       await expect(actors.create({ name: "fenced", instructions: "Allowed control." }, { checkActive() {} })).resolves.toMatchObject({ name: "fenced" });
@@ -876,7 +901,7 @@ describe("ActorManager presence under a stalled mesh lock", () => {
       fs.writeFileSync(path.join(lockPath, "owner"), `stuck\n${process.pid}\n${Date.now()}\n`);
     };
     const release = () => fs.rmSync(lockPath, { recursive: true, force: true });
-    return { mesh, make, hold, release, identity };
+    return { mesh, make, hold, release, identity, root };
   };
 
   // smarty-dev#784: a host with 13 actors re-decided every actor's ownership once per actor for
@@ -1008,21 +1033,27 @@ describe("ActorManager presence under a stalled mesh lock", () => {
     await waitFor(() => mesh.get(`actors/presence/${actor.id}`) !== undefined, 5_000);
   }, 20_000);
 
-  it("deletes a removed actor's presence once a stalled lock frees", async () => {
-    const { mesh, make, hold, release } = stalledSetup();
+  // off Linux #1031 refuses removal (accepted gap smarty-dev#11335); pi-fabric#1079 unskips
+  it.skipIf(process.platform !== "linux")("deletes a removed actor's presence once a stalled lock frees", async () => {
+    const { mesh, make, hold, release, root } = stalledSetup();
     const actors = make();
     const actor = await actors.create({ name: "reviewer", instructions: "Review.", topics: ["team.pulls"], responseMode: "text" });
     await waitFor(() => mesh.get(`actors/presence/${actor.id}`) !== undefined, 5_000);
     hold();
-    await actors.remove(actor.id);
+    const removed = await actors.remove(actor.id);
     expect(mesh.get(`actors/presence/${actor.id}`)).toBeDefined();
     release();
+    if (rootTreeDeletionRefused) {
+      expect(removed).toEqual(refusedRemoval("session:presence"));
+      expect(fs.existsSync(path.join(root, "actors", actor.id))).toBe(true);
+    }
+    // A stopped actor's already-queued presence retry independently sees the committed registry revocation.
     await waitFor(() => mesh.get(`actors/presence/${actor.id}`) === undefined, 5_000);
   }, 20_000);
 
   // review/astra on #46, F1: a presence write held on the lock must not land after a newer one.
   it("never puts a removed actor back when an older presence write lands late", async () => {
-    const { mesh, make } = stalledSetup();
+    const { mesh, make, root } = stalledSetup();
     const actors = make();
     const put = mesh.put.bind(mesh);
     let open!: () => void;
@@ -1039,8 +1070,14 @@ describe("ActorManager presence under a stalled mesh lock", () => {
     await new Promise((resolve) => setTimeout(resolve, 100));
     open();
     await created;
-    await removed;
+    const removal = await removed;
     await new Promise((resolve) => setTimeout(resolve, 200));
+    if (rootTreeDeletionRefused) {
+      expect(removal).toEqual(refusedRemoval("session:presence"));
+      expect(mesh.get(`actors/presence/${actor.id}`)).toBeDefined();
+      expect(fs.existsSync(path.join(root, "actors", actor.id))).toBe(true);
+      return;
+    }
     expect(mesh.get(`actors/presence/${actor.id}`)).toBeUndefined();
   }, 20_000);
 
@@ -3908,8 +3945,14 @@ describe("ActorManager", () => {
     const clock = () => {
       const realNow = Date.now.bind(Date);
       let skew = 0;
-      vi.spyOn(Date, "now").mockImplementation(() => realNow() + skew);
-      return { set: (at: number) => { skew = at - realNow(); } };
+      const now = vi.spyOn(Date, "now");
+      const advance = () => now.mockImplementation(() => realNow() + skew);
+      advance();
+      return {
+        set: (at: number) => { skew = at - realNow(); advance(); },
+        // Exact boundary reads must not cross expiry on a real clock tick (Windows can tick by ~16 ms).
+        freeze: (at: number) => { now.mockReturnValue(at); },
+      };
     };
     // Real timers keep running; the wake is captured so the test can fire it at the faked expiry.
     const captureWakes = () => {
@@ -4184,20 +4227,23 @@ describe("ActorManager", () => {
       expect(result.classification).toMatch(classification);
     });
 
-    it("never expires a context-overflow block", async () => {
+    it("never expires an unverified context-overflow block", async () => {
       const s = setup(true);
       const time = clock();
       const actor = await s.actors.create({ name: "overflowed", instructions: "Respond.", responseMode: "text" });
       const wakes = captureWakes();
       // smarty-dev#3238 round 2 (#853): only the run's typed CONTEXT_OVERFLOW code is an overflow;
       // error text that quotes "Context exceeds window" is classified "unknown" (still never expires).
+      // PR #1147 intentionally re-arms a verified overflow (complete evidence matching its run id) at the
+      // settled boundary/load; real-process successor tests cover that. This mock has no run id, so its typed
+      // overflow is unverified (complete: false) and must stay hard across the clock jump and restart.
       const overflow = "Error: Context exceeds window: 100 > 80";
-      vi.spyOn(s.agents, "run").mockResolvedValueOnce({ id: "overflow-run", status: "failed", error: overflow,
+      vi.spyOn(s.agents, "run").mockResolvedValueOnce({ status: "failed", error: overflow,
         errorCode: "CONTEXT_OVERFLOW", toolCalls: 0 } as unknown as Awaited<ReturnType<AgentManager["run"]>>);
       await expect(s.actors.ask(actor.id, "activate")).rejects.toThrow(overflow);
       await waitFor(() => !s.actors.status(actor.id).inFlightRun && !s.actors.status(actor.id).preparing);
       const blocked = s.actors.status(actor.id).activationBlocked!;
-      expect(blocked).toMatchObject({ code: "context-overflow", count: 1 });
+      expect(blocked).toMatchObject({ code: "context-overflow", count: 1, overflowEvidence: { version: 1, complete: false } });
       expect(blocked).not.toHaveProperty("retryAt");
       expect(wakes.filter(entry => entry.ms <= ACTOR_TRANSIENT_BLOCK_BACKOFF_MAX_MS &&
         entry.ms % ACTOR_TRANSIENT_BLOCK_BACKOFF_MS === 0)).toHaveLength(0);
@@ -4205,7 +4251,9 @@ describe("ActorManager", () => {
       expect(s.actors.status(actor.id)).toMatchObject({ activationBlocked: { code: "context-overflow", count: 1 } });
       expect(s.actors.status(actor.id)).not.toHaveProperty("activationBlockExpired");
       const restored = await restart(s, s.actors);
-      expect(restored.status(actor.id)).toMatchObject({ activationBlocked: { code: "context-overflow" } });
+      expect(restored.status(actor.id)).toMatchObject({ activationBlocked: { code: "context-overflow",
+        overflowEvidence: { version: 1, complete: false } } });
+      expect(restored.status(actor.id).activationBlocked).not.toHaveProperty("retryAt");
       expect(restored.status(actor.id)).not.toHaveProperty("activationBlockExpired");
     }, 60_000);
 
@@ -4327,11 +4375,12 @@ describe("ActorManager", () => {
           .find((row) => row.id === actor.id)!.activationBlocked;
         expect(stored).toEqual(blocked);
         expect(restored.status(actor.id).activationBlocked).toEqual(blocked);
-        time.set(blocked.retryAt! - 1);
+        time.freeze(blocked.retryAt! - 1);
         expect(restored.status(actor.id)).not.toHaveProperty("activationBlockExpired");
-        time.set(blocked.retryAt! + 1);
+        time.freeze(blocked.retryAt! + 1);
         expect(restored.status(actor.id).activationBlockExpired).toMatchObject({ class: "transient", blockedAt: blocked.blockedAt,
           backoffMs: blocked.backoffMs, expiredAt: blocked.retryAt });
+        time.set(blocked.retryAt! + 1); // Resume wall-clock progress before asynchronous probe/wait deadlines.
         await failOnce(restored, s.agents, actor.id);                                  // the probe after restart fails: doubled again
         expect(restored.status(actor.id).activationBlocked).toMatchObject({ backoffMs: 4 * ACTOR_TRANSIENT_BLOCK_BACKOFF_MS });
       }, 60_000);
@@ -4485,7 +4534,7 @@ describe("ActorManager", () => {
   }, 60_000);
 
   it("stays ambient and retains the failed run when a directive run fails", async () => {
-    const { actors, agents } = setup();
+    const { actors, agents, root } = setup();
     const actor = await actors.create({
       name: "supervisor",
       instructions: "Watch and steer only when needed.",
@@ -4515,7 +4564,13 @@ describe("ActorManager", () => {
     });
 
     // Removing the actor releases the retained run.
-    await actors.remove(actor.id);
+    const removed = await actors.remove(actor.id);
+    if (rootTreeDeletionRefused) {
+      expect(removed).toEqual(refusedRemoval());
+      expect(agents.list().map((entry) => entry.id)).toContain(retained[0]!.id);
+      expect(fs.existsSync(path.join(root, "actors", actor.id))).toBe(true);
+      return;
+    }
     expect(agents.list()).toEqual([]);
   });
 
@@ -5908,6 +5963,16 @@ describe("ActorManager removal behind an in-flight run", () => {
       await recovery;
       await actors.removalSettled(actor.id);
       expect(runSettled).toBe(true);
+      if (rootTreeDeletionRefused) {
+        const pending = actors.pendingRemovals();
+        expect(pending).toHaveLength(1);
+        expect(pending[0]!).toMatchObject({ id: actor.id, state: refusedRemoval().pending });
+        expect(actors.list().map((entry) => entry.id)).toEqual(expect.arrayContaining([actor.id, successor.id]));
+        expect(JSON.parse(fs.readFileSync(registry, "utf8")).actors.map((entry: { id: string }) => entry.id)).toEqual([successor.id]);
+        expect(fs.existsSync(history)).toBe(true);
+        expect(actors.status(actor.name).id).toBe(successor.id);
+        return;
+      }
       expect(fs.existsSync(history)).toBe(false);
       expect(fs.existsSync(marker)).toBe(false);
       expect(JSON.parse(fs.readFileSync(registry, "utf8")).actors.map((entry: { id: string }) => entry.id)).toEqual([successor.id]);
@@ -5924,7 +5989,7 @@ describe("ActorManager removal behind an in-flight run", () => {
   }, 30_000);
 
   it("returns at once, names the run, lets a same-name create through, and finishes after the run", async () => {
-    const { actors, agents } = setup(true);
+    const { actors, agents, root } = setup(true);
     let release!: () => void;
     const gate = new Promise<void>((resolve) => { release = resolve; });
     const runId = "a".repeat(32);
@@ -5955,6 +6020,15 @@ describe("ActorManager removal behind an in-flight run", () => {
 
     release();
     await actors.removalSettled(actor.id);
+    if (rootTreeDeletionRefused) {
+      const pending = actors.pendingRemovals();
+      expect(pending).toHaveLength(1);
+      expect(pending[0]!).toMatchObject({ id: actor.id, state: refusedRemoval().pending });
+      expect(actors.list().map((entry) => entry.id)).toEqual(expect.arrayContaining([actor.id, successor.id]));
+      expect(JSON.parse(fs.readFileSync(path.join(root, "actors", "actors.json"), "utf8")).actors.map((entry: { id: string }) => entry.id)).toEqual([successor.id]);
+      expect(fs.existsSync(path.join(root, "actors", actor.id))).toBe(true);
+      return;
+    }
     expect(actors.list().map((entry) => entry.id)).toEqual([successor.id]);
     expect(actors.pendingRemovals()).toEqual([]);
   });
@@ -6058,7 +6132,12 @@ describe("ActorManager removal behind an in-flight run", () => {
       expect(saved.actors[0].id).toBe(actor.id);
       expect(saved.actors[0].removal).toBeUndefined();
     } finally { synced.mockRestore(); release(); }
-    await expect(actors.remove(actor.id)).resolves.toEqual({ removed: true });
+    // smarty-dev#11335: off Linux the retried removal is accepted, then its root tree delete is refused.
+    if (rootTreeDeletionRefused) {
+      await expect(actors.remove(actor.id)).resolves.toEqual(refusedRemoval());
+    } else {
+      await expect(actors.remove(actor.id)).resolves.toEqual({ removed: true });
+    }
   });
 
   const readOnly = (dir: string) => fs.chmodSync(dir, 0o500);
@@ -6072,6 +6151,8 @@ describe("ActorManager removal behind an in-flight run", () => {
     await waitFor(() => actors.status(actor.id).inFlightRun?.id === runId);
     await actors.stop(actor.id);                               // only the removal's own save fails below
     const actorRoot = path.join(root, "actors");
+    const history = path.join(actorRoot, actor.id, "history");
+    if (rootTreeDeletionRefused) fs.writeFileSync(history, "accepted removal history");
     readOnly(actorRoot);
     try {
       await expect(actors.remove(actor.id, { wait: false })).rejects.toThrow(/removal was not saved/);
@@ -6083,10 +6164,20 @@ describe("ActorManager removal behind an in-flight run", () => {
     expect(accepted.pending).toContain(runId);
     release();
     await actors.removalSettled(actor.id);
-    expect(actors.list()).toEqual([]);
+    if (rootTreeDeletionRefused) {
+      const pending = actors.pendingRemovals();
+      expect(pending).toHaveLength(1);
+      expect(pending[0]!).toMatchObject({ id: actor.id, state: refusedRemoval().pending });
+      expect(fs.existsSync(path.join(actorRoot, actor.id))).toBe(true);
+      expect(fs.readFileSync(history, "utf8")).toBe("accepted removal history");
+    } else {
+      expect(actors.list()).toEqual([]);
+    }
   });
 
-  it.skipIf(process.platform === "win32")("retries an accepted removal whose cleanup failed", async () => {
+  // smarty-dev#11335: the subject is a failing then retried root tree delete, which never runs off Linux
+  // (refused before any hook or rm, smarty-dev#8090); the refusal itself is asserted in the round 2/3 tests below.
+  it.skipIf(process.platform !== "linux")("retries an accepted removal whose cleanup failed", async () => {
     const { actors, agents, root } = setup(true);
     const { release, runId } = hangingRun(agents);
     const actor = await actors.create({ name: "reviewer", instructions: "Review.", responseMode: "text" });
@@ -6107,7 +6198,8 @@ describe("ActorManager removal behind an in-flight run", () => {
   }, 20_000);
 
   // Review round 2 on pi-fabric#160: a waiting remove must not report success after the retries ran out.
-  it.skipIf(process.platform === "win32")("fails a waiting remove whose accepted cleanup never succeeded, and finishes on a later remove", async () => {
+  // smarty-dev#11335: same subject (the delete's retries run out, then succeed); off Linux no delete is attempted.
+  it.skipIf(process.platform !== "linux")("fails a waiting remove whose accepted cleanup never succeeded, and finishes on a later remove", async () => {
     const { agents, root, mesh, identity, meshConfig } = setup(true);
     const actors = new ActorManager("test", identity, mesh, meshConfig, agents, () => {},
       { actorRoot: path.join(root, "actors"), persistent: true, removalRetryMs: 10 });
@@ -6131,7 +6223,9 @@ describe("ActorManager removal behind an in-flight run", () => {
     expect(actors.list()).toEqual([]);
   }, 20_000);
 
-  it.each(["directory", "presence"] as const)("smarty-dev#2339 F1: retains %s cleanup after registry revocation and drains it on restart without deleting a successor", async (failure) => {
+  // smarty-dev#11335: the injected directory/presence failures sit at and after the root tree delete, which off Linux
+  // is refused first (smarty-dev#8090), so neither failure point is reachable and nothing drains on restart.
+  it.skipIf(rootTreeDeletionRefused).each(["directory", "presence"] as const)("smarty-dev#2339 F1: retains %s cleanup after registry revocation and drains it on restart without deleting a successor", async (failure) => {
     const { actors: initial, agents, root, mesh, identity, meshConfig } = setup(true);
     await initial.close();
     const actorRoot = path.join(root, "actors");
@@ -6215,6 +6309,15 @@ describe("ActorManager removal behind an in-flight run", () => {
       { actorRoot: path.join(root, "actors"), persistent: true });
     actorManagers.push(restarted);
     await restarted.finishPendingRemovals();
+    if (rootTreeDeletionRefused) {
+      const pending = restarted.pendingRemovals();
+      expect(pending).toHaveLength(1);
+      expect(pending[0]!).toMatchObject({ id: actor.id, state: refusedRemoval().pending });
+      expect(registryIds()).toEqual([successor.id]);
+      expect(fs.existsSync(path.join(root, "actors", actor.id))).toBe(true);
+      release();
+      return;
+    }
     expect(restarted.list().map((entry) => entry.id)).toEqual([successor.id]);
     expect(registryIds()).toEqual([successor.id]);
     release();
@@ -6235,7 +6338,7 @@ describe("#169 round 2 removal coordination", () => {
   };
 
   it.each([false, true])("keeps each caller's wait policy during held acceptance (first wait=%s)", async (firstWait) => {
-    const { actors, agents } = setup(true);
+    const { actors, agents, root } = setup(true);
     const run = liveRun(agents);
     const actor = await actors.create({ name: "mixed waits", instructions: "Work." });
     actors.tell(actor.id, "go");
@@ -6266,6 +6369,12 @@ describe("#169 round 2 removal coordination", () => {
       expect(waitingResult).toBeUndefined();
       run.release();
       await Promise.all([fast, waiting]);
+      if (rootTreeDeletionRefused) {
+        // smarty-dev#11335: the waiting caller settles (no hang) with the named refusal; the tree is kept.
+        expect(waitingResult).toEqual(refusedRemoval());
+        expect(fs.existsSync(path.join(root, "actors", actor.id))).toBe(true);
+        return;
+      }
       expect(waitingResult).toEqual({ removed: true });
       expect(actors.list()).toEqual([]);
     } finally {
@@ -6307,6 +6416,12 @@ describe("#169 round 2 removal coordination", () => {
       await removing;
       expect(records().map((row) => row.id)).not.toContain(actor.id);
       expect(view.map((row) => row.id)).not.toContain(actor.id);
+      if (rootTreeDeletionRefused) {
+        // smarty-dev#11335: accepted and revoked above, but the root tree delete is refused and the tree kept.
+        expect(result).toEqual(refusedRemoval());
+        expect(fs.existsSync(dir)).toBe(true);
+        return;
+      }
       expect(result).toEqual({ removed: true });
       expect(fs.existsSync(dir)).toBe(false);
     } finally { release(); await removing; lock.mockRestore(); }
@@ -6327,6 +6442,11 @@ describe("#169 round 2 removal coordination", () => {
       expect(fs.existsSync(dir)).toBe(true);
       expect(actors.status(actor.id).id).toBe(actor.id);
     } finally { write.mockRestore(); }
+    if (rootTreeDeletionRefused) {
+      await expect(actors.remove(actor.id)).resolves.toEqual(refusedRemoval());
+      expect(fs.existsSync(dir)).toBe(true);
+      return;
+    }
     await expect(actors.remove(actor.id)).resolves.toEqual({ removed: true });
     expect(fs.existsSync(dir)).toBe(false);
   });
@@ -6364,6 +6484,15 @@ describe("#169 round 2 removal coordination", () => {
       expect(recovered).toBe(false);
       run.release();
       await recovering;
+      if (rootTreeDeletionRefused) {
+        // smarty-dev#11335: recovery still waits for the drain, then the refused delete keeps the history.
+        const pending = actors.pendingRemovals();
+        expect(pending).toHaveLength(1);
+        expect(pending[0]!).toMatchObject({ id: actor.id, state: refusedRemoval().pending });
+        expect((JSON.parse(fs.readFileSync(path.join(root, "actors", "actors.json"), "utf8")) as { actors: Array<{ id: string }> }).actors.map(entry => entry.id)).not.toContain(actor.id);
+        expect(fs.readFileSync(path.join(dir, "history"), "utf8")).toBe("live history");
+        return;
+      }
       expect(fs.existsSync(dir)).toBe(false);
     } finally {
       releaseSave(); run.release();
@@ -6426,13 +6555,24 @@ describe("#169 round 4 per-id revocation authorization", () => {
     });
     try {
       const results = await Promise.allSettled([actors.remove(a.id), actors.remove(b.id)]);
-      expect(results[0]).toEqual({ status: "fulfilled", value: { removed: true } });
+      if (rootTreeDeletionRefused) {
+        expect(results[0]).toEqual({ status: "fulfilled", value: refusedRemoval() });
+      } else {
+        expect(results[0]).toEqual({ status: "fulfilled", value: { removed: true } });
+      }
       expect(results[1]).toMatchObject({ status: "rejected", reason: expect.objectContaining({ message: "B marker barrier unavailable" }) });
       expect(failedB).toBe(true);
       expect(registryIds()).toEqual([b.id]);
       expect(fs.existsSync(markerB)).toBe(false);
       expect(fs.existsSync(path.join(actorRoot, b.id))).toBe(true);
     } finally { synced.mockRestore(); opened.mockRestore(); }
+    if (rootTreeDeletionRefused) {
+      // smarty-dev#11335: B's retry is accepted and revoked; its tree delete is refused and the tree kept.
+      await expect(actors.remove(b.id)).resolves.toEqual(refusedRemoval());
+      expect(registryIds()).toEqual([]);
+      expect(fs.existsSync(path.join(actorRoot, b.id))).toBe(true);
+      return;
+    }
     await expect(actors.remove(b.id)).resolves.toEqual({ removed: true });
     expect(registryIds()).toEqual([]);
     expect(fs.existsSync(path.join(actorRoot, b.id))).toBe(false);
@@ -6487,6 +6627,12 @@ describe("#169 round 3 removal durability", () => {
       if (barrier > 1) expect(JSON.parse(fs.readFileSync(marker, "utf8")).id).toBe(actor.id);
       expect(fs.readdirSync(actorRoot).some((name) => name.endsWith(".tmp"))).toBe(false);
     } finally { synced.mockRestore(); bindingDelete.mockRestore(); }
+    if (rootTreeDeletionRefused) {
+      await expect(actors.remove(actor.id)).resolves.toEqual(refusedRemoval());
+      expect(JSON.parse(fs.readFileSync(registry, "utf8")).actors).toEqual([]);
+      expect(fs.existsSync(dir)).toBe(true);
+      return;
+    }
     await expect(actors.remove(actor.id)).resolves.toEqual({ removed: true });
     expect(JSON.parse(fs.readFileSync(registry, "utf8")).actors).toEqual([]);
     expect(fs.existsSync(marker)).toBe(false);
@@ -6540,6 +6686,10 @@ describe("#169 round 1 removal safety", () => {
         expect(actors.status(actor.id).id).toBe(actor.id);
         expect(fs.existsSync(dir)).toBe(true);
         expect(fs.existsSync(marker)).toBe(true);
+      } else if (rootTreeDeletionRefused) {
+        // smarty-dev#11335: both callers are acknowledged after the commit with the named refusal; history kept.
+        expect(results).toEqual([refusedRemoval(), refusedRemoval()]);
+        expect(fs.readFileSync(path.join(dir, "history"), "utf8")).toBe("keep");
       } else {
         expect(results).toEqual([{ removed: true }, { removed: true }]);
         expect(fs.existsSync(dir)).toBe(false);
@@ -6577,6 +6727,17 @@ describe("#169 round 1 removal safety", () => {
     const final = new ActorManager("different", identity, mesh, meshConfig, agents, () => {}, { actorRoot, persistent: true });
     actorManagers.push(final);
     await final.finishPendingRemovals();
+    if (rootTreeDeletionRefused) {
+      // smarty-dev#11335: the saved removal stays pending on startup; the refused tree delete comes before the
+      // presence delete, so the tree and the old presence are both kept.
+      const pending = final.pendingRemovals();
+      expect(pending).toHaveLength(1);
+      expect(pending[0]!).toMatchObject({ id: actor.id, state: refusedRemoval().pending });
+      expect((JSON.parse(fs.readFileSync(registryPath, "utf8")) as { actors: Array<{ id: string }> }).actors.map(entry => entry.id)).not.toContain(actor.id);
+      expect(fs.existsSync(dir)).toBe(true);
+      expect(mesh.get(`actors/test/${actor.id}`)).toBeDefined();
+      return;
+    }
     expect(final.list()).toEqual([]);
     expect(mesh.get(`actors/test/${actor.id}`)).toBeUndefined();
     expect(fs.existsSync(marker)).toBe(false);
@@ -6615,6 +6776,17 @@ describe("#169 round 1 removal safety", () => {
       const restarted = new ActorManager("restarted", identity, mesh, meshConfig, agents, () => {}, { actorRoot, persistent: true });
       actorManagers.push(restarted);
       await restarted.finishPendingRemovals();
+      if (rootTreeDeletionRefused) {
+        // smarty-dev#11335: the valid cleanup stays pending (refused, tree kept); the bad marker is still ignored.
+        const pending = restarted.pendingRemovals();
+        expect(pending).toHaveLength(1);
+        expect(pending[0]!).toMatchObject({ id: actor.id, state: refusedRemoval().pending });
+        expect((JSON.parse(fs.readFileSync(path.join(root, "actors", "actors.json"), "utf8")) as { actors: Array<{ id: string }> }).actors.map(entry => entry.id)).not.toContain(actor.id);
+        expect(fs.existsSync(dir)).toBe(true);
+        expect(fs.existsSync(badDir)).toBe(true);
+        expect(fs.lstatSync(badPath).isSymbolicLink()).toBe(bad === "symlink");
+        return;
+      }
       expect(fs.existsSync(dir)).toBe(false);
       expect(mesh.get(`actors/test/${actor.id}`)).toBeUndefined();
       expect(fs.existsSync(badDir)).toBe(true);

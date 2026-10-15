@@ -18,7 +18,7 @@ import type {
 } from "./agents/types.js";
 import { applyChildPriority } from "./agents/priority.js";
 import { saveWorkerCompletion } from "./agents/completion-journal.js";
-import { taskAgentEnvironment } from "./agents/task-environment.js";
+import { taskAgentEnvironment, withoutTaskBoundary } from "./agents/task-environment.js";
 import { applyTaskReturnAddress } from "./agents/task-return-address.js";
 import { processStartTime } from "./residency/process-identity.js";
 import { executionGroup, observeExecutionGroup } from "./worker/execution-group.js";
@@ -44,17 +44,18 @@ const executionSettled = (): Promise<void> => new Promise(resolve => {
   if (process.platform !== "win32" && process.connected && process.send) process.send({ type: "fabric-execution-settled" }, () => resolve());
   else resolve();
 });
-import { interruptedModelStreamError, retryableProviderError } from "./worker/provider-error.js";
+import { interruptedModelStreamError, retryableProviderError, WARNING_RETENTION_CAP } from "./worker/provider-error.js";
 import { copyFabricProvenance, type FabricTurnProvenance } from "./fabric-provenance.js";
 import { ActivationSession } from "./worker/activation-session.js";
 import type { ActorContextReseed } from "./worker/context-admission.js";
 import { readPiSessionHeader } from "./core/pi-session-header.js";
 import { savePiSettlementReceipt } from "./worker/settlement-receipt.js";
 import { syncPathNamespace } from "./core/atomic-write.js";
-import { finalAssistantText, readFinalAnswerReceipt, type FinalAnswerReceipt } from "./worker/terminal-answer.js";
-import { queuedTerminalControls, settleTerminalControl, trackTerminalControl } from "./worker/terminal-controls.js";
+import { finalAssistantText, readFinalAnswerReceipt, withTaskFinalAnswerLock, type FinalAnswerReceipt } from "./worker/terminal-answer.js";
+import { terminalControls, markTerminalControlForwarded, readTerminalControl, settleTerminalControl, trackTerminalControl, type TerminalControl } from "./worker/terminal-controls.js";
 import { DEFAULT_BASH_IDLE_S } from "./guards/actor-bash-timeout.js";
 import { senderHeaderHookPath } from "./guards/sender-headers.js";
+import { WriteReceiptRecorder } from "./agents/write-receipt.js";
 
 let crossSpawn: typeof import("cross-spawn");
 
@@ -299,7 +300,8 @@ const terminateChild = (child: ChildProcess, signal: NodeJS.Signals): void => {
 
 
 
-let crashContext: { statusFile: string; record: AgentRunRecord } | undefined;
+// receipt: pi-fabric#1034 round 7, the live write receipt (pending calls and dropped lines marked truncated).
+let crashContext: { statusFile: string; record: AgentRunRecord; receipt?: () => AgentRunRecord["writeReceipt"] } | undefined;
 let runRecordHelpers: WorkerRunRecordModule | undefined;
 let terminalWritten = false;
 let flushRunLog: (() => void) | undefined;
@@ -309,7 +311,7 @@ const writeCrashStatus = (error: unknown): void => {
   if (terminalWritten) return;
   try {
     if (crashContext && runRecordHelpers) {
-      runRecordHelpers.writeCrashRunRecord(crashContext.statusFile, crashContext.record, error);
+      runRecordHelpers.writeCrashRunRecord(crashContext.statusFile, crashContext.record, error, crashContext.receipt?.());
     } else {
       writeWorkerStartupFailure(process.argv, error);
     }
@@ -387,6 +389,9 @@ const main = async (): Promise<void> => {
   mkdirPrivate(deliveryDirectory, runRoot);
   const images = readImages(options.imagesFile);
   const record = createRunningRecord(options, task, thinking, Date.now());
+  // pi-fabric#1034: every Pi child's record carries a receipt from its creation, so an early refusal or failure
+  // record has the empty one too (round-2 review P2).
+  if (isPi) record.writeReceipt = { paths: [], commands: [] };
   if (options.runner === "pi") {
     // The manager removes the old status to fence terminal verdicts on relaunch.
     // History is explicitly handed across that boundary, not a Pi resume target.
@@ -657,8 +662,10 @@ const main = async (): Promise<void> => {
       appendLog(`${JSON.stringify({ type: "fabric_priority_error", error: message })}\n`));
   }
   // smarty-dev#2339 F4: a nested actor gets its own default, never its parent's override.
+  // smarty-dev#8257: only this task's own native child keeps its admitted boundary.
+  // Actors defensively clear any stale caller receipt, preserving actor roles (SRC-1).
   const childEnvironment = applyTaskReturnAddress(
-    options.actorId ? { ...process.env } : taskAgentEnvironment(), process.argv.slice(2),
+    options.actorId ? withoutTaskBoundary(process.env) : taskAgentEnvironment(process.env, true), process.argv.slice(2),
   );
   // Native session metadata belongs to this child, never its parent/resident host.
   delete childEnvironment.PI_SESSION_ID;
@@ -777,11 +784,15 @@ const main = async (): Promise<void> => {
         : {}),
       ...(options.runRoot ? { PI_FABRIC_RUN_ROOT: options.runRoot } : {}),
       // Supported child contract (docs/agents.md "Child environment contract").
+      ...(options.tmpdir ? { TMPDIR: options.tmpdir, TMP: options.tmpdir, TEMP: options.tmpdir } : {}),
       ...(options.lineage ? { PI_FABRIC_LINEAGE: options.lineage } : {}),
-      ...(options.writePolicy ? { PI_FABRIC_WRITE_POLICY: options.writePolicy } : {}),
+      PI_FABRIC_WRITE_POLICY: options.writePolicy,
       // Exactly the manager's derived scope; undefined drops an inherited value.
       PI_FABRIC_SCOPE: options.scope,
       PI_FABRIC_SCOPE_FILE: undefined,
+      // Disabled extensions must not regain ambient authority via provider discovery.
+      // Also drop an inherited target for an explicitly loaded bridge.
+      PI_FABRIC_EXTENSION_MODEL: undefined,
     },
     stdio: piRetrySdk ? ["pipe", "pipe", "pipe", "ipc"] : ["pipe", "pipe", "pipe"],
   });
@@ -811,6 +822,12 @@ const main = async (): Promise<void> => {
         do { if (exited()) return true; await new Promise(resolve => setTimeout(resolve, 20)); } while (Date.now() < deadline);
         return exited();
       };
+      if (!exited() && persistentPiTask && piRetrySdk && readFinalAnswerReceipt(path.dirname(options.statusFile), options.id)) {
+        // EOF drains buffered RPC frames through the native discard fence. TERM
+        // here would kill that reader before its durable per-frame ACKs land.
+        execution.stdin?.end();
+        await wait(KILL_GRACE_MS);
+      }
       if (!exited()) {
         group.signal("SIGTERM");
         execution.stdin?.end();
@@ -873,6 +890,16 @@ const main = async (): Promise<void> => {
   let hasCompletedToolTurn = false;
   let streamingToolCallInTurn = false;
   const unresolvedToolCalls = new Set<string>();
+  // smarty-dev#8758 item 2: what the child's write/edit/shell tools actually did, from Pi's own tool events.
+  const writeReceipt = new WriteReceiptRecorder(options.cwd);
+  // pi-fabric#1034 round 6 (Astra P1): an event line over MAX_EVENT_LINE_CHARS is dropped unread, so the recorder
+  // may miss a tool start or end in it. Rule chosen, the simplest that never under-reports: EVERY dropped line of a
+  // Pi child marks the receipt truncated, whatever the line was (the line is not parsed for its type).
+  let receiptLineDropped = false;
+  // A call still pending (started, never ended: cancelled, failed or cut off) may have had its effect: also truncated.
+  const receiptNow = (): NonNullable<typeof record.writeReceipt> =>
+    receiptLineDropped || writeReceipt.pending > 0 ? { ...writeReceipt.receipt, truncated: true } : writeReceipt.receipt;
+  if (isPi && crashContext) crashContext.receipt = receiptNow;
 
   // Only ordinary tasks with real, completed tool work and retained prose can
   // expose an interrupted report without claiming success. Never suppress
@@ -896,7 +923,7 @@ const main = async (): Promise<void> => {
   const questionRelay = options.childQuestionTimeoutMs !== undefined && isPi && options.steerFile
     ? new (await loadWorkerQuestions()).ChildQuestionRelay(options.childQuestionTimeoutMs, {
         emit: (question) => emitLifecycle("question", { ...question }),
-        send: (frame) => child.stdin?.write(`${JSON.stringify(frame)}\n`),
+        send: (frame) => { injectPiControl(`${JSON.stringify(frame)}\n`); },
         blocked: (since) => {
           if (since === undefined) delete record.blockedOn;
           else record.blockedOn = { since };
@@ -932,7 +959,7 @@ const main = async (): Promise<void> => {
       recoveryWatchdog.suspend();
       if (closeTimer) clearTimeout(closeTimer);
       closeTimer = undefined;
-      record.warnings = [...(record.warnings ?? []), `${error.message}; aborting turn for one same-model retry`].slice(-20);
+      record.warnings = [...(record.warnings ?? []), `${error.message}; aborting turn for one same-model retry`].slice(-WARNING_RETENTION_CAP);
       update();
       // Native abort waits for the assistant to finalize/persist. Close stdin
       // only after its acknowledgement; SIGTERM + EOF together can race two
@@ -995,7 +1022,7 @@ const main = async (): Promise<void> => {
       if (piSettledSuccessfully && (hasFinalResult || piSettlementDurable) && modelControl.ready && !terminalStatus &&
           !terminalError && !sawAgentError && !lostResult) {
         const warning = `${error}; preserving final result and terminating child`;
-        record.warnings = [...(record.warnings ?? []), warning].slice(-20);
+        record.warnings = [...(record.warnings ?? []), warning].slice(-WARNING_RETENTION_CAP);
         appendLog(`${JSON.stringify({ type: "worker_warning", warning })}\n`);
         process.stderr.write(`[pi-fabric] ${warning}\n`);
         // Persist the result and warning BEFORE signalling the owned group.
@@ -1012,6 +1039,26 @@ const main = async (): Promise<void> => {
     closeTimer.unref();
   };
 
+  // The child publishes its receipt under this same lock. Envelope/tracking and
+  // refusal durability stay outside; the critical section only reads and writes
+  // one stdin frame. A stale poll snapshot never authorizes a later injection.
+  const injectPiControl = (frame: string, controlId?: string): void => {
+    if (!persistentPiTask || !piRetrySdk) { child.stdin?.write(frame); return; }
+    const directory = path.dirname(options.statusFile);
+    const ended = withTaskFinalAnswerLock(directory, () => {
+      const receipt = finalAnswerReceipt ?? readFinalAnswerReceipt(directory, options.id);
+      if (!receipt && child.stdin && !child.stdin.writableEnded && !child.stdin.destroyed) {
+        // Write-ahead evidence survives a crash/partial write. Never downgrade
+        // an attempted write to unforwarded on a callback error or native close.
+        if (!controlId || markTerminalControlForwarded(directory, controlId)) child.stdin.write(frame);
+      }
+      return receipt;
+    });
+    if (ended && controlId) {
+      const control = readTerminalControl(directory, controlId);
+      if (control?.state === "queued") refuseTerminalControl(control, ended.id);
+    }
+  };
   // Auth checks and model_select hooks can be slow under concurrent launches.
   // Startup and admission share the overall run timeout below, not a shorter cap.
   const sendPiDelivery = (message: string, provenance: FabricTurnProvenance | undefined, delivery: "steer" | "followUp", images?: readonly ImageContent[], controlId?: string): void => {
@@ -1019,17 +1066,17 @@ const main = async (): Promise<void> => {
     if (persistentPiTask && piRetrySdk && controlId) {
       trackTerminalControl(path.dirname(options.statusFile), { id: controlId, delivery, provenance });
       fs.writeFileSync(path.join(deliveryDirectory, controlId + ".json"), JSON.stringify({ message, provenance, delivery, images, controlId }), { mode: 0o600 });
-      child.stdin?.write(JSON.stringify({ type: "prompt", id: controlId, message: "/fabric-delivery " + controlId, streamingBehavior: delivery }) + "\n");
+      injectPiControl(JSON.stringify({ type: "prompt", id: controlId, message: "/fabric-delivery " + controlId, streamingBehavior: delivery }) + "\n", controlId);
       return;
     }
     if (!provenance?.principal) {
-      child.stdin?.write(JSON.stringify({ type: delivery === "steer" ? "steer" : "follow_up", message,
-        ...(controlId ? { id: controlId } : {}) }) + "\n");
+      injectPiControl(JSON.stringify({ type: delivery === "steer" ? "steer" : "follow_up", message,
+        ...(controlId ? { id: controlId } : {}) }) + "\n", controlId);
       return;
     }
     const id = randomUUID();
     fs.writeFileSync(path.join(deliveryDirectory, id + ".json"), JSON.stringify({ message, provenance, delivery, images }), { mode: 0o600 });
-    child.stdin?.write(JSON.stringify({ type: "prompt", message: "/fabric-delivery " + id, streamingBehavior: delivery }) + "\n");
+    injectPiControl(JSON.stringify({ type: "prompt", message: "/fabric-delivery " + id, streamingBehavior: delivery }) + "\n", controlId);
   };
   const hasUnsettledFollowUps = (): boolean => {
     const directory = path.join(path.dirname(deliveryDirectory), "follow-ups");
@@ -1054,7 +1101,7 @@ const main = async (): Promise<void> => {
         if (item.followUpId !== id || item.delivery !== "followUp") continue;
         const receipt = followUpFile(path.dirname(deliveryDirectory), id);
         if (followUpState(receipt) !== "queued") { releaseFollowUpPayload(receipt); continue; }
-        child.stdin?.write(JSON.stringify({ type: "prompt", message: "/fabric-delivery " + id, streamingBehavior: "followUp" }) + "\n");
+        injectPiControl(JSON.stringify({ type: "prompt", message: "/fabric-delivery " + id, streamingBehavior: "followUp" }) + "\n", id);
       } catch { /* Retain malformed/uncertain envelopes; never invent delivery. */ }
     }
   };
@@ -1234,7 +1281,7 @@ const main = async (): Promise<void> => {
       if (!child.stdin || child.stdin.writableEnded || child.stdin.destroyed) {
         throw new Error("Child Pi stdin closed before compaction could start");
       }
-      child.stdin.write(`${JSON.stringify(frame)}\n`);
+      injectPiControl(`${JSON.stringify(frame)}\n`);
     },
     close: closeChild,
     update(status) {
@@ -1565,6 +1612,36 @@ const main = async (): Promise<void> => {
       }
     }
   };
+  const refusalEmitted = new Set<string>();
+  // Forwarded rows need the child's durable discard ACK. Only a row whose
+  // write-ahead transport bit is false can be refused without child consumption.
+  const refuseTerminalControl = (control: TerminalControl, receiptId: string): void => {
+    if (refusalEmitted.has(control.id)) return;
+    let published = false;
+    const publishRefusal = (current: TerminalControl): void => {
+      const data = { code: "FABRIC_TARGET_TERMINAL", targetId: options.id, messageId: current.id,
+        delivery: current.delivery, finalAnswerReceiptId: receiptId,
+        ...(current.provenance?.sender ? { sender: current.provenance.sender } : {}) };
+      const descriptor = fs.openSync(options.lifecycleFile, "a", 0o600);
+      try {
+        fs.appendFileSync(descriptor, JSON.stringify({ version: 1, event: "message.refused",
+          runId: options.id, occurredAt: Date.now(), data }) + "\n", "utf8");
+        fs.fsyncSync(descriptor);
+      } finally { fs.closeSync(descriptor); }
+      syncPathNamespace(options.lifecycleFile);
+      published = true;
+    };
+    // Host unforwarded refusals publish BEFORE the registry transition, while
+    // the same lock excludes injection/consumption. Do not nest lock acquisition.
+    const current = settleTerminalControl(path.dirname(options.statusFile), control.id, "refused", true, publishRefusal);
+    if (current?.state !== "refused") return;
+    // A child's durable discard ACK already transitioned the row independently.
+    if (!published) publishRefusal(current);
+    refusalEmitted.add(current.id);
+  };
+  const drainTerminalControlAcks = (receipt: FinalAnswerReceipt): void => {
+    for (const control of terminalControls(path.dirname(options.statusFile))) refuseTerminalControl(control, receipt.id);
+  };
   const acceptFinalAnswer = (receipt: FinalAnswerReceipt): void => {
     if (finalAnswerReceipt || !persistentPiTask) return;
     finalAnswerReceipt = receipt;
@@ -1586,21 +1663,9 @@ const main = async (): Promise<void> => {
       emitLifecycle("pi.turn_end", { terminalAnswer: true });
     }
     record.finalAnswerReceipt = { id: receipt.id, recordedAt: receipt.recordedAt };
-    for (const control of queuedTerminalControls(path.dirname(options.statusFile))) {
-      const data = { code: "FABRIC_TARGET_TERMINAL", targetId: options.id, messageId: control.id,
-        delivery: control.delivery, finalAnswerReceiptId: receipt.id,
-        ...(control.provenance?.sender ? { sender: control.provenance.sender } : {}) };
-      // Unlike progress telemetry, refusal emission must precede its registry
-      // transition. The manager's validated-status scan is the publication fence.
-      const descriptor = fs.openSync(options.lifecycleFile, "a", 0o600);
-      try {
-        fs.appendFileSync(descriptor, JSON.stringify({ version: 1, event: "message.refused",
-          runId: options.id, occurredAt: Date.now(), data }) + "\n", "utf8");
-        fs.fsyncSync(descriptor);
-      } finally { fs.closeSync(descriptor); }
-      syncPathNamespace(options.lifecycleFile);
-      settleTerminalControl(path.dirname(options.statusFile), control.id, "refused");
-    }
+    drainTerminalControlAcks(receipt);
+    // Lines the worker never read are refused now, not at manager native close.
+    pollSteer();
     // Preserve any earlier admission/limit/stop failure; the receipt never blesses
     // invalid structured output. Publish before closing the owned execution tree.
     record.status = terminalStatus ?? "completed";
@@ -1610,6 +1675,8 @@ const main = async (): Promise<void> => {
     validateCompletedResult();
     terminalStatus = record.status;
     terminalError = record.error;
+    // pi-fabric#1034: the final receipt, including a truncation no end event reported.
+    if (isPi) record.writeReceipt = receiptNow();
     saveWorkerCompletion(options.statusFile, record);
     writeRunRecord(options.statusFile, record);
     terminalWritten = true;
@@ -1632,6 +1699,13 @@ const main = async (): Promise<void> => {
       event = parsed as Record<string, unknown>;
     } catch {
       runLog.event(line, undefined);
+      // pi-fabric#1034 round 6: an unparsable Pi frame (cut at close, or a projection sentinel) may have been a tool
+      // start or end; the receipt cannot vouch for it.
+      if (isPi && line.trim() && !receiptLineDropped) {
+        receiptLineDropped = true;
+        record.writeReceipt = receiptNow();
+        update(); // persist the first transition, so a checkpoint read by the manager shows it
+      }
       return;
     }
     runLog.event(line, event);
@@ -1907,6 +1981,9 @@ const main = async (): Promise<void> => {
       return;
     }
     if (event.type === "tool_execution_start") {
+      writeReceipt.start(event);
+      // Stored at once: a checkpoint read by the manager (timeout, stop, lost worker) shows the pending call.
+      if (isPi) record.writeReceipt = receiptNow();
       unresolvedToolCalls.add(stringField(event.toolCallId) ?? "unknown-tool-call");
       record.inferenceStarted = true;
       record.toolCalls++;
@@ -1919,6 +1996,7 @@ const main = async (): Promise<void> => {
       return;
     }
     if (event.type === "tool_execution_end") {
+      if (writeReceipt.end(event)) record.writeReceipt = receiptNow();
       unresolvedToolCalls.delete(stringField(event.toolCallId) ?? "unknown-tool-call");
       completedToolInTurn = true;
       if (event.isError === true) {
@@ -2134,8 +2212,12 @@ const main = async (): Promise<void> => {
   let steerRemainder = Buffer.alloc(0);
   let skippingOversizedSteerLine = false;
   const pollSteer = (): void => {
-    if (!options.steerFile || finalAnswerReceipt || terminalStatus || (isPi &&
-        (!piControlLive || childExited || !modelControl.ready || !child.stdin?.writable || child.stdin.writableEnded || child.stdin.destroyed))) return;
+    // The native receipt can precede its IPC frame. Reuse this bounded file
+    // reader to record unread input, but never inject it after that boundary.
+    let endedReceipt = finalAnswerReceipt;
+    if (persistentPiTask && piRetrySdk && !endedReceipt) endedReceipt = readFinalAnswerReceipt(path.dirname(options.statusFile), options.id);
+    if (!options.steerFile || (!endedReceipt && (terminalStatus || (isPi &&
+        (!piControlLive || childExited || !modelControl.ready || !child.stdin?.writable || child.stdin.writableEnded || child.stdin.destroyed))))) return;
     let descriptor: number | undefined;
     try {
       descriptor = fs.openSync(options.steerFile, "r");
@@ -2192,6 +2274,18 @@ const main = async (): Promise<void> => {
           continue;
         }
         try {
+          // Re-read for every parsed row too; actual injection is serialized
+          // with publication below, including rows appended after preflight.
+          if (persistentPiTask && piRetrySdk) endedReceipt = finalAnswerReceipt ?? readFinalAnswerReceipt(path.dirname(options.statusFile), options.id);
+          if (endedReceipt) {
+            if ((command.type === "steer" || command.type === "follow_up") && typeof command.id === "string" && /^[0-9a-f-]{36}$/.test(command.id)) {
+              const directory = path.dirname(options.statusFile);
+              trackTerminalControl(directory, { id: command.id, delivery: command.type === "steer" ? "steer" : "followUp", provenance: copyFabricProvenance(command.provenance) });
+              const control = readTerminalControl(directory, command.id);
+              if (control?.state === "queued") refuseTerminalControl(control, endedReceipt.id);
+            }
+            continue;
+          }
           if (options.runner === "claude") {
             if (claudeCloseTimer) clearTimeout(claudeCloseTimer);
             claudeCloseTimer = undefined;
@@ -2231,19 +2325,20 @@ const main = async (): Promise<void> => {
                 message: command.message, provenance: command.provenance, delivery: "followUp", followUpId: id,
                 ...(persistentPiTask && piRetrySdk ? { controlId: id } : {}),
               }), { mode: 0o600 });
-              child.stdin?.write(JSON.stringify({ type: "prompt", id, message: "/fabric-delivery " + id, streamingBehavior: "followUp" }) + "\n");
+              injectPiControl(JSON.stringify({ type: "prompt", id, message: "/fabric-delivery " + id, streamingBehavior: "followUp" }) + "\n", id);
             } else sendPiDelivery(command.message, copyFabricProvenance(command.provenance), "followUp", undefined, command.id);
           } else if (command.type === "set_steering_mode" && typeof command.mode === "string") {
-            child.stdin?.write(JSON.stringify({ type: "set_steering_mode", mode: command.mode }) + "\n");
+            injectPiControl(JSON.stringify({ type: "set_steering_mode", mode: command.mode }) + "\n");
           } else if (command.type === "set_follow_up_mode" && typeof command.mode === "string") {
-            child.stdin?.write(JSON.stringify({ type: "set_follow_up_mode", mode: command.mode }) + "\n");
+            injectPiControl(JSON.stringify({ type: "set_follow_up_mode", mode: command.mode }) + "\n");
           } else if (command.type === "compact") {
             compactControl.queue(command.instructions);
           } else if (command.type === "ui_response") {
             questionRelay?.respond(command);
           }
-        } catch {
-          /* stdin closed (settled/stopped child); a late steer is dropped */
+        } catch (error) {
+          if (endedReceipt) appendLog(`${JSON.stringify({ type: "fabric_run_end_fence_failed", message: String(error) })}\n`);
+          /* Closed stdin or failed refusal persistence: manager scans durable admissions. */
         }
       }
     } finally {
@@ -2252,6 +2347,7 @@ const main = async (): Promise<void> => {
   };
   const steerTimer = options.steerFile ? setInterval(() => {
     pollSteer();
+    if (finalAnswerReceipt) drainTerminalControlAcks(finalAnswerReceipt);
     if (deferredFollowUpSettle && !nativeActivity && !hasUnsettledFollowUps()) {
       deferredFollowUpSettle = false;
       compactControl.childSettled();
@@ -2267,6 +2363,10 @@ const main = async (): Promise<void> => {
   let oversizedCount = 0;
   const startOversizedEvent = (text: string): void => {
     toolCallStreamGuard.discardedEvent();
+    if (isPi) {
+      receiptLineDropped = true;
+      record.writeReceipt = receiptNow(); // stored now too, in case no later end or terminal write comes
+    }
     oversized = { chars: text.length, prefix: text.slice(0, MAX_EVENT_LINE_CHARS) };
   };
   const finishOversizedEvent = (): void => {
@@ -2294,7 +2394,7 @@ const main = async (): Promise<void> => {
       (artifactPath ? `; first ${prefix.length} characters saved to: ${artifactPath}` : "");
     appendLog(`${JSON.stringify({ type: "worker_warning", warning })}\n`);
     process.stderr.write(`[pi-fabric] ${warning}\n`);
-    record.warnings = [...(record.warnings ?? []), warning].slice(-20);
+    record.warnings = [...(record.warnings ?? []), warning].slice(-WARNING_RETENTION_CAP);
     // Never strand a correlated admission response behind the event-line cap.
     // Only its bounded envelope is inspected; the history remains discarded.
     contextAdmission?.observeOversizedResponse(prefix, chars);
@@ -2514,7 +2614,7 @@ const main = async (): Promise<void> => {
       recoveryWatchdog.observe({ type: "auto_retry_start", delayMs: waitMs, errorMessage });
       const resume = { attempt: providerResumeAttempts + 1, maxAttempts: PI_PROVIDER_RESUME_DELAYS_MS.length,
         delayMs: waitMs, error: errorMessage, sessionFile: piSessionFile };
-      record.warnings = [...(record.warnings ?? []), `Pi provider recovery: same-session resume ${resume.attempt}/${resume.maxAttempts} scheduled after ${waitMs}ms`].slice(-20);
+      record.warnings = [...(record.warnings ?? []), `Pi provider recovery: same-session resume ${resume.attempt}/${resume.maxAttempts} scheduled after ${waitMs}ms`].slice(-WARNING_RETENTION_CAP);
       update();
       emitLifecycle("run.resumed", { ...resume, phase: "scheduled" });
       appendLog(`${JSON.stringify({ type: "fabric_provider_resume", ...resume, phase: "scheduled" })}\n`);
@@ -2540,6 +2640,10 @@ const main = async (): Promise<void> => {
 
   if (crash.pending) return; // finishCrash owns result publication after the drain.
   if (steerTimer) clearInterval(steerTimer);
+  if (finalAnswerReceipt) {
+    pollSteer(); // Last worker-side run-end fence pass.
+    drainTerminalControlAcks(finalAnswerReceipt);
+  }
   clearTimeout(recordedResultTimer);
   if (recordedResultPending && !terminalStatus) {
     terminalStatus = "failed";
@@ -2678,7 +2782,7 @@ const main = async (): Promise<void> => {
     // valid JSON prefix) must never pass completed-only consumers.
     record.partialText = interruptedText;
     record.text = interruptedText;
-    record.warnings = [...(record.warnings ?? []), warning].slice(-20);
+    record.warnings = [...(record.warnings ?? []), warning].slice(-WARNING_RETENTION_CAP);
     appendLog(`${JSON.stringify({ type: "worker_warning", warning })}\n`);
   }
   validateCompletedResult();
@@ -2702,6 +2806,8 @@ const main = async (): Promise<void> => {
     record.status = "failed";
     record.error = `${record.error ? record.error + "\n" : ""}Activation journal retention failed: ${String(error)}`;
   }
+  // pi-fabric#1034: the final receipt, including a truncation no end event reported (a child that exits mid-call).
+  if (isPi) record.writeReceipt = receiptNow();
   // The owning Main may already be dead. Publish through its immutable launch return address.
   saveWorkerCompletion(options.statusFile, record);
   writeRunRecord(options.statusFile, record);

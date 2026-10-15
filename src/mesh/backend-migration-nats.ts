@@ -79,6 +79,11 @@ export interface MeshNatsMigrationOptions {
   maxPayloadBytes?: number;
   lockTimeoutMs?: number;
   lockProtocol?: 1 | 2;
+  /** As openNatsStateBackend: create with these replicas; refuse an existing stream with other replicas.
+   * Omitted: the real client reads the agent-layer fabric.json mesh.nats.replicas; an injected port decides. */
+  replicas?: number;
+  /** Real-client placement budget in milliseconds (default 30 000); exhausted: typed unavailable, never fewer replicas. */
+  placementTimeoutMs?: number;
   /** Synchronous crash-point hook (tests stop the tool here). */
   onStep?: (step: MeshBackendStep) => void;
 }
@@ -240,19 +245,40 @@ const run = async <T>(root: string, options: MeshNatsMigrationOptions, gateVersi
       }
       const subject = `${stream}.state`;
       // The backend's subjects and message cap (pi-fabric#907): the root's open refuses a stream without max_msg_size.
-      await port.ensureStream(stream, [subject, `${stream}.snapshot`], { maxMsgSize: MAX_MESSAGE_BYTES });
+      await port.ensureStream(stream, [subject, `${stream}.snapshot`], { maxMsgSize: MAX_MESSAGE_BYTES,
+        ...(options.replicas === undefined ? {} : { replicas: options.replicas }) });
       return body(port, stream, subject);
     });
   } finally { if (owned) await port.close().catch(() => undefined); }
 };
 
+const MIGRATION_PUBLISH_ATTEMPTS = 3;
 const publish = async (port: JetStreamPort, subject: string, data: Uint8Array, expectLastSequence: number, msgID: string): Promise<number> => {
-  try { return (await port.publish(subject, data, { expectLastSequence, msgID })).seq; }
-  catch (error) {
-    if (error instanceof NatsWrongLastSequenceError) {
-      throw new MeshBackendRefusedError(`Fabric mesh NATS stream moved during the migration (expected last sequence ${expectLastSequence}): another writer; rerun`);
+  let outcomeUnknown = false;
+  for (let attempt = 1; attempt <= MIGRATION_PUBLISH_ATTEMPTS; attempt++) {
+    try {
+      const ack = await port.publish(subject, data, { expectLastSequence, msgID });
+      if (outcomeUnknown && ack.duplicate) return await reconcile();
+      return ack.seq;
+    } catch (error) {
+      if (error instanceof NatsWrongLastSequenceError) {
+        if (outcomeUnknown) return await reconcile();
+        throw new MeshBackendRefusedError(`Fabric mesh NATS stream moved during the migration (expected last sequence ${expectLastSequence}): another writer; rerun`);
+      }
+      if ((error as { transient?: boolean } | null)?.transient !== true) throw error;
+      outcomeUnknown = true;
+      if (attempt === MIGRATION_PUBLISH_ATTEMPTS) throw error;
     }
-    throw error;
+  }
+  throw new Error("unreachable migration publish retry state");
+
+  async function reconcile(): Promise<number> {
+    const sequence = expectLastSequence + 1;
+    const stored = await port.getMessage(subject.slice(0, subject.lastIndexOf(".")), sequence);
+    if (!stored || stored.seq !== sequence || stored.msgID !== msgID || Buffer.compare(Buffer.from(stored.data), Buffer.from(data)) !== 0) {
+      throw new MeshBackendRefusedError(`Fabric mesh NATS stream moved during the migration (expected last sequence ${expectLastSequence}): ambiguous publish at sequence ${sequence} does not exactly match; refusing`);
+    }
+    return sequence;
   }
 };
 

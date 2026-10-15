@@ -24,6 +24,7 @@ import {
 } from "./state-file.js";
 import { validateMeshStateKey } from "./state-sqlite.js";
 import { MeshLockTimeoutError } from "../core/atomic-write.js";
+import { MeshSyncNotDurableError } from "./not-durable.js";
 
 // ------------------------------------------------------------------ the JetStream port
 
@@ -39,7 +40,7 @@ export class NatsWrongLastSequenceError extends Error {
 }
 
 /** One stored stream message. */
-export interface NatsStreamMessage { seq: number; data: Uint8Array }
+export interface NatsStreamMessage { seq: number; data: Uint8Array; msgID?: string }
 
 /**
  * The JetStream operations this backend uses. The real implementation wraps the official nats.js v3 client
@@ -48,8 +49,11 @@ export interface NatsStreamMessage { seq: number; data: Uint8Array }
 export interface JetStreamPort {
   /** Server facts for the refusals: its version and whether it fsyncs every write (`/varz` sync_always). */
   server(): Promise<{ version: string; syncAlways: boolean | undefined; maxPayload?: number; authRequired?: boolean }>;
-  /** Creates the stream if absent (file storage, these subjects; an existing stream gains missing ones); returns its last sequence. */
-  ensureStream(stream: string, subjects: string[], options: { maxMsgSize: number }): Promise<{ lastSeq: number; maxMsgSize?: number }>;
+  /** Creates the stream if absent (file storage, these subjects; an existing stream gains missing ones); returns its last sequence.
+   * `replicas` (smarty-dev#11373): the stream's num_replicas on create; an existing stream whose num_replicas differs is
+   * refused (MeshStateNatsRefusedError) before anything is changed, never lowered or raised. Omitted: the real client
+   * uses the replicas it was connected with (explicit, else the agent fabric.json layer's mesh.nats.replicas). */
+  ensureStream(stream: string, subjects: string[], options: { maxMsgSize: number; replicas?: number }): Promise<{ lastSeq: number; maxMsgSize?: number }>;
   /** The stream's last sequence now (leader). */
   lastSequence(stream: string): Promise<number>;
   /** The stream's first stored sequence now (above 1 after a purge). */
@@ -220,12 +224,21 @@ export class MeshStateNatsLimitError extends Error {
   }
 }
 
-/** The projector could not get past repeated purges: reads and writes fail until the backend is reopened. */
+/** A projector stopped, or stream placement / a just-created stream's first consumer exceeded its readiness budget. */
 export class MeshStateNatsUnavailableError extends Error {
   readonly code = "FABRIC_MESH_STATE_NATS_UNAVAILABLE";
-  constructor(detail: string) {
-    super(`FABRIC_MESH_STATE_NATS_UNAVAILABLE: ${detail}`);
+  /** Flat numeric metadata and the prototype reason getter survive redactNatsError / guardNatsPort. */
+  declare readonly natsErrCode?: number;
+  declare readonly consumerBootstrap?: boolean;
+  constructor(detail: string, context?: { natsErrCode?: number; consumerBootstrap?: boolean; cause?: unknown }) {
+    super(`FABRIC_MESH_STATE_NATS_UNAVAILABLE: ${detail}`, context?.cause === undefined ? undefined : { cause: context.cause });
     this.name = "MeshStateNatsUnavailableError";
+    if (context?.natsErrCode !== undefined) Object.assign(this, { natsErrCode: context.natsErrCode });
+    if (context?.consumerBootstrap === true) Object.assign(this, { consumerBootstrap: true });
+  }
+  get reason(): "placement-unavailable" | "projector-unavailable" | "consumer-bootstrap-unavailable" {
+    if (this.consumerBootstrap === true) return "consumer-bootstrap-unavailable";
+    return typeof this.natsErrCode === "number" ? "placement-unavailable" : "projector-unavailable";
   }
 }
 
@@ -276,11 +289,30 @@ const lifecycle = (snapshot: NatsSnapshot, record: LifecycleRecord, seq: number)
 /** Thrown by reads and writes once the stream is retired (rolled back to sqlite or file), or while it is importing. */
 export class MeshStateNatsRefusedError extends Error {
   readonly code = "FABRIC_MESH_STATE_NATS_REFUSED";
-  constructor(message: string) {
+  /** A replicas refusal only (smarty-dev#11373): flat numbers, so they survive redactNatsError (guardNatsPort). */
+  declare readonly configuredReplicas?: number;
+  declare readonly observedReplicas?: number;
+  constructor(message: string, replicas?: { configured: number; observed: number }) {
     super(`FABRIC_MESH_STATE_NATS_REFUSED: ${message}`);
     this.name = "MeshStateNatsRefusedError";
+    if (replicas) Object.assign(this, { configuredReplicas: replicas.configured, observedReplicas: replicas.observed });
   }
 }
+
+/** smarty-dev#11373: a stream replicas value must be a positive integer; anything else is refused before any connect. */
+export const assertNatsReplicas = (value: unknown, source: string): number => {
+  if (typeof value === "number" && Number.isSafeInteger(value) && value >= 1) return value;
+  throw new MeshStateNatsRefusedError(`${source} must be a positive integer (got ${typeof value === "number" ? String(value) : typeof value})`);
+};
+
+/** A normal peer restart plus metadata election; the same scale as the cluster fixture's 30s readiness. */
+export const DEFAULT_NATS_PLACEMENT_TIMEOUT_MS = 30_000;
+/** setTimeout's largest delay; a larger value would fire at once. */
+const MAX_TIMER_MS = 2_147_483_647;
+export const assertNatsPlacementTimeout = (value: unknown, source: string): number => {
+  if (typeof value === "number" && Number.isSafeInteger(value) && value >= 1 && value <= MAX_TIMER_MS) return value;
+  throw new MeshStateNatsRefusedError(`${source} must be a positive finite integer of milliseconds up to ${MAX_TIMER_MS} (got ${typeof value === "number" ? String(value) : typeof value})`);
+};
 
 /** A `fresh` read while the projector lags the stream, or a write that ran out of its retry budget: retryable. */
 export class MeshStateNatsBusyError extends MeshLockTimeoutError {
@@ -298,6 +330,18 @@ export class MeshStateNatsOutcomeUnknownError extends Error {
   constructor(readonly batchId: string, detail: string) {
     super(`FABRIC_MESH_STATE_NATS_OUTCOME_UNKNOWN: batch ${batchId} got no acknowledgement (${detail}); re-read before writing again`);
     this.name = "MeshStateNatsOutcomeUnknownError";
+  }
+}
+
+/**
+ * `sync()` on a backend opened with `acceptPeriodicSync` (the server does not fsync every write): an acked commit
+ * is on disk only after the server's sync interval, so durability cannot be confirmed. Not retryable: the caller must
+ * not advance an external cursor or delivered mark on it (smarty-dev#9313).
+ */
+export class MeshStateNatsNotDurableError extends MeshSyncNotDurableError {
+  constructor(readonly syncAlways: boolean | undefined) {
+    super("FABRIC_MESH_STATE_NATS_NOT_DURABLE", "state", `nats-server reported sync_always ${String(syncAlways)} at open and the backend was opened with acceptPeriodicSync, so an acked commit may not survive a power loss until the server's sync interval`);
+    this.name = "MeshStateNatsNotDurableError";
   }
 }
 
@@ -382,12 +426,19 @@ export interface NatsStateBackendOptions {
   maxStateTombstones?: number;
   /** The budget of one write's CAS retries, then `MeshStateNatsBusyError`. Default 5 s. */
   lockTimeoutMs?: number;
+  /**
+   * The server's `/varz` sync_always as read at open. Only `true` lets `sync()` resolve; anything else (a server
+   * accepted through `acceptPeriodicSync`, or not stated) makes it reject with `MeshStateNatsNotDurableError`.
+   */
+  syncAlways?: boolean | undefined;
   /** Take a snapshot (and purge below it) once this many messages follow the last one; 0 never. Default 10 000. */
   snapshotEvery?: number;
   /** The state bound (the file backend's `maxStateBytes`, default 32 MiB): a snapshot body larger than it refuses. */
   maxStateBytes?: number;
   /** At most this many messages are replayed after the snapshot (or from 1) at open. Default 100 000. */
   maxReplay?: number;
+  /** The stream's replicas, passed to the port's ensureStream (smarty-dev#11373). Omitted: the port decides. */
+  replicas?: number;
 }
 
 const DEFAULT_TOMBSTONES = 2_048;
@@ -465,7 +516,7 @@ export class NatsStateBackend implements StateBackend {
   static async open(options: NatsStateBackendOptions): Promise<NatsStateBackend> {
     const backend = new NatsStateBackend(options);
     const { lastSeq, maxMsgSize } = await options.port.ensureStream(options.stream, [options.subject, options.snapshotSubject],
-      { maxMsgSize: backend.#limits.maxMessageBytes });
+      { maxMsgSize: backend.#limits.maxMessageBytes, ...(options.replicas === undefined ? {} : { replicas: options.replicas }) });
     // The server enforces the message cap too (pi-fabric#907): a stream with no limit, or a larger one, is refused.
     if (maxMsgSize === undefined || maxMsgSize <= 0 || maxMsgSize > backend.#limits.maxMessageBytes) {
       throw new MeshStateNatsLimitError(`the stream ${options.stream} allows messages of ${maxMsgSize === undefined || maxMsgSize <= 0 ? "any size" : `${maxMsgSize} bytes`} (limit ${backend.#limits.maxMessageBytes}); set its max_msg_size`);
@@ -484,7 +535,8 @@ export class NatsStateBackend implements StateBackend {
   async #startProjector(): Promise<void> {
     for (let attempt = 1; ; attempt++) {
       const loaded = await this.#loadSnapshot();
-      if (loaded && loaded.seq > this.#snapshot.seq) { this.#snapshot = loaded; this.#settle(); }
+      // A newer snapshot replaces the model: one state-change hint per install (none at open: no listener yet).
+      if (loaded && loaded.seq > this.#snapshot.seq) { this.#snapshot = loaded; this.#settle(); this.#notifyStateChanged(); }
       const last = await this.#options.port.lastSequence(this.#options.stream);
       this.#knownSeq = Math.max(this.#knownSeq, last);
       const backlog = last - this.#snapshot.seq;
@@ -689,9 +741,36 @@ export class NatsStateBackend implements StateBackend {
     this.#knownSeq = Math.max(this.#knownSeq, message.seq);
     // Stream sequences are contiguous until a purge: a gap means a snapshot purged what this model still needed.
     if (message.seq > this.#snapshot.seq + 1) { this.#resync(); return; }
+    const before = this.#snapshot;
     try { this.#snapshot = applyNatsMessage(this.#snapshot, message, this.#options.maxStateTombstones ?? DEFAULT_TOMBSTONES, this.#limits); }
     catch (error) { this.#fail(error); return; }
     this.#settle();
+    if (this.#snapshot !== before) this.#notifyStateChanged();
+  }
+
+  readonly #stateListeners = new Set<() => void>();
+  #notifyPending = false;
+
+  /** pi-fabric#7978: hints after the projector applied a whole stream message (no mesh-root file changes for it). */
+  subscribeStateChanges(listener: () => void): () => void {
+    const own = (): void => listener();
+    this.#stateListeners.add(own);
+    return () => { this.#stateListeners.delete(own); };
+  }
+
+  // Coalesced to one microtask per burst of applied messages, after the snapshot is assigned and waiters settled.
+  // A throwing listener never reaches the projector or another listener.
+  #notifyStateChanged(): void {
+    if (this.#notifyPending || this.#stateListeners.size === 0) return;
+    this.#notifyPending = true;
+    queueMicrotask(() => {
+      this.#notifyPending = false;
+      if (this.#closed || this.#failure !== undefined) return;
+      for (const listener of [...this.#stateListeners]) {
+        if (!this.#stateListeners.has(listener)) continue; // unsubscribed by an earlier listener
+        try { listener(); } catch {}
+      }
+    });
   }
 
   /** Resolves once the model has applied `seq`; a projector that does not get there within the write budget is busy. */
@@ -920,6 +999,17 @@ export class NatsStateBackend implements StateBackend {
     return operation();
   }
 
+  /**
+   * Durability barrier (smarty-dev#9313). Nothing is buffered client side: every commit, by this process or any other
+   * on the stream, returned only after JetStream acked its publish. On a server that reported `sync_always` at open
+   * the ack follows the server's fsync, so this resolves at once (no JetStream call). On a server accepted through
+   * `acceptPeriodicSync` the ack does not mean disk and the client has no flush to request, so this rejects with
+   * `MeshStateNatsNotDurableError`: a caller must never claim durability the server does not give.
+   */
+  async sync(_budgetMs: number): Promise<void> {
+    if (this.#options.syncAlways !== true) throw new MeshStateNatsNotDurableError(this.#options.syncAlways);
+  }
+
   dropCache(): void { /* the model is the stream's projection: nothing to drop */ }
 
   diagnostics(): StateBackendDiagnostics {
@@ -1001,6 +1091,12 @@ export interface OpenNatsStateBackendOptions {
   acceptPeriodicSync?: boolean;
   /** Host-only: the client's TLS files (PEM paths), for a `tls://` server. */
   tls?: NatsTlsFiles;
+  /** The stream's replicas (positive integer; smarty-dev#11373). Omitted: the real client reads only the agent-layer
+   * fabric.json mesh.nats.replicas (default 1) at first use; an injected `port` decides for itself. */
+  replicas?: number;
+  /** Real-client stream placement budget in milliseconds. Default 30 000; positive integer, at most 2^31-1.
+   * Placement exhaustion throws MeshStateNatsUnavailableError; replicas are never lowered. */
+  placementTimeoutMs?: number;
 }
 
 export interface NatsTlsFiles { caFile?: string; certFile?: string; keyFile?: string }
@@ -1060,7 +1156,7 @@ export const redactNatsUrls = (text: string): string => redactSecrets(text
  * A NEW error fit to leave the NATS client (pi-fabric#937 round 2). It keeps the prototype (so `instanceof`, e.g.
  * NatsWrongLastSequenceError, still works), a redacted name, message, stack and `code`, the number and boolean own
  * fields (`transient`, `expected`, `afterLostAck`: no text), a sanitized `cause` and AggregateError `errors` (depth
- * cap 4), and a sanitized `apiError()` result. Every other field is dropped. A non-Error throw becomes an Error with
+ * cap 4), a numeric `status`, and a sanitized `apiError()` result. Every other field is dropped. A non-Error throw becomes an Error with
  * its printable() text: a string redacted, an object only its type and allowlisted fields. Total: no coercion can throw out of it (a hostile toString, getter or proxy gives
  * "[unprintable error]").
  */
@@ -1094,16 +1190,20 @@ const sanitizeNatsError = (error: unknown, depth: number): Error => {
   if (!(error instanceof Error)) return new Error(printable(error));
   const read = (key: string): unknown => { try { return (error as unknown as Record<string, unknown>)[key]; } catch { return undefined; } };
   const safe = Object.create(Object.getPrototypeOf(error) as object) as Error & Record<string, unknown>;
-  const define = (key: string, value: unknown) => Object.defineProperty(safe, key, { value, writable: true, configurable: true, enumerable: false });
+  const define = (key: string, value: unknown, enumerable = false) => Object.defineProperty(safe, key, { value, writable: true, configurable: true, enumerable });
   define("name", printable(read("name") ?? "Error"));
   define("message", printable(read("message") ?? ""));
   define("stack", printable(read("stack") ?? ""));
   for (const key of Object.keys(error)) {
     const value = read(key);
-    if (typeof value === "number" || typeof value === "boolean") safe[key] = value;
+    if (typeof value === "number" || typeof value === "boolean") define(key, value, true);
   }
+  // SDK code/status can be getter-only and backed by private fields absent from this prototype-preserving clone.
+  // Own data properties bypass setters and keep both the first and subsequent sanitizations readable.
   const code = read("code");
-  if (code !== undefined) safe.code = typeof code === "number" ? code : printable(code);
+  if (code !== undefined) define("code", typeof code === "number" ? code : printable(code), true);
+  const status = read("status");
+  if (typeof status === "number") define("status", status, true);
   if ("cause" in error && read("cause") !== undefined) define("cause", depth < 4 ? redactNatsError(read("cause"), depth + 1) : undefined);
   const errors = read("errors");
   if (Array.isArray(errors)) define("errors", depth < 4 ? errors.map(inner => redactNatsError(inner, depth + 1)) : []);
@@ -1222,6 +1322,11 @@ export interface NatsEndpointOptions {
   port?: JetStreamPort;
   /** Tests: the resolver for the loopback check (default dns.promises.lookup). */
   lookup?: NatsLookup;
+  /** The stream's replicas for the real client (positive integer, validated before anything is resolved or connected).
+   * Omitted: the real client reads the agent fabric.json layer's mesh.nats.replicas at first use. */
+  replicas?: number;
+  /** Real-client placement budget, validated before resolution or connect. Default 30 000ms. */
+  placementTimeoutMs?: number;
 }
 
 /**
@@ -1233,6 +1338,9 @@ export interface NatsEndpointOptions {
  */
 export const connectNatsEndpoint = async (options: NatsEndpointOptions): Promise<{ port: JetStreamPort; owned: boolean;
   server: Awaited<ReturnType<JetStreamPort["server"]>> }> => {
+  const replicas = options.replicas === undefined ? undefined : assertNatsReplicas(options.replicas, "replicas");
+  const placementTimeoutMs = options.placementTimeoutMs === undefined ? undefined
+    : assertNatsPlacementTimeout(options.placementTimeoutMs, "placementTimeoutMs");
   const lookup = options.lookup ?? systemLookup;
   const servers: string[] = [];
   for (const server of options.servers ?? []) servers.push(await assertNatsTransportSecure(server, "tls:", lookup));
@@ -1244,7 +1352,9 @@ export const connectNatsEndpoint = async (options: NatsEndpointOptions): Promise
   const owned = options.port === undefined;
   const port = options.port ?? await (await import("./state-backend-nats-client.js")).connectJetStream(servers, {
     ...(monitoringUrl === undefined ? {} : { monitoringUrl }),
-    ...(tls === undefined ? {} : { tls }) });
+    ...(tls === undefined ? {} : { tls }),
+    ...(replicas === undefined ? {} : { replicas }),
+    ...(placementTimeoutMs === undefined ? {} : { placementTimeoutMs }) });
   try {
     const server = await port.server();
     // What a client CAN see of the server's access control is whether it requires authentication at all (INFO
@@ -1302,7 +1412,9 @@ export const openNatsStateBackend = async (options: OpenNatsStateBackendOptions)
       ...(options.maxStateBytes === undefined ? {} : { maxStateBytes: options.maxStateBytes }),
       ...(options.maxReplay === undefined ? {} : { maxReplay: options.maxReplay }),
       ...(options.maxStateTombstones === undefined ? {} : { maxStateTombstones: options.maxStateTombstones }),
-      ...(options.lockTimeoutMs === undefined ? {} : { lockTimeoutMs: options.lockTimeoutMs }) });
+      ...(options.lockTimeoutMs === undefined ? {} : { lockTimeoutMs: options.lockTimeoutMs }),
+      ...(options.replicas === undefined ? {} : { replicas: options.replicas }),
+      syncAlways: server.syncAlways });
     if (backend.diagnostics().nats?.status === "retired") { backend.close(); throw new MeshStateNatsRefusedError(`the stream ${stream} is retired`); }
     prepared.get(root)?.close();
     prepared.set(root, backend);

@@ -194,13 +194,14 @@ export class FabricProjectLeadInvalidError extends Error {
 
 const MAX_LEAD_MARKER_BYTES = 128;
 const LEAD_SESSION_ID = /^session:[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
-const validatedLead = (value: string): string => {
-  const id = value.trim();
+const validatedLead = (value: string, allowBareUuid = false): string => {
+  const trimmed = value.trim();
+  const id = allowBareUuid && !trimmed.startsWith("session:") ? `session:${trimmed}` : trimmed;
   if (value.length > MAX_LEAD_MARKER_BYTES || !LEAD_SESSION_ID.test(id)) throw new FabricProjectLeadInvalidError();
   return id;
 };
 
-/** Launch metadata written by smarty-lane-move, or supplied explicitly by its launcher. */
+/** Launch metadata: explicit launcher values stay strict; malformed file hints never block startup. */
 export const recordedProjectLead = (cwd: string, env: NodeJS.ProcessEnv = process.env): string | undefined => {
   const explicit = env.SMARTY_LEAD_SESSION?.trim();
   if (explicit) return validatedLead(explicit);
@@ -208,12 +209,16 @@ export const recordedProjectLead = (cwd: string, env: NodeJS.ProcessEnv = proces
     const local = path.join(dir, ".local");
     const marker = path.join(local, "lead");
     let fd: number | undefined;
+    let lead: string | undefined;
+    let invalid = false;
+    let markerSeen = false;
     try {
       // Refuse both leaf and .local symlinks. O_NOFOLLOW also closes the leaf check/open race
       // on platforms that support it; fstat verifies the opened file, not just the earlier path.
       const directory = fs.lstatSync(local);
       if (!directory.isDirectory() || directory.isSymbolicLink()) throw new FabricProjectLeadInvalidError();
       const before = fs.lstatSync(marker);
+      markerSeen = true;
       if (!before.isFile() || before.isSymbolicLink()) throw new FabricProjectLeadInvalidError();
       fd = fs.openSync(marker, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0));
       const opened = fs.fstatSync(fd);
@@ -228,13 +233,21 @@ export const recordedProjectLead = (cwd: string, env: NodeJS.ProcessEnv = proces
       const bytes = Buffer.alloc(MAX_LEAD_MARKER_BYTES + 1);
       const count = fs.readSync(fd, bytes, 0, bytes.length, 0);
       if (count > MAX_LEAD_MARKER_BYTES) throw new FabricProjectLeadInvalidError();
-      return validatedLead(bytes.subarray(0, count).toString("utf8"));
+      lead = validatedLead(bytes.subarray(0, count).toString("utf8"), true);
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw new FabricProjectLeadInvalidError();
-      // Most sessions have no launch lead marker; an invalid one must not fall back to election.
+      // Missing hints are normal; an existing marker disappearing during its read is invalid.
+      invalid = markerSeen || (error as NodeJS.ErrnoException).code !== "ENOENT";
     } finally {
-      if (fd !== undefined) fs.closeSync(fd);
+      if (fd !== undefined) {
+        try { fs.closeSync(fd); } catch { invalid = true; }
+      }
     }
+    if (invalid) {
+      // Never echo marker contents or filesystem errors: either can contain secrets.
+      console.warn(`[pi-fabric] Ignoring invalid or unreadable project lead marker ${JSON.stringify(marker)}: expected session:<uuid>.`);
+      return undefined;
+    }
+    if (lead) return lead;
     if (fs.existsSync(path.join(dir, ".git")) || path.dirname(dir) === dir) return undefined;
   }
 };

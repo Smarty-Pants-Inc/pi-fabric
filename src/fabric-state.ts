@@ -92,6 +92,7 @@ export class FabricState {
   #activatingRuntime: FabricRuntimeState | undefined;
   #activation: Promise<FabricRuntimeState> | undefined;
   #recordsWake: (() => Promise<void>) | undefined;
+  #rootInboxWake: (() => Promise<void>) | undefined;
   #activationGeneration: number | undefined;
   #config: FabricConfig | undefined;
   #provisionalConfig: FabricConfig | undefined;
@@ -377,9 +378,24 @@ export class FabricState {
     if (current) current.recordsWake = wake;
   }
 
+  /**
+   * The host's gated idle root inbox wake (smarty-dev#4313). Only the current (fully activated)
+   * runtime arms it, from mesh-root file events and one exact-deadline timer; unset closes both.
+   */
+  setRootInboxWake(wake: (() => Promise<void>) | undefined): void {
+    this.#rootInboxWake = wake;
+    if (this.#runtime) this.#runtime.rootInboxWake = wake;
+  }
+
+  /** One coalesced idle inbox read through the armed watch; false when none is armed. */
+  requestRootInboxWake(): boolean {
+    return this.#runtime?.requestRootInboxWake() ?? false;
+  }
+
   async nextRecordsInboxMessage(entries: readonly unknown[]): Promise<{ customType: string; content: string; display: boolean; details: { ids: string[] } } | undefined> {
     return this.#current()?.nextRecordsInboxMessage(entries);
   }
+  observationHealth(): string[] { return this.#current()?.observationHealth() ?? []; }
   writeStalled(): Error | undefined { return this.#current()?.writeStalled(); }
   participantsConfirmedAt(): number | undefined { return this.#current()?.participantsConfirmedAt(); }
   componentGraph(): FabricComponentGraph {
@@ -578,6 +594,8 @@ export class FabricState {
   async shutdown(reason?: string, targetSessionFile?: string): Promise<void> {
     this.#shutDown = true;
     this.sessionApprovals.reset();
+    // Close the idle inbox watch and its deadline before any await (the runtime closes it again).
+    if (this.#runtime) this.#runtime.rootInboxWake = undefined;
     this.#deactivationHook?.();
     const generation = ++this.#generation;
     const activation = this.#activation;
@@ -622,6 +640,7 @@ export class FabricState {
     // Reinitialization/session switches reuse this facade. Stop the old UI before
     // initialize() awaits teardown and state getters start rejecting (smarty-dev#4383).
     if (existing) this.#deactivationHook?.();
+    if (existing) existing.rootInboxWake = undefined;
     this.#runtime = undefined;
     let candidate: FabricRuntimeState | undefined;
     const assertCurrent = (): void => {
@@ -680,6 +699,8 @@ export class FabricState {
         this.#runtime = candidate;
         this.#activatingRuntime = undefined;
         this.#everActivated = true;
+        // Armed only now that the runtime is current; its first read covers work published before.
+        candidate.rootInboxWake = this.#rootInboxWake;
         try {
           if (config.mesh.enabled && context.isProjectTrusted() &&
             resolveFabricIdentity(context.sessionManager.getSessionId()).identity.kind === "main") {

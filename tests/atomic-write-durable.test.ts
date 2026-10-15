@@ -3,7 +3,7 @@ import { spawnSync } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
-import { renameAtomic, syncDirectoryChain, syncPathNamespace, writeFileAtomic, writeJsonAtomic, writeJsonAtomicAsync } from "../src/core/atomic-write.js";
+import { renameAtomic, syncDirectoryChain, syncPathNamespace, syncPathNamespaceDurable, writeFileAtomic, writeJsonAtomic, writeJsonAtomicAsync } from "../src/core/atomic-write.js";
 import { ActorRegistryStore } from "../src/actors/registry-store.js";
 import { MeshStore } from "../src/mesh/store.js";
 
@@ -91,6 +91,25 @@ describe("#180 S4 hop-by-hop namespace confirmation", () => {
       if (hops === 40) expect(confirm).not.toThrow();
       else expect(confirm).toThrow("Namespace symlink loop or hop limit exceeded");
     } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it("the durability variant fails closed on win32 before any I/O, where syncPathNamespace skips the directory fsync", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "atomic-durable-variant-"));
+    const target = path.join(root, "file");
+    fs.writeFileSync(target, "x");
+    const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+    const notDurable = (value: NodeJS.Platform) => Object.assign(new Error(`not durable on ${value}`), { code: "TEST_NOT_DURABLE" });
+    const lstat = vi.spyOn(fs, "lstatSync");
+    try {
+      Object.defineProperty(process, "platform", { ...platform, value: "win32" });
+      try {
+        expect(() => syncPathNamespaceDurable(target, fs.statSync(target), notDurable)).toThrow("not durable on win32");
+        expect(lstat).not.toHaveBeenCalled();
+        // Ordinary atomic writes keep today's behavior: the plain barrier still returns on win32.
+        expect(() => syncPathNamespace(target, fs.statSync(target))).not.toThrow();
+      } finally { Object.defineProperty(process, "platform", platform); }
+      if (process.platform !== "win32") expect(() => syncPathNamespaceDurable(target, fs.statSync(target), notDurable)).not.toThrow();
+    } finally { lstat.mockRestore(); fs.rmSync(root, { recursive: true, force: true }); }
   });
 
   it.skipIf(process.platform === "win32")("detects a relative symlink loop before any barrier", () => {

@@ -12,6 +12,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { readResidentIdleExit, residentIdleExitPath } from "./idle-exit.js";
+import { readResidentGenerationError } from "./generation-exit.js";
 import { readFileRetrying, writeJsonAtomic } from "../core/atomic-write.js";
 import type { FabricActorInfo, FabricActorCreateRequest } from "../actors/types.js";
 import type { FabricAgentLog, AgentHandleInfo, AgentRunRecord, AgentRunRequest, AgentRunResult } from "../agents/types.js";
@@ -33,6 +34,7 @@ import type { FabricOwnedModelGuidance } from "../components/model-guidance.js";
 import type { FabricMainAgentTarget } from "../main-agent.js";
 import { MeshStore, meshOutageAlarmSink, type MeshStateEntry } from "../mesh/store.js";
 import { MeshBackgroundRetry } from "../core/atomic-write.js";
+import { DegradedObservation } from "../core/observation-watch.js";
 import { isMeshWriteDeferred } from "../core/atomic-write.js";
 import type { FabricParticipantSource } from "../topology/types.js";
 import {
@@ -92,7 +94,27 @@ const HANDOVER_WAIT_MS = 180_000;
 const STATUS_POLL_MS = 100;
 const WATCHDOG_INTERVAL_MS = 5_000;
 const WATCHDOG_MAX_BACKOFF_MS = 60_000;
+// An adopted owner (a launcher this client did not spawn) has no exit event we
+// can observe: its crash is detected by owner.json/lease notifications or this
+// one-shot liveness deadline, i.e. within 60 s. Never a sub-minute standing poll.
+const ADOPTED_OWNER_DEADLINE_MS = 60_000;
+// Failed delivery: one bounded one-shot backoff (1 s floor, 60 s cap), no interval.
+const DELIVERY_RETRY_MIN_MS = 1_000;
+const DELIVERY_RETRY_MAX_MS = 60_000;
+// fs.watch may report one atomic journal rename more than once (notably on Windows).
+// One short, non-recurring burst deadline coalesces those hints before reading state.
+const DELIVERY_EVENT_COALESCE_MS = 25;
+// Watcher failure: one rescan, then a bounded number of one-shot re-arms.
+const WATCH_REARM_BASE_MS = 1_000;
+const WATCH_REARM_MAX_MS = 60_000;
+const WATCH_REARM_ATTEMPTS = 6;
+const MESH_STATE_FILES = new Set(["state.json", "state.db", "state.db-wal", "state.db-journal"]);
+const OWNER_FILES = new Set(["owner.json", "maintenance-ready.json", "handover.json", "idle-exit.json", "delivery-outbox"]);
 const AGENT_ID_PATTERN = /^[a-f0-9]{32}$/;
+const ROOT_ANCESTOR_KEY = "\0residency-root-ancestor";
+const isDirectory = (directory: string): boolean => {
+  try { return fs.statSync(directory).isDirectory(); } catch { return false; }
+};
 
 const delay = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
@@ -166,7 +188,6 @@ export class ResidencyClient {
   readonly hostId: string;
   readonly #configPath: string;
   readonly #ownerPath: string;
-  readonly #errorPath: string;
   readonly #requestsPath: string;
   readonly #responsesPath: string;
   readonly #agentsPath: string;
@@ -175,7 +196,32 @@ export class ResidencyClient {
   readonly #deliveryPrefix: string;
   readonly #hostPath: string;
   readonly #completions: CompletionJournal;
-  #deliveryTimer: NodeJS.Timeout | undefined;
+  #started = false;
+  #deliveryRunning = false;
+  #deliveryDirty = false;
+  #deliveryRetry: NodeJS.Timeout | undefined;
+  #deliveryFailures = 0;
+  #deliveryEventTimer: NodeJS.Timeout | undefined;
+  #stopStateChanges: (() => void) | undefined;
+  readonly #watchers = new Map<string, fs.FSWatcher>();
+  // Nearest existing ancestor of a not-yet-created residencyRoot (own key: it may equal meshRoot).
+  #rootAncestor: string | undefined;
+  #watchRearm: NodeJS.Timeout | undefined;
+  #watchRearmAttempts = 0;
+  #watchWarned = false;
+  readonly #observation = new DegradedObservation("residency", () => {
+    this.#wakeDelivery();
+    this.#wakeWatchdog();
+  }, () => {
+    this.#armWatches();
+    if (!this.#watchers.size) return false;
+    this.#watchRearmAttempts = 0;
+    return true;
+  });
+  observationHealth(): string[] { return this.#observation.health ? [this.#observation.health] : []; }
+  #ownedLauncher: { launcher: Awaited<ReturnType<typeof spawnDetached>>; token: string } | undefined;
+  #watchdogDeadline: number | undefined;
+  #watchdogAgain = false;
   #watchdogTimer: NodeJS.Timeout | undefined;
   #modelGuidanceJson: string | undefined;
   #deliveryPass: Promise<void> | undefined;
@@ -192,6 +238,8 @@ export class ResidencyClient {
   #nextWatchdogAt = 0;
   #watchdogFailures = 0;
   #watchdogWork: string | undefined;
+  #watchdogRunning = false;
+  #watchdogStopped = false;
   readonly #runtimeNonce = randomUUID();
   #generationRecorded = false;
   readonly #releaseAbort = new AbortController();
@@ -201,7 +249,6 @@ export class ResidencyClient {
     this.hostId = residentHostId(options.config.rootId);
     this.#configPath = path.join(options.config.residencyRoot, "config.json");
     this.#ownerPath = path.join(options.config.residencyRoot, "owner.json");
-    this.#errorPath = path.join(options.config.residencyRoot, "error.json");
     this.#requestsPath = path.join(options.config.residencyRoot, "requests");
     this.#responsesPath = path.join(options.config.residencyRoot, "responses");
     this.#agentsPath = path.join(options.config.residencyRoot, "agents");
@@ -230,18 +277,16 @@ export class ResidencyClient {
   }
 
   start(): void {
-    if (this.#deliveryTimer || this.#closed || !this.options.mainAgent.local) return;
+    if (this.#started || this.#closed || !this.options.mainAgent.local) return;
     this.syncPiModels();
-    this.#deliveryTimer = setInterval(
-      () => { void this.#backgroundDelivery.run(() => this.#drainDeliveries()); },
-      Math.max(1_000, this.options.config.mesh.actorPollMs),
-    );
-    this.#deliveryTimer.unref();
-    // File-only recovery stays independent of the state-reading delivery cadence/backoff.
-    this.#watchdogTimer = setInterval(() => { void this.#watchdog().catch(() => undefined); },
-      Math.max(20, this.options.config.mesh.actorPollMs));
-    this.#watchdogTimer.unref();
-    void this.#backgroundDelivery.run(() => this.#drainDeliveries());
+    this.#started = true;
+    // Event-driven: journal/mesh/owner notifications wake delivery and recovery.
+    // Arm before the startup catch-up so a write racing it is never lost.
+    this.#armWatches();
+    this.#stopStateChanges = this.options.mesh.subscribeStateChanges(() => this.#wakeDelivery());
+    // Startup catch-up: one delivery pass and one recovery pass now.
+    this.#wakeDelivery();
+    this.#wakeWatchdog();
     // Every runtime activation, including manual native /reload, reconciles
     // a live owner. This never starts an empty root or loads an optional engine.
     void this.reconcileRelease().catch((error) => this.#deferRelease(error));
@@ -259,10 +304,20 @@ export class ResidencyClient {
       } catch (error) { this.#deferRelease(error); }
     }
     this.#releaseAbort.abort();
-    if (this.#deliveryTimer) clearInterval(this.#deliveryTimer);
-    this.#deliveryTimer = undefined;
-    if (this.#watchdogTimer) clearInterval(this.#watchdogTimer);
+    this.#observation.close();
+    this.#stopStateChanges?.();
+    this.#stopStateChanges = undefined;
+    if (this.#deliveryEventTimer) clearTimeout(this.#deliveryEventTimer);
+    this.#deliveryEventTimer = undefined;
+    if (this.#deliveryRetry) clearTimeout(this.#deliveryRetry);
+    this.#deliveryRetry = undefined;
+    if (this.#watchdogTimer) clearTimeout(this.#watchdogTimer);
     this.#watchdogTimer = undefined;
+    if (this.#watchRearm) clearTimeout(this.#watchRearm);
+    this.#watchRearm = undefined;
+    this.#closeWatches();
+    // The durable host outlives this client; only stop observing its launcher.
+    this.#ownedLauncher = undefined;
     // Await the owned pass itself, not a timer polling its state. Real async file
     // I/O can settle while the caller's clock (e.g. fake timers) is stopped.
     await this.#deliveryPass?.catch(() => undefined);
@@ -311,7 +366,12 @@ export class ResidencyClient {
     const starting = this.#startHost();
     this.#startingHost = starting;
     try { return await starting; }
-    finally { this.#startingHost = undefined; }
+    finally {
+      this.#startingHost = undefined;
+      // Startup settlement is an owner event: reclassify (own child / adopted / backoff).
+      this.#armWatches();
+      this.#wakeWatchdog();
+    }
   }
 
   async #stopStartingLauncher(): Promise<void> {
@@ -352,7 +412,6 @@ export class ResidencyClient {
     // Recheck after the attachment wait: the old launcher may have entered
     // destructive watchdog custody while we still saw its live owner.
     assertNoWatchdogCustody(this.options.config.residencyRoot);
-    fs.rmSync(this.#errorPath, { force: true });
     // This explicit business startup, not a launcher recovery loop, revokes the idle stop.
     fs.rmSync(residentIdleExitPath(this.options.config.residencyRoot), { force: true });
     const launchToken = randomUUID();
@@ -364,7 +423,6 @@ export class ResidencyClient {
     this.#startupLauncher = launcher;
     // The budget counts from the launcher's first sign of life (its
     // launcher-started trace), so its own boot does not consume it.
-    const launcherBirth = processStartTime(launcher.pid);
     const budget = startupBudgetMs(this.options.startupTimeoutMs ?? HOST_READY_TIMEOUT_MS);
     let deadline = Date.now() + budget;
     let started = false;
@@ -379,14 +437,16 @@ export class ResidencyClient {
         // Only our attempt may transfer custody to durable residency. Another
         // winner does not prove our losing launcher (or restored work) exited.
         if (owner.launchToken !== launchToken) await this.#stopStartingLauncher();
-        else this.#startupLauncher = undefined;
+        else {
+          this.#startupLauncher = undefined;
+          this.#observeLauncher(launcher, launchToken);
+        }
         return owner;
       }
-      const failure = readJson<{ error?: unknown; launcherPid?: number; launcherBirth?: string }>(this.#errorPath);
-      // An exiting prior launcher can race this start after error.json was
-      // cleared. Its root diagnostic is not evidence about our owned attempt.
-      if (typeof failure?.error === "string" && (failure.launcherPid === undefined ||
-          (failure.launcherPid === launcher.pid && failure.launcherBirth === launcherBirth))) {
+      // Select only the error record whose filename is this call's launch token;
+      // a predecessor or earlier start cannot provide stale startup diagnostics.
+      const failure = readResidentGenerationError(this.options.config.residencyRoot, launchToken);
+      if (failure) {
         await this.#stopStartingLauncher();
         throw new Error(`Fabric resident host failed to start: ${failure.error}`);
       }
@@ -607,6 +667,7 @@ export class ResidencyClient {
     // deliberate prelaunch refusal, not a transient storage failure to retry.
     if (!result.logFile && !admittedRecipient && typeof this.#completions.recipientSource === "function") return;
     this.#completions.save(result, admittedRecipient);
+    this.#wakeDelivery();
   }
 
   hasAgent(id: string): boolean {
@@ -882,6 +943,8 @@ export class ResidencyClient {
           if ((command.operation === "spawnBound" && !response.handle) || (command.operation === "createActor" && !response.actor)) {
             throw new Error("Fabric resident host returned no created entity");
           }
+          // A resident response can carry new deliveries/completions: drain now.
+          this.#wakeDelivery();
           return response;
         }
         const owner = this.#liveOwner();
@@ -1057,20 +1120,80 @@ export class ResidencyClient {
     return owner;
   }
 
+  /** Own launcher child: its actual ChildProcess close is the crash/exit event. No timer. */
+  #observeLauncher(launcher: Awaited<ReturnType<typeof spawnDetached>>, token: string): void {
+    if (this.#closed) return;
+    this.#ownedLauncher = { launcher, token };
+    void launcher.closed.then(() => {
+      if (this.#ownedLauncher?.launcher !== launcher) return;
+      this.#ownedLauncher = undefined;
+      this.#wakeWatchdog();
+    }, () => undefined);
+  }
+
+  /** Run one recovery pass now (coalesced); events arriving mid-pass rerun it once. */
+  #wakeWatchdog(): void {
+    if (this.#closed || !this.#started || this.#watchdogStopped) return;
+    if (this.#watchdogRunning) { this.#watchdogAgain = true; return; }
+    // An in-flight startup settles through ensureHost's finally, which wakes again.
+    if (this.#startingHost) return;
+    if (this.#watchdogTimer) clearTimeout(this.#watchdogTimer);
+    this.#watchdogTimer = undefined;
+    this.#watchdogRunning = true;
+    this.#watchdogAgain = false;
+    void this.#watchdog().catch(() => undefined).finally(() => {
+      this.#watchdogRunning = false;
+      if (this.#closed) return;
+      // Without a kernel fence the watchdog can never act: stop after the startup check.
+      if (!kernelFenceAvailable()) { this.#watchdogStopped = true; return; }
+      if (this.#watchdogAgain && !this.#startingHost) { this.#wakeWatchdog(); return; }
+      this.#armWatchdog();
+    });
+  }
+
+  /** Arm the single one-shot deadline the last pass chose (none for idle/own child). */
+  #armWatchdog(): void {
+    if (this.#watchdogTimer) clearTimeout(this.#watchdogTimer);
+    this.#watchdogTimer = undefined;
+    if (this.#closed || this.#watchdogStopped || this.#watchdogRunning || !this.#started) return;
+    const deadline = this.#watchdogDeadline;
+    if (deadline === undefined) return;
+    this.#watchdogTimer = setTimeout(() => {
+      this.#watchdogTimer = undefined;
+      this.#wakeWatchdog();
+    }, Math.max(1, deadline - Date.now()));
+    this.#watchdogTimer.unref();
+  }
+
+  /** Deadline for a live owner: none when it is our own observed launcher child. */
+  #ownerDeadline(owner: ResidentHostOwner): number | undefined {
+    const owned = this.#ownedLauncher;
+    if (owned && owner.launchToken === owned.token) return undefined;
+    return Date.now() + ADOPTED_OWNER_DEADLINE_MS;
+  }
+
   async #watchdog(): Promise<void> {
-    const now = Date.now();
-    if (this.#closed || this.#startingHost || now < this.#nextWatchdogAt || !kernelFenceAvailable()) return;
-    this.#nextWatchdogAt = now + WATCHDOG_INTERVAL_MS;
-    if (this.#liveOwner()) {
+    this.#watchdogDeadline = undefined;
+    if (this.#closed || this.#startingHost || !kernelFenceAvailable()) return;
+    const live = this.#liveOwner();
+    if (live) {
+      this.#watchdogDeadline = this.#ownerDeadline(live);
       if (!this.#readyOwner()) return;
       void this.reconcileRelease().catch((error) => this.#deferRelease(error));
       return;
     }
-    if (handoverActive(readHandoverJson<ResidentHandoverState>(handoverPath(this.options.config.residencyRoot)))) return;
+    // Launcher custody: handover.json/owner.json notifications or the 60 s deadline.
+    if (handoverActive(readHandoverJson<ResidentHandoverState>(handoverPath(this.options.config.residencyRoot)))) {
+      this.#watchdogDeadline = Date.now() + ADOPTED_OWNER_DEADLINE_MS;
+      return;
+    }
     // Intentional dead-root retirement is not a crash, even if retained delivery debt remains.
     if (readResidentIdleExit(this.options.config.residencyRoot, this.options.config.rootId)) return;
     const work = this.#durableWork();
-    if (!work) { this.#watchdogWork = undefined; this.#watchdogFailures = 0; return; }
+    // Idle: no deadline at all; owner/outbox notifications and ensureHost wake us.
+    if (!work) { this.#watchdogWork = undefined; this.#watchdogFailures = 0; this.#nextWatchdogAt = 0; return; }
+    // Failed/unprogressing recovery: one bounded one-shot backoff while work exists.
+    if (Date.now() < this.#nextWatchdogAt) { this.#watchdogDeadline = this.#nextWatchdogAt; return; }
     const noProgress = work === this.#watchdogWork;
     this.#watchdogWork = work;
     try {
@@ -1081,6 +1204,174 @@ export class ResidencyClient {
     } catch {
       this.#nextWatchdogAt = Date.now() + Math.min(WATCHDOG_MAX_BACKOFF_MS, WATCHDOG_INTERVAL_MS * 2 ** ++this.#watchdogFailures);
     }
+    if (this.#closed) return;
+    const owner = this.#liveOwner();
+    this.#watchdogDeadline = owner ? this.#ownerDeadline(owner) : this.#nextWatchdogAt;
+  }
+
+  /** Coalesce a filesystem notification burst, not recurring delivery work. */
+  #notifyDelivery(): void {
+    if (this.#closed || this.#deliveryEventTimer) return;
+    this.#deliveryEventTimer = setTimeout(() => {
+      this.#deliveryEventTimer = undefined;
+      this.#wakeDelivery();
+    }, DELIVERY_EVENT_COALESCE_MS);
+    this.#deliveryEventTimer.unref();
+  }
+
+  /** Delivery wake: coalesced; a wake during an in-flight drain reruns it once. */
+  #wakeDelivery(): void {
+    if (this.#closed || !this.#started || !this.options.mainAgent.local) return;
+    if (this.#deliveryRunning) { this.#deliveryDirty = true; return; }
+    // A pending failure backoff owns the next attempt; it drains everything then.
+    if (this.#deliveryRetry) { this.#deliveryDirty = true; return; }
+    this.#deliveryRunning = true;
+    this.#deliveryDirty = false;
+    void this.#backgroundDelivery.run(() => this.#drainDeliveries()).then(outcome => {
+      this.#deliveryRunning = false;
+      if (this.#closed) return;
+      const meshWait = this.#backgroundDelivery.waitMs;
+      const failed = outcome === "retry" || outcome === "failed" || this.#completionFault !== undefined ||
+        (outcome === "skipped" && meshWait > 0);
+      if (!failed) {
+        this.#deliveryFailures = 0;
+        if (this.#deliveryDirty) this.#wakeDelivery();
+        return;
+      }
+      const own = Math.min(DELIVERY_RETRY_MAX_MS, DELIVERY_RETRY_MIN_MS * 2 ** this.#deliveryFailures++);
+      const delayMs = Math.min(DELIVERY_RETRY_MAX_MS, Math.max(own, meshWait));
+      this.#deliveryRetry = setTimeout(() => {
+        this.#deliveryRetry = undefined;
+        this.#wakeDelivery();
+      }, delayMs);
+      this.#deliveryRetry.unref();
+    }, () => { this.#deliveryRunning = false; });
+  }
+
+  #closeWatches(): void {
+    for (const watcher of this.#watchers.values()) { try { watcher.close(); } catch { /* already closed */ } }
+    this.#watchers.clear();
+    this.#rootAncestor = undefined;
+  }
+
+  /**
+   * A missing residencyRoot (e.g. idle start before any client materialized it) is observed
+   * through its nearest existing ancestor; each next-component creation deepens the watch until
+   * the root binds, then recovery rescans. No timer: idle stays event-only.
+   */
+  #armRootAncestor(): void {
+    const target = this.options.config.residencyRoot;
+    const close = (): void => {
+      const watcher = this.#watchers.get(ROOT_ANCESTOR_KEY);
+      if (watcher) { try { watcher.close(); } catch { /* already closed */ } }
+      this.#watchers.delete(ROOT_ANCESTOR_KEY);
+      this.#rootAncestor = undefined;
+    };
+    if (this.#watchers.has(target)) { close(); return; }
+    let ancestor = path.dirname(target);
+    while (!isDirectory(ancestor)) {
+      const parent = path.dirname(ancestor);
+      if (parent === ancestor) return;
+      ancestor = parent;
+    }
+    if (this.#rootAncestor === ancestor && this.#watchers.has(ROOT_ANCESTOR_KEY)) return;
+    close();
+    const next = path.relative(ancestor, target).split(path.sep)[0]!;
+    let watcher: fs.FSWatcher;
+    try {
+      watcher = fs.watch(ancestor, (_event, name) => {
+        if (this.#closed || this.#watchers.get(ROOT_ANCESTOR_KEY) !== watcher) return;
+        this.#watchRearmAttempts = 0;
+        if (name === null || String(name) === next) this.#rootAppeared();
+      });
+    } catch (error) {
+      this.#watchFailed(error);
+      return;
+    }
+    watcher.on("error", (error) => this.#watchFailed(error));
+    watcher.unref?.();
+    this.#watchers.set(ROOT_ANCESTOR_KEY, watcher);
+    this.#rootAncestor = ancestor;
+    // A component created between the scan and binding is not lost.
+    if (fs.existsSync(path.join(ancestor, next))) this.#rootAppeared();
+  }
+
+  #rootAppeared(): void {
+    if (this.#closed) return;
+    this.#armWatches();
+    // Root now bound: rescan owner/outbox/durable work it may already hold.
+    if (this.#watchers.has(this.options.config.residencyRoot)) this.#wakeWatchdog();
+  }
+
+  /** Bind directory watches that exist now; missing ones bind on a later event/settlement. */
+  #armWatches(): void {
+    if (this.#closed || !this.#started || this.#watchRearm) return;
+    const meshRoot = this.options.config.meshRoot;
+    const completions = path.join(meshRoot, "agent-completions");
+    const residency = this.options.config.residencyRoot;
+    const bindings: Array<[string, (name: string | null) => void]> = [
+      [meshRoot, (name) => {
+        if (name === "agent-completions") this.#armWatches();
+        if (name === null || name === "agent-completions" || MESH_STATE_FILES.has(name)) this.#notifyDelivery();
+      }],
+      [completions, (name) => {
+        if (name === "attempts") this.#armWatches();
+        if (name === null || name === "attempts" || name.endsWith(".json")) this.#notifyDelivery();
+      }],
+      [path.join(completions, "attempts"), (name) => { if (name === null || name.endsWith(".json")) this.#notifyDelivery(); }],
+      [residency, (name) => {
+        if (name === "delivery-outbox") this.#armWatches();
+        if (name === null || OWNER_FILES.has(name)) this.#wakeWatchdog();
+      }],
+      [path.join(residency, "delivery-outbox"), (name) => { if (name === null || name.endsWith(".json")) this.#wakeWatchdog(); }],
+    ];
+    for (const [directory, callback] of bindings) {
+      if (this.#watchers.has(directory)) continue;
+      let watcher: fs.FSWatcher;
+      try {
+        watcher = fs.watch(directory, (_event, name) => {
+          if (this.#closed) return;
+          this.#watchRearmAttempts = 0; // a delivered notification proves the watch works
+          callback(name === null ? null : String(name));
+        });
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") continue; // bound when it appears
+        this.#watchFailed(error);
+        return;
+      }
+      watcher.on("error", (error) => this.#watchFailed(error));
+      watcher.unref?.();
+      this.#watchers.set(directory, watcher);
+    }
+    this.#armRootAncestor();
+  }
+
+  /** Close all, rescan and re-arm; exhaustion keeps the shared degraded-only minute carrier. */
+  #watchFailed(error: unknown): void {
+    this.#closeWatches();
+    if (this.#closed || this.#observation.degraded) return;
+    const attempt = this.#watchRearmAttempts++;
+    const giveUp = attempt >= WATCH_REARM_ATTEMPTS;
+    if (!this.#watchWarned) {
+      this.#watchWarned = true;
+      const cause = (error as NodeJS.ErrnoException | undefined)?.code === "ENOSPC"
+        ? "ENOSPC: inotify watch limit, not disk space (raise fs.inotify.max_user_watches)"
+        : error instanceof Error ? error.message : String(error);
+      console.warn(`[pi-fabric] resident delivery: filesystem notifications failed for ${this.options.config.residencyRoot} (${cause}); ` +
+        `rescanned now and re-arming at most ${WATCH_REARM_ATTEMPTS} times with backoff. Normal operation has no polling; ` +
+        "exhausted watches scan and re-arm once per minute.");
+    }
+    this.#wakeDelivery();
+    this.#wakeWatchdog();
+    if (giveUp) { this.#observation.enter(); return; }
+    this.#watchRearm = setTimeout(() => {
+      this.#watchRearm = undefined;
+      this.#armWatches();
+      // Rescan after re-arming: a change between failure and re-arm is not lost.
+      this.#wakeDelivery();
+      this.#wakeWatchdog();
+    }, Math.min(WATCH_REARM_MAX_MS, WATCH_REARM_BASE_MS * 2 ** attempt));
+    this.#watchRearm.unref();
   }
 
   #durableWork(): string | undefined {

@@ -2,6 +2,7 @@
 // across the QuickJS guest boundary, so a guest program can distinguish it from Unknown and retry.
 import { describe, expect, it } from "vitest";
 import { QuickJsRuntime } from "../src/runtime/quickjs-runtime.js";
+import { FabricPeerLeaseStaleError } from "../src/agents/peer-lease-stale.js";
 
 const options = { timeoutMs: 5_000, memoryLimitBytes: 32 * 1024 * 1024 };
 
@@ -13,9 +14,7 @@ describe("FABRIC_PEER_LEASE_STALE guest metadata (smarty-dev#11703)", () => {
          secret: error.secret ?? null, cause: error.cause ?? null, unknown: String(error.message).startsWith("Unknown "),
          keys: Object.keys(error).sort() }; }`,
       async () => {
-        throw Object.assign(new Error("Fabric peer session:remote-00000000 on remote host forge may still be live: its mirrored lease lapsed; retry"), {
-          name: "FabricPeerLeaseStaleError", code: "FABRIC_PEER_LEASE_STALE", retryable: true,
-          targetId: "session:remote-00000000", remoteHost: "forge", lapsedMs: 16_000,
+        throw Object.assign(new FabricPeerLeaseStaleError("session:remote-00000000", "forge", 16_000), {
           secret: "never bridge", cause: { secret: "never bridge" },
         });
       }, options,

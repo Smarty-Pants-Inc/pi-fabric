@@ -154,9 +154,11 @@ describe("mirrored remote roots (smarty-dev#2004)", () => {
     expect(directory.list({ scope: "local" }).map((participant) => participant.id)).toEqual(["session:dev1"]);
   });
 
-  it.each(["steer", "followUp"] as const)("delivers to an older mirrored peer without an owner incarnation (%s)", async kind => {
+  it.each(["steer", "followUp"] as const)("legacy exception: an unexpired projection with no mirrorLease/sample still delivers (%s)", async kind => {
     const { mesh, directory, mirror, local, remote } = await setup();
     await mirror({ epochless: true });
+    expect(directory.mirroredControlOwner(remote.id, remote.id, remote.id)?.mirror).toBeUndefined();
+    expect(mesh.get("topology/hosts/" + hash(remote.id))?.value).not.toHaveProperty("mirrorLease");
     expect(directory.get(remote.id)).toMatchObject({ id: remote.id, controlProtocol: "v1" });
     const sender = senderOn(mesh, local, 5_000, directory);
     const request = vi.spyOn(sender, "request");
@@ -425,21 +427,24 @@ describe("mirrored remote roots (smarty-dev#2004)", () => {
   // smarty-dev#11703 Decision C: real timers and real clock (no mock); the bounded <=15 s bridge-renewal
   // wait elapses for real. Real boundary: directory lease files + router; missing live proof: real bridge/ssh
   // (covered by tests/remote-mirror-lease-wait.test.ts with a real two-store MeshBridge).
-  it("expires with the mirrored lease, waits once (<=15 s) for a bridge renewal, then fails typed-stale naming the remote host, never publishing", async () => {
+  it("legacy expired projection waits once (<=15 s), then fails typed-stale naming the remote host, never publishing", async () => {
     const { directory, mirror, local, remote, meshRoot } = await setup();
     const now = Date.now();
     await mirror({ expiresAt: now + 5_000 });
     writeHostLease(meshRoot, { id: remote.id, rootId: remote.id, identityId: remote.id, updatedAt: now, expiresAt: now + 60_000 });
     // The file lease renews the mirrored host without a shared-state write.
     expect(directory.get(remote.id, now + 30_000)).toMatchObject({ remoteHost: "forge", stale: false });
-    expect(directory.get(remote.id, now + 61_000)).toBeUndefined();
-    expect(directory.peers(now + 61_000)).toEqual([]);
+    expect(directory.get(remote.id, now + 30_000)?.bridgeStale).toBeUndefined();
+    // #10068: an unsampled (older-bridge) projection past its deadline is bridge-stale, not owner
+    // death; it stays discoverable and attributed to forge so routing can name the host.
+    expect(directory.get(remote.id, now + 61_000)).toMatchObject({ remoteHost: "forge", stale: false, bridgeStale: true });
+    expect(directory.peers(now + 61_000).map((peer) => peer.id)).toEqual([remote.id]);
 
-    await mirror({ expiresAt: Date.now() - 2_000 });
-    writeHostLease(meshRoot, { id: remote.id, rootId: remote.id, identityId: remote.id, updatedAt: now, expiresAt: Date.now() - 2_000 });
-    expect(directory.lastKnown(remote.id)).toMatchObject({ participant: { remoteHost: "forge" } });
     const request = vi.fn();
     const router = routerFor(directory, { request } as unknown as FabricControlPlane, local);
+    // Bridge freshness unknown: one bounded renewal wait, then a typed retryable refusal.
+    await mirror({ expiresAt: Date.now() - 2_000 });
+    writeHostLease(meshRoot, { id: remote.id, rootId: remote.id, identityId: remote.id, updatedAt: now, expiresAt: Date.now() - 2_000 });
     const started = Date.now();
     const error = await router.routeMessage(remote.id, "hello", undefined, "followUp").catch((e: unknown) => e);
     expect(Date.now() - started).toBeLessThanOrEqual(15_000 + 2_000);
@@ -449,6 +454,25 @@ describe("mirrored remote roots (smarty-dev#2004)", () => {
     expect((error as Error).message).not.toMatch(/^Unknown /);
     expect(request).not.toHaveBeenCalled();
   }, 30_000);
+
+  it("a modern fresh source-lapsed sample proves the root gone immediately, without waiting or publication", async () => {
+    const { directory, mirror, local, remote, meshRoot } = await setup();
+    const request = vi.fn();
+    const router = routerFor(directory, { request } as unknown as FabricControlPlane, local);
+    const observedAt = Date.now();
+    await mirror({ expiresAt: observedAt + 15_000, host: { mirrorLease: 1 } });
+    writeHostLease(meshRoot, { id: remote.id, rootId: remote.id, identityId: remote.id, startedAt: 1,
+      updatedAt: observedAt, expiresAt: observedAt + 15_000, mirrorLease: 1, mirror: { remoteHost: "forge", observedAt,
+        sourceObservedAt: observedAt - 90_000, sourceUpdatedAt: observedAt - 110_000, sourceExpiresAt: observedAt - 95_000 } });
+    expect(directory.get(remote.id)).toBeUndefined();
+    expect(directory.peers()).toEqual([]);
+    expect(directory.lastKnown(remote.id)).toMatchObject({ participant: { remoteHost: "forge", stale: true } });
+    const started = Date.now();
+    await expect(router.routeMessage(remote.id, "hello", undefined, "followUp"))
+      .rejects.toThrow(`Unknown Fabric participant: ${remote.id} (its lease mirrored from remote host forge lapsed`);
+    expect(Date.now() - started).toBeLessThan(2_000);
+    expect(request).not.toHaveBeenCalled();
+  });
 
   it.each(["steer", "followUp"] as const)("refuses a non-interactive mirrored auditor with a named error (%s)", async (kind) => {
     const { directory, mirror, local, remote } = await setup();

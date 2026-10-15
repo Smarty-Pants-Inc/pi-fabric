@@ -29,6 +29,13 @@ const tmp = (): string => {
 
 const lease = (meshRoot: string, hostId: string, expiresAt: number, rootId = hostId) =>
   writeHostLease(meshRoot, { id: hostId, rootId, identityId: hostId, updatedAt: expiresAt - 15_000, expiresAt });
+const remoteLease = (meshRoot: string, now: number, age: number, bridgeAge = 0, sourceOffset = -60 * MIN, projectionExpiry = now - 30 * MIN) => {
+  const sourceAt = now + sourceOffset;
+  writeHostLease(meshRoot, { id: ROOT, rootId: ROOT, identityId: ROOT,
+    updatedAt: sourceAt - age - 15_000, expiresAt: projectionExpiry, mirrorLease: 1,
+    mirror: { remoteHost: "ryzen4", observedAt: now - bridgeAge, sourceObservedAt: sourceAt,
+      sourceUpdatedAt: sourceAt - age - 15_000, sourceExpiresAt: sourceAt - age } });
+};
 const participantKey = (id: string) => `topology/participants/${createHash("sha256").update(id).digest("hex")}`;
 const participant = (meshRoot: string, rootId: string, ownerHostId: string, now: number) =>
   writeParticipantFile(meshRoot, {
@@ -49,6 +56,42 @@ describe("dead-root verdicts (fail-open)", () => {
     // A participant whose owner lease also expired is not live.
     participant(mesh, ROOT, ROOT, now - 20 * MIN);
     expect(judgeRoot(mesh, ROOT, now).dead).toBe(true);
+  });
+
+  it.each([
+    { label: "stale bridge, old source", age: 20 * MIN, bridgeAge: 20 * MIN, dead: false },
+    { label: "stale bridge, live source", age: -13_000, bridgeAge: 20 * MIN, dead: false },
+    { label: "fresh bridge, live source", age: -13_000, bridgeAge: 0, dead: false },
+    { label: "fresh bridge, recently expired source", age: DEAD_ROOT_GRACE_MS - 1, bridgeAge: 0, dead: false },
+    { label: "fresh bridge, old source", age: 20 * MIN, bridgeAge: 0, dead: true },
+  ])("$label judges the source clock rather than the old mirrored expiry", ({ age, bridgeAge, dead }) => {
+    for (const offset of [-60 * MIN, 60 * MIN]) {
+      const mesh = tmp();
+      remoteLease(mesh, now, age, bridgeAge, offset);
+      expect(judgeRoot(mesh, ROOT, now).dead).toBe(dead);
+      if (dead) expect(judgeRoot(mesh, ROOT, now).reason).toContain("20 min ago on source clock; fresh bridge");
+    }
+  });
+
+  it("a mirrored participant cannot use compatibility expiry to override a source-expired lease", () => {
+    const mesh = tmp();
+    remoteLease(mesh, now, 20 * MIN, 0, 60 * MIN, now + 15_000);
+    participant(mesh, ROOT, ROOT, now);
+    expect(judgeRoot(mesh, ROOT, now).dead).toBe(true);
+    // Positive native presence on another owner still keeps the root alive.
+    lease(mesh, "session:other-host", now + 15_000, ROOT);
+    participant(mesh, ROOT, "session:other-host", now);
+    expect(judgeRoot(mesh, ROOT, now).dead).toBe(false);
+  });
+
+  it("a required but missing or malformed mirror observation is doubt", () => {
+    const mesh = tmp();
+    writeHostLease(mesh, { id: ROOT, rootId: ROOT, identityId: ROOT, updatedAt: now - 30 * MIN,
+      expiresAt: now - 30 * MIN, mirrorLease: 1 });
+    expect(judgeRoot(mesh, ROOT, now).dead).toBe(false);
+    fs.writeFileSync(hostLeasePath(mesh, ROOT), JSON.stringify({ format: 1, id: ROOT, rootId: ROOT, identityId: ROOT,
+      updatedAt: now - 30 * MIN, expiresAt: now - 30 * MIN, mirror: { remoteHost: "ryzen4", sourceObservedAt: null } }));
+    expect(judgeRoot(mesh, ROOT, now).dead).toBe(false);
   });
 
   it("a live lease or a live participant is alive", () => {
@@ -204,9 +247,10 @@ const deadRootSkips = (actors: ActorManager, id: string) => actors.messages(id).
 describe("dead-root filter in the actor activation path", () => {
   const on = (exempt: string[] = []): FabricDeadRootFilterConfig => ({ mode: "on", exempt });
 
-  it("skips a durable actor's event under a dead root with no run, and logs one JSONL line", async () => {
+  it.each(["native", "remote"] as const)("skips a durable actor's event under a dead %s root with no run, and logs one JSONL line", async origin => {
     const { root, meshRoot, mesh, actors } = setup(() => on());
-    lease(meshRoot, ROOT, Date.now() - 30 * MIN);
+    if (origin === "remote") remoteLease(meshRoot, Date.now(), 30 * MIN);
+    else lease(meshRoot, ROOT, Date.now() - 30 * MIN);
     const actor = await actors.create({ name: "reviewer", instructions: "Review.", topics: ["github.demo"], residency: "durable", coalesce: false });
     const event = await mesh.publish({ topic: "github.demo", kind: "github.webhook", from, text: "wake" });
     await waitFor(() => deadRootSkips(actors, actor.id).length === 1 && actors.status(actor.id).status === "idle");
@@ -217,7 +261,9 @@ describe("dead-root filter in the actor activation path", () => {
     expect(lines).toHaveLength(1);
     expect(lines[0]).toEqual({
       at: expect.any(String), actorId: actor.id, actorName: "reviewer", rootId: ROOT, eventId: event.id,
-      topic: "github.demo", reason: "root lease expired 30 min ago; no live participant",
+      topic: "github.demo", reason: origin === "remote"
+        ? "remote root lease expired 30 min ago on source clock; fresh bridge; no live participant"
+        : "root lease expired 30 min ago; no live participant",
     });
     expect(Number.isFinite(Date.parse(lines[0]!.at as string))).toBe(true);
     // The root becomes live right after the dead verdict (a participant on another host appears; the
@@ -242,6 +288,8 @@ describe("dead-root filter in the actor activation path", () => {
         lease(m, "session:other-host", Date.now() + 10 * MIN, ROOT);
         participant(m, ROOT, "session:other-host", Date.now());
       } },
+      { name: "stale-bridge", filter: () => on(), prepare: (m) => remoteLease(m, Date.now(), 30 * MIN, 20 * MIN) },
+      { name: "fresh-remote-source", filter: () => on(), prepare: (m) => remoteLease(m, Date.now(), -13_000) },
       { name: "missing-both", filter: () => on(), prepare: () => {} },
       { name: "unreadable-lease", filter: () => on(), prepare: (m) => {
         fs.mkdirSync(path.dirname(hostLeasePath(m, ROOT)), { recursive: true });

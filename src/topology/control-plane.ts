@@ -526,6 +526,8 @@ interface OwnedControlCommand {
   acceptance?: FabricControlAcceptance;
   saved?: boolean;
   running?: boolean;
+  /** Only saved outcomes enter the serial ACK worker; retain the original wire authority. */
+  acknowledgement?: { command: FabricControlCommand; ownerIncarnation: string };
 }
 
 export class FabricControlPlane {
@@ -613,6 +615,11 @@ export class FabricControlPlane {
   // outcome until its sequence and ACK commit, never replaying a completed handler.
   readonly #sharedClaims = new Map<string, number>();
   readonly #ownedCommands = new Map<string, OwnedControlCommand>();
+  #ackWorker: Promise<void> | undefined;
+  #ackPublicationFailed = false;
+  // One body-free example, not a history: permanent uncertainty outlives dropped worker custody.
+  #uncertainAcknowledgement: { commandId: string; outcomeKey: string } | undefined;
+  #ackCapacityBlocked = false;
 
   // Recheck under the actual store lock: checking only before an await is not admission.
   #assertAdmission(): void {
@@ -1485,6 +1492,22 @@ export class FabricControlPlane {
     await Promise.allSettled([...this.#activeHandlers]);
     this.#handler = undefined;
     this.#relayAcknowledgements.clear();
+    const pendingAcknowledgements = [...this.#ownedCommands].filter(([, owned]) => owned.acknowledgement);
+    if (this.#ackPublicationFailed || pendingAcknowledgements.length) {
+      const obligations = [
+        ...(this.#uncertainAcknowledgement ? [
+          `uncertain ACK commandId=${JSON.stringify(this.#uncertainAcknowledgement.commandId)} savedOutcomeKey=${JSON.stringify(this.#uncertainAcknowledgement.outcomeKey)} (first uncertainty)`,
+        ] : []),
+        ...pendingAcknowledgements.map(([key, owned]) =>
+          `pending ACK commandId=${JSON.stringify(owned.acknowledgement!.command.commandId)} savedOutcomeKey=${JSON.stringify(key)}`),
+      ];
+      // Close must let Main finish teardown. This is not a release receipt or an ACK retry:
+      // keep the durable result and failure flag, without logging private acceptance/message bodies.
+      try {
+        console.warn(`[pi-fabric] Control close has unsettled acknowledgement obligations: ${obligations.join("; ")}. ` +
+          "Saved outcomes were committed; close does not discard them. Next start can re-publish retained commands' saved outcomes without repeating handlers. Checkpoint/release remains refused.");
+      } catch { /* A diagnostic sink must not interrupt runtime teardown. */ }
+    }
   }
 
   /** True only when a drain read the log to its end; a gated or paused drain retains its work. */
@@ -1592,6 +1615,11 @@ export class FabricControlPlane {
         this.#dirty = false;
         let complete = false;
         const outcome = await this.#backgroundPoll.run(async () => { complete = await this.#poll(); }, false);
+        if (outcome === "done" && this.#ackCapacityBlocked && this.#ackWorker) {
+          this.#dirty = true;
+          if (this.#acknowledgementsFull()) return; // settlement wakes the reader; capacity owns no timer
+          continue;
+        }
         if (outcome === "done" && complete) {
           // A detached outcome whose save/ACK failed is retained, not running: retry it with backoff.
           if ([...this.#ownedCommands.values()].some((owned) => !owned.running)) {
@@ -1665,12 +1693,17 @@ export class FabricControlPlane {
     // Partial claims retain custody across PREPARE, including spent deadlines.
     // Their expiry is an outcome decision on resume, never permission to drop ownership.
     this.#pruneRelayAcknowledgements();
-    // Detached asks may already be behind the log cursor. Resume their owned
-    // claims/outcomes too, without replaying a handler that completed.
+    this.#ackCapacityBlocked = false;
+    this.#resumeAcknowledgements();
+    // ACK-only custody never joins the reader or re-enters the handler/save retry traversal.
     for (const owned of this.#ownedCommands.values()) {
-      if (!owned.running && (!this.#paused || owned.acceptance)) await this.#acceptCommand(owned.event);
+      if (!owned.acknowledgement && !owned.running && (!this.#paused || owned.acceptance)) await this.#acceptCommand(owned.event);
     }
     while (this.options.canConsumeMesh?.() !== false) {
+      if (this.#acknowledgementsFull()) {
+        this.#ackCapacityBlocked = true;
+        return false; // stop before fetching the next page; ACK settlement wakes the reader
+      }
       const tail = this.mesh.tail(this.#offset, 100);
       for (const event of tail.events) {
         if (this.#paused || this.options.canConsumeMesh?.() === false) return false;
@@ -1685,7 +1718,16 @@ export class FabricControlPlane {
             const data = envelope && ownDataRecord(envelope.data);
             if (data?.errorCode === RELAY_DESTINATION_UNAVAILABLE || data?.errorCode === FABRIC_IDEMPOTENCY_KEY_REUSED) this.#acceptRelayRefusal(event);
             else if (data) this.#acceptAcknowledgement(event);
-          } else if (event.topic === CONTROL_TOPIC) await this.#acceptCommand(event);
+          } else if (event.topic === CONTROL_TOPIC) {
+            if (this.#acknowledgementsFull()) {
+              const command = commandFromEvent(event);
+              if (command && command.operation !== "cancel" && !this.#ownedCommands.has(controlSeenKey(this.options.hostId, command.commandId))) {
+                this.#ackCapacityBlocked = true;
+                return false; // leave this new command unread; never drop an ACK obligation
+              }
+            }
+            await this.#acceptCommand(event);
+          }
         }
         if (this.options.canConsumeMesh?.() === false) return false;
         this.#lastSequence = event.sequence;
@@ -1841,7 +1883,7 @@ export class FabricControlPlane {
     const ownedKey = controlSeenKey(this.options.hostId, command.commandId);
     const owned = this.#ownedCommands.get(ownedKey);
     if (owned) {
-      if (!owned.running) await this.#runOwnedCommand(ownedKey, owned);
+      if (!owned.acknowledgement && !owned.running) await this.#runOwnedCommand(ownedKey, owned);
       return;
     }
     this.#assertAdmission();
@@ -2012,7 +2054,7 @@ export class FabricControlPlane {
         if (detachedControlOperation(command.operation) && isLockTimeout(error)) this.#backgroundPoll.failure(error);
         throw error;
       })
-      .finally(() => { owned.running = false; });
+      .finally(() => { if (!owned.acknowledgement) owned.running = false; });
     if (detachedControlOperation(command.operation)) {
       this.#activeHandlers.add(execution);
       void execution.finally(() => {
@@ -2058,6 +2100,59 @@ export class FabricControlPlane {
     }
   }
 
+  #acknowledgementsFull(): boolean {
+    let count = 0;
+    for (const owned of this.#ownedCommands.values()) if (owned.acknowledgement && ++count >= 100) return true;
+    return false;
+  }
+
+  /** One owned worker, not a best-effort queue or one lock waiter per command. */
+  #resumeAcknowledgements(): void {
+    if (this.#ackWorker || ![...this.#ownedCommands.values()].some(owned => owned.acknowledgement)) return;
+    for (const owned of this.#ownedCommands.values()) if (owned.acknowledgement) owned.running = true;
+    let failed = false;
+    const execution = this.#publishSavedAcknowledgements().catch(error => { failed = true; throw error; });
+    this.#ackWorker = execution;
+    this.#activeHandlers.add(execution);
+    void execution.finally(() => {
+      this.#ackWorker = undefined;
+      this.#activeHandlers.delete(execution);
+      if (!failed) { this.#resumeAcknowledgements(); return; }
+      let retained: [string, OwnedControlCommand] | undefined;
+      for (const [key, owned] of this.#ownedCommands) {
+        if (!owned.acknowledgement) continue;
+        owned.running = false;
+        retained ??= [key, owned];
+      }
+      if (retained) this.#retryRetainedOwned(...retained); // one existing backoff for the worker
+    }).catch(() => undefined);
+  }
+
+  async #publishSavedAcknowledgements(): Promise<void> {
+    for (;;) {
+      const next = [...this.#ownedCommands].find(([, owned]) => owned.acknowledgement);
+      if (!next) return;
+      const [key, owned] = next;
+      const { command, ownerIncarnation } = owned.acknowledgement!;
+      try {
+        await this.#publishAcknowledgement(command, owned.acceptance!, ownerIncarnation);
+        this.#ownedCommands.delete(key);
+        this.#wake(); // settlement resumes the unread command at the capacity fence
+      } catch (error) {
+        if (isLockTimeout(error)) this.#backgroundPoll.failure(error);
+        const deferred = isMeshWriteDeferred(error) || isLockTimeout(error) || error instanceof MeshConsumptionPausedError;
+        if (!deferred) {
+          this.#ackPublicationFailed = this.#releasePublicationFailed = true;
+          this.#uncertainAcknowledgement ??= { commandId: command.commandId, outcomeKey: key };
+          // Keep the saved outcome; a later duplicate may observe it, never run its handler.
+          this.#ownedCommands.delete(key);
+          this.#wake();
+        }
+        throw error;
+      }
+    }
+  }
+
   async #executeClaimedCommand(
     command: FabricControlCommand,
     from: MeshIdentity,
@@ -2067,6 +2162,7 @@ export class FabricControlPlane {
     sequence: number,
     verification: MeshEvent["verification"],
   ): Promise<void> {
+    const outcomeIncarnation = this.incarnation;
     const controller = new AbortController();
     this.#activeCommands.set(command.commandId, {
       controller,
@@ -2100,6 +2196,15 @@ export class FabricControlPlane {
         };
       }
       acceptance = this.#boundedAcceptance(acceptance);
+      const acknowledgement = command.operation === "steer" || command.operation === "followUp"
+        ? { command: { ...command }, ownerIncarnation: outcomeIncarnation } : undefined;
+      // Snapshotting can invoke user result.toJSON again and throw. Retain the completed
+      // result first, so a transient serialization failure retries the save, never the handler.
+      owned.acceptance = acceptance;
+      if (acknowledgement) {
+        // Match the saved JSON value, not a handler-owned object that can mutate while queued.
+        acceptance = JSON.parse(JSON.stringify(acceptance)) as FabricControlAcceptance;
+      }
       owned.acceptance = acceptance; // custody precedes any awaited sequence/ACK commit
       assertMeshConsumption(this.options.canConsumeMesh);
       const saveOutcome = () => this.#putFenced(this.#seen, {
@@ -2109,7 +2214,7 @@ export class FabricControlPlane {
             hostId: this.options.hostId,
             commandId: command.commandId,
             targetId: command.targetId,
-            ownerIncarnation: this.incarnation,
+            ownerIncarnation: outcomeIncarnation,
             expiresAt: Math.max(deadlineAt, Date.now()) + this.#ackTimeoutMs,
             sequence,
             acceptance,
@@ -2127,6 +2232,11 @@ export class FabricControlPlane {
         // result under the original version fence and retry it without running the handler.
         if (!deferred) { this.#ownedCommands.delete(key); return; }
         throw error; // the owned outcome is retried by the next confirmed drain
+      }
+      if (acknowledgement) {
+        owned.acknowledgement = acknowledgement;
+        this.#resumeAcknowledgements();
+        return; // only the saved ACK is offloaded; the handler and save stayed reader-serial
       }
       try {
         await this.#publishAcknowledgement(command, acceptance);
@@ -2150,7 +2260,7 @@ export class FabricControlPlane {
         try {
           const retained = await this.#seen.put({ key, identity: this.identity, ifVersion: owned.claimVersion,
             value: { format: 1, hostId: this.options.hostId, commandId: command.commandId,
-              targetId: command.targetId, ownerIncarnation: this.incarnation, expiresAt: Math.max(deadlineAt, Date.now()) + this.#ackTimeoutMs,
+              targetId: command.targetId, ownerIncarnation: outcomeIncarnation, expiresAt: Math.max(deadlineAt, Date.now()) + this.#ackTimeoutMs,
               acceptance: owned.acceptance } satisfies FabricControlSeenRecord });
           owned.claimVersion = retained.version;
         } catch { /* The owned in-memory outcome and durable claim remain; never replay. */ }
@@ -2202,6 +2312,7 @@ export class FabricControlPlane {
     const oldest = this.mesh.oldestSequence();
     if (oldest !== undefined) {
       const stale = this.#seen.listAll(CONTROL_SEEN_PREFIX).filter((entry) => {
+        if (this.#ownedCommands.has(entry.key)) return false;
         const record = controlSeenRecord(entry.value);
         return !record || (record.expiresAt < now && record.sequence !== undefined && record.sequence < oldest);
       });
@@ -2232,6 +2343,7 @@ export class FabricControlPlane {
   // automatically, since two processes of one host write the same lease key.
   async #cleanupLegacySeen(now: number): Promise<void> {
     const expired = this.mesh.listAll(CONTROL_SEEN_PREFIX).flatMap((entry) => {
+      if (this.#ownedCommands.has(entry.key)) return [];
       const record = controlSeenRecord(entry.value);
       return !record || record.expiresAt < now ? [{ entry, record }] : [];
     });

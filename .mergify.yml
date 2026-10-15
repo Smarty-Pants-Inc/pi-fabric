@@ -13,11 +13,9 @@ merge_queue:
 
 # smarty-dev's plain rule (smarty-dev#865): the PR, its required checks and this queue are the
 # review. Mergify queues a ready PR once queue_conditions pass; `hold` and DO NOT LAND
-# titles keep a PR out. queue_conditions require both review verdicts on the reviewed head. Only a
-# PR head carries review statuses, and Mergify's in-place update (merging main into the queued
-# PR, smarty-dev#455) makes a new head that never gets them. So merge_conditions carry the same
-# opt-out vetoes and security gate, refuse a failed review, and still require fresh CI on the
-# updated head (smarty-dev#2974).
+# titles keep a PR out. merge_conditions require every queue condition again, including the
+# review verdicts and opt-out vetoes, and still require fresh CI on the updated head
+# (smarty-dev#2974).
 queue_rules:
   - name: default
     # ponytail: one Ubuntu+Windows run takes ~30 min under fleet load, so a serial queue of N PRs takes N
@@ -44,6 +42,7 @@ queue_rules:
               - -label = needs-security-pass
     merge_conditions:
       # An opt-out added after queueing must stop the merge.
+      - check-success = review/astra
       - -label ~= (?i)^(hold|do[ -]?not[ -]?merge|dnm|freeze|frozen)$
       - -label ~= (?i)^(wip|work[ -]?in[ -]?progress|do[ -]?not[ -]?land|never[ -]?land)$
       - base = main

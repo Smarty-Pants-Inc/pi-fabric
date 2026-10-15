@@ -54,7 +54,8 @@ const harness = (baseUrl?: string, ids = ["a", "b", "c"]) => {
     requests.push(request);
     return { id: "child", name: "child", status: "running", runner: "pi", transport: "process", cwd: "." };
   });
-  const config: AgentManager["config"] = { ...DEFAULT_FABRIC_CONFIG.agents, transport: "process", deniedModels: [], model: undefined };
+  const config: AgentManager["config"] = { ...DEFAULT_FABRIC_CONFIG.agents, transport: "process", deniedModels: [] };
+  delete config.model;
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-model-policy-")); roots.push(root);
   // Keep private-brand policy methods on a real instance; only the double spawns.
   const policyManager = new AgentManager(".", config, { runRoot: root, fullCodeMode: false });

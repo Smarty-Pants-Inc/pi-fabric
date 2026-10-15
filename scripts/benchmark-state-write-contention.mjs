@@ -67,9 +67,9 @@ async function child() {
   } finally { store?.close(); clearTimeout(hardStop); process.disconnect(); }
 }
 async function main() {
-  const owned = fs.mkdtempSync(path.join(tmp, 'state-contention-'));
   const cpu = fs.readFileSync('/proc/self/status', 'utf8').match(/^Cpus_allowed_list:\s*(\d+)/m)?.[1];
   assert(cpu, 'Linux CPU affinity required');
+  const owned = fs.mkdtempSync(path.join(tmp, 'state-contention-'));
   const all = [];
   function launch(root, role, extra = {}) {
     const argv = [self, `--repo=${repo}`, `--entry=${args.entry ?? 'src'}`, `--root=${root}`, `--role=${role}`,

@@ -1,3 +1,4 @@
+import childProcess from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -12,8 +13,9 @@ import { aclOwner, icaclsGrant, icaclsShow, readAcl, setOwner, tokenSids } from 
 
 // smarty-dev#8920: Windows ACL privacy of the SQLite mesh state root, its state files, its flag directory and its
 // ancestors, proved on real NTFS ACLs (icacls grants, Get-Acl/icacls read-back) with the real node:sqlite opener.
-// No mocks. Hosted-only: fixtures live in a private directory below the runner's DEFAULT USERPROFILE (not TMPDIR,
-// whose RUNNER_TEMP ancestors are not a profile), so local runs never create or delete them. The profile and its
+// No ACL mocks: the native-cache tests use only a call-through process-count spy. Hosted-only: fixtures live in a
+// private directory below the runner's DEFAULT USERPROFILE (not TMPDIR, whose RUNNER_TEMP ancestors are not a
+// profile), so local runs never create or delete them. The profile and its
 // system ancestors are never modified; every grant is on a fixture directory created by this suite.
 //
 // Policy (fabric-store ruling): root, state.db/-wal/-shm and the flag directory refuse any foreign
@@ -73,7 +75,171 @@ const grant = (file: string, sid: string, rights: string, bits: number): void =>
   expect(rules.some(rule => (rule.rights & bits) === bits), `Get-Acl ${file}: ${JSON.stringify(rules)}`).toBe(true);
 };
 
+/** Decision C: count ONLY the production native reader, never replace its execution or descriptor evidence.
+ * vi.spyOn without mockImplementation calls the original execFileSync. Independent Get-Acl readback and icacls
+ * helpers use spawnSync, so fixture preparation/verification cannot inflate this count. Restore in every finally. */
+const countNativeAclProofs = () => {
+  const spy = vi.spyOn(childProcess, "execFileSync");
+  const indexes = () => spy.mock.calls.flatMap(([, , options], index) => options && typeof options === "object"
+    && typeof options.env?.PI_FABRIC_STATE_ACL === "string" ? [index] : []);
+  return {
+    count: () => indexes().length,
+    assertRealReads: () => {
+      for (const index of indexes()) {
+        expect(spy.mock.calls[index]![0]).toMatch(/[\\/]WindowsPowerShell[\\/]v1\.0[\\/]powershell\.exe$/i);
+        const result = spy.mock.results[index]!;
+        // A thrown child execution can be accepted by today's tooling fallback, but is NOT a verified proof.
+        expect(result.type).toBe("return");
+        const snapshot = JSON.parse(String(result.value)) as { entries?: unknown };
+        expect(Array.isArray(snapshot.entries)).toBe(true);
+      }
+    },
+    restore: () => spy.mockRestore(),
+  };
+};
+/** Log bigint NTFS ChangeTime/ctimeNs, not rounded ctimeMs. No assumption that an ACL setter preserves timestamps. */
+const nativeCacheStamp = (file: string) => {
+  const stat = fs.lstatSync(file, { bigint: true, throwIfNoEntry: false });
+  return { path: file, stamp: stat ? {
+    dev: String(stat.dev), ino: String(stat.ino), size: String(stat.size),
+    ctimeNs: typeof stat.ctimeNs === "bigint" ? String(stat.ctimeNs) : null,
+    mtimeNs: String(stat.mtimeNs),
+  } : null };
+};
+/** The complete gate target set, including missing sidecars/flag directory and both checked ancestor chains. */
+const nativeCacheStamps = (root: string) => {
+  const paths = new Set([root, ...["state.db", "state.db-wal", "state.db-shm", "state.db-journal", "state-checkpoint.flags"]
+    .map(file => path.join(root, file))]);
+  for (const start of [path.resolve(root), fs.realpathSync.native(root)]) {
+    for (let at = path.dirname(start); ; at = path.dirname(at)) {
+      paths.add(at);
+      if (at === path.dirname(at)) break;
+    }
+  }
+  return [...paths].map(nativeCacheStamp);
+};
+/** Seed BEFORE measurement, retain one live SQLite connection, and never write during the counted opens.
+ * Ordinary last-close/reopen can checkpoint/delete/recreate WAL/SHM and change root/file stamps: that legitimately
+ * invalidates the full proof and is NOT a one-proof cache hit. This keeper isolates genuinely unchanged opens. */
+const seedCacheFixture = async (root: string): Promise<SqliteStateStore> => {
+  const keeper = openSync(root);
+  try {
+    await keeper.put({ key: "acl/cache-probe", value: "seeded", identity: { id: "test", name: "test", kind: "agent" } });
+    expect(keeper.get("acl/cache-probe")?.value).toBe("seeded");
+    for (const file of ["state.db", "state.db-wal", "state.db-shm"]) expect(fs.existsSync(path.join(root, file)), file).toBe(true);
+    return keeper;
+  } catch (error) { keeper.close(); throw error; }
+};
+
 describe.runIf(process.env.GITHUB_ACTIONS === "true" && process.platform === "win32")("Windows mesh state ACL privacy (smarty-dev#8920)", () => {
+  // Native integration keep reasons: ACL trust boundary/data safety and real per-open process cost. C1 is the RED
+  // performance contract; C2/C3 are safety counterexamples that already refuse on the no-cache baseline.
+  it("native-cache-C1: unchanged existing root and state.db reuse one real pinned PowerShell proof across sync and async opens", async () => {
+    const root = path.join(profileDir(), "root");
+    const keeper = await seedCacheFixture(root);
+    const proofs = countNativeAclProofs();
+    let before: ReturnType<typeof nativeCacheStamps> | undefined;
+    let after: ReturnType<typeof nativeCacheStamps> | undefined;
+    let changeTimesReadable: boolean | undefined;
+    try {
+      before = nativeCacheStamps(root);
+      // The first measured gate must really read ACLs: seeding created/wrote the sidecars after its earlier proof.
+      const first = openSync(root);
+      try { expect(first.get("acl/cache-probe")?.value).toBe("seeded"); } finally { first.close(); }
+      expect(proofs.count()).toBe(1);
+      const second = openSync(root);
+      try { expect(second.get("acl/cache-probe")?.value).toBe("seeded"); } finally { second.close(); }
+      const third = await openAsync(root);
+      try { expect(third.get("acl/cache-probe")?.value).toBe("seeded"); } finally { third.close(); }
+      const fourth = openSync(root);
+      try { expect(fourth.get("acl/cache-probe")?.value).toBe("seeded"); } finally { fourth.close(); }
+      after = nativeCacheStamps(root);
+      // Establish unchanged identity AND stamps from native observations; do not merely presume it from no writes.
+      expect(after).toEqual(before);
+      changeTimesReadable = before.every(entry => entry.stamp === null
+        || (entry.stamp.ctimeNs !== null && BigInt(entry.stamp.ctimeNs) > 0n));
+      proofs.assertRealReads();
+      // Unreadable ChangeTime cannot authorize a cached full proof: all four gates must then reprove.
+      expect(proofs.count()).toBe(changeTimesReadable ? 1 : 4);
+    } finally {
+      try {
+        console.log(JSON.stringify({ event: "native-cache-C1", nativeProofs: proofs.count(), changeTimesReadable, before,
+          after: after ?? nativeCacheStamps(root) }));
+      } finally { proofs.restore(); keeper.close(); }
+    }
+  }, 120_000);
+
+  it("native-cache-C2: Everyone R added to state.db after an accepted proof immediately reproves and refuses in the same turn", async () => {
+    const root = path.join(profileDir(), "root");
+    const keeper = await seedCacheFixture(root);
+    const file = path.join(root, "state.db");
+    const proofs = countNativeAclProofs();
+    let before: ReturnType<typeof nativeCacheStamp> | undefined;
+    let after: ReturnType<typeof nativeCacheStamp> | undefined;
+    let acceptedProofs = 0;
+    let error: unknown;
+    try {
+      const accepted = openSync(root);
+      try { expect(accepted.get("acl/cache-probe")?.value).toBe("seeded"); } finally { accepted.close(); }
+      acceptedProofs = proofs.count();
+      expect(acceptedProofs).toBe(1);
+      before = nativeCacheStamp(file);
+      grant(file, EVERYONE, "(R)", EVERYONE_READ);
+      // Both grant (including independent Get-Acl readback) and open are synchronous. No await, timer, or
+      // microtask boundary between setter return and this next open may rescue a same-turn stale proof.
+      try { openSync(root).close(); } catch (caught) { error = caught; }
+      after = nativeCacheStamp(file);
+      expect(error).toMatchObject(UNSUPPORTED);
+      expect((error as Error).message).toContain(file);
+      expect(proofs.count()).toBeGreaterThan(acceptedProofs);
+      proofs.assertRealReads();
+      expect(after.stamp?.dev).toBe(before.stamp?.dev);
+      expect(after.stamp?.ino).toBe(before.stamp?.ino);
+      // Observe ctimeNs before/after below, rather than asserting an unproven timestamp equality or delta.
+      expect(icaclsShow(file)).toMatch(/Everyone:\(R\)/);
+    } finally {
+      try {
+        console.log(JSON.stringify({ event: "native-cache-C2", acceptedProofs, nativeProofs: proofs.count(), before, after,
+          ctimeNsChanged: before && after ? before.stamp?.ctimeNs !== after.stamp?.ctimeNs : null }));
+      } finally { proofs.restore(); keeper.close(); }
+    }
+  }, 120_000);
+
+  it("native-cache-C3: foreign DELETE_CHILD added only to a fixture ancestor after an accepted proof immediately reproves and refuses", async () => {
+    const ancestor = profileDir();
+    const root = path.join(ancestor, "root");
+    const keeper = await seedCacheFixture(root);
+    const proofs = countNativeAclProofs();
+    let before: ReturnType<typeof nativeCacheStamps> | undefined;
+    let after: ReturnType<typeof nativeCacheStamps> | undefined;
+    let acceptedProofs = 0;
+    let error: unknown;
+    try {
+      const accepted = openSync(root);
+      try { expect(accepted.get("acl/cache-probe")?.value).toBe("seeded"); } finally { accepted.close(); }
+      acceptedProofs = proofs.count();
+      expect(acceptedProofs).toBe(1);
+      before = nativeCacheStamps(root);
+      // No inheritance flags, and ONLY this suite-owned ancestor: never USERPROFILE or its system ancestors.
+      grant(ancestor, EVERYONE, "(DC)", 0x40);
+      try { openSync(root).close(); } catch (caught) { error = caught; }
+      after = nativeCacheStamps(root);
+      expect(error).toMatchObject(UNSUPPORTED);
+      expect((error as Error).message).toContain(ancestor);
+      expect(proofs.count()).toBeGreaterThan(acceptedProofs);
+      proofs.assertRealReads();
+      expect(readAcl(root).rules.filter(rule => rule.sid === EVERYONE)).toEqual([]);
+      expect(readAcl(path.join(root, "state.db")).rules.filter(rule => rule.sid === EVERYONE)).toEqual([]);
+    } finally {
+      try {
+        const prior = before?.find(entry => entry.path === ancestor)?.stamp?.ctimeNs;
+        const current = after?.find(entry => entry.path === ancestor)?.stamp?.ctimeNs;
+        console.log(JSON.stringify({ event: "native-cache-C3", ancestor, acceptedProofs, nativeProofs: proofs.count(), before, after,
+          ctimeNsChanged: prior !== undefined && current !== undefined ? prior !== current : null }));
+      } finally { proofs.restore(); keeper.close(); }
+    }
+  }, 120_000);
+
   it.each(Object.keys(opens) as (keyof typeof opens)[])("%s refuses a root with a genuine Everyone:(M) grant before creating state.db", async name => {
     const root = profileDir();
     grant(root, EVERYONE, "(OI)(CI)(M)", MODIFY);

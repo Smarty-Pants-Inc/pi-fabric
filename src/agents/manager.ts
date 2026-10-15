@@ -479,6 +479,8 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
   heldPermit?: () => void;
   /** pi-fabric#939: the worker pid and birth this manager recorded at launch; the only proof source for release. */
   ownProcess?: OwnedProcess;
+  /** Monotonic host proof about this exact actor attempt, never a status-file identity. */
+  workerGone?: boolean;
   /** pi-fabric#939 round 2: its saved answer was delivered to the spawner after an unconfirmed exit (once). */
   recoveredAnswer?: boolean;
   /** Round 3: that delivery's save succeeded; only its completed mark is left. */
@@ -3635,6 +3637,8 @@ export class AgentManager {
     const previous = this.#previousRuns.get(id);
     if (previous && !this.#runs.has(id)) return structuredClone(previous);
     const managed = this.#requireRun(id);
+    // Preserve a loss proven before stop; an intentional stop is not itself loss proof.
+    const goneBeforeStop = this.#actorWorkerGone(managed);
     // A requested stop is terminal: record the intent before any transport work
     // so recovery never restarts a run the operator, a tool, or shutdown ended.
     managed.stopRequested = true;
@@ -3654,6 +3658,9 @@ export class AgentManager {
     if (managed.settled) return consumeSettled ? this.wait(id) : this.#settledResult(managed);
     managed.background = false;
     const terminal = readRecord(managed.statusFile);
+    if (goneBeforeStop && await this.#settleGoneActorWorker(managed, terminal ?? existing) && managed.settled) {
+      return consumeSettled ? this.wait(id) : this.#settledResult(managed);
+    }
     // A force-killed worker (notably on Windows) may leave only running status.
     // Its session telemetry can be newer than the monitor's last poll. Preserve
     // that snapshot, or the pre-stop one if stopping removed the status file,
@@ -4510,6 +4517,7 @@ export class AgentManager {
     deadline: number,
   ): Promise<boolean> {
     if (
+      this.#actorWorkerGone(managed) ||
       managed.launch.workerArguments.includes("--judgment") ||
       managed.transport.relaunchable === false ||
       managed.hosted ||
@@ -4565,6 +4573,7 @@ export class AgentManager {
     deadline: number,
   ): Promise<boolean> {
     if (
+      this.#actorWorkerGone(managed) ||
       managed.launch.workerArguments.includes("--judgment") ||
       managed.transport.relaunchable === false ||
       // Fabric never re-prompts a hosted run, and only its own worker
@@ -4628,7 +4637,7 @@ export class AgentManager {
     deadline = Infinity,
   ): Promise<boolean> {
     try {
-      const cancelled = () => managed.settled || this.#closing || managed.stopRequested || managed.abandoned || Date.now() >= deadline;
+      const cancelled = () => this.#actorWorkerGone(managed) || managed.settled || this.#closing || managed.stopRequested || managed.abandoned || Date.now() >= deadline;
       while (this.#releasePaused) await this.#waitForRelease(managed.abortSignal);
       if (cancelled()) return false;
       if (managed.runner === "pi" || managed.runner === "pi-durable") {
@@ -4924,6 +4933,48 @@ export class AgentManager {
     this.#terminalNoticeOutbox.route(managed.runDirectory);
   }
 
+  #actorWorkerGone(managed: ManagedAgent): boolean {
+    if (!managed.actorId || managed.hosted || managed.transport.kind !== "process") return false;
+    if (managed.workerGone) return true;
+    const identity = this.#workerIdentities.get(managed.transport);
+    if (!identity || !Number.isSafeInteger(identity.pid) || identity.pid <= 1 || identity.pid === process.pid) return false;
+    try { process.kill(identity.pid, 0); }
+    catch (error) {
+      // EPERM and every other probe error are unknown, not permission to compare births.
+      if ((error as NodeJS.ErrnoException).code === "ESRCH") managed.workerGone = true;
+      return managed.workerGone === true;
+    }
+    const current = processStartTime(identity.pid);
+    if (identity.startTime?.trim() && current?.trim() && current !== identity.startTime) managed.workerGone = true;
+    return managed.workerGone === true;
+  }
+
+  /** A leader's death forbids replay, but never substitutes for the whole native/tree join. */
+  async #settleGoneActorWorker(managed: ManagedAgent, record: AgentRunRecord | undefined): Promise<boolean> {
+    if ((managed.stopRequested && !managed.workerGone) || !this.#actorWorkerGone(managed)) return false;
+    // Preserve genuine terminal results; only missing/recoverable transport outcomes become loss.
+    const terminalResult = (candidate: AgentRunRecord | undefined): boolean =>
+      candidate !== undefined && terminalStatuses.has(candidate.status) &&
+        (candidate.status === "completed" || candidate.errorCode === "CONTEXT_OVERFLOW" ||
+          (!recoverableStop(candidate) && !transportExitedWithoutResult(candidate.error) && !retryablePiStartupError(candidate.error)));
+    if (terminalResult(record)) return false;
+    // Failure retains custody and the permit; the existing monitor retries the join.
+    try { await this.#drainExecution(managed); }
+    catch { return true; }
+    if (!managed.executionExited) return true;
+    // Final publication may race the join. Do not replace a committed success (or
+    // genuine worker failure) with the earlier running/missing snapshot's loss.
+    const joined = readRecord(managed.statusFile);
+    const result = joined && terminalResult(joined)
+      ? this.#withTransportMetadata(joined, managed) as AgentRunResult
+      : { ...failedRecord(managed, "failed", "Actor worker is proven gone; execution was lost and will not be automatically relaunched"),
+        startedAt: joined?.startedAt ?? record?.startedAt ?? Date.now() };
+    if (!terminalResult(joined)) writeRecord(managed.statusFile, result);
+    await this.#captureWorktree(managed);
+    this.#settle(managed, result);
+    return true;
+  }
+
   async #monitor(managed: ManagedAgent, timeoutMs: number): Promise<void> {
     const deadline = Date.now() + timeoutMs + TRANSPORT_EXIT_GRACE_MS;
     let firstObservedDeadAt: number | undefined;
@@ -4970,6 +5021,11 @@ export class AgentManager {
           this.#invalidateUiList();
         }
       }
+      if (await this.#settleGoneActorWorker(managed, record)) {
+        if (managed.settled) return;
+        await delay(AGENT_STATUS_POLL_INTERVAL_MS);
+        continue;
+      }
       if (managed.recursive) this.#nestedAgents(managed);
       if (record?.runnerSessionId) {
         managed.runnerSessionId = record.runnerSessionId;
@@ -4981,6 +5037,11 @@ export class AgentManager {
         if (await this.#resumeStopped(managed, record, deadline)) continue;
         // A relaunch that failed is terminal: no fallback launch may run after it.
         if (!managed.relaunchFailure && await this.#retryStartup(managed, record, deadline)) continue;
+        if (await this.#settleGoneActorWorker(managed, record)) {
+          if (managed.settled) return;
+          await delay(AGENT_STATUS_POLL_INTERVAL_MS);
+          continue;
+        }
         // Terminal publication may precede a worker's final native-session flush.
         // Give normal process exit a bounded observation window before stop():
         // on Windows SIGTERM is destructive, not a cooperative flush request.
@@ -5085,6 +5146,11 @@ export class AgentManager {
                 ? `Agent transport exited without a result; ${diagnostic}`
                 : "Agent transport exited without a result",
             );
+            if (await this.#settleGoneActorWorker(managed, failed)) {
+              if (managed.settled) return;
+              await delay(AGENT_STATUS_POLL_INTERVAL_MS);
+              continue;
+            }
             if (await this.#resumeStopped(managed, failed, deadline)) continue;
             if (!managed.relaunchFailure && await this.#retryStartup(managed, failed, deadline)) {
               managed.lastRetriedTransportFailure = failed;

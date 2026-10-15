@@ -354,11 +354,20 @@ const agentMessageBlock = (item: HeldAgentMessage, delivery: FabricMainAgentDeli
   "</fabric-agent-message>",
 ].filter((line): line is string => Boolean(line)).join("\n");
 
-const itemBytes = (item: HeldAgentMessage): number =>
-  Buffer.byteLength(item.message) + (item.data === undefined ? 0 : Buffer.byteLength(JSON.stringify(item.data))) +
-  (item.deliveryId === undefined ? 0 : Buffer.byteLength(JSON.stringify(item.deliveryId))) +
-  (item.supersedes === undefined ? 0 : Buffer.byteLength(JSON.stringify(item.supersedes))) +
-  (item.inboxReceipts === undefined ? 0 : Buffer.byteLength(JSON.stringify(item.inboxReceipts)));
+/** Preserve explicit data; otherwise carry the admitted event's work claim at native handoff. */
+const nativeItemData = (item: HeldAgentMessage): unknown =>
+  item.data === undefined && item.inboxKey !== undefined
+    ? { key: item.inboxKey, topic: item.inboxTopic } : item.data;
+
+const itemBytes = (item: HeldAgentMessage): number => {
+  const data = nativeItemData(item);
+  return Buffer.byteLength(item.message) + (data === undefined ? 0 : Buffer.byteLength(JSON.stringify(data))) +
+    // The retained key and native data are separate serialized representations: charge both.
+    (item.inboxKey === undefined ? 0 : Buffer.byteLength(JSON.stringify(item.inboxKey))) +
+    (item.deliveryId === undefined ? 0 : Buffer.byteLength(JSON.stringify(item.deliveryId))) +
+    (item.supersedes === undefined ? 0 : Buffer.byteLength(JSON.stringify(item.supersedes))) +
+    (item.inboxReceipts === undefined ? 0 : Buffer.byteLength(JSON.stringify(item.inboxReceipts)));
+};
 
 type SessionEntryLike = { id?: unknown; parentId?: unknown; type?: string; customType?: string; details?: { id?: unknown; items?: unknown } };
 
@@ -2047,10 +2056,8 @@ export class MainAgentController implements FabricMainAgentTarget {
     const delivery: FabricMainAgentDelivery = flushed ? "followUp" : deliverAs;
     const blocks = items.map((item) => agentMessageBlock(item, delivery));
     const itemDetails = (item: HeldAgentMessage) => {
-      // Preserve explicit native data claims. When there is no payload, carry the admitted
-      // event's work claim in the existing session-reader shape, outside the startup graph.
-      const data = item.data === undefined && item.inboxKey !== undefined
-        ? { key: item.inboxKey, topic: item.inboxTopic } : item.data;
+      // Use the same native shape admission charged, including synthesized work claims.
+      const data = nativeItemData(item);
       return {
         id: item.id,
         from: item.from,

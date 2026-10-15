@@ -20,7 +20,7 @@ import { isWatchLimitError } from "../core/watch-fallback.js";
 import { DegradedObservation } from "../core/observation-watch.js";
 import { watchBridgeStore } from "../mesh/change-notifier.js";
 import type { FabricMessageSender } from "../protocol.js";
-import { eventReceipts, workKey } from "./root-inbox-shared.js";
+import { eventReceipts } from "./root-inbox-shared.js";
 
 const CONTROL_TOPIC = "fabric.control.command";
 const ACK_TOPIC = "fabric.control.ack";
@@ -318,15 +318,16 @@ const commandFromEvent = (event: MeshEvent): FabricControlCommand | undefined =>
   }
   // Sender diagnostics are never evidence. Derive only from the admitted envelope.
   // A sender stamp is host-set on the event; a payload-supplied one is forged and dropped.
-  const { sender: _forged, inboxTopic: _topic, inboxKey: _key, inboxReceipts: _receipts, ...command } = data;
+  // Work claims belong in typed nested data, never an unknown outer command key.
+  const { sender: _forged, inboxTopic: _topic, inboxKey: _key, inboxReceipts: _receipts, key: _workKey, ...command } = data;
   const wakeCause = data.operation === "steer" || data.operation === "followUp"
     ? fabricWakeCause(event.from, data.operation, event.topic, event.id) : undefined;
-  const inboxKey = workKey(event.data);
   return withFabricWakeAdmission({ ...command, eventId: event.id,
     ...(wakeCause ? {
       inboxTopic: event.topic,
-      ...(inboxKey ? { inboxKey } : {}),
-      inboxReceipts: eventReceipts(event),
+      // Keep authenticated event/dedupe receipts, not raw outer key/ref/id work claims.
+      // Explicit nested data remains intact for the native carrier's own work claims.
+      inboxReceipts: eventReceipts({ ...event, data: undefined }),
     } : {}),
     wakeCause, principal: event.verification === "mesh" || event.verification === "bridge"
     ? copyFabricPrincipal(event.principal) : undefined, ...(event.sender ? { sender: event.sender } : {}) } as unknown as FabricControlCommand, wakeCause ? [wakeCause] : []);

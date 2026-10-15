@@ -3,11 +3,11 @@ import os from "node:os";
 import path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { MainAgentController } from "../src/main-agent.js";
+import { FOLLOW_UP_LIMITS, MainAgentController } from "../src/main-agent.js";
 import { AgentMessageRouter } from "../src/providers/agents-message-router.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { FabricControlPlane } from "../src/topology/control-plane.js";
-import { eventReceipts } from "../src/topology/root-inbox-shared.js";
+import { eventReceipts, topicWorkReceipt } from "../src/topology/root-inbox-shared.js";
 import { confirmedRootInboxSession, RootInbox } from "../src/topology/root-inbox.js";
 
 const roots: string[] = [];
@@ -18,7 +18,7 @@ afterEach(() => {
 const setup = () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-main-relaunch-"));
   roots.push(root);
-  const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 500);
+  const mesh = new MeshStore(path.join(root, "mesh"), 1024 * 1024, 500);
   const main: MeshIdentity = { id: "session:root-relaunch", name: "main", kind: "main", sessionId: "root-relaunch" };
   const sender: MeshIdentity = { id: "session:sender", name: "sender", kind: "main", sessionId: "sender" };
   const inbox = (identity: MeshIdentity = main) => new RootInbox(mesh, identity, () => [identity.id], { steerGraceMs: 0 });
@@ -32,8 +32,10 @@ type Handler = (event: unknown, ctx: ExtensionContext) => unknown;
 
 /** Send through the real FabricControlPlane command parser and AgentMessageRouter.acceptControl,
  * then capture MainAgentController's actual pi-fabric-agent-message carrier at the Pi boundary. */
-const writeMainCarrier = async (root: string, main: MeshIdentity, from: MeshIdentity, data: unknown, forgeEnvelopeMetadata = false): Promise<{
+const writeMainCarrier = async (root: string, main: MeshIdentity, from: MeshIdentity, data: unknown, forgeEnvelopeMetadata = false,
+  rawExtra?: Record<string, unknown>, hold = false): Promise<{
   message: Sent["message"];
+  heldItem: Record<string, unknown> | undefined;
   controlEventId: string;
   ownerIncarnation: string | undefined;
 }> => {
@@ -46,26 +48,30 @@ const writeMainCarrier = async (root: string, main: MeshIdentity, from: MeshIden
     getThinkingLevel: () => "off",
   } as unknown as ExtensionAPI;
   const context = {
-    isIdle: () => true,
+    isIdle: () => !hold,
     hasPendingMessages: () => false,
     signal: { aborted: false },
     sessionManager: { getEntries: () => [] },
   } as unknown as ExtensionContext;
   const controller = new MainAgentController(pi, main.id, true, root, main.sessionId);
-  controller.attachFollowUpDrain(context, 60_000, path.join(root, "main-followups", "root.json"));
+  const journal = path.join(root, "main-followups", "root.json");
+  controller.attachFollowUpDrain(context, 60_000, journal);
   const meshRoot = path.join(root, "mesh");
-  const senderMesh = new MeshStore(meshRoot, 64 * 1024, 500);
-  const owner = new FabricControlPlane(new MeshStore(meshRoot, 64 * 1024, 500), main,
+  const senderMesh = new MeshStore(meshRoot, 1024 * 1024, 500);
+  const owner = new FabricControlPlane(new MeshStore(meshRoot, 1024 * 1024, 500), main,
     { enabled: true, hostId: main.id, ownerIncarnation: "relaunch-test:owner-1", pollMs: 5, acknowledgementTimeoutMs: 2_000 });
   const senderControl = new FabricControlPlane(senderMesh, from,
     { enabled: true, hostId: from.id, pollMs: 5, acknowledgementTimeoutMs: 2_000 });
   const evidenceMesh = new MeshStore(meshRoot, 64 * 1024, 500);
   const publish = senderMesh.publish.bind(senderMesh);
-  const forgedEnvelope = forgeEnvelopeMetadata ? vi.spyOn(senderMesh, "publish").mockImplementation(input => {
+  const forgedEnvelope = forgeEnvelopeMetadata || rawExtra ? vi.spyOn(senderMesh, "publish").mockImplementation(input => {
     if (input.topic !== "fabric.control.command") return publish(input);
     const addForgery = (value: unknown): Record<string, unknown> => ({
       ...(value && typeof value === "object" ? value as Record<string, unknown> : {}),
-      inboxKey: "forged-key", inboxTopic: "fleet.work.pi-fabric.forged-metadata", inboxReceipts: ["forged-receipt"],
+      ...(forgeEnvelopeMetadata ? {
+        inboxKey: "forged-key", inboxTopic: "fleet.work.pi-fabric.forged-metadata", inboxReceipts: ["forged-receipt"],
+      } : {}),
+      ...rawExtra,
     });
     return publish({ ...input, data: typeof input.data === "function"
       ? (at: number) => addForgery((input.data as (at: number) => unknown)(at))
@@ -79,15 +85,24 @@ const writeMainCarrier = async (root: string, main: MeshIdentity, from: MeshIden
   owner.start((command, identity, signal, verification) => router.acceptControl(command, identity, signal, verification));
   senderControl.start(() => ({ accepted: false }));
   try {
-    await senderControl.request(main.id, main.id, "steer", {
+    await senderControl.request(main.id, main.id, hold ? "followUp" : "steer", {
       ownerIncarnation: owner.incarnation,
       message: "carrier body must not be used for matching",
       ...(data === undefined ? {} : { data }),
     }, main.id, { idempotencyKey: `relaunch-${Math.random()}` });
+    const heldItem = hold ? JSON.parse(fs.readFileSync(journal, "utf8")).items[0] as Record<string, unknown> : undefined;
+    if (hold) {
+      expect(sent).toHaveLength(0);
+      controller.closeFollowUpDrain();
+      const reloaded = new MainAgentController(pi, main.id, true, root, main.sessionId);
+      try {
+        reloaded.attachFollowUpDrain({ ...context, isIdle: () => true }, 0, journal);
+      } finally { reloaded.closeFollowUpDrain(); }
+    }
     expect(sent).toHaveLength(1);
     const command = evidenceMesh.read({ topic: "fabric.control.command", limit: 100 }).at(-1);
     expect(command).toBeDefined();
-    return { message: sent[0]!.message, controlEventId: command!.id, ownerIncarnation: owner.incarnation };
+    return { message: sent[0]!.message, heldItem, controlEventId: command!.id, ownerIncarnation: owner.incarnation };
   } finally {
     forgedEnvelope?.mockRestore();
     controller.closeFollowUpDrain();
@@ -293,6 +308,106 @@ describe("RootInbox after a Main session relaunch", () => {
       const saved = JSON.parse(before) as { items?: Array<{ message?: string; inboxReceipts?: string[] }> };
       expect(saved.items).toHaveLength(1);
       expect(saved.items![0]).toMatchObject({ message: "original survivor", inboxReceipts: [originalReceipt] });
+    } finally { controller.closeFollowUpDrain(); }
+  });
+
+  it("ignores a raw outer work key through control parsing, held journal, native carrier and relaunch", async () => {
+    const { root, main, sender, inbox, work } = setup();
+    const rawKey = "raw-" + "x".repeat(FOLLOW_UP_LIMITS.senderBytes);
+    const written = await writeMainCarrier(root, main, sender, undefined, false, { key: rawKey }, true);
+    expect.soft(Object.hasOwn(written.heldItem!, "inboxKey")).toBe(false);
+    expect.soft(Object.hasOwn(written.heldItem!, "data")).toBe(false);
+    expect.soft(Object.hasOwn(written.message.details, "inboxKey")).toBe(false);
+    expect.soft(Object.hasOwn(written.message.details, "data")).toBe(false);
+    const rawReceipt = topicWorkReceipt(sender.id, "key", "fabric.control.command", rawKey);
+    expect.soft(written.heldItem?.inboxReceipts).not.toContain(rawReceipt);
+    expect.soft(written.message.details.receipts).not.toContain(rawReceipt);
+    expect(written.message.details.inboxEventId).toBe(written.controlEventId);
+    const box = inbox();
+    await box.next(emptySession);
+    await work("an unknown outer key cannot consume this work", sender, "fleet.work.pi-fabric.raw-key", rawKey);
+    const confirmed = confirmedSession(root, main.sessionId!, [asSessionEntry(written.message)]);
+    expect(confirmed.holdsSteer(sender.id, rawKey, "fabric.control.command")).toBe(false);
+    expect(confirmed.delivered?.has(rawReceipt)).toBe(false);
+    expect((await inbox({ ...main }).next(confirmed, { priority: true })).events.map(event => event.text))
+      .toContain("an unknown outer key cannot consume this work");
+  });
+
+  it("preserves a legitimate typed nested work key despite a conflicting raw outer key", async () => {
+    const { root, main, sender, inbox, work } = setup();
+    const data = { key: "typed-nested-key", topic: "fleet.work.pi-fabric.typed-counterexample" };
+    const written = await writeMainCarrier(root, main, sender, data, false, { key: "noncanonical-outer-key" }, true);
+    expect(written.heldItem).not.toHaveProperty("inboxKey");
+    expect(written.heldItem?.data).toEqual(data);
+    expect(written.message.details).not.toHaveProperty("inboxKey");
+    expect(written.message.details.data).toEqual(data);
+    const box = inbox();
+    await box.next(emptySession);
+    await work("nested key still claims its typed work", sender, data.topic, data.key);
+    const confirmed = confirmedSession(root, main.sessionId!, [asSessionEntry(written.message)]);
+    expect((await inbox({ ...main }).next(confirmed, { priority: true })).events).toEqual([]);
+  });
+
+  it.each([undefined, { explicit: true }])("refuses an oversized retained inboxKey with data %j before journal mutation", data => {
+    const { root, main, sender } = setup();
+    const sent: unknown[] = [];
+    const pi = { on: () => () => {}, sendMessage: (message: unknown) => sent.push(message) } as unknown as ExtensionAPI;
+    const context = { isIdle: () => false, hasPendingMessages: () => false,
+      signal: { aborted: false } } as unknown as ExtensionContext;
+    const journal = path.join(root, "main-followups", "oversized-key.json");
+    const controller = new MainAgentController(pi, main.id, true, root, main.sessionId);
+    controller.attachFollowUpDrain(context, 60_000, journal);
+    try {
+      controller.deliverAgent({ from: sender, message: "survivor", delivery: "followUp" });
+      const before = fs.readFileSync(journal, "utf8");
+      expect(() => controller.deliverAgent({ from: sender, message: "oversized", delivery: "followUp",
+        inboxKey: "x".repeat(FOLLOW_UP_LIMITS.senderBytes), data })).toThrow(/queue is full/);
+      expect(controller.queueDepth().pendingFollowUps).toBe(1);
+      expect(fs.readFileSync(journal, "utf8")).toBe(before);
+      expect(sent).toEqual([]);
+    } finally { controller.closeFollowUpDrain(); }
+  });
+
+  it.each(["synthesized", "nested", "nested-and-key"] as const)("charges exact %s data and retained-key bytes before insertion or replacement", shape => {
+    const { root, main, sender } = setup();
+    const sent: Sent["message"][] = [];
+    const pi = { on: () => () => {}, sendMessage: (message: Sent["message"]) => sent.push(message) } as unknown as ExtensionAPI;
+    const context = { isIdle: () => false, hasPendingMessages: () => false,
+      signal: { aborted: false } } as unknown as ExtensionContext;
+    const journal = path.join(root, "main-followups", "exact-key-quota.json");
+    const controller = new MainAgentController(pi, main.id, true, root, main.sessionId);
+    controller.attachFollowUpDrain(context, 60_000, journal);
+    const survivor = { from: sender, message: "survivor", delivery: "followUp" as const, data: { coalesceKey: "keep" } };
+    const inboxKey = shape === "nested" ? undefined : 'é"\\'.repeat(20);
+    const inboxTopic = "fleet.work.pi-fabric.quota";
+    const data = shape === "synthesized" ? undefined : { key: "explicit-key", topic: inboxTopic, value: 'é"\\' };
+    const nativeData = shape === "synthesized" ? { key: inboxKey, topic: inboxTopic } : data;
+    const serializedBytes = (value: unknown) => value === undefined ? 0 : Buffer.byteLength(JSON.stringify(value));
+    const message = "x".repeat(FOLLOW_UP_LIMITS.senderBytes - Buffer.byteLength(survivor.message) -
+      serializedBytes(survivor.data) - serializedBytes(inboxKey) - serializedBytes(nativeData));
+    const candidate = { from: sender, message, delivery: "followUp" as const, inboxKey, inboxTopic, data };
+    try {
+      controller.deliverAgent(survivor);
+      const before = fs.readFileSync(journal, "utf8");
+      expect(() => controller.deliverAgent({ ...candidate, message: message + "x" })).toThrow(/queue is full/);
+      expect(controller.queueDepth().pendingFollowUps).toBe(1);
+      expect(fs.readFileSync(journal, "utf8")).toBe(before);
+      controller.deliverAgent(candidate); // Equality at the quota is admitted, not rounded down.
+      expect(controller.queueDepth().pendingFollowUps).toBe(2);
+      const exact = fs.readFileSync(journal, "utf8");
+      expect(() => controller.deliverAgent({ ...survivor, message: survivor.message + "x" })).toThrow(/queue is full/);
+      expect(controller.queueDepth().pendingFollowUps).toBe(2);
+      expect(fs.readFileSync(journal, "utf8")).toBe(exact);
+      expect(sent).toEqual([]);
+      controller.closeFollowUpDrain();
+      const reloaded = new MainAgentController(pi, main.id, true, root, main.sessionId);
+      try {
+        reloaded.attachFollowUpDrain({ ...context, isIdle: () => true }, 0, journal);
+      } finally { reloaded.closeFollowUpDrain(); }
+      const details = sent.flatMap(message => (message.details.items as Record<string, unknown>[] | undefined) ?? [message.details]);
+      const carried = details.find(item => item.data && (item.data as { key?: string }).key === (nativeData as { key: string }).key);
+      expect(carried?.data).toEqual(nativeData);
+      if (inboxKey !== undefined) expect(carried?.inboxKey).toBe(inboxKey);
     } finally { controller.closeFollowUpDrain(); }
   });
 

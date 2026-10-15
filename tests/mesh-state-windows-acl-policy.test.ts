@@ -18,6 +18,9 @@ const CREATOR_OWNER = "S-1-3-0";
 const FULL = 0x1f01ff;
 const MODIFY = 0x1301bf;
 const READ_EXECUTE = 0x1200a9;
+const FOREIGN_READ = 0x120089;
+const METADATA_ONLY = 0x00120080;
+const GENERIC_READ = 0x80000000;
 const ADD_SUBDIR = 0x4;
 const DIR = 0x10;
 
@@ -61,6 +64,19 @@ const judge = (entries: Entry[], input: Partial<WindowsStateAclRequest> = {}, ex
   windowsStateAclRefusal({ ...request, ...input }, runner(entries, extra).run);
 const withEntry = (index: number, change: Entry): Entry[] =>
   defaultEntries().map((entry, at) => (at === index ? { ...entry, ...change } : entry));
+const strictTargets = ["mesh root", "state-checkpoint.flags", "state.db", "state.db-wal", "state.db-shm", "state.db-journal"] as const;
+const strictRefusal = (target: typeof strictTargets[number], ace: Ace): string | undefined => {
+  const dacl = [...profileDacl(), ace];
+  if (target === "mesh root") return judge(withEntry(0, { dacl }));
+  if (target === "state-checkpoint.flags") {
+    const flags = dir("C:\\Users\\me\\.pi\\mesh\\state-checkpoint.flags", USER, dacl);
+    return judge(defaultEntries().map((entry, at) => (at === 5 ? flags : entry)));
+  }
+  if (target === "state.db") return judge(withEntry(6, { dacl }));
+  const file = `${request.root}\\${target}`;
+  return judge([...defaultEntries(), { path: file, attributes: 0x20, owner: USER, control: 0x8404, dacl }],
+    { files: [...request.files, file] });
+};
 
 describe("Windows mesh state ACL policy (smarty-dev#8920)", () => {
   afterEach(() => vi.restoreAllMocks());
@@ -97,7 +113,35 @@ describe("Windows mesh state ACL policy (smarty-dev#8920)", () => {
 
   it("refuses a root with an Everyone:(M) grant, also beside a deny ACE", () => {
     const dacl = [...profileDacl(), { type: 1, flags: 0, sid: EVERYONE, mask: FULL }, allow(EVERYONE, MODIFY)];
-    expect(judge(withEntry(0, { dacl }))).toMatch(/grants S-1-1-0 write, delete or permission rights/);
+    expect(judge(withEntry(0, { dacl }))).toMatch(/grants S-1-1-0 (?:read, )?write, delete or permission rights/);
+  });
+
+  it("refuses untrusted data-reading ACEs on every strict target and names read access in the refusal", () => {
+    const readAces = [
+      allow(EVERYONE, FOREIGN_READ, 0),
+      allow(USERS, GENERIC_READ, 0),
+      allow(EVERYONE, FOREIGN_READ, 0xb), // inherit-only still reaches state files and the flag directory
+    ];
+    const refusals = strictTargets.flatMap(target => readAces.map(ace => strictRefusal(target, ace)));
+    expect(refusals).toEqual(strictTargets.flatMap(() => readAces.map(() => expect.stringMatching(/read/i))));
+  });
+
+  it("allows metadata-only reads on strict targets and leaves trusted full-control grants unchanged", () => {
+    expect(strictTargets.map(target => strictRefusal(target, allow(EVERYONE, METADATA_ONLY, 0))))
+      .toEqual(strictTargets.map(() => undefined));
+    const trustedAces = [USER, SYSTEM, ADMINS, TRUSTED_INSTALLER].map(sid => allow(sid, FULL, 0xb));
+    for (const target of strictTargets) {
+      expect(trustedAces.map(ace => strictRefusal(target, ace)), target).toEqual(trustedAces.map(() => undefined));
+    }
+  });
+
+  it("keeps foreign read grants permitted on ordinary ancestors and the immediate creation parent", () => {
+    expect(judge(withEntry(1, { dacl: [...profileDacl(), allow(EVERYONE, FOREIGN_READ, 0)] }))).toBeUndefined();
+    const parent = "C:\\Users\\me\\.pi";
+    const creationParent: WindowsStateAclRequest = { root: parent, real: parent, role: "creation-parent", files: [], directories: [] };
+    expect(windowsStateAclRefusal(creationParent, runner([
+      dir(parent, USER, [...profileDacl(), allow(EVERYONE, FOREIGN_READ, 0)]), ...defaultEntries().slice(2, 5),
+    ]).run)).toBeUndefined();
   });
 
   it("refuses a state file a foreign user may write, delete or re-ACL", () => {
@@ -219,6 +263,11 @@ describe("Windows mesh state ACL policy (smarty-dev#8920)", () => {
     expect(judge([...head, { path: files[1], error: "Attempted to perform an unauthorized operation." }], { files }))
       .toMatch(/state\.db-wal has an unreadable Windows security descriptor/);
     expect(judge([...head, { path: files[1], missing: true }], { files })).toBeUndefined();
+  });
+
+  it("allows an absent state.db-journal sidecar", () => {
+    const journal = `${request.root}\\state.db-journal`;
+    expect(judge([...defaultEntries(), { path: journal, missing: true }], { files: [...request.files, journal] })).toBeUndefined();
   });
 
   it("refuses an existing flag directory a foreign user may write", () => {
@@ -348,7 +397,7 @@ describe("state gate wiring on win32 (smarty-dev#8920)", () => {
       gate.createStateRoot(root); // exists now: never re-protected
       expect(calls.map(call => call.protect)).toEqual([false, true]);
       expect(calls[0]).toMatchObject({ root: path.dirname(root), role: "creation-parent", files: [], directories: [] });
-      expect(calls[1]!.files.map(file => path.basename(file))).toEqual(["state.db", "state.db-wal", "state.db-shm"]);
+      expect(calls[1]!.files.map(file => path.basename(file))).toEqual(["state.db", "state.db-wal", "state.db-shm", "state.db-journal"]);
       expect(calls[1]!.directories.map(dir => path.basename(dir))).toEqual(["state-checkpoint.flags"]);
     });
   });
@@ -427,7 +476,7 @@ describe("state gate wiring on win32 (smarty-dev#8920)", () => {
     expect(calls).toHaveLength(2); // one per open, never cached
     for (const call of calls) {
       expect(call).toMatchObject({ root, protect: false });
-      expect(call.files).toEqual([file, `${file}-wal`, `${file}-shm`]);
+      expect(call.files).toEqual([file, `${file}-wal`, `${file}-shm`, `${file}-journal`]);
       expect(call.directories).toEqual([path.join(root, "state-checkpoint.flags")]);
     }
   });

@@ -22,6 +22,8 @@ const ADMINISTRATORS = "S-1-5-32-544";
 const TRUSTED_INSTALLER = "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464";
 const FULL = 0x1f01ff;
 const MODIFY = 0x301bf;
+const EVERYONE_READ = 0x120089;
+const DATA_READ_BITS = 0x90000001;
 const UNSUPPORTED = { code: "FABRIC_MESH_STATE_UNSUPPORTED" };
 
 const created: string[] = [];
@@ -84,6 +86,29 @@ describe.runIf(process.env.GITHUB_ACTIONS === "true" && process.platform === "wi
       expect(await refusal(() => openAsync(root))).toMatchObject(UNSUPPORTED);
       expect(fs.existsSync(path.join(root, "state.db"))).toBe(false);
     }, 120_000);
+
+  it("refuses a real state.db with a verified Everyone (R) data-read grant for async and sync SQLite opens", async () => {
+    const root = profileDir();
+    await roundTrip(await openAsync(root));
+    const file = path.join(root, "state.db");
+    grant(file, EVERYONE, "(R)", EVERYONE_READ);
+    const everyone = readAcl(file).rules.filter(rule => rule.sid === EVERYONE && !rule.inherited && rule.type === "Allow");
+    expect(everyone.some(rule => (rule.rights & EVERYONE_READ) === EVERYONE_READ), readAcl(file).sddl).toBe(true);
+    expect(icaclsShow(file)).toMatch(/Everyone:\(R\)/);
+    expect(await refusal(() => openAsync(root))).toMatchObject(UNSUPPORTED);
+    expect(await refusal(() => openSync(root))).toMatchObject(UNSUPPORTED);
+  }, 120_000);
+
+  it.each(["state.db-wal", "state.db-shm", "state.db-journal"])("refuses an existing %s with a verified Everyone (R) data-read grant", async file => {
+    const root = profileDir();
+    await roundTrip(await openAsync(root));
+    const target = path.join(root, file);
+    if (!fs.existsSync(target)) fs.writeFileSync(target, "");
+    grant(target, EVERYONE, "(R)", EVERYONE_READ);
+    expect(icaclsShow(target)).toMatch(/Everyone:\(R\)/);
+    expect(await refusal(() => openAsync(root))).toMatchObject(UNSUPPORTED);
+    expect(await refusal(() => openSync(root))).toMatchObject(UNSUPPORTED);
+  }, 120_000);
 
   it("opens real node:sqlite in a clean root below the default USERPROFILE without touching its ancestors", async () => {
     const profile = os.homedir();
@@ -174,6 +199,25 @@ describe.runIf(process.env.GITHUB_ACTIONS === "true" && process.platform === "wi
     expect(fs.existsSync(file)).toBe(true);
     const everyone = readAcl(file).rules.filter(rule => rule.sid === EVERYONE && !rule.inherited && rule.type === "Allow");
     expect(everyone.some(rule => (rule.rights & MODIFY) === MODIFY), readAcl(file).sddl).toBe(true);
+  }, 120_000);
+
+  it("allows SQLite-created WAL sidecars inheriting the protected root ACL without foreign data-read", async () => {
+    const { user } = tokenSids();
+    const trusted = new Set([user, SYSTEM, ADMINISTRATORS, TRUSTED_INSTALLER]);
+    const root = path.join(profileDir(), "new-root");
+    const store = await openAsync(root);
+    try {
+      await store.put({ key: "acl/probe", value: "ok", identity: { id: "test", name: "test", kind: "agent" } });
+      for (const suffix of ["-wal", "-shm"]) {
+        const file = path.join(root, `state.db${suffix}`);
+        expect(fs.existsSync(file), file).toBe(true);
+        const acl = readAcl(file);
+        expect(acl.rules.some(rule => rule.inherited), acl.sddl).toBe(true);
+        const foreignDataReaders = acl.rules.filter(rule => rule.type === "Allow" && !trusted.has(rule.sid)
+          && (rule.rights & DATA_READ_BITS) !== 0);
+        expect(foreignDataReaders, acl.sddl).toEqual([]);
+      }
+    } finally { store.close(); }
   }, 120_000);
 
   it("allows a clean state.db created by the gate callback with real node:sqlite", () => {

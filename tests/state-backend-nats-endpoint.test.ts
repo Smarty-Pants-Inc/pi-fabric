@@ -38,14 +38,15 @@ describe("NATS endpoint path shared by the backend and the migration (pi-fabric#
     const server = fakeJetStream();
     connectJetStream.mockImplementation(async () => server.port());
     const root = await seededRoot();
-    await importMeshStateToNats(root, { ...plaintext, lookup: resolvesTo("127.0.0.2") });
+    const options = { ...plaintext, lookup: resolvesTo("127.0.0.2"), replicas: 3, placementTimeoutMs: 750 };
+    await importMeshStateToNats(root, options);
     expect(readMeshStateNatsMarker(root)).toBeDefined();
-    await openNatsStateBackend({ root, ...plaintext, lookup: resolvesTo("127.0.0.2") });
-    await rollbackMeshStateFromNats(root, { ...plaintext, lookup: resolvesTo("127.0.0.2") });
+    await openNatsStateBackend({ root, ...options });
+    await rollbackMeshStateFromNats(root, options);
     expect(connectJetStream).toHaveBeenCalledTimes(3);
     for (const [servers, options] of connectJetStream.mock.calls) {
       expect(servers).toEqual(["nats://127.0.0.2:4222"]);
-      expect(options).toMatchObject({ monitoringUrl: "http://127.0.0.2:8222/" });
+      expect(options).toMatchObject({ monitoringUrl: "http://127.0.0.2:8222/", replicas: 3, placementTimeoutMs: 750 });
     }
   });
 

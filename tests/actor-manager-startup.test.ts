@@ -220,7 +220,8 @@ describe("ActorManager bounded startup (#4250 item 4)", () => {
     canonical = false;
     snapshot.mockClear();
     expect(manager.listOwned().map((actor) => actor.id)).toContain(f.records[0]!.id);
-    expect(snapshot).toHaveBeenCalledExactlyOnceWith(false);
+    // fv2-11107: a poll names its managed ids so the host may reuse a validated poll map.
+    expect(snapshot).toHaveBeenCalledExactlyOnceWith(false, [f.records[0]!.id]);
     expect(rawOwnership).not.toHaveBeenCalled();
     snapshot.mockClear();
     expect(() => manager.tell(f.records[0]!.id, "must not be delivered")).toThrow("owned by another host");

@@ -1,3 +1,5 @@
+import { detachedPreview } from "./preview.js";
+
 const PREVIEW_ARG_CHARS = 2_000;
 const WRITE_PREVIEW_CONTENT_CHARS = 16_000;
 const PREVIEW_ARG_KEYS = 32;
@@ -36,9 +38,10 @@ export const strictDecisionResult = (
 };
 
 export const truncateString = (value: string, max: number): string =>
-  value.length <= max ? value : `${value.slice(0, max)}…`;
+  value.length <= max ? detachedPreview(value, max) : `${detachedPreview(value, max)}…`;
 
 export const boundedPreviewValue = (value: unknown, maxChars: number): unknown => {
+  if (typeof value === "string") return detachedPreview(value, value.length);
   if (value === undefined || value === null || typeof value !== "object") return value;
   try {
     const serialized = JSON.stringify(value);
@@ -46,7 +49,7 @@ export const boundedPreviewValue = (value: unknown, maxChars: number): unknown =
     return {
       fabricTruncated: true,
       originalChars: serialized.length,
-      preview: serialized.slice(0, Math.max(1, maxChars - 100)),
+      preview: detachedPreview(serialized, Math.max(1, maxChars - 100)),
     };
   } catch {
     return truncateString(String(value), maxChars);
@@ -125,7 +128,7 @@ export const boundedResult = (
     value: {
       fabricTruncated: true,
       originalChars: serialized.length,
-      preview: serialized.slice(0, previewChars),
+      preview: detachedPreview(serialized, previewChars),
     },
     chars: serialized.length,
     truncated: true,

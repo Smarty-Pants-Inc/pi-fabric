@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { verifiedRemove } from "../storage/verified-remove.js";
 
 /** A staged state temp is reclaimable only when this old (smarty-dev#6622). */
 export const ABANDONED_TEMP_MIN_AGE_MS = 60_000;
@@ -40,12 +41,15 @@ export const sweepAbandonedStateTemporaries = (
     const match = PREPARED_TEMP.exec(name);
     if (!match) continue;
     const pid = Number(match[1]);
-    if (pid === process.pid || !dead(pid)) continue;
+    if (pid === process.pid) continue;
     const file = path.join(meshRoot, name);
     try {
+      // smarty-dev#8907: this lstat is the judged stat (taken before the pid, type and age judgment); verifiedRemove
+      // removes only that inode, so a successor swapped in since stays. Off Linux: main's rmSync (#7858 fallback).
       const stat = fs.lstatSync(file);
-      if (!stat.isFile() || now - stat.mtimeMs <= minAgeMs) continue;
-      fs.rmSync(file, { force: true });
+      if (!dead(pid) || !stat.isFile() || now - stat.mtimeMs <= minAgeMs) continue;
+      if (!verifiedRemove(file, stat, { deleter: "meshAbandonedStateTemp",
+        fallback: () => { fs.rmSync(file, { force: true }); return true; } }).removed) continue;
       removed.push(name);
     } catch {
       // Renamed or removed meanwhile.

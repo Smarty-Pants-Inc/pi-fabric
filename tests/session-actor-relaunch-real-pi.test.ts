@@ -122,8 +122,20 @@ it.runIf(process.env.FABRIC_9241_REAL_PI === "1")("a same-session relaunch resta
     expect(persisted.sessionOrphan).toBeUndefined();
     // An explicitly stopped actor stays stopped; its owning Main removes it.
     await expect(exec("A", `return await agents.tell({ id: ${JSON.stringify(stopped.id)}, message: "TELL-9241-STOPPED" });`)).rejects.toThrow();
-    expect(await exec("A", `return await agents.remove({ id: ${JSON.stringify(stopped.id)} });`)).toMatchObject({ removed: true });
-    expect((await actors("A")).map(actor => actor.id)).not.toContain(stopped.id);
+    if (process.platform === "linux" || process.platform === "darwin" || process.platform === "win32") {
+      expect(await exec("A", `return await agents.remove({ id: ${JSON.stringify(stopped.id)} });`)).toMatchObject({ removed: true });
+      expect((await actors("A")).map(actor => actor.id)).not.toContain(stopped.id);
+    } else {
+      // smarty-dev#11335: only unsupported platforms lack the Main publication fence and keep removal pending.
+      const stoppedDir = path.join(mesh, "actors", sessions.A, stopped.id);
+      fs.mkdirSync(stoppedDir, { recursive: true });
+      const sentinel = path.join(stoppedDir, "kept-11335.txt");
+      fs.writeFileSync(sentinel, "stopped history\n");
+      const pending = `removal cleanup failed: Root actor tree deletion needs the Main publication fence, which this platform (${process.platform}) lacks (smarty-dev#8090); follow-up smarty-dev#11335; the root session:${sessions.A} actor tree is kept (a later remove or host start finishes it)`;
+      expect(await exec("A", `return await agents.remove({ id: ${JSON.stringify(stopped.id)} });`)).toMatchObject({ removed: true, cleaned: false, pending });
+      expect(await actors("A")).toContainEqual(expect.objectContaining({ id: stopped.id, status: "stopped", removal: expect.objectContaining({ state: pending }) }));
+      expect(fs.readFileSync(sentinel, "utf8")).toBe("stopped history\n");
+    }
     outcome = { passed: true, session: sessions.A, supervisor: supervisor.id, orphaned: orphaned.sessionOrphan,
       relaunched: after[supervisor.id]?.status, explicit: after[stopped.id]?.stopReason, cli: fs.realpathSync(cli) };
   } finally {

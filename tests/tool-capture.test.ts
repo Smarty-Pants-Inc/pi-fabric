@@ -458,6 +458,25 @@ describe("registered extension tool capture", () => {
     }
   });
 
+  it("captures the pinned durable worker SDK through the same validated host registration", async () => {
+    const { ExtensionRunner: WorkerRunner } = await import("pi-fabric-worker-sdk");
+    const registry = globalThis as Record<PropertyKey, unknown>;
+    Object.defineProperty(registry, HOST_EXTENSION_RUNNER_SYMBOL, { value: WorkerRunner, configurable: true });
+    try {
+      const fabricTool = tool("fabric_exec");
+      const catalog = new CapturedToolCatalog();
+      controllers.push(await installRegisteredToolCapture({ anchorDefinition: fabricTool, catalog }));
+      const runner = Object.create(WorkerRunner.prototype) as ExtensionRunner;
+      (runner as unknown as { extensions: Array<{ tools: Map<string, RegisteredTool> }> }).extensions = [{ tools: new Map([
+        ["fabric_exec", registered(fabricTool, "/extensions/pi-fabric/index.ts")],
+        ["box_list", registered(tool("box_list"), "/extensions/pi-box/index.ts")],
+      ]) }];
+      runner.getAllRegisteredTools();
+      expect(catalog.runner).toBe(runner);
+      expect(catalog.list().map(entry => entry.name)).toEqual(["box_list"]);
+    } finally { delete registry[HOST_EXTENSION_RUNNER_SYMBOL]; }
+  });
+
   it.each([
     ["a plain object", { getAllRegisteredTools() { return []; } }, /not a constructor/],
     ["a class without the emit methods", class { getAllRegisteredTools() { return []; } },
@@ -485,5 +504,60 @@ describe("registered extension tool capture", () => {
     } finally {
       delete registry[HOST_EXTENSION_RUNNER_SYMBOL];
     }
+  });
+
+  describe("in a running Pi CLI", () => {
+    const hostRoot = path.dirname(path.dirname(fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent"))));
+    const bundledRunner = async () => ((await import(
+      pathToFileURL(path.join(hostRoot, "dist", "bundle", "index.js")).href
+    )) as { ExtensionRunner: typeof ExtensionRunner }).ExtensionRunner;
+    const asCli = async (cli: string, run: () => Promise<void>) => {
+      const savedArgv1 = process.argv[1]!;
+      const savedRoot = process.env.PI_PACKAGE_DIR;
+      process.argv[1] = cli;
+      delete process.env.PI_PACKAGE_DIR;
+      try {
+        await run();
+      } finally {
+        process.argv[1] = savedArgv1;
+        if (savedRoot === undefined) delete process.env.PI_PACKAGE_DIR;
+        else process.env.PI_PACKAGE_DIR = savedRoot;
+      }
+    };
+    const install = async () => {
+      const controller = await installRegisteredToolCapture({ anchorDefinition: tool("fabric_exec"), catalog: new CapturedToolCatalog() });
+      controllers.push(controller);
+      return controller;
+    };
+
+    it("patches only the bundle's runner in the bundled CLI, via its SDK entry", async () => {
+      // Pi's published bin is dist/bundle/cli.js. Its live runner is the bundle
+      // class; patching the unbundled dist/index.js copy as well meant
+      // evaluating that whole second SDK (and compile-caching it on exit).
+      const Bundled = await bundledRunner();
+      expect(Bundled).not.toBe(ExtensionRunner);
+      const bundledOriginal = Bundled.prototype.getAllRegisteredTools;
+      const unbundledOriginal = ExtensionRunner.prototype.getAllRegisteredTools;
+      await asCli(path.join(hostRoot, "dist", "bundle", "cli.js"), async () => {
+        const controller = await install();
+        expect(Bundled.prototype.getAllRegisteredTools).not.toBe(bundledOriginal);
+        expect(ExtensionRunner.prototype.getAllRegisteredTools).toBe(unbundledOriginal);
+        controller.dispose();
+        expect(Bundled.prototype.getAllRegisteredTools).toBe(bundledOriginal);
+      });
+    });
+
+    it("patches only the unbundled runner in the unbundled CLI", async () => {
+      const Bundled = await bundledRunner();
+      const bundledOriginal = Bundled.prototype.getAllRegisteredTools;
+      const unbundledOriginal = ExtensionRunner.prototype.getAllRegisteredTools;
+      await asCli(path.join(hostRoot, "dist", "cli.js"), async () => {
+        const controller = await install();
+        expect(ExtensionRunner.prototype.getAllRegisteredTools).not.toBe(unbundledOriginal);
+        expect(Bundled.prototype.getAllRegisteredTools).toBe(bundledOriginal);
+        controller.dispose();
+        expect(ExtensionRunner.prototype.getAllRegisteredTools).toBe(unbundledOriginal);
+      });
+    });
   });
 });

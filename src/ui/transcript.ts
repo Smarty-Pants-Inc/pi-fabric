@@ -1,7 +1,7 @@
 import type { FabricAgentRunner } from "../config.js";
 import { TranscriptAccumulator } from "./transcript-parser.js";
 import { AgentTranscriptReader } from "./transcript-reader.js";
-import { recordOf } from "./transcript-sanitization.js";
+export { isFabricAgentToolPreview } from "./transcript-sanitization.js";
 
 type FabricTranscriptEntryStatus = "running" | "completed" | "failed";
 
@@ -63,31 +63,6 @@ export const projectAgentTranscript = (
   accumulator.append(events);
   return accumulator.snapshot(olderAvailable);
 };
-
-const PREVIEW_TREE_GUARD_MAX_DEPTH = 8;
-
-const isFabricAgentToolPreviewNode = (
-  value: unknown,
-  depth: number,
-): value is FabricAgentToolPreviewNode => {
-  const record = recordOf(value);
-  if (
-    !record ||
-    typeof record.id !== "string" ||
-    typeof record.name !== "string" ||
-    (record.text !== undefined && typeof record.text !== "string") ||
-    (record.currentTool !== undefined && typeof record.currentTool !== "string") ||
-    !Array.isArray(record.tools)
-  ) {
-    return false;
-  }
-  if (record.agents === undefined) return true;
-  if (depth >= PREVIEW_TREE_GUARD_MAX_DEPTH || !Array.isArray(record.agents)) return false;
-  return record.agents.every((child) => isFabricAgentToolPreviewNode(child, depth + 1));
-};
-
-export const isFabricAgentToolPreview = (value: unknown): value is FabricAgentToolPreview =>
-  recordOf(value)?.kind === "fabric-agent-tools" && isFabricAgentToolPreviewNode(value, 0);
 
 export const recentTranscriptTools = (
   transcript: FabricAgentTranscript,

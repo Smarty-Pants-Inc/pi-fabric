@@ -10,7 +10,7 @@ import { restoreBorrowedInPlaceMain } from "../prewalk/return.js";
 import { truncateMiddle } from "../util.js";
 import type { FabricUiController } from "../ui/controller.js";
 import { FABRIC_CONVERSATION_SHORTCUT } from "../ui/conversation-shortcut.js";
-import { FABRIC_WIDGET_FOCUS_SHORTCUT } from "../ui/widget-activity.js";
+import { FABRIC_WIDGET_FOCUS_SHORTCUT } from "../ui/widget.js";
 import { safeText } from "../ui/format.js";
 import {
   FABRIC_PEER_AWAIT_SETTLE_EVENT,

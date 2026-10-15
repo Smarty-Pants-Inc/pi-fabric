@@ -1,6 +1,6 @@
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import { visibleWidth } from "@earendil-works/pi-tui";
-import { beforeAll, describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it, vi } from "vitest";
 import { projectAgentTranscript, type FabricAgentTranscript } from "../src/ui/transcript.js";
 import type { FabricDashboardSnapshot, FabricUiAgent } from "../src/ui/types.js";
 import { FabricWidget, loadWidgetInteraction, type FabricWidgetRow } from "../src/ui/widget.js";
@@ -225,6 +225,45 @@ describe("Fabric widget activity expansion", () => {
       { type: "message", message: { role: "assistant", content: [{ type: "thinking", thinking: "second" }, { type: "text", text: "b" }] } },
     ]).entries.filter((entry) => entry.kind === "thinking");
     expect(retained.map((entry) => [entry.text, entry.status])).toEqual([["first", "completed"], ["second", "completed"]]);
+  });
+
+  it("queues first-focus navigation until the lazy engine is ready", async () => {
+    vi.resetModules();
+    const { FabricWidget: ColdWidget } = await import("../src/ui/widget.js");
+    const current = snapshot();
+    const widget = new ColdWidget(theme, () => current, 6, () => 40, false, undefined, {
+      activity: () => transcript(), release: () => { widget.focused = false; }, requestRender: () => {},
+    });
+    widget.render(100);
+    expect(widget.expandedId).toBeUndefined();
+    widget.focused = true;
+    widget.handleInput("\r");
+    await widget.prepareInteraction();
+    expect(widget.expandedId).toBe("agent-1");
+    expect(widget.render(100).join("\n")).toContain("activity");
+  });
+
+  it("does not replay queued widget actions after typing returns focus to the editor", async () => {
+    vi.resetModules();
+    const { FabricWidget: ColdWidget } = await import("../src/ui/widget.js");
+    const current = snapshot();
+    const forwarded: string[] = [];
+    const widget = new ColdWidget(theme, () => current, 6, () => 40, false, undefined, {
+      activity: () => transcript(),
+      release: (key) => { widget.focused = false; if (key) forwarded.push(key); }, requestRender: () => {},
+    });
+    widget.render(100);
+    widget.focused = true;
+    widget.handleInput("\r");
+    widget.handleInput("x");
+    await widget.prepareInteraction();
+    expect(forwarded).toEqual(["x"]);
+    expect(widget.focused).toBe(false);
+    expect(widget.expandedId).toBeUndefined();
+    widget.focused = true;
+    widget.selectDefault();
+    widget.handleInput("\r");
+    expect(widget.expandedId).toBe("agent-1");
   });
 
   it("stays passive without interaction wiring", () => {

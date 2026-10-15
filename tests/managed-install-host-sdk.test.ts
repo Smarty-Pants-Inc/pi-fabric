@@ -43,7 +43,10 @@ const managedInstall = () => {
     agents: { enabled: false }, mcp: { enabled: false }, mesh: { enabled: false },
     memory: { enabled: false }, ui: { enabled: false, widget: "hidden" },
   }));
-  for (const directory of ["home", "workspace"]) fs.mkdirSync(path.join(root, directory));
+  // The inherited deletion guard pins before Pi starts. Leave the isolated HOME
+  // initially absent: an existing home inside TMPDIR makes that TMPDIR unsafe
+  // as a deletion ceiling. Pi may create it later, within the pinned fixture.
+  fs.mkdirSync(path.join(root, "workspace"));
   return { root, fabric };
 };
 

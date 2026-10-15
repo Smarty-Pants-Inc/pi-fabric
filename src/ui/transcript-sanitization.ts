@@ -1,3 +1,20 @@
+import type { FabricAgentToolPreview, FabricAgentToolPreviewNode } from "./transcript.js";
+
+// Render-time guards must not pull the transcript parser/reader barrel into startup.
+const PREVIEW_TREE_GUARD_MAX_DEPTH = 8;
+const isFabricAgentToolPreviewNode = (value: unknown, depth: number): value is FabricAgentToolPreviewNode => {
+  const record = recordOf(value);
+  if (!record || typeof record.id !== "string" || typeof record.name !== "string" ||
+      (record.text !== undefined && typeof record.text !== "string") ||
+      (record.currentTool !== undefined && typeof record.currentTool !== "string") ||
+      !Array.isArray(record.tools)) return false;
+  if (record.agents === undefined) return true;
+  if (depth >= PREVIEW_TREE_GUARD_MAX_DEPTH || !Array.isArray(record.agents)) return false;
+  return record.agents.every((child) => isFabricAgentToolPreviewNode(child, depth + 1));
+};
+export const isFabricAgentToolPreview = (value: unknown): value is FabricAgentToolPreview =>
+  recordOf(value)?.kind === "fabric-agent-tools" && isFabricAgentToolPreviewNode(value, 0);
+
 // Keep this wire-shape guard dependency-free: both transcript readers use it.
 export const isCompactToolResult = (value: unknown): boolean => {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;

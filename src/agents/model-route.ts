@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { CURRENT_SESSION_VERSION } from "@earendil-works/pi-coding-agent";
+import { PiCodingAgent } from "../core/host-sdk-runtime.js";
 import { writeJsonAtomic } from "../core/atomic-write.js";
 import { resolveAgentDir } from "../core/agent-dir.js";
 import { runAbortable } from "../async-settlement.js";
@@ -347,7 +347,7 @@ export function prepareRouteDispatch(decision: ModelRouteDecision, cwd: string |
   const bindSession = (finalCwd: string): string => {
     fs.mkdirSync(runDirectory, { recursive: true, mode: 0o700 });
     const file = path.join(runDirectory, "route-session.jsonl");
-    fs.writeFileSync(file, `${JSON.stringify({ type: "session", version: CURRENT_SESSION_VERSION,
+    fs.writeFileSync(file, `${JSON.stringify({ type: "session", version: PiCodingAgent.CURRENT_SESSION_VERSION,
       id: childId, timestamp: new Date().toISOString(), cwd: finalCwd })}\n`, { mode: 0o600 });
     sessionFile = file;
     return file;

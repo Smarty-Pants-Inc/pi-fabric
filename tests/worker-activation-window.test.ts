@@ -334,7 +334,8 @@ describe("actor context refusal (offline transport fixture)", () => {
     await actors.close();
     expect(fs.readFileSync(counter, "utf8")).toBe("attempt\n");
     expect(alarms).toHaveLength(1);
-    expect(alarms[0]).toContain("Context exceeds window");
+    expect(alarms[0]).toContain("Failure code: context-overflow");
+    expect(alarms[0]).not.toContain("Context exceeds window");
     expect(mesh.read({ topic: "ops.owner" }).filter(event => event.kind === "actor.alarm")).toHaveLength(1);
   }, TEST_GUARD_MS);
 });
@@ -1020,7 +1021,8 @@ describe("native activation window (offline; opted-in success needs exact native
     expect(s.requests).toHaveLength(0);
     expect(alarms).toHaveLength(1);
     expect(alarms[0]).toMatchObject({ delivery: "followUp", triggerTurn: true });
-    expect(alarms[0]!.message.text).toContain("Context exceeds window");
+    expect(alarms[0]!.message.text).toContain("Failure code: context-overflow");
+    expect(alarms[0]!.message.text).not.toContain("Context exceeds window");
     expect(mesh.read({ topic: "ops.owner" }).filter(event => event.kind === "actor.alarm")).toEqual([
       expect.objectContaining({ data: expect.objectContaining({ actorId: actor.id, reason: "context_window" }) }),
     ]);
@@ -1057,7 +1059,8 @@ describe("native activation window (offline; opted-in success needs exact native
       await actors.close();
       expect(s.requests).toHaveLength(0);
       expect(alarms).toHaveLength(1);
-      expect(alarms[0]!.message.text).toContain("Context exceeds window");
+      expect(alarms[0]!.message.text).toContain("Failure code: context-overflow");
+      expect(alarms[0]!.message.text).not.toContain("Context exceeds window");
       expect(mesh.read({topic: "ops.owner"}).filter(event => event.kind === "actor.alarm")).toHaveLength(1);
     } else {
       await expect(outcome).resolves.toMatchObject({text: "useful current result"});
@@ -1134,7 +1137,8 @@ describe("native activation window (offline; opted-in success needs exact native
       expect(JSON.stringify(s.requests)).not.toContain("LARGE_RAW_PAYLOAD");
       expect(JSON.stringify(s.requests)).not.toContain("LATE_PAYLOAD");
     } else {
-      expect(alarms[0]!.message.text).toContain("Context exceeds window");
+      expect(alarms[0]!.message.text).toContain("Failure code: context-overflow");
+      expect(alarms[0]!.message.text).not.toContain("Context exceeds window");
       expect(actors.messages(actor.id, 20).filter(message => message.error?.includes("Context exceeds window"))).toHaveLength(1);
     }
     expect(fs.readFileSync(transforms, "utf8")).toBe("first\nlast\n");

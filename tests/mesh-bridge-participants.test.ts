@@ -99,8 +99,9 @@ describe("bridge participant reconciliation (smarty-dev#5036)", () => {
     // A crashed transport cannot withdraw; source leases remain live across the gap.
     await f.transport.close();
     f.advance(BRIDGE_LEASE_MS + 1);
-    expect(f.leads.get(f.lead.identity.id)).toBeUndefined();
-    expect(f.lanes.get(f.lane.identity.id)).toBeUndefined();
+    // Lost bridge freshness retains attribution for a precise routing error, not a dead-Main claim.
+    expect(f.leads.get(f.lead.identity.id)).toMatchObject({ bridgeStale: true, stale: false });
+    expect(f.lanes.get(f.lane.identity.id)).toMatchObject({ bridgeStale: true, stale: false });
     if (state === "pruned") await f.prune();
     const restarted = new MeshBridge({ ...f.options, local: new StoreBridgeSide(f.hub, "ryzen2"), remote: connect(f.far).remote });
     await restarted.start();
@@ -162,7 +163,7 @@ describe("bridge participant reconciliation (smarty-dev#5036)", () => {
     f.visible();
     fs.rmSync(f.lead.file);
     f.advance(BRIDGE_LEASE_MS + 1);
-    expect(f.leads.get(f.lead.identity.id)).toBeUndefined();
+    expect(f.leads.get(f.lead.identity.id)).toMatchObject({ bridgeStale: true, stale: false });
     await f.bridge.step();
     expect(f.far.get(f.lead.entry.key)).toBeUndefined();
     expect(f.leads.get(f.lead.identity.id)).toBeUndefined();

@@ -1,4 +1,5 @@
 import { ExecutionDeadline } from "./execution-deadline.js";
+import { detachedPreview } from "../core/preview.js";
 import { createRequire } from "node:module";
 import { randomUUID } from "node:crypto";
 import type * as MontyNative from "@pydantic/monty/node";
@@ -67,7 +68,7 @@ export class MontyRuntime implements FabricKernelRuntime {
     const maxLogChars = options.maxLogChars ?? 100_000;
     const printCallback = (stream: "stdout" | "stderr", text: string): void => {
       if (truncated || stopped) return;
-      const retained = text.slice(0, Math.max(0, maxLogChars - logChars));
+      const retained = detachedPreview(text, Math.max(0, maxLogChars - logChars));
       logChars += retained.length;
       const lines = (partial[stream] + retained).split("\n");
       partial[stream] = lines.pop() ?? "";

@@ -117,7 +117,9 @@ describe("AgentManager close storage", () => {
     expect(JSON.parse(fs.readFileSync(path.join(root, ".fabric-owner.json"), "utf8"))).toMatchObject({ childrenStopped: true, closedAt: expect.any(Number) });
     const run = path.join(root, handle.id);
     const taskPath = path.join(run, "task.txt");
-    expect(fs.readdirSync(run).sort()).toEqual(["status.json", "task.txt"]);
+    expect(fs.readdirSync(run).sort()).toEqual(["manager-result.json", "status.json", "task.txt"]);
+    expect(JSON.parse(fs.readFileSync(path.join(run, "manager-result.json"), "utf8"))).toMatchObject({ id: handle.id, status: "stopped" });
+    expect(JSON.parse(fs.readFileSync(path.join(run, "manager-result.json"), "utf8"))).not.toHaveProperty("task");
     expect(fs.readFileSync(taskPath)).toEqual(Buffer.from(task, "utf8"));
     const digest = createHash("sha256").update(Buffer.from(task, "utf8")).digest("hex");
     const persisted = JSON.parse(fs.readFileSync(path.join(run, "status.json"), "utf8"));
@@ -394,7 +396,9 @@ describe("AgentManager close storage", () => {
       expect(JSON.parse(fs.readFileSync(path.join(root, ".fabric-owner.json"), "utf8"))).toMatchObject({ childrenStopped: true, closedAt: expect.any(Number) });
       const run = path.join(root, active.id);
       const taskPath = path.join(run, "task.txt");
-      expect(fs.readdirSync(run).sort()).toEqual(["status.json", "task.txt"]);
+      expect(fs.readdirSync(run).sort()).toEqual(["manager-result.json", "status.json", "task.txt"]);
+      expect(JSON.parse(fs.readFileSync(path.join(run, "manager-result.json"), "utf8"))).toMatchObject({ id: active.id, status: "stopped" });
+      expect(JSON.parse(fs.readFileSync(path.join(run, "manager-result.json"), "utf8"))).not.toHaveProperty("task");
       expect(fs.readFileSync(taskPath, "utf8")).toBe("HANG");
       const digest = createHash("sha256").update("HANG", "utf8").digest("hex");
       const persisted = JSON.parse(fs.readFileSync(path.join(run, "status.json"), "utf8"));

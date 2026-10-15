@@ -386,7 +386,7 @@ describe("#4383 resident host presence batch", () => {
     const { host, config, records } = await fixture();
     const id = records[0]!.id;
     expect(host.mesh.get(`actors/${config.sessionId}/${id}`, { fresh: true })).toBeDefined();
-    if (process.platform === "linux") {
+    if (process.platform === "linux" || process.platform === "darwin" || process.platform === "win32") {
     expect(await host.actors.remove(id, { wait: true })).toMatchObject({ removed: true });
     expect(host.actors.cleanupObligation(id)).toBeUndefined();
     expect(host.mesh.get(`actors/${config.sessionId}/${id}`, { fresh: true })).toBeUndefined();
@@ -394,8 +394,8 @@ describe("#4383 resident host presence batch", () => {
     expect(new ActorRegistryStore(config.actorRoot).records().some(row => row.id === id)).toBe(false);
     expect(host.actors.listOwned()).toHaveLength(39);
     } else {
-      // Off Linux no root actor tree deletion runs (smarty-dev#8090; follow-up smarty-dev#11335): the registry
-      // revocation commits, the tree is kept and the cleanup obligation stays pending with the named refusal.
+      // On unsupported platforms no root tree deletion runs (smarty-dev#8090; follow-up smarty-dev#11335):
+      // registry revocation commits, the tree is kept and cleanup stays pending with the named refusal.
       const dir = path.join(config.actorRoot, id);
       fs.mkdirSync(dir, { recursive: true });
       fs.writeFileSync(path.join(dir, "kept-11335.txt"), "history\n");

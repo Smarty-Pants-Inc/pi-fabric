@@ -1,3 +1,5 @@
+import { detachedPreview } from "./preview.js";
+
 // A shared, provider-agnostic heuristic for the one-line "headline" argument
 // of a nested Fabric call — the value shown beside a tool's name in the chat
 // preview (e.g. `recall <query>`) and appended to its ref in the dashboard
@@ -30,7 +32,9 @@ const HEADLINE_SKIP_KEYS = new Set([
 const cleanOneLine = (value: string, max: number): string => {
   const single = value.replace(/\s+/g, " ").trim();
   if (!single) return "";
-  return single.length <= max ? single : `${single.slice(0, Math.max(1, max - 1))}…`;
+  return single.length <= max
+    ? detachedPreview(single, max)
+    : `${detachedPreview(single, Math.max(1, max - 1))}…`;
 };
 
 /**

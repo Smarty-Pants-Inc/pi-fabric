@@ -5,6 +5,9 @@ import { EventEmitter } from "node:events";
 import type { ChildProcess } from "node:child_process";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { writeHostLease } from "../src/topology/host-leases.js";
+import { MeshStore } from "../src/mesh/store.js";
+import { canonicalResidentWakeConfig } from "../src/residency/wake-index.js";
+import * as residentWake from "../src/residency/wake.js";
 import type { ResidentHostConfig } from "../src/residency/protocol.js";
 
 const mocks = vi.hoisted(() => ({ spawn: vi.fn(), alive: new Set<number>(), births: new Map<number, string>(),
@@ -49,6 +52,16 @@ class FakeChild extends EventEmitter {
     }, 0);
     this.timer = setInterval(() => { if (this.renewing && !noLease) this.renew(); }, 25);
   }
+  exit(code = 1): void {
+    clearInterval(this.timer); mocks.alive.delete(this.pid); this.emit("exit", code, null);
+  }
+  ready(maintenanceToken = "fixture-owner-token"): void {
+    const file = path.join(this.config.residencyRoot, "owner.json");
+    const owner = JSON.parse(fs.readFileSync(file, "utf8"));
+    fs.writeFileSync(file, JSON.stringify({ ...owner, readyAt: Date.now(), maintenanceReady: 1 }));
+    fs.writeFileSync(path.join(this.config.residencyRoot, "maintenance-ready.json"), JSON.stringify({ token: maintenanceToken }));
+    this.emit("message", { event: "resident-ready", root: this.config.residencyRoot, token: owner.token });
+  }
   renew(): void {
     writeHostLease(this.config.meshRoot, { id: "fixture-host", rootId: this.config.rootId,
       identityId: "fixture-host", updatedAt: Date.now(), expiresAt: Date.now() + 1000 });
@@ -67,11 +80,15 @@ class FakeChild extends EventEmitter {
   }
 }
 
-const fixture = (settings: ResidentHostConfig["watchdog"] = {}, alwaysStall = false, noLease = false) => {
+const fixture = (settings: ResidentHostConfig["watchdog"] = {}, alwaysStall = false, noLease = false, actorCount = 1) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "launcher-wedge-unit-"));
   const config = { cwd: root, piBinary: path.join(root, "fixture.mjs"), residencyRoot: root,
-    rootId: "fixture-root", meshRoot: path.join(root, "mesh"),
+    rootId: "fixture-root", sessionId: "fixture-session", meshRoot: path.join(root, "mesh"), actorRoot: path.join(root, "actors"),
+    mesh: { actorScope: "project", maxEventBytes: 64 * 1024, maxReadEvents: 100, stateBackend: "file" },
     watchdog: { intervalMs: 50, stallMs: 100, coldStartMs: 0, ...settings } } as ResidentHostConfig;
+  fs.mkdirSync(config.actorRoot);
+  fs.writeFileSync(path.join(config.actorRoot, "actors.json"), JSON.stringify({ format: 1,
+    actors: Array.from({ length: actorCount }, (_, i) => ({ id: `actor-${i}`, rootId: config.rootId, residency: "durable" })) }));
   fs.mkdirSync(path.join(root, "runs")); fs.mkdirSync(path.join(root, "runs", "one"));
   fs.writeFileSync(path.join(root, "config.json"), JSON.stringify(config));
   fs.writeFileSync(path.join(root, "child-stderr.log"), Array.from({ length: 220 }, (_, i) => `line-${i}`).join("\n") + "\n");
@@ -93,9 +110,209 @@ const fixture = (settings: ResidentHostConfig["watchdog"] = {}, alwaysStall = fa
     try { await done; } finally { fs.rmSync(root, { recursive: true, force: true }); }
   } };
 };
-afterEach(() => { vi.useRealTimers(); mocks.spawn.mockReset(); mocks.alive.clear(); mocks.births.clear(); mocks.lockHook = undefined; mocks.sessionEmpty = true; });
+const originalExitCode = process.exitCode;
+afterEach(() => {
+  vi.restoreAllMocks(); vi.unstubAllEnvs(); vi.useRealTimers(); process.exitCode = originalExitCode;
+  mocks.spawn.mockReset(); mocks.alive.clear(); mocks.births.clear(); mocks.lockHook = undefined; mocks.sessionEmpty = true;
+});
 
 const clock = () => { vi.useFakeTimers(); vi.setSystemTime(new Date("2026-01-01T00:00:00Z")); };
+const ALARM_TOPIC = "fabric.alarm.resident-unhosted";
+const ALARM_TO = "session:11111111-2222-4333-8444-555555555555";
+const alarmClock = () => {
+  clock(); vi.stubEnv("PI_FABRIC_MESH_ALARM_TO", ALARM_TO); vi.stubEnv("SMARTY_LEAD_SESSION", "");
+  return vi.spyOn(console, "warn").mockImplementation(() => {});
+};
+const alarms = (f: ReturnType<typeof fixture>) => {
+  const mesh = new MeshStore(f.config.meshRoot, 64 * 1024, 100, { stateBackend: "file", canWakeResidents: () => false });
+  try { return mesh.read({ topic: ALARM_TOPIC }); } finally { mesh.closeState(); }
+};
+const outage = (f: ReturnType<typeof fixture>) => JSON.parse(fs.readFileSync(path.join(f.root, "resident-unhosted.json"), "utf8")) as {
+  since: number; absentSince: number; reason: string; reportedReason?: string; recovered?: true;
+};
+const settleAlarms = async () => { await vi.dynamicImportSettled(); };
+const closeSuccessor = async (f: ReturnType<typeof fixture>, controller: AbortController, done: Promise<void> | undefined) => {
+  for (const child of f.children) {
+    clearInterval(child.timer);
+    child.kill = (signal: string) => { child.emit("exit", null, signal); return true; };
+  }
+  controller.abort(); await vi.advanceTimersByTimeAsync(100); await done;
+};
+
+// Keep: #10068's native watchdog/custody failure cannot be reached cheaply by a live user flow.
+// The child and time are injected; supervision, registry reads, alarm routing and MeshStore publication are real.
+describe.skipIf(process.platform === "win32")("launcher resident-unhosted alarm", () => {
+  it("publishes custody once at exactly five childless minutes, never at 299999ms or again unchanged", async () => {
+    alarmClock(); const timeouts = vi.spyOn(globalThis, "setTimeout"); const wake = vi.spyOn(residentWake, "wakeResidentActors");
+    const f = fixture({}, true, false, 46);
+    try {
+      fs.mkdirSync(path.join(f.config.meshRoot, "residency"), { recursive: true });
+      // Duplicate scope rows count once; foreign, session-resident and stopped rows do not need this host.
+      const sessionRoot = path.join(f.config.actorRoot, f.config.sessionId); fs.mkdirSync(sessionRoot);
+      fs.writeFileSync(path.join(sessionRoot, "actors.json"), JSON.stringify({ format: 1, actors: [
+        { id: "actor-0", rootId: f.config.rootId, residency: "durable", status: "waiting" },
+        { id: "foreign", rootId: "another-root", residency: "durable" },
+        { id: "session-only", rootId: f.config.rootId, residency: "session" },
+        { id: "stopped", rootId: f.config.rootId, residency: "durable", status: "stopped" },
+      ] }));
+      await vi.advanceTimersByTimeAsync(500);
+      expect(f.children[0]!.signals).toEqual(["SIGUSR2", "SIGTERM", "SIGKILL"]);
+      expect(f.events().filter(row => row.event === "watchdog-giving-up")).toHaveLength(1);
+      const since = outage(f).since;
+      expect(since).toBe(f.children[0]!.signalTimes[2]); // Independent native SIGKILL/exit timestamp, not the tracker's own clock.
+      await supervise(path.join(f.root, "config.json")); // Short-lived custody-refused contender, same outage/deadline.
+      expect(f.children).toHaveLength(1);
+      const deadlines = timeouts.mock.calls.flatMap((args, index) => args[1] === 300_000 ? [timeouts.mock.results[index]!.value] : []);
+      expect(deadlines).toHaveLength(1); expect(deadlines[0].hasRef()).toBe(false);
+      await vi.advanceTimersByTimeAsync(since + 299_999 - Date.now());
+      expect(alarms(f)).toEqual([]);
+      await vi.advanceTimersByTimeAsync(1); await settleAlarms();
+      expect(alarms(f)).toEqual([expect.objectContaining({ topic: ALARM_TOPIC, kind: "resident-unhosted-outage", to: ALARM_TO,
+        createdAt: since + 300_000,
+        data: { root: f.config.rootId, residency: f.root, actorCount: 46, reason: "custody", since, state: "outage" } })]);
+      await vi.advanceTimersByTimeAsync(300_000); await settleAlarms();
+      await supervise(path.join(f.root, "config.json")); await settleAlarms();
+      expect(alarms(f)).toHaveLength(1); expect(f.children).toHaveLength(1);
+      expect(wake).not.toHaveBeenCalled(); // Even with mesh/residency present, alarm publication cannot recursively wake residents.
+      expect(f.events().filter(row => row.event === "watchdog-deferred" && row.proofCheck)).toHaveLength(3);
+    } finally { await f.close(); }
+  }, 20_000);
+
+  it("arms a fresh deadline after another launcher's recovered record, not the previous expired deadline", async () => {
+    alarmClock(); const timeouts = vi.spyOn(globalThis, "setTimeout"); const f = fixture({}, true);
+    try {
+      await vi.advanceTimersByTimeAsync(500);
+      await vi.advanceTimersByTimeAsync(outage(f).since + 300_000 - Date.now()); await settleAlarms();
+      expect(alarms(f)).toHaveLength(1);
+      const marker = path.join(f.root, "resident-unhosted.json");
+      const previous = JSON.parse(fs.readFileSync(marker, "utf8"));
+      // A different launcher has its own in-memory monitors. Its token-proved ready path
+      // writes this shared recovery record; the old custody observer can still be alive.
+      fs.writeFileSync(marker, JSON.stringify({ ...previous, absentSince: undefined, recovered: true }));
+      await supervise(path.join(f.root, "config.json")); // Next custody refusal observes a new outage.
+      const since = Date.now();
+      expect(outage(f).since).toBe(since);
+      await vi.advanceTimersByTimeAsync(299_999); expect(alarms(f)).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(1); await settleAlarms();
+      expect(alarms(f)).toHaveLength(2);
+      expect(alarms(f)[1]!.data).toMatchObject({ state: "outage", since, reason: "custody" });
+      const deadlines = timeouts.mock.calls.flatMap((args, index) => args[1] === 300_000 ? [timeouts.mock.results[index]!.value] : []);
+      expect(deadlines).toHaveLength(2); expect(deadlines.every(timer => !timer.hasRef())).toBe(true);
+    } finally { await f.close(); }
+  }, 20_000);
+
+  it("recovers a persisted outage once only after the successor child proves token-bound maintenance readiness", async () => {
+    alarmClock(); const f = fixture({}, true);
+    const successor = new AbortController(); let next: Promise<void> | undefined;
+    try {
+      await vi.advanceTimersByTimeAsync(500);
+      await vi.advanceTimersByTimeAsync(outage(f).since + 300_000 - Date.now()); await settleAlarms();
+      f.controller.abort(); await vi.advanceTimersByTimeAsync(100); await f.done;
+      // Test-only stand-in for an explicit operator drain. The implementation must never clear custody itself.
+      fs.unlinkSync(path.join(f.root, "watchdog-custody.json"));
+      f.config.watchdog!.enabled = false;
+      fs.writeFileSync(path.join(f.root, "config.json"), JSON.stringify(f.config));
+      next = supervise(path.join(f.root, "config.json"), { signal: successor.signal });
+      await vi.advanceTimersByTimeAsync(50);
+      const child = f.children[1]!;
+      expect(alarms(f).map(row => (row.data as { state: string }).state)).toEqual(["outage"]);
+      child.emit("message", { event: "resident-ready", root: f.root, token: "wrong-generation" });
+      child.ready("wrong-maintenance-token"); await settleAlarms();
+      expect(alarms(f)).toHaveLength(1);
+      child.ready(); await settleAlarms();
+      expect(alarms(f).map(row => (row.data as { state: string }).state)).toEqual(["outage", "recovered"]);
+      expect(alarms(f)[1]!.data).toEqual({ root: f.config.rootId, residency: f.root, actorCount: 1,
+        reason: "custody", since: (alarms(f)[0]!.data as { since: number }).since, state: "recovered" });
+      child.ready(); await vi.advanceTimersByTimeAsync(300_000); await settleAlarms();
+      expect(alarms(f)).toHaveLength(2); expect(outage(f).recovered).toBe(true);
+    } finally {
+      await closeSuccessor(f, successor, next); await f.close();
+    }
+  }, 20_000);
+
+  it.each(["empty", "stopped-only"])("never alarms for zero effective actors (%s), including watchdog give-up", async mode => {
+    alarmClock(); const f = fixture({}, true, false, 0);
+    try {
+      if (mode === "stopped-only") fs.writeFileSync(path.join(f.config.actorRoot, "actors.json"), JSON.stringify({ format: 1, actors: [
+        { id: "stopped", rootId: f.config.rootId, residency: "durable", status: "stopped" },
+      ] }));
+      await vi.advanceTimersByTimeAsync(600_500); await settleAlarms();
+      expect(f.children).toHaveLength(1);
+      expect(f.events().some(row => row.event === "watchdog-giving-up")).toBe(true);
+      expect(alarms(f)).toEqual([]);
+      expect(fs.existsSync(path.join(f.root, "resident-unhosted.json"))).toBe(false);
+    } finally { await f.close(); }
+  }, 20_000);
+
+  it("ends a short child-exit outage silently, and never calls a merely spawned child recovered", async () => {
+    alarmClock(); const f = fixture({ enabled: false });
+    const successor = new AbortController(); let next: Promise<void> | undefined;
+    try {
+      await vi.advanceTimersByTimeAsync(1); f.children[0]!.exit();
+      await vi.advanceTimersByTimeAsync(100); await f.done;
+      expect(outage(f).reason).toBe("child-exit");
+      await vi.advanceTimersByTimeAsync(60_000);
+      next = supervise(path.join(f.root, "config.json"), { signal: successor.signal });
+      await vi.advanceTimersByTimeAsync(300_001); await settleAlarms();
+      expect(outage(f).recovered).toBeUndefined(); expect(alarms(f)).toEqual([]);
+      f.children[1]!.ready(); await settleAlarms();
+      expect(outage(f).recovered).toBe(true); expect(alarms(f)).toEqual([]);
+    } finally {
+      await closeSuccessor(f, successor, next); await f.close();
+    }
+  }, 20_000);
+
+  it.each([false, true])("ordinary child exit returns and alarms without respawning (wake refused: %s)", async refused => {
+    alarmClock(); const f = fixture({ enabled: false });
+    try {
+      await vi.advanceTimersByTimeAsync(1); f.children[0]!.exit();
+      await vi.advanceTimersByTimeAsync(100); await f.done;
+      const since = outage(f).since;
+      if (refused) {
+        fs.writeFileSync(path.join(f.root, "wake-routes.json"), JSON.stringify({ format: 1, rootId: f.config.rootId,
+          hostId: "fixture-host", configJson: canonicalResidentWakeConfig(f.config), actors: [{ id: "actor-0", name: "actor", topics: [] }] }));
+        fs.writeFileSync(path.join(f.root, "config.json"), JSON.stringify({ ...f.config, piBinary: "refused-config" }));
+        fs.writeFileSync(path.join(f.root, "wake-failure.json"), JSON.stringify({ format: 1,
+          delivery: { id: "failed-delivery" }, error: "restart snapshot mismatch", failedAt: Date.now() }));
+        await expect(supervise(path.join(f.root, "config.json"), { wakeOnly: true })).rejects.toThrow("wake config differs");
+      }
+      await vi.advanceTimersByTimeAsync(since + 299_999 - Date.now()); expect(alarms(f)).toEqual([]);
+      await vi.advanceTimersByTimeAsync(1); await settleAlarms();
+      expect(alarms(f)).toEqual([expect.objectContaining({ to: ALARM_TO, data: {
+        root: f.config.rootId, residency: f.root, actorCount: 1, since, reason: refused ? "wake-refused" : "child-exit", state: "outage",
+      } })]);
+      await vi.advanceTimersByTimeAsync(300_000); await settleAlarms();
+      expect(alarms(f)).toHaveLength(1); expect(f.children).toHaveLength(1);
+    } finally { await f.close(); }
+  }, 20_000);
+
+  it("reports a refused MeshStore publication without inventing delivery or retrying unchanged, and closes its store", async () => {
+    const warn = alarmClock(); const f = fixture({}, true);
+    const publish = vi.spyOn(MeshStore.prototype, "publish").mockRejectedValueOnce(new Error("injected alarm sink failure"));
+    const close = vi.spyOn(MeshStore.prototype, "closeState");
+    try {
+      await vi.advanceTimersByTimeAsync(500);
+      await vi.advanceTimersByTimeAsync(outage(f).since + 300_000 - Date.now()); await settleAlarms();
+      expect(publish).toHaveBeenCalledOnce(); expect(close).toHaveBeenCalledOnce();
+      expect(warn.mock.calls.some(([line]) => String(line).includes("injected alarm sink failure"))).toBe(true);
+      expect(alarms(f)).toEqual([]);
+      publish.mockRestore(); await vi.advanceTimersByTimeAsync(300_000); await settleAlarms();
+      expect(alarms(f)).toEqual([]); // Persisted attempt is not a delivery receipt; stderr is the fallback.
+    } finally { await f.close(); }
+  }, 20_000);
+
+  it("leaves a structured journal fallback and explicit diagnostics when no session sink exists", async () => {
+    const warn = alarmClock(); vi.stubEnv("PI_FABRIC_MESH_ALARM_TO", "");
+    const f = fixture({}, true);
+    try {
+      await vi.advanceTimersByTimeAsync(500);
+      await vi.advanceTimersByTimeAsync(outage(f).since + 300_000 - Date.now()); await settleAlarms();
+      expect(alarms(f)).toEqual([]);
+      expect(warn.mock.calls.some(([line]) => String(line).startsWith("fabric.alarm.mesh-outage {") && String(line).includes(ALARM_TOPIC))).toBe(true);
+      expect(warn.mock.calls.some(([line]) => String(line).includes("no configured session alarm sink"))).toBe(true);
+    } finally { await f.close(); }
+  }, 20_000);
+});
 
 describe("launcher intentional idle exit", () => {
   it("makes no late diagnostic write even when the host retires before the first owner sample", async () => {
@@ -114,8 +331,11 @@ describe("launcher intentional idle exit", () => {
       expect(f.children).toHaveLength(1);
       expect(f.events().filter(row => row.event === "child-exit")).toEqual([]);
       expect(fs.existsSync(path.join(f.root, "error.json"))).toBe(false);
+      expect(fs.existsSync(path.join(f.root, "resident-unhosted.json"))).toBe(false);
+      await vi.advanceTimersByTimeAsync(300_000);
+      expect(fs.existsSync(path.join(f.root, "resident-unhosted.json"))).toBe(false);
     } finally { await f.close(); }
-  });
+  }, 20_000);
 });
 
 describe("launcher watchdog Windows contract", () => {

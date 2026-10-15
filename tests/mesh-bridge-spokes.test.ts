@@ -714,19 +714,49 @@ describe("spoke-to-spoke roots and addressed control through the hub", () => {
       incarnationToken: replacement.hosts[0]!.record.incarnationToken });
     expect(hub.get(participantKey(rootId))!.value).toMatchObject({ name: "replacement" });
 
-    const sameTokenId = "session:same-token-00000001";
-    const sameTokenPrior = incarnationPresence(sameTokenId, now - 30, "same-opaque-token", "same-token-prior", now);
-    await new StoreBridgeSide(hub, "ryzen3").mirror({ hosts: sameTokenPrior.hosts, participants: sameTokenPrior.participants });
-    const sameTokenMetadata = incarnationPresence(sameTokenId, now - 40, "same-opaque-token", "same-token-metadata", now);
-    await new StoreBridgeSide(hub, "ryzen3").mirror({ hosts: sameTokenMetadata.hosts, participants: sameTokenMetadata.participants });
-    expect(hub.get(hostKey(sameTokenId))!.value).toMatchObject({ startedAt: now - 40, incarnationToken: "same-opaque-token" });
-    expect(hub.get(participantKey(sameTokenId))!.value).toMatchObject({ name: "same-token-metadata" });
-
     const firstId = "session:first-ever-00000001";
     const first = incarnationPresence(firstId, now - 1, `opaque-${crypto.randomUUID()}`, "first", now);
     await new StoreBridgeSide(hub, "ryzen3").mirror({ hosts: first.hosts, participants: first.participants });
     expect(hub.get(hostKey(firstId))!.value).toMatchObject({ startedAt: now - 1 });
     expect(hub.get(participantKey(firstId))!.value).toMatchObject({ name: "first" });
+  });
+
+  it("retains the same-token start fence through metadata updates, stale reconnect and cleanup", async () => {
+    const { hub } = tinyStores();
+    const now = Date.now(), rootId = "session:same-token-00000001";
+    const prior = incarnationPresence(rootId, now - 30, "same-opaque-token", "same-token-prior", now);
+    await new StoreBridgeSide(hub, "ryzen3").mirror({ hosts: prior.hosts, participants: prior.participants });
+    const metadata = incarnationPresence(rootId, now - 40, "same-opaque-token", "same-token-metadata", now);
+    await expect(new StoreBridgeSide(hub, "ryzen3").mirror({ hosts: metadata.hosts, participants: metadata.participants }))
+      .resolves.toBeUndefined();
+    // Equal tokens admit changed metadata, but neither persisted authority may lose the highwater.
+    expect(hub.get(hostKey(rootId))!.value).toMatchObject({ startedAt: now - 30,
+      incarnationToken: "same-opaque-token", identity: metadata.identity });
+    expect(readHostLease(hub.root, rootId)).toMatchObject({ startedAt: now - 30, incarnationToken: "same-opaque-token" });
+    expect(hub.get(participantKey(rootId))!.value).toMatchObject({ name: "same-token-metadata" });
+    const hostBefore = hub.get(hostKey(rootId));
+    const participantBefore = hub.get(participantKey(rootId));
+    const leasePath = hostLeasePath(hub.root, rootId);
+    const leaseBefore = fs.readFileSync(leasePath);
+    const between = incarnationPresence(rootId, now - 35, "distinct-opaque-between", "stale-between", now);
+    const reconnect = new StoreBridgeSide(hub, "ryzen3");
+    await expect(reconnect.mirror({ hosts: between.hosts, participants: between.participants }))
+      .rejects.toMatchObject({ code: "FABRIC_BRIDGE_STALE_INCARNATION" });
+    expect(hub.get(hostKey(rootId))).toEqual(hostBefore);
+    expect(hub.get(participantKey(rootId))).toEqual(participantBefore);
+    expect(fs.readFileSync(leasePath)).toEqual(leaseBefore);
+    await reconnect.withdraw();
+    expect(hub.get(hostKey(rootId))).toEqual(hostBefore);
+    expect(hub.get(participantKey(rootId))).toEqual(participantBefore);
+    expect(fs.readFileSync(leasePath)).toEqual(leaseBefore);
+    expect(removals).toEqual([]);
+
+    const newer = incarnationPresence(rootId, now - 20, "distinct-opaque-newer", "genuinely-newer", now);
+    await new StoreBridgeSide(hub, "ryzen3").mirror({ hosts: newer.hosts, participants: newer.participants });
+    expect(hub.get(hostKey(rootId))!.value).toMatchObject({ startedAt: now - 20,
+      incarnationToken: "distinct-opaque-newer", identity: newer.identity });
+    expect(readHostLease(hub.root, rootId)).toMatchObject({ startedAt: now - 20, incarnationToken: "distinct-opaque-newer" });
+    expect(hub.get(participantKey(rootId))!.value).toMatchObject({ name: "genuinely-newer" });
   });
 
   it("uses a newer lease-only incarnation as authority without a persisted mirror", async () => {

@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { BRIDGE_LEASE_MS, StoreBridgeSide } from "../src/mesh/bridge.js";
+import { BRIDGE_LEASE_MS, StoreBridgeSide, type BridgePresence } from "../src/mesh/bridge.js";
 import { CommitOutbox, type CommitOutboxPlan } from "../src/mesh/commit-outbox.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { hostLeasePath, readHostLease, writeHostLease } from "../src/topology/host-leases.js";
@@ -106,6 +106,49 @@ describe("bridge incarnation admission at persisted trust boundaries (smarty-dev
     }
     expect(batches).toBe(1);
     expect(hub.listAll("topology/handoffs/", { fresh: true })).toEqual([]);
+    expect(removals).toEqual([]);
+  });
+
+  it("preserves a higher same-token lease fence across pending recovery replay and reconnect", async () => {
+    const hub = store("file");
+    const dead = new CommitOutbox(hub, "bridge/ryzen2", bridgeIdentity, {});
+    // Crash image X90: the old mirror and pending lease share the on-disk X100 token.
+    await hub.writeBatch({ identity: bridgeIdentity, ops: [], prepare: () => dead.plan().stage([
+      { kind: "put", key: hostKey(identity.id), identity, value: { ...host, remoteHost: "ryzen2" } },
+      { kind: "put", key: participantKey(identity.id), identity, value: { ...participant, remoteHost: "ryzen2" } },
+    ], [{ kind: "lease", key: `lease:${identity.id}`, payload: oldLease }]) });
+    const highLease = { ...oldLease, startedAt: host.startedAt + 1_000 };
+    writeHostLease(hub.root, highLease);
+    expect(hub.listAll(dead.prefix, { fresh: true })).toMatchObject([{ value: { kind: "lease", payload: oldLease } }]);
+    const replay = vi.fn();
+    const originalPlan = CommitOutbox.prototype.plan;
+    vi.spyOn(CommitOutbox.prototype, "plan").mockImplementation(function (this: CommitOutbox): CommitOutboxPlan {
+      const plan = originalPlan.call(this);
+      return { ...plan, replay: view => { replay(); return plan.replay(view); } };
+    });
+    const fresh = new StoreBridgeSide(hub, "ryzen2", () => NOW);
+    const equalUpdate = { ...presence, participants: [{ ...participant, name: "equal-token-recovered" }] } satisfies
+      Pick<BridgePresence, "hosts" | "participants">;
+    await expect(fresh.mirror(equalUpdate)).resolves.toBeUndefined();
+    expect(replay).toHaveBeenCalledOnce();
+    expect(hub.get(hostKey(identity.id), { fresh: true })?.value).toMatchObject({
+      startedAt: highLease.startedAt, incarnationToken: host.incarnationToken, remoteHost: "ryzen2",
+    });
+    expect(readHostLease(hub.root, identity.id)).toMatchObject({ startedAt: highLease.startedAt,
+      incarnationToken: host.incarnationToken });
+    expect(hub.get(participantKey(identity.id), { fresh: true })?.value).toMatchObject({ name: "equal-token-recovered" });
+    const stateBefore = hub.listAll("", { fresh: true });
+    const leasePath = hostLeasePath(hub.root, identity.id);
+    const leaseBefore = fs.readFileSync(leasePath);
+    // Y95 is newer than the incoming X90 metadata, but older than the retained X100 fence.
+    const between = { hosts: [{ record: { ...host, startedAt: host.startedAt + 500,
+      incarnationToken: "opaque-between-recovery" }, expiresAt: host.expiresAt }], participants: [participant] } satisfies
+      Pick<BridgePresence, "hosts" | "participants">;
+    await expect(new StoreBridgeSide(hub, "ryzen2", () => NOW).mirror(between))
+      .rejects.toMatchObject({ code: "FABRIC_BRIDGE_STALE_INCARNATION" });
+    expect(hub.listAll("", { fresh: true })).toEqual(stateBefore);
+    expect(fs.readFileSync(leasePath)).toEqual(leaseBefore);
+    expect(readHostLease(hub.root, identity.id)?.startedAt).toBe(highLease.startedAt);
     expect(removals).toEqual([]);
   });
 

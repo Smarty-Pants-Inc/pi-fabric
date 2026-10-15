@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { MeshLockTimeoutError } from "../src/core/atomic-write.js";
 import { MeshLockTicket, meshLockQueueDirectory } from "../src/mesh/lock-queue.js";
 import { MeshLock, MeshLockQueueExpiredError } from "../src/mesh/mesh-lock.js";
 
@@ -338,6 +339,64 @@ describe("fair mesh lock admission", () => {
       await vi.advanceTimersByTimeAsync(100);
       await pending;
     }
+  });
+
+  it.each([1, 2, 3] as const)("protocol %s: slow release-watch setup cannot acquire past the deadline", async (protocol) => {
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+    const root = scratch();
+    const canonical = path.join(root, ".lock");
+    fs.mkdirSync(canonical);
+    fs.writeFileSync(path.join(canonical, "owner"), `live-holder\n${process.pid}\n${Date.now()}\n`);
+    const lock = new MeshLock(root, { lockProtocol: protocol }, () => undefined);
+    await lock.ownIncarnation;
+    const watches = watchNotifications(() => {
+      vi.setSystemTime(Date.now() + 2_001);
+      fs.renameSync(canonical, path.join(root, "released-fixture"));
+    });
+    const operation = vi.fn(() => "acquired after budget");
+    const pending = lock.withLock(operation, 2_000).catch((error: unknown) => error);
+    await vi.advanceTimersByTimeAsync(0);
+    const result = await pending;
+    expect(result).toBeInstanceOf(MeshLockTimeoutError);
+    expect(result).not.toBeInstanceOf(MeshLockQueueExpiredError);
+    expect(result).toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT", attempts: 1 });
+    expect(operation).not.toHaveBeenCalled();
+    expect(watches.attempts).toEqual([root]);
+    expect(watches.handles[0]!.close).toHaveBeenCalled();
+    expect(names(root)).toEqual([]);
+    expect(fs.existsSync(canonical)).toBe(false);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it.each([1, 2, 3] as const)("protocol %s: promotion during slow predecessor-watch setup cannot acquire past the deadline", async (protocol) => {
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+    const root = scratch();
+    const head = ticket(root, 10_000);
+    expect(head.mayContend()).toBe(true);
+    const predecessor = path.join(meshLockQueueDirectory(root), names(root)[0]!);
+    const canonical = path.join(root, ".lock");
+    fs.mkdirSync(canonical);
+    fs.writeFileSync(path.join(canonical, "owner"), `live-holder\n${process.pid}\n${Date.now()}\n`);
+    const lock = new MeshLock(root, { lockProtocol: protocol }, () => undefined);
+    await lock.ownIncarnation;
+    const watches = watchNotifications(() => {
+      vi.setSystemTime(Date.now() + 2_001);
+      head.close(); // eligible on return, but only after its fixed acquisition budget
+      fs.renameSync(canonical, path.join(root, "released-fixture"));
+    });
+    const operation = vi.fn(() => "acquired after budget");
+    const pending = lock.withLock(operation, 2_000).catch((error: unknown) => error);
+    await vi.advanceTimersByTimeAsync(0);
+    const result = await pending;
+    expect(result).toBeInstanceOf(MeshLockQueueExpiredError);
+    expect(result).toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT", preLockCode: "FABRIC_MESH_LOCK_QUEUE_EXPIRED",
+      attempts: 0, waitedMs: 2_001, kind: "pre-lock" });
+    expect(operation).not.toHaveBeenCalled();
+    expect(watches.attempts).toEqual([predecessor]);
+    expect(watches.handles[0]!.close).toHaveBeenCalled();
+    expect(names(root)).toEqual([]);
+    expect(fs.existsSync(canonical)).toBe(false);
+    expect(vi.getTimerCount()).toBe(0);
   });
 
   it("abort during synchronous watch setup rejects with the exact reason without sleeping or leaking admission", async () => {

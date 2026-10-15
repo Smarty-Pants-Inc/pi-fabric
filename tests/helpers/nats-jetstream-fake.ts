@@ -53,8 +53,8 @@ export const fakeJetStream = (): FakeJetStreamServer => {
   let paused: (() => void)[] | undefined;
   const later = (run: () => void) => { if (paused) paused.push(run); else setImmediate(run); };
   const live = (seq: number) => seq >= Math.max(1, firstSeq) ? messages[seq - 1] : undefined;
-  const store = (data: Uint8Array, subject = "state"): number => {
-    const message = { seq: messages.length + 1, data: new Uint8Array(data), subject };
+  const store = (data: Uint8Array, subject = "state", msgID?: string): number => {
+    const message = { seq: messages.length + 1, data: new Uint8Array(data), subject, ...(msgID ? { msgID } : {}) };
     if (firstSeq === 0) firstSeq = message.seq;
     messages.push(message);
     for (const listener of listeners) later(() => listener(message));
@@ -95,7 +95,7 @@ export const fakeJetStream = (): FakeJetStreamServer => {
           calls.push("getMessage");
           await new Promise<void>(resolve => setImmediate(resolve));
           const message = server.hidden.has(seq) ? undefined : live(seq);
-          return message && { seq: message.seq, data: message.data };
+          return message && { seq: message.seq, data: message.data, ...(message.msgID ? { msgID: message.msgID } : {}) };
         },
         lastBySubject: async (_stream, subject) => {
           calls.push("lastBySubject");
@@ -103,7 +103,7 @@ export const fakeJetStream = (): FakeJetStreamServer => {
             const message = messages[seq - 1]!;
             // One stream (stream names are ignored), so subjects compare by their last segment (state, snapshot): a
             // backend on a root's hashed stream and a test replica opened as "S" read the same stream (smarty-dev#9663).
-            if (message.subject.split(".").at(-1) === subject.split(".").at(-1)) return { seq, data: message.data };
+            if (message.subject.split(".").at(-1) === subject.split(".").at(-1)) return { seq, data: message.data, ...(message.msgID ? { msgID: message.msgID } : {}) };
           }
           return undefined;
         },
@@ -126,7 +126,7 @@ export const fakeJetStream = (): FakeJetStreamServer => {
           if (seen !== undefined) return { seq: seen, duplicate: true };
           const verdict = server.beforePublish?.(data);
           if (expectLastSequence !== messages.length) throw new NatsWrongLastSequenceError(expectLastSequence, `wrong last sequence: ${messages.length}`);
-          const seq = store(data, subject);
+          const seq = store(data, subject, msgID);
           ids.set(msgID, seq);
           server.afterStore?.(seq);
           if (verdict === "lose-ack") throw Object.assign(new Error("timeout: no ack"), { name: "TimeoutError", transient: true });

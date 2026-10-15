@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 // importing the host package during extension load.
 
 const ENV_AGENT_DIR = "PI_CODING_AGENT_DIR";
-const CONFIG_DIR_NAME = ".pi";
+export const CONFIG_DIR_NAME = ".pi";
 
 const expandEnvDir = (envDir: string): string => {
   if (/^file:\/\//.test(envDir)) return fileURLToPath(envDir);

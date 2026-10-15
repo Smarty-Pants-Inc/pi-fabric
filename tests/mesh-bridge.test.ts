@@ -360,7 +360,8 @@ describe("presence mirror under contention (smarty-dev#2761)", () => {
       enabled: true, hostId: lane.hostId, rootId: lane.hostId, identity: lane.identity,
     });
     expect(directory.mirroredControlOwner(root.hostId, root.identity.id, root.identity.id))
-      .toEqual({ remoteHost: "forge", expiresAt: now + BRIDGE_LEASE_MS });
+      .toMatchObject({ remoteHost: "forge", expiresAt: now + BRIDGE_LEASE_MS,
+        mirror: { remoteHost: "forge", observedAt: now, sourceObservedAt: now, sourceUpdatedAt: now } });
     expect(directory.list({ scope: "project", fresh: true }).find((participant) => participant.id === root.identity.id))
       .toMatchObject({ stale: false });
     expect(presence).toHaveBeenCalledTimes(3);

@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { syncDirectoryChain, writeFileAtomic } from "../core/atomic-write.js";
+import { verifiedRemove } from "../storage/verified-remove.js";
 
 /** Host-owned send identity, retained with the receiver's durable queue, never user data. */
 export interface DeliverySend {
@@ -94,6 +95,8 @@ const compactPartition = (file: string, limits: DeliveryOutcomeLimits, at: numbe
     bytes += size; start -= 1;
   }
   const marker: DeliveryOutcomeTruncation = { truncated: true, dropped: dropped + start, at };
+  // ponytail: a compaction, not an expiry delete: the replacement keeps the newest records and the dropped count, and
+  // an appender whose inode it replaced re-appends (nlink 0 check below).
   writeFileAtomic(file, [JSON.stringify(marker), ...records.slice(start)].join("\n") + "\n", { durable: true, mode: 0o600 });
   indexes.delete(file);
 };
@@ -117,8 +120,16 @@ export const appendDeliveryOutcome = (
   for (const name of fs.readdirSync(directory)) {
     if (!/^\d{8}\.jsonl$/.test(name)) continue;
     const file = path.join(directory, name);
-    if (name.slice(0, 8) < cutoff) { fs.rmSync(file, { force: true }); indexes.delete(file); }
-    else retained.push(file);
+    // smarty-dev#8907: the inode (and mtime) seen at the expiry judgment is the only one removed: a late append or a
+    // replacement since then stays. Off Linux main's removal. The index goes only with a confirmed removal.
+    let judged: fs.Stats | undefined;
+    try { judged = fs.lstatSync(file); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") { indexes.delete(file); continue; } }
+    if (name.slice(0, 8) >= cutoff) retained.push(file);
+    // Files only (main's non-recursive rm): an expired non-file is left, never removed recursively.
+    else if (judged?.isFile() === false) continue;
+    else if (verifiedRemove(file, judged, { deleter: "deliveryOutcomeExpiry",
+      fallback: () => { fs.rmSync(file, { force: true }); return true; } }).removed) indexes.delete(file);
   }
   for (const file of retained.sort().reverse()) {
     if (indexedOutcomes(file).keys.has(key)) {

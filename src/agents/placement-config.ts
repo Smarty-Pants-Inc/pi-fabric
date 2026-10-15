@@ -8,6 +8,10 @@ export interface AgentPlacementConfig {
   default: "remote" | "local";
   /** Needs the selected target guarantees (empty is conservative); local is reserved. */
   capabilities: string[];
+  /** Host-owned shared-root overrides; absent means no caller-local paths are portable. */
+  sharedMounts?: string[];
+  /** Host-only literal picker argv; fleet defaults to the installed sibling picker. */
+  pickerCommand?: string[];
   /** Local/shared directory template containing result.md and the terminal rc marker. */
   resultDirectory?: string;
   /** Alternatively, prints JSON {rc:null} while pending, {rc,text,stderr?} after native exit. */
@@ -46,6 +50,20 @@ export const normalizeAgentPlacement = (value: unknown): AgentPlacementConfig | 
   if (capabilities.includes("local")) throw new AgentInputError("agents.placement.capabilities", 'Invalid agents.placement.capabilities: "local" is a reserved need, never a launcher capability');
   if ((input.resultDirectory === undefined) === (input.resultCommand === undefined)) throw new Error("agents.placement requires exactly one of resultDirectory or resultCommand");
   if (input.resultDirectory !== undefined && (typeof input.resultDirectory !== "string" || !path.isAbsolute(input.resultDirectory))) throw new Error("agents.placement.resultDirectory must be absolute");
+  let sharedMounts: string[] | undefined;
+  if (input.sharedMounts !== undefined) {
+    if (!Array.isArray(input.sharedMounts) || input.sharedMounts.length > 64) throw new Error("Invalid agents.placement.sharedMounts: expected absolute shared roots");
+    sharedMounts = [...new Set(input.sharedMounts.map((root: unknown) => {
+      if (typeof root !== "string" || !path.isAbsolute(root) || /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/u.test(root) || /\{[a-zA-Z]+\}/u.test(root)) {
+        throw new Error("Invalid agents.placement.sharedMounts: expected literal absolute shared roots");
+      }
+      const normalized = path.resolve(root);
+      if (normalized === path.parse(normalized).root) throw new Error("Invalid agents.placement.sharedMounts: filesystem root is not a shared mount");
+      return normalized;
+    }))];
+  }
+  const pickerCommand = input.pickerCommand === undefined ? undefined : argv(input.pickerCommand, "pickerCommand");
+  if (pickerCommand?.some(entry => /\{[a-zA-Z]+\}/u.test(entry))) throw new Error("agents.placement.pickerCommand requires literal argv, not placeholders");
   const command = argv(input.command, "command");
   if (command.some(entry => /\{(?:host|sshAlias|resultDir)\}/.test(entry))) throw new Error("agents.placement.command cannot use post-launch host/sshAlias/resultDir");
   let sshAliases: Record<string, string> | undefined;
@@ -62,6 +80,8 @@ export const normalizeAgentPlacement = (value: unknown): AgentPlacementConfig | 
   if (usesAlias && !Object.keys(sshAliases ?? {}).length) throw new Error("agents.placement {sshAlias} requires sshAliases mapping");
   return {
     command, default: input.default ?? "local", capabilities,
+    ...(sharedMounts ? { sharedMounts } : {}),
+    ...(pickerCommand ? { pickerCommand } : {}),
     ...(sshAliases ? { sshAliases } : {}),
     ...(input.resultDirectory !== undefined ? { resultDirectory: template(input.resultDirectory, "resultDirectory") } : {}),
     ...(input.resultCommand !== undefined ? { resultCommand: argv(input.resultCommand, "resultCommand") } : {}),

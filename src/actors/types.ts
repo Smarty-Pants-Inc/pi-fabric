@@ -275,11 +275,19 @@ export function normalizeActorBatching(value: unknown): FabricActorBatching {
   return result;
 }
 
+/** Exact authoritative claim revision, never a request-supplied caller identity. */
+export interface FabricActorSlotClaim {
+  key: string;
+  ifVersion: number;
+}
+
 /** Public creation input; file instructions are resolved only by the actor owner. */
 export type FabricActorCreateRequest = Omit<FabricActorRequest, "instructions"> & import("./instructions-file.js").FabricActorInstructionsSource;
 export interface FabricActorRequest extends FabricActorBatching {
-  /** Resident-host create deduplication key; reuse on retry (host-local, bounded retention). */
+  /** Stable creation retry identity; mandatory for enforced protected slot births. Resident-host retries reuse it. */
   idempotencyKey?: string;
+  /** Exact revision won by the authenticated Main on the native slot authority. */
+  slotClaim?: FabricActorSlotClaim;
   /** Storage and visibility boundary. Defaults to mesh.actorScope for compatibility. */
   scope?: FabricActorStorageScope;
   name: string;
@@ -366,6 +374,12 @@ export interface FabricActorSessionOrphan {
   role?: string;
   /** Durable mesh receipt acknowledged; absent means retry publication on the next read/event. */
   alarmPublishedAt?: number;
+  /** PRIVATE registry generation/outbox. Public tombstone fields are never authority. */
+  directorySettlement?: { by: string; at: number; settledAt?: number; retiredAt?: number; retiredBy?: string;
+    /** Compatibility with already persisted outboxes. */
+    previous?: { by: string; at: number; settledAt?: number; retiredAt?: number; retiredBy?: string };
+    /** Only receipts for the still-persisted legacy/shared/file copies, never an intent journal. */
+    persisted?: Array<{ by: string; at: number; settledAt?: number; retiredAt?: number; retiredBy?: string }> };
 }
 
 export interface FabricActorInfo extends FabricActorBatching {
@@ -542,7 +556,8 @@ export interface FabricActorDirective {
 }
 
 export interface FabricActorDeliveryRequest {
-  actor: FabricActorInfo;
+  /** Routing identity only: host alarms must not carry the diagnostic actor view. */
+  actor: Pick<FabricActorInfo, "id" | "name"> & Partial<Pick<FabricActorInfo, "status" | "rootId" | "ownerSessionId" | "project">>;
   message: FabricActorMessage;
   delivery: Exclude<FabricActorDelivery, "mailbox">;
   triggerTurn: boolean;

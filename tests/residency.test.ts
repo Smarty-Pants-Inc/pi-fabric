@@ -14,7 +14,7 @@ import { GlobalActorRegistry } from "../src/actors/global-registry.js";
 import { AgentsProvider } from "../src/providers/agents-provider.js";
 import { LifecycleBroker } from "../src/lifecycle/broker.js";
 import type { FabricInvocationContext } from "../src/protocol.js";
-import { runResidentHostFromConfigPath } from "../src/residency/host.js";
+import { runResidentHostFromConfigPath as runResidentHostFromConfigPathInProcess } from "../src/residency/host.js";
 import { AgentManager } from "../src/agents/manager.js";
 import { AgentCompletionInbox } from "../src/agents/completion-inbox.js";
 import { ActorRegistryStore } from "../src/actors/registry-store.js";
@@ -218,15 +218,53 @@ const rootHarness = async (name: string): Promise<RootHarness> => {
   };
 };
 
+// In-process hosts run by this file, by residency root: stopResident releases them through their own close path
+// (their abort signal), never by a signal to this process.
+// Every host started for a root is kept (a second start for one root may lose to the first), and each removes only itself.
+const inProcessHosts = new Map<string, Set<AbortController>>();
+const runResidentHostFromConfigPath = (configPath: string, signal?: AbortSignal): Promise<void> => {
+  const stopper = new AbortController();
+  if (signal?.aborted) stopper.abort();
+  else signal?.addEventListener("abort", () => stopper.abort(), { once: true });
+  const residencyRoot = path.dirname(configPath);
+  const stoppers = inProcessHosts.get(residencyRoot) ?? new Set<AbortController>();
+  stoppers.add(stopper);
+  inProcessHosts.set(residencyRoot, stoppers);
+  return runResidentHostFromConfigPathInProcess(configPath, stopper.signal).finally(() => {
+    stoppers.delete(stopper);
+    if (stoppers.size === 0 && inProcessHosts.get(residencyRoot) === stoppers) inProcessHosts.delete(residencyRoot);
+  });
+};
+
+const readOwner = (ownerPath: string): ResidentHostOwner | undefined => {
+  try {
+    return JSON.parse(fs.readFileSync(ownerPath, "utf8")) as ResidentHostOwner;
+  } catch {
+    return undefined;
+  }
+};
+
 const stopResident = async (config: ResidentHostConfig): Promise<void> => {
   const ownerPath = path.join(config.residencyRoot, "owner.json");
-  const owner = (() => {
-    try {
-      return JSON.parse(fs.readFileSync(ownerPath, "utf8")) as ResidentHostOwner;
-    } catch {
-      return undefined;
+  const owner = readOwner(ownerPath);
+  if (owner?.pid && (owner.pid === process.pid || owner.pid === process.ppid)) {
+    // An in-process host (this vitest fork) or the pool: a SIGTERM here, then the SIGKILL below once the fork never
+    // looks dead, ends the fork with no output. Release an in-process host through its own close path instead.
+    const stoppers = [...(inProcessHosts.get(config.residencyRoot) ?? [])];
+    if (stoppers.length === 0) {
+      // A host made directly (new ResidentHost): only its test can close it. Never signal ourselves; wait briefly for
+      // that close, then fail loudly so the caller keeps the root instead of deleting it under a live host.
+      await waitFor(() => readOwner(ownerPath)?.token !== owner.token, 5_000).catch(() => {
+        throw new Error(`stopResident: owner.json still names this test process (pid ${owner.pid}); its in-process host was not closed`);
+      });
+      return;
     }
-  })();
+    for (const stopper of stoppers) stopper.abort();
+    await waitFor(() => readOwner(ownerPath)?.token !== owner.token, 20_000).catch(() => {
+      throw new Error(`stopResident: owner.json still names this test process (pid ${owner.pid}) after its in-process stop; never signalling it`);
+    });
+    return;
+  }
   if (owner?.pid) {
     const alive = (): boolean => {
       try {
@@ -251,22 +289,26 @@ const stopResident = async (config: ResidentHostConfig): Promise<void> => {
 
 afterEach(async () => {
   vi.unstubAllEnvs();
+  const stopFailures: unknown[] = [];
   for (const root of roots.splice(0)) {
     const residencyDirectory = path.join(root, "mesh", "residency");
-    try {
-      for (const entry of fs.readdirSync(residencyDirectory)) {
-        const config = JSON.parse(
-          fs.readFileSync(path.join(residencyDirectory, entry, "config.json"), "utf8"),
-        ) as ResidentHostConfig;
-        await stopResident(config);
-      }
-    } catch {
-      // No resident host was created.
+    let entries: string[] = [];
+    try { entries = fs.readdirSync(residencyDirectory); } catch { /* No resident host was created. */ }
+    let stopFailed = false;
+    for (const entry of entries) {
+      let config: ResidentHostConfig;
+      try {
+        config = JSON.parse(fs.readFileSync(path.join(residencyDirectory, entry, "config.json"), "utf8")) as ResidentHostConfig;
+      } catch { continue; } // not a resident root
+      try { await stopResident(config); } catch (error) { stopFailed = true; stopFailures.push(error); }
     }
+    // A host that could not be stopped may still write: keep its root (the failure below names it).
+    if (stopFailed) continue;
     // A host that already removed owner.json (idle exit) may still be finishing its last mesh
     // writes: retry ENOTEMPTY briefly instead of failing the suite on a loaded runner.
     fs.rmSync(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
   }
+  if (stopFailures.length > 0) throw stopFailures[0];
 });
 
 describe("durable cwd validation", () => {
@@ -492,9 +534,13 @@ describe.skipIf(process.platform !== "linux" || !hasResidentHost)("S4 originatin
         residentRequestPreserved: true, controlActorLifecycleGatesClosed: true, successorToken: owner.token, replayedAcceptedInputOnce: true }));
       expect(state.mesh.latestSequence()).toBeGreaterThan(event.sequence);
     } finally {
+      // Probe (hosted ubuntu fork death on pi-fabric#902): whose pid owner.json names when cleanup starts.
+      const probeOwner = readOwner(ownerPath);
+      console.log(JSON.stringify({ probe: "S4-finally", mode, ownerPid: probeOwner?.pid ?? null, vitestPid: process.pid, vitestPpid: process.ppid }));
       // Release any faulted host/helper first, then join exact fixture-owned births.
       fs.rmSync(fault, { force: true });
       fs.writeFileSync(`${helperPath}.release`, "checked fixture drain");
+      await seed.close(); // the in-process seed first (idempotent): stopResident never signals this process
       await recovery?.close(); await client?.close();
       await stopResident(state.config);
       await stopAllOwned(launches.owned(), 2_000, 5_000);
@@ -686,9 +732,19 @@ describe("#169 round 2 public cleanup outcome", () => {
       });
       expect(fs.existsSync(marker)).toBe(true);
       failing.mockRestore();
+      if (process.platform === "linux" || process.platform === "darwin" || process.platform === "win32") {
       await expect(provider.invoke("remove", { id: actor.id }, context)).resolves.toEqual({ removed: true });
       expect(fs.existsSync(dir)).toBe(false);
       expect(fs.existsSync(marker)).toBe(false);
+      } else {
+        // On unsupported platforms the retry refuses before any delete (smarty-dev#8090; smarty-dev#11335): tree and marker kept.
+        await expect(provider.invoke("remove", { id: actor.id }, context)).resolves.toMatchObject({
+          removed: true, cleaned: false,
+          pending: `removal cleanup failed: Root actor tree deletion needs the Main publication fence, which this platform (${process.platform}) lacks (smarty-dev#8090); follow-up smarty-dev#11335; the root ${state.identity.id} actor tree is kept (a later remove or host start finishes it)`,
+        });
+        expect(fs.existsSync(dir)).toBe(true);
+        expect(fs.existsSync(marker)).toBe(true);
+      }
     } finally {
       failing?.mockRestore();
       controller.abort(); await running;
@@ -741,11 +797,21 @@ describe("#169 round 1 resident cleanup routing", () => {
       const retried = await request({ operation: "removeActor", id: actor.id });
       expect(retried).toMatchObject({ ok: true });
       expect(first.cleaned).toBe(false);
+      if (process.platform === "linux" || process.platform === "darwin" || process.platform === "win32") {
       expect(retried.pending).toBeUndefined();
       expect(fs.existsSync(dir)).toBe(false);
       expect(fs.existsSync(marker)).toBe(false);
       expect(fs.existsSync(removalsPath)).toBe(false);
       expect(fs.readFileSync(successor.sessionFile, "utf8")).toBe("successor history\n");
+      } else {
+        // On unsupported platforms no root actor tree deletion runs (smarty-dev#8090; smarty-dev#11335): pending, all kept.
+        expect(retried.cleaned).toBe(false);
+        expect(retried.pending).toBe(`removal cleanup failed: Root actor tree deletion needs the Main publication fence, which this platform (${process.platform}) lacks (smarty-dev#8090); follow-up smarty-dev#11335; the root ${state.identity.id} actor tree is kept (a later remove or host start finishes it)`);
+        expect(fs.existsSync(dir)).toBe(true);
+        expect(fs.existsSync(marker)).toBe(true);
+        expect(fs.existsSync(removalsPath)).toBe(true);
+        expect(fs.readFileSync(successor.sessionFile, "utf8")).toBe("successor history\n");
+      }
     } finally {
       failing?.mockRestore();
       controller.abort();
@@ -2282,7 +2348,19 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
       mainAgent: state.mainAgent,
       hostPath,
     });
-    await expect(reconnect.removeActor(actor.id)).resolves.toEqual({ removed: true });
+    if (process.platform === "linux" || process.platform === "darwin" || process.platform === "win32") {
+      await expect(reconnect.removeActor(actor.id)).resolves.toEqual({ removed: true });
+    } else {
+      const historyFile = path.join(state.config.actorRoot, actor.id, "session.jsonl");
+      fs.appendFileSync(historyFile, `${JSON.stringify({ testHistory: "resident reconnect removal" })}\n`);
+      const historyBeforeRemoval = fs.readFileSync(historyFile, "utf8");
+      // On unsupported platforms fence refusal follows revocation but precedes tree deletion; follow-up smarty-dev#11335.
+      const removal = await reconnect.removeActor(actor.id);
+      expect(removal).toEqual({ removed: true, cleaned: false,
+        pending: `removal cleanup failed: Root actor tree deletion needs the Main publication fence, which this platform (${process.platform}) lacks (smarty-dev#8090); follow-up smarty-dev#11335; the root ${state.identity.id} actor tree is kept (a later remove or host start finishes it)` });
+      expect(fs.existsSync(path.join(state.config.actorRoot, actor.id))).toBe(true);
+      expect(fs.readFileSync(historyFile, "utf8")).toBe(historyBeforeRemoval);
+    }
     // review/astra on pi-fabric#136: actor activations leave no saved durable task result.
     const resultsDir = path.join(state.config.residencyRoot, "results");
     expect(fs.existsSync(resultsDir) ? fs.readdirSync(resultsDir) : []).toEqual([]);

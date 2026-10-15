@@ -1,7 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
 import { resolveAgentDir } from "../core/agent-dir.js";
-import * as piConversationHost from "@earendil-works/pi-coding-agent";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { TUI } from "@earendil-works/pi-tui";
 import type { CodePreviewSettings } from "./code-preview.js";
@@ -80,7 +79,7 @@ export class FabricUiController {
   #widgetMounted = false;
   #widget: FabricWidget | undefined;
   #hostStreaming: boolean | undefined;
-  #lastRefreshErrorAt = 0;
+  #reportedRefreshErrors = new Set<string>();
   #lastRefreshAt = 0;
   #dashboardOpen = false;
   #conversationOpen = false;
@@ -170,7 +169,7 @@ export class FabricUiController {
     this.#meshOffset = 0;
     this.#snapshot = emptySnapshot();
     this.#widgetRetention.clear();
-    this.#lastRefreshErrorAt = 0;
+    this.#reportedRefreshErrors.clear();
     this.#lastRefreshAt = 0;
     this.#dashboardOpen = false;
     this.#activityRevision = undefined;
@@ -252,10 +251,13 @@ export class FabricUiController {
     this.#conversationOpen = true;
     const epoch = this.#epoch;
     try {
-      // Native lazy imports cannot see Pi's extension-loader aliases/virtual modules.
-      const { initializeConversationHost } = await import("./conversation-host.js");
+      // Fabric is native ESM, so Pi's jiti virtual modules never apply: resolve
+      // the running CLI's own SDK rather than a bare (unbundled) package import.
+      const [{ initializeConversationHost }, { loadHostSdk }] =
+        await Promise.all([import("./conversation-host.js"), import("../core/host-sdk.js")]);
+      const conversationHost = await loadHostSdk();
       if (epoch !== this.#epoch) return;
-      initializeConversationHost(piConversationHost);
+      initializeConversationHost(conversationHost);
       const [{ FabricConversationView, FabricConversationState }, { conversationTargets, resolveConversationTarget }, { readConversationAppearance }, { NativeConversationReader }, { imageSafeCustom }] =
         await Promise.all([import("./conversation.js"), import("./conversation-targets.js"), import("./conversation-chrome.js"), import("./conversation-native-reader.js"), import("./image-overlays.js")]);
       if (epoch !== this.#epoch) return;
@@ -726,10 +728,9 @@ export class FabricUiController {
   }
 
   #reportRefreshError(error: unknown): void {
-    const now = Date.now();
-    if (this.#lastRefreshErrorAt && now - this.#lastRefreshErrorAt < 10_000) return;
-    this.#lastRefreshErrorAt = now;
     const message = error instanceof Error ? error.message : String(error);
+    if (this.#reportedRefreshErrors.has(message)) return;
+    this.#reportedRefreshErrors.add(message);
     // A host UI can already be disposed. Error reporting must not escape a timer either.
     try { this.#context?.ui.notify(`Fabric dashboard refresh failed: ${message}`, "warning"); }
     catch { /* stale UI; the lifecycle cleanup owns it */ }

@@ -11,6 +11,7 @@ import { ActorMeshMonitor } from "../src/actors/mesh-monitor.js";
 import { ActorLogStore } from "../src/actors/log-store.js";
 import { ActorChildCompletionStore } from "../src/actors/child-completions.js";
 import { GlobalActorRegistry } from "../src/actors/global-registry.js";
+import { slotAdmissionFor } from "../src/actors/slot-admission.js";
 import { FabricActorBatchPolicyError, normalizeActorBatching } from "../src/actors/types.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { MeshStore, type MeshEvent, type MeshIdentity } from "../src/mesh/store.js";
@@ -126,6 +127,64 @@ const inputs = (run: AgentRunRequest): Input[] => {
 };
 
 describe("actor window batching on the durable receiver path", () => {
+  it("strict release drain holds an expired window until resume without changing its original IDs", async () => {
+    const f = await fixture();
+    const actor = await create(f.actors);
+    fakeClock();
+    f.send({ ref: "before-drain-1" });
+    f.send({ ref: "before-drain-2" });
+    const ids = f.snapshot(actor.id).items.map(item => item.id);
+    f.actors.pauseForRelease({ strict: true });
+    await vi.advanceTimersByTimeAsync(W);
+    expect(f.runs).toHaveLength(0);
+    expect(f.snapshot(actor.id).items.map(item => item.id)).toEqual(ids);
+    f.actors.resumeAfterRelease();
+    await settled(f.actors, actor.id);
+    expect(f.runs).toHaveLength(1);
+    expect(inputs(f.runs[0]!).map(item => item.id)).toEqual(ids);
+  });
+
+  it.each([{ window: W, count: 1 }, { window: W, count: 2 }, { window: 0, count: 2 }])(
+    "unreadable slot authority retains all $count originals (window=$window) and resumes their identities", async ({ window, count }) => {
+    const f = await fixture();
+    let readable = true;
+    vi.spyOn(slotAdmissionFor(f.mesh), "requiresEnforcement").mockImplementation(() => {
+      if (!readable) throw new Error("slot authority is temporarily unreadable");
+      return false;
+    });
+    const actor = await create(f.actors, { batchWindowMs: window, batchMax: count });
+    f.runStub.mockImplementationOnce(async request => {
+      f.runs.push(request);
+      readable = false;
+      throw new Error("recorded unlaunched slot refusal");
+    });
+    const accepted: string[] = [];
+    for (let index = 0; index < count; index++) {
+      f.send({ ref: `slot-held-${index}` });
+      accepted.push(f.actors.messages(actor.id).filter(message => message.direction === "in").at(-1)!.id);
+    }
+    for (let turn = 0; turn < 100 && (f.runs.length === 0 || f.actors.inFlightCount() > 0); turn++) {
+      await new Promise<void>(resolve => setImmediate(resolve));
+    }
+    expect(f.runs).toHaveLength(1);
+    expect(f.actors.inFlightCount()).toBe(0);
+    expect(f.snapshot(actor.id).items.map(item => item.id).sort()).toEqual([...accepted].sort());
+    const activationId = f.runs[0]!.activationId;
+    readable = true;
+    f.actors.resumeAfterRelease();
+    await new Promise<void>(resolve => setImmediate(resolve));
+    await settled(f.actors, actor.id);
+    expect(f.runs).toHaveLength(window > 0 ? 2 : count + 1);
+    if (window > 0) {
+      expect(f.runs[1]!.activationId).toBe(activationId);
+      expect(inputs(f.runs[1]!).map(item => item.id)).toEqual(accepted);
+    } else {
+      // Ordinary failed singleton preparation retains its existing queue rotation.
+      expect(f.runs.slice(1).map(run => JSON.parse(run.task.slice(run.task.indexOf("\n\n") + 2)).id).sort())
+        .toEqual([...accepted].sort());
+    }
+  });
+
   it("5-minute window: ten original inputs in FIFO order, one activation and no sliding timer", async () => {
     const f = await fixture();
     const actor = await create(f.actors);

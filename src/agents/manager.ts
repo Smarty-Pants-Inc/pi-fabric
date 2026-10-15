@@ -2216,7 +2216,7 @@ export class AgentManager {
         if (launchCancelled) {
           // Return a custody handle even for immediate admission. Actor run/wait
           // remains joined to this exact attempt until a retry confirms exit.
-          void this.stop(id).catch(() => undefined);
+          void this.#stop(id, true, false).catch(() => undefined);
         } else {
           void this.#monitor(managed, timeoutMs, deadlineAt).catch((error) => {
             // Failed cleanup leaves result/admission pending and custody retained.
@@ -3028,7 +3028,7 @@ export class AgentManager {
     const managed = this.#runs.get(id);
     if (!managed || managed.settled || this.#closing) return;
     if (!this.#observedWork(managed)) {
-      void this.stop(id).catch(() => undefined);
+      void this.#stop(id, true, false).catch(() => undefined);
       return;
     }
     this.#detach(managed, "caller aborted; the run continues");
@@ -3558,8 +3558,8 @@ export class AgentManager {
     persistRunStopIntent(managed.runDirectory, reason, recoveryRecord);
   }
 
-  /** Internal close joins execution custody without acknowledging an actor result. */
-  async #stop(id: string, consumeSettled: boolean): Promise<AgentRunResult> {
+  /** Lifecycle stops join execution custody without creating operator intent. */
+  async #stop(id: string, consumeSettled: boolean, persistIntent = true): Promise<AgentRunResult> {
     const queued = this.#queued.get(id);
     if (queued) {
       queued.background = false;
@@ -3567,7 +3567,7 @@ export class AgentManager {
       await queued.pending;
       // Admission may have promoted this queued receipt while stop was joining
       // launch. Join its installed execution fence, not a terminal queue fallback.
-      if (this.#runs.has(id)) return this.#stop(id, consumeSettled);
+      if (this.#runs.has(id)) return this.#stop(id, consumeSettled, persistIntent);
       if (queued.cleanupPending) throw new Error(`Agent ${id} execution exit unconfirmed; custody retained: ${queued.cleanupPending}`);
       return queued.result;
     }
@@ -3576,7 +3576,7 @@ export class AgentManager {
     const managed = this.#requireRun(id);
     // Persist operator intent before transport work only while the run is open.
     // Settled runs can still own detached execution groups which must be drained below.
-    if (!managed.settled) this.#persistStopIntent(managed, "explicit");
+    if (persistIntent && !managed.settled) this.#persistStopIntent(managed, "explicit");
     managed.stopRequested = true;
     // Stop retracts notices; guest publication still uses its deferred receipt.
     managed.background = false;
@@ -4074,11 +4074,11 @@ export class AgentManager {
     const running = tracked.filter((managed) => !managed.settled);
     const lastEventAt = new Map(running.map((managed) => [managed.id, lastEventTime(managed)]));
     const stopped = await Promise.allSettled([
-      ...tracked.map((managed) => this.#stop(managed.id, false)),
+      ...tracked.map((managed) => this.#stop(managed.id, false, false)),
       ...[...this.#unregisteredTransports].map(async (transport) => {
         if (!await this.#stopUnregisteredTransport(transport)) throw new Error("Unregistered execution exit unconfirmed");
       }),
-      ...queuedAtClose.map((queued) => this.#stop(queued.info.id, false)),
+      ...queuedAtClose.map((queued) => this.#stop(queued.info.id, false, false)),
     ]);
     // A reload or shutdown ends these runs; tell the spawner's session (smarty-dev#1602).
     const results = stopped.flatMap((outcome) =>
@@ -4979,6 +4979,11 @@ export class AgentManager {
           "timed_out",
           `Agent timed out after ${timeoutMs}ms`,
         );
+        // Deadline cancellation can publish a confirmed stopped receipt before
+        // we synthesize the timeout verdict. Retain its native exit code only.
+        if (completed?.status === "stopped" && completed.exitCode !== undefined) {
+          timedOut.exitCode = completed.exitCode;
+        }
         writeJsonAtomic(managed.statusFile, timedOut, { space: 2, durable: true });
         await this.#captureWorktree(managed);
         this.#settle(managed, timedOut);

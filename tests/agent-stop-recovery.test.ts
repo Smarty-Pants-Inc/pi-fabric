@@ -17,6 +17,67 @@ afterEach(async () => {
 });
 
 describe("durable explicit-stop recovery", () => {
+  it.each(["caller abort", "host close"])("relaunches restored leading work after %s without operator stop intent", async cancellation => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "agent-lifecycle-recovery-"));
+    roots.push(root);
+    const actorId = "lifecycle-actor";
+    const activationId = "lifecycle-activation";
+    const task = JSON.stringify({ task: "restored leading work", actorId, id: activationId }, null, 2);
+    const options = { workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root };
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, timeoutMs: 30_000 }, options);
+    managers.push(manager);
+    const controller = new AbortController();
+    let alive = true;
+    let close!: () => void;
+    const closed = new Promise<void>(resolve => { close = resolve; });
+    let calls = 0;
+    // This synthetic PID is known dead to the manager; only the mock transport
+    // reports liveness, so draining it must never signal a real process.
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async request => {
+      const completed = ++calls === 2;
+      const args = request.workerArguments;
+      const argument = (name: string): string => args[args.indexOf(name) + 1]!;
+      fs.writeFileSync(argument("--status-file"), JSON.stringify({
+        id: argument("--id"), actorId, name: argument("--name"), task,
+        status: completed ? "completed" : "running", runner: "pi", transport: "process",
+        sessionId: "2147483000", cwd: argument("--cwd"), startedAt: Date.now(), updatedAt: Date.now(),
+        turns: 0, toolCalls: 0, text: completed ? "restored worker answer" : "",
+        usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
+      }));
+      return {
+        kind: "process", sessionId: "2147483000", isAlive: async () => completed ? false : alive,
+        closed: completed ? Promise.resolve() : closed,
+        stop: async () => { alive = false; close(); },
+      } as Awaited<ReturnType<ProcessTransport["launch"]>>;
+    });
+    let recovered: AgentManager | undefined;
+    try {
+      const handle = await manager.spawn({ task, actorId, activationId, transport: "process" }, controller.signal);
+      expect(launch).toHaveBeenCalledTimes(1);
+      if (cancellation === "caller abort") {
+        controller.abort();
+        await manager.wait(handle.id);
+      } else {
+        await manager.close();
+      }
+      recovered = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents }, options);
+      managers.push(recovered);
+      const result = await recovered.run({ task, actorId, activationId, transport: "process" });
+      expect(result).toMatchObject({ status: "completed", text: "restored worker answer" });
+      expect(result.id).not.toBe(handle.id);
+      expect(launch).toHaveBeenCalledTimes(2);
+    } finally {
+      alive = false;
+      close();
+      try {
+        await manager.close();
+        await recovered?.close();
+      } finally {
+        launch.mockRestore();
+      }
+    }
+  });
+
   it("replays a persistently stopped activation without launching it again", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "agent-stop-recovery-"));
     roots.push(root);

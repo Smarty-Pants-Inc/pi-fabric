@@ -135,7 +135,10 @@ const reportSecondary = (primary: unknown, error: MeshLockReleaseError): void =>
     const list = secondaryReports.get(primary as object);
     if (list) list.push(error); else secondaryReports.set(primary as object, [error]);
   }
-  try { console.warn(`[pi-fabric] ALARM ${error.kind} (secondary to ${primary instanceof Error ? "Error instance" : typeof primary}): ${error.message}`); }
+  let category: string = typeof primary;
+  try { if (primary instanceof Error) category = "Error instance"; }
+  catch { /* revoked proxies cannot suppress the fixed fallback warning */ }
+  try { console.warn(`[pi-fabric] ALARM ${error.kind} (secondary to ${category}): ${error.message}`); }
   catch { /* the report never masks the primary */ }
 };
 

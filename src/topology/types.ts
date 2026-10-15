@@ -115,6 +115,8 @@ export interface FabricHostRecord {
   incarnationToken?: string;
   /** Locally observed tokens superseded by this mirror; bounded and absent on legacy records. */
   bridgeSupersededTokens?: string[];
+  /** Root-local first-seen ordinals for retained superseded tokens; absent on legacy records. */
+  bridgeSupersededTokenSeen?: Record<string, number>;
   startedAt: number;
   updatedAt: number;
   expiresAt: number;

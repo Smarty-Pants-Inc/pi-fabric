@@ -429,7 +429,7 @@ const settled = (value: Record<string, unknown>): string =>
  * A bridge side over a mesh store on this host. `peer` names the other side: it is the
  * `remoteHost` mark on mirrored records and the `bridge.from` of events it bridges in.
  */
-interface BridgeLease { id: string; rootId: string; identityId: string; updatedAt: number; expiresAt: number; startedAt?: number; incarnationToken?: string; bridgeSupersededTokens?: string[] }
+interface BridgeLease { id: string; rootId: string; identityId: string; updatedAt: number; expiresAt: number; startedAt?: number; incarnationToken?: string; bridgeSupersededTokens?: string[]; bridgeSupersededTokenSeen?: Record<string, number>; historySeenFloor?: Record<string, number> }
 /**
  * A removed mirror's lease identity, as its lease file carries it (root, identity, start and token).
  * A row without root, identity and incarnation (an older release's) proves no owner: it removes nothing.
@@ -447,8 +447,49 @@ const bridgeSupersededTokensOf = (value: unknown): string[] => {
   return [...new Set(value.filter((token): token is string => typeof token === "string" && token.length > 0))]
     .slice(-BRIDGE_SUPERSEDED_TOKEN_LIMIT);
 };
-const mergeBridgeSupersededTokens = (...histories: readonly string[][]): string[] =>
-  [...new Set(histories.flat())].slice(-BRIDGE_SUPERSEDED_TOKEN_LIMIT);
+type BridgeSupersededHistory = { tokens?: unknown; seen?: unknown };
+const bridgeSupersededSeenOf = (value: unknown): Record<string, number> => {
+  if (!isObject(value)) return {};
+  const seen: Record<string, number> = Object.create(null);
+  for (const [token, sequence] of Object.entries(value)) {
+    if (token.length > 0 && Number.isSafeInteger(sequence) && (sequence as number) >= 0) seen[token] = sequence as number;
+  }
+  return seen;
+};
+const mergeBridgeSupersededHistory = (
+  sources: readonly BridgeSupersededHistory[], additions: readonly string[] = [],
+): { tokens: string[]; seen: Record<string, number>; firstSeen: Record<string, number> } => {
+  const order: string[] = [];
+  const sequences = new Map<string, number>();
+  const origins = new Map<string, { source: number; index: number }>();
+  for (const [sourceIndex, source] of sources.entries()) {
+    for (const [token, sequence] of Object.entries(bridgeSupersededSeenOf(source.seen))) {
+      sequences.set(token, Math.min(sequences.get(token) ?? Infinity, sequence));
+    }
+    for (const [index, token] of bridgeSupersededTokensOf(source.tokens).entries()) {
+      if (!origins.has(token)) { order.push(token); origins.set(token, { source: sourceIndex, index }); }
+    }
+  }
+  let next = -1;
+  for (const sequence of sequences.values()) next = Math.max(next, sequence);
+  next += 1;
+  for (const token of additions) if (token && !order.includes(token)) {
+    origins.set(token, { source: -1, index: order.length });
+    order.push(token);
+    sequences.set(token, next++);
+  }
+  // Missing ordinals are legacy evidence: preserve each chain's order and place secondary
+  // chains before the primary chain when relative age is unknowable, so eviction favors authority.
+  const sorted = order.map(token => ({ token, origin: origins.get(token)!, sequence: sequences.get(token) }))
+    .sort((a, b) => a.sequence === undefined ? (b.sequence === undefined
+      ? b.origin.source - a.origin.source || a.origin.index - b.origin.index
+      : -1) : b.sequence === undefined ? 1
+      : a.sequence - b.sequence || b.origin.source - a.origin.source || a.origin.index - b.origin.index);
+  const retained = sorted.slice(-BRIDGE_SUPERSEDED_TOKEN_LIMIT);
+  return { tokens: retained.map(item => item.token),
+    seen: Object.fromEntries(retained.flatMap(item => item.sequence === undefined ? [] : [[item.token, item.sequence]])),
+    firstSeen: Object.fromEntries(sequences) };
+};
 
 /** Refuse only a token proven superseded by this mesh's persisted local history. */
 const olderBridgeIncarnation = (
@@ -1119,16 +1160,17 @@ export class StoreBridgeSide implements BridgeSide {
         // Same-peer mirrors are intentionally absent from reservations, but still prove a root's
         // incarnation across new link objects. Lease authority also survives a missing state row.
         const incarnations = new Map<string, Array<{ startedAt?: number; incarnationToken?: string }>>();
-        const superseded = new Map<string, string[]>();
+        const superseded = new Map<string, BridgeSupersededHistory[]>();
         const currentTokens = new Map<string, string[]>();
-        const remember = (rootId: string, record: { startedAt?: unknown; incarnationToken?: unknown; bridgeSupersededTokens?: unknown }): void => {
+        const remember = (rootId: string, record: { startedAt?: unknown; incarnationToken?: unknown;
+          bridgeSupersededTokens?: unknown; bridgeSupersededTokenSeen?: unknown }): void => {
           const known = incarnations.get(rootId) ?? [];
           known.push(incarnationOf(record));
           incarnations.set(rootId, known);
+          // Union all local evidence before bounding, including an older authority's history.
+          superseded.set(rootId, [...(superseded.get(rootId) ?? []),
+            { tokens: record.bridgeSupersededTokens, seen: record.bridgeSupersededTokenSeen }]);
           const token = incarnationOf(record).incarnationToken;
-          // An authority already proven superseded cannot reinsert its aged-out history.
-          if (token !== undefined && superseded.get(rootId)?.includes(token)) return;
-          superseded.set(rootId, mergeBridgeSupersededTokens(superseded.get(rootId) ?? [], bridgeSupersededTokensOf(record.bridgeSupersededTokens)));
           if (token !== undefined) currentTokens.set(rootId, [...new Set([...(currentTokens.get(rootId) ?? []), token])]);
         };
         for (const entry of hostEntries) {
@@ -1146,7 +1188,7 @@ export class StoreBridgeSide implements BridgeSide {
           // Refuse the whole batch, rather than omitting this host from wanted: omission would
           // delete the newer mirror, its participants and its lease in the removal pass below.
           // Check before liveness filtering too: an expired stale frame proves no withdrawal.
-          if (olderBridgeIncarnation(record, superseded.get(record.rootId) ?? [])) {
+          if (olderBridgeIncarnation(record, mergeBridgeSupersededHistory(superseded.get(record.rootId) ?? []).tokens)) {
             throw new BridgeStaleIncarnationError(record.rootId);
           }
           // A mirror never outlives its origin (smarty-dev#6477): it keeps the origin's absolute
@@ -1166,8 +1208,9 @@ export class StoreBridgeSide implements BridgeSide {
           const token = incarnation.incarnationToken;
           const priorTokens = token === undefined ? []
             : (currentTokens.get(record.rootId) ?? []).filter(held => held !== token);
-          const history = mergeBridgeSupersededTokens(superseded.get(record.rootId) ?? [], priorTokens);
-          const admitted = { ...record, ...incarnation, bridgeSupersededTokens: history };
+          const history = mergeBridgeSupersededHistory(superseded.get(record.rootId) ?? [], priorTokens);
+          const admitted = { ...record, ...incarnation, bridgeSupersededTokens: history.tokens,
+            bridgeSupersededTokenSeen: history.seen };
           hosts.set(record.id, admitted);
           wanted.set(keyFor(HOST_PREFIX, record.id), {
             value: { ...admitted, updatedAt: now, expiresAt: until, remoteHost: relayed ? record.remoteHost : this.peer },
@@ -1175,7 +1218,11 @@ export class StoreBridgeSide implements BridgeSide {
           });
           // The lease carries the same age floor as the host, including lease-only authority.
           leases.push({ id: record.id, rootId: record.rootId, identityId: record.identity.id, ...incarnation,
-            bridgeSupersededTokens: history, updatedAt: renewedAt, expiresAt: until });
+            bridgeSupersededTokens: history.tokens, bridgeSupersededTokenSeen: history.seen,
+            // Keep the bounded sources' first-seen evidence until the file effect completes;
+            // otherwise an evicted duplicate could reenter from disk with a later ordinal.
+            historySeenFloor: history.firstSeen,
+            updatedAt: renewedAt, expiresAt: until });
         }
         for (const participant of presence.participants) {
           const owner = hosts.get(participant.ownerHostId);
@@ -1309,21 +1356,30 @@ export class StoreBridgeSide implements BridgeSide {
       // matches the held row. Leave that authority intact for recovery's recomputation.
       if (bridgeIncarnationWithFloor(lease, [onDisk]).startedAt !== incarnationOf(lease).startedAt) return;
     }
-    // A replayed row never shortens a lease that a later pass already renewed.
+    // Keep pending effects from shortening an already renewed same-incarnation lease, but do
+    // not let that fast path skip repair of history split between state, file and outbox.
     const sameIncarnation = onDisk && onDisk.startedAt === lease.startedAt && onDisk.identityId === lease.identityId &&
       onDisk.rootId === lease.rootId && onDisk.incarnationToken === lease.incarnationToken;
-    if (replay && sameIncarnation && onDisk.expiresAt >= lease.expiresAt) return;
-    // Nor does a live effect of the same incarnation: concurrent mirror batches for one peer, host
-    // and incarnation can run their effects out of order, and the older one still matches start/token
-    // (smarty-dev#6939). A lease of another incarnation is replaced whatever its expiry.
-    if (onDisk && sameIncarnation && (onDisk.expiresAt > lease.expiresAt ||
-        (onDisk.expiresAt === lease.expiresAt && onDisk.updatedAt === lease.updatedAt))) return;
-    // Histories are oldest-to-newest: append the planned (newer) history after the
-    // disk's older observation so bounded eviction cannot resurrect a discarded token.
-    const history = mergeBridgeSupersededTokens(
-      onDisk?.rootId === lease.rootId ? bridgeSupersededTokensOf(onDisk.bridgeSupersededTokens) : [],
-      bridgeSupersededTokensOf(lease.bridgeSupersededTokens));
-    writeHostLease(this.store.root, { ...lease, ...(history.length ? { bridgeSupersededTokens: history } : {}) });
+    const history = mergeBridgeSupersededHistory([
+      { tokens: held.bridgeSupersededTokens, seen: held.bridgeSupersededTokenSeen },
+      { tokens: lease.bridgeSupersededTokens, seen: lease.bridgeSupersededTokenSeen },
+      { seen: lease.historySeenFloor },
+      ...(onDisk?.rootId === lease.rootId ? [{ tokens: onDisk.bridgeSupersededTokens, seen: onDisk.bridgeSupersededTokenSeen }] : []),
+    ]);
+    const base = sameIncarnation && onDisk ? {
+      ...lease,
+      updatedAt: Math.max(lease.updatedAt, onDisk.updatedAt),
+      expiresAt: Math.max(lease.expiresAt, onDisk.expiresAt),
+    } : lease;
+    const { historySeenFloor: _floor, ...leaseFields } = base;
+    const repaired = { ...leaseFields, bridgeSupersededTokens: history.tokens,
+      bridgeSupersededTokenSeen: history.seen };
+    if (sameIncarnation && onDisk && onDisk.updatedAt >= lease.updatedAt && onDisk.expiresAt >= lease.expiresAt &&
+        JSON.stringify(history.tokens) === JSON.stringify(bridgeSupersededTokensOf(onDisk.bridgeSupersededTokens)) &&
+        JSON.stringify(history.seen) === JSON.stringify(bridgeSupersededSeenOf(onDisk.bridgeSupersededTokenSeen))) return;
+    // A different incarnation is replaced; a same-token renewal carries forward the file's
+    // liveness highwater and merged metadata without shortening either deadline.
+    writeHostLease(this.store.root, repaired);
   }
 
   async bridgedIds(after: number): Promise<BridgedIds> {

@@ -275,7 +275,7 @@ describe("FabricUiController dashboard wiring", () => {
       await new Promise(resolve => setImmediate(resolve));
       expect(state.queueUserMessage).toHaveBeenCalledWith("session:test", "finish the review", "steer");
       expect(context.ui.notify).toHaveBeenCalledExactlyOnceWith("Steer queued for Main", "info");
-    } finally { dashboard?.dispose(); controller.stop(); await flushFabricDiagnostics(); vi.unstubAllEnvs(); }
+    } finally { dashboard?.dispose(); controller.stop(); await flushFabricDiagnostics(); vi.unstubAllEnvs(); fs.rmSync(root, { recursive: true, force: true }); }
   });
 
   it.each(["resolve", "reject"] as const)("fences pending dashboard model discovery %s at controller stop (#5962)", async outcome => {

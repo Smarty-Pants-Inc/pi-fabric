@@ -323,6 +323,37 @@ describe("trajectory executor handoff failure continuation", () => {
     return { ctx, session, ext, controller, invoke };
   };
 
+  it.each(["failed", "succeeded", "aborted", "timed_out", "signal-aborted"] as const)(
+    "early task-spawn refusal respects the outer %s outcome", async outcome => {
+      const h = prepare();
+      const run = execution();
+      run.success = outcome === "succeeded";
+      run.trace = { ...run.trace, outcome: outcome === "signal-aborted" ? "failed" : outcome };
+      run.audits = [{ ref: "agents.handoff", nestedToolCallId: "refused", startedAt: 1,
+        success: false, errorCode: "FABRIC_AGENT_SPAWN_FORBIDDEN" }];
+      const state = {
+        pi: h.ext.value, config: normalizeFabricConfig({}), prewalk: h.controller,
+        ensure: async () => {}, execution: { execute: async () => run },
+        claimHandoff: async () => undefined,
+      } as unknown as FabricState;
+      const tool = createFabricExecTool(state, defaultCodePreviewSettings(), new Map(), value => value);
+      const ctx = Object.assign(Object.create(h.ctx.value), {
+        tools: [], executeTool: async () => { throw new Error("unexpected nested host call"); },
+      });
+      const signal = outcome === "signal-aborted" ? AbortSignal.abort() : undefined;
+      await tool.execute("early-refusal", { code: "return 1" }, signal, undefined, ctx);
+      if (outcome === "failed") {
+        expect(h.ext.sendMessage).toHaveBeenCalledTimes(1);
+        expect(h.ext.sendMessage.mock.calls[0]![1]).toEqual({ deliverAs: "steer", triggerTurn: true });
+        await tool.execute("early-refusal-again", { code: "return 2" }, undefined, undefined, ctx);
+        expect(h.ext.sendMessage).toHaveBeenCalledTimes(1);
+      } else {
+        expect(h.ext.sendMessage).not.toHaveBeenCalled();
+        expect(h.ext.value.appendEntry).not.toHaveBeenCalled();
+      }
+    },
+  );
+
   it("capable failed nested-handoff continuation keeps the calling task agent's id per #2636", async () => {
     const h = prepare();
     Object.assign(h.ext.value, { hostCapabilities: { turnProvenance: 1 } });

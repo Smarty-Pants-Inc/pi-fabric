@@ -74,7 +74,7 @@ import {
 import { checkedHandoffCompaction } from "../agents/handoff.js";
 import { checkedSeed, completedBranchPrefix, snippetTask } from "../agents/fork-seed.js";
 import { readAgentLineage } from "../agents/child-env.js";
-import { assertAgentSpawnAllowed, snapshotAgentSpawnEnvironment } from "../agents/spawn-authority.js";
+import { assertAgentSpawnAllowed, snapshotAgentSpawnEnvironment, type AgentSpawnCaller } from "../agents/spawn-authority.js";
 import { childScope, sessionScope } from "../scope.js";
 import { withInheritedSessionPins } from "../agents/session-pins.js";
 import type {
@@ -447,6 +447,7 @@ export class AgentsProvider implements FabricProvider {
   readonly #projectLeadId: string | undefined;
   readonly #taskReturnAddress = readTaskReturnAddress();
   readonly #spawnEnvironment: NodeJS.ProcessEnv;
+  readonly #spawnCaller: AgentSpawnCaller;
   readonly name = "agents";
   /** Session registry of `provider:` participants; stop/steer/followUp route there. */
   providerParticipants: ProviderParticipantRegistry | undefined;
@@ -470,6 +471,9 @@ export class AgentsProvider implements FabricProvider {
     readonly routeEvaluate: (request: JevRequest, signal: AbortSignal, context: FabricInvocationContext) => Promise<JevResponse> = async () => { throw new Error("Jev routing unavailable"); },
   ) {
     this.#spawnEnvironment = snapshotAgentSpawnEnvironment();
+    // Bind authority at bootstrap, not to mutable adapter or invocation metadata.
+    const identity = actorManager.identity;
+    this.#spawnCaller = identity ? Object.freeze({ kind: identity.kind, id: identity.id }) : undefined;
     this.#projectLeadId = recordedProjectLead(manager.cwd ?? process.cwd());
     this.#router = new AgentMessageRouter(
       manager, actorManager, mainAgent, participants, control,
@@ -854,7 +858,7 @@ export class AgentsProvider implements FabricProvider {
   }
 
   #assertAgentSpawnAllowed(): void {
-    assertAgentSpawnAllowed(this.actorManager.identity, this.#spawnEnvironment);
+    assertAgentSpawnAllowed(this.#spawnCaller, this.#spawnEnvironment);
   }
 
   #mainWaitAtBound(record: object, timeoutMs: number): Record<string, unknown> {

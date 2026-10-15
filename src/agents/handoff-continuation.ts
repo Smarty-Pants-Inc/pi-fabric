@@ -17,6 +17,7 @@ export const queueHandoffFailureContinuation = (
   extension: ExtensionAPI,
   context: ExtensionContext,
   result: Record<string, unknown>,
+  delivery: "steer" | "followUp" = "followUp",
 ): boolean => {
   if (result.completed === true || result.status !== "failed" || context.signal?.aborted) return false;
   if (result.error instanceof Error && ["AbortError", "TimeoutError"].includes(result.error.name)) return false;
@@ -40,7 +41,7 @@ export const queueHandoffFailureContinuation = (
     extension.appendEntry(HANDOFF_CONTINUATION_MESSAGE_TYPE, details);
     sendFabricMessage(extension,
       { customType: HANDOFF_CONTINUATION_MESSAGE_TYPE, content: EXECUTOR_CONTINUATION_PROMPT, display: false, details },
-      { deliverAs: "followUp", triggerTurn: true }, identity, "followUp", "mesh",
+      { deliverAs: delivery, triggerTurn: true }, identity, delivery, "mesh",
     );
     return true;
   } catch {

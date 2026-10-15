@@ -19,6 +19,7 @@ import {
 } from "./ui/code-preview-shell.js";
 import { fabricExecTitleHintCached } from "./ui/fabric-title-hint.js";
 import { Type } from "typebox";
+import { queueHandoffFailureContinuation } from "./agents/handoff-continuation.js";
 import {
   createFabricPersistedExecutionDetails,
   readFabricExecutionRenderDetails,
@@ -959,6 +960,18 @@ export const createFabricExecTool = (
             "warning",
           );
         }
+      } else if (!signal?.aborted && result.trace.outcome === "failed" && result.audits.some(audit =>
+        audit.ref === "agents.handoff" && audit.success === false &&
+        audit.errorCode === "FABRIC_AGENT_SPAWN_FORBIDDEN",
+      ) && queueHandoffFailureContinuation(state.pi, context, { status: "failed" }, "steer")) {
+        // Refusal happens before deferHandoff, so there is no boundary runner
+        // to queue the seeded executor's one direct-work fallback. Keep the
+        // refusal authoritative and never retry or grant spawn authority.
+        // A caught refusal that completed, or a cancelled/timed-out outer run,
+        // must not be turned into another implementation turn.
+        // Steer at the next tool-loop turn: unlike a terminating deferred
+        // boundary, this path still owes an ordinary inference after its result.
+        state.prewalk.cancel();
       } else if (state.prewalk.planRequired(boundarySessionId)) {
         // This boundary was withheld because the plan is still owed. Reflect the
         // planning phase instead of leaving the footer reading "armed".

@@ -229,6 +229,38 @@ describe("dead-letter replay age and current activation filter (#10630)", () => 
     expect(receipts(manager, w.actor.id)).toEqual([{ replayed: 3, archivedStale: 6, filterSkipped: 1, remaining: 0 }]);
   });
 
+  it("archives raw stale entries before coalescing live keys by sequence, preserving FIFO and the current filter", async () => {
+    const w = await backlog({ coalesceKey: "payload.number" });
+    const now = Date.now();
+    const staleAge = DEFAULT_DEAD_LETTER_REPLAY_MAX_AGE_MS + 60_000;
+    // [key, mesh sequence, recorded age]: stale duplicates outrank every live event.
+    // Both live keys disagree with recorded-age order; key 88 also disagrees with file order.
+    const rows: Array<[number | undefined, number, number]> = [
+      [77, 900, staleAge], [77, 800, staleAge],
+      [77, 20, 2_000], [88, 60, 5_000], [77, 40, 4_000], [88, 30, 1_000],
+      [undefined, 50, 3_000], [88, 700, staleAge], [55, 70, 1_000], [undefined, 10, 6_000],
+    ];
+    for (const [index, entry] of w.entries.entries()) {
+      const [number, sequence, age] = rows[index]!;
+      entry.event.data = { payload: number === undefined ? {} : { number } };
+      entry.event.sequence = sequence;
+      entry.event.kind = index === 8 ? "noise" : "work";
+      entry.at = now - age;
+    }
+    fs.writeFileSync(w.file, w.entries.map(entry => JSON.stringify(entry) + "\n").join(""));
+    const manager = w.open();
+    await manager.setActivationFilter(w.actor.id, [{ id: "noise", kind: ["noise"] }]);
+    await waitFor(() => receipts(manager, w.actor.id).length === 1);
+    expect(w.queued()).toEqual([4, 3, 6, 9].map(index => w.entries[index]!.event.id));
+    expect(readLines<Entry>(w.archive)).toEqual([0, 1, 7].map(index => w.entries[index]!));
+    expect(readLines(w.file)).toEqual([]);
+    expect(manager.status(w.actor.id).filterSkipped.count).toBe(1);
+    expect(manager.messages(w.actor.id)).toContainEqual(expect.objectContaining({
+      reason: "filtered: noise", data: { filteredItemId: w.entries[8]!.event.id },
+    }));
+    expect(receipts(manager, w.actor.id)).toEqual([{ replayed: 4, archivedStale: 3, filterSkipped: 1, remaining: 0 }]);
+  });
+
   it("an expired current filter does not skip a fresh dead letter", async () => {
     const w = await backlog();
     const manager = w.open();

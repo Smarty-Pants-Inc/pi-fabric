@@ -12,6 +12,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { meshLockQueueDirectory } from "./lock-queue.js";
+import { verifiedRemove } from "../storage/verified-remove.js";
 import { censusHostSlug, censusRecordAlive, censusRecordPrunable } from "./store.js";
 import {
   validWriterHost, validWriterLockProtocol, validWriterPid, validWriterReleaseSha, validWriterStartedAt,
@@ -202,23 +203,66 @@ export function censusSync(root: string): WriterCensusReport {
         reason: `${directory}: ENOENT on a root with ${initialized.map(file => path.relative(root, file)).join(", ")}` });
     }
   }
+  // Refusal is evidence, including an entry held off-name in a graveyard. Only an ENOENT
+  // before any move, confirmed at the original name, is absence (smarty-dev#11570).
+  const removeJudged = (file: string, name: string, judged: fs.Stats, deleter: string): void => {
+    // ponytail: Linux stays identity-bound, with no fallback; off Linux main's existing pathname
+    // removal is the accepted residual of smarty-dev#7858.
+    const result = verifiedRemove(file, judged, { deleter, fallback: () => { fs.rmSync(file, { force: true }); return true; } });
+    if (result.removed) return;
+    if (result.graveyard === undefined && !result.reason.includes("graveyard") && /\(ENOENT\)$/.test(result.reason)) {
+      try { fs.lstatSync(file); } catch (error) { if (errno(error) === "ENOENT") return; }
+    }
+    add({ source: "process-record", name,
+      reason: `${file}: removal refused: ${result.reason}${result.graveyard !== undefined ? ` (at ${result.graveyard})` : ""}` });
+  };
   const ownPrefix = `${censusHostSlug(host)}-`;
   for (const name of names) {
+    const file = path.join(directory, name);
     if (!name.endsWith(".json")) {
       // A record is renamed into place whole: a temporary of this host's dead pid is a torn write.
       // Anything else (a live writer's write in flight, a renamed record) hides a writer: unknown.
       const temporary = name.startsWith(ownPrefix) ? /^(\d+)-\d+\.json\.[0-9a-f]+\.tmp$/.exec(name.slice(ownPrefix.length)) : null;
-      if (temporary && !processAlive(Number(temporary[1]))) {
-        try { fs.rmSync(path.join(directory, name), { force: true }); } catch { /* best effort */ }
-      } else add({ source: "process-record", name, reason: `${path.join(directory, name)}: not a census record` });
+      if (temporary) {
+        let judged: fs.Stats;
+        try { judged = fs.lstatSync(file); }
+        catch (error) {
+          if (errno(error) !== "ENOENT") add({ source: "process-record", name, reason: `${file}: ${errno(error)}` });
+          continue;
+        }
+        // Never grant recursive or link-removal authority, even at a temporary name.
+        if (judged.isFile() && !processAlive(Number(temporary[1]))) {
+          removeJudged(file, name, judged, "censusTornWrite");
+          continue;
+        }
+      }
+      add({ source: "process-record", name, reason: `${file}: not a census record` });
       continue;
     }
-    let text: string;
-    try { text = fs.readFileSync(path.join(directory, name), "utf8"); }
-    catch (error) {
-      // Removed since the listing (its writer exited): gone. Any other read failure is unknown.
-      if (errno(error) !== "ENOENT") {
-        add({ source: "process-record", name, reason: `${path.join(directory, name)}: ${errno(error)}` });
+    let text: string, judged: fs.Stats;
+    let fd: number | undefined;
+    try {
+      // Reject links and directories before opening (including platforms without O_NOFOLLOW).
+      const named = fs.lstatSync(file);
+      if (!named.isFile()) {
+        add({ source: "process-record", name, reason: `${file}: not a regular census file` });
+        continue;
+      }
+      fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0));
+      try {
+        // Both the judged identity and bytes belong to this held fd, before prunability.
+        judged = fs.fstatSync(fd);
+        const current = fs.lstatSync(file);
+        if (!judged.isFile() || !current.isFile() || judged.dev !== named.dev || judged.ino !== named.ino) {
+          add({ source: "process-record", name, reason: `${file}: changed while opening census record` });
+          continue;
+        }
+        text = fs.readFileSync(fd, "utf8");
+      } finally { fs.closeSync(fd); }
+    } catch (error) {
+      // Only absence before the open is no evidence. An fd read/stat failure is unknown.
+      if (fd !== undefined || errno(error) !== "ENOENT") {
+        add({ source: "process-record", name, reason: `${file}: ${errno(error)}` });
       }
       continue;
     }
@@ -232,7 +276,7 @@ export function censusSync(root: string): WriterCensusReport {
       continue;
     }
     if (censusRecordPrunable(fields, host)) {
-      try { fs.rmSync(path.join(directory, name), { force: true }); } catch { /* best effort */ }
+      removeJudged(file, name, judged, "censusRecordPrune");
       continue;
     }
     const record = fields as unknown as MeshWriterRecord;

@@ -224,6 +224,17 @@ export class FabricBridgeStaleError extends Error {
   }
 }
 
+/** Bounded local startup authority. Never mirrored or inferred from PID alone. */
+export interface FabricHostStartup {
+  ownerIncarnation: string;
+  sessionId: string;
+  cwd: string;
+  host: string;
+  pid: number;
+  startTime: string;
+  until: number;
+}
+
 export interface FabricHostLease {
   id: string;
   rootId: string;
@@ -234,6 +245,12 @@ export interface FabricHostLease {
   startedAt?: number;
   /** Unique incarnation fence; absent only on historical writers. */
   incarnationToken?: string;
+  /** Control epoch and local process identity survive adoption by the full runtime. */
+  ownerIncarnation?: string;
+  process?: { pid: number; host: string; startTime: string };
+  startup?: FabricHostStartup;
+  /** Predecessor-authored release, fenced to this exact lease token after work has drained. */
+  cleanHandoff?: string | undefined;
   /** Root Main's bounded reload lease; absent on ordinary heartbeats and older writers. */
   reloadUntil?: number;
   /** Main session has a fixed 15 s TTL, independent of the host TTL. */
@@ -347,10 +364,18 @@ const samePredecessor = (left: FabricHostLease | undefined, right: FabricHostLea
     left.incarnationToken !== undefined || right.incarnationToken !== undefined ? sameHostLeaseOwner(left, right) :
       left.id === right.id && left.rootId === right.rootId && left.identityId === right.identityId && left.startedAt === right.startedAt;
 
+interface HostLeaseClaimOptions {
+  claim?: boolean;
+  expected?: FabricHostLease | undefined;
+  /** Admission fence against CURRENT bytes inside custody; throw to refuse replacement.
+   * Ordinary directory claims/renewals retain their existing reload protocol. */
+  beforeReplace?: ((current: FabricHostLease) => void) | undefined;
+}
+
 /** Synchronous lease CAS; caller MUST hold this host's leaseCustody gate through the write.
  * Reload successors use it in the successful shared commit hook, never before a timed-out batch. */
 export const commitHostLeaseUnderCustody = (meshRoot: string, lease: FabricHostLease,
-  options: { claim?: boolean; expected?: FabricHostLease | undefined } = {}): void => {
+  options: HostLeaseClaimOptions = {}): void => {
   if (!lease.incarnationToken) throw new TypeError("Host lease mutation requires an incarnation token");
   const expected = options.expected;
   const current = hostLeasePredecessor(meshRoot, lease.id);
@@ -362,7 +387,9 @@ export const commitHostLeaseUnderCustody = (meshRoot: string, lease: FabricHostL
   if (!owned && (!options.claim || !samePredecessor(current, expected))) {
     throw new FabricHostLeaseSupersededError(lease.id, lease.identityId, lease.startedAt);
   }
-  writeHostLease(meshRoot, { ...lease,
+  if (!owned && current && options.claim) options.beforeReplace?.(current);
+  // Any resumed publication revokes a prior clean handoff, even if the caller copied it.
+  writeHostLease(meshRoot, { ...lease, cleanHandoff: undefined,
     ...(current && owned && lease.reloadUntil === undefined ? {
       updatedAt: Math.max(lease.updatedAt, current.updatedAt),
       expiresAt: Math.max(lease.expiresAt, current.expiresAt),
@@ -377,19 +404,19 @@ export const commitHostLeaseUnderCustody = (meshRoot: string, lease: FabricHostL
 /** Initial claim compares the captured predecessor, not clocks; subsequent renewal never
  * recreates a missing/different lease. Legacy admission has one expiry/deadline wake only. */
 export const renewHostLease = async (mesh: HostLeaseMesh, lease: FabricHostLease,
-  options: HostLeaseLockOptions & { claim?: boolean; expected?: FabricHostLease | undefined } = {}): Promise<void> => {
+  options: HostLeaseLockOptions & HostLeaseClaimOptions = {}): Promise<void> => {
   if (!lease.incarnationToken) throw new TypeError("Host lease mutation requires an incarnation token");
   const expected = options.claim
     ? Object.hasOwn(options, "expected") ? options.expected : hostLeasePredecessor(mesh.root, lease.id)
     : undefined;
-  if (expected && expected.incarnationToken === undefined && expected.expiresAt > Date.now()) {
+  if (!options.beforeReplace && expected && expected.incarnationToken === undefined && expected.expiresAt > Date.now()) {
     const waitMs = Math.min(expected.expiresAt - Date.now(), options.timeoutMs ?? Number.POSITIVE_INFINITY);
     if (waitMs <= 0) throw new FabricHostLeaseLegacyBusyError(lease.id, expected.expiresAt);
     await waitForLegacyExpiry(waitMs, options.signal); // ONE wake, never a renewal/poll loop.
   }
   try {
     await withHostLeaseLock(mesh, hostLeasePath(mesh.root, lease.id), () => {
-      commitHostLeaseUnderCustody(mesh.root, lease, { claim: options.claim ?? false, expected });
+      commitHostLeaseUnderCustody(mesh.root, lease, { claim: options.claim ?? false, expected, beforeReplace: options.beforeReplace });
     }, { ...options, lease: { incarnationToken: lease.incarnationToken, expiresAt: lease.expiresAt } });
   } catch (error) {
     if (error instanceof HostLeaseLockLostError) throw new FabricHostLeaseSupersededError(lease.id, lease.identityId, lease.startedAt);
@@ -471,6 +498,17 @@ const parseLease = (file: string, name: string): { read: boolean; lease?: Fabric
   return { read: true, lease: leaseOf(text, name) };
 };
 
+const validProcess = (value: unknown): value is NonNullable<FabricHostLease["process"]> => {
+  const p = value as NonNullable<FabricHostLease["process"]> | undefined;
+  return !!p && Number.isSafeInteger(p.pid) && p.pid > 0 && typeof p.host === "string" &&
+    typeof p.startTime === "string" && p.startTime.length > 0;
+};
+const validStartup = (value: unknown): value is FabricHostStartup => {
+  const s = value as FabricHostStartup | undefined;
+  return validProcess(s) && typeof s?.ownerIncarnation === "string" && s.ownerIncarnation.length > 0 &&
+    typeof s.sessionId === "string" && typeof s.cwd === "string" && Number.isFinite(s.until);
+};
+
 const leaseOf = (text: string, name: string): FabricHostLease | undefined => {
   try {
     const value = JSON.parse(text) as Record<string, unknown>;
@@ -491,6 +529,10 @@ const leaseOf = (text: string, name: string): FabricHostLease | undefined => {
       updatedAt: value.updatedAt, expiresAt: value.expiresAt,
       ...(typeof value.startedAt === "number" && Number.isFinite(value.startedAt) ? { startedAt: value.startedAt } : {}),
       ...(typeof value.incarnationToken === "string" ? { incarnationToken: value.incarnationToken } : {}),
+      ...(typeof value.ownerIncarnation === "string" ? { ownerIncarnation: value.ownerIncarnation } : {}),
+      ...(typeof value.cleanHandoff === "string" && value.cleanHandoff === value.incarnationToken ? { cleanHandoff: value.cleanHandoff } : {}),
+      ...(validStartup(value.startup) ? { startup: value.startup } : {}),
+      ...(validProcess(value.process) ? { process: value.process } : {}),
       ...(typeof value.reloadUntil === "number" ? { reloadUntil: value.reloadUntil } : {}),
       ...(validSession(value.session) ? { session: value.session } : {}),
       ...(validMirrorLease(value.mirror) ? { mirror: value.mirror } : {}),

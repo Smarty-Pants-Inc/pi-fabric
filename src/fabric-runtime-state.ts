@@ -94,6 +94,7 @@ import { extensionContextLive } from "./session-liveness.js";
 import type { FabricLifecycleEventType } from "./lifecycle/types.js";
 import { FabricControlPlane } from "./topology/control-plane.js";
 import { ParticipantDirectory } from "./topology/participant-directory.js";
+import type { StartingHostClaim } from "./topology/starting-host.js";
 import { rootParticipantName, validName } from "./topology/participant-name.js";
 import { herdrNameLookup, herdrPaneId, readHerdrAgentName } from "./topology/herdr-name.js";
 import type {
@@ -657,7 +658,7 @@ export class FabricRuntimeState {
   async initialize(
     context: ExtensionContext,
     bootstrapConfig?: FabricConfig,
-    options: { lifecycle?: () => boolean } = {},
+    options: { lifecycle?: () => boolean; startingHost?: StartingHostClaim | undefined } = {},
   ): Promise<void> {
     // FabricState passes its activation lease; direct callers (tests, standalone hosts) keep a
     // lease bound to this same ctx, else bind for the runtime's life.
@@ -957,6 +958,7 @@ export class FabricRuntimeState {
     let inboxMaintenance: MainInboxMaintenance | undefined;
     this.#participantsEpoch = epoch;
     this.#participants = new ParticipantDirectory(this.#mesh, {
+      ...(options.startingHost ? { startingHost: options.startingHost } : {}),
       beforePublication: async () => {
         // Hand the early acquisition failure to start() once, without another inline
         // timeout. Its existing warning/heartbeat path owns recovery from here.
@@ -1593,6 +1595,8 @@ export class FabricRuntimeState {
       agentsProvider.acceptControl(command, from, signal, verification));
     try {
       await this.#participants.start();
+      await this.#participants.finishStartup();
+      this.#control.notifyStartupReady();
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
       console.warn(

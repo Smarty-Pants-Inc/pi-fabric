@@ -1,9 +1,13 @@
 import { appendDeliveryOutcome, type DeliverySend } from "../mesh/delivery-outcomes.js";
 import type { MeshControlIncarnationFence } from "../config.js";
-import { FabricBridgeStaleError, FabricParticipantStaleError, mirroredOwnerRoutingStatus, participantLeaseGraceMs, waitForMirroredLeaseRenewal, type FabricMirrorLease, type MirrorLeaseWaitBudget } from "./host-leases.js";
+import { FabricBridgeStaleError, FabricParticipantStaleError, mirroredOwnerRoutingStatus, participantLeaseGraceMs, waitForMirroredLeaseRenewal, readHostLeaseCurrent, sameHostLeaseOwner, withOwnedHostLease, type FabricHostLease, type FabricMirrorLease, type MirrorLeaseWaitBudget } from "./host-leases.js";
+import { assertStartingHost, startingHost, localStartTime, hostLeasePredecessorGone } from "./starting-host.js";
+import { openStartingInbox, readStartingFollowUp, listStartingFollowUps, writeStartingFollowUp,
+  readStartingFollowUpCompletion, completeStartingFollowUp, removeStartingFollowUp } from "./starting-inbox.js";
+import os from "node:os";
 import { retryDelayMs } from "../core/retry-backoff.js";
 import { FabricPeerLeaseStaleError } from "../agents/peer-lease-stale.js";
-import { assertSteerPriority, type FabricSteerPriority } from "../main-agent.js";
+import { assertSteerPriority, type FabricSteerPriority, type FabricAgentMessageResult } from "../main-agent.js";
 import { copyFabricPrincipal, copyFabricWakeCause, fabricWakeCause, withFabricWakeAdmission, type FabricWakeCause, type FabricPrincipal } from "../fabric-provenance.js";
 import { FOLLOW_UP_RUNNING_TASK_MESSAGE, type AgentFollowUpRunningWarning } from "../agents/types.js";
 import { FabricTargetTerminalError, terminalRejectionFields } from "../agents/terminal-target.js";
@@ -255,6 +259,16 @@ const isObject = (value: unknown): value is Record<string, unknown> =>
 
 const isIncarnation = (value: unknown): value is string =>
   typeof value === "string" && value.length > 0 && value.length <= 128;
+
+/** Same-session retained work, never a route to another participant or physical host.
+ * Caller holds CURRENT receiver lease custody; the recorded event remains immutable. */
+const canAdoptStartingFollowUp = (recorded: FabricHostLease, current: FabricHostLease): boolean =>
+  recorded.id === current.id && recorded.rootId === current.id && recorded.identityId === current.id &&
+  current.rootId === current.id && current.identityId === current.id &&
+  current.id === `session:${current.session?.id}` && recorded.session?.id === current.session?.id &&
+  recorded.startup?.sessionId === current.session?.id && recorded.startup?.host === os.hostname() &&
+  !recorded.mirror && !recorded.mirrorLease && (!recorded.writer || recorded.writer.host === os.hostname()) &&
+  hostLeasePredecessorGone(recorded);
 
 const controlAcceptanceBytes = (acceptance: FabricControlAcceptance): number =>
   Buffer.byteLength(JSON.stringify(acceptance), "utf8");
@@ -555,6 +569,16 @@ export class FabricControlPlane {
    * shared state (see #acceptCommand).
    */
   readonly #seen: MeshStore;
+  readonly #startingInboxes = new Map<string, MeshStore>();
+
+  #startingInbox(targetId: string, create = false): MeshStore | undefined {
+    let inbox = this.#startingInboxes.get(targetId);
+    if (!inbox) {
+      inbox = openStartingInbox(this.mesh, targetId, create);
+      if (inbox) this.#startingInboxes.set(targetId, inbox);
+    }
+    return inbox;
+  }
 
   constructor(
     readonly mesh: MeshStore,
@@ -590,6 +614,76 @@ export class FabricControlPlane {
     this.#armWatch();
     this.#subscribeStateChanges();
     this.#wake(); // a microtask: a synchronous pause() right after start() still gates it
+  }
+
+  /** Native startup admission is inbox durability, NOT an owner ACK or a model wake. */
+  async queueStartingFollowUp(targetId: string, input: FabricControlInput,
+    idempotencyKey: string, signal?: AbortSignal, from: MeshIdentity = this.identity): Promise<FabricAgentMessageResult | undefined> {
+    const lease = startingHost(this.mesh.root, targetId);
+    if (!lease) {
+      const current = readHostLeaseCurrent(this.mesh.root, targetId);
+      // A failed local creation witness cannot fall back to its future startup TTL.
+      // Foreign physical hosts retain their existing remote routing contract.
+      if (current && !current.mirror && !current.mirrorLease && current.rootId === targetId &&
+        current.identityId === targetId && (current.startup?.host === os.hostname() ||
+          current.process?.host === os.hostname() && localStartTime(current.process.pid) !== current.process.startTime))
+        throw new FabricParticipantStaleError(targetId, 0, idempotencyKey);
+      return undefined;
+    }
+    const commandId = createHash("sha256").update(JSON.stringify([
+      this.options.hostId, targetId, targetId, targetId, "followUp", idempotencyKey, 0,
+    ])).digest("hex");
+    await withOwnedHostLease(this.mesh, lease, async () => {
+      signal?.throwIfAborted();
+      assertStartingHost(this.mesh.root, lease);
+      const inbox = this.#startingInbox(targetId, true)!;
+      const completed = readStartingFollowUpCompletion(inbox.root, commandId);
+      if (completed) {
+        if (completed.incarnationToken !== lease.incarnationToken || completed.ownerIncarnation !== lease.ownerIncarnation)
+          throw new FabricParticipantStaleError(targetId, 0, idempotencyKey);
+        if (completed.senderId !== from.id) throw new Error("Startup followUp idempotency collision");
+        return; // Already durable in Main: no payload publication, wake or startup ACK.
+      }
+      const row = readStartingFollowUp(inbox.root, commandId);
+      if (row) {
+        if ((!sameHostLeaseOwner(row.lease, lease) || row.lease.ownerIncarnation !== lease.ownerIncarnation) &&
+          !canAdoptStartingFollowUp(row.lease, lease))
+          throw new FabricParticipantStaleError(targetId, 0, idempotencyKey);
+        if (row.event?.from.id !== from.id || !row.event?.data ||
+          (row.event.data as FabricControlCommand).targetId !== targetId) throw new Error("Startup followUp idempotency collision");
+        // Reconfirm durability after an ambiguous prior save and re-emit the wake:
+        // the sender may have closed between committing the row and publishing its hint.
+        writeStartingFollowUp(inbox.root, commandId, row);
+        assertStartingHost(this.mesh.root, lease);
+        await this.mesh.publish({ topic: "fabric.control.startup-inbox", kind: "committed", from,
+          to: targetId, data: { commandId } });
+        return;
+      }
+      // The host's real mesh publication stamps the sender/principal envelope. Never
+      // reconstruct authority from data, including on replay after the sender closes.
+      const event = await inbox.publish({ topic: CONTROL_TOPIC, kind: "followUp", from,
+        principal: input.principal, to: targetId, signal,
+        data: (committedAt: number) => {
+          assertStartingHost(this.mesh.root, lease);
+          return { version: 1, commandId, targetId, operation: "followUp", replyTo: this.options.hostId,
+            ownerIncarnation: lease.ownerIncarnation, destinationRemoteHost: null,
+            startupLeaseToken: lease.incarnationToken, message: input.message, data: input.data,
+            ...(input.wakeCause ? { wakeCause: copyFabricWakeCause(input.wakeCause) } : {}),
+            triggerTurn: input.triggerTurn ?? true, requestedAt: committedAt, requestCreatedAt: committedAt,
+            deadlineAt: lease.startup!.until };
+        },
+      });
+      signal?.throwIfAborted();
+      assertStartingHost(this.mesh.root, lease);
+      writeStartingFollowUp(inbox.root, commandId, { format: 1, lease, event });
+      assertStartingHost(this.mesh.root, lease);
+      // Only payload-free metadata crosses the global mesh. The private durable
+      // row, not this post-commit hint, owns work.
+      await this.mesh.publish({ topic: "fabric.control.startup-inbox", kind: "committed", from,
+        to: targetId, data: { commandId } });
+    });
+    return { queued: true, messageId: commandId, routed: "mesh", triggered: false,
+      reason: "startup-inbox-durable" };
   }
 
   async request(
@@ -1178,6 +1272,11 @@ export class FabricControlPlane {
     this.#retryTimer = undefined;
   }
 
+  /** Lifecycle ready edge: rescan durable startup rows even if an earlier event was drained. */
+  notifyStartupReady(): void {
+    if (!this.#closed) this.#wake();
+  }
+
   resume(): void {
     if (this.#closed || !this.#paused) return;
     this.#paused = false;
@@ -1287,6 +1386,8 @@ export class FabricControlPlane {
     for (const active of this.#activeCommands.values()) active.controller.abort();
     await Promise.allSettled([...this.#activeHandlers]);
     this.#handler = undefined;
+    for (const inbox of this.#startingInboxes.values()) inbox.closeState();
+    this.#startingInboxes.clear();
   }
 
   /** True only when a drain read the log to its end; a gated or paused drain retains its work. */
@@ -1490,6 +1591,7 @@ export class FabricControlPlane {
       if (tail.events.length < 100) break;
     }
     if (this.#paused || this.options.canConsumeMesh?.() === false) return false;
+    await this.#drainStartingFollowUps();
     await this.#cleanupSeen(Date.now()).catch(rethrowMeshLockTimeout);
     return true;
   }
@@ -1556,7 +1658,61 @@ export class FabricControlPlane {
     return remoteHost !== undefined && isObject(data.bridge) && data.bridge.from === remoteHost;
   }
 
+  async #drainStartingFollowUps(): Promise<void> {
+    if (!this.#handler) return;
+    const inbox = this.#startingInbox(this.options.hostId);
+    if (!inbox) return;
+    for (const { commandId } of listStartingFollowUps(inbox.root)) {
+      this.#assertAdmission();
+      const owner = readHostLeaseCurrent(this.mesh.root, this.options.hostId);
+      if (!owner || owner.ownerIncarnation !== this.incarnation || owner.mirror || owner.mirrorLease ||
+        owner.rootId !== this.options.hostId || owner.identityId !== this.identity.id ||
+        owner.process?.host !== os.hostname() || owner.process.pid !== process.pid ||
+        localStartTime(owner.process.pid) !== owner.process.startTime) continue;
+      // Hold CURRENT custody, not the dead row's token. The source event is never
+      // republished or restamped: commandId, sender and principal remain original.
+      await withOwnedHostLease(this.mesh, owner, async () => {
+        this.#assertAdmission();
+        const current = readHostLeaseCurrent(this.mesh.root, this.options.hostId);
+        if (!current || !sameHostLeaseOwner(current, owner) || current.ownerIncarnation !== this.incarnation ||
+          current.process?.pid !== owner.process?.pid || current.process?.host !== owner.process?.host ||
+          current.process?.startTime !== owner.process?.startTime) return;
+        const row = readStartingFollowUp(inbox.root, commandId);
+        if (row?.format !== 1 || row.event?.to !== this.options.hostId || row.lease?.id !== this.options.hostId ||
+          ((!sameHostLeaseOwner(row.lease, owner) || row.lease.ownerIncarnation !== this.incarnation) &&
+            !canAdoptStartingFollowUp(row.lease, owner))) return;
+        const command = commandFromEvent(row.event);
+        if (!command || command.commandId !== commandId || command.operation !== "followUp" ||
+          command.ownerIncarnation !== row.lease.ownerIncarnation || command.targetId !== this.options.hostId ||
+          row.event.verification !== "mesh" || !isObject(row.event.data) ||
+          !row.lease.incarnationToken || row.event.data.startupLeaseToken !== row.lease.incarnationToken) return;
+        const completed = readStartingFollowUpCompletion(inbox.root, commandId);
+        if (completed && completed.incarnationToken === owner.incarnationToken && completed.ownerIncarnation === this.incarnation &&
+          completed.senderId === row.event.from.id) {
+          removeStartingFollowUp(inbox.root, commandId);
+          return;
+        }
+        // Bind the outcome to this successor, but retain the old source row until
+        // Main durably accepts it. A crash in that gap replays the SAME deliveryId
+        // into Main's journal/session receipt dedup, never a new logical command.
+        const adopted = { ...row, lease: owner };
+        if (row.acceptance) {
+          if (row.acceptance.accepted) completeStartingFollowUp(inbox.root, commandId, adopted, row.acceptance);
+          return;
+        }
+        // The startup deadline bounded admission, not already durable work.
+        const acceptance = await this.#handler!(command, row.event.from, new AbortController().signal, row.event.verification);
+        this.#assertAdmission();
+        if (acceptance.accepted) completeStartingFollowUp(inbox.root, commandId, adopted, acceptance);
+        else writeStartingFollowUp(inbox.root, commandId, { ...row, acceptance });
+      });
+    }
+  }
+
   async #acceptCommand(event: MeshEvent): Promise<void> {
+    // Startup events are drained ONLY from their durable queue row by its exact
+    // lease/epoch. In particular a predecessor must not publish a stale rejection.
+    if (isObject(event.data) && event.data.startupLeaseToken !== undefined) return;
     assertMeshConsumption(this.options.canConsumeMesh);
     const command = commandFromEvent(event);
     if (!command) return;
@@ -1607,6 +1763,29 @@ export class FabricControlPlane {
         accepted: false, error: STALE_INCARNATION_ERROR, errorCode: CONTROL_STALE_INCARNATION,
       }, this.incarnation, command.ownerIncarnation ?? null);
       return; // no claim, handler, or automatic notRun resend
+    }
+    // Same-key retries after readiness no longer have a live startup row. Observe
+    // its small receipt directly; only the authenticated original sender can reuse it.
+    if (command.operation === "followUp" && command.targetId === this.options.hostId && event.verification === "mesh" &&
+      /^[a-f0-9]{64}$/.test(command.commandId)) {
+      const inbox = this.#startingInbox(command.targetId);
+      const retained = inbox && readStartingFollowUp(inbox.root, command.commandId);
+      // A ready-route retry must not overtake the original private payload while
+      // startup work is waiting for this drain's usual end-of-log pass.
+      if (retained?.event.from.id === event.from.id) await this.#drainStartingFollowUps();
+      const completed = inbox && readStartingFollowUpCompletion(inbox.root, command.commandId);
+      if (completed?.ownerIncarnation === this.incarnation && completed.senderId === event.from.id) {
+        await this.#publishAcknowledgement(command, { accepted: true, messageId: completed.messageId ?? command.commandId, triggered: false });
+        return;
+      }
+      if (retained?.event.from.id === event.from.id) {
+        // A still-live/unknown predecessor's private row cannot be replaced by
+        // a new payload merely because the retry resolved a newer control epoch.
+        await this.#publishAcknowledgement(command, {
+          accepted: false, error: STALE_INCARNATION_ERROR, errorCode: CONTROL_STALE_INCARNATION,
+        }, this.incarnation, command.ownerIncarnation ?? null);
+        return;
+      }
     }
     if ((now > deadlineAt || command.requestedAt - now > this.#ackTimeoutMs) && !this.#sharedClaims.has(key)) {
       // A sender waits at most MAX_CONTROL_ACK_GRACE_MS past the deadline. An older command

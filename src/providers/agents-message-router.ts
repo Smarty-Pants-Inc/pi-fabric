@@ -140,7 +140,7 @@ export class AgentMessageRouter {
     readonly participants: Pick<FabricParticipantSource, "get" | "scheduleRefresh" | "writeStalled" | "lastKnown"> & Partial<Pick<FabricParticipantSource, "peers" | "list" | "lineageAlive" | "routingUnavailable" | "refreshRoutingView" | "retainedRouteAllowed">> & {
       resolveRoutingLease?: (id: string, signal?: AbortSignal, budget?: MirrorLeaseWaitBudget) => Promise<boolean>;
     },
-    readonly control: Pick<FabricControlPlane, "request"> | undefined,
+    readonly control: (Pick<FabricControlPlane, "request"> & Partial<Pick<FabricControlPlane, "queueStartingFollowUp">>) | undefined,
     readonly resolvePiRunBinding: (binding: FabricActorRunBinding, runner: FabricAgentRunner, context: FabricInvocationContext, requiredPin?: boolean) => FabricActorRunBinding | Promise<FabricActorRunBinding>,
     readonly residency?: Pick<ResidencyClient, "ensureActor" | "hostId"> & { options: { config: { rootId: string; meshRoot: string } } },
     readonly spawner = boundAgentSpawner(),
@@ -569,6 +569,21 @@ export class AgentMessageRouter {
       if (!task || task.runner !== "pi") throw new Error("Delivery deadlines require a local Pi task agent");
     }
     const isMain = this.mainAgent.matches(id);
+    // The early native lease is the new activation's authority while the retained
+    // participant still describes its predecessor. Steer and mirrored routes stay unchanged.
+    if (kind === "followUp" && !provenLocal && this.control && !(isMain && this.mainAgent.local)) {
+      const targetId = isMain ? this.mainAgent.id : id;
+      // A startup lease only authorizes an exact Main session. Check the spawn-bound
+      // target before publication, even with no routable predecessor presence.
+      if (targetId.startsWith("session:")) {
+        assertTaskMainTarget(this.#taskReturnAddress, targetId);
+        const queued = await this.control.queueStartingFollowUp?.(targetId, {
+          message, data, principal: options.principal, triggerTurn: options.triggerTurn ?? true,
+          ...(options.wakeCause ? { wakeCause: options.wakeCause } : {}),
+        }, options.idempotencyKey!, context?.signal, options.from ?? this.actorManager.identity);
+        if (queued) return queued;
+      }
+    }
     const remoteRoot = isMain || provenLocal ? undefined : this.#rootRouteSnapshot(id, authority);
     // Project members include peer roots, not just this host's Main and actors.
     // Resolve their current owner through the same capability/control path.

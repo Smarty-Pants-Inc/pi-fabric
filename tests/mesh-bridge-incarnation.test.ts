@@ -265,10 +265,11 @@ describe("bridge incarnation admission at persisted trust boundaries (smarty-dev
   });
 
   // Keep reason: Luna's #7397 P2, an older unsampled effect erased sampled authority.
-  it.each([
+  it.each(([
     { path: "replay", inflated: false }, { path: "replay", inflated: true },
     { path: "afterCommit", inflated: false }, { path: "afterCommit", inflated: true },
-  ] as const)("retains sampled M1 and repairs history at the unsampled $path checkpoint (inflated=$inflated)", async ({ path, inflated }) => {
+  ] as const).flatMap(test => [{ ...test, sameDeadline: false }, { ...test, sameDeadline: true }]))(
+    "retains sampled M1 and repairs history at the unsampled $path checkpoint (inflated=$inflated, equal-deadline=$sameDeadline)", async ({ path, inflated, sameDeadline }) => {
     const hub = store("file");
     const deadline = NOW + 5_000;
     const sample = { remoteHost: "ryzen2", observedAt: NOW, sourceObservedAt: NOW - 60_000,
@@ -276,7 +277,7 @@ describe("bridge incarnation admission at persisted trust boundaries (smarty-dev
     const sampled = { ...oldLease, updatedAt: NOW, expiresAt: deadline + (inflated ? 1_000 : 0),
       mirrorLease: 1 as const, mirror: sample, bridgeSupersededTokens: ["disk-predecessor"],
       bridgeSupersededTokenSeen: { "disk-predecessor": 2 } };
-    const pending = { ...oldLease, updatedAt: NOW - 1_000, expiresAt: NOW + 4_000,
+    const pending = { ...oldLease, updatedAt: NOW - 1_000, expiresAt: sameDeadline ? sampled.expiresAt : NOW + 4_000,
       mirrorLease: 1 as const, bridgeSupersededTokens: ["effect-predecessor"],
       bridgeSupersededTokenSeen: { "effect-predecessor": 1 } };
     const incoming = { hosts: [{ record: { ...host, updatedAt: sample.sourceUpdatedAt },
@@ -309,8 +310,9 @@ describe("bridge incarnation admission at persisted trust boundaries (smarty-dev
       const write = hub.writeBatch.bind(hub);
       let delayed: NonNullable<Parameters<MeshStore["writeBatch"]>[0]["afterCommit"]> | undefined;
       const intercept = vi.spyOn(hub, "writeBatch").mockImplementation(input => {
-        delayed = input.afterCommit;
-        return write({ ...input, afterCommit: undefined });
+        const { afterCommit, ...withoutAfterCommit } = input;
+        delayed = afterCommit;
+        return write(withoutAfterCommit);
       });
       // Commit an unsampled effect, withholding only its real afterCommit callback.
       await new StoreBridgeSide(hub, "ryzen2", () => NOW - 1_000).mirror({ hosts: [{

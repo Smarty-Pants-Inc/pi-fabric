@@ -1413,7 +1413,7 @@ export class StoreBridgeSide implements BridgeSide {
         // An older unsampled effect must retain the disk lease's whole sample, not just
         // its timestamps. Preserve legacy ordering before merging history (#1076/#7397).
         : onDisk.expiresAt > lease.expiresAt ||
-          (onDisk.expiresAt === lease.expiresAt && onDisk.updatedAt === lease.updatedAt)));
+          (onDisk.expiresAt === lease.expiresAt && onDisk.updatedAt >= lease.updatedAt)));
     let base = keepDiskLease ? { ...lease, ...onDisk } : sameIncarnation && onDisk && !sample ? {
       ...lease,
       updatedAt: Math.max(lease.updatedAt, onDisk.updatedAt),

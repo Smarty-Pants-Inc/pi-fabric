@@ -18,7 +18,7 @@ import type { FabricMainAgentTarget } from "../src/main-agent.js";
 import { LifecycleBroker } from "../src/lifecycle/broker.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
-import { registerMainInbox } from "../src/topology/stall-alarms.js";
+import { registerMainInbox, recordMainSuccessor } from "../src/topology/stall-alarms.js";
 import { readHostLeaseCurrent, writeHostLease, type FabricHostLease } from "../src/topology/host-leases.js";
 import { writeParticipantFile, withParticipantFileTryLock } from "../src/topology/participant-files.js";
 import { ownProcessIncarnation } from "../src/core/atomic-write.js";
@@ -36,7 +36,7 @@ const missingPid = () => {
   }
   throw new Error("No absent PID for fixture");
 };
-const fixture = async () => {
+const fixture = async (authenticatedSuccessor = true) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "owner-root-gone-"));
   const mesh = new MeshStore(root, 65536, 100);
   const old: MeshIdentity = { id: "session:old", sessionId: "old", kind: "main", name: "same display" };
@@ -50,11 +50,13 @@ const fixture = async () => {
   const oldOwner = path.join(root, "main-followups", "old.owner.json");
   const newOwner = path.join(root, "main-followups", "new.owner.json");
   // This native receiver operation, not mesh.put, is the launch grant source.
-  (registerMainInbox as (...args: unknown[]) => string)(root, old, "old", undefined, "native-lead", "trusted-project");
+  registerMainInbox(root, old, "old", undefined, "native-lead", "trusted-project");
   const original = JSON.parse(fs.readFileSync(oldOwner, "utf8"));
-  fs.writeFileSync(oldOwner, JSON.stringify({ ...original, pid: missingPid(), processStartedAt: "1" }));
+  registerMainInbox(root, current, "new", undefined, "native-lead", "trusted-project");
+  // Only the authenticated native replacement, not the identical label, carries authority.
+  if (authenticatedSuccessor) await recordMainSuccessor(mesh, old.id, "old", current.id);
+  fs.writeFileSync(oldOwner, JSON.stringify({ ...JSON.parse(fs.readFileSync(oldOwner, "utf8")), pid: missingPid(), processStartedAt: "1" }));
   fs.utimesSync(oldOwner, new Date(at), new Date(at));
-  (registerMainInbox as (...args: unknown[]) => string)(root, current, "new", undefined, "native-lead", "trusted-project");
   const lease: FabricHostLease = { id: old.id, rootId: old.id, identityId: old.id, updatedAt: at, expiresAt: at,
     writer: { pid: original.pid === process.pid ? missingPid() : original.pid, host: os.hostname(), startedAt: at,
       releaseSha: "test", lockProtocol: 1, stateBackend: "file" } };
@@ -215,7 +217,7 @@ describe("persistent old-root settlement (#12785)", () => {
     expect(f.mesh.get(f.legacy)?.value).toMatchObject({ status: "running" });
   });
 
-  it.each(["old-lease", "current-launcher", "current-activation", "registry"] as const)("rechecks %s at the actual settlement commit boundary", async mode => {
+  it.each(["old-lease", "current-identity", "current-activation", "registry"] as const)("rechecks %s at the actual settlement commit boundary", async mode => {
     const f = await fixture();
     const batch = f.mesh.writeBatch.bind(f.mesh); let fired = false;
     vi.spyOn(f.mesh, "writeBatch").mockImplementation(input => batch(input.beforeCommit ? { ...input, beforeCommit: () => {
@@ -223,10 +225,11 @@ describe("persistent old-root settlement (#12785)", () => {
         fired = true;
         if (mode === "old-lease") writeHostLease(f.root, { ...f.lease, expiresAt: Date.now() + 60000 });
         if (mode === "registry") f.store.write([{ ...f.store.records()[0], updatedAt: Date.now(), name: "successor" }]);
-        if (mode === "current-launcher" || mode === "current-activation") {
+        if (mode === "current-identity" || mode === "current-activation") {
           const owner = JSON.parse(fs.readFileSync(f.newOwner, "utf8"));
           fs.writeFileSync(f.newOwner, JSON.stringify({ ...owner,
-            ...(mode === "current-launcher" ? { nativeLauncher: "different-lead" } : { activationId: "different-activation" }) }));
+            ...(mode === "current-identity" ? { nativeLauncherIdentity: { ...owner.nativeLauncherIdentity, activationId: "different-lead" } }
+              : { activationId: "different-activation" }) }));
         }
       }
       input.beforeCommit!();
@@ -285,20 +288,33 @@ describe("persistent old-root settlement (#12785)", () => {
     expect(fs.readFileSync(f.history, "utf8")).toBe("private history sentinel\n");
   });
 
-  it.each(["different", "missing-old", "display-only", "inherited"] as const)("fails closed on %s launcher retirement while same-project truth repair remains allowed", async mode => {
-    const f = await fixture();
-    const file = mode === "different" ? f.newOwner : f.oldOwner;
+  it.each(["same-label", "different-root", "different-activation", "different-pid", "different-birth", "missing-old", "display-only", "inherited", "disk-only-current", "copied-current-token"] as const)("fails closed on %s launcher retirement while same-project truth repair remains allowed", async mode => {
+    const f = await fixture(mode !== "same-label" && mode !== "copied-current-token"); const { provider, forbidden } = providerFor(f);
+    const file = mode === "disk-only-current" ? f.newOwner : f.oldOwner;
     const owner = JSON.parse(fs.readFileSync(file, "utf8"));
-    if (mode === "different") owner.nativeLauncher = "other-native-lead";
-    else delete owner.nativeLauncher;
-    owner.name = "native-lead";
+    if (mode === "different-root") owner.nativeLauncherIdentity.rootId = "session:unrelated";
+    if (mode === "different-activation") owner.nativeLauncherIdentity.activationId = "other-incarnation";
+    if (mode === "different-pid") owner.nativeLauncherIdentity.pid = missingPid();
+    if (mode === "different-birth") owner.nativeLauncherIdentity.processStartedAt = "0";
+    if (mode === "copied-current-token") owner.nativeLauncherIdentity = JSON.parse(fs.readFileSync(f.newOwner, "utf8")).nativeLauncherIdentity;
+    if (["missing-old", "display-only", "inherited"].includes(mode)) delete owner.nativeLauncherIdentity;
+    if (mode === "disk-only-current") {
+      const forged = { ...owner.nativeLauncherIdentity, activationId: "disk-only" };
+      owner.nativeLauncherIdentity = forged;
+      const old = JSON.parse(fs.readFileSync(f.oldOwner, "utf8"));
+      fs.writeFileSync(f.oldOwner, JSON.stringify({ ...old, nativeLauncherIdentity: forged }));
+      fs.utimesSync(f.oldOwner, new Date(f.lease.updatedAt), new Date(f.lease.updatedAt));
+    }
+    owner.name = owner.nativeLauncher = "native-lead";
     fs.writeFileSync(file, JSON.stringify(owner));
     if (file === f.oldOwner) fs.utimesSync(file, new Date(f.lease.updatedAt), new Date(f.lease.updatedAt));
     if (mode === "inherited") f.store.write([{ ...f.actor, mainAgentId: f.current.id, task: { mainAgentId: f.current.id } }]);
     await f.repair.reconcile();
     expect(f.mesh.get(f.legacy)?.value).toMatchObject({ status: "stopped" });
-    await expect(f.repair.retire(f.id, () => {})).rejects.toThrow(/trusted native launcher/);
+    await expect(provider.invoke("remove", { id: f.id }, invokeContext)).rejects.toThrow(/trusted native launcher/);
+    expect(forbidden).not.toHaveBeenCalled();
     expect(f.mesh.get(f.legacy)?.value).not.toHaveProperty("retiredAt");
+    expect(fs.readFileSync(f.history, "utf8")).toBe("private history sentinel\n");
   });
 
   it("public agents.remove retires idempotently, retaining mesh/file/private history and issuing ZERO destructive calls", async () => {
@@ -335,7 +351,8 @@ describe("persistent old-root settlement (#12785)", () => {
   it("public retirement rejects changed native identity and actor/print attribution without destructive fallthrough", async () => {
     const f = await fixture(); const { provider, forbidden } = providerFor(f);
     const owner = JSON.parse(fs.readFileSync(f.newOwner, "utf8"));
-    fs.writeFileSync(f.newOwner, JSON.stringify({ ...owner, nativeLauncher: "different-native", name: "same display" }));
+    fs.writeFileSync(f.newOwner, JSON.stringify({ ...owner,
+      nativeLauncherIdentity: { ...owner.nativeLauncherIdentity, rootId: "session:different-native" }, name: "same display" }));
     await expect(provider.invoke("remove", { id: f.id, ownerRootGoneBy: f.current.id }, invokeContext)).rejects.toThrow(/trusted native launcher/);
     expect(forbidden).not.toHaveBeenCalled();
     expect(f.mesh.get(f.legacy)?.value).not.toHaveProperty("retiredAt");
@@ -368,7 +385,7 @@ describe("persistent old-root settlement (#12785)", () => {
     actors.resumeAfterRelease();
   });
 
-  it.each(["old-lease", "current-launcher", "current-incarnation"] as const)("public retirement rechecks %s after selection under commit custody", async mode => {
+  it.each(["old-lease", "old-identity", "current-identity", "current-activation", "current-incarnation"] as const)("public retirement rechecks %s after selection under commit custody", async mode => {
     const f = await fixture(); await f.repair.reconcile(); const { provider, forbidden } = providerFor(f);
     const batch = f.mesh.writeBatch.bind(f.mesh); let attempted = false, fired = false;
     vi.spyOn(f.mesh, "writeBatch").mockImplementation(input => batch({ ...input, prepare: view => {
@@ -380,9 +397,12 @@ describe("persistent old-root settlement (#12785)", () => {
         fired = true;
         if (mode === "old-lease") writeHostLease(f.root, { ...f.lease, expiresAt: Date.now() + 60000 });
         if (mode === "current-incarnation") writeHostLease(f.root, { ...readHostLeaseCurrent(f.root, f.current.id)!, incarnationToken: "replacement" });
-        if (mode === "current-launcher") {
-          const owner = JSON.parse(fs.readFileSync(f.newOwner, "utf8"));
-          fs.writeFileSync(f.newOwner, JSON.stringify({ ...owner, nativeLauncher: "changed-after-selection" }));
+        if (mode === "old-identity" || mode === "current-identity" || mode === "current-activation") {
+          const file = mode === "old-identity" ? f.oldOwner : f.newOwner;
+          const owner = JSON.parse(fs.readFileSync(file, "utf8"));
+          fs.writeFileSync(file, JSON.stringify({ ...owner, ...(mode === "current-activation" ? { activationId: "replacement" } :
+            { nativeLauncherIdentity: { ...owner.nativeLauncherIdentity, activationId: "changed-after-selection" } }) }));
+          if (file === f.oldOwner) fs.utimesSync(file, new Date(f.lease.updatedAt), new Date(f.lease.updatedAt));
         }
       }
       input.beforeCommit!();
@@ -393,12 +413,12 @@ describe("persistent old-root settlement (#12785)", () => {
     expect(f.store.records()[0]!.sessionOrphan ?? {}).not.toHaveProperty("directorySettlement.retiredAt");
   });
 
-  it.each(["actor", "print", "unrelated-project", "invalid-native"] as const)("%s lineage/display/payload cannot grant observer settlement authority", async mode => {
-    const f = await fixture();
+  it.each(["actor", "print", "unrelated-project", "invalid-project"] as const)("%s lineage/display/payload cannot grant observer settlement authority", async mode => {
+    const f = await fixture(mode !== "unrelated-project");
     const owner = JSON.parse(fs.readFileSync(f.newOwner, "utf8"));
     if (mode === "print") { delete owner.nativeLauncher; delete owner.nativeProject; }
     if (mode === "unrelated-project") { owner.nativeLauncher = "different"; owner.nativeProject = "other-project"; }
-    if (mode === "invalid-native") owner.nativeLauncher = "\nspoof";
+    if (mode === "invalid-project") owner.nativeProject = "";
     owner.name = "native-lead";
     fs.writeFileSync(f.newOwner, JSON.stringify(owner));
     const repair = mode === "actor" ? new SessionActorOrphans(f.mesh, { ...f.current, kind: "actor" }, "new", path.join(f.root, "actors")) : f.repair;
@@ -409,8 +429,8 @@ describe("persistent old-root settlement (#12785)", () => {
     await expect(repair.retire(f.id, () => {})).rejects.toThrow(/native/);
   });
 
-  it("an unnamed interactive project's native grant permits truth repair, never launcher retirement", async () => {
-    const f = await fixture(); const owner = JSON.parse(fs.readFileSync(f.newOwner, "utf8"));
+  it("an independently registered unnamed project's native grant permits truth repair, never launcher retirement", async () => {
+    const f = await fixture(false); const owner = JSON.parse(fs.readFileSync(f.newOwner, "utf8"));
     delete owner.nativeLauncher; fs.writeFileSync(f.newOwner, JSON.stringify(owner));
     await f.repair.reconcile();
     expect(f.mesh.get(f.legacy)?.value).toMatchObject({ status: "stopped", capabilities: [] });
@@ -437,6 +457,7 @@ describe("persistent old-root settlement (#12785)", () => {
     let entry = f.mesh.get(keyOf(f.id))!;
     const settledAt = f.repair.validateTombstone(entry)!.settledAt!;
     const b = observer(f, "retention-b"), c = observer(f, "retention-c");
+    await recordMainSuccessor(f.mesh, f.current.id, "new", "session:retention-b");
     const maintenanceClock = vi.spyOn(Date, "now").mockReturnValue(settledAt + 2 * 3600000);
     try {
       await b.reconcile(); await b.retire(f.id, () => {});
@@ -525,6 +546,7 @@ describe("persistent old-root settlement (#12785)", () => {
     const initial = f.store.snapshot().bytes, copies = persisted(f);
     const settledAt = f.repair.validateTombstone(copies[0])!.settledAt!;
     const b = observer(f, "observer-b"), c = observer(f, "observer-c");
+    await recordMainSuccessor(f.mesh, f.current.id, "new", "session:observer-b");
     const clock = vi.spyOn(Date, "now");
     for (const [index, repair] of [b, c, b, f.repair, c].entries()) {
       clock.mockReturnValue(settledAt + (index + 1) * 1000);

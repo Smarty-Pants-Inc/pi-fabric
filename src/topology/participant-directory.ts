@@ -18,7 +18,7 @@ import type {
   FabricPeerInfo,
 } from "./types.js";
 
-import { reapDeadHostRecords } from "./host-reaper.js";
+import { DIRECTORY_RETENTION_MS, reapDeadHostRecords } from "./host-reaper.js";
 import { observeActorOwnership, ownershipPointReads, type ActorOwnershipObservation } from "./publication-generation.js";
 import { compactExpiredHostRecords } from "./host-record-compaction.js";
 import { withStateFence } from "../mesh/commit-outbox.js";
@@ -548,12 +548,17 @@ const legacyRootFromEntry = (
 const legacyActorFromEntry = (
   entry: MeshStateEntry,
   roots: Map<string, FabricParticipantInfo>,
+  now: number,
   terminalActor?: (entry: MeshStateEntry) => FabricParticipantRecord | undefined,
 ): FabricParticipantInfo | undefined => {
   if (!isObject(entry.value)) return undefined;
   if (entry.value.stopReason === "owner-root-gone") {
     const terminal = terminalActor?.(entry);
-    return terminal ? { ...terminal, local: false, stale: true } : undefined;
+    // Only the private validator's immutable settlement starts display retention;
+    // observer rewrites and caller-controlled envelope timestamps cannot renew it.
+    const age = now - (terminal?.settledAt ?? NaN);
+    return terminal && age >= 0 && age < DIRECTORY_RETENTION_MS
+      ? { ...terminal, local: false, stale: true } : undefined;
   }
   const value = entry.value;
   if (
@@ -1369,7 +1374,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       }
       if (!options.kinds || options.kinds.includes("actor")) {
         for (const entry of parsed.legacyActors) {
-          const actor = legacyActorFromEntry(entry, legacyRoots, this.options.terminalActor);
+          const actor = legacyActorFromEntry(entry, legacyRoots, now, this.options.terminalActor);
           if (actor && (!actor.stale || options.includeStale) && !byId.has(actor.id)) byId.set(actor.id, actor);
         }
       }
@@ -2362,7 +2367,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       this.mesh
         .listAllShared(LEGACY_ACTOR_PREFIX, read)
         .flatMap((entry) => {
-          const actor = legacyActorFromEntry(entry, legacyRoots, this.options.terminalActor);
+          const actor = legacyActorFromEntry(entry, legacyRoots, now, this.options.terminalActor);
           return actor ? [[actor.id, actor.ownerIdentityId] as const] : [];
         }),
     );

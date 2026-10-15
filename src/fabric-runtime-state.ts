@@ -1021,7 +1021,9 @@ export class FabricRuntimeState {
           // In dual mode, exclude legacy file custodians with the mesh lock too.
           const register = () => {
             if (!live.current()) throw new Error("Pi Fabric mesh activation lifecycle retired");
-            return registerMainInbox(meshRoot, identity, sessionId, sessionFile, smartyAgent, namedMain ? participantProject(context.cwd) : undefined);
+            // SMARTY_AGENT is a reusable display label, never a launcher grant. Registration mints
+            // its own root/activation/process identity; only native succession may carry it forward.
+            return registerMainInbox(meshRoot, identity, sessionId, sessionFile, undefined, namedMain ? participantProject(context.cwd) : undefined);
           };
           inboxActivation = meshCustodyMode() === "own" ? register() : await mesh.exclusive(register);
         } finally { releaseCustody(); }

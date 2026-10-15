@@ -19,6 +19,7 @@ const HOST_PREFIX = "topology/hosts/";
 const PARTICIPANT_PREFIX = "topology/participants/";
 const INBOX_PREFIX = "topology/inbox/";
 const SESSION_PREFIX = "sessions/";
+const LEGACY_ACTOR_PREFIX = "actors/";
 /** 24h directory-display retention, including authenticated terminal actors; private history is never reaped here. */
 export const DIRECTORY_RETENTION_MS = 24 * 60 * 60 * 1000;
 const TERMINAL_SESSION_STATUSES = new Set(["completed", "failed", "stopped", "timed_out"]);
@@ -49,16 +50,23 @@ interface DeadHostOptions {
   terminalActor?: (entry: MeshStateEntry) => FabricParticipantRecord | undefined;
 }
 
-const retainedTerminalActor = (entry: MeshStateEntry | undefined, options: DeadHostOptions): boolean => {
-  if (!entry || record(entry.value)?.stopReason !== "owner-root-gone") return false;
+const terminalActorAge = (entry: MeshStateEntry | undefined, options: DeadHostOptions): number => {
+  if (!entry || record(entry.value)?.stopReason !== "owner-root-gone") return NaN;
   const terminal = options.terminalActor?.(entry);
   const settledAt = terminal?.settledAt;
-  const age = (options.now ?? Date.now()) - (settledAt ?? NaN);
   // Only the validator's authenticated private receipt starts DIRECTORY_RETENTION_MS.
   // A forged/future envelope timestamp must neither extend retention nor veto a sweep.
   return terminal?.kind === "actor" && terminal.status === "stopped" && terminal.stopReason === "owner-root-gone" &&
-    Number.isFinite(settledAt) && age >= 0 && age < DIRECTORY_RETENTION_MS;
+    Number.isFinite(settledAt) ? (options.now ?? Date.now()) - (settledAt ?? NaN) : NaN;
 };
+
+const retainedTerminalActor = (entry: MeshStateEntry | undefined, options: DeadHostOptions): boolean => {
+  const age = terminalActorAge(entry, options);
+  return age >= 0 && age < DIRECTORY_RETENTION_MS;
+};
+
+const expiredTerminalActor = (entry: MeshStateEntry | undefined, options: DeadHostOptions): boolean =>
+  terminalActorAge(entry, options) >= DIRECTORY_RETENTION_MS;
 
 /**
  * Records left in the shared state by hosts that are gone: host leases that expired longer ago
@@ -131,8 +139,9 @@ const liveRootCursorKeys = (
 // Inbox keys hash the writer's participant id to 32 hex chars (RootInbox.key). Raw state/file
 // presence counts even if malformed or unreadable: absence, not failed parsing, permits cleanup.
 const staleDirectoryDeletes = (
-  mesh: Pick<MeshStore, "listAll"> & { root?: string }, identity: MeshIdentity, now: number,
+  mesh: Pick<MeshStore, "listAll"> & { root?: string }, identity: MeshIdentity, options: DeadHostOptions,
 ): MeshBatchOperation[] => {
+  const now = options.now ?? Date.now();
   const cutoff = now - DIRECTORY_RETENTION_MS;
   const participants = new Set(mesh.listAll(PARTICIPANT_PREFIX, { fresh: true }).map((entry) => entry.key));
   const live = liveRootCursorKeys({ listAll: (prefix) => mesh.listAll(prefix, { fresh: true }) }, mesh, now);
@@ -159,6 +168,16 @@ const staleDirectoryDeletes = (
       ops.push({ kind: "delete", key: entry.key, ifVersion: entry.version, onConflict: "skip" });
     }
   }
+  for (const entry of mesh.listAll(LEGACY_ACTOR_PREFIX, { fresh: true })) {
+    // Legacy actors have no host-record cleanup path. Only privately authenticated
+    // terminal receipts authorize expiry; live actors and public markers stay put.
+    if (!expiredTerminalActor(entry, options)) continue;
+    ops.push({
+      kind: "delete", key: entry.key, ifVersion: entry.version, onConflict: "skip",
+      // Private proof/root liveness can change without a new envelope version.
+      condition: (current) => expiredTerminalActor(current(entry.key), options),
+    });
+  }
   return ops;
 };
 
@@ -178,7 +197,7 @@ export const reapDeadHostRecords = async (
   const cutoff = (options.now ?? Date.now()) - (options.deadAfterMs ?? DEAD_HOST_RECORDS_MS);
   const selectedLeases = fileLeases(mesh);
   const found = deadHostRecords(mesh, options, selectedLeases);
-  const bookkeeping = staleDirectoryDeletes(mesh, identity, options.now ?? Date.now());
+  const bookkeeping = staleDirectoryDeletes(mesh, identity, options);
   // Leftovers of per-key lock operations whose process died (security pass S5 on #142).
   if (typeof mesh.root === "string") {
     const root = mesh.root;

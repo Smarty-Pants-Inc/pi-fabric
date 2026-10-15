@@ -508,6 +508,20 @@ describe("Windows mesh state ACL policy (smarty-dev#8920)", () => {
     expect(judge([...head, { path: files[1], missing: true }], { files })).toBeUndefined();
   });
 
+  // Decision C: recorded native snapshot policy, not Windows/NTFS proof. Absence is not unreadable evidence.
+  it.each(["missing", "unreadable"] as const)("distinguishes a %s DB descriptor from an initially absent DB allowance", kind => {
+    const entries = withEntry(6, kind === "missing" ? { missing: true } : { error: "recorded Access is denied" });
+    const result = judge(entries);
+    if (kind === "missing") expect(result).toBeUndefined();
+    else expect(result).toMatch(/state\.db has an unreadable Windows security descriptor/);
+    entries[0] = dir(request.root, USER, [...profileDacl(), allow(OTHER, FULL, 0)]);
+    expect(judge(entries)).toMatch(/mesh grants S-1-5-21-1-2-3-1002/);
+  });
+
+  it("a missing root descriptor is not an optional missing DB or an unreadable-identity fallback", () => {
+    expect(judge(withEntry(0, { missing: true }))).toMatch(/mesh vanished while its Windows ACL was read/);
+  });
+
   it("allows an absent state.db-journal sidecar", () => {
     const journal = `${request.root}\\state.db-journal`;
     expect(judge([...defaultEntries(), { path: journal, missing: true }], { files: [...request.files, journal] })).toBeUndefined();
@@ -715,6 +729,26 @@ describe("state gate wiring on win32 (smarty-dev#8920)", () => {
         expect(calls[0]).toMatchObject({ root, protect: false });
         expect(calls[0]!.files.map(file => path.basename(file))).toEqual(["state.db", "state.db-wal", "state.db-shm", "state.db-journal"]);
       } finally { backend.close(); }
+    });
+  });
+
+  // Decision C wiring: only positively observed absence may skip the full proof, not an indeterminate lstat.
+  it("admitExistingStateRoot uses full native proof for an unreadable DB lstat, preserving safe/refused verdicts", async () => {
+    const why = "state.db has an unreadable Windows security descriptor (recorded descriptor denial)";
+    const { gate, calls } = await loadGate(undefined, [undefined, why]);
+    const root = tmp();
+    const file = path.join(root, "state.db");
+    const actualLstat = fs.lstatSync.bind(fs);
+    vi.spyOn(fs, "lstatSync").mockImplementation(((target: fs.PathLike, options?: fs.StatSyncOptions) => {
+      if (String(target) === file) throw Object.assign(new Error("recorded DB identity lstat denied"), { code: "EACCES" });
+      return actualLstat(target, options);
+    }) as typeof fs.lstatSync);
+    await asWindows(async () => {
+      expect(() => gate.admitExistingStateRoot(root)).not.toThrow();
+      expect(calls).toHaveLength(1);
+      expect(calls[0]).toMatchObject({ root, protect: false, files: [file, `${file}-wal`, `${file}-shm`, `${file}-journal`] });
+      expect(() => gate.admitExistingStateRoot(root)).toThrow(why);
+      expect(calls).toHaveLength(2);
     });
   });
 

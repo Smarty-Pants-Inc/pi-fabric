@@ -25,7 +25,13 @@ describe.skipIf(!fs.existsSync("dist/worker.js"))("resident startup worker loade
     expect(result.status, result.error).toBe(mode === "ok" ? "completed" : "failed");
     if (mode === "ok") expect(result.text).toBe("resident worker startup verified");
     else expect(result.error).toMatch(/readiness|acknowledge/);
-    const events = fs.readFileSync(path.join(root, "runs", result.id, "events.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+    let page = manager.readLog(result.id, { lines: 5000 });
+    const logLines = [...page.events];
+    while (page.hasMore) {
+      page = manager.readLog(result.id, { lines: 5000, before: page.before!, beforeGeneration: page.generation! });
+      logLines.unshift(...page.events);
+    }
+    const events = logLines.map(line => line.parsed as { type: string; args: string[]; frame: { type: string } });
     const argv = events.find(e => e.type === "probe_argv")?.args;
     expect(argv).toEqual(expect.arrayContaining(["--no-extensions", "--no-context-files"]));
     expect(events.filter(e => e.type === "probe_received").some(e => e.frame.type === "prompt")).toBe(false);
@@ -51,7 +57,13 @@ describe.skipIf(!fs.existsSync("dist/worker.js"))("resident startup worker loade
       return;
     }
     expect(result.status, result.error).toBe("completed");
-    const events = fs.readFileSync(path.join(root, "runs", result.id, "events.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+    let page = manager.readLog(result.id, { lines: 5000 });
+    const logLines = [...page.events];
+    while (page.hasMore) {
+      page = manager.readLog(result.id, { lines: 5000, before: page.before!, beforeGeneration: page.generation! });
+      logLines.unshift(...page.events);
+    }
+    const events = logLines.map(line => line.parsed as { type: string; args: string[]; frame: { type: string } });
     const argv = events.find(event => event.type === "probe_argv")?.args as string[];
     expect(argv).toContain("--no-extensions");
     expect(argv.some(arg => arg.includes("provider-bridge"))).toBe(false);
@@ -70,7 +82,13 @@ describe.skipIf(!fs.existsSync("dist/worker.js"))("resident startup worker loade
     const result = await manager.run({ task: "never infer", transport: "process", extensions: true, recursive: true, tools: [], residentStartupProbe: true });
     expect(result.status).toBe("failed");
     expect(result.error).toContain("did not acknowledge");
-    const log = fs.readFileSync(path.join(root, "runs", result.id, "events.jsonl"), "utf8");
+    let page = manager.readLog(result.id, { lines: 5000 });
+    const logLines = [...page.events];
+    while (page.hasMore) {
+      page = manager.readLog(result.id, { lines: 5000, before: page.before!, beforeGeneration: page.generation! });
+      logLines.unshift(...page.events);
+    }
+    const log = logLines.map(line => line.raw).join("\n");
     expect(log).not.toContain('"type":"prompt"');
     expect(result.toolCalls).toBe(0);
   }, 30_000);

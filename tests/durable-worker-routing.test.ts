@@ -218,7 +218,13 @@ describe("real worker durable process protocol", () => {
     });
     managers.push(manager);
     const result = await manager.run({ task: "harmless", name: "fix-tests", runner, model: "openai-codex/gpt-5.6-sol", transport: "process", extensions: false });
-    const events = fs.readFileSync(path.join(root, "runs", result.id, "events.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+    let page = manager.readLog(result.id, { lines: 5000 });
+    const logLines = [...page.events];
+    while (page.hasMore) {
+      page = manager.readLog(result.id, { lines: 5000, before: page.before!, beforeGeneration: page.generation! });
+      logLines.unshift(...page.events);
+    }
+    const events = logLines.map(line => line.parsed as { type: string; argv: string[]; headers: Record<string, string> });
     return { result, events, hook: path.join(fs.realpathSync(fixture), "guards", "sender-headers.js") };
   };
   const TASK_SENDER = { "X-Session-Id": "unmodified", "X-Smarty-Role": "task", "X-Smarty-Agent": "fix-tests", "X-Smarty-Spawner": "herdr-main-7" };
@@ -226,9 +232,9 @@ describe("real worker durable process protocol", () => {
   it("pi-durable: the durable worker gets the sender-header hook once and its requests carry the sender headers", async () => {
     const { result, events, hook } = await senderRun("pi-durable");
     expect(result.status, result.error).toBe("completed");
-    const launch = events.find(event => event.type === "launch_probe");
+    const launch = events.find(event => event.type === "launch_probe")!;
     expect(launch.argv.filter((arg: string, index: number) => launch.argv[index - 1] === "-e" && arg === hook)).toHaveLength(1);
-    const sender = events.find(event => event.type === "fake_sender_headers");
+    const sender = events.find(event => event.type === "fake_sender_headers")!;
     expect(sender).toMatchObject({ hookLoaded: true, senderHooks: [hook] });
     expect(sender.headers).toEqual(TASK_SENDER);
   });
@@ -237,7 +243,7 @@ describe("real worker durable process protocol", () => {
     const { result, events, hook } = await senderRun("pi");
     expect(result.status, result.error).toBe("completed");
     expect(events.some(event => event.type === "launch_probe")).toBe(false);
-    const sender = events.find(event => event.type === "fake_sender_headers");
+    const sender = events.find(event => event.type === "fake_sender_headers")!;
     expect(sender).toMatchObject({ hookLoaded: true, senderHooks: [hook] });
     expect(sender.headers).toEqual(TASK_SENDER);
   });

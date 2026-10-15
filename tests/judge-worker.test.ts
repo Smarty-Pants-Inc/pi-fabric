@@ -12,9 +12,11 @@ import { VERDICTS } from "../src/judge/contract.js";
 const input = () => ({ questionClass: "item-stalled", itemRef: "org/repo#1", evidenceRefs: [{ url: "https://example.test/evidence", revision: "v1", observedAt: "2026-10-01T00:00:00Z" }], evidence: { facts: { complete: true }, excerpts: ["test"] }, allowedVerdicts: [...VERDICTS], timeboxMs: 5000, budget: { maxEvaluations: 1, maxAgents: 1, maxTokens: 1000 }, requestKey: "bounded-worker-probe" });
 let root: string;
 let deps: JudgeDependencies;
+let judgmentRun: { manager: AgentManager; id: string } | undefined;
 const managers: AgentManager[] = [];
 const ownedRoots: string[] = [];
 beforeEach(() => {
+  judgmentRun = undefined;
   root = fs.mkdtempSync(path.join(os.tmpdir(), "judge-worker-test-"));
   fs.mkdirSync(path.join(root, "cwd"));
   vi.stubEnv("PI_FABRIC_DEPTH", "0");
@@ -23,7 +25,7 @@ beforeEach(() => {
     agent: async (request, limits, signal) => {
       const manager = new AgentManager(path.join(root, "cwd"), { ...DEFAULT_FABRIC_CONFIG.agents, timeoutMs: limits.timeoutMs, maxTokensPerChild: limits.maxTokens, retainRuns: true, sessionExport: false }, { workerPath: path.resolve("dist/worker.js"), piBinary: path.resolve("tests/fixtures/fake-pi-route.mjs"), runRoot: path.join(root, "runs"), fullCodeMode: false });
       managers.push(manager);
-      try { const handle = await manager.spawn(request, signal); return await manager.wait(handle.id, { signal }); }
+      try { const handle = await manager.spawn(request, signal); judgmentRun = { manager, id: handle.id }; return await manager.wait(handle.id, { signal }); }
       finally { await manager.close(); }
     },
   };
@@ -35,9 +37,18 @@ afterEach(async () => {
   for (const owned of ownedRoots.splice(0)) fs.rmSync(owned, { recursive: true, force: true });
 });
 const events = () => {
-  const runs = path.join(root, "runs");
-  const id = fs.readdirSync(runs).find(id => fs.existsSync(path.join(runs, id, "events.jsonl")))!;
-  return fs.readFileSync(path.join(runs, id, "events.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+  if (!judgmentRun) throw new Error("Judgment worker did not spawn");
+  // close() joins finalization but retains this manager's run handle.
+  const { manager, id } = judgmentRun;
+  let page = manager.readLog(id, { lines: 5000 });
+  const frames = [...page.events];
+  while (page.hasMore) {
+    expect(page.before).toBeDefined();
+    expect(page.generation).toBeDefined();
+    page = manager.readLog(id, { lines: 5000, before: page.before!, beforeGeneration: page.generation! });
+    frames.unshift(...page.events);
+  }
+  return frames.map(line => JSON.parse(line.raw));
 };
 describe.skipIf(!fs.existsSync("dist/worker.js"))("built judgment worker isolation", () => {
   it("has only host delivery/session/reply/route/sender hooks, no ambient authority, no full-code and no schema-free text result", async () => {

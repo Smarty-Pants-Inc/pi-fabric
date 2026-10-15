@@ -1,7 +1,7 @@
 import type { FabricAgentRunner } from "../config.js";
 import { TranscriptAccumulator } from "./transcript-parser.js";
-import { AgentTranscriptReader } from "./transcript-reader.js";
 import { recordOf } from "./transcript-sanitization.js";
+export type { AgentTranscriptReader } from "./transcript-reader.js";
 
 type FabricTranscriptEntryStatus = "running" | "completed" | "failed";
 
@@ -27,6 +27,9 @@ export interface FabricAgentTranscript {
   hasMore?: boolean;
   hasNewer?: boolean;
   updatedAt?: number;
+  /** The error entry explains whether any displayed history is cached. */
+  unavailable?: boolean;
+  error?: string;
 }
 
 export interface FabricTranscriptSource {
@@ -107,5 +110,3 @@ export const recentTranscriptTools = (
     .slice(-boundedLimit)
     .map((entry) => ({ ...entry }));
 };
-
-export { AgentTranscriptReader };

@@ -2,7 +2,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { AgentTranscriptReader, projectAgentTranscript } from "../src/ui/transcript.js";
+import { projectAgentTranscript } from "../src/ui/transcript.js";
+import { AgentTranscriptReader } from "../src/ui/transcript-reader.js";
 import type { FabricUiAgent } from "../src/ui/types.js";
 
 const temporaryDirectories: string[] = [];
@@ -585,7 +586,10 @@ describe("agent transcript projection", () => {
     expect(reader.read(agent).entries[0]?.text).toBe("other");
 
     fs.rmSync(logFile);
-    expect(reader.read(agent).entries[0]?.text).toBe("other");
+    const unavailable = reader.read(agent);
+    expect(unavailable.unavailable).toBe(true);
+    expect(unavailable.entries[0]).toMatchObject({ kind: "error", text: expect.stringContaining("cached history") });
+    expect(unavailable.entries[1]?.text).toBe("other");
     reader.clear();
     expect(reader.read(agent).entries).toEqual([]);
   });

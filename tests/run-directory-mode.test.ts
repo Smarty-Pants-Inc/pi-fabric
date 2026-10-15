@@ -74,6 +74,7 @@ const archiveFixture = () => {
   const source = path.join(root, "source");
   fs.mkdirSync(path.join(source, "nested", "child"), { recursive: true });
   fs.writeFileSync(path.join(source, "status.json"), "{}");
+  fs.writeFileSync(path.join(source, "events.jsonl"), "{}\n");
   const sessionFile = path.join(root, "actor", "session.jsonl");
   fs.mkdirSync(path.dirname(sessionFile), { recursive: true, mode: 0o700 });
   fs.chmodSync(path.dirname(sessionFile), 0o700);
@@ -112,7 +113,7 @@ it.skipIf(process.platform === "win32")("does not archive below a group-writable
   // The fixture has no actors/ directory: the anchor is the actor's own directory, so `root` is above it.
   fs.chmodSync(root, 0o775);
   const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
-  await store.retainRun({ sessionFile }, "run-1", source);
+  await expect(store.retainRun({ sessionFile }, "run-1", source)).rejects.toThrow(/writable by group or others/);
   expect(fs.existsSync(path.join(root, "actor", "runs"))).toBe(false);
   expect(warn).toHaveBeenCalledWith(expect.stringMatching(/not archived: .*writable by group or others/));
   expect(fs.existsSync(path.join(source, "status.json"))).toBe(true);
@@ -125,7 +126,7 @@ it.skipIf(process.platform === "win32")("does not archive through a symlinked de
   fs.mkdirSync(path.join(root, "actor", "runs"), { mode: 0o700 });
   fs.symlinkSync(outside, path.join(root, "actor", "runs", "run-1"));
   const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
-  await store.retainRun({ sessionFile }, "run-1", source);
+  await expect(store.retainRun({ sessionFile }, "run-1", source)).rejects.toThrow(/symbolic link/);
   expect(fs.readdirSync(outside)).toEqual([]);
   expect(warn).toHaveBeenCalledWith(expect.stringMatching(/not archived: .*symbolic link/));
 });
@@ -182,13 +183,12 @@ it.skipIf(process.platform === "win32")("never writes through a symlink planted 
   const victim = path.join(root, "victim");
   fs.writeFileSync(victim, "victim", { mode: 0o600 });
   fs.symlinkSync(victim, path.join(archive, "status.json"));
-  const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
-  await store.retainRun({ sessionFile }, "run-1", source);
+  await expect(store.retainRun({ sessionFile }, "run-1", source)).rejects.toThrow(/Unsafe.*archive entry status\.json/);
   expect(fs.readFileSync(victim, "utf8")).toBe("victim");
   expect(fs.lstatSync(path.join(archive, "status.json")).isSymbolicLink()).toBe(true);
-  expect(warn).toHaveBeenCalledWith(expect.stringMatching(/archive entry status\.json exists and is not our regular file/));
   expect(mode(archive)).toBe(0o755); // healed
-  expect(fs.readFileSync(path.join(archive, "reply.json"), "utf8")).toBe('{"text":"archived"}');
+  expect(fs.existsSync(path.join(archive, "reply.json"))).toBe(false);
+  expect(fs.readFileSync(path.join(source, "reply.json"), "utf8")).toBe('{"text":"archived"}');
 });
 
 it.skipIf(process.platform === "win32")("writes new archive entries 0600, and replaces an existing entry only when it is our own regular file", async () => {
@@ -274,12 +274,10 @@ describe.skipIf(process.platform === "win32")("without a traversable fd base (da
     const victim = path.join(root, "victim");
     fs.writeFileSync(victim, "victim", { mode: 0o600 });
     fs.symlinkSync(victim, path.join(archive, "status.json"));
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
-    await store.retainRun({ sessionFile }, "run-1", source);
+    await expect(store.retainRun({ sessionFile }, "run-1", source)).rejects.toThrow(/Unsafe.*archive entry status\.json/);
     expect(fs.readFileSync(victim, "utf8")).toBe("victim");
-    expect(warn).toHaveBeenCalledWith(expect.stringMatching(/archive entry status\.json exists and is not our regular file/));
     expect(mode(archive)).toBe(0o755);
-    expect(mode(path.join(archive, "reply.json"))).toBe(0o600);
+    expect(fs.existsSync(path.join(archive, "reply.json"))).toBe(false);
     const fresh = await (async () => {
       const again = archiveFixture();
       await again.store.retainRun({ sessionFile: again.sessionFile }, "run-2", again.source);
@@ -359,6 +357,7 @@ it.skipIf(process.platform === "win32")("archives an actor run's nested tree wit
   for (const directory of [path.join(source, "nested"), path.join(source, "nested", "child"), path.join(source, "nested", "child", "nested"), nested]) fs.chmodSync(directory, 0o775);
   fs.writeFileSync(path.join(nested, "status.json"), "{}", { mode: 0o644 });
   fs.writeFileSync(path.join(source, "status.json"), "{}");
+  fs.writeFileSync(path.join(source, "events.jsonl"), "{}\n");
   const sessionFile = path.join(root, "actor", "session.jsonl");
   fs.mkdirSync(path.dirname(sessionFile), { recursive: true });
   const store = new ActorLogStore({ maxEventBytes: 8192 }, { eventContextChars: 1000 }, { actorRunArchiveMs: 7 * 24 * 60 * 60 * 1000 });

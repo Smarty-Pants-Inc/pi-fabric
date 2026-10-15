@@ -32,10 +32,15 @@ describe.skipIf(!fs.existsSync(workerPath))("real worker model admission", () =>
     });
     managers.push(manager);
     const result = await manager.run({ task: "must run on requested model", model, thinking: "high", transport: "process" });
-    // The manager may win the overall deadline and return a synthetic result
-    // without logFile. Inspect the durable log at its known run location either way.
-    const logFile = path.join(directory, "runs", result.id, "events.jsonl");
-    const events = fs.readFileSync(logFile, "utf8").trim().split("\n").map(line => JSON.parse(line));
+    // The manager may win the deadline and return a synthetic result without
+    // logFile. Its public reader resolves the owned run's plain or compressed log.
+    let page = manager.readLog(result.id, { lines: 5000 });
+    const logLines = [...page.events];
+    while (page.hasMore) {
+      page = manager.readLog(result.id, { lines: 5000, before: page.before!, beforeGeneration: page.generation! });
+      logLines.unshift(...page.events);
+    }
+    const events = logLines.map(line => line.parsed as { type: string; frame: { type: string } });
     const frames = events.filter(event => event.type === "fake_received").map(event => event.frame);
     return { manager, result, frames };
   };
@@ -102,7 +107,13 @@ describe.skipIf(!fs.existsSync(workerPath))("real worker model admission", () =>
       task: "probe model", model: "model-probe/requested", thinking: "high", extensions: true, transport: "process",
     })));
     for (const result of results) {
-      const log = fs.readFileSync(path.join(directory, "runs", result.id, "events.jsonl"), "utf8");
+      let page = manager.readLog(result.id, { lines: 5000 });
+      const logLines = [...page.events];
+      while (page.hasMore) {
+        page = manager.readLog(result.id, { lines: 5000, before: page.before!, beforeGeneration: page.generation! });
+        logLines.unshift(...page.events);
+      }
+      const log = logLines.map(line => line.raw).join("\n");
       expect(result, `${result.error}\n${result.stderr}\n${log}`).toMatchObject({ status: "completed", model: "model-probe/requested", thinking: "high" });
       expect(result.text).toBe("model-probe/requested:high");
       expect(log).toContain("startup-hijacked:model-probe/mru");

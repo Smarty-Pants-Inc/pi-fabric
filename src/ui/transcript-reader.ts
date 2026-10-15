@@ -1,4 +1,4 @@
-import fs from "node:fs";
+import { openRunLogSource, type RunLogSource } from "../run-log-source.js";
 import { readJsonlPageFromDescriptor } from "../log-tail.js";
 import type { FabricLogLine } from "../agents/types.js";
 import {
@@ -25,9 +25,9 @@ interface DescriptorStats {
   mtimeMs: number;
   isFile(): boolean;
 }
-const descriptorStats = (descriptor: number): DescriptorStats => {
-  const stat = fs.fstatSync(descriptor, { bigint: true });
-  const size = Number(stat.size);
+const descriptorStats = (descriptor: RunLogSource): DescriptorStats => {
+  const stat = descriptor.stat;
+  const size = descriptor.size;
   if (!Number.isSafeInteger(size)) throw new Error("file size exceeds safe byte offsets");
   return { dev: stat.dev, ino: stat.ino, size, mtimeMs: Number(stat.mtimeNs) / 1_000_000,
     isFile: () => stat.isFile() };
@@ -50,14 +50,14 @@ interface ForwardTranscriptPage {
   end: number;
 }
 
-const completeLogEnd = (descriptor: number, size: number, fallback = 0): number => {
+const completeLogEnd = (descriptor: RunLogSource, size: number, fallback = 0): number => {
   if (size <= 0) return 0;
   const scanFloor = Math.max(0, size - MAX_PAGE_BYTES);
   let scanEnd = size;
   while (scanEnd > scanFloor) {
     const scanStart = Math.max(scanFloor, scanEnd - FORWARD_READ_CHUNK_BYTES);
     const chunk = Buffer.allocUnsafe(scanEnd - scanStart);
-    const bytesRead = fs.readSync(descriptor, chunk, 0, chunk.length, scanStart);
+    const bytesRead = descriptor.read(chunk, 0, chunk.length, scanStart);
     if (bytesRead <= 0) return 0;
     for (let index = bytesRead - 1; index >= 0; index--) {
       if (chunk[index] === 0x0a) return scanStart + index + 1;
@@ -68,7 +68,7 @@ const completeLogEnd = (descriptor: number, size: number, fallback = 0): number 
 };
 
 const readForwardPage = (
-  descriptor: number,
+  descriptor: RunLogSource,
   start: number,
   end: number,
 ): ForwardTranscriptPage => {
@@ -82,7 +82,7 @@ const readForwardPage = (
   while (readOffset < readLimit && lines.length < PAGE_LINES) {
     const chunkSize = Math.min(FORWARD_READ_CHUNK_BYTES, readLimit - readOffset);
     const chunk = Buffer.allocUnsafe(chunkSize);
-    const bytesRead = fs.readSync(descriptor, chunk, 0, chunkSize, readOffset);
+    const bytesRead = descriptor.read(chunk, 0, chunkSize, readOffset);
     if (bytesRead <= 0) break;
     const data = pending.length > 0
       ? Buffer.concat([pending, chunk.subarray(0, bytesRead)])
@@ -121,10 +121,9 @@ export class AgentTranscriptReader {
       return { entries: [], truncated: false, hasMore: false, hasNewer: false };
     }
     const cached = this.#cache.get(filePath);
-    let descriptor: number | undefined;
+    let descriptor: RunLogSource | undefined;
     try {
-      const noFollow = typeof fs.constants.O_NOFOLLOW === "number" ? fs.constants.O_NOFOLLOW : 0;
-      descriptor = fs.openSync(filePath, fs.constants.O_RDONLY | noFollow);
+      descriptor = openRunLogSource(filePath);
       const stat = descriptorStats(descriptor);
       if (!stat.isFile()) {
         return cached?.transcript ?? {
@@ -166,16 +165,22 @@ export class AgentTranscriptReader {
       }
       this.#remember(filePath, state);
       return state.transcript;
-    } catch {
-      return cached?.transcript ?? {
-        entries: [],
-        truncated: false,
-        hasMore: false,
-        hasNewer: false,
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException)?.code === "ENOENT" && !cached) {
+        return { entries: [], truncated: false, hasMore: false, hasNewer: false };
+      }
+      const reason = (error instanceof Error ? error.message : String(error)).slice(0, 300);
+      return {
+        ...(cached?.transcript ?? { truncated: false, hasMore: false, hasNewer: false }),
+        unavailable: true,
+        error: reason,
+        entries: [{ id: "run-log-unavailable", kind: "error", label: "Transcript unavailable", status: "failed",
+          text: `${reason}${cached ? " · Showing cached history; source could not be verified." : ""}` },
+          ...(cached?.transcript.entries ?? [])],
       };
     } finally {
       if (descriptor !== undefined) {
-        try { fs.closeSync(descriptor); } catch {}
+        try { descriptor.close(); } catch {}
       }
     }
   }
@@ -186,10 +191,9 @@ export class AgentTranscriptReader {
     this.read(source, false);
     const cached = this.#cache.get(filePath);
     if (!cached?.hasMore || cached.pageStart <= 0) return false;
-    let descriptor: number | undefined;
+    let descriptor: RunLogSource | undefined;
     try {
-      const noFollow = typeof fs.constants.O_NOFOLLOW === "number" ? fs.constants.O_NOFOLLOW : 0;
-      descriptor = fs.openSync(filePath, fs.constants.O_RDONLY | noFollow);
+      descriptor = openRunLogSource(filePath);
       const stat = descriptorStats(descriptor);
       if (!stat.isFile() || stat.dev !== cached.device || stat.ino !== cached.inode) return false;
       const completeEnd = completeLogEnd(descriptor, stat.size, cached.completeEnd);
@@ -218,7 +222,7 @@ export class AgentTranscriptReader {
       return false;
     } finally {
       if (descriptor !== undefined) {
-        try { fs.closeSync(descriptor); } catch {}
+        try { descriptor.close(); } catch {}
       }
     }
   }
@@ -229,10 +233,9 @@ export class AgentTranscriptReader {
     this.read(source, false);
     const cached = this.#cache.get(filePath);
     if (!cached || cached.pageEnd >= cached.completeEnd) return false;
-    let descriptor: number | undefined;
+    let descriptor: RunLogSource | undefined;
     try {
-      const noFollow = typeof fs.constants.O_NOFOLLOW === "number" ? fs.constants.O_NOFOLLOW : 0;
-      descriptor = fs.openSync(filePath, fs.constants.O_RDONLY | noFollow);
+      descriptor = openRunLogSource(filePath);
       const stat = descriptorStats(descriptor);
       if (!stat.isFile() || stat.dev !== cached.device || stat.ino !== cached.inode) return false;
       const completeEnd = completeLogEnd(descriptor, stat.size, cached.completeEnd);
@@ -253,7 +256,7 @@ export class AgentTranscriptReader {
       return false;
     } finally {
       if (descriptor !== undefined) {
-        try { fs.closeSync(descriptor); } catch {}
+        try { descriptor.close(); } catch {}
       }
     }
   }
@@ -263,10 +266,9 @@ export class AgentTranscriptReader {
     if (!filePath) return false;
     this.read(source, false);
     const cached = this.#cache.get(filePath);
-    let descriptor: number | undefined;
+    let descriptor: RunLogSource | undefined;
     try {
-      const noFollow = typeof fs.constants.O_NOFOLLOW === "number" ? fs.constants.O_NOFOLLOW : 0;
-      descriptor = fs.openSync(filePath, fs.constants.O_RDONLY | noFollow);
+      descriptor = openRunLogSource(filePath);
       const stat = descriptorStats(descriptor);
       if (!stat.isFile()) return false;
       if (cached && (stat.dev !== cached.device || stat.ino !== cached.inode)) return false;
@@ -278,7 +280,7 @@ export class AgentTranscriptReader {
       return false;
     } finally {
       if (descriptor !== undefined) {
-        try { fs.closeSync(descriptor); } catch {}
+        try { descriptor.close(); } catch {}
       }
     }
   }
@@ -288,7 +290,7 @@ export class AgentTranscriptReader {
   }
 
   #latestState(
-    descriptor: number,
+    descriptor: RunLogSource,
     stat: DescriptorStats,
     knownCompleteEnd?: number,
   ): CachedTranscript {
@@ -312,7 +314,7 @@ export class AgentTranscriptReader {
   }
 
   #stateForPage(
-    descriptor: number,
+    descriptor: RunLogSource,
     stat: DescriptorStats,
     completeEnd: number,
     lines: FabricLogLine[],

@@ -21,7 +21,7 @@ import { awaitAgentCwd } from "../agents/manager.js";
 import { BUILT_IN_RUNNER_IDS, requireAgentRunner } from "../agents/runner-registry.js";
 import { isFabricWorktreePath } from "../agents/worktree-paths.js";
 import { executeFile, spawnDetached, resolveScriptRuntime } from "../agents/transports/process-utils.js";
-import { readJsonlPage } from "../log-tail.js";
+import { readRunLogPage } from "../log-tail.js";
 import { processStartTime, residentProcessAlive } from "./process-identity.js";
 import {
   RESIDENT_HANDOVER_ABI, residentLaunchSpec, handoverActive, handoverPath, handoverOutcomePath,
@@ -711,6 +711,7 @@ export class ResidencyClient {
       ...(metadata.handle.kernel ? { kernel: metadata.handle.kernel } : {}),
       ...(metadata.handle.recursive ? { recursive: true } : {}),
       residency: "durable",
+      // A logical locator for this run's event log; read it through agents.log. The physical file may be compressed or replaced after the run's true terminal.
       logFile: path.join(metadata.runDirectory, "events.jsonl"),
       ...(metadata.handle.sessionId ? { sessionId: metadata.handle.sessionId } : {}),
       ...(metadata.handle.attachCommand ? { attachCommand: metadata.handle.attachCommand } : {}),
@@ -791,7 +792,7 @@ export class ResidencyClient {
     const metadata = this.#metadata(id);
     if (!metadata) throw new Error(`Unknown durable Fabric agent: ${id}`);
     const logFile = path.join(metadata.runDirectory, "events.jsonl");
-    const page = readJsonlPage(logFile, Math.max(1, Math.min(options.lines ?? 200, 5_000)), options.before, undefined, options.beforeGeneration);
+    const page = readRunLogPage(logFile, Math.max(1, Math.min(options.lines ?? 200, 5_000)), options.before, undefined, options.beforeGeneration);
     const status = this.#record(metadata);
     return {
       id,

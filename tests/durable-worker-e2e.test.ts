@@ -182,7 +182,13 @@ describe("AgentManager real durable parent worker", () => {
     expect(result.toolCalls).toBe(1);
     const directory = manager.runDirectory(result.id)!;
     const first = JSON.parse(fs.readFileSync(path.join(directory, "status.json"), "utf8")) as AgentRunRecord;
-    expect(events(first.logFile!).some(event => event.type === "tool_execution_end")).toBe(true);
+    let page = manager.readLog(first.id, { lines: 5000 });
+    const raw = page.events.map(event => event.raw);
+    while (page.hasMore) {
+      page = manager.readLog(first.id, { lines: 5000, before: page.before!, beforeGeneration: page.generation! });
+      raw.unshift(...page.events.map(event => event.raw));
+    }
+    expect(raw.map(line => JSON.parse(line)).some(event => event.type === "tool_execution_end")).toBe(true);
     // Changed source makes an accidental second read observable in the answer.
     fs.writeFileSync(path.join(cwd, "fixture.txt"), "MUST NOT BE READ AGAIN");
     const history = events(sessionFile).filter(event => event.type === "message");

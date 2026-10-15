@@ -26,7 +26,15 @@ const run = async (behavior: string, schema?: Record<string, unknown>, replyTool
   const result = await manager.run({ task: behavior, cwd: root, transport: "process", ...(schema ? { schema } : {}), ...(replyTool ? { replyTool } : {}) });
   return { manager, result, root };
 };
-const readEvents = (logFile: string) => fs.readFileSync(logFile, "utf8").trim().split("\n").map(line => JSON.parse(line));
+const readEvents = (manager: AgentManager, id: string) => {
+  let page = manager.readLog(id, { lines: 5000 });
+  let rows = page.events;
+  while (page.hasMore) {
+    page = manager.readLog(id, { lines: 5000, before: page.before!, beforeGeneration: page.generation! });
+    rows = [...page.events, ...rows];
+  }
+  return rows.map(({ raw }) => JSON.parse(raw));
+};
 const isRunning = (pid: number): boolean => {
   try {
     process.kill(pid, 0);
@@ -43,7 +51,7 @@ describe("settled Pi exit grace", () => {
     expect(result.text).toBe("durable final result");
     expect(result.error).toBeUndefined();
     expect(result.warnings).toEqual([expect.stringContaining("did not exit after stdin closed for 5000ms")]);
-    const events = readEvents(result.logFile!);
+    const events = readEvents(manager, result.id);
     expect(events.filter(event => event.type === "agent_settled")).toEqual([
       { type: "agent_settled", ...(behavior === "never-exit" ? {} : { outcome: "completed" }) },
     ]);
@@ -81,7 +89,7 @@ describe("settled Pi exit grace", () => {
     expect(result.value).toBeUndefined();
     expect(result.replyVia).toBeUndefined();
     expect(result.warnings ?? []).toEqual([]);
-    const events = readEvents(result.logFile!);
+    const events = readEvents(manager, result.id);
     expect(events.filter(event => event.type === "agent_settled")).toEqual([{ type: "agent_settled", outcome }]);
     expect(events.find(event => event.type === "compaction_end")).toMatchObject({
       reason: "threshold", aborted: outcome === "aborted", willRetry: false,
@@ -114,7 +122,7 @@ describe("settled Pi exit grace", () => {
     expect(result.text).toBe("durable final result");
     expect(result.error).toContain("Pi exited with code 1");
     expect(result.warnings ?? []).toEqual([]);
-    const events = readEvents(result.logFile!);
+    const events = readEvents(manager, result.id);
     expect(events.some(event => event.type === "agent_settled")).toBe(false);
     expect(events.some(event => event.type === "fake_stdin_eof")).toBe(false);
     expect(fs.existsSync(path.join(path.dirname(result.logFile!), "settlement.json"))).toBe(false);
@@ -131,11 +139,11 @@ describe("settled Pi exit grace", () => {
   }, 45_000);
 
   it.each(["reply-slow-exit", "reply-after-settle"])("preserves a tool-only reply written after assistant consumption for %s", async behavior => {
-    const { result } = await run(behavior, directiveSchema, true);
+    const { manager, result } = await run(behavior, directiveSchema, true);
     expect(result).toMatchObject({ status: "completed", value: { action: "silent" }, replyVia: "tool", text: "" });
     expect(result.error).toBeUndefined();
     expect(result.warnings).toEqual([expect.stringContaining("did not exit after stdin closed for 5000ms")]);
-    const events = readEvents(result.logFile!);
+    const events = readEvents(manager, result.id);
     expect(events.filter(event => event.type === "fake_assistant_consumed")).toEqual([
       { type: "fake_assistant_consumed", replyExists: false },
     ]);
@@ -149,11 +157,11 @@ describe("settled Pi exit grace", () => {
   }, 45_000);
 
   it.each(["empty-slow-exit", "empty-never-exit"])("keeps an explicitly successful empty settlement durable through %s", async behavior => {
-    const { result } = await run(behavior);
+    const { manager, result } = await run(behavior);
     expect(result).toMatchObject({ status: "completed", text: "" });
     expect(result.error).toBeUndefined();
     expect(result.warnings).toHaveLength(1);
-    const events = readEvents(result.logFile!);
+    const events = readEvents(manager, result.id);
     const receipt = { version: 1, runId: result.id, outcome: "completed", text: "" };
     // Native success was fsynced before EOF, not inferred from child exit or text.
     expect(events.find(event => event.type === "fake_stdin_eof")).toMatchObject({ receipt });

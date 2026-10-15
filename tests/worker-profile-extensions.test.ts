@@ -69,6 +69,17 @@ const shim = (f: ReturnType<typeof fixture>, target: string) => {
   fs.chmodSync(file, 0o700); return file;
 };
 const events = (file: string) => fs.readFileSync(file, "utf8").trim().split("\n").map(line => JSON.parse(line));
+const runEvents = (manager: AgentManager, id: string) => {
+  let page = manager.readLog(id, { lines: 5000 });
+  const raw = page.events.map(event => event.raw);
+  while (page.hasMore) {
+    page = manager.readLog(id, { lines: 5000, before: page.before!, beforeGeneration: page.generation! });
+    raw.unshift(...page.events.map(event => event.raw));
+  }
+  // The original JSONL parser rejected empty/missing logs, even for negative assertions.
+  expect(raw.length).toBeGreaterThan(0);
+  return raw.map(line => JSON.parse(line));
+};
 const nativeEnabled = async (f: ReturnType<typeof fixture>) => {
   const settings = SettingsManager.create(f.root, f.profile, { projectTrusted: false });
   const native = await new DefaultPackageManager({ cwd: f.root, agentDir: f.profile, settingsManager: settings }).resolve(() => Promise.resolve("skip"));
@@ -348,13 +359,14 @@ describe.skipIf(process.platform === "win32")("real worker profile guards throug
     f.settings({ extensions: [guard, "../guards/project-tool-guard.ts", foreign, alias, f.pinned, "../missing.ts", 3], packages: [parent, { source: "../safety" }] });
     const argvFile = path.join(f.root, "argv.json");
     const recorder = f.file("argv-recorder.mjs", `import fs from 'node:fs'; fs.writeFileSync(${JSON.stringify(argvFile)}, JSON.stringify(process.argv.slice(2))); await import(${JSON.stringify(pathToFileURL(path.resolve("tests/fixtures/fake-pi-rpc.mjs")).href)});`);
-    const result = await managerFor(f, shim(f, recorder)).run({ task: "profile argv proof", transport: "process", extensions: true, tools: [] });
+    const manager = managerFor(f, shim(f, recorder));
+    const result = await manager.run({ task: "profile argv proof", transport: "process", extensions: true, tools: [] });
     expect(result.status, result.error).toBe("completed");
     const argv = JSON.parse(fs.readFileSync(argvFile, "utf8"));
     expect(argv).toEqual(["--mode", "rpc", "--session", path.join(path.dirname(result.logFile!), "session.jsonl"), "--no-extensions",
       "-e", guard, "-e", projectGuard, "-e", packageGuard, "-e", f.pinned, "-e", path.join(parent, "dist/worker/principal-delivery.js"), "-e", path.join(parent, "dist/worker/session-id.js"), "-e", path.join(parent, "dist/guards/sender-headers.js"), "-e", path.join(parent, "dist/agents/write-guard.js"), "--no-tools", "--thinking", "medium"]);
     expect(argv).not.toContain(foreign); expect(argv).not.toContain(alias);
-    const log = events(result.logFile!);
+    const log = runEvents(manager, result.id);
     expect(log.filter(event => event.type === "fabric_profile_extensions")).toEqual([{ type: "fabric_profile_extensions", names: ["bash-guard.ts", "project-tool-guard.ts", "extension.ts"], loadedCount: 3, skippedCount: 2 }]);
     expect(log.filter(event => event.source === "profile_extensions").map(event => event.count)).toEqual([1, 2]);
     expect(result.warnings).toHaveLength(2);
@@ -364,9 +376,10 @@ describe.skipIf(process.platform === "win32")("real worker profile guards throug
     const guard = f.file("guard.ts"); f.settings({ extensions: [guard], packages: [parent] });
     const argvFile = path.join(f.root, "argv.json");
     const recorder = f.file("argv-recorder.mjs", `import fs from 'node:fs'; fs.writeFileSync(${JSON.stringify(argvFile)}, JSON.stringify(process.argv.slice(2))); await import(${JSON.stringify(pathToFileURL(path.resolve("tests/fixtures/fake-pi-rpc.mjs")).href)});`);
-    const result = await managerFor(f, shim(f, recorder)).run({ task: "disabled extensions", transport: "process", extensions: false, tools: [] });
+    const manager = managerFor(f, shim(f, recorder));
+    const result = await manager.run({ task: "disabled extensions", transport: "process", extensions: false, tools: [] });
     expect(result.status, result.error).toBe("completed"); const argv = JSON.parse(fs.readFileSync(argvFile, "utf8"));
-    expect(argv).toContain("--no-extensions"); expect(argv).not.toContain(guard); expect(events(result.logFile!).some(event => event.type === "fabric_profile_extensions")).toBe(false);
+    expect(argv).toContain("--no-extensions"); expect(argv).not.toContain(guard); expect(runEvents(manager, result.id).some(event => event.type === "fabric_profile_extensions")).toBe(false);
   });
   it.for(["malformed", "unreadable"])("refuses the launch for %s profile settings before the launcher runs", async (mode, ctx) => {
     const f = fixture(); installWorker(f); fs.writeFileSync(f.pinned, "export default function() {}\n");
@@ -375,11 +388,12 @@ describe.skipIf(process.platform === "win32")("real worker profile guards throug
     if (mode === "unreadable") { const why = chmodIneffective(file); if (why) ctx.skip(why); }
     const argvFile = path.join(f.root, "argv.json");
     const recorder = f.file("argv-recorder.mjs", `import fs from 'node:fs'; fs.writeFileSync(${JSON.stringify(argvFile)}, JSON.stringify(process.argv.slice(2))); await import(${JSON.stringify(pathToFileURL(path.resolve("tests/fixtures/fake-pi-rpc.mjs")).href)});`);
-    const result = await managerFor(f, shim(f, recorder)).run({ task: `${mode} settings`, transport: "process", extensions: true, tools: [] });
+    const manager = managerFor(f, shim(f, recorder));
+    const result = await manager.run({ task: `${mode} settings`, transport: "process", extensions: true, tools: [] });
     expect(result.status).toBe("failed");
     expect(result.error).toBe(new ProfileSettingsError(file, reason).message); expect(result.error).not.toContain(SECRET);
     expect(fs.existsSync(argvFile)).toBe(false);
-    const log = events(result.logFile!);
+    const log = runEvents(manager, result.id);
     expect(log.filter(event => event.type === "fabric_profile_extensions_refused")).toEqual([{ type: "fabric_profile_extensions_refused", settingsFile: file, reason }]);
     expect(log.some(event => event.type === "fabric_profile_extensions")).toBe(false);
     expect(JSON.stringify(log)).not.toContain(SECRET);
@@ -388,11 +402,12 @@ describe.skipIf(process.platform === "win32")("real worker profile guards throug
     const f = fixture(); const parent = installWorker(f); fs.writeFileSync(f.pinned, "export default function() {}\n");
     const argvFile = path.join(f.root, "argv.json");
     const recorder = f.file("argv-recorder.mjs", `import fs from 'node:fs'; fs.writeFileSync(${JSON.stringify(argvFile)}, JSON.stringify(process.argv.slice(2))); await import(${JSON.stringify(pathToFileURL(path.resolve("tests/fixtures/fake-pi-rpc.mjs")).href)});`);
-    const result = await managerFor(f, shim(f, recorder)).run({ task: "missing settings", transport: "process", extensions: true, tools: [] });
+    const manager = managerFor(f, shim(f, recorder));
+    const result = await manager.run({ task: "missing settings", transport: "process", extensions: true, tools: [] });
     expect(result.status, result.error).toBe("completed"); expect(result.warnings ?? []).toEqual([]);
     expect(JSON.parse(fs.readFileSync(argvFile, "utf8"))).toEqual(["--mode", "rpc", "--session", path.join(path.dirname(result.logFile!), "session.jsonl"), "--no-extensions",
       "-e", f.pinned, "-e", path.join(parent, "dist/worker/principal-delivery.js"), "-e", path.join(parent, "dist/worker/session-id.js"), "-e", path.join(parent, "dist/guards/sender-headers.js"), "-e", path.join(parent, "dist/agents/write-guard.js"), "--no-tools", "--thinking", "medium"]);
-    expect(events(result.logFile!).filter(event => event.type === "fabric_profile_extensions")).toEqual([{ type: "fabric_profile_extensions", names: [], loadedCount: 0, skippedCount: 0 }]);
+    expect(runEvents(manager, result.id).filter(event => event.type === "fabric_profile_extensions")).toEqual([{ type: "fabric_profile_extensions", names: [], loadedCount: 0, skippedCount: 0 }]);
   });
   it.each(["shim", "native"])("%s real Pi process preserves the profile guard (native argv remains unchanged)", async launch => {
     const f = fixture(); const parent = installWorker(f);
@@ -413,7 +428,8 @@ describe.skipIf(process.platform === "win32")("real worker profile guards throug
     f.settings({ extensions: ["../guard/marker-guard.ts"], packages: [parent], defaultProjectTrust: "never", enableInstallTelemetry: false, compaction: { enabled: false }, retry: { enabled: false } });
     fs.writeFileSync(path.join(f.profile, "models.json"), JSON.stringify({ providers: { proof: { baseUrl: `http://127.0.0.1:${(server.address() as { port: number }).port}/v1`, apiKey: "offline-only", api: "openai-completions", models: [{ id: "offline", name: "offline", reasoning: false, input: ["text"], contextWindow: 32000, maxTokens: 1024, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }] } } }));
     const cli = fs.realpathSync(path.resolve("node_modules/@earendil-works/pi-coding-agent/dist/cli.js"));
-    const result = await managerFor(f, launch === "shim" ? shim(f, cli) : cli).run({ task: "invoke the marker command", transport: "process", extensions: true, tools: ["bash"], model: "proof/offline" });
+    const manager = managerFor(f, launch === "shim" ? shim(f, cli) : cli);
+    const result = await manager.run({ task: "invoke the marker command", transport: "process", extensions: true, tools: ["bash"], model: "proof/offline" });
     expect(result.status, result.error).toBe("completed"); expect(result.text).toBe("guard refusal verified");
     expect(fs.existsSync(sideEffect)).toBe(false); expect(fs.existsSync(refused)).toBe(true);
     expect(toolResult).toMatchObject({ role: "tool", content: expect.stringContaining("profile marker guard refused PROFILE_GUARD_MARKER") });
@@ -423,9 +439,10 @@ describe.skipIf(process.platform === "win32")("real worker profile guards throug
     // which receives its SDK directory and recovery scale ahead of Pi's argv.
     expect(argv).toEqual([...(launch === "native" ? [resolveRetrySdk(cli), String(recoveryTimeScale())] : []), "--mode", "rpc", "--session", session, ...(launch === "shim" ? ["--no-extensions", "-e", guard] : []), "-e", f.pinned,
       "-e", path.join(parent, "dist/worker/principal-delivery.js"), "-e", path.join(parent, "dist/worker/session-id.js"), "-e", path.join(parent, "dist/guards/actor-bash-hook.js"), "-e", path.join(parent, "dist/guards/sender-headers.js"), "-e", path.join(parent, "dist/agents/write-guard.js"), "--tools", "bash", "--model", "proof/offline", "--thinking", "medium"]);
-    expect(events(result.logFile!).filter(event => event.type === "fabric_profile_extensions")).toEqual(launch === "shim" ? [{ type: "fabric_profile_extensions", names: ["marker-guard.ts"], loadedCount: 1, skippedCount: 0 }] : []);
+    const log = runEvents(manager, result.id);
+    expect(log.filter(event => event.type === "fabric_profile_extensions")).toEqual(launch === "shim" ? [{ type: "fabric_profile_extensions", names: ["marker-guard.ts"], loadedCount: 1, skippedCount: 0 }] : []);
     const sessionEvents = events(session);
     expect(sessionEvents.some(event => event.type === "message" && event.message?.role === "toolResult" && event.message.isError === true)).toBe(true);
-    if (process.env.TASK_OUT) fs.writeFileSync(path.join(process.env.TASK_OUT, `${launch}-guard-evidence.json`), JSON.stringify({ status: result.status, text: result.text, argv, toolResult, sideEffectExists: fs.existsSync(sideEffect), profileReceipt: events(result.logFile!).filter(event => event.type === "fabric_profile_extensions") }, null, 2) + "\n");
+    if (process.env.TASK_OUT) fs.writeFileSync(path.join(process.env.TASK_OUT, `${launch}-guard-evidence.json`), JSON.stringify({ status: result.status, text: result.text, argv, toolResult, sideEffectExists: fs.existsSync(sideEffect), profileReceipt: log.filter(event => event.type === "fabric_profile_extensions") }, null, 2) + "\n");
   }, 45_000);
 });

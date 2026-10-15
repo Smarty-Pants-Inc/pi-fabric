@@ -35,11 +35,12 @@ const until = async (ready: () => boolean): Promise<void> => {
 };
 const entries = (file: string): Array<Record<string, any>> => fs.existsSync(file)
   ? fs.readFileSync(file, "utf8").split("\n").filter(Boolean).map(line => JSON.parse(line)) : [];
-const events = (result: { logFile?: string }) => entries(result.logFile!);
+const events = (manager: AgentManager, result: AgentRunResult) => explain(manager, result).events;
 // Use the test's own timeout/abort, not a shorter startup+retry polling budget.
 // Watch the run directory so creating/replacing events.jsonl is observed too.
 const waitForEvent = async (manager: Pick<AgentManager, "wait">, id: string, file: string,
-  matches: (event: Record<string, any>) => boolean, signal: AbortSignal): Promise<void> => {
+  matches: (event: Record<string, any>) => boolean, signal: AbortSignal,
+  explainResult: (result: AgentRunResult) => string = JSON.stringify): Promise<void> => {
   let active = true;
   let check!: () => void;
   const watcher = fs.watch(path.dirname(file), () => check());
@@ -62,7 +63,7 @@ const waitForEvent = async (manager: Pick<AgentManager, "wait">, id: string, fil
       void manager.wait(id).then(result => {
         if (!active) return;
         check();
-        reject(new Error(`Native Pi exited before required backoff event: ${explain(result)}`));
+        reject(new Error(`Native Pi exited before required backoff event: ${explainResult(result)}`));
       }, reject);
       check(); // Also cover an event written before the watcher was installed.
       if (signal.aborted) abort();
@@ -74,14 +75,24 @@ const waitForEvent = async (manager: Pick<AgentManager, "wait">, id: string, fil
     await closed;
   }
 };
-const explain = (result: AgentRunResult) => JSON.stringify(result) + "\n" + fs.readFileSync(result.logFile!, "utf8").slice(-16_000);
-const evidence = (name: string, result: AgentRunResult) => {
+const explain = (manager: AgentManager, result: AgentRunResult) => {
+  let page = manager.readLog(result.id, { lines: 5000 });
+  let rows = page.events;
+  while (page.hasMore) {
+    page = manager.readLog(result.id, { lines: 5000, before: page.before!, beforeGeneration: page.generation! });
+    rows = [...page.events, ...rows];
+  }
+  const log = rows.map(({ raw }) => raw).join("\n") + (rows.length ? "\n" : "");
+  return { log, events: rows.map(({ raw }) => JSON.parse(raw)), message: JSON.stringify(result) + "\n" + log.slice(-16_000) };
+};
+const evidence = (manager: AgentManager, name: string, result: AgentRunResult) => {
   const directory = process.env.FABRIC_OVERLOAD_TEST_EVIDENCE_DIR;
   if (!directory) return;
   fs.mkdirSync(directory, { recursive: true });
   fs.writeFileSync(path.join(directory, name + "-result.json"), JSON.stringify(result, null, 2));
   const run = path.dirname(result.logFile!);
-  for (const file of ["events.jsonl", "lifecycle.jsonl", "session.jsonl", "status.json"]) {
+  fs.writeFileSync(path.join(directory, name + "-events.jsonl"), explain(manager, result).log);
+  for (const file of ["lifecycle.jsonl", "session.jsonl", "status.json"]) {
     if (fs.existsSync(path.join(run, file))) fs.copyFileSync(path.join(run, file), path.join(directory, name + "-" + file));
   }
 };
@@ -210,7 +221,7 @@ describe("real Pi process provider recovery (offline localhost)", () => {
       }); }`);
     const handle = await s.manager.spawn({ task: "Finish ORIGINAL_TASK", model: "overload-test/offline", tools: [], extensions: true, transport: "process" });
     await until(() => s.requests.length === 1 || ["failed", "completed"].includes(s.manager.status(handle.id).status));
-    if (!s.requests.length) { const failed = await s.manager.wait(handle.id); evidence("delayed-startup-failure", failed); throw new Error(explain(failed)); }
+    if (!s.requests.length) { const failed = await s.manager.wait(handle.id); evidence(s.manager, "delayed-startup-failure", failed); throw new Error(explain(s.manager, failed).message); }
     const receipt = s.manager.followUp(handle.id, "DELAYED_NATIVE_FOLLOW_UP", undefined, {
       v: 1, channel: "fabric", via: "followUp", sender: { id: "test", kind: "main", verified: "mesh" },
     }, { deadlineMs: 100 });
@@ -220,8 +231,8 @@ describe("real Pi process provider recovery (offline localhost)", () => {
     await until(() => fs.existsSync(held));
     expect((s.manager.status(handle.id) as any).followUpDeliveries[0].state).toBe("queued");
     expect(entries(path.join(run, "session.jsonl")).filter(e => e.type === "message" && e.message?.role === "user" && JSON.stringify(e.message.content).includes("DELAYED_NATIVE_FOLLOW_UP"))).toHaveLength(0);
-    const result = await s.manager.wait(handle.id); evidence("delayed-native-admission", result);
-    expect(result, explain(result)).toMatchObject({ status: "completed" });
+    const result = await s.manager.wait(handle.id); evidence(s.manager, "delayed-native-admission", result);
+    expect(result, explain(s.manager, result).message).toMatchObject({ status: "completed" });
     const delivery = (s.manager.status(handle.id) as any).followUpDeliveries[0];
     expect(delivery).toMatchObject({ state: "delivered", alarm: { code: "FABRIC_FOLLOW_UP_DEADLINE" } });
     expect(entries(path.join(run, "session.jsonl")).filter(e => e.type === "message" && e.message?.role === "user" && JSON.stringify(e.message.content).includes("DELAYED_NATIVE_FOLLOW_UP"))).toHaveLength(1);
@@ -242,10 +253,10 @@ describe("real Pi process provider recovery (offline localhost)", () => {
     expect((s.manager.status(handle.id) as any).followUpDeliveries[0].state).toBe("queued");
     if (cancelled) expect(s.manager.cancelFollowUp(handle.id, receipt.messageId).state).toBe("cancelled");
     s.releaseOverload();
-    const result = await s.manager.wait(handle.id); evidence("held-follow-up-" + cancelled, result);
-    expect(result, explain(result)).toMatchObject({ status: "completed" });
+    const result = await s.manager.wait(handle.id); evidence(s.manager, "held-follow-up-" + cancelled, result);
+    expect(result, explain(s.manager, result).message).toMatchObject({ status: "completed" });
     expect(result.runnerSessionIds).toHaveLength(1);
-    expect(events(result).filter(e => e.type === "fabric_provider_resume" && e.phase === "starting")).toHaveLength(1);
+    expect(events(s.manager, result).filter(e => e.type === "fabric_provider_resume" && e.phase === "starting")).toHaveLength(1);
     const users = entries(path.join(run, "session.jsonl")).filter(e => e.type === "message" && e.message?.role === "user" && JSON.stringify(e.message.content).includes(marker));
     expect(users).toHaveLength(cancelled ? 0 : 1);
     expect(s.requests.some(request => JSON.stringify(request).includes(marker))).toBe(!cancelled);
@@ -253,9 +264,9 @@ describe("real Pi process provider recovery (offline localhost)", () => {
   }, 120_000);
   it("survives a 90-second scaled overload burst in one native session, with no kill", async () => {
     const s = await setup("burst"); const handle = await s.spawn();
-    const result = await s.manager.wait(handle.id); evidence("burst", result);
-    expect(result, explain(result)).toMatchObject({ status: "completed", text: "survived overload" });
-    const log = events(result);
+    const result = await s.manager.wait(handle.id); evidence(s.manager, "burst", result);
+    expect(result, explain(s.manager, result).message).toMatchObject({ status: "completed", text: "survived overload" });
+    const log = events(s.manager, result);
     expect(log.filter(event => event.type === "auto_retry_start").map(event => event.delayMs)).toEqual([250, 500, 1000, 2000, 4000]);
     expect(log.some(event => event.type === "fabric_recovery_error" || event.type === "fabric_provider_resume")).toBe(false);
     expect(result.runnerSessionIds).toHaveLength(1);
@@ -278,7 +289,7 @@ describe("real Pi process provider recovery (offline localhost)", () => {
           (controls === "steering" || saved.followUpMode === "all");
       });
     } finally { s.releaseOverload(); }
-    const result = await s.manager.wait(handle.id); evidence("queue-modes-" + controls, result);
+    const result = await s.manager.wait(handle.id); evidence(s.manager, "queue-modes-" + controls, result);
     const saved = JSON.parse(fs.readFileSync(s.settingsFile, "utf8"));
     const directory = process.env.FABRIC_OVERLOAD_TEST_EVIDENCE_DIR;
     if (directory) fs.copyFileSync(s.settingsFile, path.join(directory, "queue-modes-" + controls + "-settings.json"));
@@ -287,8 +298,8 @@ describe("real Pi process provider recovery (offline localhost)", () => {
       ...(controls !== "follow-up" ? { steeringMode: "all" } : {}),
       ...(controls !== "steering" ? { followUpMode: "all" } : {}),
     });
-    expect(result, explain(result)).toMatchObject({ status: "completed", text: "survived overload" });
-    const log = events(result);
+    expect(result, explain(s.manager, result).message).toMatchObject({ status: "completed", text: "survived overload" });
+    const log = events(s.manager, result);
     expect(log.filter(event => event.type === "auto_retry_start").map(event => event.delayMs)).toEqual([250, 500, 1000, 2000, 4000]);
     expect(log.some(event => event.type === "fabric_provider_resume" || event.type === "fabric_recovery_error")).toBe(false);
     expect(result.runnerSessionIds).toHaveLength(1);
@@ -308,34 +319,34 @@ describe("real Pi process provider recovery (offline localhost)", () => {
         return saved.steeringMode === "all" && saved.followUpMode === "all";
       });
     } finally { s.releaseOverload(); }
-    const result = await s.manager.wait(handle.id); evidence("queue-modes-explicit", result);
+    const result = await s.manager.wait(handle.id); evidence(s.manager, "queue-modes-explicit", result);
     expect(JSON.parse(fs.readFileSync(s.settingsFile, "utf8"))).toEqual({ ...JSON.parse(s.settings), steeringMode: "all", followUpMode: "all", retry });
-    expect(result, explain(result)).toMatchObject({ status: "completed", text: "survived overload" });
-    expect(events(result).filter(event => event.type === "auto_retry_start").map(event => event.delayMs)).toEqual([11, 22, 44, 88, 176]);
-    expect(events(result).some(event => event.type === "fabric_provider_resume")).toBe(false);
+    expect(result, explain(s.manager, result).message).toMatchObject({ status: "completed", text: "survived overload" });
+    expect(events(s.manager, result).filter(event => event.type === "auto_retry_start").map(event => event.delayMs)).toEqual([11, 22, 44, 88, 176]);
+    expect(events(s.manager, result).some(event => event.type === "fabric_provider_resume")).toBe(false);
     expect(result.runnerSessionIds).toHaveLength(1);
   }, 120_000);
 
   it("fails at the same ten-minute recovery bound across relaunches, retaining the session", async () => {
     const s = await setup("forever"); const handle = await s.spawn();
-    const result = await s.manager.wait(handle.id); evidence("bound", result);
-    expect(result, explain(result)).toMatchObject({ status: "failed" });
+    const result = await s.manager.wait(handle.id); evidence(s.manager, "bound", result);
+    expect(result, explain(s.manager, result).message).toMatchObject({ status: "failed" });
     expect(result.error).toContain("10-minute bound");
     expect(result.runnerSessionIds).toHaveLength(1);
     expect(fs.existsSync(path.join(path.dirname(result.logFile!), "session.jsonl"))).toBe(true);
-    expect(events(result).filter(event => event.type === "fabric_provider_resume" && event.phase === "starting").length).toBeLessThanOrEqual(3);
-    expect(events(result).filter(event => event.type === "auto_retry_start").some(event => event.delayMs === 8000)).toBe(true);
+    expect(events(s.manager, result).filter(event => event.type === "fabric_provider_resume" && event.phase === "starting").length).toBeLessThanOrEqual(3);
+    expect(events(s.manager, result).filter(event => event.type === "auto_retry_start").some(event => event.delayMs === 8000)).toBe(true);
   }, 120_000);
 
   it("resumes an exhausted retryable Pi child on the exact same file and records the lifecycle", async () => {
     const s = await setup("resume", { maxRetries: 0 }); const handle = await s.spawn();
-    const result = await s.manager.wait(handle.id); evidence("resume", result);
-    expect(result, explain(result)).toMatchObject({ status: "completed", text: "survived overload" });
+    const result = await s.manager.wait(handle.id); evidence(s.manager, "resume", result);
+    expect(result, explain(s.manager, result).message).toMatchObject({ status: "completed", text: "survived overload" });
     expect(s.requests).toHaveLength(2);
     expect(JSON.stringify(s.requests[1])).toContain("ORIGINAL_TASK");
     expect(JSON.stringify(s.requests[1])).toContain("Continue the task");
     expect(result.runnerSessionIds).toHaveLength(1);
-    expect(events(result).filter(event => event.type === "fabric_provider_resume")).toMatchObject([
+    expect(events(s.manager, result).filter(event => event.type === "fabric_provider_resume")).toMatchObject([
       { attempt: 1, delayMs: 1500, phase: "scheduled" }, { attempt: 1, delayMs: 1500, phase: "starting" },
     ]);
     expect(entries(path.join(path.dirname(result.logFile!), "lifecycle.jsonl")).some(event => event.event === "run.resumed")).toBe(true);
@@ -351,37 +362,37 @@ describe("real Pi process provider recovery (offline localhost)", () => {
     // More than two poll ticks while the old child's real stdin is ended.
     await new Promise(resolve => setTimeout(resolve, 650));
     expect(entries(logFile).some(event => event.type === "fabric_provider_resume" && event.phase === "starting")).toBe(false);
-    const result = await s.manager.wait(handle.id); evidence("recovery-controls", result);
-    expect(result, explain(result)).toMatchObject({ status: "completed" });
+    const result = await s.manager.wait(handle.id); evidence(s.manager, "recovery-controls", result);
+    expect(result, explain(s.manager, result).message).toMatchObject({ status: "completed" });
     expect(result.runnerSessionIds).toHaveLength(1);
     const journal = entries(path.join(path.dirname(result.logFile!), "session.jsonl"));
     expect(journal.filter(entry => entry.type === "session")).toHaveLength(1);
     const users = journal.filter(entry => entry.type === "message" && entry.message?.role === "user")
       .map(entry => entry.message.content.map((part: any) => part.text ?? "").join(""));
     for (const text of ["RECOVERY_STEER_ONLY_ONCE", "RECOVERY_FOLLOW_UP_ONLY_ONCE"]) {
-      expect(users.filter(message => message === text), explain(result)).toHaveLength(1);
+      expect(users.filter(message => message === text), explain(s.manager, result).message).toHaveLength(1);
       expect(s.requests.some(request => JSON.stringify(request).includes(text))).toBe(true);
     }
-    expect(events(result).filter(event => event.type === "fabric_provider_resume" && event.phase === "starting")).toHaveLength(1);
+    expect(events(s.manager, result).filter(event => event.type === "fabric_provider_resume" && event.phase === "starting")).toHaveLength(1);
   }, 120_000);
 
   it.each(["429", "disconnect"] as const)("resumes a retryable %s with Pi's classification family", async mode => {
     const s = await setup(mode, { maxRetries: 0 }); const handle = await s.spawn();
-    const result = await s.manager.wait(handle.id); evidence(mode, result);
-    expect(result, explain(result)).toMatchObject({ status: "completed", text: "survived overload" });
+    const result = await s.manager.wait(handle.id); evidence(s.manager, mode, result);
+    expect(result, explain(s.manager, result).message).toMatchObject({ status: "completed", text: "survived overload" });
     expect(s.requests).toHaveLength(2);
     expect(result.runnerSessionIds).toHaveLength(1);
-    expect(events(result).filter(event => event.type === "fabric_provider_resume" && event.phase === "starting")).toHaveLength(1);
+    expect(events(s.manager, result).filter(event => event.type === "fabric_provider_resume" && event.phase === "starting")).toHaveLength(1);
   }, 120_000);
 
   it("never exceeds three same-session resumes even when the user's Pi retries are disabled", async () => {
     const s = await setup("forever", { maxRetries: 0 }); const handle = await s.spawn();
-    const result = await s.manager.wait(handle.id); evidence("resume-cap", result);
-    expect(result, explain(result)).toMatchObject({ status: "failed" });
+    const result = await s.manager.wait(handle.id); evidence(s.manager, "resume-cap", result);
+    expect(result, explain(s.manager, result).message).toMatchObject({ status: "failed" });
     expect(result.error).toContain("exhausted 3 same-session resumes");
     expect(result.runnerSessionIds).toHaveLength(1);
     expect(s.requests).toHaveLength(4);
-    expect(events(result).filter(event => event.type === "fabric_provider_resume" && event.phase === "starting").map(event => event.delayMs)).toEqual([1500, 3000, 6000]);
+    expect(events(s.manager, result).filter(event => event.type === "fabric_provider_resume" && event.phase === "starting").map(event => event.delayMs)).toEqual([1500, 3000, 6000]);
   }, 120_000);
 
   it.for(["native retry", "transport resume"])("stops promptly during %s backoff, with no later resume", { timeout: 120_000 }, async (backoff, { signal }) => {
@@ -390,23 +401,23 @@ describe("real Pi process provider recovery (offline localhost)", () => {
     const logFile = path.join(s.dir, "runs", handle.id, "events.jsonl");
     await waitForEvent(s.manager, handle.id, logFile, event => backoff === "native retry"
       ? event.type === "auto_retry_start" && event.delayMs >= 4000
-      : event.type === "fabric_provider_resume" && event.phase === "scheduled", signal);
+      : event.type === "fabric_provider_resume" && event.phase === "scheduled", signal, result => explain(s.manager, result).message);
     const worker = ownedProcesses.find(child => String(child.pid) === handle.sessionId)!;
     const before = Date.now(); await s.manager.stop(handle.id);
     expect(worker.didClose(), "stop must join the owned native worker close").toBe(true);
-    const result = await s.manager.wait(handle.id); evidence(backoff.replace(" ", "-"), result);
-    expect(result, explain(result)).toMatchObject({ status: "stopped" });
+    const result = await s.manager.wait(handle.id); evidence(s.manager, backoff.replace(" ", "-"), result);
+    expect(result, explain(s.manager, result).message).toMatchObject({ status: "stopped" });
     expect(Date.now() - before).toBeLessThan(2000);
-    expect(events(result).some(event => event.type === "fabric_provider_resume" && event.phase === "starting")).toBe(false);
+    expect(events(s.manager, result).some(event => event.type === "fabric_provider_resume" && event.phase === "starting")).toBe(false);
     expect(result.runnerSessionIds).toHaveLength(1);
   });
 
   it("never resumes a nonretryable 400 response", async () => {
     const s = await setup("400"); const handle = await s.spawn();
-    const result = await s.manager.wait(handle.id); evidence("400", result);
-    expect(result, explain(result)).toMatchObject({ status: "failed" });
+    const result = await s.manager.wait(handle.id); evidence(s.manager, "400", result);
+    expect(result, explain(s.manager, result).message).toMatchObject({ status: "failed" });
     expect(s.requests).toHaveLength(1);
     expect(result.error).toContain("400");
-    expect(events(result).some(event => event.type === "fabric_provider_resume" || event.type === "auto_retry_start")).toBe(false);
+    expect(events(s.manager, result).some(event => event.type === "fabric_provider_resume" || event.type === "auto_retry_start")).toBe(false);
   }, 120_000);
 });

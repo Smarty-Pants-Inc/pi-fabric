@@ -96,7 +96,7 @@ try {
   // Preserve the manager's native transport receipt and full audit before
   // session_shutdown. Neither partial text nor a fake receipt counts as proof.
   const files = [];
-  const walk = directory => { if (!fs.existsSync(directory)) return; for (const entry of fs.readdirSync(directory, { withFileTypes: true })) { const file = path.join(directory, entry.name); if (entry.isDirectory()) walk(file); else if (["placement.json", "events.jsonl", "status.json", "unresolved-worker.json"].includes(entry.name)) files.push(file); } };
+  const walk = directory => { if (!fs.existsSync(directory)) return; for (const entry of fs.readdirSync(directory, { withFileTypes: true })) { const file = path.join(directory, entry.name); if (entry.isDirectory()) walk(file); else if (["placement.json", "events.jsonl", "events.jsonl.zst", "status.json", "unresolved-worker.json"].includes(entry.name)) files.push(file); } };
   walk(path.join(scratch, "runs"));
   // Current Pi may select a custody run root under PI_FABRIC_TMPDIR instead
   // of the requested runs root. Follow the returned exact run, not a guess.

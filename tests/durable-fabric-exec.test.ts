@@ -43,7 +43,13 @@ describe("built durable Fabric host", () => {
     expect(result.text).toContain("recursive leaf");
     expect(result.text).toContain("pi-durable");
     expect(result.text).toContain("completed");
-    const events = fs.readFileSync(result.logFile!, "utf8");
+    let page = manager.readLog(result.id, { lines: 5000 });
+    const logLines = [...page.events];
+    while (page.hasMore) {
+      page = manager.readLog(result.id, { lines: 5000, before: page.before!, beforeGeneration: page.generation! });
+      logLines.unshift(...page.events);
+    }
+    const events = logLines.map(line => line.raw).join("\n");
     expect(events).toContain('"toolName":"fabric_exec"');
   }, 60000);
 });

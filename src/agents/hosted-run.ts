@@ -129,6 +129,8 @@ export class HostedRun {
   /** Stop finished; the monitor must not poll liveness again. */
   #released = false;
   #detached = false;
+  /** Start/reattach still owns its reporter until the adapter call has joined. */
+  #reporterPending = 0;
   #shutdown = false;
   #pendingQuestions = 0;
   #deliveries: Promise<void> = Promise.resolve();
@@ -197,23 +199,28 @@ export class HostedRun {
 
   /** Submit once. A failed submission may still have started remote work. */
   async start(): Promise<void> {
+    this.#reporterPending++;
     try {
       await withTimeout(() => this.adapter.start(this.locator, this.context, this.reporter), `${this.adapter.id}.start`);
     } catch (error) {
       this.#settle({ status: "failed", error: `Hosted runner start failed: ${message(error)}`, outcome: "indeterminate" });
+    } finally {
+      this.#reporterPending--;
     }
   }
 
   /** Re-attach after a restart; an unreachable or interrupted run is indeterminate. */
   async attach(): Promise<void> {
+    this.#reporterPending++;
     try {
       await withTimeout(() => this.adapter.attach(this.locator, this.context, this.reporter), `${this.adapter.id}.attach`);
+      if (this.terminal) return;
+      if (!(await this.#isAlive())) this.settleLost();
     } catch (error) {
       this.#settle({ status: "failed", error: `Hosted runner attach failed: ${message(error)}`, outcome: "indeterminate" });
-      return;
+    } finally {
+      this.#reporterPending--;
     }
-    if (this.terminal) return;
-    if (!(await this.#isAlive())) this.settleLost();
   }
 
   /** Terminal record for a run whose adapter reports it gone without a result. */
@@ -280,6 +287,11 @@ export class HostedRun {
 
   get detached(): boolean {
     return this.#detached;
+  }
+
+  /** A local append fence, distinct from process execution exit and from durable detach. */
+  get reporterClosed(): boolean {
+    return this.#closed && this.#reporterPending === 0;
   }
 
   close(): void {
@@ -478,6 +490,9 @@ export class HostedRun {
   }
 
   #appendLog(event: unknown): void {
+    // Delivery failures also use this path, after their async adapter call returns. Fence them
+    // together with reporter.transcript so a late rejection cannot recreate a retired plain log.
+    if (this.#closed) return;
     try {
       const line = JSON.stringify(event);
       if (line === undefined || Buffer.byteLength(line) > MAX_TRANSCRIPT_EVENT_BYTES) return;

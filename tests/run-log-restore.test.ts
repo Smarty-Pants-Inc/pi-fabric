@@ -40,7 +40,8 @@ const refuses = async (operation: Promise<unknown>, reason?: string) => {
   expect(fs.existsSync(encodedPath)).toBe(true);
 };
 
-describe("additive per-artifact run-log restore: dry-run or recorded temp cleanup", () => {
+// __CUT1241__: native Windows compressed-artifact publication/custody is deferred; retain every assertion for Linux.
+describe.skipIf(process.platform === "win32")("additive per-artifact run-log restore: dry-run or recorded temp cleanup", () => {
   it("defaults to dry-run with no writes and preserves compressed bytes", async () => {
     const before = fs.readFileSync(encodedPath);
     expect(await restore(encodedPath)).toMatchObject({ kind: "dry-run", originalBytes: content.length });

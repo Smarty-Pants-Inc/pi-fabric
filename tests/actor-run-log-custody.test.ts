@@ -9,6 +9,8 @@ import { AgentManager } from "../src/agents/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { MeshStore } from "../src/mesh/store.js";
 import * as logTail from "../src/log-tail.js";
+import * as atomicWrites from "../src/core/atomic-write.js";
+import * as publicationFence from "../src/topology/main-publication-fence.js";
 import { pruneActorRunArchives, pruneActorSessionBackups } from "../src/storage/retention.js";
 
 // Decision C: archive custody/data-safety failure probes. Product pruning is recorded,
@@ -42,7 +44,8 @@ const fixture = (compressed = false) => {
   return { source, actor, store, name, dest };
 };
 
-describe("actor mandatory run-log custody", () => {
+// __CUT1241__: native Windows keeps main's plain archive; these new mandatory codec/custody assertions stay POSIX-only.
+describe.skipIf(process.platform === "win32")("actor mandatory run-log custody", () => {
   it.each([false, true])("durably copies and verifies mandatory events and status (compressed=%s)", async (compressed) => {
     const f = fixture(compressed);
     const write = vi.spyOn(privateDir, "writeArchiveFile");
@@ -277,7 +280,246 @@ const managerFixture = async () => {
   return { actors, agents, actor, cleanup, commit };
 };
 
-describe("actor owner finalizer and reader boundary", () => {
+// Decision C: the compatibility regressions below use the real ask -> retain -> commit ->
+// cleanup control path, with mesh publication/removal and archive writes recorded. Every
+// archive copy creates a NEW file exclusively; no product rename, unlink or truncation runs.
+const recordedCompatibilityFixture = async () => {
+  const forbidden = ["rmSync", "rmdirSync", "unlinkSync", "renameSync", "truncateSync", "ftruncateSync"] as const;
+  const destructive = [
+    ...forbidden.map(name => vi.spyOn(fs, name).mockImplementation((() => {
+      throw new Error(`Decision C forbids product ${name}`);
+    }) as never)),
+    ...(["rm", "rmdir", "unlink", "rename", "truncate"] as const).map(name =>
+      vi.spyOn(fs.promises, name).mockRejectedValue(new Error(`Decision C forbids product promises.${name}`))),
+  ];
+  vi.spyOn(publicationFence, "deleteRootActorTree").mockResolvedValue();
+  vi.spyOn(atomicWrites, "writeJsonAtomic").mockImplementation((file, value, options) => {
+    // Actor session headers are new. Later metadata publication is recorded, not replaced.
+    if (!fs.existsSync(file)) {
+      fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+      fs.writeFileSync(file, JSON.stringify(value) + (options?.newline ? "\n" : ""), { flag: "wx", mode: 0o600 });
+    }
+  });
+  const write = vi.spyOn(privateDir, "writeArchiveFile").mockImplementation((held, name, content) => {
+    const destination = path.join(held.path, name);
+    if ("source" in content) fs.copyFileSync(content.source, destination, fs.constants.COPYFILE_EXCL);
+    else fs.writeFileSync(destination, content.bytes, { flag: "wx", mode: 0o600 });
+    return true;
+  });
+  const meshRoot = path.join(root, "recorded-mesh"); fs.mkdirSync(meshRoot);
+  const mesh = {
+    root: meshRoot, maxEventBytes: 65536, maxReadEvents: 100,
+    latestOffset: () => 0, tail: () => ({ events: [], nextOffset: 0 }),
+    get: () => undefined, listAll: () => [], listAllShared: () => [],
+    publish: vi.fn(async (request: Record<string, unknown>) => ({ ...request, id: "recorded", sequence: 1, at: Date.now() })),
+    put: vi.fn(async () => ({ version: 1 })), delete: vi.fn(async () => ({ deleted: true })),
+  } as unknown as MeshStore;
+  const agents = new AgentManager(root, { ...DEFAULT_FABRIC_CONFIG.agents, retainRuns: true, budgetUsd: 0 }, { runRoot: path.join(root, "recorded-agent-runs") });
+  closers.push(() => agents.close());
+  const actors = new ActorManager("compatibility", { id: "session:compatibility", sessionId: "compatibility", name: "main", kind: "main" },
+    mesh, DEFAULT_FABRIC_CONFIG.mesh, agents, () => {}, { actorRoot: path.join(root, "recorded-actors"),
+      persistent: false, reapDeadSessionPresence: false, meshRetentionSweepPath: false, canConsumeMesh: () => false });
+  closers.push(() => actors.close());
+  const actor = await actors.create({ name: "compatibility", instructions: "Recorded fixture only.", responseMode: "text", model: "test/model" });
+  const cleanup = vi.spyOn(agents, "cleanup").mockResolvedValue({ cleaned: true });
+  const commit = vi.spyOn(agents, "commitActorArchive").mockResolvedValue();
+  const finalize = vi.spyOn(agents, "finalizeRunLog").mockRejectedValue(new Error("no event artifact/writer receipt"));
+  vi.spyOn(agents, "actorArchiveSources").mockReturnValue(new Map());
+  return { actors, agents, actor, cleanup, commit, finalize, write, destructive };
+};
+
+describe("main-compatible event-less actor retention (Decision C recorded)", () => {
+  it.each(["live", "recovered"])("preserves main task/status archive and cleanup for a truly event-less %s source without finalization", async (kind) => {
+    const m = await recordedCompatibilityFixture();
+    const source = path.join(root, "event-less-source"); fs.mkdirSync(source, { mode: 0o700 });
+    const status = JSON.stringify({ id, status: "completed", finishedAt: 1 });
+    const task = "mechanically known-empty worker task\n";
+    fs.writeFileSync(path.join(source, "status.json"), status, { flag: "wx", mode: 0o600 });
+    fs.writeFileSync(path.join(source, "task.txt"), task, { flag: "wx", mode: 0o600 });
+    vi.spyOn(m.agents, "runDirectory").mockReturnValue(kind === "live" ? source : undefined);
+    if (kind === "recovered") vi.mocked(m.agents.actorArchiveSources).mockReturnValue(new Map([[id, source]]));
+    vi.spyOn(m.agents, "run").mockResolvedValue({ id, status: "completed", text: "fixture", toolCalls: 0, usage: {} } as never);
+    await m.actors.ask(m.actor.id, "fixture");
+    await m.actors.close();
+    expect(m.finalize).not.toHaveBeenCalled();
+    expect(m.write.mock.calls.map(([, name, , durable]) => [name, durable])).toEqual([["status.json", undefined], ["task.txt", undefined]]);
+    expect(fs.readdirSync(path.join(m.actor.logDir!, id)).sort()).toEqual(["status.json", "task.txt"]);
+    expect(fs.readFileSync(path.join(m.actor.logDir!, id, "status.json"), "utf8")).toBe(status);
+    expect(fs.readFileSync(path.join(m.actor.logDir!, id, "task.txt"), "utf8")).toBe(task);
+    expect(fs.readdirSync(source).sort()).toEqual(["status.json", "task.txt"]);
+    expect(fs.readFileSync(path.join(source, "status.json"), "utf8")).toBe(status);
+    expect(fs.readFileSync(path.join(source, "task.txt"), "utf8")).toBe(task);
+    expect(m.commit).toHaveBeenCalledExactlyOnceWith(id, m.actor.id, m.actor.sessionFile);
+    expect(m.cleanup).toHaveBeenCalledExactlyOnceWith(id);
+    for (const operation of m.destructive) expect(operation).not.toHaveBeenCalled();
+  });
+
+  it("refuses an event-less source directory successor after recorded optional copies without real rename", async () => {
+    const m = await recordedCompatibilityFixture();
+    const source = path.join(root, "event-less-successor"); fs.mkdirSync(source, { mode: 0o700 });
+    const status = JSON.stringify({ id, status: "completed" });
+    fs.writeFileSync(path.join(source, "status.json"), status, { flag: "wx" });
+    fs.writeFileSync(path.join(source, "task.txt"), "preserved task", { flag: "wx" });
+    let replaced = false;
+    const lstat = fs.lstatSync;
+    vi.spyOn(fs, "lstatSync").mockImplementation(((file: fs.PathLike, options?: unknown) => {
+      const stat = lstat(file, options as never);
+      return stat && String(file) === source && replaced ? Object.assign(stat, { ino: stat.ino + 1 }) : stat;
+    }) as typeof fs.lstatSync);
+    const write = m.write.getMockImplementation()!;
+    m.write.mockImplementation((...args) => {
+      const result = write(...args);
+      if (args[1] === "status.json") replaced = true;
+      return result;
+    });
+    vi.spyOn(m.agents, "runDirectory").mockReturnValue(source);
+    vi.spyOn(m.agents, "run").mockResolvedValue({ id, status: "completed", text: "fixture", toolCalls: 0, usage: {} } as never);
+    await m.actors.ask(m.actor.id, "fixture");
+    await m.actors.close();
+    expect(m.finalize).not.toHaveBeenCalled();
+    expect(m.write.mock.calls.map(([, name]) => name)).toEqual(["status.json", "task.txt"]);
+    expect(m.commit).not.toHaveBeenCalled();
+    expect(m.cleanup).not.toHaveBeenCalled();
+    expect(fs.readFileSync(path.join(source, "status.json"), "utf8")).toBe(status);
+    expect(fs.readFileSync(path.join(source, "task.txt"), "utf8")).toBe("preserved task");
+    for (const operation of m.destructive) expect(operation).not.toHaveBeenCalled();
+  });
+
+  // __CUT1241__: compressed-source classification/finalizer custody is POSIX-only.
+  it.skipIf(process.platform === "win32").each(["EACCES", "symlink", "hardlink", "foreign"])("does not turn a %s compressed event source into known-empty history", async (kind) => {
+    const m = await recordedCompatibilityFixture();
+    const source = path.join(root, "unsafe-event-source"); fs.mkdirSync(source, { mode: 0o700 });
+    fs.writeFileSync(path.join(source, "status.json"), JSON.stringify({ id, status: "completed" }), { flag: "wx" });
+    const target = path.join(root, "event-victim"); fs.writeFileSync(target, event, { flag: "wx" });
+    const compressed = path.join(source, "events.jsonl.zst");
+    if (kind === "symlink") fs.symlinkSync(target, compressed);
+    else if (kind === "hardlink") fs.linkSync(target, compressed);
+    else if (kind === "foreign") fs.writeFileSync(compressed, event, { flag: "wx" });
+    if (kind === "EACCES" || kind === "foreign") {
+      const lstat = fs.lstatSync;
+      vi.spyOn(fs, "lstatSync").mockImplementation(((file: fs.PathLike, options?: unknown) => {
+        if (String(file) === compressed && kind === "EACCES") throw Object.assign(new Error("EACCES event"), { code: "EACCES" });
+        const stat = lstat(file, options as never);
+        return stat && String(file) === compressed && kind === "foreign" ? Object.assign(stat, { uid: stat.uid + 1 }) : stat;
+      }) as typeof fs.lstatSync);
+    }
+    vi.spyOn(m.agents, "runDirectory").mockReturnValue(source);
+    vi.spyOn(m.agents, "run").mockResolvedValue({ id, status: "completed", text: "fixture", toolCalls: 0, usage: {} } as never);
+    await m.actors.ask(m.actor.id, "fixture");
+    await m.actors.close();
+    expect(m.finalize).not.toHaveBeenCalled();
+    expect(m.write).not.toHaveBeenCalled();
+    expect(m.commit).not.toHaveBeenCalled();
+    expect(m.cleanup).not.toHaveBeenCalled();
+    expect(fs.readFileSync(target, "utf8")).toBe(event);
+    for (const operation of m.destructive) expect(operation).not.toHaveBeenCalled();
+  });
+
+  // __CUT1241__: this compressed-source finalizer join is off on native Windows.
+  it.skipIf(process.platform === "win32")("rejects a source directory successor after a recorded finalizer without renaming any product directory", async () => {
+    const f = fixture(true), m = await recordedCompatibilityFixture();
+    let replaced = false;
+    const lstat = fs.lstatSync;
+    vi.spyOn(fs, "lstatSync").mockImplementation(((file: fs.PathLike, options?: unknown) => {
+      const stat = lstat(file, options as never);
+      return stat && String(file) === f.source && replaced ? Object.assign(stat, { ino: stat.ino + 1 }) : stat;
+    }) as typeof fs.lstatSync);
+    m.finalize.mockImplementation(async () => { replaced = true; });
+    vi.spyOn(m.agents, "runDirectory").mockReturnValue(f.source);
+    vi.spyOn(m.agents, "run").mockResolvedValue({ id, status: "completed", text: "fixture", toolCalls: 0, usage: {} } as never);
+    await m.actors.ask(m.actor.id, "fixture");
+    await m.actors.close();
+    expect(m.finalize).toHaveBeenCalledExactlyOnceWith(id);
+    expect(m.write).not.toHaveBeenCalled();
+    expect(m.commit).not.toHaveBeenCalled();
+    expect(m.cleanup).not.toHaveBeenCalled();
+    expect(fs.readFileSync(path.join(f.source, f.name), "utf8")).toBe(event);
+    for (const operation of m.destructive) expect(operation).not.toHaveBeenCalled();
+  });
+
+  // __CUT1241__: compressed finalizer/custody dispatch is off on native Windows.
+  it.skipIf(process.platform === "win32")("still joins a compressed-only source before recorded mandatory copies and cleanup", async () => {
+    const f = fixture(true), m = await recordedCompatibilityFixture();
+    const trace: string[] = [];
+    m.finalize.mockImplementation(async () => { trace.push("finalize"); });
+    const write = m.write.getMockImplementation()!;
+    m.write.mockImplementation((...args) => { trace.push(`copy:${args[1]}:${args[3]}`); return write(...args); });
+    m.commit.mockImplementation(async () => { trace.push("commit"); });
+    m.cleanup.mockImplementation(async () => { trace.push("cleanup"); return { cleaned: true }; });
+    vi.spyOn(m.agents, "runDirectory").mockReturnValue(f.source);
+    vi.spyOn(m.agents, "run").mockResolvedValue({ id, status: "completed", text: "fixture", toolCalls: 0, usage: {} } as never);
+    await m.actors.ask(m.actor.id, "fixture");
+    await m.actors.close();
+    expect(trace).toEqual(["finalize", "copy:events.jsonl.zst:true", "copy:status.json:true", "commit", "cleanup"]);
+    expect(fs.readFileSync(path.join(m.actor.logDir!, id, f.name), "utf8")).toBe(event);
+    expect(fs.readFileSync(path.join(f.source, f.name), "utf8")).toBe(event);
+    for (const operation of m.destructive) expect(operation).not.toHaveBeenCalled();
+  });
+
+  it("win32 retained-reader dispatch only (NOT native proof) preserves main plain/status behavior without compressed checks", async () => {
+    const m = await recordedCompatibilityFixture();
+    const run = path.join(m.actor.logDir!, id); fs.mkdirSync(run, { recursive: true });
+    const status = path.join(root, "main-status");
+    fs.writeFileSync(status, JSON.stringify({ id, status: "completed" }), { flag: "wx" });
+    fs.linkSync(status, path.join(run, "status.json")); // main did not require the new descriptor/nlink proof.
+    fs.writeFileSync(path.join(run, "events.jsonl"), event, { flag: "wx" });
+    const outside = path.join(root, "ignored-zst"); fs.writeFileSync(outside, "opaque ignored bytes", { flag: "wx" });
+    fs.symlinkSync(outside, path.join(run, "events.jsonl.zst"));
+    const otherId = "b".repeat(32), other = path.join(m.actor.logDir!, otherId); fs.mkdirSync(other);
+    fs.writeFileSync(path.join(other, "status.json"), JSON.stringify({ id: otherId, status: "completed" }), { flag: "wx" });
+    fs.symlinkSync(outside, path.join(other, "events.jsonl.zst"));
+    const typed = vi.spyOn(logTail, "readRunLogPage").mockImplementation(() => { throw new Error("new compressed reader must not run"); });
+    const lstat = fs.lstatSync;
+    vi.spyOn(fs, "lstatSync").mockImplementation(((file: fs.PathLike, options?: unknown) => {
+      if (String(file).endsWith("events.jsonl.zst")) throw new Error("new compressed check must not run");
+      return lstat(file, options as never);
+    }) as typeof fs.lstatSync);
+    const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+    try {
+      Object.defineProperty(process, "platform", { ...platform, value: "win32" });
+      expect(m.actors.readLog(m.actor.id, { type: "run", runId: id }).run?.events).toEqual([{ offset: 0, raw: event.trim(), parsed: JSON.parse(event) }]);
+      expect(m.actors.readLog(m.actor.id, { type: "run", runId: otherId }).run?.events).toEqual([]);
+    } finally { Object.defineProperty(process, "platform", platform); }
+    expect(typed).not.toHaveBeenCalled();
+    expect(fs.readFileSync(outside, "utf8")).toBe("opaque ignored bytes");
+    await m.actors.close();
+    for (const operation of m.destructive) expect(operation).not.toHaveBeenCalled();
+  });
+
+  it("win32 dispatch only (NOT native proof) keeps main plain/task/status copies and skips compressed custody/finalization", async () => {
+    const f = fixture(), m = await recordedCompatibilityFixture();
+    fs.writeFileSync(path.join(f.source, "events.jsonl.zst"), "opaque ignored compressed artifact", { flag: "wx" });
+    fs.writeFileSync(path.join(f.source, "task.txt"), "main task\n", { flag: "wx" });
+    vi.spyOn(m.agents, "runDirectory").mockReturnValue(f.source);
+    vi.spyOn(m.agents, "run").mockResolvedValue({ id, status: "completed", text: "fixture", toolCalls: 0, usage: {} } as never);
+    const read = vi.spyOn(logTail, "readRunLogPage");
+    const lstat = fs.lstatSync;
+    vi.spyOn(fs, "lstatSync").mockImplementation(((file: fs.PathLike, options?: unknown) => {
+      if (String(file).endsWith("events.jsonl.zst")) throw new Error("new compressed source check must not run");
+      return lstat(file, options as never);
+    }) as typeof fs.lstatSync);
+    const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+    try {
+      Object.defineProperty(process, "platform", { ...platform, value: "win32" });
+      await m.actors.ask(m.actor.id, "fixture");
+      await m.actors.close();
+    } finally { Object.defineProperty(process, "platform", platform); }
+    expect(m.finalize).not.toHaveBeenCalled();
+    expect(read).not.toHaveBeenCalled();
+    expect(m.write.mock.calls.map(([, name, , durable]) => [name, durable]))
+      .toEqual([["events.jsonl", undefined], ["status.json", undefined], ["task.txt", undefined]]);
+    expect(fs.readdirSync(path.join(m.actor.logDir!, id)).sort()).toEqual(["events.jsonl", "status.json", "task.txt"]);
+    expect(fs.readFileSync(path.join(m.actor.logDir!, id, "events.jsonl"), "utf8")).toBe(event);
+    expect(fs.readFileSync(path.join(m.actor.logDir!, id, "task.txt"), "utf8")).toBe("main task\n");
+    expect(fs.readFileSync(path.join(f.source, "events.jsonl.zst"), "utf8")).toBe("opaque ignored compressed artifact");
+    expect(m.commit).toHaveBeenCalledExactlyOnceWith(id, m.actor.id, m.actor.sessionFile);
+    expect(m.cleanup).toHaveBeenCalledExactlyOnceWith(id);
+    for (const operation of m.destructive) expect(operation).not.toHaveBeenCalled();
+  });
+});
+
+// __CUT1241__: native Windows uses main's retained-reader and archive path, not these new finalizer/descriptor cases.
+describe.skipIf(process.platform === "win32")("actor owner finalizer and reader boundary", () => {
   it("awaits finalization after locating the source but before archive writes, commit and recorded cleanup", async () => {
     const f = fixture(true), m = await managerFixture();
     let finalized = false;

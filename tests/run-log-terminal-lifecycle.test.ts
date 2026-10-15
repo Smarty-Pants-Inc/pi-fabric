@@ -118,7 +118,8 @@ const hosted = (options: { startJoin?: Promise<void>; delivery?: Promise<void> }
 };
 
 // Decision C rows and hosted E2E plans: .local/task-tmp/run-log-lifecycle-decision-c.md.
-describe("owner terminal run-log finalization (#3252)", () => {
+// __CUT1241__: this new codec/finalizer suite targets the POSIX rollout; main Windows suites remain unskipped.
+describe.skipIf(process.platform === "win32")("owner terminal run-log finalization (#3252)", () => {
   it("compresses only a settled exact execution and memoizes concurrent archive joins", async () => {
     const { manager, handle, logFile, fake } = await spawnWorker();
     expect(codec.compress).not.toHaveBeenCalled();
@@ -236,6 +237,118 @@ describe("owner terminal run-log finalization (#3252)", () => {
     }
   });
 
+  // #1241 Option B: the original forced-Windows codec assertion above is
+  // owner-escalated and deliberately unchanged. This records the separate bypass.
+  it("bypasses Windows codec joins without discharging captured native stop custody", async () => {
+    const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+    const stopJoin = deferred();
+    releases.push(() => stopJoin.resolve());
+    const { manager, handle, fake, logFile, directory } = await spawnWorker(worker({ windows: true, stopJoin: stopJoin.promise }));
+    Object.defineProperty(process, "platform", { ...platform, value: "win32" });
+    try {
+      fake.publish({ status: "completed", text: "plain Windows result" });
+      await expect(manager.wait(handle.id)).resolves.toMatchObject({ text: "plain Windows result" });
+      const stopping = manager.stop(handle.id);
+      await vi.waitFor(() => expect(fake.transport.stop).toHaveBeenCalledOnce());
+      await manager.finalizeRunLog(handle.id);
+      expect(codec.compress).not.toHaveBeenCalled();
+      expect(manager.retentionReferences().has(handle.id)).toBe(true);
+      expect(manager.retentionCustodyVeto(handle.id)).toBe(true);
+      await expect(manager.cleanup(handle.id)).rejects.toThrow(/teardown.*pending/);
+      expect(deletions).not.toContain(directory);
+      fake.exit(); stopJoin.resolve();
+      await stopping;
+      await expect(manager.cleanup(handle.id)).resolves.toEqual({ cleaned: false });
+      expect(manager.hasRunCustody(handle.id)).toBe(false);
+      expect(codec.compress).not.toHaveBeenCalled();
+      expect(fs.readFileSync(logFile, "utf8")).toContain("exact bytes π");
+    } finally {
+      stopJoin.resolve(); fake.exit();
+      await manager.close();
+      Object.defineProperty(process, "platform", platform);
+    }
+  });
+
+  it("keeps a source-missing terminal run on main retention and cleanup without a codec join", async () => {
+    const { manager, handle, fake, logFile, directory } = await spawnWorker();
+    // Fixture namespace transition, not a product unlink or fabricated empty stream.
+    fs.renameSync(logFile, `${logFile}.fixture-plain`);
+    fake.publish({ status: "completed", text: "no event stream", value: { answer: "preserved" } }); fake.exit();
+    await expect(manager.wait(handle.id)).resolves.toMatchObject({ text: "no event stream" });
+    await manager.finalizeRunLog(handle.id);
+    expect(codec.compress).not.toHaveBeenCalled();
+    expect(fs.existsSync(logFile)).toBe(false);
+    expect(fs.existsSync(`${logFile}.zst`)).toBe(false);
+    expect(manager.retentionReferences({ refresh: true, budgetMs: 100, maxEntries: 100 }).has(handle.id)).toBe(false);
+    expect(manager.retentionCustodyVeto(handle.id)).toBe(false);
+    await expect(manager.cleanup(handle.id)).resolves.toEqual({ cleaned: false });
+    expect(manager.hasRunCustody(handle.id)).toBe(false);
+    expect(codec.compress).not.toHaveBeenCalled();
+    expect(JSON.parse(fs.readFileSync(path.join(directory, "manager-result.json"), "utf8"))).toMatchObject({
+      text: "no event stream", value: { answer: "preserved" },
+    });
+    expect(fs.readFileSync(`${logFile}.fixture-plain`, "utf8")).toContain("exact bytes π");
+  });
+
+  it.each(["denied", "unsafe", "replaced"] as const)("does not mistake a %s source directory for source-missing", async reason => {
+    const { manager, handle, fake, logFile, directory } = await spawnWorker();
+    fs.renameSync(logFile, `${logFile}.fixture-plain`);
+    fake.publish({ status: "completed", text: "custody retained" }); fake.exit();
+    await manager.wait(handle.id);
+    const lstat = fs.lstatSync;
+    let seen = 0;
+    const stat = vi.spyOn(fs, "lstatSync").mockImplementation((file, options) => {
+      const value = lstat(file, options as { bigint: true });
+      if (String(file) !== directory || !(options as { bigint?: boolean } | undefined)?.bigint) return value;
+      if (reason === "denied") throw Object.assign(new Error("directory denied"), { code: "EACCES" });
+      if (reason === "unsafe") return Object.assign(Object.create(Object.getPrototypeOf(value)), value, { isSymbolicLink: () => true });
+      return ++seen < 2 ? value : Object.assign(Object.create(Object.getPrototypeOf(value)), value, { ino: value.ino + 1n });
+    });
+    try {
+      await expect(manager.finalizeRunLog(handle.id)).rejects.toMatchObject({ code: "run-log-codec", reason: "custody" });
+      expect(codec.compress).not.toHaveBeenCalled();
+      expect(manager.retentionCustodyVeto(handle.id)).toBe(true);
+      await expect(manager.cleanup(handle.id)).rejects.toMatchObject({ code: "run-log-codec", reason: "custody" });
+      expect(manager.hasRunCustody(handle.id)).toBe(true);
+      expect(deletions).not.toContain(directory);
+      expect(fs.readFileSync(`${logFile}.fixture-plain`, "utf8")).toContain("exact bytes π");
+    } finally { stat.mockRestore(); }
+  });
+
+  it.each(["linux", "win32"] as const)("prunes source-missing handles without absent-finalizer gates on %s", async platform => {
+    const original = Object.getOwnPropertyDescriptor(process, "platform")!;
+    const manager = managerFor();
+    Object.defineProperty(process, "platform", { ...original, value: platform });
+    vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async request => {
+      const now = Date.now();
+      const statusFile = request.workerArguments[request.workerArguments.indexOf("--status-file") + 1]!;
+      fs.writeFileSync(statusFile, JSON.stringify({
+        id: request.id, name: request.name, task: "source-missing pressure", runner: "pi", transport: "process",
+        sessionId: "2147483647", cwd: request.cwd, status: "completed", text: "saved answer",
+        startedAt: now, updatedAt: now, finishedAt: now, turns: 1, toolCalls: 0,
+        usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
+      }));
+      return { kind: "process", sessionId: "2147483647", isAlive: async () => false, stop: async () => {} };
+    });
+    try {
+      let first: string | undefined, directory: string | undefined;
+      for (let index = 0; index < 1_001; index++) {
+        const result = await manager.run({ task: `source-missing pressure ${index}`, transport: "process", extensions: false });
+        if (!first) { first = result.id; directory = manager.runDirectory(first); }
+        expect(result.status).toBe("completed");
+      }
+      expect(manager.runDirectory(first!)).toBeUndefined();
+      expect(manager.hasRunCustody(first!)).toBe(false);
+      expect(codec.compress).not.toHaveBeenCalled();
+      expect(deletions).not.toContain(directory);
+      expect(fs.existsSync(path.join(directory!, "events.jsonl"))).toBe(false);
+      expect(JSON.parse(fs.readFileSync(path.join(directory!, "manager-result.json"), "utf8")).text).toBe("saved answer");
+    } finally {
+      await manager.close();
+      Object.defineProperty(process, "platform", original);
+    }
+  }, 20_000);
+
   it.each(["lost contact", "native stop debt"] as const)("does not compress an unknown process exit with %s", async reason => {
     // Independent counterexamples: native debt must veto even without lostContact.
     const fake = worker(reason === "native stop debt" ? { debt: reason } : { lost: reason });
@@ -311,6 +424,112 @@ describe("owner terminal run-log finalization (#3252)", () => {
     expect(codec.compress).toHaveBeenCalledExactlyOnceWith(logFile);
     expect(fs.readFileSync(logFile, "utf8")).toContain("reattached");
     expect(fs.readFileSync(logFile, "utf8")).not.toContain("detached late");
+  });
+
+  // #1241: data-safety regression from completion-successor F5. The result's
+  // failed durability barrier must not start a second durable representation commit.
+  it.skipIf(process.platform === "win32")("defers terminal log compression until a failed settlement-save barrier recovers", async () => {
+    const { manager, handle, fake, directory, logFile } = await spawnWorker();
+    const resultFile = path.join(directory, "manager-result.json");
+    const rename = fs.renameSync, sync = fs.fsyncSync;
+    let published = false, failing = true;
+    const failure = Object.assign(new Error("post-rename barrier failed"), {
+      code: "run-log-codec", reason: "custody", path: logFile,
+    });
+    codec.compress.mockImplementation(async () => {
+      if (failing) throw failure;
+      return { kind: "compressed" };
+    });
+    const renamed = vi.spyOn(fs, "renameSync").mockImplementation((source, destination) => {
+      rename(source, destination);
+      if (String(destination) === resultFile) published = true;
+    });
+    const synced = vi.spyOn(fs, "fsyncSync").mockImplementation(fd => {
+      if (published && failing) throw new Error("post-rename barrier failed");
+      sync(fd);
+    });
+    try {
+      fake.publish({ status: "completed", text: "exact saved answer", value: { answer: "full result" } }); fake.exit();
+      await expect(manager.wait(handle.id)).resolves.toMatchObject({ status: "completed", text: "exact saved answer" });
+      await new Promise<void>(resolve => setImmediate(resolve));
+      expect(published).toBe(true);
+      expect(codec.compress).not.toHaveBeenCalled();
+      await expect(manager.cleanup(handle.id)).rejects.toThrow(/Terminal result save failed.*post-rename/);
+      expect(manager.hasRunCustody(handle.id)).toBe(true);
+      expect(deletions).not.toContain(directory);
+      expect(fs.readFileSync(logFile, "utf8")).toContain("exact bytes π");
+      failing = false;
+      await expect(manager.cleanup(handle.id)).resolves.toEqual({ cleaned: false });
+      expect(codec.compress).toHaveBeenCalledExactlyOnceWith(logFile);
+      expect(JSON.parse(fs.readFileSync(resultFile, "utf8"))).toMatchObject({
+        id: handle.id, text: "exact saved answer", value: { answer: "full result" },
+      });
+      expect(manager.hasRunCustody(handle.id)).toBe(false);
+    } finally {
+      failing = false;
+      synced.mockRestore(); renamed.mockRestore();
+    }
+  });
+
+  // #1241: recorded real release-observation failure. A pending codec must not
+  // hide an unconfirmed worker, nor may its own promise authorize release.
+  it("observes worker exit within the release deadline while terminal compression is pending", async () => {
+    const compressed = deferred<{ kind: "compressed" }>(), query = deferred<boolean>();
+    releases.push(() => { query.resolve(false); compressed.resolve({ kind: "compressed" }); });
+    codec.compress.mockReturnValue(compressed.promise);
+    const { manager, handle, fake, directory, logFile } = await spawnWorker();
+    fake.publish({ status: "completed", text: "confirmed before re-observation" }); fake.exit();
+    await manager.wait(handle.id);
+    await vi.waitFor(() => expect(codec.compress).toHaveBeenCalledExactlyOnceWith(logFile));
+    const observed = vi.spyOn(fake.transport, "isAlive").mockReturnValue(query.promise);
+    manager.pauseForRelease(true);
+    await expect(manager.checkpointForRelease(Date.now() + 80)).rejects.toThrow(/unconfirmed/);
+    expect(observed).toHaveBeenCalledOnce();
+    expect(fs.existsSync(path.join(directory, "unresolved-worker.json"))).toBe(true);
+    expect(manager.hasRunCustody(handle.id)).toBe(true);
+    expect(() => manager.releaseCheckpointReceipt()).toThrow(/unavailable/);
+    expect(deletions).not.toContain(directory);
+  });
+
+  it("keeps a pending codec fenced after checked release observations and progresses when it completes", async () => {
+    const compressed = deferred<{ kind: "compressed" }>();
+    releases.push(() => compressed.resolve({ kind: "compressed" }));
+    codec.compress.mockReturnValue(compressed.promise);
+    const { manager, handle, fake, directory, logFile } = await spawnWorker();
+    fake.publish({ status: "completed", text: "checked execution" }); fake.exit();
+    await manager.wait(handle.id);
+    await vi.waitFor(() => expect(codec.compress).toHaveBeenCalledExactlyOnceWith(logFile));
+    const observed = vi.spyOn(fake.transport, "isAlive");
+    manager.pauseForRelease(true);
+    await expect(manager.checkpointForRelease()).rejects.toThrow(/pending|changed/);
+    expect(observed).toHaveBeenCalled();
+    expect(() => manager.releaseCheckpointReceipt()).toThrow(/unavailable/);
+    compressed.resolve({ kind: "compressed" });
+    await manager.finalizeRunLog(handle.id);
+    await manager.checkpointForRelease();
+    expect(manager.releaseCheckpointReceipt()).toMatchObject({ admissionHeld: true });
+    expect(fs.readFileSync(logFile, "utf8")).toContain("exact bytes π");
+    expect(deletions).not.toContain(directory);
+  });
+
+  it("does not mark a resumed owner lost when a pending-codec release observation becomes stale", async () => {
+    const compressed = deferred<{ kind: "compressed" }>();
+    releases.push(() => compressed.resolve({ kind: "compressed" }));
+    codec.compress.mockReturnValue(compressed.promise);
+    const { manager, handle, fake, directory, logFile } = await spawnWorker();
+    fake.publish({ status: "completed", text: "resumable owner" }); fake.exit();
+    await manager.wait(handle.id);
+    await vi.waitFor(() => expect(codec.compress).toHaveBeenCalledExactlyOnceWith(logFile));
+    manager.pauseForRelease(true);
+    const observed = vi.spyOn(fake.transport, "isAlive").mockImplementationOnce(async () => {
+      manager.resumeAfterRelease();
+      return false;
+    });
+    await expect(manager.checkpointForRelease()).rejects.toThrow(/stale/);
+    expect(observed).toHaveBeenCalledOnce();
+    expect(fs.existsSync(path.join(directory, "unresolved-worker.json"))).toBe(false);
+    expect(() => manager.releaseCheckpointReceipt()).toThrow(/unavailable/);
+    expect(deletions).not.toContain(directory);
   });
 
   it("joins the finalizer before recorded cleanup without delaying canonical completion", async () => {

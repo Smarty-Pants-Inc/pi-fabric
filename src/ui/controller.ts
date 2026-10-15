@@ -796,7 +796,7 @@ export class FabricUiController {
       const directory = path.dirname(file);
       const names = directories.get(directory) ?? new Set<string>();
       names.add(path.basename(file));
-      if (path.basename(file) === "events.jsonl") names.add("events.jsonl.zst");
+      if (process.platform !== "win32" && path.basename(file) === "events.jsonl") names.add("events.jsonl.zst");
       directories.set(directory, names);
     }
     const epoch = this.#epoch;

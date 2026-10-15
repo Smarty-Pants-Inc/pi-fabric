@@ -143,16 +143,39 @@ export class ActorLogStore {
     const sessionDirectory = path.dirname(path.resolve(actor.sessionFile));
     const actorsAt = sessionDirectory.lastIndexOf(`${path.sep}actors${path.sep}`);
     const anchor = actorsAt > 0 ? sessionDirectory.slice(0, actorsAt) : sessionDirectory;
-    // Previously cleaned runs still appear as the actor's previousRunId. Absence alone is never
-    // success: securely verify the complete existing archive, or leave the owner's join pending.
-    if (!runDirectory) return this.#verifyArchivedRun(actor, runId, dest, anchor);
+    // Windows keeps main's uncompressed best-effort archive path, including absent sources.
+    // The compressed/custody protocol needs a native private-directory primitive first.
+    if (!runDirectory) {
+      if (process.platform === "win32") return;
+      return this.#verifyArchivedRun(actor, runId, dest, anchor);
+    }
     let sourceStat: fs.Stats;
     try { sourceStat = fs.lstatSync(runDirectory); }
     catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      if (process.platform === "win32") return;
       return this.#verifyArchivedRun(actor, runId, dest, anchor);
     }
-    if (!sourceStat.isDirectory()) throw new Error(`Unsafe actor run archive source ${runDirectory}`);
+    if (!sourceStat.isDirectory() || (process.platform !== "win32" && process.getuid && sourceStat.uid !== process.getuid())) {
+      throw new Error(`Unsafe actor run archive source ${runDirectory}`);
+    }
+    const verifySource = (): void => {
+      const named = fs.lstatSync(runDirectory);
+      if (!named.isDirectory() || named.dev !== sourceStat.dev || named.ino !== sourceStat.ino || named.uid !== sourceStat.uid) {
+        throw new Error(`Actor run ${runId} archive source directory changed`);
+      }
+    };
+    // Only ENOENT for BOTH representations selects main's event-less path. A denied,
+    // aliased or otherwise unsafe source must never acquire this compatibility branch.
+    const missingEvents = (): boolean => !fs.lstatSync(path.join(runDirectory, "events.jsonl"), { throwIfNoEntry: false }) &&
+      !fs.lstatSync(path.join(runDirectory, "events.jsonl.zst"), { throwIfNoEntry: false });
+    if (process.platform === "win32" || missingEvents()) {
+      const verifyLegacySource = (): void => {
+        verifySource();
+        if (process.platform !== "win32" && !missingEvents()) throw new Error(`Actor run ${runId} event source changed`);
+      };
+      return this.#retainLegacyRun(actor, runId, runDirectory, dest, anchor, verifyLegacySource);
+    }
     try { held = openPrivateDir(dest, anchor); }
     catch (error) {
       console.warn(`[pi-fabric] actor run ${runId} not archived: ${(error as Error).message}`);
@@ -186,46 +209,7 @@ export class ActorLogStore {
         file.verify();
         copied.verify();
       }
-      const receipt = path.join(runDirectory, "route-dispatch-receipt.json");
-      if (fs.existsSync(receipt)) {
-        const { readRouteDispatchReceipt } = await import("../agents/model-route.js");
-        const source = readRouteDispatchReceipt(receipt);
-        if (!source || source.runId !== runId) throw new Error("Mismatched route dispatch receipt");
-        // Durable archive confirmation precedes source cleanup (F2 custody): the file and the held directory are
-        // fsynced through their fds, then the chain above by path, which must still name the held directory.
-        if (!writeArchiveFile(held, "route-dispatch-receipt.json", { bytes: Buffer.from(JSON.stringify(source)) }, true)) {
-          throw new Error(`Archive entry ${path.join(dest, "route-dispatch-receipt.json")} exists and is not our regular file`);
-        }
-        const named = fs.statSync(dest), opened = fs.statSync(held.path);
-        if (named.dev !== opened.dev || named.ino !== opened.ino) throw new Error(`Archive directory ${dest} changed while it was held`);
-        syncDirectoryChain(dest);
-      }
-      // pi-fabric#875 round 4 SEC P1: no path write into the archive. Each entry is created O_EXCL|O_NOFOLLOW through
-      // the held fd, or replaced by rename only when it is our own regular file; anything else (a symlink planted while
-      // a healed directory was writable) refuses that entry, with one line, and the source is untouched.
-      for (const file of ["reply.json", "task.txt", "relaunches.jsonl"]) {
-        const src = path.join(runDirectory, file);
-        if (!fs.existsSync(src)) continue;
-        try {
-          if (!writeArchiveFile(held, file, { source: src })) console.warn(`[pi-fabric] actor run ${runId}: archive entry ${file} exists and is not our regular file; not written`);
-        } catch (error) { console.warn(`[pi-fabric] actor run ${runId}: archive entry ${file} not written: ${(error as Error).message}`); }
-      }
-      const nested = path.join(runDirectory, "nested");
-      if (fs.existsSync(nested)) {
-        try {
-          // Copied only into a nested/ directory this archive creates now (fresh, 0700): never into existing entries.
-          fs.mkdirSync(path.join(held.path, "nested"), { mode: 0o700 });
-          fs.chmodSync(path.join(held.path, "nested"), 0o700); // our fresh directory; a umask 0400 left 0300 (unopenable)
-          if (!closeDirectory(path.join(held.path, "nested"))) throw new Error("the new nested directory is not ours");
-          fs.cpSync(nested, path.join(held.path, "nested"), { recursive: true });
-          // cpSync keeps the source's modes; a run made under umask 002 is 0775. Archived directories are 0700, like
-          // the archive itself (smarty-dev#9016), each through its own O_NOFOLLOW fd. Files keep their modes.
-          if (process.platform !== "win32") closeDirectories(path.join(held.path, "nested"));
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code === "EEXIST") console.warn(`[pi-fabric] actor run ${runId}: archive nested/ exists; not copied again`);
-          /* otherwise best-effort recursive run retention */
-        }
-      }
+      await this.#copyRunArtifacts(held, runId, runDirectory, dest, ["reply.json", "task.txt", "relaunches.jsonl"]);
       for (const file of files) file.verify();
       const verifyDirectories = (): void => {
         const namedSource = fs.lstatSync(runDirectory), namedDest = fs.lstatSync(dest), openedDest = fs.statSync(held.path);
@@ -246,6 +230,70 @@ export class ActorLogStore {
       held.close();
     }
     this.pruneRuns(actor, Date.now(), runId);
+  }
+
+  /** Owner-authorized main path: optional plain events/status, best-effort copies and pruning.
+   * No compressed copy, finalizer receipt, or invented empty-history custody proof. */
+  async #retainLegacyRun(actor: ActorLogTarget, runId: string, runDirectory: string, dest: string, anchor: string,
+    verifySource: () => void): Promise<void> {
+    let held: PrivateDirectory;
+    verifySource();
+    try { held = openPrivateDir(dest, anchor); }
+    catch (error) {
+      console.warn(`[pi-fabric] actor run ${runId} not archived: ${(error as Error).message}`);
+      return;
+    }
+    try {
+      verifySource();
+      await this.#copyRunArtifacts(held, runId, runDirectory, dest,
+        ["events.jsonl", "status.json", "reply.json", "task.txt", "relaunches.jsonl"]);
+      verifySource();
+    } finally { held.close(); }
+    this.pruneRuns(actor);
+  }
+
+  async #copyRunArtifacts(held: PrivateDirectory, runId: string, runDirectory: string, dest: string,
+    entries: readonly string[]): Promise<void> {
+    const receipt = path.join(runDirectory, "route-dispatch-receipt.json");
+    if (fs.existsSync(receipt)) {
+      const { readRouteDispatchReceipt } = await import("../agents/model-route.js");
+      const source = readRouteDispatchReceipt(receipt);
+      if (!source || source.runId !== runId) throw new Error("Mismatched route dispatch receipt");
+      // Durable archive confirmation precedes source cleanup (F2 custody): the file and the held directory are
+      // fsynced through their fds, then the chain above by path, which must still name the held directory.
+      if (!writeArchiveFile(held, "route-dispatch-receipt.json", { bytes: Buffer.from(JSON.stringify(source)) }, true)) {
+        throw new Error(`Archive entry ${path.join(dest, "route-dispatch-receipt.json")} exists and is not our regular file`);
+      }
+      const named = fs.statSync(dest), opened = fs.statSync(held.path);
+      if (named.dev !== opened.dev || named.ino !== opened.ino) throw new Error(`Archive directory ${dest} changed while it was held`);
+      syncDirectoryChain(dest);
+    }
+    // pi-fabric#875 round 4 SEC P1: no path write into the archive. Each entry is created O_EXCL|O_NOFOLLOW through
+    // the held fd, or replaced by rename only when it is our own regular file; anything else (a symlink planted while
+    // a healed directory was writable) refuses that entry, with one line, and the source is untouched.
+    for (const file of entries) {
+      const src = path.join(runDirectory, file);
+      if (!fs.existsSync(src)) continue;
+      try {
+        if (!writeArchiveFile(held, file, { source: src })) console.warn(`[pi-fabric] actor run ${runId}: archive entry ${file} exists and is not our regular file; not written`);
+      } catch (error) { console.warn(`[pi-fabric] actor run ${runId}: archive entry ${file} not written: ${(error as Error).message}`); }
+    }
+    const nested = path.join(runDirectory, "nested");
+    if (fs.existsSync(nested)) {
+      try {
+        // Copied only into a nested/ directory this archive creates now (fresh, 0700): never into existing entries.
+        fs.mkdirSync(path.join(held.path, "nested"), { mode: 0o700 });
+        fs.chmodSync(path.join(held.path, "nested"), 0o700); // our fresh directory; a umask 0400 left 0300 (unopenable)
+        if (!closeDirectory(path.join(held.path, "nested"))) throw new Error("the new nested directory is not ours");
+        fs.cpSync(nested, path.join(held.path, "nested"), { recursive: true });
+        // cpSync keeps the source's modes; a run made under umask 002 is 0775. Archived directories are 0700, like
+        // the archive itself (smarty-dev#9016), each through its own O_NOFOLLOW fd. Files keep their modes.
+        if (process.platform !== "win32") closeDirectories(path.join(held.path, "nested"));
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "EEXIST") console.warn(`[pi-fabric] actor run ${runId}: archive nested/ exists; not copied again`);
+        /* otherwise best-effort recursive run retention */
+      }
+    }
   }
 
   /** A source-less prior join needs complete, secure reader proof, not mere artifact existence.

@@ -14,7 +14,7 @@ export interface LegacyRunArchivePolicy {
 const DEFAULT_AGE_MS = 48 * 60 * 60 * 1000;
 const terminal = new Set(["completed", "failed", "stopped"]);
 const files = new Set([
-  "task.txt", "task.txt.provenance.json", "status.json", "events.jsonl", "events.jsonl.zst", "lifecycle.jsonl", "reply.json",
+  "task.txt", "task.txt.provenance.json", "status.json", "events.jsonl", "lifecycle.jsonl", "reply.json",
   "schema.json", "images.json", "steer.jsonl", "relaunches.jsonl", "session.jsonl", "route-session.jsonl",
 ]);
 const gone = (error: unknown): boolean => ["ENOENT", "ESRCH"].includes((error as NodeJS.ErrnoException).code ?? "");
@@ -96,8 +96,10 @@ const inspectLegacyRunTree = async (directory: string, now: number, ageMs: numbe
       await yieldTurn();
       const file = path.join(dir, entry.name), stat = await owned(file);
       identities.push([path.relative(directory, file), stat.dev, stat.ino, stat.mode, stat.size, stat.mtimeMs, stat.ctimeMs]);
+      // Windows preserves main's legacy allowlist; V2 mutation remains independently gated.
       if (stat.isFile() && (files.has(entry.name) || /^oversized-event-prefix(-\d+)?\.txt$/.test(entry.name) ||
-          /^\.events\.jsonl\.restore-[1-9][0-9]*-[0-9a-f]{32}\.tmp$/.test(entry.name))) continue;
+          (process.platform !== "win32" && (entry.name === "events.jsonl.zst" ||
+            /^\.events\.jsonl\.restore-[1-9][0-9]*-[0-9a-f]{32}\.tmp$/.test(entry.name))))) continue;
       if (stat.isDirectory() && ["deliveries", "follow-ups"].includes(entry.name)) {
         // Even final-looking receipts are custody until the normal replay has
         // discharged them. Empty worker ingress directories are normal.

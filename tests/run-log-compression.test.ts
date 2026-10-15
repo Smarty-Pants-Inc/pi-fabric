@@ -46,7 +46,8 @@ const failure = async (operation: Promise<unknown>, reason?: string) => {
   return error;
 };
 
-describe("terminal run-log compression: recorded retirement only", () => {
+// __CUT1241__: native Windows keeps main's uncompressed rollout; these new writer/custody cases stay Linux-only.
+describe.skipIf(process.platform === "win32")("terminal run-log compression: recorded retirement only", () => {
   it("publishes a checksummed standard frame, verifies exact bytes, and records plain retirement", async () => {
     const result = await compress(events);
     expect(result).toMatchObject({ kind: "compressed", originalBytes: content.length });

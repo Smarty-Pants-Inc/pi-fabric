@@ -30,7 +30,8 @@ const dryRun = (runs: string, extra: Partial<Parameters<typeof pruneActorRunArch
 };
 
 describe("compressed artifacts keep existing whole-run custody", () => {
-  it.each([["events.jsonl.zst"], ["events.jsonl", "events.jsonl.zst"], ["events.jsonl.zst", restore]].map(names => ({ names })))(
+  // __CUT1241__: native compressed retention is disabled on Windows.
+  it.skipIf(process.platform === "win32").each([["events.jsonl.zst"], ["events.jsonl", "events.jsonl.zst"], ["events.jsonl.zst", restore]].map(names => ({ names })))(
     "recognizes $names for dry-run collection without removing any bytes", ({ names }) => {
       const f = fixture(false, names);
       const before = fs.readdirSync(f.run).sort();
@@ -40,7 +41,8 @@ describe("compressed artifacts keep existing whole-run custody", () => {
       for (const name of names) expect(fs.readFileSync(path.join(f.run, name), "utf8")).toBe(`${name}\n`);
     });
 
-  it.each([["events.jsonl.zst"], ["events.jsonl", "events.jsonl.zst", restore]].map(names => ({ names })))(
+  // __CUT1241__: native compressed archive custody is disabled on Windows.
+  it.skipIf(process.platform === "win32").each([["events.jsonl.zst"], ["events.jsonl", "events.jsonl.zst", restore]].map(names => ({ names })))(
     "legacy tree proof recognizes $names with stable ownership fingerprint", async ({ names }) => {
       const f = fixture(true, names);
       const proof = await legacyRunTreeProof(f.run, now, age);
@@ -95,7 +97,8 @@ describe("compressed artifacts keep existing whole-run custody", () => {
     expect(dryRun(f.runs)).toEqual([]);
   });
 
-  it("foreign compressed entry is independently vetoed on an otherwise safe tree", async () => {
+  // __CUT1241__: the positive compressed proof is POSIX-only during rollout.
+  it.skipIf(process.platform === "win32")("foreign compressed entry is independently vetoed on an otherwise safe tree", async () => {
     const f = fixture(true);
     expect(await legacyRunTreeProof(f.run, now, age)).toBeDefined();
     const lstat = fs.lstatSync;
@@ -108,7 +111,8 @@ describe("compressed artifacts keep existing whole-run custody", () => {
     expect(dryRun(f.runs)).toEqual([]);
   });
 
-  it("never tails plain while any zst target exists, including an interrupted writer", () => {
+  // __CUT1241__: Windows retains main's plain compaction path.
+  it.skipIf(process.platform === "win32")("never tails plain while any zst target exists, including an interrupted writer", () => {
     const f = fixture(false, ["events.jsonl", "events.jsonl.zst"]);
     const plain = path.join(f.run, "events.jsonl");
     const contents = '{"text":"' + "x".repeat(100) + '"}\n';

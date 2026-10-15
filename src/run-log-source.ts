@@ -32,12 +32,13 @@ const ioError = (path: string, error: unknown): RunLogReadError => {
 const missing = (error: unknown): boolean => (error as NodeJS.ErrnoException)?.code === "ENOENT";
 
 const openPhysical = (path: string): { descriptor: number; stat: BigIntStats; encoded: boolean } => {
+  // Windows compression/custody is off: retain main's plain open/fstat/read path.
+  const plainOnly = process.platform === "win32";
   const noFollow = fs.constants.O_NOFOLLOW ?? 0;
-  const flags = fs.constants.O_RDONLY | noFollow | (fs.constants.O_NONBLOCK ?? 0);
+  const flags = plainOnly ? "r" : fs.constants.O_RDONLY | noFollow | (fs.constants.O_NONBLOCK ?? 0);
   const candidate = (physicalPath: string, encoded: boolean) => {
-    // Windows has no O_NOFOLLOW: reject reparse/symlink candidates and bind
-    // the pre-open regular file to the held FD. POSIX uses its atomic flag.
-    const expected = noFollow ? undefined : fs.lstatSync(physicalPath, { bigint: true });
+    // POSIX uses its atomic flag, or binds a pre-open regular file to the held FD.
+    const expected = plainOnly || noFollow ? undefined : fs.lstatSync(physicalPath, { bigint: true });
     if (expected && (expected.isSymbolicLink() || !expected.isFile())) {
       throw new RunLogReadError(physicalPath, "not a regular no-follow source");
     }
@@ -56,8 +57,8 @@ const openPhysical = (path: string): { descriptor: number; stat: BigIntStats; en
   };
   try { return candidate(path, false); } catch (error) {
     if (!missing(error)) throw ioError(path, error);
-    // Native session and mesh/session logs retain their existing plain format.
-    if (!/(?:^|[/\\])events\.jsonl$/.test(path)) throw error;
+    // Windows and native session/mesh logs retain their existing plain format.
+    if (plainOnly || !/(?:^|[/\\])events\.jsonl$/.test(path)) throw error;
   }
   try { return candidate(`${path}.zst`, true); } catch (error) {
     if (missing(error)) throw error;
@@ -158,7 +159,7 @@ const decodedFromDescriptor = (descriptor: number, stat: BigIntStats, path: stri
   return decoded;
 };
 
-/** Plain-first, ENOENT-only fallback. The held artifact supplies physical generation. */
+/** Plain-first; POSIX has ENOENT-only zstd fallback. The held artifact supplies physical generation. */
 export const openRunLogSource = (path: string): RunLogSource => {
   const { descriptor, stat, encoded } = openPhysical(path);
   const physicalPath = encoded ? `${path}.zst` : path;

@@ -39,7 +39,8 @@ const nativeShape = (value: ReturnType<NativeConversationReader["read"]>) => ({
 });
 
 describe("compressed run log readers — fixture-only user paths", () => {
-  it("preserves dashboard entry IDs/order/content and older/newer/latest partial-tool pages", () => {
+  // __CUT1241__: Compressed dashboard paging is not a Windows rollout path.
+  it.skipIf(process.platform === "win32")("preserves dashboard entry IDs/order/content and older/newer/latest partial-tool pages", () => {
     const { file, compressed } = fixture();
     const plain = new AgentTranscriptReader();
     const zipped = new AgentTranscriptReader();
@@ -58,7 +59,8 @@ describe("compressed run log readers — fixture-only user paths", () => {
     expect(dashboardShape(zipped.read(b))).toEqual(dashboardShape(plain.read(a)));
   });
 
-  it("preserves native replay, full Unicode records and streamed tool partials across classification and paging", () => {
+  // __CUT1241__: Compressed native replay is not a Windows rollout path.
+  it.skipIf(process.platform === "win32")("preserves native replay, full Unicode records and streamed tool partials across classification and paging", () => {
     const { file, compressed } = fixture();
     const plain = new NativeConversationReader();
     const zipped = new NativeConversationReader();
@@ -75,7 +77,8 @@ describe("compressed run log readers — fixture-only user paths", () => {
     expect(zipped.last?.unavailable).toBeUndefined();
   });
 
-  it("adopts the new physical compressed generation without losing pinned native history or inventing unread arrivals", () => {
+  // __CUT1241__: Windows does not adopt compressed archive generations.
+  it.skipIf(process.platform === "win32")("adopts the new physical compressed generation without losing pinned native history or inventing unread arrivals", () => {
     const { file, bytes } = fixture();
     const reader = new NativeConversationReader();
     const input = source(file);
@@ -89,33 +92,41 @@ describe("compressed run log readers — fixture-only user paths", () => {
     expect(reader.last?.unavailable).toBeUndefined();
   });
 
-  it("distinguishes precision-colliding physical generations in native replacement and compressed caches", () => {
-    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "reader-bigint-"));
-    const file = path.join(directory, "events.jsonl");
-    const bytes = (text: string) => Buffer.from(`${JSON.stringify({ type: "message_end", message: { role: "user", content: text, timestamp: 1 } })}\n`);
-    fs.writeFileSync(`${file}.zst`, frame(bytes("first")));
-    let inode = 9007199254740992n;
-    const original = fs.fstatSync;
-    vi.spyOn(fs, "fstatSync").mockImplementation(((...args: unknown[]) => {
-      const stat = Reflect.apply(original, fs, args);
-      return Object.assign(stat, { dev: 9007199254740994n, ino: inode, birthtimeNs: 1n, mtimeNs: 2n });
-    }) as typeof fs.fstatSync);
-    // The Windows no-follow fallback binds path metadata to the opened FD.
-    const originalPathStat = fs.lstatSync;
-    vi.spyOn(fs, "lstatSync").mockImplementation(((...args: unknown[]) => {
-      const stat = Reflect.apply(originalPathStat, fs, args);
-      return Object.assign(stat, { dev: 9007199254740994n, ino: inode, birthtimeNs: 1n, mtimeNs: 2n });
-    }) as typeof fs.lstatSync);
-    const reader = new NativeConversationReader();
-    expect(reader.read(source(file)).messages[0]).toMatchObject({ content: "first" });
-    fs.writeFileSync(`${file}.zst`, frame(bytes("other")));
-    inode += 1n;
-    expect(Number(inode)).toBe(Number(inode - 1n));
-    expect(reader.read(source(file)).messages[0]).toMatchObject({ content: "other" });
-    expect(reader.last?.unavailable).toBeUndefined();
+  describe.each(["plain", "compressed"] as const)("precision-colliding physical generations: %s", (format) => {
+    // __CUT1241__: Only the compressed cache variant is off on Windows; plain wide IDs remain asserted.
+    it.skipIf(process.platform === "win32" && format === "compressed")("distinguishes precision-colliding physical generations in native replacement and compressed caches", () => {
+      const directory = fs.mkdtempSync(path.join(os.tmpdir(), "reader-bigint-"));
+      const file = path.join(directory, "events.jsonl");
+      const bytes = (text: string) => Buffer.from(`${JSON.stringify({ type: "message_end", message: { role: "user", content: text, timestamp: 1 } })}\n`);
+      const physical = format === "compressed" ? `${file}.zst` : file;
+      const encode = (text: string) => format === "compressed" ? frame(bytes(text)) : bytes(text);
+      fs.writeFileSync(physical, encode("first"));
+      let inode = 9007199254740992n;
+      const original = fs.fstatSync;
+      vi.spyOn(fs, "fstatSync").mockImplementation(((...args: unknown[]) => {
+        const stat = Reflect.apply(original, fs, args);
+        return Object.assign(stat, { dev: 9007199254740994n, ino: inode, birthtimeNs: 1n, mtimeNs: 2n });
+      }) as typeof fs.fstatSync);
+      // Preserve the POSIX no-O_NOFOLLOW fence; plain Windows needs no path-stat protocol.
+      if (process.platform !== "win32") {
+        const originalPathStat = fs.lstatSync;
+        vi.spyOn(fs, "lstatSync").mockImplementation(((...args: unknown[]) => {
+          const stat = Reflect.apply(originalPathStat, fs, args);
+          return Object.assign(stat, { dev: 9007199254740994n, ino: inode, birthtimeNs: 1n, mtimeNs: 2n });
+        }) as typeof fs.lstatSync);
+      }
+      const reader = new NativeConversationReader();
+      expect(reader.read(source(file)).messages[0]).toMatchObject({ content: "first" });
+      fs.writeFileSync(physical, encode("other"));
+      inode += 1n;
+      expect(Number(inode)).toBe(Number(inode - 1n));
+      expect(reader.read(source(file)).messages[0]).toMatchObject({ content: "other" });
+      expect(reader.last?.unavailable).toBeUndefined();
+    });
   });
 
-  it("shows codec failure as an explicit dashboard error card and native unavailable state, including cached history", () => {
+  // __CUT1241__: Windows never decodes compressed run history or reports archive codec failures.
+  it.skipIf(process.platform === "win32")("shows codec failure as an explicit dashboard error card and native unavailable state, including cached history", () => {
     const { file, compressed } = fixture();
     const dashboard = new AgentTranscriptReader();
     const native = new NativeConversationReader();
@@ -180,6 +191,18 @@ describe("compressed run log readers — fixture-only user paths", () => {
     expect(new AgentTranscriptReader().read(source(missing)).entries[0]).toMatchObject({ kind: "error", text: expect.stringContaining("EACCES") });
     expect(new NativeConversationReader().read({ ...source(missing), eventsFile: missing })).toMatchObject({ unavailable: { eventsFile: true }, error: expect.stringContaining("EACCES") });
     vi.restoreAllMocks();
+    const session = path.join(directory, "session.jsonl");
+    fs.writeFileSync(session, '{"type":"session","id":"session-id","version":3}\n');
+    expect(new NativeConversationReader().read(source(session))).toMatchObject({ sessionFile: session, sessionId: "session-id" });
+    fs.renameSync(session, `${session}.fixture-plain`);
+    fs.writeFileSync(`${session}.zst`, frame(Buffer.from('{"type":"session","id":"not-allowed"}\n')));
+    expect(new NativeConversationReader().read(source(session)).sessionId).toBeUndefined();
+  });
+
+  // __CUT1241__: Compressed input caps apply only to the POSIX read-through path.
+  it.skipIf(process.platform === "win32")("reports capped compressed history distinctly from absent history", () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "reader-caps-"));
+    const missing = path.join(directory, "events.jsonl");
     fs.writeFileSync(`${missing}.zst`, frame(Buffer.from("{}\n")));
     const originalStat = fs.fstatSync;
     vi.spyOn(fs, "fstatSync").mockImplementation(((...args: unknown[]) => {
@@ -188,12 +211,5 @@ describe("compressed run log readers — fixture-only user paths", () => {
     }) as typeof fs.fstatSync);
     expect(new AgentTranscriptReader().read(source(missing)).entries[0]).toMatchObject({ kind: "error", text: expect.stringContaining("cap") });
     expect(new NativeConversationReader().read({ ...source(missing), eventsFile: missing })).toMatchObject({ unavailable: { eventsFile: true }, error: expect.stringContaining("cap") });
-    vi.restoreAllMocks();
-    const session = path.join(directory, "session.jsonl");
-    fs.writeFileSync(session, '{"type":"session","id":"session-id","version":3}\n');
-    expect(new NativeConversationReader().read(source(session))).toMatchObject({ sessionFile: session, sessionId: "session-id" });
-    fs.renameSync(session, `${session}.fixture-plain`);
-    fs.writeFileSync(`${session}.zst`, frame(Buffer.from('{"type":"session","id":"not-allowed"}\n')));
-    expect(new NativeConversationReader().read(source(session)).sessionId).toBeUndefined();
   });
 });

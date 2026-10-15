@@ -1,5 +1,5 @@
 import { detachedPreview } from "../core/preview.js";
-import { openRunLogSource, statRunLogSource, type RunLogSource } from "../run-log-source.js";
+import { openRunLogSource, RunLogReadError, statRunLogSource, type RunLogSource } from "../run-log-source.js";
 import { createHash } from "node:crypto";
 import { NativeReaderEventReplay } from "./conversation-native-reader-replay.js";
 import { NativeReaderCheckpoint } from "./conversation-native-reader-checkpoint.js";
@@ -1106,7 +1106,8 @@ export class NativeConversationReader {
       if (savedRanges) this.#loadedRanges.set(kind, savedRanges);
       else this.#loadedRanges.delete(kind);
       this.#windows.set(kind, { ...originalWindow, unavailable: true, replacementPending: true });
-      this.#setError(`Unable to read replacement history: ${clipError(error)}`);
+      // Keep the typed diagnostic, never its potentially private path/reason/cause.
+      this.#setError(`Unable to read replacement history${error instanceof RunLogReadError ? " (run-log-codec)" : ""}`);
       return true;
     }
   }

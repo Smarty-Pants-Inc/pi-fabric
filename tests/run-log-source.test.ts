@@ -23,7 +23,20 @@ console.info("3252-write-root", JSON.stringify({ cwd: process.cwd(), testTmpdir:
   vitest: fs.realpathSync("node_modules/vitest/vitest.mjs") }));
 
 describe("run log source — physical zstd, logical bytes", () => {
-  it("pages exact raw Unicode CRLF bytes and rejects the retired plain generation", () => {
+  it("pages exact raw Unicode CRLF bytes with the plain descriptor generation", () => {
+    const file = logical();
+    const bytes = Buffer.from('{"v":"α😀"}\r\n{"v":2}\r\n{"partial":');
+    fs.writeFileSync(file, bytes);
+    const plain = readJsonlPage(file, 2);
+    expect(plain.lines.map((line) => line.raw)).toEqual(['{"v":2}', '{"partial":']);
+    expect(plain.hasMore).toBe(true);
+    expect(plain.before).toBe(Buffer.byteLength('{"v":"α😀"}\r\n'));
+    const stat = fs.statSync(file, { bigint: true });
+    expect(plain.generation).toBe(`${stat.dev}:${stat.ino}`);
+  });
+
+  // __CUT1241__: Windows run readers use only the main uncompressed path; archive custody is off.
+  it.skipIf(process.platform === "win32")("pages exact raw Unicode CRLF bytes and rejects the retired plain generation", () => {
     const file = logical();
     const bytes = Buffer.from('{"v":"α😀"}\r\n{"v":2}\r\n{"partial":');
     fs.writeFileSync(file, bytes);
@@ -39,7 +52,14 @@ describe("run log source — physical zstd, logical bytes", () => {
     expect(() => readJsonlPage(file, 1, plain.before, undefined, plain.generation)).toThrow(/cursor-stale/);
   });
 
-  it("keeps generic mesh/session pages plain and preserves all run byte offsets across multiple chunks", () => {
+  it("keeps generic mesh/session pages plain beside a compressed run artifact", () => {
+    const file = logical();
+    fs.writeFileSync(`${file}.zst`, frame('{"compressed":true}\n'));
+    expect(readPlainPage(file, 10)).toEqual({ lines: [], hasMore: false });
+  });
+
+  // __CUT1241__: Compressed run paging is not a Windows rollout path.
+  it.skipIf(process.platform === "win32")("keeps generic mesh/session pages plain and preserves all run byte offsets across multiple chunks", () => {
     const file = logical();
     const lines = Array.from({ length: 180 }, (_, index) => JSON.stringify({ index, text: `α😀${"x".repeat(1200)}` }));
     const bytes = Buffer.from(lines.join("\r\n") + "\r\n");
@@ -60,7 +80,8 @@ describe("run log source — physical zstd, logical bytes", () => {
     }
   });
 
-  it("rejects a checksum-truncated frame through raw agents.log paging", () => {
+  // __CUT1241__: Compressed run paging is not a Windows rollout path.
+  it.skipIf(process.platform === "win32")("rejects a checksum-truncated frame through raw agents.log paging", () => {
     const file = logical();
     const encoded = frame('{"type":"agent_end"}\n');
     fs.writeFileSync(`${file}.zst`, encoded.subarray(0, encoded.length - 1));
@@ -75,11 +96,12 @@ describe("run log source — physical zstd, logical bytes", () => {
   });
 
   it("opens plain first, stats without decoding, preserves descriptor identity and closes", async () => {
-    const { openRunLogSource, statRunLogSource, readRunLogBuffer, readRunLogText } = await helper();
+    const { openRunLogSource, statRunLogSource, readRunLogText } = await helper();
     const file = logical();
     fs.writeFileSync(file, "plain😀\r\n");
     fs.writeFileSync(`${file}.zst`, "incomplete");
     expect(readRunLogText(file)).toBe("plain😀\r\n");
+    expect(statRunLogSource(file).size).toBe(BigInt(Buffer.byteLength("plain😀\r\n")));
     const opened = openRunLogSource(file);
     const stat = fs.statSync(file, { bigint: true });
     expect(opened.generation).toBe(`${stat.dev}:${stat.ino}`);
@@ -89,6 +111,13 @@ describe("run log source — physical zstd, logical bytes", () => {
     expect(buffer.toString()).toBe("plain😀\r\n");
     opened.close();
     expect(() => opened.read(buffer, 0, 1, 0)).toThrow();
+  });
+
+  // __CUT1241__: Physical compressed stats/read-through are POSIX-only.
+  it.skipIf(process.platform === "win32")("stats compressed artifacts without decoding and reports invalid compressed reads", async () => {
+    const { statRunLogSource, readRunLogBuffer } = await helper();
+    const file = logical();
+    fs.writeFileSync(`${file}.zst`, "incomplete");
     expect(statRunLogSource(file).size).toBe(10n);
     expect(() => readRunLogBuffer(file)).toThrow(/run-log-codec/);
   });
@@ -110,19 +139,24 @@ describe("run log source — physical zstd, logical bytes", () => {
     expect(() => openRunLogSource(file)).toThrow(RunLogReadError);
   });
 
-  it("preserves generic plain I/O failures while run failures identify the selected physical source", async () => {
-    const { RunLogReadError, statRunLogSource } = await helper();
+  it("preserves generic plain I/O failures while run failures identify the selected physical source", () => {
     const file = logical();
     fs.writeFileSync(file, '{"ok":true}\n');
     fs.writeFileSync(`${file}.zst`, frame('{"compressed":true}\n'));
-    const originalRead = fs.readSync;
     const reads = vi.spyOn(fs, "readSync").mockImplementation((() => {
       throw Object.assign(new Error("fixture read EIO"), { code: "EIO" });
     }) as typeof fs.readSync);
     expect(readPlainPage(file, 10)).toEqual({ lines: [], hasMore: false });
     expect(() => readJsonlPage(file, 10)).toThrow(expect.objectContaining({ code: "run-log-codec", path: file }));
     reads.mockRestore();
-    fs.renameSync(file, `${file}.fixture-plain`);
+  });
+
+  // __CUT1241__: Compressed descriptor failures are outside the Windows rollout.
+  it.skipIf(process.platform === "win32")("identifies compressed stat/read/close failures and closes failed descriptors", async () => {
+    const { RunLogReadError, statRunLogSource } = await helper();
+    const file = logical();
+    fs.writeFileSync(`${file}.zst`, frame('{"compressed":true}\n'));
+    const originalRead = fs.readSync;
     const originalStat = fs.fstatSync;
     const stats = vi.spyOn(fs, "fstatSync").mockImplementation((() => {
       throw Object.assign(new Error("fixture stat EIO"), { code: "EIO" });
@@ -145,11 +179,12 @@ describe("run log source — physical zstd, logical bytes", () => {
     expect(() => statRunLogSource(file)).toThrow(expect.objectContaining({ code: "run-log-codec", path: `${file}.zst` }));
   });
 
-  it("refuses symlink and swapped physical candidates when the platform has no O_NOFOLLOW", async () => {
+  // __CUT1241__: Windows has no compressed custody protocol; retain this POSIX fallback fence.
+  it.skipIf(process.platform === "win32")("refuses symlink and swapped physical candidates when the platform has no O_NOFOLLOW", async () => {
     const file = logical();
     fs.writeFileSync(file, "plain");
     fs.writeFileSync(`${file}.zst`, frame("compressed"));
-    // Recorded Windows boundary: ordinary real fixture I/O, no no-follow flag.
+    // Recorded POSIX fallback boundary: ordinary real fixture I/O, no no-follow flag.
     vi.resetModules();
     vi.doMock("node:fs", () => ({ default: new Proxy({}, { get(_target, key) {
       return key === "constants" ? { ...fs.constants, O_NOFOLLOW: undefined } : Reflect.get(fs, key);
@@ -217,22 +252,31 @@ describe("run log source — physical zstd, logical bytes", () => {
     expect(decodeRunLogFrame(encoded, "events.jsonl.zst")).toEqual(bytes);
   });
 
-  it("keeps codec loading out of plain reads and physical-only compressed stats", async () => {
+  it("keeps codec loading out of plain reads and physical stats", async () => {
     const { readRunLogText, statRunLogSource } = await helper();
     const file = logical();
     fs.writeFileSync(file, "plain");
     const builtin = vi.spyOn(process, "getBuiltinModule");
     expect(readRunLogText(file)).toBe("plain");
-    fs.renameSync(file, `${file}.fixture-plain`);
+    expect(statRunLogSource(file).size).toBe(5n);
+    expect(builtin).not.toHaveBeenCalled();
+  });
+
+  // __CUT1241__: Compressed physical stats and lazy decode are POSIX-only.
+  it.skipIf(process.platform === "win32")("keeps codec loading out of compressed stats and loads it only for decoding", async () => {
+    const { readRunLogText, statRunLogSource } = await helper();
+    const file = logical();
     fs.writeFileSync(`${file}.zst`, frame("compressed"));
+    const builtin = vi.spyOn(process, "getBuiltinModule");
     statRunLogSource(file);
     expect(builtin).not.toHaveBeenCalled();
     expect(readRunLogText(file)).toBe("compressed");
     expect(builtin).toHaveBeenCalledWith("node:zlib");
   });
 
-  it("caps encoded allocation before read, and caps decoded bombs", async () => {
-    const { readRunLogBuffer, decodeRunLogFrame } = await helper();
+  // __CUT1241__: Encoded read-through allocation is not a Windows rollout path.
+  it.skipIf(process.platform === "win32")("caps encoded allocation before read", async () => {
+    const { readRunLogBuffer } = await helper();
     const file = logical();
     fs.writeFileSync(`${file}.zst`, frame("ok"));
     const original = fs.fstatSync;
@@ -243,17 +287,33 @@ describe("run log source — physical zstd, logical bytes", () => {
     const read = vi.spyOn(fs, "readSync");
     expect(() => readRunLogBuffer(file)).toThrow(/encoded.*cap/);
     expect(read).not.toHaveBeenCalled();
+  });
+
+  it("caps plain decoded allocation before read", async () => {
+    const { readRunLogBuffer } = await helper();
+    const file = logical();
     fs.writeFileSync(file, "plain size fixture");
+    const original = fs.fstatSync;
+    vi.spyOn(fs, "fstatSync").mockImplementation(((...args: unknown[]) => {
+      const stat = Reflect.apply(original, fs, args);
+      return Object.assign(stat, { size: 128n * 1024n * 1024n + 1n });
+    }) as typeof fs.fstatSync);
+    const read = vi.spyOn(fs, "readSync");
     expect(() => readRunLogBuffer(file)).toThrow(/decoded.*cap/);
     expect(read).not.toHaveBeenCalled();
-    vi.restoreAllMocks();
+  });
+
+  it("caps decoded bombs in the platform-independent codec", async () => {
+    const { decodeRunLogFrame } = await helper();
+    const file = logical();
     const payload = Buffer.alloc(128 * 1024 * 1024 + 1);
     expect(() => decodeRunLogFrame(frame(payload), file)).toThrow(/decoded.*cap/);
     const unknownSizeBomb = await streamFrame(payload);
     expect(() => decodeRunLogFrame(unknownSizeBomb, file)).toThrow(/run-log-codec/);
   });
 
-  it("bounds the LRU by 32 entries and 16 MiB, invalidating physical metadata changes", async () => {
+  // __CUT1241__: Decoded compressed cache custody is not a Windows rollout path.
+  it.skipIf(process.platform === "win32")("bounds the LRU by 32 entries and 16 MiB, invalidating physical metadata changes", async () => {
     const { readRunLogText, readRunLogBuffer } = await helper();
     const directory = workspace();
     const files = Array.from({ length: 34 }, (_, index) => {
@@ -298,5 +358,65 @@ describe("run log source — physical zstd, logical bytes", () => {
     read.mockClear();
     readRunLogText(files[0]!);
     expect(read).toHaveBeenCalled();
+  });
+
+  it("records the Windows plain-only open/fstat/read path without archive or identity preflight", async () => {
+    const file = logical();
+    const bytes = Buffer.from('{"v":"α😀"}\r\n{"v":2}\r\n');
+    fs.writeFileSync(file, bytes);
+    fs.writeFileSync(`${file}.zst`, frame("not the plain history"));
+    const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+    const originalStat = fs.fstatSync;
+    const inode = 2n ** 54n + 1n;
+    const stats = vi.spyOn(fs, "fstatSync").mockImplementation(((...args: unknown[]) => {
+      const stat = Reflect.apply(originalStat, fs, args);
+      return Object.assign(stat, { ino: inode });
+    }) as typeof fs.fstatSync);
+    const preflight = vi.spyOn(fs, "lstatSync");
+    const opens = vi.spyOn(fs, "openSync");
+    const builtin = vi.spyOn(process, "getBuiltinModule");
+    // Recorded platform routing only; this is not native Windows custody evidence.
+    vi.resetModules();
+    vi.doMock("node:fs", () => ({ default: new Proxy({}, { get(_target, key) {
+      return key === "constants" ? { ...fs.constants, O_NOFOLLOW: undefined } : Reflect.get(fs, key);
+    } }) }));
+    Object.defineProperty(process, "platform", { value: "win32" });
+    try {
+      const { openRunLogSource, statRunLogSource, readRunLogText, RunLogReadError } = await helper();
+      const { readRunLogPage } = await import("../src/log-tail.js");
+      const opened = openRunLogSource(file);
+      try {
+        expect(opened.generation).toBe(`${opened.stat.dev}:${inode}`);
+        const buffer = Buffer.alloc(opened.size);
+        expect(opened.read(buffer, 0, buffer.length, 0)).toBe(bytes.length);
+        expect(buffer).toEqual(bytes);
+      } finally { opened.close(); }
+      expect(stats).toHaveBeenCalledWith(expect.any(Number), { bigint: true });
+      expect(statRunLogSource(file).ino).toBe(inode);
+      const page = readRunLogPage(file, 1);
+      expect(page.lines.map((line) => line.raw)).toEqual(['{"v":2}']);
+      expect(page.generation).toBe(`${opened.stat.dev}:${inode}`);
+      expect(() => readRunLogPage(file, 1, page.before, undefined, `${opened.stat.dev}:${inode - 1n}`)).toThrow(/cursor-stale/);
+      expect(opens.mock.calls.every(([name, flags]) => name === file && flags === "r")).toBe(true);
+      expect(preflight).not.toHaveBeenCalled();
+      expect(builtin).not.toHaveBeenCalled();
+      fs.renameSync(file, `${file}.fixture-plain`);
+      opens.mockClear();
+      expect(() => readRunLogText(file)).toThrow(expect.objectContaining({ code: "ENOENT" }));
+      expect(() => statRunLogSource(file)).toThrow(expect.objectContaining({ code: "ENOENT" }));
+      expect(readRunLogPage(file, 1)).toEqual({ lines: [], hasMore: false });
+      expect(opens.mock.calls.map(([name]) => name)).not.toContain(`${file}.zst`);
+      opens.mockImplementation((() => {
+        throw Object.assign(new Error("recorded Windows denial"), { code: "EACCES" });
+      }) as typeof fs.openSync);
+      expect(() => openRunLogSource(file)).toThrow(RunLogReadError);
+      expect(() => readRunLogPage(file, 1)).toThrow(expect.objectContaining({ path: file, reason: expect.stringContaining("EACCES") }));
+      expect(preflight).not.toHaveBeenCalled();
+      expect(builtin).not.toHaveBeenCalled();
+    } finally {
+      Object.defineProperty(process, "platform", platform);
+      vi.doUnmock("node:fs");
+      vi.resetModules();
+    }
   });
 });

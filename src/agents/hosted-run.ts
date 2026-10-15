@@ -492,7 +492,7 @@ export class HostedRun {
   #appendLog(event: unknown): void {
     // Delivery failures also use this path, after their async adapter call returns. Fence them
     // together with reporter.transcript so a late rejection cannot recreate a retired plain log.
-    if (this.#closed) return;
+    if (process.platform !== "win32" && this.#closed) return; // __CUT1241__: Windows keeps main's append path.
     try {
       const line = JSON.stringify(event);
       if (line === undefined || Buffer.byteLength(line) > MAX_TRANSCRIPT_EVENT_BYTES) return;

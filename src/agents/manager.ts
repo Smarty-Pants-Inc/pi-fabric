@@ -3546,7 +3546,7 @@ export class AgentManager {
     for (const managed of this.#runs.values()) {
       const pid = managed.transport.kind === "process" ? Number(managed.transport.sessionId) : undefined;
       const unconfirmedProcess = pid !== undefined && (!Number.isSafeInteger(pid) || pid <= 0 || processAlive(pid));
-      if (!managed.settled || !managed.runLogFinalization || managed.runLogFinalizationPending || managed.runLogFinalizationFailure || managed.processStopPending || managed.nativeReleasePending || managed.lostContact || managed.settlementSaveFailure || uncheckedExternalExit(managed.transport) ||
+      if (!managed.settled || this.#runLogFinalizationVeto(managed) || managed.processStopPending || managed.nativeReleasePending || managed.lostContact || managed.settlementSaveFailure || uncheckedExternalExit(managed.transport) ||
           // Settlement and primary exit do not prove descendant exit. The
           // persistent tree veto checks every descendant's worker identity too.
           unconfirmedProcess || runTreeExitVeto(managed.runDirectory, 0, undefined, true)) protect(managed.id, managed.actorId);
@@ -3608,7 +3608,7 @@ export class AgentManager {
       const directory = managed?.runDirectory ?? path.join(this.#runRoot, runId);
       if (managed) {
         const pid = managed.transport.kind === "process" ? Number(managed.transport.sessionId) : undefined;
-        if (!managed.settled || !managed.runLogFinalization || managed.runLogFinalizationPending || managed.runLogFinalizationFailure || managed.processStopPending || managed.nativeReleasePending || managed.lostContact || managed.settlementSaveFailure || uncheckedExternalExit(managed.transport) ||
+        if (!managed.settled || this.#runLogFinalizationVeto(managed) || managed.processStopPending || managed.nativeReleasePending || managed.lostContact || managed.settlementSaveFailure || uncheckedExternalExit(managed.transport) ||
             (pid !== undefined && (!Number.isSafeInteger(pid) || pid <= 0 || processAlive(pid)))) return true;
       }
       return !boundedRunTree(directory, expired) || !!runTreeExitVeto(directory, 0, expired, true) || expired();
@@ -3680,7 +3680,7 @@ export class AgentManager {
       index(managed.id, managed.actorId);
       const pid = managed.transport.kind === "process" ? Number(managed.transport.sessionId) : undefined;
       const unconfirmedProcess = pid !== undefined && (!Number.isSafeInteger(pid) || pid <= 0 || processAlive(pid));
-      if (!managed.settled || !managed.runLogFinalization || managed.runLogFinalizationPending || managed.runLogFinalizationFailure || managed.processStopPending || managed.nativeReleasePending || managed.lostContact || managed.settlementSaveFailure || uncheckedExternalExit(managed.transport) ||
+      if (!managed.settled || this.#runLogFinalizationVeto(managed) || managed.processStopPending || managed.nativeReleasePending || managed.lostContact || managed.settlementSaveFailure || uncheckedExternalExit(managed.transport) ||
           unconfirmedProcess || !(yield* proof(() => boundedRunTree(managed.runDirectory, expired))) ||
           !(yield* proof(() => !runTreeExitVeto(managed.runDirectory, 0, expired, true)))) protect(managed.id, managed.actorId);
       yield;
@@ -4091,8 +4091,12 @@ export class AgentManager {
   }
 
   /** Join this owner's existing writer/codec obligations before archive copy or source cleanup.
-   * A pending/unknown exit is never reported as finalized. Codec failure does not change the result. */
+   * Windows/source-missing bypasses are no-ops, NOT worker-exit receipts: consumers
+   * still need their existing execution/retention fences. Codec failure never changes the result. */
   async finalizeRunLog(id: string): Promise<void> {
+    // Option B: Windows keeps main's uncompressed path, including its existing
+    // execution/retention fences. A codec join must not add a new native-close gate.
+    if (!retentionV2Enabled()) return;
     const managed = this.#runs.get(id);
     if (!managed) {
       const queued = this.#queued.get(id);
@@ -4122,14 +4126,16 @@ export class AgentManager {
       return;
     }
     if (!managed.settled) throw new Error(`Agent ${id} run log still has an unsettled writer`);
-    // Early final answers and Windows logical settlement have exact, already-owned exit continuations.
-    // Join those continuations; do not infer EOF from the result or start an independent teardown.
+    if (!this.#runLogFinalizationRequired(managed)) return;
+    // Early final answers have exact, already-owned exit continuations. Join
+    // those continuations; do not infer EOF or start an independent teardown.
     await managed.finalAnswerCompletion;
     await managed.relaunchPending;
     await managed.nativeReleasePending;
     await managed.executionDrain;
     await managed.processStop;
     const finalization = this.#finalizeRunLogIfQuiescent(managed);
+    if (!finalization && !this.#runLogFinalizationRequired(managed)) return;
     if (!finalization) throw new Error(`Agent ${id} run log writer exit is unconfirmed; custody retained${managed.lostContact ? `: ${managed.lostContact}` : ""}`);
     await finalization;
     if (managed.runLogFinalizationFailure) throw managed.runLogFinalizationFailure;
@@ -4146,9 +4152,58 @@ export class AgentManager {
     return managed.executionExited === true && !uncheckedExternalExit(managed.transport);
   }
 
+  /** Absence is an ENOENT-only observation, not permission to invent an empty
+   * stream. Recheck the private directory around both names so denial, symlinks
+   * and namespace replacement cannot be mistaken for the source-missing bypass. */
+  #runLogFinalizationRequired(managed: ManagedAgent): boolean {
+    if (!retentionV2Enabled()) return false;
+    if (managed.runLogFinalization || managed.runLogFinalizationFailure) return true;
+    const directory = managed.runDirectory, logFile = path.join(directory, "events.jsonl");
+    let fd: number | undefined, required = true;
+    try {
+      const before = fs.lstatSync(directory, { bigint: true });
+      if (!before.isDirectory() || before.isSymbolicLink() || (before.mode & 0o077n) !== 0n ||
+          (process.getuid && before.uid !== BigInt(process.getuid())) || fs.realpathSync(directory) !== path.resolve(directory)) {
+        throw new Error("unsafe run log directory");
+      }
+      fd = fs.openSync(directory, fs.constants.O_RDONLY | (fs.constants.O_DIRECTORY ?? 0) | (fs.constants.O_NOFOLLOW ?? 0));
+      const held = fs.fstatSync(fd, { bigint: true });
+      const present = (file: string): boolean => {
+        try { fs.lstatSync(file); return true; }
+        catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return false; throw error; }
+      };
+      const source = present(logFile), encoded = present(`${logFile}.zst`);
+      const after = fs.lstatSync(directory, { bigint: true });
+      if (held.dev !== before.dev || held.ino !== before.ino || after.dev !== before.dev || after.ino !== before.ino ||
+          after.mode !== before.mode || after.uid !== before.uid || after.ctimeNs !== before.ctimeNs ||
+          fs.realpathSync(directory) !== path.resolve(directory)) throw new Error("run log directory changed during source classification");
+      required = source || encoded;
+    } catch (error) {
+      rememberRunLogFailure(managed, isRunLogCodecFailure(error) ? error
+        : Object.assign(new Error(`Agent ${managed.id} run log source classification failed: ${String(error)}`, { cause: error }),
+          { code: "run-log-codec" as const, reason: "custody", path: logFile }));
+    } finally {
+      if (fd !== undefined) try { fs.closeSync(fd); } catch (error) {
+        rememberRunLogFailure(managed, Object.assign(new Error(`Agent ${managed.id} run log directory close failed`, { cause: error }),
+          { code: "run-log-codec" as const, reason: "custody", path: logFile }));
+      }
+    }
+    return required || !!managed.runLogFinalizationFailure;
+  }
+
+  #runLogFinalizationVeto(managed: ManagedAgent): boolean {
+    return this.#runLogFinalizationRequired(managed) &&
+      (!managed.runLogFinalization || !!managed.runLogFinalizationPending || !!managed.runLogFinalizationFailure);
+  }
+
   #finalizeRunLogIfQuiescent(managed: ManagedAgent): Promise<void> | undefined {
+    if (!retentionV2Enabled()) return undefined;
     if (managed.runLogFinalization) return managed.runLogFinalization;
-    if (!this.#runLogWriterClosed(managed)) return undefined;
+    // The durable save outcome (including all publication hooks), not a pre-save
+    // flag, decides eligibility. A successful retry calls us again from the saver.
+    if (!this.#runLogWriterClosed(managed) || !managed.settledResultFile || managed.settlementSaveFailure) return undefined;
+    if (!this.#runLogFinalizationRequired(managed)) return undefined;
+    if (managed.runLogFinalizationFailure) return managed.runLogFinalization = Promise.resolve();
     const logFile = path.join(managed.runDirectory, "events.jsonl");
     managed.runLogFinalizationPending = true;
     this.#retentionRevision++;
@@ -4165,6 +4220,7 @@ export class AgentManager {
     }).finally(() => {
       managed.runLogFinalizationPending = false;
       this.#retentionRevision++;
+      this.#pruneRetainedUiRecords();
       this.#invalidateUiList();
     });
     return managed.runLogFinalization;
@@ -4434,10 +4490,11 @@ export class AgentManager {
       if (epoch !== this.#releaseEpoch || valid?.() === false) throw new Error("Agent release checkpoint is stale");
     };
     check();
-    const obligations = (): boolean => this.#closing || this.#releaseWaiters.size > 0 || this.#spawns.size > 0 || this.#launches.size > 0 ||
+    const obligations = (includeCodec = true): boolean => this.#closing || this.#releaseWaiters.size > 0 || this.#spawns.size > 0 || this.#launches.size > 0 ||
       this.#queuedStarts.size > 0 || [...this.#queued.values()].some(q => !q.terminal || q.cleanupPending !== undefined) ||
-      [...this.#runs.values()].some(run => run.processStopPending || run.nativeReleasePending || run.relaunchPending || run.runLogFinalizationPending);
-    if (obligations()) throw new Error("Agent release quiescence has pending launch/cleanup obligations");
+      [...this.#runs.values()].some(run => run.processStopPending || run.nativeReleasePending || run.relaunchPending || (includeCodec && run.runLogFinalizationPending));
+    // Codec work fences the final receipt, not the bounded transport observation.
+    if (obligations(false)) throw new Error("Agent release quiescence has pending launch/cleanup obligations");
     const runs = [...this.#runs.values()];
     if (runs.some(run => !run.settled || run.lostContact || run.settlementSaveFailure || hasUnresolvedWorker(run.runDirectory))) {
       throw new Error("Agent release quiescence has an unresolved worker/result");
@@ -5631,7 +5688,6 @@ export class AgentManager {
     if (!beginAgentSettlement(managed)) return;
     managed.questions?.abort(new Error("Agent run settled"));
     managed.hosted?.close();
-    void this.#finalizeRunLogIfQuiescent(managed);
     // Images are transport inputs, not retained run artifacts. Startup retries
     // have finished by settlement, so remove the owner-only handoff file for
     // every terminal outcome even when retainRuns keeps the rest of the run.
@@ -5849,6 +5905,7 @@ export class AgentManager {
       // Main's terminal refusal reports the associated validated status; keep only that scalar.
       if (managed.finalAnswerResult) managed.finalAnswerStatus = managed.finalAnswerResult.status;
       delete managed.finalAnswerResult;
+      void this.#finalizeRunLogIfQuiescent(managed);
       return true;
     } catch (error) {
       managed.settlementSaveFailure = {
@@ -5908,13 +5965,16 @@ export class AgentManager {
   }
 
   #canCollect(managed: ManagedAgent): boolean {
-    if (!managed.runLogFinalization || managed.runLogFinalizationPending || managed.runLogFinalizationFailure ||
-        !this.#runLogWriterClosed(managed) || this.#terminalNoticeOutbox.hasPending(managed.runDirectory)) return false;
+    // Preserve main's execution/custody predicate on bypass paths as well.
+    if (!managed.executionExited || managed.processStopPending || managed.nativeReleasePending ||
+        this.#terminalNoticeOutbox.hasPending(managed.runDirectory) || managed.lostContact || hasUnresolvedWorker(managed.runDirectory)) return false;
     if (uncheckedExternalExit(managed.transport)) return false;
     // Retry the durable full archive before asking its pending-marker collection veto.
     // Settlement compacts UI caches. Retry only the original full result, never those caches.
     if (managed.settlementSaveFailure &&
         !this.#saveSettledResult(managed, managed.settlementSaveFailure.result)) return false;
+    if (this.#runLogFinalizationVeto(managed) ||
+        (this.#runLogFinalizationRequired(managed) && !this.#runLogWriterClosed(managed))) return false;
     return !runTreeExitVeto(managed.runDirectory, 0, undefined, true);
   }
 
@@ -6181,8 +6241,8 @@ export class AgentManager {
     const settled = [...this.#runs.values()].filter((managed) => managed.settled);
     let handlesChanged = false;
     for (const managed of settled.slice(0, -MAX_RETAINED_RUN_HANDLES)) {
-      if (managed.executionExited && managed.runLogFinalization && this.#runLogWriterClosed(managed) &&
-          !managed.runLogFinalizationPending && !managed.runLogFinalizationFailure &&
+      if (managed.executionExited && !this.#runLogFinalizationVeto(managed) &&
+          (!this.#runLogFinalizationRequired(managed) || this.#runLogWriterClosed(managed)) &&
           !managed.settlementSaveFailure && !managed.processStopPending &&
           !managed.nativeReleasePending && !managed.lostContact && !hasUnresolvedWorker(managed.runDirectory) &&
           !this.#terminalNoticeOutbox.hasPending(managed.runDirectory) &&

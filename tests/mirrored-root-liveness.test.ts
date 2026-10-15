@@ -468,8 +468,8 @@ const transport = (timeout = 30) => {
   const remote = new RemoteBridgeSide(input, output, timeout);
   const sent: Array<{ id: number; op: string }> = [];
   output.on("data", buffer => { sent.push(JSON.parse(buffer.toString())); });
-  const reply = (id: number, result: unknown = undefined, error?: string) => input.write(JSON.stringify({ id,
-    ok: error === undefined, ...(error === undefined ? { result } : { error }) }) + "\n");
+  const reply = (id: number, result: unknown = undefined, error?: string, code?: string) => input.write(JSON.stringify({ id,
+    ok: error === undefined, ...(error === undefined ? { result } : { error, ...(code ? { code } : {}) }) }) + "\n");
   close.push(() => remote.close());
   return { remote, sent, reply };
 };
@@ -492,6 +492,26 @@ describe("a slow mirror degrades, not disconnects (#10068)", () => {
     f.reply(f.sent[2]!.id, { hosts: [], participants: [], reserved: [] });
     await expect(presence).resolves.toMatchObject({ hosts: [] });
   });
+
+  it.each(["FABRIC_MESH_INCARNATION_PENDING", "FABRIC_MESH_SNAPSHOT_RETRIES_EXHAUSTED"])(
+    "a late %s mirror rejection releases the gate without closing the transport", async code => {
+      const f = transport();
+      const timedOut = await settle(f.remote.mirror({ hosts: [], participants: [] }));
+      expect(timedOut.error).toBeInstanceOf(BridgeMirrorDeferredError);
+      expect(f.sent).toHaveLength(1);
+      const queued = await settle(f.remote.presence());
+      expect(queued.error).toHaveProperty("code", "FABRIC_BRIDGE_STALE");
+      expect(f.sent).toHaveLength(1);
+
+      f.reply(f.sent[0]!.id, undefined, `retryable mirror refusal: ${code}`, code);
+      const renewed = f.remote.mirror({ hosts: [], participants: [] });
+      expect(f.sent).toHaveLength(2);
+      f.reply(f.sent[1]!.id);
+      await expect(renewed).resolves.toBeUndefined();
+      const presence = f.remote.presence();
+      f.reply(f.sent[2]!.id, { hosts: [], participants: [], reserved: [] });
+      await expect(presence).resolves.toMatchObject({ hosts: [] });
+    });
 
   it("a late permanent mirror rejection still closes the transport", async () => {
     const f = transport();

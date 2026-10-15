@@ -1,4 +1,5 @@
 import { childProcessEnvironment } from "../core/atomic-write.js";
+import { detachedPreview } from "../core/preview.js";
 import { ExecutionDeadline } from "./execution-deadline.js";
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
@@ -171,7 +172,7 @@ export class CPythonRuntime implements FabricKernelRuntime {
         // Settlement ends IPC admission, not the drain of already-written logs.
         if (logsFinalized || truncated) return;
         const available = Math.max(0, maxLogChars - logChars);
-        const retained = text.slice(0, available);
+        const retained = detachedPreview(text, available);
         logChars += retained.length;
         const lines = ((partialLogs[index] ?? "") + retained).split(/\r?\n/);
         partialLogs[index] = lines.pop() ?? "";
@@ -403,7 +404,7 @@ export class CPythonRuntime implements FabricKernelRuntime {
       child.on("error", (error) => fail(`CPython process failed: ${error.message}${this.enforce ? "; OS sandbox is required (no native fallback)" : ""}`));
       child.on("close", (exitCode, signal) => {
         if (settled || (finishing && !pipeError)) return;
-        const diagnostics = [...logs, ...partialLogs].join("\n").slice(-4000);
+        const diagnostics = detachedPreview([...logs, ...partialLogs].join("\n").slice(-4000), 4000);
         fail(`${pipeError ? `${pipeError}; ` : ""}CPython ${this.enforce ? "sandbox " : ""}process exited before returning a result (${signal ?? exitCode}).${this.enforce ? " Verify OS sandbox availability/user namespaces; no unsandboxed fallback is permitted." : ""}${diagnostics ? `\n${diagnostics}` : ""}`);
       });
       options.signal?.addEventListener("abort", abort, { once: true });

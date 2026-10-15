@@ -1,4 +1,5 @@
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
+import { detachedPreview } from "../core/preview.js";
 
 export type AgentSeedMode = "task" | "branch" | "snippet";
 
@@ -96,7 +97,7 @@ export const snippetTask = (
     if (message.role !== "user" && message.role !== "assistant") continue;
     let text = messageText(message.content).trim();
     if (!text) continue;
-    if (text.length > MAX_SNIPPET_MESSAGE_CHARS) text = `${text.slice(0, MAX_SNIPPET_MESSAGE_CHARS)}…`;
+    text = detachedPreview(text, MAX_SNIPPET_MESSAGE_CHARS) + (text.length > MAX_SNIPPET_MESSAGE_CHARS ? "…" : "");
     messages.push(`[${message.role}]\n${text}`);
   }
   const recent = messages.slice(-count);

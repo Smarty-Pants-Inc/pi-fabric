@@ -1207,6 +1207,15 @@ export class SqliteStateStore {
     const lockClass: MeshLockClass = input.lockClass === "bridge" ? "bridge" : "writeBatch";
     for (const op of input.ops) validateMeshStateKey(op.key);
     if (input.ops.length === 0 && !input.prepare && !input.afterCommit && !input.beforeCommit) return [];
+    // Static payload capture does not depend on transaction state. Keep callbacks and revision
+    // allocation inside BEGIN IMMEDIATE; defer capture errors until after condition/CAS skips.
+    const captured = new Map<MeshBatchOperation, ReturnType<typeof captureStoragePut> | { error: unknown }>();
+    for (const op of input.ops) {
+      if (op.kind !== "put" || typeof op.value === "function") continue;
+      try { captured.set(op, captureStoragePut({ key: op.key, value: op.value, ifVersion: op.ifVersion,
+        identity: op.identity ?? input.identity }, this.maxEventBytes)); }
+      catch (error) { captured.set(op, { error }); }
+    }
     let committed: number | undefined;
     const results = await this.#write(lockClass, (tx) => {
       if (input.beforeCommit) tx.beforeCommit = input.beforeCommit;
@@ -1234,12 +1243,14 @@ export class SqliteStateStore {
           results.push({ key: op.key, applied: false, version: slot.version });
           continue;
         }
-        const request = op.kind === "delete"
+        const ready = captured.get(op);
+        if (ready && "error" in ready) throw ready.error;
+        const request = ready ?? (op.kind === "delete"
           ? captureStorageDelete({ key: op.key, ifVersion: op.ifVersion })
           : captureStoragePut({
             key: op.key, ifVersion: op.ifVersion, identity: op.identity ?? input.identity,
             value: typeof op.value === "function" ? (op.value as (now: number) => unknown)(now) : op.value,
-          }, this.maxEventBytes);
+          }, this.maxEventBytes));
         const plan = request.transition(slot.present, slot.version, tx.highWater);
         if (plan.kind === "unchanged") {
           results.push({ key: op.key, applied: false, version: slot.version });

@@ -16,7 +16,7 @@ import { delay, errorCode, type MeshLock, type MeshStoreContext } from "./mesh-l
 import { assertFileStateWritable, isMeshStateMovedMarker, isMeshStateNatsMarker, meshStateMovedError, meshStateMovedToNatsError, readMeshStateMovedMarker,
   type MeshStateMovedMarker, type MeshStateNatsMarker } from "./backend-fence.js";
 import type { MeshIdentity } from "./event-log.js";
-import type { MeshCommitEffects, MeshStateFileRead, StateBackend, StateBackendBatchInput, StateBackendDiagnostics } from "./state-backend.js";
+import type { MeshStateFileRead, StateBackend, StateBackendBatchInput, StateBackendDiagnostics } from "./state-backend.js";
 
 // Keyed mesh state on state.json (smarty-dev#6477 L0): reads, encoding, prepared and committed
 // writes, revisions, tombstones, namespaces, the read signal and write snapshots.
@@ -495,6 +495,8 @@ export type MeshBatchOperation =
       condition?: (current: (key: string) => MeshStateEntry | undefined) => boolean;
     };
 
+type CapturedBatchPuts = Map<MeshBatchOperation, ReturnType<typeof captureStoragePut> | { error: unknown }>;
+
 export interface MeshBatchView {
   get(key: string): MeshStateEntry | undefined;
   listAll(prefix: string): MeshStateEntry[];
@@ -535,7 +537,7 @@ export const bracketFileRead = (fileRead: MeshStateFileRead): { value: unknown; 
   return fileRead.stamp() === stamp ? { value, stamp } : undefined;
 };
 
-// A copy of a committed state, readable after the transaction (commitOutbox effects).
+// Copy-on-read view of a private transaction or detached committed snapshot.
 const detachedView = (state: MeshStateFile): MeshBatchView => ({
   get: (key) => Object.hasOwn(state.entries, key) ? jsonClone(state.entries[key]) : undefined,
   listAll: (prefix) => Object.keys(state.entries).filter((key) => key.startsWith(prefix))
@@ -645,7 +647,6 @@ export class StateFile implements StateBackend {
   #requireCanonicalRead = false;
   #stateCache: ParsedStateSnapshot | undefined;
   #canonicalHeader: { identity: string; generation: string | undefined; journalHash: string | undefined } | undefined;
-  #journalBase: JournalBase | undefined;
   #lastPreparedSweep = -Infinity;
 
   constructor(context: MeshStoreContext, options: StateFileOptions) {
@@ -922,7 +923,7 @@ export class StateFile implements StateBackend {
   }
 
   async #withWriteSnapshot<T, P>(prepare: (snapshot: WriteStateSnapshot) => P,
-    commit: (prepared: P) => T, cleanup?: (prepared: P) => void, lockClass: MeshLockClass = "other"): Promise<T> {
+    commit: (prepared: P) => T, cleanup?: (prepared: P) => void, lockClass: MeshLockClass = "other", maxAttempts = Infinity): Promise<T> {
     const scope = this.#lock.tryLockScope.getStore();
     if (!scope?.active) this.#sweepPreparedState();
     const deadline = Date.now() + this.#lock.lockTimeoutMs;
@@ -966,7 +967,7 @@ export class StateFile implements StateBackend {
         }
         // Never retry inside an actor registry fence: its caller releases custody and
         // retries the whole admission step, just as for a busy mesh.
-        if (scope?.active || Date.now() >= deadline) {
+        if (scope?.active || attempts >= maxAttempts || Date.now() >= deadline) {
           throw new MeshSnapshotRetriesExhaustedError(attempts);
         }
         await delay(0, this.#lock.writeAbortSignal);
@@ -976,12 +977,26 @@ export class StateFile implements StateBackend {
     }
   }
 
-  // Only pure single-key transitions may be prepared optimistically. Callback batches
-  // still select and invoke their callbacks exactly once under validated custody.
-  async #writeState<T>(change: (state: MeshStateFile) => { result: T; keys?: string[] }, caller?: string[]): Promise<T> {
+  // Pure transitions stage optimistically; lockedKeys keeps callback batches authoritative.
+  async #writeState<T>(change: (state: MeshStateFile) => { result: T; keys?: string[] | undefined }, caller?: string[], options: {
+    lockedKeys?: string[] | undefined; validate?: () => void; beforeCommit?: (() => void) | undefined;
+    afterCommit?: (result: T, keys?: string[]) => void; lockClass?: MeshLockClass; maxAttempts?: number | undefined;
+  } = {}): Promise<T> {
     return this.#withWriteSnapshot(({ state, reuse, base }) => {
-      const outcome = change(state);
-      const prepared = outcome.keys ? this.#prepareStateCommit(state, reuse, outcome.keys, base) : undefined;
+      let namespaces: Record<string, string> | undefined;
+      if (options.lockedKeys) {
+        const omitted = new Set(options.lockedKeys);
+        reuse = new Map(reuse);
+        // Cold callback batches still encode retained entries outside custody.
+        for (const key of Object.keys(state.entries)) {
+          if (omitted.has(key) || reuse.has(key)) continue;
+          const encoded = encodeEntry(key, state.entries[key]);
+          if (encoded) reuse.set(key, encoded);
+        }
+        namespaces = this.#signalNamespaces(reuse, {}, new Set(options.lockedKeys.map(keyNamespace)));
+      }
+      const outcome = options.lockedKeys ? undefined : change(state);
+      const prepared = outcome?.keys ? this.#prepareStateCommit(state, reuse, outcome.keys, base) : undefined;
       if (prepared) {
         // State remains a soft-state atomic replacement (no durability policy change).
         // Stage the large write off-lock too; custody only compares identity and renames.
@@ -1001,10 +1016,17 @@ export class StateFile implements StateBackend {
         prepared.temporary = temporary;
         prepared.releaseTemporary = release;
       }
-      return { state, ...outcome, prepared };
-    }, ({ state, result, keys, prepared }) => {
-      if (prepared) this.#commitPreparedState(prepared, keys!, caller);
-      else this.#cacheState(state, undefined);
+      return { state, reuse, base, namespaces, outcome, prepared };
+    }, ({ state, reuse, base, namespaces, outcome, prepared }) => {
+      options.validate?.();
+      const { result, keys } = outcome ?? change(state);
+      prepared ??= keys ? this.#prepareStateCommit(state, reuse, keys, base, namespaces) : undefined;
+      if (prepared) this.#commitPreparedState(prepared, keys!, caller, options.beforeCommit);
+      else {
+        options.beforeCommit?.();
+        this.#cacheState(state, undefined);
+      }
+      options.afterCommit?.(result, keys);
       return result;
     }, ({ prepared }) => {
       if (prepared?.temporary) {
@@ -1012,20 +1034,7 @@ export class StateFile implements StateBackend {
         try { fs.rmSync(prepared.temporary, { force: true }); } catch { /* Best-effort private staging cleanup. */ }
         prepared.releaseTemporary?.();
       }
-    }, "put/delete");
-  }
-
-  // A commit's write, signal and cache, under the lock. The stamp is taken right after the rename,
-  // before hashing the encoded entries; the signal is published and the cache kept only while the file still has it,
-  // so a lock-bypassing writer replacing the file meanwhile never gets this payload's hashes or
-  // cache label. ponytail: a replace between the rename and that first stat cannot be detected
-  // without the written descriptor (atomic-write.ts); the lock protocol excludes it.
-  // The commit's new readGeneration is serialized FIRST and atomically with the payload (the
-  // previous one is dropped from the copy), so the canonical header alone identifies the commit
-  // whether or not the optional signal is published afterwards. The stamped copy is cached.
-  #commitState(state: MeshStateFile, reuse: Map<string, EncodedStateEntry> | undefined, keys: string[], caller: string[] | undefined,
-    namespaces?: Record<string, string>, beforeCommit?: () => void): void {
-    this.#commitPreparedState(this.#prepareStateCommit(state, reuse, keys, this.#journalBase, namespaces), keys, caller, beforeCommit);
+    }, options.lockClass ?? "put/delete", options.maxAttempts);
   }
 
   #prepareStateCommit(state: MeshStateFile, reuse: Map<string, EncodedStateEntry> | undefined,
@@ -1281,42 +1290,46 @@ export class StateFile implements StateBackend {
     const caller = commitTraceCaller();
     for (const op of input.ops) this.#validateKey(op.key);
     if (input.ops.length === 0 && !input.prepare && !input.afterCommit && !input.commitOutbox && !input.beforeCommit) return [];
+    // Static input payloads are independent of the authoritative snapshot, including in a
+    // mixed/prepare batch. Capture once, not on optimistic retries. Defer errors until the
+    // operation passes its condition/CAS, so an invalid but skipped value still stays skipped.
+    const captured: CapturedBatchPuts = new Map();
+    for (const op of input.ops) {
+      if (op.kind !== "put" || typeof op.value === "function") continue;
+      try { captured.set(op, captureStoragePut({ key: op.key, value: op.value, ifVersion: op.ifVersion,
+        identity: op.identity ?? input.identity }, this.maxEventBytes)); }
+      catch (error) { captured.set(op, { error }); }
+    }
     const fileRead = input.fileRead;
     const retries = Math.max(0, Math.floor(fileRead?.retries ?? 3));
     for (let attempt = 0; ; attempt += 1) {
       const bracket = fileRead ? bracketFileRead(fileRead) : undefined;
-      let outcome: { results: MeshBatchResult[]; effects?: Omit<MeshCommitEffects, "stamp"> };
+      let outcome: { results: MeshBatchResult[]; state: MeshStateFile | undefined; stamp: string | undefined };
       try {
         if (fileRead && !bracket) throw FILE_READ_CHANGED;
-        outcome = await this.#writeBatchOnce(input, caller, bracket?.value,
+        outcome = await this.#writeBatchOnce(input, captured, caller, bracket?.value,
           fileRead && bracket ? () => fileRead.stamp() === bracket.stamp : undefined, committed);
       } catch (error) {
         if (error !== FILE_READ_CHANGED) throw error;
         if (attempt >= retries) throw new MeshStateFileReadChangedError(attempt + 1);
         continue;
       }
-      if (input.commitOutbox && outcome.effects) input.commitOutbox({ ...outcome.effects, stamp: this.stateStamp() });
+      // Writers always parse a private snapshot and never mutate it after commit. Retain that
+      // exact snapshot across custody release, then detach it here rather than cloning under lock.
+      if (input.commitOutbox && outcome.state) input.commitOutbox({
+        backend: "file", results: outcome.results.map(result => ({ ...result })),
+        changed: outcome.results.filter(result => result.applied).map(result => result.key),
+        view: detachedView(jsonClone(outcome.state)), stamp: outcome.stamp,
+      });
       return outcome.results;
     }
   }
 
-  #writeBatchOnce(input: StateBackendBatchInput, caller: string[] | undefined, fileValue: unknown,
-    stampHolds: (() => boolean) | undefined, committed?: (changed: readonly string[]) => void): Promise<{ results: MeshBatchResult[]; effects?: Omit<MeshCommitEffects, "stamp"> }> {
-    return this.#withWriteSnapshot(snapshot => {
-      const omitted = new Set(input.ops.map(op => op.key));
-      const reuse = new Map(snapshot.reuse);
-      // Cold multi-process writers pre-encode retained entries before custody too.
-      // Explicitly changed/deleted keys are encoded only after their locked transition.
-      for (const key of Object.keys(snapshot.state.entries)) {
-        if (omitted.has(key) || reuse.has(key)) continue;
-        const encoded = encodeEntry(key, snapshot.state.entries[key]);
-        if (encoded) reuse.set(key, encoded);
-      }
-      const namespaces = this.#signalNamespaces(reuse, {}, new Set(input.ops.map(op => keyNamespace(op.key))));
-      return { ...snapshot, reuse, namespaces };
-    }, ({ state, reuse, base, namespaces }) => {
-      if (stampHolds && !stampHolds()) throw FILE_READ_CHANGED;
-      this.#journalBase = base;
+  #writeBatchOnce(input: StateBackendBatchInput, captured: CapturedBatchPuts, caller: string[] | undefined, fileValue: unknown,
+    stampHolds: (() => boolean) | undefined, committed?: (changed: readonly string[]) => void): Promise<{ results: MeshBatchResult[]; state: MeshStateFile | undefined; stamp: string | undefined }> {
+    const locked = input.prepare || input.fileRead || input.ops.some(op => typeof op.onConflict === "function" ||
+      (op.kind === "put" ? typeof op.value === "function" : op.condition));
+    return this.#writeState<{ results: MeshBatchResult[]; view: MeshBatchView; state: MeshStateFile | undefined; stamp: string | undefined }>(state => {
       // Each operation takes the same verified transition as put()/delete(), so a batch
       // advances the persistent clock exactly as the single writes would, and damaged
       // state is the same write barrier.
@@ -1325,14 +1338,8 @@ export class StateFile implements StateBackend {
       const results: MeshBatchResult[] = [];
       let changed = false;
       const now = Date.now();
-      const current = (key: string): MeshStateEntry | undefined =>
-        Object.hasOwn(state.entries, key) ? jsonClone(state.entries[key]) : undefined;
-      const view: MeshBatchView = {
-        get: current,
-        listAll: (prefix) => Object.keys(state.entries).filter((key) => key.startsWith(prefix))
-          .sort((left, right) => left.localeCompare(right)).map((key) => jsonClone(state.entries[key]!)),
-        version: (key) => stateSlot(state, key).version,
-      };
+      const view = detachedView(state);
+      const current = view.get;
       const ops = [...input.ops, ...(input.prepare?.(view, fileValue) ?? [])];
       for (const op of ops) this.#validateKey(op.key);
       for (const op of ops) {
@@ -1352,14 +1359,16 @@ export class StateFile implements StateBackend {
           results.push({ key: op.key, applied: false, version: slot.version });
           continue;
         }
-        const request = op.kind === "delete"
+        const ready = captured.get(op);
+        if (ready && "error" in ready) throw ready.error;
+        const request = ready ?? (op.kind === "delete"
           ? captureStorageDelete({ key: op.key, ifVersion: op.ifVersion })
           : captureStoragePut({
             key: op.key,
             ifVersion: op.ifVersion,
             value: typeof op.value === "function" ? (op.value as (now: number) => unknown)(now) : op.value,
             identity: op.identity ?? input.identity,
-          }, this.maxEventBytes);
+          }, this.maxEventBytes));
         const plan = request.transition(slot.present, slot.version, slot.highWater);
         if (plan.kind === "unchanged") {
           results.push({ key: op.key, applied: false, version: slot.version });
@@ -1382,25 +1391,24 @@ export class StateFile implements StateBackend {
         results.push({ key: op.key, applied: true, version: plan.version });
         changed = true;
       }
-      if (!changed) {
-        input.beforeCommit?.();
-        this.#cacheState(state, undefined);
-      } else {
+      if (changed) {
         state.tombstoneOrder = [...tombstones];
         compactStateTombstones(state, this.#maxStateTombstones);
-        const changedKeys = results.filter(result => result.applied).map(result => result.key);
-        this.#commitState(state, reuse, changedKeys, caller, namespaces, input.beforeCommit);
-        committed?.(changedKeys);
       }
-      input.afterCommit?.(view);
-      if (!input.commitOutbox) return { results };
-      return { results, effects: {
-        backend: "file" as const,
-        results: results.map((result) => ({ ...result })),
-        changed: results.filter((result) => result.applied).map((result) => result.key),
-        view: detachedView(jsonClone(state)),
-      } };
-    }, undefined, input.lockClass === "bridge" ? "bridge" : "writeBatch");
+      return { result: { results, view, state: input.commitOutbox ? state : undefined, stamp: undefined },
+        keys: changed ? results.filter(result => result.applied).map(result => result.key) : undefined };
+    }, caller, {
+      lockedKeys: locked ? input.ops.map(op => op.key) : undefined,
+      maxAttempts: locked ? undefined : 2,
+      validate: () => { if (stampHolds && !stampHolds()) throw FILE_READ_CHANGED; },
+      beforeCommit: input.beforeCommit,
+      afterCommit: (result, keys) => {
+        if (input.commitOutbox) result.stamp = this.stateStamp();
+        if (keys) committed?.(keys);
+        input.afterCommit?.(result.view);
+      },
+      lockClass: input.lockClass === "bridge" ? "bridge" : "writeBatch",
+    });
   }
 
   diagnostics(): StateBackendDiagnostics {

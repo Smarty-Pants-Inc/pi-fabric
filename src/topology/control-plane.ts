@@ -631,10 +631,9 @@ export class FabricControlPlane {
       if (admission) this.#assertAdmission();
       return store.put(input);
     }
-    const results = await store.writeBatch({ identity: this.identity, ops: [], prepare: () => {
+    const results = await store.writeBatch({ identity: this.identity, ops: [{ kind: "put", ...input }], beforeCommit: () => {
       if (admission) this.#assertAdmission();
       else assertMeshConsumption(this.options.canConsumeMesh);
-      return [{ kind: "put", ...input }];
     } });
     return { version: results[0]!.version };
   }
@@ -2205,10 +2204,10 @@ export class FabricControlPlane {
         const record = controlSeenRecord(entry.value);
         return !record || (record.expiresAt < now && record.sequence !== undefined && record.sequence < oldest);
       });
-      if (stale.length > 0) {
+      for (let start = 0; start < stale.length; start += 64) {
         await this.#seen.writeBatch({
           identity: this.identity,
-          ops: stale.map((entry) => ({ kind: "delete" as const, key: entry.key, ifVersion: entry.version, onConflict: "skip" as const })),
+          ops: stale.slice(start, start + 64).map((entry) => ({ kind: "delete" as const, key: entry.key, ifVersion: entry.version, onConflict: "skip" as const })),
         });
       }
     }
@@ -2260,11 +2259,13 @@ export class FabricControlPlane {
       dead.push(...unflagged.filter(({ record }) => !record || !retained.has(record.commandId)));
     }
     if (dead.length === 0) return;
-    // One write for the whole sweep, each delete fenced to the version it saw.
-    await this.mesh.writeBatch({
-      identity: this.identity,
-      ops: dead.map(({ entry }) => ({ kind: "delete" as const, key: entry.key, ifVersion: entry.version, onConflict: "skip" as const })),
-    });
+    // Independent claim retirements: keep each hold bounded, preserving every version fence.
+    for (let start = 0; start < dead.length; start += 64) {
+      await this.mesh.writeBatch({
+        identity: this.identity,
+        ops: dead.slice(start, start + 64).map(({ entry }) => ({ kind: "delete" as const, key: entry.key, ifVersion: entry.version, onConflict: "skip" as const })),
+      });
+    }
   }
 
   async #publishAcknowledgement(

@@ -302,16 +302,20 @@ export class SlotAdmissionCoordinator {
   async recoverable(registryRoot: string): Promise<SlotRecoverable[]> {
     if (!this.#authority.forOperation(registryRoot)) return [];
     const binding = this.#authority.assert(registryRoot);
-    const recovered: SlotRecoverable[] = [];
+    let entries: MeshStateEntry[] = [];
     await this.mesh.writeBatch({ identity: { id: binding.hubRootId, name: "slot-recovery", kind: "main" }, ops: [], prepare: view => {
-      for (const entry of view.listAll(SLOT_ADMISSION_PREFIX)) {
-        const pair = readPair(entry, binding.authorityGeneration);
-        for (const role of Object.values(pair.roles)) if (role?.registryRoot === registryRoot) {
-          recovered.push({ actorId: role.actorId, spec: copy(role.normalizedRecoverableSpec), state: role.state });
-        }
-      }
+      entries = view.listAll(SLOT_ADMISSION_PREFIX);
       return [];
     }, beforeCommit: () => { this.#authority.assert(registryRoot); } });
+    // The view already detached these rows. Validate and clone large recoverable specs after
+    // releasing custody; no choice or mutation is made from a newer, unfenced state read.
+    const recovered: SlotRecoverable[] = [];
+    for (const entry of entries) {
+      const pair = readPair(entry, binding.authorityGeneration);
+      for (const role of Object.values(pair.roles)) if (role?.registryRoot === registryRoot) {
+        recovered.push({ actorId: role.actorId, spec: role.normalizedRecoverableSpec, state: role.state });
+      }
+    }
     await this.mesh.stateBackendHandle.sync(5_000);
     this.#authority.assert(registryRoot);
     for (const role of recovered) if (role.state === "admitted") this.#syncedIds.add(role.actorId);

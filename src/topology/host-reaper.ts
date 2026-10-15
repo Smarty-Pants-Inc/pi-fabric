@@ -211,11 +211,9 @@ export const reapDeadHostRecords = async (
   }
   if (found.length === 0 && bookkeeping.length === 0) return 0;
   const dead = found.filter((item) => !item.file);
-  // File leases are read before the state transaction and revalidated in it by their directory
-  // stamp (smarty-dev#6477 R11): only a lease written in between is read again under the lock.
-  const leaseStamp = typeof mesh.root === "string" ? meshDirectoryStamp(mesh.root, "host-leases") : "";
-  const leasesBefore = fileLeases(mesh);
-  let leases = leasesBefore;
+  // A changed directory retries one bracketed read outside state custody, never a full scan
+  // inside prepare. Exhaustion defers this maintenance pass without deleting records or files.
+  let leases: ReadonlyMap<string, FabricHostLease> = new Map();
   const targets = [...new Set(found.map(item => item.hostId))].sort();
   const changed = new Error("Reaper target lease renewed or replaced");
   const root = mesh.root;
@@ -237,6 +235,8 @@ export const reapDeadHostRecords = async (
   try {
     results = await targetGates(() => fenced(() => mesh.writeBatch({
       identity,
+      fileRead: { read: () => fileLeases(mesh),
+        stamp: () => typeof root === "string" ? meshDirectoryStamp(root, "host-leases") : "", retries: 1 },
       ops: dead.map(({ entry, hostId }) => ({
         kind: "delete" as const, key: entry.key, ifVersion: entry.version, onConflict: "skip" as const,
         condition: (current: (key: string) => MeshStateEntry | undefined) => {
@@ -245,9 +245,9 @@ export const reapDeadHostRecords = async (
             (host === undefined || leaseGone(host, cutoff, leases));
         },
       })),
-      prepare: view => {
-        leases = typeof root !== "string" || meshDirectoryStamp(root, "host-leases") === leaseStamp
-          ? leasesBefore : fileLeases(mesh);
+      prepare: (view, fileRead) => {
+        // Rootless test adapters have no file leases. A real backend supplies the bracketed Map.
+        if (typeof root === "string") leases = fileRead as ReadonlyMap<string, FabricHostLease>;
         for (const hostId of targets) {
           const host = view.get(hostKey(hostId));
           if (!host || leaseGone(host, cutoff, leases)) reapable.add(hostId);
@@ -268,7 +268,8 @@ export const reapDeadHostRecords = async (
       },
     })));
   } catch (error) {
-    if (error === changed || isMeshWriteDeferred(error)) return 0;
+    if (error === changed || isMeshWriteDeferred(error) || (error instanceof Error &&
+      "code" in error && error.code === "FABRIC_MESH_STATE_FILE_READ_CHANGED")) return 0;
     throw error;
   }
   let removed = results.filter(result => result.applied).length;

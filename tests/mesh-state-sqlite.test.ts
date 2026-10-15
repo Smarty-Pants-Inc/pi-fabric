@@ -307,6 +307,58 @@ describe("SqliteStateStore", () => {
     expect(store.get("hosts/z")).toBeUndefined();
   });
 
+  it("pre-captures static mixed-batch payloads before SQLite custody through MeshStore", async () => {
+    const root = tempRoot("static-capture");
+    const mesh = new MeshStore(root, 64 * 1024, 1_000, { stateBackend: "sqlite" });
+    await mesh.put({ key: "hosts/old", value: "old", identity });
+    const observer = raw(root);
+    observer.exec("PRAGMA busy_timeout = 0");
+    const outside = () => {
+      expect(() => observer.exec("BEGIN IMMEDIATE")).not.toThrow();
+      observer.exec("ROLLBACK");
+    };
+    const inside = () => expect(() => observer.exec("BEGIN IMMEDIATE")).toThrow(/locked|busy/i);
+    let captures = 0, prepares = 0, values = 0, conditions = 0, conflicts = 0, dynamicCaptures = 0;
+    try {
+      const ops: MeshBatchOperation[] = Array.from({ length: 190 }, (_, actor) => ({
+        kind: "put", key: `actors/live/${actor}`, value: { toJSON() {
+          outside(); captures++; return { actor, payload: "x".repeat(512) };
+        } },
+      }));
+      ops.push({ kind: "put", key: "hosts/current", value: (now: number) => {
+        inside(); values++; return { now };
+      } }, { kind: "put", key: "hosts/old", ifVersion: 999,
+        onConflict: () => { inside(); conflicts++; return "skip"; },
+        value: { toJSON() { outside(); throw new Error("skipped payload"); } },
+      });
+      const results = await mesh.writeBatch({ identity, ops,
+        prepare: view => {
+          inside(); prepares++; expect(view.get("hosts/old")?.value).toBe("old");
+          return [{ kind: "put", key: "hosts/prepared", value: { toJSON() {
+            inside(); dynamicCaptures++; return "selected under custody";
+          } } }, { kind: "delete", key: "hosts/old", condition: current => {
+            inside(); conditions++; return current("hosts/prepared")?.value === "selected under custody";
+          } }];
+        },
+        beforeCommit: inside,
+      });
+      expect({ captures, prepares, values, conditions, conflicts, dynamicCaptures })
+        .toEqual({ captures: 190, prepares: 1, values: 1, conditions: 1, conflicts: 1, dynamicCaptures: 1 });
+      expect(results.filter(result => result.applied)).toHaveLength(193);
+      expect(mesh.get("actors/live/189")?.value).toEqual({ actor: 189, payload: "x".repeat(512) });
+      expect(mesh.get("hosts/old")).toBeUndefined();
+      const before = mesh.stateRevision();
+      let after = false;
+      await expect(mesh.writeBatch({ identity, ops: [
+        { kind: "put", key: "hosts/rollback", value: 1 },
+        { kind: "put", key: "hosts/current", value: 2, ifVersion: 999 },
+      ], afterCommit: () => { after = true; } })).rejects.toBeInstanceOf(MeshBatchConflictError);
+      expect(mesh.get("hosts/rollback")).toBeUndefined();
+      expect(mesh.stateRevision()).toBe(before); expect(after).toBe(false);
+      outside();
+    } finally { observer.close(); mesh.closeState(); }
+  });
+
   it("evicts the oldest tombstones without ever reissuing a revision", async () => {
     const store = await open(tempRoot("tombstones"), { maxStateTombstones: 2 });
     for (const key of ["t/1", "t/2", "t/3", "t/4"]) await store.put({ key, value: key, identity });

@@ -2579,6 +2579,35 @@ describe("idle confirmations without the mesh lock (smarty-dev#6477 L6)", () => 
 // idle-wake gate (docs/idle-wake-gate.md), main and resident modes, owner fv2-11172wake/event-lead: overall <= 1 wake/s
 // and no non-allowed site > 1/min.
 describe("ParticipantDirectory default lease cadence (smarty-dev#11172)", () => {
+  const owned: Array<{ mesh: MeshStore; directory: ParticipantDirectory }> = [];
+  afterEach(async () => {
+    // Close the borrowed store after its publisher, before Windows fixture-root cleanup.
+    for (const { mesh, directory } of owned.splice(0)) {
+      try { await directory.close(); } finally { mesh.closeState(); }
+    }
+  });
+  // Deliver the production root-watch callback after a real commit, not after a wall-clock wait.
+  const stateCommitWatch = (mesh: MeshStore) => {
+    let listener: ((event: string, name: string) => void) | undefined;
+    const realWatch = fs.watch;
+    const spy = vi.spyOn(fs, "watch").mockImplementation(((target: fs.PathLike, ...rest: unknown[]) => {
+      if (String(target) !== mesh.root) return (realWatch as any)(target, ...rest);
+      listener = rest.at(-1) as typeof listener;
+      return fakeWatcher();
+    }) as typeof fs.watch);
+    return {
+      notify: (name = mesh.stateBackend === "sqlite" ? "state.db-wal" : "state.json") => {
+        expect(listener).toBeTypeOf("function");
+        listener!("change", name);
+      },
+      restore: () => spy.mockRestore(),
+    };
+  };
+  const settledRefresh = async (refresh: Promise<void>) => {
+    await refresh;
+    // Clear the background runner's in-flight guard before testing the no-loop counterexamples.
+    await new Promise<void>(resolve => setImmediate(resolve));
+  };
   const identityOf = (name: string): MeshIdentity => ({ id: `session:${name}`, name: "main", kind: "main", sessionId: name });
   const fixture = (name: string, stateBackend: "file" | "sqlite" = "file") => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-11172-"));
@@ -2589,6 +2618,7 @@ describe("ParticipantDirectory default lease cadence (smarty-dev#11172)", () => 
     const directory = new ParticipantDirectory(mesh, { enabled: true, hostId: identity.id, rootId: identity.id, identity, reapDeadHosts: false });
     directory.registerSource(() => [rootRecord(identity.id, identity.id, name)]);
     directories.push(directory);
+    owned.push({ mesh, directory });
     return { mesh, identity, directory };
   };
   const addStateOnlyReader = async (mesh: MeshStore, now: number) => {
@@ -2656,6 +2686,7 @@ describe("ParticipantDirectory default lease cadence (smarty-dev#11172)", () => 
     it(`a state-only reader joining between heartbeats wakes one prompt refresh through the ${backend} state commit, without a loop`, async () => {
       const { mesh, directory } = fixture("join", backend);
       if (mesh.stateBackend !== backend) return; // no node:sqlite here: nothing to prove for this backend
+      const commits = stateCommitWatch(mesh);
       // Another store instance on the same root: its own snapshot cache, its own commits (as another process).
       const other = new MeshStore(mesh.root, 64 * 1024, 1_000, { stateBackend: backend });
       let now = Date.now();
@@ -2670,18 +2701,23 @@ describe("ParticipantDirectory default lease cadence (smarty-dev#11172)", () => 
         now += 30_000;
         const joinedAt = now;
         await addStateOnlyReader(other, joinedAt);
-        // No heartbeat (60 s) and no explicit refresh: only the commit notification can carry this.
-        await vi.waitFor(() => {
-          expect(mesh.get("sessions/join", { fresh: true })!.updatedAt).toBeGreaterThanOrEqual(joinedAt);
-          expect(legacyTicks()).toBe(1);
-        }, { timeout: 5_000, interval: 20 });
-        // Our own commits notify the same watch: each is checked once and none refreshes again.
-        await new Promise((resolve) => setTimeout(resolve, 1_500));
+        commits.notify("events.jsonl"); // a non-state notification must not carry the join
+        expect(scheduled).not.toHaveBeenCalled();
+        commits.notify();
+        expect(scheduled).toHaveBeenCalledOnce();
+        await settledRefresh(scheduled.mock.results[0]!.value);
+        expect(mesh.get("sessions/join", { fresh: true })!.updatedAt).toBe(joinedAt);
+        expect(legacyTicks()).toBe(1);
+        commits.notify(); // our own publication and its duplicate must not loop
+        commits.notify();
+        await other.put({ key: "unrelated/join-control", identity: identityOf("writer"), value: true });
+        commits.notify();
         expect(scheduled).toHaveBeenCalledTimes(1);
         expect(legacyTicks()).toBe(1);
       } finally {
         clock.mockRestore();
         timeouts.mockRestore();
+        commits.restore();
         if (backend === "sqlite") other.closeState();
       }
     }, 15_000);
@@ -2689,6 +2725,7 @@ describe("ParticipantDirectory default lease cadence (smarty-dev#11172)", () => 
 
   it.each(["file", "sqlite"] as const)("does not turn unrelated %s commits into idle refreshes or compatibility timers", async backend => {
     const { mesh, directory } = fixture("no-old-reader", backend);
+    const commits = stateCommitWatch(mesh);
     const other = new MeshStore(mesh.root, 64 * 1024, 1_000, { stateBackend: backend });
     const timeouts = vi.spyOn(globalThis, "setTimeout");
     const intervals = vi.spyOn(globalThis, "setInterval");
@@ -2698,8 +2735,8 @@ describe("ParticipantDirectory default lease cadence (smarty-dev#11172)", () => 
       const scheduled = vi.spyOn(directory, "refresh");
       const tokens = vi.spyOn(mesh, "stateToken");
       await other.put({ key: "unrelated/join-control", identity: identityOf("writer"), value: { changed: true } });
-      await vi.waitFor(() => expect(tokens).toHaveBeenCalled(), { timeout: 5_000, interval: 20 });
-      await new Promise(resolve => setTimeout(resolve, 100));
+      commits.notify();
+      expect(tokens).toHaveBeenCalled();
       expect(scheduled).not.toHaveBeenCalled();
       expect(timeouts.mock.calls.filter(([, ms]) => ms === 5_000)).toHaveLength(0);
       expect(intervals.mock.calls.map(([, ms]) => ms)).toEqual([60_000]);
@@ -2707,6 +2744,7 @@ describe("ParticipantDirectory default lease cadence (smarty-dev#11172)", () => 
     } finally {
       timeouts.mockRestore();
       intervals.mockRestore();
+      commits.restore();
       if (backend === "sqlite") other.closeState();
     }
   });
@@ -2715,6 +2753,7 @@ describe("ParticipantDirectory default lease cadence (smarty-dev#11172)", () => 
   // Keep reason: transient pre-read failure + reader expiry is not cheaply reachable in a user flow.
   it.each(["file", "sqlite"] as const)("wakes exactly once for reader B after A expires and its final %s compatibility refresh fails", async backend => {
     const { mesh, directory } = fixture("expiry-join", backend);
+    const commits = stateCommitWatch(mesh);
     expect(mesh.stateBackend).toBe(backend);
     const other = new MeshStore(mesh.root, 64 * 1024, 1_000, { stateBackend: backend });
     let now = Date.now();
@@ -2726,9 +2765,11 @@ describe("ParticipantDirectory default lease cadence (smarty-dev#11172)", () => 
       await directory.start();
       const scheduled = vi.spyOn(directory, "refresh");
       now += 30_000;
-      await addStateOnlyReader(other, now); // A joins through the real state-commit watch.
-      await vi.waitFor(() => expect(legacyTicks()).toBe(1), { timeout: 5_000, interval: 20 });
+      await addStateOnlyReader(other, now);
+      commits.notify();
       expect(scheduled).toHaveBeenCalledOnce();
+      await settledRefresh(scheduled.mock.results[0]!.value);
+      expect(legacyTicks()).toBe(1);
       now += 15_001; // A's fixed lease has expired; no intervening commit clears its latch.
       const failure = new Error("final compatibility refresh failed before canonical read");
       directory.options.beforePublication = async () => { throw failure; };
@@ -2744,15 +2785,17 @@ describe("ParticipantDirectory default lease cadence (smarty-dev#11172)", () => 
       const peer = identityOf("reader-b");
       await other.put({ key: "sessions/reader-b", identity: peer, value: { id: peer.id, sessionId: "reader-b",
         cwd: "/tmp/project", startedAt: now, status: "idle" } });
-      await vi.waitFor(() => {
-        expect(mesh.get("sessions/expiry-join", { fresh: true })!.updatedAt).toBe(now);
-        expect(legacyTicks()).toBe(2);
-      }, { timeout: 2_000, interval: 20 });
+      commits.notify();
+      expect(scheduled).toHaveBeenCalledOnce();
+      await settledRefresh(scheduled.mock.results[0]!.value);
+      expect(mesh.get("sessions/expiry-join", { fresh: true })!.updatedAt).toBe(now);
+      expect(legacyTicks()).toBe(2);
+      commits.notify(); // own publication
       // B's refresh commits to the same watch; neither that own commit nor unrelated commits loop.
       const tokens = vi.spyOn(mesh, "stateToken");
       await other.put({ key: "unrelated/expiry-join-control", identity: identityOf("writer"), value: true });
-      await vi.waitFor(() => expect(tokens).toHaveBeenCalled());
-      await new Promise(resolve => setTimeout(resolve, 100));
+      commits.notify();
+      expect(tokens).toHaveBeenCalled();
       expect(scheduled).toHaveBeenCalledOnce();
       expect(legacyTicks()).toBe(2);
     } finally {
@@ -2760,12 +2803,14 @@ describe("ParticipantDirectory default lease cadence (smarty-dev#11172)", () => 
       clock.mockRestore();
       timeouts.mockRestore();
       warn.mockRestore();
+      commits.restore();
       if (backend === "sqlite") other.closeState();
     }
   });
 
   it.each(["file", "sqlite"] as const)("does not reset the join latch for successful %s refreshes without a legacy session to publish", async backend => {
     const { mesh, identity, directory } = fixture("no-legacy-put", backend);
+    const commits = stateCommitWatch(mesh);
     expect(mesh.stateBackend).toBe(backend);
     const other = new MeshStore(mesh.root, 64 * 1024, 1_000, { stateBackend: backend });
     let status = "idle";
@@ -2780,19 +2825,23 @@ describe("ParticipantDirectory default lease cadence (smarty-dev#11172)", () => 
       await directory.start();
       const scheduled = vi.spyOn(directory, "refresh");
       await addStateOnlyReader(other, Date.now());
-      await vi.waitFor(() => expect(scheduled).toHaveBeenCalledOnce());
-      await scheduled.mock.results[0]!.value;
+      commits.notify();
+      expect(scheduled).toHaveBeenCalledOnce();
+      await settledRefresh(scheduled.mock.results[0]!.value);
+      commits.notify(); // own publication
       status = "running";
       await directory.refresh(); // real own state commit, but still no legacyPut/cadence
+      commits.notify();
       const tokens = vi.spyOn(mesh, "stateToken");
       await other.put({ key: "unrelated/no-legacy-put", identity: identityOf("writer"), value: true });
-      await vi.waitFor(() => expect(tokens).toHaveBeenCalled());
-      await new Promise(resolve => setTimeout(resolve, 100));
+      commits.notify();
+      expect(tokens).toHaveBeenCalled();
       expect(scheduled).toHaveBeenCalledTimes(2); // join + explicit refresh only
       expect(mesh.get("sessions/no-legacy-put", { fresh: true })).toBeUndefined();
       expect(timeouts.mock.calls.filter(([, ms]) => ms === 5_000)).toHaveLength(0);
     } finally {
       timeouts.mockRestore();
+      commits.restore();
       if (backend === "sqlite") other.closeState();
     }
   });
@@ -2801,6 +2850,7 @@ describe("ParticipantDirectory default lease cadence (smarty-dev#11172)", () => 
   // Its post-confirmation read must carry BOTH the session renewal and compatibility deadline.
   it.each(["file", "sqlite"] as const)("keeps the join deadline when the %s commit wake joins an in-flight confirmation", async backend => {
     const { mesh, directory } = fixture("confirm-join", backend);
+    const commits = stateCommitWatch(mesh);
     const other = new MeshStore(mesh.root, 64 * 1024, 1_000, { stateBackend: backend });
     let now = Date.now();
     const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
@@ -2824,14 +2874,14 @@ describe("ParticipantDirectory default lease cadence (smarty-dev#11172)", () => 
       await confirming;
       const scheduled = vi.spyOn(directory, "refresh");
       await addStateOnlyReader(other, now);
-      await vi.waitFor(() => expect(scheduled).toHaveBeenCalledTimes(1), { timeout: 5_000, interval: 20 });
+      commits.notify();
+      expect(scheduled).toHaveBeenCalledTimes(1);
       release();
       await refreshing;
-      await vi.waitFor(() => {
-        expect(mesh.get("sessions/confirm-join", { fresh: true })!.updatedAt).toBe(now);
-        expect(legacyTicks()).toBe(1);
-      }, { timeout: 1_000, interval: 20 });
-      await new Promise(resolve => setTimeout(resolve, 100));
+      await settledRefresh(scheduled.mock.results[0]!.value);
+      expect(mesh.get("sessions/confirm-join", { fresh: true })!.updatedAt).toBe(now);
+      expect(legacyTicks()).toBe(1);
+      commits.notify(); // own publication
       expect(scheduled).toHaveBeenCalledTimes(1); // own publication does not wake another refresh
       expect(legacyTicks()).toBe(1);
     } finally {
@@ -2839,6 +2889,7 @@ describe("ParticipantDirectory default lease cadence (smarty-dev#11172)", () => 
       await refreshing;
       clock.mockRestore();
       timeouts.mockRestore();
+      commits.restore();
       if (backend === "sqlite") other.closeState();
     }
   });

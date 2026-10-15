@@ -32,6 +32,24 @@ const MAX_TRACESTATE_CHARS = 512;
 // version-traceid-parentid-flags, lowercase hex; version ff and all-zero ids are invalid.
 const TRACEPARENT = /^(?!ff)[0-9a-f]{2}-(?!0{32})[0-9a-f]{32}-(?!0{16})[0-9a-f]{16}-[0-9a-f]{2}$/;
 const TRACESTATE = /^[\x20-\x7e]+$/;
+const TRACESTATE_KEY = /^(?:[a-z][a-z0-9_*\/\-]{0,255}|[a-z0-9][a-z0-9_*\/\-]{0,240}@[a-z][a-z0-9_*\/\-]{0,13})$/;
+const TRACESTATE_VALUE = /^[\x20-\x2b\x2d-\x3c\x3e-\x7e]{0,255}[\x21-\x2b\x2d-\x3c\x3e-\x7e]$/;
+
+const validTracestate = (value: unknown): value is string => {
+  if (typeof value !== "string" || value.length > MAX_TRACESTATE_CHARS || !TRACESTATE.test(value)) return false;
+  const members = value.split(",");
+  if (members.length > 32) return false;
+  const keys = new Set<string>();
+  for (const member of members) {
+    // ASCII-space OWS only: the environment boundary still forbids tabs and all other controls.
+    const entry = member.replace(/^ +| +$/g, "");
+    const separator = entry.indexOf("=");
+    const key = entry.slice(0, separator);
+    if (separator < 0 || !TRACESTATE_KEY.test(key) || keys.has(key) || !TRACESTATE_VALUE.test(entry.slice(separator + 1))) return false;
+    keys.add(key);
+  }
+  return true;
+};
 
 /**
  * Only the two headers, in their wire grammar: a reply reaches a child's
@@ -41,9 +59,6 @@ export const readTraceContext = (value: unknown): FabricTraceContextV1 | undefin
   if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
   const { traceparent, tracestate } = value as Record<string, unknown>;
   if (typeof traceparent !== "string" || !TRACEPARENT.test(traceparent)) return undefined;
-  if (tracestate === undefined) return { traceparent };
-  if (typeof tracestate !== "string" || tracestate.length > MAX_TRACESTATE_CHARS || !TRACESTATE.test(tracestate)) {
-    return undefined;
-  }
-  return { traceparent, tracestate };
+  // Invalid vendor state must not invalidate a valid parent.
+  return validTracestate(tracestate) ? { traceparent, tracestate } : { traceparent };
 };

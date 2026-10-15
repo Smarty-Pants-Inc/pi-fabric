@@ -91,13 +91,34 @@ describe("W3C trace context values", () => {
     ["an all-zero trace id", { traceparent: `00-${"0".repeat(32)}-00f067aa0ba902b7-01` }],
     ["an all-zero parent id", { traceparent: `00-4bf92f3577b34da6a3ce929d0e0e4736-${"0".repeat(16)}-01` }],
     ["trailing content", { traceparent: `${TRACEPARENT}\nEVIL=1` }],
-    ["an empty tracestate", { traceparent: TRACEPARENT, tracestate: "" }],
-    ["a multi-line tracestate", { traceparent: TRACEPARENT, tracestate: "vendor=a\nEVIL=1" }],
-    ["a non-ASCII tracestate", { traceparent: TRACEPARENT, tracestate: "vendor=é" }],
-    ["an oversized tracestate", { traceparent: TRACEPARENT, tracestate: `vendor=${"a".repeat(512)}` }],
-    ["a non-string tracestate", { traceparent: TRACEPARENT, tracestate: 7 }],
   ])("rejects %s", (_label, value) => {
     expect(readTraceContext(value)).toBeUndefined();
+  });
+
+  it.each([
+    "not-a-list", "vendor=a,vendor=b", "vendor=a , vendor=b", "", "vendor=a,,other=b", "vendor=a,",
+    "Vendor=a", "1vendor=a", "ven.dor=a", "vendor =a", "@vendor=a", "_tenant@vendor=a",
+    "ten.ant@vendor=a", "tenant@1vendor=a", "tenant@ven.dor=a", "tenant@vendor@other=a",
+    `${"a".repeat(257)}=v`, `${"a".repeat(242)}@v=a`, `t@${"a".repeat(15)}=v`,
+    "vendor=", "vendor=   ", `vendor=${"a".repeat(257)}`, "vendor=a=b", "vendor=a,b",
+    `a=${"x".repeat(255)},b=${"y".repeat(253)}`, 7, "vendor=é",
+    Array.from({ length: 33 }, (_, i) => `v${i}=a`).join(","),
+    ...Array.from({ length: 33 }, (_, i) => `vendor=a${String.fromCharCode(i === 32 ? 127 : i)}b`),
+    "vendor=a,\tother=b", "\tvendor=a", "vendor=a\n",
+  ])("drops invalid state %j but keeps the parent and strips unknown fields", tracestate => {
+    expect(readTraceContext({ traceparent: TRACEPARENT, tracestate, PATH: "/evil", env: { EVIL: "1" } }))
+      .toEqual({ traceparent: TRACEPARENT });
+  });
+
+  it.each([
+    "vendor=a,other=b", " vendor=a  ,  other=b ", "1tenant@vendor=opaque Value!~", "a0_*/-=value",
+    `${"a".repeat(256)}=v`, `${"a".repeat(241)}@${"s".repeat(14)}=v`,
+    `vendor=${"a".repeat(256)}`, `vendor= ${"a".repeat(255)}`,
+    `a=${"x".repeat(255)},b=${"y".repeat(252)}`,
+    Array.from({ length: 32 }, (_, i) => `v${i}=a`).join(","),
+  ])("keeps valid state verbatim: %s", tracestate => {
+    expect(readTraceContext({ traceparent: TRACEPARENT, tracestate }))
+      .toEqual({ traceparent: TRACEPARENT, tracestate });
   });
 });
 
@@ -114,6 +135,18 @@ describe("child trace context event", () => {
     });
     expect(requestChildTraceContext(emit, run)).toEqual({ traceparent: TRACEPARENT, tracestate: "vendor=a" });
     expect(seen).toEqual([FABRIC_CHILD_TRACE_CONTEXT_EVENT, { version: 1, ...run, reply: expect.any(Function) }]);
+  });
+
+  it("drops bad state without throwing or aborting later synchronous replies", () => {
+    let reachedSecondReply = false;
+    const context = requestChildTraceContext((_event, value) => {
+      const request = value as FabricChildTraceContextRequestV1;
+      request.reply({ traceparent: TRACEPARENT, tracestate: "not-a-list" });
+      request.reply({ traceparent: OTHER, tracestate: "vendor=valid" });
+      reachedSecondReply = true;
+    }, run);
+    expect(reachedSecondReply).toBe(true);
+    expect(context).toEqual({ traceparent: TRACEPARENT });
   });
 
   it("returns nothing when no listener replies, and omits identifiers the launch does not have", () => {
@@ -153,6 +186,19 @@ describe("agent manager trace context", () => {
     expect(asked).toEqual([{ runId: result.id, runner: "pi", name: "Probe", parentToolCallId: "call_outer", nestedToolCallId: "fabric_nested" }]);
     expect(launches(result.id).map(args => JSON.parse(args["trace-context"]!)))
       .toEqual([{ traceparent: TRACEPARENT, tracestate: "vendor=a" }]);
+  });
+
+  it("launches with the parent after a listener replies with invalid state", async () => {
+    const { manager, launches } = createManager({
+      resolveChildTraceContext: launch => requestChildTraceContext((_event, value) => {
+        const request = value as FabricChildTraceContextRequestV1;
+        request.reply({ traceparent: TRACEPARENT, tracestate: "not-a-list" });
+        request.reply({ traceparent: OTHER, tracestate: "vendor=valid" });
+      }, launch),
+    });
+    const result = await manager.run({ task: "one", transport: "process" });
+    expect(result.status).toBe("completed");
+    expect(JSON.parse(launches(result.id)[0]!["trace-context"]!)).toEqual({ traceparent: TRACEPARENT });
   });
 
   it("passes no trace context when nobody replies", async () => {
@@ -278,11 +324,17 @@ describe("worker trace context", () => {
     "--extensions", "false", "--tools", "[]", "--granted-risks", "[]", "--transport", "process",
   ];
 
-  it("parses a valid context and refuses anything else", () => {
+  it("parses valid parents, drops bad state, and refuses invalid parents", () => {
     expect(parseWorkerOptions(base)).not.toHaveProperty("traceContext");
     expect(parseWorkerOptions([...base, "--trace-context", JSON.stringify({ traceparent: TRACEPARENT, tracestate: "vendor=a" })]).traceContext)
       .toEqual({ traceparent: TRACEPARENT, tracestate: "vendor=a" });
-    for (const forged of ["{", "{}", JSON.stringify({ traceparent: "x" }), JSON.stringify({ traceparent: TRACEPARENT, tracestate: "a\nb" })]) {
+    expect(parseWorkerOptions([...base, "--trace-context", JSON.stringify({ traceparent: TRACEPARENT, PATH: "/evil" })]).traceContext)
+      .toEqual({ traceparent: TRACEPARENT });
+    for (const tracestate of ["not-a-list", "vendor=a,vendor=b", "a\nb", "vendor=a,\tother=b", ""]) {
+      expect(parseWorkerOptions([...base, "--trace-context", JSON.stringify({ traceparent: TRACEPARENT, tracestate, EVIL: "1" })]).traceContext)
+        .toEqual({ traceparent: TRACEPARENT });
+    }
+    for (const forged of ["{", "{}", JSON.stringify({ traceparent: "x" })]) {
       expect(() => parseWorkerOptions([...base, "--trace-context", forged])).toThrow("Invalid worker trace context");
     }
   });
@@ -296,7 +348,7 @@ describe("worker trace context", () => {
     // The multiplexer or resident host that owns the worker may carry a stale context.
     vi.stubEnv("TRACEPARENT", OTHER);
     vi.stubEnv("TRACESTATE", "stale=1");
-    const contexts: (FabricTraceContextV1 | undefined)[] = [{ traceparent: TRACEPARENT }, { traceparent: TRACEPARENT, tracestate: "vendor=a" }, undefined];
+    const contexts: (FabricTraceContextV1 | undefined)[] = [{ traceparent: TRACEPARENT }, { traceparent: TRACEPARENT, tracestate: "not-a-list" }, { traceparent: TRACEPARENT, tracestate: "vendor=a" }, undefined];
     const root = tempRoot("pi-fabric-trace-worker-");
     const manager = new AgentManager(root, { ...DEFAULT_FABRIC_CONFIG.agents, timeoutMs: 20_000 }, {
       workerPath: path.resolve(worker),
@@ -307,13 +359,14 @@ describe("worker trace context", () => {
     });
     managers.push(manager);
     const reports: { traceparent: string | null; tracestate: string | null }[] = [];
-    for (let index = 0; index < 3; index++) {
+    for (let index = 0; index < 4; index++) {
       const result = await manager.run({ task: "report", runner: "pi", transport: "process", extensions: false });
       expect(result.status, result.error).toBe("completed");
       const { traceparent, tracestate } = JSON.parse(result.text) as { traceparent: string | null; tracestate: string | null };
       reports.push({ traceparent, tracestate });
     }
     expect(reports).toEqual([
+      { traceparent: TRACEPARENT, tracestate: null },
       { traceparent: TRACEPARENT, tracestate: null },
       { traceparent: TRACEPARENT, tracestate: "vendor=a" },
       { traceparent: OTHER, tracestate: "stale=1" },

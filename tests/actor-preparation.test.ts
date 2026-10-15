@@ -248,7 +248,8 @@ describe("terminal launch-preparation settlement (#9031)", () => {
     expect(failures).toHaveLength(1);
     expect(failures.filter((message) => (message.data as { attempts?: number } | undefined)?.attempts !== undefined)).toHaveLength(0);
     expect(notices).toHaveLength(0);
-    expect(actors.status(actor.id)).toMatchObject({ queued: 0, lastError: expect.stringMatching(/preparation.*timed out/i) });
+    expect(failures[0]!.error).toMatch(/preparation.*timed out/i);
+    expect(actors.status(actor.id).queued).toBe(0);
     expect(fs.readdirSync(path.dirname(actor.sessionFile!)).filter((file) => file.startsWith("queue-"))).toEqual([]);
     gate.resolve(); await pause(250);
     expect(calls).toBe(1);

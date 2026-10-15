@@ -187,9 +187,9 @@ describe("actor coalesceKey for mesh events", () => {
     expect(tasks.map((task) => task.match(/rev-[a-z]+/)![0])).toEqual(["rev-b", "rev-x"]);   // PR 1 in its first place
   }, 30_000);
 
-  // A HANG run in flight is aborted by the ownership loss and retried first when ownership returns,
-  // so PR 1's parked event cannot start, however the polls interleave (review/astra on #86: a
-  // running event rightly gets a follow-up, which made run counts racy on Windows).
+  // Ownership is lost during host-only binding preparation, before agents.run consumes the work.
+  // The parked head stays in host preparation when ownership returns, keeping PR 1 queued while
+  // its replacement arrives (review/astra on #86: running work rightly gets a follow-up).
   it("merges an event that arrives while the same PR's work is parked", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-coalesce-key-"));
     roots.push(root);
@@ -198,21 +198,32 @@ describe("actor coalesceKey for mesh events", () => {
       workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(root, "runs"),
     });
     let owned = true;
+    let stallBinding = false;
+    let refuseBinding: ((error: Error) => void) | undefined;
+    let resumeBinding: ((model: string) => void) | undefined;
+    const run = vi.spyOn(agents, "run"); // Pass through normally; only host preparation is refused.
     const actors = new ActorManager("test", identity, mesh, { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 }, agents, () => {}, {
       actorRoot: path.join(root, "actors"), persistent: true, canManageActor: () => owned,
+      resolvePiModel: (model) => {
+        if (!stallBinding) return model;
+        return new Promise<string>((resolve, reject) => { refuseBinding = reject; resumeBinding = resolve; });
+      },
     });
-    closers.push(async () => { await actors.close(); await agents.close(); });
+    closers.push(async () => { stallBinding = false; resumeBinding?.("provider/test"); await actors.close(); await agents.close(); });
     const actor = await actors.create({
-      name: "reviewer", instructions: "Review.", topics: ["github.demo.pulls"], coalesce: false, coalesceKey: "payload.number",
+      name: "reviewer", instructions: "Review.", model: "provider/test", topics: ["github.demo.pulls"], coalesce: false, coalesceKey: "payload.number",
     });
     actors.listOwned();
+    stallBinding = true;
     await mesh.publish({ topic: "github.demo.pulls", from, text: "HANG first" });
-    await waitFor(() => actors.status(actor.id).status === "running");
+    await waitFor(() => refuseBinding !== undefined);
     await pull(mesh, 1, "rev-a");
     await waitFor(() => actors.status(actor.id).queued === 1);
     owned = false;
-    actors.listOwned();                                           // rev-a parks; HANG is aborted and parked
-    await waitFor(() => actors.status(actor.id).status !== "running");
+    actors.listOwned();                                           // rev-a parks; HANG has not reached agents.run
+    refuseBinding!(new Error("host binding preparation lost ownership"));
+    await waitFor(() => !actors.status(actor.id).preparing && actors.status(actor.id).status !== "running");
+    expect(run).not.toHaveBeenCalled();
     owned = true;
     await pull(mesh, 1, "rev-b");                                 // before or after the parked work returns
     await pull(mesh, 2, "rev-x");
@@ -222,10 +233,16 @@ describe("actor coalesceKey for mesh events", () => {
       const items = file ? (JSON.parse(fs.readFileSync(path.join(dir, file), "utf8")) as { items: Array<{ payload: { text?: string; data?: { payload?: { number?: number; revision?: string } } } }> }).items : [];
       return items.map((item) => item.payload.data?.payload ?? item.payload.text);
     };
-    await waitFor(() => actors.status(actor.id).status === "running" && actors.status(actor.id).queued === 2, 20_000);
+    await waitFor(() => actors.status(actor.id).status === "preparing" && actors.status(actor.id).queued === 2, 20_000);
     await new Promise((resolve) => setTimeout(resolve, 500));
     expect(actors.status(actor.id).queued).toBe(2);
-    expect(queued().slice(1)).toEqual([{ action: "synchronize", number: 1, revision: "rev-b" }, { action: "synchronize", number: 2, revision: "rev-x" }]);
+    expect(run).not.toHaveBeenCalled();
+    // Host preparation retries rotate the head; coalescing must still retain exactly one newest payload per PR.
+    const pendingPulls = queued().filter((item) => typeof item === "object");
+    expect(pendingPulls).toHaveLength(2);
+    expect(pendingPulls).toEqual(expect.arrayContaining([{ action: "synchronize", number: 1, revision: "rev-b" }, { action: "synchronize", number: 2, revision: "rev-x" }]));
+    stallBinding = false;
+    resumeBinding!("provider/test");
   }, 40_000);
 
   it("merges a restored queue file from before the key", async () => {

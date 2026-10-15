@@ -132,7 +132,7 @@ function fixture(snapshot = true, options: {
   preparationTimeoutMs?: number;
   preparationRetryMs?: number;
   resolvePiModel?: (model: string) => string | Promise<string>;
-  seedRun?: (root: string) => void;
+  seedRun?: ((root: string) => void) | undefined;
 } = {}): Fixture {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "actor-permit-watch-"));
   options.seedRun?.(root);
@@ -649,11 +649,12 @@ describe("resident actor permit watch (#9031)", () => {
     }
   });
 
-  it.each(["direct", "enodev"] as const)("worker-written timeout metadata on %s return before onSpawned never retains/replays handoff", async mode => {
-    if (mode === "enodev" && process.platform !== "linux") return; // Linux-only legacy recovery contract.
+  it.each(["direct", "enodev", "enodev-receipt-failure"] as const)("worker-written timeout metadata on %s return before onSpawned never retains/replays handoff", async mode => {
+    const recovered = mode !== "direct";
+    if (recovered && process.platform !== "linux") return; // Linux-only legacy recovery contract.
     const runId = "a".repeat(32);
     const childId = "f".repeat(32);
-    const f = fixture(true, { seedRun: mode === "enodev" ? root => {
+    const f = fixture(true, { seedRun: recovered ? root => {
       const directory = path.join(root, "runs", runId);
       fs.mkdirSync(directory, { recursive: true });
       fs.writeFileSync(path.join(directory, "unresolved-worker.json"), JSON.stringify({ reason: ENODEV_UNRESOLVED_REASON }));
@@ -663,11 +664,14 @@ describe("resident actor permit watch (#9031)", () => {
     } : undefined });
     const actor = await f.actors.create({ name: "early-timeout-marker", instructions: "Respond", responseMode: "text", coalesce: false });
     const store = new ActorChildCompletionStore(actor.sessionFile!);
-    if (mode === "enodev") fs.writeFileSync(path.join(f.root, "runs", runId, "status.json"), JSON.stringify({
+    if (recovered) fs.writeFileSync(path.join(f.root, "runs", runId, "status.json"), JSON.stringify({
       id: runId, actorId: actor.id, name: "legacy", task: "legacy", status: "running", runner: "pi", transport: "process",
       sessionId: "999999999", cwd: process.cwd(), startedAt: Date.now(), updatedAt: Date.now(), turns: 0, toolCalls: 0,
       text: "", launchPreparationTimeoutMs: 80, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
     }));
+    // Fail only the durable delivery receipt; real recovery and worker-written metadata stay intact.
+    const receiptFailure = mode === "enodev-receipt-failure"
+      ? vi.spyOn(f.agents, "noteEnodevDelivered").mockReturnValue(false) : undefined;
     // Withhold only the observer: AgentManager.run/spawn/wait and native custody stay real.
     const spawn = f.agents.spawn.bind(f.agents);
     const spawns = vi.spyOn(f.agents, "spawn").mockImplementation((request, signal, authorize, beforeCommit, downgrade, _onSpawned, preparation, address) =>
@@ -676,12 +680,14 @@ describe("resident actor permit watch (#9031)", () => {
     let returned: Awaited<ReturnType<typeof run>> | undefined;
     const runs = vi.spyOn(f.agents, "run").mockImplementation(async (...args) => {
       // Recovery is eligible only for a restored activation's host request identity.
-      if (mode === "enodev") args[0] = { ...args[0], activationId: childId };
+      if (recovered) args[0] = { ...args[0], activationId: childId };
       const result = await run(...args);
       returned = result;
       expect(f.actors.status(actor.id).inFlightRun).toBeUndefined();
-      f.ownership.owned = false;
-      f.actors.resumeQueued();
+      if (!receiptFailure) {
+        f.ownership.owned = false;
+        f.actors.resumeQueued();
+      } // Receipt failure must reach delivery with ownership still held.
       return result;
     });
     store.enqueue({ id: childId, name: "child", status: "completed", text: "early-return handoff",
@@ -698,7 +704,21 @@ describe("resident actor permit watch (#9031)", () => {
       expect(f.actors.inFlightCount()).toBe(0);
       expect(store.handoffConsumed(childId)).toBe(true);
     });
-    if (mode === "enodev") { expect(returned).toHaveProperty("enodevRecovered", true); expect(spawns).not.toHaveBeenCalled(); }
+    if (recovered) { expect(returned).toHaveProperty("enodevRecovered", true); expect(spawns).not.toHaveBeenCalled(); }
+    if (receiptFailure) {
+      expect(f.ownership.owned).toBe(true);
+      expect(receiptFailure).toHaveBeenCalledExactlyOnceWith(runId);
+      expect(f.actors.status(actor.id).lastError).toMatch(/delivery receipt could not be written.*activation consumed without replay/i);
+      const failures = f.actors.messages(actor.id).filter(message => message.direction === "out" && message.error);
+      expect(failures).toHaveLength(1);
+      expect(failures[0]!.error).toMatch(/delivery receipt could not be written/i);
+      expect(f.deliveries).toHaveLength(0);
+    }
+    expect(f.actors.status(actor.id).queued).toBe(0);
+    const directory = path.dirname(actor.sessionFile!);
+    for (const file of fs.readdirSync(directory).filter(file => /^queue-.*\.json$/.test(file))) {
+      expect(JSON.parse(fs.readFileSync(path.join(directory, file), "utf8")).items).toEqual([]);
+    }
     expect(fs.existsSync(store.resultFile(childId))).toBe(false);
     f.ownership.owned = true;
     f.actors.reclaim(actor.id);
@@ -709,6 +729,14 @@ describe("resident actor permit watch (#9031)", () => {
     expect(runs).toHaveBeenCalledTimes(1);
     expect(f.actors.status(actor.id).queued).toBe(0);
     expect(new ActorChildCompletionStore(actor.sessionFile!).handoffConsumed(childId)).toBe(true);
+    // Also reclaim the recreated actor: neither startup nor a fresh ownership claim may replay it.
+    f.actors.reclaim(actor.id);
+    f.actors.resumeQueued();
+    await ticks();
+    expect(runs).toHaveBeenCalledTimes(1);
+    expect(f.actors.status(actor.id).queued).toBe(0);
+    expect(f.actors.inFlightCount()).toBe(0);
+    if (receiptFailure) expect(receiptFailure).toHaveBeenCalledExactlyOnceWith(runId);
     runs.mockRestore(); spawns.mockRestore();
     const answer = f.actors.ask(actor.id, "successor after early return");
     const next = await launched(f, actor.id);

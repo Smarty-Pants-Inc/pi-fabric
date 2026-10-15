@@ -533,7 +533,8 @@ describe.each(["session", "durable"] as const)("%s actor process children", (res
     expect(store.received(child.id)).toBe(true);
   });
 
-  it.each(["worker-start", "model-resolution", "error-only-turn", "validWhile-refusal", "directive-error-only-turn"])("%s before inference keeps the full handoff for exactly one consumption after restart", async (failure) => {
+  it.each(["worker-start", "model-resolution", "error-only-turn", "validWhile-refusal", "directive-error-only-turn"])("%s consumes handoff after agents.run, retaining only host-only failures across restart", async (failure) => {
+    const hostOnly = failure === "model-resolution" || failure === "validWhile-refusal";
     const h = await setup(residency, true, failure === "validWhile-refusal" ? {
       version: 1, source: `({activation,current}) => activation.source !== "child-completion" || current.latestActivationSequence > activation.sequence`,
     } : undefined, failure === "directive-error-only-turn" ? "directive" : "text");
@@ -557,9 +558,14 @@ describe.each(["session", "durable"] as const)("%s actor process children", (res
       expect(h.owner.status(h.actor.id).queued).toBe(0);
       expect(h.owner.status(h.actor.id).inFlightRun).toBeUndefined();
     }, { timeout: 5000 });
-    expect(JSON.parse(fs.readFileSync(store.resultFile(child.id), "utf8"))).toMatchObject({
-      text: "x".repeat(100000), value: { output: "x".repeat(100000) },
-    });
+    expect(store.handoffConsumed(child.id)).toBe(!hostOnly);
+    if (hostOnly) {
+      expect(JSON.parse(fs.readFileSync(store.resultFile(child.id), "utf8"))).toMatchObject({
+        text: "x".repeat(100000), value: { output: "x".repeat(100000) },
+      });
+    } else {
+      expect(fs.existsSync(store.resultFile(child.id))).toBe(false);
+    }
     await h.owner.close();
     h.resolveModel.mockImplementation(async (model) => model);
     failedRun.mockRestore();
@@ -573,9 +579,11 @@ describe.each(["session", "durable"] as const)("%s actor process children", (res
     });
     const restarted = h.makeOwner();
     cleanups.push(() => restarted.close());
-    restarted.tell(h.actor.id, "following activation may consume the unread handoff");
+    restarted.tell(h.actor.id, "following activation consumes only host-retained handoff");
     await vi.waitFor(() => expect(restarted.status(h.actor.id).status).toBe("idle"), { timeout: 5000 });
-    expect(consumed).toBe(1);
+    expect(consumed).toBe(hostOnly ? 1 : 0);
+    expect(store.handoffConsumed(child.id)).toBe(true);
+    expect(restarted.status(h.actor.id).queued).toBe(0);
     expect(restarted.messages(h.actor.id).filter((m) => m.id === child.id && m.direction === "in")).toHaveLength(1);
     expect(fs.existsSync(store.resultFile(child.id))).toBe(false);
     expect(h.rootDeliveries).not.toHaveBeenCalled();
@@ -608,7 +616,7 @@ describe.each(["session", "durable"] as const)("%s actor process children", (res
     expect(h.rootDeliveries).not.toHaveBeenCalled();
   });
 
-  it("revokes a queued activation without consuming its deferred child handoff, then consumes it once after resume", async () => {
+  it("revokes a queued activation after agents.run and consumes its deferred child handoff without context replay", async () => {
     const h = await setup(residency, true, undefined, "text", 1);
     const child = await h.spawn("LARGE_RESULT");
     const store = new ActorChildCompletionStore(h.actor.sessionFile!);
@@ -640,20 +648,19 @@ describe.each(["session", "durable"] as const)("%s actor process children", (res
     await vi.waitFor(() => expect(h.owner.inFlightCount()).toBe(0));
     await h.ownerAgents.stop(blocker.id);
     expect(launch.mock.calls.map(([request]) => request.id)).toEqual([blocker.id]);
-    expect(JSON.parse(fs.readFileSync(store.resultFile(child.id), "utf8"))).toMatchObject({
-      text: "x".repeat(100000), value: { output: "x".repeat(100000) },
-    });
-    const queueFile = path.join(path.dirname(h.actor.sessionFile!),
-      fs.readdirSync(path.dirname(h.actor.sessionFile!)).find((file) => file.startsWith("queue-"))!);
-    expect(JSON.parse(fs.readFileSync(queueFile, "utf8")).items).toEqual([
-      expect.objectContaining({ id: child.id, deferredHandoff: true }),
-    ]);
+    expect(store.handoffConsumed(child.id)).toBe(true);
+    expect(fs.existsSync(store.resultFile(child.id))).toBe(false);
+    expect(h.owner.status(h.actor.id).queued).toBe(0);
+    const directory = path.dirname(h.actor.sessionFile!);
+    for (const file of fs.readdirSync(directory).filter((file) => file.startsWith("queue-"))) {
+      expect(JSON.parse(fs.readFileSync(path.join(directory, file), "utf8")).items).toEqual([]);
+    }
     h.owner.dispatchHostEvent("input", { source: "user" });
-    await h.owner.ask(h.actor.id, "new authorized activation consumes retained context");
+    await h.owner.ask(h.actor.id, "new authorized activation must not replay consumed context");
     // ask resolves on the outgoing message, before the drain's receipt/cleanup finally.
     await vi.waitFor(() => expect(h.owner.inFlightCount()).toBe(0));
     expect(tasks).toHaveLength(2);
-    expect(tasks[1]).toContain(JSON.stringify(store.resultFile(child.id)));
+    expect(tasks[1]).not.toContain(JSON.stringify(store.resultFile(child.id)));
     expect(fs.existsSync(store.resultFile(child.id))).toBe(false);
     await h.owner.ask(h.actor.id, "following activation must not repeat context");
     await vi.waitFor(() => expect(h.owner.inFlightCount()).toBe(0));

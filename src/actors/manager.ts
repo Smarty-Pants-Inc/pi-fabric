@@ -471,7 +471,6 @@ const ACTOR_PREPARATION_MAX_RETRIES = 3;
 /** A resumed item refused by ownership this often before it ran is reported and loses its parked exemption. */
 const RESUMED_REFUSAL_CAP = 3;
 /** The pause before a recovered answer whose delivery receipt failed is tried again (smarty-dev#8935). */
-const ENODEV_RECEIPT_RETRY_MS = 5_000;
 /** Callerless preparation backoff, in multiples of the 5 s base: 5 s, 15 s, 60 s, then 5 min. */
 export const ACTOR_PREPARATION_BACKOFF = [1, 3, 12, 60] as const;
 export const FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC = "fabric.alarm.actor-activation";
@@ -4343,7 +4342,7 @@ export class ActorManager {
           // stable (actor, activation, run): the message id derives from it, and the mesh publish carries it as its
           // dedupeKey, so a replay after any crash point is one event on the topic (the store dedupes). The durable
           // receipt is written BEFORE any delivery; if it cannot be written, nothing is delivered and the activation
-          // stays pending (parked). The run settles (marker removed) only after the queue ack, below.
+          // fails visibly without replay. The run settles (marker removed) only after the queue ack, below.
           let deliveryKey: string | undefined;
           let replayed = false;
           if (enodevRecovered) {
@@ -4351,13 +4350,7 @@ export class ActorManager {
             message.id = `enodev-${createHash("sha256").update(deliveryKey).digest("hex").slice(0, 32)}`;
             try { enodevDelivered = this.agents.noteEnodevDelivered?.(result.id) ?? false; } catch { enodevDelivered = false; }
             if (!enodevDelivered) {
-              // Parked after a pause, never re-run at once: a failing disk must not spin the drain.
-              const reason = `Fabric actor ${actor.name} (${actor.id}): its recovered answer's delivery receipt could not be written`;
-              console.warn(`[pi-fabric] ${reason} (smarty-dev#8935)`);
-              await new Promise(resolve => setTimeout(resolve, ENODEV_RECEIPT_RETRY_MS));
-              this.#park(actor, [item], reason);
-              this.#scheduleRestoreParked();
-              continue;
+              throw new Error(`Fabric actor ${actor.name} (${actor.id}): its recovered answer's delivery receipt could not be written; activation consumed without replay`);
             }
             replayed = result.enodevReplay === true && this.#liveActor(actor).messages.some(known => known.id === message.id);
           }

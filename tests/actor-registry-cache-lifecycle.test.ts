@@ -9,7 +9,7 @@ import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { MeshStore } from "../src/mesh/store.js";
 
 describe("ActorManager registry-cache lifecycle (#7791)", () => {
-  it.each([true, false])("evicts on close (persistent=%s), including before temporary-root removal", async persistent => {
+  const evictsOnClose = async (persistent: boolean) => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-cache-lifecycle-"));
     const actorRoot = path.join(root, "actors");
     fs.mkdirSync(actorRoot);
@@ -61,5 +61,8 @@ describe("ActorManager registry-cache lifecycle (#7791)", () => {
       await agents.close();
       fs.rmSync(root, { recursive: true, force: true });
     }
-  });
+  };
+  it.each([true])("evicts on close (persistent=%s), including before temporary-root removal", evictsOnClose);
+  // off Linux #1031 refuses removal (accepted gap smarty-dev#11335); pi-fabric#1079 unskips
+  it.skipIf(process.platform !== "linux").each([false])("evicts on close (persistent=%s), including before temporary-root removal", evictsOnClose);
 });

@@ -1,10 +1,10 @@
-import {
-  type CompactionResult,
-  type ExtensionAPI,
-  type ExtensionContext,
-  type SessionBeforeCompactEvent,
-  type SessionBeforeTreeEvent,
-  type SessionEntry,
+import type {
+  CompactionResult,
+  ExtensionAPI,
+  ExtensionContext,
+  SessionBeforeCompactEvent,
+  SessionBeforeTreeEvent,
+  SessionEntry,
 } from "@earendil-works/pi-coding-agent";
 import { acceptCompactionCut, acceptSummaryBounds } from "../verified/policy.js";
 import { calculateContextTokens, DEFAULT_COMPACTION_SETTINGS, estimateTokens } from "../core/token-math.js";

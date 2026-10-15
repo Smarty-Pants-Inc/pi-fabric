@@ -43,6 +43,10 @@ const validatePolicy = (document: Record<string, unknown>): void => {
   const agents = object(document.agents, "agents");
   if (agents.processSlice !== undefined && (typeof agents.processSlice !== "string"
     || !/^[a-zA-Z0-9_.-]+\.slice$/.test(agents.processSlice))) throw new Error("agents.processSlice must be a slice name");
+  // smarty-dev#8257: match config and the launcher; an unusably small cap fails
+  // gated admission without executing the worker or replaying it uncapped.
+  if (agents.processMemoryMaxBytes !== undefined && (!Number.isSafeInteger(agents.processMemoryMaxBytes)
+    || (agents.processMemoryMaxBytes as number) <= 0)) throw new Error("agents.processMemoryMaxBytes must be a positive safe integer");
   const requireReason = object(agents.modelPolicy, "agents.modelPolicy").requireReason;
   for (const [name, value] of [["agents.deniedModels", agents.deniedModels], ["agents.modelPolicy.requireReason", requireReason]] as const) {
     if (value !== undefined && (!Array.isArray(value) || value.some(item => typeof item !== "string"))) {

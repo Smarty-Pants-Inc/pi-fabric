@@ -139,8 +139,8 @@ describe("bounded durable bridge event batches", () => {
     const sent = [];
     for (const text of ["one", "two", "three"]) sent.push(await far.publish({ topic: "fleet.work.batch", kind: "ask", from: remoteId, to: localId.id, text }));
     const batch = local.publishBatch.bind(local);
-    vi.spyOn(local, "publishBatch").mockImplementationOnce(input => batch(input.slice(0, 1)))
-      .mockRejectedValueOnce(Object.assign(new Error("busy"), { code: "FABRIC_MESH_LOCK_TIMEOUT" }));
+    vi.spyOn(local, "publishBatch").mockImplementationOnce(input => batch(input.slice(0, 1)));
+    vi.spyOn(local, "publish").mockRejectedValueOnce(Object.assign(new Error("busy"), { code: "FABRIC_MESH_LOCK_TIMEOUT" }));
     await expect(bridge.step()).rejects.toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT" });
     expect(JSON.parse(fs.readFileSync(cursorPath, "utf8")).toLocal.after).toBe(sent[0]!.sequence);
     expect(hub.read().map(e => e.text)).toEqual(["one"]);

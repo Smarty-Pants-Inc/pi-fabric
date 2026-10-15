@@ -36,6 +36,13 @@ Unknown projects remain untrusted unless an existing policy or trusted bootstrap
 extension grants trust. Extension-load errors fail closed; a permission guard is
 never silently omitted.
 
+With `extensions: false`, neither Pi runner loads user extension modules, even to
+resolve an extension-registered provider. Built-in and `models.json` models remain
+available. To use an extension-only provider, explicitly enable extensions and
+keep Pi's normal project-trust checks. Fabric does not inject a provider bridge
+into disabled-extension or restricted judgment workers. Unknown models fail
+before task submission without loading discovery code or selecting a fallback.
+
 ## Recovery boundaries
 
 Private per-run JSONL stores flush payloads and commit markers. An OS-held SQLite
@@ -44,6 +51,13 @@ process death releases it without timeout-based stealing or lock-file deletion.
 Reopening the same run uses its initial run ID for idempotent submission and
 resumes checkpoints. Completed work is not repeated. An interrupted unsafe tool
 fails closed, including `fabric_exec`, writes, and shell commands.
+
+A worker's store lives in its run directory under `durable/`. Recovery never
+replays streaming updates, so each provider delta and tool progress update commits
+only an ordered marker; the full partial message or partial result reaches
+observers from memory after that commit. The journal grows with the transcript,
+not with the square of each streamed message. Run retention removes `durable/`
+with its run, and unknown or linked files inside it still preserve the run.
 
 Durability **does not restore arbitrary JavaScript continuations**, promise
 general exactly-once external effects, or restart failed workers indefinitely.

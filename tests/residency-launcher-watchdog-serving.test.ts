@@ -4,6 +4,7 @@ import path from "node:path";
 import http from "node:http";
 import { pathToFileURL } from "node:url";
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { ResidentActorClient } from "../src/residency/actor-client.js";
@@ -148,7 +149,8 @@ if(process.argv.includes(${JSON.stringify(path.resolve("dist/residency/pi-entry.
       // Admit a second real launcher while custody is absent and A still owns
       // host.lock. Its native child must not reach admission until A has exited.
       expect(fs.existsSync(path.join(config.residencyRoot, "watchdog-custody.json"))).toBe(false);
-      const delayed = spawn(process.execPath, [launcherPath, "--config", configPath], { stdio: "ignore", env: {
+      const delayedLaunchToken = randomUUID();
+      const delayed = spawn(process.execPath, [launcherPath, "--config", configPath, "--launch-token", delayedLaunchToken], { stdio: "ignore", env: {
         ...process.env, ...owned.env, NODE_OPTIONS: `${owned.env.NODE_OPTIONS} --import=${pathToFileURL(delayPreload).href}`,
         PI_OFFLINE: "1", PI_CODING_AGENT_DIR: agentDir, PI_FABRIC_MESH_ROOT: meshRoot,
         PI_FABRIC_PROJECT_ROOT: root, PI_FABRIC_RUN_ROOT: path.join(root, "runs"), PI_FABRIC_AGENT_DIR: path.join(root, "exports"),
@@ -177,9 +179,9 @@ if(process.argv.includes(${JSON.stringify(path.resolve("dist/residency/pi-entry.
       expect(fs.readFileSync(path.join(config.residencyRoot, "maintenance-ready.json"), "utf8"), "delayed child must not publish readiness").toBe(readyBefore);
       expect(inferences, "delayed child must not replay acknowledged work").toBe(1);
       expect(JSON.parse(fs.readFileSync(ownerFile, "utf8")).token).toBe(owner.token);
-      const refusal = JSON.parse(fs.readFileSync(path.join(config.residencyRoot, "error.json"), "utf8"));
-      expect(refusal.error).toContain("watchdog custody");
-      expect(refusal.launcherPid).toBe(delayed.pid);
+      const refusal = JSON.parse(fs.readFileSync(path.join(config.residencyRoot, "generations", `${delayedLaunchToken}.error.json`), "utf8"));
+      expect(refusal).toMatchObject({ generation: delayedLaunchToken, error: expect.stringContaining("watchdog custody"),
+        writer: "host", pid: delayedPid });
       expect(fs.existsSync(path.join(config.residencyRoot, "watchdog-custody.json"))).toBe(true);
       const restartingClient = new ResidencyClient({ config, mesh, participants,
         mainAgent: { id: identity.id, local: true } as FabricMainAgentTarget });

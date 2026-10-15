@@ -3506,7 +3506,8 @@ describe("ActorManager", () => {
     expect(notices()).toEqual([]);
     await actors.ask(actor.id, "FAIL_DIRECTIVE");
     expect(notices()).toEqual([expect.stringContaining(`actor supervisor failed its last ${ACTOR_FAILURE_NOTICE_AFTER} activations`)]);
-    expect(notices()[0]).toContain("Structured agent output was invalid");
+    expect(notices()[0]).toContain("Failure code: unknown");
+    expect(notices()[0]).not.toContain("Structured agent output was invalid");
     expect(actors.status(actor.id).activationBlocked).toMatchObject({ code: "unknown", count: ACTOR_FAILURE_NOTICE_AFTER });
     await waitFor(() => mesh.read({ topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, limit: 20 }).length === 1);
     await actors.ask(actor.id, "FAIL_DIRECTIVE");
@@ -4529,7 +4530,8 @@ describe("ActorManager", () => {
     for (let run = 0; run < ACTOR_FAILURE_NOTICE_AFTER; run++) {
       await actors.ask(actor.id, "EMPTY_MESSAGE_DIRECTIVE").catch(() => undefined);
     }
-    expect(notices()).toEqual([expect.stringContaining("missing message text")]);
+    expect(notices()).toEqual([expect.stringContaining("Failure code: unknown")]);
+    expect(notices()[0]).not.toContain("missing message text");
     await actors.ask(actor.id, "all good");                  // a valid message still ends the streak
     for (let run = 0; run < ACTOR_FAILURE_NOTICE_AFTER; run++) {
       await actors.ask(actor.id, "EMPTY_MESSAGE_DIRECTIVE").catch(() => undefined);

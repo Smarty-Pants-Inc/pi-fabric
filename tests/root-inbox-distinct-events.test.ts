@@ -23,7 +23,7 @@ const setup = (steerGraceMs = 0, options: { maxEventBytes?: number; horizonMs?: 
   const entries: unknown[] = [];
   let now = Date.now();
   vi.spyOn(Date, "now").mockImplementation(() => now);
-  const box = () => new RootInbox(mesh, me, () => [me.id], { now: () => now, steerGraceMs, wakeCooldownMs: 0, horizonMs: options.horizonMs });
+  const box = () => new RootInbox(mesh, me, () => [me.id], { now: () => now, steerGraceMs, wakeCooldownMs: 0, ...(options.horizonMs === undefined ? {} : { horizonMs: options.horizonMs }) });
   const pi = {
     sendMessage: (message: unknown) => entries.push({ type: "custom_message", timestamp: new Date(now).toISOString(), ...(message as object) }),
   } as unknown as ExtensionAPI;

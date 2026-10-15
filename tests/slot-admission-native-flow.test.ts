@@ -10,6 +10,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AgentManager } from "../src/agents/manager.js";
 import { ActorDirectory } from "../src/actors/directory.js";
 import { ActorRegistryStore } from "../src/actors/registry-store.js";
+import { ActorMeshMonitor } from "../src/actors/mesh-monitor.js";
 import type { FabricActorRequest } from "../src/actors/types.js";
 import { SLOT_ADMISSION_PREFIX, slotAdmissionFor } from "../src/actors/slot-admission.js";
 import { initializeFreshSlotAuthority, slotPhysicalHostIdentity, slotRoutesDigest,
@@ -52,7 +53,7 @@ function openMesh(root: string): MeshStore {
   return mesh;
 }
 
-function openDirectory(mesh: MeshStore, actorRoots: ActorRoots, durable = false): ActorDirectory {
+function openDirectory(mesh: MeshStore, actorRoots: ActorRoots, durable = false, meshCursorPath?: string): ActorDirectory {
   let launches = 0;
   // A deliberately non-executing AgentManager fixture, not a mocked create or
   // registry. releasePaused keeps accepted callerless work queued for inspection.
@@ -68,14 +69,18 @@ function openDirectory(mesh: MeshStore, actorRoots: ActorRoots, durable = false)
   const nativeIdentity = durable ? { id: "resident:slot-native-flow", name: "resident", kind: "agent" as const } : identity;
   const directory = new ActorDirectory([sessionId, nativeIdentity, mesh, DEFAULT_FABRIC_CONFIG.mesh, agents, () => {}, {
     persistent: true, rootId: identity.id, claimResidency: durable ? "durable" : "session", releasePaused: true,
-    canConsumeMesh: () => false, meshRetentionSweepPath: false, reapDeadSessionPresence: false,
+    canConsumeMesh: () => meshCursorPath !== undefined,
+    ...(meshCursorPath === undefined ? {} : { meshCursorPath }),
+    meshRetentionSweepPath: false, reapDeadSessionPresence: false,
   }], actorRoots, "project");
   directories.add(directory);
   return directory;
 }
 
 async function closeDirectory(directory: ActorDirectory): Promise<void> {
-  await directory.close();
+  const closing = directory.close();
+  if (vi.isFakeTimers()) await vi.advanceTimersByTimeAsync(1);
+  await closing;
   directories.delete(directory);
 }
 
@@ -312,6 +317,83 @@ describe.runIf(process.platform === "linux")("native local slot admission user f
     expect(restarted.status(ordinary.id).queued).toBe(1);
     expect(restarted.messages(ordinary.id)).toContainEqual(expect.objectContaining({ id: ordinaryInput.messageId }));
     expect(freshMesh.listAll(SLOT_ADMISSION_PREFIX, { fresh: true })).toEqual(ledger);
+  });
+
+  // KEEP: recorded real catch, #1199 round 2 / P1-a. A durable retired OLD
+  // generation poisoned actual monitor admission for NEW on the same topic.
+  // Real SQLite/coordinator tombstones; no old projection, worker or removal.
+  it.each([false, true])("accepts a new generation's mesh input after restart with a retired tombstone (stale registry: %s)", async staleRegistry => {
+    const observed: ActorMeshMonitor[] = [];
+    const start = ActorMeshMonitor.prototype.start;
+    const observer = vi.spyOn(ActorMeshMonitor.prototype, "start").mockImplementation(function (this: ActorMeshMonitor) {
+      observed.push(this); start.call(this);
+    });
+    const flush = async () => { for (let n = 0; n < 64; n++) await Promise.resolve(); };
+    try {
+      const f = await fixture();
+      let oldId: string | undefined;
+      await expect(f.directory.create(f.request("project"), { onCommit: id => {
+        oldId = id; throw new Error("Disconnect before projection");
+      } })).rejects.toMatchObject({ code: "FABRIC_ACTOR_SLOT_CREATE_UNCERTAIN" });
+      expect(oldId).toMatch(/^[a-f0-9]{32}$/);
+      const slots = slotAdmissionFor(f.mesh);
+      const oldSpec = (await slots.recoverable(f.actorRoots.project)).find(intent => intent.actorId === oldId)!.spec;
+      await closeDirectory(f.directory);
+      // Checked native primitives only: this incarnation never projected or ran,
+      // so there is no registry/child cleanup to execute or infer from status.
+      expect(registryRows(f.actorRoots.project)).toEqual([]);
+      expect(actorDirs(f.actorRoots.project)).toEqual([]);
+      expect(launchCounts.every(count => count() === 0)).toBe(true);
+      await slots.beginRemoval(oldId!, [routes[0]!.topic], f.actorRoots.project);
+      expect(await slots.recoverable(f.actorRoots.project)).toContainEqual({ actorId: oldId, spec: oldSpec, state: "revoking" });
+      await slots.retire(oldId!, [routes[0]!.topic], f.actorRoots.project);
+      const tombstone = f.mesh.listAll(SLOT_ADMISSION_PREFIX, { fresh: true })[0]!;
+      expect(tombstone.value).toMatchObject({ sealed: true, roles: { review: { actorId: oldId, state: "retired" } } });
+      const newKey = claimKey.replace(/base$/, "r1");
+      const newClaim = await f.mesh.put({ key: newKey, identity, value: {
+        ...(f.claim.value as Record<string, unknown>), generation: "r1",
+        names: ["slot-native-r1-review-astra", "slot-native-r1-security-astra"],
+      } });
+      const creator = openDirectory(f.mesh, f.actorRoots);
+      const actor = await creator.create({ ...f.request("project"), name: "slot-native-r1-review-astra",
+        idempotencyKey: "native-flow-r1-birth", slotClaim: { key: newKey, ifVersion: newClaim.version } });
+      await closeDirectory(creator);
+      const registry = new ActorRegistryStore(f.actorRoots.project);
+      if (staleRegistry) registry.write([...registry.snapshot().actors, oldSpec], { durable: true });
+      const freshMesh = openMesh(f.mesh.root);
+      const cursorPath = path.join(f.root, "retired-cursor.json");
+      fs.writeFileSync(cursorPath, JSON.stringify({ format: 1, ...freshMesh.latestCursor() }));
+      vi.useFakeTimers(); // Ingress is enabled below; hold retention until close.
+      const restarted = openDirectory(freshMesh, f.actorRoots, false, cursorPath);
+      const primary = observed[observed.length - 2]!;
+      await restarted.recoverProtectedActors(); await flush();
+      expect(restarted.listOwned().map(row => row.id)).toEqual([actor.id]);
+      expect(slotAdmissionFor(freshMesh).isCurrent(oldId!, [routes[0]!.topic], f.actorRoots.project)).toBe(false);
+      await expect(restarted.create(f.request("project"), { beforeMaterialize: forbidMaterialization }))
+        .rejects.toMatchObject({ code: "FABRIC_ACTOR_SLOT_CLAIM_REFUSED", reason: "occupied" });
+      const ordinary = await restarted.create({ name: "ordinary-after-retirement", instructions: "Observe", topics: ["ordinary.retired"] });
+      const input = await freshMesh.publish({ topic: routes[0]!.topic, from: identity });
+      primary.schedule(); await flush(); primary.checkpointForRelease();
+      expect(Object.values(queues(f.actorRoots.project, actor.id)).join("\n"), "retired generation must not hold new generation input").toContain(input.id);
+      expect(JSON.parse(fs.readFileSync(`${cursorPath}.project`, "utf8")).last.id).toBe(input.id);
+      if (staleRegistry) {
+        // Exercise the registry reload/watch seam too, without deleting old data.
+        registry.write(registry.snapshot().actors.map(row => row.id === oldId ? { ...row, updatedAt: Date.now() + 1 } : row), { durable: true });
+        restarted.list();
+        const next = await freshMesh.publish({ topic: routes[0]!.topic, from: identity });
+        primary.schedule(); await flush(); primary.checkpointForRelease();
+        expect(Object.values(queues(f.actorRoots.project, actor.id)).join("\n")).toContain(next.id);
+        expect(JSON.parse(fs.readFileSync(`${cursorPath}.project`, "utf8")).last.id).toBe(next.id);
+      }
+      const unchanged = await freshMesh.publish({ topic: "ordinary.retired", from: identity });
+      primary.schedule(); await flush(); primary.checkpointForRelease();
+      expect(restarted.messages(ordinary.id).some(message => (message.data as { id?: string })?.id === unchanged.id)).toBe(true);
+      expect(freshMesh.get(tombstone.key, { fresh: true })).toEqual(tombstone);
+      expect(actorDirs(f.actorRoots.project)).not.toContain(oldId);
+    } finally {
+      await Promise.all([...directories].map(directory => closeDirectory(directory)));
+      observer.mockRestore(); vi.useRealTimers();
+    }
   });
 
   it("refuses a byte-copied SQLite authority through the native local create path, despite copied claim and actor IDs", async () => {

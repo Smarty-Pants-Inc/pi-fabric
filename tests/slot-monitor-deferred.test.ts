@@ -17,7 +17,7 @@ vi.mock("../src/actors/slot-admission.js", () => ({ slotAdmissionFor: () => nati
 const topic = "github.demo.pulls";
 const identity = { id: "session:alpha", name: "main", kind: "main" as const, sessionId: "alpha" };
 const from = { id: "session:peer", name: "peer", kind: "main" as const };
-type Intent = { actorId: string; state: "admitted"; registryRoot: string; spec: Record<string, unknown> };
+type Intent = { actorId: string; state: "admitted" | "revoking" | "retired"; registryRoot: string; spec: Record<string, unknown> };
 let intents: Intent[], readable: boolean, recovering: (() => Promise<void>) | undefined;
 const roots: string[] = [], directories: ActorDirectory[] = [], meshes: MeshStore[] = [], monitors: ActorMeshMonitor[] = [];
 const flush = async () => { for (let n = 0; n < 32; n++) await Promise.resolve(); };
@@ -34,7 +34,7 @@ beforeEach(() => {
   intents = []; readable = true; recovering = undefined;
   const enforced = (topics: readonly string[]) => topics.includes(topic);
   const current = (id: string, topics: readonly string[], root: string) => !enforced(topics) ||
-    (readable && intents.some(intent => intent.actorId === id && intent.registryRoot === root));
+    (readable && intents.some(intent => intent.actorId === id && intent.registryRoot === root && intent.state === "admitted"));
   native.authority = {
     requiresEnforcement: enforced, requiresRecovery: () => true,
     admit: async () => undefined, // this suite only creates ordinary actors
@@ -155,6 +155,25 @@ describe.runIf(process.platform === "linux")("protected mesh input retains its r
     readable = true; await s.directory.recoverProtectedActors(); await flush();
     expect(s.queue()).toContain(first.id); expect(s.queue()).toContain(input.id);
     expect(s.cursor().last.id).toBe(input.id); expect(s.run).not.toHaveBeenCalled();
+  });
+
+  // KEEP: #1199 P1-a counterexample. Excluding terminal tombstones must not
+  // turn an unfinished native revocation into permission to consume input.
+  it("still holds revoking input and its cursor while ordinary input remains usable", async () => {
+    const s = await fixture();
+    intents[0]!.state = "revoking";
+    await expect(s.directory.recoverProtectedActors()).rejects.toMatchObject({ code: "FABRIC_ACTOR_SLOT_RECOVERY_PARKED" });
+    const ordinary = await s.directory.create({ name: "ordinary-revoking", instructions: "Observe", topics: ["ordinary.revoking"] });
+    const prefix = await s.mesh.publish({ topic: "ordinary.revoking", from });
+    const held = await s.mesh.publish({ topic, from });
+    await s.poll(); s.primary.checkpointForRelease();
+    expect(s.cursor().last.id).toBe(prefix.id);
+    expect(s.directory.messages(ordinary.id).some(message => (message.data as MeshEvent)?.id === prefix.id)).toBe(true);
+    expect(s.primary.caughtUp()).toBe(false);
+    await s.poll(); s.primary.checkpointForRelease();
+    expect(s.cursor().last.id).toBe(prefix.id);
+    expect(fs.existsSync(path.join(s.root, "actors", s.id)), `revoking input ${held.id} must not materialize`).toBe(false);
+    expect(s.run).not.toHaveBeenCalled();
   });
 
   it("checkpoints only a consumed same-page prefix ahead of deferred protected input", async () => {

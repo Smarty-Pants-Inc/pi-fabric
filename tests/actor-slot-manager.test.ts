@@ -259,7 +259,7 @@ describe("manager protected birth/recovery seam", () => {
     expect(runner).not.toHaveBeenCalled();
   });
 
-  it("parks stale retired registry rows from construction through resume and addressed delivery", async () => {
+  it("quarantines stale retired registry rows without holding addressed input after recovery", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "actor-slot-retired-"));
     const registryRoot = path.join(root, "actors");
     const intent = seed(registryRoot, "c".repeat(32), "project", "retired");
@@ -268,12 +268,14 @@ describe("manager protected birth/recovery seam", () => {
     fs.writeFileSync(path.join(registryRoot, "actors.json"), JSON.stringify({ format: 1, actors: [intent.spec] }));
     const { directory } = open(root);
     expect(directory.listOwned()).toEqual([]);
+    expect(doubles.monitors[0]!.onEvent(event("fabric.steer", intent.actorId))).toBe("deferred");
     await directory.recoverProtectedActors();
     directory.resumeQueued();
-    // Do NOT call resumeAfterRelease in this no-worker suite: test its parked
-    // ingress contract directly without enabling unrelated native maintenance.
+    // Do NOT call resumeAfterRelease in this no-worker suite: test ingress
+    // directly without enabling unrelated native maintenance. Recovery keeps
+    // the terminal row quarantined, but it is no longer an active input hold.
     expect(directory.listOwned()).toEqual([]);
-    expect(doubles.monitors[0]!.onEvent(event("fabric.steer", intent.actorId))).toBe("deferred");
+    expect(doubles.monitors[0]!.onEvent(event("fabric.steer", intent.actorId))).not.toBe("deferred");
     expect(() => directory.tell(intent.actorId, "must not accept")).toThrow();
     expect(runner).not.toHaveBeenCalled();
   });

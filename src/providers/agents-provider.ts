@@ -1928,7 +1928,9 @@ export class AgentsProvider implements FabricProvider {
       };
       const { instructionsFile: _file, sha256: _digest, ...base } = request;
       const resolvedRequest: FabricActorRequest = { ...base, instructions: resolveActorInstructions(request, this.manager.config.instructionsRoot) };
-      const protectedCreate = slotAdmissionFor(this.actorManager.mesh).isProtected(request.topics ?? []);
+      // Native admission owns topic/authority policy. A supplied claim only
+      // makes uncertainty conservative; ordinary adapters need no slot metadata.
+      const protectedCreate = request.slotClaim !== undefined;
       let decision: { requestId: string; state: "committed"; id: string; ownerHostId: string } | undefined;
       let outcome: ResidentOutcomeUnknownError | undefined;
       let dispatched = true;
@@ -1967,13 +1969,17 @@ export class AgentsProvider implements FabricProvider {
     // Even the first actor in an empty registry must use the authoritative
     // host's capability check and request fence. A local-create/cede path can
     // publish after cancellation with neither a decision nor a known-ID receipt.
-    return this.residency
-      ? this.residency.createActor(request, signal)
-      : this.#residentActorClient().createActor(request, signal, {
-          identity: { ...this.actorManager.identity }, hostId: this.participants.self().ownerHostId,
-          ...(invocationFabricPrincipal(context) ? { principal: invocationFabricPrincipal(context) } : {}),
-          ...(this.#toolCeiling === undefined ? {} : { toolCeiling: [...this.#toolCeiling] }),
-        });
+    if (this.residency) return this.residency.createActor(request, signal);
+    const client = this.#residentActorClient();
+    // Ordinary child handoffs need no protected caller metadata. The receiving
+    // host still requires an authenticated caller for every protected topic,
+    // including a request that omitted its required claim.
+    if (request.slotClaim === undefined) return client.createActor(request, signal);
+    return client.createActor(request, signal, {
+      identity: { ...this.actorManager.identity }, hostId: this.participants.self().ownerHostId,
+      ...(invocationFabricPrincipal(context) ? { principal: invocationFabricPrincipal(context) } : {}),
+      ...(this.#toolCeiling === undefined ? {} : { toolCeiling: [...this.#toolCeiling] }),
+    });
   }
 
   #actorsWithLiveState(): FabricActorReadInfo[] {

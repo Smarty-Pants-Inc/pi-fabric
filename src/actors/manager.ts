@@ -921,6 +921,8 @@ export class ActorManager {
   readonly #slotRunIds = new Map<string, Set<string>>();
   readonly #slotLaunchUnknown = new Set<string>();
   readonly #slotParkedRows = new Map<string, Record<string, unknown>>();
+  /** Durable no-rebirth tombstones are quarantined identities, not active input holds. */
+  readonly #slotRetiredIds = new Set<string>();
 
   constructor(
     readonly sessionId: string,
@@ -1533,7 +1535,16 @@ export class ActorManager {
     // recoverable includes ledger-only births and has already synced the exact
     // observed intents. Every materializer still revalidates under registry custody.
     const intents = (await this.#slots.recoverable(this.#actorRoot)).filter(intent => this.#ownsSlotSpec(intent.spec));
+    // Learn terminal identities before any materializer loads the shared registry:
+    // stale rows must not turn durable no-rebirth tombstones into topic-wide holds.
     for (const intent of intents) {
+      if (intent.state !== "retired") continue;
+      this.#slotRetiredIds.add(intent.actorId);
+      this.#slotParkedRows.delete(intent.actorId);
+      this.#slotEnabled.delete(intent.actorId);
+    }
+    for (const intent of intents) {
+      if (this.#slotRetiredIds.has(intent.actorId)) continue;
       this.#slotParkedRows.set(intent.actorId, intent.spec);
       if (intent.state === "admitted") await this.#materializeSlot(intent.actorId, intent.spec);
       else this.#slotEnabled.delete(intent.actorId);
@@ -1545,7 +1556,7 @@ export class ActorManager {
       for (const row of this.#registry.snapshot().actors) {
         const topics = Array.isArray(row.topics) ? row.topics.filter((v): v is string => typeof v === "string") : [];
         if (!this.#slotEnforced(topics)) continue;
-        if (!this.#ownsSlotSpec(row)) { this.#slotParkedRows.delete(row.id); continue; }
+        if (!this.#ownsSlotSpec(row) || this.#slotRetiredIds.has(row.id)) { this.#slotParkedRows.delete(row.id); continue; }
         if (!this.#slotEnabled.has(row.id) || !this.#slots.isCurrent(row.id, topics, this.#actorRoot)) {
           this.#slotEnabled.delete(row.id);
           this.#slotParkedRows.set(row.id, row);
@@ -7043,6 +7054,12 @@ export class ActorManager {
         Buffer.byteLength(record.instructions, "utf8") > this.meshConfig.maxEventBytes ||
         typeof record.createdAt !== "number"
       ) {
+        continue;
+      }
+      if (this.#slotRetiredIds.has(record.id)) {
+        // Recovery authenticated this terminal ID. Keep its row/data quarantined
+        // across watcher reloads, without holding a later generation's topic.
+        this.#slotParkedRows.delete(record.id);
         continue;
       }
       const slotTopics = Array.isArray(record.topics) ? record.topics.filter((v): v is string => typeof v === "string") : [];

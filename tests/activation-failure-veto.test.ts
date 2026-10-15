@@ -26,6 +26,19 @@ describe("registry veto activation classification (smarty-dev#11998)", () => {
       .toMatchObject({ code: "registry-update-vetoed", transient: true });
   });
 
+  it.each(["ownership", "revision", "cancelled", "actor-state"] as const)("records the concrete safe reason %s without wrapper identity", registryVeto => {
+    const result = classifyActivationFailure({ lastError: "Actor private-id preparation (registry): failure", registryVeto });
+    expect(result).toMatchObject({ code: "registry-update-vetoed", transient: true,
+      reason: `actor registry validation veto (${registryVeto})` });
+    expect(result.classification).toContain(`(${registryVeto})`);
+    expect(result.reason).not.toContain("private-id");
+  });
+
+  it("does not include an untyped identity in a safe reason", () => {
+    const result = classifyActivationFailure({ lastError: veto, registryVeto: "actor:private /secret" as "ownership" });
+    expect(result.reason).toBe("actor registry validation veto (caller-validation)");
+  });
+
   it.each([
     `unrelated failure mentioning ${veto}`,
     `${veto}; something else happened`,
@@ -42,7 +55,8 @@ describe("registry veto activation classification (smarty-dev#11998)", () => {
   });
 
   it.each([
-    { lastError: "Error: 401 Unauthorized", registryVeto: true },
+    { lastError: "Error: 401 Unauthorized", registryVeto: "ownership" as const },
+    { lastError: veto, registryVeto: "revision" as const, evidence: ["security policy violation"] },
     { lastError: veto, error: `Error: 401 Unauthorized\n${veto}` },
     { lastError: veto, evidence: ["Error: 403 Forbidden"] },
     { lastError: veto, evidence: ["security policy violation"] },

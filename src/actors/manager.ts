@@ -527,7 +527,7 @@ export const ACTOR_ALARM_KINDS: readonly ActorAlarmKind[] = ["actor-activation-b
 /** Public alarm reasons are closed codes, including when an episode was restored from disk. */
 const actorAlarmReason = (reason: unknown): string => typeof reason === "string" && [
   "unknown", "context-overflow", "auth", "permission", "security-policy", "quota", "invalid-request",
-  "provider-transient", "activation-window-lost", "child-exit-before-admission", "preparation-timeout", "failing-preparation",
+  "provider-transient", "activation-window-lost", "child-exit-before-admission", "preparation-timeout", "failing-preparation", "registry-update-vetoed",
   "relaunch", "stop", "error", "worker-unverified", "run-dir-missing", "worker-gone", "worker-pid-reused",
 ].includes(reason) ? reason : "unknown";
 /** Mesh key of an actor's alarm claim for one kind; the blocked kind keeps its #7782 key. */
@@ -683,13 +683,13 @@ const restoredActivationBlock = (stored: { reason: string; code: string; since: 
           : "fail-closed: legacy overflow lacks complete matching run evidence; explicit session reset required" };
   }
   const rederive = legacyOverflow !== undefined || typeof stored.classification !== "string" || REDERIVED_BLOCK_CODES.has(stored.code);
-  const derived = legacyOverflow ?? (!rederive ? { code: stored.code, classification: stored.classification as string }
-    : (({ code, classification }) => ({ code, classification: code === stored.code && typeof stored.classification === "string"
+  const derived: { code: string; classification: string; reason?: string | undefined } = legacyOverflow ?? (!rederive ? { code: stored.code, classification: stored.classification as string }
+    : (({ code, classification, reason }) => ({ code, reason, classification: code === stored.code && typeof stored.classification === "string"
       ? stored.classification : `${classification} (re-derived from an older record's stored reason)` }))(
       classifyActivationFailure({ lastError: stored.reason, preparation: stored.code === "failing-preparation" ||
         stored.code === "preparation-timeout" })));
   const transient = TRANSIENT_ACTIVATION_BLOCK_CODES.has(derived.code);
-  return { reason: stored.reason, code: derived.code, class: activationBlockClass(derived.code), since: stored.since,
+  return { reason: derived.reason ?? stored.reason, code: derived.code, class: activationBlockClass(derived.code), since: stored.since,
     blockedAt: finitePositive(stored.blockedAt) ? stored.blockedAt : stored.since, count: stored.count,
     classification: derived.classification, ...(overflowEvidence ? { overflowEvidence } : {}),
     ...(transient && finitePositive(stored.retryAt) ? { retryAt: stored.retryAt } : {}),
@@ -715,9 +715,9 @@ export class ActorPreparationTimeoutError extends ActorPreparationError {
 
 /** Only known preparation deadlines/deferred mesh writes and registry vetoes may expire.
  * Keep the typed veto distinct: it committed nothing, but is not a timeout. */
-const preparationFailureKind = (error: unknown): true | "timeout" | "registry-veto" => {
+const preparationFailureKind = (error: unknown): true | "timeout" | ActorRegistryUpdateVetoedError => {
   for (let cause: unknown = error, depth = 0; cause instanceof Error && depth < 4; cause = cause.cause, depth++) {
-    if (cause instanceof ActorRegistryUpdateVetoedError) return "registry-veto";
+    if (cause instanceof ActorRegistryUpdateVetoedError) return cause;
     if (cause instanceof ActorPreparationTimeoutError || cause instanceof AgentLaunchPreparationTimeoutError || Boolean(isMeshWriteDeferred(cause))) return "timeout";
   }
   return true;
@@ -4795,6 +4795,7 @@ export class ActorManager {
           }
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
+          const preparationKind = preparationFailureKind(error);
           if (error instanceof AgentLaunchPreparationTimeoutError && error.launchOutcome === "unlaunched") {
             this.#slotLaunchUnknown.delete(actor.id);
           }
@@ -4861,7 +4862,7 @@ export class ActorManager {
                 Math.min(item.preparationAttempts, ACTOR_PREPARATION_BACKOFF.length) - 1]!;
               if (item.preparationAttempts > ACTOR_PREPARATION_MAX_RETRIES) {
                 this.#noteFailedActivation(actor, message, runId, false, ACTOR_FAILURE_NOTICE_AFTER,
-                  preparationFailureKind(error));
+                  preparationKind);
               }
             }
             retryDrain = true;
@@ -4882,7 +4883,7 @@ export class ActorManager {
           item.reject?.(error instanceof ActorContextOverflowError ? error : new Error(message));
           this.#noteFailedActivation(actor, message, runId, abortController.signal.aborted || runStopped,
             retryPreparation && (item.preparationAttempts ?? 0) >= ACTOR_PREPARATION_MAX_RETRIES ? ACTOR_FAILURE_NOTICE_AFTER : 0,
-            preparationFailureKind(error) === "registry-veto" ? "registry-veto" : false,
+            preparationKind instanceof ActorRegistryUpdateVetoedError ? preparationKind : false,
             error instanceof ActorContextOverflowError, runEvidence, item.overflowRetried === true);
           // A callerless event that failed here is not retried: it is dropped (smarty-dev#9332).
           if (!item.resolve && !item.reject && !abortController.signal.aborted && !runStopped) {
@@ -5043,7 +5044,7 @@ export class ActorManager {
   // Counts consecutive failed activations and, once per streak, tells the owner's Main:
   // a blind supervisor is otherwise silent for as long as it stays broken.
   #noteFailedActivation(actor: ManagedActor, error: string, runId: string | undefined, interrupted: boolean, countFloor = 0,
-    preparation: boolean | "timeout" | "registry-veto" = false, contextOverflowCode = false, evidence?: readonly string[], overflowRetried = false): void {
+    preparation: boolean | "timeout" | ActorRegistryUpdateVetoedError = false, contextOverflowCode = false, evidence?: readonly string[], overflowRetried = false): void {
     // An interrupt (ESC), a stop or a shutdown is not a failing actor, and a notice that
     // starts a turn must never cut through the stop-the-world halt.
     if (interrupted || this.#halted || this.#closing) return;
@@ -5063,7 +5064,8 @@ export class ActorManager {
     // smarty-dev#3238 round 2: context-overflow comes only from the run's typed CONTEXT_OVERFLOW code.
     // Fail closed (smarty-dev#8487): only an explicitly transient cause may expire.
     const failure = classifyManagerActivationFailure({ lastError, error, evidence,
-      preparation: preparation === true, preparationTimeout: preparation === "timeout", registryVeto: preparation === "registry-veto" },
+      preparation: preparation === true, preparationTimeout: preparation === "timeout",
+      registryVeto: preparation instanceof ActorRegistryUpdateVetoedError ? preparation.reason : false },
       contextOverflowCode && !preparation);
     const classified = contextOverflowCode && !preparation && !CONTRADICTORY_OVERFLOW_CODES.has(failure.code)
       ? { code: "context-overflow", transient: false, classification: "permanent: context window exceeded (typed CONTEXT_OVERFLOW run code)" }
@@ -5073,7 +5075,7 @@ export class ActorManager {
       ? { code: "unknown", transient: false,
         classification: `fail-closed: overflow text without the run's typed CONTEXT_OVERFLOW code (${classified.classification})` }
       : classified;
-    const reason = lastError.slice(0, 300);
+    const reason = failure.reason ?? lastError.slice(0, 300);
     const previous = actor.activationBlocked;
     const now = Date.now();
     const count = previous?.code === code ? previous.count + 1 : 1;

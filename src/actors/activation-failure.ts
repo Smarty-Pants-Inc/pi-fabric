@@ -12,11 +12,15 @@
  * worker warning is scanned for one before any transient evidence is considered, so a
  * multiline failure whose last line is a 502 but whose earlier line is a 401 stays blocked.
  */
+import type { ActorRegistryVetoReason } from "./registry-store.js";
+
 export interface ActivationFailureClass {
   code: string;
   transient: boolean;
   /** Why: "transient: …", "permanent: …" or "fail-closed: …", with the matched text. */
   classification: string;
+  /** Safe canonical diagnostic, when the cause must not expose its preparation wrapper. */
+  reason?: string;
 }
 
 /** Codes whose block expires after the bounded backoff; every other code needs a completed run.
@@ -128,12 +132,14 @@ export const classifyActivationFailure = (input: {
   /** The preparation error is a timeout by type (a preparation, launch or mesh lock deadline). */
   preparationTimeout?: boolean | undefined;
   /** The preparation cause is the store's typed veto (not an arbitrary retryable error). */
-  registryVeto?: boolean | undefined;
+  registryVeto?: boolean | ActorRegistryVetoReason | undefined;
 }): ActivationFailureClass => {
   const permanent = permanentAnywhere(input);
   if (!permanent && (input.registryVeto || REGISTRY_VETO.test(input.lastError))) {
-    return { code: "registry-update-vetoed", transient: true,
-      classification: "transient: actor registry validation veto committed nothing; retry after backoff" };
+    const reason = typeof input.registryVeto === "string" && /^(?:cancelled|revision|ownership|actor-state|caller-validation|generation|payload-generation|lock|deadline)$/.test(input.registryVeto)
+      ? input.registryVeto : "caller-validation";
+    return { code: "registry-update-vetoed", transient: true, reason: `actor registry validation veto (${reason})`,
+      classification: `transient: actor registry validation veto (${reason}) committed nothing; retry after backoff` };
   }
   if (input.preparation || input.preparationTimeout) {
     // smarty-dev#6509: a preparation that only ran out of time (its own deadline, a model/auth

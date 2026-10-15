@@ -4337,14 +4337,15 @@ describe("ActorManager", () => {
         let veto = true;
         vi.spyOn(ActorRegistryStore.prototype, "update").mockImplementation(function (this: ActorRegistryStore, select, label) {
           if (veto && label === "manager-update" && manager.status(actor.id).preparing?.phase === "registry") {
-            return Promise.reject(new ActorRegistryUpdateVetoedError());
+            return Promise.reject(new ActorRegistryUpdateVetoedError("ownership"));
           }
           return update.call(this, select, label);
         });
         await expect(manager.ask(actor.id, "activate")).rejects.toThrow("Actor registry update was vetoed");
         await waitFor(() => !manager.status(actor.id).preparing);
         const blocked = manager.status(actor.id).activationBlocked!;
-        expect(blocked).toMatchObject({ code: "registry-update-vetoed", class: "transient", backoffMs: 2_000,
+        expect(blocked).toMatchObject({ reason: "actor registry validation veto (ownership)",
+          classification: expect.stringContaining("(ownership)"), code: "registry-update-vetoed", class: "transient", backoffMs: 2_000,
           retryAt: blocked.blockedAt! + 2_000 });
         expect(runs).toHaveLength(0); // the registry did not admit a worker
         time.set(blocked.retryAt! - 1);

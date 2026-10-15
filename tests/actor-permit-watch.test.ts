@@ -112,8 +112,10 @@ beforeEach(() => {
       kind: "process", sessionId: String(pid), closed,
       stopDebt: () => worker.debt, lostContact: () => worker.contactLost ?? worker.debt,
       waitForClose: async () => {
-        if (worker.alive || worker.descendants || worker.debt) throw new Error("Native custody still open");
+        // Like the native transport, a healthy live worker owes a close join,
+        // not an immediate uncertainty failure at logical settlement.
         await closed;
+        if (worker.alive || worker.descendants || worker.debt) throw new Error("Native custody still open");
       },
       isAlive: async () => !worker.contactLost && (worker.alive || worker.descendants),
       stop: async () => {
@@ -554,7 +556,10 @@ describe("actor worker permit release (#9031)", () => {
     expect(snapshot(f).held.map(held => held.runId)).toEqual([worker.launch.id]);
     expect(snapshot(f).waiting).toHaveLength(1);
     expect(workers.size).toBe(1);
-    expect(f.actors.status(actor.id).inFlightRun?.id).toBe(worker.launch.id);
+    // Windows may publish the failed logical result before native close. The
+    // live host-owned worker still owns RUN, regardless of actor inFlight state.
+    expect(f.agents.workerIdentity(worker.launch.id)?.pid).toBe(worker.pid);
+    expect(process.kill(worker.pid, 0)).toBe(true);
   });
 
   it.each(["descendants", "native-debt"] as const)("lost-contact publication fence registers RUN before settlement and releases it once despite %s", async fault => {

@@ -328,7 +328,7 @@ export class MeshLock {
         if (!ticket.mayContend()) {
           if (Date.now() < deadline) {
             // Woken when the predecessor's receipt goes; the short poll is only a safety net.
-            await ticket.wait(Math.min(20, Math.max(0, deadline - Date.now())), this.#writeAbortSignal);
+            await ticket.wait(Math.min(20, Math.max(0, deadline - Date.now())), this.#writeAbortSignal, deadline);
             continue;
           }
           // Expiry never grants FIFO admission: only an eligible head may probe at its deadline. Keep the legacy
@@ -410,7 +410,7 @@ export class MeshLock {
           }
           // Only the FIFO head probes promptly, woken when .lock is released. After the bounded
           // admission fallback, full jitter spreads plain contenders; the deadline bounds every sleep.
-          if (ticket.queued) await ticket.wait(Math.min(10, Math.max(0, deadline - Date.now())), this.#writeAbortSignal);
+          if (ticket.queued) await ticket.wait(Math.min(10, Math.max(0, deadline - Date.now())), this.#writeAbortSignal, deadline);
           else await delay(retryDelayMs(retryAttempt++, 20, 250, deadline - Date.now()), this.#writeAbortSignal);
         }
       }

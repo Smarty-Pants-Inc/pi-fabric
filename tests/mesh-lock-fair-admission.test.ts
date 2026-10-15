@@ -48,7 +48,7 @@ const watchNotifications = (onOpen?: () => void) => {
     handles.push(handle);
     onOpen?.();
     return handle;
-  }) as typeof fs.watch);
+  }) as unknown as typeof fs.watch);
   return { handles, attempts, failNextOpen: () => { failNext = true; } };
 };
 afterEach(() => {

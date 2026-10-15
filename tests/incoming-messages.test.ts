@@ -327,3 +327,67 @@ describe("incoming Fabric display projection", () => {
     expect(normalizeFabricConfig({}).ui.incomingMessages).toBe("auto");
   });
 });
+
+describe("incoming full-carrier markdown theme (cold import, first use)", () => {
+  const sdkLoaded = vi.fn();
+  const highlight = vi.fn<(code: string, lang: string, invalidate?: () => void) => string[] | null>();
+  afterEach(() => {
+    vi.doUnmock("@earendil-works/pi-coding-agent");
+    vi.doUnmock("../src/ui/highlight.js");
+    vi.resetModules();
+  });
+  const load = async () => {
+    vi.resetModules(); sdkLoaded.mockClear(); highlight.mockReset();
+    // Pi loads this module as native ESM: any runtime SDK edge evaluates a second SDK.
+    vi.doMock("@earendil-works/pi-coding-agent", () => { sdkLoaded(); throw new Error("runtime Pi SDK import"); });
+    vi.doMock("../src/ui/highlight.js", () => ({ highlightCode: highlight }));
+    return import("../src/ui/incoming-messages.js");
+  };
+
+  it("imports and idles without the SDK or highlighter, then colors code with the host Theme on first use", async () => {
+    const { registerIncomingMessageRenderers: register } = await load();
+    const renderers = new Map<string, MessageRenderer>();
+    let start: ((event: unknown, ctx: ExtensionContext) => unknown) | undefined;
+    register({ on: (_name: string, fn: any) => { start = fn; },
+      registerMessageRenderer: (type: string, fn: MessageRenderer) => renderers.set(type, fn) } as unknown as ExtensionAPI,
+    () => "collapsed");
+    let branch: unknown[] = [];
+    start!({}, { sessionManager: { getBranch: () => branch } } as unknown as ExtensionContext);
+    const used = new Set<string>();
+    const mark = (name: string) => (text: string) => { used.add(name); return text; };
+    const hostTheme = { fg: (name: string, text: string) => mark(name)(text), bg: (name: string, text: string) => mark(name)(text),
+      bold: mark("bold"), italic: mark("italic"), underline: mark("underline"), strikethrough: mark("strikethrough") } as unknown as Theme;
+    const render = (value: CustomMessage, expanded: boolean) =>
+      renderers.get(value.customType)!(value, { expanded, outputPad: 1 }, hostTheme);
+    const code = "Intro\n\n# Incoming Heading\n\n**Bold** and `inline`\n\n```ts\nconst x = 1;\n```\nOutro";
+    // Native inbox construction dedupes within a carrier. A prior carrier is
+    // the real path that makes fullCarrier remove a repeat while retaining code.
+    branch = [entry(inbox([event("repeated", "already delivered", {})]))];
+    const value = inbox([event("repeated", "REPEATED_COPY", {}), event("work", code, {})]);
+    // Idle: collapsed previews and native fallbacks never touch the highlighter.
+    expect(render(value, false)!.render(120)).toHaveLength(1);
+    expect(render(inbox([event("plain", "no code here", {})]), true)).toBeUndefined();
+    expect(sdkLoaded).not.toHaveBeenCalled();
+    expect(highlight).not.toHaveBeenCalled();
+
+    // First use: the not-yet-ready highlighter falls back to the host Theme's code-block color.
+    highlight.mockReturnValue(null);
+    const box = render(value, true)!;
+    const cold = box.render(120).map(plain).join("\n");
+    expect(cold).toContain("Incoming Heading");
+    expect(cold).toContain("const x = 1;");
+    expect(cold).not.toContain("REPEATED_COPY");
+    expect(highlight).toHaveBeenCalled();
+    expect(highlight.mock.calls[0]!.slice(0, 2)).toEqual(["const x = 1;", "ts"]);
+    expect([...used]).toEqual(expect.arrayContaining(["customMessageBg", "customMessageLabel", "customMessageText",
+      "mdHeading", "mdCode", "mdCodeBlock", "mdCodeBlockBorder", "bold"]));
+
+    // Ready: the highlighter's invalidate drops cached lines; the next render shows syntax colors.
+    const colored = "\x1b[38;2;1;2;3mconst x = 1;\x1b[39m";
+    highlight.mockReturnValue([colored]);
+    expect(box.render(120).join("\n")).not.toContain(colored); // Cached until invalidated.
+    highlight.mock.calls[0]![2]!();
+    expect(box.render(120).join("\n")).toContain(colored);
+    expect(sdkLoaded).not.toHaveBeenCalled();
+  });
+});

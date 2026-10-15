@@ -38,6 +38,27 @@ function writeStatus(text) {
   }
 }
 
+// Opt-in boot gate: arm the watcher before announcing entry so a test can
+// hold transport launch apart from the worker's very first status publication.
+const bootGateMatch = task.match(/"fakeWorkerBootGate":\s*("(?:\\.|[^"\\])*")/);
+if (bootGateMatch) {
+  const release = JSON.parse(bootGateMatch[1]);
+  await new Promise((resolve, reject) => {
+    const watcher = fs.watch(path.dirname(release), () => {
+      if (fs.existsSync(release)) finish();
+    });
+    const timeout = setTimeout(() => finish(new Error("Fake worker boot gate timed out")), 10_000);
+    function finish(error) {
+      clearTimeout(timeout);
+      watcher.close();
+      if (error) reject(error); else resolve();
+    }
+    watcher.on("error", finish);
+    fs.writeFileSync(`${release}.entered`, "ready");
+    if (fs.existsSync(release)) finish();
+  });
+}
+
 if (task.includes("HANG_WITH_PROGRESS")) {
   // A run that has done work (so an abort detaches it) and never finishes on its own:
   // only a stop or a kill ends it (smarty-dev#1113).

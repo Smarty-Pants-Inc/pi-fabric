@@ -58,6 +58,21 @@ const fixture = async () => {
   } };
 };
 
+const operatorCleanupUnknownOnThisPlatform = () => process.platform === "darwin" || process.platform === "win32";
+const expectPendingOperatorRemoval = (f: Awaited<ReturnType<typeof fixture>>, actorId: string, response: unknown) => {
+  const guidance = "the actor tree is kept: stop the Main, or let a host start finish it";
+  expect(response).toMatchObject({ ok: true, action: "remove", cleaned: false, pending: expect.stringContaining(guidance) });
+  expect(JSON.stringify(response)).toContain("smarty-dev#7956");
+  expect(new ActorRegistryStore(f.config.actorRoot).records().some(actor => actor.id === actorId)).toBe(false);
+  expect(fs.existsSync(path.join(f.config.actorRoot, actorId))).toBe(true);
+  expect(fs.existsSync(path.join(f.config.actorRoot, `removal-${actorId}.json`))).toBe(true);
+  expect(f.host.actors.cleanupObligation(actorId)).toMatchObject({ id: actorId, status: "stopped",
+    removal: { state: expect.stringContaining(guidance) } });
+  expect(f.host.actors.pendingRemovals()).toContainEqual(expect.objectContaining({
+    id: actorId, state: expect.stringContaining(guidance),
+  }));
+};
+
 // These are native-platform tests: no /proc census, platform mocks or skips.
 describe("same-user resident actor operator", () => {
   it("confirmed CLI stops/drains only one actor then removes its registry and participant while the other keeps running", async () => {
@@ -85,7 +100,8 @@ describe("same-user resident actor operator", () => {
       f.deadMain();
       const removed = await f.cli("remove", victim.id, f.confirm);
       expect(removed).toMatchObject({ code: 0, err: "" });
-      await waitFor(() => !new ActorRegistryStore(f.config.actorRoot).records().some(actor => actor.id === victim.id));
+      if (operatorCleanupUnknownOnThisPlatform()) expectPendingOperatorRemoval(f, victim.id, JSON.parse(removed.out));
+      else await waitFor(() => !new ActorRegistryStore(f.config.actorRoot).records().some(actor => actor.id === victim.id));
       await f.host.participants.refresh();
       expect(f.host.participants.get(victim.id, Date.now(), { fresh: true })).toBeUndefined();
       expect(f.host.participants.get(survivor.id, Date.now(), { fresh: true })).toBeDefined();
@@ -105,11 +121,19 @@ describe("same-user resident actor operator", () => {
       const runPid = Number(f.host.agents.status(runId).sessionId);
 
       f.deadMain();
-      expect(await f.cli("remove", victim.name, f.confirm)).toMatchObject({ code: 0, err: "" });
-      await f.host.actors.removalSettled(victim.id);
-      await f.host.participants.refresh();
-      expect(new ActorRegistryStore(f.config.actorRoot).records().some(actor => actor.id === victim.id)).toBe(false);
-      expect(f.host.participants.get(victim.id, Date.now(), { fresh: true })).toBeUndefined();
+      if (operatorCleanupUnknownOnThisPlatform()) {
+        const removed = await f.cli("remove", victim.name, f.confirm);
+        expect(removed).toMatchObject({ code: 0, err: "" });
+        expectPendingOperatorRemoval(f, victim.id, JSON.parse(removed.out));
+        await f.host.participants.refresh();
+        expect(f.host.participants.get(victim.id, Date.now(), { fresh: true })).toBeUndefined();
+      } else {
+        expect(await f.cli("remove", victim.name, f.confirm)).toMatchObject({ code: 0, err: "" });
+        await f.host.actors.removalSettled(victim.id);
+        await f.host.participants.refresh();
+        expect(new ActorRegistryStore(f.config.actorRoot).records().some(actor => actor.id === victim.id)).toBe(false);
+        expect(f.host.participants.get(victim.id, Date.now(), { fresh: true })).toBeUndefined();
+      }
       expect(residentProcessAlive(runPid)).toBe(false);
       expect(f.host.actors.status(survivor.id).status).toBe("running");
     } finally { await f.close(); }
@@ -209,10 +233,12 @@ describe("same-user resident actor operator", () => {
           "--resident", selector, "--actor", target.name, ...f.confirm], {
           cwd, env: { ...process.env, PI_FABRIC_MESH_ROOT: f.config.meshRoot },
         });
+        const response = JSON.parse(result.stdout);
         expect(JSON.parse(result.stdout)).toMatchObject({ ok: true, action, resident: f.config.residencyRoot });
         expect(other.host.actors.status(wrongRoot.id).status).toMatch(/^(idle|dormant)$/);
         expect(new ActorRegistryStore(other.config.actorRoot).records().some(row => row.id === wrongRoot.id)).toBe(true);
         if (action === "stop") expect(f.host.actors.status(target.id).status).toBe("stopped");
+        else if (operatorCleanupUnknownOnThisPlatform()) expectPendingOperatorRemoval(f, target.id, response);
         else expect(new ActorRegistryStore(f.config.actorRoot).records().some(row => row.id === target.id)).toBe(false);
       }
       const ambiguous = path.join(f.config.meshRoot, "residency", selector + "0");
@@ -247,9 +273,15 @@ describe("same-user resident actor operator", () => {
       }
       expect(await f.cli(action, actor.id, ["--dry-run", "--confirm-dead-root", "session:wrong"]))
         .toMatchObject({ code: 1, err: expect.stringContaining("Mismatched --confirm-dead-root") });
-      expect(await f.cli(action, actor.name, f.confirm)).toMatchObject({ code: 0, err: "" });
-      if (action === "stop") expect(f.host.actors.status(actor.id).status).toBe("stopped");
-      else expect(new ActorRegistryStore(f.config.actorRoot).records().some(row => row.id === actor.id)).toBe(false);
+      if (action === "remove" && operatorCleanupUnknownOnThisPlatform()) {
+        const removed = await f.cli(action, actor.name, f.confirm);
+        expect(removed).toMatchObject({ code: 0, err: "" });
+        expectPendingOperatorRemoval(f, actor.id, JSON.parse(removed.out));
+      } else {
+        expect(await f.cli(action, actor.name, f.confirm)).toMatchObject({ code: 0, err: "" });
+        if (action === "stop") expect(f.host.actors.status(actor.id).status).toBe("stopped");
+        else expect(new ActorRegistryStore(f.config.actorRoot).records().some(row => row.id === actor.id)).toBe(false);
+      }
     } finally { await f.close(); }
   }, 30_000);
 
@@ -325,7 +357,8 @@ describe("same-user resident actor operator", () => {
       expect(JSON.parse(dry.stdout).operatorEvidence).toMatchObject({ rootId: f.config.rootId, mainSessionId: f.config.sessionId, lastLeaseTime: null });
       f.deadMain();
       const result = await run(process.execPath, [...argv("remove", actor.name), ...f.confirm]);
-      expect(JSON.parse(result.stdout)).toMatchObject({ ok: true, action: "remove", resident: f.config.residencyRoot });
+      if (operatorCleanupUnknownOnThisPlatform()) expectPendingOperatorRemoval(f, actor.id, JSON.parse(result.stdout));
+      else expect(JSON.parse(result.stdout)).toMatchObject({ ok: true, action: "remove", resident: f.config.residencyRoot });
       await f.host.participants.refresh();
       expect(f.host.participants.get(actor.id, Date.now(), { fresh: true })).toBeUndefined();
       await expect(run(process.execPath, [...argv("stop", "unknown-id"), ...f.confirm])).rejects.toMatchObject({ code: 1, stderr: expect.stringContaining("Unknown Fabric actor") });

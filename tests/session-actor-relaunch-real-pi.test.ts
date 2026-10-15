@@ -122,11 +122,11 @@ it.runIf(process.env.FABRIC_9241_REAL_PI === "1")("a same-session relaunch resta
     expect(persisted.sessionOrphan).toBeUndefined();
     // An explicitly stopped actor stays stopped; its owning Main removes it.
     await expect(exec("A", `return await agents.tell({ id: ${JSON.stringify(stopped.id)}, message: "TELL-9241-STOPPED" });`)).rejects.toThrow();
-    if (process.platform === "linux") {
+    if (process.platform === "linux" || process.platform === "darwin" || process.platform === "win32") {
       expect(await exec("A", `return await agents.remove({ id: ${JSON.stringify(stopped.id)} });`)).toMatchObject({ removed: true });
       expect((await actors("A")).map(actor => actor.id)).not.toContain(stopped.id);
     } else {
-      // smarty-dev#11335: without a Main publication fence, removal is accepted but keeps the actor tree pending.
+      // smarty-dev#11335: only unsupported platforms lack the Main publication fence and keep removal pending.
       const stoppedDir = path.join(mesh, "actors", sessions.A, stopped.id);
       fs.mkdirSync(stoppedDir, { recursive: true });
       const sentinel = path.join(stoppedDir, "kept-11335.txt");

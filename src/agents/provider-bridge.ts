@@ -1,5 +1,6 @@
 import path from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { loadHostSdk } from "../core/host-sdk.js";
 
 /** Legacy explicit bridge target. Workers no longer set or inject it. */
 export const PROVIDER_BRIDGE_MODEL_ENV = "PI_FABRIC_EXTENSION_MODEL";
@@ -42,7 +43,7 @@ export async function resolveExtensionProviders(
 ): Promise<undefined> {
   const key = parseModelKey(options.model);
   if (!key) return undefined;
-  const pi = sdk ?? await import("@earendil-works/pi-coding-agent");
+  const pi = sdk ?? await loadHostSdk();
   const models = await pi.ModelRuntime.create({
     authPath: path.join(options.agentDir, "auth.json"),
     modelsPath: path.join(options.agentDir, "models.json"),
@@ -59,6 +60,6 @@ export async function resolveExtensionProviders(
 export default async function fabricProviderBridge(_pi: ExtensionAPI): Promise<void> {
   const model = process.env[PROVIDER_BRIDGE_MODEL_ENV]?.trim();
   if (!model) return;
-  const { getAgentDir } = await import("@earendil-works/pi-coding-agent");
-  await resolveExtensionProviders({ model, cwd: process.cwd(), agentDir: getAgentDir() });
+  const sdk = await loadHostSdk();
+  await resolveExtensionProviders({ model, cwd: process.cwd(), agentDir: sdk.getAgentDir() }, sdk);
 }

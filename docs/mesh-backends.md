@@ -40,6 +40,14 @@ protocol violation: the projector fails closed.
 files) and a non-loopback monitoring URL `https://`; plaintext refuses before connecting
 (`FABRIC_MESH_STATE_NATS_INSECURE`). Loopback (127.0.0.0/8, ::1, localhost) may be plaintext.
 - **Streams:** one per mesh root, `FABRIC_MESH_` plus 32 hex characters of the SHA-256 of the root's realpath.
+- **Replica placement:** an open or migration uses its explicit `replicas`, else the agent-layer
+`mesh.nats.replicas`. It never silently lowers that value. JetStream `err_code: 10005` (no suitable peers for
+placement, such as an offline peer) retries within `placementTimeoutMs`, default **30 000 ms**: enough for a normal
+peer restart and metadata election, the same scale as cluster readiness. One budget from the first create covers
+placement retries, backoff, subsequent pending requests and post-create leader readiness. Exhaustion throws
+`MeshStateNatsUnavailableError` (`FABRIC_MESH_STATE_NATS_UNAVAILABLE`, `reason: "placement-unavailable"`,
+`natsErrCode: 10005`), with the original sanitized cause. Other API/configuration/permission errors do not gain retries;
+the existing bounded transport-election/lost-ack handling is unchanged. Restore the peers, then retry the operation.
 - **A lost ack:** the CAS stored the batch, if at all, at exactly its base sequence plus 1. After a retry fails the
 CAS, the backend reads that one message and compares the batch id, so the batch is never run twice. If a purge
 removed that message meanwhile, the outcome is unknown (`FABRIC_MESH_STATE_NATS_OUTCOME_UNKNOWN`), never a rerun.

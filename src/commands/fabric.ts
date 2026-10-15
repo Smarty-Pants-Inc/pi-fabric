@@ -1,4 +1,4 @@
-import { type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { AutocompleteItem } from "@earendil-works/pi-tui";
 import type { CapturedToolCatalog } from "../capture/catalog.js";
 import type { FabricActorHostEvent } from "../actors/types.js";
@@ -911,21 +911,20 @@ export function registerFabricCommand(pi: ExtensionAPI, deps: FabricCommandDeps)
         return;
       }
       if (command === "import") {
-        const key = argumentsList[0];
-        if (!key) {
-          context.ui.notify("Usage: /fabric import <global-actor-name-or-id> [as <new-name>]", "warning");
-          return;
-        }
         try {
+          // Keep optional import parsing off the idle registration graph.
+          const { parseSlotImport, SLOT_IMPORT_USAGE } = await import("./slot-import.js");
+          const { key, as, ...materialization } = parseSlotImport(argumentsList);
+          if (!key) {
+            context.ui.notify(SLOT_IMPORT_USAGE, "warning");
+            return;
+          }
           const def = state.globalActors.resolve(key);
           if (!def) {
             context.ui.notify(`Unknown global actor: ${key}`, "error");
             return;
           }
-          const asIndex = argumentsList.indexOf("as");
-          const as =
-            asIndex >= 0 && argumentsList[asIndex + 1] ? argumentsList[asIndex + 1] : undefined;
-          const actor = await state.actors.create(state.globalActors.toRequest(def, as));
+          const actor = await state.actors.create({ ...state.globalActors.toRequest(def, as), ...materialization });
           context.ui.notify(`Imported global actor "${def.name}" as ${actor.name}`, "info");
         } catch (error) {
           context.ui.notify(error instanceof Error ? error.message : String(error), "error");

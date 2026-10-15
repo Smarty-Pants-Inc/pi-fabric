@@ -16,8 +16,12 @@
  * existing reclaimVerdict: our own namespace and a host-local root, pinned and rechecked right before the rename.
  * Machine and boot alone are not enough: a live holder in another PID namespace on this host shares both. That
  * recovery alone decides death (ESRCH or another incarnation); under protocol 3 a record without a namespace stays
- * unproven, the receipt never upgrades it. Only then is the dead holder's own ticket (same pid and owner token)
- * renamed out of the ticket namespace, never deleted. `custody.lock` is left to the fence's own recovery.
+ * unproven, the receipt never upgrades it. Inside that recovery, after its sole proof but BEFORE its native canonical
+ * rename, the dead holder's own ticket (same pid and owner token) is renamed out of the ticket namespace, never
+ * deleted. A SIGKILL after that rename leaves no stranded ticket; before it, the canonical owner remains to reprove.
+ * Ticket retirement must succeed (or the queue be absent) before detaching the owner; an interrupted partial retirement
+ * is idempotent on rerun. No second death proof, dead-lock resume scan, or general census weakening is introduced.
+ * Live/foreign holders and unproven legacy records still refuse. `custody.lock` is left to the fence's own recovery.
  *
  * Everything else does nothing and the gate decides as before: no, torn or unrecognized receipt, another root, host,
  * boot or PID namespace (or an unknown one), a non-local root, other owner bytes, a live holder (the gate then refuses
@@ -135,20 +139,22 @@ export const recoverKilledImportLock = async (root: string, lockProtocol: 1 | 2 
     // record without a namespace line is judged with the receipt's namespace by the same reclaimVerdict (our own PID
     // namespace AND a host-local root, pinned and rechecked before the rename); protocol 3 still refuses such records.
     const lock = new MeshLock(identity.root, { lockProtocol, lockTimeoutMs: RECOVERY_BUDGET_MS }, () => undefined);
-    if (!await lock.clearStaleLock(path.join(lock.lockPath, "owner"), Date.now() + RECOVERY_BUDGET_MS, {},
-      { owner: receipt.mesh, namespace: receipt.namespace })) return undefined;
-    // A `.lock` holder keeps its FIFO receipt through its section, so the killed holder left one: named by its pid and
-    // the owner's unique token, proven dead (or reused) by the recovery above; no other proof is taken. The census
-    // would report it as unknown. It is renamed, never deleted, inside its own queue directory to a name no ticket
-    // listing matches (TICKET is anchored); the same directory, so never EXDEV. Any failure leaves it to the gate.
     const token = receipt.mesh.split("\n")[0]!;
     const tickets: string[] = [];
-    try {
-      const queue = meshLockQueueDirectory(identity.root);
-      for (const name of fs.readdirSync(queue).filter(item => TICKET.test(item) && item.endsWith(`-${receipt.pid}-${token}`))) {
-        try { fs.renameSync(path.join(queue, name), path.join(queue, `${name}.recovered`)); tickets.push(name); } catch { /* left */ }
-      }
-    } catch { /* no queue, or unreadable: the census reports what is left */ }
+    if (!await lock.clearStaleLock(path.join(lock.lockPath, "owner"), Date.now() + RECOVERY_BUDGET_MS, {},
+      { owner: receipt.mesh, namespace: receipt.namespace, beforeRename: () => {
+        // Only the exact dead holder's pid+token, under the recovery's existing proof. Rename, never delete, in the
+        // same queue (no EXDEV), to names outside the anchored ticket grammar. Already retired names are ignored.
+        // Fail closed on any error except an absent queue: do not lose the canonical owner needed for a rerun.
+        const queue = meshLockQueueDirectory(identity.root);
+        let names: string[];
+        try { names = fs.readdirSync(queue); }
+        catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return; throw error; }
+        for (const name of names.filter(item => TICKET.test(item) && item.endsWith(`-${receipt.pid}-${token}`))) {
+          fs.renameSync(path.join(queue, name), path.join(queue, `${name}.recovered`));
+          tickets.push(name);
+        }
+      } })) return undefined;
     return `recovered the mesh .lock of killed import pid ${receipt.pid} (token ${token}, ${IMPORT_FENCE_RECEIPT}`
       + `${tickets.length > 0 ? `; ticket ${tickets.join(",")} retired` : ""}); custody.lock is left to the fence's own recovery`;
   } catch {

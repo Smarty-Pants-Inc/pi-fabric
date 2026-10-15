@@ -464,8 +464,11 @@ export class MeshLock {
   // rmdir: a late owner fails it closed); torn receipts and nonempty unrecorded directories stay. smarty-dev#9569: pid
   // evidence only for OUR PID namespace (foreign/unprovable: `note`). smarty-dev#9501: `expected` = exact owner bytes
   // after the read; a namespace-less record takes its receipt's namespace: same proof and root pin, never protocol 3.
+  // `beforeRename` is synchronous, restartable retirement of that exact owner's dependent receipt, not another death
+  // proof. It runs only AFTER the sole death/namespace/root proof and BEFORE detaching the canonical owner. A throw
+  // keeps that owner available to reprove on rerun; a kill after the native rename cannot strand its FIFO ticket.
   async clearStaleLock(ownerPath: string, deadline: number, note: StaleLockNote = {},
-    expected?: { owner: string; namespace: string }): Promise<boolean> {
+    expected?: { owner: string; namespace: string; beforeRename?: () => void }): Promise<boolean> {
     delete note.verdict; delete note.namespace; delete note.token; // describes the CURRENT holder only
     let pin: { unchanged(): boolean; close(): void } | undefined;
     try {
@@ -551,6 +554,13 @@ export class MeshLock {
       if (!unchanged()) return false;
       // pi-fabric#923 round 5: the root checked as host-local must still be the root this path names, right now.
       if (pin && !pin.unchanged()) { note.verdict = "unproven"; note.namespace = ns ?? ""; note.token = token!; return false; }
+      expected?.beforeRename?.();
+      // The callback may have stalled at a native syscall: recheck the exact owner, directory and host-local root
+      // immediately before detaching. This is the same proof's identity fence, never a second death decision.
+      if (expected?.beforeRename) {
+        if (!unchanged()) return false;
+        if (pin && !pin.unchanged()) { note.verdict = "unproven"; note.namespace = ns ?? ""; note.token = token!; return false; }
+      }
       const fence = `${this.#lockPath}.dead.${createHash("sha256").update(`${stat.dev}:${stat.ino}:${owner}`).digest("hex")}`;
       // ponytail: retain this tiny nonempty directory permanently. A paused old cleaner
       // cannot rename a successor over the same fence (native EEXIST/ENOTEMPTY). Deleting

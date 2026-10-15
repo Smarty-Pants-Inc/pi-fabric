@@ -57,6 +57,42 @@ const killedImport = (root: string): Promise<{ pid: number; signal: NodeJS.Signa
   child.once("close", (_code, signal) => resolve({ pid: child.pid!, signal, stderr }));
 });
 
+// P2 data-safety regression: fault only at the real fs.renameSync boundary, never stub the stale proof or gate.
+// Children keep NODE_OPTIONS and the unchanged deletion guard; the captured rename delegates to that guard/native fs.
+const RECOVERY_CHILD = `
+import fs from "node:fs";
+import path from "node:path";
+import { createJiti } from "jiti";
+import { pathToFileURL } from "node:url";
+if (!process[Symbol.for("pi-fabric.test-deletion-guard")]) throw new Error("recovery child lost deletion guard");
+const [root, boundary] = process.argv.slice(-2);
+const rename = fs.renameSync;
+fs.renameSync = function(from, to) {
+  const canonical = String(from) === path.join(root, ".lock") && String(to).startsWith(path.join(root, ".lock.dead."));
+  const ticket = String(to) === String(from) + ".recovered";
+  if ((canonical && boundary !== "before-ticket") || (ticket && boundary === "before-ticket")) {
+    if (boundary === "after-lock") rename.call(fs, from, to);
+    process.kill(process.pid, "SIGKILL");
+    for (;;) { /* no continuation after the fault */ }
+  }
+  return rename.call(fs, from, to);
+};
+const jiti = createJiti(pathToFileURL(process.cwd() + "/index.js").href);
+const cli = await jiti.import("./src/mesh/mesh-backend-cli.ts");
+process.exitCode = await cli.main(["import", "--root", root], {
+  gateCensus: cli.meshWriterCensusSync(root), builtinReaders: [], procScan: { listPids: () => [] },
+});
+`;
+const killedRecovery = (root: string, boundary: string): Promise<{ signal: NodeJS.Signals | null; stderr: string }> => new Promise((resolve, reject) => {
+  const child = spawn(process.execPath, ["--input-type=module", "-e", RECOVERY_CHILD, root, boundary], {
+    cwd: process.cwd(), stdio: ["ignore", "ignore", "pipe"], timeout: 30_000,
+  });
+  let stderr = "";
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
+  child.once("error", reject);
+  child.once("close", (_code, signal) => resolve({ signal, stderr }));
+});
+
 /** A pid that ran and exited (ESRCH now). */
 const deadPid = (): Promise<number> => new Promise((resolve, reject) => {
   const child = spawn(process.execPath, ["-e", ""], { stdio: "ignore" });
@@ -155,6 +191,35 @@ describe.skipIf(!linuxIdentity)("smarty-dev#9501 killed import fence receipt", (
     expect(fs.existsSync(path.join(clean, "custody.lock"))).toBe(false);
   }, 60_000);
 
+  it.each(["before-ticket", "before-lock", "after-lock"])("recovery killed at %s native rename boundary reruns through the real CLI gate", async boundary => {
+    const root = await fileRoot();
+    const pid = await deadPid();
+    const { mesh, custody } = await forge(root, pid);
+    const { own, other } = placeTickets(root, pid);
+    const queue = meshLockQueueDirectory(root);
+    // Isolate the exact owner's ticket; unrelated active tickets still refuse (covered by the preceding test).
+    fs.renameSync(path.join(queue, other), path.join(queue, `${other}.test-retired`));
+    const killed = await killedRecovery(root, boundary);
+    expect(killed.signal, killed.stderr).toBe("SIGKILL");
+    expect(lockOwner(root)).toBe(boundary === "after-lock" ? undefined : mesh);
+    expect(lockOwner(root, "custody.lock")).toBe(custody);
+    expect(deadFences(root)).toHaveLength(boundary === "after-lock" ? 1 : 0);
+    // RED on the old head at after-lock: its canonical owner is gone but this ticket remains fabric@unknown.
+    // Earlier interruption either retains the ticket AND canonical proof, or has already retired the ticket.
+    const activeAtKill = fs.existsSync(path.join(queue, own));
+    const retiredAtKill = fs.existsSync(path.join(queue, `${own}.recovered`));
+    const rerun = await cli(["import", "--root", root]);
+    expect(rerun.code, rerun.err).toBe(0);
+    expect(rerun.err).not.toContain("fabric@unknown");
+    expect(activeAtKill).toBe(boundary === "before-ticket");
+    expect(retiredAtKill).toBe(boundary !== "before-ticket");
+    expect((await meshBackendStatus(root)).backend).toBe("sqlite");
+    expect(queueNames(root)).toEqual([`${other}.test-retired`, `${own}.recovered`].sort());
+    expect(deadFences(root)).toHaveLength(1);
+    expect(lockOwner(root)).toBeUndefined();
+    expect(lockOwner(root, "custody.lock")).toBeUndefined();
+  }, 60_000);
+
   it("legacy residue without a receipt stays fabric@unknown (compatibility limit)", async () => {
     const root = await fileRoot();
     await forge(root, await deadPid());
@@ -167,15 +232,20 @@ describe.skipIf(!linuxIdentity)("smarty-dev#9501 killed import fence receipt", (
     expect(deadFences(root)).toEqual([]);
   }, 30_000);
 
-  it("a live import-owned holder is never touched; the gate refuses it as fabric@unknown without waiting", async () => {
+  it.each(["local", "foreign"])("a live import-owned holder is never touched; the gate refuses it as fabric@unknown without waiting (%s namespace)", async context => {
     const root = await fileRoot();
-    const { mesh } = await forge(root, process.ppid);
+    const namespace = (await ownPidNamespace())!;
+    const { mesh } = await forge(root, process.ppid, context === "foreign"
+      ? { namespace: namespace.replace(/:(\d+)$/, (_m, n: string) => `:${Number(n) + 1}`) } : {});
+    placeTickets(root, process.ppid);
+    const queued = queueNames(root);
     expect(await recoverKilledImportLock(root)).toBeUndefined();
     const started = Date.now();
     const rerun = await cli(["import", "--root", root]);
     expect(rerun.code).toBe(3);
     expect(rerun.err).toContain("fabric@unknown");
     expect(Date.now() - started).toBeLessThan(20_000);
+    expect(queueNames(root)).toEqual(queued);
     expect(lockOwner(root)).toBe(mesh);
     expect(deadFences(root)).toEqual([]);
   }, 30_000);
@@ -228,6 +298,15 @@ describe.skipIf(!linuxIdentity)("smarty-dev#9501 killed import fence receipt", (
     expect(lockOwner(root)).toBe(mesh);
     expect(deadFences(root)).toEqual([]);
     expect(queueNames(root)).toEqual(queued);
+    // Exercise the real gate too: foreign receipt context and unproven protocol-3 legacy records must still refuse,
+    // with the canonical owner and every FIFO ticket intact; no accept-unready or census weakening.
+    const rerun = await cli(["import", "--root", root, "--lock-protocol", String(protocol ?? 1)]);
+    expect(rerun.code, rerun.err).toBe(3);
+    expect(rerun.err).toContain("fabric@unknown");
+    expect(lockOwner(root)).toBe(mesh);
+    expect(queueNames(root)).toEqual(queued);
+    expect(deadFences(root)).toEqual([]);
+    expect(fs.existsSync(path.join(root, "state.db"))).toBe(false);
   });
 
   it("a torn receipt does nothing", async () => {

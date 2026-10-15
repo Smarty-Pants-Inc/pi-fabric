@@ -204,6 +204,57 @@ describe("dead-letter replay age and current activation filter (#10630)", () => 
     }
   });
 
+  it("appends only the fitting stale suffix without rotating existing archive history", async () => {
+    const w = await backlog();
+    const staleAt = Date.now() - DEFAULT_DEAD_LETTER_REPLAY_MAX_AGE_MS - 60_000;
+    const oversized: Entry = {
+      ...w.entries[0]!, at: staleAt,
+      event: { ...w.entries[0]!.event, id: "oversized-stale", text: "x".repeat(ACTOR_DEAD_LETTER_ARCHIVE_MAX_BYTES) },
+    };
+    const suffixEntry: Entry = {
+      ...w.entries[1]!, at: staleAt,
+      event: { ...w.entries[1]!.event, id: "fitting-stale-suffix", text: "suffix" },
+    };
+    const stale = [oversized, suffixEntry];
+    const lineBytes = (entry: Entry) => Buffer.byteLength(JSON.stringify(entry)) + 1;
+    const totalBytes = stale.reduce((total, entry) => total + lineBytes(entry), 0);
+    let suffixBytes = 0;
+    let suffixStart = stale.length;
+    for (let index = stale.length - 1; index >= 0; index--) {
+      const size = lineBytes(stale[index]!);
+      if (suffixBytes + size > ACTOR_DEAD_LETTER_ARCHIVE_MAX_BYTES) break;
+      suffixBytes += size;
+      suffixStart = index;
+    }
+    const prefix = stale.slice(0, suffixStart);
+    const suffix = stale.slice(suffixStart);
+    const history: Entry = { ...w.entries[2]!, event: { ...w.entries[2]!.event, id: "existing-history", text: "history" } };
+    const backup: Entry = { ...w.entries[3]!, event: { ...w.entries[3]!.event, id: "existing-backup", text: "backup" } };
+    const historyText = `${JSON.stringify(history)}\n`;
+    const backupText = `${JSON.stringify(backup)}\n`;
+    const headroom = ACTOR_DEAD_LETTER_ARCHIVE_MAX_BYTES - suffixBytes;
+    expect(totalBytes).toBeGreaterThan(ACTOR_DEAD_LETTER_ARCHIVE_MAX_BYTES);
+    expect(prefix).toEqual([oversized]);
+    expect(suffix).toEqual([suffixEntry]);
+    expect(lineBytes(history)).toBeLessThanOrEqual(headroom);
+    expect(lineBytes(history) + suffixBytes).toBeLessThanOrEqual(ACTOR_DEAD_LETTER_ARCHIVE_MAX_BYTES);
+    fs.writeFileSync(w.archive, historyText);
+    fs.writeFileSync(`${w.archive}.1`, backupText);
+    fs.writeFileSync(w.file, stale.map(entry => JSON.stringify(entry) + "\n").join(""));
+    const manager = w.open();
+    const configured = manager.setActivationFilter(w.actor.id, null);
+    const receipt = receipts(manager, w.actor.id).at(-1);
+    const notices = manager.messages(w.actor.id).filter(message =>
+      (message.data as { reason?: unknown } | undefined)?.reason === "dead_letter_archive");
+    await manager.close();
+    await configured;
+    expect(readLines<Entry>(w.file)).toEqual(prefix);
+    expect(fs.readFileSync(w.archive, "utf8")).toBe(historyText + suffix.map(entry => `${JSON.stringify(entry)}\n`).join(""));
+    expect(fs.readFileSync(`${w.archive}.1`, "utf8")).toBe(backupText);
+    expect(notices).toEqual([]);
+    expect(receipt).toEqual({ replayed: 0, archivedStale: suffix.length, filterSkipped: 0, remaining: prefix.length });
+  });
+
   it.each([false, true])("retains a single oversized stale entry without rotating or claiming stale progress (live work: %s)", async mixedLive => {
     const w = await backlog();
     const oversized: Entry = { ...w.entries[0]!, event: { ...w.entries[0]!.event, text: "x".repeat(ACTOR_DEAD_LETTER_ARCHIVE_MAX_BYTES) } };
@@ -312,6 +363,72 @@ describe("dead-letter replay age and current activation filter (#10630)", () => 
       reason: "filtered: noise", data: { filteredItemId: w.entries[8]!.event.id },
     }));
     expect(receipts(manager, w.actor.id)).toEqual([{ replayed: 4, archivedStale: 3, filterSkipped: 1, remaining: 0 }]);
+  });
+
+  it.each([
+    { ordering: "filtered entry is older", filteredSequence: 10, replayableSequence: 20 },
+    { ordering: "filtered entry is newer", filteredSequence: 20, replayableSequence: 10 },
+  ])("keeps same-key replayable work when a live entry is skipped ($ordering)", async ({ filteredSequence, replayableSequence }) => {
+    const w = await backlog({ coalesceKey: "payload.number" });
+    const now = Date.now();
+    const filtered: Entry = {
+      ...w.entries[0]!, at: now,
+      event: { ...w.entries[0]!.event, id: `filtered-${filteredSequence}`, kind: "noise", sequence: filteredSequence,
+        data: { payload: { number: 77 } } },
+    };
+    const replayable: Entry = {
+      ...w.entries[1]!, at: now,
+      event: { ...w.entries[1]!.event, id: `replayable-${replayableSequence}`, kind: "work", sequence: replayableSequence,
+        data: { payload: { number: 77 } } },
+    };
+    // Both entries are live and share a coalesce key. The filter is skip-only: it must
+    // acknowledge the matching entry without letting it erase the other entry.
+    fs.writeFileSync(w.file, [filtered, replayable].map(entry => JSON.stringify(entry) + "\n").join(""));
+    const manager = w.open();
+    await manager.setActivationFilter(w.actor.id, [{ id: "noise", kind: ["noise"] }]);
+    await waitFor(() => receipts(manager, w.actor.id).length === 1);
+    expect(w.queued()).toEqual([replayable.event.id]);
+    expect(readLines<Entry>(w.file)).toEqual([]);
+    expect(manager.messages(w.actor.id)).toContainEqual(expect.objectContaining({
+      reason: "filtered: noise", data: { filteredItemId: filtered.event.id },
+    }));
+    expect(receipts(manager, w.actor.id)).toEqual([{ replayed: 1, archivedStale: 0, filterSkipped: 1, remaining: 0 }]);
+  });
+
+  it("retains eligible same-key work untouched beyond replay capacity while skipping newer noise", async () => {
+    const w = await backlog({ coalesceKey: "payload.number" }, 1);
+    const entries = w.entries.slice(6, 9).map((entry, index) => ({
+      ...entry,
+      event: { ...entry.event, sequence: index + 1, kind: index === 2 ? "noise" : "work",
+        data: { payload: { number: index === 0 ? 11 : 77 } } },
+    }));
+    fs.writeFileSync(w.file, entries.map(entry => `${JSON.stringify(entry)}\n`).join(""));
+    const manager = w.open();
+    const configured = manager.setActivationFilter(w.actor.id, [{ id: "noise", kind: ["noise"] }]);
+    const replayReceipts = receipts(manager, w.actor.id);
+    await manager.close();
+    await configured;
+    expect(w.queued()).toEqual([entries[0]!.event.id]);
+    expect(readLines<Entry>(w.file)).toEqual([entries[1]!]);
+    expect(manager.messages(w.actor.id)).toContainEqual(expect.objectContaining({
+      reason: "filtered: noise", data: { filteredItemId: entries[2]!.event.id },
+    }));
+    expect(replayReceipts).toEqual([{ replayed: 1, archivedStale: 0, filterSkipped: 1, remaining: 1 }]);
+  });
+
+  it("removes and receipts every raw entry when a same-key live batch is entirely filtered", async () => {
+    const w = await backlog({ coalesceKey: "payload.number" });
+    const entries = w.entries.slice(6, 8).map(entry => ({
+      ...entry, event: { ...entry.event, kind: "noise", data: { payload: { number: 77 } } },
+    }));
+    fs.writeFileSync(w.file, entries.map(entry => `${JSON.stringify(entry)}\n`).join(""));
+    const manager = w.open();
+    await manager.setActivationFilter(w.actor.id, [{ id: "noise", kind: ["noise"] }]);
+    await waitFor(() => receipts(manager, w.actor.id).length === 1);
+    expect(w.queued()).toEqual([]);
+    expect(readLines<Entry>(w.file)).toEqual([]);
+    expect(manager.status(w.actor.id).filterSkipped.count).toBe(2);
+    expect(receipts(manager, w.actor.id)).toEqual([{ replayed: 0, archivedStale: 0, filterSkipped: 2, remaining: 0 }]);
   });
 
   it("an expired current filter does not skip a fresh dead letter", async () => {

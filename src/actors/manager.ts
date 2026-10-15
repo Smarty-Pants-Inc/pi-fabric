@@ -5999,7 +5999,7 @@ export class ActorManager {
     // existing history or claim progress while all of this stale input stays pending.
     if (start === lines.length) return { rotated: false, dropped: 0, archived: 0 };
     const current = readTail(archive);
-    const incomingBytes = lines.reduce((total, line) => total + lineBytes(line), 0);
+    const incomingBytes = bytes;
     const rotate = current.dropped > 0 || (current.data.length > 0 && current.data.length + incomingBytes > ACTOR_DEAD_LETTER_ARCHIVE_MAX_BYTES);
     let dropped = current.dropped;
     if (rotate) {
@@ -6102,13 +6102,29 @@ export class ActorManager {
         }
       } catch { return; } // Never rewrite until the archive is durable. A crash may duplicate, not lose.
     }
-    const entries = this.#coalesceDeadLetters(actor, liveEntries);
+    // Check every raw live entry before coalescing: a skipped newer event must not
+    // replace eligible work, even when it lies beyond this batch's replay capacity.
+    const eligibleLive: ActorDeadLetter[] = [];
+    let filterSkipped = 0;
+    try {
+      for (const entry of liveEntries) {
+        const ruleId = this.#filteredBy(actor, { source: entry.source, payload: entry.event });
+        if (!ruleId) { eligibleLive.push(entry); continue; }
+        // Retain outcomes already carried by a previously coalesced dead letter.
+        if (entry.supersededSends?.length) {
+          for (const send of entry.supersededSends) this.#recordDeliveryOutcome(actor.id, send, "superseded", "replaced by a newer message for the same key before delivery");
+          if (!this.#persistQueue(actor.id, true)) throw new ActorQueueCheckpointError(actor);
+        }
+        this.#recordFiltered(actor, { id: entry.event.id, source: entry.source, payload: entry.event }, ruleId);
+        filterSkipped++;
+      }
+    } catch { return; } // Keep the backlog if a carried outcome cannot be checkpointed.
+    const entries = this.#coalesceDeadLetters(actor, eligibleLive);
     const inFlight = this.#inFlight.get(actor.id);
     const held = new Set([...(inFlight ? [inFlight] : []), ...actor.queue]
       .map((item) => (item.payload as { id?: unknown } | undefined)?.id));
     let taken = 0;
     let added = 0;
-    let filterSkipped = 0;
     try {
       while (taken < entries.length && actor.queue.length < limit) {
         const entry = entries[taken]!;
@@ -6116,11 +6132,7 @@ export class ActorManager {
           for (const send of entry.supersededSends) this.#recordDeliveryOutcome(actor.id, send, "superseded", "replaced by a newer message for the same key before delivery");
           if (!this.#persistQueue(actor.id, true)) throw new ActorQueueCheckpointError(actor);
         }
-        const ruleId = this.#filteredBy(actor, { source: entry.source, payload: entry.event });
-        if (ruleId) {
-          this.#recordFiltered(actor, { id: entry.event.id, source: entry.source, payload: entry.event }, ruleId);
-          filterSkipped++;
-        } else if (!held.has(entry.event.id)) {
+        if (!held.has(entry.event.id)) {
           held.add(entry.event.id);
           if (this.#hasProcessedKey(actor, entry.source, entry.event)) {
             if (!this.#persistQueue(actor.id, true)) throw new ActorQueueCheckpointError(actor);
@@ -6132,7 +6144,7 @@ export class ActorManager {
         taken++;
       }
     } catch { /* a queue checkpoint failure keeps this entry and the rest for the next drain */ }
-    if (taken === 0 && archivedStale === 0) return;
+    if (taken === 0 && archivedStale === 0 && filterSkipped === 0) return;
     // A single rewrite per batch, under the same actor ownership fence as queue replay.
     if (added === 0 || this.#persistQueue(actor.id, true)) {
       try {

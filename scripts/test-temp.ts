@@ -91,6 +91,12 @@ const protectFreshWindowsRunDirectory = (directory: string): void => {
   }
 };
 
+/** Protect a freshly-created test fixture root before any test work uses it. */
+export function protectFreshTestDirectory(directory: string): string {
+  if (process.platform === "win32") protectFreshWindowsRunDirectory(directory);
+  return directory;
+}
+
 /** True only for a run directory this helper's mkdtemp could have made: a direct, pattern-named child of a
  * `<prefix>job` root, a real directory (not a link), and on POSIX owned by this uid with mode 0700. Windows has no
  * meaningful uid or mode bits; there the name and type checks stand alone. There is no vitest globalSetup creation

@@ -10,6 +10,7 @@ import { checkpointFlagRaised, lowerCheckpointFlag, ownerToken, raiseCheckpointF
   from "../src/mesh/state-sqlite.js";
 import { MeshStore, type MeshIdentity, type MeshStoreOptions } from "../src/mesh/store.js";
 import { processStartTime } from "../src/residency/process-identity.js";
+import { protectFreshTestDirectory } from "../scripts/test-temp.js";
 
 // smarty-dev#6477 P0 (sqlite soak): wal_autocheckpoint=0 and no production checkpointer let the hub's WAL grow
 // to 48 MB, and a raw "database is locked" (SQLITE_BUSY) escaped as fatal and stopped a mesh-bridge on restart.
@@ -24,7 +25,7 @@ const sqlite: SqliteStateStore[] = [];
 const databases: Database[] = [];
 
 const tempRoot = (label: string): string => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), `pi-fabric-sqmaint-${label}-`));
+  const root = protectFreshTestDirectory(fs.mkdtempSync(path.join(os.tmpdir(), `pi-fabric-sqmaint-${label}-`)));
   roots.push(root);
   return root;
 };
@@ -381,7 +382,7 @@ describe.skipIf(process.platform === "win32")("an existing state.db must be priv
 });
 
 describe("the WAL-reset try-lock (pi-fabric#691 review P2)", () => {
-  const lockRoot = () => { const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-wal-lock-")); roots.push(root); return root; };
+  const lockRoot = () => { const root = protectFreshTestDirectory(fs.mkdtempSync(path.join(os.tmpdir(), "fabric-wal-lock-"))); roots.push(root); return root; };
   const age = (file: string, ms: number) => { const at = new Date(Date.now() - ms); fs.utimesSync(file, at, at); };
 
   it("reclaims an ownerless stale lock and refuses a fresh one", () => {

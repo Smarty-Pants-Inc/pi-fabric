@@ -9,6 +9,7 @@ import { MeshStateBusyError } from "../src/mesh/state-backend.js";
 import { MeshStore } from "../src/mesh/store.js";
 import { closeNatsStateBackend } from "../src/mesh/state-backend-nats.js";
 import { itFor, natsMonitorUrl, natsServerUrl, prepareNatsRoot, reportNatsSkip } from "./helpers/nats-state-server.js";
+import { protectFreshTestDirectory } from "../scripts/test-temp.js";
 
 // Four processes write one sqlite-backed (or, on a real nats-server, one NATS-backed: smarty-dev#7504) mesh root
 // concurrently (smarty-dev#6477 L2a). Each child
@@ -74,7 +75,7 @@ afterEach(() => { for (const root of roots.splice(0)) fs.rmSync(root, { recursiv
 describe.each(["sqlite", "nats"] as const)("%s state backend across processes", (kind) => {
   if (kind === "nats") reportNatsSkip();
   itFor(kind)("four writers commit every update and none takes the mesh .lock", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-state-backend-mp-"));
+    const root = protectFreshTestDirectory(fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-state-backend-mp-")));
     roots.push(root);
     // sqlite mode opens only an imported root (smarty-dev#6477): the harness imports the fresh root first.
     // nats: every process prepares the root; its stream is derived from the fresh root (pi-fabric#937).
@@ -137,7 +138,7 @@ const firstOpenIdentity = { id: "first-open", name: "first-open", kind: "agent" 
 describe("sqlite state backend first open under a foreign BEGIN IMMEDIATE", () => {
   const budgetMs = 50;
   it.each(["wal", "delete"] as const)("a bounded try returns the timeout within its budget (holder journal %s)", async (mode) => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-state-backend-first-open-"));
+    const root = protectFreshTestDirectory(fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-state-backend-first-open-")));
     roots.push(root);
     const release = await holdState(root, mode);
     const store = new MeshStore(root, 64 * 1024, 1_000, { stateBackend: "sqlite", lockTimeoutMs: 5_000 });

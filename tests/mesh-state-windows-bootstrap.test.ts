@@ -1,8 +1,10 @@
 import { randomUUID } from "node:crypto";
+import childProcess from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { protectFreshTestDirectory } from "../scripts/test-temp.js";
 
 // Decision C MOCKED source-ordering probe for #13549, NOT Windows ACL proof.
 // Keep reason: data-safety trust boundary before census publication / StateFile sweep.
@@ -74,6 +76,48 @@ const fixture = async (kind: "file" | "sqlite" | "shadow", fallback = false, rej
 const cases = [
   ["sqlite", false], ["shadow", false], ["sqlite", true], ["shadow", true],
 ] as const;
+
+// Decision C MOCKED helper routing only: the existing setter/readback script is reused, never executed here.
+// Native ACL correctness belongs to hosted Windows, not this recorded subprocess call.
+describe("fresh Windows fixture protection routing", () => {
+  const platform = (value: NodeJS.Platform) => {
+    const previous = Object.getOwnPropertyDescriptor(process, "platform")!;
+    const root = process.env.SystemRoot;
+    Object.defineProperty(process, "platform", { ...previous, value });
+    process.env.SystemRoot = "C:\\Windows";
+    restoreFixture = () => {
+      Object.defineProperty(process, "platform", previous);
+      if (root === undefined) delete process.env.SystemRoot; else process.env.SystemRoot = root;
+    };
+  };
+  it("GAP13612-F1: protects a fresh Windows fixture before work starts, through the pinned setter", () => {
+    platform("win32");
+    const order: string[] = [];
+    const run = vi.spyOn(childProcess, "execFileSync").mockImplementation(() => { order.push("acl"); return ""; });
+    const root = String.raw`D:\fixture\fresh-root`;
+    expect(protectFreshTestDirectory(root)).toBe(root);
+    order.push("work");
+    expect(order).toEqual(["acl", "work"]);
+    expect(run).toHaveBeenCalledOnce();
+    expect(run.mock.calls[0]?.[0]).toBe(String.raw`C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe`);
+    expect(run.mock.calls[0]?.[2]).toMatchObject({ env: { PI_FABRIC_TEST_TEMP_DIRECTORY: root }, timeout: 15_000 });
+  });
+  it("GAP13612-F2: a fixture setter failure refuses before work", () => {
+    platform("win32");
+    const run = vi.spyOn(childProcess, "execFileSync").mockImplementation(() => { throw new Error("recorded setter failure"); });
+    const work = vi.fn();
+    expect(() => { protectFreshTestDirectory(String.raw`D:\fixture\fresh-root`); work(); })
+      .toThrow(/Windows test temp directory ACL protection failed before marker export/);
+    expect(run).toHaveBeenCalledOnce();
+    expect(work).not.toHaveBeenCalled();
+  });
+  it("GAP13612-F3: non-Windows fixture creation stays child-free", () => {
+    platform("linux");
+    const run = vi.spyOn(childProcess, "execFileSync").mockImplementation(() => "");
+    expect(protectFreshTestDirectory("/recorded/fresh-root")).toBe("/recorded/fresh-root");
+    expect(run).not.toHaveBeenCalled();
+  });
+});
 
 describe("Decision C MOCKED #13549 bootstrap source ordering (not Windows ACL proof)", () => {
   it.each(cases)("GAP13549-U1: MeshStore %s fallback=%s refuses before factory/sweep/mutation", async (kind, fallback) => {

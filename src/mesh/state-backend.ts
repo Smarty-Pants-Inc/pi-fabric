@@ -479,7 +479,8 @@ export const createStateBackend = (context: MeshStoreContext, options: CreateSta
   const factory = STATE_BACKEND_FACTORIES[kind];
   const refusal = factory.unavailable?.(context);
   // Admit before any factory/StateFile sweep, then MeshStore's census and RuntimeState's custody writes.
-  // Preserve the documented non-local SQLite -> file fallback: it still needs the identical privacy proof,
+  // ponytail: preserve the documented non-local SQLite -> file fallback, not a new stricter refusal.
+  // It still needs the identical privacy proof,
   // but the fallback is not a SQLite open and must not acquire SQLite's local-filesystem requirement.
   if (process.platform === "win32" && (kind === "sqlite" || kind === "shadow")) {
     prepareStateRootForBootstrap(context.root, refusal ? { sqliteLocality: "skip-for-file-fallback" } : {});

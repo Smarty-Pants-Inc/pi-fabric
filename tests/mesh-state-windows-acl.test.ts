@@ -1,7 +1,11 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { CapturedToolCatalog } from "../src/capture/catalog.js";
+import { normalizeFabricConfig } from "../src/config.js";
+import { FabricRuntimeState } from "../src/fabric-runtime-state.js";
 import { openPrivateStateDb } from "../src/mesh/state-gate.js";
 import { openNodeSqlite, raiseCheckpointFlag, SqliteStateStore } from "../src/mesh/state-sqlite.js";
 import { aclOwner, icaclsGrant, icaclsShow, readAcl, setOwner, tokenSids } from "./helpers/windows-acl.js";
@@ -119,6 +123,95 @@ describe.runIf(process.env.GITHUB_ACTIONS === "true" && process.platform === "wi
     // A new root below the profile opens too.
     await roundTrip(await openAsync(path.join(profileDir(), "new-root")));
     expect(readAcl(profile).sddl).toBe(before);
+  }, 120_000);
+
+  it("uses the production default mesh root for SQLite below a hosted USERPROFILE project", async () => {
+    const projectRoot = profileDir();
+    const expectedRoot = path.join(projectRoot, ".pi", "fabric", "mesh");
+    const envKeys = ["PI_FABRIC_MESH_ROOT", "PI_FABRIC_PROJECT_ROOT", "PI_FABRIC_MESH_STATE_BACKEND", "PI_CODING_AGENT_DIR"] as const;
+    const previousEnv = new Map(envKeys.map(key => [key, process.env[key]] as const));
+    const restoreEnv = (): void => {
+      for (const [key, value] of previousEnv) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    };
+    let runtime: FabricRuntimeState | undefined;
+    let resolvedPath: string | undefined;
+    let outcome = "not started";
+    let failure: string | undefined;
+    const aclChain = (root: string) => {
+      const entries: { path: string; exists: boolean; acl?: ReturnType<typeof readAcl>; error?: string }[] = [];
+      let current = path.resolve(root);
+      for (;;) {
+        const exists = fs.existsSync(current);
+        if (!exists) entries.push({ path: current, exists });
+        else {
+          try { entries.push({ path: current, exists, acl: readAcl(current) }); }
+          catch (error) { entries.push({ path: current, exists, error: error instanceof Error ? error.message : String(error) }); }
+        }
+        const parent = path.dirname(current);
+        if (parent === current) break;
+        current = parent;
+      }
+      return entries;
+    };
+
+    try {
+      delete process.env.PI_FABRIC_MESH_ROOT;
+      delete process.env.PI_FABRIC_PROJECT_ROOT;
+      process.env.PI_FABRIC_MESH_STATE_BACKEND = "sqlite";
+      process.env.PI_CODING_AGENT_DIR = path.join(projectRoot, ".pi", "coding-agent");
+      const config = normalizeFabricConfig({
+        mesh: { enabled: true, stateBackend: "sqlite" },
+        mcp: { enabled: false, cache: { enabled: false } },
+        agents: { enabled: false }, residency: { enabled: false },
+        prewalk: { enabled: false, alwaysRearm: false },
+      });
+      expect(config.mesh.root).toBeUndefined();
+      const pi = { events: { emit: vi.fn() }, getThinkingLevel: () => "off", sendMessage: vi.fn() } as unknown as ExtensionAPI;
+      const context = {
+        cwd: projectRoot, hasUI: false, isProjectTrusted: () => true, isIdle: () => true, hasPendingMessages: () => false,
+        modelRegistry: { find: vi.fn(), getApiKeyAndHeaders: vi.fn() },
+        sessionManager: { getSessionId: () => "mesh-default-root-acl", getSessionFile: () => undefined, getBranch: () => [], getLeafId: () => undefined },
+        ui: { setStatus: vi.fn(), notify: vi.fn() },
+      } as unknown as ExtensionContext;
+      const unused = path.join(projectRoot, "unused.mjs");
+      fs.writeFileSync(unused, "export default {}; ");
+      runtime = new FabricRuntimeState(pi, new CapturedToolCatalog(), { paths: { extension: unused, worker: unused, residentHost: unused, skills: projectRoot } });
+      await runtime.initialize(context, config);
+      const mesh = runtime.mesh;
+      resolvedPath = mesh.root;
+      expect(path.resolve(mesh.root)).toBe(path.resolve(expectedRoot));
+      expect(mesh.stateBackend).toBe("sqlite");
+      await mesh.put({ key: "acl/default-root-probe", value: "sqlite-default-root", identity: { id: "mesh-default-root-acl", name: "probe", kind: "agent" } });
+      expect(mesh.get("acl/default-root-probe")?.value).toBe("sqlite-default-root");
+      outcome = "passed";
+    } catch (error) {
+      outcome = "failed";
+      failure = error instanceof Error ? error.message : String(error);
+      throw error;
+    } finally {
+      let actualPath = resolvedPath;
+      if (!actualPath && runtime) {
+        try { actualPath = runtime.mesh.root; } catch { /* initialization may have failed before mesh construction */ }
+      }
+      const rootsToReport = [...new Set([actualPath ?? expectedRoot, expectedRoot])];
+      try {
+        console.log(JSON.stringify({
+          event: "mesh-default-root-acl",
+          outcome,
+          ...(failure ? { failure } : {}),
+          projectRoot,
+          expectedPath: expectedRoot,
+          resolvedPath: actualPath ?? null,
+          roots: rootsToReport.map(root => ({ path: root, ancestors: aclChain(root) })),
+        }));
+      } finally {
+        try { await runtime?.shutdown(); }
+        finally { restoreEnv(); }
+      }
+    }
   }, 120_000);
 
   it.each(Object.keys(opens) as (keyof typeof opens)[])("%s gives a new root an explicit protected ACL: current user and SYSTEM full control, inheritable", async name => {

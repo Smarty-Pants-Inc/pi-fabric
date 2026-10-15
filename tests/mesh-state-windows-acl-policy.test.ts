@@ -15,6 +15,7 @@ const AUTH_USERS = "S-1-5-11";
 const USERS = "S-1-5-32-545";
 const EVERYONE = "S-1-1-0";
 const CREATOR_OWNER = "S-1-3-0";
+const CREATOR_GROUP = "S-1-3-1";
 const FULL = 0x1f01ff;
 const MODIFY = 0x1301bf;
 const READ_EXECUTE = 0x1200a9;
@@ -65,8 +66,8 @@ const judge = (entries: Entry[], input: Partial<WindowsStateAclRequest> = {}, ex
 const withEntry = (index: number, change: Entry): Entry[] =>
   defaultEntries().map((entry, at) => (at === index ? { ...entry, ...change } : entry));
 const strictTargets = ["mesh root", "state-checkpoint.flags", "state.db", "state.db-wal", "state.db-shm", "state.db-journal"] as const;
-const strictRefusal = (target: typeof strictTargets[number], ace: Ace): string | undefined => {
-  const dacl = [...profileDacl(), ace];
+const strictRefusal = (target: typeof strictTargets[number], ace: Ace | Ace[]): string | undefined => {
+  const dacl = [...profileDacl(), ...(Array.isArray(ace) ? ace : [ace])];
   if (target === "mesh root") return judge(withEntry(0, { dacl }));
   if (target === "state-checkpoint.flags") {
     const flags = dir("C:\\Users\\me\\.pi\\mesh\\state-checkpoint.flags", USER, dacl);
@@ -121,6 +122,7 @@ describe("Windows mesh state ACL policy (smarty-dev#8920)", () => {
       allow(EVERYONE, FOREIGN_READ, 0),
       allow(USERS, GENERIC_READ, 0),
       allow(EVERYONE, FOREIGN_READ, 0xb), // inherit-only still reaches state files and the flag directory
+      ...[0x1, 0x8, 0x20, 0x20000000].flatMap(mask => [allow(OTHER, mask, 0), allow(OTHER, mask, 0xb)]),
     ];
     const refusals = strictTargets.flatMap(target => readAces.map(ace => strictRefusal(target, ace)));
     expect(refusals).toEqual(strictTargets.flatMap(() => readAces.map(() => expect.stringMatching(/read/i))));
@@ -183,16 +185,101 @@ describe("Windows mesh state ACL policy (smarty-dev#8920)", () => {
     expect(judge(withEntry(6, { owner: ADMINS }), {}, { ownerSid: USER })).toMatch(/state\.db is owned by S-1-5-32-544/);
   });
 
-  // CREATOR OWNER inherit-only full control gives whoever creates a child inside full control of it. On the root or
-  // the flag directory a foreign creator could add a state-adjacent entry it controls, so strict targets refuse it;
-  // an ancestor's is not its own access (the next component is judged itself), so C:\Users's default passes.
-  it("refuses CREATOR OWNER inherit-only grants on strict targets, allows them on ancestors only", () => {
-    const creator = allow(CREATOR_OWNER, 0x10000000, 0xb);
-    expect(judge(withEntry(0, { dacl: [...profileDacl(), creator] }))).toMatch(/mesh grants S-1-3-0/);
-    const flags = dir("C:\\Users\\me\\.pi\\mesh\\state-checkpoint.flags", USER, [...profileDacl(), creator]);
-    expect(judge(defaultEntries().map((entry, at) => (at === 5 ? flags : entry)))).toMatch(/state-checkpoint\.flags grants S-1-3-0/);
-    expect(judge(withEntry(1, { dacl: [...profileDacl(), creator] }))).toBeUndefined();
+  // CO IO expands to the child's creator, not an arbitrary foreign account. The exception is safe only if the
+  // entire strict DACL still denies foreign add-child/write rights; it must never short-circuit that DACL scan.
+  it.each(strictTargets)("accepts safe CREATOR OWNER inherit-only full control on %s beside foreign metadata only", target => {
+    for (const flags of [0x8, 0xb, 0x1b]) {
+      for (const mask of [FULL, 0x10000000]) {
+        const creator = allow(CREATOR_OWNER, mask, flags);
+        expect(strictRefusal(target, creator)).toBeUndefined();
+        for (const metadataFlags of [0, 0xb]) {
+          const metadata = allow(OTHER, METADATA_ONLY, metadataFlags);
+          expect(strictRefusal(target, [metadata, creator])).toBeUndefined();
+          expect(strictRefusal(target, [creator, metadata])).toBeUndefined();
+        }
+      }
+    }
+    expect(judge(withEntry(1, { dacl: [...profileDacl(), allow(CREATOR_OWNER, FULL, 0xb)] }))).toBeUndefined();
     expect(judge(defaultEntries())).toBeUndefined(); // C:\Users carries CREATOR OWNER (IO) full control
+  });
+
+  it.each(strictTargets)("refuses every other unsafe foreign allow on %s before or after CREATOR OWNER IO", target => {
+    const creator = allow(CREATOR_OWNER, FULL, 0xb);
+    for (const mask of [0x2, ADD_SUBDIR, 0x40000000, 0x10000000, FULL, FOREIGN_READ, GENERIC_READ]) {
+      for (const flags of [0, 0xb]) {
+        const foreign = allow(OTHER, mask, flags);
+        for (const aces of [[foreign, creator], [creator, foreign]]) {
+          expect(strictRefusal(target, aces), `mask 0x${mask.toString(16)}, flags ${flags}`)
+            .toMatch(/grants S-1-5-21-1-2-3-1002 .*rights/);
+        }
+      }
+    }
+  });
+
+  it.each(strictTargets)("does not let deny ACEs cancel an unsafe allow beside CREATOR OWNER IO on %s", target => {
+    const creator = allow(CREATOR_OWNER, FULL, 0xb);
+    const foreign = allow(OTHER, ADD_SUBDIR, 0);
+    const deny = { ...foreign, type: 1, mask: FULL };
+    for (const aces of [
+      [deny, creator, foreign], [deny, foreign, creator], [creator, deny, foreign],
+      [creator, foreign, deny], [foreign, deny, creator], [foreign, creator, deny],
+    ]) {
+      expect(strictRefusal(target, aces)).toMatch(/grants S-1-5-21-1-2-3-1002 .*rights/);
+    }
+  });
+
+  it.each(strictTargets)("refuses Creator Group IO and non-inherit-only CREATOR OWNER full control on %s", target => {
+    for (const mask of [FULL, 0x10000000]) {
+      expect(strictRefusal(target, allow(CREATOR_GROUP, mask, 0xb))).toMatch(/grants S-1-3-1/);
+      for (const flags of [0, 0x3, 0x13]) {
+        expect(strictRefusal(target, allow(CREATOR_OWNER, mask, flags))).toMatch(/grants S-1-3-0/);
+      }
+    }
+  });
+
+  it("validates ACEs after a safe CREATOR OWNER IO ACE instead of returning early", () => {
+    expect(strictRefusal("mesh root", [allow(CREATOR_OWNER, FULL, 0xb), allow(USER, FULL, 0x40)]))
+      .toMatch(/unsupported or unproven ACE/);
+  });
+
+  it("advises a private project folder or mesh root override without accepting unsafe Users grants", () => {
+    const advice = "use a private project folder, or set mesh.root/PI_FABRIC_MESH_ROOT to a private path";
+    const rootRefusal = strictRefusal("mesh root", allow(USERS, ADD_SUBDIR, 0));
+    expect(rootRefusal).toMatch(/mesh grants S-1-5-32-545 .*mask 0x4/);
+    expect(rootRefusal).toContain(advice);
+    const parent = "C:\\Users\\me\\.pi";
+    const creationParent: WindowsStateAclRequest = { root: parent, real: parent, role: "creation-parent", files: [], directories: [] };
+    const creator = allow(CREATOR_OWNER, FULL, 0xb);
+    for (const flags of [0x3, 0xb]) {
+      const foreign = allow(USERS, ADD_SUBDIR, flags);
+      for (const aces of [[creator, foreign], [foreign, creator]]) {
+        const parentRefusal = windowsStateAclRefusal(creationParent, runner([
+          dir(parent, USER, [...profileDacl(), ...aces]), ...defaultEntries().slice(2, 5),
+        ]).run);
+        expect(parentRefusal).toMatch(/immediate creation parent .* grants S-1-5-32-545 inheritable .*mask 0x4/);
+        expect(parentRefusal).toContain(advice);
+      }
+    }
+  });
+
+  it("checks root inheritance even while SQLite sidecars are absent, permitting only trusted creator expansion", () => {
+    const sidecars = ["-wal", "-shm", "-journal"].map(suffix => `${request.files[0]}${suffix}`);
+    const files = [...request.files, ...sidecars];
+    const creator = allow(CREATOR_OWNER, FULL, 0xb);
+    const entries = [...defaultEntries(), ...sidecars.map(file => ({ path: file, missing: true }))];
+    entries[0] = dir(request.root, USER, [...profileDacl(), creator]);
+    expect(judge(entries, { files })).toBeUndefined();
+    // Absence cannot hide a foreign read grant that would reach a later SQLite-created sidecar.
+    entries[0] = dir(request.root, USER, [...profileDacl(), creator, allow(OTHER, FOREIGN_READ, 0xb)]);
+    expect(judge(entries, { files })).toMatch(/mesh grants S-1-5-21-1-2-3-1002 read/);
+    // Once created by SQLite, CO expands to the user (or elevated token owner Administrators), both trusted.
+    for (const owner of [USER, ADMINS]) {
+      entries[0] = dir(request.root, owner, [...profileDacl(), creator]);
+      const present = entries.map(entry => sidecars.includes(entry.path as string)
+        ? { path: entry.path, attributes: 0x20, owner, control: 0x8404, dacl: [...profileDacl(), allow(owner, FULL, 0)] }
+        : entry);
+      expect(judge(present, { files }, { ownerSid: owner })).toBeUndefined();
+    }
   });
 
   it("refuses an ancestor another account may delete, rename into or take over", () => {

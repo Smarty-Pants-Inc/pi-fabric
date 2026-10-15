@@ -7,13 +7,16 @@ import {
   DeliverPolicy, JetStreamApiError, StorageType, jetstream, jetstreamManager,
 } from "@nats-io/jetstream";
 import {
-  assertNatsReplicas, guardNatsPort, MeshStateNatsBusyError, MeshStateNatsRefusedError, natsConnectOptions, NatsWrongLastSequenceError, redactNatsError,
+  assertNatsPlacementTimeout, assertNatsReplicas, DEFAULT_NATS_PLACEMENT_TIMEOUT_MS, guardNatsPort, MeshStateNatsBusyError,
+  MeshStateNatsRefusedError, MeshStateNatsUnavailableError, natsConnectOptions, NatsWrongLastSequenceError, redactNatsError,
   type JetStreamPort, type NatsStreamMessage, type NatsTlsFiles,
 } from "./state-backend-nats.js";
 
 /** NATS JetStream API error codes used here. */
 const WRONG_LAST_SEQUENCE = 10071;
 const STREAM_NOT_FOUND = 10059;
+// JSClusterNoPeersErrF: HTTP 400, "no suitable peers for placement", including an offline peer.
+const CLUSTER_NO_PEERS = 10005;
 // @nats-io/nats-core 3.4 names NoRespondersError "NoResponders". JetStream wraps a RequestError (whose
 // cause is that transport error) in JetStreamNotEnabled; only those known wrappers may pass through classification.
 const TRANSIENT = new Set(["TimeoutError", "NoResponders", "ConnectionError", "RequestError", "ClosedConnectionError"]);
@@ -22,11 +25,36 @@ const OPAQUE_WRAPPERS = new Set(["JetStreamNotEnabled", "RequestError"]);
 const READ_RETRY_ATTEMPTS = 3;
 const STREAM_ADD_ATTEMPTS = 3;
 const READ_RETRY_DELAY_MS = 100;
-// The official JetStream API request timeout is 5s. Read exhaustion is ~15.2s; stream creation is bounded to three
-// identical add requests plus INFO reconciliation (~30.6s worst case). Consumer create shares the three-attempt bound;
-// all preserve request timeouts and consumer identity.
+// The official JetStream API request timeout remains 5s. Read exhaustion is ~15.2s; stream creation is bounded to
+// three identical add requests plus INFO reconciliation (~30.6s worst case). Placement faults instead share one
+// wall-clock budget from CREATE's start, including backoff, pending requests, leader readiness and first consumer.
+// Only that initial ordered-consumer get is raced at 1s per attempt: a timed-out name is abandoned, not resent.
 const STREAM_LEADER_TIMEOUT_MS = 10_000;
 const STREAM_LEADER_POLL_MS = 100;
+const CONSUMER_CREATE_ATTEMPT_TIMEOUT_MS = 1_000;
+const CONSUMER_INITIAL_INACTIVE_THRESHOLD_MS = 10_000;
+const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
+type Bounded<T> = { kind: "value"; value: T } | { kind: "error"; error: unknown } | { kind: "deadline" };
+// ponytail: reuse the existing leader-wait request race for placement, not another retry framework.
+const untilDeadline = async <T>(request: () => Promise<T>, deadline: number): Promise<Bounded<T>> => {
+  const remaining = deadline - Date.now();
+  if (remaining <= 0) return { kind: "deadline" };
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  return Promise.race<Bounded<T>>([
+    Promise.resolve().then(async (): Promise<Bounded<T>> => {
+      if (Date.now() >= deadline) return { kind: "deadline" };
+      try {
+        const value = await request();
+        return Date.now() < deadline ? { kind: "value", value } : { kind: "deadline" };
+      } catch (error) {
+        return Date.now() < deadline ? { kind: "error", error } : { kind: "deadline" };
+      }
+    }),
+    new Promise<{ kind: "deadline" }>(resolve => {
+      timer = setTimeout(() => resolve({ kind: "deadline" }), remaining);
+    }),
+  ]).finally(() => { if (timer !== undefined) clearTimeout(timer); });
+};
 const apiCode = (error: unknown): number | undefined => {
   if (!(error instanceof JetStreamApiError)) return undefined;
   try { return error.apiError().err_code; } catch { return error.code; }
@@ -57,6 +85,16 @@ const isTransientReadError = (error: unknown): boolean => {
   }
   return false; // The chain did not end within the fixed inspection bound.
 };
+// Timeout rotation must still respect the classifier's permanent-error veto and bounded wrapper inspection.
+const isTransientTimeout = (error: unknown): boolean => {
+  if (!isTransientReadError(error)) return false;
+  let current = error;
+  for (let depth = 0; depth < 8 && current instanceof Error; depth++) {
+    if (current.name === "TimeoutError") return true;
+    current = (current as Error & { cause?: unknown }).cause;
+  }
+  return false;
+};
 const retryTransientRead = async <T>(operation: () => Promise<T>, attempts = READ_RETRY_ATTEMPTS): Promise<T> => {
   for (let attempt = 1; ; attempt++) {
     try { return await operation(); }
@@ -74,6 +112,9 @@ export interface ConnectJetStreamOptions {
   tls?: NatsTlsFiles;
   /** The stream's replicas (positive integer, smarty-dev#11373). Omitted: the agent-layer fabric.json mesh.nats.replicas. */
   replicas?: number;
+  /** One placement budget in milliseconds (default 30 000), including pending retries and leader readiness.
+   * Exhausted: MeshStateNatsUnavailableError; replicas are never lowered. */
+  placementTimeoutMs?: number;
 }
 
 /**
@@ -89,6 +130,8 @@ const configuredReplicas = async (): Promise<number> => {
 
 export const connectJetStream = async (servers: string[], options: ConnectJetStreamOptions = {}): Promise<JetStreamPort> => {
   if (servers.length === 0) throw new Error("NATS mesh state: no servers configured");
+  const placementTimeoutMs = options.placementTimeoutMs === undefined ? DEFAULT_NATS_PLACEMENT_TIMEOUT_MS
+    : assertNatsPlacementTimeout(options.placementTimeoutMs, "placementTimeoutMs");
   // Decided before any connection: an explicit value is validated, an omitted one is the agent layer's.
   const replicas = options.replicas === undefined ? await configuredReplicas() : assertNatsReplicas(options.replicas, "replicas");
   // smarty-dev#9663 item 2: a client or fetch error may quote a server URL; never pass its credentials on.
@@ -102,47 +145,65 @@ export const connectJetStream = async (servers: string[], options: ConnectJetStr
     throw redactNatsError(error);
   }
   const js = jetstream(nc);
+  // Every ensure grants only its first consumer the existing readiness deadline. Freshness alone grants 10059
+  // tolerance (#12900); observing an existing stream never does, even though its initial get is also bounded.
+  const streamReadiness = new Map<string, { deadline: number; fresh: boolean }>();
+  const bootstrapConsumer = async <T>(stream: string, request: () => Promise<T>, deadline: number,
+    fresh: boolean, rotateName: () => void): Promise<T> => {
+    let notFound: unknown;
+    let lastError: unknown;
+    let transientFailures = 0;
+    const unavailable = () => new MeshStateNatsUnavailableError(notFound === undefined
+      ? `stream ${stream} consumer was not created within the open's stream readiness budget; retry the open`
+      : `stream ${stream} consumer could not be created within the open's stream readiness budget: JetStream err_code ` +
+        `${STREAM_NOT_FOUND} (stream not found right after its creation, cluster metadata still propagating); retry the open`,
+      { consumerBootstrap: true, ...(notFound === undefined ? {} : { natsErrCode: STREAM_NOT_FOUND }),
+        ...(lastError === undefined ? {} : { cause: notFound ?? lastError }) });
+    for (;;) {
+      const bounded = await untilDeadline(request, Math.min(deadline, Date.now() + CONSUMER_CREATE_ATTEMPT_TIMEOUT_MS));
+      // The shorter attempt race may expire without exhausting the shared budget. Never rotate at the overall
+      // deadline (including a placement budget shorter than 1s), and never use a late abandoned get's consumer.
+      const outcome = bounded.kind === "deadline" && Date.now() < deadline
+        ? { kind: "attempt-timeout" as const } : bounded;
+      if (outcome.kind === "deadline" || Date.now() >= deadline) throw unavailable();
+      if (outcome.kind === "value") return outcome.value;
+      if (outcome.kind === "attempt-timeout") rotateName();
+      else {
+        lastError = outcome.error;
+        if (fresh && apiCode(outcome.error) === STREAM_NOT_FOUND) notFound = outcome.error;
+        else if (isTransientTimeout(outcome.error)) rotateName();
+        else if (!isTransientReadError(outcome.error) || ++transientFailures >= READ_RETRY_ATTEMPTS) throw outcome.error;
+      }
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) throw unavailable();
+      await sleep(Math.min(STREAM_LEADER_POLL_MS, remaining));
+    }
+  };
   // ponytail: nats-auth scoped roles subscribe only to their own _INBOX (roleTemplate), not to
   // $JS.EVENT.ADVISORY.STREAM.LEADER_ELECTED.<stream>. The leader event is therefore unusable with the configured
   // credentials. Keep this 10s-bounded info wait until advisory access is explicitly granted (#1067 round 4 exception);
   // do not widen auth permissions merely to replace the wait with an event.
-  const waitForStreamLeader = async (stream: string, requiredReplicas: number, current?: Awaited<ReturnType<typeof jsm.streams.info>>) => {
+  const waitForStreamLeader = async (stream: string, requiredReplicas: number, current?: Awaited<ReturnType<typeof jsm.streams.info>>,
+    budget?: { deadline: number; unavailable?: () => Error }) => {
     if (requiredReplicas === 1) return current;
-    const deadline = Date.now() + STREAM_LEADER_TIMEOUT_MS;
+    const deadline = budget?.deadline ?? Date.now() + STREAM_LEADER_TIMEOUT_MS;
+    const noLeader = budget?.unavailable ?? (() => new MeshStateNatsBusyError(`stream ${stream} had no elected leader after ${STREAM_LEADER_TIMEOUT_MS}ms`));
     let info = current;
     if (info?.cluster?.leader) return info;
     for (;;) {
-      if (deadline - Date.now() <= 0) {
-        throw new MeshStateNatsBusyError(`stream ${stream} had no elected leader after ${STREAM_LEADER_TIMEOUT_MS}ms`);
-      }
-      const remaining = deadline - Date.now();
-      if (remaining <= 0) {
-        throw new MeshStateNatsBusyError(`stream ${stream} had no elected leader after ${STREAM_LEADER_TIMEOUT_MS}ms`);
-      }
-      let timer: ReturnType<typeof setTimeout> | undefined;
-      const outcome = await Promise.race([
-        jsm.streams.info(stream).then(
-          value => ({ kind: "info" as const, value }),
-          error => ({ kind: "error" as const, error }),
-        ),
-        new Promise<{ kind: "deadline" }>(resolve => {
-          timer = setTimeout(() => resolve({ kind: "deadline" }), remaining);
-        }),
-      ]).finally(() => { if (timer !== undefined) clearTimeout(timer); });
-      if (outcome.kind === "deadline") {
-        throw new MeshStateNatsBusyError(`stream ${stream} had no elected leader after ${STREAM_LEADER_TIMEOUT_MS}ms`);
-      }
+      const outcome = await untilDeadline(() => jsm.streams.info(stream), deadline);
+      if (outcome.kind === "deadline") throw noLeader();
       if (outcome.kind === "error") {
-        if (!isTransientReadError(outcome.error)) throw outcome.error;
+        // The stream was created or observed already; INFO can briefly miss it while cluster state catches up.
+        // Only this readiness wait treats 10059 as not ready: ordinary reads must still report a missing stream.
+        if (apiCode(outcome.error) !== STREAM_NOT_FOUND && !isTransientReadError(outcome.error)) throw outcome.error;
       } else {
         info = outcome.value;
         if (Date.now() < deadline && info.cluster?.leader) return info;
       }
       const afterRequest = deadline - Date.now();
-      if (afterRequest <= 0) {
-        throw new MeshStateNatsBusyError(`stream ${stream} had no elected leader after ${STREAM_LEADER_TIMEOUT_MS}ms`);
-      }
-      await new Promise<void>(resolve => setTimeout(resolve, Math.min(STREAM_LEADER_POLL_MS, afterRequest)));
+      if (afterRequest <= 0) throw noLeader();
+      await sleep(Math.min(STREAM_LEADER_POLL_MS, afterRequest));
     }
   };
   return guardNatsPort({
@@ -161,6 +222,7 @@ export const connectJetStream = async (servers: string[], options: ConnectJetStr
         authRequired: nc.info?.auth_required === true };
     },
     ensureStream: async (stream, subjects, { maxMsgSize, replicas: requested }) => {
+      streamReadiness.delete(stream); // A later ensure replaces the deadline and never inherits old freshness.
       const configured = requested === undefined ? replicas : assertNatsReplicas(requested, "replicas");
       let info;
       try { info = await retryTransientRead(() => jsm.streams.info(stream)); }
@@ -169,17 +231,48 @@ export const connectJetStream = async (servers: string[], options: ConnectJetStr
         // The stream itself refuses a larger message (pi-fabric#907): the server enforces the cap, not only the client.
         const config = { name: stream, subjects, storage: StorageType.File, num_replicas: configured, max_msg_size: maxMsgSize };
         let created: Awaited<ReturnType<typeof jsm.streams.add>> | undefined;
-        for (let attempt = 1; ; attempt++) {
+        const createStart = Date.now();
+        let placementFault: unknown;
+        let placementDeadline: number | undefined;
+        let placementRetries = 0;
+        let transientFailures = 0;
+        const placementUnavailable = () => new MeshStateNatsUnavailableError(
+          `stream ${stream} could not place its ${configured} replicas within ${placementTimeoutMs}ms: ` +
+          `JetStream err_code ${CLUSTER_NO_PEERS} (no suitable peers for placement, peer offline or restarting); ` +
+          `replicas are never lowered; restore the peers, then retry`,
+          { natsErrCode: CLUSTER_NO_PEERS, cause: placementFault });
+        const bounded = async <T>(request: () => Promise<T>): Promise<T> => {
+          if (placementDeadline === undefined) return request();
+          const outcome = await untilDeadline(request, placementDeadline);
+          if (outcome.kind === "deadline") throw placementUnavailable();
+          if (outcome.kind === "error") throw outcome.error;
+          return outcome.value;
+        };
+        const pause = async (ms: number) => {
+          if (placementDeadline === undefined) return sleep(ms);
+          const remaining = placementDeadline - Date.now();
+          if (remaining <= 0) throw placementUnavailable();
+          await sleep(Math.min(ms, remaining));
+        };
+        for (;;) {
           try {
-            created = await jsm.streams.add(config);
+            created = await bounded(() => jsm.streams.add(config));
             break;
           } catch (error) {
+            if (error instanceof MeshStateNatsUnavailableError) throw error;
+            if (apiCode(error) === CLUSTER_NO_PEERS) {
+              placementFault = error;
+              placementDeadline ??= createStart + placementTimeoutMs;
+              await pause(Math.min(2_000, 250 * 2 ** Math.min(placementRetries++, 3)));
+              continue;
+            }
             if (!isTransientReadError(error)) throw error;
             // STREAM.CREATE is idempotent only when its reply was lost and the exact requested config is already
             // present. Reconcile before another identical request, so a stored stream is never mistaken for failure.
             let observed: Awaited<ReturnType<typeof jsm.streams.info>> | undefined;
-            try { observed = await jsm.streams.info(stream); }
+            try { observed = await bounded(() => jsm.streams.info(stream)); }
             catch (readError) {
+              if (readError instanceof MeshStateNatsUnavailableError) throw readError;
               if (apiCode(readError) !== STREAM_NOT_FOUND && !isTransientReadError(readError)) throw readError;
             }
             if (observed) {
@@ -193,12 +286,15 @@ export const connectJetStream = async (servers: string[], options: ConnectJetStr
               info = observed;
               break;
             }
-            if (attempt >= STREAM_ADD_ATTEMPTS) throw error;
-            await new Promise<void>(resolve => setTimeout(resolve, READ_RETRY_DELAY_MS));
+            if (++transientFailures >= STREAM_ADD_ATTEMPTS) throw error;
+            await pause(READ_RETRY_DELAY_MS);
           }
         }
         if (!created && !info) throw new Error(`NATS mesh state: stream ${stream} create returned no stream info`);
-        const ready = await waitForStreamLeader(stream, configured, created ?? info);
+        const readiness = placementDeadline === undefined ? { deadline: Date.now() + STREAM_LEADER_TIMEOUT_MS }
+          : { deadline: placementDeadline, unavailable: placementUnavailable };
+        const ready = await waitForStreamLeader(stream, configured, created ?? info, readiness);
+        streamReadiness.set(stream, { deadline: readiness.deadline, fresh: true });
         return { lastSeq: ready?.state.last_seq ?? (created ?? info)!.state.last_seq,
           maxMsgSize: ready?.config.max_msg_size ?? (created ?? info)!.config.max_msg_size };
       }
@@ -211,7 +307,9 @@ export const connectJetStream = async (servers: string[], options: ConnectJetStr
       }
       const missing = subjects.filter(subject => !(info.config.subjects ?? []).includes(subject));
       if (missing.length > 0) await jsm.streams.update(stream, { subjects: [...(info.config.subjects ?? []), ...missing] });
-      const ready = await waitForStreamLeader(stream, configured, info);
+      const readiness = { deadline: Date.now() + STREAM_LEADER_TIMEOUT_MS };
+      const ready = await waitForStreamLeader(stream, configured, info, readiness);
+      streamReadiness.set(stream, { deadline: readiness.deadline, fresh: false });
       return { lastSeq: ready?.state.last_seq ?? info.state.last_seq, maxMsgSize: ready?.config.max_msg_size ?? info.config.max_msg_size };
     },
     streamExists: async (stream) => {
@@ -244,13 +342,23 @@ export const connectJetStream = async (servers: string[], options: ConnectJetStr
       }
     },
     consume: async (stream, afterSeq, onMessage: (message: NatsStreamMessage) => void, onError) => {
-      const consumerOptions = {
+      // Taken before the first request: second consumes, resyncs and running consumers get no missing-stream retry.
+      const readiness = streamReadiness.get(stream);
+      streamReadiness.delete(stream);
+      let consumerOptions = {
         name_prefix: randomUUID(),
+        inactive_threshold: CONSUMER_INITIAL_INACTIVE_THRESHOLD_MS,
         ...(afterSeq === 0
           ? { deliver_policy: DeliverPolicy.All }
           : { deliver_policy: DeliverPolicy.StartSequence, opt_start_seq: afterSeq + 1 }),
       };
-      const consumer = await retryTransientRead(() => js.consumers.get(stream, consumerOptions), READ_RETRY_ATTEMPTS);
+      const request = () => js.consumers.get(stream, consumerOptions);
+      // Keep the SDK client's default 5s API timeout: its API persists into the running consumer. The race only
+      // caps initial get. Each Timeout abandons our own ephemeral assignment; do not delete it or consume it later.
+      // Replace, rather than mutate, its options so an in-flight SDK get retains only its abandoned name.
+      const consumer = readiness === undefined ? await retryTransientRead(request, READ_RETRY_ATTEMPTS)
+        : await bootstrapConsumer(stream, request, readiness.deadline, readiness.fresh,
+          () => { consumerOptions = { ...consumerOptions, name_prefix: randomUUID() }; });
       const messages = await consumer.consume();
       void (async () => { for await (const message of messages) onMessage({ seq: message.seq, data: message.data }); })()
         .catch(error => onError?.(error));

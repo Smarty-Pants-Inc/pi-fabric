@@ -114,7 +114,7 @@ const optedIn = {
   PI_FABRIC_ACTIVATION_TEST_WORKER: "./exact artifact/[worker].js",
   PI_FABRIC_TEST_PG_BIN: "./exact artifact/postgres bin", PI_FABRIC_TEST_PID_DELAY_MS: "600",
 };
-for (const entry of ["vitest.config.ts", "tests/fleet-isolation-setup.ts"]) {
+for (const entry of ["vitest.config.cts", "tests/fleet-isolation-setup.ts"]) {
   test.each([
     ["live opt-in", { PI_FABRIC_JEV_LIVE: "1", PI_FABRIC_JEV_LOCALTERM: "1" }],
     ["exact artifacts", { PI_FABRIC_ACTIVATION_TEST_PI_BINARY: optedIn.PI_FABRIC_ACTIVATION_TEST_PI_BINARY, PI_FABRIC_ACTIVATION_TEST_WORKER: optedIn.PI_FABRIC_ACTIVATION_TEST_WORKER }],

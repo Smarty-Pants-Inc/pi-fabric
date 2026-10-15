@@ -125,11 +125,10 @@ const providerTransientIn = (text: string): { why: string; match: string } | und
  * full failure text; evidence is the run's worker warnings, when the run produced any.
  */
 const WINDOW_LOST = /^[ \t]*(?:Fabric activation window failed: )?(?:Error: )?(Activation window lost (?:current activation messages|its authorized compaction|its native history boundary|its native system records|its native system prompt|the Google config object))[ \t]*\r?$/m;
-// Persisted legacy records (and the internal preparation sentinel) only: the old store's exact
-// error, optionally wrapped by #prepare or Error.toString(). The anchor keeps near matches hard.
+// Persisted legacy records only: exact internal errors, optionally wrapped by #prepare
+// or Error.toString(). Live failures require a typed cause, never a message match.
 const REGISTRY_VETO = /^(?:(?:Error|ActorPreparationError): )?(?:Actor [\w:-]+ preparation \([\w-]+\): )?(?:ActorRegistryUpdateVetoedError: )?Actor registry update was vetoed by its validation and not committed; retry$/;
 const REGISTRY_CHANGED_REPEATEDLY = /^(?:(?:Error|ActorPreparationError): )?(?:Actor [\w:-]+ preparation \([\w-]+\): )?(?:ParticipantPublicationChangedError: )?Actor registry changed (?:repeatedly during preparation|during participant preparation)$/;
-export const isRegistryChangedRepeatedlyFailure = (text: string): boolean => REGISTRY_CHANGED_REPEATEDLY.test(text);
 export const classifyActivationFailure = (input: {
   lastError: string; error?: string | undefined; evidence?: readonly string[] | undefined; preparation?: boolean | undefined;
   /** The preparation error is a timeout by type (a preparation, launch or mesh lock deadline). */
@@ -153,7 +152,7 @@ export const classifyActivationFailure = (input: {
       classification: `transient: actor registry validation veto (${reason}) committed nothing; retry after backoff` };
   }
   const knownRegistryChanged = input.persistedRegistryChangedRepeatedly === "known-code";
-  if (!permanent && ((input.preparation && REGISTRY_CHANGED_REPEATEDLY.test(input.lastError)) || knownRegistryChanged ||
+  if (!permanent && (knownRegistryChanged ||
       input.persistedRegistryChangedRepeatedly === "legacy" && REGISTRY_CHANGED_REPEATEDLY.test(input.lastError))) {
     return { code: "registry-changed-repeatedly", transient: true,
       reason: "actor registry changed repeatedly during preparation",

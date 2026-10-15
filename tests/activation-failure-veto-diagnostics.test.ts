@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import os from "node:os";
-import { ActorManager, ActorPreparationError, FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC } from "../src/actors/manager.js";
+import { ACTOR_TRANSIENT_BLOCK_BACKOFF_MS, ActorManager, ActorPreparationError, FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC } from "../src/actors/manager.js";
 import { ActorMeshMonitor } from "../src/actors/mesh-monitor.js";
 import { AgentManager } from "../src/agents/manager.js";
 import { MeshStore } from "../src/mesh/store.js";
@@ -24,6 +24,74 @@ const fixture = (valid = true, vetoReason: "generation" | "payload-generation" =
 };
 
 describe("registry veto reason at expiry (smarty-dev#11998)", () => {
+  // The old text is migration evidence only. Walk the real manager catch both before
+  // admission and after its spawned callback; neither raw error may expire routing.
+  it.each([false, true])("keeps raw registry-contention text hard (workerLaunched=%s)", async launched => {
+    vi.spyOn(fs, "rmSync").mockImplementation(() => {});
+    vi.spyOn(fs, "unlinkSync").mockImplementation(() => {});
+    vi.spyOn(fs, "rmdirSync").mockImplementation(() => {});
+    vi.spyOn(ActorMeshMonitor.prototype, "start").mockImplementation(() => {});
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "legacy-live-probe-"));
+    const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
+    vi.spyOn(mesh, "put").mockResolvedValue(undefined as never);
+    vi.spyOn(mesh, "delete").mockResolvedValue(undefined as never);
+    const agents = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, { runRoot: path.join(root, "runs") });
+    const text = "Actor registry changed repeatedly during preparation";
+    vi.spyOn(agents, "run").mockImplementation(async (_request, _signal, onSpawned) => {
+      if (launched) onSpawned?.({ id: "runtime-probe" } as never);
+      throw launched ? new Error(text) : new ActorPreparationError("private-id", "registry", new Error(text));
+    });
+    const manager = new ActorManager("legacy-live", { id: "session:legacy-live", name: "main", kind: "main" }, mesh,
+      DEFAULT_FABRIC_CONFIG.mesh, agents, () => {}, { actorRoot: path.join(root, "actors"), persistent: false, meshRetentionSweepPath: false });
+    try {
+      const actor = await manager.create({ name: "legacy-live", instructions: "Respond.", responseMode: "text" });
+      await expect(manager.ask(actor.id, "activate")).rejects.toThrow(text);
+      await new Promise<void>(resolve => setImmediate(resolve));
+      expect(manager.status(actor.id).activationBlocked).toMatchObject({ code: "unknown", class: "hard" });
+      expect(manager.status(actor.id).activationBlocked).not.toHaveProperty("retryAt");
+    } finally {
+      await manager.close();
+      await agents.close();
+    }
+  });
+
+  it.each(["unknown", "failing-preparation"])("restores legacy %s contention with a retry deadline, but keeps auth hard", async code => {
+    vi.spyOn(fs, "rmSync").mockImplementation(() => {});
+    vi.spyOn(fs, "unlinkSync").mockImplementation(() => {});
+    vi.spyOn(fs, "rmdirSync").mockImplementation(() => {});
+    vi.spyOn(ActorMeshMonitor.prototype, "start").mockImplementation(() => {});
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "legacy-restore-probe-"));
+    const actorRoot = path.join(root, "actors");
+    const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
+    vi.spyOn(mesh, "put").mockResolvedValue(undefined as never);
+    vi.spyOn(mesh, "delete").mockResolvedValue(undefined as never);
+    const agents = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, { runRoot: path.join(root, "runs") });
+    const identity = { id: "session:legacy-restore", name: "main", kind: "main" as const };
+    // Read the real persisted format; record writes so this restore probe never
+    // acquires a disk lock whose cleanup is intentionally mocked above.
+    vi.spyOn(ActorRegistryStore.prototype, "update").mockResolvedValue(undefined);
+    const since = Date.now();
+    const actorId = "a".repeat(32), hardId = "b".repeat(32);
+    const actors = [actorId, hardId].map(id => ({ id, name: id === actorId ? "legacy-review" : "hard-review",
+      rootId: identity.id, instructions: "Respond.", createdAt: since, status: "idle", runner: "pi", responseMode: "text",
+      activationBlocked: { code: id === actorId ? code : "auth", class: "hard", since, count: 1,
+        reason: id === actorId ? "Actor registry changed repeatedly during preparation" : "401 Unauthorized",
+        classification: id === actorId ? "fail-closed: no transient cause recognised" : "permanent: credential failure" } }));
+    fs.mkdirSync(actorRoot, { recursive: true });
+    fs.writeFileSync(path.join(actorRoot, "actors.json"), JSON.stringify({ format: 1, actors }));
+    const restored = new ActorManager("legacy-restore", identity, mesh, DEFAULT_FABRIC_CONFIG.mesh, agents, () => {},
+      { actorRoot, persistent: true, meshRetentionSweepPath: false });
+    try {
+      expect(restored.status(actorId).activationBlocked).toMatchObject({ code: "registry-changed-repeatedly", class: "transient",
+        reason: "actor registry changed repeatedly during preparation", retryAt: since + ACTOR_TRANSIENT_BLOCK_BACKOFF_MS });
+      expect(restored.status(hardId).activationBlocked).toMatchObject({ code: "auth", class: "hard" });
+      expect(restored.status(hardId).activationBlocked).not.toHaveProperty("retryAt");
+    } finally {
+      await restored.close();
+      await agents.close();
+    }
+  });
+
   // Recorded-call trust-boundary probe: real manager admission/catch/status; no child
   // process or deletion. Registry publication is mocked by fixture(), mesh writes recorded.
   it.each([true, false])("manager trusts only typed vetoes (typed=%s), with safe reason and retry", async typed => {

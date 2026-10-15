@@ -39,6 +39,7 @@ describe("registry veto activation classification (smarty-dev#11998)", () => {
     expect(classifyActivationFailure({ lastError: veto, error, persistedRegistryVeto: "known-code" }).transient).toBe(false);
     expect(classifyActivationFailure({ lastError: veto, error, persistedRegistryVeto: "legacy" }).transient).toBe(false);
     expect(classifyActivationFailure({ lastError: registryChanged, error, persistedRegistryChangedRepeatedly: "known-code" }).transient).toBe(false);
+    expect(classifyActivationFailure({ lastError: registryChanged, error, persistedRegistryChangedRepeatedly: "legacy" }).transient).toBe(false);
   });
 
   it("accepts a typed veto cause independently of its wrapper text", () => {
@@ -80,11 +81,12 @@ describe("registry veto activation classification (smarty-dev#11998)", () => {
     `Error: ${registryChanged}`,
     `Actor abc-123 preparation (registry): ${registryChanged}`,
     `ActorPreparationError: Actor abc-123 preparation (registry): ${registryChanged}`,
-  ])("classifies registry contention as transient only for preparation or persisted legacy records: %s", lastError => {
-    expect(classifyActivationFailure({ lastError, preparation: true })).toMatchObject({
-      code: "registry-changed-repeatedly", transient: true,
-      reason: registryChanged.toLowerCase(),
-    });
+  ])("migrates registry contention only from persisted legacy records: %s", lastError => {
+    for (const preparation of [false, true]) {
+      const live = classifyActivationFailure({ lastError, preparation });
+      expect(live.transient).toBe(false);
+      expect(activationBlockClass(live.code)).toBe("hard");
+    }
     expect(classifyActivationFailure({ lastError, persistedRegistryChangedRepeatedly: "legacy" })).toMatchObject({
       code: "registry-changed-repeatedly", transient: true,
     });

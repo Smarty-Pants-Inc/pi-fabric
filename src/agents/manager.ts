@@ -4967,7 +4967,9 @@ export class AgentManager {
     const lost: AgentRunResult = { ...failedRecord(managed, "failed",
       "Actor worker is proven gone; execution was lost and this event will not be replayed"),
       startedAt: this.#admissionOwners.get(managed.id)?.acquiredAt ?? record?.startedAt ?? Date.now(),
-      errorCode: "WORKER_GONE", settledLost: true };
+      // Host-proven loss cannot prove absence of effects. Consume the activation
+      // and its handoff snapshot even if the worker never published inference evidence.
+      errorCode: "WORKER_GONE", settledLost: true, inferenceStarted: true };
     // stop()/isAlive() retain detached descendants, native close and immutable debt.
     // Failure leaves the same run and admission joined; the existing monitor retries.
     try { await this.#drainExecution(managed); }

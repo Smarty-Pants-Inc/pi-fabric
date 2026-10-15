@@ -280,6 +280,59 @@ describe("resident actor permit watch (#9031)", () => {
     expect([...workers.values()].filter(candidate => candidate.record.task.includes("overflow event"))).toHaveLength(1);
   });
 
+  it.each([
+    ["worker-gone", "active"], ["completed", "active"],
+    ["worker-gone", "inherited"], ["completed", "inherited"],
+  ] as const)("%s activation consumes its %s child-handoff exactly once", async (outcome, placement) => {
+    let defer = placement === "inherited";
+    const f = fixture(true, { preparePiModel: async model => {
+      if (defer) { defer = false; throw new Error("defer child before inference"); }
+      return model;
+    } });
+    const actor = await f.actors.create({ name: "child-handoff", instructions: "Respond", responseMode: "text", coalesce: false });
+    const childId = "b".repeat(32);
+    const store = new ActorChildCompletionStore(actor.sessionFile!);
+    store.enqueue({ id: childId, name: "child", status: "completed", text: "child result payload",
+      startedAt: Date.now(), finishedAt: Date.now() } as Parameters<ActorChildCompletionStore["enqueue"]>[0],
+    { id: actor.id, kind: "actor", runId: "c".repeat(32) });
+    if (placement === "inherited") {
+      await eventually(() => {
+        expect(f.actors.status(actor.id).lastError).toContain("defer child before inference");
+        expect(f.actors.inFlightCount()).toBe(0);
+        expect(store.received(childId)).toBe(true);
+      });
+      expect(store.handoffConsumed(childId)).toBe(false);
+      await f.actors.tell(actor.id, "activation carrying deferred child context");
+    }
+    const activation = await launched(f, actor.id);
+    expect(activation.record.task).toContain(store.resultFile(childId));
+    if (placement === "inherited") expect(activation.record.task).toContain("context only, not current activation facts");
+
+    if (outcome === "worker-gone") {
+      // The running record has no worker-authored evidence; host custody alone proves loss.
+      activation.alive = false;
+      activation.nativeClose();
+      activation.treeClose();
+      await eventually(() => expect(f.agents.status(activation.launch.id)).toMatchObject({
+        status: "failed", errorCode: "WORKER_GONE", settledLost: true,
+      }));
+    } else complete(activation);
+
+    await eventually(() => expect(f.actors.inFlightCount()).toBe(0));
+    const successor = f.actors.ask(actor.id, "successor after child handoff");
+    const next = await launched(f, actor.id);
+    expect(next.record.task).toContain("successor after child handoff");
+    expect(next.record.task).not.toContain(store.resultFile(childId));
+    expect(next.record.task).not.toContain("child result payload");
+    if (outcome === "worker-gone") expect(f.agents.status(activation.launch.id)).toHaveProperty("inferenceStarted", true);
+    expect(store.handoffConsumed(childId)).toBe(true);
+    expect(fs.existsSync(store.resultFile(childId))).toBe(false);
+    expect(f.actors.messages(actor.id).filter(message => message.id === childId && message.direction === "in")).toHaveLength(1);
+    complete(next);
+    await expect(successor).resolves.toMatchObject({ text: "finished" });
+    expect(f.actors.messages(actor.id).filter(message => message.id === childId && message.direction === "in")).toHaveLength(1);
+  });
+
   it("committed actor success with an already-gone worker remains deliverable success", async () => {
     const f = fixture();
     const actor = await f.actors.create({ name: "successful", instructions: "Respond", responseMode: "text" });

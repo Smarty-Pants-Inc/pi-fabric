@@ -1038,6 +1038,8 @@ Local process-transport Pi task agents launched by `agents.spawn()` (including `
 
 An explicit `readOnly`, `writableRoots`, or `shell` request replaces the task default, subject to inherited confinement below. `writePolicy: "unrestricted"` opts out, writes a `write_policy.unrestricted` event before launch, and cannot be combined with those explicit fields. It cannot escape a caller's existing confinement.
 
+For writable local process tasks, `TMPDIR`, `TMP`, and `TEMP` are set before the worker starts, so native temporary files such as Pi's large-output spills stay inside the existing write grant. Fabric keeps a caller's `TMPDIR` when both its lexical and real paths are inside a granted root. Otherwise it creates a private `0700` directory beneath a granted root other than the cwd, falling back to the last root. The default task's dedicated `--tmpdir` takes precedence. No root is added to the policy; read-only, empty-root, and unrestricted launches keep their previous temporary environment.
+
 `agents.run()` and `agents.spawn()` accept `readOnly?: boolean`, `writableRoots?: string[]`, and `shell?: "deny" | "unconfined"` for Pi children. Setting any of them creates an explicit write policy:
 
 - `readOnly: true` refuses every `write` and `edit`.

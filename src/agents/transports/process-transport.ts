@@ -17,6 +17,8 @@ import type { AgentPlacementConfig } from "../placement-config.js";
 import { agentPlacementProbe, liveAgentPlacement } from "../placement-config.js";
 import { normalizeAgentCapabilityTokens } from "../../host-compatibility.js";
 import { assertAgentRequiredInputsExist, normalizeAgentRequires } from "../input-validation.js";
+import { isInside, readWritePolicy } from "../write-guard.js";
+import { assertTransportLaunchAllowed } from "./launch-authority.js";
 
 const regularFile = (file: string): boolean => {
   try { return fs.statSync(file).isFile(); } catch { return false; }
@@ -150,6 +152,87 @@ const findExecutableStrict = (command: string, environment: NodeJS.ProcessEnv): 
 /** Exact flag-position `--actor-id` only; a flag-shaped value is not an actor identity. */
 const isActorLaunch = (workerArguments: readonly string[]): boolean =>
   workerArguments.some((arg, index) => index % 2 === 0 && arg === "--actor-id");
+
+/** Match write-guard containment for a temp path, including symlinks and missing leaves. */
+const nearestRealPath = (target: string): string | undefined => {
+  let current = target;
+  for (;;) {
+    try {
+      fs.lstatSync(current);
+    } catch {
+      const parent = path.dirname(current);
+      if (parent === current) return undefined;
+      current = parent;
+      continue;
+    }
+    try {
+      return path.join(fs.realpathSync(current), path.relative(current, target));
+    } catch {
+      return undefined;
+    }
+  }
+};
+
+const launchWritePolicy = (workerArguments: readonly string[]) => {
+  let serialized: string | undefined;
+  for (let index = 0; index < workerArguments.length; index += 2) {
+    if (workerArguments[index] === "--write-policy") serialized = workerArguments[index + 1];
+  }
+  return serialized === undefined ? undefined : readWritePolicy(serialized);
+};
+
+const containedByRoot = (candidate: string, cwd: string, roots: readonly string[]): boolean => {
+  const lexical = path.isAbsolute(candidate) ? path.normalize(candidate) : path.resolve(cwd, candidate);
+  const real = nearestRealPath(lexical);
+  return real !== undefined && roots.some(root => isInside(root, lexical)) && roots.some(root => isInside(root, real));
+};
+
+/**
+ * A confined worker must not inherit a host temp directory. Keep an already
+ * safe TMPDIR verbatim; otherwise make a private directory under the grant
+ * and update --tmpdir too, because worker.ts exports that option on startup.
+ */
+const prepareTaskTemporaryDirectory = (
+  workerArguments: readonly string[],
+  environment: NodeJS.ProcessEnv,
+  cwd: string,
+): { workerArguments: string[]; environment: NodeJS.ProcessEnv } => {
+  const policy = launchWritePolicy(workerArguments);
+  if (!policy || policy.readOnly || policy.writableRoots.length === 0) return { workerArguments: [...workerArguments], environment };
+
+  const roots = policy.writableRoots;
+  const optionTmpdir = (() => {
+    let value: string | undefined;
+    for (let index = 0; index < workerArguments.length; index += 2) {
+      if (workerArguments[index] === "--tmpdir") value = workerArguments[index + 1];
+    }
+    return value;
+  })();
+  const inheritedTmpdir = environment.TMPDIR;
+  let temporary = optionTmpdir && containedByRoot(optionTmpdir, cwd, roots) ? optionTmpdir
+    : inheritedTmpdir && containedByRoot(inheritedTmpdir, cwd, roots) ? inheritedTmpdir
+    : undefined;
+  if (!temporary) {
+    const realCwd = fs.realpathSync(cwd);
+    const nonWorktreeRoot = roots.find(root => !isInside(root, realCwd) && !isInside(realCwd, root));
+    const root = nonWorktreeRoot ?? roots[roots.length - 1]!;
+    if (!containedByRoot(root, cwd, roots)) throw new Error("writable root changed outside the effective policy");
+    temporary = fs.mkdtempSync(path.join(root, ".pi-fabric-task-tmp-"));
+    fs.chmodSync(temporary, 0o700);
+    if (process.platform !== "win32" && (fs.statSync(temporary).mode & 0o777) !== 0o700) {
+      throw new Error("private task temporary directory is not mode 0700");
+    }
+    if (!containedByRoot(temporary, cwd, roots)) throw new Error("private task temporary directory escaped writable roots");
+  }
+
+  const childEnvironment = { ...environment, TMPDIR: temporary, TMP: temporary, TEMP: temporary };
+  const childArguments = [...workerArguments];
+  for (let index = 0; index < childArguments.length; index += 2) {
+    if (childArguments[index] !== "--tmpdir") continue;
+    if (!childArguments[index + 1] || !containedByRoot(childArguments[index + 1]!, cwd, roots)) childArguments[index + 1] = temporary;
+  }
+  return { workerArguments: childArguments, environment: childEnvironment };
+};
 
 export class ProcessTransport implements AgentTransportAdapter {
   readonly kind = "process" as const;
@@ -286,18 +369,23 @@ export class ProcessTransport implements AgentTransportAdapter {
       }
     }
     if (selected.fabricRelease) workerArguments.push("--fabric-release", selected.fabricRelease);
+    // Worker arguments are flag/value pairs. A flag-shaped value is not an
+    // actor identity; explicit actor ids alone retain the parent's role env.
+    const baseEnvironment = applyTaskReturnAddress(
+      // Actors keep their roles, never their caller's capped-task receipt (SRC-1).
+      isActorLaunch(workerArguments) ? withoutTaskBoundary(process.env) : taskAgentEnvironment(),
+      workerArguments,
+    );
+    assertTransportLaunchAllowed(request);
+    const prepared = isActorLaunch(workerArguments)
+      ? { workerArguments, environment: baseEnvironment }
+      : prepareTaskTemporaryDirectory(workerArguments, baseEnvironment, request.cwd);
     const processHandle = await spawnDetached(
       selected.workerPath,
-      workerArguments,
+      prepared.workerArguments,
       request.cwd,
       request,
-      // Worker arguments are flag/value pairs. A flag-shaped value is not an
-      // actor identity; explicit actor ids alone retain the parent's role env.
-      applyTaskReturnAddress(
-        // Actors keep their roles, never their caller's capped-task receipt (SRC-1).
-        isActorLaunch(workerArguments) ? withoutTaskBoundary(process.env) : taskAgentEnvironment(),
-        workerArguments,
-      ),
+      prepared.environment,
       scope,
       7_000, // allow the worker's five-second execution-child cleanup
       process.platform !== "win32", // Windows retains its native-close/helper contract

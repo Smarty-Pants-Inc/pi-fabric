@@ -16,7 +16,7 @@ export const isPrincipalDiagnostics = (): boolean => process.env.SMARTY_ROLE?.st
 export const fabricDiagnosticsFile = (id: string): string =>
   path.join(resolveAgentDir(), "fabric", "diagnostics", `${encodeURIComponent(id)}.jsonl`);
 
-/** Shared synchronous writer for the first-use sink and the process-exit fallback. */
+/** Minimal synchronous fallback used only by process.exit; the normal sink stays in diagnostics-log.js. */
 export const appendDiagnosticSync = (id: string, line: string, bytes: number): void => {
   let fd: number | undefined;
   try {

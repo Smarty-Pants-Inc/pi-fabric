@@ -1405,8 +1405,16 @@ export class ParticipantDirectory implements FabricParticipantSource {
   }
 
   #terminalOrParticipant(entry: MeshStateEntry): FabricParticipantRecord | undefined {
-    return isObject(entry.value) && entry.value.stopReason === "owner-root-gone"
-      ? this.options.terminalActor?.(entry) : participantFromEntry(entry);
+    if (!isObject(entry.value) || entry.value.stopReason !== "owner-root-gone") return participantFromEntry(entry);
+    const terminal = this.options.terminalActor?.(entry);
+    if (terminal) return terminal;
+    // A newer, unauthenticated observer envelope is not ownership. Resolve the
+    // authentic native file immediately, without restoring/rewriting shared state.
+    // Raw terminal candidates remain cached; both proof and fallback are read afresh
+    // so lease-only changes cannot memoize an authority decision. Normal parsing
+    // still requires updatedBy.id === ownerIdentityId, including this fallback.
+    const file = readParticipantFile(this.mesh.root, entry.key);
+    return file ? participantFromEntry(file) : undefined;
   }
 
   #parse(read: MeshReadOptions, listReadCacheMs?: number): ParsedDirectory {
@@ -2032,15 +2040,10 @@ export class ParticipantDirectory implements FabricParticipantSource {
     this.#deadHostSweepAt = elapsed;
     const now = Date.now();
     void this.#notifications.enqueue(() => {
-      // R-keep-all-traces (#12785): the legacy reaper deletes by dead ownerHostId,
-      // including native terminal files. Until it supports per-record retention,
-      // conservatively defer its whole destructive sweep when terminal history exists.
-      // This is a deletion veto, NOT envelope/provenance/owner authority.
-      const history = [...this.mesh.listAll(PARTICIPANT_PREFIX, { fresh: true }), ...readParticipantFiles(this.mesh.root, { maxAgeMs: 0 })]
-        .some(entry => isObject(entry.value) && entry.value.kind === "actor" && entry.value.status === "stopped" &&
-          entry.value.stopReason === "owner-root-gone");
-      if (history) return Promise.resolve(0);
+      // Per-record DIRECTORY_RETENTION_MS uses private receipt/raw owner-death
+      // proof lazily at selection and deletion. No public candidate vetoes a sweep.
       return reapDeadHostRecords(this.mesh, this.options.identity, {
+        terminalActor: entry => this.options.terminalActor?.(entry),
         withCommitFence: operation => this.#withLeaseFence(operation),
         ownHostId: this.options.hostId,
         now,
@@ -3179,7 +3182,11 @@ export class ParticipantDirectory implements FabricParticipantSource {
   }
 
   #participantEntry(key: string, read: MeshReadOptions = {}): MeshStateEntry | undefined {
-    return newer(readParticipantFile(this.mesh.root, key), this.mesh.get(key, read));
+    const file = readParticipantFile(this.mesh.root, key), state = this.mesh.get(key, read);
+    // Only authenticated terminal state may displace a native owner-written file.
+    const candidate = state && isObject(state.value) && state.value.stopReason === "owner-root-gone" &&
+      !this.options.terminalActor?.(state) ? undefined : state;
+    return newer(file, candidate);
   }
 
   #legacySessionKey(): string | undefined {

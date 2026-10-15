@@ -8,6 +8,7 @@ import { isLiveLegacyRootEntry } from "./legacy-root-liveness.js";
 import { effectiveLiveness } from "./liveness.js";
 import { sweepAbandonedStateTemporaries } from "../mesh/temp-janitor.js";
 import { meshDirectoryStamp } from "./publication-generation.js";
+import type { FabricParticipantRecord } from "./types.js";
 
 /** A host's records are removed when its lease expired this long ago (smarty-dev#367). */
 export const DEAD_HOST_RECORDS_MS = 6 * 60 * 60 * 1000;
@@ -18,8 +19,8 @@ const HOST_PREFIX = "topology/hosts/";
 const PARTICIPANT_PREFIX = "topology/participants/";
 const INBOX_PREFIX = "topology/inbox/";
 const SESSION_PREFIX = "sessions/";
-/** Keep resumable inbox state and terminal session snapshots for at least a day. */
-const DIRECTORY_RETENTION_MS = 24 * 60 * 60 * 1000;
+/** 24h directory-display retention, including authenticated terminal actors; private history is never reaped here. */
+export const DIRECTORY_RETENTION_MS = 24 * 60 * 60 * 1000;
 const TERMINAL_SESSION_STATUSES = new Set(["completed", "failed", "stopped", "timed_out"]);
 // The same key scheme as the participant directory.
 const hostKey = (id: string): string => HOST_PREFIX + createHash("sha256").update(id).digest("hex");
@@ -40,6 +41,25 @@ const fileLeases = (mesh: { root?: string }): ReadonlyMap<string, FabricHostLeas
 /** `file`: the record's own file (smarty-dev#2004), not a shared-state entry. */
 interface DeadRecord { entry: MeshStateEntry; hostId: string; file?: true }
 
+interface DeadHostOptions {
+  ownHostId: string;
+  now?: number;
+  deadAfterMs?: number;
+  /** Lazy private-receipt + raw-owner-death validation, never a public envelope flag. */
+  terminalActor?: (entry: MeshStateEntry) => FabricParticipantRecord | undefined;
+}
+
+const retainedTerminalActor = (entry: MeshStateEntry | undefined, options: DeadHostOptions): boolean => {
+  if (!entry || record(entry.value)?.stopReason !== "owner-root-gone") return false;
+  const terminal = options.terminalActor?.(entry);
+  const settledAt = terminal?.settledAt;
+  const age = (options.now ?? Date.now()) - (settledAt ?? NaN);
+  // Only the validator's authenticated private receipt starts DIRECTORY_RETENTION_MS.
+  // A forged/future envelope timestamp must neither extend retention nor veto a sweep.
+  return terminal?.kind === "actor" && terminal.status === "stopped" && terminal.stopReason === "owner-root-gone" &&
+    Number.isFinite(settledAt) && age >= 0 && age < DIRECTORY_RETENTION_MS;
+};
+
 /**
  * Records left in the shared state by hosts that are gone: host leases that expired longer ago
  * than the window, and participants whose owner host is such a host, or has no record and the
@@ -48,7 +68,7 @@ interface DeadRecord { entry: MeshStateEntry; hostId: string; file?: true }
  */
 export const deadHostRecords = (
   mesh: Pick<MeshStore, "listAll"> & { root?: string },
-  options: { ownHostId: string; now?: number; deadAfterMs?: number },
+  options: DeadHostOptions,
   leases: ReadonlyMap<string, FabricHostLease> = fileLeases(mesh),
 ): DeadRecord[] => {
   const cutoff = (options.now ?? Date.now()) - (options.deadAfterMs ?? DEAD_HOST_RECORDS_MS);
@@ -68,7 +88,7 @@ export const deadHostRecords = (
       const owner = record(entry.value)?.ownerHostId;
       if (typeof owner !== "string" || owner === options.ownHostId) continue;
       const gone = hosts.get(owner);
-      if (gone === true || (gone === undefined && entry.updatedAt <= cutoff)) {
+      if ((gone === true || (gone === undefined && entry.updatedAt <= cutoff)) && !retainedTerminalActor(entry, options)) {
         dead.push({ entry, hostId: owner, ...(file ? { file: true as const } : {}) });
       }
     }
@@ -152,8 +172,7 @@ const staleDirectoryDeletes = (
 export const reapDeadHostRecords = async (
   mesh: Pick<MeshStore, "listAll" | "writeBatch" | "custody"> & Partial<Pick<MeshStore, "leaseCustody">> & { root?: string },
   identity: MeshIdentity,
-  options: { ownHostId: string; now?: number; deadAfterMs?: number;
-    withCommitFence?: <T>(operation: () => T | Promise<T>) => Promise<T> },
+  options: DeadHostOptions & { withCommitFence?: <T>(operation: () => T | Promise<T>) => Promise<T> },
 ): Promise<number> => {
   const fenced = options.withCommitFence ?? (async <T>(operation: () => T | Promise<T>): Promise<T> => operation());
   const cutoff = (options.now ?? Date.now()) - (options.deadAfterMs ?? DEAD_HOST_RECORDS_MS);
@@ -203,7 +222,8 @@ export const reapDeadHostRecords = async (
         kind: "delete" as const, key: entry.key, ifVersion: entry.version, onConflict: "skip" as const,
         condition: (current: (key: string) => MeshStateEntry | undefined) => {
           const host = current(hostKey(hostId));
-          return host === undefined || leaseGone(host, cutoff, leases);
+          return !retainedTerminalActor(current(entry.key), options) &&
+            (host === undefined || leaseGone(host, cutoff, leases));
         },
       })),
       prepare: view => {
@@ -240,7 +260,7 @@ export const reapDeadHostRecords = async (
       const gone = await removeParticipantFileIf({ root, custody: operation => mesh.custody(operation) }, entry.key, current => {
         const host = mesh.listAll(hostKey(hostId), { fresh: true }).find(candidate => candidate.key === hostKey(hostId));
         return current.version === entry.version && current.updatedAt === entry.updatedAt &&
-          (!host || leaseGone(host, cutoff, fileLeases(mesh)));
+          !retainedTerminalActor(current, options) && (!host || leaseGone(host, cutoff, fileLeases(mesh)));
       }, { withCommitFence: operation => targetGate(hostId, () => fenced(() => {
         assertTarget(hostId, retired.has(hostId) ? undefined : selectedLeases.get(hostId));
         return operation();

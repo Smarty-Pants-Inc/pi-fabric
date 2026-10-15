@@ -23,6 +23,8 @@ import { readHostLeaseCurrent, writeHostLease, type FabricHostLease } from "../s
 import { writeParticipantFile, withParticipantFileTryLock } from "../src/topology/participant-files.js";
 import { ownProcessIncarnation } from "../src/core/atomic-write.js";
 import * as participantFiles from "../src/topology/participant-files.js";
+import * as tempJanitor from "../src/mesh/temp-janitor.js";
+import { deadHostRecords, reapDeadHostRecords, DIRECTORY_RETENTION_MS } from "../src/topology/host-reaper.js";
 
 const hash = (id: string) => createHash("sha256").update(id).digest("hex");
 const keyOf = (id: string) => `topology/participants/${hash(id)}`;
@@ -122,12 +124,14 @@ describe("persistent old-root settlement (#12785)", () => {
     const running = f.mesh.get(keyOf(f.id))!;
     await f.mesh.put({ identity: f.current, key: keyOf(f.id), value: { ...(running.value as object), status: "stopped",
       stopReason: "owner-root-gone", ownerRootGoneAt: Date.now(), ownerRootGoneBy: f.current.id, capabilities: ["steer", "stop"] } });
-    // The fresh shared envelope wins selection; no participant file is unlinked.
-    expect(f.directory.list({ includeStale: true, fresh: true }).find(p => p.id === f.id)).toBeUndefined();
+    // An invalid observer envelope cannot shadow the authentic owner-written file.
+    for (const fresh of [true, false]) expect(f.directory.list({ includeStale: true, fresh }).find(p => p.id === f.id))
+      .toMatchObject({ status: "running", ownerIdentityId: f.old.id, capabilities: ["steer", "followUp", "fabric", "stop"] });
     expect(await f.repair.reconcile()).toBe(0);
-    await f.mesh.put({ identity: f.old, key: keyOf(f.id), value: running.value });
-    expect(f.directory.list({ includeStale: true, fresh: true }).find(p => p.id === f.id)).toMatchObject({ status: "running", capabilities: ["steer", "followUp", "fabric", "stop"] });
+    expect(await f.repair.retire(f.id, () => {})).toBeUndefined();
     expect(f.store.records()[0]!.status).toBe("running");
+    expect(f.mesh.get(keyOf(f.id))?.updatedBy.id).toBe(f.current.id);
+    expect(JSON.parse(fs.readFileSync(path.join(f.root, "participants", `${hash(f.id)}.json`), "utf8"))).toEqual({ format: 1, ...running });
   });
 
   it("ignores forged capabilities/transient/routing payloads even on an authenticated terminal generation", async () => {
@@ -157,7 +161,8 @@ describe("persistent old-root settlement (#12785)", () => {
       stopReason: "owner-root-gone", ownerRootGoneAt: Date.now(), ownerRootGoneBy: f.current.id, settledAt: Date.now(),
       sessionOrphan: { directorySettlement: { by: f.current.id, at: Date.now() } }, capabilities: [] } });
     expect(f.repair.validateTombstone(f.mesh.get(entry.key)!)).toBeUndefined();
-    expect(f.directory.list({ includeStale: true, fresh: true }).find(p => p.id === f.id)).toBeUndefined();
+    expect(f.directory.list({ includeStale: true, fresh: true }).find(p => p.id === f.id))
+      .toMatchObject({ status: "running", ownerIdentityId: f.old.id });
   });
 
   it("rechecks uncached root proof when only the old lease changes, not the tombstone bytes", async () => {
@@ -405,34 +410,83 @@ describe("persistent old-root settlement (#12785)", () => {
     expect(fs.readFileSync(f.history, "utf8")).toBe("private history sentinel\n");
   });
 
-  it("the native maintenance reaper cannot unlink/delete retained terminal history (recorded deletion seam)", async () => {
+  it("native maintenance uses authenticated DIRECTORY_RETENTION_MS (24h), never a whole-sweep veto (recorded deletion seams)", async () => {
     const f = await fixture(); await f.repair.reconcile();
     const nativeFile = path.join(f.root, "participants", `${hash(f.id)}.json`);
-    const bytes = fs.readFileSync(nativeFile, "utf8"), entry = f.mesh.get(keyOf(f.id))!;
-    const deleted: string[] = []; const batch = f.mesh.writeBatch.bind(f.mesh);
-    vi.spyOn(f.mesh, "writeBatch").mockImplementation(input => batch({ ...input, prepare: view => {
-      const selected = [...input.ops, ...(input.prepare?.(view) ?? [])];
-      for (const op of selected) if (op.kind === "delete" && (op.key === entry.key || op.key === f.legacy)) {
-        deleted.push(op.key); throw new Error("Recorded forbidden history deletion");
+    let entry = f.mesh.get(keyOf(f.id))!;
+    const settledAt = f.repair.validateTombstone(entry)!.settledAt!;
+    const hostKey = `topology/hosts/${hash(f.old.id)}`;
+    await f.mesh.put({ identity: f.old, key: hostKey, value: { id: f.old.id, expiresAt: f.lease.expiresAt } });
+    const ordinaryId = "c".repeat(32), fakeId = "d".repeat(32);
+    const clock = vi.spyOn(Date, "now").mockReturnValue(settledAt + 100 * DIRECTORY_RETENTION_MS);
+    try {
+      // A refreshed/forged future envelope cannot renew the private 24h bound.
+      await f.mesh.put({ identity: f.current, key: entry.key, value: entry.value });
+      entry = f.mesh.get(entry.key)!; writeParticipantFile(f.root, entry);
+      for (const id of [ordinaryId, fakeId]) {
+        await f.mesh.put({ identity: id === ordinaryId ? f.old : f.current, key: keyOf(id), value: { ...(entry.value as object), id,
+          ...(id === ordinaryId ? { status: "running", stopReason: undefined } : {
+            settledAt: settledAt + 100 * DIRECTORY_RETENTION_MS, updatedAt: settledAt + 100 * DIRECTORY_RETENTION_MS }) } });
+        writeParticipantFile(f.root, f.mesh.get(keyOf(id))!);
       }
-      return selected.slice(input.ops.length);
-    } }));
-    const unlink = fs.unlinkSync.bind(fs);
-    vi.spyOn(fs, "unlinkSync").mockImplementation(file => {
-      if (String(file) === nativeFile) { deleted.push(nativeFile); throw new Error("Recorded forbidden participant unlink"); }
-      unlink(file);
+    } finally { clock.mockRestore(); }
+    const bytes = fs.readFileSync(nativeFile, "utf8");
+    const snapshots = participantFiles.readParticipantFiles(f.root).map(row => JSON.stringify(row));
+    const shared: string[] = [], files: string[] = [];
+    // No product deletion code is executed, even if a regression selects the protected record.
+    vi.spyOn(participantFiles, "sweepParticipantLockLeftovers").mockResolvedValue(undefined);
+    vi.spyOn(tempJanitor, "sweepAbandonedStateTemporaries").mockReturnValue([]);
+    vi.spyOn(fs, "unlinkSync").mockImplementation(() => { throw new Error("Forbidden product unlink"); });
+    vi.spyOn(participantFiles, "removeParticipantFileIf").mockImplementation(async (_mesh, key, predicate) => {
+      const current = participantFiles.readParticipantFile(f.root, key)!;
+      if (predicate(current)) { files.push(key); throw new Error("Recorded file delete, not executed"); }
+      return false;
     });
-    const identity: MeshIdentity = { id: "session:reaper", sessionId: "reaper", name: "Maintenance", kind: "main" };
-    const presence = new ParticipantDirectory(f.mesh, { enabled: true, hostId: identity.id, rootId: identity.id, identity,
-      heartbeatMs: 60000, reapDeadHosts: { sweepMs: 0, deadAfterMs: 1 } });
-    presence.registerSource(() => [presence.root({ id: identity.id, name: "Main", kind: "main", status: "idle", runner: "pi",
-      transport: "host", cwd: process.cwd(), sessionId: "reaper", updatedAt: Date.now(), pendingMessages: false, local: true })]);
-    cleanups.push(() => presence.close());
-    await presence.start(); await presence.close(); // close joins the actual maintenance queue, no polling
-    expect(deleted).toEqual([]);
+    let sharedProbe = true, proofAvailable = true;
+    const probe = {
+      root: f.root, listAll: f.mesh.listAll.bind(f.mesh), custody: async <T>(operation: () => T | Promise<T>) => operation(),
+      writeBatch: vi.fn(async (input: Parameters<MeshStore["writeBatch"]>[0]) => {
+        proofAvailable = true; // Recheck proof at the shared/file commit seams, not only selection.
+        if (sharedProbe) {
+          for (const op of input.ops) if (op.kind === "delete" && (!op.condition || op.condition(key => f.mesh.get(key)))) shared.push(op.key);
+          throw new Error("Recorded shared delete, not executed");
+        }
+        // The file-only probe skips ALL shared intents. No prepare/outbox/lease removal.
+        return [];
+      }),
+    };
+    const options = { ownHostId: f.current.id, now: settledAt + 7 * 60 * 60 * 1000,
+      terminalActor: (candidate: Parameters<typeof f.repair.validateTombstone>[0]) => proofAvailable ? f.repair.validateTombstone(candidate) : undefined };
+    const recordedReap = async (at: typeof options, hideSelectionProof = false) => {
+      sharedProbe = true; proofAvailable = !hideSelectionProof;
+      await expect(reapDeadHostRecords(probe as unknown as MeshStore, f.current, at)).rejects.toThrow("Recorded shared delete");
+      sharedProbe = false; proofAvailable = !hideSelectionProof;
+      await reapDeadHostRecords(probe as unknown as MeshStore, f.current, at);
+    };
+    const selected = deadHostRecords(probe, options);
+    expect(selected.filter(row => row.entry.key === entry.key)).toEqual([]);
+    for (const id of [ordinaryId, fakeId]) expect(selected.filter(row => row.entry.key === keyOf(id))).toHaveLength(2);
+    await recordedReap(options);
+    expect(shared).toEqual(expect.arrayContaining([hostKey, keyOf(ordinaryId), keyOf(fakeId)]));
+    expect(shared).not.toContain(entry.key);
+    expect(files).toEqual(expect.arrayContaining([keyOf(ordinaryId), keyOf(fakeId)]));
+    expect(files).not.toContain(entry.key);
+    shared.length = 0; files.length = 0;
+    const expired = { ...options, now: settledAt + DIRECTORY_RETENTION_MS };
+    expect(deadHostRecords(probe, expired).filter(row => row.entry.key === entry.key)).toHaveLength(2);
+    await recordedReap(expired);
+    expect(shared).toContain(entry.key); expect(files).toContain(entry.key);
+    shared.length = 0; files.length = 0;
+    // Even a selected terminal must survive if private proof appears before deletion.
+    await recordedReap(options, true);
+    expect(shared).not.toContain(entry.key); expect(files).not.toContain(entry.key);
+    expect(shared).toContain(keyOf(fakeId)); expect(files).toContain(keyOf(fakeId));
+    expect(DIRECTORY_RETENTION_MS).toBe(24 * 60 * 60 * 1000);
     expect(fs.readFileSync(nativeFile, "utf8")).toBe(bytes);
+    expect(participantFiles.readParticipantFiles(f.root).map(row => JSON.stringify(row))).toEqual(snapshots);
     expect(f.mesh.get(entry.key)?.version).toBe(entry.version);
     expect(f.mesh.get(f.legacy)).toBeDefined();
+    expect(fs.readFileSync(f.history, "utf8")).toBe("private history sentinel\n");
   });
 
   it("the ordinary committed presence pass repairs raw advertisements without actors/list/status reads", async () => {

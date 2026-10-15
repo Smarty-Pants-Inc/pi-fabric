@@ -140,8 +140,6 @@ export { RESIDENT_RUN_RETENTION_MS, sweepResidentRuns } from "./retention.js";
 // smarty-dev#11172: the requests/ directory watch is primary; this is only the base of
 // the capped, coalesced backoff for a failed rename (pending failed work), never an idle poll.
 const REQUEST_POLL_MS = 50;
-// ponytail: safety net for missed fs.watch events (#11172 review)
-export const RESIDENT_REQUEST_RECONCILE_MS = 5 * 60_000;
 // A failed (non-transient) request poll or delivery flush is retried at this deadline.
 const REQUEST_FAILURE_RETRY_MS = 1_000;
 // A running retention scan continues in bounded slices at the former maintenance cadence.
@@ -326,7 +324,6 @@ export class ResidentHost {
   /** The owner token this host publishes in owner.json: its generation (smarty-dev#7950). */
   get generation(): string { return this.#token; }
   #requestWatcher: fs.FSWatcher | undefined;
-  #requestReconcileTimer: NodeJS.Timeout | undefined;
   #requestWatchRetried = false;
   #rootWatchRetried = false;
   #meshWatchRetried = false;
@@ -1004,9 +1001,6 @@ export class ResidentHost {
       this.#ready = true;
       // The initial bounded drain (smarty-dev#11172): requests written before readiness.
       this.#kickRequests();
-      // The watch is primary; this unref'd slow safety net only covers a missed event.
-      this.#requestReconcileTimer = setInterval(() => this.#kickRequests(), RESIDENT_REQUEST_RECONCILE_MS);
-      this.#requestReconcileTimer.unref();
       fs.rmSync(residentSleepingPath(this.config.residencyRoot), { force: true });
       this.#scheduleIdleCheck();
       this.#writeWakeRoutes();
@@ -1124,8 +1118,6 @@ export class ResidentHost {
     this.#meshWatcher = undefined;
     if (this.#requestRetryTimer) clearTimeout(this.#requestRetryTimer);
     this.#requestRetryTimer = undefined;
-    if (this.#requestReconcileTimer) clearInterval(this.#requestReconcileTimer);
-    this.#requestReconcileTimer = undefined;
     if (this.#scheduleTimer) clearTimeout(this.#scheduleTimer);
     this.#scheduleTimer = undefined;
     if (this.#maintenanceTimer) clearTimeout(this.#maintenanceTimer);
@@ -1626,7 +1618,7 @@ export class ResidentHost {
     this.#requestRetention.sweep(now, live, 5, stoppedWritersGone);
   }
 
-  /** smarty-dev#11172: drains requests primarily on directory events, with slow reconciliation.
+  /** smarty-dev#11172: drains requests on directory events, startup and known failed-work retries.
    * Concurrent kicks coalesce into one more bounded pass after the running one. */
   #kickRequests(): void {
     this.#requestKick = true;
@@ -1678,8 +1670,8 @@ export class ResidentHost {
 
   /** smarty-dev#11172: the request queue's primary wake source. Unsupported at startup fails closed
    * (start() throws before readiness). A watcher error buys one re-registration plus one bounded
-   * rescan; a repeated error makes the host unavailable (#failWatch). The slow reconciliation is
-   * only the reviewed safety net for a healthy watcher that silently misses an event. */
+   * rescan; a repeated error makes the host unavailable (#failWatch). A healthy empty queue has
+   * no request timer; failed scans and renames retain their own bounded retry deadline. */
   #watchRequests(startup = false): void {
     if (this.#closed) return;
     let watcher: fs.FSWatcher;

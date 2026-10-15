@@ -7,7 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
-import { ResidentHost, RESIDENT_REQUEST_RECONCILE_MS } from "../src/residency/host.js";
+import { ResidentHost } from "../src/residency/host.js";
 import {
   RESIDENT_HOST_FORMAT, residentDeliveryPrefix, residentHostId, type ResidentDeliveryRecord, type ResidentHostConfig,
 } from "../src/residency/protocol.js";
@@ -70,6 +70,39 @@ const ids = (prefix: string, count: number) => Array.from({ length: count }, (_,
 const watchesOf = (watch: { mock: { calls: unknown[][] } }, target: string) =>
   watch.mock.calls.filter(([watched]) => String(watched) === target).length;
 const stackHas = (frame: string) => (new Error().stack ?? "").includes(frame);
+/** Only requests/ is synthetic: explicit events drive the real filesystem admission/response path. */
+const mockRequestWatch = (requests: string) => {
+  const watch = fs.watch;
+  const created: fs.FSWatcher[] = [];
+  const spy = vi.spyOn(fs, "watch").mockImplementation(((target: fs.PathLike, ...rest: unknown[]) => {
+    if (String(target) !== requests) return (watch as (...args: unknown[]) => fs.FSWatcher)(target, ...rest);
+    const watcher = new EventEmitter() as unknown as fs.FSWatcher;
+    watcher.on("change", rest[rest.length - 1] as (...args: unknown[]) => void);
+    let closed = false;
+    watcher.close = (() => {
+      if (!closed) { closed = true; watcher.emit("close"); }
+      return watcher;
+    }) as fs.FSWatcher["close"];
+    created.push(watcher);
+    return watcher;
+  }) as typeof fs.watch);
+  return { spy, created };
+};
+/** Count the real queue read once per drain pass, excluding idle checks nested in the same stack. */
+const observeRequestPasses = (requests: string) => {
+  const readdir = fs.readdirSync;
+  const passes: Array<{ entries: string[]; kicked: boolean }> = [];
+  vi.spyOn(fs, "readdirSync").mockImplementation(((target: fs.PathLike, ...rest: unknown[]) => {
+    const stack = new Error().stack ?? "";
+    const entries = (readdir as (...args: unknown[]) => unknown)(target, ...rest);
+    if (String(target) === requests && stack.includes("pollRequests") &&
+        !stack.includes("hasHostWork") && !stack.includes("hasPendingRequest")) {
+      passes.push({ entries: entries as string[], kicked: stack.includes("kickRequests") });
+    }
+    return entries;
+  }) as typeof fs.readdirSync);
+  return passes;
+};
 /** Settles to "hung" instead of hanging the suite. */
 const within = <T>(work: Promise<T>, ms: number) =>
   Promise.race([work.then(value => ({ value }), (error: unknown) => ({ error })), sleep(ms).then(() => "hung" as const)]);
@@ -96,36 +129,74 @@ describe("event-driven resident request queue (smarty-dev#11172)", () => {
     expect(timeouts.mock.calls.filter(([, ms]) => ms === 50)).toHaveLength(0);
   });
 
-  it("drains a request missed by fs.watch after one slow reconciliation period and clears the timer on close", async () => {
-    const { host, requests, responses } = fixture();
-    const watch = fs.watch;
-    vi.spyOn(fs, "watch").mockImplementation(((target: fs.PathLike, ...rest: unknown[]) => {
-      if (String(target) === requests) {
-        // Simulate a healthy watcher that silently misses this request-file event.
-        const watcher = new EventEmitter() as unknown as fs.FSWatcher;
-        watcher.close = (() => { watcher.emit("close"); return watcher; }) as fs.FSWatcher["close"];
-        return watcher;
+  it("schedules no request timer and makes zero request kicks over 30 virtual minutes of healthy empty idle", async () => {
+    const { host, requests, responses, idle } = fixture();
+    const { created } = mockRequestWatch(requests);
+    const passes = observeRequestPasses(requests);
+    // Virtualize only request scheduling. Presence/control/retention/idle deadlines keep their
+    // real clocks: they are legitimate independent obligations, not request reconciliation.
+    const native = { setTimeout, clearTimeout, setInterval, clearInterval };
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval"] });
+    const virtual = { setTimeout, clearTimeout, setInterval, clearInterval };
+    const nativeHandles = new Set<unknown>();
+    const requestTimers: Array<{ kind: string; ms: number }> = [];
+    const requestOrigin = () => {
+      const origin = (new Error().stack ?? "").split("\n").find(frame => /[\\/]src[\\/]/.test(frame));
+      return !!origin && /[\\/]residency[\\/]host\.(?:ts|js):/.test(origin) &&
+        /(?:armRequestRetry|ResidentHost\.start)/.test(origin);
+    };
+    vi.spyOn(globalThis, "setTimeout").mockImplementation(((...args: Parameters<typeof setTimeout>) => {
+      if (requestOrigin()) {
+        requestTimers.push({ kind: "timeout", ms: Number(args[1] ?? 0) });
+        return virtual.setTimeout(...args);
       }
-      return (watch as (...args: unknown[]) => fs.FSWatcher)(target, ...rest);
-    }) as typeof fs.watch);
-    const intervals = vi.spyOn(globalThis, "setInterval");
-    const clear = vi.spyOn(globalThis, "clearInterval");
-    await host.start();
-    await sleep(200); // settle the startup drain before creating an unwatched request
-    expect(RESIDENT_REQUEST_RECONCILE_MS).toBe(300_000);
-    const ticks = intervals.mock.calls.flatMap(([callback, ms], index) =>
-      ms === RESIDENT_REQUEST_RECONCILE_MS ? [{ callback, timer: intervals.mock.results[index]!.value }] : []);
-    expect(ticks).toHaveLength(1);
-    submit(requests, "missed-event");
-    await sleep(100);
-    expect(pending(requests)).toBe(1);
-    expect(answered(responses, ["missed-event"])).toBe(false);
-    // Expire one five-minute period through the existing timer-spy seam, without waiting five minutes.
-    (ticks[0]!.callback as () => void)();
-    expect(await waitUntil(() => answered(responses, ["missed-event"]))).toBe(true);
-    expect(pending(requests)).toBe(0);
-    await host.close();
-    expect(clear).toHaveBeenCalledWith(ticks[0]!.timer);
+      const handle = native.setTimeout(...args);
+      nativeHandles.add(handle);
+      return handle;
+    }) as typeof setTimeout);
+    vi.spyOn(globalThis, "setInterval").mockImplementation(((...args: Parameters<typeof setInterval>) => {
+      if (requestOrigin()) {
+        requestTimers.push({ kind: "interval", ms: Number(args[1] ?? 0) });
+        return virtual.setInterval(...args);
+      }
+      const handle = native.setInterval(...args);
+      nativeHandles.add(handle);
+      return handle;
+    }) as typeof setInterval);
+    vi.spyOn(globalThis, "clearTimeout").mockImplementation(timer => {
+      if (nativeHandles.delete(timer)) native.clearTimeout(timer);
+      else virtual.clearTimeout(timer);
+    });
+    vi.spyOn(globalThis, "clearInterval").mockImplementation(timer => {
+      if (nativeHandles.delete(timer)) native.clearInterval(timer);
+      else virtual.clearInterval(timer);
+    });
+    try {
+      await host.start();
+      await sleep(200);
+      // Calibrate the private-kick observation against the real startup drain before measuring idle.
+      expect(passes.length).toBeGreaterThan(0);
+      expect(passes.every(pass => pass.kicked)).toBe(true);
+      passes.length = 0;
+      await vi.advanceTimersByTimeAsync(30 * 60_000);
+      expect(requestTimers).toEqual([]); // includes scheduling during startup, not just timer firings
+      expect(vi.getTimerCount()).toBe(0);
+      expect(passes).toEqual([]);
+      expect(pending(requests)).toBe(0);
+      expect(fs.readdirSync(responses)).toEqual([]);
+      expect(created).toHaveLength(1); // healthy, never re-registered
+      expect(idle).not.toHaveBeenCalled();
+      // The same healthy watcher still serves actual arrivals; no unsolicited missed-arrival poll.
+      submit(requests, "after-quiet");
+      created[0]!.emit("change", "rename", "after-quiet.json");
+      expect(await waitUntil(() => answered(responses, ["after-quiet"]))).toBe(true);
+      expect(passes).toHaveLength(1);
+      expect(passes[0]).toEqual({ entries: ["after-quiet.json"], kicked: true });
+    } finally {
+      await host.close();
+      vi.restoreAllMocks();
+      vi.useRealTimers();
+    }
   });
 
   it("drains a startup backlog and a concurrent burst larger than one 32-entry pass", async () => {
@@ -189,50 +260,39 @@ describe("event-driven resident request queue (smarty-dev#11172)", () => {
     expect(idle).not.toHaveBeenCalled();
   });
 
-  it("re-registers once and rescans on a watcher error; a repeated error is terminal, never a poll", async () => {
+  it.each(["error", "close"] as const)("re-registers and makes exactly one rescan on request watch %s; replacement serves requests", async loss => {
     const { host, idle, requests, responses } = fixture();
-    const watch = fs.watch;
-    const created: fs.FSWatcher[] = [];
-    const spy = vi.spyOn(fs, "watch").mockImplementation(((target: fs.PathLike, ...rest: unknown[]) => {
-      const watcher = (watch as (...args: unknown[]) => fs.FSWatcher)(target, ...rest);
-      if (String(target) === requests) created.push(watcher);
-      return watcher;
-    }) as typeof fs.watch);
+    const { spy, created } = mockRequestWatch(requests);
+    const passes = observeRequestPasses(requests);
     const intervals = vi.spyOn(globalThis, "setInterval");
     await host.start();
+    await sleep(200);
+    expect(passes.length).toBeGreaterThan(0);
+    passes.length = 0;
     expect(watchesOf(spy, requests)).toBe(1);
-    // A request lands while the watch is broken: the bounded rescan finds it.
-    submit(requests, "during-error");
-    created[0]!.emit("error", Object.assign(new Error("overflow"), { code: "ENOSPC" }));
+    // No native request event can race the injected loss: only its bounded rescan finds this file.
+    submit(requests, `during-${loss}`);
+    created[0]!.emit(loss, ...(loss === "error" ? [Object.assign(new Error("overflow"), { code: "ENOSPC" })] : []));
     expect(watchesOf(spy, requests)).toBe(2);
-    expect(await waitUntil(() => answered(responses, ["during-error"]))).toBe(true);
-    // The re-registered watch is live.
+    expect(await waitUntil(() => answered(responses, [`during-${loss}`]))).toBe(true);
+    await sleep(100); // own close following error must not buy a second rescan
+    expect(passes).toEqual([{ entries: [`during-${loss}.json`], kicked: true }]);
+    expect(pending(requests)).toBe(0);
+    passes.length = 0;
     submit(requests, "after-reregister");
+    created[1]!.emit("change", "rename", "after-reregister.json");
     expect(await waitUntil(() => answered(responses, ["after-reregister"]))).toBe(true);
+    await sleep(100);
+    expect(passes).toEqual([{ entries: ["after-reregister.json"], kicked: true }]);
     expect(idle).not.toHaveBeenCalled();
-    created[1]!.emit("error", new Error("again"));
+    created[1]!.emit(loss, ...(loss === "error" ? [new Error("again")] : []));
     expect(idle).toHaveBeenCalledWith("error");
+    expect(idle).toHaveBeenCalledTimes(1);
     expect(watchesOf(spy, requests)).toBe(2);
     expect(intervals.mock.calls.filter(([, ms]) => ms === 50)).toHaveLength(0);
-  });
-
-  it("treats a native self-close as a watch loss (bounded contract), but never its own close", async () => {
-    const { host, idle, requests, responses } = fixture();
-    const watch = fs.watch;
-    const created: fs.FSWatcher[] = [];
-    const spy = vi.spyOn(fs, "watch").mockImplementation(((target: fs.PathLike, ...rest: unknown[]) => {
-      const watcher = (watch as (...args: unknown[]) => fs.FSWatcher)(target, ...rest);
-      if (String(target) === requests) created.push(watcher);
-      return watcher;
-    }) as typeof fs.watch);
-    await host.start();
-    submit(requests, "during-close");
-    created[0]!.emit("close"); // the native watch closed itself: not silently stranded
-    expect(watchesOf(spy, requests)).toBe(2);
-    expect(await waitUntil(() => answered(responses, ["during-close"]))).toBe(true);
-    created[1]!.emit("close");
-    expect(idle).toHaveBeenCalledWith("error");
-    expect(watchesOf(spy, requests)).toBe(2);
+    await host.close();
+    expect(watchesOf(spy, requests)).toBe(2); // host-owned close never re-registers
+    expect(idle).toHaveBeenCalledTimes(1);
   });
 
   it("re-evaluates the exact due time when another store moves a schedule EARLIER (schedules.json watch)", async () => {
@@ -329,37 +389,70 @@ describe("startup join watch and retry obligations (smarty-dev#11172 audit CODE-
     expect(fs.existsSync(path.join(config.residencyRoot, "maintenance-ready.json"))).toBe(true);
   });
 
-  it("CODE-5: one transient requests/ read failure with no later matching event still delivers via the bounded retry", async () => {
+  it.each(["read", "rename"] as const)("CODE-5: a transient request %s failure drains known work and a missed later event at its existing 50-1000 ms retry", async failure => {
     const { host, requests, responses } = fixture();
-    const watch = fs.watch;
-    let suppress = false;
-    vi.spyOn(fs, "watch").mockImplementation(((target: fs.PathLike, ...rest: unknown[]) => {
-      const watcher = (watch as (...args: unknown[]) => fs.FSWatcher)(target, ...rest);
-      if (String(target) === requests) {
-        // After the injected failure, drop further native request notifications: only a retry can drain.
-        const emit = watcher.emit.bind(watcher);
-        watcher.emit = ((event: string | symbol, ...args: unknown[]) =>
-          event === "change" && suppress ? false : emit(event, ...args)) as typeof watcher.emit;
-      }
-      return watcher;
-    }) as typeof fs.watch);
+    const { created } = mockRequestWatch(requests);
     await host.start();
     await sleep(200);
     const readdir = fs.readdirSync;
-    let failOnce = true;
+    const rename = fs.renameSync;
+    let failures = 0;
     vi.spyOn(fs, "readdirSync").mockImplementation(((target: fs.PathLike, ...rest: unknown[]) => {
-      if (failOnce && String(target) === requests && stackHas("pollRequests")) {
-        failOnce = false;
-        suppress = true;
-        throw Object.assign(new Error("transient"), { code: "EIO" });
+      if (failure === "read" && failures === 0 && String(target) === requests && stackHas("pollRequests")) {
+        failures++;
+        throw Object.assign(new Error("transient read"), { code: "EIO" });
       }
       return (readdir as (...args: unknown[]) => unknown)(target, ...rest);
     }) as typeof fs.readdirSync);
-    submit(requests, "after-read-error");
-    expect(await waitUntil(() => !failOnce, 2_000)).toBe(true); // the native event reached a failing scan
-    // Counterexample: the frozen host treated the failed scan as a done empty pass and armed nothing.
-    expect(await waitUntil(() => answered(responses, ["after-read-error"]), 5_000)).toBe(true);
+    vi.spyOn(fs, "renameSync").mockImplementation(((from: fs.PathLike, to: fs.PathLike) => {
+      if (failure === "rename" && failures === 0 && path.dirname(String(from)) === requests &&
+          path.dirname(String(to)) !== requests) {
+        failures++;
+        throw Object.assign(new Error("transient rename"), { code: "EBUSY" });
+      }
+      return rename(from, to);
+    }) as typeof fs.renameSync);
+    const timeout = globalThis.setTimeout;
+    const retries: Array<{ callback: () => void; ms: number; timer: ReturnType<typeof setTimeout> }> = [];
+    vi.spyOn(globalThis, "setTimeout").mockImplementation(((...args: Parameters<typeof setTimeout>) => {
+      if (stackHas("armRequestRetry")) {
+        // Hold only this request retry for deterministic expiry through its real callback.
+        // All other timers remain native, and the real timer handle still participates in close().
+        const timer = timeout(() => {}, 60_000);
+        timer.unref();
+        retries.push({ callback: args[0] as () => void, ms: Number(args[1]), timer });
+        return timer;
+      }
+      return timeout(...args);
+    }) as typeof setTimeout);
+    const first = `after-${failure}-error`;
+    submit(requests, first);
+    created[0]!.emit("change", "rename", `${first}.json`);
+    expect(await waitUntil(() => retries.length > 0, 2_000)).toBe(true);
+    expect(failures).toBe(1);
+    expect(retries).toHaveLength(1);
+    expect(retries[0]!.ms).toBeGreaterThanOrEqual(50);
+    expect(retries[0]!.ms).toBeLessThanOrEqual(1_000);
+    expect(retries[0]!.ms).toBe(50); // first failure uses the existing base, not a new safety-net timer
+    // The queue is already owed work. This subsequent arrival emits no watch notification at all.
+    // This does not promise detection of an unsolicited missed arrival into a formerly empty queue.
+    submit(requests, "missed-later-event");
+    await sleep(100);
+    expect(pending(requests)).toBe(2);
+    expect(answered(responses, [first])).toBe(false);
+    expect(answered(responses, ["missed-later-event"])).toBe(false);
+    clearTimeout(retries[0]!.timer);
+    retries[0]!.callback(); // expire the already-armed, asserted 50 ms deadline; no new watch event
+    expect(await waitUntil(() => answered(responses, [first, "missed-later-event"]))).toBe(true);
+    for (const requestId of [first, "missed-later-event"]) {
+      expect(JSON.parse(fs.readFileSync(path.join(responses, `${requestId}.json`), "utf8")))
+        .toMatchObject({ format: RESIDENT_HOST_FORMAT, requestId, ok: false, completedAt: expect.any(Number) });
+    }
     expect(pending(requests)).toBe(0);
+    await sleep(100);
+    expect(retries).toHaveLength(1); // successful drain clears the obligation, never starts polling
+    expect(created).toHaveLength(1);
+    expect(failures).toBe(1);
   });
 
   it("CODE-5 counterexample: a successful empty queue arms no request retry", async () => {

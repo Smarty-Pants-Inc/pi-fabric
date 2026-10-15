@@ -473,7 +473,7 @@ export class RootInbox {
     const has = (id: string): boolean => this.#delivered.has(id) || session.delivered?.has(id) === true;
     if (eventReceipts(event).some(has) || crossIdentityReceipts(event.from.id, event.data).some(has)) return true;
     const identity = deliveryIdentity(event.data);
-    // An explicit messageId/deliveryId is a stable event identity. Once the exact receipts above
+    // An explicit deliveryId/messageId/commandId is a stable event identity. Once the exact receipts above
     // miss, this is distinct work: never let its shared key/ref fall back to a native carrier.
     // #1226 also records originating event receipts on Main carriers, so exact matching stays the
     // preferred path as carriers gain that metadata.

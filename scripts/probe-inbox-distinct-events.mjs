@@ -199,15 +199,30 @@ const launch = async () => {
     pending.clear();
     // RPC's documented orderly shutdown: closing stdin lets Pi dispose its active runtime.
     if (child.exitCode === null && child.signalCode === null && !child.stdin.destroyed) child.stdin.end();
-    let timeout;
-    const exited = await Promise.race([
-      exit.then(() => true),
-      new Promise(resolve => { timeout = setTimeout(() => resolve(false), 15000); }),
-    ]);
-    clearTimeout(timeout);
-    fs.writeFileSync(stderrFile, stderr);
-    if (!exited) throw new Error('Pi RPC did not exit after orderly stdin EOF; no signal/kill fallback is used');
-    if (spawnError) throw spawnError;
+    const waitForExit = async timeoutMs => {
+      let timeout;
+      try {
+        return await Promise.race([
+          exit.then(() => true),
+          new Promise(resolve => { timeout = setTimeout(() => resolve(false), timeoutMs); }),
+        ]);
+      } finally { clearTimeout(timeout); }
+    };
+    try {
+      if (!await waitForExit(15000)) throw new Error('Pi RPC did not exit after orderly stdin EOF');
+      if (spawnError) throw spawnError;
+    } finally {
+      try {
+        // Reap only the child this launch owns, even when orderly shutdown fails.
+        if (child.pid && child.exitCode === null && child.signalCode === null) {
+          child.kill('SIGTERM');
+          if (!await waitForExit(2000)) {
+            child.kill('SIGKILL');
+            assert.ok(await waitForExit(5000), `Pi RPC child ${child.pid} did not exit after SIGKILL`);
+          }
+        }
+      } finally { fs.writeFileSync(stderrFile, stderr); }
+    }
   };
   current = { child, request, stop, exit };
   state = await request({ type: 'get_state' });

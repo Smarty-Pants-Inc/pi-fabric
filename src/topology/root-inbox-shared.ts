@@ -60,12 +60,13 @@ export const workKey = (data: unknown): string | undefined => {
 const receipt = (fromId: string, kind: string, value: string): string =>
   createHash("sha256").update(JSON.stringify([fromId, kind, value])).digest("hex");
 
-/** A delivery identity outranks work-key/ref fallbacks, never the other way around. */
+/** Delivery identity precedence: deliveryId > messageId > commandId > work-key/ref fallbacks. */
 export const deliveryIdentity = (data: unknown): { kind: string; value: string } | undefined => {
   if (!data || typeof data !== "object") return undefined;
   const fields = data as Record<string, unknown>;
   if (typeof fields.deliveryId === "string" && fields.deliveryId) return { kind: "delivery", value: fields.deliveryId };
   if (typeof fields.messageId === "string" && fields.messageId) return { kind: "id", value: fields.messageId };
+  if (typeof fields.commandId === "string" && fields.commandId) return { kind: "delivery", value: fields.commandId };
   return undefined;
 };
 /**
@@ -112,12 +113,6 @@ export const eventReceipts = (event: MeshEvent): string[] => {
     ...(identity ? [receipt(event.from.id, identity.kind, identity.value), ...crossIdentityReceipts(event.from.id, event.data)] : []),
   ];
 };
-const display = (event: MeshEvent): string[] => {
-  const out = eventReceipts(event);
-  const cmd = (event.data as { commandId?: unknown } | undefined)?.commandId;
-  if (!deliveryIdentity(event.data) && typeof cmd === "string" && cmd) out.push(receipt(event.from.id, "delivery", cmd));
-  return out;
-};
 /** What the session's own entries say it holds. */
 export interface RootInboxSession {
   /** Inbox messages collectively holding all of these event ids. */
@@ -143,7 +138,7 @@ export const projectRootInboxReceipt = (value: unknown): unknown => {
     return {
       id: row.id, chain: row.chain, deliveryId: row.deliveryId,
       ...(from ? { from: { id: from.id } } : {}),
-      ...(data ? { data: { key: data.key, ref: data.ref, topic: data.topic, deliveryId: data.deliveryId, messageId: data.messageId } } : {}),
+      ...(data ? { data: { key: data.key, ref: data.ref, topic: data.topic, deliveryId: data.deliveryId, messageId: data.messageId, commandId: data.commandId } } : {}),
     };
   };
   const entry = object(value);
@@ -336,6 +331,6 @@ export const rootInboxMessage = (input: readonly MeshEvent[], extra?: readonly M
     "</fabric-inbox>",
   ].join("\n"),
   display: true,
-  details: { ids: all.map((event) => event.id), receipts: rest.concat(events).flatMap(display) },
+  details: { ids: all.map((event) => event.id), receipts: rest.concat(events).flatMap(eventReceipts) },
   };
 };

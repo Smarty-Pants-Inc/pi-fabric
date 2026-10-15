@@ -6,7 +6,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MainAgentController } from "../src/main-agent.js";
 import { MeshStore, type MeshEvent, type MeshIdentity } from "../src/mesh/store.js";
-import { RootInbox, rootInboxMessage, rootInboxSession } from "../src/topology/root-inbox.js";
+import { RootInbox, projectRootInboxReceipt, rootInboxMessage, rootInboxSession } from "../src/topology/root-inbox.js";
 
 // smarty-dev#12140: a work key (data.key) is not unique per notification. Two distinct durable
 // events with the same sender, topic and key (a watcher's rc=1 then rc=124) must both deliver.
@@ -140,11 +140,12 @@ describe("distinct same-key mesh events (smarty-dev#12140)", () => {
     expect(ids((await h.box().wake(h.session(), () => true))?.events)).toEqual([third.id]);
   });
 
-  it.each(["messageId", "deliveryId"] as const)("delivers a distinct addressed event with a different %s after a key-only native carrier", async (identity) => {
+  it.each(["messageId", "deliveryId", "commandId"] as const)("delivers a distinct addressed event with a different %s after a key-only native carrier", async (identity) => {
     const h = setup(); const inbox = h.box(); inbox.start();
     h.main.deliverAgent({ from: watcher, message: "rc=1", delivery: "steer", data: { key: KEY, topic: TOPIC } });
-    await h.publish("rc=1 shadow");
-    const distinct = await h.publish("rc=124 distinct", { key: KEY, [identity]: `watcher-local-${identity}` }); h.advance(1);
+    const distinct = await h.publish("rc=124 distinct", { key: KEY, [identity]: `watcher-local-${identity}` });
+    // Explicit work comes first: it must not spend the carrier's fallback on its way past.
+    await h.publish("rc=1 shadow"); h.advance(1);
     // The legacy key-only shadow is still suppressed, but its distinct explicit identity is not.
     const batch = await inbox.next(h.session());
     expect(ids(batch.events)).toEqual([distinct.id]);
@@ -324,15 +325,45 @@ describe("distinct same-key mesh events (smarty-dev#12140)", () => {
     expect(ids((await h.box().next(h.session())).events)).toEqual([later.id]);
   });
 
-  it("keeps explicit delivery identity shadow suppression for distinct envelope ids", async () => {
+  it.each([["deliveryId", "messageId"], ["deliveryId", "commandId"], ["messageId", "commandId"]] as const)("prefers %s over %s for delivery and replay after reload", async (primary, secondary) => {
     const h = setup(); const inbox = h.box(); inbox.start();
-    const first = await h.publish("rc=1", { key: KEY, deliveryId: "delivery-1" });
-    await h.publish("rc=1 shadow", { key: KEY, deliveryId: "delivery-1" });
-    const second = await h.publish("rc=124", { key: KEY, deliveryId: "delivery-2" }); h.advance(1);
+    const first = await h.publish("first", { key: KEY, [primary]: "primary-1", [secondary]: "shared-secondary" });
+    const second = await h.publish("second", { key: KEY, [primary]: "primary-2", [secondary]: "shared-secondary" });
+    h.advance(1);
     const batch = await inbox.next(h.session());
     expect(ids(batch.events)).toEqual([first.id, second.id]);
     await h.take(inbox, batch.events);
-    await h.publish("rc=124 shadow", { key: KEY, deliveryId: "delivery-2" }); h.advance(1);
+    h.entries.length = 0;
+    await h.publish("same primary, different secondary", { key: KEY, [primary]: "primary-2", [secondary]: "changed-secondary" });
+    h.advance(1);
+    expect((await h.box().next(h.session())).events).toEqual([]);
+  });
+
+  it("matches commandId native receipts after canonical projection and cursor reload", async () => {
+    const h = setup(); const inbox = h.box(); inbox.start();
+    h.main.deliverAgent({ from: watcher, message: "native command", delivery: "steer", data: { key: KEY, topic: TOPIC, commandId: "native-command" } });
+    await h.publish("command shadow", { key: KEY, commandId: "native-command" });
+    const distinct = await h.publish("different command", { key: KEY, commandId: "other-command" });
+    h.advance(1);
+    const projected = rootInboxSession(h.entries.map(projectRootInboxReceipt));
+    const batch = await inbox.next(projected);
+    expect(ids(batch.events)).toEqual([distinct.id]);
+    await h.take(inbox, batch.events);
+    h.entries.length = 0;
+    await h.publish("command shadow after reload", { key: KEY, commandId: "native-command" }); h.advance(1);
+    expect((await h.box().next(h.session())).events).toEqual([]);
+  });
+
+  it.each(["deliveryId", "messageId", "commandId"] as const)("keeps explicit %s shadow suppression for distinct envelope ids", async (identity) => {
+    const h = setup(); const inbox = h.box(); inbox.start();
+    const first = await h.publish("rc=1", { key: KEY, [identity]: "delivery-1" });
+    await h.publish("rc=1 shadow", { key: KEY, [identity]: "delivery-1" });
+    const second = await h.publish("rc=124", { key: KEY, [identity]: "delivery-2" }); h.advance(1);
+    const batch = await inbox.next(h.session());
+    expect(ids(batch.events)).toEqual([first.id, second.id]);
+    await h.take(inbox, batch.events);
+    h.entries.length = 0;
+    await h.publish("rc=124 shadow", { key: KEY, [identity]: "delivery-2" }); h.advance(1);
     expect((await h.box().next(h.session())).events).toEqual([]);
   });
 });

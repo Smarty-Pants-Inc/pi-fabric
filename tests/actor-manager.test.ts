@@ -4346,11 +4346,11 @@ describe("ActorManager", () => {
         await waitFor(() => !manager.status(actor.id).preparing);
         const blocked = manager.status(actor.id).activationBlocked!;
         if (!typed) {
-          expect(blocked).toMatchObject({ code: "failing-preparation", class: "hard" });
+          expect(blocked).toMatchObject({ code: "unknown", class: "hard" });
           expect(blocked).not.toHaveProperty("retryAt");
           expect(runs).toHaveLength(0);
           time.set(Date.now() + 24 * 60 * 60 * 1_000);
-          expect(manager.status(actor.id).activationBlocked).toMatchObject({ code: "failing-preparation", class: "hard" });
+          expect(manager.status(actor.id).activationBlocked).toMatchObject({ code: "unknown", class: "hard" });
           return;
         }
         expect(blocked).toMatchObject({ reason: "actor registry validation veto (ownership)",

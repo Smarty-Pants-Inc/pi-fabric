@@ -12,7 +12,7 @@ import { MeshLock } from "../src/mesh/mesh-lock.js";
 import { writeParticipantFile } from "../src/topology/participant-files.js";
 import { actorParticipantRecord } from "../src/topology/records.js";
 import type { FabricActorInfo } from "../src/actors/types.js";
-import { hostLeasePath, LIVENESS_POLICY_KEY, readHostLeases, removeHostLease, STATE_LEASE_RENEW_MS, writeHostLease } from "../src/topology/host-leases.js";
+import { hostLeasePath, LIVENESS_POLICY_KEY, MIRROR_FRESH_MS, mirroredLeaseStatus, readHostLeases, removeHostLease, STATE_LEASE_RENEW_MS, writeHostLease, type FabricMirrorLease } from "../src/topology/host-leases.js";
 import { MainAgentController } from "../src/main-agent.js";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { FabricParticipantRecord } from "../src/topology/types.js";
@@ -363,7 +363,7 @@ describe("ParticipantDirectory.mirroredControlOwner", () => {
   };
 
   it("exposes the exact public read port and retains fresh expiry knowledge from first send through lapse", async () => {
-    const { directory, reader, host, putHost, read } = await setup();
+    const { directory, reader, host, putHost, read, meshRoot } = await setup();
     expect(typeof ParticipantDirectory.prototype.mirroredControlOwner).toBe("function");
     const port: (host: string, identity: string | undefined, target: string) =>
       { remoteHost: string; expiresAt: number } | undefined = directory.mirroredControlOwner.bind(directory);
@@ -378,7 +378,50 @@ describe("ParticipantDirectory.mirroredControlOwner", () => {
       const expired = Date.now() - 1_000;
       await putHost({ expiresAt: expired });
       expect(read()).toEqual({ remoteHost: "forge", expiresAt: expired });
+      // #10068: an unsampled (older-bridge) projection proves only its unexpired deadline, never
+      // the origin's death. Past it, the root stays attributed to forge (smarty-dev#2004) as bridge-stale.
+      expect(directory.get(host.rootId, Date.now(), { fresh: true }))
+        .toMatchObject({ id: host.rootId, remoteHost: "forge", stale: false, bridgeStale: true });
+
+      // A current bridge's projection requires a matching source-clock sample (mirrorLease: 1).
+      const sample = (observedAt: number, sourceExpiresAt: number): FabricMirrorLease => ({ remoteHost: "forge",
+        observedAt, sourceObservedAt: observedAt - 600_000, sourceUpdatedAt: observedAt - 605_000, sourceExpiresAt });
+      const lease = (mirror?: FabricMirrorLease) => writeHostLease(meshRoot, { id: host.id, rootId: host.rootId,
+        identityId: host.identity.id, startedAt: host.startedAt, updatedAt: Date.now(), expiresAt: Date.now() + 15_000,
+        mirrorLease: 1, ...(mirror ? { mirror } : {}) });
+      await putHost({ updatedAt: Date.now(), expiresAt: Date.now() + 15_000, mirrorLease: 1 });
+
+      // Fresh bridge, live source lease (judged on the source clock, not this hub's).
+      const fresh = sample(Date.now(), Date.now() - 600_000 + 15_000);
+      lease(fresh);
+      const live = read();
+      expect(live).toEqual({ remoteHost: "forge", expiresAt: expect.any(Number), mirror: fresh });
+      expect(live!.expiresAt).toBeLessThanOrEqual(fresh.observedAt + MIRROR_FRESH_MS);
+      expect(mirroredLeaseStatus(live!.remoteHost, live!.mirror, Date.now())).toBe("live");
+      expect(directory.get(host.rootId, Date.now(), { fresh: true }))
+        .toMatchObject({ remoteHost: "forge", stale: false });
+      expect(directory.get(host.rootId, Date.now(), { fresh: true })?.bridgeStale).toBeUndefined();
+
+      // Fresh bridge, source lease lapsed on the source clock: lease-stale, the root is gone.
+      const lapsed = sample(Date.now(), Date.now() - 600_000 - 1);
+      lease(lapsed);
+      expect(read()).toEqual({ remoteHost: "forge", expiresAt: lapsed.observedAt - 1, mirror: lapsed });
+      expect(mirroredLeaseStatus("forge", read()!.mirror, Date.now())).toBe("lease-stale");
       expect(directory.get(host.rootId, Date.now(), { fresh: true })).toBeUndefined();
+
+      // Stale transport, live source sample: bridge-stale, not owner death, still attributed.
+      const old = sample(Date.now() - MIRROR_FRESH_MS, Date.now() + 60_000);
+      lease(old);
+      expect(read()).toEqual({ remoteHost: "forge", expiresAt: expect.any(Number), mirror: old });
+      expect(mirroredLeaseStatus("forge", read()!.mirror, Date.now())).toBe("bridge-stale");
+      expect(directory.get(host.rootId, Date.now(), { fresh: true }))
+        .toMatchObject({ remoteHost: "forge", stale: false, bridgeStale: true });
+
+      // Required sample missing: doubt (bridge-stale), never a fallback to the state expiry.
+      lease();
+      expect(read()).toEqual({ remoteHost: "forge", expiresAt: expect.any(Number), bridgeStale: true });
+      expect(directory.get(host.rootId, Date.now(), { fresh: true }))
+        .toMatchObject({ remoteHost: "forge", stale: false, bridgeStale: true });
       expect(publish).not.toHaveBeenCalled();
       expect(put).not.toHaveBeenCalled();
     } finally {

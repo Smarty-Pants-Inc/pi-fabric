@@ -150,6 +150,8 @@ export interface FabricControlAcceptance {
   triggered?: boolean;
   /** Main held a requested wake; includes the provider retry deadline when applicable. */
   reason?: string;
+  /** Main is held by an operator halt; the exact code survives control ACKs. */
+  halted?: true;
   /** The owner's followUp queue for a Main target (smarty-dev#1495). */
   pendingFollowUps?: number;
   oldestAgeS?: number;
@@ -185,6 +187,7 @@ export interface FabricControlResult {
   triggered?: boolean;
   /** Main held a requested wake; includes the provider retry deadline when applicable. */
   reason?: string;
+  halted?: true;
   pendingFollowUps?: number;
   oldestAgeS?: number;
   stalled?: true;
@@ -211,6 +214,10 @@ const triggeredOf = (source: Record<string, unknown>): { triggered: boolean; rea
     ...(source.triggered === false && typeof source.reason === "string" && source.reason.length <= 200
       ? { reason: source.reason } : {}),
   } : undefined;
+
+const haltedOf = (source: Record<string, unknown>): { halted: true; reason: "operator-halt" } | undefined =>
+  source.halted === true && source.reason === "operator-halt"
+    ? { halted: true, reason: "operator-halt" } : undefined;
 
 /** The owner's coalesce report for a Main followUp (smarty-dev#1495), or nothing. */
 const coalescedOf = (source: Record<string, unknown>): { coalesced: true; replacedMessageId: string } | undefined =>
@@ -630,6 +637,7 @@ export class FabricControlPlane {
       ...coalescedOf(acceptance as unknown as Record<string, unknown>),
       ...runningTaskWarningOf(acceptance as unknown as Record<string, unknown>, targetId),
       ...triggeredOf(acceptance as unknown as Record<string, unknown>),
+      ...haltedOf(acceptance as unknown as Record<string, unknown>),
     };
   }
 
@@ -1425,6 +1433,7 @@ export class FabricControlPlane {
       ...coalescedOf(event.data),
       ...runningTaskWarningOf(event.data, pending.targetId),
       ...triggeredOf(event.data),
+      ...haltedOf(event.data),
       ...(Object.prototype.hasOwnProperty.call(event.data, "result")
         ? { result: event.data.result }
         : {}),
@@ -1908,6 +1917,7 @@ export class FabricControlPlane {
           ...coalescedOf(acceptance as unknown as Record<string, unknown>),
           ...runningTaskWarningOf(acceptance as unknown as Record<string, unknown>, command.targetId),
           ...triggeredOf(acceptance as unknown as Record<string, unknown>),
+          ...haltedOf(acceptance as unknown as Record<string, unknown>),
           ...(Object.prototype.hasOwnProperty.call(acceptance, "result")
             ? { result: acceptance.result }
             : {}),

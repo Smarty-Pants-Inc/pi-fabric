@@ -505,10 +505,12 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
   // such as arrow keys) halts every persistent actor — aborting in-flight runs
   // and cancelling queued work — and arms a stop-the-world gate that freezes
   // host-event and mesh dispatch so the interrupted actors are not re-armed by
-  // the interrupt's own turn_end / agent_settled events. The gate lifts when the
-  // user resumes by sending a new message (the "input" host event). Escape is
-  // observed but not consumed, so Pi's native cancel-streaming still fires;
-  // single ESC therefore stops the current turn and the advisor/supervisor
+  // the interrupt's own turn_end / agent_settled events. Main keeps its own halt:
+  // only non-extension user input or a fresh verified direct peer-root steer
+  // after Main is idle can resume it. Peer followUps stay passive. Peer wake does
+  // not lift the global actor/Jev/advisor stop-world gate; that still needs user
+  // input. Escape is observed but not consumed, so Pi's native cancel-streaming
+  // still fires; single ESC stops the current turn and the advisor/supervisor
   // actors and event-driven Jev observers at once. Jev observers are cancelled,
   // not automatically restarted. Also works without mesh. ui.haltOnEscape opts out.
   let haltOnEscapeUnsubscribe: (() => void) | undefined;

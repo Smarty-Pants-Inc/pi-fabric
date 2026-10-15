@@ -47,6 +47,8 @@ export const BRIDGE_LEASE_MS = MIRROR_FRESH_MS;
 /** How long a held publish retries a busy SQLite state write fence before the loop backs off. */
 const BRIDGE_FENCE_RETRY_MS = 5_000;
 const DEFAULT_PRESENCE_MS = 5_000;
+/** A retained source event revalidates after this delay; this is NOT an event/authority TTL. */
+const DEFAULT_MEMBERSHIP_RETRY_MS = 1_000;
 /** Transitional mixed-version exception only: remove after all fleet agents support changes. */
 const LEGACY_POLL_MS = 250;
 /** Commands whose ACK this link relays back to a non-participant hub sender (smarty-dev#9751). */
@@ -1710,6 +1712,8 @@ export interface MeshBridgeOptions {
   presenceMs?: number;
   /** Bound on each wait in stop(); the remote cannot hold a stop longer. */
   stopMs?: number;
+  /** Retry retained stale-membership events after this many ms (default 1 s). Never expires/drops the event. */
+  membershipRetryMs?: number;
   /** First wait after a WAL-cap refusal (then doubling to 30 s). Default 1 s; tests lower it. */
   walCapRetryMinMs?: number;
   log?: (message: string) => void;
@@ -1847,6 +1851,8 @@ interface BridgeRules {
   /** Inbound only: each admitted sender's canonical identity (senderIdentities). */
   identities?: Map<string, MeshIdentity>;
   reserved?: Set<string>;
+  /** Outbound only: ids proven native to the hub or reserved by another link, not this peer. */
+  reservedRecipients?: Set<string>;
   /** Direct other-link origins, never supplied by an untrusted remote. */
   relayOrigins?: Map<string, string>;
 }
@@ -1883,7 +1889,13 @@ export class MeshBridge {
   #directions: Promise<void> = Promise.resolve();
   readonly #directionPending: Record<Direction, boolean> = { toRemote: false, toLocal: false };
   readonly #directionBackoff: Record<Direction, boolean> = { toRemote: false, toLocal: false };
+  readonly #directionMirrorBackoff: Record<Direction, boolean> = { toRemote: false, toLocal: false };
   readonly #directionWake: Partial<Record<Direction, () => void>> = {};
+  /** Last sampled, admitted source deadlines: evidence to WAIT only, never authority to publish. */
+  #sampledDeadlines = new Map<string, number>();
+  /** At most one pending boundary per direction. Bodies stay in the durable source, before its cursor. */
+  readonly #membershipRetryAt: Partial<Record<Direction, number>> = {};
+  readonly #membershipSequence: Partial<Record<Direction, number>> = {};
   /** Events not addressed across since the last count line (smarty-dev#9352). */
   #unaddressed = { count: 0, toRemote: 0, toLocal: 0, factory: 0, topics: new Set<string>(), more: false };
   #unaddressedLoggedAt = Number.NEGATIVE_INFINITY;
@@ -1906,6 +1918,9 @@ export class MeshBridge {
       if (!validBridgeName(name)) throw new Error(`Invalid bridge name: ${name}`);
     }
     if (options.localName === options.remoteName) throw new Error("Bridge side names must differ");
+    if (options.membershipRetryMs !== undefined && !(Number.isSafeInteger(options.membershipRetryMs) && options.membershipRetryMs > 0)) {
+      throw new Error("membershipRetryMs needs a positive integer");
+    }
     const given = options.factoryRate ?? DEFAULT_FACTORY_RATE;
     const rate: Required<FactoryRate> = {
       perMinute: given.perMinute, burst: given.burst,
@@ -2182,6 +2197,13 @@ export class MeshBridge {
     const failures = results.filter((result) => result.status === "rejected");
     const failure = failures.find((result) => !isBridgeRetryable(result.reason)) ?? failures[0];
     if (failure) throw failure.reason;
+    // Retain only scalar deadlines from the latest admitted, sampled natives. A mirror commit
+    // can outlast these while the origin keeps renewing (#10068). Missing held membership then
+    // means bridge-stale, not proof of a foreign sender. This map can only defer, NEVER admit.
+    this.#sampledDeadlines = new Map(remote.hosts.flatMap(({ record, expiresAt, observedAt }) =>
+      remoteHostOf(record) === undefined && typeof observedAt === "number" && Number.isFinite(observedAt) &&
+        Number.isFinite(expiresAt) && expiresAt > observedAt
+        ? [[record.id, syncedAt + Math.min(BRIDGE_LEASE_MS, expiresAt - observedAt)] as const] : []));
     // A lock-delayed write must not make an old snapshot look freshly observed.
     this.#presenceAt = syncedAt;
     this.#syncedPresenceVersion = presenceVersion;
@@ -2197,6 +2219,41 @@ export class MeshBridge {
       .filter(expiry => Number.isFinite(expiry) && expiry > syncedAt);
     this.#expiryAt = Math.min(Infinity, ...expiries,
       ...(expiries.some(expiry => expiry > syncedAt + BRIDGE_LEASE_MS) ? [syncedAt + BRIDGE_LEASE_MS - 1_000] : []));
+    // A completed mirror invalidates pending membership observations immediately, even when
+    // no new event arrives. The source cursor, not a second body queue, owns the retry.
+    for (const direction of ["toRemote", "toLocal"] as const) {
+      if (this.#membershipRetryAt[direction] === undefined) continue;
+      delete this.#membershipRetryAt[direction];
+      this.#directionPending[direction] = true;
+      this.#directionWake[direction]?.();
+    }
+  }
+
+  /** Only an expired sampled projection makes these membership failures inconclusive. */
+  #staleMembership(event: MeshEvent, rules: BridgeRules, direction: Direction, reason?: string): boolean {
+    if (reason !== undefined && reason !== "sender is not a live participant of the remote" &&
+      reason !== "ack target is not bound to this link" && !(reason === "not addressed across" && direction === "toRemote")) return false;
+    // #refusal checks routing before body shape. A missing recipient must not hide a
+    // structural violation; nor may an already-bridged work/echo become pending membership.
+    if (!isIdentity(event.from) || (event.data !== undefined && !isObject(event.data)) ||
+      this.#destinationRefusal(event, direction)) return false;
+    const ids = direction === "toRemote" ? [event.to] : [event.from.id,
+      ...(event.topic === "fabric.control.ack" ? [isObject(event.data) ? event.data.targetId : undefined] : [])];
+    // ANY current native/other-link reservation defeats uncertainty, including an ACK's
+    // other held id. Noncanonical/missing ACK targets are structural, not a stale mirror.
+    const reserved = direction === "toRemote" ? rules.reservedRecipients : rules.reserved;
+    if (!ids.every(id => typeof id === "string" && CANONICAL_ID.test(id) && !reserved?.has(id))) return false;
+    return ids.some(id => (this.#sampledDeadlines.get(id as string) ?? Infinity) <= Date.now());
+  }
+
+  #deferMembership(direction: Direction, event: MeshEvent): void {
+    this.#membershipRetryAt[direction] = Date.now() + (this.options.membershipRetryMs ?? DEFAULT_MEMBERSHIP_RETRY_MS);
+    if (this.#membershipSequence[direction] !== event.sequence) {
+      this.options.debug?.(`${direction}: bridge membership pending for ${event.topic} ${event.id}; source cursor retained, nothing dropped`);
+    }
+    // Expiry alone never consumes the event. The next successful source sample decides
+    // anew: stale evidence waits again; current absence or a proven foreign identity refuses.
+    this.#membershipSequence[direction] = event.sequence;
   }
 
   #presenceDue(): boolean {
@@ -2236,9 +2293,10 @@ export class MeshBridge {
   #direction(direction: Direction): Promise<{ forwarded: number; dropped: number }> {
     return direction === "toRemote"
       ? this.#forward("toRemote", this.options.local, this.options.remote, async (refreshIfStale = true) => {
-        const { remote } = await this.#authority(refreshIfStale);
+        const { local, remote } = await this.#authority(refreshIfStale);
         const relays = await this.options.local.relayPresence?.();
-        return { recipients: remoteAddresses(remote), relayOrigins: new Map(relays?.hosts.map(host => [host.record.id, host.record.remoteHost!])) };
+        return { recipients: remoteAddresses(remote), reservedRecipients: new Set(local.reserved),
+          relayOrigins: new Map(relays?.hosts.map(host => [host.record.id, host.record.remoteHost!])) };
       })
       : this.#forward("toLocal", this.options.remote, this.options.local, async (refreshIfStale = true) => {
         const { local, remote } = await this.#authority(refreshIfStale);
@@ -2264,14 +2322,18 @@ export class MeshBridge {
     while (running()) {
       this.#directionPending[direction] = false;
       this.#directionBackoff[direction] = false;
+      this.#directionMirrorBackoff[direction] = false;
+      const presenceVersion = this.#presenceVersion;
       let delay: number | undefined;
       try {
         await this.#direction(direction);
         retryMs = LOCK_RETRY_MIN_MS;
         walCapDelay = undefined;
         reported = false;
-        // A factory-rate deferral retries when its token is due: one timer, no notification needed.
-        if (direction === "toLocal" && this.#factoryWaiting) delay = Math.max(0, this.#factoryRetryAt - this.#now());
+        // Pending boundaries arm one retry timer each, only while actual work is retained.
+        const membershipRetryAt = this.#membershipRetryAt[direction];
+        if (membershipRetryAt !== undefined) delay = Math.max(0, membershipRetryAt - Date.now());
+        if (direction === "toLocal" && this.#factoryWaiting) delay = Math.min(delay ?? Infinity, Math.max(0, this.#factoryRetryAt - this.#now()));
         if (this.#legacyPolling) delay = Math.min(delay ?? Infinity, this.options.pollMs ?? LEGACY_POLL_MS);
       } catch (error) {
         if (!running()) return;
@@ -2280,7 +2342,10 @@ export class MeshBridge {
           this.#wake?.();
           return;
         }
-        this.#directionBackoff[direction] = true;
+        this.#directionMirrorBackoff[direction] = error instanceof BridgeMirrorDeferredError;
+        // A late ACK may arrive while the other half of syncPresence is still settling.
+        // Its already-latched wake must also bypass the mirror backoff installed here.
+        this.#directionBackoff[direction] = !(this.#directionMirrorBackoff[direction] && this.#presenceVersion !== presenceVersion);
         if (error instanceof BridgeMirrorDeferredError || isMeshStateWalCap(error))
           delay = walCapDelay = walCapRetryDelay(walCapDelay, this.options.walCapRetryMinMs);
         else delay = retryMs;
@@ -2314,6 +2379,18 @@ export class MeshBridge {
     const seen = this.#seen[direction];
     let forwarded = 0;
     let dropped = 0;
+    if ((this.#membershipSequence[direction] ?? Infinity) <= cursor.after) {
+      delete this.#membershipSequence[direction];
+      delete this.#membershipRetryAt[direction];
+    }
+    const membershipRetryAt = this.#membershipRetryAt[direction];
+    if (membershipRetryAt !== undefined) {
+      if (Date.now() < membershipRetryAt) return { forwarded, dropped };
+      delete this.#membershipRetryAt[direction];
+      // Expiration invalidates the observation, never the event: sample again before rereading
+      // its unchanged source boundary. Failed/deferred mirrors retain that boundary too.
+      await this.syncPresence();
+    }
     if (direction === "toLocal" && this.#factoryWaiting) {
       // A factory-rate deferral holds this link's inbound drain, in order, until its token is due;
       // until then a pass does not even reread the page.
@@ -2432,12 +2509,22 @@ export class MeshBridge {
           await refresh();
           reason = this.#refusal(event, rules, direction);
         }
+        if (reason && this.#staleMembership(event, rules, direction, reason)) {
+          this.#deferMembership(direction, event);
+          if (cursor.after > start) this.#save();
+          return { forwarded, dropped };
+        }
         // Cross-spoke commands never enter either hub body-publication seam. Even a
         // missing/lapsed destination gets its refusal only on the original source link.
         if (this.#isRelayCommand(event, rules, direction) && this.#relaySenderAllowed(event, rules)) {
           if (!seen.has(event.id)) {
             if (this.#presenceDue()) await refresh();
             const result = await this.#relayCommand(event, rules);
+            if (result.pending) {
+              this.#deferMembership(direction, event);
+              if (cursor.after > start) this.#save();
+              return { forwarded, dropped };
+            }
             if (result.delivered) {
               if (result.sequence !== undefined) cursor.mark = Math.max(cursor.mark, result.sequence);
               forwarded += 1;
@@ -2461,6 +2548,7 @@ export class MeshBridge {
           // existing one-refresh commit refusal path, never an idle renewal timer.
           if (this.#presenceDue()) await this.syncPresence();
           if (this.#stopped) return { forwarded, dropped };
+          let factorySpend = 0;
           if (this.#viaFactory(event, rules, direction)) {
             const size = Buffer.byteLength(JSON.stringify(this.#outbound(event, rules, direction)), "utf8");
             if (!this.#factoryAffords(0, 0, size)) {
@@ -2471,8 +2559,7 @@ export class MeshBridge {
               if (cursor.after > start) this.#save();
               return { forwarded, dropped };
             }
-            this.#factoryTokens -= 1;
-            this.#factoryBytes -= size;
+            factorySpend = size;
           }
           try {
             // Revalidated for each event after the awaits before it: an inbound event commits only
@@ -2505,6 +2592,10 @@ export class MeshBridge {
               if (this.#refusal(event, rules, direction)) throw error;
               published = await publish();
             }
+            if (factorySpend > 0) {
+              this.#factoryTokens -= 1;
+              this.#factoryBytes -= factorySpend;
+            }
             seen.add(event.id);
             cursor.mark = Math.max(cursor.mark, published.sequence);
             cursor.after = event.sequence;
@@ -2516,7 +2607,19 @@ export class MeshBridge {
             // Legacy/singleton drains must also give waiting writers a turn after checkpoint.
             await new Promise<void>(resolve => setImmediate(resolve));
           } catch (error) {
-            // Too large or refused by the far side: never retried, or it would stall the source.
+            if (error instanceof BridgeOwnershipError) {
+              // Keep the two-attempt/one-refresh bound. An origin can renew throughout BOTH
+              // lock waits; expiry is not a foreign identity. Recheck current reservations so
+              // a proven takeover still refuses, and otherwise retry from the durable cursor.
+              rules = await authority(false);
+              const currentReason = this.#refusal(event, rules, direction);
+              if (this.#staleMembership(event, rules, direction, currentReason)) {
+                this.#deferMembership(direction, event);
+                if (cursor.after > start) this.#save();
+                return { forwarded, dropped };
+              }
+            }
+            // Structural/permanent refusals still advance; sampled membership uncertainty does not.
             if (!isPermanent(error)) throw error;
             dropped += 1;
             this.#log(`${direction}: refused ${event.topic} ${event.id}: ${(error as Error).message}`);
@@ -2545,15 +2648,20 @@ export class MeshBridge {
       !rules.reserved?.has(event.from.id) && rules.senders?.has(event.from.id) === true && rules.identities?.has(event.from.id) === true;
   }
 
-  async #relayCommand(event: MeshEvent, rules: BridgeRules): Promise<{ delivered: boolean; sequence?: number }> {
+  async #relayCommand(event: MeshEvent, rules: BridgeRules): Promise<{ delivered: boolean; sequence?: number; pending?: boolean }> {
     const { local, remote, relay, localName, remoteName } = this.options;
     const pub = this.#outbound(event, rules, "toLocal");
     const destination = rules.relayOrigins?.get(pub.to);
+    const senderHeld = local.holds?.(pub.from.id, pub.from);
+    // Do not turn a source sender's expired sampled projection into an unavailable ACK
+    // and consume its command. This is a wait, not permission to bypass the sender fence.
+    if (!senderHeld &&
+      this.#staleMembership(event, rules, "toLocal", this.#refusal(event, rules, "toLocal"))) return { delivered: false, pending: true };
     try {
       if (this.#stopped || !this.#ready || this.#notificationError || this.#refusal(event, rules, "toLocal") || !relay ||
         !destination || destination === remoteName || destination === localName ||
         pub.data.destinationRemoteHost !== destination || local.relayOrigin?.(pub.to) !== destination ||
-        !local.holds?.(pub.from.id, pub.from)) throw relayUnavailable();
+        !senderHeld) throw relayUnavailable();
       await relay(destination, pub);
     } catch (error) {
       // Timeout remains ambiguous. A typed conflict is a fixed, nonretryable source-local
@@ -2572,7 +2680,16 @@ export class MeshBridge {
     }
     // Only a confirmed destination receipt permits a hub envelope. Its sequence is LOCAL;
     // the destination sequence is deliberately absent from the delivery-only relay API.
-    const receipt = await local.recordRelay?.(pub, [pub.from.id]);
+    let receipt: { sequence: number } | undefined;
+    try { receipt = await local.recordRelay?.(pub, [pub.from.id]); }
+    catch (error) {
+      if (!(error instanceof BridgeOwnershipError)) throw error;
+      const { local: presence, remote: owned } = await this.#authority(false);
+      const current = { ...rules, senders: senders(owned), identities: senderIdentities(owned), reserved: new Set(presence.reserved) };
+      if (!this.#staleMembership(event, current, "toLocal", this.#refusal(event, current, "toLocal"))) throw error;
+      // Destination dedupe covers retry after delivery but before the fenced hub receipt.
+      return { delivered: false, pending: true };
+    }
     if (receipt && (!Number.isSafeInteger(receipt.sequence) || receipt.sequence <= 0)) throw new Error("Invalid relay receipt");
     return { delivered: true, ...(receipt ? { sequence: receipt.sequence } : {}) };
   }
@@ -2635,6 +2752,7 @@ export class MeshBridge {
 
   /** Follow notifications until stop() or failure. No timer is armed for empty idle.
    * Timer inventory: source/held-mirror expiry and pending half-lease flush (one shot);
+   * retained stale-membership boundaries (default 1 s, only while actual work is pending);
    * actual lock/SQLite busy, including WAL notification commit settlement (100 ms..2 s);
    * WAL-cap refusal (1 s..30 s); explicitly negotiated legacy-only 250 ms polling.
    * Held-publication fence retries, RPC deadlines and stop
@@ -2647,6 +2765,7 @@ export class MeshBridge {
     let walCapLoggedAt = Number.NEGATIVE_INFINITY;
     let walCapDelay: number | undefined;
     let backingOff = false;
+    let mirrorBackingOff = false;
     // smarty-dev#9751: once start() has loaded the cursors, each direction runs in its own loop (#directionLoop),
     // which also does that direction's catch-up: no sequential drain first.
     let ended = false;
@@ -2668,7 +2787,15 @@ export class MeshBridge {
         return;
       }
       this.#changesPending = true;
-      if (kind === "presence") this.#presenceVersion++;
+      if (kind === "presence") {
+        this.#presenceVersion++;
+        // A late mirror ACK already emits presence in RemoteBridgeSide. Do not leave it
+        // waiting behind the degraded-mirror backoff (up to 30 s). WAL/lock backoff is intact.
+        if (mirrorBackingOff) backingOff = false;
+        for (const direction of ["toRemote", "toLocal"] as const) {
+          if (this.#directionMirrorBackoff[direction]) this.#directionBackoff[direction] = false;
+        }
+      }
       if (!backingOff) this.#wake?.();
       wakeDirections();
     };
@@ -2680,6 +2807,7 @@ export class MeshBridge {
       while (!this.#stopped) {
         if (this.#notificationError) throw this.#notificationError;
         this.#changesPending = false; // changes during any await below stay latched
+        const presenceVersion = this.#presenceVersion;
         const pass = (async () => {
           const sides = [this.options.local, this.options.remote];
           while (unsubscribers.length < sides.length && !this.#stopped) {
@@ -2713,6 +2841,7 @@ export class MeshBridge {
         backingOff = false;
         try {
           await pass;
+          mirrorBackingOff = false;
           reportedTimeout = false;
           walCapDelay = undefined;
           retryMs = LOCK_RETRY_MIN_MS;
@@ -2728,7 +2857,8 @@ export class MeshBridge {
         } catch (error) {
           if (this.#stopped) return;
           if (!isBridgeRetryable(error)) throw error;
-          backingOff = true;
+          mirrorBackingOff = error instanceof BridgeMirrorDeferredError;
+          backingOff = !(mirrorBackingOff && this.#presenceVersion !== presenceVersion);
           delay = retryMs;
           retryMs = Math.min(retryMs * 2, LOCK_RETRY_MAX_MS);
           if (error instanceof BridgeMirrorDeferredError || isMeshStateWalCap(error)) {

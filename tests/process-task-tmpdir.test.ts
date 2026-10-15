@@ -51,7 +51,8 @@ fs.writeFileSync(args.get('--status-file'), JSON.stringify({
   exitCode: 0, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 }
 }));`);
   const manager = new AgentManager(cwd, {
-    ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, deniedModels: [], timeoutMs: 8_000, retainRuns: true, processSlice,
+    ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, deniedModels: [], timeoutMs: 8_000, retainRuns: true,
+    ...(processSlice ? { processSlice } : {}),
   }, { workerPath: worker, fullCodeMode: false, runRoot });
   managers.push(manager);
   return { root, cwd, scratch, parentTemp, runRoot, manager, worker };
@@ -170,6 +171,20 @@ describe("native process task temporary directory containment", () => {
     expect(inside(f.scratch, fs.realpathSync(value.output))).toBe(true);
     expect(value.bytes).toBeGreaterThan(50 * 1024);
     expect(fs.readdirSync(f.parentTemp)).toEqual([]);
+  });
+
+  it("does not normalize away a native symlink/.. escape before checking TMPDIR", async () => {
+    const f = fixture();
+    const nested = path.join(f.parentTemp, "nested");
+    fs.mkdirSync(nested);
+    const link = path.join(f.scratch, "linked-temp");
+    fs.symlinkSync(nested, link, "junction");
+    const callerTemp = `${link}${path.sep}..`;
+    vi.stubEnv("TMPDIR", callerTemp);
+    const { value } = await report(f, { writableRoots: [f.cwd, f.scratch], shell: "unconfined" });
+    expect(value.tmp).not.toBe(callerTemp);
+    expect(inside(f.scratch, fs.realpathSync.native(value.output))).toBe(true);
+    expect(fs.readdirSync(f.parentTemp)).toEqual(["nested"]);
   });
 
   it("refuses a replaced grant root before allocating temporary files through its symlink", async () => {

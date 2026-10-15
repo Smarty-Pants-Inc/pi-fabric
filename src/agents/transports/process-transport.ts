@@ -166,7 +166,7 @@ const nearestRealPath = (target: string): string | undefined => {
       continue;
     }
     try {
-      return path.join(fs.realpathSync(current), path.relative(current, target));
+      return path.join(fs.realpathSync.native(current), path.relative(current, target));
     } catch {
       return undefined;
     }
@@ -183,7 +183,10 @@ const launchWritePolicy = (workerArguments: readonly string[]) => {
 
 const containedByRoot = (candidate: string, cwd: string, roots: readonly string[]): boolean => {
   const lexical = path.isAbsolute(candidate) ? path.normalize(candidate) : path.resolve(cwd, candidate);
-  const real = nearestRealPath(lexical);
+  // Preserve raw link/.. traversal for the native filesystem lookup; path.resolve
+  // and the JS realpath implementation collapse it before following symlinks.
+  const raw = path.isAbsolute(candidate) ? candidate : `${cwd}${path.sep}${candidate}`;
+  const real = nearestRealPath(raw);
   return real !== undefined && roots.some(root => isInside(root, lexical)) && roots.some(root => isInside(root, real));
 };
 

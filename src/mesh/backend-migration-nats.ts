@@ -342,6 +342,8 @@ const publish = async (port: JetStreamPort, subject: string, data: Uint8Array, e
       if ((error as { transient?: boolean } | null)?.transient !== true) throw error;
       outcomeUnknown = true;
       if (attempt === MIGRATION_PUBLISH_ATTEMPTS) throw error;
+      // Fresh R3 subject interest may lag stream readiness (#13276); keep the same bounded, exact publish.
+      await new Promise<void>(resolve => setTimeout(resolve, 100));
     }
   }
   throw new Error("unreachable migration publish retry state");

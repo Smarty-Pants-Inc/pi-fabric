@@ -21,13 +21,15 @@ const scratch = () => {
 const key = (prefix: string, id: string) => prefix + createHash("sha256").update(id).digest("hex");
 const hostKey = (id: string) => key("topology/hosts/", id);
 const participantKey = (id: string) => key("topology/participants/", id);
-const fleet = (n: number, now: number): BridgePresence => {
+// `sampled` hosts carry a source-clock observation (current agents, #10068); the rest are older agents'.
+const fleet = (n: number, now: number, sampled: (i: number) => boolean = () => true): BridgePresence => {
   const hosts: BridgePresence["hosts"] = [];
   const participants: BridgePresence["participants"] = [];
   for (let i = 0; i < n; i++) {
     const id = `session:batch-${i}`;
     const identity: MeshIdentity = { id, name: "main", kind: "main", sessionId: `batch-${i}` };
-    hosts.push({ record: { format: 1, id, rootId: id, identity, startedAt: now, updatedAt: now, expiresAt: now + 15_000 }, expiresAt: now + 15_000 });
+    hosts.push({ record: { format: 1, id, rootId: id, identity, startedAt: now, updatedAt: now, expiresAt: now + 15_000 }, expiresAt: now + 15_000,
+      ...(sampled(i) ? { observedAt: now } : {}) });
     participants.push({ format: 1, id, kind: "root", rootId: id, ownerHostId: id, ownerIdentityId: id,
       name: `batch-${i}`, label: `BATCH-${i}`, status: "idle", runner: "pi", transport: "host",
       capabilities: ["steer"], sessionId: `batch-${i}`, startedAt: now, updatedAt: now, controlProtocol: "v1" });
@@ -39,9 +41,13 @@ const fleet = (n: number, now: number): BridgePresence => {
 // Keeping the reference on put/delete detects changes in revisions and owner attribution too.
 const perRecord = async (store: MeshStore, presence: BridgePresence, now: number) => {
   const wanted = new Map<string, { value: Record<string, unknown>; identity: MeshIdentity }>();
-  for (const { record, expiresAt } of presence.hosts) {
-    const until = Math.min(expiresAt, now + 15_000);
-    wanted.set(hostKey(record.id), { value: { ...record, updatedAt: now, expiresAt: until, remoteHost: "forge" }, identity: record.identity });
+  // Observed at this pass (liveAt = now): a sampled origin's remaining source life, capped at 15 s.
+  const until = ({ expiresAt, observedAt }: BridgePresence["hosts"][number]) =>
+    observedAt === undefined ? Math.min(expiresAt, now + 15_000) : now + Math.min(15_000, expiresAt - observedAt);
+  for (const host of presence.hosts) {
+    const { record } = host;
+    wanted.set(hostKey(record.id), { value: { ...record, updatedAt: now, expiresAt: until(host), remoteHost: "forge",
+      ...(host.observedAt === undefined ? {} : { mirrorLease: 1 }) }, identity: record.identity });
   }
   for (const p of presence.participants) {
     const owner = presence.hosts.find(h => h.record.id === p.ownerHostId)!.record;
@@ -56,10 +62,14 @@ const perRecord = async (store: MeshStore, presence: BridgePresence, now: number
       ? now - Number(before.updatedAt) < STATE_LEASE_RENEW_MS : before.updatedAt === value.updatedAt)) continue;
     await store.put({ key: k, value, identity });
   }
-  for (const { record, expiresAt } of presence.hosts) {
-    // Mirror leases carry the origin's incarnation (L2b owner review: owner-matched unlease).
+  for (const host of presence.hosts) {
+    const { record, expiresAt, observedAt } = host;
+    // Mirror leases carry the origin's incarnation (L2b owner review: owner-matched unlease), always
+    // the mirror marker, and a sampled origin's source-clock observation attributed to this link.
     writeHostLease(store.root, { id: record.id, rootId: record.rootId, identityId: record.identity.id, startedAt: record.startedAt,
-      updatedAt: Math.min(record.updatedAt, now), expiresAt: Math.min(expiresAt, now + 15_000) });
+      updatedAt: observedAt === undefined ? Math.min(record.updatedAt, now) : record.updatedAt, expiresAt: until(host), mirrorLease: 1,
+      ...(observedAt === undefined ? {} : { mirror: { remoteHost: "forge", observedAt: now, sourceObservedAt: observedAt,
+        sourceUpdatedAt: record.updatedAt, sourceExpiresAt: expiresAt } }) });
   }
   for (const entry of old) {
     if (wanted.has(entry.key)) continue;
@@ -108,15 +118,21 @@ describe("one presence transaction (smarty-dev#3752)", () => {
     expect(probe.counts()).toEqual({ reads: 1, commits: 1, locks: 1 });
     await perRecord(reference, presence, now);
     compare();
+    // Not vacuous: every lease carries the marker and this link's fresh source observation.
+    expect([...readHostLeases(hub.root).values()].filter(lease => lease.mirrorLease === 1 &&
+      lease.mirror?.remoteHost === "forge" && lease.mirror.observedAt === now)).toHaveLength(250);
     now += 1;
     presence.participants = presence.participants.map(p => ({ ...p, status: "running", updatedAt: now }));
+    // Each pass is a new source observation, even with unchanged host leases.
+    presence.hosts = presence.hosts.map(host => ({ ...host, observedAt: now }));
     probe.reset();
     await side.mirror(presence);
     expect(probe.counts()).toEqual({ reads: 1, commits: 1, locks: 1 });
     await perRecord(reference, presence, now);
     compare();
     now += 1;
-    const mixed = fleet(275, now);
+    // Mixed agents: odd hosts come from an older agent without a source sample.
+    const mixed = fleet(275, now, (i) => i % 2 === 0);
     mixed.hosts = mixed.hosts.slice(25);
     mixed.participants = mixed.participants.slice(25);
     probe.reset();
@@ -124,6 +140,7 @@ describe("one presence transaction (smarty-dev#3752)", () => {
     expect(probe.counts()).toEqual({ reads: 1, commits: 1, locks: 1 });
     await perRecord(reference, mixed, now);
     compare();
+    expect([...readHostLeases(hub.root).values()].filter(lease => lease.mirrorLease === 1 && !lease.mirror)).toHaveLength(125);
     probe.reset();
     await side.withdraw();
     expect(probe.counts()).toEqual({ reads: 1, commits: 1, locks: 1 });
@@ -147,12 +164,14 @@ describe("one presence transaction (smarty-dev#3752)", () => {
     const before = store.listAll();
     now += 5_000;
     // The origins renewed; only their lease fields move.
-    presence.hosts = presence.hosts.map(({ record }) => ({ record: { ...record, updatedAt: now, expiresAt: now + 15_000 }, expiresAt: now + 15_000 }));
+    // Still a current agent: a new source sample, so the host's mirrorLease marker does not toggle.
+    presence.hosts = presence.hosts.map(({ record }) => ({ record: { ...record, updatedAt: now, expiresAt: now + 15_000 }, expiresAt: now + 15_000, observedAt: now }));
     const probe = io(store);
     await side.mirror(presence);
     expect(probe.counts()).toEqual({ reads: 1, commits: 0, locks: 1 });
     expect(store.listAll()).toEqual(before);
-    expect([...readHostLeases(store.root).values()].every(l => l.updatedAt === now && l.expiresAt === now + 15_000)).toBe(true);
+    expect([...readHostLeases(store.root).values()].every(l => l.updatedAt === now && l.expiresAt === now + 15_000 &&
+      l.mirrorLease === 1 && l.mirror?.observedAt === now && l.mirror.sourceExpiresAt === now + 15_000)).toBe(true);
     const p = presence.participants[0]!;
     const record = store.get(participantKey(p.id))!;
     await store.put({ key: record.key, value: record.value, identity: { id: "session:wrong", name: "main", kind: "main" } });

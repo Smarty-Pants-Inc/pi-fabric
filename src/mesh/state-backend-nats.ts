@@ -224,12 +224,21 @@ export class MeshStateNatsLimitError extends Error {
   }
 }
 
-/** The projector could not get past repeated purges: reads and writes fail until the backend is reopened. */
+/** A projector stopped, or stream placement / a just-created stream's first consumer exceeded its readiness budget. */
 export class MeshStateNatsUnavailableError extends Error {
   readonly code = "FABRIC_MESH_STATE_NATS_UNAVAILABLE";
-  constructor(detail: string) {
-    super(`FABRIC_MESH_STATE_NATS_UNAVAILABLE: ${detail}`);
+  /** Flat numeric metadata and the prototype reason getter survive redactNatsError / guardNatsPort. */
+  declare readonly natsErrCode?: number;
+  declare readonly consumerBootstrap?: boolean;
+  constructor(detail: string, context?: { natsErrCode?: number; consumerBootstrap?: boolean; cause?: unknown }) {
+    super(`FABRIC_MESH_STATE_NATS_UNAVAILABLE: ${detail}`, context?.cause === undefined ? undefined : { cause: context.cause });
     this.name = "MeshStateNatsUnavailableError";
+    if (context?.natsErrCode !== undefined) Object.assign(this, { natsErrCode: context.natsErrCode });
+    if (context?.consumerBootstrap === true) Object.assign(this, { consumerBootstrap: true });
+  }
+  get reason(): "placement-unavailable" | "projector-unavailable" | "consumer-bootstrap-unavailable" {
+    if (this.consumerBootstrap === true) return "consumer-bootstrap-unavailable";
+    return typeof this.natsErrCode === "number" ? "placement-unavailable" : "projector-unavailable";
   }
 }
 
@@ -294,6 +303,15 @@ export class MeshStateNatsRefusedError extends Error {
 export const assertNatsReplicas = (value: unknown, source: string): number => {
   if (typeof value === "number" && Number.isSafeInteger(value) && value >= 1) return value;
   throw new MeshStateNatsRefusedError(`${source} must be a positive integer (got ${typeof value === "number" ? String(value) : typeof value})`);
+};
+
+/** A normal peer restart plus metadata election; the same scale as the cluster fixture's 30s readiness. */
+export const DEFAULT_NATS_PLACEMENT_TIMEOUT_MS = 30_000;
+/** setTimeout's largest delay; a larger value would fire at once. */
+const MAX_TIMER_MS = 2_147_483_647;
+export const assertNatsPlacementTimeout = (value: unknown, source: string): number => {
+  if (typeof value === "number" && Number.isSafeInteger(value) && value >= 1 && value <= MAX_TIMER_MS) return value;
+  throw new MeshStateNatsRefusedError(`${source} must be a positive finite integer of milliseconds up to ${MAX_TIMER_MS} (got ${typeof value === "number" ? String(value) : typeof value})`);
 };
 
 /** A `fresh` read while the projector lags the stream, or a write that ran out of its retry budget: retryable. */
@@ -1076,6 +1094,9 @@ export interface OpenNatsStateBackendOptions {
   /** The stream's replicas (positive integer; smarty-dev#11373). Omitted: the real client reads only the agent-layer
    * fabric.json mesh.nats.replicas (default 1) at first use; an injected `port` decides for itself. */
   replicas?: number;
+  /** Real-client stream placement budget in milliseconds. Default 30 000; positive integer, at most 2^31-1.
+   * Placement exhaustion throws MeshStateNatsUnavailableError; replicas are never lowered. */
+  placementTimeoutMs?: number;
 }
 
 export interface NatsTlsFiles { caFile?: string; certFile?: string; keyFile?: string }
@@ -1135,7 +1156,7 @@ export const redactNatsUrls = (text: string): string => redactSecrets(text
  * A NEW error fit to leave the NATS client (pi-fabric#937 round 2). It keeps the prototype (so `instanceof`, e.g.
  * NatsWrongLastSequenceError, still works), a redacted name, message, stack and `code`, the number and boolean own
  * fields (`transient`, `expected`, `afterLostAck`: no text), a sanitized `cause` and AggregateError `errors` (depth
- * cap 4), and a sanitized `apiError()` result. Every other field is dropped. A non-Error throw becomes an Error with
+ * cap 4), a numeric `status`, and a sanitized `apiError()` result. Every other field is dropped. A non-Error throw becomes an Error with
  * its printable() text: a string redacted, an object only its type and allowlisted fields. Total: no coercion can throw out of it (a hostile toString, getter or proxy gives
  * "[unprintable error]").
  */
@@ -1169,16 +1190,20 @@ const sanitizeNatsError = (error: unknown, depth: number): Error => {
   if (!(error instanceof Error)) return new Error(printable(error));
   const read = (key: string): unknown => { try { return (error as unknown as Record<string, unknown>)[key]; } catch { return undefined; } };
   const safe = Object.create(Object.getPrototypeOf(error) as object) as Error & Record<string, unknown>;
-  const define = (key: string, value: unknown) => Object.defineProperty(safe, key, { value, writable: true, configurable: true, enumerable: false });
+  const define = (key: string, value: unknown, enumerable = false) => Object.defineProperty(safe, key, { value, writable: true, configurable: true, enumerable });
   define("name", printable(read("name") ?? "Error"));
   define("message", printable(read("message") ?? ""));
   define("stack", printable(read("stack") ?? ""));
   for (const key of Object.keys(error)) {
     const value = read(key);
-    if (typeof value === "number" || typeof value === "boolean") safe[key] = value;
+    if (typeof value === "number" || typeof value === "boolean") define(key, value, true);
   }
+  // SDK code/status can be getter-only and backed by private fields absent from this prototype-preserving clone.
+  // Own data properties bypass setters and keep both the first and subsequent sanitizations readable.
   const code = read("code");
-  if (code !== undefined) safe.code = typeof code === "number" ? code : printable(code);
+  if (code !== undefined) define("code", typeof code === "number" ? code : printable(code), true);
+  const status = read("status");
+  if (typeof status === "number") define("status", status, true);
   if ("cause" in error && read("cause") !== undefined) define("cause", depth < 4 ? redactNatsError(read("cause"), depth + 1) : undefined);
   const errors = read("errors");
   if (Array.isArray(errors)) define("errors", depth < 4 ? errors.map(inner => redactNatsError(inner, depth + 1)) : []);
@@ -1300,6 +1325,8 @@ export interface NatsEndpointOptions {
   /** The stream's replicas for the real client (positive integer, validated before anything is resolved or connected).
    * Omitted: the real client reads the agent fabric.json layer's mesh.nats.replicas at first use. */
   replicas?: number;
+  /** Real-client placement budget, validated before resolution or connect. Default 30 000ms. */
+  placementTimeoutMs?: number;
 }
 
 /**
@@ -1312,6 +1339,8 @@ export interface NatsEndpointOptions {
 export const connectNatsEndpoint = async (options: NatsEndpointOptions): Promise<{ port: JetStreamPort; owned: boolean;
   server: Awaited<ReturnType<JetStreamPort["server"]>> }> => {
   const replicas = options.replicas === undefined ? undefined : assertNatsReplicas(options.replicas, "replicas");
+  const placementTimeoutMs = options.placementTimeoutMs === undefined ? undefined
+    : assertNatsPlacementTimeout(options.placementTimeoutMs, "placementTimeoutMs");
   const lookup = options.lookup ?? systemLookup;
   const servers: string[] = [];
   for (const server of options.servers ?? []) servers.push(await assertNatsTransportSecure(server, "tls:", lookup));
@@ -1324,7 +1353,8 @@ export const connectNatsEndpoint = async (options: NatsEndpointOptions): Promise
   const port = options.port ?? await (await import("./state-backend-nats-client.js")).connectJetStream(servers, {
     ...(monitoringUrl === undefined ? {} : { monitoringUrl }),
     ...(tls === undefined ? {} : { tls }),
-    ...(replicas === undefined ? {} : { replicas }) });
+    ...(replicas === undefined ? {} : { replicas }),
+    ...(placementTimeoutMs === undefined ? {} : { placementTimeoutMs }) });
   try {
     const server = await port.server();
     // What a client CAN see of the server's access control is whether it requires authentication at all (INFO

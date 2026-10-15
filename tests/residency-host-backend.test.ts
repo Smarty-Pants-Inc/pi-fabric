@@ -3,7 +3,8 @@ import os from "node:os";
 import path from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
-import { readMeshStateMovedMarker } from "../src/mesh/backend-fence.js";
+import { encodeMeshStateNatsMarker, readMeshStateMovedMarker } from "../src/mesh/backend-fence.js";
+import { MeshStateBackendNotBuiltError } from "../src/mesh/state-backend.js";
 import { MeshStore } from "../src/mesh/store.js";
 import { ResidentHost } from "../src/residency/host.js";
 import { RESIDENT_HOST_FORMAT, type ResidentHostConfig } from "../src/residency/protocol.js";
@@ -69,6 +70,23 @@ describe("resident host mesh backend selection (smarty-dev#7767)", () => {
       await host.start();
       expect(host.mesh.stateBackend).toBe("sqlite");
       expect(host.mesh.get("backend/retained")?.value).toBe("sqlite state");
+      expect(disagreements(warn)).toEqual([]);
+    } finally {
+      await host.close();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  it("keeps main's NATS marker authority instead of opening a stale file backend", async () => {
+    const { root, config, host } = fixture("file");
+    const marker = encodeMeshStateNatsMarker("FABRIC_STATE", 7);
+    fs.mkdirSync(config.meshRoot, { recursive: true });
+    fs.writeFileSync(path.join(config.meshRoot, "state.json"), marker);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      await expect(host.start()).rejects.toThrow(MeshStateBackendNotBuiltError);
+      expect(fs.readFileSync(path.join(config.meshRoot, "state.json"), "utf8")).toBe(marker);
+      expect(fs.existsSync(path.join(config.meshRoot, "state.db"))).toBe(false);
       expect(disagreements(warn)).toEqual([]);
     } finally {
       await host.close();

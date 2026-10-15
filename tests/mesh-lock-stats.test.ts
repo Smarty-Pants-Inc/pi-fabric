@@ -50,6 +50,53 @@ afterEach(() => {
 });
 
 describe("mesh lock stats recorder", () => {
+  it("records real SQLite writer holds and busy give-ups in the shared minute stats", async () => {
+    // Decision C: #6477's SQLite holds were missing from L8; force contention cheaply here,
+    // while the installed Ryzen 1 check compares minute holdMax with the same-minute event log.
+    vi.stubEnv("PI_FABRIC_LOCK_STATS", "1");
+    vi.resetModules();
+    const { SqliteStateStore, openNodeSqlite } = await import("../src/mesh/state-sqlite.js");
+    const { MeshLockTimeoutError } = await import("../src/core/atomic-write.js");
+    const root = temp();
+    const state = await SqliteStateStore.open(root, 64 * 1024, 100, { lockTimeoutMs: 20 });
+    const holder = openNodeSqlite(path.join(root, "state.db"));
+    const identity = { id: "sqlite-writer", name: "sqlite-writer", kind: "agent" } as const;
+    const recorded = () => {
+      registry[lockKey]!.flush();
+      const summary = summarizeLockStats(root, readLockStats(root), { minutes: 3, now: Date.now() + 120_000 });
+      return Object.fromEntries(summary.classes.map(row => [row.lockClass, row]));
+    };
+    try {
+      // Nested try scopes are budgets, not extra acquisitions. The afterCommit custody,
+      // however, really reacquires SQLite's writer lock and must count separately.
+      await state.withTryLock(() => state.withTryLock(() => state.writeBatch({
+        identity, lockClass: "bridge", ops: [{ kind: "put", key: "bridge/value", value: 1 }],
+        afterCommit: view => { expect(view.get("bridge/value")?.value).toBe(1); },
+      }), 0), 0);
+      expect(state.get("bridge/value")?.value).toBe(1);
+      const bridge = recorded().bridge!;
+      expect(bridge).toMatchObject({ n: 2, timeouts: 0, tries: 0 });
+      expect(bridge.holdMs).toBeGreaterThan(0);
+      expect(bridge.holdMaxMs).toBeGreaterThan(0);
+
+      holder.exec("BEGIN IMMEDIATE");
+      const write = () => state.writeBatch({
+        identity, lockClass: "bridge", ops: [{ kind: "put" as const, key: "bridge/value", value: 2 }],
+      });
+      await expect(write()).rejects.toBeInstanceOf(MeshLockTimeoutError);
+      await expect(state.withTryLock(() => state.withTryLock(write, 0), 0)).rejects.toBeInstanceOf(MeshLockTimeoutError);
+      await expect(state.exclusive(() => undefined, 0)).rejects.toBeInstanceOf(MeshLockTimeoutError);
+      const failed = recorded();
+      expect(failed.bridge).toMatchObject({ n: 2, timeouts: 1, tries: 1 });
+      expect(read(root).minutes.reduce((total, minute) => total + (minute.classes.bridge?.failedWaitMs ?? 0), 0)).toBeGreaterThan(0);
+      expect(failed.custody).toMatchObject({ n: 0, timeouts: 0, tries: 1 });
+      expect(state.get("bridge/value")?.value).toBe(1);
+    } finally {
+      try { if (holder.isTransaction) holder.exec("ROLLBACK"); }
+      finally { holder.close(); state.close(); }
+    }
+  });
+
   it("aggregates wait and hold per class and flushes after the minute only on real work", () => {
     vi.useFakeTimers();
     vi.setSystemTime(T0);
@@ -333,6 +380,46 @@ describe("mesh lock stats recorder", () => {
     expect(landed).toBe(2);
     expect(fs.readFileSync(file, "utf8")).toBe("{\"fresh\":2}");
     expect(fs.readdirSync(directory).filter(name => !name.startsWith(lockStatsHost()))).toEqual(["racer-5.json"]);
+  });
+
+  it("keeps a refreshed graveyard when relinking fails, but drops it on EEXIST (smarty-dev#8954)", () => {
+    const stats = createLockStats("1")!;
+    for (const code of ["EPERM", "EEXIST"]) {
+      const root = path.join(temp(), "mesh");
+      const directory = path.join(root, "lock-stats");
+      fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+      const file = path.join(directory, "racer-5.json");
+      const grave = `${file}.prune-${process.pid}`;
+      const old = (Date.now() - 25 * 60 * 60_000) / 1000;
+      fs.writeFileSync(file, "{}");
+      fs.utimesSync(file, old, old);
+      const renameSync = fs.renameSync, linkSync = fs.linkSync;
+      vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+        if (String(from) === file) {
+          // A writer replaces the aged inode just before the pruner moves it aside.
+          fs.writeFileSync(`${file}.next`, "{\"fresh\":1}");
+          renameSync(`${file}.next`, file);
+        }
+        renameSync(from, to);
+      });
+      const link = vi.spyOn(fs, "linkSync").mockImplementationOnce((from, to) => {
+        if (code === "EPERM") throw Object.assign(new Error("relink denied"), { code });
+        fs.writeFileSync(file, "{\"fresh\":2}");
+        linkSync(from, to); // The newer file makes the real no-replace link fail with EEXIST.
+      });
+      stats.acquired(root, "custody", 1, 1);
+      registry[lockKey]!.flush();
+      expect(link).toHaveBeenCalledExactlyOnceWith(grave, file);
+      if (code === "EPERM") {
+        expect(fs.existsSync(grave)).toBe(true);
+        expect(fs.readFileSync(grave, "utf8")).toBe("{\"fresh\":1}");
+        expect(fs.existsSync(file)).toBe(false);
+      } else {
+        expect(fs.existsSync(grave)).toBe(false);
+        expect(fs.readFileSync(file, "utf8")).toBe("{\"fresh\":2}");
+      }
+      vi.restoreAllMocks();
+    }
   });
 
   it("prunes a quiet root opportunistically on explicit flush and drops a removed root", () => {

@@ -1,5 +1,5 @@
 // Data-safety boundary (smarty-dev#11570). No MeshStore, children, or product deletion:
-// the real Linux verifier is forced to dryRun; other outcomes are recorded refusals.
+// the real Linux verifier is forced to dryRun; off-Linux fallback runs through recorded no-op primitives.
 // rm/unlink/rmdir are no-ops, including on the unfixed baseline. Cleanup owns only mkdtemp roots.
 import fs from "node:fs";
 import os from "node:os";
@@ -17,8 +17,9 @@ vi.mock("../src/storage/verified-remove.js", async importOriginal => {
   const real = await importOriginal<typeof import("../src/storage/verified-remove.js")>();
   return { ...real, verifiedRemove: (target: string, judged: fs.Stats | undefined, options: Options): Result => {
     probe.before?.(target);
-    // No apply or helper execution, on any platform. Linux still runs the REAL identity/type/mtime checks.
-    const result = probe.result ?? real.verifiedRemove(target, judged, { ...options, dryRun: true });
+    // Linux runs the REAL identity/type/mtime checks in dryRun; off Linux uses no-op primitives with the helper default-disabled.
+    const result = probe.result ?? real.verifiedRemove(target, judged,
+      process.platform === "linux" ? { ...options, dryRun: true } : options);
     probe.calls.push({ target, judged, options, result });
     return result;
   } };
@@ -30,7 +31,7 @@ const host = os.hostname();
 const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform")!;
 const cleanup = fs.rmSync;
 const roots: string[] = [];
-const primitives: Array<{ operation: string; file: string }> = [];
+const primitives: Array<{ operation: string; file: string; options?: fs.RmOptions | undefined }> = [];
 let afterDeadLiveness: (() => void) | undefined;
 const failure = (code: string): Error => Object.assign(new Error(code), { code });
 const body = (fields: Record<string, unknown> = {}): string => JSON.stringify({ format: 1, pid: DEAD, host,
@@ -115,7 +116,7 @@ beforeEach(() => {
     return true;
   });
   vi.spyOn(console, "warn").mockImplementation(() => {});
-  vi.spyOn(fs, "rmSync").mockImplementation(file => { primitives.push({ operation: "rm", file: String(file) }); });
+  vi.spyOn(fs, "rmSync").mockImplementation((file, options) => { primitives.push({ operation: "rm", file: String(file), options }); });
   vi.spyOn(fs, "unlinkSync").mockImplementation(file => { primitives.push({ operation: "unlink", file: String(file) }); });
   vi.spyOn(fs, "rmdirSync").mockImplementation(file => { primitives.push({ operation: "rmdir", file: String(file) }); });
 });
@@ -188,7 +189,7 @@ describe.runIf(process.platform === "linux")("writer census exact judged inode (
     const call = probe.calls[0]!;
     expect(call.target).toBe(file);
     expect(call.judged).toBe(temporary ? named[0] : observed.stats[0]);
-    expect(call.options).toEqual({ deleter: temporary ? "censusTornWrite" : "censusRecordPrune" });
+    expect(call.options).toEqual({ deleter: temporary ? "censusTornWrite" : "censusRecordPrune", fallback: expect.any(Function) });
     expect(call.result).toEqual({ removed: true, bytes: Buffer.byteLength(temporary ? "torn" : body()) });
     expect(report.unknown.map(item => item.name)).not.toContain(name);
     expect(fs.existsSync(file)).toBe(true); // A successful DRY RUN is not an actual archive/delete.
@@ -393,14 +394,22 @@ describe("writer census conservative evidence and fd lifetime", () => {
     });
   }
 
-  it.each([false, true])("retains unsupported non-Linux removal unknown, with no primitive fallback (temporary=%s)", temporary => {
+  it.each([
+    { platform: "darwin", temporary: false },
+    { platform: "darwin", temporary: true },
+    { platform: "win32", temporary: false },
+    { platform: "win32", temporary: true },
+  ])("removes a dead file via the real off-Linux fallback (platform=$platform, temporary=$temporary)", ({ platform, temporary }) => {
     const { root, file, name } = fixture(temporary);
-    Object.defineProperty(process, "platform", { ...originalPlatform, value: "darwin" });
+    Object.defineProperty(process, "platform", { ...originalPlatform, value: platform });
     const report = censusSync(root);
-    refused(report, file, /needs Linux|ownership cannot be proven/);
-    unknown(report, name);
-    expect(probe.calls[0]!.options).not.toHaveProperty("fallback");
-    expect(fs.existsSync(file)).toBe(true);
-    expect(primitives).toEqual([]);
+    expect(probe.calls).toHaveLength(1);
+    const call = probe.calls[0]!;
+    expect(call.target).toBe(file);
+    expect(call.result).toEqual({ removed: true, bytes: 0 });
+    expect(call.options).toEqual({ deleter: temporary ? "censusTornWrite" : "censusRecordPrune", fallback: expect.any(Function) });
+    expect(report.unknown.map(item => item.name)).not.toContain(name);
+    expect(primitives).toEqual([{ operation: "rm", file, options: { force: true } }]);
+    expect(fs.existsSync(file)).toBe(true); // The recorded rmSync probe does not actually delete the file.
   });
 });

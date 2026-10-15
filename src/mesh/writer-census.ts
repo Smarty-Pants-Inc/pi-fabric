@@ -206,7 +206,9 @@ export function censusSync(root: string): WriterCensusReport {
   // Refusal is evidence, including an entry held off-name in a graveyard. Only an ENOENT
   // before any move, confirmed at the original name, is absence (smarty-dev#11570).
   const removeJudged = (file: string, name: string, judged: fs.Stats, deleter: string): void => {
-    const result = verifiedRemove(file, judged, { deleter }); // No pathname fallback on any platform.
+    // ponytail: Linux stays identity-bound, with no fallback; off Linux main's existing pathname
+    // removal is the accepted residual of smarty-dev#7858.
+    const result = verifiedRemove(file, judged, { deleter, fallback: () => { fs.rmSync(file, { force: true }); return true; } });
     if (result.removed) return;
     if (result.graveyard === undefined && !result.reason.includes("graveyard") && /\(ENOENT\)$/.test(result.reason)) {
       try { fs.lstatSync(file); } catch (error) { if (errno(error) === "ENOENT") return; }

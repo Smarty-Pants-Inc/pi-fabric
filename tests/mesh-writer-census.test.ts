@@ -172,16 +172,14 @@ describe("mesh writer census", () => {
     expect(result.unknown).not.toEqual([]);
     expect(result.unknown).toContainEqual(expect.objectContaining({ pid: process.pid, source: "lock-ticket", name }));
   });
-  it("verifies this host's dead record or retains it unknown where verified removal is unsupported", async () => {
+  it("removes this host's dead record on every platform", async () => {
     const mesh = root();
     const pid = deadPid();
     const file = writeRecord(mesh, { pid, host: os.hostname(), startedAt: ownStartedAt() });
     const result = await census(mesh);
     expect(result.writers.find(writer => writer.pid === pid)).toBeUndefined();
-    if (process.platform === "linux") expect(result.unknown).toEqual([]);
-    else expect(result.unknown).toEqual([expect.objectContaining({ source: "process-record", name: path.basename(file),
-      reason: expect.stringMatching(/removal refused:/) })]);
-    expect(fs.existsSync(file)).toBe(process.platform !== "linux");
+    expect(result.unknown).toEqual([]);
+    expect(fs.existsSync(file)).toBe(false);
   });
 
   it("removes its own record when the process exits", async () => {

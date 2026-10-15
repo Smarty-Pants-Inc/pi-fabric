@@ -115,12 +115,21 @@ const { DatabaseSync } = await import("node:sqlite");
 const db = new DatabaseSync(process.argv[1]);
 if (process.argv[2] === "wal") db.exec("PRAGMA journal_mode = WAL");
 db.exec("BEGIN IMMEDIATE");
-process.stdout.write("held\\n");
-setInterval(() => undefined, 1_000);
+// The process staying alive does not keep its SQLite connection alive. Retain
+// it in the live callback, or GC can roll back BEGIN while the holder still runs.
+setInterval(() => {
+  if (!db.isTransaction) throw new Error("SQLite holder lost BEGIN IMMEDIATE");
+}, 1_000);
+// Exercise the lifetime boundary before advertising readiness, not only when a
+// particular runtime or CI heap pressure happens to collect the eval's locals.
+setImmediate(() => {
+  globalThis.gc();
+  process.stdout.write("held\\n");
+});
 `;
 
 const holdState = (root: string, mode: "wal" | "delete"): Promise<() => Promise<void>> => new Promise((resolve, reject) => {
-  const child = spawn(process.execPath, ["--no-warnings", "--input-type=module", "-e", HOLDER, path.join(root, "state.db"), mode],
+  const child = spawn(process.execPath, ["--expose-gc", "--no-warnings", "--input-type=module", "-e", HOLDER, path.join(root, "state.db"), mode],
     { stdio: ["ignore", "pipe", "pipe"] });
   const exited = new Promise<void>((done) => child.once("close", () => done()));
   let stderr = "";

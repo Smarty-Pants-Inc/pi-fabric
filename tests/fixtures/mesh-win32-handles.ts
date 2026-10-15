@@ -230,6 +230,21 @@ export class WindowsHandleHarness {
     return { child: entry.child, done: entry.done };
   }
 
+  /** Crash ONLY a live native child registered by this harness; join its finite OS-deadline process even on error.
+   * Never accepts a PID or signals the external-handle fixture/compiler. A terminal child is not a crash-at-pause. */
+  async killNative(run: NativeRun): Promise<ChildReceipt> {
+    this.active();
+    const entry = this.children.find(child => child.kind === "native" && child.child === run.child && child.done === run.done);
+    if (!entry) throw new Error("cannot crash an unowned native child");
+    if (entry.closed) throw new Error(`native child already terminal before crash: ${receiptError(await entry.done)}`);
+    let failure: unknown;
+    try { if (!entry.child.kill()) failure = new Error("owned native child did not accept crash signal"); }
+    catch (error) { failure = error; }
+    const receipt = await entry.done;
+    if (failure) throw new Error(`${String(failure)}; terminal receipt: ${receiptError(receipt)}`);
+    return receipt;
+  }
+
   /** EOF every external fixture, terminate ONLY owned pending native children, and join ALL before reporting failure.
    * Includes the already joined compiler receipt. Root cleanup belongs to the test, strictly AFTER this resolves.
    * Native nonzero exits/signals can be the crash/refusal under test; fixture nonzero exits are NEVER a pass. */
@@ -282,9 +297,12 @@ export const waitCheckpoint = async (dir: string, name: string): Promise<void> =
   }
 };
 
-export const proceedCheckpoint = (dir: string, mode?: "classic" | "trace"): void => {
-  if (mode !== undefined && mode !== "classic" && mode !== "trace") throw new Error("invalid disposition test command");
-  fs.writeFileSync(path.join(dir, "go"), mode === "classic" ? "classic-disposition\n" : mode === "trace" ? "trace-disposition\n" : "");
+type ClassicCrashCommand = `classic-debris-after-${0 | 1 | 2 | 3 | 4 | 5}`;
+export const proceedCheckpoint = (dir: string, mode?: "classic" | "trace" | ClassicCrashCommand): void => {
+  const crash = mode !== undefined && mode.length === "classic-debris-after-0".length && /^classic-debris-after-[0-5]$/.test(mode);
+  if (mode !== undefined && mode !== "classic" && mode !== "trace" && !crash) throw new Error("invalid disposition test command");
+  fs.writeFileSync(path.join(dir, "go"), mode === "classic" ? "classic-disposition\n" : mode === "trace" ? "trace-disposition\n" :
+    crash ? `${mode}\n` : "");
 };
 
 /** Missing, truncated, oversized or malformed traces fail loudly. Trace success is not proof of last-close deletion. */

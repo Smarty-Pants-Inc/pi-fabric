@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { windowsMeshCacheFixture } from "./windows-mesh-cache-fixture.js";
-// Deliberate VALUE import: unchanged local deletion detector excludes this real native suite (#13001).
+// Deliberate VALUE import of the real bootstrap; explicit win32 + GITHUB_ACTIONS gating below controls execution.
 import { windowsHelperBootstrap } from "../src/storage/verified-remove.js";
 import { MeshLockTimeoutError } from "../src/core/atomic-write.js";
 import { MeshLock } from "../src/mesh/mesh-lock.js";
@@ -154,9 +154,8 @@ const assertTrace = (gate: string, entries: readonly WindowsMeshRecoveryEntry[],
   return trace;
 };
 
-// Exactly 11 cases: 6 native D rows, 2 public D routes, 3 public E configurations (each includes its controls).
-// D's classic+kill-after-i matrix is deliberately NOT claimed: one selected checkpoint cannot both force classic
-// before the first file and pause after it. The real pending-reader partial case below is the permitted minimum.
+// Exactly 17 cases: 6 native D controls, 6 actual classic crash-after-i rows, 2 public D routes, 3 public E configurations.
+// Crash rows use unblocked real classic disposals; the external-reader delete-pending partial control stays separate.
 describe.skipIf(!hosted)(`Windows classic D and canonical E sharing (${SKIP})`, () => {
   let root: string, cap: WindowsMeshCapability, harness: WindowsHandleHarness | undefined;
   let harnessCreation: Promise<WindowsHandleHarness> | undefined;
@@ -283,6 +282,85 @@ describe.skipIf(!hosted)(`Windows classic D and canonical E sharing (${SKIP})`, 
     await finish(tree, tree.entries);
     assertNoDetach(root, tree.lock);
   }, 30_000);
+
+  for (const i of [0, 1, 2, 3, 4, 5] as const) it(`D actual classic crash after ${i}: independently rejudge survivors, finish without detach, and preserve successor B against original D`, async () => {
+    const tree = deadTree(root); await judge(tree);
+    expect(tree.entries).toHaveLength(6);
+    const originalRequest = encodeMeshDebrisRecoveryRequest(tree.lock, tree.entries, NATIVE_MS);
+    const originalLeaves = new Map(tree.entries.filter(entry => entry.record !== undefined)
+      .map(entry => [entry.path, fileSnapshot(entry.path)]));
+    const canonicalId = id(tree.lock), gate = temp(), run = start(tree.lock, tree.entries, gate);
+    await atGate(run, gate);
+    const command = `classic-debris-after-${i}` as const, checkpoint = `debris-after-${i}`;
+    proceedCheckpoint(gate, command);
+    // The harness registry owns only debris-verified. An unowned/stale later marker alone is NOT a live pause.
+    await Promise.race([waitCheckpoint(gate, checkpoint), run.done.then(receipt => {
+      throw new Error(`native exited before owned ${checkpoint}: ${JSON.stringify(receipt)}`);
+    })]);
+    expect(fs.readFileSync(path.join(gate, `${checkpoint}.paused`), "ascii")).toBe(`${run.child.pid}\n`);
+    // Keep the original go file present: it MUST NOT accidentally release this second, checkpoint-specific pause.
+    expect(fs.readFileSync(path.join(gate, "go"), "ascii")).toBe(`${command}\n`);
+    expect(fs.existsSync(path.join(gate, `${checkpoint}.go`))).toBe(false);
+    const receipt = await harness!.killNative(run); // ownership-checked signal, then finite terminal JOIN
+    expect(await run.done).toEqual(receipt);
+    diagnostic("classic-crash-joined", { checkpoint, helper: cap.absolutePath, digest: cap.digest, pid: run.child.pid, receipt });
+    expect(receipt.error).toBeUndefined(); expect(receipt.stderr).toBe(""); expect(receipt.stdout).toBe("");
+    expect(receipt.code === 0 && receipt.signal === null).toBe(false);
+    expect(receipt.code).not.toBe(124); // watchdog expiry is not the owned crash requested at this pause
+    expect(result(run, receipt).outcome).toBe("recovery-outcome-unknown");
+    const disposed = tree.entries.slice(0, i + 1), remaining = tree.entries.slice(i + 1);
+    const trace = assertTrace(gate, disposed, "classic");
+    expect(trace).toHaveLength(i + 1); // no call beyond the selected existing checkpoint
+    for (let n = 0; n <= i; n++) {
+      const entry = tree.entries[n]!, call = trace[n]!;
+      expect(call).toMatchObject({ api: "classic", forced: true, ok: true, error: 0, directory: entry.stat.isDirectory() });
+      expect(hex(call.volume)).toBe(entry.stat.dev); expect(hex(call.index)).toBe(entry.stat.ino);
+      expect(() => stat(entry.path)).toThrow(expect.objectContaining({ code: "ENOENT" })); // actual last-close removal
+    }
+    assertNoDetach(root, tree.lock);
+    if (i === 5) {
+      // The canonical directory itself was successfully disposed and closed BEFORE debris-after-5. No invented survivor.
+      expect(remaining).toEqual([]);
+      expect(() => stat(tree.lock)).toThrow(expect.objectContaining({ code: "ENOENT" }));
+    } else {
+      expect(id(tree.lock)).toBe(canonicalId);
+      // A NEW enumeration/full R/death judgment for EVERY surviving leaf, only after the crashed helper JOIN.
+      const fresh = await freshSurvivors(tree);
+      expect(fresh.map(entry => entry.path).sort()).toEqual(remaining.map(entry => entry.path).sort());
+      expect(fresh.filter(entry => entry.record !== undefined)).toHaveLength(remaining.filter(entry => entry.record !== undefined).length);
+      for (const entry of fresh) {
+        if (entry.record !== undefined) {
+          expect(fileSnapshot(entry.path)).toEqual(originalLeaves.get(entry.path));
+          expect(entry.record).toBe(tree.records.get(entry.path)); assertDead(entry.record);
+        } else {
+          const children = fresh.filter(child => child.path !== entry.path && path.dirname(child.path) === entry.path)
+            .map(child => path.basename(child.path)).sort();
+          // Includes [] for each empty survivor: emptiness, never the vanished neighboring leaf's death proof.
+          expect(fs.readdirSync(entry.path).sort()).toEqual(children);
+          expect(entry.stat.isDirectory()).toBe(true);
+        }
+      }
+      await finish(tree, fresh); // remaining admissible D only; this helper is also joined before any cleanup
+    }
+    expect(fs.existsSync(tree.lock)).toBe(false); assertNoDetach(root, tree.lock);
+
+    // Publish a fresh, live B without acquiring an application lock or replaying an application callback.
+    fs.mkdirSync(tree.lock);
+    const owner = path.join(tree.lock, "owner"), recordB = `${randomUUID()}\n${process.pid}\n${Date.now()}\n`;
+    fs.writeFileSync(owner, recordB, { flag: "wx" });
+    const directoryB = directorySnapshot(tree.lock), ownerB = fileSnapshot(owner);
+    nativeCount += 1;
+    const stale = harness!.native(cap, "debris", originalRequest), staleReceipt = await stale.done;
+    diagnostic("stale-original-D-versus-B", { checkpoint, receipt: staleReceipt, directoryB, ownerB });
+    expect(staleReceipt.error).toBeUndefined(); expect(staleReceipt.stderr).toBe("");
+    expect(staleReceipt.code).toBe(3); expect(staleReceipt.signal).toBeNull();
+    expect(staleReceipt.stdout).toMatch(/^FMREC1 refused verify [a-z-]+\n$/);
+    expect(result(stale, staleReceipt).outcome).toBe("refused");
+    expect(directorySnapshot(tree.lock)).toEqual(directoryB); // B directory's OWN volume/id (and mtime)
+    expect(fileSnapshot(owner)).toEqual(ownerB); // B owner's OWN volume/id, time, size, and complete bytes
+    expect(readMeshRecoveryOwner(tree.lock)!.record).toBe(recordB);
+    expect(fs.readdirSync(tree.lock)).toEqual(["owner"]); assertNoDetach(root, tree.lock);
+  }, 45_000);
 
   it("D ordinary extended-success counterexample is traced, not misreported as classic fallback", async () => {
     const tree = deadTree(root); await judge(tree);

@@ -65,7 +65,10 @@
  * can shorten the main-thread logical deadline to now; they never lengthen it or change the armed watchdog.
  * At any selected existing mesh checkpoint, exact "classic-disposition\n" or "trace-disposition\n" enables
  * process-local mesh-only disposition tracing (DIR\disposition.jsonl, at most 64 actual calls); classic also
- * selects the existing real classic fallback. Empty go files and the generic verified remover are unchanged.
+ * selects the existing real classic fallback. Only at debris-verified, exact "classic-debris-after-I\n" (I one
+ * of 0,1,2,3,4,5) also selects ONE existing debris-after-I pause, which waits on DIR\debris-after-I.go instead
+ * of DIR\go (the first command cannot release it). No deadline/watchdog is extended or rearmed.
+ * Empty go files and the generic verified remover are unchanged.
  */
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -314,12 +317,16 @@ static int meshExpired(void) { return GetTickCount64() >= meshDeadline; }
 static int meshClassicDisposition;
 static wchar_t meshDispositionTrace[4200];
 static unsigned meshDispositionSequence;
+static wchar_t meshClassicAfterCheckpoint[64]; /* test-only second pause; six exact commands below */
 
 /* Tests only: see the header. Bounded by the watchdog (the request deadline). */
 static void meshCheckpoint(const wchar_t *name) {
     static wchar_t want[64], dir[4096], file[4200];
     DWORD got = GetEnvironmentVariableW(L"FABRIC_WIN_MESH_TEST_CHECKPOINT", want, 64);
-    if (got == 0 || got >= 64 || wcscmp(want, name) != 0) return;
+    if (got == 0 || got >= 64) return;
+    int later = wcscmp(want, L"debris-verified") == 0 && meshClassicAfterCheckpoint[0] &&
+        wcscmp(meshClassicAfterCheckpoint, name) == 0;
+    if (wcscmp(want, name) != 0 && !later) return;
     got = GetEnvironmentVariableW(L"FABRIC_WIN_MESH_TEST_DIR", dir, 4096);
     if (got == 0 || got >= 4096) return;
     swprintf(file, 4200, L"%ls\\%ls.paused", dir, name);
@@ -331,7 +338,8 @@ static void meshCheckpoint(const wchar_t *name) {
         if (length > 0) WriteFile(marker, pid, (DWORD)length, &written, NULL);
         CloseHandle(marker);
     }
-    swprintf(file, 4200, L"%ls\\go", dir);
+    if (later) swprintf(file, 4200, L"%ls\\%ls.go", dir, name);
+    else swprintf(file, 4200, L"%ls\\go", dir);
     while (GetFileAttributesW(file) == INVALID_FILE_ATTRIBUTES) Sleep(5);
     /* The existing explicit checkpoint gate alone authorizes this read. The watchdog is NEVER rearmed here. */
     HANDLE request = CreateFileW(file, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, NULL);
@@ -347,6 +355,19 @@ static void meshCheckpoint(const wchar_t *name) {
                 (length == sizeof("trace-disposition\n") - 1 && memcmp(command, "trace-disposition\n", length) == 0)) {
                 meshClassicDisposition = command[0] == 'c';
                 swprintf(meshDispositionTrace, 4200, L"%ls\\disposition.jsonl", dir);
+            } else if (wcscmp(name, L"debris-verified") == 0) {
+                static const char *const commands[] = {
+                    "classic-debris-after-0\n", "classic-debris-after-1\n", "classic-debris-after-2\n",
+                    "classic-debris-after-3\n", "classic-debris-after-4\n", "classic-debris-after-5\n"
+                };
+                for (unsigned i = 0; i < 6; i++) {
+                    if (length == sizeof("classic-debris-after-0\n") - 1 && memcmp(command, commands[i], length) == 0) {
+                        meshClassicDisposition = 1;
+                        swprintf(meshDispositionTrace, 4200, L"%ls\\disposition.jsonl", dir);
+                        swprintf(meshClassicAfterCheckpoint, 64, L"debris-after-%u", i);
+                        break;
+                    }
+                }
             }
         }
         CloseHandle(request);

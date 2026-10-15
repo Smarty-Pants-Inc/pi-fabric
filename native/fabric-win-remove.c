@@ -63,6 +63,9 @@
  * (before-commit, after-commit, before-owner-dispose, after-owner, after-directory), writing DIR\NAME.paused (this pid)
  * and waiting for DIR\go, bounded by the watchdog. At before-owner-dispose ONLY, exact go bytes "expire-deadline\n"
  * can shorten the main-thread logical deadline to now; they never lengthen it or change the armed watchdog.
+ * At any selected existing mesh checkpoint, exact "classic-disposition\n" or "trace-disposition\n" enables
+ * process-local mesh-only disposition tracing (DIR\disposition.jsonl, at most 64 actual calls); classic also
+ * selects the existing real classic fallback. Empty go files and the generic verified remover are unchanged.
  */
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -307,6 +310,11 @@ static int meshArm(DWORD ms) {
 }
 static int meshExpired(void) { return GetTickCount64() >= meshDeadline; }
 
+/* Activated ONLY by exact go bytes at an explicitly selected existing checkpoint, never by a standalone env/verb. */
+static int meshClassicDisposition;
+static wchar_t meshDispositionTrace[4200];
+static unsigned meshDispositionSequence;
+
 /* Tests only: see the header. Bounded by the watchdog (the request deadline). */
 static void meshCheckpoint(const wchar_t *name) {
     static wchar_t want[64], dir[4096], file[4200];
@@ -325,29 +333,74 @@ static void meshCheckpoint(const wchar_t *name) {
     }
     swprintf(file, 4200, L"%ls\\go", dir);
     while (GetFileAttributesW(file) == INVALID_FILE_ATTRIBUTES) Sleep(5);
-    /* One-shot fail-safe test request, only at the validated retired-owner boundary. No new inherited environment
-     * hook: the existing explicit checkpoint gate authorizes this read. The real watchdog is NEVER rearmed here. */
-    if (wcscmp(name, L"before-owner-dispose") == 0) {
-        HANDLE request = CreateFileW(file, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, NULL);
-        if (request != INVALID_HANDLE_VALUE) {
-            char command[sizeof("expire-deadline\n")];
-            DWORD length = 0;
-            if (ReadFile(request, command, sizeof(command), &length, NULL) && length == sizeof(command) - 1 &&
-                memcmp(command, "expire-deadline\n", sizeof(command) - 1) == 0) {
+    /* The existing explicit checkpoint gate alone authorizes this read. The watchdog is NEVER rearmed here. */
+    HANDLE request = CreateFileW(file, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+    if (request != INVALID_HANDLE_VALUE) {
+        char command[32];
+        DWORD length = 0;
+        if (ReadFile(request, command, sizeof(command), &length, NULL)) {
+            if (length == sizeof("expire-deadline\n") - 1 &&
+                memcmp(command, "expire-deadline\n", length) == 0 && wcscmp(name, L"before-owner-dispose") == 0) {
                 ULONGLONG now = GetTickCount64();
                 if (now < meshDeadline) meshDeadline = now; /* only shorten, even if already expired */
+            } else if ((length == sizeof("classic-disposition\n") - 1 && memcmp(command, "classic-disposition\n", length) == 0) ||
+                (length == sizeof("trace-disposition\n") - 1 && memcmp(command, "trace-disposition\n", length) == 0)) {
+                meshClassicDisposition = command[0] == 'c';
+                swprintf(meshDispositionTrace, 4200, L"%ls\\disposition.jsonl", dir);
             }
-            CloseHandle(request);
         }
+        CloseHandle(request);
     }
 }
 
-/* Delete by handle: POSIX semantics, else classic (completes at the last close). A directory fails when not empty. */
+/* No paths in JSON. Missing/unwritable trace is a test failure, never manufactured evidence of a real call. */
+static void meshTraceDisposition(const BY_HANDLE_FILE_INFORMATION *info, const char *api, BOOL ok, DWORD error) {
+    if (meshDispositionSequence >= 64) return;
+    unsigned sequence = ++meshDispositionSequence;
+    char line[384];
+    int length = snprintf(line, sizeof(line),
+        "{\"pid\":%lu,\"sequence\":%u,\"api\":\"%s\",\"forced\":%s,\"ok\":%s,\"error\":%lu,"
+        "\"volume\":\"%lx\",\"index\":\"%llx\",\"directory\":%s}\n",
+        (unsigned long)GetCurrentProcessId(), sequence, api, meshClassicDisposition ? "true" : "false",
+        ok ? "true" : "false", (unsigned long)(ok ? ERROR_SUCCESS : error), (unsigned long)info->dwVolumeSerialNumber,
+        (unsigned long long)info->nFileIndexHigh << 32 | info->nFileIndexLow,
+        info->dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY ? "true" : "false");
+    HANDLE trace = CreateFileW(meshDispositionTrace, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+        OPEN_ALWAYS, FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+    if (trace != INVALID_HANDLE_VALUE) {
+        DWORD written = 0;
+        if (length > 0 && length < (int)sizeof(line)) WriteFile(trace, line, (DWORD)length, &written, NULL);
+        CloseHandle(trace);
+    }
+}
+
+/* Delete by handle: POSIX semantics, else classic (completes at the last close). A directory fails when not empty.
+ * This function serves mesh W/D only; the generic verified remover's inline disposal is deliberately untouched. */
 static BOOL disposeHandle(HANDLE handle) {
     FILE_DISPOSITION_INFO_EX extended = { FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS };
     FILE_DISPOSITION_INFO plain = { TRUE };
-    return SetFileInformationByHandle(handle, FileDispositionInfoEx, &extended, sizeof(extended)) ||
-        SetFileInformationByHandle(handle, FileDispositionInfo, &plain, sizeof(plain));
+    if (!meshDispositionTrace[0]) {
+        return SetFileInformationByHandle(handle, FileDispositionInfoEx, &extended, sizeof(extended)) ||
+            SetFileInformationByHandle(handle, FileDispositionInfo, &plain, sizeof(plain));
+    }
+    DWORD previous = GetLastError();
+    BY_HANDLE_FILE_INFORMATION info;
+    BOOL identified = GetFileInformationByHandle(handle, &info);
+    SetLastError(previous);
+    BOOL ok;
+    DWORD error;
+    if (!meshClassicDisposition) {
+        ok = SetFileInformationByHandle(handle, FileDispositionInfoEx, &extended, sizeof(extended));
+        error = GetLastError();
+        if (identified) meshTraceDisposition(&info, "extended", ok, error);
+        SetLastError(error);
+        if (ok) return ok;
+    }
+    ok = SetFileInformationByHandle(handle, FileDispositionInfo, &plain, sizeof(plain));
+    error = GetLastError();
+    if (identified) meshTraceDisposition(&info, "classic", ok, error);
+    SetLastError(error);
+    return ok;
 }
 
 static const char *finalPath(HANDLE handle, wchar_t *buffer) {

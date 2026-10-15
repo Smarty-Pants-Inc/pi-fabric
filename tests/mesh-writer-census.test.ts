@@ -80,8 +80,14 @@ const denyRead = (target: string): void => {
   deniedPaths.add(path.resolve(target));
   if (vi.isMockFunction(fs.readdirSync)) return;
   const eacces = (file: unknown): Error => Object.assign(new Error(`EACCES: permission denied, '${String(file)}'`), { code: "EACCES" });
-  const blocked = (file: unknown): boolean => deniedPaths.has(path.resolve(String(file)));
-  const readdir = fs.readdirSync, readFile = fs.readFileSync;
+  // Numeric descriptors are not pathnames. Deny the open itself so fd-bound readers see
+  // the same EACCES on Windows/root as an unprivileged POSIX reader.
+  const blocked = (file: unknown): boolean => typeof file !== "number" && deniedPaths.has(path.resolve(String(file)));
+  const readdir = fs.readdirSync, readFile = fs.readFileSync, open = fs.openSync;
+  vi.spyOn(fs, "openSync").mockImplementation(((file: fs.PathLike, ...rest: unknown[]) => {
+    if (blocked(file)) throw eacces(file);
+    return (open as (...args: unknown[]) => unknown)(file, ...rest);
+  }) as typeof fs.openSync);
   vi.spyOn(fs, "readdirSync").mockImplementation(((file: fs.PathLike, ...rest: unknown[]) => {
     if (blocked(file)) throw eacces(file);
     return (readdir as (...args: unknown[]) => unknown)(file, ...rest);
@@ -166,14 +172,16 @@ describe("mesh writer census", () => {
     expect(result.unknown).not.toEqual([]);
     expect(result.unknown).toContainEqual(expect.objectContaining({ pid: process.pid, source: "lock-ticket", name }));
   });
-  it("deletes this host's record of a dead process", async () => {
+  it("verifies this host's dead record or retains it unknown where verified removal is unsupported", async () => {
     const mesh = root();
     const pid = deadPid();
     const file = writeRecord(mesh, { pid, host: os.hostname(), startedAt: ownStartedAt() });
     const result = await census(mesh);
     expect(result.writers.find(writer => writer.pid === pid)).toBeUndefined();
-    expect(result.unknown).toEqual([]);
-    expect(fs.existsSync(file)).toBe(false);
+    if (process.platform === "linux") expect(result.unknown).toEqual([]);
+    else expect(result.unknown).toEqual([expect.objectContaining({ source: "process-record", name: path.basename(file),
+      reason: expect.stringMatching(/removal refused:/) })]);
+    expect(fs.existsSync(file)).toBe(process.platform !== "linux");
   });
 
   it("removes its own record when the process exits", async () => {
@@ -626,12 +634,12 @@ describe("mesh writer census", () => {
       setup: mesh => { fs.mkdirSync(path.join(mesh, ".writer-census")); fs.writeFileSync(path.join(mesh, ".writer-census", "torn.json"), "{\"format\":1,\"pid\""); } },
     { label: "a live writer's record write still in flight", reportsUnknown: true,
       setup: mesh => { fs.mkdirSync(path.join(mesh, ".writer-census")); fs.writeFileSync(`${ownRecord(mesh)}.0123456789abcdef.tmp`, "{"); } },
-    { label: "a dead writer's torn temporary (removed)", reportsUnknown: false,
+    { label: "a dead writer's torn temporary (verified removal or retained unknown)", reportsUnknown: process.platform !== "linux",
       setup: mesh => {
         fs.mkdirSync(path.join(mesh, ".writer-census"));
         fs.writeFileSync(path.join(mesh, ".writer-census", `${censusRecordFileName(os.hostname(), deadPid(), 1)}.0123456789abcdef.tmp`), "{");
       },
-      check: (_, mesh) => expect(fs.readdirSync(path.join(mesh, ".writer-census"))).toEqual([]) },
+      check: (_, mesh) => expect(fs.readdirSync(path.join(mesh, ".writer-census"))).toHaveLength(process.platform === "linux" ? 0 : 1) },
     { label: "clock skew: a live writer's wall-clock start an hour off is not proof of death", reportsUnknown: false,
       setup: mesh => { writeRecord(mesh, { pid: process.pid, host: os.hostname(), startedAt: ownStartedAt() - 3_600_000,
         ...(process.platform === "linux" ? incarnation() : {}) }); },

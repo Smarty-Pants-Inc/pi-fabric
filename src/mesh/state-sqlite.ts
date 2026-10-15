@@ -128,7 +128,8 @@ import { MeshBatchConflictError, type MeshBatchOperation, type MeshBatchResult, 
 import type { MeshIdentity } from "./event-log.js";
 import { formatWalReaders, walReaderPids, walWriterPid } from "./wal-readers.js";
 import { createLockEvents, lockHeldEventThreshold, type MeshLockClass } from "./commit-stats.js";
-import { assertPrivatePath, assertPrivateStateRoot, filesystemRefusal, MeshStateUnsupportedError, openPrivateStateDb } from "./state-gate.js";
+import { assertGatedFlagDirectory, assertPrivatePath, assertPrivateStateRoot, createStateRoot, filesystemRefusal,
+  MeshStateUnsupportedError, openPrivateStateDb } from "./state-gate.js";
 
 // The process's lock-event appender (smarty-dev#9290), shared with mesh-lock.ts through its registry.
 const lockEvents = createLockEvents();
@@ -915,20 +916,18 @@ export class SqliteStateStore {
     // smarty-dev#6477 review round 2: "create" on a fresh root runs under the import's fence (custody.lock, then
     // .lock) from the re-checked guard through the db init to the marker, so a file-mode writer either commits
     // first (the guard below sees its state.json and refuses) or its fence check sees this state.db and refuses.
+    // smarty-dev#8920: on Windows the root is created (and made private) before the fence, which would create it
+    // untracked. POSIX keeps the fence's own mkdir: nothing runs before it.
+    if (process.platform === "win32") createStateRoot(root);
     return holdMeshFence(root, { lockTimeoutMs: options.lockTimeoutMs ?? LOCK_TIMEOUT_MS }, () =>
       SqliteStateStore.#openAsync(root, maxEventBytes, maxReadEvents, options, guardBeforeOpen(root, requested), initTimeoutMs));
   }
 
   static async #openAsync(root: string, maxEventBytes: number, maxReadEvents: number, options: SqliteStateStoreOptions,
     initialize: SqliteStateStoreOptions["initialize"], initTimeoutMs?: number): Promise<SqliteStateStore> {
-    fs.mkdirSync(root, { recursive: true, mode: 0o700 });
+    createStateRoot(root);
     const file = path.join(root, "state.db");
-    assertPrivateStateRoot(root); // before the create: a refused root gets no state.db (#846 SEC P2)
-    // Create mode 0600 before SQLite opens it (its -wal/-shm inherit the mode). O_EXCL: when this
-    // succeeds no connection in this process can have the file open, so closing drops no lock.
-    try { fs.closeSync(fs.openSync(file, "wx", 0o600)); }
-    catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
-    const db = openPrivateStateDb(file, options.open ?? openNodeSqlite); // the one gate (smarty-dev#7548, pi-fabric#694 P2-E)
+    const db = openCreatingStateDb(root, file, options.open ?? openNodeSqlite); // the one gate (smarty-dev#7548, pi-fabric#694 P2-E)
     const deadline = Date.now() + Math.max(0, initTimeoutMs ?? options.lockTimeoutMs ?? LOCK_TIMEOUT_MS);
     try {
       let transient = 0;
@@ -967,18 +966,16 @@ export class SqliteStateStore {
     if (initialize !== "create") return SqliteStateStore.#openSync(root, maxEventBytes, maxReadEvents, options, initialize);
     // The same fence as open(), one synchronous attempt at the same two locks: a busy fence throws an
     // SQLITE_BUSY-coded MeshFenceBusyError, which callers retry like a busy database (see the contract above).
+    if (process.platform === "win32") createStateRoot(root); // smarty-dev#8920: before the fence, as in open()
     return holdMeshFenceSync(root, 0, () =>
       SqliteStateStore.#openSync(root, maxEventBytes, maxReadEvents, options, guardBeforeOpen(root, requested)));
   }
 
   static #openSync(root: string, maxEventBytes: number, maxReadEvents: number, options: SqliteStateStoreOptions,
     initialize: SqliteStateStoreOptions["initialize"]): SqliteStateStore {
-    fs.mkdirSync(root, { recursive: true, mode: 0o700 });
+    createStateRoot(root);
     const file = path.join(root, "state.db");
-    assertPrivateStateRoot(root);
-    try { fs.closeSync(fs.openSync(file, "wx", 0o600)); }
-    catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
-    const db = openPrivateStateDb(file, options.open ?? openNodeSqlite);
+    const db = openCreatingStateDb(root, file, options.open ?? openNodeSqlite);
     try {
       const fresh = initialize === "create" && !hasMeta(db);
       if (initialize !== "detached" && !fresh) assertImportedDatabase(db, root);
@@ -2070,6 +2067,23 @@ export class SqliteStateStore {
   }
 }
 
+// The store's open of `<root>/state.db`, creating it when missing. Create mode 0600 before SQLite opens it (its
+// -wal/-shm inherit the mode). O_EXCL: when this succeeds no connection in this process can have the file open, so
+// closing drops no lock. POSIX: the root half of the gate before the create, so a refused root gets no state.db (#846
+// SEC P2), then the whole gate. Windows (smarty-dev#8920): the create runs inside the gate, after its one native read
+// of the root, state files and flag directory and before the state files' lstat, so the open reads the descriptors
+// once; a refused root still gets no file.
+const openCreatingStateDb = (root: string, file: string, opener: SqliteOpener): SqliteConnection => {
+  const create = () => {
+    try { fs.closeSync(fs.openSync(file, "wx", 0o600)); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
+  };
+  if (process.platform === "win32") return openPrivateStateDb(file, opener, create);
+  assertPrivateStateRoot(root); // before the create: a refused root gets no state.db (#846 SEC P2)
+  create();
+  return openPrivateStateDb(file, opener);
+};
+
 // The holder an owner token names (`ownerToken`): its pid and, when recorded, its start ticks. Undefined
 // for an unreadable record. A pre-#694 token (`pid.uuid`) names the pid only.
 const lockHolder = (record: string): { pid: number; started?: string | undefined } | undefined => {
@@ -2142,8 +2156,8 @@ export const ownsFile = (file: string, token: string): boolean => {
 // An empty name means the flag could not be raised (advisory). One readdir and a stat per flag (normally
 // zero or one) per pending check; a crashed request's flag goes stale and is ignored, and the scan removes it
 // once its holder is proven dead (smarty-dev#7421: the tryLockFile rule, pid plus start ticks; see removeDeadFlag).
-// An existing flag directory is used only when it is private (assertPrivatePath, pi-fabric#694 P2-D);
-// anything else is refused with a clear error and never written through.
+// An existing flag directory is used only when it is private (assertPrivatePath, pi-fabric#694 P2-D; on Windows its
+// native ACL, smarty-dev#8920); anything else is refused with a clear error and never written through.
 export const raiseCheckpointFlag = (root: string, token: string): string => {
   const dir = path.join(root, CHECKPOINT_FLAGS);
   const flag = path.join(dir, token);
@@ -2164,7 +2178,10 @@ export const lowerCheckpointFlag = (flag: string): void => {
 export const checkpointFlagRaised = (root: string): boolean => {
   const dir = path.join(root, CHECKPOINT_FLAGS);
   let names: string[];
-  try { assertPrivatePath(dir, "directory"); names = fs.readdirSync(dir); } catch { return false; } // a foreign directory raises nothing
+  // A foreign directory raises nothing. This read-only scan runs on every writer-lock attempt: on Windows it gets the
+  // lstat checks only, never a native ACL read per poll; the store's gate reads this directory's ACL on every open
+  // (assertGatedFlagDirectory). POSIX: the same check as assertPrivatePath.
+  try { assertGatedFlagDirectory(dir); names = fs.readdirSync(dir); } catch { return false; }
   const now = Date.now();
   let raised = false;
   for (const name of names) {

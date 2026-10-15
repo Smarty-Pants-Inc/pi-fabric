@@ -1,0 +1,239 @@
+/**
+ * smarty-dev#8920: the Windows half of the mesh state gate (state-gate.ts). Node and libuv expose no Windows
+ * security descriptor API (fs.chmod maps only the read-only attribute; fs.access does not evaluate ACLs), so the
+ * gate reads native descriptors through ONE pinned Windows PowerShell child per gate call (windows-powershell.ts):
+ * the root, its state files and flag directory, and every lexical and real ancestor, in one structured snapshot.
+ * Loaded only through state-gate.ts, which is not in the startup graph.
+ *
+ * Policy (SIDs, never localized names; deny ACEs never cancel an unsafe grant):
+ * - root, state.db, -wal, -shm, flag directory: owned by the current user (TokenUser), or by BUILTIN\Administrators
+ *   only when that is this token's default owner (an elevated run creates them so); any other default owner, and
+ *   Administrators on a non-elevated run, refuses. A root this process just made private must be TokenUser's. Any grant beyond read/traverse to a SID other than the
+ *   current user, SYSTEM, Administrators or TrustedInstaller refuses (every inherit-only one included, CREATOR OWNER too).
+ * - ancestors: owned by one of those trusted SIDs; a foreign grant that applies to the ancestor itself may add
+ *   files or subdirectories (the sticky analogue: C:\ grants Authenticated Users AD) and nothing else, so nobody
+ *   else can delete, rename, re-ACL or take over a component. Inherit-only grants (CREATOR OWNER among them) are
+ *   skipped on ancestors ONLY: they are not the ancestor's own access, and each component below is judged itself.
+ * - a root this process just created (a non-recursive mkdir that succeeded) gets, through the built-in icacls, an
+ *   explicit owner (the current user) and a protected DACL: current user and SYSTEM full control, (OI)(CI); it is read
+ *   back in the same child. An existing root is never repaired or adopted.
+ * When the child cannot run at all (no SystemRoot, no powershell.exe, timeout, global script failure), the gate
+ * warns once per process and opens as before (issue step 5). Malformed output after a successful run refuses.
+ */
+import childProcess from "node:child_process";
+import path from "node:path";
+import { childProcessEnvironment } from "../core/atomic-write.js";
+import { windowsSecurityPowerShell } from "../storage/windows-powershell.js";
+
+const TRUSTED_SIDS = new Set([
+  "S-1-5-18", // LocalSystem
+  "S-1-5-32-544", // Built-in Administrators
+  "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464", // TrustedInstaller
+]);
+const ADMINISTRATORS = "S-1-5-32-544";
+// Read data, read EA, execute/traverse, read attributes, READ_CONTROL, SYNCHRONIZE, GENERIC_READ, GENERIC_EXECUTE.
+const READ_ONLY_RIGHTS = 0xa01200a9;
+// FILE_ADD_FILE (write data) and FILE_ADD_SUBDIRECTORY (append data) on a directory.
+const ADD_CHILD_RIGHTS = 0x6;
+const INHERIT_ONLY = 0x08;
+const SE_DACL_PROTECTED = 0x1000;
+const FILE_ATTRIBUTE_DIRECTORY = 0x10;
+const FILE_ATTRIBUTE_REPARSE_POINT = 0x400;
+const SID = /^S-1-\d+(?:-\d+)+$/;
+
+// Fixed script; the request travels as JSON in the child environment, never as PowerShell source. Raw descriptors
+// keep null DACLs and unsupported ACE types visible. Each path reports its own failure, so an unreadable component
+// refuses instead of looking like a tooling gap.
+const SNAPSHOT_ACLS = String.raw`
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+try {
+  $request = ConvertFrom-Json -InputObject $env:PI_FABRIC_STATE_ACL
+  $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+  $user = $identity.User
+  $protect = $null
+  if ($request.protect) {
+    try {
+      $target = [string]$request.protect
+      $before = (Get-Acl -LiteralPath $target).GetOwner([System.Security.Principal.SecurityIdentifier]).Value
+      $elevated = $before -eq 'S-1-5-32-544' -and $identity.Owner.Value -eq 'S-1-5-32-544'
+      if ($before -ne $user.Value -and -not $elevated) { throw "owner $before" }
+      # The built-in icacls from the kernel's system directory (not PATH, not an environment variable); the path and
+      # SIDs are separate arguments, never command text.
+      $icacls = [System.IO.Path]::Combine([System.Environment]::SystemDirectory, 'icacls.exe')
+      $null = & $icacls $target '/setowner' ('*' + $user.Value) '/Q'
+      if ($LASTEXITCODE -ne 0) { throw "icacls /setowner exited $LASTEXITCODE" }
+      $null = & $icacls $target '/inheritance:r' '/grant:r' ('*' + $user.Value + ':(OI)(CI)F') '*S-1-5-18:(OI)(CI)F' '/Q'
+      if ($LASTEXITCODE -ne 0) { throw "icacls /inheritance:r /grant:r exited $LASTEXITCODE" }
+      $protect = 'ok'
+    } catch { $protect = 'failed: ' + $_.Exception.Message }
+  }
+  # Existence comes from GetAttributes alone: only FileNotFound/DirectoryNotFound mean missing. Anything else
+  # (access denied included) is that entry's error, so it refuses; it never fails the whole run or looks absent.
+  $entries = @(foreach ($p in $request.paths) {
+    try {
+      $attributes = $null
+      try { $attributes = [System.IO.File]::GetAttributes($p) }
+      catch [System.IO.FileNotFoundException], [System.IO.DirectoryNotFoundException] { $attributes = $null }
+      if ($null -eq $attributes) { @{ path = $p; missing = $true } } else {
+      $raw = [System.Security.AccessControl.RawSecurityDescriptor]::new((Get-Acl -LiteralPath $p).GetSecurityDescriptorBinaryForm(), 0)
+      $dacl = $null
+      if ($null -ne $raw.DiscretionaryAcl) {
+        $dacl = @(foreach ($ace in $raw.DiscretionaryAcl) {
+          $sid = $null
+          $mask = $null
+          if ($ace -is [System.Security.AccessControl.KnownAce]) {
+            $sid = $ace.SecurityIdentifier.Value
+            $mask = [uint32]([long]$ace.AccessMask -band 4294967295)
+          }
+          @{ type = [int]$ace.AceType; flags = [int]$ace.AceFlags; sid = $sid; mask = $mask }
+        })
+      }
+      @{ path = $p; attributes = [int]$attributes; owner = $raw.Owner.Value; control = [int]$raw.ControlFlags; dacl = $dacl }
+      }
+    } catch {
+      $message = 'unreadable'
+      try { $message = [string]$_.Exception.Message } catch { }
+      @{ path = $p; error = $message }
+    }
+  })
+  @{ userSid = $user.Value; ownerSid = $identity.Owner.Value; protect = $protect; entries = $entries } | ConvertTo-Json -Compress -Depth 8
+} catch {
+  [Console]::Error.WriteLine($_.Exception.Message)
+  exit 1
+}
+`;
+
+export interface WindowsStateAclRequest {
+  /** The state root, resolved; `real` is its realpath (the real ancestor chain). */
+  root: string;
+  real: string;
+  /**
+   * What `root` is: the state root (default), or a single private path judged by itself (assertPrivatePath's direct
+   * callers: the flag directory, a state file), with its parent chain as ancestors.
+   */
+  role?: "root" | "directory" | "file";
+  /** Strict targets inside the root; a missing one passes (as in assertPrivatePath). */
+  files: string[];
+  directories: string[];
+  /** Set the private ACL first: only for a root this process just created. */
+  protect?: boolean;
+}
+
+/** Runs the child with the request in PI_FABRIC_STATE_ACL and returns its stdout; throws when it cannot run. */
+export type WindowsAclRunner = (request: string) => string;
+
+const runPowerShell: WindowsAclRunner = (request) => {
+  const command = windowsSecurityPowerShell(SNAPSHOT_ACLS, { ...process.env, PI_FABRIC_STATE_ACL: request });
+  return childProcess.execFileSync(command.file, command.args, {
+    env: childProcessEnvironment(command.env),
+    encoding: "utf8", windowsHide: true, timeout: 20_000, maxBuffer: 1024 * 1024,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+};
+
+let warned = false;
+const warnUnverified = (root: string, error: unknown): void => {
+  if (warned) return;
+  warned = true;
+  const reason = error instanceof Error ? error.message.split("\n")[0] : String(error);
+  process.emitWarning(`[pi-fabric] Fabric mesh SQLite state could not read Windows ACLs (${reason}); `
+    + `${root} and its ancestors are opened without an ACL check (smarty-dev#8920).`, { code: "FABRIC_MESH_STATE_ACL_UNVERIFIED" });
+};
+
+const record = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value);
+const uint32 = (value: unknown): value is number => typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 0xffffffff;
+
+const ancestorsOf = (dir: string): string[] => {
+  const chain: string[] = [];
+  for (let at = path.win32.dirname(dir); ; at = path.win32.dirname(at)) {
+    chain.push(at);
+    if (at === path.win32.dirname(at)) return chain;
+  }
+};
+
+type Role = "ancestor" | "root" | "directory" | "file";
+
+/**
+ * The refusal for this root, or undefined when it may be opened (including the warned tooling gap).
+ * One child process per call; nothing is cached across calls.
+ */
+export const windowsStateAclRefusal = (request: WindowsStateAclRequest, run: WindowsAclRunner = runPowerShell): string | undefined => {
+  const root = path.win32.resolve(request.root);
+  // One entry per component, first role wins; NTFS names compare case-insensitively.
+  const seen = new Set<string>();
+  const paths = new Map<string, Role>();
+  const add = (target: string, role: Role) => {
+    const key = target.toLowerCase();
+    if (!seen.has(key)) { seen.add(key); paths.set(target, role); }
+  };
+  const rootRole: Role = request.role ?? "root";
+  if (request.protect && rootRole !== "root") throw new Error("only a state root is ever made private");
+  add(root, rootRole);
+  for (const dir of [...ancestorsOf(root), ...ancestorsOf(path.win32.resolve(request.real))]) add(dir, "ancestor");
+  for (const dir of request.directories) add(path.win32.resolve(dir), "directory");
+  for (const file of request.files) add(path.win32.resolve(file), "file");
+  let output: string;
+  try { output = run(JSON.stringify({ protect: request.protect ? root : null, paths: [...paths.keys()] })); }
+  catch (error) { warnUnverified(root, error); return undefined; }
+  let snapshot: unknown;
+  try { snapshot = JSON.parse(output); } catch { return `${root} has an unreadable Windows ACL snapshot`; }
+  if (!record(snapshot) || typeof snapshot.userSid !== "string" || !SID.test(snapshot.userSid) || !Array.isArray(snapshot.entries)
+    || snapshot.entries.length !== paths.size) return `${root} has an invalid Windows ACL snapshot`;
+  const user = snapshot.userSid;
+  // TokenOwner: the default owner of what this token creates. An elevated administrator's is BUILTIN\Administrators,
+  // so a root, state.db (fs.open), SQLite's -wal/-shm and the flag directory made by an elevated run come out owned
+  // by it. Exactly that case is accepted on every strict target (lead ruling, smarty-dev#8920): owner Administrators
+  // AND this token's default owner Administrators. Any other default owner (a group a token may name as owner, whose
+  // other members could write) is not, nor Administrators on a non-elevated run. A root this call made private must
+  // still read back owned by the current user: the protect step set that owner explicitly.
+  if (typeof snapshot.ownerSid !== "string" || !SID.test(snapshot.ownerSid)) return `${root} has an invalid Windows ACL snapshot`;
+  const tokenOwner = snapshot.ownerSid;
+  if (request.protect && snapshot.protect !== "ok") {
+    return `${root} was created but its private ACL could not be set (${String(snapshot.protect)})`;
+  }
+  const trusted = (sid: string) => sid === user || TRUSTED_SIDS.has(sid);
+  for (const [index, [target, role]] of [...paths].entries()) {
+    const entry: unknown = snapshot.entries[index];
+    if (!record(entry) || entry.path !== target) return `${target} has an invalid Windows ACL snapshot entry`;
+    const strict = role !== "ancestor";
+    if (entry.missing === true) {
+      if (role === "file" || role === "directory") continue;
+      return `${target} vanished while its Windows ACL was read`;
+    }
+    if (typeof entry.error === "string") return `${target} has an unreadable Windows security descriptor (${entry.error})`;
+    if (!uint32(entry.attributes) || !uint32(entry.control)) return `${target} has an invalid Windows ACL snapshot entry`;
+    const directory = (entry.attributes & FILE_ATTRIBUTE_DIRECTORY) !== 0;
+    if ((entry.attributes & FILE_ATTRIBUTE_REPARSE_POINT) !== 0) {
+      // An ancestor junction or symbolic link: its descriptor as read here is ambiguous (the link's or its target's),
+      // so it is refused rather than guessed (lead ruling, smarty-dev#8920). No-follow native reads are out of scope.
+      return strict ? `${target} is a reparse point`
+        : `${target}, an ancestor of ${root}, is a reparse point (junction or symbolic link); `
+          + "set the mesh state root to a path with no junctions or symbolic links in it";
+    }
+    if (strict && directory !== (role !== "file")) return `${target} is not a ${role === "file" ? "regular file" : "directory"}`;
+    if (typeof entry.owner !== "string" || !SID.test(entry.owner)) return `${target} has an unproven owner`;
+    const protectedRoot = role === "root" && request.protect === true;
+    const owned = role === "ancestor" ? trusted(entry.owner)
+      : protectedRoot ? entry.owner === user
+      : entry.owner === user || (entry.owner === ADMINISTRATORS && tokenOwner === ADMINISTRATORS);
+    if (!owned) {
+      return `${target} is owned by ${entry.owner}, not ${role === "ancestor" ? "the current user, SYSTEM, Administrators or TrustedInstaller"
+        : protectedRoot ? `the current user ${user}, which it was just given` : `the current user ${user} (or Administrators on an elevated run)`}`;
+    }
+    if (role === "root" && request.protect && (entry.control & SE_DACL_PROTECTED) === 0) return `${target} still inherits its ACL after it was made private`;
+    if (!Array.isArray(entry.dacl)) return `${target} has a null or unproven DACL (everyone has full control)`;
+    for (const ace of entry.dacl as unknown[]) {
+      if (!record(ace) || (ace.type !== 0 && ace.type !== 1) || !uint32(ace.flags) || (ace.flags & ~0x1f) !== 0
+        || typeof ace.sid !== "string" || !SID.test(ace.sid) || !uint32(ace.mask)) return `${target} has an unsupported or unproven ACE`;
+      if (ace.type === 1 || trusted(ace.sid)) continue; // a deny ACE never cancels another grant: each grant is judged alone
+      // Strict targets judge inherit-only grants too (CREATOR OWNER included): state files and the flag directory
+      // would inherit them, and the creator of a child may be a foreign user.
+      if (!strict && (ace.flags & INHERIT_ONLY) !== 0) continue; // not this ancestor's own access; a child on the chain is judged itself
+      const allowed = strict ? READ_ONLY_RIGHTS : READ_ONLY_RIGHTS | ADD_CHILD_RIGHTS;
+      if ((ace.mask & ~allowed) !== 0) {
+        return `${target}${strict ? "" : `, an ancestor of ${root},`} grants ${ace.sid} write, delete or permission rights (mask 0x${ace.mask.toString(16)})`;
+      }
+    }
+  }
+  return undefined;
+};

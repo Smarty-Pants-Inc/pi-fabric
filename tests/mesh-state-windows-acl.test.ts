@@ -12,13 +12,13 @@ import { aclOwner, icaclsGrant, icaclsShow, readAcl, setOwner, tokenSids } from 
 // system ancestors are never modified; every grant is on a fixture directory created by this suite.
 //
 // Policy (fabric-store ruling): root, state.db/-wal/-shm and the flag directory refuse any foreign
-// write/modify/full/delete/WRITE_DAC/WRITE_OWNER ACE and require the current user as owner. Trusted: the current user,
-// SYSTEM, Administrators, TrustedInstaller. Ancestors refuse foreign DELETE/WRITE_DAC/WRITE_OWNER/DELETE_CHILD/
+// write/modify/full/delete/WRITE_DAC/WRITE_OWNER ACE; owner must be the current user, or Administrators only when
+// the token's default owner is Administrators (elevated). Trusted: the current user, SYSTEM, Administrators, TrustedInstaller. Ancestors refuse foreign DELETE/WRITE_DAC/WRITE_OWNER/DELETE_CHILD/
 // write/modify/full; add-file/add-subdirectory-only and CREATOR OWNER-only inheritance are allowed (sticky analogue).
 const EVERYONE = "S-1-1-0";
 const SYSTEM = "S-1-5-18";
 const ADMINISTRATORS = "S-1-5-32-544";
-const TRUSTED_INSTALLER = "S-1-5-80-956008885-3418522649-1831038044-1858805811-2023306651";
+const TRUSTED_INSTALLER = "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464";
 const FULL = 0x1f01ff;
 const MODIFY = 0x301bf;
 const UNSUPPORTED = { code: "FABRIC_MESH_STATE_UNSUPPORTED" };
@@ -161,6 +161,21 @@ describe.runIf(process.env.GITHUB_ACTIONS === "true" && process.platform === "wi
     expect(fs.readdirSync(flags)).toEqual([]);
   }, 120_000);
 
+  it("opens an existing Administrators-owned root only with the elevated Administrators default owner", async () => {
+    const { owner } = tokenSids();
+    const root = profileDir();
+    const changed = setOwner(root, ADMINISTRATORS);
+    expect(changed.changed, changed.trace.join(" | ")).toBe(true);
+    expect(readAcl(root).owner).toBe(ADMINISTRATORS);
+    if (owner === ADMINISTRATORS) {
+      await roundTrip(await openAsync(root));
+      await roundTrip(openSync(root));
+    } else {
+      expect(await refusal(() => openAsync(root))).toMatchObject(UNSUPPORTED);
+      expect(await refusal(() => openSync(root))).toMatchObject(UNSUPPORTED);
+    }
+  }, 120_000);
+
   it("refuses a pre-squatted root owned by a foreign SID (DACL unchanged, only the owner differs)", async () => {
     const { user, owner } = tokenSids();
     const foreign = ["S-1-5-32-545", SYSTEM, ADMINISTRATORS].find(sid => sid !== user && sid !== owner);
@@ -182,6 +197,29 @@ describe.runIf(process.env.GITHUB_ACTIONS === "true" && process.platform === "wi
       }
     }
   }, 240_000);
+
+  it("refuses a junction ancestor with an actionable error, while the direct profile path opens", async () => {
+    const parent = profileDir();
+    const target = path.join(parent, "target");
+    ownedDirectory(target);
+    const root = path.join(target, "root");
+    await roundTrip(await openAsync(root));
+    const junction = path.join(parent, "junction");
+    fs.symlinkSync(target, junction, "junction");
+    const error = await refusal(() => openAsync(path.join(junction, "root")));
+    expect(error).toMatchObject({ ...UNSUPPORTED, message: expect.stringContaining(junction) });
+    expect((error as Error).message).toMatch(/state root.*path with no junctions/i);
+    await roundTrip(await openAsync(root));
+  }, 120_000);
+
+  it("rechecks between two synchronous opens in the same JavaScript turn", async () => {
+    const root = path.join(profileDir(), "root");
+    const first = openSync(root);
+    first.close();
+    // icacls is synchronous too: no await/microtask may clear a cross-open cache before the second open.
+    grant(root, EVERYONE, "(OI)(CI)(M)", MODIFY);
+    expect(await refusal(() => openSync(root))).toMatchObject(UNSUPPORTED);
+  }, 120_000);
 
   it("rechecks at every open: an ACE added after an earlier successful open refuses the next one", async () => {
     const ancestor = profileDir();

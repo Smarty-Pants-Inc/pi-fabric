@@ -1,18 +1,6 @@
-import path from "node:path";
-
-/** Pin native ACL commands to Windows PowerShell and its own system modules. */
-export const windowsSecurityPowerShell = (source: string, inherited: NodeJS.ProcessEnv = process.env) => {
-  const systemRoot = Object.entries(inherited).find(([key]) => key.toLowerCase() === "systemroot")?.[1];
-  if (!systemRoot || !path.win32.isAbsolute(systemRoot)) throw new Error("Windows system directory is unavailable");
-  const home = path.win32.join(systemRoot, "System32", "WindowsPowerShell", "v1.0");
-  // Environment names are case-insensitive on Windows. Remove every spelling so
-  // a parent pwsh installation cannot redirect 5.1's security-module resolution.
-  const env = Object.fromEntries(Object.entries(inherited).filter(([key]) => key.toLowerCase() !== "psmodulepath"));
-  env.PSModulePath = path.win32.join(home, "Modules");
-  const script = "$ErrorActionPreference = 'Stop'\nImport-Module Microsoft.PowerShell.Security -ErrorAction Stop\n" + source;
-  return {
-    file: path.win32.join(home, "powershell.exe"),
-    args: ["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", Buffer.from(script, "utf16le").toString("base64")],
-    env,
-  };
-};
+// Stable import path for the one Windows PowerShell 5.1 ACL command builder, which lives
+// in windows-temp-root.ts. Layout only (startup graph): the scratch import gives every
+// importer, lazy ones included, the whole eager storage closure, so esbuild keeps the
+// builder in that existing chunk instead of splitting it into one more startup file.
+import "./scratch.js";
+export { windowsSecurityPowerShell } from "./windows-temp-root.js";

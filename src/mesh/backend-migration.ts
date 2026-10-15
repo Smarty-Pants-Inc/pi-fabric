@@ -97,7 +97,7 @@ import { pinImportRoot, type OwnedImportFiles, type RefusalCleanupReport } from 
 import { decodeMeshStateFile, encodeMeshStateFile, StateFile, type MeshStateEntry, type MeshStateFile } from "./state-file.js";
 import { filesystemRefusal, MeshStateUnsupportedError, openNodeSqlite, validateMeshStateKey, type SqliteConnection,
   type SqliteOpener, type SqliteRow } from "./state-sqlite.js";
-import { assertPrivateStateRoot, openPrivateStateDb } from "./state-gate.js";
+import { assertPrivateStateRoot, createStateRoot, openPrivateStateDb } from "./state-gate.js";
 
 // The writer fence lives in a leaf module (state-file.ts calls it; this module imports state-file.ts).
 export { assertFileStateWritable, encodeMeshStateNatsMarker, MeshBackendFenceError, readMeshStateMovedMarker, readMeshStateNatsMarker, type MeshBackendAlarm,
@@ -413,18 +413,27 @@ class FenceDb {
         const refusal = filesystemRefusal(root); // before any side effect; the gate below checks again
         if (refusal) throw new MeshStateUnsupportedError(`Fabric mesh SQLite state needs a local filesystem: ${refusal}`);
       }
-      if (!exists) {
-        fs.mkdirSync(root, { recursive: true, mode: 0o700 });
-        assertPrivateStateRoot(root); // before the create: a refused root gets no state.db (#846 SEC P2)
-        // O_EXCL: when this succeeds no connection in this process has the file open.
-        // smarty-dev#9501: an import records what it creates (fstat of that descriptor, through the held root fd).
+      const opener = options.open ?? openNodeSqlite;
+      // O_EXCL: when this succeeds no connection in this process has the file open.
+      // smarty-dev#9501: an import records what it creates (fstat of that descriptor, through the held root fd).
+      const create = () => {
         if (owned) owned.create(STATE_DB);
         else {
           try { fs.closeSync(fs.openSync(file, "wx", 0o600)); }
           catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
         }
+      };
+      if (exists) db = openPrivateStateDb(file, opener); // the one gate (smarty-dev#7548)
+      else {
+        createStateRoot(root); // smarty-dev#8920: private on Windows when this call creates it
+        // Windows: the create runs inside the gate, after its one native read (smarty-dev#8920); a refused root gets no state.db.
+        if (process.platform === "win32") db = openPrivateStateDb(file, opener, create);
+        else {
+          assertPrivateStateRoot(root); // before the create: a refused root gets no state.db (#846 SEC P2)
+          create();
+          db = openPrivateStateDb(file, opener); // the one gate (smarty-dev#7548)
+        }
       }
-      db = openPrivateStateDb(file, options.open ?? openNodeSqlite); // the one gate (smarty-dev#7548)
     } catch (error) {
       // A refused state root is a fence failure for the operator too (#846 SEC P2): alarm, then rethrow it as is.
       if (error instanceof MeshStateUnsupportedError) meshFenceAlarm(options, root, error.message);

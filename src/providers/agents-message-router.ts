@@ -921,6 +921,7 @@ export class AgentMessageRouter {
         messageId: result.messageId,
         ...(typeof result.triggered === "boolean" ? { triggered: result.triggered } : {}),
         ...(typeof result.reason === "string" ? { reason: result.reason } : {}),
+        ...(result.halted ? { halted: true as const } : {}),
         ...(result.pendingFollowUps === undefined ? {} : { pendingFollowUps: result.pendingFollowUps }),
         ...(result.oldestAgeS === undefined ? {} : { oldestAgeS: result.oldestAgeS }),
         ...(result.stalled ? { stalled: true as const } : {}),

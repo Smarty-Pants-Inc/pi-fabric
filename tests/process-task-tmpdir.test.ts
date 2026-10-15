@@ -13,13 +13,19 @@ afterEach(async () => {
   vi.unstubAllEnvs();
 });
 
-const fixture = () => {
+const fixture = (processSlice?: string) => {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "fabric-process-task-tmpdir-")));
   const cwd = path.join(root, "cwd");
   const scratch = path.join(root, "scratch");
   const parentTemp = path.join(root, "parent-temp");
   const runRoot = path.join(root, "runs");
   for (const directory of [cwd, scratch, parentTemp]) fs.mkdirSync(directory);
+  if (processSlice && process.platform === "linux") {
+    fs.writeFileSync(path.join(root, "systemd-run"), '#!/bin/sh\nprintf \'%s\\n\' "$@" > scope-args\nwhile [ "$1" != "--" ]; do shift; done; shift; exec "$@"\n', { mode: 0o700 });
+    vi.stubEnv("PATH", `${root}${path.delimiter}${process.env.PATH ?? ""}`);
+    vi.stubEnv("XDG_RUNTIME_DIR", root);
+    vi.stubEnv("DBUS_SESSION_BUS_ADDRESS", undefined);
+  }
   vi.stubEnv("TMPDIR", parentTemp);
   vi.stubEnv("TMP", parentTemp);
   vi.stubEnv("TEMP", parentTemp);
@@ -45,7 +51,7 @@ fs.writeFileSync(args.get('--status-file'), JSON.stringify({
   exitCode: 0, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 }
 }));`);
   const manager = new AgentManager(cwd, {
-    ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, deniedModels: [], timeoutMs: 8_000, retainRuns: true,
+    ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, deniedModels: [], timeoutMs: 8_000, retainRuns: true, processSlice,
   }, { workerPath: worker, fullCodeMode: false, runRoot });
   managers.push(manager);
   return { root, cwd, scratch, parentTemp, runRoot, manager, worker };
@@ -136,8 +142,8 @@ describe("native process task temporary directory containment", () => {
     expect(inside(f.cwd, value.output)).toBe(true);
   });
 
-  it("honors the default task --tmpdir before the worker starts", async () => {
-    const f = fixture();
+  it.each([undefined, "batch.slice"])("honors default --tmpdir before the worker starts (slice %s)", async processSlice => {
+    const f = fixture(processSlice);
     const { result, value } = await report(f, {});
     const expected = path.join(f.manager.runDirectory(result.id)!, "tmp");
     expect(value.argTmpdir).toBe(expected);
@@ -146,6 +152,9 @@ describe("native process task temporary directory containment", () => {
     expect(value.policy).toEqual({ readOnly: false, writableRoots: [f.cwd, expected].sort(), shell: "unconfined" });
     expect(inside(expected, value.output)).toBe(true);
     expect(value.bytes).toBeGreaterThan(50 * 1024);
+    if (processSlice && process.platform === "linux") {
+      expect(fs.readFileSync(path.join(f.cwd, "scope-args"), "utf8")).toContain("--slice=batch.slice\n");
+    }
   });
 
   it("does not preserve a lexically contained TMPDIR symlink that escapes the root", async () => {

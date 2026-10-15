@@ -271,7 +271,7 @@ describe("resident actor permit watch (#9031)", () => {
     const worker = await launched(f, actor.id);
     const next = f.actors.ask(actor.id, "next event");
     void next.catch(() => undefined);
-    save(worker, { status, text: "committed result", error: status === "failed" ? "ordinary failure" : undefined });
+    save(worker, { status, text: "committed result", ...(status === "failed" ? { error: "ordinary failure" } : {}) });
     // The real monitor first observes terminal status with a live owned worker.
     // Its stop throws without a receipt; the same monitor must remain the owner.
     await eventually(() => expect(worker.stops).toBeGreaterThan(0));
@@ -287,7 +287,8 @@ describe("resident actor permit watch (#9031)", () => {
     expect(snapshot(f).held.map(held => held.runId)).toEqual([worker.launch.id]);
     // Full scripted custody now clears. Commit success during the rejoin.
     worker.descendants = false;
-    save(worker, { status: "completed", text: "committed result", error: undefined, finishedAt: Date.now(), exitCode: 0 });
+    delete worker.record.error;
+    save(worker, { status: "completed", text: "committed result", finishedAt: Date.now(), exitCode: 0 });
     worker.treeClose();
     await expect(answer).resolves.toMatchObject({ text: "committed result" });
     await eventually(() => expect([...workers.values()]).toHaveLength(2));

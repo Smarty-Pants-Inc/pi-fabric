@@ -60,6 +60,11 @@ export function createAgentServiceClient(dispatch: AgentServiceDispatcher, capab
 
 export function createAgentsProvider(client: AgentServiceClient): FabricProvider {
   const spawnEnvironment = snapshotAgentSpawnEnvironment();
+  // Authority binds to the launch-boundary environment snapshot only. The
+  // session id never affects kind or actor id, so no ambient session,
+  // config, model or filesystem read happens per invocation (closed-world
+  // managed hosts forbid them), and guest arguments never carry the caller.
+  const spawnCaller = Object.freeze(fabricHostIdentity("hosted-agent-provider", spawnEnvironment));
   const descriptors = agentServiceDescriptors(client.capabilities);
   const allowed = new Set(descriptors.map((descriptor) => descriptor.name));
   const validate = (action: string, args: Record<string, unknown>) => {
@@ -73,8 +78,7 @@ export function createAgentsProvider(client: AgentServiceClient): FabricProvider
     prepareArguments: (action, args) => validate(action, args),
     invoke: async (action, args, context) => {
       if (action === "run" || action === "spawn" || action === "create" || action === "resume") {
-        const sessionId = context.extensionContext?.sessionManager?.getSessionId() ?? "hosted-agent-provider";
-        assertAgentSpawnAllowed(fabricHostIdentity(sessionId, spawnEnvironment), spawnEnvironment);
+        assertAgentSpawnAllowed(spawnCaller, spawnEnvironment);
       }
       const validated = validate(action, args);
       if (action !== "steer" && action !== "followUp") return client.dispatch(action as AgentServiceAction, validated, context.signal);

@@ -662,9 +662,10 @@ describe("fleet model policy (#2490)", () => {
     expect(actors.list()).toEqual([]);
   });
   const policy = { model: "cliproxyapi/gpt-6-astra", thinking: "low" as const, deniedModels: ["cliproxyapi/gpt-6-astra", "cliproxyapi/gpt-6-sol"], deniedModelReplacement: "cliproxyapi/gpt-6.1-sol" };
-  it.each(["actor", "agent"] as const)("inherits the %s spawning run's admitted model and thinking", async (kind) => {
+  it.each(["actor", "main"] as const)("inherits the %s spawning run's admitted model and thinking", async (kind) => {
     const { provider, agents, actors } = setup([], [], undefined, {
       identity: { id: `${kind}:parent`, name: "parent", kind, sessionId: "test" },
+      ...(kind !== "main" ? { mainAgentId: "session:remote-main" } : {}),
       agentsConfig: { thinking: policy.thinking, deniedModels: policy.deniedModels, deniedModelReplacement: policy.deniedModelReplacement }, callerThinking: "max",
     });
     const parentContext = { ...context, extensionContext: { modelRegistry: visibleModelRegistry, model: { provider: "cliproxyapi", id: "gpt-6.1-sol" } } as unknown as ExtensionContext };
@@ -673,6 +674,18 @@ describe("fleet model policy (#2490)", () => {
     await agents.wait(child.id);
     const actor = await provider.invoke("create", { name: "nested", instructions: "review" }, parentContext) as FabricActorInfo;
     expect(actors.definition(actor.id)).toMatchObject({ model: "cliproxyapi/gpt-6.1-sol", thinking: "max" });
+  });
+  it("refuses a task (agent) spawning run before inheriting its model or creating children", async () => {
+    const { provider, agents, actors } = setup([], [], undefined, {
+      identity: { id: "agent:parent", name: "parent", kind: "agent", sessionId: "test" }, mainAgentId: "session:remote-main",
+      agentsConfig: { thinking: policy.thinking, deniedModels: policy.deniedModels, deniedModelReplacement: policy.deniedModelReplacement }, callerThinking: "max",
+    });
+    const parentContext = { ...context, extensionContext: { modelRegistry: visibleModelRegistry, model: { provider: "cliproxyapi", id: "gpt-6.1-sol" } } as unknown as ExtensionContext };
+    const refused = { name: "AgentSpawnForbiddenError", code: "FABRIC_AGENT_SPAWN_FORBIDDEN", launchOutcome: "unlaunched" };
+    await expect(provider.invoke("spawn", { task: "review", transport: "process" }, parentContext)).rejects.toMatchObject(refused);
+    await expect(provider.invoke("create", { name: "nested", instructions: "review" }, parentContext)).rejects.toMatchObject(refused);
+    expect(agents.list()).toEqual([]);
+    expect(actors.list()).toEqual([]);
   });
   it.each(["spawn", "create"])("%s refuses explicit, alias, inherited and default denied models before creation", async (action) => {
     const { provider, agents, actors, globalActors } = setup([], [], undefined, { agentsConfig: policy, modelsConfig: { aliases: { review: { targets: ["cliproxyapi/gpt-6-astra", "cliproxyapi/gpt-6.1-sol"] } } } });

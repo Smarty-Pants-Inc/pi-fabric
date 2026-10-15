@@ -43,7 +43,8 @@ const fixture = () => {
       if (failures > 0) { failures--; throw new Error("injected first initialize failure"); }
       if (this.directory) { await this.directory.quiesce("reload"); await this.directory.close(); }
       const directory = new ParticipantDirectory(mesh, { enabled: true, hostId: id, rootId: id, identity,
-        heartbeatMs: 60_000, leaseMs: 120_000, startingHost: options.startingHost });
+        heartbeatMs: 60_000, leaseMs: 120_000,
+        ...(options.startingHost ? { startingHost: options.startingHost } : {}) });
       this.directory = directory;
       directory.registerSource(() => [{ format: 1, id, kind: "root", rootId: id, ownerHostId: id,
         ownerIdentityId: id, name: "reload-test", status: "idle", runner: "pi", transport: "process",

@@ -22,7 +22,7 @@ afterEach(async () => {
   vi.unstubAllEnvs();
 });
 
-const fixture = async (options: { spawner?: string; ancestors?: string[]; allowlist?: string[]; task?: boolean; presence?: "live" | "reloading" } = {}) => {
+const fixture = async (options: { spawner?: string; ancestors?: readonly string[]; allowlist?: readonly string[]; task?: boolean; presence?: "live" | "reloading" | undefined } = {}) => {
   // Bind every authority-bearing field explicitly: the test runner itself may be a child.
   vi.stubEnv("PI_FABRIC_TASK_PROCESS_CHILD", options.task === false ? "" : "1");
   vi.stubEnv("PI_FABRIC_PARENT_RUN", "authority-regression-run");
@@ -45,9 +45,9 @@ const fixture = async (options: { spawner?: string; ancestors?: string[]; allowl
     ownerHostId: TARGET, ownerIdentityId: TARGET, ownerIncarnation: "predecessor",
     capabilities: ["followUp", "steer"], controlProtocol: "v1" } as FabricParticipantInfo;
   const router = new AgentMessageRouter(
-    { status: (id: string) => { throw new Error(`Unknown Fabric agent: ${id}`); } } as Ports[0],
-    { identity, status: (id: string) => { throw new Error(`Unknown Fabric actor: ${id}`); } } as Ports[1],
-    { id: "session:task-host", local: true, matches: (id: string) => id === "session:task-host" } as Ports[2],
+    { status: (id: string) => { throw new Error(`Unknown Fabric agent: ${id}`); } } as unknown as Ports[0],
+    { identity, status: (id: string) => { throw new Error(`Unknown Fabric actor: ${id}`); } } as unknown as Ports[1],
+    { id: "session:task-host", local: true, matches: (id: string) => id === "session:task-host" } as unknown as Ports[2],
     { get: (id: string) => options.presence === "live" && id === TARGET ? record : undefined,
       list: () => options.presence ? [record] : [], lastKnown: () => undefined, scheduleRefresh: () => {} },
     plane, binding => binding,

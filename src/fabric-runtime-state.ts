@@ -658,7 +658,7 @@ export class FabricRuntimeState {
   async initialize(
     context: ExtensionContext,
     bootstrapConfig?: FabricConfig,
-    options: { lifecycle?: () => boolean; startingHost?: StartingHostClaim } = {},
+    options: { lifecycle?: () => boolean; startingHost?: StartingHostClaim | undefined } = {},
   ): Promise<void> {
     // FabricState passes its activation lease; direct callers (tests, standalone hosts) keep a
     // lease bound to this same ctx, else bind for the runtime's life.

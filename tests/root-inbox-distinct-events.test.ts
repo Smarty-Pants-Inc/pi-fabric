@@ -16,14 +16,14 @@ const watcher: MeshIdentity = { id: "fleet-tool:lane-watcher", name: "lane-watch
 const TOPIC = "fleet.work.tasks";
 const KEY = "watcher-lucky-6289-m4";
 
-const setup = (steerGraceMs = 0) => {
+const setup = (steerGraceMs = 0, options: { maxEventBytes?: number; horizonMs?: number } = {}) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-inbox-distinct-"));
   roots.push(root);
-  const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 500);
+  const mesh = new MeshStore(path.join(root, "mesh"), options.maxEventBytes ?? 64 * 1024, 500);
   const entries: unknown[] = [];
   let now = Date.now();
   vi.spyOn(Date, "now").mockImplementation(() => now);
-  const box = () => new RootInbox(mesh, me, () => [me.id], { now: () => now, steerGraceMs, wakeCooldownMs: 0 });
+  const box = () => new RootInbox(mesh, me, () => [me.id], { now: () => now, steerGraceMs, wakeCooldownMs: 0, horizonMs: options.horizonMs });
   const pi = {
     sendMessage: (message: unknown) => entries.push({ type: "custom_message", timestamp: new Date(now).toISOString(), ...(message as object) }),
   } as unknown as ExtensionAPI;
@@ -161,6 +161,104 @@ describe("distinct same-key mesh events (smarty-dev#12140)", () => {
     const otherTopic = await h.mesh.publish({ topic: "fleet.work.other", kind: "answer", from: watcher, to: me.id, text: "other", data: { key: KEY } });
     h.advance(1);
     expect(ids((await h.box().next(h.session())).events)).toEqual([otherTopic.id]);
+  });
+
+  it.each([[4096, 42], [128 * 1024, 1100]])("bounds fallback and delivered receipts together at %i bytes", async (maxEventBytes, count) => {
+    const h = setup(0, { maxEventBytes });
+    const hash = (key: string) => createHash("sha256").update(JSON.stringify([watcher.id, "native-topic-key", JSON.stringify([TOPIC, key])])).digest("hex");
+    const now = Date.now();
+    const fallbacks = Array.from({ length: count }, (_, i) => hash(`capacity-${i}`));
+    const delivered = [hash("newest-a"), hash("newest-b")];
+    const seed = { after: h.mesh.latestSequence(), delivered, deliveredAt: [now, now], fallbacks,
+      fallbackAt: fallbacks.map((_, i) => now - count + i) };
+    const bytes = (value: unknown) => Buffer.byteLength(JSON.stringify(value), "utf8");
+    expect(bytes(seed)).toBeLessThan(maxEventBytes);
+    if (maxEventBytes === 4096) expect(bytes(seed)).toBeGreaterThan(maxEventBytes * 0.75);
+    const key = h.box().key;
+    await h.mesh.put({ key, identity: me, value: seed });
+    expect((await h.box().next(h.session(), { commitOnly: true })).events).toEqual([]);
+    const saved = h.mesh.get(key)!.value as typeof seed;
+    expect(bytes(saved)).toBeLessThanOrEqual(Math.floor(maxEventBytes * 0.75));
+    expect(saved.delivered.length + saved.fallbacks.length).toBeLessThanOrEqual(1024);
+    expect(saved.delivered).toEqual(delivered);
+    expect(saved.fallbacks.length).toBeGreaterThan(0);
+    expect(saved.fallbacks.length).toBeLessThan(fallbacks.length);
+    expect(saved.fallbacks).toEqual(fallbacks.slice(-saved.fallbacks.length));
+    expect(saved.fallbackAt).toEqual(seed.fallbackAt.slice(-saved.fallbacks.length));
+    await h.box().next(h.session(), { commitOnly: true });
+    expect(h.mesh.get(key)!.value).toEqual(saved); // No resurrection from the stored cursor on save.
+  });
+
+  it.each([false, true])("fails open after trimming a spent fallback (old session carrier: %s)", async (keepCarrier) => {
+    const h = setup(0, { maxEventBytes: 4096 });
+    const hash = (key: string) => createHash("sha256").update(JSON.stringify([watcher.id, "native-topic-key", JSON.stringify([TOPIC, key])])).digest("hex");
+    const now = Date.now();
+    const trimmed = hash("trimmed"), retained = hash("retained");
+    const fillers = Array.from({ length: 38 }, (_, i) => hash(`filler-${i}`));
+    const seed = { after: h.mesh.latestSequence(), delivered: [trimmed, retained], deliveredAt: [now - 1000, now - 1],
+      fallbacks: [trimmed, ...fillers, retained], fallbackAt: [now - 1000, ...fillers.map((_, i) => now - 100 + i), now - 1] };
+    const key = h.box().key;
+    await h.mesh.put({ key, identity: me, value: seed });
+    await h.box().next(h.session(), { commitOnly: true });
+    const saved = h.mesh.get(key)!.value as typeof seed;
+    expect(saved.fallbacks).not.toContain(trimmed);
+    expect(saved.fallbacks).toContain(retained);
+    expect((saved as typeof seed & { fallbackThrough?: number }).fallbackThrough).toBeGreaterThanOrEqual(now - 1000);
+    // Canonical native history remains, but predates the eviction watermark. Reloading must
+    // not turn that already-spent carrier into a new claim when its marker is gone.
+    if (keepCarrier) {
+      h.advance(-1000);
+      for (const workKey of ["trimmed", "retained"]) {
+        h.main.deliverAgent({ from: watcher, message: "old native", delivery: "steer", data: { key: workKey, topic: TOPIC } });
+      }
+      h.advance(1000);
+    }
+    const failOpen = await h.publish("new identity-less work", { key: "trimmed" });
+    const retainedFirst = await h.publish("already spent, later work", { key: "retained" });
+    const retainedSecond = await h.publish("already spent, still later work", { key: "retained" });
+    h.main.deliverAgent({ from: watcher, message: "fresh native", delivery: "steer", data: { key: "fresh", topic: TOPIC } });
+    await h.publish("fresh native shadow", { key: "fresh" });
+    const freshSecond = await h.publish("fresh claim is one-use", { key: "fresh" });
+    h.advance(1);
+    const recovered = h.box();
+    const batch = await recovered.next(h.session());
+    expect(ids(batch.events)).toEqual([failOpen.id, retainedFirst.id, retainedSecond.id, freshSecond.id]);
+    await h.take(recovered, batch.events);
+    h.entries.length = 0;
+    const later = await h.publish("trimmed claim stays fail-open after reload", { key: "trimmed" });
+    h.advance(1);
+    expect(ids((await h.box().next(h.session())).events)).toEqual([later.id]);
+  });
+
+  it("expires fallback claims and native receipts at the same horizon and durably saves expiry", async () => {
+    const horizonMs = 100;
+    const h = setup(0, { horizonMs });
+    const inbox = h.box(); inbox.start();
+    h.main.deliverAgent({ from: watcher, message: "native", delivery: "steer", data: { key: KEY, topic: TOPIC } });
+    await h.publish("native shadow");
+    expect((await inbox.next(h.session())).events).toEqual([]);
+    const hash = createHash("sha256").update(JSON.stringify([watcher.id, "native-topic-key", JSON.stringify([TOPIC, KEY])])).digest("hex");
+    type Cursor = { fallbacks?: string[]; fallbackAt?: number[]; delivered?: string[]; deliveredAt?: number[] };
+    const initial = h.mesh.get(inbox.key)!.value as Cursor;
+    expect(initial.fallbacks).toContain(hash);
+    expect(initial.delivered).toContain(hash);
+    h.advance(horizonMs);
+    await h.box().next(h.session(), { commitOnly: true });
+    const boundary = h.mesh.get(inbox.key)!.value as Cursor;
+    expect(boundary.fallbacks).toContain(hash);
+    expect(boundary.delivered).toContain(hash);
+    h.advance(1);
+    // Keep the old native carrier in session history: scanning it must not refresh its age.
+    await h.box().next(h.session(), { commitOnly: true });
+    const expired = h.mesh.get(inbox.key)!.value as Cursor;
+    expect(expired.fallbacks ?? []).toEqual([]);
+    expect(expired.fallbackAt ?? []).toEqual([]);
+    expect(expired.delivered ?? []).toEqual([]);
+    expect(expired.deliveredAt ?? []).toEqual([]);
+    await h.box().next(h.session(), { commitOnly: true });
+    expect(h.mesh.get(inbox.key)!.value).toEqual(expired);
+    const later = await h.publish("new work after native receipt expiry");
+    expect(ids((await h.box().next(h.session())).events)).toEqual([later.id]);
   });
 
   it("keeps explicit delivery identity shadow suppression for distinct envelope ids", async () => {

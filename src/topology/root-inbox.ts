@@ -98,6 +98,10 @@ interface RootInboxState {
   deliveredAt?: number[];
   /** Topic-scoped legacy key/ref claims already spent suppressing one shadow each. */
   fallbacks?: string[];
+  /** Consumption times parallel to fallbacks; bounded with the delivered receipt ledger. */
+  fallbackAt?: number[];
+  /** Old native claims cannot regain suppression after their consumed marker is evicted. */
+  fallbackThrough?: number;
   /** High-water mark above `after`: no event at or below it is injected again. Never lowered. */
   ackedThrough?: number;
   /** Ids acked out of order above the mark, each with an upper bound of its mesh sequence. */
@@ -119,7 +123,7 @@ export class RootInbox {
   #dueAt = Number.POSITIVE_INFINITY;
   #delivered = new Map<string, number>();
   #acks = new Map<string, number>();
-  #fallbacks = new Set<string>();
+  #fallbacks = new Map<string, number>();
   readonly #notifications = new MeshBackgroundQueue("root inbox wake notification");
   /** An ack is one-shot: its own queue retries a mesh lock timeout instead of dropping it. */
   readonly #ackWrites = new MeshBackgroundQueue("root inbox ack");
@@ -390,8 +394,15 @@ export class RootInbox {
     const theirs = Math.max(sequenceOf(value.after), sequenceOf(value.ackedThrough));
     if (theirs > this.#mark()) state.ackedThrough = theirs;
     for (const [id, bound] of parseAcks(value.acked)) if (!this.#acks.has(id)) this.#acks.set(id, bound);
-    if (Array.isArray(value.fallbacks)) for (const id of value.fallbacks) if (typeof id === "string") this.#fallbacks.add(id);
-    state.fallbacks = [...this.#fallbacks];
+    if (typeof value.fallbackThrough === "number" && Number.isFinite(value.fallbackThrough)) {
+      state.fallbackThrough = Math.max(state.fallbackThrough ?? Number.NEGATIVE_INFINITY, value.fallbackThrough);
+    }
+    if (Array.isArray(value.fallbacks)) value.fallbacks.forEach((id, index) => {
+      if (typeof id !== "string") return;
+      const time = value.fallbackAt?.[index];
+      const at = typeof time === "number" && Number.isFinite(time) ? time : this.#fallbacks.get(id) ?? this.#now();
+      this.#fallbacks.set(id, Math.max(this.#fallbacks.get(id) ?? Number.NEGATIVE_INFINITY, at));
+    });
     this.#syncAcks();
   }
 
@@ -477,6 +488,11 @@ export class RootInbox {
     if (value === undefined) return false;
     const claim = topicWorkReceipt(event.from.id, kind, event.topic, value);
     const claimed = has(claim) || (kind === "key" && session.holdsSteer(event.from.id, value, event.topic));
+    const through = this.#state!.fallbackThrough;
+    const at = session.delivered?.has(claim) ? session.deliveredAt?.get(claim) : this.#delivered.get(claim);
+    // Forgetting a spent marker must fail open, even if canonical history still holds its
+    // native carrier. The bounded ledger's eviction watermark retires those older claims.
+    if (through !== undefined && (at === undefined || at <= through)) return false;
     if (!claimed || this.#fallbacks.has(claim) || reservations?.has(claim)) return false;
     reservations?.add(claim);
     return true;
@@ -491,8 +507,7 @@ export class RootInbox {
     if (value === undefined) return false;
     const claim = topicWorkReceipt(event.from.id, kind, event.topic, value);
     if (!reservations.has(claim) || this.#fallbacks.has(claim)) return false;
-    this.#fallbacks.add(claim);
-    this.#state!.fallbacks = [...this.#fallbacks];
+    this.#fallbacks.set(claim, this.#now());
     return true;
   }
 
@@ -514,14 +529,35 @@ export class RootInbox {
 
   /** Oldest first, by canonical receipt time, not the most recent history scan. */
   #trimReceipts(): boolean {
-    const before = this.#delivered.size;
+    const before = this.#delivered.size + this.#fallbacks.size;
     const cutoff = this.#now() - this.#horizon();
-    let entries = [...this.#delivered].filter(([, at]) => at >= cutoff)
-      .sort((a, b) => a[1] - b[1]).slice(-MAX_DELIVERED_RECEIPTS);
     const state = this.#state!;
+    const retire = (at: number): void => {
+      state.fallbackThrough = Math.max(state.fallbackThrough ?? Number.NEGATIVE_INFINITY, at);
+    };
+    for (const [id, at] of this.#fallbacks) if (at < cutoff) {
+      retire(at);
+      this.#fallbacks.delete(id);
+    }
+    const all: Array<["delivered" | "fallback", string, number]> = [
+      ...[...this.#delivered].filter(([, at]) => at >= cutoff).map(([id, at]): ["delivered", string, number] => ["delivered", id, at]),
+      ...[...this.#fallbacks].map(([id, at]): ["fallback", string, number] => ["fallback", id, at]),
+    ].sort((a, b) => a[2] - b[2]);
+    const entries = all.slice(-MAX_DELIVERED_RECEIPTS);
+    for (const [kind, , at] of all.slice(0, -MAX_DELIVERED_RECEIPTS)) if (kind === "fallback") retire(at);
+    const baseThrough = state.fallbackThrough;
     const assign = (offset: number): void => {
-      state.delivered = entries.slice(offset).map(([id]) => id);
-      state.deliveredAt = entries.slice(offset).map(([, at]) => at);
+      if (baseThrough === undefined) delete state.fallbackThrough;
+      else state.fallbackThrough = baseThrough;
+      const kept = entries.slice(offset);
+      const delivered = kept.filter(([kind]) => kind === "delivered");
+      const fallbacks = kept.filter(([kind]) => kind === "fallback");
+      state.delivered = delivered.map(([, id]) => id);
+      state.deliveredAt = delivered.map(([, , at]) => at);
+      state.fallbacks = fallbacks.map(([, id]) => id);
+      state.fallbackAt = fallbacks.map(([, , at]) => at);
+      // Include the final watermark in every byte-budget candidate, not after sizing it.
+      for (const [kind, , at] of entries.slice(0, offset)) if (kind === "fallback") retire(at);
     };
     // Account for the actual cursor and pending IDs too. Byte-size (not count) protects
     // configured small mesh values; count also caps memory at the default/larger limit.
@@ -534,9 +570,10 @@ export class RootInbox {
       else high = middle;
     }
     assign(low);
-    entries = entries.slice(low);
-    this.#delivered = new Map(entries);
-    return before !== entries.length;
+    const kept = entries.slice(low);
+    this.#delivered = new Map(kept.filter(([kind]) => kind === "delivered").map(([, id, at]) => [id, at]));
+    this.#fallbacks = new Map(kept.filter(([kind]) => kind === "fallback").map(([, id, at]) => [id, at]));
+    return before !== kept.length;
   }
 
   #horizon(): number { return this.options.horizonMs ?? inboxHorizonMs(); }
@@ -609,7 +646,13 @@ export class RootInbox {
       const at = value?.deliveredAt?.[index];
       return [id, typeof at === "number" && Number.isFinite(at) ? at : this.#now()];
     }));
-    this.#fallbacks = new Set(this.#state.fallbacks ?? []);
+    this.#fallbacks = new Map((this.#state.fallbacks ?? []).map((id, index) => {
+      const at = value?.fallbackAt?.[index];
+      return [id, typeof at === "number" && Number.isFinite(at) ? at : stored?.updatedAt ?? this.#now()];
+    }));
+    if (typeof value?.fallbackThrough === "number" && Number.isFinite(value.fallbackThrough)) {
+      this.#state.fallbackThrough = value.fallbackThrough;
+    }
     this.#saved = saved ? JSON.stringify(value) : undefined;
     this.#trimReceipts();
     this.#savedAt = saved ? this.#now() : 0;

@@ -4322,7 +4322,7 @@ describe("ActorManager", () => {
         return manager;
       };
 
-      it("#11998 a registry veto during preparation expires and the next routed activation succeeds without resetSession", async () => {
+      it.each([true, false])("#11998 only a typed registry veto during preparation expires (typed=%s)", async typed => {
         const s = setup(true);
         const actor = await s.actors.create({ name: "veto-review", instructions: "Respond.", responseMode: "text", topics: ["veto.review"] });
         await s.actors.close();
@@ -4337,13 +4337,22 @@ describe("ActorManager", () => {
         let veto = true;
         vi.spyOn(ActorRegistryStore.prototype, "update").mockImplementation(function (this: ActorRegistryStore, select, label) {
           if (veto && label === "manager-update" && manager.status(actor.id).preparing?.phase === "registry") {
-            return Promise.reject(new ActorRegistryUpdateVetoedError("ownership"));
+            return Promise.reject(typed ? new ActorRegistryUpdateVetoedError("ownership")
+              : new Error(new ActorRegistryUpdateVetoedError().message));
           }
           return update.call(this, select, label);
         });
         await expect(manager.ask(actor.id, "activate")).rejects.toThrow("Actor registry update was vetoed");
         await waitFor(() => !manager.status(actor.id).preparing);
         const blocked = manager.status(actor.id).activationBlocked!;
+        if (!typed) {
+          expect(blocked).toMatchObject({ code: "failing-preparation", class: "hard" });
+          expect(blocked).not.toHaveProperty("retryAt");
+          expect(runs).toHaveLength(0);
+          time.set(Date.now() + 24 * 60 * 60 * 1_000);
+          expect(manager.status(actor.id).activationBlocked).toMatchObject({ code: "failing-preparation", class: "hard" });
+          return;
+        }
         expect(blocked).toMatchObject({ reason: "actor registry validation veto (ownership)",
           classification: expect.stringContaining("(ownership)"), code: "registry-update-vetoed", class: "transient", backoffMs: 2_000,
           retryAt: blocked.blockedAt! + 2_000 });
@@ -4370,6 +4379,9 @@ describe("ActorManager", () => {
         const unknown = await s.actors.create({ name: "legacy-veto", instructions: "Respond.", responseMode: "text", topics: ["legacy.veto"] });
         const prep = await s.actors.create({ name: "legacy-prep-veto", instructions: "Respond.", responseMode: "text" });
         const auth = await s.actors.create({ name: "legacy-auth", instructions: "Respond.", responseMode: "text" });
+        const known = await s.actors.create({ name: "known-veto", instructions: "Respond.", responseMode: "text" });
+        const canonical = await s.actors.create({ name: "canonical-veto", instructions: "Respond.", responseMode: "text" });
+        const security = await s.actors.create({ name: "known-veto-security", instructions: "Respond.", responseMode: "text" });
         await s.actors.close();
         const file = path.join(s.root, "actors", "actors.json");
         const registry = JSON.parse(fs.readFileSync(file, "utf8"));
@@ -4380,6 +4392,12 @@ describe("ActorManager", () => {
           [prep.id]: { reason: `Actor ${prep.id} preparation (registry): ${veto}`, code: "failing-preparation",
             classification: "permanent: activation preparation kept failing past its retry budget" },
           [auth.id]: { reason: "Error: 401 Unauthorized: invalid api key", code: "auth", classification: "permanent: credential or authentication failure" },
+          [known.id]: { reason: `Actor private-id preparation (registry): ${veto}`, code: "registry-update-vetoed",
+            classification: "transient: actor registry update veto committed nothing; retry after backoff" },
+          [canonical.id]: { reason: "actor registry validation veto (ownership)", code: "registry-update-vetoed",
+            classification: "transient: actor registry validation veto (ownership) committed nothing; retry after backoff" },
+          [security.id]: { reason: `Actor private-id preparation (registry): ${veto}`, code: "registry-update-vetoed",
+            classification: "security policy violation" },
         };
         for (const row of registry.actors as Array<Record<string, unknown>>) {
           row.activationBlocked = { ...legacy[row.id as string]!, class: "hard", since, count: 7 };
@@ -4390,9 +4408,16 @@ describe("ActorManager", () => {
           actorRoot: path.join(s.root, "actors"), persistent: true,
         });
         actorManagers.push(restored);
-        for (const id of [unknown.id, prep.id]) {
-          expect(restored.status(id)).toMatchObject({ status: "idle", activationBlockExpired: { code: "registry-update-vetoed", class: "transient" } });
+        for (const id of [unknown.id, prep.id, known.id, canonical.id]) {
+          const expired = restored.status(id).activationBlockExpired!;
+          expect(restored.status(id)).toMatchObject({ status: "idle", activationBlockExpired: { code: "registry-update-vetoed", class: "transient",
+            lastBlockedReason: `actor registry validation veto (${id === canonical.id ? "ownership" : "caller-validation"})` } });
+          expect(JSON.stringify(expired)).not.toContain("private-id");
+          expect(expired.lastBlockedReason).not.toContain(id);
         }
+        expect(restored.status(security.id).activationBlocked).toMatchObject({ code: "security-policy", class: "hard" });
+        expect(restored.status(security.id).activationBlocked).not.toHaveProperty("retryAt");
+        expect(JSON.stringify(restored.status(security.id).activationBlocked)).not.toContain("private-id");
         const runs = recordRuns(s.agents);
         await s.mesh.publish({ topic: "legacy.veto", from: s.identity, text: "route after host restart" });
         await waitFor(() => runs[0]?.finishedAt !== undefined && !restored.status(unknown.id).inFlightRun);

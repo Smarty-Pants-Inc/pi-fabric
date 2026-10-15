@@ -124,8 +124,8 @@ const providerTransientIn = (text: string): { why: string; match: string } | und
  * full failure text; evidence is the run's worker warnings, when the run produced any.
  */
 const WINDOW_LOST = /^[ \t]*(?:Fabric activation window failed: )?(?:Error: )?(Activation window lost (?:current activation messages|its authorized compaction|its native history boundary|its native system records|its native system prompt|the Google config object))[ \t]*\r?$/m;
-// Only the store's exact error, optionally wrapped by #prepare or Error.toString(). A mention
-// in other error text or model prose is not evidence that no registry update committed.
+// Persisted legacy records only: the old store's exact error, optionally wrapped by #prepare
+// or Error.toString(). Live failures require the typed cause, never a message match.
 const REGISTRY_VETO = /^(?:(?:Error|ActorPreparationError): )?(?:Actor [\w:-]+ preparation \([\w-]+\): )?(?:ActorRegistryUpdateVetoedError: )?Actor registry update was vetoed by its validation and not committed; retry$/;
 export const classifyActivationFailure = (input: {
   lastError: string; error?: string | undefined; evidence?: readonly string[] | undefined; preparation?: boolean | undefined;
@@ -133,11 +133,17 @@ export const classifyActivationFailure = (input: {
   preparationTimeout?: boolean | undefined;
   /** The preparation cause is the store's typed veto (not an arbitrary retryable error). */
   registryVeto?: boolean | ActorRegistryVetoReason | undefined;
+  /** Restore only: migrate untyped legacy text, or normalize an already stored veto code. */
+  persistedRegistryVeto?: "legacy" | "known-code" | undefined;
 }): ActivationFailureClass => {
   const permanent = permanentAnywhere(input);
-  if (!permanent && (input.registryVeto || REGISTRY_VETO.test(input.lastError))) {
-    const reason = typeof input.registryVeto === "string" && /^(?:cancelled|revision|ownership|actor-state|caller-validation|generation|payload-generation|lock|deadline)$/.test(input.registryVeto)
-      ? input.registryVeto : "caller-validation";
+  const knownVeto = input.persistedRegistryVeto === "known-code";
+  if (!permanent && (input.registryVeto || knownVeto ||
+      input.persistedRegistryVeto === "legacy" && REGISTRY_VETO.test(input.lastError))) {
+    const candidate = input.registryVeto || (knownVeto
+      ? /^actor registry validation veto \(([a-z-]+)\)$/.exec(input.lastError)?.[1] : undefined);
+    const reason = typeof candidate === "string" && /^(?:cancelled|revision|ownership|actor-state|caller-validation|generation|payload-generation|lock|deadline)$/.test(candidate)
+      ? candidate : "caller-validation";
     return { code: "registry-update-vetoed", transient: true, reason: `actor registry validation veto (${reason})`,
       classification: `transient: actor registry validation veto (${reason}) committed nothing; retry after backoff` };
   }

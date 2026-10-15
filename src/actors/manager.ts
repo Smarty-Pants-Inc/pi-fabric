@@ -682,14 +682,19 @@ const restoredActivationBlock = (stored: { reason: string; code: string; since: 
         classification: complete ? "permanent: context window exceeded (complete run evidence)"
           : "fail-closed: legacy overflow lacks complete matching run evidence; explicit session reset required" };
   }
-  const rederive = legacyOverflow !== undefined || typeof stored.classification !== "string" || REDERIVED_BLOCK_CODES.has(stored.code);
+  // Older veto writers persisted the Actor preparation wrapper as the public reason. Always
+  // normalize a known veto, even with a classification; only exact canonical reasons survive.
+  const knownVeto = stored.code === "registry-update-vetoed";
+  const rederive = knownVeto || legacyOverflow !== undefined || typeof stored.classification !== "string" || REDERIVED_BLOCK_CODES.has(stored.code);
   const derived: { code: string; classification: string; reason?: string | undefined } = legacyOverflow ?? (!rederive ? { code: stored.code, classification: stored.classification as string }
-    : (({ code, classification, reason }) => ({ code, reason, classification: code === stored.code && typeof stored.classification === "string"
+    : (({ code, classification, reason }) => ({ code, reason, classification: !knownVeto && code === stored.code && typeof stored.classification === "string"
       ? stored.classification : `${classification} (re-derived from an older record's stored reason)` }))(
-      classifyActivationFailure({ lastError: stored.reason, preparation: stored.code === "failing-preparation" ||
-        stored.code === "preparation-timeout" })));
+      classifyActivationFailure({ lastError: stored.reason,
+        error: knownVeto && typeof stored.classification === "string" ? stored.classification : undefined,
+        persistedRegistryVeto: knownVeto ? "known-code" : REDERIVED_BLOCK_CODES.has(stored.code) ? "legacy" : undefined,
+        preparation: stored.code === "failing-preparation" || stored.code === "preparation-timeout" })));
   const transient = TRANSIENT_ACTIVATION_BLOCK_CODES.has(derived.code);
-  return { reason: derived.reason ?? stored.reason, code: derived.code, class: activationBlockClass(derived.code), since: stored.since,
+  return { reason: derived.reason ?? (knownVeto ? derived.classification : stored.reason), code: derived.code, class: activationBlockClass(derived.code), since: stored.since,
     blockedAt: finitePositive(stored.blockedAt) ? stored.blockedAt : stored.since, count: stored.count,
     classification: derived.classification, ...(overflowEvidence ? { overflowEvidence } : {}),
     ...(transient && finitePositive(stored.retryAt) ? { retryAt: stored.retryAt } : {}),

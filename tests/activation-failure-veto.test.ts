@@ -13,12 +13,30 @@ describe("registry veto activation classification (smarty-dev#11998)", () => {
     `ActorRegistryUpdateVetoedError: ${veto}`,
     `Actor abc-123 preparation (registry): ${veto}`,
     `ActorPreparationError: Actor abc-123 preparation (registry): ${veto}`,
-  ])("recognizes the exact boundary error: %s", lastError => {
+  ])("recognizes the exact boundary error only in persisted legacy mode: %s", lastError => {
     for (const preparation of [false, true]) {
-      const result = classifyActivationFailure({ lastError, preparation });
+      const live = classifyActivationFailure({ lastError, preparation });
+      expect(live.transient).toBe(false);
+      expect(activationBlockClass(live.code)).toBe("hard");
+      const result = classifyActivationFailure({ lastError, preparation, persistedRegistryVeto: "legacy" });
       expect(result).toMatchObject({ code: "registry-update-vetoed", transient: true });
       expect(activationBlockClass(result.code)).toBe("transient");
     }
+  });
+
+  it.each([
+    ["Actor private-id preparation (registry): " + veto, "caller-validation"],
+    ["actor registry validation veto (ownership)", "ownership"],
+  ])("normalizes a stored known veto reason: %s", (lastError, reason) => {
+    const result = classifyActivationFailure({ lastError, persistedRegistryVeto: "known-code" });
+    expect(result).toMatchObject({ code: "registry-update-vetoed", transient: true,
+      reason: `actor registry validation veto (${reason})` });
+    expect(JSON.stringify(result)).not.toContain("private-id");
+  });
+
+  it.each(["401 Unauthorized", "security policy violation"])("keeps independent stored permanent evidence hard: %s", error => {
+    expect(classifyActivationFailure({ lastError: veto, error, persistedRegistryVeto: "known-code" }).transient).toBe(false);
+    expect(classifyActivationFailure({ lastError: veto, error, persistedRegistryVeto: "legacy" }).transient).toBe(false);
   });
 
   it("accepts a typed veto cause independently of its wrapper text", () => {

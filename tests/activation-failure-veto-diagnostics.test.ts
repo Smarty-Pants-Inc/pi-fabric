@@ -26,7 +26,7 @@ const fixture = (valid = true, vetoReason: "generation" | "payload-generation" =
 describe("registry veto reason at expiry (smarty-dev#11998)", () => {
   // Recorded-call trust-boundary probe: real manager admission/catch/status; no child
   // process or deletion. Registry publication is mocked by fixture(), mesh writes recorded.
-  it("manager exposes safe veto reason, closed alarm code, cooldown and successful retry", async () => {
+  it.each([true, false])("manager trusts only typed vetoes (typed=%s), with safe reason and retry", async typed => {
     vi.spyOn(fs, "rmSync").mockImplementation(() => {});
     vi.spyOn(fs, "unlinkSync").mockImplementation(() => {});
     vi.spyOn(fs, "rmdirSync").mockImplementation(() => {});
@@ -41,7 +41,10 @@ describe("registry veto reason at expiry (smarty-dev#11998)", () => {
     const run = vi.spyOn(agents, "run").mockImplementation(async () => {
       if (veto) {
         const f = fixture();
-        await f.store.update(() => ({ actors: [], value: "never", validate: () => { f.expire(); return "ownership"; } }))
+        await f.store.update(() => ({ actors: [], value: "never", validate: () => {
+          if (!typed) throw new Error(new ActorRegistryUpdateVetoedError().message);
+          f.expire(); return "ownership";
+        } }))
           .catch(error => { throw new ActorPreparationError("private-id", "registry", error); });
       }
       return { id: "probe", status: "completed", text: "ok", toolCalls: 0, warnings: [] } as never;
@@ -59,6 +62,15 @@ describe("registry veto reason at expiry (smarty-dev#11998)", () => {
         await new Promise<void>(resolve => setImmediate(resolve));
       }
       const blocked = manager.status(actor.id).activationBlocked!;
+      if (!typed) {
+        expect(blocked).toMatchObject({ code: "unknown", class: "hard" });
+        expect(blocked).not.toHaveProperty("retryAt");
+        expect(publish.mock.calls.some(([input]) => input.topic === FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC &&
+          (input.data as { code?: string }).code === "registry-update-vetoed")).toBe(false);
+        skew += 86_400_000;
+        expect(manager.status(actor.id).activationBlocked).toMatchObject({ code: "unknown", class: "hard" });
+        return;
+      }
       expect(blocked).toMatchObject({ reason: "actor registry validation veto (ownership)",
         code: "registry-update-vetoed", class: "transient", classification: expect.stringContaining("(ownership)"), backoffMs: 2_000 });
       expect(blocked.reason).not.toContain(actor.id);
@@ -135,7 +147,7 @@ describe("registry veto reason at expiry (smarty-dev#11998)", () => {
     expect(f.commit).not.toHaveBeenCalled();
   });
 
-  it.each([new Error("private actor identity"), "ownership", { reason: "ownership", retryable: true }])("does not convert an arbitrary validation throw into a safe veto: %j", async error => {
+  it.each([new Error(new ActorRegistryUpdateVetoedError().message), new Error("private actor identity"), "ownership", { reason: "ownership", retryable: true }])("does not convert an arbitrary validation throw into a safe veto: %j", async error => {
     const f = fixture();
     await expect(f.store.update(() => ({ actors: [], value: "never", validate: () => { throw error; } }))).rejects.toBe(error);
     expect(f.commit).not.toHaveBeenCalled();

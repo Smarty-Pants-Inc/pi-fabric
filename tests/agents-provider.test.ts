@@ -2250,15 +2250,17 @@ describe("AgentsProvider runner support", () => {
     const spawn = await provider.describe("spawn", context);
     const create = await provider.describe("create", context);
     const run = await provider.describe("run", context);
-    const spawnProperties = (spawn?.inputSchema as { properties: Record<string, { enum?: string[] }> }).properties;
-    const createProperties = (create?.inputSchema as { properties: Record<string, { enum?: string[] }> }).properties;
+    const spawnProperties = (spawn?.inputSchema as { properties: Record<string, { enum?: string[]; description?: string }> }).properties;
+    const createProperties = (create?.inputSchema as { properties: Record<string, { enum?: string[]; description?: string }> }).properties;
     const runProperties = (run?.inputSchema as { properties: Record<string, unknown> }).properties;
 
     expect(spawnProperties.residency?.enum).toEqual(["session", "durable"]);
     expect(createProperties.residency?.enum).toEqual(["session", "durable"]);
     expect(runProperties).not.toHaveProperty("residency");
-    expect(spawnProperties.idempotencyKey).toMatchObject({ type: "string", minLength: 1, maxLength: 256 });
-    expect(createProperties.idempotencyKey).toEqual(spawnProperties.idempotencyKey);
+    expect(spawnProperties.idempotencyKey).toMatchObject({ type: "string", minLength: 1, maxLength: 256,
+      description: expect.stringContaining("Remote capability spawns persist") });
+    expect(createProperties.idempotencyKey).toMatchObject({ type: "string", minLength: 1, maxLength: 256 });
+    expect(createProperties.idempotencyKey?.description).not.toContain("Remote capability");
     expect(runProperties).not.toHaveProperty("idempotencyKey");
   });
 

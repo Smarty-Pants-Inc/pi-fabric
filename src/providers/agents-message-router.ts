@@ -916,6 +916,9 @@ export class AgentMessageRouter {
         };
       }
     }
+    if (command.operation !== "steer" && command.operation !== "followUp") {
+      return { accepted: false, error: "Remote task operations require the task proxy/owner receiver", errorCode: "FABRIC_REMOTE_TASK_POLICY_REFUSED" };
+    }
     if (this.mainAgent.local && this.mainAgent.matches(command.targetId)) {
       if (this.#localMainNonInteractive()) {
         return { accepted: false, error: new FabricParticipantNonInteractiveError(this.mainAgent.id).message };

@@ -85,7 +85,7 @@ export interface AgentTopologyPort {
   remove?(request: AgentTopologyRemoveRequest): Promise<AgentSessionRecord>;
   dispatch?(request: AgentTopologyDispatchRequest): Promise<AgentSessionRecord>;
 }
-export type AgentServiceAction = "run" | "spawn" | "wait" | "join" | "status" | "list" | "stop" | "steer" | "compact" | "resume" | "followUp" | "sessions" | "peers" | "self" | "members" | "create" | "remove";
+export type AgentServiceAction = "run" | "spawn" | "wait" | "result" | "join" | "status" | "list" | "stop" | "steer" | "compact" | "resume" | "followUp" | "sessions" | "peers" | "self" | "members" | "create" | "remove";
 export interface AgentServiceCapabilities { steer?: boolean; compact?: boolean; resume?: boolean; followUp?: boolean; topology?: boolean }
 export interface AgentServiceEvent {
   version: 1; sequence: number;
@@ -116,6 +116,8 @@ export interface AgentServiceClient {
   spawn(request: AgentServiceRequest, signal?: AbortSignal): Promise<AgentPublicRecord>;
   /** Bounded by timeoutMs (default and at most 5 min): at the bound the child keeps running. */
   wait(id: string, signal?: AbortSignal, timeoutMs?: number): Promise<AgentPublicRecord>;
+  /** Alias for wait. */
+  result(id: string, signal?: AbortSignal, timeoutMs?: number): Promise<AgentPublicRecord>;
   /** Alias for wait. */
   join(id: string, signal?: AbortSignal, timeoutMs?: number): Promise<AgentPublicRecord>;
   status(id: string): Promise<AgentPublicRecord>;

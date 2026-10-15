@@ -114,6 +114,9 @@ export interface FabricParticipantInfo extends FabricParticipantRecord {
 
 export interface FabricHostRecord {
   format: 1;
+  /** Only a loaded resident task owner advertises this; empty/absent grants nothing. */
+  taskCapabilities?: string[];
+  ownerIncarnation?: string;
   livenessLeaseFiles?: 1;
   id: string;
   rootId: string;
@@ -199,6 +202,8 @@ export interface FabricParticipantSource {
    * when the participant is live or has no record on this mesh root.
    */
   lastKnown?(id: string, now?: number): { participant: FabricParticipantInfo; lapsedMs: number } | undefined;
+  /** Fresh owner advertisements, including stale entries for a typed bridge refusal. */
+  taskOwners?(): Array<FabricHostRecord & { stale: boolean }>;
   refresh(): Promise<void>;
   scheduleRefresh(): void;
 }

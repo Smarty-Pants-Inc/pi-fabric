@@ -122,6 +122,16 @@ These names and panes are unauthenticated display metadata under the same-UID bo
 not routing custody or authority. Use the exact `session:<uuid>` participant id to target a
 Main. Name-based routing work is deferred to smarty-dev#8130.
 
+### Capability tasks across a mesh bridge
+
+A lead Main (`project-agent` or `org-agent`) can call `agents.spawn` with `needs: ["corpus"]` or `needs: ["github"]` from a work host. If its own host does not advertise every need, Fabric selects a live capable resident owner from the bridged directory. Tasks, actors, worktree Mains, and confined or scoped callers cannot add a remote hop. The reserved `needs: ["local"]` still pins execution to the calling host.
+
+Provision `agents.hostCapabilities: ["corpus", "github"]` in the capability host's global `fabric.json`; the default is `[]`. Workspace overrides cannot grant capabilities or change `agents.remoteSpawnPolicy`. A live resident on that host advertises the capabilities. Remote requests default to read-only with shell denied and the host's default tools. A host-only `remoteSpawnPolicy` can set an explicit `writableRoots`, `shell`, and `tools` ceiling; the request can narrow it, not widen it. The normal resident model admission still applies.
+
+Remote tasks use the existing addressed control-command and acknowledgement topics, not an external launcher or SSH. They are unseeded, nonrecursive Pi process tasks. Omit `extensions`: the execution host owns that setting, and the receiver refuses any caller-supplied value with `FABRIC_REMOTE_TASK_POLICY_REFUSED`. Give `cwd` as an existing absolute path **on the capability host**, or omit it for a fresh TMPDIR there. `requires` is checked there too. No workspace or credential is copied.
+
+The returned handle supports `agents.status`, bounded `wait`/`result`/`join`, and `stop` through a durable caller-side proxy. An observation timeout leaves the native task running. The final answer returns to the exact spawning session's normal completion inbox. Use an unchanged `idempotencyKey` and spawn settings to recover an unknown response; the persisted intent retains its original route. Typed errors distinguish `FABRIC_REMOTE_TASK_NO_OWNER`, `FABRIC_REMOTE_TASK_BRIDGE_STALE`, `FABRIC_REMOTE_TASK_POLICY_REFUSED`, and `FABRIC_REMOTE_TASK_LOST`. An interrupted owner admission is never permission to replay under a new key.
+
 ### Opt-in process task placement
 
 A Main can route ordinary `transport: "process"` Pi task agents through a host-configured external launcher. Unconfigured hosts remain local. See [process placement configuration](configuration.md#process-task-placement) for the `smarty-task-ryzen2 --host auto` example and polling contract.

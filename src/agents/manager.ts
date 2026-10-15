@@ -1687,7 +1687,7 @@ export class AgentManager {
    * beforeCommit is a separate resident-host mutation fence, checked after model preparation.
    * callerReturnAddress is a validated resident caller snapshot, never a task request field.
    */
-  spawn(request: AgentRunRequest, signal?: AbortSignal, authorize?: () => boolean, beforeCommit?: (id: string) => void, onOutputPrincipalDowngrade?: () => void, onLaunched?: (handle: AgentHandleInfo) => void, preparation?: AgentLaunchPreparationOptions, callerReturnAddress?: TaskReturnAddress): Promise<AgentHandleInfo> {
+  spawn(request: AgentRunRequest, signal?: AbortSignal, authorize?: () => boolean, beforeCommit?: (id: string) => void, onOutputPrincipalDowngrade?: () => void, onLaunched?: (handle: AgentHandleInfo) => void, preparation?: AgentLaunchPreparationOptions, callerReturnAddress?: TaskReturnAddress, callerCompletionRecipient?: CompletionRecipient, toolsCeiling?: readonly string[]): Promise<AgentHandleInfo> {
     if (this.#closing) return Promise.reject(new Error("Fabric agent manager is closing"));
     // smarty-dev#9855: at admission, free the permits of launches now proven gone, before asking for one.
     this.#releaseProvenGone();
@@ -1699,10 +1699,13 @@ export class AgentManager {
     if (request.residentStartupProbe && !probe) return Promise.reject(new Error("Invalid resident startup probe"));
     request = { ...request };
     const returnAddress = callerReturnAddress && structuredClone(callerReturnAddress);
+    const completionRecipient = callerCompletionRecipient && structuredClone(callerCompletionRecipient);
+    // Host policy is snapshotted before release pause; remote admission must not observe later mutation.
+    const toolsCeilingSnapshot = toolsCeiling === undefined ? undefined : [...toolsCeiling];
     const pending = (async () => {
       while (this.#releasePaused && !probe) await this.#waitForRelease(signal);
       if (this.#closing) throw new Error("Fabric agent manager is closing");
-      return this.#spawn(request, signal, authorize, beforeCommit, onOutputPrincipalDowngrade, onLaunched, preparation, returnAddress);
+      return this.#spawn(request, signal, authorize, beforeCommit, onOutputPrincipalDowngrade, onLaunched, preparation, returnAddress, completionRecipient, toolsCeilingSnapshot);
     })();
     this.#spawns.add(pending);
     void pending.then(() => this.#spawns.delete(pending), () => this.#spawns.delete(pending));
@@ -1794,12 +1797,16 @@ export class AgentManager {
     return true;
   }
 
-  async #spawn(request: AgentRunRequest, signal?: AbortSignal, authorize?: () => boolean, beforeCommit?: (id: string) => void, onOutputPrincipalDowngrade?: () => void, onLaunched?: (handle: AgentHandleInfo) => void, preparation?: AgentLaunchPreparationOptions, callerReturnAddress?: TaskReturnAddress): Promise<AgentHandleInfo> {
+  async #spawn(request: AgentRunRequest, signal?: AbortSignal, authorize?: () => boolean, beforeCommit?: (id: string) => void, onOutputPrincipalDowngrade?: () => void, onLaunched?: (handle: AgentHandleInfo) => void, preparation?: AgentLaunchPreparationOptions, callerReturnAddress?: TaskReturnAddress, callerCompletionRecipient?: CompletionRecipient, toolsCeiling?: readonly string[]): Promise<AgentHandleInfo> {
     if (!this.config.enabled) throw new Error("Agents are disabled in Fabric configuration");
     if (this.#currentDepth >= this.config.maxDepth) {
       throw new Error(`Fabric agent depth limit reached (${this.config.maxDepth})`);
     }
     assertAgentTask(request);
+    // Foreign Main attribution is host-admitted, never a public spawn setting.
+    // Ordinary resident caller return addresses retain the manager's existing spawner.
+    const spawner: AgentSpawner | undefined = callerCompletionRecipient && callerReturnAddress
+      ? { id: callerReturnAddress.spawnerId, kind: "main" } : this.#spawner;
     const needs = normalizeAgentCapabilityTokens(request.needs);
     const requires = normalizeAgentRequires(request.requires);
     // Session transports are disabled until they can retain execution custody.
@@ -1820,9 +1827,9 @@ export class AgentManager {
     };
     // Snapshot host-owned identity before any await/queue: later /name changes
     // affect new spawns, never an already-admitted run or its retries.
-    const completionRecipient = this.#completionRecipient
+    const completionRecipient = callerCompletionRecipient ?? (this.#completionRecipient
       ? { ...(typeof this.#completionRecipient === "function" ? this.#completionRecipient() : this.#completionRecipient) }
-      : undefined;
+      : undefined);
     if (request.model === "auto") throw new Error('Unresolved model: "auto" must go through agents.spawn routing');
     const routedActor = (request.routeDecision?.mode === "shadow" || request.routeDecision?.mode === "live") && Boolean(request.actorId) &&
       request.routeDecision.actorId === request.actorId && Boolean(request.routeDecision.activationId) && Boolean(request.sessionFile);
@@ -1956,6 +1963,13 @@ export class AgentManager {
         tools = [...mapped];
       }
       if (model && runnerAdapter.normalizeModel) model = await runnerAdapter.normalizeModel(model);
+    }
+    if (toolsCeiling !== undefined) {
+      if (requiresFabricKernel && !toolsCeiling.includes("fabric_exec")) {
+        throw new Error("Required Fabric kernel exceeds the host tool ceiling: fabric_exec");
+      }
+      const ceiling = new Set(toolsCeiling);
+      tools = tools.filter(tool => ceiling.has(tool));
     }
     this.assertModelAllowed(model, runner);
     // Alternate backend targets must be known before even accepting a queue receipt.
@@ -2251,9 +2265,9 @@ export class AgentManager {
           "--full-code-mode",
           String(inheritedFullCodeMode),
           ...(this.#mainAgentId ? ["--main-agent-id", this.#mainAgentId] : []),
-          ...(this.#spawner ? ["--spawner-id", this.#spawner.id, "--spawner-kind", this.#spawner.kind,
-            ...(this.#spawner.runId ? ["--spawner-run", this.#spawner.runId] : [])] : []),
-          ...((name?: string) => name ? ["--spawner-name", name] : [])(senderHeaderValue(this.#spawnerName())),
+          ...(spawner ? ["--spawner-id", spawner.id, "--spawner-kind", spawner.kind,
+            ...(spawner.runId ? ["--spawner-run", spawner.runId] : [])] : []),
+          ...((name?: string) => name ? ["--spawner-name", name] : [])(senderHeaderValue(callerCompletionRecipient?.name ?? this.#spawnerName())),
           ...(this.#fabricSessionId ? ["--fabric-session-id", this.#fabricSessionId] : []),
           ...(adapter.kind === "process" && !request.actorId
             ? callerReturnAddress ? ["--task-return-address", JSON.stringify(callerReturnAddress)] : this.#taskReturnAddressArguments
@@ -2443,7 +2457,7 @@ export class AgentManager {
           ...(routePin ? { routePin } : {}),
           ...(request.actorId ? { actorId: request.actorId } : {}),
           ...(request.actorName ? { actorName: request.actorName } : {}),
-          ...(this.#spawner ? { spawner: this.#spawner } : {}),
+          ...(spawner ? { spawner } : {}),
           ...(request.capabilityRequirements
             ? { capabilityRequirements: [...request.capabilityRequirements] }
             : {}),
@@ -2577,7 +2591,7 @@ export class AgentManager {
         ? { thinking: routePin?.effort ?? request.thinking ?? this.config.thinking } : {}),
       ...(request.actorId ? { actorId: request.actorId } : {}),
       ...(request.actorName ? { actorName: request.actorName } : {}),
-      ...(this.#spawner ? { spawner: this.#spawner } : {}),
+      ...(spawner ? { spawner } : {}),
       ...(request.capabilityRequirements ? { capabilityRequirements: [...request.capabilityRequirements] } : {}),
       ...(request.capabilityDigest ? { capabilityDigest: request.capabilityDigest } : {}),
       ...(request.runnerSessionId ? { runnerSessionId: request.runnerSessionId } : {}),

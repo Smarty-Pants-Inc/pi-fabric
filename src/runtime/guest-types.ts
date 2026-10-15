@@ -59,12 +59,12 @@ interface FabricAgentRequest {
   routeClass?: string;
   /** Trusted protection snapshot; omitted remains unknown. */
   protected?: boolean;
-  /** Deduplicate durable spawns on the same host; reuse for retries within 10 minutes (last 256 results). */
+  /** Remote capability spawns persist unchanged-key route/outcome across restarts; local durable spawns retain keys for 10 minutes (last 256 results). */
   idempotencyKey?: string;
   /** Omitted/inherit uses caller executor.kernel; concrete choices require Pi with extensions. */
   kernel?: FabricKernel | "inherit";
   task: string;
-  /** Required placement capabilities; local always pins to Main, and unmet needs stay local. */
+  /** Spawn routes nonlocal unmet needs to a capable bridged resident for lead Mains; local always pins to Main. */
   needs?: string[];
   /** Up to 64 absolute selected-host inputs, each at most 4096 UTF-8 bytes and without NUL. */
   requires?: string[];
@@ -1105,6 +1105,8 @@ interface FabricAgentsApi {
   spawn(args: FabricAgentRequest & { complexity?: "simple" | "normal" | "complex" | "delicate"; pinModel?: string; pinThinking?: FabricThinking }): Promise<FabricAgentHandle & { routeDecision?: { model: string; effort: FabricThinking; confidence: number | null; probability: number | null; reasonCode: string; decisionId: string } }>;
   /** Bounded by timeoutMs (default and at most 5 min): a child still running keeps running and reports on completion. */
   wait(args: FabricAgentTargetArgs & { timeoutMs?: number }): Promise<FabricAgentResult>;
+  /** Alias for wait, including a remote capability task's final result. */
+  result(args: FabricAgentTargetArgs & { timeoutMs?: number }): Promise<FabricAgentResult>;
   /** Alias for wait. */
   join(args: FabricAgentTargetArgs & { timeoutMs?: number }): Promise<FabricAgentResult>;
   status(args: FabricAgentTargetArgs): Promise<FabricAgentResult | FabricAgentHandle | FabricMainAgentInfo | FabricActorInfo | FabricParticipantInfo>;

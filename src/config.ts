@@ -6,6 +6,7 @@ import { parsePerCallRouting } from "./agents/per-call-config.js";
 import { normalizeAgentRouterConfig, type FabricAgentRouterConfig } from "./agents/router-config.js";
 export type { FabricAgentRouterConfig } from "./agents/router-config.js";
 import { normalizeAgentPlacement, type AgentPlacementConfig } from "./agents/placement-config.js";
+import { normalizeAgentCapabilityTokens } from "./host-compatibility.js";
 import { normalizeWakeTextConfig, type FabricWakeTextConfig } from "./actors/wake-text.js";
 import type { LandlockSettings } from "./core/landlock.js";
 import { DEFAULT_JEV_CONFIG, normalizeJevConfig, type FabricJevConfig } from "./jev/config.js";
@@ -245,6 +246,10 @@ export interface FabricAgentConfig {
   processMemoryMaxBytes?: number;
   /** Host-only opt-in process task placement; workspace files cannot override it. */
   placement?: AgentPlacementConfig;
+  /** Host-only capabilities of this execution host; never inferred from its name. */
+  hostCapabilities?: string[];
+  /** Foreign lead tasks may only narrow this host-owned policy; absent = read-only/no shell. */
+  remoteSpawnPolicy?: { writableRoots: string[]; shell: "deny" | "unconfined"; tools: string[] };
   /** User/workspace Pi default; package defaults intentionally leave this unset. */
   model?: string;
   /** Root deny baseline unioned with agent-dir additions; workspace lists are ignored. */
@@ -756,6 +761,7 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
     // behaviour key on the "pi" runner; upstream's pi-durable default stays opt-in here.
     runner: "pi",
     transport: "process",
+    hostCapabilities: [],
     processMemoryMaxBytes: DEFAULT_PROCESS_MEMORY_MAX_BYTES,
     deniedModels: [],
     modelPolicy: { requireReason: ["gpt-6-astra"] },
@@ -1211,6 +1217,21 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
   const prewalk = objectValue(input.prewalk);
   const agents = objectValue(input.agents);
   const placement = normalizeAgentPlacement(agents.placement);
+  const hostCapabilities = normalizeAgentCapabilityTokens(agents.hostCapabilities ?? [], "agents.hostCapabilities")!;
+  if (hostCapabilities.includes("local") || hostCapabilities.length > 32 || hostCapabilities.some(token => token.length > 64)) throw new Error('agents.hostCapabilities must be at most 32 bounded tokens, excluding reserved need "local"');
+  const remotePolicy = agents.remoteSpawnPolicy;
+  let remoteSpawnPolicy: FabricAgentConfig["remoteSpawnPolicy"];
+  if (remotePolicy !== undefined) {
+    if (!remotePolicy || typeof remotePolicy !== "object" || Array.isArray(remotePolicy)) throw new Error("Invalid agents.remoteSpawnPolicy");
+    const policy = remotePolicy as Record<string, unknown>;
+    if (!Array.isArray(policy.writableRoots) || policy.writableRoots.length > 32 || policy.writableRoots.some(root =>
+      typeof root !== "string" || !path.isAbsolute(root) || root.length > 4096) ||
+      (policy.shell !== "deny" && policy.shell !== "unconfined") || !Array.isArray(policy.tools) ||
+      policy.tools.length > 256 || policy.tools.some(tool => typeof tool !== "string" || !tool.trim())) {
+      throw new Error("agents.remoteSpawnPolicy requires absolute writableRoots, shell deny|unconfined, and a tools ceiling");
+    }
+    remoteSpawnPolicy = { writableRoots: [...policy.writableRoots] as string[], shell: policy.shell, tools: [...policy.tools] as string[] };
+  }
   const claude = objectValue(agents.claude);
   const veda = objectValue(agents.veda);
   const capture = objectValue(input.capture);
@@ -1519,6 +1540,8 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
         ? { processSlice: agents.processSlice } : {}),
       processMemoryMaxBytes: processMemoryMaxBytesValue(agents.processMemoryMaxBytes),
       ...(placement ? { placement } : {}),
+      hostCapabilities,
+      ...(remoteSpawnPolicy ? { remoteSpawnPolicy } : {}),
       ...(router ? { router } : {}),
       ...(agentModel ? { model: agentModel } : {}),
       ...(typeof agents.modelRouting === "object" && agents.modelRouting !== null && !Array.isArray(agents.modelRouting)
@@ -2232,6 +2255,8 @@ const resolveFabricConfig = (
       delete agents.processSlice;
       delete agents.processMemoryMaxBytes;
       delete agents.placement;
+      delete agents.hostCapabilities;
+      delete agents.remoteSpawnPolicy;
       delete agents.deadRootFilter; // Host-only: a lane cannot drop the fleet's exemptions.
       delete agents.stuckPreparingMs; // Host-only: a lane cannot silence the stuck-preparing owner notice.
       document.agents = agents;

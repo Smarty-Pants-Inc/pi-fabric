@@ -701,7 +701,7 @@ describe("ParticipantDirectory host leases", () => {
   });
 
   // review/astra F1 on #68: a file-only renewal must not certify that the shared state is
-  // writable; otherwise a live peer blocked behind a held lock reads as departed (#24).
+  // writable; otherwise a retired peer's lapse behind a held lock reads as a confirmed departure (#24).
   it("under the policy, never settle a peer that lapsed behind a held lock, and report the stall", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-topology-"));
     roots.push(root);
@@ -725,10 +725,11 @@ describe("ParticipantDirectory host leases", () => {
     await Promise.all([reader.start(), peer.start()]);
     const seesPeer = () => reader.peers().some((candidate) => candidate.id === "session:peer");
     await vi.waitFor(() => expect(seesPeer()).toBe(true), { timeout: 5_000, interval: 20 });
+    peer.suspend();                                            // retired lifecycle: keep records, stop automatic renewal
     const lockPath = path.join(meshRoot, ".lock");
-    fs.mkdirSync(lockPath, { mode: 0o700 });
-    fs.writeFileSync(path.join(lockPath, "owner"), `stuck\n${process.pid}\n${Date.now()}\n`);
     try {
+      fs.mkdirSync(lockPath, { mode: 0o700 });
+      fs.writeFileSync(path.join(lockPath, "owner"), `stuck\n${process.pid}\n${Date.now()}\n`);
       peerStatus = "running";
       void peer.refresh().catch(() => undefined);                 // renews its file, then blocks
       let result: PeerSettleResult | undefined;
@@ -1951,40 +1952,45 @@ describe("ParticipantDirectory", () => {
     await Promise.all([reader.start(), peer.start()]);
     await vi.waitFor(() => expect(seesPeer(reader)).toBe(true), { timeout: 5_000, interval: 20 });
     await vi.waitFor(() => expect(Date.now() - reader.confirmedAt()).toBeLessThan(40), { timeout: 5_000, interval: 5 });
-    hold();                                                    // right after the reader's last commit
-    const started = Date.now();
-    let result: PeerSettleResult | undefined;
-    void awaitPeerSettle({
-      poll: () => reader.peers(),
-      stalled: () => reader.writeStalled(),
-      confirmedAt: () => reader.confirmedAt(),
-      selector: "session:peer",
-      settledForMs: 60_000,
-      pollMs: 20,
-    }).then((settled) => { result = settled; });
-    // The peer lapses while the reader's own heartbeat is not yet overdue: the plain read omits
-    // it, but peer-settle does not take the absence as a departure.
-    await vi.waitFor(() => expect(seesPeer(reader)).toBe(false), { timeout: 3_000, interval: 10 });
-    expect(reader.writeStalled()).toBeUndefined();
-    // review/astra on a85b2c4: a settle armed now sees no peer at all; it must not succeed either.
-    let late: PeerSettleResult | undefined;
-    void awaitPeerSettle({
-      poll: () => reader.peers(),
-      stalled: () => reader.writeStalled(),
-      confirmedAt: () => reader.confirmedAt(),
-      settledForMs: 60_000,
-      pollMs: 20,
-    }).then((settled) => { late = settled; });
-    await new Promise((resolve) => setTimeout(resolve, 200));
-    expect(result).toBeUndefined();
-    expect(late).toBeUndefined();
-    // Two heartbeat intervals without a commit: the lapse now reads as unknown visibility.
-    await vi.waitFor(() => expect(result).toBeDefined(), { timeout: 5_000, interval: 20 });
-    expect(result).toEqual({ ok: false, error: expect.stringMatching(/1 peer lease lapsed while this host's heartbeat has not committed/) });
-    expect(reader.writeStalled()?.message).toMatch(/^Fabric mesh is write-stalled: 1 peer lease lapsed/);
-    await vi.waitFor(() => expect(late).toEqual({ ok: false, error: expect.stringMatching(/peer lease lapsed/) }), { timeout: 2_000, interval: 20 });
-    expect(Date.now() - started).toBeLessThan(5_000);          // long before the 10 s lock timeout
-    release();
+    peer.suspend();                                            // retired lifecycle: keep records, stop automatic renewal
+    try {
+      hold();                                                  // right after the reader's last commit
+      const started = Date.now();
+      let result: PeerSettleResult | undefined;
+      void awaitPeerSettle({
+        poll: () => reader.peers(),
+        stalled: () => reader.writeStalled(),
+        confirmedAt: () => reader.confirmedAt(),
+        selector: "session:peer",
+        settledForMs: 60_000,
+        pollMs: 20,
+      }).then((settled) => { result = settled; });
+      // The retired peer lapses while the reader's own heartbeat is not yet overdue: the plain read
+      // omits it, but peer-settle does not take the absence as a departure.
+      await vi.waitFor(() => expect(seesPeer(reader)).toBe(false), { timeout: 3_000, interval: 10 });
+      expect(reader.writeStalled()).toBeUndefined();
+      // review/astra on a85b2c4: a settle armed now sees no peer at all; it must not succeed either.
+      let late: PeerSettleResult | undefined;
+      void awaitPeerSettle({
+        poll: () => reader.peers(),
+        stalled: () => reader.writeStalled(),
+        confirmedAt: () => reader.confirmedAt(),
+        settledForMs: 60_000,
+        pollMs: 20,
+      }).then((settled) => { late = settled; });
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      expect(result).toBeUndefined();
+      expect(late).toBeUndefined();
+      // Two heartbeat intervals without a commit: the lapse now reads as unknown visibility.
+      await vi.waitFor(() => expect(result).toBeDefined(), { timeout: 5_000, interval: 20 });
+      expect(result).toEqual({ ok: false, error: expect.stringMatching(/1 peer lease lapsed while this host's heartbeat has not committed/) });
+      expect(reader.writeStalled()?.message).toMatch(/^Fabric mesh is write-stalled: 1 peer lease lapsed/);
+      await vi.waitFor(() => expect(late).toEqual({ ok: false, error: expect.stringMatching(/peer lease lapsed/) }), { timeout: 2_000, interval: 20 });
+      expect(Date.now() - started).toBeLessThan(5_000);          // long before the 10 s lock timeout
+    } finally {
+      release();
+      peer.resume();
+    }
     await vi.waitFor(() => expect(seesPeer(reader)).toBe(true), { timeout: 5_000, interval: 20 });
     await vi.waitFor(() => expect(reader.writeStalled()).toBeUndefined(), { timeout: 5_000, interval: 20 });
   }, 20_000);

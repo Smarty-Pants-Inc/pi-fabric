@@ -688,9 +688,7 @@ type HostLeaseOwner = { id: string; rootId: string; identity: { id: string }; in
 
 const matchingHostLease = (leases: ReadonlyMap<string, FabricHostLease>, host: HostLeaseOwner): FabricHostLease | undefined => {
   const lease = leases.get(host.id);
-  return lease && lease.rootId === host.rootId && lease.identityId === host.identity.id &&
-    (host.incarnationToken !== undefined ? lease.incarnationToken === host.incarnationToken :
-      (lease.startedAt === undefined || host.startedAt === undefined || lease.startedAt === host.startedAt)) ? lease : undefined;
+  return hostLeaseMatches(lease, host) ? lease : undefined;
 };
 
 /** Mirror provenance is accepted only for this host's current identity and incarnation. */
@@ -700,6 +698,13 @@ export const hostMirrorLease = (leases: ReadonlyMap<string, FabricHostLease>, ho
 };
 
 /** Matching identity and incarnation only; an old file cannot revive a takeover. */
+export const hostLeaseMatches = (
+  lease: FabricHostLease | undefined,
+  host: { id: string; rootId: string; identity: { id: string }; incarnationToken?: string; startedAt?: number },
+): boolean => !!lease && lease.id === host.id && lease.rootId === host.rootId && lease.identityId === host.identity.id &&
+  (host.incarnationToken !== undefined ? lease.incarnationToken === host.incarnationToken :
+    (lease.startedAt === undefined || host.startedAt === undefined || lease.startedAt === host.startedAt));
+
 export const hostLiveness = (
   leases: ReadonlyMap<string, FabricHostLease>,
   host: HostLeaseOwner,

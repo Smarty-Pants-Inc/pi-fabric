@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -253,13 +254,12 @@ describe.skipIf(process.platform === "win32")("without a traversable fd base (da
   it.skipIf(!stickyTmp || stickyTmp.uid !== 0 || (stickyTmp.mode & 0o1000) === 0)(
     "refuses a tree under a shared sticky ancestor (/tmp) before creating anything, so no swap can redirect it", async () => {
       const { mkdirPrivate, privateDirTestHooks } = await darwin(false);
-      const root = fs.mkdtempSync("/tmp/fabric-darwin-sticky-"); roots.push(root);
+      const target = path.join("/tmp", `fabric-darwin-sticky-${randomBytes(8).toString("hex")}`);
       const swaps: string[] = [];
       privateDirTestHooks.beforeCreate = (directory) => { swaps.push(directory); }; // where an injected swap would land
-      const target = path.join(root, "a", "run");
       expect(() => mkdirPrivate(target)).toThrow(/\/tmp is a shared sticky directory .*\$HOME or the per-user \$TMPDIR/);
       expect(swaps).toEqual([]); // the walk never reached a create
-      expect(fs.existsSync(path.join(root, "a"))).toBe(false);
+      expect(fs.existsSync(target)).toBe(false);
     });
 
   it("accepts a tree whose ancestors are root's (not shared-sticky) or ours: the per-user $TMPDIR layout", async () => {

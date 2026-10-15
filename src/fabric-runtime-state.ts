@@ -18,6 +18,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { FabricActivityStore } from "./activity/store.js";
 import { ActorDirectory, haltEvery } from "./actors/directory.js";
+import { ActorSlotRecoveryParkedError } from "./actors/slot-recovery.js";
 import type { ActorModelRouteInput } from "./actors/manager.js";
 import { resolvePiBinary } from "./agents/pi-binary.js";
 import { isPiShellRef } from "./core/pi-tools.js";
@@ -1525,6 +1526,12 @@ export class FabricRuntimeState {
         firstSeenAgents,
       ),
     );
+    // Reconcile both scopes before actor publication or control/mesh input.
+    try { await this.#actors.recoverProtectedActors(); }
+    catch (error) {
+      if (!(error instanceof ActorSlotRecoveryParkedError)) throw error;
+      console.warn(`[pi-fabric] ${this.#actors.slotRecoveryStatus().error?.message}`);
+    }
     this.#participants.registerSource(() =>
       this.#actors!.listOwned(true).map((actor) =>
         actorParticipantRecord(actor, mainAgentId, hostId, identity.id, identity.id),

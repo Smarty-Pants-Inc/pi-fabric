@@ -241,11 +241,19 @@ export function normalizeActorActivation(value: unknown): FabricActorActivationP
   return { minIntervalMs };
 }
 
+/** Exact authoritative claim revision, never a request-supplied caller identity. */
+export interface FabricActorSlotClaim {
+  key: string;
+  ifVersion: number;
+}
+
 /** Public creation input; file instructions are resolved only by the actor owner. */
 export type FabricActorCreateRequest = Omit<FabricActorRequest, "instructions"> & import("./instructions-file.js").FabricActorInstructionsSource;
 export interface FabricActorRequest {
-  /** Resident-host create deduplication key; reuse on retry (host-local, bounded retention). */
+  /** Stable creation retry identity; mandatory for enforced protected slot births. */
   idempotencyKey?: string;
+  /** Exact revision won by the authenticated Main on the native slot authority. */
+  slotClaim?: FabricActorSlotClaim;
   /** Storage and visibility boundary. Defaults to mesh.actorScope for compatibility. */
   scope?: FabricActorStorageScope;
   name: string;

@@ -190,6 +190,8 @@ then import. The details:
 - **Rollback:** it retires the stream and exports the projection through the `state.json`
   encoder into `state.json.nats-rollback-<E+2>-<uuid>.tmp`. It reads the temp back, checks the digest
   and renames it over the marker. A rerun redoes the export, or only verifies after the rename.
+  Both normal completion and a converged rerun remove this rolled-back switch's own intent, so a new import chooses
+  a new stream. An intent naming another staged switch is left intact.
   The CLI's `rollback --stream S` stays validated against the root (`natsStreamName(root)` or its per-switch
   `natsStreamName(root)_<switch id>`) and is mapped to the migration's switch id: a per-switch name selects its id, the
   fixed-root name selects no id (the earlier layout). With a marker present, an `S` that is not the marker's stream
@@ -201,8 +203,10 @@ then import. The details:
   import (`state.json.nats-intent`), leftovers without a marker, a partial, truncated or malformed marker, a marker for
   another root's stream, and any unreadable entry (its own error, e.g. EACCES). The decision is rechecked after the
   stream is opened (same kind, stream and root `dev:ino`); an existing root is rechecked and registered under the
-  migration fence, an absent root is never created. A change (file state appearing during the await) closes the backend
-  and refuses, with nothing registered.
+  migration fence, an absent root is never created. An observed change closes the backend and refuses, with nothing
+  registered. This recheck is not a durable file-side fence: a concurrent or later file writer can still race the
+  fresh-root bootstrap (known inherited gap smarty-dev#13524). Do not run a file writer and a NATS backend on the
+  same empty root until that durable fence is implemented.
 - **Fixed-root preflight:** before a new import writes its intent or a stream, the root's fixed-root stream is
   checked: if it exists and is not retired (live state of a bootstrapped root), the import refuses rather than fork it.
   An absent or retired fixed-root stream lets the new switch begin.
@@ -220,16 +224,18 @@ then import. The details:
     the proof-only path. The proof binds the switch id, S, its creation time, the head, the full digest and the
     target (`cluster-or-server/domain/account`, the account from `$SYS.REQ.USER.INFO`).
   - The preflight refuses only readers no proof can fix. A stopped projector deletes its consumer at once.
-  - `--abandon` deletes exactly the intent's unfinished S and the intent.
+  - `--abandon` deletes exactly the intent's unfinished S and the intent. A present state.json must be readable,
+    unambiguous file state: malformed markers, truncated/invalid state and unreadable state refuse before any stream
+    inspection or deletion. An absent state.json is allowed for a crash before the source read.
   - The gate checks the binding even when no reader is required: S must be this root's stream
     (`isNatsStreamForRoot`), the server must report the target account, and S's `import-begin` must carry the
     challenge nonce (an import begun without one is abandoned and redone).
   - A rerun after the marker reopens the gate: before `import-commit` it checks again; a finished commit only
-    converges (verified, no commit, no check). A malformed NATS marker refuses `import --to nats` and `rollback`.
+    converges (verified, no commit, no check). A malformed NATS marker refuses `import --to nats`, `--abandon` and `rollback`.
   - `rollback` of a NATS root is ungated and recorded. Its `--stream S` (only to verify a finished rollback, once
     the marker is gone) must be this root's stream and needs `--nats-server`; any other stream is a usage error (exit 2).
   - `--stream` is accepted only by `reader-proof --backend nats` and `rollback`, always root-bound.
-  - A root opens only the stream its marker names (`create: false`); reads refuse while S is importing.
+  - A marked root opens only the stream its marker names (`create: false`); reads refuse while S is importing.
 - **Deployment gate (pi-fabric#907):** before a fleet root moves, the install's nats-server ACLs let only
   credentialed fleet hosts publish to and purge or delete the state streams, and allow `$SYS.REQ.USER.INFO`.
   Owner: fabric-store.

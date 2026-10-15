@@ -571,7 +571,8 @@ export class FabricControlPlane {
     }
   }
 
-  #cachedRelayAcknowledgement(commandId: string, pending: PendingControlRequest): OwnerAcknowledgement | undefined {
+  #cachedRelayAcknowledgement(commandId: string, pending: ControlAcknowledgementAuthority &
+    Pick<PendingControlRequest, "idempotencyKey" | "bodyFingerprint">): OwnerAcknowledgement | undefined {
     this.#pruneRelayAcknowledgements();
     const key = relayAcknowledgementKey(commandId, pending.idempotencyKey);
     const entry = this.#relayAcknowledgements.get(key);
@@ -957,7 +958,15 @@ export class FabricControlPlane {
         Math.max(0, (this.options.now ?? Date.now)() - current.expiresAt));
       return current;
     };
-    if (mirroredOwner) {
+    // A validated receipt needs no publication or renewed lease. Authenticate it against
+    // this request's owner/epoch/link first; cache misses retain the ordinary admission below.
+    const cachedAtAdmission = this.#cachedRelayAcknowledgement(commandId, {
+      ownerHostId, ownerIdentityId, ownerIncarnation, targetId, idempotencyKey, bodyFingerprint,
+      ...(destinationRemoteHost !== undefined ? { destinationRemoteHost } : {}),
+      ...(mirroredOwner ? { mirroredOwner } : {}),
+    });
+    if (cachedAtAdmission && mirroredOwner && !readMirror()) throw unavailable(mirroredOwner.remoteHost);
+    if (mirroredOwner && !cachedAtAdmission) {
       const status = mirroredOwnerRoutingStatus(mirroredOwner, (this.options.now ?? Date.now)());
       if (status === "lease-stale") throw rootGone(mirroredOwner.remoteHost);
       if (status === "bridge-stale") mirroredOwner = await renewMirror(mirroredOwner);
@@ -1022,7 +1031,7 @@ export class FabricControlPlane {
       // Use the ordinary settlement path, including its single clear/timer/abort cleanup.
       let cached: OwnerAcknowledgement | undefined;
       try {
-        cached = this.#cachedRelayAcknowledgement(commandId, pending);
+        cached = cachedAtAdmission ?? this.#cachedRelayAcknowledgement(commandId, pending);
       } catch (error) {
         // No publication, timer, lease watchdog or abort listener on a local conflict.
         skipPublication = true;

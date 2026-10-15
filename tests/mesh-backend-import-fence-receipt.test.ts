@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { readPhysicalHostIdentity, type StaleLockNote } from "../src/core/atomic-write.js";
 import { ownPidNamespace } from "../src/core/pid-namespace.js";
 import { meshBackendStatus } from "../src/mesh/backend-migration.js";
@@ -19,7 +19,11 @@ import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 
 const identity: MeshIdentity = { id: "tester", name: "tester", kind: "agent" };
 const dirs: string[] = [];
-afterEach(() => { for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true }); });
+afterEach(() => {
+  vi.restoreAllMocks();
+  vi.unstubAllEnvs();
+  for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
+});
 
 const fileRoot = async (): Promise<string> => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-import-fence-"));
@@ -118,8 +122,8 @@ const placeTickets = (root: string, pid: number): { own: string; other: string }
 
 interface Forged { mesh: string; custody: string; receipt: Record<string, unknown> }
 /** Residue as a killed protocol-1 import leaves it, with its receipt; `patch` alters the receipt only. */
-const forge = async (root: string, pid: number, patch: Record<string, unknown> = {}): Promise<Forged> => {
-  const mesh = `${MESH_TOKEN}\n${pid}\n${Date.now()}\n`;
+const forge = async (root: string, pid: number, patch: Record<string, unknown> = {}, ownerProtocol: 1 | 2 = 1): Promise<Forged> => {
+  const mesh = `${MESH_TOKEN}\n${pid}\n${Date.now()}\n${ownerProtocol === 2 ? "123456\n" : ""}`;
   const custody = `66666666-7777-4888-8999-aaaaaaaaaaaa\n${pid}\n${Date.now()}\n`;
   for (const [lock, owner] of [[".lock", mesh], ["custody.lock", custody]] as const) {
     fs.mkdirSync(path.join(root, lock), { mode: 0o700 });
@@ -248,6 +252,65 @@ describe.skipIf(!linuxIdentity)("smarty-dev#9501 killed import fence receipt", (
     expect(queueNames(root)).toEqual(queued);
     expect(lockOwner(root)).toBe(mesh);
     expect(deadFences(root)).toEqual([]);
+  }, 30_000);
+
+  // Trust-boundary/data-safety regression: the mutable receipt is not authority for a legacy holder's namespace.
+  it.each([1, 2] as const)("a forged local receipt cannot detach a LIVE foreign namespace-less protocol-%s holder invisible here", async protocol => {
+    const root = await fileRoot();
+    const pid = process.ppid;
+    const kill = process.kill.bind(process);
+    expect(kill(pid, 0)).toBe(true); // a genuinely live holder; only this namespace's view is injected below
+    const { mesh, custody } = await forge(root, pid, {}, protocol);
+    placeTickets(root, pid);
+    const queued = queueNames(root);
+    const state = fs.readFileSync(path.join(root, "state.json"));
+    // Like mesh-lock-namespace's looksDead seam: a live foreign PID answers ESRCH in the recovering namespace.
+    vi.spyOn(process, "kill").mockImplementation(((target: number, signal?: string | number) => {
+      if (target === pid && signal === 0) throw Object.assign(new Error("foreign pid invisible here"), { code: "ESRCH" });
+      return kill(target, signal as never);
+    }) as typeof process.kill);
+    expect.soft(await recoverKilledImportLock(root, protocol)).toBeUndefined();
+    const rerun = await cli(["import", "--root", root, "--lock-protocol", String(protocol)]);
+    expect(rerun.code, rerun.err).toBe(3);
+    expect(rerun.err).toContain("fabric@unknown");
+    expect(lockOwner(root)).toBe(mesh);
+    expect(lockOwner(root, "custody.lock")).toBe(custody);
+    expect(queueNames(root)).toEqual(queued);
+    expect(deadFences(root)).toEqual([]);
+    expect(fs.existsSync(path.join(root, "state.db"))).toBe(false);
+    expect(fs.readFileSync(path.join(root, "state.json")).equals(state)).toBe(true);
+    expect(kill(pid, 0)).toBe(true);
+  }, 30_000);
+
+  it.each([1, 2] as const)("a DEAD namespace-less protocol-%s holder with a matching receipt still needs the explicit override", async protocol => {
+    const root = await fileRoot();
+    const pid = await deadPid();
+    const { mesh, custody } = await forge(root, pid, {}, protocol);
+    placeTickets(root, pid);
+    const queued = queueNames(root);
+    const state = fs.readFileSync(path.join(root, "state.json"));
+    const rerun = await cli(["import", "--root", root, "--lock-protocol", String(protocol)]);
+    expect(rerun.code, rerun.err).toBe(3);
+    expect(rerun.err).toContain("fabric@unknown");
+    expect(rerun.err).not.toContain("recovered the mesh .lock");
+    expect(lockOwner(root)).toBe(mesh);
+    expect(lockOwner(root, "custody.lock")).toBe(custody);
+    expect(queueNames(root)).toEqual(queued);
+    expect(deadFences(root)).toEqual([]);
+    expect(fs.existsSync(path.join(root, "state.db"))).toBe(false);
+    expect(fs.readFileSync(path.join(root, "state.json")).equals(state)).toBe(true);
+  }, 30_000);
+
+  it.each([1, 2] as const)("--accept-unready fabric@unknown imports a verified-dead legacy protocol-%s holder without losing state", async protocol => {
+    const root = await fileRoot();
+    await forge(root, await deadPid(), {}, protocol);
+    vi.stubEnv("PI_FABRIC_MESH_ALARM_TO", "session:0a1b2c3d-0000-4000-8000-00000000c943");
+    const rerun = await cli(["import", "--root", root, "--lock-protocol", String(protocol), "--accept-unready", "fabric@unknown"]);
+    expect(rerun.code, rerun.err).toBe(0);
+    expect((await meshBackendStatus(root)).backend).toBe("sqlite");
+    const store = new MeshStore(root, 64 * 1024, 1_000, { stateBackend: "sqlite" });
+    try { expect(store.get("seed/a")?.value).toEqual({ n: 1 }); }
+    finally { store.closeState(); }
   }, 30_000);
 
   it("recovers a dead receipt-matched owner, and only it", async () => {

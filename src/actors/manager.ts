@@ -2036,24 +2036,27 @@ export class ActorManager {
       if (fs.existsSync(actor.sessionFile)) {
         if (this.#hasSessionHeader(actor.sessionFile)) return;
         const stamp = new Date().toISOString().replace(/[-:.]/g, "");
-        archived = `${actor.sessionFile}.${stamp}.${randomUUID()}.orphan-noheader.bak`;
-        fs.renameSync(actor.sessionFile, archived);
+        const orphan = `${actor.sessionFile}.${stamp}.${randomUUID()}.orphan-noheader.bak`;
+        fs.renameSync(actor.sessionFile, orphan);
+        archived = orphan;
       }
       writeJsonAtomic(actor.sessionFile, {
         type: "session", version: 3, id: randomUUID(),
         timestamp: new Date().toISOString(), cwd: this.agents.cwd,
       }, { newline: true, durable: this.#persistent });
     } catch (error) {
-      this.#sessionAlarm(actor, "error", archived, error instanceof Error ? error.message : String(error));
+      this.#sessionAlarm(actor, "error", archived !== undefined);
       throw error;
     }
-    if (archived) this.#sessionAlarm(actor, "repaired", archived);
+    if (archived) this.#sessionAlarm(actor, "repaired", true);
   }
 
-  #sessionAlarm(actor: ManagedActor, outcome: "repaired" | "error", archived?: string, error?: string): void {
-    const text = `Fabric host notice: actor ${actor.name} session ${outcome === "repaired" ? "repaired (no valid header)" : "repair failed"}; ` +
-      `${archived ? `orphan preserved at ${archived}` : "no orphan archive"}${error ? `; ${error.split("\n")[0]}` : ""}.`;
-    const data = { actorId: actor.id, sessionFile: actor.sessionFile, archived, ...(error ? { error } : {}) };
+  #sessionAlarm(actor: ManagedActor, outcome: "repaired" | "error", archived: boolean): void {
+    const reason = actorAlarmReason("error");
+    const text = `Fabric host notice: actor ${actor.name} (${actor.id}) session ${outcome === "repaired" ? "repaired" : "repair failed"} (no valid header); ` +
+      `reason: ${reason}; ${archived ? "orphan preserved" : "no orphan archive"}. ` +
+      `Inspect it with agents.actorStatus({ id: ${JSON.stringify(actor.id)} }) and agents.log; repair or recreate it if needed.`;
+    const data = { actorId: actor.id, reason, status: outcome, archived };
     const message: FabricActorMessage = {
       id: randomUUID(), actorId: actor.id, actorName: actor.name, direction: "out",
       source: "fabric-host", createdAt: Date.now(), action: "message", text, data,
@@ -4326,7 +4329,7 @@ export class ActorManager {
                 data: { contextOverflow: { retry: false, toolCalls: result.toolCalls, runId: result.id, error: result.error, eventRef: actorEventRef(item) } },
               });
             }
-            if (contextOverflow) this.#publishActivationOverflow(actor, item, result.id, result.error ?? "");
+            if (contextOverflow) this.#publishActivationOverflow(actor, item, result.id);
             if (actor.responseMode === "directive") {
               // A failed directive run is non-fatal: stay silent and keep the
               // actor ambient instead of erroring out. Record the run error for
@@ -4659,7 +4662,7 @@ export class ActorManager {
 
   // smarty-dev#3238: an event that overflowed a fresh session gets no verdict. Say so explicitly, once,
   // on the actor's own output path, so its owner or the factory can report it where the event came from.
-  #publishActivationOverflow(actor: ManagedActor, item: ActorQueueItem, runId: string | undefined, error: string): void {
+  #publishActivationOverflow(actor: ManagedActor, item: ActorQueueItem, runId: string | undefined): void {
     const eventRef = actorEventRef(item);
     const where = eventRef.pr !== undefined ? ` for PR ${eventRef.repository ? `${eventRef.repository}#` : "#"}${eventRef.pr}`
       : eventRef.topic ? ` for ${eventRef.topic}${eventRef.kind ? ` ${eventRef.kind}` : ""}` : "";
@@ -4669,7 +4672,7 @@ export class ActorManager {
       from: { id: actor.id, name: actor.name, kind: "actor", sessionId: this.sessionId },
       text: `${actor.name}: ${ACTOR_ACTIVATION_OVERFLOW_REASON}${where}.`,
       data: { actorId: actor.id, actorName: actor.name, eventRef, reason: ACTOR_ACTIVATION_OVERFLOW_REASON,
-        ...(runId ? { runId } : {}), error: (error.split("\n").map((line) => line.trim()).find(Boolean) ?? error).slice(0, 300) },
+        ...(runId ? { runId } : {}), error: actorAlarmReason("context-overflow") },
     }).catch(() => undefined);
   }
 
@@ -5557,16 +5560,16 @@ export class ActorManager {
     if (last !== undefined && now - last < ACTOR_DEAD_LETTER_ALARM_MS) return;
     this.#deadLetterAlarms.set(actor.id, now);
     const text = `Fabric host notice: actor ${actor.name} is not keeping up: its queue (${this.meshConfig.actorQueueLimit}) and overflow ` +
-      `(${this.#overflowCap()}) are full, so ${count} further routed event(s) wait in its dead-letter file ${file}. ` +
+      `(${this.#overflowCap()}) are full, so ${count} further routed event(s) wait in its dead-letter backlog. ` +
       `They re-queue automatically once its queue drains below half; other actors are not held. ` +
       `Inspect it with agents.actorStatus({ id: ${JSON.stringify(actor.id)} }) and agents.log.`;
     const notice: FabricActorMessage = {
       id: randomUUID(), actorId: actor.id, actorName: actor.name, direction: "out", source: "fabric-host",
-      createdAt: now, action: "message", text, data: { reason: "dead_letter", deadLetters: count, file },
+      createdAt: now, action: "message", text, data: { reason: "dead_letter", deadLetters: count },
     };
     this.#recordMessage(actor, notice);
     void this.mesh.publish({ topic: "ops.owner", kind: "actor.alarm", from: this.identity, to: actor.rootId,
-      text, data: { actorId: actor.id, reason: "dead_letter", deadLetters: count, file } }).catch(() => undefined);
+      text, data: { actorId: actor.id, reason: "dead_letter", deadLetters: count } }).catch(() => undefined);
     try {
       this.onDeliver({ actor: this.#alarmInfo(actor), message: notice, delivery: "followUp", triggerTurn: true });
     } catch { /* best effort: the notice stays in the actor's messages */ }

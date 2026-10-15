@@ -175,8 +175,15 @@ describe("durable explicit-stop recovery", () => {
       const stopping = manager.stop(handle.id);
       await called;
       const directory = path.join(root, handle.id);
-      expect(JSON.parse(fs.readFileSync(path.join(directory, "archive-pending.json"), "utf8")))
-        .toMatchObject({ stopIntent: { reason: "explicit" } });
+      const receipt = JSON.parse(fs.readFileSync(path.join(directory, "archive-pending.json"), "utf8"));
+      expect(receipt).toMatchObject({ stopIntent: {
+        reason: "explicit", recoveryRecord: {
+          id: handle.id, status: "running", sessionId: String(oldPid), processStartTime: "1",
+        },
+      } });
+      const recoveryRecord = receipt.stopIntent.recoveryRecord as Record<string, unknown>;
+      expect(Object.hasOwn(recoveryRecord, "task")).toBe(false);
+      expect(Object.hasOwn(recoveryRecord, "stopIntent")).toBe(false);
       expect(fs.existsSync(path.join(directory, "unresolved-worker.json"))).toBe(false);
 
       const recovered = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents }, {
@@ -298,6 +305,12 @@ describe("durable explicit-stop recovery", () => {
       const stopping = manager.stop(handle.id);
       const receipt = JSON.parse(fs.readFileSync(path.join(directory, "archive-pending.json"), "utf8"));
       expect(receipt).toMatchObject({ stopIntent: { reason: "explicit" } });
+      const recoveryRecord = receipt.stopIntent.recoveryRecord as Record<string, unknown>;
+      expect(recoveryRecord).toMatchObject({ id: handle.id, status: "running" });
+      expect(Object.hasOwn(recoveryRecord, "sessionId")).toBe(false);
+      expect(Object.hasOwn(recoveryRecord, "processStartTime")).toBe(false);
+      expect(Object.hasOwn(recoveryRecord, "task")).toBe(false);
+      expect(Object.hasOwn(recoveryRecord, "stopIntent")).toBe(false);
       const recovered = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents }, {
         workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root,
       });

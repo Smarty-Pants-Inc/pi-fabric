@@ -3546,7 +3546,7 @@ export class AgentManager {
 
   /** A pending replacement has NO proven identity, even when the old attempt's pid is known. */
   #persistStopIntent(managed: ManagedAgent, reason: "explicit" | "deadline", attemptKnown = !managed.relaunchPending): void {
-    const recoveryRecord: Record<string, unknown> = { ...failedRecord(managed, "stopped", "Agent stopped"), status: "running" };
+    const recoveryRecord: Record<string, unknown> = { ...omitRetainedTasks(failedRecord(managed, "stopped", "Agent stopped")), status: "running" };
     delete recoveryRecord.sessionId;
     delete recoveryRecord.processStartTime;
     delete recoveryRecord.finishedAt;

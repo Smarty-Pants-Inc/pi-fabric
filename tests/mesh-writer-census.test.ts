@@ -632,12 +632,12 @@ describe("mesh writer census", () => {
       setup: mesh => { fs.mkdirSync(path.join(mesh, ".writer-census")); fs.writeFileSync(path.join(mesh, ".writer-census", "torn.json"), "{\"format\":1,\"pid\""); } },
     { label: "a live writer's record write still in flight", reportsUnknown: true,
       setup: mesh => { fs.mkdirSync(path.join(mesh, ".writer-census")); fs.writeFileSync(`${ownRecord(mesh)}.0123456789abcdef.tmp`, "{"); } },
-    { label: "a dead writer's torn temporary (verified removal or retained unknown)", reportsUnknown: process.platform !== "linux",
+    { label: "a dead writer's torn temporary (removed)", reportsUnknown: false,
       setup: mesh => {
         fs.mkdirSync(path.join(mesh, ".writer-census"));
         fs.writeFileSync(path.join(mesh, ".writer-census", `${censusRecordFileName(os.hostname(), deadPid(), 1)}.0123456789abcdef.tmp`), "{");
       },
-      check: (_, mesh) => expect(fs.readdirSync(path.join(mesh, ".writer-census"))).toHaveLength(process.platform === "linux" ? 0 : 1) },
+      check: (_, mesh) => expect(fs.readdirSync(path.join(mesh, ".writer-census"))).toEqual([]) },
     { label: "clock skew: a live writer's wall-clock start an hour off is not proof of death", reportsUnknown: false,
       setup: mesh => { writeRecord(mesh, { pid: process.pid, host: os.hostname(), startedAt: ownStartedAt() - 3_600_000,
         ...(process.platform === "linux" ? incarnation() : {}) }); },

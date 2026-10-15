@@ -12,12 +12,16 @@
  *   outside the current user, SYSTEM, Administrators or TrustedInstaller may contain only READ_CONTROL, SYNCHRONIZE
  *   and FILE_READ_ATTRIBUTES, including inherit-only grants. Only CREATOR OWNER inherit-only is excepted: every
  *   other ACE must still pass, so no foreign user can add a child or write. CREATOR GROUP has no exception.
- * - ancestors: owned by one of those trusted SIDs; a foreign grant that applies to the ancestor itself may add
+ * - ancestors: owned by one of those trusted SIDs, or by LocalService (S-1-5-19) or NetworkService (S-1-5-20)
+ *   as owner-only exceptions; these service SIDs are never trusted as DACL trustees. A foreign grant that applies
+ *   to the ancestor itself may add
  *   files or subdirectories (the sticky analogue: C:\ grants Authenticated Users AD) and nothing else, so nobody
  *   else can delete, rename, re-ACL or take over a component. Inherit-only grants (CREATOR OWNER among them) are
  *   skipped on ordinary ancestors because they are not the ancestor's own access. A directory immediately used to
  *   create a missing component is stricter: foreign inheritable write/full/modify/delete grants are refused before
- *   that component is made visible; CREATOR OWNER remains the explicit safe inheritance exception.
+ *   that component is made visible; CREATOR OWNER remains the explicit safe inheritance exception. Owner admission
+ *   is not isolation from a service: an admitted owner can WRITE_DAC and re-ACL its ancestor (R-SERVICE-OWNER-REACL;
+ *   lead-owned follow-up issue/link pending).
  * - a root this process just created (a non-recursive mkdir that succeeded) gets, through the built-in icacls, an
  *   explicit owner (the current user) and a protected DACL: current user and SYSTEM full control, (OI)(CI); it is read
  *   back in the same child. An existing root is never repaired or adopted.
@@ -34,6 +38,11 @@ const TRUSTED_SIDS = new Set([
   "S-1-5-18", // LocalSystem
   "S-1-5-32-544", // Built-in Administrators
   "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464", // TrustedInstaller
+]);
+// Owner-only ancestor admission. Keep this separate from TRUSTED_SIDS: these SIDs never become trusted trustees.
+const SERVICE_OWNER_SIDS = new Set([
+  "S-1-5-19", // LocalService
+  "S-1-5-20", // NetworkService
 ]);
 const ADMINISTRATORS = "S-1-5-32-544";
 // Strict targets permit foreign metadata access only: READ_CONTROL, SYNCHRONIZE, FILE_READ_ATTRIBUTES.
@@ -154,6 +163,12 @@ const warnUnverified = (root: string, error: unknown): void => {
 
 const record = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value);
 const uint32 = (value: unknown): value is number => typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 0xffffffff;
+const malformedAceRefusal = (target: string, ace: unknown, ordinal: number): string => {
+  const context = [`ordinal ${ordinal}`];
+  if (record(ace) && typeof ace.sid === "string" && SID.test(ace.sid)) context.push(`trustee ${ace.sid}`);
+  if (record(ace) && uint32(ace.mask)) context.push(`mask 0x${ace.mask.toString(16)}`);
+  return `${target} has an unsupported or unproven ACE (${context.join(", ")})`;
+};
 
 const ancestorsOf = (dir: string): string[] => {
   const chain: string[] = [];
@@ -222,6 +237,7 @@ export const windowsStateAclRefusal = (request: WindowsStateAclRequest, run: Win
     const entry: unknown = snapshot.entries[index];
     if (!record(entry) || entry.path !== target) return `${target} has an invalid Windows ACL snapshot entry`;
     const strict = role !== "ancestor" && role !== "creation-parent";
+    const ancestorRole = role === "ancestor" || role === "creation-parent";
     if (entry.missing === true) {
       if (role === "file" || role === "directory") continue;
       return `${target} vanished while its Windows ACL was read`;
@@ -237,35 +253,69 @@ export const windowsStateAclRefusal = (request: WindowsStateAclRequest, run: Win
           + "set the mesh state root to a path with no junctions or symbolic links in it";
     }
     if (strict && directory !== (role !== "file")) return `${target} is not a ${role === "file" ? "regular file" : "directory"}`;
-    if (typeof entry.owner !== "string" || !SID.test(entry.owner)) return `${target} has an unproven owner`;
+    const diagnostics: string[] = [];
+    let ownerFailure = false;
+    const owner = typeof entry.owner === "string" && SID.test(entry.owner) ? entry.owner : undefined;
+    const ownerProven = owner !== undefined;
+    if (!ownerProven) {
+      const reason = `${target} has an unproven owner`;
+      if (strict) return reason;
+      diagnostics.push(reason);
+      ownerFailure = true;
+    }
     const protectedRoot = role === "root" && request.protect === true;
-    const owned = role === "ancestor" || role === "creation-parent" ? trusted(entry.owner)
-      : protectedRoot ? entry.owner === user
-      : entry.owner === user || (entry.owner === ADMINISTRATORS && tokenOwner === ADMINISTRATORS);
+    const owned = owner !== undefined && (ancestorRole ? trusted(owner) || SERVICE_OWNER_SIDS.has(owner)
+      : protectedRoot ? owner === user
+      : owner === user || (owner === ADMINISTRATORS && tokenOwner === ADMINISTRATORS));
     if (!owned) {
-      return `${target} is owned by ${entry.owner}, not ${role === "ancestor" || role === "creation-parent" ? "the current user, SYSTEM, Administrators or TrustedInstaller"
-        : protectedRoot ? `the current user ${user}, which it was just given` : `the current user ${user} (or Administrators on an elevated run)`}`;
+      const ownerReason = owner !== undefined
+        ? `${target} is owned by ${owner}, not ${ancestorRole ? "the current user, SYSTEM, Administrators or TrustedInstaller"
+          : protectedRoot ? `the current user ${user}, which it was just given` : `the current user ${user} (or Administrators on an elevated run)`}`
+        : undefined;
+      if (strict) return ownerReason!;
+      const reason = ownerReason && owner !== undefined ? `${ownerReason}; owner: ${owner}` : ownerReason;
+      if (!ownerFailure && reason) diagnostics.push(reason);
+      ownerFailure = true;
     }
     if (role === "root" && request.protect && (entry.control & SE_DACL_PROTECTED) === 0) return `${target} still inherits its ACL after it was made private`;
-    if (!Array.isArray(entry.dacl)) return `${target} has a null or unproven DACL (everyone has full control)`;
-    for (const ace of entry.dacl as unknown[]) {
-      if (!record(ace) || (ace.type !== 0 && ace.type !== 1) || !uint32(ace.flags) || (ace.flags & ~0x1f) !== 0
-        || typeof ace.sid !== "string" || !SID.test(ace.sid) || !uint32(ace.mask)) return `${target} has an unsupported or unproven ACE`;
-      if (ace.type === 1 || trusted(ace.sid) || (role === "creation-parent" && ace.sid === "S-1-3-0")) continue;
-      // CO IO expands to the child's trusted creator. Skip only this ACE, never the remaining DACL: every other
-      // foreign allow is metadata-only on strict targets, proving no foreign add-child/write regardless of ACE order
-      // or deny ACEs. Every other inherit-only grant is judged too, including CREATOR GROUP. Ordinary ancestors skip
-      // IO access; a creation parent instead refuses foreign inheritable writes before a new component is visible.
-      if (strict && ace.sid === "S-1-3-0" && (ace.flags & INHERIT_ONLY) !== 0) continue;
-      const inheritable = (ace.flags & 0x0b) !== 0; // OBJECT_INHERIT | CONTAINER_INHERIT | INHERIT_ONLY
-      if (role === "ancestor" && (ace.flags & INHERIT_ONLY) !== 0) continue;
-      if (role === "creation-parent" && inheritable && (ace.mask & ~READ_ONLY_RIGHTS) !== 0) {
-        return `${target}, the immediate creation parent of ${root}, grants ${ace.sid} inheritable write, delete or permission rights (mask 0x${ace.mask.toString(16)}); ${PRIVATE_PATH_ADVICE}`;
+    if (!Array.isArray(entry.dacl)) {
+      const reason = `${target} has a null or unproven DACL (everyone has full control)`;
+      if (strict) return reason;
+      diagnostics.push(reason);
+    } else {
+      for (const [ordinal, ace] of (entry.dacl as unknown[]).entries()) {
+        if (!record(ace) || (ace.type !== 0 && ace.type !== 1) || !uint32(ace.flags) || (ace.flags & ~0x1f) !== 0
+          || typeof ace.sid !== "string" || !SID.test(ace.sid) || !uint32(ace.mask)) {
+          const reason = malformedAceRefusal(target, ace, ordinal);
+          if (strict) return `${target} has an unsupported or unproven ACE`;
+          diagnostics.push(reason);
+          continue;
+        }
+        if (ace.type === 1 || trusted(ace.sid) || (role === "creation-parent" && ace.sid === "S-1-3-0")) continue;
+        // CO IO expands to the child's trusted creator. Skip only this ACE, never the remaining DACL: every other
+        // foreign allow is metadata-only on strict targets, proving no foreign add-child/write regardless of ACE order
+        // or deny ACEs. Every other inherit-only grant is judged too, including CREATOR GROUP. Ordinary ancestors skip
+        // IO access; a creation parent instead refuses foreign inheritable writes before a new component is visible.
+        if (strict && ace.sid === "S-1-3-0" && (ace.flags & INHERIT_ONLY) !== 0) continue;
+        const inheritable = (ace.flags & 0x0b) !== 0; // OBJECT_INHERIT | CONTAINER_INHERIT | INHERIT_ONLY
+        if (role === "ancestor" && (ace.flags & INHERIT_ONLY) !== 0) continue;
+        if (role === "creation-parent" && inheritable && (ace.mask & ~READ_ONLY_RIGHTS) !== 0) {
+          const reason = `${target}, the immediate creation parent of ${root}, grants ${ace.sid} inheritable write, delete or permission rights (mask 0x${ace.mask.toString(16)}); ${PRIVATE_PATH_ADVICE}`;
+          if (strict) return reason;
+          diagnostics.push(reason);
+          continue;
+        }
+        const allowed = strict ? STRICT_METADATA_RIGHTS : READ_ONLY_RIGHTS | ADD_CHILD_RIGHTS;
+        if ((ace.mask & ~allowed) !== 0) {
+          const reason = `${target}${strict ? "" : `, an ancestor of ${root},`} grants ${ace.sid} ${strict ? "read, " : ""}write, delete or permission rights (mask 0x${ace.mask.toString(16)}); ${PRIVATE_PATH_ADVICE}`;
+          if (strict) return reason;
+          diagnostics.push(reason);
+        }
       }
-      const allowed = strict ? STRICT_METADATA_RIGHTS : READ_ONLY_RIGHTS | ADD_CHILD_RIGHTS;
-      if ((ace.mask & ~allowed) !== 0) {
-        return `${target}${strict ? "" : `, an ancestor of ${root},`} grants ${ace.sid} ${strict ? "read, " : ""}write, delete or permission rights (mask 0x${ace.mask.toString(16)}); ${PRIVATE_PATH_ADVICE}`;
-      }
+    }
+    if (diagnostics.length > 0) {
+      if (ancestorRole && !ownerFailure && owner !== undefined) diagnostics.push(`${target} owner: ${owner}`);
+      return diagnostics.join("; ");
     }
   }
   return undefined;

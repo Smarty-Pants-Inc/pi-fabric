@@ -9,6 +9,8 @@ import { windowsStateAclRefusal, type WindowsStateAclRequest } from "../src/mesh
 const USER = "S-1-5-21-1-2-3-1001";
 const OTHER = "S-1-5-21-1-2-3-1002";
 const SYSTEM = "S-1-5-18";
+const LOCAL_SERVICE = "S-1-5-19";
+const NETWORK_SERVICE = "S-1-5-20";
 const ADMINS = "S-1-5-32-544";
 const TRUSTED_INSTALLER = "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464";
 const AUTH_USERS = "S-1-5-11";
@@ -66,17 +68,30 @@ const judge = (entries: Entry[], input: Partial<WindowsStateAclRequest> = {}, ex
 const withEntry = (index: number, change: Entry): Entry[] =>
   defaultEntries().map((entry, at) => (at === index ? { ...entry, ...change } : entry));
 const strictTargets = ["mesh root", "state-checkpoint.flags", "state.db", "state.db-wal", "state.db-shm", "state.db-journal"] as const;
-const strictRefusal = (target: typeof strictTargets[number], ace: Ace | Ace[]): string | undefined => {
+const strictRefusal = (
+  target: typeof strictTargets[number], ace: Ace | Ace[], owner = USER, tokenOwner = USER,
+): string | undefined => {
   const dacl = [...profileDacl(), ...(Array.isArray(ace) ? ace : [ace])];
-  if (target === "mesh root") return judge(withEntry(0, { dacl }));
+  const identity = { ownerSid: tokenOwner };
+  if (target === "mesh root") return judge(withEntry(0, { owner, dacl }), {}, identity);
   if (target === "state-checkpoint.flags") {
-    const flags = dir("C:\\Users\\me\\.pi\\mesh\\state-checkpoint.flags", USER, dacl);
-    return judge(defaultEntries().map((entry, at) => (at === 5 ? flags : entry)));
+    const flags = dir("C:\\Users\\me\\.pi\\mesh\\state-checkpoint.flags", owner, dacl);
+    return judge(defaultEntries().map((entry, at) => (at === 5 ? flags : entry)), {}, identity);
   }
-  if (target === "state.db") return judge(withEntry(6, { dacl }));
+  if (target === "state.db") return judge(withEntry(6, { owner, dacl }), {}, identity);
   const file = `${request.root}\\${target}`;
-  return judge([...defaultEntries(), { path: file, attributes: 0x20, owner: USER, control: 0x8404, dacl }],
-    { files: [...request.files, file] });
+  return judge([...defaultEntries(), { path: file, attributes: 0x20, owner, control: 0x8404, dacl }],
+    { files: [...request.files, file] }, identity);
+};
+const roleRefusal = (
+  target: string, role: "ancestor" | "creation-parent", owner: string, dacl: Ace[],
+): string | undefined => {
+  const entries = [dir(target, owner, dacl)];
+  for (let at = path.win32.dirname(target); ; at = path.win32.dirname(at)) {
+    if (at.toLowerCase() !== target.toLowerCase()) entries.push(dir(at, USER, profileDacl()));
+    if (at === path.win32.dirname(at)) break;
+  }
+  return windowsStateAclRefusal({ root: target, real: target, role, files: [], directories: [] }, runner(entries).run);
 };
 
 describe("Windows mesh state ACL policy (smarty-dev#8920)", () => {
@@ -102,6 +117,16 @@ describe("Windows mesh state ACL policy (smarty-dev#8920)", () => {
       .toMatch(/ancestor .* reparse point/);
     expect(windowsStateAclRefusal(input, runner([{ ...entries[0], dacl: [allow(OTHER, MODIFY, 0)] }, ...entries.slice(1)]).run))
       .toMatch(/ancestor .* grants .* write, delete or permission rights/);
+  });
+
+  it("accepts LocalService and NetworkService owners only on ancestor roles with a safe DACL", () => {
+    const safeDacl = [...profileDacl(), allow(CREATOR_OWNER, FULL, 0xb)];
+    for (const owner of [LOCAL_SERVICE, NETWORK_SERVICE]) {
+      for (const role of ["ancestor", "creation-parent"] as const) {
+        expect(roleRefusal("C:\\Users\\me\\.pi", role, owner, safeDacl), `${owner} ${role}`).toBeUndefined();
+        expect(roleRefusal("C:\\Users\\me\\.pi", role, OTHER, safeDacl), `${OTHER} ${role}`).toMatch(/owned by/);
+      }
+    }
   });
 
   it("reads lexical and real ancestors once each", () => {
@@ -167,6 +192,35 @@ describe("Windows mesh state ACL policy (smarty-dev#8920)", () => {
     expect(judge(withEntry(0, { owner: ADMINS }))).toMatch(/mesh is owned by S-1-5-32-544, not the current user/); // not elevated
     expect(judge(withEntry(6, { owner: OTHER }), {}, elevated)).toMatch(/state\.db is owned by S-1-5-21-1-2-3-1002/);
     expect(judge(defaultEntries(), {}, { ownerSid: undefined })).toMatch(/invalid Windows ACL snapshot/);
+  });
+
+  it("keeps LocalService and NetworkService untrusted on every strict target", () => {
+    for (const target of strictTargets) {
+      for (const serviceSid of [LOCAL_SERVICE, NETWORK_SERVICE]) {
+        expect(strictRefusal(target, allow(OTHER, FULL, 0), serviceSid, serviceSid), `${target} ${serviceSid}`)
+          .toMatch(new RegExp(`is owned by ${serviceSid}, not the current user`));
+      }
+      expect(strictRefusal(target, [], USER, USER), `${target} user owner`).toBeUndefined();
+      expect(strictRefusal(target, [], ADMINS, ADMINS), `${target} elevated owner`).toBeUndefined();
+    }
+    // Strict targets still stop at the existing ownership error before inspecting a bad DACL.
+    const firstError = strictRefusal("mesh root", allow(OTHER, FULL, 0), LOCAL_SERVICE, LOCAL_SERVICE);
+    expect(firstError).toMatch(/mesh is owned by S-1-5-19, not the current user/);
+    expect(firstError).not.toContain("mask 0x");
+  });
+
+  it("does not treat service SIDs as trusted DACL trustees", () => {
+    for (const serviceSid of [LOCAL_SERVICE, NETWORK_SERVICE]) {
+      for (const target of strictTargets) {
+        expect(strictRefusal(target, allow(serviceSid, FULL, 0))).toMatch(new RegExp(`grants ${serviceSid} .*mask 0x1f01ff`));
+      }
+      for (const role of ["ancestor", "creation-parent"] as const) {
+        const flags = role === "ancestor" ? 0 : 0xb;
+        expect(roleRefusal("C:\\Users\\me\\.pi", role, USER,
+          [...profileDacl(), allow(serviceSid, FULL, flags)]))
+          .toMatch(new RegExp(`grants ${serviceSid} .*mask 0x1f01ff`));
+      }
+    }
   });
 
   // A token may name another group it belongs to as its default owner (a shared "Developers" group, Users...). Files
@@ -319,6 +373,108 @@ describe("Windows mesh state ACL policy (smarty-dev#8920)", () => {
     expect(windowsStateAclRefusal(creationParent, runner([
       dir(parent, USER, [...profileDacl(), allow(OTHER, 0x6, 0)]), ...entries.slice(1),
     ]).run)).toBeUndefined();
+  });
+
+  it("preserves Users CI, AD and IO classification equally on C: and D:", () => {
+    for (const drive of ["C", "D"]) {
+      const volume = `${drive}:\\`;
+      expect(roleRefusal(volume, "ancestor", USER, [
+        ...profileDacl(), allow(USERS, ADD_SUBDIR, 0x2), allow(USERS, ADD_SUBDIR, 0), allow(USERS, FULL, 0xb),
+      ]), `${drive}: ordinary ancestor`).toBeUndefined();
+
+      const parent = `${drive}:\\Users`;
+      expect(roleRefusal(parent, "creation-parent", USER, [...profileDacl(), allow(USERS, ADD_SUBDIR, 0)]),
+        `${drive}: non-inheritable AD`).toBeUndefined();
+      expect(roleRefusal(parent, "creation-parent", USER, [...profileDacl(), allow(USERS, ADD_SUBDIR, 0x2)]),
+        `${drive}: CI plus AD`).toMatch(new RegExp(`grants ${USERS} inheritable .*mask 0x4`));
+      expect(roleRefusal(parent, "creation-parent", USER, [...profileDacl(), allow(USERS, FULL, 0xb)]),
+        `${drive}: IO write`).toMatch(new RegExp(`grants ${USERS} inheritable .*mask 0x1f01ff`));
+    }
+  });
+
+  it("still refuses Users write, modify, full, delete-child, DACL and owner rights on both ancestor roles", () => {
+    const unsafeMasks = [0x40000000, MODIFY, FULL, 0x40, 0x40000, 0x80000];
+    for (const role of ["ancestor", "creation-parent"] as const) {
+      const flags = role === "ancestor" ? 0 : 0x2;
+      for (const mask of unsafeMasks) {
+        expect(roleRefusal("C:\\Users\\me\\.pi", role, USER,
+          [...profileDacl(), allow(USERS, mask, flags)]))
+          .toMatch(new RegExp(`grants ${USERS} .*mask 0x${mask.toString(16)}`));
+      }
+    }
+  });
+
+  it("refuses Users and service-trustee writes even when that same service owns the ancestor", () => {
+    for (const owner of [LOCAL_SERVICE, NETWORK_SERVICE]) {
+      for (const role of ["ancestor", "creation-parent"] as const) {
+        const flags = role === "ancestor" ? 0 : 0x2;
+        for (const trustee of [USERS, owner]) {
+          for (const mask of [0x40000000, MODIFY, FULL, 0x40, 0x40000, 0x80000]) {
+            const refusal = roleRefusal("D:\\", role, owner, [...profileDacl(), allow(trustee, mask, flags)]);
+            expect(refusal, `${owner} ${role} ${trustee} 0x${mask.toString(16)}`)
+              .toMatch(new RegExp(`grants ${trustee} .*mask 0x${mask.toString(16)}`));
+            expect(refusal).not.toContain(`is owned by ${owner}`);
+          }
+        }
+      }
+    }
+    for (const drive of ["C", "D"]) {
+      for (const owner of [LOCAL_SERVICE, NETWORK_SERVICE]) {
+        expect(roleRefusal(`${drive}:\\`, "ancestor", owner,
+          [...profileDacl(), allow(USERS, ADD_SUBDIR, 0x2)])).toBeUndefined();
+        expect(roleRefusal(`${drive}:\\`, "creation-parent", owner,
+          [...profileDacl(), allow(USERS, ADD_SUBDIR, 0x2)])).toMatch(/inheritable .*mask 0x4/);
+      }
+    }
+  });
+
+  it("reports an unsafe DACL with accepted service-owner context, not a false owner refusal", () => {
+    const refusal = roleRefusal("C:\\Users\\me\\.pi", "ancestor", LOCAL_SERVICE, [
+      ...profileDacl(), allow(USERS, 0x40000, 0), allow(OTHER, 0x80000, 0),
+    ]);
+    expect(refusal).toMatch(/owner(?: SID)?\s*[:=]?\s*S-1-5-19/i);
+    expect(refusal).not.toMatch(/is owned by S-1-5-19|not the current user/i);
+    expect(refusal).toContain(USERS);
+    expect(refusal).toContain("mask 0x40000");
+    expect(refusal?.match(new RegExp(`${USERS}[^\\n]*?mask 0x40000`, "g")) ?? []).toHaveLength(1);
+    expect(refusal).toContain(OTHER);
+    expect(refusal).toContain("mask 0x80000");
+    expect(refusal?.match(new RegExp(`${OTHER}[^\\n]*?mask 0x80000`, "g")) ?? []).toHaveLength(1);
+  });
+
+  it("reports the first failed ancestor owner and every unsafe ACE occurrence independent of order", () => {
+    const deny = { ...allow(USERS, FULL, 0), type: 1 };
+    const creator = allow(CREATOR_OWNER, FULL, 0xb);
+    const repeated = allow(USERS, 0x40000, 0);
+    const unsafe = [repeated, allow(OTHER, 0x80000, 0), allow(USERS, 0x10000, 0), repeated];
+    for (const aces of [[deny, creator, ...unsafe], [...unsafe].reverse().concat([creator, deny])]) {
+      const entries = defaultEntries();
+      entries[1] = dir("C:\\Users\\me\\.pi", AUTH_USERS, [...profileDacl(), ...aces]);
+      entries[2] = dir("C:\\Users\\me", USER, [...profileDacl(), allow(EVERYONE, 0x40000000, 0)]);
+      const refusal = windowsStateAclRefusal(request, runner(entries).run);
+      expect(refusal).toMatch(new RegExp(`owner(?: SID)?\\s*[:=]?\\s*${AUTH_USERS}`, "i"));
+      expect(refusal).toContain(USERS);
+      expect(refusal).toContain(OTHER);
+      expect(refusal?.match(new RegExp(`${USERS}[^\\n]*?mask 0x40000`, "g")) ?? []).toHaveLength(2);
+      expect(refusal?.match(new RegExp(`${OTHER}[^\\n]*?mask 0x80000`, "g")) ?? []).toHaveLength(1);
+      expect(refusal?.match(new RegExp(`${USERS}[^\\n]*?mask 0x10000`, "g")) ?? []).toHaveLength(1);
+      expect(refusal?.match(/mask 0x40000/g) ?? []).toHaveLength(2);
+      expect(refusal?.match(/mask 0x80000/g) ?? []).toHaveLength(1);
+      expect(refusal).not.toContain(EVERYONE);
+      expect(refusal).not.toContain("mask 0x40000000");
+    }
+  });
+
+  it("continues past a malformed ACE to report a later unsafe ACE", () => {
+    const malformed: Ace = { type: 9, flags: 0, sid: OTHER, mask: FULL };
+    const refusal = roleRefusal("C:\\Users\\me\\.pi", "ancestor", NETWORK_SERVICE,
+      [...profileDacl(), malformed, allow(USERS, 0x40000, 0)]);
+    expect(refusal).toMatch(/unsupported or unproven ACE/i);
+    expect(refusal).toContain(NETWORK_SERVICE);
+    expect(refusal).not.toMatch(/is owned by S-1-5-20|not the current user/i);
+    expect(refusal).toContain(USERS);
+    expect(refusal).toContain("mask 0x40000");
+    expect(refusal?.match(new RegExp(`${USERS}[^\\n]*?mask 0x40000`, "g")) ?? []).toHaveLength(1);
   });
 
   it("refuses an ancestor owned by an untrusted account", () => {

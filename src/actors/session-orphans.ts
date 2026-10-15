@@ -33,6 +33,15 @@ const record = (value: unknown): Record<string, unknown> | undefined =>
   typeof value === "object" && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
 const time = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value) && value > 0;
 const strings = (value: unknown): string[] => Array.isArray(value) ? value.filter((v): v is string => typeof v === "string") : [];
+/** Read old current/previous outboxes, but never recursively grow a receipt journal. */
+const settlementReceipts = (current: Record<string, unknown> | undefined): Record<string, unknown>[] =>
+  [current, record(current?.previous), ...(Array.isArray(current?.persisted) ? current.persisted.map(record) : [])]
+    .filter((receipt): receipt is Record<string, unknown> => !!receipt && typeof receipt.by === "string" && time(receipt.at));
+const settlementReceipt = (entry: MeshStateEntry, receipts: Record<string, unknown>[]): Record<string, unknown> | undefined => {
+  const value = record(entry.value);
+  return receipts.find(receipt => receipt.by === entry.updatedBy.id && value?.settledAt === (receipt.settledAt ?? receipt.at) &&
+    (receipt.settledAt === undefined || value?.updatedAt === receipt.at));
+};
 const until = (lease: FabricHostLease): number => Math.max(lease.expiresAt, lease.reloadUntil ?? 0, lease.session?.expiresAt ?? 0);
 
 /** Strict destructive read: invalid optional liveness/owner evidence is doubt too. */
@@ -354,7 +363,7 @@ export class SessionActorOrphans {
     if (row.residency !== "session" || row.status !== "stopped" || row.stopReason !== "host-exit" || row.removal || typeof row.name !== "string" ||
         typeof row.rootId !== "string" || !row.rootId.startsWith("session:") || !/^[a-f0-9]{32}$/.test(row.id) ||
         marker.oldRoot !== row.rootId || !time(marker.orphanedAt) || !time(row.createdAt) ||
-        !time(receipt.at) || typeof receipt.by !== "string" || !receipt.by.startsWith("session:") || receipt.by === row.rootId ||
+        !time(receipt.at) || (receipt.settledAt !== undefined && !time(receipt.settledAt)) || typeof receipt.by !== "string" || !receipt.by.startsWith("session:") || receipt.by === row.rootId ||
         (receipt.retiredAt !== undefined && (!time(receipt.retiredAt) || typeof receipt.retiredBy !== "string")) ||
         typeof row.runner !== "string" || !/^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$/.test(row.runner)) return undefined;
     // Closed allowlist: NEVER spread an advertisement. No run/preparation/queue/routing
@@ -364,7 +373,8 @@ export class SessionActorOrphans {
       ...(typeof row.project === "string" ? { project: row.project } : {}), residency: "session", runner: row.runner,
       transport: "host", capabilities: [], controlProtocol: "legacy", status: "stopped", stopReason: "owner-root-gone",
       startedAt: row.createdAt, updatedAt: receipt.at, ownerRootGoneAt: marker.orphanedAt, ownerRootGoneBy: receipt.by,
-      settledAt: receipt.at, ...(time(receipt.retiredAt) ? { retiredAt: receipt.retiredAt, retiredBy: receipt.retiredBy as string } : {}) };
+      settledAt: Math.min(...[receipt, ...settlementReceipts(record(marker.directorySettlement))]
+        .map(prior => time(prior.settledAt) ? prior.settledAt : prior.at as number)), ...(time(receipt.retiredAt) ? { retiredAt: receipt.retiredAt, retiredBy: receipt.retiredBy as string } : {}) };
   }
 
   /** Read-side exception is ONLY terminal and ONLY authenticated by a private generation.
@@ -380,9 +390,9 @@ export class SessionActorOrphans {
       const registry = this.#registries().find(item => `session:${item.sessionId}` === value.rootId);
       const row = registry && this.#rows(registry.store).find(item => item.id === value.id);
       const marker = record(row?.sessionOrphan), current = record(marker?.directorySettlement);
-      const receipt = current?.by === entry.updatedBy.id && current.at === value.settledAt ? current : record(current?.previous);
+      const receipt = settlementReceipt(entry, settlementReceipts(current));
       if (!row || !marker || !receipt || entry.updatedBy.id !== receipt.by || value.ownerRootGoneBy !== receipt.by ||
-          value.ownerRootGoneAt !== marker.orphanedAt || value.settledAt !== receipt.at ||
+          value.ownerRootGoneAt !== marker.orphanedAt || value.settledAt !== (receipt.settledAt ?? receipt.at) ||
           value.rootId !== row.rootId || value.ownerHostId !== row.rootId || value.ownerIdentityId !== row.rootId ||
           (entry.key !== participantKey(row.id) && entry.key !== `actors/${registry!.sessionId}/${row.id}`) ||
           !sessionActorRootGone(this.mesh, String(row.rootId), this.lineageAlive)) return undefined;
@@ -424,13 +434,32 @@ export class SessionActorOrphans {
     if (!current || JSON.stringify(current.sessionOrphan) !== JSON.stringify(marker)) return false;
     row = current;
     const authority = assertNativeObserver(this.mesh.root, this.identity, this.ownSessionId, row, retire);
-    const changed = !beforeReceipt || beforeReceipt.by !== this.identity.id || (retire && !time(beforeReceipt.retiredAt));
-    const receipt = changed ? { by: this.identity.id, at: Date.now(),
+    const readCopies = (): Array<MeshStateEntry | undefined> => {
+      let file: MeshStateEntry | undefined;
+      try { file = JSON.parse(fs.readFileSync(path.join(this.mesh.root, "participants", `${digest(row.id)}.json`), "utf8")); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+      return [this.mesh.get(`actors/${sessionId}/${row.id}`, { fresh: true }), this.mesh.get(participantKey(row.id), { fresh: true }), file];
+    };
+    const copies = readCopies(), copiesBytes = JSON.stringify(copies);
+    const receipts = settlementReceipts(beforeReceipt);
+    const beforeTerminal = beforeReceipt && this.#terminal(row, marker, beforeReceipt);
+    const needsRepair = copies.some(entry => entry && (!this.validateTombstone(entry) ||
+      JSON.stringify(entry.value) !== JSON.stringify(beforeTerminal)));
+    // An observer change alone is NOT a new settlement or writer generation.
+    const changed = !beforeReceipt || (retire && !time(beforeReceipt.retiredAt)) || needsRepair;
+    const settledAt = time(beforeReceipt?.settledAt) ? beforeReceipt.settledAt :
+      receipts.length ? Math.min(...receipts.map(receipt => receipt.at as number)) : Date.now();
+    // At most the three actual copies supply predecessors. Failed private intents
+    // cannot evict their provenance, nor accumulate an unbounded retry journal.
+    const persisted = copies.flatMap(entry => {
+      const prior = entry && settlementReceipt(entry, receipts);
+      return prior ? [{ by: prior.by, at: prior.at,
+        ...(time(prior.settledAt) ? { settledAt: prior.settledAt } : {}),
+        ...(time(prior.retiredAt) ? { retiredAt: prior.retiredAt, retiredBy: prior.retiredBy } : {}) }] : [];
+    }).filter((receipt, index, all) => all.findIndex(other => JSON.stringify(other) === JSON.stringify(receipt)) === index);
+    const receipt = changed ? { by: this.identity.id, at: Math.max(Date.now(), time(beforeReceipt?.at) ? beforeReceipt.at + 1 : 0), settledAt,
       ...(retire || time(beforeReceipt?.retiredAt) ? { retiredAt: time(beforeReceipt?.retiredAt) ? beforeReceipt.retiredAt : Date.now(),
-        retiredBy: typeof beforeReceipt?.retiredBy === "string" ? beforeReceipt.retiredBy : this.identity.id } : {}),
-      ...(beforeReceipt && typeof beforeReceipt.by === "string" && time(beforeReceipt.at) ? { previous: {
-        by: beforeReceipt.by, at: beforeReceipt.at, ...(time(beforeReceipt.retiredAt) ? {
-          retiredAt: beforeReceipt.retiredAt, retiredBy: beforeReceipt.retiredBy as string } : {}) } } : {}) } : beforeReceipt;
+        retiredBy: typeof beforeReceipt?.retiredBy === "string" ? beforeReceipt.retiredBy : this.identity.id } : {}), persisted } : beforeReceipt;
     const terminal = this.#terminal(row, marker, receipt);
     if (!terminal) return false;
     const prepared = changed ? store.prepare(snapshot.actors.map(item => item.id === row.id
@@ -467,6 +496,9 @@ export class SessionActorOrphans {
           beforeCommit: () => underKeys(() => {
             assertProof();
             if (!intentCommitted) {
+              // Prepared provenance must still cover exactly the copies under
+              // state + participant custody before the private intent commits.
+              if (JSON.stringify(readCopies()) !== copiesBytes) throw new Error("Actor directory copies changed before intent commit");
               if (prepared && !prepared.valid()) throw new Error("Private actor outbox generation changed");
               prepared?.commit(); intentCommitted = true; expected = store.snapshot().bytes;
             }

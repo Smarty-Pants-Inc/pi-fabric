@@ -80,6 +80,19 @@ const fixture = async () => {
   return { root, mesh, old, current, id, actor, store, lease, oldOwner, newOwner, legacy, history, repair, directory };
 };
 
+const observer = (f: Awaited<ReturnType<typeof fixture>>, sessionId: string) => {
+  const identity: MeshIdentity = { ...f.current, id: `session:${sessionId}`, sessionId };
+  registerMainInbox(f.root, identity, sessionId, undefined, "native-lead", "trusted-project");
+  writeHostLease(f.root, { ...readHostLeaseCurrent(f.root, f.current.id)!, id: identity.id, rootId: identity.id,
+    identityId: identity.id, updatedAt: Date.now(), expiresAt: Date.now() + 2 * DIRECTORY_RETENTION_MS });
+  const repair = new SessionActorOrphans(f.mesh, identity, sessionId, path.join(f.root, "actors"), () => true);
+  cleanups.push(() => repair.close());
+  return repair;
+};
+const persisted = (f: Awaited<ReturnType<typeof fixture>>) => [f.mesh.get(f.legacy, { fresh: true })!,
+  f.mesh.get(keyOf(f.id), { fresh: true })!,
+  JSON.parse(fs.readFileSync(path.join(f.root, "participants", `${hash(f.id)}.json`), "utf8"))];
+
 const invokeContext: FabricInvocationContext = { cwd: process.cwd(), signal: undefined, parentToolCallId: "record-only",
   nestedToolCallId: "record-only", extensionContext: {} as FabricInvocationContext["extensionContext"], update() {}, activity() {} };
 const providerFor = (f: Awaited<ReturnType<typeof fixture>>) => {
@@ -415,13 +428,23 @@ describe("persistent old-root settlement (#12785)", () => {
     const nativeFile = path.join(f.root, "participants", `${hash(f.id)}.json`);
     let entry = f.mesh.get(keyOf(f.id))!;
     const settledAt = f.repair.validateTombstone(entry)!.settledAt!;
+    const b = observer(f, "retention-b"), c = observer(f, "retention-c");
+    const maintenanceClock = vi.spyOn(Date, "now").mockReturnValue(settledAt + 2 * 3600000);
+    try {
+      await b.reconcile(); await b.retire(f.id, () => {});
+      const retired = f.mesh.get(entry.key)!;
+      await f.mesh.put({ identity: retired.updatedBy, key: entry.key, value: { ...(retired.value as object), actorQueued: 99 } });
+      await c.reconcile();
+      for (const copy of persisted(f)) expect(c.validateTombstone(copy)).toMatchObject({ settledAt, retiredBy: "session:retention-b" });
+      entry = f.mesh.get(entry.key)!;
+    } finally { maintenanceClock.mockRestore(); }
     const hostKey = `topology/hosts/${hash(f.old.id)}`;
     await f.mesh.put({ identity: f.old, key: hostKey, value: { id: f.old.id, expiresAt: f.lease.expiresAt } });
     const ordinaryId = "c".repeat(32), fakeId = "d".repeat(32);
     const clock = vi.spyOn(Date, "now").mockReturnValue(settledAt + 100 * DIRECTORY_RETENTION_MS);
     try {
       // A refreshed/forged future envelope cannot renew the private 24h bound.
-      await f.mesh.put({ identity: f.current, key: entry.key, value: entry.value });
+      await f.mesh.put({ identity: entry.updatedBy, key: entry.key, value: entry.value });
       entry = f.mesh.get(entry.key)!; writeParticipantFile(f.root, entry);
       for (const id of [ordinaryId, fakeId]) {
         await f.mesh.put({ identity: id === ordinaryId ? f.old : f.current, key: keyOf(id), value: { ...(entry.value as object), id,
@@ -486,6 +509,74 @@ describe("persistent old-root settlement (#12785)", () => {
     expect(participantFiles.readParticipantFiles(f.root).map(row => JSON.stringify(row))).toEqual(snapshots);
     expect(f.mesh.get(entry.key)?.version).toBe(entry.version);
     expect(f.mesh.get(f.legacy)).toBeDefined();
+    expect(fs.readFileSync(f.history, "utf8")).toBe("private history sentinel\n");
+  });
+
+  it("FVR-01: alternating authorized observers keep receipt/time stable, including retirement and real repair", async () => {
+    const f = await fixture(); await f.repair.reconcile();
+    const initial = f.store.snapshot().bytes, copies = persisted(f);
+    const settledAt = f.repair.validateTombstone(copies[0])!.settledAt!;
+    const b = observer(f, "observer-b"), c = observer(f, "observer-c");
+    const clock = vi.spyOn(Date, "now");
+    for (const [index, repair] of [b, c, b, f.repair, c].entries()) {
+      clock.mockReturnValue(settledAt + (index + 1) * 1000);
+      await repair.reconcile();
+      expect(f.store.snapshot().bytes).toBe(initial);
+      expect(persisted(f)).toEqual(copies);
+    }
+    clock.mockReturnValue(settledAt + 3600000);
+    await b.retire(f.id, () => {});
+    for (const entry of persisted(f)) expect(c.validateTombstone(entry)).toMatchObject({ settledAt, retiredBy: "session:observer-b" });
+    const entry = f.mesh.get(keyOf(f.id))!;
+    await f.mesh.put({ identity: entry.updatedBy, key: entry.key, value: { ...(entry.value as object), actorQueued: 99 } });
+    clock.mockReturnValue(settledAt + 2 * 3600000);
+    await c.reconcile();
+    for (const entry of persisted(f)) expect(c.validateTombstone(entry)).toMatchObject({ settledAt, capabilities: [], retiredBy: "session:observer-b" });
+    expect(f.mesh.get(keyOf(f.id))!.value).not.toHaveProperty("actorQueued");
+    const options = { ownHostId: f.current.id, terminalActor: (entry: Parameters<typeof c.validateTombstone>[0]) => c.validateTombstone(entry) };
+    expect(deadHostRecords(f.mesh, { ...options, now: settledAt + 7 * 3600000 }).filter(row => row.entry.key === entry.key)).toHaveLength(0);
+    expect(deadHostRecords(f.mesh, { ...options, now: settledAt + DIRECTORY_RETENTION_MS }).filter(row => row.entry.key === entry.key)).toHaveLength(2);
+    expect(fs.readFileSync(f.history, "utf8")).toBe("private history sentinel\n");
+  });
+
+  it.each(["pre-mesh", "post-shared"] as const)("FVR-01: repeated %s interrupted observer repairs retain every persisted provenance", async mode => {
+    const f = await fixture(); await f.repair.reconcile();
+    const a = persisted(f), settledAt = f.repair.validateTombstone(a[0])!.settledAt!;
+    const b = observer(f, "observer-b"), c = observer(f, "observer-c"), d = observer(f, "observer-d");
+    // A real repair is needed, not a receipt minted for an ordinary observer.
+    await f.mesh.put({ identity: f.current, key: f.legacy, value: { ...(a[0].value as object), actorQueued: 99 } });
+    const batch = f.mesh.writeBatch.bind(f.mesh);
+    let failures = 0;
+    const spy = vi.spyOn(f.mesh, "writeBatch").mockImplementation(input => batch(input.beforeCommit ? {
+      ...input, ...(mode === "pre-mesh" ? { beforeCommit: () => { input.beforeCommit!(); failures++; throw new Error("recorded pre-mesh failure"); } }
+        : { afterCommit: () => { failures++; throw new Error("recorded file publication failure"); } }),
+    } : input));
+    await b.reconcile();
+    await c.reconcile();
+    expect(failures).toBe(2);
+    for (const entry of persisted(f)) expect(d.validateTombstone(entry)).toMatchObject({ settledAt, capabilities: [] });
+    expect(d.validateTombstone(a[2])).toMatchObject({ settledAt });
+    expect((f.store.records()[0]!.sessionOrphan as any).directorySettlement.persisted.length).toBeLessThanOrEqual(3);
+    spy.mockRestore();
+    await d.reconcile();
+    for (const entry of persisted(f)) expect(d.validateTombstone(entry)).toMatchObject({ settledAt, capabilities: [] });
+    expect(f.mesh.get(f.legacy)!.value).not.toHaveProperty("actorQueued");
+    expect(fs.readFileSync(f.history, "utf8")).toBe("private history sentinel\n");
+  });
+
+  it("FVR-01: migrates an already persisted current/previous outbox without losing its older live copies", async () => {
+    const f = await fixture(); await f.repair.reconcile();
+    const copies = persisted(f), settledAt = f.repair.validateTombstone(copies[0])!.settledAt!;
+    const row = f.store.records()[0]!, marker = row.sessionOrphan as any;
+    // Exact old-format shape: B's private intent followed A, but no B mesh copy committed.
+    f.store.write([{ ...row, sessionOrphan: { ...marker, directorySettlement: {
+      by: "session:interrupted-b", at: settledAt + 1000, previous: { by: f.current.id, at: settledAt },
+    } } }]);
+    const c = observer(f, "observer-c");
+    for (const entry of copies) expect(c.validateTombstone(entry)).toMatchObject({ settledAt });
+    await c.reconcile();
+    for (const entry of persisted(f)) expect(c.validateTombstone(entry)).toMatchObject({ settledAt, capabilities: [] });
+    expect((f.store.records()[0]!.sessionOrphan as any).directorySettlement).toMatchObject({ by: "session:observer-c", settledAt });
     expect(fs.readFileSync(f.history, "utf8")).toBe("private history sentinel\n");
   });
 

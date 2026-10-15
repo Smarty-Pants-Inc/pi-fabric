@@ -155,7 +155,8 @@ const assertTrace = (gate: string, entries: readonly WindowsMeshRecoveryEntry[],
 };
 
 // Exactly 17 cases: 6 native D controls, 6 actual classic crash-after-i rows, 2 public D routes, 3 public E configurations.
-// Crash rows use unblocked real classic disposals; the external-reader delete-pending partial control stays separate.
+// Each crash row holds a compatible reader on entry i through its real classic disposal and helper crash+JOIN,
+// then closes+JOINS that reader before checking removal and freshly judging survivors; the partial control stays separate.
 describe.skipIf(!hosted)(`Windows classic D and canonical E sharing (${SKIP})`, () => {
   let root: string, cap: WindowsMeshCapability, harness: WindowsHandleHarness | undefined;
   let harnessCreation: Promise<WindowsHandleHarness> | undefined;
@@ -283,12 +284,16 @@ describe.skipIf(!hosted)(`Windows classic D and canonical E sharing (${SKIP})`, 
     assertNoDetach(root, tree.lock);
   }, 30_000);
 
-  for (const i of [0, 1, 2, 3, 4, 5] as const) it(`D actual classic crash after ${i}: independently rejudge survivors, finish without detach, and preserve successor B against original D`, async () => {
+  for (const i of [0, 1, 2, 3, 4, 5] as const) it(`D actual classic crash after ${i} with selected reader held through disposal and helper JOIN: close+JOIN reader, independently rejudge survivors, finish without detach, and preserve successor B against original D`, async () => {
     const tree = deadTree(root); await judge(tree);
     expect(tree.entries).toHaveLength(6);
     const originalRequest = encodeMeshDebrisRecoveryRequest(tree.lock, tree.entries, NATIVE_MS);
     const originalLeaves = new Map(tree.entries.filter(entry => entry.record !== undefined)
       .map(entry => [entry.path, fileSnapshot(entry.path)]));
+    const selected = tree.entries[i]!;
+    // Hold ONLY entry i: earlier disposals stay unblocked, including each earlier child before its parent.
+    // Real external file/directory access + DELETE sharing permits classic disposition, not last-close removal.
+    const reader = await hold(selected.path, selected.stat.isDirectory() ? ACCESS.READ_ATTRIBUTES : ACCESS.READ_DATA, SHARE.ALL);
     const canonicalId = id(tree.lock), gate = temp(), run = start(tree.lock, tree.entries, gate);
     await atGate(run, gate);
     const command = `classic-debris-after-${i}` as const, checkpoint = `debris-after-${i}`;
@@ -301,6 +306,7 @@ describe.skipIf(!hosted)(`Windows classic D and canonical E sharing (${SKIP})`, 
     // Keep the original go file present: it MUST NOT accidentally release this second, checkpoint-specific pause.
     expect(fs.readFileSync(path.join(gate, "go"), "ascii")).toBe(`${command}\n`);
     expect(fs.existsSync(path.join(gate, `${checkpoint}.go`))).toBe(false);
+    // Reader remains held through the actual classic call, this owned later pause, and the helper's terminal JOIN.
     const receipt = await harness!.killNative(run); // ownership-checked signal, then finite terminal JOIN
     expect(await run.done).toEqual(receipt);
     diagnostic("classic-crash-joined", { checkpoint, helper: cap.absolutePath, digest: cap.digest, pid: run.child.pid, receipt });
@@ -308,6 +314,8 @@ describe.skipIf(!hosted)(`Windows classic D and canonical E sharing (${SKIP})`, 
     expect(receipt.code === 0 && receipt.signal === null).toBe(false);
     expect(receipt.code).not.toBe(124); // watchdog expiry is not the owned crash requested at this pause
     expect(result(run, receipt).outcome).toBe("recovery-outcome-unknown");
+    await closeHeld(reader); // actual CloseHandle + terminal JOIN + baseline census AFTER the helper JOIN
+    // Only after BOTH joins may disposed paths be ENOENT or survivors supply fresh enumeration/death authority.
     const disposed = tree.entries.slice(0, i + 1), remaining = tree.entries.slice(i + 1);
     const trace = assertTrace(gate, disposed, "classic");
     expect(trace).toHaveLength(i + 1); // no call beyond the selected existing checkpoint
@@ -319,12 +327,12 @@ describe.skipIf(!hosted)(`Windows classic D and canonical E sharing (${SKIP})`, 
     }
     assertNoDetach(root, tree.lock);
     if (i === 5) {
-      // The canonical directory itself was successfully disposed and closed BEFORE debris-after-5. No invented survivor.
+      // Canonical L may stay delete-pending through debris-after-5 and helper JOIN, until reader close+JOIN. No invented survivor.
       expect(remaining).toEqual([]);
       expect(() => stat(tree.lock)).toThrow(expect.objectContaining({ code: "ENOENT" }));
     } else {
       expect(id(tree.lock)).toBe(canonicalId);
-      // A NEW enumeration/full R/death judgment for EVERY surviving leaf, only after the crashed helper JOIN.
+      // A NEW enumeration/full R/death judgment for EVERY surviving leaf, only after BOTH helper and reader JOINs.
       const fresh = await freshSurvivors(tree);
       expect(fresh.map(entry => entry.path).sort()).toEqual(remaining.map(entry => entry.path).sort());
       expect(fresh.filter(entry => entry.record !== undefined)).toHaveLength(remaining.filter(entry => entry.record !== undefined).length);

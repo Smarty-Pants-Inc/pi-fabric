@@ -7,6 +7,7 @@ import { TaskEscalationTargetError } from "../src/agents/task-return-address.js"
 import { AgentMessageRouter } from "../src/providers/agents-message-router.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { FabricControlPlane } from "../src/topology/control-plane.js";
+import { listStartingFollowUps, startingInboxRoot } from "../src/topology/starting-inbox.js";
 import { claimStartingHost } from "../src/topology/starting-host.js";
 import type { FabricParticipantInfo } from "../src/topology/types.js";
 
@@ -56,6 +57,7 @@ const fixture = async (options: { spawner?: string; ancestors?: readonly string[
 };
 
 const expectUnpublished = (mesh: MeshStore) => {
+  expect(listStartingFollowUps(startingInboxRoot(mesh.root, TARGET))).toEqual([]);
   expect(mesh.listAll("topology/starting-followups/", { fresh: true })).toEqual([]);
   expect(mesh.read({ topic: "fabric.control.command", limit: 100 })).toEqual([]);
   expect(mesh.read({ topic: "fabric.control.startup-inbox", limit: 100 })).toEqual([]);
@@ -95,11 +97,18 @@ describe("spawn-bound Main authority before startup inbox admission", () => {
     expect(f.queue).toHaveBeenCalledOnce();
     expect(f.queue.mock.calls[0]![0]).toBe(TARGET);
     expect(f.request).not.toHaveBeenCalled();
-    const rows = f.mesh.listAll("topology/starting-followups/", { fresh: true });
+    const privateRoot = startingInboxRoot(f.mesh.root, TARGET);
+    const rows = listStartingFollowUps(privateRoot);
     expect(rows).toHaveLength(1);
-    expect(rows[0]!.value).toMatchObject({ event: { from: identity, data: {
+    if (process.platform !== "win32") {
+      expect(fs.statSync(privateRoot).mode & 0o777).toBe(0o700);
+      expect(fs.statSync(path.join(privateRoot, `${receipt.messageId}.json`)).mode & 0o777).toBe(0o600);
+    }
+    expect(rows[0]!.row).toMatchObject({ event: { verification: "mesh", from: identity, data: {
       targetId: TARGET, triggerTurn: true, message: "authorized startup", data: { unchanged: true },
     } } });
-    expect(f.mesh.read({ topic: "fabric.control.command", limit: 100 })).toHaveLength(1);
+    expect(f.mesh.listAll("topology/starting-followups/", { fresh: true })).toEqual([]);
+    expect(f.mesh.read({ topic: "fabric.control.command", limit: 100 })).toEqual([]);
+    expect(f.mesh.read({ topic: "fabric.control.startup-inbox", limit: 100 })[0]!.data).toEqual({ commandId: receipt.messageId });
   });
 });

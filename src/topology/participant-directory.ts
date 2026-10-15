@@ -801,7 +801,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     }
     // Prepare the participant-file lock receipt before any publication fence. A cold
     // Darwin/Windows native identity read must never be awaited while registries are held.
-    this.#ownIncarnation = options.withPublicationFence
+    this.#ownIncarnation = options.enabled || options.withPublicationFence
       ? ownProcessIncarnation().then((value) => {
           this.#ownIncarnationValue = value;
           return value;
@@ -2240,6 +2240,10 @@ export class ParticipantDirectory implements FabricParticipantSource {
     // renewed, and an exit drops it, so the leftover entries lapse instead of staying fresh.
     if (this.#reloadPublished) {
       if (!records.ok) { failed(records.reason); return; }
+      // Only the drained predecessor may authorize a successor before its process exits.
+      const { markHostLeaseCleanHandoff } = await import("./starting-host.js");
+      await markHostLeaseCleanHandoff(this.mesh, leaseOwner,
+        { ownIncarnation: this.#ownIncarnationValue }).catch(() => false);
       this.#withdrawn = true;
       this.#withdrawalPending = false;
       this.#removeExitHook();
@@ -2941,7 +2945,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
       identityId: this.options.identity.id,
       incarnationToken: this.#incarnationToken,
       ownerIncarnation: this.ownerIncarnation,
-      ...(this.options.startingHost?.lease.process ? { process: this.options.startingHost.lease.process } : {}),
+      ...(this.options.startingHost?.lease.process ? { process: this.options.startingHost.lease.process } :
+        this.#ownIncarnationValue ? { process: { pid: process.pid, host: os.hostname(), startTime: this.#ownIncarnationValue } } : {}),
       ...(!this.#startupFinished && this.options.startingHost?.lease.startup ? { startup: this.options.startingHost.lease.startup } : {}),
       startedAt: this.#startedAt,
       // The census record's exact start time: identity is (host, pid, startedAt) (pi-fabric#638).

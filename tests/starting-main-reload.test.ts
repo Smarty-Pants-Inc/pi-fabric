@@ -9,7 +9,7 @@ import { CapturedToolCatalog } from "../src/capture/catalog.js";
 import { FabricState } from "../src/fabric-state.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
-import { startingHost, type StartingHostClaim } from "../src/topology/starting-host.js";
+import { localStartTime, startingHost, type StartingHostClaim } from "../src/topology/starting-host.js";
 import { readHostLeaseCurrent, renewHostLease, FabricHostLeaseSupersededError } from "../src/topology/host-leases.js";
 
 const cleanups: Array<() => Promise<void>> = [];
@@ -102,6 +102,7 @@ describe("FabricState consumes the native startup handoff once", () => {
     const f = fixture();
     await f.state.initialize(f.context);
     const first = readHostLeaseCurrent(f.meshRoot, f.id)!;
+    expect(first.process).toEqual({ pid: process.pid, host: os.hostname(), startTime: localStartTime(process.pid) });
     await f.state.claimSessionStart(f.context);
     await f.state.initialize(f.context);
     const next = readHostLeaseCurrent(f.meshRoot, f.id)!;

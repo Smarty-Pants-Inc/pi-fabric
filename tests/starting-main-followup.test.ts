@@ -10,6 +10,7 @@ import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { MainAgentController } from "../src/main-agent.js";
 import { AgentMessageRouter } from "../src/providers/agents-message-router.js";
 import { FabricControlPlane } from "../src/topology/control-plane.js";
+import * as startupInbox from "../src/topology/starting-inbox.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { claimStartingHost, startingHost, assertStartupOwner } from "../src/topology/starting-host.js";
 import { readHostLeaseCurrent, renewHostLease, writeHostLease, FabricHostLeaseSupersededError,
@@ -36,6 +37,8 @@ const plane = (mesh: MeshStore, identity: MeshIdentity, incarnation?: string) =>
   const p = new FabricControlPlane(mesh, identity, { enabled: true, hostId: identity.id,
     canConsumeMesh: () => true, ...(incarnation ? { ownerIncarnation: incarnation } : {}) }); planes.push(p); return p;
 };
+const privateRows = (mesh: MeshStore, targetId: string) =>
+  startupInbox.listStartingFollowUps(startupInbox.startingInboxRoot(mesh.root, targetId)).map(({ row }) => ({ value: row }));
 const claim = async (root: string, sessionId: string) => (await claimStartingHost({
   meshRoot: root, cwd: root, id: `session:${sessionId}`, sessionId, lockProtocol: 1, stateBackend: "file",
 }))!;
@@ -70,7 +73,19 @@ describe("same-session native Main startup inbox", () => {
     expect(queued).toMatchObject({ queued: true, reason: "startup-inbox-durable", triggered: false });
     expect(queued).not.toHaveProperty("acknowledged");
     expect(duplicate.messageId).toBe(queued.messageId);
-    expect(mesh.listAll("topology/starting-followups/")).toHaveLength(1);
+    expect(privateRows(mesh, targetId)).toHaveLength(1);
+    expect(mesh.listAll("topology/starting-followups/", { fresh: true })).toEqual([]);
+    expect(mesh.read({ topic: "fabric.control.command", limit: 100 })).toEqual([]);
+    const privateRoot = startupInbox.startingInboxRoot(root, targetId);
+    if (process.platform !== "win32") {
+      expect(fs.statSync(privateRoot).mode & 0o777).toBe(0o700);
+      expect(fs.statSync(path.dirname(privateRoot)).mode & 0o777).toBe(0o700);
+      expect(fs.statSync(path.join(privateRoot, `${queued.messageId}.json`)).mode & 0o777).toBe(0o600);
+    }
+    const globalEvents = JSON.stringify(mesh.read({ limit: 100 }));
+    expect(globalEvents).not.toContain("one native delivery");
+    expect(globalEvents).not.toContain("trusted-human");
+    expect(mesh.read({ topic: "fabric.control.startup-inbox", limit: 100 })[0]!.data).toEqual({ commandId: queued.messageId });
     await sender.close();
     vi.setSystemTime(receipt.lease.startup!.until + 1_000);
     expect(startingHost(root, targetId)).toBeUndefined(); // New admission is closed.
@@ -91,21 +106,22 @@ describe("same-session native Main startup inbox", () => {
     const receiver = plane(new MeshStore(root, 65_536, 1_000), receiverIdentity, directory.ownerIncarnation);
     // Simulate a crash gap after Main persisted its delivery receipt but before the
     // startup queue outcome commits. Replay must call the real Main receipt dedup.
-    const write = receiver.mesh.writeBatch.bind(receiver.mesh);
+    const write = startupInbox.writeStartingFollowUp;
     let gap = true;
-    vi.spyOn(receiver.mesh, "writeBatch").mockImplementation(input => write({ ...input, prepare: (view, fileRead) => {
-      const ops = input.prepare ? input.prepare(view, fileRead) : input.ops;
-      if (gap && ops.some(op => op.kind === "put" && op.key.startsWith("topology/starting-followups/"))) {
+    vi.spyOn(startupInbox, "writeStartingFollowUp").mockImplementation((...args) => {
+      if (gap && args[2].acceptance) {
         gap = false; throw Object.assign(new Error("injected journal/outcome gap"), { code: "FABRIC_MESH_LOCK_TIMEOUT" });
       }
-      return ops;
-    } }));
+      return write(...args);
+    });
     receiver.start((...args) => targetRouter.acceptControl(...args));
-    await vi.waitFor(() => expect((mesh.listAll("topology/starting-followups/", { fresh: true })[0]!.value as any).acceptance?.accepted).toBe(true));
+    await vi.waitFor(() => expect(privateRows(mesh, targetId)[0]!.value.acceptance?.accepted).toBe(true));
     expect(gap).toBe(false);
     expect(native).toHaveLength(1);
     expect(native[0]!.options.triggerTurn).toBe(true);
-    const envelope = (mesh.listAll("topology/starting-followups/", { fresh: true })[0]!.value as any).event;
+    const envelope = privateRows(mesh, targetId)[0]!.value.event;
+    expect(envelope.verification).toBe("mesh");
+    if (process.platform !== "win32") expect(fs.statSync(path.join(privateRoot, `${queued.messageId}.json`)).mode & 0o777).toBe(0o600);
     expect(envelope.principal).toEqual({ id: "trusted-human", binding: "herdr-client" });
     expect(envelope.from.id).toBe(senderIdentity.id);
     expect(oldHandler).not.toHaveBeenCalled();
@@ -148,8 +164,7 @@ describe("same-session native Main startup inbox", () => {
       const receiver = plane(directory.mesh, receiverIdentity, directory.ownerIncarnation);
       const targetRouter = route(receiverIdentity, main);
       receiver.start((...args) => targetRouter.acceptControl(...args));
-      await vi.waitFor(() => expect((mesh.listAll("topology/starting-followups/", { fresh: true })[0]!.value as any)
-        .acceptance?.accepted).toBe(true));
+      await vi.waitFor(() => expect(privateRows(mesh, targetId)[0]!.value.acceptance?.accepted).toBe(true));
       await directory.finishStartup(); receiver.notifyStartupReady();
       expect(readHostLeaseCurrent(root, targetId)?.startup).toBeUndefined();
       await source.start(); await source.refresh();
@@ -175,7 +190,7 @@ describe("same-session native Main startup inbox", () => {
     }
   });
 
-  it("wakes event-driven consumption when the first event drains before the durable row commits", async () => {
+  it("wakes event-driven consumption when the receiver drains before the private durable row commits", async () => {
     const root = temp(), sessionId = randomUUID(), id = `session:${sessionId}`;
     const receipt = await claim(root, sessionId);
     const senderIdentity: MeshIdentity = { id: "session:sender", name: "sender", kind: "main" };
@@ -185,27 +200,32 @@ describe("same-session native Main startup inbox", () => {
     let release!: () => void, entered!: () => void;
     const held = new Promise<void>(resolve => { release = resolve; });
     const rowEntered = new Promise<void>(resolve => { entered = resolve; });
-    const write = sender.mesh.writeBatch.bind(sender.mesh);
-    vi.spyOn(sender.mesh, "writeBatch").mockImplementation(async input => { entered(); await held; return write(input); });
+    const publish = MeshStore.prototype.publish;
+    vi.spyOn(MeshStore.prototype, "publish").mockImplementation(async function (this: MeshStore, input) {
+      const event = await publish.call(this, input);
+      if (this.root === startupInbox.startingInboxRoot(root, id) && input.topic === "fabric.control.command") {
+        entered(); await held;
+      }
+      return event;
+    });
     const pending = route(senderIdentity, rootMain(senderIdentity.id), sender).routeMessage(id, "after initial drain", undefined,
       "followUp", undefined, { idempotencyKey: "row-race" });
     await rowEntered;
-    let readCommand = false;
+    const directory = new ParticipantDirectory(receiver.mesh, { enabled: true, hostId: id, rootId: id,
+      identity: receiverIdentity, startingHost: receipt });
+    let drained = false;
     const tail = receiver.mesh.tail.bind(receiver.mesh);
     vi.spyOn(receiver.mesh, "tail").mockImplementation((...args) => {
       const result = tail(...args);
-      if (result.events.some(e => e.topic === "fabric.control.command")) readCommand = true;
+      drained = true;
       return result;
     });
     const accepted: string[] = [];
     receiver.start(command => { accepted.push(command.message!); return { accepted: true }; });
-    await vi.waitFor(() => expect(readCommand).toBe(true));
+    await vi.waitFor(() => expect(drained).toBe(true));
     expect(accepted).toEqual([]);
     release(); await pending;
-    const directory = new ParticipantDirectory(receiver.mesh, { enabled: true, hostId: id, rootId: id,
-      identity: receiverIdentity, startingHost: receipt });
-    await directory.finishStartup(); receiver.notifyStartupReady();
-    await vi.waitFor(() => expect((receiver.mesh.listAll("topology/starting-followups/", { fresh: true })[0]!.value as any).acceptance?.accepted).toBe(true));
+    await vi.waitFor(() => expect(privateRows(receiver.mesh, id)[0]!.value.acceptance?.accepted).toBe(true));
     expect(accepted).toEqual(["after initial drain"]);
     await directory.close();
   });

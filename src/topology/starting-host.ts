@@ -3,10 +3,11 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
-import { ownProcessIncarnation } from "../core/atomic-write.js";
+import { ownProcessIncarnation, validProcessIncarnation } from "../core/atomic-write.js";
 import { acquireMeshCustodyLock } from "../mesh/custody-lock.js";
-import { FabricParticipantStaleError, hostLeasePredecessor, renewHostLease, readHostLeaseCurrent,
-  sameHostLeaseOwner, meshWriterLeaseRecord, type FabricHostLease } from "./host-leases.js";
+import { FabricParticipantStaleError, FabricHostLeaseSupersededError, FabricHostLeaseLegacyBusyError, hostLeasePredecessor, renewHostLease, readHostLeaseCurrent,
+  sameHostLeaseOwner, sameHostLeaseVersion, withOwnedHostLease, writeHostLease, meshWriterLeaseRecord, type FabricHostLease } from "./host-leases.js";
+import { watchBridgeStore } from "../mesh/change-notifier.js";
 import type { HostLeaseMesh } from "./host-lease-lock.js";
 
 export interface StartingHostClaim { meshRoot: string; lease: FabricHostLease; }
@@ -18,14 +19,21 @@ export const localStartTime = (pid: number): string | undefined => {
     process.kill(pid, 0);
     if (process.platform === "linux") {
       const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
-      return stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/)[19];
+      const birth = stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/)[19];
+      return birth && /^\d+$/.test(birth) ? birth : undefined;
     }
-    if (process.platform === "darwin") return `darwin:${execFileSync("/bin/ps", ["-p", String(pid), "-o", "lstart="],
-      { encoding: "utf8", timeout: 2_000, env: { ...process.env, LC_ALL: "C", TZ: "UTC" } }).trim()}`;
-    if (process.platform === "win32" && process.env.SystemRoot) return `win32:${execFileSync(
-      path.win32.join(process.env.SystemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe"),
-      ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", `(Get-Process -Id ${pid} -ErrorAction Stop).StartTime.ToUniversalTime().Ticks.ToString([System.Globalization.CultureInfo]::InvariantCulture)`],
-      { encoding: "utf8", timeout: 2_000, windowsHide: true }).trim()}`;
+    if (process.platform === "darwin") {
+      const birth = execFileSync("/bin/ps", ["-p", String(pid), "-o", "lstart="],
+        { encoding: "utf8", timeout: 2_000, env: { ...process.env, LC_ALL: "C", TZ: "UTC" } }).trim();
+      return birth ? `darwin:${birth}` : undefined;
+    }
+    if (process.platform === "win32" && process.env.SystemRoot) {
+      const birth = execFileSync(
+        path.win32.join(process.env.SystemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe"),
+        ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", `(Get-Process -Id ${pid} -ErrorAction Stop).StartTime.ToUniversalTime().Ticks.ToString([System.Globalization.CultureInfo]::InvariantCulture)`],
+        { encoding: "utf8", timeout: 2_000, windowsHide: true }).trim();
+      return /^\d+$/.test(birth) ? `win32:${birth}` : undefined;
+    }
   } catch { /* Unknown/dead is not authority. */ }
   return undefined;
 };
@@ -41,6 +49,70 @@ const startupMesh = (root: string, lockProtocol: 1 | 2 | 3): HostLeaseMesh => ({
   },
 });
 
+/** Unknown is not dead: only ESRCH or an observed different native birth proves exit. */
+const predecessorProcess = (lease: FabricHostLease): "live" | "exited" | "unknown" => {
+  const p = lease.process;
+  if (!p || p.host !== os.hostname() || !validProcessIncarnation(p.startTime)) return "unknown";
+  try { process.kill(p.pid, 0); }
+  catch (error) { return (error as NodeJS.ErrnoException).code === "ESRCH" ? "exited" : "unknown"; }
+  const birth = localStartTime(p.pid);
+  return birth === undefined ? "unknown" : birth === p.startTime ? "live" : "exited";
+};
+
+export class FabricHostLeasePredecessorBusyError extends Error {
+  override readonly name = "FabricHostLeasePredecessorBusyError";
+  readonly code = "FABRIC_HOST_LEASE_PREDECESSOR_BUSY";
+  readonly retryable = true;
+  constructor(readonly predecessor: FabricHostLease) {
+    super(`Fabric host ${predecessor.id}: predecessor retains authority until ${predecessor.expiresAt}`);
+  }
+}
+
+/** Watch before rereading. Notifications only trigger a new custody check; silence or
+ * watch failure waits for ONE expiry timer, never a polling fallback. */
+const waitForPredecessorChange = (meshRoot: string, predecessor: FabricHostLease): Promise<void> =>
+  new Promise((resolve, reject) => {
+    let settled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let unwatch: (() => void) | undefined;
+    const finish = (error?: unknown): void => {
+      if (settled) return;
+      settled = true;
+      if (timer !== undefined) clearTimeout(timer);
+      try { unwatch?.(); } catch { /* best effort */ }
+      if (error !== undefined) reject(error); else resolve();
+    };
+    const check = (): void => {
+      if (settled) return;
+      try {
+        if (!sameHostLeaseVersion(hostLeasePredecessor(meshRoot, predecessor.id), predecessor) ||
+          predecessorProcess(predecessor) === "exited") finish();
+      } catch (error) { finish(error); }
+    };
+    try {
+      const stop = watchBridgeStore(meshRoot, () => finish(), () => { /* Keep the expiry timer. */ });
+      if (settled) { stop(); return; }
+      unwatch = stop;
+    } catch { /* No polling fallback. */ }
+    const remaining = predecessor.expiresAt - Date.now();
+    // After expiry a proven-live owner stays fenced: lease notifications only, no zero-timer spin.
+    if (remaining > 0) timer = setTimeout(() => finish(), Math.min(2_147_483_647, remaining));
+    check();
+  });
+
+/** Publish only after successful clean withdrawal/drain. The public token alone is NOT
+ * release authority: prove this process's native birth again while holding custody. */
+export const markHostLeaseCleanHandoff = async (mesh: HostLeaseMesh, owner: FabricHostLease,
+  options: { ownIncarnation: string | undefined }): Promise<boolean> =>
+  await withOwnedHostLease(mesh, owner, () => {
+    const current = hostLeasePredecessor(mesh.root, owner.id)!;
+    const p = current.process;
+    if (!options.ownIncarnation || !p || p.pid !== process.pid || p.host !== os.hostname() ||
+      p.startTime !== options.ownIncarnation || localStartTime(process.pid) !== p.startTime) return false;
+    writeHostLease(mesh.root, { ...current, cleanHandoff: current.incarnationToken! });
+    return true;
+  }, options);
+
 /** Native announcing Main claims before runtime import, including a clean predecessor exit. */
 export const claimStartingHost = async (input: {
   meshRoot: string; cwd: string; id: string; sessionId: string; lockProtocol: 1 | 2 | 3; stateBackend: string;
@@ -49,27 +121,63 @@ export const claimStartingHost = async (input: {
   if (input.id !== `session:${input.sessionId}`) return undefined;
   if (previous && (previous.mirror || previous.mirrorLease || previous.id !== input.id ||
     previous.rootId !== input.id || previous.identityId !== input.id || previous.session?.id !== input.sessionId ||
-    previous.writer && previous.writer.host !== os.hostname())) return undefined;
+    previous.writer && previous.writer.host !== os.hostname()))
+    throw new FabricHostLeaseSupersededError(input.id, input.id, previous.startedAt);
   const startTime = await ownProcessIncarnation();
-  if (!startTime || localStartTime(process.pid) !== startTime) return undefined;
+  if (!startTime || localStartTime(process.pid) !== startTime) {
+    if (previous) throw new FabricParticipantStaleError(input.id, 0);
+    return undefined;
+  }
   // Same-process reload retains the existing reload protocol. The legacy census has a
   // creation timestamp too; PID equality alone must never disable takeover.
   if (previous && (previous.process ? previous.process.pid === process.pid && previous.process.host === os.hostname() &&
     previous.process.startTime === startTime : previous.writer?.pid === process.pid &&
     Math.abs(previous.writer.startedAt - (Date.now() - process.uptime() * 1_000)) < 1_000)) return undefined;
-  const now = Date.now(), until = now + HOST_STARTUP_BOUND_MS;
-  const ownerIncarnation = randomUUID();
+  const mesh = startupMesh(input.meshRoot, input.lockProtocol);
+  const ownerIncarnation = randomUUID(), incarnationToken = randomUUID();
   const owner = { pid: process.pid, host: os.hostname(), startTime };
-  const lease: FabricHostLease = { id: input.id, rootId: input.id, identityId: input.id,
-    startedAt: now, incarnationToken: randomUUID(), ownerIncarnation, process: owner,
-    updatedAt: now, expiresAt: until,
-    session: { id: input.sessionId, startedAt: now, updatedAt: now, expiresAt: until },
-    writer: meshWriterLeaseRecord(input.lockProtocol, input.stateBackend),
-    startup: { ...owner, ownerIncarnation, sessionId: input.sessionId, cwd: path.resolve(input.cwd), until },
-  };
-  await renewHostLease(startupMesh(input.meshRoot, input.lockProtocol), lease,
-    { claim: true, expected: previous, ownIncarnation: startTime });
-  return { meshRoot: input.meshRoot, lease };
+  let expected = previous;
+  for (;;) {
+    // Admission time, not the beginning of a possibly long predecessor wait.
+    const now = Date.now(), until = now + HOST_STARTUP_BOUND_MS;
+    const lease: FabricHostLease = { id: input.id, rootId: input.id, identityId: input.id,
+      startedAt: now, incarnationToken, ownerIncarnation, process: owner,
+      updatedAt: now, expiresAt: until,
+      session: { id: input.sessionId, startedAt: now, updatedAt: now, expiresAt: until },
+      writer: meshWriterLeaseRecord(input.lockProtocol, input.stateBackend),
+      startup: { ...owner, ownerIncarnation, sessionId: input.sessionId, cwd: path.resolve(input.cwd), until },
+    };
+    try {
+      await renewHostLease(mesh, lease, { claim: true, expected, ownIncarnation: startTime,
+        beforeReplace: current => {
+          // Repeat native scope validation on CURRENT bytes under custody, even at expiry.
+          if (current.mirror || current.mirrorLease || current.rootId !== input.id || current.identityId !== input.id ||
+            current.session?.id !== input.sessionId || current.writer && current.writer.host !== os.hostname())
+            throw new FabricHostLeaseSupersededError(input.id, input.id, current.startedAt);
+          const state = predecessorProcess(current);
+          if (current.incarnationToken && current.cleanHandoff === current.incarnationToken || state === "exited") return;
+          // TRANSITIONAL: old releases lack pid+birth. Keep their TTL admission until the
+          // D5 wave leaves no identity-less lease in the directory for 24 h; then remove it.
+          // A proven-live process NEVER loses custody merely because its lease expired.
+          if (state === "unknown" && current.expiresAt <= Date.now()) return;
+          throw new FabricHostLeasePredecessorBusyError(current);
+        } });
+      return { meshRoot: input.meshRoot, lease };
+    } catch (error) {
+      if (error instanceof FabricHostLeasePredecessorBusyError) {
+        await waitForPredecessorChange(input.meshRoot, error.predecessor);
+      } else if (error instanceof FabricHostLeaseLegacyBusyError) {
+        // Keep legacy expiry admission, but never spend its wait inside a lease's
+        // already-created startup bound. The next attempt gets a fresh clock.
+        const current = hostLeasePredecessor(input.meshRoot, input.id);
+        if (current) await waitForPredecessorChange(input.meshRoot, current);
+      } else if (!(error instanceof FabricHostLeaseSupersededError)) throw error;
+      // A clean full close removes its lease. Start a fresh ABSENCE CAS only after a
+      // strict absent read, never recapture an intervening owner's token as permission.
+      if (!hostLeasePredecessor(input.meshRoot, input.id)) expected = undefined;
+      else if (!(error instanceof FabricHostLeasePredecessorBusyError) && !(error instanceof FabricHostLeaseLegacyBusyError)) throw error;
+    }
+  }
 };
 
 /** Exact native authority; no bridge fallback, clock extension, or PID-only liveness. */

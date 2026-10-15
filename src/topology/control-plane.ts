@@ -1,7 +1,8 @@
 import { appendDeliveryOutcome, type DeliverySend } from "../mesh/delivery-outcomes.js";
 import type { MeshControlIncarnationFence } from "../config.js";
-import { FabricBridgeStaleError, FabricParticipantStaleError, mirroredOwnerRoutingStatus, participantLeaseGraceMs, waitForMirroredLeaseRenewal, readHostLeaseCurrent, sameHostLeaseOwner, withOwnedHostLease, type FabricHostLease, type FabricMirrorLease, type MirrorLeaseWaitBudget } from "./host-leases.js";
+import { FabricBridgeStaleError, FabricParticipantStaleError, mirroredOwnerRoutingStatus, participantLeaseGraceMs, waitForMirroredLeaseRenewal, readHostLeaseCurrent, sameHostLeaseOwner, withOwnedHostLease, type FabricMirrorLease, type MirrorLeaseWaitBudget } from "./host-leases.js";
 import { assertStartingHost, startingHost, localStartTime } from "./starting-host.js";
+import { openStartingInbox, readStartingFollowUp, listStartingFollowUps, writeStartingFollowUp } from "./starting-inbox.js";
 import os from "node:os";
 import { retryDelayMs } from "../core/retry-backoff.js";
 import { FabricPeerLeaseStaleError } from "../agents/peer-lease-stale.js";
@@ -25,8 +26,6 @@ import type { FabricMessageSender } from "../protocol.js";
 const CONTROL_TOPIC = "fabric.control.command";
 const ACK_TOPIC = "fabric.control.ack";
 const CONTROL_SEEN_PREFIX = "topology/control-seen/";
-const STARTING_QUEUE_PREFIX = "topology/starting-followups/";
-interface StartingFollowUp { format: 1; lease: FabricHostLease; event: MeshEvent; acceptance?: FabricControlAcceptance; }
 // The participant directory's host records (topology/participant-directory.ts).
 const HOST_PREFIX = "topology/hosts/";
 const DEFAULT_POLL_MS = 100;
@@ -559,6 +558,16 @@ export class FabricControlPlane {
    * shared state (see #acceptCommand).
    */
   readonly #seen: MeshStore;
+  readonly #startingInboxes = new Map<string, MeshStore>();
+
+  #startingInbox(targetId: string, create = false): MeshStore | undefined {
+    let inbox = this.#startingInboxes.get(targetId);
+    if (!inbox) {
+      inbox = openStartingInbox(this.mesh, targetId, create);
+      if (inbox) this.#startingInboxes.set(targetId, inbox);
+    }
+    return inbox;
+  }
 
   constructor(
     readonly mesh: MeshStore,
@@ -613,24 +622,27 @@ export class FabricControlPlane {
     const commandId = createHash("sha256").update(JSON.stringify([
       this.options.hostId, targetId, targetId, targetId, "followUp", idempotencyKey, 0,
     ])).digest("hex");
-    const key = STARTING_QUEUE_PREFIX + commandId;
     await withOwnedHostLease(this.mesh, lease, async () => {
       signal?.throwIfAborted();
       assertStartingHost(this.mesh.root, lease);
-      const existing = this.mesh.get(key, { fresh: true });
-      if (existing) {
-        const row = existing.value as StartingFollowUp;
+      const inbox = this.#startingInbox(targetId, true)!;
+      const row = readStartingFollowUp(inbox.root, commandId);
+      if (row) {
         if (!sameHostLeaseOwner(row.lease, lease) || row.lease.ownerIncarnation !== lease.ownerIncarnation)
           throw new FabricParticipantStaleError(targetId, 0, idempotencyKey);
         if (row.event?.from.id !== from.id || !row.event?.data ||
           (row.event.data as FabricControlCommand).targetId !== targetId) throw new Error("Startup followUp idempotency collision");
-        await this.mesh.sync();
+        // Reconfirm durability after an ambiguous prior save and re-emit the wake:
+        // the sender may have closed between committing the row and publishing its hint.
+        writeStartingFollowUp(inbox.root, commandId, row);
         assertStartingHost(this.mesh.root, lease);
+        await this.mesh.publish({ topic: "fabric.control.startup-inbox", kind: "committed", from,
+          to: targetId, data: { commandId } });
         return;
       }
       // The host's real mesh publication stamps the sender/principal envelope. Never
       // reconstruct authority from data, including on replay after the sender closes.
-      const event = await this.mesh.publish({ topic: CONTROL_TOPIC, kind: "followUp", from,
+      const event = await inbox.publish({ topic: CONTROL_TOPIC, kind: "followUp", from,
         principal: input.principal, to: targetId, signal,
         data: (committedAt: number) => {
           assertStartingHost(this.mesh.root, lease);
@@ -642,15 +654,12 @@ export class FabricControlPlane {
             deadlineAt: lease.startup!.until };
         },
       });
-      await this.mesh.writeBatch({ identity: this.identity, ops: [], prepare: () => {
-        signal?.throwIfAborted();
-        assertStartingHost(this.mesh.root, lease);
-        return [{ kind: "put", key, ifVersion: 0, value: { format: 1, lease, event } satisfies StartingFollowUp }];
-      } });
-      await this.mesh.sync();
+      signal?.throwIfAborted();
       assertStartingHost(this.mesh.root, lease);
-      // The original command may have woken a ready receiver before its queue row
-      // existed. Publish a post-commit hint; the durable row (not this hint) owns work.
+      writeStartingFollowUp(inbox.root, commandId, { format: 1, lease, event });
+      assertStartingHost(this.mesh.root, lease);
+      // Only payload-free metadata crosses the global mesh. The private durable
+      // row, not this post-commit hint, owns work.
       await this.mesh.publish({ topic: "fabric.control.startup-inbox", kind: "committed", from,
         to: targetId, data: { commandId } });
     });
@@ -1358,6 +1367,8 @@ export class FabricControlPlane {
     for (const active of this.#activeCommands.values()) active.controller.abort();
     await Promise.allSettled([...this.#activeHandlers]);
     this.#handler = undefined;
+    for (const inbox of this.#startingInboxes.values()) inbox.closeState();
+    this.#startingInboxes.clear();
   }
 
   /** True only when a drain read the log to its end; a gated or paused drain retains its work. */
@@ -1630,13 +1641,14 @@ export class FabricControlPlane {
 
   async #drainStartingFollowUps(): Promise<void> {
     if (!this.#handler) return;
-    for (const entry of this.mesh.listAll(STARTING_QUEUE_PREFIX, { fresh: true })) {
+    const inbox = this.#startingInbox(this.options.hostId);
+    if (!inbox) return;
+    for (const { commandId, row } of listStartingFollowUps(inbox.root)) {
       this.#assertAdmission();
-      const row = entry.value as StartingFollowUp;
       if (row?.format !== 1 || row.acceptance || row.event?.to !== this.options.hostId ||
         row.lease?.ownerIncarnation !== this.incarnation || row.lease.id !== this.options.hostId) continue;
       const command = commandFromEvent(row.event);
-      if (!command || command.operation !== "followUp" || command.ownerIncarnation !== this.incarnation ||
+      if (!command || command.commandId !== commandId || command.operation !== "followUp" || command.ownerIncarnation !== this.incarnation ||
         command.targetId !== this.options.hostId || row.event.verification !== "mesh" ||
         !isObject(row.event.data) || row.event.data.startupLeaseToken !== row.lease.incarnationToken) continue;
       // One owner writes the Main journal. No pre-delivery control-seen claim: a
@@ -1648,13 +1660,12 @@ export class FabricControlPlane {
           current.rootId !== command.targetId || current.identityId !== this.identity.id ||
           current.process?.startTime !== row.lease.startup?.startTime ||
           localStartTime(row.lease.startup!.pid) !== row.lease.startup!.startTime) return;
-        const fresh = this.mesh.get(entry.key, { fresh: true });
-        if (!fresh || (fresh.value as StartingFollowUp).acceptance) return;
+        const fresh = readStartingFollowUp(inbox.root, commandId);
+        if (!fresh || fresh.acceptance) return;
         // The startup deadline bounded admission, not already durable work.
         const acceptance = await this.#handler!(command, row.event.from, new AbortController().signal, row.event.verification);
-        await this.#putFenced(this.mesh, { key: entry.key, ifVersion: fresh.version,
-          identity: this.identity, value: { ...row, acceptance } }, true);
-        await this.mesh.sync();
+        this.#assertAdmission();
+        writeStartingFollowUp(inbox.root, commandId, { ...row, acceptance });
       });
     }
   }

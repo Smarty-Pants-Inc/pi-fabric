@@ -1,0 +1,8 @@
+#!/usr/bin/env node
+// Additive per-artifact restore; default dry-run. Keep the zstd-capable release for rollback.
+import { main } from "../dist/storage/run-log-restore.js";
+try { process.exitCode = await main(process.argv.slice(2)); }
+catch (error) {
+  process.stderr.write(`fabric-restore-run-log: ${error instanceof Error ? error.message : String(error)}\n`);
+  process.exitCode = 1;
+}

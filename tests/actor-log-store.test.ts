@@ -92,6 +92,9 @@ describe("ActorLogStore", () => {
     fs.mkdirSync(source, { mode: 0o700 });
     const receipt = { runId: "latest", ledger: path.join(root, "ledger.jsonl"),
       decision: { decisionId: "decision", routeClass: "bounded-lookup", mode: "live" } };
+    // Mandatory event/status custody is independent of this receipt-specific fixture.
+    fs.writeFileSync(path.join(source, "events.jsonl"), "{}\n");
+    fs.writeFileSync(path.join(source, "status.json"), JSON.stringify({ id: "latest", status: "completed" }));
     const file = path.join(source, "route-dispatch-receipt.json");
     fs.writeFileSync(file, JSON.stringify(receipt), { mode: 0o600 });
     await store.retainRun(actor, "latest", source);
@@ -101,9 +104,9 @@ describe("ActorLogStore", () => {
     expect(JSON.parse(fs.readFileSync(file, "utf8"))).toEqual(receipt);
   });
 
-  it("copies the archive protocol and nested runs, tolerating missing sources and nested-copy failure", async () => {
+  it("copies mandatory archive artifacts and nested runs, rejecting missing sources but tolerating nested-copy failure", async () => {
     const { root, actor, store } = setup();
-    await store.retainRun(actor, "missing", undefined);
+    await expect(store.retainRun(actor, "missing", undefined)).rejects.toThrow(/source is missing/);
     expect(store.retainedRunIds(actor)).toEqual([]);
     const source = path.join(root, "source");
     fs.mkdirSync(path.join(source, "nested"), { recursive: true });

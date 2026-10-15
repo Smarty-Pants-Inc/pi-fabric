@@ -1,5 +1,5 @@
-import fs from "node:fs";
 import { detachedPreview } from "../core/preview.js";
+import { openRunLogSource, statRunLogSource, type RunLogSource } from "../run-log-source.js";
 import { createHash } from "node:crypto";
 import { NativeReaderEventReplay } from "./conversation-native-reader-replay.js";
 import { NativeReaderCheckpoint } from "./conversation-native-reader-checkpoint.js";
@@ -212,7 +212,7 @@ interface RecordPage {
  * picks up the completed record. Nothing partially written is ever surfaced.
  */
 const readBackwardPage = (
-  descriptor: number,
+  descriptor: RunLogSource,
   end: number,
   budget: number,
   includeFinalPartialLine: boolean,
@@ -221,7 +221,7 @@ const readBackwardPage = (
   for (;;) {
     const candidate = Math.max(0, end - windowBudget);
     const buffer = Buffer.allocUnsafe(end - candidate);
-    const bytesRead = fs.readSync(descriptor, buffer, 0, buffer.length, candidate);
+    const bytesRead = descriptor.read(buffer, 0, buffer.length, candidate);
     const data = buffer.subarray(0, Math.max(0, bytesRead));
     if (data.length === 0) return { start: candidate, end: candidate, records: [], offsets: [] };
     const firstNewline = data.indexOf(0x0a);
@@ -283,7 +283,7 @@ const readBackwardPage = (
  * the next read so no partially written record is ever surfaced.
  */
 const readForwardPage = (
-  descriptor: number,
+  descriptor: RunLogSource,
   start: number,
   size: number,
   budget: number,
@@ -293,7 +293,7 @@ const readForwardPage = (
     const limit = Math.min(size, start + windowBudget);
     if (limit <= start) return { start, end: start, records: [], offsets: [] };
     const buffer = Buffer.allocUnsafe(limit - start);
-    const bytesRead = fs.readSync(descriptor, buffer, 0, buffer.length, start);
+    const bytesRead = descriptor.read(buffer, 0, buffer.length, start);
     const data = buffer.subarray(0, Math.max(0, bytesRead));
     if (data.length === 0) return { start, end: start, records: [], offsets: [] };
     const records: string[] = [];
@@ -350,7 +350,7 @@ interface DescriptorGeneration {
 }
 
 interface OpenedDescriptor extends DescriptorGeneration {
-  descriptor: number;
+  descriptor: RunLogSource;
   size: number;
 }
 
@@ -372,23 +372,18 @@ interface FileWindow extends Partial<DescriptorGeneration> {
 
 type FileKind = "session" | "events";
 
-const classifyFile = (filePath: string): FileKind | "unreadable" => {
-  let descriptor: number | undefined;
+const classifyFile = (filePath: string): FileKind => {
+  let descriptor: RunLogSource | undefined;
   try {
-    const noFollow = typeof fs.constants.O_NOFOLLOW === "number" ? fs.constants.O_NOFOLLOW : 0;
-    descriptor = fs.openSync(filePath, fs.constants.O_RDONLY | noFollow);
-    const stat = fs.fstatSync(descriptor);
-    if (!stat.isFile()) return "unreadable";
-    const buffer = Buffer.allocUnsafe(Math.max(1, Math.min(CLASSIFY_PROBE_BYTES, stat.size)));
-    const bytesRead = fs.readSync(descriptor, buffer, 0, buffer.length, 0);
+    descriptor = openRunLogSource(filePath);
+    const buffer = Buffer.allocUnsafe(Math.max(1, Math.min(CLASSIFY_PROBE_BYTES, descriptor.size)));
+    const bytesRead = descriptor.read(buffer, 0, buffer.length, 0);
     const head = buffer.subarray(0, Math.max(0, bytesRead)).toString("utf8");
     const firstLine = head.split("\n", 1)[0] ?? "";
     const parsed = parseRecord(firstLine);
     // Native session files start with a {"type":"session",...} header; worker
     // events.jsonl streams start with RPC events (agent_start, response, …).
     return parsed?.type === "session" ? "session" : "events";
-  } catch {
-    return "unreadable";
   } finally {
     if (descriptor !== undefined) closeQuietly(descriptor);
   }
@@ -397,18 +392,12 @@ const classifyFile = (filePath: string): FileKind | "unreadable" => {
 const openDescriptor = (
   filePath: string,
 ): OpenedDescriptor | { error: string } | undefined => {
-  let descriptor: number | undefined;
+  let descriptor: RunLogSource | undefined;
   try {
-    const noFollow = typeof fs.constants.O_NOFOLLOW === "number" ? fs.constants.O_NOFOLLOW : 0;
-    descriptor = fs.openSync(filePath, fs.constants.O_RDONLY | noFollow);
-    // Windows file IDs exceed Number.MAX_SAFE_INTEGER. Preserve the exact ID
-    // AND creation/modification metadata from the descriptor we actually read.
-    const stat = fs.fstatSync(descriptor, { bigint: true });
-    if (!stat.isFile()) {
-      closeQuietly(descriptor);
-      return { error: "not a regular file" };
-    }
-    const size = Number(stat.size);
+    descriptor = openRunLogSource(filePath);
+    // Physical identity remains exact; all page offsets use decoded bytes.
+    const stat = descriptor.stat;
+    const size = descriptor.size;
     if (!Number.isSafeInteger(size)) throw new Error("file size exceeds safe byte offsets");
     return { descriptor, size, device: stat.dev, inode: stat.ino, birthtime: stat.birthtimeNs, mtime: stat.mtimeNs };
   } catch (error) {
@@ -417,9 +406,9 @@ const openDescriptor = (
   }
 };
 
-const closeQuietly = (descriptor: number): void => {
+const closeQuietly = (descriptor: RunLogSource): void => {
   try {
-    fs.closeSync(descriptor);
+    descriptor.close();
   } catch {
     // best effort
   }
@@ -465,6 +454,7 @@ export class NativeConversationReader {
   #messageKeys = new WeakMap<NativeAgentMessage, string>();
   #entryProjections = new WeakMap<SessionEntry, { entry: NativeTranscriptEntry; messages: NativeAgentMessage[] }>();
   #logClassification: { path: string; kind: FileKind; dev: bigint; ino: bigint; size: bigint; birthtime: bigint; mtime: bigint } | undefined;
+  #classificationError: string | undefined;
   #checkpoint: NativeReaderCheckpoint<NativeReaderState> | undefined;
   #suspendedMetadata: NativeReaderMetadata | undefined;
   readonly #loadedRanges = new Map<FileKind, Array<[number, number]>>();
@@ -549,7 +539,7 @@ export class NativeConversationReader {
       // The log path was given but could not be read: surface it as an
       // unavailable events source instead of silently showing nothing.
       this.#windows.set("events", { head: 0, tail: 0, size: 0, hasOlder: false, unavailable: true });
-      this.#setError(logFile ?? "source log unreadable");
+      this.#setError(this.#classificationError ?? logFile ?? "source log unreadable");
     }
     this.#followed = followLatest !== false;
     this.#ingest(this.#followed);
@@ -915,11 +905,11 @@ export class NativeConversationReader {
       let page: RecordPage;
       try {
         page = readBackwardPage(opened.descriptor, window.head, OLDER_PAGE_BYTES, false);
-      } catch {
+      } catch (error) {
         // No replacement: previously loaded payload/bookmarks remain valid;
         // this backward read failed before any new records were applied.
         window.unavailable = true;
-        this.#setError("Unable to read older history");
+        this.#setError(`${filePath}: ${clipError(error)}`);
         return false;
       }
       if (page.start >= window.head) return false;
@@ -961,6 +951,10 @@ export class NativeConversationReader {
       window.tail = Math.max(window.tail, page.end);
       window.loadedRecords = (window.loadedRecords ?? 0) + page.records.length;
       return true;
+    } catch (error) {
+      window.unavailable = true;
+      this.#setError(`${filePath}: ${clipError(error)}`);
+      return false;
     } finally {
       closeQuietly(opened.descriptor);
     }
@@ -970,7 +964,7 @@ export class NativeConversationReader {
     return createHash("sha256").update(JSON.stringify(records)).digest("hex");
   }
 
-  #matchesLoadedPages(kind: FileKind, descriptor: number, size: number): boolean {
+  #matchesLoadedPages(kind: FileKind, descriptor: RunLogSource, size: number): boolean {
     const pages = this.#loadedPages.get(kind);
     if (!pages?.size) return false;
     // Contradictory evidence can never validate, including after suspension.
@@ -1102,7 +1096,7 @@ export class NativeConversationReader {
         }
       }
       return true;
-    } catch {
+    } catch (error) {
       // Verification, relocation, history reread and followed unread-tail IO
       // form one transaction. Even after apply/clear, retry the ORIGINAL logical
       // boundary on this same inode; never count backwards from a guessed EOF.
@@ -1112,7 +1106,7 @@ export class NativeConversationReader {
       if (savedRanges) this.#loadedRanges.set(kind, savedRanges);
       else this.#loadedRanges.delete(kind);
       this.#windows.set(kind, { ...originalWindow, unavailable: true, replacementPending: true });
-      this.#setError("Unable to read replacement history");
+      this.#setError(`Unable to read replacement history: ${clipError(error)}`);
       return true;
     }
   }
@@ -1134,7 +1128,7 @@ export class NativeConversationReader {
     return this.#pageDigest([raw]);
   }
 
-  #relocateBounds(opened: { descriptor: number; size: number }, headKey: string | undefined, tailKey: string): { head: number; tail: number } | undefined {
+  #relocateBounds(opened: { descriptor: RunLogSource; size: number }, headKey: string | undefined, tailKey: string): { head: number; tail: number } | undefined {
     let head = headKey === undefined ? 0 : undefined;
     let tail: number | undefined;
     let headMatches = 0;
@@ -1481,19 +1475,19 @@ export class NativeConversationReader {
 
   #classifyLog(filePath: string): FileKind | "unreadable" {
     const cached = this.#logClassification;
+    this.#classificationError = undefined;
     try {
-      const stat = fs.lstatSync(filePath, { bigint: true });
+      const stat = statRunLogSource(filePath);
       if (cached?.path === filePath && stat.isFile() && cached.dev === stat.dev && cached.ino === stat.ino &&
         cached.birthtime === stat.birthtimeNs && cached.size > 0n &&
         (stat.size > cached.size || (stat.size === cached.size && stat.mtimeNs === cached.mtime))) {
         return cached.kind;
       }
       const kind = classifyFile(filePath);
-      if (kind !== "unreadable") {
-        this.#logClassification = { path: filePath, kind, dev: stat.dev, ino: stat.ino, size: stat.size, birthtime: stat.birthtimeNs, mtime: stat.mtimeNs };
-        return kind;
-      }
-    } catch {
+      this.#logClassification = { path: filePath, kind, dev: stat.dev, ino: stat.ino, size: stat.size, birthtime: stat.birthtimeNs, mtime: stat.mtimeNs };
+      return kind;
+    } catch (error) {
+      this.#classificationError = clipError(error);
       // Keep a previously classified source attached while it is unavailable.
       // Dropping its path here would discard the user's cached loaded history.
     }
@@ -1560,7 +1554,13 @@ export class NativeConversationReader {
     if (sessionWindow?.unavailable) unavailable.sessionFile = true;
     if (eventsWindow?.unavailable) unavailable.eventsFile = true;
     const hasUnavailable = unavailable.sessionFile || unavailable.eventsFile;
-    const error = hasUnavailable ? this.#error : undefined;
+    const cachedHistory = this.#messages.length > 0 || this.#branch.length > 0 || this.#streaming.active ||
+      this.#streaming.tools.length > 0 || (this.#pendingMessages?.steering.length ?? 0) > 0 ||
+      (this.#pendingMessages?.followUp.length ?? 0) > 0;
+    const warning = cachedHistory ? " · Showing cached history; source could not be verified." : "";
+    const error = hasUnavailable
+      ? `${(this.#error ?? "Transcript unavailable").slice(0, MAX_ERROR_CHARS - warning.length)}${warning}`
+      : undefined;
     const previous = this.#snapshot;
     if (previous && previous.messages === this.#messages && previous.entries === this.#branch &&
       previous.streaming === this.#streaming && previous.pendingMessages === this.#pendingMessages &&

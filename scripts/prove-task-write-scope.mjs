@@ -28,6 +28,7 @@ assert(evidenceRelative && evidenceRelative !== ".." && !evidenceRelative.starts
   "Evidence writes must be inside the assigned worktree");
 const nativePi = option("--pi-binary");
 const extension = path.join(fabricRoot, "dist/index.js");
+const { readRunLogText } = await import(pathToFileURL(path.join(fabricRoot, "dist/run-log-source.js")));
 for (const file of [nativePi, extension, path.join(fabricRoot, "dist/worker.js")]) assert(fs.statSync(file).isFile(), `Missing ${file}`);
 assert(process.env.TMPDIR, "Private TMPDIR required");
 if (process.platform !== "linux") {
@@ -344,7 +345,7 @@ await import(${JSON.stringify(pathToFileURL(nativePi).href)});`);
   assert(Array.isArray(result) && result.length === 3, JSON.stringify(result));
   const records = result.map(item => ({ scenario: item.scenario, result: item.result,
     status: JSON.parse(fs.readFileSync(path.join(runs, item.handle.id, "status.json"), "utf8")),
-    events: fs.readFileSync(path.join(runs, item.handle.id, "events.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line)),
+    events: readRunLogText(path.join(runs, item.handle.id, "events.jsonl")).trim().split("\n").map(line => JSON.parse(line)),
   }));
   assert(records.every(item => item.result.status === "completed"), JSON.stringify(records));
   assert(!fs.existsSync(forbidden), "Default write escaped its roots");
@@ -357,7 +358,7 @@ await import(${JSON.stringify(pathToFileURL(nativePi).href)});`);
   for (const record of protectedRecords) {
     const refusals = defaultTools.filter(message => JSON.stringify(message).includes(record.file) && JSON.stringify(message).includes("outside writable roots"));
     assert.equal(refusals.length, 2, `Native write and edit must refuse ${record.name}`);
-    const current = fs.readFileSync(record.file, "utf8");
+    const current = record.name === "events.jsonl" ? readRunLogText(record.file) : fs.readFileSync(record.file, "utf8");
     if (record.name === "completion-recipient.json") assert.equal(current, record.before);
     else if (record.name === "events.jsonl") assert(current.startsWith(record.before), "Host event history must not be overwritten");
     else assert.equal(JSON.parse(current).id, path.basename(path.dirname(record.file)), "Host status identity must survive");

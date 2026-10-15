@@ -37,6 +37,30 @@ const hostedOnlyDeletionSuites = [
   "tests/temp-run-sweep.test.ts", // scriptSpawnArgs selects Bun for the real .ts sweep entry.
   "tests/verified-remove-windows.test.ts", // fabric-win-remove.exe deletes by handle, outside Node fs.
   "tests/windows-temp-root-native.test.ts", // diskpart formats a native NTFS VHD mounted outside TMPDIR.
+  // smarty-dev#3252/#4664: actual product compaction/pruning and terminal-writer retirement run hosted only.
+  // Recorded-call/dry-run companions stay local; GITHUB_ACTIONS still removes every exclusion below.
+  "tests/actor-log-store.test.ts", // positive archive pruning executes verifiedRemove.
+  "tests/conversation-native-reader.test.ts", // direct successful terminal log replacement.
+  "tests/conversation-native-reader-suspension.test.ts",
+  "tests/conversation-native-reader-generation.test.ts", // suspended reader checkpoint disposal removes product files.
+  "tests/log-cursor-generation.test.ts", // cursor rollover uses the actual terminal compactor.
+  "tests/mesh-retention-sweep.test.ts", // positive removeUnreferencedRun helper bypasses the public dry-run.
+  "tests/production-worker-retention.test.ts", // real worker finalization and positive run/archive collection.
+  "tests/residency-retention.test.ts", // positive resident run/request collection.
+  "tests/retention.test.ts", // positive terminal compaction and run/archive deletion.
+  "tests/run-retention-compaction.test.ts", // positive compaction, archive prune and run-root sweep.
+  "tests/run-directory-mode.test.ts", // real archive replacement and failure-temp removal.
+  "tests/worker-run-log.test.ts", // actual compactor and real worker finalization.
+  "tests/worker-run-log-legacy-reuse.test.ts", // direct successful terminal log replacement.
+  "tests/durable-worker-e2e.test.ts", // real worker completion can retire its owned plain log.
+  "tests/worker-child-questions.test.ts", // real worker terminal/cancelled completion.
+  "tests/worker-e2e.test.ts", // real worker finalization; also explicitly selected by hosted check.
+  "tests/worker-exit-grace.test.ts", // real worker completed/failed terminal paths.
+  "tests/worker-interrupted-report.test.ts", // includes normal real-worker terminal paths.
+  "tests/worker-steer-ended.test.ts", // completed real-worker run through AgentManager.
+  "tests/worker-terminal-task.test.ts", // successful real-worker terminal completion.
+  "tests/worker-tool-call-native.test.ts", // real worker terminal success/failure.
+  "tests/worker-tool-call-stream.test.ts", // real worker terminal success/failure.
 ];
 
 /** Unguarded or reverted deletion suites stay hosted-only; GitHub Actions always collects every suite. */

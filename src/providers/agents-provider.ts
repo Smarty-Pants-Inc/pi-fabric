@@ -119,7 +119,7 @@ import {
 } from "../agents/runner-registry.js";
 import { ResidencyClient } from "../residency/client.js";
 import { ResidentActorClient } from "../residency/actor-client.js";
-import { AgentTranscriptReader } from "../ui/transcript.js";
+import { AgentTranscriptReader } from "../ui/transcript-reader.js";
 import { waitWithProgress, waitWithActorProgress } from "./agents-progress.js";
 import { AgentMessageRouter, unknownParticipant } from "./agents-message-router.js";
 import { terminalAgentStatuses } from "../agents/lifecycle.js";

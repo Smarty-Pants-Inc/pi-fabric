@@ -916,6 +916,7 @@ export class ActorManager {
   readonly #slots: ReturnType<typeof slotAdmissionFor>;
   readonly #slotRecovery: ActorSlotRecovery;
   readonly #slotNameRegistries: readonly ActorRegistryStore[];
+  readonly #creationNameReservations: Set<string>;
   readonly #slotEnabled = new Set<string>();
   readonly #slotRunIds = new Map<string, Set<string>>();
   readonly #slotLaunchUnknown = new Set<string>();
@@ -935,6 +936,8 @@ export class ActorManager {
       slotRecovery?: ActorSlotRecovery;
       /** Native-only directory registries: fence names across scopes during live/recovery projection. */
       slotNameRegistries?: readonly ActorRegistryStore[];
+      /** Native-only in-process create reservations, shared across directory scopes. */
+      creationNameReservations?: Set<string>;
       actorRoot?: string;
       actorScope?: import("./types.js").FabricActorStorageScope;
       persistent?: boolean;
@@ -1060,6 +1063,7 @@ export class ActorManager {
     });
     this.#registry = new ActorRegistryStore(this.#actorRoot);
     this.#slotNameRegistries = options.slotNameRegistries ?? [];
+    this.#creationNameReservations = options.creationNameReservations ?? new Set<string>();
     this.#bindings = new ActorBindingStore(
       sessionId,
       this.#persistent && meshConfig.enabled ? this.#actorRoot : undefined,
@@ -1194,6 +1198,7 @@ export class ActorManager {
   ): Promise<FabricActorInfo> {
     this.#assertReleaseAdmission();
     ++this.#pendingCreates;
+    let reservedName: string | undefined;
     try {
     this.#refreshOwnership();
     const registryOwnerCreate = asRegistryOwner && request.residency === "durable";
@@ -1212,6 +1217,14 @@ export class ActorManager {
     if (!this.meshConfig.enabled) throw new Error("Fabric mesh and actors are disabled");
     const name = request.name.trim();
     if (!ACTOR_NAME_PATTERN.test(name)) throw new Error(`Invalid Fabric actor name: ${name}`);
+    // Ordinary map insertion must not race protected check+intent while core admission
+    // yields under registry custody. First reservation wins; different names stay parallel.
+    if (this.#creationNameReservations.has(name)) {
+      throw new Error(`A Fabric actor named ${name} is already active (creation in progress; retry)`);
+    }
+    this.#creationNameReservations.add(name);
+    reservedName = name;
+    request = { ...request, name }; // Capture the canonical name before any awaited preparation.
     // A predecessor whose removal is pending keeps its name until its run ends (smarty-dev#2184).
     const sameName = [...this.#actors.values()].find((actor) => actor.name === name && !actor.removal);
     const protectedBirth = this.#slotEnforced(request.topics ?? []);
@@ -1390,7 +1403,11 @@ export class ActorManager {
       throw new ActorSlotCreateUncertainError({ actorId: id, claimKey: request.slotClaim?.key,
         claimVersion: request.slotClaim?.ifVersion, requestKey: request.idempotencyKey }, error);
     }
-    } finally { --this.#pendingCreates; }
+    } finally {
+      // A rejected contender never owns (and must never release) another create's key.
+      if (reservedName !== undefined) this.#creationNameReservations.delete(reservedName);
+      --this.#pendingCreates;
+    }
   }
 
   #assertNoOrdinaryNameConflict(name: string): void {

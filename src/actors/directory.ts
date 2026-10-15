@@ -43,6 +43,8 @@ export class ActorDirectory extends ActorManager {
     defaultScope: FabricActorStorageScope,
   ) {
     const options = { ...(base[6] ?? {}), slotRecovery: base[6]?.slotRecovery ?? new ActorSlotRecovery(),
+      // Delegated create acquires once in its target manager, never recursively here.
+      creationNameReservations: base[6]?.creationNameReservations ?? new Set<string>(),
       // Both managers (including startup recovery) fence actual registry rows,
       // not list() views which intentionally hide quarantined protected actors.
       slotNameRegistries: base[6]?.persistent === true

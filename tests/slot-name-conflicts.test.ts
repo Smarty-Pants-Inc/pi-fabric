@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ActorDirectory } from "../src/actors/directory.js";
+import { ActorManager } from "../src/actors/manager.js";
 import { ActorRegistryStore } from "../src/actors/registry-store.js";
 import type { AgentManager } from "../src/agents/manager.js";
 import type { FabricActorRequest, FabricActorStorageScope } from "../src/actors/types.js";
@@ -34,7 +35,7 @@ const request = (scope: FabricActorStorageScope): FabricActorRequest => ({
 });
 type Intent = { actorId: string; registryRoot: string; spec: Record<string, unknown>; request: string; state: "admitted" };
 let intents: Intent[];
-const roots: string[] = [], directories: ActorDirectory[] = [];
+const roots: string[] = [], directories: ActorManager[] = [];
 const run = vi.fn(() => { throw new Error("Workers are forbidden in this suite"); });
 
 beforeEach(() => {
@@ -89,6 +90,13 @@ function open(root = fs.mkdtempSync(path.join(os.tmpdir(), "slot-names-"))) {
   directories.push(directory);
   return { root, directory, actorRoots };
 }
+function gate() {
+  let release!: () => void;
+  const wait = new Promise<void>(resolve => { release = resolve; });
+  return { wait, release };
+}
+const outcome = <T>(pending: Promise<T>) => pending.then(value => ({ value, error: undefined }), error => ({ value: undefined, error }));
+const scopePairs = scopes.flatMap(first => scopes.map(second => ({ first, second })));
 const rows = (root: string) => new ActorRegistryStore(root).snapshot().actors;
 const namedRows = (actorRoots: { project: string; session: string }) => scopes.flatMap(scope => rows(actorRoots[scope])).filter(row => row.name === request("project").name);
 
@@ -118,6 +126,84 @@ function queueBytes(registryRoot: string, id: string) {
 }
 
 describe("ordinary name conflicts remain cross-platform", () => {
+  it.each(scopePairs)("reserves trimmed names across $first -> $second, including a third contender", async ({ first, second }) => {
+    const { directory, actorRoots } = open();
+    const entered = gate(), held = gate();
+    const original = { scope: first, name: "  reserved-name  ", instructions: "Ordinary first" };
+    const firstCreate = outcome(directory.create(original, { beforeCommit: async () => { entered.release(); await held.wait; } }));
+    await entered.wait;
+    original.name = "caller-mutated";
+    try {
+      for (let contender = 0; contender < 2; contender++) {
+        const acceptance = vi.fn();
+        const result = await outcome(directory.create({ scope: second, name: "reserved-name", instructions: "Contender" }, { beforeCommit: acceptance }));
+        expect(result.error).toBeInstanceOf(Error);
+        expect(result.error.message).toMatch(/already active/);
+        expect(acceptance).not.toHaveBeenCalled();
+        expect(directory.listOwned()).toEqual([]);
+        expect(scopes.flatMap(scope => rows(actorRoots[scope]))).toEqual([]);
+      }
+      // A different key is not queued behind the held name.
+      const parallel = await directory.create({ scope: second, name: "independent-name", instructions: "Parallel" });
+      expect(parallel.name).toBe("independent-name");
+    } finally { held.release(); await firstCreate; }
+    const result = await firstCreate;
+    expect(result.error).toBeUndefined();
+    expect(result.value?.name).toBe("reserved-name");
+    expect(intents).toEqual([]);
+  });
+
+  it("standalone manager reserves and retains ownership after rejecting a contender", async () => {
+    const { directory, actorRoots } = open();
+    const manager = new ActorManager("alpha", identity, directory.mesh, DEFAULT_FABRIC_CONFIG.mesh, directory.agents, () => {}, {
+      persistent: true, actorRoot: actorRoots.project, rootId: identity.id, claimResidency: "session", releasePaused: true,
+      canConsumeMesh: () => false, meshRetentionSweepPath: false, reapDeadSessionPresence: false,
+    });
+    directories.push(manager);
+    const entered = gate(), held = gate();
+    const pending = outcome(manager.create({ name: "standalone", instructions: "First" }, {
+      beforeCommit: async () => { entered.release(); await held.wait; },
+    }));
+    await entered.wait;
+    try {
+      for (let contender = 0; contender < 2; contender++) {
+        await expect(manager.create({ name: " standalone ", instructions: "Contender" })).rejects.toThrow(/already active/);
+        expect(manager.listOwned()).toEqual([]);
+      }
+    } finally { held.release(); await pending; }
+    expect((await pending).value?.name).toBe("standalone");
+    expect(rows(actorRoots.project)).toHaveLength(1);
+  });
+
+  it.each(scopes)("releases %s reservation after validation or an ordinary hook throws", async scope => {
+    const { directory, actorRoots } = open();
+    const ordinary = { scope, name: "release-name", instructions: "Valid" };
+    await expect(directory.create({ ...ordinary, instructions: "" })).rejects.toThrow(/instructions/);
+    await expect(directory.create({ ...ordinary, runner: "invalid" as "pi" })).rejects.toThrow(/runner/);
+    await expect(directory.create(ordinary, { beforeCommit: () => { throw new Error("ordinary hook failed"); } })).rejects.toThrow("ordinary hook failed");
+    expect(rows(actorRoots[scope])).toEqual([]);
+    const actor = await directory.create(ordinary);
+    expect(rows(actorRoots[scope]).map(row => row.id)).toEqual([actor.id]);
+  });
+
+  it.each(scopes)("retains sequential ordinary %s replacement with recorded cross-scope cleanup", async scope => {
+    const { directory, actorRoots } = open();
+    const predecessorScope = other(scope);
+    const predecessor = await directory.create({ scope: predecessorScope, name: "ordinary-replacement", instructions: "Predecessor" });
+    await directory.stop(predecessor.id);
+    const queues = queueBytes(actorRoots[predecessorScope], predecessor.id);
+    const cleanup = cleanupDouble(actorRoots[predecessorScope]);
+    const removal = vi.spyOn(directory, "remove").mockImplementation(cleanup.complete);
+    const actor = await directory.create({ scope, name: predecessor.name, instructions: "Successor" });
+    expect(actor.id).not.toBe(predecessor.id);
+    expect(removal).toHaveBeenCalledExactlyOnceWith(predecessor.id, { wait: false });
+    expect(cleanup.receipts.map(receipt => receipt.id)).toEqual([predecessor.id]);
+    expect(scopes.flatMap(scope => rows(actorRoots[scope])).map(row => row.id)).toEqual([actor.id]);
+    expect(fs.existsSync(path.join(actorRoots[predecessorScope], predecessor.id))).toBe(true);
+    expect(queueBytes(actorRoots[predecessorScope], predecessor.id)).toEqual(queues);
+    expect(intents).toEqual([]);
+  });
+
   it.each(scopes)("still creates an ordinary %s actor and rejects an active duplicate", async scope => {
     const { directory, actorRoots } = open();
     const ordinary = { scope, name: "ordinary", instructions: "No protected subscription" };
@@ -133,6 +219,100 @@ describe("ordinary name conflicts remain cross-platform", () => {
 // fresh native authority uses /etc/machine-id and /proc. No platform widening.
 // The core double deliberately does NOT claim to test that authority binding.
 describe.runIf(process.platform === "linux")("protected slot native name conflicts (#7991 R1-2)", () => {
+  it.each(scopePairs)("ordinary $first reservation rejects protected $second before intent, including a third contender", async ({ first, second }) => {
+    const { directory, actorRoots } = open();
+    const entered = gate(), held = gate();
+    const ordinary = { scope: first, name: `  ${request(second).name}  `, instructions: "Ordinary first" };
+    const pending = outcome(directory.create(ordinary, { beforeCommit: async () => { entered.release(); await held.wait; } }));
+    await entered.wait;
+    ordinary.name = "caller-mutated";
+    try {
+      for (let contender = 0; contender < 2; contender++) {
+        const acceptance = vi.fn(), materialization = vi.fn(), receipt = vi.fn();
+        const result = await outcome(directory.create(request(second), { beforeCommit: acceptance, beforeMaterialize: materialization, onCommit: receipt }));
+        expect(result.error).toBeInstanceOf(Error);
+        expect(result.error.message).toMatch(/already active/);
+        expect(intents).toEqual([]);
+        expect(acceptance).not.toHaveBeenCalled();
+        expect(materialization).not.toHaveBeenCalled();
+        expect(receipt).not.toHaveBeenCalled();
+        expect(namedRows(actorRoots)).toEqual([]);
+        expect(directory.listOwned()).toEqual([]);
+      }
+    } finally { held.release(); await pending; }
+    const result = await pending;
+    expect(result.error).toBeUndefined();
+    expect(namedRows(actorRoots).map(row => row.id)).toEqual([result.value!.id]);
+    expect(intents).toEqual([]);
+  });
+
+  it.each(scopePairs)("protected $first reservation excludes ordinary $second while core admission yields", async ({ first, second }) => {
+    const { directory, actorRoots } = open();
+    const entered = gate(), held = gate();
+    const coordinator = doubles.coordinator as { admit: (input: { request: FabricActorRequest; registryRoot: string }) => Promise<unknown> };
+    const admit = coordinator.admit.bind(coordinator);
+    vi.spyOn(coordinator, "admit").mockImplementationOnce(async input => {
+      if (input.request.topics?.includes(topic)) {
+        // Core is entered only after the manager's under-custody conflict check.
+        expect(fs.existsSync(path.join(input.registryRoot, "actors.json.lock", "owner"))).toBe(true);
+        expect(namedRows(actorRoots)).toEqual([]);
+        entered.release();
+        await held.wait;
+      }
+      return admit(input);
+    });
+    const pending = outcome(directory.create(request(first)));
+    await entered.wait;
+    let ordinary: ReturnType<typeof outcome<Awaited<ReturnType<ActorManager["create"]>>>> | undefined;
+    const inserted = gate();
+    const unsubscribe = directory.subscribe(() => {
+      if (directory.listOwned().some(actor => actor.name === request(first).name && !actor.topics.includes(topic))) inserted.release();
+    });
+    try {
+      const acceptance = vi.fn(), materialization = vi.fn(), receipt = vi.fn();
+      ordinary = outcome(directory.create({ scope: second, name: ` ${request(first).name} `, instructions: "Ordinary contender" }, {
+        beforeCommit: acceptance, beforeMaterialize: materialization, onCommit: receipt,
+      }));
+      // Baseline reaches the real map insertion even if its save blocks on the held registry.
+      const result = await Promise.race([ordinary, inserted.wait.then(() => ({ error: undefined, value: undefined }))]);
+      expect(result.error).toBeInstanceOf(Error);
+      expect(result.error.message).toMatch(/already active/);
+      expect(acceptance).not.toHaveBeenCalled();
+      expect(materialization).not.toHaveBeenCalled();
+      expect(receipt).not.toHaveBeenCalled();
+      await expect(directory.create({ scope: second, name: request(first).name, instructions: "Third contender" })).rejects.toThrow(/already active/);
+      expect(intents).toEqual([]);
+      expect(namedRows(actorRoots)).toEqual([]);
+      expect(directory.listOwned()).toEqual([]);
+    } finally { unsubscribe(); held.release(); await pending; await ordinary; }
+    const result = await pending;
+    expect(result.error).toBeUndefined();
+    const actor = result.value!;
+    expect(intents.map(intent => intent.actorId)).toEqual([actor.id]);
+    expect(namedRows(actorRoots).map(row => row.id)).toEqual([actor.id]);
+    expect(directory.listOwned().map(row => row.id)).toEqual([actor.id]);
+    directory.tell(actor.id, "Retained exact-retry work");
+    await directory.setInstructions(actor.id, request(first).instructions);
+    const queues = queueBytes(actorRoots[first], actor.id);
+    expect((await directory.create(request(first))).id).toBe(actor.id);
+    expect(queueBytes(actorRoots[first], actor.id)).toEqual(queues);
+    expect(directory.status(actor.id).queued).toBe(1);
+    expect(intents).toHaveLength(1);
+  });
+
+  it.each(scopes)("releases %s reservation after protected admission throws", async scope => {
+    const { directory, actorRoots } = open();
+    const coordinator = doubles.coordinator as { admit: (...args: unknown[]) => Promise<unknown> };
+    vi.spyOn(coordinator, "admit").mockRejectedValueOnce(new Error("admission failed"));
+    await expect(directory.create(request(scope))).rejects.toThrow("admission failed");
+    expect(intents).toEqual([]);
+    expect(namedRows(actorRoots)).toEqual([]);
+    const actor = await directory.create(request(scope));
+    expect((await directory.create(request(scope))).id).toBe(actor.id);
+    expect(namedRows(actorRoots).map(row => row.id)).toEqual([actor.id]);
+    expect(intents).toHaveLength(1);
+  });
+
   it.each(scopes)("rejects active same-%s ordinary conflict before intent or receipt effects", async scope => {
     const { directory, actorRoots } = open();
     const predecessor = await directory.create({ name: request(scope).name, instructions: "Ordinary incumbent", scope });

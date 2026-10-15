@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agents/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { mkdirPrivate, privateDirTestHooks } from "../src/storage/private-dir.js";
+import { UnsafeDirectory } from "../src/storage/private-dir-policy.js";
 import { fabricDataRoot } from "../src/storage/temp-root.js";
 
 // smarty-dev#9527 (measured on m4): on darwin the private-dir walk refuses to pass a root-owned sticky shared ancestor
@@ -454,6 +455,71 @@ describe.skipIf(process.platform === "win32")("darwin file-data root under a roo
     expect(fs.existsSync(path.join(destination, "missing"))).toBe(false);
     expect(fs.readFileSync(file, "utf8")).toBe("keep");
     expect(fs.readdirSync(root).sort()).toEqual(["destination", "file", "file-tmp", "shared"]);
+    expect(fs.readdirSync(shared)).toEqual([]);
+  });
+
+  // Input validation: a symlink-following or physical-chain stat ENOTDIR is the same #9527 non-directory refusal as an
+  // lstat ENOTDIR (UnsafeDirectory), never a raw errno and never a missing suffix.
+  const cases = modes.flatMap(m => entrypoints.map(entry => [m, entry] as const));
+  const notDirectory = (walked: string, target: string) =>
+    `${walked} has an ancestor that is not a directory: Fabric cannot keep ${target} private under it (smarty-dev#9527)`;
+  const dataTarget = (m: (typeof modes)[number], alias: string) => m === "PI_FABRIC_TMPDIR" ? path.join(alias, "missing", "data") : alias;
+  const expectUnsafe = (entry: (typeof entrypoints)[number], message: string) => {
+    let caught: unknown;
+    try { if (entry === "fabricDataRoot") fabricDataRoot(); else manager(); } catch (error) { caught = error; }
+    expect.soft(caught).toBeInstanceOf(UnsafeDirectory);
+    expect.soft((caught as Error | undefined)?.message).toBe(message);
+  };
+
+  it.each(cases)("%s via %s: a followed symlink whose target has a regular-file ancestor (stat ENOTDIR) is refused (#9527 non-directory), nothing created", (mode, entry) => {
+    const { root, shared, mkdir, mkdtemp } = darwinFixture(true);
+    const file = path.join(root, "file");
+    fs.writeFileSync(file, "keep");
+    const alias = path.join(root, "notdir-tmp");
+    fs.symlinkSync(path.join(file, "sub"), alias, "dir");
+    // Real fixture facts: the link itself lstats fine; following it fails with ENOTDIR (a regular-file ancestor).
+    expect(fs.lstatSync(alias).isSymbolicLink()).toBe(true);
+    expect(errorCode(() => fs.statSync(alias))).toBe("ENOTDIR");
+    mkdir.mockClear(); mkdtemp.mockClear();
+    useAlias(mode, alias);
+    expectUnsafe(entry, notDirectory(alias, dataTarget(mode, alias)));
+    expect(mkdtemp).not.toHaveBeenCalled();
+    expect(createdBelow(mkdir.mock.calls, root)).toEqual([]);
+    expect(fs.readFileSync(file, "utf8")).toBe("keep");
+    expect(fs.readdirSync(root).sort()).toEqual(["file", "notdir-tmp", "shared"]);
+    expect(fs.readdirSync(shared)).toEqual([]);
+  });
+
+  it.each(cases)("%s via %s: a physical-chain stat ENOTDIR after a successful lexical walk and realpath is refused (#9527 non-directory), nothing created", (mode, entry) => {
+    const { root, shared, mkdir, mkdtemp } = darwinFixture(true);
+    const physical = path.join(root, "safe");
+    fs.mkdirSync(physical, { mode: 0o700 }); fs.chmodSync(physical, 0o700);
+    const alias = path.join(root, "physical-tmp");
+    fs.symlinkSync(physical, alias, "dir");
+    // ENOTDIR through the existing statSync spy, only for the physical path: the lexical walk stats the alias instead.
+    const inner = vi.mocked(fs.statSync).getMockImplementation()!;
+    const denied: string[] = [];
+    vi.mocked(fs.statSync).mockImplementation(((target: fs.PathLike, ...rest: unknown[]) => {
+      const resolved = path.resolve(String(target));
+      if (resolved === physical) {
+        denied.push(resolved);
+        throw Object.assign(new Error(`ENOTDIR: not a directory, stat '${resolved}'`), { code: "ENOTDIR", errno: -20, syscall: "stat", path: resolved });
+      }
+      return (inner as (...args: unknown[]) => fs.Stats | undefined)(target, ...rest);
+    }) as typeof fs.statSync);
+    expect(fs.lstatSync(alias).isSymbolicLink()).toBe(true);
+    expect(fs.statSync(alias).isDirectory()).toBe(true);
+    expect(fs.realpathSync(alias)).toBe(physical);
+    expect(errorCode(() => fs.statSync(physical))).toBe("ENOTDIR");
+    denied.length = 0;
+    mkdir.mockClear(); mkdtemp.mockClear();
+    useAlias(mode, alias);
+    expectUnsafe(entry, notDirectory(physical, dataTarget(mode, alias)));
+    expect(denied).toContain(physical);
+    expect(mkdtemp).not.toHaveBeenCalled();
+    expect(createdBelow(mkdir.mock.calls, root)).toEqual([]);
+    expect(fs.readdirSync(physical)).toEqual([]);
+    expect(fs.readdirSync(root).sort()).toEqual(["physical-tmp", "safe", "shared"]);
     expect(fs.readdirSync(shared)).toEqual([]);
   });
 });

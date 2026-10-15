@@ -11,6 +11,15 @@ const refuseNonDirectory = (stat: fs.Stats | undefined, walked: string, target: 
     + `Fabric cannot keep ${target} private under it (smarty-dev#9527)`);
 };
 
+/** Symlink-following stat of an existing component: ENOTDIR is the same non-directory refusal; any other error throws. */
+const statExisting = (file: string, target: string): fs.Stats => {
+  try { return fs.statSync(file); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOTDIR") refuseNonDirectory(undefined, file, target);
+    throw error;
+  }
+};
+
 /**
  * macOS (smarty-dev#9527): refuse a root-owned sticky shared ancestor (/tmp, /private/tmp) of the data root BEFORE
  * anything is created at or below it (the override mkdir walk below, or a caller's mkdtemp such as AgentManager's
@@ -19,7 +28,7 @@ const refuseNonDirectory = (stat: fs.Stats | undefined, walked: string, target: 
  * Then checks the PHYSICAL chain of the deepest existing directory (realpath), so a symlink lexically outside the
  * shared directory cannot name a child inside it. A dangling or unresolvable symlink, or any realpath/stat error on
  * the existing prefix, throws (fail-closed, nothing written); an existing component (lexical or physical) that is not a
- * directory in its stat snapshot, or an lstat ENOTDIR, is refused; only a missing lexical component (lstat ENOENT)
+ * directory in its stat snapshot, or an lstat/stat ENOTDIR, is refused; only a missing lexical component (lstat ENOENT)
  * ends the walk, and the missing suffix is never realpath'ed. Ownership and symlink policy stay with the existing validators.
  * Returns the vetted physical path (realpath of the deepest existing directory joined with the lexical missing suffix)
  * so callers never re-follow a mutable alias chain after the check; any other platform gets its input back unchanged.
@@ -39,7 +48,7 @@ const refuseDarwinSharedSticky = (directory: string): string => {
       if (errno === "ENOTDIR") refuseNonDirectory(undefined, walked, target); // fail-closed, never a missing suffix
       throw error;
     }
-    if (stat.isSymbolicLink()) stat = fs.statSync(walked); // dangling/unresolvable link throws: refuse, never create
+    if (stat.isSymbolicLink()) stat = statExisting(walked, target); // dangling/unresolvable link throws: refuse, never create
     refuseNonDirectory(stat, walked, target); // this snapshot decides, even if the target later becomes a directory
     refuseSharedSticky(stat, walked, target);
     deepest = walked;
@@ -49,7 +58,7 @@ const refuseDarwinSharedSticky = (directory: string): string => {
   let real = path.parse(physical).root;
   for (const name of ["", ...physical.slice(real.length).split(path.sep).filter(Boolean)]) {
     real = path.join(real, name);
-    const realStat = fs.statSync(real);
+    const realStat = statExisting(real, target);
     refuseNonDirectory(realStat, real, target);
     refuseSharedSticky(realStat, real, target);
   }

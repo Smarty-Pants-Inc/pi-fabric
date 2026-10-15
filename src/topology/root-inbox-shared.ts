@@ -48,6 +48,8 @@ export interface RootInboxReconcileOptions {
   commitOnly?: boolean;
   /** A turn boundary is positive progress evidence for the pending-batch wedge alarm. */
   turnEnd?: boolean;
+  /** A new run or completed settle admits exact-session work without the shadow grace. */
+  priority?: boolean;
 }
 
 export const workKey = (data: unknown): string | undefined => {

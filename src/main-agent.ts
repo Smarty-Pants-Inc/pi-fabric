@@ -103,6 +103,8 @@ export interface FabricAgentMessageResult extends Partial<FabricFollowUpQueueDep
   triggered?: boolean;
   /** Why a requested wake was held, e.g. provider-backoff until an ISO timestamp. */
   reason?: string;
+  /** Main is held by an operator halt; peer followUps remain passive. */
+  halted?: true;
   /** Main had already admitted this deliveryId; nothing was sent again. */
   duplicate?: true;
   /** This followUp replaced a held one with the same sender and data.coalesceKey. */
@@ -415,6 +417,7 @@ export class MainAgentController implements FabricMainAgentTarget {
   #suspended = false;
   // Owner stop, unlike a run's signal: survives reload and lifts only on user input.
   #halted = false;
+  #peerSteerInFlight = false;
   // Provider failures hold peer wakes temporarily; only owner stops suppress them indefinitely.
   #providerFailed = false;
   #providerFailures = 0;
@@ -459,6 +462,7 @@ export class MainAgentController implements FabricMainAgentTarget {
     readonly interruptAuthority: FabricInterruptAuthority = {},
     readonly onProviderDead?: (event: FabricMainProviderDeadEvent) => void,
     readonly meshRoot?: string,
+    readonly peerSteerResume = false,
   ) {}
 
   /** This Main's live drain owns non-retryable provider recovery (smarty-dev#8742). */
@@ -589,6 +593,7 @@ export class MainAgentController implements FabricMainAgentTarget {
   halt(): void {
     this.#interrupts.clear();
     this.#halted = true;
+    this.#peerSteerInFlight = false;
     this.#providerReleaseUntil = undefined;
     this.#consumedDirty = true;
     const index = this.#consumedPath();
@@ -659,7 +664,22 @@ export class MainAgentController implements FabricMainAgentTarget {
     };
     // Retry required owner authority at the next delivery, even without a durable delivery id.
     this.#retryPendingHalt();
-    const triggerTurn = (request.triggerTurn ?? true) && !this.#halted;
+    // Only a project-agent's new peer escalation control envelope gets one run; halt stays latched.
+    // Replays return above; producer/backlog delivery and sender diagnostics grant no wake.
+    const peerSteerWake = this.#halted && this.peerSteerResume && !this.#peerSteerInFlight && request.delivery === "steer" && request.triggerTurn !== false &&
+      (request.verification === "mesh" || request.verification === "bridge") && sender.kind === "main" && sender.id !== this.id &&
+      request.source === undefined && request.admissionTopic === undefined && !request.priority &&
+      admittedCauses?.length === 1 && admittedCauses[0]!.cause === "steer" &&
+      admittedCauses[0]!.topic === "fabric.control.command" &&
+      admittedCauses[0]!.from.id === sender.id && admittedCauses[0]!.from.kind === "main" &&
+      !this.#reloading && this.#bindingsLive && this.#context !== undefined && extensionContextLive(this.#context) &&
+      this.#context.isIdle() && (this.#context as { isSettling?: () => boolean }).isSettling?.() === false &&
+      !this.#context.signal?.aborted && !promptPending(this.#context) && !this.#haltIndexUnknown &&
+      !this.#providerHeld() && !this.#providerAttemptInFlight;
+    if (peerSteerWake) this.#peerSteerInFlight = true;
+    const restorePeerWakeOnFailure = (): void => { if (peerSteerWake) this.halt(); };
+    const triggerTurn = (request.triggerTurn ?? true) && (peerSteerWake || !this.#halted);
+    const operatorHalted = this.#halted && !peerSteerWake;
     const providerHeld = triggerTurn && request.delivery !== "nextTurn" &&
       !this.#context?.signal?.aborted && (this.#providerHeld() || this.#providerAttemptInFlight);
     if (providerHeld && request.delivery === "steer") {
@@ -772,22 +792,26 @@ export class MainAgentController implements FabricMainAgentTarget {
         this.#save();
       } catch (error) {
         this.#sent.pop();
+        restorePeerWakeOnFailure();
         throw new Error(`Main could not record the message: ${error instanceof Error ? error.message : String(error)}`);
       }
       try {
-        triggered = this.#send([item], request.delivery, triggerTurn, false);
+        triggered = this.#send([item], request.delivery, triggerTurn, false, peerSteerWake);
       } catch (error) {
         this.#sent.splice(this.#sent.indexOf(item), 1);
         this.#trySave();
+        restorePeerWakeOnFailure();
         throw error;
       }
     } else {
-      triggered = this.#send([item], request.delivery, triggerTurn, false);
+      try { triggered = this.#send([item], request.delivery, triggerTurn, false, peerSteerWake); }
+      catch (error) { restorePeerWakeOnFailure(); throw error; }
     }
     return {
       queued: true, messageId: item.id, routed: "main",
       ...(triggered === undefined ? {} : { triggered }),
-      ...(providerHeld ? { reason: this.#providerHoldReason() } : {}),
+      ...(operatorHalted ? { halted: true as const, reason: "operator-halt" } :
+        providerHeld ? { reason: this.#providerHoldReason() } : {}),
       ...(replaced ? { coalesced: true as const, replacedMessageId: replaced.id } : {}),
       // Only a followUp that waits in the held queue can be stalled; a non-triggering one went
       // straight to Pi (#123 review F1).
@@ -1232,6 +1256,7 @@ export class MainAgentController implements FabricMainAgentTarget {
     on("input", (event: { source?: string }, ctx) => {
       this.#context = ctx;
       if (event.source === "extension") return;
+      this.#peerSteerInFlight = false;
       this.#interruptUsedThisTurn = false;
       this.#interruptResume = false;
       if (this.#switching) { this.#switching = false; this.#reloading = false; this.#bindingsLive = true; }
@@ -1288,6 +1313,7 @@ export class MainAgentController implements FabricMainAgentTarget {
     let interruptedSettle = false;
     on("agent_settled", (_event, ctx) => {
       this.#context = ctx;
+      this.#peerSteerInFlight = false;
       this.#tools.clear();
       interruptedSettle = this.#interrupts.size > 0;
       while (this.#held[0] && this.#interrupts.has(this.#held[0].id)) {
@@ -1988,11 +2014,12 @@ export class MainAgentController implements FabricMainAgentTarget {
     deliverAs: FabricMainAgentDelivery,
     triggerTurn: boolean,
     flushed: boolean,
+    peerSteer = false,
   ): boolean | undefined {
     items = items.filter(item => !this.#inboxFence || this.#inboxFence.owns(item.id));
     if (this.#reloading || !items.length || (this.#inboxFence && !this.#inboxFence.active())) return false;
     const interrupt = this.#context?.isIdle() === true && items.every(item => this.#interrupts.has(item.id));
-    triggerTurn &&= !this.#halted && !this.#providerHeld() && (!this.#context?.signal?.aborted || interrupt);
+    triggerTurn &&= (peerSteer || !this.#halted) && !this.#providerHeld() && (!this.#context?.signal?.aborted || interrupt);
     // Persist a downgraded explicit replay policy, including handoffs retried after a later reload.
     if (!triggerTurn) for (const item of items) if (item.deliverAs !== undefined) item.triggerTurn = false;
     // Each item keeps its own delivery mark: a flushed batch goes in as a steer, but it holds followUps.

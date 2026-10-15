@@ -28,6 +28,7 @@ export class ActorDirectory extends ActorManager {
   readonly #defaultScope: FabricActorStorageScope;
   readonly #sessionOrphans: SessionActorOrphans | undefined;
   #orphanReconcilePending: Promise<number> | undefined;
+  readonly #orphanRetirements = new Set<Promise<unknown>>();
   // Startup releasePaused is activation-only; explicit pauseForRelease owns this fence.
   #orphanReconcileHeld = false;
   #releaseCheckpointReady = false;
@@ -140,10 +141,33 @@ export class ActorDirectory extends ActorManager {
   override reconcileSessionOrphans(): Promise<number> {
     if (this.#orphanReconcileHeld || this.releaseAdmissionHeld || !this.#sessionOrphans) return Promise.resolve(0);
     if (this.#orphanReconcilePending) return this.#orphanReconcilePending;
-    const pending = this.#sessionOrphans.reconcile().finally(() => {
+    const pending = this.#sessionOrphans.reconcile(() => {
+      if (this.#orphanReconcileHeld || this.releaseAdmissionHeld) throw new Error("Actor directory is paused for release");
+    }).finally(() => {
       if (this.#orphanReconcilePending === pending) this.#orphanReconcilePending = undefined;
     });
     return this.#orphanReconcilePending = pending;
+  }
+  override validateSessionActorTombstone(...args: Parameters<ActorManager["validateSessionActorTombstone"]>): ReturnType<ActorManager["validateSessionActorTombstone"]> {
+    return this.#sessionOrphans?.validateTombstone(...args);
+  }
+  override retireSessionOrphan(id: string, checkActive: () => void): ReturnType<ActorManager["retireSessionOrphan"]> {
+    if (!this.#sessionOrphans || this.cleanupObligation(id) || this.#finishingScope(id)) return Promise.resolve(undefined);
+    // Preserve ordinary local exact-id/name/prefix and in-flight removal precedence.
+    try { this.#isPrimary(id); return Promise.resolve(undefined); }
+    catch (error) { if (!(error instanceof Error && /Unknown Fabric actor/.test(error.message))) throw error; }
+    const check = () => {
+      checkActive();
+      if (this.#orphanReconcileHeld || this.releaseAdmissionHeld) throw new Error("Actor directory is paused for release");
+      if (this.cleanupObligation(id) || this.#finishingScope(id)) throw new Error("Local actor removal target changed; retry selection");
+      try { this.#isPrimary(id); }
+      catch (error) { if (error instanceof Error && /Unknown Fabric actor/.test(error.message)) return; throw error; }
+      throw new Error("Local actor target appeared during orphan retirement; retry selection");
+    };
+    check();
+    const pending = this.#sessionOrphans.retire(id, check).finally(() => this.#orphanRetirements.delete(pending));
+    this.#orphanRetirements.add(pending);
+    return pending;
   }
   override list(): FabricActorInfo[] {
     // Synchronous internal/UI reads schedule work; public provider reads await it.
@@ -235,7 +259,7 @@ export class ActorDirectory extends ActorManager {
     return primary === undefined ? secondary : secondary === undefined ? primary : Math.min(primary, secondary);
   }
   override releaseCustodyCount(): number {
-    return super.releaseCustodyCount() + this.#secondary.releaseCustodyCount() + (this.#orphanReconcilePending ? 1 : 0);
+    return super.releaseCustodyCount() + this.#secondary.releaseCustodyCount() + (this.#orphanReconcilePending ? 1 : 0) + this.#orphanRetirements.size;
   }
   override haltAll(): { halted: number } {
     return { halted: haltEvery([() => super.haltAll().halted, () => this.#secondary.haltAll().halted]) };
@@ -276,6 +300,8 @@ export class ActorDirectory extends ActorManager {
     if (this.#orphanReconcilePending) {
       assertHeld?.(); await this.#orphanReconcilePending; assertHeld?.();
     }
+    await Promise.all(this.#orphanRetirements);
+    assertHeld?.();
     await super.checkpointForRelease(assertHeld);
     assertHeld?.();
     await this.#secondary.checkpointForRelease(assertHeld);
@@ -290,6 +316,7 @@ export class ActorDirectory extends ActorManager {
   }
   override async close(): Promise<void> {
     await this.#sessionOrphans?.close();
+    await Promise.all(this.#orphanRetirements);
     await Promise.all([super.close(), this.#secondary.close()]);
   }
 }

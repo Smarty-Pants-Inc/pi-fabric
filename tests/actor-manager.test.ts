@@ -3945,8 +3945,14 @@ describe("ActorManager", () => {
     const clock = () => {
       const realNow = Date.now.bind(Date);
       let skew = 0;
-      vi.spyOn(Date, "now").mockImplementation(() => realNow() + skew);
-      return { set: (at: number) => { skew = at - realNow(); } };
+      const now = vi.spyOn(Date, "now");
+      const advance = () => now.mockImplementation(() => realNow() + skew);
+      advance();
+      return {
+        set: (at: number) => { skew = at - realNow(); advance(); },
+        // Exact boundary reads must not cross expiry on a real clock tick (Windows can tick by ~16 ms).
+        freeze: (at: number) => { now.mockReturnValue(at); },
+      };
     };
     // Real timers keep running; the wake is captured so the test can fire it at the faked expiry.
     const captureWakes = () => {
@@ -4221,20 +4227,23 @@ describe("ActorManager", () => {
       expect(result.classification).toMatch(classification);
     });
 
-    it("never expires a context-overflow block", async () => {
+    it("never expires an unverified context-overflow block", async () => {
       const s = setup(true);
       const time = clock();
       const actor = await s.actors.create({ name: "overflowed", instructions: "Respond.", responseMode: "text" });
       const wakes = captureWakes();
       // smarty-dev#3238 round 2 (#853): only the run's typed CONTEXT_OVERFLOW code is an overflow;
       // error text that quotes "Context exceeds window" is classified "unknown" (still never expires).
+      // PR #1147 intentionally re-arms a verified overflow (complete evidence matching its run id) at the
+      // settled boundary/load; real-process successor tests cover that. This mock has no run id, so its typed
+      // overflow is unverified (complete: false) and must stay hard across the clock jump and restart.
       const overflow = "Error: Context exceeds window: 100 > 80";
-      vi.spyOn(s.agents, "run").mockResolvedValueOnce({ id: "overflow-run", status: "failed", error: overflow,
+      vi.spyOn(s.agents, "run").mockResolvedValueOnce({ status: "failed", error: overflow,
         errorCode: "CONTEXT_OVERFLOW", toolCalls: 0 } as unknown as Awaited<ReturnType<AgentManager["run"]>>);
       await expect(s.actors.ask(actor.id, "activate")).rejects.toThrow(overflow);
       await waitFor(() => !s.actors.status(actor.id).inFlightRun && !s.actors.status(actor.id).preparing);
       const blocked = s.actors.status(actor.id).activationBlocked!;
-      expect(blocked).toMatchObject({ code: "context-overflow", count: 1 });
+      expect(blocked).toMatchObject({ code: "context-overflow", count: 1, overflowEvidence: { version: 1, complete: false } });
       expect(blocked).not.toHaveProperty("retryAt");
       expect(wakes.filter(entry => entry.ms <= ACTOR_TRANSIENT_BLOCK_BACKOFF_MAX_MS &&
         entry.ms % ACTOR_TRANSIENT_BLOCK_BACKOFF_MS === 0)).toHaveLength(0);
@@ -4242,7 +4251,9 @@ describe("ActorManager", () => {
       expect(s.actors.status(actor.id)).toMatchObject({ activationBlocked: { code: "context-overflow", count: 1 } });
       expect(s.actors.status(actor.id)).not.toHaveProperty("activationBlockExpired");
       const restored = await restart(s, s.actors);
-      expect(restored.status(actor.id)).toMatchObject({ activationBlocked: { code: "context-overflow" } });
+      expect(restored.status(actor.id)).toMatchObject({ activationBlocked: { code: "context-overflow",
+        overflowEvidence: { version: 1, complete: false } } });
+      expect(restored.status(actor.id).activationBlocked).not.toHaveProperty("retryAt");
       expect(restored.status(actor.id)).not.toHaveProperty("activationBlockExpired");
     }, 60_000);
 
@@ -4364,11 +4375,12 @@ describe("ActorManager", () => {
           .find((row) => row.id === actor.id)!.activationBlocked;
         expect(stored).toEqual(blocked);
         expect(restored.status(actor.id).activationBlocked).toEqual(blocked);
-        time.set(blocked.retryAt! - 1);
+        time.freeze(blocked.retryAt! - 1);
         expect(restored.status(actor.id)).not.toHaveProperty("activationBlockExpired");
-        time.set(blocked.retryAt! + 1);
+        time.freeze(blocked.retryAt! + 1);
         expect(restored.status(actor.id).activationBlockExpired).toMatchObject({ class: "transient", blockedAt: blocked.blockedAt,
           backoffMs: blocked.backoffMs, expiredAt: blocked.retryAt });
+        time.set(blocked.retryAt! + 1); // Resume wall-clock progress before asynchronous probe/wait deadlines.
         await failOnce(restored, s.agents, actor.id);                                  // the probe after restart fails: doubled again
         expect(restored.status(actor.id).activationBlocked).toMatchObject({ backoffMs: 4 * ACTOR_TRANSIENT_BLOCK_BACKOFF_MS });
       }, 60_000);

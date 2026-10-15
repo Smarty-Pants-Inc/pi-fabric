@@ -1891,6 +1891,7 @@ export class AgentManager {
         const systemPrompt = [request.systemPrompt?.trim(), componentGuidance, spawnerGuidance]
           .filter((section): section is string => Boolean(section))
           .join("\n\n") || undefined;
+        const deadlineAt = Date.now() + timeoutMs;
         const launchContext: FabricRunnerLaunchContext = {
           id,
           name,
@@ -1898,7 +1899,7 @@ export class AgentManager {
           cwd: agentCwd,
           runDirectory,
           residency,
-          deadlineAt: Date.now() + timeoutMs,
+          deadlineAt,
           depth: this.#currentDepth + 1,
           lineage,
           tools,
@@ -2217,7 +2218,7 @@ export class AgentManager {
           // remains joined to this exact attempt until a retry confirms exit.
           void this.stop(id).catch(() => undefined);
         } else {
-          void this.#monitor(managed, timeoutMs).catch((error) => {
+          void this.#monitor(managed, timeoutMs, deadlineAt).catch((error) => {
             // Failed cleanup leaves result/admission pending and custody retained.
             this.#markLost(managed, String(error));
           });
@@ -4415,6 +4416,7 @@ export class AgentManager {
       managed.startupAttempts >= AGENT_STARTUP_MAX_ATTEMPTS ||
       managed.settled ||
       this.#closing ||
+      managed.stopRequested ||
       managed.abortSignal?.aborted ||
       managed.abandoned ||
       record.status !== "failed" ||
@@ -4443,7 +4445,7 @@ export class AgentManager {
     while (this.#releasePaused) await this.#waitForRelease(managed.abortSignal);
     await delay(retryDelayMs);
     while (this.#releasePaused) await this.#waitForRelease(managed.abortSignal);
-    if (managed.settled || this.#closing || managed.abortSignal?.aborted || managed.abandoned || Date.now() >= deadline) return false;
+    if (managed.settled || this.#closing || managed.stopRequested || managed.abortSignal?.aborted || managed.abandoned || Date.now() >= deadline) return false;
     managed.startupAttempts++;
     return this.#relaunch(managed, record, undefined, deadline);
   }
@@ -4647,8 +4649,8 @@ export class AgentManager {
       this.#unregisteredTransports.delete(transport);
       // A later launch succeeded: an earlier relaunch failure no longer describes this run.
       delete managed.relaunchFailure;
-      if (managed.settled || this.#closing || managed.stopRequested || managed.abandoned) {
-        // A stop (or an abandonment, #2184 8b) landed while the relaunch was in flight.
+      if (cancelled()) {
+        // A stop, abandonment, or deadline landed while the relaunch was in flight.
         // Release the child we just started so it cannot outlive the monitor and the
         // stop path can publish its terminal record.
         await this.#drainExecution(managed);
@@ -4820,8 +4822,9 @@ export class AgentManager {
     this.#terminalNoticeOutbox.route(managed.runDirectory);
   }
 
-  async #monitor(managed: ManagedAgent, timeoutMs: number): Promise<void> {
-    const deadline = Date.now() + timeoutMs + TRANSPORT_EXIT_GRACE_MS;
+  async #monitor(managed: ManagedAgent, timeoutMs: number, deadline = Date.now() + timeoutMs + TRANSPORT_EXIT_GRACE_MS): Promise<void> {
+    // Process retries share the admission deadline: exit-observation grace is
+    // not permission to start a new worker after the run's own duration cap.
     let firstObservedDeadAt: number | undefined;
     let watchedTransport: AgentTransportHandle | undefined;
     let nativeClosePending = false;

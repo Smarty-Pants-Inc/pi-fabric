@@ -10,6 +10,7 @@ import { MeshArchive, MeshArchiveLookupUnavailableError, MeshArchiveRecoveryChan
 import { delay, errorCode, type MeshLock, type MeshStoreContext } from "./mesh-lock.js";
 import { jsonClone } from "./state-file.js";
 import { verifiedRemove } from "../storage/verified-remove.js";
+import { prepareReceiptNamespace, receiptDirectoryBarrier, type ReceiptNamespace } from "./receipt-namespace.js";
 
 // Mesh events (smarty-dev#6477 L0): publish, publishBatch, dedupe receipts, the live log, its
 // compaction, archive coupling and recovery, and cursor reads.
@@ -154,6 +155,8 @@ interface AfterUnlock {
   /** Set with `finish` when `finish` is the live barrier followed by this receipt step: a batch
    * runs one barrier for all its events, then each receipt step in order (smarty-dev#6729). */
   receipt?: (() => Promise<void> | void) | undefined;
+  /** Keyed publish(): the receipt namespace prepared before `.lock` (fresh leaf barriers inside). */
+  namespace?: ReceiptNamespace | undefined;
 }
 
 // One live-log barrier per root, shared by every confirmation queued before it STARTS. A
@@ -331,8 +334,10 @@ export class EventLog {
       catch (error) { if (errorCode(error) === "ENOENT") return; throw error; }
       if (intent.dedupeKey !== event.dedupeKey || intent.eventId !== event.id ||
           intent.reservedSequence !== event.sequence) return;
-      writeFileAtomic(receiptPath, JSON.stringify(event), { durable: true });
-      this.#removeDedupeIntent(intentPath);
+      // Unprepared (batch, win32): exactly the previous writeFileAtomic + syncPathNamespace barriers.
+      const syncDirectory = after.namespace && receiptDirectoryBarrier(after.namespace);
+      writeFileAtomic(receiptPath, JSON.stringify(event), { durable: true, ...(syncDirectory ? { syncDirectory } : {}) });
+      this.#removeDedupeIntent(intentPath, syncDirectory);
     };
     const receipt = (): Promise<void> => this.#lock.withLock(finalizeReceipt, undefined, "publish");
     after.receipt = receipt;
@@ -411,9 +416,9 @@ export class EventLog {
     return event;
   }
 
-  #removeDedupeIntent(file: string): void {
+  #removeDedupeIntent(file: string, syncDirectory: ((directory: string) => void) | undefined = syncPathNamespace): void {
     fs.rmSync(file, { force: true });
-    syncPathNamespace(path.dirname(file));
+    (syncDirectory ?? syncPathNamespace)(path.dirname(file));
   }
 
   /** Read the exact live line named by an intent; archive fallback is a separate direct lookup. */
@@ -726,7 +731,7 @@ export class EventLog {
           writeFileAtomic(intentPath, JSON.stringify({
             dedupeKey: input.dedupeKey!, reservedSequence: sequence, eventId: event.id, liveOffset,
             ...(archive ? { archiveDir: archive.dir } : {}),
-          } satisfies MeshDedupeIntent), { durable: true });
+          } satisfies MeshDedupeIntent), { durable: true, ...(after?.namespace ? { syncDirectory: receiptDirectoryBarrier(after.namespace) } : {}) });
         }
         const pending = archive?.begin({ event, line });
         // Test-only process-death fence: unlike an append exception, no rollback can run.
@@ -754,8 +759,11 @@ export class EventLog {
       } else if (receiptPath) {
         // Archive-coupled receipts keep their locked protocol (smarty-dev#6000).
         this.#confirmEventFile(this.#eventsPath);
-        writeFileAtomic(receiptPath, JSON.stringify(event), { durable: true });
-        if (intentPath) this.#removeDedupeIntent(intentPath);
+        // publish() only: the checked prepared-namespace leaf barrier (as for its intent);
+        // batch/unprepared keep writeFileAtomic's default chain + syncPathNamespace.
+        const syncDirectory = after?.namespace && receiptDirectoryBarrier(after.namespace);
+        writeFileAtomic(receiptPath, JSON.stringify(event), { durable: true, ...(syncDirectory ? { syncDirectory } : {}) });
+        if (intentPath) this.#removeDedupeIntent(intentPath, syncDirectory);
       }
       if (batch) batch.bytes = bytes + 1;
       else {
@@ -784,7 +792,8 @@ export class EventLog {
     // Freeze ordinary payload/principal bytes once, even if archive validation retries.
     input = this.#capturePublication(input);
     const recoveryDeadline = Date.now() + this.#lock.lockTimeoutMs;
-    const after: AfterUnlock = {};
+    // Keyed: confirm the complete receipt namespace before `.lock`; a failure appends nothing.
+    const after: AfterUnlock = input.dedupeKey ? { namespace: prepareReceiptNamespace(path.join(this.root, "event-receipts")) } : {};
     let event: MeshEvent;
     for (;;) {
       try { event = await this.#lock.withLock(this.#preparePublish(input, undefined, after), undefined, "publish"); break; }

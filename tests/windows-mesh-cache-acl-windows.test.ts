@@ -4,6 +4,7 @@ import { spawnSync } from "node:child_process";
 import { afterEach, describe, expect, it } from "vitest";
 import { windowsMeshCacheFixture } from "./windows-mesh-cache-fixture.js";
 import { windowsHelperBootstrap } from "../src/storage/verified-remove.js";
+import { windowsSecurityPowerShell } from "../src/storage/windows-powershell.js";
 import { forgetWindowsMeshCapability, prepareWindowsMeshCapability, windowsMeshReleaseTestHooks } from "../src/storage/windows-mesh-release.js";
 
 // Hosted Windows ONLY. Keep: PR1191's real DACL trust-boundary failure; mocks cannot prove creation-time ACLs.
@@ -15,8 +16,10 @@ type Ace = { sid: string; rights: number; inherited: boolean; inheritance: numbe
 type Acl = { protected: boolean; owner: string; user: string; tokenOwner: string; aces: Ace[]; sddl: string };
 
 const powershell = (script: string, file: string): string => {
-  const result = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", `$ErrorActionPreference = 'Stop'; ${script}`], {
-    encoding: "utf8", timeout: 10_000, windowsHide: true, maxBuffer: 64 * 1024, env: { ...process.env, FMR_ACL_FIXTURE: file },
+  const invocation = windowsSecurityPowerShell(script, process.env);
+  const result = spawnSync(invocation.file, invocation.args, {
+    encoding: "utf8", timeout: 10_000, windowsHide: true, maxBuffer: 64 * 1024,
+    env: { ...invocation.env, FMR_ACL_FIXTURE: file },
   });
   expect(result.error).toBeUndefined();
   expect(result.status, result.stderr).toBe(0);

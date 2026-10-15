@@ -8,6 +8,9 @@ import { MeshStore } from "../src/mesh/store.js";
 import { hostLeasePath } from "../src/topology/host-leases.js";
 
 const roots: string[] = [], stores: MeshStore[] = [];
+// Root + separator + host-lease-commits/<16hex>/r.<64hex>/owner must be strictly below 240 UTF-16 units.
+const retiredOwnerSuffix = `\\${path.win32.join("host-lease-commits", "0".repeat(16), `r.${"0".repeat(64)}`, "owner")}`;
+const windowsRootMax = 239 - retiredOwnerSuffix.length;
 afterEach(() => {
   vi.restoreAllMocks();
   for (const mesh of stores.splice(0)) mesh.closeState();
@@ -25,9 +28,12 @@ const setup = (rootLength?: number) => {
 };
 
 describe("host lease custody path compatibility", () => {
-  it("keeps every created acquisition, contention and release path under 240 characters at a 150-character mesh root", async () => {
-    const s = setup(150);
-    expect(s.root).toHaveLength(150);
+  it("keeps acquisition, contention and release paths under 240 at the maximum Windows root (150 elsewhere)", async () => {
+    const rootLength = process.platform === "win32" ? windowsRootMax : 150;
+    const s = setup(rootLength);
+    expect(s.root).toHaveLength(rootLength);
+    expect(windowsRootMax).toBe(130);
+    if (process.platform === "win32") expect(s.root.length + retiredOwnerSuffix.length).toBe(239);
     // Observe transient paths too: a walk after release would miss the overlong staging owner.
     const staging = vi.spyOn(fs, "mkdtempSync"), writes = vi.spyOn(fs, "writeFileSync"), renames = vi.spyOn(fs, "renameSync");
     const rejected = vi.fn();
@@ -56,6 +62,21 @@ describe("host lease custody path compatibility", () => {
       if (result.type === "return") expect(path.basename(String(result.value))).toMatch(/^custody\.lock\.p\.[a-f0-9]{8}\.[A-Za-z0-9]{6}$/);
     }
     console.info(`Custody path budget: mesh root=${s.root.length}, longest created path=${longest.length}, limit<240`);
+  });
+
+  it.runIf(process.platform === "win32")("refuses bound+1 before publishing an owner, with a typed path-budget reason", async () => {
+    const s = setup(windowsRootMax + 1);
+    expect(s.root.length + retiredOwnerSuffix.length).toBe(240);
+    const staging = vi.spyOn(fs, "mkdtempSync");
+    const writes = vi.spyOn(fs, "writeFileSync");
+    const operation = vi.fn();
+    const error: unknown = await s.mesh.leaseCustody(s.file, operation).then(() => undefined, error => error);
+    expect(error).toBeInstanceOf(RangeError);
+    expect((error as RangeError).message).toMatch(/^Windows mesh lock owner path is too long \(240 logical UTF-16 units\):/);
+    expect(operation).not.toHaveBeenCalled();
+    expect(staging).not.toHaveBeenCalled();
+    expect(writes.mock.calls.some(([file]) => String(file).startsWith(s.compact + path.sep) && path.basename(String(file)) === "owner")).toBe(false);
+    expect(fs.existsSync(path.join(s.compact, MESH_CUSTODY_LOCK_NAME))).toBe(false);
   });
 
   it("prefers an existing legacy domain even when the compact domain also exists, and respects its live holder", async () => {

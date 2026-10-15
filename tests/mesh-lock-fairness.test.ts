@@ -8,6 +8,7 @@ import { buildSync } from "esbuild";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MeshLockTicket, meshLockQueueDirectory } from "../src/mesh/lock-queue.js";
 import { MeshStore } from "../src/mesh/store.js";
+import { pinnedNativeBundle } from "./helpers/pinned-native-bundle.js";
 
 const roots: string[] = [];
 const scratch = () => {
@@ -210,8 +211,9 @@ describe("bounded FIFO mesh admission", () => {
   });
 
   it.each([0, 4])("stress harness: 24 processes under CPU load, including %s legacy contenders", async (legacyN) => {
-    const output = path.join(scratch(), "store.mjs");
-    buildSync({ stdin: { contents: 'export { MeshStore } from "./src/mesh/store.ts"; export { meshLockQueueDirectory } from "./src/mesh/lock-queue.ts";', resolveDir: process.cwd() }, bundle: true, platform: "node", format: "esm", outfile: output });
+    const nativeBundle = pinnedNativeBundle(scratch(), "store.mjs");
+    const output = nativeBundle.outfile;
+    buildSync({ stdin: { contents: 'export { MeshStore } from "./src/mesh/store.ts"; export { meshLockQueueDirectory } from "./src/mesh/lock-queue.ts";', resolveDir: process.cwd() }, bundle: true, platform: "node", format: "esm", ...nativeBundle });
     const { stdout } = await promisify(execFile)(process.execPath, ["scripts/stress-mesh-lock.mjs", `--module=${output}`,
       "--n=24", "--rounds=2", "--load=2", "--cpuMs=1", `--legacyN=${legacyN}`,
       `--legacyModule=${path.resolve("tests/fixtures/mesh-legacy-contender.mjs")}`],

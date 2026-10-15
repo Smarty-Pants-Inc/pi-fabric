@@ -1508,7 +1508,7 @@ export class AgentManager {
    * beforeCommit is a separate resident-host mutation fence, checked after model preparation.
    * callerReturnAddress is a validated resident caller snapshot, never a task request field.
    */
-  spawn(request: AgentRunRequest, signal?: AbortSignal, authorize?: () => boolean, beforeCommit?: (id: string) => void, onOutputPrincipalDowngrade?: () => void, onLaunched?: (handle: AgentHandleInfo) => void, preparation?: AgentLaunchPreparationOptions, callerReturnAddress?: TaskReturnAddress, callerCompletionRecipient?: CompletionRecipient): Promise<AgentHandleInfo> {
+  spawn(request: AgentRunRequest, signal?: AbortSignal, authorize?: () => boolean, beforeCommit?: (id: string) => void, onOutputPrincipalDowngrade?: () => void, onLaunched?: (handle: AgentHandleInfo) => void, preparation?: AgentLaunchPreparationOptions, callerReturnAddress?: TaskReturnAddress, callerCompletionRecipient?: CompletionRecipient, toolsCeiling?: readonly string[]): Promise<AgentHandleInfo> {
     if (this.#closing) return Promise.reject(new Error("Fabric agent manager is closing"));
     // smarty-dev#9855: at admission, free the permits of launches now proven gone, before asking for one.
     this.#releaseProvenGone();
@@ -1521,10 +1521,12 @@ export class AgentManager {
     request = { ...request };
     const returnAddress = callerReturnAddress && structuredClone(callerReturnAddress);
     const completionRecipient = callerCompletionRecipient && structuredClone(callerCompletionRecipient);
+    // Host policy is snapshotted before release pause; remote admission must not observe later mutation.
+    const toolsCeilingSnapshot = toolsCeiling === undefined ? undefined : [...toolsCeiling];
     const pending = (async () => {
       while (this.#releasePaused && !probe) await this.#waitForRelease(signal);
       if (this.#closing) throw new Error("Fabric agent manager is closing");
-      return this.#spawn(request, signal, authorize, beforeCommit, onOutputPrincipalDowngrade, onLaunched, preparation, returnAddress, completionRecipient);
+      return this.#spawn(request, signal, authorize, beforeCommit, onOutputPrincipalDowngrade, onLaunched, preparation, returnAddress, completionRecipient, toolsCeilingSnapshot);
     })();
     this.#spawns.add(pending);
     void pending.then(() => this.#spawns.delete(pending), () => this.#spawns.delete(pending));
@@ -1596,7 +1598,7 @@ export class AgentManager {
     return childThinkingBounds(this.#thinkingBounds?.() ?? {}, requested);
   }
 
-  async #spawn(request: AgentRunRequest, signal?: AbortSignal, authorize?: () => boolean, beforeCommit?: (id: string) => void, onOutputPrincipalDowngrade?: () => void, onLaunched?: (handle: AgentHandleInfo) => void, preparation?: AgentLaunchPreparationOptions, callerReturnAddress?: TaskReturnAddress, callerCompletionRecipient?: CompletionRecipient): Promise<AgentHandleInfo> {
+  async #spawn(request: AgentRunRequest, signal?: AbortSignal, authorize?: () => boolean, beforeCommit?: (id: string) => void, onOutputPrincipalDowngrade?: () => void, onLaunched?: (handle: AgentHandleInfo) => void, preparation?: AgentLaunchPreparationOptions, callerReturnAddress?: TaskReturnAddress, callerCompletionRecipient?: CompletionRecipient, toolsCeiling?: readonly string[]): Promise<AgentHandleInfo> {
     if (!this.config.enabled) throw new Error("Agents are disabled in Fabric configuration");
     if (this.#currentDepth >= this.config.maxDepth) {
       throw new Error(`Fabric agent depth limit reached (${this.config.maxDepth})`);
@@ -1762,6 +1764,13 @@ export class AgentManager {
         tools = [...mapped];
       }
       if (model && runnerAdapter.normalizeModel) model = await runnerAdapter.normalizeModel(model);
+    }
+    if (toolsCeiling !== undefined) {
+      if (requiresFabricKernel && !toolsCeiling.includes("fabric_exec")) {
+        throw new Error("Required Fabric kernel exceeds the host tool ceiling: fabric_exec");
+      }
+      const ceiling = new Set(toolsCeiling);
+      tools = tools.filter(tool => ceiling.has(tool));
     }
     this.assertModelAllowed(model, runner);
     // Alternate backend targets must be known before even accepting a queue receipt.

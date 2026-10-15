@@ -257,6 +257,9 @@ export class RemoteTaskOwner {
     checkWritePolicyRequest(request);
     const policy = this.config.remoteSpawnPolicy ?? { writableRoots: [], shell: "deny" as const, tools: this.config.defaultTools };
     const tools = request.tools ?? policy.tools;
+    if (request.kernel !== undefined && !policy.tools.includes("fabric_exec")) {
+      return refused("Remote task kernels require fabric_exec in the host tool ceiling");
+    }
     if (tools.some(tool => !policy.tools.includes(tool))) return refused("Remote task tools exceed the host ceiling");
     if (request.cwd !== undefined && (!path.isAbsolute(request.cwd) || !fs.statSync(request.cwd).isDirectory())) return refused("Remote cwd must be an existing absolute path on the execution host");
     const cwd = request.cwd ?? fs.mkdtempSync(path.join(os.tmpdir(), "fabric-remote-task-"));
@@ -278,7 +281,7 @@ export class RemoteTaskOwner {
           callerOwnerHostId: caller.ownerHostId, callerOwnerIdentityId: caller.ownerIdentityId,
           ...(caller.remoteHost ? { callerRemoteHost: caller.remoteHost } : {}), ...(caller.ownerIncarnation ? { callerIncarnation: caller.ownerIncarnation } : {}) };
         save(this.#file(id), record); // allocated native id retained before launching
-      }, undefined, undefined, undefined, returnAddress, recipient);
+      }, undefined, undefined, undefined, returnAddress, recipient, policy.tools);
     this.manager.detachSignal(handle.id);
     save(intentPath, { format: 1, digest, handle } satisfies OwnerIntent);
     return handle;

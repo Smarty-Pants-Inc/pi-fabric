@@ -33,7 +33,7 @@ const cleanups: Array<() => Promise<unknown>> = [];
 afterEach(async () => { for (const close of cleanups.splice(0).reverse()) await close(); vi.restoreAllMocks(); });
 const scratch = (): string => fs.mkdtempSync(path.join(os.tmpdir(), "fabric-remote-capability-"));
 
-const fixture = async () => {
+const fixture = async (options: { fullCodeMode?: boolean } = {}) => {
   const root = scratch();
   const a = path.join(root, "work-host"), b = path.join(root, "capability-host");
   fs.mkdirSync(a); fs.mkdirSync(b);
@@ -59,7 +59,7 @@ const fixture = async () => {
   const config: ResidentHostConfig = {
     format: 1, rootId: hubIdentity.id, sessionId: hubIdentity.sessionId!, cwd: b, projectRoot: b, meshRoot: meshB.root,
     actorRoot: path.join(b, "actors"), sessionActorRoot: path.join(b, "actors", "hub"), residencyRoot: residentRoot(meshB.root, hubIdentity.id),
-    fullCodeMode: false, agents: { ...DEFAULT_FABRIC_CONFIG.agents, transport: "process", budgetUsd: 0, retainRuns: true,
+    fullCodeMode: options.fullCodeMode ?? false, agents: { ...DEFAULT_FABRIC_CONFIG.agents, transport: "process", budgetUsd: 0, retainRuns: true,
       hostCapabilities: ["corpus", "github"], defaultTools: ["read"], deniedModels: ["fixture/denied"],
       remoteSpawnPolicy: { writableRoots: [], shell: "deny", tools: ["read"] } },
     mesh: { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 }, retention: { ...DEFAULT_FABRIC_CONFIG.retention },
@@ -235,6 +235,35 @@ describe("remote capability process tasks over two real mesh roots", () => {
     const result = await f.host().agents.wait(handle.id);
     expect(result.status).toBe("completed");
     expect(result.value).toMatchObject({ cwd: f.b, corpus: "answer-only-on-root-B", spawner: "session:work-lead", extensions });
+  });
+
+  it.each(["typescript", "python", "inherit"] as const)("refuses remote kernel %s when fabric_exec is outside the host ceiling", async kernel => {
+    const f = await fixture();
+    f.config.agents.extensions = true;
+    await expect(f.wire({ kernel, tools: ["read"] })).rejects.toMatchObject({ code: "FABRIC_REMOTE_TASK_POLICY_REFUSED" });
+    expect(f.host().agents.list()).toEqual([]);
+  });
+
+  it.each(["typescript", "python"] as const)("preserves fabric_exec for an explicitly permitted remote %s kernel", async kernel => {
+    const f = await fixture();
+    f.config.agents.extensions = true;
+    f.config.agents.remoteSpawnPolicy = { writableRoots: [], shell: "deny", tools: ["read", "fabric_exec"] };
+    const handle = await f.wire({ kernel, tools: ["read"] }) as AgentHandleInfo;
+    const result = await f.host().agents.wait(handle.id);
+    expect(result.status).toBe("completed");
+    expect(result.value).toMatchObject({ tools: ["read", "fabric_exec"] });
+  });
+
+  it("clamps optional full-code fabric_exec for remote tasks while preserving local defaults", async () => {
+    const f = await fixture({ fullCodeMode: true });
+    f.config.agents.extensions = true;
+    const remote = await f.wire({ tools: ["read"] }) as AgentHandleInfo;
+    const remoteResult = await f.host().agents.wait(remote.id);
+    expect(remoteResult.value).toMatchObject({ fullCodeMode: true, tools: ["read"] });
+
+    const local = await f.host().agents.spawn({ task: "{}", runner: "pi", model: "fixture/visible", transport: "process" });
+    const localResult = await f.host().agents.wait(local.id);
+    expect(localResult.value).toMatchObject({ fullCodeMode: true, tools: ["read", "fabric_exec"] });
   });
 
   // Trust boundary: raw bridge callers cannot select the execution host's extension bootstrap.

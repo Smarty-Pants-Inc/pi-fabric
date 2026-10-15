@@ -60,7 +60,8 @@ const oldLease = {
   incarnationToken: host.incarnationToken!, updatedAt: NOW, expiresAt: host.expiresAt,
 };
 // Tokens identify owners, not order; the newer owner's token sorts before its predecessor's.
-const newerLease = { ...oldLease, startedAt: host.startedAt + 1_000, incarnationToken: "opaque-a-successor" };
+const newerLease = { ...oldLease, startedAt: host.startedAt + 1_000, incarnationToken: "opaque-a-successor",
+  bridgeSupersededTokens: [oldLease.incarnationToken] };
 
 describe("bridge incarnation admission at persisted trust boundaries (smarty-dev#7397)", () => {
   it.each([false, true])("SQLite no-handoff early plan, intervening newer lease: %s", async leaseChanges => {
@@ -137,19 +138,131 @@ describe("bridge incarnation admission at persisted trust boundaries (smarty-dev
     expect(readHostLease(hub.root, identity.id)).toMatchObject({ startedAt: highLease.startedAt,
       incarnationToken: host.incarnationToken });
     expect(hub.get(participantKey(identity.id), { fresh: true })?.value).toMatchObject({ name: "equal-token-recovered" });
-    const stateBefore = hub.listAll("", { fresh: true });
-    const leasePath = hostLeasePath(hub.root, identity.id);
-    const leaseBefore = fs.readFileSync(leasePath);
-    // Y95 is newer than the incoming X90 metadata, but older than the retained X100 fence.
+    // Y95 is a new identity: X100's retained floor must not be used to order another token.
     const between = { hosts: [{ record: { ...host, startedAt: host.startedAt + 500,
       incarnationToken: "opaque-between-recovery" }, expiresAt: host.expiresAt }], participants: [participant] } satisfies
       Pick<BridgePresence, "hosts" | "participants">;
-    await expect(new StoreBridgeSide(hub, "ryzen2", () => NOW).mirror(between))
+    await expect(new StoreBridgeSide(hub, "ryzen2", () => NOW).mirror(between)).resolves.toBeUndefined();
+    expect(hub.get(hostKey(identity.id), { fresh: true })?.value).toMatchObject({
+      startedAt: host.startedAt + 500, incarnationToken: "opaque-between-recovery",
+      bridgeSupersededTokens: [host.incarnationToken],
+    });
+    expect(readHostLease(hub.root, identity.id)).toMatchObject({ startedAt: host.startedAt + 500,
+      incarnationToken: "opaque-between-recovery", bridgeSupersededTokens: [host.incarnationToken] });
+    await expect(new StoreBridgeSide(hub, "ryzen2", () => NOW).mirror(presence))
       .rejects.toMatchObject({ code: "FABRIC_BRIDGE_STALE_INCARNATION" });
-    expect(hub.listAll("", { fresh: true })).toEqual(stateBefore);
-    expect(fs.readFileSync(leasePath)).toEqual(leaseBefore);
-    expect(readHostLease(hub.root, identity.id)?.startedAt).toBe(highLease.startedAt);
     expect(removals).toEqual([]);
+  });
+
+  it.each(["file", "sqlite"] as const)("bounds and persists the last 16 superseded tokens across bridge/store restart (%s)", async backend => {
+    const hub = store(backend);
+    const frame = (index: number) => ({ hosts: [{ record: { ...host, incarnationToken: `generation-${index}`,
+      startedAt: host.startedAt - index * 120_000 }, expiresAt: host.expiresAt }], participants: [participant] });
+    for (let index = 0; index <= 20; index++) {
+      await new StoreBridgeSide(hub, "ryzen2", () => NOW).mirror(frame(index));
+    }
+    const expected = Array.from({ length: 16 }, (_, index) => `generation-${index + 4}`);
+    expect(hub.get(hostKey(identity.id), { fresh: true })?.value).toMatchObject({
+      incarnationToken: "generation-20", bridgeSupersededTokens: expected,
+    });
+    expect(readHostLease(hub.root, identity.id)).toMatchObject({
+      incarnationToken: "generation-20", bridgeSupersededTokens: expected,
+    });
+    hub.closeState();
+    const restarted = new MeshStore(hub.root, 64 * 1024, 100, { stateBackend: backend });
+    stores.push(restarted);
+    // All retained tokens remain refused, despite claiming a much later start, after restart.
+    for (let index = 4; index < 20; index++) {
+      const replay = frame(index);
+      replay.hosts[0]!.record.startedAt = NOW + 120_000;
+      await expect(new StoreBridgeSide(restarted, "ryzen2", () => NOW).mirror(replay))
+        .rejects.toMatchObject({ code: "FABRIC_BRIDGE_STALE_INCARNATION" });
+    }
+    expect(readHostLease(restarted.root, identity.id)?.bridgeSupersededTokens).toEqual(expected);
+    // Persisted lease history alone is sufficient when the shared mirror was lost.
+    const leaseOnly = store(backend);
+    writeHostLease(leaseOnly.root, readHostLease(restarted.root, identity.id)!);
+    await expect(new StoreBridgeSide(leaseOnly, "ryzen2", () => NOW).mirror(frame(19)))
+      .rejects.toMatchObject({ code: "FABRIC_BRIDGE_STALE_INCARNATION" });
+    expect(leaseOnly.get(hostKey(identity.id), { fresh: true })).toBeUndefined();
+    // Once a token ages out, the bounded history proves nothing about it (the explicit N=16 trade-off).
+    await expect(new StoreBridgeSide(restarted, "ryzen2", () => NOW).mirror(frame(0))).resolves.toBeUndefined();
+    expect(readHostLease(restarted.root, identity.id)?.bridgeSupersededTokens).toEqual([...expected.slice(1), "generation-20"]);
+  });
+
+  it.each(["state", "lease"] as const)("keeps newest-16 history when %s authority is ahead during an overlapping renewal", async ahead => {
+    const hub = store("file");
+    const frame = (index: number) => ({ hosts: [{ record: { ...host, incarnationToken: `crash-generation-${index}`,
+      startedAt: host.startedAt - index * 120_000 }, expiresAt: host.expiresAt }], participants: [participant] });
+    const side = new StoreBridgeSide(hub, "ryzen2", () => NOW);
+    for (let index = 0; index < 20; index++) await side.mirror(frame(index));
+    const priorLease = readHostLease(hub.root, identity.id)!;
+    const priorHost = hub.get(hostKey(identity.id), { fresh: true })!.value;
+    await side.mirror(frame(20));
+    // The same state/file mismatch can be observed by an already-recovered early plan,
+    // not just recovery: an overlapping lease effect may lag or lead the shared row.
+    if (ahead === "state") writeHostLease(hub.root, priorLease);
+    else await hub.put({ key: hostKey(identity.id), identity, value: priorHost });
+    await side.mirror(frame(20));
+    const expected = Array.from({ length: 16 }, (_, index) => `crash-generation-${index + 4}`);
+    expect(hub.get(hostKey(identity.id), { fresh: true })?.value).toMatchObject({ bridgeSupersededTokens: expected });
+    expect(readHostLease(hub.root, identity.id)?.bridgeSupersededTokens).toEqual(expected);
+    const replay = frame(4);
+    replay.hosts[0]!.record.startedAt = NOW + 120_000;
+    await expect(new StoreBridgeSide(hub, "ryzen2", () => NOW).mirror(replay))
+      .rejects.toMatchObject({ code: "FABRIC_BRIDGE_STALE_INCARNATION" });
+  });
+
+  it("admits unknown tokens against historical token-bearing lease rows without history, regardless of clocks", async () => {
+    const hub = store("file");
+    const { bridgeSupersededTokens: _history, ...historical } = newerLease;
+    writeHostLease(hub.root, historical);
+    // An earlier start and a different token are not evidence that this is a replay.
+    await expect(new StoreBridgeSide(hub, "ryzen2", () => NOW).mirror(presence)).resolves.toBeUndefined();
+    expect(readHostLease(hub.root, identity.id)).toMatchObject({ incarnationToken: oldLease.incarnationToken,
+      startedAt: oldLease.startedAt, bridgeSupersededTokens: [historical.incarnationToken] });
+  });
+
+  it("does not import peer-supplied superseded-token claims as local authority", async () => {
+    const hub = store("file");
+    const poisoned = { hosts: [{ record: { ...host, bridgeSupersededTokens: ["genuine-next-token"] },
+      expiresAt: host.expiresAt }], participants: [participant] };
+    await new StoreBridgeSide(hub, "ryzen2", () => NOW).mirror(poisoned);
+    const genuine = { hosts: [{ record: { ...host, incarnationToken: "genuine-next-token", startedAt: host.startedAt - 120_000 },
+      expiresAt: host.expiresAt }], participants: [participant] };
+    await expect(new StoreBridgeSide(hub, "ryzen2", () => NOW).mirror(genuine)).resolves.toBeUndefined();
+    expect(readHostLease(hub.root, identity.id)).toMatchObject({ incarnationToken: "genuine-next-token",
+      bridgeSupersededTokens: [host.incarnationToken] });
+  });
+
+  it("admits a new rollback token through recovery without replaying a superseded lease over disk authority", async () => {
+    const hub = store("file");
+    const dead = new CommitOutbox(hub, "bridge/ryzen2", bridgeIdentity, {});
+    await hub.writeBatch({ identity: bridgeIdentity, ops: [], prepare: () => dead.plan().stage([
+      { kind: "put", key: hostKey(identity.id), identity, value: { ...host, remoteHost: "ryzen2" } },
+      { kind: "put", key: participantKey(identity.id), identity, value: { ...participant, remoteHost: "ryzen2" } },
+    ], [{ kind: "lease", key: `lease:${identity.id}`, payload: oldLease }]) });
+    writeHostLease(hub.root, newerLease);
+    const before = fs.readFileSync(hostLeasePath(hub.root, identity.id));
+    const originalPlan = CommitOutbox.prototype.plan;
+    const replayed = vi.fn();
+    vi.spyOn(CommitOutbox.prototype, "plan").mockImplementation(function (this: CommitOutbox): CommitOutboxPlan {
+      const plan = originalPlan.call(this);
+      return { ...plan, replay: view => {
+        const count = plan.replay(view);
+        expect(fs.readFileSync(hostLeasePath(hub.root, identity.id))).toEqual(before);
+        replayed();
+        return count;
+      } };
+    });
+    const rollback = { hosts: [{ record: { ...host, incarnationToken: "new-rollback-through-recovery",
+      startedAt: host.startedAt - 120_000 }, expiresAt: host.expiresAt }], participants: [participant] };
+    await expect(new StoreBridgeSide(hub, "ryzen2", () => NOW).mirror(rollback)).resolves.toBeUndefined();
+    expect(replayed).toHaveBeenCalledOnce();
+    expect(readHostLease(hub.root, identity.id)).toMatchObject({ incarnationToken: "new-rollback-through-recovery",
+      startedAt: host.startedAt - 120_000, bridgeSupersededTokens: expect.arrayContaining([
+        oldLease.incarnationToken, newerLease.incarnationToken,
+      ]) });
   });
 
   it("rejects a stale recovery snapshot before replaying a pending predecessor lease", async () => {

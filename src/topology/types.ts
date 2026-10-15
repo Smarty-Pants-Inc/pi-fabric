@@ -113,6 +113,8 @@ export interface FabricHostRecord {
   identity: MeshIdentity;
   /** UUID fence for token-capable host incarnations; start time is metadata. */
   incarnationToken?: string;
+  /** Locally observed tokens superseded by this mirror; bounded and absent on legacy records. */
+  bridgeSupersededTokens?: string[];
   startedAt: number;
   updatedAt: number;
   expiresAt: number;

@@ -129,7 +129,7 @@ import type { MeshIdentity } from "./event-log.js";
 import { formatWalReaders, walReaderPids, walWriterPid } from "./wal-readers.js";
 import { createLockEvents, lockHeldEventThreshold, type MeshLockClass } from "./commit-stats.js";
 import { admitExistingStateRoot, assertGatedFlagDirectory, assertPrivatePath, assertPrivateStateRoot, createStateRoot, filesystemRefusal,
-  MeshStateUnsupportedError, openPrivateStateDb } from "./state-gate.js";
+  MeshStateUnsupportedError, openPrivateStateDb, prepareStateRootForBootstrap } from "./state-gate.js";
 
 // The process's lock-event appender (smarty-dev#9290), shared with mesh-lock.ts through its registry.
 const lockEvents = createLockEvents();
@@ -918,9 +918,9 @@ export class SqliteStateStore {
     // smarty-dev#6477 review round 2: "create" on a fresh root runs under the import's fence (custody.lock, then
     // .lock) from the re-checked guard through the db init to the marker, so a file-mode writer either commits
     // first (the guard below sees its state.json and refuses) or its fence check sees this state.db and refuses.
-    // smarty-dev#8920: on Windows the root is created (and made private) before the fence, which would create it
-    // untracked. POSIX keeps the fence's own mkdir: nothing runs before it.
-    if (process.platform === "win32") createStateRoot(root);
+    // #13549: prove existing roots too, even without state.db, before custody or mesh-lock writes.
+    // Missing Windows roots are created/protected first. POSIX keeps the fence's own mkdir unchanged.
+    prepareStateRootForBootstrap(root);
     return holdMeshFence(root, { lockTimeoutMs: options.lockTimeoutMs ?? LOCK_TIMEOUT_MS }, () =>
       SqliteStateStore.#openAsync(root, maxEventBytes, maxReadEvents, options, guardBeforeOpen(root, requested), initTimeoutMs));
   }
@@ -969,7 +969,7 @@ export class SqliteStateStore {
     if (initialize !== "create") return SqliteStateStore.#openSync(root, maxEventBytes, maxReadEvents, options, initialize);
     // The same fence as open(), one synchronous attempt at the same two locks: a busy fence throws an
     // SQLITE_BUSY-coded MeshFenceBusyError, which callers retry like a busy database (see the contract above).
-    if (process.platform === "win32") createStateRoot(root); // smarty-dev#8920: before the fence, as in open()
+    prepareStateRootForBootstrap(root); // #13549: full Windows root proof before the fence, as in open()
     return holdMeshFenceSync(root, 0, () =>
       SqliteStateStore.#openSync(root, maxEventBytes, maxReadEvents, options, guardBeforeOpen(root, requested)));
   }

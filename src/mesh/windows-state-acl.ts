@@ -1,7 +1,8 @@
 /**
  * smarty-dev#8920: the Windows half of the mesh state gate (state-gate.ts). Node and libuv expose no Windows
  * security descriptor API (fs.chmod maps only the read-only attribute; fs.access does not evaluate ACLs), so the
- * gate reads native descriptors through ONE pinned Windows PowerShell child per uncached gate call (windows-powershell.ts):
+ * gate reads native descriptors through a pinned Windows PowerShell child per uncached gate call (windows-powershell.ts),
+ * with at most one read-only retry after a runner failure:
  * the root, its state files and flag directory, and every lexical and real ancestor, in one structured snapshot.
  * Loaded only through state-gate.ts, which is not in the startup graph.
  *
@@ -20,14 +21,14 @@
  *   skipped on ordinary ancestors because they are not the ancestor's own access. A directory immediately used to
  *   create a missing component is stricter: foreign inheritable write/full/modify/delete grants are refused before
  *   that component is made visible; CREATOR OWNER remains the explicit safe inheritance exception. Owner admission
- *   is not isolation from a service: an admitted owner can WRITE_DAC and re-ACL its ancestor (R-SERVICE-OWNER-REACL;
- *   lead-owned follow-up issue/link pending).
+ *   is not isolation from a service: an admitted owner can WRITE_DAC and re-ACL its ancestor. A state root below
+ *   any service-owned ancestor must therefore have a protected DACL, preventing later inherited grants.
  * - a root this process just created (a non-recursive mkdir that succeeded) gets, through the built-in icacls, an
  *   explicit owner (the current user) and a protected DACL: current user and SYSTEM full control, (OI)(CI); it is read
  *   back in the same child. An existing root is never repaired or adopted.
- * Existing-path reads retain warn-once/fail-open for missing tooling, timeout or global script failure (issue step 5;
- * nonzero/timeout residual: smarty-dev#13459). A newly created root MUST have its private ACL set: every protect
- * runner failure refuses. Output overflow (incomplete evidence) and malformed successful output always refuse.
+ * Existing-path runner failures retry once after 100 ms, then refuse (smarty-dev#13459). A newly created root MUST
+ * have its private ACL set: every protect runner failure refuses without retrying the mutation. Output overflow
+ * (incomplete evidence) and malformed successful output always refuse without retry.
  */
 import childProcess from "node:child_process";
 import fs from "node:fs";
@@ -155,16 +156,15 @@ const runPowerShell: WindowsAclRunner = (request) => {
   });
 };
 
-let warned = false;
-const warnUnverified = (root: string, error: unknown): void => {
-  if (warned) return;
-  warned = true;
-  const reason = error instanceof Error ? error.message.split("\n")[0] : String(error);
-  process.emitWarning(`[pi-fabric] Fabric mesh SQLite state could not read Windows ACLs (${reason}); `
-    + `${root} and its ancestors are opened without an ACL check (smarty-dev#8920).`, { code: "FABRIC_MESH_STATE_ACL_UNVERIFIED" });
-};
-
 const record = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value);
+const outputOverflow = (error: unknown): boolean => record(error)
+  && (error.code === "ENOBUFS" || error.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER");
+const readFailureRefusal = (root: string, error: unknown): string => {
+  const reason = record(error) && error.code === "ETIMEDOUT" ? "timeout"
+    : `exit ${record(error) && typeof error.status === "number" && Number.isFinite(error.status) && Number.isInteger(error.status)
+      ? error.status : "unknown"}`;
+  return `Windows ACL read failed (${reason}) after 1 retry; root not opened: ${root}`;
+};
 const uint32 = (value: unknown): value is number => typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 0xffffffff;
 const malformedAceRefusal = (target: string, ace: unknown, ordinal: number): string => {
   const context = [`ordinal ${ordinal}`];
@@ -309,7 +309,7 @@ const admissionDecision = (before: AdmissionIdentity, native: { root: NativePres
 };
 
 /**
- * The refusal for this root, or undefined when it may be opened (including the warned tooling gap).
+ * The refusal for this root, or undefined when its ACL proof permits it to be opened.
  * Default-runner Windows root admissions reuse only a complete verified proof with unchanged root/DB identities
  * and fresh component guards. Same-identity ACL edits by the trusted authority class are intentionally not re-read.
  * Other roles, protect/readback, injected runners, and unproven identities retain fresh native reads.
@@ -341,7 +341,7 @@ export const windowsStateAclRefusal = (request: WindowsStateAclRequest, run: Win
       [...paths].map(([target, role]) => [target.toLowerCase(), role]),
       request.files.map(file => path.win32.resolve(file).toLowerCase()),
       request.directories.map(dir => path.win32.resolve(dir).toLowerCase())]) : undefined;
-  const before = plan !== undefined ? admissionIdentity(root, db!, paths) : undefined;
+  let before = plan !== undefined ? admissionIdentity(root, db!, paths) : undefined;
   const cached = cacheable ? rootAdmissions.get(rootKey) : undefined;
   if (cached && cached.plan === plan && before?.root !== undefined && before.db !== undefined
     && before.guard !== undefined && before.root === cached.identity.root && before.db === cached.identity.db
@@ -352,22 +352,23 @@ export const windowsStateAclRefusal = (request: WindowsStateAclRequest, run: Win
   }
   // A miss must not leave an older proof available after a failed replacement proof or a protect operation.
   if (defaultWindows && rootRole === "root") rootAdmissions.delete(rootKey);
+  const nativeRequest = JSON.stringify({ protect: request.protect ? root : null, paths: [...paths.keys()] });
+  const overflowRefusal = `${root} has an incomplete Windows ACL snapshot (native reader output exceeded its buffer limit)`;
   let output: string;
-  try { output = run(JSON.stringify({ protect: request.protect ? root : null, paths: [...paths.keys()] })); }
+  try { output = run(nativeRequest); }
   catch (error) {
-    // A read-only compatibility fallback cannot prove that a new root was made private. Never create state in it
-    // when the setter did not run or failed, even if missing tooling would be accepted for an existing-root read.
-    if (request.protect) {
-      const reason = error instanceof Error ? error.message.split("\n")[0] : String(error);
-      return `${root} was created but its private ACL could not be set (native ACL reader failed: ${reason})`;
+    // A protect request mutates the root: never automatically execute it again, or expose raw child diagnostics.
+    if (request.protect) return `${root} was created but its private ACL could not be set (native ACL reader failed)`;
+    // Either stream overflowing maxBuffer leaves incomplete evidence, not a transient launch/read failure.
+    if (outputOverflow(error)) return overflowRefusal;
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
+    // Bracket only the retry's proof, not the failed attempt's potentially 20-second observation window.
+    if (plan !== undefined) before = admissionIdentity(root, db!, paths);
+    try { output = run(nativeRequest); }
+    catch (retryError) {
+      if (outputOverflow(retryError)) return overflowRefusal;
+      return readFailureRefusal(root, retryError);
     }
-    // execFileSync reports either stream overflowing maxBuffer as ENOBUFS (Node 24 spawnSync) or the explicit
-    // max-buffer code. The tool ran but the snapshot is incomplete: this is not the accepted tooling gap.
-    if (record(error) && (error.code === "ENOBUFS" || error.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER")) {
-      return `${root} has an incomplete Windows ACL snapshot (native reader output exceeded its buffer limit)`;
-    }
-    warnUnverified(root, error);
-    return undefined;
   }
   let snapshot: unknown;
   try { snapshot = JSON.parse(output); } catch { return `${root} has an unreadable Windows ACL snapshot`; }
@@ -383,9 +384,11 @@ export const windowsStateAclRefusal = (request: WindowsStateAclRequest, run: Win
   if (typeof snapshot.ownerSid !== "string" || !SID.test(snapshot.ownerSid)) return `${root} has an invalid Windows ACL snapshot`;
   const tokenOwner = snapshot.ownerSid;
   if (request.protect && snapshot.protect !== "ok") {
-    return `${root} was created but its private ACL could not be set (${String(snapshot.protect)})`;
+    return `${root} was created but its private ACL could not be set (native protection was not proven)`;
   }
   const trusted = (sid: string) => sid === user || TRUSTED_SIDS.has(sid);
+  let rootControl: number | undefined;
+  let serviceOwnedAncestor = false;
   for (const [index, [target, role]] of [...paths].entries()) {
     const entry: unknown = snapshot.entries[index];
     if (!record(entry) || entry.path !== target) return `${target} has an invalid Windows ACL snapshot entry`;
@@ -397,8 +400,9 @@ export const windowsStateAclRefusal = (request: WindowsStateAclRequest, run: Win
       if (role === "file" || role === "directory") continue;
       return `${target} vanished while its Windows ACL was read`;
     }
-    if (typeof entry.error === "string") return `${target} has an unreadable Windows security descriptor (${entry.error})`;
+    if (typeof entry.error === "string") return `${target} has an unreadable Windows security descriptor`;
     if (!uint32(entry.attributes) || !uint32(entry.control)) return `${target} has an invalid Windows ACL snapshot entry`;
+    if (role === "root") rootControl = entry.control;
     const directory = (entry.attributes & FILE_ATTRIBUTE_DIRECTORY) !== 0;
     if ((entry.attributes & FILE_ATTRIBUTE_REPARSE_POINT) !== 0) {
       // An ancestor junction or symbolic link: its descriptor as read here is ambiguous (the link's or its target's),
@@ -472,10 +476,15 @@ export const windowsStateAclRefusal = (request: WindowsStateAclRequest, run: Win
       if (ancestorRole && !ownerFailure && owner !== undefined) diagnostics.push(`${target} owner: ${owner}`);
       return diagnostics.join("; ");
     }
+    if (ancestorRole && owner !== undefined && SERVICE_OWNER_SIDS.has(owner)) serviceOwnedAncestor = true;
   }
-  // Only this bottom-of-reader path is a complete structured policy success. In particular the warned
-  // undefined return above must never publish an admission. Capture again rather than blessing a replacement
-  // with the descriptor read from its predecessor; unknown IDs simply leave this full read uncached.
+  // Root is visited before its ancestors. Decide only after the complete lexical/real plan passed normal validation.
+  if (rootRole === "root" && serviceOwnedAncestor
+    && (rootControl === undefined || (rootControl & SE_DACL_PROTECTED) === 0)) {
+    return `${root} inherits its ACL below a service-owned ancestor; the state root must have a protected DACL`;
+  }
+  // Only this bottom-of-reader path is a complete structured policy success. Capture again rather than blessing
+  // a replacement with the descriptor read from its predecessor; unknown IDs leave this full read uncached.
   if (plan !== undefined && before !== undefined) {
     const after = admissionIdentity(root, db!, paths);
     const entries = snapshot.entries;

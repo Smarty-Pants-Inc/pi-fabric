@@ -34,7 +34,7 @@ import type { MeshIdentity } from "./event-log.js";
 import { isMeshStateBackendKind, MESH_STATE_BACKEND_KIND_LIST, type MeshStateBackendKind } from "./state-backend-kinds.js";
 import type { MeshStoreContext } from "./mesh-lock.js";
 import { preparedNatsStateBackend } from "./state-backend-nats.js";
-import { admitExistingStateRoot } from "./state-gate.js";
+import { admitExistingStateRoot, prepareStateRootForBootstrap } from "./state-gate.js";
 import { bracketFileRead, FILE_READ_CHANGED, jsonClone, MeshStateFileReadChangedError, StateFile, type MeshBatchOperation, type MeshBatchResult,
   type MeshBatchView, type MeshReadOptions, type MeshStateEntry, type StateFileOptions } from "./state-file.js";
 import { filesystemRefusal, SqliteStateStore, validateMeshStateKey, type SqliteDeltaKey, type SqliteStateDelta, type SqliteStateExport,
@@ -478,6 +478,12 @@ export const createStateBackend = (context: MeshStoreContext, options: CreateSta
   const kind = resolveMeshStateBackend(options.stateBackend);
   const factory = STATE_BACKEND_FACTORIES[kind];
   const refusal = factory.unavailable?.(context);
+  // Admit before any factory/StateFile sweep, then MeshStore's census and RuntimeState's custody writes.
+  // Preserve the documented non-local SQLite -> file fallback: it still needs the identical privacy proof,
+  // but the fallback is not a SQLite open and must not acquire SQLite's local-filesystem requirement.
+  if (process.platform === "win32" && (kind === "sqlite" || kind === "shadow")) {
+    prepareStateRootForBootstrap(context.root, refusal ? { sqliteLocality: "skip-for-file-fallback" } : {});
+  }
   if (refusal) {
     if (process.platform === "win32") admitExistingStateRoot(context.root);
     const file = new StateFile(context, options);

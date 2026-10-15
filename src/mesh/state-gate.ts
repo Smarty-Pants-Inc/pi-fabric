@@ -300,9 +300,33 @@ export const admitExistingStateRoot = (root: string): void => {
 export const assertPrivateStateRoot = (root: string, db = "state.db", requireDatabase = false): void => {
   const refusal = filesystemRefusal(root);
   if (refusal) throw new MeshStateUnsupportedError(`Fabric mesh SQLite state needs a local filesystem: ${refusal}`);
+  assertStateRootPrivacy(root, db, requireDatabase);
+};
+
+// The normal root plan, shared with bootstrap admission. Only bootstrap's explicitly selected file fallback
+// may omit SQLite locality; every actual SQLite admission still goes through assertPrivateStateRoot above.
+const assertStateRootPrivacy = (root: string, db: string, requireDatabase: boolean): void => {
   assertPrivateAncestors(root);
   checkPrivatePath(root, "directory");
   if (process.platform === "win32") assertWindowsAcl(root, { ...stateTargets(root, db), requireDatabase }, false);
+};
+
+/**
+ * Windows bootstrap admission (#13549), BEFORE census/custody/fence or other bootstrap writes. Existing roots
+ * get the full normal root proof even without state.db. Missing roots use createStateRoot's ancestor/reparse
+ * preflights and owned creation/protection, then the same normal proof. This never creates a database.
+ * Call outside bounded lock/busy operations; this is not a generic custody/fence gate. Other platforms are inert.
+ * The narrow locality bypass is ONLY for a selected SQLite backend falling back to file, never an actual DB open;
+ * it retains the complete privacy plan. Selection policy belongs to the caller, not this primitive.
+ */
+export const prepareStateRootForBootstrap = (root: string,
+  options: { sqliteLocality?: "skip-for-file-fallback" } = {}): void => {
+  if (process.platform !== "win32") return;
+  // Refuse non-local SQLite storage before createStateRoot can make even an empty directory.
+  const refusal = options.sqliteLocality === "skip-for-file-fallback" ? undefined : filesystemRefusal(root);
+  if (refusal) throw new MeshStateUnsupportedError(`Fabric mesh SQLite state needs a local filesystem: ${refusal}`);
+  createStateRoot(root);
+  assertStateRootPrivacy(root, "state.db", false);
 };
 
 /**
@@ -311,8 +335,8 @@ export const assertPrivateStateRoot = (root: string, db = "state.db", requireDat
  * BEFORE each non-recursive mkdir. Recheck the chain before continuing, including before protecting our new root.
  * Only a successful final mkdir permits an explicit owner (the current user) and protected private DACL, read back.
  * An EEXIST winner is refused, never repaired or adopted. Existing roots get no ACL read here (admission/open gates them).
- * Windows callers run it BEFORE the fence
- * (custody-lock.ts and fence-lock.ts create the root too, untracked), so the fence's root is already private.
+ * Bootstrap callers pair it with the normal root proof BEFORE the fence (prepareStateRootForBootstrap):
+ * custody-lock.ts and fence-lock.ts would otherwise create an untracked root or write into an unproven existing one.
  */
 export const createStateRoot = (root: string): void => {
   if (process.platform !== "win32") { fs.mkdirSync(root, { recursive: true, mode: 0o700 }); return; }
@@ -357,7 +381,7 @@ const stateTargets = (root: string, db: string) => {
 };
 // The normal root plan must match at early admission, open and checkpoint flag writes. The ACL reader alone caches
 // verified successful root-role proofs for stable root+DB identities (volume and lossless file IDs, never ctime).
-// Missing/unknown DB identity and unverified tooling fallbacks never cache; standalone target, creation-parent and
+// Missing/unknown DB identity and failed proofs never cache; standalone target, creation-parent and
 // protect requests stay fresh. A missing DB still gets full pre/post-create proofs. Creating N missing directories
 // first costs N creation-parent preflights plus the root's protect/readback; those cannot satisfy the open's plan.
 type AclTargets = { role?: "root" | "directory" | "file" | "ancestor" | "creation-parent"; files: string[]; directories: string[]; requireDatabase?: boolean };
@@ -367,7 +391,8 @@ const assertWindowsAcl = (root: string, targets: AclTargets, protect: boolean): 
   try { real = path.join(fs.realpathSync.native(path.dirname(path.resolve(root))), path.basename(path.resolve(root))); }
   catch (error) { throw new MeshStateUnsupportedError(`Fabric mesh SQLite state refuses ${root}: its real path is unreadable`, { cause: error }); }
   const why = windowsStateAclRefusal({ root, real, protect, ...targets });
-  if (why) throw new MeshStateUnsupportedError(`Fabric mesh SQLite state refuses ${root}: ${why}`);
+  if (why) throw new MeshStateUnsupportedError(why.startsWith("Windows ACL read failed (")
+    ? why : `Fabric mesh SQLite state refuses ${root}: ${why}`);
 };
 
 // StrictModes (smarty-dev#7548): every ancestor of the root, on the lexical and the real chain, is owned by this

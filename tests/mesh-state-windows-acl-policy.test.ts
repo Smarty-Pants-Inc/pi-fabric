@@ -584,7 +584,7 @@ describe("Windows mesh state ACL policy (smarty-dev#8920)", () => {
     expect((calls[0] as { protect: string }).protect).toBe("C:\\Users\\me\\.pi\\mesh");
     expect(judge(defaultEntries(), { protect: true }, { protect: "ok" })).toMatch(/still inherits its ACL/);
     expect(judge(withEntry(0, { control: 0x9004 }), { protect: true }, { protect: "failed: owner S-1-5-21-1-2-3-1002" }))
-      .toMatch(/private ACL could not be set \(failed: owner S-1-5-21-1-2-3-1002\)/);
+      .toMatch(/private ACL could not be set \(native protection was not proven\)/);
     expect(judge(withEntry(0, { control: 0x9004, owner: ADMINS }), { protect: true }, { protect: "ok" })).toMatch(/not the current user/);
     // Elevated: Administrators may own an EXISTING root, but a root we just made private must read back as ours.
     expect(judge(withEntry(0, { control: 0x9004, owner: ADMINS }), { protect: true }, { protect: "ok", ownerSid: ADMINS }))
@@ -717,6 +717,34 @@ describe("state gate wiring on win32 (smarty-dev#8920)", () => {
     });
   });
 
+  it("GAP13549-U5: bootstrap proves an existing no-DB root before any mkdir or write", async () => {
+    const { gate, calls } = await loadGate("unsafe root ACL");
+    const root = tmp();
+    const mkdir = vi.spyOn(fs, "mkdirSync");
+    const write = vi.spyOn(fs, "writeFileSync");
+    await asWindows(async () => {
+      expect(() => gate.prepareStateRootForBootstrap(root)).toThrow(/unsafe root ACL/);
+    });
+    expect(mkdir).not.toHaveBeenCalled();
+    expect(write).not.toHaveBeenCalled();
+    expect(calls).toEqual([expect.objectContaining({ root, protect: false,
+      files: ["state.db", "state.db-wal", "state.db-shm", "state.db-journal"].map(file => path.join(root, file)),
+      directories: [path.join(root, "state-checkpoint.flags")] })]);
+    expect(fs.readdirSync(root)).toEqual([]);
+  });
+
+  it("GAP13459-U6: the gate preserves only the fixed technical ACL failure message and code", async () => {
+    const root = tmp();
+    const reason = `Windows ACL read failed (exit 17) after 1 retry; root not opened: ${root}`;
+    const { gate } = await loadGate(reason);
+    let error: unknown;
+    await asWindows(async () => {
+      try { gate.assertPrivateStateRoot(root); } catch (caught) { error = caught; }
+    });
+    expect(error).toMatchObject({ code: "FABRIC_MESH_STATE_UNSUPPORTED", message: reason });
+    expect((error as Error).cause).toBeUndefined();
+  });
+
   it("protects only a root it created, with the state files and flag directory in its read", async () => {
     const { gate, calls } = await loadGate(undefined);
     const root = path.join(tmp(), "mesh");
@@ -796,7 +824,9 @@ describe("state gate wiring on win32 (smarty-dev#8920)", () => {
       const backend = createStateBackend({ root, maxEventBytes: 1024, maxReadEvents: 16, lock: {} as never }, { stateBackend });
       try {
         expect(backend.kind).toBe(stateBackend);
-        expect(calls).toHaveLength(1); // before a read/write can start its busy/try budget
+        // The injected reader has no admission cache: selected SQLite preflights before its factory, then
+        // its directly callable constructor admits the existing DB too. Production reuses the verified proof.
+        expect(calls).toHaveLength(stateBackend === "sqlite" ? 2 : 1); // both precede any operation budget
         expect(calls[0]).toMatchObject({ root, protect: false });
         expect(calls[0]!.files.map(file => path.basename(file))).toEqual(["state.db", "state.db-wal", "state.db-shm", "state.db-journal"]);
       } finally { backend.close(); }

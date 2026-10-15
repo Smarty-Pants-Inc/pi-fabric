@@ -1536,7 +1536,7 @@ export class FabricRuntimeState {
     try { await this.#actors.recoverProtectedActors(); }
     catch (error) {
       if (!(error instanceof ActorSlotRecoveryParkedError)) throw error;
-      console.warn(`[pi-fabric] ${this.#actors.slotRecoveryStatus().error?.message}`);
+      diagnostics.warn("src/fabric-runtime-state.ts", `[pi-fabric] ${this.#actors.slotRecoveryStatus().error?.message}`);
     }
     this.#participants.registerSource(() =>
       this.#actors!.listOwned(true).map((actor) =>

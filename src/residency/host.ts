@@ -418,7 +418,7 @@ export class ResidentHost {
     // Follow moved-marker/meta authority even after a stale backend config re-apply.
     const stateBackend = meshStateBackendFromMarker(config.meshRoot, config.mesh.stateBackend);
     if (stateBackend === "sqlite" && stateBackend !== config.mesh.stateBackend) {
-      console.warn(`[pi-fabric] resident mesh ${config.meshRoot}: SQLite moved marker overrides mesh.stateBackend=${config.mesh.stateBackend}; opening sqlite`);
+      diagnostics.warn("src/residency/host.ts", `[pi-fabric] resident mesh ${config.meshRoot}: SQLite moved marker overrides mesh.stateBackend=${config.mesh.stateBackend}; opening sqlite`);
     }
     this.mesh = new MeshStore(config.meshRoot, config.mesh.maxEventBytes, config.mesh.maxReadEvents,
       { backgroundReadCacheMs: config.mesh.idleReadCoalesceMs ?? RUNTIME_MESH_READ_CACHE_MS, lockProtocol: config.mesh.lockProtocol,
@@ -836,7 +836,7 @@ export class ResidentHost {
       try { await this.actors.recoverProtectedActors(); }
       catch (error) {
         if (!(error instanceof ActorSlotRecoveryParkedError)) throw error;
-        console.warn(`[pi-fabric] ${this.actors.slotRecoveryStatus().error?.message}`);
+        diagnostics.warn("src/residency/host.ts", `[pi-fabric] ${this.actors.slotRecoveryStatus().error?.message}`);
       }
       if (this.#staged) { this.#drainActors().pauseForRelease({ strict: true }); this.#drainAgents().pauseForRelease(true); }
       fs.mkdirSync(this.#requestsPath, { recursive: true, mode: 0o700 });

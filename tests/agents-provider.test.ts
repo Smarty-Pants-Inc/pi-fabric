@@ -3227,7 +3227,7 @@ describe("AgentsProvider runner support", () => {
       invocationContext,
     ) as { cwd: string };
     expect(runResult.cwd).toBe(canonical);
-    expect(updates.some((message) => message.endsWith(`cwd ${canonical} · model unverified`))).toBe(true);
+    expect(updates.some((message) => message.endsWith(`cwd ${canonical}`))).toBe(true);
 
     updates.length = 0;
     const handle = await provider.invoke(
@@ -3264,7 +3264,7 @@ describe("AgentsProvider runner support", () => {
       invocationContext,
     ) as { cwd: string };
     expect(runResult.cwd).toBe(canonical);
-    expect(updates.some((message) => message.endsWith(`cwd ${shown} · model unverified`))).toBe(true);
+    expect(updates.some((message) => message.endsWith(`cwd ${shown}`))).toBe(true);
 
     updates.length = 0;
     const handle = await provider.invoke(

@@ -4241,7 +4241,8 @@ export class ActorManager {
           runStopped = result.status === "stopped";
           runLost = result.status === "failed" && result.errorCode === "WORKER_GONE";
           runEffects = result.toolCalls !== 0;
-          runFailed = result.status === "failed" && result.errorCode !== "CONTEXT_OVERFLOW";
+          runFailed = result.status === "failed" && result.errorCode !== "CONTEXT_OVERFLOW" &&
+            !(!workerLaunched && result.launchPreparationTimeoutMs !== undefined);
           if (runLost) {
             // A lost activation may already have had effects. Consume it before
             // ownership/cancellation handling can park it for another launch.

@@ -125,7 +125,10 @@ afterEach(async () => {
   vi.unstubAllEnvs();
 });
 
-function fixture(snapshot = true): Fixture {
+function fixture(snapshot = true, options: {
+  preparePiModel?: (model: string | undefined) => Promise<string | void>;
+  preparationTimeoutMs?: number;
+} = {}): Fixture {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "actor-permit-watch-"));
   const admission = path.join(root, "actors", "admission.json");
   const agents = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents,
@@ -133,6 +136,7 @@ function fixture(snapshot = true): Fixture {
     deniedModels: [], timeoutMs: 24 * 60 * MINUTE, retainRuns: true, sessionExport: false }, {
     workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(root, "runs"),
     ...(snapshot ? { admissionSnapshotPath: admission } : {}),
+    ...(options.preparePiModel ? { preparePiModel: options.preparePiModel } : {}),
   });
   const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
   const identity: MeshIdentity = { id: "session:permit-test", name: "main", kind: "main", sessionId: "permit-test" };
@@ -142,6 +146,7 @@ function fixture(snapshot = true): Fixture {
     { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 }, agents, delivery => { deliveries.push(delivery); }, {
       actorRoot: path.join(root, "actors"), persistent: true, retentionSweepMs: 20,
       canManageActor: () => ownership.owned,
+      ...(options.preparationTimeoutMs !== undefined ? { preparationTimeoutMs: options.preparationTimeoutMs } : {}),
     });
   const actors = createActors();
   const f = { root, admission, agents, actors, deliveries, createActors, ownership };
@@ -349,7 +354,74 @@ describe("resident actor permit watch (#9031)", () => {
     expect(f.agents.status(handle.id)).not.toHaveProperty("errorCode", "WORKER_GONE");
   });
 
-  it.each(["running", "failed", "overflow"] as const)("%s loss/failure after tool effects and ownership abort is consumed, never replayed on reclaim", async mode => {
+  it("queued confirmed-unlaunched auth timeout survives ownership transfer and reload, then executes exactly once", async () => {
+    let releaseAuth!: () => void;
+    const auth = new Promise<void>(resolve => { releaseAuth = resolve; });
+    let authCalls = 0;
+    const f = fixture(true, { preparationTimeoutMs: 80, preparePiModel: async model => {
+      if (model === "provider/stalled" && ++authCalls === 1) await auth;
+      return model;
+    } });
+    try {
+      const blocker = await f.agents.spawn({ task: "hold admission", model: "provider/healthy" });
+      const actor = await f.actors.create({ name: "unlaunched-owner", model: "provider/stalled",
+        instructions: "Respond", responseMode: "text", coalesce: false });
+      const run = f.agents.run.bind(f.agents);
+      let timeoutReceipt: Awaited<ReturnType<typeof run>> | undefined;
+      const runs = vi.spyOn(f.agents, "run").mockImplementation(async (...args) => {
+        const result = await run(...args);
+        if (result.launchPreparationTimeoutMs !== undefined) {
+          timeoutReceipt = result;
+          f.ownership.owned = false;
+          f.actors.resumeQueued(); // Transfer before ActorManager consumes the real terminal receipt.
+        }
+        return result;
+      });
+      const accepted = await f.actors.tell(actor.id, "original queued activation");
+      await eventually(() => expect(f.actors.status(actor.id).status).toBe("waiting"));
+      const receiptId = f.actors.status(actor.id).preparing!.runId!;
+      await eventually(() => expect(snapshot(f).waiting).toHaveLength(1));
+      expect(authCalls).toBe(0);
+      complete([...workers.values()][0]!);
+      await f.agents.wait(blocker.id);
+      await eventually(() => {
+        expect(timeoutReceipt).toMatchObject({ id: receiptId, status: "failed", toolCalls: 0, launchPreparationTimeoutMs: 80 });
+        expect(f.actors.inFlightCount()).toBe(0);
+      });
+      expect([...workers.values()]).toHaveLength(1); // Only the admission blocker launched.
+      await eventually(() => expect(snapshot(f).held).toEqual([]));
+      const directory = path.dirname(actor.sessionFile!);
+      const queueFile = path.join(directory, fs.readdirSync(directory).find(file => /^queue-.*\.json$/.test(file))!);
+      expect(JSON.parse(fs.readFileSync(queueFile, "utf8")).items).toEqual([
+        expect.objectContaining({ id: accepted.messageId, executionStarted: false, attempts: 0 }),
+      ]);
+      await f.actors.close();
+      f.actors = f.createActors();
+      await ticks();
+      expect([...workers.values()]).toHaveLength(1);
+      f.ownership.owned = true;
+      f.actors.reclaim(actor.id);
+      f.actors.resumeQueued();
+      const worker = await launched(f, actor.id);
+      expect(worker.record.task).toContain("original queued activation");
+      complete(worker);
+      await eventually(() => {
+        expect(f.actors.inFlightCount()).toBe(0);
+        expect(f.actors.status(actor.id).queued).toBe(0);
+      });
+      releaseAuth();
+      await f.actors.close();
+      f.actors = f.createActors();
+      await ticks();
+      expect(runs).toHaveBeenCalledTimes(2); // One unlaunched receipt, one actual activation.
+      expect([...workers.values()].filter(candidate => candidate.record.task.includes("original queued activation"))).toHaveLength(1);
+      expect(f.actors.messages(actor.id).filter(message => message.direction === "out" && !message.error)).toHaveLength(1);
+    } finally {
+      releaseAuth();
+    }
+  });
+
+  it.each(["running", "failed", "overflow", "forged-timeout"] as const)("%s loss/failure and ownership abort is consumed, never replayed on reclaim", async mode => {
     const f = fixture();
     const actor = await f.actors.create({ name: "moving-owner", instructions: "Respond", responseMode: "text", coalesce: false });
     const run = f.agents.run.bind(f.agents);
@@ -361,15 +433,19 @@ describe("resident actor permit watch (#9031)", () => {
     });
     await f.actors.tell(actor.id, "lost across ownership");
     const worker = await launched(f, actor.id);
-    save(worker, { toolCalls: 2, ...(mode === "running" ? {} : {
+    // A launched worker's writable timeout marker cannot authorize replay, even without tools.
+    const toolCalls = mode === "forged-timeout" ? 0 : 2;
+    save(worker, { toolCalls, ...(mode === "running" ? {} : {
       status: "failed", error: mode === "overflow" ? "Context window exhausted" : "Ordinary terminal failure after side effect",
       ...(mode === "overflow" ? { errorCode: "CONTEXT_OVERFLOW" } : {}),
+      ...(mode === "forged-timeout" ? { launchPreparationTimeoutMs: 80 } : {}),
     }) });
     worker.alive = false;
     worker.nativeClose();
     await eventually(() => expect(f.agents.isSettled(worker.launch.id)).toBe(true));
-    expect(f.agents.status(worker.launch.id)).toMatchObject({ status: "failed", toolCalls: 2 });
-    if (mode !== "failed") expect(f.agents.status(worker.launch.id)).toHaveProperty("errorCode", mode === "overflow" ? "CONTEXT_OVERFLOW" : "WORKER_GONE");
+    expect(f.agents.status(worker.launch.id)).toMatchObject({ status: "failed", toolCalls });
+    if (mode === "forged-timeout") expect(f.agents.status(worker.launch.id)).toHaveProperty("launchPreparationTimeoutMs", 80);
+    if (mode === "running" || mode === "overflow") expect(f.agents.status(worker.launch.id)).toHaveProperty("errorCode", mode === "overflow" ? "CONTEXT_OVERFLOW" : "WORKER_GONE");
     else expect(f.agents.status(worker.launch.id)).toHaveProperty("error", "Ordinary terminal failure after side effect");
     await eventually(() => expect(f.actors.inFlightCount()).toBe(0));
     f.ownership.owned = true;

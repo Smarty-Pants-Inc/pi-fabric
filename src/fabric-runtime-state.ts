@@ -966,6 +966,9 @@ export class FabricRuntimeState {
         }
         await initializeMeshActivation();
       },
+      // Reuse committed heartbeat maintenance, never another timer/background import.
+      presencePassMs: 25_000,
+      terminalActor: entry => this.#actors?.validateSessionActorTombstone(entry),
       presencePass: async () => {
         await rootPresenceAlarms(this.#mesh!, identity, hostId,
           this.#participants!.list({ scope: "project", includeStale: true, fresh: true }), this.#config!.mesh.rootPresenceAlarmMs);
@@ -1018,7 +1021,7 @@ export class FabricRuntimeState {
           // In dual mode, exclude legacy file custodians with the mesh lock too.
           const register = () => {
             if (!live.current()) throw new Error("Pi Fabric mesh activation lifecycle retired");
-            return registerMainInbox(meshRoot, identity, sessionId, sessionFile);
+            return registerMainInbox(meshRoot, identity, sessionId, sessionFile, smartyAgent, namedMain ? participantProject(context.cwd) : undefined);
           };
           inboxActivation = meshCustodyMode() === "own" ? register() : await mesh.exclusive(register);
         } finally { releaseCustody(); }

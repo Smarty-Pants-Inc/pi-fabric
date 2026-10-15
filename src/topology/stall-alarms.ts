@@ -32,6 +32,8 @@ const names = (directory: string): string[] => {
 interface InboxOwner {
   rootId: string; sessionId: string; sessionFile?: string | undefined;
   ownerIdentityId: string; pid: number; host?: string; name?: string; processStartedAt?: string | undefined; retired?: true; activationId?: string;
+  /** Native bootstrap grants, distinct from display/lineage. Never read from mesh.put. */
+  nativeLauncher?: string | undefined; nativeProject?: string | undefined;
 }
 interface InboxRoute { oldRoot: string; newRoot?: string; messageId: string; item?: HeldAgentMessage; done?: true }
 interface Successor { oldRoot: string; newRoot?: string; activationId?: string }
@@ -39,9 +41,10 @@ interface Successor { oldRoot: string; newRoot?: string; activationId?: string }
 /** Explicit native activation, not a name/cwd inference. Each runtime captures its
  * own token: resuming a root reopens fresh delivery, never the predecessor runtime.
  * Per-message move tombstones live separately and are never reset here. */
-export const registerMainInbox = (meshRoot: string, identity: MeshIdentity, sessionId: string, sessionFile?: string): string => {
+export const registerMainInbox = (meshRoot: string, identity: MeshIdentity, sessionId: string, sessionFile?: string,
+  nativeLauncher?: string, nativeProject?: string): string => {
   const activationId = randomUUID();
-  writeJsonAtomic(ownerFile(meshRoot, sessionId), { rootId: identity.id, sessionId, sessionFile, activationId,
+  writeJsonAtomic(ownerFile(meshRoot, sessionId), { rootId: identity.id, sessionId, sessionFile, activationId, nativeLauncher, nativeProject,
     ownerIdentityId: identity.id, pid: process.pid, host: os.hostname(), name: identity.name, processStartedAt: processStartTime(process.pid) } satisfies InboxOwner, { durable: true });
   writeJsonAtomic(successorFile(meshRoot, identity.id), { oldRoot: identity.id, activationId } satisfies Successor, { durable: true });
   return activationId;

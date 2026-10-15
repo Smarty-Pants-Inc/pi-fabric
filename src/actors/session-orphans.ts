@@ -4,11 +4,13 @@ import os from "node:os";
 import path from "node:path";
 import { ownProcessIncarnation } from "../core/atomic-write.js";
 import { withStateFence } from "../mesh/commit-outbox.js";
-import { assertMeshStateReadable, censusRecordAlive, type MeshIdentity, type MeshStateEntry, type MeshStore } from "../mesh/store.js";
+import { assertMeshStateReadable, censusRecordAlive, type MeshBatchOperation, type MeshIdentity, type MeshStateEntry, type MeshStore } from "../mesh/store.js";
 import { residentProcessAlive } from "../residency/process-identity.js";
 import { hostLeasePath, readHostLeaseCurrent, type FabricHostLease } from "../topology/host-leases.js";
 import { isLiveLegacyRootEntry } from "../topology/legacy-root-liveness.js";
-import { prepareParticipantFileLock, withParticipantFileTryLock } from "../topology/participant-files.js";
+import { prepareParticipantFileLock, withParticipantFileTryLock, writeParticipantFile } from "../topology/participant-files.js";
+import type { FabricParticipantRecord } from "../topology/types.js";
+import { assertNativeObserver } from "./launcher-lead.js";
 import { ActorRegistryStore } from "./registry-store.js";
 import { FABRIC_ACTOR_HOST_EVENTS, type FabricActorInfo, type FabricActorSessionOrphan } from "./types.js";
 
@@ -42,14 +44,15 @@ const leaseOf = (meshRoot: string, id: string): FabricHostLease | undefined => {
       !time(lease.updatedAt) || !time(lease.expiresAt)) return undefined;
   // Both reads must name the SAME lease generation. A renewal or replacement
   // between the strict parser and optional-field validation vetoes the verdict.
-  for (const key of ["id", "rootId", "identityId", "updatedAt", "expiresAt", "startedAt", "reloadUntil", "session", "writer"] as const) {
+  for (const key of ["id", "rootId", "identityId", "incarnationToken", "updatedAt", "expiresAt", "startedAt", "reloadUntil", "session", "writer"] as const) {
     if (JSON.stringify(raw[key]) !== JSON.stringify(lease[key])) return undefined;
   }
   return lease;
 };
 
 /** Missing presence is absence; an unreadable/invalid record or owner lease is NOT absence. */
-const noLiveParticipant = (mesh: MeshStore, id: string, now: number, deadOwner?: string): boolean => {
+const noLiveParticipant = (mesh: MeshStore, id: string, now: number, deadOwner?: string,
+  settled?: (entry: MeshStateEntry) => boolean): boolean => {
   const key = participantKey(id);
   const entries: MeshStateEntry[] = [];
   try {
@@ -63,10 +66,14 @@ const noLiveParticipant = (mesh: MeshStore, id: string, now: number, deadOwner?:
     const shared = mesh.get(key, { fresh: true });
     if (shared) entries.push(shared);
     for (const entry of entries) {
+      // Authenticated terminal history is not renewed execution presence. Its
+      // untrusted transient fields must neither grant capabilities nor veto scrubbing.
+      if (settled?.(entry)) continue;
       const value = record(entry.value);
       if (!value || value.id !== id || typeof value.ownerHostId !== "string" ||
           typeof value.ownerIdentityId !== "string" || typeof value.rootId !== "string" ||
           !time(entry.updatedAt) || now - entry.updatedAt < SESSION_ACTOR_ORPHAN_GRACE_MS) return false;
+      if (entry.updatedBy.id !== deadOwner) return false;
       // Staleness is not death authority for a different owner or bridged root.
       if (value.ownerHostId !== deadOwner || value.ownerIdentityId !== deadOwner || value.rootId !== deadOwner ||
           (value.remoteHost !== undefined && value.remoteHost !== os.hostname())) return false;
@@ -259,14 +266,14 @@ export class SessionActorOrphans {
     };
   }
 
-  reconcile(): Promise<number> {
+  reconcile(checkActive?: () => void): Promise<number> {
     if (this.#closed) return Promise.resolve(0);
     if (this.#pending) return this.#pending;
-    const pending = this.#reconcile().finally(() => { if (this.#pending === pending) this.#pending = undefined; });
+    const pending = this.#reconcile(checkActive).finally(() => { if (this.#pending === pending) this.#pending = undefined; });
     return this.#pending = pending;
   }
 
-  async #reconcile(): Promise<number> {
+  async #reconcile(checkActive?: () => void): Promise<number> {
     let stopped = 0;
     for (const { sessionId, store } of this.#registries()) {
       // A persisted stop is also the alarm outbox. A crash/failed publication
@@ -274,8 +281,11 @@ export class SessionActorOrphans {
       try {
         for (const row of this.#rows(store)) {
           if (this.#closed) return stopped;
-          if (row.rootId === `session:${sessionId}` && row.residency === "session" && row.status === "stopped" &&
-              record(row.sessionOrphan)?.alarmPublishedAt === undefined && row.sessionOrphan) await this.#publishAlarm(store, row);
+          if (row.rootId === `session:${sessionId}` && row.residency === "session" && row.status === "stopped" && row.sessionOrphan) {
+            // The PRIVATE orphan generation is the retry outbox, including older alarm-only stops.
+            try { await this.#settleDirectory(store, row, false, checkActive); } catch { /* retry next committed pass */ }
+            if (record(row.sessionOrphan)?.alarmPublishedAt === undefined) await this.#publishAlarm(store, row);
+          }
         }
       } catch { /* Keep unreadable/pending alarms for the next existing event/read. */ }
       let ids: string[];
@@ -304,19 +314,22 @@ export class SessionActorOrphans {
           const prepared = store.prepare(snapshot.actors.map(before => before.id === id ? row : before), { durable: true }, snapshot);
           let committed: boolean;
           try {
-            // Global custody order matches adoption: registry -> state -> zero-wait keys.
-            // A successor registry generation, resumed lineage or new live presence vetoes.
-            committed = await ActorRegistryStore.withLocks([store], () => withStateFence(this.mesh, this.identity, () =>
-              withParticipantFileTryLock(this.mesh, keys[0]!, incarnation, () =>
-                withParticipantFileTryLock(this.mesh, keys[1]!, incarnation, () => {
-                  if (this.#closed || !prepared.valid() || !sessionActorRootGone(this.mesh, rootId, this.lineageAlive) ||
-                      !this.#actorAbsent(sessionId, id)) return false;
-                  prepared.commit();
-                  return true;
-                })), 0), "session-orphans-reconcile");
+            // Registry -> target lease -> state -> zero-wait participant keys.
+            // Share actual publisher custody; recheck every proof at the durable decision.
+            committed = await ActorRegistryStore.withLocks([store], () => this.mesh.leaseCustody(hostLeasePath(this.mesh.root, rootId),
+              () => withStateFence(this.mesh, this.identity, () =>
+                withParticipantFileTryLock(this.mesh, keys[0]!, incarnation, () =>
+                  withParticipantFileTryLock(this.mesh, keys[1]!, incarnation, () => {
+                    checkActive?.();
+                    if (this.#closed || !prepared.valid() || !sessionActorRootGone(this.mesh, rootId, this.lineageAlive) ||
+                        !this.#actorAbsent(sessionId, id)) return false;
+                    prepared.commit();
+                    return true;
+                  })), 0), 0, { ownIncarnation: incarnation }), "session-orphans-reconcile");
           } finally { prepared.dispose(); }
           if (!committed) continue;
           stopped++;
+          try { await this.#settleDirectory(store, row, false, checkActive); } catch { /* durable private outbox retains retry */ }
           await this.#publishAlarm(store, row);
         } catch { /* Busy fence, corrupt evidence or I/O failure: retry only on the next event/read. */ }
       }
@@ -333,7 +346,146 @@ export class SessionActorOrphans {
     // execution presence. Recent active advertisements retain the restart grace.
     if (legacy && value?.status !== "idle" && value?.status !== "stopped" &&
         Date.now() - legacy.updatedAt < SESSION_ACTOR_ORPHAN_GRACE_MS) return false;
-    return noLiveParticipant(this.mesh, id, Date.now(), `session:${sessionId}`);
+    return noLiveParticipant(this.mesh, id, Date.now(), `session:${sessionId}`, entry => this.validateTombstone(entry) !== undefined);
+  }
+
+  #terminal(row: Record<string, unknown> & { id: string }, marker: Record<string, unknown>,
+    receipt: Record<string, unknown>): FabricParticipantRecord | undefined {
+    if (row.residency !== "session" || row.status !== "stopped" || row.stopReason !== "host-exit" || row.removal || typeof row.name !== "string" ||
+        typeof row.rootId !== "string" || !row.rootId.startsWith("session:") || !/^[a-f0-9]{32}$/.test(row.id) ||
+        marker.oldRoot !== row.rootId || !time(marker.orphanedAt) || !time(row.createdAt) ||
+        !time(receipt.at) || typeof receipt.by !== "string" || !receipt.by.startsWith("session:") || receipt.by === row.rootId ||
+        (receipt.retiredAt !== undefined && (!time(receipt.retiredAt) || typeof receipt.retiredBy !== "string")) ||
+        typeof row.runner !== "string" || !/^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$/.test(row.runner)) return undefined;
+    // Closed allowlist: NEVER spread an advertisement. No run/preparation/queue/routing
+    // state or capability (including fabric) survives an observer-written tombstone.
+    return { format: 1, id: row.id, kind: "actor", name: row.name, rootId: row.rootId,
+      ownerHostId: row.rootId, ownerIdentityId: row.rootId, parentId: row.rootId,
+      ...(typeof row.project === "string" ? { project: row.project } : {}), residency: "session", runner: row.runner,
+      transport: "host", capabilities: [], controlProtocol: "legacy", status: "stopped", stopReason: "owner-root-gone",
+      startedAt: row.createdAt, updatedAt: receipt.at, ownerRootGoneAt: marker.orphanedAt, ownerRootGoneBy: receipt.by,
+      settledAt: receipt.at, ...(time(receipt.retiredAt) ? { retiredAt: receipt.retiredAt, retiredBy: receipt.retiredBy as string } : {}) };
+  }
+
+  /** Read-side exception is ONLY terminal and ONLY authenticated by a private generation.
+   * Re-prove the ORIGINAL owner's death from raw evidence, never from its envelope.
+   * The observer may exit: its committed private receipt remains provenance, not a live lease.
+   */
+  validateTombstone(entry: MeshStateEntry): FabricParticipantRecord | undefined {
+    try {
+      const value = record(entry.value);
+      if (!time(entry.updatedAt) || !Number.isSafeInteger(entry.version) || entry.version < 1 ||
+          !value || value.stopReason !== "owner-root-gone" || value.status !== "stopped" || typeof value.id !== "string" ||
+          typeof value.rootId !== "string" || entry.updatedBy.kind !== "main") return undefined;
+      const registry = this.#registries().find(item => `session:${item.sessionId}` === value.rootId);
+      const row = registry && this.#rows(registry.store).find(item => item.id === value.id);
+      const marker = record(row?.sessionOrphan), current = record(marker?.directorySettlement);
+      const receipt = current?.by === entry.updatedBy.id && current.at === value.settledAt ? current : record(current?.previous);
+      if (!row || !marker || !receipt || entry.updatedBy.id !== receipt.by || value.ownerRootGoneBy !== receipt.by ||
+          value.ownerRootGoneAt !== marker.orphanedAt || value.settledAt !== receipt.at ||
+          value.rootId !== row.rootId || value.ownerHostId !== row.rootId || value.ownerIdentityId !== row.rootId ||
+          (entry.key !== participantKey(row.id) && entry.key !== `actors/${registry!.sessionId}/${row.id}`) ||
+          !sessionActorRootGone(this.mesh, String(row.rootId), this.lineageAlive)) return undefined;
+      return this.#terminal(row, marker, receipt);
+    } catch { return undefined; }
+  }
+
+  /** Record-only, idempotent owner retirement. No actor manager/history cleanup is involved. */
+  async retire(id: string, checkActive: () => void): Promise<{ removed: true; retired: true; id: string; historyPreserved: true } | undefined> {
+    checkActive();
+    await this.reconcile(checkActive);
+    checkActive();
+    const actor = this.resolve(id);
+    if (!actor) return undefined;
+    const registry = this.#registries().find(item => `session:${item.sessionId}` === actor.rootId);
+    const row = registry && this.#rows(registry.store).find(item => item.id === actor.id);
+    if (!registry || !row || !await this.#settleDirectory(registry.store, row, true, checkActive)) {
+      throw new Error("Actor owner root is live, leased or not independently provably gone; record was not retired");
+    }
+    return { removed: true, retired: true, id: actor.id, historyPreserved: true };
+  }
+
+  /** Private registry outbox -> persistent mesh/file tombstones, never delete/unlink.
+   * Registry -> old-root lease -> state -> zero-wait keys matches publisher custody.
+   * A private intent can precede a failed mesh commit; next normal pass retries it.
+   */
+  async #settleDirectory(store: ActorRegistryStore, row: Record<string, unknown> & { id: string }, retire: boolean,
+    checkActive?: () => void): Promise<boolean> {
+    const rootId = row.rootId, marker = record(row.sessionOrphan);
+    if (typeof rootId !== "string" || !marker || marker.oldRoot !== rootId || !time(marker.orphanedAt)) return false;
+    const sessionId = rootId.slice(8), beforeReceipt = record(marker.directorySettlement);
+    const incarnation = await ownProcessIncarnation();
+    const keys = [participantKey(rootId), participantKey(row.id)].sort();
+    for (const key of keys) await prepareParticipantFileLock(this.mesh, key);
+    const snapshot = store.snapshot();
+    const current = this.#rows(store).find(item => item.id === row.id && item.rootId === rootId && item.status === "stopped");
+    // Preparation awaits key recovery. Never overwrite a concurrent retirement/outbox
+    // selected before that await, even when it belongs to the same orphan generation.
+    if (!current || JSON.stringify(current.sessionOrphan) !== JSON.stringify(marker)) return false;
+    row = current;
+    const authority = assertNativeObserver(this.mesh.root, this.identity, this.ownSessionId, row, retire);
+    const changed = !beforeReceipt || beforeReceipt.by !== this.identity.id || (retire && !time(beforeReceipt.retiredAt));
+    const receipt = changed ? { by: this.identity.id, at: Date.now(),
+      ...(retire || time(beforeReceipt?.retiredAt) ? { retiredAt: time(beforeReceipt?.retiredAt) ? beforeReceipt.retiredAt : Date.now(),
+        retiredBy: typeof beforeReceipt?.retiredBy === "string" ? beforeReceipt.retiredBy : this.identity.id } : {}),
+      ...(beforeReceipt && typeof beforeReceipt.by === "string" && time(beforeReceipt.at) ? { previous: {
+        by: beforeReceipt.by, at: beforeReceipt.at, ...(time(beforeReceipt.retiredAt) ? {
+          retiredAt: beforeReceipt.retiredAt, retiredBy: beforeReceipt.retiredBy as string } : {}) } } : {}) } : beforeReceipt;
+    const terminal = this.#terminal(row, marker, receipt);
+    if (!terminal) return false;
+    const prepared = changed ? store.prepare(snapshot.actors.map(item => item.id === row.id
+      ? { ...item, sessionOrphan: { ...marker, directorySettlement: receipt } } : item), { durable: true }, snapshot) : undefined;
+    let expected = snapshot.bytes, intentCommitted = false, applied = false;
+    const underKeys = <T>(operation: () => T): T => withParticipantFileTryLock(this.mesh, keys[0]!, incarnation,
+      () => withParticipantFileTryLock(this.mesh, keys[1]!, incarnation, operation));
+    const assertProof = () => {
+      checkActive?.();
+      if (this.#closed || store.snapshot().bytes !== expected || !sessionActorRootGone(this.mesh, rootId, this.lineageAlive) ||
+          !this.#actorAbsent(sessionId, row.id)) throw new Error("Actor orphan generation/death proof changed at commit");
+      if (assertNativeObserver(this.mesh.root, this.identity, this.ownSessionId, row, retire) !== authority) {
+        throw new Error("Native observer activation/launcher changed at commit");
+      }
+    };
+    const same = (entry: MeshStateEntry) => this.validateTombstone(entry) !== undefined &&
+      JSON.stringify(this.validateTombstone(entry)) === JSON.stringify(terminal) && JSON.stringify(entry.value) === JSON.stringify(terminal);
+    const leases = [hostLeasePath(this.mesh.root, rootId), hostLeasePath(this.mesh.root, this.identity.id)].sort();
+    try {
+      await ActorRegistryStore.withLocks([store], () => this.mesh.leaseCustody(leases[0]!,
+        () => this.mesh.leaseCustody(leases[1]!, () => this.mesh.withTryLock(() => this.mesh.writeBatch({ identity: this.identity, ops: [],
+          prepare: view => {
+            const ops: MeshBatchOperation[] = [];
+            for (const key of [`actors/${sessionId}/${row.id}`, participantKey(row.id)]) {
+              const entry = view.get(key);
+              if (!entry) continue; // Preserve history; don't invent advertisements that never existed.
+              const value = record(entry.value);
+              if (value?.id !== row.id || value.rootId !== rootId ||
+                  (entry.updatedBy.id !== rootId && !this.validateTombstone(entry))) throw new Error("Actor advertisement owner changed");
+              if (!same(entry)) ops.push({ kind: "put", key, value: terminal, ifVersion: entry.version });
+            }
+            return ops;
+          },
+          beforeCommit: () => underKeys(() => {
+            assertProof();
+            if (!intentCommitted) {
+              if (prepared && !prepared.valid()) throw new Error("Private actor outbox generation changed");
+              prepared?.commit(); intentCommitted = true; expected = store.snapshot().bytes;
+            }
+            applied = true;
+          }),
+          afterCommit: () => underKeys(() => {
+            assertProof();
+            const file = path.join(this.mesh.root, "participants", `${digest(row.id)}.json`);
+            let entry: MeshStateEntry;
+            try { entry = JSON.parse(fs.readFileSync(file, "utf8")); }
+            catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return; throw error; }
+            if (entry.key !== participantKey(row.id) || record(entry.value)?.id !== row.id || record(entry.value)?.rootId !== rootId ||
+                (entry.updatedBy.id !== rootId && !this.validateTombstone(entry))) throw new Error("Native actor advertisement owner changed");
+            if (!same(entry)) writeParticipantFile(this.mesh.root, { ...entry, updatedBy: this.identity,
+              updatedAt: Date.now(), version: entry.version + 1, value: terminal });
+          }),
+        }), 0), 0, { ownIncarnation: incarnation }), 0, { ownIncarnation: incarnation }), "session-orphans-directory");
+    } finally { prepared?.dispose(); }
+    return applied;
   }
 
   async #publishAlarm(store: ActorRegistryStore, row: Record<string, unknown> & { id: string }): Promise<void> {

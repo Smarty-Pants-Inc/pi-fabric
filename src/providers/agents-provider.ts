@@ -1645,6 +1645,17 @@ export class AgentsProvider implements FabricProvider {
       }
       case "remove": {
         if (args.scope === "global") return this.globalActors.remove(String(args.id));
+        // Foreign terminal history has its own retirement path; never widen removeActor.
+        const retired = await this.actorManager.retireSessionOrphan(String(args.id), () => {
+          checkCommit();
+          const caller = this.actorManager.identity, self = this.participants.self();
+          if (!this.mainAgent.local || this.mainAgent.interactive === false || caller.kind !== "main" ||
+              caller.id !== this.mainAgent.id || self.kind !== "root" || self.id !== caller.id || self.rootId !== caller.id ||
+              self.ownerIdentityId !== caller.id || self.ownerHostId !== caller.id || self.stale) {
+            throw new Error("Only the live native Main can retire an orphan actor record");
+          }
+        });
+        if (retired) return retired;
         const cleanup = this.actorManager.cleanupObligation(String(args.id));
         if (cleanup) {
           if (this.actorManager.owns(cleanup.id)) return this.actorManager.remove(cleanup.id);

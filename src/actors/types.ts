@@ -332,6 +332,10 @@ export interface FabricActorSessionOrphan {
   role?: string;
   /** Durable mesh receipt acknowledged; absent means retry publication on the next read/event. */
   alarmPublishedAt?: number;
+  /** PRIVATE registry generation/outbox. Public tombstone fields are never authority. */
+  directorySettlement?: { by: string; at: number; retiredAt?: number; retiredBy?: string;
+    /** One predecessor permits an interrupted outbox/file transition, never a public claim. */
+    previous?: { by: string; at: number; retiredAt?: number; retiredBy?: string } };
 }
 
 export interface FabricActorInfo {

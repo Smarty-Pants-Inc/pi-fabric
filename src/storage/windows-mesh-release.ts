@@ -163,9 +163,17 @@ export const prepareWindowsMeshCapability = (): WindowsMeshCapability => {
   const boot = windowsHelperBootstrap(windowsMeshReleaseTestHooks.bootstrapCandidates);
   if (!boot) throw new Error("no trusted packaged Windows helper (missing, or not the digest embedded in this build); refusing before any lock publication");
   const { digest } = boot;
-  // H2: the private retained cache, assembled by this process, checked by the trusted bootstrap.
+  // H2: establish private inheritable ACLs BEFORE Node creates staging or writes executable bytes. Windows mkdir
+  // inherits the profile's DACL; POSIX mode bits do not make it private. Only the digest-verified packaged bootstrap
+  // creates missing components. Existing unsafe components (even empty ones) are refused, never silently ACL-healed.
   const { chain, base } = cacheChain();
-  fs.mkdirSync(base, { recursive: true });
+  const creation = runVerified(boot.file, digest, ["--cache-create-v1", ...chain.map(entry => path.toNamespacedPath(entry))]);
+  if (!creation || creation.status !== 0 || !/^ok created\r?\n?$/.test(creation.stdout)) {
+    const detail = creation?.stdout.trim() || (creation ? `exit ${String(creation.status)}` : "bootstrap changed");
+    const index = /^refused ([0-9]+) /.exec(detail)?.[1];
+    const component = index === undefined ? base : chain[Number(index)] ?? base;
+    throw new Error(`Windows mesh helper cache private creation refused at ${component} (${detail}); existing components are never ACL-healed. Stop all cache users and have the operator inspect this exact component before global cache maintenance; no helper or lock was published`);
+  }
   for (const dir of chain) {
     const stat = fs.lstatSync(dir);
     if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error(`Windows mesh helper cache component is not a real directory: ${dir}`);
@@ -188,6 +196,11 @@ export const prepareWindowsMeshCapability = (): WindowsMeshCapability => {
       fs.writeFileSync(staged, boot.bytes, { flag: "wx" });
       if (!holdsDigest(staged, digest)) throw new Error("staged Windows mesh helper does not rehash to its digest");
       windowsMeshReleaseTestHooks.afterCacheStaged?.(staging);
+      // Read back actual inherited directory/file privacy before publication too, using the trusted bootstrap.
+      const stagedPrivacy = runVerified(boot.file, digest, ["--cache-private-v1", ...[...realChain, staging, staged].map(entry => path.toNamespacedPath(entry))]);
+      if (!stagedPrivacy || stagedPrivacy.status !== 0 || !/^ok private\r?\n?$/.test(stagedPrivacy.stdout)) {
+        throw new Error(`unpublished Windows mesh helper staging is not private (${stagedPrivacy?.stdout.trim() || "bootstrap changed or privacy check failed"})`);
+      }
       const publish = runVerified(boot.file, digest, ["--cache-publish-v1", path.toNamespacedPath(staging), path.toNamespacedPath(digestDir)]);
       if (!publish) throw new Error("the packaged Windows helper no longer matches its digest");
       if (publish.status === 0 && /^ok published\r?\n?$/.test(publish.stdout)) published = true;

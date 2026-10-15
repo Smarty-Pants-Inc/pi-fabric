@@ -197,7 +197,7 @@ describe("Windows retained cache location policy, recorded preparation (#9569 H2
     for (const method of ["writeFileSync", "renameSync", "unlinkSync", "rmdirSync"] as const) {
       vi.spyOn(fs, method).mockImplementation(() => { throw new Error(`unexpected recorded mutation: ${method}`); });
     }
-    queue(receipt("ok private\n"), receipt("FMRCAP1 mesh-retire-v1 abi=1\n"));
+    queue(receipt("ok created\n"), receipt("ok private\n"), receipt("FMRCAP1 mesh-retire-v1 abi=1\n"));
   });
 
   it.each([
@@ -256,8 +256,9 @@ describe("Windows retained cache location policy, recorded preparation (#9569 H2
     const result = prepareWindowsMeshCapability();
     const base = path.join(selected, "pi-fabric", "native");
     expect(result).toEqual({ absolutePath: path.join(base, capability.digest, "fabric-win-remove.exe"), digest: capability.digest, meshAbi: 1 });
-    expect(fs.mkdirSync).toHaveBeenCalledWith(base, { recursive: true });
-    expect(childMock.mock.calls.map(call => call[1]?.[0])).toEqual(["--cache-private-v1", "--capability-v1"]);
+    expect(fs.mkdirSync).not.toHaveBeenCalled(); // native protected creation, never inherited recursive mkdir
+    expect(childMock.mock.calls.map(call => call[1]?.[0])).toEqual(["--cache-create-v1", "--cache-private-v1", "--capability-v1"]);
+    expect(childMock.mock.calls[0]?.[1]).toEqual(["--cache-create-v1", path.toNamespacedPath(path.dirname(base)), path.toNamespacedPath(base)]);
     expect(fs.writeFileSync).not.toHaveBeenCalled();
   });
 
@@ -266,6 +267,46 @@ describe("Windows retained cache location policy, recorded preparation (#9569 H2
     windowsMeshReleaseTestHooks.cacheRoot = `${temp}\\fixture-cache`;
     const result = prepareWindowsMeshCapability();
     expect(result.absolutePath).toBe(path.join(windowsMeshReleaseTestHooks.cacheRoot, capability.digest, "fabric-win-remove.exe"));
-    expect(childMock.mock.calls.map(call => call[1]?.[0])).toEqual(["--cache-private-v1", "--capability-v1"]);
+    expect(childMock.mock.calls.map(call => call[1]?.[0])).toEqual(["--cache-create-v1", "--cache-private-v1", "--capability-v1"]);
+    expect(childMock.mock.calls[0]?.[1]).toEqual(["--cache-create-v1", path.toNamespacedPath(windowsMeshReleaseTestHooks.cacheRoot)]);
+  });
+
+  it("PR1191: trusted private creation precedes staging writes and privacy readback precedes digest publication", () => {
+    const events: string[] = [];
+    const base = path.join(local, "pi-fabric", "native");
+    const digestDir = path.join(base, capability.digest);
+    vi.mocked(fs.lstatSync).mockImplementation(((file: fs.PathLike) => {
+      if (String(file) === digestDir) return absent();
+      return { isSymbolicLink: () => false, isDirectory: () => !String(file).endsWith(".exe"), isFile: () => String(file).endsWith(".exe") };
+    }) as typeof fs.lstatSync);
+    vi.mocked(fs.mkdirSync).mockImplementation((() => { events.push("stage-directory"); }) as typeof fs.mkdirSync);
+    vi.mocked(fs.writeFileSync).mockImplementation(() => { events.push("stage-bytes"); });
+    childMock.mockReset();
+    childMock.mockImplementation(((_file: string, args: string[]) => {
+      const mode = args[0]!;
+      events.push(mode);
+      if (mode !== "--capability-v1") expect(_file).toBe(capability.absolutePath); // trusted packaged bootstrap
+      return receipt(mode === "--cache-create-v1" ? "ok created\n" : mode === "--cache-publish-v1" ? "ok published\n"
+        : mode === "--capability-v1" ? "FMRCAP1 mesh-retire-v1 abi=1\n" : "ok private\n");
+    }) as typeof spawnSync);
+    const result = prepareWindowsMeshCapability();
+    expect(result.absolutePath).toBe(path.join(digestDir, "fabric-win-remove.exe"));
+    expect(events).toEqual(["--cache-create-v1", "stage-directory", "stage-bytes", "--cache-private-v1",
+      "--cache-publish-v1", "--cache-private-v1", "--capability-v1"]);
+    expect(fs.mkdirSync).toHaveBeenCalledTimes(1);
+    expect(fs.writeFileSync).toHaveBeenCalledWith(expect.stringContaining(".staging-"), executable, { flag: "wx" });
+    expect(fs.renameSync).not.toHaveBeenCalled();
+  });
+
+  it.each([0, 1])("PR1191: existing unsafe component %i refuses before staging/publication, without ACL healing", index => {
+    childMock.mockReset();
+    queue(receipt(`refused ${index} writable by another SID\n`, 3));
+    const component = path.join(local, "pi-fabric", ...(index ? ["native"] : []));
+    expect(() => prepareWindowsMeshCapability()).toThrow(new RegExp(component.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+    expect(childMock.mock.calls.map(call => call[1]?.[0])).toEqual(["--cache-create-v1"]);
+    expect(fs.mkdirSync).not.toHaveBeenCalled();
+    expect(fs.writeFileSync).not.toHaveBeenCalled();
+    expect(fs.unlinkSync).not.toHaveBeenCalled();
+    expect(fs.rmdirSync).not.toHaveBeenCalled();
   });
 });

@@ -31,8 +31,14 @@
  * fabric-win-remove --cache-private-v1 P1 ... Pn (1 <= n <= 8): the retained helper cache chain, checked by the TRUSTED
  * packaged bootstrap (never by the cache executable itself). Every Pi is a direct child of P(i-1), opened as itself
  * (no reparse point followed): P1..P(n-1) real directories, Pn a regular file; each owned by this token's user (or
- * default owner) and privateDacl; every ancestor of P1 is a real directory (holdAncestors); the final path of Pn is
+ * default owner) and privateDacl; every ancestor of P1 is held as a real directory with trusted ownership and no
+ * untrusted replacement/ACL-takeover rights (create-only and inherit-only ACEs are harmless); the final path of Pn is
  * Pn itself. "ok private" exit 0, else "refused I REASON" exit 3.
+ *
+ * fabric-win-remove --cache-create-v1 P1 [P2]: trusted bootstrap only, before Node writes cache bytes. Create missing
+ * direct-child directories with a protected, inheritable user/owner/SYSTEM/Administrators-only DACL. Existing entries
+ * are checked, NEVER ACL-healed (even when empty). Hold ancestors and each component; verify owner, DACL, final path
+ * and real-directory kind on readback. "ok created" exit 0, else "refused I REASON" exit 3.
  *
  * fabric-win-remove --cache-publish-v1 STAGING DEST: publish a closed and rehashed staging directory at DEST, a sibling,
  * with MoveFileExW and NO replace flag: an existing DEST is never replaced ("exists", exit 6). "ok published" exit 0.
@@ -58,6 +64,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <aclapi.h>
+#include <sddl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -65,7 +72,7 @@
 
 #define MAX_ENTRIES 4096
 /* Read, traverse and synchronize only (the same set as src/storage/windows-temp-root.ts). */
-#define READ_ONLY_RIGHTS 0xa01200a9u
+#define READ_ONLY_RIGHTS (FILE_GENERIC_READ | FILE_GENERIC_EXECUTE)
 typedef struct { HANDLE handle; int directory; } Entry;
 static Entry entries[MAX_ENTRIES];
 static PSID user, owner;
@@ -142,47 +149,109 @@ static HANDLE openJudgedIds(const wchar_t *path, DWORD access, int directory, un
     return handle;
 }
 
-/* No SID but ours, SYSTEM or Administrators may write: NULL when private, else why not. */
-static const char *privateDacl(HANDLE handle) {
+/* TrustedInstaller owns normal Windows ancestors, but is NOT an additional writer allowed by --private or the
+ * actual cache-chain privateDacl policy. Keep that policy's trusted set unchanged. */
+static int ancestorTrusted(PSID sid) {
+    static PSID installer;
+    if (trusted(sid)) return 1;
+    if (!installer && !ConvertStringSidToSidW(L"S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464", &installer)) return 0;
+    return EqualSid(sid, installer);
+}
+
+static const char *daclDiagnostic(PSECURITY_DESCRIPTOR descriptor, const char *reason, long index, PSID trustee,
+    DWORD raw, DWORD mapped, BYTE flags) {
+    static char diagnostic[16384];
+    LPSTR sid = NULL, sddl = NULL;
+    ConvertSidToStringSidA(trustee, &sid);
+    ConvertSecurityDescriptorToStringSecurityDescriptorA(descriptor, SDDL_REVISION_1, DACL_SECURITY_INFORMATION, &sddl, NULL);
+    snprintf(diagnostic, sizeof(diagnostic), "%s; ace=%ld sid=%s mask=0x%08lx mapped=0x%08lx flags=0x%02x sddl=%s",
+        reason, index, sid ? sid : "unreadable", (unsigned long)raw, (unsigned long)mapped,
+        (unsigned)flags, sddl ? sddl : "unreadable");
+    if (sid) LocalFree(sid);
+    if (sddl) LocalFree(sddl);
+    return diagnostic;
+}
+
+/* ancestor=0: strict private-object rights, unchanged for --private and the actual cache chain.
+ * ancestor=1: SEC-1191-01 namespace replacement rights, ONLY for cache-mode ancestors. A parent DELETE_CHILD can
+ * detach even a protected child; DELETE can detach the component itself; WRITE_DAC/WRITE_OWNER can enable either.
+ * Owners can implicitly rewrite DACLs, so ownership must be trusted even without an allow ACE. Do NOT reject
+ * ADD_FILE/ADD_SUBDIRECTORY alone: default C:\ grants Authenticated Users create-folder rights. */
+static const char *checkedDacl(HANDLE handle, int ancestor) {
     PACL dacl = NULL;
+    PSID fileOwner = NULL;
     PSECURITY_DESCRIPTOR descriptor = NULL;
-    if (GetSecurityInfo(handle, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, NULL, NULL, &dacl, NULL, &descriptor) != ERROR_SUCCESS) return "DACL unreadable";
+    DWORD information = DACL_SECURITY_INFORMATION | (ancestor ? OWNER_SECURITY_INFORMATION : 0);
+    if (GetSecurityInfo(handle, SE_FILE_OBJECT, information, ancestor ? &fileOwner : NULL, NULL, &dacl, NULL, &descriptor) != ERROR_SUCCESS) return "DACL unreadable";
     const char *why = dacl ? NULL : "a null DACL (everyone may write)";
+    if (!why && ancestor && (!fileOwner || !ancestorTrusted(fileOwner))) {
+        /* ace=-1 is implicit owner authority, not a stored ACE. */
+        why = fileOwner ? daclDiagnostic(descriptor, "ancestor owned by another SID (implicit WRITE_DAC)", -1,
+            fileOwner, WRITE_DAC, WRITE_DAC, 0) : "ancestor owner unreadable";
+    }
     for (DWORD i = 0; !why && i < dacl->AceCount; i++) {
         ACE_HEADER *header;
         if (!GetAce(dacl, i, (void **)&header)) { why = "DACL unreadable"; break; }
         if (header->AceFlags & INHERIT_ONLY_ACE || header->AceType == ACCESS_DENIED_ACE_TYPE) continue;
         if (header->AceType != ACCESS_ALLOWED_ACE_TYPE) { why = "an unsupported ACE type"; break; }
         ACCESS_ALLOWED_ACE *ace = (ACCESS_ALLOWED_ACE *)header;
-        if ((ace->Mask & ~READ_ONLY_RIGHTS) && !trusted((PSID)&ace->SidStart)) why = "writable by another SID";
+        GENERIC_MAPPING mapping = { FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_GENERIC_EXECUTE, FILE_ALL_ACCESS };
+        DWORD rights = ace->Mask;
+        MapGenericMask(&rights, &mapping);
+        /* NTFS may already have expanded GW before readback. Match its full FILE mapping, not individual create
+         * bits: generic write must refuse, but ADD_FILE or ADD_SUBDIRECTORY on an ancestor alone must allow. */
+        int dangerous = ancestor
+            ? (!!(rights & (DELETE | FILE_DELETE_CHILD | WRITE_DAC | WRITE_OWNER)) ||
+                (rights & FILE_GENERIC_WRITE) == FILE_GENERIC_WRITE)
+            : !!(rights & ~READ_ONLY_RIGHTS);
+        if (dangerous && !(ancestor ? ancestorTrusted((PSID)&ace->SidStart) : trusted((PSID)&ace->SidStart))) {
+            why = daclDiagnostic(descriptor, ancestor ? "ancestor replaceable by another SID" : "writable by another SID",
+                (long)i, (PSID)&ace->SidStart, ace->Mask, rights, header->AceFlags);
+        }
     }
     LocalFree(descriptor);
     return why;
 }
 
+static const char *privateDacl(HANDLE handle) { return checkedDacl(handle, 0); }
+
 /* pi-fabric#913 round 2: every ancestor of the target, up to the volume root, held open WITHOUT FILE_SHARE_DELETE
  * (and checked: a real directory, not a reparse point) until exit, so no ancestor can be renamed or replaced
  * between validation and the deletes: the judged tree stays where it was judged. With every entry held the same
  * way, nothing in the tree can move either. */
-static const char *holdAncestors(const wchar_t *target) {
+static const char *holdAncestors(const wchar_t *target, int cache) {
     static wchar_t path[32768];
     size_t length = wcslen(target);
     if (length >= 32768) return "path too long";
     wcscpy(path, target);
+    /* Cache UNC paths stop at the share root, not the non-filesystem server/UNC prefixes. Generic modes retain
+     * their existing walk. A malformed or root-only cache target cannot skip the ancestor check. */
+    size_t shareRoot = 0;
+    if (cache && wcsncmp(path, L"\\\\?\\UNC\\", 8) == 0) {
+        const wchar_t *server = wcschr(path + 8, L'\\');
+        const wchar_t *share = server ? wcschr(server + 1, L'\\') : NULL;
+        if (!server || server == path + 8 || !share || share == server + 1) return "invalid cache UNC ancestry";
+        shareRoot = (size_t)(share - path);
+    }
     for (;;) {
         wchar_t *cut = wcsrchr(path, L'\\');
         if (!cut) return NULL;
         int root = cut > path && cut[-1] == L':';
+        int share = shareRoot && (size_t)(cut - path) == shareRoot;
         if (root) cut[1] = 0; else *cut = 0; /* "\\?\C:\" for the volume root */
         if (!*path || wcscmp(path, L"\\\\?") == 0) return NULL;
-        HANDLE handle = CreateFileW(path, FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
+        HANDLE handle = CreateFileW(path, FILE_READ_ATTRIBUTES | (cache ? READ_CONTROL : 0), FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
             FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, NULL);
         if (handle == INVALID_HANDLE_VALUE) return "an ancestor could not be held (in use with delete access, or gone)";
         BY_HANDLE_FILE_INFORMATION info;
         if (!GetFileInformationByHandle(handle, &info) || !(info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ||
             (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) return "an ancestor is not a real directory (a reparse point)";
-        /* Held until the process exits. */
-        if (root) return NULL;
+        if (cache) {
+            const char *why = checkedDacl(handle, 1);
+            if (why) return why;
+        }
+        /* Held until the process exits. Cache policy checks the whole chain, including drive/share root. */
+        if (root || share) return NULL;
     }
 }
 
@@ -329,10 +398,100 @@ static int namespaced(const wchar_t *path) { return wcsncmp(path, L"\\\\?\\", 4)
 /* The parent part's length (up to the last backslash), or 0. */
 static size_t parentLength(const wchar_t *path) { const wchar_t *cut = wcsrchr(path, L'\\'); return cut ? (size_t)(cut - path) : 0; }
 
+/* Cache creation accepts only literal absolute DOS/UNC paths, with no alternate stream, dot, short-name alias or
+ * Win32 component normalization. finalPath on every held component rejects aliases that syntax cannot detect. */
+static int cachePath(const wchar_t *path) {
+    if (!namespaced(path)) return 0;
+    const wchar_t *part;
+    int unc = wcsncmp(path, L"\\\\?\\UNC\\", 8) == 0;
+    if (unc) part = path + 8;
+    else {
+        if (!((path[4] >= L'A' && path[4] <= L'Z') || (path[4] >= L'a' && path[4] <= L'z')) ||
+            path[5] != L':' || path[6] != L'\\') return 0;
+        part = path + 7;
+    }
+    int components = 0;
+    for (;;) {
+        const wchar_t *end = wcschr(part, L'\\');
+        size_t length = end ? (size_t)(end - part) : wcslen(part);
+        if (!length || part[length - 1] == L'.' || part[length - 1] == L' ') return 0;
+        for (size_t i = 0; i < length; i++) if (part[i] < 32 || wcschr(L"/:*?\"<>|", part[i])) return 0;
+        components++;
+        if (!end) break;
+        part = end + 1;
+    }
+    return !unc || components >= 3; /* server, share, and a non-root directory */
+}
+
+static int cacheCreate(int argc, wchar_t **argv) {
+    int count = argc - 2;
+    if (count < 1 || count > 2) return fail("refused", 0, "usage: one or two cache directories", 3);
+    for (int i = 0; i < count; i++) {
+        const wchar_t *path = argv[2 + i];
+        if (!cachePath(path)) return fail("refused", i, "not a literal absolute cache path", 3);
+        if (i && (parentLength(path) != wcslen(argv[1 + i]) || wcsncmp(path, argv[1 + i], parentLength(path)) != 0))
+            return fail("refused", i, "not a direct child of the previous entry", 3);
+    }
+    const char *why = holdAncestors(argv[2], 1);
+    if (why) return fail("refused", 0, why, 3);
+    BYTE systemSid[SECURITY_MAX_SID_SIZE], adminSid[SECURITY_MAX_SID_SIZE];
+    DWORD systemSize = sizeof(systemSid), adminSize = sizeof(adminSid);
+    if (!CreateWellKnownSid(WinLocalSystemSid, NULL, systemSid, &systemSize) ||
+        !CreateWellKnownSid(WinBuiltinAdministratorsSid, NULL, adminSid, &adminSize)) return fail("refused", 0, "trusted SIDs unavailable", 3);
+    PSID allowed[] = { user, owner, systemSid, adminSid };
+    DWORD aclSize = sizeof(ACL);
+    for (int i = 0; i < 4; i++) aclSize += sizeof(ACCESS_ALLOWED_ACE) - sizeof(DWORD) + GetLengthSid(allowed[i]);
+    PACL acl = (PACL)calloc(1, aclSize);
+    SECURITY_DESCRIPTOR sd;
+    if (!acl || !InitializeAcl(acl, aclSize, ACL_REVISION)) return fail("refused", 0, "private ACL unavailable", 3);
+    for (int i = 0; i < 4; i++) {
+        if (!AddAccessAllowedAceEx(acl, ACL_REVISION, OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE, FILE_ALL_ACCESS, allowed[i]))
+            return fail("refused", 0, "private ACE unavailable", 3);
+    }
+    if (!InitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION) || !SetSecurityDescriptorOwner(&sd, user, FALSE) ||
+        !SetSecurityDescriptorDacl(&sd, TRUE, acl, FALSE) || !SetSecurityDescriptorControl(&sd, SE_DACL_PROTECTED, SE_DACL_PROTECTED))
+        return fail("refused", 0, "private descriptor unavailable", 3);
+    SECURITY_ATTRIBUTES attributes = { sizeof(SECURITY_ATTRIBUTES), &sd, FALSE };
+    for (int i = 0; i < count; i++) {
+        const wchar_t *path = argv[2 + i];
+        int created = CreateDirectoryW(path, &attributes);
+        if (!created && GetLastError() != ERROR_ALREADY_EXISTS) return fail("refused", i, "private directory creation failed", 3);
+        HANDLE handle = CreateFileW(path, READ_CONTROL | FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, NULL);
+        if (handle == INVALID_HANDLE_VALUE) return fail("refused", i, "directory could not be held", 3);
+        BY_HANDLE_FILE_INFORMATION info;
+        PSID fileOwner = NULL;
+        PSECURITY_DESCRIPTOR descriptor = NULL;
+        why = !GetFileInformationByHandle(handle, &info) ? "no file information"
+            : !(info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) ? "not a real directory"
+            : GetSecurityInfo(handle, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                &fileOwner, NULL, NULL, NULL, &descriptor) != ERROR_SUCCESS ? "security unreadable"
+            : !fileOwner || !(EqualSid(fileOwner, user) || EqualSid(fileOwner, owner)) ? "not owned by this user" : NULL;
+        if (!why && created) {
+            SECURITY_DESCRIPTOR_CONTROL control;
+            DWORD revision;
+            if (!GetSecurityDescriptorControl(descriptor, &control, &revision) || !(control & SE_DACL_PROTECTED)) why = "new DACL is not protected";
+        }
+        if (descriptor) LocalFree(descriptor);
+        /* Existing normal profiles may carry inherit-only CREATOR OWNER rules. Judge actual directory rights
+         * here; the trusted bootstrap also checks the actual inherited staging directory and executable BEFORE
+         * publication. Do not turn a harmless inherit-only template into a new blanket SID prohibition. */
+        if (!why) why = privateDacl(handle);
+        static wchar_t final[MESH_MAX_PATH + 1];
+        if (!why) why = finalPath(handle, final);
+        if (!why && _wcsicmp(final, path) != 0) why = "final path differs (a reparse point or alias in its path)";
+        if (why) return fail("refused", i, why, 3);
+        /* Held until exit, including while the next component is created and read back. */
+    }
+    free(acl);
+    printf("ok created\n");
+    return 0;
+}
+
 static int cachePrivate(int argc, wchar_t **argv) {
     int count = argc - 2;
     if (count < 1 || count > 8) { printf("failed -1 usage\n"); return 2; }
-    const char *why = holdAncestors(argv[2]);
+    const char *why = holdAncestors(argv[2], 1);
     if (why) return fail("refused", 0, why, 3);
     for (int i = 0; i < count; i++) {
         const wchar_t *path = argv[2 + i];
@@ -466,7 +625,7 @@ static int meshRetire(void) {
     if (!meshArm((DWORD)deadline)) return refusedAt("parse", "watchdog-unavailable");
 
     /* W2: ancestors held, then L with DELETE (rename) and FILE_LIST_DIRECTORY, no delete sharing, held through W6. */
-    const char *why = holdAncestors(lock);
+    const char *why = holdAncestors(lock, 0);
     if (why) return refusedAt("guard", "ancestor-not-held");
     HANDLE directory = openJudgedIds(lock, DELETE | FILE_LIST_DIRECTORY | READ_CONTROL | FILE_READ_ATTRIBUTES | SYNCHRONIZE, 1,
         dirVolume, dirIndex, 0, 0, 0, &why);
@@ -565,6 +724,7 @@ int wmain(int argc, wchar_t **argv) {
     const char *why = NULL;
     if (argc == 2 && wcscmp(argv[1], L"--mesh-retire-v1") == 0) return meshRetire();
     if (argc == 2 && wcscmp(argv[1], L"--capability-v1") == 0) { printf("FMRCAP1 mesh-retire-v1 abi=1\n"); return 0; }
+    if (argc >= 2 && wcscmp(argv[1], L"--cache-create-v1") == 0) return cacheCreate(argc, argv);
     if (argc >= 2 && wcscmp(argv[1], L"--cache-private-v1") == 0) return cachePrivate(argc, argv);
     if (argc == 4 && wcscmp(argv[1], L"--cache-publish-v1") == 0) return cachePublish(argv[2], argv[3]);
     if (argc == 5 && wcscmp(argv[1], L"--private") == 0) {
@@ -578,7 +738,7 @@ int wmain(int argc, wchar_t **argv) {
     if (argc > 1 && wcscmp(argv[1], L"--dry-run") == 0) { dry = 1; first = 2; }
     int count = (argc - first) / FIELDS;
     if (count < 1 || count > MAX_ENTRIES || (argc - first) % FIELDS != 0) { printf("failed -1 usage\n"); return 2; }
-    if ((why = holdAncestors(argv[first + FIELDS * (count - 1) + 5]))) return fail("refused", count - 1, why, 3);
+    if ((why = holdAncestors(argv[first + FIELDS * (count - 1) + 5], 0))) return fail("refused", count - 1, why, 3);
     for (int i = 0; i < count; i++) {
         wchar_t **arg = argv + first + FIELDS * i;
         int directory = wcscmp(arg[0], L"d") == 0;

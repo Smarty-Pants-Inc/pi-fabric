@@ -44,6 +44,47 @@ const apis = ["spawn", "spawnSync", "exec", "execSync", "execFile", "execFileSyn
   "promisify.exec", "promisify.execFile", "Bun.spawn", "Bun.spawnSync", "Bun.spawn(array)", "Bun.spawnSync(array)"];
 
 describe.skipIf(process.platform === "win32")("explicit-env launcher children keep the Bun guard", () => {
+  it("refuses a sentinel deletion through a plain Node intermediary with a minimal explicit env", () => {
+    const directory = fs.mkdtempSync(join(tmpdir(), "unknown-launcher-"));
+    const privateRoot = join(directory, "private");
+    fs.mkdirSync(privateRoot);
+    const sentinel = join(directory, "keep");
+    fs.writeFileSync(sentinel, "keep");
+    const bun = childProcess.spawnSync("bun", ["-p", "process.execPath"], { encoding: "utf8", timeout: 10_000 });
+    expect(bun.status, bun.stderr).toBe(0);
+    const probe = `import fs from "node:fs";
+const guard=process[Symbol.for("pi-fabric.test-deletion-guard")];
+// Safe RED: a missing/report-only guard must not reach the native outside deleter.
+if(!guard || guard.report) { console.log(JSON.stringify({installed:!!guard})); process.exit(42); }
+let code=null;
+try { fs.rmSync(${JSON.stringify(sentinel)}); } catch(error) { code=error.code; }
+console.log(JSON.stringify({installed:true,root:guard.root,code,only:process.env.ONLY}));`;
+    const relay = join(directory, "relay.mjs");
+    fs.writeFileSync(relay, `import cp from "node:child_process";
+const child=cp.spawnSync(${JSON.stringify(bun.stdout.trim())},["-e",${JSON.stringify(probe)}],{env:process.env,encoding:"utf8",timeout:10000});
+if(child.error) throw child.error;
+process.stdout.write(child.stdout);process.stderr.write(child.stderr);process.exitCode=child.status??1;`);
+    const outer = `import cp from "node:child_process";
+// No Bun token in this launch's executable or argv, and no inherited loader hooks.
+const child=cp.spawnSync(process.execPath,[${JSON.stringify(relay)}],{
+  env:{ONLY:"keep",TMPDIR:${JSON.stringify(directory)}},encoding:"utf8",timeout:15000});
+if(child.error) throw child.error;
+process.stdout.write(child.stdout);process.stderr.write(child.stderr);process.exitCode=child.status??1;`;
+    expect(namedChildProcessImportsInSource("unknown-launcher-probe.mjs", probe)).toEqual([]);
+    expect(namedChildProcessImportsInSource("unknown-launcher-outer.mjs", outer)).toEqual([]);
+    const preload = new URL("./test-deletion-guard.mjs", import.meta.url);
+    preload.searchParams.set("root", privateRoot);
+    const child = childProcess.spawnSync(process.execPath, ["--import", preload.href, "--input-type=module", "-e", outer], {
+      env: { ...process.env, NODE_OPTIONS: "", TMPDIR: privateRoot, TMP: privateRoot, TEMP: privateRoot,
+        RUNNER_ENVIRONMENT: "", GITHUB_ACTIONS: "false" },
+      encoding: "utf8", timeout: 20_000,
+    });
+    expect(fs.readFileSync(sentinel, "utf8")).toBe("keep");
+    expect(child.error).toBeUndefined();
+    expect(child.status, child.stderr + child.stdout).toBe(0);
+    expect(JSON.parse(child.stdout)).toEqual({ installed: true, root: privateRoot,
+      code: "ERR_TEST_DELETION_GUARD", only: "keep" });
+  });
   it("pins a known launcher even when Bun is hidden behind a Node script", () => {
     const directory = fs.mkdtempSync(join(tmpdir(), "opaque-launcher-"));
     const script = join(directory, "relay.mjs");

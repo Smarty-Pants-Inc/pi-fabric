@@ -141,29 +141,10 @@ export function pinnedBunEnvironment(env, root, preloadPath = guardPath, platfor
   };
 }
 
-/** Only Bun executables consume the Bun preload/root contract. */
-function isBunExecutable(file) {
-  return typeof file === "string" && (/^(bun|bunx)(\.exe)?$/i.test(basename(file))
-    || Boolean(process.versions.bun && file === process.execPath));
-}
-
-// Launchers can hide Bun in a script, shell expansion or another process. Fail closed:
-// these variables are harmless to other programs, unlike dropping the guard for Bun.
-const launchers = new Set(["env", "sh", "bash", "dash", "zsh", "nice", "nohup", "timeout",
-  "setsid", "stdbuf", "xargs", "npx", "npm", "pnpm", "yarn"]);
-function commandMayRunBun(command) {
-  if (!Array.isArray(command)) return false;
-  const words = command.filter((arg) => typeof arg === "string")
-    .flatMap((arg) => arg.split(/[\s"'`;&|()<>=]+/).filter(Boolean));
-  return isBunExecutable(command[0]) || launchers.has(basename(words[0] ?? "").toLowerCase())
-    || words.some(isBunExecutable);
-}
-
-function childProcessRunsBun(name, args) {
-  return commandMayRunBun(name === "exec" || name === "execSync" ? [args[0]]
-    : [args[0], ...(Array.isArray(args[1]) ? args[1] : [])]);
-}
-
+// ponytail: fail closed for every explicit-env child (option a, no exemptions): an
+// executable name/argv cannot prove it will not relay to Bun. Pin only Bun's two
+// guard keys, never credentials or NODE_OPTIONS. The router's exact production-env
+// contract is probed in a clean Node process, outside this test-only instrumentation.
 /** Locate options without shifting arguments or exec/execFile callbacks. */
 function childProcessOptionsIndex(name, args) {
   if (name === "exec" || name === "execSync") return 1;
@@ -291,14 +272,13 @@ function install() {
   fs.cp = cpCallback("cp", fs.cp);
   fs.cpSync = cpSync("cpSync", fs.cpSync);
   fs.promises.cp = cpPromise("promises.cp", fs.promises.cp);
-  // Explicit environments do not inherit process.env. Pin Bun and opaque launchers;
-  // preserve the minimal-env contract only for direct non-Bun children.
+  // Explicit environments do not inherit process.env. Every child may be a Bun intermediary.
   for (const name of ["spawn", "spawnSync", "exec", "execSync", "execFile", "execFileSync"]) {
     const original = childProcess[name];
     childProcess[name] = function (...args) {
       const index = childProcessOptionsIndex(name, args);
       const options = args[index];
-      if (options?.env && childProcessRunsBun(name, args)) {
+      if (options?.env) {
         args[index] = { ...options, env: pinnedBunEnvironment(options.env, state.root) };
       }
       return Reflect.apply(original, this, args);
@@ -308,7 +288,7 @@ function install() {
     if (original[custom]) childProcess[name][custom] = function (...args) {
       const index = childProcessOptionsIndex(name, args);
       const options = args[index];
-      if (options?.env && childProcessRunsBun(name, args)) {
+      if (options?.env) {
         args[index] = { ...options, env: pinnedBunEnvironment(options.env, state.root) };
       }
       return Reflect.apply(original[custom], this, args);
@@ -320,8 +300,7 @@ function install() {
       Bun[name] = function (...args) {
         const index = Array.isArray(args[0]) ? 1 : 0;
         const options = args[index];
-        const command = index === 1 ? args[0] : options?.cmd;
-        if (options?.env && commandMayRunBun(command)) {
+        if (options?.env) {
           args[index] = { ...options, env: pinnedBunEnvironment(options.env, state.root) };
         }
         return Reflect.apply(original, this, args);

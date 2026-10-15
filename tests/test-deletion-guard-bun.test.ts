@@ -227,7 +227,7 @@ process.stdout.write(stdout??"");process.stderr.write(stderr??"");process.exit(s
   );
 
   it.each(["spawnSync", "execFileSync", "Bun.spawnSync", "Bun.spawnSync(array)"])(
-    "leaves a non-Bun child's explicit environment unchanged through %s", (api) => {
+    "pins only the guard keys for an unknown child through %s", (api) => {
       const env = { ONLY: "keep", BUN_OPTIONS: "caller-owned", TEST_DELETION_GUARD_ROOT: "caller-owned" };
       const outer = `import cp from "node:child_process";
 if(!process[Symbol.for("pi-fabric.test-deletion-guard")]) throw new Error("guard missing");
@@ -243,11 +243,15 @@ else {
   if(child.exitCode!==0) throw new Error(child.stderr.toString());
   stdout=child.stdout.toString();
 }
+if(JSON.stringify(env)!==${JSON.stringify(JSON.stringify(env))}) throw new Error("caller env mutated");
 process.stdout.write(stdout);`;
       const child = childProcess.spawnSync("bun", ["-e", guardedBunSource(outer)], { encoding: "utf8", timeout: 10_000 });
       expect(child.error).toBeUndefined();
       expect(child.status, child.stderr).toBe(0);
-      expect(JSON.parse(child.stdout)).toEqual(env);
+      expect(JSON.parse(child.stdout)).toEqual({
+        ONLY: "keep", BUN_OPTIONS: `caller-owned --preload=${guardPath}`,
+        TEST_DELETION_GUARD_ROOT: tmpdir(),
+      });
     },
   );
 

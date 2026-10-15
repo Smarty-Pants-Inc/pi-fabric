@@ -1,3 +1,6 @@
+import childProcess from "node:child_process";
+import { buildSync } from "esbuild";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -80,15 +83,28 @@ describe("external spawn router behavior", () => {
       for (const key of keys.length ? keys : [name.toLowerCase()]) vi.stubEnv(key, value);
     }
     const body = `require('node:fs').writeFileSync(process.argv[1] + '.env', JSON.stringify(process.env)); process.stdout.write(${JSON.stringify(JSON.stringify(pick))});`;
-    const descriptor = Object.getOwnPropertyDescriptor(process, "platform")!;
-    let routed: ReturnType<typeof routeAgentCreation>;
-    try {
-      // Inject only while the hook constructs env/spawn options; restore before
-      // asynchronous process retirement so a Linux child is retired on Linux.
-      Object.defineProperty(process, "platform", { ...descriptor, value: platform });
-      routed = routeAgentCreation({ ...opts, config: { ...opts.config, command: command(dir, body) } });
-    } finally { Object.defineProperty(process, "platform", descriptor); }
-    expect(await routed).toEqual({ model: pick.model, thinking: pick.thinking });
+    // ponytail: test the production router's exact environment in a clean Node
+    // process, not the preload's intentionally instrumented child environment.
+    // Bundle the real source only to resolve its TS/.js imports; no router mocks.
+    const routerModule = path.join(dir, "router-under-test.mjs");
+    buildSync({ entryPoints: [fileURLToPath(new URL("../src/agents/spawn-router.ts", import.meta.url))],
+      bundle: true, platform: "node", format: "esm", outfile: routerModule });
+    const probe = `import {routeAgentCreation} from ${JSON.stringify(pathToFileURL(routerModule).href)};
+const opts=${JSON.stringify({ ...opts, config: { ...opts.config, command: command(dir, body) } })};
+opts.validateModel=model=>model;
+const descriptor=Object.getOwnPropertyDescriptor(process,"platform");
+let routed;
+try {
+  Object.defineProperty(process,"platform",{...descriptor,value:${JSON.stringify(platform)}});
+  routed=routeAgentCreation(opts);
+} finally { Object.defineProperty(process,"platform",descriptor); }
+console.log(JSON.stringify(await routed));`;
+    const child = childProcess.spawnSync(process.execPath, ["--input-type=module", "-e", probe], {
+      env: { ...process.env, NODE_OPTIONS: "" }, encoding: "utf8", timeout: 10_000,
+    });
+    expect(child.error).toBeUndefined();
+    expect(child.status, child.stderr).toBe(0);
+    expect(JSON.parse(child.stdout)).toEqual({ model: pick.model, thinking: pick.thinking });
     const platformEnv = platform === "win32" ? {
       ...essentials, SystemRoot: systemRoot,
       PATH: `${path.win32.join(systemRoot, "System32")};${systemRoot}`,

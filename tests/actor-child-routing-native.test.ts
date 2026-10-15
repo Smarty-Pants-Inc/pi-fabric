@@ -43,6 +43,12 @@ describe("native compiled actor activation-end result custody", () => {
     let handoffInferences = 0;
     const errors: unknown[] = [];
     const server = http.createServer((request, response) => {
+      // Served-model admission uses a bodyless discovery request before spawn.
+      if (request.method === "GET" && request.url === "/v1/models") {
+        response.writeHead(200, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({ object: "list", data: ["activation", "child"].map((id) => ({ id, object: "model" })) }));
+        return;
+      }
       let body = "";
       request.on("data", (data) => { body += data; });
       request.on("end", () => { void (async () => {

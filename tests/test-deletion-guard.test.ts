@@ -213,11 +213,15 @@ console.log(JSON.stringify({ ops: Object.keys(ops), results, nodeOptions: proces
 
 const runRootChild = `
 import fs from "node:fs";
-const [root, sibling] = process.argv.slice(2);
-let siblingError = null;
-try { fs.rmSync(sibling); } catch (error) { siblingError = error.message; }
+const [root, sibling, outside] = process.argv.slice(2);
+const statusTemp = sibling + ".tmp";
+let siblingError = null, outsideError = null;
+fs.writeFileSync(statusTemp, "status");
+try { fs.renameSync(statusTemp, sibling); } catch (error) { siblingError = error.message; }
+try { fs.rmSync(outside); } catch (error) { outsideError = error.message; }
 fs.rmSync(root, { recursive: true, force: true });
-console.log(JSON.stringify({ siblingError, rootExists: fs.existsSync(root) }));
+console.log(JSON.stringify({ siblingError, outsideError, status: fs.existsSync(sibling) ? fs.readFileSync(sibling, "utf8") : null,
+  rootExists: fs.existsSync(root) }));
 `;
 
 // The recorder replaces every deleter BEFORE the explicit guard import, so report mode wraps the
@@ -612,18 +616,24 @@ describe("deletion guard in child processes", () => {
     expectExternalIntact();
   });
 
-  it("captures the child's narrower TMPDIR at installation and permits exit cleanup of that root", () => {
+  it("keeps the inherited private ceiling when a child narrows TMPDIR for atomic status rename", () => {
     requireGuard();
-    const root = mkdtempSync(join(fixtures, "child-root-"));
-    const sibling = join(fixtures, "child-sibling.txt");
+    const run = mkdtempSync(join(fixtures, "child-run-"));
+    const root = join(run, "tmp");
+    const sibling = join(run, "status.json");
+    mkdirSync(root);
+    writeFileSync(sibling, "old status");
     writeFileSync(join(root, "cache.json"), "x");
-    writeFileSync(sibling, "sibling");
-    const result = runChild("run-root-child.mjs", runRootChild, [root, sibling],
+    const result = runChild("run-root-child.mjs", runRootChild, [root, sibling, externalFile],
       { ...process.env, GITHUB_ACTIONS: "false", TMPDIR: root, TMP: root, TEMP: root });
-    const output = JSON.parse(result.stdout.trim()) as { siblingError: string | null; rootExists: boolean };
-    expect(output.siblingError).toMatch(refusal);
+    const output = JSON.parse(result.stdout.trim()) as
+      { siblingError: string | null; outsideError: string | null; status: string | null; rootExists: boolean };
+    expect(output.siblingError).toBeNull();
+    expect(output.outsideError).toMatch(refusal);
+    expect(output.status).toBe("status");
     expect(output.rootExists).toBe(false);
-    expect(fs.readFileSync(sibling, "utf8")).toBe("sibling");
+    expect(fs.readFileSync(sibling, "utf8")).toBe("status");
+    expectExternalIntact();
   });
 
   it("reports once without throwing under GITHUB_ACTIONS=true and never reaches the real deleter", () => {

@@ -250,6 +250,12 @@ for (const scenario of ["default", "readonly", "unrestricted"]) {
 return results;`;
 try {
   server = http.createServer((request, response) => {
+    // Served-model admission uses a bodyless discovery request before spawn.
+    if (request.method === "GET" && request.url === "/v1/models") {
+      response.writeHead(200, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({ object: "list", data: ["parent", "child"].map(id => ({ id, object: "model" })) }));
+      return;
+    }
     let body = "";
     request.on("data", chunk => { body += chunk; });
     request.on("end", () => {

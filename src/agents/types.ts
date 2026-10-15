@@ -340,6 +340,8 @@ export interface AgentRunResult extends AgentRunRecord {
 }
 
 export interface AgentHandleInfo {
+  /** Spawn admission: unavailable discovery never blocks launch, but is explicit in the receipt. */
+  modelVerification?: "verified" | "unverified";
   finalAnswerReceipt?: { id: string; recordedAt: number };
   /** smarty-dev#9855: on a waiting spawn, the admission permits unknown-outcome launches still hold. */
   heldPermits?: number;

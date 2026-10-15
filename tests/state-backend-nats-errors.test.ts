@@ -61,6 +61,8 @@ const apiShapes = [
   { label: "stream-info missing", name: "StreamNotFoundError", code: 404, err_code: 10059, description: "stream not found" },
   { label: "concurrent-create conflict", name: "JetStreamApiError", code: 400, err_code: 10058,
     description: "stream name already in use with a different configuration" },
+  { label: "placement peer offline", name: "JetStreamApiError", code: 400, err_code: 10005,
+    description: "no suitable peers for placement, peer offline" },
   { label: "leader unavailable", name: "JetStreamApiError", code: 503, err_code: 10008,
     description: "JetStream system temporarily unavailable" },
   { label: "wrong last sequence", name: "JetStreamApiError", code: 400, err_code: 10071,

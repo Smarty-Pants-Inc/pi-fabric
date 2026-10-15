@@ -34,6 +34,7 @@ queue_rules:
       - -label = hold
       - -title ~= (?i)do not land
       - check-success = review/astra
+      - -check-failure = review/security  # a failed security verdict refuses admission, label or not
       - check-success = check (ubuntu-latest)
       - or:
           - check-success = review/security

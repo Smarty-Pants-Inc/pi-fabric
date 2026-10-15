@@ -52,6 +52,10 @@ const primaryEntryPoints = [
 // path lets a session that loaded the previous index resolve delayed modules
 // after the installed package is replaced, while preserving lazy evaluation.
 const lazyEntryPoints = [
+  // Native installer bootstrap; never exposed as a guest authority grant.
+  "src/actors/slot-authority.ts",
+  // Import-only per-materialization claim parsing, not idle registration work.
+  "src/commands/slot-import.ts",
   // First-use scratch removal: a stable entry keeps the shared verifier out of the startup graph.
   "src/storage/verified-remove.ts",
   // The resident's first operator cleanup reuses the offline final-check helper (smarty-dev#8090).

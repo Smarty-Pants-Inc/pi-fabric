@@ -13,6 +13,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { WindowsStateAclRequest } from "../src/mesh/windows-state-acl.js";
+import type { SqliteOpener } from "../src/mesh/state-sqlite.js";
 
 const USER = "S-1-5-21-1-2-3-1001";
 const OTHER = "S-1-5-21-1-2-3-1002";
@@ -88,6 +89,7 @@ const fixture = async (owner = USER, withGate = false) => {
   const stats = new Map<string, fs.BigIntStats>();
   const entries = new Map<string, Entry>();
   const unreadable = new Set<string>();
+  const rawUnreadable = new Set<string>(); // opt-in: ordinary gate lstats still work
   let nextIno = 9_007_199_254_740_992n; // +1 must not disappear through Number coercion of a 64-bit file ID
   const present = (file: string) => {
     const directory = !FILES.includes(file);
@@ -107,13 +109,17 @@ const fixture = async (owner = USER, withGate = false) => {
     failure: undefined as Error | undefined,
     output: (snapshot: Snapshot): string => JSON.stringify(snapshot),
     observed: (_file: string, _options: fs.StatSyncOptions | undefined, _stat: fs.BigIntStats | undefined): void => undefined,
+    beforeLstat: (_file: string, _options: fs.StatSyncOptions | undefined): void => undefined,
   };
   const actualLstat = fs.lstatSync.bind(fs);
   vi.spyOn(fs, "lstatSync").mockImplementation(((file: fs.PathLike, options?: fs.StatSyncOptions) => {
     const name = String(file);
     if (!/^[a-z]:[\\/]/i.test(name)) return actualLstat(file, options);
     if (!PLAN.some(target => key(target) === key(name))) throw new Error(`unexpected mocked Windows path: ${name}`);
-    if (unreadable.has(key(name))) throw Object.assign(new Error("mocked lstat denied"), { code: "EACCES" });
+    if (unreadable.has(key(name)) || (options?.bigint === true && rawUnreadable.has(key(name)))) {
+      throw Object.assign(new Error("mocked lstat denied"), { code: "EACCES" });
+    }
+    state.beforeLstat(name, options);
     const found = stats.get(key(name));
     const snapshot = found ? { ...found } : undefined; // independent, as with a native lstat
     state.observed(name, options, snapshot);
@@ -136,7 +142,7 @@ const fixture = async (owner = USER, withGate = false) => {
     expect(judge(input)).toBeUndefined(); // synchronous: no await/microtask/timer between requests
     expect(native).toHaveBeenCalledTimes(1);
   };
-  return { judge, warm, gate, native, warning, stat, entry, unsafe, present, absent, unreadable, state };
+  return { judge, warm, gate, native, warning, stat, entry, unsafe, present, absent, unreadable, rawUnreadable, state };
 };
 
 describe("Windows mesh ACL identity cache — Decision C MOCKED unit contract", () => {
@@ -491,4 +497,270 @@ describe("Windows mesh ACL identity cache — Decision C MOCKED unit contract", 
     expect(exclusiveCreate).not.toHaveBeenCalled();
     expect(f.native).toHaveBeenCalledTimes(1);
   });
+
+  // Lead's presence table. Every row invokes the real gate and default reader, not a conditional fake opener.
+  type Observation = "id" | "ino0" | "missing-ID" | "numeric-ID" | "unreadable";
+  const observations: Observation[] = ["id", "ino0", "missing-ID", "numeric-ID", "unreadable"];
+  const unknownObservations: Observation[] = ["ino0", "missing-ID", "numeric-ID"];
+  type GateFixture = Awaited<ReturnType<typeof fixture>>;
+  const observeAs = (f: GateFixture, target: string, observation: Observation, identity: bigint) => {
+    f.rawUnreadable.delete(key(target));
+    f.stat(target).dev = 7n;
+    f.stat(target).ino = identity;
+    if (observation === "ino0") f.stat(target).ino = 0n;
+    if (observation === "missing-ID") Reflect.deleteProperty(f.stat(target), "ino");
+    if (observation === "numeric-ID") Reflect.set(f.stat(target), "ino", Number(identity));
+    if (observation === "unreadable") f.rawUnreadable.add(key(target));
+  };
+  const openOutcome = (f: GateFixture, open: SqliteOpener, create?: () => void) => {
+    let refusal: unknown;
+    try { f.gate!.openPrivateStateDb(DB, open, create).close(); }
+    catch (error) { refusal = error; }
+    return refusal;
+  };
+
+  it.each([ROOT, DB].flatMap(target => observations.flatMap(before => observations.map(after =>
+    ({ target, before, after, cacheable: before === "id" && after === "id" })))))(
+    "CACHE-22 TABLE $target $before -> $after: covered presence opens; only stable known ID caches", async row => {
+      const f = await fixture(USER, true);
+      const identity = f.stat(row.target).ino;
+      observeAs(f, row.target, row.before, identity);
+      f.state.output = snapshot => {
+        const safe = JSON.stringify(snapshot);
+        observeAs(f, row.target, row.after, identity);
+        return safe;
+      };
+      const sqliteOpen = vi.fn(() => ({ close: vi.fn() }) as never);
+      expect(openOutcome(f, sqliteOpen)).toBeUndefined();
+      expect(sqliteOpen).toHaveBeenCalledTimes(1);
+      expect(f.native).toHaveBeenCalledTimes(1);
+      observeAs(f, row.target, row.before, identity);
+      expect(openOutcome(f, sqliteOpen)).toBeUndefined();
+      expect(sqliteOpen).toHaveBeenCalledTimes(2);
+      expect(sqliteOpen).toHaveBeenNthCalledWith(1, DB);
+      expect(sqliteOpen).toHaveBeenNthCalledWith(2, DB);
+      expect(f.native).toHaveBeenCalledTimes(row.cacheable ? 1 : 2);
+      expect(f.warning).not.toHaveBeenCalled();
+    });
+
+  it.each([ROOT, DB].flatMap(target => observations.flatMap(before =>
+    ["native-missing/post-present", "native-missing/replacement", "post-missing", "post-wrong-type", "post-link"]
+      .map(change => ({ target, before, change })))))(
+    "CACHE-23 TABLE $target $before -> $change: refuse before create and SQLite", async row => {
+      const f = await fixture(USER, true);
+      observeAs(f, row.target, row.before, f.stat(row.target).ino);
+      f.state.output = snapshot => {
+        const safe = JSON.stringify({ ...snapshot, entries: snapshot.entries.map(entry =>
+          entry.path === row.target && row.change.startsWith("native-missing")
+            ? { path: row.target, missing: true } : entry) });
+        f.rawUnreadable.delete(key(row.target));
+        if (row.change === "post-missing") f.absent(row.target);
+        if (row.change === "post-wrong-type") {
+          f.stat(row.target).isDirectory = () => row.target === DB;
+          f.stat(row.target).isFile = () => row.target === ROOT;
+        }
+        if (row.change === "post-link") f.stat(row.target).isSymbolicLink = () => true;
+        if (row.change === "native-missing/replacement") {
+          f.present(row.target);
+          f.entry(row.target).owner = OTHER;
+          f.unsafe(row.target);
+        }
+        return safe;
+      };
+      const exclusiveCreate = vi.spyOn(fs, "openSync").mockImplementation(((file: fs.PathLike, flags: string | number) => {
+        expect(String(file)).toBe(DB);
+        expect(flags).toBe("wx");
+        throw Object.assign(new Error("recorded planted winner"), { code: "EEXIST" });
+      }) as typeof fs.openSync);
+      const create = vi.fn(() => {
+        for (const file of row.target === ROOT ? [ROOT, FLAGS, ...FILES] : [DB]) f.present(file);
+        f.entry(row.target).owner = OTHER;
+        f.unsafe(row.target);
+        try { fs.closeSync(fs.openSync(DB, "wx")); }
+        catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
+      });
+      const sqliteOpen = vi.fn(() => ({ close: vi.fn() }) as never);
+      const refusal = openOutcome(f, sqliteOpen, create);
+      expect(sqliteOpen).not.toHaveBeenCalled();
+      expect(refusal).toMatchObject({ code: "FABRIC_MESH_STATE_UNSUPPORTED" });
+      expect(create).not.toHaveBeenCalled();
+      expect(exclusiveCreate).not.toHaveBeenCalled();
+      expect(f.native).toHaveBeenCalledTimes(1);
+      expect(f.warning).not.toHaveBeenCalled();
+    });
+
+  it.each([ROOT, DB])("CACHE-24 TABLE known %s -> different known ID: refuse before create/opener", async target => {
+    const f = await fixture(USER, true);
+    f.state.output = snapshot => {
+      const safe = JSON.stringify(snapshot);
+      f.stat(target).ino += 1n;
+      return safe;
+    };
+    const sqliteOpen = vi.fn(() => ({ close: vi.fn() }) as never);
+    const create = vi.fn();
+    expect(openOutcome(f, sqliteOpen, create)).toMatchObject({ code: "FABRIC_MESH_STATE_UNSUPPORTED" });
+    expect(sqliteOpen).not.toHaveBeenCalled();
+    expect(create).not.toHaveBeenCalled();
+    expect(f.native).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([ROOT, DB].flatMap(target => unknownObservations.flatMap(identity =>
+    ["wrong-type", "link"].map(kind => ({ target, identity, kind })))))(
+    "CACHE-25 TABLE initially $kind $target with $identity: invalid type refuses independently of ID", async row => {
+      const f = await fixture(USER, true);
+      observeAs(f, row.target, row.identity, f.stat(row.target).ino);
+      if (row.kind === "link") f.stat(row.target).isSymbolicLink = () => true;
+      else {
+        f.stat(row.target).isDirectory = () => row.target === DB;
+        f.stat(row.target).isFile = () => row.target === ROOT;
+      }
+      const sqliteOpen = vi.fn(() => ({ close: vi.fn() }) as never);
+      const create = vi.fn();
+      expect(openOutcome(f, sqliteOpen, create)).toMatchObject({ code: "FABRIC_MESH_STATE_UNSUPPORTED" });
+      expect(sqliteOpen).not.toHaveBeenCalled();
+      expect(create).not.toHaveBeenCalled();
+      expect(f.native).toHaveBeenCalledTimes(row.target === ROOT ? 0 : 1);
+    });
+
+  it.each(["safe", "unsafe"] as const)(
+    "CACHE-26 TABLE absent DB before/during/after preproof -> explicit create (%s): unconditional postproof", async safety => {
+      const f = await fixture(USER, true);
+      f.absent(DB);
+      const nativeDbPresence: boolean[] = [];
+      f.state.output = snapshot => {
+        nativeDbPresence.push(snapshot.entries.find(entry => entry.path === DB)!.missing !== true);
+        return JSON.stringify(snapshot);
+      };
+      const create = vi.fn(() => { f.present(DB); if (safety === "unsafe") f.unsafe(DB); });
+      const sqliteOpen = vi.fn(() => ({ close: vi.fn() }) as never);
+      const refusal = openOutcome(f, sqliteOpen, create);
+      expect(create).toHaveBeenCalledTimes(1);
+      expect(nativeDbPresence).toEqual([false, true]);
+      expect(f.native).toHaveBeenCalledTimes(2);
+      if (safety === "safe") {
+        expect(refusal).toBeUndefined();
+        expect(sqliteOpen).toHaveBeenCalledTimes(1);
+        expect(sqliteOpen).toHaveBeenCalledWith(DB);
+      } else {
+        expect(refusal).toMatchObject({ code: "FABRIC_MESH_STATE_UNSUPPORTED" });
+        expect(sqliteOpen).not.toHaveBeenCalled();
+      }
+      expect(f.warning).not.toHaveBeenCalled();
+    });
+
+  it.each([ROOT, DB].flatMap(target => ["native-present", "native-missing"].flatMap(nativeState =>
+    observations.map(after => ({ target, nativeState, after })))))(
+    "CACHE-27 TABLE absent $target -> $after DURING proof ($nativeState), without create path: refuse", async row => {
+      const f = await fixture(USER, true);
+      f.absent(row.target);
+      f.state.output = snapshot => {
+        f.present(row.target);
+        observeAs(f, row.target, row.after, f.stat(row.target).ino);
+        return JSON.stringify({ ...snapshot, entries: snapshot.entries.map(entry =>
+          entry.path === row.target && row.nativeState === "native-present" ? f.entry(row.target) : entry) });
+      };
+      const sqliteOpen = vi.fn(() => ({ close: vi.fn() }) as never);
+      const create = vi.fn();
+      expect(openOutcome(f, sqliteOpen, create)).toMatchObject({ code: "FABRIC_MESH_STATE_UNSUPPORTED" });
+      expect(create).not.toHaveBeenCalled();
+      expect(sqliteOpen).not.toHaveBeenCalled();
+      expect(f.native).toHaveBeenCalledTimes(1);
+    });
+
+  it.each(["safe", "unsafe"] as const)(
+    "CACHE-28 TABLE unreadable raw DB before -> native missing -> confirmed absent -> planted create (%s)", async safety => {
+      const f = await fixture(USER, true);
+      f.rawUnreadable.add(key(DB));
+      const nativeDbPresence: boolean[] = [];
+      f.state.output = snapshot => {
+        const first = nativeDbPresence.length === 0;
+        const wire = { ...snapshot, entries: snapshot.entries.map(entry =>
+          first && entry.path === DB ? { path: DB, missing: true } : entry) };
+        nativeDbPresence.push(wire.entries.find(entry => entry.path === DB)!.missing !== true);
+        if (first) { f.rawUnreadable.delete(key(DB)); f.absent(DB); }
+        return JSON.stringify(wire);
+      };
+      const create = vi.fn(() => { f.present(DB); if (safety === "unsafe") f.unsafe(DB); });
+      const sqliteOpen = vi.fn(() => ({ close: vi.fn() }) as never);
+      const refusal = openOutcome(f, sqliteOpen, create);
+      expect(create).toHaveBeenCalledTimes(1);
+      expect(nativeDbPresence).toEqual([false, true]);
+      expect(f.native).toHaveBeenCalledTimes(2);
+      if (safety === "safe") {
+        expect(refusal).toBeUndefined();
+        expect(sqliteOpen).toHaveBeenCalledTimes(1);
+        expect(sqliteOpen).toHaveBeenCalledWith(DB);
+      } else {
+        expect(refusal).toMatchObject({ code: "FABRIC_MESH_STATE_UNSUPPORTED" });
+        expect(sqliteOpen).not.toHaveBeenCalled();
+      }
+      expect(f.warning).not.toHaveBeenCalled();
+    });
+
+  it.each([ROOT, DB].flatMap(target => observations.flatMap(before => observations.map(after =>
+    ({ target, before, after })))))(
+    "CACHE-29 TABLE $target $before -> native MISSING -> $after: missing descriptor never covers presence", async row => {
+      const f = await fixture(USER, true);
+      const identity = f.stat(row.target).ino;
+      observeAs(f, row.target, row.before, identity);
+      f.state.output = snapshot => {
+        const missing = JSON.stringify({ ...snapshot, entries: snapshot.entries.map(entry =>
+          entry.path === row.target ? { path: row.target, missing: true } : entry) });
+        observeAs(f, row.target, row.after, identity);
+        return missing;
+      };
+      const sqliteOpen = vi.fn(() => ({ close: vi.fn() }) as never);
+      const create = vi.fn();
+      expect(openOutcome(f, sqliteOpen, create)).toMatchObject({ code: "FABRIC_MESH_STATE_UNSUPPORTED" });
+      expect(sqliteOpen).not.toHaveBeenCalled();
+      expect(create).not.toHaveBeenCalled();
+      expect(f.native).toHaveBeenCalledTimes(1);
+      expect(f.warning).not.toHaveBeenCalled();
+    });
+
+  it("CACHE-30 TABLE root absent -> native missing -> absent never bypasses createStateRoot/protect", async () => {
+    const f = await fixture(USER, true);
+    f.absent(ROOT);
+    const sqliteOpen = vi.fn(() => ({ close: vi.fn() }) as never);
+    const create = vi.fn();
+    expect(openOutcome(f, sqliteOpen, create)).toMatchObject({ code: "FABRIC_MESH_STATE_UNSUPPORTED" });
+    expect(create).not.toHaveBeenCalled();
+    expect(sqliteOpen).not.toHaveBeenCalled();
+    expect(f.native).toHaveBeenCalledTimes(1);
+    expect(f.warning).not.toHaveBeenCalled();
+  });
+
+  it.each(["unreadable", "absent"] as const)(
+    "CACHE-31 TABLE no-create gate: %s before -> native missing -> after absent cannot authorize a connection", async before => {
+      const f = await fixture(USER, true);
+      if (before === "absent") f.absent(DB);
+      else f.rawUnreadable.add(key(DB));
+      let afterAbsent = false;
+      let planted = false;
+      f.state.output = snapshot => {
+        const missing = JSON.stringify({ ...snapshot, entries: snapshot.entries.map(entry =>
+          entry.path === DB ? { path: DB, missing: true } : entry) });
+        f.rawUnreadable.delete(key(DB));
+        f.absent(DB);
+        return missing;
+      };
+      f.state.observed = (file, options, stat) => {
+        if (file === DB && options?.bigint === true && stat === undefined) afterAbsent = true;
+      };
+      f.state.beforeLstat = (file, options) => {
+        if (file === DB && options?.bigint !== true && afterAbsent) {
+          f.present(DB);
+          f.unsafe(DB);
+          planted = true;
+        }
+      };
+      const sqliteOpen = vi.fn(() => ({ close: vi.fn() }) as never);
+      const refusal = openOutcome(f, sqliteOpen);
+      expect(sqliteOpen).not.toHaveBeenCalled();
+      expect(refusal).toMatchObject({ code: "FABRIC_MESH_STATE_UNSUPPORTED" });
+      expect(planted).toBe(false);
+      expect(f.native.mock.calls.length).toBeGreaterThanOrEqual(1);
+      expect(f.native.mock.calls.length).toBeLessThanOrEqual(2);
+      expect(f.warning).not.toHaveBeenCalled();
+    });
 });

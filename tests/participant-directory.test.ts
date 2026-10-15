@@ -111,13 +111,18 @@ describe("legacy actor tombstone retention", () => {
     kind: "actor", status: "stopped", stopReason: "owner-root-gone", capabilities: [],
     transport: "host", controlProtocol: "legacy", ...(settledAt !== undefined ? { settledAt } : {}),
   });
-  const fixture = (validate: () => FabricParticipantRecord | undefined) => {
+  const fixture = (validate: () => FabricParticipantRecord | undefined,
+    copies: "legacy" | "participant" | "dual" = "legacy") => {
     const entry = { key: "actors/gone/legacy-actor", version: 7, updatedAt: now + DIRECTORY_RETENTION_MS,
       updatedBy: identity, value: { id: "legacy-actor", status: "stopped", stopReason: "owner-root-gone",
         settledAt: now + DIRECTORY_RETENTION_MS } };
+    const participant = { ...entry, key: "topology/participants/legacy-actor" };
+    const entries = copies === "legacy" ? [entry] : copies === "participant" ? [participant] : [entry, participant];
+    const listAll = (prefix: string) => entries.filter(candidate => candidate.key.startsWith(prefix));
+    const token = {};
     const mesh = {
       root: path.join(os.tmpdir(), `p2-read-only-legacy-directory-${process.pid}`),
-      listAll: (prefix: string) => entry.key.startsWith(prefix) ? [entry] : [],
+      listAll, listAllShared: listAll, stateToken: () => token,
     } as unknown as MeshStore;
     return new ParticipantDirectory(mesh, { enabled: true, hostId: identity.id, rootId: identity.id,
       identity, reapDeadHosts: false, terminalActor: validate });
@@ -135,6 +140,33 @@ describe("legacy actor tombstone retention", () => {
     const actors = directory.list({ scope: "project", kinds: ["actor"], includeStale: true }, now);
     expect(actors.map(actor => actor.id)).toEqual(listed ? ["legacy-actor"] : []);
     if (listed) expect(actors[0]).toMatchObject({ settledAt, capabilities: [], stale: true });
+  });
+
+  describe.each(["participant", "dual"] as const)("%s copies", copies => {
+    it.each([
+      ["fresh", now - DIRECTORY_RETENTION_MS + 1, true],
+      ["exact retention boundary", now - DIRECTORY_RETENTION_MS, false],
+      ["older despite future public time", now - DIRECTORY_RETENTION_MS - 1, false],
+      ["missing private time", undefined, false],
+      ["future private time", now + 1, false],
+    ] as const)("uses immutable private time: %s", (_name, settledAt, listed) => {
+      const directory = fixture(() => terminal(settledAt), copies);
+      const actors = directory.list({ kinds: ["actor"], includeStale: true }, now);
+      expect(actors.map(actor => actor.id)).toEqual(listed ? ["legacy-actor"] : []);
+      if (listed) expect(actors[0]).toMatchObject({ settledAt, capabilities: [], stale: true });
+    });
+
+    it("ages repeated cached reads and revalidates proof", () => {
+      let authenticated = true;
+      const directory = fixture(() => authenticated ? terminal(now) : undefined, copies);
+      const options = { kinds: ["actor"] as Array<"actor">, includeStale: true };
+      expect(directory.list(options, now)).toHaveLength(1);
+      expect(directory.list(options, now + DIRECTORY_RETENTION_MS - 1)).toHaveLength(1);
+      expect(directory.list(options, now + DIRECTORY_RETENTION_MS)).toEqual([]);
+      expect(directory.list(options, now + DIRECTORY_RETENTION_MS + 1)).toEqual([]);
+      authenticated = false;
+      expect(directory.list(options, now)).toEqual([]);
+    });
   });
 
   it("does not trust a public terminal marker without private authentication", () => {

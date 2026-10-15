@@ -545,6 +545,13 @@ const legacyRootFromEntry = (
   };
 };
 
+// Retention is a display decision, never an ownership/proof decision. Only the
+// authenticated record's immutable settlement time may start the display clock.
+const retainedTerminalActor = (participant: FabricParticipantRecord, now: number): boolean => {
+  const age = now - (participant.settledAt ?? NaN);
+  return age >= 0 && age < DIRECTORY_RETENTION_MS;
+};
+
 const legacyActorFromEntry = (
   entry: MeshStateEntry,
   roots: Map<string, FabricParticipantInfo>,
@@ -556,8 +563,7 @@ const legacyActorFromEntry = (
     const terminal = terminalActor?.(entry);
     // Only the private validator's immutable settlement starts display retention;
     // observer rewrites and caller-controlled envelope timestamps cannot renew it.
-    const age = now - (terminal?.settledAt ?? NaN);
-    return terminal && age >= 0 && age < DIRECTORY_RETENTION_MS
+    return terminal && retainedTerminalActor(terminal, now)
       ? { ...terminal, local: false, stale: true } : undefined;
   }
   const value = entry.value;
@@ -1331,6 +1337,9 @@ export class ParticipantDirectory implements FabricParticipantSource {
     const refused: string[] = [];
     for (const mirror of parsed.shadowed) this.#collides(mirror, hosts);
     for (const participant of parsed.participants) {
+      // Apply on every list call, after private validation, so cached file/state
+      // copies age too without changing ownership/publication consumers.
+      if (participant.stopReason === "owner-root-gone" && !retainedTerminalActor(participant, now)) continue;
       const owner = hosts.get(participant.ownerHostId);
       if (!ownerMatches(participant, owner, this.options.hostId)) continue;
       if (this.#collides(participant, hosts)) {

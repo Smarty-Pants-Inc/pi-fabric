@@ -118,7 +118,7 @@ describe("shared finalizer (T4, platform independent)", () => {
       expect(warn).toHaveBeenCalledTimes(1);
 
       // Check every argument as well as console.warn's formatted output; no extra argument may carry the primary.
-      const captured = warn.mock.calls.flatMap(args => [...args.map(arg => format(arg)), format(...args)]).join("\n");
+      const captured = warn.mock.calls.flatMap((args: unknown[]) => [...args.map(arg => format(arg)), format(...args)]).join("\n");
       for (const marker of [messageMarker, nameMarker, primitiveMarker]) expect(captured).not.toContain(marker);
       const expected = new MeshLockReleaseError("L", "threw", refused as never, release, { cause: primary });
       expect(warn.mock.calls).toEqual([

@@ -45,7 +45,7 @@ const place = (root: string, proof: Record<string, unknown>): void => {
   fs.writeFileSync(path.join(root, "readers", `${String(proof.name)}.json`), JSON.stringify(proof), { mode: 0o600 });
 };
 
-describe("nats reader proofs (smarty-dev#9690)", () => {
+describe("nats reader proofs (smarty-dev#9690): schema and fail-closed on every platform", () => {
   it("parseProof: a nats proof needs all six bound fields; a file/sqlite proof may carry none", () => {
     expect(parseProof(JSON.stringify(natsProof()), "factory")).toMatchObject({ backends: ["file", "nats"], ...proofBind });
     expect(parseProof(JSON.stringify(natsProof({ challenge: undefined })), "factory")).toMatch(/^invalid proof: challenge/);
@@ -63,6 +63,23 @@ describe("nats reader proofs (smarty-dev#9690)", () => {
     expect(parseProof(JSON.stringify(natsProof({ backends: ["bogus"] })), "factory")).toMatch(/file, sqlite, nats/);
   });
 
+  it("fails closed without process.geteuid (Windows): readerReadiness refuses before touching the registry", () => {
+    const root = tempDir("mesh-no-posix");
+    const saved = Object.getOwnPropertyDescriptor(process, "geteuid");
+    Object.defineProperty(process, "geteuid", { value: undefined, configurable: true, writable: true });
+    try {
+      expect(() => readerReadiness(root, "nats", [], { fromEpoch: 0, toEpoch: 1 }))
+        .toThrow("the readiness gate cannot verify reader proofs on this platform (no POSIX owner; Windows ACL checks: smarty-dev#7548)");
+      expect(fs.existsSync(path.join(root, "readers"))).toBe(false);
+    } finally {
+      if (saved) Object.defineProperty(process, "geteuid", saved);
+      else delete (process as { geteuid?: unknown }).geteuid;
+    }
+  });
+});
+
+// These proof success cases require POSIX ownership; the fail-closed contract runs above on every platform.
+describe.skipIf(process.platform === "win32")("nats reader proofs (smarty-dev#9690)", () => {
   it("the gate: ready only when every bound field is the switch's; without a binding a nats proof is unready", () => {
     const root = tempDir("mesh");
     const required = requiredReaders([], [], [{ name: "factory", installRoot: installRoot("r1") }], []);
@@ -164,6 +181,10 @@ describe("nats reader proofs (smarty-dev#9690)", () => {
     expect(JSON.parse(verified.out)).toMatchObject({ from: "nats", stream: intent.stream, converged: true });
   });
 
+});
+
+// Abandon does not need a reader proof or POSIX ownership, so keep it cross-platform.
+describe("nats import abandonment", () => {
   it("--abandon deletes exactly the intent's unfinished stream and the intent", async () => {
     const root = tempDir("abandon");
     const store = new MeshStore(root, 64 * 1024, 1_000, { stateBackend: "file" });
@@ -185,6 +206,9 @@ describe("nats reader proofs (smarty-dev#9690)", () => {
     expect(again.converged).toBe(false);
   });
 
+});
+
+describe.skipIf(process.platform === "win32")("nats staged reader proof", () => {
   it("reader-proof --backend nats reads the staged stream and binds exactly what the switch commits", async () => {
     const root = tempDir("mesh-prove");
     const store = new MeshStore(root, 64 * 1024, 1_000, { stateBackend: "file" });

@@ -616,7 +616,7 @@ describe.each([false, true])("stale Main name safeguards (files=%s)", (files) =>
     const send = router(unknown, [], { request }, f.directory);
     for (const kind of ["followUp", "steer"] as const) {
       await expect(send.value.routeMessage("lead-example", "must not arrive", undefined, kind))
-        .rejects.toThrow(state === "mirrored" ? "bridge-stale for remote host peer-host" : "Unknown Fabric participant: lead-example");
+        .rejects.toThrow(state === "mirrored" ? "peer lease stale; the peer may be live" : "Unknown Fabric participant: lead-example");
     }
     expect(request).not.toHaveBeenCalled();
   });

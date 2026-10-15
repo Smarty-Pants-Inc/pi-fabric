@@ -47,10 +47,17 @@ existing events and mirrors root presence. There is no new store or protocol.
   captured before the mirror's dispatch/write wait, not when a delayed write committed. Source lease
   age is judged on the source clock; bridge freshness lasts 15 s on the receiving clock. A
   root is lease-stale only when that host's bridge observation is fresh and its sampled native
-  lease is old. A stale bridge instead yields `FABRIC_BRIDGE_STALE` (`bridge-stale`), never a
-  claim that the remote Main's lease lapsed. New projections advertise `mirrorLease: 1` and
+  lease is old: routing refuses it immediately, naming that remote host, without waiting or
+  publishing. A stale bridge, missing required observation, or expired translated authority
+  instead leaves the source lease unconfirmed. Before publication, routing waits once, at most
+  15 s, for a fresh same-owner renewal; without one it returns retryable `FABRIC_PEER_LEASE_STALE`,
+  naming the host, and publishes nothing. After publication, `FABRIC_BRIDGE_STALE` retains the
+  unknown-delivery warning; it never claims that the remote Main's lease lapsed. New projections advertise `mirrorLease: 1` and
   require matching identity/incarnation metadata; missing or malformed metadata cannot fall
-  back to an old state expiry. Older projections retain their bounded compatibility expiry.
+  back to an old state expiry. Older projections without the `mirrorLease` marker retain their
+  bounded compatibility expiry: an unexpired projection still routes, while an expired one takes
+  the same single renewal wait. Remove this exception once every bridge runs a release that writes
+  `mirrorLease`.
   Presence is refreshed on every bridge (re)connect before startup completes, then on store notifications
   and actual lease deadlines, not a periodic poll. Each pass reads the current native records, including file-only roots in
   `participants/`, and does not replay a saved projection set. A lapsed mirror is refreshed
@@ -164,8 +171,12 @@ existing events and mirrors root presence. There is no new store or protocol.
 ## Control deadlines and retention
 
 Commands addressed to a validated remote participant use `mesh.bridgeControlTimeoutMs` (default
-30,000 ms, configurable from 30,000 to 300,000), or a longer requested timeout. The deadline is
-stamped at publication commit and includes outbound bridge queueing. Senders allow an additional
+30,000 ms, configurable from 30,000 to 300,000), or a longer requested timeout. A pre-publication
+freshness wait is separate: one notification-driven renewal wait of at most 15 s, pinned to the
+selected host, identity, root and bridge link. A renewal revalidates the route; a different owner
+or link cannot redirect the attempt. A fresh source-expired sample skips that wait and refuses
+immediately. No renewal produces `FABRIC_PEER_LEASE_STALE` (`retryable: true`), with no publication.
+The control deadline is stamped at publication commit and includes outbound bridge queueing. Senders allow an additional
 15 s for the ACK return leg; mirrored steer/followUp admission waits are bounded by that same
 window plus grace, even if publication blocks or the lease renews. Cancellation uses the bridge
 window too. Native commands keep their existing timeout. A missing ACK or a lapsed mirror cannot
@@ -205,10 +216,12 @@ not event/frame limits or the default. For example, `--max-state-bytes 67108864`
 host without a global `~/.ssh/config` entry.
 
 When a bridge stops providing fresh observations, its authority expires within 15 s. A retained
-root is not proof that the Main ended: routing reports `bridge-stale`. Before publication, that
-error says the attempt was not published. After publication, it preserves the unknown-outcome
-warning because a delayed command or ACK may still arrive. Only a fresh source observation of an
-old native lease can report a lease lapse. The command's admission/ACK budget is unchanged.
+root is not proof that the Main ended. Before publication, routing waits once for renewal and
+then returns `FABRIC_PEER_LEASE_STALE` if freshness remains unknown; the attempt was not published.
+After publication, `FABRIC_BRIDGE_STALE` preserves the unknown-outcome warning because a delayed
+command or ACK may still arrive; it must not trigger a lookup retry or automatic replay. Only a
+fresh source observation of an old native lease can report a lease lapse immediately. The command's
+published admission/ACK budget is unchanged.
 The dead-root activation filter follows the same distinction: a stale bridge or a live source
 sample is doubt/alive, not owner death. Only a fresh observation of a source-expired root,
 past its existing ten-minute grace and without live native participant evidence, permits a

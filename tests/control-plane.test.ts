@@ -9,7 +9,7 @@ import {
   type MeshEvent,
   type MeshStoreOptions,
 } from "../src/mesh/store.js";
-import { CONTROL_CLAIMS_POLICY_KEY, FabricControlPlane, type FabricControlCommand, type FabricControlPlaneOptions } from "../src/topology/control-plane.js";
+import { CONTROL_CLAIMS_POLICY_KEY, FabricControlPlane, type FabricControlCommand, type FabricControlPlaneOptions, type MirroredControlOwner } from "../src/topology/control-plane.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { createMainExecutionCeilingError } from "../src/async-settlement.js";
 import { removeHostLease, writeHostLease } from "../src/topology/host-leases.js";
@@ -31,7 +31,7 @@ const plane = (
   meshRoot: string,
   id: string,
   storeOptions: MeshStoreOptions = {},
-  controlOptions: Pick<FabricControlPlaneOptions, "pollMs" | "acknowledgementTimeoutMs" | "bridgeTimeoutMs" | "readMirroredOwner"> = {},
+  controlOptions: Pick<FabricControlPlaneOptions, "pollMs" | "acknowledgementTimeoutMs" | "bridgeTimeoutMs" | "readMirroredOwner" | "mirrorLeaseWaitMs"> = {},
 ): FabricControlPlane => {
   const value = new FabricControlPlane(
     new MeshStore(meshRoot, 64 * 1024, 1_000, storeOptions),
@@ -51,6 +51,148 @@ const plane = (
 afterEach(async () => {
   await Promise.all(planes.splice(0).map((value) => value.close()));
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
+});
+
+// Keep reason: raw control admission is a pre-publication trust boundary, including
+// a lease lost while waiting for the actual event lock. Real store/watch; short real timer seam.
+describe("raw mirrored control freshness admission", () => {
+  const setup = (state: "live" | "legacy" | "stale" | "absent" | "translated-expired" | "source-lapsed") => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-control-freshness-")); roots.push(root);
+    const at = Date.now();
+    const live = (): MirroredControlOwner => ({ remoteHost: "forge", expiresAt: Date.now() + 60_000,
+      ownerIncarnation: fixtureOwnerIncarnation, mirrorLease: 1, mirror: { remoteHost: "forge", observedAt: Date.now(),
+        sourceObservedAt: at - 60_000, sourceUpdatedAt: at - 62_000, sourceExpiresAt: at - 30_000 } });
+    let current = live();
+    if (state === "legacy") current = { remoteHost: "forge", expiresAt: at + 60_000 };
+    if (state === "stale") current.mirror = { ...current.mirror!, observedAt: at - 16_000,
+      sourceExpiresAt: at - 60_001 };
+    if (state === "absent") delete current.mirror;
+    if (state === "translated-expired") current.expiresAt = at - 1;
+    if (state === "source-lapsed") current.mirror = { ...current.mirror!, sourceExpiresAt: at - 60_001 };
+    const read = vi.fn(() => current);
+    const sender = plane(root, "sender", {}, { readMirroredOwner: read, mirrorLeaseWaitMs: 50 });
+    sender.start(() => ({ accepted: false }));
+    const send = (signal?: AbortSignal, budget?: { waited?: boolean }, key?: string) => sender.request("owner", "target", "followUp",
+      { ownerIncarnation: fixtureOwnerIncarnation, message: "one attempt" }, "owner",
+      { routedRemoteHost: "forge", signal, mirrorLeaseWaitBudget: budget, idempotencyKey: key });
+    const commands = () => sender.mesh.read({ topic: "fabric.control.command" });
+    const renew = (patch: Partial<MirroredControlOwner> = {}) => {
+      current = { ...live(), ...patch };
+      writeHostLease(root, { id: "owner", rootId: "target", identityId: "owner", updatedAt: Date.now(),
+        expiresAt: current.expiresAt, ...(current.mirror ? { mirror: current.mirror } : {}) });
+    };
+    const ack = async () => {
+      await vi.waitFor(() => expect(commands()).toHaveLength(1));
+      const command = commands()[0]!.data as FabricControlCommand;
+      await sender.mesh.publish({ topic: "fabric.control.ack", kind: "accepted", from: identity("owner"), to: "sender",
+        data: { version: 1, commandId: command.commandId, targetId: "target", accepted: true,
+          ownerIncarnation: fixtureOwnerIncarnation, messageId: "once", bridge: { from: "forge" } } });
+    };
+    return { sender, send, commands, renew, ack, read,
+      doubt: () => { const { mirror: _mirror, ...rest } = live(); current = rest; } };
+  };
+
+  it.each(["live", "legacy"] as const)("%s unexpired authority delivers without a renewal wait", async state => {
+    const f = setup(state);
+    const request = f.send();
+    void request.catch(() => undefined);
+    await f.ack();
+    await expect(request).resolves.toMatchObject({ acknowledged: true, messageId: "once" });
+    expect(f.commands()).toHaveLength(1);
+  });
+
+  it.each(["stale", "absent", "translated-expired"] as const)("%s authority waits once then refuses peer-stale before publication", async state => {
+    const f = setup(state), start = Date.now();
+    await expect(f.send()).rejects.toMatchObject({ code: "FABRIC_PEER_LEASE_STALE", retryable: true, remoteHost: "forge" });
+    expect(Date.now() - start).toBeGreaterThanOrEqual(40);
+    expect(Date.now() - start).toBeLessThan(2_000);
+    expect(f.commands()).toEqual([]);
+  });
+
+  it("fresh source-lapsed evidence is immediately Unknown, even with future projection", async () => {
+    const f = setup("source-lapsed"), start = Date.now();
+    await expect(f.send()).rejects.toThrow("Unknown Fabric participant: target (its lease mirrored from remote host forge lapsed");
+    expect(Date.now() - start).toBeLessThan(1_000);
+    expect(f.read).toHaveBeenCalledOnce();
+    expect(f.commands()).toEqual([]);
+  });
+
+  it("same-owner renewal publishes once, but a shared spent budget never grants a second wait", async () => {
+    const f = setup("absent");
+    const request = f.send();
+    void request.catch(() => undefined);
+    expect(f.commands()).toEqual([]);
+    f.renew();
+    await f.ack();
+    await expect(request).resolves.toMatchObject({ acknowledged: true });
+    expect(f.commands()).toHaveLength(1);
+
+    const raced = setup("absent"), start = Date.now();
+    await expect(raced.send(undefined, { waited: true })).rejects.toMatchObject({ code: "FABRIC_PEER_LEASE_STALE" });
+    expect(Date.now() - start).toBeLessThan(1_000);
+    expect(raced.commands()).toEqual([]);
+  });
+
+  it.each([false, true])("a commit-time lapse shares the original wait budget (already waited=%s), never appending stale authority", async waited => {
+    const f = setup("live");
+    const publish = f.sender.mesh.publish.bind(f.sender.mesh);
+    let first = true, armed!: () => void;
+    const atCommit = new Promise<void>(resolve => { armed = resolve; });
+    const spy = vi.spyOn(f.sender.mesh, "publish").mockImplementation(input => publish({ ...input,
+      data: typeof input.data !== "function" ? input.data : (at: number) => {
+        if (input.topic === "fabric.control.command" && first) {
+          first = false; f.doubt(); armed(); // Actual commit callback, not a preflight-only seam.
+        }
+        return (input.data as (at: number) => unknown)(at);
+      } }));
+    try {
+      const request = f.send(undefined, { waited });
+      const result = request.catch((error: unknown) => error);
+      await atCommit;
+      expect(f.commands()).toEqual([]);
+      if (waited) {
+        expect(await result).toMatchObject({ code: "FABRIC_PEER_LEASE_STALE", retryable: true });
+        expect(f.commands()).toEqual([]);
+        expect(spy).toHaveBeenCalledOnce(); // No second wait or publication attempt.
+      } else {
+        f.renew();
+        await f.ack();
+        await expect(request).resolves.toMatchObject({ acknowledged: true });
+        expect(f.commands()).toHaveLength(1);
+        expect(spy.mock.calls.filter(([input]) => input.topic === "fabric.control.command")).toHaveLength(2);
+      }
+    } finally { spy.mockRestore(); }
+  });
+
+  it("abort during raw admission preserves the exact reason and leaves nothing published", async () => {
+    const f = setup("absent"), controller = new AbortController();
+    const request = f.send(controller.signal);
+    const reason = { cancelled: "raw admission" };
+    const refusal = expect(request).rejects.toBe(reason);
+    controller.abort(reason);
+    await refusal;
+    expect(f.commands()).toEqual([]);
+  });
+
+  it.each(["close", "epoch", "duplicate"] as const)("rechecks %s after a renewal await", async variant => {
+    const f = setup("absent");
+    const request = f.send(undefined, undefined, "same-key");
+    const result = request.catch((error: unknown) => error);
+    let duplicate: Promise<unknown> | undefined;
+    if (variant === "close") await f.sender.close();
+    if (variant === "duplicate") duplicate = f.send(undefined, undefined, "same-key").catch((error: unknown) => error);
+    f.renew(variant === "epoch" ? { ownerIncarnation: "replacement-activation" } : {});
+    if (variant === "duplicate") {
+      await f.ack();
+      const errors = await Promise.all([result, duplicate!]);
+      expect(errors.filter(error => error instanceof Error && /already awaiting acknowledgement/.test(error.message))).toHaveLength(1);
+      expect(f.commands()).toHaveLength(1);
+    } else {
+      const error = await result;
+      expect((error as Error).message).toMatch(variant === "close" ? /closed/ : /incarnation/i);
+      expect(f.commands()).toEqual([]);
+    }
+  });
 });
 
 describe("sender final delivery outcomes", () => {
@@ -975,7 +1117,8 @@ describe("FabricControlPlane", () => {
       const readMirroredOwner = vi.fn((host: string, ownerIdentity: string | undefined, target: string) =>
         directory.mirroredControlOwner(host, ownerIdentity, target));
       await advertise("forge");
-      expect(readMirroredOwner(ownerId, ownerId, ownerId)).toEqual({ remoteHost: "forge", expiresAt });
+      expect(readMirroredOwner(ownerId, ownerId, ownerId)).toEqual({ remoteHost: "forge", expiresAt,
+        ownerIncarnation: fixtureOwnerIncarnation });
       readMirroredOwner.mockClear();
       const sender = plane(meshRoot, "host:sender", { readCacheMs: 2_000 }, { readMirroredOwner });
       sender.start(() => ({ accepted: false }));

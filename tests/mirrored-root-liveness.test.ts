@@ -11,6 +11,7 @@ import { FabricControlPlane } from "../src/topology/control-plane.js";
 import { AgentMessageRouter } from "../src/providers/agents-message-router.js";
 import { FabricBridgeStaleError, hostMirrorLease, mirroredLeaseStatus, mirroredOwnerRoutingStatus, MIRROR_FRESH_MS, hostLeasePath, readHostLease, writeHostLease, type FabricMirrorLease } from "../src/topology/host-leases.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
+import { FabricPeerLeaseStaleError } from "../src/agents/peer-lease-stale.js";
 import { deadHostRecords, DEAD_HOST_RECORDS_MS } from "../src/topology/host-reaper.js";
 
 // No deletion in this suite (#11199); isolated fixture bytes are retained for the owner.
@@ -37,10 +38,12 @@ const fixture = async (sourceOffset = -60_000, sourceTtl = 13_000, path_: "cold"
   const presence: BridgePresence = { hosts: [{ record, expiresAt: record.expiresAt, observedAt: now + sourceOffset }],
     participants: [participant], reserved: [] };
   if (path_ === "warm") await local.mirror(presence, now);
+  // Shorten only the renewal bound: source/receiver clocks, real fs watches and all
+  // recorded deadline/attribution assertions stay intact (no fake-timer wait/poll seam).
   const directory = new ParticipantDirectory(store, { enabled: true, hostId: senderId, rootId: senderId,
-    identity: { id: senderId, name: "lead", kind: "main" } });
+    identity: { id: senderId, name: "lead", kind: "main" }, routingLease: { now: () => now, waitMs: 25 } });
   const control = new FabricControlPlane(store, { id: senderId, name: "lead", kind: "main" }, {
-    enabled: true, hostId: senderId, now: () => now, pollMs: 10,
+    enabled: true, hostId: senderId, now: () => now, pollMs: 10, mirrorLeaseWaitMs: 25,
     readMirroredOwner: (...args) => directory.mirroredControlOwner(...args),
   });
   control.start(() => ({ accepted: false }));
@@ -96,7 +99,7 @@ describe("source-clock root liveness (#10068)", () => {
     await f.local.mirror({ ...f.presence, participants: f.presence.participants.map(p => ({ ...p, controlProtocol: protocol })) }, f.now());
     f.advance(MIRROR_FRESH_MS + 1);
     await expect(router.routeMessage(rootId, "no fresh bridge", undefined, "followUp"))
-      .rejects.toMatchObject({ code: "FABRIC_BRIDGE_STALE" });
+      .rejects.toMatchObject({ code: "FABRIC_PEER_LEASE_STALE" });
     expect(commands(f)).toHaveLength(1);
     expect(steerRemote).not.toHaveBeenCalled();
   });
@@ -116,7 +119,7 @@ describe("source-clock root liveness (#10068)", () => {
     void refusal.then(() => { settled = true; });
     await vi.waitFor(() => expect(settled || commands(f).length > 0).toBe(true));
     expect(commands(f)).toHaveLength(0); // The old head publishes here: this is the negative control.
-    expect((await refusal).error).toMatchObject({ code: "FABRIC_BRIDGE_STALE", remoteHost: "ryzen4", targetId: rootId,
+    expect((await refusal).error).toMatchObject({ code: "FABRIC_PEER_LEASE_STALE", remoteHost: "ryzen4", targetId: rootId,
       message: expect.stringContaining("this attempt was not published") });
     expect(f.directory.get(rootId, f.now())).toMatchObject({ remoteHost: "ryzen4", bridgeStale: true });
     expect(f.directory.list({ scope: "project", fresh: true }, f.now()).find(p => p.id === rootId))
@@ -200,10 +203,10 @@ describe("source-clock root liveness (#10068)", () => {
       void refusal.then(() => { settled = true; });
       await vi.waitFor(() => expect(settled || commands(f).length > before).toBe(true));
       expect(commands(f)).toHaveLength(before);
-      expect((await refusal).error).toMatchObject({ code: "FABRIC_BRIDGE_STALE", remoteHost: "ryzen4", targetId: rootId,
+      expect((await refusal).error).toMatchObject({ code: "FABRIC_PEER_LEASE_STALE", remoteHost: "ryzen4", targetId: rootId,
         message: expect.stringContaining("this attempt was not published") });
       await expect(router.routeMessage(rootId, "expired original source deadline", undefined, operation))
-        .rejects.toMatchObject({ code: "FABRIC_BRIDGE_STALE", remoteHost: "ryzen4",
+        .rejects.toMatchObject({ code: "FABRIC_PEER_LEASE_STALE", remoteHost: "ryzen4",
           message: expect.stringContaining("this attempt was not published") });
     }
     expect(commands(f)).toHaveLength(before);
@@ -280,7 +283,7 @@ describe("source-clock root liveness (#10068)", () => {
     expect(checkpoint).toMatchObject({ expiresAt: t0 + 500, observedAt: t0, rowExpiry: t0 + 1_500,
       participant: { id: rootId, remoteHost: "ryzen4", bridgeStale: true }, routing: "bridge-stale", commands: 0 });
     expect(recorded).toHaveLength(4);
-    for (const result of recorded) expect(result.error).toMatchObject({ code: "FABRIC_BRIDGE_STALE", remoteHost: "ryzen4",
+    for (const result of recorded) expect(result.error).toMatchObject({ code: "FABRIC_PEER_LEASE_STALE", remoteHost: "ryzen4",
       message: expect.stringContaining("this attempt was not published") });
     expect(admitted).toEqual([]);
     expect(steerRemote).not.toHaveBeenCalled();
@@ -346,7 +349,7 @@ describe("source-clock root liveness (#10068)", () => {
     f.advance(1_001);
     for (const operation of ["steer", "followUp"] as const) {
       await expect(router.routeMessage(rootId, "expired translated authority", undefined, operation))
-        .rejects.toMatchObject({ code: "FABRIC_BRIDGE_STALE", remoteHost: "ryzen4",
+        .rejects.toMatchObject({ code: "FABRIC_PEER_LEASE_STALE", remoteHost: "ryzen4",
           message: expect.stringContaining("this attempt was not published") });
     }
     expect(commands(f)).toHaveLength(0);
@@ -362,13 +365,13 @@ describe("source-clock root liveness (#10068)", () => {
     expect(steerRemote).not.toHaveBeenCalled();
   });
 
-  it("retains a root behind an old bridge, but refuses publication with bridge-stale, never lease lapsed", async () => {
+  it("retains a root behind an old bridge, waits once and refuses peer-stale, never claiming source lapse", async () => {
     const f = await fixture();
     f.advance(MIRROR_FRESH_MS + 1);
     expect(f.directory.get(rootId, f.now())).toMatchObject({ id: rootId, stale: false });
     const result = await settle(request(f));
-    expect(result.error).toBeInstanceOf(FabricBridgeStaleError);
-    expect(result.error).toHaveProperty("code", "FABRIC_BRIDGE_STALE");
+    expect(result.error).toBeInstanceOf(FabricPeerLeaseStaleError);
+    expect(result.error).toHaveProperty("code", "FABRIC_PEER_LEASE_STALE");
     expect(result.error?.message).not.toContain("lapsed");
     expect(result.error?.message).toContain("not published");
     expect(commands(f)).toHaveLength(0);
@@ -409,7 +412,7 @@ describe("source-clock root liveness (#10068)", () => {
   it("never uses another host's freshness or another incarnation's observation", async () => {
     const f = await fixture();
     f.advertise(mirror(f.now(), { remoteHost: "ryzen3" }));
-    expect((await settle(request(f))).error).toHaveProperty("code", "FABRIC_BRIDGE_STALE");
+    expect((await settle(request(f))).error).toHaveProperty("code", "FABRIC_PEER_LEASE_STALE");
     writeHostLease(f.store.root, { ...f.lease(), incarnationToken: "other-incarnation", mirror: mirror(f.now()) });
     const host = f.store.get(key("topology/hosts/", rootId))!.value as typeof f.presence.hosts[0]["record"];
     expect(hostMirrorLease(new Map([[rootId, f.lease()]]), host)).toBeUndefined();
@@ -433,7 +436,7 @@ describe("source-clock root liveness (#10068)", () => {
     else fs.writeFileSync(hostLeasePath(f.store.root, rootId), JSON.stringify({ format: 1, ...f.lease(),
       mirror: { ...f.lease().mirror, sourceObservedAt: null } }));
     expect(f.local.holds(rootId)).toBe(false);
-    expect((await settle(request(f))).error).toHaveProperty("code", "FABRIC_BRIDGE_STALE");
+    expect((await settle(request(f))).error).toHaveProperty("code", "FABRIC_PEER_LEASE_STALE");
     expect(commands(f)).toHaveLength(0);
     // Read-only selection probe: unconfirmed authority does not mean an epoch-old owner.
     // The reaper ages the row by its store commit stamp (wall clock at commit), not the fixture

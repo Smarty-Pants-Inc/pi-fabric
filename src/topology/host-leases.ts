@@ -4,6 +4,8 @@ import fs from "node:fs";
 import path from "node:path";
 import { isMeshLockTimeout, readFileRetrying, writeJsonAtomic } from "../core/atomic-write.js";
 import { effectiveLiveness, type Liveness } from "./liveness.js";
+import { watchBridgeStore } from "../mesh/change-notifier.js";
+import { FabricPeerLeaseStaleError, PEER_LEASE_WAIT_MS } from "../agents/peer-lease-stale.js";
 import type { MeshStateEntry } from "../mesh/store.js";
 import { HostLeaseLockBusyError, HostLeaseLockLostError, withHostLeaseLock, type HostLeaseLockOptions, type HostLeaseMesh } from "./host-lease-lock.js";
 
@@ -134,10 +136,80 @@ export const mirroredOwnerRoutingStatus = (
   now = Date.now(),
 ): MirroredLeaseStatus => {
   if (owner.bridgeStale) return "bridge-stale";
-  // An older bridge proves only its unexpired projection, never the source's death.
+  // Mixed-release legacy exception: an older bridge proves only its unexpired projection,
+  // never source death. Remove ONLY after ALL bridges run a release with mirrorLease.
   const status = owner.mirror || owner.mirrorLease === 1
     ? mirroredLeaseStatus(owner.remoteHost, owner.mirror, now) : "live";
   return status === "live" && !(owner.expiresAt > now) ? "bridge-stale" : status;
+};
+
+/** Shared by directory recovery and commit-time control admission: never cascade two waits. */
+export interface MirrorLeaseWaitBudget { waited?: boolean; }
+
+/** Resolution only. Arm before re-reading; notifications drive renewal, one timer bounds silence.
+ * A fresh source lapse returns to the caller immediately for its ordinary root-gone refusal. */
+export const waitForMirroredLeaseRenewal = async <T extends {
+  remoteHost: string; expiresAt: number; mirror?: FabricMirrorLease; mirrorLease?: 1; bridgeStale?: true;
+}>(meshRoot: string, targetId: string, initial: T, read: () => T | undefined,
+  sameOwner: (current: T) => boolean,
+  options: { signal?: AbortSignal | undefined; now?: (() => number) | undefined; waitMs?: number | undefined; budget?: MirrorLeaseWaitBudget | undefined } = {},
+): Promise<T | undefined> => {
+  const { signal, budget } = options;
+  signal?.throwIfAborted();
+  const now = options.now ?? Date.now;
+  const stale = (current: T): never => {
+    throw new FabricPeerLeaseStaleError(targetId, initial.remoteHost, Math.max(0, now() - current.expiresAt));
+  };
+  if (budget?.waited) return stale(initial);
+  if (budget) budget.waited = true;
+  const configured = options.waitMs ?? PEER_LEASE_WAIT_MS;
+  const waitMs = Number.isFinite(configured) ? Math.min(PEER_LEASE_WAIT_MS, Math.max(0, configured)) : PEER_LEASE_WAIT_MS;
+  return await new Promise<T | undefined>((resolve, reject) => {
+    let settled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let unwatch: (() => void) | undefined;
+    const settle = (outcome: () => T | undefined): void => {
+      if (settled) return;
+      settled = true;
+      signal?.removeEventListener("abort", abort);
+      if (timer !== undefined) clearTimeout(timer);
+      timer = undefined;
+      try { unwatch?.(); } catch { /* best effort */ }
+      unwatch = undefined;
+      try { resolve(outcome()); } catch (error) { reject(error); }
+    };
+    const abort = (): void => settle(() => { throw signal!.reason; });
+    const decide = (final: boolean): { done: boolean; owner?: T } => {
+      signal?.throwIfAborted();
+      const current = read();
+      if (!current) return { done: true };
+      if (!sameOwner(current)) return stale(initial);
+      if (mirroredOwnerRoutingStatus(current, now()) !== "bridge-stale") return { done: true, owner: current };
+      if (final) return stale(current);
+      return { done: false };
+    };
+    const check = (): void => {
+      if (settled) return;
+      try {
+        const result = decide(false);
+        if (result.done) settle(() => result.owner);
+      } catch (error) { settle(() => { throw error; }); }
+    };
+    const timeout = (): void => settle(() => decide(true).owner);
+    signal?.addEventListener("abort", abort, { once: true });
+    if (signal?.aborted) abort();
+    if (settled) return;
+    try {
+      const stop = watchBridgeStore(meshRoot, check, timeout);
+      // Watch setup can synchronously abort or fail before its cleanup handle exists.
+      if (settled) { stop(); return; }
+      unwatch = stop;
+    } catch { timeout(); return; }
+    const armedTimer = setTimeout(timeout, waitMs);
+    if (settled) { clearTimeout(armedTimer); return; }
+    timer = armedTimer;
+    check();
+  });
 };
 
 export class FabricBridgeStaleError extends Error {

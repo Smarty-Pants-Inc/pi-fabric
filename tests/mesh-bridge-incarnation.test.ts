@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { BRIDGE_LEASE_MS, BridgeStaleIncarnationError, StoreBridgeSide, type BridgePresence } from "../src/mesh/bridge.js";
 import { CommitOutbox, type CommitOutboxPlan } from "../src/mesh/commit-outbox.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
-import { hostLeasePath, readHostLease, writeHostLease } from "../src/topology/host-leases.js";
+import { hostLeasePath, hostLiveness, mirroredOwnerRoutingStatus, readHostLease, writeHostLease } from "../src/topology/host-leases.js";
 import type { FabricHostRecord, FabricParticipantRecord } from "../src/topology/types.js";
 
 // smarty-dev#7397: trust-boundary probes for lease-only authority changes and crash recovery.
@@ -261,6 +261,92 @@ describe("bridge incarnation admission at persisted trust boundaries (smarty-dev
       incarnationToken: "opaque-between-recovery", bridgeSupersededTokens: [host.incarnationToken] });
     await expect(new StoreBridgeSide(hub, "ryzen2", () => NOW).mirror(presence))
       .rejects.toMatchObject({ code: "FABRIC_BRIDGE_STALE_INCARNATION" });
+    expect(removals).toEqual([]);
+  });
+
+  // Keep reason: Luna's #7397 P2, an older unsampled effect erased sampled authority.
+  it.each([
+    { path: "replay", inflated: false }, { path: "replay", inflated: true },
+    { path: "afterCommit", inflated: false }, { path: "afterCommit", inflated: true },
+  ] as const)("retains sampled M1 and repairs history at the unsampled $path checkpoint (inflated=$inflated)", async ({ path, inflated }) => {
+    const hub = store("file");
+    const deadline = NOW + 5_000;
+    const sample = { remoteHost: "ryzen2", observedAt: NOW, sourceObservedAt: NOW - 60_000,
+      sourceUpdatedAt: NOW - 61_000, sourceExpiresAt: NOW - 55_000 };
+    const sampled = { ...oldLease, updatedAt: NOW, expiresAt: deadline + (inflated ? 1_000 : 0),
+      mirrorLease: 1 as const, mirror: sample, bridgeSupersededTokens: ["disk-predecessor"],
+      bridgeSupersededTokenSeen: { "disk-predecessor": 2 } };
+    const pending = { ...oldLease, updatedAt: NOW - 1_000, expiresAt: NOW + 4_000,
+      mirrorLease: 1 as const, bridgeSupersededTokens: ["effect-predecessor"],
+      bridgeSupersededTokenSeen: { "effect-predecessor": 1 } };
+    const incoming = { hosts: [{ record: { ...host, updatedAt: sample.sourceUpdatedAt },
+      observedAt: sample.sourceObservedAt, expiresAt: sample.sourceExpiresAt }], participants: [participant] };
+    const capture = () => {
+      const lease = readHostLease(hub.root, identity.id)!;
+      return { lease, routing: mirroredOwnerRoutingStatus({ ...lease, remoteHost: "ryzen2" }, NOW),
+        liveness: hostLiveness(new Map([[identity.id, lease]]), { ...host, remoteHost: "ryzen2", mirrorLease: 1 }) };
+    };
+    let checkpoint: ReturnType<typeof capture> | undefined;
+    if (path === "replay") {
+      const dead = new CommitOutbox(hub, "bridge/ryzen2", bridgeIdentity, {});
+      await hub.writeBatch({ identity: bridgeIdentity, ops: [], prepare: () => dead.plan().stage([
+        { kind: "put", key: hostKey(identity.id), identity, value: { ...host, remoteHost: "ryzen2", mirrorLease: 1 } },
+      ], [{ kind: "lease", key: `lease:${identity.id}`, payload: pending }]) });
+      writeHostLease(hub.root, sampled);
+      const originalPlan = CommitOutbox.prototype.plan;
+      vi.spyOn(CommitOutbox.prototype, "plan").mockImplementation(function (this: CommitOutbox): CommitOutboxPlan {
+        const plan = originalPlan.call(this);
+        return { ...plan, replay: view => {
+          const count = plan.replay(view);
+          // Capture BEFORE recompute/current afterCommit could conceal an erased mirror.
+          checkpoint = capture();
+          expect(count).toBe(1);
+          return count;
+        } };
+      });
+      await new StoreBridgeSide(hub, "ryzen2", () => NOW).mirror(incoming, NOW);
+    } else {
+      const write = hub.writeBatch.bind(hub);
+      let delayed: NonNullable<Parameters<MeshStore["writeBatch"]>[0]["afterCommit"]> | undefined;
+      const intercept = vi.spyOn(hub, "writeBatch").mockImplementation(input => {
+        delayed = input.afterCommit;
+        return write({ ...input, afterCommit: undefined });
+      });
+      // Commit an unsampled effect, withholding only its real afterCommit callback.
+      await new StoreBridgeSide(hub, "ryzen2", () => NOW - 1_000).mirror({ hosts: [{
+        record: { ...host, updatedAt: pending.updatedAt }, expiresAt: pending.expiresAt }], participants: [participant] });
+      intercept.mockRestore();
+      expect(delayed).toBeTypeOf("function");
+      // An intervening pass publishes sampled M1 before the older callback regains custody.
+      await new StoreBridgeSide(hub, "ryzen2", () => NOW).mirror(incoming, NOW);
+      await hub.put({ key: hostKey(identity.id), identity, value: { ...host, remoteHost: "ryzen2", mirrorLease: 1,
+        bridgeSupersededTokens: ["effect-predecessor"], bridgeSupersededTokenSeen: { "effect-predecessor": 1 } } });
+      writeHostLease(hub.root, sampled);
+      await hub.writeBatch({ identity: bridgeIdentity, ops: [], afterCommit: view => {
+        delayed!(view);
+        checkpoint = capture(); // No later mirror pass can repair this checkpoint.
+      } });
+    }
+    expect(checkpoint).toBeDefined();
+    expect(checkpoint!.lease).toMatchObject({ mirror: sample, updatedAt: NOW, expiresAt: deadline,
+      bridgeSupersededTokens: ["effect-predecessor", "disk-predecessor"],
+      bridgeSupersededTokenSeen: { "effect-predecessor": 1, "disk-predecessor": 2 } });
+    expect(checkpoint!.lease.expiresAt).toBeLessThanOrEqual(sample.observedAt +
+      Math.min(BRIDGE_LEASE_MS, sample.sourceExpiresAt - sample.sourceObservedAt));
+    expect(checkpoint!.routing).toBe("live");
+    expect(checkpoint!.liveness).toEqual({ updatedAt: NOW, expiresAt: deadline });
+    expect(removals).toEqual([]);
+  });
+
+  it("still allows a strictly later unsampled same-token deadline over sampled M1", async () => {
+    const hub = store("file");
+    const side = new StoreBridgeSide(hub, "ryzen2", () => NOW);
+    await side.mirror({ hosts: [{ record: host, observedAt: NOW, expiresAt: NOW + 5_000 }], participants: [participant] }, NOW);
+    expect(readHostLease(hub.root, identity.id)?.mirror).toBeDefined();
+    await side.mirror(presence);
+    expect(readHostLease(hub.root, identity.id)).toMatchObject({ expiresAt: NOW + BRIDGE_LEASE_MS });
+    expect(readHostLease(hub.root, identity.id)?.mirror).toBeUndefined();
+    expect(side.holds(identity.id, identity)).toBe(true);
     expect(removals).toEqual([]);
   });
 

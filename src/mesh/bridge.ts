@@ -1405,12 +1405,16 @@ export class StoreBridgeSide implements BridgeSide {
       { seen: lease.historySeenFloor },
       ...(onDisk?.rootId === lease.rootId ? [{ tokens: onDisk.bridgeSupersededTokens, seen: onDisk.bridgeSupersededTokenSeen }] : []),
     ]);
-    const keepDiskSample = sameIncarnation && onDisk && (
+    const keepDiskLease = sameIncarnation && onDisk && (
       (replay && (onDisk.mirror?.observedAt ?? onDisk.expiresAt) >= (sample?.observedAt ?? lease.expiresAt)) ||
-      (sample && ((onDisk.mirror?.observedAt ?? -Infinity) >= sample.observedAt ||
+      (sample ? (onDisk.mirror?.observedAt ?? -Infinity) >= sample.observedAt ||
         (onDisk.mirror?.sourceObservedAt === sample.sourceObservedAt &&
-          onDisk.mirror.sourceUpdatedAt === sample.sourceUpdatedAt && onDisk.mirror.sourceExpiresAt === sample.sourceExpiresAt))));
-    let base = keepDiskSample ? { ...lease, ...onDisk } : sameIncarnation && onDisk && !sample ? {
+          onDisk.mirror.sourceUpdatedAt === sample.sourceUpdatedAt && onDisk.mirror.sourceExpiresAt === sample.sourceExpiresAt)
+        // An older unsampled effect must retain the disk lease's whole sample, not just
+        // its timestamps. Preserve legacy ordering before merging history (#1076/#7397).
+        : onDisk.expiresAt > lease.expiresAt ||
+          (onDisk.expiresAt === lease.expiresAt && onDisk.updatedAt === lease.updatedAt)));
+    let base = keepDiskLease ? { ...lease, ...onDisk } : sameIncarnation && onDisk && !sample ? {
       ...lease,
       updatedAt: Math.max(lease.updatedAt, onDisk.updatedAt),
       expiresAt: Math.max(lease.expiresAt, onDisk.expiresAt),

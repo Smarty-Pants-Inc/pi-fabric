@@ -9,6 +9,8 @@ import { Agent } from "@earendil-works/pi-agent-core";
 import { createAssistantMessageEventStream, type AssistantMessage, type Model } from "@earendil-works/pi-ai";
 import type { AgentToolResultMessage } from "../src/agents/types.js";
 import type { FabricExecutionResult } from "../src/execution-service.js";
+import { AgentSpawnForbiddenError } from "../src/agents/spawn-authority.js";
+import { QuickJsRuntime } from "../src/runtime/quickjs-runtime.js";
 import { PrewalkController } from "../src/prewalk/controller.js";
 import { CompactController } from "../src/core/compact-controller.js";
 import { normalizeFabricConfig } from "../src/config.js";
@@ -323,30 +325,97 @@ describe("trajectory executor handoff failure continuation", () => {
     return { ctx, session, ext, controller, invoke };
   };
 
-  it.each(["failed", "succeeded", "aborted", "timed_out", "signal-aborted"] as const)(
+  const earlyRefusal = (adjust?: (run: FabricExecutionResult) => void) => {
+    const h = prepare();
+    const runs: FabricExecutionResult[] = [];
+    const state = {
+      pi: h.ext.value, config: normalizeFabricConfig({}), prewalk: h.controller,
+      ensure: async () => {},
+      execution: { execute: async ({ code }: { code: string }) => {
+        const audits: FabricExecutionResult["audits"] = [];
+        // Exercise the actual host-error bridge and final QuickJS serialization,
+        // including guest catch/rethrow behavior; do not fabricate matching logs.
+        const sandbox = await new QuickJsRuntime().execute(code, async ref => {
+          if (ref !== "agents.handoff" && ref !== "agents.spawn") throw new Error(`Unexpected call: ${ref}`);
+          const error = new AgentSpawnForbiddenError();
+          audits.push({ ref, nestedToolCallId: `refused-${audits.length}`, startedAt: 1,
+            success: false, errorCode: error.code });
+          throw error;
+        }, { timeoutMs: 5_000, memoryLimitBytes: 32 * 1024 * 1024 });
+        const run = execution();
+        run.success = sandbox.terminationReason === "completed";
+        run.value = sandbox.value;
+        run.logs = sandbox.logs;
+        if (sandbox.error !== undefined) run.error = sandbox.error;
+        run.audits = audits;
+        run.trace = { ...run.trace, outcome: sandbox.terminationReason === "completed" ? "succeeded"
+          : sandbox.terminationReason === "runtime_error" ? "failed" : sandbox.terminationReason };
+        adjust?.(run);
+        runs.push(run);
+        return run;
+      } },
+      claimHandoff: async () => undefined,
+    } as unknown as FabricState;
+    const tool = createFabricExecTool(state, defaultCodePreviewSettings(), new Map(), value => value);
+    const ctx = Object.assign(Object.create(h.ctx.value), {
+      tools: [], executeTool: async () => { throw new Error("unexpected nested host call"); },
+    });
+    return { ...h, runs, tool, ctx };
+  };
+
+  it.each([
+    ["uncaught refusal", "await agents.handoff({});", true],
+    ["rethrow of the typed refusal", "try { await agents.handoff({}); } catch (error) { throw error; }", true],
+    ["caught refusal then success", "try { await agents.handoff({}); } catch {} return 1;", false],
+    ["caught refusal then unrelated error", "try { await agents.handoff({}); } catch {} throw new Error('unrelated');", false],
+    ["refusal mentioned only in unrelated error prose", "try { await agents.handoff({}); } catch {} throw new Error('AgentSpawnForbiddenError FABRIC_AGENT_SPAWN_FORBIDDEN');", false],
+    ["unrelated error spoofing the refusal name", "try { await agents.handoff({}); } catch {} const error = new Error('unrelated'); error.name = 'AgentSpawnForbiddenError'; throw error;", false],
+    ["refusal mentioned only in a thrown string", "try { await agents.handoff({}); } catch {} throw 'AgentSpawnForbiddenError FABRIC_AGENT_SPAWN_FORBIDDEN';", false],
+    ["refusal wrapped as an unrelated error cause", "try { await agents.handoff({}); } catch (error) { throw new Error('unrelated', { cause: error }); }", false],
+    ["refusal nested in an object", "try { await agents.handoff({}); } catch (error) { throw { cause: { name: error.name } }; }", false],
+    ["spawn refusal without a handoff audit", "await agents.spawn({});", false],
+  ] as const)("early recovery handles %s", async (_name, code, recover) => {
+    const h = earlyRefusal();
+    h.controller.arm({ mode: "trajectory", model: "anthropic/executor", sessionId: "session-1" });
+    await h.tool.execute("early-refusal", { code }, undefined, undefined, h.ctx);
+    expect(h.runs[0]!.audits).toHaveLength(1);
+    if (recover) {
+      // Pin the actual runtime envelope consumed by the exact terminal decoder.
+      const refusal = new AgentSpawnForbiddenError();
+      expect(JSON.parse(h.runs[0]!.error!)).toMatchObject({ name: refusal.name, message: refusal.message });
+      expect(h.ext.sendMessage).toHaveBeenCalledTimes(1);
+      expect(h.ext.sendMessage.mock.calls[0]![1]).toEqual({ deliverAs: "steer", triggerTurn: true });
+      expect(h.controller.status().state).toBe("idle");
+      await h.tool.execute("early-refusal-again", { code: `${code}\n// second invocation` }, undefined, undefined, h.ctx);
+      expect(h.ext.sendMessage).toHaveBeenCalledTimes(1);
+      expect(h.ext.value.appendEntry).toHaveBeenCalledTimes(1);
+    } else {
+      expect(h.ext.sendMessage).not.toHaveBeenCalled();
+      expect(h.ext.value.appendEntry).not.toHaveBeenCalled();
+      expect(h.controller.status().state).toBe("armed");
+    }
+  });
+
+  it("rejects a conflicting code in the structured final refusal wrapper", async () => {
+    const h = earlyRefusal(run => {
+      run.error = JSON.stringify({ ...JSON.parse(run.error!), code: "UNRELATED_FAILURE" });
+    });
+    await h.tool.execute("conflicting-refusal", { code: "await agents.handoff({});" }, undefined, undefined, h.ctx);
+    expect(h.ext.sendMessage).not.toHaveBeenCalled();
+    expect(h.ext.value.appendEntry).not.toHaveBeenCalled();
+  });
+
+  it.each(["failed", "succeeded", "aborted", "timed_out", "signal-aborted", "inconsistent-success"] as const)(
     "early task-spawn refusal respects the outer %s outcome", async outcome => {
-      const h = prepare();
-      const run = execution();
-      run.success = outcome === "succeeded";
-      run.trace = { ...run.trace, outcome: outcome === "signal-aborted" ? "failed" : outcome };
-      run.audits = [{ ref: "agents.handoff", nestedToolCallId: "refused", startedAt: 1,
-        success: false, errorCode: "FABRIC_AGENT_SPAWN_FORBIDDEN" }];
-      const state = {
-        pi: h.ext.value, config: normalizeFabricConfig({}), prewalk: h.controller,
-        ensure: async () => {}, execution: { execute: async () => run },
-        claimHandoff: async () => undefined,
-      } as unknown as FabricState;
-      const tool = createFabricExecTool(state, defaultCodePreviewSettings(), new Map(), value => value);
-      const ctx = Object.assign(Object.create(h.ctx.value), {
-        tools: [], executeTool: async () => { throw new Error("unexpected nested host call"); },
+      const h = earlyRefusal(run => {
+        run.success = outcome === "succeeded" || outcome === "inconsistent-success";
+        run.trace = { ...run.trace, outcome: outcome === "signal-aborted" || outcome === "inconsistent-success" ? "failed" : outcome };
       });
       const signal = outcome === "signal-aborted" ? AbortSignal.abort() : undefined;
-      await tool.execute("early-refusal", { code: "return 1" }, signal, undefined, ctx);
+      await h.tool.execute("early-refusal", { code: "await agents.handoff({});" }, signal, undefined, h.ctx);
       if (outcome === "failed") {
         expect(h.ext.sendMessage).toHaveBeenCalledTimes(1);
         expect(h.ext.sendMessage.mock.calls[0]![1]).toEqual({ deliverAs: "steer", triggerTurn: true });
-        await tool.execute("early-refusal-again", { code: "return 2" }, undefined, undefined, ctx);
-        expect(h.ext.sendMessage).toHaveBeenCalledTimes(1);
       } else {
         expect(h.ext.sendMessage).not.toHaveBeenCalled();
         expect(h.ext.value.appendEntry).not.toHaveBeenCalled();

@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { syncDirectoryChain } from "../core/atomic-write.js";
+import { detachedPreview } from "../core/preview.js";
 import type { FabricMeshConfig, FabricRetentionConfig } from "../config.js";
 import type { MeshStore } from "../mesh/store.js";
 import { pruneActorRunArchives, pruneActorSessionBackups } from "../storage/retention.js";
@@ -23,7 +24,7 @@ const serializedBytes = (value: unknown): number =>
   Buffer.byteLength(JSON.stringify(value), "utf8");
 
 const truncateUtf8 = (value: string, maxBytes: number, suffix = ""): string => {
-  if (Buffer.byteLength(value, "utf8") <= maxBytes) return value;
+  if (Buffer.byteLength(value, "utf8") <= maxBytes) return detachedPreview(value, value.length);
   const boundedSuffix = Buffer.byteLength(suffix, "utf8") <= maxBytes
     ? suffix
     : truncateUtf8(suffix, maxBytes);
@@ -35,11 +36,11 @@ const truncateUtf8 = (value: string, maxBytes: number, suffix = ""): string => {
     if (Buffer.byteLength(value.slice(0, middle), "utf8") <= available) low = middle;
     else high = middle - 1;
   }
-  return `${value.slice(0, low)}${boundedSuffix}`;
+  return `${detachedPreview(value, low)}${boundedSuffix}`;
 };
 
 const boundedActorText = (value: string, maxBytes: number): string => {
-  if (serializedBytes({ text: value }) <= maxBytes) return value;
+  if (serializedBytes({ text: value }) <= maxBytes) return detachedPreview(value, value.length);
   const suffix = serializedBytes({ text: ACTOR_TRUNCATION_SUFFIX }) <= maxBytes
     ? ACTOR_TRUNCATION_SUFFIX
     : "";
@@ -53,7 +54,7 @@ const boundedActorText = (value: string, maxBytes: number): string => {
       high = middle - 1;
     }
   }
-  return `${value.slice(0, low)}${suffix}`;
+  return `${detachedPreview(value, low)}${suffix}`;
 };
 
 const boundedActorData = (data: unknown, maxBytes: number): unknown => {
@@ -190,7 +191,7 @@ export class ActorLogStore {
     const dataBytes = hasText && hasData ? contentBytes - textBytes : contentBytes;
     if (bounded.text) {
       const contextBounded = bounded.text.length > this.config.eventContextChars
-        ? `${bounded.text.slice(0, this.config.eventContextChars)}${ACTOR_TRUNCATION_SUFFIX}`
+        ? `${detachedPreview(bounded.text, this.config.eventContextChars)}${ACTOR_TRUNCATION_SUFFIX}`
         : bounded.text;
       bounded.text = boundedActorText(contextBounded, textBytes);
     }

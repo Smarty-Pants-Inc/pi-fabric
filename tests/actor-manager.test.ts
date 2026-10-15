@@ -26,9 +26,9 @@ import { actorParticipantRecord } from "../src/topology/records.js";
 import { writeParticipantFile } from "../src/topology/participant-files.js";
 import { LIVENESS_POLICY_KEY, writeHostLease } from "../src/topology/host-leases.js";
 
-// smarty-dev#1031: off Linux no root actor tree deletion runs (no Main publication fence, smarty-dev#8090;
-// follow-up smarty-dev#11335). An accepted removal resolves pending with this refusal and keeps the tree.
-const rootTreeDeletionRefused = process.platform !== "linux";
+// smarty-dev#1031: Linux, Darwin and Windows support the Main publication fence (smarty-dev#8090;
+// follow-up smarty-dev#11335). Only unsupported platforms resolve pending with this refusal and keep the tree.
+const rootTreeDeletionRefused = process.platform !== "linux" && process.platform !== "darwin" && process.platform !== "win32";
 const refusedRemoval = (rootId = "session:test") => ({
   removed: true,
   cleaned: false,
@@ -95,8 +95,8 @@ const setup = (
     {
       actorRoot: path.join(root, "actors"),
       persistent,
-      // #11335 is a deterministic refusal off Linux; bound retries without changing Linux backoff.
-      ...(process.platform !== "linux" ? { removalRetryMs: 1 } : {}),
+      // #11335 is a deterministic refusal only on unsupported platforms; keep supported-platform backoff.
+      ...(rootTreeDeletionRefused ? { removalRetryMs: 1 } : {}),
       ...(canManageActor ? { canManageActor } : {}),
       ...(snapshotActorOwnership ? { snapshotActorOwnership } : {}),
       ...(acquireCapabilityView ? { acquireCapabilityView } : {}),
@@ -3506,7 +3506,8 @@ describe("ActorManager", () => {
     expect(notices()).toEqual([]);
     await actors.ask(actor.id, "FAIL_DIRECTIVE");
     expect(notices()).toEqual([expect.stringContaining(`actor supervisor failed its last ${ACTOR_FAILURE_NOTICE_AFTER} activations`)]);
-    expect(notices()[0]).toContain("Structured agent output was invalid");
+    expect(notices()[0]).toContain("Failure code: unknown");
+    expect(notices()[0]).not.toContain("Structured agent output was invalid");
     expect(actors.status(actor.id).activationBlocked).toMatchObject({ code: "unknown", count: ACTOR_FAILURE_NOTICE_AFTER });
     await waitFor(() => mesh.read({ topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, limit: 20 }).length === 1);
     await actors.ask(actor.id, "FAIL_DIRECTIVE");
@@ -3866,10 +3867,12 @@ describe("ActorManager", () => {
     }
     expect(actors.status(actor.id).activationBlocked).toMatchObject({ reason, code, count: ACTOR_FAILURE_NOTICE_AFTER, since: expect.any(Number) });
     await waitFor(() => mesh.read({ topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, limit: 20 }).length === 1);
-    // smarty-dev#10067 P2-2: the owner alarm carries the fixed code, not the error text; the Main notice keeps the text.
+    // smarty-dev#12512: both the mesh alarm and Main notice carry fixed codes, never the raw error.
     expect(mesh.read({ topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, limit: 20 })[0]!.data).toMatchObject({ reason: code, code });
     expect(deliveries.filter(text => text.startsWith("Fabric host notice:"))).toHaveLength(1);
-    expect(deliveries.find(text => text.startsWith("Fabric host notice:"))).toContain(`Last error: ${reason}`);
+    const notice = deliveries.find(text => text.startsWith("Fabric host notice:"));
+    expect(notice).toContain(`Failure code: ${code}`);
+    expect(notice).not.toContain(reason);
   });
 
   it("settles restored failed activation asks and callerless work without stranded in-flight items", async () => {
@@ -4131,13 +4134,15 @@ describe("ActorManager", () => {
       expect(restored.status(actor.id)).not.toHaveProperty("activationBlockExpired");
     }, 60_000);
 
-    it("records the classification on the owner alarm", async () => {
+    it("keeps the raw classification off the owner alarm", async () => {
       const s = setup(true);
       const actor = await s.actors.create({ name: "alarmed", instructions: "Respond.", responseMode: "text" });
       for (let run = 0; run < ACTOR_FAILURE_NOTICE_AFTER; run++) await failOnce(s.actors, s.agents, actor.id);
       await waitFor(() => s.mesh.read({ topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, limit: 20 }).length === 1);
-      expect(s.mesh.read({ topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, limit: 20 })[0]!.data).toMatchObject({
-        code: "provider-transient", classification: 'transient: provider 5xx or overload (matched ": 502")' });
+      const data = s.mesh.read({ topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, limit: 20 })[0]!.data;
+      expect(data).toMatchObject({ code: "provider-transient", reason: "provider-transient" });
+      expect(data).not.toHaveProperty("classification");
+      expect(JSON.stringify(data)).not.toContain('transient: provider 5xx or overload (matched ": 502")');
     }, 60_000);
 
     it.each([
@@ -4525,7 +4530,8 @@ describe("ActorManager", () => {
     for (let run = 0; run < ACTOR_FAILURE_NOTICE_AFTER; run++) {
       await actors.ask(actor.id, "EMPTY_MESSAGE_DIRECTIVE").catch(() => undefined);
     }
-    expect(notices()).toEqual([expect.stringContaining("missing message text")]);
+    expect(notices()).toEqual([expect.stringContaining("Failure code: unknown")]);
+    expect(notices()[0]).not.toContain("missing message text");
     await actors.ask(actor.id, "all good");                  // a valid message still ends the streak
     for (let run = 0; run < ACTOR_FAILURE_NOTICE_AFTER; run++) {
       await actors.ask(actor.id, "EMPTY_MESSAGE_DIRECTIVE").catch(() => undefined);
@@ -6132,7 +6138,7 @@ describe("ActorManager removal behind an in-flight run", () => {
       expect(saved.actors[0].id).toBe(actor.id);
       expect(saved.actors[0].removal).toBeUndefined();
     } finally { synced.mockRestore(); release(); }
-    // smarty-dev#11335: off Linux the retried removal is accepted, then its root tree delete is refused.
+    // smarty-dev#11335: on unsupported platforms the retried removal is accepted, then its root tree delete is refused.
     if (rootTreeDeletionRefused) {
       await expect(actors.remove(actor.id)).resolves.toEqual(refusedRemoval());
     } else {
@@ -6175,9 +6181,9 @@ describe("ActorManager removal behind an in-flight run", () => {
     }
   });
 
-  // smarty-dev#11335: the subject is a failing then retried root tree delete, which never runs off Linux
-  // (refused before any hook or rm, smarty-dev#8090); the refusal itself is asserted in the round 2/3 tests below.
-  it.skipIf(process.platform !== "linux")("retries an accepted removal whose cleanup failed", async () => {
+  // smarty-dev#11335: Linux and Darwin reach the retried tree delete; unsupported platforms refuse first.
+  // Keep the Windows skip: this fault injection relies on POSIX directory permissions.
+  it.skipIf(process.platform === "win32" || rootTreeDeletionRefused)("retries an accepted removal whose cleanup failed", async () => {
     const { actors, agents, root } = setup(true);
     const { release, runId } = hangingRun(agents);
     const actor = await actors.create({ name: "reviewer", instructions: "Review.", responseMode: "text" });
@@ -6198,8 +6204,8 @@ describe("ActorManager removal behind an in-flight run", () => {
   }, 20_000);
 
   // Review round 2 on pi-fabric#160: a waiting remove must not report success after the retries ran out.
-  // smarty-dev#11335: same subject (the delete's retries run out, then succeed); off Linux no delete is attempted.
-  it.skipIf(process.platform !== "linux")("fails a waiting remove whose accepted cleanup never succeeded, and finishes on a later remove", async () => {
+  // smarty-dev#11335: Linux and Darwin reach the delete retries; retain the Windows POSIX-permission skip.
+  it.skipIf(process.platform === "win32" || rootTreeDeletionRefused)("fails a waiting remove whose accepted cleanup never succeeded, and finishes on a later remove", async () => {
     const { agents, root, mesh, identity, meshConfig } = setup(true);
     const actors = new ActorManager("test", identity, mesh, meshConfig, agents, () => {},
       { actorRoot: path.join(root, "actors"), persistent: true, removalRetryMs: 10 });
@@ -6223,8 +6229,8 @@ describe("ActorManager removal behind an in-flight run", () => {
     expect(actors.list()).toEqual([]);
   }, 20_000);
 
-  // smarty-dev#11335: the injected directory/presence failures sit at and after the root tree delete, which off Linux
-  // is refused first (smarty-dev#8090), so neither failure point is reachable and nothing drains on restart.
+  // smarty-dev#11335: Linux, Darwin and Windows reach the injected directory/presence failures at and after
+  // the root tree delete; unsupported platforms refuse first (smarty-dev#8090), so skip only those platforms.
   it.skipIf(rootTreeDeletionRefused).each(["directory", "presence"] as const)("smarty-dev#2339 F1: retains %s cleanup after registry revocation and drains it on restart without deleting a successor", async (failure) => {
     const { actors: initial, agents, root, mesh, identity, meshConfig } = setup(true);
     await initial.close();

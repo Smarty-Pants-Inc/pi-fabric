@@ -1,3 +1,4 @@
+import { detachedPreview } from "../core/preview.js";
 import type {
   SessionEntry,
   SessionMessageEntry,
@@ -151,7 +152,7 @@ const firstLineOf = (text: string): string => {
 };
 
 const truncate = (text: string, max: number): string =>
-  text.length > max ? text.slice(0, max) : text;
+  detachedPreview(text, max);
 
 const clipUtf8 = (text: string, maxBytes: number): string => {
   if (Buffer.byteLength(text, "utf8") <= maxBytes) return text;

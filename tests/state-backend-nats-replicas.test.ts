@@ -19,6 +19,7 @@ const fake = vi.hoisted(() => {
     infoErrors: [] as unknown[],
     infoDelays: [] as number[],
     messageErrors: [] as unknown[],
+    messageDelays: [] as number[],
     consumerErrors: [] as unknown[],
     consumerOptions: [] as unknown[],
     consumerDelays: [] as number[],
@@ -144,7 +145,10 @@ vi.mock("@nats-io/jetstream", async importOriginal => {
       },
       getMessage: async (...args: unknown[]) => {
         fake.log.push({ op: "getMessage", args });
-        if (fake.messageErrors.length > 0) throw fake.messageErrors.shift();
+        const error = fake.messageErrors.shift();
+        const delay = fake.messageDelays.shift() ?? 0;
+        if (delay > 0) await new Promise<void>(resolve => setTimeout(resolve, delay));
+        if (error !== undefined) throw error;
         return undefined;
       },
       purge: async (...args: unknown[]) => { fake.log.push({ op: "purge", args }); throw new Error("fake: purge is not expected"); },
@@ -209,6 +213,7 @@ beforeEach(() => {
   fake.infoErrors.length = 0;
   fake.infoDelays.length = 0;
   fake.messageErrors.length = 0;
+  fake.messageDelays.length = 0;
   fake.consumerErrors.length = 0;
   fake.consumerOptions.length = 0;
   fake.consumerDelays.length = 0;
@@ -355,6 +360,113 @@ describe("NATS client read resilience (pure fakes)", () => {
     fake.publishErrors.push(fake.wrappedTransient());
     const error = await refusal(port.publish("subject", new Uint8Array(), { expectLastSequence: 0, msgID: "id" }));
     expect((error as { transient?: unknown }).transient).toBe(true);
+  });
+});
+
+// #11950/#13112: a finite initial-open reader must not leave SDK retries running after its original waiter.
+// Keep: data safety / late native operations; ordinary reads retain the existing three-attempt path.
+describe("NATS initial history read budget (#11950/#13112)", () => {
+  type Budget = { deadline: number; active: () => boolean };
+  const read = (port: Awaited<ReturnType<typeof connectJetStream>>, budget: Budget) =>
+    (port.getMessage as (stream: string, seq: number, budget?: Budget) => Promise<unknown>)(STREAM, 1, budget);
+  const reads = () => fake.log.filter(entry => entry.op === "getMessage");
+
+  it("caps transient retry backoff at D and never starts a follow-on request", async () => {
+    const port = await connectJetStream(SERVERS, withReplicas(1));
+    fake.messageErrors.push(fake.wrappedTransient());
+    vi.useFakeTimers();
+    try {
+      let settled = false;
+      const result = read(port, { deadline: Date.now() + 50, active: () => true }).then(
+        () => { settled = true; }, () => { settled = true; });
+      await vi.advanceTimersByTimeAsync(49);
+      expect(settled).toBe(false);
+      expect(reads()).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(settled).toBe(true);
+      await result;
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(reads()).toHaveLength(1);
+    } finally { vi.useRealTimers(); await port.close(); }
+  });
+
+  it.each(["resolve", "reject"] as const)("bounds an in-flight GET and observes its late %s without new requests", async completion => {
+    const port = await connectJetStream(SERVERS, withReplicas(1));
+    fake.messageDelays.push(1_000);
+    if (completion === "reject") fake.messageErrors.push(fake.wrappedTransient());
+    vi.useFakeTimers();
+    try {
+      let settled = false;
+      const result = read(port, { deadline: Date.now() + 50, active: () => true }).then(
+        () => { settled = true; }, () => { settled = true; });
+      await vi.advanceTimersByTimeAsync(49);
+      expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(settled).toBe(true);
+      await result;
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(reads()).toHaveLength(1);
+    } finally { vi.useRealTimers(); await port.close(); }
+  });
+
+  it("checks active again after backoff so a live winner prevents a redundant retry", async () => {
+    const port = await connectJetStream(SERVERS, withReplicas(1));
+    fake.messageErrors.push(fake.wrappedTransient());
+    vi.useFakeTimers();
+    try {
+      let active = true;
+      const result = read(port, { deadline: Date.now() + 5_000, active: () => active }).then(() => undefined, () => undefined);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(reads()).toHaveLength(1);
+      active = false;
+      await vi.advanceTimersByTimeAsync(5_001);
+      await result;
+      expect(reads()).toHaveLength(1);
+    } finally { vi.useRealTimers(); await port.close(); }
+  });
+
+  it("rechecks active inside the deferred operation closure, before the SDK call", async () => {
+    const port = await connectJetStream(SERVERS, withReplicas(1));
+    vi.useFakeTimers();
+    try {
+      let active = true;
+      const result = read(port, { deadline: Date.now() + 5_000, active: () => active }).then(() => undefined, () => undefined);
+      active = false; // Synchronous retirement before untilDeadline's request microtask runs.
+      await vi.advanceTimersByTimeAsync(5_001);
+      await result;
+      expect(reads()).toHaveLength(0);
+    } finally { vi.useRealTimers(); await port.close(); }
+  });
+
+  it("does not retry an active permanent GET error", async () => {
+    const port = await connectJetStream(SERVERS, withReplicas(1));
+    fake.messageErrors.push(fake.permissionDenied());
+    await expect(read(port, { deadline: Date.now() + 5_000, active: () => true })).rejects.toMatchObject({ name: "PermissionViolationError" });
+    expect(reads()).toHaveLength(1);
+    await port.close();
+  });
+
+  it("preserves omitted-budget GET retry count/backoff and pending request behavior", async () => {
+    const port = await connectJetStream(SERVERS, withReplicas(1));
+    fake.messageErrors.push(fake.wrappedTransient(), fake.wrappedTransient());
+    vi.useFakeTimers();
+    try {
+      const result = port.getMessage(STREAM, 1);
+      await vi.advanceTimersByTimeAsync(199);
+      expect(reads()).toHaveLength(2);
+      await vi.advanceTimersByTimeAsync(1);
+      await expect(result).resolves.toBeUndefined();
+      expect(reads()).toHaveLength(3);
+      fake.messageDelays.push(1_500);
+      let settled = false;
+      const pending = port.getMessage(STREAM, 1).then(() => { settled = true; });
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(500);
+      await pending;
+      expect(settled).toBe(true);
+      expect(reads()).toHaveLength(4);
+    } finally { vi.useRealTimers(); await port.close(); }
   });
 });
 

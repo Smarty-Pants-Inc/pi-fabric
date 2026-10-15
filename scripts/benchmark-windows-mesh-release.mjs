@@ -5,7 +5,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { parseArgs } from "node:util";
 
@@ -26,8 +26,8 @@ if (process.platform !== "win32" || process.env.GITHUB_ACTIONS !== "true") {
   const hookEntry = path.join(project, "dist/storage/windows-mesh-release.js");
   const { MeshStore } = await import(pathToFileURL(meshEntry).href);
   // The pinned baseline predates this stable entry/hook. Absence is not a measured zero children.
-  const hooks = fs.existsSync(hookEntry)
-    ? (await import(pathToFileURL(hookEntry).href)).windowsMeshReleaseTestHooks : undefined;
+  const releaseAdapter = fs.existsSync(hookEntry) ? await import(pathToFileURL(hookEntry).href) : undefined;
+  const hooks = releaseAdapter?.windowsMeshReleaseTestHooks;
   if (values.label === "candidate" && !hooks) throw new Error("candidate release instrumentation missing");
   const summary = numbers => {
     if (!numbers.length) return null;
@@ -110,6 +110,72 @@ if (process.platform !== "win32" || process.env.GITHUB_ACTIONS !== "true") {
     return { pid: process.pid, sections, children: hooks ? children : null, totalMs, failures,
       nativeHandleCensus: { before, after, delta: after.handleCount - before.handleCount } };
   };
+  // Candidate controller only: a separate fixture after the unchanged serial/contention cohorts.
+  const diagnosePhases = async fixtureRoot => {
+    // Never load diagnostic support in the baseline or workers, or inside any existing measurement envelope.
+    const { PHASE_PAIRS, aggregatePhases, phaseOrder, phaseReports, releaseChildEnv,
+      validateCapability, validateNoopResult, validateReleaseSamples } = await import("./windows-mesh-release-phases.mjs");
+    const pairs = [], warmups = [], failures = [];
+    let capability, store, attribution;
+    const noop = pair => {
+      // Match attempt(): exact captured capability, lstat + rehash immediately BEFORE the timer, never adopt a hash.
+      const stat = fs.lstatSync(capability.absolutePath);
+      if (!stat.isFile() || stat.isSymbolicLink() || digest(capability.absolutePath) !== capability.digest) {
+        throw new Error("diagnostic retained helper no longer matches captured capability");
+      }
+      const started = performance.now();
+      const child = spawnSync(capability.absolutePath, ["--capability-v1"], {
+        timeout: 5000, windowsHide: true, maxBuffer: 4096, env: releaseChildEnv(process.env),
+      });
+      const result = { status: child.status, signal: child.signal, error: child.error?.message ?? null,
+        stdout: Buffer.from(child.stdout ?? []).toString("utf8"), stderr: Buffer.from(child.stderr ?? []).toString("utf8") };
+      try { validateNoopResult(result); }
+      finally {
+        pair.a = { elapsedMs: performance.now() - started, absolutePath: capability.absolutePath, digest: capability.digest, ...result };
+      }
+    };
+    const measurePair = async (target, index) => {
+      const pair = { index, order: phaseOrder(index), a: null, b: [] };
+      target.push(pair); // Keep partial evidence even if correctness fails; never replay an operation.
+      for (const phase of pair.order) {
+        if (phase === "a") noop(pair);
+        else {
+          hooks.afterChild = sample => { pair.b.push({ ...sample }); };
+          try { await store.exclusive(() => undefined); }
+          finally { delete hooks.afterChild; }
+          validateReleaseSamples(pair.b, capability);
+        }
+      }
+    };
+    try {
+      capability = Object.freeze({ ...releaseAdapter.prepareWindowsMeshCapability() });
+      validateCapability(capability, helperSha256);
+      if (hooks.checkpoint || hooks.deadlineMs !== undefined) throw new Error("diagnostic requires default production child envelope");
+      store = new MeshStore(fixtureRoot, 64 * 1024, 500, { lockProtocol: 1, lockTimeoutMs: 30_000 });
+      await measurePair(warmups, 0); // Capability, store and one pair primed outside the measured 100 pairs.
+      for (let i = 0; i < PHASE_PAIRS; i++) await measurePair(pairs, i);
+      attribution = aggregatePhases({ head: values.head, capability, packagedDigest: helperSha256, pairs, warmups });
+    } catch (error) { failures.push(String(error.stack ?? error)); }
+    finally {
+      delete hooks.afterChild;
+      try { store?.closeState(); } catch (error) { failures.push(`diagnostic store close failed: ${error}`); }
+    }
+    let leftovers = [];
+    try {
+      leftovers = fs.existsSync(fixtureRoot) ? fs.readdirSync(fixtureRoot).filter(entry =>
+        entry === ".lock" || entry === "custody.lock" || entry.startsWith("r.") || entry.includes(".released.")) : [];
+      if (leftovers.some(entry => entry === ".lock" || entry === "custody.lock")) failures.push("diagnostic canonical lock residue");
+    } catch (error) { failures.push(`diagnostic residue inspection failed: ${error}`); }
+    attribution ??= { status: "invalid", head: values.head, capability: capability ?? null, pairs,
+      warmups: { capabilityPreparation: "attempted before all measurement timers", pairs: warmups },
+      phases: phaseReports(values.head, capability, "invalid", pairs), heuristic: null, residual: null };
+    if (failures.length) attribution.status = "invalid";
+    for (const phase of Object.values(attribution.phases)) {
+      if (failures.length && phase.phase !== "c") phase.status = "invalid";
+      console.log(`WINDOWS_MESH_RELEASE_PHASE: ${JSON.stringify(phase)}`);
+    }
+    return { ...attribution, fixtureRoot, leftovers, failures };
+  };
   const workerRoot = process.env.FABRIC_RELEASE_BENCH_WORKER_ROOT;
   if (workerRoot) {
     const result = await run(workerRoot, 25);
@@ -177,7 +243,10 @@ if (process.platform !== "win32" || process.env.GITHUB_ACTIONS !== "true") {
       const retirementResidue = leftovers.filter(entry => !canonicalLeftovers.includes(entry));
       const childSummary = samples => hooks ? { status: "instrumented", provenance: "afterChild hook: joined release attempts only; excludes capability-preparation children",
         timing: summary(samples.map(sample => sample.elapsedMs)), samples } : { status: "not-instrumented", timing: null, samples: null };
+      const phaseAttribution = values.label === "candidate" ? await diagnosePhases(path.join(root, "diagnostic")) : null;
+      if (phaseAttribution) failures.push(...phaseAttribution.failures);
       const receipt = {
+        ...(phaseAttribution ? { phaseAttribution } : {}),
         schema: "fabric-windows-mesh-release-benchmark/2", label: values.label, head: values.head, project,
         sampledAtUtc: new Date().toISOString(), runner: { name: process.env.RUNNER_NAME, os: os.release(), arch: process.arch,
           runId: process.env.GITHUB_RUN_ID, attempt: process.env.GITHUB_RUN_ATTEMPT }, runtime: process.version,

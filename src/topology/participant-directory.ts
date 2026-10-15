@@ -92,13 +92,13 @@ const LEGACY_RENEWAL_PREFIXES = [HOST_PREFIX, LEGACY_SESSION_PREFIX, PARTICIPANT
 // list() (the root-collision report) also reads the legacy actor records.
 const ROOT_COLLISION_PREFIXES = [HOST_PREFIX, PARTICIPANT_PREFIX, LEGACY_SESSION_PREFIX, LEGACY_ACTOR_PREFIX] as const;
 /**
- * smarty-dev#11172 (R-no-polling, chief-of-staff ruling): an idle host renews its lease at most once a
- * minute, against a ~180 s TTL (DEFAULT_PARTICIPANT_LEASE_MS). The 1:3 heartbeat:TTL ratio of the old
- * 5 s / 15 s pair is kept, so canConsumeMesh/confirmation (2 heartbeats) stays inside the lease.
+ * smarty-dev#11172 (R-no-polling, chief-of-staff ruling): an idle host renews its lease at most once
+ * every 30 s, against a ~90 s TTL (DEFAULT_PARTICIPANT_LEASE_MS). The 1:3 heartbeat:TTL ratio of
+ * the old 5 s / 15 s pair is kept, so canConsumeMesh/confirmation (2 heartbeats) stays inside the lease.
  */
-export const PARTICIPANT_HEARTBEAT_MS = 60_000;
+export const PARTICIPANT_HEARTBEAT_MS = 30_000;
 /** Default host lease TTL (and capable Main session TTL in its own host file), smarty-dev#11172. */
-export const DEFAULT_PARTICIPANT_LEASE_MS = 180_000;
+export const DEFAULT_PARTICIPANT_LEASE_MS = 90_000;
 /**
  * The old 5 s cadence, used only while a live pre-capability reader needs the fixed 15 s `sessions/`
  * TTL (LEGACY_ROOT_LEASE_MS): a deadline-bounded one-shot timer, never an idle poll (smarty-dev#11172).
@@ -717,6 +717,25 @@ export const isStaleExtensionContextError = (error: unknown): boolean =>
 
 export type ParticipantSnapshotSource = () => FabricParticipantRecord[];
 
+/** The ownership map may carry the exact expiry observed while it was prepared for polling. */
+export interface ActorOwnershipMap extends ReadonlyMap<string, boolean> {
+  observedDeadline(actorIds?: Iterable<string>): number;
+}
+
+const ownershipMap = (
+  entries: Iterable<readonly [string, boolean]>,
+  observation?: ActorOwnershipObservation,
+): ActorOwnershipMap => {
+  const map = new Map(entries) as unknown as ActorOwnershipMap;
+  const deadline = observation?.deadline() ?? Number.POSITIVE_INFINITY;
+  Object.defineProperty(map, "observedDeadline", { value: (actorIds?: Iterable<string>): number => {
+    if (!observation || actorIds === undefined) return deadline;
+    observation.scope(actorIds);
+    return observation.deadline();
+  } });
+  return map;
+};
+
 type RemoteMirrorLease = { state: "none" } | { state: "ended" } | {
   state: "live" | "expired" | "lapsed"; ownerHostId: string; ownerIdentityId: string; rootId: string;
   remoteHost: string; expiresAt: number; mirror?: FabricMirrorLease; bridgeStale?: true;
@@ -881,7 +900,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
   }
 
   /**
-   * smarty-dev#11172: an old reader that joins between our 60 s heartbeats needs our fixed-TTL
+   * smarty-dev#11172: an old reader that joins between our 30 s heartbeats needs our fixed-TTL
    * `sessions/` entry within its 15 s. Old releases always commit mesh state (their host record and
    * `sessions/` entry), so a commit notification wakes one check: the root watch on the exact files
    * the backends commit (file: the `state.json` rename; SQLite: `state.db`/`-wal`/`-journal`) plus the
@@ -894,7 +913,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     const wake = (): void => this.#joinCheck();
     let watcher: fs.FSWatcher | undefined;
     let stopped = false;
-    // The watch is the required cross-process carrier (file/SQLite): the default 60 s heartbeat is
+    // The watch is the required cross-process carrier (file/SQLite): the default 30 s heartbeat is
     // only safe beside an old reader's 15 s TTL while it works. No timer and no polling replace it:
     // a failed registration retries once synchronously, a lost watch re-registers once, then fail closed.
     const register = (): fs.FSWatcher => {
@@ -940,7 +959,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
 
   /**
    * The join carrier failed twice: stop serving the long-heartbeat compatibility guarantee rather
-   * than leave a 15 s `sessions/` entry advertised with a 60 s refresh. The heartbeat stops (the
+   * than leave a 15 s `sessions/` entry advertised with a 30 s refresh. The heartbeat stops (the
    * entries lapse with their TTLs), mesh consumption is fenced, and the owner hears it once
    * through the existing lifecycle-lost path. A live rebind (resume/start) arms afresh.
    */
@@ -1966,7 +1985,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
    * observation then never validates, so such a poll always lists. Validation, not authority:
    * admission, custody and commit fences call with fresh=true.
    */
-  actorOwnership(localHostId: string, options: { fresh?: boolean; actorIds?: Iterable<string> | undefined } = {}): ReadonlyMap<string, boolean> {
+  actorOwnership(localHostId: string, options: { fresh?: boolean; actorIds?: Iterable<string> | undefined } = {}): ActorOwnershipMap {
     const fresh = options.fresh === true;
     const ids = !fresh && options.actorIds ? new Set(options.actorIds) : undefined;
     const cached = this.#pollOwnership;
@@ -1975,7 +1994,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       try { cached.observation.scope(ids); valid = cached.observation.unchanged(); } catch { valid = false; }
       // Only the validated (scoped) ids: an unscoped entry of the old map is unobserved and could
       // resurrect ownership that moved; absent ids have no directory opinion.
-      if (valid) return new Map([...ids].flatMap((id) => cached.map.has(id) ? [[id, cached.map.get(id)!] as const] : []));
+      if (valid) return ownershipMap([...ids].flatMap((id) => cached.map.has(id) ? [[id, cached.map.get(id)!] as const] : []), cached.observation);
     }
     if (!fresh) this.#pollOwnership = undefined;
     // Observe BEFORE the decision (observeActorOwnership contract): a change in between invalidates.
@@ -2006,8 +2025,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
     };
     const listed = this.list({ scope: "project", ...(fresh ? { fresh: true } : {}) });
     const map = toMap(listed);
-    if (!ids || !observation) return map;
-    if (!exactFor(listed, { fresh: false })) return map;
+    if (!ids || !observation) return ownershipMap(map);
+    if (!exactFor(listed, { fresh: false })) return ownershipMap(map, observation);
     // The non-fresh list may come from a parse cached BEFORE the observation (listReadCacheMs):
     // its map need not correspond to the observed facts. Arm only from a list read AFTER the
     // observation (fresh), re-checked for exactness on a fresh parse, and only if the observed
@@ -2018,9 +2037,9 @@ export class ParticipantDirectory implements FabricParticipantSource {
       const freshListed = this.list({ scope: "project", fresh: true });
       if (exactFor(freshListed, { fresh: true }) && observation.unchanged()) armed = toMap(freshListed);
     } catch { armed = undefined; }
-    if (!armed) return map;
+    if (!armed) return ownershipMap(map, observation);
     this.#pollOwnership = { hostId: localHostId, ids, map: armed, observation };
-    return armed;
+    return ownershipMap(armed, observation);
   }
 
   get(id: string, now = Date.now(), options: { fresh?: boolean } = {}): FabricParticipantInfo | undefined {
@@ -3098,8 +3117,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
    * reloading Main from every listing until the commit landed, 10-55 s under lock load. Keep it.
    * Its reloadUntil still bounds the listing if this release never commits.
    * The predecessor's own recorded expiry decides, not a relation to this release's #leaseMs: a
-   * fixed 180 s reload lease never outlasts leaseMs >= 180 s (or heartbeatMs >= 90 s), which made
-   * the guard dead under that config (#663 round 2). Before this incarnation's host record commits,
+   * fixed Main reload lease may outlast the current leaseMs, so this guard must not infer it from
+   * the heartbeat/lease ratio (#663 round 2). Before this incarnation's host record commits,
    * its own lease file pairs with no host record. Keep only a matching predecessor's reload
    * lease, never an ordinary heartbeat or a lease after our own host record has committed.
    * Reload is explicit in new leases; older leases extended the fixed Main session TTL.

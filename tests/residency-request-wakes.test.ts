@@ -2,11 +2,12 @@
 // Named E2E: idle-wakes main/resident, owner fv2-11172wake/event-lead; PASS is <=1 wake/s and no call
 // site above 1/min. These unit probes pin the host's event-driven request queue and deadline maintenance.
 import fs from "node:fs";
+import { EventEmitter } from "node:events";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
-import { ResidentHost } from "../src/residency/host.js";
+import { ResidentHost, RESIDENT_REQUEST_RECONCILE_MS } from "../src/residency/host.js";
 import {
   RESIDENT_HOST_FORMAT, residentDeliveryPrefix, residentHostId, type ResidentDeliveryRecord, type ResidentHostConfig,
 } from "../src/residency/protocol.js";
@@ -74,7 +75,7 @@ const within = <T>(work: Promise<T>, ms: number) =>
   Promise.race([work.then(value => ({ value }), (error: unknown) => ({ error })), sleep(ms).then(() => "hung" as const)]);
 
 describe("event-driven resident request queue (smarty-dev#11172)", () => {
-  it("picks a request up from a real requests/ watch within 50 ms, with no poll timer", async () => {
+  it("picks a request up from a real requests/ watch within 50 ms, with no tight poll timer", async () => {
     const { host, requests, responses } = fixture();
     await host.start();
     await sleep(200); // startup drains and the first maintenance pass settle
@@ -93,6 +94,38 @@ describe("event-driven resident request queue (smarty-dev#11172)", () => {
     expect(latencies[2]).toBeLessThan(50);
     expect(intervals.mock.calls.filter(([, ms]) => ms === 50)).toHaveLength(0);
     expect(timeouts.mock.calls.filter(([, ms]) => ms === 50)).toHaveLength(0);
+  });
+
+  it("drains a request missed by fs.watch after one slow reconciliation period and clears the timer on close", async () => {
+    const { host, requests, responses } = fixture();
+    const watch = fs.watch;
+    vi.spyOn(fs, "watch").mockImplementation(((target: fs.PathLike, ...rest: unknown[]) => {
+      if (String(target) === requests) {
+        // Simulate a healthy watcher that silently misses this request-file event.
+        const watcher = new EventEmitter() as unknown as fs.FSWatcher;
+        watcher.close = (() => { watcher.emit("close"); return watcher; }) as fs.FSWatcher["close"];
+        return watcher;
+      }
+      return (watch as (...args: unknown[]) => fs.FSWatcher)(target, ...rest);
+    }) as typeof fs.watch);
+    const intervals = vi.spyOn(globalThis, "setInterval");
+    const clear = vi.spyOn(globalThis, "clearInterval");
+    await host.start();
+    await sleep(200); // settle the startup drain before creating an unwatched request
+    expect(RESIDENT_REQUEST_RECONCILE_MS).toBe(300_000);
+    const ticks = intervals.mock.calls.flatMap(([callback, ms], index) =>
+      ms === RESIDENT_REQUEST_RECONCILE_MS ? [{ callback, timer: intervals.mock.results[index]!.value }] : []);
+    expect(ticks).toHaveLength(1);
+    submit(requests, "missed-event");
+    await sleep(100);
+    expect(pending(requests)).toBe(1);
+    expect(answered(responses, ["missed-event"])).toBe(false);
+    // Expire one five-minute period through the existing timer-spy seam, without waiting five minutes.
+    (ticks[0]!.callback as () => void)();
+    expect(await waitUntil(() => answered(responses, ["missed-event"]))).toBe(true);
+    expect(pending(requests)).toBe(0);
+    await host.close();
+    expect(clear).toHaveBeenCalledWith(ticks[0]!.timer);
   });
 
   it("drains a startup backlog and a concurrent burst larger than one 32-entry pass", async () => {

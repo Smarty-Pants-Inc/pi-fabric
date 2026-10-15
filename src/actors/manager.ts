@@ -166,6 +166,11 @@ interface SettledWindow {
   timer?: NodeJS.Timeout;
 }
 
+interface ActorOwnershipSnapshot extends ReadonlyMap<string, boolean> {
+  /** Earliest lease/reload deadline from the observation that produced this poll map. */
+  observedDeadline?(actorIds?: Iterable<string>): number;
+}
+
 interface ManagedActor {
   id: string;
   name: string;
@@ -793,6 +798,7 @@ export class ActorManager {
   readonly #canManageActor: ((id: string, fresh?: boolean) => boolean | undefined) | undefined;
   readonly #snapshotActorOwnership: ((fresh?: boolean, actorIds?: readonly string[]) => ReadonlyMap<string, boolean>) | undefined;
   #directoryOwnership: ReadonlyMap<string, boolean> | undefined;
+  #directoryOwnershipDeadline = Number.POSITIVE_INFINITY;
   /** A poll map's exact requested ids; an id outside them has no opinion there, not "no owner" (fv2-11107 F1). */
   #directoryOwnershipScope: ReadonlySet<string> | undefined;
   #directoryLineages: Map<string, boolean> | undefined;
@@ -811,6 +817,7 @@ export class ActorManager {
   readonly #meshMonitor: ActorMeshMonitor;
   readonly #ownershipWatchCloses: Array<() => void> = [];
   #ownershipRecoveryTimer: NodeJS.Timeout | undefined;
+  #ownershipRecoveryAt: number | undefined;
   readonly #records = new Map<string, ActorRecords>();
   readonly #relayParticipantSteering: boolean;
   readonly #deadSessionReap: boolean | { deadAfterMs: number };
@@ -1169,7 +1176,7 @@ export class ActorManager {
     const wake = (): void => this.#meshMonitor.maintain();
     const failed = (error: unknown): void => {
       if (this.#closing) return;
-      console.warn(`[pi-fabric] actor ownership notifications unavailable; recovering once a minute: ${errorText(error)}`);
+      console.warn(`[pi-fabric] actor ownership notifications unavailable; recovering at observed lease expiry: ${errorText(error)}`);
       this.#meshMonitor.watchUnavailable();
     };
     try {
@@ -1195,24 +1202,41 @@ export class ActorManager {
     wake();
   }
 
-  #armOwnershipRecovery(): void {
+  #armOwnershipRecovery(fresh = true): void {
     // A crash emits no file edge, and lineageAlive exposes neither a death subscription nor
-    // a lease deadline. Only adoption-eligible foreign lineages need this <=1/min safety net.
-    const waiting = this.#persistent && !!this.#canManageActor && !this.#closing &&
-      [...this.#actors.values()].some(actor => actor.rootId !== this.#rootId &&
-        actor.residency === this.#claimResidency &&
-        (actor.project === undefined || actor.project === this.#project && this.#role === "project-agent"));
-    if (!waiting && this.#ownershipRecoveryTimer) {
-      clearInterval(this.#ownershipRecoveryTimer);
+    // a lease deadline. Only adoption-eligible foreign lineages need a one-shot wake at the
+    // expiry observed by the participant-directory poll map.
+    const eligible = [...this.#actors.values()].filter(actor => actor.rootId !== this.#rootId &&
+      actor.residency === this.#claimResidency &&
+      (actor.project === undefined || actor.project === this.#project && this.#role === "project-agent"));
+    const waiting = this.#persistent && !!this.#canManageActor && !this.#closing && eligible.length > 0;
+    if (!waiting) {
+      if (this.#ownershipRecoveryTimer) clearTimeout(this.#ownershipRecoveryTimer);
       this.#ownershipRecoveryTimer = undefined;
+      this.#ownershipRecoveryAt = undefined;
+      return;
     }
-    if (waiting && !this.#ownershipRecoveryTimer) {
-      this.#ownershipRecoveryTimer = setInterval(() => {
-        this.#armOwnershipRecovery();
-        if (this.#ownershipRecoveryTimer) this.#meshMonitor.maintain();
-      }, 60_000);
-      this.#ownershipRecoveryTimer.unref();
+    // Fresh authority reads have no poll observation. Keep the last observed deadline;
+    // only a new poll observation may replace it (or clear it when no deadline remains).
+    if (fresh) return;
+    const snapshot = this.#directoryOwnership as ActorOwnershipSnapshot | undefined;
+    const ids = eligible.map(actor => actor.id);
+    const observedDeadline = snapshot?.observedDeadline?.(ids);
+    if (observedDeadline === undefined || !Number.isFinite(observedDeadline) || observedDeadline < Date.now()) {
+      if (this.#ownershipRecoveryTimer) clearTimeout(this.#ownershipRecoveryTimer);
+      this.#ownershipRecoveryTimer = undefined;
+      this.#ownershipRecoveryAt = undefined;
+      return;
     }
+    if (this.#ownershipRecoveryTimer && this.#ownershipRecoveryAt === observedDeadline) return;
+    if (this.#ownershipRecoveryTimer) clearTimeout(this.#ownershipRecoveryTimer);
+    this.#ownershipRecoveryAt = observedDeadline;
+    this.#ownershipRecoveryTimer = setTimeout(() => {
+      this.#ownershipRecoveryTimer = undefined;
+      this.#ownershipRecoveryAt = undefined;
+      if (!this.#closing) this.#meshMonitor.maintain();
+    }, Math.min(2_147_483_647, Math.max(1, observedDeadline + 1 - Date.now())));
+    this.#ownershipRecoveryTimer.unref();
   }
 
   subscribe(listener: () => void): () => void {
@@ -3858,8 +3882,9 @@ export class ActorManager {
   }
 
   async #close(): Promise<void> {
-    if (this.#ownershipRecoveryTimer) clearInterval(this.#ownershipRecoveryTimer);
+    if (this.#ownershipRecoveryTimer) clearTimeout(this.#ownershipRecoveryTimer);
     this.#ownershipRecoveryTimer = undefined;
+    this.#ownershipRecoveryAt = undefined;
     for (const close of this.#ownershipWatchCloses.splice(0)) close();
     this.#meshMonitor.close();
     // Join native watch closes before any owned file can be released.
@@ -8346,9 +8371,15 @@ export class ActorManager {
     const scope = fresh ? undefined : new Set(this.#actors.keys());
     this.#directoryOwnership = scope ? this.#snapshotActorOwnership(false, [...scope]) : this.#snapshotActorOwnership(true);
     this.#directoryOwnershipScope = scope;
+    this.#directoryOwnershipDeadline = (this.#directoryOwnership as ActorOwnershipSnapshot).observedDeadline?.() ?? Number.POSITIVE_INFINITY;
     this.#directoryLineages = new Map();
     try { return operation(); }
-    finally { this.#directoryOwnership = undefined; this.#directoryOwnershipScope = undefined; this.#directoryLineages = undefined; }
+    finally {
+      this.#directoryOwnership = undefined;
+      this.#directoryOwnershipScope = undefined;
+      this.#directoryOwnershipDeadline = Number.POSITIVE_INFINITY;
+      this.#directoryLineages = undefined;
+    }
   }
 
   #ownershipDecision(id: string, fresh = true): boolean {
@@ -8367,8 +8398,8 @@ export class ActorManager {
     if (this.#directoryOwnership && this.#directoryOwnershipScope && !this.#directoryOwnershipScope.has(id)) {
       try { return this.#canManageActor?.(id, true) === true; } catch { return false; }
     }
-    const decision = this.#directoryOwnership ? this.#directoryOwnership.get(id)
-      : fresh ? this.#canManageActor?.(id) : this.#canManageActor?.(id, false);
+    const decision = this.#directoryOwnership && Date.now() < this.#directoryOwnershipDeadline ? this.#directoryOwnership.get(id)
+      : this.#directoryOwnership || fresh ? this.#canManageActor?.(id, true) : this.#canManageActor?.(id, false);
 
     // The participant directory is authoritative when it has a live opinion.
     if (decision === false) return false;
@@ -8426,7 +8457,8 @@ export class ActorManager {
     // A record from before projects were recorded keeps the old rule.
     if (actor.project !== undefined && (this.#project !== actor.project || this.#role !== "project-agent")) return;
     // Only when the directory has no live opinion about the actor itself.
-    if ((this.#directoryOwnership ? this.#directoryOwnership.get(actor.id) : this.#canManageActor(actor.id)) !== undefined) return;
+    if ((this.#directoryOwnership && Date.now() < this.#directoryOwnershipDeadline
+      ? this.#directoryOwnership.get(actor.id) : this.#canManageActor(actor.id)) !== undefined) return;
     // Only when the lineage root itself is provably dead. This refuses
     // lineages a racing winner already claimed and advertised, even when the
     // winner persisted before we loaded and its actor presence has not
@@ -8540,7 +8572,8 @@ export class ActorManager {
   #refreshOwnership(id?: string, fresh = true): void {
     // Registry synchronization runs first on polls. With no local actors there is nothing
     // to fence, adopt or restore, so do not build a fleet-wide ownership snapshot (#2039).
-    if (this.#actors.size === 0 || !this.#canManageActor || this.#reloadingOwnership) return;
+    if (this.#actors.size === 0) { this.#armOwnershipRecovery(); return; }
+    if (!this.#canManageActor || this.#reloadingOwnership) return;
     this.#withOwnershipRead(() => this.#refreshOwnershipNow(id, fresh), fresh);
   }
 
@@ -8568,7 +8601,7 @@ export class ActorManager {
       }
       if (!next) this.#maybeAdoptOrphan(actor);
     }
-    this.#armOwnershipRecovery();
+    this.#armOwnershipRecovery(fresh);
     if (!acquired || !this.#persistent || this.#closing) {
       if (acquired && !this.#closing) queueMicrotask(() => this.#resumeSettledWindows());
       this.#scheduleRestoreParked();

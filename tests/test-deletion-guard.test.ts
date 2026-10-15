@@ -550,12 +550,12 @@ console.log("CONFIG:" + JSON.stringify(out));
 `;
 
 it.each([[undefined, false], ["false", false], ["true", true]] as const)(
-  "vitest.config.ts keeps native/tool, Bun and reverted deletion hosted-only (GITHUB_ACTIONS=%s)", (value, hosted) => {
+  "vitest.config.cts keeps native/tool, Bun and reverted deletion hosted-only (GITHUB_ACTIONS=%s)", (value, hosted) => {
     const env: NodeJS.ProcessEnv = { ...process.env, GITHUB_ACTIONS: value,
       NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ""} --experimental-transform-types` };
     if (value === undefined) delete env.GITHUB_ACTIONS;
     const result = runChild(`config-child-${value}.mjs`, configChild,
-      [new URL("../vitest.config.ts", import.meta.url).href], env);
+      [new URL("../vitest.config.cts", import.meta.url).href], env);
     const line = result.stdout.split(/\r?\n/).find((entry) => entry.startsWith("CONFIG:"));
     expect(line, result.stdout + result.stderr).toBeDefined();
     const output = JSON.parse(line!.slice("CONFIG:".length)) as { include: string[]; exclude: string[];

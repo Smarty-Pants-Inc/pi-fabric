@@ -257,10 +257,10 @@ export const registerIncomingMessageRenderers = (
       for (const id of prior) receipts.add(id);
       const visible = unseenRows(message, all, receipts);
       if (!visible.length) return { render: () => [], invalidate() {} };
-      // A native carrier is the burst boundary. If it mixes a principal reply
-      // with chatter, preserve the entire native rendering rather than clip it,
+      // In the org's own pane, principal replies are the local assistant's, not
+      // incoming carriers. Other panes keep full org/principal-addressed bursts,
       // but never let that fallback restore a delivered shadow filtered above.
-      if (visible.some(row => row.full)) {
+      if (!incomingMessagesCollapsed("auto") && visible.some(row => row.full)) {
         return visible.length === all.length ? undefined : fullCarrier(message, all.filter(row => !visible.includes(row)), theme);
       }
       const first = visible[0]!;

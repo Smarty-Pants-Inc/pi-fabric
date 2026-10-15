@@ -504,7 +504,7 @@ describe("agents provider seeds and confinement", () => {
     } as unknown as FabricParticipantSource;
     const provider = new AgentsProvider(
       manager,
-      {} as ActorManager,
+      { identity: { id: "session:caller-session", kind: "main" } } as ActorManager,
       {} as GlobalActorRegistry,
       {} as FabricMainAgentTarget,
       participants,

@@ -72,6 +72,7 @@ import {
 import { checkedHandoffCompaction } from "../agents/handoff.js";
 import { checkedSeed, completedBranchPrefix, snippetTask } from "../agents/fork-seed.js";
 import { readAgentLineage } from "../agents/child-env.js";
+import { assertAgentSpawnAllowed, snapshotAgentSpawnEnvironment } from "../agents/spawn-authority.js";
 import { childScope, sessionScope } from "../scope.js";
 import { withInheritedSessionPins } from "../agents/session-pins.js";
 import type {
@@ -441,6 +442,7 @@ export class AgentsProvider implements FabricProvider {
   readonly #router: AgentMessageRouter;
   readonly #projectLeadId: string | undefined;
   readonly #taskReturnAddress = readTaskReturnAddress();
+  readonly #spawnEnvironment: NodeJS.ProcessEnv;
   readonly name = "agents";
   /** Session registry of `provider:` participants; stop/steer/followUp route there. */
   providerParticipants: ProviderParticipantRegistry | undefined;
@@ -463,6 +465,7 @@ export class AgentsProvider implements FabricProvider {
     readonly callerThinking: () => string | undefined = () => undefined,
     readonly routeEvaluate: (request: JevRequest, signal: AbortSignal, context: FabricInvocationContext) => Promise<JevResponse> = async () => { throw new Error("Jev routing unavailable"); },
   ) {
+    this.#spawnEnvironment = snapshotAgentSpawnEnvironment();
     this.#projectLeadId = recordedProjectLead(manager.cwd ?? process.cwd());
     this.#router = new AgentMessageRouter(
       manager, actorManager, mainAgent, participants, control,
@@ -729,6 +732,7 @@ export class AgentsProvider implements FabricProvider {
     args: Record<string, unknown>,
     context: FabricInvocationContext,
   ): Promise<Record<string, unknown>> {
+    this.#assertAgentSpawnAllowed();
     context = snapshotFabricInvocation(context);
     const model = typeof args.model === "string" ? args.model.trim() : "";
     if (!model) throw new Error("agents.handoff requires an explicit Pi target model");
@@ -760,6 +764,7 @@ export class AgentsProvider implements FabricProvider {
     context: FabricInvocationContext,
     sessionSeed: AgentSessionSeed,
   ): Promise<Record<string, unknown>> {
+    this.#assertAgentSpawnAllowed();
     context = snapshotFabricInvocation(context);
     const model = typeof args.model === "string" ? args.model.trim() : "";
     if (!model) throw new Error("agents.handoff requires an explicit Pi target model");
@@ -844,6 +849,10 @@ export class AgentsProvider implements FabricProvider {
     }
   }
 
+  #assertAgentSpawnAllowed(): void {
+    assertAgentSpawnAllowed(this.actorManager.identity, this.#spawnEnvironment);
+  }
+
   #mainWaitAtBound(record: object, timeoutMs: number): Record<string, unknown> {
     // The wait ended so Main can see news: held followUps land at this tool boundary.
     this.mainAgent.flushHeldAtNextBoundary?.();
@@ -862,6 +871,9 @@ export class AgentsProvider implements FabricProvider {
   ): Promise<unknown> {
     const checkCommit = (): void => throwIfExecutionExpired(context);
     checkCommit();
+    if (["run", "spawn", "handoff", "create", "createActor", "import", "export"].includes(actionName)) {
+      this.#assertAgentSpawnAllowed();
+    }
     // Only explicit public selections: inherited/default models and existing actors are untouched.
     if (actionName === "run" || actionName === "spawn" || actionName === "create" || actionName === "createActor") {
       const runner = checkedRunner(args.runner, this.manager.config.runner);
@@ -1894,6 +1906,7 @@ export class AgentsProvider implements FabricProvider {
   }
 
   async #createActor(request: FabricActorCreateRequest, context: FabricInvocationContext): Promise<FabricActorInfo> {
+    this.#assertAgentSpawnAllowed();
     const { signal } = context;
     const checkCommit = (): void => throwIfExecutionExpired(context);
     checkCommit();

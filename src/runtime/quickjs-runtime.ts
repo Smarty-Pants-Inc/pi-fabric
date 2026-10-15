@@ -56,6 +56,7 @@ const GUEST_FABRIC_ERROR_NAMES: Readonly<Record<string, string>> = Object.freeze
   FABRIC_PROJECT_AGENT_UNRESOLVED: "FabricProjectAgentUnresolvedError",
   FABRIC_PROJECT_AGENT_AMBIGUOUS: "FabricProjectAgentAmbiguousError",
   FABRIC_PROJECT_LEAD_INVALID: "FabricProjectLeadInvalidError",
+  FABRIC_AGENT_SPAWN_FORBIDDEN: "AgentSpawnForbiddenError",
 });
 const guestFabricErrorMetadata = (error: unknown): Record<string, string | boolean> | undefined => {
   if (!(error instanceof Error)) return undefined;
@@ -70,6 +71,10 @@ const guestFabricErrorMetadata = (error: unknown): Record<string, string | boole
   const name = Object.getOwnPropertyDescriptor(error, "name")?.value;
   if (typeof code !== "string" || !Object.hasOwn(GUEST_FABRIC_ERROR_NAMES, code) || GUEST_FABRIC_ERROR_NAMES[code] !== name) return undefined;
   const metadata: Record<string, string | boolean> = { name, code };
+  if (code === "FABRIC_AGENT_SPAWN_FORBIDDEN") {
+    const launchOutcome = Object.getOwnPropertyDescriptor(error, "launchOutcome")?.value;
+    if (launchOutcome === "unlaunched") metadata.launchOutcome = launchOutcome;
+  }
   const retryable = Object.getOwnPropertyDescriptor(error, "retryable")?.value;
   if (typeof retryable === "boolean") metadata.retryable = retryable;
   if (code === "FABRIC_PARTICIPANT_STALE") {

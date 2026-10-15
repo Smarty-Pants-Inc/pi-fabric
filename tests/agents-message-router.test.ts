@@ -610,12 +610,13 @@ describe.each([false, true])("stale Main name safeguards (files=%s)", (files) =>
       await f.mesh.put({ key: f.key("topology/hosts/"), identity: f.target, value: { ...host, remoteHost: "peer-host" } });
     }
     expect(f.directory.list({ scope: "project", includeStale: true, fresh: true }))
-      .toEqual(expect.arrayContaining([expect.objectContaining({ id: f.target.id, stale: true })]));
+      .toEqual(expect.arrayContaining([expect.objectContaining({ id: f.target.id,
+        ...(state === "mirrored" ? { stale: false, bridgeStale: true } : { stale: true }) })]));
     const request = vi.fn();
     const send = router(unknown, [], { request }, f.directory);
     for (const kind of ["followUp", "steer"] as const) {
       await expect(send.value.routeMessage("lead-example", "must not arrive", undefined, kind))
-        .rejects.toThrow("Unknown Fabric participant: lead-example");
+        .rejects.toThrow(state === "mirrored" ? "peer lease stale; the peer may be live" : "Unknown Fabric participant: lead-example");
     }
     expect(request).not.toHaveBeenCalled();
   });

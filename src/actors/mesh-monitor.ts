@@ -15,7 +15,6 @@ type MonitorCursor = { cursor: number; last?: { sequence: number; id: string } }
  * durable work, so they skip the replay window and are read back from the mesh archive.
  */
 const WORK_TOPIC_PREFIX = "fleet.";
-const isWork = (event: MeshEvent): boolean => event.topic.startsWith(WORK_TOPIC_PREFIX);
 
 /** Owns observation resources and the format-1 cursor, never actor ownership or dispatch policy. */
 export class ActorMeshMonitor {
@@ -67,8 +66,10 @@ export class ActorMeshMonitor {
       canConsumeMesh?: (() => boolean) | undefined;
       /** New admission only; receipt work for an already consumed prefix remains allowed. */
       canAdmit?: (() => boolean) | undefined;
-      /** false: full (retry unchanged); "ignored": no local delivery; true/void: handed on. */
-      onEvent(event: MeshEvent): boolean | void | "ignored";
+      /** Owner-defined durable input also survives replay expiry and archive rewrites. */
+      isDurableWork?: ((event: MeshEvent) => boolean) | undefined;
+      /** "deferred": hold on every topic; false: ordinary queue backpressure; "ignored": no local delivery. */
+      onEvent(event: MeshEvent): boolean | void | "ignored" | "deferred";
       /** The owner's MeshBackgroundRetry outage sink (smarty-dev#8825). */
       outageAlarm?: ((alarm: MeshOutageAlarm) => Promise<unknown> | void) | undefined;
     },
@@ -140,6 +141,10 @@ export class ActorMeshMonitor {
       throw new Error("Actor mesh cursor release readback differs");
     }
     return { format: 1, ...this.#safeCursor, persisted: !!this.callbacks.cursorPath };
+  }
+
+  #isWork(event: MeshEvent): boolean {
+    return event.topic.startsWith(WORK_TOPIC_PREFIX) || this.callbacks.isDurableWork?.(event) === true;
   }
 
   #mayAdmit(): boolean {
@@ -302,11 +307,11 @@ export class ActorMeshMonitor {
           return;
         }
         if (this.#delivered(event)) continue;
-        if (this.#replayFloor !== undefined && event.createdAt < this.#replayFloor && !isWork(event) && !this.callbacks.replayAll) {
+        if (this.#replayFloor !== undefined && event.createdAt < this.#replayFloor && !this.#isWork(event) && !this.callbacks.replayAll) {
           if (typeof event.sequence === "number" && typeof event.id === "string") this.#last = { sequence: event.sequence, id: event.id };
           continue;
         }
-        let accepted: boolean | void | "ignored";
+        let accepted: boolean | void | "ignored" | "deferred";
         try {
           accepted = this.callbacks.onEvent(event);
         } catch (error) {
@@ -327,11 +332,10 @@ export class ActorMeshMonitor {
           this.#safeCursor = { cursor: this.#offset, ...(this.#last ? { last: this.#last } : {}) };
           return;
         }
-        // A receiver that is full holds the event: while catching up, and for work events always
-        // (smarty-dev#754), so work waits for room instead of being dropped.
-        if (accepted === false && (catchingUp || isWork(event) || this.callbacks.replayAll)) {
-          // A full actor queue rejected this event while catching up (smarty-dev#472): keep
-          // the cursor on it and offer it again later; earlier events are already delivered.
+        // Explicit deferral always holds input (including live non-work). Ordinary full
+        // receivers still hold only catch-up/durable work (smarty-dev#472, smarty-dev#754).
+        if (accepted === "deferred" || (accepted === false && (catchingUp || this.#isWork(event) || this.callbacks.replayAll))) {
+          // Keep the cursor on this event and offer it again; earlier events are delivered.
           // The boundary comes from this same read, so a compaction since cannot move it.
           this.#offset = index === 0 ? start : tail.cursors?.[index - 1] ?? start;
           this.#writeCursor(handedOn);
@@ -385,10 +389,10 @@ export class ActorMeshMonitor {
     let handedOn = false;
     for (const event of older) {
       if (!this.#mayAdmit()) return false;
-      if ((isWork(event) || this.callbacks.replayAll) && !this.#delivered(event)) {
+      if ((this.#isWork(event) || this.callbacks.replayAll) && !this.#delivered(event)) {
         const accepted = this.callbacks.onEvent(event);
         if (this.callbacks.canConsumeMesh?.() === false) return false;
-        if (accepted === false) {
+        if (accepted === "deferred" || accepted === false) {
           this.#writeCursor(handedOn);
           return false;
         }

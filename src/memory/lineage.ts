@@ -1,5 +1,5 @@
 import crypto from "node:crypto";
-import fs from "node:fs";
+import { readJsonlRecords } from "./jsonl.js";
 
 export type MemoryBranches = "active" | "all";
 
@@ -40,7 +40,7 @@ const hasParentLink = (
 ): record is PersistedRecord & { id: string; parentId: string | null } =>
   typeof record.id === "string" && (record.parentId === null || typeof record.parentId === "string");
 
-const persistedNodesFromRecords = (records: readonly unknown[]): PersistedNode[] => {
+const persistedNodesFromRecords = (records: Iterable<unknown>): PersistedNode[] => {
   const nodes: PersistedNode[] = [];
   let ordinal = 0;
   for (const value of records) {
@@ -56,22 +56,11 @@ const fingerprint = (branches: MemoryBranches, leafId: string | null, ids: strin
   crypto.createHash("sha256").update(JSON.stringify({ branches, leafId, ids })).digest("hex");
 
 const readPersistedNodes = (sessionFile: string): PersistedNode[] => {
-  let content: string;
   try {
-    content = fs.readFileSync(sessionFile, "utf8");
+    return persistedNodesFromRecords(readJsonlRecords(sessionFile));
   } catch {
     return [];
   }
-  const records: unknown[] = [];
-  for (const line of content.split("\n")) {
-    if (!line.trim()) continue;
-    try {
-      records.push(JSON.parse(line));
-    } catch {
-      continue;
-    }
-  }
-  return persistedNodesFromRecords(records);
 };
 
 const allLineage = (): SessionLineage => ({
@@ -141,7 +130,7 @@ const buildActiveLineage = (nodes: PersistedNode[], liveBranch?: LiveSessionBran
  * leaf semantics applied to already-parsed session records instead of a file.
  */
 export const reconstructRecordsLineage = (
-  records: readonly unknown[],
+  records: Iterable<unknown>,
   branches: MemoryBranches,
   liveBranch?: LiveSessionBranch,
   selectedLeafId?: string | null,

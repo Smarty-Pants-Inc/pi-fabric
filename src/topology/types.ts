@@ -54,6 +54,13 @@ export interface FabricParticipantRecord {
   /** Outside capabilities so old format-1 parsers can read the advertisement. */
   livenessLeaseFiles?: 1;
   status: string;
+  /** Authenticated, capability-free terminal history of a session actor. */
+  stopReason?: "owner-root-gone";
+  ownerRootGoneAt?: number;
+  ownerRootGoneBy?: string;
+  settledAt?: number;
+  retiredAt?: number;
+  retiredBy?: string;
   /** Root records: the writing Main process (pid, host, Linux /proc start ticks), so an operator tool can
    * tell a live Main from a reused pid (smarty-dev#7817). Absent on older writers: identity unavailable. */
   mainProcess?: { pid: number; host: string; startTime?: string };
@@ -96,11 +103,15 @@ export interface FabricParticipantRecord {
    * the name of that host. A routing target only, never a local owner.
    */
   remoteHost?: string;
+  /** Trusted hub link carrying a re-export; remoteHost still names the origin. */
+  bridgeVia?: string;
 }
 
 export interface FabricParticipantInfo extends FabricParticipantRecord {
   local: boolean;
   stale: boolean;
+  /** Retained remote routing attribution; transport freshness is unknown, not owner death. */
+  bridgeStale?: true;
 }
 
 export interface FabricHostRecord {
@@ -116,6 +127,10 @@ export interface FabricHostRecord {
   expiresAt: number;
   /** Set on a host lease that the mesh bridge mirrors from another host's mesh (smarty-dev#2004). */
   remoteHost?: string;
+  /** Trusted hub link carrying a re-export; remoteHost still names the origin. */
+  bridgeVia?: string;
+  /** This projection requires a matching source-clock mirror lease; no legacy expiry fallback. */
+  mirrorLease?: 1;
 }
 
 export interface FabricParticipantListOptions {

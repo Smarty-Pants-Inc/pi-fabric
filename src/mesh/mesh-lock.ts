@@ -68,7 +68,7 @@ const queueWaitersAhead = (root: string, token: string): number | undefined => {
 /** Both canonical mesh and SQLite writers start relative waits after ticket setup. Expiry before any acquisition
  * stays a FIFO refusal: close admission before emitting its separate event, never a contention counter/event. */
 export const createMeshLockAdmission = (root: string, token: string, budgetMs: number,
-  options: { passStalledHead?: boolean } = {}, now: () => number = Date.now) => {
+  options: { passStalledHead?: boolean; stalledHeadBypassLock?: string } = {}, now: () => number = Date.now) => {
   const ticket = new MeshLockTicket(root, token, budgetMs, options);
   const startedAt = now();
   return {
@@ -312,7 +312,8 @@ export class MeshLock {
         // Already replaced/removed, unreadable, or cleanup failed: never delete canonical.
       }
     };
-    const admission = createMeshLockAdmission(this.root, token, waitMs);
+    // smarty-dev#9805: only the canonical mesh lock opts into the early free-lock bypass of a stalled head.
+    const admission = createMeshLockAdmission(this.root, token, waitMs, { stalledHeadBypassLock: this.#lockPath });
     const { ticket, deadline } = admission;
     // The shared admission helper fixes the relative budget only after setup; expiry cannot grant admission.
     try {

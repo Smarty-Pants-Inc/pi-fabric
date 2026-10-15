@@ -5,6 +5,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { writeFileAtomic, syncPathNamespace, requireNamespaceBarrier, syncPathNamespaceDurable } from "../core/atomic-write.js";
 import { meshEventsNotDurable } from "./not-durable.js";
+import { FabricIdempotencyKeyReusedError } from "./control-idempotency.js";
 import { readJsonlPage } from "../log-tail.js";
 import { MeshArchive, MeshArchiveLookupUnavailableError, MeshArchiveRecoveryChanged, type MeshArchiveEntry, type MeshArchiveRecoveryPlan } from "./archive.js";
 import { delay, errorCode, type MeshLock, type MeshStoreContext } from "./mesh-lock.js";
@@ -39,6 +40,8 @@ export interface MeshEvent {
   sequence: number;
   /** Host-only once-publication identity; the provider namespaces trusted component keys. */
   dedupeKey?: string;
+  /** Host-computed semantic body hash; never authority supplied by the wire. */
+  dedupeFingerprint?: string;
   topic: string;
   kind: string;
   from: MeshIdentity;
@@ -70,6 +73,8 @@ export interface MeshPublishInput {
   topic: string;
   /** Host-only durable publication receipt; model-authored provider calls cannot supply it. */
   dedupeKey?: string;
+  /** Host-computed body hash for a keyed publication; exactly 64 lowercase hex characters. */
+  dedupeFingerprint?: string;
   /** Host-only durability fence; batches share this barrier across their prefix. */
   durable?: boolean;
   kind?: string;
@@ -416,6 +421,15 @@ export class EventLog {
     return event;
   }
 
+  /** Called under the mesh lock before any fingerprinted retry can reuse a receipt. */
+  #assertDedupeFingerprint(event: MeshEvent, fingerprint?: string): void {
+    // Generic keyed publishers retain their historical key-only behavior. A fingerprinted
+    // retry cannot treat a legacy receipt without a fingerprint as proof of matching input.
+    if (fingerprint !== undefined && event.dedupeFingerprint !== fingerprint) {
+      throw new FabricIdempotencyKeyReusedError(event.dedupeKey);
+    }
+  }
+
   #removeDedupeIntent(file: string, syncDirectory: ((directory: string) => void) | undefined = syncPathNamespace): void {
     fs.rmSync(file, { force: true });
     (syncDirectory ?? syncPathNamespace)(path.dirname(file));
@@ -443,7 +457,8 @@ export class EventLog {
     }
   }
 
-  #settleDedupeIntent(file: string, dedupeKey?: string, archive?: MeshArchive, after?: AfterUnlock): MeshEvent | undefined {
+  #settleDedupeIntent(file: string, dedupeKey?: string, archive?: MeshArchive, after?: AfterUnlock,
+    fingerprint?: string): MeshEvent | undefined {
     let text: string;
     try { text = fs.readFileSync(file, "utf8"); }
     catch (error) { if (errorCode(error) === "ENOENT") return undefined; throw error; }
@@ -459,6 +474,7 @@ export class EventLog {
     }
     // A crash may also leave both the receipt and its intent. Never replace a receipt.
     const prior = this.#readDedupeReceipt(intent.dedupeKey, !after);
+    if (prior) this.#assertDedupeFingerprint(prior, fingerprint);
     if (prior && after) {
       // The receipt became visible after the first lookup (including a legacy off-lock
       // writer). This confirmation-only path does not install a new receipt.
@@ -472,6 +488,7 @@ export class EventLog {
     }
     const live = prior ? undefined : this.#readEventAtIntent(intent);
     let event = prior ?? live;
+    if (live) this.#assertDedupeFingerprint(live, fingerprint);
     if (!event && intent.archiveDir !== undefined && archive?.dir !== intent.archiveDir) {
       throw new MeshDedupeRecoveryError(`Cannot recover dedupe intent ${intent.dedupeKey}: event archive configuration is unavailable`);
     }
@@ -491,6 +508,7 @@ export class EventLog {
       // A different archived identity positively proves this reservation is absent. Never
       // abort that other event; leave its archive visibility and index intact.
       if (entry && archived?.id === intent.eventId) {
+        this.#assertDedupeFingerprint(archived, fingerprint);
         this.#repairEventLog();
         const lastLive = this.#readLastEventSequence();
         if (lastLive < archived.sequence) {
@@ -559,6 +577,10 @@ export class EventLog {
   #preparePublish(input: MeshPublishInput, batch?: { appendStarted: boolean; bytes: number }, after?: AfterUnlock): () => MeshEvent {
     this.#validateTopic(input.topic);
     if (input.to !== undefined && !input.to.trim()) throw new Error("Mesh recipient is empty");
+    if (input.dedupeFingerprint !== undefined &&
+        (typeof input.dedupeFingerprint !== "string" || !/^[a-f0-9]{64}$/.test(input.dedupeFingerprint) || !input.dedupeKey)) {
+      throw new Error("Mesh dedupe fingerprint must be 64 lowercase hex characters and requires a dedupe key");
+    }
     const principal = input.principal;
     const stamp = typeof input.data === "function" ? input.data as (createdAt: number) => unknown : undefined;
     const fixedData = stamp ? undefined : input.data;
@@ -611,7 +633,8 @@ export class EventLog {
     let encoded: { key: string; fields: string; bytes: number; chars: number; verification: MeshEvent["verification"] } | undefined;
     if (!stamp) {
       const verification = verificationOf(fixedData);
-      const key = input.dedupeKey ? `,"dedupeKey":${JSON.stringify(input.dedupeKey)}` : "";
+      const key = (input.dedupeKey ? `,"dedupeKey":${JSON.stringify(input.dedupeKey)}` : "") +
+        (input.dedupeFingerprint !== undefined ? `,"dedupeFingerprint":${JSON.stringify(input.dedupeFingerprint)}` : "");
       const fields = `,${JSON.stringify({
         topic: input.topic, kind, from,
         ...(principal ? { principal } : {}),
@@ -631,6 +654,7 @@ export class EventLog {
       if (input.dedupeKey) {
         const prior = this.#readDedupeReceipt(input.dedupeKey, !after);
         if (prior) {
+          this.#assertDedupeFingerprint(prior, input.dedupeFingerprint);
           // Receipt-before-unlink crash: the receipt is authoritative; finish cleanup.
           // A single publish confirms the visible receipt and unlinks after release.
           if (after) {
@@ -667,8 +691,11 @@ export class EventLog {
             throw new MeshDedupeRecoveryError("Event archive reboot recovery is unavailable during dedupe recovery", { cause: error });
           }
         }
-        const prior = this.#settleDedupeIntent(intentPath!, input.dedupeKey, archive, after);
-        if (prior) return prior;
+        const prior = this.#settleDedupeIntent(intentPath!, input.dedupeKey, archive, after, input.dedupeFingerprint);
+        if (prior) {
+          this.#assertDedupeFingerprint(prior, input.dedupeFingerprint);
+          return prior;
+        }
       }
       if (archive) {
         this.#recoverArchive(archive, false, prepared, liveCatchUp);
@@ -683,6 +710,7 @@ export class EventLog {
         const event: MeshEvent = {
           id: input.id ?? randomUUID(),
           ...(input.dedupeKey ? { dedupeKey: input.dedupeKey } : {}),
+          ...(input.dedupeFingerprint !== undefined ? { dedupeFingerprint: input.dedupeFingerprint } : {}),
           sequence,
           topic: input.topic,
           kind,
@@ -830,7 +858,7 @@ export class EventLog {
         for (const input of inputs) {
           const outcome = { appendStarted: false, bytes: 0 }, after: AfterUnlock = {};
           try { prepared.push({ commit: this.#preparePublish({ ...input, durable: false }, outcome, after), outcome, after }); }
-          catch (error) { if (!prepared.length) throw error; break; }
+          catch (error) { if (error instanceof FabricIdempotencyKeyReusedError || !prepared.length) throw error; break; }
         }
         events = await this.#lock.withLock(() => {
           const started = performance.now();
@@ -843,6 +871,9 @@ export class EventLog {
                 bytes + 2 * this.maxEventBytes + 1 > this.#retainedEventLogBytes)) break;
             try { events.push(commit()); committed.push(after); bytes += outcome.bytes; }
             catch (error) {
+              // A typed key conflict must not become a successful committed prefix. The outer
+              // catch still confirms any earlier receipts before propagating the refusal.
+              if (error instanceof FabricIdempotencyKeyReusedError) throw error;
               // After append begins, success may be unknown. Stop rather than replay a
               // possibly complete event; a restarted bridge reconciles its committed IDs.
               if (outcome.appendStarted) throw new Error("Mesh batch publication outcome is uncertain; reconcile before retry", { cause: error });

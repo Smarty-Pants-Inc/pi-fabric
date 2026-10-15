@@ -25,6 +25,7 @@ import type { AgentRunRecord } from "../src/agents/types.js";
 import { sweepTempRunRoots } from "../src/storage/retention.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 import { processAlive } from "../src/storage/scratch.js";
+import { fakeManagerHeapWorker } from "./fixtures/manager-heap-probe.js";
 
 const managers: AgentManager[] = [];
 const roots: string[] = [];
@@ -214,16 +215,32 @@ describe("Agent prompt retention at manager close (#11663)", () => {
   it("omits nested task fields on disk and normalizes them only when read", async () => {
     const { manager } = fixture();
     const prompt = "FAIL_DIRECTIVE\nparent-task-sentinel-π\n";
-    const handle = await manager.spawn({ name: "nested privacy control", task: prompt, transport: "process" });
-    await expect(manager.wait(handle.id)).resolves.toMatchObject({ status: "failed" });
+    vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async request => {
+      const transport = await fakeManagerHeapWorker(request);
+      const statusFile = request.workerArguments[request.workerArguments.indexOf("--status-file") + 1]!;
+      const record = { ...JSON.parse(fs.readFileSync(statusFile, "utf8")), status: "failed", error: "privacy control failure", exitCode: 1 };
+      fs.writeFileSync(statusFile, JSON.stringify(record), { mode: 0o600 });
+      const child = path.join(path.dirname(statusFile), "nested", "child");
+      const grandchild = path.join(child, "nested", "grandchild");
+      fs.mkdirSync(grandchild, { recursive: true, mode: 0o700 });
+      for (const [directory, id, task] of [[child, "child", "nested-task-sentinel-λ"], [grandchild, "grandchild", "grandchild-task-sentinel-δ"]] as const) {
+        fs.writeFileSync(path.join(directory, "status.json"), JSON.stringify({ ...record, id, name: "nested neutral name", task, text: "preserved nested diagnostic" }), { mode: 0o600 });
+      }
+      return transport; // All nested prompt fields exist before settlement.
+    });
+    const handle = await manager.spawn({ name: "nested privacy control", task: prompt, transport: "process", extensions: false });
+    const result = await manager.wait(handle.id);
+    expect(result.status).toBe("failed");
     const record = manager.status(handle.id) as AgentRunRecord;
     expect(record.task).toBe(prompt); // Live task policy is unchanged.
+    expect(record.nestedAgents).toEqual(result.nestedAgents);
+    expect(record.nestedAgents![0]!.task).toBe("nested-task-sentinel-λ");
+    expect(record.nestedAgents![0]!.nestedAgents![0]!.task).toBe("grandchild-task-sentinel-δ");
     const child = path.join(path.dirname(record.promptPath!), "nested", "child");
-    const grandchild = path.join(child, "nested", "grandchild");
-    fs.mkdirSync(grandchild, { recursive: true, mode: 0o700 });
-    for (const [directory, id, task] of [[child, "child", "nested-task-sentinel-λ"], [grandchild, "grandchild", "grandchild-task-sentinel-δ"]] as const) {
-      fs.writeFileSync(path.join(directory, "status.json"), JSON.stringify({ ...record, id, name: "nested neutral name", task, text: "preserved nested diagnostic" }), { mode: 0o600 });
-    }
+    fs.writeFileSync(path.join(child, "status.json"), JSON.stringify({ ...record, id: "child", task: "late-task-sentinel", text: "late diagnostic" }));
+    const late = path.join(path.dirname(record.promptPath!), "nested", "late-child");
+    fs.mkdirSync(late);
+    fs.writeFileSync(path.join(late, "status.json"), JSON.stringify({ ...record, id: "late-child", task: "late-task-sentinel", text: "late diagnostic" }));
 
     await manager.close();
     const retained = savedStatus(record.promptPath!);
@@ -232,6 +249,12 @@ describe("Agent prompt retention at manager close (#11663)", () => {
     expectNoRetainedTasks(retained);
     for (const sentinel of ["parent-task-sentinel-π", "nested-task-sentinel-λ", "grandchild-task-sentinel-δ"]) expect(rawStatus(record.promptPath!)).not.toContain(sentinel);
     expect(rawStatus(record.promptPath!)).toContain("preserved nested diagnostic");
+    expect(rawStatus(record.promptPath!)).not.toContain("late diagnostic");
+    expect(rawStatus(record.promptPath!)).not.toContain("late-task-sentinel");
+    expect(retained.nestedAgents?.map(record => record.id)).toEqual(["child"]);
+    const published = JSON.parse(fs.readFileSync(path.join(path.dirname(record.promptPath!), "manager-result.json"), "utf8"));
+    expectNoRetainedTasks(published);
+    expect(published.nestedAgents).toEqual(retained.nestedAgents);
     const reopened = manager.readLog(handle.id).status!;
     expect(reopened.task).toBe("");
     expect(reopened.nestedAgents![0]!.task).toBe("");

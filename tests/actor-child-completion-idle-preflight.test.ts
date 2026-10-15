@@ -155,6 +155,7 @@ it.each([false, true])("wakes a real idle owner and retries a failed durable que
 }, 30_000);
 
 it("releases completion watches on stop, transfer and 200 recorded actor removals without closing the manager", async () => {
+  const portableFence = ["linux", "darwin", "win32"].includes(process.platform);
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "actor-child-watch-lifecycle-"));
   const actorRoot = path.join(root, "actors");
   const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
@@ -206,7 +207,7 @@ it("releases completion watches on stop, transfer and 200 recorded actor removal
       const actor = await create(`churn-${index}`);
       const result = await owner.remove(actor.id);
       expect(result).toMatchObject({ removed: true });
-      if (process.platform !== "linux") {
+      if (!portableFence) {
         expect(result).toMatchObject({ cleaned: false, pending:
           "removal cleanup failed: Root actor tree deletion needs the Main publication fence, " +
           `which this platform (${process.platform}) lacks (smarty-dev#8090); follow-up smarty-dev#11335; ` +
@@ -221,9 +222,9 @@ it("releases completion watches on stop, transfer and 200 recorded actor removal
     owner.listOwned();
     await vi.waitFor(() => expect(live.size).toBe(0), { timeout: 5000, interval: 10 });
     expect(armed).toBeGreaterThanOrEqual(202);
-    // Non-Linux keeps trees/cleanup markers by design (smarty-dev#8090, smarty-dev#11335); Linux records 200 deletes.
+    // Only unsupported platforms keep trees/cleanup markers (smarty-dev#8090, smarty-dev#11335).
     expect(removals.filter(file => /^[a-f0-9]{32}$/.test(path.basename(file))))
-      .toHaveLength(process.platform === "linux" ? 200 : 0);
+      .toHaveLength(portableFence ? 200 : 0);
     expect(owner.status(stopped.id).status).toBe("stopped"); // not manager shutdown
   } finally {
     await owner.close();

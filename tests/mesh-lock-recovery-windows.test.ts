@@ -121,7 +121,10 @@ describe.skipIf(!hosted)(`native Windows mesh C/D recovery (${SKIP})`, () => {
       for (const key of Object.keys(windowsMeshRecoveryTestHooks)) delete (windowsMeshRecoveryTestHooks as Record<string, unknown>)[key];
       for (const key of Object.keys(windowsMeshReleaseTestHooks)) delete (windowsMeshReleaseTestHooks as Record<string, unknown>)[key];
       forgetWindowsMeshCapability();
-      for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
+      for (const dir of dirs.splice(0)) {
+        if (!path.basename(dir).startsWith("fmc-")) throw new Error("unsafe fixture cleanup");
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
     }
   }, 30_000);
 

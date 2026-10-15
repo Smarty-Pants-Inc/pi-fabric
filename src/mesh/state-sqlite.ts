@@ -119,7 +119,7 @@ import { captureStorageDelete, captureStoragePut, storageRevision, type StorageT
 import { encodeMeshStateMovedMarker, isMeshStateMovedMarker, isMeshStateNatsMarker, meshStateMovedToNatsError, readMeshStateMovedMarker } from "./backend-fence.js";
 import { holdMeshFence, holdMeshFenceSync } from "./fence-lock.js";
 import { type MeshLockTicket, meshLockQueueBusy, meshLockQueueDirectory } from "./lock-queue.js";
-import { createMeshLockAdmission } from "./mesh-lock.js";
+import { createMeshLockAdmission, lockStats } from "./mesh-lock.js";
 import { processStartTime, residentProcessAlive } from "../residency/process-identity.js";
 import { verifiedRemove } from "../storage/verified-remove.js";
 // From the domain modules, not the store.ts facade: store.ts loads this module through state-backend.ts (L2a).
@@ -1676,8 +1676,9 @@ export class SqliteStateStore {
             if (headWaitMs > this.#busyTimeoutMs) this.#db.exec(`PRAGMA busy_timeout = ${this.#busyTimeoutMs}`);
           }
           if (begun) {
-            this.#stats.maxWaitMs = Math.max(this.#stats.maxWaitMs, performance.now() - started);
-            this.#window.maxWaitMs = Math.max(this.#window.maxWaitMs, performance.now() - started);
+            const waitMs = performance.now() - started;
+            this.#stats.maxWaitMs = Math.max(this.#stats.maxWaitMs, waitMs);
+            this.#window.maxWaitMs = Math.max(this.#window.maxWaitMs, waitMs);
             // smarty-dev#6100: the SQLite writer lock is the exclusion; the advisory receipt only orders waiters.
             // Leave the queue now, so post-COMMIT work (SQLite's autocheckpoint fsync inside COMMIT, the emergency
             // checkpoint) never keeps the next waiter from contending.
@@ -1685,7 +1686,7 @@ export class SqliteStateStore {
             ticket = undefined;
             this.#writesWaiting -= 1;
             waiting = false;
-            return this.#run(body, lockClass);
+            return this.#run(body, lockClass, waitMs);
           }
         }
         const now = performance.now();
@@ -1705,7 +1706,9 @@ export class SqliteStateStore {
           // ticket at the head (pi-fabric#905 review round 3).
           ticket?.close();
           ticket = undefined;
-          if (!scope?.active && budget > 0) lockEvents?.waitTimeout(this.root, "sqlite", lockClass, now - started, walWriterPid(this.file));
+          const tried = Boolean(scope?.active) || budget <= 0;
+          lockStats?.failed(this.root, lockClass, now - started, tried);
+          if (!tried) lockEvents?.waitTimeout(this.root, "sqlite", lockClass, now - started, walWriterPid(this.file));
           throw new MeshLockTimeoutError(` (SQLite state ${this.file})`, attempts, Math.round(maxGap));
         }
         if (!ticket && now - started >= this.#fifoAfterMs) {
@@ -1753,7 +1756,7 @@ export class SqliteStateStore {
   }
 
   // The synchronous body between BEGIN IMMEDIATE (already taken) and COMMIT.
-  #run<T>(body: (tx: Tx) => T, lockClass: MeshLockClass): T {
+  #run<T>(body: (tx: Tx) => T, lockClass: MeshLockClass, waitMs: number): T {
     const began = performance.now();
     this.#inTransaction = true;
     this.#stats.transactions += 1;
@@ -1784,6 +1787,8 @@ export class SqliteStateStore {
       const hold = performance.now() - began;
       this.#stats.totalHoldMs += hold;
       this.#stats.maxHoldMs = Math.max(this.#stats.maxHoldMs, hold);
+      // One sample per actual SQLite transaction, including rollback, after releasing its writer lock.
+      lockStats?.acquired(this.root, lockClass, waitMs, hold);
       this.#heldEvent(lockClass, hold);
       if (committed && changed) {
         // data_version does not change for this connection's own commits. Metadata-only

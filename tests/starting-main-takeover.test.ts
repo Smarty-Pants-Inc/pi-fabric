@@ -14,6 +14,7 @@ const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const cases = [
   ["live", "keeps the successor pending across expiry while the incumbent receives private followUps"],
   ["death", "takes over after the owned incumbent PID is gone, delivering a retried message exactly once"],
+  ["adoption", "retains a live predecessor's durable startup row, then adopts after death with original attribution and a successful same-key retry"],
   ["handoff", "takes over immediately after clean handoff while the predecessor PID remains live"],
   ["birth", "treats a recorded old birth as exited despite the same real PID remaining live"],
   ["slow", "continues a >30-second same-session startup after predecessor death and sender close"],

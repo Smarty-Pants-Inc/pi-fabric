@@ -61,6 +61,15 @@ const predecessorProcess = (lease: FabricHostLease): "live" | "exited" | "unknow
   return birth === undefined ? "unknown" : birth === p.startTime ? "live" : "exited";
 };
 
+/** Retained startup work may cross an epoch only on exit proof or the existing
+ * transitional legacy-expiry fence. Clean handoff alone is NOT death evidence. */
+export const hostLeasePredecessorGone = (lease: FabricHostLease): boolean => {
+  const state = predecessorProcess(lease);
+  if (state === "exited") return true;
+  const legacyIdentity = !lease.process || !validProcessIncarnation(lease.process.startTime);
+  return state === "unknown" && legacyIdentity && lease.expiresAt <= Date.now();
+};
+
 export class FabricHostLeasePredecessorBusyError extends Error {
   override readonly name = "FabricHostLeasePredecessorBusyError";
   readonly code = "FABRIC_HOST_LEASE_PREDECESSOR_BUSY";
@@ -187,14 +196,10 @@ export const claimStartingHost = async (input: {
           if (current.mirror || current.mirrorLease || current.rootId !== input.id || current.identityId !== input.id ||
             current.session?.id !== input.sessionId || current.writer && current.writer.host !== os.hostname())
             throw new FabricHostLeaseSupersededError(input.id, input.id, current.startedAt);
-          const state = predecessorProcess(current);
-          if (current.incarnationToken && current.cleanHandoff === current.incarnationToken || state === "exited") return;
+          if (current.incarnationToken && current.cleanHandoff === current.incarnationToken || hostLeasePredecessorGone(current)) return;
           // TRANSITIONAL: old releases lack pid+birth. Keep their TTL admission until the
           // D5 wave leaves no identity-less lease in the directory for 24 h; then remove it.
-          // A proven-live process NEVER loses custody merely because its lease expired.
-          const legacyIdentity = !current.process || !validProcessIncarnation(current.process.startTime);
-          // A recorded native identity with an unreadable live probe is NOT a legacy lease.
-          if (state === "unknown" && legacyIdentity && current.expiresAt <= Date.now()) return;
+          // A proven-live or unreadable native identity NEVER loses custody at expiry.
           throw new FabricHostLeasePredecessorBusyError(current);
         } });
       return { meshRoot: input.meshRoot, lease };

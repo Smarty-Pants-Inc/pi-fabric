@@ -1,5 +1,5 @@
 // Real-process defensive gate; run only in an authorized isolated TMPDIR.
-// bun scripts/probe-starting-host-takeover.ts [--case live|death|handoff|birth|slow|unknown|unreadable]
+// bun scripts/probe-starting-host-takeover.ts [--case live|death|handoff|birth|slow|unknown|unreadable|adoption]
 // Retains all fixture roots. Never signals a process not spawned by this invocation.
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -17,11 +17,15 @@ import * as startupApi from "../src/topology/starting-host.js";
 import * as leases from "../src/topology/host-leases.js";
 import type { FabricParticipantInfo } from "../src/topology/types.js";
 import { validProcessIncarnation } from "../src/core/atomic-write.js";
+import { startingInboxRoot, readStartingFollowUpCompletion } from "../src/topology/starting-inbox.js";
+import { registerFabricPrincipalCapture, type FabricPrincipal } from "../src/fabric-provenance.js";
+import type { FabricInvocationContext } from "../src/protocol.js";
 
-export const CASES = ["live", "death", "handoff", "birth", "slow", "unknown", "unreadable"] as const;
+export const CASES = ["live", "death", "handoff", "birth", "slow", "unknown", "unreadable", "adoption"] as const;
 export type ProbeCase = typeof CASES[number];
 type Ports = ConstructorParameters<typeof AgentMessageRouter>;
 type Wire = { phase?: string; request?: string; action?: string; error?: string; [key: string]: unknown };
+type RecipientCall = { message: string; deliveryId?: string | undefined; data?: unknown; from: MeshIdentity; principal?: FabricPrincipal | undefined };
 const self = fileURLToPath(import.meta.url);
 const emit = (value: Wire) => process.send?.(value);
 const errorText = (error: unknown) => error instanceof Error ? `${error.name}: ${error.message}` : String(error);
@@ -93,7 +97,7 @@ async function childMain(meshRoot: string, sessionId: string, slow: boolean, unr
   const id = `session:${sessionId}`, mesh = meshAt(meshRoot), who = identity(id);
   let claim: StartingHostClaim | undefined, plane: FabricControlPlane | undefined;
   let ready = false;
-  const calls: Array<{ message: string; deliveryId?: string; data?: unknown }> = [];
+  const calls: RecipientCall[] = [];
   const markReady = async (expiryMs = 60_000) => {
     assert(claim, "claim required before readiness");
     const previous = claim.lease;
@@ -115,7 +119,8 @@ async function childMain(meshRoot: string, sessionId: string, slow: boolean, unr
       // control/router replay bugs cannot be hidden by fixture receipt suppression.
       const main: Ports[2] = { id, local: true, interactive: true, matches: target => target === id,
         deliverAgent: request => {
-          calls.push({ message: request.message, deliveryId: request.deliveryId, data: request.data });
+          calls.push({ message: request.message, deliveryId: request.deliveryId, data: request.data,
+            from: request.from, principal: request.principal });
           emit({ phase: "delivered", calls: calls.slice() });
           return { queued: true, messageId: request.deliveryId ?? randomUUID(), routed: "local", triggered: true };
         } };
@@ -203,8 +208,8 @@ class Peer {
     assert(!reply.error, String(reply.error)); return reply;
   }
   claimed() { return this.messages.some(message => message.phase === "claimed"); }
-  async calls(): Promise<Array<{ message: string; deliveryId?: string; data?: unknown }>> {
-    return (await this.rpc("snapshot")).calls as Array<{ message: string; deliveryId?: string; data?: unknown }>;
+  async calls(): Promise<RecipientCall[]> {
+    return (await this.rpc("snapshot")).calls as RecipientCall[];
   }
   async stop() {
     if (this.child.exitCode !== null || this.child.signalCode !== null) return;
@@ -236,11 +241,87 @@ export async function runCase(name: ProbeCase) {
     { privateMarker: message }, "followUp", undefined, { idempotencyKey: key });
   const receipt = { case: name, root, verdict: "PASS", realProcesses: true, payloadInspection: "recipient-calls-only" };
   try {
-    const incumbent = add(); await incumbent.wait(message => message.phase === "ready");
+    const incumbent = add(name === "adoption");
+    await incumbent.wait(message => message.phase === (name === "adoption" ? "claimed" : "ready"));
     const original = read();
     assert(original.process);
     assert(original.process.pid === incumbent.child.pid && original.process.host === os.hostname());
     assert.equal(localStartTime(incumbent.child.pid!), original.process.startTime);
+    if (name === "adoption") {
+      // Commit to a real starting receiver with NO runtime/control drain yet.
+      // Capture a host-authenticated principal; nested caller data is not authority.
+      const hooks = new Map<string, Function>();
+      registerFabricPrincipalCapture({ on: (event: string, fn: Function) => hooks.set(event, fn) } as unknown as
+        Parameters<typeof registerFabricPrincipalCapture>[0]);
+      const callerContext = { sessionManager: {} };
+      hooks.get("message_start")!({ message: { role: "user", provenance: { v: 1, channel: "keyboard", turnId: "adoption",
+        receivedAt: new Date().toISOString(), principal: { id: "trusted-original", binding: "herdr-client" } } } }, callerContext);
+      const invocation = { cwd: root, extensionContext: callerContext } as FabricInvocationContext;
+      const data = { principal: { id: "forged-payload" }, privateMarker: "original-before-death" };
+      const first = await source.routeMessage(id, "original-before-death", data, "followUp", invocation,
+        { idempotencyKey: "adopt-once" });
+      assert.equal(first.reason, "startup-inbox-durable");
+      const inbox = startingInboxRoot(root, id), rowFile = path.join(inbox, `${first.messageId}.json`);
+      assert(fs.existsSync(rowFile), "queued:true must have a durable source row before death");
+      assert.deepEqual(await incumbent.calls(), []);
+      const waiting = add(true);
+      await waiting.wait(message => message.phase === "claim-entered");
+      await delay(200);
+      assert(!waiting.claimed(), "live startup receiver must retain its lease and private row");
+      assert(fs.existsSync(rowFile));
+      // A clean release can authorize a NEW lease while the old PID remains live,
+      // but it is deliberately NOT death evidence for the old undrained row.
+      await incumbent.rpc("handoff");
+      await waiting.wait(message => message.phase === "claimed");
+      await waiting.rpc("ready");
+      await waiting.wait(message => message.phase === "ready");
+      await delay(300);
+      process.kill(incumbent.child.pid!, 0);
+      assert.deepEqual(await waiting.calls(), [], "current lease alone must not adopt still-live predecessor work");
+      assert(fs.existsSync(rowFile), "live-owner refusal must retain the source");
+      assert.equal(readStartingFollowUpCompletion(inbox, first.messageId), undefined);
+      await waiting.stop();
+      if (process.platform === "linux") {
+        // Reuse the existing native read-refusal fixture AFTER a successor owns
+        // custody: unknown old birth is not exit proof for retained rows either.
+        const unknown = add(false, incumbent.child.pid!);
+        await unknown.wait(message => message.phase === "ready");
+        await unknown.wait(message => message.phase === "birth-probe-refused");
+        assert.deepEqual(await unknown.calls(), [], "unreadable predecessor birth must not authorize adoption");
+        assert(fs.existsSync(rowFile));
+        assert.equal(readStartingFollowUpCompletion(inbox, first.messageId), undefined);
+        await unknown.stop();
+      }
+      // Both are invocation-owned; original receiver dies BEFORE any drain accepts
+      // its row, and a fresh successor relaunches through the real native claim.
+      await incumbent.killOwned();
+      const successor = add(true);
+      await successor.wait(message => message.phase === "claimed");
+      const queuedRetry = await source.routeMessage(id, "queued-retry-must-not-replace-original", undefined, "followUp", undefined,
+        { idempotencyKey: "adopt-once" });
+      assert.equal(queuedRetry.reason, "startup-inbox-durable");
+      assert.equal(queuedRetry.messageId, first.messageId);
+      await successor.rpc("ready");
+      await successor.wait(message => message.phase === "delivered");
+      const adopted = read();
+      assert.notEqual(adopted.ownerIncarnation, original.ownerIncarnation);
+      const duplicate = await source.routeMessage(id, "retry-must-not-replace-original", { principal: { id: "retry-forged" } },
+        "followUp", undefined, { idempotencyKey: "adopt-once" });
+      assert.equal(duplicate.queued, true, "same-key retry must observe successor completion, not stale epoch");
+      assert.equal(duplicate.messageId, first.messageId);
+      await delay(300);
+      const calls = await successor.calls();
+      assert.equal(calls.length, 1, "adoption and retry must make exactly one recipient call");
+      assert.equal(calls[0]!.message, "original-before-death");
+      assert.equal(calls[0]!.deliveryId, first.messageId);
+      assert.deepEqual(calls[0]!.data, data);
+      assert.equal(calls[0]!.from.id, senderId.id);
+      assert.deepEqual(calls[0]!.principal, { id: "trusted-original", binding: "herdr-client" });
+      assert.deepEqual(await successor.calls(), calls);
+      assert(!fs.existsSync(rowFile), "only accepted source rows may be compacted");
+      assert.equal(readStartingFollowUpCompletion(inbox, first.messageId)?.ownerIncarnation, adopted.ownerIncarnation);
+      return receipt;
+    }
     if (name === "live") {
       assert.equal(await startupApi.markHostLeaseCleanHandoff(meshAt(root), original,
         { ownIncarnation: original.process.startTime }), false, "a public predecessor token is not handoff authority");

@@ -636,6 +636,99 @@ describe("actor worker permit release (#9031)", () => {
     await eventually(() => expect(snapshot(f).held).toEqual([]));
   });
 
+  it.each(["linux", "win32"] as const)("settled actor with native debt releases retained RUN only on host proof (%s scan)", async scanPlatform => {
+    const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+    const f = fixture();
+    try {
+      const actor = await create(f, "settled-debt-owner");
+      const answer = f.actors.ask(actor.id, "terminal result with retained native custody");
+      void answer.catch(() => undefined);
+      const first = await launched(f, actor.id);
+      first.descendants = true;
+      first.debt = "recorded native tree close debt";
+      save(first, { status: "completed", text: "finished", finishedAt: Date.now(), updatedAt: Date.now() });
+
+      // Reach real logical settlement, not Linux's unsatisfied actor-publication
+      // fence. Windows permits the terminal result while native debt retains RUN.
+      // Then exercise that settled entry in BOTH platform branches of the scan.
+      Object.defineProperty(process, "platform", { ...platform, value: "win32" });
+      await f.agents.stop(first.launch.id, { consume: false });
+      await expect(f.agents.wait(first.launch.id)).resolves.toMatchObject({ status: "completed", text: "finished" });
+      await expect(answer).resolves.toMatchObject({ text: "finished" });
+      await eventually(() => expect(f.actors.inFlightCount()).toBe(0));
+      Object.defineProperty(process, "platform", { ...platform, value: scanPlatform });
+      expect(first.alive).toBe(true);
+      expect(f.agents.heldPermits()).toBe(1);
+      expect(f.agents.retentionCustodyVeto(first.launch.id)).toBe(true);
+      expect(f.agents.workerIdentity(first.launch.id)?.pid).toBe(first.pid);
+      const next = await blockedSuccessor(f); // Admission scans the already-settled owner while alive.
+      expect(snapshot(f).held.map(held => held.runId)).toEqual([first.launch.id]);
+
+      first.probeError = "EPERM";
+      first.birth = "67890"; // A different birth cannot override an uncertain PID probe.
+      save(first, { sessionId: String(claimedGonePid), processStartTime: "99999", workerGone: true, settledLost: true });
+      // Deliberately untyped worker-writable cause, not a new public error code.
+      fs.writeFileSync(first.statusFile, JSON.stringify({ ...first.record, errorCode: "WORKER_GONE" }));
+      expect(first.launch.onUnconfirmedExit).toBeTypeOf("function");
+      first.launch.onUnconfirmedExit!(first.debt!); // Recorded native observation, not worker-writable proof.
+      await observe();
+      expect(() => process.kill(first.pid, 0)).toThrow("EPERM");
+      expect(snapshot(f).held.map(held => held.runId)).toEqual([first.launch.id]);
+      expect(snapshot(f).waiting).toHaveLength(1);
+      expect(f.agents.heldPermits()).toBe(1);
+      expect(workers.size).toBe(1);
+
+      // The current host-owned PID is now absent. No ENODEV marker, native close
+      // or tree exit is supplied: only actual admission may be discharged.
+      first.alive = false;
+      delete first.probeError;
+      first.launch.onUnconfirmedExit!(first.debt!);
+      const second = await launched(f, next.actor.id);
+      expect(f.agents.heldPermits()).toBe(0);
+      expect(f.agents.retentionCustodyVeto(first.launch.id)).toBe(true);
+      expect(first.descendants).toBe(true);
+      expect(first.debt).toBeDefined();
+      const thirdActor = await create(f, "settled-debt-third");
+      const thirdAnswer = f.actors.ask(thirdActor.id, "wait behind successor, despite repeated old proof");
+      void thirdAnswer.catch(() => undefined);
+      await eventually(() => expect(snapshot(f).waiting).toHaveLength(1));
+      expect(snapshot(f).held.map(held => held.runId)).toEqual([second.launch.id]);
+      expect(workers.size).toBe(2);
+
+      // This ordinary no-debt actor really settles and gives RUN to the third.
+      // A later scan must ignore its already-discharged admission as well.
+      complete(second);
+      await expect(next.answer).resolves.toMatchObject({ text: "finished" });
+      const third = await launched(f, thirdActor.id);
+      await expect(f.agents.wait(second.launch.id)).resolves.toMatchObject({ status: "completed" });
+      const fourthActor = await create(f, "settled-debt-fourth");
+      const fourthAnswer = f.actors.ask(fourthActor.id, "must remain queued through late native close and stop");
+      void fourthAnswer.catch(() => undefined);
+      await eventually(() => expect(snapshot(f).waiting).toHaveLength(1));
+      expect(snapshot(f).held.map(held => held.runId)).toEqual([third.launch.id]);
+      expect(workers.size).toBe(3);
+
+      complete(first); // Late native close re-scans both settled entries.
+      await f.agents.stop(first.launch.id, { consume: false }); // Late settlement/stop is once-only too.
+      await observe();
+      expect(snapshot(f).held.map(held => held.runId)).toEqual([third.launch.id]);
+      expect(snapshot(f).waiting).toHaveLength(1);
+      expect(workers.size).toBe(3);
+      complete(third);
+      await expect(thirdAnswer).resolves.toMatchObject({ text: "finished" });
+      const fourth = await launched(f, fourthActor.id);
+      complete(fourth);
+      await expect(fourthAnswer).resolves.toMatchObject({ text: "finished" });
+      await eventually(() => expect(snapshot(f).held).toEqual([]));
+    } finally {
+      // RED must not strand actor waiters behind the baseline's leaked permit.
+      // Cancelling queued receipts never signals a worker or deletes run files.
+      try {
+        for (const waiting of snapshot(f).waiting) await f.agents.stop(waiting.runId, { consume: false });
+      } finally { Object.defineProperty(process, "platform", platform); }
+    }
+  });
+
   it("lost-contact alive worker retains actual RUN despite forged primary-death claims", async () => {
     const f = fixture();
     const actor = await create(f, "alive-lost-contact");

@@ -2666,14 +2666,14 @@ export class AgentManager {
    */
   #releaseProvenGone(): number {
     let released = 0;
-    // Unsettled actor primary death frees ONLY its actual RUN admission. Logical
-    // results, native descendants, unresolved markers and same-session custody
-    // stay joined. Settled runs retain the existing exact ENODEV recovery below;
-    // heldPermit registration is not a prerequisite for this actor-only proof.
+    // Actor primary death frees ONLY its still-held actual RUN admission, even
+    // after logical settlement with native debt. Native descendants, unresolved
+    // markers and same-session custody stay joined. Ordinary tasks retain the
+    // exact ENODEV recovery below; heldPermit registration is not a prerequisite.
     for (const managed of this.#runs.values()) {
       // A replacement may already be creating a worker while transport still names
       // the old attempt. Its death cannot discharge the replacement's admission.
-      if (!managed.actorId || managed.settled || managed.relaunchPending || !managed.admissionRelease || !this.#actorWorkerGone(managed)) continue;
+      if (!managed.actorId || managed.relaunchPending || !managed.admissionRelease || !this.#actorWorkerGone(managed)) continue;
       const permit = managed.admissionRelease;
       delete managed.heldPermit;
       permit();

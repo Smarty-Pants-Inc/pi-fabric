@@ -1,7 +1,7 @@
 /**
  * smarty-dev#8920: the Windows half of the mesh state gate (state-gate.ts). Node and libuv expose no Windows
  * security descriptor API (fs.chmod maps only the read-only attribute; fs.access does not evaluate ACLs), so the
- * gate reads native descriptors through ONE pinned Windows PowerShell child per gate call (windows-powershell.ts):
+ * gate reads native descriptors through ONE pinned Windows PowerShell child per uncached gate call (windows-powershell.ts):
  * the root, its state files and flag directory, and every lexical and real ancestor, in one structured snapshot.
  * Loaded only through state-gate.ts, which is not in the startup graph.
  *
@@ -30,6 +30,7 @@
  * runner failure refuses. Output overflow (incomplete evidence) and malformed successful output always refuse.
  */
 import childProcess from "node:child_process";
+import fs from "node:fs";
 import path from "node:path";
 import { childProcessEnvironment } from "../core/atomic-write.js";
 import { windowsSecurityPowerShell } from "../storage/windows-powershell.js";
@@ -180,9 +181,59 @@ const ancestorsOf = (dir: string): string[] => {
 
 type Role = "ancestor" | "root" | "directory" | "file" | "creation-parent";
 
+type AdmissionIdentity = { root?: string; db?: string; guard?: string };
+type RootAdmission = { plan: string; identity: AdmissionIdentity };
+// Process-local verified root admissions only. One exact plan per root, bounded by roots, not by caller plans.
+const rootAdmissions = new Map<string, RootAdmission>();
+const MAX_ROOT_ADMISSIONS = 64;
+const fileIdentity = (stat: fs.BigIntStats): string | undefined =>
+  typeof stat.dev === "bigint" && stat.dev >= 0n && typeof stat.ino === "bigint" && stat.ino > 0n
+    ? `${stat.dev}:${stat.ino}` : undefined;
+
+// No-follow, volume-down guard of every lexical component (including the real ancestor plan). Optional children
+// contribute types/reparse checks, not identities: later SQLite sidecars/flags inherit the admitted strict root.
+// Unknown IDs or unreadable paths disable reuse, never substitute a new refusal for the native policy.
+const admissionIdentity = (root: string, db: string, paths: Map<string, Role>): AdmissionIdentity => {
+  const components = new Map<string, { target: string; role: Role }>();
+  for (const [target, role] of paths) components.set(target.toLowerCase(), { target, role });
+  for (const target of paths.keys()) {
+    for (const ancestor of ancestorsOf(target)) {
+      const key = ancestor.toLowerCase();
+      if (!components.has(key)) components.set(key, { target: ancestor, role: "ancestor" });
+    }
+  }
+  const ordered = [...components.values()].sort((a, b) => a.target.split("\\").length - b.target.split("\\").length);
+  const identity: AdmissionIdentity = {};
+  const ancestors: [string, string][] = [];
+  let proven = true;
+  for (const { target, role } of ordered) {
+    let stat: fs.BigIntStats | undefined;
+    try { stat = fs.lstatSync(target, { bigint: true, throwIfNoEntry: false }); }
+    catch { return identity; }
+    if (!stat) {
+      if (role === "file" || role === "directory") continue;
+      return identity;
+    }
+    // Node's Windows lstat identifies symbolic links AND junctions without following them.
+    if (stat.isSymbolicLink() || (role === "file" ? !stat.isFile() : !stat.isDirectory())) return identity;
+    const id = fileIdentity(stat);
+    const key = target.toLowerCase();
+    if (id !== undefined && key === root.toLowerCase()) identity.root = id;
+    if (id !== undefined && key === db.toLowerCase()) identity.db = id;
+    if (role === "ancestor") {
+      if (id === undefined) proven = false;
+      else ancestors.push([key, id]);
+    }
+  }
+  if (proven) identity.guard = JSON.stringify(ancestors);
+  return identity;
+};
+
 /**
  * The refusal for this root, or undefined when it may be opened (including the warned tooling gap).
- * One child process per call; nothing is cached across calls.
+ * Default-runner Windows root admissions reuse only a complete verified proof with unchanged root/DB identities
+ * and fresh component guards. Same-identity ACL edits by the trusted authority class are intentionally not re-read.
+ * Other roles, protect/readback, injected runners, and unproven identities retain fresh native reads.
  */
 export const windowsStateAclRefusal = (request: WindowsStateAclRequest, run: WindowsAclRunner = runPowerShell): string | undefined => {
   const root = path.win32.resolve(request.root);
@@ -199,6 +250,29 @@ export const windowsStateAclRefusal = (request: WindowsStateAclRequest, run: Win
   for (const dir of [...ancestorsOf(root), ...ancestorsOf(path.win32.resolve(request.real))]) add(dir, "ancestor");
   for (const dir of request.directories) add(path.win32.resolve(dir), "directory");
   for (const file of request.files) add(path.win32.resolve(file), "file");
+  const defaultWindows = process.platform === "win32" && run === runPowerShell;
+  const rootKey = root.toLowerCase();
+  // Only direct children inherit this root's proof. Unusual external/nested target plans stay fresh.
+  const cacheable = defaultWindows && rootRole === "root" && !request.protect
+    && [...request.files, ...request.directories].every(target =>
+      path.win32.dirname(path.win32.resolve(target)).toLowerCase() === rootKey);
+  const db = request.files[0] === undefined ? undefined : path.win32.resolve(request.files[0]);
+  const plan = cacheable && db !== undefined && paths.get(db) === "file"
+    ? JSON.stringify([rootKey, path.win32.resolve(request.real).toLowerCase(),
+      [...paths].map(([target, role]) => [target.toLowerCase(), role]),
+      request.files.map(file => path.win32.resolve(file).toLowerCase()),
+      request.directories.map(dir => path.win32.resolve(dir).toLowerCase())]) : undefined;
+  const before = plan !== undefined ? admissionIdentity(root, db!, paths) : undefined;
+  const cached = cacheable ? rootAdmissions.get(rootKey) : undefined;
+  if (cached && cached.plan === plan && before?.root !== undefined && before.db !== undefined
+    && before.guard !== undefined && before.root === cached.identity.root && before.db === cached.identity.db
+    && before.guard === cached.identity.guard) {
+    rootAdmissions.delete(rootKey);
+    rootAdmissions.set(rootKey, cached);
+    return undefined;
+  }
+  // A miss must not leave an older proof available after a failed replacement proof or a protect operation.
+  if (defaultWindows && rootRole === "root") rootAdmissions.delete(rootKey);
   let output: string;
   try { output = run(JSON.stringify({ protect: request.protect ? root : null, paths: [...paths.keys()] })); }
   catch (error) {
@@ -316,6 +390,26 @@ export const windowsStateAclRefusal = (request: WindowsStateAclRequest, run: Win
     if (diagnostics.length > 0) {
       if (ancestorRole && !ownerFailure && owner !== undefined) diagnostics.push(`${target} owner: ${owner}`);
       return diagnostics.join("; ");
+    }
+  }
+  // Only this bottom-of-reader path is a complete structured policy success. In particular the warned
+  // undefined return above must never publish an admission. Capture again rather than blessing a replacement
+  // with the descriptor read from its predecessor; unknown IDs simply leave this full read uncached.
+  if (plan !== undefined && before !== undefined) {
+    const after = admissionIdentity(root, db!, paths);
+    if (before.root !== undefined && after.root !== undefined && before.root !== after.root) {
+      return `${root} identity changed while ACL was read`;
+    }
+    if (before.db !== undefined && after.db !== undefined && before.db !== after.db) {
+      return `${db} identity changed while ACL was read`;
+    }
+    const dbEntry: unknown = snapshot.entries[[...paths.keys()].indexOf(db!)];
+    // lstat presence cannot supply the DB's missing native descriptor (including a missing-file snapshot race).
+    const dbProven = record(dbEntry) && dbEntry.missing !== true;
+    if (dbProven && before.root !== undefined && before.db !== undefined && before.guard !== undefined
+      && after.root === before.root && after.db === before.db && after.guard === before.guard) {
+      rootAdmissions.set(rootKey, { plan, identity: after });
+      if (rootAdmissions.size > MAX_ROOT_ADMISSIONS) rootAdmissions.delete(rootAdmissions.keys().next().value!);
     }
   }
   return undefined;

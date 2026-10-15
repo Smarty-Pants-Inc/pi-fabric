@@ -91,10 +91,10 @@ export const filesystemRefusal = (root: string,
  * O_NOFOLLOW descriptor whose dev/ino must match the lstat, then re-checked. Anything else is refused
  * (FABRIC_MESH_STATE_UNSUPPORTED). A missing path passes. Windows has no uid or mode bits: there an existing path
  * gets its native ACL read (smarty-dev#8920): the path itself as a strict directory or file target (the elevated
- * Administrators owner exception included), every parent as an ancestor. For direct WRITERS (raiseCheckpointFlag,
- * before it writes through the flag directory); the state root itself is judged by the full gate on every open. The
- * gate batches its own paths into one read per call (checkPrivatePath below). The read-only flag scan uses
- * assertGatedFlagDirectory instead.
+ * Administrators owner exception included), every parent as an ancestor. Standalone requests always get a fresh
+ * native proof. State-root callers instead use the full root plan, whose successful Windows proof is process-cached
+ * by root/DB identity in the ACL reader; checkpoint flag writers reuse that same plan plus cheap directory checks.
+ * The read-only flag scan uses assertGatedFlagDirectory instead.
  */
 export const assertPrivatePath = (file: string, kind: "directory" | "file"): fs.Stats | undefined => {
   const stat = checkPrivatePath(file, kind);
@@ -106,17 +106,18 @@ export const assertPrivatePath = (file: string, kind: "directory" | "file"): fs.
  * smarty-dev#8920: the checkpoint flag directory for the READ-ONLY advisory scan (checkpointFlagRaised, polled on
  * every writer-lock attempt of an open store). POSIX: exactly assertPrivatePath (lstat, type, uid, mode). Windows:
  * the lstat half only (no symbolic link, a directory), and no native ACL read, so polling never spawns a child. The
- * native read of this directory happens in the gate on every open of the store that polls it (assertPrivateStateRoot
- * names it among its strict targets): when it exists then, a foreign grant on it (inherit-only included) refuses the
- * open; when it is created later, it can only be made inside that validated root (a foreign SID may not add to it)
- * and inherits the root's DACL, whose inheritable grants were judged as strictly. Re-ACLing or replacing it needs
- * WRITE_DAC, ownership or delete rights that the gate refused to every foreign SID. Nothing is cached: the lstat runs
- * on every call. Writers keep the native check (raiseCheckpointFlag calls assertPrivatePath before it writes).
+ * native proof includes this directory at root admission (assertPrivateStateRoot names it among its strict targets):
+ * when it exists then, a foreign grant on it (inherit-only included) refuses admission; when it is created later,
+ * it can only be made inside that validated root (a foreign SID may not add to it) and inherits the root's DACL,
+ * whose inheritable grants were judged as strictly. Re-ACLing or replacing it needs WRITE_DAC, ownership or delete
+ * rights that the gate refused to every foreign SID. The lstat runs on every call, independently of the reader's
+ * root/DB identity cache. Same-identity user/Admin DACL mutations after admission are outside that cache's contract.
+ * Writers use the same root plan and this cheap directory check before writing.
  */
 export const assertGatedFlagDirectory = (dir: string): fs.Stats | undefined => checkPrivatePath(dir, "directory");
 
-// The lstat half of assertPrivatePath. Windows: type and symlink checks only; the gate's callers run the ACL check
-// as one batched snapshot per gate call (assertWindowsAcl) covering the root, state files, flag directory and ancestors.
+// The lstat half of assertPrivatePath. Windows: type and symlink checks only; the gate's callers use the matching
+// root plan (assertWindowsAcl) covering state files, flag directory and ancestors, with identity caching in the reader.
 const checkPrivatePath = (file: string, kind: "directory" | "file"): fs.Stats | undefined => {
   const stat = fs.lstatSync(file, { throwIfNoEntry: false });
   if (!stat) return undefined;
@@ -263,9 +264,10 @@ const fdSnapshot = (): Map<string, string> | undefined => {
  * smarty-dev#7548: the ONE gate for every connection to a state root's state.db. A local filesystem, private
  * ancestors, a private root and state files, and a connection bound to the checked inode (openPinned, #7784).
  * `create` (smarty-dev#8920, Windows creation paths only): the exclusive create of a missing state.db, run AFTER the
- * root half (filesystem, ancestors, root, state files and flag directory: one native read on Windows) and BEFORE the
+ * root half (filesystem, ancestors, root, state files and flag directory: the normal root plan) and BEFORE the
  * state files' lstat and the pinned open, so a refused root still gets no file (#846 SEC P2). When state.db was missing
- * for that first read, a second full native read follows the callback before the open; existing state.db keeps one.
+ * for that first proof, a second full native proof follows the callback before the open. Existing state.db reuses
+ * the reader's successful admission proof only for the same root/DB identities and target plan.
  * It skips nothing: every check below runs as without it. A state.db it creates
  * inherits the root's DACL, whose inheritable grants the read just judged. POSIX callers keep their own sequence
  * (assertPrivateStateRoot, the create, then this gate without `create`).
@@ -279,6 +281,17 @@ export const openPrivateStateDb = (file: string, open: SqliteOpener, create?: ()
   // callback so an EEXIST winner (including a child renamed in after the snapshot) is never adopted by lstat alone.
   if (missingBeforeGate) assertPrivateStateRoot(path.dirname(file), path.basename(file));
   return openPinned(file, open, assertPrivateStateFiles(file));
+};
+
+/**
+ * Prime an EXISTING Windows state.db's normal root proof before any bounded lock/busy operation. No SQLite open,
+ * schema work or creation: a missing DB returns after one lstat and retains the gate's fresh pre/post-create proofs.
+ * Successful identity-keyed caching (and cheap lexical ancestor/reparse guards on hits) belongs to the ACL reader.
+ */
+export const admitExistingStateRoot = (root: string): void => {
+  if (process.platform !== "win32") return;
+  if (fs.lstatSync(path.join(root, "state.db"), { throwIfNoEntry: false }) === undefined) return;
+  assertPrivateStateRoot(root);
 };
 
 /** The root half of the gate: run it before creating state.db too, so a refused root gets no file (#846 SEC P2). */
@@ -295,7 +308,7 @@ export const assertPrivateStateRoot = (root: string, db = "state.db"): void => {
  * else. Windows: walk lexical components with lstat from the volume down, then judge the existing ancestor ACLs
  * BEFORE each non-recursive mkdir. Recheck the chain before continuing, including before protecting our new root.
  * Only a successful final mkdir permits an explicit owner (the current user) and protected private DACL, read back.
- * An EEXIST winner is refused, never repaired or adopted. Existing roots get no ACL read here (the open reads once).
+ * An EEXIST winner is refused, never repaired or adopted. Existing roots get no ACL read here (admission/open gates them).
  * Windows callers run it BEFORE the fence
  * (custody-lock.ts and fence-lock.ts create the root too, untracked), so the fence's root is already private.
  */
@@ -340,10 +353,11 @@ const stateTargets = (root: string, db: string) => {
   const file = path.join(root, db);
   return { files: [file, `${file}-wal`, `${file}-shm`, `${file}-journal`], directories: [path.join(root, CHECKPOINT_FLAGS)] };
 };
-// Every call reads the native descriptors afresh: no proof is cached or shared between calls, so an ACE added
-// between two checks (even in one synchronous turn) is seen. An existing state.db open reads once; a missing one
-// reads before and after its Windows create callback. Creating N missing directories first costs N creation-parent
-// preflight reads (one before each mkdir), plus the root's protect/readback; none of those reads is cached for the open.
+// The normal root plan must match at early admission, open and checkpoint flag writes. The ACL reader alone caches
+// verified successful root-role proofs for stable root+DB identities (volume and lossless file IDs, never ctime).
+// Missing/unknown DB identity and unverified tooling fallbacks never cache; standalone target, creation-parent and
+// protect requests stay fresh. A missing DB still gets full pre/post-create proofs. Creating N missing directories
+// first costs N creation-parent preflights plus the root's protect/readback; those cannot satisfy the open's plan.
 type AclTargets = { role?: "root" | "directory" | "file" | "ancestor" | "creation-parent"; files: string[]; directories: string[] };
 const assertWindowsAcl = (root: string, targets: AclTargets, protect: boolean): void => {
   let real: string;
@@ -377,7 +391,7 @@ const assertPrivateAncestors = (root: string): void => {
 
 // The validated lstat of state.db is returned: openPinned binds the connection to it.
 const assertPrivateStateFiles = (file: string): fs.Stats => {
-  // lstat only: the root's Windows ACL snapshot (assertPrivateStateRoot, just before) covered these paths in one read.
+  // lstat only: the matching root proof (assertPrivateStateRoot, just before) covers these Windows ACLs.
   checkPrivatePath(path.dirname(file), "directory"); // nobody else may swap files in the root
   for (const name of [`${file}-wal`, `${file}-shm`]) checkPrivatePath(name, "file");
   const stat = checkPrivatePath(file, "file");

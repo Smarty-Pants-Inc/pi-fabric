@@ -128,7 +128,7 @@ import { MeshBatchConflictError, type MeshBatchOperation, type MeshBatchResult, 
 import type { MeshIdentity } from "./event-log.js";
 import { formatWalReaders, walReaderPids, walWriterPid } from "./wal-readers.js";
 import { createLockEvents, lockHeldEventThreshold, type MeshLockClass } from "./commit-stats.js";
-import { assertGatedFlagDirectory, assertPrivatePath, assertPrivateStateRoot, createStateRoot, filesystemRefusal,
+import { admitExistingStateRoot, assertGatedFlagDirectory, assertPrivatePath, assertPrivateStateRoot, createStateRoot, filesystemRefusal,
   MeshStateUnsupportedError, openPrivateStateDb } from "./state-gate.js";
 
 // The process's lock-event appender (smarty-dev#9290), shared with mesh-lock.ts through its registry.
@@ -903,13 +903,15 @@ export class SqliteStateStore {
   /**
    * Opens (creating when absent) `<root>/state.db`. Initialisation (WAL setup, schema, seed) retries
    * asynchronously while busy, for `initTimeoutMs` (default `lockTimeoutMs`); then the driver's busy
-   * error is thrown. `initTimeoutMs` bounds only this open, never the store's later writes.
+   * error is thrown. `initTimeoutMs` bounds only this open, never the store's later writes. On Windows an existing
+   * DB's root admission runs first, before fence/custody acquisition or the initialisation busy budget.
    */
   static async open(root: string, maxEventBytes: number, maxReadEvents: number,
     options: SqliteStateStoreOptions = {}, initTimeoutMs?: number): Promise<SqliteStateStore> {
     walHardCapOf(options); // a bad cap refuses before any side effect
     const refusal = filesystemRefusal(root);
     if (refusal) throw new MeshStateUnsupportedError(`Fabric mesh SQLite state needs a local filesystem: ${refusal}`);
+    if (process.platform === "win32") admitExistingStateRoot(root);
     const requested = initializeOf(options);
     const initialize = guardBeforeOpen(root, requested);
     if (initialize !== "create") return SqliteStateStore.#openAsync(root, maxEventBytes, maxReadEvents, options, initialize, initTimeoutMs);
@@ -961,6 +963,7 @@ export class SqliteStateStore {
     walHardCapOf(options); // a bad cap refuses before any side effect
     const refusal = filesystemRefusal(root);
     if (refusal) throw new MeshStateUnsupportedError(`Fabric mesh SQLite state needs a local filesystem: ${refusal}`);
+    if (process.platform === "win32") admitExistingStateRoot(root);
     const requested = initializeOf(options);
     const initialize = guardBeforeOpen(root, requested);
     if (initialize !== "create") return SqliteStateStore.#openSync(root, maxEventBytes, maxReadEvents, options, initialize);
@@ -2070,9 +2073,9 @@ export class SqliteStateStore {
 // The store's open of `<root>/state.db`, creating it when missing. Create mode 0600 before SQLite opens it (its
 // -wal/-shm inherit the mode). O_EXCL: when this succeeds no connection in this process can have the file open, so
 // closing drops no lock. POSIX: the root half of the gate before the create, so a refused root gets no state.db (#846
-// SEC P2), then the whole gate. Windows (smarty-dev#8920): the create runs inside the gate, after its one native read
-// of the root, state files and flag directory and before the state files' lstat, so the open reads the descriptors
-// once; a refused root still gets no file.
+// SEC P2), then the whole gate. Windows (smarty-dev#8920): the create runs inside the gate, after its normal root
+// proof and before the state files' lstat. An existing DB reuses matching admission evidence; a missing one gets
+// fresh full proofs before and after the create (including an EEXIST winner). A refused root still gets no file.
 const openCreatingStateDb = (root: string, file: string, opener: SqliteOpener): SqliteConnection => {
   const create = () => {
     try { fs.closeSync(fs.openSync(file, "wx", 0o600)); }
@@ -2156,13 +2159,18 @@ export const ownsFile = (file: string, token: string): boolean => {
 // An empty name means the flag could not be raised (advisory). One readdir and a stat per flag (normally
 // zero or one) per pending check; a crashed request's flag goes stale and is ignored, and the scan removes it
 // once its holder is proven dead (smarty-dev#7421: the tryLockFile rule, pid plus start ticks; see removeDeadFlag).
-// An existing flag directory is used only when it is private (assertPrivatePath, pi-fabric#694 P2-D; on Windows its
-// native ACL, smarty-dev#8920); anything else is refused with a clear error and never written through.
+// An existing flag directory is used only when it is private (pi-fabric#694 P2-D). Windows uses the normal root
+// admission plan (including the flag directory), plus a fresh cheap directory check. A directory created later
+// inherits the admitted strict root's safe DACL; no matching admission means a full root+flag proof before writing.
+// Standalone assertPrivatePath requests remain fresh. Anything unsafe is refused and never written through.
 export const raiseCheckpointFlag = (root: string, token: string): string => {
   const dir = path.join(root, CHECKPOINT_FLAGS);
   const flag = path.join(dir, token);
   try { fs.mkdirSync(dir, { mode: 0o700 }); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") return ""; }
-  assertPrivatePath(dir, "directory");
+  if (process.platform === "win32") {
+    assertPrivateStateRoot(root);
+    assertGatedFlagDirectory(dir);
+  } else assertPrivatePath(dir, "directory");
   try {
     fs.writeFileSync(flag, "", { mode: 0o600 });
     return flag;
@@ -2179,7 +2187,7 @@ export const checkpointFlagRaised = (root: string): boolean => {
   const dir = path.join(root, CHECKPOINT_FLAGS);
   let names: string[];
   // A foreign directory raises nothing. This read-only scan runs on every writer-lock attempt: on Windows it gets the
-  // lstat checks only, never a native ACL read per poll; the store's gate reads this directory's ACL on every open
+  // lstat checks only, never a native ACL read per poll; the store's root admission includes this directory's ACL
   // (assertGatedFlagDirectory). POSIX: the same check as assertPrivatePath.
   try { assertGatedFlagDirectory(dir); names = fs.readdirSync(dir); } catch { return false; }
   const now = Date.now();

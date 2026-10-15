@@ -792,7 +792,7 @@ describe("state gate wiring on win32 (smarty-dev#8920)", () => {
     expect(opened).toEqual([]);
   });
 
-  it("opens a store on an existing root with one native read, sync and async", async () => {
+  it("delegates admission and open through the complete root plan, sync and async (fake reader has no cache)", async () => {
     const { calls } = await loadGate(undefined);
     const { SqliteStateStore } = await import("../src/mesh/state-sqlite.js");
     const root = tmp();
@@ -801,7 +801,8 @@ describe("state gate wiring on win32 (smarty-dev#8920)", () => {
       expect(calls).toHaveLength(2);
       expect(fs.existsSync(path.join(root, "state.db"))).toBe(true);
       (await SqliteStateStore.open(root, 1024, 16, { initialize: "detached" })).close();
-      expect(calls).toHaveLength(3);
+      // This seam replaces the caching reader: existing-DB admission and the open each delegate once.
+      expect(calls).toHaveLength(4);
     });
     expect(calls.every(call => call.root === root && call.protect === false && call.directories.length === 1)).toBe(true);
   });

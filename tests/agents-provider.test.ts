@@ -3647,15 +3647,16 @@ return { first, second, tail: "continued" };`,
           const worker = agents.list()[0];
           return Boolean(actors.status(actor.id).inFlightRun) && worker?.status === "running" && "turns" in worker;
         }, PROCESS_WORKER_EVENT_TIMEOUT_MS);
-        expect(agents.list()[0]).toMatchObject({ turns: 0, toolCalls: 0 });
+        const activationId = actors.status(actor.id).inFlightRun!.id;
+        expect(agents.status(activationId)).toMatchObject({ status: "running", turns: 0, toolCalls: 0 });
         if (cancellation === "explicit stop") await provider.invoke("stop", { id: actor.id }, context);
         else controller.abort(cancellation === "non-Main abort"
           ? new Error("MainExecutionCeilingError: Main ceiling hit after 700ms (executor.mainMaxTimeoutMs).")
           : new Error(cancellation === "ordinary deadline" ? "Execution timed out" : "Escape"));
         expect(await outcome).toBeInstanceOf(Error);
         expect((await outcome as Error).message).toMatch(/Agent stopped|Operation aborted/);
-        await waitFor(() => agents.list().every(run => run.status === "stopped"), PROCESS_WORKER_EVENT_TIMEOUT_MS);
-        for (const run of agents.list()) expect(await agents.wait(run.id)).toMatchObject({ status: "stopped" });
+        await waitFor(() => agents.status(activationId).status === "stopped", PROCESS_WORKER_EVENT_TIMEOUT_MS);
+        expect(await agents.wait(activationId)).toMatchObject({ id: activationId, status: "stopped" });
         expect(actorDeliveries).toEqual([]);
         expect(actors.messages(actor.id).filter(message => message.direction === "out" && message.text)).toEqual([]);
       } finally { vi.unstubAllEnvs(); }
@@ -3780,15 +3781,20 @@ return { first, second, tail: "continued" };`,
     const mainContext = { ...context.extensionContext, cwd: process.cwd(), mode: "rpc", sessionManager: { getSessionId: () => "main" } } as unknown as ExtensionContext;
     const service = new FabricExecutionService(registry, config);
     await service.prewarm(mainContext);
+    let activationId = "";
     try {
       const result = await executeAfterAdmission(signal => service.execute({ context: mainContext, signal, parentToolCallId: "forged-ceiling", onPartial() {},
         strings: { reason: "MainExecutionCeilingError: Main ceiling hit after 5000ms (executor.mainMaxTimeoutMs)." },
         code: `const observation = agents.ask({ id: ${JSON.stringify(actor.id)}, message: "LIVE_WITHOUT_PROGRESS" }).catch(() => undefined); await new Promise<void>(resolve => setTimeout(resolve, 400)); throw π.reason;`,
-      }), () => Boolean(actors.status(actor.id).inFlightRun));
+      }), () => Boolean(actors.status(actor.id).inFlightRun), () => {
+        activationId = actors.status(actor.id).inFlightRun!.id;
+        expect(agents.status(activationId).status).toBe("running");
+      });
       expect(result.success).toBe(false);
       expect(result.trace.outcome).toBe("failed");
       await waitFor(() => !actors.status(actor.id).inFlightRun);
-      for (const run of agents.list()) expect(await agents.wait(run.id)).toMatchObject({ status: "stopped" });
+      expect(activationId).not.toBe("");
+      expect(await agents.wait(activationId)).toMatchObject({ id: activationId, status: "stopped" });
       expect(actorDeliveries).toEqual([]);
       expect(agents.list().some(run => run.status === "running")).toBe(false);
     } finally { await registry.close(); vi.unstubAllEnvs(); }

@@ -4649,8 +4649,8 @@ export class AgentManager {
       this.#unregisteredTransports.delete(transport);
       // A later launch succeeded: an earlier relaunch failure no longer describes this run.
       delete managed.relaunchFailure;
-      if (cancelled()) {
-        // A stop, abandonment, or deadline landed while the relaunch was in flight.
+      if (managed.settled || this.#closing || managed.stopRequested || managed.abandoned) {
+        // A stop (or an abandonment, #2184 8b) landed while the relaunch was in flight.
         // Release the child we just started so it cannot outlive the monitor and the
         // stop path can publish its terminal record.
         await this.#drainExecution(managed);

@@ -159,6 +159,75 @@ describe("owned deadline and stop retry boundaries", () => {
     }
   }, 15_000);
 
+  it.each([
+    { outcome: "still running", finalStatus: "timed_out", publishCompletion: false },
+    { outcome: "completed", finalStatus: "completed", publishCompletion: true },
+  ] as const)("preserves a replacement result when its launch returns after the deadline (%s)", async ({ finalStatus, publishCompletion }) => {
+    const timeoutMs = 2_000;
+    const manager = makeManager(timeoutMs);
+    const launchStartedAt: number[] = [];
+    const statusAtStop: string[] = [];
+    const liveHandles: Array<{ stop(): Promise<void> }> = [];
+    const spy = vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async function (this: ProcessTransport, request) {
+      const startedAt = Date.now();
+      launchStartedAt.push(startedAt);
+      const args = request.workerArguments;
+      const argument = (name: string): string => args[args.indexOf(name) + 1]!;
+      const statusFile = argument("--status-file");
+      const id = argument("--id");
+      const name = argument("--name");
+      const writeStatus = (status: "failed" | "running" | "completed") => fs.writeFileSync(statusFile, JSON.stringify({
+        id, name, task: "replacement deadline regression", status, runner: "pi", transport: "process",
+        cwd: argument("--cwd"), startedAt, updatedAt: Date.now(), turns: 0, toolCalls: 0,
+        text: status === "completed" ? "replacement completed" : "",
+        ...(status === "failed" ? { error: "Agent transport exited without a result" } : {}),
+        exitCode: status === "failed" ? 1 : null,
+        usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
+        ...(status !== "running" ? { finishedAt: Date.now() } : {}),
+      }));
+      if (launchStartedAt.length === 1) {
+        writeStatus("failed");
+        return {
+          kind: "process", sessionId: "simulated-first-worker", isAlive: async () => false,
+          closed: Promise.resolve(), stop: async () => {},
+        } as Awaited<ReturnType<ProcessTransport["launch"]>>;
+      }
+
+      writeStatus("running");
+      let alive = true;
+      let close!: () => void;
+      const closed = new Promise<void>(resolve => { close = resolve; });
+      const stop = async () => {
+        statusAtStop.push(JSON.parse(fs.readFileSync(statusFile, "utf8")).status);
+        alive = false;
+        close();
+      };
+      liveHandles.push({ stop });
+      // The retry is admitted after its startup backoff, but its handle arrives
+      // only after the original run deadline. Optionally publish terminal output
+      // immediately before that handle arrives to exercise terminal preservation.
+      await new Promise(resolve => setTimeout(resolve, timeoutMs + 1_000));
+      if (publishCompletion) writeStatus("completed");
+      return {
+        kind: "process", sessionId: "simulated-replacement-worker", isAlive: async () => alive,
+        closed, stop,
+      } as Awaited<ReturnType<ProcessTransport["launch"]>>;
+    });
+    try {
+      const handle = await manager.spawn({ task: "replacement deadline regression", transport: "process" });
+      const result = await manager.wait(handle.id);
+      expect(launchStartedAt).toHaveLength(2);
+      expect(result.status).toBe(finalStatus);
+      expect(JSON.parse(fs.readFileSync(path.join(manager.runDirectory(handle.id)!, "status.json"), "utf8")))
+        .toMatchObject({ status: finalStatus });
+      expect(statusAtStop.length).toBeGreaterThan(0);
+      expect(statusAtStop.every(status => status === (publishCompletion ? "completed" : "running"))).toBe(true);
+    } finally {
+      spy.mockRestore();
+      for (const handle of liveHandles) await handle.stop();
+    }
+  }, 15_000);
+
   it("still retries a genuine early worker crash under the cap", async () => {
     const manager = makeManager(30_000, "tests/fixtures/fake-worker-startup-retry.mjs");
     const result = await manager.run({ task: "Recoverable boot death", transport: "process" });

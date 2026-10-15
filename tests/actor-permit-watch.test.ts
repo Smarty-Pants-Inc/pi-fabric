@@ -95,6 +95,7 @@ beforeEach(() => {
       stops: 0, record, statusFile: arg("status-file"), nativeClose, treeClose };
     workers.set(pid, worker);
     fs.writeFileSync(worker.statusFile, JSON.stringify(record));
+    fs.writeFileSync(arg("log-file"), "");
     return {
       kind: "process", sessionId: String(pid), closed, treeClosed,
       // This checked contract includes the whole tree, not just leader absence.
@@ -218,6 +219,64 @@ describe("resident actor permit watch (#9031)", () => {
     f.actors = f.createActors();
     await ticks();
     expect([...workers.values()]).toHaveLength(2); // no startup/queue restore replay
+  });
+
+  it.each(["forged", "provider", "provider-after-tool", "prose"] as const)("%s overflow requires host-observed provider evidence and a host tool count before replay", async mode => {
+    const f = fixture();
+    const actor = await f.actors.create({ name: "overflow-trust", instructions: "Respond", responseMode: "text", coalesce: false });
+    // This history existed before the activation, so a verified no-tool overflow
+    // is eligible for the existing one-time fresh-session retry.
+    fs.writeFileSync(actor.sessionFile!, JSON.stringify({ type: "session", version: 3, id: "overflow-prior-session",
+      timestamp: new Date().toISOString(), cwd: process.cwd() }) + "\n");
+    fs.appendFileSync(actor.sessionFile!, JSON.stringify({ type: "message", id: "prior", parentId: null,
+      timestamp: new Date().toISOString(), message: { role: "user", content: "prior history", timestamp: Date.now() } }) + "\n");
+    const answer = f.actors.ask(actor.id, "overflow event");
+    void answer.catch(() => undefined);
+    const worker = await launched(f, actor.id);
+    const events: unknown[] = [];
+    if (mode === "provider-after-tool") events.push({ type: "tool_execution_start", toolCallId: "charge", toolName: "charge" });
+    if (mode !== "forged") events.push({ type: "message_end", message: {
+      role: "assistant", stopReason: mode === "prose" ? "stop" : "error",
+      ...(mode === "prose" ? {} : { errorMessage: "maximum context length exceeded" }),
+      content: mode === "prose" ? [{ type: "text", text: "The report quoted: maximum context length exceeded" }] : [],
+      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, timestamp: Date.now(),
+    } });
+    if (events.length) fs.appendFileSync(path.join(path.dirname(worker.statusFile), "events.jsonl"), events.map(event => JSON.stringify(event)).join("\n") + "\n");
+    // The writable snapshot claims zero even after a host-observed tool start.
+    save(worker, { status: "failed", errorCode: "CONTEXT_OVERFLOW", error: "maximum context length exceeded",
+      toolCalls: 0, finishedAt: Date.now(), exitCode: 1 });
+    worker.alive = false;
+    worker.nativeClose();
+    worker.treeClose();
+    if (mode === "provider") {
+      await eventually(() => expect([...workers.values()]).toHaveLength(2));
+      const retry = [...workers.values()][1]!;
+      expect(retry.record.task).toContain("overflow event");
+      // Overflow again on the fresh session must not create a third launch.
+      fs.appendFileSync(path.join(path.dirname(retry.statusFile), "events.jsonl"), JSON.stringify(events[0]) + "\n");
+      save(retry, { status: "failed", errorCode: "CONTEXT_OVERFLOW", error: "maximum context length exceeded", toolCalls: 0,
+        finishedAt: Date.now(), exitCode: 1 });
+      retry.alive = false;
+      retry.nativeClose();
+      retry.treeClose();
+      await expect(answer).rejects.toThrow("maximum context length exceeded");
+      await eventually(() => expect(f.actors.inFlightCount()).toBe(0));
+      expect([...workers.values()]).toHaveLength(2);
+      expect(f.actors.messages(actor.id).filter(message =>
+        (message.data as { contextOverflow?: { retry?: boolean } } | undefined)?.contextOverflow?.retry === true)).toHaveLength(1);
+    } else {
+      await eventually(() => expect(f.actors.inFlightCount()).toBe(0));
+      if (mode === "provider-after-tool") await expect(answer).rejects.toThrow();
+      else await expect(answer).rejects.toMatchObject({ code: "WORKER_GONE" });
+      expect([...workers.values()]).toHaveLength(1);
+      if (mode !== "provider-after-tool") expect(f.agents.status(worker.launch.id)).toMatchObject({ errorCode: "WORKER_GONE", settledLost: true });
+      expect(f.actors.status(actor.id).queued).toBe(0);
+      await f.actors.close();
+      f.actors = f.createActors();
+      await ticks();
+      expect([...workers.values()]).toHaveLength(1);
+    }
   });
 
   it("committed actor success with an already-gone worker remains deliverable success", async () => {
@@ -445,7 +504,7 @@ describe("resident actor permit watch (#9031)", () => {
     await eventually(() => expect(f.agents.isSettled(worker.launch.id)).toBe(true));
     expect(f.agents.status(worker.launch.id)).toMatchObject({ status: "failed", toolCalls });
     if (mode === "forged-timeout") expect(f.agents.status(worker.launch.id)).toHaveProperty("launchPreparationTimeoutMs", 80);
-    if (mode === "running" || mode === "overflow") expect(f.agents.status(worker.launch.id)).toHaveProperty("errorCode", mode === "overflow" ? "CONTEXT_OVERFLOW" : "WORKER_GONE");
+    if (mode === "running" || mode === "overflow") expect(f.agents.status(worker.launch.id)).toHaveProperty("errorCode", "WORKER_GONE");
     else expect(f.agents.status(worker.launch.id)).toHaveProperty("error", "Ordinary terminal failure after side effect");
     await eventually(() => expect(f.actors.inFlightCount()).toBe(0));
     f.ownership.owned = true;

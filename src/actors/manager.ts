@@ -4231,17 +4231,21 @@ export class ActorManager {
             } },
           );
           runId = result.id;
+          const workerEvidence = this.agents.workerEventEvidence?.(result.id);
+          const hostOverflow = workerEvidence?.complete === true && workerEvidence.contextOverflow;
           runEvidence = result.warnings;
           // Error-only turns and a spawned handle do not prove inference consumed context.
-          handoffConsumed = result.inferenceStarted ?? (result.status === "completed" || result.toolCalls > 0);
+          handoffConsumed = result.status === "completed" || workerEvidence?.inferenceStarted === true || result.inferenceStarted === true;
           // Captured before any check that can throw: a completed run is never parked and
           // rerun, whatever happens to ownership afterwards.
           runCompleted = result.status === "completed";
           enodevRecovered = result.enodevRecovered === true;
           runStopped = result.status === "stopped";
           runLost = result.status === "failed" && result.errorCode === "WORKER_GONE";
-          runEffects = result.toolCalls !== 0;
-          runFailed = result.status === "failed" && result.errorCode !== "CONTEXT_OVERFLOW" &&
+          // Missing/partial event history is uncertainty, never permission to replay a launched item.
+          runEffects = result.toolCalls !== 0 || (workerLaunched &&
+            (workerEvidence?.complete !== true || workerEvidence.toolCalls > 0 || workerEvidence.inferenceStarted));
+          runFailed = result.status === "failed" && !hostOverflow &&
             !(!workerLaunched && result.launchPreparationTimeoutMs !== undefined);
           if (runLost) {
             // A lost activation may already have had effects. Consume it before
@@ -4300,17 +4304,13 @@ export class ActorManager {
             await this.#saveActors();
           }
           if (result.status !== "completed") {
-            // smarty-dev#3238 round 2: only the worker's typed code, set from a structured overflow
-            // signal, retries or reports an overflow; error text that quotes the phrase never does.
-            // A legacy/malformed typed result must not replay a provider disconnect as overflow.
-            // The normal classifier scans permanent causes first, including real window refusals.
-            const failure = classifyManagerActivationFailure({ lastError: result.error ?? "", error: result.error, evidence: result.warnings }, result.errorCode === "CONTEXT_OVERFLOW");
-            const contextOverflow = result.errorCode === "CONTEXT_OVERFLOW" && !CONTRADICTORY_OVERFLOW_CODES.has(failure.code) &&
+            // Only this host's consumed structured provider error authorizes overflow recovery.
+            // Status errors/warnings can suppress recovery, but cannot manufacture its authority.
+            const failure = classifyManagerActivationFailure({ lastError: result.error ?? "", error: result.error, evidence: result.warnings }, hostOverflow);
+            const contextOverflow = hostOverflow && !CONTRADICTORY_OVERFLOW_CODES.has(failure.code) &&
               !abortController.signal.aborted && !runStopped;
-            // smarty-dev#3238 round 3: a retry replays the whole event. Once a tool has run, its side
-            // effects may already have happened, and nothing makes a replay idempotent: retry only a
-            // run that executed no tool call (the worker counts each tool_execution_start).
-            const toolsRan = result.toolCalls !== 0;
+            // Tool starts are monotonic host observations; a worker-written zero cannot erase them.
+            const toolsRan = workerEvidence?.complete !== true || workerEvidence.toolCalls !== 0;
             if (contextOverflow && !toolsRan && !item.overflowRetried && !this.#closing && (actor.status as string) !== "stopped" &&
                 this.#sessionCarriedHistory(actor, sessionBytesBefore)) {
               // smarty-dev#3238: carried history left this event no room. Reset the session at this
@@ -4334,8 +4334,8 @@ export class ActorManager {
               this.#recordMessage(this.#liveActor(actor), {
                 id: randomUUID(), actorId: actor.id, actorName: actor.name, direction: "out", source: "fabric-host",
                 createdAt: Date.now(),
-                reason: `context overflow after ${Number.isFinite(result.toolCalls) ? result.toolCalls : "unknown"} tool call(s): not retrying the event, a replay could repeat their side effects`,
-                data: { contextOverflow: { retry: false, toolCalls: result.toolCalls, runId: result.id, error: result.error, eventRef: actorEventRef(item) } },
+                reason: `context overflow after ${workerEvidence?.toolCalls ?? "unknown"} tool call(s): not retrying the event, a replay could repeat their side effects`,
+                data: { contextOverflow: { retry: false, toolCalls: workerEvidence?.toolCalls, runId: result.id, error: result.error, eventRef: actorEventRef(item) } },
               });
             }
             if (contextOverflow) this.#publishActivationOverflow(actor, item, result.id, result.error ?? "");

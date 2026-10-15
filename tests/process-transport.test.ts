@@ -269,8 +269,10 @@ describe.skipIf(process.platform !== "linux")("ProcessTransport processSlice (#4
       runRoot: path.join(f.root, "runs"), workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
     });
     try {
-      const result = await manager.run({ task: "slice propagation", transport: "process" });
-      expect(result.status).toBe("completed");
+      // This fixture atomically renames host status outside the task scratch. Keep its test-only
+      // deletion guard's original temp root; the native TMPDIR suite covers scoped defaults.
+      const result = await manager.run({ task: "slice propagation", transport: "process", writePolicy: "unrestricted" });
+      expect(result.status, result.error).toBe("completed");
       expect(fs.readFileSync(path.join(f.root, "scope-args"), "utf8")).toContain("--slice=batch.slice\n");
     } finally { await manager.close(); }
   });

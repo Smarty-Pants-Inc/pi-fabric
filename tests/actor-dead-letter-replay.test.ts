@@ -396,11 +396,11 @@ describe("dead-letter replay age and current activation filter (#10630)", () => 
   });
 
   it("retains eligible same-key work untouched beyond replay capacity while skipping newer noise", async () => {
-    const w = await backlog({ coalesceKey: "payload.number" }, 1);
-    const entries = w.entries.slice(6, 9).map((entry, index) => ({
+    const w = await backlog({ coalesceKey: "payload.number" }, 2);
+    const entries = w.entries.slice(6).map((entry, index) => ({
       ...entry,
-      event: { ...entry.event, sequence: index + 1, kind: index === 2 ? "noise" : "work",
-        data: { payload: { number: index === 0 ? 11 : 77 } } },
+      event: { ...entry.event, sequence: index + 1, kind: index === 3 ? "noise" : "work",
+        data: { payload: { number: index < 2 ? 11 + index : 77 } } },
     }));
     fs.writeFileSync(w.file, entries.map(entry => `${JSON.stringify(entry)}\n`).join(""));
     const manager = w.open();
@@ -408,12 +408,14 @@ describe("dead-letter replay age and current activation filter (#10630)", () => 
     const replayReceipts = receipts(manager, w.actor.id);
     await manager.close();
     await configured;
-    expect(w.queued()).toEqual([entries[0]!.event.id]);
-    expect(readLines<Entry>(w.file)).toEqual([entries[1]!]);
+    // The first item can already be in flight; the second keeps the queue at half full
+    // so its synchronous refill cannot consume the retained same-key entry.
+    expect(w.queued()).toEqual(entries.slice(0, 2).map(entry => entry.event.id));
+    expect(readLines<Entry>(w.file)).toEqual([entries[2]!]);
     expect(manager.messages(w.actor.id)).toContainEqual(expect.objectContaining({
-      reason: "filtered: noise", data: { filteredItemId: entries[2]!.event.id },
+      reason: "filtered: noise", data: { filteredItemId: entries[3]!.event.id },
     }));
-    expect(replayReceipts).toEqual([{ replayed: 1, archivedStale: 0, filterSkipped: 1, remaining: 1 }]);
+    expect(replayReceipts).toEqual([{ replayed: 2, archivedStale: 0, filterSkipped: 1, remaining: 1 }]);
   });
 
   it("removes and receipts every raw entry when a same-key live batch is entirely filtered", async () => {

@@ -2738,7 +2738,7 @@ describe("ParticipantDirectory default lease cadence (smarty-dev#11172)", () => 
       await expect(scheduled.mock.results.at(-1)!.value).rejects.toBe(failure);
       await vi.waitFor(() => expect(warn).toHaveBeenCalledOnce()); // background retry recorded the failure
       expect(legacyTicks()).toBe(1); // the expired cadence was cancelled, not re-polled
-      directory.options.beforePublication = undefined;
+      delete directory.options.beforePublication;
       scheduled.mockClear();
       now += 1_001; // the existing non-transient background backoff, not another heartbeat
       const peer = identityOf("reader-b");
@@ -2756,7 +2756,7 @@ describe("ParticipantDirectory default lease cadence (smarty-dev#11172)", () => 
       expect(scheduled).toHaveBeenCalledOnce();
       expect(legacyTicks()).toBe(2);
     } finally {
-      directory.options.beforePublication = undefined;
+      delete directory.options.beforePublication;
       clock.mockRestore();
       timeouts.mockRestore();
       warn.mockRestore();
@@ -2769,8 +2769,12 @@ describe("ParticipantDirectory default lease cadence (smarty-dev#11172)", () => 
     expect(mesh.stateBackend).toBe(backend);
     const other = new MeshStore(mesh.root, 64 * 1024, 1_000, { stateBackend: backend });
     let status = "idle";
-    directory.registerSource(() => [{ ...rootRecord(identity.id, identity.id, "no-legacy-put"),
-      cwd: undefined, sessionId: undefined, status }]);
+    directory.registerSource(() => {
+      const record = { ...rootRecord(identity.id, identity.id, "no-legacy-put"), status };
+      delete record.cwd;
+      delete record.sessionId;
+      return [record];
+    });
     const timeouts = vi.spyOn(globalThis, "setTimeout");
     try {
       await directory.start();

@@ -1690,6 +1690,15 @@ export class RemoteBridgeSide implements BridgeSide {
 // ---------------------------------------------------------------------------------------------
 // The bridge loop.
 
+interface RelayGraceCursor {
+  /** The retained event's source sequence; this is local cursor state, not peer authority. */
+  sequence: number;
+  /** Local wall-clock start of the bounded grace window. */
+  startedAt: number;
+  /** Optional event binding for cursor files written by newer bridges. */
+  id?: string;
+}
+
 interface DirectionCursor {
   /** The last source sequence handled. */
   after: number;
@@ -1697,6 +1706,8 @@ interface DirectionCursor {
   offset?: number;
   /** The destination sequence of the last event bridged in (restart dedupe starts after it). */
   mark: number;
+  /** Optional v1 cursor extension: one retained relay boundary's local grace start. */
+  relayGrace?: RelayGraceCursor;
 }
 
 interface CursorFile {
@@ -1904,8 +1915,6 @@ export class MeshBridge {
   readonly #directionWake: Partial<Record<Direction, () => void>> = {};
   /** Last sampled, admitted source deadlines: evidence to WAIT only, never authority to publish. */
   #sampledDeadlines = new Map<string, number>();
-  /** One stable, bounded grace deadline for the retained relay boundary; bodies stay in the source log. */
-  readonly #relayGrace: Partial<Record<Direction, { sequence: number; until: number }>> = {};
   /** At most one pending boundary per direction. Bodies stay in the durable source, before its cursor. */
   readonly #membershipRetryAt: Partial<Record<Direction, number>> = {};
   readonly #membershipSequence: Partial<Record<Direction, number>> = {};
@@ -2392,7 +2401,10 @@ export class MeshBridge {
     const seen = this.#seen[direction];
     let forwarded = 0;
     let dropped = 0;
-    if ((this.#relayGrace[direction]?.sequence ?? Infinity) <= cursor.after) delete this.#relayGrace[direction];
+    if (cursor.relayGrace && Number.isSafeInteger(cursor.relayGrace.sequence) && cursor.relayGrace.sequence <= cursor.after) {
+      delete cursor.relayGrace;
+      this.#save();
+    }
     if ((this.#membershipSequence[direction] ?? Infinity) <= cursor.after) {
       delete this.#membershipSequence[direction];
       delete this.#membershipRetryAt[direction];
@@ -2687,19 +2699,29 @@ export class MeshBridge {
   }
 
   #relayGracePending(event: MeshEvent): boolean {
-    const current = this.#relayGrace.toLocal;
-    if (current && current.sequence !== event.sequence) delete this.#relayGrace.toLocal;
-    const now = Date.now();
-    const retained = this.#relayGrace.toLocal;
-    if (!retained) {
-      this.#relayGrace.toLocal = { sequence: event.sequence, until: now + BRIDGE_LEASE_MS };
+    const cursor = this.#cursor!.toLocal;
+    const retained = cursor.relayGrace;
+    const wallNow = Date.now();
+    const now = Number.isFinite(wallNow) && wallNow >= 0 ? wallNow : 0;
+    const sameEvent = isObject(retained) && Number.isSafeInteger(retained.sequence) && retained.sequence > 0 &&
+      retained.sequence === event.sequence && (retained.id === undefined || retained.id === event.id);
+    const validStart = isObject(retained) && Number.isFinite(retained.startedAt) && retained.startedAt >= 0 &&
+      retained.startedAt <= now && Number.isFinite(retained.startedAt + BRIDGE_LEASE_MS);
+    // Repair legacy/malformed/future records from the local clock, never a peer timestamp.
+    if (!sameEvent || !validStart) {
+      cursor.relayGrace = { sequence: event.sequence, startedAt: now, id: event.id };
+      this.#save();
       return true;
     }
-    return now < retained.until;
+    return now < retained.startedAt + BRIDGE_LEASE_MS;
   }
 
   #clearRelayGrace(direction: Direction, event: MeshEvent): void {
-    if (this.#relayGrace[direction]?.sequence === event.sequence) delete this.#relayGrace[direction];
+    const cursor = this.#cursor![direction];
+    const retained = cursor.relayGrace;
+    if (retained?.sequence === event.sequence && (retained.id === undefined || retained.id === event.id)) {
+      delete cursor.relayGrace;
+    }
   }
 
   async #relayCommand(event: MeshEvent, rules: BridgeRules): Promise<{ delivered: boolean; sequence?: number; pending?: boolean }> {
@@ -2714,7 +2736,6 @@ export class MeshBridge {
         (this.#relayDestinationStale(event, rules) && this.#staleRelaySender(event, rules)))) return { delivered: false, pending: true };
     const staleDestination = this.#relayDestinationStale(event, rules);
     if (staleDestination && this.#relayGracePending(event)) return { delivered: false, pending: true };
-    if (!staleDestination) this.#clearRelayGrace("toLocal", event);
     try {
       if (this.#stopped || !this.#ready || this.#notificationError || this.#refusal(event, rules, "toLocal") || !relay ||
         !destination || destination === remoteName || destination === localName ||

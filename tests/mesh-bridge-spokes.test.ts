@@ -329,6 +329,119 @@ describe("spoke-to-spoke roots and addressed control through the hub", () => {
     expect(events(hub, "fabric.control.ack")).toEqual([]);
     expect(persistedMarkerFiles(hub.root, marker)).toEqual([]);
   });
+  it.each(["retained", "missing", "Infinity", "NaN", "string", "future", "null-record", "primitive-record"] as const)(
+    "RELAY-1 persists restart-bounded destination grace and repairs %s cursor metadata from local time", async mode => {
+      const f = await fixture();
+      const a = f.stores.ryzen3!, b = f.stores.ryzen2!, hub = f.stores.ryzen1!;
+      const source = f.mains.ryzen3!, target = f.mains.ryzen2!;
+      const sourceLink = f.links.find(link => link.bridge.options.remoteName === "ryzen3")!;
+      const destinationLink = f.links.find(link => link.bridge.options.remoteName === "ryzen2")!;
+      let now = Date.now();
+      vi.spyOn(Date, "now").mockImplementation(() => now);
+      const marker = `relay-1-restart-${mode}-private-command`;
+      // The sender's directory-stale auto-cancel is independent of bridge grace.
+      await a.publish({ topic: "fabric.control.command", kind: "followUp", from: source.identity, to: target.identity.id,
+        data: { version: 1, commandId: `relay-1-restart-${mode}`, targetId: target.identity.id, operation: "followUp",
+          replyTo: source.identity.id, requestedAt: now, deadlineAt: now + 120_000,
+          destinationRemoteHost: "ryzen2", ownerIncarnation: target.ownerIncarnation, message: marker } });
+      const command = events(a, "fabric.control.command")[0]!;
+      const before = sourceCursor(sourceLink.bridge);
+      const readCursor = () => JSON.parse(fs.readFileSync(sourceLink.bridge.options.cursorPath, "utf8")) as {
+        toLocal: { after: number; mark: number; offset?: number; [field: string]: unknown };
+      };
+      const graceFields = () => Object.fromEntries(Object.entries(readCursor().toLocal)
+        .filter(([field]) => !["after", "mark", "offset"].includes(field)));
+      const restart = async () => {
+        sourceLink.bridge = new MeshBridge({ ...sourceLink.bridge.options,
+          local: new StoreBridgeSide(new MeshStore(hub.root, 64 * 1024, 100), "ryzen3", () => Date.now()) });
+        await sourceLink.bridge.start();
+        await sourceLink.bridge.step();
+      };
+      const step = async () => {
+        await sourceLink.bridge.syncPresence();
+        expect(sourceLink.bridge.options.local.holds!(source.identity.id, source.identity)).toBe(true);
+        expect(readHostLease(hub.root, target.identity.id)!.expiresAt).toBeLessThan(now);
+        expect(hub.get(hostKey(target.identity.id), { fresh: true })!.value).toMatchObject({ remoteHost: "ryzen2" });
+        expect(readHostLease(b.root, target.identity.id)!.expiresAt).toBeGreaterThan(now);
+        await sourceLink.bridge.step();
+      };
+      const retained = () => {
+        expect(sourceCursor(sourceLink.bridge)).toBe(before);
+        expect(events(a, "fabric.control.ack")).toEqual([]);
+        expect(events(b, "fabric.control.command")).toEqual([]);
+      };
+      const release = await holdHubMirror(destinationLink.bridge);
+      try {
+        now += BRIDGE_LEASE_MS + 5_000;
+        const firstPendingAt = now;
+        await step();
+        retained();
+        let boundedFrom = firstPendingAt;
+        if (mode !== "retained") {
+          now += 2_000;
+          boundedFrom = now;
+          const cursor = readCursor();
+          const { after, mark, offset } = cursor.toLocal;
+          if (mode === "missing") {
+            cursor.toLocal = { after, mark, ...(offset !== undefined ? { offset } : {}) };
+          } else if (mode === "null-record" || mode === "primitive-record") {
+            const fields = Object.keys(graceFields());
+            for (const field of fields.length ? fields : ["relayGrace"]) {
+              cursor.toLocal[field] = mode === "null-record" ? null : "not-a-grace-record";
+            }
+          } else {
+            const invalid = mode === "Infinity" ? Infinity : mode === "NaN" ? NaN
+              : mode === "future" ? now + 120_000 : "not-a-local-timestamp";
+            const corrupt = (value: unknown): unknown => {
+              if (typeof value === "number" && value >= firstPendingAt) return invalid;
+              if (Array.isArray(value)) return value.map(corrupt);
+              if (value && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, corrupt(v)]));
+              return value;
+            };
+            const fields = Object.keys(graceFields());
+            for (const field of fields) cursor.toLocal[field] = corrupt(cursor.toLocal[field]);
+            if (!fields.length) cursor.toLocal.relayGrace = { sequence: command.sequence, startedAt: invalid };
+          }
+          // JSON persists Infinity and NaN as null, exercising actual disk data.
+          fs.writeFileSync(sourceLink.bridge.options.cursorPath, JSON.stringify(cursor));
+          await restart();
+          retained();
+        }
+        const persistedGrace = graceFields();
+        now = boundedFrom + 4_000;
+        await restart();
+        await step();
+        retained();
+        expect(graceFields()).toEqual(persistedGrace);
+        now = boundedFrom + 9_000;
+        await restart();
+        await step();
+        retained();
+        expect(graceFields()).toEqual(persistedGrace);
+        now = boundedFrom + BRIDGE_LEASE_MS - 1;
+        await step();
+        retained();
+        now = boundedFrom + BRIDGE_LEASE_MS;
+        await step();
+        expect(sourceCursor(sourceLink.bridge)).toBeGreaterThanOrEqual(command.sequence);
+        expect(events(a, "fabric.control.ack")).toHaveLength(1);
+        expect(events(a, "fabric.control.ack")[0]).toMatchObject({ verification: "bridge", to: source.identity.id,
+          from: { id: "bridge:ryzen1" }, data: { accepted: false, retryable: true,
+            errorCode: "FABRIC_RELAY_DESTINATION_UNAVAILABLE", bridge: { from: "ryzen1", id: command.id } } });
+        expect(Object.keys(persistedGrace).length).toBeGreaterThan(0);
+        expect(graceFields()).toEqual({});
+        now += 1_000;
+        await restart();
+        await step();
+        expect(events(a, "fabric.control.ack")).toHaveLength(1);
+        expect(events(b, "fabric.control.command")).toEqual([]);
+        expect(events(b, "fabric.control.ack")).toEqual([]);
+        expect(events(hub, "fabric.control.command")).toEqual([]);
+        expect(events(hub, "fabric.control.ack")).toEqual([]);
+        expect(persistedMarkerFiles(hub.root, marker)).toEqual([]);
+      } finally { await release(); }
+    });
+
   it("routes a by-id followUp A -> hub -> B once, returns an origin-authenticated ACK, and keeps hub-local delivery", async () => {
     const f = await fixture();
     const a = f.stores.ryzen3!, b = f.stores.ryzen2!, hub = f.stores.ryzen1!;

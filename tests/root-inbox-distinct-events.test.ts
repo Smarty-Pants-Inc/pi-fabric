@@ -16,14 +16,14 @@ const watcher: MeshIdentity = { id: "fleet-tool:lane-watcher", name: "lane-watch
 const TOPIC = "fleet.work.tasks";
 const KEY = "watcher-lucky-6289-m4";
 
-const setup = () => {
+const setup = (steerGraceMs = 0) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-inbox-distinct-"));
   roots.push(root);
   const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 500);
   const entries: unknown[] = [];
   let now = Date.now();
   vi.spyOn(Date, "now").mockImplementation(() => now);
-  const box = () => new RootInbox(mesh, me, () => [me.id], { now: () => now, steerGraceMs: 0, wakeCooldownMs: 0 });
+  const box = () => new RootInbox(mesh, me, () => [me.id], { now: () => now, steerGraceMs, wakeCooldownMs: 0 });
   const pi = {
     sendMessage: (message: unknown) => entries.push({ type: "custom_message", timestamp: new Date(now).toISOString(), ...(message as object) }),
   } as unknown as ExtensionAPI;
@@ -83,6 +83,45 @@ describe("distinct same-key mesh events (smarty-dev#12140)", () => {
     expect((await h.box().next(h.session())).events).toEqual([]);
   });
 
+  it.each(["key", "ref"] as const)("spends one %s-only fallback across peek/wake/scan, then survives reload", async (kind) => {
+    const h = setup(); const inbox = h.box(); inbox.start();
+    const claim = { [kind]: KEY };
+    h.main.deliverAgent({ from: watcher, message: "rc=1", delivery: "steer", data: { ...claim, topic: TOPIC } });
+    const first = await h.publish("rc=1 legacy", claim);
+    const second = await h.publish("rc=124 legacy", claim); h.advance(1);
+    // wake peeks first, but its reservation is observational; the real scan consumes it once.
+    const woke = await inbox.wake(h.session(), () => true);
+    expect(ids(woke?.events)).toEqual([second.id]);
+    await h.take(inbox, woke!.events);
+    h.entries.length = 0;
+    const third = await h.publish("rc=0 legacy", claim); h.advance(1);
+    expect(ids((await h.box().next(h.session())).events)).toEqual([third.id]);
+    expect(first.id).not.toBe(third.id);
+  });
+
+  it("wakes immediately for a later same-key event past a one-use shadow inside steer grace", async () => {
+    const h = setup(60_000); const inbox = h.box(); inbox.start();
+    h.main.deliverAgent({ from: watcher, message: "native", delivery: "steer", data: { key: KEY, topic: TOPIC } });
+    await h.publish("legacy shadow");
+    const distinct = await h.publish("new legacy work"); h.advance(1);
+    const woke = await inbox.wake(h.session(), () => true);
+    expect(ids(woke?.events)).toEqual([distinct.id]);
+    await h.take(inbox, woke!.events);
+    await inbox.close();
+  });
+
+  it("does not spend a legacy fallback on an exact-id replay", async () => {
+    const h = setup(); const inbox = h.box(); inbox.start();
+    const original = await h.publish("previous work"); h.advance(1);
+    await h.take(inbox, (await inbox.next(h.session())).events);
+    await inbox.next(h.session());
+    h.main.deliverAgent({ from: watcher, message: "new native work", delivery: "steer", data: { key: KEY, topic: TOPIC } });
+    h.replay(original);
+    await h.publish("first unmatched legacy shadow");
+    const distinct = await h.publish("later distinct legacy work"); h.advance(1);
+    expect(ids((await inbox.next(h.session())).events)).toEqual([distinct.id]);
+  });
+
   it("never lets a legacy persisted topic-key fallback receipt suppress distinct new events", async () => {
     const h = setup(); const inbox = h.box(); inbox.start();
     // The hash older runtimes stored for a consumed mesh event's sender/topic/key fallback.
@@ -112,8 +151,12 @@ describe("distinct same-key mesh events (smarty-dev#12140)", () => {
     await h.take(inbox, batch.events);
     // The native claim persists in the recipient cursor once the session history is gone.
     h.entries.length = 0;
-    await h.publish("rc=1 shadow again"); h.advance(1);
-    expect((await h.box().next(h.session())).events).toEqual([]);
+    const laterLegacy = await h.publish("rc=1 shadow again"); h.advance(1);
+    // A key-only carrier is one-use: its first legacy shadow was suppressed, so this later
+    // identity-less event remains deliverable even after the cursor reloads.
+    const later = await h.box().next(h.session());
+    expect(ids(later.events)).toEqual([laterLegacy.id]);
+    await h.take(inbox, later.events);
     // Another topic or sender is not the claimed work.
     const otherTopic = await h.mesh.publish({ topic: "fleet.work.other", kind: "answer", from: watcher, to: me.id, text: "other", data: { key: KEY } });
     h.advance(1);

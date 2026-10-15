@@ -1,6 +1,8 @@
 // Real persisted Pi Main RPC proof: two distinct durable, addressed answer events sharing a key.
 // Only model transport is deterministic/keyless; host capabilities, receipts, inbox, and wake timer are native.
-// Usage: PI_FABRIC_PROBE_PI=/path/to/pi node scripts/probe-inbox-distinct-events.mjs dist/index.js "$TASK_OUT"
+// Exact-session addressed events wake immediately, without the name/alias steer grace.
+// Usage: PI_FABRIC_PROBE_PI=/absolute/path/to/pi-coding-agent/dist/cli.js node scripts/probe-inbox-distinct-events.mjs dist/index.js "$TASK_OUT"
+// Use the real executable CLI, not role-pi: the isolated child env omits SMARTY_ROLE_PI_BINARY.
 import fs from 'node:fs';
 import path from 'node:path';
 import assert from 'node:assert/strict';
@@ -58,8 +60,11 @@ const env = {
   INBOX_PROOF_HOST: hostFile,
 };
 
+const immediateWakeBoundMs = 15000; // Loose structural bound, not a millisecond performance target.
+const negativeObservationMs = 1000;
+const totalBudgetMs = 180000;
 const startedAt = Date.now();
-const totalDeadline = startedAt + 280000;
+const totalDeadline = startedAt + totalBudgetMs;
 const remaining = () => Math.max(0, totalDeadline - Date.now());
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const readJsonl = file => {
@@ -248,14 +253,14 @@ const publishDurably = async ({ key, deliveryId, text, addressed = true }) => {
 };
 
 const proveNativeDelivery = async (delivery, baseline) => {
-  const deadlineMs = Math.max(0, delivery.publishedAt + 90000 - Date.now());
+  const deadlineMs = Math.max(0, delivery.publishedAt + immediateWakeBoundMs - Date.now());
   await waitFor(() => {
     const newInferences = inferences().slice(baseline.inferences);
     const stateNow = inboxState(rootId);
     return eventReceipts(delivery.id).length === 1 && wakeReceipts(delivery.id).length === 1 &&
       newInferences.some(inference => inference.markers?.includes(delivery.text)) &&
       settled().length >= baseline.settled + 1 && Number(stateNow?.after) >= delivery.sequence;
-  }, `native inbox delivery, wake, inference, and settle for ${delivery.id} within 90 seconds`, deadlineMs);
+  }, `immediate exact-session inbox delivery, wake, inference, and settle for ${delivery.id} within ${immediateWakeBoundMs} ms`, deadlineMs);
 
   const wake = wakeReceipts(delivery.id);
   const receipt = eventReceipts(delivery.id);
@@ -263,6 +268,7 @@ const proveNativeDelivery = async (delivery, baseline) => {
   const settledDelta = settled().slice(baseline.settled);
   assert.equal(wake.length, 1, `one native inbox wake must name ${delivery.id}`);
   assert.deepEqual(wake[0].data.ids, [delivery.id]);
+  assert.equal(wake[0].data.reason, 'addressed', 'native wake must use the exact-session addressed path');
   assert.equal(receipt.length, 1, `one native session inbox receipt must name ${delivery.id}`);
   assert.deepEqual(receipt[0].details.ids, [delivery.id]);
   assert.ok(textOf(receipt[0].content).includes(delivery.text), 'persisted native inbox receipt must carry real event text');
@@ -276,10 +282,12 @@ const proveNativeDelivery = async (delivery, baseline) => {
   const wokeAt = wake[0].createdAt;
   const settledAt = settledDelta[0].receivedAt;
   const inferenceAt = newInferences[0].at;
-  assert.ok(wokeAt - delivery.publishedAt >= 60000, 'ordinary addressed answer must respect the native 60-second steer grace');
-  assert.ok(wokeAt - delivery.publishedAt <= 90000, 'native wake must occur within 90 seconds of durable publication');
-  assert.ok(inferenceAt - delivery.publishedAt <= 90000, 'assistant inference must occur within 90 seconds of durable publication');
-  assert.ok(settledAt - delivery.publishedAt <= 90000, 'native agent_settled must occur within 90 seconds of durable publication');
+  assert.ok(wokeAt - delivery.publishedAt < immediateWakeBoundMs,
+    'exact-session addressed answer must wake immediately (<15 seconds), without waiting for steer grace');
+  assert.ok(inferenceAt - delivery.publishedAt < immediateWakeBoundMs,
+    'assistant inference must follow immediate exact-session delivery within the loose 15-second bound');
+  assert.ok(settledAt - delivery.publishedAt < immediateWakeBoundMs,
+    'native agent_settled must follow immediate exact-session delivery within the loose 15-second bound');
   await sleep(500);
   assert.equal(settled().length, baseline.settled + 1, `no second native settle may follow ${delivery.id}`);
   assert.equal(inferences().length, baseline.inferences + 1, `no duplicate model call may follow ${delivery.id}`);
@@ -354,10 +362,12 @@ try {
   assert.equal(replay.senderId, first.senderId, 'true deliveryId replay must use the original sender identity');
   assert.equal(replay.deliveryId, control.deliveryId, 'true deliveryId replay must repeat the delivered explicit identity');
   await waitFor(() => Number(inboxState(rootId)?.after) >= unaddressed.sequence,
-    'native inbox cursor to pass the >60-second explicit replay and unaddressed event', 75000);
-  assert.ok(Date.now() - replay.publishedAt >= 60000, 'explicit deliveryId replay must be observed after normal grace');
-  assert.ok(Date.now() - unaddressed.publishedAt >= 60000, 'unaddressed control must be observed after normal grace');
-  await sleep(750);
+    'native inbox cursor to pass the explicit replay and unaddressed event', 75000);
+  const negativeCursorPassedAt = Date.now();
+  // Confirmed replays and unaddressed events can pass the cursor immediately. Observe after
+  // that positive progress signal, rather than imposing a steer-grace delay on negative work.
+  await sleep(negativeObservationMs);
+  const negativeObservedAt = Date.now();
   assert.equal(settled().length, baselineNegative.settled, 'replay and unaddressed controls must not start another native turn');
   assert.equal(inferences().length, baselineNegative.inferences, 'replay and unaddressed controls must not cause another assistant inference');
   assert.equal(wakes().length, baselineNegative.wakes, 'replay and unaddressed controls must not publish a native inbox wake');
@@ -371,7 +381,7 @@ try {
   const inboxIds = inboxEntries().flatMap(entry => entry.details?.ids ?? []);
   assert.deepEqual(inboxIds, [first.id, second.id, control.id], 'only the two distinct key-only events and explicit-identity control are delivered');
   assert.equal(prompts.length, 1, 'only the one activation prompt is allowed; both event turns must be promptless');
-  assert.ok(Date.now() - startedAt < 280000, 'proof must complete inside its 280-second hard work budget');
+  assert.ok(Date.now() - startedAt < totalBudgetMs, 'proof must complete inside its 180-second hard work budget');
 
   proof = {
     passed: true,
@@ -388,7 +398,10 @@ try {
     negativeControls: {
       explicitDeliveryIdReplay: replay,
       unaddressedEvent: unaddressed,
-      observedAfterGrace: true,
+      observedAfterCursor: true,
+      cursorPassedAt: negativeCursorPassedAt,
+      observedAt: negativeObservedAt,
+      observationMs: negativeObservedAt - negativeCursorPassedAt,
       settledDelta: settled().length - baselineNegative.settled,
       inferenceDelta: inferences().length - baselineNegative.inferences,
       wakeDelta: wakes().length - baselineNegative.wakes,

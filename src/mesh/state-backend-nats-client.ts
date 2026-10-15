@@ -1,10 +1,12 @@
 // The real JetStreamPort of the NATS mesh state backend (smarty-dev#7504): the official nats.js v3 client
 // (@nats-io/transport-node, @nats-io/jetstream). Loaded only by `openNatsStateBackend` (a lazy entry point), so the
-// startup graph never includes it. The optional third-party SDK packages are imported only at the first actual
-// `connectJetStream` call: a non-split bundle that flattens this module into a CLI must not gain top-level imports.
+// startup graph never includes it. The standalone fabric-mesh-backend bundle defers these SDK imports to this
+// module's lazy initialization (scripts/build.mjs, lazy-optional-sdk), so a copied bin without them still loads.
 import { randomUUID } from "node:crypto";
-import type { connect } from "@nats-io/transport-node";
-import type { JetStreamApiError, jetstreamManager } from "@nats-io/jetstream";
+import { connect } from "@nats-io/transport-node";
+import {
+  DeliverPolicy, JetStreamApiError, StorageType, jetstream, jetstreamManager,
+} from "@nats-io/jetstream";
 import {
   assertNatsPlacementTimeout, assertNatsReplicas, DEFAULT_NATS_PLACEMENT_TIMEOUT_MS, guardNatsPort, MeshStateNatsBusyError,
   MeshStateNatsRefusedError, MeshStateNatsUnavailableError, natsConnectOptions, NatsWrongLastSequenceError, redactNatsError,
@@ -54,11 +56,8 @@ const untilDeadline = async <T>(request: () => Promise<T>, deadline: number): Pr
     }),
   ]).finally(() => { if (timer !== undefined) clearTimeout(timer); });
 };
-type NatsReadBudget = NonNullable<Parameters<JetStreamPort["getMessage"]>[2]>;
-// Classification is bound to the SDK's own JetStreamApiError class (instance checks, never names), loaded lazily.
-const natsErrorClassifiers = (JetStreamApiErrorClass: typeof JetStreamApiError) => {
 const apiCode = (error: unknown): number | undefined => {
-  if (!(error instanceof JetStreamApiErrorClass)) return undefined;
+  if (!(error instanceof JetStreamApiError)) return undefined;
   try { return error.apiError().err_code; } catch { return error.code; }
 };
 const isTransientReadError = (error: unknown): boolean => {
@@ -70,7 +69,7 @@ const isTransientReadError = (error: unknown): boolean => {
     if (seen.has(current) || PERMANENT_TRANSPORT.has(current.name)) return false;
     seen.add(current);
     const cause = (current as Error & { cause?: unknown }).cause;
-    if (current instanceof JetStreamApiErrorClass) {
+    if (current instanceof JetStreamApiError) {
       try {
         const api = current.apiError();
         if (api.err_code === 10039) return false; // JetStreamNotEnabledForAccount is permanent, not election transience.
@@ -97,6 +96,7 @@ const isTransientTimeout = (error: unknown): boolean => {
   }
   return false;
 };
+type NatsReadBudget = NonNullable<Parameters<JetStreamPort["getMessage"]>[2]>;
 const retryTransientRead = async <T>(operation: () => Promise<T>, attempts = READ_RETRY_ATTEMPTS,
   budget?: NatsReadBudget): Promise<T> => {
   if (budget !== undefined) {
@@ -129,8 +129,6 @@ const retryTransientRead = async <T>(operation: () => Promise<T>, attempts = REA
     }
   }
 };
-return { apiCode, isTransientReadError, isTransientTimeout, retryTransientRead };
-};
 
 export interface ConnectJetStreamOptions {
   /** `http(s)://host:8222`: read `/varz` for `sync_always`. Host-provided only. */
@@ -161,11 +159,6 @@ export const connectJetStream = async (servers: string[], options: ConnectJetStr
     : assertNatsPlacementTimeout(options.placementTimeoutMs, "placementTimeoutMs");
   // Decided before any connection: an explicit value is validated, an omitted one is the agent layer's.
   const replicas = options.replicas === undefined ? await configuredReplicas() : assertNatsReplicas(options.replicas, "replicas");
-  // First actual use: load the optional SDK packages now, never at module evaluation or in the background.
-  const [{ connect }, { DeliverPolicy, JetStreamApiError, StorageType, jetstream, jetstreamManager }] = await Promise.all([
-    import("@nats-io/transport-node"), import("@nats-io/jetstream"),
-  ]);
-  const { apiCode, isTransientReadError, isTransientTimeout, retryTransientRead } = natsErrorClassifiers(JetStreamApiError);
   // smarty-dev#9663 item 2: a client or fetch error may quote a server URL; never pass its credentials on.
   let nc: Awaited<ReturnType<typeof connect>> | undefined;
   let jsm: Awaited<ReturnType<typeof jetstreamManager>>;

@@ -231,6 +231,33 @@ const hostProvided = /^(?:typebox|@sinclair\/typebox|@(?:earendil-works|mariozec
 // today; scripts/smoke-package-install.mjs fails if one gains another.
 // fabric-mesh-backend (smarty-dev#6477 W1) is here too: its writer census shares host-leases.ts with
 // index.js, and a split build would carve that out of index.js into one more startup chunk.
+// A flattened bundle hoists every external static import to its top, even one reached only through a lazily
+// initialized dynamic import(): the NATS SDK of state-backend-nats-client.ts would then load (and fail without its
+// optional packages) with every fabric-mesh-backend command. Here only, each SDK import becomes a module that
+// require()s the package inside the client's own lazy initialization. The client source keeps its static imports
+// (and its split-build lazy entry above); the bundle still imports no package file (assert-build-artifacts).
+// A name the client newly imports fails this build loudly ("No matching export"); add it here.
+const lazySdkExports = {
+  "@nats-io/transport-node": ["connect"],
+  "@nats-io/jetstream": ["DeliverPolicy", "JetStreamApiError", "StorageType", "jetstream", "jetstreamManager"],
+};
+const lazyOptionalSdk = {
+  name: "lazy-optional-sdk",
+  setup(pluginBuild) {
+    pluginBuild.onResolve({ filter: /^@nats-io\/(?:transport-node|jetstream)$/ }, (args) =>
+      args.kind === "import-statement" && /[\\/]src[\\/]mesh[\\/]state-backend-nats-client\.ts$/.test(args.importer)
+        ? { path: args.path, namespace: "lazy-optional-sdk" }
+        : undefined);
+    pluginBuild.onLoad({ filter: /.*/, namespace: "lazy-optional-sdk" }, (args) => ({
+      loader: "js",
+      contents: [
+        `import { createRequire } from "node:module";`,
+        `const sdk = createRequire(import.meta.url)(${JSON.stringify(args.path)});`,
+        `export const { ${lazySdkExports[args.path].join(", ")} } = sdk;`,
+      ].join("\n"),
+    }));
+  },
+};
 const standalone = await build({
   entryPoints: ["src/worker.ts", "src/memory/file-worker.ts", "src/storage/sweep-main.ts", "src/storage/retention-cli.ts",
     "src/mesh/mesh-backend-cli.ts"],
@@ -246,7 +273,7 @@ const standalone = await build({
   metafile: true,
   logLevel: "info",
   banner: { js: "// Bundles TypeBox (MIT, Copyright (c) 2017-2026 Haydn Paterson); see THIRD_PARTY_NOTICES.md." },
-  plugins: [{
+  plugins: [lazyOptionalSdk, {
     name: "external-except-host-provided",
     setup(pluginBuild) {
       pluginBuild.onResolve({ filter: /^[^./]/ }, (args) =>

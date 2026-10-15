@@ -467,10 +467,11 @@ describe("NATS state backend (smarty-dev#7504 phase 1)", () => {
   });
 
   describe("a root opens only the stream its marker names, and never an import in progress (smarty-dev#9690)", () => {
-    it("no marker, another root's stream, or a missing stream refuses; the open creates nothing", async () => {
+    it("file state without a marker, another root's stream, or a missing stream refuses; the open creates nothing", async () => {
       const server = fakeJetStream();
       const bare = root();
       fs.mkdirSync(bare, { recursive: true, mode: 0o700 });
+      fs.writeFileSync(path.join(bare, "state.json"), JSON.stringify({ format: 1, entries: {} }));
       await expect(openNatsStateBackend({ root: bare, port: server.port() })).rejects.toThrow(/has no NATS moved marker/);
       // pi-fabric#937: a marker naming a stream that is not this root's (fixed or per-switch) refuses before any stream call.
       const foreign = root();

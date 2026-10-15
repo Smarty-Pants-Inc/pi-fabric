@@ -1544,9 +1544,12 @@ export const assertNatsMaxPayload = (server: { maxPayload?: number }): void => {
  */
 export const openNatsStateBackend = async (options: OpenNatsStateBackendOptions): Promise<NatsStateBackend> => {
   const root = path.resolve(options.root);
-  const decision = decideNatsRootOpen(root);
+  // Sample before the first await, but preserve main's endpoint-security refusal precedence. A bad root is still
+  // refused after endpoint validation; its failure can never turn into bootstrap if the files disappear meanwhile.
+  const decision = (() => { try { return decideNatsRootOpen(root); } catch (error) { return { error }; } })();
   const { port, owned, server } = await connectNatsEndpoint(options);
   try {
+    if ("error" in decision) throw decision.error;
     assertNatsServerSupported(server.version);
     if (server.syncAlways !== true && options.acceptPeriodicSync !== true) {
       throw new MeshStateNatsRefusedError(`nats-server does not report sync_always (got ${String(server.syncAlways)}): an acked write may not survive a power loss; the operator may accept it explicitly`);

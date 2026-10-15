@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { format } from "node:util";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // smarty-dev#9569 Commit A: release-outcome semantics (T4 typed errors, operation once, primary preservation, nested
@@ -27,6 +28,7 @@ vi.mock("../src/core/atomic-write.js", async importOriginal => ({
 
 const {
   finalizeMeshLocks, MeshLockReleaseError, meshLockSecondaryReleaseErrors, MeshLockPreEntryRefusedError, windowsMeshReleaser,
+  runUnderMeshLocks,
 } = await import("../src/mesh/lock-release.js");
 const { MeshLock } = await import("../src/mesh/mesh-lock.js");
 const { holdMeshFence, holdMeshFenceSync } = await import("../src/mesh/fence-lock.js");
@@ -96,6 +98,62 @@ describe("shared finalizer (T4, platform independent)", () => {
     expect(secondary!.cause).toBe(primary);
     expect(warn).toHaveBeenCalledWith(expect.stringContaining("FABRIC_MESH_LOCK_RELEASE_FAILED"));
   });
+
+  // Keep: #1191 security boundary. Capture the real finalizer's warning, not just the thrown-value metadata.
+  it.each(["Error instance", "string"] as const)(
+    "#1191 captured secondary alarm redacts application secrets from a %s primary", category => {
+      const messageMarker = "1191_APPLICATION_MESSAGE_SECRET";
+      const nameMarker = "1191_APPLICATION_NAME_SECRET";
+      const primitiveMarker = "1191_APPLICATION_PRIMITIVE_SECRET";
+      const applicationError = new Error(messageMarker);
+      applicationError.name = nameMarker;
+      const primary = category === "Error instance" ? applicationError : primitiveMarker;
+      const operation = vi.fn(() => { throw primary; });
+      const release = recorder(refused as never);
+      let caught: unknown = Symbol("not thrown");
+      try { runUnderMeshLocks(operation, [{ lock: "L", release }]); } catch (error) { caught = error; }
+      expect(caught).toBe(primary);
+      expect(operation).toHaveBeenCalledTimes(1);
+      expect(release).toHaveBeenCalledTimes(1);
+      expect(warn).toHaveBeenCalledTimes(1);
+
+      // Check every argument as well as console.warn's formatted output; no extra argument may carry the primary.
+      const captured = warn.mock.calls.flatMap(args => [...args.map(arg => format(arg)), format(...args)]).join("\n");
+      for (const marker of [messageMarker, nameMarker, primitiveMarker]) expect(captured).not.toContain(marker);
+      const expected = new MeshLockReleaseError("L", "threw", refused as never, release, { cause: primary });
+      expect(warn.mock.calls).toEqual([
+        [`[pi-fabric] ALARM ${expected.kind} (secondary to ${category}): ${expected.message}`],
+      ]);
+      const secondaries = meshLockSecondaryReleaseErrors(primary);
+      if (primary instanceof Error) {
+        expect(secondaries).toHaveLength(1);
+        expect(secondaries[0]!.cause).toBe(primary);
+        expect(secondaries[0]).toMatchObject({ operationState: "threw", operationCompleted: false, releaseOutcome: refused });
+      } else {
+        expect(secondaries).toEqual([]);
+      }
+    });
+
+  it.each(["name", "message"] as const)(
+    "#1191 captured secondary alarm never reads an application Error.%s getter", property => {
+      const primary = new Error("1191_UNREAD_APPLICATION_MESSAGE");
+      const read = vi.fn(() => { throw new Error("1191_HOSTILE_GETTER_SECRET"); });
+      Object.defineProperty(primary, property, { get: read });
+      const release = recorder(unknown as never);
+      let caught: unknown = Symbol("not thrown");
+      try { runUnderMeshLocks(() => { throw primary; }, [{ lock: "L", release }]); } catch (error) { caught = error; }
+      expect(caught).toBe(primary);
+      expect(read).not.toHaveBeenCalled();
+      expect(release).toHaveBeenCalledTimes(1);
+      const secondaries = meshLockSecondaryReleaseErrors(primary);
+      expect(secondaries).toHaveLength(1);
+      expect(secondaries[0]!.cause).toBe(primary);
+      const expected = new MeshLockReleaseError("L", "threw", unknown as never, release, { cause: primary });
+      expect(warn.mock.calls).toEqual([
+        [`[pi-fabric] ALARM ${expected.kind} (secondary to Error instance): ${expected.message}`],
+      ]);
+      expect(format(...warn.mock.calls[0]!)).not.toContain("1191_");
+    });
 
   it.each([["string", "plain failure"], ["number", 42], ["frozen object", Object.freeze({ reason: "x" })], ["undefined", undefined]])(
     "preserves a non-Error %s primary unmutated with an observable secondary report", (_kind, primary) => {

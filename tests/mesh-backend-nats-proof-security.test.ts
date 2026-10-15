@@ -32,6 +32,16 @@ const staged = async (label: string, server: FakeJetStreamServer): Promise<{ roo
   return { root, check: checks[0]! };
 };
 
+/** Without POSIX ownership the proof write fails closed, including on Windows (smarty-dev#7548). */
+const NO_POSIX_OWNER = /reader registry .* is unverifiable: this platform has no POSIX owner \(smarty-dev#7548\): proof not written/;
+const provedOrFailClosed = async (root: string, proving: ReturnType<typeof proveFabricReader>):
+  Promise<Awaited<ReturnType<typeof proveFabricReader>> | undefined> => {
+  if (process.geteuid !== undefined) return await proving;
+  await expect(proving).rejects.toThrow(NO_POSIX_OWNER);
+  expect(fs.existsSync(path.join(root, "readers"))).toBe(false);
+  return undefined;
+};
+
 describe("nats reader proof endpoint security", () => {
   it("refuses a foreign root's stream before any server call or proof write", async () => {
     const root = tempDir("own");
@@ -58,10 +68,12 @@ describe("nats reader proof endpoint security", () => {
     expect(fs.existsSync(path.join(root, "readers"))).toBe(false);
     // The same remote server requiring authentication: the proof reads and binds the staged stream.
     server.authRequired = true;
-    const proved = await proveFabricReader(root, { backend: "nats", nats: { stream: check.stream, port: server.port(),
-      servers: ["tls://nats.example.com:4222"], replicas: 1 } });
-    expect(proved.entries).toBe(1);
-    expect(proved.proof).toMatchObject({ backends: ["nats"], switchId: check.switchId, stream: check.stream, head: check.head, digest: check.digest });
+    const proved = await provedOrFailClosed(root, proveFabricReader(root, { backend: "nats", nats: { stream: check.stream, port: server.port(),
+      servers: ["tls://nats.example.com:4222"], replicas: 1 } }));
+    if (proved) {
+      expect(proved.entries).toBe(1);
+      expect(proved.proof).toMatchObject({ backends: ["nats"], switchId: check.switchId, stream: check.stream, head: check.head, digest: check.digest });
+    }
   });
 
   it("refuses an unsynced or oversized-payload server before any stream read, unless sync is accepted explicitly", async () => {
@@ -78,8 +90,8 @@ describe("nats reader proof endpoint security", () => {
       .rejects.toThrow(/max_payload/);
     expect(oversized.calls).toEqual(["server"]);
     server.maxPayload = 1024 * 1024;
-    const accepted = await proveFabricReader(root, { backend: "nats", nats: { stream: check.stream, port: server.port(), acceptPeriodicSync: true } });
-    expect(accepted.entries).toBe(1);
+    const accepted = await provedOrFailClosed(root, proveFabricReader(root, { backend: "nats", nats: { stream: check.stream, port: server.port(), acceptPeriodicSync: true } }));
+    if (accepted) expect(accepted.entries).toBe(1);
   });
 
   it("awaits plaintext/DNS endpoint validation before port.server()", async () => {
@@ -108,8 +120,26 @@ describe("nats reader proof endpoint security", () => {
     // A plaintext name that resolves only to loopback is pinned and allowed.
     vi.stubEnv("PI_FABRIC_RELEASE_SHA", "relA");
     const loopback: NatsLookup = async () => [{ address: "127.0.0.1", family: 4 }];
-    const proved = await proveFabricReader(root, { backend: "nats", nats: { stream: check.stream, port: server.port(),
-      servers: ["nats://localhost:4222"], lookup: loopback } });
-    expect(proved.entries).toBe(1);
+    const proved = await provedOrFailClosed(root, proveFabricReader(root, { backend: "nats", nats: { stream: check.stream, port: server.port(),
+      servers: ["nats://localhost:4222"], lookup: loopback } }));
+    if (proved) expect(proved.entries).toBe(1);
+  });
+
+  it("fails closed without process.geteuid on every platform: the stream is read, no proof is written (smarty-dev#7548)", async () => {
+    const server = fakeJetStream();
+    const { root, check } = await staged("noeuid", server);
+    vi.stubEnv("PI_FABRIC_RELEASE_SHA", "relA");
+    const saved = Object.getOwnPropertyDescriptor(process, "geteuid");
+    Object.defineProperty(process, "geteuid", { value: undefined, configurable: true, writable: true });
+    try {
+      const port = server.port();
+      await expect(proveFabricReader(root, { backend: "nats", nats: { stream: check.stream, port } })).rejects.toThrow(NO_POSIX_OWNER);
+      expect(port.calls).toContain("consume");
+      expect(port.calls.filter(call => call === "streamInfo")).toHaveLength(2);
+    } finally {
+      if (saved) Object.defineProperty(process, "geteuid", saved);
+      else delete (process as { geteuid?: unknown }).geteuid;
+    }
+    expect(fs.existsSync(path.join(root, "readers"))).toBe(false);
   });
 });

@@ -24,7 +24,6 @@ import {
 } from "./state-file.js";
 import { validateMeshStateKey } from "./state-sqlite.js";
 import { readMeshStateNatsMarker } from "./backend-fence.js";
-import { holdMeshFence } from "./fence-lock.js";
 import { MeshLockTimeoutError } from "../core/atomic-write.js";
 import { MeshSyncNotDurableError } from "./not-durable.js";
 
@@ -1580,18 +1579,12 @@ export const openNatsStateBackend = async (options: OpenNatsStateBackendOptions)
       syncAlways: server.syncAlways });
     if (backend.diagnostics().nats?.status === "retired") { backend.close(); throw new MeshStateNatsRefusedError(`the stream ${stream} is retired`); }
     // File data may appear while the server, the ensure and the replay were awaited: recheck the same decision (and the
-    // root's identity) before registering. An existing root is rechecked and registered under the migration fence, so
-    // no import can stage between the recheck and the registration; an absent root is never created (no disk write).
-    const register = (): void => {
-      try { assertSameNatsRootDecision(root, decision); } catch (error) { backend.close(); throw error; }
-      prepared.get(root)?.close();
-      prepared.set(root, backend);
-    };
-    if (decision.identity === undefined) register();
-    else {
-      try { await holdMeshFence(root, { lockTimeoutMs: options.lockTimeoutMs ?? 5_000 }, register); }
-      catch (error) { if (prepared.get(root) !== backend) backend.close(); throw error; }
-    }
+    // root's identity) synchronously, with no await between the recheck and registration. An open takes neither
+    // custody.lock nor the mesh .lock; the migration tools retain their fence. A changed marker refuses here.
+    // This is not a durable file-writer fence for fresh-root bootstrap (accepted gap smarty-dev#13524).
+    try { assertSameNatsRootDecision(root, decision); } catch (error) { backend.close(); throw error; }
+    prepared.get(root)?.close();
+    prepared.set(root, backend);
     return backend;
   } catch (error) {
     if (owned) await port.close().catch(() => undefined);

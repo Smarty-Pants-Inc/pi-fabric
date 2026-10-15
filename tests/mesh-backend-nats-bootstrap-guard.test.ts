@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { encodeMeshStateNatsMarker } from "../src/mesh/backend-fence.js";
+import { holdMeshFence } from "../src/mesh/fence-lock.js";
 import { natsRollbackSelection } from "../src/mesh/mesh-backend-cli.js";
 import {
   closeNatsStateBackend, decideNatsRootOpen, natsStreamName, openNatsStateBackend, preparedNatsStateBackend,
@@ -124,6 +125,101 @@ describe("decision B: fixed-root bootstrap only with no file state", () => {
     expect(decideNatsRootOpen(root)).toMatchObject({ kind: "marker", stream });
     expect(port.calls).not.toContain("createStream");
     expect(preparedNatsStateBackend(root)).toBe(backend);
+  });
+});
+
+// Record these root-write receivers and the exact .lock predicate used by the real multiprocess child.
+const MUTATORS = ["mkdirSync", "mkdtempSync", "renameSync", "writeFileSync", "rmSync", "rmdirSync", "unlinkSync", "linkSync", "symlinkSync"] as const;
+interface RootWrites { writes: string[]; lockAttempts: number }
+const recordRootWrites = (root: string): RootWrites => {
+  const record: RootWrites = { writes: [], lockAttempts: 0 };
+  const isLock = (target: unknown) => path.basename(String(target)).startsWith(".lock") && path.dirname(path.resolve(String(target))) === path.resolve(root);
+  const inRoot = (target: unknown): boolean => {
+    if (typeof target !== "string" && !Buffer.isBuffer(target) && !(target instanceof URL)) return false;
+    const resolved = path.resolve(String(target));
+    return resolved === root || resolved.startsWith(`${root}${path.sep}`);
+  };
+  for (const name of MUTATORS) {
+    const original = fs[name] as unknown as (...args: unknown[]) => unknown;
+    vi.spyOn(fs, name).mockImplementation(((...args: unknown[]) => {
+      if ((["mkdirSync", "mkdtempSync", "renameSync"] as string[]).includes(name) && (isLock(args[0]) || (name === "renameSync" && isLock(args[1])))) record.lockAttempts += 1;
+      const hit = [args[0], name === "renameSync" || name === "linkSync" || name === "symlinkSync" ? args[1] : undefined].find(inRoot);
+      if (hit !== undefined) record.writes.push(`${name} ${path.relative(root, path.resolve(String(hit))) || "."}`);
+      return original.apply(fs, args);
+    }) as never);
+  }
+  return record;
+};
+const lockWrites = (writes: string[]): string[] => writes.filter(write => /(^|\s)(\.lock|custody\.lock)/.test(write) || write.endsWith(" ."));
+const identity = { id: "tester", name: "tester", kind: "agent" as const };
+const markRoot = (root: string, stream = `${natsStreamName(root)}_${SWITCH}`): string => {
+  fs.writeFileSync(path.join(root, "state.json"), encodeMeshStateNatsMarker(stream, 1), { mode: 0o600 });
+  return stream;
+};
+
+describe("steady-state marked-root open takes no fence (smarty-dev#6477 L2a)", () => {
+  it("the recorder sees the fence's custody.lock and .lock receivers (control)", async () => {
+    const root = freshRoot();
+    markRoot(root);
+    const recorded = recordRootWrites(root);
+    await holdMeshFence(root, { lockTimeoutMs: 2_000 }, () => undefined);
+    expect(recorded.lockAttempts).toBeGreaterThan(0);
+    expect(recorded.writes.some(write => /custody\.lock/.test(write))).toBe(true);
+    expect(recorded.writes.some(write => / \.lock/.test(write))).toBe(true);
+  });
+
+  it("a marked root opens, registers and serves state with no write into the root (no custody.lock, no .lock)", async () => {
+    const root = freshRoot();
+    const stream = markRoot(root);
+    const before = snapshot(root);
+    const recorded = recordRootWrites(root);
+    const server = fakeJetStream();
+    const { port, opened } = openWith(server, root);
+    const backend = await opened as Awaited<ReturnType<typeof openNatsStateBackend>>;
+    expect(recorded).toEqual({ writes: [], lockAttempts: 0 });
+    expect(port.calls).not.toContain("createStream");
+    expect(preparedNatsStateBackend(root)).toBe(backend);
+    expect(backend.diagnostics().nats?.status).toBe("ready");
+    await backend.put({ key: "steady/a", value: 1, identity });
+    expect(backend.get("steady/a")?.value).toBe(1);
+    expect(recorded).toEqual({ writes: [], lockAttempts: 0 });
+    expect(fs.readdirSync(root).filter(name => name.includes("lock"))).toEqual([]);
+    expect(snapshot(root)).toEqual(before);
+    expect(decideNatsRootOpen(root)).toMatchObject({ kind: "marker", stream });
+  });
+
+  const changes: [string, (root: string) => void][] = [
+    ["another own-root stream's marker", root => { markRoot(root, natsStreamName(root)); }],
+    ["live file state", root => fs.writeFileSync(path.join(root, "state.json"), STATE)],
+    ["a staged intent beside the marker", root => fs.writeFileSync(path.join(root, "state.json.nats-intent"),
+      JSON.stringify({ switchId: SWITCH, stream: `${natsStreamName(root)}_${SWITCH}` }))],
+  ];
+  for (const [name, change] of changes) {
+    it(`refuses a marker replaced by ${name} during the async open: nothing registered, no lock taken`, async () => {
+      const root = freshRoot();
+      markRoot(root);
+      const recorded = recordRootWrites(root);
+      const server = fakeJetStream();
+      server.beforeConsume = () => { change(root); };
+      const { opened } = openWith(server, root);
+      await expect(opened).rejects.toThrow(/changed while its NATS stream was opened|no NATS moved marker|unfinished switch/);
+      expect(preparedNatsStateBackend(root)).toBeUndefined();
+      expect(recorded.lockAttempts).toBe(0);
+      expect(lockWrites(recorded.writes)).toEqual([]);
+    });
+  }
+
+  it("refuses a marked root whose stream is retired: nothing registered, no lock taken", async () => {
+    const root = freshRoot();
+    markRoot(root);
+    const server = fakeJetStream();
+    server.append(Buffer.from(JSON.stringify({ format: 1, type: "retire", epoch: 2 })));
+    const recorded = recordRootWrites(root);
+    const { port, opened } = openWith(server, root);
+    await expect(opened).rejects.toThrow(/retired/);
+    expect(port.calls).not.toContain("createStream");
+    expect(preparedNatsStateBackend(root)).toBeUndefined();
+    expect(recorded).toEqual({ writes: [], lockAttempts: 0 });
   });
 });
 

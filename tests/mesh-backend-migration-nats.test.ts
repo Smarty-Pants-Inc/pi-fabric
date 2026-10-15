@@ -373,7 +373,8 @@ describe("the per-switch stream, its intent and the commit hook (smarty-dev#9690
     expect(intent.switchId).toMatch(/^[0-9a-f]{32}$/);
     expect(intent.stream).toBe(`${natsStreamName(root)}_${intent.switchId}`);
     expect((port as FakePort).calls).not.toContain("ensureStream"); // the intent precedes the stream
-    expect((fs.statSync(path.join(root, "state.json.nats-intent")).mode & 0o777).toString(8)).toBe("600");
+    // Windows has no POSIX modes (stat reports 666); all other intent checks remain cross-platform.
+    if (process.platform !== "win32") expect((fs.statSync(path.join(root, "state.json.nats-intent")).mode & 0o777).toString(8)).toBe("600");
     const done = await importMeshStateToNats(root, { port });
     expect(done).toMatchObject({ stream: intent.stream, digest, converged: false });
     // The import created its stream with the backend's message cap (pi-fabric#907), which the root's open requires.

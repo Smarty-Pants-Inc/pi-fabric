@@ -202,13 +202,14 @@ then import. The details:
   replicas and readiness path, as before. Everything else refuses and nothing is bootstrapped: live file state, a staged
   import (`state.json.nats-intent`), leftovers without a marker, a partial, truncated or malformed marker, a marker for
   another root's stream, and any unreadable entry (its own error, e.g. EACCES). The decision is rechecked after the
-  stream is opened (same kind, stream and root `dev:ino`); an existing root is rechecked and registered under the
-  migration fence, an absent root is never created. An observed change closes the backend and refuses, with nothing
-  registered. This recheck is not a durable file-side fence: a concurrent or later file writer can still race the
-  fresh-root bootstrap (known inherited gap smarty-dev#13524). Do not run a file writer and a NATS backend on the
-  same empty root until that durable fence is implemented.
+  stream is opened (same kind, stream and root `dev:ino`); recheck and registration are lock-free, with no await
+  between them. Opening a root takes neither `custody.lock` nor the mesh `.lock`; migration tools retain their fence.
+  An absent root is never created. An observed change closes the backend and refuses, with nothing registered.
+  This recheck is not a durable file-side fence: a concurrent or later file writer can still race the fresh-root
+  bootstrap (known inherited gap smarty-dev#13524). Do not run a file writer and a NATS backend on the same empty
+  root until that durable fence is implemented.
 - **Fixed-root preflight:** before a new import writes its intent or a stream, the root's fixed-root stream is
-  checked: if it exists and is not retired (live state of a bootstrapped root), the import refuses rather than fork it.
+  checked: if it exists and is not retired (live state of a bootstrapped root), the import refuses and never forks it.
   An absent or retired fixed-root stream lets the new switch begin.
 - **Files:** every file is created with O_CREAT|O_EXCL|O_NOFOLLOW at 0600 and checked as our own
   regular file. An existing kept copy must be ours and hold the source's digest, else the import refuses.

@@ -163,7 +163,9 @@ export const claimStartingHost = async (input: {
           // TRANSITIONAL: old releases lack pid+birth. Keep their TTL admission until the
           // D5 wave leaves no identity-less lease in the directory for 24 h; then remove it.
           // A proven-live process NEVER loses custody merely because its lease expired.
-          if (state === "unknown" && current.expiresAt <= Date.now()) return;
+          const legacyIdentity = !current.process || !validProcessIncarnation(current.process.startTime);
+          // A recorded native identity with an unreadable live probe is NOT a legacy lease.
+          if (state === "unknown" && legacyIdentity && current.expiresAt <= Date.now()) return;
           throw new FabricHostLeasePredecessorBusyError(current);
         } });
       return { meshRoot: input.meshRoot, lease };

@@ -1,6 +1,7 @@
 // Keep: same-session startup takeover is an inbox-privacy and process-authority boundary.
 // Real-process gate: SIGKILL targets only owned fixture children.
 // Run directly: bunx vitest run --cache=false tests/starting-main-takeover.test.ts
+// The native procfs read-refusal case is Linux-only; other real-process cases cover all native identity platforms.
 // All evidence roots are retained in this invocation's TMPDIR; no cleanup/removal.
 import fs from "node:fs";
 import os from "node:os";
@@ -17,11 +18,12 @@ const cases = [
   ["birth", "treats a recorded old birth as exited despite the same real PID remaining live"],
   ["slow", "continues a >30-second same-session startup after predecessor death and sender close"],
   ["unknown", "fences malformed and legacy-unknown identity before TTL, then permits transitional legacy expiry"],
+  ["unreadable", "keeps a valid recorded identity fenced after TTL when its live birth probe is unreadable"],
 ] as const;
 
 describe("real-process starting Main defensive takeover", () => {
   for (const [name, contract] of cases) {
-    it(contract, async () => {
+    it.skipIf(name === "unreadable" && process.platform !== "linux")(contract, async () => {
       const tmp = fs.mkdtempSync(path.join(os.tmpdir(), `starting-main-gate-${name}-`));
       const child = spawn(process.env.BUN_BIN ?? "bun", ["scripts/probe-starting-host-takeover.ts", "--case", name], {
         cwd: repo, env: { ...process.env, TMPDIR: tmp, TMP: tmp, TEMP: tmp },

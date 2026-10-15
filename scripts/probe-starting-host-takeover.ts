@@ -1,5 +1,5 @@
 // Real-process defensive gate; run only in an authorized isolated TMPDIR.
-// bun scripts/probe-starting-host-takeover.ts [--case live|death|handoff|birth|slow|unknown]
+// bun scripts/probe-starting-host-takeover.ts [--case live|death|handoff|birth|slow|unknown|unreadable]
 // Retains all fixture roots. Never signals a process not spawned by this invocation.
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -18,7 +18,7 @@ import * as leases from "../src/topology/host-leases.js";
 import type { FabricParticipantInfo } from "../src/topology/types.js";
 import { validProcessIncarnation } from "../src/core/atomic-write.js";
 
-export const CASES = ["live", "death", "handoff", "birth", "slow", "unknown"] as const;
+export const CASES = ["live", "death", "handoff", "birth", "slow", "unknown", "unreadable"] as const;
 export type ProbeCase = typeof CASES[number];
 type Ports = ConstructorParameters<typeof AgentMessageRouter>;
 type Wire = { phase?: string; request?: string; action?: string; error?: string; [key: string]: unknown };
@@ -74,7 +74,19 @@ const router = (meshRoot: string, who: MeshIdentity, main: Ports[2], control: Fa
 const makePlane = (mesh: MeshStore, who: MeshIdentity, epoch?: string) => new FabricControlPlane(mesh, who,
   { enabled: true, hostId: who.id, canConsumeMesh: () => true, ...(epoch ? { ownerIncarnation: epoch } : {}) });
 
-async function childMain(meshRoot: string, sessionId: string, slow: boolean) {
+async function childMain(meshRoot: string, sessionId: string, slow: boolean, unreadablePid?: number) {
+  // Read-refusal injection only, not mocked liveness: PID existence and recorded birth
+  // remain real. This covers a trust-boundary failure that needs admin rights to create.
+  if (unreadablePid) {
+    const nativeRead = fs.readFileSync;
+    fs.readFileSync = ((file: fs.PathOrFileDescriptor, ...args: unknown[]) => {
+      if (String(file) === `/proc/${unreadablePid}/stat`) {
+        emit({ phase: "birth-probe-refused", pid: unreadablePid });
+        throw Object.assign(new Error("birth probe refused"), { code: "EPERM" });
+      }
+      return Reflect.apply(nativeRead, fs, [file, ...args]);
+    }) as typeof fs.readFileSync;
+  }
   // Process-owned finite deadline, including a stuck claim or lost parent IPC.
   setTimeout(() => process.exit(124), 75_000).unref();
   process.once("disconnect", () => process.exit(0));
@@ -154,14 +166,14 @@ class Peer {
   readonly bus = new EventEmitter();
   readonly exited: Promise<{ code: number | null; signal: NodeJS.Signals | null }>;
   private stderr = "";
-  constructor(readonly root: string, readonly sessionId: string, slow = false) {
+  constructor(readonly root: string, readonly sessionId: string, slow = false, unreadablePid?: number) {
     const env: NodeJS.ProcessEnv = { ...process.env, TMPDIR: root, TMP: root, TEMP: root,
       PI_FABRIC_MESH_ROOT: root, PI_FABRIC_PROJECT_ROOT: root, PI_CODING_AGENT_DIR: path.join(root, "agent") };
     for (const key of Object.keys(env)) {
       if ((key.startsWith("PI_FABRIC_") && !["PI_FABRIC_MESH_ROOT", "PI_FABRIC_PROJECT_ROOT"].includes(key)) ||
         ["HERDR_PANE_ID", "HERDR_SOCKET_PATH", "PI_SESSION_ID", "PI_SESSION_FILE", "SMARTY_AGENT", "SMARTY_ROLE"].includes(key)) delete env[key];
     }
-    this.child = spawn(process.execPath, [self, "--child", root, sessionId, slow ? "slow" : "ready"],
+    this.child = spawn(process.execPath, [self, "--child", root, sessionId, slow ? "slow" : "ready", String(unreadablePid ?? "")],
       { cwd: root, env, stdio: ["ignore", "ignore", "pipe", "ipc"] });
     this.child.stderr!.on("data", chunk => { this.stderr = (this.stderr + String(chunk)).slice(-8_000); });
     this.child.on("message", (message: Wire) => { this.messages.push(message); this.bus.emit("change"); });
@@ -218,7 +230,7 @@ export async function runCase(name: ProbeCase) {
   const source = router(root, senderId, { id: senderId.id, local: true, interactive: true,
     matches: target => target === senderId.id, deliverAgent: () => { throw new Error("sender cannot receive fixture messages"); } }, sender);
   sender.start(() => ({ accepted: false }));
-  const add = (slow = false) => { const peer = new Peer(root, sessionId, slow); peers.push(peer); return peer; };
+  const add = (slow = false, unreadablePid?: number) => { const peer = new Peer(root, sessionId, slow, unreadablePid); peers.push(peer); return peer; };
   const read = () => { const lease = leases.readHostLeaseCurrent(root, id); assert(lease); return lease; };
   const send = (message: string, key = message) => source.routeMessage(id, message,
     { privateMarker: message }, "followUp", undefined, { idempotencyKey: key });
@@ -233,6 +245,24 @@ export async function runCase(name: ProbeCase) {
       assert.equal(await startupApi.markHostLeaseCleanHandoff(meshAt(root), original,
         { ownIncarnation: original.process.startTime }), false, "a public predecessor token is not handoff authority");
       assert.equal(read().cleanHandoff, undefined);
+    }
+    if (name === "unreadable") {
+      assert.equal(process.platform, "linux", "the procfs read-refusal probe is Linux-only");
+      await incumbent.rpc("ready", { expiryMs: 1_800 });
+      const expiry = read().expiresAt;
+      const successor = add(false, incumbent.child.pid!);
+      await successor.wait(message => message.phase === "claim-entered");
+      await delay(2_200);
+      assert(Date.now() > expiry);
+      assert(successor.messages.some(message => message.phase === "birth-probe-refused"));
+      assert.equal(localStartTime(incumbent.child.pid!), original.process.startTime);
+      assert(!successor.claimed(), "valid recorded birth with unreadable live probe must stay fenced after TTL");
+      assert.equal(read().incarnationToken, original.incarnationToken);
+      await incumbent.rpc("ready");
+      await send("unreadable-incumbent-private");
+      assert.deepEqual((await incumbent.calls()).map(call => call.message), ["unreadable-incumbent-private"]);
+      assert.deepEqual(await successor.calls(), []);
+      return receipt;
     }
     if (name === "birth" || name === "unknown") {
       const mesh = meshAt(root);
@@ -357,7 +387,7 @@ export async function runCase(name: ProbeCase) {
 }
 
 if (process.argv[2] === "--child") {
-  childMain(process.argv[3]!, process.argv[4]!, process.argv[5] === "slow").catch(error => {
+  childMain(process.argv[3]!, process.argv[4]!, process.argv[5] === "slow", Number(process.argv[6]) || undefined).catch(error => {
     emit({ error: errorText(error) }); process.exitCode = 1; process.disconnect?.();
   });
 } else if (path.resolve(process.argv[1] ?? "") === self) {

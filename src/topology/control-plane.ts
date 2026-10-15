@@ -1671,7 +1671,7 @@ export class FabricControlPlane {
         const fresh = readStartingFollowUp(inbox.root, commandId);
         if (!fresh) return;
         const completed = readStartingFollowUpCompletion(inbox.root, commandId);
-        if (completed?.incarnationToken === row.lease.incarnationToken && completed.ownerIncarnation === this.incarnation &&
+        if (completed && completed.incarnationToken === row.lease.incarnationToken && completed.ownerIncarnation === this.incarnation &&
           completed.senderId === row.event.from.id) {
           removeStartingFollowUp(inbox.root, commandId);
           return;

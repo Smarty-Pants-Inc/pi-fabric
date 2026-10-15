@@ -687,9 +687,10 @@ export class FabricState {
         // the successor ctx during session replacement (smarty-dev#5962).
         await candidate.initialize(context, config, {
           lifecycle: () => generation === this.#generation && !this.#shutDown && extensionContextLive(context),
-          ...(this.#startingHost ? { startingHost: this.#startingHost } : {}),
+          startingHost: this.#startingHost,
         });
         assertCurrent();
+        this.#startingHost = undefined;
         for (const provider of this.#externalProviders.values()) {
           candidate.registerExternal(provider, { overwrite: true });
         }

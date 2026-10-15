@@ -573,11 +573,16 @@ export class AgentMessageRouter {
     // participant still describes its predecessor. Steer and mirrored routes stay unchanged.
     if (kind === "followUp" && !provenLocal && this.control && !(isMain && this.mainAgent.local)) {
       const targetId = isMain ? this.mainAgent.id : id;
-      const queued = await this.control.queueStartingFollowUp?.(targetId, {
-        message, data, principal: options.principal, triggerTurn: options.triggerTurn ?? true,
-        ...(options.wakeCause ? { wakeCause: options.wakeCause } : {}),
-      }, options.idempotencyKey!, context?.signal, options.from ?? this.actorManager.identity);
-      if (queued) return queued;
+      // A startup lease only authorizes an exact Main session. Check the spawn-bound
+      // target before publication, even with no routable predecessor presence.
+      if (targetId.startsWith("session:")) {
+        assertTaskMainTarget(this.#taskReturnAddress, targetId);
+        const queued = await this.control.queueStartingFollowUp?.(targetId, {
+          message, data, principal: options.principal, triggerTurn: options.triggerTurn ?? true,
+          ...(options.wakeCause ? { wakeCause: options.wakeCause } : {}),
+        }, options.idempotencyKey!, context?.signal, options.from ?? this.actorManager.identity);
+        if (queued) return queued;
+      }
     }
     const remoteRoot = isMain || provenLocal ? undefined : this.#rootRouteSnapshot(id, authority);
     // Project members include peer roots, not just this host's Main and actors.

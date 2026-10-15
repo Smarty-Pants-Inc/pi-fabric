@@ -18,6 +18,8 @@ import type { SqliteOpener } from "../src/mesh/state-sqlite.js";
 const USER = "S-1-5-21-1-2-3-1001";
 const OTHER = "S-1-5-21-1-2-3-1002";
 const SYSTEM = "S-1-5-18";
+const LOCAL_SERVICE = "S-1-5-19";
+const NETWORK_SERVICE = "S-1-5-20";
 const ADMINS = "S-1-5-32-544";
 const FULL = 0x1f01ff;
 const METADATA = 0x00120080;
@@ -271,6 +273,7 @@ describe("Windows mesh ACL identity cache — Decision C MOCKED unit contract", 
         return JSON.stringify(snapshot);
       };
       const refusal = f.judge();
+      expect(f.native).toHaveBeenCalledTimes(1); // complete bad evidence is not a technical execution retry
       if (kind === "foreign ACE") expect(refusal).toContain(`grants ${OTHER}`);
       else if (kind === "unknown ACE") expect(refusal).toMatch(/unsupported or unproven ACE/);
       else expect(refusal).toMatch(/(?:unreadable|invalid) Windows/);
@@ -284,17 +287,117 @@ describe("Windows mesh ACL identity cache — Decision C MOCKED unit contract", 
       expect(f.native).toHaveBeenCalledTimes(2); // only this second, fully verified success may be retained
     });
 
-  it.each(["ENOENT", "ETIMEDOUT", "nonzero"])("CACHE-10 warned fail-open %s never becomes a cached proof", async kind => {
+  it.each(["ENOENT", "ETIMEDOUT", "nonzero"])("GAP13459-CACHE-10 terminal %s refuses after exactly two attempts and never caches", async kind => {
     const f = await fixture();
+    vi.spyOn(Atomics, "wait").mockReturnValue("timed-out");
     f.state.failure = Object.assign(new Error(`mocked native ${kind}`), kind === "nonzero" ? { status: 1 } : { code: kind });
-    expect(f.judge()).toBeUndefined();
-    expect(f.judge()).toBeUndefined();
+    expect(f.judge()).toMatch(/Windows ACL read failed .*after 1 retry/);
     expect(f.native).toHaveBeenCalledTimes(2);
-    expect(f.warning).toHaveBeenCalledTimes(1);
+    expect(f.judge()).toMatch(/Windows ACL read failed .*after 1 retry/);
+    expect(f.native).toHaveBeenCalledTimes(4); // no negative admission and no undefined/fail-open cache entry
+    expect(f.warning).not.toHaveBeenCalled();
     f.state.failure = undefined;
     f.unsafe(ROOT);
     expect(f.judge()).toContain(`grants ${OTHER}`);
-    expect(f.native).toHaveBeenCalledTimes(3);
+    expect(f.native).toHaveBeenCalledTimes(5);
+    f.entry(ROOT).dacl = trustedDacl();
+    expect(f.judge()).toBeUndefined();
+    expect(f.judge()).toBeUndefined();
+    expect(f.native).toHaveBeenCalledTimes(6); // only a later complete successful proof is cached
+  });
+
+  it.each(["ENOENT", "ETIMEDOUT", "nonzero"])(
+    "GAP13459-CACHE-31 transient %s may succeed only through the complete second read", async kind => {
+      const f = await fixture();
+      vi.spyOn(Atomics, "wait").mockReturnValue("timed-out");
+      f.native.mockImplementationOnce(() => { throw Object.assign(new Error("recorded transient read failure"),
+        kind === "nonzero" ? { status: 1 } : { code: kind }); });
+      expect(f.judge()).toBeUndefined();
+      expect(f.native).toHaveBeenCalledTimes(2);
+      expect(f.judge()).toBeUndefined();
+      expect(f.native).toHaveBeenCalledTimes(2); // cache belongs to the successful second snapshot, never the failure
+      f.stat(DB).ino += 1n;
+      f.unsafe(DB);
+      expect(f.judge()).toContain(`grants ${OTHER}`);
+      expect(f.native).toHaveBeenCalledTimes(3);
+      expect(f.warning).not.toHaveBeenCalled();
+    });
+
+  it.each(["malformed", "incomplete", "unsafe ACE"] as const)(
+    "GAP13459-CACHE-32 transient failure then %s never publishes an admission or makes a third attempt", async kind => {
+      const f = await fixture();
+      vi.spyOn(Atomics, "wait").mockReturnValue("timed-out");
+      f.native.mockImplementationOnce(() => { throw Object.assign(new Error("recorded transient failure"), { status: 1 }); });
+      if (kind === "unsafe ACE") f.unsafe(ROOT);
+      f.state.output = snapshot => kind === "malformed" ? "not JSON" : JSON.stringify(kind === "incomplete"
+        ? { ...snapshot, entries: snapshot.entries.slice(1) } : snapshot);
+      expect(f.judge()).toMatch(kind === "malformed" ? /unreadable Windows ACL snapshot/
+        : kind === "incomplete" ? /invalid Windows ACL snapshot/ : /grants S-1-5-21-1-2-3-1002/);
+      expect(f.native).toHaveBeenCalledTimes(2);
+      f.entry(ROOT).dacl = trustedDacl();
+      f.state.output = snapshot => JSON.stringify(snapshot);
+      expect(f.judge()).toBeUndefined();
+      expect(f.judge()).toBeUndefined();
+      expect(f.native).toHaveBeenCalledTimes(3);
+      expect(f.warning).not.toHaveBeenCalled();
+    });
+
+  it("GAP13459-CACHE-33 default retry config is two 20s reads plus one 100ms pause (40.1s configured)", async () => {
+    const f = await fixture();
+    const pause = vi.spyOn(Atomics, "wait").mockReturnValue("timed-out");
+    f.native.mockImplementationOnce(() => { throw Object.assign(new Error("recorded timeout"), { code: "ETIMEDOUT" }); });
+    expect(f.judge()).toBeUndefined();
+    expect(f.native).toHaveBeenCalledTimes(2);
+    const options = f.native.mock.calls.map(call => call[2] as { timeout: number; maxBuffer: number });
+    expect(options.map(option => option.timeout)).toEqual([20_000, 20_000]);
+    expect(options.map(option => option.maxBuffer)).toEqual([1024 * 1024, 1024 * 1024]);
+    expect(pause).toHaveBeenCalledTimes(1);
+    expect(pause.mock.calls[0]![3]).toBe(100);
+    expect(options.reduce((sum, option) => sum + option.timeout, 0) + pause.mock.calls[0]![3]!).toBe(40_100);
+    expect(f.warning).not.toHaveBeenCalled();
+  });
+
+  it("GAP13459-CACHE-34 real gate refuses terminal read failure before create/opener and never logs runner secrets", async () => {
+    const f = await fixture(USER, true);
+    vi.spyOn(Atomics, "wait").mockReturnValue("timed-out");
+    const logs = (["warn", "error", "log", "info", "debug"] as const).map(method =>
+      vi.spyOn(console, method).mockImplementation(() => undefined));
+    const secret = "PLANTED_POWERSHELL_PRIVATE_TOKEN";
+    f.state.failure = Object.assign(new Error(`powershell failed ${secret}`), { status: 1, stderr: secret, stdout: secret });
+    const sqliteOpen = vi.fn(() => ({ close: vi.fn() }) as never);
+    const create = vi.fn();
+    let refusal: unknown;
+    try { f.gate!.openPrivateStateDb(DB, sqliteOpen, create).close(); }
+    catch (error) { refusal = error; }
+    expect(refusal).toMatchObject({ code: "FABRIC_MESH_STATE_UNSUPPORTED",
+      message: expect.stringContaining(`Windows ACL read failed (exit 1) after 1 retry; root not opened: ${ROOT}`) });
+    expect(String(refusal)).not.toContain(secret);
+    expect(sqliteOpen).not.toHaveBeenCalled();
+    expect(create).not.toHaveBeenCalled();
+    expect(f.native).toHaveBeenCalledTimes(2);
+    expect(f.warning).not.toHaveBeenCalled();
+    for (const log of logs) expect(log).not.toHaveBeenCalled();
+  });
+
+  it.each([LOCAL_SERVICE, NETWORK_SERVICE].flatMap(owner => [...LEXICAL, ...REAL].map(ancestor => ({ owner, ancestor }))))(
+    "GAP13612-CACHE-31 unprotected root below $ancestor owned by $owner cannot publish a cache entry", async ({ owner, ancestor }) => {
+      const f = await fixture();
+      f.entry(ancestor).owner = owner;
+      f.entry(ROOT).control = 0x8004;
+      expect(f.judge()).toMatch(/inherit|protect/i);
+      expect(f.judge()).toMatch(/inherit|protect/i);
+      expect(f.native).toHaveBeenCalledTimes(2);
+      f.entry(ROOT).control = 0x9004; // same root/DB identities and safe DACL; now only protection changes
+      expect(f.judge()).toBeUndefined();
+      expect(f.judge()).toBeUndefined();
+      expect(f.native).toHaveBeenCalledTimes(3);
+      expect(f.warning).not.toHaveBeenCalled();
+    });
+
+  it("GAP13612-CACHE-32 no service ancestor retains a cacheable unprotected existing-root positive control", async () => {
+    const f = await fixture();
+    f.entry(ROOT).control = 0x8004;
+    f.warm();
   });
 
   it.each(["ENOBUFS", "ERR_CHILD_PROCESS_STDIO_MAXBUFFER"])("CACHE-11 overflow %s never caches incomplete proof", async code => {

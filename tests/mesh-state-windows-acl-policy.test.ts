@@ -129,6 +129,37 @@ describe("Windows mesh state ACL policy (smarty-dev#8920)", () => {
     }
   });
 
+  // Decision C: recorded snapshot policy only, not Windows/NTFS isolation proof. Service-owner admission
+  // remains ancestor-only; an existing state root below ANY such owner needs a protected DACL.
+  it.each([LOCAL_SERVICE, NETWORK_SERVICE].flatMap(owner => [1, 2, 3, 4].map(index => ({ owner, index }))))(
+    "GAP13612-01 safe root below lexical service owner $owner at ancestor $index requires protection", ({ owner, index }) => {
+      const entries = withEntry(index, { owner });
+      const refusal = judge(entries);
+      expect(refusal).toMatch(/inherit|protect/i);
+      expect(refusal).not.toContain(`is owned by ${owner}`);
+      entries[0] = { ...entries[0], control: 0x9004 };
+      expect(judge(entries)).toBeUndefined(); // identical owner/DACL/ancestor snapshot, only SE_DACL_PROTECTED differs
+    });
+
+  it.each([LOCAL_SERVICE, NETWORK_SERVICE].flatMap(owner => ["D:\\data", "D:\\"].map(ancestor => ({ owner, ancestor }))))(
+    "GAP13612-02 safe root below real-only service ancestor $ancestor ($owner) requires protection", ({ owner, ancestor }) => {
+      const realAncestors = ["D:\\data", "D:\\"].map(target => dir(target, target === ancestor ? owner : USER, profileDacl()));
+      const entries = [...defaultEntries().slice(0, 5), ...realAncestors, ...defaultEntries().slice(5)];
+      const input = { real: "D:\\data\\mesh" };
+      expect(judge(entries, input)).toMatch(/inherit|protect/i);
+      entries[0] = { ...entries[0], control: 0x9004 };
+      expect(judge(entries, input)).toBeUndefined();
+    });
+
+  it("GAP13612-03 keeps an unprotected existing root without service ancestors admissible", () => {
+    expect(judge(withEntry(0, { control: 0x8004 }))).toBeUndefined();
+  });
+
+  it.each([LOCAL_SERVICE, NETWORK_SERVICE])("GAP13612-04 protection never admits a service-owned strict root (%s)", owner => {
+    expect(judge(withEntry(0, { owner, control: 0x9004 }), {}, { ownerSid: owner }))
+      .toMatch(new RegExp(`mesh is owned by ${owner}, not the current user`));
+  });
+
   it("reads lexical and real ancestors once each", () => {
     const { run, calls } = runner([]);
     windowsStateAclRefusal({ ...request, real: "D:\\data\\mesh", files: [], directories: [] }, run);
@@ -580,12 +611,13 @@ describe("Windows mesh state ACL policy (smarty-dev#8920)", () => {
 
   // F2 trust boundary: either pipe can exceed execFileSync's maxBuffer. Node 24's observed spawnSync shape is
   // ENOBUFS/errno -105/status null/SIGTERM; do not mistake that incomplete proof for a missing executable.
-  it.each(["ENOBUFS", "ERR_CHILD_PROCESS_STDIO_MAXBUFFER"])("refuses %s from stdout or stderr overflow without warning", code => {
+  it.each(["ENOBUFS", "ERR_CHILD_PROCESS_STDIO_MAXBUFFER"])("GAP13459-04 refuses %s overflow once without retry or warning", code => {
     const warn = vi.spyOn(process, "emitWarning").mockImplementation(() => undefined);
     for (const stream of ["stdout", "stderr"]) {
-      const fail = () => { throw Object.assign(new Error(`${stream} maxBuffer exceeded`),
-        { code, errno: -105, status: null, signal: "SIGTERM", [stream]: "truncated output" }); };
+      const fail = vi.fn(() => { throw Object.assign(new Error(`${stream} maxBuffer exceeded`),
+        { code, errno: -105, status: null, signal: "SIGTERM", [stream]: "truncated output" }); });
       expect(windowsStateAclRefusal(request, fail)).toMatch(/incomplete Windows ACL snapshot .*buffer limit/);
+      expect(fail).toHaveBeenCalledTimes(1);
     }
     expect(warn).not.toHaveBeenCalled();
   });
@@ -596,24 +628,63 @@ describe("Windows mesh state ACL policy (smarty-dev#8920)", () => {
     ["timeout", { code: "ETIMEDOUT", status: null, signal: "SIGTERM" }],
     ["ENOBUFS", { code: "ENOBUFS", errno: -105, status: null, signal: "SIGTERM" }],
     ["ERR_CHILD_PROCESS_STDIO_MAXBUFFER", { code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER" }],
-  ] as const)("refuses a new-root setter runner failure (%s), never warning or accepting an unprotected root", (kind, fields) => {
+  ] as const)("GAP13459-05 refuses a new-root setter runner failure (%s) once, without execution retry", (kind, fields) => {
     const warn = vi.spyOn(process, "emitWarning").mockImplementation(() => undefined);
-    const fail = () => { throw Object.assign(new Error(`native setter ${kind}`), fields); };
+    const fail = vi.fn(() => { throw Object.assign(new Error(`native setter ${kind}`), fields); });
     expect(windowsStateAclRefusal({ ...request, protect: true }, fail)).toMatch(/was created but its private ACL could not be set/);
+    expect(fail).toHaveBeenCalledTimes(1);
     expect(warn).not.toHaveBeenCalled();
   });
 
-  it("warns once and opens as before for existing-root read ENOENT, nonzero exit and timeout", () => {
+  const technicalFailures = [
+    ["ENOENT", { code: "ENOENT" }],
+    ["nonzero exit", { status: 1 }],
+    ["timeout", { code: "ETIMEDOUT", status: null, signal: "SIGTERM" }],
+  ] as const;
+
+  it.each(technicalFailures)("GAP13459-01 existing-root %s retries exactly once then refuses without leaking diagnostics", (_kind, fields) => {
     const warn = vi.spyOn(process, "emitWarning").mockImplementation(() => undefined);
-    const fail = () => { throw Object.assign(new Error("spawn powershell.exe ENOENT"), { code: "ENOENT" }); };
-    expect(windowsStateAclRefusal(request, fail)).toBeUndefined();
-    expect(windowsStateAclRefusal(request, fail)).toBeUndefined();
-    for (const fields of [{ status: 1 }, { code: "ETIMEDOUT", status: null, signal: "SIGTERM" }]) {
-      expect(windowsStateAclRefusal(request, () => { throw Object.assign(new Error("native read failed"), fields); })).toBeUndefined();
-    }
-    expect(warn).toHaveBeenCalledTimes(1);
-    expect(String(warn.mock.calls[0]![0])).toMatch(/could not read Windows ACLs \(spawn powershell\.exe ENOENT\)/);
+    const logs = (["warn", "error", "log", "info", "debug"] as const).map(method =>
+      vi.spyOn(console, method).mockImplementation(() => undefined));
+    vi.spyOn(Atomics, "wait").mockReturnValue("timed-out"); // no real retry delay in mocked Decision C evidence
+    const privatePath = "C:\\private\\customer-secret";
+    const privateStderr = "PRIVATE_STDERR_TOKEN";
+    const fail = vi.fn(() => { throw Object.assign(new Error(`native read failed at ${privatePath}\n${privateStderr}`),
+      { ...fields, path: privatePath, stderr: privateStderr, stdout: privateStderr }); });
+    const refusal = windowsStateAclRefusal(request, fail);
+    expect(refusal).toMatch(/^Windows ACL read failed \((?:exit [^)]+|timeout)\) after 1 retry; root not opened: /);
+    expect(fail).toHaveBeenCalledTimes(2);
+    expect(fail.mock.calls[0]).toEqual(fail.mock.calls[1]); // same read-only plan, never a repair/protect
+    expect(refusal).toContain(request.root); // lead 22:39: retain caller root, never raw runner diagnostics
+    expect(refusal).not.toContain(privatePath);
+    expect(refusal).not.toContain(privateStderr);
+    expect(warn).not.toHaveBeenCalled();
+    for (const log of logs) expect(log).not.toHaveBeenCalled();
   });
+
+  it.each(technicalFailures)("GAP13459-02 existing-root transient %s accepts only the complete second snapshot", (_kind, fields) => {
+    const warn = vi.spyOn(process, "emitWarning").mockImplementation(() => undefined);
+    vi.spyOn(Atomics, "wait").mockReturnValue("timed-out");
+    const safe = runner(defaultEntries()).run;
+    const run = vi.fn(safe).mockImplementationOnce(() => { throw Object.assign(new Error("recorded transient read failure"), fields); });
+    expect(windowsStateAclRefusal(request, run)).toBeUndefined();
+    expect(run).toHaveBeenCalledTimes(2);
+    expect(run.mock.calls[0]).toEqual(run.mock.calls[1]);
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it.each(["malformed", "incomplete", "unsafe ACE"] as const)(
+    "GAP13459-03 %s successful output refuses after one read, never retrying into a safe snapshot", kind => {
+      const warn = vi.spyOn(process, "emitWarning").mockImplementation(() => undefined);
+      const bad = kind === "malformed" ? () => "not JSON"
+        : runner(kind === "incomplete" ? defaultEntries().slice(1)
+          : withEntry(0, { dacl: [...profileDacl(), allow(OTHER, FULL, 0)] })).run;
+      const run = vi.fn(runner(defaultEntries()).run).mockImplementationOnce(bad);
+      expect(windowsStateAclRefusal(request, run)).toMatch(kind === "malformed" ? /unreadable Windows ACL snapshot/
+        : kind === "incomplete" ? /invalid Windows ACL snapshot/ : /grants S-1-5-21-1-2-3-1002/);
+      expect(run).toHaveBeenCalledTimes(1);
+      expect(warn).not.toHaveBeenCalled();
+    });
 });
 
 describe("state gate wiring on win32 (smarty-dev#8920)", () => {

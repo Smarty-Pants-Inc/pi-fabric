@@ -9,11 +9,12 @@ import { normalizeFabricConfig } from "../src/config.js";
 import { FabricRuntimeState } from "../src/fabric-runtime-state.js";
 import { openPrivateStateDb } from "../src/mesh/state-gate.js";
 import { openNodeSqlite, raiseCheckpointFlag, SqliteStateStore } from "../src/mesh/state-sqlite.js";
-import { aclOwner, icaclsGrant, icaclsShow, readAcl, setOwner, tokenSids } from "./helpers/windows-acl.js";
+import { aclOwner, brief, icaclsGrant, icaclsShow, powershell, readAcl, setOwner, tokenSids } from "./helpers/windows-acl.js";
 
 // smarty-dev#8920: Windows ACL privacy of the SQLite mesh state root, its state files, its flag directory and its
 // ancestors, proved on real NTFS ACLs (icacls grants, Get-Acl/icacls read-back) with the real node:sqlite opener.
-// No ACL mocks: the native-cache tests use only a call-through process-count spy. Hosted-only: fixtures live in a
+// Real descriptors throughout: native-cache tests use call-through counting only; GAP13459 deterministically swaps
+// only the reader script, retaining real pinned children and production timeouts (Decision C). Hosted-only: fixtures live in a
 // private directory below the runner's DEFAULT USERPROFILE (not TMPDIR, whose RUNNER_TEMP ancestors are not a
 // profile), so local runs never create or delete them. The profile and its
 // system ancestors are never modified; every grant is on a fixture directory created by this suite.
@@ -75,6 +76,55 @@ const grant = (file: string, sid: string, rights: string, bits: number): void =>
   expect(rules.some(rule => (rule.rights & bits) === bits), `Get-Acl ${file}: ${JSON.stringify(rules)}`).toBe(true);
 };
 
+/** Real RuntimeState, selected SQLite and the production default root; workers stay outside the mesh. */
+const nativeRuntime = (projectRoot: string) => {
+  const envKeys = ["PI_FABRIC_MESH_ROOT", "PI_FABRIC_PROJECT_ROOT", "PI_FABRIC_MESH_STATE_BACKEND", "PI_CODING_AGENT_DIR"] as const;
+  const previous = new Map(envKeys.map(key => [key, process.env[key]] as const));
+  const restore = (): void => {
+    for (const [key, value] of previous) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
+  };
+  try {
+    delete process.env.PI_FABRIC_MESH_ROOT;
+    delete process.env.PI_FABRIC_PROJECT_ROOT;
+    process.env.PI_FABRIC_MESH_STATE_BACKEND = "sqlite";
+    process.env.PI_CODING_AGENT_DIR = path.join(projectRoot, ".pi", "coding-agent");
+    const config = normalizeFabricConfig({
+      mesh: { enabled: true, stateBackend: "sqlite" },
+      mcp: { enabled: false, cache: { enabled: false } },
+      agents: { enabled: false }, residency: { enabled: false },
+      prewalk: { enabled: false, alwaysRearm: false },
+    });
+    expect(config.mesh.root).toBeUndefined();
+    expect(config.mesh.stateBackend).toBe("sqlite");
+    const pi = { events: { emit: vi.fn() }, getThinkingLevel: () => "off", sendMessage: vi.fn() } as unknown as ExtensionAPI;
+    const context = {
+      cwd: projectRoot, hasUI: false, isProjectTrusted: () => true, isIdle: () => true, hasPendingMessages: () => false,
+      modelRegistry: { find: vi.fn(), getApiKeyAndHeaders: vi.fn() },
+      sessionManager: { getSessionId: () => "mesh-default-root-acl", getSessionFile: () => undefined, getBranch: () => [], getLeafId: () => undefined },
+      ui: { setStatus: vi.fn(), notify: vi.fn() },
+    } as unknown as ExtensionContext;
+    const unused = path.join(projectRoot, "unused.mjs");
+    fs.writeFileSync(unused, "export default {}; ");
+    const runtime = new FabricRuntimeState(pi, new CapturedToolCatalog(), { paths: { extension: unused, worker: unused, residentHost: unused, skills: projectRoot } });
+    return { runtime, context, config, close: async (): Promise<void> => { try { await runtime.shutdown(); } finally { restore(); } } };
+  } catch (error) { restore(); throw error; }
+};
+
+/** Closed fixture trees only: exact bytes, ACLs, identities and mutation metadata; never follow junctions. */
+const fixtureSnapshot = (file: string): unknown => {
+  const stat = fs.lstatSync(file);
+  expect(stat.isSymbolicLink(), "snapshot must not follow a fixture junction").toBe(false);
+  return {
+    dev: stat.dev, ino: stat.ino, mode: stat.mode, size: stat.size, mtimeMs: stat.mtimeMs, ctimeMs: stat.ctimeMs,
+    acl: readAcl(file).sddl,
+    ...(stat.isDirectory()
+      ? { children: fs.readdirSync(file).sort().map(name => ({ name, entry: fixtureSnapshot(path.join(file, name)) })) }
+      : { bytes: fs.readFileSync(file).toString("hex") }),
+  };
+};
+
 /** Decision C: count ONLY the production native reader, never replace its execution or descriptor evidence.
  * vi.spyOn without mockImplementation calls the original execFileSync. Independent Get-Acl readback and icacls
  * helpers use spawnSync, so fixture preparation/verification cannot inflate this count. Restore in every finally. */
@@ -127,6 +177,71 @@ const freshProcessRefusal = (root: string, mode: "async" | "sync" = "sync"): Fre
   expect(parsed.ok).toBe(false);
   return parsed;
 };
+/** Decision C deterministic fault injection, not an uncontrolled tooling outage. A NEW process is mandatory:
+ * seeding admits the root in the parent, and the C1/C2 identity cache must not be reset or weakened for this test.
+ * Only read-only mesh ACL execFileSync calls are intercepted. Every failure is a REAL pinned PowerShell child;
+ * original production options (including the 20s timeout) are retained. Helpers still use real spawnSync/Get-Acl.
+ * Two timeouts plus the requested 100ms retry configure 40.1s + setup, within the new test's 120s budget. */
+const FRESH_PROCESS_NATIVE_FAULT = String.raw`
+import childProcess from "node:child_process";
+import { createJiti } from "jiti";
+import { pathToFileURL } from "node:url";
+const [root, fault, recoverText] = process.argv.slice(1);
+const recover = recoverText === "true";
+const jiti = createJiti(pathToFileURL(process.cwd() + "/index.js").href);
+const { SqliteStateStore } = await jiti.import("./src/mesh/state-sqlite.ts");
+const { windowsSecurityPowerShell } = await jiti.import("./src/storage/windows-powershell.ts");
+const original = childProcess.execFileSync;
+const attempts = [];
+const marker = "fabric-native-acl-private-stderr: GAP13459_PRIVATE_TOKEN_6e7b2: ";
+childProcess.execFileSync = (file, args, options) => {
+  const text = options?.env?.PI_FABRIC_STATE_ACL;
+  const request = typeof text === "string" ? JSON.parse(text) : null;
+  if (!request || request.protect || !request.paths?.includes(root)) return original(file, args, options);
+  const injected = !recover || attempts.length === 0;
+  const script = "[Console]::Error.WriteLine('" + marker + "' + $env:FABRIC_TEST_PRIVATE_PATH)\n"
+    + (fault === "nonzero" ? "exit 17" : "Start-Sleep -Seconds 60");
+  const command = injected ? windowsSecurityPowerShell(script, { ...options.env, FABRIC_TEST_PRIVATE_PATH: root }) : null;
+  const attempt = { file: command?.file ?? file, timeout: options.timeout, injected };
+  attempts.push(attempt);
+  try {
+    const output = command ? original(command.file, command.args, { ...options, env: command.env }) : original(file, args, options);
+    if (!injected) attempt.realSnapshot = Array.isArray(JSON.parse(String(output)).entries);
+    return output;
+  } catch (error) {
+    attempt.error = { status: error.status ?? null, code: error.code ?? null, stderr: String(error.stderr ?? "") };
+    throw error;
+  }
+};
+let store;
+let outcome;
+try {
+  store = await SqliteStateStore.open(root, 65_536, 1_000, { initialize: "detached" });
+  const seeded = store.get("acl/probe")?.value;
+  if (recover) await store.put({ key: "acl/recovered", value: "real-retry", identity: { id: "test", name: "test", kind: "agent" } });
+  outcome = { ok: true, code: null, message: null, seeded, recovered: recover ? store.get("acl/recovered")?.value : null };
+} catch (error) {
+  outcome = { ok: false, code: error?.code ?? null, message: String(error?.message ?? error), isError: error instanceof Error };
+} finally { store?.close(); childProcess.execFileSync = original; }
+process.stdout.write(JSON.stringify({ ...outcome, attempts, pinned: windowsSecurityPowerShell("").file }) + "\n");
+`;
+interface NativeFaultResult extends FreshProcessResult {
+  logs: string;
+  isError?: boolean; seeded?: string; recovered?: string; pinned: string;
+  attempts: { file: string; timeout: number; injected: boolean; realSnapshot?: boolean;
+    error?: { status: number | null; code: string | null; stderr: string } }[];
+}
+const freshNativeFault = (root: string, fault: "nonzero" | "timeout", recover = false): NativeFaultResult => {
+  const result = childProcess.spawnSync(process.execPath,
+    ["--disable-warning=ExperimentalWarning", "--input-type=module", "-e", FRESH_PROCESS_NATIVE_FAULT, root, fault, String(recover)],
+    { cwd: process.cwd(), encoding: "utf8", windowsHide: true, timeout: 90_000, maxBuffer: 1024 * 1024, env: { ...process.env } });
+  expect(result.error?.message ?? "").toBe("");
+  expect(result.status, String(result.stderr)).toBe(0);
+  const lines = String(result.stdout).trim().split(/\r?\n/);
+  const parsed = JSON.parse(lines.pop()!) as NativeFaultResult;
+  return { ...parsed, logs: lines.join("\n") + String(result.stderr) };
+};
+
 /** Log bigint ctimeNs as metadata only; admission validity uses identity, never timestamps. */
 const nativeCacheStamp = (file: string) => {
   const stat = fs.lstatSync(file, { bigint: true, throwIfNoEntry: false });
@@ -166,6 +281,181 @@ const seedCacheFixture = async (root: string): Promise<SqliteStateStore> => {
 };
 
 describe.runIf(process.env.GITHUB_ACTIONS === "true" && process.platform === "win32")("Windows mesh state ACL privacy (smarty-dev#8920)", () => {
+  it.each([["GAP13459-N1", "nonzero"], ["GAP13459-N2", "timeout"]] as const)(
+    "%s: real pinned native reader %s fails twice then refuses without state changes or raw runner diagnostics", async (_id, fault) => {
+      const root = path.join(profileDir(), "root");
+      await roundTrip(await openAsync(root));
+      const before = fixtureSnapshot(root);
+      const result = freshNativeFault(root, fault);
+      expect.soft(result.attempts).toHaveLength(2);
+      expect.soft(result.attempts.map(attempt => attempt.timeout)).toEqual([20_000, 20_000]);
+      for (const attempt of result.attempts) {
+        expect.soft(attempt.file).toBe(result.pinned);
+        expect.soft(attempt.file).toMatch(/[\\/]WindowsPowerShell[\\/]v1\.0[\\/]powershell\.exe$/i);
+        expect.soft(attempt.injected).toBe(true);
+        expect.soft(attempt.error).toMatchObject(fault === "nonzero" ? { status: 17 } : { code: "ETIMEDOUT" });
+        expect.soft(attempt.error?.stderr).toContain("fabric-native-acl-private-stderr: GAP13459_PRIVATE_TOKEN_6e7b2: " + root);
+      }
+      expect.soft(result).toMatchObject({ ok: false, code: UNSUPPORTED.code, isError: true });
+      expect.soft(result.message).toBe(`Windows ACL read failed (${fault === "nonzero" ? "exit 17" : "timeout"}) after 1 retry; root not opened: ${root}`);
+      // Latest scope ruling: retain caller root, but NO raw child stderr/error/output in message OR logs.
+      expect.soft(result.message).toContain(root);
+      for (const text of [result.message ?? "", result.logs]) {
+        expect.soft(text).not.toContain("fabric-native-acl-private-stderr");
+        expect.soft(text).not.toContain("GAP13459_PRIVATE_TOKEN_6e7b2");
+        expect.soft(text).not.toContain("Start-Sleep");
+        expect.soft(text).not.toContain("Command failed");
+      }
+      expect(fixtureSnapshot(root)).toEqual(before);
+    }, 120_000);
+
+  it("GAP13459-N3: a fresh process recovers after one real exit 17 and one genuine ACL proof, then puts/gets SQLite", async () => {
+    const root = path.join(profileDir(), "root");
+    await roundTrip(await openAsync(root));
+    const result = freshNativeFault(root, "nonzero", true);
+    expect(result).toMatchObject({ ok: true, seeded: "ok", recovered: "real-retry" });
+    expect(result.attempts).toHaveLength(2);
+    expect(result.attempts.map(attempt => attempt.timeout)).toEqual([20_000, 20_000]);
+    expect(result.attempts.map(attempt => attempt.injected)).toEqual([true, false]);
+    expect(result.attempts.map(attempt => attempt.file)).toEqual([result.pinned, result.pinned]);
+    expect(result.attempts[0]?.error).toMatchObject({ status: 17 });
+    expect(result.attempts[1]).toMatchObject({ realSnapshot: true });
+    expect(result.attempts[1]?.error).toBeUndefined();
+    expect(result.logs).not.toContain("fabric-native-acl-private-stderr");
+    expect(result.logs).not.toContain("GAP13459_PRIVATE_TOKEN_6e7b2");
+  }, 120_000);
+
+  it.each([["GAP13549-N1", "(M)", MODIFY], ["GAP13549-N2", "(R)", EVERYONE_READ]] as const)(
+    "%s: real RuntimeState default SQLite root with Everyone %s refuses before census/custody/new directories", async (_id, rights, bits) => {
+      const projectRoot = profileDir();
+      const root = path.join(projectRoot, ".pi", "fabric", "mesh");
+      for (const directory of [path.join(projectRoot, ".pi"), path.join(projectRoot, ".pi", "fabric"), root]) ownedDirectory(directory);
+      const seed = path.join(root, "untouched-seed.txt");
+      fs.writeFileSync(seed, "existing mesh fixture must not change\n");
+      ownFixture(seed);
+      grant(root, EVERYONE, rights, bits);
+      const fixture = nativeRuntime(projectRoot);
+      const before = fixtureSnapshot(root);
+      const mkdir = vi.spyOn(fs, "mkdirSync");
+      const temporary = vi.spyOn(fs, "mkdtempSync");
+      const write = vi.spyOn(fs, "writeFileSync");
+      const rename = vi.spyOn(fs, "renameSync");
+      try {
+        let error: unknown;
+        try { await fixture.runtime.initialize(fixture.context, fixture.config); } catch (caught) { error = caught; }
+        expect.soft(error).toMatchObject(UNSUPPORTED);
+        // BEFORE shutdown, including transient custody staging/publication, not just the final DB contents.
+        const underRoot = (value: unknown) => typeof value === "string" && (value === root || value.startsWith(root + path.sep));
+        expect.soft(mkdir.mock.calls.filter(([directory]) => underRoot(directory))).toEqual([]);
+        expect.soft(temporary.mock.calls.filter(([prefix]) => underRoot(prefix))).toEqual([]);
+        expect.soft(write.mock.calls.filter(([file]) => underRoot(file))).toEqual([]);
+        expect.soft(rename.mock.calls.filter(([from, to]) => underRoot(from) || underRoot(to))).toEqual([]);
+        for (const name of [".writer-census", "custody.lock", "state.db", "state.db-wal", "state.db-shm"]) {
+          expect.soft(fs.existsSync(path.join(root, name)), name).toBe(false);
+        }
+        expect(fixtureSnapshot(root)).toEqual(before);
+      } finally { mkdir.mockRestore(); temporary.mockRestore(); write.mockRestore(); rename.mockRestore(); await fixture.close(); }
+    }, 120_000);
+
+  it("GAP13549-N3: real RuntimeState missing default root below a junction refuses before census/custody or target changes", async () => {
+    const projectRoot = profileDir();
+    const target = path.join(projectRoot, "junction-target");
+    ownedDirectory(target);
+    const seed = path.join(target, "untouched-seed.txt");
+    fs.writeFileSync(seed, "junction target must not change\n");
+    ownFixture(seed);
+    const junction = path.join(projectRoot, ".pi");
+    fs.symlinkSync(target, junction, "junction");
+    expect(fs.lstatSync(junction).isSymbolicLink()).toBe(true);
+    expect(fs.realpathSync(junction)).toBe(fs.realpathSync(target));
+    const root = path.join(junction, "fabric", "mesh");
+    const fixture = nativeRuntime(projectRoot);
+    const before = fixtureSnapshot(target);
+    const targetAcl = readAcl(target).sddl;
+    const children = fs.readdirSync(target).sort();
+    const mkdir = vi.spyOn(fs, "mkdirSync");
+    const temporary = vi.spyOn(fs, "mkdtempSync");
+    const write = vi.spyOn(fs, "writeFileSync");
+    const rename = vi.spyOn(fs, "renameSync");
+    try {
+      let error: unknown;
+      try { await fixture.runtime.initialize(fixture.context, fixture.config); } catch (caught) { error = caught; }
+      expect.soft(error).toMatchObject(UNSUPPORTED);
+      const inTarget = (value: unknown) => typeof value === "string" && [junction, target].some(base => value === base || value.startsWith(base + path.sep));
+      expect.soft(mkdir.mock.calls.filter(([directory]) => inTarget(directory))).toEqual([]);
+      expect.soft(temporary.mock.calls.filter(([prefix]) => inTarget(prefix))).toEqual([]);
+      expect.soft(write.mock.calls.filter(([file]) => inTarget(file))).toEqual([]);
+      expect.soft(rename.mock.calls.filter(([from, to]) => inTarget(from) || inTarget(to))).toEqual([]);
+      for (const name of [".writer-census", "custody.lock", "state.db"]) expect.soft(fs.existsSync(path.join(root, name)), name).toBe(false);
+      expect.soft(fs.existsSync(path.dirname(root))).toBe(false);
+      expect.soft(fs.existsSync(root)).toBe(false);
+      expect.soft(readAcl(target).sddl).toBe(targetAcl);
+      expect.soft(fs.readdirSync(target).sort()).toEqual(children);
+      expect(fixtureSnapshot(target)).toEqual(before);
+    } finally { mkdir.mockRestore(); temporary.mockRestore(); write.mockRestore(); rename.mockRestore(); await fixture.close(); }
+  }, 120_000);
+
+  it.each([["GAP13612-N1", "S-1-5-19"], ["GAP13612-N2", "S-1-5-20"]] as const)(
+    "%s: safe-DACL service-owned ancestor %s requires SE_DACL_PROTECTED on an existing root", async (_id, service) => {
+      const ancestor = profileDir();
+      const { user } = tokenSids();
+      const roots = [path.join(ancestor, "unprotected"), path.join(ancestor, "protected")];
+      for (const root of roots) ownedDirectory(root);
+      // Fixture-only protection toggle; no profile/system ACL changes. Use the shared pinned helper.
+      const setup = powershell(String.raw`
+$ErrorActionPreference = 'Stop'
+$ancestor = Get-Acl -LiteralPath $env:FABRIC_TEST_ANCESTOR
+$ancestor.SetAccessRuleProtection($true, $false)
+foreach ($rule in @($ancestor.GetAccessRules($true, $false, [Security.Principal.SecurityIdentifier]))) {
+  $null = $ancestor.RemoveAccessRuleSpecific($rule)
+}
+foreach ($sid in @($env:FABRIC_TEST_USER, 'S-1-5-18', 'S-1-5-32-544')) {
+  $identity = [Security.Principal.SecurityIdentifier]::new($sid)
+  $rule = [Security.AccessControl.FileSystemAccessRule]::new($identity, 'FullControl', 'ContainerInherit, ObjectInherit', 'None', 'Allow')
+  $ancestor.AddAccessRule($rule)
+}
+Set-Acl -LiteralPath $env:FABRIC_TEST_ANCESTOR -AclObject $ancestor
+foreach ($name in @('unprotected', 'protected')) {
+  $file = Join-Path $env:FABRIC_TEST_ANCESTOR $name
+  $acl = Get-Acl -LiteralPath $file
+  $acl.SetAccessRuleProtection(($name -eq 'protected'), $true)
+  Set-Acl -LiteralPath $file -AclObject $acl
+}
+`, { FABRIC_TEST_ANCESTOR: ancestor, FABRIC_TEST_USER: user });
+      expect(setup.status, brief(setup)).toBe(0);
+      const changed = setOwner(ancestor, service);
+      try {
+        expect(changed.changed, changed.trace.join(" | ")).toBe(true);
+        const ancestorAcl = readAcl(ancestor);
+        expect(ancestorAcl.owner).toBe(service);
+        const trusted = new Set([user, SYSTEM, ADMINISTRATORS, TRUSTED_INSTALLER]);
+        expect(ancestorAcl.rules.filter(rule => rule.type === "Allow" && !trusted.has(rule.sid)
+          && !rule.propagation.includes("InheritOnly") && (rule.rights & ~(0xa01200a9 | 0x6)) !== 0), ancestorAcl.sddl).toEqual([]);
+        const controls = roots.map(root => {
+          const acl = readAcl(root);
+          expect(acl.owner).toBe(user);
+          expect(acl.rules.filter(rule => rule.type === "Allow" && !trusted.has(rule.sid)
+            && (rule.rights & ~0x120080) !== 0), acl.sddl).toEqual([]);
+          // Decode ControlFlags from the independently read real descriptor, not an invented ACL snapshot.
+          const flags = powershell("$raw = [Security.AccessControl.RawSecurityDescriptor]::new($env:FABRIC_TEST_SDDL); [int]$raw.ControlFlags", { FABRIC_TEST_SDDL: acl.sddl });
+          expect(flags.status, brief(flags)).toBe(0);
+          return { acl, control: Number(String(flags.stdout).trim()) };
+        });
+        expect(controls[0]?.acl.protected).toBe(false);
+        expect(controls[0]!.control & 0x1000).toBe(0);
+        expect(controls[1]?.acl.protected).toBe(true);
+        expect(controls[1]!.control & 0x1000).toBe(0x1000);
+        const before = fixtureSnapshot(roots[0]!);
+        expect.soft(await refusal(() => openAsync(roots[0]!))).toMatchObject(UNSUPPORTED);
+        expect.soft(fixtureSnapshot(roots[0]!)).toEqual(before);
+        await roundTrip(await openAsync(roots[1]!));
+        expect(readAcl(ancestor).sddl).toBe(ancestorAcl.sddl);
+      } finally {
+        const restored = setOwner(ancestor, user);
+        expect(restored.changed, restored.trace.join(" | ")).toBe(true);
+      }
+    }, 120_000);
+
   // Native integration: C1 proves admitted identity reuse; C2 documents same-process trusted ACL mutation and
   // fresh-process refusal; C3 preserves the first-proof ancestor boundary. No ACL evidence is mocked.
   it("native-cache-C1: unchanged existing root and state.db reuse the admitted native proof across sync and async opens", async () => {
@@ -304,7 +594,7 @@ describe.runIf(process.env.GITHUB_ACTIONS === "true" && process.platform === "wi
     expect(readAcl(profile).sddl).toBe(before);
   }, 120_000);
 
-  it("uses the production default mesh root for SQLite below a hosted USERPROFILE project", async () => {
+  it("GAP13549-N4: uses the production default mesh root for SQLite below a hosted USERPROFILE project", async () => {
     const projectRoot = profileDir();
     const expectedRoot = path.join(projectRoot, ".pi", "fabric", "mesh");
     const envKeys = ["PI_FABRIC_MESH_ROOT", "PI_FABRIC_PROJECT_ROOT", "PI_FABRIC_MESH_STATE_BACKEND", "PI_CODING_AGENT_DIR"] as const;
@@ -319,6 +609,24 @@ describe.runIf(process.env.GITHUB_ACTIONS === "true" && process.platform === "wi
     let resolvedPath: string | undefined;
     let outcome = "not started";
     let failure: string | undefined;
+    // Observe the REAL runtime custody publication and owner before it is released; not a stand-alone lock probe.
+    const custodyOwners: { owner: string; nativeProofs: number; protectedRoot: boolean }[] = [];
+    const proofs = countNativeAclProofs();
+    const censusProofs: number[] = [];
+    const originalWrite = fs.writeFileSync;
+    const censusWrites = vi.spyOn(fs, "writeFileSync").mockImplementation((file, data, options) => {
+      originalWrite(file, data, options);
+      if (String(file).startsWith(path.join(expectedRoot, ".writer-census") + path.sep)) censusProofs.push(proofs.count());
+    });
+    const originalRename = fs.renameSync;
+    const custody = vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+      originalRename(from, to);
+      if (String(to).startsWith(path.join(expectedRoot, ".writer-census") + path.sep)) censusProofs.push(proofs.count());
+      if (String(to) === path.join(expectedRoot, "custody.lock")) {
+        custodyOwners.push({ owner: fs.readFileSync(path.join(expectedRoot, "custody.lock", "owner"), "utf8"),
+          nativeProofs: proofs.count(), protectedRoot: readAcl(expectedRoot).protected });
+      }
+    });
     const aclChain = (root: string) => {
       const entries: { path: string; exists: boolean; acl?: ReturnType<typeof readAcl>; error?: string }[] = [];
       let current = path.resolve(root);
@@ -365,6 +673,24 @@ describe.runIf(process.env.GITHUB_ACTIONS === "true" && process.platform === "wi
       expect(mesh.stateBackend).toBe("sqlite");
       await mesh.put({ key: "acl/default-root-probe", value: "sqlite-default-root", identity: { id: "mesh-default-root-acl", name: "probe", kind: "agent" } });
       expect(mesh.get("acl/default-root-probe")?.value).toBe("sqlite-default-root");
+      const census = path.join(mesh.root, ".writer-census");
+      const records = fs.readdirSync(census).filter(name => name.endsWith(".json"))
+        .map(name => JSON.parse(fs.readFileSync(path.join(census, name), "utf8")) as unknown);
+      expect(records).toEqual(expect.arrayContaining([
+        expect.objectContaining({ format: 1, pid: process.pid, host: os.hostname(), stateBackend: "sqlite" }),
+      ]));
+      expect(censusProofs.length).toBeGreaterThan(0);
+      for (const count of censusProofs) expect(count).toBeGreaterThan(0);
+      expect(custodyOwners.length).toBeGreaterThan(0);
+      for (const receipt of custodyOwners) {
+        const [token, pid, started] = receipt.owner.split("\n");
+        expect(token).toMatch(/^[a-f0-9-]{36}$/i);
+        expect(Number(pid)).toBe(process.pid);
+        expect(Number(started)).toBeGreaterThan(0);
+        expect(receipt.nativeProofs).toBeGreaterThan(0);
+        expect(receipt.protectedRoot).toBe(true);
+      }
+      proofs.assertRealReads();
       outcome = "passed";
     } catch (error) {
       outcome = "failed";
@@ -387,6 +713,9 @@ describe.runIf(process.env.GITHUB_ACTIONS === "true" && process.platform === "wi
           roots: rootsToReport.map(root => ({ path: root, ancestors: aclChain(root) })),
         }));
       } finally {
+        custody.mockRestore();
+        censusWrites.mockRestore();
+        proofs.restore();
         try { await runtime?.shutdown(); }
         finally { restoreEnv(); }
       }

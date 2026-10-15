@@ -56,6 +56,10 @@ const lazyEntryPoints = [
   "src/core/diagnostics-log.ts",
   // Command registration is eager; the subcommand implementation loads on invocation.
   "src/commands/fabric-handler.ts",
+  // Native installer bootstrap; never exposed as a guest authority grant.
+  "src/actors/slot-authority.ts",
+  // Import-only per-materialization claim parsing, not idle registration work.
+  "src/commands/slot-import.ts",
   // First-use scratch removal: a stable entry keeps the shared verifier out of the startup graph.
   "src/storage/verified-remove.ts",
   // The resident's first operator cleanup reuses the offline final-check helper (smarty-dev#8090).

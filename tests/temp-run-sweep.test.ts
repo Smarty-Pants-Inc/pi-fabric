@@ -4,18 +4,24 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agents/manager.js";
+import { CompletionJournal, type CompletionRecipient } from "../src/agents/completion-journal.js";
+import type { AgentRunResult } from "../src/agents/types.js";
+import { MeshStore } from "../src/mesh/store.js";
+import { writeHostLease } from "../src/topology/host-leases.js";
+import { fabricDataRoot } from "../src/storage/temp-root.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { scriptSpawnArgs } from "../src/agents/transports/process-utils.js";
-import { FABRIC_RUN_ROOT_PREFIX, sweepTempRunRoots, type TempRunSweepRequest } from "../src/storage/retention.js";
+import { FABRIC_RUN_ROOT_PREFIX, RUN_ROOT_SWEEP_MARKER, UNRESOLVED_WORKER_FILE, sweepTempRunRoots, type TempRunSweepRequest } from "../src/storage/retention.js";
 
-const launches = vi.hoisted(() => [] as Array<{ args: readonly string[]; status: number | null; stderr: string }>);
+// The real .ts entry can select Bun and perform native deletion: hosted CI only (vitest.config.ts).
+const launches = vi.hoisted(() => [] as Array<{ args: readonly string[]; env: NodeJS.ProcessEnv | undefined; status: number | null; stderr: string }>);
 vi.mock("node:child_process", async importOriginal => {
   const actual = await importOriginal<typeof import("node:child_process")>();
   return { ...actual, spawn: (runtime: string, args: readonly string[], options: Parameters<typeof actual.spawn>[2]) => {
     if (!options?.detached) return actual.spawn(runtime, args, options);
     // Exercise the actual detached entry, but join it in the test: no leaked background sweeps.
-    const result = actual.spawnSync(runtime, args, { encoding: "utf8", timeout: 20_000 });
-    launches.push({ args, status: result.status, stderr: result.stderr });
+    const result = actual.spawnSync(runtime, args, { env: options.env, encoding: "utf8", timeout: 20_000 });
+    launches.push({ args, env: options.env, status: result.status, stderr: result.stderr });
     return new actual.ChildProcess();
   } };
 });
@@ -44,7 +50,153 @@ const snapshot = (run: string) => ({ mtime: fs.statSync(run).mtimeMs, files: fs.
   return [name, stat.ino, stat.mtimeMs, stat.ctimeMs, fs.readFileSync(file, "utf8")];
 }) });
 
+const DEAD_PID = 2147483647;
+const abandonedRoot = (tempRoot: string, name: string, owner: Record<string, unknown> = {}) => {
+  const root = fs.mkdtempSync(path.join(tempRoot, FABRIC_RUN_ROOT_PREFIX + name + "-"));
+  const startedAt = Date.now() - 48 * HOUR;
+  fs.writeFileSync(path.join(root, ".fabric-owner.json"), JSON.stringify({ pid: DEAD_PID, startedAt, heartbeatAt: startedAt, ...owner }));
+  return root;
+};
+const unconfirmedTask = (root: string, id = "a".repeat(32), pid = DEAD_PID) => {
+  const run = path.join(root, id); fs.mkdirSync(run, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(run, "task.txt"), "session B's retained task");
+  fs.writeFileSync(path.join(run, "status.json"), JSON.stringify({ id, status: "running", runner: "pi", transport: "process", sessionId: String(pid), startedAt: 1 }));
+  fs.writeFileSync(path.join(run, UNRESOLVED_WORKER_FILE), JSON.stringify({ reason: "Owned scope observation failed: Error: ENODEV: no such device, read", markedAt: 1, runId: id }));
+  fs.writeFileSync(path.join(run, "settlement.json"), JSON.stringify({ version: 1, runId: id, outcome: "completed", text: "PRIVATE B ANSWER" }));
+  return run;
+};
+// Fixture-only claim aging: each close still passes the real manager's interval gate.
+const ageSweepClaim = (tempRoot: string) => fs.writeFileSync(path.join(tempRoot, RUN_ROOT_SWEEP_MARKER), JSON.stringify({ sweptAt: Date.now() - HOUR }));
+
 describe("configured detached temp sweep", () => {
+  it.runIf(process.platform === "linux")("reaches a shared sibling's ENODEV task through manager close, settles lost once after grace, and never delivers its answer", async () => {
+    const base = temp();
+    const privateA = path.join(base, "session-a"), privateB = path.join(base, "session-b"), shared = path.join(base, "file-data");
+    for (const root of [privateA, privateB, shared]) fs.mkdirSync(root, { mode: 0o700 });
+    const tmp = vi.spyOn(os, "tmpdir").mockReturnValue(privateB);
+    vi.stubEnv("TMPDIR", privateB);
+    vi.stubEnv("PI_FABRIC_TMPDIR", undefined); vi.stubEnv("PI_FABRIC_RUN_ROOT", undefined); vi.stubEnv("PI_FABRIC_DEPTH", "0");
+    // Old placement negative control: A cannot discover B's private parent. No legacy root is moved.
+    const privateRoot = abandonedRoot(fabricDataRoot(), "session-b");
+    const privateRun = unconfirmedTask(privateRoot);
+    const privateBefore = snapshot(privateRun), privateOwner = fs.readFileSync(path.join(privateRoot, ".fabric-owner.json"), "utf8");
+    const grace = 6 * HOUR;
+    const sweepFromA = async (override?: string) => {
+      tmp.mockReturnValue(privateA); vi.stubEnv("TMPDIR", privateA); vi.stubEnv("PI_FABRIC_TMPDIR", override);
+      const count = launches.length;
+      const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0 }, {
+        sweepPath: entry, retention: { ...DEFAULT_FABRIC_CONFIG.retention, orphanedTempRunMs: grace },
+      }); managers.push(manager);
+      await manager.close();
+      expect(launches).toHaveLength(count + 1);
+      const launch = launches.at(-1)!;
+      expect(launch).toMatchObject({ status: 0, stderr: "", env: { TMPDIR: privateA } });
+      expect(launch.env?.PI_FABRIC_TMPDIR).toBe(override);
+      const request = JSON.parse(launch.args[1]!) as TempRunSweepRequest;
+      expect(request).toMatchObject({ tempRoot: override ?? privateA, orphanedTempRunRetentionMs: grace });
+      expect(path.dirname(request.currentRoot!)).toBe(override ?? privateA);
+    };
+    await sweepFromA();
+    expect(snapshot(privateRun)).toEqual(privateBefore);
+    expect(fs.readFileSync(path.join(privateRoot, ".fabric-owner.json"), "utf8")).toBe(privateOwner);
+
+    // New launches share only file data, not TMPDIR. This is the existing public override, not a selector test.
+    tmp.mockReturnValue(privateB); vi.stubEnv("TMPDIR", privateB); vi.stubEnv("PI_FABRIC_TMPDIR", shared);
+    const sibling = abandonedRoot(fabricDataRoot(), "session-b"), run = unconfirmedTask(sibling);
+    const meshRoot = path.join(base, "mesh");
+    const recipient: CompletionRecipient = { rootId: "session:session-a", sessionId: "session-a", cwd: base, projectRoot: base, name: "main", startedAt: 1 };
+    const now = Date.now();
+    writeHostLease(meshRoot, { id: recipient.rootId, rootId: recipient.rootId, identityId: recipient.rootId, updatedAt: now,
+      expiresAt: now + HOUR, startedAt: now, session: { id: recipient.sessionId, startedAt: now, updatedAt: now, expiresAt: now + HOUR } });
+    // An untrusted recipient manifest points B's saved answer at live A; offline recovery must not use it.
+    fs.writeFileSync(path.join(run, "completion-recipient.json"), JSON.stringify({ meshRoot, recipient, supervisor: { pid: DEAD_PID } }));
+    const mesh = new MeshStore(meshRoot, 65536, 1000), delivered: AgentRunResult[] = [];
+    const completions = new CompletionJournal(meshRoot, recipient, {} as never, mesh, (result, done) => { delivered.push(result); done(); });
+    const noDelivery = async () => {
+      await completions.drain();
+      expect(delivered).toEqual([]);
+      const journal = path.join(meshRoot, "agent-completions");
+      expect(fs.existsSync(journal) ? fs.readdirSync(journal, { recursive: true }).map(String).filter(name => name.endsWith(".json")) : []).toEqual([]);
+    };
+    const hold = path.join(run, "keep-for-observation.txt"); fs.writeFileSync(hold, "unknown data vetoes collection");
+    const before = snapshot(run), ownerFile = path.join(sibling, ".fabric-owner.json");
+    expect(JSON.parse(fs.readFileSync(ownerFile, "utf8"))).not.toHaveProperty("closedAt");
+    expect(JSON.parse(fs.readFileSync(ownerFile, "utf8"))).not.toHaveProperty("orphanedAt");
+    const observedAfter = Date.now();
+    await sweepFromA(shared);
+    const owner = JSON.parse(fs.readFileSync(ownerFile, "utf8"));
+    expect(owner.closedAt).toBeUndefined();
+    expect(owner.orphanedAt).toBeGreaterThanOrEqual(observedAfter);
+    expect(owner.orphanedAt).toBeLessThanOrEqual(Date.now());
+    expect(snapshot(run)).toEqual(before);
+    await noDelivery();
+
+    ageSweepClaim(shared); await sweepFromA(shared);
+    expect(JSON.parse(fs.readFileSync(ownerFile, "utf8")).orphanedAt).toBe(owner.orphanedAt);
+    expect(snapshot(run)).toEqual(before); // Fresh stamp, still inside grace: no recovery or marker clear.
+    expect(JSON.parse(fs.readFileSync(path.join(run, "status.json"), "utf8")).status).toBe("running");
+    expect(fs.existsSync(path.join(run, UNRESOLVED_WORKER_FILE))).toBe(true);
+    await noDelivery();
+
+    // The real detached entry owns Date.now(). Age only this synthetic fixture after observing its fresh stamp.
+    fs.writeFileSync(ownerFile, JSON.stringify({ ...owner, orphanedAt: owner.orphanedAt - grace - HOUR }));
+    ageSweepClaim(shared); await sweepFromA(shared);
+    const settled = JSON.parse(fs.readFileSync(path.join(run, "status.json"), "utf8"));
+    expect(settled).toMatchObject({ status: "completed", settledLost: true });
+    expect(settled.text).toBeUndefined(); expect(settled.enodevDelivered).toBeUndefined();
+    expect(fs.existsSync(path.join(run, UNRESOLVED_WORKER_FILE))).toBe(false);
+    expect(JSON.parse(fs.readFileSync(path.join(run, "settlement.json"), "utf8")).text).toBe("PRIVATE B ANSWER");
+    expect(fs.readFileSync(path.join(run, "task.txt"), "utf8")).toBe("session B's retained task");
+    await noDelivery();
+    const settledOnce = snapshot(run);
+    ageSweepClaim(shared); await sweepFromA(shared);
+    expect(snapshot(run)).toEqual(settledOnce); // No second settlement/status rewrite, despite another eligible sweep.
+    await noDelivery();
+
+    fs.unlinkSync(hold); // Remove only our preservation fixture; the real entry must collect the now-safe tree.
+    ageSweepClaim(shared); await sweepFromA(shared);
+    expect(fs.existsSync(run)).toBe(false); expect(fs.existsSync(sibling)).toBe(false);
+    expect(snapshot(privateRun)).toEqual(privateBefore); // Shared discovery never widens to private/nested parents.
+    await noDelivery();
+  }, 60_000);
+
+  it.runIf(process.platform === "linux")("retains live owners and workers, unsafe or linked roots, and nested ENODEV markers in the shared sweep", async () => {
+    const base = temp(), shared = path.join(base, "file-data"), privateA = path.join(base, "session-a");
+    for (const root of [shared, privateA]) fs.mkdirSync(root, { mode: 0o700 });
+    vi.spyOn(os, "tmpdir").mockReturnValue(privateA); vi.stubEnv("TMPDIR", privateA);
+    vi.stubEnv("PI_FABRIC_TMPDIR", shared); vi.stubEnv("PI_FABRIC_RUN_ROOT", undefined); vi.stubEnv("PI_FABRIC_DEPTH", "0");
+    const aged = { orphanedAt: Date.now() - 7 * HOUR };
+    const liveOwner = abandonedRoot(shared, "live-owner", { pid: process.pid }), ownerRun = unconfirmedTask(liveOwner);
+    const liveWorker = abandonedRoot(shared, "live-worker", aged), workerRun = unconfirmedTask(liveWorker, "b".repeat(32), process.pid);
+    const malformed = abandonedRoot(shared, "malformed", { ...aged, pid: "unknown" }), malformedRun = unconfirmedTask(malformed);
+    const unsafe = abandonedRoot(shared, "unsafe", aged), unsafeRun = unconfirmedTask(unsafe);
+    const target = path.join(base, "private-target.txt"); fs.writeFileSync(target, "must survive");
+    fs.unlinkSync(path.join(unsafeRun, "task.txt")); fs.symlinkSync(target, path.join(unsafeRun, "task.txt"));
+    const linkedTarget = abandonedRoot(base, "linked-target", aged), linkedRun = unconfirmedTask(linkedTarget);
+    const linked = path.join(shared, FABRIC_RUN_ROOT_PREFIX + "linked"); fs.symlinkSync(linkedTarget, linked, "dir");
+    const nestedRoot = abandonedRoot(shared, "nested", aged), parent = unconfirmedTask(nestedRoot, "c".repeat(32));
+    const nested = unconfirmedTask(path.join(parent, "nested"), "d".repeat(32));
+    const retained = [ownerRun, workerRun, malformedRun, linkedRun, nested];
+    const before = retained.map(snapshot);
+    const ownerBefore = fs.readFileSync(path.join(liveOwner, ".fabric-owner.json"), "utf8");
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0 }, {
+      sweepPath: entry, retention: { ...DEFAULT_FABRIC_CONFIG.retention, orphanedTempRunMs: 6 * HOUR },
+    }); managers.push(manager);
+    await manager.close();
+    expect(launches).toHaveLength(1); expect(launches[0]).toMatchObject({ status: 0, stderr: "" });
+    expect(JSON.parse(launches[0]!.args[1]!).tempRoot).toBe(shared);
+    expect(retained.map(snapshot)).toEqual(before);
+    expect(fs.readFileSync(path.join(liveOwner, ".fabric-owner.json"), "utf8")).toBe(ownerBefore);
+    for (const run of retained) expect(fs.existsSync(path.join(run, UNRESOLVED_WORKER_FILE))).toBe(true);
+    // Recovery precedes safeRunTree: unsafe metadata may settle; do not promise byte-identical unsafe records.
+    expect(fs.existsSync(unsafeRun)).toBe(true); expect(fs.lstatSync(path.join(unsafeRun, "task.txt")).isSymbolicLink()).toBe(true);
+    expect(fs.lstatSync(linked).isSymbolicLink()).toBe(true); expect(fs.readFileSync(target, "utf8")).toBe("must survive");
+    expect(fs.existsSync(parent)).toBe(true);
+    expect(JSON.parse(fs.readFileSync(path.join(parent, "status.json"), "utf8"))).toMatchObject({ status: "completed", settledLost: true });
+    expect(fs.existsSync(path.join(parent, UNRESOLVED_WORKER_FILE))).toBe(false);
+    expect(JSON.parse(fs.readFileSync(path.join(nested, "status.json"), "utf8")).status).toBe("running");
+  });
+
   it("forwards the manager's configured compaction age and cap to the real sweep entry", async () => {
     const tempRoot = temp(); vi.spyOn(os, "tmpdir").mockReturnValue(tempRoot);
     vi.stubEnv("PI_FABRIC_TMPDIR", undefined); vi.stubEnv("PI_FABRIC_RUN_ROOT", undefined);

@@ -1,8 +1,9 @@
 import { appendDeliveryOutcome, type DeliverySend } from "../mesh/delivery-outcomes.js";
 import { diagnostics } from "../core/diagnostics.js";
 import type { MeshControlIncarnationFence } from "../config.js";
-import { FabricParticipantStaleError, participantLeaseGraceMs } from "./host-leases.js";
+import { FabricBridgeStaleError, FabricParticipantStaleError, mirroredOwnerRoutingStatus, participantLeaseGraceMs, waitForMirroredLeaseRenewal, type FabricMirrorLease, type MirrorLeaseWaitBudget } from "./host-leases.js";
 import { retryDelayMs } from "../core/retry-backoff.js";
+import { FabricPeerLeaseStaleError } from "../agents/peer-lease-stale.js";
 import { assertSteerPriority, type FabricSteerPriority } from "../main-agent.js";
 import { copyFabricPrincipal, copyFabricWakeCause, fabricWakeCause, withFabricWakeAdmission, type FabricWakeCause, type FabricPrincipal } from "../fabric-provenance.js";
 import { FOLLOW_UP_RUNNING_TASK_MESSAGE, type AgentFollowUpRunningWarning } from "../agents/types.js";
@@ -331,6 +332,22 @@ const controlSeenRecord = (value: unknown): FabricControlSeenRecord | undefined 
   return value as unknown as FabricControlSeenRecord;
 };
 
+export interface MirroredControlOwner {
+  remoteHost: string;
+  expiresAt: number;
+  mirror?: FabricMirrorLease;
+  mirrorLease?: 1;
+  /** Validated activation, when supplied by a modern directory. Never retarget after a wait. */
+  ownerIncarnation?: string;
+  /** Observation exists but does not belong to this owner/link. Never fall back to legacy expiry. */
+  bridgeStale?: true;
+}
+
+/** Private pre-publication signal only; never an owner ACK and never replay published work. */
+class MirrorLeaseAdmissionRequired extends Error {
+  constructor(readonly owner: MirroredControlOwner) { super("Mirror renewal required before publication"); }
+}
+
 export interface FabricControlPlaneOptions {
   /** Missing epochs are admitted with sender warnings by default during mixed-release rollout. */
   controlIncarnationFence?: MeshControlIncarnationFence;
@@ -351,12 +368,14 @@ export interface FabricControlPlaneOptions {
   captureOwnerLease?: (ownerHostId: string, ownerIdentityId: string, targetId: string) => (() => number) | undefined;
   /** Remote-link command window; at least 30 s, also used for bridged cancellation. */
   bridgeTimeoutMs?: number;
+  /** Testable renewal bound, capped at the standard 15 s mirror window. */
+  mirrorLeaseWaitMs?: number;
   /** Fresh, directory-validated mirror ownership, including expired leases. */
   readMirroredOwner?: (
     ownerHostId: string,
     ownerIdentityId: string | undefined,
     targetId: string,
-  ) => { remoteHost: string; expiresAt: number } | undefined;
+  ) => MirroredControlOwner | undefined;
 }
 
 export interface FabricControlInput {
@@ -402,6 +421,8 @@ export const controlActorBindingOptions = (
 export interface FabricControlRequestOptions {
   /** Snapshot from the validated participant, never from message/data. */
   routedRemoteHost?: string | null;
+  /** Host-only resolution budget shared with the directory/router, not a wire field. */
+  mirrorLeaseWaitBudget?: MirrorLeaseWaitBudget | undefined;
   timeoutMs?: number;
   /** Reuse unchanged on a stale/outcome-unknown message retry; scoped to sender/owner/target. */
   idempotencyKey?: string | undefined;
@@ -427,7 +448,7 @@ interface PendingControlRequest {
   readonly destinationRemoteHost?: string | null;
   cancellationRequested?: boolean;
   cancellationPublished?: boolean;
-  mirroredOwner?: { remoteHost: string; expiresAt: number };
+  mirroredOwner?: MirroredControlOwner;
   signal?: AbortSignal;
   onAbort?: () => void;
 }
@@ -586,7 +607,8 @@ export class FabricControlPlane {
     // Freeze diagnostic producer attribution before publication or an observation retry yields.
     input = { ...input, wakeCause: copyFabricWakeCause(input.wakeCause) };
     // One logical message key survives both observation retries and a proven-notRun resend.
-    options = { ...options, idempotencyKey: options.idempotencyKey ?? randomUUID() };
+    options = { ...options, idempotencyKey: options.idempotencyKey ?? randomUUID(),
+      mirrorLeaseWaitBudget: options.mirrorLeaseWaitBudget ?? {} };
     let notRunAttempt = 0;
     // Shared across the bounded retry: first admission may discover a mirror even
     // for an older caller that supplied no routing snapshot.
@@ -704,7 +726,7 @@ export class FabricControlPlane {
     // Freeze the resolved activation AND request origin before any publication/lock wait.
     // requestedAt remains commit-stamped and cannot prove a legacy request's origin.
     const ownerIncarnation = input.ownerIncarnation;
-    if (options.signal?.aborted) throw new Error(`Remote Fabric request cancelled: ${targetId}`);
+    options.signal?.throwIfAborted();
     const idempotencyKey = options.idempotencyKey ?? randomUUID();
     const commandId = createHash("sha256")
       .update(JSON.stringify([this.options.hostId, ownerHostId, ownerIdentityId, targetId, operation, idempotencyKey, notRunAttempt]))
@@ -731,6 +753,41 @@ export class FabricControlPlane {
       destination.remoteHost = mirroredOwner?.remoteHost ?? (this.options.readMirroredOwner ? null : undefined);
     }
     const destinationRemoteHost = destination.remoteHost;
+    const waitBudget = options.mirrorLeaseWaitBudget ?? {};
+    const rootGone = (host: string): Error => new Error(
+      `Unknown Fabric participant: ${targetId} (its lease mirrored from remote host ${host} lapsed; ` +
+        "a fresh bridge sample proves the source lease lapsed); this attempt was not published.");
+    const capturedMirror = mirroredOwner;
+    const readMirror = (): MirroredControlOwner | undefined => {
+      const current = this.options.readMirroredOwner?.(ownerHostId, ownerIdentityId, targetId);
+      if (!current || current.remoteHost !== destinationRemoteHost) return undefined;
+      if (current.ownerIncarnation !== capturedMirror?.ownerIncarnation ||
+        ownerIncarnation !== undefined && current.ownerIncarnation !== undefined && current.ownerIncarnation !== ownerIncarnation) {
+        throw new FabricControlStaleIncarnationError(targetId);
+      }
+      return current;
+    };
+    const renewMirror = async (initial: MirroredControlOwner): Promise<MirroredControlOwner> => {
+      await waitForMirroredLeaseRenewal(this.mesh.root, targetId, initial, readMirror,
+        current => current.remoteHost === initial.remoteHost,
+        { signal: options.signal, now: this.options.now, waitMs: this.options.mirrorLeaseWaitMs, budget: waitBudget });
+      // Every awaited admission rechecks lifecycle, duplicate key and the original authority.
+      options.signal?.throwIfAborted();
+      if (this.#closed) throw new Error("Fabric control plane closed");
+      if (this.#pending.has(commandId)) throw new Error(`Fabric message with idempotencyKey ${idempotencyKey} is already awaiting acknowledgement`);
+      const current = readMirror();
+      if (!current) throw unavailable(initial.remoteHost);
+      const status = mirroredOwnerRoutingStatus(current, (this.options.now ?? Date.now)());
+      if (status === "lease-stale") throw rootGone(initial.remoteHost);
+      if (status === "bridge-stale") throw new FabricPeerLeaseStaleError(targetId, initial.remoteHost,
+        Math.max(0, (this.options.now ?? Date.now)() - current.expiresAt));
+      return current;
+    };
+    if (mirroredOwner) {
+      const status = mirroredOwnerRoutingStatus(mirroredOwner, (this.options.now ?? Date.now)());
+      if (status === "lease-stale") throw rootGone(mirroredOwner.remoteHost);
+      if (status === "bridge-stale") mirroredOwner = await renewMirror(mirroredOwner);
+    }
     if (ownerIncarnation === undefined && notRunAttempt === 0) {
       // Once per logical legacy delivery, not once per proven-notRun resend.
       warnUnfencedControlDelivery(operation, targetId, ++this.#legacyDeliveryCount);
@@ -816,7 +873,7 @@ export class FabricControlPlane {
     try {
       // Settlement must not wait for the original publish or a best-effort cancellation.
       // The publish still completes once, and then cancels if settlement won while in flight.
-      const publishing = this.mesh.publish({
+      const publishOnce = () => this.mesh.publish({
         topic: CONTROL_TOPIC,
         kind: operation,
         from: this.identity,
@@ -826,25 +883,65 @@ export class FabricControlPlane {
         to: ownerHostId,
         // Stamped at commit (smarty-dev#816): the owner gets the whole timeout, not what is
         // left after this sender waited for the mesh lock (2-3 s under load).
-        data: (committedAt: number): FabricControlCommand => ({
-          version: 1,
-          commandId,
-          targetId,
-          operation,
-          replyTo: this.options.hostId,
-          ...(ownerIncarnation !== undefined ? { ownerIncarnation } : {}),
-          ...(destinationRemoteHost !== undefined ? { destinationRemoteHost } : {}),
-          ...(input.message !== undefined ? { message: input.message } : {}),
-          ...(input.data !== undefined ? { data: input.data } : {}),
-          ...(input.wakeCause !== undefined ? { wakeCause: copyFabricWakeCause(input.wakeCause) } : {}),
-          ...(input.triggerTurn !== undefined ? { triggerTurn: input.triggerTurn } : {}),
-          ...(input.priority !== undefined ? { priority: input.priority } : {}),
-          ...(input.binding !== undefined ? { binding: input.binding } : {}),
-          ...(input.bindingProvenance !== undefined ? { bindingProvenance: input.bindingProvenance } : {}),
-          requestCreatedAt,
-          requestedAt: committedAt,
-          deadlineAt: committedAt + timeoutMs,
-        }),
+        data: (committedAt: number): FabricControlCommand => {
+          // The event data callback runs under the publication lock, before event append.
+          // A still-pending queued publish cannot cross a lost lease, swapped link or activation.
+          // Once settlement has cleared #pending, preserve the original uncertain in-flight
+          // append and its best-effort cancellation rather than turning it into a preflight refusal.
+          if (this.#pending.get(commandId) === pendingRequest!) {
+            options.signal?.throwIfAborted();
+            if (mirroredOwner) {
+              const current = readMirror();
+              if (!current) throw unavailable(mirroredOwner.remoteHost);
+              const status = mirroredOwnerRoutingStatus(current, (this.options.now ?? Date.now)());
+              if (status === "lease-stale") throw rootGone(mirroredOwner.remoteHost);
+              if (status === "bridge-stale") {
+                if (waitBudget.waited) throw new FabricPeerLeaseStaleError(targetId, current.remoteHost,
+                  Math.max(0, (this.options.now ?? Date.now)() - current.expiresAt));
+                throw new MirrorLeaseAdmissionRequired(current);
+              }
+            }
+          }
+          return {
+            version: 1,
+            commandId,
+            targetId,
+            operation,
+            replyTo: this.options.hostId,
+            ...(ownerIncarnation !== undefined ? { ownerIncarnation } : {}),
+            ...(destinationRemoteHost !== undefined ? { destinationRemoteHost } : {}),
+            ...(input.message !== undefined ? { message: input.message } : {}),
+            ...(input.data !== undefined ? { data: input.data } : {}),
+            ...(input.wakeCause !== undefined ? { wakeCause: copyFabricWakeCause(input.wakeCause) } : {}),
+            ...(input.triggerTurn !== undefined ? { triggerTurn: input.triggerTurn } : {}),
+            ...(input.priority !== undefined ? { priority: input.priority } : {}),
+            ...(input.binding !== undefined ? { binding: input.binding } : {}),
+            ...(input.bindingProvenance !== undefined ? { bindingProvenance: input.bindingProvenance } : {}),
+            requestCreatedAt,
+            requestedAt: committedAt,
+            deadlineAt: committedAt + timeoutMs,
+          };
+        },
+      });
+      const publishing = publishOnce().catch(async error => {
+        if (!(error instanceof MirrorLeaseAdmissionRequired)) throw error;
+        // The failed commit callback appended nothing. Clear the prearmed request before
+        // awaiting, then re-admit this same command once under the original wait budget.
+        const pending = this.#clearPending(commandId);
+        if (!pending) throw error;
+        mirroredOwner = await renewMirror(error.owner);
+        pending.mirroredOwner = { ...mirroredOwner };
+        this.#pending.set(commandId, pending);
+        if (pending.signal && pending.onAbort) {
+          pending.signal.addEventListener("abort", pending.onAbort, { once: true });
+          if (pending.signal.aborted) { pending.onAbort(); pending.signal.throwIfAborted(); }
+        }
+        // Keep the original admission/ACK bound, rather than restarting it after renewal.
+        const remaining = Math.max(0, timeoutMs + ackGraceMs - (Date.now() - requestCreatedAt));
+        pending.timer = setTimeout(() => this.#timeoutPending(commandId), remaining);
+        pending.timer.unref();
+        this.#startLeaseWatchdog();
+        return publishOnce();
       }).then((event) => {
         this.#wake(); // own publish: never depend on this process's own watcher
         publishedEvent = event;
@@ -1016,14 +1113,15 @@ export class FabricControlPlane {
           continue;
         }
         // Never adopt a different link's label. Missing ownership cannot renew this lease.
-        if (current?.remoteHost === captured.remoteHost) captured.expiresAt = current.expiresAt;
-        if (captured.expiresAt > Date.now()) continue;
+        if (current?.remoteHost === captured.remoteHost) Object.assign(captured, { ...current, mirror: current.mirror, bridgeStale: current.bridgeStale });
+        const status = mirroredOwnerRoutingStatus(captured, (this.options.now ?? Date.now)());
+        if (status === "live") continue;
         const lapsed = this.#clearPending(commandId);
         if (!lapsed) continue;
         void this.#publishCancellation(commandId, lapsed);
-        lapsed.reject(new Error(
-          `Fabric lease mirrored from remote host ${captured.remoteHost} lapsed for ${pending.targetId}; ` +
-            "the mesh bridge is down or the owner is unavailable; " +
+        lapsed.reject(status === "bridge-stale" ? new FabricBridgeStaleError(captured.remoteHost, pending.targetId) : new Error(
+          `Fabric lease observed on remote host ${captured.remoteHost} lapsed for ${pending.targetId}; ` +
+            "the bridge observation is fresh and the remote owner's lease is old; " +
             "the outcome is unknown and it may still be delivered, so a retry can deliver it twice.",
         ));
       }

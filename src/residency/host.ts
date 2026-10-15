@@ -71,6 +71,8 @@ import {
   resolveFabricModelGuidance,
 } from "../components/model-guidance.js";
 import { ActorDirectory } from "../actors/directory.js";
+import { slotAdmissionFor } from "../actors/slot-admission.js";
+import { ActorSlotRecoveryParkedError } from "../actors/slot-recovery.js";
 import { wakeResidentActors, assertResidentWakeWatch, ensureResidentWakeArchive, readWakeJson, residentWakeRequestPath, residentSleepingPath, ResidentWakeWatchError, subscribeResidentWakeWatchErrors, type ResidentWakeRoutes } from "./wake.js";
 import { DEFAULT_STUCK_PREPARING_MS, STUCK_PREPARING_CHECK_MS } from "../actors/stuck-preparing.js";
 import { ActorRegistryStore } from "../actors/registry-store.js";
@@ -117,6 +119,8 @@ import {
   type ResidentAgentMetadata,
   type ResidentCommand,
   type ResidentCommandResponse,
+  residentSlotErrorFields,
+  residentCreateMayBeProtected,
   type ResidentDeliveryRecord,
   type ResidentHostConfig,
   type ResidentHostOwner,
@@ -423,7 +427,8 @@ export class ResidentHost {
     // An invalid preparation is discarded and re-selected outside every fence.
     // Independent liveness may only renew existing keys with matching lineage tokens;
     // it never claims, creates, removes, or certifies a shared heartbeat.
-    const registries = Object.values(residentActorRoots(config)).map((root) => new ActorRegistryStore(root));
+    const registryRoots = Object.values(residentActorRoots(config));
+    const registries = registryRoots.map((root) => new ActorRegistryStore(root));
     // smarty-dev#8526: lock only the registries holding the rows of the actors this round writes.
     // The project registry is ONE lock shared by every resident host of the project; a round that
     // publishes none of its rows no longer serializes behind (or blocks) other hosts on it.
@@ -441,7 +446,7 @@ export class ResidentHost {
       }
       return ActorRegistryStore.withLocks(scoped ?? registries, () => this.mesh.withTryLock(publish, 50), "presence-fence");
     };
-    const knownRegistries = registries.map(store => ({ store, snapshot: store.snapshot(), byId: new Map(store.snapshot().actors.map(row => [row.id, row])) }));
+    const knownRegistries = registries.map((store, index) => ({ root: registryRoots[index]!, store, snapshot: store.snapshot(), byId: new Map(store.snapshot().actors.map(row => [row.id, row])) }));
     const current = (known: typeof knownRegistries[number]): typeof knownRegistries[number] => {
       const snapshot = known.store.snapshot(); // cached last-known view unless the atomic generation moved
       if (snapshot !== known.snapshot) {
@@ -453,8 +458,14 @@ export class ResidentHost {
     const actorRenewalAllowed = (record: import("../topology/types.js").FabricParticipantRecord): boolean => {
       for (const known of knownRegistries) {
         const row = current(known).byId.get(record.id);
-        if (row) return row.rootId === config.rootId && (row.residency ?? "session") === "durable" &&
-          record.actorOwnershipToken === JSON.stringify([row.rootId, row.adoptedAt ?? null, row.adoptedFrom ?? []]);
+        if (row) {
+          const topics = Array.isArray(row.topics) ? row.topics.filter((topic): topic is string => typeof topic === "string") : [];
+          const slots = slotAdmissionFor(this.mesh);
+          if (slots.requiresEnforcement(topics, known.root, config.rootId) &&
+              (!this.actors.slotRecoveryStatus().ready || !slots.isCurrent(record.id, topics, known.root))) return false;
+          return row.rootId === config.rootId && (row.residency ?? "session") === "durable" &&
+            record.actorOwnershipToken === JSON.stringify([row.rootId, row.adoptedAt ?? null, row.adoptedFrom ?? []]);
+        }
       }
       return false;
     };
@@ -592,6 +603,7 @@ export class ResidentHost {
       claudeBinary: config.claudeBinary,
       vedaBinary: config.vedaBinary,
       runRoot: path.join(config.residencyRoot, "runs"),
+      admissionSnapshotPath: path.join(residentActorRoots(config).session, "admission.json"),
       fullCodeMode: config.fullCodeMode,
       kernel: () => currentConfig().kernel ?? config.kernel ?? "typescript",
       pythonRuntime: () => currentConfig().pythonRuntime ?? config.pythonRuntime ?? "monty",
@@ -740,13 +752,6 @@ export class ResidentHost {
           if (rootId !== config.rootId) throw new Error(`Operator cleanup for foreign root ${rootId}; tree kept`);
           const { fencedOperatorCheck } = await import("../actors/remove-offline.js");
           await fencedOperatorCheck(this.mesh, this.identity as { id: string; name: string; kind: "agent" }, rootId, get => {
-            if (process.platform !== "linux") {
-              // pi-fabric#1014: off Linux this is main's existing path on this platform (no kernel fence, no Main
-              // identity primitive): the lease veto and the participant quiet check only.
-              assertResidentOperatorConfirmed(readResidentOperatorEvidence(config, { get }), rootId);
-              assertRootParticipantQuiet(config, { get });
-              return;
-            }
             // pi-fabric#1031: the same Main-identity verdict as the offline removal. A stale record needs its Main
             // pid+start identity independently gone and no live lease file; no record or no identity is unknown.
             try {
@@ -820,6 +825,13 @@ export class ResidentHost {
             child: { pid: process.pid, processStartTime: birth }, generation: this.#token } });
       }
       this.#initialize();
+      // Both actor scopes must reconcile durable intents before any actor source,
+      // control ingress, readiness receipt, or release resume can become visible.
+      try { await this.actors.recoverProtectedActors(); }
+      catch (error) {
+        if (!(error instanceof ActorSlotRecoveryParkedError)) throw error;
+        console.warn(`[pi-fabric] ${this.actors.slotRecoveryStatus().error?.message}`);
+      }
       if (this.#staged) { this.#drainActors().pauseForRelease({ strict: true }); this.#drainAgents().pauseForRelease(true); }
       fs.mkdirSync(this.#requestsPath, { recursive: true, mode: 0o700 });
       fs.mkdirSync(this.#processingPath, { recursive: true, mode: 0o700 });
@@ -2413,7 +2425,7 @@ export class ResidentHost {
     } catch (error) {
       response = { format: RESIDENT_HOST_FORMAT, requestId, ok: false, error: errorMessage(error),
         ...(error instanceof ResidentCommandUnsupportedError || error instanceof ResidentRequestExpiredError
-          ? { errorCode: error.code } : {}), completedAt: Date.now() };
+          ? { errorCode: error.code } : {}), ...residentSlotErrorFields(error), completedAt: Date.now() };
     }
     if (response.ok) await testResidentRequestDelay("after_commit");
     const responsePath = path.join(this.#responsesPath, `${requestId}.json`);
@@ -2440,6 +2452,14 @@ export class ResidentHost {
   }
 
   async #executeOnce(command: ResidentCommand, boundaryAdmitted?: () => void): Promise<ResidentCommandResponse> {
+    // The durable native ledger, not this bounded host-local receipt cache, owns
+    // protected retries and immutable-spec conflicts across resident generations.
+    if (command.operation === "createActor") {
+      const slots = slotAdmissionFor(this.mesh);
+      if (slots.requiresEnforcement(command.request.topics ?? [], residentActorRoots(this.config)[command.request.scope ?? this.config.mesh.actorScope], this.config.rootId)) {
+        return this.#executeRequest(command, boundaryAdmitted);
+      }
+    }
     if ((command.operation !== "spawnBound" && command.operation !== "createActor") || command.idempotencyKey === undefined) {
       return this.#executeRequest(command, boundaryAdmitted);
     }
@@ -2583,13 +2603,18 @@ export class ResidentHost {
         // This handler already runs inside the authoritative durable host.
         // Keep the new actor locally owned; ceding it here created a needless
         // self-transfer window that blocked the next recruitment request.
-        const { instructionsFile: _file, sha256: _digest, ...base } = command.request;
+        const slots = slotAdmissionFor(this.mesh);
+        const protectedCreate = slots.requiresEnforcement(command.request.topics ?? [], residentActorRoots(this.config)[command.request.scope ?? this.config.mesh.actorScope], this.config.rootId);
+        if (protectedCreate) this.#authorizeResidentSetter(command.caller);
+        const { instructionsFile: _file, sha256: _digest, idempotencyKey: _requestKey, ...base } = command.request;
         const instructions = resolveActorInstructions(command.request, this.config.agents.instructionsRoot);
-        const actor = await this.actors.create({ ...base, instructions }, {
+        const actor = await this.actors.create({ ...base, instructions,
+          ...(command.idempotencyKey === undefined ? {} : { idempotencyKey: command.idempotencyKey }),
+        }, {
           asRegistryOwner: true,
           ...(command.caller ? { supervisorOwner: command.caller.identity } : {}),
           beforeCommit: id => {
-            if (command.caller) this.#authorizeResidentSetter(command.caller);
+            if (protectedCreate || command.caller) this.#authorizeResidentSetter(command.caller);
             commit(id);
           },
         });
@@ -2639,6 +2664,9 @@ export class ResidentHost {
             ? { format: RESIDENT_HOST_FORMAT, requestId, ok: true, actor: stopped, completedAt: Date.now() }
             : await this.#removeResidentActor(actor.id, requestId, () => check(), true);
         }
+      } else if (command.operation === "slotStatus") {
+        response = { format: RESIDENT_HOST_FORMAT, requestId, ok: true,
+          slotStatus: slotAdmissionFor(this.mesh).status(), completedAt: Date.now() };
       } else if (command.operation === "actors") {
         response = {
           format: RESIDENT_HOST_FORMAT, requestId, ok: true,
@@ -2693,6 +2721,23 @@ export class ResidentHost {
       }
     } catch (error) {
       const drain = command.operation === "releaseDrain" ? this.#drainRefusal(command, error) : undefined;
+      let slotFailure = residentSlotErrorFields(error);
+      if (command.operation === "createActor" && (residentCreateMayBeProtected(command) ||
+          slotAdmissionFor(this.mesh).isProtected(command.request.topics ?? []))) {
+        // Acceptance is not durable birth. Once its CAS wins, SQL/sync/projection
+        // failures are uncertainty even when the intent or response is missing.
+        let decision;
+        try { decision = readResidentRequestDecision(this.config.residencyRoot, requestId); } catch { /* retain native error */ }
+        if (decision?.state === "committed") {
+          slotFailure = { errorCode: "FABRIC_ACTOR_SLOT_CREATE_UNCERTAIN", slotError: {
+            ...slotFailure.slotError,
+            ...((slotFailure.slotError?.actorId ?? decision.id) ? { actorId: (slotFailure.slotError?.actorId ?? decision.id)! } : {}),
+            ...(command.request.slotClaim ? { claimKey: command.request.slotClaim.key,
+              claimVersion: command.request.slotClaim.ifVersion } : {}),
+            ...(command.idempotencyKey ? { requestKey: command.idempotencyKey } : {}),
+          } };
+        }
+      }
       response = {
         format: RESIDENT_HOST_FORMAT,
         requestId,
@@ -2705,6 +2750,7 @@ export class ResidentHost {
         ...(error instanceof FabricModelDeniedError ? {
           errorCode: error.code, modelDenied: { model: error.model, ...(error.replacement ? { replacement: error.replacement } : {}) },
         } : {}),
+        ...slotFailure,
         completedAt: Date.now(),
       };
     }

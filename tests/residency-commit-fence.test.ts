@@ -1424,7 +1424,9 @@ describe("round 6 registered fabric_exec post-completion deadlines", { timeout: 
       const state = await harness(false, undefined, 10_000); const main = mainProvider(state);
       const startedAt = Date.now(); const clock = vi.spyOn(Date, "now").mockReturnValue(startedAt);
       let crossed = false; const closed: Promise<void>[] = [];
-      const crossDeadline = () => { crossed = true; clock.mockReturnValue(startedAt + 60_000); };
+      // Cross the exact 5s runtime/Main deadline without passing unrelated host
+      // 30s dormancy while awaiting CPython reap.
+      const crossDeadline = () => { crossed = true; clock.mockReturnValue(startedAt + 5_001); };
       if (engine === "cpython") {
         const actual = await vi.importActual<typeof import("node:child_process")>("node:child_process");
         vi.mocked(childProcess.spawn).mockImplementation(((...args: Parameters<typeof actual.spawn>) => {
@@ -1469,7 +1471,7 @@ describe("round 6 registered fabric_exec post-completion deadlines", { timeout: 
         vi.restoreAllMocks(); vi.mocked(childProcess.spawn).mockReset();
         const reconcile = await registeredExecution(state, main, 5_000, engine);
         const reconciled = await reconcile(`return {"status": await agents.actorStatus(id="${decision.id}"), "stop": await agents.stop(id="${decision.id}")}`);
-        expect(reconciled.isError).not.toBe(true);
+        expect(reconciled.isError, visibleText(reconciled)).not.toBe(true);
         expect(JSON.parse(visibleText(reconciled))).toMatchObject({ status: { id: decision.id }, stop: { id: decision.id, status: "stopped" } });
         await waitFor(() => state.participants.get(decision.id)?.status === "stopped");
         expect(new ActorRegistryStore(state.config.actorRoot).records()).toHaveLength(1);

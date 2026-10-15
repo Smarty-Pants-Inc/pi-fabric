@@ -120,7 +120,7 @@ import { captureStorageDelete, captureStoragePut, storageRevision, type StorageT
 import { encodeMeshStateMovedMarker, isMeshStateMovedMarker, isMeshStateNatsMarker, meshStateMovedToNatsError, readMeshStateMovedMarker } from "./backend-fence.js";
 import { holdMeshFence, holdMeshFenceSync } from "./fence-lock.js";
 import { type MeshLockTicket, meshLockQueueBusy, meshLockQueueDirectory } from "./lock-queue.js";
-import { createMeshLockAdmission } from "./mesh-lock.js";
+import { createMeshLockAdmission, lockStats } from "./mesh-lock.js";
 import { processStartTime, residentProcessAlive } from "../residency/process-identity.js";
 import { verifiedRemove } from "../storage/verified-remove.js";
 // From the domain modules, not the store.ts facade: store.ts loads this module through state-backend.ts (L2a).
@@ -144,7 +144,15 @@ export interface SqliteStatement {
   all(...params: SqliteValue[]): SqliteRow[];
 }
 
+export interface SqliteFileIdentity {
+  canonicalPath: string;
+  device: string;
+  inode: string;
+}
+
 export interface SqliteConnection {
+  /** Native driver evidence for the actual opened main database, not a configured filename. */
+  attestDatabaseFile?(): SqliteFileIdentity;
   exec(sql: string): void;
   prepare(sql: string): SqliteStatement;
   close(): void;
@@ -624,6 +632,26 @@ export const validateMeshStateKey = (key: string): void => {
   if (!KEY_PATTERN.test(key) || unsafeSegment) throw new Error(`Invalid Fabric mesh key: ${key}`);
 };
 
+/**
+ * Linux evidence captured at the native open. Never open/close a second plain-fs descriptor
+ * for state.db: POSIX would drop this process's SQLite locks. stat/readlink of /proc fds is safe.
+ * SQLite can share its main fd between connections; only evidence from OUR native opener may
+ * vouch for that case. An adapter without actual-connection evidence cannot enforce slots.
+ */
+const nativeDatabaseFds = new Map<number, { device: string; inode: string; users: number }>();
+const databaseFds = (file: string): Map<number, SqliteFileIdentity> => {
+  const found = new Map<number, SqliteFileIdentity>();
+  for (const name of fs.readdirSync("/proc/self/fd")) {
+    const fd = Number(name);
+    try {
+      if (fs.readlinkSync(`/proc/self/fd/${name}`) !== file) continue;
+      const stat = fs.statSync(`/proc/self/fd/${name}`, { bigint: true });
+      if (stat.isFile()) found.set(fd, { canonicalPath: file, device: String(stat.dev), inode: String(stat.ino) });
+    } catch { /* Descriptor closed by another native subsystem; it is not evidence. */ }
+  }
+  return found;
+};
+
 /** The default driver: node:sqlite `DatabaseSync` behind the `SqliteConnection` adapter surface. */
 export const openNodeSqlite: SqliteOpener = (file) => {
   // Loaded at first use (AGENTS.md startup budget). Bun 1.4 also provides node:sqlite.
@@ -631,8 +659,47 @@ export const openNodeSqlite: SqliteOpener = (file) => {
   try { sqlite = process.getBuiltinModule?.("node:sqlite"); }
   catch (error) { throw new MeshStateUnsupportedError("node:sqlite is unavailable in this runtime (Node >= 22.13 required)", { cause: error }); }
   if (!sqlite?.DatabaseSync) throw new MeshStateUnsupportedError("node:sqlite is unavailable in this runtime (Node >= 22.13 required)");
+  // Attestation is optional for ordinary state. Non-Linux runtimes retain their existing behavior.
+  let canonical: string | undefined;
+  let before: Map<number, SqliteFileIdentity> | undefined;
+  if (process.platform === "linux") try {
+    try { canonical = fs.realpathSync(file); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      canonical = path.join(fs.realpathSync(path.dirname(file)), path.basename(file));
+    }
+    before = databaseFds(canonical);
+  } catch { /* Ordinary SQLite remains usable without /proc; enforced slots fail closed. */ }
   const database = new sqlite.DatabaseSync(file, { timeout: 0 });
+  const descriptors: Array<[number, SqliteFileIdentity]> = [];
+  let after: Map<number, SqliteFileIdentity> | undefined;
+  if (canonical && before) try { after = databaseFds(canonical); } catch { /* No attestation. */ }
+  if (after) {
+    for (const [fd, identity] of after) {
+      const known = nativeDatabaseFds.get(fd);
+      if (before!.has(fd) && (!known || known.device !== identity.device || known.inode !== identity.inode)) continue;
+      descriptors.push([fd, identity]);
+      nativeDatabaseFds.set(fd, { ...identity, users: (known?.users ?? 0) + 1 });
+    }
+  }
+  let closed = false;
   return {
+    attestDatabaseFile: () => {
+      if (closed || !canonical || descriptors.length === 0) throw new Error("SQLite connection has no Linux main-file fd attestation");
+      const main = database.prepare("PRAGMA database_list").all().find(row => row.name === "main");
+      if (main?.file !== canonical || fs.realpathSync(file) !== canonical) throw new Error("SQLite main database path changed");
+      const current = fs.lstatSync(file, { bigint: true });
+      if (!current.isFile()) throw new Error("SQLite main database is not a regular file");
+      for (const [fd, identity] of descriptors) {
+        try {
+          const opened = fs.statSync(`/proc/self/fd/${fd}`, { bigint: true });
+          if (opened.isFile() && String(opened.dev) === identity.device && String(opened.ino) === identity.inode
+            && String(current.dev) === identity.device && String(current.ino) === identity.inode
+            && fs.readlinkSync(`/proc/self/fd/${fd}`) === canonical) return { ...identity };
+        } catch { /* Try the other descriptor captured at this connection's native open. */ }
+      }
+      throw new Error("SQLite opened main-file inode no longer matches its path");
+    },
     exec: (sql) => { database.exec(sql); },
     prepare: (sql) => {
       const statement = database.prepare(sql);
@@ -642,7 +709,15 @@ export const openNodeSqlite: SqliteOpener = (file) => {
         all: (...params) => statement.all(...params),
       };
     },
-    close: () => { database.close(); },
+    close: () => {
+      if (closed) return;
+      database.close();
+      closed = true;
+      for (const [fd, identity] of descriptors) {
+        const known = nativeDatabaseFds.get(fd);
+        if (known?.device === identity.device && known.inode === identity.inode && --known.users === 0) nativeDatabaseFds.delete(fd);
+      }
+    },
     get isTransaction() { return database.isTransaction; },
   };
 };
@@ -962,6 +1037,36 @@ export class SqliteStateStore {
     this.#assertReadable();
   }
 
+  /** Actual native connection evidence. No fs open/close of the database is involved. */
+  attestDatabaseFile(): SqliteFileIdentity {
+    this.#assertOpen();
+    if (!this.#db.attestDatabaseFile) throw new Error("SQLite adapter cannot attest its opened database inode");
+    return this.#db.attestDatabaseFile();
+  }
+
+  /** Host bootstrap seal, outside public KV and therefore not writable through mesh tools. */
+  slotAuthorityBinding(): string | undefined {
+    this.#assertReadable();
+    const value = this.#sql.metaGet.get("slot_admission_binding")?.value;
+    return typeof value === "string" ? value : undefined;
+  }
+
+  /**
+   * Native fresh bootstrap ONLY, after the installer won O_EXCL creation of state.db.
+   * Empty after a restart is NOT freshness. The caller must never call this on an existing file.
+   */
+  async initializeSlotAuthority(binding: string, beforeCommit: () => void): Promise<void> {
+    await this.#write("other", tx => {
+      if (tx.highWater !== 0 || tx.commit !== 0 || this.#sql.metaGet.get("slot_admission_binding")
+        || Number(this.#sql.kvCount.get()?.n) !== 0 || Number(this.#sql.tombCount.get()?.n) !== 0) {
+        throw new Error("Existing SQLite authority cannot be enabled; smarty-dev#13036");
+      }
+      this.#db.prepare("INSERT INTO meta(name, value) VALUES ('slot_admission_binding', ?)").run(binding);
+      tx.finish = true;
+      tx.beforeCommit = beforeCommit;
+    });
+  }
+
   /** Cheap per-connection "did another connection commit?" counter (PRAGMA data_version). */
   dataVersion(): number {
     this.#assertOpen();
@@ -1057,11 +1162,12 @@ export class SqliteStateStore {
 
   // ---------------------------------------------------------------- writes
 
-  async put(input: { key: string; value: unknown; identity: MeshIdentity; ifVersion?: number }): Promise<MeshStateEntry> {
-    const { key, value, identity, ifVersion } = input;
+  async put(input: { key: string; value: unknown; identity: MeshIdentity; ifVersion?: number; beforeCommit?: () => void }): Promise<MeshStateEntry> {
+    const { key, value, identity, ifVersion, beforeCommit } = input;
     validateMeshStateKey(key);
     const request = captureStoragePut({ key, value, identity, ifVersion }, this.maxEventBytes);
     return this.#write("put/delete", (tx) => {
+      if (beforeCommit) tx.beforeCommit = beforeCommit;
       const slot = this.#slot(request.key);
       const plan = request.transition(slot.present, slot.version, tx.highWater);
       if (plan.kind !== "put") throw new Error("Invalid verified storage put plan");
@@ -1069,11 +1175,12 @@ export class SqliteStateStore {
     });
   }
 
-  async delete(input: { key: string; ifVersion?: number }): Promise<{ deleted: boolean; version?: number }> {
-    const { key, ifVersion } = input;
+  async delete(input: { key: string; ifVersion?: number; beforeCommit?: () => void }): Promise<{ deleted: boolean; version?: number }> {
+    const { key, ifVersion, beforeCommit } = input;
     validateMeshStateKey(key);
     const request = captureStorageDelete({ key, ifVersion });
     return this.#write<{ deleted: boolean; version?: number }>("put/delete", (tx) => {
+      if (beforeCommit) tx.beforeCommit = beforeCommit;
       const slot = this.#slot(request.key);
       const plan = request.transition(slot.present, slot.version, tx.highWater);
       if (plan.kind === "unchanged") return { deleted: false };
@@ -1677,8 +1784,9 @@ export class SqliteStateStore {
             if (headWaitMs > this.#busyTimeoutMs) this.#db.exec(`PRAGMA busy_timeout = ${this.#busyTimeoutMs}`);
           }
           if (begun) {
-            this.#stats.maxWaitMs = Math.max(this.#stats.maxWaitMs, performance.now() - started);
-            this.#window.maxWaitMs = Math.max(this.#window.maxWaitMs, performance.now() - started);
+            const waitMs = performance.now() - started;
+            this.#stats.maxWaitMs = Math.max(this.#stats.maxWaitMs, waitMs);
+            this.#window.maxWaitMs = Math.max(this.#window.maxWaitMs, waitMs);
             // smarty-dev#6100: the SQLite writer lock is the exclusion; the advisory receipt only orders waiters.
             // Leave the queue now, so post-COMMIT work (SQLite's autocheckpoint fsync inside COMMIT, the emergency
             // checkpoint) never keeps the next waiter from contending.
@@ -1686,7 +1794,7 @@ export class SqliteStateStore {
             ticket = undefined;
             this.#writesWaiting -= 1;
             waiting = false;
-            return this.#run(body, lockClass);
+            return this.#run(body, lockClass, waitMs);
           }
         }
         const now = performance.now();
@@ -1706,7 +1814,9 @@ export class SqliteStateStore {
           // ticket at the head (pi-fabric#905 review round 3).
           ticket?.close();
           ticket = undefined;
-          if (!scope?.active && budget > 0) lockEvents?.waitTimeout(this.root, "sqlite", lockClass, now - started, walWriterPid(this.file));
+          const tried = Boolean(scope?.active) || budget <= 0;
+          lockStats?.failed(this.root, lockClass, now - started, tried);
+          if (!tried) lockEvents?.waitTimeout(this.root, "sqlite", lockClass, now - started, walWriterPid(this.file));
           throw new MeshLockTimeoutError(` (SQLite state ${this.file})`, attempts, Math.round(maxGap));
         }
         if (!ticket && now - started >= this.#fifoAfterMs) {
@@ -1754,7 +1864,7 @@ export class SqliteStateStore {
   }
 
   // The synchronous body between BEGIN IMMEDIATE (already taken) and COMMIT.
-  #run<T>(body: (tx: Tx) => T, lockClass: MeshLockClass): T {
+  #run<T>(body: (tx: Tx) => T, lockClass: MeshLockClass, waitMs: number): T {
     const began = performance.now();
     this.#inTransaction = true;
     this.#stats.transactions += 1;
@@ -1785,6 +1895,8 @@ export class SqliteStateStore {
       const hold = performance.now() - began;
       this.#stats.totalHoldMs += hold;
       this.#stats.maxHoldMs = Math.max(this.#stats.maxHoldMs, hold);
+      // One sample per actual SQLite transaction, including rollback, after releasing its writer lock.
+      lockStats?.acquired(this.root, lockClass, waitMs, hold);
       this.#heldEvent(lockClass, hold);
       if (committed && changed) {
         // data_version does not change for this connection's own commits. Metadata-only

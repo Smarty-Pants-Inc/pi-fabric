@@ -1782,8 +1782,8 @@ export class MainAgentController implements FabricMainAgentTarget {
   }
 
   #recordProviderFailure(newFailure = false): void {
-    // An already-alarmed unclassified episode is held until owner input or real success.
-    if (this.#providerDead?.kind === "unclassified" && this.#providerDead.alarmed) return;
+    // Late failures cannot lift a terminal alarmed hold. A human compaction can still earn probation.
+    if (this.#providerDead?.phase === "alarmed") return;
     // A retryable failure (even after a non-retryable incident's compaction) is backoff again.
     this.#clearProviderDead();
     this.#providerAttemptInFlight = false;
@@ -1835,7 +1835,15 @@ export class MainAgentController implements FabricMainAgentTarget {
     this.#providerFailureRecorded = this.#providerDead !== undefined;
     this.#providerReleaseUntil = undefined;
     this.#stopProviderWake();
-    if (this.#providerDead && !this.#halted) this.#armProviderDeadTimer();
+    const dead = this.#providerDead;
+    if (dead && !this.#halted && !this.#context?.signal?.aborted) {
+      // Attach releases replay synchronously: an expired pending step must hold before that release.
+      // An already-admitted attempt owns its outcome, not the pending recovery deadline.
+      if ((dead.phase === "recovering" || dead.phase === "probation") && !this.#providerAttemptInFlight &&
+        dead.deadlineAt !== undefined && dead.deadlineAt <= Date.now()) {
+        this.#raiseProviderDead("recovery-timeout");
+      } else this.#armProviderDeadTimer();
+    }
     if (this.#providerStateDirty) this.#trySave(true);
   }
 
@@ -2275,6 +2283,7 @@ export class MainAgentController implements FabricMainAgentTarget {
       this.#providerAttemptInFlight = true;
       if (this.#providerDead) {
         this.#providerDead.attemptStarted = true;
+        this.#stopProviderDeadDeadline();
         this.#providerStateDirty = true;
         this.#trySave(true);
       }

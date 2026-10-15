@@ -74,6 +74,15 @@ if (rangeMode) {
 
 const files = [...new Set(changed)].filter((file) => fs.existsSync(file));
 const isTestFile = (file) => file.startsWith("tests/") && /\.test\.(?:ts|tsx)$/.test(file);
+const sourceTextEdges = new Map();
+for (const test of git(["ls-files", "--cached", "--others", "--exclude-standard", "--", "tests"])
+  .split("\n").filter(isTestFile)) {
+  for (const [, source] of fs.readFileSync(test, "utf8").matchAll(/["'`](src\/[^"'`]+)["'`]/g)) {
+    const tests = sourceTextEdges.get(source) ?? [];
+    tests.push(test);
+    sourceTextEdges.set(source, tests);
+  }
+}
 // Docs carry their own style suite. A docs-only change selects nothing else,
 // so without this mapping a shipped violation stays invisible to CI.
 const DOCS_STYLE_TEST = "tests/documentation-style.test.ts";
@@ -81,7 +90,7 @@ const isDocsFile = (file) => file === "README.md" || file.startsWith("docs/");
 const direct = [...new Set([
   ...files.filter(isTestFile),
   ...(files.some(isDocsFile) && fs.existsSync(DOCS_STYLE_TEST) ? [DOCS_STYLE_TEST] : []),
-  ...files.flatMap((file) => file === "src/actors/session-orphans.ts" ? ["tests/actor-registry-owner-label.test.ts"] : []),
+  ...files.flatMap((file) => sourceTextEdges.get(file) ?? []),
 ])];
 const related = files.filter(
   (file) => (file.startsWith("src/") || file.startsWith("tests/")) && !isTestFile(file),

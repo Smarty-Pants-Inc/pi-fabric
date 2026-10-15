@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { detachedPreview } from "../core/preview.js";
 import type { AgentUsage } from "../agents/types.js";
 import type { FabricAgentMessageResult } from "../main-agent.js";
 import type {
@@ -92,7 +93,7 @@ const boundedText = (value: unknown, field: string, max: number, required = fals
   const text = value.trim();
   if (required && !text) throw new TypeError(`Fabric participant ${field} must not be empty`);
   if (text.length > max) throw new RangeError(`Fabric participant ${field} exceeds ${max} characters`);
-  return text || undefined;
+  return text ? detachedPreview(text, max) : undefined;
 };
 
 const usageFrom = (value: unknown): AgentUsage | undefined => {
@@ -127,7 +128,7 @@ const activityOf = (entry: Entry): string | undefined => {
   const text = entry.status === "running"
     ? entry.phase && entry.message ? `${entry.phase}: ${entry.message}` : entry.phase ?? entry.message
     : entry.summary;
-  return text ? text.slice(0, 160) : undefined;
+  return text ? detachedPreview(text, 160) : undefined;
 };
 
 /**

@@ -60,8 +60,9 @@ export interface JetStreamPort {
   firstSequence(stream: string): Promise<number>;
   /** Whether a stream of this name exists (never creates it). */
   streamExists(stream: string): Promise<boolean>;
-  /** One stored message by sequence, or undefined when it is gone (purged) or never existed. */
-  getMessage(stream: string, seq: number): Promise<NatsStreamMessage | undefined>;
+  /** One stored message by sequence, or undefined when it is gone (purged) or never existed.
+   * Internal initial-open budget: an absolute Date.now() deadline and optional still-needed predicate; not user configuration. */
+  getMessage(stream: string, seq: number, budget?: { deadline: number; active?: () => boolean }): Promise<NatsStreamMessage | undefined>;
   /** The last stored message on one subject, or undefined. */
   lastBySubject(stream: string, subject: string): Promise<NatsStreamMessage | undefined>;
   /** Removes every message below `beforeSeq`. */
@@ -476,6 +477,8 @@ const singleWriteContract = <T>(write: Promise<T>): Promise<T> => write.catch((e
   throw error instanceof MeshBatchConflictError ? new Error(error.message) : error;
 });
 
+type NatsBootstrap = { active: boolean; generation: number };
+
 export class NatsStateBackend implements StateBackend {
   readonly kind = "nats" as const;
   readonly readCacheMs = 0;
@@ -493,6 +496,7 @@ export class NatsStateBackend implements StateBackend {
   #casRetries = 0;
   /** Bumped per projector start: deliveries of a stopped consumer are ignored. */
   #generation = 0;
+  #bootstrap: NatsBootstrap | undefined;
   #resyncing = false;
   /** A purge gap seen while a re-sync was running: the re-sync loops (bounded) instead of dropping it. */
   #gapPending = false;
@@ -515,16 +519,24 @@ export class NatsStateBackend implements StateBackend {
   /** Loads the latest snapshot, connects the projector after it and replays up to the stream's current last sequence. */
   static async open(options: NatsStateBackendOptions): Promise<NatsStateBackend> {
     const backend = new NatsStateBackend(options);
-    const { lastSeq, maxMsgSize } = await options.port.ensureStream(options.stream, [options.subject, options.snapshotSubject],
-      { maxMsgSize: backend.#limits.maxMessageBytes, ...(options.replicas === undefined ? {} : { replicas: options.replicas }) });
-    // The server enforces the message cap too (pi-fabric#907): a stream with no limit, or a larger one, is refused.
-    if (maxMsgSize === undefined || maxMsgSize <= 0 || maxMsgSize > backend.#limits.maxMessageBytes) {
-      throw new MeshStateNatsLimitError(`the stream ${options.stream} allows messages of ${maxMsgSize === undefined || maxMsgSize <= 0 ? "any size" : `${maxMsgSize} bytes`} (limit ${backend.#limits.maxMessageBytes}); set its max_msg_size`);
+    try {
+      const { lastSeq, maxMsgSize } = await options.port.ensureStream(options.stream, [options.subject, options.snapshotSubject],
+        { maxMsgSize: backend.#limits.maxMessageBytes, ...(options.replicas === undefined ? {} : { replicas: options.replicas }) });
+      // The server enforces the message cap too (pi-fabric#907): a stream with no limit, or a larger one, is refused.
+      if (maxMsgSize === undefined || maxMsgSize <= 0 || maxMsgSize > backend.#limits.maxMessageBytes) {
+        throw new MeshStateNatsLimitError(`the stream ${options.stream} allows messages of ${maxMsgSize === undefined || maxMsgSize <= 0 ? "any size" : `${maxMsgSize} bytes`} (limit ${backend.#limits.maxMessageBytes}); set its max_msg_size`);
+      }
+      backend.#knownSeq = lastSeq;
+      await backend.#startProjector();
+      const head = backend.#knownSeq;
+      await backend.#appliedThrough(head, undefined, true);
+      return backend;
+    } catch (error) {
+      const consumer = backend.#retireProjector();
+      // Only retire our projector here: the caller retains ownership of an externally supplied port.
+      void (async () => { await consumer?.stop(); })().catch(() => undefined);
+      throw error;
     }
-    backend.#knownSeq = lastSeq;
-    await backend.#startProjector();
-    await backend.#appliedThrough(backend.#knownSeq);
-    return backend;
   }
 
   /**
@@ -533,22 +545,35 @@ export class NatsStateBackend implements StateBackend {
    * during the load count), and a backlog over `maxReplay` loads a newer snapshot once, then refuses (LIMIT).
    */
   async #startProjector(): Promise<void> {
-    for (let attempt = 1; ; attempt++) {
-      const loaded = await this.#loadSnapshot();
-      // A newer snapshot replaces the model: one state-change hint per install (none at open: no listener yet).
-      if (loaded && loaded.seq > this.#snapshot.seq) { this.#snapshot = loaded; this.#settle(); this.#notifyStateChanged(); }
-      const last = await this.#options.port.lastSequence(this.#options.stream);
-      this.#knownSeq = Math.max(this.#knownSeq, last);
-      const backlog = last - this.#snapshot.seq;
-      if (backlog <= this.#limits.maxReplay) break;
-      if (attempt >= 2) {
-        throw new MeshStateNatsLimitError(`the projector would replay ${backlog} messages after sequence ${this.#snapshot.seq} (limit ${this.#limits.maxReplay})`);
-      }
-    }
+    this.#retireBootstrap();
     const generation = ++this.#generation;
-    this.#consumer = await this.#options.port.consume(this.#options.stream, this.#snapshot.seq,
-      message => { if (generation === this.#generation) this.#apply(message); },
-      error => { if (generation === this.#generation) this.#fail(error); });
+    const current = () => !this.#closed && this.#failure === undefined && generation === this.#generation;
+    try {
+      for (let attempt = 1; ; attempt++) {
+        const loaded = await this.#loadSnapshot();
+        if (!current()) return;
+        // A newer snapshot replaces the model: one state-change hint per install (none at open: no listener yet).
+        if (loaded && loaded.seq > this.#snapshot.seq) { this.#snapshot = loaded; this.#settle(); this.#notifyStateChanged(); }
+        const last = await this.#options.port.lastSequence(this.#options.stream);
+        if (!current()) return;
+        this.#knownSeq = Math.max(this.#knownSeq, last);
+        const backlog = last - this.#snapshot.seq;
+        if (backlog <= this.#limits.maxReplay) break;
+        if (attempt >= 2) {
+          throw new MeshStateNatsLimitError(`the projector would replay ${backlog} messages after sequence ${this.#snapshot.seq} (limit ${this.#limits.maxReplay})`);
+        }
+      }
+      const consumer = await this.#options.port.consume(this.#options.stream, this.#snapshot.seq,
+        message => { if (current()) this.#apply(message); },
+        error => { if (current()) this.#fail(error); });
+      if (!current()) {
+        void (async () => { await consumer.stop(); })().catch(() => undefined);
+        return;
+      }
+      this.#consumer = consumer;
+    } catch (error) {
+      if (current()) throw error;
+    }
   }
 
   /**
@@ -637,25 +662,35 @@ export class NatsStateBackend implements StateBackend {
    * the old, consistent model; `fresh` reads are busy.
    */
   #resync(): void {
-    if (this.#closed) return;
+    if (this.#closed || this.#failure !== undefined) return;
     // P1-3: a gap during a running re-sync (a second purge) is recorded, never dropped.
     if (this.#resyncing) { this.#gapPending = true; return; }
     this.#resyncing = true;
+    this.#retireBootstrap();
+    let generation = this.#generation;
+    const current = () => !this.#closed && this.#failure === undefined && generation === this.#generation;
     void (async () => {
       for (let attempt = 1; attempt <= RESYNC_ATTEMPTS; attempt++) {
+        if (!current()) return;
         this.#resyncs++;
         this.#gapPending = false;
-        this.#generation++;
+        generation = ++this.#generation;
         const consumer = this.#consumer;
         this.#consumer = undefined;
         await consumer?.stop();
-        await this.#startProjector();
+        if (!current()) return;
+        const started = this.#startProjector(); // Reserves its generation synchronously, before its first await.
+        generation = this.#generation;
+        await started;
+        if (!current()) return;
         // A purge between the snapshot load and the consumer start leaves the model below the stream's first message.
         const first = await this.#options.port.firstSequence(this.#options.stream);
+        if (!current()) return;
         if (!this.#gapPending && first <= this.#snapshot.seq + 1) return;
       }
       throw new MeshStateNatsUnavailableError(`the stream kept being purged past this projector (${RESYNC_ATTEMPTS} re-syncs); reopen the backend`);
-    })().catch(error => this.#fail(error)).finally(() => { this.#resyncing = false; });
+    })().catch(error => { if (current()) this.#fail(error); })
+      .finally(() => { if (generation === this.#generation) this.#resyncing = false; });
   }
 
   /**
@@ -732,6 +767,7 @@ export class NatsStateBackend implements StateBackend {
   /** The projector stopped (a protocol violation, a broken delivery): every later read and write fails closed. */
   #fail(error: unknown): void {
     if (this.#failure !== undefined || this.#closed) return;
+    this.#retireBootstrap();
     this.#failure = redactNatsError(error);
     for (const waiter of this.#waiters.splice(0)) waiter.reject(this.#failure);
   }
@@ -774,18 +810,71 @@ export class NatsStateBackend implements StateBackend {
   }
 
   /** Resolves once the model has applied `seq`; a projector that does not get there within the write budget is busy. */
-  #appliedThrough(seq: number, budgetMs = this.#options.lockTimeoutMs ?? 5_000): Promise<void> {
+  #appliedThrough(seq: number, budgetMs = this.#options.lockTimeoutMs ?? 5_000, bootstrap = false): Promise<void> {
     if (this.#failure !== undefined) return Promise.reject(this.#failure);
     if (this.#snapshot.seq >= seq) return Promise.resolve();
     return new Promise((resolve, reject) => {
+      const deadline = Date.now() + budgetMs;
+      const token = bootstrap ? { active: true, generation: this.#generation } : undefined;
+      if (token) this.#bootstrap = token;
+      const retire = () => {
+        if (token) {
+          token.active = false;
+          if (this.#bootstrap === token) this.#bootstrap = undefined;
+        }
+      };
       const timer = setTimeout(() => {
+        retire();
         this.#waiters = this.#waiters.filter(waiter => waiter !== entry);
         reject(new MeshStateNatsBusyError(`the projector did not reach sequence ${seq} within ${budgetMs} ms (at ${this.#snapshot.seq})`));
       }, budgetMs);
       timer.unref?.();
-      const entry = { seq, resolve: () => { clearTimeout(timer); resolve(); }, reject: (error: unknown) => { clearTimeout(timer); reject(error); } };
+      const entry = { seq, resolve: () => { retire(); clearTimeout(timer); resolve(); },
+        reject: (error: unknown) => { retire(); clearTimeout(timer); reject(error); } };
       this.#waiters.push(entry);
+      if (token && !this.#resyncing) void this.#catchUp(seq, deadline, token);
     });
+  }
+
+  #retireBootstrap(): void {
+    if (this.#bootstrap) this.#bootstrap.active = false;
+    this.#bootstrap = undefined;
+  }
+
+  /** Only initial open may fetch its finite frozen deficit, beside the native consumer and under its original timer. */
+  async #catchUp(head: number, deadline: number, token: NatsBootstrap): Promise<void> {
+    const active = () => token.active && Date.now() < deadline && !this.#closed && this.#failure === undefined &&
+      token.generation === this.#generation && !this.#resyncing && this.#snapshot.seq < head;
+    try {
+      while (active()) {
+        const next = this.#snapshot.seq + 1;
+        if (head - this.#snapshot.seq > this.#limits.maxReplay) {
+          throw new MeshStateNatsLimitError(`the projector would replay ${head - this.#snapshot.seq} messages after sequence ${this.#snapshot.seq} (limit ${this.#limits.maxReplay})`);
+        }
+        let message: NatsStreamMessage | undefined;
+        try {
+          message = await this.#options.port.getMessage(this.#options.stream, next,
+            { deadline, active: () => active() && this.#snapshot.seq < next });
+        } catch (error) {
+          if (!active()) return;
+          if (this.#snapshot.seq >= next) continue;
+          throw error;
+        }
+        // Fence both late failures and late values before inspecting an envelope: fakes may ignore the budget.
+        if (!active()) return;
+        if (this.#snapshot.seq >= next) continue;
+        if (message === undefined) return; // Missing history yields to native delivery/resync and the SAME waiter.
+        if (!Number.isSafeInteger(message.seq) || message.seq < 1 || message.seq !== next || !(message.data instanceof Uint8Array)) {
+          throw new MeshStateNatsRefusedError(`stream message ${next} has an invalid historical envelope`);
+        }
+        if (message.data.byteLength > this.#limits.maxMessageBytes) {
+          throw new MeshStateNatsLimitError(`stream message ${next} is ${message.data.byteLength} bytes (limit ${this.#limits.maxMessageBytes})`);
+        }
+        this.#apply(message);
+      }
+    } catch (error) {
+      if (active()) this.#fail(error);
+    }
   }
 
   #readable(options: MeshReadOptions = {}): NatsSnapshot {
@@ -1018,12 +1107,19 @@ export class NatsStateBackend implements StateBackend {
       resyncs: this.#resyncs, ...(this.#failure ? { failure: redactNatsUrls(String(this.#failure)) } : {}) } } as StateBackendDiagnostics;
   }
 
-  close(): void {
-    if (this.#closed) return;
+  #retireProjector(): { stop(): Promise<void> } | undefined {
     this.#closed = true;
     this.#generation++;
+    this.#retireBootstrap();
     const consumer = this.#consumer;
+    this.#consumer = undefined;
     for (const waiter of this.#waiters.splice(0)) waiter.reject(new Error("Fabric mesh NATS state backend is closed"));
+    return consumer;
+  }
+
+  close(): void {
+    if (this.#closed) return;
+    const consumer = this.#retireProjector();
     void (async () => { await consumer?.stop(); await this.#options.port.close(); })().catch(() => undefined);
   }
 }

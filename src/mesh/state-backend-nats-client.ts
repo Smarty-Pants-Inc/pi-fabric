@@ -95,7 +95,31 @@ const isTransientTimeout = (error: unknown): boolean => {
   }
   return false;
 };
-const retryTransientRead = async <T>(operation: () => Promise<T>, attempts = READ_RETRY_ATTEMPTS): Promise<T> => {
+type NatsReadBudget = NonNullable<Parameters<JetStreamPort["getMessage"]>[2]>;
+const retryTransientRead = async <T>(operation: () => Promise<T>, attempts = READ_RETRY_ATTEMPTS,
+  budget?: NatsReadBudget): Promise<T> => {
+  if (budget !== undefined) {
+    const active = () => Date.now() < budget.deadline && budget.active?.() !== false;
+    const expired = () => new MeshStateNatsBusyError("the initial projector read budget expired or was retired");
+    for (let attempt = 1; ; attempt++) {
+      if (!active()) throw expired();
+      const outcome = await untilDeadline(() => {
+        // untilDeadline defers the request: recheck authority in the actual SDK invocation closure too.
+        if (!active()) throw expired();
+        return operation();
+      }, budget.deadline);
+      if (!active() || outcome.kind === "deadline") throw expired();
+      if (outcome.kind === "value") return outcome.value;
+      if (!isTransientReadError(outcome.error) || attempt >= attempts) throw outcome.error;
+      if (!active()) throw expired();
+      const pause = await untilDeadline(() => {
+        if (!active()) throw expired();
+        return sleep(READ_RETRY_DELAY_MS);
+      }, budget.deadline);
+      if (!active() || pause.kind === "deadline") throw expired();
+      if (pause.kind === "error") throw pause.error;
+    }
+  }
   for (let attempt = 1; ; attempt++) {
     try { return await operation(); }
     catch (error) {
@@ -318,8 +342,8 @@ export const connectJetStream = async (servers: string[], options: ConnectJetStr
     },
     lastSequence: async (stream) => (await retryTransientRead(() => jsm.streams.info(stream))).state.last_seq,
     firstSequence: async (stream) => (await retryTransientRead(() => jsm.streams.info(stream))).state.first_seq,
-    getMessage: async (stream, seq) => {
-      const message = await retryTransientRead(() => jsm.streams.getMessage(stream, { seq }));
+    getMessage: async (stream, seq, budget) => {
+      const message = await retryTransientRead(() => jsm.streams.getMessage(stream, { seq }), READ_RETRY_ATTEMPTS, budget);
       const msgID = message?.header.get("Nats-Msg-Id");
       return message ? { seq: message.seq, data: message.data, ...(msgID ? { msgID } : {}) } : undefined;
     },

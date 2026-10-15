@@ -532,8 +532,29 @@ describe("resident actor permit watch (#9031)", () => {
     expect(f.deliveries[0]!.message.text).toContain("silent-owner");
     expect(f.deliveries[0]!.message.text).toContain(worker.launch.id);
     expect(f.deliveries[0]!.message).not.toHaveProperty("principal");
+    const registryFile = path.join(f.root, "actors", "actors.json");
+    const registry = () => JSON.parse(fs.readFileSync(registryFile, "utf8")) as {
+      actors: Array<Record<string, unknown>>;
+    };
+    await eventually(() => expect(registry().actors.find(row => row.id === actor.id)?.silenceAlarmRunId)
+      .toBe(worker.launch.id));
+    const savedRegistry = registry();
+    const savedActor = savedRegistry.actors.find(row => row.id === actor.id)!;
+    expect(savedActor).not.toHaveProperty("inFlightRun");
+    // Exercise the production registry refresh while ownership and the native
+    // run stay live. A newly visible row proves resumeQueued actually loaded
+    // the rewritten registry, rather than merely consulting a cached actor.
+    const importedId = "ffffffffffffffffffffffffffffffff";
+    savedRegistry.actors.push({ ...savedActor, id: importedId, name: "reload-witness", status: "idle" });
+    fs.writeFileSync(registryFile, JSON.stringify(savedRegistry));
+    f.actors.resumeQueued();
+    expect(f.actors.status(importedId).name).toBe("reload-witness");
+    expect(f.actors.status(actor.id).inFlightRun?.id).toBe(worker.launch.id);
+    expect(f.actors.inFlightCount()).toBe(1);
     skew = 7 * 60 * MINUTE;
-    await ticks();
+    await ticks(); // multiple real retention sweeps after the production reload
+    expect(f.actors.status(actor.id).inFlightRun?.id).toBe(worker.launch.id);
+    expect(f.actors.inFlightCount()).toBe(1);
     expect(f.deliveries).toHaveLength(1);
     expect(f.agents.admissionProgress(worker.launch.id)).toBeDefined();
     if (useSnapshot) expect(snapshot(f).held.map(held => held.runId)).toEqual([worker.launch.id]);
@@ -546,6 +567,8 @@ describe("resident actor permit watch (#9031)", () => {
     skew += 21 * MINUTE;
     await eventually(() => expect(f.deliveries.filter(delivery =>
       (delivery.message.data as { reason?: string } | undefined)?.reason === "worker-silent")).toHaveLength(2));
+    await eventually(() => expect(registry().actors.find(row => row.id === actor.id)?.silenceAlarmRunId)
+      .toBe(second.launch.id));
   });
 
   it("a live actor making progress raises no silence alarm", async () => {

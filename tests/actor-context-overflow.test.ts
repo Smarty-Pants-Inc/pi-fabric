@@ -18,8 +18,8 @@ vi.mock("../src/storage/retention.js", async importOriginal => ({
 
 // smarty-dev#3238: review actors silently dropped events on "Context exceeds window". A real
 // ActorManager, MeshStore, AgentManager and worker drive an offline Pi child that refuses a run
-// with the worker's window error: a carried session is reset and the event retried once; an
-// event that overflows a fresh session gets one explicit overflow notice and the actor stays live.
+// with a window error: host-observed structured overflow can reset and retry a carried session
+// once, but hook/status-only overflow fails visibly without replay and needs an explicit reset.
 
 const roots: string[] = [];
 const managers: Array<{ close(): Promise<void> }> = [];
@@ -93,51 +93,88 @@ const resets = (actors: ActorManager, id: string) => actors.messages(id, 50)
   .filter((reset): reset is Record<string, unknown> => reset !== undefined);
 
 describe("actor context overflow (smarty-dev#3238, offline Pi child)", () => {
-  it("10049 resets an over-window durable activation session after real preflight refusal and processes the same item", async () => {
+  it("10049 fails a hook-only durable preflight refusal visibly without replay until an explicit reset", async () => {
     const s = setup();
     const actor = await s.create("preflight", { inferenceContext: "activation" });
     await s.actors.ask(actor.id, "FIRST_REVIEW");
     const carried = header(actor.sessionFile!);
     fs.appendFileSync(actor.sessionFile!, JSON.stringify({ type: "message", id: "large-history", parentId: null,
       timestamp: new Date().toISOString(), message: { role: "user", content: "x".repeat(272_000 * 8), timestamp: Date.now() } }) + "\n");
-    await expect(s.actors.ask(actor.id, "PREFLIGHT_ON_HISTORY", { pr: 10049 })).resolves.toMatchObject({ text: "verdict: ok" });
+    s.recordResults();
+    await expect(s.actors.ask(actor.id, "PREFLIGHT_ON_HISTORY", { pr: 10049 })).rejects.toMatchObject({
+      code: "WORKER_GONE", message: expect.stringMatching(/explicit.*reset/i),
+    });
     await waitFor(() => s.actors.inFlightCount() === 0);
+    expect(s.results).toEqual([expect.objectContaining({ status: "failed", errorCode: "WORKER_GONE", settledLost: true,
+      error: expect.stringMatching(/explicit.*reset/i) })]);
     expect(s.prompts()).toEqual([
       { history: false, overflow: false, session: carried, marker: "FIRST_REVIEW" },
       { history: true, overflow: true, session: carried, marker: "PREFLIGHT_ON_HISTORY" },
-      { history: false, overflow: false, session: expect.not.stringMatching(carried), marker: "PREFLIGHT_ON_HISTORY" },
     ]);
-    // The refused attempt never reached even the simulated provider dispatch.
-    expect(fs.readFileSync(path.join(s.dir, "prompts.jsonl.requests"), "utf8")).toBe("request\nrequest\n");
-    expect(backups(actor.sessionFile!)).toHaveLength(1);
-    expect(resets(s.actors, actor.id)).toEqual([expect.objectContaining({ trigger: "context", overflow: true })]);
-    expect(s.actors.status(actor.id).activationBlocked).toBeUndefined();
+    // The hook refused dispatch, but its worker-owned report cannot authorize replay.
+    expect(fs.readFileSync(path.join(s.dir, "prompts.jsonl.requests"), "utf8")).toBe("request\n");
+    expect(header(actor.sessionFile!)).toBe(carried);
+    expect(backups(actor.sessionFile!)).toEqual([]);
+    expect(resets(s.actors, actor.id)).toEqual([]);
+    expect(s.actors.status(actor.id).lastError).toMatch(/explicit.*reset/i);
+    expect(s.actors.messages(actor.id, 50).find(message => message.error?.match(/explicit.*reset/i))).toMatchObject({
+      error: expect.stringMatching(/explicit.*reset/i), data: { errorCode: "WORKER_GONE", settledLost: true },
+    });
     expect(s.overflowEvents()).toEqual([]);
     expect(s.ownerAlarms()).toEqual([]);
-    expect(s.alarms).toEqual([]);
+    expect(s.alarms).toEqual([expect.objectContaining({ message: expect.objectContaining({
+      source: "fabric-host", data: expect.objectContaining({ reason: "worker-gone" }),
+    }) })]);
+
+    await s.actors.resetSession(actor.id);
+    await expect(s.actors.ask(actor.id, "NEXT_REVIEW")).resolves.toMatchObject({ text: "verdict: ok" });
+    await waitFor(() => s.actors.inFlightCount() === 0);
+    expect(s.prompts().at(-1)).toEqual({ history: false, overflow: false,
+      session: expect.not.stringMatching(carried), marker: "NEXT_REVIEW" });
+    expect(s.prompts().map(({ marker }) => marker)).toEqual(["FIRST_REVIEW", "PREFLIGHT_ON_HISTORY", "NEXT_REVIEW"]);
+    expect(resets(s.actors, actor.id)).toEqual([expect.objectContaining({ trigger: "requested" })]);
   }, TEST_GUARD_MS);
 
-  it.each(["text", "directive"] as const)("10049 alarms only after a second real preflight overflow and restores routing (%s)", async responseMode => {
+  it.each(["text", "directive"] as const)("10049 reports hook-only overflow as worker loss without an automatic reset or retry (%s)", async responseMode => {
     const s = setup();
     const actor = await s.create("preflight-stubborn", { inferenceContext: "activation", responseMode });
     await s.actors.ask(actor.id, "FIRST_REVIEW");
-    const outcome = s.actors.ask(actor.id, "PREFLIGHT_ALWAYS", { pr: 10049 });
-    if (responseMode === "text") await expect(outcome).rejects.toThrow(/Fabric activation window failed: Context exceeds window/);
-    else await expect(outcome).resolves.toMatchObject({ action: "silent", error: expect.stringContaining("Context exceeds window") });
+    const carried = header(actor.sessionFile!);
+    s.recordResults();
+    await expect(s.actors.ask(actor.id, "PREFLIGHT_ALWAYS", { pr: 10049 })).rejects.toMatchObject({
+      code: "WORKER_GONE", message: expect.stringMatching(/explicit.*reset/i),
+    });
+    await waitFor(() => s.actors.inFlightCount() === 0);
+    expect(s.results).toEqual([expect.objectContaining({ status: "failed", errorCode: "WORKER_GONE", settledLost: true })]);
+    expect(s.prompts().map(({ history, marker }) => ({ history, marker }))).toEqual([
+      { history: false, marker: "FIRST_REVIEW" }, { history: true, marker: "PREFLIGHT_ALWAYS" },
+    ]);
+    expect(fs.readFileSync(path.join(s.dir, "prompts.jsonl.requests"), "utf8")).toBe("request\n");
+    expect(header(actor.sessionFile!)).toBe(carried);
+    expect(backups(actor.sessionFile!)).toEqual([]);
+    expect(resets(s.actors, actor.id)).toEqual([]);
+    expect(s.actors.status(actor.id).lastError).toMatch(/explicit.*reset/i);
+    expect(s.actors.messages(actor.id, 50).find(message => message.error?.match(/explicit.*reset/i))).toMatchObject({
+      error: expect.stringMatching(/explicit.*reset/i), data: { errorCode: "WORKER_GONE", settledLost: true },
+    });
+    expect(s.ownerAlarms()).toEqual([]);
+    expect(s.overflowEvents()).toEqual([]);
+    expect(s.alarms).toEqual([expect.objectContaining({ message: expect.objectContaining({
+      source: "fabric-host", data: expect.objectContaining({ reason: "worker-gone" }),
+    }) })]);
+
+    await s.actors.resetSession(actor.id);
+    // This fixture emits plain text, so directive mode reaches its normal reply
+    // validation rather than receiving another preflight/lost-worker failure.
+    await expect(s.actors.ask(actor.id, "NEXT_REVIEW")).resolves.toMatchObject(responseMode === "text"
+      ? { text: "verdict: ok" }
+      : { action: "silent", error: expect.stringContaining("Directive reply missing") });
     await waitFor(() => s.actors.inFlightCount() === 0);
     expect(s.prompts().map(({ history, marker }) => ({ history, marker }))).toEqual([
       { history: false, marker: "FIRST_REVIEW" }, { history: true, marker: "PREFLIGHT_ALWAYS" },
-      { history: false, marker: "PREFLIGHT_ALWAYS" },
+      { history: false, marker: "NEXT_REVIEW" },
     ]);
-    expect(fs.readFileSync(path.join(s.dir, "prompts.jsonl.requests"), "utf8")).toBe("request\n");
-    await waitFor(() => resets(s.actors, actor.id).length === 2 && s.actors.status(actor.id).activationBlocked === undefined);
-    expect(resets(s.actors, actor.id)).toHaveLength(2);
-    expect(s.actors.status(actor.id).activationBlocked).toBeUndefined();
-    expect(s.ownerAlarms()).toHaveLength(1);
-    expect(s.overflowEvents()).toHaveLength(1);
-    expect(s.alarms).toHaveLength(1);
-    expect(s.alarms[0]!.message.text).toContain("retried once after resetting its session, but the fresh session still overflowed");
-    expect(s.alarms[0]!.message.text).not.toContain("not retried");
+    expect(resets(s.actors, actor.id)).toEqual([expect.objectContaining({ trigger: "requested" })]);
   }, TEST_GUARD_MS);
 
   it("9486 restores 85% durable context usage on host reload and proactively resets the next activation", async () => {

@@ -238,7 +238,9 @@ interface ManagedActor {
   lastRunId?: string;
   /** Setup/admission is separate from a launched worker (smarty-dev#3167). */
   preparing?: { phase: string; startedAt: number; attempts: number; runId?: string; queuePosition?: number };
-  inFlightRun?: { id: string; startedAt: number; silenceAlarmed?: boolean };
+  inFlightRun?: { id: string; startedAt: number };
+  /** Durable notice deduplication only; never restores worker custody. */
+  silenceAlarmRunId?: string;
   /** Set by a removal that returned before its in-flight run ended; persisted, so a restart finishes it. */
   removal?: { requestedAt: number; runId?: string; runStartedAt?: number; operator?: true };
   lastError?: string;
@@ -5753,13 +5755,14 @@ export class ActorManager {
           (current.stoppedAt ?? current.updatedAt) === since; });
     }
     const run = actor.inFlightRun;
-    if (run && !run.silenceAlarmed) {
+    if (run && actor.silenceAlarmRunId !== run.id) {
       const progress = this.agents.admissionProgress(run.id);
       const age = progress ? now - progress.lastProgressAt : 0;
       // Existing retention watch only. Silence is not proof of death: the
       // manager's owned handle/identity must still verify a living worker.
       if (age > 20 * 60_000 && this.#runGone(run.id) === undefined) {
-        run.silenceAlarmed = true;
+        actor.silenceAlarmRunId = run.id;
+        this.#scheduleRegistrySave();
         this.#runPermitNotice(actor, run.id, "worker-silent", age);
       }
     }
@@ -6314,6 +6317,7 @@ export class ActorManager {
       createdAt: actor.createdAt,
       updatedAt: actor.updatedAt,
       ...(actor.lastRunId ? { lastRunId: actor.lastRunId } : {}),
+      ...(actor.silenceAlarmRunId ? { silenceAlarmRunId: actor.silenceAlarmRunId } : {}),
       ...(actor.removal ? { removal: actor.removal } : {}),
       ...(actor.presenceError ? { presenceError: actor.presenceError } : {}),
       ...(actor.sessionOrphan ? { sessionOrphan: { ...actor.sessionOrphan }, ...(actor.lastError ? { lastError: actor.lastError } : {}) } : {}),
@@ -6689,7 +6693,17 @@ export class ActorManager {
     for (const value of records) {
       if (typeof value !== "object" || value === null || Array.isArray(value)) continue;
       const source = value as Record<string, unknown>;
-      if (onlyMissing && typeof source.id === "string" && this.#actors.has(source.id)) continue;
+      if (onlyMissing && typeof source.id === "string") {
+        const current = this.#actors.get(source.id);
+        if (current) {
+          // Owned runs stay live across registry refresh. A stale disk row must
+          // not replace a newer in-memory latch awaiting its scheduled save.
+          if (!current.silenceAlarmRunId && typeof source.silenceAlarmRunId === "string") {
+            current.silenceAlarmRunId = source.silenceAlarmRunId;
+          }
+          continue;
+        }
+      }
       let instructions: unknown;
       try { instructions = this.#registry.instructions(source); }
       catch { continue; } // Keep an unreadable payload's metadata, never rewrite a guessed value.
@@ -6876,6 +6890,7 @@ export class ActorManager {
             Number.isFinite(record.sessionOrphan.orphanedAt) && Number.isFinite(record.sessionOrphan.lastUpdated)
           ? { sessionOrphan: { ...record.sessionOrphan }, ...(typeof record.lastError === "string" ? { lastError: record.lastError } : {}) } : {}),
         ...(typeof record.lastRunId === "string" ? { lastRunId: record.lastRunId } : {}),
+        ...(typeof record.silenceAlarmRunId === "string" ? { silenceAlarmRunId: record.silenceAlarmRunId } : {}),
         ...(typeof record.removal?.requestedAt === "number"
           ? {
               removal: {

@@ -637,7 +637,7 @@ interface QueuedAgent {
 // Only structured assistant error frames may establish provider overflow. Prose never does.
 const providerContextOverflow = (error: unknown): boolean => typeof error === "string" &&
   /Context exceeds window|prompt (?:is )?too long|maximum context length|context(?:[ _-]+(?:window|length))?[ _-]+(?:overflow|exceeded|too long)|too many tokens/i.test(error) &&
-  !/stream.*(?:interrupt|disconnect)|connection.*(?:reset|closed)|socket hang up|ECONNRESET|fetch failed|rate limit|too many requests|^(?:Throttling error|Service unavailable):/i.test(error);
+  !/stream.*(?:interrupt|disconnect)|connection.*(?:reset|closed)|socket hang up|ECONNRESET|fetch failed|rate limit|too many requests|\bTool\s+["']|^(?:Throttling error|Service unavailable):/i.test(error);
 const terminalStatuses = terminalAgentStatuses;
 
 // Hosted runs have no Fabric transport to relaunch through.
@@ -4998,6 +4998,9 @@ export class AgentManager {
     if (committed?.status === "completed") return false;
     const finalObserved = this.workerEventEvidence(managed.id);
     if (finalObserved?.complete && finalObserved.contextOverflow) return false;
+    if (committed?.errorCode === "CONTEXT_OVERFLOW" || providerContextOverflow(committed?.error)) {
+      lost.error += "; worker-reported context overflow lacks complete host evidence; an explicit session reset is needed before the next activation";
+    }
     // A committed ordinary failure is not transport loss. Preserve its error
     // and the actor's normal failure accounting; ownership must still not replay it.
     const result = committed?.status === "failed" && committed.errorCode !== "CONTEXT_OVERFLOW" &&
@@ -5591,7 +5594,8 @@ export class AgentManager {
           if (event.type === "tool_execution_start") { seen.toolCalls++; seen.inferenceStarted = true; }
           if (event.type === "response" && event.command === "get_state" && event.success === true) {
             const window = (event.data as { model?: { contextWindow?: unknown } } | undefined)?.model?.contextWindow;
-            seen.contextWindow = typeof window === "number" && Number.isFinite(window) && window > 0 ? window : undefined;
+            if (typeof window === "number" && Number.isFinite(window) && window > 0) seen.contextWindow = window;
+            else delete seen.contextWindow;
           }
           if (event.type === "message_update") {
             const delta = event.assistantMessageEvent as Record<string, unknown> | undefined;
@@ -5978,8 +5982,8 @@ export class AgentManager {
     const budget = this.#budgetSummary();
     const { logFile: _logFile, nestedAgents: _nestedAgents, ...safeRecord } = record;
     // These markers are installed only by #recoverEnodevRun, never a live worker snapshot.
-    delete safeRecord.enodevRecovered;
-    delete safeRecord.enodevReplay;
+    delete (safeRecord as AgentRunResult).enodevRecovered;
+    delete (safeRecord as AgentRunResult).enodevReplay;
     // Status JSON is worker-writable. Only the supervisor's post-join snapshot
     // can authorize WORKER_GONE, including when wait/status re-read the disk.
     if (!managed.workerLostResult) {

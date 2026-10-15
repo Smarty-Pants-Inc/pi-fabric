@@ -103,6 +103,8 @@ export interface FabricParticipantRecord {
    * the name of that host. A routing target only, never a local owner.
    */
   remoteHost?: string;
+  /** Trusted hub link carrying a re-export; remoteHost still names the origin. */
+  bridgeVia?: string;
 }
 
 export interface FabricParticipantInfo extends FabricParticipantRecord {
@@ -125,6 +127,8 @@ export interface FabricHostRecord {
   expiresAt: number;
   /** Set on a host lease that the mesh bridge mirrors from another host's mesh (smarty-dev#2004). */
   remoteHost?: string;
+  /** Trusted hub link carrying a re-export; remoteHost still names the origin. */
+  bridgeVia?: string;
   /** This projection requires a matching source-clock mirror lease; no legacy expiry fallback. */
   mirrorLease?: 1;
 }

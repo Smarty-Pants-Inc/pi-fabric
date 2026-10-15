@@ -11,6 +11,12 @@ import {
 } from "../core/atomic-write.js";
 import { FOREIGN_LOCK, pinFenceLock, releaseFenceLock } from "./fence-lock.js";
 import { verifiedRemove } from "../storage/verified-remove.js";
+import { removeWindowsMeshDebris, retireWindowsMeshOwner } from "../storage/windows-mesh-recovery.js";
+import type { WindowsMeshCapability } from "../storage/windows-mesh-release.js";
+import {
+  captureMeshLegacyDebris, judgeMeshLegacyDebris, meshRecoveryChildren, meshRecoverySucceeded,
+  MeshLegacyDebrisUnrecoverableError, readMeshRecoveryOwner, requireMeshOwnerOnly,
+} from "./legacy-debris.js";
 import {
   failBeforeEntry, finalizeMeshLocks, prepareMeshLockRelease, windowsMeshReleaser, windowsPreEntryRefusal,
   type MeshLockReleaseHandle, type MeshLockReleaser, type MeshLockSettlement,
@@ -409,7 +415,7 @@ export class MeshLock {
           const code = errorCode(error);
           if (code !== "EEXIST" && (this.#lockProtocol === 1 ||
             (code !== "ENOTEMPTY" && code !== "EPERM" && code !== "EACCES"))) throw error;
-          if (await this.#clearStaleLock(ownerPath, deadline, blocked)) continue;
+          if (await this.#clearStaleLock(ownerPath, deadline, blocked, capability)) continue;
           if (Date.now() >= deadline) {
             // The holder was not reclaimed because its namespace is not ours (or unprovable): say so, typed.
             if (blocked.verdict) {
@@ -500,99 +506,126 @@ export class MeshLock {
   // Torn/corrupt receipts and nonempty unrecorded directories remain protected.
   // smarty-dev#9569: a protocol-3 record names its holder's PID namespace; pid evidence (ESRCH, another incarnation)
   // is used only for a holder of OUR namespace. A foreign or unprovable one is never reclaimed here (`note` says why).
-  async #clearStaleLock(ownerPath: string, deadline: number, note: StaleLockNote = {}): Promise<boolean> {
-    delete note.verdict; delete note.namespace; delete note.token; // describes the CURRENT holder only
-    let pin: { unchanged(): boolean; close(): void } | undefined;
+  async #clearStaleLock(ownerPath: string, deadline: number, note: StaleLockNote = {},
+    capability?: WindowsMeshCapability): Promise<boolean> {
+    delete note.verdict; delete note.namespace; delete note.token;
+    const pins: { unchanged(): boolean; close(): void }[] = [];
     try {
-      const stat = fs.lstatSync(this.#lockPath);
+      // Initial exact S, BEFORE reading/judging R or awaiting ANY death/namespace evidence.
+      const stat = fs.lstatSync(this.#lockPath, { bigint: true });
+      if (capability && (stat.isSymbolicLink() || !stat.isDirectory())) throw new MeshLegacyDebrisUnrecoverableError(this.#lockPath, this.#lockPath, "link-or-nondirectory");
       if (!stat.isDirectory()) return false;
       const readOwner = (): string | undefined => {
         try { return fs.readFileSync(ownerPath, "utf8"); }
         catch (error) { if (errorCode(error) === "ENOENT") return undefined; throw error; }
       };
-      const owner = readOwner();
+      let ownerStat: fs.BigIntStats | undefined;
+      let owner: string | undefined;
+      if (capability) {
+        const captured = readMeshRecoveryOwner(this.#lockPath);
+        ownerStat = captured?.stat; owner = captured?.record;
+      } else {
+        try { ownerStat = fs.lstatSync(ownerPath, { bigint: true }); }
+        catch (error) { if (errorCode(error) !== "ENOENT") throw error; }
+        owner = readOwner();
+      }
       if (owner === undefined) {
-        if (Date.now() - stat.mtimeMs <= this.#staleLockMs) return false;
-        const current = fs.lstatSync(this.#lockPath);
+        // D is canonical-only and Windows-only. Snapshot the WHOLE grammar before judging any leaf.
+        if (capability && meshRecoveryChildren(this.#lockPath).length > 0) {
+          const entries = captureMeshLegacyDebris(this.#lockPath, stat);
+          await judgeMeshLegacyDebris(this.#lockPath, entries, entry =>
+            this.#deadOwnerCategory(entry.record!, deadline, note, pins));
+          if (pins.some(pin => !pin.unchanged())) throw new MeshLegacyDebrisUnrecoverableError(this.#lockPath, this.#lockPath, "unproven-root");
+          const remaining = deadline - Date.now();
+          if (remaining <= 0) return false;
+          return meshRecoverySucceeded(this.#lockPath, removeWindowsMeshDebris(this.#lockPath, entries, capability, Math.min(4000, remaining)));
+        }
+        // E: absence is not a torn/empty file. Original grace and exact unchanged id/mtime, then EMPTY ONLY.
+        if (BigInt(Date.now()) * 1_000_000n - stat.mtimeNs <= BigInt(this.#staleLockMs) * 1_000_000n) return false;
+        const current = fs.lstatSync(this.#lockPath, { bigint: true });
         if (!current.isDirectory() || current.dev !== stat.dev || current.ino !== stat.ino ||
-          current.mtimeMs !== stat.mtimeMs || readOwner() !== undefined) return false;
-        // Native emptiness is the final fence, including against an initializer that
-        // publishes and enters while this recoverer is paused at the removal syscall.
-        // ponytail (smarty-dev#8907): atomic rmdir, not verifiedRemove. It removes only an EMPTY directory, so a
-        // directory swapped in after this judgment loses no data and no custody: an ownerless directory grants none,
-        // and a protocol-1 initializer enters only after its `wx` owner write and its lstat identity recheck of its own
-        // mkdir, which fail (ENOENT / identity) if this rmdir took its directory. Any published owner makes it ENOTEMPTY.
-        fs.rmdirSync(this.#lockPath);
-        // Retain a nonempty recovery receipt, without ever renaming a live canonical.
-        // Inode reuse may revisit the same receipt; that must not undo successful recovery.
-        const fence = `${this.#lockPath}.dead.${createHash("sha256").update(`${stat.dev}:${stat.ino}:`).digest("hex")}`;
-        fs.mkdirSync(fence, { recursive: true, mode: 0o700 });
-        try { fs.writeFileSync(path.join(fence, ".recovery-fence"), "1\n", { flag: "wx", mode: 0o600 }); }
-        catch (error) { if (errorCode(error) !== "EEXIST") throw error; }
+          current.mtimeNs !== stat.mtimeNs || readOwner() !== undefined) return false;
+        fs.rmdirSync(this.#lockPath); // a late initializer's owner makes this fail atomically
+        // F names alone retain legacy Number-Stats decimals on every platform: a paused old
+        // recoverer must find the SAME occupied F. Identity/mtime authority stays bigint.
+        const fence = `${this.#lockPath}.dead.${createHash("sha256").update(`${Number(stat.dev)}:${Number(stat.ino)}:`).digest("hex")}`;
+        // Never modify an existing F, including an old .recovery-fence receipt.
+        try { fs.mkdirSync(fence, { mode: 0o700 }); }
+        catch (error) { if (errorCode(error) === "EEXIST") return true; throw error; }
+        fs.writeFileSync(path.join(fence, "f"), "1\n", { flag: "wx", mode: 0o600 });
         return true;
       }
-      const fields = owner.split("\n");
-      const [token, pidText, createdText, startText] = fields;
-      // An in-flight/torn fourth line is not evidence of PID reuse. Protocol 3's start line may be empty (unknown).
-      const recordedStart = owner?.endsWith("\n") && startText ? startText : undefined;
-      const pid = Number(pidText);
-      const validPid = Number.isSafeInteger(pid) && pid > 0;
-      const validOwner = owner?.endsWith("\n") && (fields.length === 4 || fields.length === 5 || fields.length === 6) &&
-        !!token && validPid && createdText !== undefined &&
-        createdText.trim() !== "" && Number.isFinite(Number(createdText));
-      if (!validOwner) return false;
-      const recordNamespace = fields.length === 6 ? fields[4]! : null;
-      // pi-fabric#923 (fabric-store decisions): under protocol 3 a record without a namespace (a v1/v2 holder) is
-      // UNPROVEN: its pid may name nothing here although it is alive in another namespace. There is no previous-boot
-      // inference either (VM clones share a machine id): such holders are recovered only by the operator.
-      if (recordNamespace === null && this.#lockProtocol === 3) {
-        note.verdict = "unproven"; note.namespace = ""; note.token = token!;
+      if (capability) requireMeshOwnerOnly(this.#lockPath);
+      if (await this.#deadOwnerCategory(owner, deadline, note, pins)) return false;
+      const current = fs.lstatSync(this.#lockPath, { bigint: true });
+      if (!current.isDirectory() || current.dev !== stat.dev || current.ino !== stat.ino || readOwner() !== owner) return false;
+      if (pins.some(pin => !pin.unchanged())) {
+        const fields = owner.split("\n");
+        note.verdict = "unproven"; note.namespace = fields.length === 6 ? fields[4]! : ""; note.token = fields[0]!;
         return false;
       }
-      if (recordNamespace !== null) {
-        const namespaces = await import("../core/pid-namespace.js");
-        const own = await namespaces.ownNamespaceForReclaim(deadline, Boolean(this.#tryLockScope.getStore()?.active));
-        // pid evidence only for our own namespace AND a host-local root (pi-fabric#923 round 3).
-        const result = namespaces.reclaimVerdict(recordNamespace, own, this.root);
-        pin = result.pin;
-        if (result.verdict !== "pid") { note.verdict = result.verdict; note.namespace = recordNamespace; note.token = token!; return false; }
-      }
-      if (processAlive(pid)) {
-        if (!validProcessIncarnation(recordedStart)) return false;
-        // Registry-fenced publication cannot start even a bounded native read.
-        // Fail closed; the ordinary outside-custody admission lane obtains fresh
-        // holder evidence/recovery, then publication selects under fresh fences.
-        if (this.#tryLockScope.getStore()?.active) return false;
+      if (capability) {
         const remaining = deadline - Date.now();
-        if (remaining <= 0) return false;
-        let timer: ReturnType<typeof setTimeout> | undefined;
-        let actualStart: string | undefined;
-        try {
-          // Race only the evidence read, NEVER the recovery operation. A reader
-          // ignoring its native timeout cannot leave an escaped rename behind.
-          // The native reader also receives this budget so its child is aborted.
-          actualStart = await Promise.race([
-            processIncarnation(pid, remaining),
-            new Promise<undefined>(resolve => { timer = setTimeout(() => resolve(undefined), remaining); }),
-          ]);
-        } finally { clearTimeout(timer); }
-        if (Date.now() >= deadline || !actualStart || actualStart === recordedStart) return false;
+        if (!ownerStat || remaining <= 0) return false;
+        // C: ORIGINAL pre-judgment S/full R and acquisition capability, no JS rename or F cleanup.
+        return meshRecoverySucceeded(this.#lockPath,
+          retireWindowsMeshOwner(this.#lockPath, owner, stat, ownerStat, capability, Math.min(4000, remaining)));
       }
-      const unchanged = (): boolean => {
-        const current = fs.lstatSync(this.#lockPath);
-        return current.isDirectory() && current.dev === stat.dev && current.ino === stat.ino && readOwner() === owner;
-      };
-      if (!unchanged()) return false;
-      // pi-fabric#923 round 5: the root checked as host-local must still be the root this path names, right now.
-      if (pin && !pin.unchanged()) { note.verdict = "unproven"; note.namespace = recordNamespace ?? ""; note.token = token!; return false; }
-      const fence = `${this.#lockPath}.dead.${createHash("sha256").update(`${stat.dev}:${stat.ino}:${owner}`).digest("hex")}`;
-      // ponytail: retain this tiny nonempty directory permanently. A paused old cleaner
-      // cannot rename a successor over the same fence (native EEXIST/ENOTEMPTY). Deleting
-      // it, or recursively deleting the canonical name after a re-read, reopens that race.
-      fs.renameSync(this.#lockPath, fence);
+      // Compatibility is data safety: a paused old recoverer's Number-Stats F must
+      // remain occupied, or its by-name rename could detach a canonical successor.
+      // Convert ONLY the name, never the exact identity/death authority above.
+      const fence = `${this.#lockPath}.dead.${createHash("sha256").update(`${Number(stat.dev)}:${Number(stat.ino)}:${owner}`).digest("hex")}`;
+      fs.renameSync(this.#lockPath, fence); // existing non-Windows retained recovery fence
       return true;
-    } catch {
+    } catch (error) {
+      if (error instanceof MeshLegacyDebrisUnrecoverableError) throw error;
       return false;
-    } finally { pin?.close(); }
+    } finally { for (const pin of pins) pin.close(); }
+  }
+
+  /** SAME caller policy for C and EVERY D leaf. undefined alone proves admissible death. */
+  async #deadOwnerCategory(owner: string, deadline: number, note: StaleLockNote,
+    pins: { unchanged(): boolean; close(): void }[]): Promise<string | undefined> {
+    const fields = owner.split("\n");
+    const [token, pidText, createdText, startText] = fields;
+    const recordedStart = owner.endsWith("\n") && startText ? startText : undefined;
+    const pid = Number(pidText);
+    const validOwner = owner.endsWith("\n") && (fields.length === 4 || fields.length === 5 || fields.length === 6) &&
+      !!token && Number.isSafeInteger(pid) && pid > 0 && createdText !== undefined &&
+      createdText.trim() !== "" && Number.isFinite(Number(createdText));
+    if (!validOwner) return "torn-record";
+    const recordNamespace = fields.length === 6 ? fields[4]! : null;
+    if (recordNamespace === null && this.#lockProtocol === 3) {
+      note.verdict = "unproven"; note.namespace = ""; note.token = token!;
+      return "unproven";
+    }
+    if (recordNamespace !== null) {
+      const namespaces = await import("../core/pid-namespace.js");
+      const own = await namespaces.ownNamespaceForReclaim(deadline, Boolean(this.#tryLockScope.getStore()?.active));
+      const result = namespaces.reclaimVerdict(recordNamespace, own, this.root);
+      if (result.pin) pins.push(result.pin);
+      if (result.verdict !== "pid") {
+        note.verdict = result.verdict; note.namespace = recordNamespace; note.token = token!;
+        return result.verdict;
+      }
+    }
+    if (processAlive(pid)) {
+      if (!validProcessIncarnation(recordedStart)) return "live-owner";
+      if (this.#tryLockScope.getStore()?.active) return "unproven";
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) return "unproven";
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      let actualStart: string | undefined;
+      try {
+        // Evidence only: never race an escaped destructive operation against a timer.
+        actualStart = await Promise.race([
+          processIncarnation(pid, remaining),
+          new Promise<undefined>(resolve => { timer = setTimeout(() => resolve(undefined), remaining); }),
+        ]);
+      } finally { clearTimeout(timer); }
+      if (Date.now() >= deadline || !actualStart) return "unproven";
+      if (actualStart === recordedStart) return "live-owner";
+    }
+    return undefined;
   }
 }

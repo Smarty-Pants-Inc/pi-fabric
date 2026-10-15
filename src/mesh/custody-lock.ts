@@ -3,6 +3,12 @@ import fs from "node:fs";
 import path from "node:path";
 import { FOREIGN_LOCK, pinFenceLock, releaseFenceLock } from "./fence-lock.js";
 import { verifiedRemove } from "../storage/verified-remove.js";
+import { removeWindowsMeshDebris, retireWindowsMeshOwner } from "../storage/windows-mesh-recovery.js";
+import type { WindowsMeshCapability } from "../storage/windows-mesh-release.js";
+import {
+  captureMeshLegacyDebris, judgeMeshLegacyDebris, meshRecoveryChildren, meshRecoverySucceeded,
+  MeshLegacyDebrisUnrecoverableError, readMeshRecoveryOwner, requireMeshOwnerOnly,
+} from "./legacy-debris.js";
 import {
   failBeforeEntry, MeshLockReleaseError, prepareMeshLockRelease, runUnderMeshLocksAsync, windowsMeshReleaser, windowsPreEntryRefusal,
   type MeshLockOperationState, type MeshLockReleaseHandle, type MeshLockReleaser,
@@ -147,7 +153,7 @@ export const acquireMeshCustodyHandle = async (root: string, timeoutMs = CUSTODY
       fs.rmSync(staging, { recursive: true, force: true });
     }
     try {
-      if (await clearDeadCustodyLock(lock, readOwner, deadline, started, options.hostQualified, blocked, options.lockProtocol ?? 1)) continue;
+      if (await clearDeadCustodyLock(lock, readOwner, deadline, started, options.hostQualified, blocked, options.lockProtocol ?? 1, capability)) continue;
     } catch (error) {
       if (error instanceof MeshCustodyUnrecoverableError) {
         try { console.warn(`[pi-fabric] ALARM ${error.kind}: ${error.message}`); } catch { /* alarm never masks refusal */ }
@@ -229,75 +235,121 @@ export const acquireMeshCustodyHandle = async (root: string, timeoutMs = CUSTODY
 // once by renaming it to a retained, identity-named fence (as the mesh lock does): a paused
 // second recoverer cannot rename a successor onto the same nonempty fence.
 const clearDeadCustodyLock = async (lock: string, readOwner: () => string | undefined, deadline: number,
-  ownStart: string | undefined, hostQualified = false, note: StaleLockNote = {}, lockProtocol: 1 | 2 | 3 = 1): Promise<boolean> => {
-  delete note.verdict; delete note.namespace; delete note.token; // describes the CURRENT holder only
-  let pin: { unchanged(): boolean; close(): void } | undefined;
+  ownStart: string | undefined, hostQualified = false, note: StaleLockNote = {}, lockProtocol: 1 | 2 | 3 = 1,
+  capability?: WindowsMeshCapability): Promise<boolean> => {
+  delete note.verdict; delete note.namespace; delete note.token;
+  const pins: { unchanged(): boolean; close(): void }[] = [];
   try {
-    const stat = fs.lstatSync(lock);
+    // Capture exact initial bigint S and full R BEFORE any awaited death/namespace evidence.
+    const stat = fs.lstatSync(lock, { bigint: true });
+    if (capability && (stat.isSymbolicLink() || !stat.isDirectory())) throw new MeshLegacyDebrisUnrecoverableError(lock, lock, "link-or-nondirectory");
     if (!stat.isDirectory()) return false;
-    const owner = readOwner();
-    const fields = owner?.split("\n") ?? [];
-    const [token, pidText, createdText, recordedStart] = fields;
+    let ownerStat: fs.BigIntStats | undefined;
+    let owner: string | undefined;
+    if (capability) {
+      const captured = readMeshRecoveryOwner(lock);
+      ownerStat = captured?.stat; owner = captured?.record;
+    } else {
+      try { ownerStat = fs.lstatSync(path.join(lock, "owner"), { bigint: true }); }
+      catch (error) { if (errorCode(error) !== "ENOENT") throw error; }
+      owner = readOwner();
+    }
+    if (owner === undefined) {
+      if (capability && meshRecoveryChildren(lock).length > 0) {
+        const entries = captureMeshLegacyDebris(lock, stat);
+        await judgeMeshLegacyDebris(lock, entries, entry => {
+          const parent = entries.find(candidate => candidate.path === path.dirname(entry.path))!;
+          return deadCustodyOwnerCategory(lock, entry.record!, parent.stat, entry.stat, deadline,
+            ownStart, hostQualified, note, lockProtocol, pins);
+        });
+        if (pins.some(pin => !pin.unchanged())) throw new MeshLegacyDebrisUnrecoverableError(lock, lock, "unproven-root");
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) return false;
+        return meshRecoverySucceeded(lock, removeWindowsMeshDebris(lock, entries, capability, Math.min(4000, remaining)));
+      }
+      // E precedes the host-qualified missing-pid alarm. A torn file NEVER takes this branch.
+      if (BigInt(Date.now()) * 1_000_000n - stat.mtimeNs <= BigInt(CUSTODY_LOCK_STALE_MS) * 1_000_000n) return false;
+      const current = fs.lstatSync(lock, { bigint: true });
+      if (!current.isDirectory() || current.dev !== stat.dev || current.ino !== stat.ino ||
+        current.mtimeNs !== stat.mtimeNs || readOwner() !== undefined) return false;
+      fs.rmdirSync(lock); // atomic empty-only; late owner/unknown content survives
+      return true;
+    }
+    if (capability) requireMeshOwnerOnly(lock);
+    const pidText = owner.split("\n")[1];
     const pid = Number(pidText);
     if (hostQualified && (!pidText?.trim() || !Number.isSafeInteger(pid) || pid <= 0)) {
-      // A concurrent release/replacement is not a corrupt receipt. Alarm only the same
-      // canonical lock we actually observed, just as recovery fences the same inode/bytes.
-      const current = fs.lstatSync(lock);
+      const current = fs.lstatSync(lock, { bigint: true });
       if (!current.isDirectory() || current.dev !== stat.dev || current.ino !== stat.ino || readOwner() !== owner) return false;
       throw new MeshCustodyUnrecoverableError(lock);
     }
-    if (owner === undefined || !owner.endsWith("\n")) return false;    // never ownerless by protocol
-    // A host-lease commit gate is never recovered by a foreign/unknown PID. Matching
-    // machine evidence is still mandatory when boot/process identity is unavailable.
-    const physical = hostQualified ? readPhysicalHostIdentity() : undefined;
-    const machineId = physical?.machineId ?? (hostQualified ? readPhysicalMachineId() : undefined);
-    if (hostQualified && (!machineId || (fields.length !== 7 && fields.length !== 8) || fields[4] !== machineId)) return false;
-    const bootKnown = hostQualified && physical !== undefined && validBootId(fields[5]);
-    let previousBoot = bootKnown && fields[5] !== physical!.bootId;
-    if (!token || !Number.isSafeInteger(pid) || pid <= 0 || !Number.isFinite(Number(createdText)) ||
-      (hostQualified ? fields.length !== 7 && fields.length !== 8 : fields.length !== 4 && fields.length !== 5 && fields.length !== 6)) return false;
-    // smarty-dev#9569: a protocol-3 record names its holder's PID namespace. Before EVERY branch below (the plain one,
-    // and hostQualified with known, previous or unknown boot): pid evidence only for our namespace.
-    const recordNamespace = hostQualified ? (fields.length === 8 ? fields[6]! : null) : (fields.length === 6 ? fields[4]! : null);
-    // pi-fabric#923 (fabric-store decision): under protocol 3 no previous-boot inference at all. Two running VM clones
-    // share a machine id with different boot ids, so "another boot" does not prove the holder dead.
-    if (lockProtocol === 3) previousBoot = false;
-    if (recordNamespace !== null || lockProtocol === 3) {
-      const namespaces = await import("../core/pid-namespace.js");
-      // Under protocol 3 a record without a namespace is UNPROVEN too: recovered only by the operator.
-      const result = recordNamespace === null ? { verdict: "unproven" as const }
-        : namespaces.reclaimVerdict(recordNamespace, await namespaces.ownNamespaceForReclaim(deadline, false), path.dirname(lock));
-      pin = "pin" in result ? result.pin : undefined;
-      const verdict = result.verdict;
-      if (verdict !== "pid") {
-        note.verdict = verdict; note.namespace = recordNamespace ?? ""; note.token = token!;
-        return false;
-      }
-    }
-    if (hostQualified && !bootKnown && !previousBoot) {
-      // ESRCH on THIS machine plus old namespace/owner metadata, never expiry of a LIVE
-      // holder. Do not compare incarnations or infer a reboot from missing evidence.
-      const ownerStat = fs.lstatSync(path.join(lock, "owner"));
-      if (!ownerStat.isFile() || Date.now() - Math.max(stat.mtimeMs, ownerStat.mtimeMs) <= CUSTODY_LOCK_STALE_MS ||
-        processAlive(pid)) return false;
-    } else if (!previousBoot && processAlive(pid)) {
-      if (!validProcessIncarnation(recordedStart)) return false;
-      // Our own pid with another incarnation is a dead predecessor; with ours, a live caller.
-      const remaining = deadline - Date.now();
-      const actual = pid === process.pid ? ownStart
-        : remaining > 0 ? await processIncarnation(pid, remaining).catch(() => undefined) : undefined;
-      if (!actual || actual === recordedStart) return false;
-    }
-    const current = fs.lstatSync(lock);
+    if (!ownerStat || await deadCustodyOwnerCategory(lock, owner, stat, ownerStat, deadline,
+      ownStart, hostQualified, note, lockProtocol, pins)) return false;
+    const current = fs.lstatSync(lock, { bigint: true });
     if (!current.isDirectory() || current.dev !== stat.dev || current.ino !== stat.ino || readOwner() !== owner) return false;
-    // pi-fabric#923 round 5: the root checked as host-local must still be the root this path names, right now.
-    if (pin && !pin.unchanged()) { note.verdict = "unproven"; note.namespace = recordNamespace ?? ""; note.token = token!; return false; }
-    fs.renameSync(lock, `${lock}.dead.${createHash("sha256").update(`${stat.dev}:${stat.ino}:${owner}`).digest("hex")}`);
+    if (pins.some(pin => !pin.unchanged())) {
+      const fields = owner.split("\n");
+      note.verdict = "unproven";
+      note.namespace = hostQualified ? (fields.length === 8 ? fields[6]! : "") : (fields.length === 6 ? fields[4]! : "");
+      note.token = fields[0]!;
+      return false;
+    }
+    if (capability) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) return false;
+      return meshRecoverySucceeded(lock, retireWindowsMeshOwner(lock, owner, stat, ownerStat, capability, Math.min(4000, remaining)));
+    }
+    // Retain the legacy Number-Stats F NAME so a paused old recoverer cannot
+    // rename a successor into an absent alternate F. All identity/death authority stays bigint.
+    fs.renameSync(lock, `${lock}.dead.${createHash("sha256").update(`${Number(stat.dev)}:${Number(stat.ino)}:${owner}`).digest("hex")}`);
     return true;
   } catch (error) {
-    if (error instanceof MeshCustodyUnrecoverableError) throw error;
+    if (error instanceof MeshCustodyUnrecoverableError || error instanceof MeshLegacyDebrisUnrecoverableError) throw error;
     return false;
-  } finally { pin?.close(); }
+  } finally { for (const pin of pins) pin.close(); }
+};
+
+/** C and D share this caller's EXISTING host/namespace/incarnation policy, independently for every full record. */
+const deadCustodyOwnerCategory = async (lock: string, owner: string, stat: fs.BigIntStats, ownerStat: fs.BigIntStats,
+  deadline: number, ownStart: string | undefined, hostQualified: boolean, note: StaleLockNote, lockProtocol: 1 | 2 | 3,
+  pins: { unchanged(): boolean; close(): void }[]): Promise<string | undefined> => {
+  const fields = owner.split("\n");
+  const [token, pidText, createdText, recordedStart] = fields;
+  const pid = Number(pidText);
+  if (!owner.endsWith("\n")) return "torn-record";
+  const physical = hostQualified ? readPhysicalHostIdentity() : undefined;
+  const machineId = physical?.machineId ?? (hostQualified ? readPhysicalMachineId() : undefined);
+  if (hostQualified && (!machineId || (fields.length !== 7 && fields.length !== 8) || fields[4] !== machineId)) return "foreign-host-or-unproven";
+  const bootKnown = hostQualified && physical !== undefined && validBootId(fields[5]);
+  let previousBoot = bootKnown && fields[5] !== physical!.bootId;
+  if (!token || !Number.isSafeInteger(pid) || pid <= 0 || !Number.isFinite(Number(createdText)) ||
+    (hostQualified ? fields.length !== 7 && fields.length !== 8 : fields.length !== 4 && fields.length !== 5 && fields.length !== 6)) return "torn-record";
+  const recordNamespace = hostQualified ? (fields.length === 8 ? fields[6]! : null) : (fields.length === 6 ? fields[4]! : null);
+  if (lockProtocol === 3) previousBoot = false; // NEVER infer a previous boot under protocol 3
+  if (recordNamespace !== null || lockProtocol === 3) {
+    const namespaces = await import("../core/pid-namespace.js");
+    const result = recordNamespace === null ? { verdict: "unproven" as const }
+      : namespaces.reclaimVerdict(recordNamespace, await namespaces.ownNamespaceForReclaim(deadline, false), path.dirname(lock));
+    if ("pin" in result && result.pin) pins.push(result.pin);
+    if (result.verdict !== "pid") {
+      note.verdict = result.verdict; note.namespace = recordNamespace ?? ""; note.token = token!;
+      return result.verdict;
+    }
+  }
+  if (hostQualified && !bootKnown && !previousBoot) {
+    // Unknown boot: retain the existing old-metadata + ESRCH-only policy; no incarnation/reboot inference.
+    const latest = stat.mtimeNs > ownerStat.mtimeNs ? stat.mtimeNs : ownerStat.mtimeNs;
+    if (!ownerStat.isFile() || BigInt(Date.now()) * 1_000_000n - latest <= BigInt(CUSTODY_LOCK_STALE_MS) * 1_000_000n) return "unproven";
+    if (processAlive(pid)) return "live-owner";
+  } else if (!previousBoot && processAlive(pid)) {
+    if (!validProcessIncarnation(recordedStart)) return "live-owner";
+    const remaining = deadline - Date.now();
+    const actual = pid === process.pid ? ownStart
+      : remaining > 0 ? await processIncarnation(pid, remaining).catch(() => undefined) : undefined;
+    if (!actual) return "unproven";
+    if (actual === recordedStart) return "live-owner";
+  }
+  return undefined;
 };
 
 /**

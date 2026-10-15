@@ -101,7 +101,7 @@ jobs:
         run: bunx vitest run tests/type-checker.test.ts
       - name: Windows held-object mesh release and crash partitions (smarty-dev#9569)
         if: runner.os == 'Windows'
-        run: bunx vitest run --retry=0 tests/mesh-lock-release-windows.test.ts tests/windows-mesh-release.test.ts tests/mesh-lock-release-outcome.test.ts tests/windows-mesh-release-outcomes.test.ts tests/mesh-lock-windows-public-release.test.ts
+        run: bunx vitest run --retry=0 tests/mesh-lock-release-windows.test.ts tests/windows-mesh-release.test.ts tests/mesh-lock-release-outcome.test.ts tests/windows-mesh-release-outcomes.test.ts tests/mesh-lock-windows-public-release.test.ts tests/windows-mesh-recovery.test.ts tests/mesh-lock-recovery-windows.test.ts tests/mesh-recovery-policy-windows.test.ts
       - name: Windows release same-runner baseline and candidate overhead (smarty-dev#9569)
         if: runner.os == 'Windows'
         timeout-minutes: 15
@@ -206,6 +206,27 @@ jobs:
           path: ${{ runner.temp }}/fabric-artifact/
           if-no-files-found: error
           retention-days: 7
+
+  macos-mesh-characterization:
+    name: macOS mesh characterization (T10)
+    runs-on: macos-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: package.json
+      - uses: oven-sh/setup-bun@v2
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      - name: Build Mac bundle
+        # build-landlock.mjs intentionally emits no Linux/Windows native helper on macOS; the existing build remains
+        # the registration/compile check without pretending that a Windows helper is available on this runner.
+        run: bun run build
+      - name: Run hosted T10 characterization only
+        run: bunx vitest run --retry=0 tests/mesh-lock-macos-characterization.test.ts
 
   nats-state-conformance:
     # The StateBackend contract suites on a real nats-server (smarty-dev#7504 phase 2): JetStream with

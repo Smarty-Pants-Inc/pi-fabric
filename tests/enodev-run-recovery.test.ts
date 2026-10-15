@@ -227,34 +227,39 @@ describe.runIf(process.platform === "linux")("ENODEV-unconfirmed actor runs (sma
     }
   }, 90_000);
 
-  // pi-fabric#912 round 3: ownership is revoked while the resumed item is prepared, before run(). The delivery is
-  // refused; the marker and the saved answer must survive, and the next owner gets the answer with no launch.
-  it("ownership revoked during preparation keeps the marker and the answer for the next owner", async () => {
-    const { actor, id, directory, actors, second, launched, restart } = await interruptedRun();
+  // Ownership flips inside agents.run, after the host consumption boundary, not during host-only preparation.
+  it("ownership refused inside agents.run consumes the activation without next-owner delivery", async () => {
+    const { actor, id, directory, actorRoot, actors, second, launched, restart, mesh } = await interruptedRun();
     let owned = true;
-    launched.mockRestore(); // the real spawn: it must refuse the unauthorized request and launch nothing
-    const runRoot = path.dirname(directory);
+    launched.mockRestore(); // The real spawn must refuse authorization without launching a worker.
     const run = second.run.bind(second);
-    vi.spyOn(second, "run").mockImplementation((...args: Parameters<AgentManager["run"]>) => { owned = false; return run(...args); });
+    const runs = vi.spyOn(second, "run").mockImplementation((...args: Parameters<AgentManager["run"]>) => { owned = false; return run(...args); });
     const revoked = actors(second, "session:reload", { canManageActor: () => owned });
     try {
-      await vi.waitFor(() => expect(second.run).toHaveBeenCalled(), { timeout: 10_000, interval: 20 });
-      await new Promise(resolve => setTimeout(resolve, 300));
-      expect(vetoed(directory)).toBe(true);
-      expect(JSON.parse(fs.readFileSync(path.join(directory, "status.json"), "utf8")).status).toBe("running");
-      expect(fs.existsSync(path.join(directory, "settlement.json"))).toBe(true);
-      expect(fs.readdirSync(runRoot).filter(name => /^[a-f0-9]{32}$/.test(name))).toEqual([id]); // no new run
+      await vi.waitFor(() => {
+        expect(runs).toHaveBeenCalledTimes(1);
+        expect(revoked.inFlightCount()).toBe(0);
+        expect(revoked.status(actor.id).queued).toBe(0);
+        expect(revoked.messages(actor.id).some(message => message.error?.includes("activation no longer authorized"))).toBe(true);
+      }, { timeout: 10_000, interval: 20 });
+      expect(fs.readdirSync(path.dirname(directory)).filter(name => /^[a-f0-9]{32}$/.test(name))).toEqual([id]);
     } finally {
       await revoked.close();
       await second.close();
     }
+    for (const file of fs.readdirSync(path.join(actorRoot, actor.id)).filter(name => /^queue-/.test(name))) {
+      expect(JSON.parse(fs.readFileSync(path.join(actorRoot, actor.id, file), "utf8")).items).toEqual([]);
+    }
     const next = restart();
     const relaunched = vi.spyOn(next, "spawn").mockRejectedValue(new Error("launched a rerun"));
+    const recovered = vi.spyOn(next, "run");
     const owner = actors(next);
     try {
-      await vi.waitFor(() => expect(owner.status(actor.id)).toMatchObject({ lastRunId: id }), { timeout: 15_000, interval: 20 });
       await vi.waitFor(() => expect(vetoed(directory)).toBe(false), { timeout: 10_000, interval: 20 });
-      expect(JSON.parse(fs.readFileSync(path.join(directory, "status.json"), "utf8"))).toMatchObject({ status: "completed", text: "SAVED_ANSWER" });
+      expect(owner.status(actor.id).queued).toBe(0);
+      expect(JSON.parse(fs.readFileSync(path.join(directory, "status.json"), "utf8"))).toMatchObject({ status: "completed", settledLost: true });
+      expect(mesh.read({ after: 0, limit: 1_000 }).filter(event => event.topic === "fabric.actor.output" && event.text === "SAVED_ANSWER")).toHaveLength(0);
+      expect(recovered).not.toHaveBeenCalled();
       expect(relaunched).not.toHaveBeenCalled();
     } finally {
       await owner.close();
@@ -360,21 +365,42 @@ describe.runIf(process.platform === "linux")("ENODEV-unconfirmed actor runs (sma
     }
   }, 90_000);
 
-  it("a delivery receipt that cannot be written delivers nothing and keeps the activation pending", async () => {
-    const { actor, directory, actors, second, mesh } = await interruptedRun();
+  it("a delivery receipt that cannot be written fails visibly and consumes the activation without replay", async () => {
+    const { actor, directory, actorRoot, actors, second, mesh, restart } = await interruptedRun();
     const receipt = vi.spyOn(second, "noteEnodevDelivered").mockImplementation(() => { throw new Error("EIO"); });
-    const after = actors(second);
+    const delivered = vi.fn();
+    const after = actors(second, undefined, {}, delivered);
     try {
-      await vi.waitFor(() => expect(receipt).toHaveBeenCalled(), { timeout: 15_000, interval: 20 });
-      await new Promise(resolve => setTimeout(resolve, 300));
+      await vi.waitFor(() => {
+        expect(receipt).toHaveBeenCalledTimes(1);
+        expect(after.inFlightCount()).toBe(0);
+        expect(after.status(actor.id).queued).toBe(0);
+        expect(after.messages(actor.id).some(message => message.error?.includes("delivery receipt could not be written; activation consumed without replay"))).toBe(true);
+      }, { timeout: 15_000, interval: 20 });
+      expect(delivered).not.toHaveBeenCalled();
       expect(mesh.read({ after: 0, limit: 1_000 }).filter(event => event.topic === "fabric.actor.output" && event.from.id === actor.id)).toHaveLength(0);
-      expect(vetoed(directory)).toBe(true);
     } finally {
       await after.close();
       await second.close();
     }
-    const queue = fs.readdirSync(path.join(path.dirname(path.dirname(directory)), "actors", actor.id)).find(name => /^queue-/.test(name))!;
-    expect(JSON.parse(fs.readFileSync(path.join(path.dirname(path.dirname(directory)), "actors", actor.id, queue), "utf8")).items).toHaveLength(1);
+    for (const file of fs.readdirSync(path.join(actorRoot, actor.id)).filter(name => /^queue-/.test(name))) {
+      expect(JSON.parse(fs.readFileSync(path.join(actorRoot, actor.id, file), "utf8")).items).toEqual([]);
+    }
+    const next = restart();
+    const recovered = vi.spyOn(next, "run");
+    const relaunched = vi.spyOn(next, "spawn").mockRejectedValue(new Error("launched a rerun"));
+    const owner = actors(next, undefined, {}, delivered);
+    try {
+      await vi.waitFor(() => expect(vetoed(directory)).toBe(false), { timeout: 10_000, interval: 20 });
+      expect(owner.status(actor.id).queued).toBe(0);
+      expect(JSON.parse(fs.readFileSync(path.join(directory, "status.json"), "utf8"))).toMatchObject({ status: "completed", settledLost: true });
+      expect(delivered).not.toHaveBeenCalled();
+      expect(recovered).not.toHaveBeenCalled();
+      expect(relaunched).not.toHaveBeenCalled();
+    } finally {
+      await owner.close();
+      await next.close();
+    }
   }, 60_000);
 
   it("crash after delivery, before the queue ack: the restart recovers the answer again, with no rerun", async () => {
@@ -404,31 +430,40 @@ describe.runIf(process.platform === "linux")("ENODEV-unconfirmed actor runs (sma
     }
   }, 90_000);
 
-  it("a resumed activation refused by ownership three times before it runs is reported once and counted", async () => {
-    const { actor, directory, actors, second, launched, mesh, actorRoot } = await interruptedRun();
+  it("a resumed activation refused inside agents.run is consumed once without ownership retry alarms", async () => {
+    const { actor, actors, second, launched, mesh, actorRoot } = await interruptedRun();
     launched.mockRestore();
     let owned = true;
     let refusals = 0;
     const run = second.run.bind(second);
     vi.spyOn(second, "run").mockImplementation(async (...args: Parameters<AgentManager["run"]>) => {
       owned = false;
-      try { return await run(...args); } finally { refusals++; setTimeout(() => { owned = true; }, 30); }
+      try { return await run(...args); } finally { refusals++; }
     });
     const after = actors(second, "session:reload", { canManageActor: () => owned });
     const alarms = () => mesh.read({ after: 0, limit: 1_000 })
       .filter(event => event.topic === "ops.owner" && (event.data as { reason?: string } | undefined)?.reason === "resumed-ownership-refused");
     try {
-      await vi.waitFor(() => expect(refusals).toBeGreaterThanOrEqual(4), { timeout: 30_000, interval: 50 });
-      await vi.waitFor(() => expect(alarms()).toHaveLength(1), { timeout: 10_000, interval: 20 });
-      expect(alarms()[0]).toMatchObject({ to: "session:reload", data: { actorId: actor.id, refusals: 3 } });
-      expect(vetoed(directory)).toBe(true); // the marker and the answer stay
+      await vi.waitFor(() => {
+        expect(refusals).toBe(1);
+        expect(after.inFlightCount()).toBe(0);
+        expect(after.status(actor.id).queued).toBe(0);
+        expect(after.messages(actor.id).some(message => message.error?.includes("activation no longer authorized"))).toBe(true);
+      }, { timeout: 10_000, interval: 20 });
+      owned = true;
+      after.resumeQueued();
+      await new Promise(resolve => setTimeout(resolve, 300));
+      expect(refusals).toBe(1);
+      expect(alarms()).toHaveLength(0);
+      expect(after.status(actor.id).queued).toBe(0);
+      expect(mesh.read({ after: 0, limit: 1_000 }).filter(event => event.topic === "fabric.actor.output" && event.text === "SAVED_ANSWER")).toHaveLength(0);
     } finally {
       await after.close();
       await second.close();
     }
-    const saved = JSON.parse(fs.readFileSync(path.join(actorRoot, actor.id,
-      fs.readdirSync(path.join(actorRoot, actor.id)).find(name => /^queue-[a-f0-9]{16}\.json$/.test(name))!), "utf8"));
-    expect(saved.items[0].ownershipRefusals).toBe(3); // saturated at the cap after 4+ refusals
+    for (const file of fs.readdirSync(path.join(actorRoot, actor.id)).filter(name => /^queue-/.test(name))) {
+      expect(JSON.parse(fs.readFileSync(path.join(actorRoot, actor.id, file), "utf8")).items).toEqual([]);
+    }
   }, 90_000);
 
   it("an unreadable queue parent directory is unknown, not absent: nothing settles", async () => {

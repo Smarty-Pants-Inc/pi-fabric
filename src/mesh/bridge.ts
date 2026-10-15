@@ -1195,7 +1195,13 @@ export class StoreBridgeSide implements BridgeSide {
           // Refuse the whole batch, rather than omitting this host from wanted: omission would
           // delete the newer mirror, its participants and its lease in the removal pass below.
           // Check before liveness filtering too: an expired stale frame proves no withdrawal.
-          if (olderBridgeIncarnation(record, mergeBridgeSupersededHistory(superseded.get(record.rootId) ?? []).tokens)) {
+          const knownHistory = mergeBridgeSupersededHistory(superseded.get(record.rootId) ?? []);
+          // Legacy presence remains valid only until this root has local token authority.
+          // Refuse the downgrade before recovery/removal: writing a tokenless mirror would
+          // erase the current token and let its later replay reclaim participant authority.
+          if ((incarnationOf(record).incarnationToken === undefined &&
+              ((currentTokens.get(record.rootId)?.length ?? 0) > 0 || knownHistory.tokens.length > 0)) ||
+              olderBridgeIncarnation(record, knownHistory.tokens)) {
             throw new BridgeStaleIncarnationError(record.rootId);
           }
           // Source expiry and age are meaningful on the SOURCE clock only (#10068).

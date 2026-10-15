@@ -323,12 +323,24 @@ export class MeshLock {
       let maxGapMs = 0;
       let lastAttemptAt = Date.now();
       let retryAttempt = 0;
+      let waited = false;
+      const timeout = (): MeshLockTimeoutError => {
+        // Keep a foreign-holder refusal typed even when the deadline is crossed during a wait.
+        if (blocked.verdict) {
+          const refused = new MeshLockForeignHolderError(describeLockHolder(ownerPath), attempts, maxGapMs, blocked.verdict,
+            blocked.namespace ?? "", this.#lockPath, blocked.token ?? "");
+          alarmForeignHolder(refused);
+          return refused;
+        }
+        return new MeshLockTimeoutError(describeLockHolder(ownerPath), attempts, maxGapMs);
+      };
       while (true) {
         this.#writeAbortSignal?.throwIfAborted();
         if (!ticket.mayContend()) {
           if (Date.now() < deadline) {
             // Woken when the predecessor's receipt goes; the short poll is only a safety net.
             await ticket.wait(Math.min(20, Math.max(0, deadline - Date.now())), this.#writeAbortSignal, deadline);
+            waited = true;
             continue;
           }
           // Expiry never grants FIFO admission: only an eligible head may probe at its deadline. Keep the legacy
@@ -336,6 +348,12 @@ export class MeshLock {
           throw admission.expire(this.#lockPath, this.root, "mesh-lock", lockClass);
         }
         const attemptAt = Date.now();
+        // Both waits can spend the remaining budget in watch setup. Keep the initial/exact-deadline
+        // probes, but never acquire after a wait has crossed the fixed deadline.
+        if (waited && attemptAt > deadline) {
+          if (attempts === 0 && ticket.queued) throw admission.expire(this.#lockPath, this.root, "mesh-lock", lockClass);
+          throw timeout();
+        }
         if (attempts > 0) maxGapMs = Math.max(maxGapMs, attemptAt - lastAttemptAt);
         attempts += 1;
         lastAttemptAt = attemptAt;
@@ -398,20 +416,12 @@ export class MeshLock {
           if (code !== "EEXIST" && (this.#lockProtocol === 1 ||
             (code !== "ENOTEMPTY" && code !== "EPERM" && code !== "EACCES"))) throw error;
           if (await this.#clearStaleLock(ownerPath, deadline, blocked)) continue;
-          if (Date.now() >= deadline) {
-            // The holder was not reclaimed because its namespace is not ours (or unprovable): say so, typed.
-            if (blocked.verdict) {
-              const refused = new MeshLockForeignHolderError(describeLockHolder(ownerPath), attempts, maxGapMs, blocked.verdict,
-                blocked.namespace ?? "", this.#lockPath, blocked.token ?? "");
-              alarmForeignHolder(refused);
-              throw refused;
-            }
-            throw new MeshLockTimeoutError(describeLockHolder(ownerPath), attempts, maxGapMs);
-          }
+          if (Date.now() >= deadline) throw timeout();
           // Only the FIFO head probes promptly, woken when .lock is released. After the bounded
           // admission fallback, full jitter spreads plain contenders; the deadline bounds every sleep.
           if (ticket.queued) await ticket.wait(Math.min(10, Math.max(0, deadline - Date.now())), this.#writeAbortSignal, deadline);
           else await delay(retryDelayMs(retryAttempt++, 20, 250, deadline - Date.now()), this.#writeAbortSignal);
+          waited = true;
         }
       }
       pin = pinFenceLock(this.#lockPath, ownerRecord);

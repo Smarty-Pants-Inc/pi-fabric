@@ -60,7 +60,7 @@ fs.rmSync=path=>{if(path!==${JSON.stringify(sentinel)}) throw new Error("unexpec
   fs.writeFileSync(recordedGuard, `import ${JSON.stringify(pathToFileURL(recorder).href)};\n${fs.readFileSync(guardPath, "utf8")}`);
   const bun = spawnSync("bun", ["-p", "process.execPath"], { encoding: "utf8", timeout: 10_000 });
   expect(bun.status, bun.stderr).toBe(0);
-  const script = join(root, "child.mjs");
+  const script = join(root, "bun");
   fs.writeFileSync(script, `#!${bun.stdout.trim()}
 import fs from "node:fs";
 import {calls} from ${JSON.stringify(pathToFileURL(recorder).href)};
@@ -220,7 +220,32 @@ process.stdout.write(stdout??"");process.stderr.write(stderr??"");process.exit(s
     },
   );
 
-  // The no-argument executable fixture uses a POSIX shebang to launch Bun directly.
+  it.each(["spawnSync", "execFileSync", "Bun.spawnSync", "Bun.spawnSync(array)"])(
+    "leaves a non-Bun child's explicit environment unchanged through %s", (api) => {
+      const env = { ONLY: "keep", BUN_OPTIONS: "caller-owned", TEST_DELETION_GUARD_ROOT: "caller-owned" };
+      const outer = `import cp from "node:child_process";
+if(!process[Symbol.for("pi-fabric.test-deletion-guard")]) throw new Error("guard missing");
+const cmd=[${JSON.stringify(process.execPath)},"-p","JSON.stringify(process.env)"];
+const env=${JSON.stringify(env)};
+const api=${JSON.stringify(api)};
+let stdout;
+if(api==="execFileSync") stdout=cp.execFileSync(cmd[0],cmd.slice(1),{env,encoding:"utf8"});
+else if(api==="spawnSync") stdout=cp.spawnSync(cmd[0],cmd.slice(1),{env,encoding:"utf8"}).stdout;
+else {
+  const options={env,stdout:"pipe",stderr:"pipe"};
+  const child=api.includes("(array)")?Bun.spawnSync(cmd,options):Bun.spawnSync({cmd,...options});
+  if(child.exitCode!==0) throw new Error(child.stderr.toString());
+  stdout=child.stdout.toString();
+}
+process.stdout.write(stdout);`;
+      const child = spawnSync("bun", ["-e", outer], { encoding: "utf8", timeout: 10_000 });
+      expect(child.error).toBeUndefined();
+      expect(child.status, child.stderr).toBe(0);
+      expect(JSON.parse(child.stdout)).toEqual(env);
+    },
+  );
+
+  // The Bun-named no-argument fixture uses a POSIX shebang to launch Bun directly.
   it.skipIf(process.platform === "win32").each(
     ["spawn", "spawnSync", "execFile", "execFileSync"].flatMap(api =>
       (["undefined", "null"] as const).map(omitted => ({ api, omitted }))),

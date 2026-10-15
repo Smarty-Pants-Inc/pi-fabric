@@ -137,6 +137,20 @@ function pinnedBunEnvironment(env, root) {
   };
 }
 
+/** Only Bun executables consume the Bun preload/root contract. */
+function isBunExecutable(file) {
+  return typeof file === "string" && (/^(bun|bunx)(\.exe)?$/i.test(basename(file))
+    || Boolean(process.versions.bun && file === process.execPath));
+}
+
+function childProcessRunsBun(name, args) {
+  if (name !== "exec" && name !== "execSync") return isBunExecutable(args[0]);
+  if (typeof args[0] !== "string") return false;
+  // ponytail: inspect only the first shell word, not later arguments or commands.
+  const word = args[0].match(/^\s*(?:"([^"]+)"|'([^']+)'|([^\s]+))(?:\s|$)/);
+  return isBunExecutable(word?.[1] ?? word?.[2] ?? word?.[3]);
+}
+
 /** Locate options without shifting arguments or exec/execFile callbacks. */
 function childProcessOptionsIndex(name, args) {
   if (name === "exec" || name === "execSync") return 1;
@@ -264,13 +278,15 @@ function install() {
   fs.cp = cpCallback("cp", fs.cp);
   fs.cpSync = cpSync("cpSync", fs.cpSync);
   fs.promises.cp = cpPromise("promises.cp", fs.promises.cp);
-  // Explicit child environments do not inherit process.env. Pin every supported launch form.
+  // Explicit Bun child environments do not inherit process.env. Leave other programs untouched.
   for (const name of ["spawn", "spawnSync", "exec", "execSync", "execFile", "execFileSync"]) {
     const original = childProcess[name];
     childProcess[name] = function (...args) {
       const index = childProcessOptionsIndex(name, args);
       const options = args[index];
-      if (options?.env) args[index] = { ...options, env: pinnedBunEnvironment(options.env, state.root) };
+      if (options?.env && childProcessRunsBun(name, args)) {
+        args[index] = { ...options, env: pinnedBunEnvironment(options.env, state.root) };
+      }
       return Reflect.apply(original, this, args);
     };
     // exec/execFile expose a custom promisifier returning { stdout, stderr } and .child.
@@ -278,7 +294,9 @@ function install() {
     if (original[custom]) childProcess[name][custom] = function (...args) {
       const index = childProcessOptionsIndex(name, args);
       const options = args[index];
-      if (options?.env) args[index] = { ...options, env: pinnedBunEnvironment(options.env, state.root) };
+      if (options?.env && childProcessRunsBun(name, args)) {
+        args[index] = { ...options, env: pinnedBunEnvironment(options.env, state.root) };
+      }
       return Reflect.apply(original[custom], this, args);
     };
   }
@@ -288,7 +306,10 @@ function install() {
       Bun[name] = function (...args) {
         const index = Array.isArray(args[0]) ? 1 : 0;
         const options = args[index];
-        if (options?.env) args[index] = { ...options, env: pinnedBunEnvironment(options.env, state.root) };
+        const command = index === 1 ? args[0] : options?.cmd;
+        if (options?.env && isBunExecutable(command?.[0])) {
+          args[index] = { ...options, env: pinnedBunEnvironment(options.env, state.root) };
+        }
         return Reflect.apply(original, this, args);
       };
     }

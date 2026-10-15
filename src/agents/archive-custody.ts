@@ -40,7 +40,10 @@ export const readRunStopIntent = (directory: string, statusRecord?: Record<strin
   if (!intent || typeof intent !== "object" || Array.isArray(intent)) return undefined;
   const value = intent as Record<string, unknown>;
   return (value.reason === "explicit" || value.reason === "deadline") && typeof value.requestedAt === "number"
-    ? { reason: value.reason, requestedAt: value.requestedAt } : undefined;
+    ? { reason: value.reason, requestedAt: value.requestedAt,
+      ...(value.recoveryRecord && typeof value.recoveryRecord === "object" && !Array.isArray(value.recoveryRecord)
+        ? { recoveryRecord: value.recoveryRecord as Record<string, unknown> } : {}),
+    } : undefined;
 };
 
 /** Clear only after a terminal status has been durably published. */

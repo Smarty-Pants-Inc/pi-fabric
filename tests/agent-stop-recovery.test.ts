@@ -267,7 +267,16 @@ describe("durable explicit-stop recovery", () => {
         .toMatchObject({ id: handle.id, status: "stopped", finishedAt: result.finishedAt });
       expect(launch).toHaveBeenCalledTimes(2);
       releaseStop();
-      expect(await stopping).toMatchObject({ status: "stopped" });
+      expect(await stopping).toMatchObject({ status: "stopped", finishedAt: result.finishedAt });
+      // The original owner has now discharged archive intent. A fresh owner must
+      // retain the replacement's exact identity from the terminal status snapshot.
+      const third = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents }, {
+        workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root,
+      });
+      managers.push(third);
+      expect(await third.run({ task: "same activation after stop", actorId, activationId, transport: "process" }))
+        .toMatchObject({ id: handle.id, status: "stopped", finishedAt: result.finishedAt });
+      expect(launch).toHaveBeenCalledTimes(2);
     } finally {
       releaseLaunch();
       releaseStop();

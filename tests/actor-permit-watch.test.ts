@@ -423,6 +423,96 @@ describe("actor worker permit release (#9031)", () => {
     await eventually(() => expect(snapshot(f).held).toEqual([]));
   });
 
+  it.each([false, true])("preserves the original window refusal with retryable diagnostics after primary exit (progress=%s)", async progress => {
+    const f = fixture();
+    const actor = await create(f, "window-refusal");
+    await f.actors.tell(actor.id, "one terminal refusal, never replay");
+    const worker = await launched(f, actor.id);
+    const error = "Context exceeds window: request is too large; No API key found; Agent transport exited without a result";
+    if (progress) save(worker, { turns: 2, toolCalls: 1, updatedAt: Date.now() });
+    worker.alive = false;
+    save(worker, { status: "failed", error, finishedAt: Date.now(), updatedAt: Date.now(), exitCode: 1 });
+    worker.nativeClose();
+    await expect(f.agents.wait(worker.launch.id)).resolves.toMatchObject({ status: "failed", error,
+      turns: progress ? 2 : 0, toolCalls: progress ? 1 : 0 });
+    await eventually(() => expect(f.actors.inFlightCount()).toBe(0));
+    expect(f.agents.status(worker.launch.id)).toMatchObject({ error });
+    expect(JSON.parse(fs.readFileSync(worker.statusFile, "utf8")).error).toBe(error);
+    await observe();
+    expect(workers.size).toBe(1);
+    expect(snapshot(f).held).toEqual([]);
+  });
+
+  it.each(["active", "abandoned", "stopped"] as const)("primary death releases only RUN while a live descendant keeps wait and the same-session drain fenced (%s actor)", async mode => {
+    const launch = vi.mocked(ProcessTransport.prototype.launch).getMockImplementation()!;
+    const stops: number[] = [];
+    vi.mocked(ProcessTransport.prototype.launch).mockImplementation(async request => {
+      const handle = await launch(request);
+      const worker = workers.get(Number(handle.sessionId))!;
+      return { ...handle, stop: async () => {
+        stops.push(worker.pid);
+        // A real owned-tree stop can kill a descendant. Record that destructive
+        // effect instead of having the fake throw and hide premature draining.
+        worker.descendants = false;
+        worker.nativeClose();
+        await handle.stop();
+      } };
+    });
+    const f = fixture();
+    const actor = await create(f, "natural-tree-exit");
+    await f.actors.tell(actor.id, "primary will crash, descendant keeps writing");
+    const first = await launched(f, actor.id);
+    await f.actors.tell(actor.id, "next same-session event must wait");
+    if (mode === "stopped") {
+      save(first, { turns: 3, toolCalls: 1, updatedAt: Date.now() });
+      await eventually(() => expect(f.agents.status(first.launch.id)).toMatchObject({ toolCalls: 1 }));
+      await f.actors.stop(actor.id); // Abandons the progressed run, without stopping its writer.
+      expect(f.actors.status(actor.id)).toMatchObject({ status: "stopped", inFlightRun: { id: first.launch.id } });
+    }
+    const before = queueEvidence(f, actor.id);
+    let settled = false;
+    const result = f.agents.wait(first.launch.id).then(value => { settled = true; return value; });
+    const next = await blockedSuccessor(f);
+    if (mode === "abandoned") f.agents.abandon(first.launch.id);
+    first.descendants = true;
+    first.alive = false;
+    first.nativeClose(); // Primary close is not the native-tree exit receipt.
+    const second = await launched(f, next.actor.id);
+    await observe();
+    expect(stops).not.toContain(first.pid);
+    expect(first.descendants).toBe(true);
+    expect(settled).toBe(false);
+    expect(f.agents.status(first.launch.id).status).toBe("running");
+    expect(f.agents.retentionCustodyVeto(first.launch.id)).toBe(true);
+    expect(f.actors.status(actor.id).inFlightRun?.id).toBe(first.launch.id);
+    expect(queueEvidence(f, actor.id)).toEqual(before);
+    expect(snapshot(f).held.map(held => held.runId)).toEqual([second.launch.id]);
+    expect(workers.size).toBe(2);
+
+    first.descendants = false; // The writer exits naturally; no manager stop drove it.
+    await expect(result).resolves.toMatchObject({ status: "failed", error: expect.stringContaining("Actor worker is proven gone") });
+    const finalActor = mode === "stopped" ? await create(f, "after-stopped-writer") : actor;
+    let finalAnswer: ReturnType<ActorManager["ask"]> | undefined;
+    if (mode === "stopped") {
+      await eventually(() => expect(f.actors.status(actor.id).inFlightRun).toBeUndefined());
+      expect(f.actors.status(actor.id).status).toBe("stopped");
+      finalAnswer = f.actors.ask(finalActor.id, "independent event after natural tree exit");
+      void finalAnswer.catch(() => undefined);
+    }
+    await eventually(() => expect(snapshot(f).waiting).toHaveLength(1));
+    await observe();
+    expect(snapshot(f).held.map(held => held.runId)).toEqual([second.launch.id]);
+    expect(workers.size).toBe(2); // Old settlement cannot release RUN twice.
+    complete(second);
+    await expect(next.answer).resolves.toMatchObject({ text: "finished" });
+    const sameSession = await launched(f, finalActor.id);
+    expect(sameSession.launch.id).not.toBe(first.launch.id);
+    complete(sameSession);
+    if (finalAnswer) await expect(finalAnswer).resolves.toMatchObject({ text: "finished" });
+    await eventually(() => expect(f.actors.inFlightCount()).toBe(0));
+    expect([...workers.values()].filter(worker => worker.record.task === first.record.task)).toHaveLength(1);
+  });
+
   it.each(["live", "unknown-launch-birth", "empty-launch-birth", "unreadable-current-birth", "EPERM", "EIO"] as const)("%s worker retains its permit and blocks the next actor", async mode => {
     if (mode === "unknown-launch-birth" || mode === "empty-launch-birth") {
       const birth = vi.mocked(processIdentity.processStartTime).getMockImplementation()!;

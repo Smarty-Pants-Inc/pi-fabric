@@ -5330,16 +5330,25 @@ export class AgentManager {
   /** A leader's death forbids replay, but never substitutes for the whole native/tree join. */
   async #settleGoneActorWorker(managed: ManagedAgent, record: AgentRunRecord | undefined): Promise<boolean> {
     if ((managed.stopRequested && managed.workerGone !== managed.transport) || !this.#actorWorkerGone(managed)) return false;
+    // Current primary proof releases only RUN, even while its tree remains live.
+    this.#releaseProvenGone();
     // Preserve genuine terminal results; only missing/recoverable transport outcomes become loss.
+    // Like #retryStartup, a window refusal outranks incidental auth/transport diagnostics.
     const terminalResult = (candidate: AgentRunRecord | undefined): boolean =>
       candidate !== undefined && terminalStatuses.has(candidate.status) &&
         (candidate.status === "completed" || candidate.errorCode === "CONTEXT_OVERFLOW" ||
+          /Context exceeds window:/i.test(candidate.error ?? "") ||
           (!recoverableStop(candidate) && !transportExitedWithoutResult(candidate.error) && !retryablePiStartupError(candidate.error)));
-    if (terminalResult(record)) return false;
-    // Failure retains execution/session custody; admission has its separate host-death gate.
-    // The existing monitor retries the join.
-    try { await this.#drainExecution(managed); }
-    catch { return true; }
+    // Primary loss is not a stop request: descendants may still own the native
+    // session, including after actor abandonment. Observe their voluntary exit
+    // before joining; #drainExecution would otherwise actively kill that tree.
+    // The existing close wake/status monitor retries this bounded observation.
+    try {
+      if (!managed.executionExited &&
+          await this.#transportAliveUntil(managed.transport, Date.now() + TRANSPORT_EXIT_GRACE_MS)) return true;
+      if (terminalResult(record)) return false;
+      await this.#drainExecution(managed);
+    } catch { return true; }
     if (!managed.executionExited) return true;
     // Final publication may race the join. Do not replace a committed success (or
     // genuine worker failure) with the earlier running/missing snapshot's loss.

@@ -303,10 +303,44 @@ describe.skipIf(!hosted)(`Windows mesh release primitive, hosted (smarty-dev#956
 
   for (const phase of ["before-commit", "after-commit"] as const) {
     it(`T2: parent death at ${phase} cannot leave a helper running or reach B`, async () => {
-      const a = record("a");
+      const a = record("a"), b = record("b");
       const lock = acquire(root, a);
+      // Keep the original full R and bigint object identities BEFORE framing the helper request.
+      const id = (stat: fs.BigIntStats) => [stat.dev, stat.ino];
+      const canonical = () => ({
+        directory: id(fs.lstatSync(lock, { bigint: true })),
+        owner: id(fs.lstatSync(path.join(lock, "owner"), { bigint: true })),
+        record: fs.readFileSync(path.join(lock, "owner")),
+        entries: fs.readdirSync(lock).sort(),
+      });
+      const original = canonical();
+      expect(original.record).toEqual(Buffer.from(a, "utf8"));
+      expect(original.entries).toEqual(["owner"]);
+      const absent = (file: string) => {
+        // Only ENOENT is absence; sharing/access errors must fail, not masquerade as clean state.
+        expect(fs.lstatSync(file, { bigint: true, throwIfNoEntry: false }), file).toBeUndefined();
+        expect(fs.readdirSync(path.dirname(file)), file).not.toContain(path.basename(file));
+      };
       const gate = tempDir();
-      const { retired, message } = nativeRequest(lock, a, 3000);
+      const { retired, message } = nativeRequest(lock, original.record.toString("utf8"), 3000);
+      const retirement = () => {
+        const directory = fs.lstatSync(retired, { bigint: true, throwIfNoEntry: false });
+        if (!directory) { absent(retired); return { state: "absent" }; }
+        expect(directory.isDirectory(), retired).toBe(true);
+        expect(id(directory), retired).toEqual(original.directory);
+        const entries = fs.readdirSync(retired).sort(); // inaccessible/pending state is diagnostic failure, not absence
+        if (entries.length === 0) return { state: "empty-original", directory: id(directory) };
+        expect(entries, retired).toEqual(["owner"]); // no arbitrary entries, reparse points or replacement T
+        const owner = fs.lstatSync(path.join(retired, "owner"), { bigint: true });
+        expect(owner.isFile(), retired).toBe(true);
+        expect(id(owner), retired).toEqual(original.owner);
+        const bytes = fs.readFileSync(path.join(retired, "owner"));
+        expect(bytes, retired).toEqual(original.record);
+        return { state: "original-full-proof", directory: id(directory), owner: id(owner), record: bytes };
+      };
+      const report = (evidence: unknown) => console.info("T2 parent-death evidence", JSON.stringify(evidence,
+        (_key, value: unknown) => typeof value === "bigint" ? value.toString() : value));
+      const startedAt = Date.now();
       const requestFile = path.join(gate, "request.bin");
       fs.writeFileSync(requestFile, message);
       // A plain node parent that starts the helper and is then killed (no TypeScript loader, no Bun).
@@ -322,24 +356,62 @@ describe.skipIf(!hosted)(`Windows mesh release primitive, hosted (smarty-dev#956
       ].join("\n"), capability.absolutePath, requestFile, phase, gate, helperPidFile]);
       parent.finishBeforeTeardown = true;
       parent.child.stdin.end();
-      await waitFor(path.join(gate, `${phase}.paused`));
+      await waitFor(path.join(gate, `${phase}.paused`), 8000);
+      const checkpointAt = Date.now();
       const helper = Number(fs.readFileSync(path.join(gate, `${phase}.paused`), "utf8").trim());
       orphanHelpers.add(helper);
-      parent.child.kill();
-      await parent.done;
-      if (phase === "after-commit") fs.writeFileSync(path.join(gate, "go"), ""); // the orphan finishes its own object only
-      await waitGone(helper); // bounded by its watchdog (3 s) even without go
-      if (phase === "before-commit") {
-        expect(ownerOf(lock)).toBe(a);
-        expect(releaseWindowsMeshLock(lock, a, capability).outcome).toBe("released");
-      } else {
-        expect(exists(lock)).toBe(false);
-        expect(exists(retired)).toBe(false);
+      expect(Number.isSafeInteger(helper) && helper > 0).toBe(true);
+      expect(Number(fs.readFileSync(helperPidFile, "utf8").trim())).toBe(helper);
+      expect(alive(helper)).toBe(true);
+      let successor: ReturnType<typeof canonical>;
+      if (phase === "after-commit") {
+        absent(lock);
+        const atCheckpoint = retirement();
+        expect(atCheckpoint.state).toBe("original-full-proof");
+        // Publish B WHILE A's native helper is paused, before parent death or permission to continue.
+        acquire(root, b);
+        successor = canonical();
+        expect(successor.record).toEqual(Buffer.from(b, "utf8"));
+        absent(path.join(gate, "go"));
+        expect(alive(helper)).toBe(true);
+        report({ phase, event: "B-published-before-parent-kill", helper, checkpointAt, retirement: atCheckpoint, successor });
       }
-      const b = record("b");
-      acquire(root, b);
-      expect(ownerOf(lock)).toBe(b);
-    });
+      parent.child.kill();
+      const parentReceipt = await parent.done; // actual close barrier, not just kill delivery
+      const parentJoinedAt = Date.now();
+      const helperAliveBeforeGo = alive(helper);
+      const goSent = phase === "after-commit" && helperAliveBeforeGo;
+      if (goSent) fs.writeFileSync(path.join(gate, "go"), "");
+      await waitGone(helper, 5000); // native watchdog is 3 s, including forced parent death without go
+      const helperGoneAt = Date.now();
+      report({ phase, helper, parentPid: parent.child.pid, parentReceipt, helperAliveBeforeGo, goSent,
+        startedAt, checkpointAt, parentJoinedAt, helperGoneAt, elapsedMs: helperGoneAt - startedAt,
+        helperGone: !alive(helper), nativeTerminalReceipt: "unobserved (stdio ignored); no exit phase inferred", original });
+      expect(parentReceipt.code).not.toBe(0);
+      if (phase === "before-commit") {
+        expect(canonical()).toEqual(original); // complete original canonical proof AND both object ids survive
+        absent(retired);
+        report({ phase, canonical: canonical(), retirement: retirement() });
+        // A's explicit same-R release succeeds; do not pretend B could reap a live A.
+        expect(releaseWindowsMeshLock(lock, a, capability)).toMatchObject({ outcome: "released", cleanup: "clean" });
+        absent(lock);
+        absent(retired);
+        acquire(root, b);
+        expect(canonical().record).toEqual(Buffer.from(b, "utf8"));
+      } else {
+        // Keep reason: data safety; design.md §5 W4 / parent-death partition and §7 permit a finite orphan
+        // to complete, not require clean T. Full proof, empty original T, or absent T is safe; replaced/unknown T is not.
+        const afterDeath = retirement();
+        report({ phase, retirement: afterDeath, successor: canonical() });
+        expect(canonical()).toEqual(successor!);
+        const retry = releaseWindowsMeshLock(lock, a, capability); // release ONLY the original full R
+        const afterRetry = retirement();
+        report({ phase, retry, retirement: afterRetry, successor: canonical() });
+        expect(retry).toEqual({ outcome: "not-owner" });
+        expect(canonical()).toEqual(successor!);
+        expect(afterRetry).toEqual(afterDeath); // retry has no authority over B OR A's sibling T
+      }
+    }, 25_000);
   }
 
   it("T3: an extra child before retirement refuses with the owner intact (JS W1 and native W3)", async () => {

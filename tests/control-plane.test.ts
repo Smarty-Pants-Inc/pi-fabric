@@ -74,7 +74,8 @@ describe("raw mirrored control freshness admission", () => {
     sender.start(() => ({ accepted: false }));
     const send = (signal?: AbortSignal, budget?: { waited?: boolean }, key?: string) => sender.request("owner", "target", "followUp",
       { ownerIncarnation: fixtureOwnerIncarnation, message: "one attempt" }, "owner",
-      { routedRemoteHost: "forge", signal, mirrorLeaseWaitBudget: budget, idempotencyKey: key });
+      { routedRemoteHost: "forge", ...(signal ? { signal } : {}),
+        ...(budget ? { mirrorLeaseWaitBudget: budget } : {}), ...(key ? { idempotencyKey: key } : {}) });
     const commands = () => sender.mesh.read({ topic: "fabric.control.command" });
     const renew = (patch: Partial<MirroredControlOwner> = {}) => {
       current = { ...live(), ...patch };

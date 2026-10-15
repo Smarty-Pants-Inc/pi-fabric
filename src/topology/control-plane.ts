@@ -434,8 +434,6 @@ interface PendingControlRequest {
   operation: FabricControlOperation;
   targetId: string;
   commandPublished: boolean;
-  /** Commit callback passed admission; append may already exist even if publish has not returned. */
-  commandAdmitted?: boolean;
   readonly requestCreatedAt: number;
   readOwnerExpiry?: () => number;
   idempotencyKey?: string;
@@ -852,8 +850,7 @@ export class FabricControlPlane {
           // The remote owner already owns accepted work. Do not translate Main's
           // observation ceiling into an unbranded activation-cancel wire command.
           if (cancelled && !ceiling) void this.#publishCancellation(commandId, cancelled);
-          reject(ceiling ?? (pending.mirroredOwner && !pending.commandAdmitted
-            ? options.signal!.reason : new Error(`Remote Fabric request cancelled: ${targetId}`)));
+          reject(ceiling ?? new Error(`Remote Fabric request cancelled: ${targetId}`));
         };
         pending.signal = options.signal;
         pending.onAbort = onAbort;
@@ -879,20 +876,23 @@ export class FabricControlPlane {
         // left after this sender waited for the mesh lock (2-3 s under load).
         data: (committedAt: number): FabricControlCommand => {
           // The event data callback runs under the publication lock, before event append.
-          // A queued publish cannot cross a lost lease, swapped link or activation.
-          options.signal?.throwIfAborted();
-          if (mirroredOwner && this.#pending.get(commandId) === pendingRequest!) {
-            const current = readMirror();
-            if (!current) throw unavailable(mirroredOwner.remoteHost);
-            const status = mirroredOwnerRoutingStatus(current, (this.options.now ?? Date.now)());
-            if (status === "lease-stale") throw rootGone(mirroredOwner.remoteHost);
-            if (status === "bridge-stale") {
-              if (waitBudget.waited) throw new FabricPeerLeaseStaleError(targetId, current.remoteHost,
-                Math.max(0, (this.options.now ?? Date.now)() - current.expiresAt));
-              throw new MirrorLeaseAdmissionRequired(current);
+          // A still-pending queued publish cannot cross a lost lease, swapped link or activation.
+          // Once settlement has cleared #pending, preserve the original uncertain in-flight
+          // append and its best-effort cancellation rather than turning it into a preflight refusal.
+          if (this.#pending.get(commandId) === pendingRequest!) {
+            options.signal?.throwIfAborted();
+            if (mirroredOwner) {
+              const current = readMirror();
+              if (!current) throw unavailable(mirroredOwner.remoteHost);
+              const status = mirroredOwnerRoutingStatus(current, (this.options.now ?? Date.now)());
+              if (status === "lease-stale") throw rootGone(mirroredOwner.remoteHost);
+              if (status === "bridge-stale") {
+                if (waitBudget.waited) throw new FabricPeerLeaseStaleError(targetId, current.remoteHost,
+                  Math.max(0, (this.options.now ?? Date.now)() - current.expiresAt));
+                throw new MirrorLeaseAdmissionRequired(current);
+              }
             }
           }
-          pendingRequest!.commandAdmitted = true;
           return {
             version: 1,
             commandId,
@@ -1086,9 +1086,6 @@ export class FabricControlPlane {
     this.#leaseWatchdog = setInterval(() => {
       for (const [commandId, pending] of this.#pending) {
         const captured = pending.mirroredOwner;
-        // Pre-publication freshness is fenced by the commit callback and its one renewal
-        // wait. Only a committed command has the unknown/duplicate-risk bridge outcome.
-        if (captured && !pending.commandAdmitted) continue;
         if (!captured) {
           if (!pending.readOwnerExpiry) continue;
           let late: number;

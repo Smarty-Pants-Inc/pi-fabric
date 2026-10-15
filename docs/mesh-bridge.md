@@ -180,8 +180,11 @@ The control deadline is stamped at publication commit and includes outbound brid
 15 s for the ACK return leg; mirrored steer/followUp admission waits are bounded by that same
 window plus grace, even if publication blocks or the lease renews. Cancellation uses the bridge
 window too. Native commands keep their existing timeout. A missing ACK or a lapsed mirror cannot
-prove non-delivery: errors say the outcome is unknown and a retry may deliver twice. Only an
-authenticated owner's explicit `notRun` rejection permits the existing bounded message retry.
+prove non-delivery: errors say the outcome is unknown and a retry may deliver twice. This also
+covers a publication already handed to the store whose result is still pending: it may commit
+after the local request settles, so the sender retains its captured destination and issues the
+existing best-effort cancellation, never a lookup replay. Only an authenticated owner's explicit
+`notRun` rejection permits the existing bounded message retry.
 
 The live `events.jsonl` already compacts after a publish takes it past 64 MiB, retaining up to
 16 MiB of complete recent lines and incrementing `generation`. This is not an age-based sweep:

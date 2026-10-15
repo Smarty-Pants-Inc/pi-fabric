@@ -225,8 +225,11 @@ export class AgentMessageRouter {
     };
     const reason = this.#directoryUnavailable();
     if (reason) {
-      if (recoverLease && id && await resolveLease(id) === false) throw this.#unknownParticipant(id);
+      // Capture pre-wait authority before the canonical probe can replace its view. Classify
+      // a proven lapse only after that probe; an unconfirmed/failed directory still wins.
+      const resolved = recoverLease && id ? await resolveLease(id) : undefined;
       await this.#refreshDirectory(reason);
+      if (resolved === false) throw this.#unknownParticipant(id!);
     }
     try {
       return await operation(authority, budget);
@@ -248,8 +251,9 @@ export class AgentMessageRouter {
       // A read can fail after the preflight. Retry resolution once, never delivery after
       // an ACK/control error: only pre-publication directory failures have this class.
       if (!(error instanceof FabricDirectoryUnavailableError) || reason || !this.participants.refreshRoutingView) throw error;
-      if (recoverLease && id && await resolveLease(id) === false) throw this.#unknownParticipant(id);
+      const resolved = recoverLease && id ? await resolveLease(id) : undefined;
       await this.#refreshDirectory(error.message);
+      if (resolved === false) throw this.#unknownParticipant(id!);
       return retry();
     }
   }

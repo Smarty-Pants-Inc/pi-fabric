@@ -28,9 +28,10 @@ const runtimeAt = (cwd: string) => {
 const registries = (dir: string): string[] => fs.readdirSync(dir, { recursive: true, encoding: "utf8" })
   .filter((entry) => path.basename(entry) === "actors.json").map((entry) => path.join(dir, entry));
 
-// smarty-dev#8090, follow-up smarty-dev#11335: off Linux root actor tree deletion refuses (no Main publication fence), so the
-// restarted Main keeps the accepted removal pending with the named refusal and the old actor tree kept. Linux is unchanged.
-const OFF_LINUX_PENDING = new RegExp(`^removal cleanup failed: Root actor tree deletion needs the Main publication fence, which this platform \\(${process.platform}\\) lacks \\(smarty-dev#8090\\); follow-up smarty-dev#11335; the root \\S+ actor tree is kept \\(a later remove or host start finishes it\\)$`);
+// smarty-dev#8090, follow-up smarty-dev#11335: Linux, Darwin and Windows support the Main publication fence.
+// Only unsupported platforms keep the restarted Main's accepted removal pending and the old actor tree kept.
+const UNSUPPORTED_PLATFORM = process.platform !== "linux" && process.platform !== "darwin" && process.platform !== "win32";
+const UNSUPPORTED_PLATFORM_PENDING = new RegExp(`^removal cleanup failed: Root actor tree deletion needs the Main publication fence, which this platform \\(${process.platform}\\) lacks \\(smarty-dev#8090\\); follow-up smarty-dev#11335; the root \\S+ actor tree is kept \\(a later remove or host start finishes it\\)$`);
 
 it("a restarted Main finishes the removal it accepted before its restart", async () => {
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-removal-restart-"));
@@ -48,15 +49,15 @@ it("a restarted Main finishes the removal it accepted before its restart", async
     const record = registry.actors.find((entry) => entry.id === old.id)!;
     Object.assign(record, { status: "stopped", removal: { requestedAt: Date.now() - 5_000, runId: "c".repeat(32) } });
     fs.writeFileSync(file, JSON.stringify(registry));
-    // Off Linux only: a history file in the old actor's dir, to prove the refused tree delete kept it.
+    // Unsupported platforms only: a history file in the old actor's dir proves the refused tree delete kept it.
     const oldDir = path.join(path.dirname(file), old.id);
-    if (process.platform !== "linux") { fs.mkdirSync(oldDir, { recursive: true }); fs.writeFileSync(path.join(oldDir, "kept-11335.txt"), "history\n"); }
+    if (UNSUPPORTED_PLATFORM) { fs.mkdirSync(oldDir, { recursive: true }); fs.writeFileSync(path.join(oldDir, "kept-11335.txt"), "history\n"); }
 
     const second = runtimeAt(cwd);
     await second.init();
     try {
-      if (process.platform !== "linux") {
-        await vi.waitFor(() => expect(second.runtime.actors.pendingRemovals()).toContainEqual(expect.objectContaining({ id: old.id, state: expect.stringMatching(OFF_LINUX_PENDING) })), { timeout: 5_000 });
+      if (UNSUPPORTED_PLATFORM) {
+        await vi.waitFor(() => expect(second.runtime.actors.pendingRemovals()).toContainEqual(expect.objectContaining({ id: old.id, state: expect.stringMatching(UNSUPPORTED_PLATFORM_PENDING) })), { timeout: 5_000 });
         expect(fs.readFileSync(path.join(oldDir, "kept-11335.txt"), "utf8")).toBe("history\n");
         const successor = await second.runtime.actors.create({ name: "reviewer", instructions: "Review.", responseMode: "text" });
         expect(second.runtime.actors.list().map((actor) => actor.id)).toContain(successor.id);

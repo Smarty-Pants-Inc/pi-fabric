@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import { closeScratch, createScratch, ScratchScope } from "./storage/scratch.js";
 import path from "node:path";
 import { truncateMiddle } from "./util.js";
+import { detachedPreview } from "./core/preview.js";
 import type { FabricResidentOutcomeReceipt } from "./runtime/kernel.js";
 
 export const MAX_FAILURE_MODEL_OUTPUT_CHARS = 20_000;
@@ -67,7 +68,7 @@ const boundPrioritySections = (sections: readonly string[], budget: number): str
     if (limit === 0) return "";
     const bounded = truncateMiddle(value, limit);
     // A truncation marker can exceed a tiny allocation. Only prose is cut here.
-    return bounded.length <= limit ? bounded : value.slice(0, limit);
+    return bounded.length <= limit ? bounded : detachedPreview(value, limit);
   }).filter(Boolean);
 };
 
@@ -114,7 +115,7 @@ export const boundModelOutput = async (
 ): Promise<BoundedModelOutput> => {
   if (priority) visible = [priority.text, ...priority.sections.filter(Boolean)].join("\n\n");
   if (visible.length <= maxChars && fullOutput.length <= maxChars) {
-    return { text: visible, originalChars: fullOutput.length, omittedChars: 0 };
+    return { text: detachedPreview(visible, visible.length), originalChars: fullOutput.length, omittedChars: 0 };
   }
 
   let artifactPath: string | undefined;
@@ -152,7 +153,7 @@ export const boundModelOutput = async (
     // fits and still ends with the path.
     const rebudget = maxChars - suffix.length;
     if (rebudget <= 0) {
-      text = suffix.slice(-Math.max(1, maxChars));
+      text = detachedPreview(suffix.slice(-Math.max(1, maxChars)), Math.max(1, maxChars));
     } else {
       const shrunk = truncateMiddle(body, rebudget);
       text = shrunk.length + suffix.length <= maxChars ? `${shrunk}${suffix}` : suffix;

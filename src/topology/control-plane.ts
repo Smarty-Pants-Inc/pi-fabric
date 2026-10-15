@@ -2,7 +2,8 @@ import { appendDeliveryOutcome, type DeliverySend } from "../mesh/delivery-outco
 import type { MeshControlIncarnationFence } from "../config.js";
 import { FabricBridgeStaleError, FabricParticipantStaleError, mirroredOwnerRoutingStatus, participantLeaseGraceMs, waitForMirroredLeaseRenewal, readHostLeaseCurrent, sameHostLeaseOwner, withOwnedHostLease, type FabricMirrorLease, type MirrorLeaseWaitBudget } from "./host-leases.js";
 import { assertStartingHost, startingHost, localStartTime } from "./starting-host.js";
-import { openStartingInbox, readStartingFollowUp, listStartingFollowUps, writeStartingFollowUp } from "./starting-inbox.js";
+import { openStartingInbox, readStartingFollowUp, listStartingFollowUps, writeStartingFollowUp,
+  readStartingFollowUpCompletion, completeStartingFollowUp, removeStartingFollowUp } from "./starting-inbox.js";
 import os from "node:os";
 import { retryDelayMs } from "../core/retry-backoff.js";
 import { FabricPeerLeaseStaleError } from "../agents/peer-lease-stale.js";
@@ -626,6 +627,13 @@ export class FabricControlPlane {
       signal?.throwIfAborted();
       assertStartingHost(this.mesh.root, lease);
       const inbox = this.#startingInbox(targetId, true)!;
+      const completed = readStartingFollowUpCompletion(inbox.root, commandId);
+      if (completed) {
+        if (completed.incarnationToken !== lease.incarnationToken || completed.ownerIncarnation !== lease.ownerIncarnation)
+          throw new FabricParticipantStaleError(targetId, 0, idempotencyKey);
+        if (completed.senderId !== from.id) throw new Error("Startup followUp idempotency collision");
+        return; // Already durable in Main: no payload publication, wake or startup ACK.
+      }
       const row = readStartingFollowUp(inbox.root, commandId);
       if (row) {
         if (!sameHostLeaseOwner(row.lease, lease) || row.lease.ownerIncarnation !== lease.ownerIncarnation)
@@ -1645,7 +1653,7 @@ export class FabricControlPlane {
     if (!inbox) return;
     for (const { commandId, row } of listStartingFollowUps(inbox.root)) {
       this.#assertAdmission();
-      if (row?.format !== 1 || row.acceptance || row.event?.to !== this.options.hostId ||
+      if (row?.format !== 1 || row.event?.to !== this.options.hostId ||
         row.lease?.ownerIncarnation !== this.incarnation || row.lease.id !== this.options.hostId) continue;
       const command = commandFromEvent(row.event);
       if (!command || command.commandId !== commandId || command.operation !== "followUp" || command.ownerIncarnation !== this.incarnation ||
@@ -1661,11 +1669,23 @@ export class FabricControlPlane {
           current.process?.startTime !== row.lease.startup?.startTime ||
           localStartTime(row.lease.startup!.pid) !== row.lease.startup!.startTime) return;
         const fresh = readStartingFollowUp(inbox.root, commandId);
-        if (!fresh || fresh.acceptance) return;
+        if (!fresh) return;
+        const completed = readStartingFollowUpCompletion(inbox.root, commandId);
+        if (completed?.incarnationToken === row.lease.incarnationToken && completed.ownerIncarnation === this.incarnation &&
+          completed.senderId === row.event.from.id) {
+          removeStartingFollowUp(inbox.root, commandId);
+          return;
+        }
+        // Compact accepted rows from the earlier on-row outcome format too.
+        if (fresh.acceptance) {
+          if (fresh.acceptance.accepted) completeStartingFollowUp(inbox.root, commandId, fresh, fresh.acceptance);
+          return;
+        }
         // The startup deadline bounded admission, not already durable work.
         const acceptance = await this.#handler!(command, row.event.from, new AbortController().signal, row.event.verification);
         this.#assertAdmission();
-        writeStartingFollowUp(inbox.root, commandId, { ...row, acceptance });
+        if (acceptance.accepted) completeStartingFollowUp(inbox.root, commandId, row, acceptance);
+        else writeStartingFollowUp(inbox.root, commandId, { ...row, acceptance });
       });
     }
   }
@@ -1724,6 +1744,17 @@ export class FabricControlPlane {
         accepted: false, error: STALE_INCARNATION_ERROR, errorCode: CONTROL_STALE_INCARNATION,
       }, this.incarnation, command.ownerIncarnation ?? null);
       return; // no claim, handler, or automatic notRun resend
+    }
+    // Same-key retries after readiness no longer have a live startup row. Observe
+    // its small receipt directly; only the authenticated original sender can reuse it.
+    if (command.operation === "followUp" && command.targetId === this.options.hostId && event.verification === "mesh" &&
+      /^[a-f0-9]{64}$/.test(command.commandId)) {
+      const inbox = this.#startingInbox(command.targetId);
+      const completed = inbox && readStartingFollowUpCompletion(inbox.root, command.commandId);
+      if (completed?.ownerIncarnation === this.incarnation && completed.senderId === event.from.id) {
+        await this.#publishAcknowledgement(command, { accepted: true, messageId: completed.messageId ?? command.commandId, triggered: false });
+        return;
+      }
     }
     if ((now > deadlineAt || command.requestedAt - now > this.#ackTimeoutMs) && !this.#sharedClaims.has(key)) {
       // A sender waits at most MAX_CONTROL_ACK_GRACE_MS past the deadline. An older command

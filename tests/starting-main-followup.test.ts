@@ -82,6 +82,7 @@ describe("same-session native Main startup inbox", () => {
       expect(fs.statSync(path.dirname(privateRoot)).mode & 0o777).toBe(0o700);
       expect(fs.statSync(path.join(privateRoot, `${queued.messageId}.json`)).mode & 0o777).toBe(0o600);
     }
+    const envelope = privateRows(mesh, targetId)[0]!.value.event;
     const globalEvents = JSON.stringify(mesh.read({ limit: 100 }));
     expect(globalEvents).not.toContain("one native delivery");
     expect(globalEvents).not.toContain("trusted-human");
@@ -106,22 +107,31 @@ describe("same-session native Main startup inbox", () => {
     const receiver = plane(new MeshStore(root, 65_536, 1_000), receiverIdentity, directory.ownerIncarnation);
     // Simulate a crash gap after Main persisted its delivery receipt but before the
     // startup queue outcome commits. Replay must call the real Main receipt dedup.
-    const write = startupInbox.writeStartingFollowUp;
+    const complete = startupInbox.completeStartingFollowUp;
     let gap = true;
-    vi.spyOn(startupInbox, "writeStartingFollowUp").mockImplementation((...args) => {
-      if (gap && args[2].acceptance) {
+    vi.spyOn(startupInbox, "completeStartingFollowUp").mockImplementation((...args) => {
+      if (gap) {
         gap = false; throw Object.assign(new Error("injected journal/outcome gap"), { code: "FABRIC_MESH_LOCK_TIMEOUT" });
       }
-      return write(...args);
+      return complete(...args);
     });
-    receiver.start((...args) => targetRouter.acceptControl(...args));
-    await vi.waitFor(() => expect(privateRows(mesh, targetId)[0]!.value.acceptance?.accepted).toBe(true));
+    const accept = vi.fn((...args: Parameters<typeof targetRouter.acceptControl>) => targetRouter.acceptControl(...args));
+    receiver.start(accept);
+    await vi.waitFor(() => expect(startupInbox.readStartingFollowUpCompletion(privateRoot, queued.messageId)).toBeDefined());
+    expect(privateRows(mesh, targetId)).toEqual([]);
+    expect(accept).toHaveBeenCalledTimes(2);
     expect(gap).toBe(false);
     expect(native).toHaveLength(1);
     expect(native[0]!.options.triggerTurn).toBe(true);
-    const envelope = privateRows(mesh, targetId)[0]!.value.event;
     expect(envelope.verification).toBe("mesh");
-    if (process.platform !== "win32") expect(fs.statSync(path.join(privateRoot, `${queued.messageId}.json`)).mode & 0o777).toBe(0o600);
+    expect(fs.existsSync(path.join(privateRoot, `${queued.messageId}.json`))).toBe(false);
+    const completionFile = path.join(privateRoot, "completed", `${queued.messageId}.json`);
+    if (process.platform !== "win32") {
+      expect(fs.statSync(completionFile).mode & 0o777).toBe(0o600);
+      expect(fs.statSync(path.dirname(completionFile)).mode & 0o777).toBe(0o700);
+    }
+    expect(fs.readFileSync(completionFile, "utf8")).not.toContain("one native delivery");
+    expect(fs.readFileSync(completionFile, "utf8")).not.toContain("trusted-human");
     expect(envelope.principal).toEqual({ id: "trusted-human", binding: "herdr-client" });
     expect(envelope.from.id).toBe(senderIdentity.id);
     expect(oldHandler).not.toHaveBeenCalled();
@@ -129,7 +139,7 @@ describe("same-session native Main startup inbox", () => {
     await directory.close();
   });
 
-  it("dedups the same key across startup readiness while a fresh key still delivers", async () => {
+  it("prunes N durable Main admissions, drains zero settled rows, and dedups before and after readiness", async () => {
     const root = temp(), mesh = new MeshStore(root, 65_536, 1_000);
     const manager = SessionManager.create(root, path.join(root, "sessions"));
     const sessionId = manager.getSessionId(), targetId = `session:${sessionId}`;
@@ -150,6 +160,10 @@ describe("same-session native Main startup inbox", () => {
       const queued = await router.routeMessage(targetId, "same request", undefined, "followUp", undefined,
         { idempotencyKey: "ready-transition" });
       expect(queued).toMatchObject({ queued: true, reason: "startup-inbox-durable" });
+      const count = 8;
+      for (let i = 1; i < count; i++) await router.routeMessage(targetId, `request ${i}`, undefined, "followUp", undefined,
+        { idempotencyKey: `ready-transition-${i}` });
+      expect(privateRows(mesh, targetId)).toHaveLength(count);
       const native: any[] = [];
       const api = { on: () => {}, sendMessage: (message: any) => {
         native.push(message);
@@ -163,9 +177,37 @@ describe("same-session native Main startup inbox", () => {
       await directory.start();
       const receiver = plane(directory.mesh, receiverIdentity, directory.ownerIncarnation);
       const targetRouter = route(receiverIdentity, main);
-      receiver.start((...args) => targetRouter.acceptControl(...args));
-      await vi.waitFor(() => expect(privateRows(mesh, targetId)[0]!.value.acceptance?.accepted).toBe(true));
-      await directory.finishStartup(); receiver.notifyStartupReady();
+      const accept = vi.fn((...args: Parameters<typeof targetRouter.acceptControl>) => targetRouter.acceptControl(...args));
+      receiver.start(accept);
+      await vi.waitFor(() => expect(privateRows(mesh, targetId)).toEqual([]));
+      expect(native).toHaveLength(count);
+      expect(accept).toHaveBeenCalledTimes(count);
+      const privateRoot = startupInbox.startingInboxRoot(root, targetId);
+      expect(fs.readdirSync(path.join(privateRoot, "completed"))).toHaveLength(count);
+      const privateEvents = new MeshStore(privateRoot, 65_536, 1_000);
+      const originalPrivateCount = privateEvents.read({ topic: "fabric.control.command", limit: 100 }).length;
+      const beforeReady = await router.routeMessage(targetId, "same request", undefined, "followUp", undefined,
+        { idempotencyKey: "ready-transition" });
+      expect(beforeReady.messageId).toBe(queued.messageId);
+      expect(beforeReady).not.toHaveProperty("acknowledged");
+      expect(privateEvents.read({ topic: "fabric.control.command", limit: 100 })).toHaveLength(originalPrivateCount);
+      privateEvents.closeState();
+      expect(privateRows(mesh, targetId)).toEqual([]);
+      expect(mesh.read({ topic: "fabric.control.ack", limit: 100 })).toEqual([]);
+      await receiver.close();
+      const scans = vi.spyOn(startupInbox, "listStartingFollowUps");
+      // Each close joins a real drain; recreating owners also discards in-memory caches.
+      for (let i = 0; i < 3; i++) {
+        const replay = plane(directory.mesh, receiverIdentity, directory.ownerIncarnation);
+        replay.start(accept);
+        await replay.close();
+      }
+      expect(scans.mock.results.length).toBeGreaterThan(0);
+      expect(scans.mock.results.every(result => result.type === "return" && result.value.length === 0)).toBe(true);
+      expect(accept).toHaveBeenCalledTimes(count);
+      await directory.finishStartup();
+      const readyReceiver = plane(directory.mesh, receiverIdentity, directory.ownerIncarnation);
+      readyReceiver.start(accept); readyReceiver.notifyStartupReady();
       expect(readHostLeaseCurrent(root, targetId)?.startup).toBeUndefined();
       await source.start(); await source.refresh();
       expect(source.get(targetId)).toMatchObject({ ownerHostId: targetId, ownerIdentityId: targetId });
@@ -173,18 +215,19 @@ describe("same-session native Main startup inbox", () => {
         { idempotencyKey: "ready-transition" });
       const commands = mesh.read({ topic: "fabric.control.command", limit: 100 });
       expect((commands.at(-1)!.data as any).commandId).toBe(queued.messageId);
-      expect(duplicate.messageId).toBe(native[0].details.id);
-      expect(native).toHaveLength(1);
+      expect(duplicate.messageId).toBe(native.find(message => message.details.deliveryId === queued.messageId)!.details.id);
+      expect(native).toHaveLength(count);
+      expect(accept).toHaveBeenCalledTimes(count);
       const receipts = () => fs.readFileSync(manager.getSessionFile()!, "utf8").trim().split("\n")
         .map(line => JSON.parse(line)).filter(entry => entry.type === "custom_message" &&
           entry.customType === "pi-fabric-agent-message");
-      expect(receipts()).toHaveLength(1);
-      expect(receipts()[0].details.deliveryId).toBe(queued.messageId);
+      expect(receipts()).toHaveLength(count);
+      expect(receipts().filter(entry => entry.details.deliveryId === queued.messageId)).toHaveLength(1);
       const fresh = await router.routeMessage(targetId, "fresh request", undefined, "followUp", undefined,
         { idempotencyKey: "after-readiness" });
       expect(fresh.messageId).not.toBe(queued.messageId);
-      expect(native).toHaveLength(2);
-      expect(receipts()).toHaveLength(2);
+      expect(native).toHaveLength(count + 1);
+      expect(receipts()).toHaveLength(count + 1);
     } finally {
       await source.close(); await directory.close();
     }
@@ -224,8 +267,23 @@ describe("same-session native Main startup inbox", () => {
     receiver.start(command => { accepted.push(command.message!); return { accepted: true }; });
     await vi.waitFor(() => expect(drained).toBe(true));
     expect(accepted).toEqual([]);
-    release(); await pending;
-    await vi.waitFor(() => expect(privateRows(receiver.mesh, id)[0]!.value.acceptance?.accepted).toBe(true));
+    // Crash after receipt durability but before payload compaction: replay must
+    // finish unlinking without calling even the control handler a second time.
+    const unlink = fs.unlinkSync;
+    let pruneGap = true;
+    vi.spyOn(fs, "unlinkSync").mockImplementation(file => {
+      if (pruneGap && path.dirname(String(file)) === startupInbox.startingInboxRoot(root, id) &&
+        /^[a-f0-9]{64}\.json$/.test(path.basename(String(file)))) {
+        pruneGap = false;
+        throw Object.assign(new Error("injected receipt/prune gap"), { code: "FABRIC_MESH_LOCK_TIMEOUT" });
+      }
+      return unlink(file);
+    });
+    release(); const queued = await pending;
+    await vi.waitFor(() => expect(startupInbox.readStartingFollowUpCompletion(
+      startupInbox.startingInboxRoot(root, id), queued.messageId)).toBeDefined());
+    await vi.waitFor(() => expect(privateRows(receiver.mesh, id)).toEqual([]));
+    expect(pruneGap).toBe(false);
     expect(accepted).toEqual(["after initial drain"]);
     await directory.close();
   });

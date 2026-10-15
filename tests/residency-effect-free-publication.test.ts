@@ -14,6 +14,7 @@ import { LIVENESS_POLICY_KEY, readHostLease } from "../src/topology/host-leases.
 import { readParticipantFile } from "../src/topology/participant-files.js";
 import * as fileLock from "../src/residency/file-lock.js";
 import * as removal from "../src/storage/verified-remove.js";
+import * as atomic from "../src/core/atomic-write.js";
 
 const participantKey = (id: string) => "topology/participants/" + createHash("sha256").update(id).digest("hex");
 const fixtureRemove = fs.rmSync.bind(fs); // Only the freshly allocated fixture root may actually be removed.
@@ -83,6 +84,10 @@ const recordDeletes = (root: string) => {
 
 const fixture = async (files = false, backend: "file" | "sqlite" = "file") => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "effect-free-publication-"));
+  // ParticipantDirectory prepares this memoized native identity before publication fencing.
+  // Its one-time Windows PowerShell probe is startup, not idle heartbeat work (#7651).
+  // Prime it before the strict no-child guard, as for the unrelated native host lock below.
+  await atomic.ownProcessIncarnation();
   const safety = recordDeletes(root);
   // This probe does not test the unrelated native host-startup flock helper.
   // Keep its real descriptor/inode checks, but avoid launching a child process.

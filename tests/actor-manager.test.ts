@@ -3945,8 +3945,14 @@ describe("ActorManager", () => {
     const clock = () => {
       const realNow = Date.now.bind(Date);
       let skew = 0;
-      vi.spyOn(Date, "now").mockImplementation(() => realNow() + skew);
-      return { set: (at: number) => { skew = at - realNow(); } };
+      const now = vi.spyOn(Date, "now");
+      const advance = () => now.mockImplementation(() => realNow() + skew);
+      advance();
+      return {
+        set: (at: number) => { skew = at - realNow(); advance(); },
+        // Exact boundary reads must not cross expiry on a real clock tick (Windows can tick by ~16 ms).
+        freeze: (at: number) => { now.mockReturnValue(at); },
+      };
     };
     // Real timers keep running; the wake is captured so the test can fire it at the faked expiry.
     const captureWakes = () => {
@@ -4369,11 +4375,12 @@ describe("ActorManager", () => {
           .find((row) => row.id === actor.id)!.activationBlocked;
         expect(stored).toEqual(blocked);
         expect(restored.status(actor.id).activationBlocked).toEqual(blocked);
-        time.set(blocked.retryAt! - 1);
+        time.freeze(blocked.retryAt! - 1);
         expect(restored.status(actor.id)).not.toHaveProperty("activationBlockExpired");
-        time.set(blocked.retryAt! + 1);
+        time.freeze(blocked.retryAt! + 1);
         expect(restored.status(actor.id).activationBlockExpired).toMatchObject({ class: "transient", blockedAt: blocked.blockedAt,
           backoffMs: blocked.backoffMs, expiredAt: blocked.retryAt });
+        time.set(blocked.retryAt! + 1); // Resume wall-clock progress before asynchronous probe/wait deadlines.
         await failOnce(restored, s.agents, actor.id);                                  // the probe after restart fails: doubled again
         expect(restored.status(actor.id).activationBlocked).toMatchObject({ backoffMs: 4 * ACTOR_TRANSIENT_BLOCK_BACKOFF_MS });
       }, 60_000);

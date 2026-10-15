@@ -1,4 +1,5 @@
 import { createRequire } from "node:module";
+import { detachedPreview } from "../core/preview.js";
 import type { parser as PythonParser } from "@lezer/python";
 
 const require = createRequire(import.meta.url);
@@ -219,7 +220,7 @@ export function prepareMontySource(code: string, payloads: Record<string, string
 }
 
 export function montyErrorText(error: unknown, prepared?: PreparedSource): string {
-  const bound = (text: string): string => text.length <= 16000 ? text : text.slice(0, 7900) + "\n[Python traceback truncated]\n" + text.slice(-8000);
+  const bound = (text: string): string => text.length <= 16000 ? detachedPreview(text, 16000) : detachedPreview(text, 7900) + "\n[Python traceback truncated]\n" + detachedPreview(text.slice(-8000), 8000);
   if (!(error instanceof Error)) return bound(String(error));
   const native = error as Error & {
     exception?: { typeName: string; message: string };
@@ -233,7 +234,7 @@ export function montyErrorText(error: unknown, prepared?: PreparedSource): strin
     return bound(frames.length ? "Traceback (most recent call last):\n" + frames.map((frame) => {
       const line = frame.line - 1;
       const name = frame.functionName === "__fabric_program" ? "<fabric_exec>" : frame.functionName ?? "<fabric_exec>";
-      return `  File "fabric-exec.py", line ${line}, in ${name}\n    ${prepared.lines[line - 1]!.trimStart().slice(0, 240)}`;
+      return `  File "fabric-exec.py", line ${line}, in ${name}\n    ${detachedPreview(prepared.lines[line - 1]!.trimStart(), 240)}`;
     }).join("\n") + "\n" + summary : summary);
   }
   if (native.display) {

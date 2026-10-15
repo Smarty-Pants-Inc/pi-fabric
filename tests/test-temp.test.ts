@@ -39,7 +39,7 @@ if (simulatedWindows) childProcess.default.execFileSync = (file, args, options) 
   }
   return realExecFileSync(file, args, options);
 };
-const { default: config } = await import(pathToFileURL(path.resolve("vitest.config.ts")).href);
+const { default: config } = await import(pathToFileURL(path.resolve("vitest.config.cts")).href);
 const { isolatedTestTemp, isolateTestFleetEnvironment } = await import(pathToFileURL(path.resolve("scripts/test-temp.ts")).href);
 const root = config.test.env.TMPDIR;
 if (simulatedWindows) {
@@ -386,7 +386,7 @@ describe("test temporary-storage isolation", () => {
   it.skipIf(process.platform === "win32").each([0, 7])("runs registered teardown before process exit %i without deleting its caller", (exitCode) => {
     const caller = mkdtempSync(join(tmpdir(), "teardown-probe-"));
     try {
-      const config = new URL("../vitest.config.ts", import.meta.url).href;
+      const config = new URL("../vitest.config.cts", import.meta.url).href;
       const result = spawnSync("bun", ["-e", `
         import assert from "node:assert/strict";
         import fs from "node:fs";

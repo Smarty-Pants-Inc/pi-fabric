@@ -464,13 +464,13 @@ describe("notification-driven bridge (smarty-dev#7299 A5)", () => {
     renew(f.far.root, expiry); // host-leases mkdir after watch setup
     // Renewal-only updates are pending until the half-lease flush; actual work demands fresh authority now.
     await f.far.publish({ topic: "fleet.work.notify.7299", kind: "probe", from: lane.identity, to: "absent" });
-    await until(() => (readHostLeases(f.hub.root).get(lane.id)?.expiresAt ?? 0) >= expiry);
+    await until(() => (readHostLeases(f.hub.root).get(lane.id)?.mirror?.sourceExpiresAt ?? 0) >= expiry);
     const nextExpiry = Date.now() + 14_000;
     renew(replacement, nextExpiry);
     fs.renameSync(path.join(f.far.root, "host-leases"), path.join(f.root, "old-leases"));
     fs.renameSync(path.join(replacement, "host-leases"), path.join(f.far.root, "host-leases"));
     await f.far.publish({ topic: "fleet.work.notify.7299", kind: "probe", from: lane.identity, to: "absent" });
-    await until(() => (readHostLeases(f.hub.root).get(lane.id)?.expiresAt ?? 0) >= nextExpiry);
+    await until(() => (readHostLeases(f.hub.root).get(lane.id)?.mirror?.sourceExpiresAt ?? 0) >= nextExpiry);
     // Own mirror/lease writes and cursor renames settle, rather than feeding a renewal loop.
     await settle();
     const mirrors = vi.spyOn(f.local, "mirror");

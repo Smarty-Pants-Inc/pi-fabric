@@ -2,6 +2,9 @@ import fs from "node:fs";
 import type { FabricActorInfo, FabricActorRequest, FabricActorStorageScope } from "./types.js";
 import { ActorManager } from "./manager.js";
 import { SessionActorOrphans } from "./session-orphans.js";
+import { ActorSlotRecovery } from "./slot-recovery.js";
+import { slotAdmissionFor } from "./slot-admission.js";
+import { ActorRegistryStore } from "./registry-store.js";
 
 /**
  * Run every halt step even when one throws, then report every failure at once: a scope
@@ -26,14 +29,28 @@ export interface ActorDirectoryRoots {
 export class ActorDirectory extends ActorManager {
   readonly #secondary: ActorManager;
   readonly #defaultScope: FabricActorStorageScope;
+  readonly #slotRegistryRoots: ActorDirectoryRoots;
+  readonly #slotCallerId: string;
   readonly #sessionOrphans: SessionActorOrphans | undefined;
+  #orphanReconcilePending: Promise<number> | undefined;
+  readonly #orphanRetirements = new Set<Promise<unknown>>();
+  // Startup releasePaused is activation-only; explicit pauseForRelease owns this fence.
+  #orphanReconcileHeld = false;
+  #releaseCheckpointReady = false;
 
   constructor(
     base: ConstructorParameters<typeof ActorManager>,
     roots: ActorDirectoryRoots,
     defaultScope: FabricActorStorageScope,
   ) {
-    const options = { ...(base[6] ?? {}) };
+    const options = { ...(base[6] ?? {}), slotRecovery: base[6]?.slotRecovery ?? new ActorSlotRecovery(),
+      // Delegated create acquires once in its target manager, never recursively here.
+      creationNameReservations: base[6]?.creationNameReservations ?? new Set<string>(),
+      // Both managers (including startup recovery) fence actual registry rows,
+      // not list() views which intentionally hide quarantined protected actors.
+      slotNameRegistries: base[6]?.persistent === true
+        ? [new ActorRegistryStore(roots.project), new ActorRegistryStore(roots.session)] : [],
+    };
     const meshCursorPath = options.meshCursorPath;
     delete options.actorRoot;
     delete options.meshCursorPath;
@@ -67,6 +84,8 @@ export class ActorDirectory extends ActorManager {
       actorScope: secondaryScope,
     });
     this.#defaultScope = defaultScope;
+    this.#slotRegistryRoots = { ...roots };
+    this.#slotCallerId = options.rootId ?? base[1].id;
     this.#sessionOrphans = persistent && base[3].enabled
       // A resident host outlives Main and must also observe Main's own private
       // session registry. A Main never repairs its current session's records.
@@ -110,11 +129,17 @@ export class ActorDirectory extends ActorManager {
     // A predecessor whose removal is pending finishes behind its run, not in this create's way.
     const sameName = this.#localActors().filter((actor) => actor.name === name && !actor.removal && !actor.sessionOrphan);
     const existing = sameName.find((actor) => actor.status !== "stopped");
-    if (existing) throw new Error(`A Fabric actor named ${name} is already active (${existing.id})`);
+    const slots = slotAdmissionFor(this.mesh);
+    const protectedBirth = slots.requiresEnforcement(request.topics ?? [], this.#slotRegistryRoots[scope], this.#slotCallerId);
+    // Exact protected retries must reach the ledger. The target manager rejects
+    // same-scope ordinary conflicts before intent; cross-scope cleanup stays in
+    // the post-admission hook, with projection parked while any native row remains.
+    if (existing && !protectedBirth) throw new Error(`A Fabric actor named ${name} is already active (${existing.id})`);
     const fencedOptions = {
       ...options,
-      beforeCommit: async (id: string): Promise<void> => {
-        await options.beforeCommit?.(id);
+      beforeMaterialize: async (id: string): Promise<void> => {
+        await options.beforeMaterialize?.(id);
+        // This hook runs only AFTER durable admission, never in SQL beforeCommit.
         // Cross-scope predecessor removal is part of this create's mutation too.
         for (const actor of sameName.filter((actor) => actor.scope !== scope)) {
           options.checkActive?.();
@@ -127,7 +152,37 @@ export class ActorDirectory extends ActorManager {
       : this.#secondary.create(request, fencedOptions);
   }
   #localActors(): FabricActorInfo[] { return [...super.list(), ...this.#secondary.list()]; }
-  override reconcileSessionOrphans(): Promise<number> { return this.#sessionOrphans?.reconcile() ?? Promise.resolve(0); }
+  override reconcileSessionOrphans(): Promise<number> {
+    if (this.#orphanReconcileHeld || this.releaseAdmissionHeld || !this.#sessionOrphans) return Promise.resolve(0);
+    if (this.#orphanReconcilePending) return this.#orphanReconcilePending;
+    const pending = this.#sessionOrphans.reconcile(() => {
+      if (this.#orphanReconcileHeld || this.releaseAdmissionHeld) throw new Error("Actor directory is paused for release");
+    }).finally(() => {
+      if (this.#orphanReconcilePending === pending) this.#orphanReconcilePending = undefined;
+    });
+    return this.#orphanReconcilePending = pending;
+  }
+  override validateSessionActorTombstone(...args: Parameters<ActorManager["validateSessionActorTombstone"]>): ReturnType<ActorManager["validateSessionActorTombstone"]> {
+    return this.#sessionOrphans?.validateTombstone(...args);
+  }
+  override retireSessionOrphan(id: string, checkActive: () => void): ReturnType<ActorManager["retireSessionOrphan"]> {
+    if (!this.#sessionOrphans || this.cleanupObligation(id) || this.#finishingScope(id)) return Promise.resolve(undefined);
+    // Preserve ordinary local exact-id/name/prefix and in-flight removal precedence.
+    try { this.#isPrimary(id); return Promise.resolve(undefined); }
+    catch (error) { if (!(error instanceof Error && /Unknown Fabric actor/.test(error.message))) throw error; }
+    const check = () => {
+      checkActive();
+      if (this.#orphanReconcileHeld || this.releaseAdmissionHeld) throw new Error("Actor directory is paused for release");
+      if (this.cleanupObligation(id) || this.#finishingScope(id)) throw new Error("Local actor removal target changed; retry selection");
+      try { this.#isPrimary(id); }
+      catch (error) { if (error instanceof Error && /Unknown Fabric actor/.test(error.message)) return; throw error; }
+      throw new Error("Local actor target appeared during orphan retirement; retry selection");
+    };
+    check();
+    const pending = this.#sessionOrphans.retire(id, check).finally(() => this.#orphanRetirements.delete(pending));
+    this.#orphanRetirements.add(pending);
+    return pending;
+  }
   override list(): FabricActorInfo[] {
     // Synchronous internal/UI reads schedule work; public provider reads await it.
     void this.reconcileSessionOrphans().catch(() => undefined);
@@ -156,7 +211,23 @@ export class ActorDirectory extends ActorManager {
       throw error;
     }
   }
-  override owns(...args: Parameters<ActorManager["owns"]>): ReturnType<ActorManager["owns"]> { try { return this.#isPrimary(args[0]) ? super.owns(...args) : this.#secondary.owns(...args); } catch { return false; } }
+  override owns(...args: Parameters<ActorManager["owns"]>): ReturnType<ActorManager["owns"]> {
+    try {
+      const finishing = this.#finishingScope(args[0]);
+      if (finishing) return finishing === "primary" ? super.owns(...args) : this.#secondary.owns(...args);
+      return this.#isPrimary(args[0]) ? super.owns(...args) : this.#secondary.owns(...args);
+    } catch { return false; }
+  }
+  override finishingRemoval(id: string): ReturnType<ActorManager["finishingRemoval"]> {
+    const finishing = this.#finishingScope(id);
+    return finishing === "primary" ? super.finishingRemoval(id) : finishing ? this.#secondary.finishingRemoval(id) : undefined;
+  }
+  /** smarty-dev#11105: exact-id route to the manager whose removal commit is in flight; never by name or prefix. */
+  #finishingScope(id: string): "primary" | "secondary" | undefined {
+    const primary = super.finishingRemoval(id) !== undefined, secondary = this.#secondary.finishingRemoval(id) !== undefined;
+    if (primary && secondary) throw new Error(`Ambiguous Fabric actor: ${id}`);
+    return primary ? "primary" : secondary ? "secondary" : undefined;
+  }
   override resolveBinding(...args: Parameters<ActorManager["resolveBinding"]>): ReturnType<ActorManager["resolveBinding"]> { return this.#isPrimary(args[0]) ? super.resolveBinding(...args) : this.#secondary.resolveBinding(...args); }
   override resolveActivationBinding(...args: Parameters<ActorManager["resolveActivationBinding"]>): ReturnType<ActorManager["resolveActivationBinding"]> { return this.#isPrimary(args[0]) ? super.resolveActivationBinding(...args) : this.#secondary.resolveActivationBinding(...args); }
   override setModel(...args: Parameters<ActorManager["setModel"]>): ReturnType<ActorManager["setModel"]> { return this.#isPrimary(args[0]) ? super.setModel(...args) : this.#secondary.setModel(...args); }
@@ -197,6 +268,9 @@ export class ActorDirectory extends ActorManager {
   override inFlightActorIds(): string[] { return [...super.inFlightActorIds(), ...this.#secondary.inFlightActorIds()]; }
   override reportStuckPreparing(...args: Parameters<ActorManager["reportStuckPreparing"]>): number { return super.reportStuckPreparing(...args) + this.#secondary.reportStuckPreparing(...args); }
   override inFlightCount(): number { return super.inFlightCount() + this.#secondary.inFlightCount(); }
+  override releaseCustodyCount(): number {
+    return super.releaseCustodyCount() + this.#secondary.releaseCustodyCount() + (this.#orphanReconcilePending ? 1 : 0) + this.#orphanRetirements.size;
+  }
   override haltAll(): { halted: number } {
     return { halted: haltEvery([() => super.haltAll().halted, () => this.#secondary.haltAll().halted]) };
   }
@@ -210,13 +284,49 @@ export class ActorDirectory extends ActorManager {
     // Cleanup obligations route only by exact id, never by name or prefix.
     if (super.cleanupObligation(args[0])) return super.remove(...args);
     if (this.#secondary.cleanupObligation(args[0])) return this.#secondary.remove(...args);
+    const finishing = this.#finishingScope(args[0]);
+    if (finishing) return finishing === "primary" ? super.remove(...args) : this.#secondary.remove(...args);
     return this.#isPrimary(args[0]) ? super.remove(...args) : this.#secondary.remove(...args);
   }
-  override pauseForRelease(): void { super.pauseForRelease(); this.#secondary.pauseForRelease(); }
-  override resumeAfterRelease(): void { super.resumeAfterRelease(); this.#secondary.resumeAfterRelease(); }
-  override async checkpointForRelease(): Promise<void> { await super.checkpointForRelease(); await this.#secondary.checkpointForRelease(); }
+  override get releaseAdmissionHeld(): boolean { return super.releaseAdmissionHeld && this.#secondary.releaseAdmissionHeld; }
+  override pauseForRelease(options: Parameters<ActorManager["pauseForRelease"]>[0] = {}): void {
+    this.#releaseCheckpointReady = false;
+    // Even an activation-only pause must prevent read-triggered reconciliation
+    // from opening fresh custody while the directory joins its prior checkpoint work.
+    this.#orphanReconcileHeld = true;
+    super.pauseForRelease(options); this.#secondary.pauseForRelease(options);
+  }
+  override resumeAfterRelease(): void {
+    this.#releaseCheckpointReady = false;
+    this.#orphanReconcileHeld = false;
+    super.resumeAfterRelease(); this.#secondary.resumeAfterRelease();
+  }
+  override withReleaseAdmission<T>(admit: () => T): T {
+    return super.withReleaseAdmission(() => this.#secondary.withReleaseAdmission(admit));
+  }
+  override async checkpointForRelease(assertHeld?: () => void): Promise<void> {
+    this.#releaseCheckpointReady = false;
+    assertHeld?.();
+    if (this.#orphanReconcilePending) {
+      assertHeld?.(); await this.#orphanReconcilePending; assertHeld?.();
+    }
+    await Promise.all(this.#orphanRetirements);
+    assertHeld?.();
+    await super.checkpointForRelease(assertHeld);
+    assertHeld?.();
+    await this.#secondary.checkpointForRelease(assertHeld);
+    assertHeld?.();
+    this.#releaseCheckpointReady = true;
+    this.releaseCheckpointReceipt();
+  }
+  override releaseCheckpointReceipt(): unknown {
+    if (!this.#releaseCheckpointReady) throw new Error("Both actor scopes have not checkpointed");
+    const primary = super.releaseCheckpointReceipt(), secondary = this.#secondary.releaseCheckpointReceipt();
+    return this.#defaultScope === "project" ? { project: primary, session: secondary } : { project: secondary, session: primary };
+  }
   override async close(): Promise<void> {
     await this.#sessionOrphans?.close();
+    await Promise.all(this.#orphanRetirements);
     await Promise.all([super.close(), this.#secondary.close()]);
   }
 }

@@ -4,7 +4,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { copyFabricProvenance, fabricProvenanceOptions } from "../fabric-provenance.js";
 import { followUpFile, followUpState, settleFollowUp, followUpMessage, followUpMessageId, releaseFollowUpPayload } from "../agents/follow-up-delivery.js";
 import { readFinalAnswerReceipt } from "./terminal-answer.js";
-import { readTerminalControl, settleTerminalControl, terminalControlMessage, terminalControlMessageId } from "./terminal-controls.js";
+import { readTerminalControl, settleTerminalControl, terminalControlInputId, terminalControlMessage, terminalControlMessageId } from "./terminal-controls.js";
 
 /** Worker-owned files, not RPC/prompt fields, carry admission into the trusted extension. */
 export default function principalDelivery(pi: ExtensionAPI): void {
@@ -15,8 +15,13 @@ export default function principalDelivery(pi: ExtensionAPI): void {
   const terminal = (): boolean => terminalTask && Boolean(readFinalAnswerReceipt(runDirectory, process.env.PI_FABRIC_PARENT_RUN ?? ""));
   const held = new Map<string, () => void>();
   const submitted = new Set<string>();
+  const discardHeld = (): void => {
+    for (const id of held.keys()) settleTerminalControl(runDirectory, id, "refused");
+    held.clear();
+  };
+  if (terminalTask) process.on("fabric-terminal-answer", directory => { if (directory === runDirectory) discardHeld(); });
   const flush = (event: { outcome?: string }, ctx: ExtensionContext): void => {
-    if (terminal()) { held.clear(); return; }
+    if (terminal()) { discardHeld(); return; }
     if (ctx.signal?.aborted || event.outcome === "aborted" || event.outcome === "error") return;
     for (const [id, deliver] of held) { deliver(); held.delete(id); }
   };
@@ -30,7 +35,11 @@ export default function principalDelivery(pi: ExtensionAPI): void {
     // native queue admission is not consumption. Cancellation can win at either
     // gate, including after a message has entered a one-at-a-time native queue.
     pi.on("input", event => {
-      if (terminal()) return { action: "handled" };
+      if (terminal()) {
+        const controlId = terminalControlInputId(event.text);
+        if (controlId) settleTerminalControl(runDirectory, controlId, "refused");
+        return { action: "handled" };
+      }
       const id = event.source === "extension" ? followUpMessageId(event.text) : undefined;
       if (id && followUpState(followUpFile(runDirectory, id)) !== "queued") return { action: "handled" };
     });
@@ -57,7 +66,8 @@ export default function principalDelivery(pi: ExtensionAPI): void {
         if (first?.type !== "text") return [message];
         const controlId = terminalTask ? terminalControlMessageId(first.text) : undefined;
         if (controlId) {
-          if (terminal() || readTerminalControl(runDirectory, controlId)?.state === "refused") return [];
+          if (terminal()) { settleTerminalControl(runDirectory, controlId, "refused"); return []; }
+          if (readTerminalControl(runDirectory, controlId)?.state === "refused") return [];
           message = { ...message, content: [{ ...first, text: first.text.slice(terminalControlMessage(controlId, "").length) }, ...message.content.slice(1)] };
         }
         const content = message.content as typeof message.content & Array<{ type: string; text: string }>;
@@ -94,7 +104,7 @@ export default function principalDelivery(pi: ExtensionAPI): void {
     description: "Consume one private Fabric worker delivery (host-only)",
     handler: async (id, ctx) => {
       if (!/^[0-9a-f-]{36}$/.test(id)) throw new Error("Invalid Fabric delivery id");
-      if (terminal()) return;
+      if (terminal()) { settleTerminalControl(runDirectory, id, "refused"); return; }
       const file = path.join(directory, id + ".json");
       const receipt = followUpFile(runDirectory, id);
       // Cancellation may release an envelope before its command is ingested.
@@ -114,7 +124,8 @@ export default function principalDelivery(pi: ExtensionAPI): void {
         const admission = JSON.parse(fs.readFileSync(receipt, "utf8"));
         if (admission.messageId !== id || !Number.isSafeInteger(admission.deadlineAt)) throw new Error("Invalid follow-up admission");
         const deliver = (): void => {
-          if (terminal() || submitted.has(id) || followUpState(receipt) !== "queued") return;
+          if (terminal()) { if (control) settleTerminalControl(runDirectory, id, "refused"); return; }
+          if (submitted.has(id) || followUpState(receipt) !== "queued") return;
           submitted.add(id);
           const trackedText = followUpMessage(id, item.message as string);
           const identifiedText = control ? terminalControlMessage(id, trackedText) : trackedText;

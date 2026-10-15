@@ -5,6 +5,8 @@ import fs from "node:fs";
 import path from "node:path";
 const configPath = process.argv[process.argv.indexOf("--config") + 1];
 const dir = path.dirname(configPath);
+const launchToken = process.argv[process.argv.indexOf("--launch-token") + 1];
+fs.writeFileSync(path.join(dir, "stubborn-launch-token"), launchToken ?? "");
 process.on("SIGTERM", () => {});
 const child = spawn(process.execPath, ["-e", `
   const fs = require("node:fs");

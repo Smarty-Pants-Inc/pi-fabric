@@ -7,6 +7,7 @@ import { isMeshStateMovedMarker, readMeshStateMovedMarker } from "../mesh/backen
 import { meshStateDocumentProblem } from "../mesh/state-file.js";
 import { setWindowsVerifiedRemoval, startRemovalTally, stopRemovalTally, windowsPrivate, windowsRemoveHelper, type DeleterTally } from "./verified-remove.js";
 import { sweepResidentRuns } from "../residency/retention.js";
+import { sweepResidentGenerationRecords } from "../residency/generation-retention.js";
 import { compactTerminalRunEvents, pruneActorRunArchives, pruneActorSessionBackups, registryReferences } from "./retention.js";
 import { ownedStat, processAlive } from "./scratch.js";
 
@@ -238,7 +239,7 @@ const sweep = async (meshRoot: string, options: {
   // Windows: no uid/mode, so any registry change stops planning (fail closed); smarty-dev#7858
   // smarty-dev#976 B1: the project store's withLock dir actors/actors.json.lock is a new inode per generation. Only an
   // owned private actual directory, empty or holding only an owned private single-link regular `owner` with a valid
-  // token/pid/time(/start) record read through O_NOFOLLOW, earns the kind+dev+uid role. Safe shape with missing, torn or
+  // token/pid/time(/start[/label]) record read through O_NOFOLLOW, earns the kind+dev+uid role. Safe shape with missing, torn or
   // malformed content: undefined (unknown, no identity recorded). Any physically unsafe shape: the exact raw identity.
   const lockIdentity = (stat: fs.Stats): string | undefined | false => {
     const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
@@ -274,7 +275,9 @@ const sweep = async (meshRoot: string, options: {
     if (after && (!after.isDirectory() || after.uid !== uid || (after.mode & 0o077) !== 0)) return false;
     if (!after || after.dev !== stat.dev || after.ino !== stat.ino || after.mode !== stat.mode || after.uid !== stat.uid ||
         after.mtimeMs !== stat.mtimeMs || after.ctimeMs !== stat.ctimeMs || after.nlink !== stat.nlink) return undefined;
-    const fields = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\n([1-9]\d*)\n(0|[1-9]\d*)\n(?:\d+\n)?$/.exec(record);
+    // ponytail (#8526): exact legacy 3/4 fields or 5 with a bounded ASCII label; empty start needs that label.
+    // Absolute EOF keeps extra fields, including an extra empty field, unknown.
+    const fields = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\n([1-9]\d*)\n(0|[1-9]\d*)\n(?:\d+\n|\d*\n[\x20-\x7e]{1,64}\n)?(?![\s\S])/.exec(record);
     return fields && Number.isSafeInteger(Number(fields[1])) && Number.isSafeInteger(Number(fields[2]))
       ? `directory\0${stat.dev}\0uid:${uid}\0project-registry-lock` : undefined;
   };
@@ -508,6 +511,8 @@ const sweep = async (meshRoot: string, options: {
       }
     };
     for (const [rootId, root] of residents) await fenced(rootId, root, veto => {
+      // Always preview stale diagnostic records under the dead host's own flock fence; apply remains unreachable.
+      sweepResidentGenerationRecords(root, now, veto, true, change => changes.push(change));
       // The dead host's own startup sweep, under its flock fence: the same exit, tree,
       // preserved-result and latest-run fences as a live host's removal (smarty-dev#3252).
       if (options.runRetentionMs !== undefined) {
@@ -553,7 +558,7 @@ const sweep = async (meshRoot: string, options: {
       for (const rootId of rootIds) await fenced(rootId, residents.get(rootId)!, async veto => {
         try {
           if (!absent(path.join(registryRoot, "actors.json.lock"))) throw new Error("actor registry has a holder or uncertain lock");
-          if (dryRun) prune(rootId, veto); else await new ActorRegistryStore(registryRoot).withLock(() => prune(rootId, veto));
+          if (dryRun) prune(rootId, veto); else await new ActorRegistryStore(registryRoot).withLock(() => prune(rootId, veto), undefined, "retention");
         } catch (error) { skipped.push({ path: registryRoot, reason: String(error) }); }
       });
     }

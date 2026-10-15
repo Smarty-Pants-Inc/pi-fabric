@@ -13,6 +13,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { writeFileAtomic, writeJsonAtomic } from "../core/atomic-write.js";
+import { resolveOfflineMeshStateBackend } from "../mesh/backend-fence.js";
+import { meshStateDocumentProblem } from "../mesh/state-file.js";
 import { MeshStore } from "../mesh/store.js";
 import { lockFile } from "../residency/file-lock.js";
 import { ownProcessIncarnation } from "../core/atomic-write.js";
@@ -348,8 +350,10 @@ export const removeActorOffline = async (directory: string, config: ResidentHost
         path.resolve(config2.residencyRoot) !== path.resolve(directory) || config2.meshRoot !== config.meshRoot) {
       throw new Error("Resident root identity changed under the fence");
     }
+    // Prove the source before constructing a store, looking up actors/pending records or reading liveness.
+    const stateBackend = resolveOfflineMeshStateBackend(config.meshRoot, meshStateDocumentProblem);
     mesh = new MeshStore(config.meshRoot, config.mesh.maxEventBytes, config.mesh.maxReadEvents,
-      { lockProtocol: config.mesh.lockProtocol, stateBackend: config.mesh.stateBackend });
+      { lockProtocol: config.mesh.lockProtocol, stateBackend });
     // Input errors first: resolve the actor before any liveness or identity check.
     // Exact id/name within this root's durable actors only, as the live operator path.
     const matches: Array<{ store: ActorRegistryStore; root: string; row: Row }> = [];
@@ -500,7 +504,7 @@ export const removeActorOffline = async (directory: string, config: ResidentHost
         const current = store.snapshot().actors;
         if (!current.some(actor => actor.id === id)) return;
         store.write(current.filter(actor => actor.id !== id), { durable: true });
-      });
+      }, undefined, "remove-offline");
       if (store.snapshot().actors.some(actor => actor.id === id)) throw new Error(`Fabric actor ${id}: registry revocation did not commit`);
       await offlineRemovalHooks.afterStep?.("revoke");
       await check();

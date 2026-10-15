@@ -3,6 +3,7 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
+import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import type { CapturedToolCatalog } from "../src/capture/catalog.js";
 import { registerFabricCommand } from "../src/commands/fabric.js";
 import { FABRIC_PREWALK_REQUEST_EVENT } from "../src/protocol.js";
@@ -14,6 +15,30 @@ import type { FabricState } from "../src/fabric-state.js";
 import type { FabricUiController } from "../src/ui/controller.js";
 
 describe("/fabric command", () => {
+  it("appends observation-degraded labels to status and adds nothing when health recovers", async () => {
+    let handler!: (args: string, context: ExtensionContext) => Promise<void>;
+    const pi = { registerCommand: (_name: string, command: { handler: typeof handler }) => { handler = command.handler; } } as unknown as ExtensionAPI;
+    let health: string[] = [];
+    const state = {
+      ensure: vi.fn(async () => {}), cwd: "project", config: DEFAULT_FABRIC_CONFIG,
+      registry: { providers: () => [] }, actors: { list: () => [] }, mesh: { root: "mesh" },
+      prewalk: { status: () => ({ state: "idle" }) }, foregroundTools: () => [],
+      observationHealth: () => health,
+    } as unknown as FabricState;
+    const notify = vi.fn();
+    const context = { ui: { notify } } as unknown as ExtensionContext;
+    registerFabricCommand(pi, { state, fabricUi: {} as FabricUiController, capturedTools: { size: 0 } as CapturedToolCatalog,
+      applyFabricMode: vi.fn(), suspendToolCapture: vi.fn() });
+    await handler("status", context);
+    const healthy = notify.mock.lastCall![0];
+    expect(healthy).not.toContain("observation-");
+    health = ["observation-degraded:configuration", "observation-degraded:lifecycle", "observation-degraded:control-plane", "observation-degraded:residency"];
+    await handler("status", context);
+    expect(notify).toHaveBeenLastCalledWith(healthy + "\n" + health.join("\n"), "info");
+    health = [];
+    await handler("status", context);
+    expect(notify).toHaveBeenLastCalledWith(healthy, "info");
+  });
   it("opens the dashboard when invoked without arguments", async () => {
     let handler: ((argumentsText: string, context: ExtensionContext) => Promise<void>) | undefined;
     const pi = {

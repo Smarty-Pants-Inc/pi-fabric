@@ -75,16 +75,16 @@ describe("actor state alarms (smarty-dev#9332)", () => {
     const alarmKey = actorAlarmKey(actor.id, "actor-stopped");
     const alarm = s.mesh.get(alarmKey);
     const sentinel = path.join(path.dirname(actor.sessionFile!), "kept-11335.txt");
-    if (process.platform !== "linux") {
+    if (process.platform !== "linux" && process.platform !== "darwin" && process.platform !== "win32") {
       expect(alarm).toBeDefined();
       fs.writeFileSync(sentinel, "history\n");
     }
     const removal = await s.actors.remove(actor.id);
-    if (process.platform === "linux") {
+    if (process.platform === "linux" || process.platform === "darwin" || process.platform === "win32") {
       expect(s.mesh.get(actorAlarmKey(actor.id, "actor-stopped"))).toBeUndefined();
     } else {
-      // smarty-dev#8090 / follow-up smarty-dev#11335: registry revocation commits, but the guarded tree delete refuses
-      // before alarm-key cleanup. The cleanup obligation remains pending while no new alarms are eligible.
+      // smarty-dev#8090 / follow-up smarty-dev#11335: on unsupported platforms registry revocation commits,
+      // but tree deletion refuses before alarm-key cleanup. Cleanup stays pending; no new alarms are eligible.
       expect(removal).toEqual({ removed: true, cleaned: false,
         pending: `removal cleanup failed: Root actor tree deletion needs the Main publication fence, which this platform (${process.platform}) lacks (smarty-dev#8090); follow-up smarty-dev#11335; the root session:test actor tree is kept (a later remove or host start finishes it)` });
       expect(fs.readFileSync(sentinel, "utf8")).toBe("history\n");

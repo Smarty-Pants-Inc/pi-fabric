@@ -1469,7 +1469,7 @@ describe("round 6 registered fabric_exec post-completion deadlines", { timeout: 
         vi.restoreAllMocks(); vi.mocked(childProcess.spawn).mockReset();
         const reconcile = await registeredExecution(state, main, 5_000, engine);
         const reconciled = await reconcile(`return {"status": await agents.actorStatus(id="${decision.id}"), "stop": await agents.stop(id="${decision.id}")}`);
-        expect(reconciled.isError).not.toBe(true);
+        expect(reconciled.isError, visibleText(reconciled)).not.toBe(true);
         expect(JSON.parse(visibleText(reconciled))).toMatchObject({ status: { id: decision.id }, stop: { id: decision.id, status: "stopped" } });
         await waitFor(() => state.participants.get(decision.id)?.status === "stopped");
         expect(new ActorRegistryStore(state.config.actorRoot).records()).toHaveLength(1);

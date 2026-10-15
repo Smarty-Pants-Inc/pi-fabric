@@ -59,9 +59,12 @@ describe("disk-backed previous-run index", () => {
       writeReceipt: { paths: ["/exact/path"], commands: ["echo exact"] },
     };
     const expected = structuredClone(restored);
-    const file = path.join(directory, "old-run", "manager-result.json");
-    expect(fs.existsSync(file)).toBe(false);
+    const run = path.join(directory, "old-run");
+    expect(fs.existsSync(run)).toBe(false);
     manager.restorePreviousRuns([restored]);
+    const backing = fs.readdirSync(run).filter(name => name.startsWith("manager-restored-result-"));
+    expect(backing).toHaveLength(1);
+    const file = path.join(run, backing[0]!);
     expect(JSON.parse(fs.readFileSync(file, "utf8"))).toEqual(expected);
     expect(JSON.parse(fs.readFileSync(path.join(directory, "old-run", "status.json"), "utf8"))).toEqual(expected);
     restored.text = "caller mutated source";
@@ -81,6 +84,7 @@ describe("disk-backed previous-run index", () => {
     expect(() => manager.status("old-run")).toThrow(/no saved terminal result/);
     await expect(manager.wait("old-run")).rejects.toThrow(/no saved terminal result/);
     manager.restorePreviousRuns([newer]);
+    expect(fs.readdirSync(run).filter(name => name.startsWith("manager-restored-result-"))).toHaveLength(2);
     expect(manager.status("old-run")).toEqual(newer);
     expect(await manager.wait("old-run")).toEqual(newer);
     expect(await manager.stop("old-run")).toEqual(newer);
@@ -179,11 +183,29 @@ describe("manager artifact collection proof (no deletion)", () => {
     expect(runTreeResourceVeto(run, 0, undefined, true, true)).toBeUndefined();
     writeJsonAtomic(path.join(run, "manager-nested.json"), { id: result.id, nestedAgents: [] });
     expect(canRemoveTerminalRun(run)).toBe(true);
-    // An arbitrary JSON file is still unknown, despite our two exact additions.
+    const restarted = createManager(true, { runRoot: directory }).manager;
+    restarted.restorePreviousRuns([result]);
+    expect(fs.readdirSync(run).filter(name => name.startsWith("manager-restored-result-"))).toHaveLength(1);
+    expect(canRemoveTerminalRun(run)).toBe(true);
+    // Arbitrary JSON remains unknown beside the exact manager artifacts.
     writeJsonAtomic(path.join(run, "manager-unknown.json"), { id: result.id });
     expect(canRemoveTerminalRun(run)).toBe(false);
     expect(runTreeResourceVeto(run, 0, undefined, true, true)).toBeUndefined();
     expect(fs.existsSync(path.join(run, "manager-result.json"))).toBe(true);
+  });
+
+  it.each([
+    "manager-restored-result-not-a-uuid.json",
+    "manager-restored-result-12345678-1234-1234-8234-123456789abc.json",
+    "manager-restored-result-12345678-1234-4234-7234-123456789abc.json",
+    "manager-restored-result-12345678-1234-4234-8234-123456789ABC.json",
+    "manager-restored-result-12345678-1234-4234-8234-123456789abc.json.extra",
+  ])("vetoes noncanonical restored-result filename %s", name => {
+    const run = root(), record = heapRunResult("disk-run");
+    writeJsonAtomic(path.join(run, "status.json"), record);
+    expect(canRemoveTerminalRun(run)).toBe(true);
+    writeJsonAtomic(path.join(run, name), record);
+    expect(canRemoveTerminalRun(run)).toBe(false);
   });
 
   it("does not let manager success substitute for a live or unresolved worker status", () => {

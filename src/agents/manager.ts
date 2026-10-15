@@ -3687,7 +3687,9 @@ export class AgentManager {
       // Publish BEFORE dropping any full in-memory result. A failed save throws,
       // leaving the old index/result intact and the caller's archive unconsumed.
       writeJsonAtomic(statusFile, result, { space: 2, durable: true });
-      const resultFile = path.join(directory, MANAGER_RESULT_FILE);
+      // A restored archive is a new publication, not a replacement for any
+      // original or restored generation still authenticated by another manager.
+      const resultFile = path.join(directory, `manager-restored-result-${randomUUID()}.json`);
       const fingerprint = writePrivateJsonAtomic(resultFile, result);
       this.#rememberPreviousRun(result, resultFile, fingerprint);
     }

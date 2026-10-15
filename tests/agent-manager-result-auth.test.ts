@@ -166,6 +166,9 @@ describe("authenticated manager terminal results", () => {
       expect(result.warnings).toEqual([expect.stringMatching(/manager's bounded terminal summary, not the exact result/)]);
       expect(JSON.stringify(result)).not.toContain("FORGED");
     }
+    // Recorded collection permits only absence, never a recreated foreign file.
+    writeJsonAtomic(resultFile, { ...genuine, status: "completed", text: "FORGED recreated result" });
+    await refuses(manager, genuine.id);
   });
 
   it("keeps bounded manager-owned facts after ordinary collection, not retained UI outcome payloads", async () => {
@@ -240,7 +243,7 @@ describe("authenticated manager terminal results", () => {
     expect(JSON.stringify([status, waited])).not.toContain("FORGED");
   });
 
-  it("still discovers nested worker status while the owner is live before settlement", async () => {
+  it("refreshes cached live descendants at settlement inside the discovery throttle, then freezes them", async () => {
     let alive = true, release!: () => void, childStatusFile = "";
     const closed = new Promise<void>(resolve => { release = () => { alive = false; resolve(); }; });
     releases.push(release);
@@ -257,6 +260,7 @@ describe("authenticated manager terminal results", () => {
         text: "live nested progress" });
       return handle;
     });
+    vi.spyOn(Date, "now").mockReturnValue(Date.now()); // No timer advance can expire the 500 ms cache.
     const manager = createManager(root());
     const handle = await manager.spawn({ task: "live nested discovery", transport: "process", extensions: false });
     const status = manager.status(handle.id) as AgentRunRecord;
@@ -264,8 +268,25 @@ describe("authenticated manager terminal results", () => {
     expect(status).toMatchObject({ status: "running",
       nestedAgents: [expect.objectContaining({ id: "live-child", status: "running", text: "live nested progress" })] });
     expect(nestedReads.length).toBeGreaterThan(0);
-    release();
-    await manager.stop(handle.id);
+    writeJsonAtomic(childStatusFile, { ...heapRunResult("live-child", 64), text: "final child answer" });
+    const grandchild = path.join(path.dirname(childStatusFile), "nested", "grandchild");
+    fs.mkdirSync(grandchild, { recursive: true, mode: 0o700 });
+    writeJsonAtomic(path.join(grandchild, "status.json"), { ...heapRunResult("grandchild", 64), text: "final grandchild answer" });
+    // Stop synthesizes the parent's terminal record from running status; only
+    // settlement's forced read can replace the still-cached running child.
+    const stopped = await manager.stop(handle.id);
+    expect(stopped.nestedAgents).toEqual([expect.objectContaining({ id: "live-child", status: "completed", text: "final child answer",
+      nestedAgents: [expect.objectContaining({ id: "grandchild", status: "completed", text: "final grandchild answer" })] })]);
+    writeJsonAtomic(childStatusFile, { ...heapRunResult("live-child", 64), text: "FORGED late child" });
+    writeJsonAtomic(path.join(grandchild, "status.json"), { ...heapRunResult("grandchild", 64), text: "FORGED late grandchild" });
+    const late = path.join(path.dirname(path.dirname(childStatusFile)), "late-child");
+    fs.mkdirSync(late);
+    writeJsonAtomic(path.join(late, "status.json"), heapRunResult("late-child", 64));
+    for (const result of [manager.status(handle.id) as AgentRunRecord, await manager.wait(handle.id)]) {
+      expect(result.nestedAgents).toEqual(stopped.nestedAgents);
+      expect(result.nestedAgents?.map(record => record.id)).toEqual(["live-child"]);
+      expect(JSON.stringify(result)).not.toContain("FORGED");
+    }
   });
 
   it("never adopts a late worker receipt and matching status after a no-receipt run settles", async () => {
@@ -358,6 +379,43 @@ describe("authenticated manager terminal results", () => {
     expect(fs.existsSync(preserved)).toBe(true);
   });
 
+  it("keeps original and restored generations readable across managers sharing a run root", async () => {
+    const runRoot = root(), first = createManager(runRoot);
+    const original = await first.run({ task: "reload original answer", transport: "process", extensions: false });
+    await first.close();
+    const directory = path.join(runRoot, original.id);
+    const originalFile = path.join(directory, "manager-result.json");
+    const originalBytes = fs.readFileSync(originalFile, "utf8");
+    const generations = [{ manager: first, result: original }];
+    const savedBackings: Array<{ file: string; bytes: string }> = [];
+    for (const status of ["stopped", "failed", "completed"] as const) {
+      const restored = createManager(runRoot);
+      const result = { ...original, status, text: `restored ${status} answer` };
+      restored.restorePreviousRuns([result]);
+      generations.push({ manager: restored, result });
+      const files = fs.readdirSync(directory).filter(name => name.startsWith("manager-restored-result-"));
+      expect(files).toHaveLength(savedBackings.length + 1);
+      const file = path.join(directory, files.find(name => !savedBackings.some(saved => saved.file === path.join(directory, name)))!);
+      savedBackings.push({ file, bytes: fs.readFileSync(file, "utf8") });
+      await restored.close();
+      for (const generation of generations) {
+        expect(generation.manager.status(original.id)).toEqual(generation.result);
+        expect(await generation.manager.wait(original.id)).toEqual(generation.result);
+      }
+      expect(fs.readFileSync(originalFile, "utf8")).toBe(originalBytes);
+      for (const saved of savedBackings) expect(fs.readFileSync(saved.file, "utf8")).toBe(saved.bytes);
+    }
+    // Isolation is not permission to adopt a foreign replacement of any backing.
+    writeJsonAtomic(originalFile, { ...original, text: "foreign original replacement" });
+    await refuses(first, original.id);
+    writeJsonAtomic(savedBackings[0]!.file, { ...generations[1]!.result, text: "foreign restored replacement" });
+    await refuses(generations[1]!.manager, original.id);
+    for (const generation of generations.slice(2)) {
+      expect(generation.manager.status(original.id)).toEqual(generation.result);
+      expect(await generation.manager.wait(original.id)).toEqual(generation.result);
+    }
+  });
+
   it("republishes only caller-supplied archives after restart and refuses later disk replacement", async () => {
     const runRoot = root(), first = createManager(runRoot);
     const archived = await first.run({ task: "caller archive", transport: "process", extensions: false });
@@ -371,7 +429,10 @@ describe("authenticated manager terminal results", () => {
     restarted.restorePreviousRuns([archived]);
     expect(restarted.status(archived.id)).toMatchObject(archived);
     expect(await restarted.wait(archived.id)).toMatchObject(archived);
-    writeJsonAtomic(path.join(runRoot, archived.id, "manager-result.json"), { ...archived, text: "worker replacement after restart" });
+    const directory = path.join(runRoot, archived.id);
+    const backing = fs.readdirSync(directory).filter(name => name.startsWith("manager-restored-result-"));
+    expect(backing).toHaveLength(1);
+    writeJsonAtomic(path.join(directory, backing[0]!), { ...archived, text: "worker replacement after restart" });
     await refuses(restarted, archived.id);
   });
 

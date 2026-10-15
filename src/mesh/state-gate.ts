@@ -338,7 +338,7 @@ export const createStateRoot = (root: string): void => {
 const CHECKPOINT_FLAGS = "state-checkpoint.flags";
 const stateTargets = (root: string, db: string) => {
   const file = path.join(root, db);
-  return { files: [file, `${file}-wal`, `${file}-shm`], directories: [path.join(root, CHECKPOINT_FLAGS)] };
+  return { files: [file, `${file}-wal`, `${file}-shm`, `${file}-journal`], directories: [path.join(root, CHECKPOINT_FLAGS)] };
 };
 // Every call reads the native descriptors afresh: no proof is cached or shared between calls, so an ACE added
 // between two checks (even in one synchronous turn) is seen. An existing state.db open reads once; a missing one

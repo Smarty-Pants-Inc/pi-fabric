@@ -6,10 +6,12 @@
  * Loaded only through state-gate.ts, which is not in the startup graph.
  *
  * Policy (SIDs, never localized names; deny ACEs never cancel an unsafe grant):
- * - root, state.db, -wal, -shm, flag directory: owned by the current user (TokenUser), or by BUILTIN\Administrators
+ * - root, state.db, -wal, -shm, -journal, flag directory: owned by the current user (TokenUser), or by BUILTIN\Administrators
  *   only when that is this token's default owner (an elevated run creates them so); any other default owner, and
- *   Administrators on a non-elevated run, refuses. A root this process just made private must be TokenUser's. Any grant beyond read/traverse to a SID other than the
- *   current user, SYSTEM, Administrators or TrustedInstaller refuses (every inherit-only one included, CREATOR OWNER too).
+ *   Administrators on a non-elevated run, refuses. A root this process just made private must be TokenUser's. Grants
+ *   outside the current user, SYSTEM, Administrators or TrustedInstaller may contain only READ_CONTROL, SYNCHRONIZE
+ *   and FILE_READ_ATTRIBUTES, including inherit-only grants. Only CREATOR OWNER inherit-only is excepted: every
+ *   other ACE must still pass, so no foreign user can add a child or write. CREATOR GROUP has no exception.
  * - ancestors: owned by one of those trusted SIDs; a foreign grant that applies to the ancestor itself may add
  *   files or subdirectories (the sticky analogue: C:\ grants Authenticated Users AD) and nothing else, so nobody
  *   else can delete, rename, re-ACL or take over a component. Inherit-only grants (CREATOR OWNER among them) are
@@ -34,8 +36,11 @@ const TRUSTED_SIDS = new Set([
   "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464", // TrustedInstaller
 ]);
 const ADMINISTRATORS = "S-1-5-32-544";
-// Read data, read EA, execute/traverse, read attributes, READ_CONTROL, SYNCHRONIZE, GENERIC_READ, GENERIC_EXECUTE.
+// Strict targets permit foreign metadata access only: READ_CONTROL, SYNCHRONIZE, FILE_READ_ATTRIBUTES.
+const STRICT_METADATA_RIGHTS = 0x00120080;
+// Ancestors: read data, read EA, execute/traverse, read attributes, READ_CONTROL, SYNCHRONIZE, GENERIC_READ, GENERIC_EXECUTE.
 const READ_ONLY_RIGHTS = 0xa01200a9;
+const PRIVATE_PATH_ADVICE = "use a private project folder, or set mesh.root/PI_FABRIC_MESH_ROOT to a private path";
 // FILE_ADD_FILE (write data) and FILE_ADD_SUBDIRECTORY (append data) on a directory.
 const ADD_CHILD_RIGHTS = 0x6;
 const INHERIT_ONLY = 0x08;
@@ -247,18 +252,19 @@ export const windowsStateAclRefusal = (request: WindowsStateAclRequest, run: Win
       if (!record(ace) || (ace.type !== 0 && ace.type !== 1) || !uint32(ace.flags) || (ace.flags & ~0x1f) !== 0
         || typeof ace.sid !== "string" || !SID.test(ace.sid) || !uint32(ace.mask)) return `${target} has an unsupported or unproven ACE`;
       if (ace.type === 1 || trusted(ace.sid) || (role === "creation-parent" && ace.sid === "S-1-3-0")) continue;
-      // Strict targets judge inherit-only grants too (CREATOR OWNER included): state files and the flag directory
-      // would inherit them, and the creator of a child may be a foreign user. Ordinary distant ancestors skip
-      // inherit-only access because it is not that ancestor's own access; a creation parent is the boundary at
-      // which the next component would receive it, so every foreign inheritable write grant is unsafe here.
+      // CO IO expands to the child's trusted creator. Skip only this ACE, never the remaining DACL: every other
+      // foreign allow is metadata-only on strict targets, proving no foreign add-child/write regardless of ACE order
+      // or deny ACEs. Every other inherit-only grant is judged too, including CREATOR GROUP. Ordinary ancestors skip
+      // IO access; a creation parent instead refuses foreign inheritable writes before a new component is visible.
+      if (strict && ace.sid === "S-1-3-0" && (ace.flags & INHERIT_ONLY) !== 0) continue;
       const inheritable = (ace.flags & 0x0b) !== 0; // OBJECT_INHERIT | CONTAINER_INHERIT | INHERIT_ONLY
       if (role === "ancestor" && (ace.flags & INHERIT_ONLY) !== 0) continue;
       if (role === "creation-parent" && inheritable && (ace.mask & ~READ_ONLY_RIGHTS) !== 0) {
-        return `${target}, the immediate creation parent of ${root}, grants ${ace.sid} inheritable write, delete or permission rights (mask 0x${ace.mask.toString(16)})`;
+        return `${target}, the immediate creation parent of ${root}, grants ${ace.sid} inheritable write, delete or permission rights (mask 0x${ace.mask.toString(16)}); ${PRIVATE_PATH_ADVICE}`;
       }
-      const allowed = strict ? READ_ONLY_RIGHTS : READ_ONLY_RIGHTS | ADD_CHILD_RIGHTS;
+      const allowed = strict ? STRICT_METADATA_RIGHTS : READ_ONLY_RIGHTS | ADD_CHILD_RIGHTS;
       if ((ace.mask & ~allowed) !== 0) {
-        return `${target}${strict ? "" : `, an ancestor of ${root},`} grants ${ace.sid} write, delete or permission rights (mask 0x${ace.mask.toString(16)})`;
+        return `${target}${strict ? "" : `, an ancestor of ${root},`} grants ${ace.sid} ${strict ? "read, " : ""}write, delete or permission rights (mask 0x${ace.mask.toString(16)}); ${PRIVATE_PATH_ADVICE}`;
       }
     }
   }

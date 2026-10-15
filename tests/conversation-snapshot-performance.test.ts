@@ -80,13 +80,15 @@ describe("conversation dashboard projection", () => {
     const second = createDashboardSnapshot(state, [], undefined, [], cache);
     expect(second.actors).toBe(first.actors);
     expect(second.agents).toBe(first.agents);
-    expect(state.actors.messages).toHaveBeenCalledTimes(1);
+    // Availability must be reconciled even on a cache hit: list-only rows may
+    // no longer have local details after a registry removal or session resume.
+    expect(state.actors.messages).toHaveBeenCalledTimes(2);
     records[0]!.usage.output = 80;
     const next = createDashboardSnapshot(state, [], undefined, [], cache);
     expect(next.actors[0]?.worker?.usage?.output).toBe(80);
     expect(next.actors).not.toBe(first.actors);
     cache.clear();
     createDashboardSnapshot(state, [], undefined, [], cache);
-    expect(state.actors.messages).toHaveBeenCalledTimes(3);
+    expect(state.actors.messages).toHaveBeenCalledTimes(4);
   });
 });

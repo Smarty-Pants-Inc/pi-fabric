@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import { readHostPolicy, warnAgentLandlockDisabled, type HostPolicy } from "./host-policy.js";
+export { readHostPolicy } from "./host-policy.js";
 import type { ModelRoutingConfig } from "./agents/model-route.js";
 import { parsePerCallRouting } from "./agents/per-call-config.js";
 import { normalizeAgentRouterConfig, type FabricAgentRouterConfig } from "./agents/router-config.js";
@@ -240,6 +241,9 @@ export interface FabricAgentConfig {
   transport: FabricAgentTransport;
   /** Root-policy Linux user scope slice; agent-dir values cannot relax this. */
   processSlice?: string;
+  /** Root-policy memory.max (bytes) for capped process task cgroups, with swap 0
+   * (smarty-dev#8257). Default 24 GiB; agent-dir/workspace values cannot relax it. */
+  processMemoryMaxBytes?: number;
   /** Host-only opt-in process task placement; workspace files cannot override it. */
   placement?: AgentPlacementConfig;
   /** Host-only capabilities of this execution host; never inferred from its name. */
@@ -482,6 +486,18 @@ const meshControlIncarnationFence = (value: unknown): MeshControlIncarnationFenc
   throw new Error("mesh.controlIncarnationFence must be warn or enforce");
 };
 
+/** JetStream stream num_replicas for the NATS state backend; an explicit invalid value is refused, never defaulted. */
+const meshNatsReplicas = (value: unknown): number => {
+  if (value === undefined) return 1;
+  if (typeof value === "number" && Number.isSafeInteger(value) && value >= 1) return value;
+  throw new Error("mesh.nats.replicas must be a positive integer");
+};
+
+export interface FabricMeshNatsConfig {
+  /** Stream num_replicas on create; an existing stream with a different count is refused (default 1). */
+  replicas: number;
+}
+
 export const RESIDENT_IDLE_EXIT_MS = 10 * 60_000;
 
 export interface FabricMeshConfig {
@@ -491,6 +507,8 @@ export interface FabricMeshConfig {
   lockProtocol: MeshLockProtocol;
   /** Keyed-state backend: "file" (default), "shadow", "sqlite" or "nats" (refused until built); env PI_FABRIC_MESH_STATE_BACKEND overrides. */
   stateBackend: MeshStateBackend;
+  /** NATS state-backend settings; only read when stateBackend is "nats". */
+  nats: FabricMeshNatsConfig;
   enabled: boolean;
   root?: string;
   /** Publish the Main participant at session start instead of on first Fabric use. */
@@ -674,6 +692,13 @@ export const maxExecutorMemoryLimitBytes = (
     ? Math.min(QUICKJS_MAX_MEMORY_LIMIT_BYTES, MAX_EXECUTOR_MEMORY_LIMIT_BYTES)
     : MAX_EXECUTOR_MEMORY_LIMIT_BYTES;
 
+/** Default per-task cgroup memory.max (smarty-dev#8257): 24 GiB, swap capped at 0. */
+export const DEFAULT_PROCESS_MEMORY_MAX_BYTES = 24 * 1024 ** 3;
+
+/** A positive safe integer byte count, or the 24 GiB default for absent/invalid values. */
+export const processMemoryMaxBytesValue = (value: unknown): number =>
+  typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : DEFAULT_PROCESS_MEMORY_MAX_BYTES;
+
 export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
   fullCodeMode: true,
   autoReload: true,
@@ -737,6 +762,7 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
     runner: "pi",
     transport: "process",
     hostCapabilities: [],
+    processMemoryMaxBytes: DEFAULT_PROCESS_MEMORY_MAX_BYTES,
     deniedModels: [],
     modelPolicy: { requireReason: ["gpt-6-astra"] },
     claude: { binary: "claude" },
@@ -821,6 +847,7 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
     controlIncarnationFence: "warn",
     lockProtocol: 1,
     stateBackend: "file",
+    nats: { replicas: 1 },
     enabled: true,
     announce: false,
     actorScope: "project",
@@ -920,6 +947,41 @@ const readJsonObjectFile = (filePath: string): JsonObjectFile | undefined => {
 
 const readJsonObject = (filePath: string): Record<string, unknown> | undefined =>
   readJsonObjectFile(filePath)?.document;
+
+const isJsonObject = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
+
+/**
+ * smarty-dev#11373: the NATS stream replicas from the agent layer only (`<agentDir>/fabric.json` mesh.nats.replicas),
+ * validated by meshNatsReplicas (default 1). A missing file or an absent value is 1. Read-only: no project layer,
+ * host policy, migration, quarantine, warning or write. An unreadable file, malformed JSON, a non-object document or
+ * mesh/nats section, or an invalid value is refused (throws), never defaulted to a lower replica count.
+ */
+export const loadAgentNatsReplicas = (agentDir: string): number => {
+  const filePath = path.join(agentDir, "fabric.json");
+  let source: string;
+  try {
+    source = fs.readFileSync(filePath, "utf8");
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") return meshNatsReplicas(undefined);
+    throw new Error(`mesh.nats.replicas: cannot read ${filePath}`, { cause: error });
+  }
+  let document: unknown;
+  try {
+    document = JSON.parse(source);
+  } catch {
+    // Parser diagnostics can quote config contents; expose only the path, never the raw cause.
+    throw new Error(`mesh.nats.replicas: ${filePath} is not valid JSON`);
+  }
+  if (!isJsonObject(document)) throw new Error(`mesh.nats.replicas: ${filePath} must be a JSON object`);
+  const { mesh } = document;
+  if (mesh === undefined) return meshNatsReplicas(undefined);
+  if (!isJsonObject(mesh)) throw new Error("mesh must be an object");
+  const { nats } = mesh;
+  if (nats === undefined) return meshNatsReplicas(undefined);
+  if (!isJsonObject(nats)) throw new Error("mesh.nats must be an object");
+  return meshNatsReplicas(nats.replicas);
+};
 
 const mergeObjects = (
   base: Record<string, unknown>,
@@ -1476,6 +1538,7 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
       transport: transportValue(agents.transport, DEFAULT_FABRIC_CONFIG.agents.transport),
       ...(typeof agents.processSlice === "string" && /^[a-zA-Z0-9_.-]+\.slice$/.test(agents.processSlice)
         ? { processSlice: agents.processSlice } : {}),
+      processMemoryMaxBytes: processMemoryMaxBytesValue(agents.processMemoryMaxBytes),
       ...(placement ? { placement } : {}),
       hostCapabilities,
       ...(remoteSpawnPolicy ? { remoteSpawnPolicy } : {}),
@@ -1744,6 +1807,7 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
       controlIncarnationFence: meshControlIncarnationFence(mesh.controlIncarnationFence),
       lockProtocol: meshLockProtocol(mesh.lockProtocol),
       stateBackend: meshStateBackend(mesh.stateBackend),
+      nats: { replicas: meshNatsReplicas(objectValue(mesh.nats).replicas) },
       enabled: booleanValue(mesh.enabled, DEFAULT_FABRIC_CONFIG.mesh.enabled),
       ...(meshRoot ? { root: meshRoot } : {}),
       announce: booleanValue(mesh.announce, DEFAULT_FABRIC_CONFIG.mesh.announce),
@@ -2135,6 +2199,7 @@ const resolveFabricConfig = (
     merged = mergeObjects(merged, {
       agents: {
         ...(Object.hasOwn(agents, "processSlice") ? { processSlice: agents.processSlice } : {}),
+        ...(Object.hasOwn(agents, "processMemoryMaxBytes") ? { processMemoryMaxBytes: agents.processMemoryMaxBytes } : {}),
         ...(Array.isArray(agents.deniedModels) ? { deniedModels: agents.deniedModels } : {}),
         ...(Array.isArray(requireReason) ? { modelPolicy: { requireReason } } : {}),
       },
@@ -2165,6 +2230,7 @@ const resolveFabricConfig = (
       document.executor = executor;
       const agents = { ...objectValue(document.agents) };
       delete agents.processSlice;
+      delete agents.processMemoryMaxBytes; // Root-policy-only, like processSlice.
       const inheritedAgents = objectValue(merged.agents);
       // Agent-writable lists can add restrictions, never remove a root/default gate.
       const union = (base: unknown, extra: unknown): unknown[] => [
@@ -2187,6 +2253,7 @@ const resolveFabricConfig = (
       delete agents.instructionsRoot;
       delete agents.wakeText;
       delete agents.processSlice;
+      delete agents.processMemoryMaxBytes;
       delete agents.placement;
       delete agents.hostCapabilities;
       delete agents.remoteSpawnPolicy;

@@ -533,7 +533,9 @@ describe("fabric-mesh-backend lock-recover (smarty-dev#9569 D2): safe form, labe
 // away and a successor published. Linux releases through the pinned fd (#889). Off Linux, until the native helper of
 // option (d)/(b) lands, the release by name still removes the successor: the tracked residual of smarty-dev#9569.
 describe.runIf(process.platform !== "linux")("M6 off Linux: the forced-rename release race (tracked residual)", () => {
-  it.fails("a reclaimed holder's release never removes its successor's lock", async () => {
+  // Vitest retries before applying `fails`: an expected failure otherwise consumes all CI retries
+  // and is falsely listed as flaky (smarty-dev#7651). Keep the #9569 safety assertion and XPASS alarm.
+  it.fails("a reclaimed holder's release never removes its successor's lock", { retry: 0 }, async () => {
     const root = tempRoot();
     const lock = path.join(root, ".lock");
     const successor = "successor-token\n424242\n1\n";

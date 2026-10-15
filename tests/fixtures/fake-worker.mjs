@@ -38,6 +38,27 @@ function writeStatus(text) {
   }
 }
 
+// Opt-in boot gate: arm the watcher before announcing entry so a test can
+// hold transport launch apart from the worker's very first status publication.
+const bootGateMatch = task.match(/"fakeWorkerBootGate":\s*("(?:\\.|[^"\\])*")/);
+if (bootGateMatch) {
+  const release = JSON.parse(bootGateMatch[1]);
+  await new Promise((resolve, reject) => {
+    const watcher = fs.watch(path.dirname(release), () => {
+      if (fs.existsSync(release)) finish();
+    });
+    const timeout = setTimeout(() => finish(new Error("Fake worker boot gate timed out")), 10_000);
+    function finish(error) {
+      clearTimeout(timeout);
+      watcher.close();
+      if (error) reject(error); else resolve();
+    }
+    watcher.on("error", finish);
+    fs.writeFileSync(`${release}.entered`, "ready");
+    if (fs.existsSync(release)) finish();
+  });
+}
+
 if (task.includes("HANG_WITH_PROGRESS")) {
   // A run that has done work (so an abort detaches it) and never finishes on its own:
   // only a stop or a kill ends it (smarty-dev#1113).
@@ -82,7 +103,7 @@ if (task.includes("HANG_WITH_PROGRESS")) {
   stay();
   process.on("SIGTERM", () => process.exit(0));
   process.on("SIGINT", () => process.exit(0));
-} else if (task.includes("RESUME_AFTER_STOP") || task.includes("RESUME_AFTER_CRASH")) {
+} else if (task.includes("RESUME_AFTER_STOP") || task.includes("RESUME_AFTER_CRASH") || task.includes("RESUME_FAIL_AFTER_STOP")) {
   // Simulates a long participant losing its first attempt mid-run: either the
   // worker caught an external signal (a terminal "stopped" record, as SIGTERM
   // produces) or its transport simply died with work already done. Attempts are
@@ -119,7 +140,7 @@ if (task.includes("HANG_WITH_PROGRESS")) {
   fs.mkdirSync(path.dirname(statusFile), { recursive: true });
   writeStatus(JSON.stringify(running));
   await new Promise((resolve) => setTimeout(resolve, 100));
-  if (attempt === 1 && task.includes("RESUME_AFTER_STOP")) {
+  if (attempt === 1 && (task.includes("RESUME_AFTER_STOP") || task.includes("RESUME_FAIL_AFTER_STOP"))) {
     const stoppedAt = Date.now();
     writeStatus(
       JSON.stringify({
@@ -136,6 +157,17 @@ if (task.includes("HANG_WITH_PROGRESS")) {
     process.exit(1);
   }
   if (attempt === 1) process.exit(3);
+  if (attempt > 1 && task.includes("RESUME_FAIL_AFTER_STOP")) {
+    const failedAt = Date.now();
+    writeStatus(JSON.stringify({
+      ...running,
+      status: "failed",
+      error: "continuation failed",
+      updatedAt: failedAt,
+      finishedAt: failedAt,
+    }));
+    process.exit(1);
+  }
   const finishedAt = Date.now();
   writeStatus(
     JSON.stringify({

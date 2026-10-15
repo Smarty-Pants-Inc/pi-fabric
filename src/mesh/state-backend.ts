@@ -27,8 +27,9 @@
  * build against these declarations. Changes after that commit are recorded in the lane's
  * `iface-changes.md`.
  */
+import fs from "node:fs";
 import path from "node:path";
-import { isMeshLockTimeout, MeshLockTimeoutError } from "../core/atomic-write.js";
+import { isMeshIncarnationPending, isMeshSnapshotRetriesExhausted, isMeshLockTimeout, MeshLockTimeoutError } from "../core/atomic-write.js";
 import type { MeshIdentity } from "./event-log.js";
 import { isMeshStateBackendKind, MESH_STATE_BACKEND_KIND_LIST, type MeshStateBackendKind } from "./state-backend-kinds.js";
 import type { MeshStoreContext } from "./mesh-lock.js";
@@ -200,6 +201,12 @@ export interface StateDivergence {
  */
 export interface StateBackend {
   readonly kind: MeshStateBackendKind;
+  /** Native opened-connection attestation; absence is unsupported for enforced slot admission. */
+  attestDatabaseFile?(): import("./state-sqlite.js").SqliteFileIdentity;
+  /** Fresh-bootstrap seal in native SQLite metadata, never a public mesh KV value. */
+  slotAuthorityBinding?(): string | undefined;
+  /** Native-only final SQLite claim-write fence, installed by the memoized slot coordinator. */
+  installSlotClaimGuard?(guard: () => void): void;
 
   get(key: string, options?: MeshReadOptions): MeshStateEntry | undefined;
   list(prefix?: string, limit?: number, options?: MeshReadOptions): MeshStateEntry[];
@@ -228,8 +235,25 @@ export interface StateBackend {
    */
   withWriteFence<T>(operation: () => T): T;
 
+  /**
+   * Durability barrier (smarty-dev#9313): resolves once every state commit made before the call, by
+   * any process on this root, is on disk, or throws (within about `budgetMs` for sqlite). Never
+   * holds a writer lock while it syncs. file: fsync of state.json and its namespace; on Windows, which
+   * has no directory barrier, rejects (before any I/O) with MeshStateFileNotDurableError. sqlite: the
+   * store's PASSIVE checkpoint barrier. shadow: its authority, state.json. nats: resolves at once on a
+   * server with sync_always (a commit resolves only on the server's publish ack and the backend buffers
+   * nothing); rejects with MeshStateNatsNotDurableError when opened with acceptPeriodicSync (see NatsStateBackend.sync).
+   */
+  sync(budgetMs: number): Promise<void>;
   /** Drops parsed caches (called after a failed operation under the mesh lock). */
   dropCache(): void;
+  /**
+   * Optional (pi-fabric#7978): calls `listener` after this process's read projection has applied a whole committed
+   * change that arrived without a watched mesh-root file write (nats: the stream consumer). A hint, never authority:
+   * consumers re-read state. Backends whose commits already touch watched files (file, sqlite, shadow) omit it.
+   * Returns the unsubscribe function.
+   */
+  subscribeStateChanges?(listener: () => void): () => void;
   diagnostics(): StateBackendDiagnostics;
   /** Releases database handles; reads and writes after close throw (file: no-op). */
   close(): void;
@@ -301,12 +325,15 @@ export const isMeshStateWalCap = (error: unknown): boolean =>
   error instanceof Error && (error as { code?: unknown }).code === MESH_STATE_WAL_CAP_CODE;
 
 /**
- * Lock contention a caller retries (smarty-dev#6477): a mesh lock timeout, `FABRIC_MESH_STATE_BUSY`, a
+ * A refusal a caller retries (smarty-dev#6477): pending process identity, snapshot validation exhaustion,
+ * a mesh lock timeout, `FABRIC_MESH_STATE_BUSY`, a
  * raw SQLite busy error that escaped a path without its own mapping, or a WAL-cap refusal
  * (`FABRIC_MESH_STATE_WAL_CAP`, pi-fabric#694 P1 2: the operator rolls back; writes resume once the reader
  * lets go). Never fatal for a long-lived loop.
  */
-export const isMeshRetryableBusy = (error: unknown): boolean => isMeshLockTimeout(error) || isSqliteBusy(error) || isMeshStateWalCap(error);
+export const isMeshRetryableBusy = (error: unknown): boolean =>
+  isMeshIncarnationPending(error) || isMeshSnapshotRetriesExhausted(error) ||
+  isMeshLockTimeout(error) || isSqliteBusy(error) || isMeshStateWalCap(error);
 
 /** Wraps a raw SQLite busy error as the retryable `MeshStateBusyError` (a `MeshLockTimeoutError`). */
 export const meshStateBusyFrom = (database: string, error: unknown, attempts = 1, waitedMs = 0, where = "read"): MeshStateBusyError => {
@@ -606,6 +633,7 @@ export class SqliteStateBackend implements StateBackend {
   #snapshot: SqliteSnapshot | undefined;
   #busyTimeouts = 0;
   #closed = false;
+  #slotClaimGuard: (() => void) | undefined;
 
   constructor(context: MeshStoreContext, options: CreateStateBackendOptions = {}, root = context.root,
     storeOptions: SqliteStateStoreOptions = sqliteOptions(options)) {
@@ -619,6 +647,14 @@ export class SqliteStateBackend implements StateBackend {
   get store(): SqliteStateStore { return this.#open(); }
 
   get database(): string { return path.join(this.root, "state.db"); }
+
+  attestDatabaseFile(): import("./state-sqlite.js").SqliteFileIdentity {
+    return this.#open().attestDatabaseFile();
+  }
+
+  slotAuthorityBinding(): string | undefined { return this.#open().slotAuthorityBinding(); }
+
+  installSlotClaimGuard(guard: () => void): void { this.#slotClaimGuard = guard; }
 
   // ------------------------------------------------------------ reads
 
@@ -699,11 +735,13 @@ export class SqliteStateBackend implements StateBackend {
   // ------------------------------------------------------------ writes
 
   async put(input: StateBackendPutInput): Promise<MeshStateEntry> {
-    return this.#write((store) => store.put(input));
+    return this.#write((store) => store.put({ ...input, ...(this.#slotClaimGuard && input.key.startsWith("factory/review-slots/v1/")
+      ? { beforeCommit: () => this.#slotClaimGuard!() } : {}) }));
   }
 
   async delete(input: StateBackendDeleteInput): Promise<{ deleted: boolean; version?: number }> {
-    return this.#write((store) => store.delete(input));
+    return this.#write((store) => store.delete({ ...input, ...(this.#slotClaimGuard && input.key.startsWith("factory/review-slots/v1/")
+      ? { beforeCommit: () => this.#slotClaimGuard!() } : {}) }));
   }
 
   async writeBatch(input: StateBackendBatchInput): Promise<MeshBatchResult[]> {
@@ -714,10 +752,17 @@ export class SqliteStateBackend implements StateBackend {
     for (let attempt = 0; ; attempt += 1) {
       const bracket = fileRead ? bracketFileRead(fileRead) : undefined;
       const userPrepare = input.prepare;
+      let claimsTouched = input.ops.some(op => op.key.startsWith("factory/review-slots/v1/"));
       const prepare = fileRead || userPrepare ? (view: MeshBatchView): MeshBatchOperation[] => {
         if (fileRead && (!bracket || fileRead.stamp() !== bracket.stamp)) throw FILE_READ_CHANGED;
-        return userPrepare?.(view, bracket?.value) ?? [];
+        const prepared = userPrepare?.(view, bracket?.value) ?? [];
+        claimsTouched ||= prepared.some(op => op.key.startsWith("factory/review-slots/v1/"));
+        return prepared;
       } : undefined;
+      const beforeCommit = (): void => {
+        if (claimsTouched) this.#slotClaimGuard?.();
+        input.beforeCommit?.();
+      };
       let results: MeshBatchResult[];
       try {
         if (fileRead && !bracket) throw FILE_READ_CHANGED;
@@ -725,7 +770,7 @@ export class SqliteStateBackend implements StateBackend {
           identity: input.identity, ops: input.ops,
           ...(prepare ? { prepare } : {}),
           ...(input.afterCommit ? { afterCommit: input.afterCommit } : {}),
-          ...(input.beforeCommit ? { beforeCommit: input.beforeCommit } : {}),
+          ...(input.beforeCommit || this.#slotClaimGuard ? { beforeCommit } : {}),
           ...(input.lockClass ? { lockClass: input.lockClass } : {}),
         }));
       } catch (error) {
@@ -763,6 +808,14 @@ export class SqliteStateBackend implements StateBackend {
       this.#busyTimeouts += 1;
       throw new MeshStateBusyError(store.file, 0, error);
     }
+  }
+
+  /** The store's PASSIVE-checkpoint barrier (no writer lock). A database never created holds no commit. */
+  async sync(budgetMs: number): Promise<void> {
+    const deadline = performance.now() + Math.max(0, budgetMs);
+    if (!this.#store && !fs.existsSync(this.database)) return;
+    const store = await this.#openAsync(deadline);
+    await store.sync(Math.max(0, deadline - performance.now()));
   }
 
   dropCache(): void {
@@ -927,6 +980,10 @@ export class SqliteStateBackend implements StateBackend {
       // brings forward with this commit's change rows instead of a full export (smarty-dev#6477).
       return result;
     } catch (error) {
+      // Caller-compatible timeout subclasses can refuse before lock acquisition. Preserve their typed refusal and
+      // exact split key: wrapping them as SQLite busy would recreate a false zero-attempt contention timeout.
+      const refusal = error as { kind?: unknown; preLockCode?: unknown } | null;
+      if (error instanceof Error && (refusal?.kind === "pre-lock" || typeof refusal?.preLockCode === "string")) throw error;
       if (error instanceof MeshLockTimeoutError && !(error instanceof MeshStateBusyError)) {
         this.#busyTimeouts += 1;
         throw new MeshStateBusyError(store?.file ?? this.database, performance.now() - started, error);
@@ -1078,6 +1135,9 @@ export class ShadowStateBackend implements StateBackend {
   // state.json is the authority and its writers take `.lock`; the shadow database is never read
   // for a decision, so fencing it would only add busy refusals.
   withWriteFence<T>(operation: () => T): T { return this.#file.withWriteFence(operation); }
+
+  // state.json is the authority; the shadow database is a copy rebuilt from it, so only the file syncs.
+  sync(budgetMs: number): Promise<void> { return this.#file.sync(budgetMs); }
 
   dropCache(): void { this.#file.dropCache(); }
 

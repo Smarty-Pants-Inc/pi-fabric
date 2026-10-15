@@ -1,6 +1,8 @@
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 import { spawnDetached } from "../src/agents/transports/process-utils.js";
+import { TaskCgroupStopUnconfirmedError, TaskScopeAdmissionError } from "../src/agents/transports/task-cgroup.js";
 import fs from "node:fs";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -9,6 +11,9 @@ import { AgentManager } from "../src/agents/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { WORKER_PROTOCOL_VERSION } from "../src/agents/worker-protocol.js";
 import type { AgentHandleInfo } from "../src/agents/types.js";
+
+// Capture before any test spy. Re-spying the fixture mock must never delegate to itself.
+const nativeReadFileSync = fs.readFileSync;
 
 const roots: string[] = [];
 const managers: AgentManager[] = [];
@@ -33,6 +38,7 @@ fs.writeFileSync(args.get("status-file"), JSON.stringify({
 const fixture = (fullCodeMode = true) => {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "fabric-spawn-release-")));
   roots.push(root);
+  const cwd = path.join(root, "cwd"); fs.mkdirSync(cwd);
   const profile = path.join(root, "profile");
   fs.mkdirSync(profile);
   vi.stubEnv("PI_CODING_AGENT_DIR", profile);
@@ -48,12 +54,12 @@ const fixture = (fullCodeMode = true) => {
   const parent = release("parent");
   const select = (directory: string) => fs.writeFileSync(path.join(profile, "settings.json"), JSON.stringify({ packages: [{ source: directory }] }));
   select(parent);
-  const manager = new AgentManager(root, { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, deniedModels: [], maxConcurrent: 1, timeoutMs: 4_000 }, {
+  const manager = new AgentManager(cwd, { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, deniedModels: [], maxConcurrent: 1, timeoutMs: 4_000 }, {
     workerPath: path.join(parent, "dist/worker.js"), fabricExtensionPath: path.join(parent, "dist/index.js"),
     fullCodeMode, runRoot: path.join(root, "runs"),
   });
   managers.push(manager);
-  return { root, profile, parent, manager, release, select };
+  return { root, cwd, profile, parent, manager, release, select };
 };
 
 const probe = async (f: ReturnType<typeof fixture>, expected: string) => {
@@ -123,7 +129,7 @@ const args = new Map();`));
     const current = f.release("canonical-current");
     const alias = path.join(f.root, "parent-alias");
     fs.symlinkSync(f.parent, alias, "junction");
-    const manager = new AgentManager(f.root, { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, deniedModels: [], timeoutMs: 4_000 }, {
+    const manager = new AgentManager(f.cwd, { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, deniedModels: [], timeoutMs: 4_000 }, {
       workerPath: path.join(alias, "dist/worker.js"), fabricExtensionPath: path.join(alias, "dist/index.js"),
       fullCodeMode: true, runRoot: path.join(f.root, "alias-runs"),
     });
@@ -136,7 +142,7 @@ const args = new Map();`));
     const f = fixture();
     const custom = path.join(f.parent, "custom-worker.mjs");
     fs.writeFileSync(custom, worker);
-    const manager = new AgentManager(f.root, { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, deniedModels: [], timeoutMs: 4_000 }, {
+    const manager = new AgentManager(f.cwd, { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, deniedModels: [], timeoutMs: 4_000 }, {
       workerPath: custom, fabricExtensionPath: path.join(f.parent, "dist/index.js"),
       fullCodeMode: true, runRoot: path.join(f.root, "custom-runs"),
     });
@@ -154,7 +160,7 @@ const args = new Map();`));
     const hook = path.join(f.root, "custom-hook.mjs");
     fs.writeFileSync(hook, "export default function () {}\n");
     const current = f.release("custom-hook-current");
-    const manager = new AgentManager(f.root, { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, deniedModels: [], timeoutMs: 4_000 }, {
+    const manager = new AgentManager(f.cwd, { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, deniedModels: [], timeoutMs: 4_000 }, {
       workerPath: path.join(f.parent, "dist/worker.js"), fabricExtensionPath: hook,
       fullCodeMode: true, runRoot: path.join(f.root, "custom-hook-runs"),
     });
@@ -195,16 +201,16 @@ const args = new Map();`));
     expect(warn.mock.calls[0]?.[0]).toMatch(/protocol/i);
   });
 
-  it("never auto-selects a v1 worker without the receipt/attributed-refusal boundary", async () => {
-    expect(WORKER_PROTOCOL_VERSION).toBe(2);
+  it.each([1, 2])("never auto-selects a v%s worker without the current terminal/task-scratch boundaries", async version => {
+    expect(WORKER_PROTOCOL_VERSION).toBe(3);
     const f = fixture();
-    const legacy = f.release("legacy-terminal-protocol", 1);
+    const legacy = f.release("legacy-terminal-protocol", version);
     f.select(legacy);
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     await probe(f, f.parent);
     expect(warn).toHaveBeenCalledOnce();
-    expect(warn.mock.calls[0]?.[0]).toContain("worker protocol 1");
-    expect(warn.mock.calls[0]?.[0]).toContain("worker protocol 2");
+    expect(warn.mock.calls[0]?.[0]).toContain(`worker protocol ${version}`);
+    expect(warn.mock.calls[0]?.[0]).toContain("worker protocol 3");
   });
 
   it("pins the parent's extension on incompatible fallback outside full-code mode", async () => {
@@ -248,6 +254,9 @@ const fixture = (script = 'while [ "$1" != "--" ]; do shift; done; shift; exec "
   fs.writeFileSync(worker, 'import fs from "node:fs"; fs.appendFileSync("started", String(process.pid)+"\\n"); setInterval(() => {}, 1000);');
   fs.writeFileSync(path.join(root, "systemd-run"), `#!/bin/sh\nprintf '%s\\n' "$@" > "${root}/scope-args"\n${script}\n`, { mode: 0o700 });
   vi.stubEnv("PATH", root); // runtime is process.execPath, never PATH
+  // smarty-dev#8257: keep these uncapped processSlice fixtures ineligible for the default task cap on
+  // any host (a developer's live user bus must not turn them into capped launches).
+  vi.stubEnv("XDG_RUNTIME_DIR", root); vi.stubEnv("DBUS_SESSION_BUS_ADDRESS", undefined);
   return { root, worker, request: { id: "test", name: "test", cwd: root, workerPath: worker, workerArguments: [] } };
 };
 const workerStarted = async (root: string) => { await vi.waitFor(() => expect(fs.existsSync(path.join(root, "started"))).toBe(true)); return Number(fs.readFileSync(path.join(root, "started"), "utf8").trim()); };
@@ -255,7 +264,8 @@ const workerStarted = async (root: string) => { await vi.waitFor(() => expect(fs
 describe.skipIf(process.platform !== "linux")("ProcessTransport processSlice (#4383)", () => {
   it("propagates the host slice from AgentManager through a real process worker", async () => {
     const f = fixture();
-    const manager = new AgentManager(f.root, { ...DEFAULT_FABRIC_CONFIG.agents, processSlice: "batch.slice", budgetUsd: 0, sessionExport: false, timeoutMs: 5_000 }, {
+    const cwd = path.join(f.root, "cwd"); fs.mkdirSync(cwd);
+    const manager = new AgentManager(cwd, { ...DEFAULT_FABRIC_CONFIG.agents, processSlice: "batch.slice", budgetUsd: 0, sessionExport: false, timeoutMs: 5_000 }, {
       runRoot: path.join(f.root, "runs"), workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
     });
     try {
@@ -332,12 +342,326 @@ describe.skipIf(process.platform !== "linux")("ProcessTransport processSlice (#4
     try { expect(await workerStarted(f.root)).toBe(handle.pid); expect(warn).toHaveBeenCalledOnce(); }
     finally { await handle.stop(); await handle.waitForClose(); }
   });
+  it("smarty-dev#8257: a nested launch skips the parent task's systemd-run PATH shim and admits via the next real backend", async () => {
+    const f = fixture();
+    const shimDir = path.join(f.root, "task-shim"); fs.mkdirSync(shimDir);
+    const shim = path.join(shimDir, "systemd-run");
+    fs.writeFileSync(shim, `#!/bin/sh\nprintf ran >> "${f.root}/shim-ran"\nexit 1\n`, { mode: 0o700 });
+    vi.stubEnv("PATH", `${shimDir}${path.delimiter}${f.root}`);
+    vi.stubEnv("FABRIC_TASK_SYSTEMD_RUN_WRAPPER", shim);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const handle = await new ProcessTransport("batch.slice").launch(f.request);
+    try {
+      expect(await workerStarted(f.root)).toBe(Number(handle.sessionId));
+      expect(fs.existsSync(path.join(f.root, "shim-ran"))).toBe(false);
+      expect(fs.readFileSync(path.join(f.root, "scope-args"), "utf8")).toContain("--slice=batch.slice\n");
+      expect(warn).not.toHaveBeenCalled();
+    } finally { await handle.stop(); await handle.waitForClose?.(); }
+    expect(fs.readFileSync(path.join(f.root, "started"), "utf8").trim().split("\n")).toEqual([handle.sessionId]); // exec'd once
+  });
+  it("smarty-dev#8257: without the wrapper variable, ordinary first-on-PATH lookup is unchanged", async () => {
+    const f = fixture();
+    const shimDir = path.join(f.root, "first"); fs.mkdirSync(shimDir);
+    fs.writeFileSync(path.join(shimDir, "systemd-run"), `#!/bin/sh\nprintf ran >> "${f.root}/shim-ran"\nexit 1\n`, { mode: 0o700 });
+    vi.stubEnv("PATH", `${shimDir}${path.delimiter}${f.root}`);
+    vi.stubEnv("FABRIC_TASK_SYSTEMD_RUN_WRAPPER", undefined);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const handle = await new ProcessTransport("batch.slice").launch(f.request);
+    try {
+      expect(await workerStarted(f.root)).toBe(Number(handle.sessionId));
+      expect(fs.readFileSync(path.join(f.root, "shim-ran"), "utf8")).toBe("ran"); // first entry used, failed
+      expect(fs.existsSync(path.join(f.root, "scope-args"))).toBe(false);
+      expect(warn).toHaveBeenCalledOnce(); // existing failed-scope fallback
+    } finally { await handle.stop(); await handle.waitForClose?.(); }
+  });
   it("does not replay a worker that fails after successful scope admission", async () => {
     const f = fixture(); fs.writeFileSync(f.worker, 'import fs from "node:fs"; fs.appendFileSync("started", String(process.pid)+"\\n"); process.exit(1);');
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const handle = await new ProcessTransport("batch.slice").launch(f.request); await handle.waitForClose?.();
     expect(fs.readFileSync(path.join(f.root, "started"), "utf8").trim().split("\n")).toEqual([handle.sessionId]);
     expect(warn).not.toHaveBeenCalled(); expect(await handle.isAlive()).toBe(false);
+  });
+});
+}
+
+// smarty-dev#8257 MECHANISM tests (fake systemd-run, no real scope): capped-scope argv, eligibility
+// and fallbacks. The real cgroup/memory/stop path is proven only by tests/task-cgroup.test.ts.
+{
+const roots: string[] = [];
+const servers: net.Server[] = [];
+afterEach(async () => {
+  vi.restoreAllMocks(); vi.unstubAllEnvs();
+  for (const server of servers.splice(0)) await new Promise(resolve => server.close(resolve));
+  for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
+});
+const GIB = 1024 ** 3;
+const isV2 = (() => { try { return fs.statfsSync("/sys/fs/cgroup").type === 0x63677270; } catch { return false; } })();
+/** Eligibility inputs: a fixture-owned listening bus socket (or none), and the memory controller's
+ * delegation to this UID's user manager, simulated by answering ONLY its subtree_control read. */
+const fixture = async (bus: "live" | "none", delegated = true) => {
+  const uid = process.getuid!();
+  const readFileSync = nativeReadFileSync;
+  vi.spyOn(fs, "readFileSync").mockImplementation(((file: fs.PathOrFileDescriptor, ...rest: unknown[]) =>
+    String(file).endsWith(`/user@${uid}.service/cgroup.subtree_control`)
+      ? (delegated ? "cpu io memory pids\n" : "cpu io pids\n")
+      : (readFileSync as (...a: unknown[]) => string | Buffer)(file, ...rest)) as typeof fs.readFileSync);
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-task-cap-")); roots.push(root);
+  const worker = path.join(root, "worker.mjs");
+  fs.writeFileSync(worker, 'import fs from "node:fs"; fs.appendFileSync("started", String(process.pid)+"\\n"); setInterval(() => {}, 1000);');
+  fs.writeFileSync(path.join(root, "systemd-run"), `#!/bin/sh\nprintf '%s\\n' "$@" > "${root}/scope-args"\nwhile [ "$1" != "--" ]; do shift; done; shift; exec "$@"\n`, { mode: 0o700 });
+  vi.stubEnv("PATH", root);
+  const runtime = path.join(root, "run"); fs.mkdirSync(runtime, { mode: 0o700 });
+  vi.stubEnv("XDG_RUNTIME_DIR", runtime);
+  if (bus === "live") {
+    const server = net.createServer(); servers.push(server);
+    await new Promise<void>(resolve => server.listen(path.join(runtime, "bus"), resolve));
+    vi.stubEnv("DBUS_SESSION_BUS_ADDRESS", `unix:path=${path.join(runtime, "bus")}`);
+  } else vi.stubEnv("DBUS_SESSION_BUS_ADDRESS", undefined);
+  return { root, worker, request: { id: "cap", name: "cap", cwd: root, workerPath: worker, workerArguments: [] as string[] } };
+};
+const started = async (root: string) => { await vi.waitFor(() => expect(fs.existsSync(path.join(root, "started"))).toBe(true)); return Number(fs.readFileSync(path.join(root, "started"), "utf8").trim()); };
+const scopeArgs = (root: string): string[] | undefined => fs.existsSync(path.join(root, "scope-args"))
+  ? fs.readFileSync(path.join(root, "scope-args"), "utf8").split("\n").filter(Boolean) : undefined;
+/** Accept `-p X=Y` or `--property=X=Y`. */
+const properties = (args: string[]): string[] => args.flatMap((arg, index) =>
+  arg.startsWith("--property=") ? [arg.slice(11)] : args[index - 1] === "-p" ? [arg] : []);
+const launch = async (transport: ProcessTransport, request: Awaited<ReturnType<typeof fixture>>["request"], root: string) => {
+  vi.spyOn(console, "warn").mockImplementation(() => {});
+  const handle = await transport.launch(request);
+  try { expect(await started(root)).toBe(Number(handle.sessionId)); return handle; }
+  finally { await handle.stop(); await handle.waitForClose?.(); }
+};
+
+/** A fake runner admits into the caller's cgroup: the capped receipt can never verify. The launch
+ * must fail typed, BEFORE the gate releases the worker, with no unconfined replay. */
+const refused = async (transport: ProcessTransport, request: Awaited<ReturnType<typeof fixture>>["request"], root: string) => {
+  vi.spyOn(console, "warn").mockImplementation(() => {});
+  const outcome = await transport.launch(request).then(async handle => { await handle.stop(); return handle; }, (error: unknown) => error);
+  expect(outcome).toBeInstanceOf(TaskScopeAdmissionError);
+  expect((outcome as TaskScopeAdmissionError).code).toBe("TASK_SCOPE_ADMISSION_FAILED");
+  expect((outcome as TaskScopeAdmissionError).unit).toMatch(/^fabric-task-.+\.scope$/);
+  await new Promise(resolve => setTimeout(resolve, 200));
+  expect(fs.existsSync(path.join(root, "started")), "worker ran outside a verified capped scope").toBe(false);
+};
+
+describe.skipIf(process.platform !== "linux" || !isV2)("ProcessTransport task memory cap mechanism (smarty-dev#8257)", () => {
+  // Trust-boundary countertests (#11898): indeterminate host probes cannot authorize uncapped work.
+  const probeCases = [
+    ...["bus socket", "memory delegation"].flatMap(probe => [undefined, "batch.slice"].flatMap(slice =>
+      ["EIO", "EACCES"].map(errno => ({ probe, errno, slice, operation: probe === "bus socket" ? "stat" : "read" })))),
+    ...["stat", "read"].flatMap(operation => ["EIO", "EACCES"].flatMap(errno =>
+      [undefined, "batch.slice"].map(slice => ({ probe: "cgroup controllers", errno, slice, operation })))),
+    ...["EIO", "EACCES"].flatMap(errno => [undefined, "batch.slice"].map(slice =>
+      ({ probe: "systemd-run executable", errno, slice, operation: "stat" }))),
+  ];
+  it.each(probeCases)("astra-p2: $probe $operation $errno refuses before any spawn (slice=$slice)", async ({ probe, errno, slice, operation }) => {
+    const f = await fixture("live"); // restore both bus variables after smarty-test-env scrubs them
+    const statSync = fs.statSync;
+    const readFileSync = nativeReadFileSync;
+    const target = probe === "bus socket" ? path.join(f.root, "run/bus")
+      : probe === "cgroup controllers" ? "/sys/fs/cgroup/cgroup.controllers"
+      : probe === "systemd-run executable" ? path.join(f.root, "systemd-run")
+      : `/sys/fs/cgroup/user.slice/user-${process.getuid!()}.slice/user@${process.getuid!()}.service/cgroup.subtree_control`;
+    const failure = Object.assign(new Error(errno), { code: errno });
+    if (operation === "read") {
+      vi.spyOn(fs, "readFileSync").mockImplementation(((file: fs.PathOrFileDescriptor, ...rest: unknown[]) => {
+        if (String(file) === target) throw failure;
+        return (readFileSync as (...a: unknown[]) => string | Buffer)(file, ...rest);
+      }) as typeof fs.readFileSync);
+    } else {
+      vi.spyOn(fs, "statSync").mockImplementation(((file: fs.PathLike, ...rest: unknown[]) => {
+        if (String(file) === target) throw failure;
+        return (statSync as (...a: unknown[]) => fs.Stats)(file, ...rest);
+      }) as typeof fs.statSync);
+    }
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const authorize = vi.fn(() => true); // spawnDetached consults authority before spawning
+    const outcome = await new ProcessTransport(slice).launch({ ...f.request, authorize })
+      .then(async handle => { await handle.stop(); await handle.waitForClose?.(); return handle; }, (error: unknown) => error);
+    expect(outcome).toBeInstanceOf(Error);
+    expect(outcome).toMatchObject({ name: "TaskScopeProbeError", code: "TASK_SCOPE_PROBE_UNKNOWN", probe, errno, cause: failure });
+    expect((outcome as Error).message).toContain(probe);
+    expect((outcome as Error).message).toContain(errno);
+    expect(authorize).not.toHaveBeenCalled();
+    expect(warn).not.toHaveBeenCalled();
+    expect(scopeArgs(f.root)).toBeUndefined();
+    expect(fs.existsSync(path.join(f.root, "started"))).toBe(false);
+  });
+
+  it.each([
+    { probe: "bus socket", operation: "stat", slice: undefined },
+    { probe: "cgroup controllers", operation: "stat", slice: undefined },
+    { probe: "cgroup controllers", operation: "read", slice: undefined },
+    { probe: "memory delegation", operation: "read", slice: undefined },
+    { probe: "systemd-run executable", operation: "stat", slice: undefined },
+    { probe: "systemd-run executable", operation: "stat", slice: "batch.slice" },
+  ])("astra-p2: $probe $operation ENOENT remains verified-unsupported and launches directly", async ({ probe, operation, slice }) => {
+    const f = await fixture("live");
+    const statSync = fs.statSync;
+    const readFileSync = nativeReadFileSync;
+    const target = probe === "bus socket" ? path.join(f.root, "run/bus")
+      : probe === "cgroup controllers" ? "/sys/fs/cgroup/cgroup.controllers"
+      : probe === "systemd-run executable" ? path.join(f.root, "systemd-run")
+      : `/sys/fs/cgroup/user.slice/user-${process.getuid!()}.slice/user@${process.getuid!()}.service/cgroup.subtree_control`;
+    const failure = Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+    if (operation === "read") {
+      vi.spyOn(fs, "readFileSync").mockImplementation(((file: fs.PathOrFileDescriptor, ...rest: unknown[]) => {
+        if (String(file) === target) throw failure;
+        return (readFileSync as (...a: unknown[]) => string | Buffer)(file, ...rest);
+      }) as typeof fs.readFileSync);
+    } else {
+      vi.spyOn(fs, "statSync").mockImplementation(((file: fs.PathLike, ...rest: unknown[]) => {
+        if (String(file) === target) throw failure;
+        return (statSync as (...a: unknown[]) => fs.Stats)(file, ...rest);
+      }) as typeof fs.statSync);
+    }
+    const handle = await launch(new ProcessTransport(slice), f.request, f.root);
+    expect(scopeArgs(f.root)).toBeUndefined();
+    expect(handle.cgroup).toBeUndefined();
+  });
+
+  it("an eligible task requests a capped fabric-task scope in app.slice with swap 0; an unverifiable receipt fails typed with no worker", async () => {
+    const f = await fixture("live");
+    await refused(new ProcessTransport(undefined, undefined, undefined, 24 * GIB), f.request, f.root);
+    const args = scopeArgs(f.root)!;
+    expect(args).toBeDefined();
+    expect(args.slice(0, 2)).toEqual(["--user", "--scope"]);
+    expect(args).toContain("--slice=app.slice");
+    expect(args.find(arg => arg.startsWith("--unit="))).toMatch(/^--unit=fabric-task-.+\.scope$/);
+    expect(properties(args)).toEqual(expect.arrayContaining([expect.stringMatching(/^MemoryMax=(25769803776|24G)$/), "MemorySwapMax=0"]));
+  });
+
+  it("passes a custom cap in bytes and keeps a host processSlice as the parent slice", async () => {
+    const f = await fixture("live");
+    await refused(new ProcessTransport("batch.slice", undefined, undefined, GIB), f.request, f.root);
+    const args = scopeArgs(f.root)!;
+    expect(args).toContain("--slice=batch.slice");
+    expect(args.find(arg => arg.startsWith("--unit="))).toMatch(/^--unit=fabric-task-.+\.scope$/);
+    expect(properties(args)).toEqual(expect.arrayContaining([`MemoryMax=${GIB}`, "MemorySwapMax=0"]));
+  });
+
+  it("does not cap actors: an actor launch keeps the uncapped processSlice scope, or none", async () => {
+    const f = await fixture("live");
+    vi.stubEnv("FABRIC_TASK_MEMORY_MAX", "25769803776");
+    vi.stubEnv("FABRIC_TASK_CGROUP", "/a/fabric-task-parent.scope");
+    vi.stubEnv("FABRIC_TASK_SYSTEMD_RUN_WRAPPER", "/parent/bin/systemd-run");
+    vi.stubEnv("PI_FABRIC_ROLE", "actor");
+    fs.appendFileSync(f.worker, '\nfs.writeFileSync("actor-env.json", JSON.stringify(process.env));');
+    const actor = { ...f.request, workerArguments: ["--actor-id", "actor:a"] };
+    await launch(new ProcessTransport(undefined, undefined, undefined, 24 * GIB), actor, f.root);
+    expect(scopeArgs(f.root)).toBeUndefined();
+    fs.unlinkSync(path.join(f.root, "started"));
+    await launch(new ProcessTransport("batch.slice", undefined, undefined, 24 * GIB), actor, f.root);
+    const args = scopeArgs(f.root)!;
+    expect(args.find(arg => arg.startsWith("--unit="))).toMatch(/^--unit=fabric-scope-.+\.scope$/);
+    expect(properties(args).filter(p => /^Memory(Swap)?Max=/.test(p))).toEqual([]);
+    const environment = JSON.parse(fs.readFileSync(path.join(f.root, "actor-env.json"), "utf8"));
+    for (const key of ["FABRIC_TASK_MEMORY_MAX", "FABRIC_TASK_CGROUP", "FABRIC_TASK_SYSTEMD_RUN_WRAPPER"]) {
+      expect(environment[key], `uncapped actor inherited ${key}`).toBeUndefined();
+    }
+    expect(environment.PI_FABRIC_ROLE).toBe("actor");
+    const { cappedTaskBashBlockReason } = await import("../src/guards/actor-bash-hook.js");
+    expect(cappedTaskBashBlockReason(environment, "/usr/bin/systemd-run --user --scope -- true")).toBeUndefined();
+  });
+
+  it("without a user bus the cap is ineligible: direct launch, no systemd-run, no cgroup claim", async () => {
+    const f = await fixture("none");
+    const handle = await launch(new ProcessTransport(undefined, undefined, undefined, 24 * GIB), f.request, f.root);
+    expect(scopeArgs(f.root)).toBeUndefined();
+    expect(handle.cgroup).toBeUndefined();
+  });
+
+  it("without the memory controller delegated to the user manager the cap is ineligible", async () => {
+    const f = await fixture("live", false);
+    const handle = await launch(new ProcessTransport(undefined, undefined, undefined, 24 * GIB), f.request, f.root);
+    expect(scopeArgs(f.root)).toBeUndefined();
+    expect(handle.cgroup).toBeUndefined();
+  });
+
+  it("without unified cgroup v2 (no root cgroup.controllers) the cap is ineligible", async () => {
+    const f = await fixture("live");
+    const statSync = fs.statSync;
+    vi.spyOn(fs, "statSync").mockImplementation(((file: fs.PathLike, ...rest: unknown[]) => {
+      if (String(file) === "/sys/fs/cgroup/cgroup.controllers") throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+      return (statSync as (...a: unknown[]) => fs.Stats)(file, ...rest);
+    }) as typeof fs.statSync);
+    const handle = await launch(new ProcessTransport(undefined, undefined, undefined, 24 * GIB), f.request, f.root);
+    expect(scopeArgs(f.root)).toBeUndefined();
+    expect(handle.cgroup).toBeUndefined();
+  });
+
+  it("keeps direct non-Linux launches unchanged when a cap is configured", async () => {
+    const f = await fixture("live");
+    vi.stubEnv("PATH", `${f.root}:/usr/bin:/bin`); // portable custody needs ps
+    vi.spyOn(process, "platform", "get").mockReturnValue("darwin");
+    const handle = await launch(new ProcessTransport(undefined, undefined, undefined, 24 * GIB), f.request, f.root);
+    expect(scopeArgs(f.root)).toBeUndefined();
+    expect(handle.cgroup).toBeUndefined();
+    expect(console.warn).not.toHaveBeenCalled();
+  });
+
+  // Astra P1 counterprobe: systemd-run itself exiting nonzero BEFORE the admission marker is a capped
+  // admission failure, never permission to replay the task uncapped. Exit codes/diagnostics never prove
+  // a missing executable.
+  it.each([
+    [1, "Failed to start transient scope unit: Access denied"],
+    [203, "Failed to execute: No such file or directory"],
+    [127, "systemd-run: command not found"],
+  ])("astra-p1: systemd-run exit %i before the marker fails typed with no uncapped replay", async (code, diagnostic) => {
+    const f = await fixture("live");
+    fs.writeFileSync(path.join(f.root, "systemd-run"),
+      `#!/bin/sh\nprintf '%s\\n' "$@" >> "${f.root}/scope-args"\necho '${diagnostic}' >&2\nexit ${code}\n`, { mode: 0o700 });
+    await refused(new ProcessTransport(undefined, undefined, undefined, 24 * GIB), f.request, f.root);
+    expect(console.warn).not.toHaveBeenCalled(); // no "launching worker normally" fallback
+    expect(scopeArgs(f.root)!.filter(arg => arg.startsWith("--unit="))).toHaveLength(1); // one attempt, no replay
+  });
+
+  it("astra-p1 counterexample: a non-executable systemd-run at lookup is pre-admission missing (direct launch, never invoked)", async () => {
+    const f = await fixture("live");
+    fs.chmodSync(path.join(f.root, "systemd-run"), 0o600);
+    const handle = await launch(new ProcessTransport(undefined, undefined, undefined, 24 * GIB), f.request, f.root);
+    expect(scopeArgs(f.root)).toBeUndefined();
+    expect(handle.cgroup).toBeUndefined();
+  });
+
+  it("astra-p1: spawnDetached capped EACCES is typed; the same uncapped scope keeps legacy fallback", async () => {
+    const f = await fixture("live");
+    fs.chmodSync(path.join(f.root, "systemd-run"), 0o600);
+    const warn = vi.fn();
+    const executable = path.join(f.root, "systemd-run");
+    const outcome = await spawnDetached(f.worker, [], f.root, undefined, undefined, { executable, slice: "app.slice", warn, memoryMaxBytes: GIB })
+      .then(async handle => { await handle.stop(); return handle; }, (error: unknown) => error);
+    expect(outcome).toBeInstanceOf(TaskScopeAdmissionError);
+    expect(warn).not.toHaveBeenCalled();
+    await new Promise(resolve => setTimeout(resolve, 200));
+    expect(fs.existsSync(path.join(f.root, "started"))).toBe(false);
+    const handle = await spawnDetached(f.worker, [], f.root, undefined, undefined, { executable, slice: "batch.slice", warn });
+    try { expect(await started(f.root)).toBe(handle.pid); expect(warn).toHaveBeenCalledOnce(); expect(handle.cgroup).toBeUndefined(); }
+    finally { await handle.stop(); await handle.waitForClose(); }
+  });
+
+  it("astra-p1 counterexample: a capped executable that disappeared after lookup (ENOENT) keeps the warned direct fallback", async () => {
+    const f = await fixture("live");
+    const warn = vi.fn();
+    const handle = await spawnDetached(f.worker, [], f.root, undefined, undefined,
+      { executable: path.join(f.root, "vanished-systemd-run"), slice: "app.slice", warn, memoryMaxBytes: GIB });
+    try { expect(await started(f.root)).toBe(handle.pid); expect(warn).toHaveBeenCalledOnce(); expect(handle.cgroup).toBeUndefined(); }
+    finally { await handle.stop(); await handle.waitForClose(); }
+  });
+
+  it("astra-p1 counterexample: no user bus stays pre-admission ineligible even when systemd-run would fail", async () => {
+    const f = await fixture("none");
+    fs.writeFileSync(path.join(f.root, "systemd-run"), `#!/bin/sh\nprintf ran > "${f.root}/scope-args"\nexit 1\n`, { mode: 0o700 });
+    const handle = await launch(new ProcessTransport(undefined, undefined, undefined, 24 * GIB), f.request, f.root);
+    expect(scopeArgs(f.root)).toBeUndefined();
+    expect(handle.cgroup).toBeUndefined();
+  });
+
+  it("an omitted cap defaults to 24 GiB on an eligible host; an invalid cap is refused at construction", async () => {
+    const f = await fixture("live");
+    await refused(new ProcessTransport(), f.request, f.root);
+    expect(properties(scopeArgs(f.root)!)).toEqual(expect.arrayContaining([`MemoryMax=${24 * GIB}`, "MemorySwapMax=0"]));
+    for (const bad of [0, -1, 1.5, Number.NaN]) expect(() => new ProcessTransport(undefined, undefined, undefined, bad)).toThrow(/memoryMaxBytes/);
   });
 });
 }
@@ -372,5 +696,79 @@ describe("process transport startup diagnostics", () => {
     expect(result.error).toContain("worker-bootstrap-sentinel 界面");
     expect(result.error).not.toContain("�");
     expect(result.error!.length).toBeLessThan(21000);
+  });
+});
+
+// smarty-dev#8257 MECHANISM (env only): a NEW task never inherits the parent's capped-boundary evidence,
+// while the worker's own same-run native child keeps it (opt-in preserveTaskBoundary).
+describe("taskAgentEnvironment capped-boundary evidence (smarty-dev#8257)", () => {
+  const parent = { PATH: "/task/bin:/usr/bin", FABRIC_TASK_MEMORY_MAX: "25769803776", FABRIC_TASK_CGROUP: "/a/fabric-task-x.scope",
+    FABRIC_TASK_SYSTEMD_RUN_WRAPPER: "/task/bin/systemd-run", OTHER: "kept" };
+  it("scrubs memory/cgroup/wrapper by default (new task launch), leaving PATH and others untouched", async () => {
+    const { taskAgentEnvironment } = await import("../src/agents/task-environment.js");
+    const child = taskAgentEnvironment({ ...parent });
+    expect(child.FABRIC_TASK_MEMORY_MAX).toBeUndefined();
+    expect(child.FABRIC_TASK_CGROUP).toBeUndefined();
+    expect(child.FABRIC_TASK_SYSTEMD_RUN_WRAPPER).toBeUndefined();
+    expect(child).toMatchObject({ PATH: parent.PATH, OTHER: "kept" });
+    expect(taskAgentEnvironment({ ...parent }, false).FABRIC_TASK_CGROUP).toBeUndefined();
+  });
+  it("new actor scrub keeps roles while dropping only the caller's boundary", async () => {
+    const { withoutTaskBoundary } = await import("../src/agents/task-environment.js");
+    const environment = { ...parent, SMARTY_ROLE: "actor@abcdef123456", PI_FABRIC_ROLE: "actor", PI_FABRIC_ACTOR_ID: "actor:a" };
+    const child = withoutTaskBoundary(environment);
+    expect(child).toMatchObject({ SMARTY_ROLE: environment.SMARTY_ROLE, PI_FABRIC_ROLE: "actor", PI_FABRIC_ACTOR_ID: "actor:a", PATH: parent.PATH });
+    for (const key of ["FABRIC_TASK_MEMORY_MAX", "FABRIC_TASK_CGROUP", "FABRIC_TASK_SYSTEMD_RUN_WRAPPER"]) expect(child[key]).toBeUndefined();
+    expect(environment.FABRIC_TASK_CGROUP).toBe(parent.FABRIC_TASK_CGROUP); // original task stays truthful
+  });
+  it("preserves all three for the same run when preserveTaskBoundary is true", async () => {
+    const { taskAgentEnvironment } = await import("../src/agents/task-environment.js");
+    expect(taskAgentEnvironment({ ...parent }, true)).toMatchObject({ FABRIC_TASK_MEMORY_MAX: parent.FABRIC_TASK_MEMORY_MAX,
+      FABRIC_TASK_CGROUP: parent.FABRIC_TASK_CGROUP, FABRIC_TASK_SYSTEMD_RUN_WRAPPER: parent.FABRIC_TASK_SYSTEMD_RUN_WRAPPER });
+  });
+});
+
+// smarty-dev#8257 MECHANISM (mock transport handle via ProcessTransport.launch, no OS process): the
+// public agents.stop path after a latched watcher failure. Excludes the real kernel/EPERM branch
+// (tests/task-cgroup.test.ts) and native Pi (named proof .local/out/prove-task-stop.mjs).
+describe("AgentManager stop after latched lostContact (smarty-dev#8257)", () => {
+  const debtRoots: string[] = [];
+  const debtManagers: AgentManager[] = [];
+  afterEach(async () => {
+    vi.restoreAllMocks();
+    for (const manager of debtManagers.splice(0)) await manager.close().catch(() => undefined);
+    for (const root of debtRoots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
+  });
+  const scenario = async (cgroup: string | undefined) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-stop-debt-")); debtRoots.push(root);
+    const debt = "Owned scope watcher failed: Error: EIO";
+    const stop = vi.fn(async () => {
+      if (cgroup) throw new TaskCgroupStopUnconfirmedError(cgroup, [424242], "SIGTERM/SIGKILL did not empty the subtree");
+    });
+    vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async () => ({
+      kind: "process" as const, sessionId: "424241", ...(cgroup ? { cgroup } : {}),
+      isAlive: async () => true, lostContact: () => debt, stopDebt: () => debt,
+      waitForClose: async () => undefined, closed: new Promise<void>(() => undefined), stop,
+    }));
+    const manager = new AgentManager(root, { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, sessionExport: false, timeoutMs: 60_000 },
+      { workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(root, "runs") });
+    debtManagers.push(manager);
+    const handle = await manager.spawn({ task: "HANG", transport: "process" });
+    const outcome = await manager.stop(handle.id).then(result => result, (error: unknown) => error);
+    return { stop, outcome };
+  };
+  it("a cgroup-bearing handle still runs its owned stop and surfaces TASK_CGROUP_STOP_UNCONFIRMED with exact pids", async () => {
+    const cgroup = "/user.slice/user-1.slice/user@1.service/app.slice/fabric-task-x.scope";
+    const { stop, outcome } = await scenario(cgroup);
+    expect(stop).toHaveBeenCalled();
+    expect(outcome).toBeInstanceOf(TaskCgroupStopUnconfirmedError);
+    expect((outcome as TaskCgroupStopUnconfirmedError).code).toBe("TASK_CGROUP_STOP_UNCONFIRMED");
+    expect([...(outcome as TaskCgroupStopUnconfirmedError).pids]).toEqual([424242]);
+    expect((outcome as TaskCgroupStopUnconfirmedError).cgroup).toBe(cgroup);
+  });
+  it("counterexample: an uncapped handle with the same native debt keeps logical stop (no typed throw)", async () => {
+    const { outcome } = await scenario(undefined);
+    expect(outcome).not.toBeInstanceOf(Error);
+    expect((outcome as { status?: string }).status).toBeDefined();
   });
 });

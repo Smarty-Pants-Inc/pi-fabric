@@ -98,7 +98,7 @@ describe.skipIf(process.platform !== "linux")("fabric-actors remove on a dead ro
     ["alive with the recorded start time", "same", os.hostname(), "Main is live: Main process"],
     ["reused (a different start time)", "other", os.hostname(), undefined],
     ["recorded on a foreign host", "same", "other-host", "recorded on host other-host, not this host"],
-    ["alive with no recorded start time", "none", os.hostname(), "exists and the record has no start time"],
+    ["alive with no recorded start time", "none", os.hostname(), "Main process identity unavailable (no start time for pid"],
     ["missing from the record", "nopid", os.hostname(), "no pid in the root participant record"],
   ] as const)("--main-stopped verifies the Main process identity: a pid %s", async (_name, start, host, refusal) => {
     const f = await fixture();

@@ -98,6 +98,11 @@ const runProperties = {
     description: "Child context (Pi only). task (default): the task alone. branch: a non-blocking fork of this conversation up to its last completed turn, then the task. snippet: the last seedMessages user/assistant texts prefixed to the task.",
   },
   seedMessages: { type: "integer", minimum: 1, maximum: 50, description: "snippet only; default 12" },
+  writePolicy: {
+    type: "string",
+    enum: ["unrestricted"],
+    description: "Audited opt-out of the process task default on non-overlapping layouts (write/edit restricted to cwd and run/tmp; host-owned run records excluded; shells allowed). A run dir inside cwd skips only the implicit default and logs #11705; explicit writableRoots are unchanged. Cannot be combined with readOnly/writableRoots/shell or escape inherited confinement.",
+  },
   readOnly: { type: "boolean", description: "Pi only: refuse write/edit (and shell unless shell: \"unconfined\") in the child" },
   writableRoots: {
     type: "array",
@@ -163,6 +168,17 @@ const residencySchema = {
   description: "session stops with the current Pi host; durable transfers execution to Fabric's hidden resident host.",
 };
 
+const actorSlotClaimSchema = {
+  type: "object",
+  description: "Exact won claim revision for an enforced native review slot. Reuse unchanged with the same idempotencyKey; never refresh or steal after refusal/uncertainty.",
+  properties: {
+    key: { type: "string", minLength: 1 },
+    ifVersion: { type: "integer", minimum: 1, maximum: Number.MAX_SAFE_INTEGER },
+  },
+  required: ["key", "ifVersion"],
+  additionalProperties: false,
+};
+
 const actorBindingScopeSchema = {
   type: "string",
   enum: ["session", "project", "global"],
@@ -184,7 +200,7 @@ const residentIdempotencyKeySchema = {
   type: "string",
   minLength: 1,
   maxLength: 256,
-  description: "Optional durable create/spawn retry key. Same operation and key on the same resident host returns the first result (last 256 completed requests, up to 10 minutes). Different or omitted keys create independently; no deduplication across host restarts or for session/global creation.",
+  description: "Stable creation retry identity. Enforced native slots require a caller-supplied key and unchanged request: retries retain the original admitted ID across restarts, and retired slots never reopen. Ordinary durable create/spawn uses a host-local receipt cache (last 256 completed requests, up to 10 minutes); ordinary session/global creation is not deduplicated.",
 };
 
 const spawnSchema = {
@@ -497,6 +513,16 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
     risk: "write",
   },
   {
+    name: "slotStatus",
+    description: "Read native slot-admission status. session (default) inspects this runtime's store; durable queries the actual existing selected resident host/store without starting one. Diagnostic only: cannot enable enforcement, import existing authority (#13036), or grant a claim.",
+    inputSchema: {
+      type: "object",
+      properties: { residency: residencySchema },
+      additionalProperties: false,
+    },
+    risk: "read",
+  },
+  {
     name: "create",
     description:
       'Create a persistent actor with inline instructions or instructionsFile + sha256 verified by its owning host (max 512 KB, factory root only). Use scope "global" for a reusable template.',
@@ -534,6 +560,7 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
         protected: { type: "boolean", description: "Trusted protection snapshot; true for review/security/audit/needs-security-pass. Omitted excludes before Jev." },
         residency: residencySchema,
         idempotencyKey: residentIdempotencyKeySchema,
+        slotClaim: actorSlotClaimSchema,
         runner: runProperties.runner,
         kernel: runProperties.kernel,
         model: strictModelProperty,
@@ -963,6 +990,8 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
         id: { type: "string", description: "Template id or name (one of id/name required)" },
         name: { type: "string", description: "Template name (one of id/name required)" },
         as: { type: "string", description: "Optional new name for the imported live actor" },
+        slotClaim: actorSlotClaimSchema,
+        idempotencyKey: residentIdempotencyKeySchema,
       },
       additionalProperties: false,
     },

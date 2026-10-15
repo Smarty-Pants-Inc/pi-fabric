@@ -210,7 +210,13 @@ describe("custom worker runners", () => {
     expect(context?.files.steerFile).toMatch(/steer\.jsonl$/);
     expect(context?.fabricWorker.workerArguments).toContain("--runner");
     expect(context?.writePolicy).toBeUndefined();
-    expect(fs.readFileSync(path.join(manager.runDirectory(result.id)!, "events.jsonl"), "utf8")).toContain("acme says hi");
+    let page = manager.readLog(result.id, { lines: 5000 });
+    const logLines = [...page.events];
+    while (page.hasMore) {
+      page = manager.readLog(result.id, { lines: 5000, before: page.before!, beforeGeneration: page.generation! });
+      logLines.unshift(...page.events);
+    }
+    expect(logLines.map(line => line.raw).join("\n")).toContain("acme says hi");
   });
 
   it("refuses requests needing undeclared capabilities before launch", async () => {
@@ -271,7 +277,13 @@ describe("hosted runners", () => {
     });
     expect(result.usage).toMatchObject({ input: 150, output: 30, cost: 0.75 });
     expect(questions[0]?.question).toMatchObject({ method: "select", title: "Ship?", options: ["yes", "no"] });
-    expect(fs.readFileSync(path.join(manager.runDirectory(result.id)!, "events.jsonl"), "utf8")).toContain("thinking");
+    let page = manager.readLog(result.id, { lines: 5000 });
+    const logLines = [...page.events];
+    while (page.hasMore) {
+      page = manager.readLog(result.id, { lines: 5000, before: page.before!, beforeGeneration: page.generation! });
+      logLines.unshift(...page.events);
+    }
+    expect(logLines.map(line => line.raw).join("\n")).toContain("thinking");
   });
 
   it("hands hosted runners the narrowed host scope", async () => {

@@ -63,14 +63,20 @@ describe.skipIf(!fs.existsSync(workerPath))("real trajectory executor continuati
       task: "Finish the implementation and verify it", model: "handoff-probe/executor", kernel: "typescript",
       recursive: true, extensions: true, transport: "process", sessionSeed: seed,
     });
-    const log = fs.readFileSync(path.join(directory, "runs", result.id, "events.jsonl"), "utf8");
+    let page = manager.readLog(result.id, { lines: 5000 });
+    const logLines = [...page.events];
+    while (page.hasMore) {
+      page = manager.readLog(result.id, { lines: 5000, before: page.before!, beforeGeneration: page.generation! });
+      logLines.unshift(...page.events);
+    }
+    const log = logLines.map(line => line.raw).join("\n");
     expect(result, `${result.error}\n${result.stderr}\n${log.slice(-12_000)}`).toMatchObject({
       status: "completed", turns: 3, toolCalls: 2,
       text: "Finished original assignment directly after the failed handoff; verification passed.",
     });
     expect(fs.readFileSync(path.join(directory, "continued.txt"), "utf8")).toBe("continued directly");
     expect(fs.readFileSync(path.join(directory, "partial.txt"), "utf8")).toBe("already done");
-    const events = log.trim().split("\n").map(line => JSON.parse(line));
+    const events = logLines.map(line => line.parsed as { type: string; toolName?: string; message?: { role: string; customType?: string } });
     const continuation = events.filter(event => event.type === "message_end" &&
       event.message?.role === "custom" && event.message.customType === "pi-fabric-handoff-continuation");
     expect(continuation).toHaveLength(1);

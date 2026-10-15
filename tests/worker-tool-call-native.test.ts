@@ -32,14 +32,21 @@ describe("Fabric worker -> native Pi -> whitespace fixture provider", () => {
     const directory = path.join(root, "runs", result.id);
     const rows = (file: string): Array<Record<string, any>> => fs.readFileSync(file, "utf8").trim().split("\n").map(line => JSON.parse(line));
     const provider = rows(path.join(root, "provider.jsonl"));
-    const events = rows(path.join(directory, "events.jsonl"));
+    let page = manager.readLog(result.id, { lines: 5000 });
+    const raw = page.events.map(event => event.raw);
+    while (page.hasMore) {
+      page = manager.readLog(result.id, { lines: 5000, before: page.before!, beforeGeneration: page.generation! });
+      raw.unshift(...page.events.map(event => event.raw));
+    }
+    const events: Array<Record<string, any>> = raw.map(line => JSON.parse(line));
     const session = rows(path.join(directory, "session.jsonl"));
     const evidence = process.env.FABRIC_WHITESPACE_NATIVE_EVIDENCE_DIR;
     if (evidence) {
       const out = path.join(evidence, mode); fs.mkdirSync(out, { recursive: true });
       fs.writeFileSync(path.join(out, "result.json"), JSON.stringify(result, null, 2));
       fs.copyFileSync(path.join(root, "provider.jsonl"), path.join(out, "provider.jsonl"));
-      for (const file of ["status.json", "events.jsonl", "lifecycle.jsonl", "session.jsonl"]) fs.copyFileSync(path.join(directory, file), path.join(out, file));
+      fs.writeFileSync(path.join(out, "events.jsonl"), raw.map(line => `${line}\n`).join(""));
+      for (const file of ["status.json", "lifecycle.jsonl", "session.jsonl"]) fs.copyFileSync(path.join(directory, file), path.join(out, file));
       if (fs.existsSync(path.join(root, "effects.txt"))) fs.copyFileSync(path.join(root, "effects.txt"), path.join(out, "effects.txt"));
     }
     const starts = provider.filter(row => row.type === "native-start");

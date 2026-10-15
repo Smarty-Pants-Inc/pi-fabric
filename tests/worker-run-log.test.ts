@@ -184,6 +184,12 @@ describe.skipIf(!fs.existsSync(path.resolve("dist/worker.js")))("actual worker t
       workerPath = path.join(directory, "worker-with-frozen-work-clock.mjs");
       fs.writeFileSync(workerPath, `import { importWorkerWithFrozenTerminalClock } from ${JSON.stringify(fixtureUrl)};\nawait importWorkerWithFrozenTerminalClock(${JSON.stringify(workerUrl)}, ${JSON.stringify(workClockReceipt)});\n`);
     }
+    // Observe the worker compactor's physical generation before the manager's
+    // separate terminal codec may retire the plain representation.
+    const workerExitReceipt = path.join(directory, "worker-exit.json");
+    const workerEntry = workerPath;
+    workerPath = path.join(directory, "worker-with-exit-receipt.mjs");
+    fs.writeFileSync(workerPath, `import fs from "node:fs";\nprocess.once("exit", () => {\n  const logFile = process.argv[process.argv.indexOf("--log-file") + 1];\n  fs.writeFileSync(${JSON.stringify(workerExitReceipt)}, JSON.stringify({ ino: fs.statSync(logFile).ino }));\n});\nawait import(${JSON.stringify(pathToFileURL(workerEntry).href)});\n`);
     const binary = path.join(directory, "offline-rpc.mjs");
     const clockFile = path.join(directory, "clock.json");
     const receiptFile = path.join(directory, "before-terminal.json");
@@ -261,18 +267,33 @@ process.stdin.on("end", () => {
         expect(clockReceipt.calls).toBeGreaterThan(0);
         expect(clockReceipt.restored).toBe(true);
       }
+      // Join the public owner fence so the exit receipt is complete on platforms
+      // where a logical result can precede the worker's native close.
+      await manager.finalizeRunLog(result.id);
       const file = path.join(runRoot, result.id, "events.jsonl");
       const receipt = JSON.parse(fs.readFileSync(receiptFile, "utf8")) as { ino: number; bytes: number; sha256: string };
-      const bytes = fs.readFileSync(file);
+      const workerExit = JSON.parse(fs.readFileSync(workerExitReceipt, "utf8")) as { ino: number };
       if (scenario === "pathological") {
+        // This existing NUL-padded fixture has an undelimited tail beyond the
+        // pager's pre-existing 8 MiB budget. Check its exact decoded bytes, not
+        // compressed size/hash or an empty logical event page.
+        const { readRunLogBuffer } = await import("../src/run-log-source.js");
+        const bytes = readRunLogBuffer(file);
         expect(result.compactionSkipped).toContain("MAX_TERMINAL_LOG_BYTES");
         expect(manager.listForUi()[0]?.compactionSkipped).toBe(result.compactionSkipped);
-        expect(fs.statSync(file).ino).toBe(receipt.ino);
+        expect(workerExit.ino).toBe(receipt.ino);
         expect(bytes.length).toBe(receipt.bytes);
         expect(createHash("sha256").update(bytes).digest("hex")).toBe(receipt.sha256);
       } else {
+        let page = manager.readLog(result.id, { lines: 5000 });
+        const raw = page.events.map(event => event.raw);
+        while (page.hasMore) {
+          page = manager.readLog(result.id, { lines: 5000, before: page.before!, beforeGeneration: page.generation! });
+          raw.unshift(...page.events.map(event => event.raw));
+        }
+        const bytes = Buffer.from(raw.map(line => `${line}\n`).join(""), "utf8");
         expect(result.compactionSkipped).toBeUndefined();
-        expect(fs.statSync(file).ino).not.toBe(receipt.ino);
+        expect(workerExit.ino).not.toBe(receipt.ino);
         expect(bytes.length).toBeLessThan(receipt.bytes);
         const ends = bytes.toString("utf8").trimEnd().split("\n").map((line) => JSON.parse(line)).filter((event) => event.type === "tool_execution_end");
         expect(ends).toHaveLength(scenario === "near-deadline" ? 400 : 1);

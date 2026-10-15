@@ -73,7 +73,7 @@ describe("native compiled actor activation-end result custody", () => {
             expect(archives).toHaveLength(1);
             childId = archives[0]!.replace(/\.result\.json$/, "");
             const saved = JSON.parse(fs.readFileSync(store.resultFile(childId), "utf8")) as AgentRunResult;
-            expect(saved.status, `${saved.error ?? ""} ${saved.logFile ? fs.readFileSync(saved.logFile, "utf8").slice(-4000) : ""}`).toBe("completed");
+            expect(saved.status, `${saved.error ?? ""} ${saved.text}`).toBe("completed");
             expect(saved.value).toEqual(full);
           }, { timeout: 30000 });
           if (notify) {
@@ -134,7 +134,14 @@ describe("native compiled actor activation-end result custody", () => {
       sessionFile: actor.sessionFile!, inferenceContext: "full-history", meshRoot, model: "f10-offline/activation", transport: "process",
       recursive: true, tools: [], extensions: true });
     expect(errors).toEqual([]);
-    expect(activation, activation.logFile ? fs.readFileSync(activation.logFile, "utf8").slice(-10000) : JSON.stringify(activation))
+    let page = agents.readLog(activation.id, { lines: 5000 });
+    let rows = page.events;
+    while (page.hasMore) {
+      page = agents.readLog(activation.id, { lines: 5000, before: page.before!, beforeGeneration: page.generation! });
+      rows = [...page.events, ...rows];
+    }
+    const log = rows.map(({ raw }) => raw).join("\n") + (rows.length ? "\n" : "");
+    expect(activation, activation.logFile ? log.slice(-10000) : JSON.stringify(activation))
       .toMatchObject({ status: notify ? "failed" : "completed" });
     expect(activationRequests).toBe(2);
     expect(childRequests).toBe(1);

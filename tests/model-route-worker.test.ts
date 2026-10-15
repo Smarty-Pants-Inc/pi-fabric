@@ -33,7 +33,15 @@ describe.skipIf(!fs.existsSync(workerPath))("shadow routing in real built worker
     }); managers.push(manager);
     const result = await manager.run({ task: "harmless lookup", model: pin.model, thinking: pin.effort,
       transport: "process", extensions: false, ...facts, ...(route ? { routeDecision: decision } : {}) });
-    const events = fs.readFileSync(path.join(root,"runs",result.id,"events.jsonl"),"utf8").trim().split("\n").map(line => JSON.parse(line));
+    let page = manager.readLog(result.id, { lines: 5000 });
+    const frames = [...page.events];
+    while (page.hasMore) {
+      expect(page.before).toBeDefined();
+      expect(page.generation).toBeDefined();
+      page = manager.readLog(result.id, { lines: 5000, before: page.before!, beforeGeneration: page.generation! });
+      frames.unshift(...page.events);
+    }
+    const events = frames.map(line => JSON.parse(line.raw));
     const launch = events.find(event => event.type === "fake_route_launch");
     const rows = route ? fs.readFileSync(path.join(root,"agent/fabric/model-routing.jsonl"),"utf8").trim().split("\n").map(line => JSON.parse(line)) : [];
     const saved = JSON.parse(fs.readFileSync(path.join(root, "runs", result.id, "status.json"), "utf8"));

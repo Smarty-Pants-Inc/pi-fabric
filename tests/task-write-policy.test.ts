@@ -75,8 +75,15 @@ const [mode,id]=process.argv.slice(2); if(mode==='launch'){const dir=path.join($
     ...(remote ? { placement: remote } : {}),
   }, { workerPath: worker, ...(overlap === "environment" ? {} : { runRoot }), fullCodeMode: false, meshRoot, completionRecipient: recipient });
   managers.push(manager);
-  const events = (id: string) => fs.readFileSync(path.join(manager.runDirectory(id)!, "events.jsonl"), "utf8")
-    .trim().split("\n").filter(Boolean).map(line => JSON.parse(line));
+  const events = (id: string) => {
+    let page = manager.readLog(id, { lines: 5000 });
+    let rows = page.events;
+    while (page.hasMore) {
+      page = manager.readLog(id, { lines: 5000, before: page.before!, beforeGeneration: page.generation! });
+      rows = [...page.events, ...rows];
+    }
+    return rows.map(({ raw }) => JSON.parse(raw));
+  };
   return { root, cwd, outside, manager, events, meshRoot, recipient, runRoot };
 };
 const report = async (f: ReturnType<typeof fixture>, request: Partial<AgentRunRequest> = {}) => {
@@ -200,10 +207,29 @@ describe("local process task write default", () => {
       expect(fs.existsSync(f.outside)).toBe(false);
       for (const name of ["completion-recipient.json", "status.json", "events.jsonl"]) {
         const file = path.join(run, name);
-        const before = fs.readFileSync(file, "utf8");
+        let before: string;
+        if (name === "events.jsonl") {
+          let page = f.manager.readLog(result.id, { lines: 5000 });
+          let rows = page.events;
+          while (page.hasMore) {
+            page = f.manager.readLog(result.id, { lines: 5000, before: page.before!, beforeGeneration: page.generation! });
+            rows = [...page.events, ...rows];
+          }
+          before = rows.map(({ raw }) => raw).join("\n") + (rows.length ? "\n" : "");
+        } else before = fs.readFileSync(file, "utf8");
         await expect(provider.invoke("write", { path: file, content: "redirected" }, context)).rejects.toThrow(/outside writable roots/);
         await expect(provider.invoke("edit", { path: file, edits: [{ oldText: before, newText: "redirected" }] }, context)).rejects.toThrow(/outside writable roots/);
-        expect(fs.readFileSync(file, "utf8")).toBe(before);
+        let after: string;
+        if (name === "events.jsonl") {
+          let page = f.manager.readLog(result.id, { lines: 5000 });
+          let rows = page.events;
+          while (page.hasMore) {
+            page = f.manager.readLog(result.id, { lines: 5000, before: page.before!, beforeGeneration: page.generation! });
+            rows = [...page.events, ...rows];
+          }
+          after = rows.map(({ raw }) => raw).join("\n") + (rows.length ? "\n" : "");
+        } else after = fs.readFileSync(file, "utf8");
+        expect(after).toBe(before);
       }
       expect(completionRecipientFromRun(f.meshRoot, run)).toEqual(f.recipient);
       await provider.invoke("write", { path: path.join(value.tmpdir, "nested.txt"), content: "scratch-one" }, context);

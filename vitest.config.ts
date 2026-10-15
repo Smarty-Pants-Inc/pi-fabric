@@ -53,6 +53,25 @@ const hostedOnlyDeletionSuites = [
   "tests/worker-run-log.test.ts", // actual compactor and real worker finalization.
   "tests/worker-run-log-legacy-reuse.test.ts", // direct successful terminal log replacement.
   "tests/durable-worker-e2e.test.ts", // real worker completion can retire its owned plain log.
+  "tests/judge-worker.test.ts", // judgment manager close retires its owned plain log.
+  "tests/model-route-worker.test.ts", // real worker finalization and worktree cleanup.
+  "tests/worker-native-session-id.test.ts", // real worker finalization and actor source cleanup.
+  "tests/worker-activation-window.test.ts", // real terminal worker and actor log retirement.
+  "tests/worker-overload.test.ts", // real terminal manager log retirement.
+  "tests/worker-retry-profile.test.ts", // real terminal manager log retirement.
+  "tests/worker-pi-bash-guard.test.ts", // real terminal manager log retirement.
+  "tests/actor-child-routing-native.test.ts", // real terminal child/actor retirement and cleanup.
+  "tests/sender-headers.test.ts", // real terminal manager log retirement.
+  "tests/runner-adapters.test.ts", // real process/hosted manager log retirement.
+  "tests/durable-fabric-exec.test.ts", // real terminal durable worker log retirement.
+  "tests/worker-resident-startup.test.ts", // real terminal startup-probe log retirement.
+  "tests/durable-runner.test.ts", // real hosted manager log retirement.
+  "tests/worker-model-admission.test.ts", // real terminal manager log retirement.
+  "tests/handoff-continuation-worker.test.ts", // real terminal continuation-worker log retirement.
+  "tests/durable-worker-routing.test.ts", // real terminal manager log retirement.
+  "tests/process-placement.test.ts", // real terminal local-fallback log retirement.
+  "tests/worker-profile-extensions.test.ts", // real terminal manager log retirement.
+  "tests/residency-windows-main-parity.test.ts", // positive legacy terminal compaction replaces plain logs.
   "tests/worker-child-questions.test.ts", // real worker terminal/cancelled completion.
   "tests/worker-e2e.test.ts", // real worker finalization; also explicitly selected by hosted check.
   "tests/worker-exit-grace.test.ts", // real worker completed/failed terminal paths.

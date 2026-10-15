@@ -352,8 +352,13 @@ describe("activation worker admission (offline transport fixture)", () => {
     managers.push(manager);
     const result = await manager.run({ task: "must not infer", actorId: "same-actor", sessionFile: path.join(dir, "actor.jsonl"), inferenceContext: "activation", extensions: false, tools: [], transport: "process" });
     expect(["failed", "timed_out"]).toContain(result.status);
-    const logPath = path.join(dir, "runs", result.id, "events.jsonl");
-    const log = fs.existsSync(logPath) ? fs.readFileSync(logPath, "utf8") : "";
+    let page = manager.readLog(result.id, { lines: 5000 });
+    let rows = page.events;
+    while (page.hasMore) {
+      page = manager.readLog(result.id, { lines: 5000, before: page.before!, beforeGeneration: page.generation! });
+      rows = [...page.events, ...rows];
+    }
+    const log = rows.map(({ raw }) => raw).join("\n") + (rows.length ? "\n" : "");
     expect(log).not.toContain('"type":"prompt"');
     expect(log).not.toContain('"type":"message_start"');
     if (scenario !== "timeout") expect(result.error).toMatch(/activation window|before.*admission|model selection/);
@@ -387,9 +392,20 @@ describe("native activation window (offline; opted-in success needs exact native
     return after;
   };
   // The run's event log shows how far the worker and child Pi got.
-  const explain = (result: { logFile?: string }) => {
-    const log = result.logFile && fs.existsSync(result.logFile) ? fs.readFileSync(result.logFile, "utf8") : "";
-    return `${JSON.stringify(result)}\n${log.slice(-12_000)}`;
+  const explain = (owner: AgentManager | ActorManager, result: { id: string }, actorId?: string) => {
+    let page = owner instanceof ActorManager
+      ? owner.readLog(actorId!, { type: "run", runId: result.id, lines: 5000 }).run!
+      : owner.readLog(result.id, { lines: 5000 });
+    let rows = page.events;
+    while (page.hasMore) {
+      const cursor = { lines: 5000, before: page.before!, beforeGeneration: page.generation! };
+      page = owner instanceof ActorManager
+        ? owner.readLog(actorId!, { type: "run", runId: result.id, ...cursor }).run!
+        : owner.readLog(result.id, cursor);
+      rows = [...page.events, ...rows];
+    }
+    const log = rows.map(({ raw }) => raw).join("\n") + (rows.length ? "\n" : "");
+    return { log, message: `${JSON.stringify(result)}\n${log.slice(-12_000)}` };
   };
   const setup = async (toolRounds = 0, oversizedRound = 0, toolTask?: string,
     api: "openai-completions" | "google-generative-ai" = "openai-completions", fabric = false, runtimeTool = false,
@@ -597,8 +613,8 @@ describe("native activation window (offline; opted-in success needs exact native
     const before = readJournal(journal);
     const result = await s.manager.run({ task: "CURRENT_FULL_HISTORY_EVENT", model: "window-test/offline", actorId: "full-history-actor",
       sessionFile: journal, tools: [], extensions: false, transport: "process" });
-    expect(result, explain(result)).toMatchObject({ status: "completed", text: "useful current result" });
-    const log = fs.readFileSync(result.logFile!, "utf8");
+    const { log, message } = explain(s.manager, result);
+    expect(result, message).toMatchObject({ status: "completed", text: "useful current result" });
     expect(log).toContain('"type":"fabric_context_compaction"');
     const dispatch = s.requests.find(payload => JSON.stringify(payload.messages).includes("CURRENT_FULL_HISTORY_EVENT"));
     expect(dispatch).toBeDefined();
@@ -636,8 +652,10 @@ describe("native activation window (offline; opted-in success needs exact native
     await actors.ask(actor.id, "CURRENT_3238_ACTIVATION");
     const info = actors.status(actor.id);
     const result = await s.manager.wait(info.lastRunId!);
-    expect(result, explain(result)).toMatchObject({ status: "completed", text: "useful current result" });
-    const log = fs.readFileSync(result.logFile!, "utf8");
+    const { log, message } = explain(
+      actors.readLog(actor.id, { type: "run", lines: 5000 }).retainedRuns.includes(result.id) ? actors : s.manager,
+      result, actor.id);
+    expect(result, message).toMatchObject({ status: "completed", text: "useful current result" });
     expect(log).toContain('"type":"fabric_context_compaction"');
     expect(log).not.toContain("Context exceeds window");
     const dispatches = s.requests.filter(payload => JSON.stringify(payload.messages).includes("CURRENT_3238_ACTIVATION"));
@@ -671,7 +689,7 @@ describe("native activation window (offline; opted-in success needs exact native
     if (evidence) {
       fs.mkdirSync(evidence, { recursive: true });
       fs.writeFileSync(path.join(evidence, `native-3238-${mode}-result.json`), JSON.stringify({ oldId, finalId, requestCount: s.requestCount, result, info }, null, 2));
-      fs.copyFileSync(result.logFile!, path.join(evidence, `native-3238-${mode}-events.jsonl`));
+      fs.writeFileSync(path.join(evidence, `native-3238-${mode}-events.jsonl`), log);
     }
   }, TEST_GUARD_MS);
 
@@ -697,21 +715,21 @@ describe("native activation window (offline; opted-in success needs exact native
     expect(before.bytes.length).toBeLessThan(20 * 1024 * 1024);
     const result = await s.manager.run({ task: "CURRENT_OVER_CAP_EVENT", model: "window-test/offline", actorId: "over-cap-actor",
       sessionFile: journal, tools: [], extensions: false, transport: "process", timeoutMs: 20_000 });
+    const { log, message } = explain(s.manager, result);
     const evidence = process.env.FABRIC_CONTEXT_ADMISSION_EVIDENCE_DIR;
     if (evidence) {
       fs.mkdirSync(evidence, { recursive: true });
       fs.writeFileSync(path.join(evidence, `native-cap-${mode}-result.json`), JSON.stringify({ historyBytes: before.bytes.length, requestCount: s.requestCount, result }, null, 2));
-      fs.copyFileSync(result.logFile!, path.join(evidence, `native-cap-${mode}-events.jsonl`));
+      fs.writeFileSync(path.join(evidence, `native-cap-${mode}-events.jsonl`), log);
     }
-    const log = fs.readFileSync(result.logFile!, "utf8");
-    expect(log, explain(result)).toContain('"type":"fabric_context_compaction"');
-    expect(result.status, explain(result)).not.toBe("timed_out");
+    expect(log, message).toContain('"type":"fabric_context_compaction"');
+    expect(result.status, message).not.toBe("timed_out");
     if (mode === "reducible") {
-      expect(result, explain(result)).toMatchObject({ status: "completed", text: "useful current result" });
+      expect(result, message).toMatchObject({ status: "completed", text: "useful current result" });
       expect(s.requests.some(payload => JSON.stringify(payload.messages).includes("CURRENT_OVER_CAP_EVENT"))).toBe(true);
       expectJournalAppended(journal, before, true);
     } else {
-      expect(result, explain(result)).toMatchObject({ status: "completed", text: "useful current result" });
+      expect(result, message).toMatchObject({ status: "completed", text: "useful current result" });
       expect(log.match(/"type":"fabric_context_compaction"/g)).toHaveLength(1);
       expect(log.match(/"type":"fabric_context_reseed"/g)).toHaveLength(1);
       expect(s.requests.some(payload => JSON.stringify(payload.messages).includes("CURRENT_OVER_CAP_EVENT"))).toBe(true);
@@ -739,8 +757,8 @@ describe("native activation window (offline; opted-in success needs exact native
     const before = readJournal(journal);
     const result = await s.manager.run({ task: "CURRENT_VISIBLE_ACTIVATION", model: "window-test/offline", actorId: "visible-over-cap-actor",
       sessionFile: journal, tools: [], extensions: false, transport: "process", timeoutMs: 30_000 });
-    expect(result, explain(result)).toMatchObject({ status: "completed", text: "useful current result" });
-    const log = fs.readFileSync(result.logFile!, "utf8");
+    const { log, message } = explain(s.manager, result);
+    expect(result, message).toMatchObject({ status: "completed", text: "useful current result" });
     expect(log.match(/"type":"fabric_context_reseed"/g)).toHaveLength(1);
     const dispatches = s.requests.filter(payload => JSON.stringify(payload.messages).includes("CURRENT_VISIBLE_ACTIVATION"));
     expect(dispatches).toHaveLength(1);
@@ -762,7 +780,7 @@ describe("native activation window (offline; opted-in success needs exact native
       fs.mkdirSync(evidence, { recursive: true });
       fs.writeFileSync(path.join(evidence, `native-visible-${mode}-result.json`), JSON.stringify({ oldId, finalId,
         removedStateDispatched: dispatched.includes("REMOVED_STATE_SENTINEL"), pendingWorkDispatched: dispatched.includes("CURRENT_PENDING_WORK"), result }, null, 2));
-      fs.copyFileSync(result.logFile!, path.join(evidence, `native-visible-${mode}-events.jsonl`));
+      fs.writeFileSync(path.join(evidence, `native-visible-${mode}-events.jsonl`), log);
     }
   }, TEST_GUARD_MS);
 
@@ -905,7 +923,7 @@ describe("native activation window (offline; opted-in success needs exact native
     const s = await setup(0, 0, undefined, "google-generative-ai");
     const result = await s.manager.run({ task: "CURRENT_GOOGLE_ACTIVATION", model: "window-test/offline", actorId: "google-actor",
       sessionFile: path.join(s.dir, "actor.jsonl"), inferenceContext: "activation", tools: [], extensions: false, transport: "process" });
-    expect(result, explain(result)).toMatchObject({ status: "completed", text: "useful current result" });
+    expect(result, explain(s.manager, result).message).toMatchObject({ status: "completed", text: "useful current result" });
     expect(s.requestCount).toBe(1);
     expect(s.requests).toHaveLength(1);
     expect(JSON.stringify(s.requests)).toContain("CURRENT_GOOGLE_ACTIVATION");
@@ -916,7 +934,7 @@ describe("native activation window (offline; opted-in success needs exact native
     const s = await setup();
     fs.writeFileSync(s.settingsFile, JSON.stringify({ compaction: { enabled: false }, enableInstallTelemetry: false }));
     const result = await s.manager.run({ task: "must not infer", model: "window-test/offline", actorId: "same-actor", sessionFile: path.join(s.dir, "actor.jsonl"), inferenceContext: "activation", tools: [], extensions: false, transport: "process" });
-    expect(result, explain(result)).toMatchObject({ status: "failed" });
+    expect(result, explain(s.manager, result).message).toMatchObject({ status: "failed" });
     expect(result.error).toContain("--no-auto-compaction");
     expect(s.requests).toHaveLength(0);
   }, TEST_GUARD_MS);
@@ -930,13 +948,13 @@ describe("native activation window (offline; opted-in success needs exact native
     const before = readJournal(journal);
     const registeredId = session.getSessionId();
     const result = await s.manager.run({ task: "CURRENT_DEFAULT", model: "window-test/offline", actorId: "same-actor", sessionFile: journal, tools: [], extensions: false, transport: "process" });
-    expect(result, explain(result)).toMatchObject({ status: "completed", text: "useful current result" });
+    const { log, message } = explain(s.manager, result);
+    expect(result, message).toMatchObject({ status: "completed", text: "useful current result" });
     expect(s.requests).toHaveLength(1);
     expect(JSON.stringify(s.requests)).toContain("OLD_DEFAULT_HISTORY");
     expect(JSON.stringify(s.requests)).toContain("CURRENT_DEFAULT");
     expectJournalAppended(journal, before);
     expect(SessionManager.open(journal).getSessionId()).toBe(registeredId);
-    const log = fs.readFileSync(result.logFile!, "utf8");
     expect(log).not.toMatch(/fabric_context_compaction|fabric_context_reseed/);
     expect(fs.readFileSync(s.settingsFile, "utf8")).toBe(s.settings);
   }, TEST_GUARD_MS);
@@ -951,7 +969,7 @@ describe("native activation window (offline; opted-in success needs exact native
       : assistant("old reply", 90_000));
     const before = readJournal(journal);
     const result = await s.manager.run({ task: "CURRENT_ACTIVATION", model: "window-test/offline", actorId: "same-actor", sessionFile: journal, inferenceContext: "activation", tools: [], extensions: false, transport: "process" });
-    expect(result, explain(result)).toMatchObject({ status: "completed", text: "useful current result" });
+    expect(result, explain(s.manager, result).message).toMatchObject({ status: "completed", text: "useful current result" });
     expect(s.requests).toHaveLength(1);
     expect(JSON.stringify(s.requests)).not.toContain("OLD_PRIVATE_ACTIVATION");
     expect(JSON.stringify(s.requests)).toContain("CURRENT_ACTIVATION");
@@ -992,7 +1010,7 @@ describe("native activation window (offline; opted-in success needs exact native
     session.appendMessage({ role: "toolResult", toolCallId: "old-read", toolName: "read", content: [{ type: "text", text: "HUGE_PRIVATE_TOOL_RESULT " + "x".repeat(1_100_000) }], isError: false, timestamp: 3 });
     const before = readJournal(journal);
     const result = await s.manager.run({ task: "CURRENT_ACTIVATION", systemPrompt: "CURRENT_INSTRUCTIONS", model: "window-test/offline", actorId: "same-actor", sessionFile: journal, inferenceContext: "activation", tools: [], extensions: true, transport: "process" });
-    expect(result, explain(result)).toMatchObject({ status: "completed", text: "useful current result" });
+    expect(result, explain(s.manager, result).message).toMatchObject({ status: "completed", text: "useful current result" });
     expect(s.requests).toHaveLength(1);
     expect(JSON.stringify(s.requests)).not.toContain("HUGE_PRIVATE_TOOL_RESULT");
     expect(JSON.stringify(s.requests)).not.toContain("OLD_PRIVATE_ACTIVATION");
@@ -1267,7 +1285,7 @@ describe("native activation window (offline; opted-in success needs exact native
     const result = await s.manager.run({task: "CURRENT_COMPOSED_ACTIVATION", model: "window-test/offline",
       actorId: "same-actor", sessionFile: journal, inferenceContext: "activation", tools: ["read"],
       extensions: true, transport: "process"});
-    expect(result, explain(result)).toMatchObject({status: "completed", text: "useful current result"});
+    expect(result, explain(s.manager, result).message).toMatchObject({status: "completed", text: "useful current result"});
     expect(s.requestCount).toBe(6);
     expect(s.requests).toHaveLength(6);
     expect(fs.readFileSync(transforms, "utf8")).toBe("first\nlast\n".repeat(6));
@@ -1366,8 +1384,8 @@ describe("native activation window (offline; opted-in success needs exact native
     const result = await s.manager.run({ task: "Activate Fabric, then finish.", model: "window-test/offline",
       actorId: "eof-actor", sessionFile: journal, inferenceContext: "activation", extensions: true,
       tools: ["fabric_exec"], transport: "process", meshRoot });
-    expect(result, explain(result)).toMatchObject({ status: "completed", text: "useful current result" });
-    expect(result.warnings ?? [], explain(result)).toEqual([]);
+    expect(result, explain(s.manager, result).message).toMatchObject({ status: "completed", text: "useful current result" });
+    expect(result.warnings ?? [], explain(s.manager, result).message).toEqual([]);
     expect(s.requests).toHaveLength(2); // Fabric execution initialized its real runtime.
     expect(JSON.parse(fs.readFileSync(marker, "utf8"))).toEqual({ held: true });
   }, TEST_GUARD_MS);
@@ -1435,20 +1453,21 @@ describe("native activation window (offline; opted-in success needs exact native
       const handle = await s.manager.spawn({ task: "Activate Fabric, then finish with a full result.", model: "window-test/offline",
         extensions: true, tools: ["fabric_exec"], transport: "process", meshRoot });
       const result = await s.manager.wait(handle.id);
+      const { log, message } = explain(s.manager, result);
       const evidence = process.env.FABRIC_TASK_EXIT_EVIDENCE_DIR;
       if (evidence) {
         fs.mkdirSync(evidence, {recursive:true});
         const prefix = slowExit ? "task-slow-exit" : "task-mesh-cancel";
         fs.writeFileSync(path.join(evidence, prefix + "-result.json"), JSON.stringify(result, null, 2));
-        fs.copyFileSync(result.logFile!, path.join(evidence, prefix + "-events.jsonl"));
+        fs.writeFileSync(path.join(evidence, prefix + "-events.jsonl"), log);
         if (fs.existsSync(marker)) fs.copyFileSync(marker, path.join(evidence, prefix + "-shutdown.json"));
         if (fs.existsSync(termMarker)) fs.copyFileSync(termMarker, path.join(evidence, prefix + "-term.json"));
         for (const file of ["settlement.json", "status.json"]) {
           fs.copyFileSync(path.join(path.dirname(result.logFile!), file), path.join(evidence, prefix + "-" + file));
         }
       }
-      expect(result, explain(result)).toMatchObject({ status: "completed", text: finalText });
-      expect(result.error, explain(result)).toBeUndefined();
+      expect(result, message).toMatchObject({ status: "completed", text: finalText });
+      expect(result.error, message).toBeUndefined();
       expect(s.requests).toHaveLength(2); // Real task SDK entry initialized Fabric, then inferred a final answer.
       expect(JSON.parse(fs.readFileSync(marker, "utf8"))).toMatchObject({held: true});
       const directory = path.dirname(result.logFile!);
@@ -1464,7 +1483,7 @@ describe("native activation window (offline; opted-in success needs exact native
             status: "running", receipt: {outcome: "completed", runId: handle.id, text: finalText},
           });
         }
-      } else expect(result.warnings ?? [], explain(result)).toEqual([]);
+      } else expect(result.warnings ?? [], message).toEqual([]);
       expect(await holderClosed).toBe(0);
     } finally {
       if (holder.exitCode === null && holder.signalCode === null) holder.kill("SIGKILL");
@@ -1487,15 +1506,18 @@ describe("native activation window (offline; opted-in success needs exact native
       // Retain the failed run too, so release qualification records the exact refusal.
       await actors.ask(actor.id, task).catch(() => undefined);
       const result = await run.mock.results.at(-1)!.value;
+      const { log, message } = explain(
+        actors.readLog(actor.id, { type: "run", lines: 5000 }).retainedRuns.includes(result.id) ? actors : s.manager,
+        result, actor.id);
       const evidence = process.env.FABRIC_ACTIVATION_TEST_EVIDENCE_DIR;
       if (evidence) {
         fs.mkdirSync(evidence, { recursive: true });
         fs.writeFileSync(path.join(evidence, task + "-result.json"), JSON.stringify(result, null, 2));
-        fs.copyFileSync(result.logFile!, path.join(evidence, task + "-events.jsonl"));
+        fs.writeFileSync(path.join(evidence, task + "-events.jsonl"), log);
         if (fs.existsSync(journal)) fs.copyFileSync(journal, path.join(evidence, task + "-session.jsonl"));
         fs.writeFileSync(path.join(evidence, "requests.json"), JSON.stringify(s.requests, null, 2));
       }
-      expect(result, explain(result)).toMatchObject({ status: "completed", text: "useful current result" });
+      expect(result, message).toMatchObject({ status: "completed", text: "useful current result" });
       const records = buildSessionContext(SessionManager.open(journal).getBranch()).messages;
       const system = getCurrentSystemMessage(records as never)!;
       expect(system.content).toBe("");
@@ -1526,7 +1548,7 @@ describe("native activation window (offline; opted-in success needs exact native
     ] as const) {
       const requestStart = s.requests.length;
       const result = await s.manager.run({ ...request, task });
-      expect(result, explain(result)).toMatchObject({ status: "completed", text: "useful current result" });
+      expect(result, explain(s.manager, result).message).toMatchObject({ status: "completed", text: "useful current result" });
       const inputs = s.requests.slice(requestStart);
       expect(inputs).toHaveLength(2);
       expect(JSON.stringify(inputs)).not.toContain(excluded);

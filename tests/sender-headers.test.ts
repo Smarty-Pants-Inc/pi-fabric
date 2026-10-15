@@ -193,8 +193,14 @@ describe.skipIf(!fs.existsSync(workerPath))("sender headers in real built worker
       ...(spawnerName ? { spawnerName } : {}),
     }); managers.push(manager);
     const result = await manager.run({ task: "harmless", model: "openai-codex/gpt-5.6-sol", transport: "process", extensions: false, ...facts });
-    const events = fs.readFileSync(path.join(root, "runs", result.id, "events.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
-    return { result, launch: events.find(event => event.type === "fake_sender_headers") };
+    let page = manager.readLog(result.id, { lines: 5000 });
+    const logLines = [...page.events];
+    while (page.hasMore) {
+      page = manager.readLog(result.id, { lines: 5000, before: page.before!, beforeGeneration: page.generation! });
+      logLines.unshift(...page.events);
+    }
+    const events = logLines.map(line => line.parsed as { type: string; headers: Record<string, string> });
+    return { result, launch: events.find(event => event.type === "fake_sender_headers")! };
   };
 
   it("process task child: loads the -e hook with --no-extensions and sends role task, its name and the Main's name", async () => {

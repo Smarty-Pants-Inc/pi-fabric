@@ -110,7 +110,14 @@ describe("R3 routed session boundaries", () => {
     try {
       const handle = await manager.spawn({ task: "Probe checkout with bash", routeDecision: await decision("route-offline/offline"), transport: "process", worktree: true, extensions: false, tools: ["bash"] }); child = handle.id;
       const result = await manager.wait(handle.id);
-      expect(result, JSON.stringify(result) + (result.logFile ? fs.readFileSync(result.logFile, "utf8").slice(-8000) : "")).toMatchObject({ status: "completed" });
+      let page = manager.readLog(result.id, { lines: 5000 });
+      let rows = page.events;
+      while (page.hasMore) {
+        page = manager.readLog(result.id, { lines: 5000, before: page.before!, beforeGeneration: page.generation! });
+        rows = [...page.events, ...rows];
+      }
+      const log = rows.map(({ raw }) => raw).join("\n") + (rows.length ? "\n" : "");
+      expect(result, JSON.stringify(result) + log.slice(-8000)).toMatchObject({ status: "completed" });
       expect(requests).toHaveLength(2);
       expect(result.text).toContain("committed-worktree");
       // Native bash on Windows reports POSIX `pwd` (/tmp/..., /c/...); the same bash's `cygpath -w`

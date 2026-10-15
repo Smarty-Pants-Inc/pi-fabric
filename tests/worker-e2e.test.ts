@@ -29,7 +29,7 @@ describe.skipIf(!hasWorker)("AgentManager real worker e2e", () => {
     for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
   });
 
-  const run = async (task = "do it", timeoutMs = 2_000): Promise<AgentRunResult> => {
+  const run = async (task = "do it", timeoutMs = 2_000): Promise<{ manager: AgentManager; result: AgentRunResult }> => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-e2e-"));
     roots.push(root);
     const config = { ...DEFAULT_FABRIC_CONFIG.agents, runner: "pi" as const, timeoutMs, maxConcurrent: 1 };
@@ -39,7 +39,8 @@ describe.skipIf(!hasWorker)("AgentManager real worker e2e", () => {
       runRoot: root,
     });
     managers.push(manager);
-    return manager.run({ task, transport: "process" });
+    const result = await manager.run({ task, transport: "process" });
+    return { manager, result };
   };
 
   it("persists the spawn-selected compatible installed release in the real worker record", async () => {
@@ -129,7 +130,7 @@ if (process.argv.includes('--descendant')) {
     const previous = process.env.FAKE_PI_BEHAVIOR;
     process.env.FAKE_PI_BEHAVIOR = behavior;
     try {
-      const result = await run("inference consumption evidence", 8000);
+      const { result } = await run("inference consumption evidence", 8000);
       expect(result.inferenceStarted).toBe(behavior === "success" || behavior === "terminated-recover");
       if (behavior === "error-only-turn") {
         expect(result.status).toBe("failed");
@@ -156,7 +157,7 @@ if (process.argv.includes('--descendant')) {
     process.env[present] = "sentinel";
     delete process.env[absent];
     try {
-      const result = await run("report env presence booleans");
+      const { result } = await run("report env presence booleans");
       expect(result.status).toBe("completed");
       expect(result.text).toBe(`${present}=present ${absent}=absent`);
     } finally {
@@ -261,7 +262,7 @@ if (process.argv.includes('--descendant')) {
   const cases: Array<{
     behavior: string;
     timeoutMs?: number;
-    check: (r: AgentRunResult) => void;
+    check: (r: AgentRunResult, manager: AgentManager) => void;
   }> = [
     {
       behavior: "success",
@@ -280,14 +281,16 @@ if (process.argv.includes('--descendant')) {
     },
     {
       behavior: "stderr-framing",
-      check: (r) => {
+      check: (r, manager) => {
         expect(r.status).toBe("completed");
         expect(r.text).toBe("trusted");
-        const events = fs
-          .readFileSync(r.logFile!, "utf8")
-          .trim()
-          .split("\n")
-          .map((line) => JSON.parse(line) as Record<string, unknown>);
+        let page = manager.readLog(r.id, { lines: 5000 });
+        let rows = page.events;
+        while (page.hasMore) {
+          page = manager.readLog(r.id, { lines: 5000, before: page.before!, beforeGeneration: page.generation! });
+          rows = [...page.events, ...rows];
+        }
+        const events = rows.map(({ raw }) => JSON.parse(raw) as Record<string, unknown>);
         expect(events.some((event) => event.type === "worker_stderr")).toBe(true);
         expect(
           events.some(
@@ -383,9 +386,9 @@ if (process.argv.includes('--descendant')) {
 
   it.each(cases)("maps child behavior $behavior to the correct run outcome", async ({ behavior, timeoutMs, check }) => {
     process.env.FAKE_PI_BEHAVIOR = behavior;
-    const result = await run("do it", timeoutMs);
+    const { manager, result } = await run("do it", timeoutMs);
     try {
-      check(result);
+      check(result, manager);
     } catch (error) {
       throw new Error(
         `${behavior}: ${(error as Error).message} (status=${result.status} error=${result.error ?? ""})`,
@@ -395,24 +398,36 @@ if (process.argv.includes('--descendant')) {
 
   it("survives recovery with model streaming for more than 60 seconds and no tool execution", async () => {
     process.env.FAKE_PI_BEHAVIOR = "terminated-stream-recover";
-    const result = await run("compose a long edit", 120_000);
+    const { manager, result } = await run("compose a long edit", 120_000);
     expect(result.status).toBe("completed");
     expect(result.error).toBeUndefined();
     expect(result.text).toBe("stream recovered");
     expect(result.toolCalls).toBe(0);
-    const events = fs.readFileSync(result.logFile!, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+    let page = manager.readLog(result.id, { lines: 5000 });
+    let rows = page.events;
+    while (page.hasMore) {
+      page = manager.readLog(result.id, { lines: 5000, before: page.before!, beforeGeneration: page.generation! });
+      rows = [...page.events, ...rows];
+    }
+    const events = rows.map(({ raw }) => JSON.parse(raw));
     expect(events.filter((event) => event.type === "message_update")).toHaveLength(9);
     expect(events.some((event) => event.type === "fabric_recovery_error")).toBe(false);
   }, 90_000);
 
   it("survives an accepted retry followed by 70 seconds of silent reasoning", async () => {
     process.env.FAKE_PI_BEHAVIOR = "terminated-silent-recover";
-    const result = await run("reason silently then answer", 120_000);
+    const { manager, result } = await run("reason silently then answer", 120_000);
     expect(result.status).toBe("completed");
     expect(result.error).toBeUndefined();
     expect(result.text).toBe("silent reasoning recovered");
     expect(result.toolCalls).toBe(0);
-    const events = fs.readFileSync(result.logFile!, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+    let page = manager.readLog(result.id, { lines: 5000 });
+    let rows = page.events;
+    while (page.hasMore) {
+      page = manager.readLog(result.id, { lines: 5000, before: page.before!, beforeGeneration: page.generation! });
+      rows = [...page.events, ...rows];
+    }
+    const events = rows.map(({ raw }) => JSON.parse(raw));
     expect(events.filter((event) => event.type === "message_start")).toEqual([
       { type: "message_start", message: { role: "assistant", content: [], stopReason: "stop" } },
     ]);
@@ -425,11 +440,17 @@ if (process.argv.includes('--descendant')) {
       process.env.FAKE_PI_BEHAVIOR = behavior;
       // Deliberately much longer than the recovery deadline: generic run timeout
       // must not be what releases wait() or the concurrency slot.
-      const result = await run("recover or fail", 120_000);
+      const { manager, result } = await run("recover or fail", 120_000);
       expect(result.status).toBe("failed");
       expect(result.error).toContain("Error: Terminated");
       expect(result.error).toContain("no model stream or tool event for 60000ms");
-      const events = fs.readFileSync(result.logFile!, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+      let page = manager.readLog(result.id, { lines: 5000 });
+      let rows = page.events;
+      while (page.hasMore) {
+        page = manager.readLog(result.id, { lines: 5000, before: page.before!, beforeGeneration: page.generation! });
+        rows = [...page.events, ...rows];
+      }
+      const events = rows.map(({ raw }) => JSON.parse(raw));
       const pid = events.find((event) => event.type === "fake_child_pid").pid;
       expect(() => process.kill(pid, 0)).toThrow();
       expect(events.filter((event) => event.type === "fabric_recovery_error")).toHaveLength(1);
@@ -441,7 +462,7 @@ if (process.argv.includes('--descendant')) {
   it.each(["large-lifecycle", "large-lifecycle-retry"])(
     "preserves progress through oversized lifecycle history (%s)", async (behavior) => {
       process.env.FAKE_PI_BEHAVIOR = behavior;
-      const result = await run("finish the image-heavy task", 10_000);
+      const { manager, result } = await run("finish the image-heavy task", 10_000);
       expect(result.status).toBe("completed");
       expect(result.error).toBeUndefined();
       const retried = behavior.endsWith("retry");
@@ -450,7 +471,13 @@ if (process.argv.includes('--descendant')) {
       expect(result.usage.output).toBe(retried ? 125 : 50);
       expect(result.toolCalls).toBe(1);
       expect(result.turns).toBe(1);
-      const log = fs.readFileSync(result.logFile!, "utf8");
+      let page = manager.readLog(result.id, { lines: 5000 });
+      let rows = page.events;
+      while (page.hasMore) {
+        page = manager.readLog(result.id, { lines: 5000, before: page.before!, beforeGeneration: page.generation! });
+        rows = [...page.events, ...rows];
+      }
+      const log = rows.map(({ raw }) => raw).join("\n") + (rows.length ? "\n" : "");
       expect(log.length).toBeLessThan(10_000);
       const events = log.trim().split("\n").map((line) => JSON.parse(line));
       expect(events.find((event) => event.type === "turn_end")).toMatchObject({ toolResults: [], turnIndex: 1 });
@@ -478,13 +505,19 @@ if (process.argv.includes('--descendant')) {
 
   it("stubs a >4 MiB image tool result for the parent and completes (smarty-dev#1907)", async () => {
     process.env.FAKE_PI_BEHAVIOR = "image-tool-result";
-    const result = await run("review the screenshot", 10_000);
+    const { manager, result } = await run("review the screenshot", 10_000);
 
     expect(result.error).toBeUndefined();
     expect(result.status).toBe("completed");
     expect(result.text).toBe("image reviewed");
     expect(result.warnings).toBeUndefined();
-    const log = fs.readFileSync(result.logFile!, "utf8");
+    let page = manager.readLog(result.id, { lines: 5000 });
+    let rows = page.events;
+    while (page.hasMore) {
+      page = manager.readLog(result.id, { lines: 5000, before: page.before!, beforeGeneration: page.generation! });
+      rows = [...page.events, ...rows];
+    }
+    const log = rows.map(({ raw }) => raw).join("\n") + (rows.length ? "\n" : "");
     expect(log.length).toBeLessThan(10_000);
     const events = log.trim().split("\n").map((line) => JSON.parse(line));
     const stub = { type: "image", elided: true, bytes: ((5 * 1024 * 1024 + 4) * 3) / 4, mimeType: "image/png" };
@@ -508,7 +541,7 @@ if (process.argv.includes('--descendant')) {
     "does not complete with stale text when the final assistant event is dropped (%s)",
     async (behavior) => {
       process.env.FAKE_PI_BEHAVIOR = behavior;
-      const result = await run("do it", 10_000);
+      const { result } = await run("do it", 10_000);
 
       expect(result.status).toBe("failed");
       expect(result.error).toContain("Agent's final assistant result was lost: Dropped an oversized agent event line (message_end");
@@ -519,7 +552,7 @@ if (process.argv.includes('--descendant')) {
 
   it("drops one oversized event line with a warning and keeps the run alive", async () => {
     process.env.FAKE_PI_BEHAVIOR = "oversized-event";
-    const result = await run("do it", 10_000);
+    const { result } = await run("do it", 10_000);
 
     expect(result.status).toBe("completed");
     expect(result.text).toBe("after oversized");
@@ -803,11 +836,13 @@ if (process.argv.includes('--descendant')) {
       attempts: 1,
       ...(error ? { error } : {}),
     });
-    const events = fs
-      .readFileSync(result.logFile!, "utf8")
-      .trim()
-      .split("\n")
-      .map((line) => JSON.parse(line) as Record<string, unknown>);
+    let page = manager.readLog(result.id, { lines: 5000 });
+    let rows = page.events;
+    while (page.hasMore) {
+      page = manager.readLog(result.id, { lines: 5000, before: page.before!, beforeGeneration: page.generation! });
+      rows = [...page.events, ...rows];
+    }
+    const events = rows.map(({ raw }) => JSON.parse(raw) as Record<string, unknown>);
     const settledIndex = events.findIndex((event) => event.type === "agent_settled");
     const compactIndex = events.findIndex((event) => event.type === "fake_compact_received");
     expect(settledIndex).toBeGreaterThanOrEqual(0);
@@ -855,7 +890,7 @@ if (process.argv.includes('--descendant')) {
     process.env.FAKE_PI_BEHAVIOR = "success";
     process.env.PI_FABRIC_INJECT_CRASH = "stream";
     try {
-      const result = await run("do it", crashRunTimeoutMs);
+      const { result } = await run("do it", crashRunTimeoutMs);
       expect(result.status, JSON.stringify(result)).toBe("failed");
       expect(result.error ?? "").toMatch(/simulated stream crash/);
     } finally {
@@ -867,7 +902,7 @@ if (process.argv.includes('--descendant')) {
     process.env.FAKE_PI_BEHAVIOR = "success";
     process.env.PI_FABRIC_INJECT_CRASH = "close";
     try {
-      const result = await run("do it", crashRunTimeoutMs);
+      const { result } = await run("do it", crashRunTimeoutMs);
       expect(result.status, JSON.stringify(result)).toBe("failed");
       expect(result.error ?? "").toMatch(/simulated close crash/);
     } finally {

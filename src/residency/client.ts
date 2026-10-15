@@ -711,6 +711,7 @@ export class ResidencyClient {
       ...(metadata.handle.kernel ? { kernel: metadata.handle.kernel } : {}),
       ...(metadata.handle.recursive ? { recursive: true } : {}),
       residency: "durable",
+      // A logical locator for this run's event log; read it through agents.log. The physical file may be compressed or replaced after the run's true terminal.
       logFile: path.join(metadata.runDirectory, "events.jsonl"),
       ...(metadata.handle.sessionId ? { sessionId: metadata.handle.sessionId } : {}),
       ...(metadata.handle.attachCommand ? { attachCommand: metadata.handle.attachCommand } : {}),

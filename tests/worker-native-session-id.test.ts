@@ -116,14 +116,24 @@ describe("native pending queues across provider recovery", () => {
     expect(manager.steer(handle.id, "NATIVE_PENDING_STEER").queued).toBe(true);
     expect(manager.followUp(handle.id, "NATIVE_PENDING_FOLLOW_UP").queued).toBe(true);
     const result = await manager.wait(handle.id);
+    let page = manager.readLog(handle.id, { lines: 5000 });
+    const frames = [...page.events];
+    while (page.hasMore) {
+      expect(page.before).toBeDefined();
+      expect(page.generation).toBeDefined();
+      page = manager.readLog(handle.id, { lines: 5000, before: page.before!, beforeGeneration: page.generation! });
+      frames.unshift(...page.events);
+    }
+    const eventText = frames.map(line => line.raw).join("\n") + "\n";
     const evidenceDirectory = process.env.FABRIC_OVERLOAD_TEST_EVIDENCE_DIR;
     if (evidenceDirectory) {
       fs.mkdirSync(evidenceDirectory, { recursive: true });
-      for (const file of ["queue-inputs.jsonl", "events.jsonl", "status.json"]) {
+      for (const file of ["queue-inputs.jsonl", "status.json"]) {
         fs.copyFileSync(path.join(runDirectory, file), path.join(evidenceDirectory, "native-pending-" + file));
       }
+      fs.writeFileSync(path.join(evidenceDirectory, "native-pending-events.jsonl"), eventText);
     }
-    expect(result, JSON.stringify(result) + "\n" + fs.readFileSync(result.logFile!, "utf8")).toMatchObject({ status: "completed", text: "queues retained", runnerSessionIds: ["queue-session"] });
+    expect(result, JSON.stringify(result) + "\n" + eventText).toMatchObject({ status: "completed", text: "queues retained", runnerSessionIds: ["queue-session"] });
     const inputs = fs.readFileSync(path.join(runDirectory, "queue-inputs.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
     for (const [type, message] of [["steer", "NATIVE_PENDING_STEER"], ["follow_up", "NATIVE_PENDING_FOLLOW_UP"]]) {
       expect(inputs.filter(frame => frame.attempt === 1 && frame.type === type && frame.message === message)).toHaveLength(1);
@@ -295,8 +305,15 @@ describe("native Pi runner session attribution", () => {
     expect(events.find(event => event.event === "run.completed")).toMatchObject({
       source: { rootId: "session:" + parent }, data: { runnerSessionId: latest, fabricSessionId: parent },
     });
-    const frames = fs.readFileSync(path.join(runDirectory, "events.jsonl"), "utf8").trim().split("\n");
-    const argv = JSON.parse(frames.find(line => line.includes("fake_session_argv"))!).argv as string[];
+    let page = agents.readLog(handle.id, { lines: 5000 });
+    const frames = [...page.events];
+    while (page.hasMore) {
+      expect(page.before).toBeDefined();
+      expect(page.generation).toBeDefined();
+      page = agents.readLog(handle.id, { lines: 5000, before: page.before!, beforeGeneration: page.generation! });
+      frames.unshift(...page.events);
+    }
+    const argv = JSON.parse(frames.find(line => line.raw.includes("fake_session_argv"))!.raw).argv as string[];
     expect(argv).not.toContain("--no-session");
     expect(argv[argv.indexOf("--session") + 1]).toBe(path.join(runDirectory, "session.jsonl"));
     expect(argv.some(arg => arg.endsWith(path.join("worker", "session-id.ts")))).toBe(true);
@@ -325,8 +342,19 @@ describe("native Pi runner session attribution", () => {
     expect(events.find(event => event.event === "run.completed")).toMatchObject({
       source: { id: actor.id, name: "metered-actor", rootId: "session:" + parent }, data: { runnerSessionId: first },
     });
-    const frames = fs.readFileSync(path.join(path.dirname(file), "events.jsonl"), "utf8").trim().split("\n");
-    expect(JSON.parse(frames.find(line => line.includes("fake_session_argv"))!).argv).toContain("--session");
+    const runLog = actors.readLog(actor.id, { type: "run", runId: reply.runId!, lines: 5000 }).run;
+    expect(runLog).toBeDefined();
+    let page = runLog!;
+    const frames = [...page.events];
+    while (page.hasMore) {
+      expect(page.before).toBeDefined();
+      expect(page.generation).toBeDefined();
+      page = actors.readLog(actor.id, { type: "run", runId: reply.runId!, lines: 5000,
+        before: page.before!, beforeGeneration: page.generation! }).run!;
+      expect(page).toBeDefined();
+      frames.unshift(...page.events);
+    }
+    expect(JSON.parse(frames.find(line => line.raw.includes("fake_session_argv"))!.raw).argv).toContain("--session");
   }, 15_000);
 
   it("records resident-host actor native identity in its retained run and lifecycle emission", async () => {

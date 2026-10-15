@@ -301,6 +301,7 @@ export interface AgentRunRecord {
   attachCommand?: string;
   branch?: string;
   worktree?: string;
+  /** A logical locator for this run's event log; read it through agents.log. The physical file may be compressed or replaced after the run's true terminal. */
   logFile?: string;
   nestedAgents?: AgentRunRecord[];
   pendingMessages?: { steering: string[]; followUp: string[] };

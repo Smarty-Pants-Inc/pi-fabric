@@ -93,7 +93,7 @@ try {
     select(activated); emit({ type: "activated_selector", phase, settings: JSON.parse(fs.readFileSync(settingsFile, "utf8")), stillRunningMain: main.pid });
     const resultFile = path.join(root, phase + "-result.json");
     const before = records.length; const warnsBefore = warnings.length;
-    pendingCall = { code: `const handle = await agents.spawn({task: "Native release proof ${phase}", model: "release-proof/child", transport: "process", extensions: ${extensions}, tools: []}); const result = await agents.wait({id: handle.id, timeoutMs: 45000}); await pi.write({path: π.resultFile, text: JSON.stringify({handle, result})}); return {handle, result};`, payloads: { resultFile }, resultFormat: "json" };
+    pendingCall = { code: `const handle = await agents.spawn({task: "Native release proof ${phase}", model: "release-proof/child", transport: "process", extensions: ${extensions}, tools: []}); const result = await agents.wait({id: handle.id, timeoutMs: 45000}); const log = await agents.log({id: handle.id, lines: 5000}); await pi.write({path: π.resultFile, text: JSON.stringify({handle, result, events: log.events})}); return {handle, result};`, payloads: { resultFile }, resultFormat: "json" };
     emit({ type: "main_tool_command", phase, ...pendingCall });
     main.stdin.write(JSON.stringify({ id: phase, type: "prompt", message: "Native Main release proof " + phase }) + "\n");
     await waitFor(row => records.indexOf(row) >= before && row.type === "agent_end");
@@ -115,7 +115,8 @@ try {
     else assert.equal(loaded.length, 0);
     fs.cpSync(run, path.join(out, "native-" + phase + "-run"), { recursive: true });
     // Native RPC redirects extension stdout to stderr before it owns stdout.
-    const printed = fs.readFileSync(value.result.logFile, "utf8").trim().split("\n").map(JSON.parse).flatMap(row => {
+    const printed = value.events.flatMap(event => {
+      const row = event.parsed;
       if (row.type === "release_origin") return [row];
       if (row.type !== "worker_stderr") return [];
       return row.text.trim().split("\n").flatMap(line => { try { const mark = JSON.parse(line); return mark.type === "release_origin" ? [mark] : []; } catch { return []; } });

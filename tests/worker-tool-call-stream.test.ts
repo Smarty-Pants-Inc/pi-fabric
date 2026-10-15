@@ -26,13 +26,21 @@ describe("real worker tool-call stream guard", () => {
     const result = await manager.run({ task, thinking: "high", transport: "process" });
     const directory = path.join(root, result.id);
     const status = JSON.parse(fs.readFileSync(path.join(directory, "status.json"), "utf8"));
-    const events = fs.readFileSync(path.join(directory, "events.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+    let page = manager.readLog(result.id, { lines: 5000 });
+    let rows = page.events;
+    while (page.hasMore) {
+      page = manager.readLog(result.id, { lines: 5000, before: page.before!, beforeGeneration: page.generation! });
+      rows = [...page.events, ...rows];
+    }
+    const log = rows.map(({ raw }) => raw).join("\n") + (rows.length ? "\n" : "");
+    const events = rows.map(({ raw }) => JSON.parse(raw));
     const lifecycle = fs.readFileSync(path.join(directory, "lifecycle.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
     const evidenceDir = process.env.FABRIC_WHITESPACE_TEST_EVIDENCE_DIR;
     if (evidenceDir) {
       fs.mkdirSync(evidenceDir, { recursive: true });
       fs.writeFileSync(path.join(evidenceDir, task + "-result.json"), JSON.stringify(result, null, 2));
-      for (const file of ["status.json", "events.jsonl", "lifecycle.jsonl"]) fs.copyFileSync(path.join(directory, file), path.join(evidenceDir, task + "-" + file));
+      fs.writeFileSync(path.join(evidenceDir, task + "-events.jsonl"), log);
+      for (const file of ["status.json", "lifecycle.jsonl"]) fs.copyFileSync(path.join(directory, file), path.join(evidenceDir, task + "-" + file));
     }
     return { manager, result, status, events, lifecycle };
   };

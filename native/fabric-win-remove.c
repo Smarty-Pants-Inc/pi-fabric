@@ -50,7 +50,10 @@
  * require the entry set of L (read on the held handle) to be exactly {owner}; close the owner handle (the directory
  * guard stays); W4 COMMIT: rename the HELD directory object to the sibling DEST (r.<64 hex>) with SetFileInformation-
  * ByHandle(FileRenameInfo), ReplaceIfExists FALSE; W5 only then, below the retired object, delete the reverified
- * owner by handle and the directory empty-only by handle; W6 one terminal line and exit. A watchdog thread on a
+ * owner by handle and the directory empty-only by handle. Repeating the SAME framed request first holds/verifies
+ * DEST against original directory ids/kind/SID/final path, then resumes W5 (full original owner proof, or empty
+ * original directory); it never opens canonical L in that cleanup branch. Zero owner ids/time denote empty-only
+ * receipt rediscovery, with the full R and its length still required. W6 one terminal line and exit. A watchdog thread on a
  * waitable timer terminates the process (exit 124, no terminal line) at the request deadline even if a system call is
  * stuck or the parent died; the monotonic deadline is also checked before every mutating phase. Terminal lines:
  * "FMR1 released cleanup clean" | "FMR1 released cleanup pending-<why>" (exit 0), "FMR1 not-owner <phase> <why>"
@@ -566,6 +569,44 @@ static wchar_t *widePath(const unsigned char *text, DWORD length) {
     return namespaced(path) ? path : (free(path), NULL);
 }
 
+/* W5 shared by a fresh W4 commit and an exact same-receipt resume. directory is ALREADY held and verified
+ * against the ORIGINAL directory ids/kind/SID; dest is its checked same-parent location. Never resolve L here.
+ * Empty means no owner/file delete at all. An added/unjudged entry always survives empty-only disposition. */
+static int meshCleanup(HANDLE directory, const wchar_t *dest, unsigned long long ownerVolume, unsigned long long ownerIndex,
+    unsigned long long ownerTime, unsigned long long ownerSize, const unsigned char *record, DWORD recordLength) {
+    static wchar_t top[MESH_MAX_PATH + 1], final[MESH_MAX_PATH + 1], ownerPath[MESH_MAX_PATH + 1];
+    int owners, extra;
+    if (finalPath(directory, top) || _wcsicmp(top, dest) != 0) return meshOut("released", "cleanup", "pending-location", 0);
+    if (heldEntries(directory, &owners, &extra)) return meshOut("released", "cleanup", "pending-entries-unreadable", 0);
+    /* Full original proof OR genuinely empty original directory, never arbitrary empty r.* by name. */
+    if (extra != 0 || owners > 1) return meshOut("released", "cleanup", "pending-extra-entries", 0);
+    if (meshExpired()) return meshOut("released", "cleanup", "pending-deadline", 0);
+    /* Rediscovered empty receipts use zero owner ids/time (R and its length remain full in the unchanged frame).
+     * If an owner arrived since JS judged empty, this request has NO file-delete authority, even if metadata fit. */
+    if (owners && ownerVolume == 0 && ownerIndex == 0 && ownerTime == 0) return meshOut("released", "cleanup", "pending-owner-unverified", 0);
+    if (owners == 1) {
+        const char *why = NULL;
+        swprintf(ownerPath, MESH_MAX_PATH + 1, L"%ls\\owner", dest);
+        HANDLE ownerFile = openJudgedIds(ownerPath, DELETE | FILE_READ_DATA | READ_CONTROL | FILE_READ_ATTRIBUTES | SYNCHRONIZE, 0,
+            ownerVolume, ownerIndex, 1, ownerTime, ownerSize, &why);
+        if (!ownerFile) return meshOut("released", "cleanup", "pending-owner-unverified", 0);
+        int recordState = sameRecord(ownerFile, record, recordLength);
+        if (recordState < 0) return meshOut("released", "cleanup", "pending-record-unreadable", 0);
+        if (recordState == 0 || finalPath(ownerFile, final) || _wcsnicmp(final, top, wcslen(top)) != 0 ||
+            _wcsicmp(final + wcslen(top), L"\\owner") != 0) return meshOut("released", "cleanup", "pending-owner-unverified", 0);
+        meshCheckpoint(L"before-owner-dispose");
+        if (meshExpired()) return meshOut("released", "cleanup", "pending-deadline", 0);
+        if (!disposeHandle(ownerFile)) return meshOut("released", "cleanup", "pending-owner-delete", 0);
+        CloseHandle(ownerFile);
+        meshCheckpoint(L"after-owner");
+    }
+    if (meshExpired()) return meshOut("released", "cleanup", "pending-deadline", 0);
+    if (!disposeHandle(directory)) return meshOut("released", "cleanup", "pending-directory-not-empty", 0);
+    CloseHandle(directory);
+    meshCheckpoint(L"after-directory");
+    return meshOut("released", "cleanup", "clean", 0);
+}
+
 static int meshRetire(void) {
     meshTimer = CreateWaitableTimerW(NULL, TRUE, NULL);
     if (!meshTimer || !meshArm(MESH_BOOT_DEADLINE_MS) || !CreateThread(NULL, 0, meshWatchdog, NULL, 0, NULL)) return refusedAt("parse", "watchdog-unavailable");
@@ -627,7 +668,16 @@ static int meshRetire(void) {
     /* W2: ancestors held, then L with DELETE (rename) and FILE_LIST_DIRECTORY, no delete sharing, held through W6. */
     const char *why = holdAncestors(lock, 0);
     if (why) return refusedAt("guard", "ancestor-not-held");
-    HANDLE directory = openJudgedIds(lock, DELETE | FILE_LIST_DIRECTORY | READ_CONTROL | FILE_READ_ATTRIBUTES | SYNCHRONIZE, 1,
+    /* A retry of the SAME framed request may find its original object already retired. Check T BEFORE L:
+     * only confirmed absence permits the ordinary W2 path. Existing destinations are never replaced; a wrong
+     * identity/kind/SID/reparse target refuses. A verified T resumes W5 without EVER opening canonical B. */
+    HANDLE directory = openJudgedIds(dest, DELETE | FILE_LIST_DIRECTORY | READ_CONTROL | FILE_READ_ATTRIBUTES | SYNCHRONIZE, 1,
+        dirVolume, dirIndex, 0, 0, 0, &why);
+    if (directory) return meshCleanup(directory, dest, ownerVolume, ownerIndex, ownerTime, ownerSize, field[8], size[8]);
+    DWORD destError = GetLastError();
+    if (!why || strcmp(why, "open failed") != 0) return refusedAt("commit", "destination-exists");
+    if (destError != ERROR_FILE_NOT_FOUND && destError != ERROR_PATH_NOT_FOUND) return refusedAt("guard", "directory-not-held");
+    directory = openJudgedIds(lock, DELETE | FILE_LIST_DIRECTORY | READ_CONTROL | FILE_READ_ATTRIBUTES | SYNCHRONIZE, 1,
         dirVolume, dirIndex, 0, 0, 0, &why);
     if (!directory) {
         /* "open failed" is set straight after CreateFileW, so its last error is still CreateFileW's. */
@@ -689,31 +739,8 @@ static int meshRetire(void) {
     free(renameInfo);
     meshCheckpoint(L"after-commit");
 
-    /* W5: only below the retired object; canonical L is never resolved again. */
-    if ((why = finalPath(directory, top)) || _wcsicmp(top, dest) != 0) return meshOut("released", "cleanup", "pending-location", 0);
-    if ((why = heldEntries(directory, &owners, &extra))) return meshOut("released", "cleanup", "pending-entries-unreadable", 0);
-    /* Unjudged entries: the owner stays as the retired object's proof for a later judged cleanup. */
-    if (owners != 1 || extra != 0) return meshOut("released", "cleanup", "pending-extra-entries", 0);
-    if (meshExpired()) return meshOut("released", "cleanup", "pending-deadline", 0);
-    swprintf(ownerPath, MESH_MAX_PATH + 1, L"%ls\\owner", dest);
-    ownerFile = openJudgedIds(ownerPath, DELETE | FILE_READ_DATA | READ_CONTROL | FILE_READ_ATTRIBUTES | SYNCHRONIZE, 0,
-        ownerVolume, ownerIndex, 1, ownerTime, ownerSize, &why);
-    if (!ownerFile) return meshOut("released", "cleanup", "pending-owner-unverified", 0);
-    recordState = sameRecord(ownerFile, field[8], size[8]);
-    if (recordState < 0) return meshOut("released", "cleanup", "pending-record-unreadable", 0);
-    if (recordState == 0 || finalPath(ownerFile, final) || _wcsnicmp(final, top, wcslen(top)) != 0 ||
-        _wcsicmp(final + wcslen(top), L"\\owner") != 0) return meshOut("released", "cleanup", "pending-owner-unverified", 0);
-    meshCheckpoint(L"before-owner-dispose");
-    if (meshExpired()) return meshOut("released", "cleanup", "pending-deadline", 0);
-    if (!disposeHandle(ownerFile)) return meshOut("released", "cleanup", "pending-owner-delete", 0);
-    CloseHandle(ownerFile); /* the delete completes at close (classic semantics: at the last close) */
-    meshCheckpoint(L"after-owner");
-    if (meshExpired()) return meshOut("released", "cleanup", "pending-deadline", 0);
-    /* Empty-only: the file system refuses a non-empty directory's disposition. */
-    if (!disposeHandle(directory)) return meshOut("released", "cleanup", "pending-directory-not-empty", 0);
-    CloseHandle(directory);
-    meshCheckpoint(L"after-directory");
-    return meshOut("released", "cleanup", "clean", 0);
+    /* W5: identical held-object cleanup for fresh retirement and same-receipt resume. */
+    return meshCleanup(directory, dest, ownerVolume, ownerIndex, ownerTime, ownerSize, field[8], size[8]);
 }
 
 int wmain(int argc, wchar_t **argv) {

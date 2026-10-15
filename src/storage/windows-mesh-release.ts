@@ -344,7 +344,7 @@ const refused = (reason: string): never => { throw new Early({ outcome: "refused
 const notOwner = (): never => { throw new Early({ outcome: "not-owner" }); };
 
 /** W1: one exact snapshot; absence is not-owner, any other doubt is a refusal (nothing changed). */
-const snapshot = (lock: string): Snapshot => {
+const snapshot = (lock: string, bounded = false): Snapshot => {
   const ownerPath = path.join(lock, "owner");
   let dir: fs.BigIntStats;
   try { dir = fs.lstatSync(lock, { bigint: true }); } catch (error) { return errno(error) === "ENOENT" ? notOwner() : refused(`lock directory unreadable (${errno(error)})`); }
@@ -358,61 +358,131 @@ const snapshot = (lock: string): Snapshot => {
     try { bytes = fs.readFileSync(ownerPath); } catch (error) { return errno(error) === "ENOENT" ? notOwner() : refused(`owner unreadable (${errno(error)})`); }
   }
   let names: string[];
-  try { names = fs.readdirSync(lock).sort(); } catch (error) { return errno(error) === "ENOENT" ? notOwner() : refused(`lock directory unreadable (${errno(error)})`); }
+  try { names = (bounded ? boundedNames(lock, 1) : fs.readdirSync(lock)).sort(); }
+  catch (error) { if (error instanceof Early) throw error; return errno(error) === "ENOENT" ? notOwner() : refused(`lock directory unreadable (${errno(error)})`); }
   return { dir, owner, bytes, names };
 };
 
 /** The judged last-write time as a FILETIME (100 ns since 1601), exactly as the helper reads it. */
 const fileTime = (stat: fs.BigIntStats): bigint => stat.mtimeNs / 100n + 116_444_736_000_000_000n;
 
-const attempt = (lock: string, record: Buffer, capability: WindowsMeshCapability, number: 1 | 2): WindowsMeshReleaseOutcome => {
+const MAX_RECEIPT_PARENT_ENTRIES = 256;
+/** Finite, nonrecursive inspection, including unrelated names. Never mutate while enumerating. One extra read
+ * distinguishes an exhausted cap from a complete listing; always close before a child can start. */
+const boundedNames = (directory: string, cap: number): string[] => {
+  const listing = fs.opendirSync(directory, { bufferSize: 32 });
   try {
-    let parent: string;
-    try { parent = fs.realpathSync.native(path.dirname(path.resolve(lock))); }
-    catch (error) { return errno(error) === "ENOENT" ? { outcome: "not-owner" } : { outcome: "refused-before-retirement", reason: `lock root unresolvable (${errno(error)})` }; }
-    const base = path.basename(lock);
-    const lockPath = path.join(parent, base);
-    // W1: a consistent exact snapshot (two equal reads; one retry), the ORIGINAL record compared in full.
+    const names: string[] = [];
+    for (let i = 0; i <= cap; i++) {
+      const entry = listing.readSync();
+      if (!entry) return names;
+      if (i === cap) refused(`retired receipt inspection exceeds ${cap} entries at ${directory} (operator action needed)`);
+      names.push(entry.name);
+    }
+    return names;
+  } finally { listing.closeSync(); }
+};
+
+/** Parent death loses JS state. The durable T name binds canonical basename + ORIGINAL directory S + FULL R.
+ * Inspect at most 256 parent entries, then judge ONE matching real directory, or refuse ambiguity. Names alone,
+ * foreign owner bytes, and arbitrary empty siblings confer no authority. Native rechecks everything under guard. */
+const rediscoverReceipt = (parent: string, base: string, record: Buffer): { retiredPath: string; dir: fs.BigIntStats; owner?: fs.BigIntStats } => {
+  const names = boundedNames(parent, MAX_RECEIPT_PARENT_ENTRIES);
+  let candidate: { retiredPath: string; dir: fs.BigIntStats } | undefined;
+  for (const name of names) {
+    if (!/^r\.[0-9a-f]{64}$/.test(name)) continue;
+    const retiredPath = path.join(parent, name);
+    let dir: fs.BigIntStats;
+    try { dir = fs.lstatSync(retiredPath, { bigint: true }); }
+    catch (error) { if (errno(error) === "ENOENT") continue; return refused(`retired receipt unreadable (${errno(error)}; operator action needed)`); }
+    if (meshRetirementName(base, dir.dev, dir.ino, record) !== name) continue;
+    if (dir.isSymbolicLink() || !dir.isDirectory()) refused("matching retired receipt is not a real directory (operator action needed)");
+    if (candidate) refused("multiple identity-bound same-R retired receipts (operator action needed; none touched)");
+    candidate = { retiredPath, dir };
+  }
+  if (!candidate) return notOwner();
+  const { retiredPath, dir } = candidate;
+  const entries = boundedNames(retiredPath, 1);
+  if (entries.length === 0) {
+    const again = fs.lstatSync(retiredPath, { bigint: true });
+    if (!again.isDirectory() || again.isSymbolicLink() || again.dev !== dir.dev || again.ino !== dir.ino || boundedNames(retiredPath, 1).length !== 0) {
+      refused("empty retired receipt changed while judged (operator action needed)");
+    }
+    return candidate; // synthetic owner fields are unusable: native may ONLY dispose an empty original directory
+  }
+  if (entries[0] !== "owner") refused("unjudged entries in matching retired receipt (operator action needed; nothing touched)");
+  // Snapshot's absence convention is NOT enough for an already matched T: lost/torn proof refuses, not not-owner.
+  let judged: Snapshot, again: Snapshot;
+  try { judged = snapshot(retiredPath, true); again = snapshot(retiredPath, true); }
+  catch (error) { if (error instanceof Early) return refused("matching retired receipt proof unavailable (operator action needed)"); throw error; }
+  if (!sameSnapshot(judged, again) || judged.dir.dev !== dir.dev || judged.dir.ino !== dir.ino ||
+      !judged.bytes.equals(record) || judged.names.length !== 1 || judged.names[0] !== "owner") {
+    refused("matching retired receipt proof differs or changed (operator action needed; nothing touched)");
+  }
+  return { ...candidate, owner: judged.owner };
+};
+
+type PreparedRelease = { request: Buffer; retiredPath: string; deadlineMs: number };
+/** Judge once. A canonical match stays on the normal fast path (NO parent scan). Only absence/record mismatch
+ * permits bounded rediscovery. Neither discovery nor immediate unknown reconciliation ever snapshots B as S. */
+const prepareRelease = (lock: string, record: Buffer): PreparedRelease => {
+  let parent: string;
+  try { parent = fs.realpathSync.native(path.dirname(path.resolve(lock))); }
+  catch (error) { return errno(error) === "ENOENT" ? notOwner() : refused(`lock root unresolvable (${errno(error)})`); }
+  const base = path.basename(lock);
+  const lockPath = path.join(parent, base);
+  let proof: { retiredPath: string; dir: fs.BigIntStats; owner?: fs.BigIntStats };
+  try {
     let judged = snapshot(lockPath);
     let again = snapshot(lockPath);
     if (!sameSnapshot(judged, again)) { judged = again; again = snapshot(lockPath); }
     if (!sameSnapshot(judged, again)) refused("the lock changed while it was judged (retry the release)");
     if (!judged.bytes.equals(record)) notOwner();
     if (judged.names.length !== 1 || judged.names[0] !== "owner") refused("unexpected entries in the lock directory (owner kept as proof; operator action needed)");
-    const retiredPath = path.join(parent, meshRetirementName(base, judged.dir.dev, judged.dir.ino, record));
-    try { fs.lstatSync(retiredPath); refused("the retirement destination already exists (never replaced)"); }
-    catch (error) { if (error instanceof Early) throw error; if (errno(error) !== "ENOENT") refused(`retirement destination unreadable (${errno(error)})`); }
-    // The captured capability, rehashed right before this spawn; never re-resolved through the package.
-    if (capability.meshAbi !== 1 || !holdsDigest(capability.absolutePath, capability.digest)) {
-      return { outcome: "helper-unavailable/not-started", reason: `the retained Windows mesh helper ${capability.absolutePath} is missing or not digest ${capability.digest} (restore the exact bytes, then retry the release)` };
-    }
-    const hook = windowsMeshReleaseTestHooks.deadlineMs;
-    const deadlineMs = Number.isInteger(hook) && hook! >= 1 && hook! <= MAX_DEADLINE_MS ? hook! : DEFAULT_DEADLINE_MS;
-    const request = encodeMeshRetireRequest({
-      lockPath: path.toNamespacedPath(lockPath), retiredPath: path.toNamespacedPath(retiredPath),
-      dirVolume: judged.dir.dev, dirIndex: judged.dir.ino, ownerVolume: judged.owner.dev, ownerIndex: judged.owner.ino,
-      ownerFileTime: fileTime(judged.owner), ownerSize: judged.owner.size, record, deadlineMs,
-    });
-    const started = performance.now();
-    const child = spawnSync(capability.absolutePath, ["--mesh-retire-v1"], {
-      input: request, timeout: deadlineMs + 1000, windowsHide: true, maxBuffer: 4096, env: childEnv(windowsMeshReleaseTestHooks.checkpoint),
-    });
-    const outcome = interpretMeshRetireResult({ status: child.status, signal: child.signal, stdout: child.stdout, error: child.error, pid: child.pid }, retiredPath);
-    try {
-      windowsMeshReleaseTestHooks.afterChild?.({ elapsedMs: performance.now() - started, absolutePath: capability.absolutePath, digest: capability.digest, outcome: outcome.outcome, attempt: number });
-    } catch { /* an observer never alters a release */ }
-    return outcome;
+    proof = { retiredPath: path.join(parent, meshRetirementName(base, judged.dir.dev, judged.dir.ino, record)), dir: judged.dir, owner: judged.owner };
   } catch (error) {
-    if (error instanceof Early) return error.outcome;
-    return { outcome: "refused-before-retirement", reason: `release check failed (${errno(error)})` };
+    if (!(error instanceof Early) || error.outcome.outcome !== "not-owner") throw error;
+    proof = rediscoverReceipt(parent, base, record);
   }
+  const hook = windowsMeshReleaseTestHooks.deadlineMs;
+  const deadlineMs = Number.isInteger(hook) && hook! >= 1 && hook! <= MAX_DEADLINE_MS ? hook! : DEFAULT_DEADLINE_MS;
+  const request = encodeMeshRetireRequest({
+    lockPath: path.toNamespacedPath(lockPath), retiredPath: path.toNamespacedPath(proof.retiredPath),
+    dirVolume: proof.dir.dev, dirIndex: proof.dir.ino, ownerVolume: proof.owner?.dev ?? 0n, ownerIndex: proof.owner?.ino ?? 0n,
+    ownerFileTime: proof.owner ? fileTime(proof.owner) : 0n, ownerSize: proof.owner?.size ?? BigInt(record.length), record, deadlineMs,
+  });
+  return { request, retiredPath: proof.retiredPath, deadlineMs };
+};
+
+const attempt = (prepared: PreparedRelease, capability: WindowsMeshCapability, number: 1 | 2): WindowsMeshReleaseOutcome => {
+  // The captured capability, rehashed right before this spawn; never re-resolved through the package.
+  if (capability.meshAbi !== 1 || !holdsDigest(capability.absolutePath, capability.digest)) {
+    return { outcome: "helper-unavailable/not-started", reason: `the retained Windows mesh helper ${capability.absolutePath} is missing or not digest ${capability.digest} (restore the exact bytes, then retry the release)` };
+  }
+  const started = performance.now();
+  let outcome: WindowsMeshReleaseOutcome;
+  try {
+    const child = spawnSync(capability.absolutePath, ["--mesh-retire-v1"], {
+      input: prepared.request, timeout: prepared.deadlineMs + 1000, windowsHide: true, maxBuffer: 4096, env: childEnv(windowsMeshReleaseTestHooks.checkpoint),
+    });
+    outcome = interpretMeshRetireResult({ status: child.status, signal: child.signal, stdout: child.stdout, error: child.error, pid: child.pid }, prepared.retiredPath);
+  } catch (error) {
+    // Without a joined spawn receipt, do not guess that a child never started or that W4 did not execute.
+    outcome = { outcome: "release-outcome-unknown", reason: `helper invocation failed without a terminal receipt (${errno(error)})` };
+  }
+  try {
+    windowsMeshReleaseTestHooks.afterChild?.({ elapsedMs: performance.now() - started, absolutePath: capability.absolutePath, digest: capability.digest, outcome: outcome.outcome, attempt: number });
+  } catch { /* an observer never alters a release */ }
+  return outcome;
 };
 
 /**
  * Release the Windows mesh lock directory `lock` whose owner holds exactly `originalRecord` (the bytes this
  * acquisition published), with the capability captured at acquisition. Synchronous; never throws for an outcome.
- * `not-owner`: absent, or another record/directory (a successor) - nothing touched. `released`: the held directory was
- * retired to `retiredPath` (cleanup `pending` leaves it there, off the canonical name). A first `release-outcome-unknown`
+ * `not-owner`: no canonical match AND no identity-bound same-R retirement receipt - nothing touched. `released`: the
+ * held directory was retired or its exact receipt resumed at `retiredPath` (cleanup `pending` leaves it off-canonical).
+ * Explicit same-R release-only retries rediscover full-proof/empty receipts without any process-global state.
+ * A first `release-outcome-unknown`
  * gets ONE same-record reconciliation; only released/not-owner establishes a safe canonical result. Any other second
  * outcome retains the original unknown and both attempts' history, allowing an explicit release-only retry.
  */
@@ -420,10 +490,18 @@ export const releaseWindowsMeshLock = (lock: string, originalRecord: string, cap
   if (!realWindows()) return { outcome: "helper-unavailable/not-started", reason: "the Windows mesh release runs on real Windows only" };
   const record = Buffer.from(originalRecord, "utf8");
   if (record.length < 1 || record.length > MAX_RECORD || record.includes(0)) return { outcome: "refused-before-retirement", reason: "the original record must be 1..4096 bytes without NUL" };
-  const first = attempt(lock, record, capability, 1);
+  let prepared: PreparedRelease;
+  try { prepared = prepareRelease(lock, record); }
+  catch (error) {
+    if (error instanceof Early) return error.outcome;
+    return { outcome: "refused-before-retirement", reason: `release check failed (${errno(error)})` };
+  }
+  // Retain this exact original frame across unknown -> reconciliation. Explicit release-only calls from a new JS
+  // state recover the same S/R binding from T, never from a successor or a process-global request cache.
+  const first = attempt(prepared, capability, 1);
   if (first.outcome !== "release-outcome-unknown") return first;
   const history = [`attempt 1: release-outcome-unknown (${first.reason})`];
-  const second = attempt(lock, record, capability, 2);
+  const second = attempt(prepared, capability, 2);
   // Only these prove this holder no longer owns canonical L. A refusal says nothing about the first child's commit.
   if (second.outcome === "released" || second.outcome === "not-owner") {
     return { ...second, history: [...history, ...(second.history ?? []), `attempt 2: ${second.outcome}`] };

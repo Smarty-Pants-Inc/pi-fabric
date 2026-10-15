@@ -705,7 +705,7 @@ const restoredActivationBlock = (stored: { reason: string; code: string; since: 
     ...(transient && finitePositive(stored.retryAt) ? { retryAt: stored.retryAt } : {}),
     ...(transient && finitePositive(stored.backoffMs) ? { backoffMs: stored.backoffMs } : {}) };
 };
-type ActorDeadLetter = { at: number; source: string; event: MeshEvent };
+type ActorDeadLetter = { at: number; source: string; event: MeshEvent; batchQueued?: true; supersededSends?: DeliverySend[] };
 
 export class ActorPreparationError extends Error {
   readonly code: string = "FABRIC_ACTOR_PREPARATION_FAILED";
@@ -4105,6 +4105,8 @@ export class ActorManager {
       deadLetter?: boolean;
       /** A dead-lettered event returning to the queue; it never goes back to the file. */
       replaying?: boolean;
+      /** Preserve batching admission through dead-letter replay after a policy change. */
+      batchQueued?: true;
       /** Held host transfers checkpoint staged work before committing or starting drain. */
       checkpoint?: (item: ActorQueueItem) => void;
       onAccepted?: () => void;
@@ -4137,8 +4139,7 @@ export class ActorManager {
     const sender = options.sender === null ? undefined : options.sender ?? processSender();
     const createdAt = Date.now();
     const sequence = ++actor.latestActivationSequence;
-    // A replayed dead letter is older than anything queued: it never overwrites a queued payload (#816).
-    if (options.coalesceKey && !options.replaying) {
+    if (options.coalesceKey && !options.batchQueued && !(actor.batchWindowMs! > 0)) {
       // Parked work (waiting for ownership, or restored after a restart) coalesces too (smarty-dev#1065).
       const existing = [...actor.queue, ...(this.#overflow.get(actor.id) ?? []), ...(this.#parked.get(actor.id) ?? [])]
         // Batches retain every original; a confirmed no-tool overflow owns one replay of
@@ -4147,25 +4148,32 @@ export class ActorManager {
           item.coalesceKey === options.coalesceKey);
       if (existing) {
         const previous = options.checkpoint ? { ...existing } : undefined;
+        const incomingNewer = !options.replaying || this.#newerEvent({
+          source, payload, activation: this.#activation(existing.id, source, payload, sequence, createdAt),
+        } as ActorQueueItem, existing);
         try {
-          existing.supersededSends = [...(existing.supersededSends ?? []), ...(existing.outcomeSend ? [existing.outcomeSend] : [])];
-          if (options.outcomeSend) existing.outcomeSend = options.outcomeSend;
-          else delete existing.outcomeSend;
-          existing.payload = structuredClone(payload);
-          if (sender) existing.sender = sender;
-          else delete existing.sender;
-          this.#replaceSettledDelivery(actor.id, existing, options.settledDeliveryId);
-          existing.provenance = options.provenance ? structuredClone(options.provenance) : undefined;
-          if (options.images && options.images.length > 0) {
-            existing.images = options.images.map((image) => ({ ...image }));
-          } else {
-            delete existing.images;
+          if (incomingNewer) {
+            existing.supersededSends = [...(existing.supersededSends ?? []), ...(existing.outcomeSend ? [existing.outcomeSend] : [])];
+            if (options.outcomeSend) existing.outcomeSend = options.outcomeSend;
+            else delete existing.outcomeSend;
+            existing.payload = structuredClone(payload);
+            if (sender) existing.sender = sender;
+            else delete existing.sender;
+            this.#replaceSettledDelivery(actor.id, existing, options.settledDeliveryId);
+            existing.provenance = options.provenance ? structuredClone(options.provenance) : undefined;
+            if (options.images && options.images.length > 0) {
+              existing.images = options.images.map((image) => ({ ...image }));
+            } else {
+              delete existing.images;
+            }
+            existing.createdAt = createdAt;
+            existing.activation = this.#activation(existing.id, source, payload, sequence, createdAt);
+            existing.binding = binding;
+            existing.bindingMode = bindingMode;
+            existing.bindingVersion = 2;
+          } else if (options.outcomeSend) {
+            existing.supersededSends = [...(existing.supersededSends ?? []), options.outcomeSend];
           }
-          existing.createdAt = createdAt;
-          existing.activation = this.#activation(existing.id, source, payload, sequence, createdAt);
-          existing.binding = binding;
-          existing.bindingMode = bindingMode;
-          existing.bindingVersion = 2;
           options.checkpoint?.(existing);
         } catch (error) {
           if (previous) {
@@ -4205,7 +4213,7 @@ export class ActorManager {
         ? { images: options.images.map((image) => ({ ...image })) }
         : {}),
       createdAt,
-      ...(actor.batchWindowMs! > 0 ? { batchQueued: true } : {}),
+      ...(options.batchQueued || actor.batchWindowMs! > 0 ? { batchQueued: true } : {}),
       activation: this.#activation(itemId, source, payload, sequence, createdAt),
       binding,
       bindingMode,
@@ -6114,9 +6122,38 @@ export class ActorManager {
       if (!line) return [];
       try {
         const value = JSON.parse(line) as Partial<ActorDeadLetter>;
-        return typeof value.source === "string" && typeof value.event?.id === "string" ? [value as ActorDeadLetter] : [];
+        return typeof value.source === "string" && typeof value.event?.id === "string"
+          ? [{ ...value, batchQueued: value.batchQueued === true ? true : undefined,
+              supersededSends: Array.isArray(value.supersededSends)
+              ? value.supersededSends.flatMap((send) => { const valid = deliverySend(send); return valid ? [valid] : []; }) : undefined } as ActorDeadLetter]
+          : [];
       } catch { return []; }                                  // a torn final line from a crash
     });
+  }
+
+  #coalesceDeadLetters(actor: ManagedActor, entries: readonly ActorDeadLetter[]): ActorDeadLetter[] {
+    const result: ActorDeadLetter[] = [];
+    const keyed = new Map<string, number>();
+    for (const entry of entries) {
+      // Admission under batching remains non-replacing even after the window is disabled.
+      const key = entry.batchQueued ? undefined : this.#meshEnqueueOptions(actor, entry.event).coalesceKey;
+      const index = key === undefined ? undefined : keyed.get(key);
+      if (index === undefined) {
+        if (key !== undefined) keyed.set(key, result.length);
+        result.push(entry);
+      } else {
+        const prior = result[index]!;
+        // Mesh sequence, not append/replay time: restored older work must not win.
+        const newer = entry.event.sequence > prior.event.sequence;
+        const replacedSend = entry.event.id === prior.event.id ? undefined
+          : this.#meshEnqueueOptions(actor, newer ? prior.event : entry.event).outcomeSend;
+        const supersededSends = [
+          ...(prior.supersededSends ?? []), ...(entry.supersededSends ?? []), ...(replacedSend ? [replacedSend] : []),
+        ];
+        result[index] = { ...(newer ? entry : prior), ...(supersededSends.length ? { supersededSends } : {}) };
+      }
+    }
+    return result;
   }
 
   #deadLetterCount(actorId: string): number {
@@ -6141,16 +6178,25 @@ export class ActorManager {
     this.#deadLetters.set(actorId, entries.length);
   }
 
-  // Append-only and bounded: past the bound the oldest entries drop (to 90%, so a flood rewrites
-  // the file once per tenth), each drop counted on the actor. A write failure is a checkpoint
+  // Keyed entries replace their prior dead letter; unkeyed entries stay append-only. Past the
+  // bound the oldest entries drop (to 90%, so a flood rewrites once per tenth), each drop counted
+  // on the actor. A write failure is a checkpoint
   // failure, as for the queue file: the event stays in the mesh.
   #appendDeadLetter(actor: ManagedActor, source: string, event: MeshEvent): void {
     const file = this.#deadLetterFile(actor.id);
     let count = this.#deadLetterCount(actor.id);
     try {
       fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
-      fs.appendFileSync(file, `${JSON.stringify({ at: Date.now(), source, event })}\n`, { mode: 0o600 });
-      this.#deadLetters.set(actor.id, ++count);
+      const entry: ActorDeadLetter = { at: Date.now(), source, event,
+        ...(actor.batchWindowMs! > 0 ? { batchQueued: true } : {}) };
+      if (this.#meshEnqueueOptions(actor, event).coalesceKey !== undefined) {
+        const entries = this.#coalesceDeadLetters(actor, [...this.#readDeadLetters(actor.id), entry]);
+        this.#writeDeadLetters(actor.id, entries);
+        count = entries.length;
+      } else {
+        fs.appendFileSync(file, `${JSON.stringify(entry)}\n`, { mode: 0o600 });
+        this.#deadLetters.set(actor.id, ++count);
+      }
       if (count > ACTOR_DEAD_LETTER_MAX_ENTRIES || fs.statSync(file).size > ACTOR_DEAD_LETTER_MAX_BYTES) {
         const entries = this.#readDeadLetters(actor.id);
         const size = (entry: ActorDeadLetter) => Buffer.byteLength(JSON.stringify(entry)) + 1;
@@ -6205,7 +6251,7 @@ export class ActorManager {
       this.#parked.get(actor.id)?.length || !this.#canManageCached(actor.id) || !this.#slotCurrent(actor) || this.#deadLetterCount(actor.id) === 0) return;
     const limit = this.meshConfig.actorQueueLimit;
     if (actor.queue.length * 2 >= limit || this.#overflow.get(actor.id)?.length) return;
-    const entries = this.#readDeadLetters(actor.id);
+    const entries = this.#coalesceDeadLetters(actor, this.#readDeadLetters(actor.id));
     const held = new Set([...this.#inFlightItems(actor.id), ...actor.queue]
       .map((item) => (item.payload as { id?: unknown } | undefined)?.id));
     let taken = 0;
@@ -6213,12 +6259,17 @@ export class ActorManager {
     try {
       while (taken < entries.length && actor.queue.length < limit) {
         const entry = entries[taken]!;
+        if (entry.supersededSends?.length) {
+          for (const send of entry.supersededSends) this.#recordDeliveryOutcome(actor.id, send, "superseded", "replaced by a newer message for the same key before delivery");
+          if (!this.#persistQueue(actor.id, true)) throw new ActorQueueCheckpointError(actor);
+        }
         if (!held.has(entry.event.id)) {
           held.add(entry.event.id);
           if (this.#hasProcessedKey(actor, entry.source, entry.event)) {
             if (!this.#persistQueue(actor.id, true)) throw new ActorQueueCheckpointError(actor);
           } else {
-            this.#enqueue(actor, entry.source, entry.event, { ...this.#meshEnqueueOptions(actor, entry.event), replaying: true, deferDrain: true });
+            this.#enqueue(actor, entry.source, entry.event, { ...this.#meshEnqueueOptions(actor, entry.event),
+              ...(entry.batchQueued ? { batchQueued: true } : {}), replaying: true, deferDrain: true });
             added++;
           }
         }
@@ -6247,10 +6298,12 @@ export class ActorManager {
     if (spilled.length === 0) return items;
     try {
       fs.mkdirSync(path.dirname(this.#deadLetterFile(actor.id)), { recursive: true, mode: 0o700 });
-      this.#writeDeadLetters(actor.id, [
-        ...spilled.map((item) => ({ at: Date.now(), source: item.source, event: item.payload as MeshEvent })),
+      this.#writeDeadLetters(actor.id, this.#coalesceDeadLetters(actor, [
+        ...spilled.map((item): ActorDeadLetter => ({ at: Date.now(), source: item.source, event: item.payload as MeshEvent,
+          ...(item.batchQueued || item.batchIds ? { batchQueued: true } : {}),
+          ...(item.supersededSends?.length ? { supersededSends: item.supersededSends } : {}) })),
         ...this.#readDeadLetters(actor.id),
-      ]);
+      ]));
     } catch {
       this.#deadLetters.delete(actor.id);
       return items;

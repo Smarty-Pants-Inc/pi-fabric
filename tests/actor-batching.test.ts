@@ -436,6 +436,100 @@ describe("actor window batching on the durable receiver path", () => {
     expect(f.runs[2]!.task).toContain("latest-mesh");
   });
 
+  it("dead-letter replay recognizes a held batch's non-head original instead of queuing it twice", async () => {
+    const f = await fixture(undefined, 2);
+    const actor = await create(f.actors, { batchMax: 2 });
+    let release!: () => void;
+    f.hold(new Promise<void>(resolve => { release = resolve; }));
+    const events = [f.send({ ref: "active-first" }), f.send({ ref: "active-second" })];
+    for (let turn = 0; turn < 100 && !f.runs.length; turn++) await new Promise<void>(resolve => setImmediate(resolve));
+    expect(f.runs).toHaveLength(1);
+    for (let marker = 0; marker < 20; marker++) f.send({ ref: "discard-pending", marker });
+    const file = path.join(f.root, "actors", actor.id, "dead-letter.jsonl");
+    expect(fs.existsSync(file)).toBe(true);
+    // A crash can leave a disk copy of an already-held non-head original.
+    fs.writeFileSync(file, `${JSON.stringify({ at: Date.now(), source: "mesh:fleet.work.batch", event: events[1], batchQueued: true })}\n`);
+    const remove = fs.rmSync;
+    let removals = 0;
+    vi.spyOn(fs, "rmSync").mockImplementation((target, options) => {
+      if (String(target) !== file) return remove(target, options);
+      fs.renameSync(file, `${file}.recorded-${++removals}`);
+    });
+    await f.actors.setActivationFilter(actor.id, [{ id: "discard", where: [{ path: "data.ref", equals: "discard-pending" }] }]);
+    try {
+      expect(f.actors.status(actor.id).queued).toBe(0);
+      expect(f.snapshot(actor.id).items.map(item => item.payload.id)).toEqual(events.map(event => event.id));
+      expect(removals).toBe(1);
+    } finally { release(); }
+    await settled(f.actors, actor.id);
+    expect(f.runs).toHaveLength(1);
+    expect(inputs(f.runs[0]!).map(item => item.payload.id)).toEqual(events.map(event => event.id));
+  });
+
+  it("positive-window dead letters retain every addressed original after disabling batching and restarting", async () => {
+    const f = await fixture(undefined, 2);
+    const actor = await create(f.actors, { batchMax: 100, coalesceKey: "ref" });
+    fakeClock();
+    const events = Array.from({ length: 20 }, (_, marker) => ({ ...f.event({ ref: "same", marker }), to: actor.id }));
+    for (const event of events) expect(f.monitor.callbacks.onEvent(event)).toBe(true);
+    const file = path.join(f.root, "actors", actor.id, "dead-letter.jsonl");
+    const letters = fs.readFileSync(file, "utf8").trim().split("\n").map(line => JSON.parse(line));
+    expect(letters.map(letter => letter.event.id)).toEqual(events.slice(18).map(event => event.id));
+    expect(letters.every(letter => letter.batchQueued === true)).toBe(true);
+    // Recorded removal only: preserve the backlog bytes under a private evidence name.
+    const remove = fs.rmSync;
+    const removals: string[] = [];
+    vi.spyOn(fs, "rmSync").mockImplementation((target, options) => {
+      if (String(target) !== file) return remove(target, options);
+      removals.push(String(target));
+      fs.renameSync(file, `${file}.recorded-${removals.length}`);
+    });
+    f.actors.pauseForRelease();
+    await f.actors.setBatching(actor.id, { batchWindowMs: 0 });
+    await f.close();
+    const again = await fixture(f.root, 2);
+    await settled(again.actors, actor.id);
+    expect(again.runs).toHaveLength(events.length);
+    const delivered = again.runs.map(run => JSON.parse(run.task.slice(run.task.indexOf("\n\n") + 2)).payload.id);
+    expect(delivered).toEqual(events.map(event => event.id));
+    expect(removals).toEqual([file]);
+    const dir = path.join(again.mesh.root, "delivery-outcomes");
+    const outcomes = fs.readdirSync(dir).flatMap(name => fs.readFileSync(path.join(dir, name), "utf8").trim().split("\n").map(line => JSON.parse(line)));
+    expect(outcomes.filter(outcome => events.some(event => event.id === outcome.eventId)).map(outcome => [outcome.eventId, outcome.outcome]))
+      .toEqual(events.map(event => [event.id, "delivered"]));
+  });
+
+  it("window 0 still writes only the newest keyed dead letter and replays its superseded receipts", async () => {
+    const f = await fixture(undefined, 1, false);
+    const actor = await create(f.actors, { batchWindowMs: 0, coalesceKey: "ref" });
+    for (let marker = 0; marker < 9; marker++) f.send({ ref: `filler-${marker}` });
+    const events = [0, 1, 2].map(marker => ({ ...f.event({ ref: "same", marker }), to: actor.id }));
+    for (const event of events) expect(f.monitor.callbacks.onEvent(event)).toBe(true);
+    const file = path.join(f.root, "actors", actor.id, "dead-letter.jsonl");
+    const letters = fs.readFileSync(file, "utf8").trim().split("\n").map(line => JSON.parse(line));
+    expect(letters).toHaveLength(1);
+    expect(letters[0].event.id).toBe(events[2]!.id);
+    expect(letters[0].batchQueued).toBeUndefined();
+    const remove = fs.rmSync;
+    const removals: string[] = [];
+    vi.spyOn(fs, "rmSync").mockImplementation((target, options) => {
+      if (String(target) !== file) return remove(target, options);
+      removals.push(String(target));
+      fs.renameSync(file, `${file}.recorded-${removals.length}`);
+    });
+    await f.close();
+    const again = await fixture(f.root, 1);
+    await settled(again.actors, actor.id);
+    const subjects = again.runs.filter(run => run.task.includes('"ref": "same"'));
+    expect(subjects).toHaveLength(1);
+    expect(subjects[0]!.task).toContain('"marker": 2');
+    expect(removals).toEqual([file]);
+    const dir = path.join(again.mesh.root, "delivery-outcomes");
+    const outcomes = fs.readdirSync(dir).flatMap(name => fs.readFileSync(path.join(dir, name), "utf8").trim().split("\n").map(line => JSON.parse(line)));
+    expect(outcomes.filter(outcome => events.some(event => event.id === outcome.eventId)).map(outcome => [outcome.eventId, outcome.outcome]))
+      .toEqual(events.map((event, index) => [event.id, index === 2 ? "delivered" : "superseded"]));
+  });
+
   it("positive batching retains repeated observations after disabling the window and restarting", async () => {
     const f = await fixture();
     const actor = await create(f.actors, { coalesce: true, coalesceKey: "ref" });

@@ -522,6 +522,9 @@ export class MeshStateFileReadChangedError extends Error {
 
 /** Internal: a fileRead stamp did not hold inside the transaction; the backend re-reads and retries. */
 export const FILE_READ_CHANGED: Error = new Error("Fabric mesh fileRead stamp changed");
+// A lazy V8 stack holds receivers from the importing runtime, keeping a retired Main alive.
+// Materialize this module-lifetime sentinel once, preserving its identity and diagnostic text.
+void FILE_READ_CHANGED.stack;
 
 /**
  * Internal: runs `fileRead.read()` bracketed by two stamps. Differing stamps mean a file changed

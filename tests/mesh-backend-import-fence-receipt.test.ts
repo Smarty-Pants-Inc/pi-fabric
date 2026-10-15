@@ -50,7 +50,7 @@ import { pathToFileURL } from "node:url";
 const jiti = createJiti(pathToFileURL(process.cwd() + "/index.js").href);
 const migration = await jiti.import("./src/mesh/backend-migration.ts");
 const root = process.argv.at(-1);
-await migration.importMeshState(root, { beforeOpen: () => { process.kill(process.pid, "SIGKILL"); for (;;) { /* never */ } } });
+await migration.importMeshState(root, { lockProtocol: 3, beforeOpen: () => { process.kill(process.pid, "SIGKILL"); for (;;) { /* never */ } } });
 `;
 /** A real import, SIGKILLed under its fence right before it would open state.db (beforeOpen). */
 const killedImport = (root: string): Promise<{ pid: number; signal: NodeJS.Signals | null; stderr: string }> => new Promise((resolve, reject) => {
@@ -121,9 +121,10 @@ const placeTickets = (root: string, pid: number): { own: string; other: string }
 };
 
 interface Forged { mesh: string; custody: string; receipt: Record<string, unknown> }
-/** Residue as a killed protocol-1 import leaves it, with its receipt; `patch` alters the receipt only. */
-const forge = async (root: string, pid: number, patch: Record<string, unknown> = {}, ownerProtocol: 1 | 2 = 1): Promise<Forged> => {
-  const mesh = `${MESH_TOKEN}\n${pid}\n${Date.now()}\n${ownerProtocol === 2 ? "123456\n" : ""}`;
+/** Import residue with the requested owner format; `patch` alters the receipt only, never its owner's namespace. */
+const forge = async (root: string, pid: number, patch: Record<string, unknown> = {}, ownerProtocol: 1 | 2 | 3 = 1): Promise<Forged> => {
+  const namespace = await ownPidNamespace();
+  const mesh = `${MESH_TOKEN}\n${pid}\n${Date.now()}\n${ownerProtocol >= 2 ? "123456\n" : ""}${ownerProtocol === 3 ? `${namespace}\n` : ""}`;
   const custody = `66666666-7777-4888-8999-aaaaaaaaaaaa\n${pid}\n${Date.now()}\n`;
   for (const [lock, owner] of [[".lock", mesh], ["custody.lock", custody]] as const) {
     fs.mkdirSync(path.join(root, lock), { mode: 0o700 });
@@ -133,7 +134,7 @@ const forge = async (root: string, pid: number, patch: Record<string, unknown> =
   const stat = fs.statSync(real, { bigint: true });
   const host = readPhysicalHostIdentity()!;
   const receipt = { format: 1, kind: "fabric-mesh-import-fence", root: real, rootDev: String(stat.dev), rootIno: String(stat.ino),
-    pid, start: "123456", machineId: host.machineId, bootId: host.bootId, namespace: await ownPidNamespace(), mesh, custody, ...patch };
+    pid, start: "123456", machineId: host.machineId, bootId: host.bootId, namespace, mesh, custody, ...patch };
   fs.writeFileSync(path.join(root, IMPORT_FENCE_RECEIPT), JSON.stringify(receipt), { mode: 0o600 });
   return { mesh, custody, receipt };
 };
@@ -148,6 +149,7 @@ describe.skipIf(!linuxIdentity)("smarty-dev#9501 killed import fence receipt", (
     // The killed import's own residue, and the receipt it wrote under the fence before beforeOpen.
     const mesh = lockOwner(root)!;
     expect(mesh.split("\n")[1]).toBe(String(killed.pid));
+    expect(mesh.split("\n")[4]).toBe(await ownPidNamespace());
     expect(lockOwner(root, "custody.lock")!.split("\n")[1]).toBe(String(killed.pid));
     const receipt = JSON.parse(fs.readFileSync(path.join(root, IMPORT_FENCE_RECEIPT), "utf8")) as Record<string, unknown>;
     expect(receipt).toMatchObject({ format: 1, pid: killed.pid, mesh, custody: lockOwner(root, "custody.lock") });
@@ -175,7 +177,7 @@ describe.skipIf(!linuxIdentity)("smarty-dev#9501 killed import fence receipt", (
   it("lock and ticket residue together: the CLI rerun recovers both, then the fence recovers custody.lock", async () => {
     const root = await fileRoot();
     const pid = await deadPid();
-    await forge(root, pid);
+    await forge(root, pid, {}, 3);
     const { own, other } = placeTickets(root, pid);
     const rerun = await cli(["import", "--root", root]);
     expect(rerun.err).toContain(`ticket ${own} retired`);
@@ -185,7 +187,7 @@ describe.skipIf(!linuxIdentity)("smarty-dev#9501 killed import fence receipt", (
     expect(queueNames(root)).toEqual([other, `${own}.recovered`].sort());
     // Without that unrelated waiter's ticket, the same residue converges.
     const clean = await fileRoot();
-    await forge(clean, await deadPid());
+    await forge(clean, await deadPid(), {}, 3);
     const ticket = placeTickets(clean, Number(lockOwner(clean)!.split("\n")[1]));
     fs.renameSync(path.join(meshLockQueueDirectory(clean), ticket.other), path.join(meshLockQueueDirectory(clean), `${ticket.other}.test-retired`));
     const converged = await cli(["import", "--root", clean]);
@@ -198,7 +200,7 @@ describe.skipIf(!linuxIdentity)("smarty-dev#9501 killed import fence receipt", (
   it.each(["before-ticket", "before-lock", "after-lock"])("recovery killed at %s native rename boundary reruns through the real CLI gate", async boundary => {
     const root = await fileRoot();
     const pid = await deadPid();
-    const { mesh, custody } = await forge(root, pid);
+    const { mesh, custody } = await forge(root, pid, {}, 3);
     const { own, other } = placeTickets(root, pid);
     const queue = meshLockQueueDirectory(root);
     // Isolate the exact owner's ticket; unrelated active tickets still refuse (covered by the preceding test).
@@ -313,12 +315,12 @@ describe.skipIf(!linuxIdentity)("smarty-dev#9501 killed import fence receipt", (
     finally { store.closeState(); }
   }, 30_000);
 
-  it("recovers a dead receipt-matched owner, and only it", async () => {
+  it.each([1, 2, 3] as const)("recovers a dead receipt-matched namespaced owner, and only it, under protocol %s", async protocol => {
     const root = await fileRoot();
     const pid = await deadPid();
-    await forge(root, pid);
+    await forge(root, pid, {}, 3);
     const { own, other } = placeTickets(root, pid);
-    expect(await recoverKilledImportLock(root)).toContain(`killed import pid ${pid}`);
+    expect(await recoverKilledImportLock(root, protocol)).toContain(`killed import pid ${pid}`);
     // Only the dead owner's own ticket (its pid and token) leaves the ticket namespace, renamed and retained.
     expect(queueNames(root)).toEqual([other, `${own}.recovered`].sort());
     expect(lockOwner(root)).toBeUndefined();
@@ -383,7 +385,7 @@ describe.skipIf(!linuxIdentity)("smarty-dev#9501 killed import fence receipt", (
 
   it("clearStaleLock checks the expected owner inside the recovery, after its own read", async () => {
     const root = await fileRoot();
-    const { mesh, receipt } = await forge(root, await deadPid());
+    const { mesh, receipt } = await forge(root, await deadPid(), {}, 3);
     const lock = new MeshLock(root, { lockProtocol: 1 }, () => undefined);
     const ownerPath = path.join(lock.lockPath, "owner");
     // A dead owner, but not the expected bytes: refused although it is recoverable.

@@ -11,12 +11,12 @@
  * receipt is complete, the root is the same inode, this process runs on the same machine and boot, and both locks
  * still hold exactly the receipt's owner bytes. That is provenance only, never evidence of death. It then calls the
  * mesh lock's ordinary stale recovery (`MeshLock.clearStaleLock`) with that owner and the receipt's PID namespace as
- * the expected context: the owner is compared INSIDE the recovery after its read, so a successor's lock is never
- * touched, and a record without a namespace line (protocol 1/2) is judged with the receipt's namespace by the
- * existing reclaimVerdict: our own namespace and a host-local root, pinned and rechecked right before the rename.
+ * expected context: the owner is compared INSIDE the recovery after its read, so a successor's lock is never
+ * touched. Only the owner's own namespace is judged by reclaimVerdict: our own namespace and a host-local root,
+ * pinned and rechecked right before the rename. A mutable receipt never supplies a missing owner namespace.
  * Machine and boot alone are not enough: a live holder in another PID namespace on this host shares both. That
- * recovery alone decides death (ESRCH or another incarnation); under protocol 3 a record without a namespace stays
- * unproven, the receipt never upgrades it. Inside that recovery, after its sole proof but BEFORE its native canonical
+ * recovery alone decides death (ESRCH or another incarnation); a record without a namespace stays unproven under
+ * every protocol, even with a matching receipt. Inside that recovery, after its sole proof but BEFORE its native canonical
  * rename, the dead holder's own ticket (same pid and owner token) is renamed out of the ticket namespace, never
  * deleted. A SIGKILL after that rename leaves no stranded ticket; before it, the canonical owner remains to reprove.
  * Ticket retirement must succeed (or the queue be absent) before detaching the owner; an interrupted partial retirement
@@ -25,8 +25,8 @@
  *
  * Everything else does nothing and the gate decides as before: no, torn or unrecognized receipt, another root, host,
  * boot or PID namespace (or an unknown one), a non-local root, other owner bytes, a live holder (the gate then refuses
- * it as `fabric@unknown`), a foreign or unproven protocol-3 holder. Compatibility limit: residue of a release from
- * before this receipt (no receipt, a pid-only owner) intentionally stays `fabric@unknown`; once the operator has
+ * it as `fabric@unknown`), a foreign or unproven holder. Compatibility limit: residue without a receipt or an owner
+ * namespace (including protocol 1/2 with a receipt) intentionally stays `fabric@unknown`; once the operator has
  * verified the holder is gone, `--accept-unready fabric@unknown` is the documented override.
  * A lazy module (startup graph budget): loaded only by an import and the CLI.
  */
@@ -136,8 +136,8 @@ export const recoverKilledImportLock = async (root: string, lockProtocol: 1 | 2 
       !ownedBy(receipt.mesh, receipt.pid, receipt.start) || !ownedBy(receipt.custody, receipt.pid, receipt.start) ||
       readOwner(identity.root, ".lock") !== receipt.mesh || readOwner(identity.root, MESH_CUSTODY_LOCK_NAME) !== receipt.custody) return undefined;
     // The sole death proof: the mesh lock's own stale recovery, acting only on exactly the receipt's owner bytes. A
-    // record without a namespace line is judged with the receipt's namespace by the same reclaimVerdict (our own PID
-    // namespace AND a host-local root, pinned and rechecked before the rename); protocol 3 still refuses such records.
+    // record without its own namespace stays unproven: a forged receipt must not make a live foreign holder look dead.
+    // Namespaced owners still use reclaimVerdict (our own PID namespace AND a pinned, rechecked host-local root).
     const lock = new MeshLock(identity.root, { lockProtocol, lockTimeoutMs: RECOVERY_BUDGET_MS }, () => undefined);
     const token = receipt.mesh.split("\n")[0]!;
     const tickets: string[] = [];

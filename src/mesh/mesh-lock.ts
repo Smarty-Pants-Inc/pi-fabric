@@ -463,7 +463,7 @@ export class MeshLock {
   // A dead/other-incarnation complete receipt recovers at once, an empty ownerless directory after the grace (atomic
   // rmdir: a late owner fails it closed); torn receipts and nonempty unrecorded directories stay. smarty-dev#9569: pid
   // evidence only for OUR PID namespace (foreign/unprovable: `note`). smarty-dev#9501: `expected` = exact owner bytes
-  // after the read; a namespace-less record takes its receipt's namespace: same proof and root pin, never protocol 3.
+  // after the read; its namespace must come from the owner, never a mutable receipt.
   // `beforeRename` is synchronous, restartable retirement of that exact owner's dependent receipt, not another death
   // proof. It runs only AFTER the sole death/namespace/root proof and BEFORE detaching the canonical owner. A throw
   // keeps that owner available to reprove on rerun; a kill after the native rename cannot strand its FIFO ticket.
@@ -513,11 +513,13 @@ export class MeshLock {
       const recordNamespace = fields.length === 6 ? fields[4]! : null;
       // pi-fabric#923: under protocol 3 a record without a namespace (v1/v2 holder) is UNPROVEN (its pid may be alive in
       // another namespace); no previous-boot inference (VM clones share a machine id): operator recovery only.
-      if (recordNamespace === null && this.#lockProtocol === 3) {
+      // A forged receipt can make a LIVE foreign legacy holder look dead locally; never upgrade its namespace.
+      if (recordNamespace === null && (this.#lockProtocol === 3 || expected)) {
         note.verdict = "unproven"; note.namespace = ""; note.token = token!;
         return false;
       }
-      const ns = recordNamespace ?? expected?.namespace ?? null;
+      const ns = recordNamespace;
+      if (expected && ns !== expected.namespace) { note.verdict = "unproven"; note.namespace = ns ?? ""; note.token = token!; return false; }
       if (ns !== null) {
         const namespaces = await import("../core/pid-namespace.js");
         const own = await namespaces.ownNamespaceForReclaim(deadline, Boolean(this.#tryLockScope.getStore()?.active));

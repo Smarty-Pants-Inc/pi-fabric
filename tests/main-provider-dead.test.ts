@@ -15,7 +15,7 @@ const errorTurn = (errorMessage: string) => ({ message: { role: "assistant", sto
 const okTurn = { message: { role: "assistant", stopReason: "stop" } };
 const from = (name: string) => ({ id: `agent-${name}`, name, kind: "agent" as const });
 
-const setup = (flushMs = 120_000, onProviderDead?: (event: FabricMainProviderDeadEvent) => void) => {
+const setup = (flushMs = 120_000, onProviderDead?: (event: FabricMainProviderDeadEvent) => void, journal?: string) => {
   const handlers = new Map<string, Handler[]>();
   const sent: Array<{ message: { customType: string; content: string }; options: { deliverAs: string; triggerTurn: boolean } }> = [];
   const pi = {
@@ -43,7 +43,7 @@ const setup = (flushMs = 120_000, onProviderDead?: (event: FabricMainProviderDea
   const released: unknown[] = [];
   const main = new MainAgentController(pi, "session:root", true, "/tmp/project", "root", true,
     (event) => { released.push(event); }, {}, (event) => { alarms.push(event); onProviderDead?.(event); });
-  main.attachFollowUpDrain(ctx, flushMs);
+  main.attachFollowUpDrain(ctx, flushMs, journal);
   const emit = (name: string, event: unknown) => { for (const handler of handlers.get(name) ?? []) handler(event, ctx); };
   /** The failed run ends: Pi settles with an error outcome and goes idle. */
   const settleError = () => { state.idle = true; emit("agent_before_settle", { outcome: "error" }); emit("agent_settled", { outcome: "error" }); };
@@ -373,7 +373,7 @@ describe.each([120_000, 0])("Main provider-dead hardening (flushMs=%s, PR #841 r
     h.main.deliverAgent({ from: from("peer"), message: "ping", delivery: "followUp" });
     failRun(h, `socket hang up ${secret}`);
     expect(h.alarms).toEqual([{ kind: "unclassified", cause: "unclassified-repeated", error: "unclassified", failures: 3,
-      since: "2026-10-11T08:01:00.000Z", held: expect.any(Array) }]);
+      since: "2026-10-11T08:00:00.000Z", held: expect.any(Array) }]);
     expect(h.notify).toHaveBeenCalledWith(expect.stringMatching(/^provider-dead \(unclassified\): 3 provider failures in a row without an HTTP status or error body\. The provider's error text is in the session log\./), "warning");
     const receipt = h.main.deliverAgent({ from: from("other"), message: "x", delivery: "followUp" });
     expect(receipt.triggered).toBe(false);
@@ -402,6 +402,108 @@ describe.each([120_000, 0])("Main provider-dead hardening (flushMs=%s, PR #841 r
     failRun(h);
     expect(h.alarms).toHaveLength(1);
     h.main.closeFollowUpDrain();
+  });
+
+  it("preserves unclassified failures across same-controller reattach, alarms once on the third, and resets only on success", () => {
+    const h = setup(flushMs);
+    try {
+      failRun(h);
+      h.main.attachFollowUpDrain(h.ctx, flushMs);
+      vi.advanceTimersByTime(30_000);
+      failRun(h);
+      h.main.attachFollowUpDrain(h.ctx, flushMs);
+      expect(h.alarms).toHaveLength(0);
+      vi.advanceTimersByTime(30_000);
+      failRun(h);
+      expect(h.alarms).toEqual([expect.objectContaining({ kind: "unclassified", cause: "unclassified-repeated",
+        failures: 3, since: "2026-10-11T08:00:00.000Z" })]);
+      h.main.attachFollowUpDrain(h.ctx, flushMs);
+      failRun(h);
+      expect(h.alarms).toHaveLength(1);
+      expect(h.main.providerDeadState).toMatchObject({ kind: "unclassified", phase: "alarmed" });
+      // A real successful provider turn, unlike reload or owner input, ends the streak.
+      h.emit("agent_start", {});
+      h.emit("turn_end", okTurn);
+      h.emit("agent_settled", { outcome: "completed" });
+      expect(h.main.providerDeadState).toBeUndefined();
+      failRun(h);
+      h.main.attachFollowUpDrain(h.ctx, flushMs);
+      failRun(h);
+      expect(h.alarms).toHaveLength(1);
+      expect(h.main.providerDeadState).toBeUndefined();
+      failRun(h);
+      expect(h.alarms).toHaveLength(2);
+      expect(h.alarms[1]).toMatchObject({ kind: "unclassified", failures: 3,
+        since: "2026-10-11T08:01:00.000Z" });
+    } finally {
+      h.main.closeFollowUpDrain();
+    }
+  });
+
+  it("retains the unclassified count and first failure time in the same delivered index across controller restart", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "main-provider-count-"));
+    const journal = path.join(root, "followups.json");
+    const first = setup(flushMs, undefined, journal);
+    let restarted: ReturnType<typeof setup> | undefined;
+    try {
+      failRun(first);
+      vi.advanceTimersByTime(30_000);
+      failRun(first);
+      first.main.closeFollowUpDrain();
+      expect(fs.existsSync(journal)).toBe(false); // Metadata must survive without a payload journal.
+      expect(JSON.parse(fs.readFileSync(`${journal}.delivered`, "utf8")).provider).toMatchObject({
+        unclassifiedFailures: 2, unclassifiedSince: new Date("2026-10-11T08:00:00Z").getTime(),
+      });
+      restarted = setup(flushMs, undefined, journal);
+      expect(restarted.alarms).toHaveLength(0);
+      failRun(restarted);
+      expect(restarted.alarms).toEqual([expect.objectContaining({ kind: "unclassified", failures: 3,
+        since: "2026-10-11T08:00:00.000Z" })]);
+      restarted.main.attachFollowUpDrain(restarted.ctx, flushMs, journal);
+      failRun(restarted);
+      expect(first.alarms).toHaveLength(0);
+      expect(restarted.alarms).toHaveLength(1);
+      expect(restarted.compactions).toHaveLength(0);
+      restarted.emit("turn_end", okTurn);
+      restarted.emit("agent_settled", { outcome: "completed" });
+      restarted.main.closeFollowUpDrain();
+      const healthy = setup(flushMs, undefined, journal);
+      try {
+        failRun(healthy);
+        failRun(healthy);
+        expect(healthy.alarms).toHaveLength(0);
+        failRun(healthy);
+        expect(healthy.alarms).toHaveLength(1);
+      } finally { healthy.main.closeFollowUpDrain(); }
+    } finally {
+      first.main.closeFollowUpDrain();
+      restarted?.main.closeFollowUpDrain();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("expires an unclassified streak after the bounded five-minute window across restart", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "main-provider-window-"));
+    const journal = path.join(root, "followups.json");
+    const first = setup(flushMs, undefined, journal);
+    let restarted: ReturnType<typeof setup> | undefined;
+    try {
+      failRun(first);
+      failRun(first);
+      first.main.closeFollowUpDrain();
+      vi.advanceTimersByTime(5 * 60_000 + 1);
+      restarted = setup(flushMs, undefined, journal);
+      failRun(restarted);
+      failRun(restarted);
+      expect(restarted.alarms).toHaveLength(0);
+      failRun(restarted);
+      expect(restarted.alarms).toEqual([expect.objectContaining({ kind: "unclassified", failures: 3,
+        since: "2026-10-11T08:05:00.001Z" })]);
+    } finally {
+      first.main.closeFollowUpDrain();
+      restarted?.main.closeFollowUpDrain();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it("resets the unclassified count on any successful turn, so isolated blips never alarm", () => {
@@ -545,40 +647,134 @@ describe.each([120_000, 0])("Main provider-dead delayed work after dispose (flus
     expect(vi.getTimerCount()).toBe(0);
   });
 
-  it("ignores the old incident's late callbacks after a live successor drain attaches, and its own recovery runs once", () => {
+  it("preserves a pending recovery retry across reattach and ignores the old binding's late compaction callbacks", () => {
     const h = setupDisposable(flushMs);
     h.emit("turn_end", errorTurn(affinity));
     h.settleError();
     vi.advanceTimersByTime(0);
     expect(h.compactions).toHaveLength(1);
+    // The compaction completed, but its retry is still pending while Main is busy.
+    h.state.idle = false;
+    h.emit("session_compact", { reason: "manual" });
+    expect(h.main.providerDeadState?.phase).toBe("probation");
+    const incident = { ...h.main.providerDeadState! };
     h.original.dispose();
     const successor = staleCtx(h.compactions, h.notify, h.state);
-    h.state.idle = false;
     h.main.attachFollowUpDrain(successor.ctx, flushMs);
-    expect(h.main.providerDeadState).toBeUndefined();
-    h.emit("turn_end", errorTurn(affinity), successor.ctx);
-    h.main.deliverAgent({ from: from("lead"), message: "successor work", delivery: "followUp" });
-    h.settleError(successor.ctx);
-    vi.advanceTimersByTime(0);
-    expect(h.compactions).toHaveLength(2);
-    expect(h.main.providerDeadState?.phase).toBe("compacting");
+    expect(h.main.providerDeadState).toEqual(incident);
     h.compactions[0]!.onError?.(new Error("Compaction failed: stale"));
     h.compactions[0]!.onComplete?.({});
     vi.advanceTimersByTime(25);
     expect(h.alarms).toHaveLength(0);
-    expect(h.main.providerDeadState?.phase).toBe("compacting");
+    expect(h.main.providerDeadState).toEqual(incident);
     expect(h.sent).toHaveLength(0);
-    // The successor's own recovery compaction still earns exactly one attempt.
-    h.emit("session_before_compact", { reason: "manual", signal: new AbortController().signal }, successor.ctx);
-    h.emit("session_compact", { reason: "manual" }, successor.ctx);
-    h.compactions[1]!.onComplete?.({});
+    // The successor resumes the pending attempt, never repeating the completed compaction.
+    h.state.idle = true;
+    h.emit("agent_end", {}, successor.ctx);
     vi.advanceTimersByTime(25);
     expect(h.sent).toHaveLength(1);
     expect(h.main.providerDeadState?.phase).toBe("probation");
-    expect(h.compactions).toHaveLength(2);
+    expect(h.compactions).toHaveLength(1);
     expect(h.alarms).toHaveLength(0);
     h.main.closeFollowUpDrain();
     expect(vi.getTimerCount()).toBe(0);
+  });
+});
+
+// Keep reason: durable recovery is a data-safety boundary; reload must not buy another five minutes.
+describe.each([120_000, 0])("Main durable provider recovery across reload (flushMs=%s)", (flushMs) => {
+  it.each(["reattach", "restart"] as const)("keeps the original pending deadline after a four-minute %s and alarms one minute later", (mode) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "main-provider-deadline-"));
+    const journal = path.join(root, "followups.json");
+    const first = setup(flushMs, undefined, journal);
+    let active = first;
+    const deadlineAt = Date.now() + 5 * 60_000;
+    try {
+      // Keep both the earlier unclassified streak and the pending classified episode across restart.
+      for (let attempt = 0; attempt < 2; attempt++) {
+        first.emit("turn_end", errorTurn("Connection error."));
+        first.settleError();
+      }
+      first.state.idle = false;
+      first.emit("turn_end", errorTurn(affinity));
+      first.main.deliverAgent({ from: from("lead"), message: "held across reload", delivery: "followUp" });
+      vi.advanceTimersByTime(4 * 60_000);
+      expect(first.compactions).toHaveLength(0);
+      expect(first.alarms).toHaveLength(0);
+      first.main.prepareReload();
+      expect(JSON.parse(fs.readFileSync(`${journal}.delivered`, "utf8")).provider.dead).toMatchObject({
+        phase: "recovering", since: deadlineAt - 5 * 60_000, deadlineAt,
+      });
+      if (mode === "restart") {
+        first.main.closeFollowUpDrain();
+        active = setup(flushMs, undefined, journal); // Same journal and .delivered, a new controller.
+      } else {
+        first.main.attachFollowUpDrain(first.ctx, flushMs, journal);
+      }
+      expect(active.main.providerDeadState).toMatchObject({ phase: "recovering", deadlineAt });
+      expect(JSON.parse(fs.readFileSync(`${journal}.delivered`, "utf8")).provider).toMatchObject({
+        unclassifiedFailures: 2, unclassifiedSince: deadlineAt - 5 * 60_000,
+        dead: { deadlineAt },
+      });
+      vi.advanceTimersByTime(60_000 - 1);
+      expect(active.alarms).toHaveLength(0);
+      expect(active.compactions).toHaveLength(0);
+      vi.advanceTimersByTime(1);
+      expect(Date.now()).toBe(deadlineAt);
+      expect(active.alarms).toEqual([expect.objectContaining({ kind: "non-retryable", cause: "recovery-timeout",
+        since: "2026-10-11T08:00:00.000Z", held: [expect.objectContaining({ from: "agent-lead" })] })]);
+      expect(active.main.providerDeadState).toMatchObject({ phase: "alarmed", alarmed: true, deadlineAt });
+      active.emit("agent_end", {});
+      active.emit("session_tree", {});
+      vi.advanceTimersByTime(60 * 60_000);
+      expect(active.alarms).toHaveLength(1);
+      expect(active.compactions).toHaveLength(0);
+      expect(active.sent).toHaveLength(0);
+      expect(active.main.queueDepth().pendingFollowUps).toBe(1);
+    } finally {
+      first.main.closeFollowUpDrain();
+      if (active !== first) active.main.closeFollowUpDrain();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each(["reattach", "restart"] as const)("alarms before any compaction retry when %s happens after the absolute deadline", (mode) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "main-provider-overdue-"));
+    const journal = path.join(root, "followups.json");
+    const first = setup(flushMs, undefined, journal);
+    let active = first;
+    const deadlineAt = Date.now() + 5 * 60_000;
+    try {
+      first.emit("turn_end", errorTurn(affinity));
+      vi.advanceTimersByTime(4 * 60_000);
+      first.main.prepareReload();
+      if (mode === "restart") first.main.closeFollowUpDrain();
+      vi.advanceTimersByTime(60_000 + 1); // No live drain at the original deadline.
+      expect(first.alarms).toHaveLength(0);
+      if (mode === "restart") {
+        active = setup(flushMs, undefined, journal);
+        active.state.idle = true;
+      } else {
+        first.state.idle = true;
+        first.main.attachFollowUpDrain(first.ctx, flushMs, journal);
+      }
+      // Being idle cannot admit compaction before the already-overdue safety alarm.
+      vi.advanceTimersByTime(0);
+      expect(active.alarms).toEqual([expect.objectContaining({ kind: "non-retryable", cause: "recovery-timeout",
+        since: "2026-10-11T08:00:00.000Z" })]);
+      expect(active.main.providerDeadState).toMatchObject({ phase: "alarmed", deadlineAt });
+      expect(active.compactions).toHaveLength(0);
+      expect(first.compactions).toHaveLength(0);
+      active.emit("agent_end", {});
+      vi.advanceTimersByTime(5 * 60_000);
+      expect(active.alarms).toHaveLength(1);
+      expect(active.compactions).toHaveLength(0);
+      expect(active.sent).toHaveLength(0);
+    } finally {
+      first.main.closeFollowUpDrain();
+      if (active !== first) active.main.closeFollowUpDrain();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   });
 });
 

@@ -241,7 +241,9 @@ Mailbox:
 - `agents.export({ id, write: true, overwrite? })` **writes** a live project actor's definition to the global registry as a project-independent template, again without history. It is not a read: without `write: true` it throws and names `agents.instructions`. A name collision throws unless `overwrite` is `true`. The global registry is shared by every Pi session on the host: each read sees other sessions' changes, and each write applies only its own.
 - `agents.log({ id, type?, lines?, runId? })` reads the shared actor log or a locally owned one-shot run. `type` is `session` (the actor's `session.jsonl` transcript — every user/assistant turn and tool call), `run` (the last retained run's `events.jsonl` event stream, compacted at write time: consecutive `message_update` deltas of one content block are merged into one line, only the latest `tool_execution_update` per tool call is kept, and the repeats — toolResult `message_start`, `turn_end.message` — are dropped; `message_end` carries every complete message), or `all` (both; default `session` for actors). Actors retain their last `MAX_RETAINED_RUNS` runs so logs survive after success. Returns `{ actorId, actorName, sessionFile, logDir, session, run?, retainedRuns }` (actors) or `{ id, runDirectory, logFile, status?, events }` (one-shot runs). Use this to inspect what an "offending" actor actually sent to its model. From the TUI: `/fabric log <id>` previews, `/fabric export-log <id> [path]` writes the raw `session.jsonl` + retained `runs/` to disk.
 
-For topic drain-only during maintenance, save the existing list before clearing it:
+Native slot-bound actors have immutable topics: `setTopics` refuses them with `FABRIC_ACTOR_SLOT_CLAIM_REFUSED` (`reason: "invalid"`) before mutation. The setter also refuses an ordinary actor's transition into protected slot topics. Protected-actor drain support is tracked in [smarty-dev#13463](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/13463).
+
+For topic drain-only on an ordinary (non-slot) actor during maintenance, save the existing list before clearing it:
 
 ```ts
 const actor = await agents.actorStatus({ id: "work-reviewer" });

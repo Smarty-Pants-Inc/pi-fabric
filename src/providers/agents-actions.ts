@@ -889,7 +889,7 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
   },
   {
     name: "setTopics",
-    description: "Replace a locally owned actor's exact mesh-topic subscriptions, or a global template's topics. An empty list stops topic intake while accepted work drains; direct messages, addressed mesh events and host-event subscriptions are unchanged. Restoring a topic accepts new events again, without replaying events already passed by the monitor.",
+    description: "Replace a locally owned ordinary actor's exact mesh-topic subscriptions, or a global template's topics. Native slot-bound topics are immutable; live changes from or into protected topics are refused. An empty list stops topic intake while accepted work drains; direct messages, addressed mesh events and host-event subscriptions are unchanged. Restoring a topic accepts new events again, without replaying events already passed by the monitor.",
     inputSchema: {
       type: "object",
       properties: {

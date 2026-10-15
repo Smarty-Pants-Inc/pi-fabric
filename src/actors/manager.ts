@@ -73,6 +73,7 @@ import { ActorBindingStore } from "./binding-store.js";
 import { ActorRegistryStore, ActorRegistryUpdateVetoedError } from "./registry-store.js";
 import { ActorSlotCreateUncertainError, slotAdmissionFor } from "./slot-admission.js";
 import { ActorSlotRecovery } from "./slot-recovery.js";
+import { ActorSlotClaimRefusedError } from "./slot-authority.js";
 import { observeActorOwnership, ownershipPointReads } from "../topology/publication-generation.js";
 import { withStateFence } from "../mesh/commit-outbox.js";
 import { deleteRootActorTree } from "../topology/main-publication-fence.js";
@@ -2086,6 +2087,13 @@ export class ActorManager {
       if (typeof topic !== "string" || !TOPIC_PATTERN.test(topic)) {
         throw new Error(`Invalid Fabric actor topic: ${String(topic)}`);
       }
+    }
+    // Native admission binds a protected actor to its original topics. Changing
+    // them (including drain-only []) would bypass slot custody, so refuse before
+    // any mutation. Unenforced/ordinary actors keep the drain-only path.
+    if (this.#slotEnforced(actor.topics) || this.#slotEnforced(next)) {
+      throw new ActorSlotClaimRefusedError("invalid",
+        `Fabric actor ${actor.id} topics are bound to native slot admission and cannot be changed`, "smarty-dev#13463");
     }
     this.#assertPresenceValue(this.#presencePreview(actor, { topics: next }));
     actor.topics = next;

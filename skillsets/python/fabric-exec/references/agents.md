@@ -74,7 +74,9 @@ return await agents.create(name="auth-supervisor", instructions="Watch until the
 - `actors`, `actorStatus`, `messages`, and `log` inspect state/history. `remove` deletes through the owner. Use discovered schemas for scope and bounded history options; avoid transcript dumps.
 - Python must not supply guest callback predicates (`validWhile`, handoff predicates); those are not native Python host-call functions. Use supported host fields and explicit checks instead.
 
-For topic drain-only during maintenance, keep a receipt containing the prior list:
+Native slot-bound actors have immutable topics: `setTopics` refuses them with `FABRIC_ACTOR_SLOT_CLAIM_REFUSED` (`reason: "invalid"`) before mutation. The setter also refuses an ordinary actor's transition into protected slot topics. Protected-actor drain support is tracked in [smarty-dev#13463](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/13463).
+
+For topic drain-only on an ordinary (non-slot) actor during maintenance, keep a receipt containing the prior list:
 
 ```python
 actor = await agents.actorStatus(id="work-reviewer")

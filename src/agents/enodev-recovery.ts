@@ -32,7 +32,15 @@ const readJson = (file: string): Record<string, unknown> | undefined => {
     const stat = ownedStat(file);
     if (!stat?.isFile() || stat.size > MAX_FILE) return undefined;
     const parsed: unknown = JSON.parse(fs.readFileSync(file, "utf8"));
-    return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed) ? parsed as Record<string, unknown> : undefined;
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return undefined;
+    const record = parsed as Record<string, unknown>;
+    // Legacy ENODEV input is not the live supervisor's owned native/tree proof.
+    // Never promote a worker-authored reserved code through a recovery shortcut.
+    if (record.errorCode === "WORKER_GONE") {
+      delete record.errorCode;
+      delete record.settledLost;
+    }
+    return record;
   } catch { return undefined; }
 };
 

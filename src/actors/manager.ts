@@ -4102,6 +4102,8 @@ export class ActorManager {
         const previousRunId = actor.lastRunId;
         let runCompleted = false;
         let runLost = false;
+        let runEffects = false;
+        let runFailed = false;
         let enodevRecovered = false; // a saved answer handed back, not a run: nothing to protect from a repeat
         let enodevDelivered = false; // its durable delivery receipt is written; commit after the queue ack
         let handoffConsumed = false;
@@ -4237,7 +4239,9 @@ export class ActorManager {
           runCompleted = result.status === "completed";
           enodevRecovered = result.enodevRecovered === true;
           runStopped = result.status === "stopped";
-          runLost = result.errorCode === "WORKER_GONE";
+          runLost = result.status === "failed" && result.errorCode === "WORKER_GONE";
+          runEffects = result.toolCalls !== 0;
+          runFailed = result.status === "failed" && result.errorCode !== "CONTEXT_OVERFLOW";
           if (runLost) {
             // A lost activation may already have had effects. Consume it before
             // ownership/cancellation handling can park it for another launch.
@@ -4262,7 +4266,7 @@ export class ActorManager {
             this.#drop(actor, [item], `Fabric actor ${actor.name} (${actor.id}) halted by user interrupt`);
             continue;
           }
-          if (actor.ownershipAbort === abortController && result.status !== "completed") {
+          if (actor.ownershipAbort === abortController && result.status !== "completed" && !runEffects && !runFailed) {
             // An ownership change stopped this run; the event runs again under its owner.
             delete actor.ownershipAbort;
             this.#park(actor, [item], `Fabric actor ${actor.name} (${actor.id}) ownership moved during a run`);
@@ -4467,7 +4471,7 @@ export class ActorManager {
             // the next owner run instead of lost (smarty-dev#442); one whose run already
             // completed is recorded, not rerun, so its side effects do not repeat.
             // A recovered ENODEV answer was never run here: park it, and the next owner recovers it (marker kept).
-            if (runLost || (runCompleted && !enodevRecovered)) this.#drop(actor, [item], message);
+            if (runLost || runEffects || runFailed || (runCompleted && !enodevRecovered)) this.#drop(actor, [item], message);
             else {
               // #912 round 4: a resumed item refused before any launch spends no restart attempt, so count the
               // refusals: from the cap on it loses its parked-queue exemption, and its owner hears it once.

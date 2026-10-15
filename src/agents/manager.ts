@@ -481,6 +481,8 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
   ownProcess?: OwnedProcess;
   /** Monotonic proof about this exact actor attempt, never a status-file identity. */
   workerGone?: boolean;
+  /** Host-only outcome, installed only after owned identity AND native/tree exit proof. */
+  workerLostResult?: AgentRunResult;
   /** pi-fabric#939 round 2: its saved answer was delivered to the spawner after an unconfirmed exit (once). */
   recoveredAnswer?: boolean;
   /** Round 3: that delivery's save succeeded; only its completed mark is left. */
@@ -4954,8 +4956,6 @@ export class AgentManager {
   async #settleGoneActorWorker(managed: ManagedAgent, record: AgentRunRecord | undefined): Promise<boolean> {
     if ((managed.stopRequested && !managed.workerGone) || !this.#actorWorkerGone(managed) ||
         record?.status === "completed" || record?.errorCode === "CONTEXT_OVERFLOW") return false;
-    if (record && terminalStatuses.has(record.status) && !recoverableStop(record) &&
-        !transportExitedWithoutResult(record.error) && !retryablePiStartupError(record.error)) return false;
     const lost: AgentRunResult = { ...failedRecord(managed, "failed",
       "Actor worker is proven gone; execution was lost and this event will not be replayed"),
       startedAt: this.#admissionOwners.get(managed.id)?.acquiredAt ?? record?.startedAt ?? Date.now(),
@@ -4967,10 +4967,16 @@ export class AgentManager {
     if (!managed.executionExited) return true;
     // Native close can race the worker's final status publication. A committed
     // success remains deliverable even when the monitor first saw running.
-    if (readRecord(managed.statusFile)?.status === "completed") return false;
-    writeRecord(managed.statusFile, lost);
+    const committed = readRecord(managed.statusFile) ?? record;
+    if (committed?.status === "completed") return false;
+    // A committed ordinary failure is not transport loss. Preserve its error
+    // and the actor's normal failure accounting; ownership must still not replay it.
+    const result = committed?.status === "failed" && !recoverableStop(committed) &&
+      !retryablePiStartupError(committed.error) ? committed as AgentRunResult : lost;
+    if (result === lost) managed.workerLostResult = lost;
+    writeRecord(managed.statusFile, result);
     await this.#captureWorktree(managed);
-    this.#settle(managed, lost);
+    this.#settle(managed, result);
     return true;
   }
 
@@ -4986,12 +4992,15 @@ export class AgentManager {
       if (managed.transport !== watchedTransport) {
         const transport = watchedTransport = managed.transport;
         nativeClosePending = false;
-        void transport.closed?.then(() => {
+        const changed = () => {
           if (managed.transport !== transport || managed.settled) return;
           nativeClosePending = true;
           wake?.();
-        }, () => { /* notification is not exit proof */ });
+        };
+        void transport.closed?.then(changed, changed);
+        void transport.treeClosed?.then(changed, changed);
       }
+      try {
       this.#drainLifecycle(managed);
       if (this.#observeFinalAnswer(managed)) {
         // Result observers release now. Native admission/files remain fenced by
@@ -5051,8 +5060,9 @@ export class AgentManager {
           await this.#waitForTransportExit(managed, Date.now() + TRANSPORT_EXIT_GRACE_MS);
         }
         if (!nativeWindowsClose) await this.#drainExecution(managed);
+        if (managed.executionExited && await this.#settleGoneActorWorker(managed, readRecord(managed.statusFile) ?? record) && managed.settled) return;
         await this.#captureWorktree(managed);
-        this.#settle(managed, this.#withTransportMetadata(managed.relaunchFailure ?? record, managed) as AgentRunResult);
+        this.#settle(managed, this.#withTransportMetadata(managed.relaunchFailure ?? readRecord(managed.statusFile) ?? record, managed) as AgentRunResult);
         return;
       }
       if (Date.now() >= deadline) {
@@ -5166,6 +5176,12 @@ export class AgentManager {
           firstObservedDeadAt = undefined;
         }
       }
+      } catch (error) {
+        // Keep this ONE monitor as settlement owner after a transient join failure.
+        // Native/tree notifications wake it; the existing monitor wait is the safety net.
+        // A notification never clears debt or substitutes for #drainExecution's proof.
+        this.#markLost(managed, String(error));
+      }
       if (nativeClosePending) { nativeClosePending = false; continue; }
       await new Promise<void>(resolve => {
         const timer = setTimeout(() => { wake = undefined; resolve(); }, AGENT_STATUS_POLL_INTERVAL_MS);
@@ -5184,6 +5200,7 @@ export class AgentManager {
 
   #settle(managed: ManagedAgent, result: AgentRunResult): void {
     if (managed.settled) return;
+    result = this.#withTransportMetadata(result, managed) as AgentRunResult;
     if (managed.worktreeResult) result.worktreeResult = managed.worktreeResult;
     // Every terminal path (including explicit stop and lost transport) gets a
     // final unthrottled read before freezing the nested status tree.
@@ -5851,12 +5868,19 @@ export class AgentManager {
   }
 
   #withTransportMetadata(record: AgentRunRecord, managed: ManagedAgent, includeSaveFailure = true): AgentRunRecord {
+    record = managed.workerLostResult ?? record;
     const nestedAgents = reconcileNestedAgents(this.#nestedAgents(
       managed,
       terminalStatuses.has(record.status) && !managed.settled,
     ), record);
     const budget = this.#budgetSummary();
     const { logFile: _logFile, nestedAgents: _nestedAgents, ...safeRecord } = record;
+    // Status JSON is worker-writable. Only the supervisor's post-join snapshot
+    // can authorize WORKER_GONE, including when wait/status re-read the disk.
+    if (safeRecord.errorCode === "WORKER_GONE" && !managed.workerLostResult) {
+      delete safeRecord.errorCode;
+      delete safeRecord.settledLost;
+    }
     const model = record.model ?? managed.model;
     const thinking = record.thinking ?? managed.thinking;
     const runnerSessionId = record.runnerSessionId ?? managed.runnerSessionId;

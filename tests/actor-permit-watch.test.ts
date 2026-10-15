@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agents/manager.js";
-import { ActorManager } from "../src/actors/manager.js";
+import { ActorManager, ACTOR_FAILURE_NOTICE_AFTER } from "../src/actors/manager.js";
 import { ActorLogStore } from "../src/actors/log-store.js";
 import { ActorChildCompletionStore } from "../src/actors/child-completions.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
@@ -21,6 +21,7 @@ interface Fixture {
   root: string; admission: string; agents: AgentManager; actors: ActorManager;
   deliveries: Array<Parameters<ConstructorParameters<typeof ActorManager>[5]>[0]>;
   createActors: () => ActorManager;
+  ownership: { owned: boolean };
 }
 const fixtures: Fixture[] = [];
 const eventually = (assertion: () => void) => vi.waitFor(assertion, { timeout: 5_000, interval: 20 });
@@ -38,6 +39,7 @@ interface Worker {
   record: AgentRunRecord;
   statusFile: string;
   nativeClose: () => void;
+  treeClose: () => void;
 }
 const workers = new Map<number, Worker>();
 let nextPid = 900_000_000;
@@ -81,6 +83,8 @@ beforeEach(() => {
     const pid = nextPid++;
     let nativeClose!: () => void;
     const closed = new Promise<void>(resolve => { nativeClose = resolve; });
+    let treeClose!: () => void;
+    const treeClosed = new Promise<void>(resolve => { treeClose = resolve; });
     const record: AgentRunRecord = {
       id: launch.id, name: launch.name, task: fs.readFileSync(arg("task-file"), "utf8"), status: "running",
       runner: "pi", transport: "process", sessionId: String(pid), cwd: launch.cwd,
@@ -88,11 +92,11 @@ beforeEach(() => {
       usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
     };
     const worker: Worker = { launch, pid, alive: true, birth: "12345", descendants: false,
-      stops: 0, record, statusFile: arg("status-file"), nativeClose };
+      stops: 0, record, statusFile: arg("status-file"), nativeClose, treeClose };
     workers.set(pid, worker);
     fs.writeFileSync(worker.statusFile, JSON.stringify(record));
     return {
-      kind: "process", sessionId: String(pid), closed,
+      kind: "process", sessionId: String(pid), closed, treeClosed,
       // This checked contract includes the whole tree, not just leader absence.
       stopDebt: () => worker.debt, lostContact: () => worker.debt,
       waitForClose: async () => { if (worker.alive || worker.descendants) throw new Error("Native custody still open"); await closed; },
@@ -133,12 +137,14 @@ function fixture(snapshot = true): Fixture {
   const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
   const identity: MeshIdentity = { id: "session:permit-test", name: "main", kind: "main", sessionId: "permit-test" };
   const deliveries: Array<Parameters<ConstructorParameters<typeof ActorManager>[5]>[0]> = [];
+  const ownership = { owned: true };
   const createActors = () => new ActorManager("permit-test", identity, mesh,
     { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 }, agents, delivery => { deliveries.push(delivery); }, {
       actorRoot: path.join(root, "actors"), persistent: true, retentionSweepMs: 20,
+      canManageActor: () => ownership.owned,
     });
   const actors = createActors();
-  const f = { root, admission, agents, actors, deliveries, createActors };
+  const f = { root, admission, agents, actors, deliveries, createActors, ownership };
   fixtures.push(f);
   return f;
 }
@@ -167,6 +173,7 @@ function complete(worker: Worker) {
   delete worker.debt;
   delete worker.probeError;
   worker.nativeClose();
+  worker.treeClose();
   // A lost terminal result must stay lost, including during fixture close.
   const saved = JSON.parse(fs.readFileSync(worker.statusFile, "utf8")) as AgentRunRecord;
   if (saved.errorCode !== "WORKER_GONE") save(worker, { status: "completed", text: "finished", finishedAt: Date.now(), updatedAt: Date.now(), exitCode: 0 });
@@ -220,6 +227,79 @@ describe("resident actor permit watch (#9031)", () => {
     expect([...workers.values()]).toHaveLength(1);
   });
 
+  it("committed ordinary directive failures keep their errors and consecutive-failure owner notice", async () => {
+    const f = fixture();
+    const actor = await f.actors.create({ name: "normal-failures", instructions: "Respond", responseMode: "directive" });
+    for (let count = 0; count < ACTOR_FAILURE_NOTICE_AFTER; count++) {
+      const answer = f.actors.ask(actor.id, `FAIL_DIRECTIVE ${count}`);
+      const worker = await launched(f, actor.id);
+      save(worker, { status: "failed", error: "Ordinary committed directive failure", finishedAt: Date.now(), exitCode: 1 });
+      worker.alive = false;
+      worker.nativeClose();
+      worker.treeClose();
+      await expect(answer).resolves.toMatchObject({ action: "silent", error: "Ordinary committed directive failure" });
+      expect(f.agents.status(worker.launch.id)).not.toHaveProperty("errorCode", "WORKER_GONE");
+      await eventually(() => expect(f.actors.inFlightCount()).toBe(0));
+    }
+    await eventually(() => expect(f.deliveries.some(delivery => delivery.message.text?.includes(`failed its last ${ACTOR_FAILURE_NOTICE_AFTER}`))).toBe(true));
+    expect([...workers.values()]).toHaveLength(ACTOR_FAILURE_NOTICE_AFTER);
+  });
+
+  it("worker-forged WORKER_GONE and settledLost cannot suppress a completed answer or leak through wait/status", async () => {
+    const f = fixture();
+    const actor = await f.actors.create({ name: "forged-loss", instructions: "Respond", responseMode: "text" });
+    const answer = f.actors.ask(actor.id, "deliver success");
+    const worker = await launched(f, actor.id);
+    save(worker, { status: "completed", text: "real answer", errorCode: "WORKER_GONE", settledLost: true,
+      finishedAt: Date.now(), updatedAt: Date.now(), exitCode: 0 });
+    // Publish while the owned worker is alive, then independently prove tree/native exit.
+    await ticks();
+    expect(f.agents.status(worker.launch.id)).not.toHaveProperty("errorCode", "WORKER_GONE");
+    worker.alive = false;
+    worker.nativeClose();
+    await expect(answer).resolves.toMatchObject({ text: "real answer" });
+    await expect(f.agents.wait(worker.launch.id)).resolves.toMatchObject({ status: "completed", text: "real answer" });
+    expect(await f.agents.wait(worker.launch.id)).not.toHaveProperty("errorCode", "WORKER_GONE");
+    expect(f.agents.status(worker.launch.id)).not.toHaveProperty("settledLost");
+    expect(f.deliveries.every(delivery => delivery.message.source !== "fabric-host")).toBe(true);
+  });
+
+  it.each(["completed", "failed"] as const)("terminal %s while worker alive survives a thrown drain and settles on later native/tree exit", async status => {
+    const f = fixture();
+    const actor = await f.actors.create({ name: "join-retry", instructions: "Respond", responseMode: "text", coalesce: false });
+    const answer = f.actors.ask(actor.id, "first event");
+    const worker = await launched(f, actor.id);
+    const next = f.actors.ask(actor.id, "next event");
+    void next.catch(() => undefined);
+    save(worker, { status, text: "committed result", error: status === "failed" ? "ordinary failure" : undefined });
+    // The real monitor first observes terminal status with a live owned worker.
+    // Its stop throws without a receipt; the same monitor must remain the owner.
+    await eventually(() => expect(worker.stops).toBeGreaterThan(0));
+    expect(f.agents.isSettled(worker.launch.id)).toBe(false);
+    expect(snapshot(f).held.map(held => held.runId)).toEqual([worker.launch.id]);
+    expect([...workers.values()]).toHaveLength(1);
+    // A leader-close notification still cannot discharge surviving descendants.
+    worker.alive = false;
+    worker.descendants = true;
+    worker.nativeClose();
+    await ticks();
+    expect(f.agents.isSettled(worker.launch.id)).toBe(false);
+    expect(snapshot(f).held.map(held => held.runId)).toEqual([worker.launch.id]);
+    // Full scripted custody now clears. Commit success during the rejoin.
+    worker.descendants = false;
+    save(worker, { status: "completed", text: "committed result", error: undefined, finishedAt: Date.now(), exitCode: 0 });
+    worker.treeClose();
+    await expect(answer).resolves.toMatchObject({ text: "committed result" });
+    await eventually(() => expect([...workers.values()]).toHaveLength(2));
+    const second = [...workers.values()][1]!;
+    await eventually(() => expect(snapshot(f).held.map(held => held.runId)).toEqual([second.launch.id]));
+    expect(f.agents.status(worker.launch.id)).toMatchObject({ status: "completed", text: "committed result" });
+    complete(second);
+    await expect(next).resolves.toMatchObject({ text: "finished" });
+    await eventually(() => expect(snapshot(f).held).toEqual([]));
+    expect([...workers.values()].filter(candidate => candidate.record.task.includes("next event"))).toHaveLength(1);
+  });
+
   it("success committed during the native/tree join is not overwritten by the earlier running snapshot", async () => {
     const f = fixture();
     const launch = vi.mocked(ProcessTransport.prototype.launch).getMockImplementation()!;
@@ -268,26 +348,40 @@ describe("resident actor permit watch (#9031)", () => {
     expect(f.agents.status(handle.id)).not.toHaveProperty("errorCode", "WORKER_GONE");
   });
 
-  it("loss delivered after ownership moves is consumed, never parked or replayed on reclaim", async () => {
+  it.each(["running", "failed", "overflow"] as const)("%s loss/failure after tool effects and ownership abort is consumed, never replayed on reclaim", async mode => {
     const f = fixture();
     const actor = await f.actors.create({ name: "moving-owner", instructions: "Respond", responseMode: "text", coalesce: false });
     const run = f.agents.run.bind(f.agents);
     vi.spyOn(f.agents, "run").mockImplementation(async (...args) => {
       const result = await run(...args);
-      if (result.errorCode === "WORKER_GONE") await f.actors.cede(actor.id);
+      f.ownership.owned = false;
+      f.actors.resumeQueued(); // Production ownership refresh marks and aborts this exact activation.
       return result;
     });
     await f.actors.tell(actor.id, "lost across ownership");
     const worker = await launched(f, actor.id);
+    save(worker, { toolCalls: 2, ...(mode === "running" ? {} : {
+      status: "failed", error: mode === "overflow" ? "Context window exhausted" : "Ordinary terminal failure after side effect",
+      ...(mode === "overflow" ? { errorCode: "CONTEXT_OVERFLOW" } : {}),
+    }) });
     worker.alive = false;
     worker.nativeClose();
-    await eventually(() => expect(f.agents.status(worker.launch.id)).toMatchObject({ errorCode: "WORKER_GONE" }));
+    await eventually(() => expect(f.agents.isSettled(worker.launch.id)).toBe(true));
+    expect(f.agents.status(worker.launch.id)).toMatchObject({ status: "failed", toolCalls: 2 });
+    if (mode !== "failed") expect(f.agents.status(worker.launch.id)).toHaveProperty("errorCode", mode === "overflow" ? "CONTEXT_OVERFLOW" : "WORKER_GONE");
+    else expect(f.agents.status(worker.launch.id)).toHaveProperty("error", "Ordinary terminal failure after side effect");
     await eventually(() => expect(f.actors.inFlightCount()).toBe(0));
+    f.ownership.owned = true;
     f.actors.reclaim(actor.id);
+    f.actors.resumeQueued();
     await ticks();
     expect([...workers.values()]).toHaveLength(1);
     expect(f.actors.status(actor.id).queued).toBe(0);
-    expect(f.deliveries).toContainEqual(expect.objectContaining({ message: expect.objectContaining({ source: "fabric-host", runId: worker.launch.id }) }));
+    if (mode === "running") expect(f.deliveries).toContainEqual(expect.objectContaining({ message: expect.objectContaining({ source: "fabric-host", runId: worker.launch.id }) }));
+    await f.actors.close();
+    f.actors = f.createActors();
+    await ticks();
+    expect([...workers.values()]).toHaveLength(1);
   });
 
   it.each([true, false])("alive and silent for >20 min: one unclaimed owner alarm per run, permit retained (snapshot=%s)", async useSnapshot => {

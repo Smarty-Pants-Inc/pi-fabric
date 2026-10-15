@@ -11,8 +11,10 @@ import type { FabricScope, FabricScopeGrant } from "../protocol.js";
 import type { ThinkingTransferInput } from "./thinking-transfer.js";
 import type { FabricThinking, FabricThinkingBounds } from "../thinking.js";
 import type { FabricParticipantResidency } from "../topology/types.js";
+import type { AgentWriteReceipt } from "./write-receipt.js";
 import type { InheritedSessionPin } from "./session-pins.js";
 import type { AgentWorktreeResult } from "./worktree-manager.js";
+import type { AgentUndeliveredMessage } from "./terminal-target.js";
 
 /** Fabric run transports plus adapter-owned ("hosted") runs. */
 export type AgentRunTransport = FabricAgentTransport | "hosted";
@@ -70,6 +72,8 @@ export interface AgentSpawner {
 }
 
 export interface AgentRunRequest {
+  /** Host-only: the actor queue item this run serves (smarty-dev#8935 recovery of an ENODEV-unconfirmed run). */
+  activationId?: string;
   /** Explicit history class; routing still requires a separately prepared decision. */
   routeClass?: string;
   protected?: boolean;
@@ -115,6 +119,8 @@ export interface AgentRunRequest {
   worktree?: boolean;
   /** Shell command run in a new worktree before launch; overrides agents.worktree.setup. */
   worktreeSetup?: string;
+  /** Explicit opt-out of the process task write default, audited at launch. */
+  writePolicy?: "unrestricted";
   /** Write confinement enforced in the Pi child; see child-env.ts. */
   readOnly?: boolean;
   writableRoots?: string[];
@@ -196,6 +202,8 @@ export interface AgentCompactionStatus {
 export interface AgentRunRecord {
   /** Canonical Fabric package root selected for the process worker at spawn time. */
   fabricRelease?: string;
+  /** Admitted memory-capped task cgroup (smarty-dev#8257); absent when uncapped. */
+  cgroup?: string;
   /** Always populated for new runs; optional for legacy records. */
   routeClass?: string;
   routeClassSource?: AgentRunRouteMetadata["routeClassSource"];
@@ -210,6 +218,17 @@ export interface AgentRunRecord {
   id: string;
   name: string;
   task: string;
+  /** Exact original spawn brief, retained separately from mutable continuation task text. */
+  promptSha256?: string;
+  promptBytes?: number;
+  promptPath?: string;
+  /** Current task.txt bytes; changes when a same-run continuation rewrites the input. */
+  inputSha256?: string;
+  inputBytes?: number;
+  /** True when close/retention dropped the current input file. */
+  promptRetentionDropped?: boolean;
+  /** True when the current input failed stable digest verification. */
+  promptRetentionMismatch?: boolean;
   status: AgentRunStatus;
   /** One-based FIFO admission position; present only while queued. */
   queuePosition?: number;
@@ -234,6 +253,8 @@ export interface AgentRunRecord {
   finishedAt?: number;
   currentTool?: string;
   currentToolStartedAt?: number;
+  /** smarty-dev#8758: tool-generated receipt of the paths written and shell commands run (write-receipt.ts). */
+  writeReceipt?: AgentWriteReceipt;
   followUpDeliveries?: AgentFollowUpDelivery[];
   turns: number;
   /** Actual model output/tool execution, not worker startup or an error-only turn. */
@@ -305,6 +326,10 @@ export interface AgentRunRecord {
 export interface AgentRunResult extends AgentRunRecord {
   /** Resolution marker in agents.run results; does not replace the observed model. */
   via?: string;
+  /** smarty-dev#8935: an ENODEV-unconfirmed run's saved answer, not yet settled; the actor commits it after delivery. */
+  enodevRecovered?: boolean;
+  /** Its delivery receipt already exists: a crash came after a delivery attempt; the actor replays idempotently. */
+  enodevReplay?: boolean;
   /** Canonical launch selection when via is present; may differ from the observed model. */
   selectedModel?: string;
   /** Failed admission only: model/auth timed out before any transport launch was attempted.
@@ -315,8 +340,12 @@ export interface AgentRunResult extends AgentRunRecord {
 
 export interface AgentHandleInfo {
   finalAnswerReceipt?: { id: string; recordedAt: number };
+  /** smarty-dev#9855: on a waiting spawn, the admission permits unknown-outcome launches still hold. */
+  heldPermits?: number;
   /** Canonical Fabric package root selected for the process worker at spawn time. */
   fabricRelease?: string;
+  /** Admitted memory-capped task cgroup (smarty-dev#8257); absent when uncapped. */
+  cgroup?: string;
   followUpDeliveries?: AgentFollowUpDelivery[];
   routeClass?: string;
   routeClassSource?: AgentRunRouteMetadata["routeClassSource"];
@@ -326,6 +355,15 @@ export interface AgentHandleInfo {
   compactionSkipped?: string;
   id: string;
   name: string;
+  /** Exact original spawn brief metadata; never contains prompt text. */
+  promptSha256?: string;
+  promptBytes?: number;
+  promptPath?: string;
+  /** Current task.txt bytes, updated for a same-run continuation. */
+  inputSha256?: string;
+  inputBytes?: number;
+  promptRetentionDropped?: boolean;
+  promptRetentionMismatch?: boolean;
   status: AgentRunStatus;
   /** One-based FIFO admission position; present only while queued. */
   queuePosition?: number;
@@ -366,6 +404,12 @@ export interface AgentWorkerOptions {
   pythonRuntime?: FabricPythonRuntime;
   name: string;
   taskFile: string;
+  /** Exact original spawn brief metadata. The task file may later contain a continuation. */
+  promptSha256?: string;
+  promptBytes?: number;
+  promptPath?: string;
+  inputSha256?: string;
+  inputBytes?: number;
   imagesFile?: string;
   statusFile: string;
   lifecycleFile: string;
@@ -384,6 +428,8 @@ export interface AgentWorkerOptions {
   fullCodeMode: boolean;
   mainAgentId?: string;
   spawner?: AgentSpawner;
+  /** The spawner's own sender name (smarty-dev#6207), sent as X-Smarty-Spawner. */
+  spawnerName?: string;
   fabricSessionId?: string;
   extensions: boolean;
   tools: string[];
@@ -430,6 +476,8 @@ export interface AgentWorkerOptions {
   /** Observed native Pi session history carried across a same-run worker relaunch. Not a resume target. */
   runnerSessionIds?: string[];
   carryOver?: AgentRunCarryOver;
+  /** Default process task's own private scratch; exported as TMPDIR. */
+  tmpdir?: string;
   /** Serialized PI_FABRIC_WRITE_POLICY; Pi children also load the write guard. */
   writePolicy?: string;
   /** Serialized PI_FABRIC_LINEAGE. */
@@ -460,6 +508,8 @@ export interface AgentTransportLaunch {
   requires?: string[];
   /** Host-derived incompatibility, never accepted from guest arguments. */
   placementLocalReason?: string | undefined;
+  /** Report the default policy's actual local/remote launch boundary once; host-owned audit only. */
+  onWritePolicyDisposition?: (disposition: "local" | "remote") => void;
   /** Manager close or explicit run/actor revocation, never a returned queued receipt's guest deadline. */
   signal?: AbortSignal | undefined;
   /** Host activation generation check. Recheck after preparation, immediately before worker creation. */
@@ -519,6 +569,9 @@ export interface AgentTransportHandle {
    * observation failure rejects, never authorizes collection/replacement.
    * Unverified scopes and unscoped workers omit this field entirely. */
   treeClosed?: Promise<void>;
+  /** Admitted, memory-capped task cgroup path (smarty-dev#8257). Present only after the
+   * launcher verified the capped scope receipt; uncapped/fallback launches omit it. */
+  cgroup?: string;
   /** Bounded diagnostic tail for workers that fail before writing a status record. */
   readStderr?(): string;
   isAlive(options?: AgentTransportObservationOptions): Promise<boolean>;
@@ -552,6 +605,17 @@ export interface FabricAgentLog {
 }
 
 export type FabricSteeringMode = "all" | "one-at-a-time";
+
+/** smarty-dev#9855: held admission permits reached half of maxConcurrent. */
+export interface AgentAdmissionAlarm {
+  heldPermits: number;
+  maxConcurrent: number;
+  at: number;
+  message: string;
+  /** pi-fabric#939 round 4: one owner alarm when a held run's recovered answer cannot be saved (names the run). */
+  kind?: "recovered-answer-save-failed";
+  runId?: string;
+}
 
 export interface AgentFollowUpAlarm {
   code: "FABRIC_FOLLOW_UP_DEADLINE";
@@ -615,6 +679,8 @@ export type AgentChildQuestionResponse =
   | { cancelled: true };
 
 export interface AgentSteerResult {
+  /** Explicit receipt when the final answer won the admission/append race. */
+  undelivered?: AgentUndeliveredMessage;
   deadlineAt?: number;
   warning?: AgentFollowUpRunningWarning;
   queued: true;

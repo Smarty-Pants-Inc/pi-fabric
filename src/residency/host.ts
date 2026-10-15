@@ -2,25 +2,63 @@
 
 import { fabricTurnProvenance, fabricWakeCause, copyFabricWakeCause, type FabricWakeCause, type FabricPrincipal } from "../fabric-provenance.js";
 import { randomUUID } from "node:crypto";
+import { detachedPreview } from "../core/preview.js";
 import { resolveActorInstructions, assertActorInstructionReplacement } from "../actors/instructions-file.js";
 import {
   RESIDENT_HANDOVER_ABI, HANDOVER_DRAIN_MS, exactResidentProcess, assertAutomaticReleaseRecovery,
   residentLaunchSpec, validateLaunchSpec, assertHandoverTopology, assertPreviousLaunchSpec,
   handoverPath, handoverCustodyPath, handoverOutcomePath, handoverActive,
   readHandoverJson, writeHandoverState, writeLaunchSnapshot, mainGenerationCurrent, decideHandover,
+  writeResidentStagedReadyReceipt, assertResidentStagedReady, specDigest, type ResidentStagedReadyReceipt,
   type ResidentLaunchSpec, type ResidentLauncherIdentity, type ResidentHandoverPlan, type ResidentHandoverState,
 } from "./handover.js";
+import {
+  RESIDENT_DRAIN_ABI, ResidentDrainRefusedError, newResidentDrainReceipt, residentDrainDeadline, sameDrainOwner, sameDrainLauncher,
+  writeResidentDrainReceipt, readResidentDrainReceipt, type ResidentDrainReceipt,
+} from "./drain.js";
+import { failClosedContainment, ContainmentUnavailableError, type AttemptContainment, type AttemptLaunchReceipt } from "./attempt-containment-contract.js";
+import { readResidentLaunchAttestation } from "./launch-attestation.js";
+
+/** Internal checkpoint capability; absence refuses before holding admissions. */
+interface ResidentDrainActors {
+  pauseForRelease(options?: { strict?: boolean }): void;
+  resumeAfterRelease(): void;
+  checkpointForRelease(assertHeld?: () => void): Promise<void>;
+  releaseCheckpointReceipt(): unknown;
+  withReleaseAdmission<T>(admit: () => T): T;
+}
+interface ResidentDrainAgents {
+  pauseForRelease(strict?: boolean): void;
+  resumeAfterRelease(): void;
+  checkpointForRelease(deadlineAt?: number, valid?: () => boolean): Promise<void>;
+}
+interface ResidentDrainIngress {
+  pause(strict?: boolean): void;
+  checkpointForRelease(valid?: () => boolean): Promise<void>;
+}
+interface ResidentHeldDrain {
+  receipt: ResidentDrainReceipt;
+  caller: ResidentActorCaller;
+  checkpointAbort: AbortController;
+  timer: NodeJS.Timeout;
+  resumed: Promise<void>;
+  resolveResumed(): void;
+}
 
 interface ResidentHostLaunchContext {
   launcher: ResidentLauncherIdentity;
   spec: ResidentLaunchSpec;
+  /** Trusted launcher-channel launch receipt; never reconstructed by opening a scope path. */
+  launchAttestation?: AttemptLaunchReceipt;
   attempt?: { id: string; kind: "target" | "fallback" };
 }
 import { lockFile, FileLockBusy } from "./file-lock.js";
 import { assertNoWatchdogCustody } from "./watchdog-custody.js";
-import { readResidentOperatorEvidence, assertResidentOperatorConfirmed } from "./operator-safety.js";
+import { readResidentOperatorEvidence, assertResidentOperatorConfirmed, assertRootParticipantQuiet } from "./operator-safety.js";
 import { closeWithActors } from "../actors/close-order.js";
+import { residentProcessWorkPending, subscribeResidentProcessWork } from "./process-work.js";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { writeJsonAtomic } from "../core/atomic-write.js";
@@ -33,23 +71,32 @@ import {
   resolveFabricModelGuidance,
 } from "../components/model-guidance.js";
 import { ActorDirectory } from "../actors/directory.js";
+import { slotAdmissionFor } from "../actors/slot-admission.js";
+import { ActorSlotRecoveryParkedError } from "../actors/slot-recovery.js";
+import { wakeResidentActors, assertResidentWakeWatch, ensureResidentWakeArchive, readWakeJson, residentWakeRequestPath, residentSleepingPath, ResidentWakeWatchError, subscribeResidentWakeWatchErrors, type ResidentWakeRoutes } from "./wake.js";
+import { DEFAULT_STUCK_PREPARING_MS, STUCK_PREPARING_CHECK_MS } from "../actors/stuck-preparing.js";
 import { ActorRegistryStore } from "../actors/registry-store.js";
+import { canonicalResidentWakeConfig, residentWakeConfigMatches, residentWakeCapacityAvailable, residentWakeIndexPath, RESIDENT_WAKE_INDEX_MAX_ROOTS, ResidentWakeRecoveryReader, type ResidentWakeRecoveryBatch } from "./wake-index.js";
 import { ActorSessionResetCancelledError } from "../actors/session-reset-error.js";
 import type { FabricActorInfo } from "../actors/types.js";
 import type { StateProjector } from "../mesh/state-projector.js";
 import { AgentManager } from "../agents/manager.js";
-import { terminalRejectionFields, type AgentTerminalNotice } from "../agents/terminal-target.js";
+import { FabricTargetTerminalError, terminalRejectionFields, type AgentTerminalNotice } from "../agents/terminal-target.js";
 import { launchScope } from "../scope.js";
 import { useBudgetLedger } from "../agents/budget-ledger.js";
 import { LifecycleBroker } from "../lifecycle/broker.js";
 import { lifecycleSourceIdentity, type FabricLifecycleEvent, type FabricLifecycleSubscription } from "../lifecycle/types.js";
-import { MeshStore, RUNTIME_MESH_READ_CACHE_MS, type MeshBatchView, type MeshIdentity } from "../mesh/store.js";
+import { meshStateBackendFromMarker } from "../mesh/backend-fence.js";
+import { MeshStore, meshOutageAlarmSink, RUNTIME_MESH_READ_CACHE_MS, type MeshBatchView, type MeshIdentity } from "../mesh/store.js";
 import { CommitOutbox, withStateFence } from "../mesh/commit-outbox.js";
 import { MeshBackgroundQueue, MeshBackgroundRetry } from "../core/atomic-write.js";
 import { isMeshWriteDeferred } from "../core/atomic-write.js";
 import { FabricControlPlane, controlOwnerIncarnation, controlActorBindingOptions, type FabricControlAcceptance, type FabricControlCommand } from "../topology/control-plane.js";
 import { MeshConsumptionPausedError, assertMeshConsumption } from "../topology/mesh-consumption.js";
 import { ParticipantDirectory } from "../topology/participant-directory.js";
+import { hostLeasePath, readHostLeaseCurrent } from "../topology/host-leases.js";
+import { RESIDENT_IDLE_EXIT_MS } from "../config.js";
+import { residentIdleExitPath, type ResidentIdleExit } from "./idle-exit.js";
 import { rootPresenceAlarms } from "../topology/stall-alarms.js";
 import { actorParticipantRecord, agentParticipantRecords } from "../topology/records.js";
 import {
@@ -72,6 +119,8 @@ import {
   type ResidentAgentMetadata,
   type ResidentCommand,
   type ResidentCommandResponse,
+  residentSlotErrorFields,
+  residentCreateMayBeProtected,
   type ResidentDeliveryRecord,
   type ResidentHostConfig,
   type ResidentHostOwner,
@@ -79,6 +128,7 @@ import {
 import { completionRecipientFromRun, saveCompletion } from "../agents/completion-journal.js";
 import { projectOf } from "../topology/project-identity.js";
 import { processStartTime, residentProcessAlive } from "./process-identity.js";
+import { ensureResidentGenerations, recordResidentGenerationError, recordResidentGenerationExit } from "./generation-exit.js";
 import { ResidentRequestRetention } from "./retention.js";
 import { retentionV2Enabled } from "../storage/retention-platform.js";
 import { ResidentLegacyRunArchive } from "./legacy-run-archive.js";
@@ -88,15 +138,13 @@ import { assertResidentRequestNotExpired, residentRequestGeneration, ResidentReq
 // dead host's fence without loading the host (smarty-dev#3252).
 export { RESIDENT_RUN_RETENTION_MS, sweepResidentRuns } from "./retention.js";
 const REQUEST_POLL_MS = 50;
+// ponytail: 30s only amortizes deliveries racing clean close; no worker/session is kept warm.
 const IDLE_EXIT_MS = 30_000;
-// The request poll runs every REQUEST_POLL_MS, but its idle check need not rebuild the
-// fleet-wide actor ownership view that often: that view lists every project participant and
-// stats every host lease, so at 20 Hz it was most of an idle host's CPU (smarty-dev#6729).
-// Requests, admissions and agents are still checked on every tick; the actor check is
-// reused for at most this long, and an exit is always confirmed by a current actor check.
-// Every actor change signal (create, run start and end, stop, ownership) restarts the idle
-// window and drops the reused observation, so a run that starts and ends between two samples
-// still counts: the window always runs from the last real actor activity.
+// Reuse active-actor observations on the existing request poll, not dormancy checks.
+const ACTIVE_ACTOR_CACHE_MS = 1_000;
+// Keep fleet-wide ownership/root observations off the 20 Hz request poll (smarty-dev#6729).
+// Requests/admissions/agents remain exact on every tick; exit revalidates all observations.
+// Actor and request activity resets the window even when it starts/ends between samples.
 const IDLE_ACTOR_CHECK_MS = 1_000;
 // A stat stamp of config.json proves it unchanged only once the file is older than the
 // coarsest timestamp granularity a volume may have (FAT: 2 s). Until then a same-size
@@ -225,7 +273,7 @@ export const residentIdleDecision = (input: {
   const holdsSchedules = input.nextScheduleDueAt !== undefined && input.durableParticipants;
   const wakeAt = holdsSchedules ? input.nextScheduleDueAt : undefined;
   const busy = input.activeActor || input.activeAgent || input.pendingRequest || holdsSchedules;
-  const exit = !busy && input.now - input.idleSince >= (input.idleExitMs ?? IDLE_EXIT_MS);
+  const exit = !busy && input.now - input.idleSince >= (input.idleExitMs ?? RESIDENT_IDLE_EXIT_MS);
   return { busy, exit, ...(wakeAt !== undefined ? { wakeAt } : {}) };
 };
 
@@ -250,22 +298,32 @@ export class ResidentHost {
    */
   beforeRelease: ((failure: unknown, owned: () => boolean) => void) | undefined;
   readonly #lockPath: string;
-  readonly #errorPath: string;
   readonly #requestsPath: string;
   readonly #processingPath: string;
   readonly #responsesPath: string;
   readonly #agentsPath: string;
   readonly #removalsPath: string;
   readonly #deliveryOutboxPath: string;
-  readonly #deliveryRetry = new MeshBackgroundRetry("resident completion/actor delivery");
+  readonly #deliveryRetry = new MeshBackgroundRetry("resident completion/actor delivery")
+    .alarmsTo(meshOutageAlarmSink(() => ({ mesh: this.mesh, from: this.identity })));
   // A delivery whose root is chosen on shared state is written after the commit that chose it
   // (smarty-dev#6477 R11); a crash in between leaves its row for the next flush to replay.
   #deliveryCommits!: CommitOutbox;
   #deliveryCommitsRecovered = false;
   #flushingDeliveries: Promise<unknown> | undefined;
-  readonly #token = randomUUID();
+  readonly #token = residentGenerationToken();
+  /** The owner token this host publishes in owner.json: its generation (smarty-dev#7950). */
+  get generation(): string { return this.#token; }
   #requestTimer: NodeJS.Timeout | undefined;
   #maintenanceTimer: NodeJS.Timeout | undefined;
+  #idleCheckQueued = false;
+  #idleCheckRequested = false;
+  #idleCheckPending: Promise<void> | undefined;
+  #wakeWatchReprobeUsed = false;
+  #wakeWatchErrorUnsubscribe: (() => Promise<void>) | undefined;
+  #processWorkUnsubscribe: (() => void) | undefined;
+  #wakeWatchNeedsReprobe = false;
+  #stuckPreparingCheckedAt = 0;
   #legacyArchive: ResidentLegacyRunArchive | undefined;
   #scheduleTimer: NodeJS.Timeout | undefined;
   #scheduleWakeAt: number | undefined;
@@ -275,16 +333,36 @@ export class ResidentHost {
   // Host-local only: retain pending promises and at most 256 completed creates for 10 minutes.
   readonly #creations = new Map<string, { result: Promise<ResidentCommandResponse>; completedAt?: number }>();
   #closed = false;
+  #closePending: Promise<void> | undefined;
   #routeOwner?: ShadowRouteOwner;
-  readonly #backgroundRequests = new MeshBackgroundRetry("resident request poll");
+  readonly #backgroundRequests = new MeshBackgroundRetry("resident request poll")
+    .alarmsTo(meshOutageAlarmSink(() => ({ mesh: this.mesh, from: this.identity })));
   readonly #backgroundDeliveries = new MeshBackgroundQueue("resident completion/actor delivery");
   #started = false;
   #ready = false;
-  #idleSince = Date.now();
+  #idleSince: number | undefined;
+  #idleExitRequested = false;
+  #residentIdleExitMs = RESIDENT_IDLE_EXIT_MS;
+  #idleObservation = { at: Number.NEGATIVE_INFINITY, blocked: true, wakeable: false };
+  #idleWakeable: boolean | undefined;
+  #sleeping = false;
+  #wakeRoutesJson: string | undefined;
+  #wakeRecovery: ResidentWakeRecoveryReader | undefined;
+  #wakeRecoveryPending: Promise<void> | undefined;
+  #wakeRecoveryIgnored = 0;
+  #wakeCapacityWarned = false;
+  #wakeWatchSupported: boolean | undefined;
   #activeActor = { at: Number.NEGATIVE_INFINITY, active: true };
-  // Retention overlay of config.json, keyed by the file's identity (smarty-dev#6729).
-  #retentionOverlay: { stamp: string; retention: ResidentHostConfig["retention"] } | undefined;
+  // Accepted policy overlay of config.json, keyed by file identity (smarty-dev#6729).
+  #retentionOverlay: { stamp: string; retention: ResidentHostConfig["retention"]; idleExitMs: number } | undefined;
   #admissions = 0;
+  #businessAdmissions = 0;
+  #drain: ResidentHeldDrain | undefined;
+  #drainCheckpointPending: Promise<void> | undefined;
+  readonly #checkpointJoins = new Set<Promise<void>>();
+  #stagedReady: ResidentStagedReadyReceipt | undefined;
+  #trustedLaunchAttestation: AttemptLaunchReceipt | undefined;
+  #containmentClient: (AttemptContainment & { dispose(): void }) | undefined;
   readonly #requestRetention: ResidentRequestRetention;
   #handover: ResidentHandoverPlan | undefined;
   #advancingRelease = false;
@@ -301,13 +379,16 @@ export class ResidentHost {
     readonly onIdle: (reason?: ResidentExitReason) => void = () => {},
     private readonly modelRegistry?: PiModelRegistryView,
     readonly launch?: ResidentHostLaunchContext,
+    private readonly processWorkSessionId = config.sessionId,
+    /** Launcher-custody channel only: read-only membership seam, never scope-path reopening or launch/exit. */
+    readonly containment: AttemptContainment = failClosedContainment,
   ) {
     this.#staged = !!launch?.attempt;
+    this.#residentIdleExitMs = config.mesh.residentIdleExitMs ?? RESIDENT_IDLE_EXIT_MS;
     this.hostId = residentHostId(config.rootId);
     this.identity = { id: this.hostId, name: "Fabric resident host", kind: "agent" };
     this.#ownerPath = path.join(config.residencyRoot, "owner.json");
     this.#lockPath = path.join(config.residencyRoot, "host.lock");
-    this.#errorPath = path.join(config.residencyRoot, "error.json");
     this.#requestsPath = path.join(config.residencyRoot, "requests");
     this.#processingPath = path.join(config.residencyRoot, "processing");
     this.#responsesPath = path.join(config.residencyRoot, "responses");
@@ -322,20 +403,26 @@ export class ResidentHost {
       (directory, expired = () => false) => {
         if (!retentionV2Enabled()) { this.agents.recoverPendingArchives(directory); return; }
         if (!this.agents.hasRunCustody(path.basename(directory)) && this.agents.recoverPendingArchives(directory, expired)) this.#requestRetention.resample();
-      }, retentionV2Enabled() ? {
+      }, {
         // A checked exit clears exchange debt, not the manager's run-directory
         // custody. Deleting a still-managed tree destroys the next fresh exit
         // proof and can pin a deferred stopped-actor exchange indefinitely.
         run: id => this.agents.hasRunCustody(id),
         reference: id => this.agents.retentionCustodyVeto(id),
-      } : undefined);
+      });
   }
 
   #initialize(): void {
     const { config, modelRegistry } = this;
+    // Follow moved-marker/meta authority even after a stale backend config re-apply.
+    const stateBackend = meshStateBackendFromMarker(config.meshRoot, config.mesh.stateBackend);
+    if (stateBackend === "sqlite" && stateBackend !== config.mesh.stateBackend) {
+      console.warn(`[pi-fabric] resident mesh ${config.meshRoot}: SQLite moved marker overrides mesh.stateBackend=${config.mesh.stateBackend}; opening sqlite`);
+    }
     this.mesh = new MeshStore(config.meshRoot, config.mesh.maxEventBytes, config.mesh.maxReadEvents,
       { backgroundReadCacheMs: config.mesh.idleReadCoalesceMs ?? RUNTIME_MESH_READ_CACHE_MS, lockProtocol: config.mesh.lockProtocol,
-        stateBackend: config.mesh.stateBackend });
+        stateBackend,
+        canWakeResidents: () => this.#ready && !this.#closed && !this.#staged && !this.#handover && !this.#drain });
     this.#deliveryCommits = new CommitOutbox(this.mesh, `residency/${this.hostId}/deliveries`, this.identity, {
       delivery: (record: ResidentDeliveryRecord, view, replay) => this.#writeDelivery(record, view, replay),
     });
@@ -345,14 +432,16 @@ export class ResidentHost {
     // An invalid preparation is discarded and re-selected outside every fence.
     // Independent liveness may only renew existing keys with matching lineage tokens;
     // it never claims, creates, removes, or certifies a shared heartbeat.
-    const registries = Object.values(residentActorRoots(config)).map((root) => new ActorRegistryStore(root));
+    const registryRoots = Object.values(residentActorRoots(config));
+    const registries = registryRoots.map((root) => new ActorRegistryStore(root));
     // smarty-dev#8526: lock only the registries holding the rows of the actors this round writes.
     // The project registry is ONE lock shared by every resident host of the project; a round that
     // publishes none of its rows no longer serializes behind (or blocks) other hosts on it.
-    // Any id held by no registry, or a round without an exact actor set, locks every registry.
-    // validPublication still checks every registry's generation under the fence.
+    // An exact empty set proves no actor effects and needs no registry. Any id held by no
+    // registry, or a round without an exact actor set, still locks every registry.
+    // validPublication still checks every registry's generation before committing.
     const publishFenced = <T>(publish: () => Promise<T>, actorIds?: ReadonlySet<string>): Promise<T> => {
-      let scoped: ActorRegistryStore[] | undefined;
+      let scoped: ActorRegistryStore[] | undefined = actorIds?.size === 0 ? [] : undefined;
       if (actorIds && actorIds.size > 0) {
         // ponytail: an unreadable snapshot only loses the scoping; the full fence (and its own reads) decide.
         try {
@@ -360,9 +449,9 @@ export class ResidentHost {
           if (holders.every(store => store !== undefined)) scoped = registries.filter(store => holders.includes(store));
         } catch { scoped = undefined; }
       }
-      return ActorRegistryStore.withLocks(scoped ?? registries, () => this.mesh.withTryLock(publish, 50));
+      return ActorRegistryStore.withLocks(scoped ?? registries, () => this.mesh.withTryLock(publish, 50), "presence-fence");
     };
-    const knownRegistries = registries.map(store => ({ store, snapshot: store.snapshot(), byId: new Map(store.snapshot().actors.map(row => [row.id, row])) }));
+    const knownRegistries = registries.map((store, index) => ({ root: registryRoots[index]!, store, snapshot: store.snapshot(), byId: new Map(store.snapshot().actors.map(row => [row.id, row])) }));
     const current = (known: typeof knownRegistries[number]): typeof knownRegistries[number] => {
       const snapshot = known.store.snapshot(); // cached last-known view unless the atomic generation moved
       if (snapshot !== known.snapshot) {
@@ -374,8 +463,14 @@ export class ResidentHost {
     const actorRenewalAllowed = (record: import("../topology/types.js").FabricParticipantRecord): boolean => {
       for (const known of knownRegistries) {
         const row = current(known).byId.get(record.id);
-        if (row) return row.rootId === config.rootId && (row.residency ?? "session") === "durable" &&
-          record.actorOwnershipToken === JSON.stringify([row.rootId, row.adoptedAt ?? null, row.adoptedFrom ?? []]);
+        if (row) {
+          const topics = Array.isArray(row.topics) ? row.topics.filter((topic): topic is string => typeof topic === "string") : [];
+          const slots = slotAdmissionFor(this.mesh);
+          if (slots.requiresEnforcement(topics, known.root, config.rootId) &&
+              (!this.actors.slotRecoveryStatus().ready || !slots.isCurrent(record.id, topics, known.root))) return false;
+          return row.rootId === config.rootId && (row.residency ?? "session") === "durable" &&
+            record.actorOwnershipToken === JSON.stringify([row.rootId, row.adoptedAt ?? null, row.adoptedFrom ?? []]);
+        }
       }
       return false;
     };
@@ -455,7 +550,8 @@ export class ResidentHost {
         ...(overlay.modelGuidance ? { modelGuidance: overlay.modelGuidance } : {}),
         ...(overlay.kernel ? { kernel: overlay.kernel } : {}),
         ...(overlay.pythonRuntime ? { pythonRuntime: overlay.pythonRuntime } : {}),
-        ...(overlay.retention ? { retention: overlay.retention } : {}) };
+        ...(overlay.retention ? { retention: overlay.retention } : {}),
+        mesh: { ...config.mesh, residentIdleExitMs: overlay.mesh?.residentIdleExitMs ?? RESIDENT_IDLE_EXIT_MS } };
     };
     const currentModelGuidance = () =>
       parseFabricOwnedModelGuidance(currentConfig().modelGuidance ?? config.modelGuidance);
@@ -512,6 +608,7 @@ export class ResidentHost {
       claudeBinary: config.claudeBinary,
       vedaBinary: config.vedaBinary,
       runRoot: path.join(config.residencyRoot, "runs"),
+      admissionSnapshotPath: path.join(residentActorRoots(config).session, "admission.json"),
       fullCodeMode: config.fullCodeMode,
       kernel: () => currentConfig().kernel ?? config.kernel ?? "typescript",
       pythonRuntime: () => currentConfig().pythonRuntime ?? config.pythonRuntime ?? "monty",
@@ -524,6 +621,8 @@ export class ResidentHost {
         startedAt: config.mainStartedAt ?? this.participants.lastKnown?.(config.rootId)?.participant.startedAt ?? 0 }),
       hostId: this.hostId,
       identityId: this.identity.id,
+      // Launches on Main's behalf: Main's published name, not this host's ("main" is only the unnamed default).
+      spawnerName: () => { const name = currentConfig().mainName ?? config.mainName; return name && name !== "main" ? name : undefined; },
       retention: this.#retention,
       preparePiModel: async (model, requiredPin) => resolveResidentPiModel(model, { requiredPin: requiredPin ?? false }),
       resolveParticipantGuidance: ({ model }) => {
@@ -537,6 +636,7 @@ export class ResidentHost {
       onLifecycle: (event) => { if (this.lifecycle) this.#trackPublication(this.lifecycle.publishBackground(event)); },
       onTerminalNotice: notice => this.#deliverTerminalNotice(notice),
       onSettled: (result) => {
+        this.#scheduleIdleCheck();
         // Only public durable task runs: actor activations are cleaned by their actor (review/astra on #136).
         if (result.actorId) return;
         const file = residentResultPath(config.residencyRoot, result.id);
@@ -558,7 +658,7 @@ export class ResidentHost {
       onBackgroundComplete: (result) => {
         if (!config.agents.notifyOnComplete) return;
         const durationMs = Math.max(0, (result.finishedAt ?? Date.now()) - result.startedAt);
-        const summary = (result.text || result.error || "no result").slice(0, COMPLETION_MAX_CHARS);
+        const summary = detachedPreview(result.text || result.error || "no result", COMPLETION_MAX_CHARS);
         this.#trackPublication(this.#queueDelivery(
           { id: result.id, name: result.name, kind: "agent" },
           `Fabric agent ${result.id.slice(0, 8)} ${result.status} after ${Math.round(durationMs / 1_000)}s: ${summary}`,
@@ -573,10 +673,9 @@ export class ResidentHost {
       const participant = this.participants.get(id, undefined, { fresh });
       return participant ? participant.ownerHostId === this.hostId : undefined;
     };
-    const snapshotActorOwnership = (fresh = true): ReadonlyMap<string, boolean> => new Map(
-      this.participants.list({ scope: "project", fresh })
-        .map((participant) => [participant.id, participant.ownerHostId === this.hostId]),
-    );
+    // Polls may reuse validated ownership inputs; authority decisions still read exactly.
+    const snapshotActorOwnership = (fresh = true, actorIds?: readonly string[]): ReadonlyMap<string, boolean> =>
+      this.participants.actorOwnership(this.hostId, { fresh, ...(fresh ? {} : { actorIds }) });
     const lineageAlive = (rootId: string): boolean =>
       this.participants.lineageAlive(rootId);
     const actorRoots = residentActorRoots(config);
@@ -621,7 +720,18 @@ export class ResidentHost {
         // Restoration must not launch queued work until owner and readiness publication commit.
         releasePaused: true,
         canConsumeMesh: () => this.#ready && this.participants.canConsumeMesh(),
-        presencePublisher: { refresh: () => this.participants.refreshPresence(), schedule: () => this.participants.scheduleRefresh() },
+        presencePublisher: { refresh: async () => {
+          try {
+            await this.participants.refreshPresence();
+          } finally {
+            try {
+              this.#scheduleIdleCheck();
+            } catch (error) {
+              // Scheduling must not replace the original presence rejection.
+              console.warn(`[pi-fabric] resident idle check scheduling failed: ${String(error)}`);
+            }
+          }
+        }, schedule: () => this.participants.scheduleRefresh() },
         persistent: true,
         canManageActor,
         snapshotActorOwnership,
@@ -641,6 +751,24 @@ export class ResidentHost {
         ...(typeof config.actors?.transientBlockCooldownMs === "number" ? { transientBlockCooldownMs: config.actors.transientBlockCooldownMs } : {}),
         ...(typeof config.actors?.transientBlockMaxMs === "number" ? { transientBlockMaxMs: config.actors.transientBlockMaxMs } : {}),
         wakeText: currentWakeText,
+        // smarty-dev#8090: an operator removal's tree goes only after this check, run under the root's Main
+        // publication fence (held by the caller), the state transaction and the root participant key lock.
+        beforeOperatorCleanup: async (rootId) => {
+          if (rootId !== config.rootId) throw new Error(`Operator cleanup for foreign root ${rootId}; tree kept`);
+          const { fencedOperatorCheck } = await import("../actors/remove-offline.js");
+          await fencedOperatorCheck(this.mesh, this.identity as { id: string; name: string; kind: "agent" }, rootId, get => {
+            // pi-fabric#1031: the same Main-identity verdict as the offline removal. A stale record needs its Main
+            // pid+start identity independently gone and no live lease file; no record or no identity is unknown.
+            try {
+              assertResidentOperatorConfirmed(readResidentOperatorEvidence(config, { get }, undefined, { mainStopped: true }),
+                rootId, false, true);
+              assertRootParticipantQuiet(config, { get });
+            } catch (error) {
+              if (!(error instanceof ResidentActorAuthorizationError)) throw error;
+              throw new ResidentActorAuthorizationError(`${error.message}; the actor tree is kept: stop the Main, or let a host start finish it`);
+            }
+          });
+        },
         resolvePiModel: (model, requiredPin) => resolveResidentPiModel(model, { requiredPin: requiredPin ?? false, closest: false }),
         prepareModelRoute: async (input, signal) => {
           const { prepareModelRoute } = await import("../agents/model-route-prepare.js");
@@ -687,13 +815,40 @@ export class ResidentHost {
       // Archived runs are read on demand, never walked before the host lease is up.
       // The streaming request collector replays pending full archives before
       // terminal retention after readiness. Failed sinks retain their sources.
+      if (this.launch?.launchAttestation) {
+        try { this.#trustedLaunchAttestation = readResidentLaunchAttestation(this.config.residencyRoot, this.launch.launchAttestation); }
+        catch (error) { if (!(error instanceof ContainmentUnavailableError)) throw error; }
+      }
+      if (this.#trustedLaunchAttestation && this.launch && process.connected && this.containment === failClosedContainment) {
+        const birth = processStartTime(process.pid);
+        if (!birth || this.launch.launcher.pid !== process.ppid || !exactResidentProcess(this.launch.launcher)) {
+          throw new Error("Resident containment bootstrap parent/child birth is uncertain");
+        }
+        const { createLauncherContainmentClient } = await import("./launcher-containment-control.js");
+        this.#containmentClient = createLauncherContainmentClient({ channel: process,
+          binding: { launchAttestation: this.#trustedLaunchAttestation, launcher: this.launch.launcher,
+            child: { pid: process.pid, processStartTime: birth }, generation: this.#token } });
+      }
       this.#initialize();
+      // Both actor scopes must reconcile durable intents before any actor source,
+      // control ingress, readiness receipt, or release resume can become visible.
+      try { await this.actors.recoverProtectedActors(); }
+      catch (error) {
+        if (!(error instanceof ActorSlotRecoveryParkedError)) throw error;
+        console.warn(`[pi-fabric] ${this.actors.slotRecoveryStatus().error?.message}`);
+      }
+      if (this.#staged) { this.#drainActors().pauseForRelease({ strict: true }); this.#drainAgents().pauseForRelease(true); }
       fs.mkdirSync(this.#requestsPath, { recursive: true, mode: 0o700 });
       fs.mkdirSync(this.#processingPath, { recursive: true, mode: 0o700 });
       fs.mkdirSync(this.#responsesPath, { recursive: true, mode: 0o700 });
       fs.mkdirSync(this.#agentsPath, { recursive: true, mode: 0o700 });
       this.#recoverInterruptedRequests();
-      await this.#recoverHostedRuns();
+      // Reattachment is business admission: AgentManager deliberately waits on
+      // its hold even for terminal saved entries. A staged start must instead
+      // prove the retained trees quiet through the real checkpoint below, not
+      // await recovery whose gate only opens after that receipt is committed.
+      // Live/unknown hosted trees still veto staged readiness in that checkpoint.
+      if (!this.#staged) await this.#recoverHostedRuns();
       const firstSeenAgents = new Map<string, number>();
       this.participants.registerSource(() =>
         agentParticipantRecords(
@@ -716,12 +871,20 @@ export class ResidentHost {
           ),
         ),
       );
-      this.agents.subscribeUi(() => this.participants.scheduleRefresh());
+      this.agents.subscribeUi(() => { this.participants.scheduleRefresh(); this.#scheduleIdleCheck(); });
       this.actors.subscribe(() => this.participants.scheduleRefresh());
       this.actors.subscribe(() => this.#noteActorActivity());
+      this.#processWorkUnsubscribe = subscribeResidentProcessWork(this.processWorkSessionId, () => this.#noteActorActivity());
+      this.#wakeWatchErrorUnsubscribe = subscribeResidentWakeWatchErrors(this.config.residencyRoot, () => {
+        if (this.#wakeWatchSupported !== true) return; // probe-time errors settle through the promise
+        this.#wakeWatchSupported = undefined;
+        this.#wakeWatchReprobeUsed = true;
+        this.#wakeWatchNeedsReprobe = true;
+        this.#scheduleIdleCheck();
+      });
       this.control.start((command, from, signal, verification) =>
         this.#acceptControl(command, from, signal, verification));
-      if (this.#staged) this.control.pause();
+      if (this.#staged) (this.control as unknown as ResidentDrainIngress).pause(true);
       await this.participants.start().catch(() => undefined);
       // A publication failure is not readiness. Keep this same start pending,
       // with requests/events untouched, until a real locked renewal confirms it.
@@ -731,7 +894,7 @@ export class ResidentHost {
       }
       this.lifecycle.start();
       if (this.#staged) {
-        this.lifecycle.pause();
+        (this.lifecycle as unknown as ResidentDrainIngress).pause(true);
         await this.#probeWorkerStartup();
       }
       this.#requestTimer = setInterval(
@@ -760,18 +923,44 @@ export class ResidentHost {
         creationIdempotency: 1,
         ...(this.launch ? { releaseRoot: this.launch.spec.releaseRoot, configDigest: this.launch.spec.digest,
           handover: { abi: RESIDENT_HANDOVER_ABI, launcher: this.launch.launcher },
+          ...(this.#drainSupported() ? { drain: { abi: RESIDENT_DRAIN_ABI } } : {}),
+          ...(this.#trustedLaunchAttestation ? { launchAttestation: this.#trustedLaunchAttestation } : {}),
           ...(this.launch.attempt ? { attempt: this.launch.attempt } : {}) } : {}),
       };
+      // Where this generation's exit record goes (smarty-dev#7950), made while this host owns the root.
+      ensureResidentGenerations(this.config.residencyRoot);
       atomicWrite(this.#ownerPath, owner);
-      fs.rmSync(this.#errorPath, { force: true });
+      // A publisher can die after commit but before writing any root-local wake request.
+      // Before readiness, stream at most 256 entries / 4 MiB. Own-root recovery
+      // cannot launch another host; restored actor queues remain paused here.
+      // Presence publications above do not perform an unscoped pending drain.
+      if (!this.#staged && (fs.existsSync(residentWakeIndexPath(this.mesh.root)) || fs.existsSync(path.join(this.mesh.root, "wake-overflow")))) {
+        try {
+          this.#wakeRecovery = await this.mesh.exclusive(() => new ResidentWakeRecoveryReader(this.mesh.root));
+          await this.#recoverWakeBatch(this.#wakeRecovery.next());
+        } catch (error) {
+          this.#wakeRecovery?.close(); this.#wakeRecovery = undefined;
+          console.warn(`[pi-fabric] resident startup wake recovery deferred: ${String(error)}`);
+        }
+      }
       // The originating client may cancel this owned attempt until it sees the
       // required receipt. Commit it BEFORE opening any business gate or resuming
       // restored queues: publication failure/timeout must remain a non-serving
       // start, not shutdown of work that may already have escaped the attempt.
+      if (this.#staged) await this.#publishStagedReady(owner);
       atomicWrite(path.join(this.config.residencyRoot, "maintenance-ready.json"), { token: this.#token, readyAt: now });
       // No fallible/awaited startup work remains. Accepted backlog is untouched
       // on failure; maintenance/collection stays on normal post-readiness ticks.
       this.#ready = true;
+      fs.rmSync(residentSleepingPath(this.config.residencyRoot), { force: true });
+      this.#scheduleIdleCheck();
+      this.#writeWakeRoutes();
+      if (this.#wakeRecovery) {
+        this.#wakeRecoveryPending = this.#continueWakeRecovery().finally(() => {
+          this.#wakeRecoveryPending = undefined;
+          this.#scheduleIdleCheck();
+        });
+      }
       this.#startStateProjector();
       // Retention is not part of request admission/heartbeat/claim. A bounded
       // preparation cursor progresses even between request-retention samples.
@@ -779,7 +968,7 @@ export class ResidentHost {
         this.#maintenanceTimer = setInterval(() => this.#maintainRequests(), 100);
         this.#legacyArchive = new ResidentLegacyRunArchive(this.config.residencyRoot, this.#retention, {
           actorRoots: [...new Set(Object.values(residentActorRoots(this.config)))],
-          isRetained: id => this.#closed || !!this.#handover || !this.participants.canConsumeMesh() || this.agents.hasRunCustody(id),
+          isRetained: id => this.#closed || !!this.#handover || !!this.#drain || !this.participants.canConsumeMesh() || this.agents.hasRunCustody(id),
         });
         this.#legacyArchive.start();
       }
@@ -792,10 +981,45 @@ export class ResidentHost {
         });
         void this.#retryDeliveries();
       }
+      // The spawned process, not a watched file, owns the startup outcome.
+      if (process.connected && process.send) process.send({ event: "resident-ready",
+        root: this.config.residencyRoot, token: this.#token }, () => {});
     } catch (error) {
       this.#failure ??= error;
       await this.close();
       throw error;
+    }
+  }
+
+  async #recoverWakeBatch(batch: ResidentWakeRecoveryBatch): Promise<void> {
+    if (this.#drain || this.#staged) throw new Error(HOST_CLOSING_RETRY);
+    this.#admissions++;
+    try {
+      const recovery = { config: this.config, ownedActors: this.actors.listOwned(true), batch, ignored: 0 };
+      await wakeResidentActors(this.mesh, [], undefined, recovery);
+      this.#wakeRecoveryIgnored += recovery.ignored;
+    } finally { this.#admissions--; this.#scheduleIdleCheck(); }
+  }
+
+  async #continueWakeRecovery(): Promise<void> {
+    const reader = this.#wakeRecovery!;
+    let deferred = 0;
+    try {
+      while (!reader.done && !this.#closed) {
+        // Yield AFTER the readiness receipt and between every bounded batch.
+        await new Promise<void>(resolve => setImmediate(resolve));
+        if (this.#closed) break;
+        if (this.#drain) await this.#drain.resumed;
+        if (this.#closed || this.#staged) break;
+        const batch = reader.next();
+        deferred += batch.entries;
+        await this.#recoverWakeBatch(batch);
+      }
+    } catch (error) {
+      console.warn(`[pi-fabric] resident startup wake recovery deferred: ${String(error)}`);
+    } finally {
+      reader.close(); this.#wakeRecovery = undefined;
+      console.warn(`[pi-fabric] resident startup wake recovery: ${deferred} deferred entries processed after readiness; ${this.#wakeRecoveryIgnored} ignored (foreign, unmatched or not pending)`);
     }
   }
 
@@ -822,8 +1046,15 @@ export class ResidentHost {
   }
 
   async close(): Promise<void> {
-    if (this.#closed || !this.#started) return;
+    if (!this.#started || (this.#closed && !this.#closePending)) return;
+    this.#closePending ??= this.#close().finally(() => { this.#closePending = undefined; });
+    return this.#closePending;
+  }
+
+  async #close(): Promise<void> {
     this.#closed = true;
+    if (this.#drain) this.#finishDrain(this.#drain, "needs-operator", "HOST_CLOSED", "Resident closed during cooperative drain");
+    this.#containmentClient?.dispose(); this.#containmentClient = undefined;
     // Stops with the host (shutdown and the release handover's exit alike): the lease is released
     // so the successor host's projector takes over at once.
     const projectorStopped = this.#stateProjector?.then(projector => projector?.stop()).catch(() => undefined);
@@ -834,6 +1065,15 @@ export class ResidentHost {
     this.#scheduleTimer = undefined;
     if (this.#maintenanceTimer) clearInterval(this.#maintenanceTimer);
     this.#maintenanceTimer = undefined;
+    const wakeWatchClosed = this.#wakeWatchErrorUnsubscribe?.();
+    this.#wakeWatchErrorUnsubscribe = undefined;
+    this.#processWorkUnsubscribe?.();
+    this.#processWorkUnsubscribe = undefined;
+    // FSWatcher.close() schedules native handle closure. Join its close event before
+    // owner release or callers removing the residency directory on Windows.
+    await wakeWatchClosed;
+    await this.#wakeRecoveryPending;
+    this.#wakeRecovery?.close(); this.#wakeRecovery = undefined;
     this.#requestRetention.close();
     await this.#legacyArchive?.close();
     // Stop drains first so an in-flight ask can settle within the actor shutdown grace.
@@ -841,6 +1081,8 @@ export class ResidentHost {
     // Observed below by closeWithActors, but only after further awaits: a rejection
     // before then must not become an unhandled rejection that kills the host (pi-fabric#577).
     void actorsClosed?.catch(() => undefined);
+    // Retire an eligibility/probe already in flight before releasing host custody.
+    await this.#idleCheckPending?.catch(() => undefined);
     while (this.#pollingRequests || this.#admissions) await delay(10);
     await this.participants?.quiesce().catch(() => undefined);
     await this.lifecycle?.close().catch(() => undefined);
@@ -873,13 +1115,15 @@ export class ResidentHost {
     signal?: AbortSignal,
     verification?: "mesh" | "bridge",
   ): Promise<FabricControlAcceptance> {
-    if (this.#closed || this.#staged || this.#handover) {
+    if (this.#closed || this.#idleExitRequested || this.#staged || this.#handover || this.#drain) {
       return { accepted: false, error: HOST_CLOSING_RETRY };
     }
     assertMeshConsumption(() => this.participants.canConsumeMesh());
+    this.#idleSince = undefined;
     this.#admissions++;
+    this.#businessAdmissions++;
     try { return await this.#handleControl(command, from, signal, verification); }
-    finally { this.#admissions--; }
+    finally { this.#admissions--; this.#scheduleIdleCheck(); }
   }
 
   async #handleControl(command: FabricControlCommand, from: MeshIdentity, signal?: AbortSignal, verification?: "mesh" | "bridge"): Promise<FabricControlAcceptance> {
@@ -952,6 +1196,7 @@ export class ResidentHost {
       const result = command.operation === "steer"
         ? this.agents.steer(command.targetId, message, command.data, provenance)
         : this.agents.followUp(command.targetId, message, command.data, provenance);
+      if (result.undelivered) throw new FabricTargetTerminalError(command.targetId, result.undelivered.finalAnswerReceiptId, result.undelivered.runState);
       return { accepted: true, messageId: result.messageId,
         ...(result.warning ? { warning: result.warning } : {}) };
     } catch (error) {
@@ -969,7 +1214,9 @@ export class ResidentHost {
       await this.actors.resolveActivationBinding(command.targetId, options);
       if (this.#closed) return { accepted: false, error: HOST_CLOSING_RETRY };
       assertMeshConsumption(() => this.participants.canConsumeMesh());
-      const result = this.actors.tell(command.targetId, message, command.data, { provenance, ...options, sender: command.sender ?? null });
+      const result = this.#drain
+        ? this.#drainActors().withReleaseAdmission(() => this.actors.tell(command.targetId, message, command.data, { provenance, ...options, sender: command.sender ?? null }))
+        : this.actors.tell(command.targetId, message, command.data, { provenance, ...options, sender: command.sender ?? null });
       return { accepted: true, messageId: result.messageId };
     } catch (error) {
       if (error instanceof MeshConsumptionPausedError) throw error;
@@ -981,9 +1228,14 @@ export class ResidentHost {
     if (!notice.sender?.id) throw new Error("Terminal refusal has no attributed sender; retain native receipt");
     if (!this.#ready || this.#closed || this.#staged || this.#handover) throw new Error(HOST_CLOSING_RETRY);
     assertMeshConsumption(() => this.participants.canConsumeMesh());
-    const message = `FABRIC_TARGET_TERMINAL: ${notice.delivery} ${notice.messageId} was not delivered to task ${notice.targetId}; ` +
+    const message = `FABRIC_TARGET_TERMINAL: undelivered: task already finished; ${notice.delivery} ${notice.messageId} was not delivered to task ${notice.targetId}; ` +
       `its final answer receipt is ${notice.finalAnswerReceiptId}. Start a new task; this input cannot revive the old one.`;
     const from: MeshIdentity = { id: notice.targetId, name: `Task ${notice.targetId}`, kind: "agent" };
+    if (this.#drain) {
+      // Completion obligations may publish, but must not enqueue a new local/remote turn while held.
+      await this.#queueDelivery(from, message, "steer", false, notice, undefined, notice.sender.id);
+      return;
+    }
     if (notice.sender.id === this.config.rootId) {
       // Existing resident durable delivery outbox, addressed to the exact sender
       // root. The route receipt means retained handoff, not sender consumption.
@@ -1012,11 +1264,12 @@ export class ResidentHost {
     subscription: FabricLifecycleSubscription,
     event: FabricLifecycleEvent,
   ): Promise<void> {
-    if (this.#closed || this.#staged || this.#handover) throw new Error(HOST_CLOSING_RETRY);
+    if (this.#closed || this.#staged || this.#handover || this.#drain) throw new Error(HOST_CLOSING_RETRY);
     assertMeshConsumption(() => this.participants.canConsumeMesh());
     this.#admissions++;
+    this.#businessAdmissions++;
     try { await this.#handleLifecycle(subscription, event); }
-    finally { this.#admissions--; }
+    finally { this.#admissions--; this.#scheduleIdleCheck(); }
   }
 
   async #handleLifecycle(subscription: FabricLifecycleSubscription, event: FabricLifecycleEvent): Promise<void> {
@@ -1116,16 +1369,22 @@ export class ResidentHost {
       } catch { /* no commit: the original mailbox below */ }
       if (!chosen) persist(this.config.rootId); // Unknown custody keeps the original mailbox.
     } else persist(rootId);
+    this.#scheduleIdleCheck();
     await this.#retryDeliveries();
   }
 
   #retryDeliveries(): Promise<unknown> {
     if (this.#closed || this.#staged) return Promise.resolve();
     if (this.#flushingDeliveries) return this.#flushingDeliveries;
+    // An empty maintenance retry is not delivery custody. Avoid creating a pending
+    // promise on every request tick which can falsely restart the host idle window.
+    if (this.#deliveryCommitsRecovered && (!fs.existsSync(this.#deliveryOutboxPath) ||
+        !fs.readdirSync(this.#deliveryOutboxPath).some(entry => entry.endsWith(".json")))) return Promise.resolve();
     const flushing = this.#deliveryRetry.run(() => this.#flushDeliveries());
     this.#flushingDeliveries = flushing;
     void flushing.finally(() => {
       if (this.#flushingDeliveries === flushing) this.#flushingDeliveries = undefined;
+      this.#scheduleIdleCheck(); // Delivery custody ended; do not wait for a timed nudge.
     }).catch(() => undefined);
     return flushing;
   }
@@ -1166,7 +1425,7 @@ export class ResidentHost {
         if (!(error instanceof Error && error.message.startsWith(`Mesh compare-and-swap failed for ${key}: expected version 0,`))) {
           if (isMeshWriteDeferred(error)) throw error; // no truncated rewrite for a refused write
           await this.mesh.put({
-            key, value: { ...publish, message: publish.message.slice(0, Math.max(1, this.config.mesh.eventContextChars)), data: { fabricTruncated: true } },
+            key, value: { ...publish, message: detachedPreview(publish.message, Math.max(1, this.config.mesh.eventContextChars)), data: { fabricTruncated: true } },
             identity: this.identity, ifVersion: 0,
           });
         }
@@ -1177,8 +1436,8 @@ export class ResidentHost {
   }
 
   async #pollRequests(): Promise<void> {
-    if (!this.#ready || this.#pollingRequests || this.#closed) return;
-    if (this.#staged || this.#handover) { await this.#advanceRelease(); return; }
+    if (!this.#ready || this.#pollingRequests || this.#closed || this.#idleExitRequested) return;
+    if (this.#staged || this.#handover || this.#drain) { await this.#advanceRelease(); return; }
     this.#pollingRequests = true;
     try {
       let entries: string[];
@@ -1187,8 +1446,9 @@ export class ResidentHost {
       } catch {
         return;
       }
+      if (entries.length) this.#idleSince = undefined;
       for (const entry of entries.slice(0, 32)) {
-        if (this.#handover || this.#closed) break;
+        if (this.#handover || this.#drain || this.#closed) break;
         const source = path.join(this.#requestsPath, entry);
         const processing = path.join(this.#processingPath, entry);
         // Never overwrite an admitted exchange while its response is still pending.
@@ -1212,26 +1472,33 @@ export class ResidentHost {
           this.#boundaryRequests.set(processing, response);
           // Shutdown/handover retains custody until the terminal response is durable.
           this.#trackPublication(response);
-          void response.finally(() => this.#boundaryRequests.delete(processing)).catch(() => undefined);
+          void response.finally(() => {
+            this.#boundaryRequests.delete(processing);
+            this.#scheduleIdleCheck();
+          }).catch(() => undefined);
         }
       }
     } finally {
       this.#pollingRequests = false;
       if (!retentionV2Enabled()) this.#maintainRequests();
-      this.#checkIdle();
+      await this.#checkIdle(false);
     }
   }
 
   #maintainRequests(): void {
     const now = Date.now();
-    if (!this.#ready || this.#closed || !this.participants.canConsumeMesh() ||
-        (!retentionV2Enabled() && !this.#requestRetention.due(now))) return;
-    // ensureHost/syncPiModels already publishes reloads to config.json. Apply
-    // only the same-release/root/session overlay at the next existing sweep;
-    // actor archives and agent collectors hold this same policy object.
+    if (!this.#ready || this.#closed || this.#drain || !this.participants.canConsumeMesh()) return;
+    // Keep the stuck-preparing cadence independent from retention, as in origin/main.
+    const stuckPreparingMs = this.config.agents?.stuckPreparingMs ?? DEFAULT_STUCK_PREPARING_MS;
+    if (now - this.#stuckPreparingCheckedAt >= Math.min(STUCK_PREPARING_CHECK_MS, stuckPreparingMs)) {
+      this.#stuckPreparingCheckedAt = now;
+      try { this.actors.reportStuckPreparing(stuckPreparingMs, now); } catch { /* next tick retries */ }
+    }
+    // Preserve main's policy-reload observation cadence; this is one cached config stamp,
+    // not the retained-run reference scan. B gates the expensive work on due() in both modes.
     Object.assign(this.#retention, this.#currentRetention(now));
+    if (!this.#requestRetention.due(now)) return;
     const live = retentionV2Enabled() ? this.agents.retentionReferences({ now }) : this.agents.retentionReferences();
-    if (retentionV2Enabled() && !this.#requestRetention.due(now)) return;
     for (const id of this.actors.inFlightActorIds()) live.add(id);
     const stoppedWritersGone = new Set<string>();
     for (const actor of this.actors.listOwned()) {
@@ -1256,90 +1523,407 @@ export class ResidentHost {
       stamp = `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
       settled = BigInt(Math.floor(now)) * 1_000_000n - stat.mtimeNs >= BigInt(CONFIG_STAMP_SETTLE_MS) * 1_000_000n;
     } catch { /* Absent or unreadable: re-evaluate on every tick, as before. */ }
-    if (stamp !== undefined && this.#retentionOverlay?.stamp === stamp) return this.#retentionOverlay.retention;
-    const retention = this.#effectiveConfig?.().retention ?? this.config.retention;
+    if (stamp !== undefined && this.#retentionOverlay?.stamp === stamp) {
+      this.#residentIdleExitMs = this.#retentionOverlay.idleExitMs;
+      return this.#retentionOverlay.retention;
+    }
+    const config = this.#effectiveConfig?.() ?? this.config;
+    const retention = config.retention;
+    const configured = config.mesh.residentIdleExitMs;
+    const idleExitMs = typeof configured === "number" && Number.isFinite(configured) && configured >= 0
+      ? configured : RESIDENT_IDLE_EXIT_MS;
+    if (idleExitMs !== this.#residentIdleExitMs) this.#idleSince = undefined;
+    this.#residentIdleExitMs = idleExitMs;
     // Cache only a settled stamp: a file younger than the settle window is read on every tick.
-    this.#retentionOverlay = stamp !== undefined && settled ? { stamp, retention } : undefined;
+    this.#retentionOverlay = stamp !== undefined && settled ? { stamp, retention, idleExitMs } : undefined;
     return retention;
   }
 
-  /** Actor activity seen through the manager's change signal: count the idle window from now and
-   * take a current actor observation at the next idle check instead of the reused one. */
+  /** Actor activity restarts the idle window and requests an immediate event-driven check. */
   #noteActorActivity(): void {
-    this.#idleSince = Date.now();
+    this.#idleSince = undefined;
     this.#activeActor = { at: Number.NEGATIVE_INFINITY, active: true };
+    this.#idleObservation = { at: Number.NEGATIVE_INFINITY, blocked: true, wakeable: false };
+    this.#scheduleIdleCheck();
   }
 
   #hasActiveActor(now: number, current = false): boolean {
-    if (current || now - this.#activeActor.at >= IDLE_ACTOR_CHECK_MS) {
+    if (current || now - this.#activeActor.at >= ACTIVE_ACTOR_CACHE_MS) {
       this.#activeActor = { at: now, active: this.actors.hasActiveDurableActor() };
     }
     return this.#activeActor.active;
   }
 
-  #checkIdle(): void {
-    if (this.#closed || this.#staged || this.#handover) return;
+  #hasIdleBlocker(now: number, current = false): boolean {
+    if (current || now - this.#idleObservation.at >= IDLE_ACTOR_CHECK_MS) {
+      let blocked = true, wakeable = false;
+      try {
+        // get() honours Main's published reloadUntil and matching host-lease incarnation.
+        // A live Main host lease also vetoes exit if its participant publication is absent.
+        const root = this.participants.get(this.config.rootId, now, { fresh: true });
+        const lease = readHostLeaseCurrent(this.config.meshRoot, this.config.rootId);
+        let rootLive = !!root || !!(lease && lease.rootId === this.config.rootId &&
+          lease.identityId === this.config.rootId && lease.expiresAt >= now);
+        if (!lease) {
+          try { fs.lstatSync(hostLeasePath(this.config.meshRoot, this.config.rootId)); rootLive = true; }
+          catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") rootLive = true; }
+        }
+        const owned = this.actors.hasOwnedActors();
+        blocked = rootLive || owned;
+        // Owned durable actors (dormant included) leave by dormant release, never by dead-root retirement.
+        wakeable = owned && this.actors.hasDurableActor();
+      } catch { /* Unknown ownership/liveness is not permission to exit. */ }
+      this.#idleObservation = { at: now, blocked, wakeable };
+    }
+    return this.#idleObservation.blocked;
+  }
+
+  #hasPendingRequest(): boolean {
+    return !!(this.#pollingRequests || this.#admissions || this.#boundaryRequests.size) ||
+      [this.#requestsPath, this.#processingPath].some(directory => {
+        try { return fs.readdirSync(directory).some(entry => entry.endsWith(".json")); }
+        catch { return true; } // Unreadable queues cannot certify emptiness.
+      });
+  }
+
+  #scheduleIdleCheck(): void {
+    this.#idleCheckRequested = true;
+    if (this.#closed || this.#staged || this.#handover || this.#sleeping || this.#idleCheckQueued || this.#idleCheckPending) return;
+    this.#idleCheckQueued = true;
+    try {
+      queueMicrotask(() => {
+        this.#idleCheckQueued = false;
+        if (this.#closed || this.#staged || this.#handover || this.#sleeping || this.#idleCheckPending || !this.#idleCheckRequested) return;
+        this.#idleCheckRequested = false;
+        const pending = this.#checkIdle();
+        this.#idleCheckPending = pending;
+        void pending.finally(() => {
+          if (this.#idleCheckPending === pending) this.#idleCheckPending = undefined;
+          if (this.#idleCheckRequested) this.#scheduleIdleCheck();
+        }).catch(() => undefined);
+      });
+    } catch (error) {
+      this.#idleCheckQueued = false; // a later eligibility event must still be able to schedule
+      throw error;
+    }
+  }
+
+  async #ensureWakeWatch(): Promise<boolean> {
+    if (this.#wakeWatchSupported !== undefined) return this.#wakeWatchSupported;
+    try {
+      await assertResidentWakeWatch(this.config.residencyRoot);
+      this.#wakeWatchSupported = true;
+      this.#wakeWatchReprobeUsed = false;
+      this.#wakeWatchNeedsReprobe = false;
+      return true;
+    } catch (error) {
+      if (this.#closed) return false; // host close retired its pending native proof
+      const watcherError = error instanceof ResidentWakeWatchError;
+      if (watcherError && !this.#wakeWatchReprobeUsed) {
+        this.#wakeWatchReprobeUsed = true;
+        this.#wakeWatchSupported = undefined;
+        console.warn(`[pi-fabric] resident dormancy watcher failed for ${this.config.residencyRoot}: ${String(error)}`);
+        // An error event authorizes exactly one re-probe. Silent and synchronous
+        // failures remain cached as unsupported for this process and root.
+        this.#scheduleIdleCheck();
+        return false;
+      }
+      this.#wakeWatchSupported = false;
+      console.warn(`[pi-fabric] resident dormancy disabled for ${this.config.residencyRoot}: ${String(error)}`);
+      return false;
+    }
+  }
+
+  /** Dormancy may release the owner only when delivery can relaunch this exact generation. */
+  #hasWakeConfig(): boolean {
+    const saved = readWakeJson<ResidentHostConfig>(path.join(this.config.residencyRoot, "config.json"));
+    if (residentWakeConfigMatches(saved, this.config)) return true;
+    console.warn(`[pi-fabric] resident dormancy disabled: restart config differs or is unreadable for ${this.config.residencyRoot}`);
+    return false;
+  }
+
+  /** Capacity and its sleeping reservation share the publication lock across hosts. */
+  async #admitWakeDormancy(reserve = false): Promise<boolean> {
+    let available = false;
+    try {
+      available = await this.mesh.exclusive(() => {
+        if (!residentWakeCapacityAvailable(this.mesh.root, this.config.residencyRoot)) return false;
+        if (reserve) writeJsonAtomic(residentSleepingPath(this.config.residencyRoot), { token: this.#token,
+          request: readWakeJson<unknown>(residentWakeRequestPath(this.config.residencyRoot)) }, { durable: true });
+        return true;
+      });
+    } catch { /* Unreadable capacity is not permission to release the resident owner. */ }
+    if (available) this.#wakeCapacityWarned = false;
+    else if (!this.#wakeCapacityWarned) {
+      this.#wakeCapacityWarned = true;
+      console.warn(`[pi-fabric] resident dormancy deferred: wake capacity (${RESIDENT_WAKE_INDEX_MAX_ROOTS}) full or unavailable; staying resident for ${this.config.residencyRoot}`);
+    }
+    return available;
+  }
+
+  #writeWakeRoutes(): void {
+    const routes: ResidentWakeRoutes = { format: 1, rootId: this.config.rootId, hostId: this.hostId,
+      configJson: canonicalResidentWakeConfig(this.config),
+      actors: this.actors.listOwned().filter(actor => actor.residency === "durable" && actor.status !== "stopped")
+        .map(actor => {
+          // Preserve the host's actual published owner/capability/ACK advertisement for
+          // dormant command admission after close withdraws its live directory records.
+          const participant = this.participants.get(actor.id) ??
+            readWakeJson<ResidentWakeRoutes>(path.join(this.config.residencyRoot, "wake-routes.json"))?.actors
+              .find(entry => entry.id === actor.id)?.participant;
+          return { id: actor.id, name: actor.name, topics: actor.topics, ...(participant ? { participant } : {}) };
+        }) };
+    const serialized = JSON.stringify(routes);
+    if (serialized === this.#wakeRoutesJson) return;
+    writeJsonAtomic(path.join(this.config.residencyRoot, "wake-routes.json"), routes, { durable: true });
+    this.#wakeRoutesJson = serialized;
+  }
+
+  #expectedActors(): Set<string> {
+    const protectedIds = new Set<string>();
+    const actors = this.actors.listOwned();
+    try {
+      const main = this.participants.get(this.config.rootId, undefined, { fresh: true });
+      for (const actor of actors) {
+        // A live Main's supervisor is expected, even between its activations.
+        if (main && (actor.events.length > 0 || actor.delivery !== "mailbox" || actor.topics.includes("fabric.participant.lifecycle"))) {
+          protectedIds.add(actor.id);
+        }
+      }
+      // A subscribed live participant can still owe this actor a reply.
+      for (const subscription of this.lifecycle.list()) {
+        if (actors.some(actor => actor.id === subscription.to) && this.participants.get(subscription.from, undefined, { fresh: true })) {
+          protectedIds.add(subscription.to);
+        }
+      }
+    } catch { for (const actor of actors) protectedIds.add(actor.id); } // uncertainty is not idle
+    return protectedIds;
+  }
+
+  // Creation/adoption/reconciliation retain release custody, but must not consume
+  // an actor's eligibility event. Ordinary dormancy revalidates each actor's
+  // activation work; every idle-exit boundary still uses the full custody count.
+  #hasHostWork(includeActorCustody = true): boolean {
+    return this.#wakeRecoveryPending !== undefined || residentProcessWorkPending(this.processWorkSessionId) || this.#admissions > 0 || this.#boundaryRequests.size > 0 ||
+      this.#publicationFailed || (includeActorCustody ? this.actors.releaseCustodyCount() > 0 : this.actors.inFlightActorIds().length > 0) ||
+      this.agents.listForUi().some(agent => agent.status === "queued" || agent.status === "running") ||
+      [this.#requestsPath, this.#processingPath].some(directory => {
+        try { return fs.readdirSync(directory).some(entry => entry.endsWith(".json")); }
+        catch { return false; }
+      }) || this.#publications.size > 0 || this.#flushingDeliveries !== undefined ||
+      (fs.existsSync(this.#deliveryOutboxPath) && fs.readdirSync(this.#deliveryOutboxPath).some(entry => entry.endsWith(".json")));
+  }
+
+  async #checkIdle(includeDormancy = true): Promise<void> {
+    if (this.#closed || this.#idleExitRequested || this.#staged || this.#handover || this.#drain || this.#sleeping) {
+      this.#idleSince = undefined;
+      return;
+    }
     const now = Date.now();
+    // Startup/reload and open process calls are work even when all actors look idle.
+    // Dormant release restarts its window now; dead-root retirement at its next idle sample.
+    // Only event-owned eligibility distinguishes actor activation from release
+    // custody. Request polling and all final boundaries retain the exact veto.
+    if (!this.#ready || this.#hasHostWork(!includeDormancy)) { this.#idleSince = this.#idleWakeable ? now : undefined; return; }
+    if (!includeDormancy && this.#idleCheckPending) return;
+    if (includeDormancy) {
+      if (this.#wakeWatchNeedsReprobe && !await this.#ensureWakeWatch()) return;
+      const owned = this.actors.listOwned();
+      const hasIdleActor = owned.some(actor => actor.residency === "durable" && actor.status === "idle");
+      const protectedIds = hasIdleActor ? this.#expectedActors() : new Set<string>();
+      const eligible = hasIdleActor && this.#hasWakeConfig() && this.actors.hasDormantIdleActor(protectedIds);
+      if (eligible) {
+        if (!await this.#admitWakeDormancy()) { this.#idleSince = now; return; }
+        if (!await this.#ensureWakeWatch()) {
+          this.#idleSince = now;
+          return;
+        }
+        if (this.#closed || !this.#ready || this.#staged || this.#handover || this.#drain || this.#sleeping ||
+            this.#hasHostWork(false) || !this.#hasWakeConfig()) { this.#idleSince = Date.now(); return; }
+        try {
+          // The watcher proof may yield to delivery or presence changes. Refresh
+          // expected participants; dormantIdleActors rechecks current work custody.
+          const currentProtectedIds = this.#expectedActors();
+          this.#writeWakeRoutes(); // Arm routing before an actor can become dormant.
+          await this.actors.dormantIdleActors(currentProtectedIds);
+        } catch {
+          // Keep the actor warm. Only a new actor/delivery/presence event retries.
+          this.#idleSince = now;
+          return;
+        }
+      }
+    }
+    // A previously dormant actor still needs a working watcher before this host
+    // can release its final consumer gate after a failed re-probe.
+    if (this.#wakeWatchSupported === false && this.actors.listOwned().some(actor =>
+      actor.residency === "durable" && actor.status !== "stopped")) {
+      this.#idleSince = now;
+      return;
+    }
     const activeActor = this.#hasActiveActor(now);
     const activeAgent = this.agents
       .listForUi()
       .some((agent) => agent.status === "queued" || agent.status === "running");
-    const pendingRequest = [this.#requestsPath, this.#processingPath].some((directory) => {
-      try { return fs.readdirSync(directory).some((entry) => entry.endsWith(".json")); }
-      catch { return false; }
-    });
+    // Host work (admissions, requests, publications, outbox, process custody, wake recovery)
+    // is the dormant-wake superset of main's pending-request check.
+    const pendingRequest = this.#hasHostWork() || this.#hasPendingRequest();
+    // Owned durable actors (dormant included) leave by dormant release after IDLE_EXIT_MS. Without one,
+    // dead-root retirement holds the host while its root Main lives or it owns any actor.
+    const blocked = this.#hasIdleBlocker(now);
+    const durableActor = this.#idleObservation.wakeable;
+    // Each exit path counts its own continuous window.
+    if (durableActor !== this.#idleWakeable) {
+      this.#idleWakeable = durableActor;
+      this.#idleSince = undefined;
+    }
+    const retirementBlocked = !durableActor && blocked;
     let nextScheduleDueAt: number | undefined;
     try {
       nextScheduleDueAt = this.mesh.nextScheduleDueAt();
     } catch {
       // Unreadable schedules neither keep the host alive nor stop it.
     }
+    // Main's rule holds pending schedules for durable participants. A dormant durable actor is
+    // one too: only this host's due timer releases its schedule, and the delivery wakes it.
+    let durableParticipants = activeActor || activeAgent;
+    if (!durableParticipants && nextScheduleDueAt !== undefined) {
+      try { durableParticipants = this.actors.hasDurableActor(); }
+      catch { durableParticipants = true; } // Unknown ownership is not permission to drop a schedule.
+    }
     const decision = residentIdleDecision({
       now,
-      idleSince: this.#idleSince,
-      activeActor,
+      idleSince: this.#idleSince ?? now,
+      activeActor: activeActor || retirementBlocked,
       activeAgent,
       pendingRequest,
-      durableParticipants: activeActor || activeAgent,
+      durableParticipants,
       nextScheduleDueAt,
+      idleExitMs: durableActor ? IDLE_EXIT_MS : this.#residentIdleExitMs,
     });
+    // Due schedules are released on time even while idle exit is disabled.
     this.#armScheduleWake(decision.wakeAt);
-    if (decision.busy || this.#admissions) {
-      this.#idleSince = now;
+    if (decision.busy || (!durableActor && !this.#residentIdleExitMs)) {
+      this.#idleSince = undefined;
       return;
     }
-    if (now - this.#idleSince < IDLE_EXIT_MS) return;
-    // Never exit on a reused actor observation: confirm with a current one.
+    // Dead-root retirement starts its window on request-poll samples; event-driven checks serve dormancy.
+    if (!durableActor && includeDormancy) return;
+    this.#idleSince ??= now;
+    const idleMs = now - this.#idleSince;
+    if (!durableActor) {
+      if (idleMs < this.#residentIdleExitMs) return;
+      // A disable/rollback may have arrived between maintenance and this deadline tick.
+      // Revalidate the accepted policy before committing retirement, not just on maintenance.
+      this.#currentRetention(now);
+      if (!this.#residentIdleExitMs || this.#idleSince === undefined || now - this.#idleSince < this.#residentIdleExitMs) return;
+      // Never retire from a reused observation, or after a request or host work appeared during the fresh read.
+      if (this.#hasIdleBlocker(now, true) || this.#hasPendingRequest() || this.#hasHostWork()) {
+        this.#idleSince = undefined;
+        return;
+      }
+      const marker: ResidentIdleExit = { format: 1, reason: "root-dead-idle", rootId: this.config.rootId,
+        pid: process.pid, token: this.#token, at: now, idleMs };
+      atomicWrite(residentIdleExitPath(this.config.residencyRoot), marker);
+      this.#idleExitRequested = true;
+      console.error(`resident exiting: root dead, no actors, idle ${Math.round(idleMs / 6_000) / 10} min`);
+      this.onIdle("idle-exit"); // runResidentHost joins close(): withdraw lease/owner, then release the host fence.
+      return;
+    }
+    if (idleMs < IDLE_EXIT_MS) return;
+    // Never exit on a reused actor observation: confirm with a current actor check.
     if (this.#hasActiveActor(now, true)) {
       this.#idleSince = now;
       return;
     }
-    this.onIdle("idle-exit");
+    // A bare/in-process host or an invalid generation has no delivery-owned restart.
+    // Only check this at an actual exit boundary, not on every request-poll tick.
+    if (this.actors.listOwned().some(actor =>
+      actor.residency === "durable" && actor.status !== "stopped") && !this.#hasWakeConfig()) {
+      this.#idleSince = now;
+      return;
+    }
+    // Native watch delivery is asynchronous (especially on Windows). Ignored presence
+    // events can leave the cursor behind after the actor is already dormant. Keep the
+    // consumer gate open until it catches up; that is progress, not new host work and
+    // must not restart the idle window. The final checkpoint still fences racing work.
+    if (!this.actors.meshCaughtUp()) return;
+    // Publish the closing boundary before shutting any consumer gate: a racing publisher
+    // now queues a wake whose one-shot launcher waits for this exact owner to exit.
+    this.#sleeping = true;
+    try {
+      // A bounded live log alone cannot retain a long sleeping actor's deliveries.
+      // Enable the existing file archive under the same publication lock before sleeping.
+      if (this.actors.listOwned().some(actor => actor.residency === "durable" && actor.status !== "stopped")) {
+        await ensureResidentWakeArchive(this.mesh);
+        if (!await this.#admitWakeDormancy(true)) {
+          this.#sleeping = false;
+          this.#idleSince = Date.now();
+          return;
+        }
+      } else {
+        writeJsonAtomic(residentSleepingPath(this.config.residencyRoot), { token: this.#token,
+          request: readWakeJson<unknown>(residentWakeRequestPath(this.config.residencyRoot)) }, { durable: true });
+      }
+      this.#ready = false;
+      this.actors.pauseForRelease();
+      this.control.pause();
+      this.lifecycle.pause();
+      await this.control.checkpointForRelease();
+      await this.lifecycle.checkpointForRelease();
+      await this.#backgroundDeliveries.checkpointForRelease();
+      await this.actors.checkpointForRelease();
+      if (this.#closed || this.#hasHostWork() || this.actors.hasActiveDurableActor() ||
+          !this.actors.meshCaughtUp() || (this.actors.listOwned().some(actor =>
+            actor.residency === "durable" && actor.status !== "stopped") && !this.#hasWakeConfig()) ||
+          [this.#requestsPath, this.#processingPath].some(directory =>
+            fs.readdirSync(directory).some(entry => entry.endsWith(".json")))) throw new Error("Resident acquired work before dormancy");
+      this.onIdle(this.actors.listOwned().some(actor =>
+        actor.residency === "durable" && actor.status !== "stopped") ? "dormant" : "idle-exit");
+    } catch {
+      this.#sleeping = false;
+      fs.rmSync(residentSleepingPath(this.config.residencyRoot), { force: true });
+      if (!this.#closed) {
+        this.#ready = true;
+        this.actors.resumeAfterRelease();
+        this.control.resume();
+        this.lifecycle.resume();
+        this.#idleSince = Date.now();
+        this.#scheduleIdleCheck();
+      }
+    }
   }
 
   // Re-armed on every idle check: the due time of the earliest pending
   // schedule, released here even if no actor monitor polls in time.
   #armScheduleWake(wakeAt: number | undefined): void {
+    if (this.#closed || this.#drain || this.#staged || this.#handover) wakeAt = undefined;
     if (wakeAt === this.#scheduleWakeAt) return;
     if (this.#scheduleTimer) clearTimeout(this.#scheduleTimer);
     this.#scheduleTimer = undefined;
     this.#scheduleWakeAt = wakeAt;
-    if (wakeAt === undefined || this.#closed) return;
+    if (wakeAt === undefined || this.#closed || this.#drain || this.#staged || this.#handover) return;
     this.#scheduleTimer = setTimeout(() => {
       this.#scheduleTimer = undefined;
       this.#scheduleWakeAt = undefined;
-      void this.mesh.releaseDueSchedules().catch(() => undefined).finally(() => {
-        if (!this.#closed) this.#checkIdle();
-      });
+      if (this.#closed || this.#drain || this.#staged || this.#handover) return;
+      this.#admissions++;
+      const released = this.mesh.releaseDueSchedules().finally(() => { this.#admissions--; });
+      this.#trackPublication(released);
+      void released.catch(() => undefined).finally(() => { if (!this.#closed) void this.#checkIdle(); });
     }, Math.min(Math.max(0, wakeAt - Date.now()), 2_147_000_000));
     this.#scheduleTimer.unref();
   }
 
   #trackPublication(promise: Promise<unknown>): void {
     this.#publications.add(promise);
-    void promise.then(() => this.#publications.delete(promise), () => {
+    this.#scheduleIdleCheck();
+    void promise.then(() => {
+      this.#publications.delete(promise);
+      this.#scheduleIdleCheck();
+    }, () => {
       this.#publicationFailed = true;
       this.#publications.delete(promise);
+      this.#scheduleIdleCheck();
     });
   }
 
@@ -1354,8 +1938,323 @@ export class ResidentHost {
     await this.agents.cleanup(probe.id);
   }
 
+  #drainActors(): ResidentDrainActors {
+    const actors = this.actors as unknown as ResidentDrainActors;
+    if (typeof actors.releaseCheckpointReceipt !== "function") {
+      throw new ResidentDrainRefusedError("CHECKPOINT_RECEIPT_UNAVAILABLE", "Resident actor checkpoint readback capability is unavailable; retain A");
+    }
+    return actors;
+  }
+
+  #drainAgents(): ResidentDrainAgents {
+    const agents = this.agents as unknown as ResidentDrainAgents;
+    if (typeof agents.pauseForRelease !== "function" || typeof agents.resumeAfterRelease !== "function") {
+      throw new ResidentDrainRefusedError("DRAIN_ADMISSION_PROTOCOL_UNAVAILABLE", "Resident agent admission hold capability is unavailable; retain A");
+    }
+    return agents;
+  }
+
+  #drainSupported(): boolean {
+    const launch = this.launch;
+    if (!launch || process.platform !== "linux" || !exactResidentProcess(launch.launcher) ||
+        launch.spec.config.rootId !== this.config.rootId || launch.spec.config.sessionId !== this.config.sessionId ||
+        launch.spec.config.residencyRoot !== this.config.residencyRoot ||
+        launch.spec.config.fabricExtensionPath !== this.config.fabricExtensionPath ||
+        launch.spec.config.workerPath !== this.config.workerPath || !launch.launcher.token) return false;
+    const { digest, ...value } = launch.spec;
+    if (specDigest(value) !== digest) return false;
+    try { this.#drainActors(); this.#drainAgents(); return true; } catch { return false; }
+  }
+
+  async #publishStagedReady(owner: ResidentHostOwner): Promise<void> {
+    const launch = this.launch!;
+    const deadline = Date.now() + HANDOVER_DRAIN_MS;
+    const checkpoint = new AbortController();
+    const timer = setTimeout(() => checkpoint.abort(new Error("Staged resident checkpoint timed out")), HANDOVER_DRAIN_MS);
+    try {
+      // Startup probe is maintenance, never business admission. All four gates stay held.
+      const assertHeld = (): void => {
+        if (checkpoint.signal.aborted || Date.now() >= deadline || !this.#staged || this.#closed) throw new Error("Staged checkpoint invalidated");
+      };
+      const valid = (): boolean => { try { assertHeld(); return true; } catch { return false; } };
+      await this.#boundedCheckpoint(() => (this.control as unknown as ResidentDrainIngress).checkpointForRelease(valid), deadline, checkpoint.signal);
+      await this.#boundedCheckpoint(() => (this.lifecycle as unknown as ResidentDrainIngress).checkpointForRelease(valid), deadline, checkpoint.signal);
+      await this.#boundedCheckpoint(() => this.#drainActors().checkpointForRelease(assertHeld), deadline, checkpoint.signal);
+      await this.#boundedCheckpoint(() => this.#drainAgents().checkpointForRelease(deadline, valid), deadline, checkpoint.signal);
+      assertHeld();
+      if (this.#businessAdmissions !== 0 || !owner.processStartTime || checkpoint.signal.aborted) {
+        throw new Error("Staged resident cannot prove zero business admission");
+      }
+      const receipt: ResidentStagedReadyReceipt = { abi: RESIDENT_HANDOVER_ABI, id: launch.attempt!.id,
+        rootId: this.config.rootId, owner: { pid: owner.pid, processStartTime: owner.processStartTime,
+          token: owner.token, hostId: owner.hostId }, launcher: launch.launcher, kind: launch.attempt!.kind,
+        digest: launch.spec.digest, businessAdmissions: 0, admissionHeld: true, checkpointReadback: true,
+        checkpoint: this.#releaseCheckpointReadback(), at: Date.now() };
+      writeResidentStagedReadyReceipt(this.config.residencyRoot, receipt);
+      this.#stagedReady = receipt;
+    } finally { clearTimeout(timer); checkpoint.abort(new Error("Staged checkpoint complete")); }
+  }
+
+  #assertDrainChannelOwned(command: Extract<ResidentCommand, { operation: "releaseDrain" }>): void {
+    const uid = process.getuid?.();
+    if (process.platform !== "linux" || uid === undefined) throw new ResidentDrainRefusedError("RESIDENT_CHANNEL_UNOWNED", "Resident cannot verify same-user drain channel ownership");
+    const directories = [...new Set([this.config.meshRoot, path.dirname(this.config.meshRoot), this.config.residencyRoot,
+      path.dirname(this.config.residencyRoot), this.#requestsPath, this.#processingPath, this.#responsesPath,
+      path.join(this.config.meshRoot, "participants"), path.dirname(hostLeasePath(this.config.meshRoot, command.caller?.hostId ?? ""))])];
+    const files = [this.#ownerPath, path.join(this.config.residencyRoot, "config.json"),
+      path.join(this.config.residencyRoot, "main-generation.json"), path.join(this.#processingPath, `${command.requestId}.json`),
+      hostLeasePath(this.config.meshRoot, command.caller?.hostId ?? "")];
+    for (const file of [...directories, ...files]) {
+      const stat = fs.lstatSync(file);
+      if (stat.isSymbolicLink() || stat.uid !== uid || (stat.mode & 0o022) !== 0 ||
+          (directories.includes(file) ? !stat.isDirectory() : !stat.isFile()) || fs.realpathSync(file) !== path.resolve(file)) {
+        throw new ResidentDrainRefusedError("RESIDENT_CHANNEL_UNOWNED", `Resident drain channel is not exclusively owned by this OS user: ${file}`);
+      }
+    }
+  }
+
+  #prepareDrain(command: Extract<ResidentCommand, { operation: "releaseDrain" }>): ResidentDrainReceipt {
+    this.#authorizeResidentSetter(command.caller);
+    this.#assertDrainChannelOwned(command);
+    const launch = this.launch;
+    const owner = readHandoverJson<ResidentHostOwner>(this.#ownerPath);
+    const refuse = (code: string, reason: string): never => { throw new ResidentDrainRefusedError(code, reason); };
+    // The expected loaded release is checked BEFORE commit, snapshots, pause or any checkpoint.
+    if (!command.expected || !launch || owner?.releaseRoot !== command.expected.releaseRoot ||
+        launch.spec.releaseRoot !== command.expected.releaseRoot || owner.fabricExtensionPath !== launch.spec.config.fabricExtensionPath) {
+      return refuse("EXPECTED_RELEASE_MISMATCH", "Expected release does not match the loaded resident owner; nothing was held");
+    }
+    if (!owner.processStartTime || !sameDrainOwner(owner as ResidentDrainReceipt["owner"], command.expected.owner) ||
+        owner.pid !== process.pid || owner.token !== this.#token || owner.hostId !== this.hostId || !exactResidentProcess({ pid: owner.pid, processStartTime: owner.processStartTime })) {
+      return refuse("RESIDENT_OWNER_MISMATCH", "Resident owner birth/token fence is uncertain");
+    }
+    if (!owner.handover || !sameDrainLauncher(owner.handover.launcher, command.expected.launcher) ||
+        !sameDrainLauncher(launch.launcher, command.expected.launcher) || !exactResidentProcess(launch.launcher)) {
+      return refuse("LAUNCHER_IDENTITY_MISMATCH", "Resident launcher birth/token fence changed");
+    }
+    if (owner.configDigest !== command.expected.configDigest || owner.configDigest !== launch.spec.digest) {
+      return refuse("CONFIG_DIGEST_MISMATCH", "Expected resident config digest changed");
+    }
+    if (!this.#drainSupported() || owner.drain?.abi !== RESIDENT_DRAIN_ABI) {
+      return refuse("DRAIN_ADMISSION_PROTOCOL_UNAVAILABLE", "Loaded resident cannot attest a coherent cooperative drain boundary");
+    }
+    if (this.#closed || this.#staged || this.#handover || this.#drain || this.#drainCheckpointPending || this.#checkpointJoins.size || this.#sleeping || this.#idleExitRequested) {
+      return refuse("DRAIN_BUSY", "Another resident boundary is unsettled; retain A");
+    }
+    const root = this.participants.get(this.config.rootId, Date.now(), { fresh: true });
+    if (!mainGenerationCurrent(this.config.residencyRoot, command.main) || command.main.rootId !== this.config.rootId ||
+        command.main.sessionId !== this.config.sessionId || ![launch.spec.releaseRoot, command.target.releaseRoot].includes(command.main.releaseRoot) ||
+        root?.mainProcess?.pid !== command.main.pid || root.mainProcess.startTime !== command.main.processStartTime ||
+        root.mainProcess.host !== os.hostname()) {
+      throw new ResidentActorAuthorizationError("Obsolete owning Main drain intent");
+    }
+    const deadlineAt = residentDrainDeadline(command.timeoutMs);
+    validateLaunchSpec(command.target);
+    const previous = residentLaunchSpec(this.#effectiveConfig?.() ?? this.config, launch.spec.entry, launch.spec.runtime);
+    assertPreviousLaunchSpec(launch.spec, previous);
+    if (previous.digest !== command.expected.configDigest) return refuse("CONFIG_DIGEST_MISMATCH", "Loaded resident policy/config snapshot changed");
+    assertHandoverTopology(previous, command.target);
+    if (previous.releaseRoot === command.target.releaseRoot) return refuse("TARGET_IS_CURRENT_RELEASE", "Drain target must be a different retained release");
+    if (handoverActive(readHandoverJson<ResidentHandoverState>(handoverPath(this.config.residencyRoot)))) {
+      return refuse("DRAIN_BUSY", "A resident handover is in custody");
+    }
+    if (Date.now() >= deadlineAt) return refuse("DRAIN_TIMEOUT", "Drain deadline elapsed during read-only validation; nothing was held");
+    const receipt = newResidentDrainReceipt({ rootId: this.config.rootId, owner: command.expected.owner,
+      launcher: launch.launcher, previous, target: command.target, main: command.main, phase: "held", outcome: "held",
+      code: "DRAIN_HELD", reason: "Resident admissions held; accepted work may settle naturally", at: Date.now(),
+      deadlineAt, admissionHeld: true, terminal: false });
+    commitResidentRequest(this.config.residencyRoot, command, receipt.id, this.hostId);
+    let resolveResumed!: () => void;
+    const resumed = new Promise<void>(resolve => { resolveResumed = resolve; });
+    const checkpointAbort = new AbortController();
+    const timer = setTimeout(() => {
+      if (this.#drain === held) this.#finishDrainTimeout(held);
+    }, Math.max(0, deadlineAt - Date.now()));
+    const held: ResidentHeldDrain = { receipt, caller: structuredClone(command.caller), checkpointAbort, timer, resumed, resolveResumed };
+    // Single synchronous boundary: no await between resident state and manager gates.
+    this.#drain = held;
+    try {
+      this.#drainActors().pauseForRelease({ strict: true }); this.#drainAgents().pauseForRelease(true);
+      (this.control as unknown as ResidentDrainIngress).pause(true); (this.lifecycle as unknown as ResidentDrainIngress).pause(true);
+      this.#armScheduleWake(undefined);
+      writeResidentDrainReceipt(this.config.residencyRoot, receipt);
+      return receipt;
+    } catch (error) {
+      this.#finishDrain(held, "needs-operator", "DRAIN_HOLD_FAILED", errorMessage(error));
+      throw error;
+    }
+  }
+
+  #drainStillCurrent(held: ResidentHeldDrain): void {
+    if (this.#drain !== held || held.checkpointAbort.signal.aborted || Date.now() >= held.receipt.deadlineAt) throw new Error("Resident drain checkpoint expired");
+    this.#authorizeResidentSetter(held.caller);
+    const root = this.participants.get(this.config.rootId, Date.now(), { fresh: true });
+    if (root?.mainProcess?.pid !== held.receipt.main.pid || root.mainProcess.startTime !== held.receipt.main.processStartTime ||
+        root.mainProcess.host !== os.hostname()) throw new ResidentActorAuthorizationError("Owning Main process identity changed during drain");
+    if (!mainGenerationCurrent(this.config.residencyRoot, held.receipt.main) || !exactResidentProcess(held.receipt.launcher)) {
+      throw new Error("Owning Main/launcher lost during cooperative drain");
+    }
+    const owner = readHandoverJson<ResidentHostOwner>(this.#ownerPath);
+    if (!owner || !sameDrainOwner(owner as ResidentDrainReceipt["owner"], held.receipt.owner) ||
+        owner.releaseRoot !== held.receipt.previous.releaseRoot || owner.configDigest !== held.receipt.previous.digest ||
+        !owner.handover || !sameDrainLauncher(owner.handover.launcher, held.receipt.launcher)) throw new Error("Resident drain owner binding changed");
+    if (JSON.stringify(readResidentDrainReceipt(this.config.residencyRoot, held.receipt.id, held.receipt)) !== JSON.stringify(held.receipt)) {
+      throw new Error("Resident held drain receipt changed");
+    }
+  }
+
+  #finishDrainTimeout(held: ResidentHeldDrain): void {
+    this.#finishDrain(held, "resumed", "DRAIN_TIMEOUT", "Drain deadline elapsed; A resumed without aborting accepted work");
+  }
+
+  #finishDrain(held: ResidentHeldDrain, outcome: "resumed" | "containment-unavailable" | "needs-operator", code: string, reason: string): void {
+    if (this.#drain !== held) return;
+    clearTimeout(held.timer);
+    // Cancels checkpoint validity ONLY. Never pass this signal to a worker/accepted handler.
+    held.checkpointAbort.abort(new Error(reason));
+    this.#drain = undefined;
+    let resumeFailed = false;
+    if (!this.#closed) {
+      for (const resume of [() => this.actors.resumeAfterRelease(), () => this.#drainAgents().resumeAfterRelease(),
+        () => this.control.resume(), () => this.lifecycle.resume()]) {
+        try { resume(); }
+        catch (error) { resumeFailed = true; reason += `; resume failed: ${errorMessage(error)}`; }
+      }
+    }
+    if (resumeFailed) { outcome = "needs-operator"; code = "DRAIN_RESUME_UNCERTAIN"; }
+    held.resolveResumed();
+    const terminalAt = Date.now();
+    held.receipt = { ...held.receipt, phase: outcome === "needs-operator" ? "needs-operator" : held.receipt.phase,
+      outcome, code, reason, at: terminalAt, ...(!this.#closed && !resumeFailed ? { resumedAt: terminalAt } : {}),
+      admissionHeld: this.#closed || resumeFailed, terminal: true };
+    try { writeResidentDrainReceipt(this.config.residencyRoot, held.receipt); }
+    catch (error) { console.error(`[pi-fabric] resident drain terminal receipt unavailable: ${errorMessage(error)}`); }
+    this.#idleSince = Date.now();
+    if (!this.#closed) { try { this.#armScheduleWake(this.mesh.nextScheduleDueAt()); } catch { /* durable schedule remains upstream */ } }
+    this.#scheduleIdleCheck();
+  }
+
+  async #boundedCheckpoint(checkpoint: () => Promise<void>, deadlineAt: number, signal: AbortSignal): Promise<void> {
+    if (signal.aborted || Date.now() >= deadlineAt) throw new Error("Resident checkpoint deadline elapsed");
+    let onAbort!: () => void;
+    const aborted = new Promise<never>((_, reject) => {
+      onAbort = () => reject(signal.reason ?? new Error("Resident checkpoint invalidated"));
+      signal.addEventListener("abort", onAbort, { once: true });
+    });
+    // Observe the losing promise too; manager epoch checks prevent late persistence after resume.
+    const pending = Promise.resolve().then(() => {
+      if (signal.aborted || Date.now() >= deadlineAt) throw new Error("Resident checkpoint invalidated before entry");
+      return checkpoint();
+    });
+    this.#checkpointJoins.add(pending);
+    void pending.finally(() => this.#checkpointJoins.delete(pending)).catch(() => undefined);
+    try { await Promise.race([pending, aborted]); }
+    finally { signal.removeEventListener("abort", onAbort); }
+  }
+
+  async #advanceDrain(held: ResidentHeldDrain): Promise<void> {
+    if (this.#pollingRequests || this.#drainCheckpointPending) return;
+    try {
+      this.#drainStillCurrent(held);
+      if (this.#admissions || this.#boundaryRequests.size || this.actors.releaseCustodyCount() || this.actors.pendingRemovals().length ||
+          residentProcessWorkPending(this.processWorkSessionId) || this.#publications.size || this.#flushingDeliveries ||
+          this.agents.listForUi().some(agent => agent.status === "queued" || agent.status === "running") ||
+          fs.readdirSync(this.#processingPath).some(entry => entry.endsWith(".json"))) return;
+      const pending = this.#checkpointDrain(held);
+      this.#drainCheckpointPending = pending;
+      try { await pending; }
+      finally { if (this.#drainCheckpointPending === pending) this.#drainCheckpointPending = undefined; }
+    } catch (error) {
+      if (this.#drain === held) {
+        // The wall deadline owns terminal timeout classification even when this
+        // continuation wins the event edge just before the setTimeout callback.
+        if (Date.now() >= held.receipt.deadlineAt) this.#finishDrainTimeout(held);
+        else this.#finishDrain(held, "resumed", error instanceof ResidentDrainRefusedError ? error.code : "DRAIN_UNCERTAIN", errorMessage(error));
+      }
+    }
+  }
+
+  async #checkpointDrain(held: ResidentHeldDrain): Promise<void> {
+    const { deadlineAt } = held.receipt;
+    const signal = held.checkpointAbort.signal;
+    const assertHeld = (): void => this.#drainStillCurrent(held);
+    const valid = (): boolean => { try { assertHeld(); return true; } catch { return false; } };
+    const step = async (callback: () => Promise<void>): Promise<void> => {
+      this.#drainStillCurrent(held);
+      await this.#boundedCheckpoint(callback, deadlineAt, signal);
+      this.#drainStillCurrent(held);
+    };
+    await step(() => (this.control as unknown as ResidentDrainIngress).checkpointForRelease(valid));
+    await step(() => (this.lifecycle as unknown as ResidentDrainIngress).checkpointForRelease(valid));
+    await step(() => this.#backgroundDeliveries.checkpointForRelease());
+    await step(async () => {
+      await Promise.all([...this.#publications]); assertHeld();
+      await this.#flushingDeliveries; assertHeld();
+      // Normal producer replay owns its own durable handoff; do not leave an
+      // unguarded checkpoint flusher running across a timed-out resume.
+      if (fs.existsSync(this.#deliveryOutboxPath) && fs.readdirSync(this.#deliveryOutboxPath).some(entry => entry.endsWith(".json"))) {
+        throw new Error("Resident producer outbox has pending handoff obligations");
+      }
+    });
+    if (this.#publicationFailed || (fs.existsSync(this.#deliveryOutboxPath) && fs.readdirSync(this.#deliveryOutboxPath).some(entry => entry.endsWith(".json")))) {
+      throw new Error("Resident drain has unconfirmed producer/publication obligations");
+    }
+    await step(() => this.#drainActors().checkpointForRelease(assertHeld));
+    await step(() => this.#drainAgents().checkpointForRelease(deadlineAt, valid));
+    const checkpoint = this.#releaseCheckpointReadback();
+    this.#drainStillCurrent(held);
+    validateLaunchSpec(held.receipt.previous); validateLaunchSpec(held.receipt.target);
+    this.#drainStillCurrent(held);
+    // Quiet is evidence after real synchronous gates and joins, never a replacement admission boundary.
+    if (this.#admissions || this.#boundaryRequests.size || this.#publications.size || this.#flushingDeliveries ||
+        this.actors.releaseCustodyCount() || this.actors.pendingRemovals().length ||
+        this.agents.listForUi().some(agent => agent.status === "queued" || agent.status === "running")) throw new Error("Resident drain quiet changed during checkpoint");
+    held.receipt = { ...held.receipt, phase: "checkpointed", outcome: "checkpointed", code: "DRAIN_CHECKPOINTED",
+      reason: "Held queues, registry and receipt obligations checkpointed and read back", at: Date.now(),
+      checkpoint, checkpointReadback: true, quiet: { admissions: 0, actors: 0, agents: 0, removals: 0,
+        publications: 0, producerOutbox: 0, boundaryRequests: 0, businessAdmissions: this.#businessAdmissions } };
+    writeResidentDrainReceipt(this.config.residencyRoot, held.receipt);
+    // Drain operation IDs are NOT launch attempt IDs. Only a trusted launch
+    // attestation may select the launcher-custody channel; no scope path is opened.
+    await step(async () => {
+      try {
+        const attestation = this.#trustedLaunchAttestation;
+        if (!attestation?.attemptId || attestation.launchedInScope !== true) {
+          throw new ContainmentUnavailableError("Current resident has no launcher-issued launch attestation; retain A");
+        }
+        // ENV alone and mutable owner.json are not launch authority. Recheck the
+        // launcher's immutable record; IPC independently binds every receipt field.
+        readResidentLaunchAttestation(this.config.residencyRoot, attestation);
+        const owner = readHandoverJson<ResidentHostOwner>(this.#ownerPath);
+        if (!owner || !sameDrainOwner(owner as ResidentDrainReceipt["owner"], held.receipt.owner) ||
+            JSON.stringify(owner.launchAttestation) !== JSON.stringify(attestation)) {
+          throw new ContainmentUnavailableError("Current owner generation has no matching launcher launch attestation; retain A");
+        }
+        const membership = await (this.#containmentClient ?? this.containment).attemptMembership(attestation.attemptId);
+        if (membership.attemptId !== attestation.attemptId || membership.scope !== attestation.scope) {
+          throw new Error("Launcher membership reply is not bound to the current launch attempt");
+        }
+      } catch (error) { if (!(error instanceof ContainmentUnavailableError)) throw error; }
+    });
+    // Spec 5/7 are still absent. NEVER publish custody, exit A, or start B here.
+    try { assertAutomaticReleaseRecovery(); }
+    catch (error) { this.#finishDrain(held, "containment-unavailable", "CONTAINMENT_UNAVAILABLE", errorMessage(error)); return; }
+    this.#finishDrain(held, "containment-unavailable", "CONTAINMENT_UNAVAILABLE", "Cooperative endpoint does not own containment or release movement");
+  }
+
+  #releaseCheckpointReadback(): unknown {
+    const receipts: Record<string, unknown> = { actors: this.#drainActors().releaseCheckpointReceipt() };
+    for (const [name, manager] of [["agents", this.agents], ["control", this.control], ["lifecycle", this.lifecycle]] as const) {
+      const readback = (manager as unknown as { releaseCheckpointReceipt?: () => unknown }).releaseCheckpointReceipt;
+      if (typeof readback !== "function") throw new ResidentDrainRefusedError("CHECKPOINT_RECEIPT_UNAVAILABLE", `${name} durable checkpoint readback is unavailable; no complete quiet claim; retain A`);
+      receipts[name] = readback.call(manager);
+    }
+    return receipts;
+  }
+
   #prepareRelease(command: Extract<ResidentCommand, { operation: "releaseChange" }>): void {
     this.#authorizeResidentSetter(command.caller);
+    if (this.#drain) throw new Error("Cooperative resident drain already holds admissions");
     const launch = this.launch;
     if (!launch || process.platform !== "linux" || !exactResidentProcess(launch.launcher)) {
       throw new Error("Resident launcher has no attested handover custody capability; stay on current release");
@@ -1405,12 +2304,20 @@ export class ResidentHost {
     if (this.#advancingRelease || this.#closed) return;
     this.#advancingRelease = true;
     try {
+      if (this.#drain) { await this.#advanceDrain(this.#drain); return; }
       if (this.#staged) {
         const state = readHandoverJson<ResidentHandoverState>(handoverPath(this.config.residencyRoot));
         const attempt = this.launch?.attempt;
         if (!state || state.plan.id !== attempt?.id) throw new Error("Staged resident transaction identity changed");
         const terminal = attempt.kind === "target" ? "complete" : "fallback";
         if (state.phase !== terminal) return;
+        // Staged readiness is not containment. No forged terminal state opens B.
+        assertAutomaticReleaseRecovery();
+        if (!this.#stagedReady || this.#businessAdmissions !== 0) throw new Error("Staged resident admitted business work");
+        assertResidentStagedReady(this.config.residencyRoot, this.#stagedReady);
+        if (JSON.stringify(this.#releaseCheckpointReadback()) !== JSON.stringify(this.#stagedReady.checkpoint)) {
+          throw new Error("Staged resident checkpoint readback changed before admission");
+        }
         if (attempt.kind === "target") {
           this.#reloadEvent ??= this.mesh.publish({ topic: "host.reloaded", from: this.identity,
             data: { old: state.plan.previous.releaseRoot, new: state.plan.target.releaseRoot, transaction: state.plan.id } });
@@ -1423,7 +2330,7 @@ export class ResidentHost {
         const { attempt: _completedAttempt, ...servingOwner } = owner;
         writeJsonAtomic(this.#ownerPath, servingOwner, { durable: true });
         this.#staged = false;
-        this.actors.resumeAfterRelease(); this.control.resume(); this.lifecycle.resume();
+        this.actors.resumeAfterRelease(); this.#drainAgents().resumeAfterRelease(); this.control.resume(); this.lifecycle.resume();
         this.#trackPublication(this.#backgroundDeliveries.enqueue(async () => {
           await this.actors.finishPendingRemovals();
           this.#writeRemovals();
@@ -1449,7 +2356,7 @@ export class ResidentHost {
         this.#cancelRelease(plan, "Release drain timed out without cutting a run"); return;
       }
       if (fs.readdirSync(this.#processingPath).some((entry) => entry.endsWith(".json"))) return;
-      if (this.#admissions || this.actors.inFlightCount() || this.actors.pendingRemovals().length ||
+      if (this.#admissions || this.actors.releaseCustodyCount() || this.actors.pendingRemovals().length ||
           this.agents.listForUi().some((agent) => agent.status === "queued" || agent.status === "running")) return;
       const state = readHandoverJson<ResidentHandoverState>(handoverPath(this.config.residencyRoot));
       if (state?.plan.id !== plan.id) throw new Error("Resident release transaction changed");
@@ -1523,7 +2430,7 @@ export class ResidentHost {
     } catch (error) {
       response = { format: RESIDENT_HOST_FORMAT, requestId, ok: false, error: errorMessage(error),
         ...(error instanceof ResidentCommandUnsupportedError || error instanceof ResidentRequestExpiredError
-          ? { errorCode: error.code } : {}), completedAt: Date.now() };
+          ? { errorCode: error.code } : {}), ...residentSlotErrorFields(error), completedAt: Date.now() };
     }
     if (response.ok) await testResidentRequestDelay("after_commit");
     const responsePath = path.join(this.#responsesPath, `${requestId}.json`);
@@ -1534,6 +2441,9 @@ export class ResidentHost {
     }
     fs.rmSync(filePath, { force: true });
     this.participants.scheduleRefresh();
+    // Actor events during create/setters preceded the durable response and
+    // processing-file release. Recheck when this exchange actually settles.
+    this.#scheduleIdleCheck();
   }
 
   #pruneCreations(): void {
@@ -1547,6 +2457,14 @@ export class ResidentHost {
   }
 
   async #executeOnce(command: ResidentCommand, boundaryAdmitted?: () => void): Promise<ResidentCommandResponse> {
+    // The durable native ledger, not this bounded host-local receipt cache, owns
+    // protected retries and immutable-spec conflicts across resident generations.
+    if (command.operation === "createActor") {
+      const slots = slotAdmissionFor(this.mesh);
+      if (slots.requiresEnforcement(command.request.topics ?? [], residentActorRoots(this.config)[command.request.scope ?? this.config.mesh.actorScope], this.config.rootId)) {
+        return this.#executeRequest(command, boundaryAdmitted);
+      }
+    }
     if ((command.operation !== "spawnBound" && command.operation !== "createActor") || command.idempotencyKey === undefined) {
       return this.#executeRequest(command, boundaryAdmitted);
     }
@@ -1598,8 +2516,12 @@ export class ResidentHost {
     let response: ResidentCommandResponse;
     try {
       await testResidentRequestDelay("before_commit");
+      if (command.operation !== "releaseDrain") this.#businessAdmissions++;
       const commit = (id: string): void => commitResidentRequest(this.config.residencyRoot, command, id, this.hostId);
-      if (command.operation === "releaseChange") {
+      if (command.operation === "releaseDrain") {
+        const drain = this.#prepareDrain(command);
+        response = { format: RESIDENT_HOST_FORMAT, requestId, ok: true, drain, completedAt: Date.now() };
+      } else if (command.operation === "releaseChange") {
         this.#prepareRelease(command);
         response = { format: RESIDENT_HOST_FORMAT, requestId, ok: true, completedAt: Date.now() };
       } else if (command.operation === "spawnBound") {
@@ -1686,13 +2608,18 @@ export class ResidentHost {
         // This handler already runs inside the authoritative durable host.
         // Keep the new actor locally owned; ceding it here created a needless
         // self-transfer window that blocked the next recruitment request.
-        const { instructionsFile: _file, sha256: _digest, ...base } = command.request;
+        const slots = slotAdmissionFor(this.mesh);
+        const protectedCreate = slots.requiresEnforcement(command.request.topics ?? [], residentActorRoots(this.config)[command.request.scope ?? this.config.mesh.actorScope], this.config.rootId);
+        if (protectedCreate) this.#authorizeResidentSetter(command.caller);
+        const { instructionsFile: _file, sha256: _digest, idempotencyKey: _requestKey, ...base } = command.request;
         const instructions = resolveActorInstructions(command.request, this.config.agents.instructionsRoot);
-        const actor = await this.actors.create({ ...base, instructions }, {
+        const actor = await this.actors.create({ ...base, instructions,
+          ...(command.idempotencyKey === undefined ? {} : { idempotencyKey: command.idempotencyKey }),
+        }, {
           asRegistryOwner: true,
           ...(command.caller ? { supervisorOwner: command.caller.identity } : {}),
           beforeCommit: id => {
-            if (command.caller) this.#authorizeResidentSetter(command.caller);
+            if (protectedCreate || command.caller) this.#authorizeResidentSetter(command.caller);
             commit(id);
           },
         });
@@ -1717,21 +2644,34 @@ export class ResidentHost {
         // Exact id/name within this executor's root only; never resolve via the caller's root.
         const candidates = this.actors.listOwned().filter(actor => actor.rootId === this.config.rootId &&
           actor.residency === "durable" && (actor.id === command.id || actor.name === command.id));
-        if (candidates.length !== 1) throw new Error(candidates.length
-          ? `Ambiguous resident actor: ${command.id}` : `Unknown Fabric actor: ${command.id}`);
-        const actor = candidates[0]!;
-        if (command.dryRun === true) {
+        // smarty-dev#11105: an exact-id remove of this root's durable actor whose commit is in flight joins
+        // that commit (no preliminary stop: its run already ended). Never for stop, dry-run or an alias.
+        const finishing = candidates.length === 0 && command.action === "remove" && command.dryRun !== true
+          ? this.actors.finishingRemoval(command.id) : undefined;
+        if (finishing && finishing.rootId === this.config.rootId && finishing.residency === "durable") {
+          // Same lease veto, then this request's commit, as the stop-first path's callback.
+          const pending = this.#removeResidentActor(finishing.id, requestId, id => { check(); commit(id); }, true);
+          boundaryAdmitted?.();
+          response = await pending;
+        } else if (candidates.length !== 1) {
+          throw new Error(candidates.length ? `Ambiguous resident actor: ${command.id}` : `Unknown Fabric actor: ${command.id}`);
+        } else if (command.dryRun === true) {
+          const actor = candidates[0]!;
           response = { format: RESIDENT_HOST_FORMAT, requestId, ok: true, actor, operatorEvidence: evidence, completedAt: Date.now() };
         } else {
           // Re-read the uncached current lease immediately before each mutation.
           // This is a lease veto, not a proof that no Main exists or can restart.
+          const actor = candidates[0]!;
           const pending = this.actors.stop(actor.id, id => { check(); commit(id); }, true);
           boundaryAdmitted?.();
           const stopped = await pending;
           response = command.action === "stop"
             ? { format: RESIDENT_HOST_FORMAT, requestId, ok: true, actor: stopped, completedAt: Date.now() }
-            : await this.#removeResidentActor(actor.id, requestId, () => check());
+            : await this.#removeResidentActor(actor.id, requestId, () => check(), true);
         }
+      } else if (command.operation === "slotStatus") {
+        response = { format: RESIDENT_HOST_FORMAT, requestId, ok: true,
+          slotStatus: slotAdmissionFor(this.mesh).status(), completedAt: Date.now() };
       } else if (command.operation === "actors") {
         response = {
           format: RESIDENT_HOST_FORMAT, requestId, ok: true,
@@ -1780,34 +2720,67 @@ export class ResidentHost {
         }
         response = { format: RESIDENT_HOST_FORMAT, requestId, ok: true, actor: updated, completedAt: Date.now() };
       } else {
-        response = await this.#removeResidentActor(command.id, requestId, commit);
+        const pending = this.#removeResidentActor(command.id, requestId, commit);
+        boundaryAdmitted?.();
+        response = await pending;
       }
     } catch (error) {
+      const drain = command.operation === "releaseDrain" ? this.#drainRefusal(command, error) : undefined;
+      let slotFailure = residentSlotErrorFields(error);
+      if (command.operation === "createActor" && (residentCreateMayBeProtected(command) ||
+          slotAdmissionFor(this.mesh).isProtected(command.request.topics ?? []))) {
+        // Acceptance is not durable birth. Once its CAS wins, SQL/sync/projection
+        // failures are uncertainty even when the intent or response is missing.
+        let decision;
+        try { decision = readResidentRequestDecision(this.config.residencyRoot, requestId); } catch { /* retain native error */ }
+        if (decision?.state === "committed") {
+          slotFailure = { errorCode: "FABRIC_ACTOR_SLOT_CREATE_UNCERTAIN", slotError: {
+            ...slotFailure.slotError,
+            ...((slotFailure.slotError?.actorId ?? decision.id) ? { actorId: (slotFailure.slotError?.actorId ?? decision.id)! } : {}),
+            ...(command.request.slotClaim ? { claimKey: command.request.slotClaim.key,
+              claimVersion: command.request.slotClaim.ifVersion } : {}),
+            ...(command.idempotencyKey ? { requestKey: command.idempotencyKey } : {}),
+          } };
+        }
+      }
       response = {
         format: RESIDENT_HOST_FORMAT,
         requestId,
         ok: false,
         error: errorMessage(error),
+        ...(drain ? { drain } : {}),
         ...(error instanceof ResidentActorAuthorizationError || error instanceof ResidentCommandUnsupportedError || error instanceof ResidentRequestExpiredError
           ? { errorCode: error.code } : {}),
         ...(error instanceof ActorSessionResetCancelledError ? { errorCode: error.code } : {}),
         ...(error instanceof FabricModelDeniedError ? {
           errorCode: error.code, modelDenied: { model: error.model, ...(error.replacement ? { replacement: error.replacement } : {}) },
         } : {}),
+        ...slotFailure,
         completedAt: Date.now(),
       };
     }
     return response;
   }
 
-  async #removeResidentActor(id: string, requestId: string, commit: (id: string) => void): Promise<ResidentCommandResponse> {
+  #drainRefusal(command: Extract<ResidentCommand, { operation: "releaseDrain" }>, error: unknown): ResidentDrainReceipt | undefined {
+    const owner = readJson<ResidentHostOwner>(this.#ownerPath);
+    const launch = this.launch;
+    if (!owner?.processStartTime || !launch || !command.target || !command.main) return undefined;
+    return newResidentDrainReceipt({ rootId: this.config.rootId,
+      owner: { pid: owner.pid, processStartTime: owner.processStartTime, token: owner.token, hostId: owner.hostId },
+      launcher: launch.launcher, previous: launch.spec, target: command.target, main: command.main,
+      phase: "refused", outcome: "refused", code: error instanceof ResidentDrainRefusedError || error instanceof ResidentActorAuthorizationError
+        ? error.code : "DRAIN_REFUSED", reason: errorMessage(error), at: Date.now(), deadlineAt: Date.now(), admissionHeld: false, terminal: true });
+  }
+
+  async #removeResidentActor(id: string, requestId: string, commit: (id: string) => void, operator = false): Promise<ResidentCommandResponse> {
     const cleanup = this.actors.cleanupObligation(id);
     if (!this.actors.owns(id) || (cleanup && cleanup.residency !== "durable")) {
       throw new Error(`Resident host does not own ${id}`);
     }
     // smarty-dev#2184 item 8: stop now and return; the removal finishes behind its run.
     commit(id);
-    const removed = await this.actors.remove(id, { wait: false });
+    const removed = await this.actors.remove(id, { wait: false, ...(operator ? { operator: true as const } : {}) });
     this.#writeRemovals();
     if (removed.pending) {
       void this.actors.removalSettled(id)?.finally(() => {
@@ -2026,11 +2999,44 @@ function residentHostLaunchContext(config: ResidentHostConfig): ResidentHostLaun
   if (spec.digest !== process.env.PI_FABRIC_RESIDENT_SPEC_DIGEST || (pinned && pinned.digest !== spec.digest)) {
     throw new Error("Resident loaded release does not match launcher snapshot");
   }
-  return { launcher, spec, ...(attempt ? { attempt } : {}) };
+  const attestationRaw = process.env.PI_FABRIC_RESIDENT_LAUNCH_ATTESTATION;
+  delete process.env.PI_FABRIC_RESIDENT_LAUNCH_ATTESTATION;
+  let launchAttestation: AttemptLaunchReceipt | undefined;
+  if (attestationRaw) {
+    const value = JSON.parse(attestationRaw) as AttemptLaunchReceipt;
+    const fields = ["attemptId", "scope", "cgroupPath", "launchedInScope", "at"];
+    if (!value || Object.keys(value).length !== fields.length || Object.keys(value).some(key => !fields.includes(key)) ||
+        typeof value.attemptId !== "string" || !value.attemptId.trim() || typeof value.scope !== "string" || !value.scope.trim() ||
+        typeof value.cgroupPath !== "string" || !path.isAbsolute(value.cgroupPath) || value.launchedInScope !== true ||
+        !Number.isFinite(value.at) || value.at <= 0 || value.at > Date.now() || !process.env.PI_FABRIC_RESIDENT_GENERATION) {
+      throw new Error("Resident launcher launch attestation is malformed or has no chosen generation");
+    }
+    // An unavailable/mismatched record removes containment authority, not A's
+    // ability to serve or to cooperatively checkpoint/resume without custody.
+    try { launchAttestation = readResidentLaunchAttestation(config.residencyRoot, value); }
+    catch (error) { if (!(error instanceof ContainmentUnavailableError)) throw error; }
+  }
+  return { launcher, spec, ...(attempt ? { attempt } : {}), ...(launchAttestation ? { launchAttestation } : {}) };
 }
 
+/**
+ * This host's generation (owner token). A launcher chooses it before the spawn and passes it in
+ * PI_FABRIC_RESIDENT_GENERATION, so the launcher knows the generation of an exit it did not see the host publish
+ * (smarty-dev#7950); a malformed one refuses the start. Consumed once (removed from the environment), so no child
+ * inherits it. Absent (an in-process host, or a launcher from before this change during a handover): a random one.
+ */
+const residentGenerationToken = (): string => {
+  const chosen = process.env.PI_FABRIC_RESIDENT_GENERATION;
+  delete process.env.PI_FABRIC_RESIDENT_GENERATION;
+  if (!chosen) return randomUUID();
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(chosen)) {
+    throw new Error("Resident generation from the launcher is malformed; refusing to start");
+  }
+  return chosen;
+};
+
 /** Why a resident host exits (smarty-dev#7770). */
-export type ResidentExitReason = "idle-exit" | "handover-release" | "stopped" | "error";
+export type ResidentExitReason = "idle-exit" | "dormant" | "handover-release" | "stopped" | "error";
 
 /**
  * Names this host's exit in the root's launcher.log, in the launcher's trace
@@ -2041,7 +3047,9 @@ export type ResidentExitReason = "idle-exit" | "handover-release" | "stopped" | 
  * this filesystem (owner.json unlink), so this adds no new stall class; an
  * async or timed write could land after the release (#2010). The residual
  * window between owned() and the open is a few syscalls, reachable only by a
- * same-uid process; closing it needs an fd-relative open (smarty-dev#7950).
+ * same-uid process. This line is the human-readable copy; the durable record is
+ * the generation's exit.json (generation-exit.ts), which has no such window
+ * because its path is private to this generation (smarty-dev#7950).
  */
 export const reportResidentExit = (residencyRoot: string, reason: ResidentExitReason,
   owned: () => boolean = () => true, constants: Partial<typeof fs.constants> = fs.constants): void => {
@@ -2077,16 +3085,24 @@ const runResidentHost = async (
   config: ResidentHostConfig,
   signal?: AbortSignal,
   modelRegistry?: PiModelRegistryView,
+  processWorkSessionId = config.sessionId,
 ): Promise<void> => {
   let finishIdle: ((reason: ResidentExitReason) => void) | undefined;
   const idle = new Promise<ResidentExitReason>((resolve) => {
     finishIdle = resolve;
   });
   let reason: ResidentExitReason | undefined;
-  const host = new ResidentHost(config, (idleReason = "idle-exit") => finishIdle?.(idleReason), modelRegistry, residentHostLaunchContext(config));
+  const host = new ResidentHost(config, (idleReason = "idle-exit") => finishIdle?.(idleReason), modelRegistry,
+    residentHostLaunchContext(config), processWorkSessionId);
   // The last act before close releases owner.json (smarty-dev#1882).
-  host.beforeRelease = (failure, owned) =>
-    reportResidentExit(config.residencyRoot, failure === undefined ? reason ?? "error" : "error", owned);
+  host.beforeRelease = (failure, owned) => {
+    const exitReason = failure === undefined ? reason ?? "error" : "error";
+    reportResidentExit(config.residencyRoot, exitReason, owned);
+    // The durable record: generation-private, created once, so the launcher writes none for this exit. The
+    // path is never another generation's, so owned() only keeps a host that never owned the root from writing.
+    if (owned()) recordResidentGenerationExit(config.residencyRoot,
+      { format: 1, generation: host.generation, writer: "host", reason: exitReason, pid: process.pid, at: Date.now() });
+  };
   await host.start();
   if (signal?.aborted) {
     reason = "stopped";
@@ -2109,23 +3125,24 @@ export const runResidentHostFromConfigPath = async (
   configPath: string,
   signal?: AbortSignal,
   modelRegistry?: PiModelRegistryView,
+  processWorkSessionId?: string,
 ): Promise<void> => {
   let config: ResidentHostConfig | undefined;
+  // Capture before ResidentHost's constructor consumes the launcher env; the
+  // startup catch still reports against the exact generation that was chosen.
+  const generation = process.env.PI_FABRIC_RESIDENT_GENERATION;
   try {
     config = validateResidentHostConfig(readJson<unknown>(configPath), configPath);
-    await runResidentHost(config, signal, modelRegistry);
+    await runResidentHost(config, signal, modelRegistry, processWorkSessionId);
   } catch (error) {
     if (error instanceof ResidentHostAlreadyRunning) return;
     const residencyRoot = config?.residencyRoot ?? path.dirname(configPath);
-    try {
-      atomicWrite(path.join(residencyRoot, "error.json"), {
-        error: errorMessage(error),
-        occurredAt: Date.now(),
-        launcherPid: process.env.PI_FABRIC_RESIDENT_LAUNCHER ? process.ppid : undefined,
-        launcherBirth: process.env.PI_FABRIC_RESIDENT_LAUNCHER ? processStartTime(process.ppid) : undefined,
-      });
-    } catch {
-      // Startup diagnostics are best-effort.
+    // The launcher prepares generations/ before spawning us. Startup diagnostics are generation-private,
+    // so ownership of owner.json is irrelevant; direct hosts never create the directory on failure.
+    if (generation && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(generation)) {
+      const launcherBirth = process.env.PI_FABRIC_RESIDENT_LAUNCHER ? processStartTime(process.ppid) : undefined;
+      recordResidentGenerationError(residencyRoot, { format: 1, generation, writer: "host", error: errorMessage(error),
+        occurredAt: Date.now(), pid: process.pid, ...(launcherBirth ? { launcherBirth } : {}) });
     }
     throw error;
   }

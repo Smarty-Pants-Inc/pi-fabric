@@ -12,6 +12,8 @@ import { DurableTaskRegistry } from "../src/jev-fabric/registry.js";
 import { createMeshGrant, listMeshGrants, meshCliArgv, wrapDurableNotifyScript } from "../src/mesh/grants.js";
 import { MeshStore } from "../src/mesh/store.js";
 import { PiToolsProvider } from "../src/providers/pi-tools-provider.js";
+import { CapturedToolCatalog } from "../src/capture/catalog.js";
+import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { TasksProvider } from "../src/providers/tasks-provider.js";
 import type { FabricInvocationContext } from "../src/protocol.js";
 
@@ -34,7 +36,7 @@ const environment = () => {
   return { root, binary, home, agentDir };
 };
 
-const session = (env: ReturnType<typeof environment>, ownerId = "durable-session") => {
+const session = (env: ReturnType<typeof environment>, ownerId = "durable-session", catalog?: CapturedToolCatalog) => {
   const store = new FabricShellJobStore();
   stores.push(store);
   store.durable = new DurableShellBridge(store, {
@@ -42,7 +44,10 @@ const session = (env: ReturnType<typeof environment>, ownerId = "durable-session
     settings: () => ({ binary: env.binary, home: env.home, timeoutMs: 60_000 }),
     middleware: () => undefined,
   });
-  const provider = new PiToolsProvider(env.root, undefined, undefined, { powerShellToolDefinitionFactory: undefined, shellJobs: store });
+  // Test-only allowUnhookedTools when no extension runner is given (smarty-dev#8606 fails closed otherwise).
+  const provider = new PiToolsProvider(env.root, catalog, undefined, {
+    powerShellToolDefinitionFactory: undefined, shellJobs: store, allowUnhookedTools: catalog === undefined,
+  });
   const registry = new ActionRegistry();
   registry.register(provider);
   const context = {
@@ -71,6 +76,29 @@ describe.skipIf(process.platform === "win32")("durable shell tasks through jev-f
     // A terminal job no longer needs its session binding or launch script.
     await vi.waitFor(async () => expect(await new DurableTaskRegistry(path.join(env.agentDir, "fabric")).all()).toEqual([]));
     expect(fs.readdirSync(path.join(env.agentDir, "fabric", "durable-shell"))).toEqual([]);
+  });
+
+  it("judges a durable command through the bash tool_call guard before jev-fabric launches it (smarty-dev#8606)", async () => {
+    const env = environment();
+    const marker = path.join(env.root, "ran");
+    const seen: Array<Record<string, unknown>> = [];
+    const runner = {
+      createContext: () => ({ cwd: env.root }),
+      getActiveTools: () => [],
+      emit: vi.fn(async () => {}),
+      emitToolResult: vi.fn(async () => undefined),
+      emitToolCall: vi.fn(async (event: { toolName: string; input: Record<string, unknown> }) => {
+        seen.push({ toolName: event.toolName, ...event.input });
+        return { block: true, reason: "guard refused the durable command" };
+      }),
+    };
+    const catalog = new CapturedToolCatalog();
+    catalog.replace([], runner as never, DEFAULT_FABRIC_CONFIG.capture, "/extensions/pi-fabric/index.ts");
+    const { store, bash } = session(env, "durable-session", catalog);
+    await expect(bash({ command: `printf ran > '${marker}'`, durable: true })).rejects.toThrow("guard refused the durable command");
+    expect(seen).toEqual([expect.objectContaining({ toolName: "bash", durable: true })]);
+    expect(store.live()).toEqual([]);
+    expect(fs.existsSync(marker)).toBe(false);
   });
 
   it("detaches on session close and reattaches the same task on resume", async () => {

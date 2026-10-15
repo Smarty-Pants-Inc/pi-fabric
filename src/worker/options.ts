@@ -63,6 +63,17 @@ export const parseWorkerOptions = (
 ): AgentWorkerOptions => {
   const args = argumentMap(argv);
   const model = optional(args, "model");
+  const promptSha256 = optional(args, "prompt-sha256");
+  const promptBytesSource = optional(args, "prompt-bytes");
+  const promptPath = optional(args, "prompt-path");
+  const inputSha256 = optional(args, "input-sha256");
+  const inputBytesSource = optional(args, "input-bytes");
+  const promptBytes = promptBytesSource === undefined ? undefined : Number(promptBytesSource);
+  const inputBytes = inputBytesSource === undefined ? undefined : Number(inputBytesSource);
+  if (promptSha256 !== undefined && !/^[a-f0-9]{64}$/.test(promptSha256)) throw new Error("Invalid worker prompt sha256");
+  if (inputSha256 !== undefined && !/^[a-f0-9]{64}$/.test(inputSha256)) throw new Error("Invalid worker input sha256");
+  if (promptBytes !== undefined && (!Number.isSafeInteger(promptBytes) || promptBytes < 0)) throw new Error("Invalid worker prompt byte count");
+  if (inputBytes !== undefined && (!Number.isSafeInteger(inputBytes) || inputBytes < 0)) throw new Error("Invalid worker input byte count");
   const modelReason = args.get("model-reason");
   const routeHeader = optional(args, "route-header");
   const routeClass = args.get("route-class");
@@ -130,6 +141,7 @@ export const parseWorkerOptions = (
   }
   const branch = optional(args, "branch");
   const worktree = optional(args, "worktree");
+  const tmpdir = optional(args, "tmpdir");
   const writePolicy = optional(args, "write-policy");
   const scope = optional(args, "scope");
   const lineage = optional(args, "lineage");
@@ -172,6 +184,7 @@ export const parseWorkerOptions = (
   const spawnerId = optional(args, "spawner-id");
   const spawnerKind = optional(args, "spawner-kind");
   const spawnerRun = optional(args, "spawner-run");
+  const spawnerName = optional(args, "spawner-name");
   if (spawnerId && spawnerKind !== "main" && spawnerKind !== "agent" && spawnerKind !== "actor") {
     throw new Error("Invalid worker spawner kind");
   }
@@ -221,6 +234,11 @@ export const parseWorkerOptions = (
     ...(kernel ? { kernel, pythonRuntime } : {}),
     name: required(args, "name"),
     taskFile: required(args, "task-file"),
+    ...(promptSha256 ? { promptSha256 } : {}),
+    ...(promptBytes !== undefined ? { promptBytes } : {}),
+    ...(promptPath ? { promptPath } : {}),
+    ...(inputSha256 ? { inputSha256 } : {}),
+    ...(inputBytes !== undefined ? { inputBytes } : {}),
     ...(imagesFile ? { imagesFile } : {}),
     statusFile: required(args, "status-file"),
     lifecycleFile: required(args, "lifecycle-file"),
@@ -239,6 +257,7 @@ export const parseWorkerOptions = (
     fullCodeMode: required(args, "full-code-mode") === "true",
     ...(mainAgentId ? { mainAgentId } : {}),
     ...(spawner ? { spawner } : {}),
+    ...(spawnerName ? { spawnerName } : {}),
     ...(fabricSessionId ? { fabricSessionId } : {}),
     extensions,
     tools: JSON.parse(required(args, "tools")) as string[],
@@ -278,6 +297,7 @@ export const parseWorkerOptions = (
     ...(childQuestionTimeoutMs !== undefined ? { childQuestionTimeoutMs } : {}),
     ...(branch ? { branch } : {}),
     ...(worktree ? { worktree } : {}),
+    ...(tmpdir ? { tmpdir } : {}),
     ...(writePolicy ? { writePolicy } : {}),
     ...(scope ? { scope } : {}),
     ...(lineage ? { lineage } : {}),

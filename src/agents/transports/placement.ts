@@ -7,6 +7,8 @@ import { executeFile } from "./process-utils.js";
 import { assertTransportLaunchAllowed } from "./launch-authority.js";
 import { taskAgentEnvironment } from "../task-environment.js";
 import { normalizeAgentRequires, RequiredInputMissingError } from "../input-validation.js";
+import { preflightFleetPlacement } from "./placement-preflight.js";
+export { placementLocalPathReason, selectFleetPlacement } from "./placement-preflight.js";
 
 interface Receipt { rc: number | string; text: string; stderr?: string }
 
@@ -37,7 +39,7 @@ const receipt = (input: unknown): Receipt | undefined => {
 /** One-shot task protocol. rc is a native-exit receipt, NOT the existence of result.md.
  * No timers/processes survive outside manager-owned launch/isAlive/stop operations.
  */
-export const launchPlacedTask = async (request: AgentTransportLaunch, config: AgentPlacementConfig): Promise<AgentTransportHandle> => {
+export const launchPlacedTask = async (request: AgentTransportLaunch, config: AgentPlacementConfig, preflightDeadline?: number, selectedHost?: string): Promise<AgentTransportHandle> => {
   const requires = normalizeAgentRequires(request.requires);
   const args = new Map<string, string>();
   for (let i = 0; i < request.workerArguments.length; i += 2) args.set(request.workerArguments[i]!, request.workerArguments[i + 1]!);
@@ -56,11 +58,13 @@ export const launchPlacedTask = async (request: AgentTransportLaunch, config: Ag
     id: request.id, cwd: request.cwd, task, minutes: String(Math.max(1, Math.ceil(timeoutMs / 60_000))),
     model: args.get("--model") ?? "", thinking: args.get("--thinking") ?? "high",
   };
-  const environment = taskAgentEnvironment();
+  let environment = taskAgentEnvironment();
   // The launcher binds its inbox notification to the Pi caller, not this child.
   environment.PI_SESSION_ID = args.get("--fabric-session-id") ?? environment.PI_SESSION_ID;
+  const prepared = await preflightFleetPlacement(request, config, config.command.map(entry => render(entry, values)), task, environment, preflightDeadline, selectedHost);
+  if (prepared) environment = prepared.environment;
   const command = async (template: string[], limit = config.commandTimeoutMs, signal?: AbortSignal, extraArguments: string[] = []) => {
-    const argv = template.map(entry => render(entry, values));
+    const argv = template === config.command && prepared ? [...prepared.command] : template.map(entry => render(entry, values));
     // The fleet launcher's current repeatable preflight flag is --require.
     // Keep paths literal and before the prompt separator, never as task text.
     const separator = argv.indexOf("--");
@@ -157,6 +161,7 @@ export const launchPlacedTask = async (request: AgentTransportLaunch, config: Ag
   // Rendering/read errors above are prelaunch. After exec starts, failure cannot
   // prove that nothing ran remotely: retain custody and never spawn locally.
   assertTransportLaunchAllowed(request);
+  request.onWritePolicyDisposition?.("remote");
   try {
     let output: string;
     try { output = (await command(config.command, config.commandTimeoutMs, request.signal, (requires ?? []).flatMap(file => ["--require", file]))).stdout; }
@@ -174,7 +179,7 @@ export const launchPlacedTask = async (request: AgentTransportLaunch, config: Ag
       return handle;
     }
     const accepted = output.match(/^RYZEN2_TASK_ACCEPTED ([A-Za-z0-9._-]+) on ([A-Za-z0-9][A-Za-z0-9._-]*)\b/m);
-    if (!accepted || accepted[1] !== request.id) {
+    if (!accepted || accepted[1] !== request.id || prepared && accepted[2] !== prepared.host) {
       debt = "Placement launch outcome unknown: missing or mismatched RYZEN2_TASK_ACCEPTED receipt";
       request.onUnconfirmedExit?.(debt);
       save("failed", "", debt);
@@ -197,6 +202,9 @@ export const launchPlacedTask = async (request: AgentTransportLaunch, config: Ag
     // Reuse the manager's unknown-launch fence; never release or relaunch it.
     throw Object.assign(error instanceof Error ? error : new Error(String(error)), {
       launchOutcome: "unknown", cleanupPending: true, transport: "process", sessionId: handle.sessionId,
+      // pi-fabric#939 round 3: the launched process's own close event (manager-owned), so a held permit is
+      // re-checked when it exits, without polling.
+      ...(handle.closed ? { closed: handle.closed } : {}),
     });
   }
 };

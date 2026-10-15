@@ -18,11 +18,12 @@ it.each((["warn", "enforce"] as const).flatMap(mode =>
   for (const name of Object.keys(process.env)) if (name.startsWith("PI_FABRIC_")) vi.stubEnv(name, undefined);
   vi.stubEnv("PI_FABRIC_PROJECT_ROOT", root); vi.stubEnv("PI_CODING_AGENT_DIR", path.join(root, "agent"));
   const sessionId = "7514aaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+  const notify = vi.fn();
   const ctx = () => ({ cwd: root, hasUI: true, mode: "rpc", model: { provider: "faux", id: "m1" },
     isIdle: () => true, hasPendingMessages: () => false, isProjectTrusted: () => true, abort: () => {},
     modelRegistry: { getAvailable: () => [], find: () => undefined },
     sessionManager: { getSessionId: () => sessionId, getSessionFile: () => undefined, getBranch: () => [],
-      getLeafId: () => null, getEntries: () => [] }, ui: { setStatus: () => {}, notify: () => {} } }) as unknown as ExtensionContext;
+      getLeafId: () => null, getEntries: () => [] }, ui: { setStatus: () => {}, notify } }) as unknown as ExtensionContext;
   const sendMessage = vi.fn();
   const host = { on: () => () => {}, events: { emit: () => {}, on: () => () => {} }, sendMessage,
     appendEntry: () => {}, getThinkingLevel: () => "off", getSessionName: () => "incarnation-main" } as unknown as ExtensionAPI;
@@ -75,6 +76,7 @@ it.each((["warn", "enforce"] as const).flatMap(mode =>
     expect(ownerPlanes[1]!.options.controlIncarnationFence).toBe(mode);
     sendMessage.mockClear();
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    notify.mockClear();
     await mesh.publish({ topic: "fabric.control.command", kind: "steer", from: { id: "session:legacy", name: "Legacy", kind: "main" }, to: fresh.ownerHostId,
       data: { version: 1, commandId: "legacy-main", targetId: fresh.id, operation: "steer", replyTo: "session:legacy", message: "old-release Main sender",
         triggerTurn: false, requestedAt: Date.now(), deadlineAt: Date.now() + 5_000 } });
@@ -83,8 +85,10 @@ it.each((["warn", "enforce"] as const).flatMap(mode =>
     const legacyAck = mesh.read({ topic: "fabric.control.ack" }).find(event => (event.data as { commandId: string }).commandId === "legacy-main")!.data;
     expect(legacyAck).toMatchObject(mode === "warn" ? { accepted: true } : { accepted: false, errorCode: CONTROL_STALE_INCARNATION, staleIncarnation: null });
     expect(sendMessage).toHaveBeenCalledTimes(mode === "warn" ? 1 : 0);
-    expect(warn).toHaveBeenCalledTimes(mode === "warn" ? 1 : 0);
-    if (mode === "warn") expect(warn.mock.calls[0]![0]).toContain('count=1 sender="session:legacy"');
+    // With a live UI the warning goes to ui.notify, never to stdout/stderr.
+    expect(notify).toHaveBeenCalledTimes(mode === "warn" ? 1 : 0);
+    if (mode === "warn") expect(notify).toHaveBeenCalledWith(expect.stringContaining('count=1 sender="session:legacy"'), "warning");
+    expect(warn.mock.calls.filter(call => String(call[0]).includes("Unfenced legacy sender"))).toEqual([]);
   } finally {
     await sender.close(); await pending;
     for (const runtime of runtimes.reverse()) await runtime.shutdown("exit");

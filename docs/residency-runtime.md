@@ -69,8 +69,125 @@ runner session. Shared work must use mesh state, files, or an explicit external
 channel. Residency only keeps the execution owner available for later control
 and reconnection.
 
-The host exits after its normal idle grace once it owns no live durable actor or
-running durable agent.
+## Dormant actors and delivery-owned wake (#6782 / #7299)
+
+A durable actor with no in-flight activation, queued/overflow/parked/dead-letter
+work, pending ask/reset/removal, or child reply/archive custody becomes
+`dormant`. Its registry identity, subscriptions and session transcript stay on
+disk. Activation workers already close at settlement; dormancy also drops the
+completed drain and child-inbox runtime references. A new delivery returns the
+actor to `queued`, restores its transcript, and uses its ordinary serial drain.
+Session-resident actors are unchanged. A live Main's event/directive supervisor
+and actors subscribed to still-live participants are expected, not idle.
+Startup/reload, open tool calls, running tasks and pending host obligations also
+block dormancy. A process-backed call stays busy until its real tool promise
+settles, even if cancellation has already returned to its caller. These holds
+use session IDs, not retired Pi contexts, and survive a same-process reload.
+A new runtime restores non-stopped actors as idle and rechecks eligibility under
+its own work and owner custody; it does not inherit the old host's idle decision.
+
+A host with only dormant/stopped actors, no running task, and no pending
+request, response/publication or delivery-outbox obligation exits after the
+existing **30-second** `IDLE_EXIT_MS` grace. This constant amortizes
+close/delivery races; it is not a worker keep-warm policy. Before exit the host
+pauses admission, checkpoints control/lifecycle and actor queues/cursors, and
+confirms the actor mesh monitor is caught up. An unconsumed event or new request
+cancels sleep. `config.json`, registry/session files, `wake-routes.json` and
+cursors survive; `owner.json` and the live processes do not.
+
+This is the dormancy-only split of [PR #704](https://github.com/Smarty-Pants-Inc/pi-fabric/pull/704).
+The existing **50 ms request poll**, **100 ms V2 request-maintenance interval**,
+retention overlay and collector behavior are unchanged. The idle request-polling
+and maintenance-timer rework is separate
+[smarty-dev#7885](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/7885).
+Actor changes/final drain settlement, agent settlement, delivery-outbox drain and
+actor presence-publication completion drive dormancy eligibility. Each event's
+check commits eligible dormancy directly after proving native wake support and
+revalidating current actor work and live-participant protection. There is no
+actor quiet period, dormancy timeout, timed safety recheck or periodic retry;
+these signals do not replace the existing request polling.
+Dormancy also requires canonical JSON equality of the **entire** persisted
+`config.json` and the host's exact restart configuration. Object key ordering is
+irrelevant; no field is ignored, including `actorRoot`, `sessionActorRoot`,
+`mesh.actorScope` and future authority-bearing fields. Any difference or an
+unreadable snapshot keeps the actor/host resident and logs a one-line reason.
+`wake-routes.json` retains that complete canonical config snapshot. Dormant
+admission, delivery-owned launch and each successor start re-check equality;
+a mismatch refuses with `ResidentWakeConfigMismatch`
+(`RESIDENT_WAKE_CONFIG_MISMATCH`) without changing actor definitions. The
+archive-coupled index still retains deliveries while config is refused, so a
+later config repair and delivery event can retry without losing the cursor.
+Old route snapshots without the config fence cannot authorize a wake. Explicit
+client starts still use the ordinary resident startup protocol.
+A throwing idle-check `queueMicrotask` enqueue clears its queued flag, allowing
+the next eligibility event to schedule (smarty-dev#7988).
+The proven native watcher belongs to that host lifetime. Close joins its native
+`close` event, any failed/replaced watch handles and outstanding eligibility
+proof before releasing the owner. Concurrent close callers join the same
+teardown. A successor proves its own watcher, and Windows directory removal
+cannot race a still-closing watched-directory handle.
+
+`MeshStore.publish`/`publishBatch` route wake nudges **after** the existing event
+log durability barrier. Topic/address matches, direct control targets, and
+lifecycle subscriptions select a retained residency configuration. A durable
+`wake-request.json` nudge starts the existing launcher with `--wake`; the nudge
+is not another inbox. One POSIX `wake.lock` serializes delivery-triggered native
+wake starts. Explicit/client starts retain the ordinary kernel-fenced startup
+protocol, including an already-admitted watchdog challenger; they are not silently
+suppressed by `wake.lock`. A short `wake-intent.lock` serializes durable request writes
+with the launcher's final request/sleep snapshot **and release of `wake.lock`**.
+A commit after that snapshot cannot write its nudge until lifetime custody is
+released, so its launcher cannot lose the wake by finding a departing lock holder.
+The child-owning launcher joins the native `ChildProcess` exit receipt. An external
+pre-upgrade closing owner and explicit readiness waits use `fs.watch` with one
+bounded failure deadline. The sleep receipt covers earlier nudges, so no launcher
+remains warm after clean sleep. There is no polling hostd. The live client
+watchdog explicitly ignores dormant definitions.
+
+Wake failures are isolated per residency root. A spawn failure leaves its durable
+request intact; `wake-failure.json` also retains the delivery reference if writing
+intent fails. The next committed delivery retries pending/failed intent even when
+its own topic is unrelated, and an explicit launcher start drains the archived
+backlog normally. No periodic retry service is added. If storage cannot persist
+either intent nor the failure receipt, the archive-coupled unacknowledged watermark
+remains pending; the already-committed archive remains the delivery authority.
+This is reported, not represented as a successful wake.
+
+Direct steer/followUp/ask never wakes during preflight. `wake-routes.json` retains
+the host's published participant advertisement for dormant admission,
+bound to the exact registry root, actor ownership token and resident host. This
+is retained routing authority, not a live lease. Directory availability, owner,
+capability, binding and ACK/control-channel checks run before command publication;
+the existing control plane also checks its admission state before committing.
+Only the admitted durable command's post-commit hook wakes the owner. Rejected
+pre-publication requests write no wake request and start no host. The waking host
+revalidates ownership/binding and uses the existing claim, outcome and ACK path;
+no direct preflight or fabricated ACK constitutes accepted delivery. Older route
+snapshots without a published advertisement cannot grant dormant direct admission.
+
+The woken host runs under its own fresh owner incarnation, with no exception for
+the retained route's older epoch: it refuses the waking command with
+`FABRIC_CONTROL_STALE_INCARNATION` before any claim or handler, and once live it
+rewrites `wake-routes.json` with its own published advertisement. The sending
+router then re-reads that actor's participant once and, only when the same owner
+and actor lineage advertise a different epoch, resends once with the same
+idempotency key. The key keeps the command ID, so the owner's claim answers any
+duplicate with the one outcome. A second refusal, or a refusal from a target that
+was not resolved from a retained dormant route, reaches the caller unchanged.
+
+Before sleeping an actor-bearing host, residency ensures the existing file event
+archive is enabled under the mesh publication lock. It preserves an operator-selected
+archive, or creates `<mesh>/wake-archive` plus `event-archive.json` when the mesh
+previously had only a bounded live log. A bad/unavailable archive cannot authorize
+sleep. This is wake archive configuration, not a request-retention collector change,
+new inbox or state backend. Sleeping resident monitors replay subscribed ordinary
+topics from that archive as well as `fleet.*`; a replay-age window cannot drop
+sleeping work. Clean sleep/wake retains the existing queue dedupe and cursor
+boundaries, so wake-window deliveries drain once in order (unless the actor
+explicitly opts into coalescing). Crash/interrupted-run retry semantics are
+unchanged; this does not promise exactly-once external effects across arbitrary
+process crashes. Automatic wake uses the existing POSIX fence; durable Windows
+Pi launch remains unsupported as noted below. File-backed state remains the authority.
 
 ### PR #394 scope cut: recovery supervision deferred
 
@@ -84,7 +201,7 @@ checked whole-attempt exit and completed-drain proofs before recovery admission.
 
 ### Owner incarnation fencing
 
-A resident's root-derived host ID (`residentHostId(rootId)`) and durable actor IDs survive relaunch, and a relaunched host replays the control log from offset 0, so a stop or ask meant for the previous process could otherwise reach a durable actor's next turn. Its control-owner incarnation does not survive: each new activation stamps its participant records and claims with a fresh random epoch. Predecessor-addressed unclaimed controls (`stop`, `ask`, `steer`, `followUp`, cancellation) are refused before actor admission. The caller must re-resolve the advertised epoch and explicitly decide whether a fresh request is still wanted; there is no stale automatic resend. Senders addressing older resident releases with no published epoch retain the existing unfenced delivery path with a counted warning. Execution refusals use `FABRIC_CONTROL_STALE_INCARNATION`, while recorded predecessor outcomes retain their original epoch and are never re-executed. See [owner incarnation fencing](agents.md#owner-incarnation-fencing) for sender retry decisions, ACK matching, and the host-only `mesh.controlIncarnationFence` rollout policy: `"warn"` (default) admits older senders omitting an epoch with a counted sender-named warning at most once per hour; `"enforce"` refuses omission after every host has upgraded. Explicit stale epochs are refused in both modes.
+A resident's root-derived host ID (`residentHostId(rootId)`) and durable actor IDs survive relaunch, and a relaunched host replays the control log from offset 0, so a stop or ask meant for the previous process could otherwise reach a durable actor's next turn. Its control-owner incarnation does not survive: each new activation stamps its participant records and claims with a fresh random epoch. Predecessor-addressed unclaimed controls (`stop`, `ask`, `steer`, `followUp`, cancellation) are refused before actor admission, with no exception for a woken dormant actor's retained route. The caller must re-resolve the advertised epoch and explicitly decide whether a fresh request is still wanted; the only automatic resend is the router's single same-key resend of a message it addressed to a retained dormant route (see [dormant wake](#dormant-actors-and-delivery-owned-wake-6782--7299)). Senders addressing older resident releases with no published epoch retain the existing unfenced delivery path with a counted warning. Execution refusals use `FABRIC_CONTROL_STALE_INCARNATION`, while recorded predecessor outcomes retain their original epoch and are never re-executed. See [owner incarnation fencing](agents.md#owner-incarnation-fencing) for sender retry decisions, ACK matching, and the host-only `mesh.controlIncarnationFence` rollout policy: `"warn"` (default) admits older senders omitting an epoch with a counted sender-named warning at most once per hour; `"enforce"` refuses omission after every host has upgraded. Explicit stale epochs are refused in both modes.
 
 ### Lease-fenced consumption and accepted-work custody
 
@@ -136,6 +253,7 @@ resident `ownerHostId`.
 
 ## Known Windows limitation
 
+Generation-private startup errors use `generations/<uuid>.error.json` (seven-day retention preview only; apply remains disabled under smarty-dev#10678); publication stays closed on Windows because Node exposes no verified `O_NOFOLLOW` create/open path there.
 Durable residency E2E is POSIX-only today. On Windows, the launcher's spawn of
 the `pi` binary through the installed `node_modules/.bin` shims hangs before
 the child starts, so the resident host never starts.

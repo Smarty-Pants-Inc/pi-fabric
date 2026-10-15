@@ -14,7 +14,7 @@ import type {
   FabricToolPlacementMode,
   FabricToolPlacementResultV1,
 } from "../protocol.js";
-import type { ToolLoadout, ToolLoadoutChanges } from "@earendil-works/pi-coding-agent";
+import type { ToolExposure, ToolLoadout, ToolLoadoutChanges } from "@earendil-works/pi-coding-agent";
 
 // Hide every registered declaration, including historical transcript declarations,
 // except resolved foreground tools (full code mode only; enforce resolves none).
@@ -235,6 +235,34 @@ export const createToolOwnershipReassertion = (options: {
       queueMicrotask(reassert);
     },
   };
+};
+
+// Snapshot Pi's callable registered tools (smarty-dev#5492). Inactive direct
+// tools remain hidden: Fabric only adds fabric_exec to the active set and must
+// not undo an extension's setActiveTools removal (PR #567 review P2).
+// Pi 1.1 also calls registered `codemode`/`deferred` tools while inactive, but
+// never calls `hidden` tools (AgentSession._getCallableTools). Preserve the
+// existing active model-only capture route (e.g. native tool_search).
+// pi.getAllTools() metadata is already filtered by --tools/--exclude-tools:
+// add registered codemode/deferred tools and remove non-callable exposures.
+// Tools without reported exposure (older hosts, or no getAllTools) keep the
+// legacy active-only rule. Read failures propagate so the catalog fails closed.
+// Returns a per-read snapshot so one listing costs one host read of each list.
+type HostToolInfo = { readonly name: string; readonly exposure?: ToolExposure };
+
+export const hostToolVisibility = (
+  host: Pick<FabricToolOwnershipHost, "getActiveTools"> & {
+    getAllTools?: () => readonly HostToolInfo[];
+  },
+) => (): ((name: string) => boolean) => {
+  const offered = new Set(host.getActiveTools());
+  const registered: readonly HostToolInfo[] =
+    typeof host.getAllTools === "function" ? host.getAllTools() : [];
+  for (const tool of registered) {
+    if (tool.exposure === "hidden") offered.delete(tool.name);
+    else if (tool.exposure === "codemode" || tool.exposure === "deferred") offered.add(tool.name);
+  }
+  return (name) => offered.has(name);
 };
 
 export class FabricToolOwnership {

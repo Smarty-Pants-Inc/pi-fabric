@@ -1,5 +1,6 @@
 import type { Usage } from "@earendil-works/pi-ai";
 import { registerMainProviderRecovery } from "./main-provider-recovery.js";
+import { extensionContextLive } from "./session-liveness.js";
 import { registerIncomingMessageRenderers } from "./ui/incoming-messages.js";
 import { principalViewIncomingMode, registerPrincipalView } from "./ui/principal-view.js";
 import { rootInboxMessage, confirmedRootInboxSession, rootInboxSummary, ROOT_INBOX_CUSTOM_TYPE, type RootInboxBatch, type RootInboxReconcileOptions } from "./topology/root-inbox-shared.js";
@@ -45,6 +46,7 @@ import {
   effectiveToolCaptureConfig,
 } from "./config.js";
 import { registerLazyCompactionHook } from "./compaction/lazy-hook.js";
+import { registerLazyPerCallRouter } from "./agents/per-call-route-hook.js";
 import { COMPACTION_FAILED_ALARM, registerCompactionRecovery } from "./compaction/recovery.js";
 import { compactAtConfiguredThreshold, type AutoCompactionTrigger } from "./compaction/threshold.js";
 import type { CompactionOwnerObserver } from "./compaction/owner.js";
@@ -55,6 +57,7 @@ import {
   FabricToolLifecycle,
   FabricToolOwnership,
   fabricToolPlacement,
+  hostToolVisibility,
   ownsFabricToolSource,
 } from "./core/tool-ownership.js";
 import { readChildToolAllowlist } from "./core/child-tool-allowlist.js";
@@ -221,8 +224,9 @@ const reportInboxExpiry = async (pi: ExtensionAPI, inbox: RootInboxBatch | undef
   sendFabricMessage(pi, rootInboxSummary(inbox), { deliverAs: "followUp", triggerTurn: false });
 };
 
-// An idle Main reads its inbox this often (smarty-dev#1595). With the 60 s steer grace, an event
-// published to an idle Main starts a turn about 60-75 s later. PI_FABRIC_INBOX_WAKE_MS overrides it.
+// An idle Main reads its inbox on mesh-root file events and at the exact next grace/cooldown/lock
+// retry deadline (smarty-dev#1595, #4313), never on an interval: an event addressed to its exact
+// session id starts a turn at once; alias-addressed shadows keep the 60 s steer grace.
 // The idle wake needs a Pi that queues a triggered message behind a live prompt preflight;
 // otherwise a wake can start a run that makes a prompt in its preflight fail (#107 review F2).
 // Pi declares it on the extension API (pi.hostCapabilities, Smarty-Pants-Inc/pi#74 and #76), not through
@@ -238,11 +242,6 @@ const hostQueuesTriggeredBehindPreflight = (pi: ExtensionAPI): boolean => {
   return capabilities?.triggeredMessageQueuesBehindPreflight === true && capabilities.promptPendingVisible === true;
 };
 
-const inboxWakeMs = (): number => {
-  const value = Number(process.env.PI_FABRIC_INBOX_WAKE_MS);
-  return Number.isFinite(value) && value > 0 ? value : 15_000;
-};
-
 return async function piFabric(pi: ExtensionAPI, options: { managedHost?: FabricManagedHostOptions } = {}): Promise<void> {
   // A fixture must never construct Fabric state, capture auth or join an inherited mailbox.
   if (registerFabricFixture(pi)) return;
@@ -250,6 +249,16 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
   // this discovered copy; registering both makes Pi refuse to start (fabric_exec conflict).
   if (!options.managedHost && yieldsToExplicitFabric(FABRIC_EXTENSION_ENTRY_PATH)) return;
   registerFabricPrincipalCapture(pi);
+  // smarty-dev#6207: the Main names its sender; a Fabric worker child loads the same hook with -e.
+  // First-use import of the standalone hook file (a stable package-local path, as the worker's -e),
+  // so the resolver shared with lazy agent code stays out of the startup graph and its chunks.
+  if (!process.env.PI_FABRIC_PARENT_RUN?.trim() && !process.env.PI_FABRIC_ACTOR_ID?.trim()) {
+    const senderHeadersUrl = new URL(entryUrl.endsWith(".ts") ? "./guards/sender-headers.ts" : "./guards/sender-headers.js", entryUrl).href;
+    pi.on("before_provider_headers", async event => {
+      const { applySenderHeaders } = await import(senderHeadersUrl) as typeof import("./guards/sender-headers.js");
+      applySenderHeaders(event.headers, process.env, pi.getSessionName?.());
+    });
+  }
   if (!options.managedHost) registerJevAuth(pi);
   const codePreviewSettings = defaultCodePreviewSettings();
   const decorateShell: FabricToolShellDecorator = withCodePreviewShell;
@@ -289,8 +298,12 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
   );
   const pendingHandoffs = new Map<string, PendingFabricHandoff>();
   const toolOwnership = new FabricToolOwnership(pi);
+  // Tools an extension hid from Pi stay out of every Fabric listing, prompt and
+  // invocation, including while Fabric owns the model's tools (smarty-dev#5492).
+  capturedTools.setHostVisibility(hostToolVisibility(pi));
   const fabricUi = new FabricUiController(state, codePreviewSettings, {
-    getToolDefinition: (name) => name === "fabric_exec" ? fabricTool : capturedTools.get(name)?.definition,
+    // Rendering past calls needs the definition even when the tool is now hidden.
+    getToolDefinition: (name) => name === "fabric_exec" ? fabricTool : capturedTools.getRegistered(name)?.definition,
     get markdownTransformers() { return capturedTools.runner?.getMarkdownTransformers(); },
     getMessageRenderer: (type) => capturedTools.runner?.getMessageRenderer(type),
   });
@@ -309,7 +322,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
   const hiddenCapturedToolNames = (): Set<string> => {
     const visible = new Set(capturePolicy().keepVisible);
     return new Set(
-      capturedTools.list().map((entry) => entry.name).filter((name) => !visible.has(name)),
+      capturedTools.listRegistered().map((entry) => entry.name).filter((name) => !visible.has(name)),
     );
   };
   // Pi auto-activates tools that newly appear in the registry on every tool
@@ -438,7 +451,10 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
   const fabricToolLifecycle = new FabricToolLifecycle(
     () => ownsFabricToolSource(pi.getAllTools(), FABRIC_EXTENSION_ENTRY_PATH),
     () => state.initialized ? state.execution.authorizer : undefined,
-    () => state.initialized ? directToolApproval : undefined,
+    // Approval needs only bootstrapped config and session grants, not the lazy
+    // runtime: gating on activation let direct calls skip policy until the
+    // first fabric_exec, then deny the same call afterwards.
+    () => state.bootstrapped ? directToolApproval : undefined,
     () => ownsRunReplyTool(pi.getAllTools()),
   );
 
@@ -453,6 +469,8 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     initialPolicy: inactiveCapturePolicy,
     onCatalogRefresh: () => {
       scheduleOwnershipReassert();
+      // Pi settles the active set after the registry callback; re-read it then.
+      queueMicrotask(() => capturedTools.revalidateHostVisibility());
     },
   });
   registerHandoffCompletionRenderer(pi);
@@ -487,10 +505,12 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
   // such as arrow keys) halts every persistent actor — aborting in-flight runs
   // and cancelling queued work — and arms a stop-the-world gate that freezes
   // host-event and mesh dispatch so the interrupted actors are not re-armed by
-  // the interrupt's own turn_end / agent_settled events. The gate lifts when the
-  // user resumes by sending a new message (the "input" host event). Escape is
-  // observed but not consumed, so Pi's native cancel-streaming still fires;
-  // single ESC therefore stops the current turn and the advisor/supervisor
+  // the interrupt's own turn_end / agent_settled events. Main keeps its own halt:
+  // only non-extension user input or a fresh verified direct peer-root steer
+  // after Main is idle can resume it. Peer followUps stay passive. Peer wake does
+  // not lift the global actor/Jev/advisor stop-world gate; that still needs user
+  // input. Escape is observed but not consumed, so Pi's native cancel-streaming
+  // still fires; single ESC stops the current turn and the advisor/supervisor
   // actors and event-driven Jev observers at once. Jev observers are cancelled,
   // not automatically restarted. Also works without mesh. ui.haltOnEscape opts out.
   let haltOnEscapeUnsubscribe: (() => void) | undefined;
@@ -601,9 +621,6 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
   // (pi-coding-agent docs/sdk.md), and Pi exposes no dispose hook; every getter of a stale context throws.
   // A compile scheduled by a disposed session stops before it reads or writes the agent dir, which may
   // already be the next session's.
-  const contextLive = (context: ExtensionContext): boolean => {
-    try { void context.hasUI; return true; } catch { return false; }
-  };
 
   interface EntropyCompileRequest {
     context: ExtensionContext;
@@ -619,7 +636,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
   ): Promise<boolean> => {
     const current = (): boolean =>
       !signal.aborted && epoch === entropyLifecycleEpoch && state.initialized &&
-      state.config.entropy.compile && contextLive(context);
+      state.config.entropy.compile && extensionContextLive(context);
     if (!current()) return false;
     const entropy = await import("./entropy/index.js");
     if (!current()) return false;
@@ -675,6 +692,9 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     });
     if (!current()) return false;
     if (outcome.status === "compiled" && outcome.artifact) {
+      // Proof-checked plans are usable now, before the persist waits on another process's compiled.lock (its retry
+      // budget is timer-bound and slow on Windows); the persisted file replaces it below once saved.
+      if (current()) setActiveCompiledSurface(outcome.artifact);
       try {
         const saved = await saveCompiledSurfaceAsync(agentDir, outcome.artifact);
         if (current()) {
@@ -691,9 +711,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
         }
       } catch (error) {
         if (!(error instanceof FileLockTimeoutError)) throw error;
-        // Proof-checked plans are usable now; durable persistence can catch up
-        // later without blocking this session on another process's writer.
-        if (current()) setActiveCompiledSurface(outcome.artifact);
+        // Already active (above); durable persistence catches up later without blocking this session.
         retry = true;
       }
     }
@@ -719,7 +737,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
         }
         retry = await compileEntropyNow(request.context, request.epoch, request.signal);
       } catch (error) {
-        if (request.signal.aborted || !contextLive(request.context)) return;  // shutdown or dispose
+        if (request.signal.aborted || !extensionContextLive(request.context)) return;  // shutdown or dispose
         console.warn(
           `[pi-fabric] entropy compile failed: ${
             error instanceof Error ? error.message : String(error)
@@ -765,14 +783,15 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
   };
 
   // smarty-dev#1595: an idle Main takes the work events addressed to it without waiting for a
-  // turn, with the same call as a completed settle. The timer keeps the latest handler's context.
+  // turn, with the same call as a completed settle. The wake keeps the latest handler's context.
   // `settling` covers the settle handler: its own read and follow-up win, so a batch goes once.
   // A prompt in preflight (ctx.isPromptPending(), #111 review) takes the batch at its own turn
-  // start, so the timer never sends one then: each batch has one owner, the turn or the timer.
+  // start, so the wake never sends one then: each batch has one owner, the turn or the wake.
+  // `again` keeps a wake that arrived during a read (records and inbox share this reader).
   const inboxWake: {
-    timer?: ReturnType<typeof setInterval> | undefined; context?: ExtensionContext | undefined;
-    armed: boolean; reading: boolean; settling: boolean;
-  } = { armed: true, reading: false, settling: false };
+    context?: ExtensionContext | undefined;
+    armed: boolean; reading: boolean; settling: boolean; again: boolean;
+  } = { armed: true, reading: false, settling: false, again: false };
   // A host that declares promptPendingVisible has isPromptPending(); only a test's injected
   // capability on an older Pi lacks it.
   const hostSettling = (context: ExtensionContext): boolean =>
@@ -834,22 +853,24 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     for (const event of events) queuedRootInboxIds.set(event.id, rootInboxTurn);
   };
   const stopInboxWake = (): void => {
-    if (inboxWake.timer) clearInterval(inboxWake.timer);
-    inboxWake.timer = undefined;
+    // Closes the runtime's mesh-root watch and deadline timer; session_start arms them anew.
+    state.setRootInboxWake(undefined);
     inboxWake.context = undefined;
+    inboxWake.again = false;
     queuedRootInboxIds.clear();
     rootInboxRunSignal = undefined;
   };
+  // A busy, settling, preflight or cancelled Main is owned by its boundary, never timer-polled.
   const wakeIdleMain = async (): Promise<void> => {
     const context = inboxWake.context;
-    if (!context || !inboxWake.armed || inboxWake.reading || !state.initialized) return;
-    try {
-      context.isIdle();
-    } catch {
-      // A stale context (Pi disposed or replaced the session): this timer has no session left.
-      if (inboxWake.context === context) stopInboxWake();
-      return;
+    if (!context || !inboxWake.armed || !state.initialized) return undefined;
+    if (!extensionContextLive(context)) {
+      // A stale context (Pi disposed or replaced the session): this wake has no session left.
+      // Dispose emits no session_shutdown, so retire the session's delayed work here (smarty-dev#8881).
+      if (inboxWake.context === context) retireSessionTimers();
+      return undefined;
     }
+    if (inboxWake.reading) { inboxWake.again = true; return undefined; }
     // The host's whole settle counts, not only Fabric's handler (#111 review F4): a turn requested
     // then is deferred past every agent_settled handler, where neither the transcript nor
     // hasPendingMessages() shows it, and an earlier handler may still precede Fabric's disarm.
@@ -863,31 +884,49 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
       // A turn that started meanwhile takes the pending batch at its own start: never a second run.
       if (inbox?.events.length && idle()) {
         await deliverRootInbox(pi, inbox.events);
-        return;
+        return undefined;
       }
       // Records: the same gate, re-checked after the read (F21).
-      if (!idle()) return;
+      if (!idle()) return undefined;
       const records = await state.nextRecordsInboxMessage(context.sessionManager.getEntries()).catch(() => undefined);
       if (records && idle()) sendFabricMessage(pi, records, { deliverAs: "followUp", triggerTurn: true });
     } catch {
-      // A stale context (reload, session replacement) or a mesh error: the next tick or turn retries.
+      // A stale context (reload, session replacement) or a mesh error: the next event or turn retries.
     } finally {
       inboxWake.reading = false;
+      if (inboxWake.again) {
+        inboxWake.again = false;
+        // Through the watch, so it coalesces; without one (no capable host), nothing is armed.
+        state.requestRootInboxWake();
+      }
     }
+    return undefined;
+  };
+
+  // The one synchronous teardown of this session's ctx-bound delayed work: session_shutdown runs it,
+  // and a timer that finds its ctx disposed (no shutdown event) runs it quietly (smarty-dev#8881).
+  // ponytail: the entropy compile is advisory and machine-wide; session JSONL stays the source
+  // of truth, so the next compile on this machine reads this session's final window. Waiting
+  // for it here kept `pi -p` alive 14-98 s re-reading other agents' multi-hundred-MB sessions
+  // (smarty-dev#2010). Abort it instead; every write is gated on current().
+  const retireSessionTimers = (): void => {
+    stopInboxWake();
+    entropyStopping = true;
+    clearEntropyRetry();
+    endEntropyLifecycle();
   };
 
   pi.on("session_start", async (event, context) => {
     await sealScope();
-    clearEntropyRetry();
+    // Retire the previous session's delayed work, then reopen entropy for this one.
+    retireSessionTimers();
     entropyStopping = false;
     fabricPrewarm = undefined;
-    stopInboxWake();
     // The pre-reload warning leaves with the redraw; say it again where the user can read it (smarty-dev#1882).
     const reloadNotice = takeReloadStoppedNotice(context.sessionManager?.getSessionId?.() ?? "", event?.reason ?? "");
     if (reloadNotice && context.hasUI) context.ui.notify(reloadNotice, "warning");
     inboxWake.context = context;
     inboxWake.armed = true;
-    endEntropyLifecycle();
     pendingHandoffs.clear();
     directToolApproval.clear();
     toolDisplay.clear();
@@ -910,11 +949,9 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     await state.bootstrap(context);
     principalView.start(context);
     // Inert until Pi queues a triggered message behind a live prompt preflight (also for records, F21).
-    state.setRecordsWake(hostQueuesTriggeredBehindPreflight(pi) ? () => wakeIdleMain() : undefined);
-    if (hostQueuesTriggeredBehindPreflight(pi)) {
-      inboxWake.timer = setInterval(() => void wakeIdleMain(), inboxWakeMs());
-      inboxWake.timer.unref?.();
-    }
+    state.setRecordsWake(hostQueuesTriggeredBehindPreflight(pi) ? wakeIdleMain : undefined);
+    // Event-driven: armed by the runtime only once it is current and its mesh activation completed.
+    state.setRootInboxWake(hostQueuesTriggeredBehindPreflight(pi) ? wakeIdleMain : undefined);
     // A Fabric child narrows its level into the parent's inherited bounds.
     if (process.env[FABRIC_THINKING_BOUNDS_ENV] !== undefined && state.bootstrapped) {
       try {
@@ -1035,9 +1072,12 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
       try {
         // All outcomes acknowledge confirmed work, even if another settle operation threw.
         // Only a successful completed settle may admit new work and trigger a continuation.
-        await reconcileRootInbox(context, { commitOnly: !completed });
+        await reconcileRootInbox(context, { commitOnly: !completed, priority: completed });
       } finally {
         inboxWake.settling = false;
+        // One event-driven post-handler request, not repeated checks of the host's settle flag.
+        // A new turn/preflight/cancel still owns its boundary; the callback rechecks all gates.
+        setImmediate(() => { if (state.initialized && inboxWake.context === context) state.requestRootInboxWake(); });
       }
     }
   });
@@ -1341,6 +1381,13 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     },
   });
 
+  // Per-call model routing, shadow only (smarty-dev#2890): inert and unloaded unless
+  // agents.modelRouting.perCall.mode is "shadow"; never changes the model or the context.
+  registerLazyPerCallRouter(pi, () => {
+    const config = state.cwd ? state.config : state.provisionalConfig();
+    return { perCall: config.agents.modelRouting?.perCall, jev: config.jev };
+  });
+
   // No extractive module import, branch read or model call until explicit opt-in
   // reaches a real agent boundary. Context replay only reads the prepared view.
   let extractiveHistory: import("./memory/extractive-history.js").ExtractiveHistory | undefined;
@@ -1537,7 +1584,11 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     ) {
       return;
     }
-    const names = rewritableHiddenCapturedToolNames(hiddenCapturedToolNames());
+    // Only tools Fabric routes; an extension-hidden tool is not reachable (smarty-dev#5492).
+    const offered = new Set(capturedTools.list().map((entry) => entry.name));
+    const names = rewritableHiddenCapturedToolNames(
+      [...hiddenCapturedToolNames()].filter((name) => offered.has(name)),
+    );
     if (names.length === 0) return;
     const mentioned = proxyContractMentionsInSkills(
       event.prompt,
@@ -1562,7 +1613,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     inboxWake.context = context;
     inboxWake.armed = true;
     if (!state.initialized) return;
-    const inbox = await state.nextRootInbox(await inboxHeldBy(context)).catch(() => undefined);
+    const inbox = await state.nextRootInbox(await inboxHeldBy(context), undefined, { priority: true }).catch(() => undefined);
     await reportInboxExpiry(pi, inbox);
     if (!inbox) return;
     const events = inboxEventsToQueue(inbox);
@@ -1598,7 +1649,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
   });
 
   pi.on("session_shutdown", async (event, context) => {
-    stopInboxWake();
+    retireSessionTimers();
     const reason = event?.reason ?? "exit";
     let stopping = 0;
     try { stopping = state.initialized ? state.agents.runningCount() : 0; } catch { /* not initialized */ }
@@ -1609,13 +1660,6 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
         "warning",
       );
     }
-    // ponytail: the entropy compile is advisory and machine-wide; session JSONL stays the source
-    // of truth, so the next compile on this machine reads this session's final window. Waiting
-    // for it here kept `pi -p` alive 14-98 s re-reading other agents' multi-hundred-MB sessions
-    // (smarty-dev#2010). Abort it instead; every write is gated on current().
-    entropyStopping = true;
-    clearEntropyRetry();
-    endEntropyLifecycle();
     unsubscribeComponentRegistration();
     unsubscribeProviderRegistration();
     unsubscribeProviderWithdrawal();
@@ -1646,6 +1690,8 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
   let foregroundNoticeSession: string | undefined;
   pi.on("before_agent_start", (_event, context) => {
     reassertToolOwnership();
+    // An extension may have hidden or re-offered tools since the last turn.
+    capturedTools.revalidateHostVisibility();
     const foreground = state.foregroundTools();
     if (foreground.refused.length === 0) return;
     const sessionId = context.sessionManager?.getSessionId?.() ?? "";

@@ -24,6 +24,7 @@ Only these keys are consumed from root policy; other settings remain in the ordi
   "executor": { "landlock": { "mode": "enforce", "disabled": false, "allowEscape": false } },
   "agents": {
     "processSlice": "batch.slice",
+    "processMemoryMaxBytes": 25769803776,
     "deniedModels": ["provider/denied-model"],
     "modelPolicy": { "requireReason": ["gpt-6-astra"] }
   }
@@ -34,6 +35,7 @@ Only these keys are consumed from root policy; other settings remain in the ordi
 - `executor.landlock.mode`: an absent file (`ENOENT` before observing it) uses the built-in product default (`off`, with `disabled: false`), overlaid by a valid root policy. Present but unprovable policy (unreadable, unstable, invalid JSON/schema, or unsafe owner/mode/ancestry) selects strict `enforce`, `disabled: false`, and no escape grant. An observed file disappearing before open is invalid, not missing. Agent-dir and project `off` or unknown/permissive values are ignored, while `enforce` remains a tightening and applies. Only root policy may override the baseline with `off`; it cannot undo a session's agent/project tightening.
 - `executor.landlock.allowEscape`: only literal `true` in a valid root policy grants a leading `PI_FABRIC_LANDLOCK_ESCAPE=1` assignment or an explicit/inherited child environment value of `1` an unconfined per-command escape at the Bash Landlock launch boundary. Absent/false values deny it; invalid field types invalidate the policy; agent-dir and project values are always ignored. Without the grant repeated leading prefixes are stripped, the reserved variable is removed from child environment, the command stays confined under `enforce`, and one warning is logged per process. The flag is consumed even for granted commands, never implicitly forwarded to descendants. Granted escapes still require a pre-spawn journal entry and emit a visible notice. Live root revalidation revokes previously loaded grants when removed or when the file becomes missing/unsafe/unstable; no reload is needed.
 - `agents.processSlice`: only root policy may select/change the process-worker slice. Agent-dir and project values cannot override it.
+- `agents.processMemoryMaxBytes`: only root policy may change the per-task memory cap (default 24 GiB, `25769803776`). Agent-dir and project values are ignored, so they can neither relax nor tighten it. In the root policy file, a value that is not a positive safe integer fails policy validation, like an invalid `processSlice`. A cap too small to admit the worker fails launch; it never falls back to an uncapped task.
 - `agents.deniedModels`: root policy provides the baseline deny list. The agent-dir list is **unioned** with it; clearing the agent-dir list cannot remove a root deny. Root may remove its own denies, but any remaining agent-dir deny still tightens the result.
 - `agents.modelPolicy.requireReason`: defaults to `["gpt-6-astra"]`. Root policy may replace/relax this baseline (including `[]`); the agent-dir list is **unioned** with the root/default baseline and can only add requirements. Workspace lists remain ignored.
 
@@ -214,6 +216,8 @@ effective timeout = min(
 
 where absent values do not participate, and time spent inside a `humanWaitRefs` call is not counted. Outside interactive Main, orchestration programs (`agents.run` / `agents.wait` / `agents.ask`, `workflow.agent`, ...) keep their separate `agents.timeoutMs` floor, which is unaffected by `executor.maxTimeoutMs`. In interactive Main, the fixed `executor.mainMaxTimeoutMs` ceiling takes precedence over every source above; repeated host calls cannot extend it.
 
+`executor.powershell` (default `"refuse"`) gates PowerShell (smarty-dev#9826). By default `pi.powershell` is **refused**, and so is every captured or extension `powershell` override, whether it is reached through `pi.powershell` or `extensions.powershell`. The refusal names smarty-dev#9826 and happens before any `tool_call` hook or execution. The reason: no Fabric guard judges PowerShell grammar, and the fleet's command guards are bash-only. Showing them PowerShell source as a bash call is not a safety mechanism, because PowerShell-only spellings (for example `Set-Location <dir>; …`, the `&` call operator or `-EncodedCommand`) do not parse the way a bash guard reads them. Set `"powershell": "allow"` under `executor` in the host profile's `PI_CODING_AGENT_DIR/fabric.json` to opt in. The key is **host-only**: a workspace `.pi/fabric.json` cannot set or withdraw it. **The opt-in accepts that grammar gap.** With it, each call is first shown to guards as a `bash` `tool_call` (`input.shell: "powershell"`, a non-session `cwd` as a leading `cd`), then as the `powershell`-named `tool_call`. A block from either refuses the call. A hook that rewrites either input also refuses it, so the command runs only exactly as judged. Any other value refuses. Pi's own model-facing `powershell` tool, used outside full code mode, is not gated by this key.
+
 ## Full reference
 
 ```json
@@ -231,6 +235,7 @@ where absent values do not participate, and time spent inside a `humanWaitRefs` 
     "hostCallTimeouts": {},
     "humanWaitRefs": ["extensions.ask"],
     "shellHangMs": 120000,
+    "powershell": "refuse",
     "memoryLimitBytes": 67108864,
     "maxOutputChars": 100000,
     "maxNestedResultChars": 2000000,
@@ -318,6 +323,7 @@ where absent values do not participate, and time spent inside a `humanWaitRefs` 
     "sessionExportDir": "",
     "nice": 0,
     "deadRootFilter": { "mode": "off", "exempt": [] },
+    "stuckPreparingMs": 600000,
     "childQuestions": "cancel",
     "childQuestionTimeoutMs": 600000
   },
@@ -364,6 +370,7 @@ where absent values do not participate, and time spent inside a `humanWaitRefs` 
     "maxEventBytes": 262144,
     "maxReadEvents": 500,
     "actorPollMs": 250,
+    "residentIdleExitMs": 600000,
     "idleReadCoalesceMs": 5000,
     "actorQueueLimit": 32,
     "eventContextChars": 40000,
@@ -482,6 +489,69 @@ Each in-place handoff captures Main's active model at the boundary and restores 
   }
 }
 ```
+
+## Third-party model providers
+
+Fabric selects every model through Pi's model registry and ships no provider list of its own. The same `provider/id` keys work in `agents.model`, `models.aliases` (including fallback chains), `prewalk.model`, `approvals.model`, the `model` argument of `agents.run`, `agents.spawn`, `agents.create`, and `agents.handoff`, and the `/fabric settings` model pickers. A provider that Pi's `models.json` defines works without extension discovery. A provider that a Pi extension registers with `pi.registerProvider()` requires that extension to be enabled in the child as well as the parent.
+
+Credentials stay with Pi. Fabric hands a child agent only the model key, and the child resolves the credential through Pi as usual: a stored entry in `auth.json` (for example from `/login`), the environment variable the provider names, or the credential store. Fabric never puts keys on a child's command line or in its logs.
+
+With `extensions: false` (per call, or as `agents.extensions`), a Pi child loads none of the user's extensions, including their provider-registration code. Built-in models and models declared in Pi's `models.json` remain available. An extension-only provider requires an explicit `extensions: true` request and Pi's normal project-trust checks. Fabric does not probe provider-named paths or load other enabled extensions to find it: an isolated registration runtime is not a sandbox for module code. Unknown models fail before the task is sent, without a fallback model. Restricted judgment workers keep their fixed host-hook allowlist and never load a provider bridge. This covers both Pi runners (`pi-durable` and `pi`); strict model admission is unchanged. Claude, Veda, and custom runners use their own model catalogs and are unaffected.
+
+### Bundled Coral Bricks provider
+
+Fabric bundles the Coral Bricks provider extension, [`pi-coralbricks-provider`](https://www.npmjs.com/package/pi-coralbricks-provider), so `coralbricks/*` models are available after installing Fabric alone. Disclosure: Fabric's maintainers work at Coral Bricks.
+
+Add a key once, in either form:
+
+```sh
+/login coralbricks                # inside Pi; stores the key in auth.json
+export CORALBRICKS_API_KEY=...    # or in the environment
+```
+
+The provider registers keys such as `coralbricks/glm-5.3-fast` and `coralbricks/deepseek-v4.1-flash-fast`. Without a key it serves the model list shipped in the package and makes no network request. With a key it refreshes that list from Coral's API at session start and after `/login`. It loads as its own entry in Fabric's package (`node_modules/pi-coralbricks-provider/index.ts`), outside Fabric's startup graph, so `extensions: false` children resolve `coralbricks/*` models through the bridge above without loading Fabric's main extension.
+
+You can also install `pi-coralbricks-provider` yourself, for example to pick up a newer release before Fabric bundles it. When both copies load, the newest version registers the provider and the other one stays idle, so `/model` lists each model once.
+
+To leave the bundled provider out, replace the plain `npm:pi-fabric` entry in `~/.pi/agent/settings.json` (or a project's `.pi/settings.json`) with the package object form and exclude its path:
+
+```json
+{
+  "packages": [
+    { "source": "npm:pi-fabric", "extensions": ["!node_modules/pi-coralbricks-provider/**"] }
+  ]
+}
+```
+
+Fabric's own extension keeps loading. Use the same `source` you installed from (`git:github.com/fabric-runtime/pi-fabric` or a local path). After opting out, `coralbricks/*` models resolve only if you install the provider separately, and an `extensions: false` child that asks for one fails before the task is sent.
+
+Use the Coral Bricks keys wherever Fabric takes a model, for example in aliases that mix providers:
+
+```json
+{
+  "models": {
+    "aliases": {
+      "fast": ["coralbricks/deepseek-v4.1-flash-fast", "google/gemini-2.5-flash"],
+      "deep": { "model": "coralbricks/glm-5.3-fast", "thinking": "high" }
+    }
+  }
+}
+```
+
+Alias resolution uses the first target with a credential, so `fast` falls back to Gemini on a machine without a Coral Bricks key. A program can also run the same task on two providers side by side:
+
+```ts
+const task = "Summarize the error handling in src/worker.ts in five bullets.";
+const [coral, gemini] = await Promise.all([
+  agents.run({ model: "coralbricks/deepseek-v4.1-flash-fast", task, extensions: true }),
+  agents.run({ model: "google/gemini-2.5-flash", task, extensions: false }),
+]);
+return { coral: coral.text, gemini: gemini.text };
+```
+
+### Other providers
+
+Every other provider works the same way. Install its Pi extension with `pi install`, or define it in Pi's `models.json`, and its `provider/id` keys work in each place listed at the start of this section, including `extensions: false` children.
 
 ## Result formatting
 
@@ -605,7 +675,7 @@ A compatible exact-name core override is an additive extension of its existing `
 
 ## Approvals and risk
 
-Fabric risk classes are `read`, `write`, `execute`, `network`, and `agent`. Approval policy values are `allow`, `ask`, `auto`, or `deny`. Policies cover actions invoked inside `fabric_exec` and top-level model-requested tools left on Pi's native path. Native calls keep Pi's original implementation, result shape, and renderer. Fabric adds only the supported interception hook that runs before execution.
+Fabric risk classes are `read`, `write`, `execute`, `network`, and `agent`. Approval policy values are `allow`, `ask`, `auto`, or `deny`. Policies cover actions invoked inside `fabric_exec` and top-level model-requested tools left on Pi's native path. Native calls keep Pi's original implementation, result shape, and renderer. Fabric adds only the supported interception hook that runs before execution. The native-path check starts with the session, before Fabric's runtime activates on first use, so the same direct call gets the same answer before and after the first `fabric_exec`. `/fabric settings` and `/fabric reload` are commands, not tool calls, so a restrictive policy can always be changed in-session.
 
 - Captured and directly registered tools default to the conservative `execute` risk because Pi tool definitions do not declare effects. Add exact tool-name overrides under `capture.risks`. Fovea's verified graph-navigation tools (`fovea_sketch`, `fovea_focus`, `fovea_dwell`, and `fovea_impact`) are read-only exceptions that default to `read`.
 - `capture.hideFromModel` and `capture.keepVisible` remain accepted legacy preferences, but cannot override exclusive full-code or Schema enforce mode. Native active tools stay registered/callable while their declarations are hidden.
@@ -694,9 +764,9 @@ Fabric clears inactive run artifacts by age. It never truncates active JSONL fil
 - `retention.terminalRunEventsAgeMs`: after 6 hours (configurable, one hour to one year), the existing actor archive and resident request sweeps compact safe terminal (`completed`, `failed`, `stopped`, `timed_out`) `events.jsonl` files. Queued/live/unknown runs, unresolved workers, unsafe trees and actor `lastRunId` references are untouched.
 - `retention.terminalRunEventsMaxBytes`: retain at most 262144 bytes (256 KiB; configurable, 1 KiB to 16 MiB), including a JSON truncation marker and at most the last 200 complete trailing event lines. Compaction reads only a bounded suffix and writes atomically; it never changes `status.json`, reply/result files, or live recording. A single final event larger than the cap is dropped, so no invalid partial JSON is retained. Already bounded files are not rewritten. Ordinary actor `session.jsonl.<stamp>[-n].bak` rotation history keeps only the newest backup; malformed-session orphan backups remain recovery evidence.
 
-Run housekeeping begins on actual agent storage use (not manager startup), continues during use, and runs best-effort on close. It never truncates live run JSONL or actor `session.jsonl` files. Existing actor archive expiry and residency cleanup still apply after compaction; result files are never compacted. Caller-owned run roots retain their existing explicit-cleanup semantics. Symlink roots/markers, wrong-uid files, malformed ownership, unknown contents, and unverifiable incomplete descendants are preserved. `/fabric settings` exposes these values under **Retention**. Changing them requires `/fabric reload`.
+Run housekeeping begins on actual agent storage use (not manager startup), continues during use, and runs best-effort on close. It never truncates live run JSONL or actor `session.jsonl` files. A `pi-durable` run's own `durable/` journal is a known run artifact and expires with its run, subject to the same custody checks. Existing actor archive expiry and residency cleanup still apply after compaction; result files are never compacted. Caller-owned run roots retain their existing explicit-cleanup semantics. Symlink roots/markers, wrong-uid files, malformed ownership, unknown contents, and unverifiable incomplete descendants are preserved. `/fabric settings` exposes these values under **Retention**. Changing them requires `/fabric reload`.
 
-For a one-time **offline** mesh compaction, run `node dist/storage/retention-cli.js <mesh-root> --dry-run` (the default): it lists eligible paths and before/after bytes without creating or changing files. `--apply` performs the same compaction and backup pruning; normal expiry ages remain unchanged. The sweep requires existing Linux host flocks and proven-dead diagnostic holders, and skips live, legacy, unfenced or unreadable custody. Actors must belong to a fenced resident root; latest-run references and malformed-session recovery backups remain protected.
+For a one-time **offline** mesh compaction, run `node dist/storage/retention-cli.js <mesh-root> --dry-run` (the default): it lists eligible paths and before/after bytes without creating or changing files. `--apply` performs the same compaction and backup pruning; normal expiry ages remain unchanged. The sweep requires existing Linux host flocks and proven-dead diagnostic holders, and skips live, legacy, unfenced or unreadable custody. Actors must belong to a fenced resident root; latest-run references and malformed-session recovery backups remain protected. On Windows, `--apply` deletes only with the bundled `dist/native/fabric-win-remove.exe` whose sha256 matches the digest built into the CLI: it checks each entry's owner SID, volume serial and file index on an open handle (and, for a file, its judged last-write time and size, with writes denied while it is held, so a file refreshed after the scan is kept), never follows a reparse point, and deletes by handle (smarty-dev#7858). Without it, `--apply` deletes nothing there.
 
 Persistent actor hosts also start this CLI themselves, **once a day per mesh**, with `--apply --runs-older-than <retention.actorRunArchiveMs>`. Whichever host claims the day's slot file (`<mesh>/.mesh-retention-sweep-<day>.json`) runs it as a detached, niced process. Single flight is a kernel lock: the host takes an exclusive non-blocking `flock` on `<mesh>/.mesh-retention-sweep.lock` before it claims the slot, and hands the locked descriptor to the sweep, which holds it until it exits (a crash releases it). While a sweep holds the lock, no new sweep starts. If the lock state is uncertain (for example `flock` is missing), no sweep runs: the host logs one line and publishes one `fabric.alarm.retention-sweep-lock` event. Linux only; elsewhere the CLI refuses `--apply`.
 
@@ -735,14 +805,16 @@ Other agent settings:
 - `maxPerExecution`: hard cap on accepted child launches per `fabric_exec` invocation, including queued spawns. Cancelling a queued child does not refund that invocation's launch count.
 - `maxDepth`: nesting bound for child agent calls, including `rlm.query()`. It accepts any non-negative safe integer. A value of `0` disables child spawning. `/fabric settings` provides free-form numeric entry.
 - `timeoutMs`: default wall-clock budget per child and the floor for per-call overrides (24 hours by default, which is also the policy ceiling). Fabric ignores lower per-call values. The default matches the ceiling on purpose: an orchestration program inherits this value as its own whole-program deadline floor, so a lower default would cut a long participant short well inside the allowed maximum. Lower it to bound a class of runs, and raise a single run with a per-call value.
-- `extensions`: whether Claude children keep their normal Claude Code customizations.
+- `extensions`: whether children load the user's normal extensions (Pi) or Claude Code customizations (Claude). Pi children with `false` use only built-in or `models.json` model definitions, not extension-registered providers; see [third-party model providers](#third-party-model-providers).
 - `defaultTools`: the default tool allowlist for children.
 - `budgetUsd`: shared append-only cost ledger across a recursion tree (0 disables).
 - `maxTokensPerChild`: cumulative token bound per child (0 disables).
 - `nice`: Unix niceness 0-19 for every child agent: task agents, actors (supervisors, review agents) and durable resident children. The default, `0`, leaves priority unchanged. Fabric calls `os.setPriority(child, nice)` right after the spawn. On Linux it also sets best-effort IO priority with `ionice -c2 -n7`, when `ionice` is installed. The child's own tools (its bash commands) inherit both on Linux and macOS. On Windows `os.setPriority` maps to a priority class. A failure is logged once per worker in the run's `events.jsonl` (`fabric_priority_error`) and never stops the run. Values outside 0-19 are clamped; there is no environment override. A per-call `nice` on `agents.run`/`agents.spawn`, actor creation or `agents.setNice` can only raise it.
 - `deadRootFilter`: **host-only** skip of durable-actor activations whose owning root is positively dead (smarty-dev#6062). `mode`: `"off"` (default) or `"on"`; `exempt`: actor ids, id prefixes or exact names that always run. Fail-open: only an expired-for-over-10-minutes root lease with no live participant skips. See [agents](agents.md#dead-root-activation-filter).
+- `stuckPreparingMs`: **host-only** threshold in ms (default `600000`, ten minutes; clamped to 1 s to 7 days). An activation hung in preparation never fails, so the three-failure notice cannot fire for it (smarty-dev#6337). The resident host's maintenance tick (at most every 10 s) therefore tells the actor's root Main once per stuck episode: `Fabric host notice: actor NAME stuck in preparing for N min (since T); its queued events are waiting.` Preparation time adds up across phases; a permit wait (`waiting`) does not count. The episode ends when the activation leaves preparing. Each notice appends one line to `<mesh>/metrics/stuck-preparing.jsonl` (`stuckMs`, `waitedMs`, and `queued` including the overflow backlog).
 - `notifyOnComplete`: show concise detached `agents.spawn()` completion notices and batch unread results for Main at a safe tool-turn boundary (or wake idle Main). `wait`/`join` and terminal `status` retract pending notifications; running/UI status does not. Escape/error parks results until new input.
-- `processSlice`: optional **root-policy-only** Linux systemd user slice for process-transport workers, for example `"batch.slice"`. Unset by default; configure it in `/etc/smarty/fabric-policy.json`. Agent-dir and workspace configuration cannot enable or override it; other platforms keep direct launches. When enabled, Fabric uses `systemd-run --user --scope --slice=<slice> --quiet --collect -- <worker command>`. Scope admission and the worker execute in place, preserving worker PID/PGID and the existing exit/custody fences. If the executable is unavailable or admission fails, Fabric logs one warning per transport instance and launches directly, only after the failed attempt confirms native close; an already-admitted worker is never replayed. Admission is bounded to five seconds; an unconfirmed teardown vetoes fallback. This changes placement only: configure CPU/IO limits on the slice separately.
+- `processSlice`: optional **root-policy-only** Linux systemd user slice for process-transport workers, for example `"batch.slice"`. Unset by default; configure it in `/etc/smarty/fabric-policy.json`. Agent-dir and workspace configuration cannot enable or override it; other platforms keep direct launches. When enabled, Fabric uses `systemd-run --user --scope --slice=<slice> --quiet --collect -- <worker command>`. Scope admission and the worker execute in place, preserving worker PID/PGID and the existing exit/custody fences. If the executable is unavailable or admission fails, Fabric logs one warning per transport instance and launches directly, only after the failed attempt confirms native close; an already-admitted worker is never replayed. Admission is bounded to five seconds; an unconfirmed teardown vetoes fallback. This changes placement only: configure CPU/IO limits on the slice separately. With an explicit slice, process **tasks** also receive the memory cap below whenever the host passes the delegation check. Actors never do.
+- `processMemoryMaxBytes`: **root-policy-only** byte limit for each process **task** in its own transient scope (smarty-dev#8257). The default is `24 * 1024 ** 3` (24 GiB) and swap is capped at 0. Root policy must give a positive safe integer; anything else fails validation. A task is eligible only on Linux when all of these hold: cgroup v2 is unified, the explicit user-bus environment is usable (`$XDG_RUNTIME_DIR/bus` or a `unix:path=` `DBUS_SESSION_BUS_ADDRESS` socket), the user manager's `cgroup.subtree_control` delegates `memory`, and `systemd-run` exists. These are file checks only; Fabric runs no D-Bus command. Eligible tasks use `processSlice`, or `app.slice` when it is unset. Ineligible hosts, scrubbed environments such as CI, and actors keep the legacy launch exactly. Without an explicit `processSlice` they do not run `systemd-run`, and an explicit slice still yields an uncapped scope. Task environments drop any inherited `FABRIC_TASK_MEMORY_MAX`/`FABRIC_TASK_CGROUP`/`FABRIC_TASK_SYSTEMD_RUN_WRAPPER`. The launcher exports them only after it admits a capped receipt, so an uncapped fallback cannot claim a cap. A capped task also gets a task-local `systemd-run` shim first on `PATH`. The shim runs `--user --scope` commands in place inside the capped leaf, and `MemoryMax=` there can only lower the whole task's cap. See [agents](agents.md#task-local-systemd-run). The capped cgroup path appears as `cgroup` on the run record and handle.
 - `instructionsRoot`: host-only allowed root for actor `instructionsFile` inputs (unset defaults to `~/.local/share/smarty-dev/factory/current/`). Configure it in the host agent directory's `fabric.json`; workspace config cannot widen or replace it. Main and resident owners realpath the root at first use, so `current` may point to an installed factory generation.
 - `wakeText`: optional **host-only**, default off: `{ "receiptDb": "/abs/path/ingress.sqlite", "maxChars": 2000, "trustedPublishers": ["session:<forwarder session id>"], "repositories": { "<actor id>": ["owner/repo"] } }` (smarty-dev#6144). The mesh carries a projection of a GitHub webhook, never the comment or review body. When set, an actor activation for a projected `github.webhook` mesh event (`issue_comment`, `pull_request_review`, `pull_request_review_comment`, with `data.payloadProjected`, `data.sequence`, `data.repository`, the GitHub delivery id `data.id`, `data.digest` and `data.storeId`) reads that receipt from the factory ingress SQLite file on the same host, read-only (`node:sqlite`, `SELECT repository, event, id, digest, payload FROM deliveries WHERE sequence = ? AND id = ?` plus the `metadata` `store_id`). Any mesh publisher can send such an envelope, so hydration fails closed unless all of these hold: (1) provenance: the event's sender as the mesh store recorded it (`event.from.id`, stamped from the publisher's own runtime identity, never from the payload; `verification` `"mesh"`, so not bridge-relayed) is listed in `trustedPublishers`; (2) identity: the row's delivery id, digest, repository and event and the store's `store_id` equal the envelope's; (3) repository: the receipt's full `owner/repository` equals the envelope's exactly and the GitHub payload's `repository.full_name` agrees, the topic names it (`github.<repository name, lowercased>` or `github.<name>.<suffix>`, the forwarder's convention), the actor subscribes to that topic (an addressed delivery alone is not enough), and the full `owner/repository` is on that actor's entry in `repositories`. The topic carries no owner (`acme/demo` and `other/demo` are both `github.demo`), so the topic never authorizes on its own. `repositories` maps an exact actor ID (the 32 lowercase hex characters `agents.actorStatus` returns) to full `owner/repo` names (case-insensitive; bare names, wildcards and malformed entries are dropped; at most 64 actors and 32 repositories each) and defaults to none: an actor without an entry gets no text. Only the actor ID authorizes: actor names are not unique across sessions, projects and roots, so a key that is not an actor ID (an actor name included) is dropped and a namesake actor never inherits a grant. `trustedPublishers` holds exact sender IDs (no wildcards, at most 16) and defaults to none: the live forwarder (`smarty-factory-host@github-factory`, `pi --mode rpc --no-session`) publishes as `session:<uuid>` with a new UUID at each start, so there is no stable identity to trust by default; pin the forwarder's session (for example `pi --session-id <uuid>`) and list `session:<uuid>`. It keeps the first `maxChars` characters of the body (at most 2,000), the author login and the author association, and appends them to the activation input as one fenced JSON line between `UNTRUSTED_WAKE_TEXT_DATA_JSON` and `END_UNTRUSTED_WAKE_TEXT_DATA_JSON` (untrusted data; the body cannot spell a marker or break a line). The same object is visible to activation filter paths as `wakeText.*` and to `validWhile` facts as `wakeText`. Nothing is published, persisted in the actor queue or fetched from GitHub. An untrusted sender, a missing or unreadable database, a missing or mismatched row, or any other error gives no text, and the activation runs as before. The policy is read at every activation, not captured at start: a config reload that enables, narrows or removes it applies to the next activation in Main and in its resident host (Main rewrites the host's `config.json` on reload), so removal revokes at once without a restart; if the resident host cannot read an accepted `config.json`, it hydrates nothing and does not fall back to its startup policy. Workspace configuration cannot set it.
 - `sessionExport`: export each agent run's usage as an attributed pi-format session file (on by default).
@@ -997,6 +1069,8 @@ to canonical reads. The added UUID/hash fields and sidecar remain backward-compa
 writer cadence and CAS revisions are unchanged. See [mesh state read gates](mesh-state-reads.md).
 
 Mesh topics, shared state, and the participant directory remain project-scoped. Every runtime publishes one short-lived host lease and records for the roots, agents, and actors it owns. `agents.members()` and `mesh.members()` read those records. `agents.main()` and `agents.peers()` project roots. When a lease expires, its records leave normal discovery together. A host that stops without a clean shutdown leaves them in the shared state, so each runtime removes, every 15 minutes, the records of hosts whose lease expired more than 6 hours ago. Each removal is checked against the record's version. Existing needed directory writes also compact at most 64 expired native/resident host records per batch, without touching participant or delivery retention. `mesh.actorPollMs` controls fallback polling for actor events and owner-addressed commands when filesystem notifications are unavailable.
+
+A resident host exits cleanly when its root Main is no longer live (including the existing 180-second reload lease), it owns no actors (including idle or stopped actors), and it has no queued/processing requests or active agents continuously for `mesh.residentIdleExitMs` (default `600000`, 10 minutes; range 0–7 days). `0` disables this exit policy. Actor/request activity or a renewed root lease resets the window. The host logs `resident exiting: root dead, no actors, idle N min`, withdraws its lease, and leaves an intentional-exit marker so its launcher does not restart it. A later explicit spawn or actor-create request clears the marker and starts a new host normally. Accepted same-release configuration updates apply the setting during resident maintenance; rollback is a revert or setting `mesh.residentIdleExitMs` to `0`.
 
 Shared state keeps a persistent revision clock (`highWater` in the mesh `state.json`). A new key takes the next clock revision, and an update takes its key's version plus one. Compare revisions only through `ifVersion`; a new key seldom starts at 1. Fabric builds from before this clock can still write to a shared root. A newer Fabric then raises its clock to the highest retained revision, so both can use one root.
 

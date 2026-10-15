@@ -201,11 +201,37 @@ describe("incoming Fabric display projection", () => {
     expect(plain(h.render(mixed)![0]!)).toBe(" ↳ Build & Test: [1 work] new work");
     // Same sender and key on another topic is unrelated work (#852 security P1): shown.
     expect(plain(h.render(inbox([{ ...event("other-topic", "other topic work"), topic: "fleet.alarm" }]))![0]!)).toContain("other topic work");
+    expect(plain(h.render(inbox([event("same-event", "first", {}), event("same-event", "duplicate second", {})]))![0]!))
+      .toBe(" ↳ Build & Test: [1 work] first");
     const delivery = { ...message(), details: { id: "native-2", from: sender, data: { deliveryId: "D1", key: "same-work" } } };
     h.setBranch([entry(message()), entry(delivery)]);
     expect(h.render(inbox([event("d1", "duplicate D1", { deliveryId: "D1" })]))).toEqual([]);
     expect(plain(h.render(inbox([event("d2", "new D2", { deliveryId: "D2", key: "same-work" })]))![0]!)).toContain("new D2");
     expect(h.render(mixed, true)).toBeUndefined();
+  });
+
+  it("dedupes an inbox event id repeated a minute later, without hiding the original or new rows", () => {
+    const h = harness();
+    const first = inbox([event("ca71cd8c", "first copy", {})]);
+    const second = { ...inbox([event("ca71cd8c", "REPEATED_COPY", {}), event("new", "new work", {})]), timestamp: first.timestamp + 60_000 };
+    h.setBranch([entry(first), entry(second)]);
+    expect(plain(h.render(first)![0]!)).toContain("first copy");
+    expect(plain(h.render(second)![0]!)).toBe(" ↳ Build & Test: [1 work] new work");
+    // Expanded: the native carrier minus the repeated row (upstream fullCarrier rendering).
+    initTheme("dark", false);
+    const shown = (expanded: boolean) => {
+      const component = new CustomMessageComponent(second, h.renderers.get(second.customType));
+      component.setExpanded(expanded);
+      return component.render(120).map(plain).join("\n");
+    };
+    expect(shown(true)).toContain("new work");
+    expect(shown(true)).not.toContain("REPEATED_COPY");
+    h.setMode("expanded");
+    expect(shown(false)).toContain("new work");
+    expect(shown(false)).not.toContain("REPEATED_COPY");
+    h.setMode("collapsed");
+    h.setBranch([entry(second)]);
+    expect(plain(h.render(second)![0]!)).toContain("REPEATED_COPY");
   });
 
   it.each([
@@ -295,5 +321,69 @@ describe("incoming Fabric display projection", () => {
     }
     expect(normalizeFabricConfig({ ui: { incomingMessages: "invalid" } }).ui.incomingMessages).toBe("auto");
     expect(normalizeFabricConfig({}).ui.incomingMessages).toBe("auto");
+  });
+});
+
+describe("incoming full-carrier markdown theme (cold import, first use)", () => {
+  const sdkLoaded = vi.fn();
+  const highlight = vi.fn<(code: string, lang: string, invalidate?: () => void) => string[] | null>();
+  afterEach(() => {
+    vi.doUnmock("@earendil-works/pi-coding-agent");
+    vi.doUnmock("../src/ui/highlight.js");
+    vi.resetModules();
+  });
+  const load = async () => {
+    vi.resetModules(); sdkLoaded.mockClear(); highlight.mockReset();
+    // Pi loads this module as native ESM: any runtime SDK edge evaluates a second SDK.
+    vi.doMock("@earendil-works/pi-coding-agent", () => { sdkLoaded(); throw new Error("runtime Pi SDK import"); });
+    vi.doMock("../src/ui/highlight.js", () => ({ highlightCode: highlight }));
+    return import("../src/ui/incoming-messages.js");
+  };
+
+  it("imports and idles without the SDK or highlighter, then colors code with the host Theme on first use", async () => {
+    const { registerIncomingMessageRenderers: register } = await load();
+    const renderers = new Map<string, MessageRenderer>();
+    let start: ((event: unknown, ctx: ExtensionContext) => unknown) | undefined;
+    register({ on: (_name: string, fn: any) => { start = fn; },
+      registerMessageRenderer: (type: string, fn: MessageRenderer) => renderers.set(type, fn) } as unknown as ExtensionAPI,
+    () => "collapsed");
+    let branch: unknown[] = [];
+    start!({}, { sessionManager: { getBranch: () => branch } } as unknown as ExtensionContext);
+    const used = new Set<string>();
+    const mark = (name: string) => (text: string) => { used.add(name); return text; };
+    const hostTheme = { fg: (name: string, text: string) => mark(name)(text), bg: (name: string, text: string) => mark(name)(text),
+      bold: mark("bold"), italic: mark("italic"), underline: mark("underline"), strikethrough: mark("strikethrough") } as unknown as Theme;
+    const render = (value: CustomMessage, expanded: boolean) =>
+      renderers.get(value.customType)!(value, { expanded, outputPad: 1 }, hostTheme);
+    const code = "Intro\n\n# Incoming Heading\n\n**Bold** and `inline`\n\n```ts\nconst x = 1;\n```\nOutro";
+    // Native inbox construction dedupes within a carrier. A prior carrier is
+    // the real path that makes fullCarrier remove a repeat while retaining code.
+    branch = [entry(inbox([event("repeated", "already delivered", {})]))];
+    const value = inbox([event("repeated", "REPEATED_COPY", {}), event("work", code, {})]);
+    // Idle: collapsed previews and native fallbacks never touch the highlighter.
+    expect(render(value, false)!.render(120)).toHaveLength(1);
+    expect(render(inbox([event("plain", "no code here", {})]), true)).toBeUndefined();
+    expect(sdkLoaded).not.toHaveBeenCalled();
+    expect(highlight).not.toHaveBeenCalled();
+
+    // First use: the not-yet-ready highlighter falls back to the host Theme's code-block color.
+    highlight.mockReturnValue(null);
+    const box = render(value, true)!;
+    const cold = box.render(120).map(plain).join("\n");
+    expect(cold).toContain("Incoming Heading");
+    expect(cold).toContain("const x = 1;");
+    expect(cold).not.toContain("REPEATED_COPY");
+    expect(highlight).toHaveBeenCalled();
+    expect(highlight.mock.calls[0]!.slice(0, 2)).toEqual(["const x = 1;", "ts"]);
+    expect([...used]).toEqual(expect.arrayContaining(["customMessageBg", "customMessageLabel", "customMessageText",
+      "mdHeading", "mdCode", "mdCodeBlock", "mdCodeBlockBorder", "bold"]));
+
+    // Ready: the highlighter's invalidate drops cached lines; the next render shows syntax colors.
+    const colored = "\x1b[38;2;1;2;3mconst x = 1;\x1b[39m";
+    highlight.mockReturnValue([colored]);
+    expect(box.render(120).join("\n")).not.toContain(colored); // Cached until invalidated.
+    highlight.mock.calls[0]![2]!();
+    expect(box.render(120).join("\n")).toContain(colored);
+    expect(sdkLoaded).not.toHaveBeenCalled();
   });
 });

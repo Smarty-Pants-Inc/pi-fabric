@@ -207,6 +207,10 @@ describe("entropy background scheduler", () => {
     expect(warn).not.toHaveBeenCalled();
     fs.rmSync(lock, { recursive: true });
     await vi.waitFor(async () => expect((await poolStore.loadObservationPoolAsync(harness.agentDir)).file).toBeDefined(), { timeout: 3_000 });
+    // The pool file can be visible before updateObservationPoolAsync returns.
+    // Shutdown between that write and compile aborts the retry (notably Windows).
+    // Observe the retry's compiler before asking shutdown to cancel in-flight work.
+    await vi.waitFor(() => expect(compile).toHaveBeenCalledTimes(2), { timeout: 3_000 });
     await harness.shutdown();
     expect(compile).toHaveBeenCalledTimes(2);
     expect(warn).not.toHaveBeenCalled();
@@ -221,10 +225,23 @@ describe("entropy background scheduler", () => {
     }] } });
     expect(outcome.artifact).toBeDefined();
     vi.spyOn(BackgroundEntropyCompiler.prototype, "compile").mockResolvedValue(outcome);
-    const active = vi.spyOn(activeSurface, "setActiveCompiledSurface");
+    // The activation must not wait on the busy store: it happens before the first persist attempt settles, on every
+    // platform (the persist's lock retries are timer-bound and were slow enough on Windows to miss the wait below).
+    let persistSettled = false;
+    const save = compiledStore.saveCompiledSurfaceAsync;
+    vi.spyOn(compiledStore, "saveCompiledSurfaceAsync").mockImplementation(async (...args) => {
+      try { return await save(...args); } finally { persistSettled = true; }
+    });
+    let activeBeforePersist: boolean | undefined;
+    const setActive = activeSurface.setActiveCompiledSurface;
+    const active = vi.spyOn(activeSurface, "setActiveCompiledSurface").mockImplementation((...args) => {
+      activeBeforePersist ??= !persistSettled;
+      return Reflect.apply(setActive, activeSurface, args);
+    });
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     await harness.trigger();
     await vi.waitFor(() => expect(active).toHaveBeenCalledWith(outcome.artifact), { timeout: 2_000 });
+    expect(activeBeforePersist).toBe(true);
     expect(fs.existsSync(lock)).toBe(true);
     expect((await compiledStore.loadCompiledSurfaceAsync(harness.agentDir)).file).toBeUndefined();
     fs.rmSync(lock, { recursive: true });

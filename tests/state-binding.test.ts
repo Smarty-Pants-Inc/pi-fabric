@@ -257,7 +257,8 @@ describe("bound state certificates", () => {
   it("marks provider-originated verification as requested by the program with the schema mode", async () => {
     const { cwd, head } = createRepo();
     const mesh = createMesh();
-    const provider = new StateProvider(mesh, identity, { schemaMode: "off" });
+    // Test-only: no extension runner here; production passes the shared shell preflight (smarty-dev#8606).
+    const provider = new StateProvider(mesh, identity, { schemaMode: "off" }, { allowUnhookedTools: true });
     const context = contextFor(cwd);
     await provider.invoke(
       "transition",

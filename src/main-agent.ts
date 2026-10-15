@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { appendDeliveryOutcome, type DeliverySend, type DeliveryOutcome } from "./mesh/delivery-outcomes.js";
 import type { AgentFollowUpRunningWarning } from "./agents/types.js";
 import fs from "node:fs";
 import path from "node:path";
@@ -9,6 +10,7 @@ import type { MeshIdentity } from "./mesh/store.js";
 import { takeCompactionDecline } from "./compaction/cancellation.js";
 import { fabricProvenanceOptions, fabricProvenanceSupported, fabricTurnProvenance, fabricWakeCause, copyFabricProvenance, fabricWakeMessage, admittedFabricWakeCauses, sendFabricMessage, sendFabricUserMessage, type FabricWakeCause, type FabricTurnProvenance, type FabricPrincipal } from "./fabric-provenance.js";
 import { classifyProviderError, type ProviderErrorClass } from "./provider-error-class.js";
+import { extensionContextLive } from "./session-liveness.js";
 
 import { FabricInterruptNotAuthorizedError, FabricInterruptRateLimitedError, type FabricInterruptAuthority } from "./interrupt-authority.js";
 
@@ -75,6 +77,8 @@ export interface FabricMainAgentDeliveryRequest {
    * so the sender may delete its record after a return (review round 2 on pi-fabric#160).
    */
   deliveryId?: string;
+  /** Host-owned outcome identity; retained until native consumption. */
+  outcomeSend?: DeliverySend;
 }
 
 /** How far behind a Main is on followUps, so a sender can switch to steer (smarty-dev#1495). */
@@ -99,6 +103,8 @@ export interface FabricAgentMessageResult extends Partial<FabricFollowUpQueueDep
   triggered?: boolean;
   /** Why a requested wake was held, e.g. provider-backoff until an ISO timestamp. */
   reason?: string;
+  /** Main is held by an operator halt; peer followUps remain passive. */
+  halted?: true;
   /** Main had already admitted this deliveryId; nothing was sent again. */
   duplicate?: true;
   /** This followUp replaced a held one with the same sender and data.coalesceKey. */
@@ -270,6 +276,8 @@ const mainSenderClaimAllowed = (sender: MeshIdentity, deliveryId: unknown, sourc
     deliveryId.startsWith("resident:") && source !== "actor-output");
 
 export interface HeldAgentMessage {
+  outcomeSend?: DeliverySend;
+  supersededSends?: DeliverySend[];
   id: string;
   from: MeshIdentity;
   /** Resident producer evidence, retained even on hosts without Pi provenance support. */
@@ -409,6 +417,7 @@ export class MainAgentController implements FabricMainAgentTarget {
   #suspended = false;
   // Owner stop, unlike a run's signal: survives reload and lifts only on user input.
   #halted = false;
+  #peerSteerInFlight = false;
   // Provider failures hold peer wakes temporarily; only owner stops suppress them indefinitely.
   #providerFailed = false;
   #providerFailures = 0;
@@ -452,6 +461,8 @@ export class MainAgentController implements FabricMainAgentTarget {
     readonly onProviderWakeReleased?: (event: { until: string; messageIds: string[] }) => void,
     readonly interruptAuthority: FabricInterruptAuthority = {},
     readonly onProviderDead?: (event: FabricMainProviderDeadEvent) => void,
+    readonly meshRoot?: string,
+    readonly peerSteerResume = false,
   ) {}
 
   /** This Main's live drain owns non-retryable provider recovery (smarty-dev#8742). */
@@ -582,6 +593,7 @@ export class MainAgentController implements FabricMainAgentTarget {
   halt(): void {
     this.#interrupts.clear();
     this.#halted = true;
+    this.#peerSteerInFlight = false;
     this.#providerReleaseUntil = undefined;
     this.#consumedDirty = true;
     const index = this.#consumedPath();
@@ -632,6 +644,7 @@ export class MainAgentController implements FabricMainAgentTarget {
       cause.from.name !== derivedWake.from.name || cause.from.kind !== derivedWake.from.kind));
     const item: HeldAgentMessage = {
       id: randomUUID(),
+      ...(request.outcomeSend ? { outcomeSend: request.outcomeSend } : {}),
       from: sender,
       ...(admittedCauses?.length ? { wakeCause: admittedCauses[0]!,
         ...(admittedCauses.length > 1 ? { wakeCauses: admittedCauses } : {}),
@@ -651,7 +664,22 @@ export class MainAgentController implements FabricMainAgentTarget {
     };
     // Retry required owner authority at the next delivery, even without a durable delivery id.
     this.#retryPendingHalt();
-    const triggerTurn = (request.triggerTurn ?? true) && !this.#halted;
+    // Only a project-agent's new peer escalation control envelope gets one run; halt stays latched.
+    // Replays return above; producer/backlog delivery and sender diagnostics grant no wake.
+    const peerSteerWake = this.#halted && this.peerSteerResume && !this.#peerSteerInFlight && request.delivery === "steer" && request.triggerTurn !== false &&
+      (request.verification === "mesh" || request.verification === "bridge") && sender.kind === "main" && sender.id !== this.id &&
+      request.source === undefined && request.admissionTopic === undefined && !request.priority &&
+      admittedCauses?.length === 1 && admittedCauses[0]!.cause === "steer" &&
+      admittedCauses[0]!.topic === "fabric.control.command" &&
+      admittedCauses[0]!.from.id === sender.id && admittedCauses[0]!.from.kind === "main" &&
+      !this.#reloading && this.#bindingsLive && this.#context !== undefined && extensionContextLive(this.#context) &&
+      this.#context.isIdle() && (this.#context as { isSettling?: () => boolean }).isSettling?.() === false &&
+      !this.#context.signal?.aborted && !promptPending(this.#context) && !this.#haltIndexUnknown &&
+      !this.#providerHeld() && !this.#providerAttemptInFlight;
+    if (peerSteerWake) this.#peerSteerInFlight = true;
+    const restorePeerWakeOnFailure = (): void => { if (peerSteerWake) this.halt(); };
+    const triggerTurn = (request.triggerTurn ?? true) && (peerSteerWake || !this.#halted);
+    const operatorHalted = this.#halted && !peerSteerWake;
     const providerHeld = triggerTurn && request.delivery !== "nextTurn" &&
       !this.#context?.signal?.aborted && (this.#providerHeld() || this.#providerAttemptInFlight);
     if (providerHeld && request.delivery === "steer") {
@@ -719,6 +747,7 @@ export class MainAgentController implements FabricMainAgentTarget {
         // smarty-dev#2339 F2: a failed mesh delete can outlive the last 2000 consumed ids.
         // The replacement journals every superseded delivery id until the carrier is consumed.
         item.supersedes = [...(replaced.supersedes ?? []), ...(replaced.deliveryId === undefined ? [] : [replaced.deliveryId])];
+        item.supersededSends = [...(replaced.supersededSends ?? []), ...(replaced.outcomeSend ? [replaced.outcomeSend] : [])];
       }
       // Charge the proposed ancestry before mutating or acknowledging either carrier.
       this.#admit(item, replaced);
@@ -740,6 +769,8 @@ export class MainAgentController implements FabricMainAgentTarget {
         if (replaced) { this.#consumedDirty = true; this.#trySave(); }
         throw new Error(`Main could not record the followUp: ${error instanceof Error ? error.message : String(error)}`);
       }
+      this.#recordSuperseded(item);
+      this.#trySave();
       if (providerHeld) {
         this.#scheduleProviderWake();
         this.#armProviderDeadTimer();                   // a new delivery is an edge too; no-op unless pending
@@ -761,22 +792,26 @@ export class MainAgentController implements FabricMainAgentTarget {
         this.#save();
       } catch (error) {
         this.#sent.pop();
+        restorePeerWakeOnFailure();
         throw new Error(`Main could not record the message: ${error instanceof Error ? error.message : String(error)}`);
       }
       try {
-        triggered = this.#send([item], request.delivery, triggerTurn, false);
+        triggered = this.#send([item], request.delivery, triggerTurn, false, peerSteerWake);
       } catch (error) {
         this.#sent.splice(this.#sent.indexOf(item), 1);
         this.#trySave();
+        restorePeerWakeOnFailure();
         throw error;
       }
     } else {
-      triggered = this.#send([item], request.delivery, triggerTurn, false);
+      try { triggered = this.#send([item], request.delivery, triggerTurn, false, peerSteerWake); }
+      catch (error) { restorePeerWakeOnFailure(); throw error; }
     }
     return {
       queued: true, messageId: item.id, routed: "main",
       ...(triggered === undefined ? {} : { triggered }),
-      ...(providerHeld ? { reason: this.#providerHoldReason() } : {}),
+      ...(operatorHalted ? { halted: true as const, reason: "operator-halt" } :
+        providerHeld ? { reason: this.#providerHoldReason() } : {}),
       ...(replaced ? { coalesced: true as const, replacedMessageId: replaced.id } : {}),
       // Only a followUp that waits in the held queue can be stalled; a non-triggering one went
       // straight to Pi (#123 review F1).
@@ -1026,7 +1061,12 @@ export class MainAgentController implements FabricMainAgentTarget {
     // not sent again in this process; it stays journalled and a restart replays it.
     const seen = this.#source !== "" && this.#unverified.some((item) => !delivered.has(item.id)) ? this.#inMemory() : new Set<string>();
     for (const item of this.#unverified.splice(0)) {
-      if (delivered.has(item.id)) { this.#consume(item); continue; }
+      if (delivered.has(item.id)) {
+        this.#recordSuperseded(item);
+        if (!item.supersededSends?.length && this.#recordOutcome(item.outcomeSend, "delivered", "consumed by Main as itself")) this.#consume(item);
+        else this.#sent.push(item);
+        continue;
+      }
       if (queued.has(item.id) || seen.has(item.id)) this.#sent.push(item);
       else if (item.deliverAs !== undefined) {
         // A direct delivery goes again alone, with its own mode and triggerTurn; a failed send
@@ -1046,16 +1086,37 @@ export class MainAgentController implements FabricMainAgentTarget {
     this.#trySave();
   }
 
+  #recordOutcome(send: DeliverySend | undefined, outcome: DeliveryOutcome, reason: string): boolean {
+    const root = this.meshRoot ?? (this.#journal ? path.dirname(path.dirname(this.#journal)) : undefined);
+    if (!send || !root) return true;
+    try { appendDeliveryOutcome(root, send, outcome, reason); return true; }
+    catch (error) { console.warn("[pi-fabric] cannot append Main delivery outcome; retaining journal", error); return false; }
+  }
+
+  #recordSuperseded(item: HeldAgentMessage): boolean {
+    const pending = item.supersededSends ?? [];
+    const before = pending.length;
+    while (pending.length && this.#recordOutcome(pending[0], "superseded", "replaced by a newer message for the same key before delivery")) pending.shift();
+    if (!pending.length) delete item.supersededSends;
+    return pending.length !== before;
+  }
+
   /** Drop the handed-over followUps the session now holds (the only way one leaves the journal). */
   #confirm(): void {
     this.#retryPendingHalt();
-    if (!this.#sent.length) return;
+    let outcomesChanged = false;
+    for (const item of this.#held) outcomesChanged = this.#recordSuperseded(item) || outcomesChanged;
+    if (!this.#sent.length) { if (outcomesChanged) this.#trySave(); return; }
     const delivered = this.#refreshDelivered();
     const before = this.#sent.length;
-    const kept = this.#sent.filter((item) => !delivered.has(item.id));
-    for (const item of this.#sent) if (delivered.has(item.id)) this.#consume(item);
+    for (const item of this.#sent) outcomesChanged = this.#recordSuperseded(item) || outcomesChanged;
+    const kept = this.#sent.filter((item) => {
+      if (!delivered.has(item.id) || item.supersededSends?.length || !this.#recordOutcome(item.outcomeSend, "delivered", "consumed by Main as itself")) return true;
+      this.#consume(item);
+      return false;
+    });
     this.#sent.splice(0, this.#sent.length, ...kept);
-    if (this.#sent.length !== before) this.#trySave();
+    if (this.#sent.length !== before || outcomesChanged) this.#trySave();
   }
 
   /** After a restart: every journalled followUp the session does not hold goes back in the queue. */
@@ -1145,9 +1206,15 @@ export class MainAgentController implements FabricMainAgentTarget {
       if (this.#inboxFence && !this.#inboxFence.owns(item.id)) continue;
       if (delivered.has(item.id) || delivered.has(chainOf(item)) || last.get(chainOf(item)) !== item ||
         (item.deliveryId !== undefined && this.#consumed.has(item.deliveryId))) {
+        this.#recordSuperseded(item);
+        if (item.supersededSends?.length || (delivered.has(item.id) && !this.#recordOutcome(item.outcomeSend, "delivered", "consumed by Main as itself"))) {
+          this.#sent.push(item);
+          continue;
+        }
         this.#consume(item);
         continue;
       }
+      this.#recordSuperseded(item);
       last.delete(chainOf(item));                          // a duplicate id goes once
       this.#replayed.add(item.id);
       (item.handed ? this.#unverified : this.#held).push(item);
@@ -1189,6 +1256,7 @@ export class MainAgentController implements FabricMainAgentTarget {
     on("input", (event: { source?: string }, ctx) => {
       this.#context = ctx;
       if (event.source === "extension") return;
+      this.#peerSteerInFlight = false;
       this.#interruptUsedThisTurn = false;
       this.#interruptResume = false;
       if (this.#switching) { this.#switching = false; this.#reloading = false; this.#bindingsLive = true; }
@@ -1245,6 +1313,7 @@ export class MainAgentController implements FabricMainAgentTarget {
     let interruptedSettle = false;
     on("agent_settled", (_event, ctx) => {
       this.#context = ctx;
+      this.#peerSteerInFlight = false;
       this.#tools.clear();
       interruptedSettle = this.#interrupts.size > 0;
       while (this.#held[0] && this.#interrupts.has(this.#held[0].id)) {
@@ -1539,6 +1608,7 @@ export class MainAgentController implements FabricMainAgentTarget {
     const operation = this.#operation;
     // Retain cancellation evidence while later completion handlers still run.
     this.#wake = setInterval(() => {
+      if (this.#contextRetired()) return;
       // Drain-off uses #closed to stop holding, not to end a manual operation. Close
       // itself cancels this timer; only the real idle boundary retires its signal.
       if (!this.#context || !operation || operation.aborted) {
@@ -1559,6 +1629,7 @@ export class MainAgentController implements FabricMainAgentTarget {
     // leave FIFO delivery to its boundaries; halt/reload/close cancel this waiter too.
     if (this.#preflightWake) return;
     this.#preflightWake = setInterval(() => {
+      if (this.#contextRetired()) return;
       const ctx = this.#context;
       // A no-run preflight may also leave an async compaction handler finishing. Busy
       // alone is not proof of agent_start; that event explicitly cancels this waiter.
@@ -1568,6 +1639,21 @@ export class MainAgentController implements FabricMainAgentTarget {
       this.#armProviderDeadTimer();                        // the preflight's idle edge; no-op unless pending
     }, 25);
     this.#preflightWake.unref?.();
+  }
+
+  /**
+   * smarty-dev#8881: AgentSession.dispose() and session replacement invalidate the bound ctx without
+   * session_shutdown, and every getter then throws. A timer that finds it stale suspends the drain as
+   * a native session switch does (prepareReload: admission only journals) and stops every loop; a
+   * later live attachFollowUpDrain resumes from the journal.
+   */
+  #contextRetired(): boolean {
+    const ctx = this.#context;
+    if (!ctx || extensionContextLive(ctx)) return false;
+    this.prepareReload();
+    this.#stopOperation();
+    this.#stopProviderDeadTimer();
+    return true;
   }
 
   #stopOperation(): void {
@@ -1620,6 +1706,7 @@ export class MainAgentController implements FabricMainAgentTarget {
     this.#providerReleaseUntil = until;
     this.#providerWake = setTimeout(() => {
       this.#providerWake = undefined;
+      if (this.#contextRetired()) return;
       if (!this.#context || this.#reloading || this.#halted || this.#context.signal?.aborted) return;
       this.#release(true);
     }, Math.max(0, until - Date.now()));
@@ -1708,6 +1795,7 @@ export class MainAgentController implements FabricMainAgentTarget {
     if (this.#providerDeadTimer || (phase !== "recovering" && phase !== "probation")) return;
     this.#providerDeadTimer = setTimeout(() => {
       this.#providerDeadTimer = undefined;
+      if (this.#contextRetired()) return;
       const dead = this.#providerDead;
       const ctx = this.#context;
       if (!dead || !ctx || !this.#bindingsLive || this.#reloading || this.#halted || ctx.signal?.aborted) return;
@@ -1732,13 +1820,20 @@ export class MainAgentController implements FabricMainAgentTarget {
   /** The same path a human /compact takes; compaction extensions may drop provider-bound blocks. */
   #compactForRecovery(dead: ProviderDeadState, ctx: ExtensionContext): void {
     dead.phase = "compacting";
+    // smarty-dev#8881: Pi may deliver these callbacks after dispose() or session replacement. Only the
+    // incident they were started for, through the still-live ctx they were started on, may advance it;
+    // a stale ctx retires only a stale current binding (#contextRetired), never a live successor.
+    const fresh = (): boolean => {
+      if (!extensionContextLive(ctx)) { this.#contextRetired(); return false; }
+      return this.#providerDead === dead && this.#bindingsLive && !this.#reloading;
+    };
     const failed = (): void => {
-      if (this.#providerDead !== dead || dead.phase !== "compacting") return;
+      if (!fresh() || dead.phase !== "compacting") return;
       this.#raiseProviderDead("compaction-failed");
     };
     try {
       // Pi calls onComplete after its compaction state is cleared: the idle edge for the one attempt.
-      ctx.compact({ onComplete: () => { if (this.#providerDead === dead) { this.#providerCompacted(); this.#armProviderDeadTimer(); } }, onError: failed });
+      ctx.compact({ onComplete: () => { if (fresh()) { this.#providerCompacted(); this.#armProviderDeadTimer(); } }, onError: failed });
     } catch {
       failed();
     }
@@ -1919,11 +2014,12 @@ export class MainAgentController implements FabricMainAgentTarget {
     deliverAs: FabricMainAgentDelivery,
     triggerTurn: boolean,
     flushed: boolean,
+    peerSteer = false,
   ): boolean | undefined {
     items = items.filter(item => !this.#inboxFence || this.#inboxFence.owns(item.id));
     if (this.#reloading || !items.length || (this.#inboxFence && !this.#inboxFence.active())) return false;
     const interrupt = this.#context?.isIdle() === true && items.every(item => this.#interrupts.has(item.id));
-    triggerTurn &&= !this.#halted && !this.#providerHeld() && (!this.#context?.signal?.aborted || interrupt);
+    triggerTurn &&= (peerSteer || !this.#halted) && !this.#providerHeld() && (!this.#context?.signal?.aborted || interrupt);
     // Persist a downgraded explicit replay policy, including handoffs retried after a later reload.
     if (!triggerTurn) for (const item of items) if (item.deliverAs !== undefined) item.triggerTurn = false;
     // Each item keeps its own delivery mark: a flushed batch goes in as a steer, but it holds followUps.

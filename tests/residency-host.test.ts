@@ -655,7 +655,13 @@ describe.skipIf(process.platform !== "linux")("#2566 owned startup shutdown", ()
       await vi.waitFor(() => expect(fs.existsSync(path.join(config.residencyRoot, "stubborn-child-ready"))).toBe(true), { timeout: 5_000 });
       expect(executing()).toHaveLength(2);
       if (mode === "close") await client.close();
-      if (mode === "failure") fs.writeFileSync(path.join(config.residencyRoot, "error.json"), JSON.stringify({ error: "injected failure" }));
+      if (mode === "failure") {
+        const generation = fs.readFileSync(path.join(config.residencyRoot, "stubborn-launch-token"), "utf8");
+        fs.mkdirSync(path.join(config.residencyRoot, "generations"), { recursive: true });
+        fs.writeFileSync(path.join(config.residencyRoot, "generations", `${generation}.error.json`), JSON.stringify({
+          format: 1, generation, writer: "launcher", error: "injected failure", occurredAt: Date.now(), pid: process.pid,
+        }));
+      }
       const error = await starting;
       expect(error).toBeInstanceOf(Error);
       expect(String(error)).toMatch(mode === "timeout" ? /Timed out/ : mode === "close" ? /client is closed/ : /injected failure/);
@@ -1107,8 +1113,10 @@ describe("resident host ownership", () => {
       // Upstream sender stamps: an unstamped control carries sender: null.
       if (operation === "ask") expect(ask).toHaveBeenCalledWith("actor", "keep working", undefined, signal, { ...options, provenance, sender: null });
       else {
-        expect(binding).toHaveBeenCalledWith("actor", options);
-        expect(tell).toHaveBeenCalledWith("actor", "keep working", undefined, { ...options, provenance, sender: null });
+        // smarty-dev#5518: a followUp carries its host-owned outcome identity to the actor queue.
+        const outcomeSend = { eventId: "owner-defaults", to: "actor", from: from.id, mode: "followUp" };
+        expect(binding).toHaveBeenCalledWith("actor", { ...options, outcomeSend });
+        expect(tell).toHaveBeenCalledWith("actor", "keep working", undefined, { ...options, provenance, sender: null, outcomeSend });
       }
       await expect(handler(command, { ...from, id: "session:foreign" }, signal)).resolves.toMatchObject({ accepted: false, error: "Invalid actor owner-default binding provenance" });
       expect(operation === "ask" ? ask : tell).toHaveBeenCalledOnce();
@@ -1118,8 +1126,9 @@ describe("resident host ownership", () => {
         const foreignOptions = { binding: foreignBinding ?? {} };
         if (operation === "ask") expect(ask).toHaveBeenLastCalledWith("actor", "keep working", undefined, signal, { ...foreignOptions, provenance, sender: null });
         else {
-          expect(binding).toHaveBeenLastCalledWith("actor", foreignOptions);
-          expect(tell).toHaveBeenLastCalledWith("actor", "keep working", undefined, { ...foreignOptions, provenance, sender: null });
+          const outcomeSend = { eventId: "owner-defaults", to: "actor", from: "session:foreign", mode: "followUp" };
+          expect(binding).toHaveBeenLastCalledWith("actor", { ...foreignOptions, outcomeSend });
+          expect(tell).toHaveBeenLastCalledWith("actor", "keep working", undefined, { ...foreignOptions, provenance, sender: null, outcomeSend });
         }
       }
     } finally {

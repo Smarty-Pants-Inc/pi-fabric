@@ -1210,6 +1210,8 @@ export class StateStore {
     timeoutMs?: number;
     signal?: AbortSignal | undefined;
     identity: MeshIdentity;
+    /** Guard preflight for the shell command: resolves to run it as declared or throws a refusal (#8606). */
+    preflightCommand?: (command: string, index: number) => Promise<void>;
   }): Promise<{
     passed: boolean;
     output: string;
@@ -1219,6 +1221,8 @@ export class StateStore {
     const entry = this.store.get(GOAL_KEY);
     if (!entry) throw new Error("No goal set");
     const goal = entry.value as StateGoal;
+    // The command that runs is always the one the goal records and digests.
+    await input.preflightCommand?.(goal.check, 0);
     const result = await runCommand(goal.check, {
       cwd: input.cwd,
       timeoutMs: input.timeoutMs ?? 30_000,
@@ -1332,6 +1336,8 @@ export class StateStore {
     timeoutMs?: number;
     signal?: AbortSignal | undefined;
     identity: MeshIdentity;
+    /** Guard preflight for each evidence command: resolves to run it as declared or throws a refusal (#8606). */
+    preflightCommand?: (command: string, index: number) => Promise<void>;
     /** Caller claims to bind; `commit` is checked against the observed HEAD. */
     binding?: Record<string, string>;
     /** Defaults to "host"; the state provider passes "program". */
@@ -1443,6 +1449,7 @@ export class StateStore {
       });
     }
 
+    let commandIndex = 0;
     for (const target of bindingFailed ? [] : targets) {
       const evidence = target.evidence ?? [];
       if (evidence.length === 0) {
@@ -1454,6 +1461,8 @@ export class StateStore {
         });
       }
       for (const command of evidence) {
+        // The command that runs is always the one the result and certificate record.
+        if (!input.signal?.aborted) await input.preflightCommand?.(command, commandIndex++);
         const result: CommandResult = input.signal?.aborted
           ? {
               status: "error",

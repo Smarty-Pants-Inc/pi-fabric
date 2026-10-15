@@ -1,7 +1,8 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { HOST_POLICY_PATH } from "../src/host-policy.js";
 import {
   DEFAULT_FABRIC_CONFIG,
   MAX_EXECUTOR_MEMORY_LIMIT_BYTES,
@@ -124,6 +125,71 @@ describe("host-only processSlice (#4383)", () => {
   });
 });
 
+describe("host/root-only processMemoryMaxBytes (smarty-dev#8257)", () => {
+  const DEFAULT = 24 * 1024 ** 3;
+  it("defaults to 24 GiB", () => {
+    expect(DEFAULT_FABRIC_CONFIG.agents.processMemoryMaxBytes).toBe(DEFAULT);
+    expect(normalizeFabricConfig({}).agents.processMemoryMaxBytes).toBe(DEFAULT);
+  });
+  it.each([true, false])("ignores agent-dir and project config, even trusted (trusted=%s)", projectTrusted => {
+    const cwd = temporaryDirectory(); const agentDir = temporaryDirectory(); fs.mkdirSync(path.join(cwd, ".pi"));
+    fs.writeFileSync(path.join(cwd, ".pi", "fabric.json"), JSON.stringify({ agents: { processMemoryMaxBytes: 1024 ** 4 } }));
+    expect(loadFabricConfig({ cwd, agentDir, projectTrusted }).agents.processMemoryMaxBytes).toBe(DEFAULT);
+    fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({ agents: { processMemoryMaxBytes: 1024 ** 3 } }));
+    expect(loadFabricConfig({ cwd, agentDir, projectTrusted }).agents.processMemoryMaxBytes).toBe(DEFAULT);
+    expect(loadFabricConfigForScope({ cwd, agentDir, projectTrusted }, "global").agents.processMemoryMaxBytes).toBe(DEFAULT);
+  });
+  // Root ownership of the private test policy path only is simulated, as in process-slice-scope-e2e.
+  const withRootPolicy = <T>(document: unknown, run: () => T): T => {
+    if (!HOST_POLICY_PATH.startsWith(`${os.tmpdir()}${path.sep}`)) throw new Error("test policy path is not private");
+    fs.mkdirSync(path.dirname(HOST_POLICY_PATH), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(HOST_POLICY_PATH, JSON.stringify(document), { mode: 0o600 });
+    const ancestors = new Set<string>();
+    for (let dir = path.dirname(HOST_POLICY_PATH); ; dir = path.dirname(dir)) { ancestors.add(dir); if (path.dirname(dir) === dir) break; }
+    const as = (stat: fs.Stats, changes: Partial<fs.Stats>): fs.Stats => Object.assign(Object.create(Object.getPrototypeOf(stat)) as fs.Stats, stat, changes);
+    const lstat = fs.lstatSync, open = fs.openSync, fstat = fs.fstatSync;
+    let policyFd: number | undefined;
+    vi.spyOn(fs, "lstatSync").mockImplementation(((file: fs.PathLike, ...rest: unknown[]) => {
+      const stat = (lstat as (...args: unknown[]) => fs.Stats)(file, ...rest);
+      const name = String(file);
+      return name === HOST_POLICY_PATH || ancestors.has(name) ? as(stat, { uid: 0, ...(ancestors.has(name) ? { mode: stat.mode & ~0o022 } : {}) }) : stat;
+    }) as typeof fs.lstatSync);
+    vi.spyOn(fs, "openSync").mockImplementation(((file: fs.PathLike, ...rest: unknown[]) => {
+      const fd = (open as (...args: unknown[]) => number)(file, ...rest);
+      if (String(file) === HOST_POLICY_PATH) policyFd = fd;
+      return fd;
+    }) as typeof fs.openSync);
+    vi.spyOn(fs, "fstatSync").mockImplementation(((fd: number, ...rest: unknown[]) => {
+      const stat = (fstat as (...args: unknown[]) => fs.Stats)(fd, ...rest);
+      return fd === policyFd ? as(stat, { uid: 0 }) : stat;
+    }) as typeof fs.fstatSync);
+    try { return run(); } finally { vi.restoreAllMocks(); fs.rmSync(path.dirname(HOST_POLICY_PATH), { recursive: true, force: true }); }
+  };
+  // The fixture simulates root ownership only, never kernel capability. readHostPolicy needs O_NOFOLLOW to prove
+  // root policy (absent on Windows) and otherwise fails closed to the default; that is asserted, not skipped.
+  const rootPolicyProvable = typeof fs.constants.O_NOFOLLOW === "number";
+  it("takes a custom value from the root host policy only", () => {
+    const cwd = temporaryDirectory(); const agentDir = temporaryDirectory(); fs.mkdirSync(path.join(cwd, ".pi"));
+    fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({ agents: { processMemoryMaxBytes: 1024 ** 4 } }));
+    expect(withRootPolicy({ agents: { processMemoryMaxBytes: 8 * 1024 ** 3 } },
+      () => loadFabricConfig({ cwd, agentDir, projectTrusted: true }).agents.processMemoryMaxBytes))
+      .toBe(rootPolicyProvable ? 8 * 1024 ** 3 : DEFAULT);
+  });
+  it.runIf(rootPolicyProvable)("fails closed to the default without O_NOFOLLOW, even with root-owned policy", async () => {
+    // Proxy the test's fs so withRootPolicy's root-owner spies still apply; only O_NOFOLLOW is removed.
+    const { O_NOFOLLOW: _omitted, ...constants } = fs.constants;
+    const noNofollow = new Proxy({} as typeof fs, { get: (_, key) => key === "constants" ? constants : Reflect.get(fs, key) });
+    vi.doMock("node:fs", () => ({ ...fs, default: noNofollow, constants }));
+    vi.resetModules();
+    try {
+      const { loadFabricConfig: load } = await import("../src/config.js");
+      const cwd = temporaryDirectory(); const agentDir = temporaryDirectory();
+      expect(withRootPolicy({ agents: { processMemoryMaxBytes: 8 * 1024 ** 3 } },
+        () => load({ cwd, agentDir, projectTrusted: true }).agents.processMemoryMaxBytes)).toBe(DEFAULT);
+    } finally { vi.doUnmock("node:fs"); vi.resetModules(); }
+  });
+});
+
 describe("host-only control incarnation rollout fence (#7514)", () => {
   it("defaults to warn, accepts both modes, and rejects invalid policy values", () => {
     expect(DEFAULT_FABRIC_CONFIG.mesh.controlIncarnationFence).toBe("warn");
@@ -146,6 +212,32 @@ describe("host-only control incarnation rollout fence (#7514)", () => {
       expect(config.mesh.controlIncarnationFence).toBe("enforce");
     }
   });
+});
+describe("host-only stuckPreparingMs (smarty-dev#6337)", () => {
+  it("defaults to ten minutes and clamps to [1 s, 7 d]", () => {
+    expect(DEFAULT_FABRIC_CONFIG.agents.stuckPreparingMs).toBe(600_000);
+    expect(normalizeFabricConfig({}).agents.stuckPreparingMs).toBe(600_000);
+    expect(normalizeFabricConfig({ agents: { stuckPreparingMs: 300_000 } }).agents.stuckPreparingMs).toBe(300_000);
+    expect(normalizeFabricConfig({ agents: { stuckPreparingMs: 5 } }).agents.stuckPreparingMs).toBe(1_000);
+    expect(normalizeFabricConfig({ agents: { stuckPreparingMs: "soon" } }).agents.stuckPreparingMs).toBe(600_000);
+  });
+  it.each([true, false])("ignores even trusted project overrides (trusted=%s)", projectTrusted => {
+    const cwd = temporaryDirectory(); const agentDir = temporaryDirectory(); fs.mkdirSync(path.join(cwd, ".pi"));
+    fs.writeFileSync(path.join(cwd, ".pi", "fabric.json"), JSON.stringify({ agents: { stuckPreparingMs: 7 * 24 * 60 * 60_000 } }));
+    expect(loadFabricConfig({ cwd, agentDir, projectTrusted }).agents.stuckPreparingMs).toBe(600_000);
+    fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({ agents: { stuckPreparingMs: 120_000 } }));
+    expect(loadFabricConfig({ cwd, agentDir, projectTrusted }).agents.stuckPreparingMs).toBe(120_000);
+  });
+});
+
+it("normalizes the dead-root resident idle-exit policy, with an explicit disabled rollback", () => {
+  expect(DEFAULT_FABRIC_CONFIG.mesh.residentIdleExitMs).toBe(600_000);
+  expect(normalizeFabricConfig({}).mesh.residentIdleExitMs).toBe(600_000);
+  expect(normalizeFabricConfig({ mesh: { residentIdleExitMs: 0 } }).mesh.residentIdleExitMs).toBe(0);
+  expect(normalizeFabricConfig({ mesh: { residentIdleExitMs: 1_234 } }).mesh.residentIdleExitMs).toBe(1_234);
+  expect(normalizeFabricConfig({ mesh: { residentIdleExitMs: -1 } }).mesh.residentIdleExitMs).toBe(0);
+  expect(normalizeFabricConfig({ mesh: { residentIdleExitMs: "bad" } }).mesh.residentIdleExitMs).toBe(600_000);
+  expect(normalizeFabricConfig({ mesh: { residentIdleExitMs: 1e12 } }).mesh.residentIdleExitMs).toBe(7 * 24 * 60 * 60_000);
 });
 
 it("normalizes the reader-only idle coalescing window", () => {
@@ -172,6 +264,31 @@ it("refuses an unknown PI_FABRIC_MESH_STATE_BACKEND, never falling back to the f
     if (inherited === undefined) delete process.env.PI_FABRIC_MESH_STATE_BACKEND;
     else process.env.PI_FABRIC_MESH_STATE_BACKEND = inherited;
   }
+});
+
+describe("executor.powershell opt-in (smarty-dev#9826)", () => {
+  it("defaults to refuse and accepts only the exact allow", () => {
+    expect(DEFAULT_FABRIC_CONFIG.executor.powershell).toBe("refuse");
+    expect(normalizeFabricConfig({}).executor.powershell).toBe("refuse");
+    expect(normalizeFabricConfig({ executor: { powershell: "allow" } }).executor.powershell).toBe("allow");
+    for (const value of ["refuse", "Allow", "ALLOW", true, 1, "yes", null, {}]) {
+      expect(normalizeFabricConfig({ executor: { powershell: value } }).executor.powershell).toBe("refuse");
+    }
+  });
+  it("honors the host profile opt-in and ignores a project opt-in", () => {
+    const cwd = temporaryDirectory(); const agentDir = temporaryDirectory();
+    const options = { cwd, agentDir, projectTrusted: true };
+    expect(loadFabricConfig(options).executor.powershell).toBe("refuse");
+    fs.mkdirSync(path.join(cwd, ".pi"));
+    fs.writeFileSync(path.join(cwd, ".pi", "fabric.json"), JSON.stringify({ executor: { powershell: "allow" } }));
+    expect(loadFabricConfig(options).executor.powershell).toBe("refuse");
+    fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({ executor: { powershell: "allow" } }));
+    expect(loadFabricConfig(options).executor.powershell).toBe("allow");
+    expect(loadGlobalFabricConfig(agentDir).executor.powershell).toBe("allow");
+    // A project layer cannot withdraw it either: the key is host-only.
+    fs.writeFileSync(path.join(cwd, ".pi", "fabric.json"), JSON.stringify({ executor: { powershell: "refuse" } }));
+    expect(loadFabricConfig(options).executor.powershell).toBe("allow");
+  });
 });
 
 describe("Fabric configuration", () => {

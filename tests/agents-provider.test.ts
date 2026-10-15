@@ -400,14 +400,30 @@ describe("fleet model policy (#2490)", () => {
   });
 
   it("F6 #3115 standalone Main creation needs no participants.self API", async () => {
-    const { provider, actors, agents } = setup();
+    const { provider, actors, agents, root, mesh, identity } = setup();
     vi.spyOn(agents, "runtimeHostId", "get").mockReturnValue(undefined);
     // A minimal topology dependency is sufficient for local creation.
     delete (provider.participants as Partial<FabricParticipantSource>).self;
     const actor = await provider.invoke("create", { name: "minimal-topology", instructions: "Review." }, context) as FabricActorInfo;
     expect(actors.owns(actor.id)).toBe(true);
-    await provider.invoke("remove", { id: actor.id }, context);
-    expect(actors.list()).toEqual([]);
+    if (process.platform === "linux" || process.platform === "darwin" || process.platform === "win32") {
+      await provider.invoke("remove", { id: actor.id }, context);
+      expect(actors.list()).toEqual([]);
+    } else {
+      const historyFile = actors.status(actor.id).sessionFile!;
+      fs.appendFileSync(historyFile, `${JSON.stringify({ testHistory: "standalone Main removal" })}\n`);
+      const historyBeforeRemoval = fs.readFileSync(historyFile, "utf8");
+      const removal = await provider.invoke("remove", { id: actor.id }, context) as { removed: boolean; cleaned?: boolean; pending?: string };
+      // On unsupported platforms fence refusal follows revocation but precedes tree/presence deletion; smarty-dev#11335.
+      const pending = `removal cleanup failed: Root actor tree deletion needs the Main publication fence, which this platform (${process.platform}) lacks (smarty-dev#8090); follow-up smarty-dev#11335; the root ${identity.id} actor tree is kept (a later remove or host start finishes it)`;
+      expect(removal).toEqual({ removed: true, cleaned: false, pending });
+      expect(actors.list()).toEqual([expect.objectContaining({ id: actor.id, rootId: identity.id, status: "stopped",
+        removal: expect.objectContaining({ state: pending }) })]);
+      expect(actors.listOwned(true).some((entry) => entry.id === actor.id)).toBe(false);
+      expect(fs.existsSync(path.join(root, "actors", actor.id))).toBe(true);
+      expect(fs.readFileSync(historyFile, "utf8")).toBe(historyBeforeRemoval);
+      expect(mesh.listAll("actors/test/").map((entry) => entry.key)).toEqual([`actors/test/${actor.id}`]);
+    }
   });
 
   it("F6 #3115 missing child creation host fails closed before local commitment", async () => {
@@ -516,15 +532,52 @@ describe("fleet model policy (#2490)", () => {
           provider.participants, provider.control, provider.lifecycle, undefined, undefined, false,
         ));
         // The returned receipt supplies the exact public cleanup key; an uncancelled control still returns a handle.
-        expect((await execute(`return await agents.remove({ id: ${JSON.stringify(id)} });`)).success).toBe(true);
-        expect(actors.list()).toEqual([]); expect(mesh.listAll("actors/test/")).toEqual([]);
+        if (process.platform === "linux" || process.platform === "darwin" || process.platform === "win32") {
+          expect((await execute(`return await agents.remove({ id: ${JSON.stringify(id)} });`)).success).toBe(true);
+          expect(actors.list()).toEqual([]); expect(mesh.listAll("actors/test/")).toEqual([]);
+        } else {
+          const historyFile = actors.status(id).sessionFile!;
+          fs.appendFileSync(historyFile, `${JSON.stringify({ testHistory: `public guest ${id}` })}\n`);
+          const historyBeforeRemoval = fs.readFileSync(historyFile, "utf8");
+          const removed = await execute(`return await agents.remove({ id: ${JSON.stringify(id)} });`);
+          expect(removed.success).toBe(true);
+          // On unsupported platforms fence refusal follows revocation but precedes tree/presence deletion; smarty-dev#11335.
+          const pending = `removal cleanup failed: Root actor tree deletion needs the Main publication fence, which this platform (${process.platform}) lacks (smarty-dev#8090); follow-up smarty-dev#11335; the root ${provider.mainAgent.id} actor tree is kept (a later remove or host start finishes it)`;
+          expect(removed.value).toEqual({ removed: true, cleaned: false, pending });
+          expect(actors.list()).toEqual([expect.objectContaining({ id, rootId: provider.mainAgent.id, status: "stopped",
+            removal: expect.objectContaining({ state: pending }) })]);
+          expect(actors.listOwned(true).some((entry) => entry.id === id)).toBe(false);
+          expect(fs.existsSync(path.join(root, "actors", id))).toBe(true);
+          expect(fs.readFileSync(historyFile, "utf8")).toBe(historyBeforeRemoval);
+          expect(mesh.listAll("actors/test/").map((entry) => entry.key)).toEqual([`actors/test/${id}`]);
+        }
         await published.refresh(); expect(published.get(id)).toBeUndefined();
         const control = await execute(`return await agents.${action}(${JSON.stringify(args)});`);
         expect(control.success).toBe(true); expect(control.residentOutcomes).toBeUndefined();
         expect(control.value).toMatchObject({ name: request.name, status: "idle" });
         const controlId = (control.value as FabricActorInfo).id;
-        expect((await execute(`return await agents.remove({ id: ${JSON.stringify(controlId)} });`)).success).toBe(true);
-        expect(actors.list()).toEqual([]); expect(mesh.listAll("actors/test/")).toEqual([]);
+        if (process.platform === "linux" || process.platform === "darwin" || process.platform === "win32") {
+          expect((await execute(`return await agents.remove({ id: ${JSON.stringify(controlId)} });`)).success).toBe(true);
+          expect(actors.list()).toEqual([]); expect(mesh.listAll("actors/test/")).toEqual([]);
+        } else {
+          const controlHistoryFile = actors.status(controlId).sessionFile!;
+          fs.appendFileSync(controlHistoryFile, `${JSON.stringify({ testHistory: `public control ${controlId}` })}\n`);
+          const controlHistoryBeforeRemoval = fs.readFileSync(controlHistoryFile, "utf8");
+          const controlRemoved = await execute(`return await agents.remove({ id: ${JSON.stringify(controlId)} });`);
+          expect(controlRemoved.success).toBe(true);
+          // On unsupported platforms fence refusal follows revocation but precedes tree/presence deletion; smarty-dev#11335.
+          const pending = `removal cleanup failed: Root actor tree deletion needs the Main publication fence, which this platform (${process.platform}) lacks (smarty-dev#8090); follow-up smarty-dev#11335; the root ${provider.mainAgent.id} actor tree is kept (a later remove or host start finishes it)`;
+          expect(controlRemoved.value).toEqual({ removed: true, cleaned: false, pending });
+          expect(actors.list()).toEqual(expect.arrayContaining([
+            expect.objectContaining({ id, rootId: provider.mainAgent.id, status: "stopped", removal: expect.objectContaining({ state: expect.stringContaining("follow-up smarty-dev#11335") }) }),
+            expect.objectContaining({ id: controlId, rootId: provider.mainAgent.id, status: "stopped", removal: expect.objectContaining({ state: pending }) }),
+          ]));
+          expect(actors.list()).toHaveLength(2);
+          expect(actors.listOwned(true).some((entry) => entry.id === id || entry.id === controlId)).toBe(false);
+          expect(fs.existsSync(path.join(root, "actors", controlId))).toBe(true);
+          expect(fs.readFileSync(controlHistoryFile, "utf8")).toBe(controlHistoryBeforeRemoval);
+          expect(mesh.listAll("actors/test/").map((entry) => entry.key).sort()).toEqual([`actors/test/${id}`, `actors/test/${controlId}`].sort());
+        }
       } finally {
         fs.rmSync(lock, { recursive: true, force: true });
         await running; await done;
@@ -1323,8 +1376,15 @@ describe("#169 round 1 agents.remove cleanup routing", () => {
       state.control, state.lifecycle, undefined, { removeActor } as unknown as ResidencyClient);
     await expect(provider.invoke("remove", { id: actor.id }, context)).resolves.toMatchObject({ removed: true });
     expect(removeActor).toHaveBeenCalledExactlyOnceWith(actor.id, context.signal);
+    if (process.platform === "linux" || process.platform === "darwin" || process.platform === "win32") {
     expect(fs.existsSync(dir)).toBe(false);
     expect(await provider.invoke("actors", {}, context)).not.toContainEqual(expect.objectContaining({ id: actor.id }));
+    } else {
+      // On unsupported platforms the routed retry refuses before any delete (smarty-dev#8090; follow-up smarty-dev#11335).
+      expect(fs.existsSync(dir)).toBe(true);
+      await expect(owner.remove(actor.id)).resolves.toEqual({ removed: true, cleaned: false,
+        pending: `removal cleanup failed: Root actor tree deletion needs the Main publication fence, which this platform (${process.platform}) lacks (smarty-dev#8090); follow-up smarty-dev#11335; the root ${state.identity.id} actor tree is kept (a later remove or host start finishes it)` });
+    }
   });
 
   it.each(["project", "session"] as const)("reports and retries a cleanup-only %s id through the provider, preserving its successor", async (scope) => {
@@ -1355,12 +1415,23 @@ describe("#169 round 1 agents.remove cleanup routing", () => {
       fs.writeFileSync(successor.sessionFile!, "successor history\n");
       await expect(provider.invoke("remove", { id: actor.id.slice(0, 12) }, context)).rejects.toThrow();
       failing.mockRestore();
+      if (process.platform === "linux" || process.platform === "darwin" || process.platform === "win32") {
       await expect(provider.invoke("remove", { id: actor.id }, context)).resolves.toMatchObject({ removed: true });
       expect(directory.pendingRemovals()).toEqual([]);
       expect(fs.existsSync(dir)).toBe(false);
       expect(fs.readFileSync(successor.sessionFile!, "utf8")).toBe("successor history\n");
       expect(directory.status("retry worker").id).toBe(successor.id);
       expect(await provider.invoke("actors", {}, context)).not.toContainEqual(expect.objectContaining({ id: actor.id }));
+      } else {
+        // On unsupported platforms the retry refuses before any delete (smarty-dev#8090; follow-up smarty-dev#11335): tree kept, pending.
+        await expect(provider.invoke("remove", { id: actor.id }, context)).resolves.toMatchObject({
+          removed: true, cleaned: false,
+          pending: `removal cleanup failed: Root actor tree deletion needs the Main publication fence, which this platform (${process.platform}) lacks (smarty-dev#8090); follow-up smarty-dev#11335; the root ${state.identity.id} actor tree is kept (a later remove or host start finishes it)`,
+        });
+        expect(fs.existsSync(dir)).toBe(true);
+        expect(fs.readFileSync(successor.sessionFile!, "utf8")).toBe("successor history\n");
+        expect(directory.status("retry worker").id).toBe(successor.id);
+      }
     } finally { failing.mockRestore(); }
   });
 });
@@ -2537,38 +2608,51 @@ describe("AgentsProvider runner support", () => {
     }
   });
 
-  it("#201 never exposes a sensitive marker through projectAgent provider construction or invocation", async () => {
+  // Decision C: provider-construction unit probes, NOT new-Pi-session E2E.
+  // Named E2E: malformed .local/lead starts a new Pi session and warns; fabric-v2, after install.
+  it.each(["garbage", "empty", "directory", "symlink"])("provider starts with an ignored %s marker and warns only once without exposing contents", async (kind) => {
+    if (kind === "symlink" && process.platform === "win32") return;
     const lane = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-marker-error-"));
     roots.push(lane);
     fs.mkdirSync(path.join(lane, ".local"));
-    const secret = "ghp_sensitive_provider_marker_secret";
-    fs.writeFileSync(path.join(lane, ".local", "lead"), secret);
-    const lookup = async () => {
-      const { provider } = setup([], [], undefined, { cwd: lane });
-      return provider.invoke("projectAgent", {}, { ...context, cwd: lane });
-    };
-    await expect(lookup()).rejects.toMatchObject({
-      name: "FabricProjectLeadInvalidError", code: "FABRIC_PROJECT_LEAD_INVALID",
-      message: "Invalid project lead launch metadata: expected a regular, bounded marker containing session:<UUID>.",
+    const marker = path.join(lane, ".local", "lead");
+    if (kind === "directory") fs.mkdirSync(marker);
+    else if (kind === "symlink") fs.symlinkSync("/dev/null", marker);
+    else fs.writeFileSync(marker, kind === "empty" ? "" : "ghp_sensitive_provider_marker_secret");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { provider } = setup([], [], undefined, { cwd: lane });
+    await expect(provider.invoke("sessions", {}, { ...context, cwd: lane })).resolves.toEqual([]);
+    await expect(provider.invoke("projectAgent", {}, { ...context, cwd: lane })).rejects.toMatchObject({
+      name: "FabricProjectAgentUnresolvedError", code: "FABRIC_PROJECT_AGENT_UNRESOLVED",
     });
+    expect(warn).toHaveBeenCalledExactlyOnceWith(
+      `[pi-fabric] Ignoring invalid or unreadable project lead marker ${JSON.stringify(marker)}: expected session:<uuid>.`,
+    );
   });
 
-  it("projectAgent resolves a moved lane's same-origin remote lead using the id captured at launch", async () => {
+  it.each(["session:11111111-1111-4111-8111-111111111111", "11111111-1111-4111-8111-111111111111"])("projectAgent resolves a moved lane's same-origin remote lead using the id captured at launch: %s", async (marker) => {
     const lane = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-moved-lane-"));
     roots.push(lane);
     const git = (...args: string[]) => execFileSync("git", args, { cwd: lane, stdio: "ignore" });
     git("init", "-q");
     git("remote", "add", "origin", "git@github.com:Smarty-Pants-Inc/pi-fabric.git");
     fs.mkdirSync(path.join(lane, ".local"));
-    fs.writeFileSync(path.join(lane, ".local", "lead"), "session:11111111-1111-4111-8111-111111111111\n");
+    fs.writeFileSync(path.join(lane, ".local", "lead"), `${marker}\n`);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const base = { ownerIncarnation: "fixture:owner", format: 1, kind: "root", name: "main", status: "idle", runner: "pi", transport: "host",
       capabilities: ["steer", "followUp", "fabric"], startedAt: 1, updatedAt: 2, controlProtocol: "v1", local: false,
       stale: false, role: "project-agent", repository: "github.com/smarty-pants-inc/pi-fabric", project: "/remote/repo", cwd: "/remote/repo" };
     const lead = { ...base, id: "session:11111111-1111-4111-8111-111111111111", rootId: "session:11111111-1111-4111-8111-111111111111", ownerHostId: "remote", ownerIdentityId: "remote", remoteHost: "forge" } as FabricParticipantInfo;
     const other = { ...base, id: "session:newer", rootId: "session:newer", ownerHostId: "other", ownerIdentityId: "other", startedAt: 99 } as FabricParticipantInfo;
     const { provider } = setup([], [other, lead], undefined, { cwd: lane });
+    expect(fs.readFileSync(path.join(lane, ".local", "lead"), "utf8")).toBe(`${marker}\n`);
     fs.writeFileSync(path.join(lane, ".local", "lead"), "session:newer\n"); // must not change launch identity
     await expect(provider.invoke("projectAgent", {}, { ...context, cwd: lane })).resolves.toMatchObject({ id: lead.id });
+    expect(warn).not.toHaveBeenCalled();
+    lead.repository = "github.com/foreign/repo";
+    await expect(provider.invoke("projectAgent", {}, { ...context, cwd: lane })).rejects.toMatchObject({
+      code: "FABRIC_PROJECT_AGENT_UNRESOLVED", message: expect.stringContaining("belongs to another repository"),
+    });
   });
 
   // smarty-dev#784: a worktree agent finds its project agent by role and project.
@@ -3624,7 +3708,12 @@ return { first, second, tail: "continued" };`,
         await service.prewarm(mainContext);
         const run = vi.spyOn(agents, "run");
         const stop = vi.spyOn(agents, "stop");
-        const first = queued ? actors.ask(actor.id, "LIVE_WITHOUT_PROGRESS").catch(error => error) : undefined;
+        // smarty-dev#10340: the live worker is held by the fake worker's release file, not by its 1.5 s timer. A slow
+        // guest start (CPython on Windows) once outlived the timer, so the queued ASK was answered before admission.
+        const releaseDir = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-early-ask-"));
+        const gate = { fakeWorkerReleasePath: path.join(releaseDir, "release") };
+        const releaseWorker = () => fs.writeFileSync(gate.fakeWorkerReleasePath, "");
+        const first = queued ? actors.ask(actor.id, "LIVE_WITHOUT_PROGRESS", gate).catch(error => error) : undefined;
         if (queued) await waitFor(() => Boolean(actors.status(actor.id).inFlightRun) && "turns" in agents.list()[0]!);
         const activation = actors.status(actor.id).inFlightRun;
         let mainDeadlineAt: number | undefined;
@@ -3635,9 +3724,11 @@ return { first, second, tail: "continued" };`,
         });
         const timer = captureRuntimeDeadline(backend);
         const message = queued ? "queued advice" : "LIVE_WITHOUT_PROGRESS";
+        // The in-flight case's own live ASK is held by the same release file.
+        const data = queued ? "" : JSON.stringify(gate);
         const execution = executeAfterAdmission(signal => service.execute({
-          code: python ? `return await agents.ask(id=${JSON.stringify(actor.id)}, message=${JSON.stringify(message)})`
-            : `return agents.ask({ id: ${JSON.stringify(actor.id)}, message: ${JSON.stringify(message)} });`,
+          code: python ? `return await agents.ask(id=${JSON.stringify(actor.id)}, message=${JSON.stringify(message)}${data ? `, data=${data}` : ""})`
+            : `return agents.ask({ id: ${JSON.stringify(actor.id)}, message: ${JSON.stringify(message)}${data ? `, data: ${data}` : ""} });`,
           context: mainContext, signal, parentToolCallId: "early-runtime-ask", onPartial() {},
         }), () => timer.ready() && (queued ? actors.status(actor.id).queued === 1
           : Boolean(actors.status(actor.id).inFlightRun) && Boolean(agents.list()[0] && "turns" in agents.list()[0]!)), async () => {
@@ -3656,6 +3747,7 @@ return { first, second, tail: "continued" };`,
           const result = await execution;
           expect(result.error).toMatch(/MainExecutionCeilingError/);
           expect(result.trace.outcome).toBe("timed_out");
+          releaseWorker(); // the guest's deadline outcome is in: the accepted ASK work may finish now
           if (first) expect(await first).toMatchObject({ text: "live attempt 1 complete" });
           await waitFor(() => actorDeliveries.length === (queued ? 2 : 1) && actors.status(actor.id).status === "idle", 3_000);
           expect(actorDeliveries.map(delivery => delivery.message.text)).toEqual(queued
@@ -3664,11 +3756,13 @@ return { first, second, tail: "continued" };`,
           expect(run).toHaveBeenCalledTimes(queued ? 2 : 1);
           expect(stop).not.toHaveBeenCalled();
         } finally {
+          releaseWorker();
           timer.restore();
           await execution;
           await registry.close();
           if (first) await first;
           vi.unstubAllEnvs();
+          fs.rmSync(releaseDir, { recursive: true, force: true });
         }
     },
   );
@@ -4617,7 +4711,7 @@ describe("AgentsProvider shared actor definitions", () => {
     });
   });
 
-  it("routes passive-session ask and tell with the caller's pinned binding", async () => {
+  it.each([false, true])("routes passive-session ask and tell with the caller's pinned binding (retained=%s)", async stale => {
     const members: FabricParticipantInfo[] = [];
     const response = {
       id: "remote-response",
@@ -4664,7 +4758,7 @@ describe("AgentsProvider shared actor definitions", () => {
       updatedAt: actor.updatedAt,
       controlProtocol: "v1",
       local: false,
-      stale: false,
+      stale,
     });
 
     await expect(provider.invoke("ask", {
@@ -4682,7 +4776,7 @@ describe("AgentsProvider shared actor definitions", () => {
         binding: { model: "provider/one-off", thinking: "xhigh" },
       }),
       "identity:owner",
-      { timeoutMs: 2 * 60 * 60 * 1_000 + 30_000, routedRemoteHost: null, detachOnMainCeiling: false },
+      { timeoutMs: 2 * 60 * 60 * 1_000 + 30_000 + (stale ? 90_000 : 0), idempotencyKey: expect.any(String), routedRemoteHost: null, detachOnMainCeiling: false },
     );
 
     await expect(
@@ -4704,7 +4798,7 @@ describe("AgentsProvider shared actor definitions", () => {
         binding: { model: "provider/session", thinking: "low" },
       }),
       "identity:owner",
-      { routedRemoteHost: null, idempotencyKey: expect.any(String) },
+      { routedRemoteHost: null, idempotencyKey: expect.any(String), ...(stale ? { timeoutMs: 90_000 } : {}) },
     );
   });
 
@@ -4781,7 +4875,7 @@ describe("AgentsProvider shared actor definitions", () => {
       "ask",
       { ownerIncarnation: "fixture:owner", message: "PING", bindingProvenance: { kind: "owner-defaults", rootId: "session:test" } },
       "identity:resident",
-      { timeoutMs: DEFAULT_FABRIC_CONFIG.agents.timeoutMs + 30_000, routedRemoteHost: null, detachOnMainCeiling: false },
+      { timeoutMs: DEFAULT_FABRIC_CONFIG.agents.timeoutMs + 30_000, idempotencyKey: expect.any(String), routedRemoteHost: null, detachOnMainCeiling: false },
     );
 
     await provider.invoke("tell", {

@@ -21,6 +21,10 @@ export interface FabricJevConfig {
   maxEvaluations: number;
   maxToolCalls: number;
   maxTokens: number;
+  /** Host-only: the Node's Jev gateway Unix socket (smarty-dev#1470). Opt-in per use: only a client bound to a
+   * registered gateway use (today the per-call router's `percall_route`) goes through the gateway's
+   * `systemone` op and reads no Jev credential; every other Jev client keeps its direct route. */
+  gatewaySocket?: string;
   /**
    * Where Jev program decisions are dispatched. `fabric` (default) is always
    * in-process. `auto` opts into one jev-fabric `serve` connection per program
@@ -44,6 +48,9 @@ export const DEFAULT_JEV_CONFIG: FabricJevConfig = {
   maxTokens: 1_000_000,
   transport: "fabric",
 };
+/** An absolute, bounded, NUL-free path; the transport checks the socket itself before every connect. */
+const isGatewaySocketPath = (value: string): boolean =>
+  value.length > 1 && value.length <= 1024 && !value.includes("\0") && (value.startsWith("/") || /^[A-Za-z]:[\\/]/.test(value));
 export function normalizeJevConfig(value: unknown): FabricJevConfig {
   const input = value && typeof value === "object" && !Array.isArray(value)
     ? value as Record<string, unknown> : {};
@@ -78,6 +85,8 @@ export function normalizeJevConfig(value: unknown): FabricJevConfig {
     maxEvaluations: integer("maxEvaluations", 100_000),
     maxToolCalls: integer("maxToolCalls", 1_000_000),
     maxTokens: integer("maxTokens", 100_000_000),
+    ...(typeof input.gatewaySocket === "string" && isGatewaySocketPath(input.gatewaySocket)
+      ? { gatewaySocket: input.gatewaySocket } : {}),
     transport: input.transport === "auto" || input.transport === "jev-fabric" ? input.transport : "fabric",
   };
 }

@@ -1,3 +1,6 @@
+import { isAddressedHubFactoryEvent } from "../mesh/bridge-topics.js";
+import { slotAdmissionFor } from "../actors/slot-admission.js";
+import { recordUnknownTarget } from "../mesh/delivery-outcomes.js";
 import type {
   FabricActionDescriptor,
   FabricInvocationContext,
@@ -274,7 +277,7 @@ export class MeshHostPublishError extends Error {
   readonly code = "FABRIC_MESH_HOST_PUBLISH_REQUIRED";
   readonly retryable = false;
   constructor() {
-    super("Mesh dedupeKey and publishBatch require a trusted host component publisher");
+    super("Mesh dedupeKey, publishBatch and sync require a trusted host component publisher");
     this.name = "MeshHostPublishError";
   }
 }
@@ -294,8 +297,19 @@ const assertDedupeKey = (args: Record<string, unknown>, context: FabricInvocatio
   }
 };
 
+/** Upper bound of a host `mesh.sync` budget: a barrier that cannot confirm within it reports failure. */
+const MAX_SYNC_BUDGET_MS = 60_000;
+
 const assertPublishArguments = (actionName: string, args: Record<string, unknown>, context: FabricInvocationContext): void => {
   if (actionName === "publish") assertDedupeKey(args, context);
+  if (actionName === "sync") {
+    // Same trust class as dedupeKey and publishBatch (smarty-dev#9313): checked before any argument.
+    assertHostPublisher(context);
+    if (Object.hasOwn(args, "budgetMs") && (typeof args.budgetMs !== "number" || !Number.isFinite(args.budgetMs) ||
+        args.budgetMs < 0 || args.budgetMs > MAX_SYNC_BUDGET_MS)) {
+      throw new Error(`Mesh sync budgetMs must be a number in 0..${MAX_SYNC_BUDGET_MS}`);
+    }
+  }
   if (actionName === "publishBatch") {
     assertHostPublisher(context);
     if (!Array.isArray(args.events) || !args.events.length || args.events.length > 256) {
@@ -346,6 +360,19 @@ hostDescriptors.push({
   risk: "agent",
   namespace: "coordination",
 });
+hostDescriptors.push({
+  name: "sync",
+  description: "Durability barrier: resolve once every mesh event and state write made before the call is on disk; " +
+    "await it before fsyncing an external cursor or delivered mark that covers them. Returns { synced, through }: " +
+    "advance an event cursor only to through, the highest sequence committed to the log that the barrier made durable",
+  inputSchema: {
+    type: "object",
+    properties: { budgetMs: { type: "number", minimum: 0, maximum: MAX_SYNC_BUDGET_MS, description: "SQLite state checkpoint budget, default 1000" } },
+    additionalProperties: false,
+  },
+  risk: "agent",
+  namespace: "coordination",
+});
 const meshDescriptors = (context: FabricInvocationContext): FabricActionDescriptor[] =>
   fabricHostCallerId(context) === undefined ? descriptors : hostDescriptors;
 const normalizeHostMeshArgs = actionArgNormalizer(() => hostDescriptors);
@@ -382,7 +409,7 @@ export class MeshProvider implements FabricProvider {
     actionName: string,
     context: FabricInvocationContext,
   ): Promise<FabricActionDescriptor | undefined> {
-    if (actionName === "publishBatch") assertHostPublisher(context);
+    if (actionName === "publishBatch" || actionName === "sync") assertHostPublisher(context);
     return meshDescriptors(context).find((descriptor) => descriptor.name === actionName);
   }
 
@@ -402,6 +429,8 @@ export class MeshProvider implements FabricProvider {
     context: FabricInvocationContext,
   ): Record<string, unknown> {
     this.guardArguments(actionName, args, context);
+    // Public optional nullish fields (including `to`) intentionally normalize to omission.
+    // Raw bridge publication frames receive no argument repair and still require a string recipient.
     const normalized = (fabricHostCallerId(context) === undefined ? normalizeMeshArgs : normalizeHostMeshArgs)(actionName, args);
     this.guardArguments(actionName, normalized, context);
     return normalized;
@@ -421,6 +450,19 @@ export class MeshProvider implements FabricProvider {
         const topic = String(args.topic);
         assertPublishTopic(topic);
         const dueAt = meshScheduleDueAt(args);
+        // An immediate addressed publish needs a known target. A scheduled one (#864) is released
+        // later, when its target may exist; its presence now proves nothing either way.
+        // The hub factory role address (`factory`, any host) owns no participant record; only its
+        // exact work/owner routes skip the directory check (smarty-dev#9352).
+        if (dueAt === undefined && typeof args.to === "string" &&
+          !isAddressedHubFactoryEvent({ topic, kind: args.kind, to: args.to }) && !this.participants.get(args.to, undefined, { fresh: true }) &&
+          !this.participants.list({ scope: "project", includeStale: true, fresh: true })
+            .some(member => member.id === args.to || member.name === args.to)) {
+          const reason = `Unknown Fabric target: ${args.to}`;
+          // Coalesced per (sender, target): a publish loop to unknown targets stays bounded.
+          recordUnknownTarget(this.store.root, this.identity.id, args.to, reason);
+          throw new Error(reason);
+        }
         if (dueAt === undefined && args.key !== undefined) throw new Error("mesh.publish key requires notBefore or afterMs");
         const dedupeKey = dueAt === undefined ? namespacedDedupeKey(args, context) : undefined;
         const checked = typeof args.text === "string" ? await outgoingMessageNotice(args.text, context, this.identity.id) : undefined;
@@ -469,6 +511,14 @@ export class MeshProvider implements FabricProvider {
         }));
         context.signal?.throwIfAborted();
         return this.store.publishBatch(inputs);
+      }
+      case "sync": {
+        assertPublishArguments(actionName, args, context);
+        context.signal?.throwIfAborted();
+        // `through` is the highest sequence committed to the log before the barrier's fsync, never the
+        // reservation counter (latestSequence), which runs ahead of an append (pi-fabric#894).
+        const { through } = await this.store.sync(typeof args.budgetMs === "number" ? args.budgetMs : undefined);
+        return { synced: true, through };
       }
       case "scheduled":
         return this.store.scheduled({
@@ -558,6 +608,7 @@ export class MeshProvider implements FabricProvider {
       case "put": {
         const key = String(args.key);
         assertPublicStateKey(key);
+        if (key.startsWith("factory/review-slots/v1/")) slotAdmissionFor(this.store).guardClaimMutation(key);
         return this.store.put({
           key,
           value: args.value,
@@ -568,6 +619,7 @@ export class MeshProvider implements FabricProvider {
       case "delete": {
         const key = String(args.key);
         assertPublicStateKey(key);
+        if (key.startsWith("factory/review-slots/v1/")) slotAdmissionFor(this.store).guardClaimMutation(key);
         return this.store.delete({
           key,
           ...(typeof args.ifVersion === "number" ? { ifVersion: args.ifVersion } : {}),

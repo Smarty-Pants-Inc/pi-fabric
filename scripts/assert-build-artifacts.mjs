@@ -17,6 +17,7 @@ const stable = [
   "jev.js",
   "protocol.js",
   "judge-cli.js",
+  "resident-drain-cli.js",
   "scope.js",
   "core/provider-operations.js",
   "worker.js",
@@ -36,14 +37,21 @@ const stable = [
   "cli/index.js",
 ];
 const lazy = [
+  "actors/slot-authority.js",
+  "commands/slot-import.js",
+  "config.js",
+  "core/agent-dir.js",
+  "storage/verified-remove.js",
   "residency/launcher-owner.js",
   "judge/agent.js",
   "core/landlock.js",
+  "core/auto-approval-classifier-impl.js",
   "core/pattern-kill.js",
   "lifecycle/reload-target-profile.js",
   "lifecycle/reload-slots.js",
   "coordination/unverified-ids.js",
   "agents/model-route.js",
+  "agents/per-call-route.js",
   "agents/spawn-router.js",
   "durable/worker-host.js",
   "native-discovery.js",
@@ -52,11 +60,14 @@ const lazy = [
   "memory/extractive-history.js",
   "cli/mesh.js",
   "cli/decisions.js",
+  "mesh/nats-auth/cli.js",
   "agents/claude-cli.js",
   "agents/compact-control.js",
   "agents/result.js",
   "agents/veda-cli.js",
   "agents/transports/placement.js",
+  "agents/provider-bridge.js",
+  "core/host-sdk.js",
   "fabric-runtime-state.js",
   "components/configuration.js",
   "providers/jev-provider.js",
@@ -97,6 +108,7 @@ const lazy = [
   "worker/session-id.js",
   "guards/actor-bash-hook.js",
   "guards/model-route-hook.js",
+  "guards/sender-headers.js",
   "worker/options.js",
   "worker/recovery-watchdog.js",
   "worker/retry-profile.js",
@@ -172,10 +184,40 @@ if (!manifest.files?.includes("config/landlock-roles.json") || !existsSync(join(
 }
 const targets = (value) => typeof value === "string" ? [value]
   : value && typeof value === "object" ? Object.values(value).flatMap(targets) : [];
+// Pi packages Fabric bundles load through their node_modules resource paths
+// (Pi's packages.md); they are not part of Fabric's compiled graph.
+const hostPackages = ["@earendil-works/pi-ai", "@earendil-works/pi-agent-core", "@earendil-works/pi-coding-agent", "@earendil-works/pi-tui", "typebox"];
+const bundled = manifest.bundledDependencies ?? [];
+const bundledEntry = (target) => /^\.\/node_modules\/((?:@[^/]+\/)?[^/]+)\/(.+)$/.exec(target);
+const ownExtensions = (manifest.pi?.extensions ?? []).filter((target) => !bundledEntry(target));
+for (const name of bundled) {
+  if (!/^\d+\.\d+\.\d+$/.test(manifest.dependencies?.[name] ?? "")) {
+    throw new Error(`Bundled Pi package ${name} must be an exact runtime dependency`);
+  }
+  const bundledManifestPath = join(root, "node_modules", name, "package.json");
+  if (!existsSync(bundledManifestPath)) throw new Error(`Bundled Pi package is not installed: ${name}`);
+  const bundledManifest = JSON.parse(readFileSync(bundledManifestPath, "utf8"));
+  for (const host of hostPackages) {
+    if (bundledManifest.dependencies?.[host] !== undefined) {
+      throw new Error(`Bundled Pi package ${name} must declare host package ${host} as a peer, not a dependency`);
+    }
+  }
+}
+for (const target of manifest.pi?.extensions ?? []) {
+  const match = bundledEntry(target);
+  if (!match) continue;
+  const [, name, file] = match;
+  if (!bundled.includes(name)) throw new Error(`Extension entry ${target} is not a bundled dependency`);
+  const declared = (JSON.parse(readFileSync(join(root, "node_modules", name, "package.json"), "utf8")).pi?.extensions ?? [])
+    .map((entry) => entry.replace(/^\.\//, ""));
+  if (!declared.includes(file) || !existsSync(join(root, target))) {
+    throw new Error(`Bundled extension entry ${target} is not declared by ${name}`);
+  }
+}
 // Our operator bins ship as checked-in ./bin wrappers (package "files" includes bin/); the
 // upstream pi-fabric CLI ships from ./dist. Every other public entry must be built output.
 const binTargets = new Set(targets([manifest.bin]));
-for (const target of targets([manifest.main, manifest.types, manifest.exports, manifest.pi?.extensions, manifest.bin])) {
+for (const target of targets([manifest.main, manifest.types, manifest.exports, ownExtensions, manifest.bin])) {
   const packagedBin = binTargets.has(target) && target.startsWith("./bin/") && manifest.files?.includes("bin/");
   if ((!target.startsWith("./dist/") && !packagedBin) || target.split("/").includes("..") || !existsSync(join(root, target))) {
     throw new Error(`Missing or unpackaged public entrypoint: ${target}`);
@@ -241,14 +283,17 @@ if ([...validator.matchAll(staticImport)].length || /\bimport\s*\(/.test(validat
   throw new Error("Worker validator must be self-contained");
 }
 // Measure the entry Pi actually loads, including every shared static chunk.
-const startupFiles = staticClosure(manifest.pi.extensions.map(file => resolve(root, file)));
+const startupFiles = staticClosure(ownExtensions.map(file => resolve(root, file)));
 const startupBytes = [...startupFiles].reduce((sum, file) => sum + Buffer.byteLength(readFileSync(file)), 0);
 // 45 files: src/topology/participant-files.ts is eager (the directory and the dashboard) and also
 // imported by the lazy mesh bridge, so it is a shared chunk instead of part of index.js; the bytes
 // are the same (smarty-dev#2004).
 // Still 45 after the upstream 0.110.1 merge (smarty-dev#5776): the entry is upstream's
 // extension-bootstrap.js, and the prewalk model picker loads on first use instead of eagerly.
-if (startupBytes > 1150 * 1024 || startupFiles.size > 45) {
+// Re-baselined 2026-10-12: main + 8 KiB after #982's eager entry; smarty-dev#10373 (lazy bootstrap entry) takes it back down.
+const STARTUP_BUDGET_BYTES = 1232 * 1024;
+const STARTUP_BUDGET_FILES = 53;
+if (startupBytes > STARTUP_BUDGET_BYTES || startupFiles.size > STARTUP_BUDGET_FILES) {
   throw new Error(`Startup static graph grew beyond its budget: ${startupBytes} bytes in ${startupFiles.size} files`);
 }
 const optionalPackages = ["yaml", "@lezer/python", "shiki", "@shikijs/langs", "@shikijs/themes", "typescript", "mcporter", "jev-fabric", "@earendil-works/pi-durable", "@earendil-works/chord", "pi-fabric-worker-sdk"];
@@ -256,6 +301,16 @@ for (const file of startupFiles) {
   for (const match of readFileSync(file, "utf8").matchAll(staticImport)) {
     if (optionalPackages.some(name => match[1] === name || match[1]?.startsWith(`${name}/`))) {
       throw new Error(`Startup eagerly imports optional dependency ${match[1]} from ${file}`);
+    }
+  }
+}
+// Pi loads this graph as native ESM, where jiti's virtual host modules never
+// apply: a runtime SDK import (including the bare `import "pkg"` left by an
+// inline `type` specifier) evaluates a second, unbundled SDK in the bundled CLI.
+for (const file of startupFiles) {
+  for (const match of readFileSync(file, "utf8").matchAll(staticImport)) {
+    if (match[1] === "@earendil-works/pi-coding-agent" || match[1]?.startsWith("@earendil-works/pi-coding-agent/")) {
+      throw new Error(`Startup imports the Pi SDK at runtime from ${file}; use import type or src/core/host-sdk.ts`);
     }
   }
 }
@@ -267,7 +322,9 @@ if ([...startupFiles].some(file => /class ProviderOperations|Fabric provider ope
 const initialSource = [...startupFiles]
   .map((file) => readFileSync(file, "utf8"))
   .join("\n");
-for (const forbidden of ["src/bash-idle-watchdog.ts", "src/core/file-lock.ts", "src/guards/foreground-wait.ts", "src/lifecycle/reload-slots.ts", "src/core/landlock.ts", "src/core/pattern-kill.ts", "src/compaction/hook.ts", "src/compaction/branch-summary.ts", "src/compaction/projections.ts", "src/coordination/unverified-ids.ts", "src/main-agent.ts", "src/providers/agents-message-router.ts", "src/fabric-runtime-state.ts", "src/topology/root-inbox.ts", "src/topology/root-inbox-context.ts", "src/prewalk/handoff.ts", "src/jev/client.ts", "src/ui/languages/bend.ts", "src/ui/settings.ts", "src/ui/conversation.ts", "src/ui/conversation-chrome.ts", 'from "mcporter"', "src/native-discovery.ts", "src/memory/extractive-history.ts", "src/memory/extractive-index.ts", "src/entropy/compiler.ts", "src/entropy/trial.ts", "src/ui/image-overlays.ts", "src/ui/kitty-viewport.ts"]) {
+// file-lock, entropy/compiler and entropy/trial are eager while Pi loads dist/index.js (pi-fabric#982): its
+// re-exported entropy barrel imports them. Restore these 3 markers with the bootstrap entry, smarty-dev#10373.
+for (const forbidden of ["src/storage/verified-remove.ts", "src/bash-idle-watchdog.ts", "src/guards/foreground-wait.ts", "src/lifecycle/reload-slots.ts", "src/core/landlock.ts", "src/core/pattern-kill.ts", "src/compaction/hook.ts", "src/compaction/branch-summary.ts", "src/compaction/projections.ts", "src/coordination/unverified-ids.ts", "src/core/auto-approval-classifier-impl.ts", "src/main-agent.ts", "src/providers/agents-message-router.ts", "src/fabric-runtime-state.ts", "src/topology/root-inbox.ts", "src/topology/root-inbox-context.ts", "src/prewalk/handoff.ts", "src/jev/client.ts", "src/ui/languages/bend.ts", "src/ui/settings.ts", "src/ui/conversation.ts", "src/ui/conversation-chrome.ts", 'from "mcporter"', "src/native-discovery.ts", "src/memory/extractive-history.ts", "src/memory/extractive-index.ts", "src/ui/image-overlays.ts", "src/ui/kitty-viewport.ts"]) {
   if (initialSource.includes(forbidden)) {
     throw new Error(`Startup static graph contains lazy module marker: ${forbidden}`);
   }
@@ -280,7 +337,12 @@ if (actorBashHookFiles.size !== 1) {
 }
 const routeHookFiles = staticClosure([join(dist, "guards/model-route-hook.js")]);
 if (routeHookFiles.size !== 1) throw new Error("Model route hook must remain standalone");
+// smarty-dev#6207: loaded with -e into every Pi worker child; one self-contained file.
+if (staticClosure([join(dist, "guards/sender-headers.js")]).size !== 1) throw new Error("Sender header hook must remain standalone");
 if (initialSource.includes("src/agents/model-route.ts")) throw new Error("Model routing escaped into startup graph");
+if (initialSource.includes("src/agents/per-call-route.ts") || initialSource.includes("src/jev/gateway-transport.ts")) {
+  throw new Error("Per-call routing escaped into startup graph");
+}
 if ([...staticClosure([join(dist, "index.js"), join(dist, "fabric-runtime-state.js")])]
   .some(file => readFileSync(file, "utf8").includes("src/agents/spawn-router.ts"))) {
   throw new Error("Spawn router adapter escaped into the eager/provider static graph");
@@ -292,7 +354,7 @@ const cliEntry = join(dist, "cli/index.js");
 if (!readFileSync(cliEntry, "utf8").startsWith("#!/usr/bin/env node\n")) {
   throw new Error("pi-fabric CLI entry lost its node shebang");
 }
-for (const file of [...staticClosure([cliEntry]), ...staticClosure([join(dist, "cli/mesh.js")]), ...staticClosure([join(dist, "cli/decisions.js")])]) {
+for (const file of [...staticClosure([cliEntry]), ...staticClosure([join(dist, "cli/mesh.js")]), ...staticClosure([join(dist, "cli/decisions.js")]), ...staticClosure([join(dist, "mesh/nats-auth/cli.js")])]) {
   if (file === join(dist, "index.js") || readFileSync(file, "utf8").includes("src/fabric-runtime-state.ts")) {
     throw new Error(`pi-fabric CLI statically reaches the extension graph: ${file}`);
   }
@@ -322,5 +384,5 @@ await Promise.all(
   ),
 );
 console.log(
-  `build artifacts and lazy startup graph verified (${startupFiles.size} startup files, ${startupBytes} startup bytes, ${lazy.length} stable lazy entries, ${chunkFiles.length} chunks)`,
+  `build artifacts and lazy startup graph verified (${startupFiles.size} startup files, ${startupBytes} startup bytes, ${STARTUP_BUDGET_BYTES - startupBytes} bytes headroom, ${lazy.length} stable lazy entries, ${chunkFiles.length} chunks)`,
 );

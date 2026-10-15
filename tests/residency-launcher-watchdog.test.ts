@@ -97,6 +97,27 @@ afterEach(() => { vi.useRealTimers(); mocks.spawn.mockReset(); mocks.alive.clear
 
 const clock = () => { vi.useFakeTimers(); vi.setSystemTime(new Date("2026-01-01T00:00:00Z")); };
 
+describe("launcher intentional idle exit", () => {
+  it("makes no late diagnostic write even when the host retires before the first owner sample", async () => {
+    clock();
+    const f = fixture({ enabled: false });
+    try {
+      await vi.advanceTimersByTimeAsync(1);
+      const child = f.children[0]!;
+      fs.writeFileSync(path.join(f.root, "idle-exit.json"), JSON.stringify({ format: 1, reason: "root-dead-idle",
+        rootId: f.config.rootId, pid: child.pid, token: "fixture-owner-token", at: Date.now(), idleMs: 1 }));
+      clearInterval(child.timer);
+      mocks.alive.delete(child.pid);
+      child.emit("exit", 0, null);
+      await vi.advanceTimersByTimeAsync(100);
+      await f.done;
+      expect(f.children).toHaveLength(1);
+      expect(f.events().filter(row => row.event === "child-exit")).toEqual([]);
+      expect(fs.existsSync(path.join(f.root, "error.json"))).toBe(false);
+    } finally { await f.close(); }
+  });
+});
+
 describe("launcher watchdog Windows contract", () => {
   it.each([{}, { enabled: true }, { enabled: false }])("disables watchdog on win32 regardless of configuration %j, logging once", async settings => {
     clock();

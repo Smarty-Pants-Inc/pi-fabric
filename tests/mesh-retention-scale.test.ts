@@ -1,8 +1,8 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
-import { summaryLines, sweepMeshRetention } from "../src/storage/retention-cli.js";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { MeshRetentionApplyDisabledError, summaryLines, sweepMeshRetention } from "../src/storage/retention-cli.js";
 
 // smarty-dev#7916, measured on Ryzen 1: the installed sweep re-parsed every actor registry for every candidate run and
 // did not finish in 30 min over 606 registries. Each registry is now parsed once per sweep (re-parsed only if it
@@ -41,7 +41,7 @@ const fleet = () => {
 };
 
 describe.skipIf(process.platform !== "linux")("mesh retention at fleet scale (smarty-dev#7916)", () => {
-  it(`parses each of ${REGISTRIES} registries once per sweep, in dry run and in apply`, async () => {
+  it(`parses each of ${REGISTRIES} registries once per dry run; apply rejects before any parse (smarty-dev#10678)`, async () => {
     const root = fleet();
     let started = performance.now();
     const plan = await sweepMeshRetention(root, { now: NOW, dryRun: true, runRetentionMs: 7 * DAY });
@@ -50,13 +50,21 @@ describe.skipIf(process.platform !== "linux")("mesh retention at fleet scale (sm
     expect(plan.removedRuns).toHaveLength(REGISTRIES);
     expect(plan.summary.deleters.pruneActorRunArchives?.removed).toBe(REGISTRIES);
     expect(plan.summary.deleters.pruneActorSessionBackups?.removed).toBe(REGISTRIES);
-    started = performance.now();
-    const applied = await sweepMeshRetention(root, { now: NOW, dryRun: false, runRetentionMs: 7 * DAY });
-    const applyMs = performance.now() - started;
-    expect(applied.skipped).toEqual([]);
-    expect(applied.summary.registries).toEqual({ count: REGISTRIES, parses: REGISTRIES, maxParsesPerRegistry: 1, rootRewalks: 0 });
-    expect(applied.removedRuns.sort()).toEqual(plan.removedRuns.sort());
-    console.log(JSON.stringify({ registries: REGISTRIES, runs: REGISTRIES * 3, dryRunMs: Math.round(dryMs), applyMs: Math.round(applyMs),
+    // Apply is disabled at the public boundary (pi-fabric#1014 SEC P2-1): it rejects before any registry or mesh read.
+    const reads: string[] = [];
+    for (const name of ["lstatSync", "statSync", "readdirSync", "readFileSync", "openSync"] as const) {
+      const original = (fs[name] as (...args: unknown[]) => unknown).bind(fs);
+      vi.spyOn(fs as unknown as Record<string, (...args: unknown[]) => unknown>, name).mockImplementation((...args: unknown[]) => {
+        if (String(args[0]).startsWith(root)) reads.push(`${name} ${String(args[0])}`);
+        return original(...args);
+      });
+    }
+    try {
+      await expect(sweepMeshRetention(root, { now: NOW, dryRun: false, runRetentionMs: 7 * DAY })).rejects.toBeInstanceOf(MeshRetentionApplyDisabledError);
+    } finally { vi.restoreAllMocks(); }
+    expect(reads).toEqual([]);
+    for (const run of plan.removedRuns) expect(fs.existsSync(path.join(run, "reply.json"))).toBe(true);
+    console.log(JSON.stringify({ registries: REGISTRIES, runs: REGISTRIES * 3, dryRunMs: Math.round(dryMs),
       summary: summaryLines(true, plan.summary).slice(-2) }));
   }, 300_000);
 });

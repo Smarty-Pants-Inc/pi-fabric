@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ActorManager } from "../src/actors/manager.js";
+import type { FabricActorDeliveryRequest } from "../src/actors/types.js";
 import { DEFAULT_FABRIC_CONFIG, normalizeFabricConfig } from "../src/config.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { AgentManager } from "../src/agents/manager.js";
@@ -30,6 +31,7 @@ const setup = (options: {
   maxSessionBytes?: number;
   canManageActor?: (id: string) => boolean | undefined;
   resolvePiModel?: (model: string) => string | Promise<string>;
+  preparationTimeoutMs?: number;
 } = {}) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-actor-reset-"));
   roots.push(root);
@@ -40,9 +42,11 @@ const setup = (options: {
   });
   const identity: MeshIdentity = { id: "session:test", name: "main", kind: "main", sessionId: "test" };
   const deliveries: string[] = [];
+  const requests: FabricActorDeliveryRequest[] = [];
   const sendMessage = vi.fn();
   const pi = { sendMessage } as unknown as ExtensionAPI;
   const actors = new ActorManager("test", identity, mesh, { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 }, agents, (request) => {
+    requests.push(request);
     if (request.message.text) deliveries.push(request.message.text);
     deliverActorToMain(pi, identity, request);
   }, {
@@ -51,6 +55,7 @@ const setup = (options: {
     ...(options.maxSessionBytes !== undefined ? { maxSessionBytes: options.maxSessionBytes } : {}),
     ...(options.canManageActor ? { canManageActor: options.canManageActor } : {}),
     ...(options.resolvePiModel ? { resolvePiModel: options.resolvePiModel } : {}),
+    ...(options.preparationTimeoutMs !== undefined ? { preparationTimeoutMs: options.preparationTimeoutMs } : {}),
   });
   managers.push(actors, agents);
   // The fake worker appends each run's turns to its --session file, as Pi does: a run's
@@ -69,7 +74,7 @@ const setup = (options: {
     return run(request, signal);
   });
   return {
-    actors, agents, runs, root, mesh, deliveries, sendMessage,
+    actors, agents, runs, root, mesh, deliveries, requests, sendMessage,
     hold: () => {
       let release!: () => void;
       gate = new Promise((resolve) => { release = resolve; });
@@ -200,6 +205,59 @@ describe("actor session rotation safety (smarty-dev#2847)", () => {
     } finally { spy.mockRestore(); }
   });
 
+  // Keep reason: trust boundary, smarty-dev#12512 — agents.messages is Main-visible too.
+  it("12512 payload allowlist: session repair failure closes owner, Main and messages payloads", async () => {
+    const { actors, mesh, root, requests, sendMessage, runs } = setup();
+    const actor = await actors.create({ name: "private-repair", instructions: "Work.", delivery: "mailbox", transport: "process" });
+    const orphan = '{"type":"message","id":"private-orphan"}\n';
+    fs.mkdirSync(path.dirname(actor.sessionFile!), { recursive: true });
+    fs.writeFileSync(actor.sessionFile!, orphan);
+    const posix = "/private/12512-session/owner-record.json";
+    const windows = String.raw`C:\Users\Synthetic\12512-session\owner-record.json`;
+    const secret = "synthetic-private-token-12512-session";
+    const raw = `cannot preserve orphan: ${actor.sessionFile}; ${posix}; ${windows}; ${secret}`;
+    const before = actors.messages(actor.id, 50).length;
+    const rename = fs.renameSync.bind(fs);
+    const spy = vi.spyOn(fs, "renameSync").mockImplementation((source, target) => {
+      if (source === actor.sessionFile) throw Object.assign(new Error(raw), { code: "EACCES" });
+      return rename(source, target);
+    });
+    try {
+      // A boundary-only repair avoids confusing this alarm with a separate activation failure.
+      await expect(actors.resetSession(actor.id)).rejects.toThrow(raw);
+      await waitFor(() => mesh.read({ topic: "ops.owner" }).some(event => event.kind === "actor.session.error"));
+      const alarms = mesh.read({ topic: "ops.owner" }).filter(event => event.kind === "actor.session.error");
+      expect(alarms).toHaveLength(1);
+      expect(requests).toHaveLength(1);
+      const messages = actors.messages(actor.id, 50);
+      // No duplicate raw record or alternate message channel may preserve this alarm's detail.
+      expect(messages).toHaveLength(before + 1);
+      const visible = JSON.stringify({ owner: alarms, onDeliver: requests, main: sendMessage.mock.calls, messages });
+      for (const value of [raw, posix, windows, secret, root, actor.sessionFile!]) {
+        expect(visible).not.toContain(JSON.stringify(value).slice(1, -1));
+      }
+      expect(alarms[0]).toMatchObject({
+        topic: "ops.owner", kind: "actor.session.error", from: { id: "session:test" }, to: actor.rootId,
+        data: { actorId: actor.id }, text: expect.stringContaining("repair failed"),
+      });
+      const alarmData = alarms[0]!.data as Record<string, unknown>;
+      if ("error" in alarmData) expect(alarmData.error).toBe("error");
+      expect(requests[0]).toMatchObject({
+        actor: { id: actor.id }, delivery: "followUp", triggerTurn: true,
+        message: { actorId: actor.id, source: "fabric-host", action: "message", data: alarms[0]!.data },
+      });
+      expect(requests[0]!.message.text).toContain("agents.actorStatus");
+      expect(requests[0]!.message.text).toContain("agents.log");
+      expect(messages.at(-1)).toEqual(requests[0]!.message);
+      expect(sendMessage).toHaveBeenCalledTimes(1);
+      expect(sendMessage.mock.calls[0]?.[1]).toMatchObject({ deliverAs: "followUp", triggerTurn: true });
+      // The failed rename preserves the original privately; no worker or new archive was created.
+      expect(fs.readFileSync(actor.sessionFile!, "utf8")).toBe(orphan);
+      expect(backups(actor.sessionFile!)).toEqual([]);
+      expect(runs).toEqual([]);
+    } finally { spy.mockRestore(); }
+  });
+
   it("fails loudly if repair cannot preserve the malformed file", async () => {
     const { actors, mesh } = setup();
     const actor = await actors.create({ name: "repair-error", instructions: "Work." });
@@ -267,11 +325,14 @@ describe("actor session rotation safety (smarty-dev#2847)", () => {
     if (operation === "halt") expect(actors.halted).toBe(true);
     const alarms = mesh.read({ topic: "ops.owner" }).filter((event) => event.kind === "actor.session.repaired");
     expect(alarms).toHaveLength(1);
-    expect(alarms[0]).toMatchObject({ data: { actorId: actor.id, archived: expect.stringContaining("orphan-noheader") } });
+    expect(alarms[0]).toMatchObject({ data: { actorId: actor.id } });
+    expect(JSON.stringify(alarms[0])).not.toContain(JSON.stringify(actor.sessionFile!).slice(1, -1));
     const evidence = actors.messages(actor.id, 50).filter((message) => message.text?.includes("session repaired"));
     expect(evidence).toHaveLength(1);
     expect(evidence[0]).toMatchObject({ source: "fabric-host", data: alarms[0]!.data });
-    const archived = (alarms[0]!.data as { archived: string }).archived;
+    const kept = backups(actor.sessionFile!).filter(name => name.includes("orphan-noheader"));
+    expect(kept).toHaveLength(1);
+    const archived = path.join(path.dirname(actor.sessionFile!), kept[0]!);
     expect(fs.readFileSync(archived, "utf8")).toBe(orphan);
     expect(sessionHeader(actor.sessionFile!)).toMatchObject({ type: "session", version: 3 });
     expect(launch).not.toHaveBeenCalled();
@@ -290,7 +351,8 @@ describe("actor session rotation safety (smarty-dev#2847)", () => {
     await waitFor(() => actors.inFlightCount() === 0);
     const alarms = mesh.read({ topic: "ops.owner" }).filter((event) => event.kind === "actor.session.repaired");
     expect(alarms).toHaveLength(1);
-    expect(alarms[0]).toMatchObject({ from: { id: "session:test" }, data: { actorId: actor.id, archived: expect.stringContaining("orphan-noheader") } });
+    expect(alarms[0]).toMatchObject({ from: { id: "session:test" }, data: { actorId: actor.id } });
+    expect(JSON.stringify(alarms[0])).not.toContain(JSON.stringify(actor.sessionFile!).slice(1, -1));
     expect(deliveries.filter((text) => text.includes("session repaired"))).toHaveLength(1);
     expect(sendMessage).toHaveBeenCalledTimes(1);
     expect(sendMessage.mock.calls[0]?.[1]).toMatchObject({ deliverAs: "followUp", triggerTurn: true });
@@ -428,7 +490,14 @@ describe("actor session reset (smarty-dev#1439)", () => {
     const dir = path.dirname(actor.sessionFile!);
     fs.mkdirSync(dir, { recursive: true });
     const stamp = "20260927T150000000Z";
-    for (const name of [`session.jsonl.${stamp}.bak`, `session.jsonl.${stamp}-1.bak`]) fs.writeFileSync(path.join(dir, name), "{}\n");
+    // smarty-dev#11300: the prune orders by trusted mtime/ctime/inode and also keeps the newest by name. Written within
+    // one coarse clock tick (windows-latest), all three backups tied on time and NTFS inode order made the unsuffixed
+    // one "newest by age". Give the pre-existing backups distinct, older mtimes, as real earlier rotations have.
+    const older = Date.now() / 1000 - 120;
+    [`session.jsonl.${stamp}.bak`, `session.jsonl.${stamp}-1.bak`].forEach((name, n) => {
+      fs.writeFileSync(path.join(dir, name), "{}\n");
+      fs.utimesSync(path.join(dir, name), older + n, older + n);
+    });
     fs.writeFileSync(actor.sessionFile!, JSON.stringify({ type: "session", version: 3, id: "valid", timestamp: new Date().toISOString(), cwd: process.cwd() }) + "\n");
     vi.useFakeTimers({ toFake: ["Date"] });
     vi.setSystemTime(new Date("2026-09-27T15:00:00.000Z"));
@@ -488,6 +557,173 @@ describe("actor session reset (smarty-dev#1439)", () => {
     await expect(actors.resetSession("leased")).rejects.toThrow("owned by another host");
     expect(fs.existsSync(actor.sessionFile!)).toBe(true);
     expect(backups(actor.sessionFile!)).toEqual([]);
+  });
+
+  // smarty-dev#9890: an explicit reset is the documented repair, but a hard activation block survived it.
+  describe("hard activation block (smarty-dev#9890)", () => {
+    const AUTH = "Error: 401 Unauthorized: invalid x-api-key";
+    const presence = (mesh: MeshStore, id: string) => mesh.get(`actors/test/${id}`)?.value as Record<string, unknown> | undefined;
+    const block = async (actors: ActorManager, agents: AgentManager, id: string, times = 3) => {
+      for (let n = 0; n < times; n++) {
+        vi.mocked(agents.run).mockRejectedValueOnce(new Error(AUTH));
+        await expect(actors.ask(id, "activate")).rejects.toThrow(AUTH);
+        await waitFor(() => !actors.status(id).inFlightRun && !actors.status(id).preparing);
+      }
+    };
+
+    it("an immediate reset clears a hard block, republishes presence, and the next item runs", async () => {
+      const { actors, agents, mesh, runs } = setup();
+      const actor = await actors.create({ name: "hard-reset", instructions: "Work." });
+      await block(actors, agents, actor.id);
+      expect(actors.status(actor.id)).toMatchObject({ status: "failed", activationBlocked: { code: "auth", class: "hard" } });
+      await waitFor(() => presence(mesh, actor.id)?.status === "failed");
+      const info = await actors.resetSession(actor.id);
+      expect(info).toMatchObject({ status: "idle" });
+      expect(info).not.toHaveProperty("activationBlocked");
+      await waitFor(() => presence(mesh, actor.id)?.status === "idle");
+      expect(presence(mesh, actor.id)).not.toHaveProperty("activationBlocked");
+      const before = runs.length;
+      await expect(actors.ask(actor.id, "next item")).resolves.toMatchObject({ direction: "out" });
+      expect(runs.length - before).toBe(1);
+      await waitFor(() => actors.status(actor.id).status === "idle");
+    });
+
+    it("a deferred reset clears the hard block its in-flight run left", async () => {
+      const { actors, agents, mesh } = setup();
+      const actor = await actors.create({ name: "deferred-hard-reset", instructions: "Work." });
+      await block(actors, agents, actor.id, 2);
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => { release = resolve; });
+      let entered = false;
+      vi.mocked(agents.run).mockImplementationOnce(async () => { entered = true; await gate; throw new Error(AUTH); });
+      const failing = actors.ask(actor.id, "held failure").catch((error: Error) => error);
+      await waitFor(() => entered);
+      const reset = actors.resetSession(actor.id);
+      release();
+      expect(await failing).toBeInstanceOf(Error);
+      await expect(reset).resolves.toMatchObject({ id: actor.id, status: "idle" });
+      expect(actors.status(actor.id)).not.toHaveProperty("activationBlocked");
+      await waitFor(() => presence(mesh, actor.id)?.status === "idle");
+      expect(presence(mesh, actor.id)).not.toHaveProperty("activationBlocked");
+    });
+
+    // review P1: the deferred reset's registry save commits the cleared block, then its presence
+    // preparation times out. The rollback must restore the exact hard block and streak, durably and
+    // on the router, and must not turn the timeout into an expiring transient block.
+    it("a deferred reset whose presence preparation times out keeps the exact hard block and streak", async () => {
+      const deadline = 987_654; // a distinctive preparation deadline; its timer is captured and fired, never waited for
+      const { actors, agents, mesh, root, runs } = setup({ preparationTimeoutMs: deadline });
+      const actor = await actors.create({ name: "reset-timeout", instructions: "Work." });
+      await block(actors, agents, actor.id);
+      expect(actors.status(actor.id)).toMatchObject({ status: "failed", activationBlocked: { code: "auth", class: "hard" } });
+      const record = () => (JSON.parse(fs.readFileSync(path.join(root, "actors", "actors.json"), "utf8")) as
+        { actors: Array<Record<string, unknown>> }).actors.find((row) => row.id === actor.id);
+      const blocks: Array<Record<string, unknown>> = [];
+      const unsubscribe = actors.subscribe(() => {
+        const blocked = actors.status(actor.id).activationBlocked;
+        if (blocked && blocks.at(-1)?.count !== blocked.count) blocks.push(structuredClone(blocked) as Record<string, unknown>);
+      });
+      // Capture each preparation deadline timer; mark it settled when the manager clears it.
+      const realSetTimeout = globalThis.setTimeout, realClearTimeout = globalThis.clearTimeout;
+      const deadlines: Array<{ timer: unknown; fire: () => void; cleared: boolean }> = [];
+      vi.spyOn(globalThis, "setTimeout").mockImplementation(((callback: () => void, ms?: number, ...args: unknown[]) => {
+        const timer = realSetTimeout(callback, ms, ...args);
+        if (ms === deadline) deadlines.push({ timer, fire: callback, cleared: false });
+        return timer;
+      }) as typeof setTimeout);
+      vi.spyOn(globalThis, "clearTimeout").mockImplementation(((timer?: Parameters<typeof clearTimeout>[0]) => {
+        const entry = deadlines.find((candidate) => candidate.timer === timer);
+        if (entry) entry.cleared = true;
+        realClearTimeout(timer);
+      }) as typeof clearTimeout);
+      // Gate the presence write that would publish the cleared (unblocked) state.
+      const key = `actors/test/${actor.id}`;
+      const put = mesh.put.bind(mesh);
+      let gated = false, lateLanded = false, putsAfterLate = 0;
+      let releasePresence!: () => void;
+      const presenceGate = new Promise<void>((resolve) => { releasePresence = resolve; });
+      vi.spyOn(mesh, "put").mockImplementation(async (request) => {
+        const value = request.value as Record<string, unknown> | undefined;
+        if (request.key === key && lateLanded) putsAfterLate++;
+        if (request.key === key && !gated && value && !value.activationBlocked) {
+          gated = true;
+          await presenceGate;
+          const result = await put(request);
+          lateLanded = true;
+          return result;
+        }
+        return put(request);
+      });
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => { release = resolve; });
+      let entered = false;
+      vi.mocked(agents.run).mockImplementationOnce(async () => { entered = true; await gate; throw new Error(AUTH); });
+      try {
+        const failing = actors.ask(actor.id, "held failure").catch((error: Error) => error);
+        await waitFor(() => entered);
+        const reset = actors.resetSession(actor.id).catch((error: Error) => error);
+        release();
+        expect(await failing).toBeInstanceOf(Error);
+        // The registry save has committed; presence preparation is waiting on the gated write.
+        await waitFor(() => gated && deadlines.some((entry) => !entry.cleared));
+        const pending = deadlines.filter((entry) => !entry.cleared);
+        expect(pending).toHaveLength(1);
+        realClearTimeout(pending[0]!.timer as NodeJS.Timeout);
+        pending[0]!.fire();
+        expect(await reset).toMatchObject({ code: "FABRIC_ACTOR_PREPARATION_TIMEOUT" });
+        const hard = blocks.find((entry) => entry.count === 4);
+        expect(hard).toMatchObject({ code: "auth", class: "hard" });
+        expect(hard).not.toHaveProperty("retryAt");
+        // In memory: the exact hard block, still failed.
+        expect(actors.status(actor.id)).toMatchObject({ status: "failed", activationBlocked: hard });
+        expect(actors.status(actor.id).activationBlocked).toEqual(hard);
+        // Durable registry: the exact block and streak replace the committed cleared state.
+        await waitFor(() => JSON.stringify(record()?.activationBlocked) === JSON.stringify(hard));
+        expect(record()).toMatchObject({ activationBlocked: hard, failureStreak: { count: 4, notified: true } });
+        // The late write of the cleared state lands, and a newer write publishes the hard block over it.
+        releasePresence();
+        await waitFor(() => lateLanded && putsAfterLate > 0 && presence(mesh, actor.id)?.status === "failed");
+        expect(presence(mesh, actor.id)).toMatchObject({ status: "failed", activationBlocked: hard });
+        expect(presence(mesh, actor.id)).not.toHaveProperty("activationBlockExpired");
+        expect((presence(mesh, actor.id)!.activationBlocked as Record<string, unknown>).retryAt).toBeUndefined();
+      } finally { release(); releasePresence(); unsubscribe(); }
+      // The next explicit reset still repairs it, and the next item runs.
+      await expect(actors.resetSession(actor.id)).resolves.toMatchObject({ status: "idle" });
+      await waitFor(() => presence(mesh, actor.id)?.status === "idle");
+      const before = runs.length;
+      await expect(actors.ask(actor.id, "next item")).resolves.toMatchObject({ direction: "out" });
+      expect(runs.length - before).toBe(1);
+    });
+
+    it("a failed reset keeps the hard block", async () => {
+      const { actors, agents } = setup();
+      const actor = await actors.create({ name: "failed-reset", instructions: "Work." });
+      await actors.ask(actor.id, "seed session");
+      await block(actors, agents, actor.id);
+      const rename = fs.renameSync.bind(fs);
+      const spy = vi.spyOn(fs, "renameSync").mockImplementation((source, target) => {
+        if (source === actor.sessionFile) throw Object.assign(new Error("cannot archive"), { code: "EACCES" });
+        return rename(source, target);
+      });
+      try {
+        await expect(actors.resetSession(actor.id)).rejects.toThrow("cannot archive");
+      } finally { spy.mockRestore(); }
+      expect(actors.status(actor.id)).toMatchObject({ status: "failed", activationBlocked: { code: "auth", class: "hard" } });
+    });
+
+    it("an automatic size rotation keeps the hard block", async () => {
+      const { actors, agents, runs, hold } = setup({ maxSessionBytes: 64 });
+      const actor = await actors.create({ name: "size-rotation", instructions: "Work." });
+      await actors.ask(actor.id, "grow the session");
+      await block(actors, agents, actor.id, 1);
+      const release = hold();
+      const next = actors.ask(actor.id, "after rotation");
+      try {
+        await waitFor(() => runs.at(-1)?.task.includes("after rotation") === true);
+        expect(resets(actors, actor.id).at(-1)).toMatchObject({ data: { sessionReset: { trigger: "size" } } });
+        expect(actors.status(actor.id)).toMatchObject({ activationBlocked: { code: "auth", class: "hard" } });
+      } finally { release(); await next.catch(() => undefined); }
+    });
   });
 
   it("reads actors.maxSessionBytes from config, 20 MiB by default", () => {

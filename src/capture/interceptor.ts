@@ -39,6 +39,13 @@ export interface RegisteredToolCaptureOptions {
 }
 
 const HUB_SYMBOL = Symbol.for("pi-fabric.registered-tool-capture.v1");
+/**
+ * Set by Fabric's native SDK task entry (src/worker/task-entry.ts) to the
+ * ExtensionRunner class of the SDK it runs. There process.argv[1] is the entry
+ * script, so neither argv lookup below finds the host package and the
+ * in-realm fallback patches Fabric's private peer copy instead (#8606).
+ */
+export const HOST_EXTENSION_RUNNER_SYMBOL = Symbol.for("pi-fabric.host-extension-runner.v1");
 const ANCHOR_SYMBOL = Symbol.for("pi-fabric.registered-tool-anchor.v1");
 
 const definitionDelegatesTo = (
@@ -196,24 +203,102 @@ const entryRealmPackageRoot = (): string | undefined => {
   return undefined;
 };
 
+// Every runner method Fabric's capture and its tool_call/tool_result paths call
+// on a captured runner (catalog, wrapper, shell preflight, providers).
+const CAPTURED_RUNNER_METHODS = [
+  "getAllRegisteredTools",
+  "getActiveTools",
+  "createContext",
+  "emit",
+  "emitToolCall",
+  "emitToolResult",
+] as const;
+
+/**
+ * The task entry's registration, validated. Absent means no native task entry.
+ * Anything else that is not a plain data property holding an ExtensionRunner
+ * constructor fails closed: capturing a bogus class would leave the live SDK
+ * runner unpatched and Fabric's shell paths outside the profile guards (#8606).
+ */
+export const registeredHostExtensionRunner = (): ExtensionRunnerConstructor | undefined => {
+  const descriptor = Object.getOwnPropertyDescriptor(globalThis, HOST_EXTENSION_RUNNER_SYMBOL);
+  if (!descriptor) return undefined;
+  const refuse = (reason: string): never => {
+    throw new Error(`Pi Fabric refuses the host ExtensionRunner registered under ${String(HOST_EXTENSION_RUNNER_SYMBOL)}: ${reason}`);
+  };
+  if (!("value" in descriptor)) refuse("it is an accessor, not a data property");
+  const value: unknown = descriptor.value;
+  if (typeof value !== "function") refuse("it is not a constructor");
+  const prototype = (value as { prototype?: unknown }).prototype;
+  if (typeof prototype !== "object" || prototype === null) refuse("its prototype is not an object");
+  const missing = CAPTURED_RUNNER_METHODS.filter(
+    (method) => typeof (prototype as Record<string, unknown>)[method] !== "function",
+  );
+  if (missing.length) refuse(`its prototype lacks ${missing.join(", ")}`);
+  return value as ExtensionRunnerConstructor;
+};
+
+const realPath = (file: string): string => {
+  try {
+    return realpathSync(file);
+  } catch {
+    return file;
+  }
+};
+
+const isWithin = (directory: string, file: string): boolean => {
+  const relative = path.relative(directory, file);
+  return relative !== "" && !relative.startsWith("..") && !path.isAbsolute(relative);
+};
+
+const exportedExtensionRunner = async (entry: string): Promise<ExtensionRunnerConstructor[]> => {
+  try {
+    const module = (await import(pathToFileURL(entry).href)) as { ExtensionRunner?: unknown };
+    return isExtensionRunnerConstructor(module.ExtensionRunner) ? [module.ExtensionRunner] : [];
+  } catch {
+    return []; // Entry not importable in this realm; skip it.
+  }
+};
+
+// One Pi package ships two SDK copies with distinct ExtensionRunner identities:
+// the unbundled dist/index.js graph and the dist/bundle chunks behind the
+// published `pi` bin. Patch only the copy the running CLI evaluated. In the
+// bundled CLI, importing dist/index.js evaluated a second, unbundled SDK for a
+// class no live runner uses: hundreds of modules, each serialized to the
+// compile cache that CLI enables, on every Fabric startup and exit. The
+// bundle's SDK entry shares the chunks that CLI already evaluated, so it is a
+// module-cache hit. An unbundled CLI never evaluates the bundle's chunks, so
+// scanning them only loaded dead classes. Any other entry (embeds, wrappers
+// that set PI_PACKAGE_DIR) may use either copy.
+const packageExtensionRunnerConstructors = async (
+  packageRoot: string,
+  entry: string | undefined,
+): Promise<ExtensionRunnerConstructor[]> => {
+  const distDirectory = path.join(packageRoot, "dist");
+  const bundleDirectory = path.join(distDirectory, "bundle");
+  if (entry && isWithin(bundleDirectory, entry)) {
+    const bundled = await exportedExtensionRunner(path.join(bundleDirectory, "index.js"));
+    // Bundles without an SDK entry export the class from a chunk only.
+    return bundled.length > 0 ? bundled : bundleExtensionRunnerConstructors(bundleDirectory);
+  }
+  const unbundled = await exportedExtensionRunner(path.join(distDirectory, "index.js"));
+  if (entry && isWithin(distDirectory, entry)) return unbundled;
+  return [...unbundled, ...(await bundleExtensionRunnerConstructors(bundleDirectory))];
+};
+
 const extensionRunnerConstructors = async (): Promise<ExtensionRunnerConstructor[]> => {
   const constructors = new Set<ExtensionRunnerConstructor>();
+  // The validated, locked task-entry/durable-worker registration (#8606).
+  const registered = registeredHostExtensionRunner();
+  if (registered) constructors.add(registered);
   const packageRoots = new Set(
-    [process.env.PI_PACKAGE_DIR, hostPackageRoot(), entryRealmPackageRoot()].filter(
-      (root): root is string => typeof root === "string" && Boolean(root),
-    ),
+    [process.env.PI_PACKAGE_DIR, hostPackageRoot(), entryRealmPackageRoot()]
+      .filter((root): root is string => typeof root === "string" && Boolean(root))
+      .map(realPath),
   );
+  const entry = process.argv[1] ? realPath(process.argv[1]) : undefined;
   for (const packageRoot of packageRoots) {
-    try {
-      const hostEntry = path.join(packageRoot, "dist", "index.js");
-      const hostModule = (await import(pathToFileURL(hostEntry).href)) as {
-        ExtensionRunner?: ExtensionRunnerConstructor;
-      };
-      if (hostModule.ExtensionRunner) constructors.add(hostModule.ExtensionRunner);
-    } catch { /* host entry not importable; skip */ }
-    for (const Runner of await bundleExtensionRunnerConstructors(
-      path.join(packageRoot, "dist", "bundle"),
-    )) {
+    for (const Runner of await packageExtensionRunnerConstructors(packageRoot, entry)) {
       constructors.add(Runner);
     }
   }

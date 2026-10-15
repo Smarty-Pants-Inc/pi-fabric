@@ -16,11 +16,12 @@ const managers: AgentManager[] = [];
 const ownedRoots: string[] = [];
 beforeEach(() => {
   root = fs.mkdtempSync(path.join(os.tmpdir(), "judge-worker-test-"));
+  fs.mkdirSync(path.join(root, "cwd"));
   vi.stubEnv("PI_FABRIC_DEPTH", "0");
   deps = { policy: { version: "probe-v1", role: "Sol", pin: { model: "openai-codex/gpt-5.6-sol", effort: "max" } }, ledger: path.join(root, "ledger/route.jsonl"),
     evaluate: async () => ({ model: "fixture", answers: { verdict: { type: "choice", choice: "stalled", confidence: .6, probabilities: { moving: .4, stalled: .6, dependency: 0, agent_decision: 0, human_decision: 0, unknown: 0 } } }, usage: { input_tokens: 1, output_tokens: 1 } }),
     agent: async (request, limits, signal) => {
-      const manager = new AgentManager(root, { ...DEFAULT_FABRIC_CONFIG.agents, timeoutMs: limits.timeoutMs, maxTokensPerChild: limits.maxTokens, retainRuns: true, sessionExport: false }, { workerPath: path.resolve("dist/worker.js"), piBinary: path.resolve("tests/fixtures/fake-pi-route.mjs"), runRoot: path.join(root, "runs"), fullCodeMode: false });
+      const manager = new AgentManager(path.join(root, "cwd"), { ...DEFAULT_FABRIC_CONFIG.agents, timeoutMs: limits.timeoutMs, maxTokensPerChild: limits.maxTokens, retainRuns: true, sessionExport: false }, { workerPath: path.resolve("dist/worker.js"), piBinary: path.resolve("tests/fixtures/fake-pi-route.mjs"), runRoot: path.join(root, "runs"), fullCodeMode: false });
       managers.push(manager);
       try { const handle = await manager.spawn(request, signal); return await manager.wait(handle.id, { signal }); }
       finally { await manager.close(); }
@@ -39,14 +40,14 @@ const events = () => {
   return fs.readFileSync(path.join(runs, id, "events.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
 };
 describe.skipIf(!fs.existsSync("dist/worker.js"))("built judgment worker isolation", () => {
-  it("has only host delivery/session/reply/route hooks, no ambient authority, no full-code and no schema-free text result", async () => {
+  it("has only host delivery/session/reply/route/sender hooks, no ambient authority, no full-code and no schema-free text result", async () => {
     const result = await judge(input(), deps);
     expect(result).toMatchObject({ verdict: "unknown", reasonCode: "invalid_schema" });
     const launch = events().find(e => e.type === "fake_route_launch");
     for (const flag of ["--no-extensions", "--no-skills", "--no-prompt-templates", "--no-context-files", "--no-themes", "--no-approve", "--no-auto-compaction", "--system-prompt"]) expect(launch.argv).toContain(flag);
     expect(launch.argv[launch.argv.indexOf("--tools") + 1]).toBe("fabric_reply");
     // Delivery is a host command consuming private worker metadata, not a model tool.
-    expect(launch.argv.filter((_: string, i: number) => launch.argv[i - 1] === "-e").map((p: string) => path.basename(p))).toEqual(["principal-delivery.js", "session-id.js", "reply-tool.js", "model-route-hook.js"]);
+    expect(launch.argv.filter((_: string, i: number) => launch.argv[i - 1] === "-e").map((p: string) => path.basename(p))).toEqual(["principal-delivery.js", "session-id.js", "reply-tool.js", "model-route-hook.js", "sender-headers.js", "write-guard.js"]);
     expect(launch.header).toContain(`judgment-agent:${result.decisionId}`);
   });
   it("refuses an effort downgrade before sending any task prompt", async () => {
@@ -168,7 +169,7 @@ describe("owned cancellation, deadlines and no retry", () => {
   it.each(["RESUME_AFTER_STOP", "RESUME_AFTER_CRASH"])("never resumes or retries a spent judgment worker: %s", async text => {
     const request = input(); request.evidence.excerpts = [text];
     deps.agent = async (r, limits, signal) => {
-      const manager = new AgentManager(root, { ...DEFAULT_FABRIC_CONFIG.agents, timeoutMs: limits.timeoutMs, maxTokensPerChild: limits.maxTokens, retainRuns: false, sessionExport: false }, { workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(root, "runs"), fullCodeMode: false });
+      const manager = new AgentManager(path.join(root, "cwd"), { ...DEFAULT_FABRIC_CONFIG.agents, timeoutMs: limits.timeoutMs, maxTokensPerChild: limits.maxTokens, retainRuns: false, sessionExport: false }, { workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(root, "runs"), fullCodeMode: false });
       managers.push(manager);
       try { return await manager.run(r, signal); } finally { await manager.close(); }
     };

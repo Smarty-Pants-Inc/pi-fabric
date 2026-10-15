@@ -23,7 +23,7 @@ const fixture = (onIdle: () => void = () => {}) => {
     format: RESIDENT_HOST_FORMAT, rootId: "session:idle-poll", sessionId: "idle-poll",
     cwd: root, projectRoot: root, meshRoot: path.join(root, "mesh"),
     actorRoot: path.join(root, "actors"), residencyRoot: residentRoot(path.join(root, "mesh"), "session:idle-poll"),
-    fullCodeMode: true, agents: DEFAULT_FABRIC_CONFIG.agents, mesh: DEFAULT_FABRIC_CONFIG.mesh,
+    fullCodeMode: true, agents: DEFAULT_FABRIC_CONFIG.agents, mesh: { ...DEFAULT_FABRIC_CONFIG.mesh, residentIdleExitMs: 30_000 },
     retention: DEFAULT_FABRIC_CONFIG.retention, workerPath: path.resolve("dist/agents/worker.js"),
     fabricExtensionPath: path.resolve("dist/index.js"), piBinary: "pi", claudeBinary: "claude", vedaBinary: "veda",
   };
@@ -64,18 +64,18 @@ describe("idle resident host polling (smarty-dev#6729)", () => {
       expect(await waitUntil(() => configReads() > 0)).toBe(true);
       await host.actors.create({ name: "idle-poll", instructions: "wait", residency: "durable" });
       await host.participants.refresh();
-      // Count the fleet-wide listings the idle check itself makes. The actor mesh monitor also
-      // lists participants before each of its polls; that cadence is its own and differs by
-      // platform (a 250 ms timer on Windows, file-watch wakes plus a 2 s reconcile elsewhere).
+      // Count the idle check's ownership observations, not the implementation's full
+      // participant listings: #11107 permits reuse only after validating managed inputs.
+      // The mesh monitor's separate ownership refreshes must not enter this count.
       let inCheck = 0;
       let checkListings = 0;
-      const list = host.participants.list.bind(host.participants);
-      vi.spyOn(host.participants, "list").mockImplementation((...args: Parameters<typeof list>) => {
+      const ownership = host.participants.actorOwnership.bind(host.participants);
+      vi.spyOn(host.participants, "actorOwnership").mockImplementation((...args: Parameters<typeof ownership>) => {
         if (inCheck > 0) checkListings++;
-        return list(...args);
+        return ownership(...args);
       });
-      const active = host.actors.hasActiveDurableActor.bind(host.actors);
-      const checks = vi.spyOn(host.actors, "hasActiveDurableActor").mockImplementation(() => {
+      const active = host.actors.hasOwnedActors.bind(host.actors);
+      const checks = vi.spyOn(host.actors, "hasOwnedActors").mockImplementation(() => {
         inCheck++;
         try { return active(); } finally { inCheck--; }
       });
@@ -118,6 +118,28 @@ describe("idle resident host polling (smarty-dev#6729)", () => {
       await host.close();
       fs.rmSync(root, { recursive: true, force: true });
     };
+
+    it("does not scan retained-run references or list owned actors before maintenance is due", async () => {
+      const { root, host } = fixture();
+      try {
+        await start(host);
+        vi.spyOn(ResidentRequestRetention.prototype, "due").mockReturnValue(false);
+        const references = vi.spyOn(host.agents, "retentionReferences");
+        let maintenanceListings = 0;
+        const list = host.actors.listOwned.bind(host.actors);
+        vi.spyOn(host.actors, "listOwned").mockImplementation(() => {
+          // Startup/dormancy has an independent actor observation, not retention work.
+          if (new Error().stack?.includes("#maintainRequests")) maintenanceListings++;
+          return list();
+        });
+        // Several original 100 ms maintenance ticks, but no retention obligation.
+        await sleep(400);
+        expect(references).not.toHaveBeenCalled();
+        expect(maintenanceListings).toBe(0);
+      } finally {
+        await finish(host, root);
+      }
+    });
 
     it("applies a replaced config.json retention overlay at the next maintenance pass, then caches it", async () => {
       const { root, config, file, host } = fixture();
@@ -169,13 +191,15 @@ describe("idle resident host polling (smarty-dev#6729)", () => {
 
   it("never exits on a reused actor observation: an idle exit is confirmed by a current check", async () => {
     let idled = 0;
-    const { root, host } = fixture(() => { idled++; });
     let now = Date.now();
+    // Freeze before construction/startup: fence and recovery latency are not idle time.
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+    const { root, host } = fixture(() => { idled++; });
     try {
       await host.start();
-      const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
       let active = false;
-      const checks = vi.spyOn(host.actors, "hasActiveDurableActor").mockImplementation(() => active);
+      const checks = vi.spyOn(host.actors, "hasOwnedActors").mockImplementation(() => active);
+      await sleep(200); // Start the continuously dead-and-empty observation window.
       // Just short of the idle window: the next tick takes a current (inactive) observation.
       now += 29_950;
       await sleep(200);
@@ -189,11 +213,13 @@ describe("idle resident host polling (smarty-dev#6729)", () => {
       expect(idled).toBe(0);
       // Truly idle for the whole window again: the host exits.
       active = false;
+      now += 1_000;
+      await sleep(200); // First confirmed zero-actor sample starts the new window.
       now += 30_100;
       await sleep(200);
       expect(idled).toBeGreaterThan(0);
-      clock.mockRestore();
     } finally {
+      clock.mockRestore();
       await host.close();
       fs.rmSync(root, { recursive: true, force: true });
     }
@@ -206,6 +232,7 @@ describe("idle resident host polling (smarty-dev#6729)", () => {
     const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
     try {
       await host.start();
+      await sleep(200);
       // Close to the idle window with no actor: the next tick caches an inactive observation.
       now += 29_000;
       await sleep(200);
@@ -222,6 +249,9 @@ describe("idle resident host polling (smarty-dev#6729)", () => {
       expect(runs).toHaveBeenCalledTimes(1);
       await host.actors.stop(actor.id);
       expect(host.actors.status(actor.id).status).toBe("stopped");
+      // A stopped actor still belongs to this resident. Only removal leaves zero actors.
+      await host.actors.remove(actor.id);
+      await sleep(200);
       // The clock did not move: by time alone every tick during the run reused the inactive sample.
       expect(Date.now()).toBe(sampledAt);
       const ended = now;

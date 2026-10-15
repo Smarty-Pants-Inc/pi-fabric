@@ -519,32 +519,131 @@ describe("FabricUiController dashboard wiring", () => {
     }
   });
 
-  it("surfaces dashboard refresh failures while retaining the last snapshot", async () => {
+  it("reports each dashboard refresh cause once per lifecycle while retaining the last snapshot", async () => {
+    vi.useFakeTimers();
     const state = stubState();
-    vi.mocked(state.activity.runs).mockImplementation(() => {
-      throw new Error("corrupt activity state");
-    });
+    let cause = "corrupt activity state";
+    vi.mocked(state.activity.runs).mockImplementation(() => { throw new Error(cause); });
+    let onActor = (): void => {};
+    vi.mocked(state.actors.subscribe).mockImplementation(listener => { onActor = listener; return () => {}; });
     const notify = vi.fn();
     const context = {
       mode: "tui",
       modelRegistry: { getAvailable: () => [] },
-      ui: {
-        custom: vi.fn(async () => undefined),
-        notify,
-        setWidget: vi.fn(),
-      },
+      ui: { custom: vi.fn(async () => undefined), notify, setWidget: vi.fn() },
     } as unknown as ExtensionContext;
     const controller = new FabricUiController(state);
     try {
-      await controller.openDashboard(context);
+      controller.start(context);
       expect(notify).toHaveBeenCalledWith(
         "Fabric dashboard refresh failed: corrupt activity state",
         "warning",
       );
+      await vi.advanceTimersByTimeAsync(10_001);
+      onActor();
+      await vi.advanceTimersByTimeAsync(100);
+      expect(notify).toHaveBeenCalledTimes(1);
+
+      cause = "different activity failure";
+      onActor();
+      await vi.advanceTimersByTimeAsync(100);
+      expect(notify).toHaveBeenCalledTimes(2);
+      expect(notify).toHaveBeenLastCalledWith(
+        "Fabric dashboard refresh failed: different activity failure",
+        "warning",
+      );
+
+      controller.stop();
+      controller.start(context);
+      expect(notify).toHaveBeenCalledTimes(3);
+      expect(notify).toHaveBeenLastCalledWith(
+        "Fabric dashboard refresh failed: different activity failure",
+        "warning",
+      );
     } finally {
       controller.stop();
+      vi.useRealTimers();
     }
   });
+
+  it.each(["instructions", "messages"] as const)(
+    "silently drops a list-derived gone actor when its %s read reports Unknown Fabric actor",
+    async missingRead => {
+      vi.useFakeTimers();
+      const state = stubState();
+      // Fixture boundary: this list-only row has the persisted foreign session
+      // orphan shape appended by ActorDirectory.list(); no actor is deleted here.
+      const gone = {
+        ...stubActor,
+        id: "sessionOrphan-row",
+        name: "vanished actor",
+        scope: "session",
+        rootId: "session:old",
+        status: "stopped",
+        sessionOrphan: { oldRoot: "session:old", reason: "Main owner process is dead" },
+      };
+      const live = { ...stubActor, id: "live-actor", name: "live actor" };
+      vi.mocked(state.actors.list).mockReturnValue([gone, live] as never);
+      let goneExists = false;
+      if (missingRead === "instructions") {
+        vi.mocked(state.actors.instructions).mockImplementation(id => {
+          if (id === gone.id && !goneExists) throw new Error(`Unknown Fabric actor: ${id}`);
+          return id === gone.id ? "Returned instructions" : "Live instructions";
+        });
+      } else {
+        vi.mocked(state.actors.messages).mockImplementation(id => {
+          if (id === gone.id && !goneExists) throw new Error(`Unknown Fabric actor: ${id}`);
+          return [];
+        });
+      }
+      let onActor = (): void => {};
+      vi.mocked(state.actors.subscribe).mockImplementation(listener => { onActor = listener; return () => {}; });
+      let dashboard: FabricDashboard | undefined;
+      const context = {
+        mode: "tui",
+        modelRegistry: { getAvailable: () => [] },
+        ui: {
+          custom: vi.fn(async (factory: (t: TUI, theme: Theme, keys: unknown, done: () => void) => FabricDashboard) => {
+            dashboard = factory({ requestRender: vi.fn() } as unknown as TUI, theme, {}, () => {});
+          }),
+          notify: vi.fn(),
+          setWidget: vi.fn(),
+        },
+      } as unknown as ExtensionContext;
+      const controller = new FabricUiController(state);
+      try {
+        controller.start(context);
+        await controller.openDashboard(context);
+        dashboard!.handleInput("l");
+        dashboard!.handleInput("\r");
+        expect(dashboard!.render(120).join("\n")).toContain("live actor");
+        expect(controller.snapshot().actors.map(actor => actor.id)).toEqual([live.id]);
+        expect(context.ui.notify).not.toHaveBeenCalled();
+
+        // Repeated event refreshes remain quiet even after the old time-based
+        // warning throttle would have expired; resume-style lifecycle also resets it.
+        await vi.advanceTimersByTimeAsync(10_001);
+        onActor();
+        await vi.advanceTimersByTimeAsync(100);
+        expect(context.ui.notify).not.toHaveBeenCalled();
+        controller.stop();
+        controller.start(context);
+        expect(context.ui.notify).not.toHaveBeenCalled();
+
+        // A still-present list row is not permanently blacklisted: once the actor
+        // can be read again, a normal event refresh restores it to the real UI.
+        goneExists = true;
+        onActor();
+        await vi.advanceTimersByTimeAsync(100);
+        expect(controller.snapshot().actors.map(actor => actor.id)).toContain(gone.id);
+        expect(context.ui.notify).not.toHaveBeenCalled();
+      } finally {
+        dashboard?.dispose();
+        controller.stop();
+        vi.useRealTimers();
+      }
+    },
+  );
 
   it("refreshes streaming activity from payload-free summaries unless the dashboard is open", async () => {
     vi.useFakeTimers();
@@ -1219,5 +1318,72 @@ describe("FabricUiController dashboard wiring", () => {
       controller.stop();
       vi.useRealTimers();
     }
+  });
+});
+
+// smarty-dev#8881: AgentSession.dispose() invalidates the controller's captured ctx without
+// session_shutdown; each getter then throws Pi's stale-ctx error from timers and subscriptions.
+describe("FabricUiController after session disposal", () => {
+  const disposable = () => {
+    let stale = false;
+    const touched: string[] = [];
+    const ui = { setWidget: vi.fn(), notify: vi.fn() };
+    const context = {} as ExtensionContext;
+    for (const [key, value] of Object.entries({ mode: "tui", hasUI: true, ui, isIdle: () => true })) {
+      Object.defineProperty(context, key, { get() {
+        if (stale) { touched.push(key); throw new Error("This extension ctx is stale after session replacement or reload."); }
+        return value;
+      } });
+    }
+    return { context, ui, touched, dispose: () => { stale = true; } };
+  };
+
+  it("retires a pending refresh, stale subscriptions and stop() without touching the disposed ctx", async () => {
+    vi.useFakeTimers();
+    const state = stubState();
+    let changed = () => {};
+    vi.mocked(state.actors.subscribe).mockImplementation(listener => { changed = listener; return () => {}; });
+    const controller = new FabricUiController(state);
+    const old = disposable();
+    try {
+      controller.start(old.context);
+      changed();
+      expect(vi.getTimerCount()).toBe(1);
+      old.dispose();
+      const widgetCalls = old.ui.setWidget.mock.calls.length;
+      let timerError: unknown;
+      try { await vi.advanceTimersByTimeAsync(60_001); } catch (error) { timerError = error; }
+      expect(timerError).toBeUndefined();
+      expect(() => changed()).not.toThrow(); // a subscription emission after disposal
+      expect(() => controller.setHostStreaming(true)).not.toThrow();
+      expect(() => controller.stop()).not.toThrow();
+      expect(vi.getTimerCount()).toBe(0);
+      expect(old.ui.notify).not.toHaveBeenCalled();
+      expect(old.ui.setWidget).toHaveBeenCalledTimes(widgetCalls);
+      expect(old.touched.filter(key => key !== "hasUI")).toEqual([]);
+    } finally { controller.stop(); vi.useRealTimers(); }
+  });
+
+  it("starts cleanly on a new session after the old ctx was disposed, keeping UI refresh", async () => {
+    vi.useFakeTimers();
+    const state = stubState();
+    let changed = () => {};
+    vi.mocked(state.actors.subscribe).mockImplementation(listener => { changed = listener; return () => {}; });
+    const controller = new FabricUiController(state);
+    const old = disposable();
+    const fresh = disposable();
+    try {
+      controller.start(old.context);
+      changed();
+      old.dispose();
+      expect(() => controller.start(fresh.context)).not.toThrow();
+      expect(old.touched.filter(key => key !== "hasUI")).toEqual([]);
+      vi.mocked(state.mainAgentInfo).mockClear();
+      changed();
+      expect(vi.getTimerCount()).toBe(1);
+      await vi.advanceTimersByTimeAsync(60_001);
+      expect(state.mainAgentInfo).toHaveBeenCalledWith(fresh.context);
+      expect(fresh.ui.notify).not.toHaveBeenCalled();
+    } finally { controller.stop(); vi.useRealTimers(); }
   });
 });

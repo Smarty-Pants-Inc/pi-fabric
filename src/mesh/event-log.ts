@@ -3,14 +3,22 @@ import type { FabricMessageSender } from "../protocol.js";
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { writeFileAtomic, syncPathNamespace } from "../core/atomic-write.js";
+import { writeFileAtomic, syncPathNamespace, requireNamespaceBarrier, syncPathNamespaceDurable } from "../core/atomic-write.js";
+import { meshEventsNotDurable } from "./not-durable.js";
 import { readJsonlPage } from "../log-tail.js";
 import { MeshArchive, MeshArchiveLookupUnavailableError, MeshArchiveRecoveryChanged, type MeshArchiveEntry, type MeshArchiveRecoveryPlan } from "./archive.js";
 import { delay, errorCode, type MeshLock, type MeshStoreContext } from "./mesh-lock.js";
 import { jsonClone } from "./state-file.js";
+import { verifiedRemove } from "../storage/verified-remove.js";
 
 // Mesh events (smarty-dev#6477 L0): publish, publishBatch, dedupe receipts, the live log, its
 // compaction, archive coupling and recovery, and cursor reads.
+
+// smarty-dev#10391: stop a catch-up prefix at either bound so other writers can interleave.
+// Check elapsed time between events: one synchronous append/fsync or scheduler stall cannot
+// be preempted. SQLite ownership fences already release per event; these cap the outer .lock.
+export const BRIDGE_BATCH_MAX_EVENTS = 32;
+export const BRIDGE_BATCH_MAX_MS = 50;
 
 export interface MeshIdentity {
   id: string;
@@ -152,6 +160,22 @@ interface AfterUnlock {
 // later append enqueues a new barrier, even while an earlier one is running (pi-fabric#550).
 const eventBarriers = new Map<string, Promise<void>>();
 
+/**
+ * Test-only (smarty-dev#9313), off unless PI_FABRIC_TEST_PAUSE_AFTER_RESERVE names a file: a
+ * publisher that has reserved its sequence writes `<file>.reserved` (the sequence) and then blocks,
+ * still under `.lock` and before its append, until `<file>.go` exists (30 s at most). Production
+ * never sets it; it opens the reservation-to-append window for a cross-process race test.
+ */
+const pauseAfterReserveForTest = (file: string, sequence: number): void => {
+  fs.writeFileSync(`${file}.reserved`, String(sequence));
+  const sleeper = new Int32Array(new SharedArrayBuffer(4));
+  const deadline = Date.now() + 30_000;
+  while (!fs.existsSync(`${file}.go`)) {
+    if (Date.now() > deadline) throw new Error("PI_FABRIC_TEST_PAUSE_AFTER_RESERVE timed out");
+    Atomics.wait(sleeper, 0, 0, 5);
+  }
+};
+
 export class MeshDedupeRecoveryError extends Error {
   readonly retryable = true;
   constructor(message: string, options?: { cause?: unknown }) {
@@ -206,7 +230,8 @@ export class EventLog {
   #oldestLive: { identity: string; sequence: number | undefined } | undefined;
   #preparedLiveCatchUp: PreparedLiveCatchUp | undefined;
 
-  constructor(context: MeshStoreContext, options: EventLogOptions) {
+  constructor(context: MeshStoreContext, options: EventLogOptions,
+    readonly indexDeliveryBeforeAppend?: (event: MeshEvent) => void) {
     const { root, maxEventBytes } = context;
     this.root = root;
     this.maxEventBytes = maxEventBytes;
@@ -240,26 +265,60 @@ export class EventLog {
     return path.join(this.root, "event-receipts", createHash("sha256").update(dedupeKey).digest("hex") + suffix);
   }
 
-  #confirmEventFile(file: string): void {
+  /** `durable`: the mesh.sync barrier, whose namespace step fails closed where there is none (win32). */
+  #confirmEventFile(file: string, durable = false): void {
     const fd = fs.openSync(file, process.platform === "win32" ? "r+" : "r");
-    try { fs.fsyncSync(fd); syncPathNamespace(file, fs.fstatSync(fd)); } finally { fs.closeSync(fd); }
+    try {
+      fs.fsyncSync(fd);
+      if (durable) syncPathNamespaceDurable(file, fs.fstatSync(fd), meshEventsNotDurable);
+      else syncPathNamespace(file, fs.fstatSync(fd));
+    } finally { fs.closeSync(fd); }
   }
 
   /** Fsync the live log and its namespace outside `.lock`. Group commit: callers whose append
-   * completed before the barrier starts share one fsync (the jbd2 commit is the cost). */
-  #confirmEventsAfterRelease(): Promise<void> {
+   * completed before the barrier starts share one fsync (the jbd2 commit is the cost). A durable
+   * caller joining a queued publish barrier gets the same barrier: the variants differ only where
+   * sync() already refused, before any I/O. */
+  #confirmEventsAfterRelease(durable = false): Promise<void> {
     const file = this.#eventsPath;
     const queued = eventBarriers.get(file);
     if (queued) return queued;
     const barrier = new Promise<void>((resolve, reject) => {
       setImmediate(() => {
         eventBarriers.delete(file);
-        try { this.#confirmEventFile(file); resolve(); }
+        try { this.#confirmEventFile(file, durable); resolve(); }
         catch (error) { reject(error); }
       });
     });
     eventBarriers.set(file, barrier);
     return barrier;
+  }
+
+  /**
+   * Durability barrier for events (smarty-dev#9313): resolves once every event committed to the
+   * live log before the call, by any process on this root, is on disk. It is the same group-commit
+   * barrier a durable publish uses: one fsync of events.jsonl and its namespace, outside `.lock`
+   * (a queued barrier that has not started yet covers this call too). Archived events need nothing
+   * more: each archive line is fdatasynced before its event goes live. No live log, no event.
+   *
+   * Resolves with `through`: the highest sequence COMMITTED to the live log (on a complete line)
+   * when the barrier was requested, read before its fsync starts, so the fsync covers that line and
+   * every line before it. Never the reservation counter (latestSequence): a publisher advances that
+   * under `.lock` before it appends, so a reserved sequence may not be in the log yet
+   * (pi-fabric#894). Zero when the live log holds no complete event.
+   *
+   * Fails closed with MeshEventsNotDurableError on a platform with no namespace barrier (win32),
+   * before any I/O: neither the live log's renames nor the archive's new segments can be confirmed
+   * there (pi-fabric#894 CODE_REVIEW), so no claim is made, even for an empty root.
+   */
+  async sync(): Promise<number> {
+    requireNamespaceBarrier(meshEventsNotDurable);
+    if (!fs.existsSync(this.#eventsPath)) return 0;
+    // Sample first, then queue the barrier: a queued barrier has not started (it runs in a later
+    // setImmediate), so its fsync begins after this read in every case.
+    const through = this.#readCommittedSequence();
+    await this.#confirmEventsAfterRelease(true);
+    return through;
   }
 
   /** The live barrier stays after release. Receipt installation/removal reacquires .lock
@@ -644,6 +703,10 @@ export class EventLog {
         if (intentPath && this.#pruneDedupeReceipts(1) >= this.#maxDedupeReceipts) {
           throw new MeshDedupeStoreFullError(this.#maxDedupeReceipts);
         }
+        // Match and bound the wake set before touching the live/archive event. Overflow
+        // remains a durable pending nudge for the next delivery, never a post-append throw.
+        // A failed append can leave only a harmless nudge; actor cursors still own delivery.
+        this.indexDeliveryBeforeAppend?.(event);
         // The counter is a reservation: a crash after it leaves a gap, never a reused sequence.
         // The archive holds the event durably before it goes live (smarty-dev#754); the live
         // append commits it. If either step fails, the event is cut back out of the archive.
@@ -651,6 +714,7 @@ export class EventLog {
         // burst of 160 publishes held other writers up to 1.3 s at 5x the fleet rate. If the
         // lock's held share matters (#816), sync after unlocking so concurrent syncs share a commit.
         atomicWrite(this.#counterPath, sequence);
+        if (process.env.PI_FABRIC_TEST_PAUSE_AFTER_RESERVE) pauseAfterReserveForTest(process.env.PI_FABRIC_TEST_PAUSE_AFTER_RESERVE, sequence);
         let liveOffset = 0;
         try { liveOffset = fs.statSync(this.#eventsPath).size; }
         catch (error) { if (errorCode(error) !== "ENOENT") throw error; }
@@ -735,7 +799,8 @@ export class EventLog {
     return event;
   }
 
-  /** Commits a prefix in order under one lock. At most 256 events and 50 ms of work
+  /** Commits a prefix in order under one lock. At most BRIDGE_BATCH_MAX_EVENTS events and
+   * BRIDGE_BATCH_MAX_MS of work
    * (checked between events; a synchronous fsync/scheduler stall cannot be preempted).
    * Events retain publish's append/archive/receipt protocol. Under the lock only the appends
    * (and a keyed event's intent fence, or an archive-coupled receipt) run; one live-log barrier
@@ -765,7 +830,8 @@ export class EventLog {
           for (const { commit, outcome, after } of prepared) {
             // Keep the entire uncheckpointed prefix inside the retained tail, including
             // a line-boundary slack event, rather than compacting away its recovery IDs.
-            if (events.length && (performance.now() - started >= 50 || bytes + 2 * this.maxEventBytes + 1 > this.#retainedEventLogBytes)) break;
+            if (events.length && (events.length >= BRIDGE_BATCH_MAX_EVENTS || performance.now() - started >= BRIDGE_BATCH_MAX_MS ||
+                bytes + 2 * this.maxEventBytes + 1 > this.#retainedEventLogBytes)) break;
             try { events.push(commit()); committed.push(after); bytes += outcome.bytes; }
             catch (error) {
               // After append begins, success may be unknown. Stop rather than replay a
@@ -1320,21 +1386,26 @@ export class EventLog {
     if (reserve && count <= limit) return count;
     const candidates = receipts.filter(name => !pending.has(name.slice(0, -".json".length))).map(name => {
       const file = path.join(directory, name);
+      // The judged receipt's identity, captured before its age is read (smarty-dev#8907).
+      const stat = fs.lstatSync(file);
       const event = JSON.parse(fs.readFileSync(file, "utf8")) as MeshEvent;
       if (typeof event.dedupeKey !== "string" || this.#dedupePath(event.dedupeKey, ".json") !== file ||
           typeof event.id !== "string" || !Number.isSafeInteger(event.sequence) ||
           !Number.isFinite(event.createdAt)) {
         throw new Error("Invalid event publication receipt");
       }
-      return { file, createdAt: event.createdAt, sequence: event.sequence };
+      return { file, stat, createdAt: event.createdAt, sequence: event.sequence };
     });
     candidates.sort((a, b) => a.createdAt - b.createdAt || a.sequence - b.sequence || a.file.localeCompare(b.file));
     const now = Date.now();
     try {
       for (const receipt of candidates) {
         if (now - receipt.createdAt < this.#dedupeReceiptTtlMs && count <= limit) break;
-        fs.rmSync(receipt.file, { force: true });
-        count--;
+        // A replaced or refreshed receipt is refused and still counts: admission fails closed.
+        // File-only (main's non-recursive rmSync); the names above are exact hex patterns, so verifiedRemove's
+        // `.retention-graveyard-<pid>` directory (and a refused entry left inside it) is never enumerated or counted.
+        if (receipt.stat.isFile() && verifiedRemove(receipt.file, receipt.stat, { deleter: "meshDedupeReceiptPrune",
+          fallback: () => { fs.rmSync(receipt.file, { force: true }); return true; } }).removed) count--;
       }
     } finally {
       // Persist removals once per pass, including any completed before a later unlink failed.
@@ -1411,6 +1482,32 @@ export class EventLog {
         if (found !== undefined) return found;
       }
       return this.#lastSequenceIn(descriptor, size, window, true) ?? 0;
+    } catch (error) {
+      if (errorCode(error) === "ENOENT") return 0;
+      throw error;
+    } finally {
+      if (descriptor !== undefined) fs.closeSync(descriptor);
+    }
+  }
+
+  /**
+   * The highest committed sequence: the last parsable line that ends in a newline. A line without
+   * its newline is an append in progress (or one a crash cut, which repair truncates), and the
+   * reservation counter is never read. Zero without a complete event line (smarty-dev#9313).
+   */
+  #readCommittedSequence(): number {
+    let descriptor: number | undefined;
+    try {
+      descriptor = fs.openSync(this.#eventsPath, "r");
+      const size = fs.fstatSync(descriptor).size;
+      if (size === 0) return 0;
+      const window = Math.min(size, this.maxEventBytes + 1);
+      const tail = Buffer.allocUnsafe(window);
+      fs.readSync(descriptor, tail, 0, window, size - window);
+      const newline = tail.lastIndexOf(0x0a);
+      if (newline < 0) return 0;
+      const complete = size - window + newline + 1;
+      return this.#lastSequenceIn(descriptor, complete, Math.min(complete, this.maxEventBytes + 2), true) ?? 0;
     } catch (error) {
       if (errorCode(error) === "ENOENT") return 0;
       throw error;

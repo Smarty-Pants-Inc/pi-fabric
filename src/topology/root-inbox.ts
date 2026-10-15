@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { appendDeliveryOutcome } from "../mesh/delivery-outcomes.js";
 import { MeshBackgroundQueue } from "../core/atomic-write.js";
 import type { MeshEvent, MeshIdentity, MeshStore } from "../mesh/store.js";
 import {
@@ -38,6 +39,13 @@ export const ROOT_INBOX_PREFIX = "topology/inbox/";
 export const WORK_TOPIC_PREFIX = "fleet.";
 /** A shadow record newer than this waits a reconcile, so its steer can arrive first and win. */
 const STEER_GRACE_MS = 60_000;
+/**
+ * Idle wake priority (smarty-dev#4313): an event addressed to this exact session id wakes an idle
+ * Main at once, past the steer grace and the wake cooldown. It admits the ordered prefix before
+ * it, so the cursor never passes earlier work it has not admitted (at least once: a native steer
+ * that lands after the shadow was injected can duplicate it; confirmed receipts still suppress).
+ * Name/alias-addressed events keep the grace; unaddressed events never hold the cursor.
+ */
 const NEVER_EXPIRE_KINDS = new Set(["answer", "blocker", "handoff", "completion"]);
 const LATE_DELIVERY_HOUR_MS = 60 * 60_000;
 const inboxHorizonMs = (): number => {
@@ -58,7 +66,8 @@ const MAX_BATCH_TEXT_BYTES = 32 * 1024;
 const MAX_EVENT_TEXT_BYTES = 8 * 1024;
 /**
  * Every idle wake is a model turn (smarty-dev#1579), so an idle root wakes at most this often,
- * unless the batch holds an urgent event. PI_FABRIC_INBOX_WAKE_COOLDOWN_MS overrides it.
+ * unless the batch holds an urgent event. PI_FABRIC_INBOX_WAKE_COOLDOWN_MS overrides it, capped at
+ * MAX_WAKE_COOLDOWN_MS so a typo cannot silence idle wakes for days.
  */
 const WAKE_COOLDOWN_MS = 5 * 60_000;
 const URGENT_KINDS = new Set(["p0", "steer"]);
@@ -67,9 +76,17 @@ export const ROOT_INBOX_WAKE_TOPIC = "fabric.inbox.wake";
 /** Observational, once per pending range, only when a turn proves the root is active. */
 export const ROOT_INBOX_ALARM_TOPIC = "fleet.alarm.root-inbox";
 const PENDING_ALARM_MS = 15 * 60_000;
+const MAX_WAKE_COOLDOWN_MS = 60 * 60_000;
+let warnedWakeCooldownCap = false;
 const wakeCooldownMs = (): number => {
   const value = Number(process.env.PI_FABRIC_INBOX_WAKE_COOLDOWN_MS);
-  return process.env.PI_FABRIC_INBOX_WAKE_COOLDOWN_MS?.trim() && Number.isFinite(value) && value >= 0 ? value : WAKE_COOLDOWN_MS;
+  if (!process.env.PI_FABRIC_INBOX_WAKE_COOLDOWN_MS?.trim() || !Number.isFinite(value) || value < 0) return WAKE_COOLDOWN_MS;
+  if (value <= MAX_WAKE_COOLDOWN_MS) return value;
+  if (!warnedWakeCooldownCap) {
+    warnedWakeCooldownCap = true;
+    console.warn(`[pi-fabric] PI_FABRIC_INBOX_WAKE_COOLDOWN_MS=${value} exceeds ${MAX_WAKE_COOLDOWN_MS}; using ${MAX_WAKE_COOLDOWN_MS}`);
+  }
+  return MAX_WAKE_COOLDOWN_MS;
 };
 
 interface RootInboxState {
@@ -97,6 +114,7 @@ export class RootInbox {
   #saved: string | undefined;
   #savedAt = 0;
   #wokeAt = Number.NEGATIVE_INFINITY;
+  #dueAt = Number.POSITIVE_INFINITY;
   #delivered = new Map<string, number>();
   #acks = new Map<string, number>();
   readonly #notifications = new MeshBackgroundQueue("root inbox wake notification");
@@ -119,10 +137,25 @@ export class RootInbox {
 
   /**
    * The batch to deliver now. A pending batch the session holds is committed first; one it does
-   * not hold is delivered again. A new batch stops at the first event younger than the steer
-   * grace and at the batch bounds, so the cursor never passes an event it has not admitted.
+   * not hold is delivered again. A new batch stops at the first addressed event younger than the
+   * steer grace (priority reads admit through an exact-session event first) and at the batch
+   * bounds, so the cursor never passes an event it has not admitted.
    */
   async next(session: RootInboxSession, options: RootInboxReconcileOptions = {}): Promise<RootInboxBatch> {
+    this.#dueAt = Number.POSITIVE_INFINITY;
+    return this.#next(session, options, options.priority === true);
+  }
+
+  /**
+   * The exact time (epoch ms) at which addressed work the last read held back (steer grace or
+   * idle cooldown) becomes due; undefined when nothing is held. A hint for one one-shot idle
+   * wake timer only; it never admits or commits anything.
+   */
+  get wakeDueAt(): number | undefined {
+    return Number.isFinite(this.#dueAt) ? this.#dueAt : undefined;
+  }
+
+  async #next(session: RootInboxSession, options: RootInboxReconcileOptions, priority: boolean): Promise<RootInboxBatch> {
     const state = this.#load();
     let receiptsChanged = this.#trimReceipts();
     receiptsChanged = JSON.stringify(state) !== this.#saved || receiptsChanged;
@@ -145,6 +178,10 @@ export class RootInbox {
       const reread = this.#reread(state.after, held);
       const pending = reread.filter((event) => !this.#acked(event));
       if (holdsBatch) {
+        // smarty-dev#5518: only the session's own inbox carrier is native consumption; an ack-only commit is not.
+        if (session.holdsBatch(held.ids)) for (const event of pending) appendDeliveryOutcome(this.mesh.root, {
+          eventId: event.id, to: this.identity.id, from: event.from.id, mode: "publish",
+        }, "delivered", "consumed by Main inbox as itself", this.#now());
         this.#remember(pending.flatMap(eventReceipts));
       } else {
         // A missing retained event proves neither delivery nor expiry. Keep its id pending, until
@@ -181,7 +218,7 @@ export class RootInbox {
     }
     const batch = this.#scan(state.after, session, true, (event) => {
       receiptsChanged = this.#remember(eventReceipts(event)) || receiptsChanged;
-    });
+    }, priority);
     skippedStale += batch.skippedStale ?? 0;
     if (skippedStale) { batch.skippedStale = skippedStale; batch.horizonMs = this.#horizon(); }
     if (batch.events.length === 0) {
@@ -205,16 +242,24 @@ export class RootInbox {
    * `idle` is checked again after the read: a turn that started meanwhile takes the batch itself.
    */
   async wake(session: RootInboxSession, idle: () => boolean): Promise<RootInboxBatch | undefined> {
-    const cooling = this.#now() - this.#wokeAt < (this.options.wakeCooldownMs ?? wakeCooldownMs());
-    const urgent = this.#peek(session).some((event) => URGENT_KINDS.has(event.kind));
-    if (cooling && !urgent) return undefined;
-    const batch = await this.next(session);
+    this.#dueAt = Number.POSITIVE_INFINITY;
+    const cooldownEnd = this.#wokeAt + (this.options.wakeCooldownMs ?? wakeCooldownMs());
+    const cooling = this.#now() < cooldownEnd;
+    const peeked = this.#peek(session);
+    const urgent = peeked.some((event) => URGENT_KINDS.has(event.kind));
+    // Work addressed to this exact session wakes at once too (smarty-dev#4313), unless delivered late.
+    const exact = peeked.some((event) => this.#exact(event) && !event.deliveredLate);
+    if (cooling && !urgent && !exact) {
+      if (peeked.length) this.#dueAt = Math.min(this.#dueAt, cooldownEnd);
+      return undefined;
+    }
+    const batch = await this.#next(session, {}, true);
     if (!idle()) return undefined;
     // A stale-only drain reports once but must not buy a model turn; nor does late actionable work.
     if (batch.events.length === 0) return batch.skippedStale ? batch : undefined;
     const waking = batch.events.filter((event) => !event.deliveredLate);
     if (waking.length === 0) return batch;
-    const reason = urgent ? "p0" : "idle";
+    const reason = urgent ? "p0" : exact ? "addressed" : "idle";
     this.#wokeAt = this.#now();
     void this.#notifications.enqueue(() => this.mesh.publish({
       topic: ROOT_INBOX_WAKE_TOPIC, kind: "idle-wake", from: this.identity,
@@ -244,6 +289,11 @@ export class RootInbox {
     this.#trimReceipts();
     this.#remember([...ids.map(eventReceipt), ...receipts]);
     const pending = state.pending;
+    // smarty-dev#5518: an ack is the inbox carrier entering a turn, so it is native consumption.
+    // Resolve the batch's newly acked events before the cursor moves past them; next() then never
+    // sees them, and the journal dedups an id it already holds (exactly once per event id).
+    const consumed = pending ? ids.filter((id) => pending.ids.includes(id) && !this.#acks.has(id)) : [];
+    const delivered = consumed.length ? this.#reread(state.after, { ...pending!, ids: consumed }) : [];
     for (const id of ids) {
       if (!this.#acks.has(id)) this.#acks.set(id, pending?.ids.includes(id) ? pending.through : state.after);
     }
@@ -252,6 +302,15 @@ export class RootInbox {
       delete state.pending;
     }
     this.#syncAcks();
+    for (const event of delivered) {
+      try {
+        appendDeliveryOutcome(this.mesh.root, { eventId: event.id, to: this.identity.id, from: event.from.id, mode: "publish" },
+          "delivered", "consumed by Main inbox as itself", this.#now());
+      } catch (error) {
+        // Observational evidence must never undo the ack that keeps the event from re-injection.
+        console.warn(`[pi-fabric] root inbox delivery outcome: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
   }
 
   /**
@@ -273,12 +332,18 @@ export class RootInbox {
   }
 
   /** Every event `next` would bring now or in later batches, without the batch bounds or a save. */
-  #peek(session: RootInboxSession): MeshEvent[] {
+  #peek(session: RootInboxSession): RootInboxEvent[] {
     const state = this.#load();
     const pending = state.pending && !session.holdsBatch(state.pending.ids) ? state.pending : undefined;
     const after = state.pending ? Math.max(state.after, state.pending.through) : state.after;
     return [...(pending ? this.#reread(state.after, pending).filter((event) =>
-      !this.#acked(event) && !this.#stale(event) && !this.#steered(event, session)) : []), ...this.#scan(after, session, false).events];
+      !this.#acked(event) && !this.#stale(event) && !this.#steered(event, session)).map((event) => this.#late(event)) : []),
+    ...this.#scan(after, session, false, undefined, true).events];
+  }
+
+  /** Addressed to this session's own id on a work topic (not a name or alias). */
+  #exact(event: MeshEvent): boolean {
+    return event.topic.startsWith(WORK_TOPIC_PREFIX) && event.to === this.identity.id;
   }
 
   /** Everything at or below this sequence was delivered and acked, or decided: never again. */
@@ -321,12 +386,30 @@ export class RootInbox {
     this.#syncAcks();
   }
 
-  #scan(after: number, session: RootInboxSession, bounded = true, onDelivered?: (event: MeshEvent) => void): RootInboxBatch {
+  #scan(
+    after: number, session: RootInboxSession, bounded = true, onDelivered?: (event: MeshEvent) => void, priority = false,
+  ): RootInboxBatch {
     const now = this.#now();
     const names = new Set(this.names().filter((name) =>
       name.trim() && (name === this.identity.id || !name.startsWith(ROOT_ID_PREFIX))));
-    const cutoff = now - (this.options.steerGraceMs ?? STEER_GRACE_MS);
+    const grace = this.options.steerGraceMs ?? STEER_GRACE_MS;
+    const cutoff = now - grace;
     const pageSize = this.options.pageSize ?? 500;
+    const addressed = (event: MeshEvent): boolean =>
+      event.topic.startsWith(WORK_TOPIC_PREFIX) && event.to !== undefined && names.has(event.to);
+    // Priority reads admit the ordered prefix through the last eligible exact-session event now.
+    // Active-turn reconciles keep the grace, so a steer into a running turn still wins.
+    let bypassThrough = Number.NEGATIVE_INFINITY;
+    if (priority) for (let cursor = after; ;) {
+      const page = this.mesh.read({ after: cursor, limit: pageSize });
+      for (const event of page) {
+        cursor = Math.max(cursor, event.sequence);
+        if (event.createdAt > cutoff && this.#exact(event) && !this.#acked(event) && !this.#steered(event, session)) {
+          bypassThrough = event.sequence;
+        }
+      }
+      if (page.length < pageSize) break;
+    }
     const events: RootInboxEvent[] = [];
     let through = after;
     let bytes = 0;
@@ -336,8 +419,12 @@ export class RootInbox {
     for (;;) {
       const page = this.mesh.read({ after: through, limit: pageSize });
       for (const event of page) {
-        if (event.createdAt > cutoff) return result();
-        if (event.topic.startsWith(WORK_TOPIC_PREFIX) && event.to !== undefined && names.has(event.to)) {
+        // Only unadmitted addressed work inside the grace holds the cursor; it is due once mature.
+        if (event.createdAt > cutoff && event.sequence > bypassThrough && addressed(event) && !this.#acked(event)) {
+          this.#dueAt = Math.min(this.#dueAt, event.createdAt + grace);
+          return result();
+        }
+        if (addressed(event)) {
           if (this.#acked(event)) { /* Delivered and acked, at or below the mark: never again. */ }
           else if (this.#stale(event)) skippedStale++;
           else if (this.#steered(event, session)) onDelivered?.(event);
@@ -439,7 +526,7 @@ export class RootInbox {
       if (page.length === 0) break;
       for (const event of page) {
         if (event.sequence > pending.through) return found;
-        if (ids.has(event.id)) found.push(event);
+        if (ids.delete(event.id)) found.push(event);
         cursor = Math.max(cursor, event.sequence);
       }
       if (page.length < pageSize) break;

@@ -39,7 +39,7 @@ const events = (store: MeshStore) => {
     after = page.at(-1)!.sequence;
   }
 };
-const fixture = (rpc = true, stateBackend?: "sqlite") => {
+const fixture = (rpc = true, stateBackend?: "sqlite", callTimeoutMs?: number) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-notifications-"));
   roots.push(root);
   const options = stateBackend ? { stateBackend } : {};
@@ -55,7 +55,7 @@ const fixture = (rpc = true, stateBackend?: "sqlite") => {
     const output = new PassThrough();
     input.on("data", chunk => { for (const line of String(chunk).trim().split("\n")) requests.push(JSON.parse(line).op); });
     const serving = serveBridgeAgent(agent, input, output);
-    remote = new RemoteBridgeSide(output, input);
+    remote = new RemoteBridgeSide(output, input, callTimeoutMs);
     const rpcSide = remote;
     cleanups.push(async () => { rpcSide.close(); input.end(); await serving; output.end(); });
   }
@@ -79,8 +79,10 @@ const native = async (store: MeshStore, name: string, ttl = 60_000, participant 
   if (participant) writeParticipantFile(store.root, entry);
   return { id, identity, entry, host };
 };
+// `steps` counts the hub-side page reads: run() reads one per toRemote pass (smarty-dev#9751: the direction loops
+// do not go through step()).
 const launch = async (bridge: MeshBridge) => {
-  const steps = vi.spyOn(bridge, "step");
+  const steps = vi.spyOn(bridge.options.local as StoreBridgeSide, "tail");
   let failure: unknown;
   const running = bridge.run().catch(error => { failure = error; });
   cleanups.push(async () => { await bridge.stop(); await running; });
@@ -89,6 +91,104 @@ const launch = async (bridge: MeshBridge) => {
   await settle();
   return { steps, running, failure: () => failure };
 };
+
+// smarty-dev#9751: head-of-line blocking. Each direction runs in its own sequential loop, so nothing in the
+// hub-to-remote direction (a page read that takes minutes, a publish that never resolves) holds back a remote command.
+describe("independent directions (smarty-dev#9751)", () => {
+  const command = (lane: { id: string; identity: MeshIdentity }, lead: { id: string }, commandId: string) => ({ topic: "fabric.control.command", kind: "steer",
+    from: lane.identity, to: lead.id, data: { version: 1, commandId, replyTo: lane.id, targetId: lead.id, operation: "steer" } });
+  const within = async (check: () => boolean, ms: number) => {
+    const started = performance.now();
+    while (!check() && performance.now() - started < ms) await sleep(10);
+    return { ok: check(), ms: Math.round(performance.now() - started) };
+  };
+
+  it("carries a remote command within 1 s while one hub page read stalls for 3 s", async () => {
+    const f = fixture();
+    const lead = await native(f.hub, "lead");
+    const lane = await native(f.far, "lane");
+    const live = await launch(f.bridge);
+    const tail = f.local.tail!.bind(f.local);
+    let stalled = false;
+    f.local.tail = async (after, offset) => { if (!stalled) { stalled = true; await sleep(3_000); } return tail(after, offset); };
+    await f.hub.publish({ topic: "unrelated", kind: "noise", from: lead.identity });
+    await until(() => stalled);                                // toRemote is inside the slow read
+    await f.far.publish(command(lane, lead, "c-page"));
+    const arrived = await within(() => events(f.hub).some(event => event.topic === "fabric.control.command"), 1_000);
+    expect(arrived.ok, `after ${arrived.ms} ms`).toBe(true);
+    expect(live.failure()).toBeUndefined();
+  }, 20_000);
+
+  // pi-fabric#929 round 2: the 19:35Z shape is a catch-up after a restart. run() must not drain both directions in
+  // turn before the loops start: each loop catches up from its own saved cursor.
+  it("carries a remote command within 1 s after a restart with a saved cursor and a slow 3 s hub backlog", async () => {
+    const f = fixture(false); // stop() closes an RPC transport; a real restart opens a new one
+
+    const lead = await native(f.hub, "lead");
+    const lane = await native(f.far, "lane");
+    const first = await launch(f.bridge);
+    await f.bridge.stop();
+    await first.running;
+    expect(fs.existsSync(f.bridge.options.cursorPath)).toBe(true);
+    // While the bridge is down: a hub backlog, and a remote command behind it.
+    for (let index = 0; index < 20; index++) await f.hub.publish({ topic: "unrelated", kind: "noise", from: lead.identity, text: String(index) });
+    await f.far.publish(command(lane, lead, "c-restart"));
+    // The restarted bridge's hub reads are slow: the first takes 3 s.
+    const local = new StoreBridgeSide(f.hub, "far");
+    const tail = local.tail.bind(local);
+    let slow = false;
+    local.tail = async (after, offset) => { if (!slow) { slow = true; await sleep(3_000); } return tail(after, offset); };
+    const restarted = new MeshBridge({ ...f.bridge.options, local });
+    let failure: unknown;
+    const running = restarted.run().catch(error => { failure = error; });
+    cleanups.push(async () => { await restarted.stop(); await running; });
+    await until(() => slow);
+    const arrived = await within(() => events(f.hub).some(event => event.topic === "fabric.control.command"), 1_000);
+    expect(arrived.ok, `after ${arrived.ms} ms`).toBe(true);
+    expect(failure).toBeUndefined();
+  }, 20_000);
+
+  it("carries a remote command within 1 s while a hub-to-remote publish never resolves", async () => {
+    const f = fixture();
+    const lead = await native(f.hub, "lead");
+    const lane = await native(f.far, "lane");
+    const live = await launch(f.bridge);
+    let stuck = false;
+    const never = () => { stuck = true; return new Promise<never>(() => {}); };
+    (f.remote as RemoteBridgeSide).publish = never;
+    (f.remote as RemoteBridgeSide).publishBatch = never;
+    await f.hub.publish({ topic: "fleet.work.notify.9751", kind: "ask", from: lead.identity, to: lane.id, text: "stuck" });
+    await until(() => stuck);                                  // toRemote awaits a publish that never settles
+    await f.far.publish(command(lane, lead, "c-publish"));
+    const arrived = await within(() => events(f.hub).some(event => event.topic === "fabric.control.command"), 1_000);
+    expect(arrived.ok, `after ${arrived.ms} ms`).toBe(true);
+    expect(live.failure()).toBeUndefined();
+  }, 20_000);
+
+  // The two directions share ONE transport (one ssh stdio; the agent serves its RPCs in order). A remote call that
+  // passes its deadline closes that transport for both, so run() ends (it does not hang) and the mesh-bridge CLI
+  // exits 1 ("stopped: ..."), and the service manager restarts it (docs/mesh-bridge.md, "exits with status 1").
+  it("ends run() with the timeout when a remote call passes its deadline, rather than hanging", async () => {
+    const f = fixture(true, undefined, 300);
+    const lead = await native(f.hub, "lead");
+    const lane = await native(f.far, "lane");
+    // The agent never answers this publish (its FIFO is released at cleanup, so the agent can end).
+    let release!: () => void;
+    const held = new Promise<never>((_resolve, reject) => { release = () => reject(new Error("released")); });
+    held.catch(() => undefined);
+    cleanups.push(() => release());
+    f.agent.publish = () => held;
+    f.agent.publishBatch = () => held;
+    let failure: unknown;
+    const running = f.bridge.run().catch(error => { failure = error; });
+    cleanups.push(async () => { await f.bridge.stop(); await running; });
+    await until(() => events(f.far).length >= 0 && f.requests.length > 0);
+    await f.hub.publish({ topic: "fleet.work.notify.9751", kind: "ask", from: lead.identity, to: lane.id, text: "times out" });
+    const ended = await within(() => failure !== undefined, 5_000);
+    expect(ended.ok, `after ${ended.ms} ms`).toBe(true);
+    expect(String(failure)).toMatch(/did not answer|transport closed/);
+  }, 20_000);
+});
 
 // smarty-dev#9751: a hub sender that is no participant (a factory host) gets the ACK of a command this link carried;
 // an ACK for a command the link never carried still does not cross.
@@ -364,13 +464,13 @@ describe("notification-driven bridge (smarty-dev#7299 A5)", () => {
     renew(f.far.root, expiry); // host-leases mkdir after watch setup
     // Renewal-only updates are pending until the half-lease flush; actual work demands fresh authority now.
     await f.far.publish({ topic: "fleet.work.notify.7299", kind: "probe", from: lane.identity, to: "absent" });
-    await until(() => (readHostLeases(f.hub.root).get(lane.id)?.expiresAt ?? 0) >= expiry);
+    await until(() => (readHostLeases(f.hub.root).get(lane.id)?.mirror?.sourceExpiresAt ?? 0) >= expiry);
     const nextExpiry = Date.now() + 14_000;
     renew(replacement, nextExpiry);
     fs.renameSync(path.join(f.far.root, "host-leases"), path.join(f.root, "old-leases"));
     fs.renameSync(path.join(replacement, "host-leases"), path.join(f.far.root, "host-leases"));
     await f.far.publish({ topic: "fleet.work.notify.7299", kind: "probe", from: lane.identity, to: "absent" });
-    await until(() => (readHostLeases(f.hub.root).get(lane.id)?.expiresAt ?? 0) >= nextExpiry);
+    await until(() => (readHostLeases(f.hub.root).get(lane.id)?.mirror?.sourceExpiresAt ?? 0) >= nextExpiry);
     // Own mirror/lease writes and cursor renames settle, rather than feeding a renewal loop.
     await settle();
     const mirrors = vi.spyOn(f.local, "mirror");
@@ -523,9 +623,10 @@ describe("notification-driven bridge (smarty-dev#7299 A5)", () => {
     await f.hub.publish({ topic: "fleet.work.notify.7299", kind: "ask", from: lead.identity, to: lane.id, text: "legacy-outbound" });
     await until(() => events(f.hub).some(event => event.text === "legacy-inbound"));
     await until(() => events(f.far).some(event => event.text === "legacy-outbound"));
-    const count = live.steps.mock.calls.length;
+    // Polling goes on: since smarty-dev#9751 each direction polls in its own loop, so count the remote reads.
+    const count = operations.filter(op => op === "read").length;
     await sleep(550);
-    expect(live.steps.mock.calls.length).toBeGreaterThan(count);
+    expect(operations.filter(op => op === "read").length).toBeGreaterThan(count);
     expect(logs.filter(message => message.includes("legacy peer"))).toHaveLength(1);
     expect(live.failure()).toBeUndefined();
     expect(operations.filter(op => op === "publish")).toHaveLength(1);

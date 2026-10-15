@@ -114,7 +114,8 @@ describe.skipIf(!fs.existsSync(entry))("Main provider error recovery (#4012)", (
         expect(messages.some(message => message.role === "compactionSummary")).toBe(true);
       }
       if (failureTwice) {
-        expect(blocked[0]).toMatchObject({ content: "BLOCKED: provider error: stream error: stream disconnected before completion", display: true });
+        // 0cac50ca7 (#8742): short provider classification is intentionally unclassified; raw stream text no longer surfaces.
+        expect(blocked[0]).toMatchObject({ content: "BLOCKED: provider error: unclassified", display: true });
         expect(JSON.stringify(reports[0])).not.toContain("second diagnostic line");
       } else if (scenario === "ABORT") {
         expect(messages.at(-1)).toMatchObject({ role: "assistant", stopReason: "aborted" });

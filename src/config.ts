@@ -1,6 +1,8 @@
 import fs from "node:fs";
 import { readHostPolicy, warnAgentLandlockDisabled, type HostPolicy } from "./host-policy.js";
+export { readHostPolicy } from "./host-policy.js";
 import type { ModelRoutingConfig } from "./agents/model-route.js";
+import { parsePerCallRouting } from "./agents/per-call-config.js";
 import { normalizeAgentRouterConfig, type FabricAgentRouterConfig } from "./agents/router-config.js";
 export type { FabricAgentRouterConfig } from "./agents/router-config.js";
 import { normalizeAgentPlacement, type AgentPlacementConfig } from "./agents/placement-config.js";
@@ -78,6 +80,9 @@ type FabricActorScope = "project" | "session";
 
 export type FabricPythonRuntime = "cpython" | "monty";
 
+/** Whether pi.powershell and extension powershell overrides may run (smarty-dev#9826). */
+export type FabricPowerShellPolicy = "refuse" | "allow";
+
 interface FabricExecutorConfig {
   kernel: FabricKernel;
   pythonRuntime: FabricPythonRuntime;
@@ -112,6 +117,11 @@ interface FabricExecutorConfig {
   shellHangMs: number;
   /** Linux filesystem confinement for local pi.bash; no audit-only kernel mode. */
   landlock: LandlockSettings;
+  /** pi.powershell and every captured or extension powershell override are
+   * refused unless the host profile sets "allow" (smarty-dev#9826). No guard
+   * judges PowerShell grammar, so "allow" accepts that gap. Host-only: the
+   * project layer cannot opt in. */
+  powershell: FabricPowerShellPolicy;
   memoryLimitBytes: number;
   maxOutputChars: number;
   maxNestedResultChars: number;
@@ -230,6 +240,9 @@ export interface FabricAgentConfig {
   transport: FabricAgentTransport;
   /** Root-policy Linux user scope slice; agent-dir values cannot relax this. */
   processSlice?: string;
+  /** Root-policy memory.max (bytes) for capped process task cgroups, with swap 0
+   * (smarty-dev#8257). Default 24 GiB; agent-dir/workspace values cannot relax it. */
+  processMemoryMaxBytes?: number;
   /** Host-only opt-in process task placement; workspace files cannot override it. */
   placement?: AgentPlacementConfig;
   /** User/workspace Pi default; package defaults intentionally leave this unset. */
@@ -266,6 +279,8 @@ export interface FabricAgentConfig {
   wakeText?: FabricWakeTextConfig;
   /** Host-only: skip durable-actor activations whose owning root is dead (smarty-dev#6062). */
   deadRootFilter: FabricDeadRootFilterConfig;
+  /** Host-only: tell the root's Main once an activation stays in preparing this long (smarty-dev#6337). */
+  stuckPreparingMs: number;
   /** Admission policy for the model a child process actually reports. */
   modelAdmission: FabricModelAdmission;
   /** Shell command run in each new agent worktree before the child starts. */
@@ -466,6 +481,20 @@ const meshControlIncarnationFence = (value: unknown): MeshControlIncarnationFenc
   throw new Error("mesh.controlIncarnationFence must be warn or enforce");
 };
 
+/** JetStream stream num_replicas for the NATS state backend; an explicit invalid value is refused, never defaulted. */
+const meshNatsReplicas = (value: unknown): number => {
+  if (value === undefined) return 1;
+  if (typeof value === "number" && Number.isSafeInteger(value) && value >= 1) return value;
+  throw new Error("mesh.nats.replicas must be a positive integer");
+};
+
+export interface FabricMeshNatsConfig {
+  /** Stream num_replicas on create; an existing stream with a different count is refused (default 1). */
+  replicas: number;
+}
+
+export const RESIDENT_IDLE_EXIT_MS = 10 * 60_000;
+
 export interface FabricMeshConfig {
   /** Host-only; warn admits legacy senders, enforce requires a captured destination epoch. */
   controlIncarnationFence: MeshControlIncarnationFence;
@@ -473,6 +502,8 @@ export interface FabricMeshConfig {
   lockProtocol: MeshLockProtocol;
   /** Keyed-state backend: "file" (default), "shadow", "sqlite" or "nats" (refused until built); env PI_FABRIC_MESH_STATE_BACKEND overrides. */
   stateBackend: MeshStateBackend;
+  /** NATS state-backend settings; only read when stateBackend is "nats". */
+  nats: FabricMeshNatsConfig;
   enabled: boolean;
   root?: string;
   /** Publish the Main participant at session start instead of on first Fabric use. */
@@ -481,6 +512,8 @@ export interface FabricMeshConfig {
   maxEventBytes: number;
   maxReadEvents: number;
   actorPollMs: number;
+  /** Exit a dead-root resident after this long with no actors or requests; 0 disables. */
+  residentIdleExitMs: number;
   /** Explicit background observational age; 1 s runtime floor, never ordinary authority reads. */
   idleReadCoalesceMs: number;
   /** Admission window for commands routed over a mesh bridge, minimum 30 s. */
@@ -654,6 +687,13 @@ export const maxExecutorMemoryLimitBytes = (
     ? Math.min(QUICKJS_MAX_MEMORY_LIMIT_BYTES, MAX_EXECUTOR_MEMORY_LIMIT_BYTES)
     : MAX_EXECUTOR_MEMORY_LIMIT_BYTES;
 
+/** Default per-task cgroup memory.max (smarty-dev#8257): 24 GiB, swap capped at 0. */
+export const DEFAULT_PROCESS_MEMORY_MAX_BYTES = 24 * 1024 ** 3;
+
+/** A positive safe integer byte count, or the 24 GiB default for absent/invalid values. */
+export const processMemoryMaxBytesValue = (value: unknown): number =>
+  typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : DEFAULT_PROCESS_MEMORY_MAX_BYTES;
+
 export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
   fullCodeMode: true,
   autoReload: true,
@@ -672,6 +712,7 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
     humanWaitRefs: ["extensions.ask"],
     shellHangMs: DEFAULT_SHELL_HANG_MS,
     landlock: { mode: "off", disabled: false },
+    powershell: "refuse",
     memoryLimitBytes: 64 * 1024 * 1024,
     maxOutputChars: 50_000,
     maxNestedResultChars: 2_000_000,
@@ -715,6 +756,7 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
     // behaviour key on the "pi" runner; upstream's pi-durable default stays opt-in here.
     runner: "pi",
     transport: "process",
+    processMemoryMaxBytes: DEFAULT_PROCESS_MEMORY_MAX_BYTES,
     deniedModels: [],
     modelPolicy: { requireReason: ["gpt-6-astra"] },
     claude: { binary: "claude" },
@@ -734,6 +776,7 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
     sessionExportDir: "",
     nice: 0,
     deadRootFilter: { mode: "off", exempt: [] },
+    stuckPreparingMs: 600_000,
     modelAdmission: "strict",
   },
   jev: { ...DEFAULT_JEV_CONFIG, credentialCommand: [] },
@@ -798,12 +841,14 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
     controlIncarnationFence: "warn",
     lockProtocol: 1,
     stateBackend: "file",
+    nats: { replicas: 1 },
     enabled: true,
     announce: false,
     actorScope: "project",
     maxEventBytes: 256 * 1024,
     maxReadEvents: 500,
     actorPollMs: 250,
+    residentIdleExitMs: RESIDENT_IDLE_EXIT_MS,
     idleReadCoalesceMs: 5_000,
     bridgeControlTimeoutMs: 30_000,
     actorQueueLimit: 32,
@@ -896,6 +941,41 @@ const readJsonObjectFile = (filePath: string): JsonObjectFile | undefined => {
 
 const readJsonObject = (filePath: string): Record<string, unknown> | undefined =>
   readJsonObjectFile(filePath)?.document;
+
+const isJsonObject = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
+
+/**
+ * smarty-dev#11373: the NATS stream replicas from the agent layer only (`<agentDir>/fabric.json` mesh.nats.replicas),
+ * validated by meshNatsReplicas (default 1). A missing file or an absent value is 1. Read-only: no project layer,
+ * host policy, migration, quarantine, warning or write. An unreadable file, malformed JSON, a non-object document or
+ * mesh/nats section, or an invalid value is refused (throws), never defaulted to a lower replica count.
+ */
+export const loadAgentNatsReplicas = (agentDir: string): number => {
+  const filePath = path.join(agentDir, "fabric.json");
+  let source: string;
+  try {
+    source = fs.readFileSync(filePath, "utf8");
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") return meshNatsReplicas(undefined);
+    throw new Error(`mesh.nats.replicas: cannot read ${filePath}`, { cause: error });
+  }
+  let document: unknown;
+  try {
+    document = JSON.parse(source);
+  } catch {
+    // Parser diagnostics can quote config contents; expose only the path, never the raw cause.
+    throw new Error(`mesh.nats.replicas: ${filePath} is not valid JSON`);
+  }
+  if (!isJsonObject(document)) throw new Error(`mesh.nats.replicas: ${filePath} must be a JSON object`);
+  const { mesh } = document;
+  if (mesh === undefined) return meshNatsReplicas(undefined);
+  if (!isJsonObject(mesh)) throw new Error("mesh must be an object");
+  const { nats } = mesh;
+  if (nats === undefined) return meshNatsReplicas(undefined);
+  if (!isJsonObject(nats)) throw new Error("mesh.nats must be an object");
+  return meshNatsReplicas(nats.replicas);
+};
 
 const mergeObjects = (
   base: Record<string, unknown>,
@@ -1314,6 +1394,8 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
         disabled: landlock.disabled === true,
         ...(landlock.allowEscape === true ? { allowEscape: true } : {}),
       },
+      // Fail closed: anything but the exact opt-in refuses PowerShell (smarty-dev#9826).
+      powershell: executor.powershell === "allow" ? "allow" : "refuse",
       memoryLimitBytes: boundedInteger(
         executor.memoryLimitBytes,
         DEFAULT_FABRIC_CONFIG.executor.memoryLimitBytes,
@@ -1435,6 +1517,7 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
       transport: transportValue(agents.transport, DEFAULT_FABRIC_CONFIG.agents.transport),
       ...(typeof agents.processSlice === "string" && /^[a-zA-Z0-9_.-]+\.slice$/.test(agents.processSlice)
         ? { processSlice: agents.processSlice } : {}),
+      processMemoryMaxBytes: processMemoryMaxBytesValue(agents.processMemoryMaxBytes),
       ...(placement ? { placement } : {}),
       ...(router ? { router } : {}),
       ...(agentModel ? { model: agentModel } : {}),
@@ -1459,6 +1542,7 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
                 }
                 return { ...routing.revertReset as Record<string, string> };
               })(),
+              ...(routing.perCall !== undefined ? { perCall: parsePerCallRouting(routing.perCall) } : {}),
               ...(typeof routing.pinModel === "string" ? { pinModel: routing.pinModel } : {}),
               ...(isFabricThinking(routing.pinThinking) ? { pinThinking: routing.pinThinking } : {}),
               shadowCandidates: Array.isArray(routing.shadowCandidates)
@@ -1553,6 +1637,7 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
           : DEFAULT_FABRIC_CONFIG.agents.sessionExportDir,
       nice: boundedInteger(agents.nice, DEFAULT_FABRIC_CONFIG.agents.nice, 0, 19),
       deadRootFilter: normalizeDeadRootFilterConfig(agents.deadRootFilter),
+      stuckPreparingMs: boundedInteger(agents.stuckPreparingMs, DEFAULT_FABRIC_CONFIG.agents.stuckPreparingMs, 1_000, 7 * 24 * 60 * 60_000),
       ...(stringValue(agents.instructionsRoot)?.trim() ? { instructionsRoot: stringValue(agents.instructionsRoot)!.trim() } : {}),
       ...(wakeText ? { wakeText } : {}),
       modelAdmission: modelAdmissionValue(
@@ -1699,6 +1784,7 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
       controlIncarnationFence: meshControlIncarnationFence(mesh.controlIncarnationFence),
       lockProtocol: meshLockProtocol(mesh.lockProtocol),
       stateBackend: meshStateBackend(mesh.stateBackend),
+      nats: { replicas: meshNatsReplicas(objectValue(mesh.nats).replicas) },
       enabled: booleanValue(mesh.enabled, DEFAULT_FABRIC_CONFIG.mesh.enabled),
       ...(meshRoot ? { root: meshRoot } : {}),
       announce: booleanValue(mesh.announce, DEFAULT_FABRIC_CONFIG.mesh.announce),
@@ -1720,6 +1806,9 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
         DEFAULT_FABRIC_CONFIG.mesh.actorPollMs,
         50,
         10_000,
+      ),
+      residentIdleExitMs: boundedInteger(
+        mesh.residentIdleExitMs, DEFAULT_FABRIC_CONFIG.mesh.residentIdleExitMs, 0, 7 * 24 * 60 * 60_000,
       ),
       idleReadCoalesceMs: boundedInteger(
         mesh.idleReadCoalesceMs,
@@ -2087,6 +2176,7 @@ const resolveFabricConfig = (
     merged = mergeObjects(merged, {
       agents: {
         ...(Object.hasOwn(agents, "processSlice") ? { processSlice: agents.processSlice } : {}),
+        ...(Object.hasOwn(agents, "processMemoryMaxBytes") ? { processMemoryMaxBytes: agents.processMemoryMaxBytes } : {}),
         ...(Array.isArray(agents.deniedModels) ? { deniedModels: agents.deniedModels } : {}),
         ...(Array.isArray(requireReason) ? { modelPolicy: { requireReason } } : {}),
       },
@@ -2117,6 +2207,7 @@ const resolveFabricConfig = (
       document.executor = executor;
       const agents = { ...objectValue(document.agents) };
       delete agents.processSlice;
+      delete agents.processMemoryMaxBytes; // Root-policy-only, like processSlice.
       const inheritedAgents = objectValue(merged.agents);
       // Agent-writable lists can add restrictions, never remove a root/default gate.
       const union = (base: unknown, extra: unknown): unknown[] => [
@@ -2139,8 +2230,10 @@ const resolveFabricConfig = (
       delete agents.instructionsRoot;
       delete agents.wakeText;
       delete agents.processSlice;
+      delete agents.processMemoryMaxBytes;
       delete agents.placement;
       delete agents.deadRootFilter; // Host-only: a lane cannot drop the fleet's exemptions.
+      delete agents.stuckPreparingMs; // Host-only: a lane cannot silence the stuck-preparing owner notice.
       document.agents = agents;
       const mesh = { ...objectValue(document.mesh) };
       delete mesh.controlIncarnationFence; // Host-only: a workspace cannot weaken the fence.
@@ -2151,7 +2244,15 @@ const resolveFabricConfig = (
       delete landlock.allowEscape; // Only root policy can grant a per-command escape.
       if (landlock.mode !== "enforce") delete landlock.mode;
       executor.landlock = landlock;
+      // Host-only: a workspace cannot opt into unguarded PowerShell (smarty-dev#9826).
+      delete executor.powershell;
       document.executor = executor;
+      if (Object.hasOwn(document, "jev")) {
+        // Host-only: a lane cannot redirect Jev questions to another socket.
+        const jev = { ...objectValue(document.jev) };
+        delete jev.gatewaySocket;
+        document.jev = jev;
+      }
     }
     merged = mergeObjects(merged, document);
   }

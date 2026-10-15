@@ -90,6 +90,8 @@ Requires Node.js 24+ and Pi 1.0.0+. Monty's optional native package installs on 
 pi install npm:pi-fabric
 ```
 
+Fabric bundles the [Coral Bricks provider](docs/configuration.md#bundled-coral-bricks-provider): run `/login coralbricks` to use `coralbricks/*` models, or opt out with a package filter. Fabric's maintainers work at Coral Bricks.
+
 <details>
 <summary>Other install methods</summary>
 
@@ -160,9 +162,11 @@ See the [interface & commands reference](docs/interface.md) for every view, keyb
 
 `PI_FABRIC_TMPDIR`: absolute directory for Fabric temporary file data. On POSIX, missing directories are created with mode `0700`; existing roots must be owned by this user, real directories, and not group/world writable. Ancestors must be real directories owned by this user or root, without group/world write access unless sticky. On Windows, the directory and every ancestor must already exist on a local drive, with owners restricted to the current user, LocalSystem, Administrators or TrustedInstaller. Native ACL inspection through Windows PowerShell rejects untrusted write/delete/permission-change grants (including inherited grants), null DACLs, unsupported ACEs and reparse points. UNC/device paths, mapped or substituted drives, and ambiguous Windows names are unsupported. A private child of a permissive drive root is still unsafe. Unsafe or unproven paths fail closed without permission changes or an automatic fallback; unset the override to use OS temp. Socket/pipe paths stay unchanged.
 
+The managed-run retention sweep scans only immediate `pi-fabric-runs-*` children of the allocated data directory. A session-private temp directory therefore leaves abandoned roots unreachable by other sessions. For cross-session collection, the host launcher must export a stable, private file-data namespace **before Pi starts**, outside session-owned shell scratch. Share it only among sessions on the same physical host with the same stable PID namespace: retention uses local process-liveness evidence. Keep `TMPDIR` private, and do not share this data namespace across machines or isolated PID namespaces. This changes placement, not retention authority: dead-owner, orphan-grace, worker-exit and safe-tree checks still apply. It neither discovers older private parents nor adds recursive recovery of nested runs.
+
 ## Reference
 
-- [Configuration](docs/configuration.md): `fabric.json`, code modes, tool capture, approvals, and budgets.
+- [Configuration](docs/configuration.md): `fabric.json`, code modes, tool capture, approvals, budgets, and [third-party model providers](docs/configuration.md#third-party-model-providers).
 - [Execution kernels](docs/kernels.md): exclusive TypeScript/Python selection, Monty sandboxing, CPython escape hatch, agent inheritance, and examples.
 - [Native codemode APIs](docs/codemode-parity.md): additive native tool aliases or opt-in Pi-compatible scripts, collision-safe Fabric discovery, native models/images, branch-local state, and sPTC.
 - [Prompt cache](docs/prompt-cache.md): honest cache observations and optional, time-bounded native warming leases.

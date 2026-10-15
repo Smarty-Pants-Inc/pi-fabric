@@ -32,6 +32,7 @@ const runtimeHarness = () => {
     initialized = false;
     widgetDismissedAt = 0;
     setDecisionProfile = vi.fn();
+    observationHealth = vi.fn((): string[] => []);
     initialize = vi.fn(async () => {
       if (blocked) await new Promise<void>((resolve) => { release = resolve; });
       this.initialized = true;
@@ -66,6 +67,27 @@ const createState = (loader: never): FabricState => new FabricState(
 );
 
 describe("FabricState lazy bootstrap", () => {
+  it("reports only the active instance's observation health without activating an idle facade", async () => {
+    const cwd = project({ prewalk: { alwaysRearm: false }, mesh: { enabled: false } });
+    const harness = runtimeHarness();
+    const state = createState(harness.loader);
+    const context = contextAt(cwd);
+    try {
+      await state.bootstrap(context);
+      expect(state.observationHealth()).toEqual([]);
+      expect(harness.loader).not.toHaveBeenCalled();
+      await state.ensure(context);
+      const first = harness.instances[0]!;
+      first.observationHealth.mockReturnValue(["observation-degraded:configuration", "observation-degraded:control-plane"]);
+      expect(state.observationHealth()).toEqual(["observation-degraded:configuration", "observation-degraded:control-plane"]);
+      await state.shutdown("reload");
+      expect(state.observationHealth()).toEqual([]);
+      await state.bootstrap(context);
+      await state.ensure(context);
+      expect(state.observationHealth()).toEqual([]); // old-instance faults are not inherited
+      expect(harness.instances).toHaveLength(2);
+    } finally { await state.shutdown(); fs.rmSync(cwd, { recursive: true, force: true }); }
+  });
   it.each(["reload", "initialize", "session-switch"] as const)(
     "stops activation timers before %s invalidates the runtime", async (boundary) => {
       vi.useFakeTimers();
@@ -243,6 +265,58 @@ describe("FabricState lazy bootstrap", () => {
     } finally {
       await state.shutdown();
       fs.rmSync(cwd, { recursive: true, force: true }); fs.rmSync(other, { recursive: true, force: true });
+    }
+  });
+
+  it("smarty-dev#8881: a runtime import that resolves after an SDK dispose never initializes the stale ctx", async () => {
+    const cwd = project({ prewalk: { alwaysRearm: false }, mesh: { enabled: false } });
+    const harness = runtimeHarness();
+    let releaseImport: (() => void) | undefined;
+    let gated = true;
+    const loader = vi.fn(async () => {
+      if (gated) await new Promise<void>((resolve) => { releaseImport = resolve; });
+      return (harness.loader as unknown as () => Promise<unknown>)();
+    }) as never;
+    const state = createState(loader);
+    // AgentSession.dispose() invalidates the ctx (every read throws) but emits no session_shutdown.
+    let stale = false;
+    const base = contextAt(cwd);
+    const disposed = new Proxy(base as object, {
+      get(object, key, receiver) {
+        if (stale) throw new Error("This extension ctx is stale after session replacement or reload.");
+        return Reflect.get(object, key, receiver);
+      },
+    }) as ExtensionContext;
+    const hook = vi.fn();
+    state.setActivationHook(hook);
+    try {
+      await state.bootstrap(disposed);
+      const pending = state.ensure(disposed);
+      await vi.waitFor(() => expect(releaseImport).toBeTypeOf("function"));
+      stale = true;
+      gated = false;
+      releaseImport!();
+      await expect(pending).rejects.toThrow(/disposed/);
+      // No stale initialize, hook, or runtime left installed.
+      for (const instance of harness.instances) expect(instance.initialize).not.toHaveBeenCalled();
+      expect(hook).not.toHaveBeenCalled();
+      expect(state.initialized).toBe(false);
+
+      // A live successor session still activates normally.
+      const successor = contextAt(cwd, "session-2");
+      await state.bootstrap(successor);
+      const lease = await state.ensure(successor);
+      expect(lease.current()).toBe(true);
+      expect(state.initialized).toBe(true);
+      expect(hook).toHaveBeenCalledTimes(1);
+      expect(hook).toHaveBeenCalledWith(successor);
+      const live = harness.instances.filter((instance) => instance.initialize.mock.calls.length > 0);
+      expect(live).toHaveLength(1);
+      expect((live[0]!.initialize.mock.calls[0] as unknown[])[0]).toBe(successor);
+    } finally {
+      gated = false; releaseImport?.();
+      await state.shutdown();
+      fs.rmSync(cwd, { recursive: true, force: true });
     }
   });
 

@@ -981,10 +981,14 @@ export class ParticipantDirectory implements FabricParticipantSource {
    */
   #armLegacyCadence(): void {
     const until = this.#legacyCadenceUntil;
+    const expired = until !== undefined && Date.now() > until;
     // The obligation lapsed or this directory stopped: drop a pending tick rather than keep it.
     if (!this.#timer || this.#closed || this.#quiescing || this.#superseded ||
-      this.#heartbeatMs <= LEGACY_HEARTBEAT_MS || until === undefined || Date.now() > until) {
+      this.#heartbeatMs <= LEGACY_HEARTBEAT_MS || until === undefined || expired) {
       this.#cancelLegacyCadence();
+      // A failed refresh may never reach the renewal scan: do not let the expired reader
+      // consume the next join edge. No deadline (e.g. no legacyPut) is not an expired one.
+      if (expired) this.#joinWakeRequired = false;
       return;
     }
     if (this.#legacyTimer) return;

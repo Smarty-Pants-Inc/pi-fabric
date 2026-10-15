@@ -461,6 +461,90 @@ describe("startup join watch and retry obligations (smarty-dev#11172 audit CODE-
   });
 });
 
+// CODE-2: data-safety wake loss at a yielded final directory read; no run deletion is exercised.
+describe.each(["linux", "win32"])("retention final-slice activity (%s)", platform => {
+  const slicedEmptyScan = () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-retention-slice-"));
+    roots.push(root);
+    const runs = path.join(root, "runs");
+    fs.mkdirSync(runs);
+    const recover = vi.fn();
+    const collector = new ResidentRequestRetention(root, [], { retainRuns: true }, recover);
+    const nativePlatform = Object.getOwnPropertyDescriptor(process, "platform")!;
+    Object.defineProperty(process, "platform", { ...nativePlatform, value: platform });
+    let finalRead = false;
+    vi.spyOn(performance, "now").mockImplementation(() => finalRead ? 10 : 0);
+    const open = fs.opendirSync;
+    vi.spyOn(fs, "opendirSync").mockImplementation(((target: fs.PathLike, ...rest: unknown[]) => {
+      const directory = (open as (...args: unknown[]) => fs.Dir)(target, ...rest);
+      if (String(target) === runs) {
+        const read = directory.readSync.bind(directory);
+        vi.spyOn(directory, "readSync").mockImplementation(() => {
+          const entry = read();
+          if (!entry) finalRead = true; // final runs-read consumes the 5-ms slice
+          return entry;
+        });
+      }
+      return directory;
+    }) as typeof fs.opendirSync);
+    return { root, runs, collector, recover, nativePlatform, resume: () => { finalRead = false; } };
+  };
+
+  it("keeps the post-settlement deadline when markDirty arrives after the last runs-read", () => {
+    const { root, runs, collector, recover, nativePlatform, resume } = slicedEmptyScan();
+    try {
+      collector.sweep(1_000, new Set());
+      expect(collector.nextDueAt()).toBe(0); // yielded, completion has not executed
+      expect(fs.existsSync(path.join(root, "request-retention.json"))).toBe(false);
+      const settled = path.join(runs, "settled");
+      fs.mkdirSync(settled); // the completed run was not in the older directory snapshot
+      collector.markDirty(); // ResidentHost.onSettled's real retention edge
+      resume();
+      collector.sweep(1_001, new Set());
+      expect(collector.nextDueAt()).toBe(61_001);
+      expect(recover).not.toHaveBeenCalled();
+      expect(collector.due(61_000)).toBe(false);
+      collector.sweep(61_001, new Set());
+      expect(recover).toHaveBeenCalledWith(settled, ...(platform === "linux" ? [expect.any(Function)] : []));
+      expect(fs.existsSync(settled)).toBe(true);
+    } finally { collector.close(); Object.defineProperty(process, "platform", nativePlatform); }
+  });
+
+  it("consumes the dirty edge once, so a later empty sample can cancel sampling", () => {
+    const { collector, nativePlatform, resume } = slicedEmptyScan();
+    try {
+      collector.sweep(1_000, new Set());
+      collector.markDirty(); // transient activity leaves no retained record
+      resume();
+      collector.sweep(1_001, new Set());
+      expect(collector.nextDueAt()).toBe(61_001);
+      collector.sweep(61_001, new Set()); // next empty scan yields at its own final read
+      expect(collector.nextDueAt()).toBe(0);
+      resume();
+      collector.sweep(61_002, new Set());
+      expect(collector.nextDueAt()).toBeUndefined();
+    } finally { collector.close(); Object.defineProperty(process, "platform", nativePlatform); }
+  });
+
+  it("cancels sampling after a truly empty completed scan, with no recurring timer", () => {
+    const { collector, nativePlatform, resume } = slicedEmptyScan();
+    try {
+      const timeout = vi.spyOn(globalThis, "setTimeout");
+      const interval = vi.spyOn(globalThis, "setInterval");
+      collector.sweep(1_000, new Set());
+      expect(collector.nextDueAt()).toBe(0);
+      resume();
+      collector.sweep(1_001, new Set());
+      expect(collector.nextDueAt()).toBeUndefined();
+      // Quiet time itself does not create another scheduler obligation.
+      vi.spyOn(Date, "now").mockReturnValue(601_001);
+      expect(collector.nextDueAt()).toBeUndefined();
+      expect(timeout).not.toHaveBeenCalled();
+      expect(interval).not.toHaveBeenCalled();
+    } finally { collector.close(); Object.defineProperty(process, "platform", nativePlatform); }
+  });
+});
+
 describe("deadline maintenance (smarty-dev#11172)", () => {
   const configStats = (stat: { mock: { calls: unknown[][] } }, file: string) =>
     stat.mock.calls.filter(([target]) => String(target) === file).length;

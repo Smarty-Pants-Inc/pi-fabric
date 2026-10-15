@@ -151,6 +151,7 @@ export class ResidentRequestRetention {
   // smarty-dev#11172: the last complete sample found nothing to retain or collect. No sample is
   // due until the host marks new exchange or run activity (markDirty).
   #empty = false;
+  #dirtyDuringSample = false;
   #runsSeen = 0;
   #expiredBefore = 0;
   #now = 0;
@@ -172,11 +173,17 @@ export class ResidentRequestRetention {
   nextDueAt(): number | undefined { return this.#scanning ? 0 : this.#empty ? undefined : this.#nextSample; }
 
   /** New exchange/run activity: an empty root has an obligation again from its next scheduled sample. */
-  markDirty(): void { this.#empty = false; }
+  markDirty(): void {
+    this.#empty = false;
+    if (this.#scanning) this.#dirtyDuringSample = true;
+  }
 
   #finishSample(): void {
     const health = this.#health;
-    this.#empty = !this.#resample && health.entries === 0 && health.unknown === 0 && health.legacy === 0 && !health.error && this.#runsSeen === 0;
+    // A yielded scan's counters may predate activity already reported by the host.
+    // Consume that edge only after preserving its next-sample obligation (both sweep paths).
+    this.#empty = !this.#dirtyDuringSample && !this.#resample && health.entries === 0 && health.unknown === 0 && health.legacy === 0 && !health.error && this.#runsSeen === 0;
+    this.#dirtyDuringSample = false;
   }
 
   close(): void {

@@ -2711,6 +2711,88 @@ describe("ParticipantDirectory default lease cadence (smarty-dev#11172)", () => 
     }
   });
 
+  // CODE-1: a failed final tick must not leave A's join edge latched after its cadence expires.
+  // Keep reason: transient pre-read failure + reader expiry is not cheaply reachable in a user flow.
+  it.each(["file", "sqlite"] as const)("wakes exactly once for reader B after A expires and its final %s compatibility refresh fails", async backend => {
+    const { mesh, directory } = fixture("expiry-join", backend);
+    expect(mesh.stateBackend).toBe(backend);
+    const other = new MeshStore(mesh.root, 64 * 1024, 1_000, { stateBackend: backend });
+    let now = Date.now();
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+    const timeouts = vi.spyOn(globalThis, "setTimeout");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const legacyTicks = () => timeouts.mock.calls.filter(([, ms]) => ms === 5_000).length;
+    try {
+      await directory.start();
+      const scheduled = vi.spyOn(directory, "refresh");
+      now += 30_000;
+      await addStateOnlyReader(other, now); // A joins through the real state-commit watch.
+      await vi.waitFor(() => expect(legacyTicks()).toBe(1), { timeout: 5_000, interval: 20 });
+      expect(scheduled).toHaveBeenCalledOnce();
+      now += 15_001; // A's fixed lease has expired; no intervening commit clears its latch.
+      const failure = new Error("final compatibility refresh failed before canonical read");
+      directory.options.beforePublication = async () => { throw failure; };
+      const tick = timeouts.mock.calls.findIndex(([, ms]) => ms === 5_000);
+      clearTimeout(timeouts.mock.results[tick]!.value);
+      (timeouts.mock.calls[tick]![0] as () => void)();
+      await expect(scheduled.mock.results.at(-1)!.value).rejects.toBe(failure);
+      await vi.waitFor(() => expect(warn).toHaveBeenCalledOnce()); // background retry recorded the failure
+      expect(legacyTicks()).toBe(1); // the expired cadence was cancelled, not re-polled
+      directory.options.beforePublication = undefined;
+      scheduled.mockClear();
+      now += 1_001; // the existing non-transient background backoff, not another heartbeat
+      const peer = identityOf("reader-b");
+      await other.put({ key: "sessions/reader-b", identity: peer, value: { id: peer.id, sessionId: "reader-b",
+        cwd: "/tmp/project", startedAt: now, status: "idle" } });
+      await vi.waitFor(() => {
+        expect(mesh.get("sessions/expiry-join", { fresh: true })!.updatedAt).toBe(now);
+        expect(legacyTicks()).toBe(2);
+      }, { timeout: 2_000, interval: 20 });
+      // B's refresh commits to the same watch; neither that own commit nor unrelated commits loop.
+      const tokens = vi.spyOn(mesh, "stateToken");
+      await other.put({ key: "unrelated/expiry-join-control", identity: identityOf("writer"), value: true });
+      await vi.waitFor(() => expect(tokens).toHaveBeenCalled());
+      await new Promise(resolve => setTimeout(resolve, 100));
+      expect(scheduled).toHaveBeenCalledOnce();
+      expect(legacyTicks()).toBe(2);
+    } finally {
+      directory.options.beforePublication = undefined;
+      clock.mockRestore();
+      timeouts.mockRestore();
+      warn.mockRestore();
+      if (backend === "sqlite") other.closeState();
+    }
+  });
+
+  it.each(["file", "sqlite"] as const)("does not reset the join latch for successful %s refreshes without a legacy session to publish", async backend => {
+    const { mesh, identity, directory } = fixture("no-legacy-put", backend);
+    expect(mesh.stateBackend).toBe(backend);
+    const other = new MeshStore(mesh.root, 64 * 1024, 1_000, { stateBackend: backend });
+    let status = "idle";
+    directory.registerSource(() => [{ ...rootRecord(identity.id, identity.id, "no-legacy-put"),
+      cwd: undefined, sessionId: undefined, status }]);
+    const timeouts = vi.spyOn(globalThis, "setTimeout");
+    try {
+      await directory.start();
+      const scheduled = vi.spyOn(directory, "refresh");
+      await addStateOnlyReader(other, Date.now());
+      await vi.waitFor(() => expect(scheduled).toHaveBeenCalledOnce());
+      await scheduled.mock.results[0]!.value;
+      status = "running";
+      await directory.refresh(); // real own state commit, but still no legacyPut/cadence
+      const tokens = vi.spyOn(mesh, "stateToken");
+      await other.put({ key: "unrelated/no-legacy-put", identity: identityOf("writer"), value: true });
+      await vi.waitFor(() => expect(tokens).toHaveBeenCalled());
+      await new Promise(resolve => setTimeout(resolve, 100));
+      expect(scheduled).toHaveBeenCalledTimes(2); // join + explicit refresh only
+      expect(mesh.get("sessions/no-legacy-put", { fresh: true })).toBeUndefined();
+      expect(timeouts.mock.calls.filter(([, ms]) => ms === 5_000)).toHaveLength(0);
+    } finally {
+      timeouts.mockRestore();
+      if (backend === "sqlite") other.closeState();
+    }
+  });
+
   // The join wake can share an idle refresh whose preparation still saw no old reader.
   // Its post-confirmation read must carry BOTH the session renewal and compatibility deadline.
   it.each(["file", "sqlite"] as const)("keeps the join deadline when the %s commit wake joins an in-flight confirmation", async backend => {

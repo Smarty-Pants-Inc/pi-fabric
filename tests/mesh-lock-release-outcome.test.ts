@@ -158,13 +158,15 @@ describe("shared finalizer (T4, platform independent)", () => {
   it("#1191 revoked Proxy primary keeps the fixed fallback warning and original identity", () => {
     const { proxy: primary, revoke } = Proxy.revocable(new Error("1191_REVOKED_APPLICATION_SECRET"), {});
     revoke();
-    const operation = vi.fn(() => { throw primary; });
+    // A mock operation also inspects thrown values; use the real throw directly.
+    let operations = 0;
+    const operation = () => { operations += 1; throw primary; };
     const release = recorder(refused as never);
     let caught: unknown = Symbol("not thrown");
     try { runUnderMeshLocks(operation, [{ lock: "L", release }]); } catch (error) { caught = error; }
     // Vitest inspects matcher inputs; compare identity before giving it the revoked object.
     expect(Object.is(caught, primary)).toBe(true);
-    expect(operation).toHaveBeenCalledTimes(1);
+    expect(operations).toBe(1);
     expect(release).toHaveBeenCalledTimes(1);
     const secondaries = meshLockSecondaryReleaseErrors(primary);
     expect(secondaries).toHaveLength(1);

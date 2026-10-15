@@ -406,7 +406,7 @@ describe("fleet model policy (#2490)", () => {
     delete (provider.participants as Partial<FabricParticipantSource>).self;
     const actor = await provider.invoke("create", { name: "minimal-topology", instructions: "Review." }, context) as FabricActorInfo;
     expect(actors.owns(actor.id)).toBe(true);
-    if (process.platform === "linux") {
+    if (process.platform === "linux" || process.platform === "darwin" || process.platform === "win32") {
       await provider.invoke("remove", { id: actor.id }, context);
       expect(actors.list()).toEqual([]);
     } else {
@@ -414,7 +414,7 @@ describe("fleet model policy (#2490)", () => {
       fs.appendFileSync(historyFile, `${JSON.stringify({ testHistory: "standalone Main removal" })}\n`);
       const historyBeforeRemoval = fs.readFileSync(historyFile, "utf8");
       const removal = await provider.invoke("remove", { id: actor.id }, context) as { removed: boolean; cleaned?: boolean; pending?: string };
-      // Off Linux the fence refusal follows registry revocation but precedes tree/presence deletion; follow-up smarty-dev#11335.
+      // On unsupported platforms fence refusal follows revocation but precedes tree/presence deletion; smarty-dev#11335.
       const pending = `removal cleanup failed: Root actor tree deletion needs the Main publication fence, which this platform (${process.platform}) lacks (smarty-dev#8090); follow-up smarty-dev#11335; the root ${identity.id} actor tree is kept (a later remove or host start finishes it)`;
       expect(removal).toEqual({ removed: true, cleaned: false, pending });
       expect(actors.list()).toEqual([expect.objectContaining({ id: actor.id, rootId: identity.id, status: "stopped",
@@ -532,7 +532,7 @@ describe("fleet model policy (#2490)", () => {
           provider.participants, provider.control, provider.lifecycle, undefined, undefined, false,
         ));
         // The returned receipt supplies the exact public cleanup key; an uncancelled control still returns a handle.
-        if (process.platform === "linux") {
+        if (process.platform === "linux" || process.platform === "darwin" || process.platform === "win32") {
           expect((await execute(`return await agents.remove({ id: ${JSON.stringify(id)} });`)).success).toBe(true);
           expect(actors.list()).toEqual([]); expect(mesh.listAll("actors/test/")).toEqual([]);
         } else {
@@ -541,7 +541,7 @@ describe("fleet model policy (#2490)", () => {
           const historyBeforeRemoval = fs.readFileSync(historyFile, "utf8");
           const removed = await execute(`return await agents.remove({ id: ${JSON.stringify(id)} });`);
           expect(removed.success).toBe(true);
-          // Off Linux the fence refusal follows registry revocation but precedes tree/presence deletion; follow-up smarty-dev#11335.
+          // On unsupported platforms fence refusal follows revocation but precedes tree/presence deletion; smarty-dev#11335.
           const pending = `removal cleanup failed: Root actor tree deletion needs the Main publication fence, which this platform (${process.platform}) lacks (smarty-dev#8090); follow-up smarty-dev#11335; the root ${provider.mainAgent.id} actor tree is kept (a later remove or host start finishes it)`;
           expect(removed.value).toEqual({ removed: true, cleaned: false, pending });
           expect(actors.list()).toEqual([expect.objectContaining({ id, rootId: provider.mainAgent.id, status: "stopped",
@@ -556,7 +556,7 @@ describe("fleet model policy (#2490)", () => {
         expect(control.success).toBe(true); expect(control.residentOutcomes).toBeUndefined();
         expect(control.value).toMatchObject({ name: request.name, status: "idle" });
         const controlId = (control.value as FabricActorInfo).id;
-        if (process.platform === "linux") {
+        if (process.platform === "linux" || process.platform === "darwin" || process.platform === "win32") {
           expect((await execute(`return await agents.remove({ id: ${JSON.stringify(controlId)} });`)).success).toBe(true);
           expect(actors.list()).toEqual([]); expect(mesh.listAll("actors/test/")).toEqual([]);
         } else {
@@ -565,7 +565,7 @@ describe("fleet model policy (#2490)", () => {
           const controlHistoryBeforeRemoval = fs.readFileSync(controlHistoryFile, "utf8");
           const controlRemoved = await execute(`return await agents.remove({ id: ${JSON.stringify(controlId)} });`);
           expect(controlRemoved.success).toBe(true);
-          // Off Linux the fence refusal follows registry revocation but precedes tree/presence deletion; follow-up smarty-dev#11335.
+          // On unsupported platforms fence refusal follows revocation but precedes tree/presence deletion; smarty-dev#11335.
           const pending = `removal cleanup failed: Root actor tree deletion needs the Main publication fence, which this platform (${process.platform}) lacks (smarty-dev#8090); follow-up smarty-dev#11335; the root ${provider.mainAgent.id} actor tree is kept (a later remove or host start finishes it)`;
           expect(controlRemoved.value).toEqual({ removed: true, cleaned: false, pending });
           expect(actors.list()).toEqual(expect.arrayContaining([
@@ -1376,11 +1376,11 @@ describe("#169 round 1 agents.remove cleanup routing", () => {
       state.control, state.lifecycle, undefined, { removeActor } as unknown as ResidencyClient);
     await expect(provider.invoke("remove", { id: actor.id }, context)).resolves.toMatchObject({ removed: true });
     expect(removeActor).toHaveBeenCalledExactlyOnceWith(actor.id, context.signal);
-    if (process.platform === "linux") {
+    if (process.platform === "linux" || process.platform === "darwin" || process.platform === "win32") {
     expect(fs.existsSync(dir)).toBe(false);
     expect(await provider.invoke("actors", {}, context)).not.toContainEqual(expect.objectContaining({ id: actor.id }));
     } else {
-      // Off Linux the routed retry is refused before any delete (smarty-dev#8090; follow-up smarty-dev#11335).
+      // On unsupported platforms the routed retry refuses before any delete (smarty-dev#8090; follow-up smarty-dev#11335).
       expect(fs.existsSync(dir)).toBe(true);
       await expect(owner.remove(actor.id)).resolves.toEqual({ removed: true, cleaned: false,
         pending: `removal cleanup failed: Root actor tree deletion needs the Main publication fence, which this platform (${process.platform}) lacks (smarty-dev#8090); follow-up smarty-dev#11335; the root ${state.identity.id} actor tree is kept (a later remove or host start finishes it)` });
@@ -1415,7 +1415,7 @@ describe("#169 round 1 agents.remove cleanup routing", () => {
       fs.writeFileSync(successor.sessionFile!, "successor history\n");
       await expect(provider.invoke("remove", { id: actor.id.slice(0, 12) }, context)).rejects.toThrow();
       failing.mockRestore();
-      if (process.platform === "linux") {
+      if (process.platform === "linux" || process.platform === "darwin" || process.platform === "win32") {
       await expect(provider.invoke("remove", { id: actor.id }, context)).resolves.toMatchObject({ removed: true });
       expect(directory.pendingRemovals()).toEqual([]);
       expect(fs.existsSync(dir)).toBe(false);
@@ -1423,7 +1423,7 @@ describe("#169 round 1 agents.remove cleanup routing", () => {
       expect(directory.status("retry worker").id).toBe(successor.id);
       expect(await provider.invoke("actors", {}, context)).not.toContainEqual(expect.objectContaining({ id: actor.id }));
       } else {
-        // Off Linux the retry is refused before any delete (smarty-dev#8090; follow-up smarty-dev#11335): tree kept, pending.
+        // On unsupported platforms the retry refuses before any delete (smarty-dev#8090; follow-up smarty-dev#11335): tree kept, pending.
         await expect(provider.invoke("remove", { id: actor.id }, context)).resolves.toMatchObject({
           removed: true, cleaned: false,
           pending: `removal cleanup failed: Root actor tree deletion needs the Main publication fence, which this platform (${process.platform}) lacks (smarty-dev#8090); follow-up smarty-dev#11335; the root ${state.identity.id} actor tree is kept (a later remove or host start finishes it)`,

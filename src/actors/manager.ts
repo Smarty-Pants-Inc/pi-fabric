@@ -524,6 +524,12 @@ export const actorRealarmKey = (actorId: string): string => `actors/realarm/${ac
 /** The kinds of fabric.alarm.actor-activation: a blocked activation (pi-fabric#735) and the states that cannot act (smarty-dev#9332). */
 export type ActorAlarmKind = "actor-activation-blocked" | "actor-stopped" | "actor-event-dropped" | "actor-run-stuck";
 export const ACTOR_ALARM_KINDS: readonly ActorAlarmKind[] = ["actor-activation-blocked", "actor-stopped", "actor-event-dropped", "actor-run-stuck"];
+/** Public alarm reasons are closed codes, including when an episode was restored from disk. */
+const actorAlarmReason = (reason: unknown): string => typeof reason === "string" && [
+  "unknown", "context-overflow", "auth", "permission", "security-policy", "quota", "invalid-request",
+  "provider-transient", "activation-window-lost", "child-exit-before-admission", "preparation-timeout", "failing-preparation",
+  "relaunch", "stop", "error", "worker-unverified", "run-dir-missing", "worker-gone", "worker-pid-reused",
+].includes(reason) ? reason : "unknown";
 /** Mesh key of an actor's alarm claim for one kind; the blocked kind keeps its #7782 key. */
 export const actorAlarmKey = (actorId: string, kind: ActorAlarmKind): string =>
   kind === "actor-activation-blocked" ? actorRealarmKey(actorId) : `actors/realarm/${actorId}/${kind}`;
@@ -2317,24 +2323,27 @@ export class ActorManager {
       if (fs.existsSync(actor.sessionFile)) {
         if (this.#hasSessionHeader(actor.sessionFile)) return;
         const stamp = new Date().toISOString().replace(/[-:.]/g, "");
-        archived = `${actor.sessionFile}.${stamp}.${randomUUID()}.orphan-noheader.bak`;
-        fs.renameSync(actor.sessionFile, archived);
+        const orphan = `${actor.sessionFile}.${stamp}.${randomUUID()}.orphan-noheader.bak`;
+        fs.renameSync(actor.sessionFile, orphan);
+        archived = orphan;
       }
       writeJsonAtomic(actor.sessionFile, {
         type: "session", version: 3, id: randomUUID(),
         timestamp: new Date().toISOString(), cwd: this.agents.cwd,
       }, { newline: true, durable: this.#persistent });
     } catch (error) {
-      this.#sessionAlarm(actor, "error", archived, error instanceof Error ? error.message : String(error));
+      this.#sessionAlarm(actor, "error", archived !== undefined);
       throw error;
     }
-    if (archived) this.#sessionAlarm(actor, "repaired", archived);
+    if (archived) this.#sessionAlarm(actor, "repaired", true);
   }
 
-  #sessionAlarm(actor: ManagedActor, outcome: "repaired" | "error", archived?: string, error?: string): void {
-    const text = `Fabric host notice: actor ${actor.name} session ${outcome === "repaired" ? "repaired (no valid header)" : "repair failed"}; ` +
-      `${archived ? `orphan preserved at ${archived}` : "no orphan archive"}${error ? `; ${error.split("\n")[0]}` : ""}.`;
-    const data = { actorId: actor.id, sessionFile: actor.sessionFile, archived, ...(error ? { error } : {}) };
+  #sessionAlarm(actor: ManagedActor, outcome: "repaired" | "error", archived: boolean): void {
+    const reason = actorAlarmReason("error");
+    const text = `Fabric host notice: actor ${actor.name} (${actor.id}) session ${outcome === "repaired" ? "repaired" : "repair failed"} (no valid header); ` +
+      `reason: ${reason}; ${archived ? "orphan preserved" : "no orphan archive"}. ` +
+      `Inspect it with agents.actorStatus({ id: ${JSON.stringify(actor.id)} }) and agents.log; repair or recreate it if needed.`;
+    const data = { actorId: actor.id, reason, status: outcome, archived };
     const message: FabricActorMessage = {
       id: randomUUID(), actorId: actor.id, actorName: actor.name, direction: "out",
       source: "fabric-host", createdAt: Date.now(), action: "message", text, data,
@@ -2344,7 +2353,7 @@ export class ActorManager {
     // Preserve the alarm above, but ESC/shutdown must not restart Main with a followUp.
     if (this.#halted || this.#closing) return;
     // Host alarms are visible even when the actor's own delivery policy is silent/mailbox.
-    try { this.onDeliver({ actor: this.#publicInfo(actor), message, delivery: "followUp", triggerTurn: true }); } catch { /* alarm remains in the mesh/message log */ }
+    try { this.onDeliver({ actor: this.#alarmInfo(actor), message, delivery: "followUp", triggerTurn: true }); } catch { /* alarm remains in the mesh/message log */ }
   }
 
   /**
@@ -4662,7 +4671,7 @@ export class ActorManager {
                 data: { contextOverflow: { retry: false, toolCalls: result.toolCalls, runId: result.id, error: result.error, eventRef: actorEventRef(item) } },
               });
             }
-            if (contextOverflow) this.#publishActivationOverflow(actor, item, result.id, result.error ?? "");
+            if (contextOverflow) this.#publishActivationOverflow(actor, item, result.id);
             if (actor.responseMode === "directive") {
               // A failed directive run is non-fatal: stay silent and keep the
               // actor ambient instead of erroring out. Record the run error for
@@ -5015,7 +5024,7 @@ export class ActorManager {
 
   // smarty-dev#3238: an event that overflowed a fresh session gets no verdict. Say so explicitly, once,
   // on the actor's own output path, so its owner or the factory can report it where the event came from.
-  #publishActivationOverflow(actor: ManagedActor, item: ActorQueueItem, runId: string | undefined, error: string): void {
+  #publishActivationOverflow(actor: ManagedActor, item: ActorQueueItem, runId: string | undefined): void {
     const eventRef = actorEventRef(item);
     const where = eventRef.pr !== undefined ? ` for PR ${eventRef.repository ? `${eventRef.repository}#` : "#"}${eventRef.pr}`
       : eventRef.topic ? ` for ${eventRef.topic}${eventRef.kind ? ` ${eventRef.kind}` : ""}` : "";
@@ -5025,7 +5034,7 @@ export class ActorManager {
       from: { id: actor.id, name: actor.name, kind: "actor", sessionId: this.sessionId },
       text: `${actor.name}: ${ACTOR_ACTIVATION_OVERFLOW_REASON}${where}.`,
       data: { actorId: actor.id, actorName: actor.name, eventRef, reason: ACTOR_ACTIVATION_OVERFLOW_REASON,
-        ...(runId ? { runId } : {}), error: (error.split("\n").map((line) => line.trim()).find(Boolean) ?? error).slice(0, 300) },
+        ...(runId ? { runId } : {}), error: actorAlarmReason("context-overflow") },
     }).catch(() => undefined);
   }
 
@@ -5087,10 +5096,11 @@ export class ActorManager {
     const contextOverflow = code === "context-overflow";
     if (streak.notified || (!contextOverflow && streak.count < ACTOR_FAILURE_NOTICE_AFTER)) return;
     streak.notified = true;
+    const alarmCode = actorAlarmReason(code);
     const text =
       (contextOverflow ? `Fabric host notice: actor ${actor.name} could not complete this activation (context overflow). `
         : `Fabric host notice: actor ${actor.name} failed its last ${streak.count} activations, so it is not acting on its events. `) +
-      `Last error: ${reason}${runId ? ` (run ${runId})` : ""}. ` +
+      `Failure code: ${alarmCode}${runId ? ` (run ${runId})` : ""}. ` +
       `Inspect it with agents.actorStatus({ id: ${JSON.stringify(actor.id)} }) and agents.log, then repair, reconfigure or recreate it. ` +
       `Reconcile any prepared external effects from the failed runs before rerouting their work.` +
       (contextOverflow ? overflowRetried
@@ -5100,25 +5110,24 @@ export class ActorManager {
     const notice: FabricActorMessage = {
       id: randomUUID(), actorId: actor.id, actorName: actor.name, direction: "out",
       source: "fabric-host", createdAt: Date.now(), action: "message", text,
-      ...(contextOverflow ? { data: { reason: "context_window", error, runId } } : {}),
+      ...(contextOverflow ? { data: { reason: "context_window", ...(runId ? { runId } : {}) } } : {}),
     };
     if (contextOverflow) {
       this.#recordMessage(this.#liveActor(actor), notice);
       void this.mesh.publish({ topic: "ops.owner", kind: "actor.alarm", from: this.identity, to: actor.rootId,
-        text, data: { actorId: actor.id, reason: "context_window", error, runId } }).catch(() => undefined);
+        text, data: { actorId: actor.id, reason: "context_window", ...(runId ? { runId } : {}) } }).catch(() => undefined);
     }
     void this.#publishNotification({
       topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, kind: "actor-activation-blocked", from: this.identity,
-      // The fixed code, never the raw error text (paths, secrets): smarty-dev#10067 P2-2. The text stays in the actor's
-      // own messages and run records, and in the Main notice above.
-      data: { actorId: actor.id, actorName: actor.name, ownerRoot: actor.rootId, reason: code, code, class: activationBlockClass(code), classification,
+      // Raw errors and classifications stay in actorStatus and local run diagnostics, not public alarms.
+      data: { actorId: actor.id, actorName: actor.name, ownerRoot: actor.rootId, reason: alarmCode, code: alarmCode, class: activationBlockClass(alarmCode),
         since: actor.activationBlocked?.since, count: actor.activationBlocked?.count,
         ...(actor.activationBlocked?.retryAt !== undefined ? { retryAt: actor.activationBlocked.retryAt } : {}),
-        routingStatus: this.#publicInfo(actor).status, pendingEffects: "reconcile-required", ...(runId ? { runId } : {}) },
+        routingStatus: this.#routingStatus(actor), pendingEffects: "reconcile-required", ...(runId ? { runId } : {}) },
     }).catch(() => undefined);
     try {
       this.onDeliver({
-        actor: this.#publicInfo(actor),
+        actor: this.#alarmInfo(actor),
         message: notice,
         // A host alarm: it reaches Main and starts a turn whatever the actor's own delivery.
         delivery: "followUp",
@@ -5169,7 +5178,7 @@ export class ActorManager {
       try {
         // The same host alarm channel as the failure-streak notice: it reaches the
         // root's Main and starts a turn whatever the actor's own delivery.
-        this.onDeliver({ actor: this.#publicInfo(actor), message: notice, delivery: "followUp", triggerTurn: true });
+        this.onDeliver({ actor: this.#alarmInfo(actor), message: notice, delivery: "followUp", triggerTurn: true });
       } catch {
         // Best effort: the metrics line and the actor's preparing status remain.
       }
@@ -5919,18 +5928,18 @@ export class ActorManager {
     if (last !== undefined && now - last < ACTOR_DEAD_LETTER_ALARM_MS) return;
     this.#deadLetterAlarms.set(actor.id, now);
     const text = `Fabric host notice: actor ${actor.name} is not keeping up: its queue (${this.meshConfig.actorQueueLimit}) and overflow ` +
-      `(${this.#overflowCap()}) are full, so ${count} further routed event(s) wait in its dead-letter file ${file}. ` +
+      `(${this.#overflowCap()}) are full, so ${count} further routed event(s) wait in its dead-letter backlog. ` +
       `They re-queue automatically once its queue drains below half; other actors are not held. ` +
       `Inspect it with agents.actorStatus({ id: ${JSON.stringify(actor.id)} }) and agents.log.`;
     const notice: FabricActorMessage = {
       id: randomUUID(), actorId: actor.id, actorName: actor.name, direction: "out", source: "fabric-host",
-      createdAt: now, action: "message", text, data: { reason: "dead_letter", deadLetters: count, file },
+      createdAt: now, action: "message", text, data: { reason: "dead_letter", deadLetters: count },
     };
     this.#recordMessage(actor, notice);
     void this.mesh.publish({ topic: "ops.owner", kind: "actor.alarm", from: this.identity, to: actor.rootId,
-      text, data: { actorId: actor.id, reason: "dead_letter", deadLetters: count, file } }).catch(() => undefined);
+      text, data: { actorId: actor.id, reason: "dead_letter", deadLetters: count } }).catch(() => undefined);
     try {
-      this.onDeliver({ actor: this.#publicInfo(actor), message: notice, delivery: "followUp", triggerTurn: true });
+      this.onDeliver({ actor: this.#alarmInfo(actor), message: notice, delivery: "followUp", triggerTurn: true });
     } catch { /* best effort: the notice stays in the actor's messages */ }
   }
 
@@ -6076,15 +6085,17 @@ export class ActorManager {
     const slot = early ? -1 : actorAlarmSlot(now, blocked.since, ACTOR_BLOCK_REALARM_AFTER_MS);
     if (slot === undefined) return;
     this.#alarmActorState(actor, "actor-activation-blocked", blocked.since, slot, now, () => ({
-      actorId: actor.id, actorName: actor.name, ownerRoot: actor.rootId, reason: blocked.code, code: blocked.code,
-      classification: blocked.classification, since: blocked.since, count: blocked.count, routingStatus: this.#publicInfo(actor).status,
+      actorId: actor.id, actorName: actor.name, ownerRoot: actor.rootId,
+      reason: actorAlarmReason(blocked.code), code: actorAlarmReason(blocked.code),
+      since: blocked.since, count: blocked.count, routingStatus: this.#routingStatus(actor),
       pendingEffects: "reconcile-required", ...(early ? { early: true } : { repeat: true }), blockedForMs: age }),
       () => this.#actors.get(actor.id)?.activationBlocked?.since === blocked.since);
   }
 
   /**
    * smarty-dev#9332: actor states that cannot act raise the same owner alarm as a blocked activation
-   * (fabric.alarm.actor-activation, ownerRoot routing), evaluated on the existing retention sweep, no new timer:
+   * (fabric.alarm.actor-activation records ownerRoot; onDeliver reaches the owner's Main),
+   * evaluated on the existing retention sweep, no new timer:
    * - actor-stopped: a durable or supervisor actor stopped for over 10 min and not removed;
    * - actor-run-stuck: an in-flight run older than max(30 min, 2x the actor's p95 run time) whose run directory is
    *   missing or whose worker is gone;
@@ -6183,7 +6194,7 @@ export class ActorManager {
 
   #alarmDroppedEvents(actor: ManagedActor, dropped: NonNullable<ManagedActor["eventsDropped"]>, now: number): void {
     this.#alarmActorState(actor, "actor-event-dropped", dropped.since, actorAlarmSlot(now, dropped.since, 0), now, () => ({
-      actorId: actor.id, actorName: actor.name, ownerRoot: actor.rootId, reason: dropped.reason, count: dropped.count,
+      actorId: actor.id, actorName: actor.name, ownerRoot: actor.rootId, reason: actorAlarmReason(dropped.reason), count: dropped.count,
       since: dropped.since, lastDroppedAt: dropped.at, eventRef: dropped.eventRef, ...(dropped.runId ? { runId: dropped.runId } : {}),
       pendingEffects: "reconcile-required" }),
       () => this.#actors.get(actor.id)?.eventsDropped?.since === dropped.since);
@@ -6234,12 +6245,35 @@ export class ActorManager {
       // is idempotent per (kind, actor, episode, slot) through the mesh's durable dedupe receipt (smarty-dev#8903):
       // a crash after it and before the claim is marked published lets a later sweep take the claim over, and its
       // publish returns the first event instead of appending a second alarm.
+      const attemptId = randomUUID();
+      const dedupeKey = actorAlarmDedupeKey(kind, actor.id, since, slot);
+      let event: MeshEvent;
       try {
-        await this.mesh.publish({ topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, kind, from: this.identity, data,
-          dedupeKey: actorAlarmDedupeKey(kind, actor.id, since, slot) });
+        event = await this.mesh.publish({ id: attemptId, topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, kind, from: this.identity, data,
+          dedupeKey });
       } catch {
         await release();
         return;
+      }
+      // Blocked slot -1 is the early unknown-block notice, only if the live streak still has no notice.
+      // Blocked slot 0 remains allowed; other state kinds only repeat after slot 0.
+      const live = this.#actors.get(actor.id);
+      const repeat = kind === "actor-activation-blocked"
+        ? slot >= 0 || (slot === -1 && data.early === true && live !== undefined && !live.failureStreak?.notified)
+        : slot > 0;
+      // At-most-once Main delivery: receipt replay returns the original id, never this attempt's id.
+      // ponytail: a crash after publish but before onDeliver loses this slot's notice; the next slot re-alarms.
+      if (repeat && event.id === attemptId && current() && this.mesh.get(key)?.version === claim.version) {
+        const reason = actorAlarmReason(data.reason);
+        const notice: FabricActorMessage = {
+          id: dedupeKey, actorId: actor.id, actorName: actor.name, direction: "out",
+          source: "fabric-host", createdAt: now, action: "message",
+          // Only the alarm kind and fixed reason code, never raw errors or classification text.
+          text: `Fabric host notice: ${kind}; reason: ${reason}. Inspect it with agents.actorStatus and agents.log.`,
+        };
+        try {
+          this.onDeliver({ actor: this.#alarmInfo(live ?? actor), message: notice, delivery: "followUp", triggerTurn: true });
+        } catch { /* Best effort: the mesh alarm remains, and the slot is still marked published below. */ }
       }
       await this.mesh.put({ key, identity: this.identity, value: { ...claimed, state: "published" }, ifVersion: claim.version })
         .catch(() => undefined);
@@ -7986,6 +8020,20 @@ export class ActorManager {
     // persist and advertise this value. Unchanged bindings do no extra work.
   }
 
+  // Host alarm envelopes are built from an allowlist, never by redacting the diagnostic actor view.
+  #alarmInfo(actor: ManagedActor) {
+    return { id: actor.id, name: actor.name, status: this.#routingStatus(actor), rootId: actor.rootId };
+  }
+
+  #routingStatus(actor: ManagedActor, blockExpired = activationBlockExpired(actor.activationBlocked)): FabricActorStatus {
+    // Expired transient blocks retain diagnostics but no longer affect routing.
+    return actor.status === "stopped" ? "stopped"
+      : (actor.failureStreak?.count ?? 0) >= ACTOR_FAILURE_NOTICE_AFTER && !blockExpired
+      ? actor.activationBlocked?.code === "failing-preparation" || actor.activationBlocked?.code === "preparation-timeout"
+        ? "failing-preparation" : "failed" : actor.preparing
+      ? actor.preparing.phase === "waiting" ? "waiting" : "preparing" : actor.status;
+  }
+
   #publicInfo(actor: ManagedActor, includePresenceError = true, registryView = false): FabricActorInfo {
     const session = registryView ? undefined : this.#bindings.get(actor.id);
     // Shared observers cannot know a legacy row's last admitted binding. An
@@ -8010,11 +8058,7 @@ export class ActorManager {
       instructionsLength: actor.instructions.length,
       // Failed is a routing view, not a destructive stop: retained events and
       // explicit repair/probe asks can still run. Success clears the durable streak.
-      status: actor.status === "stopped" ? "stopped"
-        : (actor.failureStreak?.count ?? 0) >= ACTOR_FAILURE_NOTICE_AFTER && !blockExpired
-        ? actor.activationBlocked?.code === "failing-preparation" || actor.activationBlocked?.code === "preparation-timeout"
-          ? "failing-preparation" : "failed" : actor.preparing
-        ? actor.preparing.phase === "waiting" ? "waiting" : "preparing" : actor.status,
+      status: this.#routingStatus(actor, blockExpired),
       ...(actor.status === "stopped" && actor.stopReason ? { stopReason: actor.stopReason } : {}),
       ...(actor.preparing ? { preparing: { ...actor.preparing,
         ageS: Math.max(0, Math.round((Date.now() - actor.preparing.startedAt) / 1_000)),

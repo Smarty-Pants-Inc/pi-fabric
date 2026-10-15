@@ -46,6 +46,7 @@ const lazy = [
   "residency/launcher-owner.js",
   "judge/agent.js",
   "core/landlock.js",
+  "core/auto-approval-classifier-impl.js",
   "core/pattern-kill.js",
   "lifecycle/reload-target-profile.js",
   "lifecycle/reload-slots.js",
@@ -324,7 +325,9 @@ const initialSource = [...startupFiles]
   .join("\n");
 // file-lock, entropy/compiler and entropy/trial are eager while Pi loads dist/index.js (pi-fabric#982): its
 // re-exported entropy barrel imports them. Restore these 3 markers with the bootstrap entry, smarty-dev#10373.
-for (const forbidden of ["src/storage/verified-remove.ts", "src/storage/windows-mesh-release.ts", "src/bash-idle-watchdog.ts", "src/guards/foreground-wait.ts", "src/lifecycle/reload-slots.ts", "src/core/landlock.ts", "src/core/pattern-kill.ts", "src/compaction/hook.ts", "src/compaction/branch-summary.ts", "src/compaction/projections.ts", "src/coordination/unverified-ids.ts", "src/main-agent.ts", "src/providers/agents-message-router.ts", "src/fabric-runtime-state.ts", "src/topology/root-inbox.ts", "src/topology/root-inbox-context.ts", "src/prewalk/handoff.ts", "src/jev/client.ts", "src/ui/languages/bend.ts", "src/ui/settings.ts", "src/ui/conversation.ts", "src/ui/conversation-chrome.ts", 'from "mcporter"', "src/native-discovery.ts", "src/memory/extractive-history.ts", "src/memory/extractive-index.ts", "src/ui/image-overlays.ts", "src/ui/kitty-viewport.ts"]) {
+// Keep both sides' lazy-startup assertions: the Windows release helpers and the main-branch
+// auto-approval classifier are all forbidden from the eager graph.
+for (const forbidden of ["src/storage/verified-remove.ts", "src/storage/windows-mesh-release.ts", "src/bash-idle-watchdog.ts", "src/guards/foreground-wait.ts", "src/lifecycle/reload-slots.ts", "src/core/landlock.ts", "src/core/pattern-kill.ts", "src/compaction/hook.ts", "src/compaction/branch-summary.ts", "src/compaction/projections.ts", "src/coordination/unverified-ids.ts", "src/core/auto-approval-classifier-impl.ts", "src/main-agent.ts", "src/providers/agents-message-router.ts", "src/fabric-runtime-state.ts", "src/topology/root-inbox.ts", "src/topology/root-inbox-context.ts", "src/prewalk/handoff.ts", "src/jev/client.ts", "src/ui/languages/bend.ts", "src/ui/settings.ts", "src/ui/conversation.ts", "src/ui/conversation-chrome.ts", 'from "mcporter"', "src/native-discovery.ts", "src/memory/extractive-history.ts", "src/memory/extractive-index.ts", "src/ui/image-overlays.ts", "src/ui/kitty-viewport.ts"]) {
   if (initialSource.includes(forbidden)) {
     throw new Error(`Startup static graph contains lazy module marker: ${forbidden}`);
   }

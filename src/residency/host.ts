@@ -2,6 +2,7 @@
 
 import { fabricTurnProvenance, fabricWakeCause, copyFabricWakeCause, type FabricWakeCause, type FabricPrincipal } from "../fabric-provenance.js";
 import { randomUUID } from "node:crypto";
+import { detachedPreview } from "../core/preview.js";
 import { resolveActorInstructions, assertActorInstructionReplacement } from "../actors/instructions-file.js";
 import {
   RESIDENT_HANDOVER_ABI, HANDOVER_DRAIN_MS, exactResidentProcess, assertAutomaticReleaseRecovery,
@@ -402,20 +403,25 @@ export class ResidentHost {
       (directory, expired = () => false) => {
         if (!retentionV2Enabled()) { this.agents.recoverPendingArchives(directory); return; }
         if (!this.agents.hasRunCustody(path.basename(directory)) && this.agents.recoverPendingArchives(directory, expired)) this.#requestRetention.resample();
-      }, retentionV2Enabled() ? {
+      }, {
         // A checked exit clears exchange debt, not the manager's run-directory
         // custody. Deleting a still-managed tree destroys the next fresh exit
         // proof and can pin a deferred stopped-actor exchange indefinitely.
         run: id => this.agents.hasRunCustody(id),
         reference: id => this.agents.retentionCustodyVeto(id),
-      } : undefined);
+      });
   }
 
   #initialize(): void {
     const { config, modelRegistry } = this;
+    // Follow moved-marker/meta authority even after a stale backend config re-apply.
+    const stateBackend = meshStateBackendFromMarker(config.meshRoot, config.mesh.stateBackend);
+    if (stateBackend === "sqlite" && stateBackend !== config.mesh.stateBackend) {
+      console.warn(`[pi-fabric] resident mesh ${config.meshRoot}: SQLite moved marker overrides mesh.stateBackend=${config.mesh.stateBackend}; opening sqlite`);
+    }
     this.mesh = new MeshStore(config.meshRoot, config.mesh.maxEventBytes, config.mesh.maxReadEvents,
       { backgroundReadCacheMs: config.mesh.idleReadCoalesceMs ?? RUNTIME_MESH_READ_CACHE_MS, lockProtocol: config.mesh.lockProtocol,
-        stateBackend: meshStateBackendFromMarker(config.meshRoot, config.mesh.stateBackend),
+        stateBackend,
         canWakeResidents: () => this.#ready && !this.#closed && !this.#staged && !this.#handover && !this.#drain });
     this.#deliveryCommits = new CommitOutbox(this.mesh, `residency/${this.hostId}/deliveries`, this.identity, {
       delivery: (record: ResidentDeliveryRecord, view, replay) => this.#writeDelivery(record, view, replay),
@@ -652,7 +658,7 @@ export class ResidentHost {
       onBackgroundComplete: (result) => {
         if (!config.agents.notifyOnComplete) return;
         const durationMs = Math.max(0, (result.finishedAt ?? Date.now()) - result.startedAt);
-        const summary = (result.text || result.error || "no result").slice(0, COMPLETION_MAX_CHARS);
+        const summary = detachedPreview(result.text || result.error || "no result", COMPLETION_MAX_CHARS);
         this.#trackPublication(this.#queueDelivery(
           { id: result.id, name: result.name, kind: "agent" },
           `Fabric agent ${result.id.slice(0, 8)} ${result.status} after ${Math.round(durationMs / 1_000)}s: ${summary}`,
@@ -751,13 +757,6 @@ export class ResidentHost {
           if (rootId !== config.rootId) throw new Error(`Operator cleanup for foreign root ${rootId}; tree kept`);
           const { fencedOperatorCheck } = await import("../actors/remove-offline.js");
           await fencedOperatorCheck(this.mesh, this.identity as { id: string; name: string; kind: "agent" }, rootId, get => {
-            if (process.platform !== "linux") {
-              // pi-fabric#1014: off Linux this is main's existing path on this platform (no kernel fence, no Main
-              // identity primitive): the lease veto and the participant quiet check only.
-              assertResidentOperatorConfirmed(readResidentOperatorEvidence(config, { get }), rootId);
-              assertRootParticipantQuiet(config, { get });
-              return;
-            }
             // pi-fabric#1031: the same Main-identity verdict as the offline removal. A stale record needs its Main
             // pid+start identity independently gone and no live lease file; no record or no identity is unknown.
             try {
@@ -1426,7 +1425,7 @@ export class ResidentHost {
         if (!(error instanceof Error && error.message.startsWith(`Mesh compare-and-swap failed for ${key}: expected version 0,`))) {
           if (isMeshWriteDeferred(error)) throw error; // no truncated rewrite for a refused write
           await this.mesh.put({
-            key, value: { ...publish, message: publish.message.slice(0, Math.max(1, this.config.mesh.eventContextChars)), data: { fabricTruncated: true } },
+            key, value: { ...publish, message: detachedPreview(publish.message, Math.max(1, this.config.mesh.eventContextChars)), data: { fabricTruncated: true } },
             identity: this.identity, ifVersion: 0,
           });
         }

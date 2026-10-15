@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
-  forgetWindowsMeshCapability, prepareWindowsMeshCapability, releaseWindowsMeshLock, windowsMeshReleaseTestHooks, type WindowsMeshCapability,
+  forgetWindowsMeshCapability, meshRetirementName, prepareWindowsMeshCapability, releaseWindowsMeshLock, windowsMeshReleaseTestHooks, type WindowsMeshCapability,
 } from "../src/storage/windows-mesh-release.js";
 
 // Keep: data safety at the native trust boundary. Recorded filesystem/child receipts exercise the real wrapper,
@@ -37,15 +37,20 @@ const queue = (...results: ReturnType<typeof receipt>[]) => {
   for (const result of results) childMock.mockReturnValueOnce(result as ReturnType<typeof spawnSync>);
 };
 const requests = (): Buffer[] => childMock.mock.calls.map(call => (call[2] as { input: Buffer }).input);
-const originalField = (message: Buffer): string => {
+const requestField = (message: Buffer, wanted: number): string => {
   let at = 5;
   for (let field = 0; field < 10; field++) {
     const length = parseInt(message.subarray(at, at + 8).toString("ascii"), 16);
     at += 8;
-    if (field === 8) return message.subarray(at, at + length).toString("utf8");
+    if (field === wanted) return message.subarray(at, at + length).toString("utf8");
     at += length;
   }
-  throw new Error("record field absent");
+  throw new Error("request field absent");
+};
+const originalField = (message: Buffer): string => requestField(message, 8);
+const directoryReceipt = (names: readonly string[]) => {
+  let at = 0;
+  return { readSync: vi.fn(() => at < names.length ? { name: names[at++]! } : null), closeSync: vi.fn() };
 };
 
 beforeEach(() => {
@@ -62,6 +67,7 @@ beforeEach(() => {
   vi.spyOn(fs, "readFileSync").mockImplementation(((file: fs.PathOrFileDescriptor) =>
     String(file) === capability.absolutePath ? executable : bytes) as typeof fs.readFileSync);
   vi.spyOn(fs, "readdirSync").mockReturnValue(["owner"] as never);
+  vi.spyOn(fs, "opendirSync").mockImplementation((() => directoryReceipt([])) as unknown as typeof fs.opendirSync);
   childMock.mockReset();
 });
 afterEach(() => {
@@ -176,6 +182,143 @@ describe("Windows release unknown reconciliation, recorded calls (#9569 T4)", ()
     } finally {
       if (old === undefined) delete process.env[key]; else process.env[key] = old;
     }
+  });
+});
+
+describe("same-R retired receipt reconciliation, recorded only (#1191 T2/T4)", () => {
+  const retired = path.join(path.dirname(lock), meshRetirementName(".lock", 1n, 2n, bytes));
+  const successor = Buffer.from("successor-full-record\n43\n2\n");
+  let empty = false;
+  let candidateNames: string[];
+  let parentNames: string[];
+  beforeEach(() => {
+    empty = false;
+    candidateNames = ["owner"];
+    parentNames = [path.basename(retired)];
+    vi.mocked(fs.lstatSync).mockImplementation(((file: fs.PathLike) => {
+      const name = String(file);
+      if (name === capability.absolutePath) return { isFile: () => true, isSymbolicLink: () => false };
+      if (name === lock) return { ...stat(true), ino: 90n };
+      if (name === `${lock}\\owner`) return { ...stat(false), ino: 91n, size: BigInt(successor.length) };
+      if (name === retired) return stat(true);
+      if (name === `${retired}\\owner`) return empty ? absent() : stat(false);
+      return absent();
+    }) as typeof fs.lstatSync);
+    vi.mocked(fs.readFileSync).mockImplementation(((file: fs.PathOrFileDescriptor) =>
+      String(file) === capability.absolutePath ? executable : String(file) === `${lock}\\owner` ? successor : bytes) as typeof fs.readFileSync);
+    vi.mocked(fs.opendirSync).mockImplementation(((file: fs.PathLike) =>
+      directoryReceipt(String(file) === path.dirname(lock) ? parentNames : empty ? [] : candidateNames)) as unknown as typeof fs.opendirSync);
+    // A release/reconciliation is read-only in JS, including all negative cases.
+    for (const method of ["mkdirSync", "writeFileSync", "renameSync", "unlinkSync", "rmdirSync", "rmSync"] as const) {
+      vi.spyOn(fs, method).mockImplementation(() => { throw new Error(`unexpected JS mutation: ${method}`); });
+    }
+  });
+
+  it("unknown reuses the SAME original framed request after W4 even when B replaces canonical L", () => {
+    // First judgment is A; the first child's recorded commit publishes B and leaves A's T.
+    const lstat = vi.mocked(fs.lstatSync).getMockImplementation()!;
+    const read = vi.mocked(fs.readFileSync).getMockImplementation()!;
+    let committed = false;
+    vi.mocked(fs.lstatSync).mockImplementation(((file: fs.PathLike, ...args: unknown[]) =>
+      !committed && String(file) === retired ? absent() : !committed && String(file) === lock ? stat(true)
+        : !committed && String(file) === `${lock}\\owner` ? stat(false)
+        : Reflect.apply(lstat, fs, [file, ...args])) as typeof fs.lstatSync);
+    vi.mocked(fs.readFileSync).mockImplementation(((file: fs.PathOrFileDescriptor, ...args: unknown[]) =>
+      !committed && String(file) === `${lock}\\owner` ? bytes : Reflect.apply(read, fs, [file, ...args])) as typeof fs.readFileSync);
+    windowsMeshReleaseTestHooks.afterChild = () => { committed = true; };
+    queue(receipt("", 124), receipt("FMR1 released cleanup clean\n"));
+    const result = releaseWindowsMeshLock(lock, originalRecord, capability);
+    expect(result).toMatchObject({ outcome: "released", cleanup: "clean", retiredPath: retired });
+    expect(requests()).toHaveLength(2);
+    expect(requests()[1]).toEqual(requests()[0]); // original S, owner snapshot, full R and destination, not B's S
+    expect(requestField(requests()[1]!, 3)).toBe("2");
+    expect(fs.opendirSync).not.toHaveBeenCalled(); // immediate reconciliation retains the frame
+    expect(fs.readFileSync(path.join(lock, "owner"))).toEqual(successor);
+  });
+
+  it.each([false, true])("new TS state rediscovers ONLY the identity-bound same-R receipt (empty=%s), B untouched", isEmpty => {
+    empty = isEmpty;
+    queue(receipt("FMR1 released cleanup clean\n"));
+    expect(releaseWindowsMeshLock(lock, originalRecord, capability)).toMatchObject({ outcome: "released", cleanup: "clean", retiredPath: retired });
+    expect(requests()).toHaveLength(1);
+    const frame = requests()[0]!;
+    expect([requestField(frame, 2), requestField(frame, 3), originalField(frame)]).toEqual(["1", "2", originalRecord]);
+    expect(requestField(frame, 5)).toBe(isEmpty ? "0" : "3");
+    expect(requestField(frame, 7)).toBe(bytes.length.toString(16)); // R stays full even for the empty-only branch
+    expect(fs.readFileSync(path.join(lock, "owner"))).toEqual(successor);
+    parentNames = []; // native clean receipt: explicit repetition has no child and no mutation
+    expect(releaseWindowsMeshLock(lock, originalRecord, capability)).toEqual({ outcome: "not-owner" });
+    expect(requests()).toHaveLength(1);
+  });
+
+  it("rediscovery serializes original bigint S above 2^53 without borrowing either B identity", () => {
+    const volume = 0xffff_fffen, index = 0xfedc_ba98_7654_3210n;
+    const name = meshRetirementName(".lock", volume, index, bytes);
+    const target = path.join(path.dirname(lock), name);
+    parentNames = [name];
+    empty = true;
+    const lstat = vi.mocked(fs.lstatSync).getMockImplementation()!;
+    vi.mocked(fs.lstatSync).mockImplementation(((file: fs.PathLike, ...args: unknown[]) => String(file) === target
+      ? { ...stat(true), dev: volume, ino: index } : Reflect.apply(lstat, fs, [file, ...args])) as typeof fs.lstatSync);
+    queue(receipt("FMR1 released cleanup clean\n"));
+    expect(releaseWindowsMeshLock(lock, originalRecord, capability)).toMatchObject({ outcome: "released", cleanup: "clean", retiredPath: target });
+    expect([requestField(requests()[0]!, 2), requestField(requests()[0]!, 3)]).toEqual([volume.toString(16), index.toString(16)]);
+  });
+
+  it("rediscovers the same-R receipt with canonical L absent (not a new canonical snapshot)", () => {
+    const lstat = vi.mocked(fs.lstatSync).getMockImplementation()!;
+    vi.mocked(fs.lstatSync).mockImplementation(((file: fs.PathLike, ...args: unknown[]) =>
+      String(file) === lock ? absent() : Reflect.apply(lstat, fs, [file, ...args])) as typeof fs.lstatSync);
+    queue(receipt("FMR1 released cleanup clean\n"));
+    expect(releaseWindowsMeshLock(lock, originalRecord, capability)).toMatchObject({ outcome: "released", cleanup: "clean" });
+    expect(requestField(requests()[0]!, 3)).toBe("2");
+  });
+
+  it("never inspects a nonmatching arbitrary retirement sibling's owner", () => {
+    parentNames = [`r.${"a".repeat(64)}`, "other", ".lock.dead." + "b".repeat(64)];
+    const lstat = vi.mocked(fs.lstatSync).getMockImplementation()!;
+    vi.mocked(fs.lstatSync).mockImplementation(((file: fs.PathLike, ...args: unknown[]) =>
+      String(file).endsWith(parentNames[0]!) ? stat(true) : Reflect.apply(lstat, fs, [file, ...args])) as typeof fs.lstatSync);
+    expect(releaseWindowsMeshLock(lock, originalRecord, capability)).toEqual({ outcome: "not-owner" });
+    expect(childMock).not.toHaveBeenCalled();
+    expect(fs.readFileSync).not.toHaveBeenCalledWith(expect.stringContaining(parentNames[0]!));
+  });
+
+  it.each(["foreign/full-record-differs", "extra", "torn", "reparse", "wrong-S"])("protects %s instead of inferring deletion authority from r.*", variant => {
+    if (variant === "extra") candidateNames = ["owner", "unjudged"];
+    if (variant === "foreign/full-record-differs" || variant === "torn") {
+      vi.mocked(fs.readFileSync).mockImplementation(((file: fs.PathOrFileDescriptor) => String(file) === capability.absolutePath ? executable
+        : String(file) === `${lock}\\owner` ? successor : Buffer.from(variant === "torn" ? "partial" : "foreign-full-record")) as typeof fs.readFileSync);
+    }
+    if (variant === "reparse" || variant === "wrong-S") {
+      const lstat = vi.mocked(fs.lstatSync).getMockImplementation()!;
+      vi.mocked(fs.lstatSync).mockImplementation(((file: fs.PathLike, ...args: unknown[]) => String(file) === retired
+        ? { ...stat(true), ...(variant === "wrong-S" ? { ino: 99n } : { isSymbolicLink: () => true }) }
+        : Reflect.apply(lstat, fs, [file, ...args])) as typeof fs.lstatSync);
+    }
+    const result = releaseWindowsMeshLock(lock, originalRecord, capability);
+    expect(result.outcome).toBe(variant === "wrong-S" ? "not-owner" : "refused-before-retirement");
+    expect(childMock).not.toHaveBeenCalled();
+    expect(fs.readFileSync(path.join(lock, "owner"))).toEqual(successor);
+  });
+
+  it("refuses two identity-bound same-R candidates before either cleanup starts", () => {
+    const second = meshRetirementName(".lock", 1n, 4n, bytes);
+    parentNames.push(second);
+    const lstat = vi.mocked(fs.lstatSync).getMockImplementation()!;
+    vi.mocked(fs.lstatSync).mockImplementation(((file: fs.PathLike, ...args: unknown[]) => String(file) === path.join(path.dirname(lock), second)
+      ? { ...stat(true), ino: 4n } : Reflect.apply(lstat, fs, [file, ...args])) as typeof fs.lstatSync);
+    expect(releaseWindowsMeshLock(lock, originalRecord, capability)).toMatchObject({ outcome: "refused-before-retirement", reason: expect.stringContaining("multiple") });
+    expect(childMock).not.toHaveBeenCalled();
+  });
+
+  it("caps the ENTIRE parent enumeration and closes it before refusing, even with a matching receipt early", () => {
+    const listing = directoryReceipt([path.basename(retired), ...Array.from({ length: 256 }, (_, i) => `unrelated-${i}`)]);
+    vi.mocked(fs.opendirSync).mockReturnValue(listing as unknown as fs.Dir);
+    expect(releaseWindowsMeshLock(lock, originalRecord, capability)).toMatchObject({ outcome: "refused-before-retirement", reason: expect.stringContaining("256") });
+    expect(listing.readSync).toHaveBeenCalledTimes(257);
+    expect(listing.closeSync).toHaveBeenCalledOnce();
+    expect(childMock).not.toHaveBeenCalled();
   });
 });
 

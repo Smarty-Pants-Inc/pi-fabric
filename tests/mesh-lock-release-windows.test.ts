@@ -114,7 +114,10 @@ const waitFor = async (file: string, ms = 15_000): Promise<void> => {
     await new Promise(resolve => setTimeout(resolve, 20));
   }
 };
-const alive = (pid: number): boolean => { try { process.kill(pid, 0); return true; } catch { return false; } };
+const alive = (pid: number): boolean => {
+  try { process.kill(pid, 0); return true; }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === "ESRCH") return false; throw error; }
+};
 const waitGone = async (pid: number, ms = 15_000): Promise<void> => {
   for (const end = Date.now() + ms; alive(pid); ) {
     if (Date.now() > end) throw new Error(`helper ${pid} still running`);
@@ -233,7 +236,9 @@ describe.skipIf(!hosted)(`Windows mesh release primitive, hosted (smarty-dev#956
       if (name === "after-owner") expect(ownerOf(retired)).toBeUndefined();
       const b = record("b");
       acquire(root, b);
-      expect(releaseWindowsMeshLock(lock, a, capability)).toEqual({ outcome: "not-owner" });
+      expect(releaseWindowsMeshLock(lock, a, capability)).toMatchObject(name === "after-directory"
+        ? { outcome: "not-owner" } : { outcome: "released", cleanup: "clean", retiredPath: retired });
+      expect(exists(retired)).toBe(false);
       expect(ownerOf(lock)).toBe(b);
     });
   }
@@ -274,17 +279,18 @@ describe.skipIf(!hosted)(`Windows mesh release primitive, hosted (smarty-dev#956
     }, 20_000);
   }
 
-  it("T2/T4: a watchdog-terminated child after commit is unknown, and one reconciliation reports not-owner", () => {
+  it("T2/T4: a watchdog-terminated child after commit is unknown, and the SAME framed reconciliation cleans T", () => {
     const a = record("a");
     const lock = acquire(root, a);
     windowsMeshReleaseTestHooks.checkpoint = { name: "after-commit", dir: tempDir() }; // never released: the watchdog fires
     windowsMeshReleaseTestHooks.deadlineMs = 1500;
     const result = releaseWindowsMeshLock(lock, a, capability);
-    expect(result).toMatchObject({ outcome: "not-owner", history: expect.arrayContaining([
-      expect.stringContaining("attempt 1: release-outcome-unknown"), "attempt 2: not-owner",
+    expect(result).toMatchObject({ outcome: "released", cleanup: "clean", history: expect.arrayContaining([
+      expect.stringContaining("attempt 1: release-outcome-unknown"), "attempt 2: released",
     ]) });
     expect(result.history).toHaveLength(2);
-    expect(samples.map(sample => sample.outcome)).toEqual(["release-outcome-unknown"]); // reconciliation ended at W1
+    expect(samples.map(sample => sample.outcome)).toEqual(["release-outcome-unknown", "released"]);
+    expect(exists((result as { retiredPath: string }).retiredPath)).toBe(false);
     expect(exists(lock)).toBe(false);
     acquire(root, record("b"));
   });
@@ -380,8 +386,9 @@ describe.skipIf(!hosted)(`Windows mesh release primitive, hosted (smarty-dev#956
       const parentReceipt = await parent.done; // actual close barrier, not just kill delivery
       const parentJoinedAt = Date.now();
       const helperAliveBeforeGo = alive(helper);
-      const goSent = phase === "after-commit" && helperAliveBeforeGo;
-      if (goSent) fs.writeFileSync(path.join(gate, "go"), "");
+      // Never release the checkpoint: parent death + the native deadline must leave the original full-proof T
+      // after W4. Otherwise this test could pass via the first orphan completing, without testing reconciliation.
+      const goSent = false;
       await waitGone(helper, 5000); // native watchdog is 3 s, including forced parent death without go
       const helperGoneAt = Date.now();
       report({ phase, helper, parentPid: parent.child.pid, parentReceipt, helperAliveBeforeGo, goSent,
@@ -399,20 +406,130 @@ describe.skipIf(!hosted)(`Windows mesh release primitive, hosted (smarty-dev#956
         acquire(root, b);
         expect(canonical().record).toEqual(Buffer.from(b, "utf8"));
       } else {
-        // Keep reason: data safety; design.md §5 W4 / parent-death partition and §7 permit a finite orphan
-        // to complete, not require clean T. Full proof, empty original T, or absent T is safe; replaced/unknown T is not.
+        // Keep reason: data safety + bounded cleanup liveness. No go was sent; original proof MUST survive the
+        // parent's death and watchdog. A new wrapper call has no prior JS frame: it must rediscover S from T.
         const afterDeath = retirement();
+        expect(afterDeath.state).toBe("original-full-proof");
         report({ phase, retirement: afterDeath, successor: canonical() });
         expect(canonical()).toEqual(successor!);
-        const retry = releaseWindowsMeshLock(lock, a, capability); // release ONLY the original full R
+        const retry = releaseWindowsMeshLock(lock, a, capability); // release ONLY original full R, never replay work
         const afterRetry = retirement();
         report({ phase, retry, retirement: afterRetry, successor: canonical() });
-        expect(retry).toEqual({ outcome: "not-owner" });
+        expect(retry).toMatchObject({ outcome: "released", cleanup: "clean", retiredPath: retired });
+        expect(afterRetry.state).toBe("absent");
+        expect(canonical()).toEqual(successor!); // full R, directory id, owner id, exact entry set
+        const childCount = samples.length;
+        expect(releaseWindowsMeshLock(lock, a, capability)).toEqual({ outcome: "not-owner" });
+        expect(samples).toHaveLength(childCount); // repeated explicit retry: no child, no changes to B or T
+        expect(retirement().state).toBe("absent");
         expect(canonical()).toEqual(successor!);
-        expect(afterRetry).toEqual(afterDeath); // retry has no authority over B OR A's sibling T
       }
     }, 25_000);
   }
+
+  for (const phase of ["after-commit", "after-owner"] as const) {
+    it(`T2/T4: SAME original native frame and a new-state same-R call clean only T after ${phase}`, async () => {
+      // Two independent fixtures distinguish actual native same-frame resume from TS receipt rediscovery.
+      for (const mode of ["same-frame", "new-state"] as const) {
+        const ownRoot = tempDir();
+        const a = record("a"), b = record("b");
+        const lock = acquire(ownRoot, a);
+        const { retired, message } = nativeRequest(lock, a);
+        const gate = tempDir();
+        const first = startChild(capability, message, { name: phase, dir: gate });
+        await waitFor(path.join(gate, `${phase}.paused`));
+        acquire(ownRoot, b); // B published while the old helper is still alive and paused at T
+        const successor = () => ({
+          dir: fs.lstatSync(lock, { bigint: true }).ino,
+          owner: fs.lstatSync(path.join(lock, "owner"), { bigint: true }).ino,
+          bytes: fs.readFileSync(path.join(lock, "owner")), names: fs.readdirSync(lock),
+        });
+        const before = successor();
+        first.child.kill();
+        expect((await first.done).stdout).toBe(""); // join BEFORE any cleanup attempt
+        expect(ownerOf(retired)).toBe(phase === "after-commit" ? a : undefined);
+        if (mode === "same-frame") {
+          expect(await startChild(capability, message).done).toEqual({ code: 0, stdout: "FMR1 released cleanup clean\n" });
+        } else {
+          expect(releaseWindowsMeshLock(lock, a, capability)).toMatchObject({ outcome: "released", cleanup: "clean", retiredPath: retired });
+        }
+        expect(exists(retired)).toBe(false);
+        expect(successor()).toEqual(before);
+        const count = samples.length;
+        expect(releaseWindowsMeshLock(lock, a, capability)).toEqual({ outcome: "not-owner" });
+        expect(samples).toHaveLength(count);
+        expect(successor()).toEqual(before);
+      }
+    }, 25_000);
+  }
+
+  for (const variant of ["wrong-S", "foreign-owner", "full-record-differs", "torn", "extra", "reparse"] as const) {
+    it(`T2/T4: retired resume protects ${variant}, never touching B or unjudged content`, async () => {
+      const a = record("a"), b = record("b");
+      const lock = acquire(root, a);
+      const { retired, message } = nativeRequest(lock, a);
+      const originalDirectory = fs.lstatSync(lock, { bigint: true });
+      let resumeMessage = message;
+      fs.renameSync(lock, retired); // fixture represents W4, retaining original ids/full record
+      if (variant === "wrong-S" || variant === "reparse") {
+        const aside = path.join(root, "original-T");
+        fs.renameSync(retired, aside);
+        if (variant === "reparse") fs.symlinkSync(aside, retired, "junction");
+        else { fs.mkdirSync(retired); fs.writeFileSync(path.join(retired, "owner"), a); }
+      } else if (variant === "foreign-owner") {
+        fs.renameSync(path.join(retired, "owner"), path.join(root, "original-owner"));
+        fs.writeFileSync(path.join(retired, "owner"), record("foreign"), { flag: "wx" });
+      } else if (variant === "full-record-differs" || variant === "torn") {
+        fs.writeFileSync(path.join(retired, "owner"), variant === "torn" ? "partial" : a.replace("a-", "z-"));
+      } else fs.writeFileSync(path.join(retired, "unjudged"), "keep");
+      if (variant === "full-record-differs") {
+        // Match ids/time/size deliberately: only the independent FULL original R check can refuse this owner.
+        const file = fs.lstatSync(path.join(retired, "owner"), { bigint: true });
+        resumeMessage = encodeMeshRetireRequest({
+          lockPath: path.toNamespacedPath(lock), retiredPath: path.toNamespacedPath(retired),
+          dirVolume: originalDirectory.dev, dirIndex: originalDirectory.ino, ownerVolume: file.dev, ownerIndex: file.ino,
+          ownerFileTime: file.mtimeNs / 100n + 116_444_736_000_000_000n, ownerSize: file.size, record: Buffer.from(a), deadlineMs: 10_000,
+        });
+      }
+      acquire(root, b);
+      const capture = () => ({
+        dir: fs.lstatSync(lock, { bigint: true }).ino, owner: fs.lstatSync(path.join(lock, "owner"), { bigint: true }).ino,
+        bytes: fs.readFileSync(path.join(lock, "owner")), entries: fs.readdirSync(lock),
+        retiredId: fs.lstatSync(retired, { bigint: true }).ino, retiredEntries: fs.readdirSync(retired).sort(),
+        retiredOwner: fs.readFileSync(path.join(retired, "owner")),
+      });
+      const before = capture();
+      const result = await startChild(capability, resumeMessage).done;
+      expect(result).toEqual(variant === "wrong-S" || variant === "reparse"
+        ? { code: 3, stdout: "FMR1 refused commit destination-exists\n" }
+        : { code: 0, stdout: `FMR1 released cleanup ${variant === "extra" ? "pending-extra-entries" : "pending-owner-unverified"}\n` });
+      expect(capture()).toEqual(before);
+      if (variant === "extra") expect(fs.readFileSync(path.join(retired, "unjudged"), "utf8")).toBe("keep");
+    });
+  }
+
+  it("T2/T4: an empty-receipt frame has NO file-delete authority if an owner appears before native inspection", async () => {
+    const a = record("a"), b = record("b");
+    const lock = acquire(root, a);
+    const dir = fs.lstatSync(lock, { bigint: true });
+    const { retired } = nativeRequest(lock, a);
+    fs.renameSync(lock, retired);
+    const message = encodeMeshRetireRequest({
+      lockPath: path.toNamespacedPath(lock), retiredPath: path.toNamespacedPath(retired), dirVolume: dir.dev, dirIndex: dir.ino,
+      ownerVolume: 0n, ownerIndex: 0n, ownerFileTime: 0n, ownerSize: BigInt(Buffer.byteLength(a)), record: Buffer.from(a), deadlineMs: 10_000,
+    });
+    acquire(root, b);
+    // This frame represents a prior empty judgment. Even a complete matching R that appeared meanwhile is kept.
+    const originalOwner = fs.lstatSync(path.join(retired, "owner"), { bigint: true }).ino;
+    const successorDirectory = fs.lstatSync(lock, { bigint: true }).ino;
+    const successorOwner = fs.lstatSync(path.join(lock, "owner"), { bigint: true }).ino;
+    expect(await startChild(capability, message).done).toEqual({ code: 0, stdout: "FMR1 released cleanup pending-owner-unverified\n" });
+    expect(ownerOf(retired)).toBe(a);
+    expect(fs.lstatSync(path.join(retired, "owner"), { bigint: true }).ino).toBe(originalOwner);
+    expect(ownerOf(lock)).toBe(b);
+    expect([fs.lstatSync(lock, { bigint: true }).ino, fs.lstatSync(path.join(lock, "owner"), { bigint: true }).ino])
+      .toEqual([successorDirectory, successorOwner]);
+  });
 
   it("T3: an extra child before retirement refuses with the owner intact (JS W1 and native W3)", async () => {
     const a = record("a");

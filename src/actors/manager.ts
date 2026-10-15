@@ -1,6 +1,7 @@
 import { appendDeliveryOutcome, deliverySend, type DeliverySend, type DeliveryOutcome, type DeliveryOutcomeRecord } from "../mesh/delivery-outcomes.js";
 import { childProcessEnvironment } from "../core/atomic-write.js";
 import { copyFabricProvenance, fabricTurnProvenance, fabricWakeCause, type FabricTurnProvenance, type FabricPrincipal } from "../fabric-provenance.js";
+import { eventReceipts, workKey } from "../topology/root-inbox-shared.js";
 import type { ImageContent } from "@earendil-works/pi-ai";
 import { formatAge } from "../residency/protocol.js";
 import { createHash, randomUUID } from "node:crypto";
@@ -5697,6 +5698,10 @@ export class ActorManager {
             ...(event.verification === undefined ? {} : { verification: event.verification }),
             principal: event.principal,
             wakeCause: fabricWakeCause(event.from, "mesh", event.topic, event.id),
+            inboxEventId: event.id,
+            inboxTopic: event.topic,
+            ...(workKey(event.data) ? { inboxKey: workKey(event.data) } : {}),
+            inboxReceipts: eventReceipts(event),
             message,
             delivery: kind,
             outcomeSend: { eventId: event.id, to: target, from: event.from.id, mode: kind },

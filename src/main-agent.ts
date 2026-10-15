@@ -70,6 +70,11 @@ export interface FabricMainAgentDeliveryRequest {
   wakeCause?: FabricWakeCause | undefined;
   /** Receiving route metadata, never hydrated from command/message data. */
   admissionTopic?: string | undefined;
+  /** Host-hydrated origin metadata for a root-inbox event shadow. */
+  inboxEventId?: string | undefined;
+  inboxTopic?: string | undefined;
+  inboxKey?: string | undefined;
+  inboxReceipts?: string[] | undefined;
   data?: unknown;
   /**
    * A stable id of the sender's durable record (a resident actor's delivery record). Main journals
@@ -289,6 +294,11 @@ export interface HeldAgentMessage {
   /** Receiving-envelope route snapshots, never rehydrated from serialized wake causes. */
   admissionTopic?: string;
   admissionKey?: string;
+  /** Host-hydrated origin event identity and receipts; journaled with the native carrier for replay. */
+  inboxEventId?: string;
+  inboxTopic?: string;
+  inboxKey?: string;
+  inboxReceipts?: string[];
   /** A multi-source or differently classified producer has no reconstructable single envelope. */
   unattributedOnReplay?: true;
   message: string;
@@ -344,10 +354,20 @@ const agentMessageBlock = (item: HeldAgentMessage, delivery: FabricMainAgentDeli
   "</fabric-agent-message>",
 ].filter((line): line is string => Boolean(line)).join("\n");
 
-const itemBytes = (item: HeldAgentMessage): number =>
-  Buffer.byteLength(item.message) + (item.data === undefined ? 0 : Buffer.byteLength(JSON.stringify(item.data))) +
-  (item.deliveryId === undefined ? 0 : Buffer.byteLength(JSON.stringify(item.deliveryId))) +
-  (item.supersedes === undefined ? 0 : Buffer.byteLength(JSON.stringify(item.supersedes)));
+/** Preserve explicit data; otherwise carry the admitted event's work claim at native handoff. */
+const nativeItemData = (item: HeldAgentMessage): unknown =>
+  item.data === undefined && item.inboxKey !== undefined
+    ? { key: item.inboxKey, topic: item.inboxTopic } : item.data;
+
+const itemBytes = (item: HeldAgentMessage): number => {
+  const data = nativeItemData(item);
+  return Buffer.byteLength(item.message) + (data === undefined ? 0 : Buffer.byteLength(JSON.stringify(data))) +
+    // The retained key and native data are separate serialized representations: charge both.
+    (item.inboxKey === undefined ? 0 : Buffer.byteLength(JSON.stringify(item.inboxKey))) +
+    (item.deliveryId === undefined ? 0 : Buffer.byteLength(JSON.stringify(item.deliveryId))) +
+    (item.supersedes === undefined ? 0 : Buffer.byteLength(JSON.stringify(item.supersedes))) +
+    (item.inboxReceipts === undefined ? 0 : Buffer.byteLength(JSON.stringify(item.inboxReceipts)));
+};
 
 type SessionEntryLike = { id?: unknown; parentId?: unknown; type?: string; customType?: string; details?: { id?: unknown; items?: unknown } };
 
@@ -652,6 +672,11 @@ export class MainAgentController implements FabricMainAgentTarget {
       ...(unattributedOnReplay ? { unattributedOnReplay: true } : {}),
       ...(admissionTopic ? { admissionTopic } : {}),
       ...(admissionKey ? { admissionKey } : {}),
+      ...(typeof request.inboxEventId === "string" ? { inboxEventId: request.inboxEventId } : {}),
+      ...(typeof request.inboxTopic === "string" ? { inboxTopic: request.inboxTopic } : {}),
+      ...(typeof request.inboxKey === "string" ? { inboxKey: request.inboxKey } : {}),
+      ...(Array.isArray(request.inboxReceipts) && request.inboxReceipts.every((id) => typeof id === "string")
+        ? { inboxReceipts: [...request.inboxReceipts] } : {}),
       ...((request.verification === "mesh" || request.verification === "bridge") &&
         mainSenderClaimAllowed(sender, deliveryId, request.source) ? {
         provenance: fabricTurnProvenance(sender, request.delivery === "nextTurn" ? "actor" : request.delivery, request.verification, request.principal),
@@ -748,6 +773,11 @@ export class MainAgentController implements FabricMainAgentTarget {
         // The replacement journals every superseded delivery id until the carrier is consumed.
         item.supersedes = [...(replaced.supersedes ?? []), ...(replaced.deliveryId === undefined ? [] : [replaced.deliveryId])];
         item.supersededSends = [...(replaced.supersededSends ?? []), ...(replaced.outcomeSend ? [replaced.outcomeSend] : [])];
+        // Preserve every superseded source receipt. Admission charges the merged metadata
+        // before replacing or consuming the held item; refuse over-budget merges, never truncate.
+        if (replaced.inboxReceipts?.length) {
+          item.inboxReceipts = [...new Set([...replaced.inboxReceipts, ...(item.inboxReceipts ?? [])])];
+        }
       }
       // Charge the proposed ancestry before mutating or acknowledging either carrier.
       this.#admit(item, replaced);
@@ -2025,17 +2055,24 @@ export class MainAgentController implements FabricMainAgentTarget {
     // Each item keeps its own delivery mark: a flushed batch goes in as a steer, but it holds followUps.
     const delivery: FabricMainAgentDelivery = flushed ? "followUp" : deliverAs;
     const blocks = items.map((item) => agentMessageBlock(item, delivery));
-    const itemDetails = (item: HeldAgentMessage) => ({
-      id: item.id,
-      from: item.from,
-      delivery,
-      sentAt: new Date(item.sentAt).toISOString(),
-      ...(item.replacedAt === undefined ? {} : { replacedAt: new Date(item.replacedAt).toISOString() }),
-      ...(item.chain === undefined ? {} : { chain: item.chain, generation: item.generation, replaces: item.replaces }),
-      ...(item.data === undefined ? {} : { data: item.data }),
-      ...(item.deliveryId === undefined ? {} : { deliveryId: item.deliveryId }),
-      ...(item.supersedes?.length ? { supersedes: item.supersedes } : {}),
-    });
+    const itemDetails = (item: HeldAgentMessage) => {
+      // Use the same native shape admission charged, including synthesized work claims.
+      const data = nativeItemData(item);
+      return {
+        id: item.id,
+        from: item.from,
+        delivery,
+        sentAt: new Date(item.sentAt).toISOString(),
+        ...(item.replacedAt === undefined ? {} : { replacedAt: new Date(item.replacedAt).toISOString() }),
+        ...(item.chain === undefined ? {} : { chain: item.chain, generation: item.generation, replaces: item.replaces }),
+        ...(data === undefined ? {} : { data }),
+        ...(item.deliveryId === undefined ? {} : { deliveryId: item.deliveryId }),
+        ...(item.inboxEventId === undefined ? {} : { inboxEventId: item.inboxEventId }),
+        ...(item.inboxTopic === undefined ? {} : { inboxTopic: item.inboxTopic }),
+        ...(item.inboxKey === undefined ? {} : { inboxKey: item.inboxKey }),
+        ...(item.supersedes?.length ? { supersedes: item.supersedes } : {}),
+      };
+    };
     const first = items[0]!;
     const provenance = this.#provenance(first);
     const options = { deliverAs, triggerTurn };
@@ -2055,6 +2092,8 @@ export class MainAgentController implements FabricMainAgentTarget {
         details: {
           ...itemDetails(first),
           ...(items.length > 1 ? { id: randomUUID(), items: items.map(itemDetails) } : {}),
+          ...(items.some((item) => item.inboxReceipts?.length)
+            ? { receipts: items.flatMap((item) => item.inboxReceipts ?? []) } : {}),
           triggerTurn,
           ...(flushed ? { flushed: true } : {}),
         },

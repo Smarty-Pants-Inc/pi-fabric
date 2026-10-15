@@ -240,12 +240,52 @@ describe("FabricUiController dashboard wiring", () => {
     }
   });
 
-  it("fences pending dashboard model discovery at controller stop (#5962)", async () => {
+  it.each(["org-agent@x", "project-agent@x"])("routes dashboard discovery failures privately only for %s and keeps actions visible", async role => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "dashboard-discovery-diagnostics-"));
+    vi.stubEnv("SMARTY_ROLE", role);
+    vi.stubEnv("PI_CODING_AGENT_DIR", root);
+    const state = stubState();
+    vi.mocked(state.actors.list).mockReturnValue([{ ...stubActor, runner: "claude" } as never]);
+    const claudeModels = vi.fn(async () => { throw new Error("runtime unavailable"); });
+    Object.assign(state.agents, { claudeModels });
+    const controller = new FabricUiController(state);
+    let dashboard: FabricDashboard | undefined;
+    const context = { mode: "tui", modelRegistry: { getAvailable: () => [] },
+      sessionManager: { getSessionId: () => "dashboard-discovery" }, ui: {
+        custom: vi.fn(async (factory: (t: TUI, theme: Theme, keys: unknown, done: () => void) => FabricDashboard) => {
+          dashboard = factory({ requestRender: vi.fn() } as unknown as TUI, theme, {}, () => {});
+        }), notify: vi.fn(), setWidget: vi.fn(),
+      } } as unknown as ExtensionContext;
+    try {
+      await controller.openDashboard(context);
+      expect(claudeModels).toHaveBeenCalledOnce();
+      expect(dashboard).toBeDefined();
+      await flushFabricDiagnostics();
+      if (role.startsWith("org-agent")) {
+        expect(context.ui.notify).not.toHaveBeenCalled();
+        const lines = fs.readFileSync(fabricDiagnosticsFile("dashboard-discovery"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+        expect(lines).toEqual([expect.objectContaining({ source: "src/ui/controller.ts", level: "warning",
+          message: "Claude model discovery failed: runtime unavailable" })]);
+      } else {
+        expect(context.ui.notify).toHaveBeenCalledExactlyOnceWith("Claude model discovery failed: runtime unavailable", "warning");
+        expect(fs.existsSync(fabricDiagnosticsFile("dashboard-discovery"))).toBe(false);
+      }
+      vi.mocked(context.ui.notify).mockClear();
+      for (const input of ["l", "g", "s", "finish the review", "\r"]) dashboard!.handleInput(input);
+      await new Promise(resolve => setImmediate(resolve));
+      expect(state.queueUserMessage).toHaveBeenCalledWith("session:test", "finish the review", "steer");
+      expect(context.ui.notify).toHaveBeenCalledExactlyOnceWith("Steer queued for Main", "info");
+    } finally { dashboard?.dispose(); controller.stop(); await flushFabricDiagnostics(); vi.unstubAllEnvs(); }
+  });
+
+  it.each(["resolve", "reject"] as const)("fences pending dashboard model discovery %s at controller stop (#5962)", async outcome => {
     const state = stubState();
     vi.mocked(state.actors.list).mockReturnValue([{ ...stubActor, runner: "claude" } as never]);
     let entered!: () => void; let release!: () => void;
     const started = new Promise<void>(resolve => { entered = resolve; });
-    Object.assign(state.agents, { claudeModels: () => { entered(); return new Promise(resolve => { release = () => resolve([]); }); } });
+    Object.assign(state.agents, { claudeModels: () => { entered(); return new Promise((resolve, reject) => {
+      release = () => outcome === "resolve" ? resolve([]) : reject(new Error("old discovery failed"));
+    }); } });
     const context = { mode: "tui", modelRegistry: { getAvailable: () => [] },
       ui: { notify: vi.fn(), setWidget: vi.fn(), custom: vi.fn() } } as unknown as ExtensionContext;
     const controller = new FabricUiController(state);

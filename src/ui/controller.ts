@@ -459,7 +459,9 @@ export class FabricUiController {
         if (!current()) return;
       } catch (error) {
         if (!current()) return;
-        context.ui.notify(
+        notifyDiagnostic(
+          context,
+          "src/ui/controller.ts",
           `Claude model discovery failed: ${error instanceof Error ? error.message : String(error)}`,
           "warning",
         );

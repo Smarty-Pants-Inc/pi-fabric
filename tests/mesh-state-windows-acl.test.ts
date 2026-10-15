@@ -97,11 +97,42 @@ const countNativeAclProofs = () => {
     restore: () => spy.mockRestore(),
   };
 };
-/** Log bigint NTFS ChangeTime/ctimeNs, not rounded ctimeMs. No assumption that an ACL setter preserves timestamps. */
+/** A fresh process has no admitted proof and checks the real ACL through the normal SQLite entry point. */
+const FRESH_PROCESS_ACL = String.raw`
+import { createJiti } from "jiti";
+import { pathToFileURL } from "node:url";
+const [root, mode] = process.argv.slice(1);
+const jiti = createJiti(pathToFileURL(process.cwd() + "/index.js").href);
+const { SqliteStateStore } = await jiti.import("./src/mesh/state-sqlite.ts");
+try {
+  const store = mode === "sync"
+    ? SqliteStateStore.openSync(root, 65_536, 1_000, { initialize: "detached" })
+    : await SqliteStateStore.open(root, 65_536, 1_000, { initialize: "detached" });
+  store.close();
+  process.stdout.write(JSON.stringify({ ok: true, code: null, message: null }) + "\n");
+} catch (error) {
+  process.stdout.write(JSON.stringify({ ok: false, code: error?.code ?? null, message: String(error?.message ?? error) }) + "\n");
+}
+`;
+interface FreshProcessResult { ok: boolean; code: string | null; message: string | null }
+const freshProcessRefusal = (root: string, mode: "async" | "sync" = "sync"): FreshProcessResult => {
+  const result = childProcess.spawnSync(process.execPath,
+    ["--disable-warning=ExperimentalWarning", "--input-type=module", "-e", FRESH_PROCESS_ACL, root, mode],
+    { cwd: process.cwd(), encoding: "utf8", windowsHide: true, timeout: 60_000, maxBuffer: 1024 * 1024,
+      env: { ...process.env } });
+  expect(result.error?.message ?? "").toBe("");
+  expect(result.status, String(result.stderr)).toBe(0);
+  expect(String(result.stderr)).toBe("");
+  const parsed = JSON.parse(String(result.stdout).trim()) as FreshProcessResult;
+  expect(parsed.ok).toBe(false);
+  return parsed;
+};
+/** Log bigint ctimeNs as metadata only; admission validity uses identity, never timestamps. */
 const nativeCacheStamp = (file: string) => {
   const stat = fs.lstatSync(file, { bigint: true, throwIfNoEntry: false });
   return { path: file, stamp: stat ? {
     dev: String(stat.dev), ino: String(stat.ino), size: String(stat.size),
+    kind: stat.isDirectory() ? "directory" : stat.isFile() ? "file" : "other",
     ctimeNs: typeof stat.ctimeNs === "bigint" ? String(stat.ctimeNs) : null,
     mtimeNs: String(stat.mtimeNs),
   } : null };
@@ -118,9 +149,12 @@ const nativeCacheStamps = (root: string) => {
   }
   return [...paths].map(nativeCacheStamp);
 };
-/** Seed BEFORE measurement, retain one live SQLite connection, and never write during the counted opens.
- * Ordinary last-close/reopen can checkpoint/delete/recreate WAL/SHM and change root/file stamps: that legitimately
- * invalidates the full proof and is NOT a one-proof cache hit. This keeper isolates genuinely unchanged opens. */
+/** Compare existence, type, volume and file ID; ctime and mtime are deliberately not cache keys. */
+const nativeCacheIdentities = (entries: ReturnType<typeof nativeCacheStamps>) => entries.map(entry => ({
+  path: entry.path, exists: entry.stamp !== null, kind: entry.stamp?.kind ?? null,
+  dev: entry.stamp?.dev ?? null, ino: entry.stamp?.ino ?? null,
+}));
+/** Seed and retain a live SQLite connection so ordinary WAL/SHM close cleanup cannot affect fixture observations. */
 const seedCacheFixture = async (root: string): Promise<SqliteStateStore> => {
   const keeper = openSync(root);
   try {
@@ -132,21 +166,21 @@ const seedCacheFixture = async (root: string): Promise<SqliteStateStore> => {
 };
 
 describe.runIf(process.env.GITHUB_ACTIONS === "true" && process.platform === "win32")("Windows mesh state ACL privacy (smarty-dev#8920)", () => {
-  // Native integration keep reasons: ACL trust boundary/data safety and real per-open process cost. C1 is the RED
-  // performance contract; C2/C3 are safety counterexamples that already refuse on the no-cache baseline.
-  it("native-cache-C1: unchanged existing root and state.db reuse one real pinned PowerShell proof across sync and async opens", async () => {
+  // Native integration: C1 proves admitted identity reuse; C2 documents same-process trusted ACL mutation and
+  // fresh-process refusal; C3 preserves the first-proof ancestor boundary. No ACL evidence is mocked.
+  it("native-cache-C1: unchanged existing root and state.db reuse the admitted native proof across sync and async opens", async () => {
     const root = path.join(profileDir(), "root");
-    const keeper = await seedCacheFixture(root);
     const proofs = countNativeAclProofs();
+    const keeper = await seedCacheFixture(root);
+    const admittedProofs = proofs.count();
     let before: ReturnType<typeof nativeCacheStamps> | undefined;
     let after: ReturnType<typeof nativeCacheStamps> | undefined;
-    let changeTimesReadable: boolean | undefined;
     try {
       before = nativeCacheStamps(root);
-      // The first measured gate must really read ACLs: seeding created/wrote the sidecars after its earlier proof.
+      expect(before.find(entry => entry.path === path.resolve(root))?.stamp).toMatchObject({ kind: "directory" });
+      expect(before.find(entry => entry.path === path.join(path.resolve(root), "state.db"))?.stamp).toMatchObject({ kind: "file" });
       const first = openSync(root);
       try { expect(first.get("acl/cache-probe")?.value).toBe("seeded"); } finally { first.close(); }
-      expect(proofs.count()).toBe(1);
       const second = openSync(root);
       try { expect(second.get("acl/cache-probe")?.value).toBe("seeded"); } finally { second.close(); }
       const third = await openAsync(root);
@@ -154,22 +188,18 @@ describe.runIf(process.env.GITHUB_ACTIONS === "true" && process.platform === "wi
       const fourth = openSync(root);
       try { expect(fourth.get("acl/cache-probe")?.value).toBe("seeded"); } finally { fourth.close(); }
       after = nativeCacheStamps(root);
-      // Establish unchanged identity AND stamps from native observations; do not merely presume it from no writes.
-      expect(after).toEqual(before);
-      changeTimesReadable = before.every(entry => entry.stamp === null
-        || (entry.stamp.ctimeNs !== null && BigInt(entry.stamp.ctimeNs) > 0n));
+      expect(nativeCacheIdentities(after)).toEqual(nativeCacheIdentities(before));
       proofs.assertRealReads();
-      // Unreadable ChangeTime cannot authorize a cached full proof: all four gates must then reprove.
-      expect(proofs.count()).toBe(changeTimesReadable ? 1 : 4);
+      expect(proofs.count()).toBe(admittedProofs);
     } finally {
       try {
-        console.log(JSON.stringify({ event: "native-cache-C1", nativeProofs: proofs.count(), changeTimesReadable, before,
+        console.log(JSON.stringify({ event: "native-cache-C1", admittedProofs, nativeProofs: proofs.count(), before,
           after: after ?? nativeCacheStamps(root) }));
       } finally { proofs.restore(); keeper.close(); }
     }
   }, 120_000);
 
-  it("native-cache-C2: Everyone R added to state.db after an accepted proof immediately reproves and refuses in the same turn", async () => {
+  it("native-cache-C2: Everyone R added to state.db is accepted by the same-identity cache, then refused by a fresh process", async () => {
     const root = path.join(profileDir(), "root");
     const keeper = await seedCacheFixture(root);
     const file = path.join(root, "state.db");
@@ -177,26 +207,24 @@ describe.runIf(process.env.GITHUB_ACTIONS === "true" && process.platform === "wi
     let before: ReturnType<typeof nativeCacheStamp> | undefined;
     let after: ReturnType<typeof nativeCacheStamp> | undefined;
     let acceptedProofs = 0;
-    let error: unknown;
     try {
       const accepted = openSync(root);
       try { expect(accepted.get("acl/cache-probe")?.value).toBe("seeded"); } finally { accepted.close(); }
       acceptedProofs = proofs.count();
-      expect(acceptedProofs).toBe(1);
       before = nativeCacheStamp(file);
       grant(file, EVERYONE, "(R)", EVERYONE_READ);
-      // Both grant (including independent Get-Acl readback) and open are synchronous. No await, timer, or
-      // microtask boundary between setter return and this next open may rescue a same-turn stale proof.
-      try { openSync(root).close(); } catch (caught) { error = caught; }
+      const cached = openSync(root);
+      try { expect(cached.get("acl/cache-probe")?.value).toBe("seeded"); } finally { cached.close(); }
       after = nativeCacheStamp(file);
-      expect(error).toMatchObject(UNSUPPORTED);
-      expect((error as Error).message).toContain(file);
-      expect(proofs.count()).toBeGreaterThan(acceptedProofs);
-      proofs.assertRealReads();
+      expect(proofs.count()).toBe(acceptedProofs);
       expect(after.stamp?.dev).toBe(before.stamp?.dev);
       expect(after.stamp?.ino).toBe(before.stamp?.ino);
-      // Observe ctimeNs before/after below, rather than asserting an unproven timestamp equality or delta.
+      expect(after.stamp?.kind).toBe("file");
       expect(icaclsShow(file)).toMatch(/Everyone:\(R\)/);
+      for (const mode of ["async", "sync"] as const) {
+        expect(freshProcessRefusal(root, mode)).toMatchObject({ code: UNSUPPORTED.code, message: expect.stringContaining(file) });
+      }
+      proofs.assertRealReads();
     } finally {
       try {
         console.log(JSON.stringify({ event: "native-cache-C2", acceptedProofs, nativeProofs: proofs.count(), before, after,
@@ -205,39 +233,22 @@ describe.runIf(process.env.GITHUB_ACTIONS === "true" && process.platform === "wi
     }
   }, 120_000);
 
-  it("native-cache-C3: foreign DELETE_CHILD added only to a fixture ancestor after an accepted proof immediately reproves and refuses", async () => {
+  it("native-cache-C3: first proof refuses a fixture root whose ancestor has foreign DELETE_CHILD", () => {
     const ancestor = profileDir();
     const root = path.join(ancestor, "root");
-    const keeper = await seedCacheFixture(root);
+    ownedDirectory(root);
+    grant(ancestor, EVERYONE, "(DC)", 0x40);
     const proofs = countNativeAclProofs();
-    let before: ReturnType<typeof nativeCacheStamps> | undefined;
-    let after: ReturnType<typeof nativeCacheStamps> | undefined;
-    let acceptedProofs = 0;
-    let error: unknown;
     try {
-      const accepted = openSync(root);
-      try { expect(accepted.get("acl/cache-probe")?.value).toBe("seeded"); } finally { accepted.close(); }
-      acceptedProofs = proofs.count();
-      expect(acceptedProofs).toBe(1);
-      before = nativeCacheStamps(root);
-      // No inheritance flags, and ONLY this suite-owned ancestor: never USERPROFILE or its system ancestors.
-      grant(ancestor, EVERYONE, "(DC)", 0x40);
+      let error: unknown;
       try { openSync(root).close(); } catch (caught) { error = caught; }
-      after = nativeCacheStamps(root);
       expect(error).toMatchObject(UNSUPPORTED);
       expect((error as Error).message).toContain(ancestor);
-      expect(proofs.count()).toBeGreaterThan(acceptedProofs);
+      expect(proofs.count()).toBe(1);
       proofs.assertRealReads();
+      expect(fs.existsSync(path.join(root, "state.db"))).toBe(false);
       expect(readAcl(root).rules.filter(rule => rule.sid === EVERYONE)).toEqual([]);
-      expect(readAcl(path.join(root, "state.db")).rules.filter(rule => rule.sid === EVERYONE)).toEqual([]);
-    } finally {
-      try {
-        const prior = before?.find(entry => entry.path === ancestor)?.stamp?.ctimeNs;
-        const current = after?.find(entry => entry.path === ancestor)?.stamp?.ctimeNs;
-        console.log(JSON.stringify({ event: "native-cache-C3", ancestor, acceptedProofs, nativeProofs: proofs.count(), before, after,
-          ctimeNsChanged: prior !== undefined && current !== undefined ? prior !== current : null }));
-      } finally { proofs.restore(); keeper.close(); }
-    }
+    } finally { proofs.restore(); }
   }, 120_000);
 
   it.each(Object.keys(opens) as (keyof typeof opens)[])("%s refuses a root with a genuine Everyone:(M) grant before creating state.db", async name => {
@@ -265,8 +276,9 @@ describe.runIf(process.env.GITHUB_ACTIONS === "true" && process.platform === "wi
     const everyone = readAcl(file).rules.filter(rule => rule.sid === EVERYONE && !rule.inherited && rule.type === "Allow");
     expect(everyone.some(rule => (rule.rights & EVERYONE_READ) === EVERYONE_READ), readAcl(file).sddl).toBe(true);
     expect(icaclsShow(file)).toMatch(/Everyone:\(R\)/);
-    expect(await refusal(() => openAsync(root))).toMatchObject(UNSUPPORTED);
-    expect(await refusal(() => openSync(root))).toMatchObject(UNSUPPORTED);
+    for (const mode of ["async", "sync"] as const) {
+      expect(freshProcessRefusal(root, mode)).toMatchObject({ code: UNSUPPORTED.code, message: expect.stringContaining(file) });
+    }
   }, 120_000);
 
   it.each(["state.db-wal", "state.db-shm", "state.db-journal"])("refuses an existing %s with a verified Everyone (R) data-read grant", async file => {
@@ -276,8 +288,9 @@ describe.runIf(process.env.GITHUB_ACTIONS === "true" && process.platform === "wi
     if (!fs.existsSync(target)) fs.writeFileSync(target, "");
     grant(target, EVERYONE, "(R)", EVERYONE_READ);
     expect(icaclsShow(target)).toMatch(/Everyone:\(R\)/);
-    expect(await refusal(() => openAsync(root))).toMatchObject(UNSUPPORTED);
-    expect(await refusal(() => openSync(root))).toMatchObject(UNSUPPORTED);
+    for (const mode of ["async", "sync"] as const) {
+      expect(freshProcessRefusal(root, mode)).toMatchObject({ code: UNSUPPORTED.code, message: expect.stringContaining(target) });
+    }
   }, 120_000);
 
   it("opens real node:sqlite in a clean root below the default USERPROFILE without touching its ancestors", async () => {
@@ -526,8 +539,9 @@ describe.runIf(process.env.GITHUB_ACTIONS === "true" && process.platform === "wi
     const target = path.join(root, file);
     if (!fs.existsSync(target)) fs.writeFileSync(target, "");
     grant(target, EVERYONE, "(M)", MODIFY);
-    expect(await refusal(() => openAsync(root))).toMatchObject(UNSUPPORTED);
-    expect(await refusal(() => openSync(root))).toMatchObject(UNSUPPORTED);
+    for (const mode of ["async", "sync"] as const) {
+      expect(freshProcessRefusal(root, mode)).toMatchObject({ code: UNSUPPORTED.code, message: expect.stringContaining(target) });
+    }
   }, 120_000);
 
   it("refuses to raise a checkpoint flag in a flag directory that a foreign SID may modify", () => {
@@ -613,27 +627,27 @@ describe.runIf(process.env.GITHUB_ACTIONS === "true" && process.platform === "wi
     }
   }, 120_000);
 
-  it("rechecks between two synchronous opens in the same JavaScript turn", async () => {
+  it("a fresh process refuses a root ACL added after an earlier successful open", () => {
     const root = path.join(profileDir(), "root");
     const first = openSync(root);
     first.close();
-    // icacls is synchronous too: no await/microtask may clear a cross-open cache before the second open.
     grant(root, EVERYONE, "(OI)(CI)(M)", MODIFY);
-    expect(await refusal(() => openSync(root))).toMatchObject(UNSUPPORTED);
+    expect(freshProcessRefusal(root, "sync")).toMatchObject({ code: UNSUPPORTED.code, message: expect.stringContaining(root) });
   }, 120_000);
 
-  it("rechecks at every open: an ACE added after an earlier successful open refuses the next one", async () => {
+  it("a fresh process refuses ACL changes on the root and its ancestor", async () => {
     const ancestor = profileDir();
     const root = path.join(ancestor, "root");
     await roundTrip(await openAsync(root));
     await roundTrip(openSync(root));
     grant(root, EVERYONE, "(OI)(CI)(M)", MODIFY);
-    expect(await refusal(() => openAsync(root))).toMatchObject(UNSUPPORTED);
-    expect(await refusal(() => openSync(root))).toMatchObject(UNSUPPORTED);
+    for (const mode of ["async", "sync"] as const) {
+      expect(freshProcessRefusal(root, mode)).toMatchObject({ code: UNSUPPORTED.code, message: expect.stringContaining(root) });
+    }
     // And on the ancestor: a second fresh root, opened once, then its private ancestor gains a foreign DELETE_CHILD.
     const other = path.join(profileDir(), "root");
     await roundTrip(await openAsync(other));
     grant(path.dirname(other), EVERYONE, "(DC)", 0x40);
-    expect(await refusal(() => openAsync(other))).toMatchObject(UNSUPPORTED);
+    expect(freshProcessRefusal(other, "async")).toMatchObject({ code: UNSUPPORTED.code, message: expect.stringContaining(path.dirname(other)) });
   }, 120_000);
 });

@@ -645,9 +645,9 @@ describe("state gate wiring on win32 (smarty-dev#8920)", () => {
     });
   });
 
-  // F1: another process may add an Everyone:(M) ACE between two checks without this process ever yielding (a native
-  // ACL write is not a JS event). Two separate gate calls in one synchronous turn must each read the live ACL.
-  it("re-reads the ACL for a second synchronous gate call in the same turn and sees an ACE added in between", async () => {
+  // Decision C: this wiring seam deliberately does not cache. The real reader's identity-only process cache is
+  // covered by mesh-state-windows-acl-cache.test.ts; here each gate call must still delegate its complete request.
+  it("delegates successive root checks to the proof layer and propagates its refusal", async () => {
     const { gate, calls } = await loadGate(undefined, [undefined, "C:\\x grants S-1-1-0 write"]);
     const root = tmp();
     await asWindows(async () => {
@@ -676,8 +676,8 @@ describe("state gate wiring on win32 (smarty-dev#8920)", () => {
     });
   });
 
-  // Performance without a policy change: the read-only scan runs on every writer-lock attempt, so it must never spawn
-  // the native reader; the open's gate read covers the flag directory. Its lstat checks stay on every call.
+  // The read-only scan runs on every writer-lock attempt, so it must never spawn the native reader; the root's
+  // admission proof covers the flag directory. Its lstat checks stay on every call.
   it("checkpointFlagRaised polls a real flag directory with no ACL read, keeping the lstat checks", async () => {
     const { calls } = await loadGate(undefined);
     const sqlite = await import("../src/mesh/state-sqlite.js");
@@ -702,10 +702,38 @@ describe("state gate wiring on win32 (smarty-dev#8920)", () => {
     });
   });
 
+  it.each(["file", "sqlite"] as const)("admits an existing state.db before the %s backend's first operation", async stateBackend => {
+    const { calls } = await loadGate(undefined);
+    const { createStateBackend } = await import("../src/mesh/state-backend.js");
+    const root = tmp();
+    fs.writeFileSync(path.join(root, "state.db"), "");
+    await asWindows(async () => {
+      const backend = createStateBackend({ root, maxEventBytes: 1024, maxReadEvents: 16, lock: {} as never }, { stateBackend });
+      try {
+        expect(backend.kind).toBe(stateBackend);
+        expect(calls).toHaveLength(1); // before a read/write can start its busy/try budget
+        expect(calls[0]).toMatchObject({ root, protect: false });
+        expect(calls[0]!.files.map(file => path.basename(file))).toEqual(["state.db", "state.db-wal", "state.db-shm", "state.db-journal"]);
+      } finally { backend.close(); }
+    });
+  });
+
+  it("keeps backend admission child-free when state.db is absent", async () => {
+    const { calls } = await loadGate(undefined);
+    const { createStateBackend } = await import("../src/mesh/state-backend.js");
+    const root = tmp();
+    await asWindows(async () => {
+      const backend = createStateBackend({ root, maxEventBytes: 1024, maxReadEvents: 16, lock: {} as never }, { stateBackend: "file" });
+      backend.close();
+    });
+    expect(calls).toEqual([]);
+    expect(fs.existsSync(path.join(root, "state.db"))).toBe(false);
+  });
+
   // A stand-in connection: openPinned off Linux only re-lstats the checked state.db after open().
   const opener = (opened: string[]) => (file: string) => { opened.push(file); return { close: () => undefined } as never; };
 
-  it("validates the root, state files and flag directory in one native read on every open", async () => {
+  it("delegates the complete root, state files and flag directory plan on every open", async () => {
     const { gate, calls } = await loadGate(undefined);
     const root = tmp();
     const file = path.join(root, "state.db");
@@ -716,7 +744,7 @@ describe("state gate wiring on win32 (smarty-dev#8920)", () => {
       gate.openPrivateStateDb(file, opener(opened)).close();
     });
     expect(opened).toEqual([file, file]);
-    expect(calls).toHaveLength(2); // one per open, never cached
+    expect(calls).toHaveLength(2); // one delegation per open; this mock has no identity cache
     for (const call of calls) {
       expect(call).toMatchObject({ root, protect: false });
       expect(call.files).toEqual([file, `${file}-wal`, `${file}-shm`, `${file}-journal`]);

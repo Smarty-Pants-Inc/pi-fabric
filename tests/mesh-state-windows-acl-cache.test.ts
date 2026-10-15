@@ -1,6 +1,10 @@
 // Decision C: MOCKED unit evidence, NOT Windows/NTFS ACL proof or a timing benchmark.
 // Keep reason: trust boundary/data safety. Exercise the existing public policy with its DEFAULT native runner;
 // only execFileSync's output and Windows-path lstats are fake. No native helpers, filesystem fixtures or new APIs.
+// Contract: prove once per process per absolute root + root/DB BigInt dev/ino identity, never ctime/ChangeTime.
+// Same-identity ACL edits are deliberately NOT re-proved: first proof denies foreign WRITE_DAC/WRITE_OWNER;
+// trusted user/Admin/accepted service-owner re-ACL remains a residual. A new process or replaced root/DB re-proves.
+// This mocked contract is not a Windows safety claim. Missing/unproven identity requires the full native proof.
 import childProcess from "node:child_process";
 import fs from "node:fs";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -30,7 +34,7 @@ type Snapshot = { userSid: string; ownerSid: string; protect: string | null; ent
 const allow = (sid: string, mask: number, flags = 0): Ace => ({ type: 0, flags, sid, mask });
 const trustedDacl = (): Ace[] => [allow(USER, FULL, 3), allow(SYSTEM, FULL, 3), allow(ADMINS, FULL, 3)];
 
-// Nanoseconds are deliberate: +1ns below leaves ctimeMs unchanged. No wall clock or real ACL claim.
+// Timestamps are decoys: neither nanosecond nor millisecond ctime may participate in cache admission.
 const fakeStat = (ino: bigint, directory: boolean): fs.BigIntStats => ({
   dev: 7n, ino, ctimeNs: 1_700_000_000_000_000_000n, ctimeMs: 1_700_000_000_000n,
   isSymbolicLink: () => false, isDirectory: () => directory, isFile: () => !directory,
@@ -54,7 +58,7 @@ const fixture = async (owner = USER) => {
   const stats = new Map<string, fs.BigIntStats>();
   const entries = new Map<string, Entry>();
   const unreadable = new Set<string>();
-  let nextIno = 100n;
+  let nextIno = 9_007_199_254_740_992n; // +1 must not disappear through Number coercion of a 64-bit file ID
   const present = (file: string) => {
     const directory = !FILES.includes(file);
     stats.set(key(file), fakeStat(nextIno++, directory));
@@ -75,7 +79,7 @@ const fixture = async (owner = USER) => {
     if (!PLAN.some(target => key(target) === key(name))) throw new Error(`unexpected mocked Windows path: ${name}`);
     if (unreadable.has(key(name))) throw Object.assign(new Error("mocked lstat denied"), { code: "EACCES" });
     const found = stats.get(key(name));
-    if (found) return found;
+    if (found) return { ...found }; // native lstat returns an independent snapshot, not a mutable fixture reference
     if (options?.throwIfNoEntry === false) return undefined;
     throw Object.assign(new Error("mocked missing path"), { code: "ENOENT" });
   }) as typeof fs.lstatSync);
@@ -122,43 +126,49 @@ describe("Windows mesh ACL identity cache — Decision C MOCKED unit contract", 
   });
 
   it.each([ROOT, ...FILES, FLAGS, ...LEXICAL, ...REAL])(
-    "CACHE-03 same-turn ctimeNs change on %s forces a fresh snapshot and foreign-ACE refusal", async target => {
+    "CACHE-03 ctime changes on %s are ignored, including a simulated trusted-user ACE edit", async target => {
       const f = await fixture();
       f.warm();
-      f.stat(target).ctimeNs += 1n; // ctimeMs/dev/ino stay identical: millisecond stamps cannot establish this hit
-      f.unsafe(target);
-      const refusal = f.judge();
-      expect(refusal).toContain(target);
-      expect(refusal).toContain(`grants ${OTHER}`);
-      expect(f.native).toHaveBeenCalledTimes(2);
+      f.stat(target).ctimeNs += 1n;
+      f.unsafe(target); // modeled trusted-user re-ACL, NOT evidence that a foreign SID could perform this edit
+      expect(f.judge()).toBeUndefined();
+      f.stat(target).ctimeMs += 1n;
+      expect(f.judge()).toBeUndefined();
+      Reflect.deleteProperty(f.stat(target), "ctimeNs");
+      Reflect.deleteProperty(f.stat(target), "ctimeMs");
+      expect(f.judge()).toBeUndefined();
+      expect(f.native).toHaveBeenCalledTimes(1);
     });
 
-  it.each(["dev", "ino"] as const)("CACHE-04 %s replacement invalidates even with identical ctimeNs", async field => {
+  it.each([
+    [ROOT, "dev"], [ROOT, "ino"], [DB, "dev"], [DB, "ino"],
+  ] as const)("CACHE-04 %s %s replacement invalidates with unchanged timestamps", async (target, field) => {
     const f = await fixture();
     f.warm();
-    f.stat(DB)[field] += 1n;
-    f.unsafe(DB);
+    f.stat(target)[field] += 1n;
+    f.unsafe(target);
     expect(f.judge()).toContain(`grants ${OTHER}`);
     expect(f.native).toHaveBeenCalledTimes(2);
   });
 
-  it.each([DB, `${DB}-wal`, `${DB}-shm`, `${DB}-journal`, FLAGS])(
-    "CACHE-05 previously absent %s appearing invalidates without relying on parent ctime", async target => {
-      const f = await fixture();
-      f.absent(target);
-      f.warm();
-      f.present(target); // all other identity stamps intentionally unchanged
-      f.unsafe(target);
-      expect(f.judge()).toContain(`grants ${OTHER}`);
-      expect(f.native).toHaveBeenCalledTimes(2);
-    });
+  it("CACHE-05 an absent DB cannot supply identity; its appearance requires full proof", async () => {
+    const f = await fixture();
+    f.absent(DB);
+    expect(f.judge()).toBeUndefined();
+    expect(f.judge()).toBeUndefined();
+    expect(f.native).toHaveBeenCalledTimes(2);
+    f.present(DB); // root identity and every timestamp stay unchanged
+    f.unsafe(DB);
+    expect(f.judge()).toContain(`grants ${OTHER}`);
+    expect(f.native).toHaveBeenCalledTimes(3);
+  });
 
   it("CACHE-06 an expanded target plan cannot reuse a narrower successful proof", async () => {
     const f = await fixture();
-    const narrow = { ...request(), files: [] };
-    f.state.plan = PLAN.filter(file => !FILES.includes(file));
+    const narrow = { ...request(), files: [DB] };
+    f.state.plan = PLAN.filter(file => !FILES.includes(file) || file === DB);
     f.warm(narrow);
-    f.unsafe(DB); // same identity, but this descriptor has never been verified in the narrower proof
+    f.unsafe(`${DB}-wal`); // root/DB identity is unchanged; this descriptor was not in the narrower proof
     f.state.plan = [...PLAN];
     expect(f.judge()).toContain(`grants ${OTHER}`);
     expect(f.native).toHaveBeenCalledTimes(2);
@@ -170,10 +180,35 @@ describe("Windows mesh ACL identity cache — Decision C MOCKED unit contract", 
       const ordinary: WindowsStateAclRequest = { ...request(), role: "ancestor", files: [], directories: [] };
       f.state.plan = [ROOT, ...LEXICAL, ...REAL];
       f.unsafe(ROOT, allow(OTHER, FULL, 0xb)); // ordinary ancestors skip IO; root/creation-parent must refuse it
-      f.warm(ordinary);
+      // Test role separation, without demanding either reuse or always-fresh reads for ordinary ancestors.
+      expect(f.judge(ordinary)).toBeUndefined();
+      expect(f.native).toHaveBeenCalledTimes(1);
       expect(f.judge({ ...ordinary, role })).toContain(`grants ${OTHER}`);
       expect(f.native).toHaveBeenCalledTimes(2);
     });
+
+  it("CACHE-07 successful creation-parent checks are always fresh", async () => {
+    const f = await fixture();
+    const input: WindowsStateAclRequest = { ...request(), role: "creation-parent", files: [], directories: [] };
+    f.state.plan = [ROOT, ...LEXICAL, ...REAL];
+    expect(f.judge(input)).toBeUndefined();
+    expect(f.judge(input)).toBeUndefined();
+    expect(f.native).toHaveBeenCalledTimes(2);
+    f.unsafe(ROOT, allow(OTHER, FULL, 0xb));
+    expect(f.judge(input)).toContain(`grants ${OTHER}`);
+    expect(f.native).toHaveBeenCalledTimes(3);
+  });
+
+  it("CACHE-08 successful protect/readback is always fresh", async () => {
+    const f = await fixture();
+    const input = { ...request(), protect: true };
+    expect(f.judge(input)).toBeUndefined();
+    expect(f.judge(input)).toBeUndefined();
+    expect(f.native).toHaveBeenCalledTimes(2);
+    f.unsafe(ROOT);
+    expect(f.judge(input)).toContain(`grants ${OTHER}`);
+    expect(f.native).toHaveBeenCalledTimes(3);
+  });
 
   it("CACHE-08 protect cannot reuse an existing-root proof, including elevated Administrators ownership", async () => {
     const f = await fixture(ADMINS);
@@ -236,28 +271,69 @@ describe("Windows mesh ACL identity cache — Decision C MOCKED unit contract", 
     expect(f.native).toHaveBeenCalledTimes(3);
   });
 
-  it.each([ROOT, DB, LEXICAL[0]!, REAL[0]!])(
-    "CACHE-12 missing ctimeNs on %s means full native read on every call", async target => {
-      const f = await fixture();
-      f.warm();
-      Reflect.deleteProperty(f.stat(target), "ctimeNs");
-      expect(f.judge()).toBeUndefined();
-      expect(f.judge()).toBeUndefined();
-      expect(f.native).toHaveBeenCalledTimes(3);
-      f.unsafe(target); // no observable identity signal: insufficient stamps must never justify a hit
-      expect(f.judge()).toContain(`grants ${OTHER}`);
-      expect(f.native).toHaveBeenCalledTimes(4);
-    });
+  it.each([ROOT, DB])("CACHE-12 missing ctime on %s remains cacheable from the first proof", async target => {
+    const f = await fixture();
+    Reflect.deleteProperty(f.stat(target), "ctimeNs");
+    Reflect.deleteProperty(f.stat(target), "ctimeMs");
+    f.warm();
+  });
 
-  it("CACHE-13 an unreadable identity disables hits, not the full native ACL read", async () => {
+  it.each([
+    [ROOT, "dev", "missing"], [ROOT, "ino", "missing"], [DB, "dev", "missing"], [DB, "ino", "missing"],
+    [ROOT, "dev", "number"], [ROOT, "ino", "number"], [DB, "dev", "number"], [DB, "ino", "number"],
+  ] as const)("CACHE-12 %s %s identity is %s: full native read on every call", async (target, field, kind) => {
     const f = await fixture();
     f.warm();
-    f.unreadable.add(key(REAL[0]!));
+    if (kind === "missing") Reflect.deleteProperty(f.stat(target), field);
+    else Reflect.set(f.stat(target), field, Number(f.stat(target)[field])); // not a proven BigInt file identity
     expect(f.judge()).toBeUndefined();
     expect(f.judge()).toBeUndefined();
     expect(f.native).toHaveBeenCalledTimes(3);
-    f.unsafe(REAL[0]!);
+    f.unsafe(target);
     expect(f.judge()).toContain(`grants ${OTHER}`);
     expect(f.native).toHaveBeenCalledTimes(4);
+  });
+
+  it.each([ROOT, DB])("CACHE-13 unreadable %s identity disables hits, not the full native read", async target => {
+    const f = await fixture();
+    f.warm();
+    f.unreadable.add(key(target));
+    expect(f.judge()).toBeUndefined();
+    expect(f.judge()).toBeUndefined();
+    expect(f.native).toHaveBeenCalledTimes(3);
+    f.unsafe(target);
+    expect(f.judge()).toContain(`grants ${OTHER}`);
+    expect(f.native).toHaveBeenCalledTimes(4);
+  });
+
+  it.each([ROOT, FLAGS, ...FILES, ...LEXICAL, ...REAL])(
+    "CACHE-14 module reset models a new process: first proof refuses a foreign ACE on %s", async target => {
+      const f = await fixture();
+      f.warm();
+      f.unsafe(target);
+      expect(f.judge()).toBeUndefined(); // deliberate same-process, same-identity residual
+      expect(f.native).toHaveBeenCalledTimes(1);
+      vi.resetModules(); // module-lifetime model only; no actual process or Windows security claim
+      const { windowsStateAclRefusal } = await import("../src/mesh/windows-state-acl.js");
+      expect(windowsStateAclRefusal(request())).toContain(`grants ${OTHER}`);
+      expect(f.native).toHaveBeenCalledTimes(2);
+    });
+
+  it.each([
+    [ROOT, "dev"], [ROOT, "ino"], [DB, "dev"], [DB, "ino"],
+  ] as const)("CACHE-15 %s %s swapped during the child cannot inherit its safe snapshot", async (target, field) => {
+    const f = await fixture();
+    f.state.output = snapshot => {
+      const oldIdentityProof = JSON.stringify(snapshot);
+      f.stat(target)[field] += 1n; // swap after the safe descriptor read, before the native child returns
+      f.unsafe(target); // the replacement has never had a successful proof; timestamps are unchanged
+      f.state.output = next => JSON.stringify(next);
+      return oldIdentityProof;
+    };
+    expect(f.judge()).toBeDefined(); // do not use a safe descriptor snapshot paired with a different identity
+    const reads = f.native.mock.calls.length;
+    expect(reads).toBeGreaterThanOrEqual(1);
+    expect(f.judge()).toContain(`grants ${OTHER}`);
+    expect(f.native).toHaveBeenCalledTimes(reads + 1);
   });
 });

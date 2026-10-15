@@ -562,6 +562,8 @@ export const ACTOR_RUN_STUCK_MIN_MS = 30 * 60 * 1000;
 /** Bounds of an actor's dead-letter file (smarty-dev#816): past them, the oldest entries drop, counted. */
 export const ACTOR_DEAD_LETTER_MAX_ENTRIES = 10_000;
 export const ACTOR_DEAD_LETTER_MAX_BYTES = 50 * 1024 * 1024;
+/** The stale-entry archive keeps one rotated generation and drops its older backup. */
+export const ACTOR_DEAD_LETTER_ARCHIVE_MAX_BYTES = 1 * 1024 * 1024;
 /** At most one owner alarm per actor per hour while its events dead-letter. */
 const ACTOR_DEAD_LETTER_ALARM_MS = 60 * 60 * 1000;
 /** An activation block older than this is alarmed again from the retention sweep (smarty-dev#7782)... */
@@ -5894,6 +5896,73 @@ export class ActorManager {
     this.#deadLetters.set(actorId, entries.length);
   }
 
+  #noticeDeadLetter(actor: ManagedActor, text: string, data: Record<string, unknown>, force = false): void {
+    if (this.#closing) return;
+    const now = Date.now();
+    const last = this.#deadLetterAlarms.get(actor.id);
+    if (!force && last !== undefined && now - last < ACTOR_DEAD_LETTER_ALARM_MS) return;
+    this.#deadLetterAlarms.set(actor.id, now);
+    const notice: FabricActorMessage = {
+      id: randomUUID(), actorId: actor.id, actorName: actor.name, direction: "out", source: "fabric-host",
+      createdAt: now, action: "message", text, data,
+    };
+    this.#recordMessage(actor, notice);
+    void this.mesh.publish({ topic: "ops.owner", kind: "actor.alarm", from: this.identity, to: actor.rootId,
+      text, data: { actorId: actor.id, ...data } }).catch(() => undefined);
+    try {
+      this.onDeliver({ actor: this.#alarmInfo(actor), message: notice, delivery: "followUp", triggerTurn: true });
+    } catch { /* best effort: the notice stays in the actor's messages */ }
+  }
+
+  #appendDeadLetterArchive(actor: ManagedActor, stale: readonly ActorDeadLetter[]): { rotated: boolean; dropped: number } {
+    const archive = path.join(path.dirname(this.#deadLetterFile(actor.id)), "dead-letter.archive.jsonl");
+    const backup = `${archive}.1`;
+    const lines = stale.map((entry) => `${JSON.stringify(entry)}\n`);
+    const lineBytes = (line: string) => Buffer.byteLength(line);
+    let current = Buffer.alloc(0);
+    try { current = fs.readFileSync(archive); } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+    const incomingBytes = lines.reduce((total, line) => total + lineBytes(line), 0);
+    const rotate = current.length > 0 && current.length + incomingBytes > ACTOR_DEAD_LETTER_ARCHIVE_MAX_BYTES;
+    let dropped = 0;
+    if (rotate) {
+      let previousBackup = Buffer.alloc(0);
+      try { previousBackup = fs.readFileSync(backup); } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
+      dropped += previousBackup.toString("utf8").split("\n").filter(Boolean).length;
+      try {
+        fs.renameSync(archive, backup);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST" && (error as NodeJS.ErrnoException).code !== "EPERM") throw error;
+        fs.copyFileSync(archive, backup);
+        fs.truncateSync(archive, 0);
+      }
+      syncPathNamespace(backup);
+      current = Buffer.alloc(0);
+    }
+    let start = 0;
+    let bytes = current.length;
+    if (bytes === 0) {
+      bytes = 0;
+      for (let index = lines.length - 1; index >= 0; index--) {
+        const size = lineBytes(lines[index]!);
+        if (bytes + size > ACTOR_DEAD_LETTER_ARCHIVE_MAX_BYTES) { start = index + 1; break; }
+        bytes += size;
+        start = index;
+      }
+      dropped += start;
+    }
+    const text = lines.slice(start).join("");
+    if (text) {
+      const fd = fs.openSync(archive, "a", 0o600);
+      try { fs.writeFileSync(fd, text); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+      syncPathNamespace(archive);
+    }
+    return { rotated: rotate, dropped };
+  }
+
   // Append-only and bounded: past the bound the oldest entries drop (to 90%, so a flood rewrites
   // the file once per tenth), each drop counted on the actor. A write failure is a checkpoint
   // failure, as for the queue file: the event stays in the mesh.
@@ -5927,25 +5996,11 @@ export class ActorManager {
     } catch {
       throw new ActorQueueCheckpointError(actor);
     }
-    if (this.#closing) return;
-    const now = Date.now();
-    const last = this.#deadLetterAlarms.get(actor.id);
-    if (last !== undefined && now - last < ACTOR_DEAD_LETTER_ALARM_MS) return;
-    this.#deadLetterAlarms.set(actor.id, now);
     const text = `Fabric host notice: actor ${actor.name} is not keeping up: its queue (${this.meshConfig.actorQueueLimit}) and overflow ` +
       `(${this.#overflowCap()}) are full, so ${count} further routed event(s) wait in its dead-letter backlog. ` +
       `They re-queue automatically once its queue drains below half; other actors are not held. ` +
       `Inspect it with agents.actorStatus({ id: ${JSON.stringify(actor.id)} }) and agents.log.`;
-    const notice: FabricActorMessage = {
-      id: randomUUID(), actorId: actor.id, actorName: actor.name, direction: "out", source: "fabric-host",
-      createdAt: now, action: "message", text, data: { reason: "dead_letter", deadLetters: count },
-    };
-    this.#recordMessage(actor, notice);
-    void this.mesh.publish({ topic: "ops.owner", kind: "actor.alarm", from: this.identity, to: actor.rootId,
-      text, data: { actorId: actor.id, reason: "dead_letter", deadLetters: count } }).catch(() => undefined);
-    try {
-      this.onDeliver({ actor: this.#alarmInfo(actor), message: notice, delivery: "followUp", triggerTurn: true });
-    } catch { /* best effort: the notice stays in the actor's messages */ }
+    this.#noticeDeadLetter(actor, text, { reason: "dead_letter", deadLetters: count });
   }
 
   // Re-queues dead letters, oldest first, once the actor's queue has drained below half and its
@@ -5966,15 +6021,18 @@ export class ActorManager {
       if (maxAgeMs > 0 && Number.isFinite(entry.at) && entry.at < cutoff) { stale.push(entry); return false; }
       return true;
     });
-    const archive = path.join(path.dirname(this.#deadLetterFile(actor.id)), "dead-letter.archive.jsonl");
     if (stale.length) {
       try {
-        const fd = fs.openSync(archive, "a", 0o600);
-        try {
-          fs.writeFileSync(fd, stale.map((entry) => `${JSON.stringify(entry)}\n`).join(""));
-          fs.fsyncSync(fd);
-        } finally { fs.closeSync(fd); }
-        syncPathNamespace(archive);
+        const archive = this.#appendDeadLetterArchive(actor, stale);
+        if (archive.dropped > 0) {
+          const text = `Fabric host notice: actor ${actor.name} rotated its stale dead-letter archive at ` +
+            `${ACTOR_DEAD_LETTER_ARCHIVE_MAX_BYTES} bytes and dropped ${archive.dropped} older archived event(s).`;
+          this.#noticeDeadLetter(actor, text, {
+            reason: "dead_letter_archive",
+            deadLetterArchiveDropped: archive.dropped,
+            deadLetterArchiveRotated: archive.rotated,
+          }, true);
+        }
       } catch { return; } // Never rewrite until the archive is durable. A crash may duplicate, not lose.
     }
     const inFlight = this.#inFlight.get(actor.id);

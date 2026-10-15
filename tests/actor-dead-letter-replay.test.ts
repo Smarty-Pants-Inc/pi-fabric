@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agents/manager.js";
-import { ActorManager } from "../src/actors/manager.js";
+import { ACTOR_DEAD_LETTER_ARCHIVE_MAX_BYTES, ActorManager } from "../src/actors/manager.js";
 import { GlobalActorRegistry } from "../src/actors/global-registry.js";
 import { DEFAULT_DEAD_LETTER_REPLAY_MAX_AGE_MS, normalizeDeadLetterReplayMaxAgeMs, type FabricActorRequest } from "../src/actors/types.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
@@ -84,6 +84,23 @@ describe("dead-letter replay age and current activation filter (#10630)", () => 
     expect(readLines(w.file)).toEqual([]);
     expect(receipts(manager, w.actor.id)).toEqual([{ replayed: 4, archivedStale: 6, filterSkipped: 0, remaining: 0 }]);
     expect(manager.status(w.actor.id).deadLetterReplayMaxAgeMs).toBe(DEFAULT_DEAD_LETTER_REPLAY_MAX_AGE_MS);
+  });
+
+  it("bounds the stale archive, rotates one generation, and notices dropped older data", async () => {
+    const w = await backlog();
+    const oldArchive = Buffer.alloc(ACTOR_DEAD_LETTER_ARCHIVE_MAX_BYTES - 16, 0x78);
+    fs.writeFileSync(w.archive, oldArchive);
+    fs.writeFileSync(`${w.archive}.1`, "older-generation\n");
+    for (const entry of w.entries) entry.at = Date.now() - DEFAULT_DEAD_LETTER_REPLAY_MAX_AGE_MS - 60_000;
+    fs.writeFileSync(w.file, w.entries.map(entry => JSON.stringify(entry) + "\n").join(""));
+    const manager = w.open();
+    await waitFor(() => receipts(manager, w.actor.id).length === 1);
+    expect(fs.statSync(w.archive).size).toBeLessThanOrEqual(ACTOR_DEAD_LETTER_ARCHIVE_MAX_BYTES);
+    expect(fs.readFileSync(`${w.archive}.1`)).toEqual(oldArchive);
+    expect(readLines<Entry>(w.archive)).toEqual(w.entries);
+    expect(manager.messages(w.actor.id)).toContainEqual(expect.objectContaining({
+      data: expect.objectContaining({ reason: "dead_letter_archive", deadLetterArchiveDropped: 1 }),
+    }));
   });
 
   it("archives stale entries behind a full replay batch without overtaking remaining fresh work", async () => {

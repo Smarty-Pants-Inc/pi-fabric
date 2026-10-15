@@ -256,7 +256,6 @@ export interface FabricActorSlotClaim {
   key: string;
   ifVersion: number;
 }
-}
 
 /** Public creation input; file instructions are resolved only by the actor owner. */
 export type FabricActorCreateRequest = Omit<FabricActorRequest, "instructions"> & import("./instructions-file.js").FabricActorInstructionsSource;

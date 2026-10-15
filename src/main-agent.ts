@@ -673,7 +673,7 @@ export class MainAgentController implements FabricMainAgentTarget {
       admittedCauses[0]!.topic === "fabric.control.command" &&
       admittedCauses[0]!.from.id === sender.id && admittedCauses[0]!.from.kind === "main" &&
       !this.#reloading && this.#bindingsLive && this.#context !== undefined && extensionContextLive(this.#context) &&
-      this.#context.isIdle() && (this.#context as { isSettling?: () => boolean }).isSettling?.() !== true &&
+      this.#context.isIdle() && (this.#context as { isSettling?: () => boolean }).isSettling?.() === false &&
       !this.#context.signal?.aborted && !promptPending(this.#context) && !this.#haltIndexUnknown &&
       !this.#providerHeld() && !this.#providerAttemptInFlight;
     if (peerSteerWake) this.#peerSteerInFlight = true;

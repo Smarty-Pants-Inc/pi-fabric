@@ -34,7 +34,7 @@ const makeHarness = (idle = true, aborted = false, durable = false, resume = tru
   const emit = (name: string, event: unknown) => {
     for (const handler of handlers.get(name) ?? []) handler(event, ctx);
   };
-  return { main, pi, sent, state, emit };
+  return { main, pi, sent, state, emit, ctx };
 };
 
 const peer = { id: "session:peer", name: "peer", kind: "main" as const };
@@ -172,6 +172,15 @@ describe("Main operator-halt peer wake admission", () => {
       from: peer, verification: "mesh", message: "mismatch", delivery: "steer",
     }, [fabricWakeCause(other, "steer", "fabric.control.command", "command-other")]));
     expect(misattributed).toMatchObject({ triggered: false, halted: true, reason: "operator-halt" });
+    expect(sent.every(item => !item.triggerTurn)).toBe(true);
+    main.closeFollowUpDrain();
+  });
+
+  it("keeps a marked lead halted when the host cannot confirm settlement", () => {
+    const { main, sent, ctx } = makeHarness();
+    delete (ctx as { isSettling?: () => boolean }).isSettling;
+    main.halt();
+    expect(main.deliverAgent(directSteer())).toMatchObject({ triggered: false, halted: true, reason: "operator-halt" });
     expect(sent.every(item => !item.triggerTurn)).toBe(true);
     main.closeFollowUpDrain();
   });

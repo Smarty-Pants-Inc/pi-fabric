@@ -330,4 +330,83 @@ describe.skipIf(process.platform === "win32")("darwin file-data root under a roo
     expect(mode(path.join(runRoot, "run-1"))).toBe(0o700);
     expect(fs.readdirSync(shared)).toEqual([]);
   });
+
+  // Security P1 (alias bounce): A (outside) -> shared/<other uid's child>/linkB -> the safe per-user T. The final path and
+  // the lexical chain of A look safe, but the other uid can repoint linkB after the preflight; the returned root must be
+  // the vetted canonical T, so AgentManager's mkdtemp never re-resolves the mutable chain.
+  it("default os.tmpdir(): an alias bouncing through another uid's child of the shared sticky directory returns canonical T; repointing it after preflight cannot move the run root", () => {
+    const nativeMkdtemp = fs.mkdtempSync; // captured before the fixture spies on it
+    const { root, shared, mkdir, mkdtemp } = darwinFixture(true);
+    const physical = path.join(root, "home", "T");
+    fs.mkdirSync(physical, { recursive: true, mode: 0o700 });
+    fs.chmodSync(path.dirname(physical), 0o700); fs.chmodSync(physical, 0o700);
+    const redirect = path.join(root, "redirect");
+    fs.mkdirSync(redirect, { mode: 0o700 }); fs.chmodSync(redirect, 0o700);
+    const child = path.join(shared, "other-user-child");
+    fs.mkdirSync(child, { mode: 0o700 }); fs.chmodSync(child, 0o777);
+    const linkB = path.join(child, "linkB");
+    fs.symlinkSync(physical, linkB, "dir");
+    const alias = path.join(root, "bounce-tmp");
+    fs.symlinkSync(linkB, alias, "dir");
+    // A real chown is impossible here: the child is presented (by dev/ino) as another uid's, world-writable 0777.
+    const foreignUid = process.getuid!() + 1;
+    const childSeen = fs.lstatSync(child);
+    const presentForeign = (_file: string, stat: fs.Stats) =>
+      stat.isDirectory() && stat.dev === childSeen.dev && stat.ino === childSeen.ino ? asStat(stat, { uid: foreignUid }) : stat;
+    for (const spied of [fs.lstatSync, fs.statSync]) {
+      const inner = vi.mocked(spied).getMockImplementation()!;
+      vi.mocked(spied).mockImplementation(((file: fs.PathLike, ...rest: unknown[]) => {
+        const result = (inner as (...args: unknown[]) => fs.Stats | undefined)(file, ...rest);
+        return result ? presentForeign(String(file), result) : result;
+      }) as never);
+    }
+    const hook = privateDirTestHooks.stat;
+    privateDirTestHooks.stat = (walked, seen) => presentForeign(walked, hook ? hook(walked, seen) : seen);
+    // The other uid's move, staged entirely inside the fixture root: atomically rename a replacement link over linkB
+    // just after AgentManager evaluated fabricDataRoot(), then allocate with the real mkdtemp and its actual prefix.
+    let repointed = false;
+    mkdtemp.mockImplementation(((prefix: string, ...rest: unknown[]) => {
+      if (!repointed) {
+        repointed = true;
+        const next = path.join(child, "linkB.next");
+        fs.symlinkSync(redirect, next, "dir");
+        fs.renameSync(next, linkB);
+      }
+      return (nativeMkdtemp as (...args: unknown[]) => string)(prefix, ...rest);
+    }) as typeof fs.mkdtempSync);
+    mkdir.mockClear();
+    // Fixture facts: A is outside shared and resolves to the safe T only by bouncing through the foreign child.
+    expect(alias.startsWith(shared + path.sep)).toBe(false);
+    expect(physical.startsWith(shared + path.sep)).toBe(false);
+    expect(fs.lstatSync(alias).isSymbolicLink()).toBe(true);
+    expect(fs.readlinkSync(alias)).toBe(linkB);
+    expect(fs.lstatSync(linkB).isSymbolicLink()).toBe(true);
+    expect(fs.realpathSync(alias)).toBe(physical);
+    const sharedSeen = fs.statSync(shared);
+    expect([sharedSeen.uid, sharedSeen.mode & 0o7777]).toEqual([0, 0o1777]);
+    const foreign = fs.lstatSync(child);
+    expect([foreign.uid, foreign.mode & 0o7777]).toEqual([foreignUid, 0o777]);
+    expect([fs.statSync(physical).uid, mode(physical)]).toEqual([process.getuid!(), 0o700]);
+    expect([fs.statSync(alias).uid, mode(alias)]).toEqual([process.getuid!(), 0o700]);
+    expect([fs.statSync(redirect).uid, mode(redirect)]).toEqual([process.getuid!(), 0o700]);
+    expect(fs.readdirSync(redirect)).toEqual([]);
+    useAlias("default os.tmpdir()", alias);
+    // Soft: on RED the lexical A comes back, and the real manager below still shows the resulting wrong allocation.
+    expect.soft(fabricDataRoot()).toBe(physical);
+    expect(mkdtemp).not.toHaveBeenCalled();
+    manager();
+    expect(mkdtemp).toHaveBeenCalledTimes(1);
+    const prefix = path.resolve(String(mkdtemp.mock.calls[0]![0]));
+    expect.soft(path.dirname(prefix)).toBe(physical); // the canonical T, not the alias A
+    expect(repointed).toBe(true);
+    expect(fs.realpathSync(alias)).toBe(redirect); // the repoint really happened before allocation
+    expect(fs.readdirSync(child)).toEqual(["linkB"]);
+    expect(fs.readdirSync(redirect)).toEqual([]);
+    const runRoots = fs.readdirSync(physical).filter(name => name.startsWith("pi-fabric-runs-"));
+    expect(runRoots).toHaveLength(1);
+    const runRoot = path.join(physical, runRoots[0]!);
+    expect([fs.statSync(runRoot).uid, mode(runRoot)]).toEqual([process.getuid!(), 0o700]);
+    expect([...createdBelow(mkdir.mock.calls, shared), ...createdBelow(mkdir.mock.calls, alias)]).toEqual([]);
+    expect(fs.readdirSync(shared)).toEqual(["other-user-child"]);
+  });
 });

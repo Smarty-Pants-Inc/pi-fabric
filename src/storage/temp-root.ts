@@ -13,9 +13,11 @@ import { windowsDataRoot } from "./windows-temp-root.js";
  * shared directory cannot name a child inside it. A dangling or unresolvable symlink, or any realpath/stat error on
  * the existing prefix, throws (fail-closed, nothing written); only a missing lexical component (lstat ENOENT/ENOTDIR)
  * ends the walk, and the missing suffix is never realpath'ed. Ownership and symlink policy stay with the existing validators.
+ * Returns the vetted physical path (realpath of the deepest existing directory joined with the lexical missing suffix)
+ * so callers never re-follow a mutable alias chain after the check; any other platform gets its input back unchanged.
  */
-const refuseDarwinSharedSticky = (directory: string): void => {
-  if (process.platform !== "darwin") return;
+const refuseDarwinSharedSticky = (directory: string): string => {
+  if (process.platform !== "darwin") return directory;
   const target = path.resolve(directory);
   let walked = path.parse(target).root;
   const names = target.slice(walked.length).split(path.sep).filter(Boolean);
@@ -40,15 +42,14 @@ const refuseDarwinSharedSticky = (directory: string): void => {
     real = path.join(real, name);
     refuseSharedSticky(fs.statSync(real), real, target);
   }
+  return path.join(physical, path.relative(deepest, target));
 };
 
 /** File data only: socket/pipe paths must keep their short transport-specific roots. */
 export const fabricDataRoot = (): string => {
   const root = process.env.PI_FABRIC_TMPDIR;
   if (!root) {
-    const fallback = os.tmpdir();
-    refuseDarwinSharedSticky(fallback);
-    return fallback;
+    return refuseDarwinSharedSticky(os.tmpdir()); // vetted canonical path, never the lexical alias
   }
   if (process.platform === "win32") return windowsDataRoot(root);
   if (!path.isAbsolute(root)) throw new Error("PI_FABRIC_TMPDIR must be an absolute path");
@@ -58,7 +59,7 @@ export const fabricDataRoot = (): string => {
   // Match the Herdr ledger's namespace criteria. Walk from the filesystem root so no
   // mkdir/write traverses an unchecked ancestor. Never chmod an existing path.
   const directory = path.resolve(root);
-  refuseDarwinSharedSticky(directory); // before the mkdir walk below
+  const vetted = refuseDarwinSharedSticky(directory); // before the mkdir walk below
   const chain: string[] = [];
   for (let current = directory; ; current = path.dirname(current)) {
     chain.unshift(current);
@@ -81,5 +82,5 @@ export const fabricDataRoot = (): string => {
     if (stat.uid !== uid && (final || stat.uid !== 0)) fail(current, "is owned by another user");
     if ((stat.mode & 0o022) !== 0 && (final || (stat.mode & 0o1000) === 0)) fail(current, "is writable by other users");
   }
-  return directory;
+  return vetted;
 };

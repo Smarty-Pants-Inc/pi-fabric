@@ -65,15 +65,17 @@ describe("root inbox injects a batch once (R-token-waste)", () => {
     expect((await h.box().next(notHeld)).events.map(event => event.id)).toEqual([fresh.id]);
   });
 
-  it("suppresses a shadow carrying a messageId when the follow-up carried the same key and topic without an identity", async () => {
+  it("delivers a distinct messageId when a follow-up carried only the same work key", async () => {
     const h = setup(); const inbox = h.box(); inbox.start();
     h.main.deliverAgent({ from: peer, message: "already handled", delivery: "followUp", data: { key: "lane:7709", topic: TOPIC } });
-    await h.publish({ key: "lane:7709", messageId: "sender-local-7709" }); h.advance(1);
-    expect((await inbox.next(h.session())).events).toEqual([]);
+    const distinct = await h.publish({ key: "lane:7709", messageId: "sender-local-7709" }); h.advance(1);
+    const batch = await inbox.next(h.session());
+    expect(batch.events.map(event => event.id)).toEqual([distinct.id]);
+    await inbox.consume(rootInboxMessage(batch.events).details.ids, rootInboxMessage(batch.events).details.receipts);
     // A carrier with its own, different identity is distinct work and stays deliverable.
     h.main.deliverAgent({ from: peer, message: "other", delivery: "followUp", data: { key: "lane:42", messageId: "A", topic: TOPIC } });
-    const distinct = await h.publish({ key: "lane:42", messageId: "B" }); h.advance(1);
-    expect((await h.box().next(h.session())).events.map(event => event.id)).toEqual([distinct.id]);
+    const other = await h.publish({ key: "lane:42", messageId: "B" }); h.advance(1);
+    expect((await h.box().next(h.session())).events.map(event => event.id)).toEqual([other.id]);
   });
 
   it.each(["steer", "followUp"] as const)("suppresses a shadow whose messageId is the %s's control delivery id", async (delivery) => {
@@ -89,19 +91,19 @@ describe("root inbox injects a batch once (R-token-waste)", () => {
     } finally { h.main.closeFollowUpDrain(); }
   });
 
-  it("suppresses already-delivered follow-ups in a 20-event backlog, injecting only the undelivered rest", async () => {
+  it("injects distinct event identities in a backlog after key-only follow-ups", async () => {
     const h = setup(); const inbox = h.box(); inbox.start();
-    const undelivered: MeshEvent[] = [];
+    const expected: MeshEvent[] = [];
     for (let index = 0; index < 20; index++) {
       if (index % 4 === 0) {
-        undelivered.push(await h.publish({ key: `work:${index}` }));
+        expected.push(await h.publish({ key: `work:${index}` }));
         continue;
       }
       h.main.deliverAgent({ from: peer, message: `work ${index}`, delivery: "followUp", data: { key: `work:${index}`, topic: TOPIC } });
-      await h.publish({ key: `work:${index}`, messageId: `local:${index}` });
+      expected.push(await h.publish({ key: `work:${index}`, messageId: `local:${index}` }));
     }
     h.advance(1);
-    expect((await inbox.next(h.session())).events.map(event => event.id)).toEqual(undelivered.map(event => event.id));
+    expect((await inbox.next(h.session())).events.map(event => event.id)).toEqual(expected.map(event => event.id));
   });
 
   // review-fleet-2 security P1 on cdb29afd: a work-key receipt matched on sender + key only, so an
@@ -137,11 +139,11 @@ describe("root inbox injects a batch once (R-token-waste)", () => {
     const h = setup(); const inbox = h.box(); inbox.start();
     h.main.deliverAgent({ from: peer, message: "handled", delivery: "followUp", data: { key: "lane:3", topic: "fleet.work.lanes" } });
     await h.publish({ key: "lane:3" }, "copy", "fleet.work.lanes");
-    await h.publish({ key: "lane:3", messageId: "copy-3" }, "copy", "fleet.work.lanes");
+    const copyWithId = await h.publish({ key: "lane:3", messageId: "copy-3" }, "copy", "fleet.work.lanes");
     const other = await h.publish({ key: "lane:3" }, "unrelated", "fleet.alarm.ci");
     const otherWithId = await h.publish({ key: "lane:3", messageId: "unrelated-3" }, "unrelated", "fleet.alarm.ci"); h.advance(1);
     const first = await inbox.next(h.session());
-    expect(first.events.map(event => event.id)).toEqual([other.id, otherWithId.id]);
+    expect(first.events.map(event => event.id)).toEqual([copyWithId.id, other.id, otherWithId.id]);
     const delivered = rootInboxMessage(first.events).details;
     await inbox.consume(delivered.ids, delivered.receipts);
     // A follow-up that names no topic has no verifiable topic: its key suppresses nothing.

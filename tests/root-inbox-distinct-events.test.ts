@@ -101,12 +101,15 @@ describe("distinct same-key mesh events (smarty-dev#12140)", () => {
     expect(ids((await h.box().wake(h.session(), () => true))?.events)).toEqual([third.id]);
   });
 
-  it("still suppresses a shadow of a native keyed steer, beyond reload", async () => {
+  it.each(["messageId", "deliveryId"] as const)("delivers a distinct addressed event with a different %s after a key-only native carrier", async (identity) => {
     const h = setup(); const inbox = h.box(); inbox.start();
     h.main.deliverAgent({ from: watcher, message: "rc=1", delivery: "steer", data: { key: KEY, topic: TOPIC } });
     await h.publish("rc=1 shadow");
-    await h.publish("rc=1 shadow with id", { key: KEY, messageId: "watcher-local-1" }); h.advance(1);
-    expect((await inbox.next(h.session())).events).toEqual([]);
+    const distinct = await h.publish("rc=124 distinct", { key: KEY, [identity]: `watcher-local-${identity}` }); h.advance(1);
+    // The legacy key-only shadow is still suppressed, but its distinct explicit identity is not.
+    const batch = await inbox.next(h.session());
+    expect(ids(batch.events)).toEqual([distinct.id]);
+    await h.take(inbox, batch.events);
     // The native claim persists in the recipient cursor once the session history is gone.
     h.entries.length = 0;
     await h.publish("rc=1 shadow again"); h.advance(1);

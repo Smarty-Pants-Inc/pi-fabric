@@ -3,7 +3,7 @@ import { appendDeliveryOutcome } from "../mesh/delivery-outcomes.js";
 import { MeshBackgroundQueue } from "../core/atomic-write.js";
 import type { MeshEvent, MeshIdentity, MeshStore } from "../mesh/store.js";
 import {
-  INBOX_HORIZON_MS, ROOT_ID_PREFIX, crossIdentityReceipts, deliveryIdentity, eventReceipt, eventReceipts, topicWorkReceipt, workKey, workRef,
+  INBOX_HORIZON_MS, ROOT_ID_PREFIX, crossIdentityReceipts, deliveryIdentity, eventReceipt, eventReceipts, topicWorkReceipt, workKey,
   type RootInboxBatch, type RootInboxEvent, type RootInboxReconcileOptions, type RootInboxSession,
 } from "./root-inbox-shared.js";
 
@@ -449,18 +449,21 @@ export class RootInbox {
   #steered(event: MeshEvent, session: RootInboxSession): boolean {
     const has = (id: string): boolean => this.#delivered.has(id) || session.delivered?.has(id) === true;
     if (eventReceipts(event).some(has) || crossIdentityReceipts(event.from.id, event.data).some(has)) return true;
+    const identity = deliveryIdentity(event.data);
+    // An explicit messageId/deliveryId is a stable event identity. Once the exact receipts above
+    // miss, this is distinct work: never let its shared key/ref fall back to a native carrier.
+    // #1226 also records originating event receipts on Main carriers, so exact matching stays the
+    // preferred path as carriers gain that metadata.
+    if (identity) return false;
     const key = workKey(event.data);
     // smarty-dev#12140: a key/ref receipt is a native carrier's claim ("native-topic-*"), never a
-    // consumed mesh event's: a distinct event with the same sender, topic and key still delivers.
+    // consumed mesh event's: a distinct legacy event with the same sender, topic and key still
+    // needs the key fallback only when it has no stable delivery identity of its own.
     if (key === undefined) {
-      const ref = workRef(event.data);
-      return ref !== undefined && !deliveryIdentity(event.data) && has(topicWorkReceipt(event.from.id, "ref", event.topic, ref));
+      const data = event.data && typeof event.data === "object" ? event.data as { ref?: unknown } : undefined;
+      const ref = typeof data?.ref === "string" && data.ref.trim() ? data.ref.trim() : undefined;
+      return ref !== undefined && has(topicWorkReceipt(event.from.id, "ref", event.topic, ref));
     }
-    // A shadow that carries its own messageId/deliveryId still matches a follow-up or steer that
-    // carried the same work key on the same topic and no identity of its own: that carrier claimed
-    // the key there. A carrier with a different identity is distinct work (its key receipt is never
-    // recorded), and a key receipt on another topic or with no topic never suppresses (see above).
-    if (deliveryIdentity(event.data)) return has(topicWorkReceipt(event.from.id, "key", event.topic, key));
     return has(topicWorkReceipt(event.from.id, "key", event.topic, key)) || session.holdsSteer(event.from.id, key, event.topic);
   }
 

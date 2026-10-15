@@ -75,74 +75,48 @@ export const deliveryIdentity = (data: unknown): { kind: string; value: string }
  * topic-less kinds ("key", "ref") are never matched again: without a verifiable topic the event
  * is injected, because a duplicate shadow is cheap and a lost event is not.
  */
+/** Native carriers claim topic-scoped work; mesh events retain their own identities. */
 export const topicWorkReceipt = (fromId: string, kind: "key" | "ref", topic: string, value: string): string =>
-  // smarty-dev#12140: only a native carrier (a steer or follow-up) claims its key/ref. A mesh
-  // event has a unique envelope id, and two distinct events may share sender, topic and key, so
-  // mesh events never store a key/ref receipt. The "native-topic-*" kind also retires every
-  // older "topic-*" hash, which inbox carriers and cursors recorded for mesh events: such a
-  // legacy receipt can no longer suppress a distinct new event (fail open, at least once).
   receipt(fromId, `native-topic-${kind}`, JSON.stringify([topic, value]));
-/** A non-empty data.ref, the fallback work identity of a native carrier without a key. */
-export const workRef = (data: unknown): string | undefined => {
-  const ref = data && typeof data === "object" ? (data as { ref?: unknown }).ref : undefined;
-  return typeof ref === "string" && ref.trim() ? ref.trim() : undefined;
-};
 /** The topic a native carrier names for its work (data.topic); without one its key/ref claims nothing. */
 const carrierTopic = (data: unknown): string | undefined => {
   const topic = data && typeof data === "object" ? (data as { topic?: unknown }).topic : undefined;
   return typeof topic === "string" && topic.trim() ? topic.trim() : undefined;
 };
-/** Native carrier receipts only: its explicit identity, else its topic-scoped key/ref claim. */
-const carrierReceipts = (fromId: string, data: unknown, topic: string | undefined): string[] => {
+const workReceipts = (fromId: string, data: unknown, topic: string | undefined): string[] => {
   if (!data || typeof data !== "object") return [];
   const identity = deliveryIdentity(data);
   if (identity) return [receipt(fromId, identity.kind, identity.value)];
   if (topic === undefined) return [];
+  const fields = data as Record<string, unknown>;
   const key = workKey(data);
-  const ref = workRef(data);
+  const ref = typeof fields.ref === "string" && fields.ref.trim() ? fields.ref.trim() : undefined;
   return key ? [topicWorkReceipt(fromId, "key", topic, key)] : ref ? [topicWorkReceipt(fromId, "ref", topic, ref)] : [];
 };
 export const eventReceipt = (id: string): string => receipt("", "event", id);
 /**
  * Receipts that a native carrier records for the same identity under its other kind: a shadow's
  * messageId is often the control commandId the follow-up arrived with (recorded as "delivery"),
- * and a shadow's deliveryId can be the carrier id (recorded as "id"). RootInbox uses these for
- * matching, not batch dedup; inbox carriers also include them for display identity projection.
+ * and a shadow's deliveryId can be the carrier id (recorded as "id"). Matching only, never stored.
  */
 export const crossIdentityReceipts = (fromId: string, data: unknown): string[] => {
   const identity = deliveryIdentity(data);
   if (!identity) return [];
   return [receipt(fromId, identity.kind === "delivery" ? "id" : "delivery", identity.value)];
 };
-/**
- * A mesh event's receipts: its unique envelope id, a host-only publication key and an explicit
- * messageId/deliveryId. Never a sender/topic/key/ref fallback (smarty-dev#12140): a work key is
- * not unique per notification, so a consumed event must not suppress a distinct one with the
- * same key. Native keyed carriers still suppress their shadows (RootInbox #steered).
- */
 export const eventReceipts = (event: MeshEvent): string[] => {
   const identity = deliveryIdentity(event.data);
   return [
     eventReceipt(event.id), receipt(event.from.id, "id", event.id),
-    // Host-only publication keys are mesh-wide, even when a different maintenance owner
-    // retries. Carry the key into recipient-scoped confirmed session/inbox receipts too.
     ...(event.dedupeKey ? [receipt("", "dedupe", event.dedupeKey)] : []),
-    ...(identity ? [receipt(event.from.id, identity.kind, identity.value)] : []),
+    ...(identity ? [receipt(event.from.id, identity.kind, identity.value), ...crossIdentityReceipts(event.from.id, event.data)] : []),
   ];
 };
-/**
- * Display-only shadow metadata for an inbox carrier's receipt group (smarty-dev#12140): an event
- * with an explicit identity carries the other-kind receipt too, because native carriers record
- * deliveryId as "delivery" while mesh shadows record messageId as "id" (and vice versa). Factory
- * shadows carry commandId instead: acceptControl gives the native carrier that same deliveryId.
- * A key or ref is only a work claim, not a notification identity, so key/ref-only shadows fail
- * open when a distinct event reuses the same work key. An explicit deliveryId/messageId still
- * outranks commandId; sender-qualified shared identity alone proves the carrier delivered it.
- */
-const shadowDisplayReceipts = (event: MeshEvent): string[] => {
-  if (deliveryIdentity(event.data)) return crossIdentityReceipts(event.from.id, event.data);
-  const commandId = event.data && typeof event.data === "object" ? (event.data as { commandId?: unknown }).commandId : undefined;
-  return typeof commandId === "string" && commandId ? [receipt(event.from.id, "delivery", commandId)] : [];
+const display = (event: MeshEvent): string[] => {
+  const out = eventReceipts(event);
+  const cmd = (event.data as { commandId?: unknown } | undefined)?.commandId;
+  if (!deliveryIdentity(event.data) && typeof cmd === "string" && cmd) out.push(receipt(event.from.id, "delivery", cmd));
+  return out;
 };
 /** What the session's own entries say it holds. */
 export interface RootInboxSession {
@@ -179,8 +153,6 @@ export const projectRootInboxReceipt = (value: unknown): unknown => {
     type: entry.type, id: entry.id, timestamp: entry.timestamp, customType: entry.customType,
     ...(details ? { details: {
       ...carried(details), ids: details.ids, receipts: details.receipts,
-      // Keep malformed shapes unchanged: consumers retain their existing
-      // validation/failure behavior; projection must not manufacture a receipt.
       items: Array.isArray(details.items) ? details.items.map(carried) : details.items,
     } } : {}),
   };
@@ -263,7 +235,7 @@ const inboxReceiptSession = (entries: Iterable<readonly [number, unknown]>, coun
       const key = workKey(item?.data);
       const topic = carrierTopic(item?.data);
       if (typeof fromId !== "string") continue;
-      for (const id of carrierReceipts(fromId, item.data, topic)) remember(id, at);
+      for (const id of workReceipts(fromId, item.data, topic)) remember(id, at);
       if (typeof item.id === "string") remember(receipt(fromId, "id", item.id), at);
       if (typeof item.deliveryId === "string") remember(receipt(fromId, "delivery", item.deliveryId), at);
       // A carrier without a topic claims no work key: its shadow is injected (fail open).
@@ -364,9 +336,6 @@ export const rootInboxMessage = (input: readonly MeshEvent[], extra?: readonly M
     "</fabric-inbox>",
   ].join("\n"),
   display: true,
-  // Each group starts with the event receipt (the renderer's boundary); display metadata trails it.
-  // Overflow has no XML row/boundary: put its groups first so the last shown row's group
-  // ends at receipts.length without inheriting unrelated overflow identities. IDs stay in delivery order.
-  details: { ids: all.map((event) => event.id), receipts: [...rest, ...events].flatMap((event) => [...eventReceipts(event), ...shadowDisplayReceipts(event)]) },
+  details: { ids: all.map((event) => event.id), receipts: rest.concat(events).flatMap(display) },
   };
 };

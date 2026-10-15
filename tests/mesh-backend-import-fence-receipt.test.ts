@@ -1,0 +1,259 @@
+import { spawn } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { afterEach, describe, expect, it } from "vitest";
+import { readPhysicalHostIdentity, type StaleLockNote } from "../src/core/atomic-write.js";
+import { ownPidNamespace } from "../src/core/pid-namespace.js";
+import { meshBackendStatus } from "../src/mesh/backend-migration.js";
+import { IMPORT_FENCE_RECEIPT, recoverKilledImportLock } from "../src/mesh/import-fence-receipt.js";
+import { main, meshWriterCensusSync } from "../src/mesh/mesh-backend-cli.js";
+import { meshLockQueueDirectory } from "../src/mesh/lock-queue.js";
+import { MeshLock } from "../src/mesh/mesh-lock.js";
+import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
+
+// smarty-dev#9501: a SIGKILLed import leaves its own fence (.lock, custody.lock). The exact rerun's readiness gate
+// takes its census before the fence and used to require fabric@unknown for that dead owner forever. The import's
+// receipt lets the CLI preflight hand exactly that owner to the mesh lock's ordinary stale recovery; everything else
+// (live holder, other namespace, other bytes, other root/host, legacy residue, protocol 3) stays the gate's.
+
+const identity: MeshIdentity = { id: "tester", name: "tester", kind: "agent" };
+const dirs: string[] = [];
+afterEach(() => { for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true }); });
+
+const fileRoot = async (): Promise<string> => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-import-fence-"));
+  dirs.push(root);
+  const store = new MeshStore(root, 64 * 1024, 1_000, { stateBackend: "file" });
+  await store.put({ key: "seed/a", value: { n: 1 }, identity });
+  store.closeState();
+  return root;
+};
+
+/** The real CLI with the real (pre-fence and fenced) census; no built-in readers, no foreign pid scan. */
+const cli = async (argv: string[]): Promise<{ code: number; out: string; err: string }> => {
+  let out = "";
+  let err = "";
+  const root = argv[argv.indexOf("--root") + 1]!;
+  const code = await main(argv, { gateCensus: meshWriterCensusSync(root), builtinReaders: [], procScan: { listPids: () => [] },
+    stdout: (text) => { out += text; }, stderr: (text) => { err += text; } });
+  return { code, out, err };
+};
+
+const CHILD = `
+import { createJiti } from "jiti";
+import { pathToFileURL } from "node:url";
+const jiti = createJiti(pathToFileURL(process.cwd() + "/index.js").href);
+const migration = await jiti.import("./src/mesh/backend-migration.ts");
+const root = process.argv.at(-1);
+await migration.importMeshState(root, { beforeOpen: () => { process.kill(process.pid, "SIGKILL"); for (;;) { /* never */ } } });
+`;
+/** A real import, SIGKILLed under its fence right before it would open state.db (beforeOpen). */
+const killedImport = (root: string): Promise<{ pid: number; signal: NodeJS.Signals | null; stderr: string }> => new Promise((resolve, reject) => {
+  const child = spawn(process.execPath, ["--input-type=module", "-e", CHILD, root], { cwd: process.cwd(), stdio: ["ignore", "ignore", "pipe"] });
+  let stderr = "";
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
+  child.once("error", reject);
+  child.once("close", (_code, signal) => resolve({ pid: child.pid!, signal, stderr }));
+});
+
+/** A pid that ran and exited (ESRCH now). */
+const deadPid = (): Promise<number> => new Promise((resolve, reject) => {
+  const child = spawn(process.execPath, ["-e", ""], { stdio: "ignore" });
+  child.once("error", reject);
+  child.once("close", () => resolve(child.pid!));
+});
+
+const lockOwner = (root: string, lock = ".lock"): string | undefined => {
+  try { return fs.readFileSync(path.join(root, lock, "owner"), "utf8"); } catch { return undefined; }
+};
+const deadFences = (root: string): string[] => fs.readdirSync(root).filter(name => name.startsWith(".lock.dead."));
+const queueNames = (root: string): string[] => { try { return fs.readdirSync(meshLockQueueDirectory(root)).sort(); } catch { return []; } };
+const MESH_TOKEN = "11111111-2222-4333-8444-555555555555";
+/** FIFO tickets as lock-queue.ts names them: the forged holder's own, and an unrelated waiter's. */
+const placeTickets = (root: string, pid: number): { own: string; other: string } => {
+  const queue = meshLockQueueDirectory(root);
+  fs.mkdirSync(queue, { recursive: true, mode: 0o700 });
+  const own = `${"1".padStart(24, "0")}-${pid}-${MESH_TOKEN}`;
+  const other = `${"2".padStart(24, "0")}-${pid}-99999999-2222-4333-8444-555555555555`;
+  for (const name of [own, other]) fs.writeFileSync(path.join(queue, name), "", { mode: 0o600 });
+  return { own, other };
+};
+
+interface Forged { mesh: string; custody: string; receipt: Record<string, unknown> }
+/** Residue as a killed protocol-1 import leaves it, with its receipt; `patch` alters the receipt only. */
+const forge = async (root: string, pid: number, patch: Record<string, unknown> = {}): Promise<Forged> => {
+  const mesh = `${MESH_TOKEN}\n${pid}\n${Date.now()}\n`;
+  const custody = `66666666-7777-4888-8999-aaaaaaaaaaaa\n${pid}\n${Date.now()}\n`;
+  for (const [lock, owner] of [[".lock", mesh], ["custody.lock", custody]] as const) {
+    fs.mkdirSync(path.join(root, lock), { mode: 0o700 });
+    fs.writeFileSync(path.join(root, lock, "owner"), owner, { mode: 0o600 });
+  }
+  const real = fs.realpathSync(root);
+  const stat = fs.statSync(real, { bigint: true });
+  const host = readPhysicalHostIdentity()!;
+  const receipt = { format: 1, kind: "fabric-mesh-import-fence", root: real, rootDev: String(stat.dev), rootIno: String(stat.ino),
+    pid, start: "123456", machineId: host.machineId, bootId: host.bootId, namespace: await ownPidNamespace(), mesh, custody, ...patch };
+  fs.writeFileSync(path.join(root, IMPORT_FENCE_RECEIPT), JSON.stringify(receipt), { mode: 0o600 });
+  return { mesh, custody, receipt };
+};
+
+const linuxIdentity = process.platform === "linux" && readPhysicalHostIdentity() !== undefined;
+
+describe.skipIf(!linuxIdentity)("smarty-dev#9501 killed import fence receipt", () => {
+  it("the exact rerun of a SIGKILLed import converges through the real CLI gate", async () => {
+    const root = await fileRoot();
+    const killed = await killedImport(root);
+    expect(killed.signal, killed.stderr).toBe("SIGKILL");
+    // The killed import's own residue, and the receipt it wrote under the fence before beforeOpen.
+    const mesh = lockOwner(root)!;
+    expect(mesh.split("\n")[1]).toBe(String(killed.pid));
+    expect(lockOwner(root, "custody.lock")!.split("\n")[1]).toBe(String(killed.pid));
+    const receipt = JSON.parse(fs.readFileSync(path.join(root, IMPORT_FENCE_RECEIPT), "utf8")) as Record<string, unknown>;
+    expect(receipt).toMatchObject({ format: 1, pid: killed.pid, mesh, custody: lockOwner(root, "custody.lock") });
+    expect(fs.existsSync(path.join(root, "state.db"))).toBe(false);
+
+    // Its FIFO ticket, when admission was open (the census reports it once the owner is gone).
+    const ticket = queueNames(root).find(name => name.endsWith(`-${killed.pid}-${mesh.split("\n")[0]}`));
+    const rerun = await cli(["import", "--root", root]);
+    expect(rerun.err).toContain(`recovered the mesh .lock of killed import pid ${killed.pid}`);
+    // The killed holder's FIFO ticket was retired (renamed, not deleted) under the same proof.
+    if (ticket) {
+      expect(rerun.err).toContain(`ticket ${ticket} retired`);
+      expect(queueNames(root)).toContain(`${ticket}.recovered`);
+    }
+    expect(queueNames(root).filter(name => /^\d{24}-\d+-[a-f0-9-]+$/.test(name))).toEqual([]);
+    expect(rerun.err).not.toContain("fabric@unknown");
+    expect(rerun.code, rerun.err).toBe(0);
+    expect((await meshBackendStatus(root)).backend).toBe("sqlite");
+    // Recovery renamed the dead owner's directory into a retained receipt; the fence's own recovery took custody.lock.
+    expect(deadFences(root)).toHaveLength(1);
+    expect(fs.existsSync(path.join(root, ".lock"))).toBe(false);
+    expect(fs.existsSync(path.join(root, "custody.lock"))).toBe(false);
+  }, 60_000);
+
+  it("lock and ticket residue together: the CLI rerun recovers both, then the fence recovers custody.lock", async () => {
+    const root = await fileRoot();
+    const pid = await deadPid();
+    await forge(root, pid);
+    const { own, other } = placeTickets(root, pid);
+    const rerun = await cli(["import", "--root", root]);
+    expect(rerun.err).toContain(`ticket ${own} retired`);
+    // The unrelated ticket (another token of the same pid) is never touched by the preflight.
+    expect(rerun.err).toContain(`lock-ticket ${other}`);
+    expect(rerun.code).toBe(3);
+    expect(queueNames(root)).toEqual([other, `${own}.recovered`].sort());
+    // Without that unrelated waiter's ticket, the same residue converges.
+    const clean = await fileRoot();
+    await forge(clean, await deadPid());
+    const ticket = placeTickets(clean, Number(lockOwner(clean)!.split("\n")[1]));
+    fs.renameSync(path.join(meshLockQueueDirectory(clean), ticket.other), path.join(meshLockQueueDirectory(clean), `${ticket.other}.test-retired`));
+    const converged = await cli(["import", "--root", clean]);
+    expect(converged.code, converged.err).toBe(0);
+    expect(converged.err).toContain(`ticket ${ticket.own} retired`);
+    expect((await meshBackendStatus(clean)).backend).toBe("sqlite");
+    expect(fs.existsSync(path.join(clean, "custody.lock"))).toBe(false);
+  }, 60_000);
+
+  it("legacy residue without a receipt stays fabric@unknown (compatibility limit)", async () => {
+    const root = await fileRoot();
+    await forge(root, await deadPid());
+    fs.rmSync(path.join(root, IMPORT_FENCE_RECEIPT));
+    const before = lockOwner(root);
+    const rerun = await cli(["import", "--root", root]);
+    expect(rerun.code).toBe(3);
+    expect(rerun.err).toContain("fabric@unknown");
+    expect(lockOwner(root)).toBe(before);
+    expect(deadFences(root)).toEqual([]);
+  }, 30_000);
+
+  it("a live import-owned holder is never touched; the gate refuses it as fabric@unknown without waiting", async () => {
+    const root = await fileRoot();
+    const { mesh } = await forge(root, process.ppid);
+    expect(await recoverKilledImportLock(root)).toBeUndefined();
+    const started = Date.now();
+    const rerun = await cli(["import", "--root", root]);
+    expect(rerun.code).toBe(3);
+    expect(rerun.err).toContain("fabric@unknown");
+    expect(Date.now() - started).toBeLessThan(20_000);
+    expect(lockOwner(root)).toBe(mesh);
+    expect(deadFences(root)).toEqual([]);
+  }, 30_000);
+
+  it("recovers a dead receipt-matched owner, and only it", async () => {
+    const root = await fileRoot();
+    const pid = await deadPid();
+    await forge(root, pid);
+    const { own, other } = placeTickets(root, pid);
+    expect(await recoverKilledImportLock(root)).toContain(`killed import pid ${pid}`);
+    // Only the dead owner's own ticket (its pid and token) leaves the ticket namespace, renamed and retained.
+    expect(queueNames(root)).toEqual([other, `${own}.recovered`].sort());
+    expect(lockOwner(root)).toBeUndefined();
+    expect(deadFences(root)).toHaveLength(1);
+    // custody.lock is the fence's own recovery, never the preflight's.
+    expect(lockOwner(root, "custody.lock")).toBeDefined();
+  });
+
+  const refusals: Array<[string, (root: string, forged: Forged) => Record<string, unknown> | void, (1 | 2 | 3)?]> = [
+    ["a successor holds .lock (other owner bytes)", (root) => {
+      fs.writeFileSync(path.join(root, ".lock", "owner"), `99999999-2222-4333-8444-555555555555\n${process.ppid}\n${Date.now()}\n`);
+    }],
+    ["custody.lock is not the receipt's", (root) => {
+      fs.writeFileSync(path.join(root, "custody.lock", "owner"), `99999999-7777-4888-8999-aaaaaaaaaaaa\n1\n${Date.now()}\n`);
+    }],
+    ["another root inode", () => ({ rootIno: "1" })],
+    ["another root path", () => ({ root: "/elsewhere" })],
+    ["another machine", () => ({ machineId: "0".repeat(32) })],
+    ["another boot", () => ({ bootId: "00000000-0000-4000-8000-000000000000" })],
+    ["another PID namespace (live holder elsewhere on this host shares machine and boot)", (_root, forged) => {
+      const own = String(forged.receipt.namespace);
+      return { namespace: own.replace(/:(\d+)$/, (_m, n: string) => `:${Number(n) + 1}`) };
+    }],
+    ["an unknown (empty) PID namespace", () => ({ namespace: "" })],
+    ["an unproven (malformed) PID namespace", () => ({ namespace: "linux:not-a-namespace" })],
+    ["the receipt's pid is not the owner's", () => ({ pid: 1 })],
+    ["an unrecognized receipt format", () => ({ format: 2 })],
+    ["protocol 3 never upgrades a namespace-less record", () => undefined, 3],
+  ];
+  it.each(refusals)("does nothing when %s", async (_label, alter, protocol) => {
+    const root = await fileRoot();
+    const pid = await deadPid();
+    const forged = await forge(root, pid);
+    placeTickets(root, pid);
+    const queued = queueNames(root);
+    const patch = alter(root, forged);
+    if (patch) fs.writeFileSync(path.join(root, IMPORT_FENCE_RECEIPT), JSON.stringify({ ...forged.receipt, ...patch }));
+    const mesh = lockOwner(root);
+    expect(await recoverKilledImportLock(root, protocol ?? 1)).toBeUndefined();
+    expect(lockOwner(root)).toBe(mesh);
+    expect(deadFences(root)).toEqual([]);
+    expect(queueNames(root)).toEqual(queued);
+  });
+
+  it("a torn receipt does nothing", async () => {
+    const root = await fileRoot();
+    await forge(root, await deadPid());
+    fs.writeFileSync(path.join(root, IMPORT_FENCE_RECEIPT), "{\"format\":1,");
+    const mesh = lockOwner(root);
+    expect(await recoverKilledImportLock(root)).toBeUndefined();
+    expect(lockOwner(root)).toBe(mesh);
+  });
+
+  it("clearStaleLock checks the expected owner inside the recovery, after its own read", async () => {
+    const root = await fileRoot();
+    const { mesh, receipt } = await forge(root, await deadPid());
+    const lock = new MeshLock(root, { lockProtocol: 1 }, () => undefined);
+    const ownerPath = path.join(lock.lockPath, "owner");
+    // A dead owner, but not the expected bytes: refused although it is recoverable.
+    expect(await lock.clearStaleLock(ownerPath, Date.now() + 2_000, {}, { owner: `${mesh}x`, namespace: String(receipt.namespace) })).toBe(false);
+    expect(lockOwner(root)).toBe(mesh);
+    // The expected owner with a foreign namespace: the existing reclaimVerdict refuses it and says why.
+    const note: StaleLockNote = {};
+    const foreign = String(receipt.namespace).replace(/:(\d+)$/, (_m, n: string) => `:${Number(n) + 1}`);
+    expect(await lock.clearStaleLock(ownerPath, Date.now() + 2_000, note, { owner: mesh, namespace: foreign })).toBe(false);
+    expect(note.verdict).toBeDefined();
+    expect(lockOwner(root)).toBe(mesh);
+    expect(await lock.clearStaleLock(ownerPath, Date.now() + 2_000, {}, { owner: mesh, namespace: String(receipt.namespace) })).toBe(true);
+    expect(lockOwner(root)).toBeUndefined();
+  });
+});

@@ -1,5 +1,6 @@
 import type { ExtensionAPI, ExtensionContext, SessionCompactFailedEvent } from "@earendil-works/pi-coding-agent";
 import { extensionContextLive } from "../session-liveness.js";
+import { detachedPreview } from "../core/preview.js";
 
 export const COMPACTION_FAILED_ALARM = "fabric.session.compaction_failed";
 export interface CompactionRecoveryOptions {
@@ -46,7 +47,7 @@ export const registerCompactionRecovery = (pi: ExtensionAPI, options: Compaction
     current.alarmed = true;
     try {
       await options.alarm({ session: current.sessionId, windowPercent: current.windowPercent,
-        reason: current.reason, error: error.slice(0, 4000), firstError: current.firstError.slice(0, 4000), attempts: 2 }, current.context);
+        reason: current.reason, error: detachedPreview(error, 4000), firstError: detachedPreview(current.firstError, 4000), attempts: 2 }, current.context);
     } catch { /* Mesh failure must not turn a compaction error into an unhandled rejection. */ }
   };
   const schedule = (context: ExtensionContext): void => {

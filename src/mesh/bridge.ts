@@ -455,6 +455,20 @@ const olderBridgeIncarnation = (
   return next.startedAt !== undefined && held.startedAt !== undefined && next.startedAt < held.startedAt;
 };
 
+/** Same-token metadata may change, but never lowers that owner's known finite age fence. */
+const bridgeIncarnationWithFloor = (
+  incoming: { startedAt?: unknown; incarnationToken?: unknown },
+  authorities: readonly { startedAt?: number; incarnationToken?: string }[],
+): { startedAt?: number; incarnationToken?: string } => {
+  const next = incarnationOf(incoming);
+  if (next.incarnationToken === undefined) return next;
+  for (const held of authorities) {
+    if (held.incarnationToken === next.incarnationToken && held.startedAt !== undefined && Number.isFinite(held.startedAt) &&
+      (next.startedAt === undefined || held.startedAt > next.startedAt)) next.startedAt = held.startedAt;
+  }
+  return next;
+};
+
 export class StoreBridgeSide implements BridgeSide {
   // The mirror's host-lease writes and removals run after its state commit, from rows recorded in
   // that commit (smarty-dev#6477 R11): a crash in between leaves them for the next pass, which
@@ -1136,13 +1150,15 @@ export class StoreBridgeSide implements BridgeSide {
           const until = Math.min(expiresAt + Math.min(now - liveAt, BRIDGE_LEASE_MS), now + BRIDGE_LEASE_MS);
           if (until <= now) continue;
           const renewedAt = Math.min(record.updatedAt, now);
-          hosts.set(record.id, record);
+          const incarnation = bridgeIncarnationWithFloor(record, incarnations.get(record.rootId) ?? []);
+          const admitted = { ...record, ...incarnation };
+          hosts.set(record.id, admitted);
           wanted.set(keyFor(HOST_PREFIX, record.id), {
-            value: { ...record, updatedAt: now, expiresAt: until, remoteHost: relayed ? record.remoteHost : this.peer },
+            value: { ...admitted, updatedAt: now, expiresAt: until, remoteHost: relayed ? record.remoteHost : this.peer },
             identity: record.identity,
           });
-          // The lease carries the origin's incarnation, so a later removal can tell it from a replacement's.
-          leases.push({ id: record.id, rootId: record.rootId, identityId: record.identity.id, ...incarnationOf(record),
+          // The lease carries the same age floor as the host, including lease-only authority.
+          leases.push({ id: record.id, rootId: record.rootId, identityId: record.identity.id, ...incarnation,
             updatedAt: renewedAt, expiresAt: until });
         }
         for (const participant of presence.participants) {
@@ -1269,7 +1285,12 @@ export class StoreBridgeSide implements BridgeSide {
         ? lease.incarnationToken === undefined || lease.incarnationToken !== held.incarnationToken : false)) return;
     const onDisk = readHostLease(this.store.root, lease.id);
     // Recovery must not erase newer file authority while its state row is still catching up.
-    if (onDisk?.rootId === lease.rootId && olderBridgeIncarnation(lease, onDisk)) return;
+    if (onDisk?.rootId === lease.rootId) {
+      if (olderBridgeIncarnation(lease, onDisk)) return;
+      // A pending same-token effect may predate the disk's age floor even when it still
+      // matches the held row. Leave that authority intact for recovery's recomputation.
+      if (bridgeIncarnationWithFloor(lease, [onDisk]).startedAt !== incarnationOf(lease).startedAt) return;
+    }
     // A replayed row never shortens a lease that a later pass already renewed.
     const sameIncarnation = onDisk && onDisk.startedAt === lease.startedAt && onDisk.identityId === lease.identityId &&
       onDisk.rootId === lease.rootId && onDisk.incarnationToken === lease.incarnationToken;

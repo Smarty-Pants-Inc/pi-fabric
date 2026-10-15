@@ -133,7 +133,9 @@ export const connectJetStream = async (servers: string[], options: ConnectJetStr
         throw new MeshStateNatsBusyError(`stream ${stream} had no elected leader after ${STREAM_LEADER_TIMEOUT_MS}ms`);
       }
       if (outcome.kind === "error") {
-        if (!isTransientReadError(outcome.error)) throw outcome.error;
+        // The stream was created or observed already; INFO can briefly miss it while cluster state catches up.
+        // Only this readiness wait treats 10059 as not ready: ordinary reads must still report a missing stream.
+        if (apiCode(outcome.error) !== STREAM_NOT_FOUND && !isTransientReadError(outcome.error)) throw outcome.error;
       } else {
         info = outcome.value;
         if (Date.now() < deadline && info.cluster?.leader) return info;

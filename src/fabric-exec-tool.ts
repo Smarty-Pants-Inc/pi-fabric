@@ -20,7 +20,6 @@ import {
 import { fabricExecTitleHintCached } from "./ui/fabric-title-hint.js";
 import { Type } from "typebox";
 import { queueHandoffFailureContinuation } from "./agents/handoff-continuation.js";
-import { AgentSpawnForbiddenError } from "./agents/spawn-authority.js";
 import {
   createFabricPersistedExecutionDetails,
   readFabricExecutionRenderDetails,
@@ -94,25 +93,6 @@ import { countNewlines } from "./util.js";
 
 const RESULT_FORMATS = ["auto", "yaml", "json", "text"] as const;
 const MAX_FABRIC_CODE_TRANSFER_LINES = 12;
-
-const isUnhandledAgentSpawnRefusal = (error: string | undefined): boolean => {
-  if (error === undefined) return false;
-  try {
-    // QuickJS formatValue JSON-serializes context.dump(terminal Error): its
-    // canonical wrapper carries name/message/stack, but custom code metadata
-    // need not survive the dump. Require the exact refusal name AND canonical
-    // message plus the host audit below, rejecting a conflicting code if present.
-    // Never search prose, stacks, logs or causes, or guess other runtime formats.
-    const terminal: unknown = JSON.parse(error);
-    if (terminal === null || typeof terminal !== "object" || Array.isArray(terminal)) return false;
-    const refusal = new AgentSpawnForbiddenError();
-    return "name" in terminal && terminal.name === refusal.name &&
-      "message" in terminal && terminal.message === refusal.message &&
-      (!("code" in terminal) || terminal.code === refusal.code);
-  } catch {
-    return false;
-  }
-};
 
 type FabricRendererState = {
   fabricKernel?: "typescript" | "python";
@@ -981,15 +961,15 @@ export const createFabricExecTool = (
           );
         }
       } else if (!signal?.aborted && result.success === false && result.trace.outcome === "failed" &&
-        isUnhandledAgentSpawnRefusal(result.error) && result.audits.some(audit =>
+        !result.residentOutcomes?.length && result.terminalAgentSpawnRefusal?.ref === "agents.handoff" && result.audits.some(audit =>
         audit.ref === "agents.handoff" && audit.success === false &&
         audit.errorCode === "FABRIC_AGENT_SPAWN_FORBIDDEN",
       ) && queueHandoffFailureContinuation(state.pi, context, { status: "failed" }, "steer")) {
         // Refusal happens before deferHandoff, so there is no boundary runner
         // to queue the seeded executor's one direct-work fallback. Keep the
         // refusal authoritative and never retry or grant spawn authority.
-        // A caught refusal (even followed by an unrelated failure), or a
-        // cancelled/timed-out outer run, must not create another implementation turn.
+        // Only the exact host-injected terminal object qualifies. Caught then
+        // replaced/copied refusals and cancelled/timed-out runs cannot continue.
         // Steer at the next tool-loop turn: unlike a terminating deferred
         // boundary, this path still owes an ordinary inference after its result.
         state.prewalk.cancel();

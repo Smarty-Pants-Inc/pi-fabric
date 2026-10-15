@@ -8,9 +8,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Agent } from "@earendil-works/pi-agent-core";
 import { createAssistantMessageEventStream, type AssistantMessage, type Model } from "@earendil-works/pi-ai";
 import type { AgentToolResultMessage } from "../src/agents/types.js";
-import type { FabricExecutionResult } from "../src/execution-service.js";
+import { FabricExecutionService, type FabricExecutionResult } from "../src/execution-service.js";
+import { ActionRegistry } from "../src/core/action-registry.js";
 import { AgentSpawnForbiddenError } from "../src/agents/spawn-authority.js";
 import { QuickJsRuntime } from "../src/runtime/quickjs-runtime.js";
+import { registerCancellationEffect } from "../src/async-settlement.js";
 import { PrewalkController } from "../src/prewalk/controller.js";
 import { CompactController } from "../src/core/compact-controller.js";
 import { normalizeFabricConfig } from "../src/config.js";
@@ -325,6 +327,58 @@ describe("trajectory executor handoff failure continuation", () => {
     return { ctx, session, ext, controller, invoke };
   };
 
+  it("clears terminal origin when host settlement replaces the error with identical text", async () => {
+    const result = await new QuickJsRuntime().execute(
+      'await tools.progress({ message: "settlement" }); await agents.handoff({});',
+      async (ref, _args, signal) => {
+        if (ref === "fabric.$progress") {
+          registerCancellationEffect(signal, reason => new Error(reason.message));
+          return null;
+        }
+        throw new AgentSpawnForbiddenError();
+      },
+      { timeoutMs: 5_000, memoryLimitBytes: 32 * 1024 * 1024 },
+    );
+    expect(result.terminationReason).toBe("runtime_error");
+    expect(JSON.parse(result.error!)).toMatchObject({ name: "AgentSpawnForbiddenError" });
+    expect(result.terminalAgentSpawnRefusal).toBeUndefined();
+  });
+
+  it.each([
+    ["genuine refusal", 'await agents.handoff({ model: "provider/executor" });', true],
+    ["canonical-copy error", 'try { await agents.handoff({ model: "provider/executor" }); } catch (error) { const refusal = error as Error; const copy = new Error(refusal.message); copy.name = refusal.name; throw copy; }', false],
+  ] as const)("real execution service forwards only terminal origin: %s", async (_name, code, genuine) => {
+    const registry = new ActionRegistry();
+    const descriptor = {
+      name: "handoff", description: "refuse nested handoff",
+      inputSchema: {
+        type: "object", properties: { model: { type: "string" } },
+        required: ["model"], additionalProperties: false,
+      },
+      risk: "agent" as const,
+    };
+    registry.register({
+      name: "agents", description: "agents",
+      async list() { return [descriptor]; },
+      async describe(name) { return name === "handoff" ? descriptor : undefined; },
+      async invoke() { throw new AgentSpawnForbiddenError(); },
+    });
+    const config = normalizeFabricConfig({});
+    config.approvals.agent = "allow";
+    const result = await new FabricExecutionService(registry, config).execute({
+      code, signal: undefined, parentToolCallId: "terminal-refusal-service",
+      context: { cwd: process.cwd(), hasUI: false } as ExtensionContext,
+      onPartial() {},
+    });
+    expect(result.typeErrors).toBeUndefined();
+    expect(result.success).toBe(false);
+    expect(result.trace.outcome).toBe("failed");
+    expect(result.audits).toContainEqual(expect.objectContaining({
+      ref: "agents.handoff", success: false, errorCode: "FABRIC_AGENT_SPAWN_FORBIDDEN",
+    }));
+    expect(result.terminalAgentSpawnRefusal).toEqual(genuine ? { ref: "agents.handoff" } : undefined);
+  });
+
   const earlyRefusal = (adjust?: (run: FabricExecutionResult) => void) => {
     const h = prepare();
     const runs: FabricExecutionResult[] = [];
@@ -333,9 +387,15 @@ describe("trajectory executor handoff failure continuation", () => {
       ensure: async () => {},
       execution: { execute: async ({ code }: { code: string }) => {
         const audits: FabricExecutionResult["audits"] = [];
-        // Exercise the actual host-error bridge and final QuickJS serialization,
-        // including guest catch/rethrow behavior; do not fabricate matching logs.
+        // Exercise actual QuickJS object identity, including guest catch/rethrow
+        // and later host calls; never reconstruct classification from error text.
         const sandbox = await new QuickJsRuntime().execute(code, async ref => {
+          if (ref === "fabric.$progress" || ref === "fabric.$describe") {
+            const success = ref === "fabric.$progress";
+            audits.push({ ref, nestedToolCallId: `later-${audits.length}`, startedAt: 2, success });
+            if (!success) throw new Error("later unrelated host failure");
+            return null;
+          }
           if (ref !== "agents.handoff" && ref !== "agents.spawn") throw new Error(`Unexpected call: ${ref}`);
           const error = new AgentSpawnForbiddenError();
           audits.push({ ref, nestedToolCallId: `refused-${audits.length}`, startedAt: 1,
@@ -347,6 +407,8 @@ describe("trajectory executor handoff failure continuation", () => {
         run.value = sandbox.value;
         run.logs = sandbox.logs;
         if (sandbox.error !== undefined) run.error = sandbox.error;
+        if (sandbox.terminalAgentSpawnRefusal) run.terminalAgentSpawnRefusal = sandbox.terminalAgentSpawnRefusal;
+        if (sandbox.residentOutcomes) run.residentOutcomes = sandbox.residentOutcomes;
         run.audits = audits;
         run.trace = { ...run.trace, outcome: sandbox.terminationReason === "completed" ? "succeeded"
           : sandbox.terminationReason === "runtime_error" ? "failed" : sandbox.terminationReason };
@@ -366,6 +428,13 @@ describe("trajectory executor handoff failure continuation", () => {
   it.each([
     ["uncaught refusal", "await agents.handoff({});", true],
     ["rethrow of the typed refusal", "try { await agents.handoff({}); } catch (error) { throw error; }", true],
+    ["same refusal after later successful and failed host calls", "try { await agents.handoff({}); } catch (error) { await tools.progress({ message: 'later' }); try { await tools.describe({ ref: 'unrelated' }); } catch {} throw error; }", true],
+    ["same refusal with mutated public fields", "try { await agents.handoff({}); } catch (error) { error.name = 'Changed'; error.message = 'changed'; error.code = 'UNRELATED_FAILURE'; throw error; }", true],
+    ["exact canonical name and message on a new Error", "try { await agents.handoff({}); } catch (error) { const copy = new Error(error.message); copy.name = error.name; throw copy; }", false],
+    ["exact public fields including code and stack on a new Error", "try { await agents.handoff({}); } catch (error) { const copy = new Error(error.message); copy.name = error.name; copy.code = error.code; copy.stack = error.stack; throw copy; }", false],
+    ["plain object copying every public refusal field", "try { await agents.handoff({}); } catch (error) { throw { name: error.name, message: error.message, code: error.code, stack: error.stack }; }", false],
+    ["string wrapper copying every public refusal field", "try { await agents.handoff({}); } catch (error) { throw JSON.stringify({ name: error.name, message: error.message, code: error.code, stack: error.stack }); }", false],
+    ["later unrelated host error after capturing refusal", "try { await agents.handoff({}); } catch (error) { await tools.progress({ message: 'later' }); await tools.describe({ ref: 'unrelated' }); throw error; }", false],
     ["caught refusal then success", "try { await agents.handoff({}); } catch {} return 1;", false],
     ["caught refusal then unrelated error", "try { await agents.handoff({}); } catch {} throw new Error('unrelated');", false],
     ["refusal mentioned only in unrelated error prose", "try { await agents.handoff({}); } catch {} throw new Error('AgentSpawnForbiddenError FABRIC_AGENT_SPAWN_FORBIDDEN');", false],
@@ -378,11 +447,9 @@ describe("trajectory executor handoff failure continuation", () => {
     const h = earlyRefusal();
     h.controller.arm({ mode: "trajectory", model: "anthropic/executor", sessionId: "session-1" });
     await h.tool.execute("early-refusal", { code }, undefined, undefined, h.ctx);
-    expect(h.runs[0]!.audits).toHaveLength(1);
+    expect(h.runs[0]!.audits.filter(audit => audit.ref === "agents.handoff" || audit.ref === "agents.spawn")).toHaveLength(1);
     if (recover) {
-      // Pin the actual runtime envelope consumed by the exact terminal decoder.
-      const refusal = new AgentSpawnForbiddenError();
-      expect(JSON.parse(h.runs[0]!.error!)).toMatchObject({ name: refusal.name, message: refusal.message });
+      expect(h.runs[0]!.terminalAgentSpawnRefusal).toEqual({ ref: "agents.handoff" });
       expect(h.ext.sendMessage).toHaveBeenCalledTimes(1);
       expect(h.ext.sendMessage.mock.calls[0]![1]).toEqual({ deliverAs: "steer", triggerTurn: true });
       expect(h.controller.status().state).toBe("idle");
@@ -390,19 +457,20 @@ describe("trajectory executor handoff failure continuation", () => {
       expect(h.ext.sendMessage).toHaveBeenCalledTimes(1);
       expect(h.ext.value.appendEntry).toHaveBeenCalledTimes(1);
     } else {
+      expect(h.runs[0]!.terminalAgentSpawnRefusal).toEqual(
+        _name === "spawn refusal without a handoff audit" ? { ref: "agents.spawn" } : undefined,
+      );
       expect(h.ext.sendMessage).not.toHaveBeenCalled();
       expect(h.ext.value.appendEntry).not.toHaveBeenCalled();
       expect(h.controller.status().state).toBe("armed");
     }
   });
 
-  it("rejects a conflicting code in the structured final refusal wrapper", async () => {
-    const h = earlyRefusal(run => {
-      run.error = JSON.stringify({ ...JSON.parse(run.error!), code: "UNRELATED_FAILURE" });
-    });
-    await h.tool.execute("conflicting-refusal", { code: "await agents.handoff({});" }, undefined, undefined, h.ctx);
-    expect(h.ext.sendMessage).not.toHaveBeenCalled();
-    expect(h.ext.value.appendEntry).not.toHaveBeenCalled();
+  it("keeps host terminal classification when serialized error text is replaced", async () => {
+    const h = earlyRefusal(run => { run.error = "unrelated mutable serialized text"; });
+    await h.tool.execute("changed-refusal-text", { code: "await agents.handoff({});" }, undefined, undefined, h.ctx);
+    expect(h.ext.sendMessage).toHaveBeenCalledOnce();
+    expect(h.ext.value.appendEntry).toHaveBeenCalledOnce();
   });
 
   it.each(["failed", "succeeded", "aborted", "timed_out", "signal-aborted", "inconsistent-success"] as const)(

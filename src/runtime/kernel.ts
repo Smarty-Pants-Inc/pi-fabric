@@ -28,6 +28,8 @@ export interface FabricSandboxResult {
   emitted?: unknown[];
   terminationReason: FabricSandboxTerminationReason;
   error?: string;
+  /** Host-only: terminal rejection is the exact guest object injected for this refusal. */
+  terminalAgentSpawnRefusal?: { readonly ref: "agents.handoff" | "agents.spawn" };
   /** Host-side reconciliation data, independent of verbose guest error prose. */
   residentOutcomes?: FabricResidentOutcomeReceipt[];
   /** Host-only deadline cause. Guest error text is never a ceiling identity. */

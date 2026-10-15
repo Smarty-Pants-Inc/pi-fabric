@@ -1,5 +1,5 @@
 import releaseSyncVariant from "@jitl/quickjs-singlefile-mjs-release-sync";
-import { newQuickJSWASMModuleFromVariant } from "quickjs-emscripten-core";
+import { newQuickJSWASMModuleFromVariant, type QuickJSHandle } from "quickjs-emscripten-core";
 import ts from "typescript";
 import { ExecutionDeadline } from "./execution-deadline.js";
 import { MESH_INCARNATION_PENDING_CODE, MESH_LOCK_TIMEOUT_CODE, MESH_SNAPSHOT_RETRIES_EXHAUSTED_CODE } from "../core/atomic-write.js";
@@ -8,6 +8,7 @@ import { cancellationError, preserveCancellationOutcome, runAbortable, settleWit
 import { piBashExitMetadata } from "../core/pi-bash-error.js";
 import { FabricModelDeniedError } from "../core/model-policy.js";
 import { FabricTargetTerminalError } from "../agents/terminal-target.js";
+import { AgentSpawnForbiddenError } from "../agents/spawn-authority.js";
 import { JevTransientHttpError } from "../jev/validation.js";
 import { PI_ARGUMENT_NORMALIZATION_SOURCE } from "../core/pi-arguments.js";
 import { PI_CORE_TOOL_NAMES } from "../core/pi-tools.js";
@@ -1045,6 +1046,12 @@ export class QuickJsRuntime {
     const maxLogChars = options.maxLogChars ?? 100_000;
     let logChars = 0;
     let logsTruncated = false;
+    // Nonces and retained handles never enter the guest. Public error fields
+    // are mutable/copyable; only native SameValue proves terminal origin.
+    const spawnRefusals = new Map<symbol, {
+      ref: "agents.handoff" | "agents.spawn";
+      errorHandle: QuickJSHandle;
+    }>();
     const pendingHostPromises = new Set<any>();
     const hostTasks = new Set<Promise<void>>();
     const pendingTimers = new Set<NodeJS.Timeout>();
@@ -1249,6 +1256,10 @@ export class QuickJsRuntime {
                     field.dispose();
                   }
                 }
+                const ref = reference === "fabric.$call" ? args.ref : reference;
+                if (error instanceof AgentSpawnForbiddenError && (ref === "agents.handoff" || ref === "agents.spawn")) {
+                  spawnRefusals.set(Symbol(), { ref, errorHandle: errorHandle.dup() });
+                }
                 promise.reject(errorHandle);
               } finally {
                 errorHandle.dispose();
@@ -1391,6 +1402,9 @@ export class QuickJsRuntime {
       if (resolution.error) {
         const deadlineExceeded = timedOut || interruptedByCpu || deadlineReached();
         if (deadlineExceeded) timedOut = true;
+        const refusal = !options.signal?.aborted && !deadlineExceeded
+          ? [...spawnRefusals.values()].find(entry => context.sameValue(entry.errorHandle, resolution.error))
+          : undefined;
         const error = options.signal?.aborted
           ? cancellationMessage("Execution cancelled")
           : deadlineExceeded
@@ -1405,6 +1419,7 @@ export class QuickJsRuntime {
           value: undefined,
           logs,
           emitted,
+          ...(refusal ? { terminalAgentSpawnRefusal: { ref: refusal.ref } } : {}),
           terminationReason: options.signal?.aborted
             ? "aborted"
             : deadlineExceeded
@@ -1495,10 +1510,21 @@ export class QuickJsRuntime {
       }
       // A guest can finish or swallow a rejection before an unawaited host
       // mutation settles. Teardown still owes the caller every committed ID.
-      if (executionResult) preserveCancellationOutcome(executionResult, hostAbortController.signal, hostAbortController.signal.aborted || unawaitedHostCalls);
+      if (executionResult) {
+        const priorError = executionResult.error;
+        const priorReason = executionResult.terminationReason;
+        preserveCancellationOutcome(executionResult, hostAbortController.signal, hostAbortController.signal.aborted || unawaitedHostCalls);
+        if (timedOut || cancelled || options.signal?.aborted || unawaitedHostCalls ||
+          executionResult.residentOutcomes?.length || executionResult.error !== priorError ||
+          executionResult.terminationReason !== priorReason) {
+          delete executionResult.terminalAgentSpawnRefusal;
+        }
+      }
       if (activePromiseHandle?.alive !== false) activePromiseHandle?.dispose();
       if (executionGate?.alive !== false) executionGate?.dispose();
       pumpJobs();
+      for (const refusal of spawnRefusals.values()) refusal.errorHandle.dispose();
+      spawnRefusals.clear();
       jsonParse.dispose();
       jsonObject.dispose();
       disposeQuickJsContext(context);

@@ -57,7 +57,7 @@ const participant: FabricParticipantRecord = {
 const presence = { hosts: [{ record: host, expiresAt: host.expiresAt }], participants: [participant] };
 const oldLease = {
   id: identity.id, rootId: identity.id, identityId: identity.id, startedAt: host.startedAt,
-  incarnationToken: host.incarnationToken, updatedAt: NOW, expiresAt: host.expiresAt,
+  incarnationToken: host.incarnationToken!, updatedAt: NOW, expiresAt: host.expiresAt,
 };
 // Tokens identify owners, not order; the newer owner's token sorts before its predecessor's.
 const newerLease = { ...oldLease, startedAt: host.startedAt + 1_000, incarnationToken: "opaque-a-successor" };

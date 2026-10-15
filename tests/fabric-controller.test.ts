@@ -9,6 +9,7 @@ import { FabricActivityStore } from "../src/activity/store.js";
 import type { FabricState } from "../src/fabric-state.js";
 import { FabricUiController } from "../src/ui/controller.js";
 import { MeshStore } from "../src/mesh/store.js";
+import { configureFabricDiagnostics, fabricDiagnosticsFile, flushFabricDiagnostics } from "../src/core/diagnostics.js";
 import { readParticipantFiles } from "../src/topology/participant-files.js";
 import { hostLiveness, readHostLeases, writeHostLease } from "../src/topology/host-leases.js";
 import type { FabricDashboard } from "../src/ui/dashboard.js";
@@ -519,7 +520,29 @@ describe("FabricUiController dashboard wiring", () => {
     }
   });
 
+  it("logs dashboard refresh failures instead of notifying a principal", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "principal-dashboard-diagnostics-"));
+    vi.stubEnv("SMARTY_ROLE", "org-agent@x");
+    vi.stubEnv("PI_CODING_AGENT_DIR", root);
+    configureFabricDiagnostics("dashboard-principal");
+    const state = stubState();
+    vi.mocked(state.activity.runs).mockImplementation(() => { throw new Error("corrupt activity state"); });
+    const notify = vi.fn();
+    const context = { mode: "tui", sessionManager: { getSessionId: () => "dashboard-principal" },
+      ui: { setWidget: vi.fn(), notify } } as unknown as ExtensionContext;
+    const controller = new FabricUiController(state);
+    try {
+      controller.start(context);
+      await flushFabricDiagnostics();
+      expect(notify).not.toHaveBeenCalled();
+      const lines = fs.readFileSync(fabricDiagnosticsFile("dashboard-principal"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+      expect(lines).toContainEqual(expect.objectContaining({ source: "src/ui/controller.ts", level: "warning",
+        message: "Fabric dashboard refresh failed: corrupt activity state" }));
+    } finally { controller.stop(); vi.unstubAllEnvs(); }
+  });
+
   it("reports each dashboard refresh cause once per lifecycle while retaining the last snapshot", async () => {
+    vi.stubEnv("SMARTY_ROLE", "project-agent@x");
     vi.useFakeTimers();
     const state = stubState();
     let cause = "corrupt activity state";
@@ -563,6 +586,7 @@ describe("FabricUiController dashboard wiring", () => {
     } finally {
       controller.stop();
       vi.useRealTimers();
+      vi.unstubAllEnvs();
     }
   });
 

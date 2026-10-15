@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { diagnostics } from "../core/diagnostics.js";
 import path from "node:path";
 import { writeJsonAtomic } from "../config.js";
 import { stableJsonHash } from "../core/stable-hash.js";
@@ -204,7 +205,7 @@ export function watchComponentConfiguration(paths: readonly string[], changed: (
     const delay = Math.min(WATCH_REARM_MAX_MS, WATCH_REARM_BASE_MS * 2 ** attempts);
     if (!warned) {
       warned = true;
-      try { console.warn(watchRecoveryMessage(paths.join(", "), error, delay)); } catch {}
+      try { diagnostics.warn("src/components/configuration.ts", watchRecoveryMessage(paths.join(", "), error, delay)); } catch {}
     }
     check(); // one rescan
     if (rearmTimer) return;

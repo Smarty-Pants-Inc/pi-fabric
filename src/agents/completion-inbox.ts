@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { diagnostics, notifyDiagnostic } from "../core/diagnostics.js";
 import { ChildCompletionClaimLostError } from "../result-consumption.js";
 import { syncPathNamespace } from "../core/atomic-write.js";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -133,7 +134,9 @@ export class AgentCompletionInbox {
     if (this.#context.hasUI) {
       const failure = result.status !== "completed";
       const detail = failure && result.error ? `: ${oneLine(result.error).slice(0, 180)}` : "";
-      this.#context.ui.notify(`Agent ${oneLine(result.name).slice(0, 80)} ${result.status}${detail}`, failure ? "warning" : "info");
+      const message = `Agent ${oneLine(result.name).slice(0, 80)} ${result.status}${detail}`;
+      if (failure) notifyDiagnostic(this.#context, "src/agents/completion-inbox.ts", message, "warning");
+      else this.#context.ui.notify(message, "info");
     }
     this.#schedule();
   }
@@ -196,7 +199,7 @@ export class AgentCompletionInbox {
       this.#receiptFault = undefined;
     } catch (error) {
       const diagnostic = `Fabric completion carrier remains unconfirmed: ${String(error).slice(0, 1000)}`;
-      if (diagnostic !== this.#receiptFault) console.warn(diagnostic);
+      if (diagnostic !== this.#receiptFault) diagnostics.warn("src/agents/completion-inbox.ts", diagnostic);
       this.#receiptFault = diagnostic;
     }
   }

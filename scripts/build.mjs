@@ -52,6 +52,10 @@ const primaryEntryPoints = [
 // path lets a session that loaded the previous index resolve delayed modules
 // after the installed package is replaced, while preserving lazy evaluation.
 const lazyEntryPoints = [
+  // Principal diagnostics load their private file sink only on the first diverted line.
+  "src/core/diagnostics-log.ts",
+  // Command registration is eager; the subcommand implementation loads on invocation.
+  "src/commands/fabric-handler.ts",
   // First-use scratch removal: a stable entry keeps the shared verifier out of the startup graph.
   "src/storage/verified-remove.ts",
   // The resident's first operator cleanup reuses the offline final-check helper (smarty-dev#8090).

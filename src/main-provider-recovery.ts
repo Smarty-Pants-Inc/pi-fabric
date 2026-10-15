@@ -1,4 +1,5 @@
 import type { AssistantMessage } from "@earendil-works/pi-ai";
+import { notifyDiagnostic } from "./core/diagnostics.js";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { resolveFabricIdentity, sendFabricMessage } from "./fabric-provenance.js";
 import { extensionContextLive } from "./session-liveness.js";
@@ -72,7 +73,7 @@ export const registerMainProviderRecovery = (pi: ExtensionAPI, options: {
       context.ui.notify(message, "error");
       try { await options.report(message, context); }
       catch (error) {
-        if (live()) context.ui.notify(`Provider error report delivery failed: ${String(error)}`, "error");
+        if (live()) notifyDiagnostic(context, "src/main-provider-recovery.ts", `Provider error report delivery failed: ${String(error)}`, "error");
       }
       return;
     }

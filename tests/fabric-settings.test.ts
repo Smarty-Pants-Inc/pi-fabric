@@ -47,6 +47,18 @@ const buildItems = (keepVisibleCandidates: string[] = ["fabric_exec"]) =>
   });
 
 describe("FabricSettingsComponent", () => {
+  it.each(["org-agent@x", "project-agent@x"])("keeps a typed settings command response visible for %s", async role => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "principal-settings-response-"));
+    vi.stubEnv("SMARTY_ROLE", role); vi.stubEnv("PI_CODING_AGENT_DIR", path.join(root, "agent"));
+    const notify = vi.fn();
+    const state = { config: structuredClone(DEFAULT_FABRIC_CONFIG), ensure: async () => liveLease } as unknown as FabricState;
+    const context = { mode: "print", cwd: root, isProjectTrusted: () => false, ui: { notify } } as unknown as ExtensionContext;
+    try {
+      await openFabricSettings(context, { state, applyFabricMode() {}, capturedTools: { list: () => [] } as unknown as CapturedToolCatalog });
+      expect(notify).toHaveBeenCalledExactlyOnceWith("Fabric settings require an interactive UI", "warning");
+    } finally { vi.unstubAllEnvs(); }
+  });
+
   it("populates Claude models asynchronously without requiring startup discovery", async () => {
     const source: ModelSource = {
       models: [{ provider: "claude", id: "configured" }],

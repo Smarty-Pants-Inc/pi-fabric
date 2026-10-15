@@ -1,3 +1,4 @@
+import { diagnostics } from "../core/diagnostics.js";
 import { execFile, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
@@ -263,7 +264,7 @@ export const routeAgentCreation = async (options: {
     await writeDecision(dir, `${JSON.stringify(decision)}\n`);
   } catch {
     // A read-only/full mesh must not change launch selection or fail the spawn.
-    console.warn("[pi-fabric] spawn router decision log unavailable");
+    diagnostics.warn("src/agents/spawn-router.ts", "[pi-fabric] spawn router decision log unavailable");
   }
   return selected;
 };

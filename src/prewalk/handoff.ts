@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { FabricModelDeniedError } from "../core/model-policy.js";
+import { notifyDiagnostic } from "../core/diagnostics.js";
 import { sendFabricMessage } from "../fabric-provenance.js";
 import type {
   ExtensionAPI,
@@ -375,7 +376,7 @@ const runInPlacePrewalk = async (
   }
 
   controller.beginContinuation(continuationId, returnModelKey, continuationMessage);
-  context.ui.notify(
+  notifyDiagnostic(context, "src/prewalk/handoff.ts",
     `Prewalk is continuing in Main with ${modelKey}, then returning to ${returnModelKey}.`,
     "info",
   );

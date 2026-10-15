@@ -21,6 +21,7 @@ import type { ModelSource } from "./model-picker.js";
 import { createDashboardSnapshot } from "./snapshot.js";
 import { safeText } from "./format.js";
 import { extensionContextLive } from "../session-liveness.js";
+import { notifyDiagnostic } from "../core/diagnostics.js";
 import { isActiveStatus, type FabricDashboardSnapshot, type FabricUiActor, type FabricUiAgent } from "./types.js";
 import { FabricWidget, isFabricWidgetStreaming, shouldShowFabricWidget } from "./widget.js";
 import { FabricWidgetRetention } from "./retention.js";
@@ -732,8 +733,10 @@ export class FabricUiController {
     if (this.#reportedRefreshErrors.has(message)) return;
     this.#reportedRefreshErrors.add(message);
     // A host UI can already be disposed. Error reporting must not escape a timer either.
-    try { this.#context?.ui.notify(`Fabric dashboard refresh failed: ${message}`, "warning"); }
-    catch { /* stale UI; the lifecycle cleanup owns it */ }
+    try {
+      const context = this.#context;
+      if (context) notifyDiagnostic(context, "src/ui/controller.ts", `Fabric dashboard refresh failed: ${message}`, "warning");
+    } catch { /* stale UI; the lifecycle cleanup owns it */ }
   }
 
   #agentTranscriptSource(agent: FabricUiAgent): FabricTranscriptSource {

@@ -1,3 +1,4 @@
+import { diagnostics } from "../core/diagnostics.js";
 import fs from "node:fs";
 import path from "node:path";
 import { syncDirectoryChain } from "../core/atomic-write.js";
@@ -106,7 +107,7 @@ export class ActorLogStore {
     const anchor = actorsAt > 0 ? sessionDirectory.slice(0, actorsAt) : sessionDirectory;
     try { held = openPrivateDir(dest, anchor); }
     catch (error) {
-      console.warn(`[pi-fabric] actor run ${runId} not archived: ${(error as Error).message}`);
+      diagnostics.warn("src/actors/log-store.ts", `[pi-fabric] actor run ${runId} not archived: ${(error as Error).message}`);
       return;
     }
     try {
@@ -131,8 +132,8 @@ export class ActorLogStore {
         const src = path.join(runDirectory, file);
         if (!fs.existsSync(src)) continue;
         try {
-          if (!writeArchiveFile(held, file, { source: src })) console.warn(`[pi-fabric] actor run ${runId}: archive entry ${file} exists and is not our regular file; not written`);
-        } catch (error) { console.warn(`[pi-fabric] actor run ${runId}: archive entry ${file} not written: ${(error as Error).message}`); }
+          if (!writeArchiveFile(held, file, { source: src })) diagnostics.warn("src/actors/log-store.ts", `[pi-fabric] actor run ${runId}: archive entry ${file} exists and is not our regular file; not written`);
+        } catch (error) { diagnostics.warn("src/actors/log-store.ts", `[pi-fabric] actor run ${runId}: archive entry ${file} not written: ${(error as Error).message}`); }
       }
       const nested = path.join(runDirectory, "nested");
       if (fs.existsSync(nested)) {
@@ -146,7 +147,7 @@ export class ActorLogStore {
           // the archive itself (smarty-dev#9016), each through its own O_NOFOLLOW fd. Files keep their modes.
           if (process.platform !== "win32") closeDirectories(path.join(held.path, "nested"));
         } catch (error) {
-          if ((error as NodeJS.ErrnoException).code === "EEXIST") console.warn(`[pi-fabric] actor run ${runId}: archive nested/ exists; not copied again`);
+          if ((error as NodeJS.ErrnoException).code === "EEXIST") diagnostics.warn("src/actors/log-store.ts", `[pi-fabric] actor run ${runId}: archive nested/ exists; not copied again`);
           /* otherwise best-effort recursive run retention */
         }
       }

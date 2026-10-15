@@ -1,4 +1,8 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { fabricDiagnosticsFile, flushFabricDiagnostics } from "../src/core/diagnostics.js";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { sendFabricMessage } from "../src/fabric-provenance.js";
 import { registerMainProviderRecovery } from "../src/main-provider-recovery.js";
@@ -46,6 +50,32 @@ beforeEach(() => { vi.useFakeTimers(); vi.clearAllMocks(); });
 afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); });
 
 describe("Main provider recovery waiting for settlement compaction", () => {
+  it.each(["org-agent@x", "project-agent@x"])("keeps the principal's own failed-turn report visible for %s", async role => {
+    vi.stubEnv("SMARTY_ROLE", role);
+    try {
+      const h = harness(); h.idle();
+      await h.emit("agent_settled"); await vi.advanceTimersByTimeAsync(1_000);
+      await h.emit("agent_start"); await h.emit("agent_settled");
+      expect(h.context.ui.notify).toHaveBeenCalledExactlyOnceWith("BLOCKED: provider error: unclassified", "error");
+    } finally { vi.unstubAllEnvs(); }
+  });
+
+  it("logs a failed background report without hiding the principal's own-turn error", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "principal-provider-diagnostics-"));
+    vi.stubEnv("SMARTY_ROLE", "org-agent@x"); vi.stubEnv("PI_CODING_AGENT_DIR", root);
+    try {
+      const h = harness(); h.idle();
+      h.report.mockRejectedValue(new Error("report transport unavailable"));
+      await h.emit("agent_settled"); await vi.advanceTimersByTimeAsync(1_000);
+      await h.emit("agent_start"); await h.emit("agent_settled");
+      expect(h.context.ui.notify).toHaveBeenCalledExactlyOnceWith("BLOCKED: provider error: unclassified", "error");
+      await flushFabricDiagnostics();
+      const lines = fs.readFileSync(fabricDiagnosticsFile("main"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+      expect(lines).toContainEqual(expect.objectContaining({ level: "error", source: "src/main-provider-recovery.ts",
+        message: expect.stringContaining("report transport unavailable") }));
+    } finally { vi.unstubAllEnvs(); }
+  });
+
   it("a successor session_start gets its own retry budget", async () => {
     const h = harness(); h.idle();
     await h.emit("agent_settled");

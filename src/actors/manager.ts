@@ -1,5 +1,6 @@
 import { appendDeliveryOutcome, deliverySend, type DeliverySend, type DeliveryOutcome, type DeliveryOutcomeRecord } from "../mesh/delivery-outcomes.js";
 import { childProcessEnvironment } from "../core/atomic-write.js";
+import { diagnostics } from "../core/diagnostics.js";
 import { copyFabricProvenance, fabricTurnProvenance, fabricWakeCause, type FabricTurnProvenance, type FabricPrincipal } from "../fabric-provenance.js";
 import type { ImageContent } from "@earendil-works/pi-ai";
 import { formatAge } from "../residency/protocol.js";
@@ -3528,7 +3529,7 @@ export class ActorManager {
     this.#registry.releaseReadCache();
     // Fenced like every whole-tree delete (smarty-dev#8090); without the fence the tree is kept, shutdown goes on.
     await deleteRootActorTree(this.mesh.root, this.#rootId, () => fs.rmSync(this.#actorRoot, { recursive: true, force: true }))
-      .catch(error => console.warn(`[pi-fabric] actor root ${this.#actorRoot} kept: ${errorText(error)}`));
+      .catch(error => diagnostics.warn("src/actors/manager.ts", `[pi-fabric] actor root ${this.#actorRoot} kept: ${errorText(error)}`));
   }
 
   /**
@@ -3542,16 +3543,16 @@ export class ActorManager {
     for (let failures = 1; ; failures++) {
       try {
         await this.#saveActors();
-        if (failures > 1) console.warn(`[pi-fabric] actor registry save at close committed after ${failures - 1} failed attempt(s)`);
+        if (failures > 1) diagnostics.warn("src/actors/manager.ts", `[pi-fabric] actor registry save at close committed after ${failures - 1} failed attempt(s)`);
         return;
       } catch (error) {
         if (!isRetryableRegistrySave(error)) throw error;
         const wait = registrySaveRetryMs(failures);
         if (Date.now() + wait >= deadline) {
-          console.warn(`[pi-fabric] actor registry save at close not committed; keeping the last committed registry: ${errorText(error)}`);
+          diagnostics.warn("src/actors/manager.ts", `[pi-fabric] actor registry save at close not committed; keeping the last committed registry: ${errorText(error)}`);
           return;
         }
-        if (failures === 1) console.warn(`[pi-fabric] actor registry save at close failed; retrying: ${errorText(error)}`);
+        if (failures === 1) diagnostics.warn("src/actors/manager.ts", `[pi-fabric] actor registry save at close failed; retrying: ${errorText(error)}`);
         await new Promise((resolve) => setTimeout(resolve, wait));
       }
     }
@@ -4382,7 +4383,7 @@ export class ActorManager {
             if (!enodevDelivered) {
               // Parked after a pause, never re-run at once: a failing disk must not spin the drain.
               const reason = `Fabric actor ${actor.name} (${actor.id}): its recovered answer's delivery receipt could not be written`;
-              console.warn(`[pi-fabric] ${reason} (smarty-dev#8935)`);
+              diagnostics.warn("src/actors/manager.ts", `[pi-fabric] ${reason} (smarty-dev#8935)`);
               await new Promise(resolve => setTimeout(resolve, ENODEV_RECEIPT_RETRY_MS));
               this.#park(actor, [item], reason);
               this.#scheduleRestoreParked();
@@ -5685,7 +5686,7 @@ export class ActorManager {
   #alarmSweepLock(meshRoot: string, reason: string): void {
     if (this.#sweepLockAlarmed) return;
     this.#sweepLockAlarmed = true;
-    console.warn(`[pi-fabric] mesh retention sweep skipped: its lock state is uncertain (${reason})`);
+    diagnostics.warn("src/actors/manager.ts", `[pi-fabric] mesh retention sweep skipped: its lock state is uncertain (${reason})`);
     void this.mesh.publish({ topic: FABRIC_RETENTION_SWEEP_LOCK_ALARM_TOPIC, kind: "retention-sweep-lock-uncertain", from: this.identity,
       data: { meshRoot, reason } }).catch(() => undefined);
   }
@@ -6040,7 +6041,7 @@ export class ActorManager {
         actor.presenceError = diagnostic;
         this.#scheduleRegistrySave(true);
         this.#emitChange();
-        console.warn(`[pi-fabric] actor ${actor.id}: ${diagnostic}`);
+        diagnostics.warn("src/actors/manager.ts", `[pi-fabric] actor ${actor.id}: ${diagnostic}`);
       }
       return undefined;
     }
@@ -6063,7 +6064,7 @@ export class ActorManager {
         // The class or code only: a mesh error's message can carry WAL reader diagnostics (pi-fabric#893 round 4).
         if (!isMeshLockTimeout(error)) {
           const code = (error as { code?: unknown } | null)?.code;
-          console.warn(`[pi-fabric] host actor presence: ${typeof code === "string" ? code : error instanceof Error ? error.name : typeof error}`);
+          diagnostics.warn("src/actors/manager.ts", `[pi-fabric] host actor presence: ${typeof code === "string" ? code : error instanceof Error ? error.name : typeof error}`);
         }
       }
       return;
@@ -6160,7 +6161,7 @@ export class ActorManager {
         }
       })().catch(error => {
         // Keep the owned timer contained even if a non-mesh presence precondition fails.
-        console.warn(`[pi-fabric] actor presence retry failed: ${error instanceof Error ? error.message : String(error)}`);
+        diagnostics.warn("src/actors/manager.ts", `[pi-fabric] actor presence retry failed: ${error instanceof Error ? error.message : String(error)}`);
         this.#schedulePresenceRetry();
       });
     }, Math.max(1, [...this.#pendingPresence].reduce((wait, id) =>
@@ -6344,7 +6345,7 @@ export class ActorManager {
     this.#registrySaveDurable ||= durable;
     if (this.#registrySaveTimer || this.#closing) return;
     if (this.#registrySaveFailures++ === 0) {
-      console.warn(`[pi-fabric] actor registry save failed; retrying until it commits: ${errorText(error)}`);
+      diagnostics.warn("src/actors/manager.ts", `[pi-fabric] actor registry save failed; retrying until it commits: ${errorText(error)}`);
     }
     this.#lastRegistrySaveAt = Date.now();
     this.#scheduleRegistrySave(durable, registrySaveRetryMs(this.#registrySaveFailures));
@@ -6498,7 +6499,7 @@ export class ActorManager {
     if (options?.operatorRow && options.requiredActor?.removal &&
         committed.owned.includes(options.requiredActor)) options.requiredActor.removal.operator = true;
     if (this.#registrySaveFailures > 0) {
-      console.warn(`[pi-fabric] actor registry save committed after ${this.#registrySaveFailures} failed attempt(s)`);
+      diagnostics.warn("src/actors/manager.ts", `[pi-fabric] actor registry save committed after ${this.#registrySaveFailures} failed attempt(s)`);
       this.#registrySaveFailures = 0;
     }
     if (this.#registrySaveTimer) clearTimeout(this.#registrySaveTimer);
@@ -6882,7 +6883,7 @@ export class ActorManager {
         if (starts > 0) {
           const text = `actor ${actor.name} (${actor.id}): a queue file is unreadable, so its ENODEV-unconfirmed runs ` +
             `stay unsettled (start ${starts} in a row; smarty-dev#8935)`;
-          console.warn(`[pi-fabric] ${text}`);
+          diagnostics.warn("src/actors/manager.ts", `[pi-fabric] ${text}`);
           // One alarm, when the (saturating) count reaches its threshold.
           if (count.alarm) void this.mesh.publish({ topic: "ops.owner", kind: "actor.alarm", from: this.identity, to: actor.rootId,
             text, data: { actorId: actor.id, reason: "enodev-queue-unknown", starts } }).catch(() => undefined);
@@ -7960,7 +7961,7 @@ export class ActorManager {
     if (item.ownershipRefusals !== RESUMED_REFUSAL_CAP) return;
     const text = `actor ${actor.name} (${actor.id}): a resumed activation (${item.id}) was refused by ownership ` +
       `${RESUMED_REFUSAL_CAP} times before it ran; it now counts against the parked queue limit (smarty-dev#8935)`;
-    console.warn(`[pi-fabric] ${text}`);
+    diagnostics.warn("src/actors/manager.ts", `[pi-fabric] ${text}`);
     void this.mesh.publish({ topic: "ops.owner", kind: "actor.alarm", from: this.identity, to: actor.rootId,
       text, data: { actorId: actor.id, itemId: item.id, reason: "resumed-ownership-refused", refusals: RESUMED_REFUSAL_CAP } })
       .catch(() => undefined);

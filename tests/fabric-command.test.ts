@@ -39,6 +39,20 @@ describe("/fabric command", () => {
     await handler("status", context);
     expect(notify).toHaveBeenLastCalledWith(healthy, "info");
   });
+  it("preserves thrown activation errors rather than reporting them as import failures", async () => {
+    let handler!: (args: string, context: ExtensionContext) => Promise<void>;
+    const pi = { registerCommand: (_name: string, command: { handler: typeof handler }) => { handler = command.handler; } } as unknown as ExtensionAPI;
+    const failure = new Error("activation failed");
+    const state = { ensure: vi.fn().mockRejectedValue(failure) } as unknown as FabricState;
+    const notify = vi.fn();
+    registerFabricCommand(pi, {
+      state, fabricUi: {} as FabricUiController, capturedTools: {} as CapturedToolCatalog,
+      applyFabricMode: vi.fn(), suspendToolCapture: vi.fn(),
+    });
+    await expect(handler("status", { ui: { notify } } as unknown as ExtensionContext)).rejects.toBe(failure);
+    expect(notify).not.toHaveBeenCalled();
+  });
+
   it("opens the dashboard when invoked without arguments", async () => {
     let handler: ((argumentsText: string, context: ExtensionContext) => Promise<void>) | undefined;
     const pi = {

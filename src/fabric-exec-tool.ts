@@ -1,4 +1,5 @@
 import { fabricToolLoadout } from "./core/tool-ownership.js";
+import { notifyDiagnostic } from "./core/diagnostics.js";
 import type { Theme, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { TSchema } from "@earendil-works/pi-ai";
 import { Container, Text, type Component } from "@earendil-works/pi-tui";
@@ -954,7 +955,7 @@ export const createFabricExecTool = (
         // The nudge budget is spent and the arm still has no plan: the handoff
         // proceeds rather than stalling the session, and that is worth saying.
         if (pendingHandoff.readiness?.kind === "unplanned") {
-          context.ui.notify(
+          notifyDiagnostic(context, "src/fabric-exec-tool.ts",
             `Prewalk: handing off without a recorded plan after ${pendingHandoff.readiness.prompts} reminders.`,
             "warning",
           );

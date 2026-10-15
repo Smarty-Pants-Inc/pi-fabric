@@ -204,7 +204,7 @@ author-defined observational equivalence are not claimed as Bend theorems.
 
 ## Reproducible bridge
 
-The contributor toolchain pins **Bend 2.0.36**. Installed Fabric needs neither
+The contributor toolchain pins **Bend 2.0.37**. Installed Fabric needs neither
 Bend nor a Bend loader. Linux CI downloads that exact release archive and checks
 its SHA-256 before running proofs. Windows tests execute the checked-in generated
 JS and ABI; native Bend currently requires Linux, macOS, or WSL.
@@ -225,7 +225,8 @@ bun run proof:dist        # probe the actual bundled registry/compactor and kern
 `BEND_NO_TELEMETRY=1`. It never installs or updates Bend automatically.
 
 Bend's `-o *.mjs` backend emits an ES module whose default export table wraps
-every definition in Bend's own trampoline and host `Nat` (`BigInt`) marshalling.
+every definition in Bend's own trampoline and host `Nat` marshalling. Since Bend
+2.0.37 a `Nat` crosses as a plain JS number, in and out; a `BigInt` argument is refused.
 The build bridge:
 
 1. Checks the entire root proof file and its imported laws.
@@ -246,7 +247,7 @@ The build bridge:
 No algorithm is translated into handwritten JS. The small bridge, ABI
 conversions, Bend checker/compiler/Base, esbuild, and JS engine are part of the
 trusted computing base. Numeric adapters reject NaN, infinities, fractions and
-unsafe integers. Comparison-only primitives accept JS-safe integer `BigInt`s.
+unsafe integers. Comparison-only primitives accept any JS-safe integer.
 Arithmetic guards respect the pinned backend's immediate `Nat` bound of
 `2^48 - 1`; chunk/sample sums and lifecycle increments fail closed before overflow.
 Storage revisions use canonical radix-`2^32` limbs to cover the full JS-safe integer

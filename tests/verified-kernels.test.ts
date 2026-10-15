@@ -10,7 +10,7 @@ import { sampleAddressed } from "../src/compaction/bounds.js";
 
 // These are ABI/refinement checks of the emitted implementation, not substitutes
 // for the universal Bend proofs. In particular they exercise native JS numbers,
-// constructor fields, BigInts, and the adapter's actual source observations.
+// constructor fields and the adapter's actual source observations.
 describe("compiled Bend policy bridge", () => {
   // Laws prove the Boolean functions universally. These asymmetric vectors
   // distinguish ABI argument positions and output tags without truth-table grids.
@@ -87,7 +87,7 @@ describe("compiled Bend policy bridge", () => {
 
   it("checks numeric comparisons without U32 truncation and fails malformed Nat boundaries closed", () => {
     for (const count of [0, 1, 63, 64, 65, 2 ** 32, Number.MAX_SAFE_INTEGER]) {
-      expect(kernel.footprintFits(BigInt(count), 64n, true)).toBe(count <= 64);
+      expect(kernel.footprintFits(count, 64, true)).toBe(count <= 64);
       expect(acceptSummaryBounds(count, count, count, count)).toBe(true);
       expect(acceptSummaryBounds(count + 1, count, 0, 0)).toBe(false);
     }

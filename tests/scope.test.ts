@@ -481,6 +481,7 @@ describe("agent scope narrowing", () => {
       resolvePythonRuntime: () => "monty",
       resolveCwd: (cwd: string) => cwd,
       childThinkingBounds: () => ({}),
+      forwardedTraceContext: () => undefined,
       detachSignal() {},
       // Our model-policy hooks (requireReason, denied models): no policy in this fixture.
       assertExplicitModelReason() {},

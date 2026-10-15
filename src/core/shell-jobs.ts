@@ -73,9 +73,15 @@ export const formatShellHangNotice = (input: {
   elapsedMs: number;
   pid?: number;
   logPath: string;
+  /** Set once the handed-off process has already ended; `null` when it left no exit code. */
+  exitCode?: number | null;
 }): string => {
   const seconds = Math.max(1, Math.round(input.elapsedMs / 1_000));
   const pid = input.pid !== undefined ? ` (pid ${input.pid})` : "";
+  if (input.exitCode !== undefined) {
+    const exit = input.exitCode === null ? "Ended without an exit code" : `Exited with code ${input.exitCode}`;
+    return `[${exit} after ${seconds}s${pid}. Bounded output (may be truncated): ${input.logPath}]`;
+  }
   return `[Still running after ${seconds}s${pid}. Bounded live output (may be truncated): ${input.logPath}]`;
 };
 
@@ -796,6 +802,15 @@ export const raceShellHang = async <T>(options: {
       return { status: "spilled", auto };
     }
     detachParent();
+    // An immediate job is handed off however briefly it ran. On a loaded host a
+    // short command exits before the pid poll's next tick, and the caller was
+    // promised a task, not that command's foreground result or exit error. A
+    // job that never started (an error) stays in the foreground.
+    if (options.immediate && first.status === "done" && !job.finished) {
+      job.spill();
+      await job.finish(0, `\n\n[Process exited with code ${job.exitCode ?? 0}]\n`);
+      return { status: "spilled", auto: false };
+    }
     return first;
   } finally {
     if (hangTimer) clearTimeout(hangTimer);

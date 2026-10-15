@@ -39,6 +39,14 @@ describe("shell hang helpers", () => {
     })).toBe("[Still running after 47s (pid 41291). Bounded live output (may be truncated): /tmp/pi-fabric-shell-x/output.log]");
   });
 
+  it("says so when the handed-off process has already ended", () => {
+    const logPath = "/tmp/pi-fabric-shell-x/output.log";
+    expect(formatShellHangNotice({ elapsedMs: 120, pid: 41291, logPath, exitCode: 7 }))
+      .toBe(`[Exited with code 7 after 1s (pid 41291). Bounded output (may be truncated): ${logPath}]`);
+    expect(formatShellHangNotice({ elapsedMs: 120, logPath, exitCode: null }))
+      .toBe(`[Ended without an exit code after 1s. Bounded output (may be truncated): ${logPath}]`);
+  });
+
   it("appends the notice like an output-budget spill", () => {
     expect(appendShellHangNotice("hello", "[note]")).toBe("hello\n\n[note]");
     expect(appendShellHangNotice("", "[note]")).toBe("[note]");
@@ -229,6 +237,42 @@ describe("raceShellHang", () => {
     });
     await expect(pending).resolves.toEqual({ status: "spilled", auto: false });
     job.abort.abort();
+  });
+
+  it("hands off an immediate job that exits before its pid is read", async () => {
+    const jobs = store();
+    const job = jobs.begin("bash", "exit 3");
+    // A loaded host can finish a short command before the pid poll's next tick.
+    vi.spyOn(job, "readPid").mockReturnValue(new Promise(() => {}));
+    const result = await raceShellHang({
+      hangMs: 0,
+      immediate: true,
+      parentSignal: undefined,
+      job,
+      execute: async () => {
+        job.exitCode = 3;
+        return "exited";
+      },
+    });
+    expect(result).toEqual({ status: "spilled", auto: false });
+    expect(job.info()).toMatchObject({ status: "failed", exitCode: 3, spilledAt: expect.any(Number), finishedAt: expect.any(Number) });
+  });
+
+  it("keeps an immediate job that never started in the foreground", async () => {
+    const jobs = store();
+    const job = jobs.begin("bash", "echo");
+    vi.spyOn(job, "readPid").mockReturnValue(new Promise(() => {}));
+    const failure = new Error("Working directory does not exist");
+    const result = await raceShellHang({
+      hangMs: 0,
+      immediate: true,
+      parentSignal: undefined,
+      job,
+      execute: async () => { throw failure; },
+    });
+    expect(result).toEqual({ status: "error", error: failure });
+    expect(job.spilled).toBe(false);
+    await job.finish(null);
   });
 
   it("spills on demand so ctrl+b does not need background:true", async () => {

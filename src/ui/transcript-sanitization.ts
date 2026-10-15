@@ -71,6 +71,18 @@ export const contentText = (value: unknown): string => {
   return "";
 };
 
+/** Concatenated reasoning text from assistant `thinking` content blocks. */
+export const contentThinking = (value: unknown): string => {
+  if (!Array.isArray(value)) return "";
+  return value
+    .map((part) => {
+      const record = recordOf(part);
+      return record?.type === "thinking" && typeof record.thinking === "string" ? record.thinking : "";
+    })
+    .filter(Boolean)
+    .join("\n");
+};
+
 export const messageError = (message: Record<string, unknown>): string => {
   if (message.role !== "assistant" || message.stopReason !== "error") return "";
   const details: string[] = [];

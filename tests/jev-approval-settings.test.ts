@@ -42,12 +42,13 @@ describe("Jev approval probability settings", () => {
       "Inherit",
       "pi-fabric/typesafe/jev-latest",
       "pi-fabric/openrouter/jev-1.13", "pi-fabric/openrouter/jev-latest",
+      "pi-fabric/subq/subq-snap-preview",
       "pi-fabric/typesafe/jev-1.13", "pi-fabric/typesafe/jev-1.13.0", "pi-fabric/typesafe/jev-preview",
       "pi-fabric/vercel-ai-gateway/jev-latest",
     ]);
     expect(picker.rpcChoices().find(choice => choice.current)?.value).toBe("pi-fabric/typesafe/jev-latest");
   });
-  it.each([undefined, "anthropic/chat", "pi-fabric/typesafe/jev-latest", "pi-fabric/openrouter/jev-latest", "pi-fabric/vercel-ai-gateway/jev-latest", "pi-fabric/typesafe/pinned"])("shows the setting only for a Jev override: %s", model => {
+  it.each([undefined, "anthropic/chat", "pi-fabric/typesafe/jev-latest", "pi-fabric/openrouter/jev-latest", "pi-fabric/vercel-ai-gateway/jev-latest", "pi-fabric/subq/subq-snap-preview", "pi-fabric/typesafe/pinned"])("shows the setting only for a Jev override: %s", model => {
     const { config, open } = fixture(model);
     expect(config.jev.autoApprovalThreshold).toBe(0.5);
     const row = open().items.find(item => item.id === thresholdId);

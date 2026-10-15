@@ -16,27 +16,27 @@ const root = new URL("../", import.meta.url);
 for (const file of ["kernel.js", "kernel.d.ts", "provider-kernel.js", "provider-kernel.d.ts", "lifecycle-kernel.js", "lifecycle-kernel.d.ts", "authority-kernel.js", "authority-kernel.d.ts", "storage-kernel.js", "storage-kernel.d.ts", "manifest.json"]) {
   assert.equal(readFileSync(new URL(`src/verified/generated/${file}`, root), "utf8"), readFileSync(new URL(`dist/verified/generated/${file}`, root), "utf8"));
 }
-assert.equal(kernel.footprintFits(65n, 64n, true), false);
+assert.equal(kernel.footprintFits(65, 64, true), false);
 assert.equal(kernel.pointerCurrent(true, false), false);
 assert.equal(kernel.headReadable(true, true, false, true, false), false);
 assert.equal(kernel.useNormalized(true, true, true, true), false);
 assert.deepEqual(kernel.consume(true), { $: "Tuple", fst: true, snd: false });
 
 const list = (values) => values.reduceRight((tail, head) => ({ $: "Con", head, tail }), { $: "Nil" });
-const names = (values) => list(values.map(value => list(Array.from({ length: value.length }, (_, i) => BigInt(value.charCodeAt(i))))));
+const names = (values) => list(values.map(value => list(Array.from({ length: value.length }, (_, i) => value.charCodeAt(i)))));
 const parent = authority.authorityIssue(names(["exact grant"]));
 assert.equal(authority.authorityLive(authority.authorityDerive(parent, names(["different grant"]))), false);
 assert.equal(authority.authorityLive(authority.authorityRelease(parent)), false);
-const life = { $: "Life", phase: { $: "Retiring" }, owner: false, holds: 0n, calls: 0n, revoked: true };
+const life = { $: "Life", phase: { $: "Retiring" }, owner: false, holds: 0, calls: 0, revoked: true };
 const closing = bindingStep(life, { $: "Shut" });
 assert.equal(closing.command.$, "StartClose");
 assert.equal(bindingStep(closing.next, { $: "Begin", cleanup: true }).command.$, "Denied");
-const revision = value => ({ $: "Revision", high: value / 4294967296n, low: value % 4294967296n });
-const request = { $: "Request", key: list([107n]), expected: { $: "At", version: revision(0n) }, change: { $: "Put", value: list([49n]), identity: list([105n]) } };
-const storage = storageTransition(request, { $: "Slot", present: false, version: revision(0n), highWater: revision((1n << 48n) - 1n) });
-assert.deepEqual(storage, { $: "PutNext", key: request.key, value: request.change.value, identity: request.change.identity, version: revision(1n << 48n), highWater: revision(1n << 48n) });
-assert.equal(storageTransition(request, { $: "Slot", present: false, version: revision(1n), highWater: revision(1n) }).$, "Conflict");
-assert.equal(storageTransition(request, { $: "Slot", present: false, version: revision(0n), highWater: revision(9007199254740991n) }).$, "Exhausted");
+const revision = value => ({ $: "Revision", high: Math.floor(value / 4294967296), low: value % 4294967296 });
+const request = { $: "Request", key: list([107]), expected: { $: "At", version: revision(0) }, change: { $: "Put", value: list([49]), identity: list([105]) } };
+const storage = storageTransition(request, { $: "Slot", present: false, version: revision(0), highWater: revision(2 ** 48 - 1) });
+assert.deepEqual(storage, { $: "PutNext", key: request.key, value: request.change.value, identity: request.change.identity, version: revision(2 ** 48), highWater: revision(2 ** 48) });
+assert.equal(storageTransition(request, { $: "Slot", present: false, version: revision(1), highWater: revision(1) }).$, "Conflict");
+assert.equal(storageTransition(request, { $: "Slot", present: false, version: revision(0), highWater: revision(9007199254740991) }).$, "Exhausted");
 const declaration = [...Array.from({ length: 64 }, (_, i) => `r${i}`), "shared"];
 const normalized = kernel.resourceNormalize(kernel.resourceSource(names(declaration)), names(declaration.slice(0, 64)));
 assert.deepEqual(normalized, { $: "Unknown" });

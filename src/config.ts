@@ -531,6 +531,8 @@ export interface FabricMeshConfig {
   undeliveredAlarmMs: number;
   /** Explicit undeliverable receipt after root absence without a successor (default 2 h). */
   rootGoneTtlMs: number;
+  /** Tell a root session's model when other root sessions join or leave the project. */
+  peerNotices: boolean;
 }
 
 interface FabricRepairsConfig {
@@ -859,6 +861,7 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
     rootPresenceAlarmMs: 15 * 60_000,
     undeliveredAlarmMs: 30 * 60_000,
     rootGoneTtlMs: 2 * 60 * 60_000,
+    peerNotices: true,
   },
   models: {
     aliases: {},
@@ -1855,6 +1858,7 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
       rootPresenceAlarmMs: boundedInteger(mesh.rootPresenceAlarmMs, DEFAULT_FABRIC_CONFIG.mesh.rootPresenceAlarmMs, 1, 7 * 24 * 60 * 60_000),
       undeliveredAlarmMs: boundedInteger(mesh.undeliveredAlarmMs, DEFAULT_FABRIC_CONFIG.mesh.undeliveredAlarmMs, 1, 7 * 24 * 60 * 60_000),
       rootGoneTtlMs: boundedInteger(mesh.rootGoneTtlMs, DEFAULT_FABRIC_CONFIG.mesh.rootGoneTtlMs, 1, 7 * 24 * 60 * 60_000),
+      peerNotices: booleanValue(mesh.peerNotices, DEFAULT_FABRIC_CONFIG.mesh.peerNotices),
     },
     models: {
       aliases: normalizeModelAliases(modelsSection.aliases),

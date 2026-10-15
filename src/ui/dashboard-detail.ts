@@ -245,7 +245,9 @@ export class DashboardDetailRenderer {
         : entity.kind === "actor"
           ? entity.value.worker?.cwd
           : undefined;
-    if (!transcript || transcript.entries.length === 0) {
+    // Reasoning is a widget-pane view; the dashboard transcript keeps replies, tools, and errors.
+    const entries = transcript?.entries.filter((entry) => entry.kind !== "thinking") ?? [];
+    if (!transcript || entries.length === 0) {
       return [
         this.theme.fg(
           "dim",
@@ -260,7 +262,7 @@ export class DashboardDetailRenderer {
       lines.push(this.theme.fg("dim", "↑ older activity available · scroll past the top to load"));
     }
     let firstTool = true;
-    for (const entry of transcript.entries) {
+    for (const entry of entries) {
       if (entry.kind === "tool") {
         if (this.transcriptToolsExpanded && !firstTool) lines.push("");
         firstTool = false;

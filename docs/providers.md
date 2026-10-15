@@ -278,7 +278,8 @@ Results from MCP, agent, memory, state, schema, mesh, components, compact, and e
 A proxied event carries:
 
 - `toolName` holding the fully qualified Fabric ref, such as `mcp.github.search`;
-- a `toolCallId` that starts with `FABRIC_NESTED_TOOL_CALL_ID_PREFIX`;
+- a `toolCallId` that starts with `FABRIC_NESTED_TOOL_CALL_ID_PREFIX`, persisted as `nestedToolCallId` on the call's audit in the final `fabric_exec` details;
+- `parentToolCallId`, the id of the call that issued it, normally the outer `fabric_exec` tool call;
 - text `content` holding the raw string result or a JSON projection;
 - `details` matching `FabricToolResultProxyDetailsV1`, whose `result` is the exact host-side structured value.
 
@@ -319,3 +320,5 @@ export default function resultGuard(pi: ExtensionAPI) {
 If you change only `content`, the nested sandbox value becomes the patched text. To keep a structured replacement, return the proxy envelope in `details` with a changed `result`, as in the example above. When both fields are patched, a valid changed `details.result` takes precedence. Returning `isError: true` fails the nested provider invocation.
 
 Pi core tools and captured extension tools skip this generic proxy, because they already replay their native `tool_call`, `tool_result`, and `tool_execution_*` lifecycle. Nested shell calls still emit their native identity: `pi.bash()` uses `toolName: "bash"`/`isBashToolResult()`, while `pi.powershell()` uses `toolName: "powershell"`/`isPowerShellToolResult()`. Proxied events act as middleware only. They create no separate persisted tool-result messages.
+
+Those replayed `tool_call`, `tool_result`, and `tool_execution_*` events carry the same `parentToolCallId`, as Pi's own nested calls do. A listener can then attribute a nested call to its `fabric_exec` when several run in parallel. A call Fabric issues outside a `fabric_exec`, such as one from a Jev program or a component, carries Fabric's own id for that caller.

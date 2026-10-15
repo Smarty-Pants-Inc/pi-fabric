@@ -239,6 +239,8 @@ const runRequest = (
     options,
   ),
   ...(context.extensionContext.sessionManager ? { provenance: fabricTurnProvenance(fabricHostIdentity(context.extensionContext.sessionManager.getSessionId()), "actor", "mesh", invocationFabricPrincipal(context)) } : {}),
+  // Host-only: lets a trace-context listener parent the child under this call.
+  traceOrigin: { parentToolCallId: context.parentToolCallId, nestedToolCallId: context.nestedToolCallId },
 });
 
 const handoffTask = (args: Record<string, unknown>): string => {
@@ -941,8 +943,12 @@ export class AgentsProvider implements FabricProvider {
             ? { thinkingBounds: this.manager.childThinkingBounds(request.thinkingBounds) }
             : {}),
         }, context.extensionContext.sessionManager?.getEntries?.() ?? []);
+        // The resident host loads no extensions: ask this session's and send the answer.
+        const traceContext = durableRequest.residency === "durable"
+          ? this.manager.forwardedTraceContext(durableRequest)
+          : undefined;
         const handle = durableRequest.residency === "durable"
-          ? await this.#resident().spawnAgent(durableRequest, context.signal)
+          ? await this.#resident().spawnAgent({ ...durableRequest, ...(traceContext ? { traceContext } : {}) }, context.signal)
           : await this.manager.spawn(durableRequest, isInteractiveMain(context.extensionContext) ? withoutMainExecutionCeiling(context.signal) : context.signal);
         if (request.residency !== "durable") this.manager.detachSignal(handle.id);
         this.participants.scheduleRefresh();

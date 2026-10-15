@@ -11,6 +11,10 @@ const result = await pi.bash({cmd: "bun run build", background: true, descriptio
 return result; // details.taskId, pid, logPath when detached
 ```
 
+`background: true` and `durable: true` always return the task, even when the
+command ran only briefly. When it has already ended, `details.running` is `false` and the
+notice gives its exit code. A command that never started fails the call.
+
 Completion sends a bounded, batched automated event to the **owning Pi session**.
 The same mechanism works inside a Fabric-enabled child: it does not route child
 shell output directly into the parent's Main. No LLM is used to wait for a process.

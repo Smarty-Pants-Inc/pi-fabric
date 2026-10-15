@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { createModels, InMemoryCredentialStore, type AuthInteraction } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { createJevAuthProvider, registerJevAuth } from "../src/jev/auth.js";
+import { createJevAuthProvider, createSubqAuthProvider, registerJevAuth } from "../src/jev/auth.js";
 import { JevCredentials } from "../src/jev/client.js";
 describe("Jev native login", () => {
   it("registers for login without publishing a text-generating model", () => {
@@ -14,15 +14,32 @@ describe("Jev native login", () => {
   });
   // Newer Pi's createProvider rejects a provider without any api/images/classifiers
   // implementation, so the login-only provider carries a stream that only ever errors.
-  it("carries a concrete stream implementation that ends with an error", async () => {
-    const provider = createJevAuthProvider();
-    const model = { id: "none", name: "none", api: "openai-completions", provider: "jev" } as unknown as Parameters<typeof provider.stream>[0];
+  it.each([
+    ["jev", createJevAuthProvider],
+    ["subq", createSubqAuthProvider],
+  ] as const)("%s carries a concrete stream implementation that ends with an error", async (id, create) => {
+    const provider = create();
+    expect(provider.id).toBe(id);
+    expect(provider.getModels()).toEqual([]);
+    const model = { id: "none", name: "none", api: "openai-completions", provider: id } as unknown as Parameters<typeof provider.stream>[0];
     for (const stream of [provider.stream(model, { messages: [] } as never), provider.streamSimple(model, { messages: [] } as never)]) {
       const events = [];
       for await (const event of stream) events.push(event);
       expect(events.map((event) => event.type)).toEqual(["error"]);
       await expect(stream.result()).resolves.toMatchObject({ stopReason: "error", errorMessage: expect.stringContaining("login-only") });
     }
+  });
+  it("registers SubQ for login the same way, with its own key variable", async () => {
+    const registerProvider = vi.fn(); registerJevAuth({registerProvider} as unknown as ExtensionAPI);
+    expect(registerProvider.mock.calls.map(call => call[0].id)).toEqual(["jev", "subq"]);
+    const provider = registerProvider.mock.calls[1]![0];
+    expect(provider.getModels()).toEqual([]);
+    expect(() => provider.stream()).toThrow("not chat generation");
+    const storage = new InMemoryCredentialStore();
+    const models = createModels({ credentials: storage }); models.setProvider(createSubqAuthProvider());
+    await models.login("subq","api_key",{prompt: vi.fn(async () => "fake-subq-key")} as unknown as AuthInteraction);
+    expect(await storage.read("subq")).toEqual({type:"api_key",key:"fake-subq-key"});
+    expect(await storage.read("jev")).toBeUndefined();
   });
   it("persists api_key credentials through Pi storage and resolves login/logout", async () => {
     const storage = new InMemoryCredentialStore();

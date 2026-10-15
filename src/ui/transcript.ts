@@ -7,7 +7,7 @@ type FabricTranscriptEntryStatus = "running" | "completed" | "failed";
 
 export interface FabricTranscriptEntry {
   id: string;
-  kind: "user" | "assistant" | "tool" | "error" | "status";
+  kind: "user" | "assistant" | "thinking" | "tool" | "error" | "status";
   label: string;
   text?: string;
   status?: FabricTranscriptEntryStatus;

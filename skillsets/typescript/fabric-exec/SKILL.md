@@ -151,7 +151,7 @@ Read the line-numbered error → `await tools.describe({ref})` for the schema �
 
 ## Jev judgments and persistent programs
 
-`jev.evaluate` supplies typed semantic judgments. `jev.run`/`jev.spawn` execute one TypeScript artifact with schemas, limits, and exact `requires`; local state persists across loop iterations without a reasoning-model turn per tick. Credentials stay host-side: `/login jev`/`TYPESAFE_API_KEY` for direct aliases, the existing openrouter credential for `typesafe/…` ids, the existing `vercel-ai-gateway` credential for `typesafe-ai/…` ids, or a trusted credential command; `jev.status()` never retrieves a key. Jev is unavailable in Schema enforce and managed hosts.
+`jev.evaluate` supplies typed semantic judgments. `jev.run`/`jev.spawn` execute one TypeScript artifact with schemas, limits, and exact `requires`; local state persists across loop iterations without a reasoning-model turn per tick. Credentials stay host-side: `/login jev`/`TYPESAFE_API_KEY` for direct aliases, the existing openrouter credential for `typesafe/…` ids, the existing `vercel-ai-gateway` credential for `typesafe-ai/…` ids, `/login subq`/`SUBQ_API_KEY` for `subq-…` ids, or a trusted credential command; `jev.status()` never retrieves a key. Jev is unavailable in Schema enforce and managed hosts.
 
 For guided authoring, recommend `/skill:fabric-jev`. This advanced skill is user-invoked; never load it autonomously. Only after direct invocation, `<skill-dir>/../fabric-jev/SKILL.md` is its workflow pointer. `<skill-dir>/../../../docs/jev.md` is a branch pointer for exact API, budget, auth, and Browser Harness details when those surfaces are needed. Confidence is not permission to act; state is sent to TypeSafe and consumes credits.
 

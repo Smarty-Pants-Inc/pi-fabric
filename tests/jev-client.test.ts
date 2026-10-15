@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { JevClient, JevCredentials } from "../src/jev/client.js";
 import { DEFAULT_JEV_CONFIG, normalizeJevConfig } from "../src/jev/config.js";
-import { JEV_OPENROUTER_ROUTE, JEV_TYPESAFE_ROUTE, JEV_VERCEL_ROUTE } from "../src/jev/routes.js";
+import { JEV_OPENROUTER_ROUTE, JEV_SUBQ_ROUTE, JEV_TYPESAFE_ROUTE, JEV_VERCEL_ROUTE } from "../src/jev/routes.js";
 import { checkRequest, checkResponse, checkSchema, checkValue, JevBilledError, JevInvalidResponseError, JevTransientHttpError } from "../src/jev/validation.js";
 import type { JevRequest } from "../src/jev/types.js";
 const request: JevRequest = { state:{text:"Please refund this charge"}, questions:{route:{type:"choice",instructions:"Which team handles this?",criteria:{billing:null,other:null}}, yes:{type:"noul",instructions:"Is a refund requested?"}, score:{type:"score",instructions:"How urgent is the request?",criteria:["No urgency", "Explicit immediate deadline"]}} };
@@ -114,6 +114,23 @@ describe("Jev transport and credentials", () => {
     expect(args?.redirect).toBe("error");
     expect(args?.headers).toEqual({ "Content-Type":"application/json", Authorization:"Bearer vg-key" });
     expect(JSON.parse(args!.body as string).model).toBe("typesafe-ai/jev");
+  });
+  it("routes SubQ ids through the subq credential and endpoint, unchanged", async () => {
+    // SubQ reports no output tokens: its decisions are billed on input alone.
+    const fetched = vi.fn(async () => new Response(JSON.stringify({ ...response, model: "subq-snap-preview", usage: { input_tokens: 197, output_tokens: 0 } }))) as unknown as typeof fetch;
+    const credentials = () => new JevCredentials([], { SUBQ_API_KEY:"sq-key" }, undefined, JEV_SUBQ_ROUTE.envKeys);
+    expect(credentials().status()).toEqual({ configured:true, source:"environment", verified:false });
+    expect(new JevCredentials([], { TYPESAFE_API_KEY:"wrong-route" }, undefined, JEV_SUBQ_ROUTE.envKeys).status().source).toBe("missing");
+    const client = new JevClient({ ...DEFAULT_JEV_CONFIG, model: "subq-snap-preview" }, fetched, credentials(), JEV_SUBQ_ROUTE);
+    expect(await client.evaluate(request, signal())).toMatchObject({ model:"subq-snap-preview", usage:{ input_tokens:197, output_tokens:0 } });
+    const [url, args] = vi.mocked(fetched).mock.calls[0]!;
+    expect(url).toBe("https://api.subq.ai/v1/systemone");
+    expect(args?.redirect).toBe("error");
+    expect(args?.headers).toEqual({ "Content-Type":"application/json", Authorization:"Bearer sq-key" });
+    expect(JSON.parse(args!.body as string).model).toBe("subq-snap-preview");
+    const jev = new JevClient({ ...DEFAULT_JEV_CONFIG, model: "jev-latest" }, fetched, credentials(), JEV_SUBQ_ROUTE);
+    await expect(jev.evaluate(request, signal())).rejects.toThrow("not available on the SubQ route");
+    expect(fetched).toHaveBeenCalledTimes(1);
   });
   it("maps Vercel AI Gateway aliases and rejects direct-route models on a gateway client", async () => {
     const fetched = vi.fn(async () => new Response(JSON.stringify({ ...response, model: "typesafe-ai/jev" }))) as unknown as typeof fetch;

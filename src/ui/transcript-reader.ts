@@ -111,6 +111,16 @@ const readForwardPage = (
 
 export class AgentTranscriptReader {
   readonly #cache = new Map<string, CachedTranscript>();
+  /**
+   * Log lines per latest/older page. Streaming writes one line per delta, so a
+   * caller that needs the start of a long turn (the widget's activity pane)
+   * asks for a deeper page than the dashboard default.
+   */
+  readonly #pageLines: number;
+
+  constructor(pageLines = PAGE_LINES) {
+    this.#pageLines = Math.max(1, Math.floor(pageLines));
+  }
 
   read(
     source: FabricTranscriptSource,
@@ -196,7 +206,7 @@ export class AgentTranscriptReader {
       const pageEnd = Math.min(cached.pageStart, completeEnd);
       const page = readJsonlPageFromDescriptor(
         descriptor,
-        PAGE_LINES,
+        this.#pageLines,
         pageEnd,
         stat.size,
         MAX_PAGE_BYTES,
@@ -295,7 +305,7 @@ export class AgentTranscriptReader {
     const completeEnd = knownCompleteEnd ?? completeLogEnd(descriptor, stat.size);
     const page = readJsonlPageFromDescriptor(
       descriptor,
-      PAGE_LINES,
+      this.#pageLines,
       completeEnd,
       stat.size,
       MAX_PAGE_BYTES,

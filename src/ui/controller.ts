@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { resolveAgentDir } from "../core/agent-dir.js";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import type { TUI } from "@earendil-works/pi-tui";
+import type { Component, TUI } from "@earendil-works/pi-tui";
 import type { CodePreviewSettings } from "./code-preview.js";
 import type { FabricConversationState, FabricConversationTarget, FabricConversationView } from "./conversation.js";
 import type { NativeConversationReader, NativeConversationSource } from "./conversation-native-reader.js";
@@ -24,7 +24,7 @@ import { extensionContextLive } from "../session-liveness.js";
 import { isActiveStatus, type FabricDashboardSnapshot, type FabricUiActor, type FabricUiAgent } from "./types.js";
 import { FabricWidget, isFabricWidgetStreaming, shouldShowFabricWidget } from "./widget.js";
 import { FabricWidgetRetention } from "./retention.js";
-import { AgentTranscriptReader, type FabricTranscriptSource } from "./transcript.js";
+import type { AgentTranscriptReader, FabricTranscriptSource } from "./transcript.js";
 
 const WIDGET_ID = "pi-fabric";
 const ACTIVITY_REFRESH_MS = 100;
@@ -80,6 +80,11 @@ export class FabricUiController {
   #widget: FabricWidget | undefined;
   #hostStreaming: boolean | undefined;
   #reportedRefreshErrors = new Set<string>();
+  /** Component that had focus before the widget took it (normally the editor). */
+  #widgetReturnFocus: Component | undefined;
+  /** Pi's hideThinkingBlock for the widget pane; read once, at the first expansion. */
+  #widgetHideThinking: boolean | undefined;
+  #widgetHideThinkingLoad: Promise<void> | undefined;
   #lastRefreshAt = 0;
   #dashboardOpen = false;
   #conversationOpen = false;
@@ -96,7 +101,7 @@ export class FabricUiController {
   #activityRunsDetailed = true;
   #activityRuns: FabricActivityRun[] = [];
   #activityView: ((detailed?: boolean) => FabricActivityRun[]) | undefined;
-  readonly #transcripts = new AgentTranscriptReader();
+  #transcripts: AgentTranscriptReader | undefined;
   readonly #conversationReaders = new Map<string, NativeConversationReader>();
   #activeConversationReader: string | undefined;
   #refreshGeneration = 0;
@@ -148,6 +153,11 @@ export class FabricUiController {
     this.#meshUnsubscribe?.();
     this.#meshUnsubscribe = undefined;
     this.#scheduledRefresh = undefined;
+    // Hand focus back before the widget goes away, and drop the editor of this session.
+    this.#releaseWidget();
+    this.#widgetReturnFocus = undefined;
+    this.#widgetHideThinking = undefined;
+    this.#widgetHideThinkingLoad = undefined;
     this.#widget = undefined;
     this.#activityUnsubscribe?.();
     this.#activityUnsubscribe = undefined;
@@ -176,7 +186,8 @@ export class FabricUiController {
     this.#activityRunsDetailed = true;
     this.#activityRuns = [];
     this.#activityView = undefined;
-    this.#transcripts.clear();
+    this.#transcripts?.clear();
+    this.#transcripts = undefined;
     for (const reader of this.#conversationReaders.values()) reader.clear();
     this.#conversationReaders.clear();
     this.#activeConversationReader = undefined;
@@ -192,7 +203,66 @@ export class FabricUiController {
 
   /** True while Fabric owns keyboard input, including asynchronous view setup. */
   get ownsInput(): boolean {
-    return this.#dashboardOpen || this.#conversationOpen || this.#tasksOpen;
+    // A focused widget owns Esc/arrows, so Esc there closes the pane instead of halting workers.
+    return this.#dashboardOpen || this.#conversationOpen || this.#tasksOpen || this.#widget?.focused === true;
+  }
+
+  /** Focus the bottom widget so its participant rows can be expanded in place. */
+  focusWidget(context: ExtensionContext): void {
+    if (context.mode !== "tui") return;
+    const tui = this.#widgetTui as (TUI & { getFocusedComponent?(): unknown }) | undefined;
+    const widget = this.#widget;
+    if (!tui || !widget) {
+      context.ui.notify("No Fabric activity to expand", "info");
+      return;
+    }
+    if (widget.focused) return this.#releaseWidget();
+    const current = tui.getFocusedComponent?.();
+    if (current && current !== widget) this.#widgetReturnFocus = current as Component;
+    const epoch = this.#epoch;
+    tui.setFocus(widget);
+    // Claim focus synchronously, but load the engine only on this real input.
+    // A disposed/replaced widget must never reacquire focus after the await.
+    void widget.prepareInteraction().then(() => {
+      if (epoch !== this.#epoch || this.#widget !== widget || !widget.focused) return;
+      widget.selectDefault();
+      tui.requestRender();
+    }).catch((error) => {
+      if (epoch !== this.#epoch || this.#widget !== widget) return;
+      this.#releaseWidget();
+      this.#reportRefreshError(error);
+    });
+    tui.requestRender();
+  }
+
+  /** Return focus to the editor; a `forward` key the widget did not use goes to the editor too. */
+  #releaseWidget(forward?: string): void {
+    const tui = this.#widgetTui;
+    if (!tui || !this.#widget?.focused) return;
+    const target = this.#widgetReturnFocus;
+    tui.setFocus(target ?? null);
+    if (forward !== undefined) target?.handleInput?.(forward);
+    tui.requestRender();
+  }
+
+  /** Read Pi's hideThinkingBlock off the startup path, then redraw the pane. */
+  #widgetHidesThinking(context: ExtensionContext, tui: TUI): boolean {
+    if (this.#widgetHideThinking !== undefined) return this.#widgetHideThinking;
+    const epoch = this.#epoch;
+    this.#widgetHideThinkingLoad ??= (async () => {
+      let hidden = false;
+      try {
+        const { loadHostSdk } = await import("../core/host-sdk.js");
+        const { SettingsManager } = await loadHostSdk();
+        hidden = SettingsManager.create(context.cwd, resolveAgentDir(), { projectTrusted: context.isProjectTrusted?.() ?? false })
+          .getHideThinkingBlock();
+      } catch { /* no host settings: show thinking, as Pi does by default */ }
+      if (epoch !== this.#epoch) return;
+      this.#widgetHideThinking = hidden;
+      tui.requestRender();
+    })();
+    // Until the setting is known, show the marker only: never flash reasoning a user hid.
+    return true;
   }
 
   async openTasks(context: ExtensionContext, query?: string): Promise<void> {
@@ -447,9 +517,10 @@ export class FabricUiController {
     const epoch = this.#epoch;
     const current = (): boolean => epoch === this.#epoch;
     this.#refresh();
-    const [{ FabricDashboard }, { buildClaudeModelSource, buildModelSource }, { imageSafeCustom }] =
-      await Promise.all([import("./dashboard.js"), import("./model-picker.js"), import("./image-overlays.js")]);
+    const [{ FabricDashboard }, { buildClaudeModelSource, buildModelSource }, { imageSafeCustom }, { AgentTranscriptReader }] =
+      await Promise.all([import("./dashboard.js"), import("./model-picker.js"), import("./image-overlays.js"), import("./widget-interaction.js")]);
     if (!current()) return;
+    this.#transcripts ??= new AgentTranscriptReader();
     const modelSource = buildModelSource(context.modelRegistry, resolveAgentDir());
     let claudeModelSource: ModelSource | undefined;
     if (this.#snapshot.actors.some((actor) => actor.runner === "claude")) {
@@ -626,15 +697,15 @@ export class FabricUiController {
               done(undefined);
             },
             agentTranscript: (agent, followLatest) =>
-              this.#transcripts.read(this.#agentTranscriptSource(agent), followLatest),
+              this.#transcripts!.read(this.#agentTranscriptSource(agent), followLatest),
             actorTranscript: (actor, followLatest) =>
-              this.#transcripts.read(this.#actorTranscriptSource(actor), followLatest),
+              this.#transcripts!.read(this.#actorTranscriptSource(actor), followLatest),
             loadOlderTranscript: (target) =>
-              this.#transcripts.loadOlder(this.#transcriptSource(target)),
+              this.#transcripts!.loadOlder(this.#transcriptSource(target)),
             loadNewerTranscript: (target) =>
-              this.#transcripts.loadNewer(this.#transcriptSource(target)),
+              this.#transcripts!.loadNewer(this.#transcriptSource(target)),
             loadLatestTranscript: (target) =>
-              this.#transcripts.loadLatest(this.#transcriptSource(target)),
+              this.#transcripts!.loadLatest(this.#transcriptSource(target)),
             onActorModel,
             onActorThinking,
             onActorEvents,
@@ -897,6 +968,9 @@ export class FabricUiController {
         WIDGET_ID,
         (tui, theme) => {
           this.#widgetTui = tui;
+          // Mouse clicks focus the widget without a shortcut, so remember the editor up front.
+          const focused = (tui as TUI & { getFocusedComponent?(): unknown }).getFocusedComponent?.();
+          if (focused) this.#widgetReturnFocus = focused as Component;
           this.#widget = new FabricWidget(
             theme,
             () => this.#snapshot,
@@ -904,6 +978,17 @@ export class FabricUiController {
             () => tui.terminal?.rows ?? process.stdout.rows,
             true,
             this.#widgetRetention,
+            {
+              activity: (row, reader) => {
+                const target = row.kind === "actor"
+                  ? this.#snapshot.actors.find((actor) => actor.id === row.id)
+                  : this.#snapshot.agents.find((agent) => agent.id === row.id);
+                return target ? reader?.read(this.#transcriptSource(target)) : undefined;
+              },
+              release: (forward) => this.#releaseWidget(forward),
+              requestRender: () => tui.requestRender(),
+              hideThinking: () => this.#widgetHidesThinking(context, tui),
+            },
           );
           return this.#widget;
         },
@@ -912,6 +997,7 @@ export class FabricUiController {
       return;
     }
     if (!this.#widgetMounted) return;
+    this.#releaseWidget();
     context.ui.setWidget(WIDGET_ID, undefined);
     this.#widgetMounted = false;
     this.#widgetTui = undefined;

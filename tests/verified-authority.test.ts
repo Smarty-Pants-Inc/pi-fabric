@@ -16,7 +16,7 @@ const fixture = (scoped = false) => {
   return { provider, descriptor };
 };
 afterEach(async () => { await Promise.all(registries.splice(0).map(registry => registry.close())); vi.restoreAllMocks(); });
-const text = (value: string): kernel.AuthorityText => { let out: kernel.AuthorityText = { $: "Nil" }; for (let i = value.length - 1; i >= 0; i--) out = { $: "Con", head: BigInt(value.charCodeAt(i)), tail: out }; return out; };
+const text = (value: string): kernel.AuthorityText => { let out: kernel.AuthorityText = { $: "Nil" }; for (let i = value.length - 1; i >= 0; i--) out = { $: "Con", head: value.charCodeAt(i), tail: out }; return out; };
 const grants = (values: string[]): kernel.AuthorityGrants => values.reduceRight<kernel.AuthorityGrants>((tail, value) => ({ $: "Con", head: text(value), tail }), { $: "Nil" });
 
 // Mutation anchors: A.derive must not issue unconditionally or reverse covered;

@@ -21,7 +21,7 @@ const encodeGrant = (grant: Readonly<FabricCapabilityBindingView>): AuthorityTex
   ]);
   let encoded: AuthorityText = { $: "Nil" };
   for (let i = text.length - 1; i >= 0; i--) {
-    encoded = { $: "Con", head: BigInt(text.charCodeAt(i)), tail: encoded };
+    encoded = { $: "Con", head: text.charCodeAt(i), tail: encoded };
   }
   return encoded;
 };

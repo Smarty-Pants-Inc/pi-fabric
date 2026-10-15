@@ -3,11 +3,15 @@ import { isJevApprovalModel, normalizeJevApprovalModel, parseJevApprovalModel } 
 import {
   JEV_OPENROUTER_MODELS,
   JEV_OPENROUTER_ROUTE,
+  JEV_SUBQ_MODELS,
+  JEV_SUBQ_ROUTE,
   JEV_TYPESAFE_MODELS,
   JEV_TYPESAFE_ROUTE,
   JEV_VERCEL_MODELS,
   JEV_VERCEL_ROUTE,
+  isJevModelId,
   isJevOpenRouterModelId,
+  isJevSubqModelId,
   isJevVercelModelId,
   jevClassifierModels,
   resolveJevClassifierTarget,
@@ -65,6 +69,7 @@ describe("Jev route selection", () => {
       "pi-fabric/typesafe/jev-latest", "pi-fabric/typesafe/jev-1.13", "pi-fabric/typesafe/jev-1.13.0", "pi-fabric/typesafe/jev-preview",
       "pi-fabric/openrouter/jev-latest", "pi-fabric/openrouter/jev-1.13",
       "pi-fabric/vercel-ai-gateway/jev-latest", "pi-fabric/vercel-ai-gateway/typesafe-ai/jev",
+      "pi-fabric/subq/subq-snap-preview",
     ]);
     expect(jevClassifierModels("typesafe/jev-1.13").map(model => `${model.provider}/${model.id}`)).toContain("pi-fabric/openrouter/typesafe/jev-1.13");
     expect(new Set(keys).size).toBe(keys.length);
@@ -79,5 +84,27 @@ describe("Jev route selection", () => {
       providerId: "vercel-ai-gateway",
       envKeys: ["AI_GATEWAY_API_KEY"],
     });
+  });
+  it("routes SubQ model ids to SubQ's own System One endpoint", () => {
+    expect(JEV_SUBQ_MODELS).toEqual(["subq-snap-preview"]);
+    expect(JEV_SUBQ_ROUTE).toMatchObject({
+      label: "SubQ",
+      endpoint: "https://api.subq.ai/v1/systemone",
+      providerId: "subq",
+      envKeys: ["SUBQ_API_KEY"],
+    });
+    // A SubQ id also fits a bare TypeSafe alias, so it must win the route.
+    expect(isJevModelId("subq-snap-preview")).toBe(true);
+    expect(resolveJevModelRoute("subq-snap-preview")).toMatchObject({ route: JEV_SUBQ_ROUTE, model: "subq-snap-preview" });
+    expect(resolveJevModelRoute("jev-latest").route).toBe(JEV_TYPESAFE_ROUTE);
+    expect(isJevSubqModelId("subq-snap-1.0")).toBe(true);
+    for (const model of ["subq", "subq-", "jev-latest", "typesafe/subq-snap-preview", "subq/snap"]) expect(isJevSubqModelId(model)).toBe(false);
+    expect(resolveJevUpstreamModel(JEV_SUBQ_ROUTE, "subq-snap-preview")).toBe("subq-snap-preview");
+    expect(resolveJevUpstreamModel(JEV_SUBQ_ROUTE, "jev-latest")).toBeUndefined();
+    expect(parseJevApprovalModel("pi-fabric/subq/subq-snap-preview")).toEqual({ route: "subq", model: "subq-snap-preview" });
+    expect(isJevApprovalModel("pi-fabric/subq/subq-snap-preview")).toBe(true);
+    expect(resolveJevClassifierTarget("pi-fabric/subq/subq-snap-preview")).toMatchObject({ ok: true, route: JEV_SUBQ_ROUTE, model: "subq-snap-preview" });
+    expect(resolveJevClassifierTarget("pi-fabric/subq/jev-latest")).toMatchObject({ ok: false, message: expect.stringContaining("SubQ serves subq-snap-preview") });
+    expect(jevClassifierModels("subq-snap-1.0").map(model => `${model.provider}/${model.id}`)).toContain("pi-fabric/subq/subq-snap-1.0");
   });
 });

@@ -19,7 +19,7 @@ const invoke = (registry: ActionRegistry, ctx: Partial<FabricInvocationContext> 
 const speculative = (registry: ActionRegistry) => { const store = new FabricSpeculationStore({ maxConcurrent: 2, maxEntries: 4, entryTtlMs: 1000 }); registry.setSpeculation(store, () => true); return store; };
 afterEach(async () => { await Promise.all(registries.splice(0).map(registry => registry.close())); vi.restoreAllMocks(); });
 
-const encode = (text: string): StateText => { let value: StateText = { $: "Nil" }; for (let i = text.length - 1; i >= 0; i--) value = { $: "Con", head: BigInt(text.charCodeAt(i)), tail: value }; return value; };
+const encode = (text: string): StateText => { let value: StateText = { $: "Nil" }; for (let i = text.length - 1; i >= 0; i--) value = { $: "Con", head: text.charCodeAt(i), tail: value }; return value; };
 describe("compiled provider plans", () => {
   it("preserves ticket fields, exact text and consumed outcome encodings", () => {
     // Safety, completeness and consumption are universal Bend laws. Keep

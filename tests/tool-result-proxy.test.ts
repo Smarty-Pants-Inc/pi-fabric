@@ -58,6 +58,11 @@ describe("FabricToolResultProxy", () => {
       content: [{ type: "text", text: "unbounded output" }],
       isError: false,
     });
+    expect(event).not.toHaveProperty("parentToolCallId");
+
+    // The caller's id travels with the event when the registry supplies it.
+    await proxy.proxy({ ...request("unbounded output"), parentToolCallId: "call_outer" });
+    expect(emitToolResult.mock.calls[1]?.[0]).toMatchObject({ toolName: "demo.echo", parentToolCallId: "call_outer" });
     expect(readFabricToolResultProxyDetailsV1(event?.details)).toMatchObject({
       ref: "demo.echo",
       result: "unbounded output",
@@ -156,6 +161,7 @@ describe("ActionRegistry result proxy", () => {
     expect(result).toEqual({ artifact: "artifact_test", originalChars: 1_000 });
     expect(proxy.proxy).toHaveBeenCalledWith(expect.objectContaining({
       toolCallId: expect.stringMatching(/^fabric_/),
+      parentToolCallId: "parent",
       value: "x".repeat(1_000),
     }));
   });

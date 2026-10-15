@@ -6,14 +6,14 @@ import type { FabricProviderBinding, FabricProviderBindings } from "./provider-b
 
 const encode = (text: string): StateText => {
   let result: StateText = { $: "Nil" };
-  for (let i = text.length - 1; i >= 0; i--) result = { $: "Con", head: BigInt(text.charCodeAt(i)), tail: result };
+  for (let i = text.length - 1; i >= 0; i--) result = { $: "Con", head: text.charCodeAt(i), tail: result };
   return result;
 };
 const decode = (text: StateText): string => {
   const result: string[] = [];
   for (let rest = text; rest.$ === "Con"; rest = rest.tail) {
-    if (rest.head < 0n || rest.head > 65535n) throw new Error("Invalid provider plan text");
-    result.push(String.fromCharCode(Number(rest.head)));
+    if (rest.head < 0 || rest.head > 65535) throw new Error("Invalid provider plan text");
+    result.push(String.fromCharCode(rest.head));
   }
   return result.join("");
 };

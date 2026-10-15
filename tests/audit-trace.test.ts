@@ -18,7 +18,7 @@ import { projectFabricAuditArgs } from "../src/audit/projection.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { ActionRegistry } from "../src/core/action-registry.js";
 import { FabricExecutionService } from "../src/execution-service.js";
-import type { FabricProvider } from "../src/protocol.js";
+import { FABRIC_NESTED_TOOL_CALL_ID_PREFIX, type FabricProvider } from "../src/protocol.js";
 
 describe("agent message audit parity", () => {
   it.each(["agents.send", "agents.steer"])("retains only the target for %s", ref => {
@@ -138,6 +138,10 @@ describe("Fabric execution trace V1", () => {
     expect(result.audits).toMatchObject([
       { ref: "demo.echo", provider: "demo", tool: "echo", success: true },
     ]);
+    // The id a proxied tool_result carries survives into the persisted audit.
+    const callId = result.audits[0]!.nestedToolCallId;
+    expect(callId.startsWith(FABRIC_NESTED_TOOL_CALL_ID_PREFIX)).toBe(true);
+    expect(createFabricPersistedExecutionDetails(result).audits[0]!.nestedToolCallId).toBe(callId);
     expect(isFabricExecutionTraceV1(result.trace)).toBe(true);
     expect(() => JSON.stringify(result)).not.toThrow();
   });
@@ -1041,10 +1045,10 @@ return true;
         preview: { details: { codePreviewBeforeWrite: { kind: "content", content: "verbatim-preview" } } },
         startedAt: 1,
         endedAt: 2,
-        // In-memory image payloads and correlation ids never cross into the record.
+        // The call id joins an audit to its live tool events; in-memory image payloads never cross into the record.
+        nestedToolCallId: "fabric_nested-call-id",
         media: [{ type: "image", data: "image-bytes-not-persisted" }],
         mediaNote: "Read image file",
-        nestedToolCallId: "nested-correlation-id",
       } as never,
     ];
     const details = createFabricPersistedExecutionDetails({ success: true, trace, audits, phases: ["Ship"] });
@@ -1054,19 +1058,26 @@ return true;
     for (const retained of ["verbatim-argument", "verbatim-result", "verbatim-preview"]) {
       expect(serialized).toContain(retained);
     }
-    for (const volatile of ["image-bytes-not-persisted", "Read image file", "nested-correlation-id"]) {
+    for (const volatile of ["image-bytes-not-persisted", "Read image file"]) {
       expect(serialized).not.toContain(volatile);
     }
+    expect(details.audits[0]!.nestedToolCallId).toBe("fabric_nested-call-id");
 
     const parsed = readFabricExecutionRenderDetails(JSON.parse(serialized));
     expect(parsed.phases).toEqual(["Ship"]);
     expect(parsed.audits).toHaveLength(1);
     expect(parsed.audits[0]).toMatchObject({
       ref: "pi.write",
+      nestedToolCallId: "fabric_nested-call-id",
       tool: "write",
       result: { details: { codePreviewAfterWrite: { content: "verbatim-result" } } },
     });
     expect(parsed.audits[0]).not.toHaveProperty("fromTrace");
+    // Transcripts written before the id persisted, and malformed ids, still parse.
+    for (const nestedToolCallId of [undefined, 7]) {
+      const [older] = readFabricExecutionRenderDetails({ success: true, audits: [{ ref: "pi.write", nestedToolCallId }], phases: [] }).audits;
+      expect(older).toEqual({ ref: "pi.write" });
+    }
     expect(Buffer.byteLength(serialized, "utf8")).toBeLessThanOrEqual(
       FABRIC_EXECUTION_DETAILS_MAX_BYTES,
     );

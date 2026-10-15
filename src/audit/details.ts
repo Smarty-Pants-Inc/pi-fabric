@@ -25,11 +25,12 @@ export interface FabricPersistedExecutionDetailsV1 {
 
 /**
  * The audit fields that cross into the session record; read back by
- * {@link legacyAudit}. In-memory-only payloads (image blocks, media notes,
- * correlation ids) never persist.
+ * {@link legacyAudit}. In-memory-only payloads (image blocks, media notes)
+ * never persist.
  */
 export interface FabricPersistableAuditInput {
   ref: string;
+  nestedToolCallId?: string;
   tool?: string;
   provider?: string;
   success?: boolean;
@@ -44,6 +45,8 @@ export interface FabricPersistableAuditInput {
 
 export interface FabricLegacyRenderAudit {
   ref: string;
+  /** The call's opaque id; a proxied `tool_result` carries the same value as its `toolCallId`. Absent in older transcripts and trace-derived audits. */
+  nestedToolCallId?: string;
   tool?: string;
   provider?: string;
   success?: boolean;
@@ -79,6 +82,7 @@ const cloneTrace = (trace: FabricExecutionTraceV1): FabricExecutionTraceV1 =>
 const persistableAudit = (audit: FabricPersistableAuditInput): FabricLegacyRenderAudit =>
   structuredClone({
     ref: audit.ref,
+    ...(audit.nestedToolCallId !== undefined ? { nestedToolCallId: audit.nestedToolCallId } : {}),
     ...(audit.tool !== undefined ? { tool: audit.tool } : {}),
     ...(audit.provider !== undefined ? { provider: audit.provider } : {}),
     ...(audit.success !== undefined ? { success: audit.success } : {}),
@@ -181,6 +185,7 @@ const legacyAudit = (value: unknown): FabricLegacyRenderAudit | undefined => {
   if (!isRecord(value) || typeof value.ref !== "string") return undefined;
   return {
     ref: value.ref,
+    ...(typeof value.nestedToolCallId === "string" ? { nestedToolCallId: value.nestedToolCallId } : {}),
     ...(typeof value.tool === "string" ? { tool: value.tool } : {}),
     ...(typeof value.provider === "string" ? { provider: value.provider } : {}),
     ...(typeof value.success === "boolean" ? { success: value.success } : {}),

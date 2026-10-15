@@ -233,7 +233,7 @@ const principalSessionKey = (context: unknown): object | undefined => {
 };
 const requestMessage = (message: { role?: unknown; customType?: unknown }): boolean =>
   message.role === "user" || (message.role === "custom" &&
-    !["pi-fabric-skill-reference", "pi-fabric-proxy", "pi-fabric-shell-awareness"].includes(String(message.customType)));
+    !["pi-fabric-skill-reference", "pi-fabric-proxy", "pi-fabric-shell-awareness", "pi-fabric-peer-presence"].some(type => message.customType === type));
 
 /** Cheap observers only: no engine imports, identity mapping or filesystem work. */
 export const registerFabricPrincipalCapture = (pi: ExtensionAPI): void => {
@@ -249,7 +249,8 @@ export const registerFabricPrincipalCapture = (pi: ExtensionAPI): void => {
     const session = principalSessionKey(context);
     if (!session) return;
     // Actual inference input includes queued deliveries and survives live reload.
-    // Passive skill/proxy/shell-awareness notices do not replace the requester.
+    // Exact host-owned passive notices (including peer presence) do not replace
+    // the requester. Other custom messages still clear an unverified principal.
     const message = [...event.messages].reverse().find(requestMessage);
     if (message) turnPrincipals.set(session, principalFromReceipt((message as { provenance?: unknown }).provenance));
   });

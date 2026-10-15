@@ -19,7 +19,7 @@ export const encodeResourceNames = (values: readonly unknown[] | undefined): Ben
       if (cached) name = cached;
       else {
         for (let j = value.length - 1; j >= 0; j--) {
-          name = { $: "Con", head: BigInt(value.charCodeAt(j)), tail: name };
+          name = { $: "Con", head: value.charCodeAt(j), tail: name };
         }
         cache.set(value, name);
       }
@@ -36,8 +36,8 @@ export const decodeResourceScope = (scope: ResourceScope): string[] => {
   for (let names = scope.names; names.$ === "Con"; names = names.tail) {
     const chars: string[] = [];
     for (let name = names.head; name.$ === "Con"; name = name.tail) {
-      if (name.head < 0n || name.head > 65535n) throw new Error("Invalid verified resource code unit");
-      chars.push(String.fromCharCode(Number(name.head)));
+      if (name.head < 0 || name.head > 65535) throw new Error("Invalid verified resource code unit");
+      chars.push(String.fromCharCode(name.head));
     }
     result.push(chars.join(""));
   }

@@ -1,14 +1,16 @@
-/** Fabric classifier keys, not Pi chat-provider or upstream TypeSafe/OpenRouter/Vercel model IDs. */
+/** Fabric classifier keys, not Pi chat-provider or upstream TypeSafe/OpenRouter/Vercel/SubQ model IDs. */
 export const JEV_TYPESAFE_MODEL_PREFIX = "pi-fabric/typesafe/";
 export const JEV_OPENROUTER_MODEL_PREFIX = "pi-fabric/openrouter/";
 export const JEV_VERCEL_MODEL_PREFIX = "pi-fabric/vercel-ai-gateway/";
+export const JEV_SUBQ_MODEL_PREFIX = "pi-fabric/subq/";
 
-export type JevClassifierRoute = "typesafe" | "openrouter" | "vercel-ai-gateway";
+export type JevClassifierRoute = "typesafe" | "openrouter" | "vercel-ai-gateway" | "subq";
 
 const ROUTE_PREFIXES: ReadonlyArray<readonly [route: JevClassifierRoute, prefix: string]> = [
   ["typesafe", JEV_TYPESAFE_MODEL_PREFIX],
   ["openrouter", JEV_OPENROUTER_MODEL_PREFIX],
   ["vercel-ai-gateway", JEV_VERCEL_MODEL_PREFIX],
+  ["subq", JEV_SUBQ_MODEL_PREFIX],
 ];
 
 /** Keep saved pre-namespace overrides usable without moving /login jev credentials. */

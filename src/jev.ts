@@ -7,16 +7,19 @@ export { JevProvider, JEV_ACTION_DESCRIPTORS } from "./providers/jev-provider.js
 export { JevObservationHost, JEV_HOST_EVENTS } from "./jev/observation.js";
 export { JevProgramManager, type JevManagerOptions } from "./jev/manager.js";
 export { DEFAULT_JEV_CONFIG, normalizeJevConfig, type FabricJevConfig } from "./jev/config.js";
-export { createJevAuthProvider } from "./jev/auth.js";
+export { createJevAuthProvider, createSubqAuthProvider } from "./jev/auth.js";
 export {
   JEV_OPENROUTER_MODELS,
   JEV_OPENROUTER_ROUTE,
+  JEV_SUBQ_MODELS,
+  JEV_SUBQ_ROUTE,
   JEV_TYPESAFE_MODELS,
   JEV_TYPESAFE_ROUTE,
   JEV_VERCEL_MODELS,
   JEV_VERCEL_ROUTE,
   isJevModelId,
   isJevOpenRouterModelId,
+  isJevSubqModelId,
   isJevVercelModelId,
   jevClassifierKey,
   resolveJevModelRoute,

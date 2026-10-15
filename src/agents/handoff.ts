@@ -1,11 +1,10 @@
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import {
-  CURRENT_SESSION_VERSION,
+import type {
+  SessionEntry,
   SessionManager,
-  type SessionEntry,
-  type SessionMessageEntry,
+  SessionMessageEntry,
 } from "@earendil-works/pi-coding-agent";
 import type { JsonObject } from "@earendil-works/pi-ai";
 import { compileFabricSummary, rawContextTokens, type FabricCompactionBudget } from "../compaction/hook.js";
@@ -13,6 +12,7 @@ import {
   compactionRequestBoundsError,
   encodeCompactionRequest,
 } from "../compaction/instructions.js";
+import { PiCodingAgent } from "../core/host-sdk-runtime.js";
 import type {
   AgentForkSeed,
   AgentSessionSeed,
@@ -184,7 +184,7 @@ const materializeBranch = (
   const sessionFile = path.join(directory, `handoff-${id}.jsonl`);
   const header = {
     type: "session" as const,
-    version: CURRENT_SESSION_VERSION,
+    version: PiCodingAgent.CURRENT_SESSION_VERSION,
     id,
     timestamp: new Date().toISOString(),
     cwd,
@@ -195,7 +195,7 @@ const materializeBranch = (
     `${[header, ...seed.sourceBranch].map((entry) => JSON.stringify(entry)).join("\n")}\n`,
     { encoding: "utf8", mode: 0o600, flag: "wx" },
   );
-  return SessionManager.open(sessionFile, directory, cwd);
+  return PiCodingAgent.SessionManager.open(sessionFile, directory, cwd);
 };
 
 const forkBranch = (
@@ -204,7 +204,7 @@ const forkBranch = (
   directory: string,
 ): SessionManager => {
   if (!seed.sourceSessionFile) return materializeBranch(seed, cwd, directory);
-  const fork = SessionManager.open(seed.sourceSessionFile, directory, cwd);
+  const fork = PiCodingAgent.SessionManager.open(seed.sourceSessionFile, directory, cwd);
   if (!fork.getEntry(seed.sourceBranchLeafId)) {
     throw new Error(
       `Trajectory handoff branch point ${seed.sourceBranchLeafId} is missing from the persisted Pi session`,
@@ -229,7 +229,7 @@ const persistedBranch = (
   if (!seed.sourceSessionFile) {
     throw new Error("Persisted trajectory handoff is missing its source session file");
   }
-  const source = SessionManager.open(seed.sourceSessionFile, directory, cwd);
+  const source = PiCodingAgent.SessionManager.open(seed.sourceSessionFile, directory, cwd);
   if (!source.getEntry(seed.sourceBranchLeafId)) {
     throw new Error(
       `Trajectory handoff branch point ${seed.sourceBranchLeafId} is missing from the persisted Pi session`,

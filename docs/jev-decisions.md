@@ -57,6 +57,7 @@ Store routing data, never resolved keys, under trusted `fabric.json`:
       "defaultProfile": "fast",
       "profiles": {
         "fast": { "provider": "typesafe", "model": "jev-latest" },
+        "snap": { "provider": "subq", "model": "subq-snap-preview" },
         "vision": { "provider": "openai", "model": "gpt-6-luna" },
         "local": { "provider": "llama.cpp", "model": "local", "allowLocal": true }
       }

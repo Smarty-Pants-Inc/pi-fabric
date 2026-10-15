@@ -44,7 +44,7 @@
         "vitest": "^4.1.10",
       },
       "optionalDependencies": {
-        "jev-fabric": "0.6.0",
+        "jev-fabric": "0.7.1",
       },
       "peerDependencies": {
         "@earendil-works/pi-agent-core": "*",
@@ -644,13 +644,11 @@
 
     "isexe": ["isexe@2.0.0", "", {}, "sha512-RHxMLp9lnKHGHRng9QFhRCMbYAcVpn69smSGcq3f36xjgVVWThj4qqLbTLlq7Ssj8B+fIQ1EuCEGI2lKsyQeIw=="],
 
-    "jev-fabric": ["jev-fabric@0.6.0", "", { "optionalDependencies": { "jev-fabric-darwin": "0.6.0", "jev-fabric-linux-arm64": "0.6.0", "jev-fabric-linux-x64": "0.6.0" }, "bin": { "jev-fabric": "bin/jev-fabric.js" } }, "sha512-Clx9N6HahtMQBPoeAv1su1REuYrYKYuTD8Bw3Yw63QZR771hEcNaoEoR4hLeFMQfjuUb8ZpwQOrXr03uXmfnZg=="],
+    "jev-fabric": ["jev-fabric@0.7.1", "", { "optionalDependencies": { "jev-fabric-darwin": "0.7.1", "jev-fabric-linux-arm64": "0.7.1", "jev-fabric-linux-x64": "0.7.1" }, "bin": { "jev-fabric": "bin/jev-fabric.js" } }, "sha512-vll8L4R+G52VLSIg+Tr2vzdfLacYLrE9IFDCyIbEeTYMp+SeFXDY2QNh9r131YJAZkyZhJe98OcbVxXfzR+uiw=="],
 
-    "jev-fabric-darwin": ["jev-fabric-darwin@0.6.0", "", { "os": "darwin", "cpu": [ "x64", "arm64", ] }, "sha512-ppD70AAfN8kRxImk2BUoKOUwv7+1bKPh4jHthNistRrKyORXmI8JvkCbZtZGHa02mg3WRDjaUAcW+Vi54YNbSw=="],
+    "jev-fabric-darwin": ["jev-fabric-darwin@0.7.1", "", { "os": "darwin", "cpu": [ "x64", "arm64", ] }, "sha512-0+agzFKMF/vJf/I+vaBfePARl3ajz1GhgR8k8wBMT9mftCnUrVbMd18uN+psNjmtmaZ/SoARkWuVUhqSdgdOTA=="],
 
-    "jev-fabric-linux-arm64": ["jev-fabric-linux-arm64@0.6.0", "", { "os": "linux", "cpu": "arm64" }, "sha512-Q2yqAaV8FIQO1RTZedjpri2PQjyNsS1bPMbC+ctmPsa/y8ihQQ2MFCwMpU14yfGSRPb8T8hRjRxWNbyahddT1Q=="],
-
-    "jev-fabric-linux-x64": ["jev-fabric-linux-x64@0.6.0", "", { "os": "linux", "cpu": "x64" }, "sha512-8oEnuQEAA0x1dMeL0j0aPBqdoGpEAiiu7VD/qqNxTFkJIYdeNUW0UcmOGxOSBvruOhMxK5oJPEhZj0FgVQebWA=="],
+    "jev-fabric-linux-x64": ["jev-fabric-linux-x64@0.7.1", "", { "os": "linux", "cpu": "x64" }, "sha512-R1WpsJcIkzrLE/Wn8k+FmJ0ZTz6+zQ6iFzi2erqQT9Grz4ys1Ib6qMOgPQIcu/76x/RQ6uD+h08DJ8cvyVWJaA=="],
 
     "jiti": ["jiti@2.7.0", "", { "bin": { "jiti": "lib/jiti-cli.mjs" } }, "sha512-AC/7JofJvZGrrneWNaEnJeOLUx+JlGt7tNa0wZiRPT4MY1wmfKjt2+6O2p2uz2+skll8OZZmJMNqeke7kKbNgQ=="],
 

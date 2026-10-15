@@ -4,6 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { windowsMeshCacheFixture } from "./windows-mesh-cache-fixture.js";
 // Deliberate VALUE import: unchanged local deletion detector excludes this REAL native Windows suite.
 import { windowsHelperBootstrap } from "../src/storage/verified-remove.js";
 import {
@@ -105,7 +106,9 @@ describe.skipIf(!hosted)(`native Windows mesh C/D recovery (${SKIP})`, () => {
     root = temp();
     expect(windowsHelperBootstrap()).toBeDefined(); // value import intentionally retained for detector + bootstrap pin
     forgetWindowsMeshCapability();
-    windowsMeshReleaseTestHooks.cacheRoot = path.join(temp(), "cache");
+    const cache = windowsMeshCacheFixture("fmc-");
+    dirs.push(cache);
+    windowsMeshReleaseTestHooks.cacheRoot = path.join(cache, "cache");
     cap = prepareWindowsMeshCapability();
   });
   afterEach(async () => {

@@ -4,6 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { windowsMeshCacheFixture } from "./windows-mesh-cache-fixture.js";
 // Deliberate VALUE import: excludes this REAL native/deleting suite from local admission (#13001).
 import { windowsHelperBootstrap } from "../src/storage/verified-remove.js";
 import { ownPidNamespace } from "../src/core/pid-namespace.js";
@@ -54,7 +55,9 @@ for (const domain of ["mesh", "custody"] as const) describe.skipIf(!hosted)(
       root = temp(); lock = path.join(root, domain === "mesh" ? ".lock" : "custody.lock");
       auditFile = path.join(root, "lock-recoveries.jsonl"); recoveries = []; releases = [];
       forgetWindowsMeshCapability();
-      windowsMeshReleaseTestHooks.cacheRoot = path.join(temp(), "cache");
+      const cache = windowsMeshCacheFixture("fop-");
+      roots.push(cache);
+      windowsMeshReleaseTestHooks.cacheRoot = path.join(cache, "cache");
       const bootstrap = windowsHelperBootstrap(); expect(bootstrap).toBeDefined();
       cap = prepareWindowsMeshCapability(); expect(cap.digest).toBe(bootstrap!.digest);
       windowsMeshReleaseTestHooks.afterChild = sample => { releases.push(sample); };

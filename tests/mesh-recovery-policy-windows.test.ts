@@ -4,6 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { windowsMeshCacheFixture } from "./windows-mesh-cache-fixture.js";
 import { windowsHelperBootstrap } from "../src/storage/verified-remove.js";
 import { processIncarnation } from "../src/core/atomic-write.js";
 import { ownPidNamespace } from "../src/core/pid-namespace.js";
@@ -95,7 +96,9 @@ for (const domain of ["mesh", "custody"] as const) for (const protocol of [1, 2]
     beforeEach(() => {
       root = temp(); recoveries = []; releases = [];
       forgetWindowsMeshCapability();
-      windowsMeshReleaseTestHooks.cacheRoot = path.join(temp(), "cache");
+      const cache = windowsMeshCacheFixture("fpr-");
+      roots.push(cache);
+      windowsMeshReleaseTestHooks.cacheRoot = path.join(cache, "cache");
       windowsMeshReleaseTestHooks.afterChild = sample => { releases.push(sample); };
       windowsMeshRecoveryTestHooks.afterChild = sample => { recoveries.push(sample); };
       const bootstrap = windowsHelperBootstrap(); // real value import also keeps this suite detector-excluded

@@ -4374,11 +4374,36 @@ describe("ActorManager", () => {
         expect(manager.status(actor.id).activationBlocked).toMatchObject({ code: "auth", class: "hard" });
       }, 60_000);
 
+      it("#11998 classifies live repeated registry contention as transient with retry", async () => {
+        const s = setup(true);
+        const actor = await s.actors.create({ name: "repeated-registry-change", instructions: "Respond.", responseMode: "text", topics: ["repeated.registry"] });
+        await s.actors.close();
+        const manager = new ActorManager("test", s.identity, s.mesh, s.meshConfig, s.agents, () => {}, {
+          actorRoot: path.join(s.root, "actors"), persistent: true, preparationRetryMs: 1,
+          transientBlockCooldownMs: 2_000, transientBlockMaxMs: 5_000,
+        });
+        actorManagers.push(manager);
+        const update = ActorRegistryStore.prototype.update;
+        vi.spyOn(ActorRegistryStore.prototype, "update").mockImplementation(function (this: ActorRegistryStore, select, label) {
+          if (label === "manager-update" && manager.status(actor.id).preparing?.phase === "registry") {
+            return Promise.reject(new Error("Actor registry changed repeatedly during preparation"));
+          }
+          return update.call(this, select, label);
+        });
+        await expect(manager.ask(actor.id, "activate")).rejects.toThrow("Actor registry changed repeatedly during preparation");
+        await waitFor(() => !manager.status(actor.id).preparing);
+        expect(manager.status(actor.id).activationBlocked).toMatchObject({
+          code: "registry-changed-repeatedly", class: "transient", retryAt: expect.any(Number), backoffMs: 2_000,
+          reason: "actor registry changed repeatedly during preparation",
+        });
+      }, 60_000);
+
       it("#11998 reclassifies persisted hard veto blocks on host load, but preserves a real 401 hard block", async () => {
         const s = setup(true);
         const unknown = await s.actors.create({ name: "legacy-veto", instructions: "Respond.", responseMode: "text", topics: ["legacy.veto"] });
         const prep = await s.actors.create({ name: "legacy-prep-veto", instructions: "Respond.", responseMode: "text" });
         const auth = await s.actors.create({ name: "legacy-auth", instructions: "Respond.", responseMode: "text" });
+        const contention = await s.actors.create({ name: "legacy-contention", instructions: "Respond.", responseMode: "text", topics: ["legacy.contention"] });
         const known = await s.actors.create({ name: "known-veto", instructions: "Respond.", responseMode: "text" });
         const canonical = await s.actors.create({ name: "canonical-veto", instructions: "Respond.", responseMode: "text" });
         const security = await s.actors.create({ name: "known-veto-security", instructions: "Respond.", responseMode: "text" });
@@ -4392,6 +4417,8 @@ describe("ActorManager", () => {
           [prep.id]: { reason: `Actor ${prep.id} preparation (registry): ${veto}`, code: "failing-preparation",
             classification: "permanent: activation preparation kept failing past its retry budget" },
           [auth.id]: { reason: "Error: 401 Unauthorized: invalid api key", code: "auth", classification: "permanent: credential or authentication failure" },
+          [contention.id]: { reason: "Actor registry changed repeatedly during preparation", code: "unknown",
+            classification: "fail-closed: no transient cause recognised", retryAt: Date.now() + 2_000 },
           [known.id]: { reason: `Actor private-id preparation (registry): ${veto}`, code: "registry-update-vetoed",
             classification: "transient: actor registry update veto committed nothing; retry after backoff" },
           [canonical.id]: { reason: "actor registry validation veto (ownership)", code: "registry-update-vetoed",
@@ -4408,6 +4435,10 @@ describe("ActorManager", () => {
           actorRoot: path.join(s.root, "actors"), persistent: true,
         });
         actorManagers.push(restored);
+        expect(restored.status(contention.id).activationBlocked).toMatchObject({
+          code: "registry-changed-repeatedly", class: "transient", retryAt: expect.any(Number),
+          reason: "actor registry changed repeatedly during preparation",
+        });
         for (const id of [unknown.id, prep.id, known.id, canonical.id]) {
           const expired = restored.status(id).activationBlockExpired!;
           expect(restored.status(id)).toMatchObject({ status: "idle", activationBlockExpired: { code: "registry-update-vetoed", class: "transient",

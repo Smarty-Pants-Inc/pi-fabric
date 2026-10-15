@@ -5,6 +5,7 @@ import { ActorRegistryUpdateVetoedError } from "../src/actors/registry-store.js"
 // Keep: smarty-dev#11998's real catch. Registry vetoes removed review/security actors
 // from routing permanently; near matches and permanent causes must still fail closed.
 const veto = new ActorRegistryUpdateVetoedError().message;
+const registryChanged = "Actor registry changed repeatedly during preparation";
 
 describe("registry veto activation classification (smarty-dev#11998)", () => {
   it.each([
@@ -37,6 +38,7 @@ describe("registry veto activation classification (smarty-dev#11998)", () => {
   it.each(["401 Unauthorized", "security policy violation"])("keeps independent stored permanent evidence hard: %s", error => {
     expect(classifyActivationFailure({ lastError: veto, error, persistedRegistryVeto: "known-code" }).transient).toBe(false);
     expect(classifyActivationFailure({ lastError: veto, error, persistedRegistryVeto: "legacy" }).transient).toBe(false);
+    expect(classifyActivationFailure({ lastError: registryChanged, error, persistedRegistryChangedRepeatedly: "known-code" }).transient).toBe(false);
   });
 
   it("accepts a typed veto cause independently of its wrapper text", () => {
@@ -70,6 +72,23 @@ describe("registry veto activation classification (smarty-dev#11998)", () => {
     const result = classifyActivationFailure({ lastError });
     expect(result.transient).toBe(false);
     expect(activationBlockClass(result.code)).toBe("hard");
+  });
+
+  it.each([
+    registryChanged,
+    "Actor registry changed during participant preparation",
+    `Error: ${registryChanged}`,
+    `Actor abc-123 preparation (registry): ${registryChanged}`,
+    `ActorPreparationError: Actor abc-123 preparation (registry): ${registryChanged}`,
+  ])("classifies registry contention as transient only for preparation or persisted legacy records: %s", lastError => {
+    expect(classifyActivationFailure({ lastError, preparation: true })).toMatchObject({
+      code: "registry-changed-repeatedly", transient: true,
+      reason: registryChanged.toLowerCase(),
+    });
+    expect(classifyActivationFailure({ lastError, persistedRegistryChangedRepeatedly: "legacy" })).toMatchObject({
+      code: "registry-changed-repeatedly", transient: true,
+    });
+    expect(classifyActivationFailure({ lastError })).toMatchObject({ code: "unknown", transient: false });
   });
 
   it.each([

@@ -83,7 +83,7 @@ import { ModelRoutePinError } from "../core/model-refresh.js";
 import type { FabricMessageSender, FabricScope } from "../protocol.js";
 import { launchScope, normalizeScope, processSender, senderStamp, senderTrusted } from "../scope.js";
 import { WARNING_RETENTION_CAP } from "../worker/provider-error.js";
-import { activationBlockClass, classifyActivationFailure, TRANSIENT_ACTIVATION_BLOCK_CODES, type ActivationBlockClass } from "./activation-failure.js";
+import { activationBlockClass, classifyActivationFailure, isRegistryChangedRepeatedlyFailure, TRANSIENT_ACTIVATION_BLOCK_CODES, type ActivationBlockClass } from "./activation-failure.js";
 
 export interface ActorModelRouteInput {
   routeClass: string; protected: unknown; pinModel: unknown; pinThinking: unknown; modelReason?: string;
@@ -527,7 +527,7 @@ export const ACTOR_ALARM_KINDS: readonly ActorAlarmKind[] = ["actor-activation-b
 /** Public alarm reasons are closed codes, including when an episode was restored from disk. */
 const actorAlarmReason = (reason: unknown): string => typeof reason === "string" && [
   "unknown", "context-overflow", "auth", "permission", "security-policy", "quota", "invalid-request",
-  "provider-transient", "activation-window-lost", "child-exit-before-admission", "preparation-timeout", "failing-preparation", "registry-update-vetoed",
+  "provider-transient", "activation-window-lost", "child-exit-before-admission", "preparation-timeout", "failing-preparation", "registry-update-vetoed", "registry-changed-repeatedly",
   "relaunch", "stop", "error", "worker-unverified", "run-dir-missing", "worker-gone", "worker-pid-reused",
 ].includes(reason) ? reason : "unknown";
 /** Mesh key of an actor's alarm claim for one kind; the blocked kind keeps its #7782 key. */
@@ -685,16 +685,18 @@ const restoredActivationBlock = (stored: { reason: string; code: string; since: 
   // Older veto writers persisted the Actor preparation wrapper as the public reason. Always
   // normalize a known veto, even with a classification; only exact canonical reasons survive.
   const knownVeto = stored.code === "registry-update-vetoed";
-  const rederive = knownVeto || legacyOverflow !== undefined || typeof stored.classification !== "string" || REDERIVED_BLOCK_CODES.has(stored.code);
+  const knownRegistryChanged = stored.code === "registry-changed-repeatedly";
+  const rederive = knownVeto || knownRegistryChanged || legacyOverflow !== undefined || typeof stored.classification !== "string" || REDERIVED_BLOCK_CODES.has(stored.code);
   const derived: { code: string; classification: string; reason?: string | undefined } = legacyOverflow ?? (!rederive ? { code: stored.code, classification: stored.classification as string }
-    : (({ code, classification, reason }) => ({ code, reason, classification: !knownVeto && code === stored.code && typeof stored.classification === "string"
+    : (({ code, classification, reason }) => ({ code, reason, classification: !knownVeto && !knownRegistryChanged && code === stored.code && typeof stored.classification === "string"
       ? stored.classification : `${classification} (re-derived from an older record's stored reason)` }))(
       classifyActivationFailure({ lastError: stored.reason,
-        error: knownVeto && typeof stored.classification === "string" ? stored.classification : undefined,
+        error: (knownVeto || knownRegistryChanged) && typeof stored.classification === "string" ? stored.classification : undefined,
         persistedRegistryVeto: knownVeto ? "known-code" : REDERIVED_BLOCK_CODES.has(stored.code) ? "legacy" : undefined,
+        persistedRegistryChangedRepeatedly: knownRegistryChanged ? "known-code" : REDERIVED_BLOCK_CODES.has(stored.code) ? "legacy" : undefined,
         preparation: stored.code === "failing-preparation" || stored.code === "preparation-timeout" })));
   const transient = TRANSIENT_ACTIVATION_BLOCK_CODES.has(derived.code);
-  return { reason: derived.reason ?? (knownVeto ? derived.classification : stored.reason), code: derived.code, class: activationBlockClass(derived.code), since: stored.since,
+  return { reason: derived.reason ?? (knownVeto || knownRegistryChanged ? derived.classification : stored.reason), code: derived.code, class: activationBlockClass(derived.code), since: stored.since,
     blockedAt: finitePositive(stored.blockedAt) ? stored.blockedAt : stored.since, count: stored.count,
     classification: derived.classification, ...(overflowEvidence ? { overflowEvidence } : {}),
     ...(transient && finitePositive(stored.retryAt) ? { retryAt: stored.retryAt } : {}),
@@ -718,10 +720,12 @@ export class ActorPreparationTimeoutError extends ActorPreparationError {
   }
 }
 
-/** Only known preparation deadlines/deferred mesh writes and registry vetoes may expire.
- * Keep the typed veto distinct: it committed nothing, but is not a timeout. */
-const preparationFailureKind = (error: unknown): true | "timeout" | ActorRegistryUpdateVetoedError => {
+/** Only known preparation deadlines/deferred mesh writes, registry vetoes, and the
+ * registry-contention sentinel may expire. Keep the typed veto distinct: it committed nothing,
+ * but is not a timeout. */
+const preparationFailureKind = (error: unknown): true | "timeout" | "registry-changed-repeatedly" | ActorRegistryUpdateVetoedError => {
   for (let cause: unknown = error, depth = 0; cause instanceof Error && depth < 4; cause = cause.cause, depth++) {
+    if (isRegistryChangedRepeatedlyFailure(cause.message)) return "registry-changed-repeatedly";
     if (cause instanceof ActorRegistryUpdateVetoedError) return cause;
     if (cause instanceof ActorPreparationTimeoutError || cause instanceof AgentLaunchPreparationTimeoutError || Boolean(isMeshWriteDeferred(cause))) return "timeout";
   }
@@ -4894,7 +4898,7 @@ export class ActorManager {
           item.reject?.(error instanceof ActorContextOverflowError ? error : new Error(message));
           this.#noteFailedActivation(actor, message, runId, abortController.signal.aborted || runStopped,
             retryPreparation && (item.preparationAttempts ?? 0) >= ACTOR_PREPARATION_MAX_RETRIES ? ACTOR_FAILURE_NOTICE_AFTER : 0,
-            preparationKind instanceof ActorRegistryUpdateVetoedError ? preparationKind : false,
+            preparationKind === "registry-changed-repeatedly" || preparationKind instanceof ActorRegistryUpdateVetoedError ? preparationKind : false,
             error instanceof ActorContextOverflowError, runEvidence, item.overflowRetried === true);
           // A callerless event that failed here is not retried: it is dropped (smarty-dev#9332).
           if (!item.resolve && !item.reject && !abortController.signal.aborted && !runStopped) {
@@ -5055,7 +5059,7 @@ export class ActorManager {
   // Counts consecutive failed activations and, once per streak, tells the owner's Main:
   // a blind supervisor is otherwise silent for as long as it stays broken.
   #noteFailedActivation(actor: ManagedActor, error: string, runId: string | undefined, interrupted: boolean, countFloor = 0,
-    preparation: boolean | "timeout" | ActorRegistryUpdateVetoedError = false, contextOverflowCode = false, evidence?: readonly string[], overflowRetried = false): void {
+    preparation: boolean | "timeout" | "registry-changed-repeatedly" | ActorRegistryUpdateVetoedError = false, contextOverflowCode = false, evidence?: readonly string[], overflowRetried = false): void {
     // An interrupt (ESC), a stop or a shutdown is not a failing actor, and a notice that
     // starts a turn must never cut through the stop-the-world halt.
     if (interrupted || this.#halted || this.#closing) return;
@@ -5075,7 +5079,7 @@ export class ActorManager {
     // smarty-dev#3238 round 2: context-overflow comes only from the run's typed CONTEXT_OVERFLOW code.
     // Fail closed (smarty-dev#8487): only an explicitly transient cause may expire.
     const failure = classifyManagerActivationFailure({ lastError, error, evidence,
-      preparation: preparation === true, preparationTimeout: preparation === "timeout",
+      preparation: preparation === true || preparation === "registry-changed-repeatedly", preparationTimeout: preparation === "timeout",
       registryVeto: preparation instanceof ActorRegistryUpdateVetoedError ? preparation.reason : false },
       contextOverflowCode && !preparation);
     const classified = contextOverflowCode && !preparation && !CONTRADICTORY_OVERFLOW_CODES.has(failure.code)

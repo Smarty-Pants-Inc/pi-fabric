@@ -3,7 +3,8 @@
  *
  * A block only expires for a clearly transient cause: a provider 5xx or throttling 429,
  * a stream error or network disconnect, a timeout, a preparation or lock timeout, a lost
- * activation window, a registry update veto that committed nothing, a child that exited before
+ * activation window, a registry update veto that committed nothing, registry contention during
+ * participant preparation, a child that exited before
  * model admission, or a missing directive reply
  * after one of those. Credential, permission, security-policy, quota, rejected-request (4xx
  * other than 429), context and other preparation failures (a model not allowed, invalid
@@ -26,7 +27,7 @@ export interface ActivationFailureClass {
 /** Codes whose block expires after the bounded backoff; every other code needs a completed run.
  * smarty-dev#6509: a preparation or lock timeout is transient too ("preparation-timeout"). */
 export const TRANSIENT_ACTIVATION_BLOCK_CODES: ReadonlySet<string> = new Set([
-  "provider-transient", "activation-window-lost", "child-exit-before-admission", "preparation-timeout", "registry-update-vetoed",
+  "provider-transient", "activation-window-lost", "child-exit-before-admission", "preparation-timeout", "registry-update-vetoed", "registry-changed-repeatedly",
 ]);
 
 /** smarty-dev#6509: a block's class. Derived from its code, never trusted from a stored record:
@@ -124,9 +125,11 @@ const providerTransientIn = (text: string): { why: string; match: string } | und
  * full failure text; evidence is the run's worker warnings, when the run produced any.
  */
 const WINDOW_LOST = /^[ \t]*(?:Fabric activation window failed: )?(?:Error: )?(Activation window lost (?:current activation messages|its authorized compaction|its native history boundary|its native system records|its native system prompt|the Google config object))[ \t]*\r?$/m;
-// Persisted legacy records only: the old store's exact error, optionally wrapped by #prepare
-// or Error.toString(). Live failures require the typed cause, never a message match.
+// Persisted legacy records (and the internal preparation sentinel) only: the old store's exact
+// error, optionally wrapped by #prepare or Error.toString(). The anchor keeps near matches hard.
 const REGISTRY_VETO = /^(?:(?:Error|ActorPreparationError): )?(?:Actor [\w:-]+ preparation \([\w-]+\): )?(?:ActorRegistryUpdateVetoedError: )?Actor registry update was vetoed by its validation and not committed; retry$/;
+const REGISTRY_CHANGED_REPEATEDLY = /^(?:(?:Error|ActorPreparationError): )?(?:Actor [\w:-]+ preparation \([\w-]+\): )?(?:ParticipantPublicationChangedError: )?Actor registry changed (?:repeatedly during preparation|during participant preparation)$/;
+export const isRegistryChangedRepeatedlyFailure = (text: string): boolean => REGISTRY_CHANGED_REPEATEDLY.test(text);
 export const classifyActivationFailure = (input: {
   lastError: string; error?: string | undefined; evidence?: readonly string[] | undefined; preparation?: boolean | undefined;
   /** The preparation error is a timeout by type (a preparation, launch or mesh lock deadline). */
@@ -135,6 +138,8 @@ export const classifyActivationFailure = (input: {
   registryVeto?: boolean | ActorRegistryVetoReason | undefined;
   /** Restore only: migrate untyped legacy text, or normalize an already stored veto code. */
   persistedRegistryVeto?: "legacy" | "known-code" | undefined;
+  /** Restore only: migrate the old registry-contention text, or normalize its stored code. */
+  persistedRegistryChangedRepeatedly?: "legacy" | "known-code" | undefined;
 }): ActivationFailureClass => {
   const permanent = permanentAnywhere(input);
   const knownVeto = input.persistedRegistryVeto === "known-code";
@@ -146,6 +151,13 @@ export const classifyActivationFailure = (input: {
       ? candidate : "caller-validation";
     return { code: "registry-update-vetoed", transient: true, reason: `actor registry validation veto (${reason})`,
       classification: `transient: actor registry validation veto (${reason}) committed nothing; retry after backoff` };
+  }
+  const knownRegistryChanged = input.persistedRegistryChangedRepeatedly === "known-code";
+  if (!permanent && ((input.preparation && REGISTRY_CHANGED_REPEATEDLY.test(input.lastError)) || knownRegistryChanged ||
+      input.persistedRegistryChangedRepeatedly === "legacy" && REGISTRY_CHANGED_REPEATEDLY.test(input.lastError))) {
+    return { code: "registry-changed-repeatedly", transient: true,
+      reason: "actor registry changed repeatedly during preparation",
+      classification: "transient: actor registry changed repeatedly during preparation; retry after backoff" };
   }
   if (input.preparation || input.preparationTimeout) {
     // smarty-dev#6509: a preparation that only ran out of time (its own deadline, a model/auth

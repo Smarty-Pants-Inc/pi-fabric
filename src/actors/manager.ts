@@ -1180,6 +1180,32 @@ export class ActorManager {
     }
   }
 
+  async #recordSpawnRouterStart(request: FabricActorRequest, actor: ManagedActor): Promise<void> {
+    const decisionId = (request as FabricActorRequest & { spawnRouterDecisionId?: unknown }).spawnRouterDecisionId;
+    if (typeof decisionId !== "string" || !decisionId) return;
+    try {
+      const { recordSpawnRouterStart } = await import("../agents/spawn-router.js");
+      const binding = actor.resolvedBinding ?? {};
+      let sessionId: string | null = null;
+      if (actor.runner === "pi" || actor.runner === "pi-durable") {
+        try { sessionId = readPiSessionHeader(actor.sessionFile)?.id ?? null; } catch { /* No native session yet. */ }
+      }
+      await recordSpawnRouterStart({ meshRoot: this.mesh.root, decisionId, agentId: actor.id,
+        sessionId,
+        model: binding.model ?? actor.model ?? this.agents.defaultModel(actor.runner) ?? null,
+        thinking: binding.thinking ?? actor.thinking ?? this.agents.config.thinking });
+    } catch { /* Ledger writes never change actor creation. */ }
+  }
+
+  async #recordSpawnRouterStartFailed(request: FabricActorRequest): Promise<void> {
+    const decisionId = (request as FabricActorRequest & { spawnRouterDecisionId?: unknown }).spawnRouterDecisionId;
+    if (typeof decisionId !== "string" || !decisionId) return;
+    try {
+      const { recordSpawnRouterStartFailed } = await import("../agents/spawn-router.js");
+      await recordSpawnRouterStartFailed({ meshRoot: this.mesh.root, decisionId });
+    } catch { /* Ledger writes never change actor creation. */ }
+  }
+
   /**
    * Create an actor. The asRegistryOwner option is reserved for explicitly
    * durable requests arriving through the resident host control channel. That
@@ -1205,10 +1231,12 @@ export class ActorManager {
       onCommit?: (id: string) => void;
     } = {},
   ): Promise<FabricActorInfo> {
-    this.#assertReleaseAdmission();
     ++this.#pendingCreates;
+    const routerDecisionId = (request as FabricActorRequest & { spawnRouterDecisionId?: unknown }).spawnRouterDecisionId;
+    let routerStartSettled = typeof routerDecisionId !== "string" || routerDecisionId.length === 0;
     let reservedName: string | undefined;
     try {
+    this.#assertReleaseAdmission();
     this.#refreshOwnership();
     const registryOwnerCreate = asRegistryOwner && request.residency === "durable";
     const sessionMainCreate = (request.residency ?? "session") === "session" &&
@@ -1404,6 +1432,10 @@ export class ActorManager {
         this.#ownQueueRead.add(id);                             // a new actor has no queue file
         this.#ownership.set(id, true);
       }
+      if (!routerStartSettled) {
+        routerStartSettled = true;
+        await this.#recordSpawnRouterStart(request, actor);
+      }
     await this.#publishPresence(actor);
     await this.#publishSlotCreated(actor);
     return this.#publicInfo(actor);
@@ -1412,6 +1444,12 @@ export class ActorManager {
       throw new ActorSlotCreateUncertainError({ actorId: id, claimKey: request.slotClaim?.key,
         claimVersion: request.slotClaim?.ifVersion, requestKey: request.idempotencyKey }, error);
     }
+    } catch (error) {
+      if (!routerStartSettled) {
+        routerStartSettled = true;
+        await this.#recordSpawnRouterStartFailed(request);
+      }
+      throw error;
     } finally {
       // A rejected contender never owns (and must never release) another create's key.
       if (reservedName !== undefined) this.#creationNameReservations.delete(reservedName);

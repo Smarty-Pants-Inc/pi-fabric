@@ -783,9 +783,16 @@ interface FabricActorActivationPolicy {
 type FabricActorInstructionsSource =
   | { instructions: string; instructionsFile?: never; sha256?: never }
   | { instructions?: never; instructionsFile: string; sha256: string };
+/** Exact claim revision; this token is not authority and native admission still validates it. */
+interface FabricActorSlotClaim {
+  key: string;
+  ifVersion: number;
+}
 interface FabricActorRequestBase {
   /** Deduplicate durable creates on the same host; reuse for retries within 10 minutes (last 256 results). */
   idempotencyKey?: string;
+  /** Reuse the exact won revision with the same retry identity; never refresh after uncertainty. */
+  slotClaim?: FabricActorSlotClaim;
   /** Fixed at creation; ask/tell cannot change language. Global templates resolve inheritance on import. */
   kernel?: FabricKernel | "inherit";
   scope?: "session" | "project" | "global";
@@ -832,7 +839,7 @@ type FabricActorRequest = FabricActorRequestBase & FabricActorInstructionsSource
   | { delivery: "steer" | "followUp"; triggerTurn: boolean }
 );
 /** A stored global template. The registry keeps validWhile as source; it is not callable. */
-type FabricActorTemplate = Omit<FabricActorRequestBase, "validWhile" | "timeout_ms"> & {
+type FabricActorTemplate = Omit<FabricActorRequestBase, "validWhile" | "timeout_ms" | "slotClaim"> & {
   instructions: string;
   id: string;
   createdAt: number;
@@ -1071,6 +1078,25 @@ interface FabricMessageDelivery {
   coalesced?: true;
   replacedMessageId?: string;
 }
+/** Select the native store to inspect; this read-only preflight never starts a host. */
+interface FabricSlotStatusOptions {
+  readonly residency?: "session" | "durable";
+}
+/** Diagnostics from the selected native store, not caller-supplied admission authority. */
+interface FabricSlotStatus {
+  readonly protocol: "slot-admission-v1";
+  readonly enforcement: "enforced" | "unenforced" | "blocked";
+  readonly reason?: "nats-backend" | "existing-authority" | "not-configured" | "unsupported-authority" | "authority-unavailable";
+  readonly gap?: "smarty-dev#7991";
+  readonly backend: string;
+  readonly authorityGeneration?: string;
+  readonly hubRootId?: string;
+  readonly routesDigest?: string;
+  readonly meshRoot?: string;
+  readonly databaseFileIdentity?: Readonly<{ canonicalPath: string; device: string; inode: string }>;
+  readonly phase?: "enforce";
+  readonly issue?: "smarty-dev#13036";
+}
 interface FabricAgentsApi {
   run(args: FabricAgentRequest & { pinModel?: string; pinThinking?: FabricThinking }): Promise<FabricAgentResult>;
   /** Hosted capability only; resumes a paused direct child without exposing its checkpoint. */
@@ -1156,6 +1182,8 @@ interface FabricAgentsApi {
   /** Advisory compaction of a running Pi-runner child at its next safe turn boundary. */
   compact(args: { id: string; instructions?: string }): Promise<{ queued: true; messageId: string }>;
   actorStatus(args: FabricAgentTargetArgs): Promise<FabricActorReadInfo>;
+  /** Inspect session (default) or the selected live durable host without changing authority. */
+  slotStatus(args?: FabricSlotStatusOptions): Promise<FabricSlotStatus>;
   /** Read a live actor's instruction text and its sha256 digest. Writes nothing. */
   instructions(args: FabricAgentTargetArgs): Promise<{
     id: string;
@@ -1174,7 +1202,7 @@ interface FabricAgentsApi {
   /** Fresh actor session, archived history and mailbox kept. The owning Main requests resident reset directly; an admitted activation settles at the fenced boundary while other commands remain serviceable. Explicit stop cancels work and any pending reset; it is not preparation for repair. */
   resetSession(args: { id: string }): Promise<FabricActorInfo>;
   /** Stamp a global template into the current project as a fresh live actor with no inherited history. */
-  "import"(args: { id?: string; name?: string; as?: string }): Promise<FabricActorInfo>;
+  "import"(args: { id?: string; name?: string; as?: string; slotClaim?: FabricActorSlotClaim; idempotencyKey?: string }): Promise<FabricActorInfo>;
   /** Write a live project actor's definition to the global registry as a template. Requires write: true; it is not a read. */
   "export"(args: { id: string; write: true; overwrite?: boolean }): Promise<FabricActorTemplate>;
   log(args: {

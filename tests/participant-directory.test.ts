@@ -18,6 +18,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import type { FabricParticipantRecord } from "../src/topology/types.js";
 import { sessionLiveness } from "../src/topology/legacy-root-liveness.js";
 import { awaitPeerSettle, type PeerSettleResult } from "../src/topology/peer-settle.js";
+import { DIRECTORY_RETENTION_MS } from "../src/topology/host-reaper.js";
 
 const roots: string[] = [];
 const directories: ParticipantDirectory[] = [];
@@ -98,6 +99,90 @@ const createDirectory = (
 afterEach(async () => {
   await Promise.all(directories.splice(0).map((directory) => directory.close()));
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
+});
+
+// Keep reason: private-receipt trust boundary and PR #1180's legacy retention bypass.
+// Read-only stub: no mesh writes, actor execution, or product deletion.
+describe("legacy actor tombstone retention", () => {
+  const now = 2 * DIRECTORY_RETENTION_MS;
+  const identity: MeshIdentity = { id: "session:observer", name: "Observer", kind: "main" };
+  const terminal = (settledAt: number | undefined): FabricParticipantRecord => ({
+    ...agentRecord("legacy-actor", "session:gone", "session:gone", "session:gone"),
+    kind: "actor", status: "stopped", stopReason: "owner-root-gone", capabilities: [],
+    transport: "host", controlProtocol: "legacy", ...(settledAt !== undefined ? { settledAt } : {}),
+  });
+  const fixture = (validate: () => FabricParticipantRecord | undefined,
+    copies: "legacy" | "participant" | "dual" = "legacy") => {
+    const entry = { key: "actors/gone/legacy-actor", version: 7, updatedAt: now + DIRECTORY_RETENTION_MS,
+      updatedBy: identity, value: { id: "legacy-actor", status: "stopped", stopReason: "owner-root-gone",
+        settledAt: now + DIRECTORY_RETENTION_MS } };
+    const participant = { ...entry, key: "topology/participants/legacy-actor" };
+    const entries = copies === "legacy" ? [entry] : copies === "participant" ? [participant] : [entry, participant];
+    const listAll = (prefix: string) => entries.filter(candidate => candidate.key.startsWith(prefix));
+    const token = {};
+    const mesh = {
+      root: path.join(os.tmpdir(), `p2-read-only-legacy-directory-${process.pid}`),
+      listAll, listAllShared: listAll, stateToken: () => token,
+    } as unknown as MeshStore;
+    return new ParticipantDirectory(mesh, { enabled: true, hostId: identity.id, rootId: identity.id,
+      identity, reapDeadHosts: false, terminalActor: validate });
+  };
+
+  it.each([
+    ["fresh", now - DIRECTORY_RETENTION_MS + 1, true],
+    ["expired despite a future public envelope", now - DIRECTORY_RETENTION_MS - 1, false],
+    ["exact retention boundary", now - DIRECTORY_RETENTION_MS, false],
+    ["missing private time", undefined, false],
+    ["nonfinite private time", NaN, false],
+    ["future private time", now + 1, false],
+  ] as const)("lists only retained authenticated tombstones: %s", (_name, settledAt, listed) => {
+    const directory = fixture(() => terminal(settledAt));
+    const actors = directory.list({ scope: "project", kinds: ["actor"], includeStale: true }, now);
+    expect(actors.map(actor => actor.id)).toEqual(listed ? ["legacy-actor"] : []);
+    if (listed) expect(actors[0]).toMatchObject({ settledAt, capabilities: [], stale: true });
+  });
+
+  describe.each(["participant", "dual"] as const)("%s copies", copies => {
+    it.each([
+      ["fresh", now - DIRECTORY_RETENTION_MS + 1, true],
+      ["exact retention boundary", now - DIRECTORY_RETENTION_MS, false],
+      ["older despite future public time", now - DIRECTORY_RETENTION_MS - 1, false],
+      ["missing private time", undefined, false],
+      ["future private time", now + 1, false],
+    ] as const)("uses immutable private time: %s", (_name, settledAt, listed) => {
+      const directory = fixture(() => terminal(settledAt), copies);
+      const actors = directory.list({ kinds: ["actor"], includeStale: true }, now);
+      expect(actors.map(actor => actor.id)).toEqual(listed ? ["legacy-actor"] : []);
+      if (listed) expect(actors[0]).toMatchObject({ settledAt, capabilities: [], stale: true });
+    });
+
+    it("ages repeated cached reads and revalidates proof", () => {
+      let authenticated = true;
+      const directory = fixture(() => authenticated ? terminal(now) : undefined, copies);
+      const options = { kinds: ["actor"] as Array<"actor">, includeStale: true };
+      expect(directory.list(options, now)).toHaveLength(1);
+      expect(directory.list(options, now + DIRECTORY_RETENTION_MS - 1)).toHaveLength(1);
+      expect(directory.list(options, now + DIRECTORY_RETENTION_MS)).toEqual([]);
+      expect(directory.list(options, now + DIRECTORY_RETENTION_MS + 1)).toEqual([]);
+      authenticated = false;
+      expect(directory.list(options, now)).toEqual([]);
+    });
+  });
+
+  it("does not trust a public terminal marker without private authentication", () => {
+    const directory = fixture(() => undefined);
+    expect(directory.list({ kinds: ["actor"], includeStale: true }, now)).toEqual([]);
+  });
+
+  it("ages unchanged legacy envelopes and revalidates private proof on each read", () => {
+    let authenticated = true;
+    const directory = fixture(() => authenticated ? terminal(now) : undefined);
+    const options = { kinds: ["actor"] as Array<"actor">, includeStale: true };
+    expect(directory.list(options, now)).toHaveLength(1);
+    expect(directory.list(options, now + DIRECTORY_RETENTION_MS)).toEqual([]);
+    authenticated = false;
+    expect(directory.list(options, now)).toEqual([]);
+  });
 });
 
 describe("ParticipantDirectory routing freshness (#2386)", () => {

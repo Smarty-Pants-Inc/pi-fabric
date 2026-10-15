@@ -18,6 +18,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { FabricActivityStore } from "./activity/store.js";
 import { ActorDirectory, haltEvery } from "./actors/directory.js";
+import { ActorSlotRecoveryParkedError } from "./actors/slot-recovery.js";
 import type { ActorModelRouteInput } from "./actors/manager.js";
 import { resolvePiBinary } from "./agents/pi-binary.js";
 import { isPiShellRef } from "./core/pi-tools.js";
@@ -967,6 +968,9 @@ export class FabricRuntimeState {
         }
         await initializeMeshActivation();
       },
+      // Reuse committed heartbeat maintenance, never another timer/background import.
+      presencePassMs: 25_000,
+      terminalActor: entry => this.#actors?.validateSessionActorTombstone(entry),
       presencePass: async () => {
         await rootPresenceAlarms(this.#mesh!, identity, hostId,
           this.#participants!.list({ scope: "project", includeStale: true, fresh: true }), this.#config!.mesh.rootPresenceAlarmMs);
@@ -1019,7 +1023,9 @@ export class FabricRuntimeState {
           // In dual mode, exclude legacy file custodians with the mesh lock too.
           const register = () => {
             if (!live.current()) throw new Error("Pi Fabric mesh activation lifecycle retired");
-            return registerMainInbox(meshRoot, identity, sessionId, sessionFile);
+            // SMARTY_AGENT is a reusable display label, never a launcher grant. Registration mints
+            // its own root/activation/process identity; only native succession may carry it forward.
+            return registerMainInbox(meshRoot, identity, sessionId, sessionFile, undefined, namedMain ? participantProject(context.cwd) : undefined);
           };
           inboxActivation = meshCustodyMode() === "own" ? register() : await mesh.exclusive(register);
         } finally { releaseCustody(); }
@@ -1525,6 +1531,12 @@ export class FabricRuntimeState {
         firstSeenAgents,
       ),
     );
+    // Reconcile both scopes before actor publication or control/mesh input.
+    try { await this.#actors.recoverProtectedActors(); }
+    catch (error) {
+      if (!(error instanceof ActorSlotRecoveryParkedError)) throw error;
+      console.warn(`[pi-fabric] ${this.#actors.slotRecoveryStatus().error?.message}`);
+    }
     this.#participants.registerSource(() =>
       this.#actors!.listOwned(true).map((actor) =>
         actorParticipantRecord(actor, mainAgentId, hostId, identity.id, identity.id),

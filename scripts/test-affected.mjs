@@ -81,6 +81,7 @@ const isDocsFile = (file) => file === "README.md" || file.startsWith("docs/");
 const direct = [...new Set([
   ...files.filter(isTestFile),
   ...(files.some(isDocsFile) && fs.existsSync(DOCS_STYLE_TEST) ? [DOCS_STYLE_TEST] : []),
+  ...files.flatMap((file) => file === "src/actors/session-orphans.ts" ? ["tests/actor-registry-owner-label.test.ts"] : []),
 ])];
 const related = files.filter(
   (file) => (file.startsWith("src/") || file.startsWith("tests/")) && !isTestFile(file),

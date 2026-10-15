@@ -1,4 +1,5 @@
 import type { FabricExecutionOutcomeV1 } from "../audit/trace.js";
+import { detachedPreview } from "../core/preview.js";
 import type { EntryRange, MemoryCoverage } from "./index.js";
 import type { MemoryBranches } from "./lineage.js";
 import type {
@@ -149,7 +150,7 @@ interface Snippet {
 
 const boundedMetadata = (value: string | null | undefined, max = 512): string | null => {
   if (value === undefined || value === null) return null;
-  return value.length <= max ? value : `${value.slice(0, Math.max(1, max - 1))}…`;
+  return value.length <= max ? detachedPreview(value, max) : `${detachedPreview(value, Math.max(1, max - 1))}…`;
 };
 
 const safeSlice = (text: string, start: number, end: number): string => {
@@ -159,7 +160,7 @@ const safeSlice = (text: string, start: number, end: number): string => {
   if (safeStart > 0 && startCode >= 0xdc00 && startCode <= 0xdfff) safeStart += 1;
   const endCode = text.charCodeAt(safeEnd - 1);
   if (safeEnd < text.length && endCode >= 0xd800 && endCode <= 0xdbff) safeEnd -= 1;
-  return text.slice(safeStart, safeEnd);
+  return detachedPreview(text.slice(safeStart, safeEnd), Math.max(0, safeEnd - safeStart));
 };
 
 const snippetAnchor = (
@@ -191,7 +192,7 @@ const makeSnippet = (
   queryMode: MemoryQueryMode,
   maxChars: number,
 ): Snippet => {
-  if (text.length <= maxChars) return { text, truncated: false };
+  if (text.length <= maxChars) return { text: detachedPreview(text, maxChars), truncated: false };
   const anchor = snippetAnchor(text, query, queryMode);
   const leadingContext = Math.floor(maxChars / 3);
   let start = Math.max(0, anchor - leadingContext);

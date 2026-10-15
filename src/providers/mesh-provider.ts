@@ -1,4 +1,5 @@
 import { isAddressedHubFactoryEvent } from "../mesh/bridge-topics.js";
+import { slotAdmissionFor } from "../actors/slot-admission.js";
 import { recordUnknownTarget } from "../mesh/delivery-outcomes.js";
 import type {
   FabricActionDescriptor,
@@ -607,6 +608,7 @@ export class MeshProvider implements FabricProvider {
       case "put": {
         const key = String(args.key);
         assertPublicStateKey(key);
+        if (key.startsWith("factory/review-slots/v1/")) slotAdmissionFor(this.store).guardClaimMutation(key);
         return this.store.put({
           key,
           value: args.value,
@@ -617,6 +619,7 @@ export class MeshProvider implements FabricProvider {
       case "delete": {
         const key = String(args.key);
         assertPublicStateKey(key);
+        if (key.startsWith("factory/review-slots/v1/")) slotAdmissionFor(this.store).guardClaimMutation(key);
         return this.store.delete({
           key,
           ...(typeof args.ifVersion === "number" ? { ifVersion: args.ifVersion } : {}),

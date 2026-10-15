@@ -25,7 +25,7 @@ import {
 } from "../config.js";
 import { MeshStore, meshOutageAlarmSink, type MeshBatchOperation, type MeshBatchResult, type MeshEvent, type MeshIdentity, type MeshStateEntry } from "../mesh/store.js";
 import type { FabricMainAgentTarget } from "../main-agent.js";
-import type { FabricParticipantResidency } from "../topology/types.js";
+import type { FabricParticipantRecord, FabricParticipantResidency } from "../topology/types.js";
 import { PARTICIPANT_NAME_PATTERN as ACTOR_NAME_PATTERN } from "../topology/participant-name.js";
 import { AgentLaunchPreparationTimeoutError, AgentManager } from "../agents/manager.js";
 import type { AgentRunRecord, AgentRunRequest, AgentRunResult } from "../agents/types.js";
@@ -1328,6 +1328,12 @@ export class ActorManager {
 
   /** ActorDirectory supplies foreign-session discovery; a single registry has none. */
   reconcileSessionOrphans(): Promise<number> { return Promise.resolve(0); }
+
+  /** Foreign history retirement is separate from destructive actor removal. */
+  retireSessionOrphan(_id: string, _checkActive: () => void): Promise<{ removed: true; retired: true; id: string; historyPreserved: true } | undefined> {
+    return Promise.resolve(undefined);
+  }
+  validateSessionActorTombstone(_entry: MeshStateEntry): FabricParticipantRecord | undefined { return undefined; }
 
   list(): FabricActorInfo[] {
     this.#syncActorsFromRegistry();

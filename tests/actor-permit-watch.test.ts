@@ -31,6 +31,7 @@ interface Worker {
   launch: AgentTransportLaunch;
   pid: number;
   alive: boolean;
+  contactLost?: string;
   identityAlive?: boolean;
   birth?: string;
   probeError?: string;
@@ -108,12 +109,12 @@ beforeEach(() => {
     if (closing) complete(worker); // Failed-test teardown also drains any queued launches.
     return {
       kind: "process", sessionId: String(pid), closed,
-      stopDebt: () => worker.debt, lostContact: () => worker.debt,
+      stopDebt: () => worker.debt, lostContact: () => worker.contactLost ?? worker.debt,
       waitForClose: async () => {
         if (worker.alive || worker.descendants || worker.debt) throw new Error("Native custody still open");
         await closed;
       },
-      isAlive: async () => worker.alive || worker.descendants,
+      isAlive: async () => !worker.contactLost && (worker.alive || worker.descendants),
       stop: async () => {
         if (worker.alive || worker.descendants || worker.debt) throw new Error("Owned tree exit unconfirmed");
         await closed;
@@ -183,10 +184,22 @@ function complete(worker: Worker) {
   worker.alive = false;
   worker.descendants = false;
   delete worker.debt;
+  delete worker.contactLost;
   delete worker.probeError;
   worker.nativeClose();
   save(worker, { status: "completed", text: "finished", finishedAt: Date.now(), updatedAt: Date.now(), exitCode: 0 });
 }
+// Durable activation evidence, not an inference from permit counters: releasing
+// RUN must not acknowledge or restart the actor's still-owned native-session turn.
+const queueEvidence = (f: Fixture, actorId: string) => {
+  const directory = path.join(f.root, "actors", actorId);
+  const files = fs.readdirSync(directory).filter(file => /^queue-.*\.json$/.test(file));
+  expect(files).toHaveLength(1);
+  return JSON.parse(fs.readFileSync(path.join(directory, files[0]!), "utf8")) as {
+    items: Array<{ id: string; executionStarted: boolean }>;
+    latestActivationSequence: number;
+  };
+};
 const create = (f: Fixture, name: string) => f.actors.create({ name, instructions: "Respond", responseMode: "text", coalesce: false });
 async function blockedSuccessor(f: Fixture) {
   const actor = await create(f, "successor");
@@ -320,20 +333,126 @@ describe("actor worker permit release (#9031)", () => {
     expect(f.actors.status(actor.id).inFlightRun?.id).toBe(worker.launch.id);
   });
 
-  it.each(["descendants", "native-debt"] as const)("gone leader with %s does not discharge whole-execution custody", async fault => {
+  it.each(["descendants", "native-debt"] as const)("lost-contact publication fence registers RUN before settlement and releases it once despite %s", async fault => {
+    const f = fixture();
+    const actor = await create(f, "lost-contact-root");
+    await f.actors.tell(actor.id, "unique stranded activation");
+    const first = await launched(f, actor.id);
+    await f.actors.tell(actor.id, "same actor writer must wait");
+    const before = queueEvidence(f, actor.id);
+    expect(before.items.map(item => item.executionStarted)).toEqual([true, false]);
+    let logicalSettled = false;
+    void f.agents.wait(first.launch.id).then(() => { logicalSettled = true; }, () => { logicalSettled = true; });
+    const next = await blockedSuccessor(f);
+
+    // ROOT: transport contact fails while the exact host-owned PID is ALIVE.
+    // The second variant makes the host probe uncertain (EPERM); a changed
+    // birth must not override that failure and authorize early admission.
+    if (fault === "native-debt") { first.probeError = "EPERM"; first.birth = "67890"; }
+    // Native close normally wakes the monitor; its existing 1 s liveness grace
+    // is the bounded safety net needed to reach #markLost -> #settle's fence.
+    const contactLostAt = Date.now();
+    first.contactLost = "recorded transport contact lost; native PID still alive";
+    await eventually(() => {
+      const marker = path.join(path.dirname(first.statusFile), "unresolved-worker.json");
+      expect(fs.existsSync(marker)).toBe(true);
+      expect(JSON.parse(fs.readFileSync(marker, "utf8")).reason).toBe(first.contactLost);
+    });
+    expect(Date.now() - contactLostAt).toBeGreaterThanOrEqual(1_000);
+    expect(first.alive).toBe(true);
+    if (fault === "native-debt") expect(() => process.kill(first.pid, 0)).toThrow("EPERM");
+    else expect(process.kill(first.pid, 0)).toBe(true);
+    expect(logicalSettled).toBe(false);
+    expect(snapshot(f).held.map(held => held.runId)).toEqual([first.launch.id]);
+    expect(snapshot(f).waiting).toHaveLength(1);
+    expect(f.actors.status(actor.id).inFlightRun?.id).toBe(first.launch.id);
+    expect(queueEvidence(f, actor.id)).toEqual(before);
+    expect(workers.size).toBe(1);
+    expect(f.agents.heldPermits()).toBe(1); // Fails on 03ac: registration is after the actor fence.
+
+    // Exact primary death frees only RUN, not the native/session writer lease.
+    first.alive = false;
+    delete first.probeError; // The exact host probe now returns ESRCH, not EPERM.
+    if (fault === "descendants") first.descendants = true;
+    else first.debt = "native tree close unconfirmed";
+    first.nativeClose();
+    const second = await launched(f, next.actor.id);
+    expect(second.launch.id).not.toBe(first.launch.id);
+    expect(f.agents.heldPermits()).toBe(0);
+    expect(f.agents.retentionCustodyVeto(first.launch.id)).toBe(true);
+    expect(f.actors.status(actor.id).inFlightRun?.id).toBe(first.launch.id);
+    expect(f.actors.status(actor.id).queued).toBe(1);
+    expect(logicalSettled).toBe(false);
+    expect(queueEvidence(f, actor.id)).toEqual(before);
+    expect(workers.size).toBe(2);
+
+    // A later ordinary native join/settlement must not release that old RUN a
+    // second time and admit two writers while the independent second is alive.
+    const thirdActor = await create(f, "once-only-successor");
+    const thirdAnswer = f.actors.ask(thirdActor.id, "third independent event");
+    void thirdAnswer.catch(() => undefined);
+    await eventually(() => expect(snapshot(f).waiting).toHaveLength(1));
+    complete(first);
+    await f.agents.stop(first.launch.id, { consume: false });
+    await eventually(() => expect(snapshot(f).waiting).toHaveLength(2));
+    await observe();
+    expect(snapshot(f).held.map(held => held.runId)).toEqual([second.launch.id]);
+    expect(workers.size).toBe(2);
+    complete(second);
+    await expect(next.answer).resolves.toMatchObject({ text: "finished" });
+    const third = await launched(f, thirdActor.id);
+    await observe();
+    expect(snapshot(f).waiting).toHaveLength(1);
+    expect(workers.size).toBe(3);
+    complete(third);
+    await expect(thirdAnswer).resolves.toMatchObject({ text: "finished" });
+    const sameActorNext = await launched(f, actor.id);
+    expect(sameActorNext.launch.id).not.toBe(first.launch.id);
+    expect([...workers.values()].filter(worker => worker.record.task === first.record.task)).toHaveLength(1);
+    complete(sameActorNext);
+    await eventually(() => expect(snapshot(f).held).toEqual([]));
+  });
+
+  it("lost-contact alive worker retains actual RUN despite forged primary-death claims", async () => {
+    const f = fixture();
+    const actor = await create(f, "alive-lost-contact");
+    await f.actors.tell(actor.id, "still owns native session");
+    const first = await launched(f, actor.id);
+    await blockedSuccessor(f);
+    first.contactLost = "contact is lost, host worker is not";
+    await eventually(() => expect(fs.existsSync(path.join(path.dirname(first.statusFile), "unresolved-worker.json"))).toBe(true));
+    save(first, { sessionId: String(claimedGonePid), processStartTime: "99999", workerGone: true, settledLost: true });
+    // Intentionally untyped worker-writable claim, not a new public error code.
+    fs.writeFileSync(first.statusFile, JSON.stringify({ ...first.record, errorCode: "WORKER_GONE" }));
+    await observe();
+    expect(process.kill(first.pid, 0)).toBe(true);
+    expect(snapshot(f).held.map(held => held.runId)).toEqual([first.launch.id]);
+    expect(snapshot(f).waiting).toHaveLength(1);
+    expect(f.agents.retentionCustodyVeto(first.launch.id)).toBe(true);
+    expect(f.actors.status(actor.id).inFlightRun?.id).toBe(first.launch.id);
+    expect(workers.size).toBe(1);
+    expect(f.agents.heldPermits()).toBe(1);
+  });
+
+  it.each(["descendants", "native-debt"] as const)("gone leader with %s frees RUN but not whole-execution or same-actor custody", async fault => {
     const f = fixture();
     const actor = await create(f, "tree-custody");
     await f.actors.tell(actor.id, "lost event");
     const worker = await launched(f, actor.id);
-    await blockedSuccessor(f);
+    await f.actors.tell(actor.id, "same native session must wait");
+    const before = queueEvidence(f, actor.id);
+    const next = await blockedSuccessor(f);
     worker.alive = false;
     if (fault === "descendants") worker.descendants = true;
     else worker.debt = "native tree close unconfirmed";
     worker.nativeClose();
-    await observe();
-    expect(snapshot(f).held.map(held => held.runId)).toEqual([worker.launch.id]);
-    expect(snapshot(f).waiting).toHaveLength(1);
-    expect(workers.size).toBe(1);
+    const second = await launched(f, next.actor.id);
+    expect(snapshot(f).held.map(held => held.runId)).toEqual([second.launch.id]);
+    expect(snapshot(f).waiting).toHaveLength(0);
+    expect(workers.size).toBe(2);
+    expect(f.agents.retentionCustodyVeto(worker.launch.id)).toBe(true);
     expect(f.actors.status(actor.id).inFlightRun?.id).toBe(worker.launch.id);
+    expect(f.actors.status(actor.id).queued).toBe(1);
+    expect(queueEvidence(f, actor.id)).toEqual(before);
   });
 });

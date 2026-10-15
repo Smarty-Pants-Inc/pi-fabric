@@ -477,6 +477,8 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
   runRoute: AgentRunRouteMetadata;
   /** smarty-dev#9855: the admission permit a lost-contact process run holds until it is proven gone (once-only). */
   heldPermit?: () => void;
+  /** Actual once-only RUN admission, independent of result and execution/tree custody. */
+  admissionRelease?: () => void;
   /** pi-fabric#939: the worker pid and birth this manager recorded at launch; the only proof source for release. */
   ownProcess?: OwnedProcess;
   /** Monotonic host proof about this exact actor attempt, never a status-file identity. */
@@ -2220,6 +2222,10 @@ export class AgentManager {
           try { launchCancelled = !authorize(); } catch { launchCancelled = true; }
         }
         if (launchCancelled) queued?.abort.abort();
+        const admissionRelease = once(() => {
+          delete managed.admissionRelease;
+          release();
+        });
         const managed: ManagedAgent = {
           runRoute,
           id,
@@ -2250,9 +2256,10 @@ export class AgentManager {
           launch: { ...launch, signal: authorize ? signal : undefined },
           startupAttempts: 1,
           ...lifecycle,
+          admissionRelease,
           release: () => {
-            if (managed.executionExited) release();
-            else managed.executionRelease = release;
+            if (managed.executionExited) admissionRelease();
+            else managed.executionRelease = admissionRelease;
           },
           abortSignal: queued && !authorize ? undefined : signal,
           abortHandler: undefined,
@@ -2472,8 +2479,23 @@ export class AgentManager {
    * gone keeps its permit. Evaluated where permits are acquired (spawn) and held; no timer.
    */
   #releaseProvenGone(): number {
-    if (process.platform !== "linux") return 0;
     let released = 0;
+    // Unsettled actor primary death frees ONLY its actual RUN admission. Logical
+    // results, native descendants, unresolved markers and same-session custody
+    // stay joined. Settled runs retain the existing exact ENODEV recovery below;
+    // heldPermit registration is not a prerequisite for this actor-only proof.
+    for (const managed of this.#runs.values()) {
+      if (!managed.actorId || managed.settled || !managed.admissionRelease || !this.#actorWorkerGone(managed)) continue;
+      const permit = managed.admissionRelease;
+      delete managed.heldPermit;
+      permit();
+      released++;
+    }
+    if (process.platform !== "linux") {
+      if (released) this.#invalidateUiList();
+      if (this.heldPermits() * 2 < this.config.maxConcurrent) this.#admissionAlarmAt = undefined;
+      return released;
+    }
     for (const queued of this.#queued.values()) {
       if (!queued.heldPermit) continue;
       const directory = path.join(this.#runRoot, queued.info.id);
@@ -4478,6 +4500,14 @@ export class AgentManager {
         ...(managed.transport.sessionId ? { sessionId: managed.transport.sessionId } : {}),
       });
     } catch { /* the in-memory mark still guards this manager */ }
+    // Monitor failures can stop before #settle, whose actor publication fence
+    // also precedes normal held-permit registration. Keep the raw admission
+    // visible here, without substituting result settlement for native custody.
+    if (managed.actorId && managed.transport.kind === "process" && managed.admissionRelease) {
+      managed.heldPermit ??= managed.admissionRelease;
+      this.#releaseProvenGone();
+      this.#checkHeldPermits();
+    }
   }
 
   async #transportAliveUntil(transport: AgentTransportHandle, deadline: number): Promise<boolean> {
@@ -4958,7 +4988,8 @@ export class AgentManager {
         (candidate.status === "completed" || candidate.errorCode === "CONTEXT_OVERFLOW" ||
           (!recoverableStop(candidate) && !transportExitedWithoutResult(candidate.error) && !retryablePiStartupError(candidate.error)));
     if (terminalResult(record)) return false;
-    // Failure retains custody and the permit; the existing monitor retries the join.
+    // Failure retains execution/session custody; admission has its separate host-death gate.
+    // The existing monitor retries the join.
     try { await this.#drainExecution(managed); }
     catch { return true; }
     if (!managed.executionExited) return true;
@@ -4988,7 +5019,12 @@ export class AgentManager {
         const transport = watchedTransport = managed.transport;
         nativeClosePending = false;
         void transport.closed?.then(() => {
-          if (managed.transport !== transport || managed.settled) return;
+          if (managed.transport !== transport) return;
+          // An earlier monitor failure may have left only lost-contact custody.
+          // This exact current close is an event to recheck host PID/birth proof,
+          // never proof by itself and never permission to publish an actor result.
+          if (managed.actorId) this.#releaseProvenGone();
+          if (managed.settled) return;
           nativeClosePending = true;
           wake?.();
         }, () => { /* notification is not exit proof */ });
@@ -5196,11 +5232,16 @@ export class AgentManager {
     if (managed.actorId && !managed.executionExited &&
         !(managed.transport.kind === "process" && process.platform === "win32" &&
           managed.transport.waitForClose && !managed.launchCancelled &&
-          (!managed.transport.lostContact?.() || this.#hasNativeStopDebt(managed)))) return;
+          (!managed.transport.lostContact?.() || this.#hasNativeStopDebt(managed)))) {
+      const lost = managed.transport.lostContact?.() ?? managed.lostContact;
+      if (lost) this.#markLost(managed, lost);
+      return;
+    }
     this.#drainLifecycle(managed);
     const lost = managed.transport.lostContact?.();
     if (lost) this.#markLost(managed, lost);
-    if (managed.transport.kind === "process" && managed.lostContact) {
+    if (managed.transport.kind === "process" && managed.lostContact &&
+        (!managed.actorId || managed.admissionRelease)) {
       // Reporting a terminal result is allowed; releasing native admission is not.
       // An uncertain Windows tree can still contain untracked native descendants.
       // smarty-dev#9855: the permit is held, not lost: a later proof of exit releases it once.

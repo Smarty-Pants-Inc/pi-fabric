@@ -100,7 +100,7 @@ describe("real three-node NATS metadata-leader election", () => {
       if (!paused || resumedAt) return;
       clearTimeout(resumeTimer);
       const ok = paused.child.kill("SIGCONT"); // Only the fixture's owned direct ChildProcess, never PID/name discovery.
-      resumedAt = Date.now();
+      resumedAt = performance.now();
       resumed.resolve();
       expect(ok, "owned R1 receiver SIGCONT").toBe(true);
     };
@@ -147,7 +147,7 @@ describe("real three-node NATS metadata-leader election", () => {
             faultConsumer = consumer;
             faultInfo = info;
             faults++;
-            pausedAt = Date.now();
+            pausedAt = performance.now();
             resumeTimer = setTimeout(resume, 6_000); // One finite fault duration; finally also resumes on failed assertions.
             expect(host!.child.kill("SIGSTOP"), "owned R1 receiver SIGSTOP").toBe(true);
             faultArmed.resolve();
@@ -211,7 +211,7 @@ describe("real three-node NATS metadata-leader election", () => {
         const { root, expected } = await bounded(makeSeed(`fault-bootstrap-${setup}`, 3), remaining(), "seed placement precondition");
         const measured = await bounded(makePort(), remaining(), "connect placement precondition");
         selecting = true;
-        const started = Date.now();
+        const started = performance.now();
         const opening = openNatsStateBackend({ root, port: measured.port, replicas: 3, snapshotEvery: 0 });
         // Selection ends at the actual pre-NEXT placement event, not at a later faulted open's completion.
         const selected = await bounded(Promise.race([
@@ -227,12 +227,13 @@ describe("real three-node NATS metadata-leader election", () => {
           continue; // Not a failed-open retry; exact healthy state was proved before ordinary close.
         }
         expect(resumedAt, "initial open must apply exact H WHILE the original receiver host is paused").toBe(0);
-        expect(Date.now() - pausedAt).toBeLessThan(5_000 + 500);
-        expect(Date.now() - started).toBeLessThan(5_000 + 1_000); // CREATE/INFO overhead is not a replacement waiter budget.
+        expect(performance.now() - pausedAt).toBeLessThan(5_000 + 500);
+        expect(performance.now() - started).toBeLessThan(5_000 + 1_000); // CREATE/INFO overhead is not a replacement waiter budget.
         expect(received).toEqual([]);
         expect(creates.filter(info => info.stream_name === faultStream), "exactly seed + faulting reopen CREATEs").toHaveLength(2);
         await bounded(resumed.promise, 7_000, "six-second receiver resume");
-        expect(resumedAt - pausedAt).toBeGreaterThanOrEqual(6_000);
+        // Prove the pause outlived the original 5s waiter with 500ms margin, not an exact 6s timer duration.
+        expect(resumedAt - pausedAt).toBeGreaterThan(5_000 + 500);
         // Original native onMessage callbacks drive this event; no polling framework or transport reconnect.
         await bounded(lateHistory.promise, 3_000, "original consumer late sequences 1-3");
         expect(received).toEqual([1, 2, 3]);

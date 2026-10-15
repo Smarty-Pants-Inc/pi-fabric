@@ -650,7 +650,7 @@ describe("spoke-to-spoke roots and addressed control through the hub", () => {
     return { identity, hosts: [{ record, expiresAt: record.expiresAt }], participants: [{
       format: 1 as const, id, kind: "root" as const, rootId: id, ownerHostId: id, ownerIdentityId: id,
       ownerIncarnation: `fixture:${token}`, name, label: name.toUpperCase(), status: "idle" as const,
-      runner: "pi", transport: "host", capabilities: ["steer", "followUp"], sessionId: name,
+      runner: "pi", transport: "host" as const, capabilities: ["steer", "followUp"], sessionId: name,
       startedAt, updatedAt: startedAt, controlProtocol: "v1" as const,
     }] };
   };

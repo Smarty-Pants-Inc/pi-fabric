@@ -2,6 +2,9 @@ import fs from "node:fs";
 import type { FabricActorInfo, FabricActorRequest, FabricActorStorageScope } from "./types.js";
 import { ActorManager } from "./manager.js";
 import { SessionActorOrphans } from "./session-orphans.js";
+import { ActorSlotRecovery } from "./slot-recovery.js";
+import { slotAdmissionFor } from "./slot-admission.js";
+import { ActorRegistryStore } from "./registry-store.js";
 
 /**
  * Run every halt step even when one throws, then report every failure at once: a scope
@@ -26,6 +29,8 @@ export interface ActorDirectoryRoots {
 export class ActorDirectory extends ActorManager {
   readonly #secondary: ActorManager;
   readonly #defaultScope: FabricActorStorageScope;
+  readonly #slotRegistryRoots: ActorDirectoryRoots;
+  readonly #slotCallerId: string;
   readonly #sessionOrphans: SessionActorOrphans | undefined;
   #orphanReconcilePending: Promise<number> | undefined;
   readonly #orphanRetirements = new Set<Promise<unknown>>();
@@ -38,7 +43,14 @@ export class ActorDirectory extends ActorManager {
     roots: ActorDirectoryRoots,
     defaultScope: FabricActorStorageScope,
   ) {
-    const options = { ...(base[6] ?? {}) };
+    const options = { ...(base[6] ?? {}), slotRecovery: base[6]?.slotRecovery ?? new ActorSlotRecovery(),
+      // Delegated create acquires once in its target manager, never recursively here.
+      creationNameReservations: base[6]?.creationNameReservations ?? new Set<string>(),
+      // Both managers (including startup recovery) fence actual registry rows,
+      // not list() views which intentionally hide quarantined protected actors.
+      slotNameRegistries: base[6]?.persistent === true
+        ? [new ActorRegistryStore(roots.project), new ActorRegistryStore(roots.session)] : [],
+    };
     const meshCursorPath = options.meshCursorPath;
     delete options.actorRoot;
     delete options.meshCursorPath;
@@ -72,6 +84,8 @@ export class ActorDirectory extends ActorManager {
       actorScope: secondaryScope,
     });
     this.#defaultScope = defaultScope;
+    this.#slotRegistryRoots = { ...roots };
+    this.#slotCallerId = options.rootId ?? base[1].id;
     this.#sessionOrphans = persistent && base[3].enabled
       // A resident host outlives Main and must also observe Main's own private
       // session registry. A Main never repairs its current session's records.
@@ -115,11 +129,17 @@ export class ActorDirectory extends ActorManager {
     // A predecessor whose removal is pending finishes behind its run, not in this create's way.
     const sameName = this.#localActors().filter((actor) => actor.name === name && !actor.removal && !actor.sessionOrphan);
     const existing = sameName.find((actor) => actor.status !== "stopped");
-    if (existing) throw new Error(`A Fabric actor named ${name} is already active (${existing.id})`);
+    const slots = slotAdmissionFor(this.mesh);
+    const protectedBirth = slots.requiresEnforcement(request.topics ?? [], this.#slotRegistryRoots[scope], this.#slotCallerId);
+    // Exact protected retries must reach the ledger. The target manager rejects
+    // same-scope ordinary conflicts before intent; cross-scope cleanup stays in
+    // the post-admission hook, with projection parked while any native row remains.
+    if (existing && !protectedBirth) throw new Error(`A Fabric actor named ${name} is already active (${existing.id})`);
     const fencedOptions = {
       ...options,
-      beforeCommit: async (id: string): Promise<void> => {
-        await options.beforeCommit?.(id);
+      beforeMaterialize: async (id: string): Promise<void> => {
+        await options.beforeMaterialize?.(id);
+        // This hook runs only AFTER durable admission, never in SQL beforeCommit.
         // Cross-scope predecessor removal is part of this create's mutation too.
         for (const actor of sameName.filter((actor) => actor.scope !== scope)) {
           options.checkActive?.();

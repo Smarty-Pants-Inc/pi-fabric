@@ -17,7 +17,8 @@ import type { FabricAgentRunner } from "../config.js";
 import type { ResidencyClient } from "../residency/client.js";
 import fs from "node:fs";
 import { randomUUID } from "node:crypto";
-import { FabricParticipantStaleError } from "../topology/host-leases.js";
+import { FabricParticipantStaleError, type MirrorLeaseWaitBudget } from "../topology/host-leases.js";
+import { FabricPeerLeaseStaleError } from "../agents/peer-lease-stale.js";
 import path from "node:path";
 import { kernelFenceAvailable } from "../residency/file-lock.js";
 import { processAlive } from "../storage/scratch.js";
@@ -136,7 +137,9 @@ export class AgentMessageRouter {
     readonly manager: Pick<AgentManager, "status" | "steer" | "followUp" | "stop">,
     readonly actorManager: Pick<ActorManager, "identity" | "status" | "validateDirectMessage" | "tell" | "ask" | "stop" | "steerRemote" | "resolveBinding" | "resolveActivationBinding"> & { owns?: (id: string) => boolean; mesh?: { root: string } },
     readonly mainAgent: Pick<FabricMainAgentTarget, "matches" | "local" | "id" | "deliverAgent" | "interactive">,
-    readonly participants: Pick<FabricParticipantSource, "get" | "scheduleRefresh" | "writeStalled" | "lastKnown"> & Partial<Pick<FabricParticipantSource, "peers" | "list" | "lineageAlive" | "routingUnavailable" | "refreshRoutingView" | "resolveRoutingLease" | "retainedRouteAllowed">>,
+    readonly participants: Pick<FabricParticipantSource, "get" | "scheduleRefresh" | "writeStalled" | "lastKnown"> & Partial<Pick<FabricParticipantSource, "peers" | "list" | "lineageAlive" | "routingUnavailable" | "refreshRoutingView" | "retainedRouteAllowed">> & {
+      resolveRoutingLease?: (id: string, signal?: AbortSignal, budget?: MirrorLeaseWaitBudget) => Promise<boolean>;
+    },
     readonly control: Pick<FabricControlPlane, "request"> | undefined,
     readonly resolvePiRunBinding: (binding: FabricActorRunBinding, runner: FabricAgentRunner, context: FabricInvocationContext, requiredPin?: boolean) => FabricActorRunBinding | Promise<FabricActorRunBinding>,
     readonly residency?: Pick<ResidencyClient, "ensureActor" | "hostId"> & { options: { config: { rootId: string; meshRoot: string } } },
@@ -164,10 +167,10 @@ export class AgentMessageRouter {
       ? new LeaseResolutionRequired(id, error, pin) : error;
   }
 
-  async #resolveRoutingLease(id: string, signal?: AbortSignal): Promise<boolean | undefined> {
+  async #resolveRoutingLease(id: string, signal?: AbortSignal, budget?: MirrorLeaseWaitBudget): Promise<boolean | undefined> {
     signal?.throwIfAborted();
     try {
-      const resolved = await this.participants.resolveRoutingLease?.(id, signal);
+      const resolved = await this.participants.resolveRoutingLease?.(id, signal, budget);
       signal?.throwIfAborted();
       return resolved;
     } catch (error) {
@@ -197,44 +200,61 @@ export class AgentMessageRouter {
       : this.participants.writeStalled?.()?.message;
   }
 
-  async #withDirectory<T>(operation: (authority?: FabricParticipantInfo) => Promise<T>, id?: string, recoverLease = true, signal?: AbortSignal): Promise<T> {
+  async #withDirectory<T>(operation: (authority?: FabricParticipantInfo, budget?: MirrorLeaseWaitBudget) => Promise<T>, id?: string, recoverLease = true, signal?: AbortSignal): Promise<T> {
     signal?.throwIfAborted();
+    const budget: MirrorLeaseWaitBudget = {};
     let authority: FabricParticipantInfo | undefined;
+    const retry = (pin = authority): Promise<T> => operation(pin, budget).catch(error => {
+      if (error instanceof LeaseResolutionRequired) throw error.original;
+      throw error;
+    });
     const resolveLease = async (target: string): Promise<boolean | undefined> => {
       if (!this.participants.resolveRoutingLease) return undefined;
       // Bootstrap/late-read recovery must pin before waiting, even while the view is unavailable.
       // If this raw refusal-fence read fails, skip the wait, but never skip the canonical probe.
       try {
-        const known = this.participants.lastKnown?.(target)?.participant;
+        const known = this.participants.lastKnown?.(target)?.participant ??
+          this.participants.get(target, undefined, { fresh: true });
         if (known?.kind === "root" && known.remoteHost !== undefined) authority ??= known;
       } catch {
         // No wait took place, so no pre-wait authority was selected. The canonical refresh
         // below may recover; normal routing still revalidates its cached/fresh owner fence.
         return undefined;
       }
-      return this.#resolveRoutingLease(target, signal);
+      return this.#resolveRoutingLease(target, signal, budget);
     };
     const reason = this.#directoryUnavailable();
     if (reason) {
-      if (recoverLease && id && await resolveLease(id) === false) throw this.#unknownParticipant(id);
+      // Capture pre-wait authority before the canonical probe can replace its view. Classify
+      // a proven lapse only after that probe; an unconfirmed/failed directory still wins.
+      const resolved = recoverLease && id ? await resolveLease(id) : undefined;
       await this.#refreshDirectory(reason);
+      if (resolved === false) throw this.#unknownParticipant(id!);
     }
     try {
-      return await operation(authority);
+      return await operation(authority, budget);
     } catch (error) {
       signal?.throwIfAborted();
       // Lease recovery is pre-publication only. A failed ACK is never replayed here.
       if (recoverLease && error instanceof LeaseResolutionRequired && this.participants.resolveRoutingLease) {
         // The canonical unknown classification already captured the pre-wait authority.
-        if (await this.#resolveRoutingLease(error.targetId, signal)) return operation(error.authority ?? authority);
+        if (await this.#resolveRoutingLease(error.targetId, signal, budget)) return retry(error.authority ?? authority);
+        if (error.original instanceof FabricPeerLeaseStaleError) {
+          // A fresh source-lapsed sample may have arrived during an indeterminate wait.
+          // Reclassify that proof as root-gone, not the pre-wait freshness diagnostic.
+          const refusal = this.#unknownParticipant(error.targetId);
+          throw refusal instanceof LeaseResolutionRequired ? refusal.original : refusal;
+        }
         throw error.original;
       }
+      if (error instanceof LeaseResolutionRequired) throw error.original;
       // A read can fail after the preflight. Retry resolution once, never delivery after
       // an ACK/control error: only pre-publication directory failures have this class.
       if (!(error instanceof FabricDirectoryUnavailableError) || reason || !this.participants.refreshRoutingView) throw error;
-      if (recoverLease && id && await resolveLease(id) === false) throw this.#unknownParticipant(id);
+      const resolved = recoverLease && id ? await resolveLease(id) : undefined;
       await this.#refreshDirectory(error.message);
-      return operation(authority);
+      if (resolved === false) throw this.#unknownParticipant(id!);
+      return retry();
     }
   }
 
@@ -418,7 +438,7 @@ export class AgentMessageRouter {
       result = provenLocal
         ? await this.#route(id, message, data, kind, context, options, true)
         : await this.#withDurableRecovery(id, recovering =>
-          this.#withDirectory((authority) => this.#route(id, message, data, kind, context, options, false, !recovering, authority), id, !recovering, context?.signal));
+          this.#withDirectory((authority, budget) => this.#route(id, message, data, kind, context, options, false, !recovering, authority, budget), id, !recovering, context?.signal));
     } catch (error) {
       context?.signal?.throwIfAborted();
       const reason = error instanceof Error ? error.message : String(error);
@@ -533,6 +553,7 @@ export class AgentMessageRouter {
     provenLocal = false,
     recoverLease = true,
     authority?: FabricParticipantInfo,
+    budget?: MirrorLeaseWaitBudget,
   ): Promise<FabricAgentMessageResult> {
     context?.signal?.throwIfAborted();
     const provenance = fabricTurnProvenance(options.from ?? this.actorManager.identity, kind, "mesh", options.principal);
@@ -585,13 +606,15 @@ export class AgentMessageRouter {
         throw this.participants.writeStalled?.() ?? this.#unknownParticipant(this.mainAgent.id, "Fabric Main participant");
       }
       if (participant.stale && this.participants.resolveRoutingLease) {
-        if (!await this.#resolveRoutingLease(participant.id, context?.signal)) throw this.#unknownParticipant(participant.id);
+        if (!await this.#resolveRoutingLease(participant.id, context?.signal, budget)) throw this.#unknownParticipant(participant.id);
         const refreshed = this.#rootRouteSnapshot(participant.id, participant);
         if (!refreshed || refreshed.ownerHostId !== participant.ownerHostId || refreshed.ownerIdentityId !== participant.ownerIdentityId) {
           throw new FabricRouteAuthorityError(participant.id);
         }
         participant = refreshed;
       }
+      if (participant.remoteHost && participant.bridgeStale) throw new LeaseResolutionRequired(participant.id,
+        new FabricPeerLeaseStaleError(participant.id, participant.remoteHost, 0), participant);
       if (participant.interactive === false) throw new FabricParticipantNonInteractiveError(participant.id);
       if (!participant.capabilities.includes(kind)) throw unsupported(participant, kind);
       const ownerIncarnation = controlOwnerIncarnation(participant);
@@ -623,6 +646,7 @@ export class AgentMessageRouter {
         {
           ...(context?.signal ? { signal: context.signal } : {}),
           routedRemoteHost: participant.remoteHost ?? null,
+          ...(budget?.waited ? { mirrorLeaseWaitBudget: budget } : {}),
           ...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
           ...(participant.status === "reloading" && typeof participant.reloadUntil === "number"
             ? { timeoutMs: Math.max(1, participant.reloadUntil - Date.now()) } : {}),
@@ -1003,11 +1027,21 @@ export class AgentMessageRouter {
 
   /** Status uses the same bounded lease recovery as followUp/steer. */
   async resolveParticipantFresh(id: string, signal?: AbortSignal): Promise<FabricParticipantInfo | undefined> {
-    return this.#withDirectory(async () => {
+    return this.#withDirectory(async (authority, budget) => {
       const known = this.#get(id);
+      if (known?.kind === "root" && known.remoteHost || authority?.kind === "root" && authority.remoteHost) {
+        const fresh = this.#rootRouteSnapshot(id, authority ?? known);
+        if (fresh?.bridgeStale) throw new LeaseResolutionRequired(id,
+          new FabricPeerLeaseStaleError(id, fresh.remoteHost!, 0), fresh);
+        return fresh;
+      }
       if (known || !this.participants.resolveRoutingLease) return known;
-      if (!await this.#resolveRoutingLease(id, signal)) throw this.#unknownParticipant(id);
-      return this.#get(id);
+      const pin = this.#directoryRead(() => this.participants.lastKnown?.(id)?.participant);
+      if (!await this.#resolveRoutingLease(id, signal, budget)) throw this.#unknownParticipant(id);
+      const fresh = pin?.kind === "root" && pin.remoteHost ? this.#rootRouteSnapshot(id, pin) : this.#get(id);
+      if (fresh?.remoteHost && fresh.bridgeStale) throw new LeaseResolutionRequired(id,
+        new FabricPeerLeaseStaleError(id, fresh.remoteHost, 0), fresh);
+      return fresh;
     }, id, true, signal);
   }
 

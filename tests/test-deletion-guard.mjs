@@ -143,12 +143,21 @@ function isBunExecutable(file) {
     || Boolean(process.versions.bun && file === process.execPath));
 }
 
+// Launchers can hide Bun in a script, shell expansion or another process. Fail closed:
+// these variables are harmless to other programs, unlike dropping the guard for Bun.
+const launchers = new Set(["env", "sh", "bash", "dash", "zsh", "nice", "nohup", "timeout",
+  "setsid", "stdbuf", "xargs", "npx", "npm", "pnpm", "yarn"]);
+function commandMayRunBun(command) {
+  if (!Array.isArray(command)) return false;
+  const words = command.filter((arg) => typeof arg === "string")
+    .flatMap((arg) => arg.split(/[\s"'`;&|()<>=]+/).filter(Boolean));
+  return isBunExecutable(command[0]) || launchers.has(basename(words[0] ?? "").toLowerCase())
+    || words.some(isBunExecutable);
+}
+
 function childProcessRunsBun(name, args) {
-  if (name !== "exec" && name !== "execSync") return isBunExecutable(args[0]);
-  if (typeof args[0] !== "string") return false;
-  // ponytail: inspect only the first shell word, not later arguments or commands.
-  const word = args[0].match(/^\s*(?:"([^"]+)"|'([^']+)'|([^\s]+))(?:\s|$)/);
-  return isBunExecutable(word?.[1] ?? word?.[2] ?? word?.[3]);
+  return commandMayRunBun(name === "exec" || name === "execSync" ? [args[0]]
+    : [args[0], ...(Array.isArray(args[1]) ? args[1] : [])]);
 }
 
 /** Locate options without shifting arguments or exec/execFile callbacks. */
@@ -278,7 +287,8 @@ function install() {
   fs.cp = cpCallback("cp", fs.cp);
   fs.cpSync = cpSync("cpSync", fs.cpSync);
   fs.promises.cp = cpPromise("promises.cp", fs.promises.cp);
-  // Explicit Bun child environments do not inherit process.env. Leave other programs untouched.
+  // Explicit environments do not inherit process.env. Pin Bun and opaque launchers;
+  // preserve the minimal-env contract only for direct non-Bun children.
   for (const name of ["spawn", "spawnSync", "exec", "execSync", "execFile", "execFileSync"]) {
     const original = childProcess[name];
     childProcess[name] = function (...args) {
@@ -307,7 +317,7 @@ function install() {
         const index = Array.isArray(args[0]) ? 1 : 0;
         const options = args[index];
         const command = index === 1 ? args[0] : options?.cmd;
-        if (options?.env && isBunExecutable(command?.[0])) {
+        if (options?.env && commandMayRunBun(command)) {
           args[index] = { ...options, env: pinnedBunEnvironment(options.env, state.root) };
         }
         return Reflect.apply(original, this, args);
@@ -327,8 +337,10 @@ function install() {
 const owner = /** @type {Record<symbol, unknown>} */ (process);
 owner[stateKey] ??= install();
 
-// Bun 1.4.0 cannot update named builtin exports. Repository deletion calls use the fs
-// namespace/default object; test-deletion-guard-imports.test.ts enforces this (smarty-dev#13001).
+// Bun 1.4.0 cannot update named builtin exports or override these builtins with
+// a preload plugin (onResolve is skipped; build.module rejects them). The scoped
+// Bun regression fixtures use object calls; src/ is NOT covered by that contract.
+// The fs deletion-import contract remains separate (smarty-dev#13001).
 
 // Children inherit the guard and its pinned ceiling, not a wider test-mutated TMPDIR.
 {

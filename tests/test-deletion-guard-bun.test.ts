@@ -1,10 +1,16 @@
-import { spawnSync } from "node:child_process";
+import childProcess from "node:child_process";
 import fs from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { describe, expect, it } from "vitest";
 import { residentDrainTemp } from "./helpers/resident-drain-temp.js";
+import { namedChildProcessImportsInSource } from "./helpers/child-process-import-contract.js";
+
+function guardedBunSource(source: string) {
+  expect(namedChildProcessImportsInSource("bun-guard-fixture.mjs", source)).toEqual([]);
+  return source;
+}
 
 // E2E-13001-bun-child-guard: real inherited environment, Bun processes and fs boundaries.
 // A missing guard never gets permission to delete even the disposable sentinel (safe RED).
@@ -58,7 +64,7 @@ fs.rmSync=path=>{if(path!==${JSON.stringify(sentinel)}) throw new Error("unexpec
   // the recorder, never a native outside deleter. The body imports the cached recorder.
   const recordedGuard = join(root, "guard.mjs");
   fs.writeFileSync(recordedGuard, `import ${JSON.stringify(pathToFileURL(recorder).href)};\n${fs.readFileSync(guardPath, "utf8")}`);
-  const bun = spawnSync("bun", ["-p", "process.execPath"], { encoding: "utf8", timeout: 10_000 });
+  const bun = childProcess.spawnSync("bun", ["-p", "process.execPath"], { encoding: "utf8", timeout: 10_000 });
   expect(bun.status, bun.stderr).toBe(0);
   const script = join(root, "bun");
   fs.writeFileSync(script, `#!${bun.stdout.trim()}
@@ -93,7 +99,7 @@ const child=cp.spawnSync(process.execPath,["--input-type=module","-e",${JSON.str
   env:process.env,encoding:"utf8",timeout:10000});
 if(child.error) throw child.error;
 process.stdout.write(child.stdout);process.stderr.write(child.stderr);process.exitCode=child.status??1;` : outer;
-  const child = spawnSync(process.execPath, ["--input-type=module", "-e", launch], {
+  const child = childProcess.spawnSync(process.execPath, ["--input-type=module", "-e", launch], {
       env: { ...env, NODE_OPTIONS: `--import=${preload.href}`,
         BUN_OPTIONS: "", TEST_DELETION_GUARD_ROOT: tmpdir() },
       encoding: "utf8", timeout: 15_000,
@@ -112,7 +118,7 @@ process.stdout.write(child.stdout);process.stderr.write(child.stderr);process.ex
   if (omitted === "null") expect(result.options).toContain("--smol");
 }
 
-function expectGuarded(child: ReturnType<typeof spawnSync>, sentinel: string) {
+function expectGuarded(child: ReturnType<typeof childProcess.spawnSync>, sentinel: string) {
   expect(child.error).toBeUndefined();
   expect(child.status, String(child.stderr)).toBe(0);
   expect(String(child.stdout)).toContain('"guardInstalled":true');
@@ -128,17 +134,17 @@ describe("Bun children inherit the deletion guard", () => {
     const { sentinel, env } = fixture(true);
     const script = join(tmpdir(), `bun-guard-${form}.ts`);
     fs.writeFileSync(script, probe);
-    const args = form === "eval" ? ["-e", probe] : form === "run" ? ["run", script] : [script];
-    expectGuarded(spawnSync("bun", args, { env, encoding: "utf8", timeout: 10_000 }), sentinel);
+    const args = form === "eval" ? ["-e", guardedBunSource(probe)] : form === "run" ? ["run", script] : [script];
+    expectGuarded(childProcess.spawnSync("bun", args, { env, encoding: "utf8", timeout: 10_000 }), sentinel);
   });
 
   it("refuses outside deletion in nested bun -e with the inherited preload", () => {
     const { sentinel, env } = fixture(true);
-    const outer = `import {spawnSync} from "node:child_process";
-const child=spawnSync(process.execPath,["-e",${JSON.stringify(probe)}],{
+    const outer = `import cp from "node:child_process";
+const child=cp.spawnSync(process.execPath,["-e",${JSON.stringify(probe)}],{
   env:process.env,encoding:"utf8",timeout:10000});
 process.stdout.write(child.stdout);process.stderr.write(child.stderr);process.exit(child.status??1);`;
-    expectGuarded(spawnSync("bun", ["-e", outer], { env, encoding: "utf8", timeout: 15_000 }), sentinel);
+    expectGuarded(childProcess.spawnSync("bun", ["-e", guardedBunSource(outer)], { env, encoding: "utf8", timeout: 15_000 }), sentinel);
   });
 
   it("reports and delegates to recorders only on GitHub-hosted Bun", () => {
@@ -156,7 +162,7 @@ fs.rmSync(process.env.GUARD_SENTINEL);
 fs.writeFileSync(process.env.GUARD_SENTINEL,"keep");
 await fsp.rm(process.env.GUARD_SENTINEL);
 console.log(JSON.stringify({guardInstalled:true,report:guard.report,root:guard.root}));`;
-    const child = spawnSync("bun", ["-e", code], {
+    const child = childProcess.spawnSync("bun", ["-e", guardedBunSource(code)], {
       env: { ...env, GITHUB_ACTIONS: "true", RUNNER_ENVIRONMENT: "github-hosted" }, encoding: "utf8", timeout: 10_000,
     });
     expect(child.status, child.stderr).toBe(0);
@@ -171,7 +177,7 @@ console.log(JSON.stringify({guardInstalled:true,report:guard.report,root:guard.r
     env.GITHUB_ACTIONS = "true";
     if (runner) env.RUNNER_ENVIRONMENT = runner;
     else delete env.RUNNER_ENVIRONMENT;
-    expectGuarded(spawnSync("bun", ["-e", probe], {
+    expectGuarded(childProcess.spawnSync("bun", ["-e", guardedBunSource(probe)], {
       env,
       encoding: "utf8", timeout: 10_000,
     }), sentinel);
@@ -208,7 +214,7 @@ if(api.startsWith("Bun.")) {
   else {({stdout,stderr,status}=await new Promise(resolve=>cp[api](...argv,(error,stdout,stderr)=>resolve({stdout,stderr,status:error?.code??0}))));}
 }
 process.stdout.write(stdout??"");process.stderr.write(stderr??"");process.exit(status??1);`;
-      const child = spawnSync("bun", ["-e", outer], { env, encoding: "utf8", timeout: 15_000 });
+      const child = childProcess.spawnSync("bun", ["-e", guardedBunSource(outer)], { env, encoding: "utf8", timeout: 15_000 });
       // execSync/execFileSync inherit stderr rather than returning it; all paths still prove refusal in stdout.
       expect(child.error).toBeUndefined();
       expect(child.status, child.stderr).toBe(0);
@@ -238,7 +244,7 @@ else {
   stdout=child.stdout.toString();
 }
 process.stdout.write(stdout);`;
-      const child = spawnSync("bun", ["-e", outer], { encoding: "utf8", timeout: 10_000 });
+      const child = childProcess.spawnSync("bun", ["-e", guardedBunSource(outer)], { encoding: "utf8", timeout: 10_000 });
       expect(child.error).toBeUndefined();
       expect(child.status, child.stderr).toBe(0);
       expect(JSON.parse(child.stdout)).toEqual(env);
@@ -281,7 +287,7 @@ const child=crossSpawn(process.execPath,[${JSON.stringify(script)}],{
   env:childProcessEnvironment(process.env),stdio:"inherit"});
 child.once("error",error=>{console.error(error);process.exitCode=1});
 child.once("close",code=>{process.exitCode=code??1});`;
-    const child = spawnSync("bun", ["-e", outer], { env, encoding: "utf8", timeout: 15_000 });
+    const child = childProcess.spawnSync("bun", ["-e", guardedBunSource(outer)], { env, encoding: "utf8", timeout: 15_000 });
     expect(child.error).toBeUndefined();
     expect(child.status, child.stderr).toBe(0);
     expect(JSON.parse(child.stdout)).toMatchObject({ guardInstalled: true, cleanupRefused: true });
@@ -297,7 +303,7 @@ child.once("close",code=>{process.exitCode=code??1});`;
     const home = fs.mkdtempSync(join(dirname(root), "bun-home-"));
     const code = `await import(${JSON.stringify(new URL("./test-deletion-guard.mjs", import.meta.url).href)});
 console.log(JSON.stringify({options:process.env.BUN_OPTIONS,root:process.env.TEST_DELETION_GUARD_ROOT}));`;
-    const child = spawnSync(process.execPath, ["--input-type=module", "-e", code], {
+    const child = childProcess.spawnSync(process.execPath, ["--input-type=module", "-e", code], {
       env: { ...process.env, HOME: home, TMPDIR: root, TMP: root, TEMP: root, BUN_OPTIONS: "--smol" },
       encoding: "utf8", timeout: 10_000,
     });
@@ -309,7 +315,7 @@ console.log(JSON.stringify({options:process.env.BUN_OPTIONS,root:process.env.TES
     const narrowed = temp.childEnvironment(process.env.NODE_OPTIONS!);
     expect(narrowed.BUN_OPTIONS).toBe(process.env.BUN_OPTIONS);
     expect(narrowed.TEST_DELETION_GUARD_ROOT).toBe(temp.root);
-    const bun = spawnSync("bun", ["-e",
+    const bun = childProcess.spawnSync("bun", ["-e",
       'console.log(JSON.stringify(process[Symbol.for("pi-fabric.test-deletion-guard")]))'], {
       env: { ...process.env, ...narrowed, TMPDIR: tmpdir(), GITHUB_ACTIONS: "true" },
       encoding: "utf8", timeout: 10_000,

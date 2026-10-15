@@ -520,15 +520,22 @@ const ownDataRecord = (value: unknown): Record<string, unknown> | undefined => {
 const relayAcknowledgementKey = (commandId: string, idempotencyKey: string): string =>
   JSON.stringify([commandId, idempotencyKey]);
 
-interface OwnedControlCommand {
+interface ClaimedControlCommand {
   event: MeshEvent;
   claimVersion: number;
   acceptance?: FabricControlAcceptance;
   saved?: boolean;
   running?: boolean;
   /** Only saved outcomes enter the serial ACK worker; retain the original wire authority. */
-  acknowledgement?: { command: FabricControlCommand; ownerIncarnation: string };
+  acknowledgement?: { command: FabricControlCommand; ownerIncarnation: string | null };
 }
+
+/** Persisted replay owns only an ACK, never claim/save authority or handler retries. */
+type SavedControlAcknowledgement = Pick<ClaimedControlCommand, "event" | "running"> & {
+  acceptance: FabricControlAcceptance;
+  acknowledgement: NonNullable<ClaimedControlCommand["acknowledgement"]>;
+};
+type OwnedControlCommand = ClaimedControlCommand | SavedControlAcknowledgement;
 
 export class FabricControlPlane {
   readonly incarnation: string;
@@ -1697,7 +1704,7 @@ export class FabricControlPlane {
     this.#resumeAcknowledgements();
     // ACK-only custody never joins the reader or re-enters the handler/save retry traversal.
     for (const owned of this.#ownedCommands.values()) {
-      if (!owned.acknowledgement && !owned.running && (!this.#paused || owned.acceptance)) await this.#acceptCommand(owned.event);
+      if ("claimVersion" in owned && !owned.acknowledgement && !owned.running && (!this.#paused || owned.acceptance)) await this.#acceptCommand(owned.event);
     }
     while (this.options.canConsumeMesh?.() !== false) {
       if (this.#acknowledgementsFull()) {
@@ -1883,7 +1890,7 @@ export class FabricControlPlane {
     const ownedKey = controlSeenKey(this.options.hostId, command.commandId);
     const owned = this.#ownedCommands.get(ownedKey);
     if (owned) {
-      if (!owned.acknowledgement && !owned.running) await this.#runOwnedCommand(ownedKey, owned);
+      if ("claimVersion" in owned && !owned.acknowledgement && !owned.running) await this.#runOwnedCommand(ownedKey, owned);
       return;
     }
     this.#assertAdmission();
@@ -1914,9 +1921,16 @@ export class FabricControlPlane {
     if (duplicate) {
       if (duplicate.hostId === this.options.hostId && duplicate.commandId === command.commandId &&
         duplicate.targetId === command.targetId) {
-        await this.#publishAcknowledgement(command, duplicate.acceptance ?? {
-          accepted: false, error: "Fabric control outcome is indeterminate after owner restart",
-        }, duplicate.ownerIncarnation ?? null);
+        if (duplicate.acceptance && (command.operation === "steer" || command.operation === "followUp")) {
+          this.#ownedCommands.set(ownedKey, { event, acceptance: duplicate.acceptance,
+            // A worker may already exist: queued replay custody is running too, not retry work.
+            running: true, acknowledgement: { command, ownerIncarnation: duplicate.ownerIncarnation ?? null } });
+          this.#resumeAcknowledgements();
+        } else {
+          await this.#publishAcknowledgement(command, duplicate.acceptance ?? {
+            accepted: false, error: "Fabric control outcome is indeterminate after owner restart",
+          }, duplicate.ownerIncarnation ?? null);
+        }
       }
       return;
     }
@@ -2043,7 +2057,7 @@ export class FabricControlPlane {
     await this.#runOwnedCommand(key, admitted);
   }
 
-  async #runOwnedCommand(key: string, owned: OwnedControlCommand): Promise<void> {
+  async #runOwnedCommand(key: string, owned: ClaimedControlCommand): Promise<void> {
     if (!owned.acceptance) this.#assertAdmission();
     else assertMeshConsumption(this.options.canConsumeMesh);
     const command = commandFromEvent(owned.event)!;
@@ -2157,7 +2171,7 @@ export class FabricControlPlane {
     command: FabricControlCommand,
     from: MeshIdentity,
     key: string,
-    owned: OwnedControlCommand,
+    owned: ClaimedControlCommand,
     deadlineAt: number,
     sequence: number,
     verification: MeshEvent["verification"],

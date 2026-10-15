@@ -450,6 +450,198 @@ describe("saved steer/followUp ACK obligations (#9751)", () => {
     } finally { blocked.release.open(); blocked.spy.mockRestore(); }
   });
 
+  it.each([
+    ["steer", "9751:predecessor"], ["followUp", "9751:predecessor"],
+    ["steer", undefined], ["followUp", undefined],
+  ] as const)("9751: saved restart %s replay with epoch %s cannot block fresh admission or the inbound reader", async (operation, oldEpoch) => {
+    const f = setup(), blocked = holdFirstAck(f);
+    const acceptance = { accepted: true, messageId: "predecessor-result", result: { revision: 7 } };
+    const original = f.command("replay-A", "agent:same", operation);
+    const a = { ...original, data: { ...original.data, ownerIncarnation: oldEpoch } };
+    await f.own.put({ key: seenKey("replay-A"), identity: identity(ownerId), ifVersion: 0, value: {
+      format: 1, hostId: ownerId, commandId: "replay-A", targetId: "agent:same",
+      ...(oldEpoch === undefined ? {} : { ownerIncarnation: oldEpoch }), expiresAt: Date.now() + 60_000, acceptance,
+    } });
+    const persisted = f.own.get(seenKey("replay-A"), { fresh: true });
+    const put = vi.spyOn(MeshStore.prototype, "put");
+    const receive = vi.fn((command: FabricControlCommand) => ({ accepted: true, messageId: command.commandId }));
+    await f.mesh.publish(a);
+    await f.mesh.publish(f.command("fresh-B", "agent:other", "followUp"));
+    f.owner.start(receive);
+    try {
+      await until(() => expect(blocked.calls()).toBe(1));
+      // Must pass before opening A: a saved predecessor is ACK-only work, not reader work.
+      await until(() => expect(f.saved("fresh-B")).toMatchObject({ acceptance: { accepted: true, messageId: "fresh-B" } }));
+      await f.mesh.publish(a); await f.mesh.publish(f.command("fresh-B", "agent:other", "followUp"));
+      await expect(f.inboundBarrier()).resolves.toMatchObject({ acknowledged: true, messageId: "reader-advanced" });
+      expect(receive.mock.calls.map(([command]) => command.commandId)).toEqual(["fresh-B"]);
+      expect(f.acks()).toEqual([]); expect(blocked.calls()).toBe(1);
+      expect(f.mesh.get(seenKey("replay-A"), { fresh: true })).toBeUndefined(); // no shared re-claim
+      expect(put.mock.calls.some(([input]) => input.key === seenKey("replay-A"))).toBe(false); // no local re-save
+      expect(f.own.get(seenKey("replay-A"), { fresh: true })).toEqual(persisted);
+      blocked.release.open();
+      await until(() => expect(f.acks()).toHaveLength(2));
+      await f.inboundBarrier();
+      expect(f.acks().map(event => (event.data as { commandId: string }).commandId)).toEqual(["replay-A", "fresh-B"]);
+      expect(f.acks("replay-A")[0]!.data).toEqual({ version: 1, commandId: "replay-A", targetId: "agent:same",
+        ...acceptance, ...(oldEpoch === undefined ? {} : { ownerIncarnation: oldEpoch }) });
+      expect(f.acks("fresh-B")[0]!.data).toMatchObject({ ownerIncarnation: f.owner.incarnation });
+      expect(f.own.get(seenKey("replay-A"), { fresh: true })).toEqual(persisted);
+      expect(blocked.calls()).toBe(2); expect(blocked.highWater()).toBe(1); expect(receive).toHaveBeenCalledOnce();
+    } finally { blocked.release.open(); put.mockRestore(); blocked.spy.mockRestore(); }
+  });
+
+  it("9751: saved restart replay shares the 100 ACK cap and leaves the next fresh command unread and unclaimed", async () => {
+    const f = setup(), blocked = holdFirstAck(f), oldEpoch = "9751:predecessor";
+    for (let index = 1; index <= 99; index++) {
+      const id = `replay-cap:${index}`, command = f.command(id, "agent:same", index % 2 ? "steer" : "followUp");
+      await f.own.put({ key: seenKey(id), identity: identity(ownerId), ifVersion: 0, value: {
+        format: 1, hostId: ownerId, commandId: id, targetId: "agent:same", ownerIncarnation: oldEpoch,
+        expiresAt: Date.now() + 60_000, acceptance: { accepted: true, messageId: id },
+      } });
+      await f.mesh.publish({ ...command, data: { ...command.data, ownerIncarnation: oldEpoch } });
+    }
+    await f.mesh.publish(f.command("replay-cap:100", "agent:other"));
+    await f.mesh.publish(f.command("replay-cap:101", "agent:other"));
+    const tail = vi.spyOn(f.mesh, "tail");
+    vi.spyOn(fs, "watch").mockImplementation(() =>
+      Object.assign(new EventEmitter(), { close: vi.fn(), unref: vi.fn() }) as unknown as fs.FSWatcher);
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const timeouts = vi.spyOn(globalThis, "setTimeout");
+    const receive = vi.fn((command: FabricControlCommand) => ({ accepted: true, messageId: command.commandId }));
+    f.owner.start(receive);
+    try {
+      await vi.advanceTimersByTimeAsync(0);
+      expect(blocked.calls()).toBe(1);
+      // 99 saved replays plus this fresh save prove the whole first page reached the SAME cap.
+      expect(f.saved("replay-cap:100")).toMatchObject({ acceptance: { accepted: true } });
+      expect(receive.mock.calls.map(([command]) => command.commandId)).toEqual(["replay-cap:100"]);
+      expect(f.mesh.get(seenKey("replay-cap:101"), { fresh: true })).toBeUndefined();
+      expect(f.saved("replay-cap:101")).toBeUndefined();
+      // Strict pre-tail-page check: neither reading page two nor claiming its command is allowed.
+      expect(tail.mock.results.some(result => result.type === "return" && result.value.events.some(
+        (event: MeshEvent) => event.topic === "fabric.control.command" && (event.data as FabricControlCommand).commandId === "replay-cap:101"))).toBe(false);
+      const readsAtCapacity = tail.mock.calls.length, timersAtCapacity = timeouts.mock.calls.length;
+      const armedAtCapacity = vi.getTimerCount();
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(tail).toHaveBeenCalledTimes(readsAtCapacity);
+      expect(timeouts).toHaveBeenCalledTimes(timersAtCapacity); expect(vi.getTimerCount()).toBe(armedAtCapacity);
+      expect(blocked.calls()).toBe(1);
+      expect(receive.mock.calls.map(([command]) => command.commandId)).toEqual(["replay-cap:100"]);
+      blocked.release.open();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(f.acks()).toHaveLength(101);
+      expect(f.acks().map(event => (event.data as { commandId: string }).commandId)).toEqual(
+        Array.from({ length: 101 }, (_, index) => `replay-cap:${index + 1}`));
+      expect(receive.mock.calls.map(([command]) => command.commandId)).toEqual(["replay-cap:100", "replay-cap:101"]);
+      expect(f.saved("replay-cap:101")).toMatchObject({ acceptance: { accepted: true }, ownerIncarnation: f.owner.incarnation });
+      expect(blocked.calls()).toBe(101); expect(blocked.highWater()).toBe(1);
+    } finally {
+      blocked.release.open();
+      // Restore the timeout spy under the fake clock, before returning to real timers.
+      vi.restoreAllMocks(); vi.useRealTimers();
+    }
+  }, 15_000);
+
+  it("9751: queued saved restart replay owns no retry timer while the existing ACK worker is blocked", async () => {
+    const f = setup(), blocked = holdFirstAck(f), oldEpoch = "9751:predecessor";
+    for (const id of ["timer-A", "timer-C"]) {
+      const command = f.command(id);
+      await f.own.put({ key: seenKey(id), identity: identity(ownerId), ifVersion: 0, value: {
+        format: 1, hostId: ownerId, commandId: id, targetId: "agent:same", ownerIncarnation: oldEpoch,
+        expiresAt: Date.now() + 60_000, acceptance: { accepted: true, messageId: id },
+      } });
+      await f.mesh.publish({ ...command, data: { ...command.data, ownerIncarnation: oldEpoch } });
+    }
+    await f.mesh.publish(f.command("timer-B", "agent:other"));
+    vi.spyOn(fs, "watch").mockImplementation(() =>
+      Object.assign(new EventEmitter(), { close: vi.fn(), unref: vi.fn() }) as unknown as fs.FSWatcher);
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const timeouts = vi.spyOn(globalThis, "setTimeout"), tail = vi.spyOn(f.mesh, "tail");
+    const receive = vi.fn((command: FabricControlCommand) => ({ accepted: true, messageId: command.commandId }));
+    f.owner.start(receive);
+    try {
+      await vi.advanceTimersByTimeAsync(0);
+      expect(f.saved("timer-B")).toMatchObject({ acceptance: { accepted: true } });
+      expect(blocked.calls()).toBe(1);
+      const reads = tail.mock.calls.length, timers = timeouts.mock.calls.length, armed = vi.getTimerCount();
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(tail).toHaveBeenCalledTimes(reads); expect(timeouts).toHaveBeenCalledTimes(timers);
+      expect(vi.getTimerCount()).toBe(armed); expect(blocked.calls()).toBe(1);
+      blocked.release.open(); await vi.advanceTimersByTimeAsync(0);
+      expect(f.acks().map(event => (event.data as { commandId: string }).commandId)).toEqual(["timer-A", "timer-C", "timer-B"]);
+      expect(receive.mock.calls.map(([command]) => command.commandId)).toEqual(["timer-B"]);
+      expect(blocked.highWater()).toBe(1);
+    } finally { blocked.release.open(); vi.restoreAllMocks(); vi.useRealTimers(); }
+  });
+
+  it.each([
+    ["steer", false], ["followUp", false], ["ask", true], ["stop", true],
+  ] as const)("9751: restart %s with saved=%s stays inline and blocks later admission", async (operation, saved) => {
+    const f = setup(), blocked = holdFirstAck(f), oldEpoch = "9751:predecessor";
+    const original = f.command("inline-A");
+    const a = { ...original, kind: operation, data: { ...original.data, operation, ownerIncarnation: oldEpoch } };
+    const acceptance = { accepted: true, messageId: "inline-predecessor-result" };
+    await f.own.put({ key: seenKey("inline-A"), identity: identity(ownerId), ifVersion: 0, value: {
+      format: 1, hostId: ownerId, commandId: "inline-A", targetId: "agent:same", ownerIncarnation: oldEpoch,
+      expiresAt: Date.now() + 60_000, ...(saved ? { acceptance } : {}),
+    } });
+    const persisted = f.own.get(seenKey("inline-A"), { fresh: true });
+    await f.mesh.publish(a); await f.mesh.publish(f.command("inline-B", "agent:other"));
+    const receive = vi.fn((command: FabricControlCommand) => ({ accepted: true, messageId: command.commandId }));
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    f.owner.start(receive);
+    try {
+      await vi.advanceTimersByTimeAsync(0);
+      expect(blocked.calls()).toBe(1); expect(receive).not.toHaveBeenCalled();
+      expect(f.mesh.get(seenKey("inline-B"), { fresh: true })).toBeUndefined();
+      expect(f.saved("inline-B")).toBeUndefined(); expect(f.acks()).toEqual([]);
+      blocked.release.open(); await vi.advanceTimersByTimeAsync(0);
+      expect(f.acks()).toHaveLength(2);
+      const ack = f.acks("inline-A")[0]!.data;
+      expect(ack).toEqual({ version: 1, commandId: "inline-A", targetId: "agent:same", ownerIncarnation: oldEpoch,
+        ...(saved ? acceptance : { accepted: false, error: "Fabric control outcome is indeterminate after owner restart" }) });
+      expect(ack).not.toHaveProperty("notRun");
+      expect(receive.mock.calls.map(([command]) => command.commandId)).toEqual(["inline-B"]);
+      expect(f.own.get(seenKey("inline-A"), { fresh: true })).toEqual(persisted);
+    } finally { blocked.release.open(); vi.restoreAllMocks(); vi.useRealTimers(); }
+  });
+
+  it.each(["local", "legacy-shared"] as const)("9751: cleanup after compaction protects an already-saved %s restart replay while its ACK is owned", async source => {
+    const f = setup({}, { maxEventLogBytes: 80_000, retainedEventLogBytes: 40_000 }), blocked = holdFirstAck(f);
+    const oldEpoch = "9751:predecessor", original = f.command("replay-protected"), now = Date.now;
+    const store = source === "local" ? f.own : f.mesh;
+    const acceptance = { accepted: true, messageId: "replay-protected-result" };
+    await store.put({ key: seenKey("replay-protected"), identity: identity(ownerId), ifVersion: 0, value: {
+      format: 1, hostId: ownerId, commandId: "replay-protected", targetId: "agent:same", ownerIncarnation: oldEpoch,
+      sequence: 1, expiresAt: Date.now() + 60_000, acceptance,
+    } });
+    const persisted = store.get(seenKey("replay-protected"), { fresh: true });
+    await f.mesh.publish({ ...original, data: { ...original.data, ownerIncarnation: oldEpoch } });
+    const receive = vi.fn((command: FabricControlCommand) => ({ accepted: true, messageId: command.commandId }));
+    f.owner.start(receive);
+    try {
+      await until(() => expect(blocked.calls()).toBe(1));
+      await store.put({ key: seenKey("replay-sweep-witness"), identity: identity(ownerId), ifVersion: 0, value: {
+        format: 1, hostId: ownerId, commandId: "replay-sweep-witness", targetId: "agent:other", sequence: 1,
+        expiresAt: 0, acceptance: { accepted: true },
+      } });
+      vi.spyOn(Date, "now").mockImplementation(() => now() + 16 * 60_000);
+      for (let index = 0; index < 100; index++) await f.mesh.publish({ topic: "9751.compact", from: identity(senderId), text: "x".repeat(900) });
+      expect(f.mesh.oldestSequence()).toBeGreaterThan(1);
+      await f.mesh.publish(f.command("replay-sweep-trigger", "agent:other", "followUp"));
+      await until(() => {
+        expect(f.saved("replay-sweep-trigger")).toMatchObject({ acceptance: { accepted: true } });
+        expect(store.get(seenKey("replay-sweep-witness"), { fresh: true })).toBeUndefined();
+      });
+      expect(store.get(seenKey("replay-protected"), { fresh: true })).toEqual(persisted);
+      expect(blocked.calls()).toBe(1);
+      blocked.release.open(); await until(() => expect(f.acks("replay-protected")).toHaveLength(1));
+      expect(f.acks("replay-protected")[0]!.data).toMatchObject({ ...acceptance, ownerIncarnation: oldEpoch });
+      expect(receive.mock.calls.map(([command]) => command.commandId)).toEqual(["replay-sweep-trigger"]);
+    } finally { blocked.release.open(); vi.restoreAllMocks(); }
+  }, 15_000);
+
   it("9751: restart replays a saved predecessor outcome without adopting the new owner epoch", async () => {
     const f = setup(), oldEpoch = "9751:predecessor", command = f.command("restart-saved");
     command.data.ownerIncarnation = oldEpoch;

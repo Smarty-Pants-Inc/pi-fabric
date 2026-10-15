@@ -3,7 +3,7 @@ import type { FabricActivityRun } from "../src/activity/types.js";
 import type { FabricState } from "../src/fabric-state.js";
 import type { AgentRunRecord } from "../src/agents/types.js";
 import type { FabricParticipantInfo } from "../src/topology/types.js";
-import { createDashboardSnapshot } from "../src/ui/snapshot.js";
+import { createDashboardSnapshot, FabricDashboardSnapshotCache } from "../src/ui/snapshot.js";
 
 const usage = { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, cost: 0 };
 
@@ -90,6 +90,51 @@ const fakeState = (
   }) as unknown as FabricState;
 
 describe("dashboard snapshot agent ownership", () => {
+  it.each(["Ambiguous Fabric actor: actor", "Unknown Fabric actor: another-id", "unreadable actor registry"])(
+    "does not hide an actor enrichment failure: %s",
+    message => {
+      const state = fakeState([], [], [{ id: "actor" }]);
+      state.actors.instructions = () => { throw new Error(message); };
+      expect(() => createDashboardSnapshot(state, [])).toThrow(message);
+    },
+  );
+
+  it("reconciles a cached session-orphan row when details disappear and reappear", () => {
+    const orphan = {
+      id: "session-orphan",
+      name: "foreign stopped actor",
+      status: "stopped",
+      scope: "session",
+      rootId: "session:old",
+      sessionOrphan: { oldRoot: "session:old", reason: "Main owner process is dead" },
+    };
+    const state = fakeState([], [], [orphan]);
+    const cache = new FabricDashboardSnapshotCache();
+    let available = true;
+    state.actors.instructions = id => {
+      if (!available && id === orphan.id) throw new Error(`Unknown Fabric actor: ${id}`);
+      return "Current instructions";
+    };
+    state.actors.messages = id => {
+      if (!available && id === orphan.id) throw new Error(`Unknown Fabric actor: ${id}`);
+      return [];
+    };
+
+    const initial = createDashboardSnapshot(state, [], undefined, undefined, cache);
+    expect(initial.actors.map(actor => actor.id)).toEqual([orphan.id]);
+    expect(initial.actors[0]?.instructions).toBe("Current instructions");
+
+    // All list-derived snapshot inputs stay identical: the cache must not keep
+    // the previous details alive after the backing actor becomes unavailable.
+    available = false;
+    const missing = createDashboardSnapshot(state, [], undefined, undefined, cache);
+    expect(missing.actors).toEqual([]);
+
+    available = true;
+    const returned = createDashboardSnapshot(state, [], undefined, undefined, cache);
+    expect(returned.actors.map(actor => actor.id)).toEqual([orphan.id]);
+    expect(returned.actors[0]?.instructions).toBe("Current instructions");
+  });
   it("always includes the user-facing Main Pi agent", () => {
     const snapshot = createDashboardSnapshot(fakeState([], []), []);
 
@@ -249,7 +294,7 @@ describe("dashboard snapshot agent ownership", () => {
       format: 1,
       id: `remote-${index}`,
       kind: "agent",
-      rootId: "session:peer",
+      rootId: "session:test",
       ownerHostId: "session:peer",
       ownerIdentityId: "session:peer",
       parentId: "session:peer",
@@ -270,6 +315,43 @@ describe("dashboard snapshot agent ownership", () => {
     expect(snapshot.agents).toHaveLength(240);
     expect(snapshot.agents.some((agent) => agent.id === local.id)).toBe(true);
     expect(snapshot.agents.filter((agent) => agent.local === false)).toHaveLength(239);
+  });
+
+  // Fork (smarty-dev#1089, #2004): the dashboard topology keeps every root's agents
+  // and the widget alone narrows to this session; upstream filtered the snapshot.
+  it("keeps agents owned by another session's lineage as foreign-root rows", () => {
+    const local = {
+      ...record("local-agent"),
+      startedAt: 1,
+      updatedAt: 2,
+      status: "running" as const,
+    };
+    const foreign: FabricParticipantInfo[] = Array.from({ length: 3 }, (_, index) => ({
+      format: 1,
+      id: `foreign-${index}`,
+      kind: "agent",
+      rootId: "session:other",
+      ownerHostId: "session:other",
+      ownerIdentityId: "session:other",
+      parentId: "session:other",
+      name: `foreign-${index}`,
+      status: "running",
+      runner: "pi",
+      transport: "process",
+      capabilities: ["steer", "followUp", "stop"],
+      startedAt: 1_000 + index,
+      updatedAt: 2_000 + index,
+      controlProtocol: "v1",
+      local: false,
+      stale: false,
+    }));
+
+    const snapshot = createDashboardSnapshot(fakeState([], [local], [], [], foreign), []);
+
+    expect(snapshot.agents.map((agent) => agent.id).sort()).toEqual([local.id, "foreign-0", "foreign-1", "foreign-2"].sort());
+    expect(snapshot.agents.filter((agent) => agent.rootId === "session:other")).toHaveLength(3);
+    expect(snapshot.agents.filter((agent) => agent.rootId === undefined || agent.rootId === snapshot.main.id).map((agent) => agent.id))
+      .toEqual([local.id]);
   });
 
   it("does not overlay private local actor state when another host owns it", () => {
@@ -355,5 +437,41 @@ describe("dashboard snapshot agent ownership", () => {
 
     const snapshot = createDashboardSnapshot(fakeState([], [failed, running], [actor]), []);
     expect(snapshot.actors[0]?.worker?.id).toBe("actor-running");
+  });
+
+  it("shows provider-registered participants as agent rows", () => {
+    const participant: FabricParticipantInfo = {
+      format: 1,
+      id: "provider:delegate:run-1",
+      kind: "provider",
+      provider: "delegate",
+      rootId: "session:test",
+      ownerHostId: "session:test",
+      ownerIdentityId: "session:test",
+      parentId: "session:test",
+      name: "Delegated run",
+      status: "running",
+      transport: "host",
+      capabilities: ["stop"],
+      startedAt: 10,
+      updatedAt: 20,
+      currentTool: "build: compiling",
+      controlProtocol: "v1",
+      local: true,
+      stale: false,
+    };
+    const snapshot = createDashboardSnapshot(fakeState([], [], [], [], [participant]), []);
+    expect(snapshot.agents).toEqual([
+      expect.objectContaining({
+        id: participant.id,
+        name: "Delegated run",
+        status: "running",
+        transport: "provider delegate",
+        currentTool: "build: compiling",
+        participantKind: "provider",
+        capabilities: ["stop"],
+      }),
+    ]);
+    expect(snapshot.agents[0]).not.toHaveProperty("runner");
   });
 });

@@ -1,4 +1,5 @@
 import { pointerCurrent } from "../verified/policy.js";
+import { detachedPreview } from "../core/preview.js";
 import { acceptsExpansionPage } from "../verified/memory.js";
 import { RECALL_MAX_RESPONSE_CHARS } from "./context.js";
 import {
@@ -123,7 +124,7 @@ export async function processMemoryExpand(
   }
   const ref = access.ref;
   const observedSource = access.observe(branches);
-  let snapshot = cache.cachedExpansionSnapshot(ref.file, branches, observedSource);
+  let snapshot = cache.cachedExpansionSnapshot(ref.file, branches, observedSource, context.fabricScope?.digest);
   if (snapshot) {
     const sourceChanged = expectedSourceHash !== undefined &&
       snapshot.sourceHash !== expectedSourceHash;
@@ -216,6 +217,7 @@ export async function processMemoryExpand(
     snapshot = {
       file: ref.file,
       branches,
+      ...(context.fabricScope ? { scopeDigest: context.fabricScope.digest } : {}),
       sourceHash: finalState.sourceHash,
       lineageFingerprint: finalLineage.fingerprint,
       observation: finalObservation,
@@ -350,9 +352,11 @@ export async function processMemoryExpand(
   }
 
   const bounded = (value: string | null, maximum = 512): string | null =>
-    value === null || value.length <= maximum
+    value === null
       ? value
-      : `${value.slice(0, Math.max(1, maximum - 1))}…`;
+      : value.length <= maximum
+        ? detachedPreview(value, maximum)
+        : `${detachedPreview(value, Math.max(1, maximum - 1))}…`;
   const compactStructure = (value: unknown): unknown => {
     if (value === undefined) return undefined;
     const serialized = JSON.stringify(value);
@@ -377,7 +381,7 @@ export async function processMemoryExpand(
     if (end === currentTextOffset && currentTextOffset < entry.text.length) {
       end = Math.min(entry.text.length, currentTextOffset + 2);
     }
-    const chunk = entry.text.slice(currentTextOffset, end);
+    const chunk = detachedPreview(entry.text.slice(currentTextOffset, end), end - currentTextOffset);
     const textComplete = end >= entry.text.length;
     const operation = compactStructure(entry.operation);
     const branchFact = compactStructure(entry.branchFact);
@@ -482,7 +486,7 @@ export async function processMemoryExpand(
       keep -= 1;
     }
     if (keep > 0 && keep < chunk.length) {
-      record.text = chunk.slice(0, keep);
+      record.text = detachedPreview(chunk, keep);
       range.end = range.start + keep;
       range.complete = false;
       cursor = { position: entryOffset, textOffset: range.end };
@@ -500,7 +504,7 @@ export async function processMemoryExpand(
     if (JSON.stringify(response).length > RECALL_MAX_RESPONSE_CHARS) {
       const current = String(record.text);
       const firstCodePointChars = (current.codePointAt(0) ?? 0) > 0xffff ? 2 : 1;
-      const minimalText = current.slice(0, Math.min(current.length, firstCodePointChars));
+      const minimalText = detachedPreview(current, Math.min(current.length, firstCodePointChars));
       const minimalRange = record.textRange as { start: number; end: number; total: number; complete: boolean };
       minimalRange.end = minimalRange.start + minimalText.length;
       minimalRange.complete = minimalRange.end >= minimalRange.total;

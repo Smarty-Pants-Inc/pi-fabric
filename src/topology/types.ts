@@ -3,7 +3,8 @@ import type { FabricAgentRunner, FabricAgentTransport } from "../config.js";
 import type { MeshIdentity } from "../mesh/store.js";
 import type { AgentUsage } from "../agents/types.js";
 
-export type FabricParticipantKind = "root" | "agent" | "actor";
+/** `provider`: work a Fabric provider registered through `context.participants`. */
+export type FabricParticipantKind = "root" | "agent" | "actor" | "provider";
 export type FabricParticipantResidency = "session" | "durable";
 export type FabricParticipantScope = "local" | "lineage" | "project";
 export type FabricParticipantCapability =
@@ -22,7 +23,11 @@ export interface FabricParticipantRecord {
   rootId: string;
   ownerHostId: string;
   ownerIdentityId: string;
-  /** Fresh control-owner activation, including same-process extension reloads. */
+  /**
+   * Fresh control-owner activation, including same-process extension reloads.
+   * Requesters copy it onto control commands so the owner refuses commands
+   * meant for an earlier activation. Absent on older records.
+   */
   ownerIncarnation?: string;
   parentId?: string;
   name: string;
@@ -49,14 +54,24 @@ export interface FabricParticipantRecord {
   /** Outside capabilities so old format-1 parsers can read the advertisement. */
   livenessLeaseFiles?: 1;
   status: string;
+  /** Authenticated, capability-free terminal history of a session actor. */
+  stopReason?: "owner-root-gone";
+  ownerRootGoneAt?: number;
+  ownerRootGoneBy?: string;
+  settledAt?: number;
+  retiredAt?: number;
+  retiredBy?: string;
   /** Root records: the writing Main process (pid, host, Linux /proc start ticks), so an operator tool can
    * tell a live Main from a reused pid (smarty-dev#7817). Absent on older writers: identity unavailable. */
   mainProcess?: { pid: number; host: string; startTime?: string };
   /** Fixed expiry of a Main reload handoff; never a grace period for an exited session. */
   reloadUntil?: number;
   residency?: FabricParticipantResidency;
-  runner: FabricAgentRunner;
-  transport: FabricAgentTransport | "host";
+  /** Absent only for `provider` participants, which have no agent runner. */
+  runner?: FabricAgentRunner;
+  /** Registering provider name for `provider` participants. */
+  provider?: string;
+  transport: FabricAgentTransport | "host" | "hosted";
   capabilities: FabricParticipantCapability[];
   cwd?: string;
   sessionId?: string;
@@ -88,11 +103,15 @@ export interface FabricParticipantRecord {
    * the name of that host. A routing target only, never a local owner.
    */
   remoteHost?: string;
+  /** Trusted hub link carrying a re-export; remoteHost still names the origin. */
+  bridgeVia?: string;
 }
 
 export interface FabricParticipantInfo extends FabricParticipantRecord {
   local: boolean;
   stale: boolean;
+  /** Retained remote routing attribution; transport freshness is unknown, not owner death. */
+  bridgeStale?: true;
 }
 
 export interface FabricHostRecord {
@@ -108,6 +127,10 @@ export interface FabricHostRecord {
   expiresAt: number;
   /** Set on a host lease that the mesh bridge mirrors from another host's mesh (smarty-dev#2004). */
   remoteHost?: string;
+  /** Trusted hub link carrying a re-export; remoteHost still names the origin. */
+  bridgeVia?: string;
+  /** This projection requires a matching source-clock mirror lease; no legacy expiry fallback. */
+  mirrorLease?: 1;
 }
 
 export interface FabricParticipantListOptions {
@@ -165,8 +188,9 @@ export interface FabricParticipantSource {
   writeStalled?(now?: number): Error | undefined;
   /** Why a negative routing lookup is not authoritative (unjoined, overdue or failed view). */
   routingUnavailable?(now?: number): string | undefined;
-  /** Wait for a briefly late native lease using only its file; false means too old/ended. */
-  resolveRoutingLease?(id: string): Promise<boolean>;
+  /** Wait for a briefly late native lease (file) or remote mirror (notifications).
+   * false means too old/ended; signal cancels a mirror wait with its exact reason. */
+  resolveRoutingLease?(id: string, signal?: AbortSignal): Promise<boolean>;
   /** Bound retained-root delivery by routing grace, never by lineage absence alone. */
   retainedRouteAllowed?(id: string): boolean;
   /** One short, lock-bounded canonical read; does not renew or confirm a host lease. */

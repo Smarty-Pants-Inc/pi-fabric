@@ -7,6 +7,12 @@ import type { AgentTransportLaunch } from "../types.js";
 import { assertTransportLaunchAllowed } from "./launch-authority.js";
 import { terminateWindowsTree } from "../../child-process-tree.js";
 import { spawnDetached as spawnDetachedLegacy } from "./process-utils-legacy.js";
+import { randomBytes } from "node:crypto";
+import {
+  TASK_SCOPE_ENVIRONMENT, TASK_SCOPE_PREFIX, TaskScopeAdmissionError, assertMemoryMaxBytes, stopTaskCgroup, taskScopeProperties, taskScopeShim, verifiedTaskMemoryMax,
+  type TaskCgroupBoundary,
+} from "./task-cgroup.js";
+import { taskScopeWrapperSource } from "./task-scope-wrapper.js";
 
 /** A bounded tree observation ended without proof of descendant exit. */
 export class ProcessTreeCustodyUnconfirmedError extends Error {
@@ -287,6 +293,11 @@ const STOP_TERM_MS = 2_000;
 const STOP_KILL_MS = 2_000;
 const TREE_CENSUS_MIN_SPACING_MS = 60_000;
 const stopDelay = () => new Promise<void>((resolve) => setTimeout(resolve, 20));
+/** ENOENT alone is not proof (a missing cwd or #! interpreter also yields it): the path must be absent. */
+const executableMissing = (executable: string): boolean => {
+  try { fs.lstatSync(executable); fs.statSync(executable); return false; }
+  catch (error) { return (error as NodeJS.ErrnoException).code === "ENOENT"; }
+};
 
 export const spawnDetached = async (
   workerPath: string,
@@ -294,11 +305,12 @@ export const spawnDetached = async (
   cwd: string,
   authority?: Pick<AgentTransportLaunch, "signal" | "authorize" | "onUnconfirmedExit">,
   environment?: NodeJS.ProcessEnv,
-  scope?: { executable: string; slice: string; warn: (reason: string) => void },
+  /** memoryMaxBytes present: capped `fabric-task-*.scope` with an owned cgroup kill boundary (#8257). */
+  scope?: { executable: string; slice: string; warn: (reason: string) => void; memoryMaxBytes?: number },
   /** Ordinary workers need time to run their five-second execution-child cleanup. */
   termGraceMs = STOP_TERM_MS,
   executionCustodian = false,
-): Promise<{ pid: number; closed: Promise<void>; treeClosed?: Promise<void>; stop(): Promise<void>; isAlive(): Promise<boolean>; lostContact(): string | undefined; stopDebt?(): string | undefined; waitForClose(): Promise<void> }> => {
+): Promise<{ pid: number; closed: Promise<void>; treeClosed?: Promise<void>; cgroup?: string; stop(): Promise<void>; isAlive(): Promise<boolean>; lostContact(): string | undefined; stopDebt?(): string | undefined; waitForClose(): Promise<void> }> => {
   // No PR observer or timer is created on the unscoped/unsupported path.
   const scopedLinux = Boolean(scope && process.platform === "linux");
   if (!scopedLinux) {
@@ -310,10 +322,35 @@ export const spawnDetached = async (
   // The new tree-custody protocol is unsupported on Windows. Even an internal
   // caller requesting it must get only the legacy native worker-exit contract.
   const tracksExecution = executionCustodian && process.platform !== "win32";
-  // Scope admission execs in place: the captured PID and custody IPC stay owned.
-  const scopeRoot = scope ? fs.mkdtempSync(path.join(os.tmpdir(), "fabric-scope-")) : undefined;
+  // Use the prepared child scratch, not the parent's possibly replaced TMPDIR.
+  const temporary = environment?.TMPDIR ?? os.tmpdir();
+  // Canonicalize natively before joining marker paths (including symlink/..).
+  const scopeParent = fs.realpathSync.native(path.isAbsolute(temporary) ? temporary : `${cwd}${path.sep}${temporary}`);
+  if (!fs.statSync(scopeParent).isDirectory()) throw new Error("Scope temporary path is not a directory");
+  fs.accessSync(scopeParent, fs.constants.W_OK | fs.constants.X_OK);
+  const scopeRoot = fs.mkdtempSync(path.join(scopeParent, "fabric-scope-"));
   const marker = scopeRoot ? path.join(scopeRoot, "admitted") : undefined;
-  const scopeUnit = scopeRoot ? `${path.basename(scopeRoot)}.scope` : undefined;
+  // Capped task scopes get their own unit name; uncapped explicit scopes keep the old one.
+  const memoryMaxBytes = scope?.memoryMaxBytes === undefined ? undefined : assertMemoryMaxBytes(scope.memoryMaxBytes);
+  const capped = memoryMaxBytes !== undefined;
+  const scopeUnit = scopeRoot
+    ? capped ? `${TASK_SCOPE_PREFIX}${process.pid}-${randomBytes(8).toString("hex")}.scope` : `${path.basename(scopeRoot)}.scope`
+    : undefined;
+  // The capped shim blocks on this inherited pipe until the parent verified the boundary.
+  const gateFd = tracksExecution ? 4 : 3;
+  const childEnvironment = childProcessEnvironment(environment);
+  if (capped) {
+    // Only the released shim exports these, and only for a proven admission.
+    for (const name of TASK_SCOPE_ENVIRONMENT) delete childEnvironment[name];
+  }
+  // Released capped scopes keep scopeRoot (task-local systemd-run wrapper) until the
+  // owned leaf is proven empty: populated-0 receipt or a successful owned stop.
+  let scratchRetained = false;
+  const releaseScratch = (): void => {
+    if (!scratchRetained) return;
+    scratchRetained = false;
+    fs.rmSync(scopeRoot!, { recursive: true, force: true });
+  };
   const markerIdentity = `admitted ${scopeUnit}`;
   const markerIsAdmitted = (): boolean => {
     if (!marker) return false;
@@ -332,21 +369,36 @@ export const spawnDetached = async (
     finally { if (fd !== undefined) fs.closeSync(fd); }
   };
   const child = spawn(scope?.executable ?? runtime, scope ? [
-    "--user", "--scope", `--slice=${scope.slice}`, "--quiet", "--collect", `--unit=${scopeUnit}`, "--",
-    "/bin/sh", "-c", 'while IFS= read -r line; do printf "%s\\n" "$line"; done < /proc/self/cgroup > "$1.cgroup" || exit 125; printf "admitted %s" "$2" > "$1" || exit 125; shift 2; exec "$@"',
+    "--user", "--scope", `--slice=${scope.slice}`, "--quiet", "--collect", `--unit=${scopeUnit}`,
+    ...(capped ? taskScopeProperties(memoryMaxBytes) : []), "--",
+    "/bin/sh", "-c", capped ? taskScopeShim(gateFd) : 'while IFS= read -r line; do printf "%s\\n" "$line"; done < /proc/self/cgroup > "$1.cgroup" || exit 125; printf "admitted %s" "$2" > "$1" || exit 125; shift 2; exec "$@"',
     "fabric-scope", marker!, scopeUnit!, runtime, workerPath, ...workerArguments,
   ] : [workerPath, ...workerArguments], {
     cwd,
-    env: childProcessEnvironment(environment),
+    env: childEnvironment,
     detached: process.platform !== "win32",
-    stdio: tracksExecution ? ["ignore", "ignore", "ignore", "ipc"] : "ignore",
+    stdio: capped
+      ? ["ignore", "ignore", "ignore", ...(tracksExecution ? ["ipc" as const] : []), "pipe"]
+      : tracksExecution ? ["ignore", "ignore", "ignore", "ipc"] : "ignore",
   });
   let spawnError: Error | undefined;
   child.once("error", error => { spawnError = error; });
+  const gate = capped ? child.stdio[gateFd] as import("node:stream").Writable | null : null;
+  gate?.on("error", () => undefined); // EPIPE: the shim already exited without executing the worker
+  let gateReleased = false;
+  let boundary: TaskCgroupBoundary | undefined;
+  let cappedRefusal: string | undefined;
   if (!child.pid) {
+    gate?.destroy();
     await new Promise<void>(resolve => child.once("close", () => resolve()));
     if (!scope) throw spawnError ?? new Error("Failed to launch Fabric worker process");
     fs.rmSync(scopeRoot!, { recursive: true, force: true });
+    // Capped tasks fall back only when the backend executable is PROVEN missing (ENOENT and
+    // absent now, e.g. removed after lookup). EACCES, a missing interpreter/cwd, or any other
+    // spawn error is a capped admission failure, never an uncapped replay.
+    if (capped && !(((spawnError as NodeJS.ErrnoException | undefined)?.code === "ENOENT") && executableMissing(scope.executable))) {
+      throw new TaskScopeAdmissionError(scopeUnit!, `systemd-run spawn failed: ${spawnError?.message ?? "no pid"}`);
+    }
     assertTransportLaunchAllowed(authority);
     scope.warn(spawnError?.message ?? "systemd-run did not launch");
     return spawnDetached(workerPath, workerArguments, cwd, authority, environment, undefined, termGraceMs, executionCustodian);
@@ -357,6 +409,10 @@ export const spawnDetached = async (
   let force: ReturnType<typeof setTimeout> | undefined;
   child.once("exit", () => { exited = true; clearTimeout(force); });
   const closed = new Promise<void>((resolve) => child.once("close", () => { exited = true; clearTimeout(force); resolve(); }));
+  const workerExited = new Promise<void>(resolve => child.once("exit", () => resolve()));
+  // Capture a scope-start failure for the typed capped admission refusal, never for replay.
+  let exitStatus: { code: number | null; signal: NodeJS.Signals | null } | undefined;
+  child.once("exit", (code, signal) => { exitStatus = { code, signal }; });
   let stopping: Promise<void> | undefined;
   let lost: string | undefined;
   const unconfirmed = (reason: string): void => {
@@ -529,6 +585,14 @@ export const spawnDetached = async (
   // Unscoped workers returned through the unchanged legacy path above.
   const posix = process.platform !== "win32";
   let treeConfirmed = false;
+  let boundaryReleased = false;
+  // Physical boundary ownership is independent of the one-shot tree receipt.
+  // A failed watcher settles that receipt, but teardown still needs this fd.
+  const releaseBoundary = (): void => {
+    if (!boundary || boundaryReleased) return;
+    fs.closeSync(boundary.fd);
+    boundaryReleased = true;
+  };
   let treeFinished = false;
   let nativeClosed = false;
   // Receipt existence, not merely requested scope admission, enables events.
@@ -570,7 +634,13 @@ export const spawnDetached = async (
     scopeEventsFd = undefined;
     scopeEvents = undefined;
     if (error !== undefined) rejectTree(error);
-    else { treeConfirmed = true; resolveTree(); }
+    else {
+      treeConfirmed = true;
+      // Populated-0 receipt: the leaf is empty and may be collected; release its descriptor.
+      releaseBoundary();
+      releaseScratch();
+      resolveTree();
+    }
   };
   const observeTree = async (atDeadline = false): Promise<void> => {
     if (!posix || treeFinished || observingTree || !nativeClosed || !treeObservationReady) return;
@@ -582,6 +652,9 @@ export const spawnDetached = async (
     // owned scope's populated receipt with a primary-PID absence observation.
     try {
       if (scopeEvents && !scopeIsEmpty()) return;
+      // Released capped leaf: its whole-subtree populated-0 is the tree receipt.
+      // No /proc census or execution uncertainty applies inside the owned boundary.
+      if (scopeEvents && boundary && gateReleased) { executionPending = false; finishTree(); return; }
       censusStarted = true;
       const remaining = process.platform === "linux" ? members().length : (await portableMembers()).length;
       const uncertain = process.platform === "linux"
@@ -633,6 +706,21 @@ export const spawnDetached = async (
         return stat.isDirectory() && stat.uid === process.getuid?.();
       };
       if (!ownedDirectory() || fs.statfsSync(directory).type !== 0x63677270) throw new Error("Scope is not our UID-owned cgroup-v2 directory");
+      if (capped) {
+        // Retain the admitted leaf by descriptor: later limit reads, kills and
+        // membership walks never re-authorize a same-UID pathname.
+        const leafFd = fs.openSync(directory, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW);
+        try {
+          const byPath = fs.lstatSync(directory);
+          const held = fs.fstatSync(leafFd);
+          if (!held.isDirectory() || held.dev !== byPath.dev || held.ino !== byPath.ino || held.uid !== process.getuid?.()) {
+            throw new Error("Task cgroup leaf changed during admission");
+          }
+          const memoryMax = verifiedTaskMemoryMax(leafFd, memoryMaxBytes);
+          if (memoryMax === undefined) throw new Error("Task scope memory.max/memory.swap.max are not the requested cap");
+          boundary = { relative: cgroup, fd: leafFd, memoryMax };
+        } catch (error) { fs.closeSync(leafFd); throw error; }
+      }
       scopeEvents = path.join(directory, "cgroup.events");
       scopeEventsFd = fs.openSync(scopeEvents, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
       const changed = (): void => {
@@ -659,7 +747,9 @@ export const spawnDetached = async (
       treeObservationReady = true;
       void observeTree();
       return true;
-    } catch {
+    } catch (error) {
+      cappedRefusal = String(error);
+      if (boundary) { releaseBoundary(); boundary = undefined; }
       // Scope launch is not replayed. This SAME worker keeps legacy checked
       // monitoring, with no treeClosed receipt and no event census deadline.
       scopeWatcher?.close();
@@ -692,9 +782,33 @@ export const spawnDetached = async (
       if (stopping) return stopping;
       stopFailed = false;
       const pending = (async () => {
+        // Verified capped boundary: the owned leaf, not a /proc census, defines
+        // the tree, so setsid/separately grouped descendants are inside it.
+        // An admitted leaf also owns the unreleased shim on refusal paths.
+        const verified = boundary;
+        if (verified) {
+          if (!treeConfirmed && !boundaryReleased) {
+            const current = birth && !exited ? linuxGroupMember(pid) : undefined;
+            if (current && current.started === birth!.started) {
+              // Cooperative worker TERM first: it runs its own execution cleanup.
+              // A refused signal must not skip the verified cgroup teardown below.
+              try { process.kill(current.group === pid ? -pid : pid, "SIGTERM"); }
+              catch { /* cgroup stop and empty confirmation remain authoritative */ }
+              let grace: ReturnType<typeof setTimeout> | undefined;
+              await Promise.race([workerExited, new Promise<void>(resolve => { grace = setTimeout(resolve, termGraceMs); })]);
+              clearTimeout(grace);
+            }
+            await stopTaskCgroup(verified, { termMs: STOP_TERM_MS, killMs: STOP_KILL_MS });
+          }
+          // Successful teardown proves emptiness even if finishTree(error)
+          // already latched the immutable failed observation receipt.
+          releaseBoundary();
+          // Empty owned leaf proves no execution descendant remains inside it.
+          // Only this uncertainty is cleared; recorded watcher/native-close debt stays.
+          executionPending = false;
+        } else if (ownedTree && treeOwner) treeOwner.captureDescendants(ownedTree);
         // Retain the PR's observed detached descendants before TERM can reparent them.
-        if (ownedTree && treeOwner) treeOwner.captureDescendants(ownedTree);
-        if (process.platform !== "win32") {
+        if (verified) { /* boundary stop above */ } else if (process.platform !== "win32") {
           if (process.platform === "linux" && !birth) {
             // A captured native handle can lag /proc absence. Bound its close
             // without adopting a new birth or an unowned surviving group. In
@@ -743,8 +857,11 @@ export const spawnDetached = async (
           ]);
           // Sampling cleanup supplements, but never replaces, the confirmed-exit
           // custody and birth-checked group drain above. Native-close debt stays latched.
-          if (ownedTree && treeOwner) await treeOwner.stopObservedDescendants(ownedTree, pid);
+          if (!verified && ownedTree && treeOwner) await treeOwner.stopObservedDescendants(ownedTree, pid);
           stopped = true;
+          // Confirmed empty owned subtree + joined native close completes the receipt now
+          // (cancelling any pending census timer). Latched `lost` debt is untouched.
+          if (verified) { releaseScratch(); finishTree(); }
         } finally { clearTimeout(force); clearTimeout(deadline); }
       })();
       stopping = pending;
@@ -818,15 +935,53 @@ export const spawnDetached = async (
           authority?.signal?.removeEventListener("abort", ended);
         }
       })();
-      if (admitted) return await admittedHandle();
-      if (!nativeClosed) await handle.stop();
+      if (admitted && !capped) return await admittedHandle();
+      if (admitted && await armTreeObservation() && boundary && gate?.writable) {
+        // Proven owned v2 leaf with the configured cap: install the task-local
+        // systemd-run wrapper, then release the shim to export and exec.
+        let wrapperBin: string | undefined;
+        try {
+          wrapperBin = path.join(scopeRoot!, "bin");
+          if (/[\n\r]/.test(wrapperBin) || /\s/.test(boundary.relative)) throw new Error("Unsupported task scope path");
+          // Standalone shell wrapper (shell exec preserves the PID; no runtime dependency).
+          // The effective verified memory.max is passed: the wrapper may lower, never raise it.
+          fs.mkdirSync(wrapperBin, { mode: 0o700 });
+          fs.writeFileSync(path.join(wrapperBin, "systemd-run"),
+            taskScopeWrapperSource(scope.executable, boundary.relative, boundary.memoryMax), { mode: 0o700, flag: "wx" });
+        } catch (error) {
+          wrapperBin = undefined;
+          cappedRefusal = `task-local systemd-run wrapper unavailable: ${String(error)}`;
+        }
+        if (wrapperBin && gate.writable) {
+          gate.end(`release ${boundary.memoryMax} ${boundary.relative} ${wrapperBin}\n`);
+          gateReleased = true;
+          scratchRetained = true;
+          // A receipt may already have proven the leaf empty (shim died after release).
+          if (treeConfirmed) releaseScratch();
+          return { ...handle, treeClosed: treeClosed!, cgroup: boundary.relative };
+        }
+      }
+      // Unproven capped admission: EOF makes the shim exit 125 before the worker runs.
+      gate?.destroy();
+      if (!nativeClosed || (boundary && !boundaryReleased)) await handle.stop();
       if (handle.lostContact()) throw new Error(handle.lostContact());
       if (await handle.isAlive()) throw new Error("Scope termination is unconfirmed; custody retained");
       assertTransportLaunchAllowed(authority);
-      if (markerIsAdmitted()) return await admittedHandle(); // admitted during teardown: never replay
+      // A gated shim never executed the worker, but that alone cannot authorize uncapped replay.
+      if (!capped && markerIsAdmitted()) return await admittedHandle(); // admitted during teardown: never replay
+      if (capped) {
+        // The gate was never released: no worker ran. systemd-run launched (it had a pid), so
+        // the executable was present: ANY exit status, diagnostic, signal, receipt mismatch or
+        // timeout fails closed. Uncapped replay is reserved for a proven missing executable.
+        throw new TaskScopeAdmissionError(scopeUnit!, cappedRefusal ?? (exitStatus
+          ? `scope exited before release (code ${exitStatus.code}, signal ${exitStatus.signal})` : "scope admission timed out"));
+      }
       scope.warn(spawnError?.message ?? "systemd-run failed or scope admission timed out");
       return await spawnDetached(workerPath, workerArguments, cwd, authority, environment, undefined, termGraceMs, executionCustodian);
-    } finally { fs.rmSync(scopeRoot!, { recursive: true, force: true }); }
+    } finally {
+      if (!gateReleased) gate?.destroy();
+      if (!scratchRetained) fs.rmSync(scopeRoot!, { recursive: true, force: true });
+    }
   }
   return handle;
 };

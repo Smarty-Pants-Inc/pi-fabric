@@ -4,6 +4,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agents/manager.js";
 import { ActorManager } from "../src/actors/manager.js";
+import type { FabricActorDeliveryRequest } from "../src/actors/types.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 
@@ -56,12 +57,13 @@ const world = (actorQueueLimit: number) => {
     if (!signal?.aborted) tasks.push({ actor: request.actorName ?? "", task: request.task });
     return run(request, signal, ...callbacks);
   });
-  const manager = (queueLimit = actorQueueLimit) => {
+  const deliveries: FabricActorDeliveryRequest[] = [];
+  const manager = (queueLimit = actorQueueLimit, persistent = true) => {
     const value = new ActorManager("test", identity, mesh,
-      { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20, actorQueueLimit: queueLimit }, agents, () => {}, {
+      { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20, actorQueueLimit: queueLimit }, agents, request => { deliveries.push(request); }, persistent ? {
         actorRoot: path.join(root, "actors"), persistent: true,
         meshCursorPath: path.join(root, "mesh-cursor.json"), meshReplayAgeMs: 10 * 60_000,
-      });
+      } : { actorRoot: path.join(root, "actors"), persistent: false });
     closers.unshift(() => value.close());
     return value;
   };
@@ -74,7 +76,7 @@ const world = (actorQueueLimit: number) => {
       ? fs.readFileSync(file, "utf8").split("\n").filter(Boolean).map((line) => (JSON.parse(line) as { event: { text?: string } }).event.text ?? "")
       : [];
   };
-  return { root, mesh, agents, manager, release: () => release(), unhold: () => unhold(), held: () => held, events, deadLetters };
+  return { root, mesh, agents, manager, deliveries, release: () => release(), unhold: () => unhold(), held: () => held, events, deadLetters };
 };
 const evs = (from: number, to: number) => Array.from({ length: to - from + 1 }, (_, index) => `ev-${from + index}`);
 
@@ -150,6 +152,94 @@ describe("actor queue overflow", () => {
     await new Promise((resolve) => setTimeout(resolve, 300));
     expect(w.events("slow")).toEqual(evs(1, 12));
     expect(actors.messages(slow.id, 500).filter((message) => message.error?.startsWith("Dropped"))).toEqual([]);
+  }, 60_000);
+
+  // Keep reason: trust boundary/data safety, smarty-dev#12512 — private backlog paths never enter Main.
+  it("12512 payload allowlist: dead-letter owner and Main notices omit private paths but retain the event", async () => {
+    const w = world(1);                                           // 1 queued + 8 overflow, then dead-letter
+    const actors = w.manager();
+    const slow = await actors.create({ name: "private-backlog", instructions: "Supervise.", responseMode: "text", coalesce: false, delivery: "mailbox" });
+    const fast = await actors.create({ name: "unblocked", instructions: "Review.", topics: ["team.fast"], responseMode: "text", coalesce: false });
+    await w.mesh.publish({ topic: "team.direct", to: slow.id, from, text: "BLOCK slow's long run" });
+    await waitFor(() => actors.status(slow.id).status === "preparing");
+    try {
+      for (let n = 1; n <= 9; n++) await w.mesh.publish({ topic: "team.direct", to: slow.id, from, text: `ev-${n}` });
+      await waitFor(() => actors.status(slow.id).queued === 9);
+      const posix = "/private/12512-backlog/owner-record.json";
+      const windows = String.raw`C:\Users\Synthetic\12512-backlog\owner-record.json`;
+      const secret = "synthetic-private-token-12512-backlog";
+      const rejected = await w.mesh.publish({ topic: "team.direct", to: slow.id, from,
+        text: `ev-10 ${posix}; ${windows}; ${secret}`, data: { posix, windows, secret } });
+      const ownerAlarms = () => w.mesh.read({ topic: "ops.owner" }).filter(event =>
+        event.kind === "actor.alarm" && (event.data as { reason?: string } | undefined)?.reason === "dead_letter");
+      const mainAlarms = () => w.deliveries.filter(request =>
+        (request.message.data as { reason?: string } | undefined)?.reason === "dead_letter");
+      await waitFor(() => w.deadLetters(slow.id).length === 1 && ownerAlarms().length === 1 && mainAlarms().length === 1);
+      const file = path.join(w.root, "actors", slow.id, "dead-letter.jsonl");
+      const records = fs.readFileSync(file, "utf8").split("\n").filter(Boolean)
+        .map(line => JSON.parse(line) as { event: unknown });
+      // The rejected event remains intact in the existing private file, not in an alarm copy.
+      expect(records).toEqual([expect.objectContaining({ event: rejected })]);
+      expect(actors.status(slow.id).queued).toBe(9);
+      const messages = actors.messages(slow.id, 50).filter(message =>
+        (message.data as { reason?: string } | undefined)?.reason === "dead_letter");
+      expect(messages).toHaveLength(1);
+      const visible = JSON.stringify({ owner: ownerAlarms(), onDeliver: mainAlarms(), messages });
+      for (const value of [w.root, file, slow.sessionFile!, slow.logDir!, posix, windows, secret]) {
+        expect(visible).not.toContain(JSON.stringify(value).slice(1, -1));
+      }
+      expect(ownerAlarms()[0]).toMatchObject({
+        topic: "ops.owner", kind: "actor.alarm", from: { id: identity.id }, to: slow.rootId,
+        data: { actorId: slow.id, reason: "dead_letter", deadLetters: 1 },
+      });
+      expect(mainAlarms()[0]).toMatchObject({
+        actor: { id: slow.id }, delivery: "followUp", triggerTurn: true,
+        message: { actorId: slow.id, source: "fabric-host", action: "message", data: { reason: "dead_letter", deadLetters: 1 } },
+      });
+      expect(ownerAlarms()[0]!.text).toBe(mainAlarms()[0]!.message.text);
+      for (const guidance of ["queue (1)", "overflow (8)", "re-queue automatically", "other actors are not held", "agents.actorStatus", "agents.log"]) {
+        expect(mainAlarms()[0]!.message.text).toContain(guidance);
+      }
+      await w.mesh.publish({ topic: "team.fast", from, text: "ev-11" });
+      await waitFor(() => w.events(fast.name).includes("ev-11"));
+      expect(w.deadLetters(slow.id)).toHaveLength(1);             // other actors progress without draining this backlog
+    } finally { w.release(); }
+    await waitFor(() => w.events(slow.name).length === 10 && w.deadLetters(slow.id).length === 0, 30_000);
+    expect(w.events(slow.name)).toEqual(evs(1, 10));               // original admission/replay ordering is unchanged
+    expect(w.deliveries.filter(request => (request.message.data as { reason?: string } | undefined)?.reason === "dead_letter")).toHaveLength(1);
+  }, 60_000);
+
+  // #554 round 2 P2: on a non-persistent host only unaddressed fleet.* work holds the shared cursor. An
+  // addressed event past the queue and overflow is dropped at once, with one failed delivery outcome,
+  // on a fleet.* topic too (PR #551 review P1).
+  it.each(["team.direct", "fleet.direct"])("drops an addressed %s event past a full non-persistent queue with a failed outcome, never holding the cursor", async (direct) => {
+    const w = world(1);                                           // overflow cap: 8
+    const actors = w.manager(1, false);
+    const slow = await actors.create({ name: "slow", instructions: "Supervise.", topics: [], responseMode: "text", coalesce: false });
+    const fast = await actors.create({ name: "fast", instructions: "Review.", topics: ["team.events"], responseMode: "text", coalesce: false });
+    await w.mesh.publish({ topic: direct, to: slow.id, from, text: "BLOCK slow's long run" });
+    await waitFor(() => actors.status(slow.id).status === "preparing");
+    for (let n = 1; n <= 9; n++) await w.mesh.publish({ topic: direct, to: slow.id, from, text: `ev-${n}` });
+    await waitFor(() => actors.status(slow.id).queued === 9, 10_000);          // 1 queued and 8 in its overflow
+    const dropped = await w.mesh.publish({ topic: direct, to: slow.id, from, text: "ev-10" });
+    await w.mesh.publish({ topic: "team.events", from, text: "ev-11" });
+    // The event behind the dropped one reaches another actor: the cursor did not wait for room.
+    await waitFor(() => w.events("fast").includes("ev-11"), 10_000);
+    const outcomes = () => {
+      const directory = path.join(w.root, "mesh", "delivery-outcomes");
+      return fs.existsSync(directory) ? fs.readdirSync(directory).flatMap((file) => fs.readFileSync(path.join(directory, file), "utf8")
+        .split("\n").filter(Boolean).map((line) => JSON.parse(line) as { eventId: string; outcome: string; reason: string; to: string; mode: string })) : [];
+    };
+    await waitFor(() => outcomes().some((record) => record.eventId === dropped.id), 10_000);
+    await new Promise((resolve) => setTimeout(resolve, 300));     // a held event would be offered again
+    const failed = outcomes().filter((record) => record.outcome === "failed");
+    expect(failed).toHaveLength(1);
+    expect(failed[0]).toMatchObject({ eventId: dropped.id, to: slow.id, from: from.id, mode: "publish" });
+    expect(failed[0]!.reason).toMatch(/^dropped: queue full/);
+    expect(outcomes().filter((record) => record.eventId === dropped.id)).toHaveLength(1);
+    expect(actors.status(slow.id).queued).toBe(9);
+    expect(actors.messages(slow.id, 500).filter((message) => message.error?.startsWith("Dropped"))).toHaveLength(1);
+    void fast;
   }, 60_000);
 
   // PR #554 round 3 P1: restored work waits in #parked after a restart. Dead letters must not replay

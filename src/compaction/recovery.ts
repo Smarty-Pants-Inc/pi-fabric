@@ -1,9 +1,13 @@
 import type { ExtensionAPI, ExtensionContext, SessionCompactFailedEvent } from "@earendil-works/pi-coding-agent";
+import { extensionContextLive } from "../session-liveness.js";
+import { detachedPreview } from "../core/preview.js";
 
 export const COMPACTION_FAILED_ALARM = "fabric.session.compaction_failed";
 export interface CompactionRecoveryOptions {
   enabled: () => boolean;
   alarm: (data: Record<string, unknown>, context: ExtensionContext) => Promise<void>;
+  /** The retry compaction ended, either way, and Pi has left its compaction state (smarty-dev#9271). */
+  retryEnded?: () => void;
 }
 interface Incident {
   sessionId: string;
@@ -31,12 +35,19 @@ export const registerCompactionRecovery = (pi: ExtensionAPI, options: Compaction
     if (timer) clearTimeout(timer);
     timer = undefined;
   };
+  // smarty-dev#8881: dispose/replacement invalidates the ctx with no session_shutdown. Retire the
+  // incident quietly instead of touching it, so a later failure on a live ctx retries afresh.
+  const retired = (current: Incident): boolean => {
+    if (extensionContextLive(current.context)) return false;
+    if (incident === current) reset();
+    return true;
+  };
   const alarm = async (current: Incident, error: string): Promise<void> => {
-    if (closed || incident !== current || current.alarmed) return;
+    if (closed || incident !== current || current.alarmed || retired(current)) return;
     current.alarmed = true;
     try {
       await options.alarm({ session: current.sessionId, windowPercent: current.windowPercent,
-        reason: current.reason, error: error.slice(0, 4000), firstError: current.firstError.slice(0, 4000), attempts: 2 }, current.context);
+        reason: current.reason, error: detachedPreview(error, 4000), firstError: detachedPreview(current.firstError, 4000), attempts: 2 }, current.context);
     } catch { /* Mesh failure must not turn a compaction error into an unhandled rejection. */ }
   };
   const schedule = (context: ExtensionContext): void => {
@@ -47,14 +58,15 @@ export const registerCompactionRecovery = (pi: ExtensionAPI, options: Compaction
       timer = undefined;
       const current = incident;
       if (!current || current.retrying || closed) return;
+      if (retired(current)) return;
       const ctx = current.context;
       if (ctx.sessionManager.getSessionId() !== current.sessionId || ctx.signal?.aborted) { reset(); return; }
       if (!ctx.isIdle()) return; // agent_settled supplies the next safe boundary, without polling.
       current.retrying = true;
       try {
         ctx.compact({ ...(current.customInstructions ? { customInstructions: current.customInstructions } : {}),
-          onComplete: () => { if (incident === current) reset(); },
-          onError: error => { void alarm(current, error.message); },
+          onComplete: () => { if (retired(current)) return; if (incident === current) reset(); options.retryEnded?.(); },
+          onError: error => { if (retired(current)) return; void alarm(current, error.message); options.retryEnded?.(); },
         });
       } catch (error) {
         void alarm(current, error instanceof Error ? error.message : String(error));

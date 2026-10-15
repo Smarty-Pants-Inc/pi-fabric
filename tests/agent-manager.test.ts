@@ -1,10 +1,13 @@
 import { execFileSync, spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
+import { senderHeaderHookPath } from "../src/guards/sender-headers.js";
 import type { FabricLifecyclePublishRequest } from "../src/lifecycle/types.js";
 import { snapshotHandoffSession } from "../src/agents/handoff.js";
 import {
@@ -21,6 +24,7 @@ import {
 } from "../src/agents/budget-ledger.js";
 import type { AgentRunRecord, AgentRunResult } from "../src/agents/types.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
+import { fakeManagerHeapWorker } from "./fixtures/manager-heap-probe.js";
 
 const managers: AgentManager[] = [];
 const roots: string[] = [];
@@ -82,6 +86,10 @@ const fabricEnvKeys = [
   "PI_FABRIC_BUDGET",
   "PI_FABRIC_BUDGET_FILE",
   "PI_FABRIC_BUDGET_ID",
+  // Manager fixtures below assert legacy live-worker/debt behavior, not capped
+  // subtree teardown. Select that route explicitly even on delegated CI hosts.
+  "DBUS_SESSION_BUS_ADDRESS",
+  "XDG_RUNTIME_DIR",
 ] as const;
 const inheritedFabricEnv = new Map(
   fabricEnvKeys.map((key) => [key, process.env[key]]),
@@ -124,6 +132,156 @@ const expectUnconfirmedClose = async (manager: AgentManager) => {
   await expect(manager.close()).rejects.toThrow(/execution exit unconfirmed/);
   managers.splice(managers.indexOf(manager), 1);
 };
+describe("Agent prompt retention (#11663)", () => {
+  const managedFixture = (prefix: string) => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), prefix)); roots.push(tempRoot);
+    // Retention belongs to managed OS-temp roots, not explicit caller roots.
+    vi.spyOn(os, "tmpdir").mockReturnValue(tempRoot);
+    vi.stubEnv("PI_FABRIC_TMPDIR", undefined);
+    vi.stubEnv("PI_FABRIC_RUN_ROOT", undefined);
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, retainRuns: false }, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
+    });
+    managers.push(manager);
+    return manager;
+  };
+  afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); });
+
+  it("keeps a failed prompt and metadata across manager close while successful trees are removed", async () => {
+    const manager = managedFixture("pi-fabric-prompt-retention-");
+    const prompt = "FAIL_DIRECTIVE\nprivate brief with exact bytes: π\n";
+    const failedHandle = await manager.spawn({ task: prompt, transport: "process" });
+    expect(failedHandle).toMatchObject({
+      promptSha256: createHash("sha256").update(Buffer.from(prompt, "utf8")).digest("hex"),
+      promptBytes: Buffer.byteLength(prompt, "utf8"),
+      promptPath: expect.any(String),
+    });
+    const failed = await manager.wait(failedHandle.id);
+    expect(failed.status).toBe("failed");
+    expect(failed).toMatchObject({
+      promptSha256: createHash("sha256").update(Buffer.from(prompt, "utf8")).digest("hex"),
+      promptBytes: Buffer.byteLength(prompt, "utf8"),
+      promptPath: expect.any(String),
+    });
+    const successfulHandle = await manager.spawn({ task: "successful task", transport: "process" });
+    await expect(manager.wait(successfulHandle.id)).resolves.toMatchObject({ status: "completed" });
+    const failedStatus = manager.status(failedHandle.id);
+    expect(failedStatus).toMatchObject({
+      promptSha256: createHash("sha256").update(Buffer.from(prompt, "utf8")).digest("hex"),
+      promptBytes: Buffer.byteLength(prompt, "utf8"),
+    });
+    const promptPath = (failedStatus as AgentRunRecord).promptPath!;
+    expect(fs.readFileSync(promptPath, "utf8")).toBe(prompt);
+    // Windows has no POSIX modes: exact private modes are POSIX-only.
+    if (process.platform !== "win32") {
+      expect(fs.statSync(promptPath).mode & 0o777).toBe(0o600);
+      expect(fs.statSync(path.dirname(promptPath)).mode & 0o777).toBe(0o700);
+    }
+    const successfulDirectory = manager.runDirectory(successfulHandle.id)!;
+    await manager.close();
+    expect(fs.existsSync(successfulDirectory)).toBe(false);
+    expect(fs.existsSync(promptPath)).toBe(true);
+    expect(fs.readdirSync(path.dirname(promptPath)).sort()).toEqual(["manager-result.json", "status.json", "task.txt"]);
+    const retainedResult = JSON.parse(fs.readFileSync(path.join(path.dirname(promptPath), "manager-result.json"), "utf8")) as AgentRunRecord;
+    expect(retainedResult).toMatchObject({ id: failedHandle.id, status: "failed" });
+    expect(retainedResult).not.toHaveProperty("task");
+    const persisted = JSON.parse(fs.readFileSync(path.join(path.dirname(promptPath), "status.json"), "utf8")) as AgentRunRecord;
+    expect(persisted).toMatchObject({
+      status: "failed",
+      promptSha256: failedStatus.promptSha256,
+      promptBytes: failedStatus.promptBytes,
+      promptPath,
+      inputSha256: createHash("sha256").update(fs.readFileSync(promptPath)).digest("hex"),
+      inputBytes: fs.readFileSync(promptPath).byteLength,
+    });
+    expect(persisted).not.toHaveProperty("task");
+    const afterClose = manager.status(failedHandle.id) as AgentRunRecord;
+    expect(afterClose.promptSha256).toBe(failedStatus.promptSha256);
+    expect(createHash("sha256").update(fs.readFileSync(afterClose.promptPath!)).digest("hex")).toBe(afterClose.inputSha256);
+  });
+
+  it("retains a failed continuation under its current digest while preserving the original metadata", async () => {
+    const manager = managedFixture("pi-fabric-prompt-continuation-");
+    const original = "RESUME_FAIL_AFTER_STOP\noriginal brief π\n";
+    const handle = await manager.spawn({ task: original, transport: "process" });
+    const result = await manager.wait(handle.id);
+    expect(result.status).toBe("failed");
+    const beforeClose = manager.status(handle.id) as AgentRunRecord;
+    expect(beforeClose.promptSha256).toBe(createHash("sha256").update(Buffer.from(original, "utf8")).digest("hex"));
+    expect(beforeClose.inputSha256).not.toBe(beforeClose.promptSha256);
+    const taskPath = beforeClose.promptPath!;
+    const currentBytes = fs.readFileSync(taskPath);
+    expect(createHash("sha256").update(currentBytes).digest("hex")).toBe(beforeClose.inputSha256);
+    expect(Buffer.byteLength(currentBytes)).toBe(beforeClose.inputBytes);
+    await manager.close();
+    expect(fs.readdirSync(path.dirname(taskPath)).sort()).toEqual(["manager-result.json", "status.json", "task.txt"]);
+    expect(JSON.parse(fs.readFileSync(path.join(path.dirname(taskPath), "manager-result.json"), "utf8"))).not.toHaveProperty("task");
+    const persisted = JSON.parse(fs.readFileSync(path.join(path.dirname(taskPath), "status.json"), "utf8")) as AgentRunRecord;
+    expect(persisted.promptSha256).toBe(beforeClose.promptSha256);
+    expect(persisted.promptBytes).toBe(beforeClose.promptBytes);
+    expect(persisted.inputSha256).toBe(beforeClose.inputSha256);
+    expect(persisted.inputBytes).toBe(beforeClose.inputBytes);
+    expect(persisted.promptPath).toBe(taskPath);
+    expect(persisted.status).toBe("failed");
+    expect(persisted).not.toHaveProperty("task");
+    expect(fs.readFileSync(taskPath)).toEqual(currentBytes);
+    expect(persisted.promptRetentionDropped).toBeUndefined();
+  });
+
+  it("drops a tampered task file but retains a mismatch status record", async () => {
+    const manager = managedFixture("pi-fabric-prompt-tamper-");
+    const handle = await manager.spawn({ task: "FAIL_DIRECTIVE\noriginal bytes\n", transport: "process" });
+    await manager.wait(handle.id);
+    const taskPath = (manager.status(handle.id) as AgentRunRecord).promptPath!;
+    fs.writeFileSync(taskPath, "tampered bytes\n", { mode: 0o600 });
+    await manager.close();
+    expect(fs.readdirSync(path.dirname(taskPath)).sort()).toEqual(["manager-result.json", "status.json"]);
+    expect(JSON.parse(fs.readFileSync(path.join(path.dirname(taskPath), "manager-result.json"), "utf8"))).toMatchObject({ status: "failed" });
+    expect(JSON.parse(fs.readFileSync(path.join(path.dirname(taskPath), "manager-result.json"), "utf8"))).not.toHaveProperty("task");
+    const persisted = JSON.parse(fs.readFileSync(path.join(path.dirname(taskPath), "status.json"), "utf8")) as AgentRunRecord;
+    expect(persisted.promptRetentionDropped).toBe(true);
+    expect(persisted.promptRetentionMismatch).toBe(true);
+    expect(persisted.inputSha256).toBeDefined();
+    expect(persisted.status).toBe("failed");
+    expect(persisted).not.toHaveProperty("task");
+  });
+
+  it("marks a managed root closed for the configured one-shot sweep age", async () => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-prompt-sweep-")); roots.push(tempRoot);
+    // Match agent-manager-close's private OS-temp fixture; an explicit override
+    // requires a safe Windows volume ancestor, which CI's D:\ does not prove.
+    const tmpdir = vi.spyOn(os, "tmpdir").mockReturnValue(tempRoot);
+    vi.stubEnv("PI_FABRIC_TMPDIR", undefined);
+    vi.stubEnv("PI_FABRIC_RUN_ROOT", undefined);
+    try {
+      const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, retainRuns: false }, {
+        workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
+      });
+      managers.push(manager);
+      const handle = await manager.spawn({ task: "FAIL_DIRECTIVE\nmanaged root\n", transport: "process" });
+      const result = await manager.wait(handle.id);
+      const taskPath = (manager.status(handle.id) as AgentRunRecord).promptPath!;
+      const runRoot = path.dirname(path.dirname(taskPath));
+      expect(path.dirname(runRoot)).toBe(tempRoot);
+      await manager.close();
+      const owner = JSON.parse(fs.readFileSync(path.join(runRoot, ".fabric-owner.json"), "utf8")) as { closedAt?: number };
+      expect(owner.closedAt).toBeTypeOf("number");
+      const sweepOptions = {
+        tempRoot,
+        orphanedTempRunRetentionMs: DEFAULT_FABRIC_CONFIG.retention.orphanedTempRunMs,
+        oneShotRunRetentionMs: DEFAULT_FABRIC_CONFIG.retention.oneShotRunMs,
+      };
+      expect(retentionStorage.sweepTempRunRoots({ ...sweepOptions,
+        now: result.finishedAt! + DEFAULT_FABRIC_CONFIG.retention.oneShotRunMs - 1,
+      }).removedRuns).toEqual([]);
+      const swept = retentionStorage.sweepTempRunRoots({ ...sweepOptions,
+        now: result.finishedAt! + DEFAULT_FABRIC_CONFIG.retention.oneShotRunMs + 1,
+      });
+      expect(swept.removedRuns).toContain(path.dirname(taskPath));
+    } finally { tmpdir.mockRestore(); vi.unstubAllEnvs(); }
+  });
+});
+
 describe("AgentManager fleet model admission (#2490)", () => {
   it.each([
     ["veda", "backend-shortcut", "explicit"],
@@ -1670,7 +1828,7 @@ describe("AgentManager", () => {
   },
   30_000);
 
-  it("resumes a run whose worker was stopped mid-run and carries its progress forward", async () => {
+  it.each(["pi", "pi-durable"])("resumes a stopped %s worker and carries its progress forward", async (runner) => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
     roots.push(root);
     const manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
@@ -1679,7 +1837,7 @@ describe("AgentManager", () => {
     });
     managers.push(manager);
 
-    const result = await manager.run({ task: "RESUME_AFTER_STOP", transport: "process" });
+    const result = await manager.run({ task: "RESUME_AFTER_STOP", runner, transport: "process" });
 
     expect(result.status).toBe("completed");
     expect(result.text).toBe("resumed attempt 2");
@@ -1689,8 +1847,10 @@ describe("AgentManager", () => {
     expect(result.toolCalls).toBe(4);
     expect(result.usage.input).toBe(110);
     expect(result.usage.cost).toBeCloseTo(0.011, 6);
-    // The resumed child is told what it is continuing, not handed a bare task.
-    expect(result.task).toContain("[Fabric continuation]");
+    // Native retries need a continuation note; durable retries retain the
+    // prompt identity of the journal they reopen.
+    if (runner === "pi-durable") expect(result.task).toBe("RESUME_AFTER_STOP");
+    else expect(result.task).toContain("[Fabric continuation]");
     const runDirectory = manager.runDirectory(result.id)!;
     expect(fs.readFileSync(path.join(runDirectory, "resume-attempts"), "utf8")).toBe("2");
   },
@@ -2099,45 +2259,54 @@ describe("AgentManager", () => {
     expect(types).toContain("agent_settled");
   });
 
-  it("derives trusted log paths and recursively discovers bounded nested runs", async () => {
+  it("derives trusted log paths and freezes recursively discovered nested runs at settlement", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
     roots.push(root);
-    const manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, retainRuns: true }, {
       workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
       runRoot: root,
     });
     managers.push(manager);
-    const result = await manager.run({ task: "Inspect nesting", transport: "process" });
-    const runDirectory = manager.runDirectory(result.id)!;
-    const topStatus = JSON.parse(fs.readFileSync(path.join(runDirectory, "status.json"), "utf8"));
-    fs.writeFileSync(
-      path.join(runDirectory, "status.json"),
-      JSON.stringify({ ...topStatus, logFile: "/tmp/untrusted-top.jsonl" }),
-    );
-    const childDirectory = path.join(runDirectory, "nested", "child");
-    const grandchildDirectory = path.join(childDirectory, "nested", "grandchild");
-    fs.mkdirSync(grandchildDirectory, { recursive: true });
-    fs.writeFileSync(
-      path.join(childDirectory, "status.json"),
-      JSON.stringify({ ...result, id: "child", name: "child", logFile: "/tmp/untrusted-child.jsonl" }),
-    );
-    fs.writeFileSync(
-      path.join(grandchildDirectory, "status.json"),
-      JSON.stringify({ ...result, id: "grandchild", name: "grandchild", logFile: "/tmp/untrusted-grandchild.jsonl" }),
-    );
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async request => {
+      const transport = await fakeManagerHeapWorker(request);
+      const statusFile = request.workerArguments[request.workerArguments.indexOf("--status-file") + 1]!;
+      const record = JSON.parse(fs.readFileSync(statusFile, "utf8"));
+      const child = path.join(path.dirname(statusFile), "nested", "child");
+      const grandchild = path.join(child, "nested", "grandchild");
+      fs.mkdirSync(grandchild, { recursive: true });
+      writeJsonAtomic(statusFile, { ...record, logFile: "/tmp/untrusted-top.jsonl" });
+      for (const [directory, id] of [[child, "child"], [grandchild, "grandchild"]] as const) {
+        writeJsonAtomic(path.join(directory, "status.json"), { ...record, id, name: id, logFile: `/tmp/untrusted-${id}.jsonl` });
+      }
+      return transport; // Publish the whole tree before the manager can settle.
+    });
+    try {
+      const result = await manager.run({ task: "Inspect nesting", transport: "process", extensions: false });
+      const runDirectory = manager.runDirectory(result.id)!;
+      const childDirectory = path.join(runDirectory, "nested", "child");
+      const grandchildDirectory = path.join(childDirectory, "nested", "grandchild");
+      const status = manager.status(result.id) as AgentRunRecord;
+      for (const record of [result, status, await manager.wait(result.id)]) {
+        expect(record.logFile).toBe(path.join(runDirectory, "events.jsonl"));
+        expect(record.nestedAgents?.[0]?.logFile).toBe(path.join(childDirectory, "events.jsonl"));
+        expect(record.nestedAgents?.[0]?.nestedAgents?.[0]?.logFile).toBe(path.join(grandchildDirectory, "events.jsonl"));
+      }
+      const published = JSON.parse(fs.readFileSync(path.join(runDirectory, "manager-result.json"), "utf8"));
+      expect(published.nestedAgents).toEqual(result.nestedAgents);
 
-    const status = manager.status(result.id) as AgentRunRecord;
-    expect(status.logFile).toBe(path.join(runDirectory, "events.jsonl"));
-    expect(status.nestedAgents?.[0]?.logFile).toBe(path.join(childDirectory, "events.jsonl"));
-    expect(status.nestedAgents?.[0]?.nestedAgents?.[0]?.logFile).toBe(
-      path.join(grandchildDirectory, "events.jsonl"),
-    );
-
-    status.nestedAgents![0]!.name = "caller mutation";
-    fs.rmSync(path.join(runDirectory, "nested"), { recursive: true, force: true });
-    const retained = manager.status(result.id) as AgentRunRecord;
-    expect(retained.nestedAgents?.[0]?.name).toBe("child");
-    expect(retained.nestedAgents?.[0]?.nestedAgents?.[0]?.name).toBe("grandchild");
+      status.nestedAgents![0]!.name = "caller mutation";
+      // Native teardown can still publish after the parent's result boundary.
+      writeJsonAtomic(path.join(childDirectory, "status.json"), { ...result, id: "child", name: "late rewrite" });
+      const late = path.join(runDirectory, "nested", "late-child");
+      fs.mkdirSync(late);
+      writeJsonAtomic(path.join(late, "status.json"), { ...result, id: "late-child", name: "late child" });
+      for (const retained of [manager.status(result.id) as AgentRunRecord, await manager.wait(result.id)]) {
+        expect(retained.nestedAgents).toEqual(result.nestedAgents);
+        expect(retained.nestedAgents?.map(record => record.id)).toEqual(["child"]);
+        expect(retained.nestedAgents?.[0]?.name).toBe("child");
+        expect(retained.nestedAgents?.[0]?.nestedAgents?.[0]?.name).toBe("grandchild");
+      }
+    } finally { launch.mockRestore(); }
   });
 
   it("captures recursive leaves before the child process removes their directories", async () => {
@@ -2303,7 +2472,7 @@ describe("AgentManager", () => {
     process.env.PI_FABRIC_TOOL_ALLOWLIST = allowlist;
     let manager: AgentManager;
     try {
-      manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+      manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, runner: "pi" }, {
         workerPath: path.resolve("src/worker.ts"),
         piBinary: path.resolve("tests/fixtures/fake-pi-launch-probe.mjs"),
         runRoot: path.join(root, "runs"), fullCodeMode: true,
@@ -2336,7 +2505,7 @@ describe("AgentManager", () => {
     roots.push(root);
     const fakePi = path.resolve("tests/fixtures/fake-pi-launch-probe.mjs");
     fs.chmodSync(fakePi, 0o755);
-    const manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, runner: "pi" }, {
       workerPath: path.resolve("src/worker.ts"),
       piBinary: fakePi,
       runRoot: root,
@@ -2369,11 +2538,14 @@ describe("AgentManager", () => {
     });
     expect(native.status).toBe("completed");
     // --no-extensions disables Fabric/discovery, not explicitly installed host helpers.
-    // Principal delivery and native session observation remain installed host helpers;
-    // neither widens the child's tools nor enables Fabric/discovery.
+    // Principal delivery, native session observation and the sender-header hook (smarty-dev#6207,
+    // every Pi-backed child) remain installed host helpers; none widens the child's tools nor
+    // enables Fabric/discovery. The hook path comes from the worker's own resolver.
     expect(JSON.parse(native.text).extensionPaths).toEqual([
       path.resolve("src/worker/principal-delivery.ts"),
       path.resolve("src/worker/session-id.ts"),
+      senderHeaderHookPath(pathToFileURL(path.resolve("src/worker.ts")).href),
+      path.resolve("src/agents/write-guard.ts"),
     ]);
     expect(JSON.parse(native.text)).toMatchObject({
       extensions: false,
@@ -2389,7 +2561,7 @@ describe("AgentManager", () => {
     roots.push(root);
     const fakePi = path.resolve("tests/fixtures/fake-pi-rpc.mjs");
     fs.chmodSync(fakePi, 0o755);
-    const manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, runner: "pi" }, {
       workerPath: path.resolve("src/worker.ts"),
       piBinary: fakePi,
       runRoot: root,
@@ -2427,7 +2599,7 @@ describe("AgentManager", () => {
     roots.push(root);
     const fakePi = path.resolve("tests/fixtures/fake-pi-rpc.mjs");
     fs.chmodSync(fakePi, 0o755);
-    const manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, runner: "pi" }, {
       workerPath: path.resolve("src/worker.ts"),
       piBinary: fakePi,
       runRoot: root,
@@ -2509,7 +2681,7 @@ describe("AgentManager", () => {
     roots.push(root);
     const fakePi = path.resolve("tests/fixtures/fake-pi-rpc.mjs");
     fs.chmodSync(fakePi, 0o755);
-    const manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, runner: "pi" }, {
       workerPath: path.resolve("src/worker.ts"),
       piBinary: fakePi,
       runRoot: root,
@@ -2534,7 +2706,7 @@ describe("AgentManager", () => {
     roots.push(root);
     const fakePi = path.resolve("tests/fixtures/fake-pi-rpc.mjs");
     fs.chmodSync(fakePi, 0o755);
-    const manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, runner: "pi" }, {
       workerPath: path.resolve("src/worker.ts"),
       piBinary: fakePi,
       runRoot: root,
@@ -2859,7 +3031,7 @@ describe("AgentManager", () => {
     fs.chmodSync(fakePi, 0o755);
     // The fake pi emits one assistant turn with 7 tokens (input 3 + output 4);
     // a 5-token ceiling trips the guard after the first message_end.
-    const config = { ...DEFAULT_FABRIC_CONFIG.agents, maxTokensPerChild: 5 };
+    const config = { ...DEFAULT_FABRIC_CONFIG.agents, runner: "pi" as const, maxTokensPerChild: 5 };
     const manager = new AgentManager(process.cwd(), config, {
       workerPath: path.resolve("src/worker.ts"),
       piBinary: fakePi,
@@ -2890,7 +3062,7 @@ describe("AgentManager multimodal prompts", () => {
     process.env.FAKE_PI_BEHAVIOR = "capture-prompt";
     process.env.FAKE_PI_PROMPT_LOG = promptLog;
     try {
-      const manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+      const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, runner: "pi" }, {
         workerPath: path.resolve("src/worker.ts"),
         piBinary: path.resolve("tests/fixtures/fake-pi.mjs"),
         runRoot: path.join(root, "runs"),
@@ -3191,7 +3363,7 @@ describe("AgentManager steering", () => {
     const received = path.join(root, "received.jsonl");
     process.env.FAKE_PI_STEER_LOG = received;
     try {
-      const manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+      const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, runner: "pi" }, {
         workerPath: path.resolve("src/worker.ts"),
         piBinary: fakePiSteer,
         runRoot: root,
@@ -3232,7 +3404,7 @@ describe("AgentManager steering", () => {
     const received = path.join(root, "received.jsonl");
     process.env.FAKE_PI_STEER_LOG = received;
     try {
-      const manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+      const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, runner: "pi" }, {
         workerPath: path.resolve("src/worker.ts"),
         piBinary: fakePiSteer,
         runRoot: root,
@@ -3263,7 +3435,7 @@ describe("AgentManager steering", () => {
     const received = path.join(root, "received.jsonl");
     process.env.FAKE_PI_STEER_LOG = received;
     try {
-      const manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+      const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, runner: "pi" }, {
         workerPath: path.resolve("src/worker.ts"),
         piBinary: fakePiSteer,
         runRoot: root,
@@ -3363,7 +3535,7 @@ describe("AgentManager steering", () => {
     const received = path.join(root, "received.jsonl");
     process.env.FAKE_PI_STEER_LOG = received;
     try {
-      const manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+      const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, runner: "pi" }, {
         workerPath: path.resolve("src/worker.ts"),
         piBinary: fakePiSteer,
         runRoot: root,

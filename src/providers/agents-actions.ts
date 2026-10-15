@@ -10,6 +10,9 @@ import {
 import { FABRIC_LIFECYCLE_EVENTS } from "../lifecycle/types.js";
 import type { FabricActionDescriptor } from "../protocol.js";
 
+// RUNNER_ID_PATTERN (src/agents/runner-registry.ts) as source text; kept in sync by a test.
+const RUNNER_ID_SOURCE = "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$";
+
 const runProperties = {
   task: { type: "string", description: "A self-contained task for the child agent" },
   name: { type: "string" },
@@ -17,8 +20,9 @@ const runProperties = {
   requires: { type: "array", maxItems: MAX_AGENT_REQUIRED_INPUTS, items: { type: "string", minLength: 1, maxLength: MAX_AGENT_REQUIRED_INPUT_BYTES }, description: "Literal absolute selected-host input paths, each at most 4096 UTF-8 bytes, without dot/dot-dot segments, line breaks or control characters. Local process spawns check existence before starting; unsupported transports refuse requires with AgentInputError; remote launches preflight via repeated --require PATH arguments." },
   runner: {
     type: "string",
-    enum: ["pi", "claude", "veda"],
-    description: "Execution harness. Defaults to agents.runner.",
+    pattern: RUNNER_ID_SOURCE,
+    maxLength: 64,
+    description: "Execution harness: pi (default), pi-durable (opt-in isolated durable Pi host), claude, veda, or a runner registered through pi-fabric/runners. Defaults to agents.runner.",
   },
   kernel: {
     type: "string",
@@ -49,6 +53,15 @@ const runProperties = {
     type: "string",
     enum: ["off", "minimal", "low", "medium", "high", "xhigh", "max"],
   },
+  thinkingBounds: {
+    type: "object",
+    properties: {
+      min: { type: "string", enum: ["off", "minimal", "low", "medium", "high", "xhigh", "max"] },
+      max: { type: "string", enum: ["off", "minimal", "low", "medium", "high", "xhigh", "max"] },
+    },
+    additionalProperties: false,
+    description: "Optional child thinking bounds; must lie inside this session's bounds (omitted ends inherit). Child Fabric sessions never widen them. thinking outside the effective bounds is clamped and reported as requestedThinking.",
+  },
   tools: { type: "array", items: { type: "string" } },
   nice: {
     type: "integer",
@@ -74,10 +87,63 @@ const runProperties = {
     description: "Filesystem execution directory for leaf or recursive Pi runs; relative paths resolve from the caller cwd. Does not change project/mesh ownership or grant target project trust.",
   },
   worktree: { type: "boolean" },
+  worktreeSetup: {
+    type: "string",
+    maxLength: 8192,
+    description: "Shell command run in a new worktree before the child starts; overrides agents.worktree.setup. Non-zero exit fails the run.",
+  },
+  seed: {
+    type: "string",
+    enum: ["task", "branch", "snippet"],
+    description: "Child context (Pi only). task (default): the task alone. branch: a non-blocking fork of this conversation up to its last completed turn, then the task. snippet: the last seedMessages user/assistant texts prefixed to the task.",
+  },
+  seedMessages: { type: "integer", minimum: 1, maximum: 50, description: "snippet only; default 12" },
+  writePolicy: {
+    type: "string",
+    enum: ["unrestricted"],
+    description: "Audited opt-out of the process task default on non-overlapping layouts (write/edit restricted to cwd and run/tmp; host-owned run records excluded; shells allowed). A run dir inside cwd skips only the implicit default and logs #11705; explicit writableRoots are unchanged. Cannot be combined with readOnly/writableRoots/shell or escape inherited confinement.",
+  },
+  readOnly: { type: "boolean", description: "Pi only: refuse write/edit (and shell unless shell: \"unconfined\") in the child" },
+  writableRoots: {
+    type: "array",
+    items: { type: "string", maxLength: 4096 },
+    maxItems: 32,
+    description: "Pi only: confine write/edit to these directories (relative to the child cwd; default the cwd). Shell is refused unless shell: \"unconfined\".",
+  },
+  scope: {
+    type: "object",
+    properties: {
+      grants: {
+        type: "array",
+        maxItems: 64,
+        items: {
+          type: "object",
+          properties: {
+            resource: { type: "string", minLength: 3, maxLength: 512 },
+            actions: { type: "array", minItems: 1, maxItems: 3, items: { type: "string", enum: ["read", "write", "execute"] } },
+          },
+          required: ["resource", "actions"],
+          additionalProperties: false,
+        },
+      },
+    },
+    required: ["grants"],
+    additionalProperties: false,
+    description: "Narrow this session's host-issued scope for the child (each grant must be covered by a parent grant; resource <ns>:<path>, <ns>:<path>/*, <ns>:<path>/**, <ns>:*). Omit to inherit it; refused in an unscoped session.",
+  },
+  shell: {
+    type: "string",
+    enum: ["deny", "unconfined"],
+    description: "With a write policy, bash is refused by default; unconfined allows it and is not a sandbox",
+  },
   schema: { type: "object", description: "Optional JSON Schema for validated structured output" },
   systemPrompt: {
     type: "string",
     description: "Optional extra system prompt body for this child run. Pi runners merge it below component guidance and forward it via --system-prompt; Claude runners receive it via --append-system-prompt. Useful for reliability-focused prompt rules on models with weak behavioral defaults.",
+  },
+  persistSession: {
+    type: "boolean",
+    description: "Claude runner only: persist the Claude Code transcript for hook-based observability. Defaults to false.",
   },
 };
 
@@ -102,6 +168,17 @@ const residencySchema = {
   description: "session stops with the current Pi host; durable transfers execution to Fabric's hidden resident host.",
 };
 
+const actorSlotClaimSchema = {
+  type: "object",
+  description: "Exact won claim revision for an enforced native review slot. Reuse unchanged with the same idempotencyKey; never refresh or steal after refusal/uncertainty.",
+  properties: {
+    key: { type: "string", minLength: 1 },
+    ifVersion: { type: "integer", minimum: 1, maximum: Number.MAX_SAFE_INTEGER },
+  },
+  required: ["key", "ifVersion"],
+  additionalProperties: false,
+};
+
 const actorBindingScopeSchema = {
   type: "string",
   enum: ["session", "project", "global"],
@@ -123,7 +200,7 @@ const residentIdempotencyKeySchema = {
   type: "string",
   minLength: 1,
   maxLength: 256,
-  description: "Optional durable create/spawn retry key. Same operation and key on the same resident host returns the first result (last 256 completed requests, up to 10 minutes). Different or omitted keys create independently; no deduplication across host restarts or for session/global creation.",
+  description: "Stable creation retry identity. Enforced native slots require a caller-supplied key and unchanged request: retries retain the original admitted ID across restarts, and retired slots never reopen. Ordinary durable create/spawn uses a host-local receipt cache (last 256 completed requests, up to 10 minutes); ordinary session/global creation is not deduplicated.",
 };
 
 const spawnSchema = {
@@ -383,7 +460,7 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
     inputSchema: {
       type: "object",
       properties: {
-        runner: { type: "string", enum: ["pi", "claude", "veda"] },
+        runner: { type: "string", pattern: RUNNER_ID_SOURCE, maxLength: 64 },
         refresh: { type: "boolean" },
       },
       additionalProperties: false,
@@ -429,6 +506,16 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
     risk: "write",
   },
   {
+    name: "slotStatus",
+    description: "Read native slot-admission status. session (default) inspects this runtime's store; durable queries the actual existing selected resident host/store without starting one. Diagnostic only: cannot enable enforcement, import existing authority (#13036), or grant a claim.",
+    inputSchema: {
+      type: "object",
+      properties: { residency: residencySchema },
+      additionalProperties: false,
+    },
+    risk: "read",
+  },
+  {
     name: "create",
     description:
       'Create a persistent actor with inline instructions or instructionsFile + sha256 verified by its owning host (max 512 KB, factory root only). Use scope "global" for a reusable template.',
@@ -466,6 +553,7 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
         protected: { type: "boolean", description: "Trusted protection snapshot; true for review/security/audit/needs-security-pass. Omitted excludes before Jev." },
         residency: residencySchema,
         idempotencyKey: residentIdempotencyKeySchema,
+        slotClaim: actorSlotClaimSchema,
         runner: runProperties.runner,
         kernel: runProperties.kernel,
         model: strictModelProperty,
@@ -895,6 +983,8 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
         id: { type: "string", description: "Template id or name (one of id/name required)" },
         name: { type: "string", description: "Template name (one of id/name required)" },
         as: { type: "string", description: "Optional new name for the imported live actor" },
+        slotClaim: actorSlotClaimSchema,
+        idempotencyKey: residentIdempotencyKeySchema,
       },
       additionalProperties: false,
     },

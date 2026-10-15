@@ -1,13 +1,16 @@
 #!/usr/bin/env node
 
 import { childProcessEnvironment } from "./core/atomic-write.js";
+import { detachedPreview } from "./core/preview.js";
 import fs from "node:fs";
 import { followUpFile, followUpState, followUpMessageId, releaseFollowUpPayload } from "./agents/follow-up-delivery.js";
 import path from "node:path";
+import { mkdirPrivate } from "./storage/private-dir.js";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
 import type { ChildProcess, SpawnOptions } from "node:child_process";
-import crossSpawn from "cross-spawn";
+import { assertWorkerRuntime, writeWorkerStartupFailure } from "./worker/startup.js";
+
 import { StringDecoder } from "node:string_decoder";
 import type { ImageContent } from "@earendil-works/pi-ai";
 import type {
@@ -16,10 +19,10 @@ import type {
 } from "./agents/types.js";
 import { applyChildPriority } from "./agents/priority.js";
 import { saveWorkerCompletion } from "./agents/completion-journal.js";
-import { taskAgentEnvironment } from "./agents/task-environment.js";
+import { taskAgentEnvironment, withoutTaskBoundary } from "./agents/task-environment.js";
 import { applyTaskReturnAddress } from "./agents/task-return-address.js";
 import { processStartTime } from "./residency/process-identity.js";
-import { executionGroup } from "./worker/execution-group.js";
+import { executionGroup, observeExecutionGroup } from "./worker/execution-group.js";
 import { createCrashFinisher } from "./worker/crash-finish.js";
 
 // ProcessTransport's native channel transfers the execution cleanup obligation
@@ -42,16 +45,20 @@ const executionSettled = (): Promise<void> => new Promise(resolve => {
   if (process.platform !== "win32" && process.connected && process.send) process.send({ type: "fabric-execution-settled" }, () => resolve());
   else resolve();
 });
-import { interruptedModelStreamError, retryableProviderError } from "./worker/provider-error.js";
+import { interruptedModelStreamError, retryableProviderError, WARNING_RETENTION_CAP } from "./worker/provider-error.js";
 import { copyFabricProvenance, type FabricTurnProvenance } from "./fabric-provenance.js";
 import { ActivationSession } from "./worker/activation-session.js";
 import type { ActorContextReseed } from "./worker/context-admission.js";
 import { readPiSessionHeader } from "./core/pi-session-header.js";
 import { savePiSettlementReceipt } from "./worker/settlement-receipt.js";
 import { syncPathNamespace } from "./core/atomic-write.js";
-import { finalAssistantText, readFinalAnswerReceipt, type FinalAnswerReceipt } from "./worker/terminal-answer.js";
-import { queuedTerminalControls, settleTerminalControl, trackTerminalControl } from "./worker/terminal-controls.js";
+import { finalAssistantText, readFinalAnswerReceipt, withTaskFinalAnswerLock, type FinalAnswerReceipt } from "./worker/terminal-answer.js";
+import { terminalControls, markTerminalControlForwarded, readTerminalControl, settleTerminalControl, trackTerminalControl, type TerminalControl } from "./worker/terminal-controls.js";
 import { DEFAULT_BASH_IDLE_S } from "./guards/actor-bash-timeout.js";
+import { senderHeaderHookPath } from "./guards/sender-headers.js";
+import { WriteReceiptRecorder } from "./agents/write-receipt.js";
+
+let crossSpawn: typeof import("cross-spawn");
 
 const NODE_SCRIPT_EXTENSIONS = new Set([".js", ".cjs", ".mjs", ".ts", ".cts", ".mts"]);
 
@@ -126,12 +133,20 @@ const loadToolCallStreamGuard = async (): Promise<WorkerToolCallStreamGuardModul
   return import(sourceModulePath) as Promise<WorkerToolCallStreamGuardModule>;
 };
 
-type AgentResultModule = typeof import("./agents/result.js");
+type AgentResultModule = typeof import("./worker/result.js");
 
 const loadAgentResult = async (): Promise<AgentResultModule> => {
-  if (!import.meta.url.endsWith(".ts")) return import("./agents/result.js");
-  const sourceModulePath = "./agents/result.ts";
+  if (!import.meta.url.endsWith(".ts")) return import("./worker/result.js");
+  const sourceModulePath = "./worker/result.ts";
   return import(sourceModulePath) as Promise<AgentResultModule>;
+};
+
+type WorkerQuestionsModule = typeof import("./worker/questions.js");
+
+const loadWorkerQuestions = async (): Promise<WorkerQuestionsModule> => {
+  if (!import.meta.url.endsWith(".ts")) return import("./worker/questions.js");
+  const sourceModulePath = "./worker/questions.ts";
+  return import(sourceModulePath) as Promise<WorkerQuestionsModule>;
 };
 
 const loadWorkerOptions = async (): Promise<WorkerOptionsModule> => {
@@ -170,6 +185,22 @@ const loadVedaCli = async (): Promise<VedaCliModule> => {
   return import(sourceModulePath) as Promise<VedaCliModule>;
 };
 
+/**
+ * Every runner whose child is Pi: the pi CLI (or Fabric's task entry) and the pi-durable SDK
+ * worker, which loads each explicit -e path into its session's extension list.
+ */
+const PI_BACKED_RUNNERS: ReadonlySet<string> = new Set(["pi", "pi-durable"]);
+/**
+ * smarty-dev#6207: the one launch rule for the sender-header hook. Every Pi-backed child names
+ * its sender, also with --no-extensions (an explicit -e still loads). The Main's own hook skips
+ * worker children, so a runner missing here would send no sender headers at all.
+ */
+const senderHeaderHookArguments = (runner: string): string[] => {
+  if (!PI_BACKED_RUNNERS.has(runner)) return [];
+  const hookPath = senderHeaderHookPath(import.meta.url);
+  if (!fs.existsSync(hookPath)) throw new Error("Sender header hook is missing");
+  return ["-e", hookPath];
+};
 const MAX_STDERR_CHARS = 20_000;
 const STEER_READ_CHUNK_BYTES = 256 * 1024;
 const MAX_STEER_LINE_BYTES = 64 * 1024;
@@ -224,6 +255,16 @@ const numberField = (value: unknown): number => (typeof value === "number" ? val
 const stringField = (value: unknown): string | undefined =>
   typeof value === "string" && value.trim() ? value.trim() : undefined;
 
+/** smarty-dev#3238 round 3: why a silently overflowed answer ("stop"/"length" over the window) is withheld. */
+const silentOverflowError = (message: Record<string, unknown>, contextWindow: number): string => {
+  const usage = typeof message.usage === "object" && message.usage !== null && !Array.isArray(message.usage)
+    ? message.usage as Record<string, unknown> : {};
+  const count = (value: unknown): number => typeof value === "number" && Number.isFinite(value) ? value : 0;
+  const input = count(usage.input) + count(usage.cacheRead);
+  return `Context overflow: the provider ended the turn with stopReason "${String(message.stopReason)}" with ${input} input tokens ` +
+    `against a ${contextWindow}-token window; its answer is unchecked and was not delivered`;
+};
+
 const assistantError = (message: Record<string, unknown>): string => {
   const details: string[] = [];
   const direct = stringField(message.errorMessage) ?? stringField(message.error);
@@ -245,7 +286,7 @@ const assistantError = (message: Record<string, unknown>): string => {
   const model = stringField(message.model);
   const source = [provider, model].filter((value): value is string => Boolean(value)).join("/");
   const summary = unique.join(" · ") || "Pi agent reported an error";
-  return `${source ? `${source}: ` : ""}${summary}`.slice(0, MAX_STDERR_CHARS);
+  return detachedPreview(`${source ? `${source}: ` : ""}${summary}`, MAX_STDERR_CHARS);
 };
 
 const runnerLabel = (runner: string): string =>
@@ -260,15 +301,21 @@ const terminateChild = (child: ChildProcess, signal: NodeJS.Signals): void => {
 
 
 
-let crashContext: { statusFile: string; record: AgentRunRecord } | undefined;
+// receipt: pi-fabric#1034 round 7, the live write receipt (pending calls and dropped lines marked truncated).
+let crashContext: { statusFile: string; record: AgentRunRecord; receipt?: () => AgentRunRecord["writeReceipt"] } | undefined;
 let runRecordHelpers: WorkerRunRecordModule | undefined;
 let terminalWritten = false;
 let flushRunLog: (() => void) | undefined;
 const writeCrashStatus = (error: unknown): void => {
   flushRunLog?.();
-  if (!crashContext || !runRecordHelpers || terminalWritten) return;
+  // Without a run context yet, upstream's startup writer still persists the failure.
+  if (terminalWritten) return;
   try {
-    runRecordHelpers.writeCrashRunRecord(crashContext.statusFile, crashContext.record, error);
+    if (crashContext && runRecordHelpers) {
+      runRecordHelpers.writeCrashRunRecord(crashContext.statusFile, crashContext.record, error, crashContext.receipt?.());
+    } else {
+      writeWorkerStartupFailure(process.argv, error);
+    }
   } catch {
     // Best effort: if the crash-status write itself fails, #monitor falls back
     // to "Agent transport exited without a result".
@@ -289,6 +336,8 @@ process.on("unhandledRejection", (error) => { void finishCrash(error); });
 
 const main = async (): Promise<void> => {
   await custodyReady;
+  assertWorkerRuntime();
+  crossSpawn = (await import("cross-spawn")).default;
   const [optionHelpers, loadedRunRecordHelpers, sessionExportHelpers, {parseStructuredValue, validateAgentResult}, { PiModelControl }, { PiEventProjection }, { PiRecoveryWatchdog, PI_PROVIDER_RESUME_DELAYS_MS, recoveryTimeScale }, { createRunLogWriter, compactTerminalRunLog, MAX_EVENT_LINE_CHARS }, { ToolCallStreamGuard }] = await Promise.all([
     loadWorkerOptions(),
     loadWorkerRunRecord(),
@@ -303,6 +352,8 @@ const main = async (): Promise<void> => {
   runRecordHelpers = loadedRunRecordHelpers;
   const {
     applyUsage,
+    assistantContextTokens,
+    piWindowRefusal,
     createRunningRecord,
     emptyUsage,
     extractUsageDelta,
@@ -311,6 +362,7 @@ const main = async (): Promise<void> => {
     writeRunRecord,
   } = loadedRunRecordHelpers;
   const options = optionHelpers.parseWorkerOptions();
+  const isPi = PI_BACKED_RUNNERS.has(options.runner);
   const sessionExporter = options.sessionExportFile
     ? new sessionExportHelpers.SessionExporter({
         file: options.sessionExportFile,
@@ -333,9 +385,14 @@ const main = async (): Promise<void> => {
   const taskProvenance = fs.existsSync(options.taskFile + ".provenance.json")
     ? copyFabricProvenance(JSON.parse(fs.readFileSync(options.taskFile + ".provenance.json", "utf8"))) : undefined;
   const deliveryDirectory = path.join(path.dirname(options.taskFile), "deliveries");
-  fs.mkdirSync(deliveryDirectory, { recursive: true, mode: 0o700 });
+  // The run root (the run directory's parent) is the Fabric-owned anchor (pi-fabric#875 round 3).
+  const runRoot = path.dirname(path.dirname(options.taskFile));
+  mkdirPrivate(deliveryDirectory, runRoot);
   const images = readImages(options.imagesFile);
   const record = createRunningRecord(options, task, thinking, Date.now());
+  // pi-fabric#1034: every Pi child's record carries a receipt from its creation, so an early refusal or failure
+  // record has the empty one too (round-2 review P2).
+  if (isPi) record.writeReceipt = { paths: [], commands: [] };
   if (options.runner === "pi") {
     // The manager removes the old status to fence terminal verdicts on relaunch.
     // History is explicitly handed across that boundary, not a Pi resume target.
@@ -356,7 +413,7 @@ const main = async (): Promise<void> => {
     data?: Record<string, unknown>,
   ): void => {
     try {
-      fs.mkdirSync(path.dirname(options.lifecycleFile), { recursive: true });
+      mkdirPrivate(path.dirname(options.lifecycleFile), runRoot); // smarty-dev#9016: 0700 under any umask
       fs.appendFileSync(
         options.lifecycleFile,
         JSON.stringify({ version: 1, event, occurredAt: Date.now(), ...(data ? { data } : {}) }) + "\n",
@@ -368,7 +425,7 @@ const main = async (): Promise<void> => {
   };
   crashContext = { statusFile: options.statusFile, record };
   process.stdout.write(`[pi-fabric] ${options.name}\n${task}\n\n`);
-  fs.mkdirSync(path.dirname(options.logFile), { recursive: true });
+  mkdirPrivate(path.dirname(options.logFile), runRoot); // smarty-dev#9016: 0700 under any umask
   // Other processes tail this file while the run is live (transcript reader,
   // dashboards, preview trees). The previous buffered createWriteStream visibly
   // stalled mid-run — append synchronously so events are durable immediately.
@@ -404,8 +461,15 @@ const main = async (): Promise<void> => {
   if (persistentPiTask && options.inferenceContext !== "activation") {
     const profileModule = import.meta.url.endsWith(".ts") ? "./worker/retry-profile.ts" : "./worker/retry-profile.js";
     const { prepareRetryProfile, resolveRetrySdk } = await import(profileModule) as typeof import("./worker/retry-profile.js");
+    // Native SDK task entry owns the final-answer fence even when the profile
+    // keeps its own retry settings.
     piRetrySdk = resolveRetrySdk(options.piBinary);
-    if (prepareRetryProfile(options.cwd, path.join(path.dirname(options.statusFile), "pi-agent"), process.env, recoveryScale)) {
+    // Invalid personal entries must not prevent an opaque launcher from
+    // starting. Its explicit profile replay below counts the skipped entries.
+    let retryProfile: string | undefined;
+    try { retryProfile = prepareRetryProfile(options.cwd, path.join(path.dirname(options.statusFile), "pi-agent"), process.env, recoveryScale); }
+    catch (error) { if (piRetrySdk) throw error; }
+    if (retryProfile) {
       // Opaque/custom launchers are a supported fallback, not a degraded run.
       // Keep profile-selection telemetry separate from result/cleanup warnings.
       if (!piRetrySdk) appendLog(`${JSON.stringify({ type: "fabric_retry_profile", mode: "launcher", reason: "sdk_unavailable", message: "Selected Pi launcher has no discoverable native SDK; preserving its retry settings and canonical auth path (Fabric same-session recovery remains enabled)" })}\n`);
@@ -424,10 +488,13 @@ const main = async (): Promise<void> => {
   const piArguments = ["--mode", "rpc"];
   if (piSessionFile) piArguments.push("--session", activationSession?.file ?? piSessionFile);
   else piArguments.push("--no-session");
-  // Opaque launchers have no supplied native discovery API. Fail closed on
-  // auto-discovery rather than reintroducing an unvalidated Fabric generation.
-  // Explicit task hooks still load; native launchers retain all other resources.
-  if (!options.extensions || (options.fabricExtensionPath && !piReleaseSdk)) piArguments.push("--no-extensions");
+  // Opaque launchers have no supplied native discovery API. Keep discovery
+  // disabled, but replay the personal profile's explicit non-Fabric extensions
+  // so its guard policy survives. Native launchers retain their own discovery.
+  // The release fence is for the pi CLI launcher; the durable host is Fabric's own
+  // pinned SDK and keeps native discovery (upstream pi-durable).
+  const opaqueFabricLauncher = options.runner === "pi" && options.fabricExtensionPath && !piReleaseSdk;
+  if (!options.extensions || opaqueFabricLauncher) piArguments.push("--no-extensions");
   if (options.judgment) piArguments.push("--no-skills", "--no-prompt-templates", "--no-context-files", "--no-themes", "--no-approve", "--no-auto-compaction");
   if (options.residentStartupProbe) {
     // Explicit Fabric -e still loads. Do not execute unrelated profile hooks,
@@ -447,6 +514,32 @@ const main = async (): Promise<void> => {
     // CLI extensions precede discovered extensions. Install the compaction
     // guard before any other hook can start summarization work.
     piArguments.push("-e", hookPath, "--no-auto-compaction");
+  }
+  if (opaqueFabricLauncher && options.extensions && !options.residentStartupProbe) {
+    const profileModule = import.meta.url.endsWith(".ts") ? "./worker/profile-extensions.ts" : "./worker/profile-extensions.js";
+    const { resolveProfileExtensions, ProfileSettingsError } = await import(profileModule) as typeof import("./worker/profile-extensions.js");
+    let profile: ReturnType<typeof resolveProfileExtensions>;
+    try { profile = resolveProfileExtensions(pinnedFabricExtension!); }
+    catch (error) {
+      if (!(error instanceof ProfileSettingsError)) throw error;
+      // Fail closed: this launcher runs with --no-extensions, so unreadable or
+      // invalid profile settings would start the task without its guards.
+      appendLog(`${JSON.stringify({ type: "fabric_profile_extensions_refused", settingsFile: error.settingsFile, reason: error.reason })}\n`);
+      record.status = "failed"; record.error = error.message;
+      record.finishedAt = Date.now(); record.updatedAt = record.finishedAt;
+      writeRunRecord(options.statusFile, record); terminalWritten = true;
+      await executionSettled();
+      await new Promise<void>(resolve => sessionStream ? sessionStream.end(resolve) : resolve());
+      process.exitCode = 1;
+      return;
+    }
+    for (const extension of profile.paths) piArguments.push("-e", extension);
+    for (const [index, warning] of profile.warnings.entries()) {
+      record.warnings = [...(record.warnings ?? []), warning];
+      appendLog(`${JSON.stringify({ type: "worker_warning", warning, source: "profile_extensions", count: index + 1 })}\n`);
+    }
+    appendLog(`${JSON.stringify({ type: "fabric_profile_extensions", names: profile.names, loadedCount: profile.names.length, skippedCount: profile.warnings.length })}\n`);
+    writeRunRecord(options.statusFile, record);
   }
   if (options.fabricExtensionPath) piArguments.push("-e", options.fabricExtensionPath);
   const deliveryHook = fileURLToPath(new URL(
@@ -494,6 +587,14 @@ const main = async (): Promise<void> => {
     // Explicit -e is loaded even with --no-extensions: attribution is not optional.
     piArguments.push("-e", hookPath);
   }
+  // smarty-dev#6207: one rule for every Pi-backed runner (pi CLI or task entry, pi-durable SDK worker).
+  piArguments.push(...senderHeaderHookArguments(options.runner));
+  if (options.writePolicy) {
+    // The guard loads even with --no-extensions; other runners cannot enforce it.
+    if (!isPi) throw new Error(`Write confinement requires the Pi runner, not ${options.runner}`);
+    const guard = import.meta.url.endsWith(".ts") ? "./agents/write-guard.ts" : "./agents/write-guard.js";
+    piArguments.push("-e", fileURLToPath(new URL(guard, import.meta.url)));
+  }
   const piTools = replyTool ? [...options.tools, "fabric_reply"] : options.tools;
   if (piTools.length > 0) piArguments.push("--tools", piTools.join(","));
   else piArguments.push("--no-tools"); // explicit empty allowlist => no tools, not Pi defaults
@@ -508,6 +609,12 @@ const main = async (): Promise<void> => {
         : `Your final response must contain only JSON matching this schema, without Markdown fences:\n${schema}`,
     );
   }
+  if (options.runner === "pi-durable") {
+    piArguments.push(
+      "--durable-run-id", options.id,
+      "--durable-directory", path.join(path.dirname(options.statusFile), "durable"),
+    );
+  }
   const claudeCli = options.runner === "claude" ? await loadClaudeCli() : undefined;
   const vedaCli = options.runner === "veda" ? await loadVedaCli() : undefined;
   const childArguments =
@@ -515,7 +622,8 @@ const main = async (): Promise<void> => {
       ? claudeCli!.buildClaudeArguments({
           tools: options.tools,
           extensions: options.extensions,
-          persistentSession: Boolean(options.sessionFile),
+          // Actors and handoffs already have a session file; one-shot Claude runs opt in explicitly.
+          persistentSession: Boolean(options.sessionFile) || options.persistSession === true,
           ...(options.model ? { model: options.model } : {}),
           ...(thinking ? { thinking } : {}),
           ...(options.systemPrompt ? { systemPrompt: options.systemPrompt } : {}),
@@ -540,7 +648,12 @@ const main = async (): Promise<void> => {
       ? options.claudeBinary
       : options.runner === "veda"
         ? options.vedaBinary
-        : options.piBinary;
+        : options.runner === "pi-durable"
+          ? fileURLToPath(new URL(
+              import.meta.url.endsWith(".ts") ? "./durable/worker.ts" : "./durable/worker.js",
+              import.meta.url,
+            ))
+          : options.piBinary;
 
   // smarty-dev#1579: agents.nice lowers CPU and IO priority. This dedicated worker lowers its own
   // spawning (main) thread before the fork, so the child, every thread it starts and its tools
@@ -550,8 +663,10 @@ const main = async (): Promise<void> => {
       appendLog(`${JSON.stringify({ type: "fabric_priority_error", error: message })}\n`));
   }
   // smarty-dev#2339 F4: a nested actor gets its own default, never its parent's override.
+  // smarty-dev#8257: only this task's own native child keeps its admitted boundary.
+  // Actors defensively clear any stale caller receipt, preserving actor roles (SRC-1).
   const childEnvironment = applyTaskReturnAddress(
-    options.actorId ? { ...process.env } : taskAgentEnvironment(), process.argv.slice(2),
+    options.actorId ? withoutTaskBoundary(process.env) : taskAgentEnvironment(process.env, true), process.argv.slice(2),
   );
   // Native session metadata belongs to this child, never its parent/resident host.
   delete childEnvironment.PI_SESSION_ID;
@@ -563,7 +678,7 @@ const main = async (): Promise<void> => {
   // A task child has its own identity and reply contract, not its actor parent's.
   for (const key of ["PI_FABRIC_ACTOR_ID", "PI_FABRIC_ACTOR_NAME", "PI_FABRIC_ACTOR_SESSION_FILE",
     "PI_FABRIC_REPLY_SCHEMA_FILE", "PI_FABRIC_REPLY_FILE", "PI_FABRIC_REPLY_HOOK",
-    "PI_FABRIC_SPAWNER_ID", "PI_FABRIC_SPAWNER_KIND", "PI_FABRIC_SPAWNER_RUN"]) {
+    "PI_FABRIC_SPAWNER_ID", "PI_FABRIC_SPAWNER_KIND", "PI_FABRIC_SPAWNER_RUN", "PI_FABRIC_SPAWNER_NAME"]) {
     delete childEnvironment[key];
   }
   // A nested explicit-model task must never inherit its parent's route attribution.
@@ -631,12 +746,15 @@ const main = async (): Promise<void> => {
       PI_FABRIC_AGENT_RUN_DIR: path.dirname(options.statusFile),
       PI_FABRIC_DEPTH: String(options.depth),
       PI_FABRIC_PARENT_RUN: options.id,
+      // A child Fabric intersects its own thinking.bounds with these.
+      ...(options.thinkingBounds ? { PI_FABRIC_THINKING_BOUNDS: options.thinkingBounds } : {}),
       PI_FABRIC_AGENT_NAME: options.name,
       ...(options.spawner ? {
         PI_FABRIC_SPAWNER_ID: options.spawner.id,
         PI_FABRIC_SPAWNER_KIND: options.spawner.kind,
         PI_FABRIC_SPAWNER_RUN: options.spawner.runId ?? "",
       } : {}),
+      ...(options.spawnerName ? { PI_FABRIC_SPAWNER_NAME: options.spawnerName } : {}),
       ...(options.mainAgentId ? { PI_FABRIC_MAIN_AGENT_ID: options.mainAgentId } : {}),
       ...(options.fabricSessionId ? { PI_FABRIC_SESSION_ID: options.fabricSessionId } : {}),
       PI_FABRIC_GRANTED_RISKS: options.grantedRisks.join(","),
@@ -666,6 +784,16 @@ const main = async (): Promise<void> => {
         ? { PI_FABRIC_OWNER_IDENTITY_ID: options.ownerIdentityId }
         : {}),
       ...(options.runRoot ? { PI_FABRIC_RUN_ROOT: options.runRoot } : {}),
+      // Supported child contract (docs/agents.md "Child environment contract").
+      ...(options.tmpdir ? { TMPDIR: options.tmpdir, TMP: options.tmpdir, TEMP: options.tmpdir } : {}),
+      ...(options.lineage ? { PI_FABRIC_LINEAGE: options.lineage } : {}),
+      PI_FABRIC_WRITE_POLICY: options.writePolicy,
+      // Exactly the manager's derived scope; undefined drops an inherited value.
+      PI_FABRIC_SCOPE: options.scope,
+      PI_FABRIC_SCOPE_FILE: undefined,
+      // Disabled extensions must not regain ambient authority via provider discovery.
+      // Also drop an inherited target for an explicitly loaded bridge.
+      PI_FABRIC_EXTENSION_MODEL: undefined,
     },
     stdio: piRetrySdk ? ["pipe", "pipe", "pipe", "ipc"] : ["pipe", "pipe", "pipe"],
   });
@@ -677,6 +805,7 @@ const main = async (): Promise<void> => {
     // Windows preserves native-child cleanup, not an execution-tree receipt.
     const group = process.platform === "win32" ? {
       observe(): void {},
+      members: (): number[] => [],
       exited: () => nativeClosed,
       signal: (signal: NodeJS.Signals): void => {
         if (execution.exitCode === null && execution.signalCode === null) execution.kill(signal);
@@ -684,7 +813,8 @@ const main = async (): Promise<void> => {
     } : executionGroup(execution);
     executionGroups.set(execution, group);
     execution.once("close", () => { nativeClosed = true; });
-    const groupObserver = setInterval(() => { try { group.observe(); } catch { /* cleanup fails closed */ } }, 100);
+    // Background adoption only; signal()/exited() re-read members on demand.
+    const groupObserver = observeExecutionGroup(group);
     let draining: Promise<void> | undefined;
     executionCleanup = () => draining ??= (async () => {
       const exited = () => nativeClosed && group.exited();
@@ -693,6 +823,12 @@ const main = async (): Promise<void> => {
         do { if (exited()) return true; await new Promise(resolve => setTimeout(resolve, 20)); } while (Date.now() < deadline);
         return exited();
       };
+      if (!exited() && persistentPiTask && piRetrySdk && readFinalAnswerReceipt(path.dirname(options.statusFile), options.id)) {
+        // EOF drains buffered RPC frames through the native discard fence. TERM
+        // here would kill that reader before its durable per-frame ACKs land.
+        execution.stdin?.end();
+        await wait(KILL_GRACE_MS);
+      }
       if (!exited()) {
         group.signal("SIGTERM");
         execution.stdin?.end();
@@ -726,7 +862,7 @@ const main = async (): Promise<void> => {
   // once the child closes instead of treating stdout as NDJSON lines.
   let vedaOutput = "";
   let vedaParsed: Record<string, unknown> | undefined;
-  let eventProjection = options.runner === "pi" ? new PiEventProjection() : undefined;
+  let eventProjection = isPi ? new PiEventProjection() : undefined;
   let outputDecoder = new StringDecoder("utf8");
   let stderrDecoder = new StringDecoder("utf8");
   let terminalStatus: AgentRunStatus | undefined;
@@ -745,12 +881,26 @@ const main = async (): Promise<void> => {
   let producedFinalAnswer = false;
   let finalAnswerReceipt: FinalAnswerReceipt | undefined;
   let lastUsageMessageTimestamp: number | undefined;
+  // smarty-dev#3238: the child's model window, from its own get_state, for an actor's contextUsage.
+  let childContextWindow: number | undefined;
+  // smarty-dev#3238 round 2: set only from a structured overflow signal; stamps errorCode on failure.
+  let contextOverflowSignal = false;
   let finalTurnCompleted = false;
   let attemptBase = { turns: record.turns, toolCalls: record.toolCalls, usage: { ...record.usage } };
   let completedToolInTurn = false;
   let hasCompletedToolTurn = false;
   let streamingToolCallInTurn = false;
   const unresolvedToolCalls = new Set<string>();
+  // smarty-dev#8758 item 2: what the child's write/edit/shell tools actually did, from Pi's own tool events.
+  const writeReceipt = new WriteReceiptRecorder(options.cwd);
+  // pi-fabric#1034 round 6 (Astra P1): an event line over MAX_EVENT_LINE_CHARS is dropped unread, so the recorder
+  // may miss a tool start or end in it. Rule chosen, the simplest that never under-reports: EVERY dropped line of a
+  // Pi child marks the receipt truncated, whatever the line was (the line is not parsed for its type).
+  let receiptLineDropped = false;
+  // A call still pending (started, never ended: cancelled, failed or cut off) may have had its effect: also truncated.
+  const receiptNow = (): NonNullable<typeof record.writeReceipt> =>
+    receiptLineDropped || writeReceipt.pending > 0 ? { ...writeReceipt.receipt, truncated: true } : writeReceipt.receipt;
+  if (isPi && crashContext) crashContext.receipt = receiptNow;
 
   // Only ordinary tasks with real, completed tool work and retained prose can
   // expose an interrupted report without claiming success. Never suppress
@@ -764,8 +914,24 @@ const main = async (): Promise<void> => {
     terminalStatus !== "stopped" && terminalStatus !== "timed_out" &&
     record.compaction?.status !== "queued" && record.compaction?.status !== "in_flight" &&
     record.compaction?.status !== "failed" && interruptedModelStreamError(error);
+  let answerProjected = false;
+  let recordedResultPending = false;
+  let recordedResultTimer: NodeJS.Timeout | undefined;
+  const recordedResultId = `fabric-recorded-result:${options.id}`;
 
   const update = (): void => updateRunRecord(options.statusFile, record);
+  // agents.childQuestions "route": child dialogs wait for a parent ui_response.
+  const questionRelay = options.childQuestionTimeoutMs !== undefined && isPi && options.steerFile
+    ? new (await loadWorkerQuestions()).ChildQuestionRelay(options.childQuestionTimeoutMs, {
+        emit: (question) => emitLifecycle("question", { ...question }),
+        send: (frame) => { injectPiControl(`${JSON.stringify(frame)}\n`); },
+        blocked: (since) => {
+          if (since === undefined) delete record.blockedOn;
+          else record.blockedOn = { since };
+          update();
+        },
+      })
+    : undefined;
   let killTimer: NodeJS.Timeout | undefined;
   let closeTimer: NodeJS.Timeout | undefined;
   const recoveryWatchdog = new PiRecoveryWatchdog((error) => failStalledChild(error), recoveryScale);
@@ -794,7 +960,7 @@ const main = async (): Promise<void> => {
       recoveryWatchdog.suspend();
       if (closeTimer) clearTimeout(closeTimer);
       closeTimer = undefined;
-      record.warnings = [...(record.warnings ?? []), `${error.message}; aborting turn for one same-model retry`].slice(-20);
+      record.warnings = [...(record.warnings ?? []), `${error.message}; aborting turn for one same-model retry`].slice(-WARNING_RETENTION_CAP);
       update();
       // Native abort waits for the assistant to finalize/persist. Close stdin
       // only after its acknowledgement; SIGTERM + EOF together can race two
@@ -857,7 +1023,7 @@ const main = async (): Promise<void> => {
       if (piSettledSuccessfully && (hasFinalResult || piSettlementDurable) && modelControl.ready && !terminalStatus &&
           !terminalError && !sawAgentError && !lostResult) {
         const warning = `${error}; preserving final result and terminating child`;
-        record.warnings = [...(record.warnings ?? []), warning].slice(-20);
+        record.warnings = [...(record.warnings ?? []), warning].slice(-WARNING_RETENTION_CAP);
         appendLog(`${JSON.stringify({ type: "worker_warning", warning })}\n`);
         process.stderr.write(`[pi-fabric] ${warning}\n`);
         // Persist the result and warning BEFORE signalling the owned group.
@@ -874,6 +1040,26 @@ const main = async (): Promise<void> => {
     closeTimer.unref();
   };
 
+  // The child publishes its receipt under this same lock. Envelope/tracking and
+  // refusal durability stay outside; the critical section only reads and writes
+  // one stdin frame. A stale poll snapshot never authorizes a later injection.
+  const injectPiControl = (frame: string, controlId?: string): void => {
+    if (!persistentPiTask || !piRetrySdk) { child.stdin?.write(frame); return; }
+    const directory = path.dirname(options.statusFile);
+    const ended = withTaskFinalAnswerLock(directory, () => {
+      const receipt = finalAnswerReceipt ?? readFinalAnswerReceipt(directory, options.id);
+      if (!receipt && child.stdin && !child.stdin.writableEnded && !child.stdin.destroyed) {
+        // Write-ahead evidence survives a crash/partial write. Never downgrade
+        // an attempted write to unforwarded on a callback error or native close.
+        if (!controlId || markTerminalControlForwarded(directory, controlId)) child.stdin.write(frame);
+      }
+      return receipt;
+    });
+    if (ended && controlId) {
+      const control = readTerminalControl(directory, controlId);
+      if (control?.state === "queued") refuseTerminalControl(control, ended.id);
+    }
+  };
   // Auth checks and model_select hooks can be slow under concurrent launches.
   // Startup and admission share the overall run timeout below, not a shorter cap.
   const sendPiDelivery = (message: string, provenance: FabricTurnProvenance | undefined, delivery: "steer" | "followUp", images?: readonly ImageContent[], controlId?: string): void => {
@@ -881,17 +1067,17 @@ const main = async (): Promise<void> => {
     if (persistentPiTask && piRetrySdk && controlId) {
       trackTerminalControl(path.dirname(options.statusFile), { id: controlId, delivery, provenance });
       fs.writeFileSync(path.join(deliveryDirectory, controlId + ".json"), JSON.stringify({ message, provenance, delivery, images, controlId }), { mode: 0o600 });
-      child.stdin?.write(JSON.stringify({ type: "prompt", id: controlId, message: "/fabric-delivery " + controlId, streamingBehavior: delivery }) + "\n");
+      injectPiControl(JSON.stringify({ type: "prompt", id: controlId, message: "/fabric-delivery " + controlId, streamingBehavior: delivery }) + "\n", controlId);
       return;
     }
     if (!provenance?.principal) {
-      child.stdin?.write(JSON.stringify({ type: delivery === "steer" ? "steer" : "follow_up", message,
-        ...(controlId ? { id: controlId } : {}) }) + "\n");
+      injectPiControl(JSON.stringify({ type: delivery === "steer" ? "steer" : "follow_up", message,
+        ...(controlId ? { id: controlId } : {}) }) + "\n", controlId);
       return;
     }
     const id = randomUUID();
     fs.writeFileSync(path.join(deliveryDirectory, id + ".json"), JSON.stringify({ message, provenance, delivery, images }), { mode: 0o600 });
-    child.stdin?.write(JSON.stringify({ type: "prompt", message: "/fabric-delivery " + id, streamingBehavior: delivery }) + "\n");
+    injectPiControl(JSON.stringify({ type: "prompt", message: "/fabric-delivery " + id, streamingBehavior: delivery }) + "\n", controlId);
   };
   const hasUnsettledFollowUps = (): boolean => {
     const directory = path.join(path.dirname(deliveryDirectory), "follow-ups");
@@ -916,16 +1102,19 @@ const main = async (): Promise<void> => {
         if (item.followUpId !== id || item.delivery !== "followUp") continue;
         const receipt = followUpFile(path.dirname(deliveryDirectory), id);
         if (followUpState(receipt) !== "queued") { releaseFollowUpPayload(receipt); continue; }
-        child.stdin?.write(JSON.stringify({ type: "prompt", message: "/fabric-delivery " + id, streamingBehavior: "followUp" }) + "\n");
+        injectPiControl(JSON.stringify({ type: "prompt", message: "/fabric-delivery " + id, streamingBehavior: "followUp" }) + "\n", id);
       } catch { /* Retain malformed/uncertain envelopes; never invent delivery. */ }
     }
   };
   let activationWindowReady = false;
   let residentProbeReady = false;
   // Optional worker-only edge: never load native estimation in Main registration.
-  const admissionModule = options.runner === "pi" && options.actorId && !activationWindow
+  const actorPiModule = options.runner === "pi" && options.actorId
     ? await import(import.meta.url.endsWith(".ts") ? "./worker/context-admission.ts" : "./worker/context-admission.js") as typeof import("./worker/context-admission.js")
     : undefined;
+  const admissionModule = activationWindow ? undefined : actorPiModule;
+  // smarty-dev#3238 round 2: Pi's provider-overflow classifier, for an actor run's typed overflow code.
+  const piContextOverflow = actorPiModule ? await actorPiModule.loadPiContextOverflow(options.piBinary) : undefined;
   const estimateActorInput = admissionModule
     ? await admissionModule.loadActorInputEstimator(options.piBinary) : undefined;
   if (admissionModule && !estimateActorInput) appendLog(`${JSON.stringify({ type: "fabric_context_admission", mode: "launcher", reason: "native_estimator_unavailable" })}\n`);
@@ -1014,7 +1203,7 @@ const main = async (): Promise<void> => {
       appendLog(`${JSON.stringify({ type: "fabric_model_error", requestedModel: options.model, model: record.model, error })}\n`);
       killChild();
     },
-  }, activationWindow, options.residentStartupProbe === true, Boolean(options.routeHeader));
+  }, activationWindow, options.residentStartupProbe === true, Boolean(options.routeHeader), options.modelAdmission);
   let modelControl = createModelControl();
 
   // Attributed token telemetry. Every usage-bearing child event emits one
@@ -1093,7 +1282,7 @@ const main = async (): Promise<void> => {
       if (!child.stdin || child.stdin.writableEnded || child.stdin.destroyed) {
         throw new Error("Child Pi stdin closed before compaction could start");
       }
-      child.stdin.write(`${JSON.stringify(frame)}\n`);
+      injectPiControl(`${JSON.stringify(frame)}\n`);
     },
     close: closeChild,
     update(status) {
@@ -1408,7 +1597,7 @@ const main = async (): Promise<void> => {
       } catch { /* The reply tool's durable file is authoritative, never final prose. */ }
       if (record.value === undefined) {
         record.status = "failed";
-        const snippet = record.text.trim().slice(0, 200);
+        const snippet = detachedPreview(record.text.trim(), 200);
         record.error = `Directive reply missing: the run ended without a fabric_reply call${snippet ? ` (final text: ${snippet}${record.text.trim().length > 200 ? "…" : ""})` : ""}`;
       }
     }
@@ -1419,10 +1608,40 @@ const main = async (): Promise<void> => {
         record.status = "failed";
         const reason = error instanceof Error ? error.message : String(error);
         const output = record.text.trim();
-        const snippet = output.slice(0, 200);
+        const snippet = detachedPreview(output, 200);
         record.error = `Structured agent output was invalid: ${reason}${snippet ? ` (output: ${snippet}${output.length > 200 ? "…" : ""})` : ""}`;
       }
     }
+  };
+  const refusalEmitted = new Set<string>();
+  // Forwarded rows need the child's durable discard ACK. Only a row whose
+  // write-ahead transport bit is false can be refused without child consumption.
+  const refuseTerminalControl = (control: TerminalControl, receiptId: string): void => {
+    if (refusalEmitted.has(control.id)) return;
+    let published = false;
+    const publishRefusal = (current: TerminalControl): void => {
+      const data = { code: "FABRIC_TARGET_TERMINAL", targetId: options.id, messageId: current.id,
+        delivery: current.delivery, finalAnswerReceiptId: receiptId,
+        ...(current.provenance?.sender ? { sender: current.provenance.sender } : {}) };
+      const descriptor = fs.openSync(options.lifecycleFile, "a", 0o600);
+      try {
+        fs.appendFileSync(descriptor, JSON.stringify({ version: 1, event: "message.refused",
+          runId: options.id, occurredAt: Date.now(), data }) + "\n", "utf8");
+        fs.fsyncSync(descriptor);
+      } finally { fs.closeSync(descriptor); }
+      syncPathNamespace(options.lifecycleFile);
+      published = true;
+    };
+    // Host unforwarded refusals publish BEFORE the registry transition, while
+    // the same lock excludes injection/consumption. Do not nest lock acquisition.
+    const current = settleTerminalControl(path.dirname(options.statusFile), control.id, "refused", true, publishRefusal);
+    if (current?.state !== "refused") return;
+    // A child's durable discard ACK already transitioned the row independently.
+    if (!published) publishRefusal(current);
+    refusalEmitted.add(current.id);
+  };
+  const drainTerminalControlAcks = (receipt: FinalAnswerReceipt): void => {
+    for (const control of terminalControls(path.dirname(options.statusFile))) refuseTerminalControl(control, receipt.id);
   };
   const acceptFinalAnswer = (receipt: FinalAnswerReceipt): void => {
     if (finalAnswerReceipt || !persistentPiTask) return;
@@ -1445,21 +1664,9 @@ const main = async (): Promise<void> => {
       emitLifecycle("pi.turn_end", { terminalAnswer: true });
     }
     record.finalAnswerReceipt = { id: receipt.id, recordedAt: receipt.recordedAt };
-    for (const control of queuedTerminalControls(path.dirname(options.statusFile))) {
-      const data = { code: "FABRIC_TARGET_TERMINAL", targetId: options.id, messageId: control.id,
-        delivery: control.delivery, finalAnswerReceiptId: receipt.id,
-        ...(control.provenance?.sender ? { sender: control.provenance.sender } : {}) };
-      // Unlike progress telemetry, refusal emission must precede its registry
-      // transition. The manager's validated-status scan is the publication fence.
-      const descriptor = fs.openSync(options.lifecycleFile, "a", 0o600);
-      try {
-        fs.appendFileSync(descriptor, JSON.stringify({ version: 1, event: "message.refused",
-          runId: options.id, occurredAt: Date.now(), data }) + "\n", "utf8");
-        fs.fsyncSync(descriptor);
-      } finally { fs.closeSync(descriptor); }
-      syncPathNamespace(options.lifecycleFile);
-      settleTerminalControl(path.dirname(options.statusFile), control.id, "refused");
-    }
+    drainTerminalControlAcks(receipt);
+    // Lines the worker never read are refused now, not at manager native close.
+    pollSteer();
     // Preserve any earlier admission/limit/stop failure; the receipt never blesses
     // invalid structured output. Publish before closing the owned execution tree.
     record.status = terminalStatus ?? "completed";
@@ -1469,6 +1676,8 @@ const main = async (): Promise<void> => {
     validateCompletedResult();
     terminalStatus = record.status;
     terminalError = record.error;
+    // pi-fabric#1034: the final receipt, including a truncation no end event reported.
+    if (isPi) record.writeReceipt = receiptNow();
     saveWorkerCompletion(options.statusFile, record);
     writeRunRecord(options.statusFile, record);
     terminalWritten = true;
@@ -1491,6 +1700,13 @@ const main = async (): Promise<void> => {
       event = parsed as Record<string, unknown>;
     } catch {
       runLog.event(line, undefined);
+      // pi-fabric#1034 round 6: an unparsable Pi frame (cut at close, or a projection sentinel) may have been a tool
+      // start or end; the receipt cannot vouch for it.
+      if (isPi && line.trim() && !receiptLineDropped) {
+        receiptLineDropped = true;
+        record.writeReceipt = receiptNow();
+        update(); // persist the first transition, so a checkpoint read by the manager shows it
+      }
       return;
     }
     runLog.event(line, event);
@@ -1516,6 +1732,63 @@ const main = async (): Promise<void> => {
     }
     if (options.runner === "claude") {
       processClaudeEvent(event);
+      return;
+    }
+    if (event.type === "response" && recordedResultPending && event.id === recordedResultId) {
+      recordedResultPending = false;
+      clearTimeout(recordedResultTimer);
+      const fail = (reason: string): void => failStalledChild(`Durable recorded result retrieval failed: ${reason}`);
+      if (event.command !== "get_messages" || event.success !== true) {
+        fail(typeof event.error === "string" ? event.error : "invalid or rejected RPC response");
+        return;
+      }
+      const data = event.data as { messages?: unknown } | undefined;
+      const messages = Array.isArray(data?.messages) ? data.messages : [];
+      const isMessage = (value: unknown): value is Record<string, unknown> =>
+        typeof value === "object" && value !== null && !Array.isArray(value);
+      let start = messages.length - 1;
+      while (start >= 0 && !(isMessage(messages[start]) && messages[start].role === "user")) start--;
+      // Native history includes earlier actor turns. Never attribute those to
+      // this run, or accept a stale assistant as the completed prompt's answer.
+      if (start < 0 || extractText(messages[start]) !== task) {
+        fail("recorded history does not end with the submitted prompt");
+        return;
+      }
+      const assistants = messages.slice(start + 1).filter(
+        (message): message is Record<string, unknown> => isMessage(message) && message.role === "assistant",
+      );
+      const last = assistants.at(-1);
+      if (!last) {
+        fail("recorded prompt has no assistant result");
+        return;
+      }
+      // Read-only projection: do not manufacture message_end/SessionManager
+      // writes or export already charged usage as newly generated tokens.
+      const restored = { ...record, usage: emptyUsage() };
+      for (const message of assistants) {
+        applyUsage(restored, message);
+        modelControl.observeAssistant(message);
+      }
+      if (terminalStatus) return;
+      for (const key of ["input", "output", "cacheRead", "cacheWrite", "cost"] as const) {
+        record.usage[key] = Math.max(record.usage[key], restored.usage[key]);
+      }
+      answerProjected = true;
+      record.text = latestRunText(extractText(last));
+      record.turns = Math.max(record.turns, assistants.length);
+      record.toolCalls = Math.max(record.toolCalls, messages.slice(start + 1).filter(
+        message => isMessage(message) && message.role === "toolResult",
+      ).length);
+      if (last.stopReason === "error" || last.stopReason === "aborted") {
+        sawAgentError = true;
+        terminalError = assistantError(last);
+      }
+      enforceTokenLimit();
+      update();
+      if (!terminalStatus) {
+        pollSteer();
+        compactControl.childSettled();
+      }
       return;
     }
     if (event.type === "fabric_runner_session") {
@@ -1566,12 +1839,22 @@ const main = async (): Promise<void> => {
       } else modelControl.fail("activation window readiness does not match the selected run/policy/hook");
       return;
     }
+    // smarty-dev#3238 round 2: the activation window's own window refusal, typed by its bound frame.
+    if (activationWindow && event.type === "fabric_activation_window_refusal") {
+      if (event.runId === options.id && event.nonce === activationNonce && event.protocol === 1 &&
+          event.hook === activationHookPath && event.code === "context-overflow") contextOverflowSignal = true;
+      return;
+    }
     if (residentProbeNonce && event.type === "fabric_resident_extension_ready") {
       if (event.runId === options.id && event.nonce === residentProbeNonce &&
           event.protocol === 1 && event.extension === options.fabricExtensionPath && !residentProbeReady) {
         residentProbeReady = true;
       } else modelControl.fail("resident readiness does not match the selected run/extension/nonce");
       return;
+    }
+    if (event.type === "response" && event.command === "get_state" && event.success === true) {
+      const window = (event.data as { model?: { contextWindow?: unknown } } | null | undefined)?.model?.contextWindow;
+      if (typeof window === "number" && Number.isFinite(window) && window > 0) childContextWindow = window;
     }
     if (modelControl.observe(event)) return;
     if (contextAdmission?.observe(event)) return;
@@ -1582,18 +1865,17 @@ const main = async (): Promise<void> => {
       }
     }
     // Context refusal is deterministic for an actor's admitted input. Native
-    // retries cannot make it fit; stop at the first structured failure, also
-    // for full-history actors or a preflight extension that reports an error.
+    // retries cannot make it fit; stop at Pi's own structured refusal (smarty-dev#3238
+    // round 2: the whole refusal message on its assistant message, never free text).
     const eventMessage = event.type === "message_end" && typeof event.message === "object" && event.message !== null
       ? event.message as Record<string, unknown> : undefined;
-    const contextError = eventMessage?.stopReason === "error" ? stringField(eventMessage.errorMessage)
-      : event.type === "extension_error" || (event.type === "response" && event.success === false) ? stringField(event.error)
-      : event.type === "auto_retry_start" ? stringField(event.errorMessage) : undefined;
-    if (options.actorId && !terminalStatus && contextError && /Context exceeds window:/i.test(contextError)) {
+    if (options.actorId && !terminalStatus && eventMessage && piWindowRefusal(eventMessage)) {
+      const contextError = stringField(eventMessage.errorMessage) ?? "Context exceeds window";
       terminalStatus = "failed";
       terminalError = contextError;
       record.error = contextError;
       sawAgentError = true;
+      contextOverflowSignal = true;
       update();
       killChild();
       return;
@@ -1639,7 +1921,9 @@ const main = async (): Promise<void> => {
     if (event.type === "agent_start") {
       nativeActivity = true;
       deferredFollowUpSettle = false;
-      if (options.runner === "pi" && replayAfterStart) {
+      // Both Pi runners gate steer/control reads on a live native turn (pi-durable included,
+      // or its steer channel, follow-ups and routed child answers would never be read).
+      if (isPi && replayAfterStart) {
         replayAfterStart = false;
         piControlLive = true;
         const retained = retainedPiQueues;
@@ -1688,7 +1972,8 @@ const main = async (): Promise<void> => {
       const method = event.method;
       if (
         typeof event.id === "string" &&
-        (method === "select" || method === "confirm" || method === "input" || method === "editor")
+        (method === "select" || method === "confirm" || method === "input" || method === "editor") &&
+        !questionRelay?.request(event)
       ) {
         child.stdin?.write(
           `${JSON.stringify({ type: "extension_ui_response", id: event.id, cancelled: true })}\n`,
@@ -1697,6 +1982,9 @@ const main = async (): Promise<void> => {
       return;
     }
     if (event.type === "tool_execution_start") {
+      writeReceipt.start(event);
+      // Stored at once: a checkpoint read by the manager (timeout, stop, lost worker) shows the pending call.
+      if (isPi) record.writeReceipt = receiptNow();
       unresolvedToolCalls.add(stringField(event.toolCallId) ?? "unknown-tool-call");
       record.inferenceStarted = true;
       record.toolCalls++;
@@ -1709,6 +1997,7 @@ const main = async (): Promise<void> => {
       return;
     }
     if (event.type === "tool_execution_end") {
+      if (writeReceipt.end(event)) record.writeReceipt = receiptNow();
       unresolvedToolCalls.delete(stringField(event.toolCallId) ?? "unknown-tool-call");
       completedToolInTurn = true;
       if (event.isError === true) {
@@ -1765,35 +2054,54 @@ const main = async (): Promise<void> => {
       if (text || (messageRecord.stopReason !== "error" && messageRecord.stopReason !== "aborted")) {
         record.inferenceStarted = true;
       }
-      hasFinalText = Boolean(text) && messageRecord.stopReason !== "error" &&
-        messageRecord.stopReason !== "aborted" && messageRecord.stopReason !== "toolUse";
+      // smarty-dev#3238 round 3: the run's latest model turn, judged by Pi's own classifier whatever
+      // its stopReason. A provider that answers "stop" (or "length") with usage above the window has
+      // overflowed silently (pi-ai isContextOverflow case 2/3): Pi keeps that answer without
+      // retrying, so it is unchecked. Such a turn fails like an error turn and is never final. A
+      // later turn that fits (Pi's own recovery) supersedes it, as it supersedes an error turn.
+      const overflowTurn = Boolean(options.actorId && piContextOverflow &&
+        piContextOverflow(messageRecord, childContextWindow ?? 0));
+      if (options.actorId) contextOverflowSignal = overflowTurn;
+      const failedTurn = messageRecord.stopReason === "error" || messageRecord.stopReason === "aborted" || overflowTurn;
+      hasFinalText = Boolean(text) && !failedTurn && messageRecord.stopReason !== "toolUse";
       producedFinalAnswer ||= hasFinalText;
+      if (text || messageRecord.stopReason === "error" || messageRecord.stopReason === "aborted") {
+        answerProjected = true;
+      }
       if (text) {
         record.text = latestRunText(text);
-        if (messageRecord.stopReason === "error" || messageRecord.stopReason === "aborted") {
+        if (failedTurn) {
           record.partialText = record.text;
         } else {
           record.lastCompleteText = record.text;
         }
         process.stdout.write(`\n${text}\n`);
       }
-      if (messageRecord.stopReason !== "error" && messageRecord.stopReason !== "aborted") {
+      if (!failedTurn) {
         delete record.partialText;
       }
       const usageDelta = extractUsageDelta(messageRecord);
       lastUsageMessageTimestamp = typeof messageRecord.timestamp === "number" ? messageRecord.timestamp : undefined;
       applyUsage(record, messageRecord);
+      const contextTokens = assistantContextTokens(messageRecord);
+      if (options.actorId && childContextWindow && contextTokens > 0) {
+        record.contextUsage = { tokens: contextTokens, contextWindow: childContextWindow };
+      }
       emitTokenUsage(usageDelta, {
         model: stringField(messageRecord.model),
         provider: stringField(messageRecord.provider),
       }, messageRecord);
       modelControl.observeAssistant(messageRecord);
       enforceTokenLimit();
-      if ((messageRecord.stopReason === "error" || messageRecord.stopReason === "aborted") && !terminalStatus) {
+      if (failedTurn && !terminalStatus) {
         sawAgentError = true;
         providerAborted ||= messageRecord.stopReason === "aborted";
-        terminalError = assistantError(messageRecord);
-        recoveryWatchdog.arm(terminalError);
+        const silentOverflow = overflowTurn && messageRecord.stopReason !== "error";
+        terminalError = silentOverflow ? silentOverflowError(messageRecord, childContextWindow ?? 0) : assistantError(messageRecord);
+        // Pi never retries a silent "stop" overflow (it compacts and keeps the answer), so no
+        // recovery is pending; any other failed turn may still be recovered by Pi.
+        if (silentOverflow && messageRecord.stopReason === "stop") recoveryWatchdog.clear();
+        else recoveryWatchdog.arm(terminalError);
       } else {
         recoveryWatchdog.clear();
         sawAgentError = false;
@@ -1815,6 +2123,16 @@ const main = async (): Promise<void> => {
       nativeActivity = false;
       emitLifecycle("pi.agent_settled");
       if (!retryPending) {
+        if (options.runner === "pi-durable" && !answerProjected && !terminalStatus) {
+          if (!recordedResultPending) {
+            recordedResultPending = true;
+            recordedResultTimer = setTimeout(() => failStalledChild(
+              "Durable recorded result retrieval timed out waiting for get_messages",
+            ), KILL_GRACE_MS);
+            child.stdin?.write(`${JSON.stringify({ type: "get_messages", id: recordedResultId })}\n`);
+          }
+          return;
+        }
         // Settlement ends automatic work, not necessarily successfully: native
         // compaction failures/aborts need not emit an assistant error message.
         // Older Pi frames omit outcome; retain their existing result checks.
@@ -1854,7 +2172,8 @@ const main = async (): Promise<void> => {
     }
     if (event.type === "extension_error") {
       const error = typeof event.error === "string" ? event.error : "Extension error";
-      stderr = `${stderr}\n${error}`.trim().slice(-MAX_STDERR_CHARS);
+      const combined = `${stderr}\n${error}`.trim();
+      stderr = detachedPreview(combined.slice(-MAX_STDERR_CHARS), MAX_STDERR_CHARS);
       update();
     }
   };
@@ -1895,8 +2214,12 @@ const main = async (): Promise<void> => {
   let steerRemainder = Buffer.alloc(0);
   let skippingOversizedSteerLine = false;
   const pollSteer = (): void => {
-    if (!options.steerFile || finalAnswerReceipt || terminalStatus || (options.runner === "pi" &&
-        (!piControlLive || childExited || !modelControl.ready || !child.stdin?.writable || child.stdin.writableEnded || child.stdin.destroyed))) return;
+    // The native receipt can precede its IPC frame. Reuse this bounded file
+    // reader to record unread input, but never inject it after that boundary.
+    let endedReceipt = finalAnswerReceipt;
+    if (persistentPiTask && piRetrySdk && !endedReceipt) endedReceipt = readFinalAnswerReceipt(path.dirname(options.statusFile), options.id);
+    if (!options.steerFile || (!endedReceipt && (terminalStatus || (isPi &&
+        (!piControlLive || childExited || !modelControl.ready || !child.stdin?.writable || child.stdin.writableEnded || child.stdin.destroyed))))) return;
     let descriptor: number | undefined;
     try {
       descriptor = fs.openSync(options.steerFile, "r");
@@ -1946,13 +2269,25 @@ const main = async (): Promise<void> => {
         const line = raw.trim();
         if (!line) continue;
         processedCommands += 1;
-        let command: { id?: string; type?: string; message?: string; mode?: string; instructions?: string; provenance?: unknown; followUpId?: string };
+        let command: { id?: string; type?: string; message?: string; mode?: string; instructions?: string; provenance?: unknown; followUpId?: string; requestId?: string };
         try {
           command = JSON.parse(line);
         } catch {
           continue;
         }
         try {
+          // Re-read for every parsed row too; actual injection is serialized
+          // with publication below, including rows appended after preflight.
+          if (persistentPiTask && piRetrySdk) endedReceipt = finalAnswerReceipt ?? readFinalAnswerReceipt(path.dirname(options.statusFile), options.id);
+          if (endedReceipt) {
+            if ((command.type === "steer" || command.type === "follow_up") && typeof command.id === "string" && /^[0-9a-f-]{36}$/.test(command.id)) {
+              const directory = path.dirname(options.statusFile);
+              trackTerminalControl(directory, { id: command.id, delivery: command.type === "steer" ? "steer" : "followUp", provenance: copyFabricProvenance(command.provenance) });
+              const control = readTerminalControl(directory, command.id);
+              if (control?.state === "queued") refuseTerminalControl(control, endedReceipt.id);
+            }
+            continue;
+          }
           if (options.runner === "claude") {
             if (claudeCloseTimer) clearTimeout(claudeCloseTimer);
             claudeCloseTimer = undefined;
@@ -1992,17 +2327,20 @@ const main = async (): Promise<void> => {
                 message: command.message, provenance: command.provenance, delivery: "followUp", followUpId: id,
                 ...(persistentPiTask && piRetrySdk ? { controlId: id } : {}),
               }), { mode: 0o600 });
-              child.stdin?.write(JSON.stringify({ type: "prompt", id, message: "/fabric-delivery " + id, streamingBehavior: "followUp" }) + "\n");
+              injectPiControl(JSON.stringify({ type: "prompt", id, message: "/fabric-delivery " + id, streamingBehavior: "followUp" }) + "\n", id);
             } else sendPiDelivery(command.message, copyFabricProvenance(command.provenance), "followUp", undefined, command.id);
           } else if (command.type === "set_steering_mode" && typeof command.mode === "string") {
-            child.stdin?.write(JSON.stringify({ type: "set_steering_mode", mode: command.mode }) + "\n");
+            injectPiControl(JSON.stringify({ type: "set_steering_mode", mode: command.mode }) + "\n");
           } else if (command.type === "set_follow_up_mode" && typeof command.mode === "string") {
-            child.stdin?.write(JSON.stringify({ type: "set_follow_up_mode", mode: command.mode }) + "\n");
+            injectPiControl(JSON.stringify({ type: "set_follow_up_mode", mode: command.mode }) + "\n");
           } else if (command.type === "compact") {
             compactControl.queue(command.instructions);
+          } else if (command.type === "ui_response") {
+            questionRelay?.respond(command);
           }
-        } catch {
-          /* stdin closed (settled/stopped child); a late steer is dropped */
+        } catch (error) {
+          if (endedReceipt) appendLog(`${JSON.stringify({ type: "fabric_run_end_fence_failed", message: String(error) })}\n`);
+          /* Closed stdin or failed refusal persistence: manager scans durable admissions. */
         }
       }
     } finally {
@@ -2011,6 +2349,7 @@ const main = async (): Promise<void> => {
   };
   const steerTimer = options.steerFile ? setInterval(() => {
     pollSteer();
+    if (finalAnswerReceipt) drainTerminalControlAcks(finalAnswerReceipt);
     if (deferredFollowUpSettle && !nativeActivity && !hasUnsettledFollowUps()) {
       deferredFollowUpSettle = false;
       compactControl.childSettled();
@@ -2026,7 +2365,11 @@ const main = async (): Promise<void> => {
   let oversizedCount = 0;
   const startOversizedEvent = (text: string): void => {
     toolCallStreamGuard.discardedEvent();
-    oversized = { chars: text.length, prefix: text.slice(0, MAX_EVENT_LINE_CHARS) };
+    if (isPi) {
+      receiptLineDropped = true;
+      record.writeReceipt = receiptNow(); // stored now too, in case no later end or terminal write comes
+    }
+    oversized = { chars: text.length, prefix: detachedPreview(text, MAX_EVENT_LINE_CHARS) };
   };
   const finishOversizedEvent = (): void => {
     if (!oversized) return;
@@ -2053,7 +2396,7 @@ const main = async (): Promise<void> => {
       (artifactPath ? `; first ${prefix.length} characters saved to: ${artifactPath}` : "");
     appendLog(`${JSON.stringify({ type: "worker_warning", warning })}\n`);
     process.stderr.write(`[pi-fabric] ${warning}\n`);
-    record.warnings = [...(record.warnings ?? []), warning].slice(-20);
+    record.warnings = [...(record.warnings ?? []), warning].slice(-WARNING_RETENTION_CAP);
     // Never strand a correlated admission response behind the event-line cap.
     // Only its bounded envelope is inspected; the history remains discarded.
     contextAdmission?.observeOversizedResponse(prefix, chars);
@@ -2068,7 +2411,7 @@ const main = async (): Promise<void> => {
     if (!text) return;
     appendLog(`${JSON.stringify({ type: "worker_stderr", text })}\n`);
     process.stderr.write(text);
-    stderr = `${stderr}${text}`.slice(-MAX_STDERR_CHARS);
+    stderr = detachedPreview(`${stderr}${text}`.slice(-MAX_STDERR_CHARS), MAX_STDERR_CHARS);
   };
   const consumeOutput = (decoded: string, projected = false): void => {
     if (options.runner === "veda") {
@@ -2105,6 +2448,9 @@ const main = async (): Promise<void> => {
       outputBuffer = outputBuffer.slice(newline + 1);
       processEvent(line);
     }
+    // Only the unfinished line survives until the next read. Copy once here,
+    // not at each transient line slice in a multi-event chunk.
+    outputBuffer = detachedPreview(outputBuffer, outputBuffer.length);
   };
   const attachChildStreams = (): void => {
     child.on("message", (message: unknown) => {
@@ -2149,7 +2495,7 @@ const main = async (): Promise<void> => {
     if (terminalStatus) return;
     terminalStatus = "timed_out";
     terminalError = `Agent timed out after ${options.timeoutMs}ms`;
-    if (options.runner === "pi" && !modelControl.ready) {
+    if (isPi && !modelControl.ready) {
       terminalError += "; Pi model admission did not complete; task was not sent";
     }
     killChild();
@@ -2273,7 +2619,7 @@ const main = async (): Promise<void> => {
       recoveryWatchdog.observe({ type: "auto_retry_start", delayMs: waitMs, errorMessage });
       const resume = { attempt: providerResumeAttempts + 1, maxAttempts: PI_PROVIDER_RESUME_DELAYS_MS.length,
         delayMs: waitMs, error: errorMessage, sessionFile: piSessionFile };
-      record.warnings = [...(record.warnings ?? []), `Pi provider recovery: same-session resume ${resume.attempt}/${resume.maxAttempts} scheduled after ${waitMs}ms`].slice(-20);
+      record.warnings = [...(record.warnings ?? []), `Pi provider recovery: same-session resume ${resume.attempt}/${resume.maxAttempts} scheduled after ${waitMs}ms`].slice(-WARNING_RETENTION_CAP);
       update();
       emitLifecycle("run.resumed", { ...resume, phase: "scheduled" });
       appendLog(`${JSON.stringify({ type: "fabric_provider_resume", ...resume, phase: "scheduled" })}\n`);
@@ -2299,13 +2645,24 @@ const main = async (): Promise<void> => {
 
   if (crash.pending) return; // finishCrash owns result publication after the drain.
   if (steerTimer) clearInterval(steerTimer);
+  if (finalAnswerReceipt) {
+    pollSteer(); // Last worker-side run-end fence pass.
+    drainTerminalControlAcks(finalAnswerReceipt);
+  }
+  clearTimeout(recordedResultTimer);
+  if (recordedResultPending && !terminalStatus) {
+    terminalStatus = "failed";
+    terminalError = "Durable worker exited before recorded result retrieval completed";
+  }
+  questionRelay?.close();
+  delete record.blockedOn;
   if (claudeCloseTimer) clearTimeout(claudeCloseTimer);
   clearTimeout(timeout);
   if (killTimer) clearTimeout(killTimer);
   if (closeTimer) clearTimeout(closeTimer);
   recoveryWatchdog.dispose();
   toolCallStreamGuard.dispose();
-  if (options.runner === "pi" && !modelControl.ready && !terminalStatus) {
+  if (isPi && !modelControl.ready && !terminalStatus) {
     terminalStatus = "failed";
     terminalError = `Child Pi exited before requested model admission completed; task was not sent${stderr.trim() ? `: ${stderr.trim()}` : ""}`;
   }
@@ -2378,7 +2735,7 @@ const main = async (): Promise<void> => {
   }
   runLog.flush();
   record.exitCode = exitCode;
-  record.stderr = stderr.slice(-MAX_STDERR_CHARS);
+  record.stderr = detachedPreview(stderr.slice(-MAX_STDERR_CHARS), MAX_STDERR_CHARS);
   if (
     record.compaction?.status === "queued" ||
     record.compaction?.status === "in_flight"
@@ -2405,7 +2762,7 @@ const main = async (): Promise<void> => {
   const childCompleted =
     exitCode === 0 &&
     !sawAgentError &&
-    (options.runner === "pi" ||
+    (isPi ||
       (options.runner === "claude" &&
         claudeResultSeen &&
         claudeSentInputs.length === 0 &&
@@ -2414,6 +2771,8 @@ const main = async (): Promise<void> => {
       (options.runner === "veda" && vedaParsed !== undefined));
   record.status = terminalStatus ?? (childCompleted ? "completed" : "failed");
   if (terminalError) record.error = terminalError;
+  // smarty-dev#3238 round 2: the manager retries and reports overflow only on this typed code.
+  if (record.status === "failed" && contextOverflowSignal && !record.errorCode) record.errorCode = "CONTEXT_OVERFLOW";
   if (record.status === "failed" && !record.error) {
     record.error =
       stderr.trim() ||
@@ -2428,7 +2787,7 @@ const main = async (): Promise<void> => {
     // valid JSON prefix) must never pass completed-only consumers.
     record.partialText = interruptedText;
     record.text = interruptedText;
-    record.warnings = [...(record.warnings ?? []), warning].slice(-20);
+    record.warnings = [...(record.warnings ?? []), warning].slice(-WARNING_RETENTION_CAP);
     appendLog(`${JSON.stringify({ type: "worker_warning", warning })}\n`);
   }
   validateCompletedResult();
@@ -2452,6 +2811,8 @@ const main = async (): Promise<void> => {
     record.status = "failed";
     record.error = `${record.error ? record.error + "\n" : ""}Activation journal retention failed: ${String(error)}`;
   }
+  // pi-fabric#1034: the final receipt, including a truncation no end event reported (a child that exits mid-call).
+  if (isPi) record.writeReceipt = receiptNow();
   // The owning Main may already be dead. Publish through its immutable launch return address.
   saveWorkerCompletion(options.statusFile, record);
   writeRunRecord(options.statusFile, record);

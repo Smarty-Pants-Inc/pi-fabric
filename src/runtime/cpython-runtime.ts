@@ -1,4 +1,5 @@
 import { childProcessEnvironment } from "../core/atomic-write.js";
+import { detachedPreview } from "../core/preview.js";
 import { ExecutionDeadline } from "./execution-deadline.js";
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
@@ -13,6 +14,7 @@ import { piBashExitMetadata } from "../core/pi-bash-error.js";
 import { isPiShellRef } from "../core/pi-tools.js";
 import type { FabricHostCall, FabricKernelRuntime, FabricSandboxOptions, FabricSandboxResult } from "./kernel.js";
 import { CPYTHON_CHILD_SOURCE } from "./cpython-child-source.js";
+import { HumanWaitDeadlinePause } from "./deadline-pause.js";
 import { linuxCPythonNetworkFilter } from "./cpython-linux-sandbox.js";
 
 const MAX_FRAME_BYTES = 16 * 1024 * 1024;
@@ -170,7 +172,7 @@ export class CPythonRuntime implements FabricKernelRuntime {
         // Settlement ends IPC admission, not the drain of already-written logs.
         if (logsFinalized || truncated) return;
         const available = Math.max(0, maxLogChars - logChars);
-        const retained = text.slice(0, available);
+        const retained = detachedPreview(text, available);
         logChars += retained.length;
         const lines = ((partialLogs[index] ?? "") + retained).split(/\r?\n/);
         partialLogs[index] = lines.pop() ?? "";
@@ -257,6 +259,18 @@ export class CPythonRuntime implements FabricKernelRuntime {
         void finish(executionDeadline.timeoutResult([]));
       };
       const scheduleDeadline = (): void => executionDeadline.scheduleDeadline(expireDeadline, true);
+      const humanWait = new HumanWaitDeadlinePause({
+        // ExecutionDeadline owns the clock, so a pause never lifts the host-owned ceiling.
+        remainingMs: () => executionDeadline.remainingMs(),
+        suspend: () => {
+          executionDeadline.suspend();
+          scheduleDeadline();
+        },
+        resume: (remainingMs) => {
+          executionDeadline.resume(remainingMs);
+          scheduleDeadline();
+        },
+      });
       const send = (message: any, delivered?: () => void): void => {
         // A terminal guest result closes its reply channel while issued host
         // work may still be settling. Its late replies are no longer consumed.
@@ -331,12 +345,18 @@ export class CPythonRuntime implements FabricKernelRuntime {
         const ref = message.ref;
         const args = message.args;
         callIds.add(id);
+        let waitsForHuman = false;
         try {
           const floor = options.minimumTimeoutMsForHostCall?.(ref, args);
-          if (executionDeadline.extend(floor)) scheduleDeadline();
+          if (typeof floor === "number" && Number.isFinite(floor) && humanWait.paused) humanWait.raise(floor);
+          else if (executionDeadline.extend(floor)) scheduleDeadline();
+          waitsForHuman = options.isHumanWaitHostCall?.(ref, args) === true;
         } catch (error) { fail(`CPython deadline policy failed: ${errorText(error)}`); return; }
         if (executionDeadline.reached) { expireDeadline(); return; }
-        const task = runAbortable(hostAbort.signal, () => hostCall(ref, args, hostAbort.signal)).then(
+        if (waitsForHuman) humanWait.enter();
+        const hostTask = runAbortable(hostAbort.signal, () => hostCall(ref, args, hostAbort.signal));
+        // Only a human-wait call gets the extra settlement hop (ordinary delivery timing unchanged).
+        const task = (waitsForHuman ? hostTask.finally(() => humanWait.leave()) : hostTask).then(
           (value) => send({ type: "response", id, ok: true, value }, () => options.onHostResultDelivered?.(args)),
           (error) => send({ type: "response", id, ok: false, error: errorText(error), ...(isPiShellRef(ref) ? { bashExit: piBashExitMetadata(error) } : {}) }),
         ).finally(() => { hostTasks.delete(task); callIds.delete(id); });
@@ -384,7 +404,7 @@ export class CPythonRuntime implements FabricKernelRuntime {
       child.on("error", (error) => fail(`CPython process failed: ${error.message}${this.enforce ? "; OS sandbox is required (no native fallback)" : ""}`));
       child.on("close", (exitCode, signal) => {
         if (settled || (finishing && !pipeError)) return;
-        const diagnostics = [...logs, ...partialLogs].join("\n").slice(-4000);
+        const diagnostics = detachedPreview([...logs, ...partialLogs].join("\n").slice(-4000), 4000);
         fail(`${pipeError ? `${pipeError}; ` : ""}CPython ${this.enforce ? "sandbox " : ""}process exited before returning a result (${signal ?? exitCode}).${this.enforce ? " Verify OS sandbox availability/user namespaces; no unsandboxed fallback is permitted." : ""}${diagnostics ? `\n${diagnostics}` : ""}`);
       });
       options.signal?.addEventListener("abort", abort, { once: true });

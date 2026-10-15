@@ -151,7 +151,9 @@ describe("legacy routes and durable mesh delivery", () => {
     try {
       type Ports = ConstructorParameters<typeof MeshProvider>;
       const store = new MeshStore(root, 64 * 1024, 100);
-      const provider = new MeshProvider(store, { id: "sender", name: "Sender", kind: "main" }, {} as Ports[2]);
+      // An addressed publish needs a known target (smarty-dev#5518); this one is merely absent from the mesh.
+      const participants = { get: (id: string) => id === "unknown-target" ? { id } : undefined, list: () => [] };
+      const provider = new MeshProvider(store, { id: "sender", name: "Sender", kind: "main" }, participants as unknown as Ports[2]);
       const manager = session();
       const context = invocation(manager);
       const data = { untouched: "head def5678" };

@@ -1,8 +1,12 @@
-import { getMarkdownTheme, type ExtensionAPI, type MessageRenderer } from "@earendil-works/pi-coding-agent";
-import { Box, Markdown, Spacer, Text, truncateToWidth } from "@earendil-works/pi-tui";
+// Type-only: Pi loads this startup graph as native ESM, where a runtime SDK
+// import evaluates a second, unbundled SDK (assert-build-artifacts.mjs).
+import type { ExtensionAPI, MessageRenderer } from "@earendil-works/pi-coding-agent";
+import { Box, Markdown, Spacer, Text, truncateToWidth, type MarkdownTheme } from "@earendil-works/pi-tui";
 import { createHash } from "node:crypto";
+import { detachedPreview } from "../core/preview.js";
 import type { FabricIncomingMessageMode } from "../config.js";
 import { safeText } from "./format.js";
+import { highlightCode } from "./highlight.js";
 
 export const INCOMING_MESSAGE_TYPES = [
   "pi-fabric-agent-message", // Includes mail.inbound follow-up notices.
@@ -65,17 +69,42 @@ const rows = (message: IncomingMessage): Row[] => {
 const receipt = (from: string, kind: string, value: string): string =>
   createHash("sha256").update(JSON.stringify([from, kind, value])).digest("hex");
 
-/** A display-only index, separate from the authoritative delivery/inbox state. */
+/**
+ * A display-only index, separate from the authoritative delivery/inbox state.
+ * Keep only stable scalar branch metadata. In particular, never retain the branch array or
+ * any entry object. V8 slices retain their parent strings, so scalar IDs are detached first.
+ * Entry keys are the detached string id, a private token object for id-less objects, or
+ * the numeric index for non-objects; the key types never collide. The session version is `<session id>:<header version>`, or the bare session id without a header version.
+ */
+type SessionSource = { getBranch: () => readonly unknown[]; getHeader?: () => unknown; getSessionId?: () => unknown };
 class DeliveredDisplayIndex {
   #seen: readonly unknown[] = [];
+  #version: string | undefined;
+  #tokens = new WeakMap<object, object>();
   #receipts = new Set<string>();
-  update(entries: readonly unknown[]): ReadonlySet<string> {
-    const previous = this.#seen;
-    if (entries.length < previous.length || (previous.length && entries[previous.length - 1] !== previous.at(-1))) {
+
+  update(entries: readonly unknown[], session?: SessionSource): ReadonlySet<string> {
+    const header = record(session?.getHeader?.()).version;
+    const rawId = session?.getSessionId?.();
+    const sessionId = typeof rawId === "string" ? rawId : undefined;
+    const version = typeof header === "string" || typeof header === "number" ? `${sessionId ?? ""}:${header}` : sessionId;
+    const ids = entries.map((entry, index) => {
+      const id = record(entry).id;
+      if (typeof id === "string" && id) return detachedPreview(id, Infinity);
+      if (entry === null || typeof entry !== "object") return index;
+      let token = this.#tokens.get(entry);
+      if (!token) this.#tokens.set(entry, token = {});
+      return token;
+    });
+    const seen = this.#seen;
+    let start = seen.length;
+    // A known session version that differs from the last known one resets the index.
+    if ((version !== undefined && (this.#version ?? version) !== version) ||
+      ids.length < start || seen.some((id, index) => ids[index] !== id)) {
       this.#receipts.clear();
-      this.#seen = [];
+      start = 0;
     }
-    for (let index = this.#seen.length; index < entries.length; index++) {
+    for (let index = start; index < entries.length; index++) {
       const entry = record(entries[index]);
       if (entry.type !== "custom_message" || entry.customType !== "pi-fabric-agent-message") continue;
       const details = record(entry.details);
@@ -97,10 +126,37 @@ class DeliveredDisplayIndex {
         else if (typeof data.ref === "string" && data.ref.trim() && topic) add("topic-ref", JSON.stringify([topic, data.ref.trim()]));
       }
     }
-    this.#seen = entries;
+    this.#seen = ids;
+    if (version !== undefined) this.#version = detachedPreview(version, Infinity);
     return this.#receipts;
   }
 }
+
+/** Only earlier inbox carriers count; rendering the first carrier must not hide itself. */
+const priorInboxReceipts = (entries: readonly unknown[], message: IncomingMessage): Set<string> => {
+  const seen = new Set<string>();
+  for (const raw of entries) {
+    const entry = record(raw);
+    if (entry.type !== "custom_message" || entry.customType !== "pi-fabric-inbox") continue;
+    const at = typeof entry.timestamp === "string" ? Date.parse(entry.timestamp) : entry.timestamp;
+    if (entry.details === message.details || (entry.content === message.content && at === message.timestamp)) break;
+    const ids = record(entry.details).ids;
+    if (Array.isArray(ids)) for (const id of ids) if (typeof id === "string") seen.add(receipt("", "event", id));
+  }
+  return seen;
+};
+
+/** Inbox rows whose event id repeats within this carrier or an earlier one (smarty-dev#5518). */
+const repeatedInboxRows = (all: readonly Row[], prior: ReadonlySet<string>): Row[] => {
+  const seen = new Set<string>();
+  return all.filter(row => {
+    const id = row.attributes.id;
+    if (!id) return false;
+    if (seen.has(id) || prior.has(receipt("", "event", id))) return true;
+    seen.add(id);
+    return false;
+  });
+};
 
 const unseenRows = (message: IncomingMessage, all: readonly Row[], delivered: ReadonlySet<string>): Row[] => {
   if (message.customType !== "pi-fabric-inbox") return [...all];
@@ -109,7 +165,11 @@ const unseenRows = (message: IncomingMessage, all: readonly Row[], delivered: Re
   // Native inbox receipts group each event's identity/work receipts behind its event hash.
   // This lets mixed batches hide only duplicates, including deliveryId-only shadows.
   const boundaries = all.map(row => row.attributes.id ? receipts.indexOf(receipt("", "event", row.attributes.id)) : -1);
+  const seen = new Set<string>();
   return all.filter((row, index) => {
+    const eventId = row.attributes.id;
+    if (eventId && (seen.has(eventId) || delivered.has(receipt("", "event", eventId)))) return false;
+    if (eventId) seen.add(eventId);
     const start = boundaries[index]!;
     if (start >= 0) {
       const next = boundaries.slice(index + 1).find(value => value > start) ?? receipts.length;
@@ -134,6 +194,29 @@ const withoutRows = (text: string, hidden: readonly Row[]): string => hidden
   }, text);
 
 /**
+ * Pi's markdown theme built from the host-supplied renderer Theme (as in
+ * dashboard-detail.ts), not the SDK's runtime getMarkdownTheme().
+ */
+const incomingMarkdownTheme = (theme: Parameters<MessageRenderer>[2], invalidate: () => void): MarkdownTheme => ({
+  heading: text => theme.fg("mdHeading", text),
+  link: text => theme.fg("mdLink", text),
+  linkUrl: text => theme.fg("mdLinkUrl", text),
+  code: text => theme.fg("mdCode", text),
+  codeBlock: text => theme.fg("mdCodeBlock", text),
+  codeBlockBorder: text => theme.fg("mdCodeBlockBorder", text),
+  quote: text => theme.fg("mdQuote", text),
+  quoteBorder: text => theme.fg("mdQuoteBorder", text),
+  hr: text => theme.fg("mdHr", text),
+  listBullet: text => theme.fg("mdListBullet", text),
+  bold: text => theme.bold(text),
+  italic: text => theme.italic(text),
+  underline: text => theme.underline(text),
+  strikethrough: text => theme.strikethrough(text),
+  highlightCode: (code, lang) => highlightCode(code, lang ?? "", invalidate) ??
+    code.split("\n").map(line => theme.fg("mdCodeBlock", line)),
+});
+
+/**
  * Mirrors Pi's native custom-message rendering (label + full markdown body) for a
  * carrier from which already-delivered rows were removed. Nothing is collapsed or clipped.
  */
@@ -141,9 +224,11 @@ const fullCarrier = (message: IncomingMessage, hidden: readonly Row[], theme: Pa
   const box = new Box(1, 1, text => theme.bg("customMessageBg", text));
   box.addChild(new Text(theme.fg("customMessageLabel", `\x1b[1m[${message.customType}]\x1b[22m`), 0, 0));
   box.addChild(new Spacer(1));
-  box.addChild(new Markdown(withoutRows(contentText(message), hidden), 0, 0, getMarkdownTheme(), {
-    color: text => theme.fg("customMessageText", text),
-  }));
+  // The first fenced block with a language starts the shared highlighter; once
+  // it is ready, drop the cached lines so the next host render colors the code.
+  const markdown: Markdown = new Markdown(withoutRows(contentText(message), hidden), 0, 0,
+    incomingMarkdownTheme(theme, () => markdown.invalidate()), { color: text => theme.fg("customMessageText", text) });
+  box.addChild(markdown);
   return box;
 };
 
@@ -152,21 +237,30 @@ export const registerIncomingMessageRenderers = (
   pi: ExtensionAPI,
   mode: () => FabricIncomingMessageMode,
 ): void => {
-  let entries: () => readonly unknown[] = () => [];
+  let session: SessionSource | undefined;
   const delivered = new DeliveredDisplayIndex();
   pi.on("session_start", (_event, context) => {
-    entries = () => context.sessionManager.getBranch();
+    session = context.sessionManager as unknown as SessionSource;
   });
   for (const type of INCOMING_MESSAGE_TYPES) {
     pi.registerMessageRenderer(type, (message, options, theme) => {
-      if (options.expanded || !incomingMessagesCollapsed(mode())) return undefined;
+      const history = type === "pi-fabric-inbox" ? session?.getBranch() ?? [] : [];
+      const prior = priorInboxReceipts(history, message);
       const all = rows(message);
-      const visible = unseenRows(message, all, type === "pi-fabric-inbox" ? delivered.update(entries()) : new Set());
+      if (options.expanded || !incomingMessagesCollapsed(mode())) {
+        if (type !== "pi-fabric-inbox") return undefined;
+        // A repeated event id renders once; otherwise the native expanded rendering is unchanged.
+        const repeated = repeatedInboxRows(all, prior);
+        return repeated.length ? fullCarrier(message, repeated, theme) : undefined;
+      }
+      const receipts = new Set(type === "pi-fabric-inbox" ? delivered.update(history, session) : []);
+      for (const id of prior) receipts.add(id);
+      const visible = unseenRows(message, all, receipts);
       if (!visible.length) return { render: () => [], invalidate() {} };
-      // A native carrier is the burst boundary. If it mixes a principal reply
-      // with chatter, preserve the entire native rendering rather than clip it,
+      // In the org's own pane, principal replies are the local assistant's, not
+      // incoming carriers. Other panes keep full org/principal-addressed bursts,
       // but never let that fallback restore a delivered shadow filtered above.
-      if (visible.some(row => row.full)) {
+      if (!incomingMessagesCollapsed("auto") && visible.some(row => row.full)) {
         return visible.length === all.length ? undefined : fullCarrier(message, all.filter(row => !visible.includes(row)), theme);
       }
       const first = visible[0]!;

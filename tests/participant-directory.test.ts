@@ -12,12 +12,13 @@ import { MeshLock } from "../src/mesh/mesh-lock.js";
 import { writeParticipantFile } from "../src/topology/participant-files.js";
 import { actorParticipantRecord } from "../src/topology/records.js";
 import type { FabricActorInfo } from "../src/actors/types.js";
-import { hostLeasePath, LIVENESS_POLICY_KEY, readHostLeases, removeHostLease, STATE_LEASE_RENEW_MS, writeHostLease } from "../src/topology/host-leases.js";
+import { hostLeasePath, LIVENESS_POLICY_KEY, MIRROR_FRESH_MS, mirroredLeaseStatus, readHostLeases, removeHostLease, STATE_LEASE_RENEW_MS, writeHostLease, type FabricMirrorLease } from "../src/topology/host-leases.js";
 import { MainAgentController } from "../src/main-agent.js";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { FabricParticipantRecord } from "../src/topology/types.js";
 import { sessionLiveness } from "../src/topology/legacy-root-liveness.js";
 import { awaitPeerSettle, type PeerSettleResult } from "../src/topology/peer-settle.js";
+import { DIRECTORY_RETENTION_MS } from "../src/topology/host-reaper.js";
 
 const roots: string[] = [];
 const directories: ParticipantDirectory[] = [];
@@ -98,6 +99,90 @@ const createDirectory = (
 afterEach(async () => {
   await Promise.all(directories.splice(0).map((directory) => directory.close()));
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
+});
+
+// Keep reason: private-receipt trust boundary and PR #1180's legacy retention bypass.
+// Read-only stub: no mesh writes, actor execution, or product deletion.
+describe("legacy actor tombstone retention", () => {
+  const now = 2 * DIRECTORY_RETENTION_MS;
+  const identity: MeshIdentity = { id: "session:observer", name: "Observer", kind: "main" };
+  const terminal = (settledAt: number | undefined): FabricParticipantRecord => ({
+    ...agentRecord("legacy-actor", "session:gone", "session:gone", "session:gone"),
+    kind: "actor", status: "stopped", stopReason: "owner-root-gone", capabilities: [],
+    transport: "host", controlProtocol: "legacy", ...(settledAt !== undefined ? { settledAt } : {}),
+  });
+  const fixture = (validate: () => FabricParticipantRecord | undefined,
+    copies: "legacy" | "participant" | "dual" = "legacy") => {
+    const entry = { key: "actors/gone/legacy-actor", version: 7, updatedAt: now + DIRECTORY_RETENTION_MS,
+      updatedBy: identity, value: { id: "legacy-actor", status: "stopped", stopReason: "owner-root-gone",
+        settledAt: now + DIRECTORY_RETENTION_MS } };
+    const participant = { ...entry, key: "topology/participants/legacy-actor" };
+    const entries = copies === "legacy" ? [entry] : copies === "participant" ? [participant] : [entry, participant];
+    const listAll = (prefix: string) => entries.filter(candidate => candidate.key.startsWith(prefix));
+    const token = {};
+    const mesh = {
+      root: path.join(os.tmpdir(), `p2-read-only-legacy-directory-${process.pid}`),
+      listAll, listAllShared: listAll, stateToken: () => token,
+    } as unknown as MeshStore;
+    return new ParticipantDirectory(mesh, { enabled: true, hostId: identity.id, rootId: identity.id,
+      identity, reapDeadHosts: false, terminalActor: validate });
+  };
+
+  it.each([
+    ["fresh", now - DIRECTORY_RETENTION_MS + 1, true],
+    ["expired despite a future public envelope", now - DIRECTORY_RETENTION_MS - 1, false],
+    ["exact retention boundary", now - DIRECTORY_RETENTION_MS, false],
+    ["missing private time", undefined, false],
+    ["nonfinite private time", NaN, false],
+    ["future private time", now + 1, false],
+  ] as const)("lists only retained authenticated tombstones: %s", (_name, settledAt, listed) => {
+    const directory = fixture(() => terminal(settledAt));
+    const actors = directory.list({ scope: "project", kinds: ["actor"], includeStale: true }, now);
+    expect(actors.map(actor => actor.id)).toEqual(listed ? ["legacy-actor"] : []);
+    if (listed) expect(actors[0]).toMatchObject({ settledAt, capabilities: [], stale: true });
+  });
+
+  describe.each(["participant", "dual"] as const)("%s copies", copies => {
+    it.each([
+      ["fresh", now - DIRECTORY_RETENTION_MS + 1, true],
+      ["exact retention boundary", now - DIRECTORY_RETENTION_MS, false],
+      ["older despite future public time", now - DIRECTORY_RETENTION_MS - 1, false],
+      ["missing private time", undefined, false],
+      ["future private time", now + 1, false],
+    ] as const)("uses immutable private time: %s", (_name, settledAt, listed) => {
+      const directory = fixture(() => terminal(settledAt), copies);
+      const actors = directory.list({ kinds: ["actor"], includeStale: true }, now);
+      expect(actors.map(actor => actor.id)).toEqual(listed ? ["legacy-actor"] : []);
+      if (listed) expect(actors[0]).toMatchObject({ settledAt, capabilities: [], stale: true });
+    });
+
+    it("ages repeated cached reads and revalidates proof", () => {
+      let authenticated = true;
+      const directory = fixture(() => authenticated ? terminal(now) : undefined, copies);
+      const options = { kinds: ["actor"] as Array<"actor">, includeStale: true };
+      expect(directory.list(options, now)).toHaveLength(1);
+      expect(directory.list(options, now + DIRECTORY_RETENTION_MS - 1)).toHaveLength(1);
+      expect(directory.list(options, now + DIRECTORY_RETENTION_MS)).toEqual([]);
+      expect(directory.list(options, now + DIRECTORY_RETENTION_MS + 1)).toEqual([]);
+      authenticated = false;
+      expect(directory.list(options, now)).toEqual([]);
+    });
+  });
+
+  it("does not trust a public terminal marker without private authentication", () => {
+    const directory = fixture(() => undefined);
+    expect(directory.list({ kinds: ["actor"], includeStale: true }, now)).toEqual([]);
+  });
+
+  it("ages unchanged legacy envelopes and revalidates private proof on each read", () => {
+    let authenticated = true;
+    const directory = fixture(() => authenticated ? terminal(now) : undefined);
+    const options = { kinds: ["actor"] as Array<"actor">, includeStale: true };
+    expect(directory.list(options, now)).toHaveLength(1);
+    expect(directory.list(options, now + DIRECTORY_RETENTION_MS)).toEqual([]);
+    authenticated = false;
+    expect(directory.list(options, now)).toEqual([]);
+  });
 });
 
 describe("ParticipantDirectory routing freshness (#2386)", () => {
@@ -363,7 +448,7 @@ describe("ParticipantDirectory.mirroredControlOwner", () => {
   };
 
   it("exposes the exact public read port and retains fresh expiry knowledge from first send through lapse", async () => {
-    const { directory, reader, host, putHost, read } = await setup();
+    const { directory, reader, host, putHost, read, meshRoot } = await setup();
     expect(typeof ParticipantDirectory.prototype.mirroredControlOwner).toBe("function");
     const port: (host: string, identity: string | undefined, target: string) =>
       { remoteHost: string; expiresAt: number } | undefined = directory.mirroredControlOwner.bind(directory);
@@ -378,7 +463,50 @@ describe("ParticipantDirectory.mirroredControlOwner", () => {
       const expired = Date.now() - 1_000;
       await putHost({ expiresAt: expired });
       expect(read()).toEqual({ remoteHost: "forge", expiresAt: expired });
+      // #10068: an unsampled (older-bridge) projection proves only its unexpired deadline, never
+      // the origin's death. Past it, the root stays attributed to forge (smarty-dev#2004) as bridge-stale.
+      expect(directory.get(host.rootId, Date.now(), { fresh: true }))
+        .toMatchObject({ id: host.rootId, remoteHost: "forge", stale: false, bridgeStale: true });
+
+      // A current bridge's projection requires a matching source-clock sample (mirrorLease: 1).
+      const sample = (observedAt: number, sourceExpiresAt: number): FabricMirrorLease => ({ remoteHost: "forge",
+        observedAt, sourceObservedAt: observedAt - 600_000, sourceUpdatedAt: observedAt - 605_000, sourceExpiresAt });
+      const lease = (mirror?: FabricMirrorLease) => writeHostLease(meshRoot, { id: host.id, rootId: host.rootId,
+        identityId: host.identity.id, startedAt: host.startedAt, updatedAt: Date.now(), expiresAt: Date.now() + 15_000,
+        mirrorLease: 1, ...(mirror ? { mirror } : {}) });
+      await putHost({ updatedAt: Date.now(), expiresAt: Date.now() + 15_000, mirrorLease: 1 });
+
+      // Fresh bridge, live source lease (judged on the source clock, not this hub's).
+      const fresh = sample(Date.now(), Date.now() - 600_000 + 15_000);
+      lease(fresh);
+      const live = read();
+      expect(live).toEqual({ remoteHost: "forge", expiresAt: expect.any(Number), mirror: fresh });
+      expect(live!.expiresAt).toBeLessThanOrEqual(fresh.observedAt + MIRROR_FRESH_MS);
+      expect(mirroredLeaseStatus(live!.remoteHost, live!.mirror, Date.now())).toBe("live");
+      expect(directory.get(host.rootId, Date.now(), { fresh: true }))
+        .toMatchObject({ remoteHost: "forge", stale: false });
+      expect(directory.get(host.rootId, Date.now(), { fresh: true })?.bridgeStale).toBeUndefined();
+
+      // Fresh bridge, source lease lapsed on the source clock: lease-stale, the root is gone.
+      const lapsed = sample(Date.now(), Date.now() - 600_000 - 1);
+      lease(lapsed);
+      expect(read()).toEqual({ remoteHost: "forge", expiresAt: lapsed.observedAt - 1, mirror: lapsed });
+      expect(mirroredLeaseStatus("forge", read()!.mirror, Date.now())).toBe("lease-stale");
       expect(directory.get(host.rootId, Date.now(), { fresh: true })).toBeUndefined();
+
+      // Stale transport, live source sample: bridge-stale, not owner death, still attributed.
+      const old = sample(Date.now() - MIRROR_FRESH_MS, Date.now() + 60_000);
+      lease(old);
+      expect(read()).toEqual({ remoteHost: "forge", expiresAt: expect.any(Number), mirror: old });
+      expect(mirroredLeaseStatus("forge", read()!.mirror, Date.now())).toBe("bridge-stale");
+      expect(directory.get(host.rootId, Date.now(), { fresh: true }))
+        .toMatchObject({ remoteHost: "forge", stale: false, bridgeStale: true });
+
+      // Required sample missing: doubt (bridge-stale), never a fallback to the state expiry.
+      lease();
+      expect(read()).toEqual({ remoteHost: "forge", expiresAt: expect.any(Number), bridgeStale: true });
+      expect(directory.get(host.rootId, Date.now(), { fresh: true }))
+        .toMatchObject({ remoteHost: "forge", stale: false, bridgeStale: true });
       expect(publish).not.toHaveBeenCalled();
       expect(put).not.toHaveBeenCalled();
     } finally {
@@ -1970,11 +2098,13 @@ describe("ParticipantDirectory reads", () => {
     await reader.start();
     const prefixes = ["topology/participants/", "sessions/", "actors/"];
     const preparation = shared.mock.calls.filter(([prefix, options]) => prefixes.includes(prefix!) && options?.snapshot);
-    expect(preparation.map(([prefix]) => prefix)).toEqual(prefixes);
+    // smarty-dev#7978: the compatibility liveness probe (#legacyRenewalsRequired) reads the same pinned
+    // snapshot without copies too, so every prefix is read shared, from one snapshot.
+    expect(new Set(preparation.map(([prefix]) => prefix))).toEqual(new Set(prefixes));
     expect(new Set(preparation.map(([, options]) => options!.snapshot)).size).toBe(1);
-    // Compatibility liveness probes still scan sessions/participants separately; the large
-    // retained actor payloads must never be copied by this heartbeat preparation.
-    expect(cloned.mock.calls.filter(([prefix]) => prefix === "actors/")).toEqual([]);
+    // Neither the preparation nor the liveness probes copy entries: the large retained actor
+    // payloads, and every host, session and participant entry, are never cloned by this heartbeat.
+    expect(cloned.mock.calls.filter(([prefix]) => ["actors/", "sessions/", "topology/participants/", "topology/hosts/"].includes(prefix!))).toEqual([]);
     expect(reader.mesh.get(actorKey, { fresh: true })?.value).toEqual({ id: "actor", instructions: "x".repeat(30_000) });
     cloned.mockRestore(); shared.mockRestore();
   });

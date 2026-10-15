@@ -48,12 +48,12 @@ const assertIsolated = () => {
   // Test controls are separate from the private writable roots, not fleet authority.
   for (const [key, value] of Object.entries({ ...testControls, ...fixed })) assert.equal(process.env[key], value);
   assert.deepEqual(Object.keys(process.env).filter(key => key.toUpperCase().startsWith("PI_FABRIC_") && !safe.has(key) && !Object.hasOwn(testControls, key) && !Object.hasOwn(fixed, key)), []);
-  for (const key of ["SMARTY_ROLE", "HERDR_ENV", "HERDR_SOCKET_PATH", "HERDR_WORKSPACE_ID"])
+  for (const key of ["SMARTY_ROLE", "SMARTY_AGENT", "HERDR_ENV", "HERDR_SOCKET_PATH", "HERDR_WORKSPACE_ID"])
     assert.equal(process.env[key], undefined, key + " inherited fleet authority");
   return root;
 };
 const assertChildSnapshot = () => {
-  const child = spawnSync(process.execPath, ["-e", 'console.log(JSON.stringify(Object.fromEntries(Object.entries(process.env).filter(([key]) => key.toUpperCase().startsWith("PI_FABRIC_") || ["PI_CODING_AGENT_DIR", "SMARTY_ROLE", "HERDR_ENV", "HERDR_SOCKET_PATH", "HERDR_WORKSPACE_ID", "MCPORTER_CONFIG"].includes(key)))))'], { encoding: "utf8", timeout: 3_000 });
+  const child = spawnSync(process.execPath, ["-e", 'console.log(JSON.stringify(Object.fromEntries(Object.entries(process.env).filter(([key]) => key.toUpperCase().startsWith("PI_FABRIC_") || ["PI_CODING_AGENT_DIR", "SMARTY_ROLE", "SMARTY_AGENT", "HERDR_ENV", "HERDR_SOCKET_PATH", "HERDR_WORKSPACE_ID", "MCPORTER_CONFIG"].includes(key)))))'], { encoding: "utf8", timeout: 3_000 });
   assert.equal(child.status, 0, child.stderr);
   const inherited = JSON.parse(child.stdout);
   for (const key of keys) assert.equal(inherited[key], process.env[key]);
@@ -148,7 +148,7 @@ console.log(JSON.stringify({ root, configRoot, paths: Object.fromEntries(keys.ma
 
 const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
-test.each(["vitest.config.ts", "tests/fleet-isolation-setup.ts"])(
+test.each(["vitest.config.cts", "tests/fleet-isolation-setup.ts"])(
   "%s fences inherited fleet paths before real source initialization and config writes",
   (entry) => {
     const sentinel = fs.mkdtempSync(path.join(tmpdir(), "fleet-isolation-sentinel-"));
@@ -174,7 +174,7 @@ test.each(["vitest.config.ts", "tests/fleet-isolation-setup.ts"])(
         "PI_FABRIC_FUTURE_SELECTOR", "PI_FABRIC_PI_BINARY", "PI_FABRIC_NODE_BINARY",
         "PI_FABRIC_PROFILE", "PI_FABRIC_JEV_LIVE_EXTRA", "PI_FABRIC_ACTIVATION_TEST_WORKER_EXTRA",
         "PI_FABRIC_TEST_FUTURE", "PI_FABRIC_TEST_PG_BIN_EXTRA", "pi_fabric_future_case_selector",
-        "SMARTY_ROLE", "HERDR_WORKSPACE_ID"])
+        "SMARTY_ROLE", "SMARTY_AGENT", "HERDR_WORKSPACE_ID"])
         env[key] = "production-main-sentinel";
       env.HERDR_ENV = "1";
       const child = spawnSync(process.execPath, ["--experimental-transform-types", "--input-type=module", "-e", childProbe], {

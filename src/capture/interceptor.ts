@@ -14,6 +14,7 @@ type ToolCaptureListener = (tools: RegisteredTool[], runner: ExtensionRunner) =>
 
 interface ToolCaptureHub {
   listeners: Set<ToolCaptureListener>;
+  restore?: () => void;
 }
 
 export interface RegisteredToolCaptureController {
@@ -29,12 +30,22 @@ export interface RegisteredToolCaptureOptions {
   // active-tool ownership. Tools are deliberately left in Pi's registry — the
   // listener observes rather than filters — because extensions that gate tool
   // calls against `pi.getAllTools()` (e.g. permission systems) must still see
-  // captured tools as registered; hiding from the model happens exclusively in
-  // the active tool set (see FabricToolOwnership).
+  // captured tools as registered. Pi 1.0 prepareLoadout/context_with_system
+  // own model visibility; this observer retains full definitions/renderers and
+  // the owning runner for Fabric-specific shell middleware and prepared args.
+  // Neither ctx.tools nor getAllTools exposes that metadata, so this bridge is
+  // still needed (and must patch the live SDK or bundled CLI class identity).
   onCatalogRefresh?: () => void;
 }
 
 const HUB_SYMBOL = Symbol.for("pi-fabric.registered-tool-capture.v1");
+/**
+ * Set by Fabric's native SDK task entry (src/worker/task-entry.ts) to the
+ * ExtensionRunner class of the SDK it runs. There process.argv[1] is the entry
+ * script, so neither argv lookup below finds the host package and the
+ * in-realm fallback patches Fabric's private peer copy instead (#8606).
+ */
+export const HOST_EXTENSION_RUNNER_SYMBOL = Symbol.for("pi-fabric.host-extension-runner.v1");
 const ANCHOR_SYMBOL = Symbol.for("pi-fabric.registered-tool-anchor.v1");
 
 const definitionDelegatesTo = (
@@ -70,8 +81,13 @@ const isExtensionRunnerConstructor = (value: unknown): value is ExtensionRunnerC
 // pi >= 0.84.3 loads the CLI from dist/bundle/cli.js, whose rollup chunks carry
 // their own ExtensionRunner class identity — the library-level patch alone
 // never fires because the live host runner is an instance of the bundle's copy.
-// Importing each chunk inside the running CLI is a Node module-cache hit, so
-// scanning the bundle is free and yields the class the host actually runs.
+// Only runner-bearing chunks belong in this scan: worker entrypoints can throw
+// on the Main thread, and Node keeps their evaluation Error (and lazy stack) forever.
+const logImportFailure = (file: string, error: unknown): void => {
+  // Reading the stack releases V8 CallSiteInfo receivers before the cached Error outlives this Main.
+  const diagnostic = error instanceof Error ? error.stack ?? error.message : String(error);
+  console.warn(`[pi-fabric] skipped runner import ${file}: ${diagnostic}`);
+};
 export const bundleExtensionRunnerConstructors = async (
   bundleDir: string,
 ): Promise<ExtensionRunnerConstructor[]> => {
@@ -86,15 +102,18 @@ export const bundleExtensionRunnerConstructors = async (
   const constructors = new Set<ExtensionRunnerConstructor>();
   for (const file of files) {
     if (!file.endsWith(".js")) continue;
+    const filePath = path.join(chunksDir, file);
     try {
-      const module = (await import(pathToFileURL(path.join(chunksDir, file)).href)) as Record<
+      // Public method names survive bundling/minification; worker-only image/native chunks do not export a runner.
+      if (!readFileSync(filePath, "utf8").includes("getAllRegisteredTools")) continue;
+      const module = (await import(pathToFileURL(filePath).href)) as Record<
         string,
         unknown
       >;
       for (const exported of Object.values(module)) {
         if (isExtensionRunnerConstructor(exported)) constructors.add(exported);
       }
-    } catch { /* chunk not importable in this realm (worker entries, natives); skip */ }
+    } catch (error) { logImportFailure(filePath, error); }
   }
   return [...constructors];
 };
@@ -112,14 +131,22 @@ const captureHub = (Runner: ExtensionRunnerConstructor): ToolCaptureHub => {
   const hub: ToolCaptureHub = { listeners: new Set() };
   Object.defineProperty(prototype, HUB_SYMBOL, {
     value: hub,
-    configurable: false,
+    configurable: true,
     enumerable: false,
     writable: false,
   });
-  prototype.getAllRegisteredTools = function getFabricVisibleTools(): RegisteredTool[] {
+  const wrapped = function getFabricRegisteredTools(this: ExtensionRunner): RegisteredTool[] {
     let tools = original.call(this);
     for (const listener of [...hub.listeners]) tools = listener(tools, this);
     return tools;
+  };
+  prototype.getAllRegisteredTools = wrapped;
+  hub.restore = () => {
+    // Other extensions may have wrapped us. Never overwrite their patch;
+    // keep the inert hub in that case so the next install reuses it.
+    if (hub.listeners.size > 0 || prototype.getAllRegisteredTools !== wrapped) return;
+    prototype.getAllRegisteredTools = original;
+    delete prototype[HUB_SYMBOL];
   };
   return hub;
 };
@@ -184,24 +211,104 @@ const entryRealmPackageRoot = (): string | undefined => {
   return undefined;
 };
 
-const extensionRunnerConstructors = async (): Promise<ExtensionRunnerConstructor[]> => {
-  const constructors = new Set<ExtensionRunnerConstructor>();
-  const packageRoots = new Set(
-    [process.env.PI_PACKAGE_DIR, hostPackageRoot(), entryRealmPackageRoot()].filter(
-      (root): root is string => typeof root === "string" && Boolean(root),
-    ),
+// Every runner method Fabric's capture and its tool_call/tool_result paths call
+// on a captured runner (catalog, wrapper, shell preflight, providers).
+const CAPTURED_RUNNER_METHODS = [
+  "getAllRegisteredTools",
+  "getActiveTools",
+  "createContext",
+  "emit",
+  "emitToolCall",
+  "emitToolResult",
+] as const;
+
+/**
+ * The task entry's registration, validated. Absent means no native task entry.
+ * Anything else that is not a plain data property holding an ExtensionRunner
+ * constructor fails closed: capturing a bogus class would leave the live SDK
+ * runner unpatched and Fabric's shell paths outside the profile guards (#8606).
+ */
+export const registeredHostExtensionRunner = (): ExtensionRunnerConstructor | undefined => {
+  const descriptor = Object.getOwnPropertyDescriptor(globalThis, HOST_EXTENSION_RUNNER_SYMBOL);
+  if (!descriptor) return undefined;
+  const refuse = (reason: string): never => {
+    throw new Error(`Pi Fabric refuses the host ExtensionRunner registered under ${String(HOST_EXTENSION_RUNNER_SYMBOL)}: ${reason}`);
+  };
+  if (!("value" in descriptor)) refuse("it is an accessor, not a data property");
+  const value: unknown = descriptor.value;
+  if (typeof value !== "function") refuse("it is not a constructor");
+  const prototype = (value as { prototype?: unknown }).prototype;
+  if (typeof prototype !== "object" || prototype === null) refuse("its prototype is not an object");
+  const missing = CAPTURED_RUNNER_METHODS.filter(
+    (method) => typeof (prototype as Record<string, unknown>)[method] !== "function",
   );
+  if (missing.length) refuse(`its prototype lacks ${missing.join(", ")}`);
+  return value as ExtensionRunnerConstructor;
+};
+
+const realPath = (file: string): string => {
+  try {
+    return realpathSync(file);
+  } catch {
+    return file;
+  }
+};
+
+const isWithin = (directory: string, file: string): boolean => {
+  const relative = path.relative(directory, file);
+  return relative !== "" && !relative.startsWith("..") && !path.isAbsolute(relative);
+};
+
+const exportedExtensionRunner = async (entry: string): Promise<ExtensionRunnerConstructor[]> => {
+  try {
+    const module = (await import(pathToFileURL(entry).href)) as { ExtensionRunner?: unknown };
+    return isExtensionRunnerConstructor(module.ExtensionRunner) ? [module.ExtensionRunner] : [];
+  } catch (error) {
+    logImportFailure(entry, error);
+    return []; // Entry not importable in this realm; skip it.
+  }
+};
+
+// One Pi package ships two SDK copies with distinct ExtensionRunner identities:
+// the unbundled dist/index.js graph and the dist/bundle chunks behind the
+// published `pi` bin. Patch only the copy the running CLI evaluated. In the
+// bundled CLI, importing dist/index.js evaluated a second, unbundled SDK for a
+// class no live runner uses: hundreds of modules, each serialized to the
+// compile cache that CLI enables, on every Fabric startup and exit. The
+// bundle's SDK entry shares the chunks that CLI already evaluated, so it is a
+// module-cache hit. An unbundled CLI never evaluates the bundle's chunks, so
+// scanning them only loaded dead classes. Any other entry (embeds, wrappers
+// that set PI_PACKAGE_DIR) may use either copy.
+const packageExtensionRunnerConstructors = async (
+  packageRoot: string,
+  entry: string | undefined,
+  includeBundle: boolean,
+): Promise<ExtensionRunnerConstructor[]> => {
+  const distDirectory = path.join(packageRoot, "dist");
+  const bundleDirectory = path.join(distDirectory, "bundle");
+  if (entry && isWithin(bundleDirectory, entry)) {
+    const bundled = await exportedExtensionRunner(path.join(bundleDirectory, "index.js"));
+    // Bundles without an SDK entry export the class from a chunk only.
+    return bundled.length > 0 || !includeBundle ? bundled : bundleExtensionRunnerConstructors(bundleDirectory);
+  }
+  const unbundled = await exportedExtensionRunner(path.join(distDirectory, "index.js"));
+  if (entry && isWithin(distDirectory, entry)) return unbundled;
+  return [...unbundled, ...(includeBundle ? await bundleExtensionRunnerConstructors(bundleDirectory) : [])];
+};
+
+const extensionRunnerConstructors = async (includeBundle: boolean): Promise<ExtensionRunnerConstructor[]> => {
+  const constructors = new Set<ExtensionRunnerConstructor>();
+  // The validated, locked task-entry/durable-worker registration (#8606).
+  const registered = registeredHostExtensionRunner();
+  if (registered) constructors.add(registered);
+  const packageRoots = new Set(
+    [process.env.PI_PACKAGE_DIR, hostPackageRoot(), entryRealmPackageRoot()]
+      .filter((root): root is string => typeof root === "string" && Boolean(root))
+      .map(realPath),
+  );
+  const entry = process.argv[1] ? realPath(process.argv[1]) : undefined;
   for (const packageRoot of packageRoots) {
-    try {
-      const hostEntry = path.join(packageRoot, "dist", "index.js");
-      const hostModule = (await import(pathToFileURL(hostEntry).href)) as {
-        ExtensionRunner?: ExtensionRunnerConstructor;
-      };
-      if (hostModule.ExtensionRunner) constructors.add(hostModule.ExtensionRunner);
-    } catch { /* host entry not importable; skip */ }
-    for (const Runner of await bundleExtensionRunnerConstructors(
-      path.join(packageRoot, "dist", "bundle"),
-    )) {
+    for (const Runner of await packageExtensionRunnerConstructors(packageRoot, entry, includeBundle)) {
       constructors.add(Runner);
     }
   }
@@ -213,7 +320,7 @@ const extensionRunnerConstructors = async (): Promise<ExtensionRunnerConstructor
         ExtensionRunner?: ExtensionRunnerConstructor;
       };
       if (hostModule.ExtensionRunner) constructors.add(hostModule.ExtensionRunner);
-    } catch { /* host unavailable in this realm; tool capture stays inert */ }
+    } catch (error) { logImportFailure("@earendil-works/pi-coding-agent", error); }
   }
   return [...constructors];
 };
@@ -221,7 +328,8 @@ const extensionRunnerConstructors = async (): Promise<ExtensionRunnerConstructor
 export const installRegisteredToolCapture = async (
   options: RegisteredToolCaptureOptions,
 ): Promise<RegisteredToolCaptureController> => {
-  const hubs = (await extensionRunnerConstructors()).map(captureHub);
+  const initialPolicy = options.initialPolicy ?? DEFAULT_FABRIC_CONFIG.capture;
+  const hubs = new Set((await extensionRunnerConstructors(initialPolicy.enabled)).map(captureHub));
   const anchorToken = {};
   Object.defineProperty(options.anchorDefinition, ANCHOR_SYMBOL, {
     value: anchorToken,
@@ -229,8 +337,9 @@ export const installRegisteredToolCapture = async (
     enumerable: true,
     writable: false,
   });
-  let policy = clonePolicy(options.initialPolicy ?? DEFAULT_FABRIC_CONFIG.capture);
+  let policy = clonePolicy(initialPolicy);
   let disposed = false;
+  let bundledCapture: Promise<void> | undefined = initialPolicy.enabled ? Promise.resolve() : undefined;
 
   const listener: ToolCaptureListener = (tools, runner) => {
     if (disposed) return tools;
@@ -251,11 +360,23 @@ export const installRegisteredToolCapture = async (
     setPolicy(config) {
       policy = clonePolicy(config);
       if (!policy.enabled) options.catalog.clear();
+      else bundledCapture ??= extensionRunnerConstructors(true).then((constructors) => {
+        if (disposed) return;
+        for (const Runner of constructors) {
+          const hub = captureHub(Runner);
+          if (!hubs.has(hub)) { hubs.add(hub); hub.listeners.add(listener); }
+        }
+        options.onCatalogRefresh?.();
+      });
+      return bundledCapture;
     },
     dispose() {
       if (disposed) return;
       disposed = true;
-      for (const hub of hubs) hub.listeners.delete(listener);
+      for (const hub of hubs) {
+        hub.listeners.delete(listener);
+        hub.restore?.();
+      }
       options.catalog.clear();
     },
   };

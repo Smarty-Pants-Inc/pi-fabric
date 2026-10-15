@@ -1,3 +1,6 @@
+import { isAddressedHubFactoryEvent } from "../mesh/bridge-topics.js";
+import { slotAdmissionFor } from "../actors/slot-admission.js";
+import { recordUnknownTarget } from "../mesh/delivery-outcomes.js";
 import type {
   FabricActionDescriptor,
   FabricInvocationContext,
@@ -5,17 +8,68 @@ import type {
   FabricProviderListRequest,
 } from "../protocol.js";
 import { fabricHostCallerId, invocationFabricPrincipal, snapshotFabricInvocation } from "../fabric-provenance.js";
-import { MeshStore, type MeshIdentity } from "../mesh/store.js";
+import {
+  MESH_MAX_PENDING_SCHEDULES,
+  MESH_MAX_SCHEDULE_AHEAD_MS,
+  MeshStore,
+  type MeshIdentity,
+} from "../mesh/store.js";
+import {
+  createMeshGrant,
+  listMeshGrants,
+  meshCliArgv,
+  meshPostCommand,
+  MESH_GRANT_MAX_TTL_MS,
+  MESH_GRANT_MAX_USES,
+  MESH_GRANT_MIN_TTL_MS,
+  revokeMeshGrant,
+} from "../mesh/grants.js";
 import type { FabricParticipantSource } from "../topology/types.js";
 import { FABRIC_PARTICIPANT_LIFECYCLE_TOPIC } from "../lifecycle/types.js";
 import { actionArgNormalizer } from "./arg-normalization.js";
 import { deliverWithMessageNotice, outgoingMessageNotice } from "./message-id-notice.js";
 
 const emptySchema = { type: "object", properties: {}, additionalProperties: false };
-const INTERNAL_STATE_PREFIXES = ["topology/", "sessions/", "actors/", "residency/"];
+const INTERNAL_STATE_PREFIXES = ["topology/", "sessions/", "actors/", "residency/", "decisions/"];
 const PRIVATE_STATE_PREFIXES = ["residency/"];
 const INTERNAL_CONTROL_PREFIX = "fabric.control.";
 const INTERNAL_HOST_EVENT_TOPIC = "fabric.actor.host-event";
+
+/** Topics reserved for host coordination; user code, schedules and grants may not target them. */
+export const assertPublicMeshTopic = (topic: string): string => {
+  if (
+    topic.startsWith(INTERNAL_CONTROL_PREFIX) ||
+    topic === INTERNAL_HOST_EVENT_TOPIC ||
+    topic === FABRIC_PARTICIPANT_LIFECYCLE_TOPIC
+  ) {
+    throw new Error(`Fabric mesh topic is reserved for host coordination: ${topic}`);
+  }
+  return topic;
+};
+
+/** Resolves `notBefore` (epoch ms or ISO 8601) or `afterMs` to an absolute due time. */
+export const meshScheduleDueAt = (args: Record<string, unknown>, now = Date.now()): number | undefined => {
+  if (args.notBefore !== undefined && args.afterMs !== undefined) {
+    throw new Error("mesh.publish accepts notBefore or afterMs, not both");
+  }
+  if (args.afterMs !== undefined) {
+    const afterMs = args.afterMs;
+    if (typeof afterMs !== "number" || !Number.isFinite(afterMs) || afterMs < 0) {
+      throw new Error("mesh.publish afterMs must be a nonnegative number of milliseconds");
+    }
+    return now + Math.ceil(afterMs);
+  }
+  if (args.notBefore === undefined) return undefined;
+  const dueAt = typeof args.notBefore === "number"
+    ? args.notBefore
+    : typeof args.notBefore === "string" && /^\d{4}-\d{2}-\d{2}T/.test(args.notBefore)
+      ? Date.parse(args.notBefore)
+      : Number.NaN;
+  if (!Number.isFinite(dueAt) || dueAt < 0) {
+    throw new Error("mesh.publish notBefore must be epoch milliseconds or an ISO 8601 date-time");
+  }
+  return Math.ceil(dueAt);
+};
 
 const assertPublicStateKey = (key: string): void => {
   if (INTERNAL_STATE_PREFIXES.some((prefix) => key.startsWith(prefix))) {
@@ -39,7 +93,8 @@ const descriptors: FabricActionDescriptor[] = [
   },
   {
     name: "publish",
-    description: "Append a durable event to a mesh topic, optionally addressed to one actor",
+    description:
+      "Append a durable event to a mesh topic, optionally addressed to one actor. notBefore (epoch ms or ISO) or afterMs schedules it instead; key makes the schedule replaceable",
     inputSchema: {
       type: "object",
       properties: {
@@ -48,11 +103,78 @@ const descriptors: FabricActionDescriptor[] = [
         to: { type: "string" },
         text: { type: "string" },
         data: {},
+        notBefore: { anyOf: [{ type: "number", minimum: 0 }, { type: "string", maxLength: 64 }] },
+        afterMs: { type: "number", minimum: 0, maximum: MESH_MAX_SCHEDULE_AHEAD_MS },
+        key: { type: "string", minLength: 1, maxLength: 128 },
       },
       required: ["topic"],
       additionalProperties: false,
     },
     risk: "agent",
+    namespace: "coordination",
+  },
+  {
+    name: "scheduled",
+    description: "List pending scheduled mesh events by due time",
+    inputSchema: {
+      type: "object",
+      properties: {
+        topic: { type: "string" },
+        limit: { type: "number", minimum: 1, maximum: MESH_MAX_PENDING_SCHEDULES },
+      },
+      additionalProperties: false,
+    },
+    risk: "read",
+    namespace: "coordination",
+  },
+  {
+    name: "unschedule",
+    description: "Cancel a pending scheduled mesh event by key",
+    inputSchema: {
+      type: "object",
+      properties: { key: { type: "string", minLength: 1, maxLength: 128 } },
+      required: ["key"],
+      additionalProperties: false,
+    },
+    risk: "agent",
+    namespace: "coordination",
+  },
+  {
+    name: "grant",
+    description:
+      "Mint a scoped token that lets an outside process post untrusted events to one topic through `pi-fabric mesh post`",
+    inputSchema: {
+      type: "object",
+      properties: {
+        topic: { type: "string" },
+        ttlMs: { type: "number", minimum: MESH_GRANT_MIN_TTL_MS, maximum: MESH_GRANT_MAX_TTL_MS },
+        uses: { type: "number", minimum: 1, maximum: MESH_GRANT_MAX_USES },
+        kind: { type: "string", minLength: 1, maxLength: 128 },
+      },
+      required: ["topic", "ttlMs"],
+      additionalProperties: false,
+    },
+    // Opens an ingress for principals outside this session: the most conservative fitting class.
+    risk: "network",
+    namespace: "coordination",
+  },
+  {
+    name: "revoke",
+    description: "Revoke a scoped external mesh grant",
+    inputSchema: {
+      type: "object",
+      properties: { grantId: { type: "string", minLength: 1, maxLength: 64 } },
+      required: ["grantId"],
+      additionalProperties: false,
+    },
+    risk: "write",
+    namespace: "coordination",
+  },
+  {
+    name: "grants",
+    description: "List unexpired external mesh grants (never tokens)",
+    inputSchema: emptySchema,
+    risk: "read",
     namespace: "coordination",
   },
   {
@@ -155,7 +277,7 @@ export class MeshHostPublishError extends Error {
   readonly code = "FABRIC_MESH_HOST_PUBLISH_REQUIRED";
   readonly retryable = false;
   constructor() {
-    super("Mesh dedupeKey and publishBatch require a trusted host component publisher");
+    super("Mesh dedupeKey, publishBatch and sync require a trusted host component publisher");
     this.name = "MeshHostPublishError";
   }
 }
@@ -175,8 +297,19 @@ const assertDedupeKey = (args: Record<string, unknown>, context: FabricInvocatio
   }
 };
 
+/** Upper bound of a host `mesh.sync` budget: a barrier that cannot confirm within it reports failure. */
+const MAX_SYNC_BUDGET_MS = 60_000;
+
 const assertPublishArguments = (actionName: string, args: Record<string, unknown>, context: FabricInvocationContext): void => {
   if (actionName === "publish") assertDedupeKey(args, context);
+  if (actionName === "sync") {
+    // Same trust class as dedupeKey and publishBatch (smarty-dev#9313): checked before any argument.
+    assertHostPublisher(context);
+    if (Object.hasOwn(args, "budgetMs") && (typeof args.budgetMs !== "number" || !Number.isFinite(args.budgetMs) ||
+        args.budgetMs < 0 || args.budgetMs > MAX_SYNC_BUDGET_MS)) {
+      throw new Error(`Mesh sync budgetMs must be a number in 0..${MAX_SYNC_BUDGET_MS}`);
+    }
+  }
   if (actionName === "publishBatch") {
     assertHostPublisher(context);
     if (!Array.isArray(args.events) || !args.events.length || args.events.length > 256) {
@@ -227,6 +360,19 @@ hostDescriptors.push({
   risk: "agent",
   namespace: "coordination",
 });
+hostDescriptors.push({
+  name: "sync",
+  description: "Durability barrier: resolve once every mesh event and state write made before the call is on disk; " +
+    "await it before fsyncing an external cursor or delivered mark that covers them. Returns { synced, through }: " +
+    "advance an event cursor only to through, the highest sequence committed to the log that the barrier made durable",
+  inputSchema: {
+    type: "object",
+    properties: { budgetMs: { type: "number", minimum: 0, maximum: MAX_SYNC_BUDGET_MS, description: "SQLite state checkpoint budget, default 1000" } },
+    additionalProperties: false,
+  },
+  risk: "agent",
+  namespace: "coordination",
+});
 const meshDescriptors = (context: FabricInvocationContext): FabricActionDescriptor[] =>
   fabricHostCallerId(context) === undefined ? descriptors : hostDescriptors;
 const normalizeHostMeshArgs = actionArgNormalizer(() => hostDescriptors);
@@ -263,7 +409,7 @@ export class MeshProvider implements FabricProvider {
     actionName: string,
     context: FabricInvocationContext,
   ): Promise<FabricActionDescriptor | undefined> {
-    if (actionName === "publishBatch") assertHostPublisher(context);
+    if (actionName === "publishBatch" || actionName === "sync") assertHostPublisher(context);
     return meshDescriptors(context).find((descriptor) => descriptor.name === actionName);
   }
 
@@ -283,6 +429,8 @@ export class MeshProvider implements FabricProvider {
     context: FabricInvocationContext,
   ): Record<string, unknown> {
     this.guardArguments(actionName, args, context);
+    // Public optional nullish fields (including `to`) intentionally normalize to omission.
+    // Raw bridge publication frames receive no argument repair and still require a string recipient.
     const normalized = (fabricHostCallerId(context) === undefined ? normalizeMeshArgs : normalizeHostMeshArgs)(actionName, args);
     this.guardArguments(actionName, normalized, context);
     return normalized;
@@ -301,24 +449,44 @@ export class MeshProvider implements FabricProvider {
         assertPublishArguments(actionName, args, context);
         const topic = String(args.topic);
         assertPublishTopic(topic);
-        const dedupeKey = namespacedDedupeKey(args, context);
+        const dueAt = meshScheduleDueAt(args);
+        // An immediate addressed publish needs a known target. A scheduled one (#864) is released
+        // later, when its target may exist; its presence now proves nothing either way.
+        // The hub factory role address (`factory`, any host) owns no participant record; only its
+        // exact work/owner routes skip the directory check (smarty-dev#9352).
+        if (dueAt === undefined && typeof args.to === "string" &&
+          !isAddressedHubFactoryEvent({ topic, kind: args.kind, to: args.to }) && !this.participants.get(args.to, undefined, { fresh: true }) &&
+          !this.participants.list({ scope: "project", includeStale: true, fresh: true })
+            .some(member => member.id === args.to || member.name === args.to)) {
+          const reason = `Unknown Fabric target: ${args.to}`;
+          // Coalesced per (sender, target): a publish loop to unknown targets stays bounded.
+          recordUnknownTarget(this.store.root, this.identity.id, args.to, reason);
+          throw new Error(reason);
+        }
+        if (dueAt === undefined && args.key !== undefined) throw new Error("mesh.publish key requires notBefore or afterMs");
+        const dedupeKey = dueAt === undefined ? namespacedDedupeKey(args, context) : undefined;
         const checked = typeof args.text === "string" ? await outgoingMessageNotice(args.text, context, this.identity.id) : undefined;
+        // One closure for both: a scheduled publish (upstream; the store releases it at dueAt,
+        // key replaces) keeps the originating principal and the outgoing-message notice path.
         const publish = (text?: string) => {
           context.signal?.throwIfAborted();
-          return this.store.publish({
+          const message = {
             topic,
             from: this.identity,
             principal: invocationFabricPrincipal(context),
-            signal: context.signal,
-            ...(dedupeKey === undefined ? {} : { dedupeKey }),
             ...(typeof args.kind === "string" ? { kind: args.kind } : {}),
             ...(typeof args.to === "string" ? { to: args.to } : {}),
             ...(text === undefined ? {} : { text }),
             ...(args.data !== undefined ? { data: args.data } : {}),
-          });
+          };
+          if (dueAt !== undefined) {
+            return this.store.schedule({ ...message, signal: context.signal, dueAt, ...(typeof args.key === "string" ? { key: args.key } : {}) })
+              .then(schedule => ({ scheduled: true as const, ...schedule }));
+          }
+          return this.store.publish({ ...message, signal: context.signal, ...(dedupeKey === undefined ? {} : { dedupeKey }) });
         };
         const event = checked
-          ? await deliverWithMessageNotice(args.text as string, checked, publish, "mesh.publish")
+          ? await deliverWithMessageNotice<Awaited<ReturnType<typeof publish>>>(args.text as string, checked, publish, "mesh.publish")
           : await publish();
         return checked?.notice ? { ...event, notice: checked.notice } : event;
       }
@@ -344,7 +512,47 @@ export class MeshProvider implements FabricProvider {
         context.signal?.throwIfAborted();
         return this.store.publishBatch(inputs);
       }
+      case "sync": {
+        assertPublishArguments(actionName, args, context);
+        context.signal?.throwIfAborted();
+        // `through` is the highest sequence committed to the log before the barrier's fsync, never the
+        // reservation counter (latestSequence), which runs ahead of an append (pi-fabric#894).
+        const { through } = await this.store.sync(typeof args.budgetMs === "number" ? args.budgetMs : undefined);
+        return { synced: true, through };
+      }
+      case "scheduled":
+        return this.store.scheduled({
+          ...(typeof args.topic === "string" ? { topic: args.topic } : {}),
+          ...(typeof args.limit === "number" ? { limit: args.limit } : {}),
+        });
+      case "unschedule":
+        return this.store.unschedule(String(args.key));
+      case "grant": {
+        const topic = assertPublicMeshTopic(String(args.topic));
+        const { grant, token } = await createMeshGrant(this.store, {
+          topic,
+          ttlMs: Number(args.ttlMs),
+          ...(typeof args.uses === "number" ? { uses: args.uses } : {}),
+          ...(typeof args.kind === "string" ? { kind: args.kind } : {}),
+          createdBy: this.identity,
+        });
+        return {
+          ...grant,
+          token,
+          command: meshPostCommand(meshCliArgv(), {
+            root: this.store.root,
+            token,
+            ...(grant.kind !== undefined ? { kind: grant.kind } : {}),
+          }),
+        };
+      }
+      case "revoke":
+        return revokeMeshGrant(this.store, String(args.grantId));
+      case "grants":
+        return listMeshGrants(this.store);
       case "read":
+        // Reading the mesh is a touch: release schedules that fell due while no host ran.
+        await this.store.releaseDueSchedules().catch(() => undefined);
         return this.store.read({
           ...(typeof args.after === "number" ? { after: args.after } : {}),
           ...(typeof args.topic === "string" ? { topic: args.topic } : {}),
@@ -400,6 +608,7 @@ export class MeshProvider implements FabricProvider {
       case "put": {
         const key = String(args.key);
         assertPublicStateKey(key);
+        if (key.startsWith("factory/review-slots/v1/")) slotAdmissionFor(this.store).guardClaimMutation(key);
         return this.store.put({
           key,
           value: args.value,
@@ -410,6 +619,7 @@ export class MeshProvider implements FabricProvider {
       case "delete": {
         const key = String(args.key);
         assertPublicStateKey(key);
+        if (key.startsWith("factory/review-slots/v1/")) slotAdmissionFor(this.store).guardClaimMutation(key);
         return this.store.delete({
           key,
           ...(typeof args.ifVersion === "number" ? { ifVersion: args.ifVersion } : {}),

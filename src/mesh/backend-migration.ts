@@ -85,27 +85,39 @@ import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { renameAtomic } from "../core/atomic-write.js";
+import { verifiedRemove } from "../storage/verified-remove.js";
 import { storageRevision } from "../verified/storage.js";
-import { assertFileStateWritable, encodeMeshStateMovedMarker, MeshBackendFenceError, meshFenceAlarm, meshStateSourceOf, readMeshStateMovedMarker,
-  readStateFileEpoch as readEpochHeader, type MeshBackendAlarm, type MeshStateMovedMarker, type MeshStateSource } from "./backend-fence.js";
+import { assertFileStateWritable, encodeMeshStateMovedMarker, encodeMeshStateNatsMarker, MeshBackendFenceError, meshFenceAlarm, meshStateSourceOf,
+  readMeshStateMovedMarker, readMeshStateNatsMarker, readStateFileEpoch as readEpochHeader, type MeshBackendAlarm, type MeshStateMovedMarker,
+  type MeshStateNatsMarker, type MeshStateSource } from "./backend-fence.js";
 import type { MeshIdentity } from "./event-log.js";
 import { holdMeshFence } from "./fence-lock.js";
 import type { MeshLock } from "./mesh-lock.js";
+import { pinImportRoot, type OwnedImportFiles, type RefusalCleanupReport } from "./owned-import-files.js";
 import { decodeMeshStateFile, encodeMeshStateFile, StateFile, type MeshStateEntry, type MeshStateFile } from "./state-file.js";
 import { filesystemRefusal, MeshStateUnsupportedError, openNodeSqlite, validateMeshStateKey, type SqliteConnection,
   type SqliteOpener, type SqliteRow } from "./state-sqlite.js";
 import { assertPrivateStateRoot, openPrivateStateDb } from "./state-gate.js";
 
 // The writer fence lives in a leaf module (state-file.ts calls it; this module imports state-file.ts).
-export { assertFileStateWritable, MeshBackendFenceError, readMeshStateMovedMarker, type MeshBackendAlarm, type MeshStateMovedMarker, type MeshStateSource };
+export { assertFileStateWritable, encodeMeshStateNatsMarker, MeshBackendFenceError, readMeshStateMovedMarker, readMeshStateNatsMarker, type MeshBackendAlarm,
+  type MeshStateMovedMarker, type MeshStateNatsMarker, type MeshStateSource };
 
-export type MeshBackendFlag = "sqlite" | "importing" | "exporting" | "file";
+/**
+ * state.db's `meta.backend`. `nats` (smarty-dev#7504, docs/mesh-backends.md §Migration step 3): the state moved to a
+ * NATS stream; sqlite readers and writers fail closed on it as on any flag but `sqlite`, and the reader rule
+ * (`meshStateSourceOf`) refuses file and sqlite mode and names the stream.
+ */
+export type MeshBackendFlag = "sqlite" | "importing" | "exporting" | "file" | "nats";
 
 /** Crash points, in commit order. `onStep` runs synchronously right after each one. */
 export type MeshBackendStep =
   | "import-read" | "import-commit" | "import-verify"
   | "rollback-flag" | "rollback-export-temp" | "rollback-verify" | "rollback-switch" | "rollback-replace"
-  | "abort-rollback" | "cutover-reconcile" | "cutover-copy" | "cutover-marker" | "cutover-flag";
+  | "abort-rollback" | "cutover-reconcile" | "cutover-copy" | "cutover-marker" | "cutover-flag"
+  // file <-> nats (backend-migration-nats.ts, smarty-dev#9670)
+  | "nats-import-begin" | "nats-import-chunk" | "nats-import-verify" | "nats-copy" | "nats-marker" | "nats-import-commit"
+  | "nats-retire" | "nats-export-temp" | "nats-replace";
 
 export interface MeshCensusWriter { pid: number; release: string; mode: string }
 /** Provided by the census lane (writer-census.ts): the writers it attributed and the evidence it could not. */
@@ -130,7 +142,7 @@ export interface MeshBackendOptions {
   /** Receives the advisory census report of each operation (logs, the CLI). Never throws into it. */
   onAdvisory?: (advisory: MeshCensusAdvisory) => void;
   /** The mesh `.lock` protocol of the fleet. Default 1 (as mesh-bridge). */
-  lockProtocol?: 1 | 2;
+  lockProtocol?: 1 | 2 | 3;
   /** Budget for each fence lock (`custody.lock`, then `.lock`). Default 60 s. */
   lockTimeoutMs?: number;
   /** Synchronous SQLite busy handler of the tool's own connection. Default 5,000 ms. */
@@ -245,6 +257,8 @@ export interface MeshBackendStatus {
   fileError?: string;
   /** state.json is cutover's moved marker (backend=sqlite at fileEpoch), not state. */
   fileMoved?: boolean;
+  /** state.json is the NATS moved marker: the state is on this stream at fileEpoch (smarty-dev#7504). */
+  natsStream?: string;
   dbDigest?: string;
   fileDigest?: string;
   importDigest?: string | undefined;
@@ -287,7 +301,7 @@ type FencedFile = MeshStateFile & { backendEpoch?: number; backendDigest?: strin
 
 // ------------------------------------------------------------------ digest
 
-interface NormalizedState {
+export interface NormalizedState {
   entries: MeshStateEntry[];
   tombstones: Array<{ key: string; version: number }>;
   highWater: number;
@@ -301,7 +315,7 @@ const isRecord = (value: unknown): value is Record<string, unknown> =>
  * The file store's own validation (state-file.ts stateSlot) and tombstone order
  * (compactStateTombstones: tombstoneOrder first occurrence, then the remaining versions keys).
  */
-const normalizeSnapshot = (state: MeshStateSnapshot): NormalizedState => {
+export const normalizeSnapshot = (state: MeshStateSnapshot): NormalizedState => {
   if (!isRecord(state) || !isRecord(state.entries)) throw new Error("Invalid Fabric mesh state envelope");
   if (state.versions !== undefined && !isRecord(state.versions)) throw new Error("Invalid Fabric mesh revision table");
   if (state.tombstoneOrder !== undefined && !Array.isArray(state.tombstoneOrder)) throw new Error("Invalid Fabric mesh tombstone order");
@@ -380,13 +394,16 @@ const metaOf = (rows: SqliteRow[]): DbMeta => {
 };
 
 class FenceDb {
+  /** smarty-dev#9501: set as the importing transaction's body ends, right before its COMMIT; from then on a refusal keeps the files. */
+  importCommitting = false;
+  #closed = false;
   private constructor(readonly file: string, readonly db: SqliteConnection) {}
 
   /**
    * Opens `<root>/state.db` on the tool's own connection. `create` creates and seeds a missing or
    * uninitialised database at backend=file, epoch 0; otherwise such a database reads as absent.
    */
-  static open(root: string, options: MeshBackendOptions, intent: "read" | "write", create = false): FenceDb | undefined {
+  static open(root: string, options: MeshBackendOptions, intent: "read" | "write", create = false, owned?: OwnedImportFiles): FenceDb | undefined {
     const file = path.join(root, STATE_DB);
     const exists = fs.statSync(file, { throwIfNoEntry: false }) !== undefined;
     if (!exists && !create) return undefined;
@@ -400,13 +417,22 @@ class FenceDb {
         fs.mkdirSync(root, { recursive: true, mode: 0o700 });
         assertPrivateStateRoot(root); // before the create: a refused root gets no state.db (#846 SEC P2)
         // O_EXCL: when this succeeds no connection in this process has the file open.
-        try { fs.closeSync(fs.openSync(file, "wx", 0o600)); }
-        catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
+        // smarty-dev#9501: an import records what it creates (fstat of that descriptor, through the held root fd).
+        if (owned) owned.create(STATE_DB);
+        else {
+          try { fs.closeSync(fs.openSync(file, "wx", 0o600)); }
+          catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
+        }
       }
       db = openPrivateStateDb(file, options.open ?? openNodeSqlite); // the one gate (smarty-dev#7548)
     } catch (error) {
       // A refused state root is a fence failure for the operator too (#846 SEC P2): alarm, then rethrow it as is.
       if (error instanceof MeshStateUnsupportedError) meshFenceAlarm(options, root, error.message);
+      // smarty-dev#11466: the gate's failed close (sqliteCloseError) keeps this run's file pins; the report rides on it.
+      if (owned?.createdDb && error instanceof Error && "sqliteCloseError" in error) {
+        const { cleanupWarnings, retained, reason } = owned.keepAfterFailure("close-failed", error.sqliteCloseError);
+        Object.assign(error, { cleanupWarnings, ...(retained.length > 0 ? { retained } : {}), ...(reason ? { reason } : {}) });
+      }
       throw error;
     }
     try {
@@ -420,6 +446,8 @@ class FenceDb {
         // The fence transactions run at FULL (plan section 5, steps 2 and 5).
         db.exec("PRAGMA synchronous = FULL");
         db.exec("PRAGMA wal_autocheckpoint = 0");
+        // smarty-dev#9501: the sidecars of a state.db this run created, before the first page access opens them.
+        owned?.createSidecars();
       }
       const fence = new FenceDb(file, db);
       if (!fence.#initialised()) {
@@ -428,7 +456,19 @@ class FenceDb {
       }
       return fence;
     } catch (error) {
-      try { db.close(); } catch { /* closing anyway */ }
+      // smarty-dev#9501: a WAL setup refusal on a state.db this run created gets the refusal cleanup; this catch owns the
+      // connection, so it knows whether the close succeeded. Anything else keeps the files, as before.
+      if (owned?.createdDb && error instanceof MeshStateUnsupportedError) cleanupAfterRefusal(error, owned, () => db.close());
+      else {
+        try { db.close(); }
+        catch (closeError) {
+          // smarty-dev#11466: a failed close keeps this run's file pins (close-failed); the report rides on the original error.
+          if (owned?.createdDb && error instanceof Error) {
+            const { cleanupWarnings, retained, reason } = owned.keepAfterFailure("close-failed", closeError);
+            Object.assign(error, { cleanupWarnings, ...(retained.length > 0 ? { retained } : {}), ...(reason ? { reason } : {}) });
+          } else if (owned?.createdDb) owned.keepAfterFailure("close-failed", closeError);
+        }
+      }
       throw error;
     }
   }
@@ -551,6 +591,8 @@ class FenceDb {
   }
 
   close(): void {
+    if (this.#closed) return;
+    this.#closed = true;
     try { if (this.db.isTransaction) this.db.exec("ROLLBACK"); } catch { /* closing anyway */ }
     this.db.close();
   }
@@ -578,9 +620,20 @@ const readFile = (root: string, options: MeshBackendOptions): FencedFile =>
  */
 const dropBlankStateFile = (root: string): void => {
   const file = path.join(root, STATE_JSON);
-  const stat = fs.statSync(file, { throwIfNoEntry: false });
-  if (!stat?.isFile() || stat.size > 4096 || fs.readFileSync(file, "utf8").trim() !== "") return;
-  fs.rmSync(file, { force: true });
+  // smarty-dev#8907: judged by this lstat; the content is read through a descriptor proven to be that inode, and only
+  // that inode is removed. A successor swapped in since is kept and the import refused. pi-fabric#1036 round 3 P2: no
+  // path fallback here (smarty-dev#7858): where the verified path is unavailable (darwin, Windows without the helper)
+  // nothing is deleted, the file is kept and the import refused, so a successor swapped in after the blank judgment
+  // is never removed by name. The Windows helper, where switched on, still verifies the judged inode.
+  const stat = fs.lstatSync(file, { throwIfNoEntry: false });
+  if (!stat?.isFile() || stat.size > 4096) return;
+  const descriptor = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+  try {
+    const opened = fs.fstatSync(descriptor);
+    if (opened.dev !== stat.dev || opened.ino !== stat.ino || fs.readFileSync(descriptor, "utf8").trim() !== "") return;
+  } finally { fs.closeSync(descriptor); }
+  const result = verifiedRemove(file, stat, { deleter: "meshBlankStateFile" });
+  if (!result.removed) throw new MeshBackendRefusedError(`Fabric mesh blank state.json was not dropped (${result.reason}); import refused`);
 };
 
 const fileEpochOf = (state: FencedFile): number => (state.backendEpoch === undefined ? 0 : storageRevision(state.backendEpoch));
@@ -625,9 +678,21 @@ const fsyncDirectory = (directory: string): void => {
   try { fs.fsyncSync(descriptor); } finally { fs.closeSync(descriptor); }
 };
 
+/** smarty-dev#8907: a migration or rollback temp judged by its name, then this lstat; only that inode is removed.
+ * A refusal throws, as a failed rmSync did: a successor swapped in since stays in place and is never renamed or
+ * overwritten (the export opens its temp "wx"). Off Linux: main's rmSync (#7858 fallback). */
+const removeTemp = (root: string, name: string): void => {
+  const file = path.join(root, name);
+  const stat = fs.lstatSync(file, { throwIfNoEntry: false });
+  if (!stat) return;
+  if (!stat.isFile()) throw new MeshBackendRefusedError(`Fabric mesh temp ${file} is not a regular file; left in place`);
+  const result = verifiedRemove(file, stat, { deleter: "meshMigrationTemp", fallback: () => { fs.rmSync(file, { force: true }); return true; } });
+  if (!result.removed) throw new MeshBackendRefusedError(`Fabric mesh temp ${file} was not removed (${result.reason}); left in place`);
+};
+
 const removeStaleTemps = (root: string): void => {
   for (const name of fs.readdirSync(root)) {
-    if (name.startsWith(TEMP_PREFIX) && name.endsWith(".tmp")) fs.rmSync(path.join(root, name), { force: true });
+    if (name.startsWith(TEMP_PREFIX) && name.endsWith(".tmp")) removeTemp(root, name);
   }
 };
 
@@ -770,6 +835,7 @@ const importUnderLock = (root: string, options: MeshBackendOptions, fence: Fence
     // Reconcile right before COMMIT: a state.json that moved since G0 keeps the flag where it was.
     assertFileUnchanged(root, options, { generation, digest }, "before the flag commit", "import aborted, the backend flag is unchanged");
     options.beforeCommit?.({ phase: "importing", fromEpoch: previous, toEpoch: next });
+    fence.importCommitting = true;
     return { epoch: next, previousEpoch: previous };
   });
   options.onStep?.("import-commit");
@@ -804,7 +870,44 @@ const fencedCutover = async (root: string, options: MeshBackendOptions): Promise
   return holdFence(root, options, async (lock) => {
     await options.beforeOpen?.();
     const census = await adviseCensus(options);
-    const fence = FenceDb.open(root, options, "write", true)!;
+    const owned = pinImportRoot(root);
+    try { return await cutoverWithFence(root, options, lock, census, owned); }
+    finally { owned.close(); }
+  });
+};
+
+/**
+ * smarty-dev#9501: the one refusal cleanup. `close` is called exactly once; a close that throws keeps every file
+ * (close-failed), never retried and nothing moved. Only after a successful close are this run's files quarantined.
+ * The report is attached to the same error object; the caller rethrows it unchanged.
+ */
+const cleanupAfterRefusal = (error: Error, owned: OwnedImportFiles, close: () => void): void => {
+  // Nothing here masks the refusal: a cleanup that cannot run keeps the files and says so.
+  // First the close: SQLite's own close may checkpoint and remove its sidecars. A close that throws fails closed:
+  // the connection may still hold the files, so nothing is unlinked, and the close is not retried.
+  let report: RefusalCleanupReport | undefined;
+  try { close(); }
+  catch (closeError) { report = owned.keepAfterFailure("close-failed", closeError); }
+  if (!report) {
+    try { report = owned.removeAfterRefusal(); }
+    catch (cleanup) { report = owned.keepAfterFailure("cleanup-failed", cleanup); }
+  }
+  const { cleanupWarnings, retained, reason } = report;
+  if (cleanupWarnings.length > 0) Object.assign(error, { cleanupWarnings, ...(retained.length > 0 ? { retained } : {}), ...(reason ? { reason } : {}) });
+};
+
+/**
+ * smarty-dev#9501: a refusal (MeshBackendRefusedError, MeshBackendFenceError: exit 3) BEFORE the importing commit
+ * leaves the root as it was. The state.db, -wal and -shm this run created are removed, still under the fence, after
+ * the connection is closed. The removal runs only through the held root fd and only while each name still names the
+ * inode this run created. Kept files are reported on the error (cleanupWarnings, retained, reason); the refusal
+ * itself is rethrown unchanged. Ordinary errors and crashes keep every file (a rerun converges), and so does any
+ * refusal from the importing commit on (the database then holds the import, later the authority).
+ */
+const cutoverWithFence = (root: string, options: MeshBackendOptions, lock: MeshLock, census: MeshCensusAdvisory | undefined,
+  owned: OwnedImportFiles): MeshCutoverResult => {
+  const fence = FenceDb.open(root, options, "write", true, owned)!;
+  try {
     try {
       // G0, import, flag at E+1 and verification; a state.json that moved before COMMIT aborts it.
       const imported = importUnderLock(root, options, fence, lock);
@@ -842,8 +945,24 @@ const fencedCutover = async (root: string, options: MeshBackendOptions): Promise
       }
       throw new MeshCutoverFailedError(`Fabric mesh cutover failed: ${reason}; rolled back to backend=file at epoch ${rollback.epoch}`
         + (conflictFile ? `; the conflicting state.json is kept at ${conflictFile}` : ""), rollback, conflictFile);
-    } finally { fence.close(); }
-  });
+    } catch (error) {
+      if (owned.createdDb && !fence.importCommitting && (error instanceof MeshBackendRefusedError || error instanceof MeshBackendFenceError)) {
+        // FenceDb.close marks itself closed before it calls db.close, so the outer finally is a no-op and cannot mask the refusal.
+        cleanupAfterRefusal(error, owned, () => fence.close());
+      }
+      throw error;
+    }
+  } finally {
+    try { fence.close(); }
+    catch (closeError) {
+      // smarty-dev#11466: a failed close keeps this run's file pins (close-failed); the same close error is rethrown.
+      if (owned.createdDb && closeError instanceof Error) {
+        const { cleanupWarnings, retained, reason } = owned.keepAfterFailure("close-failed", closeError);
+        Object.assign(closeError, { cleanupWarnings, ...(retained.length > 0 ? { retained } : {}), ...(reason ? { reason } : {}) });
+      } else if (owned.createdDb) owned.keepAfterFailure("close-failed", closeError);
+      throw closeError;
+    }
+  }
 };
 
 /**
@@ -895,6 +1014,8 @@ const writeMovedMarker = (root: string, epoch: number): void => {
     fs.writeSync(descriptor, encodeMeshStateMovedMarker(epoch));
     fs.fsyncSync(descriptor);
   } finally { fs.closeSync(descriptor); }
+  // ponytail: replacement, not cleanup: under the fence (custody.lock, .lock) the marker replaces state.json by design
+  // (retireStateFile keeps a copy first; a cutover conflict is copied aside); legacy writers serialize on .lock.
   renameAtomic(temporary, path.join(root, STATE_JSON));
   fsyncDirectory(root);
 };
@@ -921,7 +1042,7 @@ const ROLLBACK_TEMP = /^state\.json\.rollback-\d+\.tmp$/;
 
 const removeRollbackTemps = (root: string, keep?: string): void => {
   for (const name of fs.readdirSync(root)) {
-    if (ROLLBACK_TEMP.test(name) && name !== keep) fs.rmSync(path.join(root, name), { force: true });
+    if (ROLLBACK_TEMP.test(name) && name !== keep) removeTemp(root, name);
   }
 };
 
@@ -1043,6 +1164,8 @@ const rollbackSwitch = (root: string, options: MeshBackendOptions, fence: FenceD
 
 /** Step 5, the very last: the verified temp replaces the marker (atomic rename, directory fsync). */
 const rollbackReplace = (root: string, options: MeshBackendOptions, temporary: string): void => {
+  // ponytail: replacement, not cleanup: under the fence the verified export replaces the marker, which no writer
+  // can commit over (legacy strict reads fail on it; sqlite writers are fenced by the flag).
   renameAtomic(temporary, path.join(root, STATE_JSON));
   fsyncDirectory(root);
   options.onStep?.("rollback-replace");
@@ -1185,16 +1308,23 @@ export const meshBackendStatus = async (root: string, options: MeshBackendOption
     } finally { fence.close(); }
   }
   const marker = readMeshStateMovedMarker(root);
+  const nats = marker ? undefined : readMeshStateNatsMarker(root);
   if (marker) {
     status.fileEpoch = marker.epoch;
     status.fileMoved = true;
+  } else if (nats) {
+    status.fileEpoch = nats.epoch;
+    status.fileMoved = true;
+    status.natsStream = nats.natsStream;
   } else try {
     const file = readFile(root, options);
     status.fileEpoch = fileEpochOf(file);
     status.fileGeneration = typeof file.readGeneration === "string" ? file.readGeneration : undefined;
     status.fileDigest = meshSnapshotDigest(file);
   } catch (error) { status.fileError = (error as Error).message; }
-  status.fenceHolds = status.fileEpoch === undefined ? status.backend !== "file"
+  // A NATS marker holds over no database (from file) or over a fenced one (from sqlite: exporting, then nats) at or below its epoch.
+  status.fenceHolds = nats ? (status.backend === "none" || (["exporting", "nats"].includes(status.backend) && status.epoch <= nats.epoch))
+    : status.fileEpoch === undefined ? status.backend !== "file"
     : status.fileEpoch <= status.epoch && (status.fileMoved ? ["sqlite", "importing", "exporting", "file"].includes(status.backend)
       : status.backend !== "file" || status.fileEpoch === status.epoch);
   const { onAlarm: _quiet, ...quiet } = options;

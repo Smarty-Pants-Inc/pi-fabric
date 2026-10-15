@@ -4,7 +4,7 @@ import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { writeJsonAtomic } from "../core/atomic-write.js";
 import type { SessionReceiptManager } from "../core/session-receipts.js";
-import { confirmedMainInboxIds } from "./root-inbox.js";
+import { confirmedMainInboxIds } from "./root-inbox-shared.js";
 import { processStartTime, residentProcessAlive } from "../residency/process-identity.js";
 import type { HeldAgentMessage, MainAgentController } from "../main-agent.js";
 import type { MeshIdentity, MeshStore } from "../mesh/store.js";
@@ -21,6 +21,17 @@ const mailbox = (meshRoot: string): string => path.join(meshRoot, "main-followup
 const ownerFile = (meshRoot: string, sessionId: string): string => path.join(mailbox(meshRoot), `${encodeURIComponent(sessionId)}.owner.json`);
 const routeFile = (meshRoot: string, id: string): string => path.join(mailbox(meshRoot), "routes", `${hash(id)}.json`);
 const successorFile = (meshRoot: string, rootId: string): string => path.join(mailbox(meshRoot), "successors", `${hash(rootId)}.json`);
+/** Unique identity minted by the ORIGINAL native receiver registration, never a launch label. */
+export interface NativeLauncherIdentity {
+  rootId: string; activationId: string; pid: number; host: string; processStartedAt?: string | undefined;
+}
+// Current-process registration and authenticated predecessor grants. Never reconstruct from disk.
+const registeredMainActivations = new Map<string, { activationId: string; launcher: NativeLauncherIdentity;
+  predecessors: NativeLauncherIdentity[] }>();
+const sameLauncherIdentity = (a: NativeLauncherIdentity | undefined, b: NativeLauncherIdentity | undefined): boolean =>
+  !!a && !!b && a.rootId === b.rootId && a.activationId === b.activationId && a.pid === b.pid &&
+  a.host === b.host && a.processStartedAt === b.processStartedAt;
+const registrationKey = (meshRoot: string, rootId: string): string => `${meshRoot}\u0000${rootId}`;
 const read = <T>(file: string): T | undefined => {
   try { return JSON.parse(fs.readFileSync(file, "utf8")) as T; }
   catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw error; }
@@ -32,6 +43,9 @@ const names = (directory: string): string[] => {
 interface InboxOwner {
   rootId: string; sessionId: string; sessionFile?: string | undefined;
   ownerIdentityId: string; pid: number; host?: string; name?: string; processStartedAt?: string | undefined; retired?: true; activationId?: string;
+  /** Legacy launcher label is display-only. Project and identity are receiver-owned, never mesh grants. */
+  nativeLauncher?: string | undefined; nativeProject?: string | undefined;
+  nativeLauncherIdentity?: NativeLauncherIdentity | undefined;
 }
 interface InboxRoute { oldRoot: string; newRoot?: string; messageId: string; item?: HeldAgentMessage; done?: true }
 interface Successor { oldRoot: string; newRoot?: string; activationId?: string }
@@ -39,23 +53,63 @@ interface Successor { oldRoot: string; newRoot?: string; activationId?: string }
 /** Explicit native activation, not a name/cwd inference. Each runtime captures its
  * own token: resuming a root reopens fresh delivery, never the predecessor runtime.
  * Per-message move tombstones live separately and are never reset here. */
-export const registerMainInbox = (meshRoot: string, identity: MeshIdentity, sessionId: string, sessionFile?: string): string => {
+export const registerMainInbox = (meshRoot: string, identity: MeshIdentity, sessionId: string, sessionFile?: string,
+  nativeLauncher?: string, nativeProject?: string): string => {
   const activationId = randomUUID();
-  writeJsonAtomic(ownerFile(meshRoot, sessionId), { rootId: identity.id, sessionId, sessionFile, activationId,
-    ownerIdentityId: identity.id, pid: process.pid, host: os.hostname(), name: identity.name, processStartedAt: processStartTime(process.pid) } satisfies InboxOwner, { durable: true });
+  const launcher: NativeLauncherIdentity = { rootId: identity.id, activationId, pid: process.pid,
+    host: os.hostname(), processStartedAt: processStartTime(process.pid) };
+  writeJsonAtomic(ownerFile(meshRoot, sessionId), { rootId: identity.id, sessionId, sessionFile, activationId, nativeLauncher, nativeProject,
+    nativeLauncherIdentity: launcher, ownerIdentityId: identity.id, pid: launcher.pid, host: launcher.host,
+    name: identity.name, processStartedAt: launcher.processStartedAt } satisfies InboxOwner, { durable: true });
   writeJsonAtomic(successorFile(meshRoot, identity.id), { oldRoot: identity.id, activationId } satisfies Successor, { durable: true });
+  registeredMainActivations.set(registrationKey(meshRoot, identity.id), { activationId, launcher, predecessors: [] });
   return activationId;
 };
+export const registeredMainActivation = (meshRoot: string, rootId: string): string | undefined =>
+  registeredMainActivations.get(registrationKey(meshRoot, rootId))?.activationId;
+export const registeredMainLauncherIdentity = (meshRoot: string, rootId: string): NativeLauncherIdentity | undefined => {
+  const launcher = registeredMainActivations.get(registrationKey(meshRoot, rootId))?.launcher;
+  return launcher && { ...launcher };
+};
+export const registeredMainPredecessors = (meshRoot: string, rootId: string): NativeLauncherIdentity[] =>
+  registeredMainActivations.get(registrationKey(meshRoot, rootId))?.predecessors.map(identity => ({ ...identity })) ?? [];
+/** Only a live process-local registration can receive or originate predecessor grants. */
+const authenticatedLaunchers = (meshRoot: string, owner: InboxOwner): NativeLauncherIdentity[] | undefined => {
+  const registered = registeredMainActivations.get(registrationKey(meshRoot, owner.rootId));
+  if (!registered || registered.activationId !== owner.activationId || owner.ownerIdentityId !== owner.rootId ||
+      owner.sessionId !== owner.rootId.slice(8) || owner.pid !== process.pid || owner.host !== os.hostname() ||
+      (process.platform === "linux" && (!owner.processStartedAt || owner.processStartedAt !== processStartTime(process.pid))) ||
+      !sameLauncherIdentity(owner.nativeLauncherIdentity, registered.launcher)) return undefined;
+  return [registered.launcher, ...registered.predecessors].map(identity => ({ ...identity }));
+};
+const inheritLaunchers = (meshRoot: string, newRoot: string, predecessors: NativeLauncherIdentity[] | undefined): void => {
+  if (!predecessors || !newRoot.startsWith("session:")) return;
+  const owner = read<InboxOwner>(ownerFile(meshRoot, newRoot.slice(8)));
+  if (!owner || owner.rootId !== newRoot || owner.retired || !authenticatedLaunchers(meshRoot, owner)) return;
+  const registered = registeredMainActivations.get(registrationKey(meshRoot, newRoot))!;
+  registered.predecessors = [...registered.predecessors, ...predecessors]
+    .filter((identity, index, all) => all.findIndex(other => sameLauncherIdentity(identity, other)) === index)
+    .map(identity => ({ ...identity }));
+};
+/** smarty-dev#8881 F-01: optional activation liveness, checked inside the custody critical section
+ * before any write. Custody acquisition awaits; a session disposed in that wait must commit nothing. */
+const fenceActivation = (live?: () => boolean): void => {
+  if (live && !live()) throw new Error("Pi Fabric mesh activation lifecycle retired");
+};
 /** Called only after the old Main/control drainer has closed on an actual native session change. */
-export const recordMainSuccessor = async (mesh: MeshStore, oldRoot: string, oldSessionId: string, newRoot: string): Promise<void> => {
+export const recordMainSuccessor = async (mesh: MeshStore, oldRoot: string, oldSessionId: string, newRoot: string,
+  live?: () => boolean): Promise<void> => {
   if (oldRoot === newRoot) return;
   await mesh.custody(() => {
+    fenceActivation(live);
     const owner = read<InboxOwner>(ownerFile(mesh.root, oldSessionId));
     if (!owner || owner.rootId !== oldRoot || owner.pid !== process.pid) throw new Error("Cannot rotate an unowned Main inbox");
     const prior = read<Successor>(successorFile(mesh.root, oldRoot));
     if (prior?.newRoot && prior.newRoot !== newRoot) throw new Error("Main inbox already has a different successor");
+    const launchers = authenticatedLaunchers(mesh.root, owner);
     writeJsonAtomic(successorFile(mesh.root, oldRoot), { oldRoot, newRoot, activationId: owner.activationId }, { durable: true });
     writeJsonAtomic(ownerFile(mesh.root, oldSessionId), { ...owner, retired: true }, { durable: true });
+    inheritLaunchers(mesh.root, newRoot, launchers);
   });
 };
 
@@ -69,15 +123,19 @@ export const stageMainSuccessor = async (mesh: MeshStore, oldRoot: string, sessi
     // Resuming the current native session keeps its root; it is not a rotation.
     if (owner.sessionFile && path.resolve(owner.sessionFile) === path.resolve(targetSessionFile)) return;
     writeJsonAtomic(path.join(mailbox(mesh.root), "rotations", `${hash(path.resolve(targetSessionFile))}.json`),
-      { oldRoot, sessionId, activationId: owner.activationId, targetSessionFile: path.resolve(targetSessionFile) }, { durable: true });
+      { oldRoot, sessionId, activationId: owner.activationId, targetSessionFile: path.resolve(targetSessionFile),
+        nativeLauncherIdentity: owner.nativeLauncherIdentity, nativeLauncherGrants: authenticatedLaunchers(mesh.root, owner) }, { durable: true });
     writeJsonAtomic(file, { ...owner, retired: true }, { durable: true });
   });
 };
-export const confirmMainSuccessor = async (mesh: MeshStore, newRoot: string, sessionFile?: string): Promise<boolean> => {
+export const confirmMainSuccessor = async (mesh: MeshStore, newRoot: string, sessionFile?: string,
+  live?: () => boolean): Promise<boolean> => {
   if (!sessionFile) return false;
   return mesh.custody(() => {
+    fenceActivation(live);
     const intentFile = path.join(mailbox(mesh.root), "rotations", `${hash(path.resolve(sessionFile))}.json`);
-    const intent = read<{ oldRoot: string; sessionId: string; activationId?: string; targetSessionFile: string }>(intentFile);
+    const intent = read<{ oldRoot: string; sessionId: string; activationId?: string; targetSessionFile: string;
+      nativeLauncherIdentity?: NativeLauncherIdentity; nativeLauncherGrants?: NativeLauncherIdentity[] }>(intentFile);
     if (!intent) return false;
     const owner = read<InboxOwner>(ownerFile(mesh.root, intent.sessionId));
     // An interrupted/canceled switch cannot authorize a different activation.
@@ -86,7 +144,12 @@ export const confirmMainSuccessor = async (mesh: MeshStore, newRoot: string, ses
     const file = successorFile(mesh.root, intent.oldRoot);
     const prior = read<Successor>(file);
     if (prior?.newRoot && prior.newRoot !== newRoot) throw new Error("Main inbox already has a different successor");
+    // The staged native intent authenticates the old registration across runtime/process replacement.
+    // A legacy intent/owner without identity still routes messages, but grants no retirement authority.
     writeJsonAtomic(file, { oldRoot: intent.oldRoot, newRoot, activationId: owner.activationId }, { durable: true });
+    if (sameLauncherIdentity(intent.nativeLauncherIdentity, owner.nativeLauncherIdentity)) {
+      inheritLaunchers(mesh.root, newRoot, intent.nativeLauncherGrants);
+    }
     // An intent authorizes this switch only, not a later return to the same file.
     fs.unlinkSync(intentFile);
     return true;
@@ -141,6 +204,85 @@ export const rootPresenceAlarms = async (mesh: MeshStore, identity: MeshIdentity
       data: { rootId, firstAbsentAt: since, byKind, byStatus } });
   }
 };
+
+/** Held messages one alarm lists by id; its heldCount still counts them all. */
+const PROVIDER_DEAD_LISTED_MESSAGES = 50;
+/** Alarms per mesh publishBatch call; the loop publishes batches until every address is covered. */
+const PROVIDER_DEAD_ALARM_BATCH = 50;
+
+/**
+ * smarty-dev#8742: a Main whose provider rejects every request as non-retryable reaches ops at
+ * once, on the inbox-age alarm's path: ops.owner, addressed to the Main's owner and to the sender
+ * of every held message (Main holds up to 200), one inbox.age.alarm per address however many of
+ * its messages are held. PR #841 review: no held message's sender is left for the age pass.
+ * An address's alarm reuses the age pass's dedupe key for its first held message, so it crosses
+ * the existing mesh bridge to remote senders and the age pass never repeats it; the age pass
+ * still reports that address's other messages if they stay unread past mesh.undeliveredAlarmMs.
+ */
+/**
+ * pi-fabric#939 P2-b: the one recipient of the agent-admission alarm. An owner alarm is never published without one,
+ * and never to a name ("org", "org-kate"): only an exact `session:<uuid>` address. The configured owner identity
+ * first, else this Main's own session id (the manager's owner); undefined means log locally and skip the publish.
+ */
+const SESSION_ADDRESS = /^session:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+export const admissionAlarmRecipient = (ownerIdentityId: string | undefined, identity: MeshIdentity | undefined): string | undefined =>
+  [ownerIdentityId?.trim(), identity?.kind === "main" ? identity.id : undefined]
+    .find((candidate): candidate is string => typeof candidate === "string" && SESSION_ADDRESS.test(candidate));
+
+export const providerDeadAlarms = async (mesh: MeshStore, identity: MeshIdentity, rootId: string,
+  event: ProviderDeadAlarmEvent, ownerIdentityId?: string): Promise<void> => {
+  const owners = [...new Set([identity.id, ...(ownerIdentityId ? [ownerIdentityId] : [])])];
+  const fields = providerDeadAlarmFields(event);
+  const reason = fields.kind === "unclassified" ? "provider-dead (unclassified)" : `provider-dead (non-retryable: ${fields.error})`;
+  for (const to of owners) await mesh.publish({
+    topic: "ops.owner", kind: "fabric.main.provider-dead", from: identity, to,
+    dedupeKey: `provider-dead:${rootId}:${event.since}:${to}`,
+    text: `Main ${rootId} ${reason}: ${fields.cause}; ${event.held.length} held message(s) unread`,
+    data: { rootId, ...fields, held: event.held.slice(0, PROVIDER_DEAD_LISTED_MESSAGES), heldCount: event.held.length } });
+  // Deduplicated per address: each sender once, listing its own held messages; owners list all.
+  const byAddress = new Map<string, Array<ProviderDeadAlarmEvent["held"][number]>>();
+  for (const item of event.held) {
+    for (const to of new Set([item.from, ...owners])) {
+      const items = byAddress.get(to);
+      if (items) items.push(item); else byAddress.set(to, [item]);
+    }
+  }
+  const alarms = [...byAddress].map(([to, items]) => {
+    const first = items[0]!;
+    return { topic: "ops.owner", kind: "inbox.age.alarm", from: identity, to, dedupeKey: `inbox-age:${first.id}:${to}`,
+      text: items.length === 1 ? `Undelivered Main message ${first.id} to ${rootId}: ${reason}`
+        : `${items.length} undelivered Main messages to ${rootId}, first ${first.id}: ${reason}`,
+      data: { messageId: first.id, rootId, sentAt: first.sentAt, reason: "provider-dead", error: fields.error,
+        messageIds: items.slice(0, PROVIDER_DEAD_LISTED_MESSAGES).map(item => item.id), heldCount: items.length } };
+  });
+  // A batch may commit only a prefix: continue from the first uncommitted alarm.
+  for (let next = 0; next < alarms.length;) {
+    const committed = await mesh.publishBatch(alarms.slice(next, next + PROVIDER_DEAD_ALARM_BATCH));
+    if (!committed.length) throw new Error("Provider-dead alarm batch committed nothing");
+    next += committed.length;
+  }
+};
+
+/** What a provider-dead alarm may carry: the shape of FabricMainProviderDeadEvent, nothing else. */
+export interface ProviderDeadAlarmEvent {
+  kind?: "non-retryable" | "unclassified";
+  error: string; status?: number; type?: string; code?: string; failures?: number;
+  since: string; cause: string;
+  held: ReadonlyArray<{ id: string; from: string; sentAt: number }>;
+}
+
+/**
+ * smarty-dev#8742 security review: alarm data is an explicit allowlist (status, known type, fixed
+ * code, Fabric's own cause), so a field an event happens to carry can never ride along to ops.owner,
+ * held messages' senders or the mesh bridge. Provider message text is never one of them.
+ */
+export const providerDeadAlarmFields = (event: Omit<ProviderDeadAlarmEvent, "held">) => ({
+  kind: event.kind ?? "non-retryable", error: event.error, since: event.since, cause: event.cause,
+  ...(event.status === undefined ? {} : { status: event.status }),
+  ...(event.type === undefined ? {} : { type: event.type }),
+  ...(event.code === undefined ? {} : { code: event.code }),
+  ...(event.failures === undefined ? {} : { failures: event.failures }),
+});
 
 export class MainInboxMaintenance {
   readonly #receipts = new Map<string, SessionReceiptManager>();

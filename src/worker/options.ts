@@ -63,6 +63,17 @@ export const parseWorkerOptions = (
 ): AgentWorkerOptions => {
   const args = argumentMap(argv);
   const model = optional(args, "model");
+  const promptSha256 = optional(args, "prompt-sha256");
+  const promptBytesSource = optional(args, "prompt-bytes");
+  const promptPath = optional(args, "prompt-path");
+  const inputSha256 = optional(args, "input-sha256");
+  const inputBytesSource = optional(args, "input-bytes");
+  const promptBytes = promptBytesSource === undefined ? undefined : Number(promptBytesSource);
+  const inputBytes = inputBytesSource === undefined ? undefined : Number(inputBytesSource);
+  if (promptSha256 !== undefined && !/^[a-f0-9]{64}$/.test(promptSha256)) throw new Error("Invalid worker prompt sha256");
+  if (inputSha256 !== undefined && !/^[a-f0-9]{64}$/.test(inputSha256)) throw new Error("Invalid worker input sha256");
+  if (promptBytes !== undefined && (!Number.isSafeInteger(promptBytes) || promptBytes < 0)) throw new Error("Invalid worker prompt byte count");
+  if (inputBytes !== undefined && (!Number.isSafeInteger(inputBytes) || inputBytes < 0)) throw new Error("Invalid worker input byte count");
   const modelReason = args.get("model-reason");
   const routeHeader = optional(args, "route-header");
   const routeClass = args.get("route-class");
@@ -75,6 +86,7 @@ export const parseWorkerOptions = (
     throw new Error("Invalid worker protection snapshot");
   }
   const thinking = optional(args, "thinking");
+  const thinkingBounds = optional(args, "thinking-bounds");
   const fabricExtensionPath = optional(args, "fabric-extension");
   const fabricRelease = optional(args, "fabric-release");
   const schemaFile = optional(args, "schema-file");
@@ -82,6 +94,22 @@ export const parseWorkerOptions = (
   const imagesFile = optional(args, "images-file");
   const systemPrompt = optional(args, "system-prompt");
   const sessionFile = optional(args, "session-file");
+  const persistSessionSource = optional(args, "persist-session");
+  if (persistSessionSource !== undefined && persistSessionSource !== "true" && persistSessionSource !== "false") {
+    throw new Error("Invalid worker persist-session flag");
+  }
+  const persistSession = persistSessionSource === "true";
+  const modelAdmissionSource = optional(args, "model-admission");
+  if (
+    modelAdmissionSource !== undefined &&
+    modelAdmissionSource !== "strict" &&
+    modelAdmissionSource !== "permissive"
+  ) {
+    throw new Error("Invalid worker model-admission flag");
+  }
+  const modelAdmission = modelAdmissionSource === "strict" || modelAdmissionSource === "permissive"
+    ? modelAdmissionSource
+    : undefined;
   const sessionExportFile = optional(args, "session-export-file");
   const actorId = optional(args, "actor-id");
   const actorName = optional(args, "actor-name");
@@ -106,8 +134,17 @@ export const parseWorkerOptions = (
   const ownerIdentityId = optional(args, "owner-identity-id");
   const runRoot = optional(args, "run-root");
   const steerFile = optional(args, "steer-file");
+  const childQuestions = optional(args, "child-questions");
+  const childQuestionTimeoutMs = childQuestions === undefined ? undefined : Number(childQuestions);
+  if (childQuestionTimeoutMs !== undefined && !(Number.isInteger(childQuestionTimeoutMs) && childQuestionTimeoutMs >= 1_000)) {
+    throw new Error("Invalid worker child-questions timeout");
+  }
   const branch = optional(args, "branch");
   const worktree = optional(args, "worktree");
+  const tmpdir = optional(args, "tmpdir");
+  const writePolicy = optional(args, "write-policy");
+  const scope = optional(args, "scope");
+  const lineage = optional(args, "lineage");
   const maxTokens = optional(args, "max-tokens");
   const nice = optional(args, "nice");
   const carryOverSource = optional(args, "carry-over");
@@ -147,6 +184,7 @@ export const parseWorkerOptions = (
   const spawnerId = optional(args, "spawner-id");
   const spawnerKind = optional(args, "spawner-kind");
   const spawnerRun = optional(args, "spawner-run");
+  const spawnerName = optional(args, "spawner-name");
   if (spawnerId && spawnerKind !== "main" && spawnerKind !== "agent" && spawnerKind !== "actor") {
     throw new Error("Invalid worker spawner kind");
   }
@@ -156,7 +194,8 @@ export const parseWorkerOptions = (
   } : undefined;
   const fabricSessionId = optional(args, "fabric-session-id");
   const runner = required(args, "runner");
-  if (runner !== "pi" && runner !== "claude" && runner !== "veda") {
+  const isPi = runner === "pi" || runner === "pi-durable";
+  if (!isPi && runner !== "claude" && runner !== "veda") {
     throw new Error(`Unsupported Fabric agent runner: ${runner}`);
   }
   const inferenceContext = optional(args, "inference-context");
@@ -165,6 +204,9 @@ export const parseWorkerOptions = (
   }
   if (inferenceContext === "activation" && (runner !== "pi" || !sessionFile || !actorId)) {
     throw new Error("Activation inference context requires a persistent Pi actor session");
+  }
+  if (persistSession && runner !== "claude") {
+    throw new Error("Worker persist-session requires the Claude runner");
   }
   const extensions = required(args, "extensions") === "true";
   const selectedKernel = args.get("kernel");
@@ -175,11 +217,11 @@ export const parseWorkerOptions = (
   if (selectedKernel !== undefined && selectedKernel !== "typescript" && selectedKernel !== "python") {
     throw new Error(`Invalid worker kernel: ${selectedKernel}`);
   }
-  if (selectedKernel !== undefined && (runner !== "pi" || !extensions)) {
+  if (selectedKernel !== undefined && (!isPi || !extensions)) {
     throw new Error("Explicit worker kernel requires the Pi runner with Fabric extensions enabled");
   }
   // Old launchers had no flag and always used TypeScript, regardless of ambient env.
-  const kernel = runner === "pi" && extensions ? selectedKernel ?? "typescript" : undefined;
+  const kernel = isPi && extensions ? selectedKernel ?? "typescript" : undefined;
   const residentStartupProbe = optional(args, "resident-startup-probe") === "true";
   if (residentStartupProbe && (runner !== "pi" || !extensions || actorId || sessionFile || schemaFile || replyTool)) {
     throw new Error("Resident startup probe must be an isolated Pi worker");
@@ -192,6 +234,11 @@ export const parseWorkerOptions = (
     ...(kernel ? { kernel, pythonRuntime } : {}),
     name: required(args, "name"),
     taskFile: required(args, "task-file"),
+    ...(promptSha256 ? { promptSha256 } : {}),
+    ...(promptBytes !== undefined ? { promptBytes } : {}),
+    ...(promptPath ? { promptPath } : {}),
+    ...(inputSha256 ? { inputSha256 } : {}),
+    ...(inputBytes !== undefined ? { inputBytes } : {}),
     ...(imagesFile ? { imagesFile } : {}),
     statusFile: required(args, "status-file"),
     lifecycleFile: required(args, "lifecycle-file"),
@@ -210,6 +257,7 @@ export const parseWorkerOptions = (
     fullCodeMode: required(args, "full-code-mode") === "true",
     ...(mainAgentId ? { mainAgentId } : {}),
     ...(spawner ? { spawner } : {}),
+    ...(spawnerName ? { spawnerName } : {}),
     ...(fabricSessionId ? { fabricSessionId } : {}),
     extensions,
     tools: JSON.parse(required(args, "tools")) as string[],
@@ -223,7 +271,10 @@ export const parseWorkerOptions = (
     ...(routeClassSource ? { routeClassSource } : {}),
     ...(protection !== undefined ? { protected: protection === "true" } : {}),
     ...(thinking ? { thinking } : {}),
+    ...(thinkingBounds ? { thinkingBounds } : {}),
     ...(systemPrompt ? { systemPrompt } : {}),
+    ...(persistSession ? { persistSession: true } : {}),
+    ...(modelAdmission ? { modelAdmission } : {}),
     ...(sessionFile ? { sessionFile } : {}),
     ...(inferenceContext ? { inferenceContext } : {}),
     ...(sessionExportFile ? { sessionExportFile } : {}),
@@ -243,8 +294,13 @@ export const parseWorkerOptions = (
     ...(runnerSessionIds ? { runnerSessionIds } : {}),
     ...(runRoot ? { runRoot } : {}),
     ...(steerFile ? { steerFile } : {}),
+    ...(childQuestionTimeoutMs !== undefined ? { childQuestionTimeoutMs } : {}),
     ...(branch ? { branch } : {}),
     ...(worktree ? { worktree } : {}),
+    ...(tmpdir ? { tmpdir } : {}),
+    ...(writePolicy ? { writePolicy } : {}),
+    ...(scope ? { scope } : {}),
+    ...(lineage ? { lineage } : {}),
     ...(maxTokens ? { maxTokens: Number(maxTokens) } : {}),
     ...(nice ? { nice: Number(nice) } : {}),
     ...(carryOver ? { carryOver } : {}),

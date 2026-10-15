@@ -1,11 +1,12 @@
-import { randomUUID } from "node:crypto";
-import fs from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import fs, { type FSWatcher } from "node:fs";
 import path from "node:path";
 import { syncDirectoryChain, withExclusiveFileLock, writeJsonAtomic } from "../core/atomic-write.js";
 import { ChildCompletionClaimLostError } from "../result-consumption.js";
 export { ChildCompletionClaimLostError } from "../result-consumption.js";
 import { ARCHIVE_PENDING_FILE, commitRunArchive, readPendingRunArchives } from "../agents/archive-custody.js";
 import { ownedStat, processAlive } from "../storage/scratch.js";
+import { verifiedRemove } from "../storage/verified-remove.js";
 import type { AgentRunResult, AgentSpawner } from "../agents/types.js";
 
 export type ActorChildResult = Pick<AgentRunResult, "id" | "name" | "status" | "text" | "error" | "startedAt" | "finishedAt">;
@@ -16,6 +17,133 @@ export interface ActorChildCompletion {
 }
 const ID = /^[a-f0-9]{32}$/;
 const STORED_FILE = /^([a-f0-9]{32})(?:\.result\.json|\.json|\.receipt|\.live-receipt|\.consumed|\.abandon)$/;
+
+// Writer-visible pending work: an envelope, cancellation intent or archive source.
+const WAKE_FILE = /^[a-f0-9]{32}\.(?:json|abandon|source)$/;
+const WATCH_REARM_MS = 60_000;
+const WATCH_REARM_MAX_MS = 5 * 60_000;
+const WATCH_FAILURE_LIMIT = 6;
+// A closed native handle normally reports `close`; an errored one may never do so.
+const WATCH_CLOSE_GRACE_MS = 1_000;
+// Envelopes/control records are small metadata, not the retained full result or session.
+const MAX_SPOOL_JSON_BYTES = 1024 * 1024;
+const MAX_WARNING_ENTRIES = 256;
+class UnsafeCompletionEntry extends Error {}
+
+/**
+ * Edge-only wake for completion writers in other processes. It carries no authority:
+ * the callback only schedules the owner's existing fresh ownership/claim reconcile.
+ * Arm it BEFORE the first empty preflight so a later write cannot fall between them.
+ * A failed watch gets one immediate rescan/re-arm, then 60/120/240/300 s one-shots.
+ * Six consecutive failures enter observation-degraded health and warn once. Only a
+ * delivered event resets the budget. Degraded recovery scans/re-arms once per minute;
+ * a successful re-arm stops that fallback and restores the native event path.
+ */
+export class ActorChildCompletionWatch {
+  #watcher: FSWatcher | undefined;
+  #timer: NodeJS.Timeout | undefined;
+  #failures = 0;
+  #unavailable = false;
+  #warnedUnavailable = false;
+  #closed = false;
+  // Watchers closed after an error whose native close may still be in flight.
+  readonly #closing = new Set<Promise<void>>();
+  constructor(readonly directory: string, readonly wake: () => void) { this.#arm(); }
+
+  /** Native observation is unavailable; the degraded durable-source fallback remains active. */
+  get unavailable(): boolean { return this.#unavailable; }
+  get health(): "observing" | "recovering" | "observation-degraded" | "closed" {
+    return this.#closed ? "closed" : this.#unavailable ? "observation-degraded" : this.#watcher ? "observing" : "recovering";
+  }
+
+  #arm(): void {
+    this.#timer = undefined;
+    if (this.#closed || this.#watcher) return;
+    try {
+      // Create the empty spool once (never recursively: a removed actor stays removed).
+      try { fs.mkdirSync(this.directory, { mode: 0o700 }); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
+      const watcher = fs.watch(this.directory, { persistent: false }, (_event, filename) => {
+        if (this.#closed || this.#watcher !== watcher) return;
+        this.#failures = 0; // Only a delivered event, never arming, resets the failure budget.
+        this.#warnedUnavailable = false;
+        const name = filename == null ? undefined : path.basename(filename.toString());
+        // A nameless event is a wake, not evidence that nothing changed.
+        if (name === undefined || WAKE_FILE.test(name)) this.wake();
+      });
+      watcher.on("error", () => this.#failed(watcher));
+      const degraded = this.#unavailable;
+      this.#watcher = watcher;
+      this.#unavailable = false;
+      // A degraded tick already rescanned. Other re-arms cover their missed edges once.
+      if (this.#failures && !degraded) this.wake();
+    } catch { this.#failed(undefined); }
+  }
+
+  #failed(watcher: FSWatcher | undefined): void {
+    if (this.#closed || (watcher && this.#watcher !== watcher)) return;
+    if (watcher) {
+      this.#watcher = undefined;
+      this.#closing.add(this.#closeHandle(watcher));
+    }
+    if (this.#timer || this.#unavailable) return;
+    this.#failures++;
+    if (this.#failures === 1) {
+      this.wake();
+      this.#arm(); // Single immediate rescan/re-arm, not a fast retry timer.
+      return;
+    }
+    if (this.#failures >= WATCH_FAILURE_LIMIT) {
+      this.#unavailable = true;
+      if (!this.#warnedUnavailable) {
+        this.#warnedUnavailable = true;
+        console.warn(`[pi-fabric] observation-degraded: child completion watch unavailable for ${this.directory}; using bounded 60 s durable-source scan/re-arm until native observation recovers`);
+      }
+      this.#scheduleDegraded();
+      return;
+    }
+    this.#timer = setTimeout(() => this.#arm(), Math.min(WATCH_REARM_MAX_MS, WATCH_REARM_MS * 2 ** (this.#failures - 2)));
+    this.#timer.unref();
+  }
+
+  #scheduleDegraded(): void {
+    if (this.#closed || !this.#unavailable || this.#timer) return;
+    // ponytail: named R-no-polling exception (#1047/#11172), exhausted observer only.
+    // One bounded durable-source wake plus re-arm each minute; never abandon late work,
+    // and never retain a safety poll when native observation has recovered.
+    this.#timer = setTimeout(() => {
+      this.#timer = undefined;
+      if (this.#closed || !this.#unavailable) return;
+      this.wake();
+      this.#arm();
+      this.#scheduleDegraded();
+    }, WATCH_REARM_MS);
+    this.#timer.unref();
+  }
+
+  /** Joins the native close; an errored handle that never reports it is released after a bounded grace. */
+  #closeHandle(watcher: FSWatcher): Promise<void> {
+    let settle!: () => void;
+    const closed = new Promise<void>(resolve => { settle = resolve; });
+    const grace = setTimeout(() => settle(), WATCH_CLOSE_GRACE_MS);
+    grace.unref();
+    watcher.once("close", () => { clearTimeout(grace); settle(); });
+    try { watcher.close(); } catch { clearTimeout(grace); settle(); }
+    const done: Promise<void> = closed.then(() => { this.#closing.delete(done); });
+    return done;
+  }
+
+  /** Resolves once every owned native handle has closed (or its bounded grace expired), so custody is not released early. */
+  close(): Promise<void> {
+    this.#closed = true;
+    if (this.#timer) clearTimeout(this.#timer);
+    this.#timer = undefined;
+    const watcher = this.#watcher;
+    this.#watcher = undefined;
+    if (watcher) this.#closing.add(this.#closeHandle(watcher));
+    return Promise.all([...this.#closing]).then(() => undefined);
+  }
+}
 
 /** Offline recovery retries exact actor-addressed archives before a dead root is collected. */
 export const recoverActorRunArchives = (directory: string, expired: () => boolean = () => false, depth = 0): void => {
@@ -63,9 +191,117 @@ export class ActorChildCompletionStore {
   readonly #consumed = new Set<string>();
   readonly #publicationId = randomUUID();
   readonly #uncertainReceipts = new Set<string>();
+  // Retain listed paths until absent, even if their contents/type become readable.
+  readonly #warnedEntries = new Set<string>();
+  #overflowSignature: string | undefined;
+  #overflowScanned = false;
   #claimDepth = 0;
   constructor(readonly sessionFile: string) {
     this.directory = path.join(path.dirname(sessionFile), "child-completions");
+  }
+
+  #scanFiles(): string[] {
+    let files: string[];
+    try { files = fs.readdirSync(this.directory); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        this.#warnedEntries.clear();
+        this.#overflowSignature = undefined;
+        this.#overflowScanned = false;
+      }
+      throw error;
+    }
+    if (this.#warnedEntries.size) {
+      const present = new Set(files);
+      for (const file of this.#warnedEntries) if (!present.has(path.basename(file))) this.#warnedEntries.delete(file);
+    }
+    this.#overflowScanned = false;
+    // Inventory before callers short-circuit on a legitimate envelope/source. Only
+    // saturated warning caches (or a still-active overflow) pay for this metadata-
+    // only pass; no spool is opened. Safe-file churn cannot reset the summary.
+    if (this.#warnedEntries.size === MAX_WARNING_ENTRIES || this.#overflowSignature !== undefined) this.#warnOverflow(files);
+    return files;
+  }
+
+  #safeSpoolStat(stat: fs.Stats): boolean {
+    return stat.isFile() && stat.nlink === 1 &&
+      (!process.getuid || stat.uid === process.getuid()) && stat.size <= MAX_SPOOL_JSON_BYTES;
+  }
+
+  #warnOverflow(files?: string[], refused?: string): void {
+    // A direct receipt/control read may precede any scan. Inventory at most once
+    // between directory scans, never once per overflowing read. Later direct-read
+    // changes remain refused; the next scan refreshes their aggregate visibility.
+    if (this.#overflowScanned) return;
+    this.#overflowScanned = true;
+    try { files ??= fs.readdirSync(this.directory); } catch { files = []; }
+    // XOR of path digests is order-independent and retains no unlisted path keys.
+    const digest = Buffer.alloc(32);
+    let unsafe = 0, additional = 0, includedRefused = false;
+    const include = (file: string): void => {
+      unsafe++;
+      if (!this.#warnedEntries.has(file)) additional++;
+      const entry = createHash("sha256").update(file).digest();
+      for (let index = 0; index < digest.length; index++) digest[index] = digest[index]! ^ entry[index]!;
+    };
+    for (const name of files) {
+      if (!WAKE_FILE.test(name) && !STORED_FILE.test(name)) continue;
+      const file = path.join(this.directory, name);
+      if (file === refused) { include(file); includedRefused = true; continue; }
+      try { if (!this.#safeSpoolStat(fs.lstatSync(file))) include(file); }
+      catch { /* Unreadable metadata is not proof of an unsafe entry. */ }
+    }
+    // Preserve visibility for a raced refusal even if its current metadata is safe
+    // or its directory entry disappeared before this inventory.
+    if (refused && !includedRefused) include(refused);
+    const signature = `${unsafe}:${digest.toString("hex")}`;
+    if (additional && signature !== this.#overflowSignature) {
+      console.warn(`[pi-fabric] ${additional} additional unsafe child completion entries retained, not read; individual warning limit ${MAX_WARNING_ENTRIES} reached in ${this.directory}`);
+    }
+    this.#overflowSignature = unsafe ? signature : undefined;
+  }
+
+  /** A task can write spool names. Refuse unsafe entries before open and bound every
+   * read; POSIX no-follow/nonblocking open also protects the final-component swap. */
+  #readSpoolJson(file: string) {
+    let fd: number | undefined;
+    try {
+      const expected = fs.lstatSync(file);
+      if (expected.isSymbolicLink() || !this.#safeSpoolStat(expected)) throw new UnsafeCompletionEntry("not an owned bounded regular file");
+      // ponytail: Windows has no task confinement, so a same-user task can already
+      // end the host directly. Refuse Node-reported symlinks/junctions BEFORE open
+      // and retain fstat checks; the remaining Windows lstat/open swap is an accepted
+      // security gap, not a claim that these unavailable POSIX flags protect it.
+      fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0));
+      const stat = fs.fstatSync(fd);
+      if (!this.#safeSpoolStat(stat) || stat.dev !== expected.dev || stat.ino !== expected.ino) {
+        throw new UnsafeCompletionEntry("file changed before read");
+      }
+      // The sentinel catches growth, without allocating/reading beyond the bound.
+      const bytes = Buffer.alloc(stat.size + 1);
+      let length = 0;
+      while (length < bytes.length) {
+        const read = fs.readSync(fd, bytes, length, bytes.length - length, null);
+        if (read === 0) break;
+        length += read;
+      }
+      const after = fs.fstatSync(fd);
+      if (length !== stat.size || !this.#safeSpoolStat(after) || after.size !== stat.size || after.mtimeMs !== stat.mtimeMs) {
+        throw new UnsafeCompletionEntry("file changed during read");
+      }
+      return JSON.parse(bytes.subarray(0, length).toString("utf8"));
+    } catch (error) {
+      if (error instanceof UnsafeCompletionEntry || (error as NodeJS.ErrnoException).code === "ELOOP") {
+        if (!this.#warnedEntries.has(file)) {
+          if (this.#warnedEntries.size < MAX_WARNING_ENTRIES) {
+            this.#warnedEntries.add(file);
+            console.warn(`[pi-fabric] unsafe child completion entry retained, not read: ${file}`);
+          } else this.#warnOverflow(undefined, file);
+        }
+        throw error instanceof UnsafeCompletionEntry ? error : new UnsafeCompletionEntry("no-follow open refused");
+      }
+      throw error;
+    } finally { if (fd !== undefined) fs.closeSync(fd); }
   }
 
   enqueue(result: AgentRunResult, spawner: AgentSpawner, notify = true): void {
@@ -75,7 +311,7 @@ export class ActorChildCompletionStore {
       // the source's archive obligation, not let its prepared receipt discharge it.
       this.#rollbackAbandoned(result.id);
       const received = this.received(result.id);
-      const publication = received ? JSON.parse(fs.readFileSync(this.#receipt(result.id), "utf8")).publication : undefined;
+      const publication = received ? this.#readSpoolJson(this.#receipt(result.id)).publication : undefined;
       if (this.#consumed.has(result.id) || (received && !publication)) {
         // A finalized observation/claim still prevents replay. Fence a receipt
         // whose rename was visible but whose durability barrier previously failed.
@@ -115,7 +351,7 @@ export class ActorChildCompletionStore {
     this.#withClaim(() => {
       const received = this.received(id);
       if (received && options.mailbox && !this.mailboxClaimed(id)) throw new ChildCompletionClaimLostError([id]);
-      const publication = received ? JSON.parse(fs.readFileSync(this.#receipt(id), "utf8")).publication : undefined;
+      const publication = received ? this.#readSpoolJson(this.#receipt(id)).publication : undefined;
       if (!received || this.#uncertainReceipts.has(id) || (!options.publication && publication === this.#publicationId)) {
         this.#uncertainReceipts.add(id);
         writeJsonAtomic(this.#receipt(id), { id, kind: options.mailbox ? "mailbox" : "foreground", acknowledgedAt: Date.now(),
@@ -139,9 +375,9 @@ export class ActorChildCompletionStore {
   #rollbackAbandoned(id: string): void {
     const file = path.join(this.directory, `${id}.abandon`);
     if (!fs.existsSync(file)) return;
-    const abandoned = JSON.parse(fs.readFileSync(file, "utf8"));
+    const abandoned = this.#readSpoolJson(file);
     let receipt;
-    try { receipt = JSON.parse(fs.readFileSync(this.#receipt(id), "utf8")); }
+    try { receipt = this.#readSpoolJson(this.#receipt(id)); }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
     if (abandoned.id === id && typeof abandoned.publication === "string" && receipt?.publication === abandoned.publication) {
       writeJsonAtomic(this.#receipt(id), { id, unread: true }, { durable: true });
@@ -189,7 +425,7 @@ export class ActorChildCompletionStore {
   mailboxClaimed(id: string): boolean {
     return this.#withClaim(() => {
       if (!this.received(id)) return false;
-      const receipt = JSON.parse(fs.readFileSync(this.#receipt(id), "utf8"));
+      const receipt = this.#readSpoolJson(this.#receipt(id));
       // Legacy standalone receipts also gated persisted mailbox records.
       return receipt.kind === "mailbox" || (!receipt.kind && !receipt.batchId && !receipt.publication);
     });
@@ -218,7 +454,7 @@ export class ActorChildCompletionStore {
 
   handoffConsumed(id: string): boolean {
     if (!ID.test(id)) return false;
-    try { return JSON.parse(fs.readFileSync(path.join(this.directory, `${id}.consumed`), "utf8")).id === id; }
+    try { return this.#readSpoolJson(path.join(this.directory, `${id}.consumed`)).id === id; }
     catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
       throw error;
@@ -260,10 +496,10 @@ export class ActorChildCompletionStore {
   /** An owner/restart retries sources even when the original activation has exited. */
   recoverArchives(options: { actorId?: string; inFlightRunId?: string } = {}): void {
     let files: string[];
-    try { files = fs.readdirSync(this.directory); } catch { return; }
+    try { files = this.#scanFiles(); } catch { return; }
     for (const name of files.filter(file => file.endsWith(".source") && ID.test(file.slice(0, -7))).slice(0, 100)) {
       try {
-        const source = JSON.parse(fs.readFileSync(path.join(this.directory, name), "utf8"));
+        const source = this.#readSpoolJson(path.join(this.directory, name));
         if (source.id !== name.slice(0, -7) || typeof source.directory !== "string" || path.basename(source.directory) !== source.id || !ownedStat(source.directory)?.isDirectory()) continue;
         const pending = path.join(source.directory, ARCHIVE_PENDING_FILE);
         if (!fs.existsSync(pending)) { fs.rmSync(path.join(this.directory, name), { force: true }); continue; }
@@ -280,15 +516,53 @@ export class ActorChildCompletionStore {
     }
   }
 
+  /** Unsettled child custody is a pending reply, even before a result envelope exists. */
+  hasPendingReply(): boolean {
+    try {
+      return this.#scanFiles().some(file => {
+        if (file.endsWith(".source") || file.endsWith(".abandon")) return true;
+        return /^[a-f0-9]{32}\.json$/.test(file) && !this.received(file.slice(0, -5));
+      });
+    } catch (error) {
+      return (error as NodeJS.ErrnoException).code !== "ENOENT"; // unknown custody cannot authorize sleep
+    }
+  }
+
   pending(options: { actorId?: string; inFlightRunId?: string } = {}): ActorChildCompletion[] {
+    // Most resident polls find an empty spool. Readdir is the observation; do not take the
+    // claim lock until an envelope, cancellation intent, or recoverable archive source exists.
+    // The owner arms ActorChildCompletionWatch before this preflight; a later writer wakes
+    // the existing actor settlement/mesh path, so an empty scan never waits on a slow cadence.
+    if (!this.#hasPendingWork(options)) return [];
     this.recoverArchives(options);
+    if (!this.#hasPendingWork(options)) return [];
     try { return this.#withClaim(() => this.#pending(options)); }
     catch { return []; } // Busy/unreadable claims retry on the next owner poll.
   }
 
+  #hasPendingWork(options: { actorId?: string; inFlightRunId?: string }): boolean {
+    let files: string[];
+    try { files = this.#scanFiles(); } catch (error) {
+      return (error as NodeJS.ErrnoException).code !== "ENOENT";
+    }
+    return files.some(file => {
+      if (!WAKE_FILE.test(file)) return false;
+      try {
+        const value = this.#readSpoolJson(path.join(this.directory, file)) as ActorChildCompletion;
+        if (!file.endsWith(".json") || (!options.actorId && !options.inFlightRunId)) return true;
+        return value.format === 1 && value.spawner?.kind === "actor" &&
+          (!options.actorId || value.spawner.id === options.actorId) &&
+          (!options.inFlightRunId || value.spawner.runId !== options.inFlightRunId);
+      } catch (error) {
+        // Unsafe entries remain on disk/custody-visible, but never enter the claim/read path.
+        return !(error instanceof UnsafeCompletionEntry);
+      }
+    });
+  }
+
   #pending(options: { actorId?: string; inFlightRunId?: string }): ActorChildCompletion[] {
     let files: string[];
-    try { files = fs.readdirSync(this.directory); } catch { return []; }
+    try { files = this.#scanFiles(); } catch { return []; }
     // Intent is independent of archival: neither an envelope nor even a result
     // file need exist when a foreground publication is cancelled. Reconcile these
     // under the claim lock on restart, including muted outcomes with no envelope.
@@ -307,12 +581,12 @@ export class ActorChildCompletionStore {
         this.#rollbackAbandoned(id);
         if (this.received(id)) {
           // An unpublished foreground fence can still be abandoned. Retain its envelope.
-          if (JSON.parse(fs.readFileSync(this.#receipt(id), "utf8")).publication) continue;
+          if (this.#readSpoolJson(this.#receipt(id)).publication) continue;
           fs.rmSync(this.#file(id), { force: true });
           this.#checked.delete(id);
           continue;
         }
-        const value = JSON.parse(fs.readFileSync(this.#file(id), "utf8")) as ActorChildCompletion;
+        const value = this.#readSpoolJson(this.#file(id)) as ActorChildCompletion;
         if (value.format !== 1 || value.result?.id !== id || value.spawner?.kind !== "actor") continue;
         if (options.actorId && value.spawner.id !== options.actorId) continue;
         // Crucially this precedes the session read, not merely mailbox enqueue.
@@ -337,23 +611,33 @@ export class ActorChildCompletionStore {
 
   /** On the existing retention sweep, bound unread archives and receipt tombstones. */
   prune(retentionMs: number, now = Date.now(), keepIds: ReadonlySet<string> = new Set()): void {
-    const groups = new Map<string, { files: string[]; newest: number }>();
+    // smarty-dev#7916: each file's owned stat is taken at judgment; only that inode is removed.
+    const groups = new Map<string, { files: { file: string; stat: fs.Stats | undefined }[]; newest: number }>();
     try {
-      for (const name of fs.readdirSync(this.directory)) {
+      for (const name of this.#scanFiles()) {
         const id = STORED_FILE.exec(name)?.[1];
         if (!id || keepIds.has(id)) continue;
         const file = path.join(this.directory, name);
         const group = groups.get(id) ?? { files: [], newest: 0 };
-        group.files.push(file);
-        group.newest = Math.max(group.newest, fs.statSync(file).mtimeMs);
+        // One stat for both the age and the removal (pi-fabric#850 round 1 SEC P1): a second stat could describe a
+        // swapped-in older inode and make a fresh group look expired. Without an owned stat (a link, hard-linked or
+        // not ours) Linux removes nothing; off Linux main's age stat and removal stay (smarty-dev#7858).
+        const stat = ownedStat(file);
+        group.files.push({ file, stat });
+        group.newest = Math.max(group.newest, stat?.mtimeMs ?? (process.platform === "linux" ? Infinity : fs.statSync(file).mtimeMs));
         groups.set(id, group);
       }
     } catch { return; }
     for (const [id, group] of groups) {
       if (now - group.newest < retentionMs) continue;
       try {
-        for (const file of group.files) fs.rmSync(file, { force: true });
-        this.#checked.delete(id);
+        let all = true;
+        for (const { file, stat } of group.files) {
+          // No owned stat: refused on Linux; off Linux main's removal runs unchanged (smarty-dev#7858).
+          if (!verifiedRemove(file, stat, { deleter: "childCompletionsPrune",
+            fallback: () => { fs.rmSync(file, { force: true }); return true; } }).removed) all = false;
+        }
+        if (all) this.#checked.delete(id);
       } catch { /* Best effort, like actor run retention. */ }
     }
   }
@@ -385,7 +669,7 @@ export class ActorChildCompletionStore {
 
   #received(id: string): boolean {
     let receipt: { batchId?: string; unread?: boolean };
-    try { receipt = JSON.parse(fs.readFileSync(this.#receipt(id), "utf8")); } catch (error) {
+    try { receipt = this.#readSpoolJson(this.#receipt(id)); } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
       throw error; // Unreadable consumption evidence is not evidence of non-consumption.
     }

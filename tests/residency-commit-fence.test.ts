@@ -42,6 +42,7 @@ import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-work
 import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, type AgentSession } from "@earendil-works/pi-coding-agent";
 import { PiToolsProvider } from "../src/providers/pi-tools-provider.js";
 import { claimFabricHandoff, runFabricHandoffAtBoundary } from "../src/prewalk/handoff.js";
+import { powerShellToolDefinitionFactory } from "../src/providers/pi-bash-cwd.js";
 
 vi.mock("node:child_process", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:child_process")>();
@@ -859,7 +860,7 @@ const registeredExecution = async (state: Awaited<ReturnType<typeof harness>>, m
   } as unknown as FabricInvocationContext["extensionContext"];
   let sequence = 0;
   return async (code: string, signal?: AbortSignal) => {
-    const result = await tool.execute(`round4-${++sequence}`, { code }, signal, undefined, context!);
+    const result = await tool.execute(`round4-${++sequence}`, { code }, signal, undefined, context! as never);
     // Pi's ToolDefinition return type omits the runtime-supported isError flag.
     return result as typeof result & { isError?: boolean };
   };
@@ -878,10 +879,10 @@ describe("round 7 resident receipts at actual Pi message_end", { timeout: 30_000
     ["handled expiry", "in-place", true], ["handled expiry", "in-place", false],
     ["collected expiry", "in-place", true],
   ] as const;
-  it.each(cases)("preserves %s through %s boundary (switch=%s) in persisted and next model context", async (ending, mode, switchSucceeds) => {
+  const runCase = async (ending: (typeof cases)[number][0], mode: (typeof cases)[number][1], switchSucceeds: (typeof cases)[number][2]) => {
     const state = await harness(false, undefined, ending === "handled uncertainty" || ending === "handled expiry" ? 250 : 10_000);
     const main = mainProvider(state);
-    main.registry.register(new PiToolsProvider(state.root));
+    main.registry.register(new PiToolsProvider(state.root, undefined, undefined, { powerShellToolDefinitionFactory, allowUnhookedTools: true }));
     const config = normalizeFabricConfig({ fullCodeMode: true,
       executor: { resultFormat: "json", timeoutMs: 8_000, maxOutputChars: 1_400, memoryLimitBytes: 256 * 1024 * 1024 },
       prewalk: { compactOnReturn: false }, entropy: { compile: false } });
@@ -953,7 +954,10 @@ describe("round 7 resident receipts at actual Pi message_end", { timeout: 30_000
         await delay(900); return actor;
       });
     }
-    const args = requestArgs(state, "create");
+    // This fixture proves receipt expiry and resumed reconciliation, not host idle
+    // exit. Make its writer a real live-Main supervisor so advancing the retention
+    // wall clock cannot race unrelated cold-host shutdown before status/stop.
+    const args = { ...requestArgs(state, "create"), events: ["agent_settled"] };
     const mutation = `await pi.write({path:${JSON.stringify(path.join(state.root, "trigger.txt"))},text:"triggered"});`;
     const requests = `await agents.create(${JSON.stringify({ ...args, name: "boundary-one" })});` +
       (ending === "terminal failure" ? `await agents.create(${JSON.stringify({ ...args, name: "boundary-two" })});` : "");
@@ -1056,7 +1060,10 @@ describe("round 7 resident receipts at actual Pi message_end", { timeout: 30_000
         if (mode === "in-place" && switchSucceeds) expect(nextModelText).toBe(text);
       }
     } finally { vi.restoreAllMocks(); await session?.abort(); session?.dispose(); await main.close(); await state.close(); }
-  });
+  };
+  it.each(cases.filter(([ending]) => ending !== "collected expiry"))("preserves %s through %s boundary (switch=%s) in persisted and next model context", runCase);
+  // off Linux #1031 refuses removal (accepted gap smarty-dev#11335); pi-fabric#1079 unskips
+  it.skipIf(process.platform !== "linux").each(cases.filter(([ending]) => ending === "collected expiry"))("preserves %s through %s boundary (switch=%s) in persisted and next model context", runCase);
 });
 
 describe("expiry receipt ledger through real Main and nested clients", { timeout: 25_000 }, () => {
@@ -1083,7 +1090,7 @@ describe("expiry receipt ledger through real Main and nested clients", { timeout
     try {
       const run = await registeredExecution(state, main, 5_000);
       const executed = vi.spyOn(FabricExecutionService.prototype, "execute");
-      const result = await run(`try { await agents.create(${JSON.stringify(requestArgs(state, "create"))}); } catch {} console.log("guest-large-log" + "log;".repeat(10000)); return "guest swallowed expiry";`);
+      const result = await run(`try { await agents.create(${JSON.stringify({ ...requestArgs(state, "create"), events: ["agent_settled"] })}); } catch {} console.log("guest-large-log" + "log;".repeat(10000)); return "guest swallowed expiry";`);
       const settled = await executed.mock.results[0]!.value;
       const text = visibleText(result);
       artifactPath = /saved to: ([^\n]+)\]/.exec(text)?.[1];
@@ -1092,6 +1099,7 @@ describe("expiry receipt ledger through real Main and nested clients", { timeout
       await waitFor(() => entries(state.residencyRoot, "processing").length === 0);
       const realNow = Date.now.bind(Date);
       const clock = vi.spyOn(Date, "now").mockImplementation(() => realNow() + RESIDENT_REQUEST_RETENTION_MS + 20_000);
+      await state.participants.refresh(); // resumed Main owns a real renewed lease at this watermark
       // The 250 ms exchange budget exists to expire the create above; this follow-up status read only checks the
       // committed actor, so give it a bounded 5 s budget (a 2-core CI runner timed out at 250 ms; smarty-dev#7651).
       state.client.options.commandTimeoutMs = 5_000;
@@ -1119,7 +1127,9 @@ describe("expiry receipt ledger through real Main and nested clients", { timeout
 
 describe("host-originated expired replies use the real resident receipt ledger", { timeout: 25_000 }, () => {
   for (const caller of ["main", "nested"] as const) for (const collected of [false, true]) {
-    it(`${caller} handles an expired replay reply with ${collected ? "collected" : "retained live"} commitment facts`, async () => {
+    const test = collected ? it.skipIf(process.platform !== "linux") : it;
+    // off Linux #1031 refuses removal (accepted gap smarty-dev#11335); pi-fabric#1079 unskips
+    test(`${caller} handles an expired replay reply with ${collected ? "collected" : "retained live"} commitment facts`, async () => {
       const state = await harness(false, undefined, 10_000);
       const main = mainProvider(state, caller);
       if (caller === "nested") {
@@ -1414,7 +1424,9 @@ describe("round 6 registered fabric_exec post-completion deadlines", { timeout: 
       const state = await harness(false, undefined, 10_000); const main = mainProvider(state);
       const startedAt = Date.now(); const clock = vi.spyOn(Date, "now").mockReturnValue(startedAt);
       let crossed = false; const closed: Promise<void>[] = [];
-      const crossDeadline = () => { crossed = true; clock.mockReturnValue(startedAt + 60_000); };
+      // Cross the exact 5s runtime/Main deadline without passing unrelated host
+      // 30s dormancy while awaiting CPython reap.
+      const crossDeadline = () => { crossed = true; clock.mockReturnValue(startedAt + 5_001); };
       if (engine === "cpython") {
         const actual = await vi.importActual<typeof import("node:child_process")>("node:child_process");
         vi.mocked(childProcess.spawn).mockImplementation(((...args: Parameters<typeof actual.spawn>) => {
@@ -1459,7 +1471,7 @@ describe("round 6 registered fabric_exec post-completion deadlines", { timeout: 
         vi.restoreAllMocks(); vi.mocked(childProcess.spawn).mockReset();
         const reconcile = await registeredExecution(state, main, 5_000, engine);
         const reconciled = await reconcile(`return {"status": await agents.actorStatus(id="${decision.id}"), "stop": await agents.stop(id="${decision.id}")}`);
-        expect(reconciled.isError).not.toBe(true);
+        expect(reconciled.isError, visibleText(reconciled)).not.toBe(true);
         expect(JSON.parse(visibleText(reconciled))).toMatchObject({ status: { id: decision.id }, stop: { id: decision.id, status: "stopped" } });
         await waitFor(() => state.participants.get(decision.id)?.status === "stopped");
         expect(new ActorRegistryStore(state.config.actorRoot).records()).toHaveLength(1);
@@ -1475,7 +1487,8 @@ describe("round 6 registered fabric_exec post-completion deadlines", { timeout: 
 });
 describe("round 4 public cleanup-obligation retry cancellation", { timeout: 25_000 }, () => {
   for (const caller of ["main", "nested"] as const) for (const before of [true, false]) {
-    it(`${caller} retry cancellation ${before ? "before" : "after"} commitment preserves the accepted removal obligation`, async () => {
+    // off Linux #1031 refuses removal (accepted gap smarty-dev#11335); pi-fabric#1079 unskips
+    it.skipIf(process.platform !== "linux")(`${caller} retry cancellation ${before ? "before" : "after"} commitment preserves the accepted removal obligation`, async () => {
       const state = await harness(false, undefined, 10_000); const main = mainProvider(state, caller);
       if (caller === "nested") {
         vi.stubEnv("PI_FABRIC_MAIN_AGENT_ID", state.config.rootId);

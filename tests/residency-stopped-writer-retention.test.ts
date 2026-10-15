@@ -19,6 +19,17 @@ import { FabricControlPlane } from "../src/topology/control-plane.js";
 import type { FabricMainAgentTarget } from "../src/main-agent.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { MeshStore } from "../src/mesh/store.js";
+import { verifiedRemoveTestHooks } from "../src/storage/verified-remove.js";
+
+// On Linux the collector removes through verifiedRemove (smarty-dev#7916), not rmSync: record each verified removal
+// in the test's rmSync spy, so its "collected once" counts hold on every platform.
+// ponytail: appends to the spy's call log instead of rewriting four identical assertions.
+beforeEach(() => {
+  verifiedRemoveTestHooks.beforeOpen = (target) => {
+    const calls = (fs.rmSync as unknown as { mock?: { calls: unknown[][] } }).mock?.calls;
+    calls?.push([target]);
+  };
+});
 
 // A native session Main owns the caller binding independently of the resident executor.
 const mainParticipants = (config: ResidentHostConfig) => {
@@ -452,9 +463,16 @@ it.skipIf(process.platform === "win32").each(["closed", "replacement"] as const)
     for (const file of [run, metadata, result, handle.worktree!]) expect(fs.existsSync(file), file).toBe(false);
     expect(client.hasAgent(handle.id)).toBe(false);
     expect(committed()).toHaveLength(1);
+    if (owner === "closed") {
+      // Offline cleanup removes the backing; the closed manager must not rebuild
+      // a terminal result from the worker's former status or a cached fallback.
+      expect(() => host.agents.status(handle.id)).toThrow(/no saved terminal result/);
+    }
   } finally {
     fs.writeFileSync(release, "cleanup nested"); fs.writeFileSync(crash, "cleanup primary");
-    for (const run of host.agents?.listForUi() ?? []) await host.agents.stop(run.id);
+    for (const run of host.agents?.listForUi() ?? []) {
+      if (!host.agents.isSettled(run.id)) await host.agents.stop(run.id);
+    }
     if (fs.existsSync(observation)) {
       const child = JSON.parse(fs.readFileSync(observation, "utf8")) as { pid: number };
       await waitFor(() => !processAlive(child.pid));

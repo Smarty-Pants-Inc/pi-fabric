@@ -1,6 +1,8 @@
 import fs from "node:fs";
 import { readHostPolicy, warnAgentLandlockDisabled, type HostPolicy } from "./host-policy.js";
+export { readHostPolicy } from "./host-policy.js";
 import type { ModelRoutingConfig } from "./agents/model-route.js";
+import { parsePerCallRouting } from "./agents/per-call-config.js";
 import { normalizeAgentRouterConfig, type FabricAgentRouterConfig } from "./agents/router-config.js";
 export type { FabricAgentRouterConfig } from "./agents/router-config.js";
 import { normalizeAgentPlacement, type AgentPlacementConfig } from "./agents/placement-config.js";
@@ -13,6 +15,8 @@ export type { FabricJevConfig } from "./jev/config.js";
 import os from "node:os";
 import path from "node:path";
 import { renameAtomic } from "./core/atomic-write.js";
+import { approvalActionOverridesValue, type FabricActionApprovalMode } from "./core/approval-overrides.js";
+import { foregroundConfigValue, type FabricForegroundConfig } from "./core/foreground-tools.js";
 import { quarantineDamagedFile } from "./core/damaged-file.js";
 import { normalizeModelAliases, type FabricModelAliases } from "./core/model-resolution.js";
 import { PI_CORE_TOOL_NAME_SET } from "./core/pi-tools.js";
@@ -24,7 +28,16 @@ import {
 import type { FabricComponentEntry } from "./components/types.js";
 import type { FabricRisk } from "./protocol.js";
 import type { FabricKernel } from "./runtime/kernel.js";
-import { DEFAULT_FABRIC_THINKING, isFabricThinking, type FabricThinking } from "./thinking.js";
+import {
+  DEFAULT_FABRIC_THINKING,
+  FABRIC_THINKING_BOUNDS_ENV,
+  inheritedThinkingBounds,
+  intersectThinkingBounds,
+  isFabricThinking,
+  normalizeThinkingBounds,
+  type FabricThinking,
+  type FabricThinkingBounds,
+} from "./thinking.js";
 import { MESH_STATE_BACKEND_KIND_LIST, MESH_STATE_BACKEND_KINDS, type MeshStateBackendKind } from "./mesh/state-backend-kinds.js";
 import {
   defaultCodePreviewSettings,
@@ -40,7 +53,14 @@ export type FabricAgentTransport =
   | "screen"
   | "localterm"
   | "herdr";
-export type FabricAgentRunner = "pi" | "claude" | "veda";
+/** Built-in runner ids, or a runner registered through pi-fabric/runners. */
+export type FabricAgentRunner = "pi-durable" | "pi" | "claude" | "veda" | (string & {});
+
+/** How a child run's reported model is checked against the requested key.
+ * Strict fails the run on a mismatch. Permissive records the reported
+ * attribution instead, so virtual provider keys can resolve to a concrete
+ * backend at stream time. */
+export type FabricModelAdmission = "strict" | "permissive";
 export type FabricUiWidgetMode = "auto" | "always" | "hidden";
 type FabricToolDisplayMode = "full" | "compact";
 export type FabricIncomingMessageMode = "auto" | "collapsed" | "expanded";
@@ -60,12 +80,23 @@ type FabricActorScope = "project" | "session";
 
 export type FabricPythonRuntime = "cpython" | "monty";
 
+/** Whether pi.powershell and extension powershell overrides may run (smarty-dev#9826). */
+export type FabricPowerShellPolicy = "refuse" | "allow";
+
 interface FabricExecutorConfig {
   kernel: FabricKernel;
   pythonRuntime: FabricPythonRuntime;
   cpython: { binary: string };
+  /** Optional jev-fabric backend for durable tasks and sessions (macOS/Linux).
+   * `binary` empty or "auto" picks the user's compatible install outside the
+   * workspace, then the bundled package; an explicit path never falls back.
+   * `home` empty means JEV_FABRIC_HOME, else `<cwd>/.jev-fabric-native`, the
+   * same store other harnesses share. `timeoutMs` is the default job lifetime. */
+  jevFabric: { binary: string; home: string; timeoutMs: number };
   /** TypeScript backend only; ignored by the Python kernel. */
   runtime: FabricExecutorRuntime;
+  /** Add native tool aliases, or opt into Pi's script-level naming/result ergonomics. */
+  codemodeProfile: "additive" | "native";
   timeoutMs: number;
   /** Policy maximum for any executor deadline, including per-invocation
    * requests and per-ref floors. Values above this are visibly normalized. */
@@ -75,6 +106,10 @@ interface FabricExecutorConfig {
   /** Exact-ref deadline floors (ms) for known long-running host calls, e.g.
    * "extensions.subagent". Keys are exact refs; no wildcard matching. */
   hostCallTimeouts: Record<string, number>;
+  /** Exact host-call refs that wait for a person, e.g. "extensions.ask".
+   * While such a call is in flight the program deadline is paused, so a
+   * foreground question can wait indefinitely. Cancellation still applies. */
+  humanWaitRefs: string[];
   /** Wait budget for nested pi.bash / pi.powershell (default 2m, max 10m).
    * 0 disables auto-spill. After this, the await settles successfully with a
    * live output path while the process keeps running. `background: true`
@@ -82,6 +117,11 @@ interface FabricExecutorConfig {
   shellHangMs: number;
   /** Linux filesystem confinement for local pi.bash; no audit-only kernel mode. */
   landlock: LandlockSettings;
+  /** pi.powershell and every captured or extension powershell override are
+   * refused unless the host profile sets "allow" (smarty-dev#9826). No guard
+   * judges PowerShell grammar, so "allow" accepts that gap. Host-only: the
+   * project layer cannot opt in. */
+  powershell: FabricPowerShellPolicy;
   memoryLimitBytes: number;
   maxOutputChars: number;
   maxNestedResultChars: number;
@@ -95,6 +135,12 @@ export interface FabricApprovalConfig {
   network: FabricApprovalMode;
   agent: FabricApprovalMode;
   model?: string;
+  /** Exact `provider.action` or `provider.*` → allow | ask | deny; exact beats wildcard beats risk mode. */
+  actions?: Record<string, FabricActionApprovalMode>;
+  /** No-UI approvals: "deny" (absent, fail closed) or "decision" (await a durable user decision). */
+  headless?: "deny" | "decision";
+  /** Headless approval decision deadline; absent means 5 minutes. */
+  headlessTimeoutMs?: number;
 }
 
 /** Session-start background revalidation scope for the MCP descriptor cache:
@@ -120,8 +166,19 @@ export interface FabricMcpJevConfig {
   semanticMinProbability: number;
 }
 
+const nativeMcpServersValue = (value: unknown): string[] => {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.length > 256 || value.some(name =>
+    typeof name !== "string" || !/^[A-Za-z0-9_-]+$/.test(name.trim()))) {
+    throw new Error("mcp.nativeServers must be an array of at most 256 exact Pi MCP server names (letters, digits, _ and -)");
+  }
+  return [...new Set(value.map((name: string) => name.trim()))];
+};
+
 export interface FabricMcpConfig {
   enabled: boolean;
+  /** Opt-in exact server names owned by Pi, never mcporter fallback targets. */
+  nativeServers?: string[];
   configPath?: string;
   disableOAuth: boolean;
   allowDynamicServers: boolean;
@@ -183,6 +240,9 @@ export interface FabricAgentConfig {
   transport: FabricAgentTransport;
   /** Root-policy Linux user scope slice; agent-dir values cannot relax this. */
   processSlice?: string;
+  /** Root-policy memory.max (bytes) for capped process task cgroups, with swap 0
+   * (smarty-dev#8257). Default 24 GiB; agent-dir/workspace values cannot relax it. */
+  processMemoryMaxBytes?: number;
   /** Host-only opt-in process task placement; workspace files cannot override it. */
   placement?: AgentPlacementConfig;
   /** User/workspace Pi default; package defaults intentionally leave this unset. */
@@ -219,6 +279,16 @@ export interface FabricAgentConfig {
   wakeText?: FabricWakeTextConfig;
   /** Host-only: skip durable-actor activations whose owning root is dead (smarty-dev#6062). */
   deadRootFilter: FabricDeadRootFilterConfig;
+  /** Host-only: tell the root's Main once an activation stays in preparing this long (smarty-dev#6337). */
+  stuckPreparingMs: number;
+  /** Admission policy for the model a child process actually reports. */
+  modelAdmission: FabricModelAdmission;
+  /** Shell command run in each new agent worktree before the child starts. */
+  worktree?: { setup?: string };
+  /** Child UI dialogs: "cancel" (absent) or "route" to the parent UI or a decision. */
+  childQuestions?: "cancel" | "route";
+  /** Routed child question deadline; absent means 10 minutes. */
+  childQuestionTimeoutMs?: number;
 }
 
 export type FabricDeadRootFilterMode = "off" | "on";
@@ -312,11 +382,22 @@ interface FabricUiConfig {
   updateDebounceMs: number;
 }
 
+export interface FabricCompactionPressureBands {
+  warn: number;
+  urgent: number;
+}
+
 interface FabricCompactionConfig {
   engine: FabricCompactionEngine;
   targetContextRatio: number;
   thresholds: Record<string, number>;
   tokenThresholds: Record<string, number>;
+  /** Occupancy fractions reported by `compact.pressure()`; 0 < warn < urgent < 1. */
+  pressureBands: FabricCompactionPressureBands;
+  /** Compact at a settled boundary when window headroom drops below this; 0 disables. */
+  outputReserveTokens: number;
+  /** Drop orphaned tool results and fill missing ones in outgoing context. */
+  repairOrphans: boolean;
 }
 
 export const MIN_COMPACTION_TOKEN_THRESHOLD = 1_000;
@@ -353,14 +434,25 @@ export interface FabricRetentionConfig {
 export interface FabricActorsConfig {
   /** Reset an actor's Pi session at a run boundary once its file exceeds this many bytes; 0 disables. */
   maxSessionBytes: number;
+  /** How long a transient activation block (provider stream error, timeout, preparation or lock
+   * timeout) gates routing before the actor gets a probe run (default 10 min; smarty-dev#6509). */
+  transientBlockCooldownMs?: number;
+  /** Cap of the doubling backoff after failed probes (default 60 min). */
+  transientBlockMaxMs?: number;
 }
 
-export type MeshLockProtocol = 1 | 2;
+/**
+ * 1: the B68 wire; 2: a complete owner published by rename, with the holder's process incarnation; 3: protocol 2 plus
+ * the holder's PID namespace on its own line (smarty-dev#9569), so a reclaimer uses pid evidence only in its own
+ * namespace, and processes from before protocol 3 cannot parse (so never reclaim) its records. Switch a root to 3 once
+ * its writers run a release that knows it.
+ */
+export type MeshLockProtocol = 1 | 2 | 3;
 
 const meshLockProtocol = (value: unknown): MeshLockProtocol => {
   if (value === undefined) return 1;
-  if (value === 1 || value === 2) return value;
-  throw new Error("mesh.lockProtocol must be 1 or 2");
+  if (value === 1 || value === 2 || value === 3) return value;
+  throw new Error("mesh.lockProtocol must be 1, 2 or 3");
 };
 
 /** Keyed mesh state backend (smarty-dev#6477 L2a): see src/mesh/state-backend.ts. */
@@ -389,6 +481,20 @@ const meshControlIncarnationFence = (value: unknown): MeshControlIncarnationFenc
   throw new Error("mesh.controlIncarnationFence must be warn or enforce");
 };
 
+/** JetStream stream num_replicas for the NATS state backend; an explicit invalid value is refused, never defaulted. */
+const meshNatsReplicas = (value: unknown): number => {
+  if (value === undefined) return 1;
+  if (typeof value === "number" && Number.isSafeInteger(value) && value >= 1) return value;
+  throw new Error("mesh.nats.replicas must be a positive integer");
+};
+
+export interface FabricMeshNatsConfig {
+  /** Stream num_replicas on create; an existing stream with a different count is refused (default 1). */
+  replicas: number;
+}
+
+export const RESIDENT_IDLE_EXIT_MS = 10 * 60_000;
+
 export interface FabricMeshConfig {
   /** Host-only; warn admits legacy senders, enforce requires a captured destination epoch. */
   controlIncarnationFence: MeshControlIncarnationFence;
@@ -396,6 +502,8 @@ export interface FabricMeshConfig {
   lockProtocol: MeshLockProtocol;
   /** Keyed-state backend: "file" (default), "shadow", "sqlite" or "nats" (refused until built); env PI_FABRIC_MESH_STATE_BACKEND overrides. */
   stateBackend: MeshStateBackend;
+  /** NATS state-backend settings; only read when stateBackend is "nats". */
+  nats: FabricMeshNatsConfig;
   enabled: boolean;
   root?: string;
   /** Publish the Main participant at session start instead of on first Fabric use. */
@@ -404,6 +512,8 @@ export interface FabricMeshConfig {
   maxEventBytes: number;
   maxReadEvents: number;
   actorPollMs: number;
+  /** Exit a dead-root resident after this long with no actors or requests; 0 disables. */
+  residentIdleExitMs: number;
   /** Explicit background observational age; 1 s runtime floor, never ordinary authority reads. */
   idleReadCoalesceMs: number;
   /** Admission window for commands routed over a mesh bridge, minimum 30 s. */
@@ -431,7 +541,41 @@ interface FabricEntropyConfig {
   compile: boolean;
 }
 
+interface FabricTraceConfig {
+  /** Persist the opt-in FabricAssessmentTraceV1 (timings, usage) beside the execution trace. */
+  assessment: boolean;
+}
+
+/** One configured portable memory source (see docs/memory-recall.md). */
+export interface FabricMemorySourceConfig {
+  /** Registry id used as `args.source` in source-qualified memory calls. */
+  id: string;
+  /** Adapter kind; `"fs"` walks a local directory of session JSONL files. */
+  kind: "fs";
+  /** Absolute directory the `fs` adapter enumerates recursively. */
+  root: string;
+}
+
+export interface FabricExtractiveConfig {
+  enabled: boolean;
+  provider: string;
+  model: string;
+  maxViewBytes: number;
+  maxCandidates: number;
+  maxSourceChars: number;
+  /** Zero selects deterministic-only operation. V1 issues at most one batch. */
+  maxEvaluationsPerTurn: number;
+  timeoutMs: number;
+}
+
+export const DEFAULT_EXTRACTIVE_CONFIG: FabricExtractiveConfig = {
+  enabled: false, provider: "typesafe", model: "jev-latest",
+  maxViewBytes: 8192, maxCandidates: 128, maxSourceChars: 24000,
+  maxEvaluationsPerTurn: 1, timeoutMs: 3000,
+};
+
 export interface FabricMemoryConfig {
+  extractive?: FabricExtractiveConfig;
   enabled: boolean;
   indexDir?: string;
   maxSessions: number;
@@ -449,6 +593,8 @@ export interface FabricMemoryConfig {
   regexMaxHaystackTerms?: number;
   regexMaxHaystackBytes?: number;
   regexTimeoutMs?: number;
+  /** Configured portable sources; present enables source-qualified calls. */
+  sources?: FabricMemorySourceConfig[];
 }
 
 export interface FabricSpeculationConfig {
@@ -477,6 +623,11 @@ export interface FabricModelsConfig {
   aliases: FabricModelAliases;
 }
 
+export interface FabricThinkingConfig {
+  /** Inclusive host/child thinking bounds; empty means the model's levels. */
+  bounds: FabricThinkingBounds;
+}
+
 export interface FabricConfig {
   fullCodeMode: boolean;
   /** A Main reloads itself onto a newer active Fabric release at a safe run end (smarty-dev#2160). */
@@ -491,6 +642,8 @@ export interface FabricConfig {
   models: FabricModelsConfig;
   components: FabricComponentEntry[];
   capture: FabricToolCaptureConfig;
+  /** Registered tools full code mode keeps declared beside fabric_exec. */
+  foreground: FabricForegroundConfig;
   ui: FabricUiConfig;
   compaction: FabricCompactionConfig;
   retention: FabricRetentionConfig;
@@ -501,8 +654,10 @@ export interface FabricConfig {
   records: FabricRecordsConfig;
   entropy: FabricEntropyConfig;
   repairs: FabricRepairsConfig;
+  trace: FabricTraceConfig;
   schema: FabricSchemaConfig;
   speculation: FabricSpeculationConfig;
+  thinking: FabricThinkingConfig;
   codePreview: CodePreviewSettings;
 }
 
@@ -532,6 +687,13 @@ export const maxExecutorMemoryLimitBytes = (
     ? Math.min(QUICKJS_MAX_MEMORY_LIMIT_BYTES, MAX_EXECUTOR_MEMORY_LIMIT_BYTES)
     : MAX_EXECUTOR_MEMORY_LIMIT_BYTES;
 
+/** Default per-task cgroup memory.max (smarty-dev#8257): 24 GiB, swap capped at 0. */
+export const DEFAULT_PROCESS_MEMORY_MAX_BYTES = 24 * 1024 ** 3;
+
+/** A positive safe integer byte count, or the 24 GiB default for absent/invalid values. */
+export const processMemoryMaxBytesValue = (value: unknown): number =>
+  typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : DEFAULT_PROCESS_MEMORY_MAX_BYTES;
+
 export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
   fullCodeMode: true,
   autoReload: true,
@@ -540,13 +702,17 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
     kernel: "typescript",
     pythonRuntime: "monty",
     cpython: { binary: "python3" },
+    jevFabric: { binary: "", home: "", timeoutMs: 3_600_000 },
     runtime: "quickjs",
+    codemodeProfile: "additive",
     timeoutMs: 120_000,
     maxTimeoutMs: 900_000,
     mainMaxTimeoutMs: 600_000,
     hostCallTimeouts: {},
+    humanWaitRefs: ["extensions.ask"],
     shellHangMs: DEFAULT_SHELL_HANG_MS,
     landlock: { mode: "off", disabled: false },
+    powershell: "refuse",
     memoryLimitBytes: 64 * 1024 * 1024,
     maxOutputChars: 50_000,
     maxNestedResultChars: 2_000_000,
@@ -561,6 +727,7 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
   },
   mcp: {
     enabled: true,
+    nativeServers: [],
     disableOAuth: true,
     allowDynamicServers: true,
     callTimeoutMs: 120_000,
@@ -585,8 +752,11 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
   },
   agents: {
     enabled: true,
+    // Fork policy (smarty-dev#5776): our route pins, release pinning, placement and residency
+    // behaviour key on the "pi" runner; upstream's pi-durable default stays opt-in here.
     runner: "pi",
     transport: "process",
+    processMemoryMaxBytes: DEFAULT_PROCESS_MEMORY_MAX_BYTES,
     deniedModels: [],
     modelPolicy: { requireReason: ["gpt-6-astra"] },
     claude: { binary: "claude" },
@@ -606,6 +776,8 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
     sessionExportDir: "",
     nice: 0,
     deadRootFilter: { mode: "off", exempt: [] },
+    stuckPreparingMs: 600_000,
+    modelAdmission: "strict",
   },
   jev: { ...DEFAULT_JEV_CONFIG, credentialCommand: [] },
   records: structuredClone(DEFAULT_RECORDS_CONFIG),
@@ -647,6 +819,9 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
     targetContextRatio: 0.65,
     thresholds: {},
     tokenThresholds: {},
+    pressureBands: { warn: 0.6, urgent: 0.8 },
+    outputReserveTokens: 0,
+    repairOrphans: true,
   },
   retention: {
     orphanedTempRunMs: 6 * 60 * 60 * 1_000,
@@ -659,17 +834,21 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
   },
   actors: {
     maxSessionBytes: 20 * 1024 * 1024,
+    transientBlockCooldownMs: 10 * 60_000,
+    transientBlockMaxMs: 60 * 60_000,
   },
   mesh: {
     controlIncarnationFence: "warn",
     lockProtocol: 1,
     stateBackend: "file",
+    nats: { replicas: 1 },
     enabled: true,
     announce: false,
     actorScope: "project",
     maxEventBytes: 256 * 1024,
     maxReadEvents: 500,
     actorPollMs: 250,
+    residentIdleExitMs: RESIDENT_IDLE_EXIT_MS,
     idleReadCoalesceMs: 5_000,
     bridgeControlTimeoutMs: 30_000,
     actorQueueLimit: 32,
@@ -685,6 +864,7 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
     aliases: {},
   },
   memory: {
+    extractive: { ...DEFAULT_EXTRACTIVE_CONFIG },
     enabled: true,
     maxSessions: 500,
     maxEntryChars: 2_000,
@@ -708,6 +888,9 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
   repairs: {
     enabled: true,
   },
+  trace: {
+    assessment: false,
+  },
   schema: {
     mode: "off",
     certificateTtlMs: 30_000,
@@ -723,6 +906,8 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
     entryTtlMs: 180_000,
     mcpAllowlist: [],
   },
+  thinking: { bounds: {} },
+  foreground: { tools: [], maxTools: 4 },
   codePreview: defaultCodePreviewSettings(),
 };
 
@@ -757,6 +942,41 @@ const readJsonObjectFile = (filePath: string): JsonObjectFile | undefined => {
 const readJsonObject = (filePath: string): Record<string, unknown> | undefined =>
   readJsonObjectFile(filePath)?.document;
 
+const isJsonObject = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
+
+/**
+ * smarty-dev#11373: the NATS stream replicas from the agent layer only (`<agentDir>/fabric.json` mesh.nats.replicas),
+ * validated by meshNatsReplicas (default 1). A missing file or an absent value is 1. Read-only: no project layer,
+ * host policy, migration, quarantine, warning or write. An unreadable file, malformed JSON, a non-object document or
+ * mesh/nats section, or an invalid value is refused (throws), never defaulted to a lower replica count.
+ */
+export const loadAgentNatsReplicas = (agentDir: string): number => {
+  const filePath = path.join(agentDir, "fabric.json");
+  let source: string;
+  try {
+    source = fs.readFileSync(filePath, "utf8");
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") return meshNatsReplicas(undefined);
+    throw new Error(`mesh.nats.replicas: cannot read ${filePath}`, { cause: error });
+  }
+  let document: unknown;
+  try {
+    document = JSON.parse(source);
+  } catch {
+    // Parser diagnostics can quote config contents; expose only the path, never the raw cause.
+    throw new Error(`mesh.nats.replicas: ${filePath} is not valid JSON`);
+  }
+  if (!isJsonObject(document)) throw new Error(`mesh.nats.replicas: ${filePath} must be a JSON object`);
+  const { mesh } = document;
+  if (mesh === undefined) return meshNatsReplicas(undefined);
+  if (!isJsonObject(mesh)) throw new Error("mesh must be an object");
+  const { nats } = mesh;
+  if (nats === undefined) return meshNatsReplicas(undefined);
+  if (!isJsonObject(nats)) throw new Error("mesh.nats must be an object");
+  return meshNatsReplicas(nats.replicas);
+};
+
 const mergeObjects = (
   base: Record<string, unknown>,
   override: Record<string, unknown>,
@@ -764,7 +984,11 @@ const mergeObjects = (
   const merged = { ...base };
   for (const [key, value] of Object.entries(override)) {
     const baseValue = merged[key];
-    if (
+    // Routing documents replace atomically: never splice one provider's route/options
+    // into another provider across trusted global/project layers or UI updates.
+    if (key === "decisionProfiles") {
+      merged[key] = structuredClone(value);
+    } else if (
       typeof baseValue === "object" &&
       baseValue !== null &&
       !Array.isArray(baseValue) &&
@@ -804,8 +1028,19 @@ const boundedFloat = (value: unknown, fallback: number, min: number, max: number
 const stringValue = (value: unknown): string | undefined =>
   typeof value === "string" && value.trim() ? value : undefined;
 
+// Inlined copy of RUNNER_ID_PATTERN (src/agents/runner-registry.ts) so config
+// never loads the runner registry; tests/runner-registry-graph.test.ts keeps it in sync.
+const RUNNER_ID_PATTERN = /^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$/;
+
+// A registered runner may load after config; launch fails closed if it never does.
 const runnerValue = (value: unknown, fallback: FabricAgentRunner): FabricAgentRunner =>
-  value === "pi" || value === "claude" || value === "veda" ? value : fallback;
+  typeof value === "string" && value.length <= 64 && RUNNER_ID_PATTERN.test(value) ? value : fallback;
+
+const modelAdmissionValue = (
+  value: unknown,
+  fallback: FabricModelAdmission,
+): FabricModelAdmission =>
+  value === "strict" || value === "permissive" ? value : fallback;
 
 const prewalkModeValue = (
   value: unknown,
@@ -828,6 +1063,14 @@ const transportValue = (
 
 const thinkingValue = (value: unknown, fallback: FabricThinking): FabricThinking =>
   isFabricThinking(value) ? value : fallback;
+
+const humanWaitRefsValue = (value: unknown): string[] =>
+  Array.isArray(value)
+    ? [...new Set(value
+        .filter((ref): ref is string => typeof ref === "string")
+        .map((ref) => ref.trim())
+        .filter((ref) => ref.length > 0 && ref.length <= 512))].slice(0, 256)
+    : [...DEFAULT_FABRIC_CONFIG.executor.humanWaitRefs];
 
 const objectValue = (value: unknown): Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value)
@@ -865,6 +1108,26 @@ const compactionEngineValue = (
 ): FabricCompactionEngine =>
   value === "pi" || value === "fabric" ? value : fallback;
 
+// Bands are validated as a pair: any non-finite value or an ordering other
+// than 0 < warn < urgent < 1 falls back to the defaults as a whole.
+const compactionPressureBandsValue = (
+  value: unknown,
+  fallback: FabricCompactionPressureBands,
+): FabricCompactionPressureBands => {
+  const bands = objectValue(value);
+  const warn = bands.warn === undefined ? fallback.warn : bands.warn;
+  const urgent = bands.urgent === undefined ? fallback.urgent : bands.urgent;
+  return typeof warn === "number"
+    && typeof urgent === "number"
+    && Number.isFinite(warn)
+    && Number.isFinite(urgent)
+    && warn > 0
+    && warn < urgent
+    && urgent < 1
+    ? { warn, urgent }
+    : { ...fallback };
+};
+
 const actorScopeValue = (value: unknown, fallback: FabricActorScope): FabricActorScope =>
   value === "project" || value === "session" ? value : fallback;
 
@@ -886,6 +1149,46 @@ const riskValue = (value: unknown, fallback: FabricRisk): FabricRisk =>
     ? value
     : fallback;
 
+const MEMORY_SOURCE_ID_PATTERN = /^[a-z0-9][a-z0-9_.-]{0,127}$/;
+
+/**
+ * Parse `memory.sources`. A wrong-typed value stays absent like every other
+ * memory key, but a present array with malformed entries is a hard config
+ * error: a silently dropped source would surface only as a confusing
+ * `source_not_found` at call time. The id charset is the portable registry's
+ * SOURCE_ID_PATTERN restricted to lowercase.
+ */
+const memorySourcesValue = (value: unknown): FabricMemorySourceConfig[] | undefined => {
+  if (!Array.isArray(value)) return undefined;
+  const sources: FabricMemorySourceConfig[] = [];
+  const seen = new Set<string>();
+  value.forEach((raw, index) => {
+    const entry = objectValue(raw);
+    const where = `memory.sources[${index}]`;
+    const id = stringValue(entry.id);
+    if (!id || !MEMORY_SOURCE_ID_PATTERN.test(id)) {
+      throw new Error(
+        `Invalid ${where}: id must be 1-128 chars of lowercase letters, digits, dot, underscore, or dash, starting with a letter or digit`,
+      );
+    }
+    if (entry.kind !== "fs") {
+      throw new Error(
+        `Invalid ${where}: unknown kind ${JSON.stringify(entry.kind ?? null)}; expected "fs"`,
+      );
+    }
+    const root = stringValue(entry.root);
+    if (!root || !path.isAbsolute(root)) {
+      throw new Error(`Invalid ${where}: root must be an absolute directory path`);
+    }
+    if (seen.has(id)) {
+      throw new Error(`Invalid ${where}: duplicate source id ${JSON.stringify(id)}`);
+    }
+    seen.add(id);
+    sources.push({ id, kind: "fs", root });
+  });
+  return sources.length > 0 ? sources : undefined;
+};
+
 export const normalizeFabricConfig = (input: Record<string, unknown>): FabricConfig => {
   const executor = objectValue(input.executor);
   const cpython = objectValue(executor.cpython);
@@ -893,6 +1196,7 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
   if (landlock.mode !== undefined && landlock.mode !== "off" && landlock.mode !== "enforce") {
     throw new Error("executor.landlock.mode must be off or enforce. Landlock has no honest warn/audit mode on kernel 6.8; use a one-lane enforce trial with root-granted, logged PI_FABRIC_LANDLOCK_ESCAPE=1 commands.");
   }
+  const jevFabric = objectValue(executor.jevFabric);
   const executorKernel = executorKernelValue(executor.kernel, DEFAULT_FABRIC_CONFIG.executor.kernel);
   const executorMaxTimeoutMs = boundedInteger(
     executor.maxTimeoutMs,
@@ -916,8 +1220,11 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
   const actors = objectValue(input.actors);
   const mesh = objectValue(input.mesh);
   const memory = objectValue(input.memory);
+  const extractive = objectValue(memory.extractive);
+  const memorySources = memorySourcesValue(memory.sources);
   const entropy = objectValue(input.entropy);
   const repairs = objectValue(input.repairs);
+  const trace = objectValue(input.trace);
   const modelsSection = objectValue(input.models);
   const schema = objectValue(input.schema);
   const schemaMode = schemaModeValue(schema.mode, DEFAULT_FABRIC_CONFIG.schema.mode);
@@ -935,6 +1242,7 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
       )
     : DEFAULT_FABRIC_CONFIG.agents.defaultTools;
   const approvalModel = normalizeJevApprovalModel(stringValue(approvals.model));
+  const approvalActions = approvalActionOverridesValue(approvals.actions);
   const configPath = stringValue(mcp.configPath);
   const meshRoot = stringValue(mesh.root);
   const memoryIndexDir = stringValue(memory.indexDir);
@@ -1038,7 +1346,13 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
       cpython: {
         binary: stringValue(cpython.binary)?.trim() ?? DEFAULT_FABRIC_CONFIG.executor.cpython.binary,
       },
+      jevFabric: {
+        binary: stringValue(jevFabric.binary)?.trim() ?? DEFAULT_FABRIC_CONFIG.executor.jevFabric.binary,
+        home: stringValue(jevFabric.home)?.trim() ?? "",
+        timeoutMs: boundedInteger(jevFabric.timeoutMs, DEFAULT_FABRIC_CONFIG.executor.jevFabric.timeoutMs, 1_000, MAX_EXECUTOR_TIMEOUT_MS),
+      },
       runtime: executorRuntime,
+      codemodeProfile: executor.codemodeProfile === "native" ? "native" : "additive",
       maxTimeoutMs: boundedInteger(
         executor.maxTimeoutMs,
         DEFAULT_FABRIC_CONFIG.executor.maxTimeoutMs,
@@ -1062,6 +1376,7 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
           )
           .map(([ref, value]) => [ref, boundedInteger(value, 1_000, 1_000, executorMaxTimeoutMs)]),
       ),
+      humanWaitRefs: humanWaitRefsValue(executor.humanWaitRefs),
       timeoutMs: boundedInteger(
         executor.timeoutMs,
         DEFAULT_FABRIC_CONFIG.executor.timeoutMs,
@@ -1079,6 +1394,8 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
         disabled: landlock.disabled === true,
         ...(landlock.allowEscape === true ? { allowEscape: true } : {}),
       },
+      // Fail closed: anything but the exact opt-in refuses PowerShell (smarty-dev#9826).
+      powershell: executor.powershell === "allow" ? "allow" : "refuse",
       memoryLimitBytes: boundedInteger(
         executor.memoryLimitBytes,
         DEFAULT_FABRIC_CONFIG.executor.memoryLimitBytes,
@@ -1109,9 +1426,15 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
       network: approvalMode(approvals.network, DEFAULT_FABRIC_CONFIG.approvals.network),
       agent: approvalMode(approvals.agent, DEFAULT_FABRIC_CONFIG.approvals.agent),
       ...(approvalModel ? { model: approvalModel } : {}),
+      ...(approvalActions ? { actions: approvalActions } : {}),
+      ...(approvals.headless === "decision" ? { headless: "decision" as const } : {}),
+      ...(approvals.headlessTimeoutMs === undefined ? {} : {
+        headlessTimeoutMs: boundedInteger(approvals.headlessTimeoutMs, 300_000, 1_000, 86_400_000),
+      }),
     },
     mcp: {
       enabled: booleanValue(mcp.enabled, DEFAULT_FABRIC_CONFIG.mcp.enabled),
+      nativeServers: nativeMcpServersValue(mcp.nativeServers),
       ...(configPath ? { configPath } : {}),
       disableOAuth: booleanValue(mcp.disableOAuth, DEFAULT_FABRIC_CONFIG.mcp.disableOAuth),
       allowDynamicServers: booleanValue(
@@ -1194,6 +1517,7 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
       transport: transportValue(agents.transport, DEFAULT_FABRIC_CONFIG.agents.transport),
       ...(typeof agents.processSlice === "string" && /^[a-zA-Z0-9_.-]+\.slice$/.test(agents.processSlice)
         ? { processSlice: agents.processSlice } : {}),
+      processMemoryMaxBytes: processMemoryMaxBytesValue(agents.processMemoryMaxBytes),
       ...(placement ? { placement } : {}),
       ...(router ? { router } : {}),
       ...(agentModel ? { model: agentModel } : {}),
@@ -1218,6 +1542,7 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
                 }
                 return { ...routing.revertReset as Record<string, string> };
               })(),
+              ...(routing.perCall !== undefined ? { perCall: parsePerCallRouting(routing.perCall) } : {}),
               ...(typeof routing.pinModel === "string" ? { pinModel: routing.pinModel } : {}),
               ...(isFabricThinking(routing.pinThinking) ? { pinThinking: routing.pinThinking } : {}),
               shadowCandidates: Array.isArray(routing.shadowCandidates)
@@ -1312,8 +1637,20 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
           : DEFAULT_FABRIC_CONFIG.agents.sessionExportDir,
       nice: boundedInteger(agents.nice, DEFAULT_FABRIC_CONFIG.agents.nice, 0, 19),
       deadRootFilter: normalizeDeadRootFilterConfig(agents.deadRootFilter),
+      stuckPreparingMs: boundedInteger(agents.stuckPreparingMs, DEFAULT_FABRIC_CONFIG.agents.stuckPreparingMs, 1_000, 7 * 24 * 60 * 60_000),
       ...(stringValue(agents.instructionsRoot)?.trim() ? { instructionsRoot: stringValue(agents.instructionsRoot)!.trim() } : {}),
       ...(wakeText ? { wakeText } : {}),
+      modelAdmission: modelAdmissionValue(
+        agents.modelAdmission,
+        DEFAULT_FABRIC_CONFIG.agents.modelAdmission,
+      ),
+      ...(stringValue(objectValue(agents.worktree).setup)
+        ? { worktree: { setup: String(objectValue(agents.worktree).setup).trim() } }
+        : {}),
+      ...(agents.childQuestions === "route" ? { childQuestions: "route" as const } : {}),
+      ...(agents.childQuestionTimeoutMs === undefined ? {} : {
+        childQuestionTimeoutMs: boundedInteger(agents.childQuestionTimeoutMs, 600_000, 1_000, 86_400_000),
+      }),
     },
     jev: normalizeJevConfig(input.jev),
     records: normalizeRecordsConfig(input.records),
@@ -1372,6 +1709,20 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
       ),
       thresholds: compactionThresholds,
       tokenThresholds: compactionTokenThresholds,
+      pressureBands: compactionPressureBandsValue(
+        compaction.pressureBands,
+        DEFAULT_FABRIC_CONFIG.compaction.pressureBands,
+      ),
+      outputReserveTokens: boundedInteger(
+        compaction.outputReserveTokens,
+        DEFAULT_FABRIC_CONFIG.compaction.outputReserveTokens,
+        0,
+        MAX_COMPACTION_TOKEN_THRESHOLD,
+      ),
+      repairOrphans: booleanValue(
+        compaction.repairOrphans,
+        DEFAULT_FABRIC_CONFIG.compaction.repairOrphans,
+      ),
     },
     retention: {
       legacyRunArchiveEnabled: booleanValue(retention.legacyRunArchiveEnabled, DEFAULT_FABRIC_CONFIG.retention.legacyRunArchiveEnabled ?? true),
@@ -1416,11 +1767,24 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
         0,
         Number.MAX_SAFE_INTEGER,
       ),
+      transientBlockCooldownMs: boundedInteger(
+        actors.transientBlockCooldownMs,
+        DEFAULT_FABRIC_CONFIG.actors.transientBlockCooldownMs!,
+        1_000,
+        24 * 60 * 60_000,
+      ),
+      transientBlockMaxMs: boundedInteger(
+        actors.transientBlockMaxMs,
+        DEFAULT_FABRIC_CONFIG.actors.transientBlockMaxMs!,
+        1_000,
+        7 * 24 * 60 * 60_000,
+      ),
     },
     mesh: {
       controlIncarnationFence: meshControlIncarnationFence(mesh.controlIncarnationFence),
       lockProtocol: meshLockProtocol(mesh.lockProtocol),
       stateBackend: meshStateBackend(mesh.stateBackend),
+      nats: { replicas: meshNatsReplicas(objectValue(mesh.nats).replicas) },
       enabled: booleanValue(mesh.enabled, DEFAULT_FABRIC_CONFIG.mesh.enabled),
       ...(meshRoot ? { root: meshRoot } : {}),
       announce: booleanValue(mesh.announce, DEFAULT_FABRIC_CONFIG.mesh.announce),
@@ -1442,6 +1806,9 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
         DEFAULT_FABRIC_CONFIG.mesh.actorPollMs,
         50,
         10_000,
+      ),
+      residentIdleExitMs: boundedInteger(
+        mesh.residentIdleExitMs, DEFAULT_FABRIC_CONFIG.mesh.residentIdleExitMs, 0, 7 * 24 * 60 * 60_000,
       ),
       idleReadCoalesceMs: boundedInteger(
         mesh.idleReadCoalesceMs,
@@ -1493,8 +1860,19 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
       aliases: normalizeModelAliases(modelsSection.aliases),
     },
     memory: {
+      extractive: {
+        enabled: booleanValue(extractive.enabled, false),
+        provider: stringValue(extractive.provider) || DEFAULT_EXTRACTIVE_CONFIG.provider,
+        model: stringValue(extractive.model) || DEFAULT_EXTRACTIVE_CONFIG.model,
+        maxViewBytes: boundedInteger(extractive.maxViewBytes, 8192, 1024, 32768),
+        maxCandidates: boundedInteger(extractive.maxCandidates, 128, 1, 256),
+        maxSourceChars: boundedInteger(extractive.maxSourceChars, 24000, 256, 100000),
+        maxEvaluationsPerTurn: boundedInteger(extractive.maxEvaluationsPerTurn, 1, 0, 1),
+        timeoutMs: boundedInteger(extractive.timeoutMs, 3000, 100, 10000),
+      },
       enabled: booleanValue(memory.enabled, DEFAULT_FABRIC_CONFIG.memory.enabled),
       ...(memoryIndexDir ? { indexDir: memoryIndexDir } : {}),
+      ...(memorySources ? { sources: memorySources } : {}),
       maxSessions: boundedInteger(
         memory.maxSessions,
         DEFAULT_FABRIC_CONFIG.memory.maxSessions,
@@ -1588,6 +1966,9 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
     repairs: {
       enabled: booleanValue(repairs.enabled, DEFAULT_FABRIC_CONFIG.repairs.enabled),
     },
+    trace: {
+      assessment: booleanValue(trace.assessment, DEFAULT_FABRIC_CONFIG.trace.assessment),
+    },
     schema: {
       mode: schemaMode,
       certificateTtlMs: boundedInteger(
@@ -1650,6 +2031,12 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
         ),
       ].slice(0, 256),
     },
+    thinking: {
+      // Bounds are a ceiling policy: malformed values fail closed.
+      bounds: normalizeThinkingBounds(objectValue(input.thinking).bounds, "thinking.bounds"),
+    },
+    // Malformed entries fail config loading; semantic refusals report at runtime.
+    foreground: foregroundConfigValue(input.foreground),
     codePreview: normalizeCodePreviewSettings(input.codePreview),
   };
 };
@@ -1789,6 +2176,7 @@ const resolveFabricConfig = (
     merged = mergeObjects(merged, {
       agents: {
         ...(Object.hasOwn(agents, "processSlice") ? { processSlice: agents.processSlice } : {}),
+        ...(Object.hasOwn(agents, "processMemoryMaxBytes") ? { processMemoryMaxBytes: agents.processMemoryMaxBytes } : {}),
         ...(Array.isArray(agents.deniedModels) ? { deniedModels: agents.deniedModels } : {}),
         ...(Array.isArray(requireReason) ? { modelPolicy: { requireReason } } : {}),
       },
@@ -1819,6 +2207,7 @@ const resolveFabricConfig = (
       document.executor = executor;
       const agents = { ...objectValue(document.agents) };
       delete agents.processSlice;
+      delete agents.processMemoryMaxBytes; // Root-policy-only, like processSlice.
       const inheritedAgents = objectValue(merged.agents);
       // Agent-writable lists can add restrictions, never remove a root/default gate.
       const union = (base: unknown, extra: unknown): unknown[] => [
@@ -1841,8 +2230,10 @@ const resolveFabricConfig = (
       delete agents.instructionsRoot;
       delete agents.wakeText;
       delete agents.processSlice;
+      delete agents.processMemoryMaxBytes;
       delete agents.placement;
       delete agents.deadRootFilter; // Host-only: a lane cannot drop the fleet's exemptions.
+      delete agents.stuckPreparingMs; // Host-only: a lane cannot silence the stuck-preparing owner notice.
       document.agents = agents;
       const mesh = { ...objectValue(document.mesh) };
       delete mesh.controlIncarnationFence; // Host-only: a workspace cannot weaken the fence.
@@ -1853,7 +2244,15 @@ const resolveFabricConfig = (
       delete landlock.allowEscape; // Only root policy can grant a per-command escape.
       if (landlock.mode !== "enforce") delete landlock.mode;
       executor.landlock = landlock;
+      // Host-only: a workspace cannot opt into unguarded PowerShell (smarty-dev#9826).
+      delete executor.powershell;
       document.executor = executor;
+      if (Object.hasOwn(document, "jev")) {
+        // Host-only: a lane cannot redirect Jev questions to another socket.
+        const jev = { ...objectValue(document.jev) };
+        delete jev.gatewaySocket;
+        document.jev = jev;
+      }
     }
     merged = mergeObjects(merged, document);
   }
@@ -1879,7 +2278,15 @@ const resolveFabricConfig = (
   ) {
     merged.fullCodeMode = inheritedFullCodeMode === "true";
   }
-  return normalizeFabricConfig(merged);
+  const normalized = normalizeFabricConfig(merged);
+  if (applyEnvironmentOverrides && process.env[FABRIC_THINKING_BOUNDS_ENV] !== undefined) {
+    // A child only narrows its own bounds by the parent's; never widens them.
+    const inherited = inheritedThinkingBounds();
+    if (inherited) {
+      normalized.thinking.bounds = intersectThinkingBounds(inherited, normalized.thinking.bounds);
+    }
+  }
+  return normalized;
 };
 
 export const loadFabricConfigForScope = (
@@ -1954,6 +2361,11 @@ export const saveFabricConfig = (
   const input = readJsonObjectFile(targetPath);
   const existing = migrateFabricConfigDocument(input?.document ?? {}).document;
   const merged = mergeObjects(existing, partial) as Record<string, unknown>;
+  // Reject invalid ownership before the settings UI replaces a working file.
+  // Do not normalize the whole document: saved layers must remain sparse.
+  nativeMcpServersValue(objectValue(merged.mcp).nativeServers);
+  approvalActionOverridesValue(objectValue(merged.approvals).actions);
+  foregroundConfigValue(merged.foreground);
   // Never stamp down: preserve version markers written by newer builds.
   merged.configVersion = Math.max(
     typeof merged.configVersion === "number" ? merged.configVersion : 0,

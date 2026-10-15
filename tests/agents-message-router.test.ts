@@ -15,7 +15,7 @@ import principalDelivery from "../src/worker/principal-delivery.js";
 import { AgentManager } from "../src/agents/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { AgentMessageRouter } from "../src/providers/agents-message-router.js";
-import { FabricControlPlane } from "../src/topology/control-plane.js";
+import { CONTROL_STALE_INCARNATION, FabricControlPlane, FabricControlStaleIncarnationError } from "../src/topology/control-plane.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import type { FabricParticipantInfo } from "../src/topology/types.js";
 
@@ -114,6 +114,35 @@ const mainLeaseFixture = async (files: boolean) => {
   };
   return { root, meshRoot, mesh, directory, target, sessionId, participantKey, key, plane, presence, publishPresence };
 };
+
+describe("dormant wake resend boundary (#774)", () => {
+  it("never resends a live actor's stale-incarnation refusal: only a retained dormant route takes the one wake resend", async () => {
+    const participant = { ...remote("actor:live", "idle", "actor"), residency: "durable", rootId: "session:peer",
+      actorOwnershipToken: "lineage" } as FabricParticipantInfo;
+    // The live owner reloaded: its refusal is followed by a fresh advertised epoch. Unlike a
+    // dormant wake, that is a new decision for the caller (#709), never an automatic resend.
+    let advertised = participant;
+    const request = vi.fn(async () => {
+      advertised = { ...participant, ownerIncarnation: "reloaded:epoch" };
+      throw new FabricControlStaleIncarnationError(participant.id);
+    });
+    const actors = {
+      identity, validateDirectMessage: vi.fn(), owns: () => false,
+      status: vi.fn((id: string) => {
+        if (id !== participant.id) throw new Error(`Unknown Fabric actor: ${id}`);
+        return { id, status: "idle", residency: "durable", runner: "pi", rootId: "session:peer", ownershipToken: "lineage" };
+      }),
+      tell: vi.fn(), ask: vi.fn(), stop: vi.fn(), steerRemote: vi.fn(), resolveBinding: vi.fn(() => ({})), resolveActivationBinding: vi.fn(),
+    } as unknown as Ports[1];
+    const main = { id: identity.id, local: true, matches: (id: string) => id === identity.id, deliverAgent: vi.fn() } as unknown as Ports[2];
+    const participants = { get: (id: string) => id === participant.id ? advertised : undefined, scheduleRefresh: vi.fn(), lastKnown: () => undefined } as unknown as Ports[3];
+    const value = new AgentMessageRouter(unknown, actors, main, participants, { request } as unknown as Ports[4], b => b);
+    await expect(value.routeMessage(participant.id, "to a reloaded live actor", undefined, "followUp"))
+      .rejects.toMatchObject({ code: CONTROL_STALE_INCARNATION });
+    expect(request).toHaveBeenCalledTimes(1);
+    expect(value.resolveActorTarget(participant.id).participant?.ownerIncarnation).toBe("reloaded:epoch");
+  });
+});
 
 describe("sender incarnation fencing (#7514)", () => {
   it.each(["warn", "enforce"] as const)("a legacy wire sender to an advertised Main obeys %s and explicit stale epochs still fail", async mode => {
@@ -581,12 +610,13 @@ describe.each([false, true])("stale Main name safeguards (files=%s)", (files) =>
       await f.mesh.put({ key: f.key("topology/hosts/"), identity: f.target, value: { ...host, remoteHost: "peer-host" } });
     }
     expect(f.directory.list({ scope: "project", includeStale: true, fresh: true }))
-      .toEqual(expect.arrayContaining([expect.objectContaining({ id: f.target.id, stale: true })]));
+      .toEqual(expect.arrayContaining([expect.objectContaining({ id: f.target.id,
+        ...(state === "mirrored" ? { stale: false, bridgeStale: true } : { stale: true }) })]));
     const request = vi.fn();
     const send = router(unknown, [], { request }, f.directory);
     for (const kind of ["followUp", "steer"] as const) {
       await expect(send.value.routeMessage("lead-example", "must not arrive", undefined, kind))
-        .rejects.toThrow("Unknown Fabric participant: lead-example");
+        .rejects.toThrow(state === "mirrored" ? "peer lease stale; the peer may be live" : "Unknown Fabric participant: lead-example");
     }
     expect(request).not.toHaveBeenCalled();
   });

@@ -122,7 +122,7 @@ export interface ActorOwnershipObservation {
   /** False once any ownership fact of a scoped actor changed since the observation, or once
    * the clock reached the earliest lease/reload deadline that was still live when observed. */
   unchanged(): boolean;
-  /** Earliest observed live deadline of the scoped actors (Infinity when none). */
+  /** Earliest scoped deadline (strict poll reuse retains expired deadlines too); Infinity when none. */
   deadline(): number;
 }
 
@@ -141,24 +141,44 @@ export interface ActorOwnershipObservation {
  * `openState` returns a reader of shared-state entries current at the call; pass
  * `ownershipPointReads(store)` (smarty-dev#6477), never a full-state snapshot.
  */
+/** fv2-11107: opt-in strict mode for reusing a poll ownership MAP (never used by registry saves,
+ * whose semantics are unchanged without it). The selected facts above ignore renewals on purpose;
+ * a reused map must also see (a) any edit that changes whether the directory PARSES the participant
+ * or owner host record (the caller's own validators, which read every field), and (b) an owner's
+ * effective lease deadline moving EARLIER or disappearing (shortening/removal), since the observed
+ * deadline only bounds extensions. A later deadline (legitimate renewal) stays allowed. */
+export interface StrictOwnershipValidators {
+  participant(entry: MeshStateEntry): boolean;
+  host(entry: MeshStateEntry): boolean;
+}
+
 export const observeActorOwnership = (
   mesh: string | PublicationGenerationSource,
   actorIds: Iterable<string>,
   openState?: () => (key: string) => MeshStateEntry | undefined,
-  options: { now?: () => number } = {},
+  options: { now?: () => number; strict?: StrictOwnershipValidators } = {},
 ): ActorOwnershipObservation => {
   const clock = options.now ?? Date.now;
-  // pi-fabric#637: read the clock BEFORE the inputs, as get() does after them; a deadline is
-  // kept only while still live at this instant (an already-lapsed lease was not relied on).
+  const strict = options.strict;
+  const validity = (entry: MeshStateEntry | undefined, valid: ((entry: MeshStateEntry) => boolean) | undefined): string => {
+    if (!valid || !entry) return "";
+    try { return valid(entry) ? "|valid" : "|invalid"; } catch { return "|unknown"; }
+  };
+  const pFacts = (entry: MeshStateEntry | undefined): string => participantFacts(entry) + validity(entry, strict?.participant);
+  const hFacts = (entry: MeshStateEntry | undefined): string => hostFacts(entry) + validity(entry, strict?.host);
+  // pi-fabric#637: a registry save need not rely on an already-lapsed lease. Strict poll
+  // reuse must retain its real expired deadline: a renewal between observation and listing
+  // cannot turn a non-live observation into an indefinitely reusable owned map.
   const observedAt = clock();
-  const live = (deadline: number | undefined): number => deadline !== undefined && deadline >= observedAt ? deadline : Number.POSITIVE_INFINITY;
+  const live = (deadline: number | undefined): number => deadline !== undefined &&
+    (strict !== undefined || deadline >= observedAt) ? deadline : Number.POSITIVE_INFINITY;
   const meshRoot = typeof mesh === "string" ? mesh : mesh.root;
   // Stamp first, then content: a commit between them changes the stamp and is compared. The stamp
   // follows the ACTIVE backend (pi-fabric#640): SQLite commits never touch state.json, so a
   // state.json stamp would pass every shared ownership change on SQLite unseen.
   const stateStamp = sharedStateStamp(mesh);
   const state = openState?.();
-  const participants = new Map<string, { key: string; file: string; stamp: string; facts: string; shared: string; owners: string[]; roots: string[]; deadline: number }>();
+  const participants = new Map<string, { key: string; file: string; stamp: string; facts: string; shared: string; owners: string[]; roots: string[]; deadline: number; arbitrated: boolean }>();
   const hosts = new Map<string, { file: string; stamp: string; facts: string; shared: string; deadline: number }>();
   const closures = new Map<string, string>();
   const ownerOf = (entry: MeshStateEntry | undefined): { owner?: string; root?: string } => {
@@ -174,7 +194,7 @@ export const observeActorOwnership = (
     const stamp = stampOf(file);
     const lease = readHostLeaseCurrent(meshRoot, id);
     const entry = state?.(HOST_PREFIX + digest(id));
-    hosts.set(id, { file, stamp, facts: leaseFacts(lease), shared: hostFacts(entry), deadline: live(hostDeadline(id, entry, lease)) });
+    hosts.set(id, { file, stamp, facts: leaseFacts(lease), shared: hFacts(entry), deadline: live(hostDeadline(id, entry, lease)) });
   };
   for (const id of actorIds) {
     if (participants.has(id)) continue;
@@ -186,7 +206,15 @@ export const observeActorOwnership = (
     const sharedEntry = state?.(key);
     const owners = [...new Set([ownerOf(fileEntry).owner, ownerOf(sharedEntry).owner].filter((owner): owner is string => owner !== undefined))];
     const roots = [...new Set([ownerOf(fileEntry).root, ownerOf(sharedEntry).root].filter((root): root is string => root !== undefined))];
-    participants.set(id, { key, file, stamp, facts: participantFacts(fileEntry), shared: participantFacts(sharedEntry), owners, roots,
+    const facts = pFacts(fileEntry);
+    const shared = pFacts(sharedEntry);
+    // fv2-11107 (strict only): the directory picks between a file and a shared record of one key by
+    // updatedAt (mergeParticipantEntries), which the selected facts ignore. When both copies exist
+    // and their facts (incl. parse validity) disagree, or the shared copy is unknown, an
+    // arbitration-only renewal of the losing copy can flip the winner unseen: never validate it.
+    const arbitrated = strict !== undefined && fileEntry !== undefined &&
+      (!state || (sharedEntry !== undefined && (facts !== shared || facts.endsWith("|unknown"))));
+    participants.set(id, { key, file, stamp, facts, shared, owners, roots, arbitrated,
       deadline: Math.min(live(reloadDeadline(fileEntry)), live(reloadDeadline(sharedEntry))) });
     for (const owner of owners) observeHost(owner);
     for (const root of roots) if (!closures.has(root)) closures.set(root, closureFacts(state?.(LINEAGE_CLOSURE_PREFIX + digest(root))));
@@ -209,19 +237,45 @@ export const observeActorOwnership = (
       // no stamp can see them. Once the clock reaches the earliest deadline that was live when
       // observed, the observed decision may be stale: veto, and the retry decides afresh.
       if (clock() >= scopedDeadline(records)) return false;
+      if (records.some(record => record.arbitrated)) return false;
       const owners = new Set(records.flatMap(record => record.owners));
       const roots = new Set(records.flatMap(record => record.roots));
       for (const record of records) {
-        if (stampOf(record.file) !== record.stamp && participantFacts(readParticipantFile(meshRoot, record.key)) !== record.facts) return false;
+        if (stampOf(record.file) !== record.stamp && pFacts(readParticipantFile(meshRoot, record.key)) !== record.facts) return false;
       }
+      const movedLeases = new Map<string, FabricHostLease | undefined>();
       for (const id of owners) {
         const host = hosts.get(id)!;
-        if (stampOf(host.file) !== host.stamp && leaseFacts(readHostLeaseCurrent(meshRoot, id)) !== host.facts) return false;
+        if (stampOf(host.file) === host.stamp) continue;
+        const lease = readHostLeaseCurrent(meshRoot, id);
+        if (leaseFacts(lease) !== host.facts) return false;
+        movedLeases.set(id, lease);
       }
-      if (sharedStateStamp(mesh) === stateStamp || !openState) return true;
+      const sharedMoved = sharedStateStamp(mesh) !== stateStamp;
+      if (strict) {
+        // Strict: fail closed when a moved input cannot be re-read.
+        if ((sharedMoved || movedLeases.size > 0) && !openState) return false;
+        if (!sharedMoved && movedLeases.size === 0) return true;
+        const current = openState!();
+        for (const id of owners) {
+          if (!sharedMoved && !movedLeases.has(id)) continue;
+          const host = hosts.get(id)!;
+          const entry = current(HOST_PREFIX + digest(id));
+          if (hFacts(entry) !== host.shared) return false;
+          const lease = movedLeases.has(id) ? movedLeases.get(id) : readHostLeaseCurrent(meshRoot, id);
+          const deadline = hostDeadline(id, entry, lease);
+          // Check effective liveness even when the observation had no live deadline.
+          // Absence/non-live -> renewal must relist, never inherit an Infinity bound.
+          if (deadline === undefined || !Number.isFinite(deadline) || deadline < clock() || deadline < host.deadline) return false;
+        }
+        if (!sharedMoved) return true;
+        return records.every(record => pFacts(current(record.key)) === record.shared) &&
+          [...roots].every(root => closureFacts(current(LINEAGE_CLOSURE_PREFIX + digest(root))) === closures.get(root));
+      }
+      if (!sharedMoved || !openState) return true;
       const current = openState();
-      return records.every(record => participantFacts(current(record.key)) === record.shared) &&
-        [...owners].every(id => hostFacts(current(HOST_PREFIX + digest(id))) === hosts.get(id)!.shared) &&
+      return records.every(record => pFacts(current(record.key)) === record.shared) &&
+        [...owners].every(id => hFacts(current(HOST_PREFIX + digest(id))) === hosts.get(id)!.shared) &&
         [...roots].every(root => closureFacts(current(LINEAGE_CLOSURE_PREFIX + digest(root))) === closures.get(root));
     },
   };

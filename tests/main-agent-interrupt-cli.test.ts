@@ -13,7 +13,7 @@ describe.runIf(process.platform === "linux" && process.env.FABRIC_7452_REAL_CLI 
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-interrupt-cli-"));
     const clients: RpcClient[] = [];
     const events: Record<string, Event[]> = { receiver: [], sender: [] };
-    let run: Promise<void> | undefined;
+    let run: Promise<unknown> | undefined; // Pi 1.1 RPC prompt resolves to a PromptDisposition
     const make = (name: string) => {
       const cwd = path.join(root, name);
       const agentDir = path.join(cwd, "agent");

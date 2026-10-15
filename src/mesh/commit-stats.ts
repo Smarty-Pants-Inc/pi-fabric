@@ -2,6 +2,7 @@ import { randomBytes } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { verifiedRemove } from "../storage/verified-remove.js";
 
 interface CommitStats {
   record(bytes: number, keys: readonly string[]): void;
@@ -274,26 +275,41 @@ export const createLockStats = (setting = process.env.PI_FABRIC_LOCK_STATS,
   const prune = (directory: string, now: number): void => {
     checkStatsDirectory(directory);
     for (const name of fs.readdirSync(directory)) {
-      // A `.prune-<pid>` name is a pruner's graveyard; one left by a crash is pruned by age too.
+      // A `.prune-<pid>` name is a pruner's graveyard; one left by a crash or failed relink is pruned by age too.
       if (!(name.endsWith(".json") || name.endsWith(".tmp") || /\.prune-\d+$/.test(name))) continue;
       const file = path.join(directory, name);
       try {
         const seen = fs.lstatSync(file);
-        if (now - seen.mtimeMs <= LOCK_STATS_STALE_FILE_MS) continue;
-        // Temporaries and graveyards have unique names that no writer refreshes.
-        if (!name.endsWith(".json")) { fs.unlinkSync(file); continue; }
+        // Files only, as main's unlink: a directory (a verifiedRemove graveyard or anything else) is never removed
+        // recursively here; graveyards (`.retention-graveyard-<pid>`) do not match the names above either.
+        if (!seen.isFile() || now - seen.mtimeMs <= LOCK_STATS_STALE_FILE_MS) continue;
+        // Temporaries and graveyards have unique names that no writer refreshes. smarty-dev#8907: only the inode
+        // judged aged above is removed; off Linux main's unlink.
+        if (!name.endsWith(".json")) {
+          verifiedRemove(file, seen, { deleter: "lockStatsPrune", fallback: () => { fs.unlinkSync(file); return true; } });
+          continue;
+        }
         // Never unlink a stats file by name (smarty-dev#7879): its writer may refresh it by rename
         // at any time. Move it aside atomically (readers skip non-.json names), then delete it only
         // if it is still the aged file. Otherwise the writer's fresh file was moved: put it back with
         // an atomic no-replace link (EEXIST when an even newer file holds the name: keep that one;
-        // works on NTFS too), then drop the graveyard name either way.
+        // works on NTFS too), then drop the graveyard name only after restoration or EEXIST.
         const grave = `${file}.prune-${process.pid}`;
         fs.renameSync(file, grave);
         const moved = fs.lstatSync(grave);
         if (moved.dev !== seen.dev || moved.ino !== seen.ino || moved.mtimeMs !== seen.mtimeMs) {
-          try { fs.linkSync(grave, file); } catch { /* A newer file holds the name. */ }
+          try { fs.linkSync(grave, file); } catch (error) {
+            // Keep the fresh graveyard for age pruning unless a newer file holds the name.
+            if (errorCodeOf(error) !== "EEXIST") continue;
+          }
+          // ponytail: not the aged inode: our per-pid graveyard name (no writer writes it) only drops the extra link of
+          // the refreshed file put back above, or one a newer file at the name superseded (main's behaviour).
+          fs.unlinkSync(grave);
+        } else {
+          // smarty-dev#8907: the judged (aged) stat, never the refreshed lstat: a refusal leaves the graveyard name,
+          // pruned by age later. Off Linux main's unlink.
+          verifiedRemove(grave, seen, { deleter: "lockStatsPrune", fallback: () => { fs.unlinkSync(grave); return true; } });
         }
-        fs.unlinkSync(grave);
       } catch { /* Raced with its owner or another pruner. */ }
     }
   };
@@ -322,6 +338,8 @@ export const createLockStats = (setting = process.env.PI_FABRIC_LOCK_STATS,
       finally { fs.closeSync(descriptor); }
       fs.renameSync(temporary, file);
     } catch (error) {
+      // ponytail: our own unpublished temporary (random name, O_EXCL|O_NOFOLLOW above), removed only after its write or
+      // rename failed; nothing judged it.
       try { fs.unlinkSync(temporary); } catch { /* Already renamed or gone. */ }
       throw error;
     }
@@ -430,6 +448,322 @@ export const createLockStats = (setting = process.env.PI_FABRIC_LOCK_STATS,
   lockGlobals[lockKey] = { version: 1, stats, flush, dispose };
   return stats;
 };
+
+// ---------------------------------------------------------------------------------------------
+// Mesh-lock events at the source (smarty-dev#9290).
+//
+// The minute files above say how busy the lock was; they cannot say which hold made a waiter give
+// up, so commswatch sampled `.lock` every 50 ms to catch it. Instead the two parties report it
+// themselves, to `<root>/lock-stats/events.jsonl`: the holder when it releases after holding
+// longer than a threshold (`held`), the waiter when it gives up with the typed lock timeout
+// (`wait-timeout`, FABRIC_MESH_STATE_BUSY at the bridge), naming the holder it could identify.
+// A FIFO refusal before canonical acquisition is a separate `pre-lock` event (FABRIC_MESH_LOCK_QUEUE_EXPIRED), never a
+// real-contention timeout in these events or the minute counters. It has no identified lock holder.
+// It is a local append, never a mesh publish: publishing would need the very lock that is
+// contended. One O_APPEND write() per line, each line at most PIPE_BUF (4096) bytes, so concurrent
+// appenders never interleave. At 1 MiB the file is renamed to `events.jsonl.1` (one old file kept),
+// under a short O_EXCL rotation lock and only if the name still holds the oversized inode.
+// Windows: rotation is disabled (scope cut, smarty-dev#10191). Concurrent appenders across a forced
+// rotation lost ~46% of lines on Windows CI with no counted error, cause not found; there the file
+// only grows, and one warning per process says so once it passes the rotation size.
+// An I/O error never blocks or throws into the lock path: it is counted, and warned about at most
+// once a minute. Off with the minute files (PI_FABRIC_LOCK_STATS=0); `held` is also off with a
+// threshold of 0 (`lockHeldEventMs`). Bounded tries (registry-fenced or zero-wait callers and the
+// R20 write fence) fail by design while the lock is busy: they stay `tries` in the minute files.
+
+export type LockEventStore = "sqlite" | "mesh-lock";
+/** Who held the lock. A wait-timeout names the holder only as far as the lock's record shows it. */
+export interface LockEventHolder {
+  pid: number | null;
+  /** The process's short name (/proc/PID/comm), never its arguments, which may hold secrets. */
+  process: string | null;
+  /** The holder's caller class: known for `held` (the holder itself), null on `wait-timeout`. */
+  op: MeshLockClass | null;
+  /** Sanitized host label (both locks live on a local filesystem). */
+  host: string;
+}
+export interface LockEventWaiter { pid: number; process: string; op: MeshLockClass }
+export interface LockEvent {
+  v: 1;
+  /** Epoch ms of the release (`held`), contention timeout, or pre-lock refusal. */
+  at: number;
+  kind: "held" | "wait-timeout" | "pre-lock";
+  store: LockEventStore;
+  class: MeshLockClass;
+  /** `held` only. */
+  heldMs?: number;
+  /** `wait-timeout` or `pre-lock`. */
+  waitedMs?: number;
+  /** `pre-lock` only: a refusal before canonical lock acquisition, never contention. */
+  preLockCode?: "FABRIC_MESH_LOCK_QUEUE_EXPIRED";
+  /** `pre-lock` only: observed FIFO receipts ahead, if available. */
+  waitersAhead?: number;
+  holder: LockEventHolder;
+  /** `wait-timeout` or `pre-lock`. */
+  waiter?: LockEventWaiter;
+}
+export interface LockEvents {
+  /** A release after a hold longer than the caller's threshold (the caller compares). */
+  held(root: string, store: LockEventStore, lockClass: MeshLockClass, heldMs: number): void;
+  /** A full-budget acquisition that gave up; `holderPid` from the lock's owner record, if readable. */
+  waitTimeout(root: string, store: LockEventStore, lockClass: MeshLockClass, waitedMs: number,
+    holderPid: number | undefined): void;
+  /** FIFO refusal before admission; separate from the real-contention event and minute counters. */
+  queueExpired(root: string, store: LockEventStore, lockClass: MeshLockClass, waitedMs: number,
+    waitersAhead: number | undefined): void;
+  /** Appends that failed (never thrown into the lock path). */
+  readonly errors: number;
+}
+
+export const LOCK_EVENTS_FILE = "events.jsonl";
+/** At this size the file is renamed to `events.jsonl.1`, replacing the older one. */
+export const LOCK_EVENTS_ROTATE_BYTES = 1024 * 1024;
+/** The follow-up issue that re-enables rotation on Windows, where it is disabled until then. */
+export const LOCK_EVENTS_WIN32_ROTATION_ISSUE = "smarty-dev#10191";
+/** Exclusive (O_EXCL) rotation lock beside the file: one rotator at a time across processes. */
+export const LOCK_EVENTS_ROTATE_LOCK = `${LOCK_EVENTS_FILE}.rotating`;
+/** A rotation lock older than this was left by a crashed rotator (a rotation takes microseconds). */
+export const LOCK_EVENTS_ROTATE_LOCK_STALE_MS = 10_000;
+/** PIPE_BUF: an O_APPEND write() of at most this many bytes never interleaves with another. */
+export const LOCK_EVENT_MAX_LINE_BYTES = 4096;
+/** Default `lockHeldEventMs`: a hold longer than this emits a `held` event; 0 disables them. */
+export const LOCK_HELD_EVENT_MS = 1_000;
+/** The effective `lockHeldEventMs`: undefined or not finite means the default; negative means 0 (off). */
+export const lockHeldEventThreshold = (value: number | undefined): number =>
+  value === undefined || !Number.isFinite(value) ? LOCK_HELD_EVENT_MS : Math.max(0, value);
+const LOCK_EVENTS_WARN_EVERY_MS = 60_000;
+const PROCESS_NAME_MAX_CHARS = LOCK_STATS_WRITER_MAX_CHARS;
+const APPEND_FLAGS = process.platform === "win32" ? "a"
+  : fs.constants.O_WRONLY | fs.constants.O_APPEND | fs.constants.O_CREAT | (fs.constants.O_NOFOLLOW ?? 0);
+const ROTATE_LOCK_FLAGS = process.platform === "win32" ? "wx"
+  : fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | (fs.constants.O_NOFOLLOW ?? 0);
+/**
+ * Windows: a rename, open or lstat that races another process's handle on events.jsonl (or a name
+ * left delete-pending by a rename) fails transiently with one of these. Never a lost line: a refused
+ * rename skips the rotation, a refused append retries.
+ */
+const WIN32_TRANSIENT_CODES: ReadonlySet<unknown> = new Set(["EPERM", "EBUSY", "EACCES"]);
+/** Windows: tries per line against the current events.jsonl before the append counts as failed. */
+export const LOCK_EVENTS_APPEND_TRIES_WIN32 = 5;
+/** Windows: the backoff before retry N is N times this (10, 20, 30, 40 ms: at most 100 ms per line). */
+export const LOCK_EVENTS_APPEND_RETRY_MS = 10;
+/** A synchronous bounded sleep (the appender is synchronous inside the lock path). */
+const sleepSync = (ms: number): void => { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); };
+
+interface ProcessLockEvents {
+  /** Registry generation. Keep existing methods/line shapes stable; explicitly hand over additive APIs. */
+  version: number;
+  events: LockEvents | undefined;
+  dispose(): void;
+}
+const eventsKey = Symbol.for("pi-fabric.mesh.lock-events");
+const eventsGlobals = globalThis as typeof globalThis & { [eventsKey]?: ProcessLockEvents };
+
+/** A process's short name: Linux /proc/PID/comm (never cmdline), else undefined. */
+export const lockEventProcessName = (pid: number): string | undefined => {
+  if (process.platform !== "linux" || !Number.isSafeInteger(pid) || pid <= 0) return undefined;
+  try {
+    const name = fs.readFileSync(`/proc/${pid}/comm`, "utf8").trim();
+    return name ? name.slice(0, PROCESS_NAME_MAX_CHARS) : undefined;
+  } catch { return undefined; }
+};
+
+/** One JSONL line of at most LOCK_EVENT_MAX_LINE_BYTES: process names shrink until it fits. */
+export const lockEventLine = (event: LockEvent): string => {
+  let line = `${JSON.stringify(event)}\n`;
+  let room = PROCESS_NAME_MAX_CHARS;
+  while (Buffer.byteLength(line) > LOCK_EVENT_MAX_LINE_BYTES && room > 0) {
+    room = Math.floor(room / 2);
+    const holder = { ...event.holder, process: event.holder.process === null ? null : event.holder.process.slice(0, room) };
+    const waiter = event.waiter ? { waiter: { ...event.waiter, process: event.waiter.process.slice(0, room) } } : {};
+    line = `${JSON.stringify({ ...event, holder, ...waiter })}\n`;
+  }
+  return line;
+};
+
+/**
+ * The process's lock-event appender, captured once (including disabled) across module and release
+ * reloads like the recorder: on unless PI_FABRIC_LOCK_STATS=0. No timer, file or descriptor is held.
+ */
+export const createLockEvents = (setting = process.env.PI_FABRIC_LOCK_STATS,
+  options: {
+    warn?: (message: string) => void;
+    rotateBytes?: number;
+    /** Tests: the platform whose rename/append semantics apply (default process.platform). */
+    platform?: NodeJS.Platform;
+    /** Tests: the synchronous backoff sleep (default Atomics.wait). */
+    sleep?: (ms: number) => void;
+  } = {}): LockEvents | undefined => {
+  const existing = eventsGlobals[eventsKey];
+  if (existing && (!existing.events || (existing.version >= 3 && typeof existing.events.queueExpired === "function"))) return existing.events;
+  if (!existing && lockStatsDisabled(setting)) {
+    eventsGlobals[eventsKey] = { version: 1, events: undefined, dispose() {} };
+    return undefined;
+  }
+  const host = lockStatsHost();
+  const rotateBytes = Math.max(1, options.rotateBytes ?? LOCK_EVENTS_ROTATE_BYTES);
+  const warn = options.warn ?? warnPrivately;
+  const windows = (options.platform ?? process.platform) === "win32";
+  const sleep = options.sleep ?? sleepSync;
+  const transient = (error: unknown): boolean => windows && WIN32_TRANSIENT_CODES.has(errorCodeOf(error));
+  let errors = 0;
+  let unwarned = 0;
+  let warnedAt = Number.NEGATIVE_INFINITY;
+  let warnedUnrotated = false;
+  let ownName: string | undefined;
+  const self = (): string => ownName ??= lockEventProcessName(process.pid)
+    ?? (process.title.trim().slice(0, PROCESS_NAME_MAX_CHARS) || "unknown");
+  const failed = (error: unknown): void => {
+    errors++;
+    unwarned++;
+    const now = Date.now();
+    if (now - warnedAt < LOCK_EVENTS_WARN_EVERY_MS) return;
+    warnedAt = now;
+    const count = unwarned;
+    unwarned = 0;
+    try { warn(`mesh lock events: ${count} append error(s) since the last warning; last: ${error instanceof Error ? error.message : String(error)}`); }
+    catch { /* Diagnostics only. */ }
+  };
+  // BigInt stats: a Windows (NTFS) file id is 64 bits and above 2^53 once its sequence number
+  // passes 31, so as a Number two different files can compare equal (nodejs/node#12115).
+  const open = (file: string): { descriptor: number; stat: fs.BigIntStats } => {
+    const descriptor = fs.openSync(file, APPEND_FLAGS, 0o600);
+    try {
+      const stat = fs.fstatSync(descriptor, { bigint: true });
+      if (!stat.isFile()) throw new Error(`${file} is not a regular file`);
+      return { descriptor, stat };
+    } catch (error) { fs.closeSync(descriptor); throw error; }
+  };
+  const append = (root: string, event: LockEvent): void => {
+    try {
+      const directory = path.join(root, LOCK_STATS_DIR);
+      // Never recreate a removed mesh root: a missing parent fails with ENOENT (counted).
+      try { fs.mkdirSync(directory, { mode: 0o700 }); }
+      catch (error) { if (errorCodeOf(error) !== "EEXIST") throw error; }
+      checkStatsDirectory(directory);
+      const file = path.join(directory, LOCK_EVENTS_FILE);
+      const data = Buffer.from(lockEventLine(event));
+      // A concurrent rotation moved the name between our open and our rename check (ENOENT): append
+      // once more against the current events.jsonl (O_APPEND|O_CREAT). Windows: also EPERM/EBUSY/
+      // EACCES while another process holds or renames the file, up to LOCK_EVENTS_APPEND_TRIES_WIN32
+      // tries with a short growing backoff. The last failure is counted.
+      const tries = windows ? LOCK_EVENTS_APPEND_TRIES_WIN32 : 2;
+      for (let attempt = 1; attempt <= tries; attempt++) {
+        try { appendOnce(file, data); return; }
+        catch (error) {
+          if (attempt === tries || (errorCodeOf(error) !== "ENOENT" && !transient(error))) throw error;
+          if (windows) sleep(LOCK_EVENTS_APPEND_RETRY_MS * attempt);
+        }
+      }
+    } catch (error) { failed(error); }
+  };
+  /** Takes the rotation lock, breaking one a crashed rotator left; undefined when another holds it. */
+  /** Off Linux main's unlink; ENOENT (another breaker removed it) counts as gone, as main ignored it. */
+  const unlinkGone = (lock: string) => (): boolean => {
+    try { fs.unlinkSync(lock); } catch (error) { if (errorCodeOf(error) !== "ENOENT") throw error; }
+    return true;
+  };
+  const takeRotateLock = (lock: string): number | undefined => {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try { return fs.openSync(lock, ROTATE_LOCK_FLAGS, 0o600); }
+      catch (error) {
+        if (errorCodeOf(error) !== "EEXIST" || attempt > 0) return undefined;
+        try {
+          // smarty-dev#8907: break only the lock judged stale: a fresh lock swapped in since then stays (refused: skip).
+          const seen = fs.lstatSync(lock);
+          // A non-file is never broken (main's unlink refused it; no recursive removal).
+          if (!seen.isFile() || Date.now() - seen.mtimeMs <= LOCK_EVENTS_ROTATE_LOCK_STALE_MS) return undefined;
+          if (!verifiedRemove(lock, seen, { deleter: "lockEventsRotateLock", fallback: unlinkGone(lock) }).removed) return undefined;
+        } catch (stale) { if (errorCodeOf(stale) !== "ENOENT") return undefined; }
+      }
+    }
+    return undefined;
+  };
+  /**
+   * Renames the oversized file `seen` to `.1` under the rotation lock, only if the name still holds
+   * that inode: an appender holding a stale lstat can never rename a newer file over `.1`. Busy lock:
+   * skip (the holder rotates; this line lands in whichever file the name holds next). The inode is
+   * compared exactly (BigInt), and the name must still hold at least the bytes seen: a reused or
+   * colliding file id on a smaller, newer file never renames it over `.1`. Windows: a rename (or
+   * lstat) refused because another process holds the file skips this rotation; the file stays
+   * oversized until a later rotation succeeds.
+   */
+  const rotate = (file: string, seen: fs.BigIntStats): void => {
+    const lock = path.join(path.dirname(file), LOCK_EVENTS_ROTATE_LOCK);
+    const held = takeRotateLock(lock);
+    if (held === undefined) return;
+    let own: fs.Stats | undefined;
+    try {
+      own = fs.fstatSync(held);
+      let current: fs.BigIntStats;
+      try { current = fs.lstatSync(file, { bigint: true }); }
+      catch (error) { if (errorCodeOf(error) === "ENOENT" || transient(error)) return; throw error; }
+      if (current.dev !== seen.dev || current.ino !== seen.ino || current.size < seen.size) return;
+      // ponytail: rotation, not a judged delete: the one previous generation `.1` is replaced by design, under the
+      // rotation lock, and only by the exact (BigInt) inode checked just above.
+      try { fs.renameSync(file, `${file}.1`); }
+      catch (error) { if (!transient(error)) throw error; }
+    } finally {
+      try { fs.closeSync(held); } catch { /* Closed either way. */ }
+      // smarty-dev#8907: our own lock inode only (never written, so its mtime is the created one): a stale-lock breaker
+      // may have removed it and another rotator taken the name, whose lock stays.
+      verifiedRemove(lock, own, { deleter: "lockEventsRotateLock", fallback: unlinkGone(lock) });
+    }
+  };
+  /** Windows: rotation is disabled; the first time the file passes the rotation size, warn once. */
+  const unrotated = (file: string): void => {
+    if (warnedUnrotated) return;
+    warnedUnrotated = true;
+    try {
+      warn(`mesh lock events: ${file} passed the ${rotateBytes}-byte rotation size; rotation is disabled on Windows `
+        + `until ${LOCK_EVENTS_WIN32_ROTATION_ISSUE}, so the file keeps growing`);
+    } catch { /* Diagnostics only. */ }
+  };
+  const appendOnce = (file: string, data: Buffer): void => {
+    let { descriptor, stat } = open(file);
+    try {
+      const oversized = stat.size > 0n && stat.size + BigInt(data.length) > BigInt(rotateBytes);
+      // Windows: append only (no rename, no rotation lock); see LOCK_EVENTS_WIN32_ROTATION_ISSUE.
+      if (oversized && windows) unrotated(file);
+      else if (oversized) {
+        // Closed first, so the rename also works on Windows.
+        fs.closeSync(descriptor);
+        descriptor = -1;
+        rotate(file, stat);
+        ({ descriptor, stat } = open(file));
+      }
+      // ONE write per line, appended atomically by O_APPEND.
+      const written = fs.writeSync(descriptor, data);
+      if (written !== data.length) throw new Error(`short append to ${file} (${written} of ${data.length} bytes)`);
+    } finally { if (descriptor >= 0) fs.closeSync(descriptor); }
+  };
+  const events: LockEvents = {
+    held(root, store, lockClass, heldMs) {
+      append(root, { v: 1, at: Date.now(), kind: "held", store, class: lockClass, heldMs: Math.round(heldMs),
+        holder: { pid: process.pid, process: self(), op: lockClass, host } });
+    },
+    waitTimeout(root, store, lockClass, waitedMs, holderPid) {
+      const pid = holderPid !== undefined && Number.isSafeInteger(holderPid) && holderPid > 0 ? holderPid : null;
+      const name = pid === null ? null : pid === process.pid ? self() : lockEventProcessName(pid) ?? null;
+      append(root, { v: 1, at: Date.now(), kind: "wait-timeout", store, class: lockClass, waitedMs: Math.round(waitedMs),
+        holder: { pid, process: name, op: null, host }, waiter: { pid: process.pid, process: self(), op: lockClass } });
+    },
+    queueExpired(root, store, lockClass, waitedMs, waitersAhead) {
+      append(root, { v: 1, at: Date.now(), kind: "pre-lock", preLockCode: "FABRIC_MESH_LOCK_QUEUE_EXPIRED", store, class: lockClass,
+        waitedMs: Math.round(waitedMs), ...(waitersAhead === undefined ? {} : { waitersAhead }),
+        holder: { pid: null, process: null, op: null, host }, waiter: { pid: process.pid, process: self(), op: lockClass } });
+    },
+    get errors() { return errors; },
+  };
+  // Additive handover from captured v1/v2 appenders: retain existing methods/sink/error count. The queue event
+  // uses this generation's full code, so reload cannot retain the older abbreviated field or a missing method.
+  const legacy = existing?.events;
+  const shared: LockEvents = legacy ? { held: legacy.held, waitTimeout: legacy.waitTimeout,
+    queueExpired: events.queueExpired, get errors() { return legacy.errors + events.errors; } } : events;
+  eventsGlobals[eventsKey] = { version: 3, events: shared, dispose: existing?.dispose ?? (() => {}) };
+  return shared;
+};
+
 
 // ---------------------------------------------------------------------------------------------
 // Reading and summarizing (fabric-mesh-lock-stats).

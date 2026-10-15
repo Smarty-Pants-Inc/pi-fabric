@@ -2,12 +2,16 @@ import releaseSyncVariant from "@jitl/quickjs-singlefile-mjs-release-sync";
 import { newQuickJSWASMModuleFromVariant } from "quickjs-emscripten-core";
 import ts from "typescript";
 import { ExecutionDeadline } from "./execution-deadline.js";
-import { isMeshLockTimeout } from "../core/atomic-write.js";
+import { MESH_INCARNATION_PENDING_CODE, MESH_LOCK_TIMEOUT_CODE, MESH_SNAPSHOT_RETRIES_EXHAUSTED_CODE } from "../core/atomic-write.js";
+import { isMeshRetryableBusy } from "../mesh/state-backend.js";
 import { cancellationError, preserveCancellationOutcome, runAbortable, settleWithin, shareCancellationEffects } from "../async-settlement.js";
 import { piBashExitMetadata } from "../core/pi-bash-error.js";
 import { FabricModelDeniedError } from "../core/model-policy.js";
 import { FabricTargetTerminalError } from "../agents/terminal-target.js";
+import { JevTransientHttpError } from "../jev/validation.js";
 import { PI_ARGUMENT_NORMALIZATION_SOURCE } from "../core/pi-arguments.js";
+import { PI_CORE_TOOL_NAMES } from "../core/pi-tools.js";
+import { HumanWaitDeadlinePause } from "./deadline-pause.js";
 import { createGuestStackMap, remapGuestErrorText } from "./guest-stack-map.js";
 import { transpileFabricCodeWithSourceMap } from "./type-checker.js";
 
@@ -27,6 +31,14 @@ export type {
 
 type QuickJsModule = Awaited<ReturnType<typeof newQuickJSWASMModuleFromVariant>>;
 
+// The shared retry predicate also accepts WAL-cap and raw SQLite errors: only
+// these three mesh families have a guest code contract, with canonical names.
+const GUEST_MESH_RETRYABLE_ERROR_NAMES: Readonly<Record<string, string>> = Object.freeze({
+  [MESH_LOCK_TIMEOUT_CODE]: "MeshLockTimeoutError",
+  [MESH_INCARNATION_PENDING_CODE]: "MeshIncarnationPendingError",
+  [MESH_SNAPSHOT_RETRIES_EXHAUSTED_CODE]: "MeshSnapshotRetriesExhaustedError",
+});
+
 // Explicit safe contracts, not Error serialization: never bridge stacks, causes, arbitrary
 // properties or getters. Keep this dependency-free so runtime loading cannot pull in providers.
 const GUEST_FABRIC_ERROR_NAMES: Readonly<Record<string, string>> = Object.freeze({
@@ -37,7 +49,10 @@ const GUEST_FABRIC_ERROR_NAMES: Readonly<Record<string, string>> = Object.freeze
   FABRIC_INTERRUPT_NOT_AUTHORIZED: "FabricInterruptNotAuthorizedError",
   FABRIC_INTERRUPT_RATE_LIMITED: "FabricInterruptRateLimitedError",
   FABRIC_PARTICIPANT_STALE: "FabricParticipantStaleError",
+  FABRIC_RELAY_DESTINATION_UNAVAILABLE: "FabricRelayDestinationUnavailableError",
+  FABRIC_IDEMPOTENCY_KEY_REUSED: "FabricIdempotencyKeyReusedError",
   FABRIC_PARTICIPANT_NOT_YET_MIRRORED: "FabricParticipantNotYetMirroredError",
+  FABRIC_PEER_LEASE_STALE: "FabricPeerLeaseStaleError",
   FABRIC_PARTICIPANT_NON_INTERACTIVE: "FabricParticipantNonInteractiveError",
   FABRIC_TASK_ESCALATION_TARGET_DENIED: "TaskEscalationTargetError",
   FABRIC_PROJECT_AGENT_UNRESOLVED: "FabricProjectAgentUnresolvedError",
@@ -51,6 +66,7 @@ const guestFabricErrorMetadata = (error: unknown): Record<string, string | boole
   if (error instanceof FabricTargetTerminalError) return {
     name: "FabricTargetTerminalError", code: "FABRIC_TARGET_TERMINAL",
     targetId: error.targetId, finalAnswerReceiptId: error.finalAnswerReceiptId,
+    reason: error.reason, deliveryStatus: error.deliveryStatus, runState: error.runState,
   };
   const code = Object.getOwnPropertyDescriptor(error, "code")?.value;
   const name = Object.getOwnPropertyDescriptor(error, "name")?.value;
@@ -58,7 +74,7 @@ const guestFabricErrorMetadata = (error: unknown): Record<string, string | boole
   const metadata: Record<string, string | boolean> = { name, code };
   const retryable = Object.getOwnPropertyDescriptor(error, "retryable")?.value;
   if (typeof retryable === "boolean") metadata.retryable = retryable;
-  if (code === "FABRIC_PARTICIPANT_STALE") {
+  if (code === "FABRIC_PARTICIPANT_STALE" || code === "FABRIC_RELAY_DESTINATION_UNAVAILABLE" || code === "FABRIC_IDEMPOTENCY_KEY_REUSED") {
     // The public message schema bounds retry keys to 1-200 chars. Read only own
     // data properties: never invoke a host getter or export unrelated metadata.
     const key = Object.getOwnPropertyDescriptor(error, "idempotencyKey")?.value;
@@ -115,8 +131,10 @@ const quickJsModule = (): Promise<QuickJsModule> => {
 
 // piTools is false in orchestration-only mode: `pi` fails the type check there, so hints
 // name the native tool instead (smarty-dev#459).
-export const guestSetupSource = (fields?: Record<string, string[]>, piTools = true): string =>
-  `const __piCanonicalFields = ${JSON.stringify(fields ?? {})};\nconst __piToolsAvailable = ${piTools};\n${GUEST_SETUP}`;
+export const guestSetupSource = (fields?: Record<string, string[]>, piTools = true, nativeStoreEnabled = false, profile = "additive", nativeToolsEnabled = false): string =>
+  `const __piCanonicalFields = ${JSON.stringify(fields ?? {})};\nconst __piToolsAvailable = ${piTools}; const __nativeStoreEnabled = ${nativeStoreEnabled}; const __nativeProfile = ${profile === "native"}; const __nativeToolsEnabled = ${nativeToolsEnabled};\n${GUEST_SETUP}`;
+
+import { NATIVE_CODEMODE_GUEST } from "./native-codemode-guest.js";
 
 export const GUEST_SETUP = `
 (() => {
@@ -143,7 +161,7 @@ const __call = async (ref, args) => {
   __recordSuccessfulCall(ref, normalizedArgs);
   return value;
 };
-const __piToolNames = ["read","bash","powershell","edit","write","grep","find","ls"];
+// __piToolNames is declared once, below, beside the π proxy (upstream placement).
 const __coreToolHint = (name) => __piToolsAvailable
   ? "For the Pi core tool, call pi." + name + "(args), e.g. pi." + name + "({ ... })."
   : "Orchestration-only mode: pi does not exist inside fabric_exec; call the native " + name + " tool directly, outside fabric_exec.";
@@ -160,26 +178,40 @@ const __toolsBase = {
   progress: (args) => __call("fabric.$progress", args),
   models: () => __call("fabric.$models", {}),
 };
-// tools is discovery + generic calls only. The proxy keeps the seven discovery
-// methods and turns a core-tool name (read/bash/edit/...) into an actionable
-// error pointing at pi.<name>, so a model that writes tools.read(...) learns
-// the fix in one turn instead of looping on "tools.read is not a function".
-globalThis.tools = new Proxy(__toolsBase, {
+${NATIVE_CODEMODE_GUEST}
+const __nativeToolNames = new Set();
+let __nativeCatalogReady = false;
+globalThis.nativeTools = new Proxy(Object.create(null), {
+  get(_target, property) {
+    if (typeof property === "symbol" || (__nativeCatalogReady ? !__nativeToolNames.has(property) : property === "then")) return undefined;
+    return args => __call("fabric.$nativeTool", { name: String(property), args: args === undefined ? {} : args });
+  },
+  ownKeys() { return [...__nativeToolNames]; },
+  getOwnPropertyDescriptor(_target, property) { return __nativeToolNames.has(property) ? {enumerable:true, configurable:true} : undefined; },
+  set() { return true; },
+  deleteProperty() { return true; },
+});
+const __fabricTools = new Proxy(__toolsBase, {
   get(target, property) {
     if (property === "then" || typeof property === "symbol") return undefined;
+    if (Object.prototype.hasOwnProperty.call(target, property)) return target[property];
     const name = String(property);
-    if (__piToolNames.indexOf(name) >= 0) {
+    // Orchestration-only mode has no Pi core tools in fabric_exec: name the native tool
+    // (smarty-dev#459). Otherwise unknown tools.* names route to native tools (upstream).
+    if (!__piToolsAvailable && __piToolNames.indexOf(name) >= 0) {
       return () => {
         throw new Error(
           "tools." + name + " is not available on the discovery API. tools is discovery + generic calls only (providers/catalog/list/search/describe/call/models). " + __coreToolHint(name)
         );
       };
     }
-    return target[property];
+    return globalThis.nativeTools[property];
   },
   set() { return true; },
   deleteProperty() { return true; },
 });
+globalThis.fabric = Object.freeze({ tools: __fabricTools });
+globalThis.tools = typeof __nativeProfile !== "undefined" && __nativeProfile ? globalThis.nativeTools : __fabricTools;
 const __piStringFields = { bash: "command", powershell: "command", read: "path", ls: "path", grep: "pattern", find: "pattern" };
 // Object aliases and coercions are shared with host preparation in core/pi-arguments.ts.
 
@@ -306,6 +338,7 @@ globalThis.pi = new Proxy({}, {
     };
   },
 });
+const __piToolNames = ${JSON.stringify(PI_CORE_TOOL_NAMES)};
 const __piStrings = (typeof globalThis["π"] === "object" && globalThis["π"] !== null) ? globalThis["π"] : {};
 globalThis["π"] = new Proxy(__piStrings, {
   get(target, property) {
@@ -485,6 +518,9 @@ globalThis.schema = __providerProxy("schema");
 globalThis.components = __providerProxy("components");
 globalThis.compact = __providerProxy("compact");
 globalThis.cache = __providerProxy("cache");
+globalThis.thinking = __providerProxy("thinking");
+globalThis.decisions = __providerProxy("decisions");
+globalThis.programs = __providerProxy("programs");
 globalThis.prewalk = __providerProxy("prewalk");
 globalThis.records = __providerProxy("records");
 globalThis.jev = __providerProxy("jev");
@@ -563,6 +599,7 @@ globalThis.agents = Object.freeze({
   setFollowUpMode: (args) => __call("agents.setFollowUpMode", args),
   compact: (args) => __call("agents.compact", args),
   actorStatus: (args) => __call("agents.actorStatus", args),
+  slotStatus: (args = {}) => __call("agents.slotStatus", args),
   instructions: (args) => __call("agents.instructions", args),
   setModel: (args) => __call("agents.setModel", args),
   switchModel: (args) => __call("agents.switchModel", args),
@@ -595,6 +632,11 @@ globalThis.mesh = Object.freeze({
   list: (args = {}) => __call("mesh.list", args),
   put: (args) => __call("mesh.put", args),
   delete: (args) => __call("mesh.delete", args),
+  scheduled: (args = {}) => __call("mesh.scheduled", args),
+  unschedule: (args) => __call("mesh.unschedule", args),
+  grant: (args) => __call("mesh.grant", args),
+  revoke: (args) => __call("mesh.revoke", args),
+  grants: () => __call("mesh.grants", {}),
 });
 // The mcp proxy itself stays schema-less — the registry validates args at
 // dispatch — but guestTypeDeclarations renders per-server argument types from
@@ -760,10 +802,10 @@ globalThis.log = workflow.log;
 globalThis.budget = workflow.budget;
 globalThis.rlm = Object.freeze({
   query: (args) => {
-    if (args && args.runner && args.runner !== "pi") {
-      throw new Error("rlm.query requires the Pi runner because recursive Fabric is unavailable in Claude Code");
+    if (args && args.runner && args.runner !== "pi" && args.runner !== "pi-durable") {
+      throw new Error("rlm.query requires a Pi runner (pi-durable or pi) for recursive Fabric");
     }
-    return __budgetedRun({ ...args, runner: "pi", recursive: true });
+    return __budgetedRun({ ...args, runner: args?.runner ?? "pi", recursive: true });
   },
 });
 globalThis.council = Object.freeze({
@@ -782,7 +824,7 @@ globalThis.council = Object.freeze({
     });
   },
 });
-globalThis.console = Object.freeze({ log: print, info: print, warn: print, error: print });
+globalThis.console = Object.freeze({ log: print, info: print, warn: print, error: print, debug: print });
 const __timerCallbacks = new Map();
 let __nextTimerId = 1;
 globalThis.setTimeout = (callback, ms = 0) => {
@@ -987,6 +1029,13 @@ export class QuickJsRuntime {
       interruptedByDeadline = true;
       return true;
     });
+    const emittedSnapshot = (): unknown[] => {
+      try {
+        const handle = context.getProp(context.global, "__fabricEmitted");
+        try { const value = context.dump(handle); return Array.isArray(value) ? value : []; }
+        finally { handle.dispose(); }
+      } catch { return []; }
+    };
     const logs: string[] = [];
     const maxLogChars = options.maxLogChars ?? 100_000;
     let logChars = 0;
@@ -1052,8 +1101,25 @@ export class QuickJsRuntime {
       ) {
         return;
       }
+      if (humanWait.paused) {
+        humanWait.raise(Math.max(1, Math.floor(requestedTimeoutMs)));
+        return;
+      }
       if (executionDeadline.extend(requestedTimeoutMs)) scheduleDeadline();
     };
+
+    const humanWait = new HumanWaitDeadlinePause({
+      // ExecutionDeadline owns the clock, so a pause never lifts the host-owned ceiling.
+      remainingMs: () => executionDeadline.remainingMs(),
+      suspend: () => {
+        executionDeadline.suspend();
+        scheduleDeadline();
+      },
+      resume: (remainingMs) => {
+        executionDeadline.resume(remainingMs);
+        scheduleDeadline();
+      },
+    });
 
     try {
       const hostFunction = context.newFunction(
@@ -1094,12 +1160,17 @@ export class QuickJsRuntime {
             void promise.settled.then(() => pendingTimers.delete(timer));
             return promise.handle;
           }
-          const task = runAbortable(hostAbortController.signal, () => {
+          const waitsForHuman = options.isHumanWaitHostCall?.(reference, args) === true;
+          if (waitsForHuman) humanWait.enter();
+          const hostTask = runAbortable(hostAbortController.signal, () => {
             // Argument decoding and deadline policy also consume wall time.
             // Recheck immediately before admitting actual host work.
             if (deadlineReached()) { expireDeadline(); throw executionDeadline.reason; }
             return hostCall(reference, args, hostAbortController.signal);
-          })
+          });
+          // Only a human-wait call gets the extra settlement hop: ordinary replies keep
+          // their delivery timing relative to the execution gate and receipts.
+          const task = (waitsForHuman ? hostTask.finally(() => humanWait.leave()) : hostTask)
             .then((value) => {
               if (closing || promise.alive === false) return;
               if (deadlineReached()) { expireDeadline(); return; }
@@ -1117,10 +1188,11 @@ export class QuickJsRuntime {
                 error instanceof Error ? error.message : String(error),
               );
               try {
-                // The host-issued lock code wins over a legacy or overridden name.
-                // Both contracts supply only vetted metadata; each key is assigned once.
-                const safeMetadata = isMeshLockTimeout(error)
-                  ? { name: "MeshLockTimeoutError", code: error.code }
+                // Known host-issued mesh codes win over legacy or overridden names.
+                // Retryability alone never authorizes exporting arbitrary error codes.
+                const meshCode = error instanceof Error && "code" in error ? error.code : undefined;
+                const safeMetadata = typeof meshCode === "string" && Object.hasOwn(GUEST_MESH_RETRYABLE_ERROR_NAMES, meshCode) && isMeshRetryableBusy(error)
+                  ? { name: GUEST_MESH_RETRYABLE_ERROR_NAMES[meshCode]!, code: meshCode }
                   : guestFabricErrorMetadata(error);
                 // Fabric metadata includes its vetted name. Otherwise transfer only
                 // a host Error's string classification, never arbitrary properties
@@ -1158,6 +1230,18 @@ export class QuickJsRuntime {
                     context.setProp(errorHandle, "__fabricBashExit", metadata);
                   } finally {
                     metadata.dispose();
+                  }
+                }
+                // Only the trusted Jev transient HTTP error may expose numeric
+                // status/retryAfterMs. They never replace vetted metadata: each
+                // key is still assigned once.
+                for (const [key, value] of trustedJevErrorFields(error)) {
+                  if (safeMetadata && Object.hasOwn(safeMetadata, key)) continue;
+                  const field = context.newNumber(value);
+                  try {
+                    context.setProp(errorHandle, key, field);
+                  } finally {
+                    field.dispose();
                   }
                 }
                 promise.reject(errorHandle);
@@ -1200,7 +1284,7 @@ export class QuickJsRuntime {
       tokenBudget.dispose();
 
       cpuDeadlineAt = Date.now() + (options.maxCpuSliceMs ?? Infinity);
-      const setupResult = context.evalCode(guestSetupSource(options.piToolCanonicalFields, options.piTools !== false), "pi-fabric-setup.js");
+      const setupResult = context.evalCode(guestSetupSource(options.piToolCanonicalFields, options.piTools !== false, options.nativeStoreEnabled, options.codemodeProfile, options.nativeToolsEnabled), "pi-fabric-setup.js");
       if (setupResult.error) {
         const deadlineExceeded = interruptedByCpu || deadlineReached();
         if (deadlineExceeded) timedOut = true;
@@ -1233,7 +1317,7 @@ export class QuickJsRuntime {
         : { code: options.transpiledCode, sourceMap: options.transpiledSourceMap };
       const guestStackMap = createGuestStackMap(guestBundle.sourceMap);
       const guestLineCount = guestBundle.code.split("\n").length;
-      const invokeCode = "Promise.race([__piFabricMain(), globalThis.__fabricExecutionGate])";
+      const invokeCode = "Promise.race([globalThis.__fabricRun(__piFabricMain), globalThis.__fabricExecutionGate])";
       const wrappedCode = `${guestBundle.code}\n${invokeCode}`;
       if (options.setupTimeoutMs !== undefined) {
         // evalCode compiles AND evaluates: serialized source can escape the main
@@ -1308,10 +1392,14 @@ export class QuickJsRuntime {
             ? cancellationMessage(timeoutMessage())
             : remapGuestErrorText(formatValue(context.dump(resolution.error)), guestStackMap, guestLineCount);
         resolution.error.dispose();
+        const emittedHandle = context.getProp(context.global, "__fabricEmitted");
+        const emitted = context.dump(emittedHandle) as unknown[];
+        emittedHandle.dispose();
         abortHostCalls(deadlineExceeded && !interruptedByCpu ? executionDeadline.reason : error);
         return recordResult({
           value: undefined,
           logs,
+          emitted,
           terminationReason: options.signal?.aborted
             ? "aborted"
             : deadlineExceeded
@@ -1335,7 +1423,10 @@ export class QuickJsRuntime {
         abortHostCalls(executionDeadline.reason);
         return recordResult(executionDeadline.timeoutResult(logs));
       }
-      return recordResult({ value, logs, terminationReason: "completed" });
+      const emittedHandle = context.getProp(context.global, "__fabricEmitted");
+      const emitted = context.dump(emittedHandle) as unknown[];
+      emittedHandle.dispose();
+      return recordResult({ value, logs, emitted, terminationReason: "completed" });
     } catch (error) {
       const deadlineExceeded = timedOut || interruptedByCpu || deadlineReached();
       if (deadlineExceeded) timedOut = true;
@@ -1344,6 +1435,7 @@ export class QuickJsRuntime {
         ...(deadlineExceeded && !interruptedByCpu && !cancelled ? executionDeadline.timeoutResult(logs) : {}),
         value: undefined,
         logs,
+        emitted: emittedSnapshot(),
         terminationReason: cancelled ? "aborted" : deadlineExceeded ? "timed_out" : "runtime_error",
         error: cancelled
           ? cancellationMessage("Execution cancelled")
@@ -1357,6 +1449,9 @@ export class QuickJsRuntime {
       if (abortHandler) options.signal?.removeEventListener("abort", abortHandler);
       const unawaitedHostCalls = pendingHostPromises.size > 0;
       if (hostTasks.size > 0) {
+        // Ours: a delivered reply's task may still be finishing its chain; let host tasks
+        // settle within the grace before aborting (an early abort fabricates resident
+        // outcome uncertainty for replies the guest already received).
         const settled = await settleWithin(hostTasks, HOST_TASK_SETTLE_GRACE_MS);
         if (!settled) {
           abortHostCalls("Fabric guest execution ended before its host calls settled");
@@ -1404,4 +1499,21 @@ export class QuickJsRuntime {
       disposeQuickJsContext(context);
     }
   }
+}
+
+/**
+ * Numeric HTTP metadata from the trusted Jev transient error class only.
+ * Arbitrary host errors (including a `guestFields` map) never set numeric
+ * fields. Reads own data-property descriptors, so no accessor is invoked.
+ */
+function trustedJevErrorFields(error: unknown): Array<[string, number]> {
+  if (!(error instanceof JevTransientHttpError)) return [];
+  const fields: Array<[string, number]> = [];
+  for (const key of ["status", "retryAfterMs"] as const) {
+    const descriptor = Object.getOwnPropertyDescriptor(error, key);
+    if (!descriptor || !("value" in descriptor)) continue;
+    const value: unknown = descriptor.value;
+    if (typeof value === "number" && Number.isFinite(value)) fields.push([key, value]);
+  }
+  return fields;
 }

@@ -6,6 +6,7 @@ import { createHash } from "node:crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { ActorRegistryStore } from "../src/actors/registry-store.js";
+import { ActorDirectory } from "../src/actors/directory.js";
 import { ActorBindingStore } from "../src/actors/binding-store.js";
 import { MeshLockTimeoutError } from "../src/core/atomic-write.js";
 import { MeshStore } from "../src/mesh/store.js";
@@ -48,6 +49,9 @@ const fixture = async (files = false) => {
   }
   if (files) await new MeshStore(config.meshRoot, 256 * 1024, 500).put({ key: LIVENESS_POLICY_KEY,
     value: { version: 1, hostLeases: "files", participants: "files" }, identity: { id: "policy", name: "policy", kind: "agent" } });
+  // These fixtures measure publication/metadata, not autonomous dormancy. Gate
+  // eligibility before startup's first event check can change the seeded statuses.
+  vi.spyOn(ActorDirectory.prototype, "hasDormantIdleActor").mockReturnValue(false);
   const host = new ResidentHost(config); hosts.push(host); const heartbeatStartedAt = Date.now(); await host.start();
   await delay(20); await host.participants.refresh();
   return { root, config, host, records, heartbeatStartedAt };
@@ -276,6 +280,9 @@ describe("#4383 resident host presence batch", () => {
 
   it.each([false, true])("flushes only changed presence before the next full renewal (files=%s)", async files => {
     const { host, config, records } = await fixture(files);
+    // Exercise presence batching in isolation under the real reversible activation
+    // gate; autonomous dormancy is covered by residency-dormancy.test.ts.
+    host.actors.pauseForRelease();
     let now = Date.now(); vi.spyOn(Date, "now").mockImplementation(() => now);
     const full = vi.spyOn(host.participants, "refresh");
     const batch = vi.spyOn(host.mesh, "writeBatch");
@@ -379,12 +386,26 @@ describe("#4383 resident host presence batch", () => {
     const { host, config, records } = await fixture();
     const id = records[0]!.id;
     expect(host.mesh.get(`actors/${config.sessionId}/${id}`, { fresh: true })).toBeDefined();
+    if (process.platform === "linux" || process.platform === "darwin" || process.platform === "win32") {
     expect(await host.actors.remove(id, { wait: true })).toMatchObject({ removed: true });
     expect(host.actors.cleanupObligation(id)).toBeUndefined();
     expect(host.mesh.get(`actors/${config.sessionId}/${id}`, { fresh: true })).toBeUndefined();
     expect(readParticipantFile(config.meshRoot, participantKey(id))).toBeUndefined();
     expect(new ActorRegistryStore(config.actorRoot).records().some(row => row.id === id)).toBe(false);
     expect(host.actors.listOwned()).toHaveLength(39);
+    } else {
+      // On unsupported platforms no root tree deletion runs (smarty-dev#8090; follow-up smarty-dev#11335):
+      // registry revocation commits, the tree is kept and cleanup stays pending with the named refusal.
+      const dir = path.join(config.actorRoot, id);
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, "kept-11335.txt"), "history\n");
+      const removed = await host.actors.remove(id, { wait: true });
+      expect(removed).toEqual({ removed: true, cleaned: false,
+        pending: `removal cleanup failed: Root actor tree deletion needs the Main publication fence, which this platform (${process.platform}) lacks (smarty-dev#8090); follow-up smarty-dev#11335; the root ${config.rootId} actor tree is kept (a later remove or host start finishes it)` });
+      expect(fs.readFileSync(path.join(dir, "kept-11335.txt"), "utf8")).toBe("history\n");
+      expect(host.actors.cleanupObligation(id)).toBeDefined();
+      expect(new ActorRegistryStore(config.actorRoot).records().some(row => row.id === id)).toBe(false);
+    }
   });
 
   it("uses fresh registry custody before batching legacy actor presence", async () => {
@@ -402,6 +423,7 @@ describe("#4383 resident host presence batch", () => {
 
   it("checks active durable metadata in both scopes without building public records", async () => {
     const { host, records } = await fixture();
+    host.actors.pauseForRelease(); // keep fixture statuses stable while testing the metadata-only read
     const bindingReads = vi.spyOn(ActorBindingStore.prototype, "get");
     const messageReads = vi.spyOn(ActorRegistryStore.prototype, "messageCount");
     expect(host.actors.hasActiveDurableActor()).toBe(true);

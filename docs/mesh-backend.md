@@ -58,8 +58,34 @@ The gate decides from an inventory, never from what readers chose to register:
    bytes are the executed bytes. A mismatch, a symlink, no compiled digest, or no `/proc/self/fd` is
    `holder@lease-probe` (no copy, no path exec). The trust root is the installed package: a writer who
    can change the bundle can change the gate itself (smarty-dev#7800). Compiler pin: smarty-dev#8121.
+   The helper and the gate's own bundle, and every directory on their real paths up to the install root
+   (the package directory), must be owned by this user (or root), not group- or other-writable, and
+   inside that root (no symlink out of it), checked at each probe. Above the root, every ancestor up to
+   the first root-owned one that only root can change (or a root-owned sticky one, such as `/tmp`)
+   must be ours (or root) and not group- or other-writable. The operator's `bin/fabric-mesh-backend` runs
+   the same check on itself, the gate bundle and the helper BEFORE it loads the bundle, and exits 3
+   (a bundle another user swapped in would drop its own check). Otherwise it is
+   `holder@lease-probe` (smarty-dev#8145). The build strips group/other write from `dist/`, and the
+   build check refuses any such entry or symlink in `dist/`. A same-user in-place write between the hash and the exec
+   remains the accepted smarty-dev#7800 class: Node has no `memfd_create` to exec a sealed copy.
 
-   Known limit (smarty-dev#8116, the accepted gap that remains of smarty-dev#7936; acceptance: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/7936#issuecomment-6089556187): the window runs from the lease probe under the fence (before the switch opens `state.db`) to each commit, still under the fence. A process whose fd directory this user cannot read and that opens `state.db`, `-wal` or `-shm` WITHOUT any SQLite lock in that window is not detected; WAL connections always hold a lock on `-shm`. The gate does not probe again after its own open (its own fd makes the probe refuse), and the lease cannot be held through the commit: the switch's own open conflicts with it. Each gated switch prints this gap on stderr.
+   The fenced window (smarty-dev#8116): under the fence the helper runs as `fabric-mesh-lease --watch`. Its
+   inotify watches (the directories of `state.db`, `-wal` and `-shm`, plain and under `state-shadow/`, and
+   each existing file's inode) go up BEFORE the lease probe, so an open after the probe is an event,
+   whatever the opener's dumpability or locks. The final report is taken BEFORE the switch's own first open
+   of these files (pi-fabric#881), so every open by name in that window but the probe's own is foreign and
+   refuses. Closes are never netted and nothing is subtracted: inotify merges an event with an identical one
+   at the queue tail, whoever opened. The verdict stands for the checks before each commit. An inode opened through
+   another name (a hard link), a moved file, a removed file name (a hard link elsewhere can keep its inode open;
+   pi-fabric#881), a mode, owner or link-count change (IN_ATTRIB) on a watched file or directory (smarty-dev#9473), lost events (queue overflow), a `state-shadow/` that appeared, a watched
+   directory or file inode deleted, moved or dropped by inotify (its replacement would be unwatched),
+   or a helper that does not report within 10 s is never ready (`holder@lease:<file>` or
+   `holder@lease-probe`). On Linux a probe that cannot run is `holder@lease-probe` even when no SQLite file
+   exists yet. Neither simpler option works: any open breaks a held write lease, the switch's own
+   included, and a re-probe after the switch's own open always refuses.
+   Residual (smarty-dev#8116): r0, an open after the report (from the switch's own open of `state.db` to each
+   commit) is not watched; r1, a file created inside the window is watched by name until the helper adds its
+   inode watch, microseconds later, so a hard-link open in that gap is not seen.
 
    On Linux, the census's SQLite-file evidence (`state-database`) is replaced by this scan, so
    `fabric@unknown` no longer covers it: each holder is named and accepted only by its own
@@ -90,7 +116,11 @@ POSIX owner (no `process.geteuid`), so nothing can be verified there and the gat
 `reader-proof` refuses to write, and `cutover` and `import` refuse whether or not `readers/` exists;
 no `--accept-unready` lifts it (until Windows ACL checks exist: smarty-dev#7548).
 
-`--accept-unready NAME,...` is the only override.
+`--accept-unready NAME,...` is the only override. When a switch commits with accepted-unready readers, the CLI publishes exactly one addressed
+`fabric.alarm.mesh-switch-override` event through the existing mesh alarm path. The event carries the switch id and each accepted reader's
+name and reason, and goes to the owning lead selected by the normal alarm recipient configuration. Outcome append attempted, then alarm;
+the alarm does not depend on the append succeeding. An outcome-append failure warns on stderr (the outcome remains best-effort). If that post-commit publish fails,
+the committed switch stays committed; the CLI prints the accepted readers and failure on stderr and exits non-zero, without changing the switch record.
 
 Order of a switch (crash reruns included):
 
@@ -167,10 +197,17 @@ checks the schema and writes it under the fence:
 
 1. `release = basename(realpath(<its release root>/current))` of the running install.
 2. `provedEpoch` = `epoch` from `fabric-mesh-backend status --root <mesh> --json`.
-3. Copy `<mesh>/state.json` into an empty scratch directory and run
-   `fabric-mesh-backend import --root <scratch>` there.
+3. Run `fabric-mesh-backend import --scratch-proof-from <mesh>/state.json --json`. The CLI creates a fresh
+   private (0700) scratch directory itself (`mkdtemp` under the OS temp directory, or under
+   `--scratch-parent DIR`, whose whole chain must be yours or root's, contain no symlink at all, and not be
+   group/other-writable unless root-owned and sticky). It copies `state.json` (a regular file of at most
+   64 MiB) into that directory through the directory fd it holds, checks the path still names that
+   directory, and imports there without the readiness gate: the directory is provably a copy it just
+   made, never a live mesh. Check `"ok": true` and `"scratchProof": true`, and read `"root"`: that is
+   `<scratch>`. On a refusal or error the CLI removes that directory itself, through the held fd; any
+   cleanup failure is a warning on stderr and in `"cleanupWarnings"`. No `--accept-unready` is needed.
 4. Read every entry from `<scratch>` with its own SQLite read path; fail on any error or a count
-   other than the import's `entries`.
+   other than the import's `entries`. Then remove `<scratch>`.
 5. Write the proof JSON (format above) to a private temp file and run
    `fabric-mesh-backend reader-proof --root <mesh> --name <name> --proof-file <temp>`.
    It refuses `fabric*` names and `implementation: "fabric-meshstore"`.

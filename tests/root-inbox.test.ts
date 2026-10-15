@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { deliverRootInbox } from "../src/topology/root-inbox-delivery.js";
 import { MeshStore, type MeshEvent, type MeshIdentity } from "../src/mesh/store.js";
@@ -188,7 +188,7 @@ describe("RootInbox.wake", () => {
     const { mesh, clock, inbox, work, texts } = setup();
     const box = inbox(60_000);
     await box.next(held);
-    await work("addressed");
+    await work("addressed", "fabric-v2");
     expect(await box.wake(held, idle)).toBeUndefined();            // inside the steer grace
     clock.advance(61_000);
     const batch = await box.wake(notHeld, idle);
@@ -199,6 +199,42 @@ describe("RootInbox.wake", () => {
     expect(wakes(mesh).map((event) => [event.kind, event.from.id, event.data])).toEqual([
       ["idle-wake", me.id, { count: 1, reason: "idle", ids: batch!.events.map((event) => event.id) }],
     ]);
+  });
+
+  it.each(["answer", "blocker", "handoff", "completion"])("queues a late addressed %s without a turn, including a mixed fresh batch", async (kind) => {
+    const { mesh, work } = setup();
+    let now = Date.now();
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+    const box = new RootInbox(mesh, me, () => [me.id], { now: () => now, steerGraceMs: 0, wakeCooldownMs: 0 });
+    box.start();
+    const late = await work("late actionable result", me.id, "fleet.work.tasks", "late", kind);
+    now += 3 * 60 * 60_000;
+    const pending = await box.wake(notHeld, idle);
+    expect(pending!.events.map(event => event.id)).toEqual([late.id]);
+    expect(wakes(mesh)).toEqual([]);
+    const entries: Array<{ type: string } & ReturnType<typeof rootInboxMessage>> = [];
+    const options: Array<Parameters<ExtensionAPI["sendMessage"]>[1]> = [];
+    const pi = { sendMessage: (message: ReturnType<typeof rootInboxMessage>, delivery: Parameters<ExtensionAPI["sendMessage"]>[1]) => {
+      entries.push({ type: "custom_message", ...message }); options.push(delivery);
+    } } as unknown as ExtensionAPI;
+    deliverRootInbox(pi, pending!.events);
+    expect(entries.map(entry => entry.details.ids)).toEqual([[late.id]]);
+    expect(options).toEqual([{ deliverAs: "followUp", triggerTurn: false }]);
+    expect(await box.wake(rootInboxSession(entries), idle)).toBeUndefined();
+    // A mixed batch can wake for fresh work only, without a late message triggering it.
+    const another = await work("another late result", me.id, "fleet.work.tasks", "another", kind);
+    now += 3 * 60 * 60_000;
+    const fresh = await work("fresh work"); now++;
+    const mixed = await box.wake(rootInboxSession(entries), idle);
+    expect(mixed!.events.map(event => event.id)).toEqual([another.id, fresh.id]);
+    deliverRootInbox(pi, mixed!.events);
+    expect(entries.map(entry => entry.details.ids)).toEqual([[late.id], [another.id], [fresh.id]]);
+    expect(options.slice(1)).toEqual([
+      { deliverAs: "followUp", triggerTurn: false }, { deliverAs: "followUp", triggerTurn: true },
+    ]);
+    expect((await box.next(rootInboxSession(entries))).events).toEqual([]);
+    await box.close();
+    expect(wakes(mesh).map(event => event.data)).toEqual([{ count: 1, reason: "addressed", ids: [fresh.id] }]);
   });
 
   it("never wakes for a broadcast without `to`, or for an event to someone else", async () => {
@@ -225,11 +261,11 @@ describe("RootInbox.wake", () => {
     const { clock, inbox, work, texts } = setup();
     const box = inbox(0);
     await box.next(held);
-    await work("first");
+    await work("first", "fabric-v2");
     clock.advance(1);
     expect(texts((await box.wake(held, idle))!.events)).toEqual(["first"]);
     clock.advance(60_000);
-    await work("a minute later");
+    await work("a minute later", "fabric-v2");
     clock.advance(1);
     expect(await box.wake(held, idle)).toBeUndefined();
     // The held-back event is not pending, so a p0 behind it still wakes at once, with both.
@@ -239,7 +275,7 @@ describe("RootInbox.wake", () => {
     await work("steer kind", me.id, "fleet.work.pi-fabric.3", "s", "steer");
     clock.advance(1);
     expect(texts((await box.wake(held, idle))!.events)).toEqual(["steer kind"]);
-    await work("later");
+    await work("later", "fabric-v2");
     clock.advance(4 * 60_000);
     expect(await box.wake(held, idle)).toBeUndefined();
     clock.advance(60_000);
@@ -264,17 +300,17 @@ describe("RootInbox.wake", () => {
     const { mesh, clock, inbox, work, texts } = setup();
     const box = inbox(0);
     await box.next(held);
-    await work("first");
+    await work("first", "fabric-v2");
     clock.advance(1);
     expect(await box.wake(held, idle)).toBeDefined();               // the cooldown starts here
-    for (let index = 1; index <= 20; index++) await work(`item ${index}`);
+    for (let index = 1; index <= 20; index++) await work(`item ${index}`, "fabric-v2");
     await work("urgent", me.id, "fleet.work.pi-fabric.2", "urgent", "p0");
     clock.advance(1);
     const first = await box.wake(held, idle);
     expect(first!.events).toHaveLength(20);
     // The settle of that run brings the next batch, with the urgent event: none is skipped.
     expect(texts((await box.next(held)).events)).toEqual(["urgent"]);
-    for (let index = 1; index <= 4; index++) await work(`${index}${"x".repeat(9_000)}`);
+    for (let index = 1; index <= 4; index++) await work(`${index}${"x".repeat(9_000)}`, "fabric-v2");
     await work("urgent steer", me.id, "fleet.work.pi-fabric.3", "s", "steer");
     clock.advance(1);
     expect((await box.wake(held, idle))!.events).toHaveLength(4);
@@ -282,7 +318,7 @@ describe("RootInbox.wake", () => {
     await new Promise((resolve) => setTimeout(resolve, 50));
     expect(wakes(mesh).map((event) => (event.data as { reason: string }).reason)).toEqual(["idle", "p0", "p0"]);
     // Without an urgent event, a full batch inside the cooldown still waits.
-    for (let index = 1; index <= 21; index++) await work(`plain ${index}`);
+    for (let index = 1; index <= 21; index++) await work(`plain ${index}`, "fabric-v2");
     clock.advance(1);
     expect(await box.wake(held, idle)).toBeUndefined();
   });

@@ -1,3 +1,4 @@
+import { interruptedModelStreamError } from "./provider-error.js";
 import fs from "node:fs";
 import * as nodeModule from "node:module";
 import path from "node:path";
@@ -8,9 +9,8 @@ export interface ActorContextReseed {
   tokens: number; contextWindow: number; reason: string; summary: string; summaryTokens: number;
 }
 
-/** Pure estimator belonging to the selected Pi launcher, not a bundled peer/runtime. */
-export async function loadActorInputEstimator(binary: string): Promise<((text: string) => number) | undefined> {
-  let estimator: string;
+/** The selected Pi launcher's own pi-ai package.json, or undefined for an opaque launcher. */
+function selectedPiAiPackage(binary: string): string | undefined {
   try {
     const selected = fs.realpathSync(binary);
     // Dependency resolution alone does not identify the executable: an opaque
@@ -41,13 +41,48 @@ export async function loadActorInputEstimator(binary: string): Promise<((text: s
       if (parent === directory) break;
       directory = parent;
     }
-    if (!packageFile) return undefined;
-    estimator = path.join(path.dirname(packageFile), "dist", "utils", "estimate.js");
+    return packageFile;
   }
   catch { return undefined; } // Opaque launchers retain their native admission policy.
+}
+
+/** Pure estimator belonging to the selected Pi launcher, not a bundled peer/runtime. */
+export async function loadActorInputEstimator(binary: string): Promise<((text: string) => number) | undefined> {
+  const packageFile = selectedPiAiPackage(binary);
+  if (!packageFile) return undefined;
+  const estimator = path.join(path.dirname(packageFile), "dist", "utils", "estimate.js");
   const native = await import(pathToFileURL(estimator).href) as { estimateTextTokens(text: string): number };
   if (typeof native.estimateTextTokens !== "function") throw new Error("Selected Pi launcher lacks native text estimation");
   return native.estimateTextTokens;
+}
+
+export type PiContextOverflow = (message: Record<string, unknown>, contextWindow: number) => boolean;
+
+/**
+ * smarty-dev#3238: Pi's own provider-overflow classifier, pi-ai isContextOverflow (utils/overflow, a
+ * pure module): the selected launcher's copy, else the one this worker resolves. It judges the
+ * structured assistant message (stopReason, errorMessage, provider, usage), as Pi's overflow
+ * recovery does; undefined leaves only Pi's own refusal and the activation window's typed frame.
+ */
+export async function loadPiContextOverflow(binary: string): Promise<PiContextOverflow | undefined> {
+  const packageFile = selectedPiAiPackage(binary);
+  const candidates = [
+    ...(packageFile ? [pathToFileURL(path.join(path.dirname(packageFile), "dist", "utils", "overflow.js")).href] : []),
+    "@earendil-works/pi-ai/utils/overflow",
+  ];
+  for (const candidate of candidates) {
+    try {
+      const native = await import(candidate) as { isContextOverflow?: unknown };
+      if (typeof native.isContextOverflow === "function") {
+        const classify = native.isContextOverflow as (message: unknown, contextWindow?: number) => boolean;
+        return (message, contextWindow) => {
+          if (typeof message.errorMessage === "string" && interruptedModelStreamError(message.errorMessage)) return false;
+          try { return classify(message, contextWindow) === true; } catch { return false; }
+        };
+      }
+    } catch { /* try the next copy */ }
+  }
+  return undefined;
 }
 
 const object = (value: unknown): Record<string, unknown> | undefined =>

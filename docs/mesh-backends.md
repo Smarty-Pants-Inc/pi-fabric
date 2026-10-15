@@ -16,12 +16,97 @@ store open. Before this, it was ignored, and a typo silently opened a different 
 |---|---|---|
 | `file` | `StateFile` | none |
 | `sqlite`, `shadow` | `SqliteStateBackend`, `ShadowStateBackend` | non-local filesystem (R16), no `node:sqlite` (R19) |
-| `nats` | throws `MeshStateBackendNotBuiltError` (`FABRIC_MESH_STATE_BACKEND_NOT_BUILT`) | none |
+| `nats` | the backend a host prepared with `openNatsStateBackend` for that root (`src/mesh/state-backend-nats.ts`); otherwise throws `MeshStateBackendNotBuiltError` (`FABRIC_MESH_STATE_BACKEND_NOT_BUILT`) | none |
 
 `nats` never falls back to `file`. A host that wrote local state while its peers wrote the
-shared stream would split the mesh. fabric-v2 plugs in by setting `STATE_BACKEND_FACTORIES.nats`
+shared stream would split the mesh.
+
+Phase 1 (smarty-dev#7504, single host) implements option (c) below.
+- **The factory and the client:** the factory is synchronous and the connection is not, so a host first awaits
+`openNatsStateBackend({ root, servers })`. That call loads the official nats.js v3 client
+(`@nats-io/transport-node`, `@nats-io/jetstream`; a lazy entry point, never in the startup graph), refuses and
+replays the stream. The factory then returns that prepared backend.
+- **Refusals:** a server older than 2.11; a server whose `sync_always` is not proven true, unless the host passes
+`acceptPeriodicSync` (then `sync()`, the #9313 barrier, rejects with `MeshStateNatsNotDurableError`: not durable); a retired stream; writes while the stream is importing; a `fresh` read while the projector lags
+(busy, retryable); and a stream message that could not have passed the CAS (the backend fails closed).
+- **Bridges (interim):** on `nats` the R20 state write fence excludes no other writer, so a bridge's held-event
+ownership check (security F2) cannot hold. A root where a bridge holds events (a mirrored remote host record) refuses
+`nats`, and a bridge refuses a `nats` store (`FABRIC_MESH_STATE_NATS_BRIDGE_REFUSED`). This lasts until the event log
+moves onto the state stream (smarty-dev#9725) or a lease fences the append.
+- **Lifecycle:** `import-begin` (ready, newer epoch) -> importing; `import-commit` (importing, same epoch) -> ready;
+`retire` (ready or importing, newer epoch) -> retired, terminal. Any other control record, or a batch after `retire`, is a
+protocol violation: the projector fails closed.
+- **Transport:** a non-loopback server must be `tls://` (the client then requires TLS; `tls` passes CA and client
+files) and a non-loopback monitoring URL `https://`; plaintext refuses before connecting
+(`FABRIC_MESH_STATE_NATS_INSECURE`). Loopback (127.0.0.0/8, ::1, localhost) may be plaintext.
+- **Streams:** one per mesh root, `FABRIC_MESH_` plus 32 hex characters of the SHA-256 of the root's realpath.
+- **Replica placement:** an open or migration uses its explicit `replicas`, else the agent-layer
+`mesh.nats.replicas`. It never silently lowers that value. JetStream `err_code: 10005` (no suitable peers for
+placement, such as an offline peer) retries within `placementTimeoutMs`, default **30 000 ms**: enough for a normal
+peer restart and metadata election, the same scale as cluster readiness. One budget from the first create covers
+placement retries, backoff, subsequent pending requests and post-create leader readiness. Exhaustion throws
+`MeshStateNatsUnavailableError` (`FABRIC_MESH_STATE_NATS_UNAVAILABLE`, `reason: "placement-unavailable"`,
+`natsErrCode: 10005`), with the original sanitized cause. Other API/configuration/permission errors do not gain retries;
+the existing bounded transport-election/lost-ack handling is unchanged. Restore the peers, then retry the operation.
+- **A lost ack:** the CAS stored the batch, if at all, at exactly its base sequence plus 1. After a retry fails the
+CAS, the backend reads that one message and compares the batch id, so the batch is never run twice. If a purge
+removed that message meanwhile, the outcome is unknown (`FABRIC_MESH_STATE_NATS_OUTCOME_UNKNOWN`), never a rerun.
+- **Bounded replay:** every `snapshotEvery` messages (default 10 000; `compact()` on demand) a writer publishes a
+snapshot of the model, in chunks on the batch subject and one end record on `<stream>.snapshot`, as one CAS chain right
+after the model's sequence. It then purges the stream below the first chunk. Any commit inside the chain abandons the
+snapshot (its chunks are inert). A host opens from the latest end record, and a projector whose delivery skips
+sequences (a purge passed it) reloads from it. A stream purged without a snapshot is refused.
+- **Snapshot integrity:** the end record commits to the sha256 of the canonical body (sorted by key), the previous
+snapshot's digest, the body's bytes and entries, and the lifecycle (status, epoch). A loading host re-checks all of it
+after the join. Every live projector re-serializes its own model when it applies an end record and compares the
+digest and the chain. Any mismatch (an altered, dropped or swapped chunk, a wrong epoch) fails closed
+(`FABRIC_MESH_STATE_NATS_SNAPSHOT_INTEGRITY`). This is integrity, not authentication: a stream writer that forges a
+whole self-consistent snapshot is caught by live projectors, not by a host that opens after it (the same trust as
+forging a batch).
+- **Bounds:** chunks, chunk size, bytes and entries are checked against the state bound (`maxStateBytes`, 32 MiB)
+before anything is fetched or joined; the replay after the snapshot is checked against `maxReplay` (100 000) before
+the consumer starts (`FABRIC_MESH_STATE_NATS_LIMIT`). Nothing is truncated.
+- **Repeated purges:** a gap seen during a re-sync is recorded, not dropped; the re-sync re-checks the stream's first
+sequence and loops (3 times), then the backend fails closed (`FABRIC_MESH_STATE_NATS_UNAVAILABLE`), never stale.
+- **The read model:** in memory, rebuilt at open from the snapshot plus the messages after it. Persisting it in the `state.db` schema, the
+cross-writer write fence, the migration flag and the conformance suite against a real server are phase 2. fabric-v2 plugs in by setting `STATE_BACKEND_FACTORIES.nats`
 to `{ unavailable?, create }`, where `create` returns a `StateBackend`. Its `unavailable` must
 also refuse (throw), never return a reason, for the same reason.
+
+### Required nats-server configuration (pi-fabric#907)
+
+No fleet NATS server is deployed (the backend is opt-in). Any server that hosts a mesh state stream MUST be configured
+as below. The stream is `FABRIC_MESH_<32 hex>` (`natsStreamName`); its subjects are `<stream>.state` and
+`<stream>.snapshot`.
+
+```
+max_payload: 1MB                    # 1048576; the adapter refuses a server whose max_payload is larger
+jetstream { sync_interval: always } # the adapter refuses a server without sync_always (unless accepted)
+authorization {                     # or an account; the adapter refuses a NON-loopback server without auth
+  users = [
+    { user: fleet, password: $FLEET_NATS_PASSWORD, permissions: {
+        publish: { allow: [
+          "FABRIC_MESH_*.state", "FABRIC_MESH_*.snapshot",
+          "$JS.API.INFO", "$JS.API.STREAM.INFO.FABRIC_MESH_*", "$JS.API.STREAM.CREATE.FABRIC_MESH_*",
+          "$JS.API.STREAM.UPDATE.FABRIC_MESH_*", "$JS.API.STREAM.MSG.GET.FABRIC_MESH_*",
+          "$JS.API.STREAM.PURGE.FABRIC_MESH_*", "$JS.API.CONSUMER.CREATE.FABRIC_MESH_*",
+          "$JS.API.CONSUMER.CREATE.FABRIC_MESH_*.>", "$JS.API.CONSUMER.MSG.NEXT.FABRIC_MESH_*.>",
+          "$JS.API.CONSUMER.DELETE.FABRIC_MESH_*.>", "$JS.API.CONSUMER.INFO.FABRIC_MESH_*.>", "$JS.FC.FABRIC_MESH_*.>",
+          "$JS.ACK.FABRIC_MESH_*.>" ] }
+        subscribe: { allow: [ "_INBOX.>" ] } } }
+    # Every other user: no publish on FABRIC_MESH_* and no $JS.API.STREAM.PURGE / DELETE / UPDATE on them.
+  ]
+}
+```
+
+- **Only the fleet user** may publish to the state subjects or purge the stream; every other user is denied (the
+  default once `permissions` exist). `DELETE` of the stream is granted to nobody.
+- The stream's `max_msg_size` is set to 1048576 when the adapter creates it, and a stream with no limit or a larger one
+  is refused (`FABRIC_MESH_STATE_NATS_LIMIT`).
+- **What the adapter can and cannot check:** it reads the server's INFO, and refuses a non-loopback server whose INFO
+  does not say `auth_required`, a `max_payload` over 1 MiB, a server older than 2.11 and one without `sync_always`. It
+  CANNOT see other users' permissions (NATS exposes no client API for them), so the publish and purge rules above are
+  an operator requirement, checked when the server is deployed (phase 2's CI job uses this exact config).
 
 ## What the selector and migration need from fabric-v2: option (c)
 
@@ -69,7 +154,10 @@ the marker is removed. The new parts are a `nats` value for `MeshBackendFlag` an
    refuse. The migrator projects the stream and checks the digest against the source snapshot
    (as the `import-verify` step). It then re-reads the source and compares it with G0, as
    cutover does today.
-3. **Commit.** Install the moved marker (`backend: "nats"`, epoch E+1) over `state.json`. Then
+3. **Commit.** Install the NATS moved marker (epoch E+1) over `state.json`. It is the SQLite
+   marker's exact shape plus `natsStream`, so every release since pi-fabric#627 (main c58cec72)
+   refuses it on its tolerant read as well (a new `format` would read as damage there, so as an
+   EMPTY mesh). Releases before c58cec72 know no marker, the same gap the SQLite cutover accepts. Then
    publish `import-commit{E+1}` with the expected last sequence. Then set the local flag to
    `nats`. Every crash point reruns from the stream head plus the marker, as the `importing`
    rerun does now.
@@ -79,6 +167,32 @@ the marker is removed. The new parts are a `nats` value for `MeshBackendFlag` an
    `retire` sequence through the existing import (into `state.db`) or export (into
    `state.json.rollback-<E>.tmp`) path. Verify the digest, switch the local flag, and replace
    the marker. **Abort** publishes `unretire{E+2}`, as `abortMeshRollback` does.
+
+**Built (smarty-dev#9670, `backend-migration-nats.ts`): file <-> nats.** `importMeshStateToNats`
+and `rollbackMeshStateFromNats` run steps 2-4 for a file root (no `state.db`, epoch 0, so E+1 = 1
+and `retire` is epoch 2). A sqlite root refuses: roll it back to file first (`rollbackMeshState`),
+then import. The details:
+
+- `import-begin` also records the source digest and `readGeneration`.
+- The chunks are deterministic batch records: entries in key order, then tombstones in eviction
+  order, at most 512 KiB of changes each, with fixed message ids.
+- The source is kept at `state.json.nats-cutover-<E+1>` before the marker goes in.
+- **Rerun without the marker:** the same source resumes. Stored chunks must match byte for byte.
+  A changed source refuses. An import never purges, and the stream name is derived from the root (pi-fabric#937).
+  A leftover of a failed import (still importing, no marker) may be deleted on the server, after checking that no
+  Fabric process serves the root from NATS. A stream with committed state refuses the import and is never deleted.
+- **Rerun with the marker:** the stream is checked against the kept copy, then committed.
+- **Rollback:** it retires the stream and exports the projection through the `state.json`
+  encoder into `state.json.nats-rollback-<E+2>-<uuid>.tmp`. It reads the temp back, checks the digest
+  and renames it over the marker. A rerun redoes the export, or only verifies after the rename.
+- **Files:** every file is created with O_CREAT|O_EXCL|O_NOFOLLOW at 0600 and checked as our own
+  regular file. An existing kept copy must be ours and hold the source's digest, else the import refuses.
+- **Limits (`LIMIT: FABRIC_MESH_NATS_MIGRATION_LIMIT`):** `maxReplay` stream messages,
+  `maxStateBytes` of projected state and of the export, and `maxStateTombstones` (bounded as the
+  backend bounds them), and `maxPayloadBytes` per import chunk (default 1 MiB, the server default),
+  checked before `import-begin`. A rollback counts its own `retire` record against `maxReplay`. A
+  limit refuses before any retire, rename or commit.
+- **Not built:** the sqlite-direct path and abort (`unretire`).
 
 The local locks fence only this host. Other hosts are fenced by the stream itself, because every
 nats write carries an expected sequence. Each host's `.lock` and the census still stop its

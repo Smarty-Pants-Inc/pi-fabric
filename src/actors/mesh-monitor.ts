@@ -1,7 +1,8 @@
 import fs, { type FSWatcher } from "node:fs";
-import { MeshBackgroundRetry } from "../core/atomic-write.js";
+import { MeshBackgroundRetry, type MeshOutageAlarm } from "../core/atomic-write.js";
 import path from "node:path";
 import { writeJsonAtomic } from "../core/atomic-write.js";
+import { warnWatchFallback } from "../core/watch-fallback.js";
 import type { FabricMeshConfig } from "../config.js";
 import { meshCursorAtStart, meshCursorGeneration, type MeshEvent, type MeshStore } from "../mesh/store.js";
 
@@ -14,12 +15,15 @@ type MonitorCursor = { cursor: number; last?: { sequence: number; id: string } }
  * durable work, so they skip the replay window and are read back from the mesh archive.
  */
 const WORK_TOPIC_PREFIX = "fleet.";
-const isWork = (event: MeshEvent): boolean => event.topic.startsWith(WORK_TOPIC_PREFIX);
 
 /** Owns observation resources and the format-1 cursor, never actor ownership or dispatch policy. */
 export class ActorMeshMonitor {
-  readonly #backgroundPoll = new MeshBackgroundRetry("actor mesh monitor");
+  // The monitor has no identity or publish of its own: its owner supplies the outage sink (smarty-dev#8825).
+  readonly #backgroundPoll = new MeshBackgroundRetry("actor mesh monitor")
+    .alarmsTo((alarm) => this.callbacks.outageAlarm?.(alarm));
   #safetyNetTimer: NodeJS.Timeout | undefined;
+  #dueTimer: NodeJS.Timeout | undefined;
+  #dueAt: number | undefined;
   #watcher: FSWatcher | undefined;
   #stamp: string | undefined;
   #needsPoll = true;
@@ -46,7 +50,7 @@ export class ActorMeshMonitor {
   #lastCheckpointAt = Date.now();
 
   constructor(
-    readonly mesh: Pick<MeshStore, "root" | "latestOffset" | "tail"> & Partial<Pick<MeshStore, "read" | "oldestSequence" | "nextEventAfter" | "latestCursor">>,
+    readonly mesh: Pick<MeshStore, "root" | "latestOffset" | "tail"> & Partial<Pick<MeshStore, "read" | "oldestSequence" | "nextEventAfter" | "latestCursor" | "nextScheduleDueAt" | "releaseDueSchedules">>,
     readonly config: Pick<FabricMeshConfig, "enabled" | "actorPollMs" | "maxReadEvents">,
     readonly callbacks: {
       cursorPath?: string | undefined;
@@ -55,11 +59,19 @@ export class ActorMeshMonitor {
        * restart replays the gap it missed and not a long downtime (#37's replay storm).
        */
       maxReplayAgeMs?: number | undefined;
+      /** Sleeping residents replay subscribed events after live-log compaction. */
+      replayAll?: boolean;
       beforePoll(): boolean;
       /** Rechecked per event: a page can outlast the resident host lease. */
       canConsumeMesh?: (() => boolean) | undefined;
-      /** false: full (retry unchanged); "ignored": no local delivery; true/void: handed on. */
-      onEvent(event: MeshEvent): boolean | void | "ignored";
+      /** New admission only; receipt work for an already consumed prefix remains allowed. */
+      canAdmit?: (() => boolean) | undefined;
+      /** Owner-defined durable input also survives replay expiry and archive rewrites. */
+      isDurableWork?: ((event: MeshEvent) => boolean) | undefined;
+      /** "deferred": hold on every topic; false: ordinary queue backpressure; "ignored": no local delivery. */
+      onEvent(event: MeshEvent): boolean | void | "ignored" | "deferred";
+      /** The owner's MeshBackgroundRetry outage sink (smarty-dev#8825). */
+      outageAlarm?: ((alarm: MeshOutageAlarm) => Promise<unknown> | void) | undefined;
     },
   ) {
     const saved = this.#readCursor();
@@ -91,31 +103,60 @@ export class ActorMeshMonitor {
       // is a wake, not evidence that nothing changed. The stamp filters duplicates.
       const watcher = fs.watch(this.mesh.root, { persistent: false }, (_event, filename) => {
         const name = filename == null ? undefined : path.basename(filename.toString());
-        if (name !== undefined && name !== "events.jsonl" && name !== "generation") return;
+        // schedules.json re-arms the due timer when another process schedules.
+        if (name !== undefined && name !== "events.jsonl" && name !== "generation" && name !== "schedules.json") return;
         this.#schedule();
       });
       this.#watcher = watcher;
-      watcher.on("error", () => this.#fallback(watcher));
-    } catch {
+      watcher.on("error", (error) => this.#fallback(watcher, error));
+    } catch (error) {
       // An unsupported watch (including a missing directory) takes the fallback.
+      // ENOSPC here is the inotify watch limit (smarty-dev#5247), not a full disk: poll instead
+      // and say so once, so nobody hunts for free space and the session never crashes.
+      warnWatchFallback("actor mesh monitor", this.mesh.root, error, this.config.actorPollMs);
     }
     this.#startSafetyNet();
     this.schedule();
   }
 
+  caughtUp(): boolean {
+    return !this.#polling && this.#archiveAfter === undefined && this.#safeCursor.cursor === this.mesh.latestOffset();
+  }
+
   /** Checked release receipt; normal best-effort writes are NOT a handover barrier. */
-  checkpointForRelease(): void {
+  checkpointForRelease(assertHeld?: () => void): void {
+    assertHeld?.();
     if (this.#polling) throw new Error("Actor mesh cursor still polling");
     if (this.callbacks.cursorPath) {
       writeJsonAtomic(this.callbacks.cursorPath, { format: 1, ...this.#safeCursor }, { durable: true, space: 2 });
+      assertHeld?.();
       this.#persistedCursor = JSON.stringify(this.#safeCursor);
     }
+    this.releaseCheckpointReceipt();
+  }
+
+  releaseCheckpointReceipt(): unknown {
+    if (this.#polling) throw new Error("Actor mesh cursor still polling");
+    if (this.callbacks.cursorPath && JSON.stringify(this.#readCursor()) !== JSON.stringify(this.#safeCursor)) {
+      throw new Error("Actor mesh cursor release readback differs");
+    }
+    return { format: 1, ...this.#safeCursor, persisted: !!this.callbacks.cursorPath };
+  }
+
+  #isWork(event: MeshEvent): boolean {
+    return event.topic.startsWith(WORK_TOPIC_PREFIX) || this.callbacks.isDurableWork?.(event) === true;
+  }
+
+  #mayAdmit(): boolean {
+    return !this.#closed && this.callbacks.canConsumeMesh?.() !== false && this.callbacks.canAdmit?.() !== false;
   }
 
   close(): void {
     this.#closed = true;
     if (this.#safetyNetTimer) clearInterval(this.#safetyNetTimer);
     this.#safetyNetTimer = undefined;
+    if (this.#dueTimer) clearTimeout(this.#dueTimer);
+    this.#dueTimer = undefined;
     this.#watcher?.close();
     this.#watcher = undefined;
     if (this.#started) this.#persistCursor(true);
@@ -146,12 +187,29 @@ export class ActorMeshMonitor {
     });
   }
 
-  #fallback(watcher: FSWatcher): void {
+  #fallback(watcher: FSWatcher, error: unknown): void {
     if (this.#closed || this.#watcher !== watcher) return;
+    warnWatchFallback("actor mesh monitor", this.mesh.root, error, this.config.actorPollMs);
     watcher.close();
     this.#watcher = undefined;
     this.#startSafetyNet();
     this.schedule();
+  }
+
+  // A schedule falling due changes no file, so wake at its due time instead of
+  // waiting for the reconcile interval.
+  #armDue(dueAt: number | undefined): void {
+    if (dueAt === this.#dueAt) return;
+    if (this.#dueTimer) clearTimeout(this.#dueTimer);
+    this.#dueTimer = undefined;
+    this.#dueAt = dueAt;
+    if (dueAt === undefined || this.#closed) return;
+    this.#dueTimer = setTimeout(() => {
+      this.#dueTimer = undefined;
+      this.#dueAt = undefined;
+      this.schedule();
+    }, Math.min(Math.max(0, dueAt - Date.now()), 2_147_000_000));
+    this.#dueTimer.unref();
   }
 
   #startSafetyNet(): void {
@@ -183,7 +241,7 @@ export class ActorMeshMonitor {
     if (!explicit && !maintenance && unchanged) return;
     // The safety net also retains the manager's registry/ownership/filter/child-result
     // recovery obligations, even with a quiet log. It does not reread that log.
-    if (!this.callbacks.beforePoll() || this.callbacks.canConsumeMesh?.() === false) {
+    if (!this.callbacks.beforePoll() || !this.#mayAdmit()) {
       this.#needsPoll = true;
       return;
     }
@@ -196,12 +254,24 @@ export class ActorMeshMonitor {
     this.#needsPoll = true;
     this.#polling = true;
     try {
+      // Whichever process polls first releases due schedules; the store lock
+      // makes the release exactly-once, and this poll's tail then sees them.
+      // The lockless due check keeps an idle poll synchronous.
+      let dueAt: number | undefined;
+      try { dueAt = this.mesh.nextScheduleDueAt?.(); } catch { dueAt = undefined; }
+      if (dueAt !== undefined && dueAt <= Date.now()) {
+        await this.mesh.releaseDueSchedules?.().catch(() => undefined);
+        if (!this.#mayAdmit()) return;
+        try { dueAt = this.mesh.nextScheduleDueAt?.(); } catch { dueAt = undefined; }
+      }
+      if (!this.#mayAdmit()) return;
+      this.#armDue(dueAt);
       if (this.#archiveAfter !== undefined && !this.#catchUpArchive()) return;
       // Live and catch-up both read whole pages. A throwing dispatch restores the boundary
       // before its event, so an empty later poll cannot checkpoint past failed work.
       const start = this.#offset;
       const tail = this.mesh.tail(start, this.config.maxReadEvents);
-      if (this.callbacks.canConsumeMesh?.() === false) return;
+      if (!this.#mayAdmit()) return;
       // A rewrite restarts the stream at the retained log; the events it cut are in the archive
       // (it holds each event before it goes live). The generation and the events file are two
       // reads, and a rewrite renames the file before it bumps the generation, so a page can come
@@ -231,17 +301,17 @@ export class ActorMeshMonitor {
       let handedOn = false;
       if (!catchingUp) this.#offset = tail.nextOffset;
       for (const [index, event] of tail.events.entries()) {
-        if (this.callbacks.canConsumeMesh?.() === false) {
+        if (!this.#mayAdmit()) {
           this.#offset = index === 0 ? start : tail.cursors?.[index - 1] ?? start;
           this.#safeCursor = { cursor: this.#offset, ...(this.#last ? { last: this.#last } : {}) };
           return;
         }
         if (this.#delivered(event)) continue;
-        if (this.#replayFloor !== undefined && event.createdAt < this.#replayFloor && !isWork(event)) {
+        if (this.#replayFloor !== undefined && event.createdAt < this.#replayFloor && !this.#isWork(event) && !this.callbacks.replayAll) {
           if (typeof event.sequence === "number" && typeof event.id === "string") this.#last = { sequence: event.sequence, id: event.id };
           continue;
         }
-        let accepted: boolean | void | "ignored";
+        let accepted: boolean | void | "ignored" | "deferred";
         try {
           accepted = this.callbacks.onEvent(event);
         } catch (error) {
@@ -256,11 +326,16 @@ export class ActorMeshMonitor {
           this.#safeCursor = { cursor: this.#offset, ...(this.#last ? { last: this.#last } : {}) };
           return;
         }
-        // A receiver that is full holds the event: while catching up, and for work events always
-        // (smarty-dev#754), so work waits for room instead of being dropped.
-        if (accepted === false && (catchingUp || isWork(event))) {
-          // A full actor queue rejected this event while catching up (smarty-dev#472): keep
-          // the cursor on it and offer it again later; earlier events are already delivered.
+        // A cut inside the synchronous callback must never turn false into a live drop.
+        if (accepted === false && this.callbacks.canAdmit?.() === false) {
+          this.#offset = index === 0 ? start : tail.cursors?.[index - 1] ?? start;
+          this.#safeCursor = { cursor: this.#offset, ...(this.#last ? { last: this.#last } : {}) };
+          return;
+        }
+        // Explicit deferral always holds input (including live non-work). Ordinary full
+        // receivers still hold only catch-up/durable work (smarty-dev#472, smarty-dev#754).
+        if (accepted === "deferred" || (accepted === false && (catchingUp || this.#isWork(event) || this.callbacks.replayAll))) {
+          // Keep the cursor on this event and offer it again; earlier events are delivered.
           // The boundary comes from this same read, so a compaction since cannot move it.
           this.#offset = index === 0 ? start : tail.cursors?.[index - 1] ?? start;
           this.#writeCursor(handedOn);
@@ -268,6 +343,12 @@ export class ActorMeshMonitor {
         }
         if (accepted !== false && accepted !== "ignored") handedOn = true;
         if (typeof event.sequence === "number" && typeof event.id === "string") this.#last = { sequence: event.sequence, id: event.id };
+        if (this.callbacks.canAdmit?.() === false) {
+          // Finish the accepted prefix's receipt; never move over the next held input.
+          this.#offset = tail.cursors?.[index] ?? start;
+          this.#writeCursor(handedOn);
+          return;
+        }
       }
       if (catchingUp) this.#offset = tail.nextOffset;
       this.#writeCursor(handedOn);
@@ -297,6 +378,7 @@ export class ActorMeshMonitor {
   // catch-up does. Returns true when the archive is caught up to the live log's oldest event;
   // false while a page remains, or while a full receiver holds a work event back.
   #catchUpArchive(): boolean {
+    if (!this.#mayAdmit()) return false;
     const oldest = this.mesh.oldestSequence?.();
     if (!this.mesh.read || oldest === undefined || this.#archiveAfter === undefined || this.#archiveAfter + 1 >= oldest) {
       this.#archiveAfter = undefined;
@@ -306,11 +388,11 @@ export class ActorMeshMonitor {
     const older = page.filter((event) => event.sequence < oldest);
     let handedOn = false;
     for (const event of older) {
-      if (this.callbacks.canConsumeMesh?.() === false) return false;
-      if (isWork(event) && !this.#delivered(event)) {
+      if (!this.#mayAdmit()) return false;
+      if ((this.#isWork(event) || this.callbacks.replayAll) && !this.#delivered(event)) {
         const accepted = this.callbacks.onEvent(event);
         if (this.callbacks.canConsumeMesh?.() === false) return false;
-        if (accepted === false) {
+        if (accepted === "deferred" || accepted === false) {
           this.#writeCursor(handedOn);
           return false;
         }
@@ -320,6 +402,10 @@ export class ActorMeshMonitor {
       // first event follows it with no gap. Only a relevant delivery checkpoints immediately.
       this.#archiveAfter = event.sequence;
       this.#last = { sequence: event.sequence, id: event.id };
+      if (this.callbacks.canAdmit?.() === false) {
+        this.#writeCursor(handedOn);
+        return false;
+      }
     }
     if (older.length === page.length && page.length === this.config.maxReadEvents) {
       this.#writeCursor(handedOn);

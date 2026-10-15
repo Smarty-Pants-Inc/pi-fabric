@@ -1,7 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
 import { resolveAgentDir } from "../core/agent-dir.js";
-import * as piConversationHost from "@earendil-works/pi-coding-agent";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { TUI } from "@earendil-works/pi-tui";
 import type { CodePreviewSettings } from "./code-preview.js";
@@ -21,8 +20,10 @@ import type { FabricDashboardMessageTarget } from "./dashboard.js";
 import type { ModelSource } from "./model-picker.js";
 import { createDashboardSnapshot } from "./snapshot.js";
 import { safeText } from "./format.js";
+import { extensionContextLive } from "../session-liveness.js";
 import { isActiveStatus, type FabricDashboardSnapshot, type FabricUiActor, type FabricUiAgent } from "./types.js";
 import { FabricWidget, isFabricWidgetStreaming, shouldShowFabricWidget } from "./widget.js";
+import { FabricWidgetRetention } from "./retention.js";
 import { AgentTranscriptReader, type FabricTranscriptSource } from "./transcript.js";
 
 const WIDGET_ID = "pi-fabric";
@@ -78,7 +79,7 @@ export class FabricUiController {
   #widgetMounted = false;
   #widget: FabricWidget | undefined;
   #hostStreaming: boolean | undefined;
-  #lastRefreshErrorAt = 0;
+  #reportedRefreshErrors = new Set<string>();
   #lastRefreshAt = 0;
   #dashboardOpen = false;
   #conversationOpen = false;
@@ -99,6 +100,7 @@ export class FabricUiController {
   readonly #conversationReaders = new Map<string, NativeConversationReader>();
   #activeConversationReader: string | undefined;
   #refreshGeneration = 0;
+  readonly #widgetRetention = new FabricWidgetRetention();
 
   constructor(
     readonly state: FabricState,
@@ -153,10 +155,12 @@ export class FabricUiController {
     this.#actorUnsubscribe = undefined;
     this.#agentUnsubscribe?.();
     this.#agentUnsubscribe = undefined;
-    if (this.#context?.mode === "tui") {
-      this.#context.ui.setWidget(WIDGET_ID, undefined);
-    }
+    const context = this.#context;
     this.#context = undefined;
+    // smarty-dev#8881: a disposed session's ctx throws from every getter and its widget went with it.
+    if (context && extensionContextLive(context) && context.mode === "tui") {
+      context.ui.setWidget(WIDGET_ID, undefined);
+    }
     this.#widgetTui = undefined;
     this.#dashboardTui = undefined;
     this.#widgetMounted = false;
@@ -164,7 +168,8 @@ export class FabricUiController {
     this.#events = [];
     this.#meshOffset = 0;
     this.#snapshot = emptySnapshot();
-    this.#lastRefreshErrorAt = 0;
+    this.#widgetRetention.clear();
+    this.#reportedRefreshErrors.clear();
     this.#lastRefreshAt = 0;
     this.#dashboardOpen = false;
     this.#activityRevision = undefined;
@@ -179,7 +184,7 @@ export class FabricUiController {
 
   /** Host lifecycle boundaries are independent of child/activity revisions. */
   setHostStreaming(streaming: boolean): void {
-    if (!this.#context || !this.state.config.ui.enabled || this.#context.mode !== "tui") return;
+    if (!this.#liveTuiContext() || !this.state.config.ui.enabled) return;
     this.#hostStreaming = streaming;
     if (this.#dashboardOpen) this.#scheduleRefresh();
     else this.#refresh();
@@ -194,6 +199,8 @@ export class FabricUiController {
     if (this.ownsInput) return;
     const jobs = this.state.shellJobs;
     if (!jobs) { context.ui.notify("No shell task store in this session", "info"); return; }
+    // Input ownership is claimed synchronously; reattached tasks arrive as store events.
+    void jobs.durable?.resume();
     const candidates = query ? jobs.list().filter(job => job.id === query || job.id.startsWith(query)) : [];
     if (query && candidates.length !== 1) { context.ui.notify("Task ID is unknown or ambiguous", "warning"); return; }
     if (context.mode !== "tui") {
@@ -205,12 +212,12 @@ export class FabricUiController {
     this.#tasksOpen = true;
     const epoch = this.#epoch;
     try {
-      const { ShellTasksView } = await import("./shell-tasks.js");
+      const [{ ShellTasksView }, { imageSafeCustom }] = await Promise.all([import("./shell-tasks.js"), import("./image-overlays.js")]);
       if (epoch !== this.#epoch) return;
-      await context.ui.custom<void>((tui, theme, _keys, done) => {
+      await imageSafeCustom<void>(context.ui, (tui, theme, keys, done) => {
         this.#closeTasks = () => done();
         const id = candidates[0]?.id;
-        this.#tasksView = new ShellTasksView({ jobs, theme, done: () => done(), requestRender: () => tui.requestRender(),
+        this.#tasksView = new ShellTasksView({ jobs, theme, keys, done: () => done(), requestRender: () => tui.requestRender(),
           rows: () => tui.terminal?.rows ?? 24, ...(id ? { id } : {}) });
         return this.#tasksView;
       }, { overlay: true, overlayOptions: { width: "94%", maxHeight: "90%", anchor: "center", margin: 1 } });
@@ -244,12 +251,15 @@ export class FabricUiController {
     this.#conversationOpen = true;
     const epoch = this.#epoch;
     try {
-      // Native lazy imports cannot see Pi's extension-loader aliases/virtual modules.
-      const { initializeConversationHost } = await import("./conversation-host.js");
+      // Fabric is native ESM, so Pi's jiti virtual modules never apply: resolve
+      // the running CLI's own SDK rather than a bare (unbundled) package import.
+      const [{ initializeConversationHost }, { loadHostSdk }] =
+        await Promise.all([import("./conversation-host.js"), import("../core/host-sdk.js")]);
+      const conversationHost = await loadHostSdk();
       if (epoch !== this.#epoch) return;
-      initializeConversationHost(piConversationHost);
-      const [{ FabricConversationView, FabricConversationState }, { conversationTargets, resolveConversationTarget }, { readConversationAppearance }, { NativeConversationReader }] =
-        await Promise.all([import("./conversation.js"), import("./conversation-targets.js"), import("./conversation-chrome.js"), import("./conversation-native-reader.js")]);
+      initializeConversationHost(conversationHost);
+      const [{ FabricConversationView, FabricConversationState }, { conversationTargets, resolveConversationTarget }, { readConversationAppearance }, { NativeConversationReader }, { imageSafeCustom }] =
+        await Promise.all([import("./conversation.js"), import("./conversation-targets.js"), import("./conversation-chrome.js"), import("./conversation-native-reader.js"), import("./image-overlays.js")]);
       if (epoch !== this.#epoch) return;
       this.#refresh();
       const initialTarget = query?.trim()
@@ -340,7 +350,7 @@ export class FabricUiController {
           throw new Error(target?.readOnlyReason ?? `Participant ${id} cannot receive ${action}`);
         }
       };
-      await context.ui.custom<void>((tui, theme, keybindings, done) => {
+      await imageSafeCustom<void>(context.ui, (tui, theme, keybindings, done) => {
         if (epoch !== this.#epoch) {
           done(undefined);
           return { render: () => [], invalidate: () => {} };
@@ -437,8 +447,8 @@ export class FabricUiController {
     const epoch = this.#epoch;
     const current = (): boolean => epoch === this.#epoch;
     this.#refresh();
-    const [{ FabricDashboard }, { buildClaudeModelSource, buildModelSource }] =
-      await Promise.all([import("./dashboard.js"), import("./model-picker.js")]);
+    const [{ FabricDashboard }, { buildClaudeModelSource, buildModelSource }, { imageSafeCustom }] =
+      await Promise.all([import("./dashboard.js"), import("./model-picker.js"), import("./image-overlays.js")]);
     if (!current()) return;
     const modelSource = buildModelSource(context.modelRegistry, resolveAgentDir());
     let claudeModelSource: ModelSource | undefined;
@@ -597,7 +607,7 @@ export class FabricUiController {
     };
     let conversationTarget: string | undefined;
     try {
-      await context.ui.custom<void>(
+      await imageSafeCustom<void>(context.ui,
         (tui, theme, keybindings, done) => {
           if (!current()) { done(undefined); return { render: () => [], invalidate() {} }; }
           this.#dashboardTui = tui;
@@ -674,8 +684,20 @@ export class FabricUiController {
     this.#scheduledRefresh = undefined;
   }
 
+  /** Dispose emits no shutdown (#8881): retire local views, timers and subscriptions before a stale ctx read. */
+  #liveTuiContext(): ExtensionContext | undefined {
+    const context = this.#context;
+    if (!context) return undefined;
+    if (!extensionContextLive(context)) {
+      this.#context = undefined;
+      this.stop();
+      return undefined;
+    }
+    return context.mode === "tui" ? context : undefined;
+  }
+
   #scheduleRefresh(): void {
-    if (this.#scheduledRefresh || !this.#context || this.#context.mode !== "tui" || !this.state.initialized) return;
+    if (this.#scheduledRefresh || !this.#liveTuiContext() || !this.state.initialized) return;
     // No consumer exists when every Fabric surface is explicitly hidden.
     if (!this.#dashboardTui && !this.#conversationTui && this.state.config.ui.widget === "hidden") return;
     // Model discovery can mark the dashboard open before a TUI is attached.
@@ -697,7 +719,7 @@ export class FabricUiController {
 
   /** Coalesced event refreshes own their faults; a queued old epoch cannot rearm. */
   #runBackground(epoch: number, callback: () => void): void {
-    if (epoch !== this.#epoch || !this.#context || this.#context.mode !== "tui" || !this.state.initialized) return;
+    if (epoch !== this.#epoch || !this.#liveTuiContext() || !this.state.initialized) return;
     try {
       callback();
     } catch (error) {
@@ -706,10 +728,9 @@ export class FabricUiController {
   }
 
   #reportRefreshError(error: unknown): void {
-    const now = Date.now();
-    if (this.#lastRefreshErrorAt && now - this.#lastRefreshErrorAt < 10_000) return;
-    this.#lastRefreshErrorAt = now;
     const message = error instanceof Error ? error.message : String(error);
+    if (this.#reportedRefreshErrors.has(message)) return;
+    this.#reportedRefreshErrors.add(message);
     // A host UI can already be disposed. Error reporting must not escape a timer either.
     try { this.#context?.ui.notify(`Fabric dashboard refresh failed: ${message}`, "warning"); }
     catch { /* stale UI; the lifecycle cleanup owns it */ }
@@ -793,6 +814,7 @@ export class FabricUiController {
     this.#lastRefreshAt = performance.now();
     const context = this.#context;
     if (!context || !this.state.initialized) return;
+    if (!extensionContextLive(context)) { this.#liveTuiContext(); return; }
     try {
       this.#pollMesh();
       const revision =
@@ -832,6 +854,9 @@ export class FabricUiController {
       if (this.#snapshot.main.status !== main.status) {
         this.#snapshot = { ...this.#snapshot, main: { ...this.#snapshot.main, status: main.status } };
       }
+      this.#widgetRetention.sync(this.#snapshot);
+      // Fork (46857f02, no widget clock): retained completion rows expire on the
+      // next event refresh after their deadline, never on a timer of their own.
       this.#renderWidget(context);
       // Read the native source even when manager metadata is unchanged: log
       // appends and pinned-window growth do not require a status revision.
@@ -859,7 +884,7 @@ export class FabricUiController {
     const config = this.state.config.ui;
     const shouldShow =
       context.mode === "tui" &&
-      shouldShowFabricWidget(this.#snapshot, config.widget);
+      shouldShowFabricWidget(this.#snapshot, config.widget, this.#widgetRetention);
     // Keep the above-editor component mounted for the entire streamed turn.
     // A transient status gap must not turn into a remove/add pair while Pi is
     // diff-rendering the conversation.
@@ -878,6 +903,7 @@ export class FabricUiController {
             config.maxRows,
             () => tui.terminal?.rows ?? process.stdout.rows,
             true,
+            this.#widgetRetention,
           );
           return this.#widget;
         },

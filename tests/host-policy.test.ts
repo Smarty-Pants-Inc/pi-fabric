@@ -168,6 +168,27 @@ describe.runIf(process.platform !== "win32")("root-owned host policy (#7591)", (
     expect(String(warn.mock.calls[0]?.[0])).toContain("must be");
   });
 
+  // smarty-dev#8257: root-only task memory cap. Positive safe integer bytes (1 included, no 64 KiB floor).
+  it.each([0, -1, 1.5, "24G", null, 2 ** 53])("fails strict on an invalid agents.processMemoryMaxBytes %j", value => {
+    simulateRootOwnership(); writePolicy({ agents: { processMemoryMaxBytes: value } });
+    const loaded = load();
+    expect(loaded.agents.processMemoryMaxBytes).toBe(24 * 1024 ** 3);
+    expect(loaded.executor.landlock).toEqual({ mode: "enforce", disabled: false }); // invalid policy tightens
+    expect(warn.mock.calls.some(call => String(call[0]).includes("agents.processMemoryMaxBytes must be a positive safe integer"))).toBe(true);
+  });
+
+  it.each([1, 65_535, 8 * 1024 ** 3])("accepts root agents.processMemoryMaxBytes=%d across loaders; agent/project cannot override", bytes => {
+    simulateRootOwnership(); writePolicy({ agents: { processMemoryMaxBytes: bytes } });
+    writeAgent({ agents: { processMemoryMaxBytes: 1024 ** 4 } });
+    fs.writeFileSync(path.join(cwd, ".pi/fabric.json"), JSON.stringify({ agents: { processMemoryMaxBytes: 1024 ** 4 } }));
+    for (const loaded of [load(), config.loadGlobalFabricConfig(agentDir),
+      config.loadFabricConfigForScope({ cwd, agentDir, projectTrusted: true }, "global"),
+      config.loadFabricConfigForScope({ cwd, agentDir, projectTrusted: true }, "project")]) {
+      expect(loaded.agents.processMemoryMaxBytes).toBe(bytes);
+    }
+    expect(warn.mock.calls.filter(call => String(call[0]).includes("ignoring untrusted"))).toHaveLength(0);
+  });
+
   it("keeps tightening agent settings without a root policy", () => {
     writeAgent({ executor: { landlock: { mode: "enforce" } }, agents: {
       deniedModels: ["agent-deny"], modelPolicy: { requireReason: ["agent-reason"] },
@@ -433,7 +454,7 @@ describe.runIf(process.platform !== "win32")("root-owned host policy (#7591)", (
     const { SessionManager, createExtensionRuntime, ExtensionRunner } = await import("@earendil-works/pi-coding-agent");
     const runtime = createExtensionRuntime(); runtime.getThinkingLevel = () => "off";
     const runner = new ExtensionRunner([], runtime, cwd, SessionManager.inMemory(cwd), {} as never);
-    const provider = new PiToolsProvider(cwd, undefined, undefined, {
+    const provider = new PiToolsProvider(cwd, undefined, undefined, { allowUnhookedTools: true,
       powerShellToolDefinitionFactory: undefined, getShellHangMs: () => 0,
       getLandlockSettings: () => config.liveLandlockSettings(loaded, agentDir),
     });
@@ -495,7 +516,7 @@ describe.runIf(process.platform !== "win32")("root-owned host policy (#7591)", (
     const { SessionManager, createExtensionRuntime, ExtensionRunner } = await import("@earendil-works/pi-coding-agent");
     const runtime = createExtensionRuntime(); runtime.getThinkingLevel = () => "off";
     const runner = new ExtensionRunner([], runtime, cwd, SessionManager.inMemory(cwd), {} as never);
-    const provider = new PiToolsProvider(cwd, undefined, undefined, {
+    const provider = new PiToolsProvider(cwd, undefined, undefined, { allowUnhookedTools: true,
       powerShellToolDefinitionFactory: undefined, getShellHangMs: () => 0,
       getLandlockSettings: () => config.liveLandlockSettings(loaded, agentDir),
     });

@@ -6,7 +6,12 @@ export const processStartTime = (pid: number): string | undefined => {
   if (process.platform !== "linux") return undefined;
   try {
     const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
-    return stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/)[19];
+    const close = stat.lastIndexOf(")");
+    if (close < 0) return undefined;
+    // Counted from after the LAST ")": comm may hold spaces and parentheses. Anything but clock ticks is a
+    // parse failure: undefined, which every caller treats as unverified.
+    const field = stat.slice(close + 2).trim().split(/\s+/)[19];
+    return field !== undefined && /^\d+$/.test(field) ? field : undefined;
   } catch { return undefined; }
 };
 

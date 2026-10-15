@@ -5,7 +5,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { AgentManager } from "../src/agents/manager.js";
-import { reportResidentExit, runResidentHostFromConfigPath } from "../src/residency/host.js";
+import { ResidentHost, reportResidentExit, runResidentHostFromConfigPath } from "../src/residency/host.js";
 import { residentRoot, type ResidentHostConfig } from "../src/residency/protocol.js";
 
 const waitFor = async (predicate: () => boolean, boundMs: number): Promise<void> => {
@@ -40,7 +40,8 @@ const harness = (name: string) => {
     format: 1, rootId: `session:${sessionId}`, sessionId, cwd: root, projectRoot: root, meshRoot,
     actorRoot: path.join(root, "actors"), sessionActorRoot: path.join(root, "session-actors"), residencyRoot,
     fullCodeMode: true, agents: { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0 },
-    mesh: { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 }, retention: DEFAULT_FABRIC_CONFIG.retention,
+    // A dead root retires after residentIdleExitMs; keep the window inside the 60 s clock jump below.
+    mesh: { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20, residentIdleExitMs: 30_000 }, retention: DEFAULT_FABRIC_CONFIG.retention,
     workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), fabricExtensionPath: path.resolve("dist/index.js"),
     piBinary: "pi", claudeBinary: "claude", vedaBinary: "veda",
   };
@@ -70,6 +71,7 @@ it.skipIf(!posix)("an idle exit leaves one resident-exit idle-exit line, written
   try {
     const run = runResidentHostFromConfigPath(h.configPath);
     await waitFor(() => fs.existsSync(h.ownerPath), 30_000);
+    const generation = (JSON.parse(fs.readFileSync(h.ownerPath, "utf8")) as { token: string }).token;
     // Skip the 30 s idle window: the host's idle check reads Date.now().
     const now = Date.now.bind(Date);
     vi.spyOn(Date, "now").mockImplementation(() => now() + 60_000);
@@ -77,7 +79,40 @@ it.skipIf(!posix)("an idle exit leaves one resident-exit idle-exit line, written
     expect(h.atRelease.lines).toEqual([expect.objectContaining({ event: "resident-exit", reason: "idle-exit", pid: process.pid })]);
     expect(exitLines(h.residencyRoot)).toHaveLength(1);
     expect(h.late()).toEqual([]);
+    // smarty-dev#7950: the durable per-generation record, written by the host before the release.
+    expect(fs.readdirSync(path.join(h.residencyRoot, "generations"))).toEqual([`${generation}.exit.json`]);
+    expect(JSON.parse(fs.readFileSync(path.join(h.residencyRoot, "generations", `${generation}.exit.json`), "utf8")))
+      .toMatchObject({ format: 1, generation, writer: "host", reason: "idle-exit", pid: process.pid });
   } finally {
+    vi.restoreAllMocks();
+    fs.rmSync(h.root, { recursive: true, force: true });
+  }
+});
+
+it.skipIf(!posix)("a dormant exit leaves one resident-exit dormant line before owner.json is removed", { timeout: 60_000 }, async () => {
+  const h = harness("dormant");
+  const controller = new AbortController();
+  let host: ResidentHost | undefined;
+  const start = ResidentHost.prototype.start;
+  vi.spyOn(ResidentHost.prototype, "start").mockImplementation(async function (this: ResidentHost) {
+    host = this;
+    await start.call(this);
+  });
+  const run = runResidentHostFromConfigPath(h.configPath, controller.signal);
+  try {
+    await waitFor(() => fs.existsSync(h.ownerPath), 30_000);
+    const actor = await host!.actors.create({ name: "exit-listener", instructions: "wait", residency: "durable", topics: ["exit.wake"] });
+    await waitFor(() => host!.actors.status(actor.id).status === "dormant", 8_000);
+    const now = Date.now.bind(Date);
+    vi.spyOn(Date, "now").mockImplementation(() => now() + 60_000);
+    await run;
+    expect(h.atRelease.lines).toEqual([expect.objectContaining({ event: "resident-exit", reason: "dormant", pid: process.pid })]);
+    expect(exitLines(h.residencyRoot)).toHaveLength(1);
+    expect(fs.existsSync(h.ownerPath)).toBe(false);
+    expect(h.late()).toEqual([]);
+  } finally {
+    controller.abort();
+    await run.catch(() => undefined);
     vi.restoreAllMocks();
     fs.rmSync(h.root, { recursive: true, force: true });
   }
@@ -101,7 +136,7 @@ it.skipIf(posix)("win32: an idle exit writes no exit line (no O_NOFOLLOW) and th
 });
 
 // #1882: after the host releases owner.json the root may belong to the next
-// generation: no exit line after it. (error.json handling is main's, unchanged here.)
+// generation: no exit line after it. Any startup diagnostic is generation-private.
 it("a failure from close() after the release writes no exit line after the release", { timeout: 60_000 }, async () => {
   const h = harness("release");
   // The release is the last step of close(); this failure surfaces after it.
@@ -116,8 +151,8 @@ it("a failure from close() after the release writes no exit line after the relea
     const expected = posix ? [expect.objectContaining({ event: "resident-exit", reason: "stopped" })] : [];
     expect(h.atRelease.lines).toEqual(expected);
     expect(exitLines(h.residencyRoot)).toEqual(expected);
-    // Only main's own error.json write may follow the release; never launcher.log.
-    expect(h.late().filter(file => path.basename(file) !== "error.json")).toEqual([]);
+    // Only a generation-private diagnostic may follow the release; never a shared-root write.
+    expect(h.late().filter(file => !/generations[\\/]\S+\.error\.json$/.test(file))).toEqual([]);
   } finally {
     vi.restoreAllMocks();
     fs.rmSync(h.root, { recursive: true, force: true });
@@ -151,6 +186,7 @@ it.each(posix ? ["launch-context", "lock-busy"] as const : ["launch-context"] as
       await expect(run).resolves.toBeUndefined(); // Already running: a silent return, as on main.
     }
     for (const [file, bytes] of Object.entries(files)) expect(fs.readFileSync(file, "utf8")).toBe(bytes);
+    expect(fs.existsSync(path.join(h.residencyRoot, "generations"))).toBe(false); // no exit record for a non-owner
   } finally {
     if (previous === undefined) delete process.env.PI_FABRIC_RESIDENT_LAUNCHER; else process.env.PI_FABRIC_RESIDENT_LAUNCHER = previous;
     holder?.kill("SIGKILL");

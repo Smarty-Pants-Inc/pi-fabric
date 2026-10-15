@@ -1,0 +1,728 @@
+# Conflict resolutions: pi-fabric upstream 0.110.1 sync
+
+Merge commit **114f5e55**, "chore: merge upstream pi-fabric 0.110.1 (cd9435c1)", on `sync/upstream-0.110.1`.
+
+- Parents: e267a9a5 (our main) and cd9435c1 (upstream v0.110.1, `refs/fv2/upstream-0.110.1`).
+- Merge base: 9bf95033 (upstream 0.97.0). 157 upstream commits are new to main.
+- `git merge` reported **103 conflicted files with 389 hunks**. One was an add/add conflict (`tests/process-transport.test.ts`).
+
+## Totals
+
+Upstream merge 114f5e55, 103 conflicted files: **98 fresh, 5 replayed (#541), 25 fresh overlapping #541.**
+
+- The two later merges of current main add 4 conflicts, all fresh: 3 in 30aa4e91 and 1 in 5f32bbac. Two of them (`src/agents/request.ts`, `src/index.ts`) also conflicted in #541. Counting those 4 rows, the table has 107 rows: 102 fresh, 5 replayed, 27 fresh overlapping #541.
+- The merge of main f2814332 adds 12 more conflicts, all fresh, in their own section ("Merge of current main (f2814332)") at the end.
+- The merge of main f8a03c8e adds 3 more conflicts, all fresh, in their own section ("Merge of current main (f8a03c8e)") after it.
+- The merge of main 048e031e adds 3 more conflicts, all fresh, in their own section ("Merge of current main (048e031e)") after that.
+- The merge of main 85197461 adds 2 more conflicts, all fresh, in their own section ("Merge of current main (85197461)") at the end, after the scope cut.
+- Fork-lead reviews the fresh rows independently. The replayed rows repeat #541's resolution of the same conflict.
+
+Difference from the 98/5/30 quoted in the part 2 summary: 98 and 5 match. That summary's 30 was the 25 fresh rows that also conflicted in #541's merges plus 5 test files (`tests/agents-provider-services.test.ts`, `tests/agents-provider.test.ts`, `tests/node-process-runtime.test.ts`, `tests/process-transport.test.ts`, `tests/verified-providers.test.ts`). #541's merge commits edited those 5 without a conflict. By that wider measure (the #541 merge result differs from both of its parents, `git show --cc`), 26 fresh rows qualify, not 5. So this table counts conflicts only and names the edit-only merges in the overlap column. Counted with the 5 replayed rows, which all conflicted in #541 too, the overlap is 30 rows.
+
+How the columns were computed:
+
+- **Files**: `git merge-tree --write-tree --name-only --no-messages e267a9a5 cd9435c1` lists the same 103 paths as the table. The later rows come from the same command on the parents of 30aa4e91 and 5f32bbac.
+- **Method**: `replayed (#541)` for the 4 files rerere resolved from #541's replayed merges, and for `src/index.ts`, where `git diff 9eba6fb1 114f5e55 -- src/index.ts` is empty. Every other row is `fresh`.
+- **#541 overlap**: `yes` when `git merge-tree --write-tree --name-only --no-messages M^1 M^2` reports the file as conflicted for at least one of #541's sync merges M (6fc3e89a: 15 files, 19dc43cb: 17, 45b5fdbd: 2, 9eba6fb1: 7). The merges are named in the cell. `no (edited without conflict: ...)` marks a file that `git show --cc --name-only M` lists without a conflict.
+
+## How the conflicts were resolved
+
+| Method | Files |
+|---|---|
+| rerere, trained by replaying #541's 4 sync-branch merges (6fc3e89a, 19dc43cb, 45b5fdbd, 9eba6fb1) in an isolated clone | 4 |
+| By hand, hunk by hunk | 99 |
+
+The per-file table below counts `src/index.ts` as replayed: it was resolved by hand, and the result is byte-identical to #541's `src/index.ts` at 9eba6fb1. That gives 98 fresh and 5 replayed rows.
+
+The 99 hand resolutions break down roughly as follows:
+
+- About 35 unions of independent additions.
+- About 40 combined hunk by hunk, keeping our behaviour and adding upstream's feature.
+- About 15 kept ours where both sides fixed the same thing. Each such case is named below.
+- 5 took upstream as a strict superset:
+  - `tests/shell-hang.test.ts`
+  - `tests/package-manifest.test.ts`
+  - `tests/pi-tools-provider.test.ts` (H1)
+  - `src/actors/types.ts` comment
+  - the Pi 1.1.0 dependency pins in `package.json`
+
+rerere ran in an isolated clone so the shared repo's rr-cache never auto-enabled in other lanes. The trained cache is in `rr-cache-sync0110-part1.tar.gz`.
+
+## Policy
+
+- Keep every Smarty fork behaviour on main: mesh locks, residency, actors, review routing, Windows, security fences, the Main deadline ceiling and custody.
+- Take upstream where our side made no deliberate change.
+- In `.github/workflows`, keep our runners, jobs and required checks. Only upstream steps that leave them unchanged were added.
+- Where both sides fixed the same bug, keep ours unless upstream's fix is a strict superset.
+
+## Conflicted files: one row each (103 upstream, 4 from main merges)
+
+The first 103 rows are the conflicts of the upstream merge 114f5e55. The last 4 rows are the conflicts of the two later merges of current main.
+
+| File | Method | #541 overlap | Resolution |
+|---|---|---|---|
+| `bun.lock` | fresh | no (edited without conflict: 19dc43cb) | mechanical union toward the merged manifest; regenerated by bun install in a follow-up commit |
+| `docs/agents.md` | fresh | yes (9eba6fb1) | H1 kept our rewritten retry/interrupted-report section (upstream only reworded a sentence ours replaced); H2 upstream child-dialog paragraph plus our followUp flush text; H3 union: our MeshStore host-script note plus upstream sender stamps, scheduled events and external grants |
+| `docs/configuration.md` | fresh | yes (6fc3e89a, 9eba6fb1) | union: our Main ceiling, mesh/actors keys, stall guard, export dir and refresh docs plus upstream humanWaitRefs (noting the Main ceiling still applies), jevFabric, child questions, memory/trace example, Node 24 note, worktree setup and widget lineage text |
+| `docs/entropy.md` | fresh | no | combined: upstream persistence-contention paragraph plus our cursor-based background-compile paragraph |
+| `docs/harnesses.md` | fresh | no | both fixed the same writing-style line; kept ours |
+| `docs/jev.md` | fresh | no | both fixed the same writing-style sentence; kept ours |
+| `docs/prompt-cache.md` | fresh | no | H1 ours (documents our hold-release semantics); H2 both style-fixed same sentence, kept ours |
+| `docs/residency-runtime.md` | fresh | no | union: our PR #394 scope/lease-fenced custody sections plus upstream scheduled-events, stale-command and PID-namespace sections. **Superseded by the scope cut** (see "Scope cut: PID-namespace liveness (to its own PR)"): the PID-namespace section is removed |
+| `.github/workflows/test.yml` | fresh | no | union: kept our Package install smoke step and added upstream CI-workflow and Python-diagnostics test steps; runners, matrix and jobs (including mesh-lock-bench) unchanged. Upstream setup-node, setup-python 3.14, Bend 2.0.36 and the Windows mkdir /tmp line auto-merged into our check job |
+| `package.json` | fresh | no (edited without conflict: 19dc43cb) | union of exports (our ./mesh, upstream ./scope) and smoke list; took upstream deps chord/pi-durable/pi-fabric-worker-sdk, pi-agent-core peer and Pi 1.1.0 + typebox 1.3.27 dev pins (upstream code needs Pi 1.x); kept our pg dependency; merged the two auto-merged bin objects (upstream pi-fabric CLI + our bins) and dropped the duplicate typebox 1.3.8 dev pin in favour of upstream 1.3.27 |
+| `README.md` | fresh | no (edited without conflict: 19dc43cb) | union: keep our Records doc link and add upstream thinking/durable/decisions/programs links |
+| `scripts/assert-build-artifacts.mjs` | fresh | yes (19dc43cb) | union of required lazy entries, forbidden eager modules and standalone checks (our judge/hooks, upstream CLI); kept our startup budget (1150 KiB / 45 files) pending a measured build |
+| `scripts/build.mjs` | fresh | yes (6fc3e89a, 19dc43cb, 9eba6fb1) | union of build entries (ours plus upstream runners/durable/cli/native/decisions/programs); src/worker.ts stays where ours moved it |
+| `skillsets/typescript/fabric-exec/references/agents.md` | fresh | no | combined: our pendingFollowUps/coalesceKey text plus upstream restarted-owner-incarnation sentence |
+| `src/actors/manager.ts` | fresh | yes (19dc43cb, 9eba6fb1) | kept our actor manager (registry ownership/fences, route pins, binding modes, queue persistence #878, activation filters/windows, wake text, records view, settled deliveries); added upstream sender stamps with principal-scope trust (untrusted external/foreign message headers), principalScope persistence/inheritance and pi-durable model resolution |
+| `src/actors/mesh-monitor.ts` | fresh | yes (6fc3e89a) | kept our watcher/safety-net monitor, archive catch-up and cursor custody; added upstream scheduled-event due timer and release-on-poll |
+| `src/actors/registry-store.ts` | fresh | yes (6fc3e89a, 45b5fdbd) | both fixed lock-owner PID reuse; kept ours (start-time identity, identity-bound dead fence) over upstream identity-line reaping |
+| `src/actors/types.ts` | fresh | no (edited without conflict: 6fc3e89a, 45b5fdbd, 9eba6fb1) | union: our activation filter, wake text, records view and session-orphan record plus upstream scope binding (principalScope, principal) and mcp_servers_change exclusion |
+| `src/agents/completion-inbox.ts` | fresh | no | combined: our held-confirmation hooks, receipt retries and sendFabricMessage provenance plus upstream settled-abort flag, #failed gate and post-compaction retry (1a78d011b) |
+| `src/agents/manager.ts` | fresh | yes (6fc3e89a, 19dc43cb) | kept our agent manager (task return addresses, wait bounds, input validation, route pins/denied-model admission, follow-up deadlines, final-answer fences, terminal notices, custody/execution drains, unconfirmed-exit handling, archive staging at close); ported upstream runner contract (worker/hosted adapters, pi-durable), fork seeds, write confinement, lineage, thinking bounds (route pins stay exact), child-question routing, worktree setup/results, nested-agent reconciliation and hosted-run detach on close into our restructured spawn/launch block |
+| `src/agents/request.ts` | fresh | yes (19dc43cb) | kept our request normalization order (explicit/inherited model, requires/needs, nice, bash idle) and took upstream pluggable runner validation (pi-durable counts as Pi for model inheritance), thinkingBounds and worktree/confinement/scope fields |
+| `src/agents/result.ts` | fresh | no | combined: our parseStructuredResult plus upstream parsed=true flag |
+| `src/agents/transports/process-transport.ts` | fresh | yes (6fc3e89a) | kept our spawn arguments (task return address, scope, cleanup grace); dropped upstream captureStderr option and readStderr passthrough until ported |
+| `src/agents/transports/process-utils.ts` | fresh | no | kept ours (systemd-run scopes, custody, legacy fallback); upstream bounded-stderr capture (captureStderr/readStderr) NOT ported yet: follow-up |
+| `src/agents/types.ts` | fresh | no (edited without conflict: 6fc3e89a) | union: our niceness/bash timeouts, completion delivery, transport custody fields and followUp warning plus upstream fork seed, worktree/hosted results, run outcome, readStderr and child questions; kind uses upstream AgentRunTransport |
+| `src/capture/catalog.ts` | fresh | no | combined: upstream hidden-exposure skip plus our run-reply host-owned skip (smarty-dev#967) |
+| `src/compaction/hook.ts` | fresh | no | kept our lazy handleFabricBeforeCompact structure and added upstream onYield on the pi-vcc yield |
+| `src/config.ts` | fresh | yes (9eba6fb1) | union: our nice/wakeText/deadRootFilter/landlock/mesh-backend config plus upstream thinking bounds, modelAdmission, worktree setup, child questions and jevFabric |
+| `src/core/action-registry.ts` | fresh | no (edited without conflict: 19dc43cb) | combined: our deadline check, cancellation sharing and principal snapshot plus upstream jev.decide strict result and host-issued scope |
+| `src/core/approval-controller.ts` | fresh | no | combined: our internalRouting param (position 7) and session-generation fence plus upstream headless param (now position 8) and action-level deny override |
+| `src/core/atomic-write.ts` | fresh | no (edited without conflict: 6fc3e89a) | union: our mesh-lock timeout/background retry plus upstream owner identity/heartbeat liveness (independent additions). **Superseded by the scope cut** (see "Scope cut: PID-namespace liveness (to its own PR)"): the owner identity/heartbeat liveness is removed; main's lock liveness stays |
+| `src/core/file-lock.ts` | fresh | no | kept our single withExclusiveFileLock in atomic-write.ts (re-exported); ported upstream FileLockTimeoutError (contention is retryable) into it; upstream identity-aware reaping of this lock left for follow-up. **Superseded by the scope cut** (see "Scope cut: PID-namespace liveness (to its own PR)"): the async lock keeps main's owner probe and reap rule |
+| `src/core/shell-inbox.ts` | fresh | no | combined: our sendFabricMessage delivery plus upstream #failed guard |
+| `src/core/shell-jobs.ts` | fresh | no | combined: our scratch scope, spill PID wait and cleanup plus upstream byte-offset task reads, durable jev-fabric jobs and output notifications |
+| `src/core/system-guidance.ts` | fresh | yes (19dc43cb) | combined: our host-globals/payload-literal guidance and state/mesh notes plus upstream shell-composition guidance, native models namespace text and codemode profile parameter |
+| `src/core/tool-ownership.ts` | fresh | no | combined: our reply-tool identity import plus upstream Pi 1.0 tool-loadout ownership |
+| `src/execution-service.ts` | fresh | yes (19dc43cb) | kept our Main ceiling (ExecutionDeadline clamp, watchdog, guarded host calls, deferred result consumption, late-deadline preservation, invocation outcome) and helper structure; added upstream native codemode, nested saved programs (sandboxBase now carries piTools and the Main ceiling), human-wait refs, hard timeouts, workflow item events, owned-work stop, emitted images and write-policy native-executor refusal |
+| `src/fabric-exec-tool.ts` | fresh | no (edited without conflict: 19dc43cb) | kept our piTools-gated guideline structure and wording; took upstream acceptance-ledger wording (no tool call); H2 both lazy-load type-error guidance, ours also passes piTools |
+| `src/fabric-runtime-state.ts` | fresh | yes (6fc3e89a) | kept our runtime (custody lock, background retry, mesh activation before control plane, lifecycle-loss ops events, residency close ordering, output artifacts, reload quiesce); added upstream decisions/headless approvals, child-question routing, provider participants, shell timing bridge, decision profile setter and owner incarnation (one id shared by directory and control plane via a new incarnation option) |
+| `src/fabric-state.ts` | fresh | no (edited without conflict: 6fc3e89a) | both added built-in guidance before activation; ours is a superset (skips managed hosts) |
+| `src/host-compatibility.ts` | fresh | no | kept our agent input/capability metadata; took upstream minimum Pi host 1.0.0 (required by its Pi 1.0 tool-ownership APIs) |
+| `src/index.ts` | replayed (#541) | yes (6fc3e89a) | upstream moved the extension body to src/extension.ts; took upstream 8-line entry and kept our FabricModelDeniedError export (as #541); the result is byte-identical to #541's `src/index.ts` (9eba6fb1) |
+| `src/jev/auth.ts` | fresh | no | both adapted the auth-only Jev provider to newer Pi; kept ours (createProvider with failing login-only stream) |
+| `src/jev/client.ts` | fresh | no | combined: our pending-credential tracking plus upstream dispatch path |
+| `src/jev/manager.ts` | fresh | no | kept our lease ordering (endedAt before async cleanup); upstream registry.endInvocation inserted before our runLease.release |
+| `src/jev.ts` | fresh | no | combined: our JevCredentialCommandUnsupportedError export plus upstream decision exports |
+| `src/lifecycle/broker.ts` | fresh | no | both fixed per-subscription directory cost: kept our skip-before-read (smarty-dev#557) and added upstream one-rebuild-per-cycle for the remaining lookups; dropped upstream early return so unsaved-cursor cleanup still runs |
+| `src/mesh/store.ts` | fresh | yes (6fc3e89a, 9eba6fb1) | kept our split store facade (MeshLock, state backends, EventLog, census); ported upstream scheduled events (schedule/unschedule/scheduled/nextScheduleDueAt/releaseDueSchedules, schedules.json under the mesh lock), transact() for grants, validateMeshTopic, sender stamps and event origin/scheduled fields onto it (EventLog gained appendLocked + optional id/origin/untrusted/grantId/scheduled/sender/maxEventBytes); upstream lock-owner identity line not taken (our MeshLock owns lock liveness) |
+| `src/protocol.ts` | fresh | no | union: our Main deadline/budget/deferred-consumption fields plus upstream participants field |
+| `src/providers/agents-message-router.ts` | fresh | no (edited without conflict: 6fc3e89a) | kept our routing (remote roots via owner snapshot, remote agents, binding provenance, typed final-receipt refusal); upstream remote-root block redundant with ours; added upstream ownerIncarnation stamps and actor sender stamps |
+| `src/providers/agents-provider.ts` | fresh | yes (19dc43cb) | kept our agents provider (route classes/pins, closest model selection, actor creation ledger, Main-ceiling-aware waits, outgoing notices, stop directory); added upstream pluggable runners incl. pi-durable, models config in run requests, fork seeds, durable confinement assertion, scope/thinking bounds for durable children, lineage on self, provider participants and owner incarnation |
+| `src/providers/jev-provider.ts` | fresh | no | took upstream jev-fabric dispatch/decisions close path and kept our credential drain on close |
+| `src/providers/mesh-provider.ts` | fresh | no | kept our publish path (topic fence, dedupe, principal, outgoing notice, publishBatch) and added upstream scheduled publish (notBefore/afterMs/key) plus grants imports |
+| `src/providers/pi-tools-provider.ts` | fresh | no | kept our Landlock confinement, temp-custody holds and Landlock-aware preflight; added upstream durable jev-fabric shell launch and notify (durable refused under Landlock enforce); H8 took upstream (the preflight helper already auto-merged, ours would duplicate it) |
+| `src/providers/state-provider.ts` | fresh | no | combined constructor: upstream options.schemaMode plus our piTools selector (function form still accepted) |
+| `src/residency/client.ts` | fresh | no (edited without conflict: 6fc3e89a) | kept our host-captured caller, idempotency and start-time owner liveness; added upstream runner-registry residentModule handoff (upstream heartbeat liveness for this check not taken: both fixed PID reuse). The round 2 heartbeat check (5300ffcd) is **superseded by the scope cut** (see "Scope cut: PID-namespace liveness (to its own PR)"); main's start-time probe |
+| `src/residency/host.ts` | fresh | yes (6fc3e89a, 45b5fdbd) | kept our resident host (flock host fence, handover/watchdog custody, process-start identity, registry-scoped presence fences, request retention, caller-bound spawns, admission fences, idle confirmation); added upstream runner residentModule loading, hosted-run recovery, residentIdleDecision with schedule wake timer, launch scope recording, sender stamps and owner incarnation (shared with the control plane); upstream owner heartbeat/identity records not taken (our flock fence and start-time identity own liveness). The round 2 heartbeat records (5300ffcd) are **superseded by the scope cut** (see "Scope cut: PID-namespace liveness (to its own PR)"); main's owner records |
+| `src/residency/launcher-owner.ts` | fresh | no (edited without conflict: 6fc3e89a) | union: our process-tree ownership plus upstream identity-based owner liveness import. **Superseded by the scope cut** (see "Scope cut: PID-namespace liveness (to its own PR)"): main's file |
+| `src/residency/launcher.ts` | fresh | yes (6fc3e89a) | kept our launcher (handover, watchdog custody, process identity); imported upstream identity-aware liveOwnerPid from launcher-owner |
+| `src/residency/protocol.ts` | fresh | no (edited without conflict: 6fc3e89a) | union: our imports/caller/modelDenied fields plus upstream FabricRunOutcome, runnerModule and outcome fields |
+| `src/runtime/cpython-child-source.ts` | fresh | no | H1 both fixed Python 3.14 exc_type; kept ours (also handles exc_type_str); H2 union of guest roots |
+| `src/runtime/cpython-runtime.ts` | fresh | no | kept our ceiling-aware abort, pipe-failure diagnosis and ExecutionDeadline; added upstream human-wait pause via ExecutionDeadline and delivery receipts kept |
+| `src/runtime/guest-types.ts` | fresh | no (edited without conflict: 6fc3e89a, 19dc43cb, 9eba6fb1) | union: our participant fields, follow-up deliveries and publish notice plus upstream provider kind, worktreeResult and mesh schedule/grant APIs |
+| `src/runtime/kernel.ts` | fresh | yes (19dc43cb) | union: our host deadline fields plus upstream native codemode options |
+| `src/runtime/monty-bridge.ts` | fresh | no | union of guest roots: upstream thinking/decisions/programs plus our records |
+| `src/runtime/monty-runtime.ts` | fresh | no | kept our ExecutionDeadline clamp (absolute Main ceiling); wired upstream human-wait deadline pause through ExecutionDeadline.suspend/resume (ceiling never paused) |
+| `src/runtime/node-process-runtime.ts` | fresh | yes (19dc43cb) | kept our ExecutionDeadline, response acks and settle-then-abort of unawaited host calls; added upstream partial output streaming, native codemode setup args and human-wait pause via ExecutionDeadline |
+| `src/runtime/quickjs-runtime.ts` | fresh | yes (19dc43cb) | combined: guestSetupSource keeps our piTools flag (param 2) plus upstream native store/profile/tools flags; orchestration-only pi-tool hint kept, other tools.* route to upstream nativeTools; our ExecutionDeadline + upstream human-wait pause, __fabricRun wrapper and emitted images |
+| `src/runtime-state-builtins.ts` | fresh | no | combined: StateProvider gets upstream schemaMode and our piTools hint selector in one options object; upstream decisions provider added |
+| `src/storage/retention.ts` | fresh | yes (6fc3e89a) | kept our run-file set, follow-up/terminal-artifact vetoes, deadlines, age-first and run-by-run removal; threaded upstream run-root owner identity (owner param last) and veto when either liveness check says alive. **Superseded by the scope cut** (see "Scope cut: PID-namespace liveness (to its own PR)"): main's run-root owner liveness |
+| `src/topology/control-plane.ts` | fresh | yes (6fc3e89a) | kept our ack grace, bridge timeouts, shared-claim policy, wake-cause/principal admission, idempotent command ids and terminal rejection fields; added upstream owner-incarnation fencing (stale-command refusal) and host-set sender stamps |
+| `src/topology/participant-directory.ts` | fresh | no (edited without conflict: 6fc3e89a, 19dc43cb, 45b5fdbd) | combined: upstream ownerIncarnation stamping plus our root name and quiescing status (smarty-dev#1113) |
+| `src/ui/controller.ts` | fresh | no (edited without conflict: 6fc3e89a, 19dc43cb) | kept our event-driven refresh (no recurring poll), stale-context fence and streaming-stable widget; added upstream image-safe overlays and widget completion retention (FabricWidget args: stableWhileStreaming, retention) |
+| `src/ui/settings.ts` | fresh | no | H1 kept our eager discovery with live() fence (#5962 tests depend on it) over upstream lazy discovery; H2 both added the same overlay options, kept ours |
+| `src/ui/widget.ts` | fresh | no | combined: upstream completion retention plus our own-session agent filter (smarty-dev#1089) and stableWhileStreaming param (retention moved to param 6) |
+| `src/worker/model-control.ts` | fresh | no (edited without conflict: 19dc43cb) | combined: our activationWindow/startupFence/requiredPin params (admission moved to param 8) and route-pin checks plus upstream permissive admission; a required pin stays strict |
+| `src/worker/options.ts` | fresh | yes (19dc43cb) | union: our inference-context and resident-startup-probe validation plus upstream persist-session check and isPi (pi/pi-durable) kernel selection |
+| `src/worker.ts` | fresh | yes (19dc43cb) | kept our worker (custody, hooks: principal delivery, session id, reply tool, bash defaults, model route; final-answer receipts; settlement receipts; interrupted reports; steer provenance) and added upstream pi-durable runner (isPi), runtime assertion, lazy cross-spawn, standalone worker/result validator, write-confinement guard, recorded-result retrieval and modelAdmission (PiModelControl argument 8) |
+| `tests/agent-completion-inbox.test.ts` | fresh | no | union: our #733 parked-after-abort delivery tests plus upstream recovered-error/deferred-retry tests |
+| `tests/agent-kernel-provider.test.ts` | replayed (#541) | yes (19dc43cb) | resolved by rerere from #541's replayed merge (identical conflict) |
+| `tests/agents-provider-services.test.ts` | fresh | no (edited without conflict: 6fc3e89a, 19dc43cb) | both added remote-root routing tests for the same fix; kept ours (asserts our principal/idempotency/routedRemoteHost control arguments) |
+| `tests/agents-provider.test.ts` | fresh | no (edited without conflict: 6fc3e89a, 19dc43cb) | ours adds own-root resident setter suite; upstream only dropped a blank line |
+| `tests/build-artifacts.test.ts` | fresh | no (edited without conflict: 19dc43cb) | union: our launcher-owner lazy entry test plus upstream bootstrap/worker validator tests |
+| `tests/claude-cli.test.ts` | fresh | no | union of imports (upstream buildClaudeArguments, our discoverClaudeModels + fs/os/path) |
+| `tests/compact-controller.test.ts` | fresh | no | combined: our cross-Pi outcome cast plus upstream aborted:false field |
+| `tests/core-override-guidance.test.ts` | replayed (#541) | yes (19dc43cb) | resolved by rerere from #541's replayed merge (identical conflict) |
+| `tests/entropy-background.test.ts` | fresh | no | kept our session-file scan mock and test; added upstream pool-contention retry tests, active-surface reset and written:false save assertions |
+| `tests/fabric-command.test.ts` | fresh | no | combined: upstream parameterized picker fixture plus our modelRegistry.find |
+| `tests/fabric-controller.test.ts` | fresh | no (edited without conflict: 6fc3e89a, 19dc43cb) | ours is a superset (same upstream test plus our #5962 stale-controller tests) |
+| `tests/fabric-settings.test.ts` | fresh | no (edited without conflict: 6fc3e89a, 19dc43cb) | ours is a superset (same upstream test plus our #5962/retention tests; live-lease ensure stub) |
+| `tests/kernel-errors.test.ts` | fresh | no | combined: upstream all-backend runtime_error assertions plus our CPython traceback-frame assertion |
+| `tests/kernel-skills.test.ts` | replayed (#541) | yes (19dc43cb) | resolved by rerere from #541's replayed merge (identical conflict) |
+| `tests/node-process-runtime.test.ts` | fresh | no (edited without conflict: 19dc43cb) | union: our host-result/records tests plus upstream thinking-primitive test |
+| `tests/package-manifest.test.ts` | fresh | no | took upstream runtimePackages (TS-emit based; strict superset of our type-only-import regex) |
+| `tests/pi-shorthand.test.ts` | fresh | no | took upstream native-tool routing assertions and kept our orchestration-only (#459) test |
+| `tests/pi-tools-provider.test.ts` | fresh | no | H1 took upstream import (adds BashOperations type); H2 both added the same nested-bash preflight suite, kept ours (stdout-based cwd check) |
+| `tests/prewalk-prompt.test.ts` | replayed (#541) | yes (19dc43cb) | resolved by rerere from #541's replayed merge (identical conflict) |
+| `tests/process-transport.test.ts` | fresh | no (edited without conflict: 19dc43cb) | add/add: kept our file and appended upstream startup-diagnostics suite (its bounded-stderr case depends on the unported stderr capture) |
+| `tests/residency.test.ts` | fresh | no (edited without conflict: 6fc3e89a) | union of imports (ours host/router/process-identity/project + upstream runners/scope) |
+| `tests/retention.test.ts` | fresh | no | union: our terminal-run-event retention imports/tests plus upstream run-root owner identity tests |
+| `tests/shell-hang.test.ts` | fresh | no | took upstream: it removed the host-speed threshold the pass-through test raced on; strict superset of our smarty-dev#883 30s threshold (constant now unused) |
+| `tests/shell-inbox.test.ts` | fresh | no | union: our #2216 interrupted-Main count test plus upstream recovery/deferred-retry tests |
+| `tests/verified-providers.test.ts` | fresh | no (edited without conflict: 19dc43cb) | union of provider families (upstream decisions/programs/sessions/thinking plus our records) |
+| `src/agents/claude-cli.ts` (main merge 30aa4e91) | fresh | no | main's Landlock env scrub (`childProcessEnvironment`, #738) on our first-use `cross-spawn` loader |
+| `src/agents/request.ts` (main merge 30aa4e91) | fresh | yes (19dc43cb) | main's configured-model-wins rule and denied-default fallback (#699 follow-ups), applied to both Pi runners (`pi`, `pi-durable`) |
+| `src/providers/pi-tools-provider.ts` (main merge 30aa4e91) | fresh | no | main's env-scrubbed local bash and new Landlock operations signature (settings getter, tracking prefixes), combined with the upstream jev-fabric durable shell launch and our refusal of durable shells under Landlock enforce |
+| `src/index.ts` (main merge 5f32bbac) | fresh | yes (6fc3e89a) | kept our thin entry (upstream 0.110.1 moved the extension body to `src/extension.ts`); ported #852's two index.ts hunks into `src/extension.ts`: `consumeInjectedInbox()` after `inboxEventsToQueue`, and the `message_end` hook that records a `pi-fabric-inbox` message's `details.ids`/`receipts` as consumed (`state.consumeRootInbox`) right after the root-inbox `before_agent_start` delivery hook, as on main |
+
+## Semantic ports inside the merge commit (outside conflict hunks)
+
+| File | Change |
+|---|---|
+| `.github/workflows/test.yml` | union: keep our Package install smoke step and add upstream CI-workflow + Python-diagnostics test steps; runners/matrix/jobs (incl. mesh-lock-bench) unchanged; upstream setup-node/setup-python/Bend 2.0.36/mkdir /tmp auto-merged |
+| `src/extension.ts (not conflicted; resolution target)` | started from #541 extension.ts (main@9241dbd7 index.ts ported), merged upstream 0.108.1->0.110.1 extension.ts delta (clean), then ported main index.ts 9241dbd7->HEAD delta (6 hunks hand-merged: wake capture, host streaming, root-inbox queueing, lazy root-inbox imports) |
+| `src/runtime/execution-deadline.ts (not conflicted)` | added remainingMs/suspend/resume so the upstream human-wait pause runs through ExecutionDeadline; a pause rises to the host-owned ceiling, never past it |
+| `src/mesh/event-log.ts (not conflicted)` | MeshEvent/MeshPublishInput gained optional id/origin/untrusted/grantId/scheduled/sender/maxEventBytes, encoded byte-identically; appendLocked() for in-lock appends |
+| `src/topology/control-plane.ts (extra)` | new incarnation option (random when absent) so runtime-state and resident host share one owner incarnation with their participant directory |
+| `src/core/atomic-write.ts` (extra) | defines `FileLockTimeoutError`; our sync `withExclusiveFileLock` throws it on contention |
+| `src/jev/manager.ts` (extra) | upstream `registry.endInvocation` placed after our `endedAt`, before lease release |
+
+## Follow-up commits on the branch (merge-caused fixes, in order)
+
+| Commit | Change |
+|---|---|
+| ebc6f821 | settings: restore upstream lazy Claude discovery, keeping our live() fence |
+| 52cd1530 | Drop #541-only symbols from `extension.ts` (claimFabricRegistration, entropy/active-state, native-MCP approval argument). Remove duplicate imports. Add the runner fallback. Add hosted ManagedAgent fields. |
+| 14558d74 | Tests: merged constructor order (ApprovalController headless is argument 8, FabricWidget retention argument 6, PiModelControl admission argument 8), Pi 1.1 types, entropy mock, schedules callback |
+| d5e0a065 | Build gates: static root-inbox imports; the artifact check accepts our ./bin wrappers and declared dependencies in our standalone worker bundle; startup file budget 45→47 with bytes unchanged (**flagged**) |
+| 04a1d5bc | One `__piToolNames` in the QuickJS guest setup (the duplicate broke every guest). Keep inbox receipt retries armed. |
+| 2a698dd7 | **Keep `agents.runner: "pi"` as our default.** Our route pins, release pinning, placement and residency key on "pi"; upstream's pi-durable stays opt-in. Also: hosted runs exempt from close-exit custody, tolerant Main info, upstream fixtures fitted to our contracts, CI-workflow test exempts our node24 mesh-lock-bench job. |
+| 15522f6b | Skip the upstream bounded-stderr probe until the capture is ported |
+| 3b93cf4e | Test expects the upstream Pi 1.0.0 host minimum |
+| 3680feab | Ordinary mesh publish stays synchronous when nothing is due. Mesh golden regenerated; the only difference from main's encoder is the upstream sender stamp. Doc style fixes, `ts host` doc blocks, manifest/config tests. |
+| e848ed2d | Human-wait leave hop only for human-wait host calls. Settings tolerates hosts without a lease. |
+| 47bb9329 | QuickJS lets host tasks settle before aborting them at guest end (ours). Upstream's immediate abort fabricated ResidentOutcomeUnknown receipts. |
+| 198af542 | Upstream shell tests close the store on real timers; spill results carry our auto flag |
+| a8005ea4 | Upstream lock-owner reaping ported into our sync exclusive lock: identity line, EPERM counts as alive, mtime fallback for damaged metadata. Strict superset of our PID-only check. **Superseded by the scope cut** (see "Scope cut: PID-namespace liveness (to its own PR)"): reverted; main's sync lock |
+
+## Deliberate deviations from upstream behaviour (review these)
+
+1. **Default runner stays `pi`.** Upstream 0.107 made `pi-durable` the default. Adopting it would silently bypass fork behaviour keyed on the "pi" runner.
+2. **QuickJS end-of-run** keeps our settle-before-abort order.
+3. ~~Startup graph file budget is 47~~: superseded in part 2; back to 45 files (c960249f).
+4. **Upstream bounded worker-stderr capture is not ported.** A stderr pipe would delay the close event our process-tree custody relies on. Its probe is skipped with the reason.
+5. **Upstream owner heartbeat records are not adopted** for the resident host; our flock fence and start-time identity remain the authority. The sync lock now reads identity lines (a8005ea4). **Superseded by the scope cut** (see "Scope cut: PID-namespace liveness (to its own PR)"): no owner identity, heartbeat or locality code remains; all lock and owner liveness is main's.
+
+## Test evidence
+
+| Run | Commit | Files failed | Tests failed | Tests passed | Skipped | Total | Log |
+|---|---|---|---|---|---|---|---|
+| 1 | d5e0a065 | 166 | 1486 | 14065 | 232 | 15784 | `vitest-1.log` |
+| 2 | 15522f6b | 56 | 206 | 15344 | 233 | 15784 | `vitest-2.log` |
+| 3 | e848ed2d | 42 | 181 | 15369 | 233 | 15784 | `vitest-3.log` |
+| 4 (final) | 47bb9329 | 36 | 114 | 15436 | 233 | 15784 | `vitest-4.log` |
+| 4, rerun of the 36 failing files | 47bb9329 | 36 | 114 | 1393 | | | `vitest-4-rerun.log` |
+| **5 (final)** | **a8005ea4** | **32** | **93** | **15457** | 233 | 15784 | `vitest-5.log`, `vitest-5.json` |
+| 5, rerun of the 32 failing files | a8005ea4 | 32 | 93 | 1359 | | | `vitest-5-rerun.log` |
+
+Notes:
+- Run 1 predates the guest-setup fix, which made every QuickJS guest fail.
+- Run 3 may be slightly contaminated: `execution-service.ts` was briefly edited (about a minute) while it ran.
+- The final failures are deterministic: the rerun reproduced the same 93. The known flaky `mesh-state-sqlite-open-busy` test did not fail.
+
+## Remaining failures for part 2 (32 files, 93 tests, final run 5)
+
+Full list with first error: `vitest-5-failing-files.txt`. Fixed since run 4: shell-tasks-layout/shell-timing (198af542), file-lock/liveness (a8005ea4), spawn-sibling-cwd-session.
+
+- **agents-provider.test.ts (13).**
+  - F4 "public cancellation during refresh" cases time out at 15 s.
+  - "native written-but-unadmitted observations" cases fail.
+  - These pass on main (checked in a baseline worktree at e267a9a5). Look at end-of-run settlement in node-process (deferred consumption and response acks) and the leakage of cancellation across invocations.
+- **fabric-conversation (11), conversation-latest (3), conversation-controller-performance (1).** Conversation rendering: "while pinned" text and latest view. These areas are upstream UI (kitty/scrollbar/latest) merged with our conversation view.
+- **agent-spawn-primitives (8), agent-manager-nesting (1).** "Cannot clean up agent ...: worker exit is unconfirmed: unknown root identity". The upstream lineage/nested run-root change (`#parentOwnedRunRoot`) meets our custody cleanup.
+- **entropy-background (7).** The upstream retry tests run against our session-file compile path; compile is not called. Needs the mock or the scheduling path aligned.
+- **worker-installation (5), durable-worker-routing (4), durable-actors (1), durable-fabric-exec (1), handoff-continuation-worker (1).** Durable worker and package-install paths under our runner default and worker bundle.
+- **bash-idle-watchdog (4).** Watchdog expectations flip under the merged guards; investigate the actor-bash hook and idle defaults.
+- **worker-reply-tool-session (3).** bash is still active in reply-tool mode: Pi 1.1 tool loadout vs our reply-tool hiding.
+- **widget-retention (4), fabric-controller (2).** Retention timer (we dropped upstream's poll-driven expiry) and widget ordering.
+- Smaller items:
+  - agent-result-coercion (3)
+  - turn-provenance-r3 (3), namespace undefined
+  - agents-provider-services (2)
+  - agent-manager (2)
+  - lifecycle-broker (2): our skip-before-read vs upstream's directory map
+  - residency-host (2)
+  - actor-kernel, actor-manager, compaction-extension-hooks, extractive-extension
+  - global-registry: activation inference context with runner
+  - jev-auth: auth provider shape (we kept ours)
+  - jev-realtime-loop
+  - main-reload-messages: stale incarnation vs our reload flow
+  - tool-placement
+  - mesh-state-sqlite-wal-pinned (1)
+
+## Part 2 (smarty-dev#5776): follow-up fixes, startup budget, main merge
+
+Branch `sync/upstream-0.110.1`, continued from a8005ea4. Part 2 adds 10 fix commits, one merge of current main, and two fixes after it.
+
+### Part 2 commits (in order)
+
+| Commit | Change |
+|---|---|
+| 3a958828 | Global actor templates and `rlm.query` default to `pi` like `agents.runner` (upstream: `pi-durable`); docs follow. The native written-but-unadmitted test waits for the paused `agents.wait` response, not upstream's earlier native-tools catalog call. |
+| 03bdaa91 | Entropy calls upstream's `updateObservationPoolAsync` directly (it rebases under the pool lock and skips unchanged writes). Reply-tool identity tolerates tools without source info. Test fixtures fitted to the fork's extra context handlers, journaled prompt sections and captured-tool definitions. |
+| f0057798 | `AgentManager.close` keeps tracked runs under a parent-owned nested run root (upstream lineage). `validateAgentResult` keeps the #576 contract (see calls below). Spawn-primitive fixtures save a process identity for our cleanup custody. |
+| 5d20fb86 | Conversation tests send Pi 1.1's bound viewport keys (Ctrl+End/Ctrl+Home). |
+| 72248964 | Peer agents stay in the topology snapshot (see calls below). Lifecycle-broker tests fitted to our skip-before-read. Also added a one-shot widget retention timer, reverted in d8e98a91. |
+| b42e2e5e | Opt-in `pi-durable` works under fork gates: model preparation like `pi`, steer/control channel read for both Pi runners, the pi-CLI release fence scoped to `pi`, and the durable worker names its pinned SDK in `PI_PACKAGE_DIR` so tool capture patches the runner it uses. |
+| 9784beba | Worker startup failures leave a failed status record again; `claude-cli` loads `cross-spawn` on first use (the standalone worker bundle inlines it). |
+| 158e7fa3 | The run's `fabric_reply` stays declared to the model under Pi 1.x tool loadouts (it was hidden in full-code and enforce modes). Bash watchdog harness reads Pi 1.1's `isError` result. |
+| e3170bb9 | Owner incarnation is per process and host id (reload keeps it). Billed but malformed Jev answers are accounted. Jev login-only stream throws upstream's usage error without a model. Sender-stamp expectations (`sender: null`). |
+| c960249f | Startup graph back to **45 files**: the `/fabric prewalk` model picker loads on first use; `ui/fabric-model-selector.ts` is a stable lazy entry. Budget restored to 45 files / 1150 KiB. |
+| 30aa4e91 | Merge of current main `refs/remotes/origin/main-now` (83832d06, 105 commits since e267a9a5). |
+| da26e869 | The native actor child-routing test proves custody-joined removal of nested child files through the enclosing run's cleanup (they belong to that run since f0057798). |
+| d8e98a91 | No widget expiry timer: main removed the widget clock (46857f02) and pins that an idle Main arms no timer while a finished row is shown. Retained rows expire on the next event refresh after their deadline. |
+
+### Behaviour calls where upstream changed something our tests pin (review these)
+
+| Area | Call | Why |
+|---|---|---|
+| Default runner for global actor templates and `rlm.query` | **ours** (`pi`) | Follows part 1's `agents.runner: "pi"` decision; upstream's `pi-durable` default is not a superset (it changes which runner fork route pins, release pins and residency key on). `pi-durable` stays selectable explicitly. |
+| Structured results: directive prose (upstream 004d0475, 1c04dede) | **ours** (smarty-dev#576) | Our contract requires one final JSON value; `No JSON here at all.` and `Result: {...}` must fail. Upstream coerces prose into a `message`/`silent` action. Conflicting, not a superset. Upstream's coercion tests now assert the loud failure. |
+| Dashboard snapshot root filter (upstream b1378de3) | **ours** (smarty-dev#2004, #142 F3, #1089) | Both sides fixed "other sessions' agents in this session's status". Ours narrows only the widget and keeps peers in the topology; upstream drops them from the snapshot. Upstream's provider rows are taken. |
+| Fabric guidance in the system prompt | **ours** | We write the journaled `systemPromptOptions.sections.fabric_execution`; upstream returns a forced `systemPrompt`, which activation dispatch rejects. Upstream's extractive test reads our section instead. |
+| `tmux` transport | **ours** (smarty-dev#2566) | Refused until detached execution custody is confirmed. Upstream's real-tmux worker probe is skipped; a test asserts the refusal. |
+| Standalone worker layout | **ours** | `dist/worker.js` is one self-contained bundle (options parser inlined). Upstream's startup-module probe now removes `dist/worker/retry-profile.js` instead of `options.js`. |
+| Owner incarnation across reload | **ours, with upstream's fence** (smarty-dev#2160 item 4); **superseded by main #709 in the f2814332 merge** | One incarnation per process and host id: a same-process reload keeps sender messages; a restarted process still gets upstream's stale-command refusal. Since the f2814332 merge, every activation has a fresh epoch and a reload refuses the predecessor's queued messages (main's rule). |
+| Entropy observation pool update | **upstream** (strict superset) | Upstream's update rebases under the cross-process lock and skips the write for unchanged evidence (`written: false`), which is what our pre-lock check did. Our abort fence stays in the merge wrapper. |
+| Lifecycle broker directory reads | **both** | Our skip-before-read (smarty-dev#557) first, then upstream's one directory build per drain cycle. Tests fitted to both. |
+| Widget completion retention | **ours** (46857f02, no widget clock) | Upstream repaints at each retention deadline from its poll. Main removed the widget clock for idle CPU, and `shell-tasks-ui` pins zero timers while a finished row is shown. Rows expire on the first event refresh after their deadline; upstream's retention-window rules (per-row deadlines, no extension on control refresh) are kept. |
+| `pi-durable` model preparation and native discovery | **upstream** | `pi-durable` is upstream-only and opt-in; our `pi` paths are unchanged. |
+
+### Failures that also fail at upstream v0.110.1 itself
+
+Checked in a scratch worktree at cd9435c1 with the same Pi 1.1.0 install. Fixed here anyway:
+
+- Conversation dock and latest-message tests sent plain End/Home; Pi 1.1.0 binds `tui.altScreen.bottom/top` to Ctrl+End/Ctrl+Home (`fabric-conversation`, `conversation-latest`, `conversation-controller-performance`).
+- `handoff-continuation-worker` (`pi-durable`): tool capture patched the host's `ExtensionRunner`, not the durable worker's pinned SDK, so mutating `pi.*` tools stayed fenced ("until extension tool hooks initialize").
+- `jev-realtime-loop`: a billed but malformed typed answer blocked all further inference as unknown spend.
+
+### Startup budget
+
+Kept at **45 files** (no ponytail needed). Part 1's 47 came from two tiny shared chunks (`ui/fabric-model-selector.ts`, `ui/model-picker.ts`) that `/fabric prewalk`'s picker pulled in statically through `commands/fabric.ts`. They now load on first use. Build: `45 startup files, 1101179 startup bytes, 69 stable lazy entries, 145 chunks` after the main merge.
+
+### Merge of current main (30aa4e91)
+
+Parents c960249f and 83832d06 (`refs/remotes/origin/main-now`; it moved from 428d7419 to 83832d06 during this task, so the merge took the newer main). Three conflicts, all **fresh**:
+
+| File | Resolution |
+|---|---|
+| `src/agents/claude-cli.ts` | main's Landlock env scrub (`childProcessEnvironment`, #738) on our first-use `cross-spawn` loader |
+| `src/agents/request.ts` | main's configured-model-wins rule and denied-default fallback (#699 follow-ups), applied to both Pi runners (`pi`, `pi-durable`) |
+| `src/providers/pi-tools-provider.ts` | main's env-scrubbed local bash and new Landlock operations signature (settings getter, tracking prefixes), combined with the upstream jev-fabric durable shell launch and our refusal of durable shells under Landlock enforce |
+
+Outside the conflict hunks: the jev-fabric client and serve spawns now scrub reserved Landlock controls like every other owned child boundary (#738). The interrupt CLI test types Pi 1.1's prompt disposition. `bun install --frozen-lockfile`: no changes.
+
+### Part 2 test evidence
+
+Logs are in the part 2 task's artifacts, outside the repo. Runs use `bunx vitest run --maxWorkers=12` like part 1.
+
+| Run | Commit | Files failed | Tests failed | Tests passed | Skipped | Total | Log |
+|---|---|---|---|---|---|---|---|
+| 32 previously failing files | e3170bb9 | 2 | 7 | 1445 | 1 | 1453 | `p2-failing32-1.log` (6 of the 7 from a concurrent `bun run build` deleting `dist/`; the 7th was the WAL Case B that main fixes) |
+| full, maxWorkers 2 | 30aa4e91 | stopped at the 2400 s cap after 519 of 814 files | 2 | | | | `p2-vitest-1.log` (the 2 were `actor-child-routing-native`, fixed in da26e869) |
+| full | da26e869 | 2 | 2 | 15974 | 236 | 16213 | `p2-vitest-2.log`, `.json`, `-failing.tsv` (entropy live-lock timing flake; `shell-tasks-ui`, fixed in d8e98a91) |
+| **full (final)** | **d8e98a91** | 2 | 4 | 15972 | 236 | 16213 | `p2-vitest-3.log`, `.json`, `-failing.tsv` |
+| rerun of run 3's failing files (+ entropy) | d8e98a91 | 0 | 0 | 49 | | 49 | `p2-vitest-3-rerun.log` |
+
+Run 3's 4 failures were timing-bound and passed on one rerun: `completion-journal` (2, a 16 ms synchronous-scan budget measured at 16.1 and 23.3 ms under suite load) and `residency-stopped-writer-retention` (2 parameter cases with real nested writer processes; both passed in run 2 and in the rerun).
+
+- `bun run typecheck`: 0 errors on d8e98a91 (`p2-typecheck.log`).
+- `bun run build` on d8e98a91: "build artifacts and lazy startup graph verified (45 startup files, 1100205 startup bytes, 69 stable lazy entries, 145 chunks)" (`p2-build-2.log`).
+- `bun run assert:lazy-graph`: "lazy UI graph is host-package-free (46 files checked)".
+- `bun install --frozen-lockfile` after the main merge: no changes.
+
+### Merge of current main (5f32bbac)
+
+Parents d8e98a91 and 09cc92b9 (`refs/remotes/origin/main-now`, #852: cdb29afd inject a fabric-inbox batch once and bound it; 871110e5 scope work-key receipts to their topic and fail open). One conflict, **fresh**:
+
+| File | Resolution |
+|---|---|
+| `src/index.ts` | **fresh**: kept our thin entry (upstream 0.110.1 moved the extension body to `src/extension.ts`); ported #852's two index.ts hunks into `src/extension.ts`: `consumeInjectedInbox()` after `inboxEventsToQueue`, and the `message_end` hook that records a `pi-fabric-inbox` message's `details.ids`/`receipts` as consumed (`state.consumeRootInbox`) right after the root-inbox `before_agent_start` delivery hook, as on main |
+
+Auto-merged unchanged (patch-id of main's #852 diff on these 13 files equals the merge's diff from d8e98a91): the injection budget in `root-inbox.ts` (8 events, 12 KiB total, 4 KiB per event, one `<overflow>` line) and `root-inbox-delivery.ts`, topic-scoped work receipts, `consumeRootInbox` in `fabric-state.ts`/`fabric-runtime-state.ts`, topic keys in `ui/incoming-messages.ts`. `bun install --frozen-lockfile`: no changes.
+
+Evidence (logs in the m3 task's artifacts, outside the repo):
+
+- `bun run build`: "45 startup files, 1104783 startup bytes, 69 stable lazy entries, 145 chunks" (`m3-build.log`); `bun run assert:lazy-graph`: host-package-free (46 files checked).
+- `bun run typecheck`: 0 errors (`m3-typecheck.log`).
+- Inbox tests (`tests/*inbox*`, index.ts importers that touch the root inbox, #852's changed tests; 17 files): 446 passed, 1 skipped, 2 failed (`m3-vitest.log`). Both failures are in `root-inbox-session.test.ts` and also fail on pure main 09cc92b9 once `dist/` is built (`m3-main-09cc92b9-root-inbox-session.log`). The test is skipped without `dist/`, which hides it in main's CI. Its steer carriers have `data: { key }` and no `data.topic`, and 871110e5 makes a topic-less carrier claim nothing (fail open). Adding `topic: "fleet.work.pi-fabric.1"` to the two carriers makes all 18 pass on main (`m3-suggested-main-test-fix.diff`). Not applied in that merge: the fix belongs on main. Main's fix is pi-fabric#862; this branch now carries it as b91adf0d (next section).
+
+### Root-inbox-session test fix (b91adf0d)
+
+b91adf0d cherry-picks 60e5a135 (pi-fabric#862, branch `fix/852-root-inbox-session-topic`). The two steer carriers in `tests/root-inbox-session.test.ts` name their work topic (`topic: "fleet.work.pi-fabric.1"`), as #852's topic-scoped work receipts require. The idle-stream assertion moved into the after-error branch, because a during-error followUp may already be streaming when the prompt resolves. After a fresh `bun run build` (45 startup files), the file passes 18 of 18 tests on this branch.
+
+### Merge of current main (f2814332)
+
+Parents 66f19a32 (this branch, round 2 fixes included) and f2814332 (`refs/remotes/origin/main-now`, fetched from `main774.bundle` ref `fv2-main-now`). Main since 09cc92b9: #709 (control-plane owner-incarnation fence), #842 (activation-failure classes), #850 (retention `verifiedRemove` and refusal gates), #853, #859 (processSlice scope E2E), #862, #865, #866 (session actor relaunch, `stopReason`). `git merge` (rerere off) reported **12 conflicted files**, all **fresh**: 11 content conflicts and one add/add (`tests/control-plane-incarnation.test.ts`).
+
+The main design call: upstream 0.110.1 (a8d2714b) and main #709 each added an owner-incarnation fence under the same wire field (`ownerIncarnation` on participant records, commands, claims and ACKs). Main's fence is the stronger contract: a typed `FabricControlStaleIncarnationError` (`FABRIC_CONTROL_STALE_INCARNATION`), stricter ACK matching, fenced cancellation, the host-only `mesh.controlIncarnationFence` warn/enforce rollout, a captured request origin, and a fresh epoch for every activation, same-process reloads included. Main's fence is kept as the single implementation; upstream's per-control-plane epoch and its `incarnation` option are dropped. This supersedes e3170bb9's "reload keeps the owner incarnation" call (smarty-dev#2160 item 4): main's `tests/main-reload-messages.test.ts` now pins that a reload refuses the predecessor's queued messages with the typed error and delivers fresh ones once.
+
+The round 2 fixes stay as they were: a stale foreign heartbeat is `unknown` (89f2ed56), PID-namespace-aware liveness (bc69194c, and the `ownerAlive`/`childAlive` probes in retention and scratch), and a resident host with unknown liveness refuses offline cleanup (5300ffcd). Main touched none of their files except `src/residency/host.ts`, where its change is only the incarnation wiring.
+
+> **Superseded by the scope cut.** The round 2 namespace-aware liveness (89f2ed56, bc69194c, 5300ffcd, the `ownerAlive`/`childAlive` probes) and the later PR #864 P1 fixes (085e829c, f9d31966, 83d75f4c) are reverted to main's lock and owner liveness; see "Scope cut: PID-namespace liveness (to its own PR)". The liveness parts of the `src/residency/host.ts`, `src/storage/retention.ts` and `src/storage/scratch.ts` rows below are superseded too; main's incarnation wiring, `ownedStat`, `countRefusal` and `verifiedRemove` stay.
+
+| File | Method | Resolution |
+|---|---|---|
+| `docs/agents.md` | fresh | main's "Owner incarnation fencing" section (typed stale error, warn/enforce rollout, ACK attestation, no automatic retry); upstream's "Stale commands after restart" subsection folded in as its opening sentence (stable host and actor IDs, retained control-log replay) |
+| `src/actors/manager.ts` | fresh | union of imports: ours `FabricMessageSender`/`FabricScope` and the scope helpers (`launchScope`, `processSender`, `senderStamp`, ...), main's `classifyActivationFailure`/`TRANSIENT_ACTIVATION_BLOCK_CODES` (#842); #842 and #866 bodies (transient block expiry, `stopReason`, host-exit relaunch) auto-merged |
+| `src/providers/agents-message-router.ts` | fresh | main's single capture `ownerIncarnation = controlOwnerIncarnation(remoteAgent)` from the final, revalidated record; ours' raw `remoteAgent.ownerIncarnation` spread dropped. Outside the hunk, the two auto-merged duplicate `participant.ownerIncarnation` spreads (Main steer, actor message) were removed, so every route stamps only main's captured epoch |
+| `src/providers/agents-provider.ts` | fresh | `stop`: main's `{ ownerIncarnation }` captured with `controlOwnerIncarnation` (malformed advertised epochs refused before publication); the duplicate upstream spread in remote `ask` removed outside the hunk |
+| `src/residency/host.ts` | fresh | lifecycle delivery: main's `ownerIncarnation: controlOwnerIncarnation(target)`. Outside the hunk, upstream's per-process `#ownerIncarnation` and its `ownerIncarnation`/`incarnation` options removed: the control plane takes `this.participants.ownerIncarnation` with `controlIncarnationFence` (main), so a relaunch gets a fresh epoch. Round 2's tri-state `ownerAlive`, owner heartbeat and identity are unchanged |
+| `src/storage/retention.ts` (2 hunks) | fresh | both deleters: main's judged `ownedStat`, `countRefusal` and `verifiedRemove` (#850), with ours' owner-aware `safeRunTree(..., false, owner)` so a process child in a foreign PID namespace is judged by the run root owner's identity (`childAlive`), never by a local ESRCH |
+| `src/storage/scratch.ts` (2 hunks) | fresh | imports: ours' owner identity helpers plus main's `verifiedRemove`; removal: ours' namespace-aware `ownerAlive`/`childAlive` rechecks, then main's `verifiedRemove` of the judged root inode (`sweepScratch` deleter) |
+| `src/topology/control-plane.ts` (7 hunks) | fresh | main's #709 file, plus ours' host-set `sender` stamp (`FabricMessageSender` import, `sender?` on the command, a payload-supplied `sender` is dropped and the event's stamp copied). Upstream's `incarnation` option, private `#incarnation`, `MAX_INCARNATION_LENGTH` and its looser ACK check are dropped; main's public `incarnation` field serves upstream's callers and tests. `STALE_INCARNATION_ERROR` is main's text ("targets a previous or unverifiable owner incarnation") |
+| `src/topology/participant-directory.ts` (4 hunks) | fresh | main's directory-owned `readonly ownerIncarnation = randomUUID()` stamped on self, root and every published record (overriding source epochs); upstream's `ownerIncarnation` option removed outside the hunks. Validation hunk identical on both sides (took main's) |
+| `src/topology/types.ts` | fresh | one `ownerIncarnation?` field, both doc comments combined (per activation, reloads included; requesters copy it; absent on older records) |
+| `tests/control-plane-incarnation.test.ts` (add/add) | fresh | main's suite in full, plus upstream's 10 cases in a separate `describe`, fitted to main's design: the directory owns the epoch and the plane adopts it; the legacy-record case strips the epoch from a published record; the replayed-stale case also expects `errorCode`; the epochless case runs in the default warn rollout |
+| `tests/control-plane.test.ts` | fresh | ours' deterministic forged-ACK ordering (forgery published inside the handler), plus main's `ownerIncarnation: receiver.incarnation` on the request |
+
+Outside the conflict hunks:
+
+- `src/fabric-runtime-state.ts`: removed `PROCESS_OWNER_INCARNATIONS` (e3170bb9), the directory's `ownerIncarnation` option and the plane's `incarnation` option, and the now-unused `randomUUID` import. Main's wiring stays: `ownerIncarnation: controlParticipants.ownerIncarnation`, `controlIncarnationFence`, and `canConsumeMesh` gated on both mesh activation and the directory's committed epoch.
+- `docs/residency-runtime.md`: upstream's "Stale commands after restart" folded into main's "Owner incarnation fencing" (its stale link to `agents.md#stale-commands-after-restart` is gone).
+- The fabric-exec agents references (TypeScript and Python skill sets): the quoted stale-command text now matches main's error and names `FABRIC_CONTROL_STALE_INCARNATION`.
+- `src/topology/provider-participants.ts` (upstream only) still stamps `participant.ownerIncarnation` from the directory record; the directory drops malformed epochs, so it sends the same value `controlOwnerIncarnation` would.
+
+Evidence (logs in the m4 task's artifacts, outside the repo):
+
+- `bun run typecheck`: 0 errors.
+- `bun run build`: "44 startup files, 1111578 startup bytes, 69 stable lazy entries, 144 chunks" (budget 45 files, 1150 KiB) (`build.log`).
+- `bun run test:changed` selection before the commit (28 changed source files, 49 changed test files), run with `--maxWorkers=12`:
+  - `vitest related` on the 28 source files: 515 files, 508 passed, 5 skipped, 2 failed; 11223 tests passed, 128 skipped, 3 failed (`vitest-related.log`, `.json`). The 2 `wait-aliases` failures are a 100 ms execution deadline under load; `principal-relay` "a scheduled mesh.publish keeps the turn principal..." (6370b5e0, round 2) is flaky: alone it fails 1 of 8 runs both at 66f19a32 and on this merge. Both files pass alone (64 of 64, `rerun-2-failing.log`).
+  - The 49 changed test files plus the liveness, retention, control-plane, incarnation, actor-session-relaunch and mesh-grants suites (65 files): 62 passed, 2 skipped (opt-in real-Pi E2Es), 1 failed; 3248 tests passed (`vitest-direct-named.log`, `.json`). The failure, `residency-completed-retention` "wrong transport", is a `waitFor` deadline; the file passes alone, 12 of 12.
+  - Opt-in real-Pi E2Es (`FABRIC_9241_REAL_PI=1`, `FABRIC_8467_REAL_PI=1`): `session-actor-relaunch-real-pi` and `mesh-exit-cleanup-real-pi.e2e`, 4 of 4 passed (`real-pi-e2e.log`).
+
+### Merge of current main (f8a03c8e)
+
+Parents 55571003 (this branch, the f2814332 merge d316c841 and its review receipts included) and f8a03c8e (`refs/remotes/origin/main-now`). Main since f2814332: #869 (SQLite checkpoint and fsyncs off the writer lock), #841 (provider-dead alarms), #874 (transient-block cooldown and preparation timeouts), #843 (presence binding on restart), #857 (moved-main handoff). `git merge` (rerere off) reported **3 conflicted files, 3 hunks**, all **fresh**. No behaviour decision was needed: in each hunk the two sides built different things, so the resolution is a union.
+
+| File | Method | Overlap | Resolution |
+|---|---|---|---|
+| `docs/configuration.md` | fresh | conflicted in upstream merge 114f5e55 | full example config, `actors` block: main's two new keys `transientBlockCooldownMs: 600000` and `transientBlockMaxMs: 3600000` (#874), with ours' upstream `memory` and `trace` blocks after it. Main's prose for both keys auto-merged unchanged |
+| `src/actors/manager.ts` | fresh | conflicted in 114f5e55 and in the f2814332 merge d316c841 | union of imports: ours `FabricMessageSender`/`FabricScope` and the scope helpers (`launchScope`, `normalizeScope`, `processSender`, `senderStamp`, `senderTrusted`); main's `activationBlockClass` and `type ActivationBlockClass` added to the `activation-failure.js` import (#874). #874's and #843's bodies auto-merged |
+| `src/index.ts` | fresh | conflicted in 114f5e55 (replayed #541) and in the 5f32bbac merge | kept our thin entry, byte-identical to 55571003 (upstream 0.110.1 moved the extension body to `src/extension.ts`); ported main's only `src/index.ts` change since f2814332 (#841) into `src/extension.ts`: `ownsNonRetryable: () => state.initialized && state.mainOwnsProviderRecovery()` on the `registerMainProviderRecovery` call |
+
+No line is lost. For each conflicted file, both parents were diffed against the merge (for `src/index.ts`, the merged `src/index.ts` plus `src/extension.ts`):
+
+- Every line that either side added since the base f2814332 is in the merge: `docs/configuration.md` 129 ours and 4 main lines, `src/actors/manager.ts` 56 and 122, `src/index.ts` 3 and 1. Missing: 0.
+- Every parent line absent from the merge is a line that the other side changed since the base. Unexplained: 0 for every file and parent.
+- `src/index.ts`: the 88 main lines absent from `src/index.ts` plus `src/extension.ts` are exactly the base lines that 0.110.1 had already restructured at 55571003. The merge restores the one line that was missing at 55571003 (`ownsNonRetryable`).
+
+Evidence (logs in the qs32729 task's artifacts, outside the repo):
+
+- `bun install --frozen-lockfile`: no changes.
+- `bun run typecheck`: 0 errors (`c-typecheck.log`).
+- `bun run build`: "44 startup files, 1112563 startup bytes, 69 stable lazy entries, 145 chunks", within the budget (`c-build.log`).
+- Tests for the conflicted areas, `--maxWorkers=12` (21 files: `actor-manager`, `actor-manager-startup`, `actor-transient-block-e2e`, `actor-transient-block-resident-e2e`, `main-provider-dead`, `main-provider-dead-real-pi`, `main-provider-recovery`, `provider-error-class`, `stall-alarms`, `stall-alarms-resume`, `stall-alarms-real-pi`, `control-plane`, `control-plane-incarnation`, `config`, `runner-default-docs`, `process-placement-startup`, plus main's auto-merged `mesh-bridge-handoff`, `mesh-state-sqlite-checkpoint-timing`, `mesh-state-sqlite-slow-fsync`, `residency`, `agents-provider`): 19 files passed, 2 skipped (the opt-in real-Pi files); 1316 tests passed, 4 skipped, 0 failed (`c-vitest.log`, `.json`).
+- Opt-in real-Pi E2E for #841 through the ported `src/extension.ts` line (`FABRIC_8742_REAL_PI=1`, `main-provider-dead-real-pi`): 3 of 3 passed (`c-real-pi-8742.log`). `stall-alarms-real-pi` needs an installed-Pi evidence setup and was not run.
+
+### Merge of current main (048e031e)
+
+Parents 085e829c (this branch: 203ebd37 plus the PR #864 P1 liveness fix) and 048e031e (`refs/remotes/origin/main-now`). Main since f8a03c8e: #878 (actor registry reads skip the open when unchanged), #879 (pinned zig for the native helpers), #863 (each root inbox event reaches the model once, acked by id), #829 (opaque launchers replay the profile's explicit extensions), #853 (context overflow is typed and retried). `git merge` (rerere off) reported **3 conflicted files, 3 hunks**, all **fresh**. In two hunks both sides built the same thing; main's form is kept and nothing is dropped.
+
+| File | Method | Overlap | Resolution |
+|---|---|---|---|
+| `scripts/assert-build-artifacts.mjs` | fresh | conflicted in upstream merge 114f5e55 | forbidden eager-module list: union. Ours' 27 markers (upstream 0.110.1's `src/core/file-lock.ts`, native discovery, extractive memory, entropy compiler and trial, image overlays, kitty viewport) plus main's two new ones, `src/topology/root-inbox.ts` and `src/topology/root-inbox-context.ts` (#863): 29 markers, none dropped. Main's pinned-zig manifest check (#879) and its `worker/profile-extensions.js` lazy entry (#829) auto-merged |
+| `src/index.ts` | fresh | conflicted in 114f5e55 (replayed #541), in the 5f32bbac merge and in the f8a03c8e merge 93929fe6 | kept our thin entry, byte-identical to 085e829c (upstream 0.110.1 moved the extension body to `src/extension.ts`). Ported main's only `src/index.ts` change since f8a03c8e (#863) into `src/extension.ts`: the root inbox imports come from `root-inbox-shared.js` (with `ROOT_INBOX_CUSTOM_TYPE`); the context projection became `projectContext`, with main's lazily loaded `root-inbox-context.js` filter between the prewalk planning filter and skill-marker expansion; the `context` handler loads the filter at the first request that holds an inbox message, then projects once. Our `projectContext` stays async, because it keeps ours' first-use orphan repair (`compaction.repairOrphans`) |
+| `src/worker.ts` | fresh | conflicted in 114f5e55 | both sides restricted the opaque-launcher `--no-extensions` fence to the `pi` runner with the same predicate. Kept main's `opaqueFabricLauncher` constant, which #829's profile-extension replay reads below it, plus ours' note that `pi-durable` keeps native discovery. #853's overflow typing and retry auto-merged |
+
+No line is lost. For each conflicted file, both parents were diffed against the merge (for `src/index.ts`, the merged `src/index.ts` plus `src/extension.ts`):
+
+- Every line that either side added since the base f8a03c8e is in the merge, except the 3 resolution lines named above: the old forbidden-list line on each side (merged into one; its entries were checked one by one, 0 missing), ours' `--no-extensions` line (same predicate as main's `opaqueFabricLauncher`), and main's synchronous `projectContext` signature (async here). `scripts/assert-build-artifacts.mjs`: 53 ours and 11 main lines; `src/worker.ts`: 147 and 94; `src/index.ts`: 3 and 32.
+- Every other parent line absent from the merge is a line that the other side changed since the base. Unexplained: 0.
+- `src/mesh/bridge-handoff.ts` and `src/fabric-runtime-state.ts` import `root-inbox.js` exactly as on main, and `src/mesh/bridge.ts`, `stall-alarms.ts`, `fabric-state.ts` and `root-inbox-delivery.ts` import `root-inbox-shared.js` as on main, so `root-inbox.ts` stays out of the startup graph.
+
+Evidence (logs in the qs32729 task's artifacts, outside the repo):
+
+- `bun install --frozen-lockfile`: lockfile unchanged; it installed main's new `@types/semver` into `node_modules`.
+- `bun run typecheck`: 0 errors (`merge-typecheck.log`).
+- `bun run build`: "44 startup files, 1100252 startup bytes, 70 stable lazy entries, 146 chunks", within the budget of 45 files and 1150 KiB (`merge-build.log`). `bun run assert:lazy-graph`: host-package-free (46 files checked).
+- Tests for the conflicted files, `--maxWorkers=12` (25 files: `build-artifacts`, `native-toolchain`, `root-inbox*` including main's `root-inbox-ack`, `index-root-inbox`, `session-entry-retention`, `wake-causes`, `main-agent-startup`, `worker-profile-extensions`, `actor-context-overflow`, `worker-release-loader`, `worker-resident-startup`, `worker-activation-window`, `worker-e2e`, `worker-retry-profile`, `durable-worker-host`, `worker-context-admission`, `worker-startup`, plus main's auto-merged `actor-registry-open-churn`, `actor-registry-cache` and `actor-manager`): 25 files passed; 786 tests passed, 67 skipped, 0 failed (`merge-conflict-tests.log`).
+- Liveness, lock, retention, scratch and resident-host suites (`tests/liveness*`, `tests/*lock*`, `tests/retention*`, `tests/scratch*`, `tests/residency-host*`; 27 files): 475 passed, 3 skipped, 0 failed (`merge-fix-suites.log`).
+
+## Independent per-row review receipts (non-test rows)
+
+Three independent read-only auditors (Luna, not the author; fabric-v2 lanes fv2-864-aud1/2/3, 10-11 13:1x-13:3xZ) reviewed every non-test row of the upstream table at 66f19a32, plus the main-merge rows. They compared the merge result with our side and with upstream v0.110.1. Totals: **79 PASS, 0 FAIL, 3 CONCERN**. The three CONCERNs are the two deliberate decisions already listed under Behaviour calls: upstream bounded worker-stderr capture is not ported yet (rows 23-24, P2), and finished widget rows expire on the next event, with no widget clock (src/ui/controller.ts, P3). Both are tracked as follow-ups.
+
+### Auditor aud1
+
+# PR #864 — independent read-only audit (upstream 0.110.1)
+
+Host: `qs32729`. Audited HEAD: `66f19a321d907f07367d617fbec539d1e3b0dcd9` (matches assignment). Scope: resolution rows 1–34; no `tests/` rows. Verdicts are against final HEAD, with the merge-resolution and both parent comparisons retained in the accompanying patch artifacts.
+
+| file | verdict | risk (one phrase) | evidence (file:line) |
+|---|---|---|---|
+| `bun.lock` | PASS | Pi worker/runtime dependency union is locked | `bun.lock:780` |
+| `docs/agents.md` | PASS | fork HOLD/retry guarantees coexist with upstream sender and schedule guidance | `docs/agents.md:39,1559` |
+| `docs/configuration.md` | PASS | fixed Main ceiling remains explicit during human-wait pauses | `docs/configuration.md:190-192` |
+| `docs/entropy.md` | PASS | advisory persistence retry and cursor-based compilation remain distinct | `docs/entropy.md:70,84` |
+| `docs/harnesses.md` | PASS | bounded process and explicit cleanup guidance retained | `docs/harnesses.md:47` |
+| `docs/jev.md` | PASS | shell-first code-owned commands and typed decisions retained | `docs/jev.md:3` |
+| `docs/prompt-cache.md` | PASS | explicit hold/release and native-policy boundaries retained | `docs/prompt-cache.md:24,35` |
+| `docs/residency-runtime.md` | PASS | lease-fenced custody and restart-incarnation rules coexist with schedules | `docs/residency-runtime.md:77,110` |
+| `.github/workflows/test.yml` | PASS | fork CI jobs/checks remain while upstream diagnostics checks are added | `.github/workflows/test.yml:70,74,121` |
+| `package.json` | PASS | fork exports/dependencies and upstream runtime pins are unioned | `package.json:45,167` |
+| `README.md` | PASS | Records link retained with upstream feature links | `README.md:169-173` |
+| `scripts/assert-build-artifacts.mjs` | PASS | startup static-closure budget remains enforced with lazy entries | `scripts/assert-build-artifacts.mjs:219,226` |
+| `scripts/build.mjs` | PASS | upstream durable and lazy targets join fork build entries | `scripts/build.mjs:7,53,160` |
+| `skillsets/typescript/fabric-exec/references/agents.md` | PASS | owner-incarnation rejection guidance retained with delivery receipts | `skillsets/typescript/fabric-exec/references/agents.md:156` |
+| `src/actors/manager.ts` | PASS | foreign/external sender authority is downgraded; queue transfer is checkpointed | `src/actors/manager.ts:2073,3786` |
+| `src/actors/mesh-monitor.ts` | PASS | scheduled due timer and release-on-poll preserve cursor custody | `src/actors/mesh-monitor.ts:164,226` |
+| `src/actors/registry-store.ts` | PASS | registry lock recovery detects PID reuse using start identity | `src/actors/registry-store.ts:440,446` |
+| `src/actors/types.ts` | PASS | principal scope coexists with activation and orphan-record fields | `src/actors/types.ts:316,403` |
+| `src/agents/completion-inbox.ts` | PASS | failed-turn gate and delivery-receipt retries preserve inbox custody | `src/agents/completion-inbox.ts:55,231` |
+| `src/agents/manager.ts` | PASS | archive markers and unconfirmed-exit fences retain execution custody | `src/agents/manager.ts:1402,1787,3348` |
+| `src/agents/request.ts` | PASS | Pi durable model inheritance and thinking bounds preserve normalization order | `src/agents/request.ts:55,59,86` |
+| `src/agents/result.ts` | PASS | structured-result parsing retains the upstream parsed marker | `src/agents/result.ts:49,89` |
+| `src/agents/transports/process-transport.ts` | CONCERN | upstream bounded stderr accessor is not wired into the process handle | `src/agents/transports/process-transport.ts:148; src/agents/types.ts:516` |
+| `src/agents/transports/process-utils.ts` | CONCERN | detached worker stdio discards stderr rather than retaining a bounded tail | `src/agents/transports/process-utils.ts:291,342` |
+| `src/agents/types.ts` | PASS | fork custody fields coexist with upstream run, transport, and child-question types | `src/agents/types.ts:113,449,516` |
+| `src/capture/catalog.ts` | PASS | hidden tools and host-owned run replies remain excluded | `src/capture/catalog.ts:71` |
+| `src/compaction/hook.ts` | PASS | lazy hook structure remains and Pi yield invokes the callback | `src/compaction/hook.ts:905,1019` |
+| `src/config.ts` | PASS | fork controls coexist with model admission, worktree, child, and Jev settings | `src/config.ts:265,270,649` |
+| `src/core/action-registry.ts` | PASS | deadline checks and strict decision-result validation remain in invocation flow | `src/core/action-registry.ts:1160,1162` |
+| `src/core/approval-controller.ts` | PASS | internal-routing fence, absolute deny, and session-generation check coexist | `src/core/approval-controller.ts:104,121,209` |
+| `src/core/atomic-write.ts` | PASS | durable barriers, mesh-lock handling, and owner-identity liveness are present | `src/core/atomic-write.ts:403,418,484` |
+| `src/core/file-lock.ts` | PASS | final HEAD has identity-aware reaping through the shared lock implementation | `src/core/file-lock.ts:17; src/core/atomic-write.ts:484` |
+| `src/core/shell-inbox.ts` | PASS | provider-error gate prevents inbox delivery until a healthy retry | `src/core/shell-inbox.ts:53` |
+| `src/core/shell-jobs.ts` | PASS | scratch-scoped jobs retain byte-offset reads and durable detach behavior | `src/core/shell-jobs.ts:252,289,721` |
+
+## FAIL and CONCERN findings
+
+- **CONCERN — P2 — rows 23–24, bounded worker stderr capture.** **Trigger:** a process worker fails before writing its status record (or fails without enough run-log context). **Effect:** `AgentManager` can consume an optional `readStderr()` tail, but `ProcessTransport` does not provide it and `spawnDetached` launches worker stdio as ignored; early failure diagnostics lose upstream's bounded stderr evidence. Execution custody and terminal failure handling remain fenced. **Fix:** port the bounded stderr capture into `spawnDetached`, expose its reader on the returned process handle, and wire the upstream capture option/accessor through `ProcessTransport` to the transport handle, keeping the buffer bounded.
+
+## Verification
+
+- Read-only tracked-tree check: `git diff --quiet` after the audit/test attempt; no tracked files changed. The only status entry observed was untracked `.pi/`, left untouched.
+- Focused Vitest attempt: 300 tests passed; 12 test-file/project instances passed. Six instances (actor mesh monitor and agent-manager close across three projects) could not load because `@earendil-works/pi-coding-agent` is absent from the local install. Full log: `targeted-tests.log`.
+- Captured comparisons: `merge-resolution-part.patch`, `fork-comparison-part.patch`, `upstream-comparison-part.patch`; row 14 equivalents: `row14-merge.patch`, `row14-fork.patch`, `row14-upstream.patch`. The two `*-part.stat` files record comparison footprints.
+
+### Auditor aud2
+
+# pi-fabric PR #864 / upstream 0.110.1 — independent audit
+
+Host: `qs32729`. Pinned HEAD verified as `66f19a321d907f07367d617fbec539d1e3b0dcd9`. Scope: resolutions table rows 35–69 (`docs/upstream-sync/0.110.1/resolutions.md:94-128`); all 35 are non-test paths. Reviewed `git show 114f5e55 -- <file>`, `git diff 114f5e55^1 66f19a32 -- <file>`, and `git diff cd9435c1 66f19a32 -- <file>` across the assigned paths. Verdict evidence below cites final source lines.
+
+| file | verdict | risk (one phrase) | evidence (file:line) |
+|---|---|---|---|
+| `src/core/system-guidance.ts` | PASS | guidance union leaves execution policy unchanged | `src/core/system-guidance.ts:22-26,51` |
+| `src/core/tool-ownership.ts` | PASS | exclusive declaration hiding preserves Fabric and foreground tools | `src/core/tool-ownership.ts:25-47,243-251` |
+| `src/execution-service.ts` | PASS | hard timeout and nested runs remain bounded by the Main ceiling | `src/execution-service.ts:780-790,871,1448-1450` |
+| `src/fabric-exec-tool.ts` | PASS | prepareLoadout enforces resolved tool visibility and ledger guidance adds no call | `src/fabric-exec-tool.ts:185-193,213` |
+| `src/fabric-runtime-state.ts` | PASS | mesh custody and lineage precede root-inbox activation | `src/fabric-runtime-state.ts:819-820,882-904,934` |
+| `src/fabric-state.ts` | PASS | built-in guidance is available pre-activation and omitted for managed hosts | `src/fabric-state.ts:380-382` |
+| `src/host-compatibility.ts` | PASS | host-version floor matches native loadout API requirement | `src/host-compatibility.ts:80,163-165` |
+| `src/index.ts` | PASS | thin upstream entry retains the fork’s public denial-error export | `src/index.ts:1-9` |
+| `src/jev/auth.ts` | PASS | login-only provider exposes no chat models and fails closed if streamed | `src/jev/auth.ts:19-42,49-56` |
+| `src/jev/client.ts` | PASS | dispatch and credential work remain tracked through cleanup | `src/jev/client.ts:143-167,215-217` |
+| `src/jev/manager.ts` | PASS | terminal hold starts before asynchronous invocation and lease cleanup | `src/jev/manager.ts:295-300` |
+| `src/jev.ts` | PASS | fork credential error and upstream decision APIs are both exported | `src/jev.ts:1-5` |
+| `src/lifecycle/broker.ts` | PASS | directory rebuild is shared; unsaved-cursor cleanup remains reachable | `src/lifecycle/broker.ts:229-256,268-271` |
+| `src/mesh/store.ts` | PASS | schedule/grant mutations use the mesh lock and preserve originating authority | `src/mesh/store.ts:439-476,557-585` |
+| `src/protocol.ts` | PASS | invocation deadline, receipt, and participant contracts coexist | `src/protocol.ts:556-564` |
+| `src/providers/agents-message-router.ts` | PASS | remote commands carry the resolved owner incarnation | `src/providers/agents-message-router.ts:547,615,681` |
+| `src/providers/agents-provider.ts` | PASS | durable runner admission narrows scope/thinking and refuses write-confined launch | `src/providers/agents-provider.ts:918-940,2014-2018` |
+| `src/providers/jev-provider.ts` | PASS | upstream dispatch/decisions close path retains credential drain | `src/providers/jev-provider.ts:180-206` |
+| `src/providers/mesh-provider.ts` | PASS | reserved topics stay fenced and scheduled publish retains principal | `src/providers/mesh-provider.ts:35-45,48-66,423-441` |
+| `src/providers/pi-tools-provider.ts` | PASS | durable shell is rejected under Landlock enforce; confined temp custody remains | `src/providers/pi-tools-provider.ts:488-506,518-530` |
+| `src/providers/state-provider.ts` | PASS | schema mode and legacy piTools selector remain compatible | `src/providers/state-provider.ts:218-233,267-270,372` |
+| `src/residency/client.ts` | PASS | owner liveness uses process identity; request abandonment fence remains | `src/residency/client.ts:841-848,1028-1038` |
+| `src/residency/host.ts` | PASS | immutable flock, shared owner incarnation, retention, and schedule wake remain | `src/residency/host.ts:280,410-425,1302-1342,1891-2003` |
+| `src/residency/launcher-owner.ts` | PASS | descendant cleanup is birth-validated and unknown owner liveness is retained | `src/residency/launcher-owner.ts:14-31,129-140` |
+| `src/residency/launcher.ts` | PASS | launcher recovery uses observed-process custody and session-exit proof | `src/residency/launcher.ts:10,192,205,366` |
+| `src/residency/protocol.ts` | PASS | runner module and terminal run outcome fields survive residency transport | `src/residency/protocol.ts:467,673,707` |
+| `src/runtime/cpython-child-source.ts` | PASS | Python 3.14 exception type names and legacy fallback are covered | `src/runtime/cpython-child-source.ts:222-226` |
+| `src/runtime/cpython-runtime.ts` | PASS | human-wait pause retains deadline and response-receipt handling | `src/runtime/cpython-runtime.ts:261-263,309-310,352-359` |
+| `src/runtime/guest-types.ts` | PASS | upstream mesh schedule/grant and worktree result types join fork types | `src/runtime/guest-types.ts:391-393,1201-1238` |
+| `src/runtime/kernel.ts` | PASS | sandbox contract carries host ceiling, native options, and emitted output | `src/runtime/kernel.ts:27-28,37-46` |
+| `src/runtime/monty-bridge.ts` | PASS | upstream guest roots are unioned with fork records | `src/runtime/monty-bridge.ts:5,61` |
+| `src/runtime/monty-runtime.ts` | PASS | pause/resume uses the shared clamped deadline clock | `src/runtime/monty-runtime.ts:103-112; src/runtime/execution-deadline.ts:64-75` |
+| `src/runtime/node-process-runtime.ts` | PASS | partial output is bounded and host-call receipts still require guest ack | `src/runtime/node-process-runtime.ts:128-150,219-232` |
+| `src/runtime/quickjs-runtime.ts` | PASS | native tool routing and human-wait pause retain host mediation and ceiling | `src/runtime/quickjs-runtime.ts:118-119,168-198,1094-1103` |
+| `src/runtime-state-builtins.ts` | PASS | upstream decisions registration and combined StateProvider options are present | `src/runtime-state-builtins.ts:144-153` |
+
+## FAIL / CONCERN findings
+
+None: 35 PASS, 0 FAIL, 0 CONCERN. No P0–P3 findings, triggers, effects, or fixes identified in the assigned source review.
+
+## Verification limits
+
+The targeted `bun run test:related -- <35 audited paths>` command could not start because `vitest` is unavailable (`command not found`, exit 127). `bun run assert:lazy-graph` could not evaluate the graph because the checkout lacks the required built `dist/ui/*` entries. No files were edited; no build was run in this read-only audit.
+### Auditor aud3
+
+# pi-fabric PR #864 / upstream 0.110.1 independent audit
+
+Audited at HEAD `66f19a321d907f07367d617fbec539d1e3b0dcd9` on `qs32729`. Scope: conflict rows 70–78 and non-test main-merge rows 104–107; test-file rows skipped. Evidence references final-HEAD source unless noted.
+
+| file | verdict | risk (one phrase) | evidence (file:line) |
+|---|---|---|---|
+| `src/storage/retention.ts` | PASS | run-tree, receipt, unresolved-worker and owner-liveness vetoes compose | `src/storage/retention.ts:157-164,371-385,478-480` |
+| `src/topology/control-plane.ts` | PASS | lock-fenced claims and stale-owner-incarnation refusal retained | `src/topology/control-plane.ts:386-390,1183-1222,1324-1336` |
+| `src/topology/participant-directory.ts` | PASS | owner incarnation is shared with control plane and stamped on participant records | `src/topology/participant-directory.ts:1722-1725; src/fabric-runtime-state.ts:815-820,928-935` |
+| `src/ui/controller.ts` | CONCERN | 30-second completion retention is pruned only on a later refresh | `src/ui/controller.ts:837-843; src/ui/retention.ts:53-65` |
+| `src/ui/settings.ts` | PASS | lazy Claude discovery restored behind the live-session fence | `src/ui/settings.ts:68-72,166-176` |
+| `src/ui/widget.ts` | PASS | own-session filtering and per-completion retention preserved | `src/ui/widget.ts:53-55,117-120,267-271` |
+| `src/worker/model-control.ts` | PASS | required route pins remain strict under permissive Pi admission | `src/worker/model-control.ts:46-57,151-166` |
+| `src/worker/options.ts` | PASS | pi-durable Pi selection and worker-option constraints retained | `src/worker/options.ts:184-212` |
+| `src/worker.ts` | PASS | durable result retrieval composes with fork execution-drain and receipt custody | `src/worker.ts:538-581,736-746,1490-1539,1944-1950` |
+| `src/agents/claude-cli.ts` (main merge `30aa4e91`) | PASS | first-use cross-spawn and reserved-environment scrub both retained | `src/agents/claude-cli.ts:15-25` |
+| `src/agents/request.ts` (main merge `30aa4e91`) | PASS | configured model wins unless denied, then caller binding is used | `src/agents/request.ts:55-71` |
+| `src/providers/pi-tools-provider.ts` (main merge `30aa4e91`) | PASS | enforced Landlock refuses durable shell and confines local operations | `src/providers/pi-tools-provider.ts:488-529,547-550` |
+| `src/index.ts` (main merge `5f32bbac`) | PASS | inbox IDs/receipts are consumed after injection through the migrated extension entry | `src/extension.ts:802-807,1539-1543; src/topology/root-inbox.ts:663-682` |
+
+## Findings
+
+### CONCERN P3 — `src/ui/controller.ts`: completion expiry waits for another refresh
+- **Trigger:** The TUI becomes idle with a completed widget row visible, then receives no further refresh-causing event after its 30-second retention deadline.
+- **Effect:** The retained completion row (and potentially its widget reservation) remains visible past the intended TTL; the existing `nextExpiryDelay` helper is not scheduled by the controller.
+- **Fix:** Schedule/recompute a single unref'ed expiry timeout from `FabricWidgetRetention.nextExpiryDelay` (cancel/re-arm it on snapshot changes), preserving the fork's no-recurring-poll behavior.
+
+## Verification
+
+- Required HEAD matched exactly; audit commands were read-only and no tracked worktree changes were present (`.pi/` was pre-existing untracked state).
+- `bunx vitest run tests/agent-request-alias.test.ts`: **51 passed** across three configured Vitest projects.
+- Provider integration probe could not load `@earendil-works/pi-coding-agent` in this worktree, so no provider test result is claimed.
+
+## Independent per-row review receipts: main-merge rows (f2814332, merge d316c841)
+
+An independent read-only auditor (Luna xhigh, not the author; lane fv2-864-aud4, 10-11 14:1x-14:33Z) reviewed all 12 rows of the main-merge section at head 99d614bb, test files included. For each row it diffed the merge against main (f2814332) and against the branch (66f19a32), and checked that the row text matches the diff. **Totals: 12 PASS, 0 FAIL, 0 CONCERN.** Tests: the two conflicted test files pass (149 tests), and the focused storage, scratch, verified-removal and root-inbox suites pass (251 tests). Some actor and provider suites could not load in the audit checkout because two dependencies were missing; CI runs them on this head. The named security pass also judged all 12 resolutions safe on 99d614bb (pi-fabric#864 SECURITY_REVIEW, 10-11 14:05Z).
+
+# pi-fabric PR #864 — independent audit receipts
+
+Audited fetched commit `99d614bb4b30ade56af8e261c07848a8cea867c6`; merge under review `d316c841bfc8ed1b3a9216a8727b6e073543a2b0` (parents `66f19a321d907f07367d617fbec539d1e3b0dcd9`, `f2814332418300c13a5181c41c3731417c1318d7`). Both requested parent-relative diffs were run for every row.
+
+| file | verdict PASS/FAIL/CONCERN | risk (one phrase) | evidence (file:line) |
+|---|---|---|---|
+| `docs/agents.md` | PASS | documented stale-command and reload fence drift | `docs/upstream-sync/0.110.1/resolutions.md:365; docs/agents.md:966,968` |
+| `src/actors/manager.ts` | PASS | activation classification or safe relaunch could be lost | `docs/upstream-sync/0.110.1/resolutions.md:366; src/actors/manager.ts:3763,5304,5369` |
+| `src/providers/agents-message-router.ts` | PASS | stale cached epoch could authorize routing | `docs/upstream-sync/0.110.1/resolutions.md:367; src/providers/agents-message-router.ts:612` |
+| `src/providers/agents-provider.ts` | PASS | remote ask/stop could target the wrong activation | `docs/upstream-sync/0.110.1/resolutions.md:368; src/providers/agents-provider.ts:1357,2169` |
+| `src/residency/host.ts` | PASS | resident activation or liveness fence could regress | `docs/upstream-sync/0.110.1/resolutions.md:369; src/residency/host.ts:165,417,1071` |
+| `src/storage/retention.ts` | PASS | live foreign-namespace worker could be deleted | `docs/upstream-sync/0.110.1/resolutions.md:370; src/storage/retention.ts:108,116,505,614` |
+| `src/storage/scratch.ts` | PASS | live scratch owner/child or replaced inode could be swept | `docs/upstream-sync/0.110.1/resolutions.md:371; src/storage/scratch.ts:38,203` |
+| `src/topology/control-plane.ts` | PASS | stale command, ACK, or cancellation could cross activations | `docs/upstream-sync/0.110.1/resolutions.md:372; src/topology/control-plane.ts:1157,1186` |
+| `src/topology/participant-directory.ts` | PASS | source-provided epoch could spoof the owner | `docs/upstream-sync/0.110.1/resolutions.md:373; src/topology/participant-directory.ts:606,1935` |
+| `src/topology/types.ts` | PASS | participant/control epoch contract could diverge | `docs/upstream-sync/0.110.1/resolutions.md:374; src/topology/types.ts:27,30` |
+| `tests/control-plane-incarnation.test.ts` | PASS | main fence or upstream epoch cases could be omitted | `docs/upstream-sync/0.110.1/resolutions.md:375; tests/control-plane-incarnation.test.ts:432,506,619` |
+| `tests/control-plane.test.ts` | PASS | forged-ACK ordering or epoch-bound request coverage could regress | `docs/upstream-sync/0.110.1/resolutions.md:376; tests/control-plane.test.ts:1571,1580` |
+
+## FAIL and CONCERN findings
+
+None. All 12 resolutions preserve the applicable main guarantees and branch behavior; the resolution-table descriptions match the reviewed diffs. Main's per-activation #709 fence is the sole control-plane epoch, #850 `verifiedRemove` remains the deletion gate alongside owner-aware PID-namespace checks, #842 activation classes and #866 `stopReason` relaunch logic coexist in the actor manager, and root-inbox source/session-test paths are unchanged by the merge relative to either parent.
+
+## Validation notes
+
+- `tests/control-plane-incarnation.test.ts` and `tests/control-plane.test.ts`: 2 files, 149 tests passed. Log: `control-plane-tests.log`.
+- Focused verified-removal, storage-retention, scratch, and root-inbox checks: 7 files, 251 tests passed. Log: `storage-inbox-tests.log`.
+- A broader selected run reported 1,600 passing tests, but actor lifecycle/provider/secondary-retention/root-index suites could not load because this checkout lacks `@earendil-works/pi-coding-agent` and `cross-spawn`; these are environment import blockers, not assertion failures. Log: `audit-tests.log`.
+
+
+## Independent per-row review receipts: main-merge rows (f8a03c8e, merge 93929fe6)
+
+An independent read-only auditor (Luna xhigh, not the author; lane fv2-864-aud5, 10-11 14:4x-14:56Z) reviewed the 3 rows of the 'Merge of current main (f8a03c8e)' section at 93929fe6, diffing against main (f8a03c8e) and against the branch (55571003). **Totals: 3 PASS, 0 FAIL, 0 CONCERN.** It confirmed that main's #841 recovery call and condition (f8a03c8e src/index.ts:426-433) match the runtime wiring in src/extension.ts:518-525, and that the #869 checkpoint/fsync and #857 handoff paths are byte-identical to main.
+
+# pi-fabric PR #864 — independent merge-resolution audit
+
+Audited commit `93929fe6f628336ea31040443e056b4fa3f6a434` (parents `555710036d85518db51049e6fbb65ce16c08c2e9` and `f8a03c8ec269acdd681731cd9542041d461877ce`).
+
+| file | verdict PASS/FAIL/CONCERN | risk (one phrase) | evidence (file:line) |
+|---|---|---|---|
+| `docs/configuration.md` | PASS | #874 cooldown defaults coexist with upstream memory/trace example | `docs/configuration.md:376-388,963; src/config.ts:788-789,1679-1689` |
+| `src/actors/manager.ts` | PASS | cooldown classes and restart binding coexist with upstream scope handling | `src/actors/manager.ts:77-79,3821,3850,5593,6119-6174,6253-6258` |
+| `src/index.ts` | PASS | thin upstream entry retained; #841 recovery hook is active in extension | `src/index.ts:1-9; f8a03c8e:src/index.ts:426-433; src/extension.ts:518-525` |
+
+## Cross-row checks
+
+- `src/extension.ts` has the same `registerMainProviderRecovery` call and `ownsNonRetryable: () => state.initialized && state.mainOwnsProviderRecovery()` condition as main's `src/index.ts`; the comparison `f2814332..f8a03c8e` shows this is main's only `src/index.ts` change. The merge keeps `src/index.ts` byte-identical to branch parent `55571003` and adds the hook to the runtime implementation in `src/extension.ts`.
+- #843's `#restoreLoadedBinding` runs during load, checks the persisted owner-default model/thinking against the resolved run binding, fails closed on mismatch/refusal, and is unchanged from main (`src/actors/manager.ts:5593,6119-6174`). The scope imports and their usages remain (`src/actors/manager.ts:77-78,1031,3070,3601,3925,5445`).
+- #869 SQLite checkpoint/fsync paths and #857 moved-main handoff paths are byte-identical to main in the merge: `src/mesh/state-sqlite.ts` and `src/mesh/bridge-handoff.ts` (including `tests/mesh-state-sqlite-checkpoint-timing.test.ts`, `tests/mesh-state-sqlite-slow-fsync.test.ts`, and `tests/mesh-bridge-handoff.test.ts`). Source evidence: `src/mesh/state-sqlite.ts:36-68,1292-1295,1361-1364`; `src/mesh/bridge-handoff.ts:11-24,157-203`.
+- `git diff --check f8a03c8e 93929fe6` passed for the reviewed paths. No tracked files were edited; no tests/build were run for this read-only review.
+
+## FAIL/CONCERN findings
+
+None (3 PASS, 0 FAIL, 0 CONCERN); no severity, trigger, effect, or fix entries apply.
+
+
+## Independent per-row review receipts: main-merge rows (048e031e, merge b7534f6d)
+
+Auditor fv2-864-aud6 (Luna xhigh, read-only, not the author) reviewed the 3 rows of the 'Merge of current main (048e031e)' section, merge b7534f6d: **3 PASS, 0 FAIL, 0 CONCERN**.
+
+| file | verdict PASS/FAIL/CONCERN | risk | evidence (file:line) |
+|---|---|---|---|
+| `scripts/assert-build-artifacts.mjs` | PASS | Startup-forbidden union, native compiler gate, and lazy profile-replay entry are retained | `scripts/assert-build-artifacts.mjs:103,128-130,255`; `diff-048e031e-to-merge.txt:43-68,131-136`; `diff-085e829c-to-merge.txt:5-38` |
+| `src/index.ts` | PASS | #863's once-only context filter loads only on an inbox-bearing request in the migrated extension; branch orphan repair and thin entry remain | `src/extension.ts:5,1367-1435`; `048e031e:src/index.ts:1146-1207`; `src/topology/root-inbox-context.ts:1-131`; `diff-085e829c-to-merge.txt:40-115` |
+| `src/worker.ts` | PASS | #829 replays explicit profile extensions without enabling auto-discovery; #853 typed overflow path and durable-runner discovery policy remain | `src/worker.ts:468-471,492-520,1043-1044,1953-2000,2640-2642`; `src/worker/profile-extensions.ts:72-145`; `scripts/assert-build-artifacts.mjs:103`; `tests/actor-context-overflow.test.ts:207-244`; `diff-085e829c-to-merge.txt:163-214` |
+
+Findings: none (3 PASS, 0 FAIL, 0 CONCERN).
+
+## Scope cut: PID-namespace liveness (to its own PR)
+
+Chief-of-staff ruling, 10-11 20:02Z: **split**. This sync lands on main's current lock and owner liveness. The PID-namespace liveness work moves to its own PR off main, under a new smarty-dev issue. The cut is one commit on top of 03782396, before the merge of current main below. The removed diff is kept outside the repo as `liveness-split.patch` for that PR. It re-applies on the cut commit.
+
+Why: the namespace-aware liveness has needed a P1 fix in every review round (89f2ed56, bc69194c, 5300ffcd, then 085e829c, f9d31966, 83d75f4c). It changes how every lock and owner record is judged, so it gets its own review against main. Without it, this PR has no lock or owner liveness change.
+
+What the cut removes:
+
+- Upstream 0.110.1 liveness: 7c836626 (owner identity, heartbeats and namespace-aware probes), 748580eb (run-root owners judged by identity and heartbeat), and the reap rule of 1ed0cf74 in `src/core/file-lock.ts` (`EPERM` counts as alive; damaged metadata falls back to the directory mtime).
+- Branch liveness: a8005ea4 (that reap rule and the identity line ported into our sync lock), round 2 (89f2ed56, bc69194c, 5300ffcd) and the PR #864 P1 fixes (085e829c, f9d31966, 83d75f4c).
+
+Restored to main (048e031e) exactly, whole file:
+
+| File | Liveness removed |
+|---|---|
+| `src/actors/binding-store.ts` | identity line in the binding lock owner; `lockOwnerLiveness` reaping |
+| `src/actors/registry-store.ts` | locality token (`localityLockToken`), `lockTokenLocality`, `unknownNamespaceLockLiveness` in dead-owner recovery |
+| `src/mesh/custody-lock.ts` | locality token; foreign owners never recovered; hostname previous-boot tag |
+| `src/mesh/mesh-lock.ts` | locality token; foreign and unknown-namespace recovery rules; the "another host or PID namespace" holder text |
+| `src/residency/launcher-owner.ts`, `src/residency/launcher.ts` | `liveOwnerPid` with `recordOwnerLiveness` (the launcher only imported it) |
+| `src/schema/controller.ts` | commit-lock identity and heartbeat; `recordOwnerLiveness` in journal recovery |
+| `src/storage/retention.ts` | `RUN_ROOT_HEARTBEAT_TTL_MS`, owner identity on run-root markers, `ownerAlive`/`childAlive`, the `owner` parameter of `safeRunTree` |
+| `src/storage/scratch.ts` | owner identity on scratch markers, `ownerAlive`/`childAlive` |
+| `tests/retention.test.ts`, `tests/scratch.test.ts`, `tests/schema-enforcement.test.ts`, `tests/host-lease-custody-paths.test.ts` | their namespace and identity cases, and the locality-token receipt match |
+
+Deleted, since main lacks them: `tests/liveness.test.ts`, `tests/lock-token-locality.test.ts`, `tests/mesh-lock-unknown-namespace-crash.test.ts` and its fixture `tests/fixtures/mesh-lock-unknown-namespace-crash.ts`.
+
+Liveness hunks removed; the upstream features in the same files stay:
+
+| File | Removed | Kept (not liveness) |
+|---|---|---|
+| `src/core/atomic-write.ts` | the owner-liveness section (`ownerLiveness`, `recordOwnerLiveness`, `lockOwnerLiveness`, identity lines, heartbeats, procfs evidence, `SHORT_LOCK_MAX_HOLD_MS`), lock-token locality (`localityLockToken`, `lockTokenLocality`, `unknownNamespaceLockLiveness`) and a8005ea4's sync-lock reap rule | upstream `FileLockTimeoutError`; the sync lock throws it on contention |
+| `src/core/file-lock.ts` | identity line, `ownerCanBeReaped` (`EPERM` alive, mtime fallback, `lockOwnerLiveness`); the owner probe and reap rule are main's again | `FileLockTimeoutError`; only `ENOENT` falls through to ownerless-lock recovery, which re-checks that the claimed directory is still ownerless |
+| `src/residency/client.ts` | `recordOwnerLiveness` in `#liveOwner` (5300ffcd); main's `residentProcessAlive` start-time probe is back | upstream runner `residentModule` handoff |
+| `src/residency/host.ts` | `ownerAlive`, the owner heartbeat timer, `identity`/`heartbeatAt` in `owner.json` and `host.lock`, `#refreshHeartbeat` (5300ffcd) | runner modules, hosted-run recovery, `residentIdleDecision` and its schedule wake, launch scope, sender stamps, `forkSeed` refusal, indeterminate outcome |
+| `src/residency/protocol.ts` | `ResidentHostOwner extends OwnerHeartbeatFields` | `runnerModule`, `outcome` and `scope` fields |
+| `tests/residency.test.ts` | the 3 foreign or local owner offline-cleanup cases (5300ffcd) | upstream runner-module and scope cases |
+| `tests/residency-host.test.ts` | "resident owner identity" | upstream `sender: null` expectations |
+| `tests/file-lock.test.ts` (upstream) | the 3 damaged-metadata recovery cases and the `EPERM` case, in both lock modes | ownerless recovery, dead-owner recovery, live-owner protection, grace period, release, contention |
+| `tests/mesh-schedules.test.ts` | `localityLockToken()` as the live holder's token; it is a plain `randomUUID()`, as on main | the cancelled-schedule case (0c0f9065) |
+| `docs/residency-runtime.md` | the "Containers and PID namespaces" section, with the operator-recovery text "Recovering a lock whose owner's PID namespace is unknown" (83d75f4c) | scope, scheduled-events and incarnation text |
+| `docs/configuration.md` | the locality-token and unknown-namespace recovery text in the mesh lock recovery paragraph | everything else |
+| `docs/architecture.md` | "Lock and owner liveness is PID-namespace aware" | upstream foreground tools and provider lines |
+
+Not changed: upstream's README release note for 0.103.0 still lists "heartbeat liveness across PID namespaces" as upstream's own history. The hosted-runner `liveness()` contract (`FabricHostedLiveness`) is unrelated and stays.
+
+Check: `git diff refs/remotes/origin/main-now HEAD -- src/core/atomic-write.ts` shows only `FileLockTimeoutError` and its throw. No file under `src/` or `tests/` names `ownerLiveness`, `lockOwnerLiveness`, `lockTokenLocality`, `pidNamespace` or `unknownNamespaceLockLiveness`.
+
+## Merge of current main (85197461)
+
+Parents 82d69094 (this branch: 03782396 plus the scope cut above) and 85197461 (`refs/remotes/origin/main-now`, newer than 8d0af4b0). Main since 048e031e: #876 (bridge factory topic), #887 (WAL cap alarm), #868 (completions wake an ended turn), #890, #884, #883 (daily sweep single flight), #553 (inbox keeps addressed answers), #899 (process harness), #903, #875 (run directories 0700), #904 (presence gap), #909 (scratch open cleanup), #900 (JetStream state adapter), #910 (stale entropy context). `git merge` (rerere off) reported **2 conflicted files**, both **fresh**. #876, #553, #883 and the rest merged without a conflict. Because the cut restored main's lock, retention and scratch files first, main's #883, #903, #909 and #875 changes to those files applied as on main.
+
+| File | Method | Overlap | Resolution |
+|---|---|---|---|
+| `src/agents/completion-inbox.ts` (2 hunks) | fresh | conflicted in upstream merge 114f5e55 | both sides built the same two things; main's form is kept for both. (1) A turn that ends in a provider error: upstream 1a78d011's `#failed` gate held results until a successful retry or input; main #868 (smarty-dev#6134) keeps them pending and wakes idle Main at `agent_settled`, and a successful retry's `turn_end` still delivers. `#failed` is dropped. (2) A busy period that ends without `agent_settled` (manual compaction): upstream's 250 ms busy-retry timer, against main's `session_compact`/`session_compact_failed`/`retryEnded` idle signal, which polls nothing (smarty-dev#9271). `#schedule(250)` and its `delayMs` parameter are dropped. Upstream's other parts stay: `event.aborted` on `agent_settled`, the aborted-signal check in the idle check, and the timer clear when the inbox drains. Outside the hunks, 3 upstream cases in `tests/agent-completion-inbox.test.ts` that pinned the busy-retry timer are fitted to main's rule: delivery at the next busy-ending event with no timer while busy; close cancels the one idle check an enqueue arms |
+| `src/index.ts` | fresh | conflicted in 114f5e55 (replayed #541), in the 5f32bbac, f8a03c8e (93929fe6) and 048e031e (b7534f6d) merges | kept our thin entry, byte-identical to 82d69094 (upstream 0.110.1 moved the extension body to `src/extension.ts`). Ported main's two `src/index.ts` changes since 048e031e into `src/extension.ts`: #910 (smarty-dev#8881) `contextLive`, so `compileEntropyNow`'s `current()` and the background compile's error path stop on a disposed session's stale context; #868 `retryEnded: () => state.completionIdleSignal()` on `registerCompactionRecovery` |
+
+No line is lost. Every line added since the base 048e031e was checked against the merge (for `src/index.ts`, the merged `src/index.ts` plus `src/extension.ts`). Main: `src/agents/completion-inbox.ts` 28 lines and `src/index.ts` 11, missing 0. Ours: `src/index.ts` 3 lines, missing 0. `src/agents/completion-inbox.ts` 22 lines, of which 13 are missing: exactly the `#failed` gate and the 250 ms retry named in the row.
+
+Evidence (logs in the task's artifacts, outside the repo):
+
+- `bun install --frozen-lockfile`: lockfile unchanged; it installed main's `@nats-io/jetstream` and `@nats-io/transport-node` 3.4.0 (#900).
+- `bun run typecheck`: 0 errors (`merge-typecheck.log`).
+- `bun run build`: "44 startup files, 1091869 startup bytes, 70 stable lazy entries, 147 chunks", within the budget of 45 files and 1150 KiB (`merge-build.log`). `bun run assert:lazy-graph`: host-package-free (46 files checked).
+- Scope-cut suites before the merge, at 82d69094 (`tests/liveness*`, `tests/*lock*`, `tests/registry*`, `tests/retention*`, `tests/scratch*`, `tests/residency-host*`, `residency`, `schema-enforcement`, `mesh-schedules`, `host-lease-custody-paths`, `entropy*`, `actor-registry*`, `actor-binding*`; 53 files): 891 passed, 3 skipped, 0 failed (`cut-vitest.log`).
+- After the merge, `--maxWorkers=12`, 72 files: the same lock, liveness, retention, scratch and resident-host suites; the completion-inbox importers (`agent-completion-*`, `completion-inbox-sdk`, `completion-successor*`, `agents-provider`, `agent-stopped-runs`, `residency`, `turn-provenance-r3`, `wake-causes`, `shell-inbox`); `compaction-recovery`, `entropy*` with main's `entropy-compile-dispose`, `index-root-inbox`; and the 24 test files main changed. Result: 69 files passed, 3 skipped (the opt-in real-CLI files); 1964 tests passed, 7 skipped, 0 failed (`merge-vitest-2.log`). The first run, before the 3 cases were fitted, failed exactly those 3 (`merge-vitest.log`).
+- Opt-in real-CLI completion-wake tests for #868 (`FABRIC_6134_REAL_CLI=1`: `completion-wake-after-compaction-cli`, `-exec-timeout-cli`, `-refusal-cli`): 4 of 4 passed against the built `dist/` (`merge-real-cli.log`).

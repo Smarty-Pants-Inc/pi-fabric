@@ -54,6 +54,26 @@ describe("ApprovalController", () => {
     expect(session.approvedRisks.size).toBe(0);
   });
 
+  it("retires a headless decision answered after the session reset", async () => {
+    const config = { ...policies, headless: "decision" as const };
+    let answer!: (approved: boolean) => void; let entered!: () => void;
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    const headless = vi.fn(() => { entered(); return new Promise<boolean>(resolve => { answer = resolve; }); });
+    const session = new FabricSessionApprovals();
+    const stale = new ApprovalController(config, { hasUI: false } as ExtensionContext, session, undefined, undefined, undefined, false, headless);
+    const pending = stale.approve(action).catch(error => error);
+    await started;
+    session.reset();
+    answer(true);
+    expect(await pending).toMatchObject({ message: "Fabric approval session closed; no approval was granted" });
+    expect(session.approvedRisks.size).toBe(0);
+    // The successor generation still honours an explicit headless approval.
+    const current = new ApprovalController(config, { hasUI: false } as ExtensionContext, session, undefined, undefined, undefined, false, async () => true);
+    await expect(current.approve(action)).resolves.toBeUndefined();
+    const denied = new ApprovalController(config, { hasUI: false } as ExtensionContext, session, undefined, undefined, undefined, false, async () => false);
+    await expect(denied.approve(action)).rejects.toThrow("approval was denied, cancelled, or expired");
+  });
+
   it("fails closed when approval is required without a UI", async () => {
     const controller = new ApprovalController(policies, { hasUI: false } as ExtensionContext);
     await expect(controller.approve(action)).rejects.toThrow("no interactive UI");

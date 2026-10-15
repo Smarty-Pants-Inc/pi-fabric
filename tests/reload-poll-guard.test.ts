@@ -109,7 +109,7 @@ describe.skipIf(!fs.existsSync(entry))("real Pi reload event-refresh guard (smar
       const open = async () => {
         const runner = session!.extensionRunner!;
         const result = await runner.getToolDefinition("fabric_exec")!.execute("activate", { code: "return 1" } as never,
-          undefined, undefined, runner.createContext());
+          undefined, undefined, runner.createContext() as never);
         expect(result.content).toEqual(expect.arrayContaining([expect.objectContaining({ type: "text" })]));
         modal = runner.getCommand("fabric")!.handler("dashboard", runner.createCommandContext());
         await waitUntil(() => doneCallbacks.length > 0, "the dashboard TUI to attach");
@@ -117,7 +117,7 @@ describe.skipIf(!fs.existsSync(entry))("real Pi reload event-refresh guard (smar
         // a second real tool execution, then reload through its pending coalescer.
         expect(owned.filter(({ timer, stack }) => !destroyed(timer) && stack.includes("FabricUiController.#schedulePoll"))).toEqual([]);
         await runner.getToolDefinition("fabric_exec")!.execute("event", { code: "return 2" } as never,
-          undefined, undefined, runner.createContext());
+          undefined, undefined, runner.createContext() as never);
         await waitUntil(
           () => owned.some(({ timer, stack }) => !destroyed(timer) && stack.includes("FabricUiController.#scheduleRefresh")),
           "a real dashboard event refresh to be queued before opening a reload window",

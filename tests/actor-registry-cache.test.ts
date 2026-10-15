@@ -243,8 +243,9 @@ describe("ActorRegistryStore cached read (#7791)", () => {
     expect(parse).toHaveBeenCalledTimes(cacheable ? 1 : 1_000);
     if (cacheable) expect(last).toBe(first);
     else expect(last).not.toBe(first);
-    expect(fstat).toHaveBeenCalledTimes(1_000);
-    expect(stat).not.toHaveBeenCalled();
+    // smarty-dev#7791: a proven generation is re-checked with one stat of the path and never reopened.
+    expect(fstat).toHaveBeenCalledTimes(cacheable ? 1 : 1_000);
+    expect(stat).toHaveBeenCalledTimes(cacheable ? 999 : 0);
     expect(disk).toHaveBeenCalledTimes(cacheable ? 1 : 1_000);
     const view = first as typeof value;
     expect(() => view.actors.push({ id: "bad", extra: { values: [] } })).toThrow(TypeError);
@@ -261,19 +262,31 @@ describe("ActorRegistryStore cached read (#7791)", () => {
     const quantumStartMs = 1_700_000_000_000;
     let now = quantumStartMs + 100, writtenAt = now;
     vi.spyOn(Date, "now").mockImplementation(() => now);
-    const nativeFstat = fs.fstatSync.bind(fs);
-    vi.spyOn(fs, "fstatSync").mockImplementation(((fd: number, options: unknown) => {
+    // smarty-dev#9384: the same coarse filesystem answers BOTH the descriptor fstat (the open path) and the path stat
+    // (pi-fabric#878's stat-only fast path), so their fingerprints match and only the settled guard decides.
+    const coarse = <T extends object>(stat: T): T => {
       const stampNs = BigInt(Math.floor(writtenAt / quantumMs) * quantumMs) * 1_000_000n;
-      return Object.assign(Reflect.apply(nativeFstat, fs, [fd, options]), {
-        ino: 1n, mtimeNs: stampNs, ctimeNs: stampNs,
-      });
-    }) as typeof fs.fstatSync);
+      return Object.assign(stat, { ino: 1n, mtimeNs: stampNs, ctimeNs: stampNs });
+    };
+    const nativeFstat = fs.fstatSync.bind(fs);
+    vi.spyOn(fs, "fstatSync").mockImplementation(((fd: number, options: unknown) =>
+      coarse(Reflect.apply(nativeFstat, fs, [fd, options]))) as typeof fs.fstatSync);
+    const nativeStat = fs.statSync.bind(fs);
+    vi.spyOn(fs, "statSync").mockImplementation(((target: fs.PathLike, options: unknown) => {
+      const stat = Reflect.apply(nativeStat, fs, [target, options]) as object;
+      return String(target) === file ? coarse(stat) : stat;
+    }) as typeof fs.statSync);
+    const opens = vi.spyOn(fs, "openSync");
+    const opened = () => opens.mock.calls.filter(([target]) => String(target) === file).length;
     const parse = vi.spyOn(JSON, "parse"), disk = vi.spyOn(fs, "readFileSync");
     const before = store.read();
     expect(before).toEqual(value);
     now += 100; writtenAt = now;
     fs.writeFileSync(file, bytes); // Same inode, size, mtime and ctime quantum.
+    const openedBefore = opened();
     const after = store.read();
+    // (1) Inside the settled window the fast path is not taken: the matching fingerprint still costs an open.
+    expect(opened()).toBe(openedBefore + 1);
     expect(after).toEqual(replacement);
     expect(after).not.toBe(before);
     expect(Object.isFrozen(after)).toBe(true);
@@ -290,9 +303,18 @@ describe("ActorRegistryStore cached read (#7791)", () => {
     expect(mature).not.toBe(racy);
     expect(parse).toHaveBeenCalledTimes(5);
     expect(disk).toHaveBeenCalledTimes(5);
+    const openedMature = opened();
     expect(store.read()).toBe(mature); // Re-read after the racy window proves this generation.
+    expect(opened()).toBe(openedMature); // the warm hit is the stat-only fast path: no open
     expect(parse).toHaveBeenCalledTimes(5);
     expect(disk).toHaveBeenCalledTimes(5);
+    // (2) After that warm hit, a same-size rewrite in the current tick is still seen (its stamp moved with the clock).
+    const latest = { ...value, actors: [{ id: "third", extra: { values: [5, 6] } }] };
+    expect(JSON.stringify(latest)).toHaveLength(bytes.length);
+    writtenAt = now;
+    fs.writeFileSync(file, JSON.stringify(latest));
+    expect(store.read()).toEqual(latest);
+    expect(opened()).toBe(openedMature + 1);
   });
 
   it.each([1_000, 2_000])("hits an untouched coarse %i ms generation older than two seconds", quantumMs => {
@@ -359,6 +381,17 @@ describe("ActorRegistryStore cached read (#7791)", () => {
     const disk = vi.spyOn(fs, "readFileSync");
     const fstat = fs.fstatSync.bind(fs);
     let replaced = false, deferred = false;
+    // A warm cache answers from a stat of the path (smarty-dev#7791): replace right after whichever look comes first.
+    const pathStat = fs.statSync.bind(fs);
+    vi.spyOn(fs, "statSync").mockImplementation(((target: fs.PathLike, options: unknown) => {
+      const stat = Reflect.apply(pathStat, fs, [target, options]);
+      if (!replaced && String(target) === file) {
+        replaced = true;
+        fs.writeFileSync(`${file}.new`, JSON.stringify(replacement));
+        fs.renameSync(`${file}.new`, file);
+      }
+      return stat;
+    }) as typeof fs.statSync);
     vi.spyOn(fs, "fstatSync").mockImplementation(((fd: number, options: unknown) => {
       const stat = Reflect.apply(fstat, fs, [fd, options]);
       if (!replaced) {
@@ -464,6 +497,12 @@ describe("ActorRegistryStore cached read (#7791)", () => {
       Object.assign(Reflect.apply(fstat, fs, [fd, options]), {
         dev: 0n, ino: 0n, size: stamp.size, mtimeNs: stamp.mtimeNs, ctimeNs: stamp.ctimeNs,
       })) as typeof fs.fstatSync);
+    // The same zero-ID filesystem answers a path stat too (the smarty-dev#7791 fast path).
+    const pathStat = fs.statSync.bind(fs);
+    vi.spyOn(fs, "statSync").mockImplementation(((target: fs.PathLike, options: unknown) =>
+      Object.assign(Reflect.apply(pathStat, fs, [target, options]) as object, {
+        dev: 0n, ino: 0n, size: stamp.size, mtimeNs: stamp.mtimeNs, ctimeNs: stamp.ctimeNs,
+      })) as typeof fs.statSync);
     const descriptor = Object.getOwnPropertyDescriptor(process, "platform")!;
     try {
       if (platform === "win32") Object.defineProperty(process, "platform", { ...descriptor, value: "win32" });

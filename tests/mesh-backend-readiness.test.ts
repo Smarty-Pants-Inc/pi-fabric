@@ -3,21 +3,31 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { pathToFileURL } from "node:url";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { meshBackendStatus, type MeshBackendOptions } from "../src/mesh/backend-migration.js";
-import { main } from "../src/mesh/mesh-backend-cli.js";
+import { MESH_SWITCH_OVERRIDE_ALARM_TOPIC, main } from "../src/mesh/mesh-backend-cli.js";
 import { openNodeSqlite } from "../src/mesh/state-sqlite.js";
-import { leaseHelperPath, probeStateDbLeases, proveFabricReader, procLocksKey, readerReadiness, requiredReaders, type InstalledReader, type LeaseProbeOptions, type ProcScanOptions, type ReaderProof } from "../src/mesh/reader-proof.js";
+import { leaseHelperPath, unsafeChain, probeStateDbLeases, proveFabricReader, procLocksKey, readerReadiness, requiredReaders, type InstalledReader, type LeaseProbeOptions, type ProcScanOptions, type ReaderProof } from "../src/mesh/reader-proof.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 
 // smarty-dev#7815: the switch refuses unless every REQUIRED reader (the inventory: live Fabric releases,
 // built-in installed readers, --require-reader) proved it can read sqlite.
 
 const identity: MeshIdentity = { id: "tester", name: "tester", kind: "agent" };
+const SWITCH_OWNER = "session:0a1b2c3d-0000-4000-8000-00000000c943";
 const dirs: string[] = [];
 const savedRelease = process.env.PI_FABRIC_RELEASE_SHA;
-beforeEach(() => { process.env.PI_FABRIC_RELEASE_SHA = "fabric-rel-a"; });
+beforeEach(() => {
+  process.env.PI_FABRIC_RELEASE_SHA = "fabric-rel-a";
+  // Hermetic alarm recipient (smarty-dev#9436): a launcher's SMARTY_LEAD_SESSION or PI_FABRIC_MESH_ALARM_TO must not
+  // leak in. Tests whose accepted-unready switch is expected to succeed set PI_FABRIC_MESH_ALARM_TO themselves.
+  vi.stubEnv("PI_FABRIC_MESH_ALARM_TO", undefined);
+  vi.stubEnv("SMARTY_LEAD_SESSION", undefined);
+});
 afterEach(() => {
+  vi.restoreAllMocks();
+  vi.unstubAllEnvs();
   if (savedRelease === undefined) delete process.env.PI_FABRIC_RELEASE_SHA; else process.env.PI_FABRIC_RELEASE_SHA = savedRelease;
   for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
 });
@@ -86,6 +96,11 @@ const records = (root: string): Array<Record<string, unknown>> => {
   return fs.existsSync(file) ? fs.readFileSync(file, "utf8").trim().split("\n").map(line => JSON.parse(line) as Record<string, unknown>) : [];
 };
 const backendOf = async (root: string): Promise<string> => (await meshBackendStatus(root)).backend;
+const switchOverrideAlarms = (root: string) => {
+  const store = new MeshStore(root, 256 * 1024, 500, { stateBackend: "file" });
+  try { return store.read({ topic: MESH_SWITCH_OVERRIDE_ALARM_TOPIC }); }
+  finally { store.closeState(); }
+};
 
 // ponytail: these tests need proofs, which fail closed without POSIX owners (Windows ACLs: smarty-dev#7548);
 // the fail-closed behaviour itself is covered below on every platform.
@@ -104,6 +119,120 @@ describe.skipIf(process.platform === "win32")("fabric-mesh-backend readiness gat
     expect(records(root)).toEqual([]);
     // Not installed on this host: not required.
     expect(requiredReaders([], [], [{ name: "factory", installRoot: path.join(root, "absent") }], [])).toEqual([]);
+  });
+
+  it("publishes one addressed override alarm after a committed switch, and none when no reader is overridden", async () => {
+    vi.stubEnv("PI_FABRIC_MESH_ALARM_TO", SWITCH_OWNER);
+    const root = await crashedImport();
+    const accepted = await run(["cutover", "--root", root, "--json", "--accept-unready", "holder@lease-probe"], { leaseProbe: { platform: "darwin" } });
+    expect(accepted.code, accepted.err).toBe(0);
+    const json = JSON.parse(accepted.out) as { readers: { switchId: string; acceptedUnready: Array<{ name: string; reason: string }> } };
+    expect(new Set(json.readers.acceptedUnready.map(reader => reader.name))).toEqual(new Set(["holder@lease-probe"]));
+    const alarms = switchOverrideAlarms(root);
+    expect(alarms).toHaveLength(1);
+    expect(alarms[0]).toMatchObject({ topic: MESH_SWITCH_OVERRIDE_ALARM_TOPIC, kind: "mesh-switch-override", to: SWITCH_OWNER,
+      data: { switchId: json.readers.switchId, acceptedUnready: [{ name: "holder@lease-probe", reason: expect.stringContaining("not Linux") }] } });
+    expect(alarms[0]!.data).not.toHaveProperty("root");
+    expect(alarms[0]!.text).toContain(json.readers.switchId);
+
+    const readyRoot = await fileRoot();
+    const ready = await run(["cutover", "--root", readyRoot, "--json"]);
+    expect(ready.code, ready.err).toBe(0);
+    expect(switchOverrideAlarms(readyRoot)).toEqual([]);
+  });
+
+  it("alarms an override accepted at the importing commit even when the reader is ready by the sqlite commit, once across both commits and not on a verified rerun", async () => {
+    vi.stubEnv("PI_FABRIC_MESH_ALARM_TO", SWITCH_OWNER);
+    const root = await fileRoot();
+    const builtins = [{ name: "factory", installRoot: installRoot("r1") }];
+    expect(await proveFactory(root)).toBe(0);
+    const proof = path.join(root, "readers", "factory.json");
+    const switched = await run(["cutover", "--root", root, "--json", "--accept-unready", "factory"], { builtins,
+      options: { beforeCommit: commit => {
+        fs.writeFileSync(proof, JSON.stringify(factoryProof({ backends: commit.phase === "importing" ? ["file"] : ["file", "sqlite"] })));
+      } } });
+    expect(switched.code, switched.err).toBe(0);
+    const json = JSON.parse(switched.out);
+    expect(json.readers).toMatchObject({ acceptedUnready: [], checkedUnderFence: ["importing", "sqlite"] });
+    expect(switchOverrideAlarms(root)).toHaveLength(1);
+    expect(switchOverrideAlarms(root)[0]).toMatchObject({ data: { switchId: json.readers.switchId,
+      acceptedUnready: [{ name: "factory", reason: "missing sqlite (has file)" }] } });
+    const rerun = await run(["cutover", "--root", root, "--json", "--accept-unready", "factory"], { builtins });
+    expect(rerun.code, rerun.err).toBe(0);
+    expect(switchOverrideAlarms(root)).toHaveLength(1);
+  });
+
+  it("returns non-zero when the post-commit override alarm fails, without changing the committed switch record", async () => {
+    vi.stubEnv("PI_FABRIC_MESH_ALARM_TO", SWITCH_OWNER);
+    const root = await crashedImport();
+    const originalPublish = MeshStore.prototype.publish;
+    let committedRecord = "";
+    let committedMarker = "";
+    const publish = vi.spyOn(MeshStore.prototype, "publish").mockImplementation(async function (this: MeshStore, input) {
+      if (input.topic === MESH_SWITCH_OVERRIDE_ALARM_TOPIC) {
+        committedRecord = fs.readFileSync(path.join(root, "backend-switches.jsonl"), "utf8");
+        committedMarker = fs.readFileSync(path.join(root, "state.json"), "utf8");
+        throw new Error("event log unwritable");
+      }
+      return await originalPublish.call(this, input);
+    });
+    const failed = await run(["cutover", "--root", root, "--json", "--accept-unready", "holder@lease-probe"], { leaseProbe: { platform: "darwin" } });
+    expect(failed.code).toBe(1);
+    expect(failed.err).toContain(`${MESH_SWITCH_OVERRIDE_ALARM_TOPIC} publish failed after committed switch`);
+    expect(failed.err).toContain("accepted readers: holder@lease-probe");
+    expect(failed.err.split("\n").filter(line => line.includes(`${MESH_SWITCH_OVERRIDE_ALARM_TOPIC} publish failed`))).toHaveLength(1);
+    expect(publish).toHaveBeenCalledOnce();
+    expect(JSON.parse(failed.out)).toMatchObject({ ok: false, committed: true, error: "event log unwritable" });
+    expect(await backendOf(root)).toBe("sqlite");
+    expect(fs.readFileSync(path.join(root, "backend-switches.jsonl"), "utf8")).toBe(committedRecord);
+    expect(fs.readFileSync(path.join(root, "state.json"), "utf8")).toBe(committedMarker);
+    const [intent, outcome] = records(root).slice(-2);
+    expect(outcome).toMatchObject({ phase: "outcome", ok: true, switchId: intent!.switchId });
+    expect((outcome!.acceptedUnready as Array<{ name: string }>).some(reader => reader.name === "holder@lease-probe")).toBe(true);
+    expect(switchOverrideAlarms(root)).toEqual([]);
+  });
+
+  it("still publishes the override alarm when the best-effort outcome append fails, warning without changing exit 0", async () => {
+    vi.stubEnv("PI_FABRIC_MESH_ALARM_TO", SWITCH_OWNER);
+    const root = await crashedImport();
+    const record = path.join(root, "backend-switches.jsonl");
+    let failOutcome = false;
+    const open = fs.openSync;
+    vi.spyOn(fs, "openSync").mockImplementation(((file: fs.PathLike, flags: string | number, mode?: fs.Mode) => {
+      if (failOutcome && String(file) === record && flags === "a") throw new Error("outcome append unwritable");
+      return open(file, flags, mode);
+    }) as typeof fs.openSync);
+    const switched = await run(["cutover", "--root", root, "--json", "--accept-unready", "holder@lease-probe"], {
+      leaseProbe: { platform: "darwin" }, options: { beforeCommit: commit => { if (commit.phase === "sqlite") failOutcome = true; } } });
+    expect(switched.code, switched.err).toBe(0);
+    const json = JSON.parse(switched.out);
+    expect(switched.err).toContain(`could not append the switch outcome ${json.readers.switchId}: outcome append unwritable`);
+    expect(switched.err.split("\n").filter(line => line.includes("could not append the switch outcome"))).toHaveLength(1);
+    expect(await backendOf(root)).toBe("sqlite");
+    expect(records(root).at(-1)).toMatchObject({ phase: "intent", switchId: json.readers.switchId });
+    expect(switchOverrideAlarms(root)).toHaveLength(1);
+    expect(switchOverrideAlarms(root)[0]).toMatchObject({ to: SWITCH_OWNER, data: { switchId: json.readers.switchId,
+      acceptedUnready: [{ name: "holder@lease-probe", reason: expect.stringContaining("not Linux") }] } });
+  });
+
+  it("reports a missing override alarm recipient as post-commit failure, never as a broadcast", async () => {
+    // No recipient at all (beforeEach unset both); an empty value counts as unset too.
+    expect(process.env.PI_FABRIC_MESH_ALARM_TO).toBeUndefined();
+    expect(process.env.SMARTY_LEAD_SESSION).toBeUndefined();
+    vi.stubEnv("PI_FABRIC_MESH_ALARM_TO", "");
+    vi.stubEnv("SMARTY_LEAD_SESSION", "");
+    const root = await crashedImport();
+    const publish = vi.spyOn(MeshStore.prototype, "publish");
+    const failed = await run(["cutover", "--root", root, "--json", "--accept-unready", "holder@lease-probe"], { leaseProbe: { platform: "darwin" } });
+    expect(failed.code).toBe(1);
+    expect(failed.err).toContain("no owning-lead alarm recipient");
+    expect(failed.err).toContain("accepted readers: holder@lease-probe");
+    expect(failed.err.split("\n").filter(line => line.includes(`${MESH_SWITCH_OVERRIDE_ALARM_TOPIC} publish failed`))).toHaveLength(1);
+    expect(JSON.parse(failed.out)).toMatchObject({ ok: false, committed: true });
+    expect(await backendOf(root)).toBe("sqlite");
+    expect(records(root).at(-1)).toMatchObject({ ok: true, phase: "outcome" });
+    expect(publish).not.toHaveBeenCalled();
+    expect(switchOverrideAlarms(root)).toEqual([]);
   });
 
   it("passes when every required reader proved sqlite, re-checks before both commits, and records intent and outcome", async () => {
@@ -128,6 +257,7 @@ describe.skipIf(process.platform === "win32")("fabric-mesh-backend readiness gat
   });
 
   it("refuses a live Fabric writer on a release with no proof, and one without a release", async () => {
+    vi.stubEnv("PI_FABRIC_MESH_ALARM_TO", SWITCH_OWNER);
     const root = await fileRoot();
     expect((await run(["reader-proof", "--root", root, "--backend", "sqlite"])).code).toBe(0); // fabric-rel-a
     const old = await run(["cutover", "--root", root], { writers: [{ pid: 7, release: "fabric-rel-old", mode: "file" }] });
@@ -275,11 +405,22 @@ describe.skipIf(process.platform === "win32")("fabric-mesh-backend readiness gat
     const root = await fileRoot();
     expect((await run(["reader-proof", "--root", root, "--backend", "sqlite"])).code).toBe(0); // fabric-rel-a
     let live: Writer[] = [{ pid: 7, release: "fabric-rel-a", mode: "sqlite" }];
+    const stateJson = fs.readFileSync(path.join(root, "state.json"));
+    expect(fs.existsSync(path.join(root, "state.db"))).toBe(false);
     const result = await run(["cutover", "--root", root], { writers: () => live,
       options: { beforeCommit: () => { live = [...live, { pid: 11, release: "fabric-rel-new", mode: "sqlite" }]; } } });
     expect(result.code).toBe(3);
     expect(result.err).toContain("(under the fence, before the importing commit): fabric@fabric-rel-new (no proof from installed reader fabric release fabric-rel-new");
-    expect(await backendOf(root)).toBe("file");
+    // smarty-dev#9501: the refusal precedes the importing commit and this run created state.db, so it is removed under
+    // the fence: status backend "none" means no state.db (the file reader stays). Without a held directory fd
+    // (macOS smarty-dev#11066) the database is kept, at backend=file.
+    expect(fs.readFileSync(path.join(root, "state.json")).equals(stateJson)).toBe(true);
+    if (result.err.includes("no-held-dir-fd")) {
+      expect(await backendOf(root)).toBe("file");
+    } else {
+      expect(fs.readdirSync(root).filter(name => /^state\.db(?:-wal|-shm|-journal)?$/.test(name))).toEqual([]);
+      expect(await meshBackendStatus(root)).toMatchObject({ backend: "none", epoch: 0, reader: { source: "file" } });
+    }
   });
 
   // ponytail: the holder scan reads /proc and /proc/locks, Linux only (smarty-dev#7936); off Linux it
@@ -402,6 +543,28 @@ sys.stdin.readline()`;
     return { child, release };
   };
 
+  it.skipIf(leaseSkip !== "")(`keeps held-file override alarms path-free without changing local output${leaseSkip ? ` (skipped: ${leaseSkip})` : ""}`, async () => {
+    vi.stubEnv("PI_FABRIC_MESH_ALARM_TO", SWITCH_OWNER);
+    const root = await crashedImport();
+    const db = path.join(root, "state.db");
+    const holder = await pythonHolder(db, "fd");
+    try {
+      const accepted = await run(["cutover", "--root", root, "--json", "--accept-unready", "holder@lease:state.db"], {
+        procScan: { listPids: () => [] } });
+      expect(accepted.code, accepted.err).toBe(0);
+      const json = JSON.parse(accepted.out) as { readers: { acceptedUnready: Array<{ name: string; reason: string }> } };
+      expect(json.readers.acceptedUnready).toEqual([{ name: "holder@lease:state.db", reason: expect.stringContaining(db) }]);
+      expect(accepted.err).toContain(db);
+      const alarms = switchOverrideAlarms(root);
+      expect(alarms).toHaveLength(1);
+      const event = alarms[0]!;
+      expect(JSON.stringify(event)).not.toContain(root);
+      expect(event.data).not.toHaveProperty("root");
+      expect(event).toMatchObject({ data: { acceptedUnready: [{ name: "holder@lease:state.db", reason: expect.stringContaining(path.basename(db)) }] } });
+      expect(event.text).toContain("unidentified holder of state.db");
+    } finally { await holder.release(); }
+  });
+
   for (const mode of ["fd", "nondumpable", "mmap"] as const) {
     it.skipIf(leaseSkip !== "")(`refuses a lock-free ${mode} holder of state.db through the lease probe alone${leaseSkip ? ` (skipped: ${leaseSkip})` : ""}`, async () => {
       const root = await crashedImport();
@@ -443,7 +606,45 @@ sys.stdin.readline()`;
     } finally { await holder.release(); }
   });
 
+  // pi-fabric#881 (SEC + Astra P1): a lock-free, non-dumpable opener landing between the probe's F_UNLCK and its close
+  // used to merge into the probe's still-unread IN_OPEN. The probe now reads its own IN_OPEN before the lease, so this
+  // open is a new event. End to end through the operator's bin; the helper's test pause point places the open there.
+  it.skipIf(binSkip !== "")(`end to end: a lock-free opener between the probe's F_UNLCK and its close is refused${binSkip ? ` (skipped: ${binSkip})` : ""}`, async () => {
+    const root = await crashedImport();
+    const pause = tempDir("pause");
+    const child = spawn(process.execPath, [BIN, "cutover", "--root", root, "--accept-unready", "factory,fabric@unknown"], {
+      env: { ...process.env, PI_FABRIC_MESH_STATE_BACKEND: "", FABRIC_MESH_LEASE_TEST_PAUSE_AFTER_UNLCK: pause }, stdio: ["ignore", "pipe", "pipe"] });
+    let stderr = "";
+    child.stderr!.on("data", (data: Buffer) => { stderr += String(data); });
+    const exited = new Promise<number | null>(resolve => child.once("exit", resolve));
+    const started = Date.now();
+    while (!fs.existsSync(path.join(pause, "paused"))) {
+      if (Date.now() - started > 20_000) throw new Error(`the helper never paused after F_UNLCK: ${stderr}`);
+      await new Promise(resolve => setTimeout(resolve, 5));
+    }
+    const holder = await pythonHolder(path.join(root, "state.db"), "nondumpable");
+    try {
+      fs.writeFileSync(path.join(pause, "go"), "");
+      expect(await exited, stderr).toBe(3);
+      expect(stderr).toContain(`holder@lease:state.db (unidentified holder of ${root}/state.db (1 open(s) since the lease probe; smarty-dev#8116))`);
+    } finally { await holder.release(); }
+  }, 60_000);
+
+  // pi-fabric#881: if the probe's own IN_OPEN never arrives, nothing can be counted exactly: fail closed.
+  it.skipIf(leaseSkip !== "")(`fails closed when the probe's own IN_OPEN is not seen${leaseSkip ? ` (skipped: ${leaseSkip})` : ""}`, async () => {
+    const root = await crashedImport();
+    vi.stubEnv("FABRIC_MESH_LEASE_TEST_IGNORE_PROBE_OPEN", "1");
+    try {
+      const result = await run(["cutover", "--root", root], { procScan: { listPids: () => [] } });
+      expect(result.code, result.err).toBe(3);
+      expect(result.err).toContain(`holder@lease-probe (state.db lease probe unavailable (smarty-dev#7936): unexpected helper output: unwatched ${root}/state.db)`);
+      expect(await backendOf(root)).toBe("importing");
+    } finally { vi.unstubAllEnvs(); }
+  }, 60_000);
+
   it.skipIf(binSkip !== "")(`end to end through the operator's bin: a lock-free holder refuses, without it the switch is ready${binSkip ? ` (skipped: ${binSkip})` : ""}`, async () => {
+    // The host's real inventory may hold an unready installed reader (factory): its accepted override then alarms.
+    vi.stubEnv("PI_FABRIC_MESH_ALARM_TO", SWITCH_OWNER);
     const root = await crashedImport();
     // The operator's entry point (package bin -> dist), as a child; the real census, fd scan, /proc/locks and lease probe.
     const cli = (...argv: string[]) => spawnSync(process.execPath, [BIN, ...argv], { encoding: "utf8", timeout: 60_000,
@@ -458,6 +659,535 @@ sys.stdin.readline()`;
     expect(ready.status, ready.stderr).toBe(0);
     expect(ready.stdout).toMatch(/^cutover done: backend=sqlite epoch 1 \(from 0\)/);
   });
+
+  // smarty-dev#8145 item 3, STRESS coverage: swaps during whole CLI runs through the operator's bin on a copy of the
+  // built package; the probe-window overlap is not asserted. The deterministic proof of the hash-to-exec window is the
+  // unit test "executes the hashed fd: a helper swapped at its path after the hash never runs" (afterHash hook).
+  it.skipIf(binSkip !== "")(`stress: a helper swapped at its path during whole CLI runs never reports a held state.db free${binSkip ? ` (skipped: ${binSkip})` : ""}`, async () => {
+    const root = await crashedImport();
+    const pkg = tempDir("pkg");
+    fs.cpSync(path.resolve("dist"), path.join(pkg, "dist"), { recursive: true });
+    fs.cpSync(path.resolve("bin"), path.join(pkg, "bin"), { recursive: true });
+    const helper = path.join(pkg, "dist/native/fabric-mesh-lease");
+    // A racing child swaps a fake ("free" for every file) and the real helper at the path, without pause.
+    const racer = spawn(process.execPath, ["-e", `
+const fs = require("node:fs");
+const [helper] = process.argv.slice(1);
+fs.linkSync(helper, helper + ".real");
+fs.writeFileSync(helper + ".fake", '#!/bin/sh\\nfor f in "$@"; do echo "free $f"; done\\n', { mode: 0o700 });
+// Hard links, not rewrites: a swap is two syscalls, so it lands often inside the hash-to-exec window.
+// Every 64 swaps it publishes its count: it shows swaps went on during a CLI run (not inside the probe window).
+for (let i = 0; ; i++) {
+  fs.linkSync(helper + (i % 2 ? ".real" : ".fake"), helper + ".next");
+  fs.renameSync(helper + ".next", helper);
+  if (i % 64 === 0) fs.writeFileSync(helper + ".swaps", String(i));
+}`, helper], { stdio: "ignore" });
+    const swaps = (): number => { try { return Number(fs.readFileSync(`${helper}.swaps`, "utf8")); } catch { return -1; } };
+    const holder = await pythonHolder(path.join(root, "state.db"), "nondumpable");
+    try {
+      const started = Date.now();
+      while (swaps() < 64) {
+        if (Date.now() - started > 10_000) throw new Error("the racer did not start swapping");
+        await new Promise(resolve => setTimeout(resolve, 5));
+      }
+      let overlapped = 0;
+      for (let run = 0; run < 8; run++) {
+        const before = swaps();
+        const result = spawnSync(process.execPath, [path.join(pkg, "bin/fabric-mesh-backend"), "cutover", "--root", root,
+          "--accept-unready", "factory,fabric@unknown"], { encoding: "utf8", timeout: 60_000, env: { ...process.env, PI_FABRIC_MESH_STATE_BACKEND: "" } });
+        expect(result.status, result.stderr).toBe(3);
+        // Refused by the real verdict, or fail closed (the swapped bytes fail the hash): never "free".
+        expect(result.stderr).toMatch(/cutover refused: readers not ready for sqlite: holder@lease(:state\.db \(unidentified holder|-probe \(state\.db lease probe unavailable)/);
+        // Swaps went on during the run (stress: swaps during whole CLI runs; the probe-window overlap is not asserted).
+        if (swaps() > before) overlapped++;
+      }
+      // Under a loaded host a short run may see no published count; at least one run must have seen swaps.
+      expect(overlapped).toBeGreaterThan(0);
+      expect(await backendOf(root)).toBe("importing");
+    } finally {
+      racer.kill("SIGKILL");
+      await holder.release();
+    }
+  }, 120_000);
+
+  // smarty-dev#8145 round 1 (SEC P1): the whole real chain up to the install root, not only the helper's directory.
+  it.skipIf(leaseSkip !== "")(`fails closed on a group-writable or symlinked directory between the helper and the install root${leaseSkip ? ` (skipped: ${leaseSkip})` : ""}`, async () => {
+    const root = await crashedImport();
+    const pkg = tempDir("chain");
+    const native = path.join(pkg, "dist/native");
+    fs.mkdirSync(native, { recursive: true, mode: 0o700 });
+    const helper = path.join(native, "fabric-mesh-lease");
+    fs.copyFileSync(leaseHelperPath(), helper);
+    fs.chmodSync(helper, 0o700);
+    expect(probeStateDbLeases(root, { helper, trustRoot: pkg })).toEqual([]);
+    const dist = fs.realpathSync(path.join(pkg, "dist"));
+    fs.chmodSync(dist, 0o770);
+    expect(probeStateDbLeases(root, { helper, trustRoot: pkg })[0]).toMatchObject({ name: "holder@lease-probe",
+      reason: expect.stringContaining(`helper integrity: ${dist} is group/other-writable (mode 770)`) });
+    fs.chmodSync(dist, 0o700);
+    // dist/native as a symlink to a directory outside the package: its real path is not under the install root.
+    const elsewhere = tempDir("elsewhere");
+    fs.renameSync(native, path.join(elsewhere, "native"));
+    fs.symlinkSync(path.join(elsewhere, "native"), native);
+    expect(probeStateDbLeases(root, { helper, trustRoot: pkg })[0]).toMatchObject({ name: "holder@lease-probe",
+      reason: expect.stringContaining(`is outside the install root ${fs.realpathSync(pkg)}`) });
+  });
+
+  // pi-fabric#880 review round 2: above the install root up to the first root-owned, root-only (or sticky) ancestor.
+  // pi-fabric#880 review round 7 (SEC P1): the walk above the install root stopped at the FIRST root-owned 0755 dir, so
+  // a writable parent above it could rename it and replace the package. Root ownership cannot be made in a test: the
+  // ancestors above a scratch tree are an injected lstat. Both the bin's shipped check (its <chain-check> text, run
+  // as is) and the bundle's unsafeChain must agree.
+  describe("the chain above the install root walks to / (pi-fabric#880 round 7)", () => {
+    const fake = (uid: number, mode: number): fs.Stats =>
+      ({ uid, mode, dev: 0, ino: 0, isDirectory: () => true, isSymbolicLink: () => false, isFile: () => false }) as unknown as fs.Stats;
+    /** A scratch package; every ancestor above `base` is fake: `first` just above it, `higher` for all others. */
+    const layout = (first: fs.Stats, higher: (at: string) => fs.Stats) => {
+      const base = fs.realpathSync(tempDir("above"));
+      const pkg = path.join(base, "pkg");
+      fs.mkdirSync(path.join(pkg, "dist/native"), { recursive: true, mode: 0o700 });
+      const file = path.join(pkg, "dist/native/fabric-mesh-lease");
+      fs.writeFileSync(file, "x", { mode: 0o700 });
+      const inside = (at: string) => at === base || at.startsWith(`${base}${path.sep}`);
+      const lstat = (at: string): fs.Stats => inside(at) ? fs.lstatSync(at) : at === path.dirname(base) ? first : higher(at);
+      return { pkg, file, lstat, top: path.dirname(path.dirname(base)) };
+    };
+    const source = fs.readFileSync(path.resolve("bin/fabric-mesh-backend"), "utf8");
+    const region = source.slice(source.indexOf("// <chain-check>"), source.indexOf("// </chain-check>"));
+    const shim = new Function("fs", "path", "process", `${region}\nreturn { unsafeAbove };`)(fs, path, process) as
+      { unsafeAbove: (root: string, lstat: (at: string) => fs.Stats, euid?: number) => string | undefined };
+    const bundle = (file: string, pkg: string, lstat: (at: string) => fs.Stats) => unsafeChain(file, pkg, undefined, lstat);
+
+    it.skipIf(process.platform === "win32")("refuses a package under a root-owned 0755 dir whose parent is group/other-writable", () => {
+      const { pkg, file, lstat, top } = layout(fake(0, 0o40755), at => at === top ? fake(0, 0o40777) : fake(0, 0o40755));
+      expect(shim.unsafeAbove(pkg, lstat)).toBe(`${top} is group/other-writable (mode 777)`);
+      expect(bundle(file, pkg, lstat)).toBe(`${top} is group/other-writable (mode 777)`);
+    });
+
+    it.skipIf(process.platform === "win32")("passes a root-owned sticky dir (like /tmp) with our own entry below it", () => {
+      const { pkg, file, lstat } = layout(fake(0, 0o41777), () => fake(0, 0o40755));
+      expect(shim.unsafeAbove(pkg, lstat)).toBeUndefined();
+      expect(bundle(file, pkg, lstat)).toBeUndefined();
+    });
+  });
+
+  it.skipIf(leaseSkip !== "")(`fails closed on a group-writable, non-sticky parent of the install root${leaseSkip ? ` (skipped: ${leaseSkip})` : ""}`, async () => {
+    const root = await crashedImport();
+    const parent = tempDir("parent");
+    const pkg = path.join(parent, "pkg");
+    fs.mkdirSync(path.join(pkg, "dist/native"), { recursive: true, mode: 0o700 });
+    const helper = path.join(pkg, "dist/native/fabric-mesh-lease");
+    fs.copyFileSync(leaseHelperPath(), helper);
+    fs.chmodSync(helper, 0o700);
+    const real = fs.realpathSync(parent);
+    fs.chmodSync(real, 0o770);
+    expect(probeStateDbLeases(root, { helper, trustRoot: pkg })[0]).toMatchObject({ name: "holder@lease-probe",
+      reason: expect.stringContaining(`helper integrity: ${real} is group/other-writable (mode 770)`) });
+    // A 0755 parent passes, and so do the test directory's own ancestors (/tmp is root-owned and sticky).
+    fs.chmodSync(real, 0o755);
+    expect(probeStateDbLeases(root, { helper, trustRoot: pkg })).toEqual([]);
+  });
+
+  // pi-fabric#880 review round 3 (SEC P1): a swapped-in bundle drops any check it carries, so the operator's shim checks
+  // the chain BEFORE it imports the bundle. The fake bundle leaves a marker if any of its code runs.
+  it.skipIf(binSkip !== "")(`the operator's bin refuses before loading a bundle under a group-writable parent${binSkip ? ` (skipped: ${binSkip})` : ""}`, async () => {
+    // The host's real inventory may hold an unready installed reader (factory): its accepted override then alarms.
+    vi.stubEnv("PI_FABRIC_MESH_ALARM_TO", SWITCH_OWNER);
+    const root = await crashedImport();
+    const parent = tempDir("shim");
+    const pkg = path.join(parent, "pkg");
+    fs.cpSync(path.resolve("dist"), path.join(pkg, "dist"), { recursive: true });
+    fs.cpSync(path.resolve("bin"), path.join(pkg, "bin"), { recursive: true });
+    const bundle = path.join(pkg, "dist/mesh/mesh-backend-cli.js");
+    const real = fs.readFileSync(bundle);
+    const marker = path.join(parent, "bundle-ran");
+    fs.writeFileSync(bundle, `import fs from "node:fs";\nfs.writeFileSync(${JSON.stringify(marker)}, "ran");\nexport const main = async () => 0;\n`, { mode: 0o600 });
+    const cli = () => spawnSync(process.execPath, [path.join(pkg, "bin/fabric-mesh-backend"), "cutover", "--root", root,
+      "--accept-unready", "factory,fabric@unknown"], { encoding: "utf8", timeout: 60_000, env: { ...process.env, PI_FABRIC_MESH_STATE_BACKEND: "" } });
+    const parentReal = fs.realpathSync(parent);
+    fs.chmodSync(parentReal, 0o770);
+    const refused = cli();
+    expect(refused.status, refused.stderr).toBe(3);
+    expect(refused.stderr).toBe(`fabric-mesh-backend: refused before loading: helper integrity: ${parentReal} is group/other-writable (mode 770)\n`);
+    expect(fs.existsSync(marker)).toBe(false);                 // no bundle code ran
+    // Under a 0755 parent, with the real bundle back, the real switch passes.
+    fs.chmodSync(parentReal, 0o755);
+    fs.writeFileSync(bundle, real);
+    const ready = cli();
+    expect(ready.status, ready.stderr).toBe(0);
+    expect(await backendOf(root)).toBe("sqlite");
+  });
+
+  // pi-fabric#880 review round 4 (CODE P1): a symlink at or below the package root could be swapped after the check.
+  it.skipIf(binSkip !== "")(`the operator's bin refuses a symlinked bundle or bundle directory inside the package${binSkip ? ` (skipped: ${binSkip})` : ""}`, async () => {
+    // The host's real inventory may hold an unready installed reader (factory): its accepted override then alarms.
+    vi.stubEnv("PI_FABRIC_MESH_ALARM_TO", SWITCH_OWNER);
+    const root = await crashedImport();
+    const pkg = path.join(tempDir("links"), "pkg");
+    fs.cpSync(path.resolve("dist"), path.join(pkg, "dist"), { recursive: true });
+    fs.cpSync(path.resolve("bin"), path.join(pkg, "bin"), { recursive: true });
+    const cli = () => spawnSync(process.execPath, [path.join(pkg, "bin/fabric-mesh-backend"), "cutover", "--root", root,
+      "--accept-unready", "factory,fabric@unknown"], { encoding: "utf8", timeout: 60_000, env: { ...process.env, PI_FABRIC_MESH_STATE_BACKEND: "" } });
+    const pkgReal = fs.realpathSync(pkg);
+    // (1) The bundle is a symlink, in a group-writable dist/mesh, to an in-root copy (here a fake that leaves a marker).
+    const mesh = path.join(pkgReal, "dist/mesh");
+    const bundle = path.join(mesh, "mesh-backend-cli.js");
+    const copy = path.join(pkgReal, "dist/copy");
+    fs.mkdirSync(copy, { mode: 0o700 });
+    const marker = path.join(pkgReal, "..", "bundle-ran");
+    fs.writeFileSync(path.join(copy, "cli.js"), `import fs from "node:fs";\nfs.writeFileSync(${JSON.stringify(marker)}, "ran");\nexport const main = async () => 0;\n`, { mode: 0o600 });
+    const real = fs.readFileSync(bundle);
+    fs.unlinkSync(bundle);
+    fs.symlinkSync(path.join(copy, "cli.js"), bundle);
+    fs.chmodSync(mesh, 0o770);
+    // Walking down from the root, the writable dist/mesh refuses first; with it fixed, the symlinked bundle does.
+    const writable = cli();
+    expect(writable.status, writable.stderr).toBe(3);
+    expect(writable.stderr).toBe(`fabric-mesh-backend: refused before loading: helper integrity: ${mesh} is group/other-writable (mode 770)\n`);
+    fs.chmodSync(mesh, 0o700);
+    const linked = cli();
+    expect(linked.status, linked.stderr).toBe(3);
+    expect(linked.stderr).toBe(`fabric-mesh-backend: refused before loading: helper integrity: ${bundle} is a symlink inside the install root\n`);
+    expect(fs.existsSync(marker)).toBe(false);
+    fs.unlinkSync(bundle);
+    fs.writeFileSync(bundle, real, { mode: 0o600 });
+    // (2) dist/mesh itself is an in-root symlink to the real directory.
+    fs.renameSync(mesh, path.join(pkgReal, "dist/mesh-real"));
+    fs.symlinkSync(path.join(pkgReal, "dist/mesh-real"), mesh);
+    const dir = cli();
+    expect(dir.status, dir.stderr).toBe(3);
+    expect(dir.stderr).toBe(`fabric-mesh-backend: refused before loading: helper integrity: ${mesh} is a symlink inside the install root\n`);
+    fs.unlinkSync(mesh);
+    fs.renameSync(path.join(pkgReal, "dist/mesh-real"), mesh);
+    // (2b) dist/ itself is an in-root symlink to a trusted copy: refused as a symlink, never resolved.
+    const dist = path.join(pkgReal, "dist");
+    fs.renameSync(dist, path.join(pkgReal, "dist-real"));
+    fs.symlinkSync(path.join(pkgReal, "dist-real"), dist);
+    const top = cli();
+    expect(top.status, top.stderr).toBe(3);
+    expect(top.stderr).toBe(`fabric-mesh-backend: refused before loading: helper integrity: ${dist} is a symlink inside the install root\n`);
+    fs.unlinkSync(dist);
+    fs.renameSync(path.join(pkgReal, "dist-real"), dist);
+    // (3) The normal layout passes.
+    const ready = cli();
+    expect(ready.status, ready.stderr).toBe(0);
+    expect(await backendOf(root)).toBe("sqlite");
+  });
+
+  // pi-fabric#880 review round 5 (CODE P1): launched through a symlinked package-root alias with the symlink-preserving
+  // flags, the bin must still load the CANONICAL bundle it checked, never the alias (which another uid could swap).
+  it.skipIf(binSkip !== "")(`the operator's bin loads the canonical bundle when launched through a package-root alias${binSkip ? ` (skipped: ${binSkip})` : ""}`, () => {
+    const parent = tempDir("alias");
+    const pkg = path.join(parent, "pkg");
+    fs.cpSync(path.resolve("dist"), path.join(pkg, "dist"), { recursive: true });
+    fs.cpSync(path.resolve("bin"), path.join(pkg, "bin"), { recursive: true });
+    // The bundle records the URL it was loaded as.
+    const seen = path.join(parent, "loaded-as");
+    fs.writeFileSync(path.join(pkg, "dist/mesh/mesh-backend-cli.js"),
+      `import fs from "node:fs";\nfs.writeFileSync(${JSON.stringify(seen)}, import.meta.url);\nexport const main = async () => 0;\n`, { mode: 0o600 });
+    const alias = path.join(parent, "alias");
+    fs.symlinkSync(pkg, alias);
+    const result = spawnSync(process.execPath, [path.join(alias, "bin/fabric-mesh-backend"), "--help"], { encoding: "utf8", timeout: 60_000,
+      env: { ...process.env, NODE_OPTIONS: "--preserve-symlinks --preserve-symlinks-main" } });
+    expect(result.status, result.stderr).toBe(0);
+    expect(fs.readFileSync(seen, "utf8")).toBe(pathToFileURL(path.join(fs.realpathSync(pkg), "dist/mesh/mesh-backend-cli.js")).href);
+  });
+
+  it.skipIf(binSkip !== "")(`end to end: a group-writable directory of the gate's own bundle refuses the switch${binSkip ? ` (skipped: ${binSkip})` : ""}`, async () => {
+    // The host's real inventory may hold an unready installed reader (factory): its accepted override then alarms.
+    vi.stubEnv("PI_FABRIC_MESH_ALARM_TO", SWITCH_OWNER);
+    const root = await crashedImport();
+    const pkg = tempDir("bundle");
+    fs.cpSync(path.resolve("dist"), path.join(pkg, "dist"), { recursive: true });
+    fs.cpSync(path.resolve("bin"), path.join(pkg, "bin"), { recursive: true });
+    const cli = () => spawnSync(process.execPath, [path.join(pkg, "bin/fabric-mesh-backend"), "cutover", "--root", root,
+      "--accept-unready", "factory,fabric@unknown"], { encoding: "utf8", timeout: 60_000, env: { ...process.env, PI_FABRIC_MESH_STATE_BACKEND: "" } });
+    // dist/mesh holds the gate (mesh-backend-cli.js), not the helper: only the bundle chain covers it.
+    const mesh = fs.realpathSync(path.join(pkg, "dist/mesh"));
+    fs.chmodSync(mesh, 0o775);
+    const refused = cli();
+    expect(refused.status, refused.stderr).toBe(3);
+    // Since round 3 the shim refuses first, before the bundle loads; the bundle's own check stays as defence in depth.
+    expect(refused.stderr).toBe(`fabric-mesh-backend: refused before loading: helper integrity: ${mesh} is group/other-writable (mode 775)\n`);
+    fs.chmodSync(mesh, 0o700);
+    const ready = cli();
+    expect(ready.status, ready.stderr).toBe(0);
+  });
+
+  // smarty-dev#8116: a holder that opens AFTER the fenced lease probe and before the commit. The python3 child
+  // waits for a trigger file, so the switch's own onStep (between its open of state.db and the commit) runs it.
+  const lateHolder = async (file: string, mode: "open" | "link"): Promise<{ trigger: () => void; release: () => Promise<void> }> => {
+    const scratch = tempDir("late");
+    const code = `
+import ctypes, os, sys, time
+ctypes.CDLL(None).prctl(4, 0, 0, 0, 0)
+print("ready", flush=True)
+while not os.path.exists(sys.argv[2] + "/go"): time.sleep(0.005)
+if sys.argv[3] == "link":
+    os.link(sys.argv[1], sys.argv[2] + "/alias"); fd = os.open(sys.argv[2] + "/alias", os.O_RDWR); os.unlink(sys.argv[2] + "/alias")
+else:
+    fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT, 0o600)
+open(sys.argv[2] + "/opened", "w").close()
+sys.stdin.readline()`;
+    const child = spawn("python3", ["-c", code, file, scratch, mode], { stdio: ["pipe", "pipe", "inherit"] });
+    await new Promise<void>((resolve, reject) => {
+      const deadline = setTimeout(() => reject(new Error("python3 holder not ready within 10 s")), 10_000);
+      child.stdout!.once("data", () => { clearTimeout(deadline); resolve(); });
+    });
+    const trigger = (): void => {
+      fs.writeFileSync(path.join(scratch, "go"), "");
+      const until = Date.now() + 10_000;
+      while (!fs.existsSync(path.join(scratch, "opened"))) {
+        if (Date.now() > until) throw new Error("late holder did not open");
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
+      }
+    };
+    const release = (): Promise<void> => new Promise((resolve) => {
+      if (child.exitCode !== null) { resolve(); return; }
+      const deadline = setTimeout(() => { child.kill("SIGKILL"); resolve(); }, 5_000);
+      child.once("exit", () => { clearTimeout(deadline); resolve(); });
+      child.stdin!.end("\n");
+    });
+    return { trigger, release };
+  };
+  // pi-fabric#881 (Astra P1): no netting of closes. Two foreign processes open state.db back to back inside the window
+  // and one closes again: the other still holds it, so the switch refuses (an open is never cancelled by a close).
+  it.skipIf(leaseSkip !== "")(`refuses two back-to-back foreign openers of which one closes again${leaseSkip ? ` (skipped: ${leaseSkip})` : ""}`, async () => {
+    const root = await crashedImport();
+    const file = path.join(root, "state.db");
+    const holder = await lateHolder(file, "open");
+    try {
+      const result = await run(["cutover", "--root", root], { procScan: { listPids: () => [] },
+        leaseProbe: { beforeReport: () => {
+          holder.trigger();
+          spawnSync("python3", ["-c", "import os, sys; os.close(os.open(sys.argv[1], os.O_RDONLY))", file], { timeout: 10_000 });
+        } } });
+      expect(result.code, result.err).toBe(3);
+      expect(result.err).toContain(`holder@lease:state.db (unidentified holder of ${file} (2 open(s) since the lease probe; smarty-dev#8116))`);
+    } finally { await holder.release(); }
+  });
+
+  // pi-fabric#881 (Astra P2 #3): nothing is subtracted for the parent: a dup() by the parent plus a foreign opener
+  // reports every open, and the verdict (opens > probed) refuses.
+  it.skipIf(leaseSkip !== "")(`a dup by the parent plus a foreign opener is refused, never subtracted${leaseSkip ? ` (skipped: ${leaseSkip})` : ""}`, () => {
+    const dir = tempDir("dup");
+    const file = path.join(dir, "state.db");
+    fs.writeFileSync(file, "x", { mode: 0o600 });
+    // python3 is the PARENTPID: it starts the helper, opens the file once and dup()s it; a foreign child opens it too.
+    const script = `
+import os, subprocess, sys, time
+helper, file, control = sys.argv[1], sys.argv[2], sys.argv[3]
+out = open(control + ".out", "w")
+child = subprocess.Popen([helper, "--watch", str(os.getpid()), control, file], stdout=out, pass_fds=())
+while "watching" not in open(control + ".out").read(): time.sleep(0.01)
+fd = os.open(file, os.O_RDWR); os.dup(fd)
+foreign = subprocess.Popen([sys.executable, "-c", "import os, sys, time; os.open(sys.argv[1], os.O_RDONLY); print('ready', flush=True); time.sleep(30)", file], stdout=subprocess.PIPE)
+foreign.stdout.readline()
+open(control + "/go1", "w").close()
+while "end 1" not in open(control + ".out").read(): time.sleep(0.01)
+print(open(control + ".out").read(), flush=True)
+foreign.kill(); child.kill()`;
+    const control = path.join(dir, "control");
+    fs.mkdirSync(control, { mode: 0o700 });
+    const result = spawnSync("python3", ["-c", script, leaseHelperPath(), file, control], { encoding: "utf8", timeout: 30_000 });
+    // opens: the probe's own, the parent's one open, the foreign open; own: ONE description although two fds.
+    // opens: the probe's own, the parent's open (its dup makes no event), the foreign open: 3 > PROBED 1, refused.
+    expect(result.stdout, result.stderr).toContain(`opens 3 1 ${file}\n`);
+  });
+
+  // pi-fabric#881: the window ends BEFORE the switch's first own open of the files, so no own open can merge with a
+  // foreign one inside it (by construction): the report is taken before SQLite opens state.db.
+  it.skipIf(leaseSkip !== "")(`takes the watch's final report before the switch's first own open of the files${leaseSkip ? ` (skipped: ${leaseSkip})` : ""}`, async () => {
+    const root = await crashedImport();
+    const order: string[] = [];
+    // Every own open of a watched file: Node's fs opens (the create, the pinned fd) and SQLite's (the opener).
+    const openSync = fs.openSync;
+    const spy = vi.spyOn(fs, "openSync").mockImplementation(((file: fs.PathLike, ...rest: unknown[]) => {
+      if (/state\.db(-wal|-shm)?$/.test(String(file))) order.push(`open ${path.basename(String(file))}`);
+      return (openSync as (...args: unknown[]) => number)(file, ...rest);
+    }) as typeof fs.openSync);
+    const result = await run(["cutover", "--root", root], { procScan: { listPids: () => [] },
+      leaseProbe: { afterReport: () => { order.push("report"); } },
+      options: { open: (file: string) => { order.push(`open ${path.basename(file)}`); return openNodeSqlite(file); } } });
+    expect(result.code, result.err).toBe(0);
+    spy.mockRestore();
+    expect(order[0]).toBe("report");
+    expect(order.filter(step => step === "report")).toHaveLength(1);
+    expect(order.slice(1).every(step => step.startsWith("open "))).toBe(true);
+  });
+
+  const lateCases = [
+    { name: "state.db", mode: "open", why: "1 open(s) since the lease probe" },
+    // -shm does not exist at the probe: the foreign holder creates it inside the window, seen by name.
+    { name: "state.db-shm", mode: "open", why: "1 open(s) since the lease probe" },
+    // A hard link elsewhere, opened and removed again: the inode watch still sees the open.
+    { name: "state.db", mode: "link", why: "opened through another name (a hard link) since the lease probe" },
+  ] as const;
+  for (const late of lateCases) {
+    it.skipIf(leaseSkip !== "")(`refuses a lock-free, non-dumpable holder that opens ${late.name} (${late.mode}) after the lease probe and before the commit (smarty-dev#8116)${leaseSkip ? ` (skipped: ${leaseSkip})` : ""}`, async () => {
+      const root = await crashedImport();
+      if (late.name === "state.db-shm") expect(fs.existsSync(path.join(root, late.name))).toBe(false);
+      const holder = await lateHolder(path.join(root, late.name), late.mode);
+      try {
+        const result = await run(["cutover", "--root", root], { procScan: { listPids: () => [] },
+          leaseProbe: { beforeReport: () => holder.trigger() } });
+        expect(result.code, result.err).toBe(3);
+        expect(result.err).toContain(`holder@lease:${late.name} (unidentified holder of ${root}/${late.name} (${late.why}; smarty-dev#8116))`);
+        expect(await backendOf(root)).toBe("importing");
+      } finally { await holder.release(); }
+      // Without the late holder the same switch is ready: its own SQLite fds are not holders.
+      const ready = await run(["cutover", "--root", root], { procScan: { listPids: () => [] } });
+      expect(ready.code, ready.err).toBe(0);
+      expect(await backendOf(root)).toBe("sqlite");
+    });
+  }
+
+  // smarty-dev#9473: a mode, owner or link-count change (IN_ATTRIB) on a watched component fails closed like an open.
+  const attribCases = [
+    { name: "a chmod of state.db", change: (root: string) => fs.chmodSync(path.join(root, "state.db"), 0o640),
+      undo: (root: string) => fs.chmodSync(path.join(root, "state.db"), 0o600) },
+    // Only the inode watch sees this: the new name is in a directory nobody watches.
+    { name: "a hard link to state.db in an unwatched directory", change: (root: string) => fs.linkSync(path.join(root, "state.db"), path.join(root, "..", `${path.basename(root)}-link`)),
+      undo: (root: string) => fs.rmSync(path.join(root, "..", `${path.basename(root)}-link`), { force: true }) },
+  ] as const;
+  for (const attrib of attribCases) {
+    it.skipIf(leaseSkip !== "")(`refuses ${attrib.name} after the lease probe (smarty-dev#9473)${leaseSkip ? ` (skipped: ${leaseSkip})` : ""}`, async () => {
+      const root = await crashedImport();
+      const mode = fs.statSync(path.join(root, "state.db")).mode & 0o777;
+      try {
+        const result = await run(["cutover", "--root", root], { procScan: { listPids: () => [] },
+          leaseProbe: { beforeReport: () => attrib.change(root) } });
+        expect(result.code, result.err).toBe(3);
+        expect(result.err).toContain(`holder@lease:state.db (unidentified holder of ${root}/state.db (its mode, owner or link count changed since the lease probe; smarty-dev#8116))`);
+        expect(await backendOf(root)).toBe("importing");
+      } finally { attrib.undo(root); fs.chmodSync(path.join(root, "state.db"), mode); }
+      // Without the change the same switch is ready.
+      const ready = await run(["cutover", "--root", root], { procScan: { listPids: () => [] } });
+      expect(ready.code, ready.err).toBe(0);
+    });
+  }
+
+  // pi-fabric#881 Astra round 4 (P1): a hard link out, the original name unlinked, then the retained link opened before
+  // the final report. The inode stays alive with no IN_DELETE_SELF; the removed name must not end counting silently.
+  it.skipIf(leaseSkip !== "")(`refuses a state.db whose name is unlinked while a hard link elsewhere is opened (pi-fabric#881 round 4)${leaseSkip ? ` (skipped: ${leaseSkip})` : ""}`, async () => {
+    const root = await crashedImport();
+    const db = path.join(root, "state.db");
+    const link = path.join(root, "..", `${path.basename(root)}-retained`);
+    let fd: number | undefined;
+    try {
+      const result = await run(["cutover", "--root", root], { procScan: { listPids: () => [] },
+        leaseProbe: { beforeReport: () => { fs.linkSync(db, link); fs.unlinkSync(db); fd = fs.openSync(link, "r+"); } } });
+      expect(result.code, result.err).toBe(3);
+      expect(result.err).toContain(`holder@lease:state.db (unidentified holder of ${db} (its name was removed since the lease probe (a hard link may keep the inode open); smarty-dev#8116))`);
+    } finally {
+      if (fd !== undefined) fs.closeSync(fd);
+      fs.rmSync(link, { force: true });
+    }
+    // Refused, never committed: the switch record ends in a refused outcome. (The old store lived on only through the
+    // retained link: exactly the detached store the rule refuses to switch away from. The ready path is the tests above.)
+    expect(records(root).at(-1)).toMatchObject({ phase: "outcome", ok: false, refused: true });
+  });
+
+  it.skipIf(leaseSkip !== "")(`refuses a chmod of a watched state-shadow/ after the lease probe (smarty-dev#9473)${leaseSkip ? ` (skipped: ${leaseSkip})` : ""}`, async () => {
+    const root = await crashedImport();
+    const shadow = path.join(root, "state-shadow");
+    fs.mkdirSync(shadow, { mode: 0o700 });
+    const result = await run(["cutover", "--root", root], { procScan: { listPids: () => [] },
+      leaseProbe: { beforeReport: () => fs.chmodSync(shadow, 0o750) } });
+    expect(result.code, result.err).toBe(3);
+    expect(result.err).toContain("the lease watch reported a watched directory's mode, owner or link count changed (smarty-dev#8116)");
+    expect(await backendOf(root)).toBe("importing");
+    fs.chmodSync(shadow, 0o700);
+    const ready = await run(["cutover", "--root", root], { procScan: { listPids: () => [] } });
+    expect(ready.code, ready.err).toBe(0);
+  });
+
+  // smarty-dev#8116 review round 1 (SEC P1): a watched directory swapped for a new one during the window. The new
+  // state-shadow/ (and any SQLite file in it) is unwatched, so the counts are void: refuse.
+  it.skipIf(leaseSkip !== "")(`refuses when a watched state-shadow/ is moved away and replaced after the lease probe${leaseSkip ? ` (skipped: ${leaseSkip})` : ""}`, async () => {
+    const root = await crashedImport();
+    const shadow = path.join(root, "state-shadow");
+    fs.mkdirSync(shadow, { mode: 0o700 });
+    const result = await run(["cutover", "--root", root], { procScan: { listPids: () => [] },
+      leaseProbe: { beforeReport: () => {
+        fs.renameSync(shadow, path.join(root, "state-shadow.old"));
+        fs.mkdirSync(shadow, { mode: 0o700 });
+        fs.writeFileSync(path.join(shadow, "state.db"), "");
+      } } });
+    expect(result.code, result.err).toBe(3);
+    expect(result.err).toContain("holder@lease-probe (state.db lease probe unavailable (smarty-dev#7936): the lease watch reported a watched directory or file moved, deleted or replaced (smarty-dev#8116))");
+    expect(await backendOf(root)).toBe("importing");
+    // With the directory left alone the same switch is ready.
+    const ready = await run(["cutover", "--root", root], { procScan: { listPids: () => [] } });
+    expect(ready.code, ready.err).toBe(0);
+  });
+
+  // The real helper: a state-shadow/ that did not exist at the probe appears during the window (unwatched): refuse.
+  it.skipIf(leaseSkip !== "")(`refuses when a state-shadow/ appears after the lease probe${leaseSkip ? ` (skipped: ${leaseSkip})` : ""}`, async () => {
+    const root = await crashedImport();
+    expect(fs.existsSync(path.join(root, "state-shadow"))).toBe(false);
+    const result = await run(["cutover", "--root", root], { procScan: { listPids: () => [] },
+      leaseProbe: { beforeReport: () => { fs.mkdirSync(path.join(root, "state-shadow"), { mode: 0o700 }); } } });
+    expect(result.code, result.err).toBe(3);
+    expect(result.err).toContain("holder@lease-probe (state.db lease probe unavailable (smarty-dev#7936): the lease watch reported a new state-shadow directory (smarty-dev#8116))");
+    expect(await backendOf(root)).toBe("importing");
+  });
+
+  // pi-fabric#881 review round 2 (SEC P1): the missing state-shadow/ appears as a SYMLINK to a directory elsewhere, and
+  // a holder opens state.db through it; or a pre-made directory is renamed into place. Both refuse.
+  it.skipIf(leaseSkip !== "")(`refuses when a missing state-shadow/ appears as a symlink and a holder opens state.db through it${leaseSkip ? ` (skipped: ${leaseSkip})` : ""}`, async () => {
+    const root = await crashedImport();
+    const outside = tempDir("outside");
+    fs.writeFileSync(path.join(outside, "state.db"), "");
+    const holder = await lateHolder(path.join(root, "state-shadow", "state.db"), "open");
+    try {
+      const result = await run(["cutover", "--root", root], { procScan: { listPids: () => [] },
+        leaseProbe: { beforeReport: () => {
+          fs.symlinkSync(outside, path.join(root, "state-shadow"));
+          holder.trigger();
+        } } });
+      expect(result.code, result.err).toBe(3);
+      expect(result.err).toContain("holder@lease-probe (state.db lease probe unavailable (smarty-dev#7936): the lease watch reported a new state-shadow directory (smarty-dev#8116))");
+      expect(await backendOf(root)).toBe("importing");
+    } finally { await holder.release(); }
+  });
+
+  it.skipIf(leaseSkip !== "")(`refuses when a pre-made directory is renamed into place as state-shadow/${leaseSkip ? ` (skipped: ${leaseSkip})` : ""}`, async () => {
+    const root = await crashedImport();
+    const premade = path.join(root, "premade");
+    fs.mkdirSync(premade, { mode: 0o700 });
+    fs.writeFileSync(path.join(premade, "state.db"), "");
+    const result = await run(["cutover", "--root", root], { procScan: { listPids: () => [] },
+      leaseProbe: { beforeReport: () => { fs.renameSync(premade, path.join(root, "state-shadow")); } } });
+    expect(result.code, result.err).toBe(3);
+    expect(result.err).toContain("the lease watch reported a new state-shadow directory (smarty-dev#8116)");
+  });
+
+  // ponytail: an inotify queue overflow needs root (fs.inotify.max_queued_events); a fake helper with a matching
+  // digest stands in for the helper's report, so the gate's handling of it is what this proves.
+  for (const report of ["overflow", "silent"] as const) {
+    it.skipIf(leaseSkip !== "")(`fails closed when the lease watch reports ${report}${leaseSkip ? ` (skipped: ${leaseSkip})` : ""}`, async () => {
+      const root = await crashedImport();
+      const helper = path.join(tempDir("fake"), "fabric-mesh-lease");
+      fs.writeFileSync(helper, `#!/bin/sh
+if [ "$1" = --watch ]; then control=$3; shift 3; fi
+for f in "$@"; do if [ -e "$f" ]; then echo "free $f"; else echo "absent $f"; fi; done
+[ -n "$control" ] || exit 0
+echo watching
+while [ ! -e "$control/go1" ]; do sleep 0.01; done
+${report === "silent" ? "" : `echo ${report}; echo "end 1"`}
+exec sleep 30
+`, { mode: 0o700 });
+      const expectedDigest = createHash("sha256").update(fs.readFileSync(helper)).digest("hex");
+      const started = Date.now();
+      const result = await run(["cutover", "--root", root], { procScan: { listPids: () => [] }, leaseProbe: { helper, expectedDigest } });
+      expect(result.code, result.err).toBe(3);
+      expect(result.err).toContain(`holder@lease-probe (state.db lease probe unavailable (smarty-dev#7936): ${report === "overflow"
+        ? "the lease watch reported lost events (inotify queue overflow)" : "the lease watch did not report"} (smarty-dev#8116))`);
+      expect(await backendOf(root)).toBe("importing");
+      if (report === "silent") expect(Date.now() - started).toBeLessThan(30_000);
+    }, 60_000);
+  }
 
   it.skipIf(leaseSkip !== "")(`fails closed on helper integrity: a tampered helper, even with a matching forged manifest.json${leaseSkip ? ` (skipped: ${leaseSkip})` : ""}`, async () => {
     const root = await crashedImport();
@@ -478,6 +1208,27 @@ sys.stdin.readline()`;
     fs.symlinkSync(leaseHelperPath(), link);
     expect(probeStateDbLeases(root, { helper: link })[0]!.reason).toContain(`helper integrity: ${link} cannot be opened (ELOOP)`);
     expect(probeStateDbLeases(root, { expectedDigest: "" })[0]!.reason).toContain("helper integrity: no embedded digest in this build");
+  });
+
+  // smarty-dev#8145 item 2: another user who can write the helper or its directory could change what runs.
+  it.skipIf(leaseSkip !== "")(`fails closed on a group- or other-writable helper or helper directory${leaseSkip ? ` (skipped: ${leaseSkip})` : ""}`, async () => {
+    const root = await crashedImport();
+    const copy = tempDir("helper");
+    const helper = path.join(copy, "fabric-mesh-lease");
+    fs.copyFileSync(leaseHelperPath(), helper);
+    fs.chmodSync(copy, 0o700);
+    fs.chmodSync(helper, 0o700);
+    expect(probeStateDbLeases(root, { helper })).toEqual([]);
+    fs.chmodSync(helper, 0o720);
+    expect(probeStateDbLeases(root, { helper })[0]).toMatchObject({ name: "holder@lease-probe",
+      reason: expect.stringContaining(`helper integrity: ${helper} is group/other-writable (mode 720)`) });
+    fs.chmodSync(helper, 0o700);
+    fs.chmodSync(copy, 0o703);
+    try {
+      const refused = await run(["cutover", "--root", root], { procScan: { listPids: () => [] }, leaseProbe: { helper } });
+      expect(refused.code).toBe(3);
+      expect(refused.err).toContain(`helper integrity: ${copy} is group/other-writable (mode 703)`);
+    } finally { fs.chmodSync(copy, 0o700); }
   });
 
   it.skipIf(leaseSkip !== "")(`executes the hashed fd: a helper swapped at its path after the hash never runs${leaseSkip ? ` (skipped: ${leaseSkip})` : ""}`, async () => {
@@ -507,6 +1258,7 @@ sys.stdin.readline()`;
   // ponytail: the remaining fail-closed branches (not Linux, leases-enable=0, a missing helper) cannot run end to
   // end on a Linux CI host with leases enabled and the helper built, so they are injected here.
   it.skipIf(process.platform !== "linux")("fails closed when the lease probe cannot run: a missing helper, leases disabled, not Linux", async () => {
+    vi.stubEnv("PI_FABRIC_MESH_ALARM_TO", SWITCH_OWNER);
     const root = await crashedImport();
     const missing = await run(["cutover", "--root", root], { procScan: { listPids: () => [] }, leaseProbe: { helper: path.join(root, "no-helper") } });
     expect(missing.code).toBe(3);
@@ -530,6 +1282,7 @@ sys.stdin.readline()`;
   // ponytail: the holder scan reads /proc and /proc/locks, Linux only (smarty-dev#7936); off Linux it
   // fails closed, covered by "fails closed off Linux" below.
   it.skipIf(process.platform !== "linux")("fails closed when /proc/locks is unreadable: an unreadable /proc/<pid>/fd is then ambiguous", async () => {
+    vi.stubEnv("PI_FABRIC_MESH_ALARM_TO", SWITCH_OWNER);
     const root = await fileRoot();
     const other = process.ppid;
     const procScan: ProcScanOptions = { listPids: () => [other], readFdDir: denied(other),
@@ -562,6 +1315,7 @@ sys.stdin.readline()`;
   });
 
   it("fails closed off Linux: state.db evidence stays fabric@unknown and only the override passes", async () => {
+    vi.stubEnv("PI_FABRIC_MESH_ALARM_TO", SWITCH_OWNER);
     const root = await fileRoot();
     const unknown = [{ pid: 0, release: "unknown", mode: `unknown state-database ${root}/state.db-wal` }];
     const refused = await run(["cutover", "--root", root], { unknown, procScan: { platform: "darwin" } });

@@ -112,6 +112,7 @@ describe("LifecycleBroker", () => {
     await new Promise(resolve => setTimeout(resolve, 80));
     expect(broker.list()[0]?.afterSequence).toBe(sub.afterSequence);
     leased = true;
+    broker.resume(); // the real lease grant path resumes the gated broker
     await waitFor(() => broker.list()[0]?.afterSequence === mesh.latestSequence());
     expect(deliver).toHaveBeenCalledOnce();
   });
@@ -139,6 +140,7 @@ describe("LifecycleBroker", () => {
     expect(broker.list()).toHaveLength(1);
     expect(broker.list()[0]?.afterSequence).toBe(sub.afterSequence);
     waiting.mockRestore(); leased = true;
+    broker.resume(); // the real lease grant path resumes the gated broker
     await waitFor(() => once ? broker.list().length === 0 : broker.list()[0]?.afterSequence === mesh.latestSequence());
     expect(deliver).toHaveBeenCalledOnce();
   });
@@ -265,7 +267,10 @@ describe("LifecycleBroker", () => {
     const reads = vi.spyOn(mesh, "read");
     await mesh.publish({ topic: "unrelated", from: sourceIdentity, text: "two" });
     await waitFor(() => reads.mock.calls.length > 0);
-    expect(new Set(gets.mock.calls.map(([id]) => id))).toEqual(new Set([targetIdentity.id]));
+    // One project directory build per drain (upstream ee2b27b8) serves the lookup;
+    // any individual lookup is for this host's target only.
+    expect(lists.mock.calls.length + gets.mock.calls.length).toBeGreaterThan(0);
+    expect(gets.mock.calls.every(([id]) => id === targetIdentity.id)).toBe(true);
     expect((mesh.get("topology/subscriptions/elsewhere")?.value as FabricLifecycleSubscription).afterSequence)
       .toBe(0);
   });
@@ -657,5 +662,56 @@ describe("LifecycleBroker", () => {
     await publisher.publish({ source, event: "pi.agent_settled" });
     await waitFor(() => delivered.length === 2);
     await expect(replacement.unsubscribe(subscription.id)).resolves.toEqual({ removed: true });
+  });
+
+  // Each get() rebuilds the whole project directory from mesh state. Historical
+  // mesh state reaches megabytes, so a per-subscription lookup turns every poll
+  // into O(subscriptions x entries) work on the main thread.
+  it("rebuilds the project directory once per drain cycle, not per subscription", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-lifecycle-lookup-"));
+    roots.push(root);
+    const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
+    const records = [participant(targetIdentity, true), participant(sourceIdentity, false)];
+    const list = vi.fn(() => records);
+    const get = vi.fn((id: string) => records.find((record) => record.id === id));
+    const directory: FabricParticipantSource = {
+      list,
+      get,
+      self: () => records[0]!,
+      peers: () => [],
+      async refresh() {},
+      scheduleRefresh() {},
+    };
+    const target = new LifecycleBroker(
+      mesh,
+      targetIdentity,
+      directory,
+      { enabled: true, pollMs: 20, maxReadEvents: 100 },
+      () => {},
+    );
+    brokers.push(target);
+
+    const kinds = ["pi.agent_settled", "pi.agent_end", "pi.turn_end"] as const;
+    for (const kind of kinds) {
+      await target.subscribe({
+        from: source.id,
+        events: [kind],
+        to: targetIdentity.id,
+        delivery: "followUp",
+        triggerTurn: false,
+      });
+    }
+
+    // Subscription creation resolves both endpoints once. After that, a drain
+    // cycle resolves every target from a single directory build; only an id the
+    // projection omits (for example the "main" alias) pays an individual lookup.
+    const beforeDrain = get.mock.calls.length;
+    // Fork (smarty-dev#557): caught-up subscriptions skip the directory entirely,
+    // so put them behind the log before the drain is observed.
+    await mesh.publish({ topic: "unrelated", from: sourceIdentity, text: "behind" });
+    target.start();
+    await waitFor(() => list.mock.calls.length > 0);
+    const duringDrain = get.mock.calls.slice(beforeDrain).map((call) => call[0]);
+    expect(duringDrain).not.toContain(targetIdentity.id);
   });
 });

@@ -12,6 +12,7 @@ import type { ActorWakeText } from "./wake-text.js";
 export type { FabricActorActivationFilter } from "./activation-filter.js";
 import type { FabricActorRecordsOptions, FabricActorRecordsView } from "./records.js";
 export type { FabricActorRecord, FabricActorRecordsOptions, FabricActorRecordsView } from "./records.js";
+import type { FabricScope } from "../protocol.js";
 
 // Pi's extension event union is closed; every member we want the actor host
 // to observe must appear in FABRIC_ACTOR_PI_HOST_EVENTS below. `project_trust`
@@ -29,10 +30,11 @@ export type { FabricActorRecord, FabricActorRecordsOptions, FabricActorRecordsVi
 //     messages and its result is sent verbatim. Exposing it to actors would let
 //     them rewrite the system prompt per request, which Fabric deliberately
 //     avoids to keep the cached system prefix byte-stable.
-//   - `provider_stream_event` (newer Pi) fires for every raw provider stream chunk: far
-//     too frequent for an actor mailbox. Excluding it is a no-op on Pi versions that
-//     do not define it.
-// To observe one of these as an actor event, add it to
+// Pi 0.99's mcp_servers_change is infrastructure reconciliation, and
+// provider_stream_event carries raw provider data on the request hot path.
+// Neither is an actor observation: forwarding would expose raw payloads and
+// enqueue actors once per stream frame. Keep the exhaustive allowlist below.
+// To observe these as actor events, add them to
 // FABRIC_ACTOR_PI_HOST_EVENTS below and give it a FABRIC_LIFECYCLE_EVENTS topic.
 export type FabricActorPiHostEvent = Exclude<
   ExtensionEvent["type"],
@@ -40,6 +42,7 @@ export type FabricActorPiHostEvent = Exclude<
   | "cache_warming_decision"
   | "agent_before_settle"
   | "context_with_system"
+  | "mcp_servers_change"
   | "provider_stream_event"
 >;
 
@@ -131,7 +134,13 @@ export function validateActorDedupeKey(value: unknown): asserts value is string 
 export type FabricActorDelivery = "mailbox" | "steer" | "followUp" | "nextTurn";
 export type FabricActorResponseMode = "text" | "directive";
 /** failed excludes routing after the failure budget; explicit repair/probe asks remain available. */
-export type FabricActorStatus = "idle" | "queued" | "preparing" | "waiting" | "running" | "stopped" | "failed" | "failing-preparation";
+export type FabricActorStatus = "dormant" | "idle" | "queued" | "preparing" | "waiting" | "running" | "stopped" | "failed" | "failing-preparation";
+/**
+ * Why a stopped actor stopped (smarty-dev#9241). explicit: agents.stop/remove; directive: the actor's
+ * own stop directive; host-exit: its session Main exited and the root-gone reconciler retired it.
+ * Only host-exit is restarted, by the same session's next start. A reload never stops an actor.
+ */
+export type FabricActorStopReason = "explicit" | "directive" | "host-exit";
 export type FabricActorBindingScope = "session" | "project";
 export type FabricActorStorageScope = "session" | "project";
 
@@ -232,11 +241,19 @@ export function normalizeActorActivation(value: unknown): FabricActorActivationP
   return { minIntervalMs };
 }
 
+/** Exact authoritative claim revision, never a request-supplied caller identity. */
+export interface FabricActorSlotClaim {
+  key: string;
+  ifVersion: number;
+}
+
 /** Public creation input; file instructions are resolved only by the actor owner. */
 export type FabricActorCreateRequest = Omit<FabricActorRequest, "instructions"> & import("./instructions-file.js").FabricActorInstructionsSource;
 export interface FabricActorRequest {
-  /** Resident-host create deduplication key; reuse on retry (host-local, bounded retention). */
+  /** Stable creation retry identity; mandatory for enforced protected slot births. */
   idempotencyKey?: string;
+  /** Exact revision won by the authenticated Main on the native slot authority. */
+  slotClaim?: FabricActorSlotClaim;
   /** Storage and visibility boundary. Defaults to mesh.actorScope for compatibility. */
   scope?: FabricActorStorageScope;
   name: string;
@@ -306,6 +323,11 @@ export interface FabricActorRequest {
   validWhile?: FabricActorValidWhileSource;
   /** Host-maintained, bounded records topic projection for validWhile. */
   records?: FabricActorRecordsOptions;
+  /**
+   * Host-only creating principal's scope (never a provider argument). Every
+   * turn launches with it and it decides which senders the actor trusts.
+   */
+  principalScope?: FabricScope;
 }
 
 export interface FabricActorSessionOrphan {
@@ -318,6 +340,12 @@ export interface FabricActorSessionOrphan {
   role?: string;
   /** Durable mesh receipt acknowledged; absent means retry publication on the next read/event. */
   alarmPublishedAt?: number;
+  /** PRIVATE registry generation/outbox. Public tombstone fields are never authority. */
+  directorySettlement?: { by: string; at: number; settledAt?: number; retiredAt?: number; retiredBy?: string;
+    /** Compatibility with already persisted outboxes. */
+    previous?: { by: string; at: number; settledAt?: number; retiredAt?: number; retiredBy?: string };
+    /** Only receipts for the still-persisted legacy/shared/file copies, never an intent journal. */
+    persisted?: Array<{ by: string; at: number; settledAt?: number; retiredAt?: number; retiredBy?: string }> };
 }
 
 export interface FabricActorInfo {
@@ -338,7 +366,9 @@ export interface FabricActorInfo {
   /** The creating root's project; its project agent receives the actor's work (smarty-dev#878). */
   project?: string;
   status: FabricActorStatus;
-  /** Terminal foreign session-root record, not authority to adopt or restart it. */
+  /** Present only while stopped; missing on a legacy stop means explicit. */
+  stopReason?: FabricActorStopReason;
+  /** Terminal foreign session-root record, not authority to adopt it. Its own session's restart revives it. */
   sessionOrphan?: FabricActorSessionOrphan;
   runner: FabricAgentRunner;
   kernel?: FabricKernel;
@@ -390,11 +420,26 @@ export interface FabricActorInfo {
   requirements?: FabricCapabilityRequirement[];
   capabilityDigest?: string;
   missingCapabilities?: string[];
-  /** Persistent reason an activation is blocked; cleared after a later successful activation. */
-  activationBlocked?: { reason: string; code: string; since: number; count: number };
+  /** Persistent reason an activation is blocked; cleared after a later successful activation.
+   * class is "transient" or "hard"; classification says why. Only a transient code
+   * (provider-transient, activation-window-lost, child-exit-before-admission, preparation-timeout)
+   * carries backoffMs and retryAt, its expiry: from then on the block no longer gates routing and is
+   * reported as activationBlockExpired instead, and the next activation is its probe
+   * (smarty-dev#8487, smarty-dev#6509). Credential, permission, security-policy, quota,
+   * invalid-request, context-overflow, failing-preparation and unknown are hard and stay blocked.
+   * since starts the same-code streak; blockedAt is its latest failure. */
+  activationBlocked?: { reason: string; code: string; class?: "transient" | "hard"; since: number; blockedAt?: number; count: number;
+    retryAt?: number; backoffMs?: number; classification?: string };
+  /** History of a transient block whose cooldown ended; the next activation is its probe.
+   * A transient failure of the probe blocks again with the backoff doubled (to the cap); a
+   * completed run clears it. */
+  activationBlockExpired?: { lastBlockedReason: string; code: string; class?: "transient" | "hard"; since: number; blockedAt?: number;
+    count: number; backoffMs?: number; expiredAt: number; classification?: string };
   validWhile?: FabricActorValidWhileSource;
   /** Host-maintained, bounded records topic projection for validWhile. */
   records?: FabricActorRecordsOptions;
+  /** The bound principal; absent for unscoped actors. */
+  principal?: { id: string; digest: string };
   queued: number;
   messages: number;
   createdAt: number;
@@ -477,7 +522,8 @@ export interface FabricActorDirective {
 }
 
 export interface FabricActorDeliveryRequest {
-  actor: FabricActorInfo;
+  /** Routing identity only: host alarms must not carry the diagnostic actor view. */
+  actor: Pick<FabricActorInfo, "id" | "name"> & Partial<Pick<FabricActorInfo, "status" | "rootId" | "ownerSessionId" | "project">>;
   message: FabricActorMessage;
   delivery: Exclude<FabricActorDelivery, "mailbox">;
   triggerTurn: boolean;

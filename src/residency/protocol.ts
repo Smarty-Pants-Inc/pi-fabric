@@ -1,8 +1,11 @@
 import type { TaskReturnAddress } from "../agents/task-return-address.js";
+import type { slotAdmissionFor } from "../actors/slot-admission.js";
 import type { FabricParticipantInfo } from "../topology/types.js";
 import type { FabricPrincipal, FabricWakeCause } from "../fabric-provenance.js";
 import { createHash, randomUUID } from "node:crypto";
 import type { ResidentReleaseIntent, ResidentLauncherIdentity } from "./handover.js";
+import type { ResidentDrainIntent, ResidentDrainReceipt } from "./drain.js";
+import type { AttemptLaunchReceipt } from "./attempt-containment-contract.js";
 import { recordResidentOutcome, registerCancellationEffect } from "../async-settlement.js";
 import { readFileRetrying } from "../core/atomic-write.js";
 import fs from "node:fs";
@@ -14,9 +17,13 @@ import type { FabricModelAliases, FabricModelCandidate } from "../core/model-res
 import type { FabricActorsConfig, FabricAgentConfig, FabricMeshConfig, FabricRetentionConfig } from "../config.js";
 import type { FabricActorInfo, FabricActorCreateRequest, FabricActorBindingScope, FabricActorActivationFilter } from "../actors/types.js";
 import type { FabricThinking } from "../thinking.js";
-import type { AgentHandleInfo, AgentRunRequest } from "../agents/types.js";
+import type { AgentHandleInfo, AgentRunRequest, FabricRunOutcome } from "../agents/types.js";
 import type { FabricKernel, FabricResidentOutcomeReceipt } from "../runtime/kernel.js";
 import type { MeshIdentity } from "../mesh/store.js";
+import type { FabricScope } from "../protocol.js";
+
+export type ResidentSlotStatus = ReturnType<ReturnType<typeof slotAdmissionFor>["status"]>;
+
 export const sleepUnlessAborted = (ms: number, signal?: AbortSignal): Promise<void> =>
   // Executor form: the configured lib is ES2022, which has no
   // Promise.withResolvers, and an abort listener plus a timer need shared
@@ -157,6 +164,13 @@ export const abandonResidentRequest = (
   return decision;
 };
 
+/** The proxy has no authoritative route table. Conservatively treat every topic
+ * subscription create (and every token-bearing create) as potentially protected.
+ * This affects uncertainty only; it never enables or grants native admission. */
+export const residentCreateMayBeProtected = (command: ResidentCommand): boolean =>
+  command.operation === "createActor" &&
+  (command.request.slotClaim !== undefined || (command.request.topics?.length ?? 0) > 0);
+
 /** Existing handle/actor return contracts cannot represent an unconfirmed launch. */
 export class ResidentOutcomeUnknownError extends Error {
   readonly residentOutcome: FabricResidentOutcomeReceipt;
@@ -164,14 +178,21 @@ export class ResidentOutcomeUnknownError extends Error {
   readonly id: string | undefined;
   readonly operation: ResidentCommand["operation"];
   readonly ownerHostId: string | undefined;
+  readonly claimKey: string | undefined;
+  readonly claimVersion: number | undefined;
+  readonly requestKey: string | undefined;
 
   constructor(command: ResidentCommand, decision: ResidentRequestDecision | undefined, cause: unknown, signal?: AbortSignal) {
     const id = decision?.id ?? ("id" in command ? command.id : undefined);
     const kind = ["spawn", "spawnBound", "foreground", "cleanup"].includes(command.operation) ? "agent" : "actor";
+    const claim = command.operation === "createActor" ? command.request.slotClaim : undefined;
+    const requestKey = command.operation === "createActor" ? command.idempotencyKey ?? command.request.idempotencyKey : undefined;
     // Guest runtimes may preserve only message, so the classification and IDs live there too.
     super(`ResidentOutcomeUnknownError: Fabric residency ${command.operation} outcome unknown: requestId=${command.requestId}` +
       `, ${kind}Id=${id ?? "not yet known"}` +
       `${decision?.ownerHostId ? `, ownerHostId=${decision.ownerHostId}` : ""}` +
+      `${claim ? `, claimKey=${claim.key}, claimVersion=${claim.ifVersion}` : ""}` +
+      `${requestKey ? `, requestKey=${requestKey}` : ""}` +
       // smarty-dev#6829: the request journal committed; the registry save may still be retrying.
       `${decision?.state === "committed" ? `, state=accepted; ${kind === "actor" ? "registry save" : "publication"} pending` : ""}. ` +
       `Do not retry or reassign this work. Check agents.${kind === "actor" ? "actorStatus" : "status"}` +
@@ -183,6 +204,9 @@ export class ResidentOutcomeUnknownError extends Error {
     this.id = id;
     this.operation = command.operation;
     this.ownerHostId = decision?.ownerHostId;
+    this.claimKey = claim?.key;
+    this.claimVersion = claim?.ifVersion;
+    this.requestKey = requestKey;
     this.residentOutcome = Object.freeze({
       requestId: command.requestId,
       state: decision?.state === "committed" ? "committed" : "unknown",
@@ -200,9 +224,12 @@ export class ResidentOutcomeUnknownError extends Error {
  * A collected (or unreadable) fence preserves expiry without inventing an ID. */
 export const residentRequestExpiredOutcome = (
   residencyRoot: string, command: ResidentCommand, signal?: AbortSignal,
-): ResidentRequestExpiredError => {
+): ResidentRequestExpiredError | ResidentOutcomeUnknownError => {
   let decision: ResidentRequestDecision | undefined;
   try { decision = readResidentRequestDecision(residencyRoot, command.requestId); } catch { /* unknown fence */ }
+  if (residentCreateMayBeProtected(command)) {
+    return new ResidentOutcomeUnknownError(command, decision, new ResidentRequestExpiredError(command.requestId), signal);
+  }
   const committed = decision?.state === "committed" ? decision : undefined;
   const operation = committed?.operation ?? command.operation;
   return new ResidentRequestExpiredError(command.requestId, {
@@ -219,11 +246,13 @@ export const registerResidentCancellation = (
   signal: AbortSignal | undefined,
   residencyRoot: string,
   command: ResidentCommand,
+  mayHaveDispatched: () => boolean = () => true,
 ): void => {
   // A committed receipt is immutable. Reuse its first error instead of nesting
   // already-formatted uncertainty again at each enclosing cancellation gate.
   let committedOutcome: ResidentOutcomeUnknownError | ResidentRequestExpiredError | undefined;
   registerCancellationEffect(signal, (reason) => {
+    if (!mayHaveDispatched()) return undefined;
     if (committedOutcome) return committedOutcome;
     let decision: ResidentRequestDecision | undefined;
     try {
@@ -233,7 +262,9 @@ export const registerResidentCancellation = (
       try { decision = readResidentRequestDecision(residencyRoot, command.requestId); } catch { /* unreadable fence */ }
       return new ResidentOutcomeUnknownError(command, decision, error, signal);
     }
-    if (decision.state === "committed") return committedOutcome = new ResidentOutcomeUnknownError(command, decision, reason, signal);
+    if (decision.state === "committed" || residentCreateMayBeProtected(command)) {
+      return committedOutcome = new ResidentOutcomeUnknownError(command, decision, reason, signal);
+    }
     return undefined;
   });
 };
@@ -413,6 +444,10 @@ export interface ResidentHostOwner {
   releaseRoot?: string;
   configDigest?: string;
   handover?: { abi: "fabric-resident-1"; launcher: ResidentLauncherIdentity };
+  /** Loaded owner supports reversible cooperative drain, NOT automatic containment/exit. */
+  drain?: { abi: "fabric-resident-drain-1" };
+  /** Launcher-custody receipt for this exact native generation, not permission to reopen the scope. */
+  launchAttestation?: AttemptLaunchReceipt;
   /** A staged successor has proved worker startup but admits no business work yet. */
   attempt?: { id: string; kind: "target" | "fallback" };
 }
@@ -459,6 +494,8 @@ interface ResidentSpawnCommand {
   request: AgentRunRequest;
   /** Host-captured runtime binding, separate from all task-supplied run settings. */
   caller: ResidentTaskCaller;
+  /** A registered runner's residentModule, imported by the host before launch. */
+  runnerModule?: string;
   createdAt: number;
 }
 
@@ -555,7 +592,7 @@ type ResidentActorMutationCommand = ResidentActorMutation & {
 
 interface ResidentActorStatusCommand {
   format: typeof RESIDENT_ACTOR_COMMAND_FORMAT;
-  operation: "actorStatus" | "actors";
+  operation: "actorStatus" | "actors" | "slotStatus";
   requestId: string;
   rootId: string;
   id?: string;
@@ -584,6 +621,8 @@ type LegacyResidentCommand =
   | ResidentActorStatusCommand
   | ResidentOperatorActorCommand
   | (ResidentReleaseIntent & { format: typeof RESIDENT_ACTOR_COMMAND_FORMAT; operation: "releaseChange";
+      requestId: string; rootId: string; createdAt: number })
+  | (ResidentDrainIntent & { format: typeof RESIDENT_ACTOR_COMMAND_FORMAT; operation: "releaseDrain";
       requestId: string; rootId: string; createdAt: number });
 
 type ExpiringResidentCommand<T> = T extends unknown ? Omit<T, "format"> & { format: typeof RESIDENT_EXPIRING_COMMAND_FORMAT } : never;
@@ -598,8 +637,8 @@ export const residentCommandForOwner = (command: ResidentCommand, owner: Residen
 // The only operations every format-1 host predating command negotiation understood.
 const LEGACY_RESIDENT_COMMANDS = ["spawn", "foreground", "cleanup", "createActor", "removeActor"] as const;
 export const RESIDENT_COMMANDS = [
-  "spawnBound", "foreground", "cleanup", "createActor", "removeActor", "actors", "actorStatus", "setInstructions", "setModel",
-  "setThinking", "setTools", "setActivationFilter", "resetSession", "stop", "releaseChange", "operatorActor",
+  "spawnBound", "foreground", "cleanup", "createActor", "removeActor", "actors", "actorStatus", "slotStatus", "setInstructions", "setModel",
+  "setThinking", "setTools", "setActivationFilter", "resetSession", "stop", "releaseChange", "releaseDrain", "operatorActor",
 ] as const satisfies readonly ResidentCommand["operation"][];
 
 export const isResidentCommandOperation = (operation: unknown): operation is ResidentCommand["operation"] =>
@@ -635,6 +674,12 @@ export const assertResidentCommandSupported = (owner: ResidentHostOwner, operati
 /** Fence explicit retry keys before publication; keep unkeyed calls compatible with older hosts. */
 export const prepareResidentCreationCommand = (owner: ResidentHostOwner, command: ResidentCommand): ResidentCommand => {
   if (command.operation !== "spawnBound" && command.operation !== "createActor") return command;
+  if (command.operation === "createActor" && command.request.slotClaim !== undefined &&
+      (!Array.isArray(owner.commands) || !owner.commands.includes("slotStatus"))) {
+    throw new ResidentCommandUnsupportedError(
+      "The loaded resident lacks native slot-admission support; no token-bearing create request was dispatched.",
+    );
+  }
   if (owner.creationIdempotency !== 1) {
     if (command.idempotencyKey !== undefined) {
       throw new ResidentCommandUnsupportedError(
@@ -643,9 +688,72 @@ export const prepareResidentCreationCommand = (owner: ResidentHostOwner, command
     }
     return command;
   }
-  // One key per call, held in the envelope for any transport replay. Generate it
-  // only after negotiation, so an unkeyed call can still use a pre-key host.
+  // Protected admission requires the caller's stable retry identity. Never turn
+  // an omitted key into a new birth identity on each retry. The native receiver
+  // decides enforcement; topic-bearing unkeyed calls remain allowed unenforced.
+  if (residentCreateMayBeProtected(command) && command.idempotencyKey === undefined) return command;
+  // One key per ordinary call, held in the envelope for transport replay.
   return { ...command, idempotencyKey: command.idempotencyKey ?? randomUUID() };
+};
+
+export type ResidentSlotErrorCode = "FABRIC_ACTOR_SLOT_CLAIM_REFUSED" | "FABRIC_ACTOR_SLOT_CREATE_UNCERTAIN" | "FABRIC_MESH_STATE_NATS_NOT_DURABLE";
+export interface ResidentSlotErrorDetails {
+  reason?: string;
+  actorId?: string;
+  claimKey?: string;
+  claimVersion?: number;
+  requestKey?: string;
+}
+
+/** Preserve native error identity/details without serializing untrusted Error graphs. */
+export const residentSlotErrorFields = (error: unknown): Pick<ResidentCommandResponse, "errorCode" | "slotError"> => {
+  if (!error || typeof error !== "object") return {};
+  const value = error as Record<string, unknown>;
+  if (value.code !== "FABRIC_ACTOR_SLOT_CLAIM_REFUSED" && value.code !== "FABRIC_ACTOR_SLOT_CREATE_UNCERTAIN" &&
+      value.code !== "FABRIC_MESH_STATE_NATS_NOT_DURABLE") return {};
+  const details: ResidentSlotErrorDetails = {};
+  for (const key of ["reason", "actorId", "claimKey", "requestKey"] as const) {
+    if (typeof value[key] === "string") details[key] = value[key];
+  }
+  if (typeof value.claimVersion === "number" && Number.isSafeInteger(value.claimVersion) && value.claimVersion > 0) {
+    details.claimVersion = value.claimVersion;
+  }
+  return { errorCode: value.code, slotError: details };
+};
+
+/** A rehydrated native error is identified by its stable code, not cross-process instanceof. */
+export class ResidentSlotError extends Error implements ResidentSlotErrorDetails {
+  readonly code: ResidentSlotErrorCode;
+  readonly reason?: string;
+  readonly actorId?: string;
+  readonly claimKey?: string;
+  readonly claimVersion?: number;
+  readonly requestKey?: string;
+  constructor(code: ResidentSlotErrorCode, message: string, details: ResidentSlotErrorDetails = {}) {
+    const allowed = residentSlotErrorFields({ ...details, code }).slotError ?? {};
+    super(`${code}: ${message}${Object.entries(allowed).map(([key, value]) => `, ${key}=${value}`).join("")}`);
+    this.code = code;
+    this.name = code === "FABRIC_ACTOR_SLOT_CLAIM_REFUSED" ? "ActorSlotClaimRefusedError"
+      : code === "FABRIC_ACTOR_SLOT_CREATE_UNCERTAIN" ? "ActorSlotCreateUncertainError" : "MeshStateNatsNotDurableError";
+    // Reuse the sender's allowlist even when decoding a malformed response.
+    Object.assign(this, allowed);
+  }
+}
+
+export const residentSlotResponseError = (response: ResidentCommandResponse, signal?: AbortSignal): ResidentSlotError | undefined => {
+  const code = response.errorCode;
+  if (code !== "FABRIC_ACTOR_SLOT_CLAIM_REFUSED" && code !== "FABRIC_ACTOR_SLOT_CREATE_UNCERTAIN" &&
+      code !== "FABRIC_MESH_STATE_NATS_NOT_DURABLE") return undefined;
+  const error = new ResidentSlotError(code, response.error ?? code, response.slotError);
+  if (code === "FABRIC_ACTOR_SLOT_CREATE_UNCERTAIN") {
+    const receipt: FabricResidentOutcomeReceipt = {
+      requestId: response.requestId, state: "unknown", operation: "createActor", entityKind: "actor",
+      ...(error.actorId ? { id: error.actorId } : {}),
+    };
+    Object.assign(error, { residentOutcome: receipt });
+    recordResidentOutcome(signal, receipt);
+  }
+  return error;
 };
 
 export interface ResidentCommandResponse {
@@ -655,14 +763,20 @@ export interface ResidentCommandResponse {
   handle?: AgentHandleInfo;
   actor?: FabricActorInfo;
   actors?: FabricActorInfo[];
+  slotStatus?: ResidentSlotStatus;
   operatorEvidence?: import("./operator-safety.js").ResidentOperatorEvidence;
+  drain?: ResidentDrainReceipt;
   /** A removeActor that returned before the actor's in-flight run ended: the pending state. */
   pending?: string;
   cleaned?: boolean;
   error?: string;
-  errorCode?: "RESIDENT_ACTOR_FORBIDDEN" | "RESIDENT_COMMAND_UNSUPPORTED" | "RESIDENT_REQUEST_EXPIRED" | "FABRIC_MODEL_DENIED" | "ACTOR_SESSION_RESET_CANCELLED";
+  errorCode?: "RESIDENT_ACTOR_FORBIDDEN" | "RESIDENT_COMMAND_UNSUPPORTED" | "RESIDENT_REQUEST_EXPIRED" | "FABRIC_MODEL_DENIED" | "ACTOR_SESSION_RESET_CANCELLED" | ResidentSlotErrorCode;
+  /** Narrow native slot error payload; no arbitrary Error properties cross the wire. */
+  slotError?: ResidentSlotErrorDetails;
   /** Allowlisted policy-refusal payload, never arbitrary host Error properties. */
   modelDenied?: { model: string; replacement?: string };
+  /** Set when a claimed request was interrupted; the same concept as a run record's outcome. */
+  outcome?: FabricRunOutcome;
   completedAt: number;
 }
 
@@ -695,6 +809,10 @@ export interface ResidentAgentMetadata {
   runDirectory: string;
   handle: AgentHandleInfo;
   worktreeGitRoot?: string;
+  /** Imported again by a restarted host before it re-attaches hosted runs. */
+  runnerModule?: string;
+  /** The scope the durable child launched with (forwarded by the requesting session). */
+  scope?: FabricScope;
   /** Main consumed this terminal result; suppress queued delivery across reconnects. */
   completionConsumedAt?: number;
   createdAt: number;

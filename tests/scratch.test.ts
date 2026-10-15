@@ -4,9 +4,14 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { closeScratch, createScratch, SCRATCH_OWNER_FILE, sweepScratch } from "../src/storage/scratch.js";
+import { fabricDataRoot } from "../src/storage/temp-root.js";
 import { NativeReaderCheckpoint } from "../src/ui/conversation-native-reader-checkpoint.js";
 
 const HOUR = 3_600_000;
+// pi-fabric#1014: on Linux the verified helper removes (only with getuid proof); off Linux scratch keeps main's path
+// removal after its rechecks (tests/scratch-platform-retention.test.ts). Planning and dry runs are unchanged everywhere.
+// This suite performs real deletions of its own fixtures: hosted CI only, not run on agent hosts.
+const verifiedDeletes = process.platform !== "linux" || typeof process.getuid === "function";
 const roots: string[] = [];
 const sandbox = (): string => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "scratch-test-"));
@@ -23,6 +28,7 @@ const fixture = (tempRoot: string, kind: "output" | "shell" | "checkpoint" = "ou
 };
 afterEach(() => {
   vi.restoreAllMocks();
+  vi.unstubAllEnvs();
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 
@@ -60,7 +66,8 @@ describe("managed scratch retention", () => {
     const options = { tempRoot, now: 30 * HOUR + 1 };
     expect((await sweepScratch({ ...options, dryRun: true })).eligible).toEqual([old]);
     expect(fs.existsSync(old)).toBe(true);
-    expect((await sweepScratch(options)).removed).toEqual([old]);
+    expect((await sweepScratch(options)).removed).toEqual(verifiedDeletes ? [old] : []);
+    expect(fs.existsSync(old)).toBe(!verifiedDeletes);
     for (const file of [young, active, unrelated]) expect(fs.existsSync(file)).toBe(true);
   });
 
@@ -71,9 +78,36 @@ describe("managed scratch retention", () => {
     const recent = fixture(tempRoot, "output", { closedAt: 2 * HOUR });
     const active = fixture(tempRoot, "output");
     const checkpoint = fixture(tempRoot, "checkpoint");
-    expect((await sweepScratch({ tempRoot, now: 2 * HOUR + 1, maxItems: 3 })).removed).toEqual([old]);
-    expect((await sweepScratch({ tempRoot, now: 2 * HOUR + 1, maxBytes: 0 })).removed).toEqual([newer]);
+    expect((await sweepScratch({ tempRoot, now: 2 * HOUR + 1, maxItems: 3 })).removed).toEqual(verifiedDeletes ? [old] : []);
+    expect((await sweepScratch({ tempRoot, now: 2 * HOUR + 1, maxBytes: 0 })).removed).toEqual(verifiedDeletes ? [newer] : []);
+    if (!verifiedDeletes) for (const file of [old, newer]) expect(fs.existsSync(file)).toBe(true);
     for (const file of [recent, active, checkpoint]) expect(fs.existsSync(file)).toBe(true);
+  });
+
+  it.runIf(process.platform === "linux")("shared-root pressure evicts session B's old closed output cache but preserves live caches and unknown files", async () => {
+    const base = sandbox(), privateA = path.join(base, "session-a"), privateB = path.join(base, "session-b"), shared = path.join(base, "file-data");
+    for (const root of [privateA, privateB, shared]) fs.mkdirSync(root, { mode: 0o700 });
+    const tmp = vi.spyOn(os, "tmpdir").mockReturnValue(privateB);
+    vi.stubEnv("TMPDIR", privateB); vi.stubEnv("PI_FABRIC_TMPDIR", shared);
+    // B's cache is older than the one-hour pressure fence, but younger than normal 24-hour expiry.
+    const closedB = fixture(fabricDataRoot(), "output", { pid: 2147483647, closedAt: HOUR });
+    const liveB = fixture(fabricDataRoot(), "output");
+    const unknownB = fixture(fabricDataRoot(), "output", { pid: 2147483647, closedAt: 1 });
+    fs.writeFileSync(path.join(unknownB, "mine.txt"), "not Fabric's data");
+    tmp.mockReturnValue(privateA); vi.stubEnv("TMPDIR", privateA);
+    const activeA = fixture(fabricDataRoot(), "output");
+    const protectedRoots = [liveB, activeA, unknownB];
+    const preserved = () => protectedRoots.map(root => fs.readdirSync(root).sort().map(name => [name, fs.readFileSync(path.join(root, name), "utf8")]));
+    const before = preserved();
+    const options = { tempRoot: fabricDataRoot(), now: 3 * HOUR };
+    expect(options.tempRoot).toBe(shared);
+    expect((await sweepScratch({ ...options, dryRun: true })).eligible).toEqual([]);
+    expect((await sweepScratch({ ...options, maxItems: 0, dryRun: true })).eligible).toEqual([closedB]);
+    expect(fs.existsSync(closedB)).toBe(true);
+    expect((await sweepScratch({ ...options, maxItems: 0 })).removed).toEqual(verifiedDeletes ? [closedB] : []);
+    expect(fs.existsSync(closedB)).toBe(!verifiedDeletes);
+    expect(preserved()).toEqual(before);
+    expect(fs.readdirSync(privateA)).toEqual([]); expect(fs.readdirSync(privateB)).toEqual([]);
   });
 
   it("recovers a dead host checkpoint only after first-observed-dead grace", async () => {
@@ -86,7 +120,8 @@ describe("managed scratch retention", () => {
     expect(fs.readFileSync(path.join(orphan, SCRATCH_OWNER_FILE), "utf8")).toBe(before);
     expect((await sweepScratch({ tempRoot, now: 40 * HOUR })).removed).toEqual([]);
     expect((await sweepScratch({ tempRoot, now: 45 * HOUR })).removed).toEqual([]);
-    expect((await sweepScratch({ tempRoot, now: 46 * HOUR })).removed).toEqual([orphan]);
+    expect((await sweepScratch({ tempRoot, now: 46 * HOUR })).removed).toEqual(verifiedDeletes ? [orphan] : []);
+    expect(fs.existsSync(orphan)).toBe(!verifiedDeletes);
   });
 
   it("protects shell children even after their host dies", async () => {

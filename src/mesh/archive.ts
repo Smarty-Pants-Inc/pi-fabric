@@ -311,6 +311,12 @@ export class MeshArchive {
     if (pending.dedupe) this.confirmLive(pending.sequence, pending.id);
     // PENDING goes first: a stop before the head moves leaves a head that is behind, and the
     // catch-up skips the event it finds already archived.
+    // ponytail (smarty-dev#8907, every PENDING.json/DIGEST-REPAIR.json removal below): these are fixed-name control
+    // markers in the archive root, never aged or owner-judged. Every writer and remover of those names, new and legacy
+    // (module header), runs inside the mesh root's .lock publish hold, and each judgment (here the `pending` begin()
+    // wrote in this hold, elsewhere a re-read under it) and its removal run synchronously in that one hold with no
+    // await between, so no writer of the name can interleave. A path is kept: verifiedRemove's graveyard would add
+    // namespace ops to every archived publish, and a refused marker would need new commit semantics.
     fs.rmSync(path.join(this.dir, "PENDING.json"), { force: true });
     this.#writeHead({ sequence: pending.sequence, id: pending.id, file: pending.file });
     if (sealClosedDays) this.#sealClosedDays(pending.file);
@@ -390,11 +396,13 @@ export class MeshArchive {
     if (!repair || this.#readJson<{ file: string }>("DIGEST-REPAIR.json")?.file !== repair.file) return;
     const stat = fs.statSync(path.join(this.dir, repair.file), { throwIfNoEntry: false });
     if (!stat) {
+      // ponytail: re-read DIGEST-REPAIR.json and removed in one synchronous .lock hold (see commit()).
       fs.rmSync(path.join(this.dir, "DIGEST-REPAIR.json"), { force: true });
       return;
     }
     if (fileIdentity(stat) !== repair.identity) return;
     this.#saveDigest(repair.file, repair.digest, stat);
+    // ponytail: re-read DIGEST-REPAIR.json and removed in one synchronous .lock hold (see commit()).
     fs.rmSync(path.join(this.dir, "DIGEST-REPAIR.json"), { force: true });
   }
 
@@ -520,6 +528,7 @@ export class MeshArchive {
     const pending = this.pending();
     if (this.#readText("BOOT") === currentBoot()) {
       if (pending && !rebootOnly) {
+        // ponytail: PENDING.json read above and removed in one synchronous .lock hold (see commit()).
         if ((this.head()?.sequence ?? 0) >= pending.sequence) fs.rmSync(path.join(this.dir, "PENDING.json"), { force: true });
         else this.#cutBack(pending);
       }
@@ -534,6 +543,7 @@ export class MeshArchive {
         truncateTo(absolute, size);
         this.#saveDigest(file, digest, fs.statSync(absolute));
       }
+      // ponytail: PENDING.json read above and removed in one synchronous .lock hold (see commit()).
       fs.rmSync(path.join(this.dir, "PENDING.json"), { force: true });
     }
     return { rebooted: true, promote: plan.promote.filter(entry => entry.event.sequence > lastLive) };
@@ -625,7 +635,7 @@ export class MeshArchive {
   }
 
   /** Exact archived bytes and advisory new-writer confirmation, never absence evidence. */
-  lookupEntry(sequence: number): (MeshArchiveEntry & { committed: boolean }) | undefined {
+  lookupEntry(sequence: number, maxBytes = 64 * 1024 * 1024): (MeshArchiveEntry & { committed: boolean }) | undefined {
     if (!Number.isSafeInteger(sequence) || sequence < 1) throw new MeshArchiveLookupUnavailableError("Invalid mesh archive sequence lookup");
     const indexPath = this.#indexPath(sequence);
     let indexed: MeshArchiveIndexEntry | { sequence: number; absent: true };
@@ -647,6 +657,8 @@ export class MeshArchive {
         (indexed.committed !== undefined && typeof indexed.committed !== "boolean")) {
       throw new MeshArchiveLookupUnavailableError(`Invalid mesh archive sequence index: ${indexPath}`);
     }
+    // Callers doing pre-readiness recovery have a smaller aggregate byte budget.
+    if (indexed.length > maxBytes) throw new MeshArchiveLookupUnavailableError("Mesh archive lookup exceeds caller byte budget");
     if (this.#readJson<Record<string, string>>(`${indexed.file.split("/").slice(0, 3).join("/")}/ABORTED.json`)?.[sequence] === indexed.id) return undefined;
     let descriptor: number | undefined;
     try {
@@ -658,12 +670,14 @@ export class MeshArchive {
       if (available <= 0) return undefined;
       let bytes = Buffer.allocUnsafe(Math.min(indexed.length, available));
       let count = fs.readSync(descriptor, bytes, 0, bytes.length, indexed.offset);
+      let readBytes = count;
       let newline = bytes.subarray(0, count).indexOf(0x0a);
       // The old writer may reuse that address for a differently sized event. Resolve
       // only this one bounded line, never search the segment for the missing identity.
-      while (newline < 0 && count === bytes.length && bytes.length < available && bytes.length < 64 * 1024 * 1024) {
-        bytes = Buffer.allocUnsafe(Math.min(Math.max(bytes.length * 2, 4096), available, 64 * 1024 * 1024));
+      while (newline < 0 && count === bytes.length && bytes.length < available && bytes.length < Math.min(64 * 1024 * 1024, maxBytes - readBytes)) {
+        bytes = Buffer.allocUnsafe(Math.min(Math.max(bytes.length * 2, 4096), available, 64 * 1024 * 1024, maxBytes - readBytes));
         count = fs.readSync(descriptor, bytes, 0, bytes.length, indexed.offset);
+        readBytes += count;
         newline = bytes.subarray(0, count).indexOf(0x0a);
       }
       if (newline < 0) throw new Error("short archive line");
@@ -698,6 +712,7 @@ export class MeshArchive {
     this.reserveLookup(entry.event.sequence);
     const pending = this.pending();
     if (pending?.sequence === entry.event.sequence && pending.id === entry.event.id) {
+      // ponytail: PENDING.json read above and removed in one synchronous .lock hold (see commit()).
       fs.rmSync(path.join(this.dir, "PENDING.json"), { force: true });
     }
   }
@@ -798,6 +813,7 @@ export class MeshArchive {
     } catch (error) {
       if (errorCode(error) !== "ENOENT") throw error;
     }
+    // ponytail: the caller's PENDING.json, read in this synchronous .lock hold (see commit()).
     fs.rmSync(path.join(this.dir, "PENDING.json"), { force: true });
   }
 

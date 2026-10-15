@@ -61,6 +61,36 @@ export const handoverPath = (root: string): string => path.join(root, "handover.
 export const mainGenerationPath = (root: string): string => path.join(root, "main-generation.json");
 export const handoverCustodyPath = (root: string, id: string): string => path.join(root, `handover-${id}.custody.json`);
 export const handoverDecisionPath = (root: string, id: string): string => path.join(root, `handover-${id}.decision.json`);
+export interface ResidentStagedReadyReceipt {
+  abi: typeof RESIDENT_HANDOVER_ABI;
+  id: string;
+  rootId: string;
+  owner: { pid: number; processStartTime: string; token: string; hostId: string };
+  launcher: ResidentLauncherIdentity;
+  kind: "target" | "fallback";
+  digest: string;
+  businessAdmissions: 0;
+  admissionHeld: true;
+  checkpointReadback: true;
+  checkpoint: unknown;
+  at: number;
+}
+export function handoverStagedReadyPath(root: string, id: string): string {
+  if (!/^[0-9a-f-]{36}$/i.test(id)) throw new Error("Invalid staged resident operation ID");
+  return path.join(root, `handover-${id}.ready.json`);
+}
+export function writeResidentStagedReadyReceipt(root: string, receipt: ResidentStagedReadyReceipt): void {
+  writeJsonAtomic(handoverStagedReadyPath(root, receipt.id), receipt, { durable: true });
+  if (JSON.stringify(readHandoverJson(handoverStagedReadyPath(root, receipt.id))) !== JSON.stringify(receipt)) {
+    throw new Error("Staged resident zero-business-admission receipt readback failed");
+  }
+}
+export function assertResidentStagedReady(root: string, expected: ResidentStagedReadyReceipt): void {
+  const receipt = readHandoverJson<ResidentStagedReadyReceipt>(handoverStagedReadyPath(root, expected.id));
+  if (receipt?.abi !== RESIDENT_HANDOVER_ABI || receipt.businessAdmissions !== 0 ||
+      receipt.admissionHeld !== true || receipt.checkpointReadback !== true ||
+      JSON.stringify(receipt) !== JSON.stringify(expected)) throw new Error("Staged resident readiness is uncertain");
+}
 export interface ResidentHandoverDecision { id: string; state: "custody" | "cancelled"; }
 export const handoverOutcomePath = (root: string, target: ResidentLaunchSpec): string =>
   path.join(root, `handover-outcome-${createHash("sha256").update(target.releaseRoot).update(target.artifact).digest("hex")}.json`);

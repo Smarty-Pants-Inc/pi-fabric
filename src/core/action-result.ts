@@ -1,3 +1,5 @@
+import { detachedPreview } from "./preview.js";
+
 const PREVIEW_ARG_CHARS = 2_000;
 const WRITE_PREVIEW_CONTENT_CHARS = 16_000;
 const PREVIEW_ARG_KEYS = 32;
@@ -5,10 +7,41 @@ const PREVIEW_RESULT_CHARS = 16_000;
 const PREVIEW_NESTED_CHARS = 16_000;
 export const MAX_AUDIT_VALUE_CHARS = 64_000;
 
+// Explicit native decision transport budget, not the generic preview/result cap.
+// Keep core independent of the optional Jev provider graph.
+export const DECISION_RESULT_MAX_BYTES = 16 * 1024 * 1024;
+const DECISION_RESULT_ERROR =
+  "jev.decide result must be JSON-serializable and at most 16 MiB (UTF-8)";
+
+/** Preserve the original decision (including rawJson), or fail without echoing
+ * provider data/errors. JSON's silent omission/coercion of non-JSON values is
+ * not lossless either. Character counts remain compatible with existing audits.
+ */
+export const strictDecisionResult = (
+  value: unknown,
+): { value: unknown; chars: number; truncated: false } => {
+  try {
+    const serialized = JSON.stringify(value, (_key, item: unknown) => {
+      if (
+        (typeof item === "number" && !Number.isFinite(item)) ||
+        ["undefined", "function", "symbol", "bigint"].includes(typeof item)
+      ) throw new Error(DECISION_RESULT_ERROR);
+      return item;
+    });
+    if (serialized === undefined || Buffer.byteLength(serialized, "utf8") > DECISION_RESULT_MAX_BYTES) {
+      throw new Error(DECISION_RESULT_ERROR);
+    }
+    return { value, chars: serialized.length, truncated: false };
+  } catch {
+    throw new Error(DECISION_RESULT_ERROR);
+  }
+};
+
 export const truncateString = (value: string, max: number): string =>
-  value.length <= max ? value : `${value.slice(0, max)}…`;
+  value.length <= max ? detachedPreview(value, max) : `${detachedPreview(value, max)}…`;
 
 export const boundedPreviewValue = (value: unknown, maxChars: number): unknown => {
+  if (typeof value === "string") return detachedPreview(value, value.length);
   if (value === undefined || value === null || typeof value !== "object") return value;
   try {
     const serialized = JSON.stringify(value);
@@ -16,7 +49,7 @@ export const boundedPreviewValue = (value: unknown, maxChars: number): unknown =
     return {
       fabricTruncated: true,
       originalChars: serialized.length,
-      preview: serialized.slice(0, Math.max(1, maxChars - 100)),
+      preview: detachedPreview(serialized, Math.max(1, maxChars - 100)),
     };
   } catch {
     return truncateString(String(value), maxChars);
@@ -95,7 +128,7 @@ export const boundedResult = (
     value: {
       fabricTruncated: true,
       originalChars: serialized.length,
-      preview: serialized.slice(0, previewChars),
+      preview: detachedPreview(serialized, previewChars),
     },
     chars: serialized.length,
     truncated: true,

@@ -10,7 +10,7 @@ vi.mock("../src/fabric-provenance.js", () => ({
 vi.mock("@earendil-works/pi-ai/compat", () => ({ isContextOverflow: () => false }));
 
 type Handler = (event: unknown, context: ExtensionContext) => unknown;
-const harness = () => {
+const harness = (options: { errorMessage?: string; owns?: boolean } = {}) => {
   const handlers = new Map<string, Handler>();
   let idle = false;
   let settling = false;
@@ -23,14 +23,14 @@ const harness = () => {
     sessionManager: {
       getSessionId: () => "main",
       getEntries: () => [{ type: "message", message: {
-        role: "assistant", stopReason: "error", errorMessage: "disconnect\nprivate diagnostic",
+        role: "assistant", stopReason: "error", errorMessage: options.errorMessage ?? "disconnect\nprivate diagnostic",
       } }],
     },
     ui: { notify: vi.fn() },
   } as unknown as ExtensionContext;
   const report = vi.fn(async () => undefined);
   registerMainProviderRecovery({ on: (name: string, handler: Handler) => handlers.set(name, handler) } as unknown as ExtensionAPI,
-    { halted: () => halted, report });
+    { halted: () => halted, report, ownsNonRetryable: () => options.owns ?? false });
   return {
     emit: async (name: string) => handlers.get(name)!({ outcome: "error" }, context),
     report, context,
@@ -46,6 +46,20 @@ beforeEach(() => { vi.useFakeTimers(); vi.clearAllMocks(); });
 afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); });
 
 describe("Main provider recovery waiting for settlement compaction", () => {
+  it("a successor session_start gets its own retry budget", async () => {
+    const h = harness(); h.idle();
+    await h.emit("agent_settled");
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(sendFabricMessage).toHaveBeenCalledTimes(1);
+    await h.emit("session_start");
+    await h.emit("agent_settled");
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(sendFabricMessage).toHaveBeenCalledTimes(2);
+    expect(sendFabricMessage).toHaveBeenLastCalledWith(expect.anything(),
+      expect.objectContaining({ customType: "pi-fabric-provider-retry" }), { deliverAs: "followUp", triggerTurn: true });
+    expect(h.report).not.toHaveBeenCalled();
+  });
+
   it("drops a late report failure after session shutdown without touching the stale ctx (#5962)", async () => {
     const h = harness(); h.idle();
     await h.emit("agent_settled"); await vi.advanceTimersByTimeAsync(1_000);
@@ -76,7 +90,7 @@ describe("Main provider recovery waiting for settlement compaction", () => {
     await vi.advanceTimersByTimeAsync(5_000);
     expect(sendFabricMessage).toHaveBeenCalledTimes(2); // retry + non-triggering BLOCKED
     expect(sendFabricMessage).toHaveBeenLastCalledWith(expect.anything(),
-      expect.objectContaining({ customType: "pi-fabric-provider-blocked", content: "BLOCKED: provider error: disconnect" }),
+      expect.objectContaining({ customType: "pi-fabric-provider-blocked", content: "BLOCKED: provider error: unclassified" }),
       { deliverAs: "followUp", triggerTurn: false });
     expect(h.report).toHaveBeenCalledTimes(1);
     expect(vi.getTimerCount()).toBe(0);
@@ -95,7 +109,7 @@ describe("Main provider recovery waiting for settlement compaction", () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
-  it.each(["input", "agent_start", "session_before_switch", "session_tree", "session_shutdown", "owner-abort", "owner-halt"])(
+  it.each(["input", "agent_start", "session_start", "session_before_switch", "session_tree", "session_shutdown", "owner-abort", "owner-halt"])(
     "%s cancels a busy wake without consuming the recovery budget", async fence => {
       const h = harness();
       await h.emit("agent_settled");
@@ -115,4 +129,47 @@ describe("Main provider recovery waiting for settlement compaction", () => {
         expect.objectContaining({ customType: "pi-fabric-provider-retry" }), { deliverAs: "followUp", triggerTurn: true });
       expect(h.report).not.toHaveBeenCalled();
     });
+});
+
+describe("Main provider recovery reports only allowlisted fields after a retryable failure (smarty-dev#8742)", () => {
+  const secret = "FAKE-SECRET-8742 echoed prompt hunter2";
+  it.each([
+    ["a 5xx body that echoes a secret", `503 ${JSON.stringify({ type: "error", error: { type: "api_error", message: `upstream echoed Authorization: Bearer ${secret}` } })}`, "503 api_error"],
+    ["a secret as the type and code", `502 ${JSON.stringify({ error: { type: secret, code: secret, message: secret } })}`, "502"],
+    ["a secret on the raw first line", `${secret} connection reset by peer\nprivate diagnostic`, "unclassified"],
+  ])("%s never reaches the UI notice or the report payload", async (_name, errorMessage, short) => {
+    const h = harness({ errorMessage, owns: true });
+    h.idle();
+    await h.emit("agent_settled");
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(sendFabricMessage).toHaveBeenCalledExactlyOnceWith(expect.anything(),   // retryable: the one retry
+      expect.objectContaining({ customType: "pi-fabric-provider-retry" }), { deliverAs: "followUp", triggerTurn: true });
+    await h.emit("agent_start");
+    await h.emit("agent_settled");
+    const expected = `BLOCKED: provider error: ${short}`;
+    expect(h.report).toHaveBeenCalledExactlyOnceWith(expected, h.context);
+    expect(h.context.ui.notify).toHaveBeenCalledExactlyOnceWith(expected, "error");
+    expect(sendFabricMessage).toHaveBeenLastCalledWith(expect.anything(),
+      expect.objectContaining({ customType: "pi-fabric-provider-blocked", content: expected }), { deliverAs: "followUp", triggerTurn: false });
+    const published = JSON.stringify([vi.mocked(sendFabricMessage).mock.calls.map(call => call.slice(1)),
+      vi.mocked(h.context.ui.notify).mock.calls, (h.report.mock.calls as unknown[][]).map(call => call[0])]);
+    expect(published).not.toContain(secret);
+    expect(published).not.toContain("private diagnostic");
+  });
+});
+
+describe("Main provider recovery leaves non-retryable errors to Main's drain (smarty-dev#8742)", () => {
+  const affinity = `409 ${JSON.stringify({ type: "error", error: { type: "invalid_request_error", message: "compaction_affinity_missing" } })}`;
+  it.each([
+    ["owned non-retryable", affinity, true, 0],
+    ["unowned non-retryable", affinity, false, 1],
+    ["owned retryable", "503 upstream connect error", true, 1],
+  ])("%s", async (_name, errorMessage, owns, retries) => {
+    const h = harness({ errorMessage, owns });
+    h.idle();
+    await h.emit("agent_settled");
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(sendFabricMessage).toHaveBeenCalledTimes(retries);
+    expect(h.report).not.toHaveBeenCalled();
+  });
 });

@@ -14,7 +14,7 @@ import { GlobalActorRegistry } from "../src/actors/global-registry.js";
 import { AgentsProvider } from "../src/providers/agents-provider.js";
 import { LifecycleBroker } from "../src/lifecycle/broker.js";
 import type { FabricInvocationContext } from "../src/protocol.js";
-import { runResidentHostFromConfigPath } from "../src/residency/host.js";
+import { runResidentHostFromConfigPath as runResidentHostFromConfigPathInProcess } from "../src/residency/host.js";
 import { AgentManager } from "../src/agents/manager.js";
 import { AgentCompletionInbox } from "../src/agents/completion-inbox.js";
 import { ActorRegistryStore } from "../src/actors/registry-store.js";
@@ -29,9 +29,12 @@ import { ResidentHost, RESIDENT_RUN_RETENTION_MS } from "../src/residency/host.j
 import { AgentMessageRouter } from "../src/providers/agents-message-router.js";
 import { processStartTime, residentProcessAlive } from "../src/residency/process-identity.js";
 import { projectOf } from "../src/topology/project-identity.js";
+import { registerAgentRunner } from "../src/runners.js";
+import { normalizeScope, type FabricScope } from "../src/scope.js";
 import { ResidentActorClient } from "../src/residency/actor-client.js";
 import {
   RESIDENT_HOST_FORMAT,
+  residentActorRoots,
   residentDeliveryPrefix,
   residentHostId,
   residentResultPath,
@@ -82,6 +85,13 @@ const initRepository = (directory: string): void => {
   fs.writeFileSync(path.join(directory, "README.md"), "test repository\n");
   git(directory, "add", ".");
   git(directory, "commit", "-qm", "initial");
+};
+
+// A dormant actor keeps identity, subscriptions and routable presence and wakes on delivery;
+// reopened #774, pi-fabric#897. Exactly these two statuses count as routable idle.
+const ROUTABLE_IDLE_STATUSES: readonly unknown[] = ["idle", "dormant"];
+const expectRoutableIdle = (status: unknown): void => {
+  expect(ROUTABLE_IDLE_STATUSES, `status ${String(status)} is not routable idle`).toContain(status);
 };
 
 const waitFor = async (predicate: () => boolean, timeoutMs = 7_000): Promise<void> => {
@@ -208,15 +218,53 @@ const rootHarness = async (name: string): Promise<RootHarness> => {
   };
 };
 
+// In-process hosts run by this file, by residency root: stopResident releases them through their own close path
+// (their abort signal), never by a signal to this process.
+// Every host started for a root is kept (a second start for one root may lose to the first), and each removes only itself.
+const inProcessHosts = new Map<string, Set<AbortController>>();
+const runResidentHostFromConfigPath = (configPath: string, signal?: AbortSignal): Promise<void> => {
+  const stopper = new AbortController();
+  if (signal?.aborted) stopper.abort();
+  else signal?.addEventListener("abort", () => stopper.abort(), { once: true });
+  const residencyRoot = path.dirname(configPath);
+  const stoppers = inProcessHosts.get(residencyRoot) ?? new Set<AbortController>();
+  stoppers.add(stopper);
+  inProcessHosts.set(residencyRoot, stoppers);
+  return runResidentHostFromConfigPathInProcess(configPath, stopper.signal).finally(() => {
+    stoppers.delete(stopper);
+    if (stoppers.size === 0 && inProcessHosts.get(residencyRoot) === stoppers) inProcessHosts.delete(residencyRoot);
+  });
+};
+
+const readOwner = (ownerPath: string): ResidentHostOwner | undefined => {
+  try {
+    return JSON.parse(fs.readFileSync(ownerPath, "utf8")) as ResidentHostOwner;
+  } catch {
+    return undefined;
+  }
+};
+
 const stopResident = async (config: ResidentHostConfig): Promise<void> => {
   const ownerPath = path.join(config.residencyRoot, "owner.json");
-  const owner = (() => {
-    try {
-      return JSON.parse(fs.readFileSync(ownerPath, "utf8")) as ResidentHostOwner;
-    } catch {
-      return undefined;
+  const owner = readOwner(ownerPath);
+  if (owner?.pid && (owner.pid === process.pid || owner.pid === process.ppid)) {
+    // An in-process host (this vitest fork) or the pool: a SIGTERM here, then the SIGKILL below once the fork never
+    // looks dead, ends the fork with no output. Release an in-process host through its own close path instead.
+    const stoppers = [...(inProcessHosts.get(config.residencyRoot) ?? [])];
+    if (stoppers.length === 0) {
+      // A host made directly (new ResidentHost): only its test can close it. Never signal ourselves; wait briefly for
+      // that close, then fail loudly so the caller keeps the root instead of deleting it under a live host.
+      await waitFor(() => readOwner(ownerPath)?.token !== owner.token, 5_000).catch(() => {
+        throw new Error(`stopResident: owner.json still names this test process (pid ${owner.pid}); its in-process host was not closed`);
+      });
+      return;
     }
-  })();
+    for (const stopper of stoppers) stopper.abort();
+    await waitFor(() => readOwner(ownerPath)?.token !== owner.token, 20_000).catch(() => {
+      throw new Error(`stopResident: owner.json still names this test process (pid ${owner.pid}) after its in-process stop; never signalling it`);
+    });
+    return;
+  }
   if (owner?.pid) {
     const alive = (): boolean => {
       try {
@@ -241,22 +289,26 @@ const stopResident = async (config: ResidentHostConfig): Promise<void> => {
 
 afterEach(async () => {
   vi.unstubAllEnvs();
+  const stopFailures: unknown[] = [];
   for (const root of roots.splice(0)) {
     const residencyDirectory = path.join(root, "mesh", "residency");
-    try {
-      for (const entry of fs.readdirSync(residencyDirectory)) {
-        const config = JSON.parse(
-          fs.readFileSync(path.join(residencyDirectory, entry, "config.json"), "utf8"),
-        ) as ResidentHostConfig;
-        await stopResident(config);
-      }
-    } catch {
-      // No resident host was created.
+    let entries: string[] = [];
+    try { entries = fs.readdirSync(residencyDirectory); } catch { /* No resident host was created. */ }
+    let stopFailed = false;
+    for (const entry of entries) {
+      let config: ResidentHostConfig;
+      try {
+        config = JSON.parse(fs.readFileSync(path.join(residencyDirectory, entry, "config.json"), "utf8")) as ResidentHostConfig;
+      } catch { continue; } // not a resident root
+      try { await stopResident(config); } catch (error) { stopFailed = true; stopFailures.push(error); }
     }
+    // A host that could not be stopped may still write: keep its root (the failure below names it).
+    if (stopFailed) continue;
     // A host that already removed owner.json (idle exit) may still be finishing its last mesh
     // writes: retry ENOTEMPTY briefly instead of failing the suite on a loaded runner.
     fs.rmSync(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
   }
+  if (stopFailures.length > 0) throw stopFailures[0];
 });
 
 describe("durable cwd validation", () => {
@@ -282,6 +334,38 @@ describe("durable cwd validation", () => {
       expect(fs.existsSync(path.join(state.config.residencyRoot, "owner.json"))).toBe(false);
       expect(fs.existsSync(path.join(state.config.residencyRoot, "requests"))).toBe(false);
     } finally {
+      await client.close();
+      await state.participants.close();
+    }
+  });
+
+  it("refuses a durable custom runner that the resident host could not load", async () => {
+    const state = await rootHarness("resident-runner-module");
+    const unregister = registerAgentRunner({
+      kind: "worker",
+      id: "local-only",
+      label: "Local only",
+      capabilities: {
+        recursiveFabric: false, steer: false, followUp: false, persistentSessions: false,
+        kernels: false, handoff: false, modelDiscovery: false, imageInput: false,
+        compaction: false, questions: false, sleep: false, writePolicy: false,
+      },
+      launch: () => ({ workerPath: "/bin/true", workerArguments: [] }),
+    });
+    const client = new ResidencyClient({
+      config: state.config,
+      mesh: state.mesh,
+      participants: state.participants,
+      mainAgent: state.mainAgent,
+      hostPath,
+    });
+    try {
+      await expect(
+        client.spawnAgent({ task: "durable", runner: "local-only", residency: "durable" }),
+      ).rejects.toThrow(/declares no residentModule/);
+      expect(fs.existsSync(path.join(state.config.residencyRoot, "owner.json"))).toBe(false);
+    } finally {
+      unregister();
       await client.close();
       await state.participants.close();
     }
@@ -450,9 +534,13 @@ describe.skipIf(process.platform !== "linux" || !hasResidentHost)("S4 originatin
         residentRequestPreserved: true, controlActorLifecycleGatesClosed: true, successorToken: owner.token, replayedAcceptedInputOnce: true }));
       expect(state.mesh.latestSequence()).toBeGreaterThan(event.sequence);
     } finally {
+      // Probe (hosted ubuntu fork death on pi-fabric#902): whose pid owner.json names when cleanup starts.
+      const probeOwner = readOwner(ownerPath);
+      console.log(JSON.stringify({ probe: "S4-finally", mode, ownerPid: probeOwner?.pid ?? null, vitestPid: process.pid, vitestPpid: process.ppid }));
       // Release any faulted host/helper first, then join exact fixture-owned births.
       fs.rmSync(fault, { force: true });
       fs.writeFileSync(`${helperPath}.release`, "checked fixture drain");
+      await seed.close(); // the in-process seed first (idempotent): stopResident never signals this process
       await recovery?.close(); await client?.close();
       await stopResident(state.config);
       await stopAllOwned(launches.owned(), 2_000, 5_000);
@@ -644,9 +732,19 @@ describe("#169 round 2 public cleanup outcome", () => {
       });
       expect(fs.existsSync(marker)).toBe(true);
       failing.mockRestore();
+      if (process.platform === "linux" || process.platform === "darwin" || process.platform === "win32") {
       await expect(provider.invoke("remove", { id: actor.id }, context)).resolves.toEqual({ removed: true });
       expect(fs.existsSync(dir)).toBe(false);
       expect(fs.existsSync(marker)).toBe(false);
+      } else {
+        // On unsupported platforms the retry refuses before any delete (smarty-dev#8090; smarty-dev#11335): tree and marker kept.
+        await expect(provider.invoke("remove", { id: actor.id }, context)).resolves.toMatchObject({
+          removed: true, cleaned: false,
+          pending: `removal cleanup failed: Root actor tree deletion needs the Main publication fence, which this platform (${process.platform}) lacks (smarty-dev#8090); follow-up smarty-dev#11335; the root ${state.identity.id} actor tree is kept (a later remove or host start finishes it)`,
+        });
+        expect(fs.existsSync(dir)).toBe(true);
+        expect(fs.existsSync(marker)).toBe(true);
+      }
     } finally {
       failing?.mockRestore();
       controller.abort(); await running;
@@ -699,11 +797,21 @@ describe("#169 round 1 resident cleanup routing", () => {
       const retried = await request({ operation: "removeActor", id: actor.id });
       expect(retried).toMatchObject({ ok: true });
       expect(first.cleaned).toBe(false);
+      if (process.platform === "linux" || process.platform === "darwin" || process.platform === "win32") {
       expect(retried.pending).toBeUndefined();
       expect(fs.existsSync(dir)).toBe(false);
       expect(fs.existsSync(marker)).toBe(false);
       expect(fs.existsSync(removalsPath)).toBe(false);
       expect(fs.readFileSync(successor.sessionFile, "utf8")).toBe("successor history\n");
+      } else {
+        // On unsupported platforms no root actor tree deletion runs (smarty-dev#8090; smarty-dev#11335): pending, all kept.
+        expect(retried.cleaned).toBe(false);
+        expect(retried.pending).toBe(`removal cleanup failed: Root actor tree deletion needs the Main publication fence, which this platform (${process.platform}) lacks (smarty-dev#8090); follow-up smarty-dev#11335; the root ${state.identity.id} actor tree is kept (a later remove or host start finishes it)`);
+        expect(fs.existsSync(dir)).toBe(true);
+        expect(fs.existsSync(marker)).toBe(true);
+        expect(fs.existsSync(removalsPath)).toBe(true);
+        expect(fs.readFileSync(successor.sessionFile, "utf8")).toBe("successor history\n");
+      }
     } finally {
       failing?.mockRestore();
       controller.abort();
@@ -1722,7 +1830,7 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
       const actor = await client.createActor({ name: "resident live review", instructions: "Reply.", residency: "durable", transport: "process", responseMode: "text", delivery: "mailbox", coalesce: false });
       const participant = () => state.participants.get(actor.id, undefined, { fresh: true });
       await control.request(client.hostId, actor.id, "followUp", { message: "settled baseline", ownerIncarnation: await liveControlOwnerIncarnation(state.participants, actor.id) }, client.hostId);
-      await waitFor(() => participant()?.status === "idle" && Boolean(passive.status(actor.id).lastRunId));
+      await waitFor(() => ROUTABLE_IDLE_STATUSES.includes(participant()?.status) && Boolean(passive.status(actor.id).lastRunId));
       const baseline = passive.status(actor.id);
       expect(passive.owns(actor.id)).toBe(false);
       const definition = passive.definition(actor.id);
@@ -1742,7 +1850,7 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
       expect(live).toMatchObject({ status: "running", ownerHostId: client.hostId, actorQueued: 2,
         actorRun: { id: running.actorRun!.id } });
       expect(live.actorMessages).toBeGreaterThan(baseline.messages);
-      expect(passive.status(actor.id)).toMatchObject({ status: "idle", queued: 0, lastRunId: baseline.lastRunId });
+      expect(passive.status(actor.id)).toMatchObject({ status: baseline.status, queued: 0, lastRunId: baseline.lastRunId });
       const single = await provider.invoke("actorStatus", { id: actor.id }, context);
       const listed = (await provider.invoke("actors", {}, context) as Array<{ id: string }>).find(row => row.id === actor.id);
       for (const view of [single, listed]) {
@@ -1752,11 +1860,13 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
       expect(passive.definition(actor.id)).toEqual(definition);
       // The real worker cannot finish FIRST until both provider reads above agree.
       fs.writeFileSync(releasePath, "release\n");
-      await waitFor(() => participant()?.status === "idle" && participant()?.actorQueued === 0 && participant()?.actorRun === undefined);
+      await waitFor(() => ROUTABLE_IDLE_STATUSES.includes(participant()?.status) && participant()?.actorQueued === 0 && participant()?.actorRun === undefined);
       const idleSingle = await provider.invoke("actorStatus", { id: actor.id }, context) as { inFlightRun?: unknown; lastRunId?: string };
       const idleListed = (await provider.invoke("actors", {}, context) as Array<{ id: string; inFlightRun?: unknown }>).find(row => row.id === actor.id)!;
       for (const view of [idleSingle, idleListed]) {
-        expect(view).toMatchObject({ status: "idle", queued: 0, messages: participant()!.actorMessages });
+        // The two independent reads may straddle the idle -> dormant event.
+        expectRoutableIdle((view as { status?: string }).status);
+        expect(view).toMatchObject({ queued: 0, messages: participant()!.actorMessages });
         expect(view.inFlightRun).toBeUndefined();
       }
       expect(idleSingle.lastRunId).not.toBe(baseline.lastRunId);
@@ -2238,7 +2348,19 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
       mainAgent: state.mainAgent,
       hostPath,
     });
-    await expect(reconnect.removeActor(actor.id)).resolves.toEqual({ removed: true });
+    if (process.platform === "linux" || process.platform === "darwin" || process.platform === "win32") {
+      await expect(reconnect.removeActor(actor.id)).resolves.toEqual({ removed: true });
+    } else {
+      const historyFile = path.join(state.config.actorRoot, actor.id, "session.jsonl");
+      fs.appendFileSync(historyFile, `${JSON.stringify({ testHistory: "resident reconnect removal" })}\n`);
+      const historyBeforeRemoval = fs.readFileSync(historyFile, "utf8");
+      // On unsupported platforms fence refusal follows revocation but precedes tree deletion; follow-up smarty-dev#11335.
+      const removal = await reconnect.removeActor(actor.id);
+      expect(removal).toEqual({ removed: true, cleaned: false,
+        pending: `removal cleanup failed: Root actor tree deletion needs the Main publication fence, which this platform (${process.platform}) lacks (smarty-dev#8090); follow-up smarty-dev#11335; the root ${state.identity.id} actor tree is kept (a later remove or host start finishes it)` });
+      expect(fs.existsSync(path.join(state.config.actorRoot, actor.id))).toBe(true);
+      expect(fs.readFileSync(historyFile, "utf8")).toBe(historyBeforeRemoval);
+    }
     // review/astra on pi-fabric#136: actor activations leave no saved durable task result.
     const resultsDir = path.join(state.config.residencyRoot, "results");
     expect(fs.existsSync(resultsDir) ? fs.readdirSync(resultsDir) : []).toEqual([]);
@@ -2636,6 +2758,89 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
     }
   });
 
+  // pi-fabric#843 review (smarty-dev#8487): a REAL resident restart. The resident host process
+  // gets SIGTERM, an older runtime's save drops resolvedBinding, the owner re-ensures the actor
+  // and the new host process republishes the idle presence the router reads with its verified
+  // model/thinking, with no new run; a forged row's model, which the run path refuses, stays unknown.
+  it("republishes a verified legacy actor binding after a real resident SIGTERM restart, without a run (pi-fabric#843)", { timeout: 120_000 }, async () => {
+    const state = await rootHarness("resident-binding-restart");
+    const client = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants,
+      mainAgent: state.mainAgent, hostPath });
+    const ownerPath = path.join(state.config.residencyRoot, "owner.json");
+    const presence = (id: string) =>
+      state.mesh.get(`actors/${state.config.sessionId}/${id}`)?.value as Record<string, unknown> | undefined;
+    const registryFile = (id: string): string => {
+      const roots = Object.values(residentActorRoots(state.config));
+      const file = roots.map(root => path.join(root, "actors.json")).find(candidate => fs.existsSync(candidate) &&
+        (JSON.parse(fs.readFileSync(candidate, "utf8")) as { actors: Array<{ id: string }> }).actors.some(row => row.id === id));
+      if (!file) throw new Error(`No registry row for ${id}`);
+      return file;
+    };
+    const row = (id: string) => (JSON.parse(fs.readFileSync(registryFile(id), "utf8")) as { actors: Array<Record<string, unknown>> })
+      .actors.find(candidate => candidate.id === id)!;
+    const runs = (): string[] => {
+      const directory = path.join(state.config.residencyRoot, "runs");
+      return fs.existsSync(directory) ? fs.readdirSync(directory) : [];
+    };
+    try {
+      const bound = await client.createActor({ name: "review pair", instructions: "Review.", residency: "durable",
+        runner: "pi", model: "provider/visible", modelReason: "review pair", thinking: "high" });
+      const forged = await client.createActor({ name: "forged pair", instructions: "Review.", residency: "durable",
+        runner: "pi", model: "provider/visible", thinking: "high" });
+      await waitFor(() => presence(bound.id)?.model === "provider/visible", 20_000);
+      expect(row(bound.id).resolvedBinding).toMatchObject({ model: "provider/visible", thinking: "high" });
+      const before = JSON.parse(fs.readFileSync(ownerPath, "utf8")) as ResidentHostOwner;
+      const runsBefore = runs();
+      const lastRunIdsBefore = { bound: presence(bound.id)?.lastRunId, forged: presence(forged.id)?.lastRunId };
+
+      // Real SIGTERM of the resident host process; wait for the process itself to exit.
+      await stopResident(state.config);
+      expect(residentProcessAlive(before.pid, before.processStartTime)).toBe(false);
+      // Seed what an older runtime's save leaves: rows without resolvedBinding, one with a
+      // forged model. Drop the old presence so only the restarted process can write it.
+      for (const [id, model] of [[bound.id, undefined], [forged.id, "provider/forged"]] as const) {
+        const file = registryFile(id);
+        const registry = JSON.parse(fs.readFileSync(file, "utf8")) as { actors: Array<Record<string, unknown>> };
+        const target = registry.actors.find(candidate => candidate.id === id)!;
+        delete target.resolvedBinding;
+        if (model) target.model = model;
+        fs.writeFileSync(file, JSON.stringify(registry));
+        await state.mesh.delete({ key: `actors/${state.config.sessionId}/${id}` });
+      }
+      expect(row(bound.id).resolvedBinding).toBeUndefined();
+
+      // The owner re-ensures the actor: a new resident host process loads the legacy rows.
+      await client.ensureActor(bound.id);
+      const after = JSON.parse(fs.readFileSync(ownerPath, "utf8")) as ResidentHostOwner;
+      expect(after.pid).not.toBe(before.pid);
+      await waitFor(() => presence(bound.id)?.model === "provider/visible", 20_000);
+      // A restarted idle durable actor may already be dormant: it still accepts deliveries and wakes.
+      expectRoutableIdle(presence(bound.id)?.status);
+      // Idle or dormant, the restart started no run and moved no lastRunId.
+      expect(presence(bound.id)).not.toHaveProperty("inFlightRun");
+      expect(presence(bound.id)?.lastRunId).toBe(lastRunIdsBefore.bound);
+      expect(presence(bound.id)).toMatchObject({ id: bound.id, model: "provider/visible",
+        modelReason: "review pair", thinking: "high" });
+      await waitFor(() => presence(forged.id) !== undefined, 20_000);
+      // The resident resolver refuses the forged selector; give it time to settle, then prove unknown.
+      await delay(1_500);
+      expectRoutableIdle(presence(forged.id)?.status);
+      expect(presence(forged.id)).not.toHaveProperty("inFlightRun");
+      expect(presence(forged.id)?.lastRunId).toBe(lastRunIdsBefore.forged);
+      expect(presence(forged.id)).not.toHaveProperty("model");
+      expect(presence(forged.id)).not.toHaveProperty("thinking");
+      // No new run: no run directory, no lastRunId, and the verified view was not persisted as a run pin.
+      expect(runs()).toEqual(runsBefore);
+      expect(row(bound.id).lastRunId).toBeUndefined();
+      expect(row(forged.id).lastRunId).toBeUndefined();
+      expect(row(bound.id).resolvedBinding).toBeUndefined();
+    } finally {
+      await client.close();
+      await state.participants.close();
+      await stopResident(state.config);
+    }
+  });
+
   it("resolves a model added to models.json after the resident host started, with no restart", { timeout: 60_000 }, async () => {
     // pi-fabric#138: the resident host runs in its own Pi process; its registry, not the
     // session's snapshot from host start, must discover the new exact id on ask and tell.
@@ -2777,6 +2982,33 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
     await state.participants.close();
   });
 
+  it("launches durable agents with the forwarded scope and records it", { timeout: 45_000 }, async () => {
+    const state = await rootHarness("resident-scope");
+    const client = new ResidencyClient({
+      config: state.config,
+      mesh: state.mesh,
+      participants: state.participants,
+      mainAgent: state.mainAgent,
+      hostPath,
+    });
+    const scope = normalizeScope({ principal: { id: "user:alice" }, grants: [{ resource: "fs:/repo/**", actions: ["read"] }] });
+    const handle = await client.spawnAgent({
+      task: "Scoped durable agent", transport: "process", residency: "durable", inheritedScope: scope,
+    });
+    const metadata = JSON.parse(fs.readFileSync(
+      path.join(state.config.residencyRoot, "agents", `${handle.id}.json`), "utf8",
+    )) as { scope?: FabricScope };
+    expect(metadata.scope).toEqual(JSON.parse(JSON.stringify(scope)));
+    await expect(client.spawnAgent({
+      task: "Forged", transport: "process", residency: "durable",
+      inheritedScope: { ...scope, grants: [{ resource: "fs:*", actions: ["write"] }] },
+    })).rejects.toThrow(/Invalid forwarded Fabric scope/);
+    await client.waitAgent(handle.id);
+    await client.cleanupAgent(handle.id);
+    await client.close();
+    await state.participants.close();
+  });
+
   it("completes and cleans a durable agent after its originating Main closes", { timeout: 45_000 }, async () => {
     const state = await rootHarness("resident-agent");
     const client = new ResidencyClient({
@@ -2854,6 +3086,8 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
   // smarty-dev#1882: the host's exit removes runs/; a later session still reads the result.
   it("returns a completed durable agent's result after its resident host exits", { timeout: 90_000 }, async () => {
     const state = await rootHarness("resident-exit-status");
+    // This case closes Main below: use a short configured dead-root window, not a live-root exit.
+    state.config.mesh = { ...state.config.mesh, residentIdleExitMs: 1_000 };
     const client = new ResidencyClient({
       config: state.config,
       mesh: state.mesh,
@@ -2865,7 +3099,7 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
     expect((await client.waitAgent(handle.id)).status).toBe("completed");
     await client.close();
     await state.participants.close();
-    // The real path: the host exits after 30 s idle and its close removes runs/.
+    // The real path: Main's lease is withdrawn; the host exits after the configured idle window.
     const runsDir = path.join(state.config.residencyRoot, "runs");
     await waitFor(() => !fs.existsSync(path.join(state.config.residencyRoot, "owner.json")), 60_000);
     // owner.json goes last: nothing may write under mesh/ once it is gone, or a new host

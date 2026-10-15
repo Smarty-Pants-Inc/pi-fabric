@@ -116,7 +116,20 @@ export const createDashboardSnapshot = (
   // read displayOnly, and the state listing opts in directly. Deciders keep bound reads.
   const participants = typeof state.participantInfos === "function"
     ? state.participantInfos({ scope: "project", background: true }) : [];
-  const actorRecords = state.actors.list();
+  // Listings can include foreign session-orphan/cleanup rows with no local details,
+  // or lose an actor to a registry refresh. Reconcile before caching the view.
+  const actorRecords = state.actors.list().flatMap((actor) => {
+    try {
+      return [{
+        ...actor,
+        instructions: state.actors.instructions(actor.id),
+        recentMessages: state.actors.messages(actor.id, 12),
+      }];
+    } catch (error) {
+      if (error instanceof Error && error.message === `Unknown Fabric actor: ${actor.id}`) return [];
+      throw error;
+    }
+  });
   const main = state.mainAgentInfo(context);
   const peers = typeof state.peerInfos === "function" ? state.peerInfos({ background: true }) : [];
   const globalActors = state.globalActors.list();
@@ -229,8 +242,6 @@ export const createDashboardSnapshot = (
       const worker = workerByActor.get(actor.id);
       return {
         ...actor,
-        instructions: state.actors.instructions(actor.id),
-        recentMessages: state.actors.messages(actor.id, 12),
         ...(participant
           ? { ownerHostId: participant.ownerHostId, local: participant.local }
           : {}),
@@ -256,14 +267,21 @@ export const createDashboardSnapshot = (
         : agent;
     });
   const localAgentIds = new Set(localAgents.map((agent) => agent.id));
+  // Fork (smarty-dev#2004, #142 F3): the dashboard topology shows peer
+  // sessions' agents from the project directory; the widget alone narrows to
+  // this session's work (smarty-dev#1089). Upstream's snapshot-level root
+  // filter would drop peers from the topology, so only its provider rows are
+  // taken here.
   const remoteAgents: FabricUiAgent[] = participants
-    .filter((participant) => participant.kind === "agent" && !localAgentIds.has(participant.id))
+    .filter((participant) =>
+      (participant.kind === "agent" || participant.kind === "provider") &&
+      !localAgentIds.has(participant.id))
     .map((participant) => ({
       id: participant.id,
       name: participant.name,
       status: participant.status,
-      runner: participant.runner,
-      transport: participant.transport,
+      ...(participant.runner ? { runner: participant.runner } : {}),
+      transport: participant.provider ? `provider ${participant.provider}` : participant.transport,
       cwd: participant.cwd ?? "",
       ...(participant.model ? { model: participant.model } : {}),
       ...(participant.thinking ? { thinking: participant.thinking } : {}),

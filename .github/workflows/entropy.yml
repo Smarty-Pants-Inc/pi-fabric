@@ -12,10 +12,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: package.json
       - uses: oven-sh/setup-bun@v2
       - name: Install dependencies
         run: bun install --frozen-lockfile
+      - name: Fetch the pinned native toolchain
+        run: node scripts/native-toolchain.mjs fetch
       - name: Build
+        env:
+          FABRIC_NATIVE_CC_PINNED: "1"
         run: bun run build
       - name: Certify entropy
         run: node scripts/certify-entropy.mjs --json entropy-report.json

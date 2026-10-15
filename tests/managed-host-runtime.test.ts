@@ -50,6 +50,7 @@ describe("managed runtime early composition", () => {
       expect(runtime.initialized).toBe(true);
       expect(runtime.modelGuidance()).toEqual([]);
       expect(runtime.registry.has("cache")).toBe(false);
+      expect(runtime.registry.has("thinking")).toBe(false);
       const invocation = {cwd: context.cwd, signal: undefined, parentToolCallId: "test", nestedToolCallId: "nested", extensionContext: context, update() {}, approve: async () => {}, audits: [], maxResultChars: 10000};
       expect(await runtime.registry.invoke("agents.run", {task: "hosted"}, invocation)).toMatchObject({status: "completed", text: "hosted"});
       await runtime.components.reload("fabric.provider.agents");

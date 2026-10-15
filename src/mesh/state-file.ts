@@ -6,10 +6,15 @@ import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import childProcess from "node:child_process";
-import { readFileRetrying, writeFileAtomic, renameAtomic, MeshLockTimeoutError, trackTemporary } from "../core/atomic-write.js";
+import { readFileRetrying, writeFileAtomic, renameAtomic, isMeshIncarnationPending, MeshLockTimeoutError,
+  MeshSnapshotRetriesExhaustedError, trackTemporary, isNamespaceRace,
+  requireNamespaceBarrier, syncPathNamespaceDurable } from "../core/atomic-write.js";
+import { MeshSyncNotDurableError } from "./not-durable.js";
 import { captureStoragePut, captureStorageDelete, storageRevision } from "../verified/storage.js";
-import { delay, describeLockHolder, errorCode, lockStats, type MeshLock, type MeshStoreContext } from "./mesh-lock.js";
-import { assertFileStateWritable, isMeshStateMovedMarker, meshStateMovedError, readMeshStateMovedMarker, type MeshStateMovedMarker } from "./backend-fence.js";
+import { verifiedRemove } from "../storage/verified-remove.js";
+import { delay, errorCode, type MeshLock, type MeshStoreContext } from "./mesh-lock.js";
+import { assertFileStateWritable, isMeshStateMovedMarker, isMeshStateNatsMarker, meshStateMovedError, meshStateMovedToNatsError, readMeshStateMovedMarker,
+  type MeshStateMovedMarker, type MeshStateNatsMarker } from "./backend-fence.js";
 import type { MeshIdentity } from "./event-log.js";
 import type { MeshCommitEffects, MeshStateFileRead, StateBackend, StateBackendBatchInput, StateBackendDiagnostics } from "./state-backend.js";
 
@@ -92,6 +97,46 @@ export const jsonClone = <T>(value: T): T => {
   return JSON.parse(serialized) as T;
 };
 
+/**
+ * Deep check of a parsed state.json document, for callers that must not act on doubt (retention --apply,
+ * smarty-dev#7916). The tolerant reader below accepts `{"format":1,"entries":{"k":null}}`; this does not: the
+ * envelope has only known fields and every entry is a complete entry under its own key. Returns the first problem.
+ */
+export const meshStateDocumentProblem = (value: unknown): string | undefined => {
+  const object = (item: unknown): item is Record<string, unknown> => typeof item === "object" && item !== null && !Array.isArray(item);
+  const count = (item: unknown): boolean => Number.isSafeInteger(item) && (item as number) >= 0;
+  if (!object(value)) return "not an object";
+  const known = new Set(["format", "revisionFormat", "entries", "versions", "tombstoneOrder", "highWater", "readGeneration", "readJournalHash"]);
+  const unknown = Object.keys(value).find(key => !known.has(key));
+  if (unknown !== undefined) return `unknown field ${JSON.stringify(unknown)}`;
+  if (value.format !== 1 && value.format !== 2) return "unknown format";
+  if (value.revisionFormat !== undefined && value.revisionFormat !== 2) return "unknown revisionFormat";
+  if (value.highWater !== undefined && !count(value.highWater)) return "invalid highWater";
+  for (const field of ["readGeneration", "readJournalHash"] as const) {
+    if (value[field] !== undefined && typeof value[field] !== "string") return `invalid ${field}`;
+  }
+  if (value.versions !== undefined && (!object(value.versions) || !Object.values(value.versions).every(count))) return "invalid versions";
+  if (value.tombstoneOrder !== undefined && (!Array.isArray(value.tombstoneOrder) || !value.tombstoneOrder.every(key => typeof key === "string"))) {
+    return "invalid tombstoneOrder";
+  }
+  if (!object(value.entries)) return "entries is not an object";
+  const entryFields = new Set(["key", "value", "version", "updatedAt", "updatedBy"]);
+  for (const [key, entry] of Object.entries(value.entries)) {
+    const at = `entry ${JSON.stringify(key)}`;
+    if (!object(entry)) return `${at} is not an object`;
+    if (Object.keys(entry).some(field => !entryFields.has(field))) return `${at} has an unknown field`;
+    if (entry.key !== key) return `${at} names another key`;
+    if (!count(entry.version)) return `${at} has an invalid version`;
+    if (typeof entry.updatedAt !== "number" || !Number.isFinite(entry.updatedAt) || entry.updatedAt < 0) return `${at} has an invalid updatedAt`;
+    const by = entry.updatedBy;
+    if (!object(by) || typeof by.id !== "string" || typeof by.name !== "string" || typeof by.kind !== "string" ||
+        (by.sessionId !== undefined && typeof by.sessionId !== "string") || (by.verified !== undefined && typeof by.verified !== "string")) {
+      return `${at} has an invalid updatedBy`;
+    }
+  }
+  return undefined;
+};
+
 const isMeshStateFile = (value: unknown): value is MeshStateFile => {
   if (
     typeof value !== "object" ||
@@ -164,14 +209,14 @@ const readState = (
     throw new Error(`Failed to read Fabric mesh state: ${message}`);
   }
   if (!serialized.trim() && recoverDamage) return emptyState();
-  let moved: MeshStateMovedMarker | undefined;
+  let moved: MeshStateMovedMarker | MeshStateNatsMarker | undefined;
   try {
     const parsed: unknown = JSON.parse(serialized);
     if (isMeshStateFile(parsed)) {
       observed?.(serialized);
       return parsed;
     }
-    if (!isMeshStateMovedMarker(parsed)) throw new Error("invalid state format");
+    if (!isMeshStateMovedMarker(parsed) && !isMeshStateNatsMarker(parsed)) throw new Error("invalid state format");
     moved = parsed;
   } catch (error) {
     // Failed parsing must not silently erase the allocation clock. Read-only
@@ -185,7 +230,7 @@ const readState = (
   // pi-fabric#627 review round 3: cutover's moved marker (backend-fence.ts). Never state, damage or an
   // empty mesh, for strict and tolerant reads alike: this file-mode store fails closed (a write is
   // refused before it stages anything; a reader does not report false absence).
-  throw meshStateMovedError(filePath, moved);
+  throw isMeshStateNatsMarker(moved) ? meshStateMovedToNatsError(filePath, moved) : meshStateMovedError(filePath, moved);
 };
 
 // smarty-dev#2014 read signal: state.read-signal.json, rewritten best effort after each commit
@@ -477,6 +522,9 @@ export class MeshStateFileReadChangedError extends Error {
 
 /** Internal: a fileRead stamp did not hold inside the transaction; the backend re-reads and retries. */
 export const FILE_READ_CHANGED: Error = new Error("Fabric mesh fileRead stamp changed");
+// A lazy V8 stack holds receivers from the importing runtime, keeping a retired Main alive.
+// Materialize this module-lifetime sentinel once, preserving its identity and diagnostic text.
+void FILE_READ_CHANGED.stack;
 
 /**
  * Internal: runs `fileRead.read()` bracketed by two stamps. Differing stamps mean a file changed
@@ -559,6 +607,21 @@ const processStartedAfter = (pid: number, modifiedAt: number): boolean => {
   } catch { return false; }
 };
 
+/**
+ * `StateFile.sync()` on a platform with no durable namespace barrier (Windows: no directory fsync, and
+ * `renameAtomic` is a plain rename). state.json is replaced by a rename on every commit, so an fsync of the
+ * file cannot confirm the directory entry survives a power loss. Not retryable: the caller must not advance
+ * an external cursor or delivered mark on it (smarty-dev#9313; one MeshSyncNotDurableError shape for every backend).
+ */
+export class MeshStateFileNotDurableError extends MeshSyncNotDurableError {
+  constructor(readonly platform: NodeJS.Platform) {
+    super("FABRIC_MESH_STATE_FILE_NOT_DURABLE", "state", `state.json is replaced by a rename and ${platform} has no directory fsync barrier for it, so a commit may not survive a power loss`);
+    this.name = "MeshStateFileNotDurableError";
+  }
+}
+
+const stateFileNotDurable = (platform: NodeJS.Platform): MeshStateFileNotDurableError => new MeshStateFileNotDurableError(platform);
+
 export class StateFile implements StateBackend {
   readonly kind = "file" as const;
   /** Set by the backend factory when a configured sqlite/shadow backend runs as file. */
@@ -627,6 +690,10 @@ export class StateFile implements StateBackend {
         if (!Number.isSafeInteger(pid) || pid === process.pid) continue;
         const file = path.join(this.root, entry.name);
         try {
+          // smarty-dev#8907: the judged stat, taken before the pid and age judgment; verifiedRemove removes only this
+          // inode (a successor swapped in since stays). Off Linux: main's unlink (#7858 fallback).
+          const stat = fs.lstatSync(file);
+          if (!stat.isFile()) continue;
           let dead = false;
           try { process.kill(pid, 0); }
           catch (error) {
@@ -634,10 +701,11 @@ export class StateFile implements StateBackend {
             dead = true;
           }
           if (!dead) {
-            const modifiedAt = fs.statSync(file).mtimeMs;
+            const modifiedAt = stat.mtimeMs;
             if (now - modifiedAt <= PREPARED_REUSE_AGE_MS || !processStartedAfter(pid, modifiedAt)) continue;
           }
-          fs.unlinkSync(file);
+          if (!verifiedRemove(file, stat, { deleter: "meshPreparedStateSweep",
+            fallback: () => { fs.unlinkSync(file); return true; } }).removed) continue;
           removed++;
         } catch { /* A sibling sweep/rename or unavailable evidence never blocks the store. */ }
       }
@@ -864,11 +932,13 @@ export class StateFile implements StateBackend {
     // The reduced remaining budget below must not turn an ordinary cold protocol-2
     // write into a bounded custody try. Await constructor preparation outside custody;
     // an actual registry-fenced try still fails closed promptly in #withLock.
-    if (this.#lock.lockProtocol === 2 && !this.#lock.ownIncarnationReady && !scope?.active) {
+    if (this.#lock.lockProtocol >= 2 && !this.#lock.ownIncarnationReady && !scope?.active) {
       await this.#lock.ownIncarnation;
     }
+    let attempts = 0;
     for (;;) {
       this.#lock.writeAbortSignal?.throwIfAborted();
+      attempts += 1;
       const identity = this.#stateWriteIdentity();
       if (identity === undefined) {
         return this.#lock.withLock(() => {
@@ -887,6 +957,11 @@ export class StateFile implements StateBackend {
           return commit(prepared!);
         }, Math.max(0, deadline - Date.now()), lockClass);
       } catch (error) {
+        // Acquisition refusals retain their origin, even if the snapshot changed while waiting.
+        if (error instanceof MeshLockTimeoutError || isMeshIncarnationPending(error)) {
+          this.#stateCache = undefined;
+          throw error;
+        }
         // A stale CAS/parse/size error belongs to the snapshot, not the current file.
         if (error !== WRITE_SNAPSHOT_CHANGED && (admitted || this.#stateWriteIdentity() === identity)) {
           this.#stateCache = undefined;
@@ -895,8 +970,7 @@ export class StateFile implements StateBackend {
         // Never retry inside an actor registry fence: its caller releases custody and
         // retries the whole admission step, just as for a busy mesh.
         if (scope?.active || Date.now() >= deadline) {
-          if (!(error instanceof MeshLockTimeoutError)) lockStats?.failed(this.root, lockClass, 0, Boolean(scope?.active));
-          throw new MeshLockTimeoutError(describeLockHolder(path.join(this.#lock.lockPath, "owner")), 0, 0);
+          throw new MeshSnapshotRetriesExhaustedError(attempts);
         }
         await delay(0, this.#lock.writeAbortSignal);
       } finally {
@@ -921,6 +995,8 @@ export class StateFile implements StateBackend {
         const release = trackTemporary(temporary);
         try { writeFileAtomic(temporary, prepared.encoded.serialized); }
         catch (error) {
+          // ponytail: no judgment precedes this: our own unique unpublished staging name (live pid + uuid, so no sweep
+          // claims it) in the private mesh root, only ever created by this write (smarty-dev#8907 inventory).
           try { fs.rmSync(temporary, { force: true }); } catch { /* Best-effort private staging cleanup. */ }
           release();
           throw error;
@@ -935,6 +1011,7 @@ export class StateFile implements StateBackend {
       return result;
     }, ({ prepared }) => {
       if (prepared?.temporary) {
+        // ponytail: as above, our own unique staging name; after the commit's rename it is absent (force: no-op).
         try { fs.rmSync(prepared.temporary, { force: true }); } catch { /* Best-effort private staging cleanup. */ }
         prepared.releaseTemporary?.();
       }
@@ -1117,6 +1194,33 @@ export class StateFile implements StateBackend {
   /** R20 write fence: every state.json writer takes `.lock`, which the caller holds. */
   withWriteFence<T>(operation: () => T): T {
     return operation();
+  }
+
+  /**
+   * Durability barrier (smarty-dev#9313): state.json is renamed into place without an fsync, so this
+   * fsyncs the file the path names now and its namespace, outside `.lock`. A commit made before the
+   * call is that file or an older one it replaced, and the directory barrier persists the rename. A
+   * concurrent rename during the namespace check is retried within the budget; an I/O error is not.
+   * On Windows there is no directory barrier (syncPathNamespace skips it), so the durable namespace
+   * variant fails closed with MeshStateFileNotDurableError, before any I/O, instead of claiming
+   * durability for the rename.
+   */
+  async sync(budgetMs: number): Promise<void> {
+    requireNamespaceBarrier(stateFileNotDurable);
+    const deadline = Date.now() + Math.max(0, budgetMs);
+    for (;;) {
+      let fd: number;
+      try { fd = fs.openSync(this.#statePath, "r"); }
+      catch (error) { if (errorCode(error) === "ENOENT") return; throw error; }
+      try {
+        fs.fsyncSync(fd);
+        syncPathNamespaceDurable(this.#statePath, fs.fstatSync(fd), stateFileNotDurable);
+        return;
+      } catch (error) {
+        if (!isNamespaceRace(error) || Date.now() >= deadline) throw error;
+      } finally { fs.closeSync(fd); }
+      await delay(1 + Math.random() * 3);
+    }
   }
 
   async confirmWritable(onAcquired?: (at: number) => void): Promise<void> {

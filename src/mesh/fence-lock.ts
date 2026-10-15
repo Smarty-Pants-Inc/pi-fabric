@@ -16,7 +16,7 @@ import { MeshLock } from "./mesh-lock.js";
  */
 export interface MeshFenceOptions {
   /** The mesh `.lock` protocol. Default 1 (the migration tool's). */
-  lockProtocol?: 1 | 2;
+  lockProtocol?: 1 | 2 | 3;
   /** Budget for each fence lock (`custody.lock`, then `.lock`). */
   lockTimeoutMs: number;
 }
@@ -24,7 +24,7 @@ export interface MeshFenceOptions {
 /** Holds the fence across awaits until the operation settles. */
 export const holdMeshFence = async <T>(root: string, options: MeshFenceOptions,
   operation: (lock: MeshLock) => Promise<T> | T): Promise<T> => {
-  const releaseCustody = await acquireMeshCustodyLock(root, options.lockTimeoutMs);
+  const releaseCustody = await acquireMeshCustodyLock(root, options.lockTimeoutMs, { lockProtocol: options.lockProtocol ?? 1 });
   try {
     const lock = new MeshLock(root, { lockProtocol: options.lockProtocol ?? 1, lockTimeoutMs: options.lockTimeoutMs }, () => undefined);
     return await lock.withLockAcrossAwait(async () => operation(lock), options.lockTimeoutMs, "other");
@@ -44,6 +44,8 @@ const tryCustody = (lock: string, token: string, record: string): boolean => {
       if (["EEXIST", "ENOTEMPTY", "EPERM", "EACCES"].includes(codeOf(error) ?? "")) return false;
       throw error;
     }
+  // ponytail: no judgment precedes this. `staging` is this attempt's own unpublished mkdtemp name (random suffix, never
+  // published under it, never a recovery or rename target); after a successful publish `force` makes it a no-op.
   } finally { fs.rmSync(staging, { recursive: true, force: true }); }
 };
 
@@ -53,6 +55,8 @@ const tryMeshLock = (lock: string, record: string): boolean => {
   try { fs.writeFileSync(path.join(lock, "owner"), record, { encoding: "utf8", flag: "wx", mode: 0o600 }); return true; }
   catch (error) {
     if (codeOf(error) === "EEXIST") return false; // a recoverer's successor owns it now: never clean it
+    // ponytail: atomic rmdir of an EMPTY directory (fails on any owner): a swapped-in directory loses no data or custody,
+    // its protocol-1 creator's `wx` owner write then fails (ENOENT) and it never enters. smarty-dev#8907 inventory.
     try { fs.rmdirSync(lock); } catch { /* not ours to clean any more */ }
     throw error;
   }
@@ -121,9 +125,13 @@ export const releaseFenceLock = (lock: string, record: string,
       const ours = fs.fstatSync(pin);
       hooks.afterCheck?.();
       if (!sameInode(fs.lstatSync(lock, { throwIfNoEntry: false }), ours)) return; // moved or replaced: not ours to touch
+      // ponytail (smarty-dev#8907): not verifiedRemove (its open would refuse the /proc/self/fd/<fd> final symlink). The
+      // unlink goes through the fd pinned on OUR directory inode, whose `owner` was just read as our unique record; no
+      // writer replaces an owner in place (all use `wx`) and no recoverer moves one out of its directory (step 1 above).
       try { fs.unlinkSync(path.join(pinned, "owner")); } catch { return; }
       hooks.afterTake?.();
       if (!sameInode(fs.lstatSync(lock, { throwIfNoEntry: false }), ours)) return;
+      // ponytail: atomic rmdir, fails closed (ENOTEMPTY) on any successor's record (step 4 above).
       try { fs.rmdirSync(lock); } catch { /* a successor's owner is in it: never ours to remove */ }
     } finally { try { fs.closeSync(pin); } catch { /* already closed */ } }
     return;
@@ -137,6 +145,10 @@ export const releaseFenceLock = (lock: string, record: string,
   let ours = false;
   try { ours = fs.readFileSync(taken, "utf8") === record; } catch { /* unreadable: not provably ours */ }
   if (ours) {
+    // ponytail (smarty-dev#8907; off Linux, or the synchronous fence's Linux pin-failure fallback):
+    // `taken` is `owner.released.<our unique token>` inside <lock>, a name only this holder ever creates, just verified
+    // as our record. The rmdir below is atomic and fails closed on any successor's owner; the link-back unlink removes
+    // only the extra name of the inode just linked back to `owner`.
     try { fs.unlinkSync(taken); } catch { /* best effort */ }
     try { fs.rmdirSync(lock); } catch { /* a successor's owner is in it: never ours to remove */ }
     return;

@@ -80,8 +80,14 @@ const denyRead = (target: string): void => {
   deniedPaths.add(path.resolve(target));
   if (vi.isMockFunction(fs.readdirSync)) return;
   const eacces = (file: unknown): Error => Object.assign(new Error(`EACCES: permission denied, '${String(file)}'`), { code: "EACCES" });
-  const blocked = (file: unknown): boolean => deniedPaths.has(path.resolve(String(file)));
-  const readdir = fs.readdirSync, readFile = fs.readFileSync;
+  // Numeric descriptors are not pathnames. Deny the open itself so fd-bound readers see
+  // the same EACCES on Windows/root as an unprivileged POSIX reader.
+  const blocked = (file: unknown): boolean => typeof file !== "number" && deniedPaths.has(path.resolve(String(file)));
+  const readdir = fs.readdirSync, readFile = fs.readFileSync, open = fs.openSync;
+  vi.spyOn(fs, "openSync").mockImplementation(((file: fs.PathLike, ...rest: unknown[]) => {
+    if (blocked(file)) throw eacces(file);
+    return (open as (...args: unknown[]) => unknown)(file, ...rest);
+  }) as typeof fs.openSync);
   vi.spyOn(fs, "readdirSync").mockImplementation(((file: fs.PathLike, ...rest: unknown[]) => {
     if (blocked(file)) throw eacces(file);
     return (readdir as (...args: unknown[]) => unknown)(file, ...rest);
@@ -166,7 +172,7 @@ describe("mesh writer census", () => {
     expect(result.unknown).not.toEqual([]);
     expect(result.unknown).toContainEqual(expect.objectContaining({ pid: process.pid, source: "lock-ticket", name }));
   });
-  it("deletes this host's record of a dead process", async () => {
+  it("removes this host's dead record on every platform", async () => {
     const mesh = root();
     const pid = deadPid();
     const file = writeRecord(mesh, { pid, host: os.hostname(), startedAt: ownStartedAt() });
@@ -268,7 +274,7 @@ describe("mesh writer census", () => {
   });
 
   it.each([
-    { label: "lock protocol 3", fields: { lockProtocol: 3 }, absent: "lockProtocol" },
+    { label: "lock protocol 4", fields: { lockProtocol: 4 }, absent: "lockProtocol" },
     { label: "lock protocol 0", fields: { lockProtocol: 0 }, absent: "lockProtocol" },
     { label: "a string lock protocol", fields: { lockProtocol: "2" }, absent: "lockProtocol" },
     { label: "an unsupported backend", fields: { stateBackend: "redis" }, absent: "stateBackend" },
@@ -291,7 +297,7 @@ describe("mesh writer census", () => {
   });
 
   it.each([
-    { label: "lock protocol 3", fields: { lockProtocol: 3 } },
+    { label: "lock protocol 4", fields: { lockProtocol: 4 } },
     { label: "an unsupported backend", fields: { stateBackend: "redis" } },
   ])("drops lease writer metadata with $label", async ({ fields }) => {
     const mesh = root();

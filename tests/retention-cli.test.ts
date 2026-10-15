@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { MESH_RETENTION_APPROVAL, MESH_RETENTION_HOLD, sweepMeshRetention, writeReport } from "../src/storage/retention-cli.js";
+import { MESH_RETENTION_APPLY_DISABLED_CODE, MESH_RETENTION_APPROVAL, MESH_RETENTION_HOLD, MeshRetentionApplyDisabledError, sweepMeshRetention, writeReport } from "../src/storage/retention-cli.js";
 import { pruneActorSessionBackups } from "../src/storage/retention.js";
 import { lockFile } from "../src/residency/file-lock.js";
 import { spawnSync } from "node:child_process";
@@ -30,8 +30,22 @@ const make = () => {
   }
   write(path.join(actor, "session.jsonl.20260927T150000000Z.bak"), "old");
   write(path.join(actor, "session.jsonl.20260928T150000000Z.bak"), "new");
+  // Rotation order is trusted data (smarty-dev#7916): mtimes follow the rotations, never one shared millisecond.
+  fs.utimesSync(path.join(actor, "session.jsonl.20260927T150000000Z.bak"), 1_000, 1_000);
+  fs.utimesSync(path.join(actor, "session.jsonl.20260928T150000000Z.bak"), 1_001, 1_001);
   write(path.join(actor, "session.jsonl"), "live");
+  // A valid, empty mesh state: --apply refuses on any doubt about state.json (smarty-dev#7916).
+  write(path.join(root, "state.json"), JSON.stringify({ format: 1, revisionFormat: 2, entries: {}, highWater: 0 }));
   return { root, host, actor };
+};
+/** smarty-dev#10678 (pi-fabric#1014 SEC P2-1): the public apply rejects at its boundary, typed, and changes nothing. */
+const applyRejects = async (root: string, options: { now?: number; runRetentionMs?: number } = {}) => {
+  const before = snapshot(root);
+  await expect(sweepMeshRetention(root, { ...options, dryRun: false })).rejects.toMatchObject({
+    name: "MeshRetentionApplyDisabledError", code: MESH_RETENTION_APPLY_DISABLED_CODE, message: expect.stringMatching(/smarty-dev#10678/),
+  });
+  await expect(sweepMeshRetention(root, { ...options, dryRun: false })).rejects.toBeInstanceOf(MeshRetentionApplyDisabledError);
+  expect(snapshot(root)).toEqual(before);
 };
 
 describe.skipIf(process.platform !== "linux")("offline retained mesh sweep", () => {
@@ -47,7 +61,9 @@ describe.skipIf(process.platform !== "linux")("offline retained mesh sweep", () 
       path.join(actor, "runs", "archive", "events.jsonl"),
       path.join(actor, "session.jsonl.20260927T150000000Z.bak"),
     ].sort());
-    // ponytail: the apply half (it changes exactly the plan) is disabled until smarty-dev#7916; re-enable there.
+    expect(plan.summary.applyRefusal).toBeUndefined();
+    await applyRejects(root, { now: 7 * 3600000 });
+    expect(fs.existsSync(path.join(actor, "session.jsonl.20260927T150000000Z.bak"))).toBe(true);
   });
 
   it("enumerates an owned actor registry larger than 1 MiB in a dry run without losing latest-run vetoes", async () => {
@@ -73,7 +89,6 @@ describe.skipIf(process.platform !== "linux")("offline retained mesh sweep", () 
       path.join(actor, "runs", "archive", "events.jsonl"),
       path.join(actor, "session.jsonl.20260927T150000000Z.bak"),
     ].sort());
-    // ponytail: the apply half is disabled until smarty-dev#7916; re-enable there.
     fs.mkdirSync(`${file}.lock`);
     const locked = snapshot(root);
     expect((await sweepMeshRetention(root, { now: 7 * 3600000, dryRun: true })).skipped).toEqual([
@@ -87,11 +102,11 @@ describe.skipIf(process.platform !== "linux")("offline retained mesh sweep", () 
     const unsafe = [path.join(host, "runs", "terminal"), path.join(actor, "runs", "archive")];
     for (const run of unsafe) write(path.join(run, "status.json"), JSON.stringify({ status: "completed", transport, finishedAt: 1, sessionId: "2147483647", exitCode: 0 }));
     const before = unsafe.map(run => ({ directoryMtime: fs.statSync(run).mtimeMs, tree: snapshot(run) }));
-    for (const dryRun of [true]) { // ponytail: apply disabled until smarty-dev#7916; re-enable `false` there.
-      const result = await sweepMeshRetention(root, { now: 7 * 3600000, dryRun });
-      expect(result.changes.filter(change => unsafe.some(run => change.path.startsWith(run + path.sep)))).toEqual([]);
-      expect(unsafe.map(run => ({ directoryMtime: fs.statSync(run).mtimeMs, tree: snapshot(run) }))).toEqual(before);
-    }
+    const result = await sweepMeshRetention(root, { now: 7 * 3600000, dryRun: true });
+    expect(result.changes.filter(change => unsafe.some(run => change.path.startsWith(run + path.sep)))).toEqual([]);
+    expect(unsafe.map(run => ({ directoryMtime: fs.statSync(run).mtimeMs, tree: snapshot(run) }))).toEqual(before);
+    await applyRejects(root, { now: 7 * 3600000 });
+    expect(unsafe.map(run => ({ directoryMtime: fs.statSync(run).mtimeMs, tree: snapshot(run) }))).toEqual(before);
   });
 
   it("does not displace a kernel-fenced holder even with stale dead-PID diagnostics", async () => {
@@ -118,29 +133,37 @@ describe.skipIf(process.platform !== "linux")("offline retained mesh sweep", () 
   });
 
   it("a host waiting for a root's lock wins that root mid-sweep (smarty-dev#7766)", async () => {
-    // ponytail: the "hold" case gates deletions only; apply disabled until smarty-dev#7916; re-enable it there.
-    for (const event of ["wake"] as ("hold" | "wake")[]) {
-      const { root, host } = make();
-      const runs = snapshot(path.join(host, "runs"));
-      // residentRunRetentionMs is read inside the dead root's fenced sweep, before its first deletion.
-      const options = { now: 30 * 86400000, dryRun: true, runRetentionMs: 7 * 86400000, get residentRunRetentionMs() {
-        if (event === "hold") write(path.join(root, MESH_RETENTION_HOLD), "{}");
-        // A waking host: flock(1) blocks on host.lock in the background, so /proc/locks lists a waiter.
-        else spawnSync("sh", ["-c", `flock -x -w 20 '${path.join(host, "host.lock")}' true </dev/null >/dev/null 2>&1 & sleep 0.3`]);
-        return 86400000;
-      } };
-      const result = await sweepMeshRetention(root, options);
-      // A hold stops every deletion; a waking host stops its own root's work. The mesh-wide actor pass is
-      // independent of host liveness by design (pi-fabric#645): it keeps its own registry fences.
-      expect(result.changes.filter(change => event === "hold" || change.path.startsWith(host)), event).toEqual([]);
-      expect(result.skipped.map(item => item.reason).join(" "), event).toMatch(event === "hold" ? /held/ : /host is waking/);
-      if (event === "hold") fs.unlinkSync(path.join(root, MESH_RETENTION_HOLD));
-      expect(snapshot(path.join(host, "runs")), event).toEqual(runs);
-    }
+    const { root, host } = make();
+    const runs = snapshot(path.join(host, "runs"));
+    // residentRunRetentionMs is read inside the dead root's fenced sweep, before its first deletion.
+    const options = { now: 30 * 86400000, dryRun: true, runRetentionMs: 7 * 86400000, get residentRunRetentionMs() {
+      // A waking host: flock(1) blocks on host.lock in the background, so /proc/locks lists a waiter.
+      spawnSync("sh", ["-c", `flock -x -w 20 '${path.join(host, "host.lock")}' true </dev/null >/dev/null 2>&1 & sleep 0.3`]);
+      return 86400000;
+    } };
+    const result = await sweepMeshRetention(root, options);
+    // A waking host stops its own root's work. The mesh-wide actor pass is independent of host liveness by design
+    // (pi-fabric#645): it keeps its own registry fences.
+    expect(result.changes.filter(change => change.path.startsWith(host))).toEqual([]);
+    expect(result.skipped.map(item => item.reason).join(" ")).toMatch(/host is waking/);
+    expect(snapshot(path.join(host, "runs"))).toEqual(runs);
   });
 
-  // ponytail: apply disabled until smarty-dev#7916; re-enable there.
-  it.skip("reads the epoch approval only from our own regular file, never through a link", async () => {
+  it("a hold landing mid-sweep cannot be reached by apply: it rejects before arming the seam (smarty-dev#10678)", async () => {
+    const { root } = make();
+    let armed = false;
+    // The former mid-sweep hold seam: never read, because apply rejects before the sweep starts.
+    const options = { now: 30 * 86400000, dryRun: false, runRetentionMs: 7 * 86400000, get residentRunRetentionMs() {
+      armed = true; write(path.join(root, MESH_RETENTION_HOLD), "{}"); return 86400000;
+    } };
+    const before = snapshot(root);
+    await expect(sweepMeshRetention(root, options))
+      .rejects.toBeInstanceOf(MeshRetentionApplyDisabledError);
+    expect(armed).toBe(false);
+    expect(snapshot(root)).toEqual(before);
+  });
+
+  it("reads the epoch approval only from our own regular file, never through a link", async () => {
     const { root } = make();
     write(path.join(root, "state.json"), JSON.stringify({ format: "sqlite", movedTo: "state.db", backend: "sqlite", epoch: 3, at: "2026-10-09T15:29:19.869Z" }));
     write(path.join(root, "state.db"), "");
@@ -148,13 +171,16 @@ describe.skipIf(process.platform !== "linux")("offline retained mesh sweep", () 
     write(path.join(elsewhere, "ok.json"), JSON.stringify({ epoch: 3 }));
     fs.symlinkSync(path.join(elsewhere, "ok.json"), path.join(root, MESH_RETENTION_APPROVAL));
     const before = snapshot(root);
-    const options = { now: 30 * 86400000, dryRun: false, runRetentionMs: 7 * 86400000 };
-    expect((await sweepMeshRetention(root, options)).skipped).toEqual([{ path: root, reason: expect.stringMatching(/ruling/) }]);
+    // The gate is reported by the dry run's summary; the public apply rejects before it (smarty-dev#10678).
+    const options = { now: 30 * 86400000, dryRun: true, runRetentionMs: 7 * 86400000 };
+    expect((await sweepMeshRetention(root, options)).summary.applyRefusal).toMatch(/ruling/);
     expect(snapshot(root)).toEqual(before);
+    await applyRejects(root, options);
     fs.unlinkSync(path.join(root, MESH_RETENTION_APPROVAL));
     write(path.join(root, MESH_RETENTION_APPROVAL), JSON.stringify({ epoch: 3 }));
     fs.chmodSync(path.join(root, MESH_RETENTION_APPROVAL), 0o666);
-    expect((await sweepMeshRetention(root, options)).skipped).toEqual([{ path: root, reason: expect.stringMatching(/ruling/) }]);
+    expect((await sweepMeshRetention(root, options)).summary.applyRefusal).toMatch(/ruling/);
+    await applyRejects(root, options);
   });
 
   it("writes the report atomically without following a link", () => {
@@ -182,8 +208,7 @@ describe.skipIf(process.platform !== "linux")("offline retained mesh sweep", () 
     expect(fs.readdirSync(dir).filter(name => name.endsWith(".bak"))).toHaveLength(3);
   });
 
-  // ponytail: apply disabled until smarty-dev#7916; re-enable there.
-  it.skip("never accepts an approval whose owner cannot be proven (smarty-dev#7766)", async () => {
+  it("never accepts an approval whose owner cannot be proven (smarty-dev#7766)", async () => {
     // No getuid (Windows): even our own private approval naming the right epoch is refused.
     const { root } = make();
     write(path.join(root, "state.json"), JSON.stringify({ format: "sqlite", movedTo: "state.db", backend: "sqlite", epoch: 3, at: "2026-10-09T15:29:19.869Z" }));
@@ -197,51 +222,63 @@ describe.skipIf(process.platform !== "linux")("offline retained mesh sweep", () 
     Object.defineProperty(process, "getuid", { value: undefined, configurable: true, writable: true });
     try {
       for (const where of [root, plain]) {
-        const result = await sweepMeshRetention(where, { now: 30 * 86400000, dryRun: false, runRetentionMs: 7 * 86400000 });
-        expect(result.changes, where).toEqual([]);
-        expect(result.skipped, where).toEqual([{ path: where, reason: expect.stringMatching(/ownership cannot be proven/) }]);
+        // The gate is reported by the dry run's summary; the public apply rejects before it (smarty-dev#10678).
+        const result = await sweepMeshRetention(where, { now: 30 * 86400000, dryRun: true, runRetentionMs: 7 * 86400000 });
+        expect(result.summary.applyRefusal, where).toMatch(/ownership cannot be proven/);
+        await applyRejects(where, { now: 30 * 86400000, runRetentionMs: 7 * 86400000 });
       }
       expect(snapshot(plain)).toEqual(before);
     } finally { Object.defineProperty(process, "getuid", { value: getuid, configurable: true, writable: true }); }
   });
 
-  // ponytail: apply disabled until smarty-dev#7916; re-enable there.
-  it.skip("deletes nothing under an operator hold or after a backend switch until a ruling names the new epoch (smarty-dev#7766)", async () => {
+  it("deletes nothing under an operator hold or after a backend switch until a ruling names the new epoch (smarty-dev#7766)", async () => {
     const { root } = make();
-    const options = { now: 30 * 86400000, dryRun: false, runRetentionMs: 7 * 86400000 };
+    // Each gate is reported by the dry run's summary; the public apply rejects before any of them (smarty-dev#10678).
+    const options = { now: 30 * 86400000, dryRun: true, runRetentionMs: 7 * 86400000 };
     write(path.join(root, MESH_RETENTION_HOLD), "{}");
     let before = snapshot(root);
-    expect((await sweepMeshRetention(root, options)).skipped).toEqual([{ path: root, reason: expect.stringMatching(/held/) }]);
+    expect((await sweepMeshRetention(root, options)).summary.applyRefusal).toMatch(/held/);
     expect(snapshot(root)).toEqual(before);
+    await applyRejects(root, options);
     fs.unlinkSync(path.join(root, MESH_RETENTION_HOLD));
     write(path.join(root, "state.json"), JSON.stringify({ format: "sqlite", movedTo: "state.db", backend: "sqlite", epoch: 3, at: "2026-10-09T15:29:19.869Z" }));
     write(path.join(root, "state.db"), "");
     write(path.join(root, MESH_RETENTION_APPROVAL), JSON.stringify({ epoch: 2 }));
     before = snapshot(root);
-    expect((await sweepMeshRetention(root, options)).skipped).toEqual([{ path: root, reason: expect.stringMatching(/epoch 3.*ruling/) }]);
+    const switched = await sweepMeshRetention(root, options);
+    expect(switched.summary.applyRefusal).toMatch(/epoch 3.*ruling/);
+    expect(switched.changes.length).toBeGreaterThan(0);
     expect(snapshot(root)).toEqual(before);
-    expect((await sweepMeshRetention(root, { ...options, dryRun: true })).changes.length).toBeGreaterThan(0);
+    await applyRejects(root, options);
     write(path.join(root, MESH_RETENTION_APPROVAL), JSON.stringify({ epoch: 3 }));
-    expect((await sweepMeshRetention(root, options)).changes.length).toBeGreaterThan(0);
+    const approved = await sweepMeshRetention(root, options);
+    expect(approved.summary.applyRefusal).toBeUndefined();
+    expect(approved.changes.length).toBeGreaterThan(0);
+    // Even with every gate open, the public apply stays refused until smarty-dev#10678.
+    await applyRejects(root, options);
   });
 
-  it("--apply is disabled: the CLI exits 2 before touching the mesh, and the hourly ActorManager sweep is a dry run (smarty-dev#7916)", () => {
-    const { root } = make();
-    write(path.join(root, MESH_RETENTION_APPROVAL), JSON.stringify({ epoch: 3 }));
-    const before = snapshot(root);
+  it("--apply refuses until #10678 and changes nothing; the dry run previews and the daily sweep only reports (smarty-dev#7916)", () => {
+    const { root, actor } = make();
     const cli = path.resolve("src/storage/retention-cli.ts");
     const runner = `const { createJiti } = require("jiti"); const { pathToFileURL } = require("node:url");
 process.argv = [process.argv[0], ${JSON.stringify(cli)}, ...process.argv.slice(1)];
 createJiti(pathToFileURL(process.cwd() + "/index.js").href).import(${JSON.stringify(cli)}).catch(error => { console.error(error); process.exitCode = 1; });`;
-    for (const args of [[root, "--apply"], [root, "--apply", "--runs-older-than", String(7 * 86400000), "--report", path.join(root, "report.json")]]) {
-      const result = spawnSync(process.execPath, ["-e", runner, ...args], { encoding: "utf8", timeout: 60_000 });
-      expect(result.status, result.stderr).toBe(2);
-      expect(result.stderr).toContain("retention --apply is disabled until smarty-dev#7916 (verified-inode deletion); run --dry-run");
-      expect(snapshot(root)).toEqual(before);
-    }
+    const old = path.join(actor, "session.jsonl.20260927T150000000Z.bak");
+    const report = path.join(root, "report.json");
+    const dry = spawnSync(process.execPath, ["-e", runner, root, "--dry-run", "--report", report], { encoding: "utf8", timeout: 60_000 });
+    expect(dry.status, dry.stderr).toBe(0);
+    expect(dry.stderr).toMatch(/^pruneActorSessionBackups: would delete 1 \(3 bytes\), refused 0$/m);
+    expect(dry.stderr).toMatch(/^WOULD_FREE_GIB=\d+\.\d{3}$/m);
+    expect(fs.existsSync(old)).toBe(true);
+    const prior = fs.readFileSync(report, "utf8");
+    const result = spawnSync(process.execPath, ["-e", runner, root, "--apply", "--report", report], { encoding: "utf8", timeout: 60_000 });
+    expect(result.status, result.stderr).toBe(2);
+    expect(result.stderr).toMatch(/--apply is disabled until smarty-dev#10678/);
+    expect(fs.readFileSync(report, "utf8")).toBe(prior);
+    expect(fs.existsSync(old)).toBe(true);
     const argv = meshRetentionSweepArgs(root, 7 * 86400000);
     expect(argv).toEqual([root, "--dry-run", "--runs-older-than", String(7 * 86400000), "--report", path.join(root, ".mesh-retention-report.json")]);
-    expect(argv).not.toContain("--apply");
   });
 
   it("refuses ambiguous identities and linked actor-reference trees without changing them", async () => {

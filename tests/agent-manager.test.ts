@@ -316,6 +316,29 @@ describe("Agent prompt retention (#11663)", () => {
 });
 
 describe("AgentManager fleet model admission (#2490)", () => {
+  it("refuses a concrete denied model before cancellation and still aborts an allowed model", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-policy-aborted-"));
+    roots.push(root);
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, runner: "pi", budgetUsd: 0, deniedModels: ["provider/blocked"] }, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root,
+    });
+    managers.push(manager);
+    const controller = new AbortController();
+    controller.abort();
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    try {
+      await expect(manager.spawn({ task: "denied before cancellation", model: "provider/blocked", transport: "process" }, controller.signal))
+        .rejects.toMatchObject({ name: "FabricModelDeniedError", code: "FABRIC_MODEL_DENIED", model: "provider/blocked" });
+      expect(manager.list()).toEqual([]);
+      expect(fs.readdirSync(root)).toEqual([]);
+      await expect(manager.spawn({ task: "allowed but cancelled", model: "provider/allowed", transport: "process" }, controller.signal))
+        .rejects.toThrow("Operation aborted");
+      expect(manager.list()).toEqual([]);
+      expect(fs.readdirSync(root)).toEqual([]);
+      expect(launch).not.toHaveBeenCalled();
+    } finally { launch.mockRestore(); }
+  });
+
   it.each([
     ["veda", "backend-shortcut", "explicit"],
     ["veda", "veda/gpt-6-astra", "configured"],

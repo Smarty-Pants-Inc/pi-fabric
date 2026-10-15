@@ -1294,18 +1294,18 @@ export class ActorManager {
     const requestedReason = request.modelReason ?? request.opusReason;
     request = { ...request, ...(requestedReason !== undefined ? { modelReason: requestedReason } : {}) };
     delete request.opusReason;
-    const admitted = await this.#resolvedRunBindingFor(runner, {
+    const admittedBinding = await this.#resolvedRunBindingFor(runner, {
       model: requestedModel || this.agents.defaultModel(runner), modelReason: request.modelReason,
       thinking: request.thinking, modelPolicyOriginalModel: request.modelPolicyOriginalModel,
       modelSource: request.modelSource ?? (request.routeClass !== undefined ? "route" : requestedModel ? "explicit" : "default"),
     }, request.routeClass !== undefined, false, `actor:${name}`);
-    const admittedModel = admitted.model;
+    const admittedModel = admittedBinding.model;
     // Unchanged defaults stay dynamic; a substituted target/thinking must travel together.
-    const model = requestedModel || admitted.modelPolicyOriginalModel ? admittedModel : undefined;
+    const model = requestedModel || admittedBinding.modelPolicyOriginalModel ? admittedModel : undefined;
     request = { ...request,
-      ...(admitted.thinking ? { thinking: admitted.thinking } : {}),
-      ...(admitted.modelPolicyOriginalModel ? { modelPolicyOriginalModel: admitted.modelPolicyOriginalModel } : {}) };
-    if (admitted.modelReason !== undefined) request.modelReason = admitted.modelReason;
+      ...(admittedBinding.thinking ? { thinking: admittedBinding.thinking } : {}),
+      ...(admittedBinding.modelPolicyOriginalModel ? { modelPolicyOriginalModel: admittedBinding.modelPolicyOriginalModel } : {}) };
+    if (admittedBinding.modelReason !== undefined) request.modelReason = admittedBinding.modelReason;
     else delete request.modelReason;
     const requirements = normalizeCapabilityRequirements(request.requires);
     if (requirements.length > 0 && !this.#acquireCapabilityView) {

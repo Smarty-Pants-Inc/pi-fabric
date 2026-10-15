@@ -2687,6 +2687,76 @@ describe("ParticipantDirectory default lease cadence (smarty-dev#11172)", () => 
     }, 15_000);
   }
 
+  it.each(["file", "sqlite"] as const)("does not turn unrelated %s commits into idle refreshes or compatibility timers", async backend => {
+    const { mesh, directory } = fixture("no-old-reader", backend);
+    const other = new MeshStore(mesh.root, 64 * 1024, 1_000, { stateBackend: backend });
+    const timeouts = vi.spyOn(globalThis, "setTimeout");
+    const intervals = vi.spyOn(globalThis, "setInterval");
+    try {
+      await directory.start();
+      const before = mesh.get("sessions/no-old-reader", { fresh: true });
+      const scheduled = vi.spyOn(directory, "refresh");
+      const tokens = vi.spyOn(mesh, "stateToken");
+      await other.put({ key: "unrelated/join-control", identity: identityOf("writer"), value: { changed: true } });
+      await vi.waitFor(() => expect(tokens).toHaveBeenCalled(), { timeout: 5_000, interval: 20 });
+      await new Promise(resolve => setTimeout(resolve, 100));
+      expect(scheduled).not.toHaveBeenCalled();
+      expect(timeouts.mock.calls.filter(([, ms]) => ms === 5_000)).toHaveLength(0);
+      expect(intervals.mock.calls.map(([, ms]) => ms)).toEqual([60_000]);
+      expect(mesh.get("sessions/no-old-reader", { fresh: true })).toEqual(before);
+    } finally {
+      timeouts.mockRestore();
+      intervals.mockRestore();
+      if (backend === "sqlite") other.closeState();
+    }
+  });
+
+  // The join wake can share an idle refresh whose preparation still saw no old reader.
+  // Its post-confirmation read must carry BOTH the session renewal and compatibility deadline.
+  it.each(["file", "sqlite"] as const)("keeps the join deadline when the %s commit wake joins an in-flight confirmation", async backend => {
+    const { mesh, directory } = fixture("confirm-join", backend);
+    const other = new MeshStore(mesh.root, 64 * 1024, 1_000, { stateBackend: backend });
+    let now = Date.now();
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+    const timeouts = vi.spyOn(globalThis, "setTimeout");
+    const legacyTicks = () => timeouts.mock.calls.filter(([, ms]) => ms === 5_000).length;
+    let release!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    let entered!: () => void;
+    const confirming = new Promise<void>(resolve => { entered = resolve; });
+    const confirm = mesh.confirmWritable.bind(mesh);
+    let refreshing: Promise<void> | undefined;
+    try {
+      await directory.start();
+      now += 30_000;
+      vi.spyOn(mesh, "confirmWritable").mockImplementationOnce(async callback => {
+        entered();
+        await held;
+        await confirm(callback);
+      });
+      refreshing = directory.refresh();
+      await confirming;
+      const scheduled = vi.spyOn(directory, "refresh");
+      await addStateOnlyReader(other, now);
+      await vi.waitFor(() => expect(scheduled).toHaveBeenCalledTimes(1), { timeout: 5_000, interval: 20 });
+      release();
+      await refreshing;
+      await vi.waitFor(() => {
+        expect(mesh.get("sessions/confirm-join", { fresh: true })!.updatedAt).toBe(now);
+        expect(legacyTicks()).toBe(1);
+      }, { timeout: 1_000, interval: 20 });
+      await new Promise(resolve => setTimeout(resolve, 100));
+      expect(scheduled).toHaveBeenCalledTimes(1); // own publication does not wake another refresh
+      expect(legacyTicks()).toBe(1);
+    } finally {
+      release();
+      await refreshing;
+      clock.mockRestore();
+      timeouts.mockRestore();
+      if (backend === "sqlite") other.closeState();
+    }
+  });
+
   it("control: without the root watch the joining reader waits for the heartbeat (the watch is the carrier)", async () => {
     const { mesh, directory } = fixture("unwatched");
     const other = new MeshStore(mesh.root, 64 * 1024, 1_000);

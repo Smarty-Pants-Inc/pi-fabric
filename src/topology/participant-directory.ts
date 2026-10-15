@@ -2808,7 +2808,14 @@ export class ParticipantDirectory implements FabricParticipantSource {
             JSON.stringify(host.identity) === JSON.stringify(this.options.identity) &&
             host.incarnationToken === this.#incarnationToken;
           if (!hostValid) return { skip: false, host: true, session: false };
-          if (!this.#legacyRenewalsRequired(leaseAt, snapshot)) return { skip: true, host: false, session: false };
+          const legacyRequired = this.#legacyRenewalsRequired(leaseAt, snapshot);
+          // A join wake may share this in-flight heartbeat after preparation saw no old reader.
+          // Carry the post-confirmation answer into its cadence too, not just the state renewal:
+          // the wake has already spent its false-to-true edge and will not refresh us again.
+          this.#legacyCadenceUntil = legacyPut && legacyRequired
+            ? this.#legacyRenewals?.until ?? leaseAt + PARTICIPANT_LEASE_MS : undefined;
+          this.#joinWakeRequired = legacyRequired;
+          if (!legacyRequired) return { skip: true, host: false, session: false };
           const legacy = root && legacySessionKey ? this.mesh.get(legacySessionKey, read) : undefined;
           // The host retains its configured policy cadence (10 min under hostLeases: files).
           const hostDue = hostPolicyFilesOnly

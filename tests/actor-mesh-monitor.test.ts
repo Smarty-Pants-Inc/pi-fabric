@@ -95,7 +95,7 @@ describe("ActorMeshMonitor", () => {
     expect(s.mesh.latestOffset).toHaveBeenCalledOnce(); // no log-derived stamp
   });
 
-  it("falls back to actorPollMs polling when a healthy watch closes on its own", async () => {
+  it("falls back no faster than once a minute when a healthy watch closes on its own", async () => {
     const s = setup();
     vi.spyOn(console, "warn").mockImplementation(() => {});
     s.mesh.tail.mockReturnValue({ events: [], nextOffset: 10 });
@@ -105,8 +105,10 @@ describe("ActorMeshMonitor", () => {
     await flush();
     expect(vi.getTimerCount()).toBe(1);
     const count = s.mesh.tail.mock.calls.length;
-    await vi.advanceTimersByTimeAsync(50);
-    expect(s.mesh.tail).toHaveBeenCalledTimes(count + 1); // unhealthy: forced poll at actorPollMs
+    await vi.advanceTimersByTimeAsync(59_999);
+    expect(s.mesh.tail).toHaveBeenCalledTimes(count);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(s.mesh.tail).toHaveBeenCalledTimes(count + 1); // no event carrier: one-minute recovery
     s.monitor.close();
     expect(vi.getTimerCount()).toBe(0);
   });
@@ -386,13 +388,13 @@ describe("ActorMeshMonitor", () => {
     expect(s.watcher.close).toHaveBeenCalledOnce();
     expect(vi.getTimerCount()).toBe(1); // replaces, never adds to, the safety timer
     const count = s.mesh.tail.mock.calls.length;
-    // With a broken watch, even an unchanged stamp must retain the old poll contract.
-    await vi.advanceTimersByTimeAsync(49);
+    // No event carrier: recover even an unchanged stamp, but never faster than once a minute.
+    await vi.advanceTimersByTimeAsync(59_999);
     expect(s.mesh.tail).toHaveBeenCalledTimes(count);
     await vi.advanceTimersByTimeAsync(1);
     expect(s.mesh.tail).toHaveBeenCalledTimes(count + 1);
     fs.appendFileSync(path.join(s.root, "events.jsonl"), "changed\n");
-    await vi.advanceTimersByTimeAsync(50);
+    await vi.advanceTimersByTimeAsync(60_000);
     expect(s.mesh.tail).toHaveBeenCalledTimes(count + 2);
     s.monitor.schedule();
     s.monitor.close();
@@ -524,12 +526,12 @@ describe("ActorMeshMonitor", () => {
     await flush();
     expect(fs.watch).toHaveBeenCalledOnce();
     expect(s.mesh.tail).toHaveBeenCalledExactlyOnceWith(10, 7);
-    await vi.advanceTimersByTimeAsync(49);
+    await vi.advanceTimersByTimeAsync(59_999);
     expect(s.mesh.tail).toHaveBeenCalledTimes(1);
     await vi.advanceTimersByTimeAsync(1);
     expect(s.mesh.tail).toHaveBeenCalledTimes(2);
     fs.appendFileSync(path.join(s.root, "events.jsonl"), "changed\n");
-    await vi.advanceTimersByTimeAsync(50);
+    await vi.advanceTimersByTimeAsync(60_000);
     expect(s.mesh.tail).toHaveBeenCalledTimes(3);
     expect(vi.getTimerCount()).toBe(1);
   });

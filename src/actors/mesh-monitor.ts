@@ -9,6 +9,8 @@ import { meshCursorAtStart, meshCursorGeneration, type MeshEvent, type MeshStore
 const CURSOR_CHECKPOINT_MS = 10_000;
 // One-shot retry after a failed/deferred poll (lock timeout, dispatch throw); never armed while idle.
 const MESH_MONITOR_RETRY_MS = 5_000;
+// No notification carrier: bounded recovery only, never a fast idle loop.
+const MESH_MONITOR_FALLBACK_MS = 60_000;
 type MonitorCursor = { cursor: number; last?: { sequence: number; id: string } };
 /**
  * Work topics (smarty-dev#754 §3.2 step 3): agent-to-agent acks, asks, handoffs. They are
@@ -119,7 +121,7 @@ export class ActorMeshMonitor {
       // An unsupported watch (including a missing directory) takes the fallback.
       // ENOSPC here is the inotify watch limit (smarty-dev#5247), not a full disk: poll instead
       // and say so once, so nobody hunts for free space and the session never crashes.
-      warnWatchFallback("actor mesh monitor", this.mesh.root, error, this.config.actorPollMs);
+      warnWatchFallback("actor mesh monitor", this.mesh.root, error, Math.max(MESH_MONITOR_FALLBACK_MS, this.config.actorPollMs));
     }
     // smarty-dev#11172: a healthy watch has no idle timer; only a failed watch polls.
     if (!this.#watcher) this.#startSafetyNet();
@@ -172,6 +174,12 @@ export class ActorMeshMonitor {
   /** Explicit delivery/resume/queue-capacity wake; never delayed by watch traffic. */
   schedule(): void { this.#schedule(true); }
 
+  /** Ownership/registry hints must run beforePoll even when the event log is unchanged. */
+  maintain(): void { this.#schedule(false, true); }
+
+  /** A required notification carrier failed; recover at most once a minute. */
+  watchUnavailable(): void { this.#startSafetyNet(); this.maintain(); }
+
   #schedule(explicit = false, maintenance = false): void {
     if (this.#closed || !this.config.enabled) return;
     this.#wakePending = true;
@@ -204,7 +212,7 @@ export class ActorMeshMonitor {
 
   #fallback(watcher: FSWatcher, error: unknown): void {
     if (this.#closed || this.#watcher !== watcher) return;
-    warnWatchFallback("actor mesh monitor", this.mesh.root, error, this.config.actorPollMs);
+    warnWatchFallback("actor mesh monitor", this.mesh.root, error, Math.max(MESH_MONITOR_FALLBACK_MS, this.config.actorPollMs));
     watcher.close();
     this.#watcher = undefined;
     this.#startSafetyNet();
@@ -230,10 +238,10 @@ export class ActorMeshMonitor {
   #startSafetyNet(): void {
     if (this.#safetyNetTimer) clearInterval(this.#safetyNetTimer);
     // ponytail: keep one bounded timer, not a watcher-retry subsystem. ONLY a
-    // failed/unsupported/closed watch runs it, restoring the pre-event-driven
-    // actorPollMs polling contract. Healthy watches rely on watch edges, explicit
-    // schedule() wakes and the due timer (smarty-dev#11172).
-    this.#safetyNetTimer = setInterval(() => this.#schedule(true, true), this.config.actorPollMs);
+    // failed/unsupported/closed watch runs it: without a notification carrier,
+    // one-minute recovery bounds missed work without restoring fast idle polling.
+    // Healthy watches rely on edges, explicit wakes and owed-work deadlines.
+    this.#safetyNetTimer = setInterval(() => this.#schedule(true, true), Math.max(MESH_MONITOR_FALLBACK_MS, this.config.actorPollMs));
     this.#safetyNetTimer.unref();
   }
 
@@ -255,8 +263,8 @@ export class ActorMeshMonitor {
     const stamp = this.#meshStamp();
     const unchanged = !this.#needsPoll && stamp !== undefined && stamp === this.#stamp;
     if (!explicit && !maintenance && unchanged) return;
-    // The safety net also retains the manager's registry/ownership/filter/child-result
-    // recovery obligations, even with a quiet log. It does not reread that log.
+    // Ownership/registry notifications (or degraded-watch recovery) retain the
+    // manager's maintenance obligations even with a quiet, unchanged event log.
     if (!this.callbacks.beforePoll() || !this.#mayAdmit()) {
       this.#needsPoll = true;
       return;

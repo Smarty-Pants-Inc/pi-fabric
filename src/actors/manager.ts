@@ -7,6 +7,7 @@ import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import { readPiSessionHeader } from "../core/pi-session-header.js";
 import { ActorMeshMonitor } from "./mesh-monitor.js";
+import { watchBridgeStore } from "../mesh/change-notifier.js";
 import { ActorSessionResetCancelledError } from "./session-reset-error.js";
 import { MeshBackgroundQueue, MeshBackgroundRetry, ownProcessIncarnation } from "../core/atomic-write.js";
 import { prepareParticipantFileLock, withParticipantFileTryLock } from "../topology/participant-files.js";
@@ -796,6 +797,8 @@ export class ActorManager {
   readonly #project: string | undefined;
   readonly #role: string | undefined;
   readonly #meshMonitor: ActorMeshMonitor;
+  readonly #ownershipWatchCloses: Array<() => void> = [];
+  #ownershipRecoveryTimer: NodeJS.Timeout | undefined;
   readonly #records = new Map<string, ActorRecords>();
   readonly #relayParticipantSteering: boolean;
   readonly #deadSessionReap: boolean | { deadAfterMs: number };
@@ -1105,6 +1108,7 @@ export class ActorManager {
       },
     });
     this.#meshMonitor.start();
+    if (this.#persistent && meshConfig.enabled && this.#canManageActor) this.#watchOwnership();
     this.#presenceRetryMs = options.presenceRetryMs ?? PRESENCE_RETRY_MS;
     this.#meshOutageAlarmMs = options.meshOutageAlarmMs;
     this.#preparationTimeoutMs = Math.max(1, options.preparationTimeoutMs ?? ACTOR_PREPARATION_TIMEOUT_MS);
@@ -1117,6 +1121,59 @@ export class ActorManager {
       this.#reapOrphanPresence();
     }, 0);
     this.#orphanPresenceTimer.unref();
+  }
+
+  /** Accepted backlog has passed the event cursor. Registry close/claim writes and owner
+   * lease/presence/state changes must therefore wake ownership independently of that log.
+   * These are hints only: beforePoll and the adoption commit still recheck fresh authority. */
+  #watchOwnership(): void {
+    const wake = (): void => this.#meshMonitor.maintain();
+    const failed = (error: unknown): void => {
+      if (this.#closing) return;
+      console.warn(`[pi-fabric] actor ownership notifications unavailable; recovering once a minute: ${errorText(error)}`);
+      this.#meshMonitor.watchUnavailable();
+    };
+    try {
+      this.#ownershipWatchCloses.push(watchBridgeStore(this.mesh.root, kind => {
+        if (kind !== "events") wake();
+      }, failed));
+    } catch (error) { failed(error); }
+    try {
+      // Watch the parent: atomic actors.json replacements must not detach observation.
+      fs.mkdirSync(this.#actorRoot, { recursive: true });
+      const watcher = fs.watch(this.#actorRoot, { persistent: false }, (_event, name) => {
+        if (name === null || String(name) === "actors.json") wake();
+      });
+      watcher.on("error", error => { watcher.close(); failed(error); });
+      watcher.on("close", () => failed(new Error("actor registry watch closed")));
+      this.#ownershipWatchCloses.push(() => watcher.close());
+    } catch (error) { failed(error); }
+    // NATS has no local state-file edge; its applied-projection notification is the carrier.
+    try { this.#ownershipWatchCloses.push(this.mesh.subscribeStateChanges(wake)); }
+    catch (error) { failed(error); }
+    // Subscribe before rereading: cover changes between construction and watch registration.
+    this.#armOwnershipRecovery();
+    wake();
+  }
+
+  #armOwnershipRecovery(): void {
+    // A crash emits no file edge, and lineageAlive exposes neither a death subscription nor
+    // a lease deadline. Only adoption-eligible foreign lineages need this <=1/min safety net.
+    const waiting = this.#persistent && !!this.#canManageActor && !this.#closing &&
+      [...this.#actors.values()].some(actor => actor.rootId !== this.#rootId &&
+        actor.residency === this.#claimResidency &&
+        (actor.project === undefined || actor.project === this.#project && this.#role === "project-agent"));
+    if (!waiting && this.#ownershipRecoveryTimer) {
+      clearInterval(this.#ownershipRecoveryTimer);
+      this.#ownershipRecoveryTimer = undefined;
+    }
+    if (waiting && !this.#ownershipRecoveryTimer) {
+      this.#ownershipRecoveryTimer = setInterval(() => {
+        this.#armOwnershipRecovery();
+        if (this.#ownershipRecoveryTimer) this.#meshMonitor.maintain();
+      }, 60_000);
+      this.#ownershipRecoveryTimer.unref();
+    }
   }
 
   subscribe(listener: () => void): () => void {
@@ -3475,6 +3532,9 @@ export class ActorManager {
   }
 
   async #close(): Promise<void> {
+    if (this.#ownershipRecoveryTimer) clearInterval(this.#ownershipRecoveryTimer);
+    this.#ownershipRecoveryTimer = undefined;
+    for (const close of this.#ownershipWatchCloses.splice(0)) close();
     this.#meshMonitor.close();
     // Join native watch closes before any owned file can be released.
     const watches = [...this.#childCompletionWatches.values()];
@@ -7999,6 +8059,7 @@ export class ActorManager {
       }
       if (!next) this.#maybeAdoptOrphan(actor);
     }
+    this.#armOwnershipRecovery();
     if (!acquired || !this.#persistent || this.#closing) {
       if (acquired && !this.#closing) queueMicrotask(() => this.#resumeSettledWindows());
       this.#scheduleRestoreParked();

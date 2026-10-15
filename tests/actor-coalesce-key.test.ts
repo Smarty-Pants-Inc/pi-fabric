@@ -18,14 +18,14 @@ afterEach(async () => {
 const identity: MeshIdentity = { id: "session:test", name: "main", kind: "main", sessionId: "test" };
 const from: MeshIdentity = { id: "session:forwarder", name: "forwarder", kind: "main", sessionId: "forwarder" };
 
-const setup = (root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-coalesce-key-"))) => {
+const setup = (root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-coalesce-key-")), canConsumeMesh?: () => boolean) => {
   if (!roots.includes(root)) roots.push(root);
   const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
   const agents = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
     workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(root, "runs"),
   });
   const actors = new ActorManager("test", identity, mesh, { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 }, agents, () => {}, {
-    actorRoot: path.join(root, "actors"), persistent: true,
+    actorRoot: path.join(root, "actors"), persistent: true, ...(canConsumeMesh ? { canConsumeMesh } : {}),
   });
   closers.push(async () => { await actors.close(); await agents.close(); });
   return { root, mesh, agents, actors };
@@ -116,6 +116,78 @@ describe("actor setTopics", () => {
       expect(queue()[0].items).toEqual([]);
       expect(queue()[0].processedKeys).toHaveLength(5);
     } finally {
+      fs.writeFileSync(release, "finish");
+    }
+  }, 30_000);
+
+  // #1209 review P2: reconnect/log replacement must retain the admission boundary,
+  // not refresh subscriptions by moving the cursor or reconsidering accepted work.
+  it("delivers admitted old and new topic events once across a cutover and mesh reconnect", async () => {
+    let connected = true;
+    const { root, mesh, actors } = setup(undefined, () => connected);
+    const oldTopic = "topics.before-reconnect";
+    const newTopic = "topics.after-reconnect";
+    const actor = await actors.create({
+      name: "topics-reconnect", instructions: "Work.", topics: [oldTopic], coalesce: false,
+    });
+    const release = path.join(root, "release-topics-reconnect");
+    const queuedIds = () => fs.readdirSync(path.join(root, "actors", actor.id))
+      .filter(name => /^queue-.+\.json$/.test(name))
+      .flatMap(name => JSON.parse(fs.readFileSync(path.join(root, "actors", actor.id, name), "utf8"))
+        .items.map((item: { payload: { id: string } }) => item.payload.id));
+    const completed = () => actors.messages(actor.id).filter(message => message.direction === "out" && !message.error);
+    const publish = (topic: string, text: string) => mesh.publish({ topic, from, text });
+    try {
+      const a = await mesh.publish({ topic: oldTopic, from, text: "reconnect-event-A", data: { fakeWorkerFinishGate: release } });
+      await waitFor(() => fs.existsSync(`${release}.entered`) && actors.status(actor.id).inFlightRun !== undefined);
+      const inFlight = actors.status(actor.id).inFlightRun!;
+      expect(queuedIds()).toEqual([a.id]); // A matched and was durably admitted before the cutover.
+
+      connected = false; // Hold monitor admission while the hub's local projection reconnects.
+      expect((await actors.setTopics(actor.id, [newTopic])).topics).toEqual([newTopic]);
+      const removedDuringGap = await publish(oldTopic, "reconnect-removed-during-gap");
+      const b = await publish(newTopic, "reconnect-event-B");
+      expect(queuedIds()).toEqual([a.id]); // B is published, but not yet consumed.
+
+      // Same native-watch reconnect seam as actor-mesh-monitor.test.ts: atomically
+      // replace the projected log and generation, without restarting the manager.
+      const events = path.join(mesh.root, "events.jsonl");
+      fs.writeFileSync(`${events}.tmp`, fs.readFileSync(events));
+      fs.renameSync(`${events}.tmp`, events);
+      const generation = path.join(mesh.root, "generation");
+      fs.writeFileSync(`${generation}.tmp`, String(Number(fs.existsSync(generation) ? fs.readFileSync(generation, "utf8") : 0) + 1));
+      connected = true;
+      fs.renameSync(`${generation}.tmp`, generation); // A real watch edge wakes the existing monitor.
+      await waitFor(() => actors.status(actor.id).queued === 1);
+      expect(queuedIds()).toEqual([a.id, b.id]);
+      expect(actors.status(actor.id).inFlightRun).toMatchObject({ id: inFlight.id, startedAt: inFlight.startedAt });
+      expect(actors.status(actor.id).topics).toEqual([newTopic]);
+      expect(new ActorRegistryStore(path.join(root, "actors")).snapshot().actors.find(row => row.id === actor.id)?.topics).toEqual([newTopic]);
+
+      const removedAfterReconnect = await publish(oldTopic, "reconnect-removed-after-reconnect");
+      const c = await publish(newTopic, "reconnect-new-topic-still-live");
+      // Positive barrier: the monitor must pass both removed-topic events and B
+      // before admitting this addressed event; no negative timing assertion.
+      const barrier = await mesh.publish({ topic: "topics.reconnect-barrier", to: actor.id, from, text: "reconnect-direct-barrier" });
+      await waitFor(() => queuedIds().includes(barrier.id));
+      expect(queuedIds()).toEqual([a.id, b.id, c.id, barrier.id]);
+      expect(queuedIds()).not.toContain(removedDuringGap.id);
+      expect(queuedIds()).not.toContain(removedAfterReconnect.id);
+      expect(completed()).toEqual([]);
+
+      fs.writeFileSync(release, "finish");
+      await waitFor(() => completed().length >= 4 && actors.status(actor.id).status === "idle");
+      const tasks = runTasks(root, actors, actor.id);
+      expect(tasks).toHaveLength(4);
+      for (const text of ["reconnect-event-A", "reconnect-event-B", "reconnect-new-topic-still-live", "reconnect-direct-barrier"]) {
+        expect(tasks.filter(task => task.includes(text))).toHaveLength(1);
+      }
+      expect(tasks.some(task => task.includes("reconnect-removed-"))).toBe(false);
+      expect(new Set(completed().map(message => message.runId)).size).toBe(4);
+      expect(actors.status(actor.id)).toMatchObject({ topics: [newTopic], queued: 0 });
+      expect(queuedIds()).toEqual([]);
+    } finally {
+      connected = true;
       fs.writeFileSync(release, "finish");
     }
   }, 30_000);

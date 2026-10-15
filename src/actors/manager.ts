@@ -5948,7 +5948,7 @@ export class ActorManager {
     } catch { /* best effort: the notice stays in the actor's messages */ }
   }
 
-  #appendDeadLetterArchive(actor: ManagedActor, stale: readonly ActorDeadLetter[]): { rotated: boolean; dropped: number } {
+  #appendDeadLetterArchive(actor: ManagedActor, stale: readonly ActorDeadLetter[]): { rotated: boolean; dropped: number; archived: number } {
     const archive = path.join(path.dirname(this.#deadLetterFile(actor.id)), "dead-letter.archive.jsonl");
     const backup = `${archive}.1`;
     const lines = stale.map((entry) => `${JSON.stringify(entry)}\n`);
@@ -5985,6 +5985,19 @@ export class ActorManager {
       }
       syncPathNamespace(file);
     };
+    // Only remove the suffix that fits after its append is durable. The prefix stays in
+    // the bounded backlog for a later replay; it is not dropped archive history.
+    let bytes = 0;
+    let start = lines.length;
+    for (let index = lines.length - 1; index >= 0; index--) {
+      const size = lineBytes(lines[index]!);
+      if (bytes + size > ACTOR_DEAD_LETTER_ARCHIVE_MAX_BYTES) break;
+      bytes += size;
+      start = index;
+    }
+    // An oversized newest entry cannot fit even in an empty archive. Do not rotate
+    // existing history or claim progress while all of this stale input stays pending.
+    if (start === lines.length) return { rotated: false, dropped: 0, archived: 0 };
     const current = readTail(archive);
     const incomingBytes = lines.reduce((total, line) => total + lineBytes(line), 0);
     const rotate = current.dropped > 0 || (current.data.length > 0 && current.data.length + incomingBytes > ACTOR_DEAD_LETTER_ARCHIVE_MAX_BYTES);
@@ -5997,23 +6010,13 @@ export class ActorManager {
       try { fs.fsyncSync(archiveFd); } finally { fs.closeSync(archiveFd); }
       syncPathNamespace(archive);
     }
-    const retained = rotate ? Buffer.alloc(0) : current.data;
-    let bytes = retained.length;
-    let start = 0;
-    for (let index = lines.length - 1; index >= 0; index--) {
-      const size = lineBytes(lines[index]!);
-      if (bytes + size > ACTOR_DEAD_LETTER_ARCHIVE_MAX_BYTES) { start = index + 1; break; }
-      bytes += size;
-      start = index;
-    }
-    dropped += start;
     const text = lines.slice(start).join("");
     if (text) {
       const fd = fs.openSync(archive, "a", 0o600);
       try { fs.writeFileSync(fd, text); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
       syncPathNamespace(archive);
     }
-    return { rotated: rotate, dropped };
+    return { rotated: rotate, dropped, archived: lines.length - start };
   }
 
   // Keyed entries replace their prior dead letter; unkeyed entries stay append-only. Past the
@@ -6083,9 +6086,11 @@ export class ActorManager {
       if (maxAgeMs > 0 && Number.isFinite(entry.at) && entry.at < cutoff) { stale.push(entry); return false; }
       return true;
     });
+    let archivedStale = 0;
     if (stale.length) {
       try {
         const archive = this.#appendDeadLetterArchive(actor, stale);
+        archivedStale = archive.archived;
         if (archive.dropped > 0) {
           const text = `Fabric host notice: actor ${actor.name} rotated its stale dead-letter archive at ` +
             `${ACTOR_DEAD_LETTER_ARCHIVE_MAX_BYTES} bytes and dropped ${archive.dropped} older archived event(s).`;
@@ -6127,15 +6132,16 @@ export class ActorManager {
         taken++;
       }
     } catch { /* a queue checkpoint failure keeps this entry and the rest for the next drain */ }
-    if (taken === 0 && stale.length === 0) return;
+    if (taken === 0 && archivedStale === 0) return;
     // A single rewrite per batch, under the same actor ownership fence as queue replay.
     if (added === 0 || this.#persistQueue(actor.id, true)) {
       try {
-        this.#writeDeadLetters(actor.id, entries.slice(taken));
+        const remaining = [...stale.slice(0, stale.length - archivedStale), ...entries.slice(taken)];
+        this.#writeDeadLetters(actor.id, remaining);
         this.#recordMessage(actor, {
           id: randomUUID(), actorId: actor.id, actorName: actor.name, direction: "in",
           source: "actor:dead-letter-replay", createdAt: Date.now(),
-          data: { replayed: added, archivedStale: stale.length, filterSkipped, remaining: entries.length - taken },
+          data: { replayed: added, archivedStale, filterSkipped, remaining: remaining.length },
         });
       } catch { this.#deadLetters.delete(actor.id); }
     }

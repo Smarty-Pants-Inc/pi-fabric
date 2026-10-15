@@ -147,7 +147,7 @@ describe("dead-letter replay age and current activation filter (#10630)", () => 
     }
   });
 
-  it("keeps only the newest suffix across repeated oversized stale batches", async () => {
+  it("retains each oversized stale prefix until a restart durably archives it", async () => {
     const w = await backlog();
     let previous: Entry[] = [];
     for (let batch = 0; batch < 3; batch++) {
@@ -155,24 +155,77 @@ describe("dead-letter replay age and current activation filter (#10630)", () => 
         ...w.entries[0]!,
         event: { ...w.entries[0]!.event, id: `batch-${batch}-${index}`, text: "x".repeat(40_000) },
       }));
+      let bytes = 0, archivedCount = 0;
+      for (const entry of [...entries].reverse()) {
+        const size = Buffer.byteLength(JSON.stringify(entry)) + 1;
+        if (bytes + size > ACTOR_DEAD_LETTER_ARCHIVE_MAX_BYTES) break;
+        bytes += size;
+        archivedCount++;
+      }
+      expect(archivedCount).toBeGreaterThan(0);
+      expect(archivedCount).toBeLessThan(entries.length);
+      const suffix = entries.slice(-archivedCount);
+      const prefix = entries.slice(0, -archivedCount);
+      // The preceding batch was completely archived before installing any new work.
+      if (batch > 0) expect(readLines(w.file)).toEqual([]);
       fs.writeFileSync(w.file, entries.map(entry => JSON.stringify(entry) + "\n").join(""));
       const manager = w.open();
-      await waitFor(() => readLines(w.file).length === 0);
-      const newest = readLines<Entry>(w.archive);
+      // Replay is synchronous up to the presence write. Close immediately, before queued
+      // microtasks/timers can archive the retained prefix and hide the first checkpoint.
+      const configured = manager.setActivationFilter(w.actor.id, null);
+      const receipt = receipts(manager, w.actor.id).at(-1);
+      const notices = manager.messages(w.actor.id).filter(message =>
+        (message.data as { reason?: unknown } | undefined)?.reason === "dead_letter_archive");
+      await manager.close();
+      await configured;
+      expect(readLines<Entry>(w.archive)).toEqual(suffix);
       expect(fs.statSync(w.archive).size).toBeLessThanOrEqual(ACTOR_DEAD_LETTER_ARCHIVE_MAX_BYTES);
-      expect(newest.length).toBeGreaterThan(0);
-      expect(newest.length).toBeLessThan(entries.length);
-      expect(newest.map(entry => entry.event.id)).toEqual(entries.slice(-newest.length).map(entry => entry.event.id));
+      expect(readLines<Entry>(w.file)).toEqual(prefix);
+      expect(receipt).toEqual({ replayed: 0, archivedStale: archivedCount, filterSkipped: 0, remaining: prefix.length });
+      if (batch === 0) expect(notices).toEqual([]); // retained input is not dropped history
       if (batch > 0) {
         expect(fs.statSync(`${w.archive}.1`).size).toBeLessThanOrEqual(ACTOR_DEAD_LETTER_ARCHIVE_MAX_BYTES);
-        expect(readLines<Entry>(`${w.archive}.1`).map(entry => entry.event.id)).toEqual(previous.map(entry => entry.event.id));
+        expect(readLines<Entry>(`${w.archive}.1`)).toEqual(previous);
+        expect(notices.at(-1)?.data).toEqual(expect.objectContaining({ deadLetterArchiveDropped: 1 }));
       }
-      expect(manager.messages(w.actor.id)).toContainEqual(expect.objectContaining({
-        data: expect.objectContaining({ reason: "dead_letter_archive", deadLetterArchiveDropped: expect.any(Number) }),
-      }));
-      previous = newest;
-      await manager.close();
+
+      const restarted = w.open();
+      const retried = restarted.setActivationFilter(w.actor.id, null);
+      const retryReceipt = receipts(restarted, w.actor.id).at(-1);
+      await restarted.close();
+      await retried;
+      expect(readLines(w.file)).toEqual([]);
+      expect(readLines<Entry>(w.archive)).toEqual(prefix);
+      expect(readLines<Entry>(`${w.archive}.1`)).toEqual(suffix);
+      expect(retryReceipt).toEqual({ replayed: 0, archivedStale: prefix.length, filterSkipped: 0, remaining: 0 });
+      expect(new Set([...readLines<Entry>(w.archive), ...readLines<Entry>(`${w.archive}.1`)].map(entry => entry.event.id)))
+        .toEqual(new Set(entries.map(entry => entry.event.id)));
+      previous = prefix;
     }
+  });
+
+  it.each([false, true])("retains a single oversized stale entry without rotating or claiming stale progress (live work: %s)", async mixedLive => {
+    const w = await backlog();
+    const oversized: Entry = { ...w.entries[0]!, event: { ...w.entries[0]!.event, text: "x".repeat(ACTOR_DEAD_LETTER_ARCHIVE_MAX_BYTES) } };
+    const live = mixedLive ? w.entries.slice(6) : [];
+    const entries = [oversized, ...live];
+    const history = `${JSON.stringify(w.entries[1])}\n`;
+    fs.writeFileSync(w.archive, history);
+    fs.writeFileSync(w.file, entries.map(entry => JSON.stringify(entry) + "\n").join(""));
+    const manager = w.open();
+    const configured = manager.setActivationFilter(w.actor.id, null);
+    const replayReceipts = receipts(manager, w.actor.id);
+    await manager.close();
+    await configured;
+    expect(readLines<Entry>(w.file)).toEqual([oversized]);
+    expect(fs.readFileSync(w.archive, "utf8")).toBe(history);
+    expect(fs.existsSync(`${w.archive}.1`)).toBe(false);
+    expect(w.queued()).toEqual(live.map(entry => entry.event.id));
+    expect(replayReceipts).toEqual(mixedLive
+      ? [{ replayed: live.length, archivedStale: 0, filterSkipped: 0, remaining: 1 }]
+      : []);
+    expect(manager.messages(w.actor.id).filter(message =>
+      (message.data as { reason?: unknown } | undefined)?.reason === "dead_letter_archive")).toEqual([]);
   });
 
   it("archives stale entries behind a full replay batch without overtaking remaining fresh work", async () => {

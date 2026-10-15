@@ -1,3 +1,8 @@
+# Follow smarty-dev's .mergify.yml auto-queue pattern for ready PRs.
+# `hold` is the opt-out; every queue keeps the same required checks.
+merge_protections_settings:
+  auto_merge_conditions: true
+
 merge_queue:
   mode: serial
   # Two speculative batches at once (chief-of-staff GO 10-12 01:42Z): a bisect or a slow batch no longer
@@ -7,7 +12,7 @@ merge_queue:
   reset_on_external_merge: always
 
 # smarty-dev's plain rule (smarty-dev#865): the PR, its required checks and this queue are the
-# review. The Astra reviewer queues a ready PR after its success verdict; `hold` and DO NOT LAND
+# review. Mergify queues a ready PR once queue_conditions pass; `hold` and DO NOT LAND
 # titles keep a PR out. queue_conditions require both review verdicts on the reviewed head. Only a
 # PR head carries review statuses, and Mergify's in-place update (merging main into the queued
 # PR, smarty-dev#455) makes a new head that never gets them. So merge_conditions only refuse a
@@ -24,6 +29,7 @@ queue_rules:
     checks_timeout: 180 min
     merge_method: merge
     queue_conditions:
+      - -label ~= (?i)^(hold|do[ -]?not[ -]?merge|dnm|freeze|frozen)$
       - base = main
       - -draft
       - -label = hold

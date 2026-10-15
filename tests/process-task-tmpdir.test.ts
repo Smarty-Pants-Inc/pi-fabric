@@ -100,7 +100,7 @@ describe("native process task temporary directory containment", () => {
   });
 
   it.each(["missing", "regular-file"] as const)("replaces %s in-root TMPDIR with usable private scratch", async kind => {
-    const f = fixture();
+    const f = fixture("batch.slice");
     const callerTemp = path.join(f.scratch, "invalid-temp");
     if (kind === "regular-file") fs.writeFileSync(callerTemp, "not a directory");
     vi.stubEnv("TMPDIR", callerTemp);
@@ -147,7 +147,7 @@ describe("native process task temporary directory containment", () => {
   });
 
   it.each(["equal", "inside"] as const)("preserves caller TMPDIR when it is %s an authorized root", async placement => {
-    const f = fixture();
+    const f = fixture("batch.slice");
     const callerTemp = placement === "equal" ? f.scratch : path.join(f.scratch, "caller-temp");
     if (placement === "inside") fs.mkdirSync(callerTemp);
     vi.stubEnv("TMPDIR", callerTemp);
@@ -159,6 +159,34 @@ describe("native process task temporary directory containment", () => {
     expect(value.env).toEqual({ TMPDIR: callerTemp, TMP: callerTemp, TEMP: callerTemp });
     expect(value.policy).toEqual({ readOnly: false, writableRoots: [...requestedRoots].sort(), shell: "unconfined" });
     expect(inside(f.scratch, value.output)).toBe(true);
+    expect(value.bytes).toBeGreaterThan(50 * 1024);
+  });
+
+  it.each(["relative", "native-symlink-parent"] as const)("preserves valid %s TMPDIR for scoped state", async kind => {
+    const f = fixture("batch.slice");
+    const candidate = path.join(f.scratch, "caller-temp");
+    let callerTemp: string;
+    let expected: string;
+    if (kind === "relative") {
+      fs.mkdirSync(candidate);
+      callerTemp = path.relative(f.cwd, candidate);
+      expected = candidate;
+    } else {
+      const nested = path.join(f.cwd, "nested");
+      fs.mkdirSync(nested);
+      fs.symlinkSync(nested, candidate, "junction");
+      callerTemp = `${candidate}${path.sep}..`;
+      expected = process.platform === "win32" ? f.scratch : f.cwd;
+    }
+    vi.stubEnv("TMPDIR", callerTemp);
+    const { value } = await report(f, { writableRoots: [f.cwd, f.scratch], shell: "unconfined" });
+    expect(value.tmp).toBe(callerTemp);
+    expect(value.env).toEqual({ TMPDIR: callerTemp, TMP: callerTemp, TEMP: callerTemp });
+    if (process.platform === "linux") {
+      const scopeArgs = fs.readFileSync(path.join(f.cwd, "scope-args"), "utf8").split("\n");
+      const marker = scopeArgs.find(argument => path.basename(argument) === "admitted")!;
+      expect(inside(expected, marker)).toBe(true);
+    }
     expect(value.bytes).toBeGreaterThan(50 * 1024);
   });
 
@@ -210,6 +238,27 @@ describe("native process task temporary directory containment", () => {
       expect(fs.readFileSync(path.join(f.cwd, "scope-args"), "utf8")).toContain("--slice=batch.slice\n");
     }
   });
+
+  it.each(["missing", "regular-file", "escaping-symlink"] as const)(
+    "places explicit processSlice scope state under validated scratch when parent TMPDIR is %s",
+    async kind => {
+      if (process.platform !== "linux") return;
+      const f = fixture("batch.slice");
+      const movedParent = path.join(f.root, "parent-temp-original");
+      fs.renameSync(f.parentTemp, movedParent);
+      if (kind === "regular-file") fs.writeFileSync(f.parentTemp, "not a directory");
+      else if (kind === "escaping-symlink") fs.symlinkSync(movedParent, f.parentTemp, "junction");
+      const { value } = await report(f, { writableRoots: [f.cwd, f.scratch], shell: "unconfined" });
+
+      expect(inside(f.scratch, value.tmp)).toBe(true);
+      const scopeArgs = fs.readFileSync(path.join(f.cwd, "scope-args"), "utf8").split("\n");
+      const marker = scopeArgs.find(argument => path.basename(argument) === "admitted")!;
+      expect(path.basename(marker)).toBe("admitted");
+      expect(inside(value.tmp, marker)).toBe(true);
+      expect(fs.readdirSync(movedParent)).toEqual([]);
+      expect(value.bytes).toBeGreaterThan(50 * 1024);
+    },
+  );
 
   it("does not preserve a lexically contained TMPDIR symlink that escapes the root", async () => {
     const f = fixture();

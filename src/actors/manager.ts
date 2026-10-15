@@ -4223,8 +4223,8 @@ export class ActorManager {
           );
           runId = result.id;
           // Worker status may diagnose overflow, but neither status nor logs authorize replay.
-          const contextOverflow = result.status !== "completed" && (result.errorCode === "CONTEXT_OVERFLOW" ||
-            classifyManagerActivationFailure({ lastError: result.error ?? "", error: result.error, evidence: result.warnings }, true).code === "context-overflow");
+          const contextOverflow = result.status !== "completed" && result.errorCode === "CONTEXT_OVERFLOW" &&
+            !CONTRADICTORY_OVERFLOW_CODES.has(classifyManagerActivationFailure({ lastError: result.error ?? "", error: result.error, evidence: result.warnings }, true).code);
           runEvidence = result.warnings;
           // Positive worker inference is a conservative consumption signal only.
           handoffConsumed = result.status === "completed" || result.inferenceStarted === true;

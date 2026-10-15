@@ -10,6 +10,7 @@ import type { writePolicyDispositionHeapProbe } from "./fixtures/write-policy-di
 // lexical Context, retaining request.task (100 x 4 MiB) via manager.#runs ->
 // launch.onWritePolicyDisposition -> context.previous.previous -> request.task.
 const execute = promisify(execFile);
+const ROOT_PREFIX = "disposition-heap-";
 const FIVE_MIB = 5 * 1024 * 1024;
 const FIXED = "        const onWritePolicyDisposition = writePolicyDispositionAudit(logFile, id, runner, writePolicy);\n";
 // The exact original e22d68dc callback (unsafe lexical capture); only this boundary is substituted.
@@ -56,8 +57,7 @@ type Receipt = Awaited<ReturnType<typeof writePolicyDispositionHeapProbe>> & {
   variant: "negative" | "fixed"; substituted: number; sourceSha256: string;
 };
 const probe = async (variant: "negative" | "fixed"): Promise<Receipt> => {
-  // Private root stays for its environment owner; nothing here deletes.
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "disposition-heap-"));
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), ROOT_PREFIX));
   try {
     const result = await execute("node", ["--expose-gc", "--max-old-space-size=4096", "--input-type=module", "-e", childProgram,
       root, variant, FIXED, UNSAFE], { cwd: process.cwd(), timeout: 90_000, killSignal: "SIGKILL", maxBuffer: 1024 * 1024 });
@@ -73,6 +73,11 @@ const probe = async (variant: "negative" | "fixed"): Promise<Receipt> => {
     if (output.stdout) process.stdout.write(output.stdout);
     if (output.stderr) process.stderr.write(output.stderr);
     throw error;
+  } finally {
+    expect(path.dirname(path.resolve(root))).toBe(path.resolve(os.tmpdir()));
+    expect(path.basename(root).startsWith(ROOT_PREFIX)).toBe(true);
+    fs.rmSync(root, { recursive: true, force: true });
+    expect(fs.existsSync(root)).toBe(false);
   }
 };
 
@@ -84,6 +89,7 @@ it("retained onWritePolicyDisposition callbacks do not keep closed runs' tasks; 
     for (const receipt of [negative, fixed]) {
       expect(receipt).toMatchObject({ runs: 100, taskUnits: 4 * 1024 * 1024, callbacks: 100,
         localRuns: 50, remoteRuns: 50, checks: [] });
+      expect(receipt.recordedDeletions).toBeGreaterThan(0);
       expect(receipt.sourceSha256).toMatch(/^[a-f0-9]{64}$/);
     }
     expect(negative.substituted).toBe(1);

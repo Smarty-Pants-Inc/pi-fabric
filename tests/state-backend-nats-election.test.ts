@@ -1,9 +1,9 @@
 import fs from "node:fs";
 import path from "node:path";
-import type { ConsumerAPI } from "@nats-io/jetstream";
+import type { Consumer, ConsumerAPI, ConsumerInfo, Consumers } from "@nats-io/jetstream";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { importMeshStateToNats } from "../src/mesh/backend-migration-nats.js";
-import { closeNatsStateBackend, MeshStateNatsUnavailableError, natsStreamName, openNatsStateBackend } from "../src/mesh/state-backend-nats.js";
+import { closeNatsStateBackend, MeshStateNatsUnavailableError, natsStreamName, openNatsStateBackend, type JetStreamPort } from "../src/mesh/state-backend-nats.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { startNatsElectionCluster, stopNatsElectionCluster, type NatsElectionCluster } from "./helpers/nats-election-cluster.js";
 
@@ -54,6 +54,219 @@ const observePeerElection = async (cluster: NatsElectionCluster, paused: string,
   throw new Error(`healthy peers did not agree on a new metadata leader before SIGCONT: ${JSON.stringify(last)}`);
 };
 describe("real three-node NATS metadata-leader election", () => {
+  // Keep: #11950/#13112's real R3-history / silent R1-receiver split, without changing CREATE or pull budgets.
+  it.skipIf(!binary)("bootstraps exact R3 history while the actual distinct R1 consumer host is paused before first NEXT", async () => {
+    const cluster = await startNatsElectionCluster(binary!);
+    clusters.push(cluster); // Existing afterEach owns native child exit/scratch receipts on every outcome.
+    const [{ connect }, { jetstream, jetstreamManager }, { connectJetStream }] = await Promise.all([
+      import("@nats-io/transport-node"), import("@nats-io/jetstream"), import("../src/mesh/state-backend-nats-client.js"),
+    ]);
+    const observer = await connect({ servers: [cluster.seedUrl], ignoreClusterUpdates: true, reconnect: false, timeout: 1_000 });
+    const manager = await jetstreamManager(observer, { timeout: 1_000 });
+    const nodeFor = (name: string | undefined) => cluster.nodes.find(node => node.name === name || node.metaId === name);
+    const seedNode = cluster.nodes.find(node => node.clientUrl === cluster.seedUrl)!;
+    const ownStreams = new Set<string>();
+    const roots: string[] = [];
+    const ports: JetStreamPort[] = [];
+    const creates: ConsumerInfo[] = [];
+    const placements: unknown[] = [];
+    const metrics: { records: number; gets: number; elapsedMs: number }[] = [];
+    const deferred = <T,>() => {
+      let resolve!: (value: T) => void;
+      const promise = new Promise<T>(yes => { resolve = yes; });
+      return { promise, resolve };
+    };
+    const bounded = async <T,>(promise: Promise<T>, ms: number, label: string): Promise<T> => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try { return await Promise.race([promise, new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${label} exceeded ${ms}ms; underlying operation not retried`)), ms);
+      })]); } finally { clearTimeout(timer); }
+    };
+    let paused: NatsElectionCluster["nodes"][number] | undefined;
+    let pausedAt = 0;
+    let resumedAt = 0;
+    let resumeTimer: ReturnType<typeof setTimeout> | undefined;
+    let faultStream: string | undefined;
+    let faultConsumer: Consumer | undefined;
+    let faultInfo: ConsumerInfo | undefined;
+    let faults = 0;
+    let selecting = false;
+    let selectionDeadline = 0;
+    const faultArmed = deferred<void>();
+    const resumed = deferred<void>();
+    const lateHistory = deferred<void>();
+    const received: number[] = [];
+    const resume = () => {
+      if (!paused || resumedAt) return;
+      clearTimeout(resumeTimer);
+      const ok = paused.child.kill("SIGCONT"); // Only the fixture's owned direct ChildProcess, never PID/name discovery.
+      resumedAt = performance.now();
+      resumed.resolve();
+      expect(ok, "owned R1 receiver SIGCONT").toBe(true);
+    };
+    const consumerPrototype = Object.getPrototypeOf(manager.consumers) as ConsumerAPI;
+    const originalAdd = consumerPrototype.add;
+    const addSpy = vi.spyOn(consumerPrototype, "add").mockImplementation(async function (this: ConsumerAPI, ...args: Parameters<ConsumerAPI["add"]>) {
+      const ack = await originalAdd.apply(this, args);
+      if (ownStreams.has(args[0])) creates.push(ack); // Actual successful CREATE ACK, no separately sampled consumer.
+      return ack;
+    });
+    const consumersPrototype = Object.getPrototypeOf(jetstream(observer).consumers) as Consumers;
+    const originalGet = consumersPrototype.get;
+    const getSpy = vi.spyOn(consumersPrototype, "get").mockImplementation(async function (this: Consumers, ...args: Parameters<Consumers["get"]>) {
+      const consumer = await originalGet.apply(this, args);
+      if (!ownStreams.has(args[0])) return consumer;
+      // Install only AFTER the real get returns: no added await inside the adapter's existing 1s bootstrap get.
+      const consume = consumer.consume.bind(consumer);
+      consumer.consume = async (...consumeArgs: Parameters<Consumer["consume"]>) => {
+        if (selecting) {
+          const info = await consumer.info(false); // Uncached INFO, before original consume can issue its first NEXT.
+          const stream = await manager.streams.info(args[0]);
+          const ack = [...creates].reverse().find(item => item.stream_name === args[0] && item.name === info.name);
+          expect(ack, "faulting open must have its own real CREATE ACK").toBeDefined();
+          expect(info).toMatchObject({ stream_name: args[0], config: { num_replicas: 1, mem_storage: true, ack_policy: "none" } });
+          expect(ack!.cluster?.leader).toBe(info.cluster?.leader);
+          expect(stream.config.num_replicas).toBe(3);
+          expect(stream.state).toMatchObject({ first_seq: 1, last_seq: 3 });
+          const host = nodeFor(info.cluster?.leader);
+          const streamHost = nodeFor(stream.cluster?.leader);
+          expect(host, "map actual R1 consumer host to an owned child").toBeDefined();
+          expect(streamHost, "map R3 stream leader").toBeDefined();
+          const qualifies = host !== seedNode && host !== streamHost;
+          const placement = { setup: placements.length + 1, stream: args[0], consumer: info.name, createLeader: ack!.cluster?.leader,
+            consumerHost: host!.name, streamLeader: streamHost!.name, connectedSeed: seedNode.name, qualifies };
+          placements.push(placement);
+          console.log(`NATS_BOOTSTRAP_PLACEMENT ${JSON.stringify(placement)}`);
+          if (!selecting || Date.now() >= selectionDeadline) throw new Error("placement precondition expired before first NEXT; no fault issued");
+          if (qualifies) {
+            expect(faults).toBe(0);
+            expect(host!.child.exitCode).toBeNull();
+            expect(host!.child.signalCode).toBeNull();
+            paused = host;
+            faultStream = args[0];
+            faultConsumer = consumer;
+            faultInfo = info;
+            faults++;
+            pausedAt = performance.now();
+            resumeTimer = setTimeout(resume, 6_000); // One finite fault duration; finally also resumes on failed assertions.
+            expect(host!.child.kill("SIGSTOP"), "owned R1 receiver SIGSTOP").toBe(true);
+            faultArmed.resolve();
+          }
+        }
+        return consume(...consumeArgs); // Original SDK consumer/options/request; no reset, delete, or forced error.
+      };
+      return consumer;
+    });
+    const makePort = async () => {
+      const port = await connectJetStream([cluster.seedUrl], { monitoringUrl: cluster.seedMonitorUrl, replicas: 3 });
+      ports.push(port);
+      const get = port.getMessage.bind(port);
+      let gets = 0;
+      port.getMessage = (...args: Parameters<JetStreamPort["getMessage"]>) => { gets++; return get(...args); };
+      const consume = port.consume.bind(port);
+      port.consume = (stream, after, onMessage, onError) => consume(stream, after, message => {
+        onMessage(message);
+        if (stream === faultStream && message.seq <= 3) {
+          received.push(message.seq);
+          if (received.length === 3) lateHistory.resolve();
+        }
+      }, onError);
+      const close = port.close.bind(port);
+      let closing: Promise<void> | undefined;
+      port.close = () => closing ??= close();
+      return { port, gets: () => gets };
+    };
+    const makeSeed = async (name: string, records: number) => {
+      const root = path.join(cluster.root, name);
+      fs.mkdirSync(root);
+      roots.push(root);
+      ownStreams.add(natsStreamName(root));
+      const { port } = await makePort();
+      const backend = await openNatsStateBackend({ root, port, replicas: 3, snapshotEvery: 0 });
+      for (let index = 0; index < records; index++) await backend.put({ key: `bootstrap/${index}`, value: { index }, identity });
+      const expected = backend.listAll();
+      expect(backend.diagnostics().nats).toMatchObject({ appliedSeq: records, knownSeq: records });
+      closeNatsStateBackend(root);
+      await port.close();
+      return { root, expected };
+    };
+    try {
+      // Observations, not an invented one-GET or hard-millisecond performance SLA. Parent records BASE/candidate.
+      for (const records of [3, 1_000]) {
+        const { root, expected } = await makeSeed(`healthy-bootstrap-${records}`, records);
+        const measured = await makePort();
+        const started = performance.now();
+        const backend = await openNatsStateBackend({ root, port: measured.port, replicas: 3, snapshotEvery: 0 });
+        metrics.push({ records, gets: measured.gets(), elapsedMs: performance.now() - started });
+        expect(backend.listAll()).toEqual(expected);
+        expect(backend.diagnostics().nats).toMatchObject({ appliedSeq: records, knownSeq: records });
+        console.log(`NATS_BOOTSTRAP_HEALTHY_COST ${JSON.stringify(metrics.at(-1))}`);
+        closeNatsStateBackend(root);
+        await measured.port.close();
+      }
+      selectionDeadline = Date.now() + 30_000;
+      // Only successful healthy setups may advance this bounded placement precondition. ANY open/API error escapes.
+      for (let setup = 1; setup <= 32 && Date.now() < selectionDeadline; setup++) {
+        const remaining = () => Math.max(1, selectionDeadline - Date.now());
+        const { root, expected } = await bounded(makeSeed(`fault-bootstrap-${setup}`, 3), remaining(), "seed placement precondition");
+        const measured = await bounded(makePort(), remaining(), "connect placement precondition");
+        selecting = true;
+        const started = performance.now();
+        const opening = openNatsStateBackend({ root, port: measured.port, replicas: 3, snapshotEvery: 0 });
+        // Selection ends at the actual pre-NEXT placement event, not at a later faulted open's completion.
+        const selected = await bounded(Promise.race([
+          opening.then(backend => ({ backend })), faultArmed.promise.then(() => ({ fault: true as const })),
+        ]), remaining(), "reopen placement precondition");
+        const backend = "backend" in selected ? selected.backend : await bounded(opening, 5_500, "faulted initial open");
+        selecting = false;
+        expect(backend.listAll()).toEqual(expected);
+        expect(backend.diagnostics().nats).toMatchObject({ appliedSeq: 3, knownSeq: 3 });
+        if (!faults) {
+          closeNatsStateBackend(root);
+          await measured.port.close();
+          continue; // Not a failed-open retry; exact healthy state was proved before ordinary close.
+        }
+        expect(resumedAt, "initial open must apply exact H WHILE the original receiver host is paused").toBe(0);
+        expect(performance.now() - pausedAt).toBeLessThan(5_000 + 500);
+        expect(performance.now() - started).toBeLessThan(5_000 + 1_000); // CREATE/INFO overhead is not a replacement waiter budget.
+        expect(received).toEqual([]);
+        expect(creates.filter(info => info.stream_name === faultStream), "exactly seed + faulting reopen CREATEs").toHaveLength(2);
+        await bounded(resumed.promise, 7_000, "six-second receiver resume");
+        // Prove the pause outlived the original 5s waiter with 500ms margin, not an exact 6s timer duration.
+        expect(resumedAt - pausedAt).toBeGreaterThan(5_000 + 500);
+        // Original native onMessage callbacks drive this event; no polling framework or transport reconnect.
+        await bounded(lateHistory.promise, 3_000, "original consumer late sequences 1-3");
+        expect(received).toEqual([1, 2, 3]);
+        expect(backend.listAll()).toEqual(expected);
+        expect(backend.diagnostics().nats).toMatchObject({ appliedSeq: 3, knownSeq: 3 });
+        expect(backend.diagnostics().nats?.failure).toBeUndefined();
+        expect((await faultConsumer!.info(false)).name).toBe(faultInfo!.name);
+        expect((await manager.consumers.info(faultStream!, faultInfo!.name)).created).toBe(faultInfo!.created);
+        const entry = expected[0]!;
+        await backend.put({ key: entry.key, ifVersion: entry.version, value: { resumed: true }, identity });
+        expect(backend.get(entry.key)).toMatchObject({ value: { resumed: true }, version: entry.version + 1 });
+        expect(backend.diagnostics().nats).toMatchObject({ appliedSeq: 4, knownSeq: 4 });
+        expect(creates.filter(info => info.stream_name === faultStream)).toHaveLength(2);
+        expect((await manager.streams.info(faultStream!)).config.num_replicas).toBe(3);
+        console.log(`NATS_BOOTSTRAP_FAULT ${JSON.stringify({ setups: placements.length, faults, paused: paused!.name,
+          consumer: faultInfo!.name, pausedAt, resumedAt, received, gets: measured.gets(), metrics, exactHistoryAndPostResumeCAS: true })}`);
+        closeNatsStateBackend(root);
+        await measured.port.close();
+        break;
+      }
+      expect(faults, `no distinct consumer placement within 32 successful setups/30s: ${JSON.stringify(placements)}`).toBe(1);
+    } finally {
+      resume(); // Must precede observer/port close and the existing fixture afterEach cleanup.
+      clearTimeout(resumeTimer);
+      selecting = false;
+      getSpy.mockRestore();
+      addSpy.mockRestore();
+      for (const root of roots) closeNatsStateBackend(root);
+      try { await bounded(Promise.all(ports.map(port => port.close())), 3_000, "bootstrap ports close"); }
+      finally { await observer.close(); }
+    }
+  }, 90_000);
+
   it.skipIf(!binary)("bounds unavailable R3 placement and recovers migrations and new-root opens when the peer returns", async () => {
     const cluster = await startNatsElectionCluster(binary!);
     clusters.push(cluster);

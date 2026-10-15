@@ -1,4 +1,5 @@
 import { createRequire } from "node:module";
+import { detachedPreview } from "../core/preview.js";
 import { fileURLToPath } from "node:url";
 import type { FabricResultFormat } from "../config.js";
 import { countNewlines } from "../util.js";
@@ -93,7 +94,7 @@ const boundedSection = (value: string, maxChars: number): string => {
   const available = maxChars - marker.length;
   const head = Math.ceil(available / 2);
   const tail = Math.floor(available / 2);
-  return `${value.slice(0, head)}${marker}${value.slice(value.length - tail)}`;
+  return `${detachedPreview(value, head)}${marker}${detachedPreview(value.slice(value.length - tail), tail)}`;
 };
 
 const fairSectionBudgets = (lengths: number[], budget: number): number[] => {

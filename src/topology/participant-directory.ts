@@ -27,6 +27,7 @@ import { isLiveLegacyRootEntry, sessionLiveness, LEGACY_ROOT_LEASE_MS as PARTICI
 import {
   fileLeasesOnly,
   hostLeaseExpiry,
+  hostLeaseMatches,
   hostLeasePath,
   hostLeasePredecessor,
   hostLiveness,
@@ -54,6 +55,7 @@ import { HostLeaseLockBusyError, withHostLeaseLock } from "./host-lease-lock.js"
 import { peerLabelPrefix } from "./peer-settle.js";
 import { rootParticipantName } from "./participant-name.js";
 import { ownProcessIncarnation } from "../core/atomic-write.js";
+import { processStartTime } from "../residency/process-identity.js";
 import { watchBridgeStore } from "../mesh/change-notifier.js";
 import { FabricPeerLeaseStaleError, PEER_LEASE_WAIT_MS } from "../agents/peer-lease-stale.js";
 import {
@@ -373,14 +375,7 @@ let ownProcessIdentity: { pid: number; host: string; startTime?: string } | unde
 /** This process's identity, read once: stable for the process's life. */
 const ownMainProcess = (): { pid: number; host: string; startTime?: string } => {
   if (!ownProcessIdentity) {
-    // Linux /proc/<pid>/stat field 22 (start ticks), after comm; the same value residency's processStartTime reads.
-    let startTime: string | undefined;
-    if (process.platform === "linux") {
-      try {
-        const stat = fs.readFileSync(`/proc/${process.pid}/stat`, "utf8");
-        startTime = stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/)[19];
-      } catch { /* unknown: the record carries no start time */ }
-    }
+    const startTime = processStartTime(process.pid);
     ownProcessIdentity = { pid: process.pid, host: os.hostname(), ...(startTime ? { startTime } : {}) };
   }
   return ownProcessIdentity;
@@ -719,6 +714,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
   #leaseRenewing: Promise<number> | undefined;
   /** Serialize only our own asynchronous lease gate users; foreign custody stays a one-shot try. */
   #leaseCommitting: Promise<void> = Promise.resolve();
+  /** Set only inside this directory's still-held physical custody callback. */
+  #heldLeaseOwner: FabricHostLease | undefined;
   /** Last independent file renewal of each stopped actor (see STOPPED_ACTOR_RENEW_MS). */
   readonly #stoppedRenewedAt = new Map<string, number>();
   /** A successful sequence claim survives discarded preparations for this root. */
@@ -816,10 +813,10 @@ export class ParticipantDirectory implements FabricParticipantSource {
       this.#lifecycleTick(live);
       if (!live) return;
       void this.#renewActors();
-      // The retry runner coalesces shared publication, not independent liveness.
-      // Renew through per-key waits even when run() skips an in-flight refresh;
-      // shared-lock-only waits still lapse and confirmation still needs its lock.
-      if (this.#refreshing && this.#fileWork > 0 && !this.#quiescing) {
+      // Publication/confirmation and retry admission may await for longer than a
+      // lease. Renew admitted liveness independently, never the mesh receipt.
+      if (!this.#quiescing && (this.#refreshing && this.#fileWork > 0 ||
+        this.#leaseConfirmed && (this.#refreshing || this.#publicationRetryTimer || this.#publicationRetrying))) {
         void this.#renewFileLease().catch(error => {
           this.#refreshError = this.#superseded ?? error;
           this.#routingReadAt = 0;
@@ -1330,7 +1327,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       }
       const stale =
         !owner ||
-        owner.expiresAt < now ||
+        (owner.expiresAt < now && !this.#nativeRootAlive(participant, owner, read)) ||
         (participant.status === "reloading" && (participant.reloadUntil ?? 0) < now) ||
         owner.identity.id !== participant.ownerIdentityId ||
         owner.rootId !== participant.rootId;
@@ -1564,10 +1561,10 @@ export class ParticipantDirectory implements FabricParticipantSource {
     return { remoteHost: participant.remoteHost, expiresAt: owner.expiresAt };
   }
 
-  #routingOwner(id: string) {
+  #routingOwner(id: string, fresh = false) {
     if (!this.options.enabled) return undefined;
     const target = id === "main" ? this.options.rootId : id;
-    const read = { snapshot: this.mesh.stateToken() };
+    const read = { snapshot: this.mesh.stateToken({ fresh }) };
     const entry = this.#participantEntry(keyFor(PARTICIPANT_PREFIX, target), read);
     const participant = entry ? participantFromEntry(entry) : undefined;
     if (!participant || participant.id !== target || participant.remoteHost) return undefined;
@@ -1594,15 +1591,44 @@ export class ParticipantDirectory implements FabricParticipantSource {
       this.#sessionEnded(participant.rootId, read);
   }
 
-  /** Capture owner authority once. Subsequent ACK checks only stat/read that owner's file. */
+  /** Only exact, readable local Linux Main process identity can extend routing,
+   * never admission, mesh confirmation, a resident host, or a terminal lineage. */
+  #nativeRootAlive(participant: FabricParticipantRecord, owner: FabricHostRecord, read: MeshReadOptions): boolean {
+    const main = participant.mainProcess;
+    if (process.platform !== "linux" || participant.remoteHost !== undefined || owner.remoteHost !== undefined ||
+      participant.kind !== "root" || participant.runner !== "pi" || participant.transport !== "host" ||
+      participant.id !== participant.rootId || owner.id !== participant.id || owner.rootId !== participant.id ||
+      participant.ownerHostId !== owner.id || participant.ownerIdentityId !== owner.identity.id ||
+      owner.identity.kind !== "main" || owner.identity.id !== participant.id ||
+      (participant.status !== "idle" && participant.status !== "running") ||
+      !main || main.host !== os.hostname() || !Number.isSafeInteger(main.pid) || main.pid <= 0 ||
+      !main.startTime || processStartTime(main.pid) !== main.startTime || this.#routeEnded(participant, read)) return false;
+    try {
+      const lease = hostLeasePredecessor(this.mesh.root, owner.id);
+      if (lease && !hostLeaseMatches(lease, owner)) return false;
+      const stat = fs.readFileSync(`/proc/${main.pid}/stat`, "utf8");
+      const fields = stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/);
+      return /^[RSDTtWI]$/.test(fields[0] ?? "") && fields[19] === main.startTime;
+    } catch { return false; }
+  }
+
+  /** File freshness stays cheap. Native ACK extension revalidates current authority. */
   captureControlOwnerLease(ownerHostId: string, ownerIdentityId: string, targetId: string): (() => number) | undefined {
     const record = this.#routingOwner(targetId);
     if (!record || record.owner.id !== ownerHostId || record.owner.identity.id !== ownerIdentityId ||
       this.#routeEnded(record.participant, record.read)) return undefined;
-    const { owner } = record;
+    const { owner, participant } = record;
     return () => {
       const lease = readHostLease(this.mesh.root, owner.id);
-      return hostLeaseExpiry(lease ? new Map([[owner.id, lease]]) : new Map(), owner);
+      const expiry = hostLeaseExpiry(lease ? new Map([[owner.id, lease]]) : new Map(), owner);
+      const now = (this.options.routingLease?.now ?? Date.now)();
+      if (expiry >= now || process.platform !== "linux" || !participant.mainProcess) return expiry;
+      const current = this.#routingOwner(targetId, true);
+      return current && current.owner.id === owner.id && current.owner.identity.id === owner.identity.id &&
+        current.owner.incarnationToken === owner.incarnationToken && current.owner.startedAt === owner.startedAt &&
+        current.participant.ownerIncarnation === participant.ownerIncarnation && current.participant.status === participant.status &&
+        JSON.stringify(current.participant.mainProcess) === JSON.stringify(participant.mainProcess) &&
+        this.#nativeRootAlive(current.participant, current.owner, current.read) ? now + this.#leaseMs : expiry;
     };
   }
 
@@ -1626,11 +1652,9 @@ export class ParticipantDirectory implements FabricParticipantSource {
     if (this.#routeEnded(participant, record.read)) return false;
     const snapshot = readHostLeaseSnapshot(this.mesh.root, owner.id);
     const lease = snapshot?.lease;
-    const matching = lease && lease.rootId === owner.rootId && lease.identityId === owner.identity.id &&
-      (owner.incarnationToken !== undefined ? lease.incarnationToken === owner.incarnationToken :
-        (lease.startedAt === undefined || lease.startedAt === owner.startedAt));
-    const expiresAt = hostLeaseExpiry(matching ? new Map([[owner.id, lease]]) : new Map(), owner);
-    if (expiresAt >= now) return true;
+    const matching = hostLeaseMatches(lease, owner);
+    const expiresAt = hostLeaseExpiry(matching && lease ? new Map([[owner.id, lease]]) : new Map(), owner);
+    if (expiresAt >= now || this.#nativeRootAlive(participant, owner, record.read)) return true;
     if (now - expiresAt > participantLeaseGraceMs(options.graceMs) ||
       participant.status === "stopping" || participant.status === "reloading") return false;
     // A direct `.lock` observer (smarty-dev#6477 A1 section 4): a heartbeat writer shows there on
@@ -1867,7 +1891,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
           owner &&
           ownerMatches(participant, owner, this.options.hostId) &&
           !(participant.status === "reloading" && (participant.reloadUntil ?? 0) < now) &&
-          hostLeaseExpiry(lease ? new Map([[owner.id, lease]]) : new Map(), owner) >= now &&
+          (hostLeaseExpiry(lease ? new Map([[owner.id, lease]]) : new Map(), owner) >= now ||
+            this.#nativeRootAlive(participant, owner, read)) &&
           owner.identity.id === participant.ownerIdentityId &&
           owner.rootId === participant.rootId
         ) {
@@ -2974,6 +2999,20 @@ export class ParticipantDirectory implements FabricParticipantSource {
   }
 
   #renewFileLease(): Promise<number> {
+    // The shared write can await while retaining OUR custody. Queueing renewal
+    // behind it would self-deadlock. This synchronous CAS needs no second gate;
+    // the callback that supplied #heldLeaseOwner has not unwound or released it.
+    if (this.#heldLeaseOwner && this.#leaseClaimed && sameHostLeaseOwner(this.#heldLeaseOwner, this.#leaseOwner())) {
+      try {
+        this.#assertLeaseActive();
+        const at = Date.now();
+        if (!this.#closed) commitHostLeaseUnderCustody(this.mesh.root, this.#fileLease(at));
+        return Promise.resolve(at);
+      } catch (error) {
+        if (error instanceof FabricHostLeaseSupersededError) this.#markSuperseded(error);
+        return Promise.reject(error);
+      }
+    }
     if (this.#leaseRenewing) return this.#leaseRenewing;
     const renewing = this.#withLeaseCommit(() => this.#commitFileLease());
     this.#leaseRenewing = renewing.finally(() => { this.#leaseRenewing = undefined; });
@@ -3137,8 +3176,11 @@ export class ParticipantDirectory implements FabricParticipantSource {
   #withLeaseFence<T>(operation: () => T | Promise<T>): Promise<T> {
     return this.#withLeaseCommit(async () => {
       this.#assertLeaseActive();
-      try { return await withOwnedHostLease(this.mesh, this.#leaseFenceOwner(), operation,
-        { ownIncarnation: this.#ownIncarnationValue, ownerAfter: () => this.#leaseFenceOwner() }); }
+      try { return await withOwnedHostLease(this.mesh, this.#leaseFenceOwner(), async () => {
+        this.#heldLeaseOwner = this.#leaseFenceOwner();
+        try { return await operation(); }
+        finally { this.#heldLeaseOwner = undefined; }
+      }, { ownIncarnation: this.#ownIncarnationValue, ownerAfter: () => this.#leaseFenceOwner() }); }
       catch (error) {
         if (error instanceof FabricHostLeaseSupersededError) this.#markSuperseded(error);
         if (isMeshLockTimeout(error)) this.#prepareLeaseLock = true;

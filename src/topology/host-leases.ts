@@ -549,15 +549,19 @@ const validSession = (value: unknown): value is NonNullable<FabricHostLease["ses
 };
 
 /** Matching identity and incarnation only; an old file cannot revive a takeover. */
+export const hostLeaseMatches = (
+  lease: FabricHostLease | undefined,
+  host: { id: string; rootId: string; identity: { id: string }; incarnationToken?: string; startedAt?: number },
+): boolean => !!lease && lease.id === host.id && lease.rootId === host.rootId && lease.identityId === host.identity.id &&
+  (host.incarnationToken !== undefined ? lease.incarnationToken === host.incarnationToken :
+    (lease.startedAt === undefined || host.startedAt === undefined || lease.startedAt === host.startedAt));
+
 export const hostLiveness = (
   leases: ReadonlyMap<string, FabricHostLease>,
   host: { id: string; rootId: string; identity: { id: string }; incarnationToken?: string; startedAt?: number; updatedAt?: number; expiresAt: number },
 ): Liveness => {
   const lease = leases.get(host.id);
-  const matching = lease && lease.rootId === host.rootId && lease.identityId === host.identity.id &&
-    (host.incarnationToken !== undefined ? lease.incarnationToken === host.incarnationToken :
-      (lease.startedAt === undefined || host.startedAt === undefined || lease.startedAt === host.startedAt));
-  return effectiveLiveness({ updatedAt: host.updatedAt ?? 0, expiresAt: host.expiresAt }, matching ? lease : undefined);
+  return effectiveLiveness({ updatedAt: host.updatedAt ?? 0, expiresAt: host.expiresAt }, hostLeaseMatches(lease, host) ? lease : undefined);
 };
 
 /** Reapers also accept incomplete historical records, retaining them conservatively. */

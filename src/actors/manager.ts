@@ -2347,7 +2347,7 @@ export class ActorManager {
         },
       });
     void this.#notifications.enqueue(() => publish(images.length > 0).catch(error => {
-      if (isMeshLockTimeout(error)) throw error;
+      if (isMeshWriteDeferred(error)) throw error;
       if (images.length > 0) return publish(false);
       throw error;
     }));

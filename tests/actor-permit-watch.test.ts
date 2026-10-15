@@ -41,6 +41,9 @@ interface Worker {
   record: AgentRunRecord;
   statusFile: string;
   nativeClose: () => void;
+  closeStarted: boolean;
+  closeJoined: boolean;
+  primaryProofScans: number;
 }
 interface Fixture {
   root: string;
@@ -60,6 +63,7 @@ beforeEach(() => {
   vi.spyOn(process, "kill").mockImplementation((pid, signal) => {
     if (signal !== 0) throw new Error("No real or scripted worker signals allowed");
     const worker = workers.get(pid);
+    if (worker) worker.primaryProofScans++;
     const code = pid === claimedGonePid ? "ESRCH"
       : worker?.probeError ?? (worker && !(worker.identityAlive ?? worker.alive) ? "ESRCH" : undefined);
     if (code) throw Object.assign(new Error(code), { code });
@@ -104,7 +108,7 @@ beforeEach(() => {
       usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
     };
     const worker: Worker = { launch, pid, alive: true, birth: "12345", descendants: false,
-      record, statusFile: arg("status-file"), nativeClose };
+      record, statusFile: arg("status-file"), nativeClose, closeStarted: false, closeJoined: false, primaryProofScans: 0 };
     workers.set(pid, worker);
     fs.writeFileSync(worker.statusFile, JSON.stringify(record));
     if (closing) complete(worker); // Failed-test teardown also drains any queued launches.
@@ -114,8 +118,10 @@ beforeEach(() => {
       waitForClose: async () => {
         // Like the native transport, a healthy live worker owes a close join,
         // not an immediate uncertainty failure at logical settlement.
+        worker.closeStarted = true;
         await closed;
         if (worker.alive || worker.descendants || worker.debt) throw new Error("Native custody still open");
+        worker.closeJoined = true;
       },
       isAlive: async () => !worker.contactLost && (worker.alive || worker.descendants),
       stop: async () => {
@@ -731,6 +737,90 @@ describe("actor worker permit release (#9031)", () => {
       // Cancelling queued receipts never signals a worker or deletes run files.
       try {
         for (const waiting of snapshot(f).waiting) await f.agents.stop(waiting.runId, { consume: false });
+      } finally { Object.defineProperty(process, "platform", platform); }
+    }
+  });
+
+  it.each([
+    ["confirmed", "ESRCH"],
+    ["uncertain", "different-birth"],
+  ] as const)("Windows terminal %s close keeps RUN fenced across %s primary-death proof until the captured native close joins", async (closeOutcome, primaryProof) => {
+    const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+    const f = fixture();
+    let first: Worker | undefined;
+    try {
+      Object.defineProperty(process, "platform", { ...platform, value: "win32" });
+      const actor = await create(f, "terminal-proof-race");
+      const answer = f.actors.ask(actor.id, "terminal result while native close is pending");
+      void answer.catch(() => undefined);
+      first = await launched(f, actor.id);
+      const next = await blockedSuccessor(f);
+
+      // Publish the terminal result and host death in one turn, before the
+      // monitor's pre-terminal proof hook. Captured native close is still open.
+      first.primaryProofScans = 0;
+      save(first, { status: "completed", text: "finished", finishedAt: Date.now(), updatedAt: Date.now(), exitCode: 0 });
+      first.alive = false;
+      if (primaryProof === "ESRCH") first.identityAlive = false;
+      else { first.identityAlive = true; first.birth = "67890"; }
+      await eventually(() => {
+        expect(first!.primaryProofScans).toBeGreaterThan(0);
+        // Either the proper close join began, or the regression admitted a
+        // successor. Do not let a worker-writable terminal file alone pass.
+        expect(first!.closeStarted || workers.size > 1).toBe(true);
+      });
+      expect(first.closeJoined).toBe(false);
+      expect(workers.size, "primary death cannot bypass the pending Windows close").toBe(1);
+      expect(snapshot(f).held.map(held => held.runId)).toEqual([first.launch.id]);
+      expect(snapshot(f).waiting).toHaveLength(1);
+      expect(first.closeStarted).toBe(true);
+      await expect(answer).resolves.toMatchObject({ text: "finished" });
+
+      if (closeOutcome === "confirmed") {
+        first.nativeClose();
+        await eventually(() => expect(first!.closeJoined).toBe(true));
+        const second = await launched(f, next.actor.id);
+        expect(workers.size, "confirmed native close admits exactly one successor").toBe(2);
+        expect([...workers.values()].filter(worker => worker.launch.id === second.launch.id)).toHaveLength(1);
+        complete(second);
+        await expect(next.answer).resolves.toMatchObject({ text: "finished" });
+        await eventually(() => expect(snapshot(f).held).toEqual([]));
+      } else {
+        // Repeated host-proof scans and a late uncertain captured close must
+        // not erase the terminal path's persistent native-admission fence.
+        first.debt = "native tree close unconfirmed";
+        const scan = first.launch.onUnconfirmedExit!;
+        expect(scan).toBeTypeOf("function");
+        scan(first.debt);
+        scan(first.debt);
+        await observe();
+        expect(first.closeJoined).toBe(false);
+        expect(snapshot(f).held.map(held => held.runId)).toEqual([first.launch.id]);
+        expect(snapshot(f).waiting).toHaveLength(1);
+        expect(workers.size).toBe(1);
+
+        first.nativeClose();
+        scan(first.debt);
+        scan(first.debt);
+        await observe();
+        expect(first.closeJoined, "uncertain close is not joined custody").toBe(false);
+        expect(f.agents.retentionCustodyVeto(first.launch.id)).toBe(true);
+        expect(f.agents.heldPermits()).toBe(1);
+        expect(snapshot(f).held.map(held => held.runId)).toEqual([first.launch.id]);
+        expect(snapshot(f).waiting).toHaveLength(1);
+        expect(workers.size, "late uncertain close cannot launch the queued successor").toBe(1);
+      }
+    } finally {
+      if (first) {
+        first.alive = false;
+        first.descendants = false;
+        delete first.debt;
+        first.nativeClose();
+      }
+      // Cancel queued receipts; a RED early launch may have promoted one
+      // before the snapshot flush, so leave that fake to afterEach's drain.
+      try {
+        for (const waiting of snapshot(f).waiting) await f.agents.stop(waiting.runId, { consume: false }).catch(() => undefined);
       } finally { Object.defineProperty(process, "platform", platform); }
     }
   });

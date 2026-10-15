@@ -5335,8 +5335,6 @@ export class AgentManager {
   /** A leader's death forbids replay, but never substitutes for the whole native/tree join. */
   async #settleGoneActorWorker(managed: ManagedAgent, record: AgentRunRecord | undefined): Promise<boolean> {
     if ((managed.stopRequested && managed.workerGone !== managed.transport) || !this.#actorWorkerGone(managed)) return false;
-    // Current primary proof releases only RUN, even while its tree remains live.
-    this.#releaseProvenGone();
     // Preserve genuine terminal results; only missing/recoverable transport outcomes become loss.
     // Like #retryStartup, a window refusal outranks incidental auth/transport diagnostics.
     const terminalResult = (candidate: AgentRunRecord | undefined): boolean =>
@@ -5344,6 +5342,16 @@ export class AgentManager {
         (candidate.status === "completed" || candidate.errorCode === "CONTEXT_OVERFLOW" ||
           /Context exceeds window:/i.test(candidate.error ?? "") ||
           (!recoverableStop(candidate) && !transportExitedWithoutResult(candidate.error) && !retryablePiStartupError(candidate.error)));
+    if (terminalResult(record) && process.platform === "win32" && managed.transport.waitForClose &&
+        !managed.launchCancelled && !managed.transport.lostContact?.() && !managed.lostContact) {
+      // Transfer terminal admission to #settle's captured close/stop join before
+      // any primary-death scan can release it. Keep the fence through async
+      // terminal processing and permanently if that native join is uncertain.
+      managed.nativeAdmissionFenced = true;
+      return false;
+    }
+    // Nonterminal primary loss releases only RUN, even while its tree remains live.
+    this.#releaseProvenGone();
     // Primary loss is not a stop request: descendants may still own the native
     // session, including after actor abandonment. Observe their voluntary exit
     // before joining; #drainExecution would otherwise actively kill that tree.

@@ -62,7 +62,9 @@ function pinRoot() {
     // A child may narrow TMPDIR, but changing its environment must not widen the run's root.
     if (inheritedRoot !== null) {
       const cap = realpath(inheritedRoot);
-      return isShared(cap) ? undefined : within(cap, root) ? root : cap;
+      // Descendants may narrow TMPDIR for their own scratch files, but the inherited
+      // ceiling is the already-validated private test root and must not narrow with it.
+      return isShared(cap) ? undefined : cap;
     }
     return isShared(root) ? undefined : root;
   } catch { return undefined; }

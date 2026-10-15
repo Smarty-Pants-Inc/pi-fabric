@@ -1,4 +1,3 @@
-import { diagnostics } from "../core/diagnostics.js";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -630,9 +629,9 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
   const runRetentionMs = value === undefined ? undefined : Number(value);
   if (!root || !["--dry-run", "--apply"].includes(mode) || args.length > 2 || report === "" ||
       (runRetentionMs !== undefined && (!Number.isSafeInteger(runRetentionMs) || runRetentionMs < 60 * 60 * 1_000))) {
-    diagnostics.error("src/storage/retention-cli.ts", "Usage: node dist/storage/retention-cli.js <mesh-root> [--dry-run] [--runs-older-than <ms, >= 1 h>] [--report <file>]"); process.exitCode = 2;
+    console.error("Usage: node dist/storage/retention-cli.js <mesh-root> [--dry-run] [--runs-older-than <ms, >= 1 h>] [--report <file>]"); process.exitCode = 2;
   } else if (mode === "--apply") {
-    diagnostics.error("src/storage/retention-cli.ts", "retention-cli: --apply is disabled until smarty-dev#10678 (owner-attributed callback fencing) lands; nothing was changed. Use --dry-run.");
+    console.error("retention-cli: --apply is disabled until smarty-dev#10678 (owner-attributed callback fencing) lands; nothing was changed. Use --dry-run.");
     process.exitCode = 2;
   } else {
     try {
@@ -642,8 +641,8 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
       const text = JSON.stringify(result, null, 2);
       if (report !== undefined) writeReport(path.resolve(report), `${text}\n`); else console.log(text);
       // The operator's summary, on stderr so stdout stays one JSON document.
-      for (const line of summaryLines(result.dryRun, result.summary)) diagnostics.error("src/storage/retention-cli.ts", line);
+      for (const line of summaryLines(result.dryRun, result.summary)) console.error(line);
     }
-    catch (error) { diagnostics.error("src/storage/retention-cli.ts", error); process.exitCode = 1; }
+    catch (error) { console.error(error); process.exitCode = 1; }
   }
 }

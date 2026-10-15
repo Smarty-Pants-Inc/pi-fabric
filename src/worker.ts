@@ -326,7 +326,7 @@ const crash = createCrashFinisher({
   settled: () => executionSettled(),
   report: writeCrashStatus,
   exit: code => process.exit(code),
-  log: text => diagnostics.error("src/worker.ts", text),
+  log: text => console.error(text),
   // Keep the custodian available to its parent even if no native pipes remain.
   retain: () => { setInterval(() => {}, 1000); },
 });

@@ -138,7 +138,7 @@ describe("principal Fabric diagnostics", () => {
     const chmod = vi.spyOn(fs, "fchmodSync").mockImplementation(() => {});
     const close = vi.spyOn(fs, "closeSync").mockImplementation(() => {});
     const rename = vi.spyOn(fs, "renameSync").mockImplementation(() => {});
-    const write = vi.spyOn(fs, "writeSync").mockReturnValue(1);
+    const write = vi.spyOn(fs, "appendFileSync").mockImplementation(() => {});
     diagnostics.warn("src/test.ts", "first"); diagnostics.warn("src/test.ts", "second");
     await flushFabricDiagnostics();
     expect(mkdir).toHaveBeenCalled();

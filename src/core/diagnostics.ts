@@ -1,3 +1,4 @@
+import fs from "node:fs";
 import path from "node:path";
 import { format } from "node:util";
 import { resolveAgentDir } from "./agent-dir.js";
@@ -9,10 +10,35 @@ let sessionId: string | undefined;
 let pending: QueuedLine[] = [];
 let pendingBytes = 0;
 let draining: Promise<void> | undefined;
+let exitFlushRegistered = false;
 
 export const isPrincipalDiagnostics = (): boolean => process.env.SMARTY_ROLE?.startsWith("org-agent") === true;
 export const fabricDiagnosticsFile = (id: string): string =>
   path.join(resolveAgentDir(), "fabric", "diagnostics", `${encodeURIComponent(id)}.jsonl`);
+
+/** Shared synchronous writer for the first-use sink and the process-exit fallback. */
+export const appendDiagnosticSync = (id: string, line: string, bytes: number): void => {
+  let fd: number | undefined;
+  try {
+    const file = fabricDiagnosticsFile(id);
+    fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+    fd = fs.openSync(file, fs.constants.O_CREAT | fs.constants.O_APPEND | fs.constants.O_WRONLY | (fs.constants.O_NOFOLLOW ?? 0), 0o600);
+    const stat = fs.fstatSync(fd);
+    if (!stat.isFile() || stat.nlink !== 1) return;
+    fs.fchmodSync(fd, 0o600);
+    if (stat.size + bytes > DIAGNOSTICS_MAX_BYTES) {
+      fs.closeSync(fd);
+      fd = undefined;
+      fs.renameSync(file, `${file}.1`);
+      fd = fs.openSync(file, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY, 0o600);
+    }
+    fs.appendFileSync(fd, line);
+  } catch {
+    // A failed diagnostic write must not break the operation or reach the principal's pane.
+  } finally {
+    if (fd !== undefined) { try { fs.closeSync(fd); } catch {} }
+  }
+};
 
 const drain = (): void => {
   if (draining || !pending.some(row => row.id)) return;
@@ -43,6 +69,15 @@ const enqueue = (level: Level, source: string, message: string): void => {
   while (pending.length && pendingBytes + bytes > DIAGNOSTICS_MAX_BYTES) pendingBytes -= pending.shift()!.bytes;
   pending.push({ id: sessionId ?? (process.env.PI_FABRIC_SESSION_ID?.trim() || undefined), line, bytes });
   pendingBytes += bytes;
+  if (!exitFlushRegistered) {
+    exitFlushRegistered = true;
+    // An exit handler cannot await the lazy import. Use the same bounded, private writer.
+    process.once("exit", () => {
+      for (const row of pending) if (row.id) appendDiagnosticSync(row.id, row.line, row.bytes);
+      pending = [];
+      pendingBytes = 0;
+    });
+  }
   drain();
 };
 

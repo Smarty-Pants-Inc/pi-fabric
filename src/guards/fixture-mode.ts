@@ -1,5 +1,4 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { diagnostics } from "../core/diagnostics.js";
 import { detectPiHostVersion, fixturePiHostSupported, MINIMUM_FIXTURE_PI_HOST_VERSION } from "../host-compatibility.js";
 
 const READ_ONLY_TOOLS = ["read", "grep", "find", "ls"];
@@ -13,7 +12,7 @@ export const registerFabricFixture = (pi: ExtensionAPI): boolean => {
   if (!fixturePiHostSupported(version)) {
     // Pi catches extension factory errors and continues without that extension. A throw
     // would therefore discard these guards and start an unrestricted fixture session.
-    diagnostics.error("src/guards/fixture-mode.ts", `[pi-fabric] Refusing read-only fixture: requires Pi >= ${MINIMUM_FIXTURE_PI_HOST_VERSION} with fail-closed RPC/TUI user shell interception; detected ${version ?? "unknown host"}. Upgrade Pi or use a verifiable Pi CLI host.`);
+    console.error(`[pi-fabric] Refusing read-only fixture: requires Pi >= ${MINIMUM_FIXTURE_PI_HOST_VERSION} with fail-closed RPC/TUI user shell interception; detected ${version ?? "unknown host"}. Upgrade Pi or use a verifiable Pi CLI host.`);
     process.exit(1);
   }
   const restrictTools = () => pi.setActiveTools([...READ_ONLY_TOOLS]);

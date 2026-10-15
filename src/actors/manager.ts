@@ -915,6 +915,7 @@ export class ActorManager {
   readonly #canConsumeMesh: (() => boolean) | undefined;
   readonly #slots: ReturnType<typeof slotAdmissionFor>;
   readonly #slotRecovery: ActorSlotRecovery;
+  readonly #slotNameRegistries: readonly ActorRegistryStore[];
   readonly #slotEnabled = new Set<string>();
   readonly #slotRunIds = new Map<string, Set<string>>();
   readonly #slotLaunchUnknown = new Set<string>();
@@ -932,6 +933,8 @@ export class ActorManager {
       releasePaused?: boolean;
       /** Native-only shared protected readiness barrier, supplied by ActorDirectory. */
       slotRecovery?: ActorSlotRecovery;
+      /** Native-only directory registries: fence names across scopes during live/recovery projection. */
+      slotNameRegistries?: readonly ActorRegistryStore[];
       actorRoot?: string;
       actorScope?: import("./types.js").FabricActorStorageScope;
       persistent?: boolean;
@@ -1056,6 +1059,7 @@ export class ActorManager {
       this.#meshMonitor.schedule();
     });
     this.#registry = new ActorRegistryStore(this.#actorRoot);
+    this.#slotNameRegistries = options.slotNameRegistries ?? [];
     this.#bindings = new ActorBindingStore(
       sessionId,
       this.#persistent && meshConfig.enabled ? this.#actorRoot : undefined,
@@ -1080,6 +1084,7 @@ export class ActorManager {
       canAdmit: () => !this.#releaseStrict,
       maxReplayAgeMs: options.meshReplayAgeMs,
       replayAll: options.claimResidency === "durable",
+      isDurableWork: (event) => this.#slotEventDurable(event),
       beforePoll: () => {
         if (this.#releaseStrict || options.canConsumeMesh?.() === false) return false;
         // Initial publication may have outlived the first deferred slice (or
@@ -1097,7 +1102,8 @@ export class ActorManager {
         return !this.#halted;
       },
       onEvent: (event) => {
-        if (this.#releaseStrict || this.#slotEventParked(event)) return false;
+        if (this.#releaseStrict) return false;
+        if (this.#slotEventParked(event)) return "deferred";
         for (const [id, records] of this.#records) {
           if (this.#actors.has(id)) records.accept(event);
           else this.#records.delete(id);
@@ -1210,6 +1216,9 @@ export class ActorManager {
     const sameName = [...this.#actors.values()].find((actor) => actor.name === name && !actor.removal);
     const protectedBirth = this.#slotEnforced(request.topics ?? []);
     if (protectedBirth && !this.#persistent) throw new Error("Protected actor admission requires a persistent native registry");
+    // Ordinary incumbents cannot be an exact protected retry. Reject before the
+    // permanent intent/receipt boundary, without disturbing their accepted work.
+    if (protectedBirth) this.#assertNoOrdinaryNameConflict(name);
     if (sameName && sameName.status !== "stopped" && !protectedBirth) {
       throw new Error(`A Fabric actor named ${name} is already active (${sameName.id})`);
     }
@@ -1331,7 +1340,7 @@ export class ActorManager {
     if (protectedBirth && !this.#slotRecovery.ready) await this.recoverProtectedActors();
     // No predecessor, directory, map, registry or publication effect precedes this
     // common birth seam. Core owns the exact compare+intent transaction AND sync.
-    const admitted = await this.#slots.admit({ actorId: id, request: { ...request, name, topics },
+    const admit = () => this.#slots.admit({ actorId: id, request: { ...request, name, topics },
       spec: this.#serializedActor(actor), registryRoot: this.#actorRoot, caller: supervisorOwner,
       beforeCommit: (selectedId: string) => {
         id = selectedId;
@@ -1343,6 +1352,12 @@ export class ActorManager {
           throw new Error("Protected actor beforeCommit must be synchronous");
         }
       } });
+    // Validation/model resolution above can yield. Recheck the actual same-scope
+    // rows under registry-before-mesh custody before allowing any durable intent.
+    const admitted = protectedBirth ? await this.#registry.withLock(() => {
+      this.#assertNoOrdinaryNameConflict(name);
+      return admit();
+    }, undefined, "slot-admit") : await admit();
     if (!admitted) await beforeCommit?.(id);
     // All subsequent failures of a protected birth are occupied/uncertain. Never
     // compensate by deleting a claim, intent, or a successfully admitted actor.
@@ -1376,6 +1391,13 @@ export class ActorManager {
         claimVersion: request.slotClaim?.ifVersion, requestKey: request.idempotencyKey }, error);
     }
     } finally { --this.#pendingCreates; }
+  }
+
+  #assertNoOrdinaryNameConflict(name: string): void {
+    const rows = [...this.#actors.values(), ...this.#registry.snapshot().actors];
+    const conflict = rows.find(row => row.name === name && row.status !== "stopped" && !row.removal &&
+      !this.#slotEnforced(Array.isArray(row.topics) ? row.topics.filter((topic): topic is string => typeof topic === "string") : []));
+    if (conflict) throw new Error(`A Fabric actor named ${name} is already active (${conflict.id})`);
   }
 
   #publishSlotCreated(actor: ManagedActor): Promise<void> {
@@ -1448,6 +1470,17 @@ export class ActorManager {
     }
   }
 
+  #slotEventDurable(event: MeshEvent): boolean {
+    try {
+      // The monitor must select protected input BEFORE replay-age/archive filtering,
+      // even once reconciliation has opened the receiver. Unknown addressed input
+      // stays conservative until bootstrap identifies its native projection.
+      return this.#slotEnforced([event.topic]) || this.#slotEventParked(event) ||
+        [...this.#actors.values()].some(actor =>
+          (event.to === actor.id || event.to === actor.name || actor.topics.includes(event.topic)) && this.#slotEnforced(actor.topics));
+    } catch { return true; }
+  }
+
   #slotEventParked(event: MeshEvent): boolean {
     try {
       if (!this.#slotRecovery.ready) {
@@ -1510,16 +1543,28 @@ export class ActorManager {
     }
   }
 
-  /** Registry-before-mesh, one acquisition, no call to #saveActors/#publishPresence
+  /** Registries-before-mesh, each acquired once, no call to #saveActors/#publishPresence
    * (both reacquire custody). Core's state fence ends BEFORE registry file I/O;
    * the held registry prevents revokers from crossing validation and enable.
    */
   async #materializeSlot(id: string, spec: Record<string, unknown>): Promise<ManagedActor> {
     const topics = Array.isArray(spec.topics) ? spec.topics.filter((v): v is string => typeof v === "string") : [];
     if (spec.id !== id || !/^[a-f0-9]{32}$/.test(id)) throw new Error("Invalid protected recovery ID");
-    return this.#registry.withLock(() => {
+    const registries = [this.#registry, ...this.#slotNameRegistries];
+    // Acquire every native scope once, in global path order, BEFORE mesh custody.
+    // Recovery and exact retries use this same seam, not the live predecessor hook.
+    return ActorRegistryStore.withLocks(registries, () => {
       this.#slots.withCurrent(id, topics, this.#actorRoot, () => undefined);
       const rows = this.#registry.snapshot().actors;
+      const conflict = registries.flatMap(registry => registry.snapshot().actors)
+        .find(row => row.id !== id && row.name === spec.name);
+      if (conflict) {
+        // Even stopped, removing or quarantined rows retain their name until
+        // checked native cleanup completes. Never adopt, overwrite or drop queues.
+        this.#slotEnabled.delete(id);
+        this.#slotParkedRows.set(id, spec);
+        throw new Error(`Protected Fabric actor ${id} is parked until same-name predecessor ${conflict.id} finishes native cleanup`);
+      }
       const existing = rows.find(row => row.id === id);
       // Mutable queues, message heads, bindings and status belong to the existing
       // row, never the original empty birth projection. Identity cannot drift.
@@ -1536,7 +1581,7 @@ export class ActorManager {
       this.#ownership.set(id, this.#ownershipDecision(id));
       this.#pendingPresence.add(id);
       return actor;
-    }, undefined, "slot-project");
+    }, "slot-project");
   }
 
   /** ActorDirectory supplies foreign-session discovery; a single registry has none. */
@@ -5632,10 +5677,10 @@ export class ActorManager {
     }
   }
 
-  // Returns false only when a receiver could not checkpoint the event (or, on a non-persistent
-  // host, a fleet.* receiver's queue was full); the monitor then offers it again and actors that
-  // already took it are skipped. A durable receiver's full queue dead-letters instead (#816).
-  #dispatchMeshEvent(event: MeshEvent): boolean | "ignored" {
+  // Protected authority refusal is always deferred, independently of topic/replay mode.
+  // Ordinary false retains the monitor's existing queue-backpressure policy. Receivers
+  // that already checkpointed a partial delivery are skipped on retry (#816).
+  #dispatchMeshEvent(event: MeshEvent): boolean | "ignored" | "deferred" {
     // Empty polls only observe owners through the idle cache. The matched targets below
     // revalidate canonical ownership before delivery; unrelated mesh traffic must not refresh
     // every actor. Async continuations also recheck after every wait (smarty-dev#4383).
@@ -5650,8 +5695,8 @@ export class ActorManager {
     }
   }
 
-  #deliverMeshEvent(event: MeshEvent): boolean | "ignored" {
-    if (this.#slotEventParked(event)) return false;
+  #deliverMeshEvent(event: MeshEvent): boolean | "ignored" | "deferred" {
+    if (this.#slotEventParked(event)) return "deferred";
     // Keep stable IDs across ownership refreshes: persistent reacquisition can replace
     // every ManagedActor object before the synchronous delivery loop enqueues work.
     const targets = [...this.#actors.values()].filter((actor) => {
@@ -5667,8 +5712,9 @@ export class ActorManager {
     return this.#withOwnershipRead(() => this.#deliverMeshTargets(event, targets));
   }
 
-  #deliverMeshTargets(event: MeshEvent, targets: readonly string[]): boolean | "ignored" {
+  #deliverMeshTargets(event: MeshEvent, targets: readonly string[]): boolean | "ignored" | "deferred" {
     let full = false;
+    let deferred = false;
     let handedOn = false;
     for (const actorId of targets) {
       this.#refreshOwnership(actorId);
@@ -5676,7 +5722,7 @@ export class ActorManager {
       // the captured object; resolve the current actor and recheck its filters.
       const actor = this.#actors.get(actorId);
       if (!actor || actor.status === "stopped") continue;
-      if (!this.#slotCurrent(actor)) { full = true; continue; }
+      if (!this.#slotCurrent(actor)) { deferred = true; continue; }
       const addressed = event.to === actor.id || event.to === actor.name;
       if (!(addressed || actor.topics.includes(event.topic)) ||
         (event.from.id === actor.id && !addressed)) continue;
@@ -5698,12 +5744,15 @@ export class ActorManager {
           this.#delivered.delete(this.#delivered.values().next().value!);
         }
       } catch (error) {
+        // Authority can change during ownership refresh or synchronous enqueue hooks.
+        // Never conflate that protected refusal with ordinary live non-work pressure.
+        if (!this.#slotCurrent(actor)) deferred = true;
         // A stopped actor or other failure skips the event, as before; a full queue defers it.
         if (error instanceof ActorQueueCheckpointError ||
           (error instanceof Error && error.message.startsWith("Fabric actor queue limit reached"))) full = true;
       }
     }
-    return full ? false : handedOn ? true : "ignored";
+    return deferred ? "deferred" : full ? false : handedOn ? true : "ignored";
   }
 
   #processedMeshKey(actor: ManagedActor, source: string, payload: unknown): string | undefined {

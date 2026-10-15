@@ -60,7 +60,8 @@ afterEach(() => {
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 
-describe("native fresh authority bootstrap", () => {
+// Native first-attach enforcement is Linux-only (/etc/machine-id and opened-fd evidence).
+describe.runIf(process.platform === "linux")("native fresh authority bootstrap", () => {
   it("publishes no authority from empty existing DB, and leaves one-shot crash orphans blocked (#13036)", async () => {
     const root = temp(), plan = planAt(root);
     installPolicy([plan]);
@@ -108,6 +109,10 @@ describe("native fresh authority bootstrap", () => {
     expect(before.status().enforcement).toBe("blocked");
   });
 
+});
+
+// Existing-authority status/ordinary behavior is supported on every platform.
+describe("native unenforced authority boundary", () => {
   it("leaves direct existing SQLite allowed UNENFORCED with an explicit #7991/#13036 gap", async () => {
     installPolicy([]);
     const mesh = meshAt(path.join(temp(), "existing")), coordinator = slotAdmissionFor(mesh);
@@ -126,6 +131,19 @@ describe("native fresh authority bootstrap", () => {
     expect(ordinary.requiresRecovery(path.join(temp(), "ordinary-registry"))).toBe(false);
   });
 
+  it("keeps unbound NATS status and protected-topic creation visibly unenforced on every platform", async () => {
+    installPolicy([]);
+    const nats = { root: path.join(temp(), "nats"), stateBackend: "nats" } as unknown as MeshStore;
+    const coordinator = slotAdmissionFor(nats), registryRoot = path.join(temp(), "registry");
+    expect(coordinator.status()).toMatchObject({ enforcement: "unenforced", reason: "nats-backend", gap: "smarty-dev#7991" });
+    expect(coordinator.requiresEnforcement([routes[0]!.topic], registryRoot, caller.id)).toBe(false);
+    await expect(coordinator.admit({ actorId: "ordinary", request: { name: "legacy", instructions: "Work", topics: [routes[0]!.topic] },
+      spec: {}, registryRoot, caller })).resolves.toBeUndefined();
+    expect(coordinator.requiresRecovery(registryRoot, caller.id)).toBe(false);
+  });
+});
+
+describe.runIf(process.platform === "linux")("native fresh authority binding", () => {
   it("keeps matching-binding NATS births/lifecycle allowed UNENFORCED without invoking any SQLite gate", async () => {
     // Policy-branch evidence only, not a NATS server/persistence test. The real trusted fresh
     // binding remains configured; the backend surface throws if enforcement tries to use it.
@@ -216,7 +234,7 @@ describe("native fresh authority bootstrap", () => {
   });
 });
 
-describe("same-transaction permanent actor-birth ledger", () => {
+describe.runIf(process.platform === "linux")("same-transaction permanent actor-birth ledger", () => {
   it("rejects missing, malformed, stale, foreign and multi-slot claims before the acceptance callback or any intent", async () => {
     const f = await fresh();
     const callback = vi.fn();

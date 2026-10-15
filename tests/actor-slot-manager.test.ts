@@ -244,8 +244,8 @@ describe("manager protected birth/recovery seam", () => {
     recover = async registryRoot => { if (registryRoot === actorRoots.session) { reached.resolve(); await gate.promise; } };
     const { directory } = open(root);
     expect(directory.listOwned()).toEqual([]);
-    expect(doubles.monitors.every(monitor => monitor.onEvent(event()) === false)).toBe(true);
-    expect(doubles.monitors.every(monitor => monitor.onEvent(event("fabric.steer", "b".repeat(32))) === false)).toBe(true);
+    expect(doubles.monitors.every(monitor => monitor.onEvent(event()) === "deferred")).toBe(true);
+    expect(doubles.monitors.every(monitor => monitor.onEvent(event("fabric.steer", "b".repeat(32))) === "deferred")).toBe(true);
     const pending = directory.recoverProtectedActors();
     await reached.promise;
     expect(directory.listOwned()).toEqual([]);
@@ -273,7 +273,7 @@ describe("manager protected birth/recovery seam", () => {
     // Do NOT call resumeAfterRelease in this no-worker suite: test its parked
     // ingress contract directly without enabling unrelated native maintenance.
     expect(directory.listOwned()).toEqual([]);
-    expect(doubles.monitors[0]!.onEvent(event("fabric.steer", intent.actorId))).toBe(false);
+    expect(doubles.monitors[0]!.onEvent(event("fabric.steer", intent.actorId))).toBe("deferred");
     expect(() => directory.tell(intent.actorId, "must not accept")).toThrow();
     expect(runner).not.toHaveBeenCalled();
   });
@@ -310,7 +310,7 @@ describe("manager protected birth/recovery seam", () => {
     expect(failure.code).toBe("FABRIC_ACTOR_SLOT_RECOVERY_PARKED");
     expect(directory.slotRecoveryStatus()).toMatchObject({ ready: false, error: { code: "FABRIC_ACTOR_SLOT_RECOVERY_PARKED", message: expect.stringContaining("authority unavailable") } });
     expect(directory.listOwned()).toEqual([]);
-    expect(doubles.monitors[0]!.onEvent(event())).toBe(false);
+    expect(doubles.monitors[0]!.onEvent(event())).toBe("deferred");
     const ordinary = await directory.create({ name: "ordinary during outage", instructions: "unrelated" });
     const accepted = directory.tell(ordinary.id, "still usable");
     expect(accepted.queued).toBe(true);
@@ -358,7 +358,7 @@ describe("manager protected birth/recovery seam", () => {
     directory.resumeAfterRelease();
     expect(directory.listOwned()).toEqual([]);
     expect(() => directory.tell(actor.id, "must not enqueue")).toThrow("parked");
-    expect(doubles.monitors[0]!.onEvent(event())).toBe(false);
+    expect(doubles.monitors[0]!.onEvent(event())).toBe("deferred");
     expect(runner).not.toHaveBeenCalled();
   });
 

@@ -6,7 +6,7 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { build } from "esbuild";
-import { afterEach, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { MeshStore } from "../src/mesh/store.js";
 import { readHostPolicy } from "../src/host-policy.js";
 import { initializeFreshSlotAuthority, slotPhysicalHostIdentity, slotRoutesDigest, type SlotAuthorityBinding } from "../src/actors/slot-authority.js";
@@ -79,6 +79,8 @@ afterEach(async () => {
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 }, 30_000);
 
+// Enforcement requires Linux native DB evidence; public/wire/CLI boundaries remain portable.
+describe.runIf(process.platform === "linux")("native Linux multiprocess slot admission", () => {
 it("multiprocess: concurrent same-role births serialize to one durable permanent ID", async () => {
   const f = await fixture(), a = f.child(f.input("actor-a", "request-a")), b = f.child(f.input("actor-b", "request-b"));
   await Promise.all([a.ready, b.ready]); a.go(); b.go();
@@ -126,3 +128,4 @@ it.each([["exit-before-commit", 42, 0], ["exit-before-sync", 43, 1]] as const)(
     if (count) expect(recovered[0]).toMatchObject({ actorId: "actor-crash", state: "admitted" });
     expect(fs.existsSync(path.join(f.binding.registryRoots[0]!, "actors.json"))).toBe(false);
   }, 30_000);
+});

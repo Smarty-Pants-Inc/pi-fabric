@@ -4,6 +4,7 @@ import { ActorManager } from "./manager.js";
 import { SessionActorOrphans } from "./session-orphans.js";
 import { ActorSlotRecovery } from "./slot-recovery.js";
 import { slotAdmissionFor } from "./slot-admission.js";
+import { ActorRegistryStore } from "./registry-store.js";
 
 /**
  * Run every halt step even when one throws, then report every failure at once: a scope
@@ -41,7 +42,12 @@ export class ActorDirectory extends ActorManager {
     roots: ActorDirectoryRoots,
     defaultScope: FabricActorStorageScope,
   ) {
-    const options = { ...(base[6] ?? {}), slotRecovery: base[6]?.slotRecovery ?? new ActorSlotRecovery() };
+    const options = { ...(base[6] ?? {}), slotRecovery: base[6]?.slotRecovery ?? new ActorSlotRecovery(),
+      // Both managers (including startup recovery) fence actual registry rows,
+      // not list() views which intentionally hide quarantined protected actors.
+      slotNameRegistries: base[6]?.persistent === true
+        ? [new ActorRegistryStore(roots.project), new ActorRegistryStore(roots.session)] : [],
+    };
     const meshCursorPath = options.meshCursorPath;
     delete options.actorRoot;
     delete options.meshCursorPath;
@@ -122,7 +128,9 @@ export class ActorDirectory extends ActorManager {
     const existing = sameName.find((actor) => actor.status !== "stopped");
     const slots = slotAdmissionFor(this.mesh);
     const protectedBirth = slots.requiresEnforcement(request.topics ?? [], this.#slotRegistryRoots[scope], this.#slotCallerId);
-    // Exact retries must reach the authoritative ledger, not a same-name shortcut.
+    // Exact protected retries must reach the ledger. The target manager rejects
+    // same-scope ordinary conflicts before intent; cross-scope cleanup stays in
+    // the post-admission hook, with projection parked while any native row remains.
     if (existing && !protectedBirth) throw new Error(`A Fabric actor named ${name} is already active (${existing.id})`);
     const fencedOptions = {
       ...options,

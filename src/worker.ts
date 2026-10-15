@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { childProcessEnvironment } from "./core/atomic-write.js";
+import { detachedPreview } from "./core/preview.js";
 import fs from "node:fs";
 import { followUpFile, followUpState, followUpMessageId, releaseFollowUpPayload } from "./agents/follow-up-delivery.js";
 import path from "node:path";
@@ -286,7 +287,7 @@ const assistantError = (message: Record<string, unknown>): string => {
   const model = stringField(message.model);
   const source = [provider, model].filter((value): value is string => Boolean(value)).join("/");
   const summary = unique.join(" · ") || "Pi agent reported an error";
-  return `${source ? `${source}: ` : ""}${summary}`.slice(0, MAX_STDERR_CHARS);
+  return detachedPreview(`${source ? `${source}: ` : ""}${summary}`, MAX_STDERR_CHARS);
 };
 
 const runnerLabel = (runner: string): string =>
@@ -1597,7 +1598,7 @@ const main = async (): Promise<void> => {
       } catch { /* The reply tool's durable file is authoritative, never final prose. */ }
       if (record.value === undefined) {
         record.status = "failed";
-        const snippet = record.text.trim().slice(0, 200);
+        const snippet = detachedPreview(record.text.trim(), 200);
         record.error = `Directive reply missing: the run ended without a fabric_reply call${snippet ? ` (final text: ${snippet}${record.text.trim().length > 200 ? "…" : ""})` : ""}`;
       }
     }
@@ -1608,7 +1609,7 @@ const main = async (): Promise<void> => {
         record.status = "failed";
         const reason = error instanceof Error ? error.message : String(error);
         const output = record.text.trim();
-        const snippet = output.slice(0, 200);
+        const snippet = detachedPreview(output, 200);
         record.error = `Structured agent output was invalid: ${reason}${snippet ? ` (output: ${snippet}${output.length > 200 ? "…" : ""})` : ""}`;
       }
     }
@@ -2178,7 +2179,8 @@ const main = async (): Promise<void> => {
     }
     if (event.type === "extension_error") {
       const error = typeof event.error === "string" ? event.error : "Extension error";
-      stderr = `${stderr}\n${error}`.trim().slice(-MAX_STDERR_CHARS);
+      const combined = `${stderr}\n${error}`.trim();
+      stderr = detachedPreview(combined.slice(-MAX_STDERR_CHARS), MAX_STDERR_CHARS);
       update();
     }
   };
@@ -2374,7 +2376,7 @@ const main = async (): Promise<void> => {
       receiptLineDropped = true;
       record.writeReceipt = receiptNow(); // stored now too, in case no later end or terminal write comes
     }
-    oversized = { chars: text.length, prefix: text.slice(0, MAX_EVENT_LINE_CHARS) };
+    oversized = { chars: text.length, prefix: detachedPreview(text, MAX_EVENT_LINE_CHARS) };
   };
   const finishOversizedEvent = (): void => {
     if (!oversized) return;
@@ -2416,7 +2418,7 @@ const main = async (): Promise<void> => {
     if (!text) return;
     appendLog(`${JSON.stringify({ type: "worker_stderr", text })}\n`);
     process.stderr.write(text);
-    stderr = `${stderr}${text}`.slice(-MAX_STDERR_CHARS);
+    stderr = detachedPreview(`${stderr}${text}`.slice(-MAX_STDERR_CHARS), MAX_STDERR_CHARS);
   };
   const consumeOutput = (decoded: string, projected = false): void => {
     if (options.runner === "veda") {
@@ -2453,6 +2455,9 @@ const main = async (): Promise<void> => {
       outputBuffer = outputBuffer.slice(newline + 1);
       processEvent(line);
     }
+    // Only the unfinished line survives until the next read. Copy once here,
+    // not at each transient line slice in a multi-event chunk.
+    outputBuffer = detachedPreview(outputBuffer, outputBuffer.length);
   };
   const attachChildStreams = (): void => {
     child.on("message", (message: unknown) => {
@@ -2737,7 +2742,7 @@ const main = async (): Promise<void> => {
   }
   runLog.flush();
   record.exitCode = exitCode;
-  record.stderr = stderr.slice(-MAX_STDERR_CHARS);
+  record.stderr = detachedPreview(stderr.slice(-MAX_STDERR_CHARS), MAX_STDERR_CHARS);
   if (
     record.compaction?.status === "queued" ||
     record.compaction?.status === "in_flight"

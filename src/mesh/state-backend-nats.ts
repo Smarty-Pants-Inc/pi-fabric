@@ -23,6 +23,7 @@ import {
   type MeshBatchResult, type MeshBatchView, type MeshReadOptions, type MeshStateEntry,
 } from "./state-file.js";
 import { validateMeshStateKey } from "./state-sqlite.js";
+import { readMeshStateNatsMarker } from "./backend-fence.js";
 import { MeshLockTimeoutError } from "../core/atomic-write.js";
 import { MeshSyncNotDurableError } from "./not-durable.js";
 
@@ -47,13 +48,28 @@ export interface NatsStreamMessage { seq: number; data: Uint8Array; msgID?: stri
  * (state-backend-nats-client.ts); tests use an in-process fake with the same semantics.
  */
 export interface JetStreamPort {
-  /** Server facts for the refusals: its version and whether it fsyncs every write (`/varz` sync_always). */
-  server(): Promise<{ version: string; syncAlways: boolean | undefined; maxPayload?: number; authRequired?: boolean }>;
+  /**
+   * Server facts for the refusals: its version, whether it fsyncs every write (`/varz` sync_always), its payload cap and
+   * whether it requires authentication (pi-fabric#907); and the target identity of this connection (smarty-dev#9690):
+   * cluster (else server) name, JetStream domain, and the user's account from `$SYS.REQ.USER.INFO` (undefined when the
+   * server or the account's permissions do not answer it).
+   */
+  server(): Promise<{ version: string; syncAlways: boolean | undefined; maxPayload?: number; authRequired?: boolean;
+    name?: string; cluster?: string; domain?: string; account?: string }>;
   /** Creates the stream if absent (file storage, these subjects; an existing stream gains missing ones); returns its last sequence.
    * `replicas` (smarty-dev#11373): the stream's num_replicas on create; an existing stream whose num_replicas differs is
    * refused (MeshStateNatsRefusedError) before anything is changed, never lowered or raised. Omitted: the real client
-   * uses the replicas it was connected with (explicit, else the agent fabric.json layer's mesh.nats.replicas). */
-  ensureStream(stream: string, subjects: string[], options: { maxMsgSize: number; replicas?: number }): Promise<{ lastSeq: number; maxMsgSize?: number }>;
+   * uses the replicas it was connected with (explicit, else the agent fabric.json layer's mesh.nats.replicas).
+   * `create: false` (smarty-dev#9690): an absent stream refuses (MeshStateNatsRefusedError) and nothing is created; an
+   * existing one gets the same replica check and readiness wait. */
+  ensureStream(stream: string, subjects: string[], options: { maxMsgSize: number; replicas?: number; create?: boolean }): Promise<{ lastSeq: number; maxMsgSize?: number }>;
+  /** The stream's creation time (ISO 8601, as the server reports it), last sequence and message cap, or undefined when absent. */
+  streamInfo(stream: string): Promise<{ created: string; lastSeq: number; maxMsgSize?: number } | undefined>;
+  /** Creates an ABSENT stream (an existing one refuses) through ensureStream's own create (placement, replicas,
+   * readiness); returns its creation time. */
+  createStream(stream: string, subjects: string[], options: { maxMsgSize: number; replicas?: number }): Promise<{ created: string }>;
+  /** Deletes a stream (an abandoned import's own, smarty-dev#9690); false when it was absent. */
+  deleteStream(stream: string): Promise<boolean>;
   /** The stream's last sequence now (leader). */
   lastSequence(stream: string): Promise<number>;
   /** The stream's first stored sequence now (above 1 after a purge). */
@@ -440,6 +456,10 @@ export interface NatsStateBackendOptions {
   maxReplay?: number;
   /** The stream's replicas, passed to the port's ensureStream (smarty-dev#11373). Omitted: the port decides. */
   replicas?: number;
+  /** Create the stream when absent (default true). The root's open passes false: a migration creates streams. */
+  create?: boolean;
+  /** smarty-dev#9690, the reader proof only: reads pass while the stream is importing (writes still refuse). */
+  readImporting?: boolean;
 }
 
 const DEFAULT_TOMBSTONES = 2_048;
@@ -520,8 +540,11 @@ export class NatsStateBackend implements StateBackend {
   static async open(options: NatsStateBackendOptions): Promise<NatsStateBackend> {
     const backend = new NatsStateBackend(options);
     try {
+      // smarty-dev#9690: `create: false` (a root's open, a reader proof) never creates a stream; a migration made it with
+      // both subjects and the cap. The existing stream still gets the replica check and readiness wait (smarty-dev#11373).
       const { lastSeq, maxMsgSize } = await options.port.ensureStream(options.stream, [options.subject, options.snapshotSubject],
-        { maxMsgSize: backend.#limits.maxMessageBytes, ...(options.replicas === undefined ? {} : { replicas: options.replicas }) });
+        { maxMsgSize: backend.#limits.maxMessageBytes, ...(options.replicas === undefined ? {} : { replicas: options.replicas }),
+          ...(options.create === false ? { create: false } : {}) });
       // The server enforces the message cap too (pi-fabric#907): a stream with no limit, or a larger one, is refused.
       if (maxMsgSize === undefined || maxMsgSize <= 0 || maxMsgSize > backend.#limits.maxMessageBytes) {
         throw new MeshStateNatsLimitError(`the stream ${options.stream} allows messages of ${maxMsgSize === undefined || maxMsgSize <= 0 ? "any size" : `${maxMsgSize} bytes`} (limit ${backend.#limits.maxMessageBytes}); set its max_msg_size`);
@@ -881,7 +904,13 @@ export class NatsStateBackend implements StateBackend {
     if (this.#closed) throw new Error("Fabric mesh NATS state backend is closed");
     if (this.#failure !== undefined) throw this.#failure;
     const snapshot = (options.snapshot as NatsSnapshot | undefined) ?? this.#snapshot;
-    if (snapshot.status === "retired") throw new MeshStateNatsRefusedError("the stream is retired (rolled back); reopen on the active backend");
+    // The CURRENT model and the given token both count: an older token never reads past a retire or an import.
+    if (snapshot.status === "retired" || this.#snapshot.status === "retired") {
+      throw new MeshStateNatsRefusedError("the stream is retired (rolled back); reopen on the active backend");
+    }
+    if ((snapshot.status === "importing" || this.#snapshot.status === "importing") && this.#options.readImporting !== true) {
+      throw new MeshStateNatsRefusedError("the stream is importing (smarty-dev#9690): no reads until import-commit");
+    }
     if (options.fresh === true && this.#knownSeq > this.#snapshot.seq) {
       throw new MeshStateNatsBusyError(`the projector is at ${this.#snapshot.seq} of ${this.#knownSeq}`);
     }
@@ -1157,6 +1186,13 @@ const versionAtLeast = (version: string, minimum: readonly number[]): boolean =>
 /** Test-only: the floor comparison (the semver parity check). */
 export const natsVersionAtLeastForTest = versionAtLeast;
 
+/**
+ * The target identity T of a connection (smarty-dev#9690): `cluster-or-server/domain/account`. Undefined when the server
+ * does not tell this user its account ($SYS.REQ.USER.INFO): a proof or a switch that needs T then refuses.
+ */
+export const natsTargetOf = (server: { name?: string; cluster?: string; domain?: string; account?: string }): string | undefined =>
+  server.account === undefined ? undefined : `${server.cluster ?? server.name ?? "unknown"}/${server.domain ?? ""}/${server.account}`;
+
 /** Refuses a nats-server below the floor, by #937's strict-semver rule: an unparseable version or a prerelease of the
  * floor refuses (the backend's open and the migration share it, pi-fabric#918). */
 export const assertNatsServerSupported = (version: string): void => {
@@ -1409,6 +1445,26 @@ export const natsStreamName = (root: string): string => {
   return `FABRIC_MESH_${createHash("sha256").update(canonical, "utf8").digest("hex").slice(0, 32)}`;
 };
 
+/** A per-switch stream id (smarty-dev#9690): 32 lowercase hex. */
+export const NATS_SWITCH_ID = /^[0-9a-f]{32}$/;
+
+/**
+ * Whether `stream` belongs to `root` (pi-fabric#937: no stream override, so two roots never share one): exactly the
+ * root's fixed stream natsStreamName(root) (a marker of the earlier, fixed-root layout), or a per-switch stream
+ * `natsStreamName(root)_<32 hex switch id>` (smarty-dev#9690). Anything else is never opened, imported, proven or deleted.
+ */
+export const isNatsStreamForRoot = (root: string, stream: string): boolean => {
+  const base = natsStreamName(root);
+  if (stream === base) return true;
+  return stream.startsWith(`${base}_`) && NATS_SWITCH_ID.test(stream.slice(base.length + 1));
+};
+
+/** The per-switch stream of a root and switch id (validated: 32 lowercase hex). */
+export const natsSwitchStreamName = (root: string, switchId: string): string => {
+  if (!NATS_SWITCH_ID.test(switchId)) throw new MeshStateNatsRefusedError(`NATS switch id ${JSON.stringify(switchId)} is not 32 lowercase hex characters`);
+  return `${natsStreamName(root)}_${switchId}`;
+};
+
 /** Where to reach a nats-server: the official client on `servers` (with `monitoringUrl`, `tls`), or an injected port. */
 export interface NatsEndpointOptions {
   servers?: string[];
@@ -1494,16 +1550,26 @@ export const openNatsStateBackend = async (options: OpenNatsStateBackendOptions)
       throw new MeshStateNatsRefusedError(`nats-server does not report sync_always (got ${String(server.syncAlways)}): an acked write may not survive a power loss; the operator may accept it explicitly`);
     }
     assertNatsMaxPayload(server);
-    const stream = natsStreamName(root);
+    const rootStream = natsStreamName(root);
     // smarty-dev#9663 item 4: a stream under the c03c829f name holds this root's state; the hashed stream would
     // silently start empty beside it. Refuse until the operator migrates it.
     const legacy = legacyNatsStreamName(root);
-    if (legacy !== stream && await port.streamExists(legacy)) {
+    if (legacy !== rootStream && await port.streamExists(legacy)) {
       throw new MeshStateNatsRefusedError(`the stream ${legacy} holds this root's state under the old (c03c829f) name; ` +
-        `migrate it to ${stream} (or remove it after an export), then open again: it is never replaced silently`);
+        `migrate it to ${rootStream} (or remove it after an export), then open again: it is never replaced silently`);
     }
+    // smarty-dev#9690 (and #9663 item 7): a root's stream comes ONLY from its NATS moved marker, and the open never
+    // creates a stream. Nothing can find an import's stream before the marker names it; a root without the marker
+    // (live file state, or an unmigrated root) refuses instead of opening some derived, empty stream.
+    const marker = readMeshStateNatsMarker(root);
+    if (!marker) throw new MeshStateNatsRefusedError(`${root} has no NATS moved marker: migrate it first (importMeshStateToNats)`);
+    // pi-fabric#937: the marker's stream must be this root's (its fixed stream, or one of its per-switch streams).
+    if (!isNatsStreamForRoot(root, marker.natsStream)) {
+      throw new MeshStateNatsRefusedError(`${root}'s marker names stream ${marker.natsStream}, which is not this root's (${rootStream} or ${rootStream}_<switch id>)`);
+    }
+    const stream = marker.natsStream;
     const backend = await NatsStateBackend.open({ port, stream, subject: `${stream}.state`, snapshotSubject: `${stream}.snapshot`,
-      maxEventBytes: options.maxEventBytes ?? 1024 * 1024,
+      maxEventBytes: options.maxEventBytes ?? 1024 * 1024, create: false,
       ...(options.snapshotEvery === undefined ? {} : { snapshotEvery: options.snapshotEvery }),
       ...(options.maxStateBytes === undefined ? {} : { maxStateBytes: options.maxStateBytes }),
       ...(options.maxReplay === undefined ? {} : { maxReplay: options.maxReplay }),

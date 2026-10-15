@@ -7,7 +7,8 @@ import { isMeshLockTimeout } from "../src/core/atomic-write.js";
 import { importMeshState } from "../src/mesh/backend-migration.js";
 import { MeshStateBusyError } from "../src/mesh/state-backend.js";
 import { MeshStore } from "../src/mesh/store.js";
-import { closeNatsStateBackend } from "../src/mesh/state-backend-nats.js";
+import { closeNatsStateBackend, natsStreamName } from "../src/mesh/state-backend-nats.js";
+import { readMeshStateNatsMarker } from "../src/mesh/backend-fence.js";
 import { itFor, natsMonitorUrl, natsServerUrl, prepareNatsRoot, reportNatsSkip } from "./helpers/nats-state-server.js";
 
 // Four processes write one sqlite-backed (or, on a real nats-server, one NATS-backed: smarty-dev#7504) mesh root
@@ -79,6 +80,7 @@ describe.each(["sqlite", "nats"] as const)("%s state backend across processes", 
     // sqlite mode opens only an imported root (smarty-dev#6477): the harness imports the fresh root first.
     // nats: every process prepares the root; its stream is derived from the fresh root (pi-fabric#937).
     if (kind === "sqlite") await importMeshState(root);
+    else { await prepareNatsRoot(root); closeNatsStateBackend(root); } // the stream and the root's marker
     const seen: string[] = [];
     const watcher = fs.watch(root, (_event, name) => { if (name) seen.push(String(name)); });
     const count = 40;
@@ -95,7 +97,11 @@ describe.each(["sqlite", "nats"] as const)("%s state backend across processes", 
     expect(seen.filter(name => name.startsWith(".lock"))).toEqual([]);
     // The import left only the moved marker; no writer wrote state.json (nats: no local state file at all).
     if (kind === "sqlite") expect(JSON.parse(fs.readFileSync(path.join(root, "state.json"), "utf8"))).toMatchObject({ format: "sqlite", movedTo: "state.db", epoch: 1 });
-    else expect(fs.readdirSync(root).filter(name => name.startsWith("state"))).toEqual([]);
+    else {
+      // No local state file: state.json is only the NATS marker that names the stream.
+      expect(fs.readdirSync(root).filter(name => name.startsWith("state"))).toEqual(["state.json"]);
+      expect(readMeshStateNatsMarker(root)?.natsStream).toBe(natsStreamName(root));
+    }
     // nats: a fresh process view replays the stream from the server.
     if (kind === "nats") await prepareNatsRoot(root);
     const store = new MeshStore(root, 64 * 1024, 1_000, { stateBackend: kind });

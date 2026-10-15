@@ -25,15 +25,16 @@
  * The local locks fence this host only; other hosts are fenced by the stream itself (every nats write carries an
  * expected sequence). This module loads the NATS client only when no port is given.
  */
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { renameAtomic } from "../core/atomic-write.js";
 import { encodeMeshStateNatsMarker, readMeshStateMovedMarker, readMeshStateNatsMarker } from "./backend-fence.js";
 import { MeshBackendRefusedError, meshSnapshotDigest, normalizeSnapshot, type MeshBackendStep, type MeshStateSnapshot } from "./backend-migration.js";
 import { holdMeshFence } from "./fence-lock.js";
-import { applyNatsMessage, assertNatsMaxPayload, assertNatsServerSupported, connectNatsEndpoint, MAX_MESSAGE_BYTES, NatsStateBackend,
-  natsSnapshotLimits, natsStreamName, NatsWrongLastSequenceError, type JetStreamPort, type NatsLookup, type NatsTlsFiles } from "./state-backend-nats.js";
+import { applyNatsMessage, assertNatsMaxPayload, assertNatsServerSupported, connectNatsEndpoint, isNatsStreamForRoot, MAX_MESSAGE_BYTES,
+  NATS_SWITCH_ID, NatsStateBackend, natsSnapshotLimits, natsStreamName, natsSwitchStreamName, natsTargetOf, NatsWrongLastSequenceError,
+  type JetStreamPort, type NatsLookup, type NatsTlsFiles } from "./state-backend-nats.js";
 import { decodeMeshStateFile, encodeMeshStateFile, type MeshStateFile } from "./state-file.js";
 
 const STATE_JSON = "state.json";
@@ -44,9 +45,9 @@ const CHUNK_BYTES = 512 * 1024;
 /** The backend's own tombstone bound (state-backend-nats.ts DEFAULT_TOMBSTONES): the projection forgets as it does. */
 const DEFAULT_MAX_TOMBSTONES = 2_048;
 /** The remedy for a partial import left in the root's stream (still `importing`, and no state.json NATS marker, so no
- * Fabric store serves it): it may be deleted, after the operator checks that nothing serves the root from NATS. */
+ * Fabric store serves it): abandon it (smarty-dev#9690: deletes exactly this switch's own unfinished stream and intent). */
 const LEFTOVER = (stream: string): string => `the stream is a leftover of a failed import (still importing; state.json has no NATS marker). `
-  + `After checking that no Fabric process serves this root from NATS, delete stream ${stream} on the server and rerun (an import never purges)`;
+  + `Abandon it (import --to nats --abandon deletes stream ${stream} only when it is this switch's unfinished import) and rerun (an import never purges)`;
 /** At most this many stream messages are replayed by one projection (a stream that long needs a snapshot first). */
 const DEFAULT_MAX_REPLAY = 1_000_000;
 
@@ -78,15 +79,69 @@ export interface MeshNatsMigrationOptions {
   /** The server's `max_payload` (one message). Default 1 MiB, the nats-server default. */
   maxPayloadBytes?: number;
   lockTimeoutMs?: number;
-  lockProtocol?: 1 | 2;
+  lockProtocol?: 1 | 2 | 3;
   /** As openNatsStateBackend: create with these replicas; refuse an existing stream with other replicas.
    * Omitted: the real client reads the agent-layer fabric.json mesh.nats.replicas; an injected port decides. */
   replicas?: number;
   /** Real-client placement budget in milliseconds (default 30 000); exhausted: typed unavailable, never fewer replicas. */
   placementTimeoutMs?: number;
+  /**
+   * Rollback only (smarty-dev#9690): the 32-hex switch id of a per-switch stream, to verify a FINISHED rollback (state.json
+   * no longer names the stream). The stream is always `natsStreamName(root)_<switchId>`, root-bound by construction:
+   * never an arbitrary stream (pi-fabric#937). Omitted: the root's fixed stream (the earlier layout). With the marker
+   * present it must agree with the marker's stream.
+   */
+  switchId?: string;
   /** Synchronous crash-point hook (tests stop the tool here). */
   onStep?: (step: MeshBackendStep) => void;
+  /**
+   * smarty-dev#9690: runs synchronously under the fence right before the marker replaces state.json and right before
+   * `import-commit` (a crash rerun too), after every server read. The reader-readiness gate goes here; a throw stops
+   * that step (state.json unchanged before the marker; the stream stays importing before the commit).
+   */
+  beforeCommit?: (commit: MeshNatsCommitCheck) => void;
 }
+
+/** What the import is about to commit: the binding a `nats` reader proof must match (reader-proof.ts NatsProofBind). */
+export interface MeshNatsCommitCheck {
+  phase: "nats-marker" | "nats-import-commit";
+  switchId: string;
+  stream: string;
+  /** The stream's creation time, as the server reports it. */
+  streamCreated: string;
+  /** The target identity (natsTargetOf); undefined when the server does not report the account. */
+  target: string | undefined;
+  /** The switch's challenge nonce from the stream's `import-begin` (undefined: an import begun without one; the gate refuses). */
+  nonce: string | undefined;
+  head: number;
+  digest: string;
+  fromEpoch: number;
+  toEpoch: number;
+}
+
+/**
+ * The import intent (smarty-dev#9690): written under the fence BEFORE the stream exists, so the per-switch stream S
+ * (never derivable from the root alone) is known only to this root's migration until the marker names it. S is always
+ * `natsStreamName(root)_<switchId>` (pi-fabric#937: root-bound, never an override); any other intent refuses.
+ */
+const INTENT = `${STATE_JSON}.nats-intent`;
+interface NatsIntent { switchId: string; stream: string }
+const readIntent = (root: string): NatsIntent | undefined => {
+  const file = path.join(root, INTENT);
+  const stat = fs.lstatSync(file, { throwIfNoEntry: false });
+  if (stat === undefined) return undefined;
+  assertOwnRegular(file, stat);
+  const value = JSON.parse(fs.readFileSync(file, "utf8")) as Partial<NatsIntent>;
+  if (typeof value.switchId !== "string" || !NATS_SWITCH_ID.test(value.switchId) || typeof value.stream !== "string"
+    || value.stream !== natsSwitchStreamName(root, value.switchId)) {
+    throw new MeshBackendRefusedError(`Fabric mesh NATS import refused: ${file} is not a valid intent`);
+  }
+  return { switchId: value.switchId, stream: value.stream };
+};
+const removeIntent = (root: string): void => {
+  fs.rmSync(path.join(root, INTENT), { force: true });
+  fsyncDirectory(root);
+};
 
 export interface MeshNatsMigrationResult {
   root: string;
@@ -149,7 +204,7 @@ const replaceDurably = (root: string, target: string, data: Uint8Array | string)
 };
 
 /** The projection's state in the file representation (what `meshSnapshotDigest` reads). */
-const snapshotOf = (projection: Snapshot): MeshStateSnapshot & { versions: Record<string, number>; tombstoneOrder: string[]; highWater: number } => ({
+export const snapshotOf = (projection: Snapshot): MeshStateSnapshot & { versions: Record<string, number>; tombstoneOrder: string[]; highWater: number } => ({
   entries: Object.fromEntries([...projection.entries].map(([key, entry]) => [key, { ...entry }])),
   versions: Object.fromEntries(projection.versions),
   tombstoneOrder: [...projection.tombstones],
@@ -222,8 +277,9 @@ const importChunks = (state: MeshStateSnapshot, epoch: number): Uint8Array[] => 
 };
 
 /** Connects, refuses an unsafe server, ensures the stream, then runs `body` under the migration fence. */
-const run = async <T>(root: string, options: MeshNatsMigrationOptions, gateVersion: boolean,
-  body: (port: JetStreamPort, stream: string, subject: string) => Promise<T>): Promise<T> => {
+// `forImport`: an import is gated on the server version and creates its (intent's) stream; a rollback is neither.
+const run = async <T>(root: string, options: MeshNatsMigrationOptions, forImport: boolean, pickStream: (root: string) => string,
+  body: (port: JetStreamPort, stream: string, subject: string, target: { created: string; target: string | undefined }) => Promise<T>): Promise<T> => {
   root = path.resolve(root);
   if (!fs.statSync(root, { throwIfNoEntry: false })?.isDirectory()) throw new MeshBackendRefusedError(`No mesh root at ${root}`);
   // The backend's own endpoint path (pi-fabric#918 round 8): pinned URLs, refusals before any connect, and a remote
@@ -232,22 +288,30 @@ const run = async <T>(root: string, options: MeshNatsMigrationOptions, gateVersi
   try {
     // Before an IMPORT writes anything: a server the backend refuses to open would strand a migrated root (pi-fabric#918).
     // A rollback is the escape hatch from such a server, so it is never gated on the version or max_payload (round 4).
-    if (gateVersion) { assertNatsServerSupported(server.version); assertNatsMaxPayload(server); }
+    if (forImport) { assertNatsServerSupported(server.version); assertNatsMaxPayload(server); }
     if (server.syncAlways !== true && options.acceptPeriodicSync !== true) {
       throw new MeshBackendRefusedError(`nats-server does not report sync_always (got ${String(server.syncAlways)}): refusing to migrate state onto it`);
     }
     return await holdMeshFence(root, { lockProtocol: options.lockProtocol ?? 1, lockTimeoutMs: options.lockTimeoutMs ?? DEFAULT_LOCK_MS }, async () => {
-      const marker = readMeshStateNatsMarker(root);
-      // The stream is the root's, as the backend opens it (pi-fabric#937: no override, so two roots never share one).
-      const stream = natsStreamName(root);
-      if (marker && marker.natsStream !== stream) {
-        throw new MeshBackendRefusedError(`Fabric mesh state.json says the state is on NATS stream ${marker.natsStream}, not this root's ${stream}`);
-      }
+      const stream = pickStream(root);
+      // pi-fabric#937: whatever picked it, the stream is this root's (fixed or per-switch); two roots never share one.
+      if (!isNatsStreamForRoot(root, stream)) throw new MeshBackendRefusedError(`Fabric mesh NATS stream ${stream} is not this root's`);
       const subject = `${stream}.state`;
-      // The backend's subjects and message cap (pi-fabric#907): the root's open refuses a stream without max_msg_size.
-      await port.ensureStream(stream, [subject, `${stream}.snapshot`], { maxMsgSize: MAX_MESSAGE_BYTES,
-        ...(options.replicas === undefined ? {} : { replicas: options.replicas }) });
-      return body(port, stream, subject);
+      const subjects = [subject, `${stream}.snapshot`];
+      const replicas = options.replicas === undefined ? {} : { replicas: options.replicas };
+      // Only an import creates its stream (named by its intent first); a rollback needs the stream to exist. The stream
+      // gets the backend's subjects and message cap (pi-fabric#907): the root's open refuses a stream without max_msg_size.
+      // createStream delegates to ensureStream's create (replicas, placement, readiness, smarty-dev#11373); an existing
+      // stream gets ensureStream's replica check and readiness wait, never a create or a change.
+      if (await port.streamInfo(stream) === undefined) {
+        if (!forImport) throw new MeshBackendRefusedError(`Fabric mesh NATS stream ${stream} does not exist`);
+        await port.createStream(stream, subjects, { maxMsgSize: MAX_MESSAGE_BYTES, ...replicas });
+      } else {
+        await port.ensureStream(stream, subjects, { maxMsgSize: MAX_MESSAGE_BYTES, ...replicas, create: false });
+      }
+      const info = await port.streamInfo(stream);
+      if (!info) throw new MeshBackendRefusedError(`Fabric mesh NATS stream ${stream} does not exist`);
+      return body(port, stream, subject, { created: info.created, target: natsTargetOf(server) });
     });
   } finally { if (owned) await port.close().catch(() => undefined); }
 };
@@ -322,16 +386,76 @@ const encodeExport = (state: ReturnType<typeof snapshotOf>, limits: Limits): Buf
   return serialized;
 };
 
+/**
+ * The stream a marker names (pi-fabric#937: it must be this root's, fixed or per-switch; a marker of the earlier
+ * fixed-root layout is accepted). A rollback's `switchId` must agree with it.
+ */
+const markerStream = (root: string, options: MeshNatsMigrationOptions): string | undefined => {
+  const marker = readMeshStateNatsMarker(root);
+  if (!marker) return undefined;
+  if (!isNatsStreamForRoot(root, marker.natsStream)) {
+    throw new MeshBackendRefusedError(`Fabric mesh state.json says the state is on NATS stream ${marker.natsStream}, which is not this root's (${natsStreamName(root)})`);
+  }
+  if (options.switchId !== undefined && natsSwitchStreamName(root, options.switchId) !== marker.natsStream) {
+    throw new MeshBackendRefusedError(`Fabric mesh state.json says the state is on NATS stream ${marker.natsStream}, not switch ${options.switchId}'s`);
+  }
+  return marker.natsStream;
+};
+
+/**
+ * The import's stream: the marker's (a rerun after it), else the intent's (a rerun before it), else a NEW per-switch
+ * stream `natsStreamName(root)_<switch id>`, recorded in a new intent before it is created (never an override).
+ */
+const importStream = (root: string, options: MeshNatsMigrationOptions): string => {
+  const marked = markerStream(root, options);
+  const intent = readIntent(root);
+  if (marked !== undefined) {
+    if (intent && intent.stream !== marked) throw new MeshBackendRefusedError(`Fabric mesh NATS import refused: ${INTENT} names ${intent.stream}, the marker ${marked}`);
+    return marked;
+  }
+  if (intent) return intent.stream;
+  const switchId = randomUUID().replaceAll("-", "");
+  const stream = natsSwitchStreamName(root, switchId);
+  writeDurably(path.join(root, INTENT), JSON.stringify({ switchId, stream } satisfies NatsIntent));
+  fsyncDirectory(root);
+  if (readIntent(root)?.stream !== stream) throw new MeshBackendRefusedError(`Fabric mesh NATS import refused: ${INTENT} does not read back`);
+  options.onStep?.("nats-intent");
+  return stream;
+};
+
+/** The switch id the stream's `import-begin` records (undefined before it). */
+type BeginRecord = { type?: string; digest?: string; generation?: string; switch?: string; nonce?: string };
+const beginSwitch = async (port: JetStreamPort, stream: string): Promise<BeginRecord | undefined> => {
+  const begin = await port.getMessage(stream, 1);
+  return begin ? JSON.parse(Buffer.from(begin.data).toString("utf8")) as BeginRecord : undefined;
+};
+
 /** Imports a file root's state into its NATS stream and moves state.json to the NATS marker. */
 export const importMeshStateToNats = (root: string, options: MeshNatsMigrationOptions = {}): Promise<MeshNatsMigrationResult> =>
-  run(root, options, true, async (port, stream, subject) => {
-    root = path.resolve(root);
-    if (fs.existsSync(path.join(root, "state.db")) || readMeshStateMovedMarker(root)) {
-      throw new MeshBackendRefusedError(`Fabric mesh NATS import refused for ${root}: it has state.db; roll it back to file first (rollbackMeshState)`);
+  run(root, options, true, (at) => {
+    if (fs.existsSync(path.join(at, "state.db")) || readMeshStateMovedMarker(at)) {
+      throw new MeshBackendRefusedError(`Fabric mesh NATS import refused for ${at}: it has state.db; roll it back to file first (rollbackMeshState)`);
     }
+    return importStream(at, options);
+  }, async (port, stream, subject, { created, target }) => {
+    root = path.resolve(root);
     const limits = limitsOf(options);
     const marker = readMeshStateNatsMarker(root);
+    const intent = readIntent(root);
     let { projection, head } = await project(port, stream, limits);
+    const recordedBegin = head > 0 ? await beginSwitch(port, stream) : undefined;
+    // The switch id: the stream's own `import-begin` once it exists, else the intent's. Undefined only for a rerun of an
+    // import of the earlier fixed-root layout (its marker names natsStreamName(root)): it converges or commits ungated.
+    const switchId = typeof recordedBegin?.switch === "string" ? recordedBegin.switch : intent?.switchId;
+    if (switchId === undefined && !marker) throw new MeshBackendRefusedError(`Fabric mesh NATS import refused: no intent and no import-begin name the switch of ${stream}`);
+    // pi-fabric#927 round 1: the switch's challenge nonce lives ONLY in the stream (`import-begin`): a reader learns it
+    // only by reading NATS. Never written to the mesh directory, a switch record or the output.
+    let nonce = typeof recordedBegin?.nonce === "string" ? recordedBegin.nonce : undefined;
+    const check = (phase: MeshNatsCommitCheck["phase"], digest: string): void => {
+      if (options.beforeCommit === undefined) return;
+      if (switchId === undefined) throw new MeshBackendRefusedError(`Fabric mesh NATS import refused: no import-begin names the switch of ${stream} (an import of the earlier layout); the readiness gate cannot bind it`);
+      options.beforeCommit({ phase, switchId, stream, streamCreated: created, target, head, digest, nonce, fromEpoch: 0, toEpoch: 1 });
+    };
     if (marker) {
       // Rerun after the marker: the stream must hold the kept copy's state; commit it if it is still importing.
       const copy = path.join(root, `${STATE_JSON}.nats-cutover-${marker.epoch}`);
@@ -339,14 +463,17 @@ export const importMeshStateToNats = (root: string, options: MeshNatsMigrationOp
       if (kept === undefined) throw new MeshBackendRefusedError(`Fabric mesh NATS import rerun refused: ${copy} is missing`);
       const digest = meshSnapshotDigest(kept);
       if (projection.status === "ready" && projection.epoch === marker.epoch) {
+        if (intent) removeIntent(root);
         return { root, stream, epoch: marker.epoch, digest, entries: projection.entries.size, tombstones: projection.tombstones.length, converged: true };
       }
       if (projection.status !== "importing" || projection.epoch !== marker.epoch) {
         throw new MeshBackendRefusedError(`Fabric mesh NATS stream ${stream} is ${projection.status} at epoch ${projection.epoch}, but state.json is its marker at epoch ${marker.epoch}`);
       }
       if (meshSnapshotDigest(snapshotOf(projection)) !== digest) throw new MeshBackendRefusedError(`Fabric mesh NATS stream ${stream} does not hold ${copy}: refusing to commit`);
+      check("nats-import-commit", digest);
       await publish(port, subject, record({ format: 1, type: "import-commit", epoch: marker.epoch }), head, `${stream}-import-commit-${marker.epoch}`);
       options.onStep?.("nats-import-commit");
+      if (intent) removeIntent(root);
       return { root, stream, epoch: marker.epoch, digest, entries: projection.entries.size, tombstones: projection.tombstones.length, converged: false };
     }
 
@@ -373,18 +500,18 @@ export const importMeshStateToNats = (root: string, options: MeshNatsMigrationOp
       throw new MeshNatsMigrationLimitError(`one import chunk is ${largest} bytes, more than the server's max payload ${limits.maxPayloadBytes} (a single entry is too large)`);
     }
     if (head === 0) {
-      head = await publish(port, subject, record({ format: 1, type: "import-begin", epoch, digest, generation }), 0, `${stream}-import-begin-${epoch}`);
+      nonce = randomBytes(16).toString("hex");
+      head = await publish(port, subject, record({ format: 1, type: "import-begin", epoch, digest, generation, switch: switchId, nonce }), 0, `${stream}-import-begin-${epoch}`);
       options.onStep?.("nats-import-begin");
     } else {
-      const begin = await port.getMessage(stream, 1);
-      const recorded = begin ? JSON.parse(Buffer.from(begin.data).toString("utf8")) as { type?: string; digest?: string; generation?: string } : undefined;
+      const recorded = recordedBegin;
       // A committed, live or retired projection may be this root's live NATS mesh: never advise deleting it.
       if (projection.status !== "importing") {
         throw new MeshBackendRefusedError(`Fabric mesh: this root already has NATS state in stream ${stream} `
           + `(${projection.status} at epoch ${projection.epoch}, ${head} messages); an import never overwrites it`);
       }
-      if (projection.epoch !== epoch || recorded?.type !== "import-begin"
-        || recorded.digest !== digest || recorded.generation !== generation || head > 1 + chunks.length) {
+      if (projection.epoch !== epoch || recorded?.type !== "import-begin" || recorded.digest !== digest
+        || recorded.generation !== generation || recorded.switch !== intent?.switchId || head > 1 + chunks.length) {
         throw new MeshBackendRefusedError(`Fabric mesh NATS stream ${stream} holds an unfinished import of another state.json `
           + `(epoch ${projection.epoch}, ${head} messages): ${LEFTOVER(stream)}`);
       }
@@ -414,16 +541,23 @@ export const importMeshStateToNats = (root: string, options: MeshNatsMigrationOp
     // Keep the source (the rerun's and the operator's reference), then the marker, then the commit.
     keepCopy(root, path.join(root, `${STATE_JSON}.nats-cutover-${epoch}`), source, digest, options);
     options.onStep?.("nats-copy");
+    check("nats-marker", digest);
     replaceDurably(root, statePath, encodeMeshStateNatsMarker(stream, epoch));
     options.onStep?.("nats-marker");
+    check("nats-import-commit", digest);
     await publish(port, subject, record({ format: 1, type: "import-commit", epoch }), head, `${stream}-import-commit-${epoch}`);
     options.onStep?.("nats-import-commit");
+    removeIntent(root);
     return { root, stream, epoch, digest, entries: projection.entries.size, tombstones: projection.tombstones.length, converged: false };
   });
 
 /** Rolls a NATS root back to file: retires the stream, exports its state to state.json over the marker. */
 export const rollbackMeshStateFromNats = (root: string, options: MeshNatsMigrationOptions = {}): Promise<MeshNatsMigrationResult> =>
-  run(root, options, false, async (port, stream, subject) => {
+  run(root, options, false, (at) => {
+    // The marker names the stream; after the rename (a converged rerun) the root-bound stream of the given switch id,
+    // else the root's fixed stream (the earlier layout). Never an arbitrary stream (pi-fabric#937).
+    return markerStream(at, options) ?? (options.switchId === undefined ? natsStreamName(at) : natsSwitchStreamName(at, options.switchId));
+  }, async (port, stream, subject) => {
     root = path.resolve(root);
     const limits = limitsOf(options);
     const marker = readMeshStateNatsMarker(root);
@@ -467,3 +601,40 @@ export const rollbackMeshStateFromNats = (root: string, options: MeshNatsMigrati
     }
     return { root, stream, epoch: projection.epoch, digest, entries: projection.entries.size, tombstones: projection.tombstones.length, converged: false };
   });
+
+/**
+ * `import --to nats --abandon` (smarty-dev#9690, R5): under the fence, with no marker, deletes exactly the intent's
+ * stream when it is absent, empty, or this switch's unfinished import (importing at epoch 1 with the intent's switch
+ * id), then the intent. Anything else refuses: an abandon never deletes a stream that a marker names or that holds
+ * another switch's records.
+ */
+export const abandonMeshNatsImport = async (root: string, options: MeshNatsMigrationOptions = {}): Promise<{ root: string; stream: string; deleted: boolean }> => {
+  root = path.resolve(root);
+  // The same secured endpoint as the migration (pi-fabric#918 round 8): refusals before any connect or delete.
+  const { port, owned } = await connectNatsEndpoint(options);
+  try {
+    return await holdMeshFence(root, { lockProtocol: options.lockProtocol ?? 1, lockTimeoutMs: options.lockTimeoutMs ?? DEFAULT_LOCK_MS }, async () => {
+      if (readMeshStateNatsMarker(root)) throw new MeshBackendRefusedError(`Fabric mesh NATS abandon refused for ${root}: the marker names the stream (roll back instead)`);
+      const intent = readIntent(root);
+      if (!intent) throw new MeshBackendRefusedError(`Fabric mesh NATS abandon refused for ${root}: no ${INTENT} (nothing to abandon)`);
+      // readIntent already bound the stream to this root and switch; checked again right before a delete.
+      if (!isNatsStreamForRoot(root, intent.stream) || intent.stream === natsStreamName(root)) {
+        throw new MeshBackendRefusedError(`Fabric mesh NATS abandon refused: ${intent.stream} is not this root's per-switch stream`);
+      }
+      const info = await port.streamInfo(intent.stream);
+      let deleted = false;
+      if (info) {
+        if (info.lastSeq > 0) {
+          const { projection } = await project(port, intent.stream, limitsOf(options));
+          const begin = await beginSwitch(port, intent.stream);
+          if (projection.status !== "importing" || projection.epoch !== 1 || begin?.switch !== intent.switchId) {
+            throw new MeshBackendRefusedError(`Fabric mesh NATS abandon refused: ${intent.stream} is ${projection.status} at epoch ${projection.epoch}, not this switch's unfinished import`);
+          }
+        }
+        deleted = await port.deleteStream(intent.stream);
+      }
+      removeIntent(root);
+      return { root, stream: intent.stream, deleted };
+    });
+  } finally { if (owned) await port.close().catch(() => undefined); }
+};

@@ -25,7 +25,8 @@ const apiFailure = (api: ApiError): Error => {
 
 const rejectingPort = (error: unknown): JetStreamPort => {
   const fail = async (): Promise<never> => { throw error; };
-  return { server: fail, ensureStream: fail, lastSequence: fail, firstSequence: fail, streamExists: fail,
+  return { server: fail, ensureStream: fail, streamInfo: fail, createStream: fail, deleteStream: fail,
+    lastSequence: fail, firstSequence: fail, streamExists: fail,
     getMessage: fail, lastBySubject: fail, purge: fail, publish: fail, consume: fail, close: fail };
 };
 const guardedFailure = (error: unknown): Promise<Error> => guardNatsPort(rejectingPort(error)).lastSequence("STREAM").then(

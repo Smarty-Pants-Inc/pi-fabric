@@ -173,7 +173,12 @@ and `rollbackMeshStateFromNats` run steps 2-4 for a file root (no `state.db`, ep
 and `retire` is epoch 2). A sqlite root refuses: roll it back to file first (`rollbackMeshState`),
 then import. The details:
 
-- `import-begin` also records the source digest and `readGeneration`.
+- **Per-switch stream (smarty-dev#9690):** each import uses a new stream
+  `natsStreamName(root)_<switch id>`. Under the fence the import first writes it to
+  `state.json.nats-intent` (0600, exclusive, read back), then creates it. A rerun takes it from the
+  intent, or after the marker from the marker. The commit removes the intent. A `beforeCommit` hook
+  (the reader-readiness gate) runs before the marker and before `import-commit`; a throw stops that step.
+- `import-begin` also records the source digest, `readGeneration` and the switch id.
 - The chunks are deterministic batch records: entries in key order, then tombstones in eviction
   order, at most 512 KiB of changes each, with fixed message ids.
 - The source is kept at `state.json.nats-cutover-<E+1>` before the marker goes in.
@@ -192,7 +197,27 @@ then import. The details:
   backend bounds them), and `maxPayloadBytes` per import chunk (default 1 MiB, the server default),
   checked before `import-begin`. A rollback counts its own `retire` record against `maxReplay`. A
   limit refuses before any retire, rename or commit.
-- **Not built:** the sqlite-direct path and abort (`unretire`).
+- **CLI and the reader gate (smarty-dev#9690):**
+  - `fabric-mesh-backend import --to nats --nats-server URL --accept-old-release-gap` stages S, then runs the #7815
+    gate under the fence before the marker and before `import-commit`.
+  - Each required reader proves `nats` with `reader-proof --backend nats --stream S`: a real read of the staged S on
+    the proof-only path. The proof binds the switch id, S, its creation time, the head, the full digest and the
+    target (`cluster-or-server/domain/account`, the account from `$SYS.REQ.USER.INFO`).
+  - The preflight refuses only readers no proof can fix. A stopped projector deletes its consumer at once.
+  - `--abandon` deletes exactly the intent's unfinished S and the intent.
+  - The gate checks the binding even when no reader is required: S must be this root's stream
+    (`isNatsStreamForRoot`), the server must report the target account, and S's `import-begin` must carry the
+    challenge nonce (an import begun without one is abandoned and redone).
+  - A rerun after the marker reopens the gate: before `import-commit` it checks again; a finished commit only
+    converges (verified, no commit, no check). A malformed NATS marker refuses `import --to nats` and `rollback`.
+  - `rollback` of a NATS root is ungated and recorded. Its `--stream S` (only to verify a finished rollback, once
+    the marker is gone) must be this root's stream and needs `--nats-server`; any other stream is a usage error (exit 2).
+  - `--stream` is accepted only by `reader-proof --backend nats` and `rollback`, always root-bound.
+  - A root opens only the stream its marker names (`create: false`); reads refuse while S is importing.
+- **Deployment gate (pi-fabric#907):** before a fleet root moves, the install's nats-server ACLs let only
+  credentialed fleet hosts publish to and purge or delete the state streams, and allow `$SYS.REQ.USER.INFO`.
+  Owner: fabric-store.
+- **Not built:** the sqlite-direct path and `unretire`.
 
 The local locks fence only this host. Other hosts are fenced by the stream itself, because every
 nats write carries an expected sequence. Each host's `.lock` and the census still stop its

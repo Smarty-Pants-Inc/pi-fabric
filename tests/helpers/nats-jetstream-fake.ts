@@ -1,7 +1,7 @@
 // An in-process fake of the JetStream operations the NATS mesh state backend uses (smarty-dev#7504), with the
 // server's semantics: one stream, expected-last-sequence CAS (err 10071 as NatsWrongLastSequenceError), msgID dedupe
 // (a duplicate returns the original sequence), ordered delivery after a sequence, asynchronous like the network.
-import { NatsWrongLastSequenceError, type JetStreamPort, type NatsStreamMessage } from "../../src/mesh/state-backend-nats.js";
+import { MeshStateNatsRefusedError, NatsWrongLastSequenceError, type JetStreamPort, type NatsStreamMessage } from "../../src/mesh/state-backend-nats.js";
 
 export interface FakeJetStreamServer {
   /** Every message ever stored, by sequence (index seq - 1), purged ones included; `firstSeq` is the purge floor. */
@@ -22,8 +22,16 @@ export interface FakeJetStreamServer {
   /** The server INFO fields the backend checks. */
   maxPayload: number | undefined;
   authRequired: boolean;
-  /** The stream's max_msg_size: set by the first ensureStream (like a created stream); preset it for an existing one (-1: none). */
+  /**
+   * The stream's max_msg_size: set by the first ensureStream or createStream (like a created stream); preset it for an
+   * existing one (-1: none). Unset, `streamInfo` reports the backend's cap (an existing stream a migration made).
+   */
   streamMaxMsgSize: number | undefined;
+  /** The target identity `server()` reports (smarty-dev#9690). */
+  identity: { name?: string; cluster?: string; domain?: string; account?: string };
+  /** Whether the one stream exists (default true), and its creation time. */
+  streamExists: boolean;
+  streamCreated: string;
   /** Runs before each publish is stored (inject a concurrent writer); return "lose-ack" to store it but fail the ack once. */
   beforePublish?: (data: Uint8Array) => void | "lose-ack";
   /** Runs after a publish is stored, before its ack (inject writers that commit after it). */
@@ -62,7 +70,8 @@ export const fakeJetStream = (): FakeJetStreamServer => {
   };
   const server: FakeJetStreamServer = {
     messages, version: "2.14.7", syncAlways: true, hidden: new Set<number>(), maxPayload: 1024 * 1024, authRequired: false,
-    streamMaxMsgSize: undefined, streams: new Set<string>(),
+    streamMaxMsgSize: undefined, streams: new Set<string>(), identity: { name: "fake-server", account: "FLEET" },
+    streamExists: true, streamCreated: "2026-10-11T00:00:00.000000000Z",
     get firstSeq() { return firstSeq; },
     append: (data, subject) => store(data, subject),
     pause: () => { paused ??= []; },
@@ -80,15 +89,41 @@ export const fakeJetStream = (): FakeJetStreamServer => {
         server: async () => {
           calls.push("server");
           return { version: server.version, syncAlways: server.syncAlways, authRequired: server.authRequired,
-            ...(server.maxPayload === undefined ? {} : { maxPayload: server.maxPayload }) };
+            ...(server.maxPayload === undefined ? {} : { maxPayload: server.maxPayload }), ...server.identity };
         },
-        ensureStream: async (stream, _subjects, { maxMsgSize }) => {
+        ensureStream: async (stream, _subjects, { maxMsgSize, create }) => {
           calls.push("ensureStream");
+          // `create: false` (a root's open, a proof, a migration's existing stream) never creates one.
+          if (create === false && !server.streamExists) {
+            throw new MeshStateNatsRefusedError(`the stream ${stream} does not exist (a NATS root opens only a migrated stream)`);
+          }
           server.streams.add(stream);
+          server.streamExists = true;
           server.streamMaxMsgSize ??= maxMsgSize;
           return { lastSeq: messages.length, maxMsgSize: server.streamMaxMsgSize };
         },
         streamExists: async (stream) => { calls.push("streamExists"); return server.streams.has(stream); },
+        streamInfo: async () => {
+          calls.push("streamInfo");
+          return server.streamExists ? { created: server.streamCreated, lastSeq: messages.length, maxMsgSize: server.streamMaxMsgSize ?? 1024 * 1024 } : undefined;
+        },
+        createStream: async (stream, _subjects, { maxMsgSize }) => {
+          calls.push("createStream");
+          if (server.streamExists) throw new Error(`NATS stream ${stream} already exists`);
+          server.streams.add(stream);
+          server.streamExists = true;
+          server.streamMaxMsgSize = maxMsgSize;
+          return { created: server.streamCreated };
+        },
+        deleteStream: async () => {
+          calls.push("deleteStream");
+          const existed = server.streamExists;
+          server.streamExists = false;
+          messages.splice(0);
+          firstSeq = 0;
+          ids.clear();
+          return existed;
+        },
         lastSequence: async () => { calls.push("lastSequence"); return messages.length; },
         firstSequence: async () => { calls.push("firstSequence"); return firstSeq; },
         getMessage: async (_stream, seq) => {

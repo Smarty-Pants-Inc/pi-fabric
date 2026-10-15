@@ -1,7 +1,10 @@
+import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import semver from "semver";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { readMeshStateNatsMarker } from "../src/mesh/backend-fence.js";
+import { markNatsRoot } from "./helpers/nats-state-server.js";
 import {
   applyNatsMessage, assertNatsServerSupported, assertNatsTransportSecure, closeNatsStateBackend, MeshStateNatsBusyError, MeshStateNatsInsecureError, MeshStateNatsOutcomeUnknownError,
   MAX_MESSAGE_BYTES, MIN_SERVER, natsVersionAtLeastForTest, MeshStateNatsLimitError, MeshStateNatsNotDurableError, MeshStateNatsRefusedError, MeshStateNatsSnapshotIntegrityError, MeshStateNatsUnavailableError,
@@ -18,10 +21,16 @@ import { fakeJetStream, type FakeJetStreamServer } from "./helpers/nats-jetstrea
 // in-process fake of the five JetStream operations it uses. The real server runs in phase 2's conformance job.
 const identity: MeshIdentity = { id: "tester", name: "tester", kind: "agent" };
 const roots: string[] = [];
-afterEach(() => { for (const root of roots.splice(0)) closeNatsStateBackend(root); });
+afterEach(() => { for (const root of roots.splice(0)) { closeNatsStateBackend(root); fs.rmSync(root, { recursive: true, force: true }); } });
 const root = () => { const value = path.join(os.tmpdir(), `nats-state-${Math.random().toString(36).slice(2)}`); roots.push(value); return value; };
-const open = (server: FakeJetStreamServer, extra: Partial<Parameters<typeof openNatsStateBackend>[0]> = {}) =>
-  openNatsStateBackend({ root: root(), port: server.port(), lockTimeoutMs: 2_000, ...extra });
+/** A fresh root with the NATS moved marker of its own stream (smarty-dev#9690: a root opens only a migrated stream). */
+const markedRoot = () => { const value = root(); markNatsRoot(value); return value; };
+// smarty-dev#9690: a root opens only the stream its NATS moved marker names; pi-fabric#937: the root's own stream.
+const open = (server: FakeJetStreamServer, extra: Partial<Parameters<typeof openNatsStateBackend>[0]> = {}) => {
+  const at = extra.root ?? root();
+  markNatsRoot(at);
+  return openNatsStateBackend({ port: server.port(), lockTimeoutMs: 2_000, ...extra, root: at });
+};
 const encode = (record: unknown) => Buffer.from(JSON.stringify(record));
 /** A stub resolver (no network): `localhost` is loopback, `nats.example.com` is not, anything else does not resolve. */
 const resolver = async (host: string) => {
@@ -228,7 +237,7 @@ describe("NATS state backend (smarty-dev#7504 phase 1)", () => {
 
   it("sync is a no-op barrier: an acked commit is already durable at the server (sync_always), no JetStream call", async () => {
     const port = fakeJetStream().port();
-    const backend = await openNatsStateBackend({ root: root(), port, lockTimeoutMs: 2_000 });
+    const backend = await openNatsStateBackend({ root: markedRoot(), port, lockTimeoutMs: 2_000 });
     await backend.put({ key: "ns/a", value: 1, identity });
     const calls = port.calls.length;
     await expect(backend.sync(0)).resolves.toBeUndefined();
@@ -264,7 +273,7 @@ describe("NATS state backend (smarty-dev#7504 phase 1)", () => {
       peers: () => [], async refresh() {}, scheduleRefresh() {} };
     for (const syncAlways of [false, true]) {
       const meshRoot = root();
-      fs.mkdirSync(meshRoot, { recursive: true, mode: 0o700 });
+      markNatsRoot(meshRoot);
       const server = fakeJetStream();
       server.syncAlways = syncAlways;
       await openNatsStateBackend({ root: meshRoot, port: server.port(), acceptPeriodicSync: !syncAlways });
@@ -444,16 +453,66 @@ describe("NATS state backend (smarty-dev#7504 phase 1)", () => {
     const { MeshStore } = await import("../src/mesh/store.js");
     const fs = await import("node:fs");
     const meshRoot = root();
-    fs.mkdirSync(meshRoot, { recursive: true, mode: 0o700 });
+    markNatsRoot(meshRoot);
     await openNatsStateBackend({ root: meshRoot, port: fakeJetStream().port() });
     const store = new MeshStore(meshRoot, 64 * 1024, 100, { stateBackend: "nats" });
     try {
       const written = await store.put({ key: "shared/a", value: { n: 1 }, identity });
       expect(store.get("shared/a")).toMatchObject({ value: { n: 1 }, version: written.version });
       expect(store.listAll("shared/").map(entry => entry.key)).toEqual(["shared/a"]);
-      expect(fs.existsSync(`${meshRoot}/state.json`)).toBe(false);
+      // state.json is only the marker that names the stream: no state is written there.
+      expect(readMeshStateNatsMarker(meshRoot)?.natsStream).toBe(natsStreamName(meshRoot));
       await expectSyncDurableOrRefused(store.sync(), { through: expect.any(Number) });
     } finally { store.closeState(); fs.rmSync(meshRoot, { recursive: true, force: true }); }
+  });
+
+  describe("a root opens only the stream its marker names, and never an import in progress (smarty-dev#9690)", () => {
+    it("no marker, another root's stream, or a missing stream refuses; the open creates nothing", async () => {
+      const server = fakeJetStream();
+      const bare = root();
+      fs.mkdirSync(bare, { recursive: true, mode: 0o700 });
+      await expect(openNatsStateBackend({ root: bare, port: server.port() })).rejects.toThrow(/has no NATS moved marker/);
+      // pi-fabric#937: a marker naming a stream that is not this root's (fixed or per-switch) refuses before any stream call.
+      const foreign = root();
+      markNatsRoot(foreign, "S");
+      const foreignPort = server.port();
+      await expect(openNatsStateBackend({ root: foreign, port: foreignPort })).rejects.toThrow(/marker names stream S, which is not this root's/);
+      expect(foreignPort.calls).not.toContain("ensureStream");
+      const other = root();
+      markNatsRoot(other, `${natsStreamName(root())}_${"a".repeat(32)}`);
+      await expect(openNatsStateBackend({ root: other, port: server.port() })).rejects.toThrow(/which is not this root's/);
+      // The root's own per-switch stream opens (a migrated root).
+      const switched = root();
+      fs.mkdirSync(switched, { recursive: true, mode: 0o700 });
+      markNatsRoot(switched, `${natsStreamName(switched)}_${"b".repeat(32)}`);
+      (await openNatsStateBackend({ root: switched, port: server.port() })).close();
+      closeNatsStateBackend(switched);
+      const marked = root();
+      markNatsRoot(marked);
+      server.streamExists = false;
+      const port = server.port();
+      await expect(openNatsStateBackend({ root: marked, port })).rejects.toThrow(/stream \S+ does not exist/);
+      expect(port.calls).not.toContain("createStream");
+      expect(server.streamExists).toBe(false);
+    });
+
+    it("reads refuse while the stream is importing, also with a token from before; readImporting reads but never writes", async () => {
+      const server = fakeJetStream();
+      const backend = await open(server);
+      await backend.put({ key: "k", value: 1, identity });
+      const token = backend.stateToken();
+      server.append(encode({ format: 1, type: "import-begin", epoch: 1 }));
+      await settle(); await settle();
+      expect(() => backend.get("k")).toThrow(/the stream is importing/);
+      expect(() => backend.get("k", { snapshot: token })).toThrow(/the stream is importing/);
+      expect(() => backend.listAll("")).toThrow(MeshStateNatsRefusedError);
+      const prover = await NatsStateBackend.open({ port: server.port(), stream: "S", subject: "S.state", snapshotSubject: "S.snapshot",
+        maxEventBytes: 1 << 20, create: false, readImporting: true });
+      try {
+        expect(prover.get("k")?.value).toBe(1);
+        await expect(prover.put({ key: "k", value: 2, identity })).rejects.toThrow(/the stream is importing; writes refuse/);
+      } finally { prover.close(); }
+    });
   });
 
   it("loads no NATS client unless a backend is opened without a port", async () => {
@@ -934,9 +993,12 @@ describe("NATS state snapshots: review round 2 (pi-fabric#907)", () => {
   });
 
   it("the server enforces the message cap: a new stream gets max_msg_size; a looser stream or max_payload refuses", async () => {
+    // smarty-dev#9690: the root's open never creates a stream; the migration creates it with the cap (createStream).
     const created = fakeJetStream();
-    await open(created);
+    created.streamExists = false;
+    await created.port().createStream("S", ["S.state", "S.snapshot"], { maxMsgSize: MAX_MESSAGE_BYTES });
     expect(created.streamMaxMsgSize).toBe(MAX_MESSAGE_BYTES);
+    await expect(open(created)).resolves.toBeInstanceOf(NatsStateBackend);
     for (const loose of [-1, 4 * MAX_MESSAGE_BYTES]) {
       const server = fakeJetStream();
       server.streamMaxMsgSize = loose;
@@ -950,7 +1012,11 @@ describe("NATS state snapshots: review round 2 (pi-fabric#907)", () => {
   });
 
   it("refuses a non-loopback server that does not require authentication; loopback, or auth required, opens", async () => {
-    const open_ = (server: FakeJetStreamServer, servers: string[]) => openNatsStateBackend({ root: root(), port: server.port(), servers, lookup: resolver });
+    const open_ = (server: FakeJetStreamServer, servers: string[]) => {
+      const at = root();
+      markNatsRoot(at);
+      return openNatsStateBackend({ root: at, port: server.port(), servers, lookup: resolver });
+    };
     await expect(open_(fakeJetStream(), ["tls://nats.example.com:4222"])).rejects.toThrow(/does not require authentication/);
     const authed = fakeJetStream();
     authed.authRequired = true;
@@ -994,6 +1060,8 @@ describe("JetStream backend P2s (smarty-dev#9663)", () => {
     const first = root();
     const second = root();
     const override = { stream: "SHARED" } as unknown as Partial<Parameters<typeof openNatsStateBackend>[0]>;
+    markNatsRoot(first);
+    markNatsRoot(second);
     await openNatsStateBackend({ ...override, root: first, port: server.port() });
     await openNatsStateBackend({ ...override, root: second, port: server.port() });
     expect([...server.streams].sort()).toEqual([natsStreamName(first), natsStreamName(second)].sort());
@@ -1005,6 +1073,7 @@ describe("JetStream backend P2s (smarty-dev#9663)", () => {
     const at = root();
     const legacy = `FABRIC_MESH_${Buffer.from(path.resolve(at)).toString("base64url").replace(/[^A-Za-z0-9_]/g, "_").slice(-48)}`;
     server.streams.add(legacy);
+    markNatsRoot(at);
     const port = server.port();
     await expect(openNatsStateBackend({ root: at, port })).rejects.toThrow(new RegExp(`${legacy}.*old \\(c03c829f\\) name`));
     expect(port.calls).not.toContain("ensureStream"); // the hashed stream is never created beside it
@@ -1054,7 +1123,7 @@ describe("JetStream backend: round 1 (pi-fabric#937)", () => {
     const streamServer = fakeJetStream();
     const streamPort = streamServer.port();
     streamPort.ensureStream = async () => { throw leaky("ensureStream"); };
-    const opened = await openNatsStateBackend({ root: root(), port: guardNatsPort(streamPort) }).catch(caught => caught as Error);
+    const opened = await openNatsStateBackend({ root: markedRoot(), port: guardNatsPort(streamPort) }).catch(caught => caught as Error);
     expect(opened).toBeInstanceOf(Error);
     expect((opened as Error & { code?: string }).code).toBe("E_LEAKY");
     expectNoSecret(texts(opened));
@@ -1069,7 +1138,7 @@ describe("JetStream backend: round 1 (pi-fabric#937)", () => {
       if (failPublish) throw Object.assign(new PublishFailure(`publish failed at ${credentialed}`), { url: credentialed, cause: leaky("ack") });
       return publish(...args);
     };
-    const backend = await openNatsStateBackend({ root: root(), port: guardNatsPort(port) });
+    const backend = await openNatsStateBackend({ root: markedRoot(), port: guardNatsPort(port) });
     await backend.put({ key: "x/a", value: 1, identity });
     failPublish = true;
     const published = await backend.put({ key: "x/b", value: 1, identity }).catch(caught => caught as Error);
@@ -1149,16 +1218,16 @@ describe("JetStream backend: round 2 (pi-fabric#937)", () => {
     await expect(openNatsStateBackend({ root: root(), port: fakeJetStream().port(), servers: ["tls://localhost:4222"], lookup: rebinding }))
       .rejects.toThrow(/does not require authentication/);
     // Still local: a loopback IP literal, and a plaintext name pinned (by its one lookup) to a loopback address.
-    await expect(openNatsStateBackend({ root: root(), port: fakeJetStream().port(), servers: ["tls://127.0.0.1:4222"], lookup: rebinding }))
+    await expect(openNatsStateBackend({ root: markedRoot(), port: fakeJetStream().port(), servers: ["tls://127.0.0.1:4222"], lookup: rebinding }))
       .resolves.toBeInstanceOf(NatsStateBackend);
-    await expect(openNatsStateBackend({ root: root(), port: fakeJetStream().port(), servers: ["nats://localhost:4222"], lookup: resolver }))
+    await expect(openNatsStateBackend({ root: markedRoot(), port: fakeJetStream().port(), servers: ["nats://localhost:4222"], lookup: resolver }))
       .resolves.toBeInstanceOf(NatsStateBackend);
   });
 
   it("P1-2: bare tokens, passwords, nkeys, JWTs and .creds blocks never reach a message, a stack or diagnostics", async () => {
     expectNoSecret("redactNatsUrls", [redactNatsUrls(bare)]);
     const server = fakeJetStream();
-    const backend = await openNatsStateBackend({ root: root(), port: guardNatsPort(server.port()) });
+    const backend = await openNatsStateBackend({ root: markedRoot(), port: guardNatsPort(server.port()) });
     await backend.put({ key: "x/a", value: 1, identity });
     server.breakDelivery(new Error(`consumer failed: ${bare}`));
     const read = (() => { try { backend.get("x/a"); return undefined; } catch (caught) { return caught as Error; } })();
@@ -1283,7 +1352,7 @@ describe("JetStream backend: round 4 (pi-fabric#937)", () => {
     for (const host of ["::ffff:7f00:1", "::ffff:7f00:0001", "::FFFF:7F00:1", "::ffff:127.0.0.1", "0:0:0:0:0:ffff:7f00:1", "::ffff:7fff:fffe", "0:0:0:0:0:0:0:1"]) {
       await expect(assertNatsTransportSecure(`nats://[${host}]:4222`, "tls:", resolver), host).resolves.toBeTypeOf("string");
       // The auth check counts it as local too: no auth required.
-      await expect(openNatsStateBackend({ root: root(), port: fakeJetStream().port(), servers: [`tls://[${host}]:4222`], lookup: resolver }), host)
+      await expect(openNatsStateBackend({ root: markedRoot(), port: fakeJetStream().port(), servers: [`tls://[${host}]:4222`], lookup: resolver }), host)
         .resolves.toBeInstanceOf(NatsStateBackend);
     }
     for (const host of ["::ffff:a00:1", "::ffff:8000:1", "::ffff:10.0.0.1", "::2"]) {

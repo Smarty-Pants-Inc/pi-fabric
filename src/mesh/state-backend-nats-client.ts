@@ -230,7 +230,7 @@ export const connectJetStream = async (servers: string[], options: ConnectJetStr
       await sleep(Math.min(STREAM_LEADER_POLL_MS, afterRequest));
     }
   };
-  return guardNatsPort({
+  const port: JetStreamPort = {
     server: async () => {
       let syncAlways: boolean | undefined;
       if (options.monitoringUrl) {
@@ -241,16 +241,54 @@ export const connectJetStream = async (servers: string[], options: ConnectJetStr
         } catch (error) { throw redactNatsError(error); }
         syncAlways = typeof varz.jetstream?.config?.sync_always === "boolean" ? varz.jetstream.config.sync_always : undefined;
       }
-      return { version: nc.info?.version ?? "0.0.0", syncAlways,
-        ...(typeof nc.info?.max_payload === "number" ? { maxPayload: nc.info.max_payload } : {}),
-        authRequired: nc.info?.auth_required === true };
+      // smarty-dev#9690: the target identity. A normal user may ask `$SYS.REQ.USER.INFO` (measured on 2.14.7) when its
+      // permissions allow it; otherwise the account stays undefined and a caller that needs it refuses.
+      let account: string | undefined;
+      try {
+        const reply = await nc.request("$SYS.REQ.USER.INFO", "", { timeout: 2_000 });
+        const info = JSON.parse(new TextDecoder().decode(reply.data)) as { data?: { account?: unknown } };
+        account = typeof info.data?.account === "string" && info.data.account !== "" ? info.data.account : undefined;
+      } catch { account = undefined; }
+      const info = nc.info as { version?: string; server_name?: string; cluster?: string; domain?: string; max_payload?: unknown; auth_required?: unknown } | undefined;
+      return { version: info?.version ?? "0.0.0", syncAlways,
+        // pi-fabric#907: the payload cap and whether the server requires authentication.
+        ...(typeof info?.max_payload === "number" ? { maxPayload: info.max_payload } : {}), authRequired: info?.auth_required === true,
+        ...(info?.server_name ? { name: info.server_name } : {}), ...(info?.cluster ? { cluster: info.cluster } : {}),
+        ...(info?.domain ? { domain: info.domain } : {}), ...(account ? { account } : {}) };
     },
-    ensureStream: async (stream, subjects, { maxMsgSize, replicas: requested }) => {
+    streamInfo: async (stream) => {
+      try {
+        const info = await retryTransientRead(() => jsm.streams.info(stream));
+        return { created: String(info.created), lastSeq: info.state.last_seq, maxMsgSize: info.config.max_msg_size };
+      } catch (error) { if (apiCode(error) === STREAM_NOT_FOUND) return undefined; throw error; }
+    },
+    createStream: async (stream, subjects, { maxMsgSize, replicas: requested }) => {
+      // `streams.add` of an existing stream with the same config succeeds silently: check absence first (the caller
+      // holds the migration fence, and the stream name carries a random switch id).
+      let existing = false;
+      try { await retryTransientRead(() => jsm.streams.info(stream)); existing = true; }
+      catch (error) { if (apiCode(error) !== STREAM_NOT_FOUND) throw error; }
+      if (existing) throw new MeshStateNatsRefusedError(`NATS stream ${stream} already exists`);
+      // ensureStream's own create: the subjects, the server-enforced cap (pi-fabric#907), the configured replicas,
+      // placement retries and leader readiness (smarty-dev#11373), and lost-reply reconciliation; never a cheap add.
+      await port.ensureStream(stream, subjects, { maxMsgSize, ...(requested === undefined ? {} : { replicas: requested }) });
+      const info = await retryTransientRead(() => jsm.streams.info(stream));
+      return { created: String(info.created) };
+    },
+    deleteStream: async (stream) => {
+      try { return await jsm.streams.delete(stream); }
+      catch (error) { if (apiCode(error) === STREAM_NOT_FOUND) return false; throw error; }
+    },
+    ensureStream: async (stream, subjects, { maxMsgSize, replicas: requested, create }) => {
       streamReadiness.delete(stream); // A later ensure replaces the deadline and never inherits old freshness.
       const configured = requested === undefined ? replicas : assertNatsReplicas(requested, "replicas");
       let info;
       try { info = await retryTransientRead(() => jsm.streams.info(stream)); }
       catch (error) { if (apiCode(error) !== STREAM_NOT_FOUND) throw error; }
+      if (!info && create === false) {
+        // smarty-dev#9690: a root's open and a reader proof never create a stream; a migration made it.
+        throw new MeshStateNatsRefusedError(`the stream ${stream} does not exist (a NATS root opens only a migrated stream)`);
+      }
       if (!info) {
         // The stream itself refuses a larger message (pi-fabric#907): the server enforces the cap, not only the client.
         const config = { name: stream, subjects, storage: StorageType.File, num_replicas: configured, max_msg_size: maxMsgSize };
@@ -330,6 +368,10 @@ export const connectJetStream = async (servers: string[], options: ConnectJetStr
           "(mesh.nats.replicas); it is never changed automatically", { configured, observed });
       }
       const missing = subjects.filter(subject => !(info.config.subjects ?? []).includes(subject));
+      // `create: false` never changes a stream either: a migrated stream already has both subjects.
+      if (missing.length > 0 && create === false) {
+        throw new MeshStateNatsRefusedError(`the stream ${stream} lacks the subjects ${missing.join(", ")} (a NATS root opens only a migrated stream)`);
+      }
       if (missing.length > 0) await jsm.streams.update(stream, { subjects: [...(info.config.subjects ?? []), ...missing] });
       const readiness = { deadline: Date.now() + STREAM_LEADER_TIMEOUT_MS };
       const ready = await waitForStreamLeader(stream, configured, info, readiness);
@@ -386,8 +428,11 @@ export const connectJetStream = async (servers: string[], options: ConnectJetStr
       const messages = await consumer.consume();
       void (async () => { for await (const message of messages) onMessage({ seq: message.seq, data: message.data }); })()
         .catch(error => onError?.(error));
-      return { stop: async () => { await messages.close(); } };
+      // smarty-dev#9690: a stopped projector also deletes its (ephemeral) consumer at once, best effort, so a proof or a
+      // closed store leaves nothing on the server; the server removes a missed one after its inactive threshold.
+      return { stop: async () => { await messages.close(); await consumer.delete().catch(() => false); } };
     },
     close: async () => { await nc.drain(); },
-  });
+  };
+  return guardNatsPort(port);
 };

@@ -2,14 +2,15 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { readMeshStateNatsMarker } from "../src/mesh/backend-fence.js";
-import { importMeshStateToNats, MeshNatsMigrationLimitError, rollbackMeshStateFromNats, type MeshNatsMigrationOptions } from "../src/mesh/backend-migration-nats.js";
+import { encodeMeshStateNatsMarker, readMeshStateNatsMarker } from "../src/mesh/backend-fence.js";
+import { abandonMeshNatsImport, importMeshStateToNats, MeshNatsMigrationLimitError, rollbackMeshStateFromNats, type MeshNatsCommitCheck, type MeshNatsMigrationOptions } from "../src/mesh/backend-migration-nats.js";
 import { importMeshState, MeshBackendRefusedError, meshSnapshotDigest, type MeshBackendStep } from "../src/mesh/backend-migration.js";
-import { closeNatsStateBackend, natsStreamName, openNatsStateBackend, type JetStreamPort } from "../src/mesh/state-backend-nats.js";
+import { closeNatsStateBackend, isNatsStreamForRoot, MAX_MESSAGE_BYTES, NatsStateBackend, natsStreamName, openNatsStateBackend,
+  type JetStreamPort } from "../src/mesh/state-backend-nats.js";
 import { connectJetStream } from "../src/mesh/state-backend-nats-client.js";
 import { decodeMeshStateFile } from "../src/mesh/state-file.js";
 import { MeshStore, type MeshBatchOperation, type MeshIdentity } from "../src/mesh/store.js";
-import { fakeJetStream } from "./helpers/nats-jetstream-fake.js";
+import { fakeJetStream, type FakePort } from "./helpers/nats-jetstream-fake.js";
 import { itFor, natsMonitorUrl, natsServerUrl, reportNatsSkip } from "./helpers/nats-state-server.js";
 
 // smarty-dev#9670: file -> nats -> file, with digests, and a crash at every step (docs/mesh-backends.md, Migration).
@@ -48,10 +49,10 @@ const connection = (target: Target): MeshNatsMigrationOptions => {
   if (target === "fake") return { port: fakeJetStream().port() };
   return { servers: [natsServerUrl!], monitoringUrl: natsMonitorUrl! };
 };
-/** A target whose port a closed nats backend may have closed: a new port on the same fake server each time. */
 /** A raw JetStream port on the target (the fake's, or a real connection). */
 const rawPort = async (options: MeshNatsMigrationOptions): Promise<JetStreamPort> =>
   options.port ?? connectJetStream(options.servers!);
+/** A target whose port a closed nats backend may have closed: a new port on the same fake server each time. */
 const reconnectable = (target: Target): () => MeshNatsMigrationOptions => {
   if (target === "nats") { const options = connection(target); return () => options; }
   const server = fakeJetStream();
@@ -91,7 +92,15 @@ describe.each(["fake", "nats"] as const)("file <-> nats migration on the %s serv
     expect(back).toMatchObject({ stream: imported.stream, epoch: 2, entries: 29, tombstones: 3, converged: false });
     expect(fileDigest(root)).toBe(back.digest);
     // A rerun only verifies, while state.json still holds the stream's state.
-    expect(await rollbackMeshStateFromNats(root, connect())).toMatchObject({ digest: back.digest, converged: true });
+    // After the rename no marker names S: a verify-only rerun names its switch id (S is natsStreamName(root)_<id>,
+    // root-bound by construction; never an arbitrary stream, pi-fabric#937). Without it, the root's fixed stream of the
+    // earlier layout, absent on a real server (the one-stream fake cannot tell names apart).
+    expect(isNatsStreamForRoot(root, imported.stream)).toBe(true);
+    const switchId = imported.stream.slice(natsStreamName(root).length + 1);
+    expect(switchId).toMatch(/^[0-9a-f]{32}$/);
+    if (targetKind === "nats") await expect(rollbackMeshStateFromNats(root, connect())).rejects.toThrow(/does not exist/);
+    await expect(rollbackMeshStateFromNats(root, { ...connect(), switchId: "nothex" })).rejects.toThrow(/not 32 lowercase hex/);
+    expect(await rollbackMeshStateFromNats(root, { ...connect(), switchId })).toMatchObject({ stream: imported.stream, digest: back.digest, converged: true });
     const file = new MeshStore(root, 64 * 1024, 1_000, { stateBackend: "file" });
     stores.push(file);
     expect(file.get("after/nats")?.value).toEqual({ on: "nats" });
@@ -101,9 +110,13 @@ describe.each(["fake", "nats"] as const)("file <-> nats migration on the %s serv
     expect(file.get("after/nats")?.version).toBe(written.version);
     expect((await file.put({ key: "fresh/after", value: 1, identity })).version).toBe(written.version + 1);
     await expect(file.put({ key: "seed/ns0/3", value: 1, identity, ifVersion: 0 })).rejects.toThrow(/compare-and-swap/);
-    // The stream is retired: a nats store refuses it, and a rerun of the rollback only verifies.
+    // The root is a file root again (no marker: a nats open refuses it), and the stream itself is retired.
     await expect(openNatsStateBackend({ root, ...(after.port ? { port: after.port } : { servers: after.servers!, monitoringUrl: after.monitoringUrl! }) }))
-      .rejects.toThrow(/retired/);
+      .rejects.toThrow(/has no NATS moved marker/);
+    const raw = await rawPort(connect());
+    const retired = await NatsStateBackend.open({ port: raw, stream: imported.stream, subject: `${imported.stream}.state`,
+      snapshotSubject: `${imported.stream}.snapshot`, maxEventBytes: 1 << 20, create: false });
+    try { expect(() => retired.get("seed/solo")).toThrow(/retired/); } finally { retired.close(); }
   }, 60_000);
 
   it("a compacted stream (a snapshot, then a purge below it, pi-fabric#907) still rolls back with every write", async () => {
@@ -160,10 +173,12 @@ describe.each(["fake", "nats"] as const)("file <-> nats migration on the %s serv
     const root = tempRoot(`rollback-${step}`);
     const digest = await seedFileRoot(root);
     const options = connection(target);
-    await importMeshStateToNats(root, options);
+    const imported = await importMeshStateToNats(root, options);
     await expect(rollbackMeshStateFromNats(root, { ...options, ...crashAt(step) })).rejects.toThrow(`crash at ${step}`);
     expect(readMeshStateNatsMarker(root) !== undefined).toBe(step !== "nats-replace");
-    expect(await rollbackMeshStateFromNats(root, options)).toMatchObject({ digest, epoch: 2, converged: step === "nats-replace" });
+    // After the rename only the switch id names the root-bound stream (never an arbitrary stream, pi-fabric#937).
+    const switchId = imported.stream.slice(natsStreamName(root).length + 1);
+    expect(await rollbackMeshStateFromNats(root, { ...options, switchId })).toMatchObject({ digest, epoch: 2, converged: step === "nats-replace" });
     expect(fileDigest(root)).toBe(digest);
   }, 60_000);
 
@@ -200,12 +215,15 @@ describe.each(["fake", "nats"] as const)("file <-> nats migration on the %s serv
     expect(fs.readFileSync(victim, "utf8")).toBe("keep me");
     expect(readMeshStateNatsMarker(root)).toBeUndefined();
     expect(fileDigest(root)).toBe(digest);
-    // The link refused BEFORE any stream write: the root's stream is still empty.
+    // The link refused BEFORE any stream write: the switch's (root-bound) stream is still empty.
+    const intentOf = () => JSON.parse(fs.readFileSync(path.join(root, "state.json.nats-intent"), "utf8")) as { stream: string };
+    expect(isNatsStreamForRoot(root, intentOf().stream)).toBe(true);
     const raw = await rawPort(linked());
-    try { expect(await raw.lastSequence(natsStreamName(root))).toBe(0); } finally { if (targetKind === "nats") await raw.close(); }
+    try { expect(await raw.lastSequence(intentOf().stream)).toBe(0); } finally { if (targetKind === "nats") await raw.close(); }
 
-    // A regular kept copy that holds another state refuses too.
+    // A regular kept copy that holds another state refuses too (on a new switch: the refused one is abandoned).
     fs.unlinkSync(path.join(root, "state.json.nats-cutover-1"));
+    fs.unlinkSync(path.join(root, "state.json.nats-intent"));
     fs.writeFileSync(path.join(root, "state.json.nats-cutover-1"), fs.readFileSync(path.join(root, "state.json")));
     const store = new MeshStore(root, 64 * 1024, 1_000, { stateBackend: "file" });
     stores.push(store);
@@ -213,7 +231,7 @@ describe.each(["fake", "nats"] as const)("file <-> nats migration on the %s serv
     store.closeState();
     await expect(importMeshStateToNats(root, linked())).rejects.toThrow(/nats-cutover-1 exists and holds another state/);
     const after = await rawPort(linked());
-    try { expect(await after.lastSequence(natsStreamName(root))).toBe(0); } finally { if (targetKind === "nats") await after.close(); }
+    try { expect(await after.lastSequence(intentOf().stream)).toBe(0); } finally { if (targetKind === "nats") await after.close(); }
     expect(readMeshStateNatsMarker(root)).toBeUndefined();
 
     const clean = tempRoot("links-rollback");
@@ -237,7 +255,9 @@ describe.each(["fake", "nats"] as const)("file <-> nats migration on the %s serv
     // Not retired: a nats store still opens on the stream, and a rollback in bounds then succeeds.
     const options = connect();
     const stream = readMeshStateNatsMarker(root)!.natsStream;
-    expect(stream).toBe(natsStreamName(root));
+    // A per-switch stream, bound to the root (pi-fabric#937): natsStreamName(root)_<32 hex>.
+    expect(isNatsStreamForRoot(root, stream)).toBe(true);
+    expect(stream).toMatch(new RegExp(`^${natsStreamName(root)}_[0-9a-f]{32}$`));
     const backend = await openNatsStateBackend({ root, ...(options.port ? { port: options.port } : { servers: options.servers!, monitoringUrl: options.monitoringUrl! }) });
     expect(backend.diagnostics().nats?.status).toBe("ready");
     closeNatsStateBackend(root);
@@ -300,11 +320,9 @@ describe.each(["fake", "nats"] as const)("file <-> nats migration on the %s serv
     await expect(importMeshStateToNats(root, options)).rejects.toThrow(/^LIMIT: .*more than the server's max payload 1048576/);
     expect(readMeshStateNatsMarker(root)).toBeUndefined();
     expect(fileDigest(root)).toBe(digest);
-    const probe = connect();
-    const backend = await openNatsStateBackend({ root,
-      ...(probe.port ? { port: probe.port } : { servers: probe.servers!, monitoringUrl: probe.monitoringUrl! }) });
-    expect(backend.diagnostics().nats).toMatchObject({ appliedSeq: 0, status: "ready" });
-    closeNatsStateBackend(root);
+    const intent = JSON.parse(fs.readFileSync(path.join(root, "state.json.nats-intent"), "utf8")) as { stream: string };
+    const raw = await rawPort(connect());
+    try { expect(await raw.lastSequence(intent.stream)).toBe(0); } finally { if (targetKind === "nats") await raw.close(); }
   }, 60_000);
 
   it("refuses a sqlite root, and a rerun whose state.json changed after a crash before the marker", async () => {
@@ -321,25 +339,121 @@ describe.each(["fake", "nats"] as const)("file <-> nats migration on the %s serv
     stores.push(file);
     await file.put({ key: "late/writer", value: 1, identity });
     await expect(importMeshStateToNats(root, options)).rejects.toBeInstanceOf(MeshBackendRefusedError);
-    // A partial leftover (still importing, no marker): it may be deleted, after checking nothing serves the root.
-    await expect(importMeshStateToNats(root, options)).rejects.toThrow(/leftover of a failed import .*After checking that no Fabric process serves this root from NATS, delete stream \S+ on the server and rerun/);
+    // A partial leftover (still importing, no marker): abandon removes exactly this switch's stream (smarty-dev#9690).
+    await expect(importMeshStateToNats(root, options)).rejects.toThrow(/leftover of a failed import .*Abandon it \(import --to nats --abandon deletes stream \S+ only when it is this switch's unfinished import\) and rerun/);
     expect(readMeshStateNatsMarker(root)).toBeUndefined();
     expect(file.get("late/writer")?.value).toBe(1);
   }, 60_000);
 });
 
 // pi-fabric#918: a stream that holds committed (here retired) state may be the root's live NATS mesh: the refusal never
-// advises deleting it.
+// advises deleting it. (A real server gives a new switch a new, empty stream; the one-stream fake shows the old one.)
 it("refuses to import over a stream with committed state, and never advises deleting it", async () => {
   const server = fakeJetStream();
   const root = tempRoot("committed");
   await seedFileRoot(root);
-  const imported = await importMeshStateToNats(root, { port: server.port() });
+  await importMeshStateToNats(root, { port: server.port() });
   await rollbackMeshStateFromNats(root, { port: server.port() });
   expect(readMeshStateNatsMarker(root)).toBeUndefined();
   const refusal = importMeshStateToNats(root, { port: server.port() });
-  await expect(refusal).rejects.toThrow(new RegExp(`this root already has NATS state in stream ${imported.stream} \\(retired at epoch 2, \\d+ messages\\); an import never overwrites it$`));
+  await expect(refusal).rejects.toThrow(/this root already has NATS state in stream \S+ \(retired at epoch 2, \d+ messages\); an import never overwrites it$/);
   await expect(refusal).rejects.not.toThrow(/delete/);
+});
+
+describe("the per-switch stream, its intent and the commit hook (smarty-dev#9690)", () => {
+  it("the intent names a new per-switch stream before the stream exists; import-begin records the switch; the commit removes the intent", async () => {
+    const server = fakeJetStream();
+    server.streamExists = false;
+    const root = tempRoot("intent");
+    const digest = await seedFileRoot(root);
+    const port = server.port();
+    await expect(importMeshStateToNats(root, { port, ...crashAt("nats-intent") })).rejects.toThrow("crash at nats-intent");
+    expect((port as FakePort).calls).not.toContain("createStream");
+    const intent = JSON.parse(fs.readFileSync(path.join(root, "state.json.nats-intent"), "utf8")) as { switchId: string; stream: string };
+    expect(intent.switchId).toMatch(/^[0-9a-f]{32}$/);
+    expect(intent.stream).toBe(`${natsStreamName(root)}_${intent.switchId}`);
+    expect((port as FakePort).calls).not.toContain("ensureStream"); // the intent precedes the stream
+    expect((fs.statSync(path.join(root, "state.json.nats-intent")).mode & 0o777).toString(8)).toBe("600");
+    const done = await importMeshStateToNats(root, { port });
+    expect(done).toMatchObject({ stream: intent.stream, digest, converged: false });
+    // The import created its stream with the backend's message cap (pi-fabric#907), which the root's open requires.
+    expect((port as FakePort).calls).toContain("createStream");
+    expect(server.streamMaxMsgSize).toBe(MAX_MESSAGE_BYTES);
+    expect(JSON.parse(Buffer.from(server.messages[0]!.data).toString("utf8"))).toMatchObject({ type: "import-begin", switch: intent.switchId });
+    expect(fs.existsSync(path.join(root, "state.json.nats-intent"))).toBe(false);
+    expect(readMeshStateNatsMarker(root)?.natsStream).toBe(intent.stream);
+  });
+
+  it("beforeCommit gets the binding before the marker and before import-commit; a throw stops that step and the rerun completes", async () => {
+    const server = fakeJetStream();
+    const root = tempRoot("hook");
+    const digest = await seedFileRoot(root);
+    const port = server.port();
+    const seen: MeshNatsCommitCheck[] = [];
+    const stopAt = (phase: MeshNatsCommitCheck["phase"]) => (check: MeshNatsCommitCheck): void => {
+      seen.push(check);
+      if (check.phase === phase) throw new Error(`unready at ${phase}`);
+    };
+    await expect(importMeshStateToNats(root, { port, beforeCommit: stopAt("nats-marker") })).rejects.toThrow("unready at nats-marker");
+    expect(readMeshStateNatsMarker(root)).toBeUndefined();
+    expect(fileDigest(root)).toBe(digest);
+    expect(seen[0]).toMatchObject({ phase: "nats-marker", digest, fromEpoch: 0, toEpoch: 1, head: server.messages.length });
+    expect(seen[0]!.switchId).toMatch(/^[0-9a-f]{32}$/);
+    await expect(importMeshStateToNats(root, { port, beforeCommit: stopAt("nats-import-commit") })).rejects.toThrow("unready at nats-import-commit");
+    expect(readMeshStateNatsMarker(root)).toBeDefined();
+    const last = JSON.parse(Buffer.from(server.messages.at(-1)!.data).toString("utf8")) as { type: string };
+    expect(last.type).not.toBe("import-commit"); // still importing
+    expect(new Set(seen.map(check => check.switchId)).size).toBe(1); // one switch across the reruns
+    const done = await importMeshStateToNats(root, { port, beforeCommit: (check) => { seen.push(check); } });
+    expect(done).toMatchObject({ digest, converged: false });
+    expect(seen.at(-1)).toMatchObject({ phase: "nats-import-commit", stream: done.stream });
+  });
+
+  it("an intent or a marker that names a stream not bound to this root refuses before any stream call (pi-fabric#937)", async () => {
+    const root = tempRoot("intent-other");
+    const digest = await seedFileRoot(root);
+    const port = fakeJetStream().port();
+    await expect(importMeshStateToNats(root, { port, ...crashAt("nats-intent") })).rejects.toThrow("crash at");
+    const intentPath = path.join(root, "state.json.nats-intent");
+    const { switchId } = JSON.parse(fs.readFileSync(intentPath, "utf8")) as { switchId: string };
+    const other = tempRoot("intent-foreign");
+    for (const stream of ["FABRIC_MESH_other", natsStreamName(root), `${natsStreamName(other)}_${switchId}`, `${natsStreamName(root)}_${"f".repeat(32)}`]) {
+      fs.rmSync(intentPath);
+      fs.writeFileSync(intentPath, JSON.stringify({ switchId, stream }), { mode: 0o600 });
+      const probe = fakeJetStream().port();
+      await expect(importMeshStateToNats(root, { port: probe })).rejects.toThrow(/is not a valid intent/);
+      await expect(abandonMeshNatsImport(root, { port: probe })).rejects.toThrow(/is not a valid intent/);
+      expect(probe.calls.filter(call => /stream|publish/i.test(call))).toEqual([]);
+    }
+    expect(fileDigest(root)).toBe(digest);
+  });
+
+  it("abandon deletes only this switch's own unfinished stream, on the fake port", async () => {
+    const root = tempRoot("abandon");
+    await seedFileRoot(root);
+    const server = fakeJetStream();
+    server.streamExists = false;
+    await expect(importMeshStateToNats(root, { port: server.port(), ...crashAt("nats-import-chunk") })).rejects.toThrow("crash at");
+    const intent = JSON.parse(fs.readFileSync(path.join(root, "state.json.nats-intent"), "utf8")) as { stream: string };
+    const port = server.port();
+    expect(await abandonMeshNatsImport(root, { port })).toEqual({ root, stream: intent.stream, deleted: true });
+    expect(port.calls).toContain("deleteStream");
+    expect(fs.existsSync(path.join(root, "state.json.nats-intent"))).toBe(false);
+    await expect(abandonMeshNatsImport(root, { port: server.port() })).rejects.toThrow(/nothing to abandon/);
+  });
+
+  it("a marker of the earlier fixed-root layout is accepted: a rollback of it converges on the root's stream", async () => {
+    const root = tempRoot("legacy-marker");
+    await seedFileRoot(root);
+    const server = fakeJetStream();
+    const imported = await importMeshStateToNats(root, { port: server.port() });
+    // Rewrite the marker as the earlier layout wrote it (the root's fixed stream); the fake holds the same records.
+    fs.writeFileSync(path.join(root, "state.json"), encodeMeshStateNatsMarker(natsStreamName(root), 1));
+    expect(await importMeshStateToNats(root, { port: server.port() })).toMatchObject({ stream: natsStreamName(root), converged: true });
+    const back = await rollbackMeshStateFromNats(root, { port: server.port() });
+    expect(back).toMatchObject({ stream: natsStreamName(root), digest: imported.digest, converged: false });
+    expect(await rollbackMeshStateFromNats(root, { port: server.port() })).toMatchObject({ converged: true });
+  });
 });
 
 it("refuses a nats-server older than the backend's minimum before any write: no marker, state.json unchanged", async () => {

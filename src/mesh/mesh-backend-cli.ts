@@ -11,7 +11,10 @@ import { abortMeshRollback, cutoverMeshState, describeCensusAdvisory, importMesh
   MeshBackendRefusedError, rollbackMeshState, type MeshBackendAlarm, type MeshBackendOptions, type MeshBackendStatus,
   type MeshCensusAdvisory, type MeshCensusWriter, type MeshWriterCensus } from "./backend-migration.js";
 import { BUILTIN_READERS, installReaderProof, probeStateDbLeases, scanStateDbHolders, watchStateDbLeases, type StateDbLeaseWatch, type LeaseProbeOptions, type ProcScanOptions, type StateDbHolder, isReaderName, proveFabricReader, readerReadiness, recordSwitch, requiredReaders,
-  type InstalledReader, type ReaderBackend, type ReaderReadiness, type RequiredReader } from "./reader-proof.js";
+  type InstalledReader, type NatsGateBind, type ReaderBackend, type ReaderReadiness, type RequiredReader } from "./reader-proof.js";
+import { abandonMeshNatsImport, importMeshStateToNats, rollbackMeshStateFromNats, type MeshNatsCommitCheck, type MeshNatsMigrationOptions } from "./backend-migration-nats.js";
+import { meshStateMalformedMarkerError, readMeshStateNatsMarker, stateFileIsMalformedNatsMarker } from "./backend-fence.js";
+import { isNatsStreamForRoot, type JetStreamPort } from "./state-backend-nats.js";
 
 const COMMANDS = ["census", "import", "status", "cutover", "rollback", "abort-rollback", "reader-proof", "lock-recover"] as const;
 type Command = typeof COMMANDS[number];
@@ -23,6 +26,9 @@ const USAGE = `Usage: fabric-mesh-backend <census|import|status|cutover|rollback
        fabric-mesh-backend reader-proof --root DIR --backend file|sqlite [--name fabric...] [--reader-version V] [--json]
        fabric-mesh-backend reader-proof --root DIR --name NAME --proof-file FILE [--json]
        fabric-mesh-backend lock-recover --root DIR --lock mesh|custody --holder TOKEN [--unsafe-holder-stopped] [--json]
+       fabric-mesh-backend import --to nats --root DIR --nats-server URL... [--nats-monitor URL] --accept-old-release-gap [--abandon] [--json]
+       fabric-mesh-backend reader-proof --root DIR --backend nats --stream S --nats-server URL... [--nats-monitor URL] [--json]
+       fabric-mesh-backend rollback --root DIR --nats-server URL... [--nats-monitor URL] [--stream S] [--json]   (a NATS root)
 
   census          the ADVISORY writer census (writer-census.ts): the processes it attributed (mode,
                   release) and the evidence it could not. Informational; always exit 0 when it ran.
@@ -45,6 +51,13 @@ const USAGE = `Usage: fabric-mesh-backend <census|import|status|cutover|rollback
                   earlier-boot inference. Run it inside the holder's namespace when you can.
                   --unsafe-holder-stopped recovers on YOUR word that the holder is stopped; if it still runs, its
                   release can remove its successor's lock and two writers can run.
+
+NATS (smarty-dev#9690, docs/mesh-backends.md): import --to nats stages a new per-switch stream S (named in
+state.json.nats-intent first), then gates before the marker and before import-commit: each required reader
+proves nats by reading S (reader-proof --backend nats --stream S, S from the intent or the refusal). It
+refuses without --accept-old-release-gap (risk R1: a release before c58cec72 started later reads an empty
+mesh; recorded with user and host). --abandon deletes the intent's own unfinished S and the intent. rollback
+of a NATS root is not gated (its target is file) and is recorded.
 
 Readiness gate (smarty-dev#7815, docs/mesh-backend.md): import and cutover refuse (exit 3) unless
 every REQUIRED reader holds a valid proof of sqlite for this switch, made within 24 h by its installed
@@ -106,6 +119,8 @@ interface Options {
   /** smarty-dev#9404: import a fresh scratch copy of this state.json, gate skipped; `root` is then unset until made. */
   scratchProofFrom?: string; scratchParent?: string;
   lock?: "mesh" | "custody"; holder?: string; unsafeHolderStopped?: boolean;
+  /** smarty-dev#9690: `import --to nats`, the NATS connection (host flags), the stream, the R1 acceptance, abandon. */
+  to?: "nats"; stream?: string; natsServers: string[]; natsMonitor?: string; acceptOldReleaseGap: boolean; abandon: boolean;
 }
 
 class UsageError extends Error {}
@@ -129,10 +144,18 @@ const parseArgs = (argv: string[]): Options | "help" => {
   let holder: string | undefined;
   let unsafeHolderStopped = false;
   const requireReaders: InstalledReader[] = [];
+  let to: "nats" | undefined;
+  let stream: string | undefined;
+  const natsServers: string[] = [];
+  let natsMonitor: string | undefined;
+  let acceptOldReleaseGap = false;
+  let abandon = false;
   for (let index = 0; index < rest.length; index++) {
     const flag = rest[index]!;
     if (flag === "--json") { json = true; continue; }
     if (flag === "--unsafe-holder-stopped") { unsafeHolderStopped = true; continue; }
+    if (flag === "--accept-old-release-gap") { acceptOldReleaseGap = true; continue; }
+    if (flag === "--abandon") { abandon = true; continue; }
     const value = rest[++index];
     if (value === undefined || value.startsWith("--")) throw new UsageError(`Missing value for ${flag}`);
     if (flag === "--root" || flag === "--mesh") root = value;
@@ -148,9 +171,16 @@ const parseArgs = (argv: string[]): Options | "help" => {
       if (!isReaderName(value)) throw new UsageError(`Bad --name ${value} (letters, digits, . _ -; at most 64)`);
       name = value;
     } else if (flag === "--backend") {
-      if (value !== "file" && value !== "sqlite") throw new UsageError("--backend must be file or sqlite");
+      if (value !== "file" && value !== "sqlite" && value !== "nats") throw new UsageError("--backend must be file, sqlite or nats");
       backend = value;
-    } else if (flag === "--reader-version") readerVersion = value;
+    } else if (flag === "--to") {
+      if (value !== "nats") throw new UsageError("--to must be nats");
+      to = value;
+    } else if (flag === "--stream") {
+      if (!/^[A-Za-z0-9_-]{1,255}$/.test(value)) throw new UsageError(`Bad --stream ${value}`);
+      stream = value;
+    } else if (flag === "--nats-server") natsServers.push(value);
+    else if (flag === "--nats-monitor") natsMonitor = value; else if (flag === "--reader-version") readerVersion = value;
     else if (flag === "--proof-file") proofFile = value;
     else if (flag === "--scratch-proof-from") scratchProofFrom = value;
     else if (flag === "--scratch-parent") scratchParent = value;
@@ -176,16 +206,32 @@ const parseArgs = (argv: string[]): Options | "help" => {
     if (command !== "import" || scratchProofFrom === undefined || root !== undefined || acceptUnready.length > 0 || requireReaders.length > 0) {
       throw new UsageError("--scratch-proof-from STATE_JSON [--scratch-parent DIR] is for import only, without --root, --accept-unready or --require-reader");
     }
-    return { command: "import", root: "", json, lockProtocol, acceptUnready, requireReaders, scratchProofFrom: path.resolve(scratchProofFrom),
+    return { command: "import", root: "", json, lockProtocol, acceptUnready, requireReaders, natsServers, acceptOldReleaseGap, abandon, scratchProofFrom: path.resolve(scratchProofFrom),
       ...(scratchParent === undefined ? {} : { scratchParent: path.resolve(scratchParent) }),
       ...(lockTimeoutMs === undefined ? {} : { lockTimeoutMs }) };
   }
   if (!root) throw new UsageError("--root DIR is required");
   if (command === "reader-proof" && (proofFile ? !name || backend : !backend)) {
-    throw new UsageError("reader-proof needs --backend file|sqlite, or --name NAME --proof-file FILE");
+    throw new UsageError("reader-proof needs --backend file|sqlite|nats, or --name NAME --proof-file FILE");
   }
   if (command === "lock-recover" && (!lock || !holder)) throw new UsageError("lock-recover needs --lock mesh|custody and --holder TOKEN");
+  if (to !== undefined && command !== "import") throw new UsageError("--to nats is for import only");
+  if ((abandon || acceptOldReleaseGap) && to !== "nats") throw new UsageError("--abandon and --accept-old-release-gap need import --to nats");
+  // pi-fabric#927 round 1: a NATS switch has no override for an unready reader; each required reader proves its read.
+  if (to === "nats" && acceptUnready.length > 0) {
+    throw new UsageError("--accept-unready is refused with --to nats: every required reader proves a real read of the staged stream (reader-proof --backend nats)");
+  }
+  if ((to === "nats" || backend === "nats") && natsServers.length === 0) throw new UsageError("NATS needs --nats-server URL");
+  if (backend === "nats" && stream === undefined) throw new UsageError("reader-proof --backend nats needs --stream S (the staged stream)");
+  if (stream !== undefined && !((command === "reader-proof" && backend === "nats") || command === "rollback")) {
+    throw new UsageError("--stream is for reader-proof --backend nats and the rollback of a NATS root");
+  }
+  // pi-fabric#937: an explicit stream is strictly this root's (natsStreamName(root) or its per-switch stream), never another.
+  if (stream !== undefined && !isNatsStreamForRoot(path.resolve(root), stream)) throw new UsageError(`Bad --stream ${stream}: not a NATS stream of ${path.resolve(root)}`);
+  if (stream !== undefined && natsServers.length === 0) throw new UsageError("--stream needs --nats-server URL");
   return { command: command as Command, root: path.resolve(root), json, lockProtocol, acceptUnready, requireReaders,
+    natsServers, acceptOldReleaseGap, abandon, ...(to === undefined ? {} : { to }), ...(stream === undefined ? {} : { stream }),
+    ...(natsMonitor === undefined ? {} : { natsMonitor }),
     ...(proofFile === undefined ? {} : { proofFile }),
     ...(lockTimeoutMs === undefined ? {} : { lockTimeoutMs }), ...(name === undefined ? {} : { name }),
     ...(backend === undefined ? {} : { backend }), ...(readerVersion === undefined ? {} : { readerVersion }),
@@ -196,7 +242,9 @@ const formatStatus = (status: MeshBackendStatus): string => {
   const lines = [
     `root          ${status.root}`,
     `backend       ${status.backend}  epoch ${status.epoch}${status.commit === undefined ? "" : `  commit ${status.commit}`}`,
-    `state.json    ${status.fileMoved ? `moved marker (backend=sqlite at epoch ${status.fileEpoch})` : status.fileError ? `unreadable: ${status.fileError}` : `epoch ${status.fileEpoch}  generation ${status.fileGeneration ?? "-"}`}`,
+    `state.json    ${status.fileMoved ? (status.natsStream !== undefined
+      ? `moved marker (backend=nats, stream ${status.natsStream}, at epoch ${status.fileEpoch})`
+      : `moved marker (backend=sqlite at epoch ${status.fileEpoch})`) : status.fileError ? `unreadable: ${status.fileError}` : `epoch ${status.fileEpoch}  generation ${status.fileGeneration ?? "-"}`}`,
     `db digest     ${status.dbDigest ?? "-"}`,
     `file digest   ${status.fileDigest ?? "-"}`,
     `readers use   ${"source" in status.reader ? status.reader.source : `NOTHING (fails closed: ${status.reader.error})`}`,
@@ -399,7 +447,9 @@ const scratchProofImport = async (options: Options, io: { census?: MeshWriterCen
 };
 
 interface Gate { stop?: () => void; ownStateDbFds?: string[]; switchId: string; required: RequiredReader[]; readiness: ReaderReadiness; final?: ReaderReadiness;
-  accepted: ReaderReadiness["unready"]; checked: string[] }
+  accepted: ReaderReadiness["unready"]; checked: string[];
+  /** `nats`: the check before the marker and before import-commit (backend-migration-nats.ts beforeCommit). */
+  natsBeforeCommit?: (check: MeshNatsCommitCheck) => void }
 
 /** The one post-commit alarm for a switch that accepted unready readers (smarty-dev#9436). */
 export const MESH_SWITCH_OVERRIDE_ALARM_TOPIC = "fabric.alarm.mesh-switch-override";
@@ -444,12 +494,25 @@ const publishSwitchOverrideAlarm = async (options: Options, gate: Gate, accepted
  */
 const openGate = async (options: Options, library: MeshBackendOptions, builtins: readonly InstalledReader[],
   gateCensus: MeshWriterCensusSync, procScan: ProcScanOptions, leaseProbe: LeaseProbeOptions,
-  warn: (text: string) => void): Promise<Gate | undefined> => {
+  warn: (text: string) => void, target: "sqlite" | "nats" = "sqlite"): Promise<Gate | undefined> => {
   // No mesh root: the switch itself refuses with nothing changed.
   if (!fs.statSync(options.root, { throwIfNoEntry: false })?.isDirectory()) return undefined;
   const { backend, epoch } = await meshBackendStatus(options.root);
-  // sqlite: switched already, a rerun only verifies (no commit); exporting/file+marker: the switch refuses.
-  if (backend !== "file" && backend !== "none" && backend !== "importing") return undefined;
+  if (target === "nats") {
+    // nats (smarty-dev#9690): a file root (no state.db, epoch 0 -> 1), or the rerun of this root's own switch once its
+    // valid marker is down: the gate stays open so a crash before import-commit commits with the checks below, and a
+    // finished commit converges (the migration verifies it; no commit, so no check). A malformed marker or a sqlite
+    // root refuses (the migration refuses state.db too).
+    if (stateFileIsMalformedNatsMarker(options.root)) throw meshStateMalformedMarkerError(path.join(options.root, "state.json"));
+    const marker = readMeshStateNatsMarker(options.root);
+    if (marker && !isNatsStreamForRoot(options.root, marker.natsStream)) {
+      throw new MeshBackendRefusedError(`import --to nats refused: state.json names NATS stream ${marker.natsStream}, which is not this root's`);
+    }
+    if (backend !== "none" && !(marker && backend === "nats")) return undefined;
+  } else if (backend !== "file" && backend !== "none" && backend !== "importing") {
+    // sqlite: switched already, a rerun only verifies (no commit); exporting/file+marker: the switch refuses.
+    return undefined;
+  }
   // The whole inventory, recomputed for every check (pre-fence and under the fence before each commit).
   // Evidence the census cannot attribute, and a failed census, are required as fabric@unknown.
   let ownFds: string[] | undefined;
@@ -481,30 +544,57 @@ const openGate = async (options: Options, library: MeshBackendOptions, builtins:
     if (scan) unattributed = unattributed.filter(writer => !writer.mode.startsWith("unknown state-database "));
     return requiredReaders(writers, unattributed, builtins, options.requireReaders, [...scan?.holders ?? [], ...leaseHolders()]);
   };
-  const evaluate = (window: { fromEpoch: number; toEpoch: number }, when: string, required = inventory()): ReaderReadiness => {
+  const evaluate = (window: { fromEpoch: number; toEpoch: number }, when: string, required = inventory(), bind?: NatsGateBind,
+    fixableOnly = false): ReaderReadiness => {
     let readiness: ReaderReadiness;
-    try { readiness = readerReadiness(options.root, "sqlite", required, window); }
+    try { readiness = readerReadiness(options.root, target, required, window, Date.now(), process.geteuid?.(), bind); }
     catch (error) { throw new MeshBackendRefusedError(`${(error as Error).message}${when}`); }
-    const blocking = readiness.unready.filter(reader => !options.acceptUnready.includes(reader.name));
+    // nats preflight: proofs come after the stream is staged, so only readers no proof can fix block here.
+    const unfixable = new Set(required.filter(reader => reader.kind === "holder" || reader.kind === "unattributed").map(reader => reader.name));
+    const blocking = readiness.unready.filter(reader => !options.acceptUnready.includes(reader.name) && (!fixableOnly || unfixable.has(reader.name)));
     if (blocking.length > 0) {
-      throw new MeshBackendRefusedError(`readers not ready for sqlite${when}: ${blocking.map(reader => `${reader.name} (${reader.reason})`).join("; ")}; `
-        + "each reader proves a real read (docs/mesh-backend.md), or pass --accept-unready NAME,...");
+      const how = target === "nats" && bind
+        ? `each reader proves a real read of the staged stream (reader-proof --backend nats --stream ${bind.stream}), or pass --accept-unready NAME,...`
+        : "each reader proves a real read (docs/mesh-backend.md), or pass --accept-unready NAME,...";
+      throw new MeshBackendRefusedError(`readers not ready for ${target}${when}: ${blocking.map(reader => `${reader.name} (${reader.reason})`).join("; ")}; ${how}`);
     }
     return readiness;
   };
-  const window = backend === "importing" ? { fromEpoch: epoch - 1, toEpoch: epoch } : { fromEpoch: epoch, toEpoch: epoch + 1 };
+  const window = target === "nats" ? { fromEpoch: 0, toEpoch: 1 }
+    : backend === "importing" ? { fromEpoch: epoch - 1, toEpoch: epoch } : { fromEpoch: epoch, toEpoch: epoch + 1 };
   const required = inventory();
-  const preview = (() => { try { return readerReadiness(options.root, "sqlite", required, window); } catch { return undefined; } })();
-  for (const reader of preview?.unready ?? []) {
-    warn(`fabric-mesh-backend: reader ${reader.name} not ready: ${reader.reason}${options.acceptUnready.includes(reader.name) ? " (accepted by --accept-unready)" : ""}\n`);
+  if (target === "sqlite") {
+    const preview = (() => { try { return readerReadiness(options.root, "sqlite", required, window); } catch { return undefined; } })();
+    for (const reader of preview?.unready ?? []) {
+      warn(`fabric-mesh-backend: reader ${reader.name} not ready: ${reader.reason}${options.acceptUnready.includes(reader.name) ? " (accepted by --accept-unready)" : ""}\n`);
+    }
   }
-  const readiness = evaluate(window, "", required);
+  const readiness = evaluate(window, "", required, undefined, target === "nats");
   const gate: Gate = { switchId: randomUUID(), required, readiness, accepted: [], checked: [], stop: () => fencedWatch?.stop() };
   try {
-    recordSwitch(options.root, { switchId: gate.switchId, phase: "intent", command: options.command, backend: "sqlite", from: backend, ...window,
-      required, requireReader: options.requireReaders, acceptUnready: options.acceptUnready, readersReady: readiness.ready, acceptedUnready: readiness.unready });
+    recordSwitch(options.root, { switchId: gate.switchId, phase: "intent", command: options.command, backend: target, from: backend, ...window,
+      required, requireReader: options.requireReaders, acceptUnready: options.acceptUnready, readersReady: readiness.ready, acceptedUnready: readiness.unready,
+      ...(target === "nats" ? { acceptOldReleaseGap: { user: os.userInfo().username, host: os.hostname() } } : {}) });
   } catch (error) {
     throw new MeshBackendRefusedError(`cannot write the switch record ${options.root}/backend-switches.jsonl: ${(error as Error).message}`);
+  }
+  if (target === "nats") {
+    gate.natsBeforeCommit = (check) => {
+      // The binding is checked whether or not any reader is required (an empty inventory proves nothing about it):
+      // the stream is this root's, the target identity is known, the switch has its challenge nonce.
+      if (!isNatsStreamForRoot(options.root, check.stream)) {
+        throw new MeshBackendRefusedError(`the NATS import stream ${check.stream} is not this root's (before the ${check.phase} step)`);
+      }
+      if (check.target === undefined) throw new MeshBackendRefusedError("the NATS server does not report this user's account ($SYS.REQ.USER.INFO): the switch cannot bind reader proofs");
+      if (check.nonce === undefined) {
+        throw new MeshBackendRefusedError(`the NATS stream ${check.stream} has no challenge nonce (an import begun before it): abandon it (import --to nats --abandon) and import again`);
+      }
+      const bind: NatsGateBind = { switchId: check.switchId, stream: check.stream, streamCreated: check.streamCreated, head: check.head,
+        digest: check.digest, target: check.target, nonce: check.nonce };
+      gate.final = evaluate({ fromEpoch: check.fromEpoch, toEpoch: check.toEpoch }, ` (under the fence, before the ${check.phase} step)`, inventory(), bind);
+      gate.checked.push(check.phase);
+    };
+    return gate;
   }
   const outerOpen = library.beforeOpen;
   library.beforeOpen = async () => {
@@ -542,7 +632,78 @@ const closeGate = (root: string, gate: Gate, warn: (text: string) => void, outco
   }
 };
 
-export const main = async (argv: string[], io: {
+/** The injection points the NATS verbs use (tests: a fake port). */
+interface NatsIo {
+  natsPort?: () => JetStreamPort;
+  gateCensus?: MeshWriterCensusSync; procScan?: ProcScanOptions; leaseProbe?: LeaseProbeOptions; builtinReaders?: readonly InstalledReader[];
+}
+
+/** The NATS connection of a verb: host flags (--nats-server, --nats-monitor), never read from the mesh directory. */
+const natsConnection = (options: Options, io: NatsIo): Pick<MeshNatsMigrationOptions, "port" | "servers" | "monitoringUrl"> =>
+  io.natsPort ? { port: io.natsPort() } : { servers: options.natsServers, ...(options.natsMonitor === undefined ? {} : { monitoringUrl: options.natsMonitor }) };
+
+const natsMigrationOptions = (options: Options, io: NatsIo, library: MeshBackendOptions): MeshNatsMigrationOptions => ({
+  ...natsConnection(options, io), lockProtocol: options.lockProtocol,
+  ...(options.lockTimeoutMs === undefined ? {} : { lockTimeoutMs: options.lockTimeoutMs }),
+  ...(library.onStep === undefined ? {} : { onStep: library.onStep }),
+});
+
+const formatNats = (verb: string, result: Record<string, unknown>): string =>
+  `${verb} ${result.converged ? "already done (verified)" : "done"}: stream ${String(result.stream)} epoch ${String(result.epoch)}, `
+  + `${String(result.entries)} entries, ${String(result.tombstones)} tombstones, digest ${String(result.digest)}`;
+
+/** `import --to nats` (smarty-dev#9690): gated before the marker and before import-commit; or `--abandon`. */
+const natsImport = async (options: Options, io: NatsIo, library: MeshBackendOptions, write: (text: string) => void,
+  warn: (text: string) => void): Promise<number> => {
+  const nats = natsMigrationOptions(options, io, library);
+  if (options.abandon) {
+    const abandoned = await abandonMeshNatsImport(options.root, nats);
+    recordSwitch(options.root, { switchId: randomUUID(), phase: "outcome", command: "import --to nats --abandon", backend: "nats", ok: true, ...abandoned });
+    write(`${options.json ? JSON.stringify({ command: "import", to: "nats", abandon: true, ok: true, ...abandoned }, null, 2)
+      : `import --to nats abandoned: stream ${abandoned.stream} ${abandoned.deleted ? "deleted" : "was absent"}; the intent is removed`}\n`);
+    return 0;
+  }
+  if (!options.acceptOldReleaseGap) {
+    throw new MeshBackendRefusedError("import --to nats needs --accept-old-release-gap: a Fabric release before c58cec72 that starts after the switch "
+      + "reads an EMPTY mesh (risk R1, smarty-dev#9690); remove such installs first, then accept it explicitly (it is recorded)");
+  }
+  const gate = await openGate(options, library, io.builtinReaders ?? BUILTIN_READERS, io.gateCensus ?? meshWriterCensusSync(options.root),
+    io.procScan ?? {}, io.leaseProbe ?? {}, warn, "nats");
+  if (!gate) throw new MeshBackendRefusedError(`import --to nats refused for ${options.root}: not a file root (roll a sqlite root back to file first)`);
+  try {
+    const result: Record<string, unknown> = { ...(await importMeshStateToNats(options.root, { ...nats, beforeCommit: gate.natsBeforeCommit! })) };
+    const final = gate.final ?? gate.readiness;
+    result.readers = { switchId: gate.switchId, ready: final.ready, acceptedUnready: final.unready, checkedUnderFence: gate.checked };
+    result.switchRecord = closeGate(options.root, gate, warn, { ok: true, stream: result.stream, epoch: result.epoch, digest: result.digest,
+      converged: result.converged, checkedUnderFence: gate.checked, readersReady: final.ready, acceptedUnready: final.unready });
+    write(`${options.json ? JSON.stringify({ command: "import", to: "nats", ok: true, ...result }, null, 2) : formatNats("import --to nats", result)}\n`);
+    return 0;
+  } catch (error) {
+    const refused = error instanceof MeshBackendRefusedError || error instanceof MeshBackendFenceError;
+    closeGate(options.root, gate, warn, { ok: false, refused, error: (error as Error).message });
+    throw error;
+  }
+};
+
+/** `rollback` of a NATS root (smarty-dev#9690): not gated (its target is file, as the sqlite rollback), recorded. */
+const natsRollback = async (options: Options, io: NatsIo, library: MeshBackendOptions, write: (text: string) => void,
+  warn: (text: string) => void): Promise<number> => {
+  const switchId = randomUUID();
+  recordSwitch(options.root, { switchId, phase: "intent", command: "rollback", backend: "file", from: "nats", gated: false });
+  try {
+    const result = await rollbackMeshStateFromNats(options.root, { ...natsMigrationOptions(options, io, library),
+      ...(options.stream === undefined ? {} : { stream: options.stream }) });
+    recordSwitch(options.root, { switchId, phase: "outcome", ok: true, ...result });
+    write(`${options.json ? JSON.stringify({ command: "rollback", from: "nats", ok: true, switchId, ...result }, null, 2) : formatNats("rollback from nats", { ...result })}\n`);
+    return 0;
+  } catch (error) {
+    try { recordSwitch(options.root, { switchId, phase: "outcome", ok: false, error: (error as Error).message }); }
+    catch (record) { warn(`fabric-mesh-backend: could not append the switch outcome ${switchId}: ${(record as Error).message}\n`); }
+    throw error;
+  }
+};
+
+export const main = async (argv: string[], io: NatsIo & {
   stdout?: (text: string) => void; stderr?: (text: string) => void;
   /** The writer census; default `meshWriterCensus` (writer-census.ts) of --root. */
   census?: MeshWriterCensus;
@@ -615,7 +776,8 @@ export const main = async (argv: string[], io: {
       const proved = options.proofFile !== undefined
         ? { ...(await installReaderProof(options.root, options.name!, fs.readFileSync(options.proofFile, "utf8"))), entries: undefined }
         : await proveFabricReader(options.root, { backend: options.backend!, ...(options.name === undefined ? {} : { name: options.name }),
-          ...(options.readerVersion === undefined ? {} : { version: options.readerVersion }) });
+          ...(options.readerVersion === undefined ? {} : { version: options.readerVersion }),
+          ...(options.backend === "nats" ? { nats: { stream: options.stream!, ...natsConnection(options, io) } } : {}) });
       write(`${options.json ? JSON.stringify({ command: "reader-proof", ok: true, ...proved }, null, 2)
         : `reader-proof done: ${proved.proof.name} ${proved.entries === undefined ? "installed" : `read ${options.backend} (${proved.entries} entries)`}, `
           + `backends ${proved.proof.backends.join(",")} at epoch ${proved.proof.provedEpoch}, release ${proved.proof.release}: ${proved.file}`}\n`);
@@ -625,6 +787,13 @@ export const main = async (argv: string[], io: {
       const status = await meshBackendStatus(options.root, library);
       write(`${options.json ? JSON.stringify(status, null, 2) : formatStatus(status)}\n`);
       return status.fenceHolds && "source" in status.reader ? 0 : 3;
+    }
+    // smarty-dev#9690: file <-> nats.
+    if (options.command === "import" && options.to === "nats") return await natsImport(options, io, library, write, warn);
+    // A malformed NATS marker is neither root kind: refuse before either rollback (smarty-dev#9747).
+    if (options.command === "rollback" && stateFileIsMalformedNatsMarker(options.root)) throw meshStateMalformedMarkerError(path.join(options.root, "state.json"));
+    if (options.command === "rollback" && (options.natsServers.length > 0 || readMeshStateNatsMarker(options.root))) {
+      return await natsRollback(options, io, library, write, warn);
     }
     // The readiness gate (smarty-dev#7815): every registered reader proved the target backend.
     if (options.command === "import" || options.command === "cutover") gate = await openGate(options, library, io.builtinReaders ?? BUILTIN_READERS,
@@ -661,7 +830,8 @@ export const main = async (argv: string[], io: {
     write(`${options.json ? JSON.stringify({ command: options.command, ok: true, ...result, alarms }, null, 2) : formatResult(options.command, result)}\n`);
     return 0;
   } catch (error) {
-    const refused = error instanceof MeshBackendRefusedError || error instanceof MeshBackendFenceError;
+    const refused = error instanceof MeshBackendRefusedError || error instanceof MeshBackendFenceError
+      || (error as { code?: unknown }).code === "FABRIC_MESH_STATE_NATS_REFUSED";
     const message = error instanceof Error ? error.message : String(error);
     if (gate) closeGate(options.root, gate, warn, { ok: false, refused, error: message });
     // smarty-dev#9501: what a refused import could not remove (the library attaches it to the refusal itself).

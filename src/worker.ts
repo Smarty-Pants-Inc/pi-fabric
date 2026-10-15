@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { childProcessEnvironment } from "./core/atomic-write.js";
+import { detachedPreview } from "./core/preview.js";
 import fs from "node:fs";
 import { followUpFile, followUpState, followUpMessageId, releaseFollowUpPayload } from "./agents/follow-up-delivery.js";
 import path from "node:path";
@@ -44,7 +45,8 @@ const executionSettled = (): Promise<void> => new Promise(resolve => {
   if (process.platform !== "win32" && process.connected && process.send) process.send({ type: "fabric-execution-settled" }, () => resolve());
   else resolve();
 });
-import { interruptedModelStreamError, retryableProviderError } from "./worker/provider-error.js";
+import { interruptedModelStreamError, retryableProviderError, WARNING_RETENTION_CAP } from "./worker/provider-error.js";
+import { classifyProviderError } from "./provider-error-class.js";
 import { copyFabricProvenance, type FabricTurnProvenance } from "./fabric-provenance.js";
 import { ActivationSession } from "./worker/activation-session.js";
 import type { ActorContextReseed } from "./worker/context-admission.js";
@@ -285,7 +287,7 @@ const assistantError = (message: Record<string, unknown>): string => {
   const model = stringField(message.model);
   const source = [provider, model].filter((value): value is string => Boolean(value)).join("/");
   const summary = unique.join(" · ") || "Pi agent reported an error";
-  return `${source ? `${source}: ` : ""}${summary}`.slice(0, MAX_STDERR_CHARS);
+  return detachedPreview(`${source ? `${source}: ` : ""}${summary}`, MAX_STDERR_CHARS);
 };
 
 const runnerLabel = (runner: string): string =>
@@ -959,7 +961,7 @@ const main = async (): Promise<void> => {
       recoveryWatchdog.suspend();
       if (closeTimer) clearTimeout(closeTimer);
       closeTimer = undefined;
-      record.warnings = [...(record.warnings ?? []), `${error.message}; aborting turn for one same-model retry`].slice(-20);
+      record.warnings = [...(record.warnings ?? []), `${error.message}; aborting turn for one same-model retry`].slice(-WARNING_RETENTION_CAP);
       update();
       // Native abort waits for the assistant to finalize/persist. Close stdin
       // only after its acknowledgement; SIGTERM + EOF together can race two
@@ -1022,7 +1024,7 @@ const main = async (): Promise<void> => {
       if (piSettledSuccessfully && (hasFinalResult || piSettlementDurable) && modelControl.ready && !terminalStatus &&
           !terminalError && !sawAgentError && !lostResult) {
         const warning = `${error}; preserving final result and terminating child`;
-        record.warnings = [...(record.warnings ?? []), warning].slice(-20);
+        record.warnings = [...(record.warnings ?? []), warning].slice(-WARNING_RETENTION_CAP);
         appendLog(`${JSON.stringify({ type: "worker_warning", warning })}\n`);
         process.stderr.write(`[pi-fabric] ${warning}\n`);
         // Persist the result and warning BEFORE signalling the owned group.
@@ -1596,7 +1598,7 @@ const main = async (): Promise<void> => {
       } catch { /* The reply tool's durable file is authoritative, never final prose. */ }
       if (record.value === undefined) {
         record.status = "failed";
-        const snippet = record.text.trim().slice(0, 200);
+        const snippet = detachedPreview(record.text.trim(), 200);
         record.error = `Directive reply missing: the run ended without a fabric_reply call${snippet ? ` (final text: ${snippet}${record.text.trim().length > 200 ? "…" : ""})` : ""}`;
       }
     }
@@ -1607,7 +1609,7 @@ const main = async (): Promise<void> => {
         record.status = "failed";
         const reason = error instanceof Error ? error.message : String(error);
         const output = record.text.trim();
-        const snippet = output.slice(0, 200);
+        const snippet = detachedPreview(output, 200);
         record.error = `Structured agent output was invalid: ${reason}${snippet ? ` (output: ${snippet}${output.length > 200 ? "…" : ""})` : ""}`;
       }
     }
@@ -2099,7 +2101,13 @@ const main = async (): Promise<void> => {
         terminalError = silentOverflow ? silentOverflowError(messageRecord, childContextWindow ?? 0) : assistantError(messageRecord);
         // Pi never retries a silent "stop" overflow (it compacts and keeps the answer), so no
         // recovery is pending; any other failed turn may still be recovered by Pi.
-        if (silentOverflow && messageRecord.stopReason === "stop") recoveryWatchdog.clear();
+        const providerError = classifyProviderError(messageRecord);
+        if ((providerError?.type === "model_not_found" || providerError?.code === "model_not_found") &&
+          (providerError.status === 400 || providerError.status === 404)) {
+          // A catalog miss cannot recover on the same model. Stop before native or worker retries;
+          // retain the provider error in the failed result and the existing spawner completion.
+          failStalledChild(terminalError);
+        } else if (silentOverflow && messageRecord.stopReason === "stop") recoveryWatchdog.clear();
         else recoveryWatchdog.arm(terminalError);
       } else {
         recoveryWatchdog.clear();
@@ -2171,7 +2179,8 @@ const main = async (): Promise<void> => {
     }
     if (event.type === "extension_error") {
       const error = typeof event.error === "string" ? event.error : "Extension error";
-      stderr = `${stderr}\n${error}`.trim().slice(-MAX_STDERR_CHARS);
+      const combined = `${stderr}\n${error}`.trim();
+      stderr = detachedPreview(combined.slice(-MAX_STDERR_CHARS), MAX_STDERR_CHARS);
       update();
     }
   };
@@ -2367,7 +2376,7 @@ const main = async (): Promise<void> => {
       receiptLineDropped = true;
       record.writeReceipt = receiptNow(); // stored now too, in case no later end or terminal write comes
     }
-    oversized = { chars: text.length, prefix: text.slice(0, MAX_EVENT_LINE_CHARS) };
+    oversized = { chars: text.length, prefix: detachedPreview(text, MAX_EVENT_LINE_CHARS) };
   };
   const finishOversizedEvent = (): void => {
     if (!oversized) return;
@@ -2394,7 +2403,7 @@ const main = async (): Promise<void> => {
       (artifactPath ? `; first ${prefix.length} characters saved to: ${artifactPath}` : "");
     appendLog(`${JSON.stringify({ type: "worker_warning", warning })}\n`);
     process.stderr.write(`[pi-fabric] ${warning}\n`);
-    record.warnings = [...(record.warnings ?? []), warning].slice(-20);
+    record.warnings = [...(record.warnings ?? []), warning].slice(-WARNING_RETENTION_CAP);
     // Never strand a correlated admission response behind the event-line cap.
     // Only its bounded envelope is inspected; the history remains discarded.
     contextAdmission?.observeOversizedResponse(prefix, chars);
@@ -2409,7 +2418,7 @@ const main = async (): Promise<void> => {
     if (!text) return;
     appendLog(`${JSON.stringify({ type: "worker_stderr", text })}\n`);
     process.stderr.write(text);
-    stderr = `${stderr}${text}`.slice(-MAX_STDERR_CHARS);
+    stderr = detachedPreview(`${stderr}${text}`.slice(-MAX_STDERR_CHARS), MAX_STDERR_CHARS);
   };
   const consumeOutput = (decoded: string, projected = false): void => {
     if (options.runner === "veda") {
@@ -2446,6 +2455,9 @@ const main = async (): Promise<void> => {
       outputBuffer = outputBuffer.slice(newline + 1);
       processEvent(line);
     }
+    // Only the unfinished line survives until the next read. Copy once here,
+    // not at each transient line slice in a multi-event chunk.
+    outputBuffer = detachedPreview(outputBuffer, outputBuffer.length);
   };
   const attachChildStreams = (): void => {
     child.on("message", (message: unknown) => {
@@ -2614,7 +2626,7 @@ const main = async (): Promise<void> => {
       recoveryWatchdog.observe({ type: "auto_retry_start", delayMs: waitMs, errorMessage });
       const resume = { attempt: providerResumeAttempts + 1, maxAttempts: PI_PROVIDER_RESUME_DELAYS_MS.length,
         delayMs: waitMs, error: errorMessage, sessionFile: piSessionFile };
-      record.warnings = [...(record.warnings ?? []), `Pi provider recovery: same-session resume ${resume.attempt}/${resume.maxAttempts} scheduled after ${waitMs}ms`].slice(-20);
+      record.warnings = [...(record.warnings ?? []), `Pi provider recovery: same-session resume ${resume.attempt}/${resume.maxAttempts} scheduled after ${waitMs}ms`].slice(-WARNING_RETENTION_CAP);
       update();
       emitLifecycle("run.resumed", { ...resume, phase: "scheduled" });
       appendLog(`${JSON.stringify({ type: "fabric_provider_resume", ...resume, phase: "scheduled" })}\n`);
@@ -2730,7 +2742,7 @@ const main = async (): Promise<void> => {
   }
   runLog.flush();
   record.exitCode = exitCode;
-  record.stderr = stderr.slice(-MAX_STDERR_CHARS);
+  record.stderr = detachedPreview(stderr.slice(-MAX_STDERR_CHARS), MAX_STDERR_CHARS);
   if (
     record.compaction?.status === "queued" ||
     record.compaction?.status === "in_flight"
@@ -2782,7 +2794,7 @@ const main = async (): Promise<void> => {
     // valid JSON prefix) must never pass completed-only consumers.
     record.partialText = interruptedText;
     record.text = interruptedText;
-    record.warnings = [...(record.warnings ?? []), warning].slice(-20);
+    record.warnings = [...(record.warnings ?? []), warning].slice(-WARNING_RETENTION_CAP);
     appendLog(`${JSON.stringify({ type: "worker_warning", warning })}\n`);
   }
   validateCompletedResult();

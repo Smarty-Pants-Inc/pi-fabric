@@ -54,6 +54,10 @@ import {
   readResidentRequestDecision,
   registerResidentCancellation,
   residentRequestExpiredOutcome,
+  residentCreateMayBeProtected,
+  residentSlotResponseError,
+  ResidentSlotError,
+  type ResidentSlotStatus,
   commitResidentRequest,
   RESIDENT_HOST_FORMAT,
   RESIDENT_ACTOR_COMMAND_FORMAT,
@@ -535,6 +539,17 @@ export class ResidencyClient {
     await this.#waitForParticipant(id, "actor");
   }
 
+  /** Read the selected live resident's actual native store; do not start a host. */
+  async slotStatus(signal?: AbortSignal): Promise<ResidentSlotStatus> {
+    if (!this.#liveOwner()) throw new Error("Root resident host is not live");
+    const response = await this.#command({
+      format: RESIDENT_ACTOR_COMMAND_FORMAT, operation: "slotStatus", requestId: randomUUID(),
+      rootId: this.options.config.rootId, createdAt: Date.now(),
+    }, signal);
+    if (!response.slotStatus) throw new Error("Resident host returned no native slot status");
+    return response.slotStatus;
+  }
+
   async createActor(request: FabricActorCreateRequest, signal?: AbortSignal): Promise<FabricActorInfo> {
     const { idempotencyKey, ...creationRequest } = request;
     await this.ensureHost();
@@ -917,9 +932,12 @@ export class ResidencyClient {
     command = prepareResidentCreationCommand(owner, command);
     throwIfAborted(signal);
     command = residentCommandForOwner(command, owner);
-    registerResidentCancellation(signal, this.options.config.residencyRoot, command);
+    let dispatched = false;
+    registerResidentCancellation(signal, this.options.config.residencyRoot, command, () => dispatched);
     const responsePath = path.join(this.#responsesPath, `${command.requestId}.json`);
     try {
+      throwIfAborted(signal);
+      dispatched = true; // A failed publication can still have reached the selected host.
       atomicWrite(path.join(this.#requestsPath, `${command.requestId}.json`), command);
       const deadline = Date.now() + (this.options.commandTimeoutMs ?? COMMAND_TIMEOUT_MS);
       while (Date.now() < deadline) {
@@ -928,6 +946,11 @@ export class ResidencyClient {
         if (response?.format === RESIDENT_HOST_FORMAT && response.requestId === command.requestId) {
           if (acknowledgeResidentResponse(this.options.config.residencyRoot, response, Date.now(), command.format)) fs.rmSync(responsePath, { force: true });
           if (!response.ok) {
+            const slotError = residentSlotResponseError(response, signal);
+            if (slotError) {
+              if (slotError.code === "FABRIC_ACTOR_SLOT_CLAIM_REFUSED") dispatched = false;
+              throw slotError;
+            }
             if (command.operation === "resetSession" && response.errorCode === "ACTOR_SESSION_RESET_CANCELLED") {
               throw new ActorSessionResetCancelledError(command.id, response.error, command.requestId);
             }
@@ -956,7 +979,11 @@ export class ResidencyClient {
         ` (${command.operation})${note ? `: ${note}` : ""}`);
     } catch (error) {
       // This acknowledged terminal response is known, unlike a lost post-commit reply.
-      if (error instanceof ActorSessionResetCancelledError) throw error;
+      if (error instanceof ActorSessionResetCancelledError || error instanceof ResidentSlotError) throw error;
+      // The protected receiver upgrades every post-accept failure to distinct
+      // slot uncertainty, so these terminal native refusals retain their codes.
+      if (error instanceof ResidentActorAuthorizationError || error instanceof ResidentCommandUnsupportedError ||
+          error instanceof FabricModelDeniedError) { dispatched = false; throw error; }
       if (error instanceof ResidentRequestExpiredError) throw residentRequestExpiredOutcome(this.options.config.residencyRoot, command, signal);
       let decision;
       try {
@@ -968,7 +995,9 @@ export class ResidencyClient {
         try { known = readResidentRequestDecision(this.options.config.residencyRoot, command.requestId); } catch { /* unreadable fence */ }
         throw new ResidentOutcomeUnknownError(command, known, fenceError, signal);
       }
-      if (decision.state === "committed") throw new ResidentOutcomeUnknownError(command, decision, error, signal);
+      if (decision.state === "committed" || (dispatched && residentCreateMayBeProtected(command))) {
+        throw new ResidentOutcomeUnknownError(command, decision, error, signal);
+      }
       throw error;
     }
   }

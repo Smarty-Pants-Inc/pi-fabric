@@ -23,7 +23,7 @@ registerHooks({ resolve(specifier, context, nextResolve) {
   return nextResolve(specifier, context);
 }});
 Object.defineProperty(process, "platform", { value: "win32" });
-const { default: config } = await import(pathToFileURL(path.resolve("vitest.config.ts")).href);
+const { default: config } = await import(pathToFileURL(path.resolve("vitest.config.cts")).href);
 const { isolatedTestTemp, isolateTestFleetEnvironment } = await import(pathToFileURL(path.resolve("scripts/test-temp.ts")).href);
 const root = config.test.env.TMPDIR;
 // smarty-dev#11145 r5: a private run child of the job root, never the shared job root itself.
@@ -339,7 +339,7 @@ describe("test temporary-storage isolation", () => {
   it.skipIf(process.platform === "win32").each([0, 7])("runs registered teardown before process exit %i without deleting its caller", (exitCode) => {
     const caller = mkdtempSync(join(tmpdir(), "teardown-probe-"));
     try {
-      const config = new URL("../vitest.config.ts", import.meta.url).href;
+      const config = new URL("../vitest.config.cts", import.meta.url).href;
       const result = spawnSync("bun", ["-e", `
         import assert from "node:assert/strict";
         import fs from "node:fs";

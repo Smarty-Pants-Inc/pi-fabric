@@ -747,12 +747,12 @@ describe("#169 round 2 public cleanup outcome", () => {
       });
       expect(fs.existsSync(marker)).toBe(true);
       failing.mockRestore();
-      if (process.platform === "linux") {
+      if (process.platform === "linux" || process.platform === "darwin" || process.platform === "win32") {
       await expect(provider.invoke("remove", { id: actor.id }, context)).resolves.toEqual({ removed: true });
       expect(fs.existsSync(dir)).toBe(false);
       expect(fs.existsSync(marker)).toBe(false);
       } else {
-        // Off Linux the retry is refused before any delete (smarty-dev#8090; follow-up smarty-dev#11335): tree and marker kept.
+        // On unsupported platforms the retry refuses before any delete (smarty-dev#8090; smarty-dev#11335): tree and marker kept.
         await expect(provider.invoke("remove", { id: actor.id }, context)).resolves.toMatchObject({
           removed: true, cleaned: false,
           pending: `removal cleanup failed: Root actor tree deletion needs the Main publication fence, which this platform (${process.platform}) lacks (smarty-dev#8090); follow-up smarty-dev#11335; the root ${state.identity.id} actor tree is kept (a later remove or host start finishes it)`,
@@ -812,14 +812,14 @@ describe("#169 round 1 resident cleanup routing", () => {
       const retried = await request({ operation: "removeActor", id: actor.id });
       expect(retried).toMatchObject({ ok: true });
       expect(first.cleaned).toBe(false);
-      if (process.platform === "linux") {
+      if (process.platform === "linux" || process.platform === "darwin" || process.platform === "win32") {
       expect(retried.pending).toBeUndefined();
       expect(fs.existsSync(dir)).toBe(false);
       expect(fs.existsSync(marker)).toBe(false);
       expect(fs.existsSync(removalsPath)).toBe(false);
       expect(fs.readFileSync(successor.sessionFile, "utf8")).toBe("successor history\n");
       } else {
-        // Off Linux no root actor tree deletion runs (smarty-dev#8090; follow-up smarty-dev#11335): still pending, all kept.
+        // On unsupported platforms no root actor tree deletion runs (smarty-dev#8090; smarty-dev#11335): pending, all kept.
         expect(retried.cleaned).toBe(false);
         expect(retried.pending).toBe(`removal cleanup failed: Root actor tree deletion needs the Main publication fence, which this platform (${process.platform}) lacks (smarty-dev#8090); follow-up smarty-dev#11335; the root ${state.identity.id} actor tree is kept (a later remove or host start finishes it)`);
         expect(fs.existsSync(dir)).toBe(true);
@@ -2363,13 +2363,13 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
       mainAgent: state.mainAgent,
       hostPath,
     });
-    if (process.platform === "linux") {
+    if (process.platform === "linux" || process.platform === "darwin" || process.platform === "win32") {
       await expect(reconnect.removeActor(actor.id)).resolves.toEqual({ removed: true });
     } else {
       const historyFile = path.join(state.config.actorRoot, actor.id, "session.jsonl");
       fs.appendFileSync(historyFile, `${JSON.stringify({ testHistory: "resident reconnect removal" })}\n`);
       const historyBeforeRemoval = fs.readFileSync(historyFile, "utf8");
-      // Off Linux the fence refusal follows registry revocation but precedes tree deletion; follow-up smarty-dev#11335.
+      // On unsupported platforms fence refusal follows revocation but precedes tree deletion; follow-up smarty-dev#11335.
       const removal = await reconnect.removeActor(actor.id);
       expect(removal).toEqual({ removed: true, cleaned: false,
         pending: `removal cleanup failed: Root actor tree deletion needs the Main publication fence, which this platform (${process.platform}) lacks (smarty-dev#8090); follow-up smarty-dev#11335; the root ${state.identity.id} actor tree is kept (a later remove or host start finishes it)` });

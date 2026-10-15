@@ -1,3 +1,4 @@
+import { detachedPreview } from "../core/preview.js";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { SessionBoundaryDraft, TurnEndEvent } from "@earendil-works/pi-coding-agent";
 
@@ -33,7 +34,7 @@ export function compactActivationTools(event: TurnEndEvent, options: { includeLa
         messages.push(message);
         continue;
       }
-      let excerpt = text.slice(0, EXCERPT_CHARS);
+      let excerpt = detachedPreview(text, EXCERPT_CHARS);
       if (/[\uD800-\uDBFF]$/.test(excerpt)) excerpt = excerpt.slice(0, -1);
       const content = [{ type: "text" as const, text: `${excerpt}\n${marker}` }];
       edits.push({ type: "context_edit", targetId: entry.id, replacement: { content } });

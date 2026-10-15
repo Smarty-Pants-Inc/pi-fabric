@@ -1,3 +1,5 @@
+import { detachedPreview } from "../core/preview.js";
+
 interface ActorContentBlock {
   type?: string;
   text?: string;
@@ -36,7 +38,7 @@ const PATH_RE = new RegExp('(["\'`])([\\w@./-]+\\.(?:' + FILE_EXT + '))\\1', "g"
 
 const clip = (value: string, max: number): string => {
   const text = value.replace(/\s+/g, " ").trim();
-  return text.length > max ? text.slice(0, max - 1) + "\u2026" : text;
+  return text.length > max ? detachedPreview(text, max - 1) + "\u2026" : detachedPreview(text, max);
 };
 
 const firstLine = (value: string): string => {
@@ -101,7 +103,7 @@ const scanFiles = (messages: ActorMessage[], cap: number): string[] => {
     PATH_RE.lastIndex = 0;
     let match: RegExpExecArray | null;
     while ((match = PATH_RE.exec(hay)) !== null) {
-      if (match[2]) seen.add(match[2]);
+      if (match[2]) seen.add(detachedPreview(match[2], match[2].length));
       if (seen.size >= cap * 3) break;
     }
   }

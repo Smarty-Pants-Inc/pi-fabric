@@ -26,6 +26,7 @@ import type { AgentRunRecord, AgentRunResult } from "../src/agents/types.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 import { buildVedaArguments } from "../src/agents/veda-cli.js";
 import { modelExceptionGrant, withRootExceptionMetadata, writeModelExceptions } from "./helpers/model-exceptions.js";
+import { fakeManagerHeapWorker } from "./fixtures/manager-heap-probe.js";
 
 const ProductionAgentManager = AgentManager;
 const managers: AgentManager[] = [];
@@ -213,7 +214,10 @@ describe("Agent prompt retention (#11663)", () => {
     await manager.close();
     expect(fs.existsSync(successfulDirectory)).toBe(false);
     expect(fs.existsSync(promptPath)).toBe(true);
-    expect(fs.readdirSync(path.dirname(promptPath)).sort()).toEqual(["status.json", "task.txt"]);
+    expect(fs.readdirSync(path.dirname(promptPath)).sort()).toEqual(["manager-result.json", "status.json", "task.txt"]);
+    const retainedResult = JSON.parse(fs.readFileSync(path.join(path.dirname(promptPath), "manager-result.json"), "utf8")) as AgentRunRecord;
+    expect(retainedResult).toMatchObject({ id: failedHandle.id, status: "failed" });
+    expect(retainedResult).not.toHaveProperty("task");
     const persisted = JSON.parse(fs.readFileSync(path.join(path.dirname(promptPath), "status.json"), "utf8")) as AgentRunRecord;
     expect(persisted).toMatchObject({
       status: "failed",
@@ -243,7 +247,8 @@ describe("Agent prompt retention (#11663)", () => {
     expect(createHash("sha256").update(currentBytes).digest("hex")).toBe(beforeClose.inputSha256);
     expect(Buffer.byteLength(currentBytes)).toBe(beforeClose.inputBytes);
     await manager.close();
-    expect(fs.readdirSync(path.dirname(taskPath)).sort()).toEqual(["status.json", "task.txt"]);
+    expect(fs.readdirSync(path.dirname(taskPath)).sort()).toEqual(["manager-result.json", "status.json", "task.txt"]);
+    expect(JSON.parse(fs.readFileSync(path.join(path.dirname(taskPath), "manager-result.json"), "utf8"))).not.toHaveProperty("task");
     const persisted = JSON.parse(fs.readFileSync(path.join(path.dirname(taskPath), "status.json"), "utf8")) as AgentRunRecord;
     expect(persisted.promptSha256).toBe(beforeClose.promptSha256);
     expect(persisted.promptBytes).toBe(beforeClose.promptBytes);
@@ -263,7 +268,9 @@ describe("Agent prompt retention (#11663)", () => {
     const taskPath = (manager.status(handle.id) as AgentRunRecord).promptPath!;
     fs.writeFileSync(taskPath, "tampered bytes\n", { mode: 0o600 });
     await manager.close();
-    expect(fs.readdirSync(path.dirname(taskPath)).sort()).toEqual(["status.json"]);
+    expect(fs.readdirSync(path.dirname(taskPath)).sort()).toEqual(["manager-result.json", "status.json"]);
+    expect(JSON.parse(fs.readFileSync(path.join(path.dirname(taskPath), "manager-result.json"), "utf8"))).toMatchObject({ status: "failed" });
+    expect(JSON.parse(fs.readFileSync(path.join(path.dirname(taskPath), "manager-result.json"), "utf8"))).not.toHaveProperty("task");
     const persisted = JSON.parse(fs.readFileSync(path.join(path.dirname(taskPath), "status.json"), "utf8")) as AgentRunRecord;
     expect(persisted.promptRetentionDropped).toBe(true);
     expect(persisted.promptRetentionMismatch).toBe(true);
@@ -2635,45 +2642,54 @@ describe("AgentManager", () => {
     expect(types).toContain("agent_settled");
   });
 
-  it("derives trusted log paths and recursively discovers bounded nested runs", async () => {
+  it("derives trusted log paths and freezes recursively discovered nested runs at settlement", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
     roots.push(root);
-    const manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, retainRuns: true }, {
       workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
       runRoot: root,
     });
     managers.push(manager);
-    const result = await manager.run({ task: "Inspect nesting", transport: "process" });
-    const runDirectory = manager.runDirectory(result.id)!;
-    const topStatus = JSON.parse(fs.readFileSync(path.join(runDirectory, "status.json"), "utf8"));
-    fs.writeFileSync(
-      path.join(runDirectory, "status.json"),
-      JSON.stringify({ ...topStatus, logFile: "/tmp/untrusted-top.jsonl" }),
-    );
-    const childDirectory = path.join(runDirectory, "nested", "child");
-    const grandchildDirectory = path.join(childDirectory, "nested", "grandchild");
-    fs.mkdirSync(grandchildDirectory, { recursive: true });
-    fs.writeFileSync(
-      path.join(childDirectory, "status.json"),
-      JSON.stringify({ ...result, id: "child", name: "child", logFile: "/tmp/untrusted-child.jsonl" }),
-    );
-    fs.writeFileSync(
-      path.join(grandchildDirectory, "status.json"),
-      JSON.stringify({ ...result, id: "grandchild", name: "grandchild", logFile: "/tmp/untrusted-grandchild.jsonl" }),
-    );
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async request => {
+      const transport = await fakeManagerHeapWorker(request);
+      const statusFile = request.workerArguments[request.workerArguments.indexOf("--status-file") + 1]!;
+      const record = JSON.parse(fs.readFileSync(statusFile, "utf8"));
+      const child = path.join(path.dirname(statusFile), "nested", "child");
+      const grandchild = path.join(child, "nested", "grandchild");
+      fs.mkdirSync(grandchild, { recursive: true });
+      writeJsonAtomic(statusFile, { ...record, logFile: "/tmp/untrusted-top.jsonl" });
+      for (const [directory, id] of [[child, "child"], [grandchild, "grandchild"]] as const) {
+        writeJsonAtomic(path.join(directory, "status.json"), { ...record, id, name: id, logFile: `/tmp/untrusted-${id}.jsonl` });
+      }
+      return transport; // Publish the whole tree before the manager can settle.
+    });
+    try {
+      const result = await manager.run({ task: "Inspect nesting", transport: "process", extensions: false });
+      const runDirectory = manager.runDirectory(result.id)!;
+      const childDirectory = path.join(runDirectory, "nested", "child");
+      const grandchildDirectory = path.join(childDirectory, "nested", "grandchild");
+      const status = manager.status(result.id) as AgentRunRecord;
+      for (const record of [result, status, await manager.wait(result.id)]) {
+        expect(record.logFile).toBe(path.join(runDirectory, "events.jsonl"));
+        expect(record.nestedAgents?.[0]?.logFile).toBe(path.join(childDirectory, "events.jsonl"));
+        expect(record.nestedAgents?.[0]?.nestedAgents?.[0]?.logFile).toBe(path.join(grandchildDirectory, "events.jsonl"));
+      }
+      const published = JSON.parse(fs.readFileSync(path.join(runDirectory, "manager-result.json"), "utf8"));
+      expect(published.nestedAgents).toEqual(result.nestedAgents);
 
-    const status = manager.status(result.id) as AgentRunRecord;
-    expect(status.logFile).toBe(path.join(runDirectory, "events.jsonl"));
-    expect(status.nestedAgents?.[0]?.logFile).toBe(path.join(childDirectory, "events.jsonl"));
-    expect(status.nestedAgents?.[0]?.nestedAgents?.[0]?.logFile).toBe(
-      path.join(grandchildDirectory, "events.jsonl"),
-    );
-
-    status.nestedAgents![0]!.name = "caller mutation";
-    fs.rmSync(path.join(runDirectory, "nested"), { recursive: true, force: true });
-    const retained = manager.status(result.id) as AgentRunRecord;
-    expect(retained.nestedAgents?.[0]?.name).toBe("child");
-    expect(retained.nestedAgents?.[0]?.nestedAgents?.[0]?.name).toBe("grandchild");
+      status.nestedAgents![0]!.name = "caller mutation";
+      // Native teardown can still publish after the parent's result boundary.
+      writeJsonAtomic(path.join(childDirectory, "status.json"), { ...result, id: "child", name: "late rewrite" });
+      const late = path.join(runDirectory, "nested", "late-child");
+      fs.mkdirSync(late);
+      writeJsonAtomic(path.join(late, "status.json"), { ...result, id: "late-child", name: "late child" });
+      for (const retained of [manager.status(result.id) as AgentRunRecord, await manager.wait(result.id)]) {
+        expect(retained.nestedAgents).toEqual(result.nestedAgents);
+        expect(retained.nestedAgents?.map(record => record.id)).toEqual(["child"]);
+        expect(retained.nestedAgents?.[0]?.name).toBe("child");
+        expect(retained.nestedAgents?.[0]?.nestedAgents?.[0]?.name).toBe("grandchild");
+      }
+    } finally { launch.mockRestore(); }
   });
 
   it("captures recursive leaves before the child process removes their directories", async () => {

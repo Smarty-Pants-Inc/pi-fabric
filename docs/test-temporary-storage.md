@@ -2,7 +2,7 @@
 
 `bun run test -- <Vitest arguments>` uses `scripts/run-tests.mjs`. The launcher creates one private
 run directory through `scripts/test-temp.ts`, then sets `TMPDIR`, `TMP` and `TEMP` before starting
-Vitest. `vitest.config.ts` reuses this owned root before fleet state or workers are created. Fixture
+Vitest. `vitest.config.cts` reuses this owned root before fleet state or workers are created. Fixture
 directories and inherited child tools therefore stay beneath it. Direct config imports still create
 their own root. There is no shared `/tmp` fallback for long caller paths.
 

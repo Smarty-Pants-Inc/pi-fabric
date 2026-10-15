@@ -9,9 +9,9 @@ import { MeshStore, type MeshIdentity, type MeshStateEntry } from "../src/mesh/s
 import { hostLiveness, LIVENESS_POLICY_KEY, readHostLeases, writeHostLease } from "../src/topology/host-leases.js";
 import { writeParticipantFile } from "../src/topology/participant-files.js";
 
-// smarty-dev#6477: a hub with links to two spokes. A dead origin's mirrored host lease and root
-// must lapse on every mesh within one BRIDGE_LEASE_MS of the origin's own expiry (+ one sync),
-// and no mirror may ever outlive the origin's expiry.
+// A hub with links to two spokes. Fresh source observations may keep a root discoverable
+// until the next source sample, but never renew its recorded native lease (#10068). A dead
+// origin is withdrawn within one bridge freshness window of its source expiry (+ one sync).
 const roots: string[] = [];
 const links: Array<() => Promise<void>> = [];
 afterEach(async () => {
@@ -73,8 +73,8 @@ const liveness = (store: MeshStore, id: string) => {
   return { remoteHost: value.remoteHost, ...hostLiveness(readHostLeases(store.root), value) };
 };
 
-describe("mirrored leases keep their origin expiry (smarty-dev#6477)", () => {
-  it("lapses a dead origin's host lease and root on every mesh, never outliving the origin", async () => {
+describe("mirrored roots retain source lease evidence (#10068)", () => {
+  it("withdraws a dead origin on every mesh without inventing source renewals", async () => {
     const f = await fixture();
     const origin = await native(f.spokes.ryzen3, "ghost", f.now());
     const witness = await native(f.spokes.ryzen2, "witness", f.now());
@@ -100,7 +100,13 @@ describe("mirrored leases keep their origin expiry (smarty-dev#6477)", () => {
         const seen = liveness(mesh, origin.identity.id);
         const root = mesh.get(participantKey(origin.identity.id), { fresh: true });
         if (tick % 5 === 0) trace.push(`t+${(at - diedAt) / 1000}s ${name}: lease ${seen ? `${seen.remoteHost} expires t+${(seen.expiresAt - diedAt) / 1000}s` : "none"}, root ${root ? "present" : "none"} (origin expires t+${(expiry - diedAt) / 1000}s)`);
+        // All fixture clocks agree: traffic authority must still not outlive the origin.
         if (seen && seen.expiresAt > expiry) violations.push(`${name} at t+${(at - diedAt) / 1000}s: mirror expires ${(seen.expiresAt - expiry) / 1000}s after its origin`);
+        const observation = readHostLeases(mesh.root).get(origin.identity.id)?.mirror;
+        if (observation && observation.sourceExpiresAt > expiry)
+          violations.push(`${name}: mirror invented a source renewal`);
+        if (observation && observation.sourceExpiresAt <= observation.sourceObservedAt && seen && seen.expiresAt > at)
+          violations.push(`${name}: mirror admitted a source-expired root`);
         if (at >= deadline && seen && seen.expiresAt > at) violations.push(`${name} at t+${(at - diedAt) / 1000}s: lease still live`);
         if (at >= deadline && root) violations.push(`${name} at t+${(at - diedAt) / 1000}s: root still mirrored`);
       }

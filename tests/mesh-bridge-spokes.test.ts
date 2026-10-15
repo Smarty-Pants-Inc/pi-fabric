@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { BRIDGE_LEASE_MS, MeshBridge, RemoteBridgeSide, serveBridgeAgent, StoreBridgeSide } from "../src/mesh/bridge.js";
+import { BRIDGE_LEASE_MS, MeshBridge, RemoteBridgeSide, serveBridgeAgent, StoreBridgeSide, type BridgePresence } from "../src/mesh/bridge.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { FabricControlPlane } from "../src/topology/control-plane.js";
@@ -652,7 +652,7 @@ describe("spoke-to-spoke roots and addressed control through the hub", () => {
       ownerIncarnation: `fixture:${token}`, name, label: name.toUpperCase(), status: "idle" as const,
       runner: "pi", transport: "host" as const, capabilities: ["steer", "followUp"], sessionId: name,
       startedAt, updatedAt: startedAt, controlProtocol: "v1" as const,
-    }] };
+    }] } satisfies Pick<BridgePresence, "hosts" | "participants"> & { identity: MeshIdentity };
   };
 
   it("rejects an older first reconnect frame and preserves authority through bridge cleanup", async () => {

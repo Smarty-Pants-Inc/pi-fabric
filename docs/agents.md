@@ -1256,7 +1256,7 @@ In a scoped session, every actor is bound to the principal that created it. Acto
 
 ### Replace mesh topics without stopping an actor
 
-Use `agents.setTopics({ id, topics, scope? })` to replace an actor's exact mesh-topic list. The list is required, duplicate topics are removed, and topic names follow the same validation as `agents.create`: 1–128 characters, beginning with an ASCII letter or digit, followed by letters, digits, `.`, `_`, `:`, `/` or `-`. Wildcards, blank names, non-string entries and malformed lists are rejected rather than silently clearing subscriptions.
+Use `agents.setTopics({ id, topics, scope? })` to replace an actor's exact mesh-topic list. The list is required, duplicate topics are removed, and topic names follow the same validation as `agents.create`: 1–128 characters, beginning with an ASCII letter or digit, followed by letters, digits, `.`, `_`, `:`, `/` or `-`. Wildcards, blank names, non-string entries and malformed lists are rejected without clearing subscriptions.
 
 Native slot-bound actors have immutable topics: `setTopics` refuses them with `FABRIC_ACTOR_SLOT_CLAIM_REFUSED` (`reason: "invalid"`) before changing their state. An ordinary actor cannot acquire protected slot topics through this setter either. Protected-actor drain support is tracked in [smarty-dev#13463](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/13463).
 

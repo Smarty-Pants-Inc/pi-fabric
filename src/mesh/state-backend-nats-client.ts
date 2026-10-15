@@ -128,12 +128,36 @@ export const connectJetStream = async (servers: string[], options: ConnectJetStr
     throw redactNatsError(error);
   }
   const js = jetstream(nc);
+  // A successful fresh CREATE grants only the first consumer this open's existing readiness deadline (#12900).
+  const freshStreams = new Map<string, { deadline: number }>();
+  const bootstrapConsumer = async <T>(stream: string, request: () => Promise<T>, deadline: number): Promise<T> => {
+    let notFound: unknown;
+    let lastError: unknown;
+    let transientFailures = 0;
+    const unavailable = () => new MeshStateNatsUnavailableError(notFound === undefined
+      ? `stream ${stream} consumer was not created within the open's stream readiness budget; retry the open`
+      : `stream ${stream} consumer could not be created within the open's stream readiness budget: JetStream err_code ` +
+        `${STREAM_NOT_FOUND} (stream not found right after its creation, cluster metadata still propagating); retry the open`,
+      { consumerBootstrap: true, ...(notFound === undefined ? {} : { natsErrCode: STREAM_NOT_FOUND }),
+        ...(lastError === undefined ? {} : { cause: notFound ?? lastError }) });
+    for (;;) {
+      const outcome = await untilDeadline(request, deadline);
+      if (outcome.kind === "value") return outcome.value;
+      if (outcome.kind === "deadline") throw unavailable();
+      lastError = outcome.error;
+      if (apiCode(outcome.error) === STREAM_NOT_FOUND) notFound = outcome.error;
+      else if (!isTransientReadError(outcome.error) || ++transientFailures >= READ_RETRY_ATTEMPTS) throw outcome.error;
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) throw unavailable();
+      await sleep(Math.min(STREAM_LEADER_POLL_MS, remaining));
+    }
+  };
   // ponytail: nats-auth scoped roles subscribe only to their own _INBOX (roleTemplate), not to
   // $JS.EVENT.ADVISORY.STREAM.LEADER_ELECTED.<stream>. The leader event is therefore unusable with the configured
   // credentials. Keep this 10s-bounded info wait until advisory access is explicitly granted (#1067 round 4 exception);
   // do not widen auth permissions merely to replace the wait with an event.
   const waitForStreamLeader = async (stream: string, requiredReplicas: number, current?: Awaited<ReturnType<typeof jsm.streams.info>>,
-    budget?: { deadline: number; unavailable: () => Error }) => {
+    budget?: { deadline: number; unavailable?: () => Error }) => {
     if (requiredReplicas === 1) return current;
     const deadline = budget?.deadline ?? Date.now() + STREAM_LEADER_TIMEOUT_MS;
     const noLeader = budget?.unavailable ?? (() => new MeshStateNatsBusyError(`stream ${stream} had no elected leader after ${STREAM_LEADER_TIMEOUT_MS}ms`));
@@ -171,6 +195,7 @@ export const connectJetStream = async (servers: string[], options: ConnectJetStr
         authRequired: nc.info?.auth_required === true };
     },
     ensureStream: async (stream, subjects, { maxMsgSize, replicas: requested }) => {
+      freshStreams.delete(stream); // An ordinary existing-stream ensure must not inherit an older unused grant.
       const configured = requested === undefined ? replicas : assertNatsReplicas(requested, "replicas");
       let info;
       try { info = await retryTransientRead(() => jsm.streams.info(stream)); }
@@ -239,8 +264,10 @@ export const connectJetStream = async (servers: string[], options: ConnectJetStr
           }
         }
         if (!created && !info) throw new Error(`NATS mesh state: stream ${stream} create returned no stream info`);
-        const ready = await waitForStreamLeader(stream, configured, created ?? info,
-          placementDeadline === undefined ? undefined : { deadline: placementDeadline, unavailable: placementUnavailable });
+        const readiness = placementDeadline === undefined ? { deadline: Date.now() + STREAM_LEADER_TIMEOUT_MS }
+          : { deadline: placementDeadline, unavailable: placementUnavailable };
+        const ready = await waitForStreamLeader(stream, configured, created ?? info, readiness);
+        freshStreams.set(stream, { deadline: readiness.deadline });
         return { lastSeq: ready?.state.last_seq ?? (created ?? info)!.state.last_seq,
           maxMsgSize: ready?.config.max_msg_size ?? (created ?? info)!.config.max_msg_size };
       }
@@ -286,13 +313,18 @@ export const connectJetStream = async (servers: string[], options: ConnectJetStr
       }
     },
     consume: async (stream, afterSeq, onMessage: (message: NatsStreamMessage) => void, onError) => {
+      // Taken before the first request: second consumes, resyncs and running consumers get no missing-stream retry.
+      const fresh = freshStreams.get(stream);
+      freshStreams.delete(stream);
       const consumerOptions = {
         name_prefix: randomUUID(),
         ...(afterSeq === 0
           ? { deliver_policy: DeliverPolicy.All }
           : { deliver_policy: DeliverPolicy.StartSequence, opt_start_seq: afterSeq + 1 }),
       };
-      const consumer = await retryTransientRead(() => js.consumers.get(stream, consumerOptions), READ_RETRY_ATTEMPTS);
+      const request = () => js.consumers.get(stream, consumerOptions);
+      const consumer = fresh === undefined ? await retryTransientRead(request, READ_RETRY_ATTEMPTS)
+        : await bootstrapConsumer(stream, request, fresh.deadline);
       const messages = await consumer.consume();
       void (async () => { for await (const message of messages) onMessage({ seq: message.seq, data: message.data }); })()
         .catch(error => onError?.(error));

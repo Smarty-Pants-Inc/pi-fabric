@@ -24,6 +24,8 @@ const fake = vi.hoisted(() => {
     messageErrors: [] as unknown[],
     consumerErrors: [] as unknown[],
     consumerOptions: [] as unknown[],
+    consumerDelays: [] as number[],
+    consumeIteratorError: undefined as unknown,
     publishErrors: [] as unknown[],
     drains: 0,
     addStop: false,
@@ -74,9 +76,11 @@ vi.mock("@nats-io/jetstream", () => ({
     consumers: { get: async (...args: unknown[]) => {
       fake.log.push({ op: "consumer", args });
       fake.consumerOptions.push(structuredClone(args[1]));
+      const delay = fake.consumerDelays.shift() ?? 0;
+      if (delay > 0) await new Promise<void>(resolve => setTimeout(resolve, delay));
       if (fake.consumerErrors.length > 0) throw fake.consumerErrors.shift();
       return { consume: async () => ({
-        async *[Symbol.asyncIterator]() { /* no messages */ },
+        async *[Symbol.asyncIterator]() { if (fake.consumeIteratorError !== undefined) throw fake.consumeIteratorError; },
         close: async () => undefined,
       }) };
     } },
@@ -193,6 +197,8 @@ beforeEach(() => {
   fake.messageErrors.length = 0;
   fake.consumerErrors.length = 0;
   fake.consumerOptions.length = 0;
+  fake.consumerDelays.length = 0;
+  fake.consumeIteratorError = undefined;
   fake.publishErrors.length = 0;
   fake.drains = 0;
   fake.addStop = false;
@@ -466,6 +472,200 @@ describe("NATS stream placement budget (smarty-dev#12881)", () => {
   it.each([0, -1, 1.5, NaN, Infinity, 2 ** 31])("rejects invalid placement timeout %s before connecting", async placementTimeoutMs => {
     await expect(connectJetStream(SERVERS, placementOptions(placementTimeoutMs))).rejects.toThrow(/placementTimeoutMs/);
     expect(connects()).toBe(0);
+  });
+});
+
+// smarty-dev#12900: consumer create answered 10059 right after a real-cluster fresh stream was ready.
+describe("NATS fresh-stream consumer bootstrap budget (smarty-dev#12900)", () => {
+  const notFound = () => new fake.FakeJetStreamApiError(10059);
+  const ensure = (port: Awaited<ReturnType<typeof connectJetStream>>) => port.ensureStream(STREAM, SUBJECTS, { maxMsgSize: 1024 * 1024 });
+  const settle = <T>(promise: Promise<T>) => {
+    const state = { settled: false };
+    const result = promise.then(value => { state.settled = true; return value as unknown; }, error => { state.settled = true; return error as unknown; });
+    return { state, result };
+  };
+  const expectStableOptions = () => {
+    expect(fake.consumerOptions.length).toBeGreaterThan(0);
+    expect(fake.consumerOptions.every(options => JSON.stringify(options) === JSON.stringify(fake.consumerOptions[0]))).toBe(true);
+    expect((fake.consumerOptions[0] as { name_prefix: string }).name_prefix).toMatch(/^[0-9a-f-]{36}$/);
+  };
+
+  it.each(["created", "ambiguous created"] as const)("retries consumer 10059 after a %s stream, then succeeds", async source => {
+    fake.addErrorAfterStore = source === "ambiguous created";
+    fake.createdWithoutLeader = true;
+    vi.useFakeTimers();
+    try {
+      const port = await connectJetStream(SERVERS, withReplicas(3));
+      await ensure(port);
+      fake.consumerErrors.push(notFound(), notFound());
+      const { result } = settle(port.consume(STREAM, 0, () => undefined));
+      await vi.advanceTimersByTimeAsync(200);
+      expect(await result).toMatchObject({ stop: expect.any(Function) });
+      expect(fake.consumerOptions).toHaveLength(3);
+      expectStableOptions();
+      expect(fake.consumerOptions[0]).toMatchObject({ deliver_policy: "all" });
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("surfaces persistent 10059 as typed consumer-bootstrap unavailability at exactly the default readiness deadline", async () => {
+    vi.useFakeTimers();
+    try {
+      const port = await connectJetStream(SERVERS, withReplicas(1));
+      const startedAt = Date.now();
+      await ensure(port);
+      fake.consumerErrors.push(...Array.from({ length: 500 }, notFound));
+      const { state, result } = settle(port.consume(STREAM, 0, () => undefined));
+      await vi.advanceTimersByTimeAsync(9_999);
+      expect(state.settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      const error = await result;
+      expect(Date.now() - startedAt).toBe(10_000);
+      expect(error).toBeInstanceOf(MeshStateNatsUnavailableError);
+      expect(error).toMatchObject({ code: "FABRIC_MESH_STATE_NATS_UNAVAILABLE", reason: "consumer-bootstrap-unavailable", natsErrCode: 10059 });
+      expect((error as Error).message).toContain("10059");
+      expect((error as Error).message).not.toMatch(/placement/i);
+      expect(((error as Error).cause as { apiError?: () => { err_code: number } }).apiError?.().err_code).toBe(10059);
+      expect(fake.consumerOptions.length).toBeGreaterThan(3);
+      expectStableOptions();
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("keeps consumer 10059 on an existing stream fatal after one attempt", async () => {
+    seedStream(STREAM, 3, SUBJECTS);
+    const port = await connectJetStream(SERVERS, withReplicas(3));
+    await ensure(port);
+    fake.consumerErrors.push(notFound(), notFound());
+    await expect(port.consume(STREAM, 7, () => undefined)).rejects.toBeInstanceOf(fake.FakeJetStreamApiError);
+    expect(fake.consumerOptions).toHaveLength(1);
+  });
+
+  it("clears a fresh budget when a later ensure only observes the existing stream", async () => {
+    const port = await connectJetStream(SERVERS, withReplicas(1));
+    await ensure(port);
+    await ensure(port);
+    expect(mutations().map(entry => entry.op)).toEqual(["add"]);
+    fake.consumerErrors.push(notFound(), notFound());
+    await expect(port.consume(STREAM, 0, () => undefined)).rejects.toBeInstanceOf(fake.FakeJetStreamApiError);
+    expect(fake.consumerOptions).toHaveLength(1);
+  });
+
+  it("grants no 10059 tolerance to a second consume or a running consumer", async () => {
+    const port = await connectJetStream(SERVERS, withReplicas(1));
+    await ensure(port);
+    const first = await port.consume(STREAM, 0, () => undefined);
+    fake.consumerErrors.push(notFound(), notFound());
+    await expect(port.consume(STREAM, 0, () => undefined)).rejects.toBeInstanceOf(fake.FakeJetStreamApiError);
+    expect(fake.consumerOptions).toHaveLength(2);
+    await first.stop();
+
+    fake.consumerErrors.length = 0;
+    fake.streams.clear();
+    await ensure(port);
+    fake.consumeIteratorError = notFound();
+    const errors: unknown[] = [];
+    await port.consume(STREAM, 0, () => undefined, error => { errors.push(error); });
+    await vi.waitFor(() => expect(errors).toHaveLength(1));
+    expect((errors[0] as { apiError?: () => { err_code: number } }).apiError?.().err_code).toBe(10059);
+    expect(fake.consumerOptions).toHaveLength(3);
+  });
+
+  it("bounds a pending retry by the shared deadline with stable options and the observed 10059 cause", async () => {
+    vi.useFakeTimers();
+    try {
+      const port = await connectJetStream(SERVERS, withReplicas(1));
+      await ensure(port);
+      fake.consumerErrors.push(notFound());
+      fake.consumerDelays.push(0, 60_000);
+      const { state, result } = settle(port.consume(STREAM, 4, () => undefined));
+      await vi.advanceTimersByTimeAsync(9_999);
+      expect(state.settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(await result).toMatchObject({ reason: "consumer-bootstrap-unavailable", natsErrCode: 10059 });
+      expect(fake.consumerOptions).toHaveLength(2);
+      expectStableOptions();
+      expect(fake.consumerOptions[0]).toMatchObject({ deliver_policy: "by_start_sequence", opt_start_seq: 5 });
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("reports a first pending request that outlives the budget without faking a 10059 cause", async () => {
+    vi.useFakeTimers();
+    try {
+      const port = await connectJetStream(SERVERS, withReplicas(1));
+      await ensure(port);
+      fake.consumerDelays.push(60_000);
+      const { result } = settle(port.consume(STREAM, 0, () => undefined));
+      await vi.advanceTimersByTimeAsync(10_000);
+      const error = await result;
+      expect(error).toBeInstanceOf(MeshStateNatsUnavailableError);
+      expect(error).toMatchObject({ reason: "consumer-bootstrap-unavailable" });
+      expect((error as { natsErrCode?: unknown }).natsErrCode).toBeUndefined();
+      expect((error as Error).message).not.toContain("10059");
+      expect((error as Error).cause).toBeUndefined();
+      expect(fake.consumerOptions).toHaveLength(1);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("does not start a consumer request after its shared deadline has already elapsed", async () => {
+    vi.useFakeTimers();
+    try {
+      const port = await connectJetStream(SERVERS, withReplicas(1));
+      await ensure(port);
+      await vi.advanceTimersByTimeAsync(10_000);
+      const error = await port.consume(STREAM, 0, () => undefined).then(() => undefined, error => error);
+      expect(error).toBeInstanceOf(MeshStateNatsUnavailableError);
+      expect(error).toMatchObject({ reason: "consumer-bootstrap-unavailable" });
+      expect(fake.consumerOptions).toHaveLength(0);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("shares one budget across placement retries, leader wait and consumer 10059", async () => {
+    fake.addErrors.push(new fake.FakeJetStreamApiError(10005, 400));
+    fake.createdWithoutLeader = true;
+    fake.infoDelays.push(0, 50);
+    vi.useFakeTimers();
+    try {
+      const port = await connectJetStream(SERVERS, { replicas: 3, placementTimeoutMs: 350 });
+      const startedAt = Date.now();
+      fake.consumerErrors.push(...Array.from({ length: 50 }, notFound));
+      const { state, result } = settle(ensure(port).then(() => port.consume(STREAM, 0, () => undefined)));
+      await vi.advanceTimersByTimeAsync(349);
+      expect(state.settled).toBe(false);
+      expect(fake.consumerOptions.length).toBeGreaterThan(0);
+      await vi.advanceTimersByTimeAsync(1);
+      const error = await result;
+      expect(Date.now() - startedAt).toBe(350);
+      expect(error).toMatchObject({ reason: "consumer-bootstrap-unavailable", natsErrCode: 10059 });
+      expectStableOptions();
+    } finally { vi.useRealTimers(); }
+  });
+
+  it.each([new fake.FakeJetStreamApiError(10058, 400), fake.permissionDenied()])(
+    "keeps unrelated bootstrap error $name fatal without retry", async fatal => {
+      const port = await connectJetStream(SERVERS, withReplicas(1));
+      await ensure(port);
+      fake.consumerErrors.push(fatal);
+      await expect(port.consume(STREAM, 0, () => undefined)).rejects.toMatchObject({ name: fatal.name, message: fatal.message });
+      expect(fake.consumerOptions).toHaveLength(1);
+    },
+  );
+
+  it("keeps the three-attempt transport bound inside a fresh budget", async () => {
+    vi.useFakeTimers();
+    try {
+      const port = await connectJetStream(SERVERS, withReplicas(1));
+      await ensure(port);
+      fake.consumerErrors.push(fake.wrappedTransient(), notFound(), fake.wrappedTransient(), fake.wrappedTransient(), fake.wrappedTransient());
+      const { result } = settle(port.consume(STREAM, 0, () => undefined));
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(await result).toMatchObject({ name: "JetStreamNotEnabled" });
+      expect(fake.consumerOptions).toHaveLength(4);
+      expectStableOptions();
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("keeps the placement reason for 10005 and the projector reason without a code", () => {
+    expect(new MeshStateNatsUnavailableError("x", { natsErrCode: 10005 }).reason).toBe("placement-unavailable");
+    expect(new MeshStateNatsUnavailableError("x").reason).toBe("projector-unavailable");
   });
 });
 

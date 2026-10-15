@@ -1089,6 +1089,9 @@ export class FabricRuntimeState {
       // smarty-dev#8881: plus bound-ctx freshness, so a disposed Main stops admitting before its
       // first heartbeat would notice.
       canConsumeMesh: () => meshActivationReady && this.#bindingFresh() && controlParticipants.canConsumeMesh(),
+      // Main's journal is open before this consumption gate; its stable deliveryId makes
+      // admission recoverable after a claim/journal crash. Actors/tasks never opt in.
+      ...(mainAgent.local ? { durableFollowUpTargetId: mainAgent.id } : {}),
       enabled: this.#config.mesh.enabled,
       hostId,
       pollMs: this.#config.mesh.actorPollMs,

@@ -2501,7 +2501,7 @@ describe("FabricControlPlane", () => {
       await vi.waitFor(() => expect(store.read({ topic: "fabric.control.ack", limit: 10 })).toHaveLength(1),
         { timeout: 3_000, interval: 20 });
       const ack = store.read({ topic: "fabric.control.ack", limit: 10 })[0]!.data;
-      expect(ack).toMatchObject({ accepted: false, error: "Fabric control outcome is indeterminate after owner restart" });
+      expect(ack).toMatchObject({ accepted: false, error: "Fabric control outcome is indeterminate after concurrent claim" });
       expect(ack).not.toHaveProperty("notRun");
       expect(receive.mock.calls.length + olderDeliveries).toBe(1);
     }, 15_000);
@@ -2534,23 +2534,14 @@ describe("FabricControlPlane", () => {
         .toHaveLength(1);
     }, 15_000);
 
-    it("retries a message once with a new command, and the owner delivers it once", async () => {
-      const { value, error, receive, commands, acks, store } = await run("followUp");
+    it("keeps an expired followUp under its original commandId and returns its deferred receipt without a resend", async () => {
+      const { value, error, receive, commands, acks } = await run("followUp");
       expect(error).toBeUndefined();
-      expect(commands).toHaveLength(2);
+      expect(commands).toHaveLength(1);
       const first = commands[0]!.data as { commandId: string };
-      const retry = commands[1]!.data as { commandId: string };
-      expect(first.commandId).not.toBe(retry.commandId);
-      // The owner won the shared claim for the first command, so nothing ran it: it proves notRun,
-      // and records the expiry in that claim, where every runtime, new or old, finds it.
-      expect(acks.find((ack) => ack.commandId === first.commandId))
-        .toMatchObject({ accepted: false, error: "Fabric control command expired", notRun: true });
-      expect(store.get(sharedKey(first.commandId))?.value).toMatchObject({
-        hostId: "host:receiver", commandId: first.commandId,
-        acceptance: { accepted: false, error: "Fabric control command expired", notRun: true },
-      });
-      expect(acks.find((ack) => ack.commandId === retry.commandId)).toMatchObject({ accepted: true });
-      expect(value).toMatchObject({ acknowledged: true, messageId: "delivered:" + retry.commandId });
+      expect(acks).toEqual([expect.objectContaining({ commandId: first.commandId, accepted: true, deferred: true })]);
+      expect(acks[0]).not.toHaveProperty("notRun");
+      expect(value).toMatchObject({ acknowledged: true, deferred: true, messageId: "delivered:" + first.commandId });
       expect(receive).toHaveBeenCalledTimes(1);
     }, 15_000);
 

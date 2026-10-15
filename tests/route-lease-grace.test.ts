@@ -310,18 +310,56 @@ describe("same-key retry after proven-notRun resend (#4383)", () => {
         return { sequence: 0 } as Awaited<ReturnType<typeof owner.mesh.publish>>;
       return publish(input);
     });
-    const first = sender.request("owner", "session:target", "followUp", { message: "unchanged", ownerIncarnation: owner.incarnation }, "owner", { idempotencyKey: "resend-key" }).catch(e => e);
+    // #4383 exercises a proven-notRun resend. followUp is queueable after expiry;
+    // use live-only steer so the first attempt still expires without running.
+    const first = sender.request("owner", "session:target", "steer", { message: "unchanged", ownerIncarnation: owner.incarnation }, "owner", { idempotencyKey: "resend-key" }).catch(e => e);
     await drainMicrotasks(); await vi.advanceTimersByTimeAsync(60001);
     owner.start(deliver); await vi.advanceTimersByTimeAsync(500);
     expect(deliver).toHaveBeenCalledOnce(); const admittedId = command(sender).commandId;
-    expect(sender.mesh.read({ topic: "fabric.control.command" })).toHaveLength(2);
+    const attempts = sender.mesh.read({ topic: "fabric.control.command" });
+    expect(attempts).toHaveLength(2);
+    const expiredId = (attempts[0]!.data as FabricControlCommand).commandId;
+    expect(expiredId).not.toBe(admittedId);
+    expect(sender.mesh.read({ topic: "fabric.control.ack" })[0]!.data).toMatchObject({
+      commandId: expiredId, accepted: false, error: "Fabric control command expired", notRun: true,
+    });
     expiresAt = Date.now() - 45001; await vi.advanceTimersByTimeAsync(20);
     expect(await first).toMatchObject({ code: "FABRIC_PARTICIPANT_STALE", idempotencyKey: "resend-key" });
     expiresAt = Date.now() + 120000; drop = false;
-    const retry = sender.request("owner", "session:target", "followUp", { message: "unchanged", ownerIncarnation: owner.incarnation }, "owner", { idempotencyKey: "resend-key" });
+    const retry = sender.request("owner", "session:target", "steer", { message: "unchanged", ownerIncarnation: owner.incarnation }, "owner", { idempotencyKey: "resend-key" });
     await drainMicrotasks(); await vi.advanceTimersByTimeAsync(500);
     await expect(retry).resolves.toMatchObject({ messageId: "one-resend" });
     expect(command(sender).commandId).toBe(admittedId); expect(deliver).toHaveBeenCalledOnce();
+    const replayedIds = sender.mesh.read({ topic: "fabric.control.command" }).map(e => (e.data as FabricControlCommand).commandId);
+    expect(replayedIds).toEqual([expiredId, admittedId, expiredId, admittedId]);
+  });
+
+  it("re-observes an expired followUp's original deferred attempt without creating a notRun resend", async () => {
+    vi.useFakeTimers(); const root = temp(); let expiresAt = Date.now() + 120000;
+    const owner = control(root, "owner"), sender = control(root, "sender", { captureOwnerLease: () => () => expiresAt });
+    const deliver = vi.fn((_command: FabricControlCommand) => ({ accepted: true, messageId: "one-deferred-followup" }));
+    sender.start(() => ({ accepted: false }));
+    const publish = owner.mesh.publish.bind(owner.mesh); let drop = true;
+    vi.spyOn(owner.mesh, "publish").mockImplementation(async input => {
+      if (drop && input.topic === "fabric.control.ack" && input.kind === "accepted")
+        return { sequence: 0 } as Awaited<ReturnType<typeof owner.mesh.publish>>;
+      return publish(input);
+    });
+    const first = sender.request("owner", "session:target", "followUp", { message: "unchanged", ownerIncarnation: owner.incarnation }, "owner", { idempotencyKey: "deferred-key" }).catch(e => e);
+    await drainMicrotasks(); await vi.advanceTimersByTimeAsync(60001);
+    owner.start(deliver); await vi.advanceTimersByTimeAsync(500);
+    expect(deliver).toHaveBeenCalledOnce(); const admittedId = command(sender).commandId;
+    expect(deliver.mock.calls[0]![0]).toMatchObject({ commandId: admittedId, deferred: true });
+    expect(sender.mesh.read({ topic: "fabric.control.command" })).toHaveLength(1);
+    expiresAt = Date.now() - 45001; await vi.advanceTimersByTimeAsync(20);
+    expect(await first).toMatchObject({ code: "FABRIC_PARTICIPANT_STALE", idempotencyKey: "deferred-key" });
+    expiresAt = Date.now() + 120000; drop = false;
+    const retry = sender.request("owner", "session:target", "followUp", { message: "unchanged", ownerIncarnation: owner.incarnation }, "owner", { idempotencyKey: "deferred-key" });
+    await drainMicrotasks(); await vi.advanceTimersByTimeAsync(500);
+    await expect(retry).resolves.toMatchObject({ messageId: "one-deferred-followup", deferred: true });
+    expect(sender.mesh.read({ topic: "fabric.control.command" }).map(e => (e.data as FabricControlCommand).commandId))
+      .toEqual([admittedId, admittedId]);
+    expect(deliver).toHaveBeenCalledOnce();
   });
 });
 

@@ -928,6 +928,7 @@ export class AgentMessageRouter {
         principal: provenance?.principal,
         message,
         delivery: command.operation,
+        ...(command.deferred ? { deferred: true as const } : {}),
         ...(command.priority ? { priority: command.priority } : {}),
         deliveryId: command.commandId,
         outcomeSend: { eventId: command.eventId ?? command.commandId, to: this.mainAgent.id, from: from.id, mode: command.operation },

@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -130,8 +131,15 @@ describe("FabricRuntimeState unfenced sender warning wiring", () => {
   it("with a UI, notifies the counted warning and never writes it to stderr; delivery still happens", async () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     const m = await runtimeMain(true);
-    await m.legacy("ui:1");
+    const event = await m.legacy("ui:1");
     expect(await m.ack("ui:1")).toMatchObject({ accepted: true });
+    // Actual runtime bootstrap opts in only its journalled local Main; verify the durable
+    // shared claim's original-envelope marker, not a manually constructed plane option.
+    const targetId = (event.data as { targetId: string }).targetId;
+    const claimKey = "topology/control-seen/" + createHash("sha256").update(`${targetId}\0ui:1`).digest("hex");
+    expect(m.runtime.mesh.get(claimKey, { fresh: true })?.value).toMatchObject({
+      commandId: "ui:1", targetId, followUpEventId: event.id,
+    });
     await m.legacy("ui:2");
     expect(await m.ack("ui:2")).toMatchObject({ accepted: true });
     expect(m.sendMessage).toHaveBeenCalledWith(expect.objectContaining({ content: expect.stringContaining("legacy ui:1") }), expect.anything());

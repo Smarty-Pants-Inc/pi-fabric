@@ -200,11 +200,11 @@ describe("ACK relay to a non-participant hub sender (smarty-dev#9751)", () => {
     const other = await native(f.far, "other");
     const factory: MeshIdentity = { id: "factory-host:ryzen1", name: "factory-host", kind: "agent" };
     const live = await launch(f.bridge);
-    await f.hub.publish({ topic: "fabric.control.command", kind: "steer", from: factory, to: lane.id,
-      data: { version: 1, commandId: "c-carried", replyTo: factory.id, targetId: lane.id, operation: "steer" } });
+    await f.hub.publish({ topic: "fabric.control.command", kind: "followUp", from: factory, to: lane.id,
+      data: { version: 1, commandId: "c-carried", replyTo: factory.id, targetId: lane.id, operation: "followUp" } });
     await until(() => events(f.far).some(event => event.topic === "fabric.control.command"));
     const ack = (commandId: string, from = lane) => f.far.publish({ topic: "fabric.control.ack", kind: "ack", from: from.identity, to: factory.id,
-      data: { version: 1, commandId, targetId: lane.id, accepted: true, result: { secret: true } } });
+      data: { version: 1, commandId, targetId: lane.id, accepted: true, deferred: true, result: { secret: true } } });
     await ack("c-unknown");
     await ack("c-carried", other);        // (b) not from the owner the command was addressed to
     await ack("c-carried");
@@ -213,7 +213,7 @@ describe("ACK relay to a non-participant hub sender (smarty-dev#9751)", () => {
     const relayed = events(f.hub).filter(event => event.topic === "fabric.control.ack");
     expect(relayed.map(event => [(event.data as { commandId: string }).commandId, event.from.id])).toEqual([["c-carried", lane.id]]);
     // (c) a relayed ACK carries the outcome only, never the command's result payload
-    expect(relayed[0]!.data).toMatchObject({ commandId: "c-carried", targetId: lane.id, accepted: true });
+    expect(relayed[0]!.data).toMatchObject({ commandId: "c-carried", targetId: lane.id, accepted: true, deferred: true });
     expect(relayed[0]!.data).not.toHaveProperty("result");
     expect(live.failure()).toBeUndefined();
   });

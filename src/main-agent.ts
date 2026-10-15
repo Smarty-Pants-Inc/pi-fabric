@@ -66,6 +66,8 @@ export interface FabricMainAgentDeliveryRequest {
   delivery: FabricMainAgentDelivery;
   priority?: FabricSteerPriority;
   triggerTurn?: boolean;
+  /** Host-only expiry deferral: journal a followUp and append it for the next turn without a wake. */
+  deferred?: true;
   /** Legacy sender diagnostics are ignored at admission. */
   wakeCause?: FabricWakeCause | undefined;
   /** Receiving route metadata, never hydrated from command/message data. */
@@ -97,6 +99,8 @@ export interface FabricAgentMessageResult extends Partial<FabricFollowUpQueueDep
   messageId: string;
   routed: "local" | "main" | "mesh";
   acknowledged?: boolean;
+  /** Owner retained an expired followUp for the next turn without an immediate wake. */
+  deferred?: true;
   /** Main requested a new turn at admission, not merely a triggering queue policy.
    * False for busy, passive, halted, reload-held, and duplicate deliveries; absent for
    * older owners or targets that cannot report Main's state. */
@@ -664,6 +668,8 @@ export class MainAgentController implements FabricMainAgentTarget {
     };
     // Retry required owner authority at the next delivery, even without a durable delivery id.
     this.#retryPendingHalt();
+    const deferred = request.delivery === "followUp" && request.deferred === true;
+    const nativeDelivery = deferred ? "nextTurn" : request.delivery;
     // Only a project-agent's new peer escalation control envelope gets one run; halt stays latched.
     // Replays return above; producer/backlog delivery and sender diagnostics grant no wake.
     const peerSteerWake = this.#halted && this.peerSteerResume && !this.#peerSteerInFlight && request.delivery === "steer" && request.triggerTurn !== false &&
@@ -678,7 +684,7 @@ export class MainAgentController implements FabricMainAgentTarget {
       !this.#providerHeld() && !this.#providerAttemptInFlight;
     if (peerSteerWake) this.#peerSteerInFlight = true;
     const restorePeerWakeOnFailure = (): void => { if (peerSteerWake) this.halt(); };
-    const triggerTurn = (request.triggerTurn ?? true) && (peerSteerWake || !this.#halted);
+    const triggerTurn = (request.triggerTurn ?? true) && (peerSteerWake || !this.#halted) && !deferred;
     const operatorHalted = this.#halted && !peerSteerWake;
     const providerHeld = triggerTurn && request.delivery !== "nextTurn" &&
       !this.#context?.signal?.aborted && (this.#providerHeld() || this.#providerAttemptInFlight);
@@ -688,7 +694,7 @@ export class MainAgentController implements FabricMainAgentTarget {
     }
     if (this.#reloading) {
       if (!this.#journal) throw new Error("Main has no follow-up journal open; retry after reload");
-      item.deliverAs = request.delivery;
+      item.deliverAs = nativeDelivery;
       item.triggerTurn = triggerTurn;
       this.#admit(item);
       this.#held.push(item);
@@ -785,7 +791,7 @@ export class MainAgentController implements FabricMainAgentTarget {
       // A sent message may wait in Pi's volatile queue (prompt preflight, a settle): it stays in
       // the journal until the session holds it, and a restart replays it (#confirm, #replay).
       item.handed = true;
-      item.deliverAs = request.delivery;
+      item.deliverAs = nativeDelivery;
       item.triggerTurn = triggerTurn;
       this.#sent.push(item);
       try {
@@ -796,7 +802,7 @@ export class MainAgentController implements FabricMainAgentTarget {
         throw new Error(`Main could not record the message: ${error instanceof Error ? error.message : String(error)}`);
       }
       try {
-        triggered = this.#send([item], request.delivery, triggerTurn, false, peerSteerWake);
+        triggered = this.#send([item], nativeDelivery, triggerTurn, false, peerSteerWake);
       } catch (error) {
         this.#sent.splice(this.#sent.indexOf(item), 1);
         this.#trySave();
@@ -804,7 +810,7 @@ export class MainAgentController implements FabricMainAgentTarget {
         throw error;
       }
     } else {
-      try { triggered = this.#send([item], request.delivery, triggerTurn, false, peerSteerWake); }
+      try { triggered = this.#send([item], nativeDelivery, triggerTurn, false, peerSteerWake); }
       catch (error) { restorePeerWakeOnFailure(); throw error; }
     }
     return {

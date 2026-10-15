@@ -6,7 +6,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { Readable, Writable } from "node:stream";
 import { readFileRetrying, writeJsonAtomic } from "../core/atomic-write.js";
-import { type FabricHostLease, hostLeaseExpiry, hostLeasePath, hostLiveness, readHostLease, readHostLeases, removeHostLeaseIf, STATE_LEASE_RENEW_MS, writeHostLease } from "../topology/host-leases.js";
+import { type FabricHostLease, type FabricMirrorLease, MIRROR_FRESH_MS, hostLeaseExpiry, hostLeasePath, hostLiveness, readHostLease, readHostLeases, removeHostLeaseIf, STATE_LEASE_RENEW_MS, writeHostLease } from "../topology/host-leases.js";
 import { meshDirectoryStamp } from "../topology/publication-generation.js";
 import type { FabricHostRecord, FabricParticipantRecord } from "../topology/types.js";
 import { ROOT_ID_PREFIX } from "../topology/root-inbox-shared.js";
@@ -42,8 +42,8 @@ export const BRIDGE_PROTOCOL_VERSION = 2;
 const LEGACY_BRIDGE_PROTOCOL_VERSION = 1;
 const HOST_PREFIX = "topology/hosts/";
 const PARTICIPANT_PREFIX = "topology/participants/";
-/** A mirrored host lease lasts this long past its last renewal, so a dead bridge lapses it. */
-export const BRIDGE_LEASE_MS = 15_000;
+/** Freshness bound for an observation from one physical bridge peer. */
+export const BRIDGE_LEASE_MS = MIRROR_FRESH_MS;
 /** How long a held publish retries a busy SQLite state write fence before the loop backs off. */
 const BRIDGE_FENCE_RETRY_MS = 5_000;
 const DEFAULT_PRESENCE_MS = 5_000;
@@ -186,6 +186,8 @@ export interface BridgeHost {
   record: FabricHostRecord;
   /** The effective lease expiry on the source (the later of state and file lease). */
   expiresAt: number;
+  /** Source clock at the native lease read; absent on older bridge agents. */
+  observedAt?: number;
 }
 
 export interface BridgePresence {
@@ -429,7 +431,7 @@ const settled = (value: Record<string, unknown>): string =>
  * A bridge side over a mesh store on this host. `peer` names the other side: it is the
  * `remoteHost` mark on mirrored records and the `bridge.from` of events it bridges in.
  */
-interface BridgeLease { id: string; rootId: string; identityId: string; updatedAt: number; expiresAt: number; startedAt?: number; incarnationToken?: string }
+interface BridgeLease { id: string; rootId: string; identityId: string; updatedAt: number; expiresAt: number; startedAt?: number; incarnationToken?: string; mirror?: FabricMirrorLease; mirrorLease?: 1 }
 /**
  * A removed mirror's lease identity, as its lease file carries it (root, identity, start and token).
  * A row without root, identity and incarnation (an older release's) proves no owner: it removes nothing.
@@ -465,9 +467,8 @@ export class StoreBridgeSide implements BridgeSide {
         // A lease without an incarnation is a mirror lease of an earlier release (or a writer from
         // before lease incarnations): root and identity decide it, as before.
         removeHostLeaseIf(this.store.root, gone.id, (lease) => lease.id === gone.id && lease.rootId === gone.rootId &&
-          lease.identityId === gone.identityId && (lease.startedAt === undefined || lease.startedAt === gone.startedAt) &&
-          (gone.incarnationToken !== undefined || lease.incarnationToken !== undefined
-            ? gone.incarnationToken !== undefined && lease.incarnationToken === gone.incarnationToken : true));
+          lease.identityId === gone.identityId && lease.incarnationToken === gone.incarnationToken &&
+          (lease.startedAt === undefined || lease.startedAt === gone.startedAt));
       },
     });
   }
@@ -573,7 +574,8 @@ export class StoreBridgeSide implements BridgeSide {
           participantFilePresent(this.store.root, keyFor(PARTICIPANT_PREFIX, host.id)) ||
           entry.updatedBy.id !== host.identity.id) continue;
       const liveness = hostLiveness(leases, host);
-      if (liveness.expiresAt > this.now()) hosts.push({ record: { ...host, ...liveness }, expiresAt: liveness.expiresAt });
+      const observedAt = this.now();
+      if (liveness.expiresAt > observedAt) hosts.push({ record: { ...host, ...liveness }, expiresAt: liveness.expiresAt, observedAt });
     }
     const owners = new Map(hosts.map(host => [host.record.id, host.record]));
     const participants = this.store.listAll(PARTICIPANT_PREFIX, { fresh: true }).flatMap(entry => {
@@ -622,7 +624,8 @@ export class StoreBridgeSide implements BridgeSide {
         .map(entry => ({ key: entry.key, value: entry.key.startsWith(HOST_PREFIX) && isObject(entry.value)
           ? settled(entry.value) : entry.value, updatedBy: entry.updatedBy }));
       const topology = { ...native, hosts: native.hosts.map(host => settled(host.record as unknown as Record<string, unknown>)) };
-      return { native, digest: contentDigest({ native, mirrored, relays }), topology: contentDigest({ topology, mirrored, relays }) };
+      const content = { ...native, hosts: native.hosts.map(({ observedAt: _observedAt, ...host }) => host) };
+      return { native, digest: contentDigest({ native: content, mirrored, relays }), topology: contentDigest({ topology, mirrored, relays }) };
     };
     // A WAL write can be observed before the writer's COMMIT/wal-index publication. A
     // read then sees old state and may receive no later fs event. Fence the observation
@@ -727,7 +730,7 @@ export class StoreBridgeSide implements BridgeSide {
       const expiresAt = liveness.expiresAt;
       // Carry effective renewal time as well as expiry, with the same incarnation fence.
       const record = { ...host, ...liveness };
-      if (expiresAt > now) hosts.push({ record, expiresAt });
+      if (expiresAt > now) hosts.push({ record, expiresAt, observedAt: now });
     }
     const live = new Map(hosts.map((host) => [host.record.id, host.record]));
     const participants = new Map<string, { record: FabricParticipantRecord; updatedAt: number }>();
@@ -964,7 +967,11 @@ export class StoreBridgeSide implements BridgeSide {
     const host = hostOf(hostEntry.key, hostEntry.value);
     if (!host || host.id !== id || host.identity.id !== id || host.rootId !== id || hostEntry.updatedBy.id !== id) return 0;
     if (identity && !sameIdentity(host.identity, identity)) return 0;
-    const until = hostLeaseExpiry(readHostLeases(this.store.root), host);
+    // hostLeaseExpiry consults only leases.get(host.id) (host.id === id above), and a lease file is
+    // valid only under its own id's name: read that one file, not the whole lease directory (a
+    // readdir plus a stat per fleet lease, per held event, on Windows where listings are never cached).
+    const lease = readHostLease(this.store.root, id);
+    const until = hostLeaseExpiry(new Map<string, FabricHostLease>(lease ? [[id, lease]] : []), host);
     if (until <= now) return 0;
     if (participantEntry) {
       const participant = participantOf(participantEntry.key, participantEntry.value);
@@ -1073,31 +1080,36 @@ export class StoreBridgeSide implements BridgeSide {
         const own = new Set(scan.presence.reserved);
         const wanted = new Map<string, { value: Record<string, unknown>; identity: MeshIdentity }>();
         const hosts = new Map<string, FabricHostRecord>();
-        for (const { record, expiresAt } of presence.hosts) {
+        for (const { record, expiresAt, observedAt: sourceObservedAt } of presence.hosts) {
           const relayed = remoteHostOf(record) !== undefined;
           if (relayed && (!fromHub || record.bridgeVia !== this.peer || record.remoteHost === this.peer)) continue;
           if (own.has(record.id) || own.has(record.identity.id) || own.has(record.rootId)) continue;
-          // A mirror never outlives its origin (smarty-dev#6477): it keeps the origin's absolute
-          // expiry, capped at one BRIDGE_LEASE_MS from this sync so a dead bridge still lapses it.
-          // A mirror never renews: its lease carries the origin's last renewal, not this sync.
-          // Liveness is judged when the snapshot was requested (liveAt); the origin's remaining
-          // life is then counted from this commit, so a slow pass does not lapse a live mirror.
-          // That shift is at most this pass's latency (zero when no observedAt is given) and never
-          // more than one BRIDGE_LEASE_MS, so a stalled pass cannot keep a dead origin's mirror
-          // alive longer than one lease past the origin (independent review, P2). A mirror that
-          // the capped shift leaves already lapsed is not written: it is dropped like any other.
-          if (!Number.isFinite(expiresAt) || expiresAt <= liveAt) continue;
-          const until = Math.min(expiresAt + Math.min(now - liveAt, BRIDGE_LEASE_MS), now + BRIDGE_LEASE_MS);
-          if (until <= now) continue;
-          const renewedAt = Math.min(record.updatedAt, now);
+          // Source expiry and age are meaningful on the SOURCE clock only (#10068).
+          // Keep legacy projection deadlines for older readers, but give current readers the
+          // successful per-host observation. A delayed commit never makes that snapshot fresh.
+          const sampled = typeof sourceObservedAt === "number" && Number.isFinite(sourceObservedAt);
+          if (!Number.isFinite(expiresAt) || expiresAt <= (sampled ? sourceObservedAt : liveAt)) continue;
+          // A sampled origin's remaining life is a SOURCE-clock duration, anchored at liveAt (this
+          // clock, before the source read it), so liveAt + remaining never overstates the origin.
+          // Never extend sampled authority for pass latency: retain an expired projection for
+          // routing attribution, but readers judge its translated deadline bridge-stale. Older
+          // unsampled peers retain the bounded latency allowance (smarty-dev#6477).
+          const origin = sampled ? liveAt + Math.min(BRIDGE_LEASE_MS, expiresAt - sourceObservedAt) : expiresAt;
+          const until = sampled ? origin
+            : Math.min(origin + Math.min(now - liveAt, BRIDGE_LEASE_MS), now + BRIDGE_LEASE_MS);
+          if (!sampled && until <= now) continue;
+          const renewedAt = sampled ? record.updatedAt : Math.min(record.updatedAt, now);
+          const mirror: FabricMirrorLease | undefined = sampled ? { remoteHost: relayed ? record.remoteHost! : this.peer, observedAt: liveAt,
+            sourceObservedAt, sourceUpdatedAt: record.updatedAt, sourceExpiresAt: expiresAt } : undefined;
           hosts.set(record.id, record);
           wanted.set(keyFor(HOST_PREFIX, record.id), {
-            value: { ...record, updatedAt: now, expiresAt: until, remoteHost: relayed ? record.remoteHost : this.peer },
+            value: { ...record, updatedAt: now, expiresAt: until, remoteHost: relayed ? record.remoteHost : this.peer,
+              ...(sampled ? { mirrorLease: 1 } : {}) },
             identity: record.identity,
           });
           // The lease carries the origin's incarnation, so a later removal can tell it from a replacement's.
           leases.push({ id: record.id, rootId: record.rootId, identityId: record.identity.id, ...incarnationOf(record),
-            updatedAt: renewedAt, expiresAt: until });
+            updatedAt: renewedAt, expiresAt: until, mirrorLease: 1, ...(mirror ? { mirror } : {}) });
         }
         for (const participant of presence.participants) {
           const owner = hosts.get(participant.ownerHostId);
@@ -1184,10 +1196,28 @@ export class StoreBridgeSide implements BridgeSide {
             else if (early) throw new MirrorPlanStale();
             else result = compute(view, sameFiles ? files : participantFileSnapshot(this.store.root));
             if (!result) return plan.stage([], []);
-            ({ leases, removed } = result);
+            // Cap sampled authority at its ORIGINAL translated source deadline after the lock wait.
+            // A sample that expired during the wait stays expired; neither its observation nor its
+            // authority is renewed by committing it (#10068; independent review P2).
+            const deadlines = new Map<string, number>();
+            leases = result.leases.map((lease) => {
+              const sample = lease.mirror;
+              if (!sample) return lease;
+              const origin = sample.observedAt + Math.min(BRIDGE_LEASE_MS, sample.sourceExpiresAt - sample.sourceObservedAt);
+              const until = Math.min(lease.expiresAt, origin);
+              deadlines.set(keyFor(HOST_PREFIX, lease.id), until);
+              return { ...lease, expiresAt: until };
+            });
+            removed = result.removed;
+            // The changed host row, when this pass writes one, carries the lease's own deadline.
+            const ops = deadlines.size === 0 ? result.ops : result.ops.map((op) => {
+              const until = op.kind === "put" ? deadlines.get(op.key) : undefined;
+              return op.kind === "put" && until !== undefined && isObject(op.value)
+                ? { ...op, value: { ...op.value, expiresAt: until } } : op;
+            });
             // A changing commit records its lease effects in the same commit; a lease-only renewal
             // commits nothing, records nothing and loses nothing in a crash (the next pass redoes it).
-            return plan.stage(result.ops, effects());
+            return plan.stage(ops, effects());
           },
           // After the commit, on the committed owner, never a fresh per-record state read.
           afterCommit: (view) => { plan.run(view, halted); },
@@ -1212,18 +1242,39 @@ export class StoreBridgeSide implements BridgeSide {
     // earlier release carries no incarnation and proves none: it is discarded, and a later pass
     // renews the lease of whichever mirror is held then (pi-fabric#640 review round 3).
     if (typeof lease.startedAt !== "number" || lease.startedAt !== held.startedAt ||
-      (held.incarnationToken !== undefined || lease.incarnationToken !== undefined
-        ? lease.incarnationToken === undefined || lease.incarnationToken !== held.incarnationToken : false)) return;
+      lease.incarnationToken !== held.incarnationToken) return;
+    // Every effect, including a pre-fix outbox replay, keeps the original sampled deadline.
+    const sample = lease.mirror;
+    const sourceDeadline = sample ? sample.observedAt +
+      Math.min(BRIDGE_LEASE_MS, sample.sourceExpiresAt - sample.sourceObservedAt) : undefined;
+    if (sourceDeadline !== undefined) lease = { ...lease, expiresAt: Math.min(lease.expiresAt, sourceDeadline) };
     const onDisk = readHostLease(this.store.root, lease.id);
+    // Dedup must not preserve an inflated deadline for this EXACT owner and sample. A newer
+    // observation (even of the same source renewal) still goes through the guards below.
+    if (sample && sourceDeadline !== undefined && onDisk && onDisk.startedAt === lease.startedAt &&
+      onDisk.incarnationToken === lease.incarnationToken && onDisk.identityId === lease.identityId &&
+      onDisk.rootId === lease.rootId && onDisk.mirror?.remoteHost === sample.remoteHost &&
+      onDisk.mirror.observedAt === sample.observedAt && onDisk.mirror.sourceObservedAt === sample.sourceObservedAt &&
+      onDisk.mirror.sourceUpdatedAt === sample.sourceUpdatedAt && onDisk.mirror.sourceExpiresAt === sample.sourceExpiresAt &&
+      onDisk.expiresAt > sourceDeadline) {
+      writeHostLease(this.store.root, lease);
+      return;
+    }
     // A replayed row never shortens a lease that a later pass already renewed.
     const sameIncarnation = onDisk && onDisk.startedAt === lease.startedAt && onDisk.identityId === lease.identityId &&
       onDisk.rootId === lease.rootId && onDisk.incarnationToken === lease.incarnationToken;
-    if (replay && sameIncarnation && onDisk.expiresAt >= lease.expiresAt) return;
+    if (replay && sameIncarnation && (onDisk.mirror?.observedAt ?? onDisk.expiresAt) >=
+      (lease.mirror?.observedAt ?? lease.expiresAt)) return;
     // Nor does a live effect of the same incarnation: concurrent mirror batches for one peer, host
     // and incarnation can run their effects out of order, and the older one still matches start/token
     // (smarty-dev#6939). A lease of another incarnation is replaced whatever its expiry.
-    if (onDisk && sameIncarnation && (onDisk.expiresAt > lease.expiresAt ||
-        (onDisk.expiresAt === lease.expiresAt && onDisk.updatedAt === lease.updatedAt))) return;
+    if (onDisk && sameIncarnation && (lease.mirror
+        ? (onDisk.mirror?.observedAt ?? -Infinity) >= lease.mirror.observedAt ||
+          (onDisk.mirror?.sourceObservedAt === lease.mirror.sourceObservedAt &&
+            onDisk.mirror.sourceUpdatedAt === lease.mirror.sourceUpdatedAt &&
+            onDisk.mirror.sourceExpiresAt === lease.mirror.sourceExpiresAt)
+        : onDisk.expiresAt > lease.expiresAt ||
+          (onDisk.expiresAt === lease.expiresAt && onDisk.updatedAt === lease.updatedAt))) return;
     writeHostLease(this.store.root, lease);
   }
 
@@ -1340,6 +1391,7 @@ export const serveBridgeAgent = (side: StoreBridgeSide, input: Readable, output:
     lines(
       input,
       (line) => {
+        const receivedAt = Date.now(); // Receiver clock BEFORE the serial dispatch/lock wait.
         queue = queue.then(async () => {
           if (closed) return; // stdin may have ended while this request was queued
           let request: RpcRequest;
@@ -1363,7 +1415,7 @@ export const serveBridgeAgent = (side: StoreBridgeSide, input: Readable, output:
               );
               if (closed) { finish(); return; }
             }
-            const result = await dispatch(side, request);
+            const result = await dispatch(side, request, receivedAt);
             if (closed) { finish(); return; }
             reply({ id: request.id, ok: true, result });
           } catch (error) {
@@ -1400,7 +1452,8 @@ const presenceArg = (args: unknown, hub: string): Pick<BridgePresence, "hosts" |
     if (!isObject(host) || typeof host.expiresAt !== "number" || !isObject(host.record)) return [];
     const record = hostOf(keyFor(HOST_PREFIX, String(host.record.id)), host.record);
     return record && (remoteHostOf(record) === undefined || (record.bridgeVia === hub && record.remoteHost !== hub))
-      ? [{ record, expiresAt: host.expiresAt }] : [];
+      ? [{ record, expiresAt: host.expiresAt,
+        ...(typeof host.observedAt === "number" && Number.isFinite(host.observedAt) ? { observedAt: host.observedAt } : {}) }] : [];
   });
   const participants = args.participants.flatMap((value): FabricParticipantRecord[] => {
     const record = isObject(value) ? participantOf(keyFor(PARTICIPANT_PREFIX, String(value.id)), value) : undefined;
@@ -1409,7 +1462,7 @@ const presenceArg = (args: unknown, hub: string): Pick<BridgePresence, "hosts" |
   return { hosts, participants };
 };
 
-const dispatch = async (side: StoreBridgeSide, request: RpcRequest): Promise<unknown> => {
+const dispatch = async (side: StoreBridgeSide, request: RpcRequest, receivedAt: number): Promise<unknown> => {
   switch (request.op) {
     // Unversioned v1 clients must still accept a new agent during host-by-host rollout.
     // New clients request v2 explicitly; only a reported v1 peer can lack notifications.
@@ -1430,13 +1483,25 @@ const dispatch = async (side: StoreBridgeSide, request: RpcRequest): Promise<unk
       // Remote wire never accepts held IDs: those are hub-local ownership fences.
       return side.publishBatch(request.args.map(event => ({ event: checkBridgePublish(event) })), true);
     }
-    case "mirror": return side.mirror(presenceArg(request.args, side.peer), undefined, true);
+    case "mirror": return side.mirror(presenceArg(request.args, side.peer), receivedAt, true);
     case "bridgedIds": return side.bridgedIds(numberArg(request.args, "after"));
     default: throw new Error(`Unknown bridge operation: ${String(request.op)}`);
   }
 };
 
 class BridgeLegacyNotificationsError extends Error {}
+
+/** One mirror stays in flight after its deadline; retries must not queue more RPCs behind it. */
+export class BridgeMirrorDeferredError extends Error {
+  readonly code: string;
+  constructor(readonly timedOut: boolean, timeoutMs: number) {
+    super(timedOut ? `Fabric bridge-stale: Bridge agent did not answer mirror within ${timeoutMs} ms; retrying with backoff` :
+      "Bridge mirror is still in flight; retrying with backoff");
+    this.name = "BridgeMirrorDeferredError";
+    this.code = timedOut ? "FABRIC_BRIDGE_STALE" : "FABRIC_BRIDGE_MIRROR_PENDING";
+  }
+}
+const isBridgeRetryable = (error: unknown): boolean => error instanceof BridgeMirrorDeferredError || isMeshRetryableBusy(error);
 
 /** The hub's view of the remote side, over the transport's stdio. */
 export class RemoteBridgeSide implements BridgeSide {
@@ -1447,13 +1512,15 @@ export class RemoteBridgeSide implements BridgeSide {
   readonly #subscribers = new Set<{ changed: (kind: BridgeChange) => void; failed: (error: Error) => void }>();
   publishBatch?: NonNullable<BridgeSide["publishBatch"]>;
   #closed: Error | undefined;
+  #mirrorPending: { id: number; error: BridgeMirrorDeferredError } | undefined;
   readonly #pending = new Map<number, { resolve: (value: unknown) => void; reject: (error: Error) => void }>();
   readonly #onClosed: (error: Error) => void;
   readonly closed: Promise<Error>;
 
   /**
-   * Every call has a deadline: a remote that stops answering closes the transport, so an
-   * untrusted peer never decides whether the bridge can stop (security review F3).
+   * Every call has a deadline. A slow mirror degrades this host without closing the transport;
+   * exactly one mirror remains in flight until its late answer or close(). Other RPC deadlines
+   * remain fatal. stop() still bounds its waits and closes the transport (security review F3).
    */
   constructor(readonly input: Readable, readonly output: Writable, readonly callTimeoutMs = DEFAULT_CALL_TIMEOUT_MS) {
     let onClosed!: (error: Error) => void;
@@ -1483,6 +1550,17 @@ export class RemoteBridgeSide implements BridgeSide {
         const pending = typeof response.id === "number" ? this.#pending.get(response.id) : undefined;
         if (!pending) return;
         this.#pending.delete(response.id as number);
+        const mirrorPending = this.#mirrorPending;
+        if (mirrorPending && mirrorPending.id === response.id) {
+          const late = mirrorPending.error.timedOut;
+          this.#mirrorPending = undefined;
+          if (late && response.ok !== true && response.code !== MESH_LOCK_TIMEOUT_CODE &&
+            response.code !== MESH_INCARNATION_PENDING_CODE && response.code !== MESH_SNAPSHOT_RETRIES_EXHAUSTED_CODE) {
+            this.close(new Error(`Bridge agent: ${String(response.error)}`));
+            return;
+          }
+          if (late) for (const subscriber of this.#subscribers) subscriber.changed("presence");
+        }
         if (response.ok === true) pending.resolve(response.result);
         else {
           if (response.code === FABRIC_IDEMPOTENCY_KEY_REUSED) {
@@ -1506,6 +1584,7 @@ export class RemoteBridgeSide implements BridgeSide {
     this.#closed = error;
     for (const pending of this.#pending.values()) pending.reject(error);
     this.#pending.clear();
+    this.#mirrorPending = undefined;
     this.#onClosed(error);
     for (const subscriber of this.#subscribers) subscriber.failed(error);
     this.#subscribers.clear();
@@ -1515,12 +1594,20 @@ export class RemoteBridgeSide implements BridgeSide {
 
   #call<T>(op: RpcOp, args?: unknown): Promise<T> {
     if (this.#closed) return Promise.reject(this.#closed);
+    // The remote dispatches serially. Do not let queued reads/publications time out behind a
+    // slow mirror, or accumulate repeated mirrors whose late writes would refresh old data.
+    if (this.#mirrorPending) return Promise.reject(this.#mirrorPending.error);
     const id = this.#next++;
     return new Promise<T>((resolve, reject) => {
-      const timer = setTimeout(
-        () => this.close(new Error(`Bridge agent did not answer ${op} within ${this.callTimeoutMs} ms`)),
-        this.callTimeoutMs,
-      );
+      if (op === "mirror") this.#mirrorPending = { id, error: new BridgeMirrorDeferredError(false, this.callTimeoutMs) };
+      const timer = setTimeout(() => {
+        if (op !== "mirror") { this.close(new Error(`Bridge agent did not answer ${op} within ${this.callTimeoutMs} ms`)); return; }
+        const error = new BridgeMirrorDeferredError(true, this.callTimeoutMs);
+        this.#mirrorPending = { id, error };
+        // Keep this one response slot: its late ACK releases the gate, but never renews a
+        // hub observation. The loop retries a NEW presence snapshot after backoff.
+        reject(error);
+      }, this.callTimeoutMs);
       const settle = <V>(done: (value: V) => void) => (value: V): void => {
         clearTimeout(timer);
         done(value);
@@ -2093,7 +2180,7 @@ export class MeshBridge {
     const results = await Promise.allSettled([this.options.remote.mirror(outbound.presence), this.options.local.mirror(remote, syncedAt)]);
     // A transient failure must not hide a simultaneous permanent/transport failure.
     const failures = results.filter((result) => result.status === "rejected");
-    const failure = failures.find((result) => !isMeshRetryableBusy(result.reason)) ?? failures[0];
+    const failure = failures.find((result) => !isBridgeRetryable(result.reason)) ?? failures[0];
     if (failure) throw failure.reason;
     // A lock-delayed write must not make an old snapshot look freshly observed.
     this.#presenceAt = syncedAt;
@@ -2105,7 +2192,9 @@ export class MeshBridge {
     // the 15 s mirror cap (transport/commit headroom), not an unconditional 5 s presence loop.
     // Source expiry itself is reconciled once. No hosts means no deadline at all.
     const expiries = [...local.hosts, ...claimed.hosts, ...relays.hosts]
-      .map(host => host.expiresAt).filter(expiry => Number.isFinite(expiry) && expiry > syncedAt);
+      .map(host => typeof host.observedAt === "number" && Number.isFinite(host.observedAt)
+        ? syncedAt + host.expiresAt - host.observedAt : host.expiresAt)
+      .filter(expiry => Number.isFinite(expiry) && expiry > syncedAt);
     this.#expiryAt = Math.min(Infinity, ...expiries,
       ...(expiries.some(expiry => expiry > syncedAt + BRIDGE_LEASE_MS) ? [syncedAt + BRIDGE_LEASE_MS - 1_000] : []));
   }
@@ -2186,17 +2275,18 @@ export class MeshBridge {
         if (this.#legacyPolling) delay = Math.min(delay ?? Infinity, this.options.pollMs ?? LEGACY_POLL_MS);
       } catch (error) {
         if (!running()) return;
-        if (isIdempotencyKeyReused(error) || !isMeshRetryableBusy(error)) {
+        if (isIdempotencyKeyReused(error) || !isBridgeRetryable(error)) {
           this.#notificationError ??= error instanceof Error ? error : new Error(String(error));
           this.#wake?.();
           return;
         }
         this.#directionBackoff[direction] = true;
-        if (isMeshStateWalCap(error)) delay = walCapDelay = walCapRetryDelay(walCapDelay, this.options.walCapRetryMinMs);
+        if (error instanceof BridgeMirrorDeferredError || isMeshStateWalCap(error))
+          delay = walCapDelay = walCapRetryDelay(walCapDelay, this.options.walCapRetryMinMs);
         else delay = retryMs;
         retryMs = Math.min(retryMs * 2, LOCK_RETRY_MAX_MS);
         if (!reported) {
-          this.#log(`${meshBusyLabel(error)} (${direction}); retrying in ${delay} ms: ${(error as Error).message}`);
+          this.#log(`${error instanceof BridgeMirrorDeferredError ? "bridge mirror degraded" : meshBusyLabel(error)} (${direction}); retrying in ${delay} ms: ${(error as Error).message}`);
           reported = true;
         }
       }
@@ -2637,16 +2727,16 @@ export class MeshBridge {
           if (this.#legacyPolling) delay = Math.min(delay ?? Infinity, this.options.pollMs ?? LEGACY_POLL_MS);
         } catch (error) {
           if (this.#stopped) return;
-          if (!isMeshRetryableBusy(error)) throw error;
+          if (!isBridgeRetryable(error)) throw error;
           backingOff = true;
           delay = retryMs;
           retryMs = Math.min(retryMs * 2, LOCK_RETRY_MAX_MS);
-          if (isMeshStateWalCap(error)) {
+          if (error instanceof BridgeMirrorDeferredError || isMeshStateWalCap(error)) {
             walCapDelay = walCapRetryDelay(walCapDelay, this.options.walCapRetryMinMs);
             delay = walCapDelay;
             const now = Date.now();
             if (now - walCapLoggedAt >= WAL_CAP_LOG_MS) {
-              this.#log(`mesh state WAL cap; retrying in ${delay} ms: ${meshDeferredSummary(error)}`); // no reader pids
+              this.#log(`${error instanceof BridgeMirrorDeferredError ? "bridge mirror degraded" : "mesh state WAL cap"}; retrying in ${delay} ms: ${meshDeferredSummary(error)}`); // no reader pids
               walCapLoggedAt = now;
             }
           } else if (!reportedTimeout) {

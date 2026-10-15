@@ -30,6 +30,11 @@ import {
   hostLeasePath,
   hostLeasePredecessor,
   hostLiveness,
+  hostMirrorLease,
+  mirroredOwnerRoutingStatus,
+  waitForMirroredLeaseRenewal,
+  type MirrorLeaseWaitBudget,
+  type FabricMirrorLease,
   LIVENESS_POLICY_KEY,
   readHostLease,
   readHostLeaseCurrent,
@@ -54,8 +59,6 @@ import { HostLeaseLockBusyError, withHostLeaseLock } from "./host-lease-lock.js"
 import { peerLabelPrefix } from "./peer-settle.js";
 import { rootParticipantName } from "./participant-name.js";
 import { ownProcessIncarnation } from "../core/atomic-write.js";
-import { watchBridgeStore } from "../mesh/change-notifier.js";
-import { FabricPeerLeaseStaleError, PEER_LEASE_WAIT_MS } from "../agents/peer-lease-stale.js";
 import {
   ParticipantFileLockBusyError,
   prepareParticipantFileLocks,
@@ -448,6 +451,7 @@ const hostFromEntry = (entry: MeshStateEntry): FabricHostRecord | undefined => {
       value.identity.kind !== "agent" &&
       value.identity.kind !== "actor") ||
     (value.incarnationToken !== undefined && (typeof value.incarnationToken !== "string" || value.incarnationToken.length === 0)) ||
+    (value.mirrorLease !== undefined && value.mirrorLease !== 1) ||
     typeof value.startedAt !== "number" ||
     typeof value.updatedAt !== "number" ||
     typeof value.expiresAt !== "number"
@@ -679,7 +683,8 @@ export const isStaleExtensionContextError = (error: unknown): boolean =>
 export type ParticipantSnapshotSource = () => FabricParticipantRecord[];
 
 type RemoteMirrorLease = { state: "none" } | { state: "ended" } | {
-  state: "live" | "expired"; ownerHostId: string; ownerIdentityId: string; rootId: string; remoteHost: string; expiresAt: number;
+  state: "live" | "expired" | "lapsed"; ownerHostId: string; ownerIdentityId: string; rootId: string;
+  remoteHost: string; expiresAt: number; mirror?: FabricMirrorLease; bridgeStale?: true;
 };
 
 export class ParticipantDirectory implements FabricParticipantSource {
@@ -1335,7 +1340,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       }
       const stale =
         !owner ||
-        owner.expiresAt < now ||
+        (owner.remoteHost ? this.#mirrorStatus(owner, now) === "lease-stale" : owner.expiresAt < now) ||
         (participant.status === "reloading" && (participant.reloadUntil ?? 0) < now) ||
         owner.identity.id !== participant.ownerIdentityId ||
         owner.rootId !== participant.rootId;
@@ -1344,7 +1349,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
       if (options.scope === "local" && !local) continue;
       if (options.scope === "lineage" && participant.rootId !== this.options.rootId) continue;
       if (options.kinds && !options.kinds.includes(participant.kind)) continue;
-      byId.set(participant.id, { ...participant, local, stale });
+      byId.set(participant.id, { ...participant, local, stale,
+        ...(owner?.remoteHost && this.#mirrorStatus(owner, now) === "bridge-stale" ? { bridgeStale: true as const } : {}) });
     }
     // A local record a mirror overwrote in the shared state still answers from memory until
     // this host's next heartbeat puts it back: local always wins (smarty-dev#2004).
@@ -1454,13 +1460,20 @@ export class ParticipantDirectory implements FabricParticipantSource {
 
   // Valid host records by id, each with its effective expiry: the later of its shared-state
   // lease and its file lease (smarty-dev#816).
-  #liveHosts(entries: Iterable<MeshStateEntry>, leases: ReadonlyMap<string, FabricHostLease> = readHostLeases(this.mesh.root)): Map<string, FabricHostRecord> {
-    const hosts = new Map<string, FabricHostRecord>();
+  #liveHosts(entries: Iterable<MeshStateEntry>, leases: ReadonlyMap<string, FabricHostLease> = readHostLeases(this.mesh.root)): Map<string, FabricHostRecord & { mirror?: FabricMirrorLease; bridgeStale?: true }> {
+    const hosts = new Map<string, FabricHostRecord & { mirror?: FabricMirrorLease; bridgeStale?: true }>();
     for (const entry of entries) {
       const host = hostFromEntry(entry);
-      if (host) hosts.set(host.id, { ...host, ...hostLiveness(leases, host) });
+      const mirror = host && hostMirrorLease(leases, host);
+      if (host) hosts.set(host.id, { ...host, ...hostLiveness(leases, host),
+        ...(mirror ? { mirror } : host.remoteHost && (host.mirrorLease === 1 || leases.get(host.id)?.mirrorLease === 1)
+          ? { bridgeStale: true as const } : {}) });
     }
     return hosts;
+  }
+
+  #mirrorStatus(owner: FabricHostRecord & { mirror?: FabricMirrorLease; bridgeStale?: true }, now: number) {
+    return mirroredOwnerRoutingStatus({ ...owner, remoteHost: owner.remoteHost! }, now);
   }
 
   // A mirrored record never shadows a local target (smarty-dev#2004): it is refused when its id
@@ -1543,7 +1556,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     ownerHostId: string,
     ownerIdentityId: string | undefined,
     targetId: string,
-  ): { remoteHost: string; expiresAt: number } | undefined {
+  ): { remoteHost: string; expiresAt: number; mirror?: FabricMirrorLease; bridgeStale?: true; ownerIncarnation?: string } | undefined {
     if (!this.options.enabled || ownerIdentityId === undefined) return undefined;
     const read = { fresh: true };
     const entry = this.#participantEntry(keyFor(PARTICIPANT_PREFIX, targetId), read);
@@ -1556,7 +1569,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
       participant.ownerHostId !== ownerHostId ||
       participant.ownerIdentityId !== ownerIdentityId
     ) return undefined;
-    const hosts = this.#liveHosts(this.mesh.listAll(HOST_PREFIX, read));
+    const leases = readHostLeases(this.mesh.root);
+    const hosts = this.#liveHosts(this.mesh.listAll(HOST_PREFIX, read), leases);
     const owner = hosts.get(ownerHostId);
     if (
       !owner ||
@@ -1566,7 +1580,10 @@ export class ParticipantDirectory implements FabricParticipantSource {
       !Number.isFinite(owner.expiresAt) ||
       this.#collides(participant, hosts, false)
     ) return undefined;
-    return { remoteHost: participant.remoteHost, expiresAt: owner.expiresAt };
+    const mirror = owner.mirror;
+    return { remoteHost: participant.remoteHost, expiresAt: owner.expiresAt,
+      ...(participant.ownerIncarnation !== undefined ? { ownerIncarnation: participant.ownerIncarnation } : {}),
+      ...(mirror ? { mirror } : owner.bridgeStale ? { bridgeStale: true as const } : {}) };
   }
 
   #routingOwner(id: string) {
@@ -1621,10 +1638,10 @@ export class ParticipantDirectory implements FabricParticipantSource {
   }
 
   /** Recovery is resolution-only: no mesh write, ownership transfer, or delivery retry here. */
-  async resolveRoutingLease(id: string, signal?: AbortSignal): Promise<boolean> {
+  async resolveRoutingLease(id: string, signal?: AbortSignal, budget?: MirrorLeaseWaitBudget): Promise<boolean> {
     signal?.throwIfAborted();
     const record = this.#routingOwner(id);
-    if (!record) return this.#resolveRemoteMirrorLease(id, signal); // Unknown ids retain the ordinary resolver.
+    if (!record) return this.#resolveRemoteMirrorLease(id, signal, budget); // Unknown ids retain the ordinary resolver.
     const { participant, owner } = record;
     const options = this.options.routingLease ?? {};
     const now = (options.now ?? Date.now)();
@@ -1677,85 +1694,30 @@ export class ParticipantDirectory implements FabricParticipantSource {
       !Number.isFinite(owner.expiresAt) || this.#collides(participant, hosts, false)) return { state: "none" };
     if (participant.status === "stopping" || this.#routeEnded(participant, read)) return { state: "ended" };
     const now = (this.options.routingLease?.now ?? Date.now)();
+    const status = this.#mirrorStatus(owner, now);
     return {
-      state: owner.expiresAt >= now ? "live" : "expired",
+      state: status === "lease-stale" ? "lapsed" : status === "live" ? "live" : "expired",
       ownerHostId: owner.id, ownerIdentityId: owner.identity.id, rootId: owner.rootId,
       remoteHost: participant.remoteHost, expiresAt: owner.expiresAt,
+      ...(owner.mirror ? { mirror: owner.mirror } : {}),
+      ...(owner.bridgeStale || owner.mirrorLease === 1 && !owner.mirror ? { bridgeStale: true as const } : {}),
     };
   }
 
-  /** Resolution only: one notification-driven wait (no polling) of at most PEER_LEASE_WAIT_MS for
-   * an EXPIRED validated remote mirror. true lets the caller re-run ordinary fresh routing; it never
-   * routes the expired mirror. The watcher is armed before the re-read so a renewal cannot be lost. */
-  async #resolveRemoteMirrorLease(id: string, signal?: AbortSignal): Promise<boolean> {
+  /** One source-aware, notification-driven wait. Old/missing required samples are doubt,
+   * regardless of their projected deadline; only a fresh source lapse proves root death. */
+  async #resolveRemoteMirrorLease(id: string, signal?: AbortSignal, budget?: MirrorLeaseWaitBudget): Promise<boolean> {
     signal?.throwIfAborted();
     const initial = this.#remoteMirrorLease(id);
     if (initial.state === "none" || initial.state === "live") return true;
-    if (initial.state === "ended") return false;
-    const configured = this.options.routingLease?.waitMs ?? PEER_LEASE_WAIT_MS;
-    const waitMs = Number.isFinite(configured) ? Math.min(PEER_LEASE_WAIT_MS, Math.max(0, configured)) : PEER_LEASE_WAIT_MS;
-    const now = this.options.routingLease?.now ?? Date.now;
-    const sameOwner = (current: RemoteMirrorLease): boolean =>
-      current.state !== "none" && current.state !== "ended" && current.ownerHostId === initial.ownerHostId &&
-      current.ownerIdentityId === initial.ownerIdentityId && current.rootId === initial.rootId &&
-      current.remoteHost === initial.remoteHost;
-    return await new Promise<boolean>((resolve, reject) => {
-      let settled = false;
-      let timer: ReturnType<typeof setTimeout> | undefined;
-      let unwatch: (() => void) | undefined;
-      const settle = (outcome: () => boolean): void => {
-        if (settled) return;
-        settled = true;
-        signal?.removeEventListener("abort", abort);
-        if (timer !== undefined) clearTimeout(timer);
-        timer = undefined;
-        try { unwatch?.(); } catch { /* best effort */ }
-        unwatch = undefined;
-        try { resolve(outcome()); } catch (error) { reject(error); }
-      };
-      const abort = (): void => settle(() => { throw signal!.reason; });
-      const stale = (current: { expiresAt: number }): never => {
-        throw new FabricPeerLeaseStaleError(id, initial.remoteHost, Math.max(0, now() - current.expiresAt));
-      };
-      // Only a renewal of the SAME owner/identity/root/remoteHost captured before waiting re-runs
-      // ordinary routing. A different valid owner/link gets a typed stale refusal; removed,
-      // invalid or ended mirrors keep the ordinary refusal (R1: never redirect the retry).
-      const decide = (final: boolean): boolean | undefined => {
-        signal?.throwIfAborted();
-        const current = this.#remoteMirrorLease(id);
-        if (current.state === "none" || current.state === "ended") return false;
-        if (!sameOwner(current)) return stale(initial);
-        if (current.state === "live") return true;
-        return final ? stale(current) : undefined;
-      };
-      const check = (): void => {
-        if (settled) return;
-        try {
-          const outcome = decide(false);
-          if (outcome !== undefined) settle(() => outcome);
-        } catch (error) { settle(() => { throw error; }); }
-      };
-      const timeout = (): void => settle(() => decide(true) ?? stale(initial));
-      signal?.addEventListener("abort", abort, { once: true });
-      if (signal?.aborted) abort();
-      if (settled) return;
-      try {
-        const stop = watchBridgeStore(this.mesh.root, check, () => {
-          // Notifications unavailable: no polling fallback; one canonical read, else refuse typed.
-          settle(() => decide(true) ?? stale(initial));
-        });
-        // Arming can synchronously settle (abort, renewal or watch failure) before stop exists.
-        if (settled) { stop(); return; }
-        unwatch = stop;
-      } catch {
-        settle(() => decide(true) ?? stale(initial));
-        return;
-      }
-      const armedTimer = setTimeout(timeout, waitMs);
-      if (settled) { clearTimeout(armedTimer); return; }
-      timer = armedTimer;
-      check();
-    });
+    if (initial.state === "ended" || initial.state === "lapsed") return false;
+    const current = await waitForMirroredLeaseRenewal(this.mesh.root, id, initial, () => {
+      const owner = this.#remoteMirrorLease(id);
+      return owner.state === "none" || owner.state === "ended" ? undefined : owner;
+    }, owner => owner.ownerHostId === initial.ownerHostId && owner.ownerIdentityId === initial.ownerIdentityId &&
+      owner.rootId === initial.rootId && owner.remoteHost === initial.remoteHost,
+    { ...this.options.routingLease, signal, budget });
+    return current !== undefined && current.state === "live";
   }
 
   lastKnown(id: string, now = Date.now()): { participant: FabricParticipantInfo; lapsedMs: number } | undefined {
@@ -1866,17 +1828,21 @@ export class ParticipantDirectory implements FabricParticipantSource {
         !this.#collides(participant, this.#liveHosts(this.mesh.listAll(HOST_PREFIX, read)))
       )) {
         const hostEntry = this.mesh.get(keyFor(HOST_PREFIX, participant.ownerHostId), read);
-        const owner = hostEntry ? hostFromEntry(hostEntry) : undefined;
-        const lease = owner ? readHostLease(this.mesh.root, owner.id) : undefined;
+        const host = hostEntry ? hostFromEntry(hostEntry) : undefined;
+        const lease = host ? readHostLease(this.mesh.root, host.id) : undefined;
+        const owner = hostEntry ? this.#liveHosts([hostEntry], lease ? new Map([[lease.id, lease]]) : new Map())
+          .get(participant.ownerHostId) : undefined;
+        const status = owner?.remoteHost ? this.#mirrorStatus(owner, now) : undefined;
         if (
           owner &&
           ownerMatches(participant, owner, this.options.hostId) &&
           !(participant.status === "reloading" && (participant.reloadUntil ?? 0) < now) &&
-          hostLeaseExpiry(lease ? new Map([[owner.id, lease]]) : new Map(), owner) >= now &&
+          (owner.remoteHost ? status !== "lease-stale" : owner.expiresAt >= now) &&
           owner.identity.id === participant.ownerIdentityId &&
           owner.rootId === participant.rootId
         ) {
-          return { ...participant, local: isLocal(participant, this.options.hostId), stale: false };
+          return { ...participant, local: isLocal(participant, this.options.hostId), stale: false,
+            ...(status === "bridge-stale" ? { bridgeStale: true as const } : {}) };
         }
       }
     }

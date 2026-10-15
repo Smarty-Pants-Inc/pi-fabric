@@ -181,7 +181,12 @@ const ancestorsOf = (dir: string): string[] => {
 
 type Role = "ancestor" | "root" | "directory" | "file" | "creation-parent";
 
-type AdmissionIdentity = { root?: string; db?: string; guard?: string };
+type AdmissionIdentity = {
+  root?: string; db?: string; guard?: string;
+  rootStatus?: "present" | "missing" | "invalid";
+  dbStatus?: "present" | "missing" | "invalid";
+  invalidAncestor?: string;
+};
 type RootAdmission = { plan: string; identity: AdmissionIdentity };
 // Process-local verified root admissions only. One exact plan per root, bounded by roots, not by caller plans.
 const rootAdmissions = new Map<string, RootAdmission>();
@@ -193,6 +198,7 @@ const fileIdentity = (stat: fs.BigIntStats): string | undefined =>
 // No-follow, volume-down guard of every lexical component (including the real ancestor plan). Optional children
 // contribute types/reparse checks, not identities: later SQLite sidecars/flags inherit the admitted strict root.
 // Unknown IDs or unreadable paths disable reuse, never substitute a new refusal for the native policy.
+// Keep positive missing/type observations separate: a known target cannot vanish during a successful proof.
 const admissionIdentity = (root: string, db: string, paths: Map<string, Role>): AdmissionIdentity => {
   const components = new Map<string, { target: string; role: Role }>();
   for (const [target, role] of paths) components.set(target.toLowerCase(), { target, role });
@@ -207,17 +213,26 @@ const admissionIdentity = (root: string, db: string, paths: Map<string, Role>): 
   const ancestors: [string, string][] = [];
   let proven = true;
   for (const { target, role } of ordered) {
+    const key = target.toLowerCase();
+    const status = key === root.toLowerCase() ? "rootStatus" : key === db.toLowerCase() ? "dbStatus" : undefined;
     let stat: fs.BigIntStats | undefined;
     try { stat = fs.lstatSync(target, { bigint: true, throwIfNoEntry: false }); }
-    catch { return identity; }
+    catch { proven = false; continue; }
     if (!stat) {
-      if (role === "file" || role === "directory") continue;
-      return identity;
+      if (status !== undefined) identity[status] = "missing";
+      if (role !== "file" && role !== "directory") proven = false;
+      // A missing ancestor must not hide the required root/DB observations below it.
+      continue;
     }
-    // Node's Windows lstat identifies symbolic links AND junctions without following them.
-    if (stat.isSymbolicLink() || (role === "file" ? !stat.isFile() : !stat.isDirectory())) return identity;
+    // Node's Windows lstat identifies symbolic links AND junctions without following the final component.
+    if (stat.isSymbolicLink() || (role === "file" ? !stat.isFile() : !stat.isDirectory())) {
+      if (status !== undefined) identity[status] = "invalid";
+      if (role === "ancestor" || key === root.toLowerCase()) identity.invalidAncestor = target;
+      proven = false;
+      continue;
+    }
+    if (status !== undefined) identity[status] = "present";
     const id = fileIdentity(stat);
-    const key = target.toLowerCase();
     if (id !== undefined && key === root.toLowerCase()) identity.root = id;
     if (id !== undefined && key === db.toLowerCase()) identity.db = id;
     if (role === "ancestor") {
@@ -313,7 +328,8 @@ export const windowsStateAclRefusal = (request: WindowsStateAclRequest, run: Win
     const strict = role !== "ancestor" && role !== "creation-parent";
     const ancestorRole = role === "ancestor" || role === "creation-parent";
     if (entry.missing === true) {
-      if (role === "file" || role === "directory") continue;
+      if ((role === "file" || role === "directory")
+        && !(target.toLowerCase() === db?.toLowerCase() && before?.db !== undefined)) continue;
       return `${target} vanished while its Windows ACL was read`;
     }
     if (typeof entry.error === "string") return `${target} has an unreadable Windows security descriptor (${entry.error})`;
@@ -397,6 +413,17 @@ export const windowsStateAclRefusal = (request: WindowsStateAclRequest, run: Win
   // with the descriptor read from its predecessor; unknown IDs simply leave this full read uncached.
   if (plan !== undefined && before !== undefined) {
     const after = admissionIdentity(root, db!, paths);
+    if (before.root !== undefined && (after.rootStatus === "missing" || after.rootStatus === "invalid")) {
+      return `${root} identity changed while ACL was read`;
+    }
+    if (before.db !== undefined && (after.dbStatus === "missing" || after.dbStatus === "invalid")) {
+      return `${db} identity changed while ACL was read`;
+    }
+    // Descendant lstat may still resolve through an invalid ancestor; those IDs must not bless that path.
+    if ((before.root !== undefined || before.db !== undefined)
+      && (before.invalidAncestor !== undefined || after.invalidAncestor !== undefined)) {
+      return `${before.invalidAncestor ?? after.invalidAncestor} changed type while ACL was read`;
+    }
     if (before.root !== undefined && after.root !== undefined && before.root !== after.root) {
       return `${root} identity changed while ACL was read`;
     }

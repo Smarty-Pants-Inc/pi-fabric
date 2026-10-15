@@ -290,7 +290,8 @@ export const openPrivateStateDb = (file: string, open: SqliteOpener, create?: ()
  */
 export const admitExistingStateRoot = (root: string): void => {
   if (process.platform !== "win32") return;
-  if (fs.lstatSync(path.join(root, "state.db"), { throwIfNoEntry: false }) === undefined) return;
+  try { if (fs.lstatSync(path.join(root, "state.db"), { throwIfNoEntry: false }) === undefined) return; }
+  catch { /* Indeterminate presence is not absence: let the full native proof decide, without caching unknown IDs. */ }
   assertPrivateStateRoot(root);
 };
 

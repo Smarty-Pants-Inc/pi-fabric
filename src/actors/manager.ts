@@ -5896,11 +5896,11 @@ export class ActorManager {
     this.#deadLetters.set(actorId, entries.length);
   }
 
-  #noticeDeadLetter(actor: ManagedActor, text: string, data: Record<string, unknown>, force = false): void {
+  #noticeDeadLetter(actor: ManagedActor, text: string, data: Record<string, unknown>): void {
     if (this.#closing) return;
     const now = Date.now();
     const last = this.#deadLetterAlarms.get(actor.id);
-    if (!force && last !== undefined && now - last < ACTOR_DEAD_LETTER_ALARM_MS) return;
+    if (last !== undefined && now - last < ACTOR_DEAD_LETTER_ALARM_MS) return;
     this.#deadLetterAlarms.set(actor.id, now);
     const notice: FabricActorMessage = {
       id: randomUUID(), actorId: actor.id, actorName: actor.name, direction: "out", source: "fabric-host",
@@ -5919,41 +5919,60 @@ export class ActorManager {
     const backup = `${archive}.1`;
     const lines = stale.map((entry) => `${JSON.stringify(entry)}\n`);
     const lineBytes = (line: string) => Buffer.byteLength(line);
-    let current = Buffer.alloc(0);
-    try { current = fs.readFileSync(archive); } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-    }
-    const incomingBytes = lines.reduce((total, line) => total + lineBytes(line), 0);
-    const rotate = current.length > 0 && current.length + incomingBytes > ACTOR_DEAD_LETTER_ARCHIVE_MAX_BYTES;
-    let dropped = 0;
-    if (rotate) {
-      let previousBackup = Buffer.alloc(0);
-      try { previousBackup = fs.readFileSync(backup); } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    const readTail = (file: string): { data: Buffer; dropped: number } => {
+      let size: number;
+      try { size = fs.statSync(file).size; } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return { data: Buffer.alloc(0), dropped: 0 };
+        throw error;
       }
-      dropped += previousBackup.toString("utf8").split("\n").filter(Boolean).length;
+      if (size <= ACTOR_DEAD_LETTER_ARCHIVE_MAX_BYTES) return { data: fs.readFileSync(file), dropped: 0 };
+      const fd = fs.openSync(file, "r");
       try {
-        fs.renameSync(archive, backup);
+        const buffer = Buffer.alloc(ACTOR_DEAD_LETTER_ARCHIVE_MAX_BYTES);
+        const offset = size - buffer.length;
+        const read = fs.readSync(fd, buffer, 0, buffer.length, offset);
+        const tail = buffer.subarray(0, read);
+        const boundary = tail.indexOf(0x0a);
+        return { data: boundary < 0 ? Buffer.alloc(0) : tail.subarray(boundary + 1), dropped: 1 };
+      } finally { fs.closeSync(fd); }
+    };
+    const writeDurable = (file: string, data: Buffer): void => {
+      const temporary = `${file}.${process.pid}.tmp`;
+      const fd = fs.openSync(temporary, "w", 0o600);
+      try { fs.writeFileSync(fd, data); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+      try {
+        fs.renameSync(temporary, file);
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "EEXIST" && (error as NodeJS.ErrnoException).code !== "EPERM") throw error;
-        fs.copyFileSync(archive, backup);
-        fs.truncateSync(archive, 0);
+        fs.copyFileSync(temporary, file);
+        const backupFd = fs.openSync(file, "r");
+        try { fs.fsyncSync(backupFd); } finally { fs.closeSync(backupFd); }
+        fs.unlinkSync(temporary);
       }
-      syncPathNamespace(backup);
-      current = Buffer.alloc(0);
+      syncPathNamespace(file);
+    };
+    const current = readTail(archive);
+    const incomingBytes = lines.reduce((total, line) => total + lineBytes(line), 0);
+    const rotate = current.dropped > 0 || (current.data.length > 0 && current.data.length + incomingBytes > ACTOR_DEAD_LETTER_ARCHIVE_MAX_BYTES);
+    let dropped = current.dropped;
+    if (rotate) {
+      const previousBackup = readTail(backup);
+      dropped += previousBackup.dropped + (previousBackup.data.length > 0 ? 1 : 0);
+      writeDurable(backup, current.data);
+      const archiveFd = fs.openSync(archive, "w", 0o600);
+      try { fs.fsyncSync(archiveFd); } finally { fs.closeSync(archiveFd); }
+      syncPathNamespace(archive);
     }
+    const retained = rotate ? Buffer.alloc(0) : current.data;
+    let bytes = retained.length;
     let start = 0;
-    let bytes = current.length;
-    if (bytes === 0) {
-      bytes = 0;
-      for (let index = lines.length - 1; index >= 0; index--) {
-        const size = lineBytes(lines[index]!);
-        if (bytes + size > ACTOR_DEAD_LETTER_ARCHIVE_MAX_BYTES) { start = index + 1; break; }
-        bytes += size;
-        start = index;
-      }
-      dropped += start;
+    for (let index = lines.length - 1; index >= 0; index--) {
+      const size = lineBytes(lines[index]!);
+      if (bytes + size > ACTOR_DEAD_LETTER_ARCHIVE_MAX_BYTES) { start = index + 1; break; }
+      bytes += size;
+      start = index;
     }
+    dropped += start;
     const text = lines.slice(start).join("");
     if (text) {
       const fd = fs.openSync(archive, "a", 0o600);
@@ -6031,7 +6050,7 @@ export class ActorManager {
             reason: "dead_letter_archive",
             deadLetterArchiveDropped: archive.dropped,
             deadLetterArchiveRotated: archive.rotated,
-          }, true);
+          });
         }
       } catch { return; } // Never rewrite until the archive is durable. A crash may duplicate, not lose.
     }

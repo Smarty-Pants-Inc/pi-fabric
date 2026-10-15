@@ -90,12 +90,13 @@ describe("dead-letter replay age and current activation filter (#10630)", () => 
     const w = await backlog();
     const oldArchive = Buffer.alloc(ACTOR_DEAD_LETTER_ARCHIVE_MAX_BYTES - 16, 0x78);
     fs.writeFileSync(w.archive, oldArchive);
-    fs.writeFileSync(`${w.archive}.1`, "older-generation\n");
+    fs.writeFileSync(`${w.archive}.1`, Buffer.alloc(ACTOR_DEAD_LETTER_ARCHIVE_MAX_BYTES + 16, 0x79));
     for (const entry of w.entries) entry.at = Date.now() - DEFAULT_DEAD_LETTER_REPLAY_MAX_AGE_MS - 60_000;
     fs.writeFileSync(w.file, w.entries.map(entry => JSON.stringify(entry) + "\n").join(""));
     const manager = w.open();
     await waitFor(() => receipts(manager, w.actor.id).length === 1);
     expect(fs.statSync(w.archive).size).toBeLessThanOrEqual(ACTOR_DEAD_LETTER_ARCHIVE_MAX_BYTES);
+    expect(fs.statSync(`${w.archive}.1`).size).toBeLessThanOrEqual(ACTOR_DEAD_LETTER_ARCHIVE_MAX_BYTES);
     expect(fs.readFileSync(`${w.archive}.1`)).toEqual(oldArchive);
     expect(readLines<Entry>(w.archive)).toEqual(w.entries);
     expect(manager.messages(w.actor.id)).toContainEqual(expect.objectContaining({

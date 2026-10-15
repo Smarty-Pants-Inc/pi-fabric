@@ -947,7 +947,7 @@ describe("FabricSettingsComponent", () => {
     } } as unknown as FabricState;
     let staleReads = 0;
     const context = { mode: "tui", cwd: root, isProjectTrusted: () => true,
-      modelRegistry: { getAvailable: () => fakeModelSource.models }, ui: { notify: vi.fn(), custom: async (factory) => {
+      modelRegistry: { getAvailable: () => fakeModelSource.models }, ui: { notify: vi.fn(), custom: async (factory: (tui: unknown, theme: Theme, keys: unknown, done: () => void) => FabricSettingsComponent) => {
         const component = factory({}, theme, {}, () => {}) as FabricSettingsComponent;
         const list = component.settingsList as any;
         list.selectedIndex = list.items.findIndex((item: { id: string }) => item.id === "agents");

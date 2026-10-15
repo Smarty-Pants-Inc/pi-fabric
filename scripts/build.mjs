@@ -12,6 +12,7 @@ const primaryEntryPoints = [
   "src/mesh-bridge.ts",
   "src/participants-cli.ts",
   "src/actors-cli.ts",
+  "src/resident-drain-cli.ts",
   "src/judge-cli.ts",
   "src/releases-cli.ts",
   "src/mesh-lock-stats-cli.ts",
@@ -51,9 +52,19 @@ const primaryEntryPoints = [
 // path lets a session that loaded the previous index resolve delayed modules
 // after the installed package is replaced, while preserving lazy evaluation.
 const lazyEntryPoints = [
+  // Native installer bootstrap; never exposed as a guest authority grant.
+  "src/actors/slot-authority.ts",
+  // Import-only per-materialization claim parsing, not idle registration work.
+  "src/commands/slot-import.ts",
   // First-use scratch removal: a stable entry keeps the shared verifier out of the startup graph.
   "src/storage/verified-remove.ts",
+  // The resident's first operator cleanup reuses the offline final-check helper (smarty-dev#8090).
+  "src/actors/remove-offline.ts",
   "src/residency/launcher-owner.ts",
+  // The actor proxy loads the cooperative drain protocol only at first drain use.
+  "src/residency/drain.ts",
+  // Native host IPC is loaded only for a launch with trusted containment attestation.
+  "src/residency/launcher-containment-control.ts",
   "src/residency/wake.ts",
   "src/residency/process-work.ts",
   "src/agents/transports/process-utils.ts",
@@ -73,12 +84,14 @@ const lazyEntryPoints = [
   "src/memory/extractive-history.ts",
   "src/cli/mesh.ts",
   "src/cli/decisions.ts",
+  "src/mesh/nats-auth/cli.ts",
   "src/thinking-control.ts",
   "src/compaction/owner.ts",
   "src/compaction/orphan-repair.ts",
   "src/decisions/command.ts",
   "src/programs/host.ts",
   "src/core/provider-operations.ts",
+  "src/core/auto-approval-classifier-impl.ts",
   "src/guards/foreground-wait.ts",
   "src/agents/model-route.ts",
   "src/agents/model-route-prepare.ts",
@@ -91,6 +104,11 @@ const lazyEntryPoints = [
   "src/agents/transports/placement.ts",
   // Also loaded by the worker as a Pi extension (-e) for confined children.
   "src/agents/write-guard.ts",
+  // Also loaded by the worker (-e) so extensions: false children keep
+  // extension-registered model providers.
+  "src/agents/provider-bridge.ts",
+  // The running Pi CLI's own SDK entry, for the bridge and the conversation UI.
+  "src/core/host-sdk.ts",
   "src/fabric-runtime-state.ts",
   "src/provider-error-class.ts",
   "src/topology/root-inbox-context.ts",
@@ -152,6 +170,8 @@ const lazyEntryPoints = [
   "src/worker/session-export.ts",
   // smarty-dev#7504: the NATS state backend's official client, loaded only by openNatsStateBackend.
   "src/mesh/state-backend-nats-client.ts",
+  "src/config.ts",
+  "src/core/agent-dir.ts",
 ];
 
 // smarty-dev#7936: the native helpers' sha256 values become a constant of the bundle (reader-proof.ts).

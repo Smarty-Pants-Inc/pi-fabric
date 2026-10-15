@@ -1,5 +1,6 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { RootInbox, type RootInboxBatch, type RootInboxSession, type RootInboxReconcileOptions } from "./topology/root-inbox.js";
+import { RootInboxWatch } from "./topology/root-inbox-wake.js";
 import { MainInboxMaintenance, registerMainInbox, recordMainSuccessor, mainInboxOwns, mainInboxActive, rootPresenceAlarms, stageMainSuccessor, confirmMainSuccessor, providerDeadAlarms, providerDeadAlarmFields, admissionAlarmRecipient } from "./topology/stall-alarms.js";
 import type { RecordsService } from "./records/service.js";
 import { recordsInboxMessage, recordsInboxSession, type RecordsInboxBatch, type RecordsInboxSession } from "./records/inbox.js";
@@ -17,6 +18,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { FabricActivityStore } from "./activity/store.js";
 import { ActorDirectory, haltEvery } from "./actors/directory.js";
+import { ActorSlotRecoveryParkedError } from "./actors/slot-recovery.js";
 import type { ActorModelRouteInput } from "./actors/manager.js";
 import { resolvePiBinary } from "./agents/pi-binary.js";
 import { isPiShellRef } from "./core/pi-tools.js";
@@ -85,7 +87,7 @@ import { actionApprovalOverride } from "./core/approval-overrides.js";
 import type { FabricSpeculationStreamTap } from "./speculation/stream-tap.js";
 import { MeshStore, meshOutageAlarmSink, type MeshIdentity } from "./mesh/store.js";
 import { acquireMeshCustodyLock, meshCustodyMode } from "./mesh/custody-lock.js";
-import { MeshBackgroundQueue, MeshBackgroundRetry, isMeshLockTimeout } from "./core/atomic-write.js";
+import { MeshBackgroundQueue, MeshBackgroundRetry, isMeshWriteDeferred } from "./core/atomic-write.js";
 import { DecisionStore } from "./decisions/store.js";
 import { requestHeadlessApproval, routeChildQuestion } from "./decisions/host.js";
 import { LifecycleBroker } from "./lifecycle/broker.js";
@@ -264,7 +266,7 @@ export class FabricRuntimeState {
   #componentLoader: FabricComponentLoader | undefined;
   #componentControl: FabricComponentControl | undefined;
   #componentConfiguration: FabricComponentConfiguration | undefined;
-  #stopComponentWatch: (() => void) | undefined;
+  #stopComponentWatch: ReturnType<typeof watchComponentConfiguration> | undefined;
   readonly #componentTransitionSignatures = new Map<string, string>();
   readonly #componentTransitionPublications = new Set<Promise<void>>();
   #sessionCapabilityLease: FabricCapabilityViewLease | undefined;
@@ -403,8 +405,58 @@ export class FabricRuntimeState {
     await this.#inboxRetry.run(async () => {
       if (!this.#meshActivationReady()) return;
       batch = await (idle ? this.#rootInbox?.wake(session, idle) : this.#rootInbox?.next(session, options));
+      this.#inboxReads++;
     });
     return batch;
+  }
+
+  /**
+   * The host's gated idle inbox wake (smarty-dev#4313, replaces the 15 s interval), called
+   * after the host's idle/preflight/cancel gates. A local Main
+   * with a root inbox runs it from mesh-root file events and one exact-deadline timer, armed only
+   * once this runtime is current and its mesh activation (RootInbox.start) completed.
+   */
+  #rootInboxWake: (() => Promise<void>) | undefined;
+  #inboxWatch: RootInboxWatch | undefined;
+  #inboxReads = 0;
+  set rootInboxWake(wake: (() => Promise<void>) | undefined) {
+    this.#rootInboxWake = wake;
+    this.#syncInboxWatch();
+  }
+  get rootInboxWake(): (() => Promise<void>) | undefined { return this.#rootInboxWake; }
+  /** One coalesced idle read through the watch (after a settle); false when none is armed. */
+  requestRootInboxWake(): boolean {
+    this.#inboxWatch?.request();
+    return this.#inboxWatch !== undefined;
+  }
+  #syncInboxWatch(): void {
+    const inbox = this.#rootInbox;
+    if (!this.#rootInboxWake || !inbox || this.#managedHost || !this.#meshActivationReady()) {
+      this.#closeInboxWatch();
+      return;
+    }
+    if (this.#inboxWatch) return;
+    const watch = new RootInboxWatch(inbox.mesh.root, async () => {
+      if (this.#inboxWatch !== watch || !this.#meshActivationReady()) return undefined;
+      const reads = this.#inboxReads;
+      await this.#rootInboxWake?.();
+      if (this.#inboxWatch !== watch) return undefined;
+      const now = Date.now();
+      const deadlines: number[] = [];
+      // Only a read made by this call reports a deadline: a skipped read must not rearm a timer.
+      const due = this.#inboxReads !== reads ? inbox.wakeDueAt : undefined;
+      if (due !== undefined) deadlines.push(due);
+      // A typed mesh lock failure: the existing bounded backoff owns the explicit retry.
+      if (this.#inboxRetry.waitMs > 0) deadlines.push(now + this.#inboxRetry.waitMs);
+      return deadlines.length ? Math.min(...deadlines) : undefined;
+    });
+    this.#inboxWatch = watch;
+    watch.start();
+  }
+  /** Synchronous: every teardown path calls it before its first await. */
+  #closeInboxWatch(): void {
+    this.#inboxWatch?.close();
+    this.#inboxWatch = undefined;
   }
 
   /**
@@ -448,6 +500,17 @@ export class FabricRuntimeState {
   /** Why peer visibility is unknown (a stalled mesh writer), or undefined when healthy. */
   writeStalled(): Error | undefined {
     return this.#participants?.writeStalled();
+  }
+
+  /** Per-instance observation faults, separate from mesh-write/peer-visibility health. */
+  observationHealth(): string[] {
+    return [
+      ...(this.#stopComponentWatch?.observationHealth() ?? []),
+      ...(this.#lifecycle?.observationHealth() ?? []),
+      ...(this.#control?.observationHealth() ?? []),
+      ...(this.#residency?.observationHealth() ?? []),
+      ...(this.#inboxWatch?.failure ? [this.#inboxWatch.failure] : []),
+    ];
   }
 
   /** When this host last committed its mesh heartbeat, if it has a directory. */
@@ -609,6 +672,7 @@ export class FabricRuntimeState {
     // successor's; the successor lease is installed only once the old runtime is torn down.
     this.#epoch += 1;
     this.#meshActivationReady = () => false;
+    this.#closeInboxWatch();
     this.#controlPausedByDispose = false;
     const epoch = this.#epoch;
     this.#binding = undefined;
@@ -840,6 +904,7 @@ export class FabricRuntimeState {
       },
       (event) => { this.#alarmProviderDead(mainAgentId, event); },
       meshRoot,
+      role === "project-agent",
     );
     this.#mainAgent = mainAgent;
     // SMARTY_AGENT is the primary name (smarty-dev#11146). An unnamed interactive Main falls
@@ -903,6 +968,9 @@ export class FabricRuntimeState {
         }
         await initializeMeshActivation();
       },
+      // Reuse committed heartbeat maintenance, never another timer/background import.
+      presencePassMs: 25_000,
+      terminalActor: entry => this.#actors?.validateSessionActorTombstone(entry),
       presencePass: async () => {
         await rootPresenceAlarms(this.#mesh!, identity, hostId,
           this.#participants!.list({ scope: "project", includeStale: true, fresh: true }), this.#config!.mesh.rootPresenceAlarmMs);
@@ -955,7 +1023,9 @@ export class FabricRuntimeState {
           // In dual mode, exclude legacy file custodians with the mesh lock too.
           const register = () => {
             if (!live.current()) throw new Error("Pi Fabric mesh activation lifecycle retired");
-            return registerMainInbox(meshRoot, identity, sessionId, sessionFile);
+            // SMARTY_AGENT is a reusable display label, never a launcher grant. Registration mints
+            // its own root/activation/process identity; only native succession may carry it forward.
+            return registerMainInbox(meshRoot, identity, sessionId, sessionFile, undefined, namedMain ? participantProject(context.cwd) : undefined);
           };
           inboxActivation = meshCustodyMode() === "own" ? register() : await mesh.exclusive(register);
         } finally { releaseCustody(); }
@@ -978,6 +1048,8 @@ export class FabricRuntimeState {
       // Custody admission and succession succeeded: only now open inbox reads/drains.
       rootInbox?.start();
       meshActivationReady = true;
+      // A delayed activation (initial lock timeout) arms the idle wake once a current runtime set it.
+      this.#syncInboxWatch();
       mainAgent.attachFollowUpDrain(
         activationContext,
         followUpDrainSupported() ? meshConfig.followUpFlushMs : 0,
@@ -996,7 +1068,7 @@ export class FabricRuntimeState {
     try {
       await initializeMeshActivation();
     } catch (error) {
-      if (!isMeshLockTimeout(error)) throw error;
+      if (!isMeshWriteDeferred(error)) throw error;
       initialMeshError = error;
     }
     // Capture this activation's directory: no control may claim/run before its epoch
@@ -1176,7 +1248,7 @@ export class FabricRuntimeState {
       },
       onTerminalNotice: async (notice) => {
         if (!notice.sender?.id) throw new Error("Terminal refusal has no attributed sender; retain native receipt");
-        const message = `FABRIC_TARGET_TERMINAL: ${notice.delivery} ${notice.messageId} was not delivered to task ${notice.targetId}; ` +
+        const message = `FABRIC_TARGET_TERMINAL: undelivered: task already finished; ${notice.delivery} ${notice.messageId} was not delivered to task ${notice.targetId}; ` +
           `its final answer receipt is ${notice.finalAnswerReceiptId}. Start a new task; this input cannot revive the old one.`;
         if (notice.sender.id === identity.id || mainAgent.matches(notice.sender.id) && mainAgent.local) {
           this.pi.sendMessage({ customType: "pi-fabric-target-terminal", content: message, display: true, details: notice },
@@ -1277,10 +1349,8 @@ export class FabricRuntimeState {
       const participant = this.#participants?.get(actorId, undefined, { fresh });
       return participant ? participant.ownerHostId === hostId : undefined;
     };
-    const snapshotActorOwnership = (fresh = true): ReadonlyMap<string, boolean> => new Map(
-      (this.#participants?.list({ scope: "project", fresh }) ?? [])
-        .map((participant) => [participant.id, participant.ownerHostId === hostId]),
-    );
+    const snapshotActorOwnership = (fresh = true, actorIds?: readonly string[]): ReadonlyMap<string, boolean> =>
+      this.#participants?.actorOwnership(hostId, { fresh, ...(fresh ? {} : { actorIds }) }) ?? new Map();
     // Capture this generation's directory: replacement/quiesce must veto old
     // deferred slices, and new actors cannot maintain archives before publication.
     const actorParticipants = this.#participants;
@@ -1461,6 +1531,12 @@ export class FabricRuntimeState {
         firstSeenAgents,
       ),
     );
+    // Reconcile both scopes before actor publication or control/mesh input.
+    try { await this.#actors.recoverProtectedActors(); }
+    catch (error) {
+      if (!(error instanceof ActorSlotRecoveryParkedError)) throw error;
+      console.warn(`[pi-fabric] ${this.#actors.slotRecoveryStatus().error?.message}`);
+    }
     this.#participants.registerSource(() =>
       this.#actors!.listOwned(true).map((actor) =>
         actorParticipantRecord(actor, mainAgentId, hostId, identity.id, identity.id),
@@ -2121,6 +2197,7 @@ export class FabricRuntimeState {
     this.#stopHerdrLookup?.();
     this.#stopHerdrLookup = undefined;
     this.#meshActivationReady = () => false;
+    this.#closeInboxWatch();
     this.#controlPausedByDispose = false;
     // The session lifecycle retired: stop the background heartbeat before any teardown await.
     this.#participants?.suspend();

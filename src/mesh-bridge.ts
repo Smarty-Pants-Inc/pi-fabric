@@ -14,8 +14,10 @@ import { spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { readMeshStateMovedMarker } from "./mesh/backend-fence.js";
 import { DEFAULT_CALL_TIMEOUT_MS, DEFAULT_FACTORY_RATE, MeshBridge, RemoteBridgeSide, serveBridgeAgent, StoreBridgeSide, validBridgeName } from "./mesh/bridge.js";
+import { BridgeRelayUnavailableError, startBridgeRelay } from "./mesh/bridge-relay.js";
 import { BridgeHandoffRefusedError, BridgeHandoffUsageError, handOffNativeIdentity, handoffRootId, listHandoffs, revokeHandoff } from "./mesh/bridge-handoff.js";
 import { MeshStore, type MeshStoreOptions } from "./mesh/store.js";
 
@@ -109,6 +111,7 @@ const log = (message: string): void => void process.stderr.write(`mesh-bridge: $
 const runAgent = async (flags: Map<string, string>): Promise<void> => {
   const peer = required(flags, "peer");
   const side = new StoreBridgeSide(openBridgeStore(required(flags, "mesh"), flags), peer);
+  await side.store.prepareLock();
   await serveBridgeAgent(side, process.stdin, process.stdout);
 };
 
@@ -152,6 +155,10 @@ export const runBridge = async (
   const local = new StoreBridgeSide(openBridgeStore(required(flags, "mesh"), flags), remoteName);
   const argv = transportCommand(flags, command);
   if (signal.aborted) return 0;
+  // Prepare before starting the link, not inside a short registry/mesh try. Readiness is
+  // immutable for this store; an unknown identity still permits conservative publication.
+  await local.store.prepareLock();
+  if (signal.aborted) return 0;
 
   const child = spawn(argv[0]!, argv.slice(1), { env: childProcessEnvironment(), stdio: ["pipe", "pipe", "inherit"] });
   let spawnError: Error | undefined;
@@ -170,6 +177,8 @@ export const runBridge = async (
   });
   child.stdin.on("error", () => undefined);
   let bridge: MeshBridge | undefined;
+  let relay: Awaited<ReturnType<typeof startBridgeRelay>> | undefined;
+  let starting: Promise<void> | undefined;
   let code = 0;
   try {
     onChild?.(child.pid);
@@ -178,6 +187,10 @@ export const runBridge = async (
     const linked = remote;
     bridge = new MeshBridge({
       localName, remoteName, local, remote: linked, cursorPath,
+      relay: async (destinationRemote, event) => {
+        if (!relay || signal.aborted) throw new BridgeRelayUnavailableError();
+        await relay.send(destinationRemote, event);
+      },
       stopMs: Math.min(callTimeoutMs, 5_000),
       log,
       factoryRate,
@@ -188,12 +201,29 @@ export const runBridge = async (
       if (signal.aborted) resolve();
       else signal.addEventListener("abort", () => resolve(), { once: true });
     });
+    // Start/sync the link before binding a delivery server. The registered script is the
+    // exact canonical bin entry in THIS package generation, never argv[1] or a current link.
+    starting = (async () => {
+      await linked.hello();
+      if (signal.aborted) return;
+      await running.start();
+      if (signal.aborted) return;
+      if (process.platform === "linux") {
+        try {
+          relay = await startBridgeRelay({ localName, remoteName, meshRoot: local.store.root,
+            bridgeScriptPath: fs.realpathSync(fileURLToPath(new URL("../bin/mesh-bridge", import.meta.url))),
+            deliver: (sourceRemote, event) => running.deliverRelay(sourceRemote, event) });
+        } catch {
+          // Unsafe/missing authentication or socket authority is a relay-only refusal.
+          // Do not leak exception details; hub-local bridge traffic remains supported.
+          log("relay unavailable; hub-local link remains active");
+        }
+      }
+      if (signal.aborted) return;
+      log(`linked ${localName} <-> ${remoteName}`);
+    })();
     await Promise.race([
-      (async () => {
-        await linked.hello();
-        log(`linked ${localName} <-> ${remoteName}`);
-        await running.run();
-      })(),
+      starting.then(async () => { if (!signal.aborted) await running.run(); }),
       linked.closed.then((error) => {
         throw error;
       }),
@@ -205,6 +235,12 @@ export const runBridge = async (
       code = 1;
     }
   } finally {
+    // Join initialization so an abort cannot leave a late-bound socket behind. All startup
+    // remote calls are bounded; no receiver is advertised before its presence is ready.
+    await starting?.catch(() => undefined);
+    // Fence/close delivery ingress BEFORE withdrawing presence or shutting down the link.
+    await relay?.close().catch(() => undefined);
+    relay = undefined;
     // The mirrors of the remote on this side go at once; the remote's lapse with their lease.
     await (bridge ? bridge.stop() : local.withdraw()).catch(() => undefined);
     remote?.close();

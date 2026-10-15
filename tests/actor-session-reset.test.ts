@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ActorManager } from "../src/actors/manager.js";
+import type { FabricActorDeliveryRequest } from "../src/actors/types.js";
 import { DEFAULT_FABRIC_CONFIG, normalizeFabricConfig } from "../src/config.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { AgentManager } from "../src/agents/manager.js";
@@ -41,9 +42,11 @@ const setup = (options: {
   });
   const identity: MeshIdentity = { id: "session:test", name: "main", kind: "main", sessionId: "test" };
   const deliveries: string[] = [];
+  const requests: FabricActorDeliveryRequest[] = [];
   const sendMessage = vi.fn();
   const pi = { sendMessage } as unknown as ExtensionAPI;
   const actors = new ActorManager("test", identity, mesh, { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 }, agents, (request) => {
+    requests.push(request);
     if (request.message.text) deliveries.push(request.message.text);
     deliverActorToMain(pi, identity, request);
   }, {
@@ -71,7 +74,7 @@ const setup = (options: {
     return run(request, signal);
   });
   return {
-    actors, agents, runs, root, mesh, deliveries, sendMessage,
+    actors, agents, runs, root, mesh, deliveries, requests, sendMessage,
     hold: () => {
       let release!: () => void;
       gate = new Promise((resolve) => { release = resolve; });
@@ -202,6 +205,59 @@ describe("actor session rotation safety (smarty-dev#2847)", () => {
     } finally { spy.mockRestore(); }
   });
 
+  // Keep reason: trust boundary, smarty-dev#12512 — agents.messages is Main-visible too.
+  it("12512 payload allowlist: session repair failure closes owner, Main and messages payloads", async () => {
+    const { actors, mesh, root, requests, sendMessage, runs } = setup();
+    const actor = await actors.create({ name: "private-repair", instructions: "Work.", delivery: "mailbox", transport: "process" });
+    const orphan = '{"type":"message","id":"private-orphan"}\n';
+    fs.mkdirSync(path.dirname(actor.sessionFile!), { recursive: true });
+    fs.writeFileSync(actor.sessionFile!, orphan);
+    const posix = "/private/12512-session/owner-record.json";
+    const windows = String.raw`C:\Users\Synthetic\12512-session\owner-record.json`;
+    const secret = "synthetic-private-token-12512-session";
+    const raw = `cannot preserve orphan: ${actor.sessionFile}; ${posix}; ${windows}; ${secret}`;
+    const before = actors.messages(actor.id, 50).length;
+    const rename = fs.renameSync.bind(fs);
+    const spy = vi.spyOn(fs, "renameSync").mockImplementation((source, target) => {
+      if (source === actor.sessionFile) throw Object.assign(new Error(raw), { code: "EACCES" });
+      return rename(source, target);
+    });
+    try {
+      // A boundary-only repair avoids confusing this alarm with a separate activation failure.
+      await expect(actors.resetSession(actor.id)).rejects.toThrow(raw);
+      await waitFor(() => mesh.read({ topic: "ops.owner" }).some(event => event.kind === "actor.session.error"));
+      const alarms = mesh.read({ topic: "ops.owner" }).filter(event => event.kind === "actor.session.error");
+      expect(alarms).toHaveLength(1);
+      expect(requests).toHaveLength(1);
+      const messages = actors.messages(actor.id, 50);
+      // No duplicate raw record or alternate message channel may preserve this alarm's detail.
+      expect(messages).toHaveLength(before + 1);
+      const visible = JSON.stringify({ owner: alarms, onDeliver: requests, main: sendMessage.mock.calls, messages });
+      for (const value of [raw, posix, windows, secret, root, actor.sessionFile!]) {
+        expect(visible).not.toContain(JSON.stringify(value).slice(1, -1));
+      }
+      expect(alarms[0]).toMatchObject({
+        topic: "ops.owner", kind: "actor.session.error", from: { id: "session:test" }, to: actor.rootId,
+        data: { actorId: actor.id }, text: expect.stringContaining("repair failed"),
+      });
+      const alarmData = alarms[0]!.data as Record<string, unknown>;
+      if ("error" in alarmData) expect(alarmData.error).toBe("error");
+      expect(requests[0]).toMatchObject({
+        actor: { id: actor.id }, delivery: "followUp", triggerTurn: true,
+        message: { actorId: actor.id, source: "fabric-host", action: "message", data: alarms[0]!.data },
+      });
+      expect(requests[0]!.message.text).toContain("agents.actorStatus");
+      expect(requests[0]!.message.text).toContain("agents.log");
+      expect(messages.at(-1)).toEqual(requests[0]!.message);
+      expect(sendMessage).toHaveBeenCalledTimes(1);
+      expect(sendMessage.mock.calls[0]?.[1]).toMatchObject({ deliverAs: "followUp", triggerTurn: true });
+      // The failed rename preserves the original privately; no worker or new archive was created.
+      expect(fs.readFileSync(actor.sessionFile!, "utf8")).toBe(orphan);
+      expect(backups(actor.sessionFile!)).toEqual([]);
+      expect(runs).toEqual([]);
+    } finally { spy.mockRestore(); }
+  });
+
   it("fails loudly if repair cannot preserve the malformed file", async () => {
     const { actors, mesh } = setup();
     const actor = await actors.create({ name: "repair-error", instructions: "Work." });
@@ -269,11 +325,14 @@ describe("actor session rotation safety (smarty-dev#2847)", () => {
     if (operation === "halt") expect(actors.halted).toBe(true);
     const alarms = mesh.read({ topic: "ops.owner" }).filter((event) => event.kind === "actor.session.repaired");
     expect(alarms).toHaveLength(1);
-    expect(alarms[0]).toMatchObject({ data: { actorId: actor.id, archived: expect.stringContaining("orphan-noheader") } });
+    expect(alarms[0]).toMatchObject({ data: { actorId: actor.id } });
+    expect(JSON.stringify(alarms[0])).not.toContain(JSON.stringify(actor.sessionFile!).slice(1, -1));
     const evidence = actors.messages(actor.id, 50).filter((message) => message.text?.includes("session repaired"));
     expect(evidence).toHaveLength(1);
     expect(evidence[0]).toMatchObject({ source: "fabric-host", data: alarms[0]!.data });
-    const archived = (alarms[0]!.data as { archived: string }).archived;
+    const kept = backups(actor.sessionFile!).filter(name => name.includes("orphan-noheader"));
+    expect(kept).toHaveLength(1);
+    const archived = path.join(path.dirname(actor.sessionFile!), kept[0]!);
     expect(fs.readFileSync(archived, "utf8")).toBe(orphan);
     expect(sessionHeader(actor.sessionFile!)).toMatchObject({ type: "session", version: 3 });
     expect(launch).not.toHaveBeenCalled();
@@ -292,7 +351,8 @@ describe("actor session rotation safety (smarty-dev#2847)", () => {
     await waitFor(() => actors.inFlightCount() === 0);
     const alarms = mesh.read({ topic: "ops.owner" }).filter((event) => event.kind === "actor.session.repaired");
     expect(alarms).toHaveLength(1);
-    expect(alarms[0]).toMatchObject({ from: { id: "session:test" }, data: { actorId: actor.id, archived: expect.stringContaining("orphan-noheader") } });
+    expect(alarms[0]).toMatchObject({ from: { id: "session:test" }, data: { actorId: actor.id } });
+    expect(JSON.stringify(alarms[0])).not.toContain(JSON.stringify(actor.sessionFile!).slice(1, -1));
     expect(deliveries.filter((text) => text.includes("session repaired"))).toHaveLength(1);
     expect(sendMessage).toHaveBeenCalledTimes(1);
     expect(sendMessage.mock.calls[0]?.[1]).toMatchObject({ deliverAs: "followUp", triggerTurn: true });
@@ -430,7 +490,14 @@ describe("actor session reset (smarty-dev#1439)", () => {
     const dir = path.dirname(actor.sessionFile!);
     fs.mkdirSync(dir, { recursive: true });
     const stamp = "20260927T150000000Z";
-    for (const name of [`session.jsonl.${stamp}.bak`, `session.jsonl.${stamp}-1.bak`]) fs.writeFileSync(path.join(dir, name), "{}\n");
+    // smarty-dev#11300: the prune orders by trusted mtime/ctime/inode and also keeps the newest by name. Written within
+    // one coarse clock tick (windows-latest), all three backups tied on time and NTFS inode order made the unsuffixed
+    // one "newest by age". Give the pre-existing backups distinct, older mtimes, as real earlier rotations have.
+    const older = Date.now() / 1000 - 120;
+    [`session.jsonl.${stamp}.bak`, `session.jsonl.${stamp}-1.bak`].forEach((name, n) => {
+      fs.writeFileSync(path.join(dir, name), "{}\n");
+      fs.utimesSync(path.join(dir, name), older + n, older + n);
+    });
     fs.writeFileSync(actor.sessionFile!, JSON.stringify({ type: "session", version: 3, id: "valid", timestamp: new Date().toISOString(), cwd: process.cwd() }) + "\n");
     vi.useFakeTimers({ toFake: ["Date"] });
     vi.setSystemTime(new Date("2026-09-27T15:00:00.000Z"));

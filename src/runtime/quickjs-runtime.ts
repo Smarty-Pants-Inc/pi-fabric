@@ -2,11 +2,13 @@ import releaseSyncVariant from "@jitl/quickjs-singlefile-mjs-release-sync";
 import { newQuickJSWASMModuleFromVariant } from "quickjs-emscripten-core";
 import ts from "typescript";
 import { ExecutionDeadline } from "./execution-deadline.js";
-import { isMeshLockTimeout } from "../core/atomic-write.js";
+import { MESH_INCARNATION_PENDING_CODE, MESH_LOCK_TIMEOUT_CODE, MESH_SNAPSHOT_RETRIES_EXHAUSTED_CODE } from "../core/atomic-write.js";
+import { isMeshRetryableBusy } from "../mesh/state-backend.js";
 import { cancellationError, preserveCancellationOutcome, runAbortable, settleWithin, shareCancellationEffects } from "../async-settlement.js";
 import { piBashExitMetadata } from "../core/pi-bash-error.js";
 import { FabricModelDeniedError } from "../core/model-policy.js";
 import { FabricTargetTerminalError } from "../agents/terminal-target.js";
+import { JevTransientHttpError } from "../jev/validation.js";
 import { PI_ARGUMENT_NORMALIZATION_SOURCE } from "../core/pi-arguments.js";
 import { PI_CORE_TOOL_NAMES } from "../core/pi-tools.js";
 import { HumanWaitDeadlinePause } from "./deadline-pause.js";
@@ -29,6 +31,14 @@ export type {
 
 type QuickJsModule = Awaited<ReturnType<typeof newQuickJSWASMModuleFromVariant>>;
 
+// The shared retry predicate also accepts WAL-cap and raw SQLite errors: only
+// these three mesh families have a guest code contract, with canonical names.
+const GUEST_MESH_RETRYABLE_ERROR_NAMES: Readonly<Record<string, string>> = Object.freeze({
+  [MESH_LOCK_TIMEOUT_CODE]: "MeshLockTimeoutError",
+  [MESH_INCARNATION_PENDING_CODE]: "MeshIncarnationPendingError",
+  [MESH_SNAPSHOT_RETRIES_EXHAUSTED_CODE]: "MeshSnapshotRetriesExhaustedError",
+});
+
 // Explicit safe contracts, not Error serialization: never bridge stacks, causes, arbitrary
 // properties or getters. Keep this dependency-free so runtime loading cannot pull in providers.
 const GUEST_FABRIC_ERROR_NAMES: Readonly<Record<string, string>> = Object.freeze({
@@ -39,7 +49,10 @@ const GUEST_FABRIC_ERROR_NAMES: Readonly<Record<string, string>> = Object.freeze
   FABRIC_INTERRUPT_NOT_AUTHORIZED: "FabricInterruptNotAuthorizedError",
   FABRIC_INTERRUPT_RATE_LIMITED: "FabricInterruptRateLimitedError",
   FABRIC_PARTICIPANT_STALE: "FabricParticipantStaleError",
+  FABRIC_RELAY_DESTINATION_UNAVAILABLE: "FabricRelayDestinationUnavailableError",
+  FABRIC_IDEMPOTENCY_KEY_REUSED: "FabricIdempotencyKeyReusedError",
   FABRIC_PARTICIPANT_NOT_YET_MIRRORED: "FabricParticipantNotYetMirroredError",
+  FABRIC_PEER_LEASE_STALE: "FabricPeerLeaseStaleError",
   FABRIC_PARTICIPANT_NON_INTERACTIVE: "FabricParticipantNonInteractiveError",
   FABRIC_TASK_ESCALATION_TARGET_DENIED: "TaskEscalationTargetError",
   FABRIC_PROJECT_AGENT_UNRESOLVED: "FabricProjectAgentUnresolvedError",
@@ -53,6 +66,7 @@ const guestFabricErrorMetadata = (error: unknown): Record<string, string | boole
   if (error instanceof FabricTargetTerminalError) return {
     name: "FabricTargetTerminalError", code: "FABRIC_TARGET_TERMINAL",
     targetId: error.targetId, finalAnswerReceiptId: error.finalAnswerReceiptId,
+    reason: error.reason, deliveryStatus: error.deliveryStatus, runState: error.runState,
   };
   const code = Object.getOwnPropertyDescriptor(error, "code")?.value;
   const name = Object.getOwnPropertyDescriptor(error, "name")?.value;
@@ -60,7 +74,7 @@ const guestFabricErrorMetadata = (error: unknown): Record<string, string | boole
   const metadata: Record<string, string | boolean> = { name, code };
   const retryable = Object.getOwnPropertyDescriptor(error, "retryable")?.value;
   if (typeof retryable === "boolean") metadata.retryable = retryable;
-  if (code === "FABRIC_PARTICIPANT_STALE") {
+  if (code === "FABRIC_PARTICIPANT_STALE" || code === "FABRIC_RELAY_DESTINATION_UNAVAILABLE" || code === "FABRIC_IDEMPOTENCY_KEY_REUSED") {
     // The public message schema bounds retry keys to 1-200 chars. Read only own
     // data properties: never invoke a host getter or export unrelated metadata.
     const key = Object.getOwnPropertyDescriptor(error, "idempotencyKey")?.value;
@@ -585,6 +599,7 @@ globalThis.agents = Object.freeze({
   setFollowUpMode: (args) => __call("agents.setFollowUpMode", args),
   compact: (args) => __call("agents.compact", args),
   actorStatus: (args) => __call("agents.actorStatus", args),
+  slotStatus: (args = {}) => __call("agents.slotStatus", args),
   instructions: (args) => __call("agents.instructions", args),
   setModel: (args) => __call("agents.setModel", args),
   switchModel: (args) => __call("agents.switchModel", args),
@@ -1173,10 +1188,11 @@ export class QuickJsRuntime {
                 error instanceof Error ? error.message : String(error),
               );
               try {
-                // The host-issued lock code wins over a legacy or overridden name.
-                // Both contracts supply only vetted metadata; each key is assigned once.
-                const safeMetadata = isMeshLockTimeout(error)
-                  ? { name: "MeshLockTimeoutError", code: error.code }
+                // Known host-issued mesh codes win over legacy or overridden names.
+                // Retryability alone never authorizes exporting arbitrary error codes.
+                const meshCode = error instanceof Error && "code" in error ? error.code : undefined;
+                const safeMetadata = typeof meshCode === "string" && Object.hasOwn(GUEST_MESH_RETRYABLE_ERROR_NAMES, meshCode) && isMeshRetryableBusy(error)
+                  ? { name: GUEST_MESH_RETRYABLE_ERROR_NAMES[meshCode]!, code: meshCode }
                   : guestFabricErrorMetadata(error);
                 // Fabric metadata includes its vetted name. Otherwise transfer only
                 // a host Error's string classification, never arbitrary properties
@@ -1214,6 +1230,18 @@ export class QuickJsRuntime {
                     context.setProp(errorHandle, "__fabricBashExit", metadata);
                   } finally {
                     metadata.dispose();
+                  }
+                }
+                // Only the trusted Jev transient HTTP error may expose numeric
+                // status/retryAfterMs. They never replace vetted metadata: each
+                // key is still assigned once.
+                for (const [key, value] of trustedJevErrorFields(error)) {
+                  if (safeMetadata && Object.hasOwn(safeMetadata, key)) continue;
+                  const field = context.newNumber(value);
+                  try {
+                    context.setProp(errorHandle, key, field);
+                  } finally {
+                    field.dispose();
                   }
                 }
                 promise.reject(errorHandle);
@@ -1471,4 +1499,21 @@ export class QuickJsRuntime {
       disposeQuickJsContext(context);
     }
   }
+}
+
+/**
+ * Numeric HTTP metadata from the trusted Jev transient error class only.
+ * Arbitrary host errors (including a `guestFields` map) never set numeric
+ * fields. Reads own data-property descriptors, so no accessor is invoked.
+ */
+function trustedJevErrorFields(error: unknown): Array<[string, number]> {
+  if (!(error instanceof JevTransientHttpError)) return [];
+  const fields: Array<[string, number]> = [];
+  for (const key of ["status", "retryAfterMs"] as const) {
+    const descriptor = Object.getOwnPropertyDescriptor(error, key);
+    if (!descriptor || !("value" in descriptor)) continue;
+    const value: unknown = descriptor.value;
+    if (typeof value === "number" && Number.isFinite(value)) fields.push([key, value]);
+  }
+  return fields;
 }

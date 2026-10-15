@@ -3,11 +3,14 @@ import type { FabricMessageSender } from "../protocol.js";
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { writeFileAtomic, syncPathNamespace } from "../core/atomic-write.js";
+import { writeFileAtomic, syncPathNamespace, requireNamespaceBarrier, syncPathNamespaceDurable } from "../core/atomic-write.js";
+import { meshEventsNotDurable } from "./not-durable.js";
+import { FabricIdempotencyKeyReusedError } from "./control-idempotency.js";
 import { readJsonlPage } from "../log-tail.js";
 import { MeshArchive, MeshArchiveLookupUnavailableError, MeshArchiveRecoveryChanged, type MeshArchiveEntry, type MeshArchiveRecoveryPlan } from "./archive.js";
 import { delay, errorCode, type MeshLock, type MeshStoreContext } from "./mesh-lock.js";
 import { jsonClone } from "./state-file.js";
+import { verifiedRemove } from "../storage/verified-remove.js";
 
 // Mesh events (smarty-dev#6477 L0): publish, publishBatch, dedupe receipts, the live log, its
 // compaction, archive coupling and recovery, and cursor reads.
@@ -36,6 +39,8 @@ export interface MeshEvent {
   sequence: number;
   /** Host-only once-publication identity; the provider namespaces trusted component keys. */
   dedupeKey?: string;
+  /** Host-computed semantic body hash; never authority supplied by the wire. */
+  dedupeFingerprint?: string;
   topic: string;
   kind: string;
   from: MeshIdentity;
@@ -67,6 +72,8 @@ export interface MeshPublishInput {
   topic: string;
   /** Host-only durable publication receipt; model-authored provider calls cannot supply it. */
   dedupeKey?: string;
+  /** Host-computed body hash for a keyed publication; exactly 64 lowercase hex characters. */
+  dedupeFingerprint?: string;
   /** Host-only durability fence; batches share this barrier across their prefix. */
   durable?: boolean;
   kind?: string;
@@ -158,6 +165,22 @@ interface AfterUnlock {
 // later append enqueues a new barrier, even while an earlier one is running (pi-fabric#550).
 const eventBarriers = new Map<string, Promise<void>>();
 
+/**
+ * Test-only (smarty-dev#9313), off unless PI_FABRIC_TEST_PAUSE_AFTER_RESERVE names a file: a
+ * publisher that has reserved its sequence writes `<file>.reserved` (the sequence) and then blocks,
+ * still under `.lock` and before its append, until `<file>.go` exists (30 s at most). Production
+ * never sets it; it opens the reservation-to-append window for a cross-process race test.
+ */
+const pauseAfterReserveForTest = (file: string, sequence: number): void => {
+  fs.writeFileSync(`${file}.reserved`, String(sequence));
+  const sleeper = new Int32Array(new SharedArrayBuffer(4));
+  const deadline = Date.now() + 30_000;
+  while (!fs.existsSync(`${file}.go`)) {
+    if (Date.now() > deadline) throw new Error("PI_FABRIC_TEST_PAUSE_AFTER_RESERVE timed out");
+    Atomics.wait(sleeper, 0, 0, 5);
+  }
+};
+
 export class MeshDedupeRecoveryError extends Error {
   readonly retryable = true;
   constructor(message: string, options?: { cause?: unknown }) {
@@ -247,26 +270,60 @@ export class EventLog {
     return path.join(this.root, "event-receipts", createHash("sha256").update(dedupeKey).digest("hex") + suffix);
   }
 
-  #confirmEventFile(file: string): void {
+  /** `durable`: the mesh.sync barrier, whose namespace step fails closed where there is none (win32). */
+  #confirmEventFile(file: string, durable = false): void {
     const fd = fs.openSync(file, process.platform === "win32" ? "r+" : "r");
-    try { fs.fsyncSync(fd); syncPathNamespace(file, fs.fstatSync(fd)); } finally { fs.closeSync(fd); }
+    try {
+      fs.fsyncSync(fd);
+      if (durable) syncPathNamespaceDurable(file, fs.fstatSync(fd), meshEventsNotDurable);
+      else syncPathNamespace(file, fs.fstatSync(fd));
+    } finally { fs.closeSync(fd); }
   }
 
   /** Fsync the live log and its namespace outside `.lock`. Group commit: callers whose append
-   * completed before the barrier starts share one fsync (the jbd2 commit is the cost). */
-  #confirmEventsAfterRelease(): Promise<void> {
+   * completed before the barrier starts share one fsync (the jbd2 commit is the cost). A durable
+   * caller joining a queued publish barrier gets the same barrier: the variants differ only where
+   * sync() already refused, before any I/O. */
+  #confirmEventsAfterRelease(durable = false): Promise<void> {
     const file = this.#eventsPath;
     const queued = eventBarriers.get(file);
     if (queued) return queued;
     const barrier = new Promise<void>((resolve, reject) => {
       setImmediate(() => {
         eventBarriers.delete(file);
-        try { this.#confirmEventFile(file); resolve(); }
+        try { this.#confirmEventFile(file, durable); resolve(); }
         catch (error) { reject(error); }
       });
     });
     eventBarriers.set(file, barrier);
     return barrier;
+  }
+
+  /**
+   * Durability barrier for events (smarty-dev#9313): resolves once every event committed to the
+   * live log before the call, by any process on this root, is on disk. It is the same group-commit
+   * barrier a durable publish uses: one fsync of events.jsonl and its namespace, outside `.lock`
+   * (a queued barrier that has not started yet covers this call too). Archived events need nothing
+   * more: each archive line is fdatasynced before its event goes live. No live log, no event.
+   *
+   * Resolves with `through`: the highest sequence COMMITTED to the live log (on a complete line)
+   * when the barrier was requested, read before its fsync starts, so the fsync covers that line and
+   * every line before it. Never the reservation counter (latestSequence): a publisher advances that
+   * under `.lock` before it appends, so a reserved sequence may not be in the log yet
+   * (pi-fabric#894). Zero when the live log holds no complete event.
+   *
+   * Fails closed with MeshEventsNotDurableError on a platform with no namespace barrier (win32),
+   * before any I/O: neither the live log's renames nor the archive's new segments can be confirmed
+   * there (pi-fabric#894 CODE_REVIEW), so no claim is made, even for an empty root.
+   */
+  async sync(): Promise<number> {
+    requireNamespaceBarrier(meshEventsNotDurable);
+    if (!fs.existsSync(this.#eventsPath)) return 0;
+    // Sample first, then queue the barrier: a queued barrier has not started (it runs in a later
+    // setImmediate), so its fsync begins after this read in every case.
+    const through = this.#readCommittedSequence();
+    await this.#confirmEventsAfterRelease(true);
+    return through;
   }
 
   /** The live barrier stays after release. Receipt installation/removal reacquires .lock
@@ -359,6 +416,15 @@ export class EventLog {
     return event;
   }
 
+  /** Called under the mesh lock before any fingerprinted retry can reuse a receipt. */
+  #assertDedupeFingerprint(event: MeshEvent, fingerprint?: string): void {
+    // Generic keyed publishers retain their historical key-only behavior. A fingerprinted
+    // retry cannot treat a legacy receipt without a fingerprint as proof of matching input.
+    if (fingerprint !== undefined && event.dedupeFingerprint !== fingerprint) {
+      throw new FabricIdempotencyKeyReusedError(event.dedupeKey);
+    }
+  }
+
   #removeDedupeIntent(file: string): void {
     fs.rmSync(file, { force: true });
     syncPathNamespace(path.dirname(file));
@@ -386,7 +452,8 @@ export class EventLog {
     }
   }
 
-  #settleDedupeIntent(file: string, dedupeKey?: string, archive?: MeshArchive, after?: AfterUnlock): MeshEvent | undefined {
+  #settleDedupeIntent(file: string, dedupeKey?: string, archive?: MeshArchive, after?: AfterUnlock,
+    fingerprint?: string): MeshEvent | undefined {
     let text: string;
     try { text = fs.readFileSync(file, "utf8"); }
     catch (error) { if (errorCode(error) === "ENOENT") return undefined; throw error; }
@@ -402,6 +469,7 @@ export class EventLog {
     }
     // A crash may also leave both the receipt and its intent. Never replace a receipt.
     const prior = this.#readDedupeReceipt(intent.dedupeKey, !after);
+    if (prior) this.#assertDedupeFingerprint(prior, fingerprint);
     if (prior && after) {
       // The receipt became visible after the first lookup (including a legacy off-lock
       // writer). This confirmation-only path does not install a new receipt.
@@ -415,6 +483,7 @@ export class EventLog {
     }
     const live = prior ? undefined : this.#readEventAtIntent(intent);
     let event = prior ?? live;
+    if (live) this.#assertDedupeFingerprint(live, fingerprint);
     if (!event && intent.archiveDir !== undefined && archive?.dir !== intent.archiveDir) {
       throw new MeshDedupeRecoveryError(`Cannot recover dedupe intent ${intent.dedupeKey}: event archive configuration is unavailable`);
     }
@@ -434,6 +503,7 @@ export class EventLog {
       // A different archived identity positively proves this reservation is absent. Never
       // abort that other event; leave its archive visibility and index intact.
       if (entry && archived?.id === intent.eventId) {
+        this.#assertDedupeFingerprint(archived, fingerprint);
         this.#repairEventLog();
         const lastLive = this.#readLastEventSequence();
         if (lastLive < archived.sequence) {
@@ -502,6 +572,10 @@ export class EventLog {
   #preparePublish(input: MeshPublishInput, batch?: { appendStarted: boolean; bytes: number }, after?: AfterUnlock): () => MeshEvent {
     this.#validateTopic(input.topic);
     if (input.to !== undefined && !input.to.trim()) throw new Error("Mesh recipient is empty");
+    if (input.dedupeFingerprint !== undefined &&
+        (typeof input.dedupeFingerprint !== "string" || !/^[a-f0-9]{64}$/.test(input.dedupeFingerprint) || !input.dedupeKey)) {
+      throw new Error("Mesh dedupe fingerprint must be 64 lowercase hex characters and requires a dedupe key");
+    }
     const principal = input.principal;
     const stamp = typeof input.data === "function" ? input.data as (createdAt: number) => unknown : undefined;
     const fixedData = stamp ? undefined : input.data;
@@ -554,7 +628,8 @@ export class EventLog {
     let encoded: { key: string; fields: string; bytes: number; chars: number; verification: MeshEvent["verification"] } | undefined;
     if (!stamp) {
       const verification = verificationOf(fixedData);
-      const key = input.dedupeKey ? `,"dedupeKey":${JSON.stringify(input.dedupeKey)}` : "";
+      const key = (input.dedupeKey ? `,"dedupeKey":${JSON.stringify(input.dedupeKey)}` : "") +
+        (input.dedupeFingerprint !== undefined ? `,"dedupeFingerprint":${JSON.stringify(input.dedupeFingerprint)}` : "");
       const fields = `,${JSON.stringify({
         topic: input.topic, kind, from,
         ...(principal ? { principal } : {}),
@@ -574,6 +649,7 @@ export class EventLog {
       if (input.dedupeKey) {
         const prior = this.#readDedupeReceipt(input.dedupeKey, !after);
         if (prior) {
+          this.#assertDedupeFingerprint(prior, input.dedupeFingerprint);
           // Receipt-before-unlink crash: the receipt is authoritative; finish cleanup.
           // A single publish confirms the visible receipt and unlinks after release.
           if (after) {
@@ -610,8 +686,11 @@ export class EventLog {
             throw new MeshDedupeRecoveryError("Event archive reboot recovery is unavailable during dedupe recovery", { cause: error });
           }
         }
-        const prior = this.#settleDedupeIntent(intentPath!, input.dedupeKey, archive, after);
-        if (prior) return prior;
+        const prior = this.#settleDedupeIntent(intentPath!, input.dedupeKey, archive, after, input.dedupeFingerprint);
+        if (prior) {
+          this.#assertDedupeFingerprint(prior, input.dedupeFingerprint);
+          return prior;
+        }
       }
       if (archive) {
         this.#recoverArchive(archive, false, prepared, liveCatchUp);
@@ -626,6 +705,7 @@ export class EventLog {
         const event: MeshEvent = {
           id: input.id ?? randomUUID(),
           ...(input.dedupeKey ? { dedupeKey: input.dedupeKey } : {}),
+          ...(input.dedupeFingerprint !== undefined ? { dedupeFingerprint: input.dedupeFingerprint } : {}),
           sequence,
           topic: input.topic,
           kind,
@@ -662,6 +742,7 @@ export class EventLog {
         // burst of 160 publishes held other writers up to 1.3 s at 5x the fleet rate. If the
         // lock's held share matters (#816), sync after unlocking so concurrent syncs share a commit.
         atomicWrite(this.#counterPath, sequence);
+        if (process.env.PI_FABRIC_TEST_PAUSE_AFTER_RESERVE) pauseAfterReserveForTest(process.env.PI_FABRIC_TEST_PAUSE_AFTER_RESERVE, sequence);
         let liveOffset = 0;
         try { liveOffset = fs.statSync(this.#eventsPath).size; }
         catch (error) { if (errorCode(error) !== "ENOENT") throw error; }
@@ -768,7 +849,7 @@ export class EventLog {
         for (const input of inputs) {
           const outcome = { appendStarted: false, bytes: 0 }, after: AfterUnlock = {};
           try { prepared.push({ commit: this.#preparePublish({ ...input, durable: false }, outcome, after), outcome, after }); }
-          catch (error) { if (!prepared.length) throw error; break; }
+          catch (error) { if (error instanceof FabricIdempotencyKeyReusedError || !prepared.length) throw error; break; }
         }
         events = await this.#lock.withLock(() => {
           const started = performance.now();
@@ -781,6 +862,9 @@ export class EventLog {
                 bytes + 2 * this.maxEventBytes + 1 > this.#retainedEventLogBytes)) break;
             try { events.push(commit()); committed.push(after); bytes += outcome.bytes; }
             catch (error) {
+              // A typed key conflict must not become a successful committed prefix. The outer
+              // catch still confirms any earlier receipts before propagating the refusal.
+              if (error instanceof FabricIdempotencyKeyReusedError) throw error;
               // After append begins, success may be unknown. Stop rather than replay a
               // possibly complete event; a restarted bridge reconciles its committed IDs.
               if (outcome.appendStarted) throw new Error("Mesh batch publication outcome is uncertain; reconcile before retry", { cause: error });
@@ -1333,21 +1417,26 @@ export class EventLog {
     if (reserve && count <= limit) return count;
     const candidates = receipts.filter(name => !pending.has(name.slice(0, -".json".length))).map(name => {
       const file = path.join(directory, name);
+      // The judged receipt's identity, captured before its age is read (smarty-dev#8907).
+      const stat = fs.lstatSync(file);
       const event = JSON.parse(fs.readFileSync(file, "utf8")) as MeshEvent;
       if (typeof event.dedupeKey !== "string" || this.#dedupePath(event.dedupeKey, ".json") !== file ||
           typeof event.id !== "string" || !Number.isSafeInteger(event.sequence) ||
           !Number.isFinite(event.createdAt)) {
         throw new Error("Invalid event publication receipt");
       }
-      return { file, createdAt: event.createdAt, sequence: event.sequence };
+      return { file, stat, createdAt: event.createdAt, sequence: event.sequence };
     });
     candidates.sort((a, b) => a.createdAt - b.createdAt || a.sequence - b.sequence || a.file.localeCompare(b.file));
     const now = Date.now();
     try {
       for (const receipt of candidates) {
         if (now - receipt.createdAt < this.#dedupeReceiptTtlMs && count <= limit) break;
-        fs.rmSync(receipt.file, { force: true });
-        count--;
+        // A replaced or refreshed receipt is refused and still counts: admission fails closed.
+        // File-only (main's non-recursive rmSync); the names above are exact hex patterns, so verifiedRemove's
+        // `.retention-graveyard-<pid>` directory (and a refused entry left inside it) is never enumerated or counted.
+        if (receipt.stat.isFile() && verifiedRemove(receipt.file, receipt.stat, { deleter: "meshDedupeReceiptPrune",
+          fallback: () => { fs.rmSync(receipt.file, { force: true }); return true; } }).removed) count--;
       }
     } finally {
       // Persist removals once per pass, including any completed before a later unlink failed.
@@ -1424,6 +1513,32 @@ export class EventLog {
         if (found !== undefined) return found;
       }
       return this.#lastSequenceIn(descriptor, size, window, true) ?? 0;
+    } catch (error) {
+      if (errorCode(error) === "ENOENT") return 0;
+      throw error;
+    } finally {
+      if (descriptor !== undefined) fs.closeSync(descriptor);
+    }
+  }
+
+  /**
+   * The highest committed sequence: the last parsable line that ends in a newline. A line without
+   * its newline is an append in progress (or one a crash cut, which repair truncates), and the
+   * reservation counter is never read. Zero without a complete event line (smarty-dev#9313).
+   */
+  #readCommittedSequence(): number {
+    let descriptor: number | undefined;
+    try {
+      descriptor = fs.openSync(this.#eventsPath, "r");
+      const size = fs.fstatSync(descriptor).size;
+      if (size === 0) return 0;
+      const window = Math.min(size, this.maxEventBytes + 1);
+      const tail = Buffer.allocUnsafe(window);
+      fs.readSync(descriptor, tail, 0, window, size - window);
+      const newline = tail.lastIndexOf(0x0a);
+      if (newline < 0) return 0;
+      const complete = size - window + newline + 1;
+      return this.#lastSequenceIn(descriptor, complete, Math.min(complete, this.maxEventBytes + 2), true) ?? 0;
     } catch (error) {
       if (errorCode(error) === "ENOENT") return 0;
       throw error;

@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { windowsMeshCacheFixture } from "./windows-mesh-cache-fixture.js";
-// Deliberate VALUE import: the UNCHANGED local product-deletion detector excludes this hosted native suite.
+// Real packaged helper bootstrap; the explicit hosted predicate prevents local native execution.
 import { windowsHelperBootstrap } from "../src/storage/verified-remove.js";
 import { MeshLock } from "../src/mesh/mesh-lock.js";
 import { acquireMeshCustodyLock } from "../src/mesh/custody-lock.js";
@@ -326,13 +326,21 @@ describe.skipIf(!hosted)(`Windows T8 classic disposition / external sharing (${H
       if (rows[1]!.ok) assertAbsent(original.retired);
       else {
         expect(id(original.retired)).toEqual({ dev: before.directory.dev, ino: before.directory.ino });
-        expect(fs.readdirSync(original.retired)).toEqual([]); // no auto cleaner; failed empty-dir disposal leaves only empty T
+        expect(fs.readdirSync(original.retired)).toEqual([]); // failed classic disposition leaves only original empty T
       }
+      const afterClose = { retired: observation(original.retired), owner: observation(ownerPath) };
       assertProof(lock, successor); // complete UUID/pid/time and both exact ids after helper AND fixture close
+      const reconciled = releaseWindowsMeshLock(lock, a, cap);
+      if (rows[1]!.ok) expect(reconciled).toEqual({ outcome: "not-owner" });
+      else expect(reconciled).toMatchObject({ outcome: "released", cleanup: "clean", retiredPath: original.retired });
+      assertAbsent(original.retired); // bounded same-R recovery removes only the admissible original T
+      assertProof(lock, successor);
+      const children = samples.length;
       expect(releaseWindowsMeshLock(lock, a, cap)).toEqual({ outcome: "not-owner" });
+      expect(samples).toHaveLength(children); // successful cleanup leaves no receipt or further child to reconcile
       assertProof(lock, successor);
       note(`${base}-owner-classic-pending`, { access: held.ready, receipt, closed, dispositions: rows, during,
-        afterClose: { retired: observation(original.retired), owner: observation(ownerPath) }, classification: rows[1]!.ok ? "classic-last-close-clean" : "classic-owner-pending-then-empty-T" });
+        afterClose, reconciled, classification: rows[1]!.ok ? "classic-last-close-clean" : "classic-owner-pending-then-empty-T-reconciled" });
     }, TEST_DEADLINE_MS);
 
     it(`4/7 ${base}: compatible READ_ATTRIBUTES/SHARE_ALL directory handle opens after W4 and isolates pending T from B`, async () => {

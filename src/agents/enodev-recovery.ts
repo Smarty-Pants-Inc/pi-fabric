@@ -145,9 +145,12 @@ export const ownedProcess = (sessionId: unknown): OwnedProcess | undefined => {
  * alive with a different start time (reused). A live pid with no recorded birth is not proven gone.
  */
 export const ownedProcessGone = (owned: OwnedProcess): boolean => {
-  if (!processAlive(owned.pid)) return true;
+  if (!Number.isSafeInteger(owned.pid) || owned.pid <= 1 || owned.pid === process.pid) return false;
+  // EPERM and every other unknown probe are not proof of life OR death.
+  try { process.kill(owned.pid, 0); }
+  catch (error) { return (error as NodeJS.ErrnoException).code === "ESRCH"; }
   const current = processStartTime(owned.pid);
-  return owned.started !== undefined && current !== undefined && current !== owned.started;
+  return !!owned.started && !!current && current !== owned.started;
 };
 
 /** The worker's saved answer for run `directory` (its settlement.json receipt for exactly this run), else undefined. */

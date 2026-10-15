@@ -278,7 +278,9 @@ export interface AgentRunRecord {
    * (Pi's own window refusal, pi-ai isContextOverflow on the assistant message, or the activation
    * window's nonce-bound refusal frame), never from free error text.
    */
-  errorCode?: "RUNAWAY_TOOL_CALL_STREAM" | "PROCESS_LIVENESS_WATCH_FAILED" | "PROCESS_TREE_CUSTODY_UNCONFIRMED" | "CONTEXT_OVERFLOW";
+  errorCode?: "RUNAWAY_TOOL_CALL_STREAM" | "PROCESS_LIVENESS_WATCH_FAILED" | "PROCESS_TREE_CUSTODY_UNCONFIRMED" | "CONTEXT_OVERFLOW" | "WORKER_GONE";
+  /** Host-proven lost execution; the activation must never be replayed. */
+  settledLost?: boolean;
   /** Run diagnostics, including partial-report retention; warnings never override status. */
   warnings?: string[];
   stderr?: string;

@@ -238,7 +238,7 @@ interface ManagedActor {
   lastRunId?: string;
   /** Setup/admission is separate from a launched worker (smarty-dev#3167). */
   preparing?: { phase: string; startedAt: number; attempts: number; runId?: string; queuePosition?: number };
-  inFlightRun?: { id: string; startedAt: number };
+  inFlightRun?: { id: string; startedAt: number; silenceAlarmed?: boolean };
   /** Set by a removal that returned before its in-flight run ended; persisted, so a restart finishes it. */
   removal?: { requestedAt: number; runId?: string; runStartedAt?: number; operator?: true };
   lastError?: string;
@@ -4101,6 +4101,7 @@ export class ActorManager {
         let runId: string | undefined;
         const previousRunId = actor.lastRunId;
         let runCompleted = false;
+        let runLost = false;
         let enodevRecovered = false; // a saved answer handed back, not a run: nothing to protect from a repeat
         let enodevDelivered = false; // its durable delivery receipt is written; commit after the queue ack
         let handoffConsumed = false;
@@ -4236,6 +4237,24 @@ export class ActorManager {
           runCompleted = result.status === "completed";
           enodevRecovered = result.enodevRecovered === true;
           runStopped = result.status === "stopped";
+          runLost = result.errorCode === "WORKER_GONE";
+          if (runLost) {
+            // A lost activation may already have had effects. Consume it before
+            // ownership/cancellation handling can park it for another launch.
+            actor.lastRunId = result.id;
+            const reason = result.error ?? "Actor worker is gone; event lost (not replayed)";
+            actor.lastError = reason;
+            const failed: FabricActorMessage = {
+              id: randomUUID(), actorId: actor.id, actorName: actor.name, direction: "out",
+              source: item.source, createdAt: Date.now(), error: reason, runId: result.id,
+              data: { errorCode: "WORKER_GONE", settledLost: true, runId: result.id },
+            };
+            this.#recordMessage(this.#liveActor(actor), failed);
+            this.#runPermitNotice(actor, result.id, "worker-gone", Date.now() - result.startedAt);
+            item.reject?.(Object.assign(new Error(reason), { code: "WORKER_GONE" }));
+            if (!item.reject) item.resolve?.(structuredClone(failed));
+            continue;
+          }
           const cancelled = actor.cancelAbort === abortController;
           if (cancelled) delete actor.cancelAbort;
           // A caller hears the run's own outcome; an event without one is recorded dropped.
@@ -4448,7 +4467,7 @@ export class ActorManager {
             // the next owner run instead of lost (smarty-dev#442); one whose run already
             // completed is recorded, not rerun, so its side effects do not repeat.
             // A recovered ENODEV answer was never run here: park it, and the next owner recovers it (marker kept).
-            if (runCompleted && !enodevRecovered) this.#drop(actor, [item], message);
+            if (runLost || (runCompleted && !enodevRecovered)) this.#drop(actor, [item], message);
             else {
               // #912 round 4: a resumed item refused before any launch spends no restart attempt, so count the
               // refusals: from the cap on it loses its parked-queue exemption, and its owner hears it once.
@@ -5729,6 +5748,16 @@ export class ActorManager {
           (current.stoppedAt ?? current.updatedAt) === since; });
     }
     const run = actor.inFlightRun;
+    if (run && !run.silenceAlarmed) {
+      const progress = this.agents.admissionProgress(run.id);
+      const age = progress ? now - progress.lastProgressAt : 0;
+      // Existing retention watch only. Silence is not proof of death: the
+      // manager's owned handle/identity must still verify a living worker.
+      if (age > 20 * 60_000 && this.#runGone(run.id) === undefined) {
+        run.silenceAlarmed = true;
+        this.#runPermitNotice(actor, run.id, "worker-silent", age);
+      }
+    }
     if (run && now - run.startedAt > ACTOR_RUN_STUCK_MIN_MS) {
       const threshold = Math.max(ACTOR_RUN_STUCK_MIN_MS, 2 * (this.#p95RunMs(actor) ?? 0));
       const gone = now - run.startedAt > threshold ? this.#runGone(run.id) : undefined;
@@ -5741,6 +5770,22 @@ export class ActorManager {
     }
     const dropped = actor.eventsDropped;
     if (dropped) this.#alarmDroppedEvents(actor, dropped, now);
+  }
+
+  /** Unclaimed host notice: ResidentHost persists it for the actor owner's Main. */
+  #runPermitNotice(actor: ManagedActor, runId: string, reason: "worker-silent" | "worker-gone", ageMs: number): void {
+    const text = `Fabric host notice: actor ${actor.name} (${actor.id}), run ${runId}: ` +
+      (reason === "worker-gone" ? "worker is gone; activation failed/lost and will not be replayed. "
+        : "worker is alive but has made no progress; admission permit retained. ") +
+      `Age: ${Math.max(0, Math.floor(ageMs / 60_000))} min.`;
+    const notice: FabricActorMessage = {
+      id: randomUUID(), actorId: actor.id, actorName: actor.name, direction: "out", source: "fabric-host",
+      createdAt: Date.now(), action: "message", text, runId,
+      data: { actorId: actor.id, actorName: actor.name, ownerRoot: actor.rootId, runId, reason, ageMs },
+    };
+    this.#recordMessage(this.#liveActor(actor), notice);
+    try { this.onDeliver({ actor: this.#publicInfo(actor), message: notice, delivery: "followUp", triggerTurn: true }); }
+    catch { /* The actor's retained message still exposes the failed/lost or silent run. */ }
   }
 
   /** Why an in-flight run's worker is gone, or undefined while it can still be running. */

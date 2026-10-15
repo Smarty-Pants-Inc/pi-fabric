@@ -131,7 +131,7 @@ for (const domain of ["mesh", "custody"] as const) for (const protocol of [1, 2]
       expect(fs.existsSync(lock)).toBe(false);
       assertCapturedNative();
       if (domain === "mesh") {
-        const fence = `${lock}.dead.${createHash("sha256").update(`${directory.dev}:${directory.ino}:`).digest("hex")}`;
+        const fence = `${lock}.dead.${createHash("sha256").update(`${Number(directory.dev)}:${Number(directory.ino)}:`).digest("hex")}`;
         expect(fs.readdirSync(fence)).toEqual(["f"]); expect(fs.readFileSync(path.join(fence, "f"), "utf8")).toBe("1\n");
       }
     }, 30_000);
@@ -146,7 +146,7 @@ for (const domain of ["mesh", "custody"] as const) for (const protocol of [1, 2]
       const owner = await nodeOwner(protocol, true);
       const lock = lockAt(root, domain); fs.mkdirSync(lock); fs.writeFileSync(path.join(lock, "owner"), owner.record, { flag: "wx" });
       const initial = fs.lstatSync(lock, { bigint: true });
-      const fence = `${lock}.dead.${createHash("sha256").update(`${initial.dev}:${initial.ino}:${owner.record}`).digest("hex")}`;
+      const fence = `${lock}.dead.${createHash("sha256").update(`${Number(initial.dev)}:${Number(initial.ino)}:${owner.record}`).digest("hex")}`;
       const originalOwner = snapshot(path.join(lock, "owner"));
       expect(await publicAcquire(domain, root, protocol, () => "entered")).toBe("entered");
       assertCapturedNative("owner");

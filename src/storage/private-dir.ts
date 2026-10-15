@@ -2,6 +2,9 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { refuseSharedSticky, UnsafeDirectory } from "./private-dir-policy.js";
+
+export { refuseSharedSticky, UnsafeDirectory };
 
 /**
  * Private (0700) directories under any umask, reached only through trusted directories (smarty-dev#9016,
@@ -63,7 +66,6 @@ export const fdBase = (): string | undefined => {
   return found;
 };
 
-class UnsafeDirectory extends Error {}
 /** A directory we may pass or use: ours or root's; not group/other-writable unless root-owned and sticky. */
 const safeDirectory = (stat: fs.Stats, where: string): void => {
   const uid = process.getuid?.();
@@ -191,17 +193,12 @@ const openHeld = (target: string, anchor: string | undefined, base: string): Pri
  * allow is a root-owned sticky shared one (/tmp, /private/tmp), so this walk refuses to pass one (smarty-dev#9527,
  * option 3): Fabric's private trees belong under $HOME or the per-user $TMPDIR (/var/folders/...), whose ancestors
  * only root and our own uid can write (the accepted same-uid-or-root class, #7800). Linux uses the fd-pinned walk
- * (openHeld) and keeps accepting sticky ancestors.
+ * (openHeld) and keeps accepting sticky ancestors. The refusal itself (refuseSharedSticky) lives in private-dir-policy.ts.
  */
-const refuseSharedSticky = (stat: fs.Stats, walked: string, target: string): void => {
-  if (stat.uid === 0 && (stat.mode & 0o1000) !== 0 && (stat.mode & 0o022) !== 0) {
-    throw new UnsafeDirectory(`${walked} is a shared sticky directory (mode ${(stat.mode & 0o7777).toString(8)}): on this platform `
-      + `Fabric cannot keep ${target} private under it. Use a directory under $HOME or the per-user $TMPDIR (/var/folders/...), `
-      + "for example by setting TMPDIR or PI_FABRIC_TMPDIR (smarty-dev#9527)");
-  }
-};
 const openWalked = (target: string, anchor: string | undefined): PrivateDirectory => {
-  safeDirectory(fs.lstatSync("/"), "/");
+  const root = fs.lstatSync("/");
+  refuseSharedSticky(privateDirTestHooks.stat?.("/", root) ?? root, "/", target);
+  safeDirectory(root, "/");
   let fd = fs.openSync("/", NOFOLLOW_DIRECTORY);
   try {
     let walked = "/";

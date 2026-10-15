@@ -190,6 +190,16 @@ const containedByRoot = (candidate: string, cwd: string, roots: readonly string[
   return real !== undefined && roots.some(root => isInside(root, lexical)) && roots.some(root => isInside(root, real));
 };
 
+const writableDirectory = (candidate: string, cwd: string): boolean => {
+  // Match the child's native lookup, including relative paths and link/.. traversal.
+  const raw = path.isAbsolute(candidate) ? candidate : `${cwd}${path.sep}${candidate}`;
+  try {
+    if (!fs.statSync(raw).isDirectory()) return false;
+    fs.accessSync(raw, fs.constants.W_OK | fs.constants.X_OK);
+    return true;
+  } catch { return false; }
+};
+
 /**
  * A confined worker must not inherit a host temp directory. Keep an already
  * safe TMPDIR verbatim; otherwise make a private directory under the grant
@@ -212,8 +222,8 @@ const prepareTaskTemporaryDirectory = (
     return value;
   })();
   const inheritedTmpdir = environment.TMPDIR;
-  let temporary = optionTmpdir && containedByRoot(optionTmpdir, cwd, roots) ? optionTmpdir
-    : inheritedTmpdir && containedByRoot(inheritedTmpdir, cwd, roots) ? inheritedTmpdir
+  let temporary = optionTmpdir && containedByRoot(optionTmpdir, cwd, roots) && writableDirectory(optionTmpdir, cwd) ? optionTmpdir
+    : inheritedTmpdir && containedByRoot(inheritedTmpdir, cwd, roots) && writableDirectory(inheritedTmpdir, cwd) ? inheritedTmpdir
     : undefined;
   if (!temporary) {
     const realCwd = fs.realpathSync(cwd);
@@ -232,7 +242,8 @@ const prepareTaskTemporaryDirectory = (
   const childArguments = [...workerArguments];
   for (let index = 0; index < childArguments.length; index += 2) {
     if (childArguments[index] !== "--tmpdir") continue;
-    if (!childArguments[index + 1] || !containedByRoot(childArguments[index + 1]!, cwd, roots)) childArguments[index + 1] = temporary;
+    const candidate = childArguments[index + 1];
+    if (!candidate || !containedByRoot(candidate, cwd, roots) || !writableDirectory(candidate, cwd)) childArguments[index + 1] = temporary;
   }
   return { workerArguments: childArguments, environment: childEnvironment };
 };

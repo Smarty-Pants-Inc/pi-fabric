@@ -6,7 +6,9 @@ import { AgentManager } from "../src/agents/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 
-// Trust-boundary regression for smarty-dev#10544. Fixtures remain for inspection.
+// Trust-boundary regressions for smarty-dev#10544 / pi-fabric#1192: native
+// os.tmpdir()/mkdtemp and >50KiB spills must work without widening the grant.
+// Fixtures remain for inspection.
 const managers: AgentManager[] = [];
 afterEach(async () => {
   await Promise.all(managers.splice(0).map(manager => manager.close()));
@@ -36,6 +38,10 @@ import os from 'node:os';
 import path from 'node:path';
 const args = new Map();
 for (let i = 2; i < process.argv.length; i += 2) args.set(process.argv[i], process.argv[i + 1]);
+// Mirror worker.ts exporting --tmpdir to its execution child's environment.
+if (args.has('--tmpdir')) {
+  for (const key of ['TMPDIR', 'TMP', 'TEMP']) process.env[key] = args.get('--tmpdir');
+}
 const tmp = os.tmpdir();
 const output = fs.mkdtempSync(path.join(tmp, 'pi-output-'));
 const payload = path.join(output, 'payload.bin');
@@ -91,6 +97,53 @@ describe("native process task temporary directory containment", () => {
     expect(value.bytes).toBeGreaterThan(50 * 1024);
     expect(fs.statSync(value.payload).size).toBe(value.bytes);
     expect(fs.readdirSync(f.parentTemp)).toEqual([]);
+  });
+
+  it.each(["missing", "regular-file"] as const)("replaces %s in-root TMPDIR with usable private scratch", async kind => {
+    const f = fixture();
+    const callerTemp = path.join(f.scratch, "invalid-temp");
+    if (kind === "regular-file") fs.writeFileSync(callerTemp, "not a directory");
+    vi.stubEnv("TMPDIR", callerTemp);
+    const requestedRoots = [f.cwd, f.scratch];
+    const { value } = await report(f, { writableRoots: requestedRoots, shell: "unconfined" });
+
+    expect(value.tmp).not.toBe(callerTemp);
+    expect(value.tmp).not.toBe(f.scratch);
+    expect(inside(f.scratch, value.tmp)).toBe(true);
+    expect(fs.statSync(value.tmp).isDirectory()).toBe(true);
+    if (process.platform !== "win32") expect(fs.statSync(value.tmp).mode & 0o777).toBe(0o700);
+    expect(value.env).toEqual({ TMPDIR: value.tmp, TMP: value.tmp, TEMP: value.tmp });
+    expect(value.policy).toEqual({ readOnly: false, writableRoots: [...requestedRoots].sort(), shell: "unconfined" });
+    expect(inside(value.tmp, value.output)).toBe(true);
+    expect(value.bytes).toBeGreaterThan(50 * 1024);
+    expect(fs.statSync(value.payload).size).toBe(value.bytes);
+    expect(fs.readdirSync(f.parentTemp)).toEqual([]);
+  });
+
+  it.each(["missing", "regular-file"] as const)("replaces %s in-root --tmpdir before worker bootstrap", async kind => {
+    const f = fixture();
+    const optionTmpdir = path.join(f.scratch, "invalid-option-temp");
+    if (kind === "regular-file") fs.writeFileSync(optionTmpdir, "not a directory");
+    const nativeLaunch = ProcessTransport.prototype.launch;
+    // Inject at the receiver boundary, including retries, while retaining the real native transport.
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(function (this: ProcessTransport, request) {
+      return nativeLaunch.call(this, { ...request, workerArguments: [...request.workerArguments, "--tmpdir", optionTmpdir] });
+    });
+    try {
+      const requestedRoots = [f.cwd, f.scratch];
+      const { value } = await report(f, { writableRoots: requestedRoots, shell: "unconfined" });
+      expect(value.argTmpdir).toBe(value.tmp);
+      expect(value.tmp).not.toBe(optionTmpdir);
+      expect(value.tmp).not.toBe(f.scratch);
+      expect(inside(f.scratch, value.tmp)).toBe(true);
+      if (process.platform !== "win32") expect(fs.statSync(value.tmp).mode & 0o777).toBe(0o700);
+      expect(value.env).toEqual({ TMPDIR: value.tmp, TMP: value.tmp, TEMP: value.tmp });
+      expect(value.policy).toEqual({ readOnly: false, writableRoots: [...requestedRoots].sort(), shell: "unconfined" });
+      expect(inside(value.tmp, value.output)).toBe(true);
+      expect(value.bytes).toBeGreaterThan(50 * 1024);
+      expect(fs.statSync(value.payload).size).toBe(value.bytes);
+      expect(fs.readdirSync(f.parentTemp)).toEqual([]);
+    } finally { launch.mockRestore(); }
   });
 
   it.each(["equal", "inside"] as const)("preserves caller TMPDIR when it is %s an authorized root", async placement => {

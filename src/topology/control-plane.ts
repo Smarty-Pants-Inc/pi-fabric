@@ -12,7 +12,7 @@ import path from "node:path";
 import { mainExecutionCeilingAbortReason, withoutMainExecutionCeiling } from "../async-settlement.js";
 import type { FabricActorRunBinding, FabricActorBindingProvenance } from "../actors/types.js";
 import { MeshStore, meshOutageAlarmSink, type MeshEvent, type MeshIdentity } from "../mesh/store.js";
-import { MeshBackgroundQueue, MeshBackgroundRetry } from "../core/atomic-write.js";
+import { MeshBackgroundQueue, MeshBackgroundRetry, isMeshWriteDeferred } from "../core/atomic-write.js";
 import { rethrowMeshLockTimeout } from "../core/atomic-write.js";
 import { MeshConsumptionPausedError, assertMeshConsumption } from "./mesh-consumption.js";
 import { isWatchLimitError } from "../core/watch-fallback.js";
@@ -168,6 +168,8 @@ export interface FabricControlAcceptance {
   triggered?: boolean;
   /** Main held a requested wake; includes the provider retry deadline when applicable. */
   reason?: string;
+  /** Main is held by an operator halt; the exact code survives control ACKs. */
+  halted?: true;
   /** The owner's followUp queue for a Main target (smarty-dev#1495). */
   pendingFollowUps?: number;
   oldestAgeS?: number;
@@ -203,6 +205,7 @@ export interface FabricControlResult {
   triggered?: boolean;
   /** Main held a requested wake; includes the provider retry deadline when applicable. */
   reason?: string;
+  halted?: true;
   pendingFollowUps?: number;
   oldestAgeS?: number;
   stalled?: true;
@@ -229,6 +232,10 @@ const triggeredOf = (source: Record<string, unknown>): { triggered: boolean; rea
     ...(source.triggered === false && typeof source.reason === "string" && source.reason.length <= 200
       ? { reason: source.reason } : {}),
   } : undefined;
+
+const haltedOf = (source: Record<string, unknown>): { halted: true; reason: "operator-halt" } | undefined =>
+  source.halted === true && source.reason === "operator-halt"
+    ? { halted: true, reason: "operator-halt" } : undefined;
 
 /** The owner's coalesce report for a Main followUp (smarty-dev#1495), or nothing. */
 const coalescedOf = (source: Record<string, unknown>): { coalesced: true; replacedMessageId: string } | undefined =>
@@ -769,6 +776,7 @@ export class FabricControlPlane {
       ...coalescedOf(acceptance as unknown as Record<string, unknown>),
       ...runningTaskWarningOf(acceptance as unknown as Record<string, unknown>, targetId),
       ...triggeredOf(acceptance as unknown as Record<string, unknown>),
+      ...haltedOf(acceptance as unknown as Record<string, unknown>),
     };
   }
 
@@ -1696,6 +1704,7 @@ export class FabricControlPlane {
       ...coalescedOf(data),
       ...runningTaskWarningOf(data, pending.targetId),
       ...triggeredOf(data),
+      ...haltedOf(data),
       ...(Object.prototype.hasOwnProperty.call(data, "result") ? { result: data.result } : {}),
       ...(typeof data.error === "string" ? { error: data.error } : {}),
       ...(data.accepted === false && data.errorCode === CONTROL_STALE_INCARNATION
@@ -1813,7 +1822,7 @@ export class FabricControlPlane {
           }, true);
           acceptance = expired;
         } catch (error) {
-          if (isLockTimeout(error) || error instanceof MeshConsumptionPausedError) throw error;
+          if (isMeshWriteDeferred(error) || isLockTimeout(error) || error instanceof MeshConsumptionPausedError) throw error;
           const raced = ownRecord(controlSeenRecord(this.mesh.get(key, { fresh: true })?.value));
           acceptance = raced?.acceptance ?? indeterminate;
           outcomeIncarnation = raced?.ownerIncarnation ?? null;
@@ -1859,7 +1868,7 @@ export class FabricControlPlane {
         ifVersion: 0,
       }, true);
     } catch (error) {
-      if (isLockTimeout(error) || error instanceof MeshConsumptionPausedError) throw error;
+      if (isMeshWriteDeferred(error) || isLockTimeout(error) || error instanceof MeshConsumptionPausedError) throw error;
       this.#sharedClaims.delete(key);
       const raced = this.#seenRecord(key);
       if (
@@ -2005,18 +2014,25 @@ export class FabricControlPlane {
         if (!owned.saved) { await saveOutcome(); owned.saved = true; }
       } catch (error) {
         if (error instanceof MeshConsumptionPausedError) throw error;
-        this.#releasePublicationFailed = true;
+        const deferred = isMeshWriteDeferred(error) || isLockTimeout(error);
+        if (!deferred) this.#releasePublicationFailed = true;
         // A conflict belongs to another owner; a timeout wrote nothing. Preserve the actual
         // result under the original version fence and retry it without running the handler.
-        if (!isLockTimeout(error)) { this.#ownedCommands.delete(key); return; }
+        if (!deferred) { this.#ownedCommands.delete(key); return; }
         throw error; // the owned outcome is retried by the next confirmed drain
       }
       try {
         await this.#publishAcknowledgement(command, acceptance);
         this.#ownedCommands.delete(key);
       } catch (error) {
-        if (!(error instanceof MeshConsumptionPausedError)) this.#releasePublicationFailed = true;
-        throw error; // preserve the already-owned result, including detached asks
+        const deferred = isMeshWriteDeferred(error) || isLockTimeout(error) || error instanceof MeshConsumptionPausedError;
+        if (!deferred) {
+          this.#releasePublicationFailed = true;
+          // An indeterminate permanent ACK must not hot-loop or re-run a completed handler.
+          // A later duplicate command can retry the durable outcome under its own event.
+          this.#ownedCommands.delete(key);
+        }
+        throw error; // preserve known no-write outcomes for bounded retry
       }
     } catch (error) {
       if (error instanceof MeshConsumptionPausedError && owned.acceptance && !owned.saved) {
@@ -2151,8 +2167,7 @@ export class FabricControlPlane {
     // null explicitly attests that this command arrived without an epoch.
     staleIncarnation?: string | null,
   ): Promise<void> {
-    await this.mesh
-      .publish({
+    await this.mesh.publish({
         topic: ACK_TOPIC,
         kind: acceptance.accepted ? "accepted" : "rejected",
         from: this.identity,
@@ -2171,6 +2186,7 @@ export class FabricControlPlane {
           ...coalescedOf(acceptance as unknown as Record<string, unknown>),
           ...runningTaskWarningOf(acceptance as unknown as Record<string, unknown>, command.targetId),
           ...triggeredOf(acceptance as unknown as Record<string, unknown>),
+          ...haltedOf(acceptance as unknown as Record<string, unknown>),
           ...(Object.prototype.hasOwnProperty.call(acceptance, "result")
             ? { result: acceptance.result }
             : {}),
@@ -2183,10 +2199,14 @@ export class FabricControlPlane {
         },
       })
       .catch((error: unknown) => {
-        // A lock timeout published nothing: the caller retries it (smarty-dev#424).
+        // Known no-write refusals published nothing: the caller retains and retries them
+        // (smarty-dev#424). Other failures are indeterminate and fail closed at release.
+        if (isMeshWriteDeferred(error) || isLockTimeout(error) || error instanceof MeshConsumptionPausedError) throw error;
         this.#releasePublicationFailed = true;
         throw error;
       });
+    // Never clear #releasePublicationFailed here: one success cannot reconcile earlier unknown
+    // obligations. A retained known no-write outcome settles via #ownedCommands instead.
     // An ACK this host addressed to itself is consumed by its own drain, not its own watcher.
     if (command.replyTo === this.options.hostId) this.#wake();
   }

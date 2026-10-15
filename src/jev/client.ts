@@ -5,7 +5,7 @@ import { runAbortable } from "../async-settlement.js";
 import type { FabricJevConfig } from "./config.js";
 import type { JevRequest, JevResponse } from "./types.js";
 import { JEV_TYPESAFE_ROUTE, resolveJevUpstreamModel, type JevRoute } from "./routes.js";
-import { checkRequest, checkResponse, jsonText } from "./validation.js";
+import { checkRequest, checkResponse, jsonText, JevInvalidResponseError, JevTransientHttpError, JEV_TRANSIENT_HTTP_STATUSES, reportedUsage } from "./validation.js";
 import { createGatewaySocketTransport, JevGatewayError, type JevGatewayTransport } from "./gateway-transport.js";
 
 /** The only gateway uses Fabric may spend over jev.gatewaySocket. Every other Jev client (provider, programs,
@@ -232,15 +232,26 @@ export class JevClient {
       throw new Error(timedSignal.aborted ? "Jev request cancelled or timed out" : "Jev network request failed");
     }
     if (!response.ok) {
-      await response.body?.cancel();
       // No automatic retry: the controller decides whether a delayed decision is still useful.
-      throw new Error(`${this.route.label} HTTP ${response.status}${[429, 529].includes(response.status) ? ": rate limited; back off before retrying" : ""}`);
+      const message = `${this.route.label} HTTP ${response.status}${[429, 529].includes(response.status) ? ": rate limited; back off before retrying" : ""}`;
+      if (!JEV_TRANSIENT_HTTP_STATUSES.includes(response.status)) {
+        await response.body?.cancel();
+        throw new Error(message);
+      }
+      // A transient status is a billed retry only at the body's validated
+      // reported usage. Without it the cost is unknown (output may have been
+      // charged), so a plain Error closes inference. The body is never surfaced.
+      const retryAfterMs = retryAfter(response.headers);
+      const reported = reportedUsage(await readErrorBody(response, timedSignal));
+      if (timedSignal.aborted) throw new Error("Jev response cancelled or timed out");
+      if (!reported) throw new Error(message);
+      throw new JevTransientHttpError(retryAfterMs === undefined ? message : `${message} (retry after ${retryAfterMs} ms)`,
+        reported, response.status, retryAfterMs);
     }
     const reader = response.body?.getReader();
     if (!reader) throw new Error(`${this.route.label} returned an empty response`);
     const chunks: Uint8Array[] = [];
     let bytes = 0;
-    let parsed: unknown;
     try {
       for (;;) {
         const { value, done } = await runAbortable(timedSignal, () => reader.read());
@@ -249,18 +260,12 @@ export class JevClient {
         if (bytes > 1_048_576) throw new Error("oversize");
         chunks.push(value);
       }
-      parsed = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-      return checkResponse(parsed, request);
-    } catch {
-      const error = new Error(timedSignal.aborted ? "Jev response cancelled or timed out" : `${this.route.label} returned an invalid or oversized typed response`);
-      // A malformed answer was still billed: keep the reported usage so the caller
-      // can account it instead of treating the spend as unknown.
-      const usage = (parsed as { usage?: { input_tokens?: unknown; output_tokens?: unknown } } | undefined)?.usage;
-      if (usage && Number.isSafeInteger(usage.input_tokens) && Number.isSafeInteger(usage.output_tokens) &&
-          (usage.input_tokens as number) >= 0 && (usage.output_tokens as number) >= 0) {
-        Object.assign(error, { jevUsage: { input: usage.input_tokens as number, output: usage.output_tokens as number } });
-      }
-      throw error;
+      return checkResponse(JSON.parse(Buffer.concat(chunks).toString("utf8")), request);
+    } catch (error) {
+      if (timedSignal.aborted) throw new Error("Jev response cancelled or timed out");
+      const message = `${this.route.label} returned an invalid or oversized typed response`;
+      // Keep well-formed reported usage so the caller can bill a malformed answer.
+      throw error instanceof JevInvalidResponseError ? new JevInvalidResponseError(message, error.usage) : new Error(message);
     } finally { await reader.cancel().catch(() => undefined); }
   }
   /** The gateway owns the key, the budget and the meter; Fabric sends the exact typed body and reads
@@ -305,4 +310,34 @@ export class JevClient {
     await this.credentials.drainCommands();
   }
   close(): void { this.credentials.clear(); }
+}
+
+const MAX_ERROR_BODY_BYTES = 65_536;
+/** Parsed JSON of a bounded error body, or undefined when unreadable, oversized or not JSON. */
+async function readErrorBody(response: Response, signal: AbortSignal): Promise<unknown> {
+  const reader = response.body?.getReader();
+  if (!reader) return undefined;
+  const chunks: Uint8Array[] = [];
+  let bytes = 0;
+  try {
+    for (;;) {
+      const { value, done } = await runAbortable(signal, () => reader.read());
+      if (done) break;
+      bytes += value.byteLength;
+      if (bytes > MAX_ERROR_BODY_BYTES) return undefined;
+      chunks.push(value);
+    }
+    return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+  } catch {
+    return undefined;
+  } finally { await reader.cancel().catch(() => undefined); }
+}
+
+/** `retry-after-ms`, then `retry-after` seconds or HTTP date, as whole milliseconds up to one day. */
+function retryAfter(headers: Headers): number | undefined {
+  const exact = headers.get("retry-after-ms"), coarse = headers.get("retry-after");
+  let ms = exact !== null && exact.trim() !== "" ? Number(exact) : Number.NaN;
+  if (!Number.isFinite(ms) && coarse !== null && coarse.trim() !== "")
+    ms = /^\s*\d+(?:\.\d+)?\s*$/.test(coarse) ? Number(coarse) * 1000 : Date.parse(coarse) - Date.now();
+  return Number.isFinite(ms) ? Math.min(86_400_000, Math.max(0, Math.ceil(ms))) : undefined;
 }

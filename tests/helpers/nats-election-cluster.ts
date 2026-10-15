@@ -2,8 +2,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
-
-const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+import { waitForNatsCluster } from "../../scripts/nats-cluster-readiness.mjs";
 const reservePorts = async (count: number): Promise<{ ports: number[]; release(): Promise<void> }> => {
   const servers: net.Server[] = [];
   try {
@@ -120,35 +119,22 @@ export const startNatsElectionCluster = async (binary: string): Promise<NatsElec
       child.once("error", error => { stderr += `\n${error.message}`; });
       (child as ChildProcess & { electionStderr?: () => string }).electionStderr = () => stderr;
     }
-    const readyUntil = Date.now() + 30_000;
-    let ready = false;
-    let agreedLeader: string | undefined;
-    let lastError = "not yet ready";
-    while (!ready && Date.now() < readyUntil) {
-      try {
-        const states = await Promise.all(nodes.map(async node => {
-          if (node.child.exitCode !== null || node.child.signalCode !== null) throw new Error(`${node.name} exited: ${node.child.exitCode ?? node.child.signalCode}; ${(node.child as ChildProcess & { electionStderr?: () => string }).electionStderr?.() ?? ""}`);
-          const [health, routes, varz, jsz] = await Promise.all([
-            fetch(`${node.monitorUrl}/healthz`, { signal: AbortSignal.timeout(1_000) }),
-            json(`${node.monitorUrl}/routez`), json(`${node.monitorUrl}/varz`), json(`${node.monitorUrl}/jsz?raft=true`),
-          ]);
-          if (!health.ok || routes.num_routes < 2) throw new Error(`${node.name} not healthy/routed: health=${health.status}, routes=${JSON.stringify(routes)}`);
-          if (varz.jetstream?.config?.sync_always !== true) throw new Error(`${node.name} is not sync_always: ${JSON.stringify(varz.jetstream?.config)}`);
-          const leader = jsz.meta_cluster?.leader;
-          const id = varz.server_id;
-          if (typeof leader !== "string" || !leader || typeof id !== "string" || !id) throw new Error(`${node.name} has no visible metadata leader: ${JSON.stringify(jsz.meta_cluster)}`);
-          return { node, leader, id };
-        }));
-        const leaders = new Set(states.map(state => state.leader));
-        if (leaders.size === 1 && states.every(state => states.some(candidate => candidate.node.name === state.leader || candidate.id === state.leader))) {
-          for (const state of states) state.node.metaId = state.id;
-          agreedLeader = states[0]!.leader;
-          ready = true;
-        } else lastError = `nodes disagree on metadata leader: ${JSON.stringify(states.map(state => ({ name: state.node.name, leader: state.leader, id: state.id })))}`;
-      } catch (error) { lastError = error instanceof Error ? error.message : String(error); }
-      if (!ready) await sleep(200);
+    let readiness;
+    try {
+      readiness = await waitForNatsCluster(nodes.map(node => ({ name: node.name, monitorUrl: node.monitorUrl })));
+    } catch (error) {
+      const childDiagnostics = nodes.map(node => {
+        const child = node.child as ChildProcess & { electionStderr?: () => string };
+        return `${node.name} child pid=${child.pid ?? "unknown"} exit=${child.exitCode ?? child.signalCode ?? "running"} stderr:\n${child.electionStderr?.() ?? "(no stderr captured)"}`;
+      }).join("\n");
+      const readinessMessage = error instanceof Error ? error.message : String(error);
+      throw new Error(`three-node NATS readiness failed:\n${readinessMessage}\n\nPer-node fixture child diagnostics:\n${childDiagnostics}`);
     }
-    if (!ready) throw new Error(`three-node NATS readiness deadline: ${lastError}`);
+    for (const state of readiness.nodes) {
+      const node = nodes.find(candidate => candidate.name === state.name);
+      if (node) node.metaId = state.serverId;
+    }
+    const agreedLeader = readiness.metaLeader!;
     let seed = nodes.find(node => node.name !== agreedLeader && nodes.some(candidate => candidate.name === agreedLeader || candidate.metaId === agreedLeader))!;
     let seedUrl = seed.clientUrl;
     let seedMonitorUrl = seed.monitorUrl;

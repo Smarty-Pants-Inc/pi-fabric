@@ -90,6 +90,8 @@ Requires Node.js 24+ and Pi 1.0.0+. Monty's optional native package installs on 
 pi install npm:pi-fabric
 ```
 
+Fabric bundles the [Coral Bricks provider](docs/configuration.md#bundled-coral-bricks-provider): run `/login coralbricks` to use `coralbricks/*` models, or opt out with a package filter. Fabric's maintainers work at Coral Bricks.
+
 <details>
 <summary>Other install methods</summary>
 

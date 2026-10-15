@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { JevClient, JevCredentials } from "../src/jev/client.js";
 import { DEFAULT_JEV_CONFIG, normalizeJevConfig } from "../src/jev/config.js";
 import { JEV_OPENROUTER_ROUTE, JEV_TYPESAFE_ROUTE, JEV_VERCEL_ROUTE } from "../src/jev/routes.js";
-import { checkRequest, checkResponse, checkSchema, checkValue } from "../src/jev/validation.js";
+import { checkRequest, checkResponse, checkSchema, checkValue, JevBilledError, JevInvalidResponseError, JevTransientHttpError } from "../src/jev/validation.js";
 import type { JevRequest } from "../src/jev/types.js";
 const request: JevRequest = { state:{text:"Please refund this charge"}, questions:{route:{type:"choice",instructions:"Which team handles this?",criteria:{billing:null,other:null}}, yes:{type:"noul",instructions:"Is a refund requested?"}, score:{type:"score",instructions:"How urgent is the request?",criteria:["No urgency", "Explicit immediate deadline"]}} };
 const response = { model:"jev-latest", answers:{route:{type:"choice",choice:"billing",confidence:1,probabilities:{billing:1,other:0}},yes:{type:"noul",noul:0.98},score:{type:"score",score:0.1,confidence:0.9,probabilities:{"0":0.9,"1":0.1},legend:{"0":"No urgency","1":"Explicit immediate deadline"}}},usage:{input_tokens:30,output_tokens:10} };
@@ -38,6 +38,44 @@ describe("Jev transport and credentials", () => {
     expect(fetcher).toHaveBeenCalledTimes(1);
     const fail = new JevClient(DEFAULT_JEV_CONFIG, (async () => { throw new Error("FAKE_SECRET"); }) as typeof fetch, new JevCredentials([], { TYPESAFE_API_KEY:"test-key" }));
     await expect(fail.evaluate(request, signal())).rejects.toThrow(/^Jev network request failed$/);
+  });
+  it("classifies only received transient HTTP statuses with validated usage as billed retries", async () => {
+    const rejection = async (reply: Response) => {
+      let sent = "";
+      const client = new JevClient(DEFAULT_JEV_CONFIG, (async (_url: string, init: { body: string }) => { sent = init.body; return reply; }) as unknown as typeof fetch, new JevCredentials([], { TYPESAFE_API_KEY:"test-key" }));
+      return { error: await client.evaluate(request, signal()).catch((error: unknown) => error), bytes: Buffer.byteLength(sent) };
+    };
+    const unknownCost = (error: unknown) => {
+      expect(error).toBeInstanceOf(Error); expect(error).not.toBeInstanceOf(JevBilledError);
+      expect(error).not.toHaveProperty("usage");
+    };
+    for (const status of [408, 429, 500, 502, 503, 504, 529]) {
+      const { error } = await rejection(new Response(JSON.stringify({ secret: "FAKE_SECRET", usage: { input_tokens: 5, output_tokens: 2 } }), { status }));
+      expect(error).toBeInstanceOf(JevTransientHttpError);
+      expect(error).toMatchObject({ status, usage: { input_tokens: 5, output_tokens: 2 }, guestFields: { status } });
+      expect((error as Error).message).not.toContain("FAKE_SECRET");
+      // Missing usage is unknown cost: never invented from request bytes.
+      const missing = await rejection(new Response("FAKE_SECRET", { status }));
+      unknownCost(missing.error);
+      expect((missing.error as Error).message).not.toContain("FAKE_SECRET");
+    }
+    for (const status of [400, 401, 403, 404, 409, 422]) {
+      const { error } = await rejection(new Response(JSON.stringify({ usage: { input_tokens: 1, output_tokens: 1 } }), { status }));
+      expect(error).toBeInstanceOf(Error); expect(error).not.toBeInstanceOf(JevTransientHttpError);
+    }
+    const reported = await rejection(new Response(JSON.stringify({ usage: { input_tokens: 4, output_tokens: 1 } }), { status: 502, headers: { "retry-after-ms": "1500.2", "retry-after": "9" } }));
+    expect(reported.error).toMatchObject({ usage: { input_tokens: 4, output_tokens: 1 }, retryAfterMs: 1501, guestFields: { status: 502, retryAfterMs: 1501 } });
+    const invalid = await rejection(new Response(JSON.stringify({ usage: { input_tokens: -4, output_tokens: 1 } }), { status: 503, headers: { "retry-after": "soon" } }));
+    unknownCost(invalid.error);
+    expect((invalid.error as Error).message).toBe("TypeSafe HTTP 503");
+    for (const usage of [{ input_tokens: 1 }, { input_tokens: 1.5, output_tokens: 0 }, { input_tokens: "1", output_tokens: 0 }, null])
+      unknownCost((await rejection(new Response(JSON.stringify({ usage }), { status: 500 }))).error);
+    // An oversized body is not read past the bound and its usage is not trusted.
+    unknownCost((await rejection(new Response(JSON.stringify({ usage: { input_tokens: 1, output_tokens: 1 }, pad: "x".repeat(70_000) }), { status: 502 }))).error);
+    const noRetryAfter = await rejection(new Response(JSON.stringify({ usage: { input_tokens: 2, output_tokens: 0 } }), { status: 503, headers: { "retry-after": "soon" } }));
+    expect(noRetryAfter.error).toMatchObject({ usage: { input_tokens: 2, output_tokens: 0 }, retryAfterMs: undefined, guestFields: { status: 503 } });
+    const dated = await rejection(new Response(JSON.stringify({ usage: { input_tokens: 1, output_tokens: 0 } }), { status: 429, headers: { "retry-after": new Date(Date.now() + 60_000).toUTCString() } }));
+    expect((dated.error as JevTransientHttpError).retryAfterMs).toBeGreaterThan(50_000);
   });
   it("bounds a fetch that does not cooperate with cancellation", async () => {
     const client=new JevClient({...DEFAULT_JEV_CONFIG,requestTimeoutMs:20},(()=>new Promise<Response>(()=>{})) as typeof fetch,new JevCredentials([],{TYPESAFE_API_KEY:"fake"}));
@@ -93,6 +131,19 @@ describe("Jev transport and credentials", () => {
     const controller = new AbortController(); controller.abort();
     await expect(client.evaluate(request,controller.signal)).rejects.toThrow(); expect(fetcher).not.toHaveBeenCalled();
     await expect(client.evaluate(request,signal())).rejects.toThrow("oversized");
+    await expect(client.evaluate(request,signal())).rejects.not.toBeInstanceOf(JevInvalidResponseError);
+  });
+  it("keeps only well-formed reported usage when rejecting a malformed answer", async () => {
+    const malformed = { ...response, answers: { ...response.answers, yes: { type: "noul", noul: 2 } } };
+    const client = new JevClient(DEFAULT_JEV_CONFIG, (async () => new Response(JSON.stringify(malformed))) as unknown as typeof fetch, new JevCredentials([], { TYPESAFE_API_KEY:"test-key" }));
+    const rejected = await client.evaluate(request, signal()).catch((error: unknown) => error);
+    expect(rejected).toBeInstanceOf(JevInvalidResponseError);
+    expect(rejected).toMatchObject({ message: "TypeSafe returned an invalid or oversized typed response", usage: { input_tokens: 30, output_tokens: 10 } });
+    expect(rejected).not.toHaveProperty("answers");
+    for (const usage of [{ input_tokens: -1, output_tokens: 10 }, undefined]) {
+      const unknown = (() => { try { return checkResponse({ ...malformed, usage }, request); } catch (error) { return error; } })();
+      expect(unknown).toBeInstanceOf(Error); expect(unknown).not.toBeInstanceOf(JevInvalidResponseError);
+    }
   });
 });
 describe("Jev validation", () => {

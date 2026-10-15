@@ -8,6 +8,7 @@ import { cancellationError, preserveCancellationOutcome, runAbortable, settleWit
 import { piBashExitMetadata } from "../core/pi-bash-error.js";
 import { FabricModelDeniedError } from "../core/model-policy.js";
 import { FabricTargetTerminalError } from "../agents/terminal-target.js";
+import { JevTransientHttpError } from "../jev/validation.js";
 import { PI_ARGUMENT_NORMALIZATION_SOURCE } from "../core/pi-arguments.js";
 import { PI_CORE_TOOL_NAMES } from "../core/pi-tools.js";
 import { HumanWaitDeadlinePause } from "./deadline-pause.js";
@@ -49,6 +50,7 @@ const GUEST_FABRIC_ERROR_NAMES: Readonly<Record<string, string>> = Object.freeze
   FABRIC_INTERRUPT_RATE_LIMITED: "FabricInterruptRateLimitedError",
   FABRIC_PARTICIPANT_STALE: "FabricParticipantStaleError",
   FABRIC_PARTICIPANT_NOT_YET_MIRRORED: "FabricParticipantNotYetMirroredError",
+  FABRIC_PEER_LEASE_STALE: "FabricPeerLeaseStaleError",
   FABRIC_PARTICIPANT_NON_INTERACTIVE: "FabricParticipantNonInteractiveError",
   FABRIC_TASK_ESCALATION_TARGET_DENIED: "TaskEscalationTargetError",
   FABRIC_PROJECT_AGENT_UNRESOLVED: "FabricProjectAgentUnresolvedError",
@@ -1227,6 +1229,18 @@ export class QuickJsRuntime {
                     metadata.dispose();
                   }
                 }
+                // Only the trusted Jev transient HTTP error may expose numeric
+                // status/retryAfterMs. They never replace vetted metadata: each
+                // key is still assigned once.
+                for (const [key, value] of trustedJevErrorFields(error)) {
+                  if (safeMetadata && Object.hasOwn(safeMetadata, key)) continue;
+                  const field = context.newNumber(value);
+                  try {
+                    context.setProp(errorHandle, key, field);
+                  } finally {
+                    field.dispose();
+                  }
+                }
                 promise.reject(errorHandle);
               } finally {
                 errorHandle.dispose();
@@ -1482,4 +1496,21 @@ export class QuickJsRuntime {
       disposeQuickJsContext(context);
     }
   }
+}
+
+/**
+ * Numeric HTTP metadata from the trusted Jev transient error class only.
+ * Arbitrary host errors (including a `guestFields` map) never set numeric
+ * fields. Reads own data-property descriptors, so no accessor is invoked.
+ */
+function trustedJevErrorFields(error: unknown): Array<[string, number]> {
+  if (!(error instanceof JevTransientHttpError)) return [];
+  const fields: Array<[string, number]> = [];
+  for (const key of ["status", "retryAfterMs"] as const) {
+    const descriptor = Object.getOwnPropertyDescriptor(error, key);
+    if (!descriptor || !("value" in descriptor)) continue;
+    const value: unknown = descriptor.value;
+    if (typeof value === "number" && Number.isFinite(value)) fields.push([key, value]);
+  }
+  return fields;
 }

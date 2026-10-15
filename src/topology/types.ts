@@ -177,8 +177,9 @@ export interface FabricParticipantSource {
   writeStalled?(now?: number): Error | undefined;
   /** Why a negative routing lookup is not authoritative (unjoined, overdue or failed view). */
   routingUnavailable?(now?: number): string | undefined;
-  /** Wait for a briefly late native lease using only its file; false means too old/ended. */
-  resolveRoutingLease?(id: string): Promise<boolean>;
+  /** Wait for a briefly late native lease (file) or remote mirror (notifications).
+   * false means too old/ended; signal cancels a mirror wait with its exact reason. */
+  resolveRoutingLease?(id: string, signal?: AbortSignal): Promise<boolean>;
   /** Bound retained-root delivery by routing grace, never by lineage absence alone. */
   retainedRouteAllowed?(id: string): boolean;
   /** One short, lock-bounded canonical read; does not renew or confirm a host lease. */

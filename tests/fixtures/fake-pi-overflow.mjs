@@ -9,6 +9,9 @@
 // Round 3: SILENT_OVERFLOW answers "stop" with usage above the window (pi-ai isContextOverflow case 2;
 // Pi keeps such an answer without retrying). TOOL_THEN_OVERFLOW_ON_HISTORY runs one side-effecting
 // tool (logged to FAKE_PI_LOG.tools) and then overflows on the next model turn of a carried session.
+// STREAM_DISCONNECT_ONCE emits one provider-style incomplete-stream error, then succeeds on the
+// next marker attempt. Its first/next contract is keyed by FAKE_PI_LOG, not native history, so
+// a manager retry can prove that the worker did not persist a stale CONTEXT_OVERFLOW code.
 import fs from "node:fs";
 import { randomUUID } from "node:crypto";
 import { StringDecoder } from "node:string_decoder";
@@ -17,6 +20,7 @@ import { pathToFileURL } from "node:url";
 const WINDOW = 272_000;
 const OVERFLOW = "Context exceeds window: estimated 272511 input tokens, window 272000";
 const PROVIDER_OVERFLOW = "prompt is too long: 280000 tokens > 272000 maximum";
+const STREAM_DISCONNECT = "cliproxyapi/gpt-6-luna: stream error: stream disconnected before completion: stream closed before response.completed";
 const QUOTED = 'Tool "read" failed: the log line says "Context exceeds window: estimated 272511 input tokens, window 272000"';
 const args = process.argv.slice(2);
 const arg = (name) => (args.includes(name) ? args[args.indexOf(name) + 1] : undefined);
@@ -76,6 +80,10 @@ process.stdin.on("data", async (chunk) => {
       // can still read the registered durable journal; exercise that final payload.
       const journal = entries(activation ? process.env.PI_FABRIC_ACTOR_SESSION_FILE : sessionFile);
       const history = journal.some((entry) => entry.type === "message");
+      const priorMarkers = process.env.FAKE_PI_LOG && fs.existsSync(process.env.FAKE_PI_LOG)
+        ? fs.readFileSync(process.env.FAKE_PI_LOG, "utf8").split("\n").filter(Boolean)
+          .filter((line) => line.includes('"marker":"STREAM_DISCONNECT_ONCE"')).length : 0;
+      const streamDisconnect = task.includes("STREAM_DISCONNECT_ONCE") && priorMarkers === 0;
       const providerOverflow = task.includes("PROVIDER_OVERFLOW_ON_HISTORY") && history;
       const quoted = task.includes("QUOTED_PHRASE");
       const silent = task.includes("SILENT_OVERFLOW");
@@ -86,7 +94,7 @@ process.stdin.on("data", async (chunk) => {
       if (process.env.FAKE_PI_LOG) {
         fs.appendFileSync(process.env.FAKE_PI_LOG, JSON.stringify({
           history, overflow, session: journal.find((entry) => entry.type === "session")?.id,
-          marker: (task.match(/\b(?:PREFLIGHT_ALWAYS|PREFLIGHT_ON_HISTORY|OVERFLOW_ALWAYS|PROVIDER_OVERFLOW_ON_HISTORY|TOOL_THEN_OVERFLOW_ON_HISTORY|OVERFLOW_ON_HISTORY|SILENT_OVERFLOW|QUOTED_PHRASE|FILL_CONTEXT_85|FILL_CONTEXT|[A-Z]+_REVIEW)\b/g) ?? []).join(","),
+          marker: (task.match(/\b(?:PREFLIGHT_ALWAYS|PREFLIGHT_ON_HISTORY|OVERFLOW_ALWAYS|PROVIDER_OVERFLOW_ON_HISTORY|TOOL_THEN_OVERFLOW_ON_HISTORY|OVERFLOW_ON_HISTORY|SILENT_OVERFLOW|STREAM_DISCONNECT_ONCE|QUOTED_PHRASE|FILL_CONTEXT_85|FILL_CONTEXT|[A-Z]+_REVIEW)\b/g) ?? []).join(","),
         }) + "\n");
       }
       append({ role: "user", content: task, timestamp: Date.now() });
@@ -137,15 +145,15 @@ process.stdin.on("data", async (chunk) => {
         emit({ type: "agent_settled", outcome: "error" });
         continue;
       }
-      if ((overflow && !preflight) || quoted) {
+      if (streamDisconnect || (overflow && !preflight) || quoted) {
         const message = { role: "assistant", provider, model: model.id, content: [], stopReason: "error",
-          errorMessage: quoted ? QUOTED : providerOverflow ? PROVIDER_OVERFLOW : OVERFLOW,
+          errorMessage: streamDisconnect ? STREAM_DISCONNECT : quoted ? QUOTED : providerOverflow ? PROVIDER_OVERFLOW : OVERFLOW,
           usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0 }, timestamp: Date.now() };
         append(message);
         emit({ type: "message_end", message });
         emit({ type: "agent_end" });
         // Pi's own window refusal is killed at message_end; other errors settle as Pi does.
-        if (quoted || providerOverflow) emit({ type: "agent_settled", outcome: "error" });
+        if (streamDisconnect || quoted || providerOverflow) emit({ type: "agent_settled", outcome: "error" });
         continue;
       }
       const input = task.includes("FILL_CONTEXT_85") ? Math.floor(WINDOW * 0.85) :

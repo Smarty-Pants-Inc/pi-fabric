@@ -422,7 +422,10 @@ describe("mirrored remote roots (smarty-dev#2004)", () => {
     await expect(plain).resolves.toMatchObject({ messageId: "answered" });
   });
 
-  it("expires with the mirrored lease and names the remote host at once, without waiting for an ack", async () => {
+  // smarty-dev#11703 Decision C: real timers and real clock (no mock); the bounded <=15 s bridge-renewal
+  // wait elapses for real. Real boundary: directory lease files + router; missing live proof: real bridge/ssh
+  // (covered by tests/remote-mirror-lease-wait.test.ts with a real two-store MeshBridge).
+  it("expires with the mirrored lease, waits once (<=15 s) for a bridge renewal, then fails typed-stale naming the remote host, never publishing", async () => {
     const { directory, mirror, local, remote, meshRoot } = await setup();
     const now = Date.now();
     await mirror({ expiresAt: now + 5_000 });
@@ -437,13 +440,16 @@ describe("mirrored remote roots (smarty-dev#2004)", () => {
 
     const request = vi.fn();
     const router = routerFor(directory, { request } as unknown as FabricControlPlane, local);
-    // Stale transport sample: refused at once, naming the remote host, before any publication.
+    // Bridge freshness unknown: one bounded renewal wait, then a typed retryable refusal.
     await mirror({ expiresAt: Date.now() - 2_000 });
     writeHostLease(meshRoot, { id: remote.id, rootId: remote.id, identityId: remote.id, updatedAt: now, expiresAt: Date.now() - 2_000 });
-    await expect(router.routeMessage(remote.id, "hello", undefined, "followUp")).rejects.toMatchObject({
-      name: "FabricBridgeStaleError", code: "FABRIC_BRIDGE_STALE", remoteHost: "forge", targetId: remote.id,
-      message: expect.stringContaining("Fabric bridge-stale for remote host forge"),
-    });
+    const started = Date.now();
+    const error = await router.routeMessage(remote.id, "hello", undefined, "followUp").catch((e: unknown) => e);
+    expect(Date.now() - started).toBeLessThanOrEqual(15_000 + 2_000);
+    expect(error).toMatchObject({ name: "FabricPeerLeaseStaleError", code: "FABRIC_PEER_LEASE_STALE", retryable: true,
+      targetId: remote.id, remoteHost: "forge" });
+    expect((error as Error).message).toContain("forge");
+    expect((error as Error).message).not.toMatch(/^Unknown /);
     expect(request).not.toHaveBeenCalled();
 
     // Fresh bridge sample of a source lease that lapsed on the source clock: the mirrored lease
@@ -459,7 +465,7 @@ describe("mirrored remote roots (smarty-dev#2004)", () => {
     await expect(router.routeMessage(remote.id, "hello", undefined, "followUp"))
       .rejects.toThrow(`Unknown Fabric participant: ${remote.id} (its lease mirrored from remote host forge lapsed`);
     expect(request).not.toHaveBeenCalled();
-  });
+  }, 30_000);
 
   it.each(["steer", "followUp"] as const)("refuses a non-interactive mirrored auditor with a named error (%s)", async (kind) => {
     const { directory, mirror, local, remote } = await setup();

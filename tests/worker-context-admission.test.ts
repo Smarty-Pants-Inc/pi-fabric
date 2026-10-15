@@ -3,7 +3,8 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { expect, it, vi } from "vitest";
-import { ActorContextAdmission, loadActorInputEstimator } from "../src/worker/context-admission.js";
+import { ActorContextAdmission, loadActorInputEstimator, loadPiContextOverflow } from "../src/worker/context-admission.js";
+import { interruptedModelStreamError, retryableProviderError } from "../src/worker/provider-error.js";
 const fixture = (window = 272_000) => {
   const sent: Record<string, unknown>[] = [];
   const ready = vi.fn(); const fail = vi.fn(); const compact = vi.fn(); const reseed = vi.fn();
@@ -83,6 +84,51 @@ it("loads the pure estimator from selected native launcher ancestry, not a worke
 });
 it.each(["fake-pi-session-id.mjs", "fake-pi-rpc.mjs"])("does not infer native Pi history RPC from dependencies beside %s", async name => {
   expect(await loadActorInputEstimator(fileURLToPath(new URL(`./fixtures/${name}`, import.meta.url)))).toBeUndefined();
+});
+// Recorded incident #11998: exercise the selected-launcher boundary, not its source text.
+it("retries interrupted provider streams but keeps permanent auth, policy, quota, and context failures terminal", () => {
+  for (const error of [
+    "cliproxyapi/gpt-6-luna: stream error: stream disconnected before completion: stream closed before response.completed",
+    "stream disconnected before completion: stream closed before response.completed",
+    "stream ended without completing",
+  ]) expect(retryableProviderError(error)).toBe(true);
+  const permanent = [
+    "401 Unauthorized: stream disconnected before completion",
+    "Authentication failed: stream disconnected before completion",
+    "AuthError: stream ended without completing",
+    "Refused by security policy: stream disconnected before completion",
+    "Permission denied: stream disconnected before completion",
+    "quota exceeded: stream disconnected before completion",
+    "context exceeded: stream disconnected before completion",
+  ];
+  for (const error of permanent) {
+    expect(retryableProviderError(error), error).toBe(false);
+    // This predicate also gates retention of successful-looking partial output.
+    expect(interruptedModelStreamError(error), error).toBe(false);
+  }
+  expect(interruptedModelStreamError("stream disconnected before completion")).toBe(true);
+});
+it("keeps stream failures out of every native overflow classifier", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "actor-native-overflow-"));
+  try {
+    const launcher = path.join(root, "pi.mjs");
+    fs.writeFileSync(path.join(root, "package.json"), JSON.stringify({ name: "@earendil-works/pi-coding-agent", type: "module" }));
+    fs.writeFileSync(launcher, "#!/usr/bin/env node\n");
+    const ai = path.join(root, "node_modules", "@earendil-works", "pi-ai");
+    fs.mkdirSync(path.join(ai, "dist", "utils"), { recursive: true });
+    fs.writeFileSync(path.join(ai, "package.json"), JSON.stringify({ name: "@earendil-works/pi-ai", type: "module" }));
+    fs.writeFileSync(path.join(ai, "dist", "utils", "overflow.js"), "export function isContextOverflow() { return true; }\n");
+    const classify = await loadPiContextOverflow(launcher);
+    expect(classify).toBeTypeOf("function");
+    expect(classify!({ role: "assistant", stopReason: "error",
+      errorMessage: "stream disconnected before completion: stream closed before response.completed" }, 272_000)).toBe(false);
+    expect(classify!({ role: "assistant", stopReason: "error",
+      errorMessage: "stream ended without completing" }, 272_000)).toBe(false);
+    expect(classify!({ role: "assistant", stopReason: "error",
+      errorMessage: "prompt is too long: 280000 tokens > 272000 maximum" }, 272_000)).toBe(true);
+    expect(classify!({ role: "assistant", stopReason: "stop",
+      usage: { input: 280_000, output: 10 } }, 272_000)).toBe(true);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 it("keeps an opaque launcher opaque even when it has its own pi-ai dependency", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "actor-opaque-launcher-"));

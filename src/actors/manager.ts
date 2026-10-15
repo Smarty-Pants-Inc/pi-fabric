@@ -80,6 +80,7 @@ import { MAX_ACTOR_BASH_TIMEOUT_S } from "../guards/actor-bash-timeout.js";
 import { ModelRoutePinError } from "../core/model-refresh.js";
 import type { FabricMessageSender, FabricScope } from "../protocol.js";
 import { launchScope, normalizeScope, processSender, senderStamp, senderTrusted } from "../scope.js";
+import { WARNING_RETENTION_CAP } from "../worker/provider-error.js";
 import { activationBlockClass, classifyActivationFailure, TRANSIENT_ACTIVATION_BLOCK_CODES, type ActivationBlockClass } from "./activation-failure.js";
 
 export interface ActorModelRouteInput {
@@ -481,7 +482,9 @@ export const ACTOR_CONTEXT_RESET_RATIO = 0.8;
 /** One explicit notice per event that overflowed a fresh session, on the actor's own output path. */
 export const ACTOR_ACTIVATION_OVERFLOW_KIND = "actor.activation.overflow";
 /** A failed run the worker typed CONTEXT_OVERFLOW, carried to the drain's failure notice (smarty-dev#3238). */
-class ActorContextOverflowError extends Error {}
+class ActorContextOverflowError extends Error {
+  readonly code = "CONTEXT_OVERFLOW";
+}
 export const ACTOR_ACTIVATION_OVERFLOW_REASON = "no verdict (context overflow)";
 const refRecord = (value: unknown): Record<string, unknown> | undefined =>
   typeof value === "object" && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
@@ -579,28 +582,104 @@ const activationBlockExpired = (blocked: Parameters<typeof activationBlockExpire
 /** class is derived from code (never trusted from a stored record); blockedAt is the latest failure;
  * a transient block carries backoffMs (its current cooldown) and retryAt (its expiry). */
 type ActivationBlock = { reason: string; code: string; class: ActivationBlockClass; since: number; blockedAt: number; count: number;
-  retryAt?: number; backoffMs?: number; classification: string };
+  retryAt?: number; backoffMs?: number; classification: string;
+  /** No raw failure text: whether the complete run error/warnings authorised overflow recovery. */
+  overflowEvidence?: { version: 1; runId?: string; complete: boolean } };
 /** Codes whose stored classification carries no evidence a newer rule could overturn into a
  * permanent cause: a fail-closed "unknown" (its full failure was already scanned for a permanent
  * cause and had none) and the fixed "failing-preparation" text (a preparation timeout is
  * transient since smarty-dev#6509). Re-derived from the stored reason on load, so an actor an
  * older host blocked for good on a transient cause recovers after an upgrade without a re-create. */
 const REDERIVED_BLOCK_CODES: ReadonlySet<string> = new Set(["unknown", "failing-preparation"]);
+/** Recognisable contradictory causes override an overflow tag, never weaken permanent failures. */
+const CONTRADICTORY_OVERFLOW_CODES: ReadonlySet<string> = new Set(["provider-transient", "auth", "permission", "security-policy", "quota", "invalid-request", "incomplete-evidence", "unknown"]);
+// Saturated worker warnings cannot prove that permanent evidence was not evicted.
+const saturatedWarningEvidence = (warnings: readonly string[] | undefined): boolean =>
+  (warnings?.length ?? 0) >= WARNING_RETENTION_CAP;
+// Context-only wording must not hide an independent permanent cause, nor turn a
+// correctly typed provider overflow ("prompt is too long") into invalid configuration.
+const OVERFLOW_WORDING = /Context exceeds window|prompt (?:is )?too long|maximum context length|context(?:[ _-]+(?:window|length))?[ _-]+(?:overflow|exceeded|too long)|too many tokens/gi;
+// A typed overflow may carry provider details after its wording. Those details are not an
+// independent cause; any other residual error or warning is. Keep this narrow so an unknown
+// residual cannot authorize overflow recovery while genuine overflow-only runs still recover.
+const OVERFLOW_MARKER = "\u0000";
+const residualText = (text: string): string => text.replace(/^\s*(?:Error|Warning)\s*:?\s*/i, "")
+  .replace(/[\s:;,./()<>+="'_-]/g, "");
+const hasUnknownResidual = (texts: readonly string[]): boolean => texts.some(text => text.split(/\r?\n/).some(line => {
+  const marker = line.indexOf(OVERFLOW_MARKER);
+  if (marker >= 0) {
+    // A provider/model prefix and the detail after a typed overflow are context. Only a named
+    // Error/Warning before or after that wording can be an independent same-line cause.
+    const before = line.slice(0, marker), after = line.slice(marker + 1);
+    return /\b(?:Error|Warning)\b/i.test(before) && residualText(before).length > 0 ||
+      /\b(?:Error|Warning)\b/i.test(after) && residualText(after).length > 0;
+  }
+  return residualText(line).length > 0;
+}));
+const classifyManagerActivationFailure = (input: Parameters<typeof classifyActivationFailure>[0], typedOverflow = false): ReturnType<typeof classifyActivationFailure> => {
+  let contextWording = false;
+  const strip = (text: string): string => text.replace(OVERFLOW_WORDING, () => { contextWording = true; return OVERFLOW_MARKER; });
+  // Strip each field independently but keep the input structure (terminal line, full error,
+  // worker warnings, preparation flags), so a permanent cause keeps its provenance suffix.
+  const stripped = { ...input, lastError: strip(input.lastError),
+    error: input.error === undefined ? undefined : strip(input.error), evidence: input.evidence?.map(strip) };
+  const contradiction = classifyActivationFailure(stripped);
+  if (saturatedWarningEvidence(input.evidence)) return { code: "incomplete-evidence", transient: false,
+    classification: "fail-closed: saturated worker warnings may have evicted permanent evidence; explicit session reset required" };
+  if (!contradiction.transient && CONTRADICTORY_OVERFLOW_CODES.has(contradiction.code) &&
+      (contradiction.code !== "unknown" || hasUnknownResidual([stripped.lastError, stripped.error ?? "", ...(stripped.evidence ?? [])]))) return contradiction;
+  const failure = classifyActivationFailure(input);
+  return typedOverflow && contextWording && failure.code === "invalid-request"
+    ? { code: "context-overflow", transient: false, classification: "permanent: context window exceeded (typed run with context-only wording)" }
+    : failure;
+};
+const verifiedOverflowBlock = (blocked: ActivationBlock | undefined, runId: string | undefined): boolean =>
+  blocked?.code === "context-overflow" && blocked.overflowEvidence?.version === 1 &&
+  blocked.overflowEvidence.complete === true && blocked.overflowEvidence.runId === runId && typeof runId === "string";
+const retainedOverflowRunId = (value: unknown): value is string => typeof value === "string" && value.length > 0 &&
+  value !== "." && value !== ".." && !/[\\/\\\\]/.test(value);
 const finitePositive = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value) && value > 0;
 /** A stored block without a classification comes from an older writer: re-derive its class from
  * its stored reason with today's rules, so only a recognisably transient one can expire. */
 const restoredActivationBlock = (stored: { reason: string; code: string; since: number; count: number;
-  retryAt?: unknown; classification?: unknown; blockedAt?: unknown; backoffMs?: unknown }): ActivationBlock => {
-  const rederive = typeof stored.classification !== "string" || REDERIVED_BLOCK_CODES.has(stored.code);
-  const derived = !rederive ? { code: stored.code, classification: stored.classification as string }
+  retryAt?: unknown; classification?: unknown; blockedAt?: unknown; backoffMs?: unknown; overflowEvidence?: unknown },
+  run: AgentRunRecord | undefined, runId: string | undefined, actorId: string): ActivationBlock => {
+  let overflowEvidence: ActivationBlock["overflowEvidence"];
+  let legacyOverflow: ReturnType<typeof classifyActivationFailure> | undefined;
+  if (stored.code === "context-overflow") {
+    const marker = refRecord(stored.overflowEvidence);
+    // An incomplete migration is sticky across re-saves/reloads: only an explicit reset releases it.
+    const markedComplete = marker?.version === 1 && marker.complete === true && marker.runId === runId && typeof runId === "string";
+    const matchingRun = run !== undefined && retainedOverflowRunId(runId) && run.id === runId &&
+      run.actorId === actorId && run.status === "failed";
+    const inspectableRun = (marker === undefined || markedComplete) && matchingRun && typeof run.error === "string" && stored.reason.length > 0 &&
+      run.error.includes(stored.reason) &&
+      (run.warnings === undefined || (Array.isArray(run.warnings) && run.warnings.every(warning => typeof warning === "string")));
+    const failure = inspectableRun && run ? classifyManagerActivationFailure({ lastError: run.error!, error: run.error, evidence: run.warnings }, run.errorCode === "CONTEXT_OVERFLOW") : undefined;
+    const pureStream = failure?.code === "provider-transient" && failure.classification.startsWith("transient: model stream disconnect");
+    const genuineOverflow = failure?.code === "context-overflow" && run?.errorCode === "CONTEXT_OVERFLOW";
+    // A retained run is authoritative even when an older writer marked it complete: reclassify
+    // its full error and warnings, and only complete the proof when that record proves overflow alone.
+    // An incomplete v1 marker is sticky: a later readable record cannot upgrade lost evidence.
+    const complete = !saturatedWarningEvidence(run?.warnings) && (matchingRun
+      ? (marker === undefined ? pureStream || genuineOverflow : markedComplete && genuineOverflow)
+      : markedComplete);
+    overflowEvidence = { version: 1, ...(typeof runId === "string" ? { runId } : {}), complete };
+    legacyOverflow = failure && !failure.transient && CONTRADICTORY_OVERFLOW_CODES.has(failure.code) ? failure
+      : pureStream ? failure : { code: "context-overflow", transient: false,
+        classification: complete ? "permanent: context window exceeded (complete run evidence)"
+          : "fail-closed: legacy overflow lacks complete matching run evidence; explicit session reset required" };
+  }
+  const rederive = legacyOverflow !== undefined || typeof stored.classification !== "string" || REDERIVED_BLOCK_CODES.has(stored.code);
+  const derived = legacyOverflow ?? (!rederive ? { code: stored.code, classification: stored.classification as string }
     : (({ code, classification }) => ({ code, classification: code === stored.code && typeof stored.classification === "string"
       ? stored.classification : `${classification} (re-derived from an older record's stored reason)` }))(
       classifyActivationFailure({ lastError: stored.reason, preparation: stored.code === "failing-preparation" ||
-        stored.code === "preparation-timeout" }));
+        stored.code === "preparation-timeout" })));
   const transient = TRANSIENT_ACTIVATION_BLOCK_CODES.has(derived.code);
   return { reason: stored.reason, code: derived.code, class: activationBlockClass(derived.code), since: stored.since,
     blockedAt: finitePositive(stored.blockedAt) ? stored.blockedAt : stored.since, count: stored.count,
-    classification: derived.classification,
+    classification: derived.classification, ...(overflowEvidence ? { overflowEvidence } : {}),
     ...(transient && finitePositive(stored.retryAt) ? { retryAt: stored.retryAt } : {}),
     ...(transient && finitePositive(stored.backoffMs) ? { backoffMs: stored.backoffMs } : {}) };
 };
@@ -793,6 +872,12 @@ export class ActorManager {
   #closing = false;
   #closePromise: Promise<void> | undefined;
   #releasePaused = false;
+  #releaseStrict = false;
+  #releaseEpoch = 0;
+  #releaseAdmissionDepth = 0;
+  #pendingCreates = 0;
+  #releaseCheckpoint: { epoch: number; files: Map<string, string | undefined>; queues: unknown[]; cursor: unknown } | undefined;
+  readonly #releaseQueueSnapshots = new Map<string, { file: string; snapshot: Record<string, unknown> }>();
   readonly #closeGraceMs: number;
   // Stop-the-world gate armed by haltAll() (ESC): while true, host-event and
   // mesh dispatch are frozen so interrupted actors are not re-armed by the
@@ -969,10 +1054,13 @@ export class ActorManager {
       outageAlarm: meshOutageAlarmSink(() => ({ mesh: this.mesh, from: this.identity })),
       cursorPath: options.meshCursorPath,
       canConsumeMesh: options.canConsumeMesh,
+      // Legacy/staged pauses gate worker activation, not relay/mesh ingress.
+      // Only the cooperative strict hold may leave input behind the cursor.
+      canAdmit: () => !this.#releaseStrict,
       maxReplayAgeMs: options.meshReplayAgeMs,
       replayAll: options.claimResidency === "durable",
       beforePoll: () => {
-        if (this.#releasePaused || options.canConsumeMesh?.() === false) return false;
+        if (this.#releaseStrict || options.canConsumeMesh?.() === false) return false;
         // Initial publication may have outlived the first deferred slice (or
         // failed and later recovered). Retry once ready, never on the constructor.
         if (this.#initialRetentionPending) this.#startRetentionSweep();
@@ -988,6 +1076,7 @@ export class ActorManager {
         return !this.#halted;
       },
       onEvent: (event) => {
+        if (this.#releaseStrict) return false;
         for (const [id, records] of this.#records) {
           if (this.#actors.has(id)) records.accept(event);
           else this.#records.delete(id);
@@ -997,6 +1086,7 @@ export class ActorManager {
         for (const listener of this.#meshListeners) {
           try { listener(); } catch { /* Observers must not interrupt delivery. */ }
         }
+        if (this.#releaseStrict) return false;
         if (event.topic === "fabric.steer") this.#relaySteer(event);
         else if (!event.topic.startsWith("fabric.control.")) return this.#dispatchMeshEvent(event);
         return event.topic === "fabric.steer" ? true : "ignored";
@@ -1039,7 +1129,7 @@ export class ActorManager {
 
   /** Re-admit restored work after the host's providers and ownership directory are ready. */
   resumeQueued(): void {
-    if (this.#closing || this.#halted) return;
+    if (this.#closing || this.#halted || this.#releaseStrict) return;
     this.#settledRestoreReady = true;
     this.#syncActorsFromRegistry();
     this.#refreshOwnership();
@@ -1072,6 +1162,9 @@ export class ActorManager {
       onCommit?: (id: string) => void;
     } = {},
   ): Promise<FabricActorInfo> {
+    this.#assertReleaseAdmission();
+    ++this.#pendingCreates;
+    try {
     this.#refreshOwnership();
     const registryOwnerCreate = asRegistryOwner && request.residency === "durable";
     const sessionMainCreate = (request.residency ?? "session") === "session" &&
@@ -1230,6 +1323,7 @@ export class ActorManager {
       })
       .catch(() => undefined);
     return this.#publicInfo(actor);
+    } finally { --this.#pendingCreates; }
   }
 
   /** ActorDirectory supplies foreign-session discovery; a single registry has none. */
@@ -1760,14 +1854,17 @@ export class ActorManager {
       throw error;
     }
     this.#forgetRealarm(actor);
-    return this.#publicInfo(actor);
+    const live = this.#liveActor(actor);
+    if (live.queue.length > 0) this.#requestDrain(live);
+    return this.#publicInfo(live);
   }
 
   /** smarty-dev#9890: an explicit reset is the documented repair for a hard block (auth, config,
    * unknown): it ends the block and its failure streak, so routing presence reads idle again. A
-   * transient block keeps its own expiry. Only a requested reset calls this, never a size or context
-   * rotation. Returns an undo for a reset whose commit failed; it reports whether it restored the
-   * exact prior hard block and streak (never over a newer failure recorded meanwhile). */
+   * transient block keeps its own expiry. Context rotation also ends a typed overflow block after
+   * that activation settled; it never clears auth/config/security failures. Returns an undo for a
+   * reset whose commit failed; it reports whether it restored the exact prior hard block and streak
+   * (never over a newer failure recorded meanwhile). */
   #clearHardBlockForReset(actor: ManagedActor): () => boolean {
     const blocked = actor.activationBlocked;
     if (!blocked || activationBlockClass(blocked.code) !== "hard") return () => false;
@@ -1813,7 +1910,10 @@ export class ActorManager {
       waiters.forEach((waiter) => waiter.reject(error));
       return undefined;
     }
-    let trigger: "requested" | "size" | "context" | undefined = waiters ? "requested" : undefined;
+    // A terminal overflow failed only its item. Rotate after settlement, never replay tool work,
+    // and restore routing even when there is no queued successor or new event to wake the actor.
+    const overflowFailure = verifiedOverflowBlock(live.activationBlocked, live.lastRunId);
+    let trigger: "requested" | "size" | "context" | undefined = waiters ? "requested" : overflowFailure ? "context" : undefined;
     if (!trigger && this.#maxSessionBytes > 0) {
       try {
         if (fs.statSync(live.sessionFile).size > this.#maxSessionBytes) trigger = "size";
@@ -1830,13 +1930,14 @@ export class ActorManager {
       usage.tokens >= usage.contextWindow * ACTOR_CONTEXT_RESET_RATIO))) trigger = "context";
     if (!trigger) return undefined;
     try {
-      this.#archiveSession(live, trigger, overflowRetry);
+      this.#archiveSession(live, trigger, overflowRetry || overflowFailure, overflowRetry);
     } catch (error) {
       const failure = error instanceof Error ? error : new Error(String(error));
       waiters?.forEach((waiter) => waiter.reject(failure));
       return undefined;
     }
-    const restore = trigger === "requested" ? this.#clearHardBlockForReset(live) : undefined;
+    const restore = trigger === "requested" || (trigger === "context" && overflowFailure)
+      ? this.#clearHardBlockForReset(live) : undefined;
     return this.#publishDrainPresence(live, waiters !== undefined).then(
       () => {
         if (restore) this.#forgetRealarm(live);
@@ -1853,7 +1954,7 @@ export class ActorManager {
   }
 
   // Moves session.jsonl to session.jsonl.<UTC stamp>.bak, keeps the newest backup and logs it.
-  #archiveSession(actor: ManagedActor, trigger: "requested" | "size" | "context", overflow = false): void {
+  #archiveSession(actor: ManagedActor, trigger: "requested" | "size" | "context", overflow = false, overflowRetry = false): void {
     const running = this.#runningActor(actor.id);
     if (this.#inFlight.has(actor.id) || running?.abortController || running?.inFlightRun) {
       throw new Error(`Cannot rotate actor ${actor.name} while an activation is in flight`);
@@ -1902,11 +2003,12 @@ export class ActorManager {
       reason: trigger === "size"
         ? `session reset (size limit): ${bytes} bytes > ${this.#maxSessionBytes}`
         : trigger === "context"
-        ? overflow ? "session reset (context overflow): retrying the event once on a fresh session"
+        ? overflow ? overflowRetry ? "session reset (context overflow): retrying the event once on a fresh session"
+            : "session reset (context overflow): failed item will not be replayed; next work starts on a fresh session"
           : `session reset (context window): last run used ${usage?.tokens} of ${usage?.contextWindow} tokens`
         : "session reset (requested)",
       data: { sessionReset: { trigger, bytes, archived, ...(trigger === "context" ? { overflow,
-        ...(usage ? { contextUsage: { tokens: usage.tokens, contextWindow: usage.contextWindow } } : {}) } : {}) } },
+        ...(overflow ? { retry: overflowRetry } : {}), ...(usage ? { contextUsage: { tokens: usage.tokens, contextWindow: usage.contextWindow } } : {}) } : {}) } },
     });
   }
 
@@ -1979,6 +2081,7 @@ export class ActorManager {
     data?: unknown,
     bindingOptions: ActorMessageBindingOptions = {},
   ): { queued: true; messageId: string } {
+    this.#assertReleaseAdmission(true);
     this.validateDirectMessage(message, data);
     const actor = this.#requireOwnedActiveActor(id);
     const item = this.#enqueue(
@@ -2035,6 +2138,7 @@ export class ActorManager {
     signal?: AbortSignal,
     bindingOptions: ActorMessageBindingOptions = {},
   ): Promise<FabricActorMessage> {
+    this.#assertReleaseAdmission();
     this.validateDirectMessage(message, data);
     const actor = this.#requireOwnedActiveActor(id);
     if (signal?.aborted) {
@@ -2240,6 +2344,7 @@ export class ActorManager {
   }
 
   noteMainActivity(idle = false): void {
+    if (this.#releaseStrict) return;
     this.#mainRevision++;
     this.#persistRevisions();
     this.#mainIdle = idle;
@@ -2275,6 +2380,7 @@ export class ActorManager {
     payload: unknown,
     images: readonly ImageContent[] = [],
   ): number {
+    if (this.#releaseStrict) return 0;
     let delivered = 0;
     for (const actor of this.#actors.values()) {
       if (!this.#observesHostEvent(actor, event)) continue;
@@ -2328,7 +2434,7 @@ export class ActorManager {
         },
       });
     void this.#notifications.enqueue(() => publish(images.length > 0).catch(error => {
-      if (isMeshLockTimeout(error)) throw error;
+      if (isMeshWriteDeferred(error)) throw error;
       if (images.length > 0) return publish(false);
       throw error;
     }));
@@ -2379,6 +2485,7 @@ export class ActorManager {
     pendingSourceId?: string,
     sender?: FabricMessageSender | null,
   ): boolean {
+    if (this.#releaseStrict) return false;
     if (this.#skipOnArrival(actor, `host:${event}`, payload)) return true;
     const interval = event === "agent_settled" ? actor.activation?.minIntervalMs ?? 0 : 0;
     let sourceId = pendingSourceId;
@@ -2450,7 +2557,7 @@ export class ActorManager {
   #resumeSettledWindows(onlyActorId?: string): void {
     // The host calls resumeQueued/resumeAfterRelease after providers and ownership
     // bootstrap. Registry construction/polls must only retain, not activate, work.
-    if (!this.#settledRestoreReady || this.#closing || this.#settledClosePending || this.#halted || this.#canConsumeMesh?.() === false) return;
+    if (!this.#settledRestoreReady || this.#releaseStrict || this.#closing || this.#settledClosePending || this.#halted || this.#canConsumeMesh?.() === false) return;
     for (const [actorId, sources] of this.#settledWindows) {
       if ((onlyActorId !== undefined && actorId !== onlyActorId) || !this.#canManageCached(actorId)) continue;
       for (const [sourceId, window] of sources) {
@@ -2462,7 +2569,7 @@ export class ActorManager {
   }
 
   #armSettledWindow(actorId: string, sourceId: string, window: SettledWindow): void {
-    if (this.#settledClosePending) return;
+    if (this.#settledClosePending || this.#releaseStrict) return;
     // Node clamps delays above signed int32 to 1 ms. Chunk long valid intervals instead.
     const remaining = Math.max(0, window.intervalMs - (Date.now() - window.acceptedAt));
     window.timer = setTimeout(() => this.#flushSettledWindow(actorId, sourceId, window), Math.min(remaining, 2_147_483_647));
@@ -2472,7 +2579,7 @@ export class ActorManager {
   #flushSettledWindow(actorId: string, sourceId: string, window: SettledWindow): void {
     if (this.#settledWindows.get(actorId)?.get(sourceId) !== window) return;
     delete window.timer;
-    if (!window.pending || this.#closing || this.#settledClosePending || this.#halted || this.#canConsumeMesh?.() === false) return;
+    if (!window.pending || this.#releaseStrict || this.#closing || this.#settledClosePending || this.#halted || this.#canConsumeMesh?.() === false) return;
     this.#syncActorsFromRegistry();
     this.#refreshOwnership(actorId);
     // Reload/reacquisition can replace every registry object. Resolve only after fencing.
@@ -2541,7 +2648,7 @@ export class ActorManager {
   }
 
   #beginHostEvent(event: FabricActorHostEvent, idle: boolean, source?: string): boolean {
-    if (this.#closing || !this.meshConfig.enabled) return false;
+    if (this.#releaseStrict || this.#closing || !this.meshConfig.enabled) return false;
     // Streaming/message/provider hooks are frequent. The actor registry watcher
     // keeps this in-memory roster current, so events that do not participate in
     // Main freshness revisions can return without per-update filesystem work
@@ -2646,10 +2753,18 @@ export class ActorManager {
       .map(actor => actor.id);
   }
 
-  /** Actors whose runs or drains a reload would stop (smarty-dev#1830, #2160). */
-  inFlightCount(): number {
+  #inFlightRunCount(): number {
     return [...new Set([...this.#actors.values(), ...this.#draining.values()])]
       .filter((actor) => actor.abortController !== undefined || actor.draining).length;
+  }
+
+  /** Actors whose runs or drains a reload would stop (smarty-dev#1830, #2160). */
+  inFlightCount(): number { return this.#inFlightRunCount(); }
+
+  /** Release custody also includes accepted setup and ownership work, not additional runs. */
+  releaseCustodyCount(): number {
+    // Use the scope-local count: ActorDirectory aggregates both managers separately.
+    return this.#inFlightRunCount() + this.#pendingCreates + this.#adoptionPending.size;
   }
 
   /**
@@ -3129,35 +3244,181 @@ export class ActorManager {
     return this.#finishCleanup(cleanup);
   }
 
-  /** Reversible activation gate. It never aborts a worker or consumes mesh input. */
-  pauseForRelease(): void { this.#releasePaused = true; }
+  get releaseAdmissionHeld(): boolean { return this.#releaseStrict; }
+
+  /** No worker abort. Legacy/staged startup keeps its activation-only behavior. */
+  pauseForRelease(options: { strict?: boolean } = {}): void {
+    ++this.#releaseEpoch;
+    this.#releaseCheckpoint = undefined;
+    this.#releasePaused = true;
+    this.#releaseStrict ||= options.strict === true;
+    if (this.#releaseStrict) {
+      // Suspend deadlines, not windows: acceptedAt, payload and delivery IDs stay intact.
+      for (const sources of this.#settledWindows.values()) for (const window of sources.values()) {
+        if (window.timer) clearTimeout(window.timer);
+        delete window.timer;
+      }
+    }
+  }
   resumeAfterRelease(): void {
-    this.#releasePaused = false;
+    ++this.#releaseEpoch;
+    this.#releaseCheckpoint = undefined;
+    this.#releasePaused = this.#releaseStrict = false;
+    this.#syncActorsFromRegistry();
+    this.#refreshOwnership();
     this.#settledRestoreReady = true;
+    this.#scheduleRestoreParked();
     this.#resumeSettledWindows();
     if (this.#initialRetentionPending) this.#startRetentionSweep();
     for (const actor of this.#actors.values()) if (actor.queue.length) this.#ensureDrain(actor);
     this.#meshMonitor.schedule();
   }
-  /** Save accepted queues (including empty completion fences) BEFORE either cursor advances. */
-  async checkpointForRelease(): Promise<void> {
-    if (!this.#releasePaused || this.inFlightCount() || this.#pendingResets.size ||
-        this.#removals.size || this.#removeCalls.size || this.#finishCalls.size || this.pendingRemovals().length) {
-      throw new Error("Actor release boundary is not quiescent");
+
+  /** Trusted host ONLY: finish synchronous tell ingress for a pre-cut accepted handler.
+   * No activation authority, no asynchronous propagation, no provider/user exposure. */
+  withReleaseAdmission<T>(admit: () => T): T {
+    ++this.#releaseAdmissionDepth;
+    try {
+      const value = admit();
+      if (value && typeof (value as { then?: unknown }).then === "function") {
+        void Promise.resolve(value).catch(() => undefined); // observe misuse, never propagate authority
+        throw new Error("Release admission wrapper must be synchronous");
+      }
+      return value;
+    } finally { --this.#releaseAdmissionDepth; }
+  }
+
+  #assertReleaseAdmission(trustedTell = false): void {
+    if (this.#releaseStrict && !(trustedTell && this.#releaseAdmissionDepth > 0)) {
+      throw new Error("Fabric actor release admission held; retry unchanged");
     }
+  }
+
+  #assertReleaseQuiet(epoch: number, assertHeld?: () => void): void {
+    assertHeld?.();
+    if (!this.#releasePaused || epoch !== this.#releaseEpoch || this.releaseCustodyCount() || this.#pendingResets.size ||
+        this.#removals.size || this.#removeCalls.size || this.#finishCalls.size || this.pendingRemovals().length ||
+        [...this.#pendingHandoffConsumption.values()].some(ids => ids.size) ||
+        [...this.#pendingRunArchives.values()].some(ids => ids.size)) {
+      throw new Error("Actor release boundary is not quiescent or is stale");
+    }
+    // Callback-backed asks belong to A memory, not a serializable successor queue.
+    const held = [...this.#actors.values()].flatMap(actor => actor.queue).concat(
+      ...this.#overflow.values(), ...this.#parked.values(), ...this.#deferredHandoffs.values());
+    if (held.some(item => item.resolve || item.reject)) throw new Error("Actor release has queued callback asks retained in A");
+  }
+
+  #readReleaseFile(file: string): string | undefined {
+    try {
+      const stat = fs.lstatSync(file);
+      if (!stat.isFile() || stat.isSymbolicLink()) throw new Error(`Actor release file is not regular: ${file}`);
+      if (stat.size > 16 * 1024 * 1024) throw new Error(`Actor release readback exceeds bounded file size: ${file}`);
+      return fs.readFileSync(file, "utf8");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+      throw error;
+    }
+  }
+
+  #releaseFiles(assertHeld?: () => void, durable = false): Map<string, string | undefined> {
+    const files = new Map<string, string | undefined>();
+    let bytes = 0;
+    const add = (file: string) => {
+      assertHeld?.();
+      const contents = this.#readReleaseFile(file);
+      bytes += contents === undefined ? 0 : Buffer.byteLength(contents);
+      if (files.size >= 10_000 || bytes > 16 * 1024 * 1024) throw new Error("Actor release readback exceeds bounded custody snapshot");
+      if (durable && contents !== undefined) {
+        // FlushFileBuffers requires write access on Windows; a read-only handle
+        // fails before wake-config admission even though the saved bytes are valid.
+        const access = process.platform === "win32" ? fs.constants.O_RDWR : fs.constants.O_RDONLY;
+        const fd = fs.openSync(file, access | (fs.constants.O_NOFOLLOW ?? 0));
+        try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+        syncDirectoryChain(path.dirname(file));
+      }
+      assertHeld?.();
+      files.set(file, contents);
+    };
+    add(path.join(this.#actorRoot, "actors.json"));
+    for (const actor of this.#actors.values()) {
+      if (!this.#ownershipDecision(actor.id)) continue;
+      add(this.#ownQueueFile(actor));
+      const directory = path.dirname(actor.sessionFile);
+      // Completion receipts, source obligations and registry payload heads are part of custody.
+      for (const subdir of [directory, path.join(directory, "registry"), path.join(directory, "child-completions")]) {
+        let names: string[];
+        try { names = fs.readdirSync(subdir).sort(); }
+        catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") continue; throw error; }
+        for (const name of names) {
+          if (subdir === directory && !/^(queue-|dead-letter)/.test(name)) continue;
+          const file = path.join(subdir, name);
+          if (!fs.lstatSync(file).isFile()) throw new Error(`Actor release obligation is not regular: ${file}`);
+          add(file);
+        }
+      }
+    }
+    return files;
+  }
+
+  /** Queues + registry + completion fences/readback precede the safe cursor. */
+  async checkpointForRelease(assertHeld?: () => void): Promise<void> {
+    const epoch = this.#releaseEpoch;
+    const check = () => this.#assertReleaseQuiet(epoch, assertHeld);
+    this.#releaseCheckpoint = undefined;
+    this.#releaseQueueSnapshots.clear();
+    check();
+    await this.#retentionSweep;
+    check();
     await Promise.all([...this.#presenceChains.values()]);
+    check();
+    await this.#notifications.checkpointForRelease();
+    check();
+    await this.#filterStateSave;
+    check();
     await this.#registrySavePending;
+    check();
     await this.#registrySaveChain;
+    check();
     let checkpointedActor = false;
     for (const actor of this.#actors.values()) {
+      check();
       if (!this.#ownershipDecision(actor.id)) continue;
       checkpointedActor = true;
       if (!this.#persistQueue(actor.id, true, true)) throw new Error(`Actor ${actor.id} queue did not checkpoint`);
     }
-    // An untouched empty secondary scope has no registry inode to checkpoint.
-    // Do not turn its proven absence into a rollback-read of a nonexistent file.
-    if (checkpointedActor || this.#registry.records().length) await this.#saveActors(new Set(), { durable: true });
-    this.#meshMonitor.checkpointForRelease();
+    // Proven absence of an untouched empty secondary scope remains absence.
+    if (checkpointedActor || this.#registry.records().length) {
+      await this.#saveActors(new Set(), { durable: true, assertHeld: check });
+      check();
+    }
+    const files = this.#releaseFiles(check, true);
+    const queues: unknown[] = [];
+    for (const [actorId, { file, snapshot }] of this.#releaseQueueSnapshots) {
+      if (JSON.stringify(JSON.parse(files.get(file) ?? "null")) !== JSON.stringify(snapshot)) {
+        throw new Error(`Actor ${actorId} queue release readback differs`);
+      }
+      queues.push({ actorId, file, ...snapshot });
+    }
+    check();
+    this.#meshMonitor.checkpointForRelease(check);
+    check();
+    this.#releaseCheckpoint = { epoch, files, queues, cursor: this.#meshMonitor.releaseCheckpointReceipt() };
+  }
+
+  /** Synchronous exact disk readback, not a cached successful-write claim. */
+  releaseCheckpointReceipt(): unknown {
+    const checkpoint = this.#releaseCheckpoint;
+    if (!checkpoint) throw new Error("Actor release checkpoint is absent or invalidated");
+    this.#assertReleaseQuiet(checkpoint.epoch);
+    const files = this.#releaseFiles(() => this.#assertReleaseQuiet(checkpoint.epoch));
+    if (files.size !== checkpoint.files.size || [...checkpoint.files].some(([file, bytes]) => files.get(file) !== bytes)) {
+      throw new Error("Actor release checkpoint disk readback differs");
+    }
+    const cursor = this.#meshMonitor.releaseCheckpointReceipt();
+    if (JSON.stringify(cursor) !== JSON.stringify(checkpoint.cursor)) throw new Error("Actor release cursor readback differs");
+    return { scope: this.#actorScope, epoch: checkpoint.epoch, queues: checkpoint.queues, cursor,
+      files: [...files].map(([file, bytes]) => ({ file, present: bytes !== undefined,
+        ...(bytes !== undefined ? { sha256: createHash("sha256").update(bytes).digest("hex"), bytes: Buffer.byteLength(bytes) } : {}) })) };
   }
 
   /**
@@ -3355,7 +3616,7 @@ export class ActorManager {
   // Once its spawning activation ends, an unread child result belongs to the
   // actor's next activation. Stopped/removed actors keep the spool; never reroute to Main.
   #reconcileChildCompletions(completed?: ManagedActor): void {
-    if (!this.#persistent || this.#closing) return;
+    if (!this.#persistent || this.#closing || this.#releaseStrict) return;
     for (const actor of completed ? [completed] : this.#actors.values()) {
       if (actor.status === "stopped" || actor.removal || !this.#canManageCached(actor.id)) {
         void this.#releaseChildCompletionStore(actor);
@@ -3480,7 +3741,9 @@ export class ActorManager {
       onAccepted?: () => void;
     } = {},
   ): ActorQueueItem {
+    this.#assertReleaseAdmission(source === "direct");
     if (this.#closing) throw new Error("Fabric actor manager is closing; retry");
+    this.#releaseCheckpoint = undefined;
     const canManage = options.ownershipChecked
       ? this.#canManageCached(actor.id)
       : this.#canManage(actor.id);
@@ -3508,7 +3771,8 @@ export class ActorManager {
     if (options.coalesceKey && !options.replaying) {
       // Parked work (waiting for ownership, or restored after a restart) coalesces too (smarty-dev#1065).
       const existing = [...actor.queue, ...(this.#overflow.get(actor.id) ?? []), ...(this.#parked.get(actor.id) ?? [])]
-        .find((item) => item.coalesceKey === options.coalesceKey);
+        // A confirmed no-tool overflow owns one replay of this exact activation, not its successor.
+        .find((item) => !item.overflowRetried && item.coalesceKey === options.coalesceKey);
       if (existing) {
         const previous = options.checkpoint ? { ...existing } : undefined;
         try {
@@ -3671,7 +3935,7 @@ export class ActorManager {
       // replaced the object an older drain still runs on (smarty-dev#442).
       this.#draining.has(actor.id) ||
       actor.status === "stopped" ||
-      (this.#releasePaused && !actor.queue.some((item) => item.resolve || item.reject)) ||
+      (this.#releasePaused && (this.#releaseStrict || !actor.queue.some((item) => item.resolve || item.reject))) ||
       this.#closing ||
       !this.#canManage(actor.id)
     ) {
@@ -3766,14 +4030,15 @@ export class ActorManager {
     try {
       while (
         actor.queue.length > 0 &&
-        (!this.#releasePaused || actor.queue.some((item) => item.resolve || item.reject)) &&
+        (!this.#releasePaused || (!this.#releaseStrict && actor.queue.some((item) => item.resolve || item.reject))) &&
         actor.status !== "stopped" &&
         !this.#closing &&
         this.#canManage(actor.id)
       ) {
         const reset = this.#resetAtBoundary(actor);
         if (reset) await reset;
-        if (actor.queue.length === 0 || (actor.status as string) === "stopped" || this.#closing) break;
+        if (actor.queue.length === 0 || (actor.status as string) === "stopped" || this.#closing ||
+            (this.#releasePaused && (this.#releaseStrict || !actor.queue.some(item => item.resolve || item.reject)))) break;
         // A persisted completion cannot run before its handoff receipt commits.
         // If receipt I/O failed, even an unrelated new message must not drain it;
         // the next poll retries the same queued id before opening this gate.
@@ -3845,6 +4110,7 @@ export class ActorManager {
         let committedRefs: string[] | undefined;
         let preLaunch = true;
         let workerLaunched = false;
+        let runEvidence: readonly string[] | undefined;
         const preparationAbort = new AbortController();
         try {
           await this.#publishDrainPresence(actor);
@@ -3962,6 +4228,7 @@ export class ActorManager {
             } },
           );
           runId = result.id;
+          runEvidence = result.warnings;
           // Error-only turns and a spawned handle do not prove inference consumed context.
           handoffConsumed = result.inferenceStarted ?? (result.status === "completed" || result.toolCalls > 0);
           // Captured before any check that can throw: a completed run is never parked and
@@ -4011,7 +4278,11 @@ export class ActorManager {
           if (result.status !== "completed") {
             // smarty-dev#3238 round 2: only the worker's typed code, set from a structured overflow
             // signal, retries or reports an overflow; error text that quotes the phrase never does.
-            const contextOverflow = result.errorCode === "CONTEXT_OVERFLOW" && !abortController.signal.aborted && !runStopped;
+            // A legacy/malformed typed result must not replay a provider disconnect as overflow.
+            // The normal classifier scans permanent causes first, including real window refusals.
+            const failure = classifyManagerActivationFailure({ lastError: result.error ?? "", error: result.error, evidence: result.warnings }, result.errorCode === "CONTEXT_OVERFLOW");
+            const contextOverflow = result.errorCode === "CONTEXT_OVERFLOW" && !CONTRADICTORY_OVERFLOW_CODES.has(failure.code) &&
+              !abortController.signal.aborted && !runStopped;
             // smarty-dev#3238 round 3: a retry replays the whole event. Once a tool has run, its side
             // effects may already have happened, and nothing makes a replay idempotent: retry only a
             // run that executed no tool call (the worker counts each tool_execution_start).
@@ -4059,7 +4330,7 @@ export class ActorManager {
                 createdAt: Date.now(),
                 action: "silent",
                 error: reason,
-                data: { runError: reason, runId: result.id },
+                data: { runError: reason, runId: result.id, ...(contextOverflow ? { errorCode: "CONTEXT_OVERFLOW" } : {}) },
                 runId: result.id,
                 usage: result.usage,
               };
@@ -4231,12 +4502,13 @@ export class ActorManager {
             source: item.source,
             createdAt: Date.now(),
             error: message,
+            ...(error instanceof ActorContextOverflowError ? { data: { errorCode: error.code } } : {}),
           };
           this.#recordMessage(this.#liveActor(actor), failed);
-          item.reject?.(new Error(message));
+          item.reject?.(error instanceof ActorContextOverflowError ? error : new Error(message));
           this.#noteFailedActivation(actor, message, runId, abortController.signal.aborted || runStopped,
             retryPreparation && (item.preparationAttempts ?? 0) >= ACTOR_PREPARATION_MAX_RETRIES ? ACTOR_FAILURE_NOTICE_AFTER : 0,
-            false, error instanceof ActorContextOverflowError, undefined, item.overflowRetried === true);
+            false, error instanceof ActorContextOverflowError, runEvidence, item.overflowRetried === true);
           // A callerless event that failed here is not retried: it is dropped (smarty-dev#9332).
           if (!item.resolve && !item.reject && !abortController.signal.aborted && !runStopped) {
             this.#noteDroppedEvent(actor, item, message, runId);
@@ -4307,10 +4579,17 @@ export class ActorManager {
       // fresh drain instead of stranding a just-enqueued item.
       // A reset requested during the last run is applied before a new drain can start one.
       // Its caller may queue work at once, which the drain after this one runs.
-      const resetAtExit = this.#pendingResets.has(actor.id);
+      const resetLive = this.#liveActor(actor);
+      const resetAtExit = this.#pendingResets.has(actor.id) || verifiedOverflowBlock(resetLive.activationBlocked, resetLive.lastRunId);
       // A reset caller can enqueue another reset from its resolved promise while
       // the boundary presence write is settling. Consume it before releasing admission.
       while (this.#pendingResets.has(actor.id) && !this.#inFlight.has(actor.id) && !actor.abortController) {
+        await this.#resetAtBoundary(actor)?.catch(() => undefined);
+      }
+      // No backlog is needed to repair routing after a terminal overflow. The failed activation
+      // has already left the checkpoint; only its session/block are repaired, never its effects.
+      if (verifiedOverflowBlock(this.#liveActor(actor).activationBlocked, this.#liveActor(actor).lastRunId) &&
+          !this.#inFlight.has(actor.id) && !actor.abortController && !this.#closing && actor.status !== "stopped") {
         await this.#resetAtBoundary(actor)?.catch(() => undefined);
       }
       actor.draining = false;
@@ -4404,10 +4683,11 @@ export class ActorManager {
       ?? lines.at(-1) ?? "Unknown activation failure";
     // smarty-dev#3238 round 2: context-overflow comes only from the run's typed CONTEXT_OVERFLOW code.
     // Fail closed (smarty-dev#8487): only an explicitly transient cause may expire.
-    const classified = contextOverflowCode && !preparation
+    const failure = classifyManagerActivationFailure({ lastError, error, evidence,
+      preparation: preparation === true, preparationTimeout: preparation === "timeout" }, contextOverflowCode && !preparation);
+    const classified = contextOverflowCode && !preparation && !CONTRADICTORY_OVERFLOW_CODES.has(failure.code)
       ? { code: "context-overflow", transient: false, classification: "permanent: context window exceeded (typed CONTEXT_OVERFLOW run code)" }
-      : classifyActivationFailure({ lastError, error, evidence,
-        preparation: preparation === true, preparationTimeout: preparation === "timeout" });
+      : failure;
     // Error text that only quotes "Context exceeds window" stays blocked (never expires), but it is not an overflow.
     const { code, transient, classification } = classified.code === "context-overflow" && !contextOverflowCode
       ? { code: "unknown", transient: false,
@@ -4429,6 +4709,7 @@ export class ActorManager {
     actor.activationBlocked = {
       reason, code, class: activationBlockClass(code), since: previous?.code === code ? previous.since : now, blockedAt: now, count,
       classification, ...(transient ? { retryAt: now + backoffMs, backoffMs } : {}),
+      ...(code === "context-overflow" ? { overflowEvidence: { version: 1 as const, ...(typeof runId === "string" ? { runId } : {}), complete: contextOverflowCode && typeof runId === "string" && !saturatedWarningEvidence(evidence) } } : {}),
     };
     this.#armActivationBlockExpiry(actor, now);
     actor.updatedAt = now;
@@ -4439,13 +4720,15 @@ export class ActorManager {
     if (streak.notified || (!contextOverflow && streak.count < ACTOR_FAILURE_NOTICE_AFTER)) return;
     streak.notified = true;
     const text =
-      `Fabric host notice: actor ${actor.name} failed its last ${streak.count} activations, so it is not acting on its events. ` +
+      (contextOverflow ? `Fabric host notice: actor ${actor.name} could not complete this activation (context overflow). `
+        : `Fabric host notice: actor ${actor.name} failed its last ${streak.count} activations, so it is not acting on its events. `) +
       `Last error: ${reason}${runId ? ` (run ${runId})` : ""}. ` +
       `Inspect it with agents.actorStatus({ id: ${JSON.stringify(actor.id)} }) and agents.log, then repair, reconfigure or recreate it. ` +
       `Reconcile any prepared external effects from the failed runs before rerouting their work.` +
       (contextOverflow ? overflowRetried
         ? " This activation was retried once after resetting its session, but the fresh session still overflowed; reduce its input before retrying."
-        : ` This activation was not retried; reduce its input or reset the session on its owning host with agents.resetSession({ id: ${JSON.stringify(actor.name)} }).` : "");
+        : " This activation was not retried; a replay could repeat tool effects or the event cannot fit a fresh session. Reduce its input before resubmitting." : "") +
+      (contextOverflow ? " The failed item will not be replayed; its session resets at settlement so the next work can run." : "");
     const notice: FabricActorMessage = {
       id: randomUUID(), actorId: actor.id, actorName: actor.name, direction: "out",
       source: "fabric-host", createdAt: Date.now(), action: "message", text,
@@ -5283,7 +5566,7 @@ export class ActorManager {
   // held in memory, or met twice in one batch, is skipped, so each dead letter runs once. Entries
   // leave the file only after the queue file durably holds what they replayed.
   #replayDeadLetters(actor: ManagedActor): void {
-    if (!this.#persistent || this.#closing || this.#halted || actor.status === "stopped" || actor.removal ||
+    if (!this.#persistent || this.#closing || this.#halted || this.#releaseStrict || actor.status === "stopped" || actor.removal ||
       this.#parked.get(actor.id)?.length || !this.#canManageCached(actor.id) || this.#deadLetterCount(actor.id) === 0) return;
     const limit = this.meshConfig.actorQueueLimit;
     if (actor.queue.length * 2 >= limit || this.#overflow.get(actor.id)?.length) return;
@@ -5374,11 +5657,11 @@ export class ActorManager {
     const script = this.#meshRetentionSweepPath;
     const meshRoot = this.mesh.root;
     const relative = path.relative(path.join(meshRoot, "actors"), this.#actorRoot);
-    if (!script || relative.startsWith("..") || path.isAbsolute(relative) || process.platform !== "linux" || this.#closing) return;
+    if (!script || relative.startsWith("..") || path.isAbsolute(relative) || process.platform !== "linux" || this.#closing || this.#releaseStrict) return;
     try {
       const [runtime, ...args] = await scriptSpawnArgs(script,
         meshRetentionSweepArgs(meshRoot, this.#logs.retention.actorRunArchiveMs));
-      if (this.#closing) return;
+      if (this.#closing || this.#releaseStrict) return;
       const now = Date.now();
       const outcome = await startLockedMeshRetentionSweep(meshRoot, MESH_RETENTION_SWEEP_INTERVAL_MS, (lock) => {
         // The sweep inherits the locked descriptor as fd 3 and holds the lock until it exits.
@@ -5390,7 +5673,7 @@ export class ActorManager {
           try { os.setPriority(child.pid, 19); } catch { /* best effort */ }
         }
         child.unref();
-      }, now, () => !this.#closing);
+      }, now, () => !this.#closing && !this.#releaseStrict);
       if (typeof outcome === "object") this.#alarmSweepLock(meshRoot, outcome.uncertain);
       // smarty-dev#9508: only a successful acquire proves the lock works again; "busy" proves nothing about it.
       else if (outcome === "started" || outcome === "claimed") this.#sweepLockAlarmed = false;
@@ -5590,7 +5873,7 @@ export class ActorManager {
   }
 
   #startRetentionSweep(): void {
-    if (this.#retentionSweep || this.#closing) return;
+    if (this.#retentionSweep || this.#closing || this.#releaseStrict) return;
     const sweep = this.#sweepRetainedRuns().catch(() => undefined);
     this.#retentionSweep = sweep;
     void sweep.finally(() => { if (this.#retentionSweep === sweep) this.#retentionSweep = undefined; });
@@ -5606,10 +5889,10 @@ export class ActorManager {
     // but re-enter the publication/ownership fences between Windows actors.
     const batchSize = ACTOR_RETENTION_BATCH_SIZE[process.platform === "win32" ? "win32" : "other"];
     for (let offset = 0; offset < actors.length; offset += batchSize) {
-      if (this.#closing || this.#canConsumeMesh?.() === false) return;
+      if (this.#closing || this.#releaseStrict || this.#canConsumeMesh?.() === false) return;
       this.#withOwnershipRead(() => {
         for (const actor of actors.slice(offset, offset + batchSize)) {
-          if (this.#closing || this.#canConsumeMesh?.() === false) return;
+          if (this.#closing || this.#releaseStrict || this.#canConsumeMesh?.() === false) return;
           // Reload/removal, cede and a newly published owner all veto maintenance.
           if (this.#actors.get(actor.id) !== actor || !this.#ownershipDecision(actor.id)) continue;
           this.#realarmBlockedActivation(actor, now);
@@ -5637,11 +5920,11 @@ export class ActorManager {
       });
       await new Promise<void>((resolve) => setImmediate(resolve));
     }
-    if (this.#closing || this.#canConsumeMesh?.() === false) return;
+    if (this.#closing || this.#releaseStrict || this.#canConsumeMesh?.() === false) return;
     // smarty-dev#9508: joined, so close's await of #retentionSweep covers script preparation and a pending acquire.
     if (this.#persistent && this.meshConfig.enabled) {
       await this.#startMeshRetentionSweep();
-      if (this.#closing) return;
+      if (this.#closing || this.#releaseStrict) return;
     }
     if (this.#deadSessionReap && this.#persistent && this.meshConfig.enabled) {
       void this.#notifications.enqueue(() => reapDeadSessionPresence(this.mesh, this.identity, {
@@ -6104,7 +6387,7 @@ export class ActorManager {
 
   #saveActors(removedIds: ReadonlySet<string> = new Set(), options?: {
     durable?: boolean; flush?: boolean; removedLineages?: ReadonlyMap<string, string>; requiredActor?: ManagedActor;
-    operatorRow?: true;
+    operatorRow?: true; assertHeld?: () => void;
   }): Promise<void> {
     ++this.#registrySaveRevision;
     // Serialization is process-local and OUTSIDE custody. A later preparation
@@ -6119,6 +6402,7 @@ export class ActorManager {
     });
     const operation = this.#registrySaveChain.then(() => {
       if (controller.signal.aborted) throw controller.signal.reason;
+      options?.assertHeld?.();
       return this.#saveActorsNow(removedIds, options, controller.signal);
     });
     const saved = Promise.race([operation, cancelled]).finally(() => {
@@ -6131,13 +6415,14 @@ export class ActorManager {
 
   async #saveActorsNow(removedIds: ReadonlySet<string> = new Set(), options?: {
     durable?: boolean; flush?: boolean; removedLineages?: ReadonlyMap<string, string>; requiredActor?: ManagedActor;
-    operatorRow?: true;
+    operatorRow?: true; assertHeld?: () => void;
   }, signal?: AbortSignal): Promise<void> {
     if (!this.#persistent || !this.meshConfig.enabled) return;
     if (this.#registrySaveDurable) options = { ...options, durable: true };
     let committed;
     try {
       committed = await this.#registry.update(current => {
+      options?.assertHeld?.();
       if (signal?.aborted) return undefined;
       const revision = this.#registrySaveRevision;
       // smarty-dev#6829: observe only the ownership inputs of this manager's actors (their
@@ -6180,7 +6465,7 @@ export class ActorManager {
         const states = owned.map(actor => ({ actor, updatedAt: actor.updatedAt, status: actor.status,
           append: this.#unarchivedMessages.get(actor), count: this.#unarchivedMessages.get(actor)?.length }));
         return { actors, durable: removedIds.size > 0 || options?.durable === true || this.#registrySaveDurable,
-          validate: () => !signal?.aborted && revision === this.#registrySaveRevision && ownership.unchanged() &&
+          validate: () => (options?.assertHeld?.(), !signal?.aborted) && revision === this.#registrySaveRevision && ownership.unchanged() &&
             states.every(({ actor, updatedAt, status, append, count }) => this.#actors.get(actor.id) === actor &&
               actor.updatedAt === updatedAt && actor.status === status && !this.#ceded.has(actor.id) &&
               !this.#finishCalls.has(actor.id) && append === this.#unarchivedMessages.get(actor) && append?.length === count),
@@ -6196,7 +6481,19 @@ export class ActorManager {
       }
       throw error;
     }
+    options?.assertHeld?.();
     if (!committed) return;
+    if (options?.assertHeld) {
+      const readback = JSON.parse(this.#readReleaseFile(path.join(this.#actorRoot, "actors.json")) ?? "null") as { format?: number; actors?: Array<Record<string, unknown>> } | null;
+      if (readback?.format !== 1 || !Array.isArray(readback.actors) ||
+          JSON.stringify(readback.actors.map(row => row.id)) !== JSON.stringify(committed.actors.map(row => (row as Record<string, unknown>).id)) ||
+          committed.owned.some(actor => {
+            const row = readback.actors!.find(row => row.id === actor.id);
+            return !row || row.rootId !== actor.rootId || row.residency !== actor.residency || row.status !== actor.status ||
+              row.instructions !== actor.instructions || this.#lineage(row) !== this.#lineage(actor);
+          })) throw new Error("Actor registry release readback differs");
+      options.assertHeld();
+    }
     // Accepted: set synchronously, before the next queued save serializes this row.
     if (options?.operatorRow && options.requiredActor?.removal &&
         committed.owned.includes(options.requiredActor)) options.requiredActor.removal.operator = true;
@@ -6240,7 +6537,7 @@ export class ActorManager {
   #syncActorsFromRegistry(): void {
     // An unchanged registry needs no ownership read; idle polls share the
     // coalesced directory view in #refreshOwnership instead.
-    if (!this.#persistent || this.#closing || this.#reloadingOwnership) return;
+    if (!this.#persistent || this.#closing || this.#releaseStrict || this.#reloadingOwnership) return;
     const fingerprint = this.#registry.fingerprint();
     if (!fingerprint || fingerprint === this.#registryFingerprint) return;
     this.#withOwnershipRead(() => this.#syncActorsFromRegistryNow());
@@ -6486,7 +6783,10 @@ export class ActorManager {
           : {}),
         ...(typeof record.activationBlocked?.reason === "string" && typeof record.activationBlocked?.code === "string" &&
           typeof record.activationBlocked?.since === "number" && typeof record.activationBlocked?.count === "number"
-          ? { activationBlocked: restoredActivationBlock(record.activationBlocked) }
+          ? { activationBlocked: restoredActivationBlock(record.activationBlocked,
+            record.activationBlocked.code === "context-overflow" && retainedOverflowRunId(record.lastRunId)
+              ? readRunRecord(path.join(this.#actorRoot, record.id, "runs", record.lastRunId, "status.json")) : undefined,
+            record.lastRunId, record.id) }
           : {}),
         ...(Number.isSafeInteger(record.failureStreak?.count) && (record.failureStreak?.count ?? 0) > 0 &&
           typeof record.failureStreak?.notified === "boolean"
@@ -6599,7 +6899,14 @@ export class ActorManager {
     // Dead letters from before a restart re-queue once this host manages an idle actor (#816),
     // after restored work: #replayDeadLetters waits while any of it is still parked.
     if (firstLoads.length && this.#persistent) queueMicrotask(() => {
-      for (const actor of firstLoads) { const live = this.#actors.get(actor.id); if (live) this.#replayDeadLetters(live); }
+      for (const actor of firstLoads) {
+        const live = this.#actors.get(actor.id);
+        if (!live) continue;
+        this.#replayDeadLetters(live);
+        // A restored terminal overflow may have no pending activation: repair only the
+        // session/routing at a settled boundary, never resurrect its dropped (possibly toolful) item.
+        if (verifiedOverflowBlock(live.activationBlocked, live.lastRunId)) this.#requestDrain(live);
+      }
     });
   }
 
@@ -6649,6 +6956,7 @@ export class ActorManager {
     sourceId: string; window: SettledWindow; pending: NonNullable<SettledWindow["pending"]>; item: ActorQueueItem;
   }, cancellationFallback = false): boolean {
     if (!this.#persistent || this.#closing || !this.#ownQueueRead.has(actorId)) return false;
+    if (!release) this.#releaseCheckpoint = undefined;
     const actor = this.#actors.get(actorId);
     if (!actor) return false;
     // Ordinary pending saves remain soft. Cancellation and predecessor deletion,
@@ -6748,6 +7056,12 @@ export class ActorManager {
         }
       }
       return false;
+    }
+    if (release && snapshot) {
+      if (JSON.stringify(JSON.parse(this.#readReleaseFile(file) ?? "null")) !== JSON.stringify(snapshot)) {
+        throw new Error(`Actor ${actorId} queue release readback differs`);
+      }
+      this.#releaseQueueSnapshots.set(actorId, { file, snapshot });
     }
     if (durable) {
       for (const { sourceId, window, pending } of savedPendingWindows) {
@@ -7445,6 +7759,7 @@ export class ActorManager {
     if (
       !this.#persistent ||
       this.#closing ||
+      this.#releaseStrict ||
       !this.#canManageActor ||
       this.#claimResidency === undefined ||
       this.#adoptionPending.has(actor.id)
@@ -7494,12 +7809,15 @@ export class ActorManager {
 
   async #confirmAdoption(actor: ManagedActor): Promise<void> {
     try {
-      if (this.#closing) return;
+      if (this.#closing || this.#releaseStrict) return;
+      const epoch = this.#releaseEpoch;
+      const held = () => this.#closing || this.#releaseStrict || epoch !== this.#releaseEpoch;
       const expectedRootId = actor.rootId;
       const participantKey = `topology/participants/${createHash("sha256").update(actor.id).digest("hex")}`;
       const incarnation = await ownProcessIncarnation();
+      if (held()) return;
       await prepareParticipantFileLock(this.mesh, participantKey);
-      if (this.#closing || this.#actors.get(actor.id) !== actor) return;
+      if (held() || this.#actors.get(actor.id) !== actor) return;
       // Prepare the claim without custody; no actor object changes until commit.
       const snapshot = this.#registry.snapshot();
       const current = snapshot.actors.find(record => record.id === actor.id);
@@ -7522,10 +7840,10 @@ export class ActorManager {
         // writes nothing; the registry commit inside it is the R11 exception (plan, A1 X15).
         adopted = await ActorRegistryStore.withLocks([this.#registry], () => withStateFence(this.mesh, this.identity, () =>
           withParticipantFileTryLock(this.mesh, participantKey, incarnation, () => {
-            if (this.#closing || !prepared.valid() || actor.updatedAt !== previousUpdatedAt || actor.rootId !== expectedRootId) return false;
+            if (held() || !prepared.valid() || actor.updatedAt !== previousUpdatedAt || actor.rootId !== expectedRootId) return false;
             if (this.#canManageActor?.(actor.id) !== undefined || this.#lineageMayBeAlive(expectedRootId)) return false;
             if (typeof current.adoptedAt === "number" && Date.now() - current.adoptedAt < this.#adoptionGraceMs) return false;
-            if (this.#closing) return false;
+            if (held()) return false;
             prepared.commit();
             actor.adoptedFrom = adoptedFrom;
             actor.rootId = this.#rootId;
@@ -7535,6 +7853,7 @@ export class ActorManager {
             return true;
           }), 0), "manager-adoption");
       } finally { prepared.dispose(); }
+      if (held() && !adopted) return;
       this.#adoptionRetryAt.delete(actor.id);
       // Close can also begin after the synchronous claim, before lock release
       // resumes us. Do not take over queues or resync/notify a disposed owner.
@@ -7564,7 +7883,7 @@ export class ActorManager {
     } finally {
       this.#adoptionPending.delete(actor.id);
     }
-    if (this.#closing) return;
+    if (this.#closing || this.#releaseStrict) return;
     this.#refreshOwnership();
     this.#emitChange();
   }
@@ -7586,6 +7905,7 @@ export class ActorManager {
     for (const actor of actors) {
       const previous = this.#ownership.get(actor.id) ?? false;
       const next = this.#ownershipDecision(actor.id, fresh);
+      if (this.#releaseStrict && !previous && next) continue; // reacquisition is new admission
       this.#ownership.set(actor.id, next);
       if (previous && !next) {
         void this.#releaseChildCompletionStore(actor);
@@ -7740,6 +8060,8 @@ export class ActorManager {
     let changed = false;
     const overflow = this.#overflow.get(actor.id) ?? [];
     for (const item of [...parked, ...actor.queue, ...overflow]) {
+      // Keep the same-item fresh-session retry ahead of newer work, including after reload.
+      if (item.overflowRetried) continue;
       const key = this.#meshItemKey(actor, item);
       if (key === undefined) continue;
       if (item.coalesceKey !== key) {
@@ -7838,10 +8160,11 @@ export class ActorManager {
   }
 
   #scheduleRestoreParked(): void {
-    if (this.#parked.size === 0 || this.#closing) return;
+    if (this.#parked.size === 0 || this.#closing || this.#releaseStrict) return;
+    const epoch = this.#releaseEpoch;
     queueMicrotask(() => {
-      // An interrupt holds parked work until the user resumes (the halt gate).
-      if (this.#halted || this.#closing) return;
+      // The wake itself grants no admission across a release cut, even if A resumed.
+      if (this.#halted || this.#closing || this.#releaseStrict || epoch !== this.#releaseEpoch) return;
       for (const [id, items] of [...this.#parked]) {
         const actor = this.#actors.get(id);
         if (!actor || actor.status === "stopped" || !this.#canManageCached(id)) continue;

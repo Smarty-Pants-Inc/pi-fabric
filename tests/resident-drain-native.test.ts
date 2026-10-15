@@ -1,9 +1,9 @@
 import fs from "node:fs";
 import http from "node:http";
-import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { createHash } from "node:crypto";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { findExecutable } from "../src/agents/transports/process-utils.js";
@@ -18,6 +18,7 @@ import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import type { ResidentDrainReceipt } from "../src/resident-drain-cli.js";
 import { liveControlOwnerIncarnation } from "./helpers/live-control-owner.js";
 import { launchLog, same } from "./helpers/owned-processes.js";
+import { residentDrainTemp } from "./helpers/resident-drain-temp.js";
 
 const repo = fileURLToPath(new URL("../", import.meta.url));
 const live = (pid: number): boolean => {
@@ -58,23 +59,37 @@ const readJson = <T>(file: string): T => JSON.parse(fs.readFileSync(file, "utf8"
 type QueueItem = { id: string; attempts?: number; launchEvidenceVersion?: number; executionStarted?: boolean };
 type QueueSnapshot = { format: number; items: QueueItem[] };
 const cases = [
-  { mode: "canonical", code: "DRAIN_ADMISSION_PROTOCOL_UNAVAILABLE" },
+  { mode: "canonical", code: "MAIN_AUTHORITY_UNAVAILABLE" },
   { mode: "aliased", code: "MISSING_LAUNCH_ATTESTATION" },
 ] as const;
 
 // Native compiled OLD launcher -> native OLD Pi CLI -> native OLD worker -> native
 // OLD Pi CLI. Only provider inference is substituted by loopback HTTP SSE. The
-// aliased case deliberately addresses the SAME real worker through a fixture-owned
+// current canonical build supports cooperative drain, but this original refusal
+// fixture has no native birth-bound main-generation: its root participant is not
+// sufficient Main authority. Do not manufacture a generation to make it cooperate.
+// The aliased case deliberately addresses the SAME real worker through a fixture-owned
 // symlink outside OLD/dist: residentLaunchSpec genuinely rejects the mixed path,
 // so the real host publishes no handover attestation. No OLD artifact or owner,
 // lease, actor record, checkpoint or history is manufactured or edited.
 // Linux only; fresh `bun run build` is a prerequisite, not a silent skip condition.
-// Default CI uses the current build. Pinned-release proof sets both release envs.
+// Hosted CI uses a fresh current build plus a physical retained target copy.
+// Main supplies two independent retained OLD/NEW builds for the explicit proof.
 // Every fixture root is retained; cleanup signals only exact fixture births.
-describe.skipIf(process.platform !== "linux")("compiled resident-drain refuses real native legacy hosts without disturbing accepted work", () => {
+describe.skipIf(process.platform !== "linux")("compiled resident-drain refuses missing Main authority or legacy attestation without disturbing accepted work", () => {
   it.each(cases)("$mode real worker refuses $code and remains serving", async ({ mode, code }) => {
-    const oldRelease = fs.realpathSync(process.env.FABRIC_DRAIN_TEST_OLD_RELEASE ?? repo);
-    const targetRelease = fs.realpathSync(process.env.FABRIC_DRAIN_TEST_NEW_RELEASE ?? repo);
+    const oldRelease = fs.realpathSync(process.env.FABRIC_DRAIN_TEST_OLD_RELEASE ?? process.env.OLD_RELEASE ?? repo);
+    const privateTemp = residentDrainTemp(`resident-drain-native-${mode}-`);
+    const { root } = privateTemp;
+    const targetInput = process.env.FABRIC_DRAIN_TEST_NEW_RELEASE ?? process.env.NEW_RELEASE;
+    const defaultTarget = path.join(root, "target-release");
+    if (!targetInput) {
+      fs.mkdirSync(defaultTarget, { mode: 0o700 });
+      fs.cpSync(path.join(oldRelease, "dist"), path.join(defaultTarget, "dist"), { recursive: true });
+      fs.copyFileSync(path.join(oldRelease, "package.json"), path.join(defaultTarget, "package.json"));
+    }
+    const targetRelease = fs.realpathSync(targetInput ?? defaultTarget);
+    expect(targetRelease).not.toBe(oldRelease);
     const launcherPath = path.join(oldRelease, "dist/residency/launcher.js");
     const hostEntry = path.join(oldRelease, "dist/residency/pi-entry.js");
     const realWorker = path.join(oldRelease, "dist/worker.js");
@@ -85,7 +100,6 @@ describe.skipIf(process.platform !== "linux")("compiled resident-drain refuses r
       path.join(repo, "bin/fabric-resident-drain"), path.join(targetRelease, "dist/index.js")]) {
       expect(fs.statSync(artifact).isFile(), `fresh compiled artifact required: ${artifact}`).toBe(true);
     }
-    const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), `resident-drain-native-${mode}-`)));
     const observations = observeFixture(root);
     const until = observations.until;
     const owned = launchLog(root);
@@ -174,12 +188,16 @@ describe.skipIf(process.platform !== "linux")("compiled resident-drain refuses r
     // Positive allowlist: unrelated API credentials and SMARTY/fleet state are
     // absent, not merely filtered by a namespace. The only provider credential
     // is the ephemeral loopback key in this fixture's models.json.
-    const env: NodeJS.ProcessEnv = Object.fromEntries(["PATH", "TMPDIR", "LANG", "LC_ALL"].flatMap(key =>
+    const env: NodeJS.ProcessEnv = Object.fromEntries(["PATH", "LANG", "LC_ALL", "GITHUB_ACTIONS", "CI"].flatMap(key =>
       process.env[key] === undefined ? [] : [[key, process.env[key]]]));
-    Object.assign(env, owned.env, { NODE_OPTIONS: `--import=${pathToFileURL(path.join(root, "launch-preload.mjs")).href}`,
-      HOME: root, PI_OFFLINE: "1", PI_CODING_AGENT_DIR: agentDir, PI_FABRIC_MESH_ROOT: meshRoot,
+    // Preserve all preloads; narrow only the standard guard's physical ceiling.
+    // HOME is a private sibling of the mutable work/temp tree, never inside it.
+    Object.assign(env, owned.env, privateTemp.childEnvironment(owned.env.NODE_OPTIONS!), { FABRIC_DRAIN_RECORD_ROOT: root,
+      PI_OFFLINE: "1", PI_CODING_AGENT_DIR: agentDir, PI_FABRIC_MESH_ROOT: meshRoot,
       PI_FABRIC_PROJECT_ROOT: root, PI_FABRIC_RUN_ROOT: path.join(root, "runs"), PI_FABRIC_AGENT_DIR: path.join(root, "exports"),
       PI_FABRIC_PI_BINARY: piBinary, PI_FABRIC_NODE_BINARY: node });
+    expect(env.GITHUB_ACTIONS).toBe(process.env.GITHUB_ACTIONS);
+    expect(env.NODE_OPTIONS).toContain("test-deletion-guard.mjs");
     let launcher: ReturnType<typeof spawn> | undefined;
     let lifetime: ReturnType<typeof watchResidentChild> | undefined;
     let stderr = "";
@@ -203,9 +221,18 @@ describe.skipIf(process.platform !== "linux")("compiled resident-drain refuses r
         expect(exit.code).not.toBe(0);
         const lines = stdout.trim().split("\n"); expect(lines).toHaveLength(1);
         const receipt = JSON.parse(lines[0]!) as ResidentDrainReceipt;
-        expect(receipt).toMatchObject({ ok: false, phase: "preflight", outcome: "refused", resident: config.residencyRoot,
-          expected: expectedRelease, target: targetRelease, unchanged: true, transitionAttempted: false,
+        expect(receipt).toMatchObject({ ok: false, phase: "preflight", outcome: "refused", resident: path.relative(meshRoot, config.residencyRoot),
+          expected: path.relative(meshRoot, expectedRelease), target: path.relative(meshRoot, targetRelease), unchanged: true, transitionAttempted: false,
           rollback: { status: "not-needed", reason: "no-transition-attempted" } });
+        const recordedOwner = readJson<ResidentHostOwner>(ownerFile);
+        expect(stdout).not.toContain(recordedOwner.token);
+        if (recordedOwner.handover) expect(stdout).not.toContain(recordedOwner.handover.launcher.token);
+        // ../ mesh-relative values may contain an absolute-root substring.
+        for (const value of [receipt.resident, receipt.expected, receipt.target,
+          receipt.observed?.loadedRelease.releaseRoot, receipt.observed?.loadedRelease.fabricExtensionPath]) {
+          if (value !== undefined && value !== null) expect(path.isAbsolute(value)).toBe(false);
+        }
+        expect(receipt.observed).not.toHaveProperty("token");
         const result = { expectedRelease, stdout, stderr: commandStderr, exit, receipt };
         commands.push(result); fs.writeFileSync(path.join(root, `cli-${commands.length}.json`), JSON.stringify(result, null, 2));
         return receipt;
@@ -229,6 +256,7 @@ describe.skipIf(process.platform !== "linux")("compiled resident-drain refuses r
       expect(owner.fabricExtensionPath).toBe(path.join(oldRelease, "dist/index.js"));
       if (mode === "canonical") {
         expect(owner.releaseRoot).toBe(oldRelease); expect(owner.configDigest).toMatch(/^[0-9a-f]{64}$/);
+        expect(owner.drain).toMatchObject({ abi: "fabric-resident-drain-1" });
         expect(owner.handover).toMatchObject({ abi: "fabric-resident-1", launcher: { pid: launcherBirth.pid,
           processStartTime: launcherBirth.started, entry: hostEntry } });
       } else {
@@ -279,15 +307,15 @@ describe.skipIf(process.platform !== "linux")("compiled resident-drain refuses r
         expect(requests).toHaveLength(1);
         expect(fs.existsSync(path.join(config.residencyRoot, "handover.json"))).toBe(false);
         expect(fs.existsSync(path.join(config.residencyRoot, "watchdog-custody.json"))).toBe(false);
+        expect(fs.existsSync(path.join(config.residencyRoot, "main-generation.json"))).toBe(false);
+        expect(fs.readdirSync(config.residencyRoot).filter(name => /^drain-[0-9a-f-]+\.json$/.test(name))).toEqual([]);
       };
       const mismatch = await invoke(wrongRelease);
       expect(mismatch.code).toBe("EXPECTED_RELEASE_MISMATCH"); unchanged();
       const refusal = await invoke(oldRelease);
       expect(refusal.code).toBe(code);
       if (mode === "canonical") {
-        expect(refusal.reason).toContain("closes admission and checkpoints accepted work");
-        expect(refusal.reason).toContain("setActivationFilter skips/consumes rather than holds");
-        expect(refusal.reason).toContain("no transition attempted");
+        expect(refusal.reason).toMatch(/main|generation/i);
       } else expect(refusal.reason).toContain("Missing immutable releaseRoot");
       unchanged();
       expect(owned.owned().filter(record => !launchesBefore.includes(`${record.pid}:${record.started}`))).toHaveLength(2);
@@ -322,8 +350,10 @@ describe.skipIf(process.platform !== "linux")("compiled resident-drain refuses r
       expect(launches.filter(record => record.argv[0] === piBinary)).toHaveLength(3); // resident + two activation children
       expect(launches.every(record => [launcherPath, piBinary, realWorker, path.join(repo, "bin/fabric-resident-drain")].includes(record.argv[0] ?? ""))).toBe(true);
       for (const command of commands) expect(command.receipt).toMatchObject({ observed: {
-        rootId: identity.id, hostId: owner.hostId, pid: owner.pid, processStartTime: owner.processStartTime, token: owner.token,
-        loadedRelease: { releaseRoot: owner.releaseRoot ?? null, fabricExtensionPath: owner.fabricExtensionPath },
+        rootId: identity.id, hostId: owner.hostId, pid: owner.pid, processStartTime: owner.processStartTime,
+        tokenFingerprint: `sha256:${createHash("sha256").update(owner.token).digest("hex").slice(0, 16)}`,
+        loadedRelease: { releaseRoot: owner.releaseRoot ? path.relative(meshRoot, owner.releaseRoot) : null,
+          fabricExtensionPath: path.relative(meshRoot, owner.fabricExtensionPath!) },
       } });
       const proof = { mode, root, oldRelease, targetRelease, command: path.join(repo, "bin/fabric-resident-drain"),
         nativePi: piBinary, workerPath, realWorker, owner: ownerBirth, launcher: launcherBirth, ownerToken: owner.token,
@@ -365,12 +395,15 @@ describe.skipIf(process.platform !== "linux")("compiled resident-drain refuses r
         fs.writeFileSync(path.join(root, "cleanup.json"), JSON.stringify(cleanup, null, 2));
         preserve(path.join(root, "cleanup.json"), "cleanup.json");
         expect(liveFixturePids, "only fixture-owned processes must be quiescent after native cleanup").toEqual([]);
+        if (launcher) expect(fs.existsSync(path.join(root, "deletion-guard-audit.jsonl")), "native children must validate and audit the standard guard").toBe(true);
+        privateTemp.assertNoOutsideDeletion(); // Hosted reports fail too, not just local refusals.
         if (fs.existsSync(path.join(root, "proof.json"))) {
           const finalProof = { ...readJson<Record<string, unknown>>(path.join(root, "proof.json")), cleanup };
           fs.writeFileSync(path.join(root, "proof.json"), JSON.stringify(finalProof, null, 2));
           const saved = finalProof as Record<string, unknown>;
           console.info("resident drain offline native refusal proof", JSON.stringify({ mode, root, oldRelease, targetRelease,
-            owner: saved.owner, launcher: saved.launcher, ownerToken: saved.ownerToken, actorId: saved.actorId,
+            owner: saved.owner, launcher: saved.launcher,
+            ownerTokenFingerprint: `sha256:${createHash("sha256").update(String(saved.ownerToken)).digest("hex").slice(0, 16)}`, actorId: saved.actorId,
             secondAcceptedId: saved.secondAcceptedId, refusalCodes: commands.map(command => command.receipt.code),
             providerRequests: saved.providerRequests, secondInputCount: saved.secondInputCount, secondOutputCount: saved.secondOutputCount,
             actorStatus: saved.actorStatus, unchangedOwner: true, targetLauncherSpawns: 0, transitionAttempted: false,
@@ -380,7 +413,7 @@ describe.skipIf(process.platform !== "linux")("compiled resident-drain refuses r
             fs.appendFileSync(proofOut, JSON.stringify(finalProof) + "\n");
           }
         }
-        for (const name of ["proof.json", "cleanup.json", "failure.json", "provider-requests.jsonl", "launches.jsonl", "queue-before.json"]) {
+        for (const name of ["proof.json", "cleanup.json", "failure.json", "provider-requests.jsonl", "launches.jsonl", "queue-before.json", "deletion-guard-audit.jsonl"]) {
           preserve(path.join(root, name), name);
         }
         preserve(path.join(config.residencyRoot, "launcher.log"), "launcher.log");

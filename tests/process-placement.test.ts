@@ -53,6 +53,8 @@ if (mode === 'launch') {
 `;
 const fixture = (pollCommand = false, timeoutMs = 1_000, resolveInheritedSessionPins?: () => InheritedSessionPin[] | undefined, live = false) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-placement-")); roots.push(root);
+  // Remote cwd fixtures are siblings of the caller's private TMPDIR, not its descendants.
+  const callerTmp = path.join(root, "caller-tmp"); fs.mkdirSync(callerTmp); vi.stubEnv("TMPDIR", callerTmp);
   const profile = path.join(root, "profile"); fs.mkdirSync(profile); vi.stubEnv("PI_CODING_AGENT_DIR", profile);
   const launcher = path.join(root, "launcher.mjs"); fs.writeFileSync(launcher, fake);
   const results = path.join(root, "results");

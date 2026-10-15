@@ -317,6 +317,8 @@ interface FabricTargetTerminalNotice {
   sender?: { id: string; kind: "main" | "actor" | "agent" | "remote"; name?: string; verified: "mesh" | "bridge" };
 }
 interface FabricAgentHandle {
+  /** Spawn catalog discovery failed open when unverified. */
+  modelVerification?: "verified" | "unverified";
   /** Durable answer boundary; does not confirm native worker/tree exit. */
   finalAnswerReceipt?: { id: string; recordedAt: number };
   /** Canonical Fabric release actually selected for this process child. */

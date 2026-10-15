@@ -33,6 +33,7 @@ const hostedOnlyDeletionSuites = [
   "tests/residency.test.ts", // restored/tampered worktree cleanup and fixture teardown invoke git removal.
   "tests/routed-session-boundaries.test.ts", // rollback and successful cleanup invoke git worktree remove.
   "tests/stall-alarms.test.ts", // nice/bun crash fixture reaches MeshStore/lock cleanup before its crash.
+  "tests/task-write-policy.test.ts", // sentinel run's native proof timed out; unproven slice stays hosted-only (#13018).
   "tests/temp-run-sweep.test.ts", // scriptSpawnArgs selects Bun for the real .ts sweep entry.
   "tests/verified-remove-windows.test.ts", // fabric-win-remove.exe deletes by handle, outside Node fs.
   "tests/windows-temp-root-native.test.ts", // diskpart formats a native NTFS VHD mounted outside TMPDIR.

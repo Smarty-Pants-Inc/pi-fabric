@@ -509,7 +509,7 @@ const hostedOnlySuites = ["tests/actor-child-completion-idle-preflight.test.ts",
   "tests/actor-remove-dead-root.test.ts", "tests/agent-manager.test.ts", "tests/agent-release-observation.test.ts",
   "tests/agents-provider.test.ts", "tests/residency-commit-fence.test.ts", "tests/residency-stopped-writer-retention.test.ts",
   "tests/residency.test.ts", "tests/routed-session-boundaries.test.ts", "tests/stall-alarms.test.ts",
-  "tests/temp-run-sweep.test.ts", "tests/verified-remove-windows.test.ts", "tests/windows-temp-root-native.test.ts"];
+  "tests/task-write-policy.test.ts", "tests/temp-run-sweep.test.ts", "tests/verified-remove-windows.test.ts", "tests/windows-temp-root-native.test.ts"];
 const guardableSuites = ["tests/actor-directory.test.ts",
   "tests/mesh-backend-migration-nats.test.ts",
   "tests/state-backend-nats.test.ts", "tests/residency-operator-actors.test.ts", "tests/mesh-publish-batch-hold.test.ts",

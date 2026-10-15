@@ -118,6 +118,7 @@ async function childMain(meshRoot: string, sessionId: string, slow: boolean) {
       const { action, request } = message;
       if (action === "snapshot") emit({ request, calls: calls.slice(), ready, claim: claim?.lease });
       else if (action === "ready") { await markReady(Number(message.expiryMs ?? 60_000)); emit({ request, ok: true }); }
+      else if (action === "retire") { await plane?.close(); emit({ request, ok: true }); }
       else if (action === "handoff") {
         assert(claim);
         // This helper must persist clean-handoff authority under lease custody.
@@ -228,11 +229,19 @@ export async function runCase(name: ProbeCase) {
     assert(original.process);
     assert(original.process.pid === incumbent.child.pid && original.process.host === os.hostname());
     assert.equal(localStartTime(incumbent.child.pid!), original.process.startTime);
+    if (name === "live") {
+      assert.equal(await startupApi.markHostLeaseCleanHandoff(meshAt(root), original,
+        { ownIncarnation: original.process.startTime }), false, "a public predecessor token is not handoff authority");
+      assert.equal(read().cleanHandoff, undefined);
+    }
     if (name === "birth" || name === "unknown") {
       const mesh = meshAt(root);
       // Simulated old birth is explicitly fixture data for a STILL LIVE real PID.
       // A nonempty malformed identity is UNKNOWN, not a comparable old birth.
       // Start with a future lease to catch pre-expiry malformed-identity takeover.
+      // PID reuse means the live PID is NOT the old receiver. Keep the real process
+      // alive, but retire its control listener before representing that unrelated PID.
+      if (name === "birth") await incumbent.rpc("retire");
       const modified = { ...original, expiresAt: name === "birth" ? Date.now() - 1 : Date.now() + 60_000,
         process: { ...original.process, startTime: name === "birth"
           ? differentNativeBirth(original.process.startTime) : "unproven" } };
@@ -256,6 +265,8 @@ export async function runCase(name: ProbeCase) {
         assert.equal(read().process?.startTime, "unproven");
         // TRANSITIONAL legacy compatibility: missing pid+birth retains its old TTL,
         // but cannot be replaced BEFORE that TTL. A known live identity never uses this.
+        // Older releases can quiesce without writing the new handoff/identity fields.
+        await incumbent.rpc("retire");
         const legacy = { ...modified, process: undefined, expiresAt: Date.now() + 1_800 };
         await leases.withOwnedHostLease(mesh, original, () => leases.writeHostLease(root, legacy));
         await delay(300);

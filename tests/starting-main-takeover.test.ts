@@ -1,6 +1,6 @@
 // Keep: same-session startup takeover is an inbox-privacy and process-authority boundary.
-// Real-process gate (SIGKILL targets only owned fixture children); intentionally opt-in.
-// Parent gate: PI_FABRIC_STARTING_TAKEOVER_REAL=1 bunx vitest run tests/starting-main-takeover.test.ts
+// Real-process gate: SIGKILL targets only owned fixture children.
+// Run directly: bunx vitest run --cache=false tests/starting-main-takeover.test.ts
 // All evidence roots are retained in this invocation's TMPDIR; no cleanup/removal.
 import fs from "node:fs";
 import os from "node:os";
@@ -10,7 +10,6 @@ import { spawn } from "node:child_process";
 import { describe, expect, it } from "vitest";
 
 const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const enabled = process.env.PI_FABRIC_STARTING_TAKEOVER_REAL === "1";
 const cases = [
   ["live", "keeps the successor pending across expiry while the incumbent receives private followUps"],
   ["death", "takes over after the owned incumbent PID is gone, delivering a retried message exactly once"],
@@ -22,7 +21,7 @@ const cases = [
 
 describe("real-process starting Main defensive takeover", () => {
   for (const [name, contract] of cases) {
-    it.skipIf(!enabled)(contract, async () => {
+    it(contract, async () => {
       const tmp = fs.mkdtempSync(path.join(os.tmpdir(), `starting-main-gate-${name}-`));
       const child = spawn(process.env.BUN_BIN ?? "bun", ["scripts/probe-starting-host-takeover.ts", "--case", name], {
         cwd: repo, env: { ...process.env, TMPDIR: tmp, TMP: tmp, TEMP: tmp },

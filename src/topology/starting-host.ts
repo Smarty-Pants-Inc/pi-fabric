@@ -6,7 +6,7 @@ import { execFileSync } from "node:child_process";
 import { ownProcessIncarnation, validProcessIncarnation } from "../core/atomic-write.js";
 import { acquireMeshCustodyLock } from "../mesh/custody-lock.js";
 import { FabricParticipantStaleError, FabricHostLeaseSupersededError, FabricHostLeaseLegacyBusyError, hostLeasePredecessor, renewHostLease, readHostLeaseCurrent,
-  sameHostLeaseOwner, sameHostLeaseVersion, withOwnedHostLease, writeHostLease, meshWriterLeaseRecord, type FabricHostLease } from "./host-leases.js";
+  sameHostLeaseOwner, sameHostLeaseVersion, assertHostLeaseOwner, hostLeasePath, writeHostLease, meshWriterLeaseRecord, type FabricHostLease } from "./host-leases.js";
 import { watchBridgeStore } from "../mesh/change-notifier.js";
 import type { HostLeaseMesh } from "./host-lease-lock.js";
 
@@ -44,7 +44,9 @@ const startupMesh = (root: string, lockProtocol: 1 | 2 | 3): HostLeaseMesh => ({
     const hash = createHash("sha256").update(path.basename(file)).digest("hex");
     const legacy = path.join(root, "host-lease-commits", hash);
     const domain = fs.existsSync(legacy) ? legacy : path.join(root, "host-lease-commits", hash.slice(0, 16));
-    const release = await acquireMeshCustodyLock(domain, timeoutMs, { ...options, hostQualified: true, lockProtocol });
+    // Bootstrap holds no registry locks. Join a clean handoff's in-flight custody
+    // release with the existing bounded lock acquisition, rather than failing startup.
+    const release = await acquireMeshCustodyLock(domain, Math.max(timeoutMs, 5_000), { ...options, hostQualified: true, lockProtocol });
     try { return await operation(); } finally { release(); }
   },
 });
@@ -104,14 +106,16 @@ const waitForPredecessorChange = (meshRoot: string, predecessor: FabricHostLease
  * release authority: prove this process's native birth again while holding custody. */
 export const markHostLeaseCleanHandoff = async (mesh: HostLeaseMesh, owner: FabricHostLease,
   options: { ownIncarnation: string | undefined }): Promise<boolean> =>
-  await withOwnedHostLease(mesh, owner, () => {
+  await mesh.leaseCustody(hostLeasePath(mesh.root, owner.id), () => {
+    assertHostLeaseOwner(mesh.root, owner);
     const current = hostLeasePredecessor(mesh.root, owner.id)!;
     const p = current.process;
     if (!options.ownIncarnation || !p || p.pid !== process.pid || p.host !== os.hostname() ||
       p.startTime !== options.ownIncarnation || localStartTime(process.pid) !== p.startTime) return false;
     writeHostLease(mesh.root, { ...current, cleanHandoff: current.incarnationToken! });
+    assertHostLeaseOwner(mesh.root, owner);
     return true;
-  }, options);
+  }, 5_000, options);
 
 /** Native announcing Main claims before runtime import, including a clean predecessor exit. */
 export const claimStartingHost = async (input: {

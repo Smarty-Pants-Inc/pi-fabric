@@ -250,7 +250,7 @@ export interface FabricHostLease {
   process?: { pid: number; host: string; startTime: string };
   startup?: FabricHostStartup;
   /** Predecessor-authored release, fenced to this exact lease token after work has drained. */
-  cleanHandoff?: string;
+  cleanHandoff?: string | undefined;
   /** Root Main's bounded reload lease; absent on ordinary heartbeats and older writers. */
   reloadUntil?: number;
   /** Main session has a fixed 15 s TTL, independent of the host TTL. */

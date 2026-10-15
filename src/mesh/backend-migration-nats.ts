@@ -29,7 +29,8 @@ import { randomBytes, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { renameAtomic } from "../core/atomic-write.js";
-import { encodeMeshStateNatsMarker, readMeshStateMovedMarker, readMeshStateNatsMarker } from "./backend-fence.js";
+import { encodeMeshStateNatsMarker, meshStateMalformedMarkerError, readMeshStateMovedMarker, readMeshStateNatsMarker,
+  stateFileIsMalformedNatsMarker } from "./backend-fence.js";
 import { MeshBackendRefusedError, meshSnapshotDigest, normalizeSnapshot, type MeshBackendStep, type MeshStateSnapshot } from "./backend-migration.js";
 import { holdMeshFence } from "./fence-lock.js";
 import { applyNatsMessage, assertNatsMaxPayload, assertNatsServerSupported, connectNatsEndpoint, isNatsStreamForRoot, MAX_MESSAGE_BYTES,
@@ -141,6 +142,13 @@ const readIntent = (root: string): NatsIntent | undefined => {
 const removeIntent = (root: string): void => {
   fs.rmSync(path.join(root, INTENT), { force: true });
   fsyncDirectory(root);
+};
+/**
+ * A rollback's cleanup (LD-02): removes the intent only when it (re-read and validated, under the fence) names `stream`,
+ * the switch this rollback retired; an intent of another (newer, staged) switch is never this rollback's and stays.
+ */
+const removeOwnIntent = (root: string, stream: string): void => {
+  if (readIntent(root)?.stream === stream) removeIntent(root);
 };
 
 export interface MeshNatsMigrationResult {
@@ -573,11 +581,15 @@ export const rollbackMeshStateFromNats = (root: string, options: MeshNatsMigrati
     root = path.resolve(root);
     const limits = limitsOf(options);
     const marker = readMeshStateNatsMarker(root);
+    // LD-02: an intent present is validated BEFORE anything is retired or renamed (an invalid one refuses here).
+    readIntent(root);
     let { projection, head } = await project(port, stream, limits);
     if (!marker) {
       // A rerun after the rename: done when the stream is retired and state.json holds its state.
       const digest = meshSnapshotDigest(snapshotOf(projection));
       if (projection.status === "retired" && meshSnapshotDigest(readSource(path.join(root, STATE_JSON), options)) === digest) {
+        // A crash after the rename left this switch's intent: remove it (only if it is this stream's).
+        removeOwnIntent(root, stream);
         return { root, stream, epoch: projection.epoch, digest, entries: projection.entries.size, tombstones: projection.tombstones.length, converged: true };
       }
       throw new MeshBackendRefusedError(`Fabric mesh NATS rollback refused for ${root}: state.json is not the NATS marker of ${stream}`);
@@ -611,6 +623,9 @@ export const rollbackMeshStateFromNats = (root: string, options: MeshNatsMigrati
     if (meshSnapshotDigest(readSource(path.join(root, STATE_JSON), options)) !== digest) {
       throw new MeshBackendRefusedError("Fabric mesh NATS rollback verification: state.json does not hold the stream's state");
     }
+    // LD-02: a rollback after the marker but before import-commit retires the intent's stream: its intent goes too, so the
+    // next import allocates a NEW switch instead of reselecting the retired stream.
+    removeOwnIntent(root, stream);
     return { root, stream, epoch: projection.epoch, digest, entries: projection.entries.size, tombstones: projection.tombstones.length, converged: false };
   });
 
@@ -626,7 +641,19 @@ export const abandonMeshNatsImport = async (root: string, options: MeshNatsMigra
   const { port, owned } = await connectNatsEndpoint(options);
   try {
     return await holdMeshFence(root, { lockProtocol: options.lockProtocol ?? 1, lockTimeoutMs: options.lockTimeoutMs ?? DEFAULT_LOCK_MS }, async () => {
+      // LD-03: a malformed marker is never "no marker" (as the import and rollback preflights): refuse before any stream call.
+      const statePath = path.join(root, STATE_JSON);
+      if (stateFileIsMalformedNatsMarker(root)) throw meshStateMalformedMarkerError(statePath);
       if (readMeshStateNatsMarker(root)) throw new MeshBackendRefusedError(`Fabric mesh NATS abandon refused for ${root}: the marker names the stream (roll back instead)`);
+      // LD-03: a present state.json must be a strict, readable file state (a failed import keeps it so); truncated,
+      // invalid, another marker or unreadable (EACCES, ...) refuses. Absent: a crash before the source was read.
+      if (fs.lstatSync(statePath, { throwIfNoEntry: false }) !== undefined) {
+        try { readSource(statePath, options); }
+        catch (error) {
+          throw new MeshBackendRefusedError(`Fabric mesh NATS abandon refused for ${root}: ${statePath} is not a readable file state `
+            + `(${error instanceof Error ? error.message : String(error)}); repair it first`);
+        }
+      }
       const intent = readIntent(root);
       if (!intent) throw new MeshBackendRefusedError(`Fabric mesh NATS abandon refused for ${root}: no ${INTENT} (nothing to abandon)`);
       // readIntent already bound the stream to this root and switch; checked again right before a delete.

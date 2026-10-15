@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { importMeshStateToNats } from "../src/mesh/backend-migration-nats.js";
-import { closeNatsStateBackend, natsStreamName, openNatsStateBackend } from "../src/mesh/state-backend-nats.js";
+import { closeNatsStateBackend, MeshStateNatsUnavailableError, natsStreamName, openNatsStateBackend } from "../src/mesh/state-backend-nats.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { startNatsElectionCluster, stopNatsElectionCluster, type NatsElectionCluster } from "./helpers/nats-election-cluster.js";
 
@@ -16,6 +16,13 @@ afterEach(async () => {
   }
 });
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+const streamInfo = async (seed: string, stream: string) => {
+  const [{ connect }, { jetstreamManager }] = await Promise.all([import("@nats-io/transport-node"), import("@nats-io/jetstream")]);
+  const nc = await connect({ servers: [seed], ignoreClusterUpdates: true });
+  try { return await (await jetstreamManager(nc)).streams.info(stream); }
+  finally { await nc.drain(); }
+};
+const streamReplicas = async (seed: string, stream: string): Promise<number> => (await streamInfo(seed, stream)).config.num_replicas;
 const getMonitorJson = async (url: string): Promise<Record<string, any>> => {
   const response = await fetch(url, { signal: AbortSignal.timeout(500) });
   if (!response.ok) throw new Error(`${url} returned HTTP ${response.status}`);
@@ -46,12 +53,12 @@ const observePeerElection = async (cluster: NatsElectionCluster, paused: string,
   throw new Error(`healthy peers did not agree on a new metadata leader before SIGCONT: ${JSON.stringify(last)}`);
 };
 describe("real three-node NATS metadata-leader election", () => {
-  it.skipIf(!binary)("keeps reads, migrations, and new-root opens healthy through metadata-leader election", async () => {
+  it.skipIf(!binary)("bounds unavailable R3 placement and recovers migrations and new-root opens when the peer returns", async () => {
     const cluster = await startNatsElectionCluster(binary!);
     clusters.push(cluster);
     const root = path.join(cluster.root, "mesh-state");
     fs.mkdirSync(root);
-    let options = { servers: [cluster.seedUrl], monitoringUrl: cluster.seedMonitorUrl, replicas: 3 };
+    const options = { servers: [cluster.seedUrl], monitoringUrl: cluster.seedMonitorUrl, replicas: 3 };
     const seedBackend = await openNatsStateBackend({ root, ...options, maxEventBytes: 64 * 1024 });
     try { await seedBackend.put({ key: "election/seed", value: { durable: true }, identity }); }
     finally { closeNatsStateBackend(root); }
@@ -62,6 +69,10 @@ describe("real three-node NATS metadata-leader election", () => {
     const { connectJetStream } = await import("../src/mesh/state-backend-nats-client.js");
     const faultRoots = Array.from({ length: 5 }, (_, index) => path.join(cluster.root, `fault-open-${index + 1}`));
     const migrationRoot = path.join(cluster.root, "fault-migration");
+    const unavailableRoot = path.join(cluster.root, "placement-unavailable");
+    const unavailableStore = new MeshStore(unavailableRoot, 64 * 1024, 1_000, { stateBackend: "file" });
+    try { await unavailableStore.put({ key: "election/unavailable", value: { durable: true }, identity }); }
+    finally { unavailableStore.closeState(); }
     const migrationStore = new MeshStore(migrationRoot, 64 * 1024, 1_000, { stateBackend: "file" });
     try { await migrationStore.put({ key: "election/fault-migration", value: { durable: true }, identity }); }
     finally { migrationStore.closeState(); }
@@ -92,15 +103,13 @@ describe("real three-node NATS metadata-leader election", () => {
             resumedAt = Date.now();
             resolve(paused.child.kill("SIGCONT"));
           };
-          const safetyTimer = setTimeout(resume, 15_000);
+          const safetyTimer = setTimeout(resume, 70_000);
           resumeNow = resume;
         });
         migrationOptions = { servers: [cluster.seedUrl], monitoringUrl: cluster.seedMonitorUrl, replicas: 3 };
         directReads = Promise.allSettled([
           raw!.streamExists(initial.stream), raw!.lastSequence(initial.stream), raw!.getMessage(initial.stream, sequence),
         ]);
-        migrationsPromise = Promise.allSettled([importMeshStateToNats(migrationRoot, migrationOptions)]);
-        opensPromise = Promise.allSettled(faultRoots.map(rootPath => openNatsStateBackend({ root: rootPath, ...migrationOptions })));
       }, async survivingSeed => {
         raw = await connectJetStream([survivingSeed], { monitoringUrl: cluster.seedMonitorUrl, replicas: 3 });
         sequence = await raw.lastSequence(initial.stream);
@@ -110,18 +119,60 @@ describe("real three-node NATS metadata-leader election", () => {
       let peerObservationError: string | undefined;
       try { peerStates = await observePeerElection(cluster, leader.name, pausedAt + 14_500); }
       catch (error) { peerObservationError = error instanceof Error ? error.message : String(error); }
+      expect(peerStates, peerObservationError ?? "healthy peers did not elect a different metadata leader").toBeDefined();
+      // NATS 2.14.7 selectPeerGroup intentionally allows R3 on two live peers when the third's config/stats
+      // are known. Missing peer metadata instead returns 10005. Both are valid; neither may degrade to R1.
+      // See upstream jetstream_cluster.go:8193 and :8313-8325 and TestJetStreamClusterCreateR3StreamWithOfflineNodes.
+      const placementTimeoutMs = 30_000;
+      const startedAt = Date.now();
+      const placement = await importMeshStateToNats(unavailableRoot, { ...migrationOptions!, placementTimeoutMs }).then(
+        value => ({ kind: "success-r3" as const, value }), error => ({ kind: "unavailable" as const, error }));
+      const elapsedMs = Date.now() - startedAt;
+      console.log(`NATS_PLACEMENT_OUTCOME ${JSON.stringify({ branch: placement.kind, placementTimeoutMs, elapsedMs })}`);
+      expect(elapsedMs).toBeLessThan(placementTimeoutMs + 2_000);
+      expect(resumedAt, "placement must settle before the safety SIGCONT").toBe(0);
+      if (placement.kind === "unavailable") {
+        expect(placement.error).toBeInstanceOf(MeshStateNatsUnavailableError);
+        expect(placement.error).toMatchObject({ code: "FABRIC_MESH_STATE_NATS_UNAVAILABLE", reason: "placement-unavailable", natsErrCode: 10005 });
+        expect(elapsedMs).toBeGreaterThanOrEqual(placementTimeoutMs);
+        expect(await raw!.streamExists(natsStreamName(unavailableRoot))).toBe(false);
+      } else {
+        expect(await streamReplicas(cluster.seedUrl, placement.value.stream)).toBe(3);
+        const duringPause = await openNatsStateBackend({ root: unavailableRoot, ...migrationOptions! });
+        try { await duringPause.put({ key: "election/during-pause", value: { durable: true }, identity }); }
+        finally { closeNatsStateBackend(unavailableRoot); }
+        expect(resumedAt, "the R3 write must commit before SIGCONT").toBe(0);
+      }
+      // Counterexample: a normal peer restart within the default 30s budget must recover at R3.
+      migrationsPromise = Promise.allSettled([importMeshStateToNats(migrationRoot, migrationOptions!)]);
+      opensPromise = Promise.allSettled(faultRoots.map(rootPath => openNatsStateBackend({ root: rootPath, ...migrationOptions })));
+      await sleep(250);
       resumeNow?.();
       const resumed = await resumePromise!;
       const [readResults, migrations, openResults] = await Promise.all([directReads!, migrationsPromise!, opensPromise!]);
+      if (placement.kind === "success-r3") {
+        // Observe the actual resumed stream replica becoming current, then reopen through that node and read
+        // the write committed during its pause. Merely seeing num_replicas:3 on the healthy seed is not enough.
+        await expect.poll(async () => {
+          const info = await streamInfo(cluster.seedUrl, placement.value.stream);
+          return info.cluster?.leader === leader!.name || info.cluster?.replicas?.some(peer => peer.name === leader!.name && peer.current) === true;
+        }, { timeout: 10_000, interval: 100 }).toBe(true);
+        const caughtUp = await openNatsStateBackend({ root: unavailableRoot, servers: [leader.clientUrl], monitoringUrl: leader.monitorUrl, replicas: 3 });
+        try { expect(caughtUp.get("election/during-pause")?.value).toEqual({ durable: true }); }
+        finally { closeNatsStateBackend(unavailableRoot); }
+      }
       const details = (results: PromiseSettledResult<unknown>[]) => results.map(result => result.status === "rejected"
         ? (result.reason instanceof Error ? result.reason.stack ?? result.reason.message : String(result.reason)) : "fulfilled");
       expect(resumed, `timer failed to SIGCONT paused leader ${leader.name}`).toBe(true);
       expect(peerStates, peerObservationError ?? "healthy peers did not elect a different metadata leader").toBeDefined();
       expect(migrationOptions!.servers).toEqual([cluster.seedUrl]);
       expect(readResults.map(result => result.status), `all direct reads must work during the bounded election: ${JSON.stringify(details(readResults))}`).toEqual(["fulfilled", "fulfilled", "fulfilled"]);
-      expect(migrations.map(result => result.status), `new-root migration must work during the bounded election: ${JSON.stringify(details(migrations))}`).toEqual(["fulfilled"]);
+      expect(migrations.map(result => result.status), `new-root R3 migration must recover when placement returns within budget: ${JSON.stringify(details(migrations))}`).toEqual(["fulfilled"]);
       const fresh = migrations[0]!.status === "fulfilled" ? migrations[0]!.value : undefined;
       expect(fresh, `new-root migration failed: ${JSON.stringify(migrations[0])}`).toMatchObject({ stream: natsStreamName(migrationRoot), entries: 1 });
+      const replicas = await streamReplicas(cluster.seedUrl, fresh!.stream);
+      expect(replicas).toBe(3);
+      expect(await Promise.all(faultRoots.map(rootPath => streamReplicas(cluster.seedUrl, natsStreamName(rootPath))))).toEqual([3, 3, 3, 3, 3]);
       expect(openResults.map(result => result.status), `all five new-root backend opens must work during the bounded election: ${JSON.stringify(details(openResults))}`).toEqual(["fulfilled", "fulfilled", "fulfilled", "fulfilled", "fulfilled"]);
       const freshConverged = await importMeshStateToNats(migrationRoot, migrationOptions!);
       expect(freshConverged).toMatchObject({ stream: natsStreamName(migrationRoot), entries: 1, converged: true });
@@ -132,14 +183,15 @@ describe("real three-node NATS metadata-leader election", () => {
       expect(recoveryReads[1]).toBeGreaterThanOrEqual(sequence);
       expect(recoveryReads[2]).toBeDefined();
       expect(await importMeshStateToNats(migrationRoot, migrationOptions!)).toMatchObject({ stream: natsStreamName(migrationRoot), entries: 1, converged: true });
-      console.log(`NATS_ELECTION_FAULT ${JSON.stringify({ pausedLeader: leader.name, seedSurvived: cluster.seedUrl !== leader.clientUrl, stoppedLeaderMs: resumedAt - pausedAt, differentLeaderObserved: peerStates, directReadsDuringPause: readResults.map(result => result.status), newRootMigrationDuringPause: { stream: fresh!.stream, entries: fresh!.entries }, newRootConvergence: freshConverged.converged, newRootOpensDuringPause: openResults.map(result => result.status), recoveryReads: "passed", recoveryMigrations: "passed" })}`);
+      console.log(`NATS_ELECTION_FAULT ${JSON.stringify({ pausedLeader: leader.name, seedSurvived: cluster.seedUrl !== leader.clientUrl, stoppedLeaderMs: resumedAt - pausedAt, differentLeaderObserved: peerStates, directReadsDuringPause: readResults.map(result => result.status), placementOutcome: { branch: placement.kind, placementTimeoutMs, elapsedMs, preResumeWriteCaughtUp: placement.kind === "success-r3" ? true : "not-applicable" }, recoveredMigration: { stream: fresh!.stream, entries: fresh!.entries, replicas }, newRootConvergence: freshConverged.converged, newRootOpensDuringPause: openResults.map(result => result.status), recoveryReads: "passed", recoveryMigrations: "passed" })}`);
     } finally {
-      if (leader && leader.child.exitCode === null && leader.child.signalCode === null) leader.child.kill("SIGCONT");
+      resumeNow?.();
       if (resumePromise) await resumePromise;
       await raw?.close();
       for (const rootPath of faultRoots) closeNatsStateBackend(rootPath);
       closeNatsStateBackend(root);
       closeNatsStateBackend(migrationRoot);
+      closeNatsStateBackend(unavailableRoot);
     }
 
     // Both competing real JetStream publishes use the same expected last sequence. Exactly one may commit.

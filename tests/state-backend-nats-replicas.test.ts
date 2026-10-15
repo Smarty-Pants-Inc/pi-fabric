@@ -27,6 +27,8 @@ const fake = vi.hoisted(() => {
     publishErrors: [] as unknown[],
     drains: 0,
     addStop: false,
+    addErrors: [] as unknown[],
+    addDelays: [] as number[],
     addErrorAfterStore: false,
     addStoredConfigOverride: undefined as Record<string, unknown> | undefined,
     createdWithoutLeader: false,
@@ -106,6 +108,10 @@ vi.mock("@nats-io/jetstream", () => ({
       add: async (config: Record<string, unknown> & { name: string }) => {
         fake.log.push({ op: "add", args: [structuredClone(config)] });
         if (fake.addStop) throw new Error("fake: add recorded, stop");
+        const delay = fake.addDelays.shift() ?? 0;
+        if (delay > 0) await new Promise<void>(resolve => setTimeout(resolve, delay));
+        const error = fake.addErrors.shift();
+        if (error !== undefined) throw error;
         const created = { config: { ...config, ...fake.addStoredConfigOverride }, state: { last_seq: 0, first_seq: 0 },
           cluster: fake.createdWithoutLeader ? {} : { leader: "n1" } };
         fake.streams.set(config.name, created);
@@ -131,7 +137,7 @@ vi.mock("@nats-io/jetstream", () => ({
 }));
 
 const { connectJetStream } = await import("../src/mesh/state-backend-nats-client.js");
-const { MeshStateNatsBusyError, MeshStateNatsRefusedError, connectNatsEndpoint, natsStreamName, openNatsStateBackend } = await import("../src/mesh/state-backend-nats.js");
+const { MeshStateNatsBusyError, MeshStateNatsRefusedError, MeshStateNatsUnavailableError, connectNatsEndpoint, natsStreamName, openNatsStateBackend } = await import("../src/mesh/state-backend-nats.js");
 const { normalizeFabricConfig } = await import("../src/config.js");
 
 const STREAM = "FABRIC_MESH_REPLICAS_TEST";
@@ -190,6 +196,8 @@ beforeEach(() => {
   fake.publishErrors.length = 0;
   fake.drains = 0;
   fake.addStop = false;
+  fake.addErrors.length = 0;
+  fake.addDelays.length = 0;
   fake.addErrorAfterStore = false;
   fake.addStoredConfigOverride = undefined;
   fake.createdWithoutLeader = false;
@@ -327,6 +335,137 @@ describe("NATS client read resilience (pure fakes)", () => {
     fake.publishErrors.push(fake.wrappedTransient());
     const error = await refusal(port.publish("subject", new Uint8Array(), { expectLastSequence: 0, msgID: "id" }));
     expect((error as { transient?: unknown }).transient).toBe(true);
+  });
+});
+
+// Decision C: data-safety regression #12881. The real cluster flow below owns R3 recovery proof;
+// deterministic clocks cover deadline/request boundaries and error counterexamples that are costly there.
+describe("NATS stream placement budget (smarty-dev#12881)", () => {
+  const placementFault = () => new fake.FakeJetStreamApiError(10005, 400);
+  const adds = () => fake.log.filter(entry => entry.op === "add");
+  const placementOptions = (placementTimeoutMs: number) => ({ replicas: 3, placementTimeoutMs });
+
+  it("waits exactly one configured budget, then preserves the typed unavailable error through the port guard", async () => {
+    fake.addErrors.push(...Array.from({ length: 10 }, placementFault));
+    vi.useFakeTimers();
+    try {
+      const port = await connectJetStream(SERVERS, placementOptions(350));
+      let settled = false;
+      const result = port.ensureStream(STREAM, SUBJECTS, { maxMsgSize: 1024 * 1024 }).then(
+        () => { settled = true; return undefined; }, error => { settled = true; return error; });
+      await vi.advanceTimersByTimeAsync(349);
+      expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      const error = await result;
+      expect(error).toBeInstanceOf(MeshStateNatsUnavailableError);
+      expect(error).toMatchObject({ code: "FABRIC_MESH_STATE_NATS_UNAVAILABLE", reason: "placement-unavailable" });
+      expect((error as Error).message).toContain("10005");
+      expect((error as Error).message).toMatch(/placement/i);
+      expect(adds().length).toBeGreaterThan(1);
+      expect(adds().every(entry => (entry.args[0] as { num_replicas: number }).num_replicas === 3)).toBe(true);
+      expect(fake.streams.size).toBe(0);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("recovers placement before the deadline with identical R3 configuration", async () => {
+    fake.addErrors.push(placementFault(), placementFault());
+    vi.useFakeTimers();
+    try {
+      const port = await connectJetStream(SERVERS, placementOptions(1_000));
+      const result = port.ensureStream(STREAM, SUBJECTS, { maxMsgSize: 1024 * 1024 }).then(value => value, error => error);
+      await vi.advanceTimersByTimeAsync(750);
+      expect(await result).toEqual({ lastSeq: 0, maxMsgSize: 1024 * 1024 });
+      expect(adds()).toHaveLength(3);
+      expect(adds().every(entry => JSON.stringify(entry.args) === JSON.stringify(adds()[0]!.args))).toBe(true);
+      expect(fake.streams.get(STREAM)?.config.num_replicas).toBe(3);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("does not let a pending CREATE extend the placement deadline", async () => {
+    fake.addErrors.push(placementFault());
+    fake.addDelays.push(0, 5_000);
+    vi.useFakeTimers();
+    try {
+      const port = await connectJetStream(SERVERS, placementOptions(350));
+      const result = port.ensureStream(STREAM, SUBJECTS, { maxMsgSize: 1024 * 1024 }).then(() => undefined, error => error);
+      await vi.advanceTimersByTimeAsync(350);
+      expect(await result).toBeInstanceOf(MeshStateNatsUnavailableError);
+      expect(adds()).toHaveLength(2);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("shares the placement deadline with post-create leader readiness instead of granting another 10s", async () => {
+    fake.addErrors.push(placementFault());
+    fake.createdWithoutLeader = true;
+    fake.leaderPolls = Number.MAX_SAFE_INTEGER;
+    vi.useFakeTimers();
+    try {
+      const port = await connectJetStream(SERVERS, placementOptions(350));
+      const result = port.ensureStream(STREAM, SUBJECTS, { maxMsgSize: 1024 * 1024 }).then(() => undefined, error => error);
+      await vi.advanceTimersByTimeAsync(350);
+      expect(await result).toBeInstanceOf(MeshStateNatsUnavailableError);
+      expect(adds()).toHaveLength(2);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("bounds lost-ack reconciliation INFO by the same placement deadline", async () => {
+    fake.addErrors.push(placementFault(), fake.wrappedTransient());
+    fake.infoDelays.push(0, 5_000);
+    vi.useFakeTimers();
+    try {
+      const port = await connectJetStream(SERVERS, placementOptions(350));
+      const result = port.ensureStream(STREAM, SUBJECTS, { maxMsgSize: 1024 * 1024 }).then(() => undefined, error => error);
+      await vi.advanceTimersByTimeAsync(350);
+      expect(await result).toBeInstanceOf(MeshStateNatsUnavailableError);
+      expect(adds()).toHaveLength(2);
+      expect(fake.log.filter(entry => entry.op === "info")).toHaveLength(2);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it.each([new fake.FakeJetStreamApiError(10058, 400), fake.permissionDenied()])(
+    "keeps unrelated $name fatal even after a placement retry", async fatal => {
+      fake.addErrors.push(placementFault(), fatal);
+      vi.useFakeTimers();
+      try {
+        const port = await connectJetStream(SERVERS, placementOptions(1_000));
+        const result = port.ensureStream(STREAM, SUBJECTS, { maxMsgSize: 1024 * 1024 }).then(() => undefined, error => error);
+        await vi.advanceTimersByTimeAsync(250);
+        expect(await result).toMatchObject({ name: fatal.name, message: fatal.message });
+        expect(adds()).toHaveLength(2);
+      } finally { vi.useRealTimers(); }
+    },
+  );
+
+  it("defaults to 30000ms for a normal peer restart and metadata election", async () => {
+    fake.addErrors.push(...Array.from({ length: 400 }, placementFault));
+    vi.useFakeTimers();
+    try {
+      const port = await connectJetStream(SERVERS, withReplicas(3));
+      let settled = false;
+      const result = port.ensureStream(STREAM, SUBJECTS, { maxMsgSize: 1024 * 1024 }).then(
+        () => { settled = true; return undefined; }, error => { settled = true; return error; });
+      await vi.advanceTimersByTimeAsync(29_999);
+      expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(await result).toBeInstanceOf(MeshStateNatsUnavailableError);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it.each([
+    new fake.FakeJetStreamApiError(10058, 400),
+    fake.permissionDenied(),
+    new Error("no suitable peers for placement, peer offline"),
+    Object.assign(new fake.FakeJetStreamApiError(10071, 400), { message: "no suitable peers for placement, peer offline" }),
+  ])("does not retry unrelated errors or classify placement by text: $message", async fatal => {
+    fake.addErrors.push(fatal);
+    const port = await connectJetStream(SERVERS, placementOptions(350));
+    await expect(port.ensureStream(STREAM, SUBJECTS, { maxMsgSize: 1024 * 1024 })).rejects.toMatchObject({ name: fatal.name, message: fatal.message });
+    expect(adds()).toHaveLength(1);
+  });
+
+  it.each([0, -1, 1.5, NaN, Infinity, 2 ** 31])("rejects invalid placement timeout %s before connecting", async placementTimeoutMs => {
+    await expect(connectJetStream(SERVERS, placementOptions(placementTimeoutMs))).rejects.toThrow(/placementTimeoutMs/);
+    expect(connects()).toBe(0);
   });
 });
 

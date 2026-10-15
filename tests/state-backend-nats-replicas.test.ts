@@ -440,6 +440,81 @@ describe("NATS stream replicas: real client ensureStream (pure fakes)", () => {
     expect(fake.log.filter(entry => entry.op === "info")).toHaveLength(1); // the initial lookup only
   });
 
+  // smarty-dev#12633: deterministic replay of the hosted four-writer child's readiness failure.
+  it.each(["successful create", "observed stream", "ambiguous create"] as const)(
+    "recovers leader-wait INFO 10059 after %s", async source => {
+      if (source === "observed stream") {
+        seedStream(STREAM, 3, SUBJECTS);
+        fake.leaderPolls = 1; // The initial lookup observes the stream without its leader.
+      } else {
+        fake.createdWithoutLeader = true;
+        fake.addErrorAfterStore = source === "ambiguous create";
+        if (fake.addErrorAfterStore) fake.leaderPolls = 1; // Reconciliation observes the stream without its leader.
+      }
+      fake.infoErrors.push(undefined, ...(source === "ambiguous create" ? [undefined] : []),
+        new fake.FakeJetStreamApiError(10059), new fake.FakeJetStreamApiError(10059));
+      vi.useFakeTimers();
+      try {
+        const port = await connectJetStream(SERVERS, withReplicas(3));
+        // Attach the rejection handler before advancing timers so RED has no unhandled rejection.
+        const result = port.ensureStream(STREAM, SUBJECTS, { maxMsgSize: 1024 * 1024 }).then(value => value, error => error);
+        await vi.advanceTimersByTimeAsync(200);
+        expect(await result).toEqual({ lastSeq: source === "observed stream" ? 7 : 0, maxMsgSize: 1024 * 1024 });
+        expect(mutations().map(entry => entry.op)).toEqual(source === "observed stream" ? [] : ["add"]);
+        expect(fake.log.filter(entry => entry.op === "info")).toHaveLength(source === "ambiguous create" ? 5 : 4);
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
+
+  it("bounds persistent leader-wait INFO 10059 at the unchanged 10000ms busy deadline", async () => {
+    seedStream(STREAM, 3, SUBJECTS);
+    fake.leaderPolls = 1;
+    fake.infoErrors.push(undefined, ...Array.from({ length: 100 }, () => new fake.FakeJetStreamApiError(10059)));
+    vi.useFakeTimers();
+    try {
+      const port = await connectJetStream(SERVERS, withReplicas(3));
+      const startedAt = Date.now();
+      let settled = false;
+      const result = port.ensureStream(STREAM, SUBJECTS, { maxMsgSize: 1024 * 1024 }).then(
+        () => { settled = true; return undefined; }, error => { settled = true; return error; });
+      await vi.advanceTimersByTimeAsync(9_999);
+      expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      const error = await result;
+      expect(error).toBeInstanceOf(MeshStateNatsBusyError);
+      expect((error as Error).message).toContain(`stream ${STREAM} had no elected leader after 10000ms`);
+      expect(Date.now() - startedAt).toBe(10_000);
+      expect(fake.log.filter(entry => entry.op === "info")).toHaveLength(101);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it.each(["other API error", "permission denied"] as const)(
+    "keeps %s immediately fatal during leader wait", async kind => {
+      seedStream(STREAM, 3, SUBJECTS);
+      fake.leaderPolls = 1;
+      const fatal = kind === "other API error" ? new fake.FakeJetStreamApiError(10071, 400) : fake.permissionDenied();
+      fake.infoErrors.push(undefined, fatal);
+      const port = await connectJetStream(SERVERS, withReplicas(3));
+      await expect(port.ensureStream(STREAM, SUBJECTS, { maxMsgSize: 1024 * 1024 })).rejects.toMatchObject({
+        name: fatal.name, message: fatal.message,
+      });
+      expect(fake.log.filter(entry => entry.op === "info")).toHaveLength(2);
+    },
+  );
+
+  it("keeps INFO 10059 fatal for ordinary reads and false for streamExists", async () => {
+    const port = await connectJetStream(SERVERS, withReplicas(3));
+    await expect(port.lastSequence(STREAM)).rejects.toBeInstanceOf(fake.FakeJetStreamApiError);
+    expect(fake.log.filter(entry => entry.op === "info")).toHaveLength(1);
+    await expect(port.streamExists(STREAM)).resolves.toBe(false);
+    expect(fake.log.filter(entry => entry.op === "info")).toHaveLength(2);
+    expect(mutations()).toEqual([]);
+  });
+
   it("fails with a bounded busy error when a replicated stream never elects a leader", async () => {
     seedStream(STREAM, 3, SUBJECTS);
     fake.leaderPolls = Number.MAX_SAFE_INTEGER;

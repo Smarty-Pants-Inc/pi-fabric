@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { ActorRegistryStore } from "../src/actors/registry-store.js";
 import { CapturedToolCatalog } from "../src/capture/catalog.js";
 import { FabricState } from "../src/fabric-state.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
@@ -91,6 +92,107 @@ const harness = () => {
 };
 
 describe("a Main's own heartbeat across reload and session replacement (smarty-dev#5962, #4313)", () => {
+  const seedSidecar = async (h: ReturnType<typeof harness>, scope: "project" | "session", sessionId: string) => {
+    const actorRoot = scope === "project" ? path.join(h.meshRoot, "actors") : path.join(h.meshRoot, "actors", sessionId);
+    const store = new ActorRegistryStore(actorRoot);
+    cleanup.push(() => store.releaseReadCache());
+    const instructions = "Remain idle until explicitly asked to help. ".repeat(40);
+    await store.withLock(() => store.write([{
+      id: "a".repeat(32), name: "sidecar-startup", instructions, createdAt: Date.now(), messages: [], events: [], topics: [],
+    }]));
+    const registry = JSON.parse(fs.readFileSync(path.join(actorRoot, "actors.json"), "utf8")) as {
+      actors: Array<Record<string, unknown>>;
+    };
+    expect(registry.actors).toHaveLength(1);
+    const row = registry.actors[0]!;
+    expect(row).not.toHaveProperty("instructions");
+    expect(row.instructionsFile).toMatch(/^[a-f0-9]{64}$/);
+    expect(store.instructions(row)).toBe(instructions);
+    return { store, row, actorRoot };
+  };
+
+  it.each(["project", "session"] as const)("session_start publishes an idle Main for a %s sidecar-only registry without first tool use (pi-fabric#872 P2-1)", async (scope) => {
+    // Decision C: keep this integration test because the real store's sidecar encoding must agree with startup admission.
+    // E2E (real entry scenario): extension session_start -> bootstrap -> shouldEagerlyActivate -> ensure -> participant directory.
+    // Owner: fabric-store. Pass condition: announce=false plus valid sidecar-only actors publishes idle Main and a live lease before tool use.
+    const h = harness();
+    const sessionId = "8721aaaa-0000-0000-0000-000000000001";
+    await seedSidecar(h, scope, sessionId);
+    const { state } = h.generation();
+    const context = h.session(sessionId).value as unknown as ExtensionContext;
+    expect(state.activated).toBe(false);
+
+    await h.sessionStart(state, context);
+
+    expect(state.config.mesh.announce).toBe(false);
+    expect(state.initialized).toBe(true);
+    await vi.waitFor(() => {
+      expect(h.leaseAge(`session:${sessionId}`)).toBeLessThan(2_000);
+      expect(state.participantInfos({ kinds: ["root"], fresh: true })).toEqual(expect.arrayContaining([
+        expect.objectContaining({ id: `session:${sessionId}`, kind: "root", status: "idle", sessionId }),
+      ]));
+    }, { timeout: 2_000 });
+  });
+
+  it.each(["project", "session"] as const)("session_start skips a broken sidecar before a valid actor in the same %s registry (pi-fabric#872 P2-1)", async (scope) => {
+    // Decision C: keep this integration counterexample because payload read failures must be isolated per actor, not per registry.
+    // E2E (real entry scenario): extension session_start -> bootstrap -> shouldEagerlyActivate -> ensure -> participant directory.
+    // Owner: fabric-store. Pass condition: a missing first sidecar cannot suppress a later valid sidecar or idle Main publication.
+    const h = harness();
+    const sessionId = "8721aaaa-0000-0000-0000-000000000003";
+    const { store, row, actorRoot } = await seedSidecar(h, scope, sessionId);
+    const broken = { ...row, id: "b".repeat(32), name: "broken-sidecar-startup" };
+    expect(() => store.instructions(broken)).toThrow("ENOENT");
+    await store.withLock(() => store.write([broken, row]));
+    const persisted = JSON.parse(fs.readFileSync(path.join(actorRoot, "actors.json"), "utf8")) as { actors: Array<{ id: string }> };
+    expect(persisted.actors.map((actor) => actor.id)).toEqual([broken.id, row.id]);
+    const { state } = h.generation();
+    const context = h.session(sessionId).value as unknown as ExtensionContext;
+
+    await h.sessionStart(state, context);
+
+    expect(state.config.mesh.announce).toBe(false);
+    expect(state.initialized).toBe(true);
+    await vi.waitFor(() => {
+      expect(h.leaseAge(`session:${sessionId}`)).toBeLessThan(2_000);
+      expect(state.participantInfos({ kinds: ["root"], fresh: true })).toEqual(expect.arrayContaining([
+        expect.objectContaining({ id: `session:${sessionId}`, kind: "root", status: "idle", sessionId }),
+      ]));
+    }, { timeout: 2_000 });
+  });
+
+  it.each([
+    ["project", "corrupt"], ["session", "corrupt"],
+    ["project", "missing"], ["session", "missing"],
+  ] as const)("session_start rejects a %s registry with a %s instructions sidecar (pi-fabric#872 P2-1)", async (scope, fault) => {
+    // Decision C: keep this integration counterexample so sidecar admission cannot become a digest-shape-only check.
+    // E2E (real entry scenario): extension session_start -> bootstrap -> shouldEagerlyActivate, with invalid on-disk payload.
+    // Owner: fabric-store. Pass condition: no eager runtime activation, Main publication, or host lease for corrupt/missing sidecars.
+    const h = harness();
+    const sessionId = "8721aaaa-0000-0000-0000-000000000002";
+    const { store, row, actorRoot } = await seedSidecar(h, scope, sessionId);
+    const invalid = fault === "missing" ? { ...row, instructionsFile: "0".repeat(64) } : row;
+    const file = path.join(actorRoot, String(row.id), "registry", `instructions-${invalid.instructionsFile}.txt`);
+    if (fault === "corrupt") fs.writeFileSync(file, "Corrupt instructions, not the selected digest.");
+    else {
+      expect(fs.existsSync(file)).toBe(false);
+      await store.withLock(() => store.write([invalid]));
+    }
+    expect(() => store.instructions(invalid)).toThrow(fault === "corrupt" ? "Corrupt actor instructions payload" : "ENOENT");
+    const { state } = h.generation();
+    const context = h.session(sessionId).value as unknown as ExtensionContext;
+    // Do not ensure() first: that would seed the process-wide published-Main scope and bypass rejection.
+    await h.sessionStart(state, context);
+
+    expect(state.bootstrapped).toBe(true);
+    expect(state.config.mesh.announce).toBe(false);
+    expect(state.shouldEagerlyActivate(context)).toBe(false);
+    expect(state.activated).toBe(false);
+    expect(state.initialized).toBe(false);
+    expect(readHostLeases(h.meshRoot).has(`session:${sessionId}`)).toBe(false);
+    expect(state.participantInfos()).toEqual([]);
+  });
+
   it.each([
     ["reload", "5962bbbb-0000-0000-0000-000000000001", "5962bbbb-0000-0000-0000-000000000001"],
     ["new", "5962bbbb-0000-0000-0000-000000000002", "5962bbbb-0000-0000-0000-000000000003"],

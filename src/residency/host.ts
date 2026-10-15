@@ -398,13 +398,13 @@ export class ResidentHost {
       (directory, expired = () => false) => {
         if (!retentionV2Enabled()) { this.agents.recoverPendingArchives(directory); return; }
         if (!this.agents.hasRunCustody(path.basename(directory)) && this.agents.recoverPendingArchives(directory, expired)) this.#requestRetention.resample();
-      }, retentionV2Enabled() ? {
+      }, {
         // A checked exit clears exchange debt, not the manager's run-directory
         // custody. Deleting a still-managed tree destroys the next fresh exit
         // proof and can pin a deferred stopped-actor exchange indefinitely.
         run: id => this.agents.hasRunCustody(id),
         reference: id => this.agents.retentionCustodyVeto(id),
-      } : undefined);
+      });
   }
 
   #initialize(): void {

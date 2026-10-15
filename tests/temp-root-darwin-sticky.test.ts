@@ -39,7 +39,10 @@ const darwinFixture = (sticky: boolean) => {
   const real = fs.statSync(shared);
   const isShared = (file: string, stat: fs.Stats) =>
     path.resolve(file) === shared || (stat.isDirectory() && stat.dev === real.dev && stat.ino === real.ino);
+  // Directories (by dev/ino) presented as root's 0755 to model the measured m4 system layout.
+  const rootOwned = new Set<string>();
   const present = (file: string, stat: fs.Stats): fs.Stats => {
+    if (stat.isDirectory() && rootOwned.has(`${stat.dev}:${stat.ino}`)) return asStat(stat, { uid: 0, mode: (stat.mode & ~0o7777) | 0o755 });
     if (sticky && isShared(file, stat)) return asStat(stat, { uid: 0, mode: (stat.mode & ~0o7777) | 0o1777 });
     if (stat.uid === 0 && (stat.mode & 0o1000) !== 0) return asStat(stat, { mode: (stat.mode & ~0o7777) | 0o755 });
     return stat;
@@ -65,7 +68,33 @@ const darwinFixture = (sticky: boolean) => {
   vi.stubEnv("PI_FABRIC_DEPTH", "0");
   const mkdir = vi.spyOn(fs, "mkdirSync");
   const mkdtemp = vi.spyOn(fs, "mkdtempSync");
-  return { root, shared, mkdir, mkdtemp };
+  const markRootOwned = (...directories: string[]) => {
+    for (const directory of directories) { const seen = lstat(directory); rootOwned.add(`${seen.dev}:${seen.ino}`); }
+  };
+  return { root, shared, mkdir, mkdtemp, markRootOwned };
+};
+
+// Presents a system alias itself as root's to both the lstat spy and private-dir's linkStat hook.
+const presentRootLink = (link: string) => {
+  const lstat = vi.mocked(fs.lstatSync).getMockImplementation()!;
+  const rootLink = (file: string, stat: fs.Stats) =>
+    path.resolve(file) === link && stat.isSymbolicLink() ? asStat(stat, { uid: 0 }) : stat;
+  vi.mocked(fs.lstatSync).mockImplementation(((file: fs.PathLike, ...rest: unknown[]) => {
+    const result = (lstat as (...args: unknown[]) => fs.Stats | undefined)(file, ...rest);
+    return result ? rootLink(String(file), result) : result;
+  }) as typeof fs.lstatSync);
+  privateDirTestHooks.linkStat = rootLink;
+  restores.push(() => { delete privateDirTestHooks.linkStat; });
+};
+
+const errorCode = (run: () => unknown): string | undefined => {
+  try { run(); } catch (error) { return (error as NodeJS.ErrnoException).code; }
+  return undefined;
+};
+const modes = ["default os.tmpdir()", "PI_FABRIC_TMPDIR"] as const;
+const useAlias = (mode: (typeof modes)[number], alias: string) => {
+  if (mode === "PI_FABRIC_TMPDIR") vi.stubEnv("PI_FABRIC_TMPDIR", path.join(alias, "missing", "data"));
+  else { vi.stubEnv("PI_FABRIC_TMPDIR", undefined); vi.spyOn(os, "tmpdir").mockReturnValue(alias); }
 };
 
 const sharedStickyRefusal = (shared: string) =>
@@ -187,6 +216,118 @@ describe.skipIf(process.platform === "win32")("darwin file-data root under a roo
     expect(() => manager()).toThrow(refusal);
     expect(mkdtemp).not.toHaveBeenCalled();
     expect([...createdBelow(mkdir.mock.calls, shared), ...createdBelow(mkdir.mock.calls, alias)]).toEqual([]);
+    expect(fs.readdirSync(shared)).toEqual([]);
+  });
+
+  // Security P1: a non-sticky target can hide its shared-sticky physical ancestor from the lexical walk.
+  it.each(modes)("%s: a symlink outside it naming a non-sticky descendant of the shared sticky directory is refused (#9527) before mkdir/mkdtemp", mode => {
+    const { root, shared, mkdir, mkdtemp } = darwinFixture(true);
+    const user = path.join(shared, "user");
+    fs.mkdirSync(user, { mode: 0o700 }); fs.chmodSync(user, 0o700);
+    fs.writeFileSync(path.join(user, "keep"), "");
+    const alias = path.join(root, "user-tmp");
+    fs.symlinkSync(user, alias, "dir");
+    mkdir.mockClear();
+    expect(alias.startsWith(shared + path.sep)).toBe(false);
+    expect(fs.lstatSync(alias).isSymbolicLink()).toBe(true);
+    expect(fs.realpathSync(alias)).toBe(user);
+    const through = fs.statSync(alias);
+    expect([through.uid, through.mode & 0o7777]).toEqual([process.getuid!(), 0o700]);
+    const sharedSeen = fs.statSync(shared);
+    expect([sharedSeen.uid, sharedSeen.mode & 0o7777]).toEqual([0, 0o1777]);
+    useAlias(mode, alias);
+    // Soft assertions exercise BOTH real entrypoints even on RED, exposing AgentManager's actual bootstrap write.
+    expect.soft(() => fabricDataRoot()).toThrow(sharedStickyRefusal(shared));
+    expect.soft(() => manager()).toThrow(sharedStickyRefusal(shared));
+    expect(mkdtemp).not.toHaveBeenCalled();
+    expect([...createdBelow(mkdir.mock.calls, shared), ...createdBelow(mkdir.mock.calls, alias)]).toEqual([]);
+    expect(fs.readdirSync(user)).toEqual(["keep"]);
+    expect(fs.readdirSync(shared)).toEqual(["user"]);
+  });
+
+  it.each(modes)("%s: a dangling link into the shared sticky directory fails closed (realpath ENOENT), nothing created", mode => {
+    const { root, shared, mkdir, mkdtemp } = darwinFixture(true);
+    const gone = path.join(shared, "gone");
+    const alias = path.join(root, "dangling-tmp");
+    fs.symlinkSync(gone, alias, "dir");
+    mkdir.mockClear();
+    expect(fs.lstatSync(alias).isSymbolicLink()).toBe(true);
+    expect(errorCode(() => fs.realpathSync(alias))).toBe("ENOENT");
+    useAlias(mode, alias);
+    expect.soft(() => fabricDataRoot()).toThrow();
+    expect.soft(() => manager()).toThrow();
+    expect(mkdtemp).not.toHaveBeenCalled();
+    expect([...createdBelow(mkdir.mock.calls, shared), ...createdBelow(mkdir.mock.calls, alias)]).toEqual([]);
+    expect(fs.existsSync(gone)).toBe(false);
+    expect(fs.readdirSync(shared)).toEqual([]);
+  });
+
+  it.each(modes)("%s: a realpath error (EACCES) on the data root fails closed, nothing created", mode => {
+    const { root, shared, mkdir, mkdtemp } = darwinFixture(true);
+    const target = path.join(root, "safe");
+    fs.mkdirSync(target, { mode: 0o700 }); fs.chmodSync(target, 0o700);
+    const alias = path.join(root, "denied-tmp");
+    fs.symlinkSync(target, alias, "dir");
+    mkdir.mockClear();
+    // EACCES through the existing fs seam: our uid can access these real, private test fixtures.
+    const realpath = fs.realpathSync, nativeRealpath = fs.realpathSync.native;
+    const deny = (file: fs.PathLike) => {
+      const resolved = path.resolve(String(file));
+      if (resolved === alias || resolved.startsWith(alias + path.sep)) {
+        throw Object.assign(new Error(`EACCES: permission denied, realpath '${resolved}'`), { code: "EACCES", errno: -13, syscall: "realpath", path: resolved });
+      }
+    };
+    vi.spyOn(fs.realpathSync, "native").mockImplementation(((file: fs.PathLike, ...rest: unknown[]) => {
+      deny(file); return (nativeRealpath as (...args: unknown[]) => string)(file, ...rest);
+    }) as typeof fs.realpathSync.native);
+    vi.spyOn(fs, "realpathSync").mockImplementation(((file: fs.PathLike, ...rest: unknown[]) => {
+      deny(file); return (realpath as (...args: unknown[]) => string)(file, ...rest);
+    }) as typeof fs.realpathSync);
+    Object.assign(fs.realpathSync, { native: realpath.native });
+    expect(errorCode(() => fs.realpathSync(alias))).toBe("EACCES");
+    expect(errorCode(() => fs.realpathSync.native(alias))).toBe("EACCES");
+    useAlias(mode, alias);
+    expect.soft(() => fabricDataRoot()).toThrow();
+    expect.soft(() => manager()).toThrow();
+    expect(mkdtemp).not.toHaveBeenCalled();
+    expect([...createdBelow(mkdir.mock.calls, target), ...createdBelow(mkdir.mock.calls, alias)]).toEqual([]);
+    expect(fs.readdirSync(target)).toEqual([]);
+    expect(fs.readdirSync(shared)).toEqual([]);
+  });
+
+  it("counterexample: the per-user physical layout alias /var/folders/../T -> /private/var/folders/../T is accepted by default, 0700 run root", () => {
+    // Models lead-supplied m4 stat facts: system ancestors root0755, user hash directory ours0755, T ours0700.
+    const { root, shared, mkdtemp, markRootOwned } = darwinFixture(true);
+    const privateVar = path.join(root, "private", "var");
+    const physical = path.join(privateVar, "folders", "xx", "user-hash", "T");
+    fs.mkdirSync(physical, { recursive: true, mode: 0o700 });
+    for (let dir = physical; dir !== root; dir = path.dirname(dir)) fs.chmodSync(dir, 0o700);
+    fs.chmodSync(path.dirname(physical), 0o755);
+    markRootOwned(path.join(root, "private"), privateVar, path.join(privateVar, "folders"), path.join(privateVar, "folders", "xx"));
+    const varLink = path.join(root, "var");
+    fs.symlinkSync(path.join("private", "var"), varLink, "dir");
+    presentRootLink(varLink);
+    const tmpdir = path.join(varLink, "folders", "xx", "user-hash", "T");
+    expect(fs.realpathSync(tmpdir)).toBe(physical);
+    expect(fs.lstatSync(varLink).uid).toBe(0);
+    for (const dir of [path.join(root, "private"), privateVar, path.join(privateVar, "folders"), path.join(privateVar, "folders", "xx")]) {
+      const seen = fs.statSync(dir);
+      expect([seen.uid, seen.mode & 0o7777]).toEqual([0, 0o755]);
+    }
+    expect([fs.statSync(path.dirname(tmpdir)).uid, mode(path.dirname(tmpdir))]).toEqual([process.getuid!(), 0o755]);
+    expect([fs.statSync(tmpdir).uid, mode(tmpdir)]).toEqual([process.getuid!(), 0o700]);
+    vi.stubEnv("PI_FABRIC_TMPDIR", undefined);
+    vi.spyOn(os, "tmpdir").mockReturnValue(tmpdir);
+    expect([tmpdir, physical]).toContain(fabricDataRoot());
+    manager();
+    expect(mkdtemp).toHaveBeenCalledTimes(1);
+    expect(fs.realpathSync(path.dirname(path.resolve(String(mkdtemp.mock.calls[0]![0]))))).toBe(physical);
+    const runRoots = fs.readdirSync(physical).filter(name => name.startsWith("pi-fabric-runs-"));
+    expect(runRoots).toHaveLength(1);
+    const runRoot = path.join(physical, runRoots[0]!);
+    expect(mode(runRoot)).toBe(0o700);
+    mkdirPrivate(path.join(runRoot, "run-1"), runRoot);
+    expect(mode(path.join(runRoot, "run-1"))).toBe(0o700);
     expect(fs.readdirSync(shared)).toEqual([]);
   });
 });

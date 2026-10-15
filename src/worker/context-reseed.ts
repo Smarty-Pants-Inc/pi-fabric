@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { detachedPreview } from "../core/preview.js";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { readPiSessionHeader } from "../core/pi-session-header.js";
@@ -7,7 +8,7 @@ import { writeFileAtomic, syncDirectoryChain } from "../core/atomic-write.js";
 const record = (value: unknown): Record<string, unknown> | undefined =>
   value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
 const excerpt = (text: string, cap: number): string => text.length <= cap ? text :
-  `${text.slice(0, Math.floor(cap / 2))}\n[excerpt omitted]\n${text.slice(-Math.floor(cap / 2))}`;
+  `${detachedPreview(text, Math.floor(cap / 2))}\n[excerpt omitted]\n${detachedPreview(text.slice(-Math.floor(cap / 2)), text.length)}`;
 
 /** Recovery is deliberately extractive, not a new inferred objective or authorization. */
 export function summarizeActorState(messages: unknown[], maxChars = 16_384): string {

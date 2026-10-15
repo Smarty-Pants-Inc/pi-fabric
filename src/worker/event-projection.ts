@@ -1,3 +1,5 @@
+import { detachedPreview } from "../core/preview.js";
+
 // Pi repeats the entire history in agent_end.messages and the current tool
 // results in turn_end.toolResults. These top-level fields are not consumed by
 // the worker or transcript reader; authoritative messages arrive separately.
@@ -166,6 +168,9 @@ class ImageDataProjection {
       if (this.#held.length > MAX_HELD_CHARS) {
         this.#flush(parts);
         this.#passthrough = true;
+      } else {
+        // This un-emitted key/whitespace survives between reads.
+        this.#held = detachedPreview(this.#held, MAX_HELD_CHARS);
       }
     } else if (!this.#dropping) parts.push(text.slice(start));
     return parts.join("");

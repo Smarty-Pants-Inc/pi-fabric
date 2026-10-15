@@ -25,7 +25,7 @@ import { readFileRetrying, renameAtomic, syncDirectoryChain, trackTemporary, wri
 import { discardWorkerCompletion, type CompletionRecipient } from "./completion-journal.js";
 import { processStartTime } from "../residency/process-identity.js";
 import { countUnknownEnodevStarts, enodevDelivered, enodevUnresolvedRuns, noteEnodevDelivered, peekEnodevRun, settleEnodevRun,
-  settleGoneEnodevLaunch, settleLostEnodevRun, ownedProcess, provenGoneEnodevLaunch, goneEnodevOutcome, savedEnodevAnswer, type OwnedProcess } from "./enodev-recovery.js";
+  settleGoneEnodevLaunch, settleLostEnodevRun, ownedProcess, provenGoneEnodevLaunch, goneEnodevOutcome, savedEnodevAnswer, recoverDurableActorStop, type OwnedProcess } from "./enodev-recovery.js";
 import {
   DEFAULT_FABRIC_CONFIG,
   MAX_AGENT_TIMEOUT_MS,
@@ -68,7 +68,7 @@ import { tokenUsagePayloadFromValue } from "../lifecycle/types.js";
 import type { FabricTokenUsagePayload } from "../lifecycle/types.js";
 import { AgentAdmission, assertAgentTask, beginAgentSettlement, createAgentLifecycle, finishAgentSettlement, terminalAgentStatuses, type AgentLifecycleState } from "./lifecycle.js";
 import { removeTree } from "./rm.js";
-import { ARCHIVE_PENDING_FILE, ACTOR_RUN_ARCHIVE_PENDING_FILE, stageRunArchive, commitRunArchive, readPendingRunArchives, parsePendingRunArchives, type PendingRunArchive } from "./archive-custody.js";
+import { ARCHIVE_PENDING_FILE, ACTOR_RUN_ARCHIVE_PENDING_FILE, stageRunArchive, commitRunArchive, readPendingRunArchives, parsePendingRunArchives, persistRunStopIntent, readRunStopIntent, clearRunStopIntent, type PendingRunArchive } from "./archive-custody.js";
 import { ActorChildCompletionStore } from "../actors/child-completions.js";
 import { HerdrTransport } from "./transports/herdr-transport.js";
 import { LocaltermTransport } from "./transports/localterm-transport.js";
@@ -2854,6 +2854,10 @@ export class AgentManager {
     preparation?: AgentLaunchPreparationOptions,
   ): Promise<AgentRunResult> {
     while (this.#releasePaused && !request.residentStartupProbe) await this.#waitForRelease(signal);
+    if (request.actorId && request.activationId && !signal?.aborted && (!authorize || authorize())) {
+      const stopped = await recoverDurableActorStop(this.#runRoot, request.actorId, request.activationId, this.#closeAbort.signal);
+      if (stopped) return stopped;
+    }
     const recovered = this.#recoverEnodevRun(request, signal, authorize);
     if (recovered) return recovered;
     const handle = await this.spawn(request, signal, authorize, undefined, onOutputPrincipalDowngrade, onSpawned, preparation);
@@ -3451,12 +3455,22 @@ export class AgentManager {
   // otherwise spawn refuses it and the marker is untouched), and it settles nothing: the actor commits after it
   // delivered the answer (commitEnodevRecovery). An uncommitted recovery keeps the marker and the answer.
   #recoverEnodevRun(request: AgentRunRequest, signal?: AbortSignal, authorize?: () => boolean): AgentRunResult | undefined {
-    if (!request.actorId || !request.activationId || process.platform !== "linux") return undefined;
+    if (!request.actorId || !request.activationId) return undefined;
     if (signal?.aborted || (authorize && !authorize())) return undefined;
     this.#enodevRuns ??= enodevUnresolvedRuns(this.#runRoot);
     for (const directory of this.#enodevRuns) {
       const result = peekEnodevRun(directory, request.actorId, request.activationId);
       if (!result) continue;
+      if (result.status === "stopped" || result.status === "timed_out") {
+        const settled = settleEnodevRun(directory, request.actorId, request.activationId);
+        if (settled) {
+          this.#enodevSettledHere.add(result.id);
+          this.#enodevRuns = this.#enodevRuns.filter(other => other !== directory);
+          this.#previousRuns.set(result.id, structuredClone(settled));
+          this.#retentionRevision++;
+        }
+        return settled ?? result;
+      }
       this.#enodevCommits.set(result.id, { directory, actorId: request.actorId, activationId: request.activationId });
       // A receipt means a delivery may already have happened (a crash before the queue ack): replay it idempotently.
       const replay = enodevDelivered(directory, result.id, request.activationId);
@@ -3546,8 +3560,9 @@ export class AgentManager {
     const previous = this.#previousRuns.get(id);
     if (previous && !this.#runs.has(id)) return structuredClone(previous);
     const managed = this.#requireRun(id);
-    // A requested stop is terminal: record the intent before any transport work
-    // so recovery never restarts a run the operator, a tool, or shutdown ended.
+    // Persist operator intent before transport work only while the run is open.
+    // Settled runs can still own detached execution groups which must be drained below.
+    if (!managed.settled) persistRunStopIntent(managed.runDirectory, "explicit");
     managed.stopRequested = true;
     // Stop retracts notices; guest publication still uses its deferred receipt.
     managed.background = false;
@@ -3562,7 +3577,15 @@ export class AgentManager {
     // Only an exact native deadline receipt permits logical completion with
     // retained debt. Platform or process kind alone is never such a receipt.
     await this.#drainExecution(managed);
-    if (managed.settled) return consumeSettled ? this.wait(id) : this.#settledResult(managed);
+    if (managed.settled) {
+      const settled = readRecord(managed.statusFile);
+      const stopIntent = readRunStopIntent(managed.runDirectory);
+      if (settled && terminalStatuses.has(settled.status) && stopIntent) {
+        writeJsonAtomic(managed.statusFile, { ...settled, stopIntent }, { space: 2, durable: true });
+        if (managed.executionExited) clearRunStopIntent(managed.runDirectory);
+      }
+      return consumeSettled ? this.wait(id) : this.#settledResult(managed);
+    }
     managed.background = false;
     const terminal = readRecord(managed.statusFile);
     // A force-killed worker (notably on Windows) may leave only running status.
@@ -3581,7 +3604,11 @@ export class AgentManager {
       terminal && terminalStatuses.has(terminal.status)
         ? (this.#withTransportMetadata(terminal, managed) as AgentRunResult)
         : failedRecord(managed, "stopped", "Agent stopped");
-    if (!terminal || !terminalStatuses.has(terminal.status)) writeRecord(managed.statusFile, record);
+    const stopIntent = readRunStopIntent(managed.runDirectory);
+    if (stopIntent) record.stopIntent = stopIntent;
+    // Re-publish even a worker terminal answer durably before discharging intent.
+    writeJsonAtomic(managed.statusFile, record, { space: 2, durable: true });
+    if (managed.executionExited) clearRunStopIntent(managed.runDirectory);
     await this.#captureWorktree(managed);
     this.#settle(managed, record);
     return record;
@@ -4417,6 +4444,7 @@ export class AgentManager {
       managed.settled ||
       this.#closing ||
       managed.stopRequested ||
+      readRunStopIntent(managed.runDirectory) !== undefined ||
       managed.abortSignal?.aborted ||
       managed.abandoned ||
       record.status !== "failed" ||
@@ -4473,6 +4501,7 @@ export class AgentManager {
       managed.settled ||
       this.#closing ||
       managed.stopRequested ||
+      readRunStopIntent(managed.runDirectory) !== undefined ||
       managed.abandoned ||
       managed.resumeAttempts >= AGENT_RESUME_MAX_ATTEMPTS ||
       !this.#observedWork(managed) ||
@@ -4895,6 +4924,7 @@ export class AgentManager {
         return;
       }
       if (Date.now() >= deadline) {
+        persistRunStopIntent(managed.runDirectory, "deadline");
         managed.stopRequested = true;
         await this.#stopWorkerRunner(managed);
         await this.#stopManagedTransport(managed);
@@ -4931,7 +4961,7 @@ export class AgentManager {
           "timed_out",
           `Agent timed out after ${timeoutMs}ms`,
         );
-        writeRecord(managed.statusFile, timedOut);
+        writeJsonAtomic(managed.statusFile, timedOut, { space: 2, durable: true });
         await this.#captureWorktree(managed);
         this.#settle(managed, timedOut);
         return;
@@ -5094,7 +5124,16 @@ export class AgentManager {
     if (result.nestedAgents) {
       managed.nestedSnapshot = result.nestedAgents.map((record) => compactUiRecord(record));
     }
-    this.#saveSettledResult(managed, result);
+    const stopIntent = readRunStopIntent(managed.runDirectory);
+    if (stopIntent) result.stopIntent = stopIntent;
+    if (this.#saveSettledResult(managed, result)) {
+      try {
+        // A native deadline receipt can settle before worker exit. Keep its fence
+        // until both terminal status and native execution custody are resolved.
+        writeJsonAtomic(managed.statusFile, result, { space: 2, durable: true });
+        if (managed.executionExited) clearRunStopIntent(managed.runDirectory);
+      } catch { /* retain stop intent and archive custody for the next recovery */ }
+    }
     this.#pruneRetainedUiRecords();
     this.#invalidateUiList();
     const reported = this.#withTransportMetadata(result, managed) as AgentRunResult;

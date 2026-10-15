@@ -200,6 +200,8 @@ export interface AgentCompactionStatus {
 }
 
 export interface AgentRunRecord {
+  /** Manager-owned durable intent distinguishing operator/deadline stops from worker checkpoints. */
+  stopIntent?: { reason: "explicit" | "deadline"; requestedAt: number };
   /** Canonical Fabric package root selected for the process worker at spawn time. */
   fabricRelease?: string;
   /** Admitted memory-capped task cgroup (smarty-dev#8257); absent when uncapped. */

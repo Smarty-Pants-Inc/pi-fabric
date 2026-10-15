@@ -166,6 +166,11 @@ import type { FabricKernel } from "../runtime/kernel.js";
 import type { FabricPythonRuntime } from "../config.js";
 import { isMainSupervisorRequest } from "../interrupt-authority.js";
 
+interface ActorQueueRestoreInputs {
+  own: unknown;
+  predecessors: Array<{ file: string; saved: unknown }>;
+}
+
 interface SettledWindow {
   acceptedAt: number;
   intervalMs: number;
@@ -7359,6 +7364,7 @@ export class ActorManager {
     const loaded: ManagedActor[] = [];
     let added = 0;
     const firstLoads: ManagedActor[] = [];
+    const restoreInputs = new Map<string, ActorQueueRestoreInputs>();
     const restartedIds: string[] = [];
     let parsed: unknown;
     try {
@@ -7609,7 +7615,13 @@ export class ActorManager {
       // Once per process: later a live process's memory, not the file, holds its work.
       if (!this.#ownQueueRead.has(actor.id)) {
         this.#ownQueueRead.add(actor.id);
-        this.#restoreQueue(actor, this.#readQueue(this.#ownQueueFile(actor)), false);
+        const own = this.#readQueue(this.#ownQueueFile(actor));
+        const inputs = { own, predecessors: this.#predecessorQueues(actor, own) };
+        restoreInputs.set(actor.id, inputs);
+        // Restore can rewrite its input. Collect every terminal fence first,
+        // including a later predecessor's tombstone for an earlier copy.
+        this.#restoreFailedSends(actor, [inputs.own, ...inputs.predecessors.map(queue => queue.saved)]);
+        this.#restoreQueue(actor, inputs.own, false);
         this.#seedDeadLetterDeliveries(actor);
         firstLoads.push(actor);
       }
@@ -7630,7 +7642,7 @@ export class ActorManager {
     // the actor's id, definition, filters, topics, mailbox and the session's mesh cursor.
     if (restartedIds.length) this.#scheduleRegistrySave(true, 1);
     // After every own file, whose counters the predecessors' activations shift against.
-    const claimed = new Set(firstLoads.filter(actor => this.#takeOverPredecessors(actor)).map(actor => actor.id));
+    const claimed = new Set(firstLoads.filter(actor => this.#takeOverPredecessors(actor, restoreInputs.get(actor.id))).map(actor => actor.id));
     // smarty-dev#8935: this host's ENODEV-unconfirmed runs of an activation no longer pending settle as lost, only
     // in the lineage that owns the actor (its root and residency: the takeover fence, pi-fabric#912 round 2) and
     // once every queue that can hold the activation is restored (own and adopted predecessors). Another lineage's
@@ -7724,7 +7736,8 @@ export class ActorManager {
     if (!actor) return false;
     // Ordinary pending saves remain soft. Cancellation and predecessor deletion,
     // unlike ordinary admission, require a fresh durable destination receipt.
-    durable ||= this.#queueCancellationDirty.has(actorId) || !!this.#takenOver.get(actorId)?.size;
+    durable ||= this.#queueCancellationDirty.has(actorId) || !!this.#takenOver.get(actorId)?.size ||
+      this.#pendingDeliveryOutcomes.get(actorId)?.some(record => record.outcome === "failed") === true;
     const persistedIds = new Set<string>();
     const parked = this.#parked.get(actorId) ?? [];
     const items = [
@@ -7920,13 +7933,24 @@ export class ActorManager {
     // A prior write may have failed. Re-establish the failure fence before any
     // deferred FAILED append, including restored pending-receipt snapshots.
     if (this.#persistent && pending.some(record => record.outcome === "failed") && !this.#persistQueue(actorId, true)) return;
-    while (pending.length) {
-      const record = pending[0]!;
-      try { appendDeliveryOutcome(this.mesh.root, record, record.outcome, record.reason, record.at); }
-      catch { return; } // Retained in the queue envelope, independently of runnable work.
-      pending.shift();
+    let index = 0;
+    while (index < pending.length) {
+      const record = pending[index]!;
+      try {
+        // Restored terminal intent owes FAILED only in the absence of ANY exact
+        // outcome. appendDeliveryOutcome itself deduplicates only equal outcomes.
+        const observed = record.outcome === "failed"
+          ? (["delivered", "superseded", "failed", "unknown"] as const).find(outcome => hasDeliveryOutcome(this.mesh.root, record, outcome))
+          : undefined;
+        // Reconfirm an existing receipt's durability without adding a new line.
+        appendDeliveryOutcome(this.mesh.root, record, observed ?? record.outcome, record.reason, record.at);
+      } catch { return; } // Retained in the queue envelope, independently of runnable work.
+      // Keep terminal evidence while a failed predecessor unlink can replay an
+      // unmarked copy, but do not block later independent outcome receipts.
+      if (record.outcome === "failed" && this.#takenOver.get(actorId)?.size) index++;
+      else pending.splice(index, 1);
     }
-    this.#pendingDeliveryOutcomes.delete(actorId);
+    if (!pending.length) this.#pendingDeliveryOutcomes.delete(actorId);
     this.#persistQueue(actorId, true);
   }
 
@@ -8028,19 +8052,100 @@ export class ActorManager {
   // Only the claiming lineage takes over: its root and its residency (a Main and its resident host
   // share a root, review/astra F6 on #79), and never from its own file (F7).
   /** False when this lineage does not own the actor (root or residency), so it took nothing over. */
-  #takeOverPredecessors(actor: ManagedActor): boolean {
+  #takeOverPredecessors(actor: ManagedActor, inputs?: ActorQueueRestoreInputs): boolean {
     if (actor.rootId !== this.#rootId || (this.#claimResidency ?? actor.residency) !== actor.residency) return false;
-    const own = this.#ownQueueFile(actor);
-    for (const rootId of actor.adoptedFrom ?? []) {
-      const file = this.#queueFile(actor.id, rootId, actor.residency);
-      if (file === own) continue;
+    const queues = inputs?.predecessors ?? this.#predecessorQueues(actor);
+    this.#restoreFailedSends(actor, [inputs ? inputs.own : this.#readQueue(this.#ownQueueFile(actor)), ...queues.map(queue => queue.saved)]);
+    for (const { file, saved } of queues) {
       if (this.#cancelledPredecessors.get(actor.id)?.has(path.basename(file))) continue;
-      const saved = this.#readQueue(file);
-      if (saved === undefined) continue;
       this.#takenOver.set(actor.id, new Set([...(this.#takenOver.get(actor.id) ?? []), file]));
       this.#restoreQueue(actor, saved, true);
     }
+    this.#flushDeliveryOutcomes(actor.id);
     return true;
+  }
+
+  /** Snapshot every input before restore rewrites/deletes any of them. */
+  #predecessorQueues(actor: ManagedActor, savedOwn?: unknown): Array<{ file: string; saved: unknown }> {
+    if (actor.rootId !== this.#rootId || (this.#claimResidency ?? actor.residency) !== actor.residency) return [];
+    const own = this.#ownQueueFile(actor);
+    const cancelled = refRecord(savedOwn)?.cancelledPredecessors;
+    return [...new Set(actor.adoptedFrom ?? [])].flatMap(rootId => {
+      const file = this.#queueFile(actor.id, rootId, actor.residency);
+      if (file === own || this.#cancelledPredecessors.get(actor.id)?.has(path.basename(file)) ||
+          (Array.isArray(cancelled) && cancelled.includes(path.basename(file)))) return [];
+      const saved = this.#readQueue(file);
+      return saved === undefined ? [] : [{ file, saved }];
+    });
+  }
+
+  /** Legacy addressed mesh copies can lack outcomeSend; use the same exact host
+   * envelope tuple as admission, never an event id alone or arbitrary data. */
+  #restoredSend(actor: ManagedActor, item: Partial<ActorQueueItem>): DeliverySend | undefined {
+    const send = deliverySend(item.outcomeSend);
+    if (send) return send;
+    if (typeof item.source !== "string" || !item.source.startsWith("mesh:")) return undefined;
+    const event = refRecord(item.payload);
+    const from = refRecord(event?.from);
+    return typeof event?.id === "string" && typeof from?.id === "string" &&
+      (event.to === actor.id || event.to === actor.name)
+      ? { eventId: event.id, to: actor.id, from: from.id, mode: "publish" } : undefined;
+  }
+
+  #sendKey(send: DeliverySend): string {
+    return JSON.stringify([send.eventId, send.to, send.from, send.mode]);
+  }
+
+  /** Pending FAILED is also a durable terminal fence, even without a queue item.
+   * Import all obligations before any restore-time save can forget a tombstone. */
+  #restoreFailedSends(actor: ManagedActor, snapshots: readonly unknown[]): void {
+    if (!this.#persistent) return;
+    const pending = this.#pendingDeliveryOutcomes.get(actor.id) ?? [];
+    const items: Partial<ActorQueueItem>[] = [];
+    const add = (record: DeliveryOutcomeRecord): void => {
+      if (!pending.some(item => this.#sendKey(item) === this.#sendKey(record) && item.outcome === record.outcome)) pending.push(record);
+    };
+    for (const snapshot of snapshots) {
+      const saved = refRecord(snapshot);
+      if (saved?.format !== 1 || !Array.isArray(saved.items)) continue;
+      for (const raw of Array.isArray(saved.pendingDeliveryOutcomes) ? saved.pendingDeliveryOutcomes : []) {
+        const send = deliverySend(raw);
+        const record = raw as DeliveryOutcomeRecord;
+        if (send && ["delivered", "superseded", "failed", "unknown"].includes(record.outcome) &&
+            typeof record.reason === "string" && Number.isFinite(record.at)) add({ ...send, outcome: record.outcome, reason: record.reason, at: record.at });
+      }
+      for (const raw of saved.items) {
+        const item = refRecord(raw) as Partial<ActorQueueItem> | undefined;
+        if (!item) continue;
+        items.push(item);
+        const send = this.#restoredSend(actor, item);
+        if (send && (item.terminalFailed === true || hasDeliveryOutcome(this.mesh.root, send, "failed"))) add({ ...send, outcome: "failed",
+          reason: "activation ended before inference consumed this event", at: Date.now() });
+      }
+    }
+    if (pending.length) this.#pendingDeliveryOutcomes.set(actor.id, pending);
+    const failed = new Set(pending.filter(record => record.outcome === "failed").map(record => this.#sendKey(record)));
+    const terminal = (item: Partial<ActorQueueItem>): boolean => {
+      const send = this.#restoredSend(actor, item);
+      return !(item.source === "child-completion" && item.deferredHandoff === true) &&
+        (item.terminalFailed === true || !!send && failed.has(this.#sendKey(send)));
+    };
+    // Adoption can find a tombstone for a copy already parked by this process.
+    actor.queue = actor.queue.filter(item => !terminal(item));
+    for (const queue of [this.#overflow, this.#parked]) {
+      const kept = queue.get(actor.id)?.filter(item => !terminal(item));
+      if (kept?.length) queue.set(actor.id, kept);
+      else queue.delete(actor.id);
+    }
+    items.push(...actor.queue, ...(this.#overflow.get(actor.id) ?? []), ...(this.#parked.get(actor.id) ?? []), ...this.#inFlightItems(actor.id));
+    // The mesh cursor's old event-only cache must not turn a terminal send into
+    // evidence against a distinct tuple that happens to share its event id.
+    const liveEvents = new Set(items.filter(item => !terminal(item) && typeof item.source === "string" && item.source.startsWith("mesh:"))
+      .map(item => refRecord(item.payload)?.id));
+    for (const item of items) {
+      const eventId = typeof item.source === "string" && item.source.startsWith("mesh:") ? refRecord(item.payload)?.id : undefined;
+      if (terminal(item) && typeof eventId === "string" && !liveEvents.has(eventId)) this.#delivered.add(`${actor.id}\0${eventId}`);
+    }
   }
 
   // Merges saved queue items into the actor's parked work (which waits for ownership), skipping
@@ -8056,18 +8161,6 @@ export class ActorManager {
     };
     const records = saved.format === 1 ? saved.items : undefined;
     if (!Array.isArray(records)) return;
-    if (Array.isArray(saved.pendingDeliveryOutcomes)) {
-      const pending = this.#pendingDeliveryOutcomes.get(actor.id) ?? [];
-      for (const raw of saved.pendingDeliveryOutcomes) {
-        const send = deliverySend(raw); const record = raw as DeliveryOutcomeRecord;
-        if (!send || !["delivered", "superseded", "failed", "unknown"].includes(record.outcome) ||
-          typeof record.reason !== "string" || !Number.isFinite(record.at)) continue;
-        if (!pending.some(item => item.eventId === send.eventId && item.outcome === record.outcome && item.to === send.to && item.from === send.from && item.mode === send.mode)) {
-          pending.push({ ...send, outcome: record.outcome, reason: record.reason, at: record.at });
-        }
-      }
-      if (pending.length) this.#pendingDeliveryOutcomes.set(actor.id, pending);
-    }
     if (actor.residency === "durable" && actor.dedupeKey && Array.isArray(saved.processedKeys)) {
       // Predecessor history precedes locally completed work; never let an old
       // handoff evict a newer local completion. Legacy snapshots have no history.
@@ -8181,13 +8274,12 @@ export class ActorManager {
       if (saved.cancelled === true && !deferredHandoff) continue;
       // A FAILED receipt can precede queue cleanup, but never this durable
       // tombstone. Retain any pending receipt; do not rerun its original.
-      const restoredSend = deliverySend(value.outcomeSend);
+      const restoredSend = this.#restoredSend(actor, value);
       if (!deferredHandoff && (value.terminalFailed === true ||
-          (restoredSend && hasDeliveryOutcome(this.mesh.root, restoredSend, "failed")))) {
-        // A predecessor may lack the newer tombstone, but its exact send receipt
-        // is still terminal. Cursor replay of that original is not a new delivery.
-        const eventId = value.source.startsWith("mesh:") ? refRecord(value.payload)?.id : undefined;
-        if (typeof eventId === "string") this.#delivered.add(`${actor.id}\0${eventId}`);
+          (restoredSend && (this.#pendingDeliveryOutcomes.get(actor.id)?.some(record => record.outcome === "failed" &&
+            this.#sendKey(record) === this.#sendKey(restoredSend)) || hasDeliveryOutcome(this.mesh.root, restoredSend, "failed"))))) {
+        // All input files' terminal identities were collected before admission;
+        // a stale predecessor need not carry the newer tombstone or send stamp.
         continue;
       }
       // New snapshots prove whether a worker actually launched since the last

@@ -730,6 +730,164 @@ describe("round 2 batch failure and recovery interleavings", () => {
     expect(receipts.filter(record => record.eventId === fresh.id).map(record => record.outcome)).toEqual(["delivered"]);
   });
 
+  it.each([
+    { source: "mesh", fence: "own", predecessors: ["unmarked"], retryAppend: false },
+    { source: "mesh", fence: "adopted", predecessors: ["unmarked", "terminal"], retryAppend: false },
+    { source: "mesh", fence: "adopted", predecessors: ["terminal", "unmarked"], retryAppend: false },
+    { source: "mesh", fence: "own", predecessors: ["unmarked"], retryAppend: true },
+    { source: "direct", fence: "own", predecessors: ["unmarked"], retryAppend: false },
+    { source: "direct", fence: "adopted", predecessors: ["unmarked", "terminal"], retryAppend: false },
+    { source: "direct", fence: "adopted", predecessors: ["terminal", "unmarked"], retryAppend: false },
+  ])("restores a $fence terminal fence before FAILED append (source=$source, predecessors=$predecessors, retryAppend=$retryAppend)", async ({ source, fence, predecessors, retryAppend }) => {
+    // Astra P2, PR #1075 / smarty-dev#11605: no durable receipt exists yet. Index
+    // all adopted tombstones before importing an earlier unmarked copy as work.
+    const first = await fixture();
+    const actor = await create(first.actors, { batchWindowMs: 0 });
+    let unmarked = "";
+    first.runStub.mockImplementationOnce(async () => {
+      unmarked = fs.readFileSync(first.snapshotFile(actor.id), "utf8");
+      throw new Error("recorded terminal refusal before inference");
+    });
+    let interrupted = "";
+    let queueFile = "";
+    const append = deliveryOutcomes.appendDeliveryOutcome;
+    const receipt = vi.spyOn(deliveryOutcomes, "appendDeliveryOutcome").mockImplementation((...args) => {
+      if (args[2] === "failed") {
+        if (!interrupted) {
+          queueFile = first.snapshotFile(actor.id);
+          interrupted = fs.readFileSync(queueFile, "utf8");
+        }
+        throw new Error("recorded crash BEFORE FAILED append");
+      }
+      append(...args);
+    });
+    // Routed owner admission carries the send separately: its payload is not a MeshEvent.
+    const admit = (event: MeshEvent) => source === "direct"
+      ? expect(first.actors.tell(actor.id, "routed original", event.data, { outcomeSend: {
+        eventId: event.id, to: actor.id, from: event.from.id, mode: "steer",
+      } }).queued).toBe(true)
+      : expect(first.monitor.callbacks.onEvent(event)).toBe(true);
+    const failed = { ...first.event({ ref: "terminal-predecessor-original" }), to: actor.id };
+    admit(failed);
+    await settled(first.actors, actor.id);
+    expect(interrupted).not.toBe("");
+    const crash = JSON.parse(interrupted);
+    expect(crash.items).toHaveLength(1);
+    expect(crash.items[0]).toMatchObject({ terminalFailed: true, ...(source === "direct"
+      ? { source: "direct", payload: { message: "routed original", data: failed.data } }
+      : { payload: { id: failed.id } }) });
+    const failedSend = deliveryOutcomes.deliverySend(crash.items[0].outcomeSend)!;
+    expect(failedSend).toBeDefined();
+    expect(crash.pendingDeliveryOutcomes).toMatchObject([{ ...failedSend, outcome: "failed" }]);
+    const older = JSON.parse(unmarked);
+    expect(older.items).toHaveLength(1);
+    expect(older.items[0].terminalFailed).toBeUndefined();
+    expect(older.items[0].outcomeSend).toEqual(failedSend);
+
+    // Obtain the counterexample through real admission too: same receiver,
+    // sender and mode, but a distinct original/event must remain runnable.
+    first.actors.pauseForRelease();
+    const unrelated = { ...first.event({ ref: "unrelated-predecessor-original" }), to: actor.id };
+    admit(unrelated);
+    const unrelatedSnapshot = JSON.parse(fs.readFileSync(first.snapshotFile(actor.id), "utf8"));
+    const unrelatedItem = unrelatedSnapshot.items.find((item: { outcomeSend?: deliveryOutcomes.DeliverySend }) => item.outcomeSend?.eventId === unrelated.id);
+    expect(unrelatedItem).toBeDefined();
+    const unrelatedSend = deliveryOutcomes.deliverySend(unrelatedItem.outcomeSend)!;
+    expect(unrelated.id).not.toBe(failed.id);
+    expect(unrelatedSend).toEqual({ ...failedSend, eventId: unrelated.id });
+    await first.close();
+    expect(deliveryOutcomes.hasDeliveryOutcome(first.mesh.root, failedSend, "failed")).toBe(false);
+    const receiptDir = path.join(first.mesh.root, "delivery-outcomes");
+    const receipts = (): deliveryOutcomes.DeliveryOutcomeRecord[] => fs.existsSync(receiptDir)
+      ? fs.readdirSync(receiptDir).flatMap(file => fs.readFileSync(path.join(receiptDir, file), "utf8")
+        .trim().split("\n").filter(Boolean).map(line => JSON.parse(line))) : [];
+    expect(receipts()).toEqual([]); // The fault never delegates FAILED to the real appender.
+
+    const predecessorFiles = new Map(["unmarked", "terminal"].map(label => {
+      const root = `session:retired-before-append-${label}`;
+      const key = createHash("sha256").update([root, actor.residency].join("\0")).digest("hex").slice(0, 16);
+      return [label, { root, file: path.join(first.root, "actors", actor.id, `queue-${key}.json`) }] as const;
+    }));
+    // The terminal lineage gets the exact recorded crash bytes, not a snapshot
+    // captured after append. The other lineage has no pending failure evidence.
+    fs.writeFileSync(queueFile, fence === "own" ? interrupted : JSON.stringify({ ...crash, items: [], pendingDeliveryOutcomes: [] }));
+    fs.writeFileSync(predecessorFiles.get("unmarked")!.file, JSON.stringify({
+      ...unrelatedSnapshot, items: [...older.items, unrelatedItem], pendingDeliveryOutcomes: [],
+    }));
+    if (fence === "adopted") fs.writeFileSync(predecessorFiles.get("terminal")!.file, interrupted);
+    const registryFile = path.join(first.root, "actors", "actors.json");
+    const registry = JSON.parse(fs.readFileSync(registryFile, "utf8"));
+    registry.actors.find((record: { id: string }) => record.id === actor.id).adoptedFrom = predecessors.map(label => predecessorFiles.get(label)!.root);
+    fs.writeFileSync(registryFile, JSON.stringify(registry));
+    const retained = new Set(predecessors.map(label => predecessorFiles.get(label)!.file));
+    const removals: string[] = [];
+    const remove = fs.rmSync;
+    vi.spyOn(fs, "rmSync").mockImplementation((file, options) => {
+      if (retained.has(String(file))) {
+        removals.push(String(file));
+        throw Object.assign(new Error("recorded undeletable predecessor"), { code: "EACCES" });
+      }
+      return remove(file, options);
+    }); // Recorded removal attempts only; no predecessor file is actually deleted.
+
+    if (retryAppend) {
+      const blocked = await fixture(first.root, 32, false);
+      expect(blocked.runStub).not.toHaveBeenCalled();
+      if (source === "mesh") expect(blocked.monitor.callbacks.onEvent(failed)).toBe("ignored");
+      await blocked.close();
+      expect(receipts()).toEqual([]);
+      const pendingOnly = JSON.parse(fs.readFileSync(queueFile, "utf8"));
+      expect(pendingOnly.pendingDeliveryOutcomes).toMatchObject([{ ...failedSend, outcome: "failed" }]);
+      expect(pendingOnly.items.map((item: { payload: MeshEvent }) => item.payload.id)).toEqual([unrelated.id]);
+      expect(pendingOnly.items.some((item: { terminalFailed?: boolean }) => item.terminalFailed)).toBe(false);
+    }
+    receipt.mockRestore();
+    const second = await fixture(first.root, 32, false);
+    expect(second.runStub).not.toHaveBeenCalled();
+    // Restore alone must settle the obligation, before any fresh event or run
+    // can incidentally flush it. Keep worker activation paused for this check.
+    // Soft convergence check deliberately reaches the execution assertions on an unfixed manager.
+    expect.soft(receipts().filter(record => record.eventId === failed.id)).toEqual([expect.objectContaining({ ...failedSend, outcome: "failed" })]);
+    expect(receipts().filter(record => record.eventId === unrelated.id)).toEqual([]);
+    if (source === "mesh") expect(second.monitor.callbacks.onEvent(failed)).toBe("ignored");
+    second.actors.resumeAfterRelease();
+    await settled(second.actors, actor.id);
+    expect.soft(second.runStub).toHaveBeenCalledTimes(1);
+    expect.soft(second.runs).toHaveLength(1);
+    expect.soft(second.runs.some(run => run.task.includes('"ref": "unrelated-predecessor-original"'))).toBe(true);
+    expect.soft(second.runs.some(run => run.task.includes('"ref": "terminal-predecessor-original"'))).toBe(false);
+    expect.soft(receipts().filter(record => record.eventId === failed.id).map(record => record.outcome)).toEqual(["failed"]);
+    expect(receipts().filter(record => record.eventId === unrelated.id)).toEqual([expect.objectContaining({ ...unrelatedSend, outcome: "delivered" })]);
+    await second.close();
+    for (const file of retained) {
+      expect(removals).toContain(file);
+      expect(fs.existsSync(file)).toBe(true);
+    }
+
+    // Retained, unmarked predecessors remain fenced on another restart. Only
+    // mesh has cursor replay: another direct tell would be a new admission.
+    // Do not require successful unrelated work to rerun.
+    const third = await fixture(first.root);
+    await settled(third.actors, actor.id);
+    for (const [request] of third.runStub.mock.calls) {
+      expect.soft(request.task).toContain('"ref": "unrelated-predecessor-original"');
+      expect.soft(request.task).not.toContain('"ref": "terminal-predecessor-original"');
+    }
+    const calls = third.runStub.mock.calls.length;
+    if (source === "mesh") expect(third.monitor.callbacks.onEvent(failed)).toBe("ignored");
+    await settled(third.actors, actor.id);
+    expect(third.runStub).toHaveBeenCalledTimes(calls);
+    expect.soft(receipts().filter(record => record.eventId === failed.id)).toEqual([expect.objectContaining({ ...failedSend, outcome: "failed" })]);
+    expect(receipts().filter(record => record.eventId === unrelated.id)).toEqual([expect.objectContaining({ ...unrelatedSend, outcome: "delivered" })]);
+    // Retaining a terminal fence for an undeletable predecessor must not hold up
+    // a later independent send's receipt after another restart.
+    const fresh = { ...third.event({ ref: "fresh-after-terminal-restart" }, "steer"), to: actor.id };
+    expect(third.monitor.callbacks.onEvent(fresh)).toBe(true);
+    await settled(third.actors, actor.id);
+    expect(third.runStub).toHaveBeenCalledTimes(calls + 1);
+    expect(receipts().filter(record => record.eventId === fresh.id).map(record => record.outcome)).toEqual(["delivered"]);
+  });
+
   it("an undeletable adopted predecessor cannot resurrect an unmarked FAILED send across restarts", async () => {
     const first = await fixture();
     const actor = await create(first.actors, { batchWindowMs: 0 });

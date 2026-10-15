@@ -15,7 +15,10 @@ import { ProcessTransport } from "../src/agents/transports/process-transport.js"
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { MeshStore } from "../src/mesh/store.js";
 import { processStartTime } from "../src/residency/process-identity.js";
-import { sweepTempRunRoots } from "../src/storage/retention.js";
+import { canRemoveTerminalRun, pruneActorRunArchives, sweepTempRunRoots } from "../src/storage/retention.js";
+import { readTerminalAdmissions } from "../src/agents/terminal-notices.js";
+import { readTerminalControl } from "../src/worker/terminal-controls.js";
+import { taskControlDirectory, taskControlReadDirectory } from "../src/worker/terminal-answer.js";
 import { writeHostLease } from "../src/topology/host-leases.js";
 import type { AgentRunResult } from "../src/agents/types.js";
 
@@ -77,6 +80,81 @@ const journal = (meshRoot: string): string[] => {
 };
 
 describe.runIf(process.platform === "linux")("ENODEV-unconfirmed task-agent runs (smarty-dev#9855)", () => {
+  it("a legacy stopped run remains queryable, recovers once without delivery, and dry-run collection accepts only consumed controls", async () => {
+    const meshRoot = tempRoot(), runRoot = tempRoot(), id = "1".repeat(32);
+    const directory = runDir(runRoot, meshRoot, id, { status: "stopped", text: "operator stopped this legacy task" });
+    const controlId = "11111111-1111-4111-8111-111111111111";
+    const sender = { id: `session:${SESSION}`, kind: "main", verified: "mesh" };
+    const provenance = { v: 1, channel: "fabric", via: "steer", sender };
+    // Exact old on-disk layout: a matching prior status, no sibling, and a
+    // delivered row tied to its original legacy admission. Never initialize a
+    // new sibling just to make an existing-run READ or stop appear successful.
+    fs.writeFileSync(path.join(directory, "steer.jsonl"), JSON.stringify({ id: controlId, type: "steer", provenance }) + "\n");
+    fs.mkdirSync(path.join(directory, "terminal-controls"), { mode: 0o700 });
+    fs.writeFileSync(path.join(directory, "terminal-controls", controlId + ".json"), JSON.stringify({ id: controlId, delivery: "steer", provenance, state: "delivered" }));
+    const controlBytes = fs.readFileSync(path.join(directory, "steer.jsonl"));
+    expect(fs.existsSync(taskControlDirectory(directory))).toBe(false);
+    expect(taskControlReadDirectory(directory)).toBe(directory);
+    expect(readTerminalAdmissions(directory).byId.get(controlId)?.sender).toEqual(sender);
+    expect(readTerminalControl(directory, controlId)?.state).toBe("delivered");
+    expect(canRemoveTerminalRun(directory), "ENODEV custody is still unresolved").toBe(false);
+
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, retainRuns: true }, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: tempRoot(),
+    }); managers.push(manager);
+    manager.restorePreviousRuns([{ ...status(directory), name: "legacy stopped task", task: "legacy", cwd: process.cwd(),
+      updatedAt: 2, finishedAt: 2, turns: 0, toolCalls: 0,
+      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
+    } as AgentRunResult]);
+    await expect(manager.stop(id)).resolves.toMatchObject({ id, status: "stopped", text: "operator stopped this legacy task" });
+    await expect(manager.wait(id)).resolves.toMatchObject({ status: "stopped" });
+    expect(manager.status(id)).toMatchObject({ status: "stopped" });
+    expect(() => manager.steer(id, "do not restart stopped custody")).toThrow(/stopped|already finished/);
+    expect(fs.existsSync(taskControlDirectory(directory))).toBe(false);
+
+    expect(recoverEnodevTaskRun(directory)).toBe("lost");
+    expect(status(directory)).toMatchObject({ status: "stopped", settledLost: true, text: "operator stopped this legacy task" });
+    expect(recoverEnodevTaskRun(directory)).toBeUndefined();
+    expect(journal(meshRoot)).toEqual([]);
+    expect(pendingCompletions(meshRoot, meshRoot)).toEqual([]);
+    expect(readTerminalAdmissions(directory).byId.get(controlId)?.sender).toEqual(sender);
+    expect(readTerminalControl(directory, controlId)?.state).toBe("delivered");
+    expect(canRemoveTerminalRun(directory)).toBe(true);
+    const retentionMs = 1_000, now = status(directory).finishedAt + retentionMs;
+    expect(pruneActorRunArchives({ runsDirectory: runRoot, retentionMs, now, dryRun: true })).toEqual([directory]);
+    expect(fs.existsSync(directory)).toBe(true); // Dry run, not deletion evidence.
+    expect(fs.readFileSync(path.join(directory, "steer.jsonl"))).toEqual(controlBytes);
+    expect(fs.existsSync(taskControlDirectory(directory))).toBe(false);
+  });
+
+  it.each(["queued", "malformed", "fifo", "linked"] as const)("legacy recovery never makes %s control evidence collectible", fault => {
+    const meshRoot = tempRoot(), runRoot = tempRoot(), id = "2".repeat(32);
+    const directory = runDir(runRoot, meshRoot, id, { status: "stopped" });
+    const controlId = "22222222-2222-4222-8222-222222222222";
+    fs.writeFileSync(path.join(directory, "steer.jsonl"), JSON.stringify({ id: controlId, type: "steer" }) + "\n");
+    const controls = path.join(directory, "terminal-controls"); fs.mkdirSync(controls, { mode: 0o700 });
+    const file = path.join(controls, controlId + ".json");
+    const delivered = JSON.stringify({ id: controlId, delivery: "steer", state: "delivered" });
+    if (fault === "fifo") expect(spawnSync("mkfifo", [file]).status).toBe(0);
+    else if (fault === "linked") {
+      const external = path.join(runRoot, "owned-link-evidence"); fs.writeFileSync(external, delivered);
+      fs.symlinkSync(external, file);
+    } else fs.writeFileSync(file, fault === "malformed" ? "{bad" : JSON.stringify({ id: controlId, delivery: "steer", state: "queued" }));
+    expect(taskControlReadDirectory(directory)).toBe(directory);
+    expect(recoverEnodevTaskRun(directory)).toBe("lost");
+    expect(status(directory)).toMatchObject({ status: "stopped", settledLost: true });
+    expect(readTerminalAdmissions(directory).byId.has(controlId)).toBe(true);
+    expect(readTerminalControl(directory, controlId)?.state).toBe(fault === "queued" ? "queued" : undefined);
+    expect(canRemoveTerminalRun(directory)).toBe(false);
+    // The identity remover relies on its caller's terminal-safety judgment.
+    // Exercise that judgment through the collector at the same expiry boundary
+    // as the consumed legacy counterexample above, not through the remover alone.
+    const retentionMs = 1_000, now = status(directory).finishedAt + retentionMs;
+    expect(pruneActorRunArchives({ runsDirectory: runRoot, retentionMs, now, dryRun: true })).toEqual([]);
+    expect(fs.lstatSync(file)).toBeDefined(); // Refused dry run preserves evidence, including the FIFO/link.
+    expect(journal(meshRoot)).toEqual([]);
+  });
+
   it("(a) a saved answer, a live spawner AND a manifest naming another live session: settled lost, nothing delivered", () => {
     const meshRoot = tempRoot();
     const spawner = recipientOf(meshRoot);

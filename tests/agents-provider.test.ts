@@ -50,6 +50,7 @@ import { ResidentActorClient } from "../src/residency/actor-client.js";
 import { residentHostId, residentRoot, ResidentOutcomeUnknownError } from "../src/residency/protocol.js";
 import { snapshotHandoffSession } from "../src/agents/handoff.js";
 import { AgentManager } from "../src/agents/manager.js";
+import { taskSteerFile } from "../src/worker/terminal-answer.js";
 import { parseWorkerOptions } from "../src/worker/options.js";
 import { createRunningRecord, writeRunRecord } from "../src/worker/run-record.js";
 import { resolvePiModel } from "../src/core/model-refresh.js";
@@ -5401,8 +5402,13 @@ describe("AgentsProvider global actors", () => {
 });
 
 describe("AgentsProvider steering", () => {
+  const steeringSetup = () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "provider-steer-workspace-")); roots.push(root);
+    const workspace = path.join(root, "workspace"); fs.mkdirSync(workspace);
+    return setup([], [], undefined, { cwd: workspace });
+  };
   const readSteerFile = (root: string, id: string): Array<Record<string, unknown>> => {
-    const file = path.join(root, "runs", id, "steer.jsonl");
+    const file = taskSteerFile(path.join(root, "runs", id));
     if (!fs.existsSync(file)) return [];
     return fs
       .readFileSync(file, "utf8")
@@ -5460,7 +5466,7 @@ describe("AgentsProvider steering", () => {
   });
 
   it("steer routes to a local running agent and queues a steer command", async () => {
-    const { provider, root } = setup();
+    const { provider, root } = steeringSetup();
     const handle = (await provider.invoke(
       "spawn",
       { task: "HANG", transport: "process" },
@@ -5478,7 +5484,7 @@ describe("AgentsProvider steering", () => {
   });
 
   it("accepts an owner-addressed control command for a local agent", async () => {
-    const { provider, root } = setup();
+    const { provider, root } = steeringSetup();
     const handle = (await provider.invoke(
       "spawn",
       { task: "HANG", transport: "process" },
@@ -5653,7 +5659,7 @@ describe("AgentsProvider steering", () => {
   });
 
   it("setSteeringMode routes to a local agent", async () => {
-    const { provider, root } = setup();
+    const { provider, root } = steeringSetup();
     const handle = (await provider.invoke(
       "spawn",
       { task: "HANG", transport: "process" },
@@ -5673,7 +5679,7 @@ describe("AgentsProvider steering", () => {
   });
 
   it("setSteeringMode rejects an invalid mode", async () => {
-    const { provider } = setup();
+    const { provider } = steeringSetup();
     const handle = (await provider.invoke(
       "spawn",
       { task: "HANG", transport: "process" },
@@ -5686,7 +5692,7 @@ describe("AgentsProvider steering", () => {
   });
 
   it("compact enqueues a compact entry for a running pi child", async () => {
-    const { provider, root } = setup();
+    const { provider, root } = steeringSetup();
     const handle = (await provider.invoke(
       "spawn",
       { task: "HANG", transport: "process" },

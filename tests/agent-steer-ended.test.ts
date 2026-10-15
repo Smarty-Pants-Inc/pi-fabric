@@ -1,48 +1,357 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { spawnSync } from "node:child_process";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agents/manager.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { writeJsonAtomic } from "../src/core/atomic-write.js";
-import { saveFinalAnswerReceipt } from "../src/worker/terminal-answer.js";
 import { readTerminalControl, settleTerminalControl } from "../src/worker/terminal-controls.js";
 import { TerminalNoticeOutbox } from "../src/agents/terminal-notices.js";
+import { createHostTaskRun, MAX_TASK_CONTROL_BYTES, ensureTaskControlRoot, saveFinalAnswerReceipt, taskControlDirectory, taskControlRoot, taskSteerFile } from "../src/worker/terminal-answer.js";
 import type { AgentRunRecord } from "../src/agents/types.js";
-import type { AgentTerminalNotice } from "../src/agents/terminal-target.js";
+import type { FabricWritePolicy } from "../src/agents/write-guard.js";
+import { FabricSteerAdmissionLimitError, type AgentTerminalNotice } from "../src/agents/terminal-target.js";
+import { MAX_STEER_BYTES, MAX_STEER_CONTROLS, MAX_PUBLIC_REFUSALS, readTerminalAdmissions } from "../src/agents/terminal-notices.js";
 
-// Decision C: only the exact manager pre-check/append instruction interleaving
-// is mocked. E-steer-final exercises real process transport and dist worker.
+// Private scratch roots are retained as evidence; this regression never deletes fixtures.
 const managers: AgentManager[] = [];
-afterEach(async () => { await Promise.all(managers.splice(0).map(manager => manager.close())); vi.restoreAllMocks(); });
-const provenance = { v: 1 as const, channel: "fabric" as const, via: "steer" as const,
-  sender: { id: "session:original-sender", name: "Original", kind: "main" as const, verified: "mesh" as const } };
-const harness = () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "steer-ended-manager-"));
+const exits: (() => void)[] = [];
+afterEach(async () => {
+  for (const exit of exits.splice(0)) exit();
+  await Promise.all(managers.splice(0).map(manager => manager.close()));
+  vi.restoreAllMocks();
+});
+
+const harness = (retainRuns = true, parentPolicy?: (root: string, workspace: string) => FabricWritePolicy) => {
   const notices: AgentTerminalNotice[] = [];
-  let record: AgentRunRecord;
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "steer-ended-"));
+  const workspace = path.join(root, "workspace"); fs.mkdirSync(workspace);
+  const records = new Map<string, AgentRunRecord>();
+  const closures = new Map<string, () => void>();
+  if (parentPolicy) vi.stubEnv("PI_FABRIC_WRITE_POLICY", JSON.stringify(parentPolicy(root, workspace)));
   const launch = vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async request => {
-    record = { id: request.id, name: request.name, task: "task", runner: "pi", transport: "process", status: "running",
-      cwd: request.cwd, startedAt: Date.now(), updatedAt: Date.now(), turns: 1, toolCalls: 0, text: "",
-      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 } };
-    writeJsonAtomic(path.join(root, request.id, "status.json"), record);
+    const args = new Map<string, string>();
+    for (let i = 0; i < request.workerArguments.length; i += 2) args.set(request.workerArguments[i]!, request.workerArguments[i + 1]!);
+    const now = Date.now();
+    const record: AgentRunRecord = { id: request.id, name: request.name, task: "task", status: "running", runner: "pi", transport: "process",
+      cwd: request.cwd, startedAt: now, updatedAt: now, turns: 1, toolCalls: 0, text: "intermediate prose",
+      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 }, sessionId: "99999999" };
+    records.set(request.id, record);
+    writeJsonAtomic(args.get("--status-file")!, record);
     let alive = true;
-    return { kind: "process", isAlive: async () => alive, stop: async () => { alive = false; } };
+    let close!: () => void;
+    const closed = new Promise<void>(resolve => { close = () => { alive = false; resolve(); }; });
+    closures.set(request.id, close); exits.push(close);
+    return { kind: "process", sessionId: "99999999", closed, stopDebt: () => undefined,
+      waitForClose: () => closed, isAlive: async () => alive, stop: async () => { await closed; } };
   });
-  const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, retainRuns: true }, {
-    workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root, onTerminalNotice: notice => { notices.push(notice); },
-  });
+  const manager = new AgentManager(workspace, { ...DEFAULT_FABRIC_CONFIG.agents, maxConcurrent: 1, budgetUsd: 0, retainRuns },
+    { workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root, onTerminalNotice: notice => { notices.push(notice); } });
   managers.push(manager);
-  const finish = (id: string, publishStatus = true) => {
-    const receipt = saveFinalAnswerReceipt(path.join(root, id), id, "done");
-    if (publishStatus) writeJsonAtomic(path.join(root, id, "status.json"), { ...record, status: "completed", text: "done",
+  const finish = (id: string, text: string) => {
+    const receipt = saveFinalAnswerReceipt(path.join(root, id), id, text);
+    writeJsonAtomic(path.join(root, id, "status.json"), { ...records.get(id)!, status: "completed", text,
       finalAnswerReceipt: { id: receipt.id, recordedAt: receipt.recordedAt } });
     return receipt;
   };
-  return { root, notices, launch, manager, finish };
+  return { manager, root, workspace, launch, records, notices, finish, close: (id: string) => closures.get(id)!() };
 };
+const waitUntil = async (condition: () => boolean) => {
+  for (let i = 0; i < 200 && !condition(); i++) await new Promise(resolve => setTimeout(resolve, 10));
+  expect(condition()).toBe(true);
+};
+const sender = { id: "session:original-sender", name: "Original", kind: "main" as const, verified: "mesh" as const };
+const provenance = { v: 1 as const, channel: "fabric" as const, via: "steer" as const, sender };
 
+describe("steer/followUp after an ordinary Pi task's final answer", () => {
+  it.each(["steer", "followUp"] as const)("%s: final recorded between ingress pre-check and append is run-ended in the receipt and status, before native exit", async kind => {
+    const { manager, root, launch, records, notices, finish, close } = harness();
+    const handle = await manager.spawn({ task: "ordinary", transport: "process" });
+    const directory = path.join(root, handle.id);
+    const steerFile = taskSteerFile(directory);
+    const append = fs.appendFileSync;
+    let receipt: ReturnType<typeof finish> | undefined;
+    vi.spyOn(fs, "appendFileSync").mockImplementation(((file: fs.PathOrFileDescriptor, data: string | Uint8Array, options?: fs.WriteFileOptions) => {
+      // The pre-checks passed; the worker records its immutable final answer while this input is being appended.
+      if (typeof file === "number" && fs.fstatSync(file).ino === fs.statSync(steerFile).ino && !receipt) receipt = finish(handle.id, "done");
+      return append(file, data, options);
+    }) as typeof fs.appendFileSync);
+    const sent = kind === "steer"
+      ? manager.steer(handle.id, "racing input", undefined, provenance)
+      : manager.followUp(handle.id, "racing input", undefined, { ...provenance, via: "followUp" }, { deadlineMs: 60_000 });
+    expect(receipt).toBeDefined();
+    const expected = { code: "FABRIC_TARGET_TERMINAL", reason: "run-ended", deliveryStatus: "undelivered", messageId: sent.messageId, delivery: kind,
+      finalAnswerReceiptId: receipt!.id, sender };
+    expect(sent).toMatchObject({ queued: true, messageId: sent.messageId, undelivered: { ...expected, runState: "completed" } });
+    // Visible through status while the native process is still alive.
+    expect(manager.hasRunCustody(handle.id)).toBe(true);
+    expect(manager.status(handle.id).undeliveredMessages).toMatchObject([expected]);
+    // The parent consumes the result; it reports the same refusal, still without native exit.
+    const result = await manager.wait(handle.id, { timeoutMs: 1000 });
+    expect(result).toMatchObject({ status: "completed", text: "done", undeliveredMessages: [expected] }); // runState is view-time
+    await waitUntil(() => fs.existsSync(path.join(taskControlDirectory(directory), "terminal-notices", `${sent.messageId}.json.delivered`)));
+    expect(notices).toEqual([{ code: "FABRIC_TARGET_TERMINAL", targetId: handle.id, finalAnswerReceiptId: receipt!.id,
+      messageId: sent.messageId, delivery: kind, sender }]);
+    // No new turn, no relaunch, and the final answer source is untouched.
+    expect(launch).toHaveBeenCalledTimes(1);
+    expect(records.get(handle.id)!.turns).toBe(1);
+    expect(fs.readFileSync(path.join(taskControlDirectory(directory), "final-answer.json"), "utf8")).toContain("done");
+    close(handle.id);
+    await new Promise(resolve => setTimeout(resolve, 20));
+    expect(notices).toHaveLength(1);
+    expect(manager.status(handle.id).undeliveredMessages).toMatchObject([expected]);
+  });
+
+  it("an unread admission appended just before the final answer is run-ended in status without waiting on native exit", async () => {
+    const { manager, root, notices, finish } = harness();
+    const handle = await manager.spawn({ task: "ordinary", transport: "process" });
+    const sent = manager.steer(handle.id, "never read", undefined, provenance);
+    expect(sent.undelivered).toBeUndefined();
+    const receipt = finish(handle.id, "done");
+    expect(manager.hasRunCustody(handle.id)).toBe(true);
+    expect(manager.status(handle.id).undeliveredMessages).toMatchObject([{ code: "FABRIC_TARGET_TERMINAL", reason: "run-ended", deliveryStatus: "undelivered",
+      messageId: sent.messageId, delivery: "steer", finalAnswerReceiptId: receipt.id, sender }]);
+    await waitUntil(() => fs.existsSync(path.join(taskControlDirectory(path.join(root, handle.id)), "terminal-notices", `${sent.messageId}.json.delivered`)));
+    expect(notices.map(notice => notice.sender)).toEqual([sender]);
+  });
+
+  it("counterexample: input delivered before the final answer stays delivered, with no refusal", async () => {
+    const { manager, root, notices, finish, close } = harness();
+    const handle = await manager.spawn({ task: "ordinary", transport: "process" });
+    const sent = manager.steer(handle.id, "consumed before final", undefined, provenance);
+    expect(sent.undelivered).toBeUndefined();
+    writeJsonAtomic(path.join(taskControlDirectory(path.join(root, handle.id)), "terminal-controls", `${sent.messageId}.json`),
+      { id: sent.messageId, delivery: "steer", state: "delivered", provenance });
+    finish(handle.id, "done");
+    expect(manager.status(handle.id).undeliveredMessages).toBeUndefined();
+    expect((await manager.wait(handle.id, { timeoutMs: 1000 })).undeliveredMessages).toBeUndefined();
+    close(handle.id);
+    await new Promise(resolve => setTimeout(resolve, 30));
+    expect(notices).toEqual([]);
+    expect(fs.existsSync(path.join(taskControlDirectory(path.join(root, handle.id)), "terminal-notices"))).toBe(false);
+  });
+
+  it("5,000 small requests stay bounded: every excess request is typed, every admitted refusal reaches its original sender", async () => {
+    const { manager, root, notices, finish } = harness();
+    const handle = await manager.spawn({ task: "bounded admission", transport: "process" });
+    const directory = path.join(root, handle.id);
+    const started = performance.now(), heap = process.memoryUsage().heapUsed;
+    const admitted: string[] = [];
+    let refused = 0;
+    for (let i = 0; i < 5000; i++) {
+      try { admitted.push(manager.steer(handle.id, `small ${i}`, undefined, provenance).messageId); }
+      catch (error) {
+        expect(error).toBeInstanceOf(FabricSteerAdmissionLimitError);
+        expect(error).toMatchObject({ code: "FABRIC_STEER_ADMISSION_LIMIT", targetId: handle.id, controlLimit: 256, byteLimit: MAX_STEER_BYTES });
+        refused++;
+      }
+    }
+    expect(admitted).toHaveLength(MAX_STEER_CONTROLS);
+    expect(refused).toBe(5000 - MAX_STEER_CONTROLS);
+    expect(fs.statSync(taskSteerFile(directory)).size).toBeLessThan(MAX_STEER_BYTES);
+    // Deadline refusal happens before any follow-up payload is created.
+    expect(() => manager.followUp(handle.id, "overflow", undefined, provenance, { deadlineMs: 60000 })).toThrow(FabricSteerAdmissionLimitError);
+    expect(fs.existsSync(path.join(directory, "follow-ups"))).toBe(false);
+    finish(handle.id, "done");
+    const read = fs.readFileSync;
+    const journalReads = vi.spyOn(fs, "readFileSync").mockImplementation(((file: fs.PathOrFileDescriptor, ...args: any[]) => {
+      if (file === taskSteerFile(directory)) throw new Error("unbounded admission read");
+      return (read as any)(file, ...args);
+    }) as typeof fs.readFileSync);
+    const readChunk = fs.readSync; let journalChunks = 0;
+    const streaming = vi.spyOn(fs, "readSync").mockImplementation(((fd: number, buffer: Buffer, offset: number, length: number, position: number) => {
+      if (fs.fstatSync(fd).ino === fs.statSync(taskSteerFile(directory)).ino) journalChunks++;
+      return readChunk(fd, buffer, offset, length, position);
+    }) as typeof fs.readSync);
+    const status = manager.status(handle.id);
+    expect(status.undeliveredMessages).toHaveLength(MAX_PUBLIC_REFUSALS);
+    expect(status).toMatchObject({ undeliveredMessagesTotal: 256, undeliveredMessagesTruncated: true });
+    await waitUntil(() => notices.length === MAX_STEER_CONTROLS);
+    expect(new Set(notices.map(notice => notice.messageId))).toEqual(new Set(admitted));
+    expect(notices.every(notice => notice.sender?.id === sender.id)).toBe(true);
+    // One <=1MiB stream pass shared by scan, view and routing, not N full reads.
+    expect(journalChunks).toBeLessThanOrEqual(Math.ceil(fs.statSync(taskSteerFile(directory)).size / (16 * 1024)) + 1);
+    journalReads.mockRestore(); streaming.mockRestore();
+    const elapsedMs = performance.now() - started, heapGrowth = process.memoryUsage().heapUsed - heap;
+    expect(elapsedMs).toBeLessThan(20000);
+    expect(heapGrowth).toBeLessThan(128 * 1024 * 1024);
+    console.log(JSON.stringify({ proof: "5000 admission attempts", admitted: admitted.length, refused, routed: notices.length, publicEntries: status.undeliveredMessages?.length,
+      total: status.undeliveredMessagesTotal, truncated: status.undeliveredMessagesTruncated, elapsedMs, heapGrowth }));
+  }, 30000);
+
+  it.each(process.platform === "win32" ? ["oversized"] : ["fifo", "oversized"])("manager final-state scan refuses a %s registry without blocking or inventing delivery", async fault => {
+    const h = harness(), handle = await h.manager.spawn({ task: "bounded scan", transport: "process" });
+    const sent = h.manager.steer(handle.id, "unconsumed", undefined, provenance);
+    const controls = path.join(taskControlDirectory(path.join(h.root, handle.id)), "terminal-controls"); fs.mkdirSync(controls);
+    const file = path.join(controls, sent.messageId + ".json");
+    if (fault === "fifo") expect(spawnSync("mkfifo", [file]).status).toBe(0);
+    else fs.writeFileSync(file, "x".repeat(MAX_TASK_CONTROL_BYTES + 1));
+    h.finish(handle.id, "done");
+    const start = performance.now();
+    expect(() => h.manager.status(handle.id)).not.toThrow();
+    expect(performance.now() - start).toBeLessThan(1000);
+    expect(h.notices).toEqual([]); h.close(handle.id);
+  });
+
+  const failedQueuedLaunch = async (recorded: boolean) => {
+    const h = harness(), first = await h.manager.spawn({ task: "occupy capacity", transport: "process" });
+    const queued = await h.manager.spawn({ task: "queued launch fails", transport: "process" });
+    expect(queued.status).toBe("queued");
+    const directory = path.join(h.root, queued.id), control = taskControlDirectory(directory);
+    h.launch.mockImplementationOnce(async () => {
+      expect(fs.existsSync(control)).toBe(true);
+      expect(fs.existsSync(path.join(directory, "status.json"))).toBe(false);
+      throw new Error("fixture launch failed after ctl creation");
+    });
+    const remove = recorded ? vi.spyOn(fs, "rmSync").mockImplementation(() => undefined) : undefined;
+    h.finish(first.id, "done"); h.close(first.id);
+    const result = await h.manager.wait(queued.id, { timeoutMs: 5000 });
+    expect(result).toMatchObject({ status: "failed", error: expect.stringContaining("after ctl creation") });
+    if (remove) {
+      expect(remove.mock.calls.map(call => call[0]).filter(target => target === control || target === directory)).toEqual([directory, control]);
+      expect(fs.existsSync(control)).toBe(true); expect(fs.existsSync(directory)).toBe(true);
+      remove.mockRestore();
+    } else {
+      expect(fs.existsSync(control)).toBe(false); expect(fs.existsSync(directory)).toBe(false);
+    }
+  };
+  it("records paired cleanup after a queued launch fails between ctl creation and status", () => failedQueuedLaunch(true));
+  it("CI-only: failed queued launch removes both run and ctl", () => failedQueuedLaunch(false));
+
+  it("queued launch cleanup refuses and logs a dangling ctl link instead of deleting only the run", async () => {
+    const h = harness(), first = await h.manager.spawn({ task: "occupy capacity", transport: "process" });
+    const queued = await h.manager.spawn({ task: "queued linked controls", transport: "process" });
+    const directory = path.join(h.root, queued.id), control = taskControlDirectory(directory);
+    h.launch.mockImplementationOnce(async () => {
+      fs.renameSync(control, control + ".retained"); fs.symlinkSync(path.join(h.root, "missing"), control, process.platform === "win32" ? "junction" : "dir");
+      throw new Error("fixture dangling ctl launch failure");
+    });
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined), remove = vi.spyOn(fs, "rmSync").mockImplementation(() => undefined);
+    h.finish(first.id, "done"); h.close(first.id);
+    expect((await h.manager.wait(queued.id, { timeoutMs: 5000 })).status).toBe("failed");
+    expect(warning).toHaveBeenCalledWith(expect.stringContaining("FABRIC_TASK_CONTROL_UNSAFE cleanup refused"));
+    expect(remove.mock.calls.some(call => call[0] === directory || call[0] === control)).toBe(false);
+    expect(fs.existsSync(directory)).toBe(true); expect(fs.lstatSync(control).isSymbolicLink()).toBe(true);
+    await h.manager.close(); warning.mockRestore(); remove.mockRestore();
+  });
+
+  it("records paired ctl/run cleanup together without deleting either fixture", async () => {
+    const { manager, root, finish, close } = harness(false);
+    const handle = await manager.spawn({ task: "paired cleanup", transport: "process" });
+    finish(handle.id, "done"); await manager.wait(handle.id, { timeoutMs: 1000 }); close(handle.id);
+    const remove = vi.spyOn(fs.promises, "rm").mockResolvedValue(undefined);
+    // Join the owning close barrier, not registry presence or final-result settlement.
+    await manager.close();
+    const directory = path.join(root, handle.id);
+    expect(remove.mock.calls.map(call => call[0])).toContain(taskControlDirectory(directory));
+    expect(remove.mock.calls.map(call => call[0])).toContain(directory);
+    expect(fs.existsSync(directory)).toBe(true); expect(fs.existsSync(taskControlDirectory(directory))).toBe(true);
+    remove.mockRestore();
+  });
+
+  it("fails launch closed with a typed error when an explicit grant covers the central task-control root", async () => {
+    const { manager, root, launch } = harness();
+    // Explicit write roots must exist; create the real central root the manager itself would use.
+    const controlRoot = ensureTaskControlRoot();
+    await expect(manager.spawn({ task: "unsafe custom root", transport: "process", cwd: root, writableRoots: [controlRoot] })).rejects.toMatchObject({
+      name: "FabricTaskControlDirectoryError", code: "FABRIC_TASK_CONTROL_UNSAFE", message: expect.stringContaining("overlaps writable root"),
+    });
+    expect(launch).not.toHaveBeenCalled();
+  });
+
+  it("refuses inherited parent write roots that cover the central task-control root's state ancestor", async () => {
+    const h = harness(true, () => ({ readOnly: false, writableRoots: [path.dirname(taskControlRoot())], shell: "deny" }));
+    try {
+      await expect(h.manager.spawn({ task: "inherited unsafe root", transport: "process" })).rejects.toMatchObject({
+        name: "FabricTaskControlDirectoryError", code: "FABRIC_TASK_CONTROL_UNSAFE", message: expect.stringContaining("overlaps writable root"),
+      });
+      expect(h.launch).not.toHaveBeenCalled();
+    } finally { vi.unstubAllEnvs(); }
+  });
+
+  it("inherits a safe parent policy through the real manager worker arguments", async () => {
+    const h = harness(true, (_root, workspace) => ({ readOnly: false, writableRoots: [workspace], shell: "deny" }));
+    try {
+      const handle = await h.manager.spawn({ task: "safe inherited layout", transport: "process" });
+      const args = h.launch.mock.calls[0]![0].workerArguments;
+      const policyIndex = args.indexOf("--write-policy");
+      expect(policyIndex).toBeGreaterThanOrEqual(0);
+      const forwarded = JSON.parse(args[policyIndex + 1]!) as FabricWritePolicy;
+      expect(forwarded).toEqual({ readOnly: false, writableRoots: [h.workspace], shell: "deny" });
+      const statusIndex = args.indexOf("--status-file");
+      const runDirectory = path.dirname(args[statusIndex + 1]!);
+      const controls = taskControlDirectory(runDirectory);
+      expect(fs.existsSync(controls)).toBe(true);
+      const controlParent = path.dirname(controls);
+      expect(forwarded.writableRoots.some(root => {
+        const relative = path.relative(root, controlParent);
+        return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+      })).toBe(false);
+      expect(path.dirname(controls)).toBe(taskControlRoot());
+      h.finish(handle.id, "done"); h.close(handle.id);
+      expect(await h.manager.wait(handle.id, { timeoutMs: 1000 })).toMatchObject({ status: "completed", text: "done" });
+    } finally { vi.unstubAllEnvs(); }
+  });
+
+  it("allows default unconfined tasks with runs under cwd, keeping Fabric-owned private control directories", async () => {
+    const h = harness();
+    const first = await h.manager.spawn({ task: "legitimate unconfined layout", transport: "process", cwd: h.root });
+    h.finish(first.id, "done"); h.close(first.id); await h.manager.wait(first.id, { timeoutMs: 1000 });
+    const second = await h.manager.spawn({ task: "same owner next run", transport: "process", cwd: h.root });
+    await waitUntil(() => h.launch.mock.calls.length === 2);
+    expect(h.launch).toHaveBeenCalledTimes(2);
+    for (const id of [first.id, second.id]) {
+      const stat = fs.statSync(taskControlDirectory(path.join(h.root, id)));
+      if (process.getuid) expect(stat.uid).toBe(process.getuid());
+      if (process.platform !== "win32") expect(stat.mode & 0o777).toBe(0o700);
+    }
+    h.finish(second.id, "done"); h.close(second.id); await h.manager.close();
+  });
+
+  it("allows a trusted parent run to contain its child's control sibling outside the child's own grants", async () => {
+    const { manager, root, launch } = harness();
+    vi.stubEnv("PI_FABRIC_AGENT_RUN_DIR", root);
+    try {
+      const handle = await manager.spawn({ task: "nested caller", transport: "process" });
+      expect(handle.id).toBeTruthy();
+      expect(launch).toHaveBeenCalledTimes(1);
+    } finally { vi.unstubAllEnvs(); }
+  });
+
+  it("enforces the durable byte bound and fails closed on an oversized retained journal", async () => {
+    const { manager, root } = harness();
+    const handle = await manager.spawn({ task: "byte admission", transport: "process" });
+    const directory = path.join(root, handle.id);
+    for (let i = 0; i < 16; i++) manager.steer(handle.id, "x".repeat(63000), undefined, provenance);
+    expect(() => manager.steer(handle.id, "x".repeat(63000), undefined, provenance)).toThrow(FabricSteerAdmissionLimitError);
+    const file = taskSteerFile(directory);
+    expect(fs.statSync(file).size).toBeLessThanOrEqual(MAX_STEER_BYTES);
+    // Retained data, not a volatile counter, establishes the bound on resume.
+    fs.appendFileSync(file, "x".repeat(MAX_STEER_BYTES));
+    expect(readTerminalAdmissions(directory)).toMatchObject({ truncated: true });
+    expect(() => manager.steer(handle.id, "tiny", undefined, provenance)).toThrow(FabricSteerAdmissionLimitError);
+  });
+
+  it("refuses later input with a typed error naming the run state, keeping FABRIC_TARGET_TERMINAL", async () => {
+    const { manager, root, finish } = harness();
+    const handle = await manager.spawn({ task: "ordinary", transport: "process" });
+    const receipt = saveFinalAnswerReceipt(path.join(root, handle.id), handle.id, "pending");
+    expect(() => manager.steer(handle.id, "late")).toThrow(expect.objectContaining({ name: "FabricTargetTerminalError",
+      code: "FABRIC_TARGET_TERMINAL", reason: "run-ended", runState: "final-answer-pending", finalAnswerReceiptId: receipt.id }));
+    finish(handle.id, "pending");
+    await manager.wait(handle.id, { timeoutMs: 1000 });
+    expect(() => manager.followUp(handle.id, "late")).toThrow(expect.objectContaining({ code: "FABRIC_TARGET_TERMINAL",
+      reason: "run-ended", runState: "completed", message: expect.stringMatching(/run ended \(completed\)/) }));
+    expect(fs.existsSync(taskSteerFile(path.join(root, handle.id)))).toBe(false); // nothing was admitted
+  });
+});
+
+// Main (deliveryStatus/runState + forwarded transport evidence) cases, ported onto
+// the protected harness: controls/journal/receipt live in taskControlDirectory.
+// Receipt-only (status unpublished) models main's `finish(id, false)`.
+const receiptOnly = (root: string, id: string) => saveFinalAnswerReceipt(path.join(root, id), id, "done");
 describe("manager final-answer admission race", () => {
   it.each([
     { delivery: "steer", runState: "completed" }, { delivery: "followUp", runState: "completed" },
@@ -50,21 +359,22 @@ describe("manager final-answer admission race", () => {
   ] as const)("$delivery reports the real $runState when final is published during append", async ({ delivery, runState }) => {
     const h = harness();
     const handle = await h.manager.spawn({ task: "ordinary", transport: "process" });
-    const journal = path.join(h.root, handle.id, "steer.jsonl");
+    const journal = taskSteerFile(path.join(h.root, handle.id));
     const append = fs.appendFileSync;
     let final: ReturnType<typeof h.finish> | undefined;
     vi.spyOn(fs, "appendFileSync").mockImplementation(((file: fs.PathOrFileDescriptor, data: string | Uint8Array, options?: fs.WriteFileOptions) => {
-      if (file === journal && !final) final = h.finish(handle.id, runState === "completed");
+      const isJournal = file === journal || typeof file === "number" && fs.fstatSync(file).ino === fs.statSync(journal).ino;
+      if (isJournal && !final) final = runState === "completed" ? h.finish(handle.id, "done") : receiptOnly(h.root, handle.id);
       return append(file, data, options);
     }) as typeof fs.appendFileSync);
     const sent = delivery === "steer" ? h.manager.steer(handle.id, "racing input", undefined, provenance)
       : h.manager.followUp(handle.id, "racing input", undefined, { ...provenance, via: "followUp" }, { deadlineMs: 60_000 });
     expect(sent.undelivered).toEqual({ code: "FABRIC_TARGET_TERMINAL", reason: "run-ended", deliveryStatus: "undelivered",
       messageId: sent.messageId, delivery, finalAnswerReceiptId: final!.id, runState, sender: provenance.sender });
-    h.finish(handle.id); // Publish the delayed associated status after inspecting the pending receipt.
+    h.finish(handle.id, "done"); // Publish the delayed associated status after inspecting the pending receipt.
     if (delivery === "followUp") expect(h.manager.status(handle.id).followUpDeliveries).toMatchObject([{ state: "cancelled" }]);
     expect(await h.manager.wait(handle.id)).toMatchObject({ status: "completed", text: "done", turns: 1 });
-    await h.manager.close();
+    h.close(handle.id); await h.manager.close();
     expect(h.notices).toEqual([{ code: "FABRIC_TARGET_TERMINAL", targetId: handle.id, finalAnswerReceiptId: final!.id,
       messageId: sent.messageId, delivery, sender: provenance.sender }]);
     expect(h.launch).toHaveBeenCalledTimes(1);
@@ -75,11 +385,11 @@ describe("manager final-answer admission race", () => {
     const handle = await h.manager.spawn({ task: "ordinary", transport: "process" });
     const sent = h.manager.steer(handle.id, "consumed", undefined, provenance);
     expect(sent.undelivered).toBeUndefined();
-    writeJsonAtomic(path.join(h.root, handle.id, "terminal-controls", `${sent.messageId}.json`),
+    writeJsonAtomic(path.join(taskControlDirectory(path.join(h.root, handle.id)), "terminal-controls", `${sent.messageId}.json`),
       { id: sent.messageId, delivery: "steer", state: "delivered", provenance });
-    h.finish(handle.id);
+    h.finish(handle.id, "done");
     expect(await h.manager.wait(handle.id)).toMatchObject({ status: "completed", turns: 1 });
-    await h.manager.close();
+    h.close(handle.id); await h.manager.close();
     expect(h.notices).toEqual([]);
   });
 
@@ -91,12 +401,13 @@ describe("manager final-answer admission race", () => {
     const directory = path.join(h.root, handle.id);
     const sent = h.manager.steer(handle.id, "possibly consumed native input", undefined, provenance);
     expect(sent.undelivered).toBeUndefined();
-    writeJsonAtomic(path.join(directory, "terminal-controls", `${sent.messageId}.json`),
+    const controls = taskControlDirectory(directory);
+    writeJsonAtomic(path.join(controls, "terminal-controls", `${sent.messageId}.json`),
       { id: sent.messageId, delivery: "steer", state: "queued", forwarded: true, provenance });
     if (state === "refused") settleTerminalControl(directory, sent.messageId, "refused"); // Confirmed native discard ACK.
-    const final = h.finish(handle.id);
+    const final = h.finish(handle.id, "done");
     expect(await h.manager.wait(handle.id)).toMatchObject({ status: "completed", turns: 1 });
-    await h.manager.close();
+    h.close(handle.id); await h.manager.close();
     const notice: AgentTerminalNotice = { code: "FABRIC_TARGET_TERMINAL", targetId: handle.id,
       finalAnswerReceiptId: final.id, messageId: sent.messageId, delivery: "steer", sender: provenance.sender };
     expect(h.notices).toEqual(state === "refused" ? [notice] : []);
@@ -106,12 +417,15 @@ describe("manager final-answer admission race", () => {
     // the original admission and terminal registry exactly; no deletes needed.
     const restartRoot = fs.mkdtempSync(path.join(os.tmpdir(), "steer-ended-outbox-recovery-"));
     const restartDirectory = path.join(restartRoot, handle.id);
-    fs.mkdirSync(restartDirectory);
-    fs.copyFileSync(path.join(directory, "steer.jsonl"), path.join(restartDirectory, "steer.jsonl"));
-    fs.mkdirSync(path.join(restartDirectory, "terminal-controls"));
-    fs.copyFileSync(path.join(directory, "terminal-controls", `${sent.messageId}.json`),
-      path.join(restartDirectory, "terminal-controls", `${sent.messageId}.json`));
-    fs.copyFileSync(path.join(directory, "final-answer.json"), path.join(restartDirectory, "final-answer.json"));
+    // Fresh protected namespace for the restarted run; copy bytes into it, never
+    // into the task-writable run directory (raw in-run controls are not authority).
+    createHostTaskRun(restartDirectory);
+    const restartControls = taskControlDirectory(restartDirectory);
+    fs.copyFileSync(path.join(controls, "steer.jsonl"), path.join(restartControls, "steer.jsonl"));
+    fs.mkdirSync(path.join(restartControls, "terminal-controls"), { recursive: true, mode: 0o700 });
+    fs.copyFileSync(path.join(controls, "terminal-controls", `${sent.messageId}.json`),
+      path.join(restartControls, "terminal-controls", `${sent.messageId}.json`));
+    fs.copyFileSync(path.join(controls, "final-answer.json"), path.join(restartControls, "final-answer.json"));
     fs.copyFileSync(path.join(directory, "status.json"), path.join(restartDirectory, "status.json"));
     const recovered: AgentTerminalNotice[] = [];
     const outbox = new TerminalNoticeOutbox(replayed => { recovered.push(replayed); });
@@ -120,7 +434,7 @@ describe("manager final-answer admission race", () => {
     for (let i = 0; i < 8; i++) await Promise.resolve();
     expect(recovered).toEqual(state === "refused" ? [notice] : []);
     expect(readTerminalControl(restartDirectory, sent.messageId)).toMatchObject({ state, forwarded: true });
-    expect(fs.existsSync(path.join(restartDirectory, "terminal-notices", `${sent.messageId}.json.delivered`))).toBe(state === "refused");
+    expect(fs.existsSync(path.join(restartControls, "terminal-notices", `${sent.messageId}.json.delivered`))).toBe(state === "refused");
     outbox.recover(restartDirectory);
     for (let i = 0; i < 8; i++) await Promise.resolve();
     expect(recovered).toEqual(state === "refused" ? [notice] : []); // No invented refusal or restart duplicate.

@@ -42,7 +42,7 @@ describe("named lane succession in native Pi sessions", () => {
     for (const key of Object.keys(process.env)) if (key.startsWith("PI_FABRIC_")) vi.stubEnv(key, undefined);
     vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
     vi.stubEnv("PI_FABRIC_MESH_ROOT", meshRoot);
-    vi.stubEnv("PI_FABRIC_RUN_ROOT", path.join(root, "runs"));
+    vi.stubEnv("PI_FABRIC_TMPDIR", root);
     const states: FabricState[] = [];
     const ensure = FabricState.prototype.ensure;
     vi.spyOn(FabricState.prototype, "ensure").mockImplementation(async function (this: FabricState, context) {
@@ -90,10 +90,12 @@ describe("named lane succession in native Pi sessions", () => {
     };
 
     const a = await open("probe-lane");
-    const runtimeA = (a.state as unknown as { agents: { spawn(r: unknown): Promise<{ id: string }>; wait(id: string): Promise<unknown> } });
+    const runtimeA = (a.state as unknown as { agents: { spawn(r: unknown): Promise<{ id: string }>; wait(id: string): Promise<unknown>; runDirectory(id: string): string | undefined } });
     const handle = await runtimeA.agents.spawn({ task: "ordinary", transport: "process" });
     await runtimeA.agents.wait(handle.id);
-    const manifest = JSON.parse(fs.readFileSync(path.join(root, "runs", handle.id, "completion-recipient.json"), "utf8")) as { recipient: CompletionRecipient };
+    const runDirectory = runtimeA.agents.runDirectory(handle.id);
+    expect(runDirectory).toBeDefined();
+    const manifest = JSON.parse(fs.readFileSync(path.join(runDirectory!, "completion-recipient.json"), "utf8")) as { recipient: CompletionRecipient };
     expect(manifest.recipient).toMatchObject({ rootId: a.id, name: "probe-lane" });
     const resident = clients.find(client => client.options.config.rootId === a.id)!;
     expect(resident.options.config.mainName).toBe("probe-lane");

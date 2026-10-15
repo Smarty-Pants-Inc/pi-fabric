@@ -3,6 +3,11 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentManager, HOST_STOP_REASON } from "../src/agents/manager.js";
+import { ProcessTransport } from "../src/agents/transports/process-transport.js";
+import { readTerminalAdmissions, TerminalNoticeOutbox } from "../src/agents/terminal-notices.js";
+import { readTerminalControl } from "../src/worker/terminal-controls.js";
+import { taskControlDirectory, taskControlReadDirectory } from "../src/worker/terminal-answer.js";
+import { canRemoveTerminalRun } from "../src/storage/retention.js";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { AgentCompletionInbox } from "../src/agents/completion-inbox.js";
 import {
@@ -13,13 +18,13 @@ import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 
 const managers: AgentManager[] = [];
 const roots: string[] = [];
-const manager = (extra: ConstructorParameters<typeof AgentManager>[2] = {}) => {
+const manager = (extra: ConstructorParameters<typeof AgentManager>[2] = {}, retainRuns = false) => {
   const runRoot = fs.mkdtempSync(path.join(os.tmpdir(), "stopped-runs-test-"));
   roots.push(runRoot);
   vi.stubEnv("PI_FABRIC_DEPTH", "0");
   const created = new AgentManager(
     process.cwd(),
-    { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, maxConcurrent: 1, transport: "process", sessionExport: false },
+    { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, maxConcurrent: 1, transport: "process", sessionExport: false, retainRuns },
     { workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot, ...extra },
   );
   managers.push(created);
@@ -82,6 +87,77 @@ describe("task agents stopped by a reload (smarty-dev#1602)", () => {
     expect(() => next.steer("old-run", "hi")).not.toThrow(/Unknown Fabric agent/);
     await expect(next.stop("old-run")).resolves.toMatchObject({ status: "stopped" });
     await expect(next.wait("never-seen")).rejects.toThrow("Unknown Fabric agent");
+  });
+
+  it("stops and closes an already-live legacy handle without creating sibling controls or losing consumed admissions", async () => {
+    // Model a transport admitted by the old release, then exercise CURRENT
+    // manager stop/close on it. Only transport execution is substituted; the
+    // real stop path still observes finality, drains custody and saves status.
+    let alive = true, directory = "";
+    const controlId = "11111111-1111-4111-8111-111111111111";
+    const stop = vi.fn(async () => { alive = false; });
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async request => {
+      const file = request.workerArguments[request.workerArguments.indexOf("--status-file") + 1]!;
+      directory = path.dirname(file);
+      // Preserve the new host fixture as evidence, then install the exact old
+      // on-disk inputs: matching status, no layout field and no sibling. This is
+      // trusted fixture setup, not a confined task allowed to move its parent.
+      fs.renameSync(taskControlDirectory(directory), taskControlDirectory(directory) + ".fixture-evidence");
+      fs.writeFileSync(file, JSON.stringify({ id: request.id, name: request.name, task: "legacy live task", status: "running",
+        runner: "pi", transport: "process", sessionId: "2147483647", cwd: request.cwd,
+        startedAt: 1, updatedAt: 2, turns: 1, toolCalls: 0, text: "legacy progress",
+        usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: 0 },
+      }));
+      fs.writeFileSync(path.join(directory, "steer.jsonl"), JSON.stringify({ id: controlId, type: "steer" }) + "\n");
+      fs.mkdirSync(path.join(directory, "terminal-controls"), { mode: 0o700 });
+      fs.writeFileSync(path.join(directory, "terminal-controls", controlId + ".json"), JSON.stringify({ id: controlId, delivery: "steer", state: "delivered" }));
+      return { kind: "process", sessionId: "2147483647", isAlive: async () => alive, stop };
+    });
+    // Inspect the persisted row after close: explicitly retain the source.
+    const current = manager({}, true);
+    try {
+      const handle = await current.spawn({ task: "legacy live task", runner: "pi", transport: "process", extensions: false });
+      expect(taskControlReadDirectory(directory)).toBe(directory);
+      expect(readTerminalAdmissions(directory).byId.has(controlId)).toBe(true);
+      expect(readTerminalControl(directory, controlId)?.state).toBe("delivered");
+      await expect(current.stop(handle.id)).resolves.toMatchObject({ id: handle.id, status: "stopped" });
+      expect(stop).toHaveBeenCalledOnce();
+      await current.close();
+      await expect(current.wait(handle.id)).resolves.toMatchObject({ status: "stopped" });
+      expect(fs.existsSync(taskControlDirectory(directory))).toBe(false);
+      expect(readTerminalControl(directory, controlId)?.state).toBe("delivered");
+      expect(canRemoveTerminalRun(directory)).toBe(true);
+    } finally { alive = false; await current.close(); launch.mockRestore(); }
+  });
+
+  it.each([{}, { id: "original-run", runner: "pi" }])("reads old minimal or aliased status without losing consumed controls (%j)", identity => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "stopped-legacy-shape-")); roots.push(directory);
+    const id = "11111111-1111-4111-8111-111111111111";
+    fs.writeFileSync(path.join(directory, "status.json"), JSON.stringify({ ...identity, status: "stopped", transport: "process", sessionId: "2147483647" }));
+    fs.writeFileSync(path.join(directory, "steer.jsonl"), JSON.stringify({ id, type: "steer" }) + "\n");
+    fs.mkdirSync(path.join(directory, "terminal-controls"), { mode: 0o700 });
+    fs.writeFileSync(path.join(directory, "terminal-controls", id + ".json"), JSON.stringify({ id, delivery: "steer", state: "delivered" }));
+    expect(taskControlReadDirectory(directory)).toBe(directory);
+    expect(readTerminalControl(directory, id)?.state).toBe("delivered");
+    expect(canRemoveTerminalRun(directory)).toBe(true);
+  });
+
+  it.each(["sibling-v1", "legacy-read", "unknown-layout"])("retains missing protected controls and outbox recovery never crashes maintenance (%s)", taskControlLayout => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "stopped-unsafe-outbox-")); roots.push(directory);
+    const id = "11111111-1111-4111-8111-111111111111";
+    fs.writeFileSync(path.join(directory, "status.json"), JSON.stringify({ status: "stopped", transport: "process", sessionId: "2147483647", taskControlLayout }));
+    fs.mkdirSync(path.join(directory, "terminal-controls"), { mode: 0o700 });
+    fs.writeFileSync(path.join(directory, "terminal-controls", id + ".json"), JSON.stringify({ id, delivery: "steer", state: "delivered" }));
+    const deliver = vi.fn(), outbox = new TerminalNoticeOutbox(deliver);
+    expect(() => taskControlReadDirectory(directory)).toThrow(/fallback refused/);
+    expect(readTerminalControl(directory, id)).toBeUndefined();
+    expect(canRemoveTerminalRun(directory)).toBe(false);
+    expect(() => outbox.recover(directory)).not.toThrow();
+    expect(() => outbox.route(directory)).not.toThrow();
+    expect(outbox.hasPending(directory)).toBe(true);
+    expect(deliver).not.toHaveBeenCalled();
+    expect(fs.existsSync(taskControlDirectory(directory))).toBe(false);
+    expect(fs.existsSync(path.join(directory, "terminal-controls", id + ".json"))).toBe(true);
   });
 
   it("reads back stopped runs from the session and skips delivered ones", () => {

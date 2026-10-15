@@ -6,7 +6,7 @@ import { AgentManager } from "../src/agents/manager.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { writeJsonAtomic } from "../src/core/atomic-write.js";
-import { saveFinalAnswerReceipt } from "../src/worker/terminal-answer.js";
+import { saveFinalAnswerReceipt, taskControlDirectory, taskSteerFile } from "../src/worker/terminal-answer.js";
 import type { AgentRunRecord } from "../src/agents/types.js";
 import type { AgentTerminalNotice } from "../src/agents/terminal-target.js";
 import { TerminalNoticeOutbox, readTerminalAdmission } from "../src/agents/terminal-notices.js";
@@ -24,6 +24,7 @@ afterEach(async () => {
 
 const harness = (onTerminalNotice?: (notice: AgentTerminalNotice) => void | Promise<void>) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "terminal-manager-")); roots.push(root);
+  const workspace = path.join(root, "workspace"); fs.mkdirSync(workspace);
   const records = new Map<string, AgentRunRecord>();
   const closures = new Map<string, () => void>();
   const launch = vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async request => {
@@ -43,7 +44,7 @@ const harness = (onTerminalNotice?: (notice: AgentTerminalNotice) => void | Prom
       waitForClose: () => closed, isAlive: async () => alive, stop: async () => { await closed; } };
   });
   const settled = vi.fn();
-  const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, maxConcurrent: 1, budgetUsd: 0, retainRuns: true },
+  const manager = new AgentManager(workspace, { ...DEFAULT_FABRIC_CONFIG.agents, maxConcurrent: 1, budgetUsd: 0, retainRuns: true },
     { workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root, onSettled: settled, ...(onTerminalNotice ? { onTerminalNotice } : {}) });
   managers.push(manager);
   const finish = (id: string, text: string) => {
@@ -108,7 +109,7 @@ describe("ordinary process-task final answer boundary", () => {
     for (const send of [() => manager.steer(handle.id, "stale steer"), () => manager.followUp(handle.id, "stale follow-up")]) {
       expect(send).toThrow(expect.objectContaining({ code: "FABRIC_TARGET_TERMINAL", finalAnswerReceiptId: receipt.id }));
     }
-    expect(fs.readFileSync(path.join(root, handle.id, "steer.jsonl"), "utf8")).not.toContain("stale");
+    expect(fs.readFileSync(taskSteerFile(path.join(root, handle.id)), "utf8")).not.toContain("stale");
   });
 
   it("retains schema failures, waits for the associated validated snapshot, and preserves replyVia/value", async () => {
@@ -131,7 +132,7 @@ describe("ordinary process-task final answer boundary", () => {
     const consumed = manager.steer(handle.id, "consumed before final", undefined, provenance("sender-consumed"));
     const queued = manager.steer(handle.id, "queued", undefined, provenance("sender-local"));
     const unread = manager.followUp(handle.id, "unread", undefined, { ...provenance("sender-remote"), sender: { id: "sender-remote", kind: "remote", verified: "bridge" } }, { deadlineMs: 60_000 });
-    writeJsonAtomic(path.join(root, handle.id, "terminal-controls", `${consumed.messageId}.json`), { id: consumed.messageId, delivery: "steer", state: "delivered", provenance: provenance("sender-consumed") });
+    writeJsonAtomic(path.join(taskControlDirectory(path.join(root, handle.id)), "terminal-controls", `${consumed.messageId}.json`), { id: consumed.messageId, delivery: "steer", state: "delivered", provenance: provenance("sender-consumed") });
     const receipt = finish(handle.id, "done");
     for (const [messageId, sender] of [[queued.messageId, provenance("sender-local").sender], [consumed.messageId, provenance("sender-consumed").sender]] as const) {
       fs.appendFileSync(path.join(root, handle.id, "lifecycle.jsonl"), JSON.stringify({ version: 1, event: "message.refused", occurredAt: Date.now(), data: {
@@ -158,7 +159,7 @@ describe("ordinary process-task final answer boundary", () => {
     const provenance = { v: 1 as const, channel: "fabric" as const, via: "steer" as const, sender };
     const queued = manager.steer(handle.id, "original admission", undefined, provenance);
     const directory = path.join(root, handle.id);
-    writeJsonAtomic(path.join(directory, "terminal-controls", `${queued.messageId}.json`), {
+    writeJsonAtomic(path.join(taskControlDirectory(directory), "terminal-controls", `${queued.messageId}.json`), {
       id: mismatch === "id" ? "other-control" : queued.messageId,
       delivery: mismatch === "delivery" ? "followUp" : "steer", state: "delivered",
       provenance: mismatch === "sender" ? { ...provenance, sender: { ...sender, id: "session:senderB" } } : provenance,
@@ -184,11 +185,11 @@ describe("ordinary process-task final answer boundary", () => {
     recovery.recover(directory);
     recovery.recover(directory);
     await new Promise(resolve => setTimeout(resolve, 10));
-    const pending = path.join(directory, "terminal-notices", `${queued.messageId}.json`);
+    const pending = path.join(taskControlDirectory(directory), "terminal-notices", `${queued.messageId}.json`);
     expect(notices).toEqual([]);
     expect(fs.existsSync(pending)).toBe(false);
     expect(fs.existsSync(`${pending}.delivered`)).toBe(false);
-    expect(fs.existsSync(path.join(directory, "terminal-controls", `${queued.messageId}.json`))).toBe(true);
+    expect(fs.existsSync(path.join(taskControlDirectory(directory), "terminal-controls", `${queued.messageId}.json`))).toBe(true);
     expect(readTerminalAdmission(directory, queued.messageId)).toEqual({ id: queued.messageId, delivery: "steer", sender });
     expect(canRemoveTerminalRun(directory)).toBe(false);
   });
@@ -201,7 +202,7 @@ describe("ordinary process-task final answer boundary", () => {
     const provenance = { v: 1 as const, channel: "fabric" as const, via: "followUp" as const, sender };
     const queued = manager.followUp(handle.id, "original followUp", undefined, provenance, { deadlineMs: 60_000 });
     const directory = path.join(root, handle.id);
-    writeJsonAtomic(path.join(directory, "terminal-controls", `${queued.messageId}.json`), {
+    writeJsonAtomic(path.join(taskControlDirectory(directory), "terminal-controls", `${queued.messageId}.json`), {
       id: queued.messageId, delivery: "steer", state: "delivered", provenance,
     });
     finish(handle.id, "done");
@@ -215,11 +216,11 @@ describe("ordinary process-task final answer boundary", () => {
     recovery.recover(directory);
     await new Promise(resolve => setTimeout(resolve, 10));
     expect(notices).toEqual([]);
-    const pending = path.join(directory, "terminal-notices", `${queued.messageId}.json`);
+    const pending = path.join(taskControlDirectory(directory), "terminal-notices", `${queued.messageId}.json`);
     expect(fs.existsSync(pending)).toBe(false);
     expect(fs.existsSync(`${pending}.delivered`)).toBe(false);
     expect(manager.status(handle.id).followUpDeliveries).toContainEqual(expect.objectContaining({ messageId: queued.messageId, state: "queued" }));
-    expect(fs.existsSync(path.join(directory, "terminal-controls", `${queued.messageId}.json`))).toBe(true);
+    expect(fs.existsSync(path.join(taskControlDirectory(directory), "terminal-controls", `${queued.messageId}.json`))).toBe(true);
     expect(readTerminalAdmission(directory, queued.messageId)).toEqual({ id: queued.messageId, delivery: "followUp", sender });
     expect(canRemoveTerminalRun(directory)).toBe(false);
   });
@@ -254,7 +255,7 @@ describe("ordinary process-task final answer boundary", () => {
     const provenance = { v: 1 as const, channel: "fabric" as const, via: "steer" as const,
       sender: { id: "session:sender", kind: "main" as const, verified: "mesh" as const } };
     const queued = manager.steer(handle.id, "queued", undefined, provenance);
-    writeJsonAtomic(path.join(root, handle.id, "terminal-controls", `${queued.messageId}.json`), {
+    writeJsonAtomic(path.join(taskControlDirectory(path.join(root, handle.id)), "terminal-controls", `${queued.messageId}.json`), {
       id: queued.messageId, delivery: "steer", state: "refused", forwarded: true, provenance,
     });
     const receipt = finish(handle.id, "done");
@@ -262,7 +263,7 @@ describe("ordinary process-task final answer boundary", () => {
     const next = await manager.spawn({ task: "native-close barrier", transport: "process" });
     expect(next.status).toBe("queued");
     close(handle.id);
-    const outbox = path.join(root, handle.id, "terminal-notices", `${queued.messageId}.json`);
+    const outbox = path.join(taskControlDirectory(path.join(root, handle.id)), "terminal-notices", `${queued.messageId}.json`);
     await waitUntil(() => attempts === 1 && fs.existsSync(outbox));
     expect(canRemoveTerminalRun(path.join(root, handle.id))).toBe(false);
     manager.status(handle.id);

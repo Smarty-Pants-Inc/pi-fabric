@@ -303,7 +303,7 @@ export const spawnDetached = async (
   workerPath: string,
   workerArguments: string[],
   cwd: string,
-  authority?: Pick<AgentTransportLaunch, "signal" | "authorize" | "onUnconfirmedExit">,
+  authority?: Pick<AgentTransportLaunch, "signal" | "authorize" | "onUnconfirmedExit" | "inheritFds">,
   environment?: NodeJS.ProcessEnv,
   /** memoryMaxBytes present: capped `fabric-task-*.scope` with an owned cgroup kill boundary (#8257). */
   scope?: { executable: string; slice: string; warn: (reason: string) => void; memoryMaxBytes?: number },
@@ -332,7 +332,9 @@ export const spawnDetached = async (
     ? capped ? `${TASK_SCOPE_PREFIX}${process.pid}-${randomBytes(8).toString("hex")}.scope` : `${path.basename(scopeRoot)}.scope`
     : undefined;
   // The capped shim blocks on this inherited pipe until the parent verified the boundary.
-  const gateFd = tracksExecution ? 4 : 3;
+  // Routed-session inherited descriptors keep fd3 (IPC or ignore) and start at fd4; the gate follows them.
+  const inheritFds = authority?.inheritFds ?? [];
+  const gateFd = inheritFds.length ? 4 + inheritFds.length : tracksExecution ? 4 : 3;
   const childEnvironment = childProcessEnvironment(environment);
   if (capped) {
     // Only the released shim exports these, and only for a proven admission.
@@ -372,7 +374,9 @@ export const spawnDetached = async (
     cwd,
     env: childEnvironment,
     detached: process.platform !== "win32",
-    stdio: capped
+    stdio: inheritFds.length
+      ? ["ignore", "ignore", "ignore", tracksExecution ? "ipc" : "ignore", ...inheritFds, ...(capped ? ["pipe" as const] : [])]
+      : capped
       ? ["ignore", "ignore", "ignore", ...(tracksExecution ? ["ipc" as const] : []), "pipe"]
       : tracksExecution ? ["ignore", "ignore", "ignore", "ipc"] : "ignore",
   });

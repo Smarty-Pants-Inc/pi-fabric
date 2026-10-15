@@ -1,12 +1,19 @@
-// Real worker pipes; fake only the SDK AgentSession/native queue. Final receipt,
-// ingress fence, delivery consumption and terminal discard all use production
-// code bundled by the test. A captured stdin frame is NOT native consumption.
+// Fake native task entry for tests/worker-steer-ended.test.ts. The test builds a
+// throwaway SDK directory whose dist/index.js imports this module, so the real
+// worker resolves a "native SDK". Real worker pipes; fake only the SDK
+// AgentSession/native queue. Final receipt, ingress fence, delivery consumption
+// and terminal discard all use production code bundled by the test, so the
+// protected (central) control layout comes only from the real helper. A captured
+// stdin frame is NOT native consumption. A late request the model obeys writes
+// the no-source-write sentinel into the workspace (cwd).
 import fs from "node:fs";
 import path from "node:path";
 import readline from "node:readline";
 
 const root = process.env.STEER_ENDED_ROOT;
 const directory = process.env.PI_FABRIC_AGENT_RUN_DIR;
+// Fail closed: without the real production helper there is no trusted control layout.
+if (!process.env.STEER_ENDED_HELPER) throw new Error("STEER_ENDED_HELPER is required");
 const terminal = await import(process.env.STEER_ENDED_HELPER);
 const log = value => fs.appendFileSync(path.join(root, "fake.jsonl"), JSON.stringify({ pid: process.pid, ...value }) + "\n");
 const send = event => process.stdout.write(JSON.stringify(event) + "\n");

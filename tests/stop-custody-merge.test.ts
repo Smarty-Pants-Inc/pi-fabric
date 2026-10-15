@@ -16,6 +16,21 @@ import { hasUnresolvedWorker } from "../src/storage/retention.js";
 // the real host, so the private-dir fallback must see the real platform: a mocked "linux" on a Windows runner
 // would otherwise demand /proc/self/fd (pi-fabric#875).
 const hostPlatform = process.platform;
+const filesystemHost = vi.hoisted(() => ({ platform: Object.getOwnPropertyDescriptor(process, "platform")! }));
+vi.mock("../src/worker/terminal-answer.js", async importOriginal => {
+  const actual = await importOriginal<typeof import("../src/worker/terminal-answer.js")>();
+  // Custody branches are emulated below, but synchronous filesystem operations
+  // must validate the real host (Windows drive roots are not POSIX ancestry).
+  return Object.fromEntries(Object.entries(actual).map(([name, value]) => {
+    if (typeof value !== "function" || name === "FabricTaskControlDirectoryError") return [name, value];
+    return [name, (...args: unknown[]) => {
+      const branch = Object.getOwnPropertyDescriptor(process, "platform")!;
+      Object.defineProperty(process, "platform", filesystemHost.platform);
+      try { return (value as (...args: unknown[]) => unknown)(...args); }
+      finally { Object.defineProperty(process, "platform", branch); }
+    }];
+  }));
+});
 
 vi.mock("node:child_process", async importOriginal => {
   const actual = await importOriginal<typeof import("node:child_process")>();

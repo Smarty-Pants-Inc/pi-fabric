@@ -18,6 +18,7 @@ import {
 import { markUnresolvedWorker } from "../src/storage/retention.js";
 import * as retentionStorage from "../src/storage/retention.js";
 import { writeJsonAtomic } from "../src/core/atomic-write.js";
+import { taskSteerFile } from "../src/worker/terminal-answer.js";
 import {
   clearOwnedBudgetEnv,
   readBudgetLedgerDetailed,
@@ -3268,7 +3269,7 @@ describe("AgentManager steering", () => {
   };
 
   const readSteerFile = (runDir: string): Array<Record<string, unknown>> => {
-    const file = path.join(runDir, "steer.jsonl");
+    const file = taskSteerFile(runDir);
     if (!fs.existsSync(file)) return [];
     return fs
       .readFileSync(file, "utf8")
@@ -3278,7 +3279,8 @@ describe("AgentManager steering", () => {
   };
 
   const hangManager = (root: string, workerPath = fakeWorker, piBinary?: string) => {
-    const manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+    const workspace = path.join(root, "workspace"); fs.mkdirSync(workspace);
+    const manager = new AgentManager(workspace, DEFAULT_FABRIC_CONFIG.agents, {
       workerPath,
       ...(piBinary ? { piBinary } : {}),
       runRoot: root,
@@ -3396,7 +3398,7 @@ describe("AgentManager steering", () => {
       managers.push(manager);
       const handle = await manager.spawn({ task: "STEER_ME", transport: "process" });
       await waitFor(() => manager.status(handle.id).status === "running");
-      const steerFile = path.join(manager.runDirectory(handle.id)!, "steer.jsonl");
+      const steerFile = taskSteerFile(manager.runDirectory(handle.id)!);
       const line = Buffer.from(`${JSON.stringify({ type: "steer", message: "转向界面 🚀" })}\n`);
       const split = line.indexOf(Buffer.from("界")) + 1;
       fs.appendFileSync(steerFile, line.subarray(0, split));

@@ -31,7 +31,13 @@ assert.equal(path.dirname(root), path.join(process.env.RUNNER_TEMP, "pi-fabric-v
 assert.match(path.basename(root), /^pi-fabric-vitest-run-[A-Za-z0-9]{6}$/);
 assert.deepEqual(isolatedTestTemp("pi-fabric-vitest-"), { TMPDIR: root, TMP: root, TEMP: root });
 const configFleet = path.dirname(process.env.PI_CODING_AGENT_DIR);
-const fileFleet = path.dirname(isolateTestFleetEnvironment().PI_CODING_AGENT_DIR);
+assert.equal(process.env.PI_FABRIC_RUN_ROOT, undefined, "Windows hosts must not inherit nested run authority");
+const stateHome = process.env.XDG_STATE_HOME;
+const isolated = isolateTestFleetEnvironment();
+const fileFleet = path.dirname(isolated.PI_CODING_AGENT_DIR);
+assert.equal(Object.hasOwn(isolated, "PI_FABRIC_RUN_ROOT"), false);
+assert.equal(process.env.PI_FABRIC_RUN_ROOT, undefined);
+assert.equal(process.env.XDG_STATE_HOME, stateHome, "caller central-state isolation must survive setup");
 assert.notEqual(configFleet, fileFleet, "fleet state must remain unique per file");
 for (const fleet of [configFleet, fileFleet]) assert.equal(path.dirname(fleet), root);
 if (process.env.WINDOWS_TEMP_PROBE_CHILD === "1") {
@@ -203,6 +209,50 @@ describe.skipIf(process.platform === "win32")("launcher stale-root trust", () =>
       cleanupIsolatedTestTemp();
       assert(!fs.existsSync(temp.TMPDIR));
     `], { env: { ...process.env, RUNNER_TEMP: "" }, encoding: "utf8", timeout: 15_000 });
+    expect(result.error).toBeUndefined();
+    expect(result.status, result.stderr).toBe(0);
+  });
+});
+
+describe("test fleet run-root authority", () => {
+  const helper = new URL("../scripts/test-temp.ts", import.meta.url).href;
+  const runPaths = new URL("../src/worker/task-run-path.ts", import.meta.url).href;
+  // Keep reason: Windows inherited-root trust boundary (#12214), plus the
+  // CI incident fail-116090200428. Real helper/environment, not a source-text test.
+  it.each(["win32", "linux"])("isolates %s hosts without changing explicit fixture authority", (platform) => {
+    const result = spawnSync("bun", ["-e", `
+      import assert from "node:assert/strict";
+      import fs from "node:fs";
+      import path from "node:path";
+      import os from "node:os";
+      Object.defineProperty(process, "platform", { value: ${JSON.stringify(platform)} });
+      const { isolateTestFleetEnvironment } = await import(${JSON.stringify(helper)});
+      const { assertTaskRunRootAdmissible } = await import(${JSON.stringify(runPaths)});
+      process.env.PI_FABRIC_RUN_ROOT = "inherited-production-root";
+      delete process.env.XDG_STATE_HOME;
+      const first = isolateTestFleetEnvironment();
+      assert.equal(process.env.XDG_STATE_HOME, undefined, "setup must not choose central state");
+      const root = path.dirname(first.PI_CODING_AGENT_DIR);
+      assert.equal(path.dirname(root), os.tmpdir());
+      assert(fs.statSync(root).isDirectory());
+      if (${JSON.stringify(platform)} === "win32") {
+        assert.equal(Object.hasOwn(first, "PI_FABRIC_RUN_ROOT"), false);
+        assert.equal(process.env.PI_FABRIC_RUN_ROOT, undefined);
+      } else {
+        assert.equal(first.PI_FABRIC_RUN_ROOT, path.join(root, "runs"));
+        assert(fs.statSync(first.PI_FABRIC_RUN_ROOT).isDirectory());
+      }
+      for (const key of ["PI_FABRIC_MESH_ROOT", "PI_FABRIC_PROJECT_ROOT", "PI_FABRIC_AGENT_DIR", "PI_CODING_AGENT_DIR", "MCPORTER_CONFIG"])
+        assert.equal(path.dirname(first[key]), root, key);
+      const state = path.resolve(".local", "caller-isolated-state");
+      process.env.XDG_STATE_HOME = state;
+      const second = isolateTestFleetEnvironment();
+      assert.equal(process.env.XDG_STATE_HOME, state);
+      assert.notEqual(second.PI_CODING_AGENT_DIR, first.PI_CODING_AGENT_DIR);
+      const makeError = message => new Error(message);
+      assert.doesNotThrow(() => assertTaskRunRootAdmissible(false, makeError, "win32"));
+      assert.throws(() => assertTaskRunRootAdmissible(true, makeError, "win32"), /Inherited PI_FABRIC_RUN_ROOT is refused/);
+    `], { cwd: repo, env: { ...process.env, RUNNER_TEMP: "" }, encoding: "utf8", timeout: 10_000 });
     expect(result.error).toBeUndefined();
     expect(result.status, result.stderr).toBe(0);
   });

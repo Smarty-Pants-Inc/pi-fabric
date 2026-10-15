@@ -11,6 +11,7 @@ import { RESIDENT_RUN_RETENTION_MS, sweepResidentRuns } from "../src/residency/h
 import { findExecutable } from "../src/agents/transports/process-utils.js";
 import { decideModelRoute } from "../src/agents/model-route.js";
 import { ActorLogStore } from "../src/actors/log-store.js";
+import { createArchiveTaskControlDirectory, TASK_CONTROL_LAYOUT, taskControlDirectory, withLegacyTaskControlDirectories } from "../src/worker/terminal-answer.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { fabricTurnProvenance } from "../src/fabric-provenance.js";
 import { FABRIC_RUN_ROOT_PREFIX, canRemoveTerminalRun, markRunRootActive, markRunRootClosed, runTreeExitVeto, sweepTempRunRoots } from "../src/storage/retention.js";
@@ -101,6 +102,9 @@ const productionRun = async (principal: boolean, retainRuns = true, nestedRunRoo
   expect(requests).toHaveLength(1);
   expect(JSON.stringify(requests[0]!.messages.filter(message => message.role === "user"))).toContain(task);
   expect(fs.readdirSync(path.join(run, "deliveries"))).toEqual([]);
+  expect(JSON.parse(fs.readFileSync(path.join(run, "status.json"), "utf8"))).toMatchObject({ id: result.id, taskControlLayout: TASK_CONTROL_LAYOUT });
+  expect(fs.statSync(taskControlDirectory(run)).isDirectory()).toBe(true);
+  expectCurrentBinding(run);
   expect(fs.existsSync(path.join(run, "task.txt.provenance.json"))).toBe(principal);
   expect(fs.existsSync(path.join(run, "route-session.jsonl"))).toBe(routed);
   expect(fs.existsSync(path.join(run, "session.jsonl"))).toBe(!routed);
@@ -138,8 +142,71 @@ const makeUnsafe = (run: string, kind: UnsafeKind) => {
   if (kind === "unknown-directory") fs.mkdirSync(path.join(run, "other-deliveries"));
 };
 
-// Copy the entire emitted tree, including native session and delivery artifacts.
-const copyRun = (source: string, destination: string) => { fs.cpSync(source, destination, { recursive: true }); return destination; };
+// central-v1 always has a current-only v2 binding, despite its historical filename.
+// A copy/archive owns its fresh run inode, so binding bytes must NOT be transported.
+const expectCurrentBinding = (run: string) => {
+  const stat = fs.lstatSync(run, { bigint: true });
+  expect(JSON.parse(fs.readFileSync(path.join(taskControlDirectory(run), ".legacy-read.json"), "utf8"))).toEqual({
+    version: 2, runId: path.basename(run), dev: String(stat.dev), ino: String(stat.ino), snapshot: null,
+  });
+  expect(withLegacyTaskControlDirectories(run, sources => sources.length)).toBe(0);
+};
+// Copy genuine emitted data, with independently published destination authority.
+const assertPairCopy = (source: string, destination: string) => {
+  expect(fs.readFileSync(path.join(destination, "status.json"))).toEqual(fs.readFileSync(path.join(source, "status.json")));
+  const controls = taskControlDirectory(source);
+  if (!fs.existsSync(controls)) {
+    // Only the genuinely legacy failed-parent fixture may lack controls.
+    expect(JSON.parse(fs.readFileSync(path.join(source, "status.json"), "utf8"))).not.toHaveProperty("taskControlLayout");
+    return;
+  }
+  expectCurrentBinding(source);
+  expectCurrentBinding(destination);
+  const compare = (from: string, to: string): void => {
+    expect(fs.readdirSync(to).sort()).toEqual(fs.readdirSync(from).sort());
+    if (process.platform !== "win32") expect(fs.statSync(to).mode & 0o777).toBe(0o700);
+    for (const entry of fs.readdirSync(from, { withFileTypes: true })) {
+      const original = path.join(from, entry.name), copied = path.join(to, entry.name);
+      if (entry.isDirectory()) compare(original, copied);
+      else {
+        if (entry.name !== ".legacy-read.json") expect(fs.readFileSync(copied)).toEqual(fs.readFileSync(original));
+        if (process.platform !== "win32") expect(fs.statSync(copied).mode & 0o777).toBe(0o600);
+      }
+    }
+  };
+  compare(controls, taskControlDirectory(destination));
+};
+const copyRun = (source: string, destination: string) => {
+  fs.mkdirSync(path.dirname(destination), { recursive: true, mode: 0o700 });
+  fs.cpSync(source, destination, { recursive: true });
+  // cpSync creates directories using the host umask, not the source's private mode.
+  const makePrivate = (directory: string): void => {
+    fs.chmodSync(directory, 0o700);
+    for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+      if (entry.isDirectory()) makePrivate(path.join(directory, entry.name));
+    }
+  };
+  makePrivate(destination);
+  const check = (from: string, to: string): void => {
+    const controls = taskControlDirectory(from);
+    if (fs.existsSync(controls)) {
+      // The archive producer binds the copy to its OWN inode. Never clone the
+      // source binding (validation-only startup correctly refuses such a clone).
+      createArchiveTaskControlDirectory(to);
+      fs.cpSync(controls, taskControlDirectory(to), { recursive: true,
+        filter: file => path.basename(file) !== ".legacy-read.json" });
+      makePrivate(taskControlDirectory(to));
+    }
+    assertPairCopy(from, to);
+    const nested = path.join(from, "nested");
+    if (!fs.existsSync(nested)) return;
+    for (const entry of fs.readdirSync(nested, { withFileTypes: true })) {
+      if (entry.isDirectory() && !entry.name.endsWith(".ctl")) check(path.join(nested, entry.name), path.join(to, "nested", entry.name));
+    }
+  };
+  check(source, destination);
+  return destination;
+};
 
 describe("I-2 production-worker ingress retention", () => {
   it("a completed native descendant persists its process identity and releases a retained failed parent's ownership debt", async () => {
@@ -240,16 +307,33 @@ describe("I-2 production-worker ingress retention", () => {
       fs.writeFileSync(receiptFile, JSON.stringify({ ...receipt, runId: kind }));
       copyRun(plain.run, path.join(source, "nested", "plain"));
       const nested = copyRun(attributed.run, path.join(source, "nested", "attributed"));
-      if (kind !== "successful" && kind !== "latest") makeUnsafe(nested, kind);
-      // Exercise production's selective top-level archive and recursive nested copy.
+      // First publish a valid pair: the archiver must not launder source links or
+      // hardlinks merely to reach the collector's independent negative cases.
       await store.retainRun(actor, kind, source);
       const archive = path.join(root, "runs", kind);
       expect(fs.readdirSync(path.join(archive, "nested", "attributed")).sort()).toEqual(fs.readdirSync(nested).sort());
       expect(fs.existsSync(path.join(archive, "deliveries"))).toBe(false);
       expect(JSON.parse(fs.readFileSync(path.join(archive, "route-dispatch-receipt.json"), "utf8"))).toEqual({ ...receipt, runId: kind });
-      // cpSync makes independent copies of hardlinked source files. Reintroduce
-      // an actual multiply-linked file in the archive to test the collector veto.
-      if (kind === "hardlink") makeUnsafe(path.join(archive, "nested", "attributed"), kind);
+      assertPairCopy(source, archive);
+      for (const name of ["plain", "attributed"]) assertPairCopy(path.join(source, "nested", name), path.join(archive, "nested", name));
+      // The original host controls remain byte-for-byte intact, with original IDs.
+      assertPairCopy(plain.run, source);
+      assertPairCopy(attributed.run, nested);
+      if (kind !== "successful" && kind !== "latest") {
+        makeUnsafe(path.join(archive, "nested", "attributed"), kind);
+        expect(canRemoveTerminalRun(archive), kind).toBe(false);
+        if (["delivery-link", "sidecar-link", "directory-link", "hardlink"].includes(kind)) {
+          const refusedId = kind + "-refused";
+          const refusedSource = copyRun(source, path.join(root, "sources", refusedId));
+          fs.writeFileSync(path.join(refusedSource, "route-dispatch-receipt.json"), JSON.stringify({ ...receipt, runId: refusedId }));
+          makeUnsafe(path.join(refusedSource, "nested", "attributed"), kind);
+          expect(canRemoveTerminalRun(refusedSource), kind).toBe(false);
+          await expect(store.retainRun(actor, refusedId, refusedSource), kind).rejects.toThrow("Unsafe nested archive artifact");
+          expect(fs.existsSync(refusedSource), kind).toBe(true);
+          assertPairCopy(source, refusedSource);
+          assertPairCopy(nested, path.join(refusedSource, "nested", "attributed"));
+        }
+      }
     }
     store.pruneRuns(actor, base + 99);
     expect(store.retainedRunIds(actor)).toContain("successful");

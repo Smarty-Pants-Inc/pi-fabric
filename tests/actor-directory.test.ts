@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { ActorDirectory } from "../src/actors/directory.js";
 import { SessionActorOrphans } from "../src/actors/session-orphans.js";
 import { AgentManager } from "../src/agents/manager.js";
+import { taskSteerFile } from "../src/worker/terminal-answer.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 
@@ -28,7 +29,8 @@ const open = (
     kind: "main",
     sessionId,
   };
-  const manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+  const workspace = path.join(root, `workspace-${sessionId}`); fs.mkdirSync(workspace, { recursive: true });
+  const manager = new AgentManager(workspace, DEFAULT_FABRIC_CONFIG.agents, {
     workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
     runRoot: path.join(root, `runs-${sessionId}-${agents.length}`),
   });
@@ -316,7 +318,7 @@ describe("ActorDirectory", () => {
 
     const handle = await opened.manager.spawn({ task: "HANG", transport: "process" });
     await opened.directory.steerRemote(handle.id, "deliver exactly once", "steer");
-    const steerFile = path.join(opened.manager.runDirectory(handle.id)!, "steer.jsonl");
+    const steerFile = taskSteerFile(opened.manager.runDirectory(handle.id)!);
 
     await vi.waitFor(() => {
       expect(fs.existsSync(`${cursor}.project`)).toBe(true);

@@ -1,10 +1,11 @@
 import fs from "node:fs";
 import path from "node:path";
-import { syncPathNamespace, writeJsonAtomic } from "../core/atomic-write.js";
-import { readFinalAnswerReceipt, withTaskFinalAnswerLock } from "../worker/terminal-answer.js";
-import type { AgentTerminalNotice } from "./terminal-target.js";
+import { syncPathNamespace } from "../core/atomic-write.js";
+import { readFinalAnswerReceipt, readTaskControlJson, readTaskControlJsonAt, readTaskRunStatus, statDir, writeTaskControlJson, removeTaskControlFile, openTaskControlReadFile, openLegacyTaskControlFiles, taskControlFileStat, MAX_TASK_CONTROL_ROWS, taskControlDirectory, withTaskControlDirectory, withTaskControlReadDirectory, visitLegacyTaskControlDirectories, withTaskControlSubdirectory, initializeTaskControlDirectory, withTaskFinalAnswerLock } from "../worker/terminal-answer.js";
+import { FabricSteerAdmissionLimitError, type AgentTerminalNotice, type AgentUndeliveredMessage, type FabricTargetRunState } from "./terminal-target.js";
 import { followUpFile, releaseFollowUpPayload, settleFollowUp } from "./follow-up-delivery.js";
 import { copyFabricProvenance, type FabricTurnProvenance } from "../fabric-provenance.js";
+import type { AgentRunRecord } from "./types.js";
 
 export interface TerminalAdmission {
   id: string;
@@ -44,26 +45,23 @@ export const terminalControlMatchesAdmission = (value: unknown, admission: Termi
 
 /** Refusal requires a native discard ACK or locked proof that no stdin bytes
  * were attempted. Native close, a queued row, or an event alone proves neither.
- * Legacy queued rows without transport evidence remain uncertain. */
+ * Legacy queued rows without transport evidence remain uncertain. The receipt,
+ * row and refused transition all use the pinned host-owned control directory. */
 export const terminalControlRefusalProven = (directory: string, admission: TerminalAdmission, runId: string): boolean =>
-  withTaskFinalAnswerLock(directory, () => {
-    const receipt = readFinalAnswerReceipt(directory, runId);
+  withTaskFinalAnswerLock(directory, read => {
+    const receipt = read(runId);
     if (!receipt) return false;
-    const file = path.join(directory, "terminal-controls", `${admission.id}.json`);
-    let control: { state?: string; forwarded?: unknown };
-    try { control = JSON.parse(fs.readFileSync(file, "utf8")); }
-    catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-      // A dangling link is uncertainty, not an absent transport row.
-      try { fs.lstatSync(file); return false; }
-      catch (missing) { if ((missing as NodeJS.ErrnoException).code !== "ENOENT") throw missing; }
-      try { if (!fs.lstatSync(path.dirname(file)).isDirectory()) return false; }
-      catch (missing) { if ((missing as NodeJS.ErrnoException).code !== "ENOENT") throw missing; }
-      return true;
-    }
+    const relative = path.join("terminal-controls", `${admission.id}.json`);
+    let control: { state?: string; forwarded?: unknown; reason?: unknown } | undefined;
+    // Absent (central and every protected legacy layer) is the locked no-row proof.
+    // A linked, unsafe, oversized or malformed row is uncertainty, not absence.
+    try { control = readTaskControlJson(directory, relative); }
+    catch { return false; }
+    if (control === undefined) return true;
     if (!terminalControlMatchesAdmission(control, admission) ||
-        Object.keys(control).some(key => !["id", "delivery", "state", "provenance", "forwarded"].includes(key)) ||
-        control.forwarded !== undefined && typeof control.forwarded !== "boolean") return false;
+        Object.keys(control).some(key => !["id", "delivery", "state", "provenance", "forwarded", "reason"].includes(key)) ||
+        control.forwarded !== undefined && typeof control.forwarded !== "boolean" ||
+        control.reason !== undefined && control.reason !== "run-ended") return false;
     // Legacy shape: pre-`forwarded` workers wrote stdin, then marked queued rows
     // refused at final answer while the frame could still be buffered. Neither a
     // legacy queued nor a legacy refused row proves refusal; they stay uncertain.
@@ -85,37 +83,182 @@ export const terminalControlRefusalProven = (directory: string, admission: Termi
       fs.fsyncSync(descriptor);
     } finally { fs.closeSync(descriptor); }
     syncPathNamespace(lifecycleFile);
-    writeJsonAtomic(file, { ...control, state: "refused" }, { durable: true });
+    writeTaskControlJson(directory, relative, { ...control, state: "refused" });
     return true;
   });
 
-/** Manager-owned native ingress journal, not worker event data or final prose. */
-export const readTerminalAdmission = (directory: string, id: string): TerminalAdmission | undefined => {
+export const MAX_STEER_CONTROLS = MAX_TASK_CONTROL_ROWS;
+export const MAX_STEER_BYTES = 1024 * 1024;
+export const MAX_STEER_ENTRY_BYTES = 64 * 1024;
+export const MAX_PUBLIC_REFUSALS = 64;
+export interface TerminalAdmissionIndex {
+  byId: Map<string, TerminalAdmission>;
+  controls: number;
+  bytes: number;
+  truncated: boolean;
+}
+// Bounded cache, invalidated by the journal's exact native identity/version.
+// One streaming pass is reused by scan, recovery, routing and receipt views.
+const admissionCache = new Map<string, { signature: string; index: TerminalAdmissionIndex }>();
+const signature = (s: fs.BigIntStats): string => `${s.dev}:${s.ino}:${s.size}:${s.mtimeNs}:${s.ctimeNs}`;
+export class FabricSteerJournalError extends Error {
+  override readonly name = "FabricSteerJournalError";
+  readonly code = "FABRIC_STEER_JOURNAL_INVALID";
+}
+const requireJournal = (fd: number): fs.BigIntStats => {
+  try { return taskControlFileStat(fd); }
+  catch { throw new FabricSteerJournalError("Steering journal must be an owned regular file with one link"); }
+};
+export const appendTerminalAdmission = (directory: string, line: string): void => withTaskControlDirectory(directory, (control, directoryFd) => {
+  // Recheck at the actual write too: a host downgrade hook may re-enter admission.
+  const index = readTerminalAdmissions(directory), bytes = Buffer.byteLength(line);
+  if (index.truncated || index.controls >= MAX_STEER_CONTROLS || bytes > MAX_STEER_ENTRY_BYTES || index.bytes + bytes > MAX_STEER_BYTES) {
+    throw new FabricSteerAdmissionLimitError(path.basename(directory), MAX_STEER_CONTROLS, MAX_STEER_BYTES);
+  }
+  const file = path.join(control, "steer.jsonl"), created = !fs.existsSync(file);
+  const fd = fs.openSync(file, fs.constants.O_WRONLY | fs.constants.O_APPEND | fs.constants.O_CREAT |
+    (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0), 0o600);
   try {
-    for (const line of fs.readFileSync(path.join(directory, "steer.jsonl"), "utf8").split("\n")) {
-      if (!line.trim()) continue;
-      const entry = JSON.parse(line);
-      if (entry?.id !== id || (entry.type !== "steer" && entry.type !== "follow_up")) continue;
-      return terminalAdmissionFromEntry(entry);
+    requireJournal(fd); fs.appendFileSync(fd, line, "utf8"); fs.fsyncSync(fd);
+    if (created && directoryFd !== undefined && process.platform !== "win32") fs.fsyncSync(directoryFd);
+  }
+  finally { fs.closeSync(fd); }
+});
+const cacheIndex = (directory: string, version: string, index: TerminalAdmissionIndex): void => {
+  admissionCache.delete(directory);
+  if (admissionCache.size >= 64) admissionCache.delete(admissionCache.keys().next().value!);
+  admissionCache.set(directory, { signature: version, index });
+};
+const emptyAdmissions = (): TerminalAdmissionIndex => ({ byId: new Map(), controls: 0, bytes: 0, truncated: false });
+const readAdmissionJournal = (fd: number, directory: string): TerminalAdmissionIndex => {
+  try {
+    const stat = requireJournal(fd), version = signature(stat);
+    const cacheKey = `${directory}:${stat.dev}:${stat.ino}`;
+    const cached = admissionCache.get(cacheKey);
+    if (cached?.signature === version) return cached.index;
+    const index = emptyAdmissions();
+    index.bytes = Number(stat.size);
+    index.truncated = index.bytes > MAX_STEER_BYTES;
+    const buffer = Buffer.alloc(16 * 1024);
+    let offset = 0, remainder = Buffer.alloc(0), skipping = false;
+    while (offset < Math.min(index.bytes, MAX_STEER_BYTES)) {
+      const length = fs.readSync(fd, buffer, 0, Math.min(buffer.length, MAX_STEER_BYTES - offset), offset);
+      if (!length) break;
+      offset += length;
+      let chunk = Buffer.concat([remainder, buffer.subarray(0, length)]);
+      remainder = Buffer.alloc(0);
+      if (skipping) {
+        const end = chunk.indexOf(10);
+        if (end < 0) continue;
+        chunk = chunk.subarray(end + 1); skipping = false;
+      }
+      let start = 0, end: number;
+      while ((end = chunk.indexOf(10, start)) >= 0) {
+        const line = chunk.subarray(start, end); start = end + 1;
+        if (!line.length) continue;
+        index.controls++;
+        if (line.length > MAX_STEER_ENTRY_BYTES || index.controls > MAX_STEER_CONTROLS) { index.truncated = true; continue; }
+        try {
+          const admission = terminalAdmissionFromEntry(JSON.parse(line.toString("utf8")));
+          if (admission && !index.byId.has(admission.id)) index.byId.set(admission.id, admission);
+        } catch { /* A malformed row never grants sender authority. */ }
+      }
+      remainder = Buffer.from(chunk.subarray(start));
+      if (remainder.length > MAX_STEER_ENTRY_BYTES) { remainder = Buffer.alloc(0); skipping = true; index.truncated = true; }
     }
-  } catch { /* Missing/malformed admission never grants a notification recipient. */ }
+    if (remainder.length || skipping) index.truncated = true; // incomplete/oversized ingress fails closed
+    // Never cache a pass across a concurrent append/replacement.
+    if (signature(requireJournal(fd)) === version) cacheIndex(cacheKey, version, index);
+    return index;
+  } finally { fs.closeSync(fd); }
+};
+export const readTerminalAdmissions = (directory: string): TerminalAdmissionIndex => {
+  try {
+    const journals: TerminalAdmissionIndex[] = [], seen = new Set<string>();
+    const read = (fd: number | undefined): void => {
+      if (fd === undefined) return;
+      let stat: fs.BigIntStats;
+      try { stat = requireJournal(fd); } catch (error) { fs.closeSync(fd); throw error; }
+      const identity = `${stat.dev}:${stat.ino}`;
+      if (seen.has(identity)) { fs.closeSync(fd); return; }
+      seen.add(identity); journals.push(readAdmissionJournal(fd, directory));
+    };
+    // Original admissions precede newer sibling ingress after a legacy restart.
+    // Oldest layer first (in-run, then old sibling): every legacy journal is kept.
+    let legacyFds: number[] = [];
+    try { legacyFds = openLegacyTaskControlFiles(directory, "steer.jsonl").reverse(); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+    for (let index = 0; index < legacyFds.length; index++) {
+      try { read(legacyFds[index]); }
+      catch (error) { for (const fd of legacyFds.slice(index + 1)) fs.closeSync(fd); throw error; }
+    }
+    try { read(openTaskControlReadFile(directory, "steer.jsonl")); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+    const index = emptyAdmissions();
+    for (const journal of journals) {
+      index.bytes += journal.bytes; index.controls += journal.controls; index.truncated ||= journal.truncated;
+      for (const [id, admission] of journal.byId) if (!index.byId.has(id)) index.byId.set(id, admission);
+    }
+    index.truncated ||= index.bytes > MAX_STEER_BYTES || index.controls > MAX_STEER_CONTROLS;
+    return index;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return emptyAdmissions();
+    const refused = error instanceof FabricSteerJournalError ? error : new FabricSteerJournalError(`Cannot safely open steering journal: ${String(error)}`);
+    console.warn(`[pi-fabric] ${refused.code}: ${refused.message}`);
+    throw refused;
+  }
+};
+export const readTerminalAdmission = (directory: string, id: string): TerminalAdmission | undefined => readTerminalAdmissions(directory).byId.get(id);
+
+const retainedNotice = (directory: string, admission: TerminalAdmission, receiptId: string): AgentTerminalNotice | undefined => {
+  for (const suffix of [".json.delivered", ".json"]) {
+    try {
+      const notice = readTaskControlJson<AgentTerminalNotice>(directory, path.join("terminal-notices", admission.id + suffix));
+      if (notice?.code === "FABRIC_TARGET_TERMINAL" && notice.targetId === path.basename(directory) && notice.finalAnswerReceiptId === receiptId &&
+          notice.messageId === admission.id && notice.delivery === admission.delivery && terminalSenderMatches(notice.sender, admission.sender)) return notice;
+    } catch { /* An uncertain notice never establishes a refusal. */ }
+  }
   return undefined;
 };
+export const readUndeliveredMessage = (directory: string, id: string, runState: FabricTargetRunState = "final-answer-recorded"): AgentUndeliveredMessage | undefined => {
+  const receipt = readFinalAnswerReceipt(directory, path.basename(directory));
+  const admission = readTerminalAdmission(directory, id);
+  if (!receipt || !admission || !retainedNotice(directory, admission, receipt.id)) return;
+  return { code: "FABRIC_TARGET_TERMINAL", reason: "run-ended", deliveryStatus: "undelivered", messageId: id, delivery: admission.delivery,
+    finalAnswerReceiptId: receipt.id, runState, ...(admission.sender ? { sender: admission.sender } : {}) };
+};
+export const readUndeliveredMessageView = (directory: string, runState: FabricTargetRunState = "final-answer-recorded"): { messages: AgentUndeliveredMessage[]; total: number; truncated: boolean } => {
+  const receipt = readFinalAnswerReceipt(directory, path.basename(directory));
+  const index = readTerminalAdmissions(directory);
+  const result = { messages: [] as AgentUndeliveredMessage[], total: 0, truncated: index.truncated };
+  if (!receipt) return result;
+  for (const admission of index.byId.values()) {
+    if (!retainedNotice(directory, admission, receipt.id)) continue;
+    result.total++;
+    if (result.messages.length < MAX_PUBLIC_REFUSALS) result.messages.push({ code: "FABRIC_TARGET_TERMINAL", reason: "run-ended", deliveryStatus: "undelivered", messageId: admission.id,
+      delivery: admission.delivery, finalAnswerReceiptId: receipt.id, runState, ...(admission.sender ? { sender: admission.sender } : {}) });
+  }
+  result.truncated ||= result.total > result.messages.length;
+  return result;
+};
+export const readUndeliveredMessages = (directory: string): AgentUndeliveredMessage[] => readUndeliveredMessageView(directory).messages;
 
 /** Durable sender outbox. Failed routes retry on ordinary status/recovery/sweep wakes. */
 export class TerminalNoticeOutbox {
   readonly #routing = new Set<string>();
   constructor(readonly deliver?: (notice: AgentTerminalNotice) => void | Promise<void>) {}
 
-  retain(directory: string, notice: AgentTerminalNotice): void {
-    const admission = readTerminalAdmission(directory, notice.messageId);
+  retain(directory: string, notice: AgentTerminalNotice, route = true): void {
+    if (!/^[a-zA-Z0-9_-]{1,200}$/.test(notice.messageId)) throw new Error("Invalid terminal notice identity");
+    const admitted = readTerminalAdmission(directory, notice.messageId);
     const receipt = readFinalAnswerReceipt(directory, notice.targetId);
-    if (!admission || admission.delivery !== notice.delivery || !receipt || receipt.id !== notice.finalAnswerReceiptId ||
-        !terminalSenderMatches(notice.sender, admission.sender) ||
-        !terminalControlRefusalProven(directory, admission, receipt.runId)) return;
-    const file = path.join(directory, "terminal-notices", `${notice.messageId}.json`);
-    if (fs.existsSync(`${file}.delivered`)) return;
-    writeJsonAtomic(file, notice, { durable: true });
+    if (!admitted || admitted.delivery !== notice.delivery || !receipt || receipt.id !== notice.finalAnswerReceiptId ||
+        !terminalSenderMatches(notice.sender, admitted.sender) ||
+        !terminalControlRefusalProven(directory, admitted, receipt.runId)) return;
+    const relative = path.join("terminal-notices", `${notice.messageId}.json`);
+    if (readTaskControlJson(directory, relative + ".delivered")) return;
+    initializeTaskControlDirectory(directory);
+    writeTaskControlJson(directory, relative, notice);
     if (notice.delivery === "followUp" && /^[0-9a-f-]{36}$/.test(notice.messageId)) {
       const admission = followUpFile(directory, notice.messageId);
       if (fs.existsSync(admission)) {
@@ -123,74 +266,106 @@ export class TerminalNoticeOutbox {
         releaseFollowUpPayload(admission);
       }
     }
-    this.route(directory);
+    if (route) this.route(directory);
   }
 
   /** Reconstruct a missing outbox after a host crash between refusal and scan. */
   recover(directory: string): void {
-    const receipt = readFinalAnswerReceipt(directory, path.basename(directory));
-    if (!receipt) return;
     try {
-      const status = JSON.parse(fs.readFileSync(path.join(directory, "status.json"), "utf8"));
+      const receipt = readFinalAnswerReceipt(directory, path.basename(directory));
+      if (!receipt) return;
+      const status = readTaskRunStatus<AgentRunRecord>(directory);
       if (status.id !== receipt.runId || status.actorId || status.runner !== "pi" || status.finalAnswerReceipt?.id !== receipt.id ||
           !["completed", "failed", "stopped", "timed_out"].includes(status.status)) return;
-      for (const line of fs.readFileSync(path.join(directory, "steer.jsonl"), "utf8").split("\n")) {
-        if (!line.trim()) continue;
-        const entry = JSON.parse(line);
-        if ((entry.type !== "steer" && entry.type !== "follow_up") || typeof entry.id !== "string" || !/^[a-zA-Z0-9_-]{1,200}$/.test(entry.id)) continue;
-        const admission = readTerminalAdmission(directory, entry.id);
-        if (!admission) continue;
+      const index = readTerminalAdmissions(directory);
+      for (const admission of index.byId.values()) {
+        let state: { state?: string } | undefined;
+        try { state = readTaskControlJson(directory, path.join("terminal-controls", `${admission.id}.json`)); }
+        catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+        if (state?.state === "delivered" && terminalControlMatchesAdmission(state, admission)) continue;
         if (!terminalControlRefusalProven(directory, admission, receipt.runId)) continue;
         this.retain(directory, { code: "FABRIC_TARGET_TERMINAL", targetId: receipt.runId,
-          finalAnswerReceiptId: receipt.id, messageId: entry.id, delivery: admission.delivery,
-          ...(admission.sender ? { sender: admission.sender } : {}) });
+          finalAnswerReceiptId: receipt.id, messageId: admission.id, delivery: admission.delivery,
+          ...(admission.sender ? { sender: admission.sender } : {}) }, false);
       }
-    } catch { /* Native sources remain retained; never guess incomplete attribution. */ }
-    this.route(directory);
+      this.route(directory);
+    } catch { /* Unsafe metadata retains custody; never guess attribution or crash maintenance. */ }
   }
 
   hasPending(directory: string): boolean {
-    try { return fs.readdirSync(path.join(directory, "terminal-notices")).some(name => !name.endsWith(".json.delivered")); }
-    catch (error) { return (error as NodeJS.ErrnoException).code !== "ENOENT"; }
+    let count = 0, legacySelected = false;
+    const scan = (pinned: string): boolean => {
+      try { return withTaskControlSubdirectory(pinned, "terminal-notices", parent => {
+        const entries = fs.opendirSync(parent);
+        try {
+          for (;;) {
+            const entry = entries.readSync();
+            if (!entry) return false;
+            if (++count > MAX_STEER_CONTROLS * 2) return true;
+            if (!entry.isFile()) return true;
+            if (entry.name.endsWith(".json.delivered")) continue;
+            if (!/^[a-zA-Z0-9_-]{1,200}\.json$/.test(entry.name)) return true;
+            const relative = path.join("terminal-notices", entry.name);
+            const notice = readTaskControlJsonAt(pinned, relative);
+            const ack = readTaskControlJson(directory, relative + ".delivered");
+            if (!notice || JSON.stringify(ack) !== JSON.stringify(notice)) return true;
+          }
+        } finally { entries.closeSync(); }
+      }); } catch (error) { return (error as NodeJS.ErrnoException).code !== "ENOENT"; }
+    };
+    try {
+      const pending = withTaskControlReadDirectory(directory, pinned => { legacySelected = fs.realpathSync(pinned) === path.resolve(directory); return scan(pinned); });
+      return pending || (!legacySelected && visitLegacyTaskControlDirectories(directory, scan).some(Boolean));
+    } catch (error) { return (error as NodeJS.ErrnoException).code !== "ENOENT"; }
   }
 
   route(directory: string): void {
     if (!this.deliver) return;
-    const outbox = path.join(directory, "terminal-notices");
-    let entries: string[];
-    try { entries = fs.readdirSync(outbox); } catch { return; }
-    const receipt = readFinalAnswerReceipt(directory, path.basename(directory));
-    if (!receipt) return;
-    for (const entry of entries) {
-      if (!/^[a-zA-Z0-9_-]{1,200}\.json$/.test(entry)) continue;
-      const file = path.join(outbox, entry);
-      if (this.#routing.has(file)) continue;
-      let notice: AgentTerminalNotice;
-      try { notice = JSON.parse(fs.readFileSync(file, "utf8")); } catch { continue; }
-      const admission = readTerminalAdmission(directory, notice.messageId);
-      if (notice.code !== "FABRIC_TARGET_TERMINAL" || notice.targetId !== receipt.runId || notice.finalAnswerReceiptId !== receipt.id ||
-          entry !== `${notice.messageId}.json` || admission?.delivery !== notice.delivery || !admission.sender ||
-          !terminalSenderMatches(notice.sender, admission.sender) ||
-          !terminalControlRefusalProven(directory, admission, receipt.runId)) continue;
-      if (fs.existsSync(`${file}.delivered`)) {
+    try {
+      const outbox = path.join(taskControlDirectory(directory), "terminal-notices");
+      const receipt = readFinalAnswerReceipt(directory, path.basename(directory));
+      if (!receipt) return;
+      const index = readTerminalAdmissions(directory);
+      for (const admission of index.byId.values()) {
+        const entry = admission.id + ".json";
+        const file = path.join(outbox, entry);
+        if (this.#routing.has(file)) continue;
+        let notice: AgentTerminalNotice | undefined;
+        try { notice = readTaskControlJson(directory, path.join("terminal-notices", entry)); } catch { continue; }
+        if (!notice || notice.code !== "FABRIC_TARGET_TERMINAL" || notice.targetId !== receipt.runId || notice.finalAnswerReceiptId !== receipt.id ||
+            entry !== `${notice.messageId}.json` || admission?.delivery !== notice.delivery || !admission.sender ||
+            !terminalSenderMatches(notice.sender, admission.sender) ||
+            !terminalControlRefusalProven(directory, admission, receipt.runId)) continue;
         try {
-          const acknowledged = JSON.parse(fs.readFileSync(`${file}.delivered`, "utf8"));
-          if (JSON.stringify(acknowledged) === JSON.stringify(notice)) fs.rmSync(file);
-        } catch { /* Uncertain/corrupt route receipt retains custody, never repeats delivery. */ }
-        continue;
+          const acknowledged = readTaskControlJson(directory, path.join("terminal-notices", entry + ".delivered"));
+          if (acknowledged !== undefined) {
+            if (JSON.stringify(acknowledged) === JSON.stringify(notice)) removeTaskControlFile(directory, path.join("terminal-notices", entry));
+            continue; // an uncertain ACK retains custody, never repeats delivery
+          }
+        } catch { continue; }
+        initializeTaskControlDirectory(directory);
+        const identity = withTaskControlDirectory(directory, (pinned, fd) => {
+          const stat = statDir(fd, pinned); return `${stat.dev}:${stat.ino}`;
+        });
+        this.#routing.add(file); // stable key only; never a retained /proc/self/fd path
+        void Promise.resolve().then(() => {
+          // Recheck at actual dispatch, not only while enumerating the outbox.
+          if (!terminalControlRefusalProven(directory, admission, receipt.runId)) throw new Error("Terminal refusal is unproven");
+          return this.deliver!(notice);
+        }).then(() => {
+          // Reopen after the async route, and require the original host namespace.
+          withTaskControlDirectory(directory, (pinned, fd) => {
+            const stat = statDir(fd, pinned);
+            if (`${stat.dev}:${stat.ino}` !== identity || readFinalAnswerReceipt(directory, receipt.runId)?.id !== receipt.id) throw new Error("Terminal outbox namespace changed during route");
+            const current = readTaskControlJson(directory, path.join("terminal-notices", entry));
+            if (JSON.stringify(current) !== JSON.stringify(notice)) throw new Error("Terminal notice changed during route");
+            writeTaskControlJson(directory, path.join("terminal-notices", entry + ".delivered"), notice);
+            removeTaskControlFile(directory, path.join("terminal-notices", entry));
+            // Legacy sources stay read-only; matching sibling ACKs suppress replay.
+          });
+        }).catch(() => { /* Receipt remains durable; the next ordinary wake retries. */ })
+          .finally(() => this.#routing.delete(file));
       }
-      this.#routing.add(file);
-      void Promise.resolve().then(() => {
-        // Recheck at actual dispatch, not only while enumerating the outbox.
-        if (!terminalControlRefusalProven(directory, admission!, receipt.runId)) throw new Error("Terminal refusal is unproven");
-        return this.deliver!(notice);
-      }).then(() => {
-        // A routed ACK is not sender consumption. Keep the native refusal and
-        // its route receipt through retention, and suppress restart duplicates.
-        writeJsonAtomic(`${file}.delivered`, notice, { durable: true });
-        fs.rmSync(file);
-      }).catch(() => { /* Receipt remains durable; the next ordinary wake retries. */ })
-        .finally(() => this.#routing.delete(file));
-    }
+    } catch { /* Unsafe metadata remains pending/vetoed, never an unhandled host exception. */ }
   }
 }

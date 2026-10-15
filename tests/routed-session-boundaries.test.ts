@@ -11,6 +11,7 @@ import { findExecutable } from "../src/agents/transports/process-utils.js";
 import { decideModelRoute } from "../src/agents/model-route.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { processStartTime } from "../src/residency/process-identity.js";
+import { createHostTaskRun } from "../src/worker/terminal-answer.js";
 import { FABRIC_RUN_ROOT_PREFIX, markRunRootActive, markRunRootClosed, runTreeExitVeto, sweepTempRunRoots } from "../src/storage/retention.js";
 
 const decision = (model = "test/sol") => decideModelRoute({ routeClass: "bounded-lookup", protected: true,
@@ -35,7 +36,13 @@ describe("R3 routed session boundaries", () => {
     vi.stubEnv("PI_CODING_AGENT_DIR", path.join(root, "agent"));
     const manager = new AgentManager(repo, { ...DEFAULT_FABRIC_CONFIG.agents, retainRuns: true, nice: 19 }, { workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(root, "runs") });
     const launch = vi.spyOn(ProcessTransport.prototype, "launch"); const write = fs.writeFileSync;
-    vi.spyOn(fs, "writeFileSync").mockImplementation((file: any, data: any, options: any) => { if (String(file).endsWith("route-session.jsonl")) throw new Error("session bind disk failure"); return write(file, data, options); });
+    vi.spyOn(fs, "writeFileSync").mockImplementation((file: any, data: any, options: any) => {
+      const target = typeof file === "number" && process.platform === "linux"
+        ? fs.readlinkSync(`/proc/self/fd/${file}`)
+        : String(file);
+      if (target.includes("route-session.jsonl")) throw new Error("session bind disk failure");
+      return write(file, data, options);
+    });
     try {
       const route = await decision();
       await expect(manager.spawn({ task: "must not launch", worktree: true, routeDecision: route, transport: "process" })).rejects.toThrow("session bind disk failure");
@@ -165,7 +172,9 @@ describe("R3 routed session boundaries", () => {
       expect(() => process.kill(Number(absentIdentity.sessionId), 0)).toThrow(expect.objectContaining({ code: "ESRCH" }));
       markRunRootActive(runRoot, 1);
       for (const kind of ["successful", "pending", "live", "link", "unknown", "unresolved"]) {
-        const run = path.join(runRoot, kind); fs.mkdirSync(run);
+        const run = path.join(runRoot, kind);
+        // Current-v2 host seeding: publish the protected binding before status and artifacts.
+        createHostTaskRun(run);
         const identity = kind === "live"
           ? { sessionId: String(process.pid), processStartTime: processStartTime(process.pid) }
           : absentIdentity;

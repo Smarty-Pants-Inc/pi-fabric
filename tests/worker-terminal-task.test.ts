@@ -4,19 +4,24 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agents/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
-import { finalAssistantText, readFinalAnswerReceipt, saveFinalAnswerReceipt } from "../src/worker/terminal-answer.js";
+import { finalAssistantText, readFinalAnswerReceipt, saveFinalAnswerReceipt, createHostTaskRun, taskControlDirectory } from "../src/worker/terminal-answer.js";
 import { readTerminalControl, settleTerminalControl, trackTerminalControl } from "../src/worker/terminal-controls.js";
 
 const roots: string[] = [];
 const managers: AgentManager[] = [];
-const temporary = () => { const root = fs.mkdtempSync(path.join(os.tmpdir(), "worker-terminal-task-")); roots.push(root); return root; };
+const temporary = () => { const root = fs.mkdtempSync(path.join(os.tmpdir(), "worker-terminal-task-")); roots.push(root, taskControlDirectory(root)); return root; };
 afterEach(async () => {
   await Promise.all(managers.splice(0).map(manager => manager.close()));
   vi.unstubAllEnvs();
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 });
-const rows = (file: string): Record<string, any>[] => fs.existsSync(file)
-  ? fs.readFileSync(file, "utf8").trim().split("\n").filter(Boolean).map(line => JSON.parse(line)) : [];
+const rows = (file: string): Record<string, any>[] => {
+  if (!fs.existsSync(file)) return [];
+  const contents = fs.readFileSync(file, "utf8");
+  // A live provider may still be appending the last JSONL row. Observe only
+  // newline-committed records; malformed complete records still fail loudly.
+  return contents.slice(0, contents.lastIndexOf("\n") + 1).split("\n").filter(Boolean).map(line => JSON.parse(line));
+};
 const until = async (condition: () => boolean, timeoutMs = 20000) => {
   const deadline = Date.now() + timeoutMs;
   while (!condition()) {
@@ -65,13 +70,14 @@ export default function (pi) {
 `;
 const setup = () => {
   const root = temporary();
+  const workspace = path.join(root, "workspace"); fs.mkdirSync(workspace);
   const agentDir = path.join(root, "agent"); fs.mkdirSync(path.join(agentDir, "extensions"), { recursive: true });
   fs.writeFileSync(path.join(agentDir, "settings.json"), JSON.stringify({ compaction: { enabled: false }, retry: { enabled: false }, defaultProjectTrust: "never" }));
   fs.writeFileSync(path.join(agentDir, "extensions", "provider.ts"), provider);
   vi.stubEnv("PI_CODING_AGENT_DIR", agentDir); vi.stubEnv("PI_OFFLINE", "1"); vi.stubEnv("TERMINAL_PROOF_ROOT", root);
   const notices: unknown[] = [];
-  const manager = new AgentManager(root, { ...DEFAULT_FABRIC_CONFIG.agents, timeoutMs: 30000, nice: 19 }, {
-    workerPath: path.resolve("src/worker.ts"), piBinary: path.resolve("node_modules/@earendil-works/pi-coding-agent/dist/cli.js"),
+  const manager = new AgentManager(workspace, { ...DEFAULT_FABRIC_CONFIG.agents, timeoutMs: 30000, nice: 19 }, {
+    workerPath: path.resolve(process.env.FABRIC_TERMINAL_TASK_WORKER ?? "src/worker.ts"), piBinary: path.resolve("node_modules/@earendil-works/pi-coding-agent/dist/cli.js"),
     runRoot: path.join(root, "runs"), fullCodeMode: false, onTerminalNotice: notice => { notices.push(notice); },
   }); managers.push(manager);
   return { root, manager, notices };
@@ -85,14 +91,16 @@ const spawn = async (s: ReturnType<typeof setup>, extra: Record<string, unknown>
 
 describe("durable task final-answer contract", () => {
   it("keeps the first complete full answer immutable and rejects malformed/mismatched receipts", () => {
-    const root = temporary(); const text = "full answer ".repeat(100000);
+    // Validation no longer bootstraps authority: allocate an absent host run first.
+    const root = path.join(temporary(), "run"); createHostTaskRun(root);
+    const text = "full answer ".repeat(100000);
     const first = saveFinalAnswerReceipt(root, "run", text);
     expect(readFinalAnswerReceipt(root, "run")).toEqual(first);
     expect(saveFinalAnswerReceipt(root, "run", "late overwrite")).toEqual(first);
     expect(first.text).toBe(text);
     expect(readFinalAnswerReceipt(root, "other")).toBeUndefined();
     expect(() => saveFinalAnswerReceipt(root, "other", "wrong run")).toThrow("mismatched");
-    fs.writeFileSync(path.join(root, "final-answer.json"), "{}");
+    fs.writeFileSync(path.join(taskControlDirectory(root), "final-answer.json"), "{}");
     expect(readFinalAnswerReceipt(root, "run")).toBeUndefined();
     expect(() => saveFinalAnswerReceipt(root, "run", "invalid file")).toThrow("Invalid");
   });
@@ -104,7 +112,9 @@ describe("durable task final-answer contract", () => {
     expect(finalAssistantText({ role: "assistant", stopReason: "stop", content: [] })).toBe("");
   });
   it("does not resurrect a consumed control on replay", () => {
-    const root = temporary(); const id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+    // Validation no longer bootstraps authority: allocate an absent host run first.
+    const root = path.join(temporary(), "run"); createHostTaskRun(root);
+    const id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
     trackTerminalControl(root, { id, delivery: "steer" }); settleTerminalControl(root, id, "delivered");
     trackTerminalControl(root, { id, delivery: "steer" }); settleTerminalControl(root, id, "refused");
     expect(readTerminalControl(root, id)?.state).toBe("delivered");
@@ -220,7 +230,7 @@ describe("native worker task terminal boundary", () => {
   it("does not claim success when native final receipt persistence fails", async () => {
     const s = setup(); fs.writeFileSync(path.join(s.root, "answer.txt"), "must not claim success");
     const { handle, directory } = await spawn(s);
-    fs.mkdirSync(path.join(directory, "final-answer.json"));
+    fs.mkdirSync(path.join(taskControlDirectory(directory), "final-answer.json"));
     fs.writeFileSync(path.join(s.root, "release-1"), "");
     const result = await s.manager.wait(handle.id, { timeoutMs: 30000 });
     expect(result.status).toBe("failed");

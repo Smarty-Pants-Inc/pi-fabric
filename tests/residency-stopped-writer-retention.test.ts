@@ -357,9 +357,19 @@ it.skipIf(process.platform === "win32").each([
     expect(await settlement).toMatchObject({ status: "failed" });
     expect((restart ? host.actors.status(actor.id) : await client.actorStatus(actor.id)).inFlightRun).toBeUndefined();
     expect(JSON.parse(fs.readFileSync(child.statusFile, "utf8"))).toMatchObject({ status: "completed", turns: 5 });
-    // Explicitly finish a fresh offline proof; idle snapshots may conservatively
-    // retain an exited descendant until the next 60-second refresh.
-    expect(host.agents.retentionReferences({ refresh: true, budgetMs: 5 }).has(actor.id)).toBe(false);
+    // This asserts checked-exit ownership, not a 5ms filesystem-speed promise.
+    // Central-v1 adds binding validation to the walk: expiration MUST retain the
+    // actor, while a complete scan of the same checked-exited tree releases it.
+    const clock = vi.spyOn(performance, "now").mockReturnValueOnce(0).mockReturnValueOnce(0).mockReturnValue(6);
+    try {
+      const interrupted = host.agents.retentionReferences({ refresh: true, budgetMs: 5 });
+      expect(interrupted.has(actor.id)).toBe(true);
+      expect(interrupted.has("*")).toBe(true);
+      clock.mockReturnValue(0);
+      const complete = host.agents.retentionReferences({ refresh: true, budgetMs: 5 });
+      expect(complete.has(actor.id)).toBe(false);
+      expect(complete.has("*")).toBe(false);
+    } finally { clock.mockRestore(); }
     const before = scans;
     scanTime = (scanTime ?? 0) + 60_001;
     due.mockReturnValue(true);

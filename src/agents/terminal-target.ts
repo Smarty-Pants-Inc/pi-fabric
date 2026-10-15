@@ -6,15 +6,25 @@ export class FabricTargetTerminalError extends Error {
   readonly code = "FABRIC_TARGET_TERMINAL";
   readonly reason = "run-ended";
   readonly deliveryStatus = "undelivered";
+  /** Run state at refusal: the settled status, or `final-answer-pending` before result validation lands. */
   constructor(readonly targetId: string, readonly finalAnswerReceiptId: string,
     readonly runState: FabricTargetRunState = "final-answer-recorded") {
     super(`undelivered: task already finished — Fabric task ${targetId} run ended (${runState}); it recorded its final answer (${finalAnswerReceiptId}); input cannot revive it. Start a new task.`);
   }
 }
 
+/** A durable run-local steering budget refuses excess input before append. */
+export class FabricSteerAdmissionLimitError extends Error {
+  override readonly name = "FabricSteerAdmissionLimitError";
+  readonly code = "FABRIC_STEER_ADMISSION_LIMIT";
+  constructor(readonly targetId: string, readonly controlLimit: number, readonly byteLimit: number) {
+    super(`Fabric run ${targetId} reached its steering admission bound (${controlLimit} controls / ${byteLimit} bytes); input was not queued. Start a new run.`);
+  }
+}
+
 export type FabricTargetRunState = "final-answer-pending" | "final-answer-recorded" | "completed" | "failed" | "stopped" | "timed_out";
 
-/** One admitted control lost the final-answer race; it was not consumed. */
+/** One admitted control the ended run never consumed (append race or retained refusal). */
 export interface AgentUndeliveredMessage {
   code: "FABRIC_TARGET_TERMINAL";
   reason: "run-ended";

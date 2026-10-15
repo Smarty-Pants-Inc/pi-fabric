@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agents/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import type { AgentRunRecord } from "../src/agents/types.js";
+import { createHostTaskRun, TASK_CONTROL_LAYOUT, taskControlDirectory } from "../src/worker/terminal-answer.js";
 
 const roots: string[] = [];
 const managers: AgentManager[] = [];
@@ -20,8 +21,12 @@ afterEach(async () => {
 // Outside the checkout: ancestor node_modules and development peers must not
 // rescue imports. Pi managed installs deliberately omit host-provided peers.
 const installation = (text = "hi") => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-worker-install-"));
-  roots.push(root);
+  const installationRoot = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-worker-install-"));
+  roots.push(installationRoot);
+  const root = path.join(installationRoot, "probe");
+  // central-v1 removed worker-side bootstrap. A trusted host must allocate the
+  // absent run and publish its inode-bound authority before the first task write.
+  createHostTaskRun(root);
   fs.cpSync(path.resolve("dist"), path.join(root, "dist"), { recursive: true });
   fs.writeFileSync(path.join(root, "package.json"), '{"type":"module"}');
   fs.mkdirSync(path.join(root, "node_modules"));
@@ -55,10 +60,32 @@ const installation = (text = "hi") => {
 
 describe("standalone worker without Pi host peers", () => {
   it("boots a published worker without typebox or Pi packages installed", async () => {
-    const { run } = installation();
+    const { root, run } = installation();
+    // Raw invocation bypasses AgentManager, but not the host allocation contract.
+    const stat = fs.lstatSync(root, { bigint: true });
+    const binding = fs.readFileSync(path.join(taskControlDirectory(root), ".legacy-read.json"));
+    expect(JSON.parse(binding.toString())).toEqual({ version: 2, runId: "probe", dev: String(stat.dev), ino: String(stat.ino), snapshot: null });
     const { child, record } = await run();
     expect(child, child.stderr).toMatchObject({ exitCode: 0 });
-    expect(record).toMatchObject({ status: "completed", text: "hi" });
+    expect(record).toMatchObject({ status: "completed", text: "hi", taskControlLayout: TASK_CONTROL_LAYOUT });
+    expect(fs.readFileSync(path.join(taskControlDirectory(root), ".legacy-read.json"))).toEqual(binding);
+    expect(fs.statSync(taskControlDirectory(root)).isDirectory()).toBe(true);
+    if (process.platform !== "win32") expect(fs.statSync(taskControlDirectory(root)).mode & 0o777).toBe(0o700);
+  });
+
+  it("validates host-created activation controls before refusing an unadmitted native child", async () => {
+    const { root, run } = installation();
+    const binding = fs.readFileSync(path.join(taskControlDirectory(root), ".legacy-read.json"));
+    const { child, record } = await run({
+      "actor-id": "standalone-activation", "activation-id": "activation-probe",
+      "session-file": path.join(root, "actor.jsonl"), "inference-context": "activation",
+    });
+    expect(record, child.stderr).toMatchObject({ status: "failed", taskControlLayout: TASK_CONTROL_LAYOUT });
+    expect(record?.error).toMatch(/activation window|before.*admission|model selection/);
+    expect(fs.readFileSync(path.join(taskControlDirectory(root), ".legacy-read.json"))).toEqual(binding);
+    expect(fs.statSync(taskControlDirectory(root)).isDirectory()).toBe(true);
+    if (process.platform !== "win32") expect(fs.statSync(taskControlDirectory(root)).mode & 0o777).toBe(0o700);
+    expect(fs.readFileSync(path.join(root, "events.jsonl"), "utf8")).not.toContain('"type":"prompt"');
   });
 
   it.each([

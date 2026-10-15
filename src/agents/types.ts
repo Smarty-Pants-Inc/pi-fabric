@@ -15,6 +15,7 @@ import type { AgentWriteReceipt } from "./write-receipt.js";
 import type { InheritedSessionPin } from "./session-pins.js";
 import type { AgentWorktreeResult } from "./worktree-manager.js";
 import type { AgentUndeliveredMessage } from "./terminal-target.js";
+export type { AgentUndeliveredMessage } from "./terminal-target.js";
 
 /** Fabric run transports plus adapter-owned ("hosted") runs. */
 export type AgentRunTransport = FabricAgentTransport | "hosted";
@@ -200,6 +201,8 @@ export interface AgentCompactionStatus {
 }
 
 export interface AgentRunRecord {
+  /** Advisory downgrade fence only; legacy READ authority lives in host-owned controls. */
+  taskControlLayout?: "sibling-v1" | "central-v1";
   /** Canonical Fabric package root selected for the process worker at spawn time. */
   fabricRelease?: string;
   /** Admitted memory-capped task cgroup (smarty-dev#8257); absent when uncapped. */
@@ -256,6 +259,12 @@ export interface AgentRunRecord {
   /** smarty-dev#8758: tool-generated receipt of the paths written and shell commands run (write-receipt.ts). */
   writeReceipt?: AgentWriteReceipt;
   followUpDeliveries?: AgentFollowUpDelivery[];
+  /** Ordinary Pi task: admitted steer/followUp input the ended run refused (validated retained notices). */
+  undeliveredMessages?: AgentUndeliveredMessage[];
+  /** Count of validated refusals; public snapshots include at most 64 entries. */
+  undeliveredMessagesTotal?: number;
+  /** True when the public view or retained admission journal exceeds its bound. */
+  undeliveredMessagesTruncated?: boolean;
   turns: number;
   /** Actual model output/tool execution, not worker startup or an error-only turn. */
   inferenceStarted?: boolean;
@@ -347,6 +356,9 @@ export interface AgentHandleInfo {
   /** Admitted memory-capped task cgroup (smarty-dev#8257); absent when uncapped. */
   cgroup?: string;
   followUpDeliveries?: AgentFollowUpDelivery[];
+  undeliveredMessages?: AgentUndeliveredMessage[];
+  undeliveredMessagesTotal?: number;
+  undeliveredMessagesTruncated?: boolean;
   routeClass?: string;
   routeClassSource?: AgentRunRouteMetadata["routeClassSource"];
   protected?: boolean;
@@ -504,6 +516,8 @@ export interface AgentTransportLaunch {
   cwd: string;
   workerPath: string;
   workerArguments: string[];
+  /** Host-owned descriptors inherited as stdio slots 4+; slot 3 stays IPC (routed session handoff only). */
+  inheritFds?: number[];
   needs?: string[];
   requires?: string[];
   /** Host-derived incompatibility, never accepted from guest arguments. */

@@ -67,7 +67,7 @@ describe("named lane completion succession through FabricRuntimeState", () => {
     const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "fabric-queued-successor-"))); roots.push(root);
     for (const key of Object.keys(process.env)) if (key.startsWith("PI_FABRIC_")) vi.stubEnv(key, undefined);
     vi.stubEnv("PI_CODING_AGENT_DIR", path.join(root, "agent"));
-    vi.stubEnv("PI_FABRIC_RUN_ROOT", path.join(root, "runs"));
+    vi.stubEnv("PI_FABRIC_TMPDIR", root);
     const meshRoot = path.join(root, "mesh");
     const config = normalizeFabricConfig({ fullCodeMode: false,
       mesh: { enabled: true, root: meshRoot, actorPollMs: 20 },
@@ -90,6 +90,9 @@ describe("named lane completion succession through FabricRuntimeState", () => {
       await a.runtime.initialize(a.context, config);
       a.rename(admittedName);
       const blocker = await a.runtime.agents.spawn({ task: "HANG", name: "permit-holder", transport: "process", nice: 19, model: "fake/fake-model" });
+      const blockerRun = a.runtime.agents.runDirectory(blocker.id);
+      expect(blockerRun).toBeDefined();
+      const runRoot = path.dirname(blockerRun!);
       const privateTask = "ROUND6_PRIVATE_QUEUED_TASK";
       const queued = await a.runtime.agents.spawn({ task: privateTask, name: "queued-private", transport: "process", nice: 19, model: "fake/fake-model" });
       queuedId = queued.id;
@@ -106,7 +109,7 @@ describe("named lane completion succession through FabricRuntimeState", () => {
         expect(result).toMatchObject({ task: privateTask, status: "stopped" });
       }
       expect(a.runtime.agents.runDirectory(queued.id)).toBeUndefined();
-      expect(fs.existsSync(path.join(root, "runs", queued.id))).toBe(false);
+      expect(fs.existsSync(path.join(runRoot, queued.id))).toBe(false);
       expect(a.runtime.agents.status(queued.id)).toMatchObject({ task: privateTask, status: outcome });
       const envelopes = pendingCompletions(meshRoot, root).filter(value => value.result.id === queued.id);
       if (missing) expect(envelopes).toEqual([]);
@@ -163,7 +166,7 @@ describe("named lane completion succession through FabricRuntimeState", () => {
     const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "fabric-renamed-successor-"))); roots.push(root);
     for (const key of Object.keys(process.env)) if (key.startsWith("PI_FABRIC_")) vi.stubEnv(key, undefined);
     vi.stubEnv("PI_CODING_AGENT_DIR", path.join(root, "agent"));
-    vi.stubEnv("PI_FABRIC_RUN_ROOT", path.join(root, "runs"));
+    vi.stubEnv("PI_FABRIC_TMPDIR", root);
     const meshRoot = path.join(root, "mesh");
     const config = normalizeFabricConfig({ fullCodeMode: false,
       mesh: { enabled: true, root: meshRoot, actorPollMs: 20 },
@@ -266,7 +269,7 @@ describe("named lane completion succession through FabricRuntimeState", () => {
     const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "fabric-named-successor-"))); roots.push(root);
     for (const key of Object.keys(process.env)) if (key.startsWith("PI_FABRIC_")) vi.stubEnv(key, undefined);
     vi.stubEnv("PI_CODING_AGENT_DIR", path.join(root, "agent"));
-    vi.stubEnv("PI_FABRIC_RUN_ROOT", path.join(root, "runs"));
+    vi.stubEnv("PI_FABRIC_TMPDIR", root);
     const meshRoot = path.join(root, "mesh");
     const config = normalizeFabricConfig({ fullCodeMode: false,
       mesh: { enabled: true, root: meshRoot, actorPollMs: 20 },
@@ -286,7 +289,9 @@ describe("named lane completion succession through FabricRuntimeState", () => {
       // Ordinary return address, as persisted by the production launch path.
       const handle = await a.runtime.agents.spawn({ task: "ordinary", transport: "process", nice: 19, model: "fake/fake-model" });
       await a.runtime.agents.wait(handle.id);
-      const manifest = JSON.parse(fs.readFileSync(path.join(root, "runs", handle.id, "completion-recipient.json"), "utf8")) as { recipient: CompletionRecipient };
+      const runDirectory = a.runtime.agents.runDirectory(handle.id);
+      expect(runDirectory).toBeDefined();
+      const manifest = JSON.parse(fs.readFileSync(path.join(runDirectory!, "completion-recipient.json"), "utf8")) as { recipient: CompletionRecipient };
       expect(manifest.recipient).toMatchObject({ rootId: a.id, name: "probe-lane" });
       // Durable (resident host/journal) return address, as configured by production initialization.
       const resident = clients.find(client => client.options.config.rootId === a.id)!;

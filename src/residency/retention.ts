@@ -260,8 +260,10 @@ export class ResidentRequestRetention {
               hasPreservedResidentResult(directory, entry.name) &&
               boundedRunTree(file, unitExpired) && !unitExpired() &&
               actorReferenceFingerprint(this.actorRoots) === fingerprint) {
-            // smarty-dev#7916: only the judged run inode, verified; a failure retries next scan.
-            verifiedRemove(file, stat, { deleter: "residentRunRetention", fallback: () => { fs.rmSync(file, { recursive: true, force: true }); return true; } });
+            // The paired control inode and judged run both keep the same fresh
+            // registry-generation veto at each verified removal boundary.
+            removeUnreferencedRun(file, stat, () => actorReferenceFingerprint(this.actorRoots) !== fingerprint,
+              false, "residentRunRetention");
             continue;
           }
           const compacted = compactTerminalRunEvents(file, { ...this.retention, now, expired: unitExpired,
@@ -363,8 +365,10 @@ export class ResidentRequestRetention {
               !runTreeExitVeto(file, 0, undefined, true) && canRemoveTerminalRun(file) &&
               hasPreservedResidentResult(directory, entry.name) &&
               actorReferenceFingerprint(this.actorRoots) === fingerprint) {
-            // Windows main sweep: verifiedRemove runs main's removal unchanged off Linux (smarty-dev#7858).
-            verifiedRemove(file, stat, { deleter: "residentRunRetention", fallback: () => { fs.rmSync(file, { recursive: true, force: true }); return true; } });
+            // Paired metadata follows the same fingerprint fence; verifiedRemove
+            // still retains main's off-Linux removal fallback (smarty-dev#7858).
+            removeUnreferencedRun(file, stat, () => actorReferenceFingerprint(this.actorRoots) !== fingerprint,
+              false, "residentRunRetention");
             continue;
           }
           compactTerminalRunEvents(file, { ...this.retention, now,

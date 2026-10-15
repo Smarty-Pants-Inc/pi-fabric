@@ -281,7 +281,7 @@ export const spawnDetached = async (
   workerPath: string,
   workerArguments: string[],
   cwd: string,
-  authority?: Pick<AgentTransportLaunch, "signal" | "authorize" | "onUnconfirmedExit">,
+  authority?: Pick<AgentTransportLaunch, "signal" | "authorize" | "onUnconfirmedExit" | "inheritFds">,
   environment?: NodeJS.ProcessEnv,
   scope?: { executable: string; slice: string; warn: (reason: string) => void },
   /** Ordinary workers need time to run their five-second execution-child cleanup. */
@@ -305,7 +305,9 @@ export const spawnDetached = async (
     cwd,
     env: childProcessEnvironment(environment),
     detached: process.platform !== "win32",
-    stdio: tracksExecution ? ["ignore", "ignore", "ignore", "ipc"] : "ignore",
+    stdio: authority?.inheritFds?.length
+      ? ["ignore", "ignore", "ignore", tracksExecution ? "ipc" : "ignore", ...authority.inheritFds]
+      : tracksExecution ? ["ignore", "ignore", "ignore", "ipc"] : "ignore",
   });
   let spawnError: Error | undefined;
   child.once("error", error => { spawnError = error; });

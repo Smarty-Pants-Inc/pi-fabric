@@ -15,9 +15,96 @@ import type { FabricKernel } from "../runtime/kernel.js";
 import fs from "node:fs";
 import { spawn } from "node:child_process";
 import os from "node:os";
+
 import { fabricDataRoot } from "../storage/temp-root.js";
 import path from "node:path";
-import { mkdirPrivate } from "../storage/private-dir.js";
+import { fdBase, mkdirPrivate } from "../storage/private-dir.js";
+import type { RunDirectoryPin } from "./model-route.js";
+import { assertTaskRunPathUnaliased, assertTaskRunRootAdmissible } from "../worker/task-run-path.js";
+
+/** DELTA-SEC-02: errors from the run-path alias guard; never followed by a run-path outcome write. */
+const unsafeRunPathErrors = new WeakSet<object>();
+const isUnsafeRunPathError = (error: unknown): boolean => typeof error === "object" && error !== null &&
+  (unsafeRunPathErrors.has(error) || ["FABRIC_RUN_IDENTITY_REFUSED", "FABRIC_CONTROL_PUBLISH_UNSUPPORTED_PLATFORM"].includes(String((error as { code?: unknown }).code)));
+const assertRunPathSafe = (runDirectory: string, inheritedRoot: boolean): void => {
+  const makeError = (message: string): Error => {
+    const error = new FabricTaskControlDirectoryError(message); // same error type as before (imported below; hoisted)
+    unsafeRunPathErrors.add(error);
+    return error;
+  };
+  // Owner OPTION1 (#12214 recursion cut): Windows refuses an inherited PI_FABRIC_RUN_ROOT before any write.
+  assertTaskRunRootAdmissible(inheritedRoot, makeError);
+  assertTaskRunPathUnaliased(runDirectory, makeError);
+};
+/** DELTA-SEC-02 typed refusal (same code as model-route RUN_IDENTITY_REFUSED); never followed by a run-path write. */
+const runIdentityRefusal = (message: string): Error => {
+  const error = Object.assign(new FabricTaskControlDirectoryError(`FABRIC_RUN_IDENTITY_REFUSED: ${message}`), { code: "FABRIC_RUN_IDENTITY_REFUSED" });
+  unsafeRunPathErrors.add(error);
+  return error;
+};
+const unsupportedControlPublication = (run: string): Error => {
+  const error = Object.assign(new FabricTaskControlDirectoryError(
+    `FABRIC_CONTROL_PUBLISH_UNSUPPORTED_PLATFORM: routed model dispatch is unavailable on ${managerRunTestHooks.platform ?? process.platform} until smarty-dev#12444 lands; pass an explicit model (for example model: "cliproxyapi/gpt-6.1-sol") instead of model: "auto" (${run})`,
+  ), { code: "FABRIC_CONTROL_PUBLISH_UNSUPPORTED_PLATFORM" });
+  unsafeRunPathErrors.add(error);
+  return error;
+};
+const NOFOLLOW_DIRECTORY = fs.constants.O_RDONLY | (fs.constants.O_DIRECTORY ?? 0) | (fs.constants.O_NOFOLLOW ?? 0);
+/**
+ * DELTA-SEC-02: bind the freshly allocated run directory's dev+ino ONCE, right after createHostTaskRun and before any
+ * yield. The bound identity must equal both the no-follow opened directory and the central v2 binding the exclusive
+ * allocation published, so a replacement cannot be recaptured. `use` reopens no-follow and rechecks dev+ino immediately
+ * before each write; publication requires a traversable held fd (`/proc/self/fd/N` or equivalent). Platforms without
+ * one refuse routed control publication before opening a temp file; plain non-routed task spawns are unaffected.
+ */
+const pinRunDirectory = (runDirectory: string): RunDirectoryPin => {
+  const run = path.resolve(runDirectory);
+  const platform = managerRunTestHooks.platform ?? process.platform;
+  const base = platform === "win32"
+    ? undefined
+    : managerRunTestHooks.resolveFdBase
+      ? managerRunTestHooks.resolveFdBase()
+      : fdBase();
+  if (base === undefined) throw unsupportedControlPublication(run);
+  const open = (): { fd: number; dev: bigint; ino: bigint } => {
+    let fd: number;
+    try { fd = fs.openSync(run, NOFOLLOW_DIRECTORY); }
+    catch (error) { throw runIdentityRefusal(`Run directory ${run} cannot be opened without following links (${(error as NodeJS.ErrnoException).code}); refusing route write`); }
+    try {
+      const stat = fs.fstatSync(fd, { bigint: true });
+      if (!stat.isDirectory()) throw runIdentityRefusal(`Run directory ${run} is not a directory; refusing route write`);
+      return { fd, dev: stat.dev, ino: stat.ino };
+    } catch (error) { fs.closeSync(fd); throw error; }
+  };
+  const first = open();
+  let bound: { dev: bigint; ino: bigint };
+  try {
+    // The allocation's own central v2 binding must name this exact lifetime (refuses a replacement).
+    withLegacyTaskControlDirectories(run, () => undefined);
+    const named = fs.lstatSync(run, { bigint: true });
+    if (named.dev !== first.dev || named.ino !== first.ino) throw runIdentityRefusal(`Run directory ${run} changed while its allocation identity was bound`);
+    bound = { dev: first.dev, ino: first.ino };
+  } finally { if (first.fd !== undefined) fs.closeSync(first.fd); }
+  return {
+    run,
+    use<T>(operation: (directory: string, fd: number | undefined) => T): T {
+      const current = open();
+      try {
+        if (current.dev !== bound.dev || current.ino !== bound.ino) throw runIdentityRefusal(`Run directory ${run} is no longer the allocated directory; refusing route write (nothing written)`);
+        return operation(`${base}/${current.fd}`, current.fd);
+      } finally { fs.closeSync(current.fd); }
+    },
+  };
+};
+/** Test seam only: awaited (when set) at the post-allocation yield, before route-module import and receipt write. */
+export const managerRunTestHooks: {
+  afterRunAllocation?: (runDirectory: string) => void | Promise<void>;
+  /** Test-only platform override for the fail-closed no-fd publication boundary. */
+  platform?: NodeJS.Platform;
+  /** Test-only override for the held-directory traversal capability used by routed publication. */
+  resolveFdBase?: () => string | undefined;
+} = {};
+
 import { fileURLToPath } from "node:url";
 import { assertFabricModelAllowed, FabricModelDeniedError } from "../core/model-policy.js";
 import { readChildToolAllowlist } from "../core/child-tool-allowlist.js";
@@ -100,9 +187,9 @@ import type {
 import { FOLLOW_UP_RUNNING_TASK_MESSAGE, type AgentAdmissionAlarm, type AgentFollowUpAlarm, type AgentFollowUpDelivery } from "./types.js";
 import { followUpFile, followUpState, settleFollowUp, releaseFollowUpPayload } from "./follow-up-delivery.js";
 import { createRunRouteMetadata } from "../worker/run-record.js";
-import { readFinalAnswerReceipt, type FinalAnswerReceipt } from "../worker/terminal-answer.js";
-import { FabricTargetTerminalError, type AgentTerminalNotice, type AgentUndeliveredMessage } from "./terminal-target.js";
-import { TerminalNoticeOutbox, readTerminalAdmission, terminalControlRefusalProven, terminalSenderMatches } from "./terminal-notices.js";
+import { readFinalAnswerReceipt, readTaskControlJson, taskControlDirectory, taskSteerFile, withTaskControlDirectory, withLegacyTaskControlDirectories, createHostTaskRun, initializeTaskControlDirectory, assertTaskControlWriteRoots, isTaskControlDirectoryEntry, legacyTaskControlSibling, taskControlReadDirectory, FabricTaskControlDirectoryError, type FinalAnswerReceipt } from "../worker/terminal-answer.js";
+import { FabricTargetTerminalError, FabricSteerAdmissionLimitError, type AgentTerminalNotice, type AgentUndeliveredMessage } from "./terminal-target.js";
+import { TerminalNoticeOutbox, appendTerminalAdmission, readTerminalAdmission, readTerminalAdmissions, readUndeliveredMessage, readUndeliveredMessageView, MAX_STEER_CONTROLS, MAX_STEER_BYTES, MAX_STEER_ENTRY_BYTES, terminalControlMatchesAdmission, terminalControlRefusalProven, terminalSenderMatches } from "./terminal-notices.js";
 import type { AgentRunRouteMetadata } from "./types.js";
 import { WorktreeManager, type AgentWorktreeResult } from "./worktree-manager.js";
 import { writeForkSession, writeHandoffSession } from "./handoff.js";
@@ -595,10 +682,14 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
 }
 
 interface QueuedAgent {
+  /** Unallocated admission: mint strict host authority only at launch commit or required archive custody. */
+  allocateRun?: () => void;
   /** Host-owned admission address, including terminal outcomes with no launch manifest. */
   completionRecipient?: CompletionRecipient;
   routeSaveFailure?: string;
   outcomeSaved?: boolean;
+  /** DELTA-SEC-02: its run path was refused as aliased; no run-path outcome/custody write may follow. */
+  runPathUnsafe?: boolean;
   routeOutcome?: (result: AgentRunResult) => void;
   /** Also guard cleanup if writing the persistent unresolved marker failed. */
   cleanupPending?: string;
@@ -797,6 +888,7 @@ const readNestedAgents = (runDirectory: string, depth = 0): AgentRunRecord[] => 
   }
   const agents: AgentRunRecord[] = [];
   for (const entry of entries.slice(0, 200)) {
+    if (isTaskControlDirectoryEntry(nestedRoot, entry)) continue;
     const runDirectory = path.join(nestedRoot, entry);
     const record = readRecord(path.join(runDirectory, "status.json"));
     if (!record) continue;
@@ -874,6 +966,7 @@ const failedRecord = (
   }
   return {
     ...managed.runRoute,
+    ...(previous?.taskControlLayout ? { taskControlLayout: previous.taskControlLayout } : {}),
     id: managed.id,
     name: managed.name,
     task: managed.task,
@@ -949,7 +1042,8 @@ const hostStoppedResult = (result: AgentRunResult, lastEventAt: number | undefin
 const runRootHasExitVeto = (root: string, prelaunchIds: ReadonlySet<string>): boolean => {
   try {
     return fs.readdirSync(root, { withFileTypes: true })
-      .some((entry) => entry.isDirectory() && !!runTreeResourceVeto(path.join(root, entry.name), 0, undefined, true, !prelaunchIds.has(entry.name)));
+      .some((entry) => !isTaskControlDirectoryEntry(root, entry.name) && (!entry.isDirectory() && entry.name !== ".fabric-owner.json" ||
+        entry.isDirectory() && !!runTreeResourceVeto(path.join(root, entry.name), 0, undefined, true, !prelaunchIds.has(entry.name))));
   } catch (error) {
     return (error as NodeJS.ErrnoException).code !== "ENOENT";
   }
@@ -963,6 +1057,8 @@ export class AgentManager {
   readonly #worktrees = new WorktreeManager();
   readonly #runRoot: string;
   readonly #managedTempRoot: boolean;
+  /** Run root came from an inherited PI_FABRIC_RUN_ROOT, not a trusted host option or host-created temp root. */
+  readonly #inheritedRunRoot: boolean;
   readonly #parentOwnedRunRoot: boolean;
   readonly #retention: FabricRetentionConfig;
   readonly #workerPath: string;
@@ -1013,6 +1109,7 @@ export class AgentManager {
   readonly #onAdmissionAlarm: ((alarm: AgentAdmissionAlarm) => void) | undefined;
   #admissionAlarmAt: number | undefined;
   readonly #terminalNoticeOutbox: TerminalNoticeOutbox;
+
   readonly #followUps = new Map<string, Map<string, AgentFollowUpDelivery>>();
   readonly #followUpTimers = new Map<string, NodeJS.Timeout>();
   readonly #onChildQuestion:
@@ -1156,8 +1253,11 @@ export class AgentManager {
   ) {
     this.#semaphore = new AgentAdmission(config.maxConcurrent, Infinity, config.maxDepth);
     this.#managedTempRoot = options.runRoot === undefined && process.env.PI_FABRIC_RUN_ROOT === undefined;
-    this.#runRoot =
-      options.runRoot ?? process.env.PI_FABRIC_RUN_ROOT ?? fs.mkdtempSync(path.join(fabricDataRoot(), "pi-fabric-runs-"));
+    this.#inheritedRunRoot = options.runRoot === undefined && process.env.PI_FABRIC_RUN_ROOT !== undefined;
+    // Canonicalize only the host-created default root, before allocating any run id.
+    // Explicit and inherited roots stay lexical: user-owned aliases must still refuse.
+    this.#runRoot = options.runRoot !== undefined ? path.resolve(options.runRoot)
+      : process.env.PI_FABRIC_RUN_ROOT ?? fs.realpathSync(fs.mkdtempSync(path.join(fabricDataRoot(), "pi-fabric-runs-")));
     // Nested run artifacts belong to the enclosing run, not the short-lived Pi
     // child. Its owner removes them on cleanup/retention/root shutdown.
     this.#parentOwnedRunRoot = options.runRoot === undefined &&
@@ -1470,6 +1570,18 @@ export class AgentManager {
     while (this.#releasePaused && !probe) await this.#waitForRelease(request.signal);
     if (this.#closing) throw new Error("Fabric agent manager is closing");
     const signal = request.signal ? AbortSignal.any([request.signal, this.#closeAbort.signal]) : this.#closeAbort.signal;
+    // Re-pin for EVERY launch, including startup/provider retries and held-admission
+    // re-attempts. Only one adapter.launch invocation owns each duplicate; the stored
+    // retry request never retains a closed descriptor number. The worker receives its
+    // own inherited copy.
+    let pinnedRunDirectory: string | undefined;
+    if (request.workerArguments.some((value, index) => index % 2 === 0 && value === "--session-file-identity")) {
+      if (adapter.kind !== "process") throw runIdentityRefusal("Pinned routed sessions require the local process transport");
+      const statusIndex = request.workerArguments.indexOf("--status-file");
+      const statusFile = request.workerArguments[statusIndex + 1];
+      if (statusIndex < 0 || !statusFile) throw runIdentityRefusal("Pinned routed session has no run directory");
+      pinnedRunDirectory = path.dirname(statusFile);
+    }
     const pending = (async () => {
       for (;;) {
         while (this.#releasePaused && !probe) await this.#waitForRelease(signal);
@@ -1479,8 +1591,10 @@ export class AgentManager {
         // unknown launches and caller revocation never become another attempt.
         const held = new Error("Agent transport release admission is held");
         let admitted = false;
+        const sessionDirectoryFd = pinnedRunDirectory === undefined ? undefined : pinRunDirectory(pinnedRunDirectory).use(directory =>
+          fs.openSync(directory, fs.constants.O_RDONLY | (fs.constants.O_DIRECTORY ?? 0)));
         try {
-          return await adapter.launch({ ...request, signal, authorize: () => {
+          return await adapter.launch({ ...request, signal, ...(sessionDirectoryFd !== undefined ? { inheritFds: [sessionDirectoryFd] } : {}), authorize: () => {
             if (!admitted && this.#releasePaused && !probe) throw held;
             const authorized = request.authorize?.() !== false;
             if (authorized) admitted = true;
@@ -1488,6 +1602,9 @@ export class AgentManager {
           } });
         } catch (error) {
           if (error !== held) throw error;
+        } finally {
+          // This attempt's launch resolved or rejected (sync or async): its duplicate is done.
+          if (sessionDirectoryFd !== undefined) fs.closeSync(sessionDirectoryFd);
         }
       }
     })();
@@ -1695,9 +1812,30 @@ export class AgentManager {
     const admissionSignal = signal ? AbortSignal.any([signal, this.#closeAbort.signal]) : this.#closeAbort.signal;
     if (admissionSignal.aborted) throw new Error("Operation aborted");
     while (this.#releasePaused && !request.residentStartupProbe) await this.#waitForRelease(admissionSignal);
+    const id = randomUUID().replaceAll("-", "");
+    // DELTA-SEC-02: refuse an aliased (or Windows-inherited) run path BEFORE admission and BEFORE prepareRouteDispatch
+    // can write its receipt there; refusing before admit() leaves no admission count to leak.
+    assertRunPathSafe(path.join(this.#runRoot, id), this.#inheritedRunRoot);
     // Count accepted requests, including queued ones, exactly once.
     this.#semaphore.admit(this.#currentDepth + 1);
-    const id = randomUUID().replaceAll("-", "");
+    const runDirectory = path.join(this.#runRoot, id);
+    let runAllocated = false;
+    const allocateRun = (): void => {
+      if (runAllocated) return;
+      // Exclusive fresh allocation is the host witness; never adopt a blank/pre-existing run.
+      assertRunPathSafe(runDirectory, this.#inheritedRunRoot);
+      createHostTaskRun(runDirectory);
+      runAllocated = true;
+      const queued = this.#queued.get(id);
+      if (queued) delete queued.allocateRun;
+    };
+    // Routed receipts need authority before dispatch. Ordinary admissions remain
+    // in memory until model preparation, activation authority and commit succeed.
+    if (request.routeDecision) allocateRun();
+    // Routed dispatch is the only path that publishes route controls in C. Plain
+    // task spawns keep working on platforms without a traversable directory fd.
+    const runPin = request.routeDecision ? pinRunDirectory(runDirectory) : undefined;
+    if (runAllocated && managerRunTestHooks.afterRunAllocation) await managerRunTestHooks.afterRunAllocation(runDirectory);
     const name = safeName(request.name ?? request.task.split("\n", 1)[0] ?? "Fabric agent");
     const prompt = promptMetadata(request.task, path.join(this.#runRoot, id, "task.txt"));
     const callerSignal = signal;
@@ -1712,7 +1850,7 @@ export class AgentManager {
     let routeDispatch: ReturnType<typeof import("./model-route.js")["prepareRouteDispatch"]> | undefined;
     if (request.routeDecision) {
       const { prepareRouteDispatch } = await import("./model-route.js");
-      routeDispatch = prepareRouteDispatch(request.routeDecision, undefined, path.join(this.#runRoot, id), id, request.routeRecord);
+      routeDispatch = prepareRouteDispatch(request.routeDecision, undefined, runDirectory, id, { ...request.routeRecord, runPin: runPin! });
       // Failed decision storage demotes before admission: no unlogged candidate.
       routePin = Object.freeze({ ...(request.routeDecision.mode === "live"
         ? { model: request.routeDecision.model, effort: request.routeDecision.effort } : request.routeDecision.pin) });
@@ -1735,12 +1873,22 @@ export class AgentManager {
         // Internal resident-host fence: preparation may outlive the caller's deadline.
         // Activation authority and durable request commit are independent obligations.
         beforeCommit?.(id);
+        if (!runAllocated) {
+          allocateRun();
+          if (managerRunTestHooks.afterRunAllocation) await managerRunTestHooks.afterRunAllocation(runDirectory);
+        }
       } catch (error) {
-        try { routeDispatch?.outcome({ status: signal?.aborted ? "stopped" : "failed" }); } catch { /* pinned work is never blocked by routing storage */ }
+        let refusal: unknown;
+        try { routeDispatch?.outcome({ status: signal?.aborted ? "stopped" : "failed" }); }
+        catch (saveError) { if (isUnsafeRunPathError(saveError)) refusal = saveError; /* else pinned work is never blocked by routing storage */ }
         release();
-        throw error;
+        throw refusal ?? error;
       }
-      const runDirectory = path.join(this.#runRoot, id);
+      // DELTA-SEC-02: recheck after async preparation (an alias may have changed) BEFORE the first mkdir/custody/task write.
+      // Refusal releases admission but never invokes the route outcome saver through the aliased path.
+      assertRunPathSafe(runDirectory, this.#inheritedRunRoot);
+      // A real replacement directory is not an alias: require the original allocation identity too.
+      runPin?.use(() => undefined);
       // 0700 whatever the umask (smarty-dev#9016): a login shell's umask 002 made run directories 0775, which
       // verified retention refuses (group-writable). Only directories it creates are changed.
       mkdirPrivate(runDirectory, this.#trustRoot());
@@ -1771,7 +1919,7 @@ export class AgentManager {
       const statusFile = path.join(runDirectory, "status.json");
       const lifecycleFile = path.join(runDirectory, "lifecycle.jsonl");
       const logFile = path.join(runDirectory, "events.jsonl");
-      const steerFile = path.join(runDirectory, "steer.jsonl");
+      const steerFile = taskSteerFile(runDirectory);
       const schemaFile = request.schema ? path.join(runDirectory, "schema.json") : undefined;
       const imagesFile = request.images && request.images.length > 0
         ? path.join(runDirectory, "images.json")
@@ -1817,6 +1965,8 @@ export class AgentManager {
               : request, this.#parentWritePolicy, agentCwd)
           : undefined;
         if (applyTaskWriteDefault) assertDefaultTaskWriteRoots(this.#runRoot, writePolicy!.writableRoots);
+        this.#assertTaskControlRoot(runDirectory, agentCwd, writePolicy);
+        initializeTaskControlDirectory(runDirectory);
         const auditWritePolicy = (type: string, warning?: string, policy?: FabricWritePolicy): void => {
           fs.appendFileSync(logFile, JSON.stringify({ type, ts: Date.now(), id, runner,
             ...(policy ? { policy } : {}), ...(warning ? { warning } : {}),
@@ -1842,6 +1992,7 @@ export class AgentManager {
           childIndex: this.#childIndex++,
           worker: true,
         };
+        const routeSession = !routedActor ? routeDispatch?.bindSession(agentCwd) : undefined;
         const sessionFile = request.forkSeed
           ? writeForkSession(request.forkSeed, agentCwd, path.join(runDirectory, "fork-session"), request.thinkingTransfer)
           : request.sessionSeed
@@ -1853,7 +2004,7 @@ export class AgentManager {
               request.handoffCompact,
               request.handoffCompact ? await this.#resolveHandoffCompactionBudget?.(model, agentCwd) : undefined,
             )
-          : routedActor ? request.sessionFile : routeDispatch?.bindSession(agentCwd) ?? request.sessionFile;
+          : routedActor ? request.sessionFile : routeSession?.path ?? request.sessionFile;
         const adapter = await this.#resolveTransport(request.transport ?? this.config.transport);
         const runRoute = createRunRouteMetadata({ ...routeFacts, runner, transport: adapter.kind });
         const timeoutMs = effectiveAgentTimeoutMs(
@@ -2025,6 +2176,7 @@ export class AgentManager {
           ...(request.routeDecision?.mode === "judgment" ? ["--judgment", "true"] : []),
           ...(systemPrompt ? ["--system-prompt", systemPrompt] : []),
           ...(sessionFile ? ["--session-file", sessionFile] : []),
+          ...(routeSession ? ["--session-file-identity", JSON.stringify(routeSession.identity), "--session-directory-fd", "4"] : []),
           ...(request.inferenceContext ? ["--inference-context", request.inferenceContext] : []),
           ...(sessionExportFile ? ["--session-export-file", sessionExportFile] : []),
           ...(inheritedSessionPins && inheritedSessionPins.length > 0
@@ -2270,7 +2422,8 @@ export class AgentManager {
           return this.#queuedInfo(queued);
         }
         release();
-        try { routeDispatch?.outcome({ status: signal?.aborted ? "stopped" : "failed" }); } catch { /* pinned work is never blocked by routing storage */ }
+        try { routeDispatch?.outcome({ status: signal?.aborted ? "stopped" : "failed" }); }
+        catch (saveError) { if (isUnsafeRunPathError(saveError)) error = saveError; /* else pinned work is never blocked by routing storage */ }
         // Prelaunch archive custody is not native worker debt. Persisted worker
         // records still require a checked root exit before rollback.
         if (worktree && !runTreeResourceVeto(runDirectory, 0, undefined, true, fs.existsSync(path.join(runDirectory, "status.json")))) {
@@ -2285,9 +2438,9 @@ export class AgentManager {
         // Cover preparation writes and worktree creation as well as transport failures,
         // without releasing admission while an unconfirmed worker retains custody.
         if ((error as { launchOutcome?: string } | undefined)?.launchOutcome !== "unknown") release();
-        if ((error as { launchOutcome?: string } | undefined)?.launchOutcome !== "unknown" && !this.#queued.has(id)) {
+        if ((error as { launchOutcome?: string } | undefined)?.launchOutcome !== "unknown" && !this.#queued.has(id) && !isUnsafeRunPathError(error)) {
           try { routeDispatch?.outcome({ status: signal?.aborted ? "stopped" : "failed" }); }
-          catch (saveError) { console.warn(`[pi-fabric] Pre-worker route outcome save failed; files retained at ${path.join(this.#runRoot, id)}: ${String(saveError)}`); }
+          catch (saveError) { if (isUnsafeRunPathError(saveError)) throw saveError; console.warn(`[pi-fabric] Pre-worker route outcome save failed; files retained at ${path.join(this.#runRoot, id)}: ${String(saveError)}`); }
         }
         throw error;
       }
@@ -2295,7 +2448,8 @@ export class AgentManager {
     let release: (() => void) | undefined;
     try { release = this.#semaphore.tryAcquire("native", admissionSignal); }
     catch (error) {
-      try { routeDispatch?.outcome({ status: admissionSignal.aborted ? "stopped" : "failed" }); } catch { /* storage does not block cancellation */ }
+      try { routeDispatch?.outcome({ status: admissionSignal.aborted ? "stopped" : "failed" }); }
+      catch (saveError) { if (isUnsafeRunPathError(saveError)) throw saveError; /* storage does not block cancellation */ }
       throw error;
     }
     if (release) return start(release).catch((error) => { release(); throw error; });
@@ -2315,7 +2469,7 @@ export class AgentManager {
       ...(request.capabilityRequirements ? { capabilityRequirements: [...request.capabilityRequirements] } : {}),
       ...(request.capabilityDigest ? { capabilityDigest: request.capabilityDigest } : {}),
       ...(request.runnerSessionId ? { runnerSessionId: request.runnerSessionId } : {}),
-    }, request.task, start, authorize ? callerSignal : undefined, routeDispatch?.outcome, completionRecipient);
+    }, request.task, start, authorize ? callerSignal : undefined, routeDispatch?.outcome, completionRecipient, runAllocated ? undefined : allocateRun);
   }
 
   #enqueue(
@@ -2325,6 +2479,7 @@ export class AgentManager {
     ownerSignal?: AbortSignal,
     routeOutcome?: (result: AgentRunResult) => void,
     completionRecipient?: CompletionRecipient,
+    allocateRun?: () => void,
   ): AgentHandleInfo {
     const abort = new AbortController();
     // Guest receipts belong to the session, not a program deadline. Host-owned
@@ -2333,6 +2488,7 @@ export class AgentManager {
     let resolve!: (result: AgentRunResult) => void;
     const result = new Promise<AgentRunResult>((done) => { resolve = done; });
     const queued: QueuedAgent = { info, task, enqueuedAt: Date.now(), abort, result, resolve, background: false,
+      ...(allocateRun ? { allocateRun } : {}),
       ...(routeOutcome ? { routeOutcome } : {}), ...(completionRecipient ? { completionRecipient } : {}) };
     this.#queued.set(info.id, queued);
     const admission = this.#semaphore.acquire("native", signal);
@@ -2351,6 +2507,7 @@ export class AgentManager {
           return;
         }
         release?.();
+        if (isUnsafeRunPathError(error)) queued.runPathUnsafe = true;
         this.#settleQueued(queued, signal.aborted ? "stopped" : "failed", error);
       }
     })();
@@ -2550,10 +2707,25 @@ export class AgentManager {
   #saveQueuedRouteOutcome(queued: QueuedAgent): boolean {
     if (queued.outcomeSaved) return true;
     if (!queued.terminal) return !queued.routeSaveFailure;
+    if (queued.runPathUnsafe) {
+      // Deliver the in-memory receipt only: queued-result, archive and route saves would write through the alias.
+      try { this.#onSettled?.(queued.terminal, queued.completionRecipient); } catch { /* receipt stays on the waiter */ }
+      queued.outcomeSaved = true;
+      return true;
+    }
+    if (queued.allocateRun && !queued.routeOutcome && !this.#onSettled) {
+      // No worker or durable settlement sink: the terminal receipt belongs only
+      // to memory. Shutdown archival, if required, allocates at its own fence.
+      queued.outcomeSaved = true;
+      return true;
+    }
     let failure: unknown;
     // Finite retries only; persistent failure keeps the full terminal receipt and run files.
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
+        // A failed unlaunched admission may still owe a durable archive source.
+        // Establish strict central authority BEFORE queued-result/status/custody writes.
+        queued.allocateRun?.();
         if (queued.routeOutcome || this.#onSettled) {
           // Even an unlaunched queued run needs a durable full source if archival fails.
           writeJsonAtomic(path.join(this.#runRoot, queued.info.id, "queued-result.json"), queued.terminal, { durable: true });
@@ -2577,7 +2749,7 @@ export class AgentManager {
             startedAt: queued.terminal.startedAt, updatedAt: queued.terminal.updatedAt, finishedAt: queued.terminal.finishedAt }, { durable: true });
           try {
             fs.rmSync(path.join(directory, "queued-result.json"), { force: true });
-            fs.rmSync(directory, { recursive: true, force: true });
+            this.#removeRunTreeSync(directory);
           } catch { /* Its committed terminal state is collectible later. */ }
         }
         queued.outcomeSaved = true;
@@ -2766,6 +2938,7 @@ export class AgentManager {
     const recovered: string[] = [];
     for (const entry of entries) {
       while (this.#releasePaused) await this.#waitForRelease();
+      if (isTaskControlDirectoryEntry(this.#runRoot, entry)) continue;
       if (this.#closing || this.#runs.has(entry) || !/^[0-9a-f]{32}$/.test(entry)) continue;
       const runDirectory = path.join(this.#runRoot, entry);
       const statusFile = path.join(runDirectory, "status.json");
@@ -3086,11 +3259,17 @@ export class AgentManager {
     if (queued) return queued.terminal ? structuredClone(queued.terminal) : this.#queuedInfo(queued);
     const previous = this.#previousRuns.get(id);
     if (previous && !this.#runs.has(id)) {
-      this.#terminalNoticeOutbox.recover(path.join(this.#runRoot, previous.id));
-      return structuredClone(previous);
+      const directory = path.join(this.#runRoot, previous.id);
+      this.#terminalNoticeOutbox.recover(directory);
+      const view = previous.runner === "pi" && !previous.actorId && previous.finalAnswerReceipt ? this.#refusalView(directory) : {};
+      const { undeliveredMessages: _messages, undeliveredMessagesTotal: _total, undeliveredMessagesTruncated: _truncated, ...safe } = previous;
+      return structuredClone({ ...safe, ...view });
     }
     const managed = this.#requireRun(id);
-    this.#observeFinalAnswer(managed);
+    // A recorded receipt makes unconsumed admissions final now, not at native exit.
+    if (this.#observeFinalAnswer(managed)) {
+      try { this.#refuseUnreadTerminalControls(managed); } catch { /* The exit scan retries from durable sources. */ }
+    }
     this.#routeTerminalNotices(managed);
     const record = managed.finalAnswerResult ?? (managed.settled
       ? readRecord(managed.statusFile) ?? managed.latestRecord
@@ -3099,6 +3278,7 @@ export class AgentManager {
       const info = this.#handleInfo(managed, "running");
       const deliveries = this.#checkFollowUps(managed);
       if (deliveries.length) info.followUpDeliveries = deliveries;
+      if (managed.finalAnswer) Object.assign(info, this.#refusalView(managed.runDirectory));
       return info;
     }
     managed.latestRecord = record;
@@ -3198,6 +3378,7 @@ export class AgentManager {
       let entry: fs.Dirent | null;
       while (!expired() && (entry = directory.readSync())) {
         if (this.#managedTempRoot && entry.name === ".fabric-owner.json") continue;
+        if (isTaskControlDirectoryEntry(this.#runRoot, entry.name)) continue;
         if (this.#runs.has(entry.name) || this.#queued.has(entry.name)) continue;
         const run = path.join(this.#runRoot, entry.name);
         if (!entry.isDirectory()) { refs.add("*"); continue; }
@@ -3332,6 +3513,7 @@ export class AgentManager {
         directory = fs.opendirSync(this.#runRoot);
         let entry: fs.Dirent | null;
         while ((entry = directory.readSync())) {
+          if (isTaskControlDirectoryEntry(this.#runRoot, entry.name)) { if (expired()) yield; continue; }
           if (!(this.#managedTempRoot && entry.name === ".fabric-owner.json") && !this.#runs.has(entry.name) && !this.#queued.has(entry.name)) {
             const run = path.join(this.#runRoot, entry.name), stat = ownedStat(run);
             if (!entry.isDirectory() || !stat?.isDirectory()) protect("*");
@@ -3394,13 +3576,14 @@ export class AgentManager {
     syncDirectoryChain(directory);
     // A restarted owner has no live handle, but the saved native exit and all
     // other archive fences still govern collection of this exact source.
-    if (!this.#runs.has(runId) && !this.config.retainRuns && !runTreeExitVeto(directory, 0, undefined, true)) await removeTree(directory);
+    if (!this.#runs.has(runId) && !this.config.retainRuns && !runTreeExitVeto(directory, 0, undefined, true)) await this.#removeRunTree(directory);
   }
   /** Recover only this actor's fenced sources under the configured host run root. */
   actorArchiveSources(actorId: string, sessionFile: string): Map<string, string> {
     const sources = new Map<string, string>();
     if (!ownedStat(this.#runRoot)?.isDirectory()) return sources;
     for (const runId of fs.readdirSync(this.#runRoot)) {
+      if (isTaskControlDirectoryEntry(this.#runRoot, runId)) continue;
       if (!/^[a-f0-9]{32}$/.test(runId)) continue;
       const directory = path.join(this.#runRoot, runId);
       const file = path.join(directory, ACTOR_RUN_ARCHIVE_PENDING_FILE);
@@ -3599,7 +3782,7 @@ export class AgentManager {
       if (exitVeto) throw new Error(`Cannot clean up agent ${id}: ${exitVeto}`);
       this.#onResultConsumed?.(id);
       const cleaned = await this.#worktrees.cleanup(id, deleteBranch);
-      if (!this.config.retainRuns) await removeTree(runDirectory);
+      if (!this.config.retainRuns) await this.#removeRunTree(runDirectory);
       this.#queued.delete(id);
       this.#invalidateUiList();
       return { cleaned: cleaned || !fs.existsSync(runDirectory) };
@@ -3636,7 +3819,7 @@ export class AgentManager {
     this.markForeground(id);
     const cleaned = await this.#worktrees.cleanup(id, deleteBranch);
     if (!this.config.retainRuns) {
-      await removeTree(managed.runDirectory);
+      await this.#removeRunTree(managed.runDirectory);
     }
     this.#runs.delete(id);
     for (const messageId of this.#followUps.get(id)?.keys() ?? []) this.#clearFollowUpTimer(messageId);
@@ -3688,6 +3871,7 @@ export class AgentManager {
     const messageId = randomUUID();
     const deadlineAt = Date.now() + options.deadlineMs;
     if (!Number.isSafeInteger(deadlineAt)) throw new Error("deadlineMs exceeds the safe timestamp range");
+    this.#requireSteerAdmission(managed, Buffer.byteLength(JSON.stringify({ type: "follow_up", message, data, provenance, followUpId: messageId, deadlineAt, id: messageId, ts: Date.now() }) + "\n"));
     const file = followUpFile(managed.runDirectory, messageId);
     mkdirPrivate(path.dirname(file), this.#trustRoot());
     fs.writeFileSync(file, JSON.stringify({ messageId, deadlineAt }), { mode: 0o600 });
@@ -3764,6 +3948,7 @@ export class AgentManager {
     const managed = this.#requireRun(id);
     this.#observeFinalAnswer(managed);
     if (managed.finalAnswer) throw this.#terminalError(managed);
+    this.#requireSteerAdmission(managed);
     if (!managed.runnerAdapter.capabilities[kind]) {
       throw new Error(
         managed.runner === "veda"
@@ -3832,25 +4017,113 @@ export class AgentManager {
     });
   }
 
+  /** Name the run state: the validated result status, or pending while the receipt's result settles. */
   #terminalError(managed: ManagedAgent): FabricTargetTerminalError {
-    return new FabricTargetTerminalError(managed.id, managed.finalAnswer!.id,
-      managed.finalAnswerResult?.status ?? "final-answer-pending");
+    return new FabricTargetTerminalError(managed.id, managed.finalAnswer!.id, managed.finalAnswerResult?.status ?? "final-answer-pending");
   }
 
-  /** Close the receipt-publication race between ingress preflight and append. */
+  #runDeletionPaths(runDirectory: string): string[] {
+    // Judge every path first, then remove the run before its host metadata.
+    // A failed run removal must not leave a protected run with erased controls.
+    // Controls: the CENTRAL directory (outside the run tree), a validated old
+    // sibling-v1 directory, and nested runs' central directories.
+    const paths = [runDirectory];
+    const control = taskControlDirectory(runDirectory);
+    const stat = fs.lstatSync(control, { throwIfNoEntry: false });
+    if (!stat) {
+      // A never-launched in-memory receipt has neither namespace to collect.
+      // Do not invoke the strict read selector (or remove a later planted run).
+      if (!fs.lstatSync(runDirectory, { throwIfNoEntry: false })) return [];
+      // Missing controls never downgrade an existing marked/unknown run.
+      try { taskControlReadDirectory(runDirectory); }
+      catch (readError) { if ((readError as NodeJS.ErrnoException).code !== "ENOENT") throw readError; }
+    } else {
+      try {
+        if (!stat.isDirectory() || stat.isSymbolicLink()) throw new FabricTaskControlDirectoryError("Refusing cleanup of a linked or non-directory task control path");
+        withTaskControlDirectory(runDirectory, () => undefined);
+      } catch (error) {
+        console.warn(`[pi-fabric] FABRIC_TASK_CONTROL_UNSAFE cleanup refused for ${control}: ${String(error)}`);
+        throw error;
+      }
+      paths.push(control);
+    }
+    const sibling = legacyTaskControlSibling(runDirectory);
+    if (sibling !== control && fs.lstatSync(sibling, { throwIfNoEntry: false })) {
+      try {
+        if (!isTaskControlDirectoryEntry(path.dirname(sibling), path.basename(sibling))) throw new FabricTaskControlDirectoryError("Unvalidated legacy task control sibling");
+      } catch (error) {
+        console.warn(`[pi-fabric] FABRIC_TASK_CONTROL_UNSAFE cleanup refused for ${sibling}: ${String(error)}`);
+        throw error;
+      }
+      paths.push(sibling);
+    }
+    // Nested central controls are best-effort: an unvalidated one is retained
+    // (never deleted), and a failed walk never blocks the run's own cleanup.
+    let visited = 0;
+    const visit = (run: string, depth: number): void => {
+      const nested = path.join(run, "nested");
+      if (depth > 32 || !fs.lstatSync(nested, { throwIfNoEntry: false })?.isDirectory()) return;
+      for (const entry of fs.readdirSync(nested, { withFileTypes: true })) {
+        if (++visited > 4096) throw new Error("nested control walk bound exceeded");
+        if (!entry.isDirectory() || entry.name.endsWith(".ctl")) continue; // old nested siblings go with the tree
+        const child = path.join(nested, entry.name), central = taskControlDirectory(child);
+        const childStat = fs.lstatSync(central, { throwIfNoEntry: false });
+        if (childStat) {
+          try {
+            if (!childStat.isDirectory() || childStat.isSymbolicLink()) throw new FabricTaskControlDirectoryError("linked or non-directory task control path");
+            withTaskControlDirectory(child, () => undefined);
+            paths.push(central);
+          } catch (error) { console.warn(`[pi-fabric] FABRIC_TASK_CONTROL_UNSAFE nested control retained at ${central}: ${String(error)}`); }
+        }
+        visit(child, depth + 1);
+      }
+    };
+    try { visit(runDirectory, 0); }
+    catch (error) { console.warn(`[pi-fabric] nested task control collection incomplete for ${runDirectory}: ${String(error)}`); }
+    return paths;
+  }
+  #removeRunTreeSync(runDirectory: string): void {
+    for (const directory of this.#runDeletionPaths(runDirectory)) fs.rmSync(directory, { recursive: true, force: true });
+  }
+  async #removeRunTree(runDirectory: string): Promise<void> {
+    for (const directory of this.#runDeletionPaths(runDirectory)) await removeTree(directory);
+  }
+
+  #assertTaskControlRoot(runDirectory: string, cwd: string, policy: FabricWritePolicy | undefined): void {
+    assertTaskControlWriteRoots(runDirectory, cwd, policy);
+  }
+
+  #requireSteerAdmission(managed: ManagedAgent, bytes = 0) {
+    const index = readTerminalAdmissions(managed.runDirectory);
+    if (index.truncated || index.controls >= MAX_STEER_CONTROLS || bytes > MAX_STEER_ENTRY_BYTES || index.bytes + bytes > MAX_STEER_BYTES) {
+      throw new FabricSteerAdmissionLimitError(managed.id, MAX_STEER_CONTROLS, MAX_STEER_BYTES);
+    }
+    return index;
+  }
+
+  #refusalView(directory: string): Pick<AgentRunRecord, "undeliveredMessages" | "undeliveredMessagesTotal" | "undeliveredMessagesTruncated"> {
+    const view = readUndeliveredMessageView(directory);
+    return {
+      ...(view.messages.length ? { undeliveredMessages: view.messages } : {}),
+      ...(view.total || view.truncated ? { undeliveredMessagesTotal: view.total, undeliveredMessagesTruncated: view.truncated } : {}),
+    };
+  }
+
+  /** Pre-check/append race: a receipt that landed during append fences this exact unconsumed admission now. */
   #appendRaceRefusal(managed: ManagedAgent, messageId: string, delivery: "steer" | "followUp"): AgentUndeliveredMessage | undefined {
-    if (!this.#observeFinalAnswer(managed) || !managed.finalAnswer) return;
-    const admission = readTerminalAdmission(managed.runDirectory, messageId);
-    if (!admission || admission.delivery !== delivery) return;
-    if (!terminalControlRefusalProven(managed.runDirectory, admission, managed.id)) return;
-    this.#retainTerminalNotice(managed, { code: "FABRIC_TARGET_TERMINAL", targetId: managed.id,
-      messageId, delivery, finalAnswerReceiptId: managed.finalAnswer.id });
-    return { code: "FABRIC_TARGET_TERMINAL", reason: "run-ended", deliveryStatus: "undelivered",
-      messageId, delivery, finalAnswerReceiptId: managed.finalAnswer.id, runState: this.#terminalError(managed).runState,
-      ...(admission.sender ? { sender: admission.sender } : {}) };
+    if (!this.#observeFinalAnswer(managed) || !managed.finalAnswer) return undefined;
+    try {
+      const admission = readTerminalAdmission(managed.runDirectory, messageId);
+      if (!admission || admission.delivery !== delivery) return undefined;
+      if (!terminalControlRefusalProven(managed.runDirectory, admission, managed.id)) return undefined;
+      this.#retainTerminalNotice(managed, { code: "FABRIC_TARGET_TERMINAL", targetId: managed.id, messageId, delivery,
+        finalAnswerReceiptId: managed.finalAnswer.id });
+      this.#routeTerminalNotices(managed);
+      return readUndeliveredMessage(managed.runDirectory, messageId, this.#terminalError(managed).runState);
+    } catch { return undefined; /* Exit scan and status retain the refusal from durable sources. */ }
   }
 
-  #appendSteer(id: string, entry: Omit<AgentSteerEntry, "id" | "ts">): AgentSteerResult {
+  #appendSteer(id: string, entry: Omit<AgentSteerEntry, "id" | "ts"> | { type: "ui_response"; requestId: string; value?: string; cancelled?: boolean }): AgentSteerResult {
     const managed = this.#requireRun(id);
     this.#observeFinalAnswer(managed);
     if (managed.finalAnswer) throw this.#terminalError(managed);
@@ -3861,9 +4134,11 @@ export class AgentManager {
         `Fabric agent ${id} already finished (${record.status}); steering has no target`,
       );
     }
-    const steerFile = path.join(managed.runDirectory, "steer.jsonl");
-    const messageId = entry.followUpId ?? randomUUID();
-    const line = JSON.stringify({ ...entry, id: messageId, ts: Date.now() }) + "\n";
+    const messageId = ("followUpId" in entry ? entry.followUpId : undefined) ?? randomUUID();
+    const admitted = { ...entry, id: messageId, ts: Date.now() };
+    const line = JSON.stringify(admitted) + "\n";
+    const bytes = Buffer.byteLength(line);
+    this.#requireSteerAdmission(managed, bytes);
     if (entry.type === "steer" || entry.type === "follow_up") {
       const incoming = copyFabricPrincipal(entry.provenance?.principal);
       if (!incoming || incoming.id !== managed.outputPrincipal?.id || incoming.binding !== managed.outputPrincipal?.binding) {
@@ -3873,7 +4148,7 @@ export class AgentManager {
         managed.onOutputPrincipalDowngrade?.();
       }
     }
-    fs.appendFileSync(steerFile, line, { encoding: "utf8", mode: 0o600 });
+    appendTerminalAdmission(managed.runDirectory, line);
     const undelivered = entry.type === "steer" || entry.type === "follow_up"
       ? this.#appendRaceRefusal(managed, messageId, entry.type === "steer" ? "steer" : "followUp") : undefined;
     return {
@@ -3938,7 +4213,9 @@ export class AgentManager {
         }
       }
       const nested = path.join(directory, "nested");
-      if (fs.existsSync(nested)) for (const name of fs.readdirSync(nested)) inspect(path.join(nested, name), false, depth + 1);
+      if (fs.existsSync(nested)) for (const name of fs.readdirSync(nested)) {
+        if (!isTaskControlDirectoryEntry(nested, name)) inspect(path.join(nested, name), false, depth + 1);
+      }
     };
     let entries: fs.Dirent[];
     try { entries = fs.readdirSync(this.#runRoot, { withFileTypes: true }); }
@@ -3948,8 +4225,17 @@ export class AgentManager {
     }
     for (const entry of entries) {
       if (this.#managedTempRoot && entry.name === ".fabric-owner.json") continue;
+      if (isTaskControlDirectoryEntry(this.#runRoot, entry.name)) continue;
       if (!entry.isDirectory()) throw new Error("Agent release quiescence has unknown run-root contents");
-      inspect(path.join(this.#runRoot, entry.name), this.#runs.has(entry.name));
+      const directory = path.join(this.#runRoot, entry.name);
+      // An empty, unadmitted top-level workspace is not a worker. Classify it
+      // before the run-only control selector; any admission, content or sibling
+      // (including unsafe/dangling links) keeps the full native-custody veto.
+      if (!this.#runs.has(entry.name) && !this.#queued.has(entry.name) && !this.#previousRuns.has(entry.name) &&
+          ownedStat(directory)?.isDirectory() && fs.readdirSync(directory).length === 0 &&
+          !fs.lstatSync(taskControlDirectory(directory), { throwIfNoEntry: false }) &&
+          !fs.lstatSync(legacyTaskControlSibling(directory), { throwIfNoEntry: false }) && !expired()) continue;
+      inspect(directory, this.#runs.has(entry.name));
     }
     check();
     if (obligations()) throw new Error("Agent release quiescence changed while checking workers");
@@ -4046,12 +4332,16 @@ export class AgentManager {
     if (results.length > 0) {
       for (let attempt = 0; attempt < 3; attempt++) {
         try {
-          if (this.#onStoppedAtClose) for (const result of results) this.#stageArchive(path.join(this.#runRoot, result.id), result, "shutdown");
+          if (this.#onStoppedAtClose) for (const result of results) {
+            // A queued stop can be memory-only until shutdown requires custody.
+            this.#queued.get(result.id)?.allocateRun?.();
+            this.#stageArchive(path.join(this.#runRoot, result.id), result, "shutdown");
+          }
           this.#onStoppedAtClose?.(results);
           if (this.#onStoppedAtClose) for (const result of results) {
             const directory = path.join(this.#runRoot, result.id);
             this.#commitArchive(directory, result, "shutdown");
-            if (this.#queued.has(result.id) && !this.#queued.get(result.id)?.routeSaveFailure && !fs.existsSync(path.join(directory, "status.json"))) fs.rmSync(directory, { recursive: true, force: true });
+            if (this.#queued.has(result.id) && !this.#queued.get(result.id)?.routeSaveFailure && !fs.existsSync(path.join(directory, "status.json"))) this.#removeRunTreeSync(directory);
           }
           break;
         }
@@ -4089,7 +4379,7 @@ export class AgentManager {
           // Explicit roots (including judge runs) and completed runs keep whole-tree
           // deletion. Retention errors preserve custody rather than authorize deletion.
           if (await this.#retainTerminalPromptRecord(managed).catch(() => true)) return;
-          await removeTree(managed.runDirectory).catch(() => undefined);
+          await this.#removeRunTree(managed.runDirectory).catch(() => undefined);
         }));
     }
     // A failed stop is not authority to delete a child's working files.
@@ -4109,7 +4399,7 @@ export class AgentManager {
           await Promise.all([...this.#queued.values()]
             .filter(queued => queued.terminal && !queued.routeSaveFailure && !queued.cleanupPending &&
               !runTreeExitVeto(path.join(this.#runRoot, queued.info.id)))
-            .map(queued => removeTree(path.join(this.#runRoot, queued.info.id)).catch(() => undefined)));
+            .map(queued => this.#removeRunTree(path.join(this.#runRoot, queued.info.id)).catch(() => undefined)));
           // Independently collectible tracked runs were removed above. Retry only
           // the owned empty root; never recursively remove unknown contents.
           await removeManagedRunRoot(this.#runRoot, this.#managedTempRoot);
@@ -4193,7 +4483,7 @@ export class AgentManager {
       if (!this.#canCollect(managed)) continue;
       // Retry settlement saves first; pending deliveries and unsafe contents still veto expiry.
       if (!canRemoveTerminalRun(managed.runDirectory)) continue;
-      await removeTree(managed.runDirectory).catch(() => undefined);
+      await this.#removeRunTree(managed.runDirectory).catch(() => undefined);
       if (!fs.existsSync(managed.runDirectory)) this.#runs.delete(managed.id);
     }
     if (expired.length > 0) {
@@ -4701,8 +4991,11 @@ export class AgentManager {
   #observeFinalAnswer(managed: ManagedAgent): boolean {
     if (managed.actorId || managed.runner !== "pi" || managed.transport.kind !== "process") return false;
     if (managed.finalAnswer) return true;
-    const receipt = readFinalAnswerReceipt(managed.runDirectory, managed.id);
-    if (!receipt) return false;
+    let observedReceipt: FinalAnswerReceipt | undefined;
+    try { observedReceipt = readFinalAnswerReceipt(managed.runDirectory, managed.id); }
+    catch { return false; /* Unsafe metadata grants no finality, but must not block native stop/drain. */ }
+    if (!observedReceipt) return false;
+    const receipt = observedReceipt;
     managed.finalAnswer = receipt; // Fence synchronous ingress before any validation yields.
     managed.finalAnswerCompletion = (async () => {
       let snapshot = readRecord(managed.statusFile) ?? managed.latestRecord;
@@ -4772,6 +5065,10 @@ export class AgentManager {
     if (managed.terminalNoticeSeen?.has(notice.messageId)) return;
     const admission = readTerminalAdmission(managed.runDirectory, notice.messageId);
     if (!admission || admission.delivery !== notice.delivery) return;
+    try {
+      const control = readTaskControlJson<any>(managed.runDirectory, path.join("terminal-controls", `${notice.messageId}.json`));
+      if (control?.state === "delivered" && terminalControlMatchesAdmission(control, admission)) return;
+    } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
     if (!terminalControlRefusalProven(managed.runDirectory, admission, managed.id)) return;
     // Worker event fields cannot select the recipient. Verify supplied attribution
     // against the original trusted admission, then route only that admitted sender.
@@ -4780,7 +5077,7 @@ export class AgentManager {
       finalAnswerReceiptId: receipt.id, messageId: notice.messageId, delivery: admission.delivery,
       ...(admission.sender ? { sender: admission.sender } : {}) };
     // Save BEFORE routing: a failed sender route cannot erase the refusal.
-    this.#terminalNoticeOutbox.retain(managed.runDirectory, attributed);
+    this.#terminalNoticeOutbox.retain(managed.runDirectory, attributed, false);
     if (admission.delivery === "followUp" && /^[0-9a-f-]{36}$/.test(notice.messageId)) {
       const file = followUpFile(managed.runDirectory, notice.messageId);
       if (fs.existsSync(file)) {
@@ -4796,20 +5093,18 @@ export class AgentManager {
 
   #refuseUnreadTerminalControls(managed: ManagedAgent): void {
     if (!managed.finalAnswer || managed.actorId) return;
-    let lines: string[];
-    try { lines = fs.readFileSync(path.join(managed.runDirectory, "steer.jsonl"), "utf8").split("\n"); }
-    catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return; throw error; }
-    for (const line of lines) {
-      if (!line.trim()) continue;
-      const entry = JSON.parse(line) as AgentSteerEntry;
-      if ((entry.type !== "steer" && entry.type !== "follow_up") || !/^[a-zA-Z0-9_-]{1,200}$/.test(entry.id)) continue;
-      const admission = readTerminalAdmission(managed.runDirectory, entry.id);
-      if (!admission) continue;
+    const admissions = readTerminalAdmissions(managed.runDirectory);
+    for (const admission of admissions.byId.values()) {
+      let state: { state?: string } | undefined;
+      try { state = readTaskControlJson(managed.runDirectory, path.join("terminal-controls", `${admission.id}.json`)); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+      if (state?.state === "delivered" && terminalControlMatchesAdmission(state, admission)) continue;
       if (!terminalControlRefusalProven(managed.runDirectory, admission, managed.id)) continue;
       // Close does not prove non-consumption. Only child discard ACKs and locked
       // unforwarded/absent-row proofs qualify; ambiguous forwarded rows survive.
+      // The original admission id deduplicates worker and host paths, including an unread tail.
       this.#retainTerminalNotice(managed, {
-        code: "FABRIC_TARGET_TERMINAL", targetId: managed.id, messageId: entry.id,
+        code: "FABRIC_TARGET_TERMINAL", targetId: managed.id, messageId: admission.id,
         delivery: admission.delivery,
         finalAnswerReceiptId: managed.finalAnswer.id, ...(admission.sender ? { sender: admission.sender } : {}),
       });
@@ -5028,6 +5323,8 @@ export class AgentManager {
           managed.transport.waitForClose && !managed.launchCancelled &&
           (!managed.transport.lostContact?.() || this.#hasNativeStopDebt(managed)))) return;
     this.#drainLifecycle(managed);
+    // The result boundary reports unconsumed admissions as run-ended now, before native exit.
+    if (managed.finalAnswer) try { this.#refuseUnreadTerminalControls(managed); } catch { /* exit scan retries */ }
     const lost = managed.transport.lostContact?.();
     if (lost) this.#markLost(managed, lost);
     if (managed.transport.kind === "process" && managed.lostContact) {
@@ -5165,10 +5462,14 @@ export class AgentManager {
         } catch { /* The persisted veto remains for the next recovery attempt. */ }
       }
       const nested = path.join(directory, "nested");
-      if (ownedStat(nested)?.isDirectory()) for (const name of fs.readdirSync(nested)) visit(path.join(nested, name), depth + 1);
+      if (ownedStat(nested)?.isDirectory()) for (const name of fs.readdirSync(nested)) {
+        if (!isTaskControlDirectoryEntry(nested, name)) visit(path.join(nested, name), depth + 1);
+      }
     };
     if (runDirectory) visit(runDirectory, 0);
-    else if (ownedStat(this.#runRoot)?.isDirectory()) for (const name of fs.readdirSync(this.#runRoot)) visit(path.join(this.#runRoot, name), 0);
+    else if (ownedStat(this.#runRoot)?.isDirectory()) for (const name of fs.readdirSync(this.#runRoot)) {
+      if (!isTaskControlDirectoryEntry(this.#runRoot, name)) visit(path.join(this.#runRoot, name), 0);
+    }
     return recovered;
   }
 
@@ -5183,7 +5484,7 @@ export class AgentManager {
         let entry: fs.Dirent | null;
         while ((entry = cursor.readSync())) {
           yield 0;
-          if (entry.isDirectory()) yield* visit(path.join(directory, entry.name), depth);
+          if (!isTaskControlDirectoryEntry(directory, entry.name) && entry.isDirectory()) yield* visit(path.join(directory, entry.name), depth);
         }
       } catch { /* Unknown sources retain their custody marker. */ }
       finally { try { cursor?.closeSync(); } catch { /* retry next sweep */ } }
@@ -5385,20 +5686,17 @@ export class AgentManager {
         // Ignore malformed worker lifecycle records; status monitoring remains authoritative.
       }
     }
+    this.#routeTerminalNotices(managed);
   }
 
   // Answer one routed child dialog through the steer channel. Without a router
   // (or on any router failure) the child gets a cancelled response.
   #routeChildQuestion(managed: ManagedAgent, data: unknown): void {
     if (typeof data !== "object" || data === null || typeof (data as { requestId?: unknown }).requestId !== "string") return;
-    const question = data as Record<string, unknown>;
+    const question = data as Record<string, unknown> & { requestId: string };
     const respond = (response: AgentChildQuestionResponse): void => {
       try {
-        fs.appendFileSync(
-          path.join(managed.runDirectory, "steer.jsonl"),
-          `${JSON.stringify({ type: "ui_response", requestId: question.requestId, ...response, id: randomUUID(), ts: Date.now() })}\n`,
-          { encoding: "utf8", mode: 0o600 },
-        );
+        this.#appendSteer(managed.id, { type: "ui_response", requestId: question.requestId, ...response });
       } catch {
         // The worker's own deadline cancels the dialog if this write is lost.
       }
@@ -5680,12 +5978,15 @@ export class AgentManager {
       terminalStatuses.has(record.status) && !managed.settled,
     ), record);
     const budget = this.#budgetSummary();
-    const { logFile: _logFile, nestedAgents: _nestedAgents, ...safeRecord } = record;
+    const { logFile: _logFile, nestedAgents: _nestedAgents, undeliveredMessages: _messages,
+      undeliveredMessagesTotal: _total, undeliveredMessagesTruncated: _truncated, ...safeRecord } = record;
     const model = record.model ?? managed.model;
     const thinking = record.thinking ?? managed.thinking;
     const runnerSessionId = record.runnerSessionId ?? managed.runnerSessionId;
+    const view = managed.finalAnswer ? this.#refusalView(managed.runDirectory) : {};
     return {
       ...safeRecord,
+      ...view,
       ...(managed.finalAnswer ? { finalAnswerReceipt: { id: managed.finalAnswer.id, recordedAt: managed.finalAnswer.recordedAt } } : {}),
       ...(managed.finalAnswerResult ? {
         status: managed.finalAnswerResult.status, text: managed.finalAnswerResult.text,

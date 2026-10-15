@@ -7,7 +7,7 @@ import { PassThrough } from "node:stream";
 import readline from "node:readline";
 import { describe, expect, it } from "vitest";
 import { installTerminalControlFrameFence } from "../src/worker/terminal-boundary.js";
-import { saveFinalAnswerReceipt } from "../src/worker/terminal-answer.js";
+import { createHostTaskRun, saveFinalAnswerReceipt } from "../src/worker/terminal-answer.js";
 import { markTerminalControlForwarded, readTerminalControl, trackTerminalControl } from "../src/worker/terminal-controls.js";
 
 // Keep reason: child RPC ingress/data-safety boundary. Real stream + JSONL
@@ -16,7 +16,9 @@ const setup = () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "terminal-frame-fence-"));
   const runId = randomUUID();
   const directory = path.join(root, runId);
-  fs.mkdirSync(directory);
+  // The production fence reads current-only authority even before finality.
+  // Mirror host allocation before installing it; a blank mkdir is not a grant.
+  createHostTaskRun(directory);
   const input = new PassThrough();
   installTerminalControlFrameFence(input, directory, runId);
   const downstream: Array<Record<string, unknown>> = [];

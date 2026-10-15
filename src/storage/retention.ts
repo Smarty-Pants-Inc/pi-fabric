@@ -10,8 +10,9 @@ import { FileLockBusy, lockFile } from "../residency/file-lock.js";
 import { recoverActorRunArchives } from "../actors/child-completions.js";
 import { recoverEnodevTaskRun } from "../agents/enodev-recovery.js";
 import { copyFabricProvenance } from "../fabric-provenance.js";
-import { readFinalAnswerReceipt } from "../worker/terminal-answer.js";
-import { readTerminalAdmission, terminalAdmissionFromEntry, terminalControlMatchesAdmission, terminalSenderMatches, type TerminalAdmission } from "../agents/terminal-notices.js";
+import { readTerminalControl } from "../worker/terminal-controls.js";
+import { readFinalAnswerReceipt, openTaskControlFile, statDir, MAX_TASK_CONTROL_BYTES, isTaskControlDirectoryEntry, legacyTaskControlSibling, taskControlDirectory, taskControlReadDirectory, withTaskControlDirectory, withTaskControlReadDirectory, withLegacyTaskControlDirectories } from "../worker/terminal-answer.js";
+import { MAX_STEER_CONTROLS, MAX_STEER_BYTES, MAX_STEER_ENTRY_BYTES, readTerminalAdmission, terminalAdmissionFromEntry, terminalControlMatchesAdmission, terminalSenderMatches, type TerminalAdmission } from "../agents/terminal-notices.js";
 
 export const FABRIC_RUN_ROOT_PREFIX = "pi-fabric-runs-";
 const RUN_ROOT_OWNER_FILE = ".fabric-owner.json";
@@ -231,6 +232,10 @@ const runTreeVeto = (
     catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return; throw error; }
     if (!ownedStat(nested)?.isDirectory()) return "worker exit is unconfirmed: unsafe nested run directory";
     for (const name of fs.readdirSync(nested)) {
+      if (name.endsWith(".ctl")) {
+        if (!isPairedTaskControlEntry(nested, name, expired)) return "worker exit is unconfirmed: unsafe or unpaired task control directory";
+        continue;
+      }
       const reason = runTreeVeto(path.join(nested, name), depth + 1, expired, requirePersistedExit, preserveArchives, requireRootExit, acceptPidReuse);
       if (reason) return reason;
     }
@@ -257,7 +262,7 @@ const followUpName = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{
 /** Only paired, owned admission/final-receipt artifacts authorize collection.
  * A passed alarm deadline is not expiry of the payload: the sender may wait.
  * Queued, crashed claims, malformed state, links and unknown contents veto. */
-const safeFollowUps = (directory: string, expired: Deadline): boolean => {
+const safeFollowUps = (directory: string, expired: Deadline, settledIds?: Set<string>): boolean => {
   const names = fs.readdirSync(directory);
   for (const name of names) {
     if (expired()) return false;
@@ -276,43 +281,153 @@ const safeFollowUps = (directory: string, expired: Deadline): boolean => {
     if (!stat?.isFile() || stat.size > 9) return false;
     const state = fs.readFileSync(stateFile, "utf8");
     if (state !== "delivered" && state !== "cancelled") return false;
+    settledIds?.add(admissionName.slice(0, -5));
   }
-  return true;
+  return !expired();
 };
-/** A refusal journal is not a sender route receipt. Every unconsumed admission
- * needs its retained delivered notice; pending, malformed and linked artifacts veto. */
-const safeTerminalArtifacts = (root: string, expired: Deadline): boolean => {
-  const answerFile = path.join(root, "final-answer.json");
-  const controls = path.join(root, "terminal-controls"), notices = path.join(root, "terminal-notices");
-  // Read original native admissions before trusting any worker consumption row.
+interface TerminalArtifactBudget { entries: number; bytes: number }
+const MAX_TERMINAL_ARTIFACT_ENTRIES = MAX_STEER_CONTROLS * 3;
+const MAX_TERMINAL_ARTIFACT_BYTES = MAX_STEER_BYTES * 4;
+/** Lazy enumeration closes even when a caller vetoes early. Directory churn,
+ * unknown entries and oversized collections never grant deletion authority. */
+function* terminalArtifactNames(directory: string, budget: TerminalArtifactBudget, expired: Deadline): Generator<string> {
+  if (!ownedStat(directory)?.isDirectory()) throw new Error("Invalid terminal artifact directory");
+  const entries = fs.opendirSync(directory, { bufferSize: 32 });
+  let count = 0;
+  try {
+    for (;;) {
+      if (expired()) throw new Error("Terminal artifact scan deadline exceeded");
+      const entry = entries.readSync();
+      if (!entry) return;
+      if (++count > MAX_STEER_CONTROLS * 2 || ++budget.entries > MAX_TERMINAL_ARTIFACT_ENTRIES) throw new Error("Terminal artifact entry bound exceeded");
+      if (!entry.isFile()) throw new Error("Terminal artifact is not a regular file");
+      yield entry.name;
+    }
+  } finally { entries.closeSync(); }
+}
+/** Read only through an already selected/held namespace, with the shared
+ * no-follow/nonblocking regular-file validator and a hard growing-file bound. */
+const readPinnedTerminalFile = (file: string, maxBytes: number, expired: Deadline): string | undefined => {
+  let fd: number;
+  try { fd = openTaskControlFile(file); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return; throw error; }
+  try {
+    if (fs.fstatSync(fd).size > maxBytes) throw new Error("Terminal artifact byte bound exceeded");
+    const buffer = Buffer.alloc(maxBytes + 1);
+    let bytes = 0;
+    for (;;) {
+      if (expired()) throw new Error("Terminal artifact scan deadline exceeded");
+      const count = fs.readSync(fd, buffer, bytes, buffer.length - bytes, bytes);
+      if (!count) return buffer.subarray(0, bytes).toString("utf8");
+      bytes += count;
+      if (bytes > maxBytes) throw new Error("Terminal artifact byte bound exceeded");
+    }
+  } finally { fs.closeSync(fd); }
+};
+const terminalArtifactFiles = new Set(["steer.jsonl", "final-answer.json"]);
+const terminalArtifactDirectories = new Set(["terminal-controls", "terminal-notices"]);
+/** A refusal journal is not a sender route receipt. Unconsumed admissions need
+ * their own settled tracked follow-up or delivered notice; unsafe artifacts veto. */
+const safeTerminalArtifacts = (root: string, expired: Deadline): boolean => withTaskControlReadDirectory(root, (selected, fd) => {
+  const runStat = ownedStat(root) ? fs.lstatSync(root, { bigint: true }) : undefined, selectedStat = statDir(fd, selected);
+  if (!runStat) return false;
+  // The shared read selector holds the run itself ONLY for an unmarked pre-v2 run;
+  // judge its raw artifacts read-only with no protected layers (queued still vetoes).
+  if (runStat.dev === selectedStat.dev && runStat.ino === selectedStat.ino) return safeSelectedTerminalArtifacts(root, selected, [], true, expired, true);
+  // Status is task-writable. Only kernel-validated protected snapshot layers
+  // carry history; keep their origin through the custody judgment.
+  return withLegacyTaskControlDirectories(root, sources => {
+    const inRunLayers = sources.filter(source => source.origin.kind === "in-run");
+    if (inRunLayers.some(source => source.origin.dev !== String(runStat.dev) || source.origin.ino !== String(runStat.ino))) return false;
+    return safeSelectedTerminalArtifacts(root, selected, sources, inRunLayers.length > 0, expired);
+  });
+});
+const safeSelectedTerminalArtifacts = (root: string, selected: string, sources: ReadonlyArray<{ directory: string; origin: { kind: "in-run" | "sibling" } }>, inRunOrigin: boolean, expired: Deadline, rawRun = false): boolean => {
+  const legacy = sources.map(source => source.directory);
+  const namespaces = [selected, ...legacy];
+  const artifactPaths = (name: string): string[] => namespaces.map(directory => path.join(directory, name))
+    .filter(file => !!fs.lstatSync(file, { throwIfNoEntry: false }));
+  const answers = artifactPaths("final-answer.json");
+  if (answers.length > 1) return false; // Conflicting result namespaces never establish finality.
+  const answerFile = answers[0];
+  const controlDirectories = artifactPaths("terminal-controls"), noticeDirectories = artifactPaths("terminal-notices");
+  {
+    // Raw in-run controls are custody evidence only: without a validated in-run
+    // origin layer they are unknown and veto; with one they are never read.
+    if (!inRunOrigin && [...terminalArtifactFiles, ...terminalArtifactDirectories].some(name => fs.lstatSync(path.join(root, name), { throwIfNoEntry: false }))) return false;
+    // Raw old sibling likewise needs a validated sibling-origin layer.
+    if (!sources.some(source => source.origin.kind === "sibling") && fs.lstatSync(legacyTaskControlSibling(root), { throwIfNoEntry: false })) return false;
+    // A private sibling is not an unlimited artifact allowlist. Interrupted
+    // staging/locks, unknown names, links and nonregular artifacts retain custody.
+    // A raw pre-v2 run's other entries are judged by safeRunTree's run-root allowlist.
+    if (!rawRun) for (const name of fs.readdirSync(selected)) {
+      if (expired()) return false;
+      const stat = ownedStat(path.join(selected, name));
+      if (!stat || !(terminalArtifactFiles.has(name) && stat.isFile() || terminalArtifactDirectories.has(name) && stat.isDirectory() ||
+          // Main's stale-lock proof, applied where the protected writer now holds the lock.
+          name === TASK_FINAL_ANSWER_LOCK && stat.isDirectory() && TERMINAL_STATUSES.has(readJson<RunRecordSummary>(path.join(root, "status.json"))?.status ?? "") &&
+            safeStaleFinalAnswerLock(path.join(selected, name)) ||
+          // Reserved names only after kernel validation of binding and snapshot.
+          name === ".legacy-read.json" && stat.isFile() || name === ".legacy-snapshot" && sources.length > 0 && stat.isDirectory())) return false;
+    }
+  }
+  // Sender views may omit malformed/duplicate rows; omission is never retention
+  // authority. Preserve main's strict original-admission judgment with the same
+  // bounded shared READ selection, including eligible legacy sources.
   const admissions = new Map<string, TerminalAdmission>();
-  const steering = path.join(root, "steer.jsonl");
-  if (fs.existsSync(steering)) {
-    if (!ownedStat(steering)?.isFile()) return false;
-    for (const line of fs.readFileSync(steering, "utf8").split("\n")) {
+  const trackedFollowUps = new Set<string>();
+  let rows = 0, journalBytes = 0;
+  for (const file of artifactPaths("steer.jsonl")) {
+    const steering = readPinnedTerminalFile(file, MAX_STEER_BYTES, expired);
+    if (steering === undefined || steering && !steering.endsWith("\n")) return false;
+    journalBytes += Buffer.byteLength(steering);
+    if (journalBytes > MAX_STEER_BYTES) return false;
+    for (const line of steering.split("\n")) {
       if (expired()) return false;
       if (!line.trim()) continue;
+      if (++rows > MAX_STEER_CONTROLS || Buffer.byteLength(line) > MAX_STEER_ENTRY_BYTES) return false;
       const entry = JSON.parse(line);
       if (entry?.type !== "steer" && entry?.type !== "follow_up") continue;
       const admission = terminalAdmissionFromEntry(entry);
       if (!admission || admissions.has(admission.id)) return false;
       admissions.set(admission.id, admission);
+      if (admission.delivery === "followUp" && entry.followUpId === admission.id) trackedFollowUps.add(admission.id);
     }
   }
-  if (!fs.existsSync(answerFile)) {
-    if (fs.existsSync(notices) && (!ownedStat(notices)?.isDirectory() || fs.readdirSync(notices).length > 0)) return false;
-    if (!fs.existsSync(controls)) return true;
-    if (!ownedStat(controls)?.isDirectory()) return false;
-    // A failed/interrupted task need not have a final answer. Already consumed
-    // controls remain known collectible artifacts; queued/unknown ones do not.
-    return fs.readdirSync(controls).every(name => {
-      if (expired() || !/^[a-zA-Z0-9_-]{1,200}\.json$/.test(name)) return false;
-      const control = readJson<{ id?: string; state?: string; delivery?: string; provenance?: unknown; forwarded?: unknown }>(path.join(controls, name));
-      return !!control && control.state === "delivered" &&
-        (control.forwarded === undefined || typeof control.forwarded === "boolean") &&
-        Object.keys(control).every(key => ["id", "state", "delivery", "provenance", "forwarded"].includes(key)) &&
-        terminalControlMatchesAdmission(control, admissions.get(name.slice(0, -5)));
-    });
+  const budget: TerminalArtifactBudget = { entries: 0, bytes: 0 };
+  const readArtifact = <T>(file: string): T | undefined => {
+    const contents = readPinnedTerminalFile(file, MAX_TASK_CONTROL_BYTES, expired);
+    if (contents === undefined) return;
+    budget.bytes += Buffer.byteLength(contents);
+    if (budget.bytes > MAX_TERMINAL_ARTIFACT_BYTES) throw new Error("Terminal artifact aggregate byte bound exceeded");
+    return JSON.parse(contents) as T;
+  };
+  if (!answerFile) {
+    for (const notices of noticeDirectories) for (const _name of terminalArtifactNames(notices, budget, expired)) return false;
+    // A failed/interrupted task need not have a final answer. An eligible old
+    // queued row may coexist with its delivered sibling overlay, but only the
+    // independently admission-matched delivered row discharges consumption debt.
+    const consumed = new Set<string>(), queued = new Set<string>();
+    for (const controls of controlDirectories) for (const name of terminalArtifactNames(controls, budget, expired)) {
+      if (!/^[a-zA-Z0-9_-]{1,200}\.json$/.test(name)) return false;
+      const control = readArtifact<{ id?: string; state?: string; delivery?: string; provenance?: unknown; forwarded?: unknown }>(path.join(controls, name));
+      if (!control || control.state !== "delivered" && !(control.state === "queued" && legacy.some(directory => controls === path.join(directory, "terminal-controls"))) ||
+          control.forwarded !== undefined && typeof control.forwarded !== "boolean" ||
+          Object.keys(control).some(key => !["id", "state", "delivery", "provenance", "forwarded"].includes(key)) ||
+          !terminalControlMatchesAdmission(control, admissions.get(name.slice(0, -5)))) return false;
+      if (control.state === "delivered") consumed.add(name.slice(0, -5));
+      else queued.add(name.slice(0, -5));
+    }
+    const outstanding = [...admissions.values()].filter(admission => !consumed.has(admission.id));
+    if (!outstanding.length) return !expired();
+    // Main's tracked follow-up protocol settles at receiver context consumption
+    // or manager cancellation, even without a terminal registry row. Reuse its
+    // run-local artifact contract, only for the exact original tracked identity;
+    // this is not a sender route or a general run-local receipt integrity claim.
+    if (outstanding.some(admission => queued.has(admission.id) || admission.delivery !== "followUp" || !trackedFollowUps.has(admission.id))) return false;
+    const followUps = path.join(root, "follow-ups"), settled = new Set<string>();
+    return !!ownedStat(followUps)?.isDirectory() && safeFollowUps(followUps, expired, settled) && !expired() &&
+      outstanding.every(admission => settled.has(admission.id));
   }
   if (!ownedStat(answerFile)?.isFile()) return false;
   const record = readJson<RunRecordSummary>(path.join(root, "status.json"));
@@ -323,12 +438,14 @@ const safeTerminalArtifacts = (root: string, expired: Deadline): boolean => {
   if (!answer || expired() || record?.id !== answer.runId || record.finalAnswerReceipt?.id !== answer.id ||
       record.finalAnswerReceipt.recordedAt !== answer.recordedAt || record.actorId) return false;
   const routed = new Set<string>();
-  if (fs.existsSync(notices)) {
-    if (!ownedStat(notices)?.isDirectory()) return false;
-    for (const name of fs.readdirSync(notices)) {
+  for (const notices of noticeDirectories) {
+    for (const name of terminalArtifactNames(notices, budget, expired)) {
       if (expired() || !/^[a-zA-Z0-9_-]{1,200}\.json(?:\.delivered)?$/.test(name)) return false;
       const deliveredName = name.endsWith(".delivered") ? name : `${name}.delivered`;
-      const notice = readJson<{ code?: string; targetId?: string; messageId?: string; delivery?: string; finalAnswerReceiptId?: string; sender?: { id?: string; kind?: string; verified?: string } }>(path.join(notices, deliveredName));
+      const copies = noticeDirectories.map(directory => readArtifact<{ code?: string; targetId?: string; messageId?: string; delivery?: string; finalAnswerReceiptId?: string; sender?: { id?: string; kind?: string; verified?: string } }>(path.join(directory, deliveredName)))
+        .filter(value => value !== undefined);
+      const notice = copies[0];
+      if (copies.some(value => JSON.stringify(value) !== JSON.stringify(notice))) return false;
       if (!notice || notice.code !== "FABRIC_TARGET_TERMINAL" || notice.targetId !== answer.runId ||
           notice.finalAnswerReceiptId !== answer.id || deliveredName !== `${notice.messageId}.json.delivered` ||
           !["steer", "followUp"].includes(notice.delivery ?? "") || !notice.sender?.id ||
@@ -336,38 +453,45 @@ const safeTerminalArtifacts = (root: string, expired: Deadline): boolean => {
       const admission = admissions.get(notice.messageId!);
       if (!admission || notice.delivery !== admission.delivery || !terminalSenderMatches(notice.sender, admission.sender)) return false;
       if (!name.endsWith(".delivered")) {
-        const pending = readJson<unknown>(path.join(notices, name));
+        const pending = readArtifact<unknown>(path.join(notices, name));
         if (JSON.stringify(pending) !== JSON.stringify(notice)) return false;
       }
       routed.add(notice.messageId!);
     }
   }
-  const consumed = new Set<string>();
-  if (fs.existsSync(controls)) {
-    if (!ownedStat(controls)?.isDirectory()) return false;
-    for (const name of fs.readdirSync(controls)) {
+  const consumed = new Set<string>(), uncertain = new Set<string>();
+  for (const controls of controlDirectories) {
+    for (const name of terminalArtifactNames(controls, budget, expired)) {
       if (expired() || !/^[a-zA-Z0-9_-]{1,200}\.json$/.test(name)) return false;
-      const control = readJson<{ id?: string; state?: string; delivery?: string; provenance?: unknown; forwarded?: unknown }>(path.join(controls, name));
+      const control = readArtifact<{ id?: string; state?: string; delivery?: string; provenance?: unknown; reason?: unknown; forwarded?: unknown }>(path.join(controls, name));
       const id = name.slice(0, -5), admission = admissions.get(id);
       if (!control || !admission || typeof control.id !== "string" || !/^[a-zA-Z0-9_-]{1,200}$/.test(control.id) ||
           !["steer", "followUp"].includes(control.delivery ?? "") || !["queued", "refused", "delivered"].includes(control.state ?? "") ||
-          Object.keys(control).some(key => !["id", "state", "delivery", "provenance", "forwarded"].includes(key)) ||
+          Object.keys(control).some(key => !["id", "state", "delivery", "provenance", "reason", "forwarded"].includes(key)) ||
+          control.reason !== undefined && (control.state !== "refused" || control.reason !== "run-ended") ||
           control.forwarded !== undefined && typeof control.forwarded !== "boolean" ||
           control.provenance !== undefined && !copyFabricProvenance(control.provenance)) return false;
+      const matches = terminalControlMatchesAdmission(control, admission);
       // A previously fabricated route receipt cannot discharge an ambiguous
       // forwarded frame, nor a still-queued legacy row without transport proof.
-      if (control.state === "queued") return false;
       // Legacy shape (no `forwarded`): a refused row may hide a buffered, consumed
       // frame, so even an old route receipt cannot retire it. Delivered stays allowed.
-      if (control.forwarded === undefined && control.state !== "delivered") return false;
-      if (control.state === "delivered" && terminalControlMatchesAdmission(control, admission)) consumed.add(id);
-      else if (!routed.has(id)) return false; // Only the original-attributed refusal discharges mismatched rows.
+      if (control.state === "queued" || control.forwarded === undefined && control.state !== "delivered") {
+        // Only a matching row in an eligible legacy namespace may coexist with its
+        // delivered sibling overlay; route receipts never discharge it.
+        if (!matches || !legacy.some(directory => controls === path.join(directory, "terminal-controls"))) return false;
+        uncertain.add(id);
+        continue;
+      }
+      if (control.state === "delivered" && matches) consumed.add(id);
+      else if (!matches && !routed.has(id)) return false;
+      // Only the original-attributed refusal discharges mismatched rows.
     }
   }
   for (const id of admissions.keys()) {
-    if (expired() || !consumed.has(id) && !routed.has(id)) return false;
+    if (expired() || !consumed.has(id) && (!routed.has(id) || uncertain.has(id))) return false;
   }
-  return true;
+  return !expired();
 };
 const DURABLE_KEY = /^(?:initial|[0-9a-f]{64})$/;
 const DURABLE_LEASE_FILES = new Set(["lease.sqlite", "lease.sqlite-journal"]);
@@ -416,7 +540,9 @@ const safeRunTree = (root: string, childrenStopped: boolean, depth = 0, expired:
         if (!record?.status || !TERMINAL_STATUSES.has(record.status) || !safeStaleFinalAnswerLock(file)) return false;
         continue;
       }
-      if (stat.isDirectory() && (name === "terminal-controls" || name === "terminal-notices")) continue;
+      // These legacy names are permitted only after the shared selector and the
+      // complete original-admission/receipt checks above, never as arbitrary trees.
+      if (stat.isDirectory() && terminalArtifactDirectories.has(name)) continue;
       if (stat.isDirectory() && name === "tmp") {
         // Manager-created task scratch belongs to this run. Reuse the owned,
         // bounded walk: links, hardlinks, special files or incomplete scans veto.
@@ -447,7 +573,7 @@ const safeRunTree = (root: string, childrenStopped: boolean, depth = 0, expired:
               Object.keys(item).some(key => !["message", "delivery", "followUpId", "controlId", "images", "provenance"].includes(key))) return false;
           if (item.controlId === id) {
             const admission = readTerminalAdmission(root, id);
-            const control = readJson<{ state?: string }>(path.join(root, "terminal-controls", child));
+            const control = readTerminalControl(root, id);
             if (!control || !["delivered", "refused"].includes(control.state ?? "") ||
                 !terminalControlMatchesAdmission(control, admission) ||
                 !terminalControlMatchesAdmission({ id, delivery: item.delivery, provenance: item.provenance }, admission)) return false;
@@ -464,13 +590,82 @@ const safeRunTree = (root: string, childrenStopped: boolean, depth = 0, expired:
         continue;
       }
       if (stat.isDirectory() && name === "nested") {
-        for (const child of fs.readdirSync(file)) if (!safeRunTree(path.join(file, child), false, depth + 1, expired, acceptPidReuse)) return false;
+        for (const child of fs.readdirSync(file)) {
+          if (child.endsWith(".ctl")) {
+            if (!isPairedTaskControlEntry(file, child, expired)) return false;
+            continue;
+          }
+          if (!safeRunTree(path.join(file, child), false, depth + 1, expired, acceptPidReuse)) return false;
+        }
         continue;
       }
       return false;
     }
-    return true;
+    return !expired();
   } catch { return false; }
+};
+/** A suffix is not authority to skip a run-root entry. The exact sibling must
+ * be private/owned/no-follow and its paired run must exist; the caller still
+ * judges that run's exit and all terminal artifacts independently. */
+export const isPairedTaskControlEntry = (parent: string, name: string, expired: Deadline = noDeadline): boolean => {
+  if (expired() || !name.endsWith(".ctl") || path.basename(name) !== name) return false;
+  const runName = name.slice(0, -4);
+  if (!runName || runName.endsWith(".ctl")) return false; // Controls cannot themselves admit a second control sibling.
+  const run = path.join(parent, runName);
+  if (!ownedStat(run)?.isDirectory() || !ownedStat(path.join(parent, name))?.isDirectory()) return false;
+  // sibling-v1 only: taskControlDirectory(run) is now the CENTRAL namespace, so
+  // validate this exact old sibling through the shared compatibility filter.
+  try { return isTaskControlDirectoryEntry(parent, name) && !expired(); }
+  catch { return false; }
+};
+/** Old read-only sibling-v1 location of a run's controls. */
+const legacyControlSibling = legacyTaskControlSibling;
+type ControlRemoval = { path: string; stat: fs.Stats };
+/** Every control namespace a run removal must collect with its run: the run's
+ * CENTRAL directory (outside the tree), its validated old sibling, and the
+ * central directories of nested runs (their old siblings sit inside the tree
+ * and go with it). Undefined refuses the whole removal: never strand or drop
+ * an unvalidated control namespace. */
+const runControlRemovals = (directory: string): ControlRemoval[] | undefined => {
+  const removals: ControlRemoval[] = [];
+  let visited = 0;
+  const add = (run: string, nested: boolean): boolean => {
+    if (++visited > 4096) throw new Error("Task control removal plan bound exceeded");
+    const central = taskControlDirectory(run);
+    const stat = fs.lstatSync(central, { throwIfNoEntry: false });
+    if (stat) {
+      if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("Refusing linked or non-directory task control path");
+      withTaskControlDirectory(run, () => undefined);
+      // Snapshot children go with the central removal; validate them, never plan them separately.
+      withLegacyTaskControlDirectories(run, () => undefined);
+      removals.push({ path: central, stat });
+    }
+    if (!nested) {
+      const sibling = legacyControlSibling(run), old = fs.lstatSync(sibling, { throwIfNoEntry: false });
+      if (old && sibling !== central) {
+        if (!isTaskControlDirectoryEntry(path.dirname(sibling), path.basename(sibling))) throw new Error("Unvalidated legacy task control sibling");
+        removals.push({ path: sibling, stat: old });
+      }
+    }
+    return true;
+  };
+  const visit = (run: string, depth: number, nested: boolean): void => {
+    if (depth > 32) throw new Error("Task control removal nested depth bound exceeded");
+    add(run, nested);
+    const children = path.join(run, "nested");
+    const stat = fs.lstatSync(children, { throwIfNoEntry: false });
+    if (!stat) return;
+    if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("Unsafe nested run directory");
+    for (const entry of fs.readdirSync(children, { withFileTypes: true })) {
+      // Nested old siblings live inside the tree and go with it.
+      if (entry.isDirectory() && !entry.name.endsWith(".ctl")) visit(path.join(children, entry.name), depth + 1, true);
+    }
+  };
+  try { visit(path.resolve(directory), 0, false); return removals; }
+  catch (error) {
+    console.warn(`[pi-fabric] FABRIC_TASK_CONTROL_UNSAFE cleanup refused for ${directory}: ${String(error)}`);
+    return undefined;
+  }
 };
 /** Why safeRunTree refused a run, as a fixed category for the retention report (ids and paths removed). Report only:
  * it repeats the checks in safeRunTree's order and is not a deletion authority. */
@@ -494,7 +689,7 @@ const runTreeRefusal = (root: string, acceptPidReuse: boolean): string => {
         return "task scratch subtree is unsafe or exceeds scan bounds";
       }
       const known = stat.isFile() ? runFile(name) || name === "final-answer.json" || name === "queued-result.json"
-        : [TASK_FINAL_ANSWER_LOCK, "terminal-controls", "terminal-notices", "handoff-session", "follow-ups", "deliveries", "nested", "tmp"].includes(name);
+        : [TASK_FINAL_ANSWER_LOCK, "terminal-controls", "terminal-notices", "handoff-session", "follow-ups", "deliveries", "nested", "tmp", "durable"].includes(name);
       if (!known) return `unknown entry ${name.replace(/[0-9a-f-]{8,}/gi, "<id>")}`;
     }
   } catch { return "run tree unreadable"; }
@@ -507,7 +702,8 @@ export const canRemoveTerminalRun = (directory: string, expired: Deadline = noDe
   return !!record?.status && TERMINAL_STATUSES.has(record.status) && safeRunTree(directory, false, 0, expired, acceptPidReuse);
 };
 const safeRootContents = (root: string, childrenStopped: boolean): boolean => {
-  try { return fs.readdirSync(root).every((name) => name === RUN_ROOT_OWNER_FILE || safeRunTree(path.join(root, name), childrenStopped)); }
+  try { return fs.readdirSync(root).every((name) => name === RUN_ROOT_OWNER_FILE ||
+    (name.endsWith(".ctl") ? isPairedTaskControlEntry(root, name) : safeRunTree(path.join(root, name), childrenStopped))); }
   catch { return false; }
 };
 export const canRemoveManagedRunRoot = (root: string): boolean => {
@@ -541,6 +737,10 @@ const pruneClosedRunRoot = (
   try { entries = fs.readdirSync(root, { withFileTypes: true }); } catch { return removed; }
   for (const entry of entries) {
     if (expired()) break;
+    if (entry.name.endsWith(".ctl")) {
+      if (!isPairedTaskControlEntry(root, entry.name, expired)) countRefusal("pruneClosedRunRoot", "unsafe or unpaired task control directory", path.join(root, entry.name));
+      continue; // Paired controls are removed only with their judged run; unknown ones stay.
+    }
     if (!entry.isDirectory()) continue;
     const directory = path.join(root, entry.name);
     // Age first: a young run is kept either way, so it needs no full tree walk (smarty-dev#2010).
@@ -556,7 +756,7 @@ const pruneClosedRunRoot = (
     // The judged stat: taken after recovery, before the safety walk; the removal requires it unchanged.
     const judged = ownedStat(directory);
     if (!safeRunTree(directory, owner.childrenStopped === true, 0, expired)) { countRefusal("pruneClosedRunRoot", "run tree is not proven safe", directory); continue; }
-    if (verifiedRemove(directory, judged, { deleter: "pruneClosedRunRoot", fallback: rmTree(directory) }).removed) removed.push(directory);
+    if (removeUnreferencedRun(directory, judged, undefined, false, "pruneClosedRunRoot")) removed.push(directory);
   }
   return removed;
 };
@@ -722,6 +922,10 @@ export const sweepTempRunRoots = (options: TempRunSweepRequest & {
     try { runs = fs.readdirSync(root, { withFileTypes: true }); } catch { continue; }
     for (const run of runs) {
       if (expired()) break;
+      if (run.name.endsWith(".ctl")) {
+        if (!isPairedTaskControlEntry(root, run.name, expired)) countRefusal("sweepTempRunRoots", "unsafe or unpaired task control directory", path.join(root, run.name));
+        continue;
+      }
       if (run.name === RUN_ROOT_OWNER_FILE || !run.isDirectory()) continue;
       const directory = path.join(root, run.name);
       recoverActorRunArchives(directory, expired);
@@ -729,7 +933,7 @@ export const sweepTempRunRoots = (options: TempRunSweepRequest & {
       const judged = ownedStat(directory);
       if (!safeRunTree(directory, false, 0, expired)) { countRefusal("sweepTempRunRoots", "run tree is not proven safe", directory); continue; }
       // Reported as the root's removal once it is empty, as before.
-      verifiedRemove(directory, judged, { deleter: "sweepTempRunRoots", fallback: rmTree(directory) });
+      removeUnreferencedRun(directory, judged, undefined, false, "sweepTempRunRoots");
     }
     if (removeEmptyRunRoot(root)) result.removedRoots.push(root);
   }
@@ -1045,6 +1249,10 @@ export const pruneActorRunArchives = (options: {
   let entries: fs.Dirent[];
   try { entries = fs.readdirSync(options.runsDirectory, { withFileTypes: true }); } catch { return removed; }
   for (const entry of entries) {
+    if (entry.name.endsWith(".ctl")) {
+      if (!isPairedTaskControlEntry(options.runsDirectory, entry.name)) countRefusal("pruneActorRunArchives", "unsafe or unpaired task control directory", path.join(options.runsDirectory, entry.name));
+      continue;
+    }
     if (!entry.isDirectory()) continue;
     const directory = path.join(options.runsDirectory, entry.name);
     // Reported refusals carry their size (the CLI's report only; in-process sweeps measure nothing).
@@ -1094,8 +1302,35 @@ export const removeUnreferencedRun = (
 ): boolean => {
   const check = (): boolean => { try { return !!referenced?.(); } catch { return true; } };
   if (check()) { countRefusal(deleter, "referenced at the final check", directory, bytes); return false; }
-  return verifiedRemove(directory, judged, { deleter, ...(dryRun ? { dryRun: true } : {}), proceed: () => !check(),
+  // Validate selection even when no sibling exists: only an existing legacy
+  // record may authorize its absence; a protected run must never lose its fence.
+  // The selector itself strictly validates central; a raw selection is read-only pre-v2.
+  try { taskControlReadDirectory(directory); }
+  catch (error) {
+    console.warn(`[pi-fabric] FABRIC_TASK_CONTROL_UNSAFE cleanup refused for ${directory}: ${String(error)}`);
+    return false;
+  }
+  const controls = runControlRemovals(directory);
+  if (!controls) return false;
+  // The main run judgment/reference/identity fence runs FIRST. Deleting controls
+  // first loses a retained protected run's admission evidence when a late veto
+  // or inode change rejects its removal. Never manufacture a missing-ctl legacy
+  // fallback to compensate for that loss.
+  const removed = verifiedRemove(directory, judged, { deleter, ...(dryRun ? { dryRun: true } : {}), proceed: () => !check(),
     fallback: () => mainRemoveUnreferencedRun(directory, referenced, check) }).removed;
+  if (!removed) return false;
+  for (const control of controls) {
+    if (fs.lstatSync(control.path, { throwIfNoEntry: false }) === undefined && !dryRun) continue; // went with its tree
+    if (!verifiedRemove(control.path, control.stat, { deleter, ...(dryRun ? { dryRun: true } : {}),
+      proceed: () => !check(), fallback: rmTree(control.path) }).removed) {
+      // Partial collection: the run is already removed (and is reported as such),
+      // but control evidence stays. An unknown/orphan .ctl never gains cleanup
+      // authority on a later sweep; do not lie that the run itself was retained.
+      countRefusal(deleter, "run removed but paired task control removal incomplete", control.path);
+      console.warn(`[pi-fabric] FABRIC_TASK_CONTROL_UNSAFE partial cleanup: run removed, controls retained at ${control.path}`);
+    }
+  }
+  return true;
 };
 /** Main's path-based tombstone removal, unchanged: the non-Linux fallback only (smarty-dev#7858). */
 const mainRemoveUnreferencedRun = (directory: string, referenced: (() => boolean) | undefined, check: () => boolean): boolean => {

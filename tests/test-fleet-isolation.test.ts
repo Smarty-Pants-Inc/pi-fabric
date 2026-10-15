@@ -30,8 +30,11 @@ const fixed = { PI_FABRIC_LOCK_STATS: "0" };
 const baseline = fs.readFileSync(path.join(sentinel, "agent", "fabric.json"), "utf8");
 const module = await import(pathToFileURL(entry).href);
 // These selectors grant WRITE locations; semantic project attribution is deliberately absent.
+// Windows intentionally omits inherited PI_FABRIC_RUN_ROOT: hosts allocate a trusted root
+// themselves, and task-run-path.ts refuses nested authority before any write (#12214).
 const keys = ["PI_FABRIC_MESH_ROOT", "PI_FABRIC_PROJECT_ROOT",
-  "PI_FABRIC_RUN_ROOT", "PI_FABRIC_AGENT_DIR", "PI_CODING_AGENT_DIR", "MCPORTER_CONFIG"];
+  ...(process.platform === "win32" ? [] : ["PI_FABRIC_RUN_ROOT"]),
+  "PI_FABRIC_AGENT_DIR", "PI_CODING_AGENT_DIR", "MCPORTER_CONFIG"];
 const contained = (root, target) => {
   const relative = path.relative(root, target);
   return relative !== "" && relative !== ".." && !relative.startsWith(".." + path.sep) && !path.isAbsolute(relative);

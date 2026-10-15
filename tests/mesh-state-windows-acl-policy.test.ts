@@ -835,8 +835,9 @@ describe("state gate wiring on win32 (smarty-dev#8920)", () => {
       expect(calls).toHaveLength(2);
       expect(fs.existsSync(path.join(root, "state.db"))).toBe(true);
       (await SqliteStateStore.open(root, 1024, 16, { initialize: "detached" })).close();
-      // This seam replaces the caching reader: existing-DB admission and the open each delegate once.
-      expect(calls).toHaveLength(4);
+      // This seam replaces the caching reader: existing-DB admission, pre-create and mandatory post-create
+      // each delegate; production's stable verified identity hits the cache for the latter two.
+      expect(calls).toHaveLength(5);
     });
     expect(calls.every(call => call.root === root && call.protect === false && call.directories.length === 1)).toBe(true);
   });

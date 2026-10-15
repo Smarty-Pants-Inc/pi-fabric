@@ -139,6 +139,8 @@ export interface WindowsStateAclRequest {
   directories: string[];
   /** Set the private ACL first: only for a root this process just created. Every runner failure then refuses. */
   protect?: boolean;
+  /** Require the native snapshot to prove that state.db is present (no-create/post-create gate). */
+  requireDatabase?: boolean;
 }
 
 /** Runs the child with the request in PI_FABRIC_STATE_ACL and returns its stdout; throws when it cannot run. */
@@ -181,10 +183,11 @@ const ancestorsOf = (dir: string): string[] => {
 
 type Role = "ancestor" | "root" | "directory" | "file" | "creation-parent";
 
+type AdmissionStatus = "present" | "absent" | "invalid" | "unreadable";
 type AdmissionIdentity = {
   root?: string; db?: string; guard?: string;
-  rootStatus?: "present" | "missing" | "invalid";
-  dbStatus?: "present" | "missing" | "invalid";
+  rootStatus?: AdmissionStatus;
+  dbStatus?: AdmissionStatus;
   invalidAncestor?: string;
 };
 type RootAdmission = { plan: string; identity: AdmissionIdentity };
@@ -217,9 +220,13 @@ const admissionIdentity = (root: string, db: string, paths: Map<string, Role>): 
     const status = key === root.toLowerCase() ? "rootStatus" : key === db.toLowerCase() ? "dbStatus" : undefined;
     let stat: fs.BigIntStats | undefined;
     try { stat = fs.lstatSync(target, { bigint: true, throwIfNoEntry: false }); }
-    catch { proven = false; continue; }
+    catch {
+      if (status !== undefined) identity[status] = "unreadable";
+      proven = false;
+      continue;
+    }
     if (!stat) {
-      if (status !== undefined) identity[status] = "missing";
+      if (status !== undefined) identity[status] = "absent";
       if (role !== "file" && role !== "directory") proven = false;
       // A missing ancestor must not hide the required root/DB observations below it.
       continue;
@@ -242,6 +249,63 @@ const admissionIdentity = (root: string, db: string, paths: Map<string, Role>): 
   }
   if (proven) identity.guard = JSON.stringify(ancestors);
   return identity;
+};
+
+type NativePresence = "present" | "absent";
+type AdmissionDecision =
+  | { kind: "cache" }
+  | { kind: "fresh" }
+  | { kind: "refuse"; target: "root" | "db"; reason: string };
+
+// Matrix for the two security-critical targets. Native presence is the middle observation: an absent DB is
+// admissible only for the pre-create proof when the after observation confirms absence and no positive before
+// presence was seen. Unknown IDs and unreadable lstats remain full-proof/uncached, never a new refusal by themselves.
+const admissionDecision = (before: AdmissionIdentity, native: { root: NativePresence; db: NativePresence },
+  after: AdmissionIdentity, requireDatabase: boolean): AdmissionDecision => {
+  if (before.invalidAncestor !== undefined || after.invalidAncestor !== undefined) {
+    return { kind: "refuse", target: "root", reason: `${before.invalidAncestor ?? after.invalidAncestor} changed type while ACL was read` };
+  }
+  if (native.root === "absent") return { kind: "refuse", target: "root", reason: "the root is missing" };
+  const targets = ["root", "db"] as const;
+  for (const target of targets) {
+    const beforeStatus = before[`${target}Status`] ?? "unreadable";
+    const afterStatus = after[`${target}Status`] ?? "unreadable";
+    const beforeId = before[target];
+    const afterId = after[target];
+    if (beforeStatus === "invalid" || afterStatus === "invalid") {
+      return { kind: "refuse", target, reason: "it changed to the wrong type or a link" };
+    }
+    if (beforeId !== undefined && afterId !== undefined && beforeId !== afterId) {
+      return { kind: "refuse", target, reason: "its identity changed while ACL was read" };
+    }
+    if (target === "db" && native.db === "absent") {
+      if (beforeStatus === "present" || afterStatus !== "absent") {
+        return { kind: "refuse", target, reason: "state.db presence was not covered by the native snapshot" };
+      }
+      if (requireDatabase) {
+        return { kind: "refuse", target, reason: "the native snapshot did not prove state.db is present" };
+      }
+    } else {
+      // A positive before observation that disappears, or a positive native observation that is absent after it,
+      // is a replacement race. Conversely, a target absent before native proof may not appear without a create path.
+      if (beforeStatus === "absent" && native[target] === "present") {
+        return { kind: "refuse", target, reason: "it appeared during ACL proof without a create path" };
+      }
+      if (native[target] === "present" && afterStatus === "absent") {
+        return { kind: "refuse", target, reason: "it disappeared while ACL was read" };
+      }
+      if (beforeStatus === "present" && afterStatus === "absent") {
+        return { kind: "refuse", target, reason: "it disappeared while ACL was read" };
+      }
+      if (beforeStatus === "absent" && afterStatus === "present") {
+        return { kind: "refuse", target, reason: "it appeared while ACL was read without a create path" };
+      }
+    }
+  }
+  const cacheable = targets.every(target => before[`${target}Status`] === "present"
+    && after[`${target}Status`] === "present" && before[target] !== undefined && before[target] === after[target])
+    && native.root === "present" && native.db === "present";
+  return cacheable ? { kind: "cache" } : { kind: "fresh" };
 };
 
 /**
@@ -328,8 +392,9 @@ export const windowsStateAclRefusal = (request: WindowsStateAclRequest, run: Win
     const strict = role !== "ancestor" && role !== "creation-parent";
     const ancestorRole = role === "ancestor" || role === "creation-parent";
     if (entry.missing === true) {
-      if ((role === "file" || role === "directory")
-        && !(target.toLowerCase() === db?.toLowerCase() && before?.db !== undefined)) continue;
+      // Optional sidecars/flags may be absent. The admission matrix below separately reconciles state.db's
+      // native absence with positive before/after presence, and requires it on no-create/post-create gates.
+      if (role === "file" || role === "directory") continue;
       return `${target} vanished while its Windows ACL was read`;
     }
     if (typeof entry.error === "string") return `${target} has an unreadable Windows security descriptor (${entry.error})`;
@@ -413,28 +478,15 @@ export const windowsStateAclRefusal = (request: WindowsStateAclRequest, run: Win
   // with the descriptor read from its predecessor; unknown IDs simply leave this full read uncached.
   if (plan !== undefined && before !== undefined) {
     const after = admissionIdentity(root, db!, paths);
-    if (before.root !== undefined && (after.rootStatus === "missing" || after.rootStatus === "invalid")) {
-      return `${root} identity changed while ACL was read`;
-    }
-    if (before.db !== undefined && (after.dbStatus === "missing" || after.dbStatus === "invalid")) {
-      return `${db} identity changed while ACL was read`;
-    }
-    // Descendant lstat may still resolve through an invalid ancestor; those IDs must not bless that path.
-    if ((before.root !== undefined || before.db !== undefined)
-      && (before.invalidAncestor !== undefined || after.invalidAncestor !== undefined)) {
-      return `${before.invalidAncestor ?? after.invalidAncestor} changed type while ACL was read`;
-    }
-    if (before.root !== undefined && after.root !== undefined && before.root !== after.root) {
-      return `${root} identity changed while ACL was read`;
-    }
-    if (before.db !== undefined && after.db !== undefined && before.db !== after.db) {
-      return `${db} identity changed while ACL was read`;
-    }
-    const dbEntry: unknown = snapshot.entries[[...paths.keys()].indexOf(db!)];
-    // lstat presence cannot supply the DB's missing native descriptor (including a missing-file snapshot race).
-    const dbProven = record(dbEntry) && dbEntry.missing !== true;
-    if (dbProven && before.root !== undefined && before.db !== undefined && before.guard !== undefined
-      && after.root === before.root && after.db === before.db && after.guard === before.guard) {
+    const entries = snapshot.entries;
+    const entryAt = (target: string): unknown => entries[[...paths.keys()].indexOf(target)];
+    const nativePresence = (entry: unknown): NativePresence => record(entry) && entry.missing === true ? "absent" : "present";
+    const decision = admissionDecision(before, {
+      root: nativePresence(entryAt(root)),
+      db: nativePresence(entryAt(db!)),
+    }, after, request.requireDatabase === true);
+    if (decision.kind === "refuse") return `${decision.target === "root" ? root : db} ${decision.reason}`;
+    if (decision.kind === "cache" && before.guard !== undefined && after.guard === before.guard) {
       rootAdmissions.set(rootKey, { plan, identity: after });
       if (rootAdmissions.size > MAX_ROOT_ADMISSIONS) rootAdmissions.delete(rootAdmissions.keys().next().value!);
     }

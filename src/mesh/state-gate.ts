@@ -273,13 +273,14 @@ const fdSnapshot = (): Map<string, string> | undefined => {
  * (assertPrivateStateRoot, the create, then this gate without `create`).
  */
 export const openPrivateStateDb = (file: string, open: SqliteOpener, create?: () => void): SqliteConnection => {
-  const missingBeforeGate = process.platform === "win32"
-    && fs.lstatSync(file, { throwIfNoEntry: false }) === undefined;
-  assertPrivateStateRoot(path.dirname(file), path.basename(file));
+  // A no-create open must prove DB presence in the native snapshot immediately. A create path gets the normal
+  // pre-create allowance for confirmed absence, then the mandatory post-create proof below requires presence.
+  const requireDatabase = process.platform === "win32" && create === undefined;
+  assertPrivateStateRoot(path.dirname(file), path.basename(file), requireDatabase);
   create?.();
-  // A missing state.db was only covered by the first snapshot. Re-read the native owner/DACL after the create
-  // callback so an EEXIST winner (including a child renamed in after the snapshot) is never adopted by lstat alone.
-  if (missingBeforeGate) assertPrivateStateRoot(path.dirname(file), path.basename(file));
+  // Always rerun the normal Windows root gate after the callback. Stable known IDs hit the complete cached proof;
+  // unknown IDs and newly created DBs take a fresh native proof, so an EEXIST/planted winner is never lstat-only.
+  if (process.platform === "win32" && create !== undefined) assertPrivateStateRoot(path.dirname(file), path.basename(file), true);
   return openPinned(file, open, assertPrivateStateFiles(file));
 };
 
@@ -292,16 +293,16 @@ export const admitExistingStateRoot = (root: string): void => {
   if (process.platform !== "win32") return;
   try { if (fs.lstatSync(path.join(root, "state.db"), { throwIfNoEntry: false }) === undefined) return; }
   catch { /* Indeterminate presence is not absence: let the full native proof decide, without caching unknown IDs. */ }
-  assertPrivateStateRoot(root);
+  assertPrivateStateRoot(root, "state.db", true);
 };
 
 /** The root half of the gate: run it before creating state.db too, so a refused root gets no file (#846 SEC P2). */
-export const assertPrivateStateRoot = (root: string, db = "state.db"): void => {
+export const assertPrivateStateRoot = (root: string, db = "state.db", requireDatabase = false): void => {
   const refusal = filesystemRefusal(root);
   if (refusal) throw new MeshStateUnsupportedError(`Fabric mesh SQLite state needs a local filesystem: ${refusal}`);
   assertPrivateAncestors(root);
   checkPrivatePath(root, "directory");
-  if (process.platform === "win32") assertWindowsAcl(root, stateTargets(root, db), false);
+  if (process.platform === "win32") assertWindowsAcl(root, { ...stateTargets(root, db), requireDatabase }, false);
 };
 
 /**
@@ -359,7 +360,7 @@ const stateTargets = (root: string, db: string) => {
 // Missing/unknown DB identity and unverified tooling fallbacks never cache; standalone target, creation-parent and
 // protect requests stay fresh. A missing DB still gets full pre/post-create proofs. Creating N missing directories
 // first costs N creation-parent preflights plus the root's protect/readback; those cannot satisfy the open's plan.
-type AclTargets = { role?: "root" | "directory" | "file" | "ancestor" | "creation-parent"; files: string[]; directories: string[] };
+type AclTargets = { role?: "root" | "directory" | "file" | "ancestor" | "creation-parent"; files: string[]; directories: string[]; requireDatabase?: boolean };
 const assertWindowsAcl = (root: string, targets: AclTargets, protect: boolean): void => {
   let real: string;
   // The real chain is the parent's: the target itself is never followed (a reparse point is refused as such).

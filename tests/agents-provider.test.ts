@@ -3236,7 +3236,7 @@ describe("AgentsProvider runner support", () => {
       invocationContext,
     ) as { id: string; cwd: string };
     expect(handle.cwd).toBe(canonical);
-    expect(updates.some((message) => message.endsWith(`cwd ${canonical}`))).toBe(true);
+    expect(updates.some((message) => message.endsWith(`cwd ${canonical} · model unverified`))).toBe(true);
     await provider.invoke("wait", { id: handle.id }, invocationContext);
     await provider.invoke("cleanup", { id: handle.id }, invocationContext);
   });
@@ -3273,7 +3273,7 @@ describe("AgentsProvider runner support", () => {
       invocationContext,
     ) as { id: string; cwd: string };
     expect(handle.cwd).toBe(canonical);
-    expect(updates.some((message) => message.endsWith(`cwd ${shown}`))).toBe(true);
+    expect(updates.some((message) => message.endsWith(`cwd ${shown} · model unverified`))).toBe(true);
     expect(updates.every((message) => !/[\u0000-\u001f\u007f]/.test(message))).toBe(true);
     expect(updates.every((message) => message.length < 512)).toBe(true);
     await provider.invoke("wait", { id: handle.id }, invocationContext);

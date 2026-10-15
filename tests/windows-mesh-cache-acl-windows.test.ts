@@ -1,8 +1,8 @@
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
+import { windowsMeshCacheFixture } from "./windows-mesh-cache-fixture.js";
 import { windowsHelperBootstrap } from "../src/storage/verified-remove.js";
 import { forgetWindowsMeshCapability, prepareWindowsMeshCapability, windowsMeshReleaseTestHooks } from "../src/storage/windows-mesh-release.js";
 
@@ -73,22 +73,18 @@ const trustedOnly = (acl: Acl): void => {
 };
 const setup = (): { fixture: string; local: string } => {
   expect(windowsHelperBootstrap(), "hosted build must supply digest-pinned bootstrap").toBeDefined();
-  const fixture = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "fmacl-")));
+  const fixture = windowsMeshCacheFixture("fmacl-");
   fixtures.push(fixture);
   const local = path.join(fixture, "profile");
   fs.mkdirSync(local);
   broadParent(local);
-  const effectiveTemp = path.join(fixture, "effective-temp");
-  fs.mkdirSync(effectiveTemp);
-  vi.stubEnv("TEMP", effectiveTemp);
-  vi.stubEnv("TMP", effectiveTemp);
-  vi.stubEnv("LOCALAPPDATA", local);
+  // Isolate ACL poisoning below the actual profile, without relabeling runner temp or overriding LOCALAPPDATA.
+  windowsMeshReleaseTestHooks.cacheRoot = path.join(local, "pi-fabric");
   return { fixture, local };
 };
 afterEach(() => {
   forgetWindowsMeshCapability();
   for (const key of Object.keys(windowsMeshReleaseTestHooks)) delete (windowsMeshReleaseTestHooks as Record<string, unknown>)[key];
-  vi.unstubAllEnvs();
   for (const dir of fixtures.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
 });
 
@@ -215,10 +211,21 @@ describe.skipIf(!hosted)("PR1191 private cache creation and real ACL readback (h
     trustedOnly(readAcl(capability.absolutePath));
   }, 60_000);
 
-  it.each(["production-chain-two", "explicit-chain-one"] as const)("%s: broad inheritance never enters a new cache or its staged/published executable", kind => {
+  it.each(["profile-chain-two", "explicit-chain-one"] as const)("%s: broad inheritance never enters a new cache or its staged/published executable", kind => {
     const { local } = setup();
     expect(readAcl(local).aces.some(ace => ace.sid === "S-1-5-32-545" && ace.allow && ace.inheritance !== 0 && (ace.propagation & 2) !== 0)).toBe(true);
-    if (kind === "explicit-chain-one") windowsMeshReleaseTestHooks.cacheRoot = path.join(local, "test-cache");
+    const base = kind === "profile-chain-two" ? path.join(local, "pi-fabric", "native") : path.join(local, "test-cache");
+    const chain = kind === "profile-chain-two" ? [path.dirname(base), base] : [base];
+    if (kind === "profile-chain-two") {
+      // Exercise the same trusted two-component native creation as production, only inside our ACL fixture.
+      // The separate default-path regression uses actual LOCALAPPDATA without any cacheRoot hook.
+      const created = spawnSync(windowsHelperBootstrap()!.file, ["--cache-create-v1", ...chain.map(file => path.toNamespacedPath(file))], {
+        encoding: "utf8", timeout: 10_000, windowsHide: true,
+      });
+      expect(created.error).toBeUndefined();
+      expect(created.status, created.stdout).toBe(0);
+    }
+    windowsMeshReleaseTestHooks.cacheRoot = base;
     let staged = 0;
     windowsMeshReleaseTestHooks.afterCacheStaged = staging => {
       staged++;
@@ -227,8 +234,6 @@ describe.skipIf(!hosted)("PR1191 private cache creation and real ACL readback (h
     };
     const capability = prepareWindowsMeshCapability();
     expect(staged).toBe(1);
-    const base = kind === "production-chain-two" ? path.join(local, "pi-fabric", "native") : windowsMeshReleaseTestHooks.cacheRoot!;
-    const chain = kind === "production-chain-two" ? [path.dirname(base), base] : [base];
     for (const component of chain) {
       const acl = readAcl(component);
       expect(acl.protected).toBe(true);

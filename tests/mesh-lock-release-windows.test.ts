@@ -6,6 +6,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { windowsMeshCacheFixture } from "./windows-mesh-cache-fixture.js";
 import { windowsHelperBootstrap } from "../src/storage/verified-remove.js";
 import {
   encodeMeshRetireRequest, forgetWindowsMeshCapability, meshRetirementName, prepareWindowsMeshCapability, releaseWindowsMeshLock,
@@ -24,6 +25,12 @@ const SKIP = "skip reason: real NTFS handle rename/sharing and the digest-pinned
 const dirs: string[] = [];
 const tempDir = (): string => {
   const dir = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "fmr-")));
+  dirs.push(dir);
+  return dir;
+};
+// Only caches live under the actual profile; locks, checkpoints and copied packages stay in TMPDIR.
+const cacheDir = (): string => {
+  const dir = windowsMeshCacheFixture("fmr-");
   dirs.push(dir);
   return dir;
 };
@@ -123,7 +130,7 @@ describe.skipIf(!hosted)(`Windows mesh release primitive, hosted (smarty-dev#956
     root = tempDir();
     samples = [];
     forgetWindowsMeshCapability();
-    windowsMeshReleaseTestHooks.cacheRoot = path.join(tempDir(), "cache");
+    windowsMeshReleaseTestHooks.cacheRoot = path.join(cacheDir(), "cache");
     windowsMeshReleaseTestHooks.afterChild = sample => { samples.push(sample); };
     capability = prepareWindowsMeshCapability();
   });
@@ -413,7 +420,7 @@ describe.skipIf(!hosted)(`Windows mesh release primitive, hosted (smarty-dev#956
     fs.mkdirSync(path.join(dist, "native"), { recursive: true });
     fs.writeFileSync(path.join(dist, "native", "fabric-win-remove.exe"), boot.bytes);
     windowsMeshReleaseTestHooks.bootstrapCandidates = [path.join(dist, "native", "fabric-win-remove.exe")];
-    windowsMeshReleaseTestHooks.cacheRoot = path.join(tempDir(), "cache");
+    windowsMeshReleaseTestHooks.cacheRoot = path.join(cacheDir(), "cache");
     const held = prepareWindowsMeshCapability();
     const a = record("a");
     const lock = acquire(root, a);
@@ -441,7 +448,7 @@ describe.skipIf(!hosted)(`Windows mesh release primitive, hosted (smarty-dev#956
   it("T5 extension: kill a plain Node parent after actual closed staging and BEFORE publication; next prepare ignores it", async () => {
     forgetWindowsMeshCapability();
     const boot = windowsHelperBootstrap()!;
-    const cache = fs.realpathSync.native(tempDir());
+    const cache = cacheDir();
     const gate = tempDir();
     const stagedMarker = path.join(gate, "staged.json");
     const module = nodeFixtureModule(boot.digest);
@@ -484,7 +491,7 @@ describe.skipIf(!hosted)(`Windows mesh release primitive, hosted (smarty-dev#956
   it("T5 extension: two actual publisher children race, both join, exactly one wins without replacing any digest", async () => {
     forgetWindowsMeshCapability();
     const boot = windowsHelperBootstrap()!;
-    const cache = fs.realpathSync.native(tempDir());
+    const cache = cacheDir();
     windowsMeshReleaseTestHooks.cacheRoot = cache;
     const old = path.join(cache, "0".repeat(64));
     fs.mkdirSync(old);
@@ -524,7 +531,7 @@ describe.skipIf(!hosted)(`Windows mesh release primitive, hosted (smarty-dev#956
   it("T5: a tampered published digest is refused, never overwritten", () => {
     forgetWindowsMeshCapability();
     const boot = windowsHelperBootstrap()!;
-    const cache = fs.realpathSync.native(tempDir());
+    const cache = cacheDir();
     windowsMeshReleaseTestHooks.cacheRoot = cache;
     fs.mkdirSync(path.join(cache, boot.digest));
     fs.writeFileSync(path.join(cache, boot.digest, "fabric-win-remove.exe"), "tampered");

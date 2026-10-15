@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { windowsMeshCacheFixture } from "./windows-mesh-cache-fixture.js";
 import { MeshLock } from "../src/mesh/mesh-lock.js";
 import { MeshStore } from "../src/mesh/store.js";
 import { acquireMeshCustodyLock, withMeshCustody } from "../src/mesh/custody-lock.js";
@@ -146,8 +147,8 @@ describe.skipIf(!hostedWindows)(`Windows public lock release (#9569; ${HOSTED_ON
   let samples: WindowsMeshReleaseChildSample[];
 
   beforeAll(() => {
-    // Same real cache preparation as the native suite; never install/compile a helper or use the user's cache.
-    cacheFixture = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "fwc-")));
+    // Same real profile ancestry as production, but a uniquely test-owned cache, never the default retained cache.
+    cacheFixture = windowsMeshCacheFixture("fwc-");
     forgetWindowsMeshCapability();
     windowsMeshReleaseTestHooks.cacheRoot = path.join(cacheFixture, "cache");
     capability = prepareWindowsMeshCapability();

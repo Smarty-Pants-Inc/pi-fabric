@@ -74,7 +74,9 @@ it.each(["custody.lock", ".lock"])("initializes under a live foreign %s timeout 
   const exited = once(holder, "exit");
   void exited.catch(() => undefined);
   const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-  const custody = vi.spyOn(custodyLocks, "acquireMeshCustodyLock");
+  // Observe the handle acquired by runtime activation; the legacy release-function
+  // wrapper is no longer on that path after the shared-finalizer migration (#1191).
+  const custody = vi.spyOn(custodyLocks, "acquireMeshCustodyHandle");
   const attachDrain = vi.spyOn(MainAgentController.prototype, "attachFollowUpDrain");
   let released = false;
   try {
@@ -148,7 +150,7 @@ it.each(["dual", "own"])("keeps lineage and every inbox pending under foreign cu
   const holder = spawn(process.execPath, ["-e", holderSource, f.meshRoot, "custody.lock"], { stdio: ["pipe", "pipe", "pipe"] });
   const exited = once(holder, "exit");
   void exited.catch(() => undefined);
-  const custody = vi.spyOn(custodyLocks, "acquireMeshCustodyLock");
+  const custody = vi.spyOn(custodyLocks, "acquireMeshCustodyHandle");
   const originalResume = ParticipantDirectory.prototype.resumeLineage;
   let firstResume = true;
   const resume = vi.spyOn(ParticipantDirectory.prototype, "resumeLineage").mockImplementation(async function (this: ParticipantDirectory) {
@@ -257,8 +259,18 @@ it("fences inbox reads and wakes before initialization and after shutdown", asyn
 it("still rejects non-contention inbox activation errors", async () => {
   const f = fixture();
   try {
-    vi.spyOn(custodyLocks, "acquireMeshCustodyLock").mockRejectedValueOnce(new Error("inbox storage failure"));
-    await expect(f.runtime.initialize(f.context, f.config)).rejects.toThrow("inbox storage failure");
+    const error = new Error("inbox storage failure");
+    const custody = vi.spyOn(custodyLocks, "acquireMeshCustodyHandle").mockRejectedValueOnce(error);
+    const resume = vi.spyOn(ParticipantDirectory.prototype, "resumeLineage");
+    const start = vi.spyOn(RootInbox.prototype, "start");
+    const attachDrain = vi.spyOn(MainAgentController.prototype, "attachFollowUpDrain");
+    // Acquisition failed before entry: preserve the primary error and leave every
+    // receiver closed, rather than treating a permanent refusal as contention.
+    await expect(f.runtime.initialize(f.context, f.config)).rejects.toBe(error);
+    expect(custody).toHaveBeenCalledExactlyOnceWith(f.meshRoot);
+    expect(resume).not.toHaveBeenCalled();
+    expect(start).not.toHaveBeenCalled();
+    expect(attachDrain).not.toHaveBeenCalled();
     expect(f.notify).not.toHaveBeenCalled();
   } finally { await f.cleanup(); }
 });

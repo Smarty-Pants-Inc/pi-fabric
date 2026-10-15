@@ -1471,6 +1471,7 @@ describe("round 6 registered fabric_exec post-completion deadlines", { timeout: 
         vi.restoreAllMocks(); vi.mocked(childProcess.spawn).mockReset();
         const reconcile = await registeredExecution(state, main, 5_000, engine);
         const reconciled = await reconcile(`return {"status": await agents.actorStatus(id="${decision.id}"), "stop": await agents.stop(id="${decision.id}")}`);
+        // Preserve the actual fresh-invocation error on hosted-only failures (#1191); a boolean hides its cause.
         expect(reconciled.isError, visibleText(reconciled)).not.toBe(true);
         expect(JSON.parse(visibleText(reconciled))).toMatchObject({ status: { id: decision.id }, stop: { id: decision.id, status: "stopped" } });
         await waitFor(() => state.participants.get(decision.id)?.status === "stopped");

@@ -263,7 +263,7 @@ describe("actor context overflow (smarty-dev#3238, offline Pi child)", () => {
       text: "security: no verdict (context overflow) for PR Smarty-Pants-Inc/smarty-dev#3238.",
       data: {
         actorId: actor.id, actorName: "security", reason: "no verdict (context overflow)",
-        error: "Context exceeds window: estimated 272511 input tokens, window 272000",
+        error: "context-overflow",
         eventRef: { source: "mesh:github.smarty-dev", topic: "github.smarty-dev", kind: "github.webhook",
           repository: "Smarty-Pants-Inc/smarty-dev", pr: 3238, ref: "https://github.com/Smarty-Pants-Inc/smarty-dev/pull/3238" },
       },
@@ -293,6 +293,56 @@ describe("actor context overflow (smarty-dev#3238, offline Pi child)", () => {
     await waitFor(() => s.actors.status(actor.id).activationBlocked === undefined);
     expect(s.actors.messages(actor.id, 50).at(-1)).toMatchObject({ direction: "out", text: "verdict: ok" });
     expect(s.overflowEvents()).toHaveLength(1);
+  }, TEST_GUARD_MS);
+
+  // Keep reason: trust boundary, smarty-dev#12512 — real typed overflow diagnostics stay local.
+  it("12512 payload allowlist: typed overflow keeps diagnostics out of mesh output and Main", async () => {
+    const s = setup();
+    const actor = await s.create("private-overflow");
+    const posix = "/private/12512-overflow/owner-record.json";
+    const windows = String.raw`C:\Users\Synthetic\12512-overflow\owner-record.json`;
+    const secret = "synthetic-private-token-12512-overflow";
+    const raw = `Context exceeds window: ${posix}; ${windows}; ${secret}`;
+    const run = s.agents.run.bind(s.agents);
+    vi.spyOn(s.agents, "run").mockImplementation(async (...args: Parameters<AgentManager["run"]>) => {
+      const result = await run(...args);
+      if (result.status === "failed") {
+        // Decorate only an actual worker-typed overflow, never an ordinary quoted error.
+        expect(result.errorCode).toBe("CONTEXT_OVERFLOW");
+        result.error = raw;
+      }
+      s.results.push(result);
+      return result;
+    });
+    await expect(s.actors.ask(actor.id, "OVERFLOW_ALWAYS", { pr: 12512, repository: "synthetic/review" }))
+      .rejects.toThrow(raw);
+    await waitFor(() => s.actors.inFlightCount() === 0 && s.overflowEvents().length === 1 && s.ownerAlarms().length === 1);
+    expect(s.results).toEqual([expect.objectContaining({ status: "failed", errorCode: "CONTEXT_OVERFLOW", error: raw })]);
+    expect(s.alarms).toHaveLength(1);
+    const visible = JSON.stringify({ output: s.overflowEvents(), owner: s.ownerAlarms(), main: s.alarms });
+    for (const value of [posix, windows, secret, actor.sessionFile!, actor.logDir!]) {
+      expect(visible).not.toContain(JSON.stringify(value).slice(1, -1));
+    }
+    expect(s.overflowEvents()[0]).toMatchObject({
+      topic: "fabric.actor.output", kind: ACTOR_ACTIVATION_OVERFLOW_KIND,
+      from: { id: actor.id, kind: "actor" }, text: expect.stringContaining("no verdict (context overflow)"),
+      data: { actorId: actor.id, reason: "no verdict (context overflow)", error: "context-overflow",
+        runId: s.results[0]!.id, eventRef: { source: "direct", pr: 12512, repository: "synthetic/review" } },
+    });
+    expect(s.ownerAlarms()[0]).toMatchObject({
+      from: { id: "owner" }, to: actor.rootId, data: { actorId: actor.id, reason: "context_window" },
+    });
+    expect(s.alarms[0]).toMatchObject({
+      delivery: "followUp", triggerTurn: true, actor: { id: actor.id }, message: { source: "fabric-host", actorId: actor.id },
+    });
+    expect(s.alarms[0]!.message.text).toContain("agents.actorStatus");
+    expect(s.alarms[0]!.message.text).toContain("agents.log");
+    // Other overflow history is outside this named payload projection and remains diagnostic.
+    expect(s.actors.messages(actor.id, 50).some(message => message.error === raw)).toBe(true);
+    expect(s.prompts()).toHaveLength(1);
+    await expect(s.actors.ask(actor.id, "NEXT_REVIEW")).resolves.toMatchObject({ text: "verdict: ok" });
+    expect(s.overflowEvents()).toHaveLength(1);
+    expect(s.alarms).toHaveLength(1);
   }, TEST_GUARD_MS);
 
   it("retries a carried overflow only once: a fresh-session overflow then fails explicitly", async () => {

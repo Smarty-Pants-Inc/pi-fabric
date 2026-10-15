@@ -2,8 +2,12 @@ import fs from "node:fs";
 import path from "node:path";
 import type { Consumer, ConsumerAPI, ConsumerInfo, Consumers } from "@nats-io/jetstream";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { importMeshStateToNats } from "../src/mesh/backend-migration-nats.js";
-import { closeNatsStateBackend, MeshStateNatsUnavailableError, natsStreamName, openNatsStateBackend, type JetStreamPort } from "../src/mesh/state-backend-nats.js";
+import { MeshLockTimeoutError } from "../src/core/atomic-write.js";
+import { importMeshStateToNats, rollbackMeshStateFromNats } from "../src/mesh/backend-migration-nats.js";
+import { meshSnapshotDigest } from "../src/mesh/backend-migration.js";
+import { decodeMeshStateFile } from "../src/mesh/state-file.js";
+import { readMeshStateNatsMarker } from "../src/mesh/backend-fence.js";
+import { closeNatsStateBackend, MeshStateNatsUnavailableError, natsStreamName, natsSwitchStreamName, openNatsStateBackend, preparedNatsStateBackend, type JetStreamPort } from "../src/mesh/state-backend-nats.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { startNatsElectionCluster, stopNatsElectionCluster, type NatsElectionCluster } from "./helpers/nats-election-cluster.js";
 
@@ -267,6 +271,128 @@ describe("real three-node NATS metadata-leader election", () => {
     }
   }, 90_000);
 
+  it.skipIf(!binary)("refuses a returning-peer open while a real rollback holds custody and the mesh fence", async () => {
+    const cluster = await startNatsElectionCluster(binary!);
+    clusters.push(cluster); // Existing afterEach awaits owned child exits and logs the cluster cleanup receipt.
+    const root = path.join(cluster.root, "rollback-peer-return");
+    const options = { servers: [cluster.seedUrl], monitoringUrl: cluster.seedMonitorUrl, replicas: 3 };
+    type Outcome<T> = { status: "fulfilled"; value: T } | { status: "rejected"; error: unknown };
+    type RollbackResult = Awaited<ReturnType<typeof rollbackMeshStateFromNats>>;
+    const settle = <T,>(promise: Promise<T>): Promise<Outcome<T>> => promise.then(
+      value => ({ status: "fulfilled" as const, value }), (error: unknown) => ({ status: "rejected" as const, error }));
+    let signalRetire!: () => void;
+    let releaseRetire!: () => void;
+    const retireEntered = new Promise<void>(resolve => { signalRetire = resolve; });
+    const retireReleased = new Promise<void>(resolve => { releaseRetire = resolve; });
+    let released = false;
+    const release = () => { released = true; releaseRetire(); };
+    let peer: NatsElectionCluster["nodes"][number] | undefined;
+    let peerPaused = false;
+    const resume = () => {
+      if (!peerPaused) return true;
+      const sent = peer!.child.kill("SIGCONT");
+      if (sent) peerPaused = false;
+      return sent;
+    };
+    let raw: JetStreamPort | undefined;
+    let rollback: Promise<Outcome<RollbackResult>> | undefined;
+    let opened: Awaited<ReturnType<typeof openNatsStateBackend>> | undefined;
+    try {
+      const store = new MeshStore(root, 64 * 1024, 1_000, { stateBackend: "file" });
+      try { await store.put({ key: "election/rollback-seed", value: { durable: true }, identity }); }
+      finally { store.closeState(); }
+      const imported = await importMeshStateToNats(root, options);
+      const switchId = imported.stream.slice(natsStreamName(root).length + 1);
+      expect(imported).toMatchObject({ stream: natsSwitchStreamName(root, switchId), entries: 1, converged: false });
+      expect(readMeshStateNatsMarker(root)).toMatchObject({ natsStream: imported.stream, epoch: 1 });
+      expect(preparedNatsStateBackend(root)).toBeUndefined();
+      const statePath = path.join(root, "state.json");
+      const marker = fs.readFileSync(statePath, "utf8");
+      const info = await streamInfo(cluster.seedUrl, imported.stream);
+      expect(info.config.num_replicas).toBe(3);
+      expect(info.cluster?.leader).toBeTypeOf("string");
+      // Keep the stream leader and seed live: the owned stopped follower is the returning open's endpoint.
+      peer = cluster.nodes.find(node => node.clientUrl !== cluster.seedUrl
+        && node.name !== info.cluster?.leader && node.metaId !== info.cluster?.leader);
+      expect(peer, "map an actual non-seed, non-stream-leader peer to an owned child").toBeDefined();
+      expect(peer!.child.exitCode).toBeNull();
+      expect(peer!.child.signalCode).toBeNull();
+      const { connectJetStream } = await import("../src/mesh/state-backend-nats-client.js");
+      raw = await connectJetStream(options.servers, { monitoringUrl: options.monitoringUrl, replicas: 3 });
+      peerPaused = peer!.child.kill("SIGSTOP");
+      expect(peerPaused, "owned non-seed peer SIGSTOP").toBe(true);
+      let expectedHead: number | undefined;
+      let retireCalls = 0;
+      let rollbackSettled = false;
+      const port: JetStreamPort = { ...raw, publish: async (subject, data, publishOptions) => {
+        if ((JSON.parse(Buffer.from(data).toString("utf8")) as { type?: string }).type === "retire") {
+          expectedHead = publishOptions.expectLastSequence;
+          retireCalls++;
+          signalRetire();
+          await retireReleased; // Real rollback has both locks and its CAS head; no server API is faked.
+        }
+        return raw!.publish(subject, data, publishOptions);
+      } };
+      rollback = settle(rollbackMeshStateFromNats(root, { port, replicas: 3 })).then(outcome => { rollbackSettled = true; return outcome; });
+      expect(await Promise.race([retireEntered.then(() => "retire"), rollback.then(() => "rollback-settled")])).toBe("retire");
+      expect(expectedHead).toBe(info.state.last_seq);
+      expect(retireCalls).toBe(1);
+      expect(fs.readFileSync(statePath, "utf8")).toBe(marker);
+      const lockPaths = ["custody.lock", ".lock"].map(name => path.join(root, name, "owner"));
+      const owners = lockPaths.map(file => fs.readFileSync(file, "utf8"));
+      for (const owner of owners) expect(owner.split("\n")[1]).toBe(String(process.pid));
+      expect(resume(), "owned returning peer SIGCONT before open").toBe(true);
+      const open = await settle(openNatsStateBackend({ root, servers: [peer!.clientUrl], monitoringUrl: peer!.monitorUrl,
+        replicas: 3 }));
+      const held = { released, rollbackSettled, registered: preparedNatsStateBackend(root) !== undefined,
+        markerUnchanged: fs.readFileSync(statePath, "utf8") === marker,
+        ownersUnchanged: lockPaths.every((file, index) => fs.readFileSync(file, "utf8") === owners[index]) };
+      // Counterexample on d5: commit an actual record before releasing retire, invalidating rollback's captured CAS.
+      const write = open.status === "fulfilled" ? await settle((opened = open.value).put({
+        key: "election/racing-open", value: { committedBeforeRetire: true }, identity })) : undefined;
+      const headBeforeRelease = await raw.lastSequence(imported.stream);
+      release();
+      const back = await rollback;
+      const converged = back.status === "fulfilled"
+        ? await settle(rollbackMeshStateFromNats(root, { port: raw, replicas: 3, switchId })) : undefined;
+      const busy = open.status === "rejected" && open.error instanceof MeshLockTimeoutError;
+      const rollbackConverged = converged?.status === "fulfilled" && converged.value.converged;
+      console.log(`NATS_ROLLBACK_PEER_RETURN ${JSON.stringify({ busy, rollbackConverged, peer: peer!.name,
+        stream: imported.stream, expectedHead, headBeforeRelease, held, open: open.status, write: write?.status,
+        rollback: back.status, rollbackError: back.status === "rejected" ? String(back.error) : undefined })}`);
+      if (open.status === "fulfilled") {
+        expect(write?.status, "broken open must commit the real CAS counterexample").toBe("fulfilled");
+        expect(headBeforeRelease).toBe(expectedHead! + 1);
+        expect(back.status, "the real intervening write must defeat retire's captured-head CAS").toBe("rejected");
+        if (back.status === "rejected") expect(String(back.error)).toMatch(/stream moved during the migration/);
+      }
+      expect(held).toEqual({ released: false, rollbackSettled: false, registered: false, markerUnchanged: true, ownersUnchanged: true });
+      expect(open.status).toBe("rejected");
+      if (open.status === "rejected") {
+        expect(open.error).toBeInstanceOf(MeshLockTimeoutError);
+        expect(String(open.error)).toMatch(/custody lock/); // Not an unrelated projector/catch-up timeout.
+      }
+      expect(busy).toBe(true);
+      expect(headBeforeRelease).toBe(expectedHead);
+      expect(back).toMatchObject({ status: "fulfilled", value: { stream: imported.stream, epoch: 2, digest: imported.digest, converged: false } });
+      expect(converged).toMatchObject({ status: "fulfilled", value: { stream: imported.stream, epoch: 2, digest: imported.digest, converged: true } });
+      expect(rollbackConverged).toBe(true);
+      expect(readMeshStateNatsMarker(root)).toBeUndefined();
+      expect(meshSnapshotDigest(decodeMeshStateFile(statePath, 64 * 1024 * 1024, false))).toBe(imported.digest);
+    } finally {
+      try { resume(); }
+      finally {
+        release();
+        try { await rollback; }
+        finally {
+          opened?.close();
+          closeNatsStateBackend(root);
+          await raw?.close();
+        }
+      }
+    }
+  }, 90_000);
+
   it.skipIf(!binary)("bounds unavailable R3 placement and recovers migrations and new-root opens when the peer returns", async () => {
     const cluster = await startNatsElectionCluster(binary!);
     clusters.push(cluster);
@@ -277,7 +403,24 @@ describe("real three-node NATS metadata-leader election", () => {
     const faultRoots = Array.from({ length: 5 }, (_, index) => path.join(cluster.root, `fault-open-${index + 1}`));
     const migrationRoot = path.join(cluster.root, "fault-migration");
     const unavailableRoot = path.join(cluster.root, "placement-unavailable");
-    const ownStreams = new Set([root, ...faultRoots, migrationRoot, unavailableRoot].map(natsStreamName));
+    const ownStreams = new Set([root, ...faultRoots].map(natsStreamName));
+    const migrationStreams = new Map<string, string>();
+    const trackMigration = (rootPath: string) => (step: string) => {
+      if (step !== "nats-intent") return;
+      // The durable intent precedes stream creation: register this exact root-bound switch before any CREATE sample.
+      const intent = JSON.parse(fs.readFileSync(path.join(rootPath, "state.json.nats-intent"), "utf8")) as { switchId: string; stream: string };
+      expect(intent.switchId).toMatch(/^[0-9a-f]{32}$/);
+      const stream = natsSwitchStreamName(rootPath, intent.switchId);
+      expect(intent.stream).toBe(stream);
+      migrationStreams.set(rootPath, stream);
+      ownStreams.add(stream);
+    };
+    const migratedStream = (rootPath: string): string => {
+      const stream = migrationStreams.get(rootPath);
+      expect(stream, `missing validated import intent for ${rootPath}`).toBeDefined();
+      expect(readMeshStateNatsMarker(rootPath)).toMatchObject({ natsStream: stream, epoch: 1 });
+      return stream!;
+    };
     const [{ connect }, { jetstreamManager }] = await Promise.all([import("@nats-io/transport-node"), import("@nats-io/jetstream")]);
     const successfulCreates: { stream: string; ms: number; healthy: boolean }[] = [];
     const qualifiedOpens: string[] = [];
@@ -414,30 +557,33 @@ describe("real three-node NATS metadata-leader election", () => {
       // See upstream jetstream_cluster.go:8193 and :8313-8325 and TestJetStreamClusterCreateR3StreamWithOfflineNodes.
       const placementTimeoutMs = 30_000;
       const startedAt = Date.now();
-      const placement = await importMeshStateToNats(unavailableRoot, { ...migrationOptions!, placementTimeoutMs }).then(
+      const placement = await importMeshStateToNats(unavailableRoot, { ...migrationOptions!, placementTimeoutMs, onStep: trackMigration(unavailableRoot) }).then(
         value => ({ kind: "success-r3" as const, value }), error => ({ kind: "unavailable" as const, error }));
       const elapsedMs = Date.now() - startedAt;
       console.log(`NATS_PLACEMENT_OUTCOME ${JSON.stringify({ branch: placement.kind, placementTimeoutMs, elapsedMs })}`);
       expect(elapsedMs).toBeLessThan(placementTimeoutMs + 2_000);
       expect(resumedAt, "placement must settle before the safety SIGCONT").toBe(0);
+      const placementStream = migrationStreams.get(unavailableRoot);
+      expect(placementStream, "placement must name its exact root-bound switch in the intent").toBeDefined();
       if (placement.kind === "unavailable") {
         expect(placement.error).toBeInstanceOf(MeshStateNatsUnavailableError);
         expect(placement.error).toMatchObject({ code: "FABRIC_MESH_STATE_NATS_UNAVAILABLE", reason: "placement-unavailable", natsErrCode: 10005 });
         expect(elapsedMs).toBeGreaterThanOrEqual(placementTimeoutMs);
         // A late CREATE or post-create leader-wait expiry may leave a stream; it must still be R3.
-        if (await raw!.streamExists(natsStreamName(unavailableRoot))) {
-          expect(await streamReplicas(cluster.seedUrl, natsStreamName(unavailableRoot))).toBe(3);
+        if (await raw!.streamInfo(placementStream!)) {
+          expect(await streamReplicas(cluster.seedUrl, placementStream!)).toBe(3);
         }
       } else {
+        expect(placement.value).toMatchObject({ stream: migratedStream(unavailableRoot), entries: 1, converged: false });
         expect(await streamReplicas(cluster.seedUrl, placement.value.stream)).toBe(3);
         const duringPause = await openNatsStateBackend({ root: unavailableRoot, ...migrationOptions! });
-        qualifiedOpens.push(natsStreamName(unavailableRoot));
+        qualifiedOpens.push(placement.value.stream);
         try { await duringPause.put({ key: "election/during-pause", value: { durable: true }, identity }); }
         finally { closeNatsStateBackend(unavailableRoot); }
         expect(resumedAt, "the R3 write must commit before SIGCONT").toBe(0);
       }
       // Counterexample: a normal peer restart within the default 30s budget must recover at R3.
-      migrationsPromise = Promise.allSettled([importMeshStateToNats(migrationRoot, migrationOptions!)]);
+      migrationsPromise = Promise.allSettled([importMeshStateToNats(migrationRoot, { ...migrationOptions!, onStep: trackMigration(migrationRoot) })]);
       opensPromise = Promise.allSettled(faultRoots.map(rootPath => openNatsStateBackend({ root: rootPath, ...migrationOptions })));
       await sleep(250);
       resumeNow?.();
@@ -451,7 +597,7 @@ describe("real three-node NATS metadata-leader election", () => {
           return info.cluster?.leader === leader!.name || info.cluster?.replicas?.some(peer => peer.name === leader!.name && peer.current) === true;
         }, { timeout: 10_000, interval: 100 }).toBe(true);
         const caughtUp = await openNatsStateBackend({ root: unavailableRoot, servers: [leader.clientUrl], monitoringUrl: leader.monitorUrl, replicas: 3 });
-        qualifiedOpens.push(natsStreamName(unavailableRoot));
+        qualifiedOpens.push(placement.value.stream);
         try { expect(caughtUp.get("election/during-pause")?.value).toEqual({ durable: true }); }
         finally { closeNatsStateBackend(unavailableRoot); }
       }
@@ -463,21 +609,22 @@ describe("real three-node NATS metadata-leader election", () => {
       expect(readResults.map(result => result.status), `all direct reads must work during the bounded election: ${JSON.stringify(details(readResults))}`).toEqual(["fulfilled", "fulfilled", "fulfilled"]);
       expect(migrations.map(result => result.status), `new-root R3 migration must recover when placement returns within budget: ${JSON.stringify(details(migrations))}`).toEqual(["fulfilled"]);
       const fresh = migrations[0]!.status === "fulfilled" ? migrations[0]!.value : undefined;
-      expect(fresh, `new-root migration failed: ${JSON.stringify(migrations[0])}`).toMatchObject({ stream: natsStreamName(migrationRoot), entries: 1 });
+      const freshStream = migratedStream(migrationRoot);
+      expect(fresh, `new-root migration failed: ${JSON.stringify(migrations[0])}`).toMatchObject({ stream: freshStream, entries: 1, converged: false });
       const replicas = await streamReplicas(cluster.seedUrl, fresh!.stream);
       expect(replicas).toBe(3);
       expect(await Promise.all(faultRoots.map(rootPath => streamReplicas(cluster.seedUrl, natsStreamName(rootPath))))).toEqual([3, 3, 3, 3, 3]);
       expect(openResults.map(result => result.status), `all five new-root backend opens must work during the bounded election: ${JSON.stringify(details(openResults))}`).toEqual(["fulfilled", "fulfilled", "fulfilled", "fulfilled", "fulfilled"]);
       qualifiedOpens.push(...faultRoots.map(natsStreamName));
       const freshConverged = await importMeshStateToNats(migrationRoot, migrationOptions!);
-      expect(freshConverged).toMatchObject({ stream: natsStreamName(migrationRoot), entries: 1, converged: true });
+      expect(freshConverged).toMatchObject({ stream: freshStream, entries: 1, converged: true });
       const recoveryReads = await Promise.all([
         raw!.streamExists(initial.stream), raw!.lastSequence(initial.stream), raw!.getMessage(initial.stream, sequence),
       ]);
       expect(recoveryReads[0]).toBe(true);
       expect(recoveryReads[1]).toBeGreaterThanOrEqual(sequence);
       expect(recoveryReads[2]).toBeDefined();
-      expect(await importMeshStateToNats(migrationRoot, migrationOptions!)).toMatchObject({ stream: natsStreamName(migrationRoot), entries: 1, converged: true });
+      expect(await importMeshStateToNats(migrationRoot, migrationOptions!)).toMatchObject({ stream: freshStream, entries: 1, converged: true });
       console.log(`NATS_ELECTION_FAULT ${JSON.stringify({ pausedLeader: leader.name, seedSurvived: cluster.seedUrl !== leader.clientUrl, stoppedLeaderMs: resumedAt - pausedAt, differentLeaderObserved: peerStates, directReadsDuringPause: readResults.map(result => result.status), placementOutcome: { branch: placement.kind, placementTimeoutMs, elapsedMs, preResumeWriteCaughtUp: placement.kind === "success-r3" ? true : "not-applicable" }, recoveredMigration: { stream: fresh!.stream, entries: fresh!.entries, replicas }, newRootConvergence: freshConverged.converged, newRootOpensDuringPause: openResults.map(result => result.status), recoveryReads: "passed", recoveryMigrations: "passed" })}`);
     } finally {
       resumeNow?.();

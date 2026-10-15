@@ -202,8 +202,19 @@ then import. The details:
   replicas and readiness path, as before. Everything else refuses and nothing is bootstrapped: live file state, a staged
   import (`state.json.nats-intent`), leftovers without a marker, a partial, truncated or malformed marker, a marker for
   another root's stream, and any unreadable entry (its own error, e.g. EACCES). The decision is rechecked after the
-  stream is opened (same kind, stream and root `dev:ino`); recheck and registration are lock-free, with no await
-  between them. Opening a root takes neither `custody.lock` nor the mesh `.lock`; migration tools retain their fence.
+  stream is opened (same kind, stream, marker epoch/time and root `dev:ino`). An existing root's admission takes
+  `custody.lock` only, never the mesh `.lock`, excluding modern migration/rollback writers. A busy custody holder
+  gives `MeshLockTimeoutError` (`FABRIC_MESH_LOCK_TIMEOUT`): retry the open later, with no silent fallback or queued
+  wait behind that holder. A future host must bound its own backoff and overall deadline for NEW open calls, then
+  fail closed; `MeshLockForeignHolderError` is fatal despite its timeout ancestry. Never retry permission, corruption,
+  transport or unknown-outcome errors as admission contention. Under custody, admission checks the current stream
+  head and refuses a lagging or retired projection, then rechecks the marker and registers without an intervening
+  await. Stream replay stays outside custody; the final metadata read can hold custody for about 15.2 s under the
+  client's existing bounded request retries, temporarily excluding lifecycle writers. Concurrent successful opens
+  own independent handles; registering or closing one never closes another opener's handle. The last successful
+  registration is the selector's current backend; closing that owner removes only its own entry. As before, a stream
+  still importing can return an inactive handle: its projection must cover the current head, but all reads and writes
+  refuse until import-commit. This does not relax any marker or migration-fence check.
   An absent root is never created. An observed change closes the backend and refuses, with nothing registered.
   This recheck is not a durable file-side fence: a concurrent or later file writer can still race the fresh-root
   bootstrap (known inherited gap smarty-dev#13524). Do not run a file writer and a NATS backend on the same empty

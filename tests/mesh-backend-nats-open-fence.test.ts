@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { MeshLockTimeoutError } from "../src/core/atomic-write.js";
-import { readMeshStateNatsMarker } from "../src/mesh/backend-fence.js";
+import { encodeMeshStateNatsMarker, readMeshStateNatsMarker } from "../src/mesh/backend-fence.js";
 import { importMeshStateToNats, rollbackMeshStateFromNats } from "../src/mesh/backend-migration-nats.js";
 import { meshSnapshotDigest } from "../src/mesh/backend-migration.js";
 import { closeNatsStateBackend, openNatsStateBackend, preparedNatsStateBackend, type JetStreamPort, type NatsStateBackend } from "../src/mesh/state-backend-nats.js";
@@ -122,6 +122,7 @@ describe("NATS open vs the migration fence and other openers (rf2 P1)", () => {
       expect(o2.status).toBe("fulfilled");
       const second = (o2 as { value: NatsStateBackend }).value;
       handles.push(second);
+      expect(second).not.toBe(first);
       // The first opener still owns a working backend: the second open never closed it.
       expect(await settle(first.put({ key: "owner/first", value: 1, identity }))).toMatchObject({ status: "fulfilled" });
       expect(first.get("owner/first")?.value).toBe(1);
@@ -135,7 +136,11 @@ describe("NATS open vs the migration fence and other openers (rf2 P1)", () => {
         expect(preparedNatsStateBackend(root)).toBe(second);
         expect(await settle(second.put({ key: "owner/after", value: 3, identity }))).toMatchObject({ status: "fulfilled" });
         expect(second.get("owner/after")?.value).toBe(3);
+        first.close(); // repeated stale-owner cleanup still cannot remove its successor
+        expect(preparedNatsStateBackend(root)).toBe(second);
       }
+      second.close();
+      expect(preparedNatsStateBackend(root)).toBeUndefined();
     } finally {
       one.gate.release(); two.gate.release();
       for (const outcome of [await p1, await p2]) if (outcome.status === "fulfilled" && !handles.includes(outcome.value)) handles.push(outcome.value);
@@ -143,4 +148,94 @@ describe("NATS open vs the migration fence and other openers (rf2 P1)", () => {
       closeNatsStateBackend(root);
     }
   }, 30_000);
+
+  it("an importing stream keeps its inactive handle contract: no reads or writes", async () => {
+    const { root, server } = await markedRoot("importing");
+    server.append(Buffer.from(JSON.stringify({ format: 1, type: "import-begin", epoch: 2 })));
+    const backend = await openNatsStateBackend({ root, port: server.port() });
+    try {
+      expect(backend.diagnostics().nats?.status).toBe("importing");
+      expect(preparedNatsStateBackend(root)).toBe(backend);
+      expect(() => backend.get("seed/a")).toThrow(/importing/);
+      await expect(backend.put({ key: "blocked", value: true, identity })).rejects.toThrow(/importing/);
+    } finally { backend.close(); }
+  });
+
+  it.each(["undelivered retire", "importing with undelivered retire", "same-stream marker replacement", "same-stream timestamp replacement", "head-read failure"] as const)(
+    "admission refuses %s under custody and closes only its candidate", async change => {
+      const { root, server, imported } = await markedRoot("admission");
+      if (change === "importing with undelivered retire") server.append(Buffer.from(JSON.stringify({ format: 1, type: "import-begin", epoch: 2 })));
+      const previous = await openNatsStateBackend({ root, port: server.port() });
+      const raw = server.port();
+      let changed = false;
+      let candidateClosed = false;
+      const port: JetStreamPort = { ...raw,
+        lastSequence: async stream => {
+          if (!changed && fs.existsSync(path.join(root, "custody.lock"))) {
+            changed = true;
+            if (change === "head-read failure") throw new Error("admission metadata unavailable");
+            if (change === "same-stream marker replacement" || change === "same-stream timestamp replacement") {
+              const marker = readMeshStateNatsMarker(root)!;
+              fs.writeFileSync(path.join(root, "state.json"), change === "same-stream marker replacement"
+                ? encodeMeshStateNatsMarker(imported.stream, 2, marker.at)
+                : encodeMeshStateNatsMarker(imported.stream, marker.epoch, new Date(Date.parse(marker.at) + 1).toISOString()));
+            } else {
+              raw.pause();
+              server.append(Buffer.from(JSON.stringify({ format: 1, type: "retire", epoch: change === "importing with undelivered retire" ? 3 : 2 })), `${imported.stream}.state`);
+            }
+          }
+          return raw.lastSequence(stream);
+        },
+        close: async () => { candidateClosed = true; await raw.close(); },
+      };
+      try {
+        await expect(openNatsStateBackend({ root, port })).rejects.toThrow(
+          change.includes("undelivered retire") ? /admission projector/ : change === "head-read failure" ? /metadata unavailable/ : /changed while/);
+        expect(changed).toBe(true);
+        expect(candidateClosed).toBe(true);
+        expect(preparedNatsStateBackend(root)).toBe(previous);
+        expect(fs.existsSync(path.join(root, "custody.lock"))).toBe(false);
+      } finally { raw.resume(); previous.close(); }
+    });
+
+  it.each([false, true])("a pending admission head read excludes another open and releases custody (fail=%s)", async fail => {
+    const { root, server } = await markedRoot("head-hold");
+    const previous = await openNatsStateBackend({ root, port: server.port() });
+    const head = barrier();
+    const raw = server.port();
+    let held = false;
+    const port: JetStreamPort = { ...raw, lastSequence: async stream => {
+      if (!held && fs.existsSync(path.join(root, "custody.lock"))) {
+        held = true; head.signal(); await head.released;
+        if (fail) throw new Error("held metadata read failed");
+      }
+      return raw.lastSequence(stream);
+    } };
+    const pending = settle(openNatsStateBackend({ root, port }));
+    let candidate: NatsStateBackend | undefined;
+    try {
+      expect(await Promise.race([head.entered.then(() => true), pending.then(() => false)])).toBe(true);
+      const competitor = await settle(openNatsStateBackend({ root, port: server.port() }));
+      expect(competitor.status).toBe("rejected");
+      expect((competitor as { error: unknown }).error).toBeInstanceOf(MeshLockTimeoutError);
+      expect(preparedNatsStateBackend(root)).toBe(previous);
+      expect(fs.existsSync(path.join(root, "custody.lock"))).toBe(true);
+      head.release();
+      const outcome = await pending;
+      expect(outcome.status).toBe(fail ? "rejected" : "fulfilled");
+      if (outcome.status === "fulfilled") candidate = outcome.value;
+      else expect(String(outcome.error)).toMatch(/held metadata read failed/);
+      expect(preparedNatsStateBackend(root)).toBe(fail ? previous : candidate);
+      expect(fs.existsSync(path.join(root, "custody.lock"))).toBe(false);
+      // A later NEW call succeeds; neither the busy competitor nor a failed candidate damaged the earlier owner.
+      const later = await openNatsStateBackend({ root, port: server.port() });
+      try { expect(await settle(previous.put({ key: "owner/still-live", value: true, identity }))).toMatchObject({ status: "fulfilled" }); }
+      finally { later.close(); }
+    } finally {
+      head.release();
+      const outcome = await pending;
+      if (outcome.status === "fulfilled") outcome.value.close();
+      previous.close();
+    }
+  });
 });

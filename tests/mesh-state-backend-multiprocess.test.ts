@@ -31,8 +31,20 @@ for (const name of ["mkdirSync", "mkdtempSync", "renameSync"]) {
 const jiti = createJiti(pathToFileURL(process.cwd() + "/index.js").href);
 const { MeshStore } = await jiti.import("./src/mesh/store.ts");
 if (kind === "nats") {
-  const { openNatsStateBackend } = await jiti.import("./src/mesh/state-backend-nats.ts");
-  await openNatsStateBackend({ root, servers: [process.env.NATS_SERVER_URL], monitoringUrl: process.env.NATS_MONITOR_URL });
+  const { openNatsStateBackend, MeshStateNatsBusyError } = await jiti.import("./src/mesh/state-backend-nats.ts");
+  const { MeshLockTimeoutError } = await jiti.import("./src/core/atomic-write.ts");
+  // Admission is a custody-only try: concurrent children explicitly retry a NEW connection, never a foreign holder
+  // (a timeout subclass), permissions, transport or corruption. Each single busy attempt remains fail-fast.
+  const deadline = Date.now() + 30_000;
+  for (;;) {
+    try {
+      await openNatsStateBackend({ root, servers: [process.env.NATS_SERVER_URL], monitoringUrl: process.env.NATS_MONITOR_URL });
+      break;
+    } catch (error) {
+      if (!(error?.constructor === MeshLockTimeoutError || error instanceof MeshStateNatsBusyError) || Date.now() >= deadline) throw error;
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+  }
 }
 const store = new MeshStore(root, 64 * 1024, 1000, { stateBackend: kind });
 if (store.stateBackend !== kind) throw new Error("not " + kind + ": " + JSON.stringify(store.stateDiagnostics()));

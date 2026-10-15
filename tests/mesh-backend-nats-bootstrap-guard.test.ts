@@ -157,7 +157,7 @@ const markRoot = (root: string, stream = `${natsStreamName(root)}_${SWITCH}`): s
   return stream;
 };
 
-describe("steady-state marked-root open takes no fence (smarty-dev#6477 L2a)", () => {
+describe("steady-state marked-root admission takes custody but no mesh .lock (smarty-dev#6477 L2a)", () => {
   it("the recorder sees the fence's custody.lock and .lock receivers (control)", async () => {
     const root = freshRoot();
     markRoot(root);
@@ -168,7 +168,7 @@ describe("steady-state marked-root open takes no fence (smarty-dev#6477 L2a)", (
     expect(recorded.writes.some(write => / \.lock/.test(write))).toBe(true);
   });
 
-  it("a marked root opens, registers and serves state with no write into the root (no custody.lock, no .lock)", async () => {
+  it("a marked root opens under custody, then serves state without filesystem writes or mesh .lock", async () => {
     const root = freshRoot();
     const stream = markRoot(root);
     const before = snapshot(root);
@@ -176,13 +176,16 @@ describe("steady-state marked-root open takes no fence (smarty-dev#6477 L2a)", (
     const server = fakeJetStream();
     const { port, opened } = openWith(server, root);
     const backend = await opened as Awaited<ReturnType<typeof openNatsStateBackend>>;
-    expect(recorded).toEqual({ writes: [], lockAttempts: 0 });
+    expect(recorded.lockAttempts).toBe(0);
+    expect(recorded.writes.some(write => /custody\.lock/.test(write))).toBe(true);
+    expect(snapshot(root)).toEqual(before);
+    const admissionWrites = [...recorded.writes];
     expect(port.calls).not.toContain("createStream");
     expect(preparedNatsStateBackend(root)).toBe(backend);
     expect(backend.diagnostics().nats?.status).toBe("ready");
     await backend.put({ key: "steady/a", value: 1, identity });
     expect(backend.get("steady/a")?.value).toBe(1);
-    expect(recorded).toEqual({ writes: [], lockAttempts: 0 });
+    expect(recorded).toEqual({ writes: admissionWrites, lockAttempts: 0 });
     expect(fs.readdirSync(root).filter(name => name.includes("lock"))).toEqual([]);
     expect(snapshot(root)).toEqual(before);
     expect(decideNatsRootOpen(root)).toMatchObject({ kind: "marker", stream });

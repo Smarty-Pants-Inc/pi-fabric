@@ -26,6 +26,7 @@ import { validateMeshStateKey } from "./state-sqlite.js";
 import { readMeshStateNatsMarker } from "./backend-fence.js";
 import { MeshLockTimeoutError } from "../core/atomic-write.js";
 import { MeshSyncNotDurableError } from "./not-durable.js";
+import { acquireMeshCustodyLock } from "./custody-lock.js";
 
 // ------------------------------------------------------------------ the JetStream port
 
@@ -1147,6 +1148,8 @@ export class NatsStateBackend implements StateBackend {
   }
 
   close(): void {
+    // A superseded opener owns only its own handle, never the next selector entry.
+    for (const [root, backend] of prepared) if (backend === this) prepared.delete(root);
     if (this.#closed) return;
     const consumer = this.#retireProjector();
     void (async () => { await consumer?.stop(); await this.#options.port.close(); })().catch(() => undefined);
@@ -1540,6 +1543,14 @@ export const assertNatsMaxPayload = (server: { maxPayload?: number }): void => {
  * connectNatsEndpoint refuses; a server older than MIN_SERVER (2.14.7); a server that does not fsync every write unless
  * the operator accepts it; a stream that is retired; a root whose state is still in a stream under the old (c03c829f)
  * name. Loads the official client only in connectNatsEndpoint.
+ *
+ * Existing-root admission tries custody once, never queues and never takes mesh .lock. An ordinary
+ * MeshLockTimeoutError or MeshStateNatsBusyError is retryable: a host may make a NEW open call with bounded backoff
+ * and its own overall deadline, then fail closed. MeshLockForeignHolderError is fatal, despite its timeout ancestry;
+ * transport, permission, corruption and unknown-outcome errors are not admission retries. There are no in-repo host
+ * callers today. An importing stream may return an inactive handle as before; all its reads and writes still refuse
+ * until import-commit. Replay is outside custody; the final current-head read inside it uses the client's existing
+ * bounded requests (up to about 15.2 s), temporarily excluding lifecycle writers. This is not a durable fresh-root file fence.
  */
 export const openNatsStateBackend = async (options: OpenNatsStateBackendOptions): Promise<NatsStateBackend> => {
   const root = path.resolve(options.root);
@@ -1547,6 +1558,7 @@ export const openNatsStateBackend = async (options: OpenNatsStateBackendOptions)
   // refused after endpoint validation; its failure can never turn into bootstrap if the files disappear meanwhile.
   const decision = (() => { try { return decideNatsRootOpen(root); } catch (error) { return { error }; } })();
   const { port, owned, server } = await connectNatsEndpoint(options);
+  let backend: NatsStateBackend | undefined;
   try {
     if ("error" in decision) throw decision.error;
     assertNatsServerSupported(server.version);
@@ -1568,7 +1580,7 @@ export const openNatsStateBackend = async (options: OpenNatsStateBackendOptions)
     // import, a partial or malformed marker, an unreadable entry) refuses: never an empty bootstrap beside real state.
     assertSameNatsRootDecision(root, decision);
     const stream = decision.stream;
-    const backend = await NatsStateBackend.open({ port, stream, subject: `${stream}.state`, snapshotSubject: `${stream}.snapshot`,
+    backend = await NatsStateBackend.open({ port, stream, subject: `${stream}.state`, snapshotSubject: `${stream}.snapshot`,
       maxEventBytes: options.maxEventBytes ?? 1024 * 1024, ...(decision.kind === "marker" ? { create: false } : {}),
       ...(options.snapshotEvery === undefined ? {} : { snapshotEvery: options.snapshotEvery }),
       ...(options.maxStateBytes === undefined ? {} : { maxStateBytes: options.maxStateBytes }),
@@ -1577,17 +1589,31 @@ export const openNatsStateBackend = async (options: OpenNatsStateBackendOptions)
       ...(options.lockTimeoutMs === undefined ? {} : { lockTimeoutMs: options.lockTimeoutMs }),
       ...(options.replicas === undefined ? {} : { replicas: options.replicas }),
       syncAlways: server.syncAlways });
-    if (backend.diagnostics().nats?.status === "retired") { backend.close(); throw new MeshStateNatsRefusedError(`the stream ${stream} is retired`); }
-    // File data may appear while the server, the ensure and the replay were awaited: recheck the same decision (and the
-    // root's identity) synchronously, with no await between the recheck and registration. An open takes neither
-    // custody.lock nor the mesh .lock; the migration tools retain their fence. A changed marker refuses here.
-    // This is not a durable file-writer fence for fresh-root bootstrap (accepted gap smarty-dev#13524).
-    try { assertSameNatsRootDecision(root, decision); } catch (error) { backend.close(); throw error; }
-    prepared.get(root)?.close();
-    prepared.set(root, backend);
-    return backend;
+    if (backend.diagnostics().nats?.status === "retired") throw new MeshStateNatsRefusedError(`the stream ${stream} is retired`);
+    assertSameNatsRootDecision(root, decision);
+    // Modern migration/rollback writers take custody before .lock. Admission takes only custody, with no contention
+    // wait: a live holder gives a retryable MeshLockTimeoutError, never an active backend beside its unchanged marker.
+    // Never create an initially absent root just to lock it (bootstrap gap smarty-dev#13524 remains).
+    const release = decision.identity === undefined ? undefined : await acquireMeshCustodyLock(root, 0);
+    try {
+      assertSameNatsRootDecision(root, decision);
+      // A rollback may have retired, then failed before replacing the marker. Do not register a cached ready model
+      // whose consumer has not delivered that retire yet; catch-up waits stay outside admission custody.
+      const head = await port.lastSequence(stream);
+      const projection = backend.diagnostics().nats!;
+      // Preserve main's inactive importing handle, without granting importing reads/writes. Its validated projection
+      // must still cover the current head; failed/ready/retired models retain the normal readable/fresh checks.
+      const seq = projection.status === "importing" && projection.failure === undefined
+        ? projection.appliedSeq : (backend.stateToken({ fresh: true }) as NatsSnapshot).seq;
+      if (seq < head) throw new MeshStateNatsBusyError(`admission projector is at ${seq} of ${head}; retry open`);
+      assertSameNatsRootDecision(root, decision);
+      // No await between this last fenced check and publication. Earlier successful handles belong to their callers.
+      prepared.set(root, backend);
+      return backend;
+    } finally { release?.(); }
   } catch (error) {
-    if (owned) await port.close().catch(() => undefined);
+    if (backend) backend.close();
+    else if (owned) await port.close().catch(() => undefined);
     throw error;
   }
 };
@@ -1598,6 +1624,8 @@ export interface NatsRootOpenDecision {
   stream: string;
   /** The root directory's identity (`dev:ino`), undefined when the root does not exist (then nothing is written). */
   identity: string | undefined;
+  /** A validated marker's lifecycle identity; a same-stream marker replacement must also refuse. */
+  marker?: string;
 }
 
 const errnoOf = (error: unknown): string | undefined => (error as NodeJS.ErrnoException | undefined)?.code;
@@ -1637,13 +1665,13 @@ export const decideNatsRootOpen = (root: string): NatsRootOpenDecision => {
   if (entries.includes("state.json.nats-intent") || entries.some(name => name.startsWith("state.db"))) {
     throw new MeshStateNatsRefusedError(`${root} has a NATS moved marker beside ${entries.filter(name => name !== "state.json").join(", ")}: an unfinished switch; rerun or roll it back first`);
   }
-  return { kind: "marker", stream: marker.natsStream, identity };
+  return { kind: "marker", stream: marker.natsStream, identity, marker: `${marker.epoch}:${marker.at}` };
 };
 
 /** The same decision again (after an await): anything else, including a replaced root, refuses. */
 const assertSameNatsRootDecision = (root: string, before: NatsRootOpenDecision): void => {
   const after = decideNatsRootOpen(root);
-  if (after.kind !== before.kind || after.stream !== before.stream || after.identity !== before.identity) {
+  if (after.kind !== before.kind || after.stream !== before.stream || after.identity !== before.identity || after.marker !== before.marker) {
     throw new MeshStateNatsRefusedError(`${root} changed while its NATS stream was opened (${before.kind} ${before.stream} -> ${after.kind} ${after.stream}): refusing; nothing was registered`);
   }
 };
@@ -1651,6 +1679,7 @@ const assertSameNatsRootDecision = (root: string, before: NatsRootOpenDecision):
 /** Forgets a root's prepared backend (closing it). */
 export const closeNatsStateBackend = (root: string): void => {
   const resolved = path.resolve(root);
-  prepared.get(resolved)?.close();
-  prepared.delete(resolved);
+  const backend = prepared.get(resolved);
+  if (backend && prepared.get(resolved) === backend) prepared.delete(resolved);
+  backend?.close();
 };

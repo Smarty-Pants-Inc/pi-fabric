@@ -40,9 +40,11 @@ export const assertRemoteTaskLead = (from: MeshIdentity, caller: FabricParticipa
 };
 
 // The wire never carries seeds, launch paths, provenance, or ambient host authority.
+// Extensions control host-side bootstrap and belong to the execution host, even when disabling them.
 const fields = new Set(["task", "name", "runner", "kernel", "model", "modelReason", "thinking", "thinkingBounds", "tools", "timeoutMs",
-  "extensions", "cwd", "needs", "requires", "readOnly", "writableRoots", "shell", "schema", "replyTool", "systemPrompt", "nice", "bashIdleSeconds"]);
+  "cwd", "needs", "requires", "readOnly", "writableRoots", "shell", "schema", "replyTool", "systemPrompt", "nice", "bashIdleSeconds"]);
 export const remoteTaskRequest = (request: AgentRunRequest): AgentRunRequest => {
+  if (Object.hasOwn(request, "extensions")) return refused("Remote task extensions are controlled by the execution host");
   if (request.recursive || request.worktree || request.worktreeSetup !== undefined || request.sessionSeed || request.forkSeed ||
     request.actorId || request.actorName || request.sessionFile || request.residentStartupProbe || request.scope || request.inheritedScope ||
     request.routeDecision || request.inheritedSessionPins?.length || request.images?.length || request.residency === "durable" ||

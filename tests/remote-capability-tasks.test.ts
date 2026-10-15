@@ -228,12 +228,24 @@ describe("remote capability process tasks over two real mesh roots", () => {
     await f.provider.invoke("wait", { id: tmp.id }, f.context);
   });
 
+  it.each([true, false])("completes a raw bridge request with extensions omitted using the host default %s", async extensions => {
+    const f = await fixture();
+    f.config.agents.extensions = extensions;
+    const handle = await f.wire({}) as AgentHandleInfo;
+    const result = await f.host().agents.wait(handle.id);
+    expect(result.status).toBe("completed");
+    expect(result.value).toMatchObject({ cwd: f.b, corpus: "answer-only-on-root-B", spawner: "session:work-lead", extensions });
+  });
+
+  // Trust boundary: raw bridge callers cannot select the execution host's extension bootstrap.
   it.each([
     ["return address", {}, { returnTo: "session:hub-lead" }],
     ["return session", {}, { sessionId: "hub-lead" }],
     ["shell widening", { shell: "unconfined" }, {}],
     ["write widening", { readOnly: false, writableRoots: ["REPLACE_CWD"] }, {}],
     ["tool widening", { tools: ["bash"] }, {}],
+    ["extensions enabled", { extensions: true }, {}],
+    ["extensions disabled", { extensions: false }, {}],
     ["denied model", { model: "fixture/denied" }, {}],
     ["relative cwd", { cwd: "relative" }, {}],
     ["internal launch fields", { residentStartupProbe: true }, {}],
@@ -242,6 +254,7 @@ describe("remote capability process tasks over two real mesh roots", () => {
   ])("refuses %s at the authenticated receiver without starting a worker", async (_name, request, overrides) => {
     const f = await fixture();
     const fixed = { ...request };
+    if ("extensions" in fixed) f.config.agents.extensions = false;
     if ("writableRoots" in fixed) fixed.writableRoots = [f.b];
     if ("requires" in fixed) fixed.requires = [path.join(f.b, "missing")];
     await expect(f.wire(fixed, overrides)).rejects.toMatchObject({ code: "FABRIC_REMOTE_TASK_POLICY_REFUSED" });
@@ -298,6 +311,10 @@ describe("remote capability authority and host-only configuration", () => {
     fs.writeFileSync(path.join(cwd, ".pi", "fabric.json"), JSON.stringify({ agents: { hostCapabilities: ["other"], remoteSpawnPolicy: { writableRoots: [root], shell: "unconfined", tools: ["bash"] } } }));
     expect(loadFabricConfig({ cwd, agentDir, projectTrusted: true }).agents).toMatchObject({ hostCapabilities: ["corpus", "github"], remoteSpawnPolicy: policy });
     expect(() => normalizeFabricConfig({ agents: { hostCapabilities: ["local"] } })).toThrow("reserved");
+  });
+  it.each([true, false])("refuses explicit extensions=%s rather than silently stripping host authority", extensions => {
+    expect(() => remoteTaskRequest({ task: "work", extensions })).toThrow(expect.objectContaining({ code: "FABRIC_REMOTE_TASK_POLICY_REFUSED" }));
+    expect(remoteTaskRequest({ task: "work" })).toEqual({ task: "work" });
   });
   it("requires an authenticated lead root, and refuses inherited/private run authority", () => {
     const f = { id: "session:lead", sessionId: "lead", name: "lead", kind: "main" as const };

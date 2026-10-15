@@ -14,5 +14,6 @@ if (delay) await new Promise(resolve => setTimeout(resolve, Math.min(5000, delay
 const value = { cwd: process.cwd(), corpus: fs.existsSync("corpus.txt") ? fs.readFileSync("corpus.txt", "utf8") : null,
   spawner: process.env.PI_FABRIC_SPAWNER_ID, spawnerSession: process.env.PI_FABRIC_SPAWNER_SESSION_ID,
   returnAddress: JSON.parse(args.get("task-return-address")), spawnerArgument: args.get("spawner-id"),
-  writePolicy: args.get("write-policy") ? JSON.parse(args.get("write-policy")) : null, pid: process.pid };
+  writePolicy: args.get("write-policy") ? JSON.parse(args.get("write-policy")) : null,
+  extensions: args.get("extensions") === "true", pid: process.pid };
 write({ ...record, status: "completed", finishedAt: Date.now(), updatedAt: Date.now(), text: JSON.stringify(value), value });

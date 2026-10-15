@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 import { MESH_ARCHIVE_CONFIG } from "../src/mesh/archive.js";
+import { controlBodyFingerprint, FABRIC_IDEMPOTENCY_KEY_REUSED, FabricIdempotencyKeyReusedError } from "../src/mesh/control-idempotency.js";
 import { MeshStore } from "../src/mesh/store.js";
 
 // fv2-coldpub design C: a keyed publish confirms the complete `event-receipts` namespace before
@@ -113,6 +114,36 @@ describe.skipIf(process.platform !== "linux")("keyed publish: prepared receipt n
     expect(once(rebooted, "cold")).toEqual([receipt]);
   });
 
+  // Keep reason: data safety. A prepared receipt namespace must never acknowledge another body.
+  it.each([false, true])("prepared namespace preserves fingerprinted retry identity and rejects changed input without appending (stamp=%s)", async stamp => {
+    const { root, receipts } = fixture();
+    const sync = watch(root);
+    const options = { maxEventLogBytes: 230 * 1024 * 1024 };
+    const mesh = new MeshStore(root, 1024, 100, options);
+    const body = { message: "original", data: { value: 1 } };
+    const data = (command: typeof body) => stamp ? (createdAt: number) => ({ ...command, requestedAt: createdAt }) : command;
+    const input = { ...keyed(`fingerprint-${stamp}`), dedupeFingerprint: controlBodyFingerprint(body), data: data(body) };
+    const event = await mesh.publish(input);
+    expect(event.dedupeFingerprint).toBe(input.dedupeFingerprint);
+    expect(sync.syncs.filter(entry => entry.held && entry.dir).map(entry => entry.file)).toEqual([receipts, receipts, receipts]);
+    const livePath = path.join(root, "events.jsonl");
+    const receiptPath = path.join(receipts, `${hash(input.dedupeKey)}.json`);
+    const live = fs.readFileSync(livePath, "utf8"), receipt = fs.readFileSync(receiptPath, "utf8");
+    expect(live).toBe(`${JSON.stringify(event)}\n`);
+    expect(receipt).toBe(JSON.stringify(event));
+    const sequence = mesh.latestSequence();
+    const rebooted = new MeshStore(root, 1024, 100, options);
+    expect(await rebooted.publish(input)).toEqual(event);
+    const changed = { ...body, data: { value: 2 } };
+    const refused = rebooted.publish({ ...input, data: data(changed), dedupeFingerprint: controlBodyFingerprint(changed) });
+    await expect(refused).rejects.toBeInstanceOf(FabricIdempotencyKeyReusedError);
+    await expect(refused).rejects.toMatchObject({ code: FABRIC_IDEMPOTENCY_KEY_REUSED, retryable: false, idempotencyKey: input.dedupeKey });
+    expect(fs.readFileSync(livePath, "utf8")).toBe(live);
+    expect(rebooted.latestSequence()).toBe(sequence);
+    expect(fs.readFileSync(receiptPath, "utf8")).toBe(receipt);
+    expect(once(rebooted, input.dedupeKey)).toEqual([event]);
+  });
+
   it("a current-day archived keyed publish uses leaf barriers for receipt install + unlink; archive barriers remain", async () => {
     const { root, real, receipts, base } = fixture();
     const archiveBase = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "mesh-receipt-ns-archive-")));
@@ -201,21 +232,36 @@ describe.skipIf(process.platform !== "linux")("keyed publish: prepared receipt n
     expect(once(mesh, "leaf")).toEqual([event]);
   });
 
-  it("post-live receipt-file fsync failure keeps the intent; a rebooted retry returns the exact identity", async () => {
+  it("post-live receipt-file fsync failure keeps the intent; a rebooted retry rejects a changed fingerprint and returns the exact identity", async () => {
     const { root, receipts } = fixture();
     const mesh = new MeshStore(root, 1024, 100, { maxEventLogBytes: 230 * 1024 * 1024 });
+    const body = { message: "original" };
+    const input = { ...keyed("receipt"), data: body, dedupeFingerprint: controlBodyFingerprint(body) };
     const sync = watch(root);
     sync.failOnce(entry => entry.held && !entry.dir && entry.appended && /[a-f0-9]{64}\.json\.\d+\..+\.tmp$/.test(entry.file));
-    await expect(mesh.publish(keyed("receipt"))).rejects.toThrow("injected EIO");
+    await expect(mesh.publish(input)).rejects.toThrow("injected EIO");
     const [committed] = once(mesh, "receipt");
     expect(committed).toBeDefined();
-    expect(fs.existsSync(path.join(receipts, `${hash("receipt")}.pending.json`))).toBe(true);
+    expect(committed?.dedupeFingerprint).toBe(input.dedupeFingerprint);
+    const pendingPath = path.join(receipts, `${hash("receipt")}.pending.json`);
+    expect(fs.existsSync(pendingPath)).toBe(true);
     expect(fs.existsSync(path.join(receipts, `${hash("receipt")}.json`))).toBe(false);
+    const livePath = path.join(root, "events.jsonl");
+    const live = fs.readFileSync(livePath, "utf8"), pending = fs.readFileSync(pendingPath, "utf8");
+    const sequence = mesh.latestSequence();
     const rebooted = new MeshStore(root, 1024, 100, { maxEventLogBytes: 230 * 1024 * 1024 });
-    expect(await rebooted.publish(keyed("receipt"))).toEqual(committed);
+    const changed = { message: "changed" };
+    await expect(rebooted.publish({ ...input, data: changed, dedupeFingerprint: controlBodyFingerprint(changed) }))
+      .rejects.toBeInstanceOf(FabricIdempotencyKeyReusedError);
+    expect(fs.readFileSync(livePath, "utf8")).toBe(live);
+    expect(rebooted.latestSequence()).toBe(sequence);
+    expect(fs.readFileSync(pendingPath, "utf8")).toBe(pending);
+    expect(fs.existsSync(path.join(receipts, `${hash("receipt")}.json`))).toBe(false);
+    expect(await rebooted.publish(input)).toEqual(committed);
+    expect(fs.readFileSync(livePath, "utf8")).toBe(live);
     expect(once(rebooted, "receipt")).toEqual([committed]);
     expect(JSON.parse(fs.readFileSync(path.join(receipts, `${hash("receipt")}.json`), "utf8"))).toEqual(committed);
-    expect(skipped).toContain(path.join(receipts, `${hash("receipt")}.pending.json`));
+    expect(skipped).toContain(pendingPath);
   });
 
   it("an unlink leaf-barrier failure keeps the durable receipt authoritative; the retry cannot append again", async () => {

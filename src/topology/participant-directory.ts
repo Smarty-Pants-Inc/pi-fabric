@@ -1605,7 +1605,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       !main.startTime || processStartTime(main.pid) !== main.startTime || this.#routeEnded(participant, read)) return false;
     try {
       const lease = hostLeasePredecessor(this.mesh.root, owner.id);
-      if (lease && !hostLeaseMatches(lease, owner)) return false;
+      if (!hostLeaseMatches(lease, owner)) return false;
       const stat = fs.readFileSync(`/proc/${main.pid}/stat`, "utf8");
       const fields = stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/);
       return /^[RSDTtWI]$/.test(fields[0] ?? "") && fields[19] === main.startTime;

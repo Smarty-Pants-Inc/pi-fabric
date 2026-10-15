@@ -9,7 +9,7 @@ import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { FabricControlPlane } from "../src/topology/control-plane.js";
 import { AgentMessageRouter } from "../src/providers/agents-message-router.js";
-import { readHostLeaseCurrent, writeHostLease } from "../src/topology/host-leases.js";
+import { hostLeasePath, readHostLeaseCurrent, writeHostLease } from "../src/topology/host-leases.js";
 import { processStartTime } from "../src/residency/process-identity.js";
 import type { FabricParticipantRecord } from "../src/topology/types.js";
 
@@ -132,6 +132,36 @@ describe.skipIf(process.platform !== "linux")("local native Main routing proof",
     expect(f.reader.retainedRouteAllowed(f.target)).toBe(false);
     await expect(f.router.routeMessage(f.target, "gone", undefined, "followUp")).rejects.toThrow("Unknown Fabric participant");
     expect(f.deliver).toHaveBeenCalledOnce();
+  });
+
+  it("refuses native extension when the current host lease file is missing despite exact live PID/birth", async () => {
+    const f = await fixture();
+    await f.publish({ mainProcess: { pid: process.pid, host: os.hostname(), startTime: processStartTime(process.pid)! } });
+    await f.expire();
+    const captured = f.reader.captureControlOwnerLease(f.target, f.target, f.target)!;
+    const read = fs.readFileSync.bind(fs), filePath = hostLeasePath(f.root, f.target);
+    let missingReads = 0;
+    const stat = fs.statSync.bind(fs);
+    vi.spyOn(fs, "statSync").mockImplementation(((file: fs.PathLike, ...args: unknown[]) => {
+      if (String(file) === filePath) throw Object.assign(new Error("missing current host lease"), { code: "ENOENT" });
+      return Reflect.apply(stat, fs, [file, ...args]);
+    }) as typeof fs.statSync);
+    vi.spyOn(fs, "readFileSync").mockImplementation(((file: fs.PathOrFileDescriptor, ...args: unknown[]) => {
+      if (String(file) === filePath) {
+        missingReads++;
+        throw Object.assign(new Error("missing current host lease"), { code: "ENOENT" });
+      }
+      return Reflect.apply(read, fs, [file, ...args]);
+    }) as typeof fs.readFileSync);
+    expect(f.reader.get(f.target, Date.now(), { fresh: true })).toBeUndefined();
+    expect(f.reader.list({ scope: "project", fresh: true }).find(p => p.id === f.target)).toBeUndefined();
+    expect(f.reader.list({ scope: "project", fresh: true, includeStale: true }).find(p => p.id === f.target)).toMatchObject({ stale: true });
+    expect(await f.reader.resolveRoutingLease(f.target)).toBe(false);
+    expect(f.reader.retainedRouteAllowed(f.target)).toBe(false);
+    expect(captured()).toBe(2);
+    await expect(f.router.routeMessage(f.target, "missing lease", undefined, "followUp")).rejects.toThrow();
+    expect(f.deliver).not.toHaveBeenCalled();
+    expect(missingReads).toBeGreaterThan(0);
   });
 
   it.each(["reused", "foreign", "unknown", "unreadable", "zombie", "actor", "resident", "identity", "mirror"] as const)("does not grant native extension to %s metadata", async kind => {

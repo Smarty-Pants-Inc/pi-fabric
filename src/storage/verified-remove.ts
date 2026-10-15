@@ -288,7 +288,10 @@ const findWindowsRemoveHelper = (): string | undefined => windowsHelperBootstrap
 const sourcePinnedWindowsHelperDigest = (): string | undefined => {
   try {
     const sourcePath = fileURLToPath(import.meta.url);
-    if (!sourcePath.includes(`${path.sep}src${path.sep}`)) return undefined;
+    const sourceDir = path.dirname(sourcePath);
+    // A packaged dist file can be installed below a directory named `src`; require the actual source module shape
+    // and TypeScript extension so a package can never fall back to a sibling toolchain file.
+    if (path.basename(sourceDir) !== "storage" || path.basename(path.dirname(sourceDir)) !== "src" || path.extname(sourcePath) !== ".ts") return undefined;
     const toolchain = JSON.parse(fs.readFileSync(new URL("../../native/toolchain.json", import.meta.url), "utf8")) as {
       expected?: { windows?: Record<string, string> };
     };

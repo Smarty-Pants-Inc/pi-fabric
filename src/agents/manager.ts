@@ -483,12 +483,6 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
   workerGone?: boolean;
   /** Host-only outcome, installed only after owned identity AND native/tree exit proof. */
   workerLostResult?: AgentRunResult;
-  /** Host-consumed raw events, never counters or recovery authority from status.json. */
-  workerEvents?: {
-    offset: number; remainder: Buffer; anchor: Buffer; dev?: number; ino?: number;
-    invalid: boolean; complete: boolean; contextOverflow: boolean; toolCalls: number; inferenceStarted: boolean;
-    contextWindow?: number;
-  };
   /** pi-fabric#939 round 2: its saved answer was delivered to the spawner after an unconfirmed exit (once). */
   recoveredAnswer?: boolean;
   /** Round 3: that delivery's save succeeded; only its completed mark is left. */
@@ -634,7 +628,7 @@ interface QueuedAgent {
   completionNotified?: boolean;
 }
 
-// Only structured assistant error frames may establish provider overflow. Prose never does.
+// Diagnostic classification only: worker-reported overflow never authorizes actor replay.
 const providerContextOverflow = (error: unknown): boolean => typeof error === "string" &&
   /Context exceeds window|prompt (?:is )?too long|maximum context length|context(?:[ _-]+(?:window|length))?[ _-]+(?:overflow|exceeded|too long)|too many tokens/i.test(error) &&
   !/stream.*(?:interrupt|disconnect)|connection.*(?:reset|closed)|socket hang up|ECONNRESET|fetch failed|rate limit|too many requests|\bTool\s+["']|^(?:Throttling error|Service unavailable):/i.test(error);
@@ -3785,17 +3779,6 @@ export class AgentManager {
     };
   }
 
-  /** Replay authority belongs to this host's consumed event stream, not writable status JSON. */
-  workerEventEvidence(id: string): { complete: boolean; contextOverflow: boolean; toolCalls: number; inferenceStarted: boolean } | undefined {
-    const managed = this.#runs.get(id);
-    if (!managed?.actorId || managed.hosted || managed.transport.kind !== "process" ||
-        (managed.runner !== "pi" && managed.runner !== "pi-durable")) return undefined;
-    if (!managed.settled) this.#observeWorkerEvents(managed);
-    const seen = managed.workerEvents;
-    return seen ? { complete: seen.complete && !seen.invalid && managed.executionExited === true, contextOverflow: seen.contextOverflow,
-      toolCalls: seen.toolCalls, inferenceStarted: seen.inferenceStarted } : undefined;
-  }
-
   /** Automatic outputs must use admitted task lineage, never the original mailbox item. */
   outputPrincipal(id: string): FabricPrincipal | undefined {
     return copyFabricPrincipal(this.#runs.get(id)?.outputPrincipal);
@@ -4981,8 +4964,6 @@ export class AgentManager {
   async #settleGoneActorWorker(managed: ManagedAgent, record: AgentRunRecord | undefined): Promise<boolean> {
     if ((managed.stopRequested && !managed.workerGone) || !this.#actorWorkerGone(managed) ||
         record?.status === "completed") return false;
-    const observed = this.workerEventEvidence(managed.id);
-    if (observed?.complete && observed.contextOverflow) return false;
     const lost: AgentRunResult = { ...failedRecord(managed, "failed",
       "Actor worker is proven gone; execution was lost and this event will not be replayed"),
       startedAt: this.#admissionOwners.get(managed.id)?.acquiredAt ?? record?.startedAt ?? Date.now(),
@@ -4996,10 +4977,8 @@ export class AgentManager {
     // success remains deliverable even when the monitor first saw running.
     const committed = readRecord(managed.statusFile) ?? record;
     if (committed?.status === "completed") return false;
-    const finalObserved = this.workerEventEvidence(managed.id);
-    if (finalObserved?.complete && finalObserved.contextOverflow) return false;
     if (committed?.errorCode === "CONTEXT_OVERFLOW" || providerContextOverflow(committed?.error)) {
-      lost.error += "; worker-reported context overflow lacks complete host evidence; an explicit session reset is needed before the next activation";
+      lost.error += "; context overflow: explicit reset needed before the next activation";
     }
     // A committed ordinary failure is not transport loss. Preserve its error
     // and the actor's normal failure accounting; ownership must still not replay it.
@@ -5549,80 +5528,7 @@ export class AgentManager {
     }
   }
 
-  /** Bounded incremental observation. Any missing/replaced/truncated/malformed span forbids replay. */
-  #observeWorkerEvents(managed: ManagedAgent): void {
-    if (!managed.actorId || managed.hosted || managed.transport.kind !== "process" ||
-        (managed.runner !== "pi" && managed.runner !== "pi-durable")) return;
-    const seen = managed.workerEvents ??= { offset: 0, remainder: Buffer.alloc(0), anchor: Buffer.alloc(0),
-      invalid: false, complete: false, contextOverflow: false, toolCalls: 0, inferenceStarted: false };
-    seen.complete = false;
-    let fd: number | undefined;
-    try {
-      fd = fs.openSync(path.join(managed.runDirectory, "events.jsonl"), fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
-      const stat = fs.fstatSync(fd);
-      if (!stat.isFile() || (seen.dev !== undefined && (seen.dev !== stat.dev || seen.ino !== stat.ino)) || stat.size < seen.offset) {
-        seen.invalid = true;
-        return;
-      }
-      seen.dev = stat.dev; seen.ino = stat.ino;
-      if (seen.anchor.length) {
-        const anchor = Buffer.alloc(seen.anchor.length);
-        if (fs.readSync(fd, anchor, 0, anchor.length, seen.offset - anchor.length) !== anchor.length || !anchor.equals(seen.anchor)) {
-          seen.invalid = true;
-          return;
-        }
-      }
-      const bytes = Buffer.alloc(Math.min(256 * 1024, stat.size - seen.offset));
-      const count = fs.readSync(fd, bytes, 0, bytes.length, seen.offset);
-      if (count !== bytes.length) { seen.invalid = true; return; }
-      const appended = bytes.subarray(0, count);
-      const tail = Buffer.concat([seen.anchor, appended]);
-      seen.anchor = Buffer.from(tail.subarray(Math.max(0, tail.length - 64)));
-      seen.offset += count;
-      const combined = Buffer.concat([seen.remainder, appended]);
-      const end = combined.lastIndexOf(10);
-      seen.remainder = end < 0 ? combined : Buffer.from(combined.subarray(end + 1));
-      if (seen.remainder.length > 256 * 1024) { seen.invalid = true; seen.remainder = Buffer.alloc(0); }
-      const complete = end < 0 ? Buffer.alloc(0) : combined.subarray(0, end);
-      if (!Buffer.from(complete.toString("utf8"), "utf8").equals(complete)) seen.invalid = true;
-      if (end >= 0) for (const line of complete.toString("utf8").split("\n")) {
-        try {
-          const event = JSON.parse(line) as Record<string, unknown>;
-          if (!event || typeof event !== "object" || Array.isArray(event) || typeof event.type !== "string") { seen.invalid = true; continue; }
-          // The worker emits this when an oversized raw frame was discarded: the gap is not safe.
-          if (event.type === "worker_warning") seen.invalid = true;
-          if (event.type === "tool_execution_start") { seen.toolCalls++; seen.inferenceStarted = true; }
-          if (event.type === "response" && event.command === "get_state" && event.success === true) {
-            const window = (event.data as { model?: { contextWindow?: unknown } } | undefined)?.model?.contextWindow;
-            if (typeof window === "number" && Number.isFinite(window) && window > 0) seen.contextWindow = window;
-            else delete seen.contextWindow;
-          }
-          if (event.type === "message_update") {
-            const delta = event.assistantMessageEvent as Record<string, unknown> | undefined;
-            if (typeof delta?.delta === "string" && delta.delta.length) seen.inferenceStarted = true;
-          }
-          if (event.type === "message_end") {
-            const message = event.message as Record<string, unknown> | undefined;
-            if (!message || typeof message !== "object" || Array.isArray(message)) { seen.invalid = true; continue; }
-            if (message.role !== "assistant") continue;
-            const usage = message.usage as Record<string, unknown> | undefined;
-            const input = typeof usage?.input === "number" && typeof usage.cacheRead === "number" ? usage.input + usage.cacheRead : NaN;
-            const silentOverflow = seen.contextWindow !== undefined && Number.isFinite(input) &&
-              ((message.stopReason === "stop" && input > seen.contextWindow) ||
-                (message.stopReason === "length" && usage?.output === 0 && input >= seen.contextWindow * 0.99));
-            seen.contextOverflow = (message.stopReason === "error" && providerContextOverflow(message.errorMessage)) || silentOverflow;
-            if (message.stopReason !== "error" && message.stopReason !== "aborted") seen.inferenceStarted = true;
-          }
-        } catch { seen.invalid = true; }
-      }
-      seen.complete = seen.offset === fs.fstatSync(fd).size && seen.remainder.length === 0;
-    } catch {
-      if (seen.dev !== undefined) seen.invalid = true;
-    } finally { if (fd !== undefined) fs.closeSync(fd); }
-  }
-
   #drainLifecycle(managed: ManagedAgent): void {
-    this.#observeWorkerEvents(managed);
     let content: Buffer;
     try {
       content = fs.readFileSync(managed.lifecycleFile);
@@ -5995,7 +5901,7 @@ export class AgentManager {
     const runnerSessionId = record.runnerSessionId ?? managed.runnerSessionId;
     return {
       ...safeRecord,
-      id: managed.id, // A status-written id must not select another run's host replay evidence.
+      id: managed.id, // A status-written id must not rebind this managed run's identity.
       ...(managed.finalAnswer ? { finalAnswerReceipt: { id: managed.finalAnswer.id, recordedAt: managed.finalAnswer.recordedAt } } : {}),
       ...(managed.finalAnswerResult ? {
         status: managed.finalAnswerResult.status, text: managed.finalAnswerResult.text,

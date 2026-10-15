@@ -490,8 +490,9 @@ export class RootInbox {
     const claimed = has(claim) || (kind === "key" && session.holdsSteer(event.from.id, value, event.topic));
     const through = this.#state!.fallbackThrough;
     const at = session.delivered?.has(claim) ? session.deliveredAt?.get(claim) : this.#delivered.get(claim);
-    // Forgetting a spent marker must fail open, even if canonical history still holds its
-    // native carrier. The bounded ledger's eviction watermark retires those older claims.
+    // Canonical history can outlive its cursor receipt, even for an unused claim. Expiry
+    // and eviction must fail open rather than resurrect that old carrier's suppression.
+    if (at !== undefined && at < this.#now() - this.#horizon()) return false;
     if (through !== undefined && (at === undefined || at <= through)) return false;
     if (!claimed || this.#fallbacks.has(claim) || reservations?.has(claim)) return false;
     reservations?.add(claim);
@@ -544,7 +545,9 @@ export class RootInbox {
       ...[...this.#fallbacks].map(([id, at]): ["fallback", string, number] => ["fallback", id, at]),
     ].sort((a, b) => a[2] - b[2]);
     const entries = all.slice(-MAX_DELIVERED_RECEIPTS);
-    for (const [kind, , at] of all.slice(0, -MAX_DELIVERED_RECEIPTS)) if (kind === "fallback") retire(at);
+    // Hashes do not expose receipt kind. Retire every evicted timestamp conservatively;
+    // the watermark affects only legacy fallback, never the exact-ID checks above it.
+    for (const [, , at] of all.slice(0, -MAX_DELIVERED_RECEIPTS)) retire(at);
     const baseThrough = state.fallbackThrough;
     const assign = (offset: number): void => {
       if (baseThrough === undefined) delete state.fallbackThrough;
@@ -557,7 +560,7 @@ export class RootInbox {
       state.fallbacks = fallbacks.map(([, id]) => id);
       state.fallbackAt = fallbacks.map(([, , at]) => at);
       // Include the final watermark in every byte-budget candidate, not after sizing it.
-      for (const [kind, , at] of entries.slice(0, offset)) if (kind === "fallback") retire(at);
+      for (const [, , at] of entries.slice(0, offset)) retire(at);
     };
     // Account for the actual cursor and pending IDs too. Byte-size (not count) protects
     // configured small mesh values; count also caps memory at the default/larger limit.

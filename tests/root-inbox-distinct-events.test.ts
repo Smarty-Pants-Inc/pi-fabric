@@ -230,6 +230,69 @@ describe("distinct same-key mesh events (smarty-dev#12140)", () => {
     expect(ids((await h.box().next(h.session())).events)).toEqual([later.id]);
   });
 
+  it.each(["key", "ref"] as const)("fails open after an UNUSED %s-only native claim expires without a shadow", async (kind) => {
+    const h = setup(0, { horizonMs: 100 });
+    const inbox = h.box(); inbox.start();
+    const claim = { [kind]: KEY };
+    const hash = createHash("sha256").update(JSON.stringify([watcher.id, `native-topic-${kind}`, JSON.stringify([TOPIC, KEY])])).digest("hex");
+    h.main.deliverAgent({ from: watcher, message: "unused native", delivery: "steer", data: { ...claim, topic: TOPIC } });
+    // Persist the native receipt without ever publishing its legacy shadow.
+    await inbox.next(h.session(), { commitOnly: true });
+    const initial = h.mesh.get(inbox.key)!.value as { delivered?: string[]; fallbacks?: string[] };
+    expect(initial.delivered).toContain(hash);
+    expect(initial.fallbacks ?? []).toEqual([]);
+    h.advance(101);
+    await h.box().next(h.session(), { commitOnly: true });
+    const expired = h.mesh.get(inbox.key)!.value as typeof initial;
+    expect(expired.delivered ?? []).not.toContain(hash);
+    expect(expired.fallbacks ?? []).toEqual([]);
+    expect(h.session().delivered?.has(hash)).toBe(true); // Canonical old carrier remains.
+    const later = await h.publish("new identity-less work after unused claim expiry", claim);
+    expect(ids((await h.box().next(h.session())).events)).toEqual([later.id]);
+  });
+
+  it.each(["key", "ref"] as const)("keeps an UNUSED %s-only native claim fresh at the exact 100ms boundary", async (kind) => {
+    const h = setup(0, { horizonMs: 100 });
+    const inbox = h.box(); inbox.start();
+    const claim = { [kind]: KEY };
+    h.main.deliverAgent({ from: watcher, message: "fresh native", delivery: "steer", data: { ...claim, topic: TOPIC } });
+    await inbox.next(h.session(), { commitOnly: true });
+    h.advance(100);
+    await h.box().next(h.session(), { commitOnly: true });
+    await h.publish("first legacy shadow at exact boundary", claim);
+    const later = await h.publish("subsequent legacy work at exact boundary", claim);
+    expect(ids((await h.box().next(h.session())).events)).toEqual([later.id]);
+  });
+
+  it.each([[4096, 42], [128 * 1024, 1100]])("fails open after capacity trimming an UNUSED native receipt at %i bytes", async (maxEventBytes, count) => {
+    const h = setup(0, { maxEventBytes });
+    const now = Date.now();
+    const hash = (key: string) => createHash("sha256").update(JSON.stringify([watcher.id, "native-topic-key", JSON.stringify([TOPIC, key])])).digest("hex");
+    h.advance(-1000);
+    h.main.deliverAgent({ from: watcher, message: "unused old native", delivery: "steer", data: { key: KEY, topic: TOPIC } });
+    h.advance(1000);
+    const native = hash(KEY);
+    const delivered = [native, ...Array.from({ length: count - 1 }, (_, i) => hash(`unused-capacity-${i}`))];
+    const seed = { after: h.mesh.latestSequence(), delivered,
+      deliveredAt: [now - 1000, ...delivered.slice(1).map((_, i) => now - 100 + Math.floor(i / count * 99))] };
+    const bytes = (value: unknown) => Buffer.byteLength(JSON.stringify(value), "utf8");
+    expect(bytes(seed)).toBeLessThan(maxEventBytes);
+    if (maxEventBytes === 4096) expect(bytes(seed)).toBeGreaterThan(maxEventBytes * 0.75);
+    const key = h.box().key;
+    // No fallbacks/spent marker: only an unused native receipt plus delivered fillers.
+    await h.mesh.put({ key, identity: me, value: seed });
+    await h.box().next(h.session(), { commitOnly: true });
+    const saved = h.mesh.get(key)!.value as typeof seed & { fallbacks?: string[]; fallbackThrough?: number };
+    expect(saved.delivered).not.toContain(native);
+    expect(saved.fallbacks ?? []).toEqual([]);
+    expect(saved.delivered.length).toBeLessThan(delivered.length);
+    expect(bytes(saved)).toBeLessThanOrEqual(Math.floor(maxEventBytes * 0.75));
+    expect(h.session().delivered?.has(native)).toBe(true);
+    const later = await h.publish("new identity-less work after unused receipt eviction");
+    expect(ids((await h.box().next(h.session())).events)).toEqual([later.id]);
+    expect(saved.fallbackThrough).toBeGreaterThanOrEqual(now - 1000);
+  });
+
   it("expires fallback claims and native receipts at the same horizon and durably saves expiry", async () => {
     const horizonMs = 100;
     const h = setup(0, { horizonMs });

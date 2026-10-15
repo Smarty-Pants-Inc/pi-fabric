@@ -2,4 +2,4 @@ Scope decision: the concurrent diagnostics append/rotate size-check race is exac
 
 Principal console sweep: the only remaining `console.warn`/`console.error` call sites are `src/core/diagnostics.ts:96-97`, which are the intentional non-principal fallback inside `!isPrincipalDiagnostics()`; the `src/topology/control-plane.ts:374` and `src/topology/participant-directory.ts:682` matches are documentation comments, not calls. Principal-reachable Fabric diagnostics now use the private diagnostics helper, including the parked actor recovery path. The fixture compatibility refusal uses `process.stderr.write` because it is an explicit safety refusal that must remain visible to the fixture user, not an internal diagnostic.
 
-Test model: no task agents were used before the final audit; final audit model will be recorded here when its verdict arrives.
+Final audit: CODE_REVIEW: PASS 41801a58b58e78d3df0ab1865114511336fffc54; SECURITY_REVIEW: PASS 41801a58b58e78d3df0ab1865114511336fffc54. Model: cliproxyapi/gpt-6-luna, max; task id 778b6ce90e23438cb831ae4784926a38. The auditor found no file:line findings; local targeted gates independently passed.

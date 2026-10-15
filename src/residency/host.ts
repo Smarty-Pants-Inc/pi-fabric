@@ -414,9 +414,14 @@ export class ResidentHost {
 
   #initialize(): void {
     const { config, modelRegistry } = this;
+    // Follow moved-marker/meta authority even after a stale backend config re-apply.
+    const stateBackend = meshStateBackendFromMarker(config.meshRoot, config.mesh.stateBackend);
+    if (stateBackend === "sqlite" && stateBackend !== config.mesh.stateBackend) {
+      console.warn(`[pi-fabric] resident mesh ${config.meshRoot}: SQLite moved marker overrides mesh.stateBackend=${config.mesh.stateBackend}; opening sqlite`);
+    }
     this.mesh = new MeshStore(config.meshRoot, config.mesh.maxEventBytes, config.mesh.maxReadEvents,
       { backgroundReadCacheMs: config.mesh.idleReadCoalesceMs ?? RUNTIME_MESH_READ_CACHE_MS, lockProtocol: config.mesh.lockProtocol,
-        stateBackend: meshStateBackendFromMarker(config.meshRoot, config.mesh.stateBackend),
+        stateBackend,
         canWakeResidents: () => this.#ready && !this.#closed && !this.#staged && !this.#handover && !this.#drain });
     this.#deliveryCommits = new CommitOutbox(this.mesh, `residency/${this.hostId}/deliveries`, this.identity, {
       delivery: (record: ResidentDeliveryRecord, view, replay) => this.#writeDelivery(record, view, replay),

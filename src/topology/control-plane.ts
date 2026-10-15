@@ -611,7 +611,7 @@ export class FabricControlPlane {
       return undefined;
     }
     const commandId = createHash("sha256").update(JSON.stringify([
-      this.options.hostId, from.id, targetId, "startup-followUp", idempotencyKey,
+      this.options.hostId, targetId, targetId, targetId, "followUp", idempotencyKey, 0,
     ])).digest("hex");
     const key = STARTING_QUEUE_PREFIX + commandId;
     await withOwnedHostLease(this.mesh, lease, async () => {

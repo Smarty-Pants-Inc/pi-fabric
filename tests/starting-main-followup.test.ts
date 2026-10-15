@@ -113,6 +113,68 @@ describe("same-session native Main startup inbox", () => {
     await directory.close();
   });
 
+  it("dedups the same key across startup readiness while a fresh key still delivers", async () => {
+    const root = temp(), mesh = new MeshStore(root, 65_536, 1_000);
+    const manager = SessionManager.create(root, path.join(root, "sessions"));
+    const sessionId = manager.getSessionId(), targetId = `session:${sessionId}`;
+    const senderIdentity: MeshIdentity = { id: "session:sender", name: "Sender", kind: "main" };
+    const receiverIdentity: MeshIdentity = { id: targetId, name: "Receiver", kind: "main" };
+    const receipt = await claim(root, sessionId);
+    const source = new ParticipantDirectory(mesh, { enabled: true, hostId: senderIdentity.id,
+      rootId: senderIdentity.id, identity: senderIdentity });
+    const directory = new ParticipantDirectory(new MeshStore(root, 65_536, 1_000), { enabled: true,
+      hostId: targetId, rootId: targetId, identity: receiverIdentity, startingHost: receipt });
+    directory.registerSource(() => [{ format: 1, id: targetId, rootId: targetId, kind: "root",
+      ownerHostId: targetId, ownerIdentityId: targetId, name: "Receiver", status: "idle", runner: "pi",
+      transport: "host", controlProtocol: "v1", cwd: root, sessionId, interactive: true,
+      capabilities: ["followUp", "steer"], startedAt: Date.now(), updatedAt: Date.now() }]);
+    try {
+      const sender = plane(mesh, senderIdentity); sender.start(() => ({ accepted: false }));
+      const router = route(senderIdentity, rootMain(senderIdentity.id), sender, source);
+      const queued = await router.routeMessage(targetId, "same request", undefined, "followUp", undefined,
+        { idempotencyKey: "ready-transition" });
+      expect(queued).toMatchObject({ queued: true, reason: "startup-inbox-durable" });
+      const native: any[] = [];
+      const api = { on: () => {}, sendMessage: (message: any) => {
+        native.push(message);
+        manager.appendCustomMessageEntry(message.customType, message.content, true, message.details);
+        manager.appendMessage(fauxAssistantMessage("persist receipt"));
+      } } as unknown as ExtensionAPI;
+      const main = new MainAgentController(api, targetId, true, root, sessionId); mains.push(main);
+      main.attachFollowUpDrain({ sessionManager: manager, isIdle: () => true,
+        hasPendingMessages: () => false } as unknown as ExtensionContext,
+      60_000, path.join(root, "main-followups", `${sessionId}.json`));
+      await directory.start();
+      const receiver = plane(directory.mesh, receiverIdentity, directory.ownerIncarnation);
+      const targetRouter = route(receiverIdentity, main);
+      receiver.start((...args) => targetRouter.acceptControl(...args));
+      await vi.waitFor(() => expect((mesh.listAll("topology/starting-followups/", { fresh: true })[0]!.value as any)
+        .acceptance?.accepted).toBe(true));
+      await directory.finishStartup(); receiver.notifyStartupReady();
+      expect(readHostLeaseCurrent(root, targetId)?.startup).toBeUndefined();
+      await source.start(); await source.refresh();
+      expect(source.get(targetId)).toMatchObject({ ownerHostId: targetId, ownerIdentityId: targetId });
+      const duplicate = await router.routeMessage(targetId, "same request", undefined, "followUp", undefined,
+        { idempotencyKey: "ready-transition" });
+      const commands = mesh.read({ topic: "fabric.control.command", limit: 100 });
+      expect((commands.at(-1)!.data as any).commandId).toBe(queued.messageId);
+      expect(duplicate.messageId).toBe(native[0].details.id);
+      expect(native).toHaveLength(1);
+      const receipts = () => fs.readFileSync(manager.getSessionFile()!, "utf8").trim().split("\n")
+        .map(line => JSON.parse(line)).filter(entry => entry.type === "custom_message" &&
+          entry.customType === "pi-fabric-agent-message");
+      expect(receipts()).toHaveLength(1);
+      expect(receipts()[0].details.deliveryId).toBe(queued.messageId);
+      const fresh = await router.routeMessage(targetId, "fresh request", undefined, "followUp", undefined,
+        { idempotencyKey: "after-readiness" });
+      expect(fresh.messageId).not.toBe(queued.messageId);
+      expect(native).toHaveLength(2);
+      expect(receipts()).toHaveLength(2);
+    } finally {
+      await source.close(); await directory.close();
+    }
+  });
+
   it("wakes event-driven consumption when the first event drains before the durable row commits", async () => {
     const root = temp(), sessionId = randomUUID(), id = `session:${sessionId}`;
     const receipt = await claim(root, sessionId);

@@ -17,8 +17,9 @@
  * - a root this process just created (a non-recursive mkdir that succeeded) gets, through the built-in icacls, an
  *   explicit owner (the current user) and a protected DACL: current user and SYSTEM full control, (OI)(CI); it is read
  *   back in the same child. An existing root is never repaired or adopted.
- * When the child cannot run at all (no SystemRoot, no powershell.exe, timeout, global script failure), the gate
- * warns once per process and opens as before (issue step 5). Malformed output after a successful run refuses.
+ * Existing-path reads retain warn-once/fail-open for missing tooling, timeout or global script failure (issue step 5;
+ * nonzero/timeout residual: smarty-dev#13459). A newly created root MUST have its private ACL set: every protect
+ * runner failure refuses. Output overflow (incomplete evidence) and malformed successful output always refuse.
  */
 import childProcess from "node:child_process";
 import path from "node:path";
@@ -54,6 +55,9 @@ try {
   if ($request.protect) {
     try {
       $target = [string]$request.protect
+      # Do not change an ACL through a reparse point swapped in after the caller's lexical preflight.
+      $attributes = [System.IO.File]::GetAttributes($target)
+      if (($attributes -band 1024) -ne 0 -or ($attributes -band 16) -eq 0) { throw 'not a plain directory' }
       $before = (Get-Acl -LiteralPath $target).GetOwner([System.Security.Principal.SecurityIdentifier]).Value
       $elevated = $before -eq 'S-1-5-32-544' -and $identity.Owner.Value -eq 'S-1-5-32-544'
       if ($before -ne $user.Value -and -not $elevated) { throw "owner $before" }
@@ -109,13 +113,14 @@ export interface WindowsStateAclRequest {
   real: string;
   /**
    * What `root` is: the state root (default), or a single private path judged by itself (assertPrivatePath's direct
-   * callers: the flag directory, a state file), with its parent chain as ancestors.
+   * callers: the flag directory, a state file), with its parent chain as ancestors. `ancestor` is the existing
+   * parent of a missing component, preflighted before creation with the unchanged ancestor policy.
    */
-  role?: "root" | "directory" | "file";
+  role?: "root" | "directory" | "file" | "ancestor";
   /** Strict targets inside the root; a missing one passes (as in assertPrivatePath). */
   files: string[];
   directories: string[];
-  /** Set the private ACL first: only for a root this process just created. */
+  /** Set the private ACL first: only for a root this process just created. Every runner failure then refuses. */
   protect?: boolean;
 }
 
@@ -174,7 +179,21 @@ export const windowsStateAclRefusal = (request: WindowsStateAclRequest, run: Win
   for (const file of request.files) add(path.win32.resolve(file), "file");
   let output: string;
   try { output = run(JSON.stringify({ protect: request.protect ? root : null, paths: [...paths.keys()] })); }
-  catch (error) { warnUnverified(root, error); return undefined; }
+  catch (error) {
+    // A read-only compatibility fallback cannot prove that a new root was made private. Never create state in it
+    // when the setter did not run or failed, even if missing tooling would be accepted for an existing-root read.
+    if (request.protect) {
+      const reason = error instanceof Error ? error.message.split("\n")[0] : String(error);
+      return `${root} was created but its private ACL could not be set (native ACL reader failed: ${reason})`;
+    }
+    // execFileSync reports either stream overflowing maxBuffer as ENOBUFS (Node 24 spawnSync) or the explicit
+    // max-buffer code. The tool ran but the snapshot is incomplete: this is not the accepted tooling gap.
+    if (record(error) && (error.code === "ENOBUFS" || error.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER")) {
+      return `${root} has an incomplete Windows ACL snapshot (native reader output exceeded its buffer limit)`;
+    }
+    warnUnverified(root, error);
+    return undefined;
+  }
   let snapshot: unknown;
   try { snapshot = JSON.parse(output); } catch { return `${root} has an unreadable Windows ACL snapshot`; }
   if (!record(snapshot) || typeof snapshot.userSid !== "string" || !SID.test(snapshot.userSid) || !Array.isArray(snapshot.entries)

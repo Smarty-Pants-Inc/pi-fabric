@@ -97,7 +97,9 @@ describe.runIf(process.env.GITHUB_ACTIONS === "true" && process.platform === "wi
 
   it.each(Object.keys(opens) as (keyof typeof opens)[])("%s gives a new root an explicit protected ACL: current user and SYSTEM full control, inheritable", async name => {
     const { user } = tokenSids();
-    const root = path.join(profileDir(), "new-root");
+    const root = path.join(profileDir(), "nested", "new-root");
+    expect(fs.existsSync(path.dirname(root))).toBe(false);
+    expect(fs.existsSync(root)).toBe(false);
     await roundTrip(await opens[name](root));
     const acl = readAcl(root);
     expect(acl.owner).toBe(user);
@@ -210,6 +212,27 @@ describe.runIf(process.env.GITHUB_ACTIONS === "true" && process.platform === "wi
     expect(error).toMatchObject({ ...UNSUPPORTED, message: expect.stringContaining(junction) });
     expect((error as Error).message).toMatch(/state root.*path with no junctions/i);
     await roundTrip(await openAsync(root));
+  }, 120_000);
+
+  it("refuses a nested missing root below a junction without changing the target", async () => {
+    const parent = profileDir();
+    const target = path.join(parent, "target");
+    ownedDirectory(target);
+    const junction = path.join(parent, "junction");
+    fs.symlinkSync(target, junction, "junction");
+    const targetAcl = readAcl(target).sddl;
+    const targetChildren = fs.readdirSync(target).sort();
+    const root = path.join(junction, "new", "mesh");
+    expect(fs.existsSync(path.dirname(root))).toBe(false);
+    expect(fs.existsSync(root)).toBe(false);
+
+    for (const name of Object.keys(opens) as (keyof typeof opens)[]) {
+      const error = await refusal(() => opens[name](root));
+      expect(error).toMatchObject({ ...UNSUPPORTED, message: expect.stringContaining(junction) });
+      expect((error as Error).message).toMatch(/state root.*path with no junctions/i);
+      expect(readAcl(target).sddl).toBe(targetAcl);
+      expect(fs.readdirSync(target).sort()).toEqual(targetChildren);
+    }
   }, 120_000);
 
   it("rechecks between two synchronous opens in the same JavaScript turn", async () => {

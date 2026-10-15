@@ -71,6 +71,22 @@ describe("Windows mesh state ACL policy (smarty-dev#8920)", () => {
     expect(calls).toEqual([{ protect: null, paths: defaultEntries().map(entry => entry.path) }]);
   });
 
+  // F1 trust boundary: the nearest existing parent of a missing root uses the approved ANCESTOR policy,
+  // not strict-root policy. Default volume/profile add-child and inherit-only grants must still pass.
+  it("preflights an existing creation parent as an ancestor, refusing reparse points and foreign writers", () => {
+    const parent = "C:\\Users\\me";
+    const input: WindowsStateAclRequest = { root: parent, real: parent, role: "ancestor", files: [], directories: [] };
+    const entries = defaultEntries().slice(2, 5);
+    entries[0] = dir(parent, USER, [...profileDacl(), allow(OTHER, 0x6, 0), allow(CREATOR_OWNER, FULL, 0xb)]);
+    const { run, calls } = runner(entries);
+    expect(windowsStateAclRefusal(input, run)).toBeUndefined();
+    expect(calls).toEqual([{ protect: null, paths: entries.map(entry => entry.path) }]);
+    expect(windowsStateAclRefusal(input, runner([{ ...entries[0], attributes: DIR | 0x400 }, ...entries.slice(1)]).run))
+      .toMatch(/ancestor .* reparse point/);
+    expect(windowsStateAclRefusal(input, runner([{ ...entries[0], dacl: [allow(OTHER, MODIFY, 0)] }, ...entries.slice(1)]).run))
+      .toMatch(/ancestor .* grants .* write, delete or permission rights/);
+  });
+
   it("reads lexical and real ancestors once each", () => {
     const { run, calls } = runner([]);
     windowsStateAclRefusal({ ...request, real: "D:\\data\\mesh", files: [], directories: [] }, run);
@@ -230,18 +246,46 @@ describe("Windows mesh state ACL policy (smarty-dev#8920)", () => {
     expect(windowsStateAclRefusal({ ...single, role: "file" }, runner(entries(USER)).run)).toMatch(/is not a regular file/);
   });
 
-  it("warns once and opens as before when the ACL reader cannot run", () => {
+  // F2 trust boundary: either pipe can exceed execFileSync's maxBuffer. Node 24's observed spawnSync shape is
+  // ENOBUFS/errno -105/status null/SIGTERM; do not mistake that incomplete proof for a missing executable.
+  it.each(["ENOBUFS", "ERR_CHILD_PROCESS_STDIO_MAXBUFFER"])("refuses %s from stdout or stderr overflow without warning", code => {
+    const warn = vi.spyOn(process, "emitWarning").mockImplementation(() => undefined);
+    for (const stream of ["stdout", "stderr"]) {
+      const fail = () => { throw Object.assign(new Error(`${stream} maxBuffer exceeded`),
+        { code, errno: -105, status: null, signal: "SIGTERM", [stream]: "truncated output" }); };
+      expect(windowsStateAclRefusal(request, fail)).toMatch(/incomplete Windows ACL snapshot .*buffer limit/);
+    }
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["ENOENT", { code: "ENOENT" }],
+    ["nonzero exit", { status: 1 }],
+    ["timeout", { code: "ETIMEDOUT", status: null, signal: "SIGTERM" }],
+    ["ENOBUFS", { code: "ENOBUFS", errno: -105, status: null, signal: "SIGTERM" }],
+    ["ERR_CHILD_PROCESS_STDIO_MAXBUFFER", { code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER" }],
+  ] as const)("refuses a new-root setter runner failure (%s), never warning or accepting an unprotected root", (kind, fields) => {
+    const warn = vi.spyOn(process, "emitWarning").mockImplementation(() => undefined);
+    const fail = () => { throw Object.assign(new Error(`native setter ${kind}`), fields); };
+    expect(windowsStateAclRefusal({ ...request, protect: true }, fail)).toMatch(/was created but its private ACL could not be set/);
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("warns once and opens as before for existing-root read ENOENT, nonzero exit and timeout", () => {
     const warn = vi.spyOn(process, "emitWarning").mockImplementation(() => undefined);
     const fail = () => { throw Object.assign(new Error("spawn powershell.exe ENOENT"), { code: "ENOENT" }); };
     expect(windowsStateAclRefusal(request, fail)).toBeUndefined();
     expect(windowsStateAclRefusal(request, fail)).toBeUndefined();
+    for (const fields of [{ status: 1 }, { code: "ETIMEDOUT", status: null, signal: "SIGTERM" }]) {
+      expect(windowsStateAclRefusal(request, () => { throw Object.assign(new Error("native read failed"), fields); })).toBeUndefined();
+    }
     expect(warn).toHaveBeenCalledTimes(1);
     expect(String(warn.mock.calls[0]![0])).toMatch(/could not read Windows ACLs \(spawn powershell\.exe ENOENT\)/);
   });
 });
 
 describe("state gate wiring on win32 (smarty-dev#8920)", () => {
-  afterEach(() => { vi.doUnmock("../src/mesh/windows-state-acl.js"); vi.resetModules(); });
+  afterEach(() => { vi.restoreAllMocks(); vi.doUnmock("../src/mesh/windows-state-acl.js"); vi.resetModules(); });
 
   const asWindows = async <T>(run: () => Promise<T>): Promise<T> => {
     const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
@@ -276,9 +320,10 @@ describe("state gate wiring on win32 (smarty-dev#8920)", () => {
     await asWindows(async () => {
       gate.createStateRoot(root);
       gate.createStateRoot(root); // exists now: never re-protected
-      expect(calls.map(call => call.protect)).toEqual([true]);
-      expect(calls[0]!.files.map(file => path.basename(file))).toEqual(["state.db", "state.db-wal", "state.db-shm"]);
-      expect(calls[0]!.directories.map(dir => path.basename(dir))).toEqual(["state-checkpoint.flags"]);
+      expect(calls.map(call => call.protect)).toEqual([false, true]);
+      expect(calls[0]).toMatchObject({ root: path.dirname(root), role: "ancestor", files: [], directories: [] });
+      expect(calls[1]!.files.map(file => path.basename(file))).toEqual(["state.db", "state.db-wal", "state.db-shm"]);
+      expect(calls[1]!.directories.map(dir => path.basename(dir))).toEqual(["state-checkpoint.flags"]);
     });
   });
 
@@ -396,22 +441,122 @@ describe("state gate wiring on win32 (smarty-dev#8920)", () => {
     expect(calls.every(call => call.root === root && call.protect === false && call.directories.length === 1)).toBe(true);
   });
 
-  // F3: a recursive mkdir returns the FIRST directory it created. If another account creates the root right after
-  // its missing parent was made, the root is theirs: it must never be re-owned or re-ACLed as ours.
-  it("never protects a root another account created at the recursive-parent boundary", async () => {
+  // F1 recorded creation counterexample: a missing root through a junction used to mutate the target before
+  // refusing. Exercise both public entrypoints, including their BEFORE-fence create path, on a real link fixture.
+  it.each(["create", "detached"] as const)("public sync/async opens refuse a missing root below a junction before any mutation (%s)", async initialize => {
+    const { calls } = await loadGate(undefined);
+    const { SqliteStateStore } = await import("../src/mesh/state-sqlite.js");
+    const base = tmp();
+    const target = path.join(base, "target");
+    fs.mkdirSync(target);
+    fs.writeFileSync(path.join(target, "sentinel"), "unchanged");
+    const junction = path.join(base, "junction");
+    fs.symlinkSync(target, junction, "junction");
+    const root = path.join(junction, "new", "mesh");
+    const mkdir = vi.spyOn(fs, "mkdirSync");
+    await asWindows(async () => {
+      expect(() => SqliteStateStore.openSync(root, 1024, 16, { initialize }))
+        .toThrow(expect.objectContaining({ code: "FABRIC_MESH_STATE_UNSUPPORTED", message: expect.stringContaining(junction) }));
+      await expect(SqliteStateStore.open(root, 1024, 16, { initialize })).rejects.toThrow(/path with no junctions or symbolic links/);
+    });
+    expect(mkdir).not.toHaveBeenCalled();
+    expect(calls).toEqual([]); // no protect, hence no target ACL mutation
+    expect(fs.readdirSync(target)).toEqual(["sentinel"]);
+    expect(fs.readFileSync(path.join(target, "sentinel"), "utf8")).toBe("unchanged");
+  });
+
+  it("public new-root opens refuse a failed setter before the fence or state.db creation", async () => {
+    const why = "new root was created but its private ACL could not be set (native ACL reader failed: ENOENT)";
+    const { calls } = await loadGate(undefined, [undefined, why, undefined, why]);
+    const { SqliteStateStore } = await import("../src/mesh/state-sqlite.js");
+    const base = tmp();
+    const sync = path.join(base, "sync");
+    const asyncRoot = path.join(base, "async");
+    const open = vi.fn();
+    await asWindows(async () => {
+      expect(() => SqliteStateStore.openSync(sync, 1024, 16, { initialize: "create", open }))
+        .toThrow(expect.objectContaining({ code: "FABRIC_MESH_STATE_UNSUPPORTED", message: expect.stringContaining("private ACL could not be set") }));
+      await expect(SqliteStateStore.open(asyncRoot, 1024, 16, { initialize: "create", open })).rejects.toThrow(/private ACL could not be set/);
+    });
+    expect(calls.map(call => [call.root, call.protect])).toEqual([[base, false], [sync, true], [base, false], [asyncRoot, true]]);
+    expect(open).not.toHaveBeenCalled();
+    expect(fs.readdirSync(sync)).toEqual([]); // no custody.lock/.lock or state.db
+    expect(fs.readdirSync(asyncRoot)).toEqual([]);
+  });
+
+  it.each(["is a reparse point", "grants S-1-1-0 write"])("refuses a native ancestor preflight that %s before any mkdir or protect", async why => {
+    const { gate, calls } = await loadGate(why);
+    const base = tmp();
+    const root = path.join(base, "new", "mesh");
+    const mkdir = vi.spyOn(fs, "mkdirSync");
+    await asWindows(async () => { expect(() => gate.createStateRoot(root)).toThrow(why); });
+    expect(mkdir).not.toHaveBeenCalled();
+    expect(calls).toEqual([expect.objectContaining({ root: base, role: "ancestor", protect: false, files: [], directories: [] })]);
+    expect(fs.readdirSync(base)).toEqual([]);
+  });
+
+  it("creates a missing ordinary parent chain non-recursively, checking each new parent before using it", async () => {
+    const { gate, calls } = await loadGate(undefined);
+    const base = tmp();
+    const parent = path.join(base, "new");
+    const root = path.join(parent, "mesh");
+    const mkdir = vi.spyOn(fs, "mkdirSync");
+    await asWindows(async () => { gate.createStateRoot(root); });
+    expect(mkdir.mock.calls).toEqual([[parent, { mode: 0o700 }], [root, { mode: 0o700 }]]);
+    expect(calls.map(call => [call.root, call.role, call.protect])).toEqual([
+      [base, "ancestor", false], [parent, "ancestor", false], [root, undefined, true],
+    ]);
+    expect(fs.lstatSync(root).isDirectory()).toBe(true);
+  });
+
+  it("refuses a newly created parent whose inherited ACL is unsafe before creating its child", async () => {
+    const { gate, calls } = await loadGate(undefined, [undefined, "new parent grants S-1-1-0 write"]);
+    const base = tmp();
+    const root = path.join(base, "new", "mesh");
+    await asWindows(async () => { expect(() => gate.createStateRoot(root)).toThrow(/new parent grants/); });
+    expect(fs.readdirSync(path.dirname(root))).toEqual([]);
+    expect(calls.map(call => call.protect)).toEqual([false, false]);
+  });
+
+  it("rechecks a created parent before continuing if it is replaced by a junction", async () => {
+    const { gate, calls } = await loadGate(undefined);
+    const base = tmp();
+    const target = path.join(base, "target");
+    fs.mkdirSync(target);
+    const parent = path.join(base, "new");
+    const root = path.join(parent, "mesh");
+    const mkdir = fs.mkdirSync.bind(fs);
+    const made: fs.PathLike[] = [];
+    vi.spyOn(fs, "mkdirSync").mockImplementation(((file: fs.PathLike, options?: fs.MakeDirectoryOptions) => {
+      made.push(file);
+      const result = mkdir(file, options);
+      if (file === parent) {
+        fs.renameSync(parent, path.join(base, "moved-parent"));
+        fs.symlinkSync(target, parent, "junction");
+      }
+      return result;
+    }) as typeof fs.mkdirSync);
+    await asWindows(async () => { expect(() => gate.createStateRoot(root)).toThrow(/path with no junctions/); });
+    expect(made).toEqual([parent]);
+    expect(calls.map(call => call.protect)).toEqual([false]);
+    expect(fs.readdirSync(target)).toEqual([]);
+  });
+
+  // EEXIST at either boundary is someone else's directory, never our permission to protect, repair or adopt it.
+  it.each(["parent", "root"])("never adopts or protects an EEXIST winner at the %s boundary", async winner => {
     const { gate, calls } = await loadGate(undefined);
     const root = path.join(tmp(), "missing-parent", "mesh");
+    const parent = path.dirname(root);
     const mkdir = fs.mkdirSync.bind(fs);
     const made: unknown[][] = [];
     vi.spyOn(fs, "mkdirSync").mockImplementation(((target: fs.PathLike, options?: fs.MakeDirectoryOptions) => {
       made.push([target, options?.recursive ?? false]);
-      if (target === root && !options?.recursive) mkdir(root); // the other account wins the race
+      if (target === (winner === "root" ? root : parent)) mkdir(target); // another account wins
       return mkdir(target, options);
     }) as typeof fs.mkdirSync);
-    try {
-      await asWindows(async () => { gate.createStateRoot(root); });
-    } finally { vi.mocked(fs.mkdirSync).mockRestore(); }
-    expect(made).toEqual([[path.dirname(root), true], [root, false]]);
-    expect(calls).toEqual([]); // no protect, no mutation: the gate judges it on open
+    await asWindows(async () => { expect(() => gate.createStateRoot(root)).toThrow(/appeared during creation; it was not adopted/); });
+    expect(made).toEqual(winner === "root" ? [[parent, false], [root, false]] : [[parent, false]]);
+    expect(calls.map(call => call.protect)).toEqual(winner === "root" ? [false, false] : [false]);
+    expect(fs.readdirSync(winner === "root" ? root : parent)).toEqual([]);
   });
 });

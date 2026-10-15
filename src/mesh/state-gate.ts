@@ -286,18 +286,44 @@ export const assertPrivateStateRoot = (root: string, db = "state.db"): void => {
 
 /**
  * smarty-dev#8920: creates a missing state root (mode 0700). POSIX: the same recursive mkdir as before, nothing
- * else. Windows: missing parents first, then the root itself non-recursively, because a recursive mkdir reports the
- * FIRST directory it created, not that the root is ours. Only when that final mkdir succeeded does the root get an
- * explicit owner (the current user) and a protected private DACL, read back; EEXIST (someone else's root, even one
- * made between the two calls) is never changed, only judged by the gate. Windows callers run it BEFORE the fence
+ * else. Windows: walk lexical components with lstat from the volume down, then judge the existing ancestor ACLs
+ * BEFORE each non-recursive mkdir. Recheck the chain before continuing, including before protecting our new root.
+ * Only a successful final mkdir permits an explicit owner (the current user) and protected private DACL, read back.
+ * An EEXIST winner is refused, never repaired or adopted. Existing roots get no ACL read here (the open reads once).
+ * Windows callers run it BEFORE the fence
  * (custody-lock.ts and fence-lock.ts create the root too, untracked), so the fence's root is already private.
  */
 export const createStateRoot = (root: string): void => {
   if (process.platform !== "win32") { fs.mkdirSync(root, { recursive: true, mode: 0o700 }); return; }
-  fs.mkdirSync(path.dirname(path.resolve(root)), { recursive: true, mode: 0o700 });
-  try { fs.mkdirSync(root, { mode: 0o700 }); }
-  catch (error) { if ((error as NodeJS.ErrnoException).code === "EEXIST") return; throw error; }
-  checkPrivatePath(root, "directory");
+  const chain = [path.resolve(root)];
+  while (path.dirname(chain[0]!) !== chain[0]) chain.unshift(path.dirname(chain[0]!));
+  const refuse = (why: string) => new MeshStateUnsupportedError(`Fabric mesh SQLite state refuses ${root}: ${why}`);
+  // Start at the volume: lstat of a descendant alone would follow an unchecked junction in its parent path.
+  const existing = (): number => {
+    for (const [index, component] of chain.entries()) {
+      const stat = fs.lstatSync(component, { throwIfNoEntry: false });
+      if (!stat) return index;
+      if (stat.isSymbolicLink()) throw refuse(`${component} is a reparse point (junction or symbolic link); `
+        + "set the mesh state root to a path with no junctions or symbolic links in it");
+      if (!stat.isDirectory()) throw refuse(`${component} is not a directory`);
+    }
+    return chain.length;
+  };
+  const firstMissing = existing();
+  if (firstMissing === chain.length) return;
+  for (let index = firstMissing; index < chain.length; index += 1) {
+    const parent = chain[index - 1];
+    if (!parent || existing() !== index) throw refuse("its directory chain changed before creation");
+    // `parent` is an ancestor, NOT a strict state root: default profile/volume add-child and inherit-only rules apply.
+    assertWindowsAcl(parent, { role: "ancestor", files: [], directories: [] }, false);
+    if (existing() !== index) throw refuse("its directory chain changed during the ancestor ACL read");
+    try { fs.mkdirSync(chain[index]!, { mode: 0o700 }); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") throw refuse(`${chain[index]} appeared during creation; it was not adopted`);
+      throw error;
+    }
+  }
+  if (existing() !== chain.length) throw refuse("its directory chain changed before setting the private ACL");
   assertWindowsAcl(root, stateTargets(root, "state.db"), true);
 };
 
@@ -309,9 +335,9 @@ const stateTargets = (root: string, db: string) => {
 };
 // Every call reads the native descriptors afresh: no proof is cached or shared between calls, so an ACE added
 // between two checks (even in one synchronous turn) is seen. An open reads once (a Windows create path runs its
-// state.db create inside the gate, after this read); a root this call creates reads once more first (createStateRoot:
-// the protect step and its readback).
-type AclTargets = { role?: "root" | "directory" | "file"; files: string[]; directories: string[] };
+// state.db create inside the gate, after this read). Creating N missing directories first costs N ancestor preflight
+// reads (one before each mkdir), plus the root's protect/readback; none of those reads is cached for the open.
+type AclTargets = { role?: "root" | "directory" | "file" | "ancestor"; files: string[]; directories: string[] };
 const assertWindowsAcl = (root: string, targets: AclTargets, protect: boolean): void => {
   let real: string;
   // The real chain is the parent's: the target itself is never followed (a reparse point is refused as such).

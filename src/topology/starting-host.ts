@@ -70,13 +70,24 @@ export class FabricHostLeasePredecessorBusyError extends Error {
   }
 }
 
-/** Watch before rereading. Notifications only trigger a new custody check; silence or
- * watch failure waits for ONE expiry timer, never a polling fallback. */
+export class FabricHostLeaseWatchError extends Error {
+  override readonly name = "FabricHostLeaseWatchError";
+  readonly code = "FABRIC_HOST_LEASE_WATCH_FAILED";
+  readonly retryable = true;
+  constructor(readonly predecessor: FabricHostLease, cause: unknown) {
+    super(`Fabric host ${predecessor.id}: predecessor notifications unavailable; retry startup`, { cause });
+  }
+}
+
+/** Watch before rereading. Only this lease's snapshot/exit wakes custody. Watch failure
+ * gets an immediate reread and ONE bounded expiry reread, never polling or a TTL steal. */
 const waitForPredecessorChange = (meshRoot: string, predecessor: FabricHostLease): Promise<void> =>
   new Promise((resolve, reject) => {
     let settled = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
     let unwatch: (() => void) | undefined;
+    let watchError: FabricHostLeaseWatchError | undefined;
+    const deadline = Math.min(predecessor.expiresAt, Date.now() + HOST_STARTUP_BOUND_MS);
     const finish = (error?: unknown): void => {
       if (settled) return;
       settled = true;
@@ -91,14 +102,32 @@ const waitForPredecessorChange = (meshRoot: string, predecessor: FabricHostLease
           predecessorProcess(predecessor) === "exited") finish();
       } catch (error) { finish(error); }
     };
-    try {
-      const stop = watchBridgeStore(meshRoot, () => finish(), () => { /* Keep the expiry timer. */ });
-      if (settled) { stop(); return; }
-      unwatch = stop;
-    } catch { /* No polling fallback. */ }
+    const wake = (): void => {
+      if (watchError) { check(); if (!settled) finish(watchError); }
+      else finish();
+    };
+    const failed = (error: unknown): void => {
+      if (settled || watchError) return;
+      watchError = new FabricHostLeaseWatchError(predecessor, error);
+      try { unwatch?.(); } catch { /* best effort */ }
+      unwatch = undefined;
+      check();
+      if (!settled && Date.now() >= deadline) finish(watchError);
+      else if (!settled && predecessor.expiresAt > deadline) {
+        // Shorten an unusually distant expiry ONCE on failure, not a retry timer loop.
+        if (timer !== undefined) clearTimeout(timer);
+        timer = setTimeout(wake, Math.max(0, deadline - Date.now()));
+      }
+    };
     const remaining = predecessor.expiresAt - Date.now();
-    // After expiry a proven-live owner stays fenced: lease notifications only, no zero-timer spin.
-    if (remaining > 0) timer = setTimeout(() => finish(), Math.min(2_147_483_647, remaining));
+    // Keep the existing positive expiry wake; after expiry a healthy watch has no zero-timer spin.
+    if (remaining > 0) timer = setTimeout(wake, Math.min(2_147_483_647, remaining));
+    try {
+      const stop = watchBridgeStore(meshRoot, check, failed);
+      // A synchronous failure may arrive before the cleanup handle exists.
+      if (settled || watchError) stop();
+      else unwatch = stop;
+    } catch (error) { failed(error); }
     check();
   });
 

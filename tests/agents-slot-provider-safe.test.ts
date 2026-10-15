@@ -7,7 +7,7 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agents/manager.js";
 import type { FabricActorRequest } from "../src/actors/types.js";
-import { cancellationError } from "../src/async-settlement.js";
+import { cancellationError, preserveCancellationOutcome } from "../src/async-settlement.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import type { FabricInvocationContext } from "../src/protocol.js";
 import { AgentsProvider } from "../src/providers/agents-provider.js";
@@ -23,7 +23,7 @@ const context = (signal?: AbortSignal) => ({
   update() {}, activity() {},
 }) as unknown as FabricInvocationContext;
 type Args = ConstructorParameters<typeof AgentsProvider>;
-type CreateOptions = { beforeCommit(id: string): void; checkActive(): void; onCommit(id: string): void };
+type CreateOptions = { beforeCommit(id: string, nativeBoundary?: boolean): void; checkActive(): void; onCommit(id: string): void };
 const setup = () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "agents-slot-provider-safe-"));
   roots.push(root);
@@ -103,14 +103,53 @@ describe("safe actor provider admission boundary", () => {
     expect(cancellationError(signal, cancelled)).toBe(cancelled);
   });
 
-  it.each([false, true])("preserves commit/cancellation outcomes (claim=%s)", async claimed => {
+  it.each([undefined, false])("does not invent a commit for an ordinary claimed create (native boundary=%s)", async nativeBoundary => {
+    const { provider, create } = setup();
+    const controller = new AbortController();
+    const cancelled = new Error("cancelled before ordinary materialization");
+    let boundaryOutcome: Error | undefined;
+    create.mockImplementationOnce(async (request, options) => {
+      options.beforeCommit("never-created", nativeBoundary);
+      controller.abort(cancelled);
+      boundaryOutcome = cancellationError(controller.signal, cancelled);
+      options.checkActive();
+      throw new Error("Cancelled ordinary create reached materialization");
+    });
+    const failure = await provider.invoke("create", { name: "ordinary", instructions: "Work.",
+      topics: ["ordinary.topic"], slotClaim: claim, idempotencyKey: "irrelevant-claim" }, context(controller.signal))
+      .catch((error: unknown) => error);
+    expect(boundaryOutcome).toBe(cancelled);
+    expect(failure).toBe(cancelled);
+    expect(preserveCancellationOutcome({ value: undefined, terminationReason: "aborted", error: cancelled.message },
+      controller.signal)).not.toHaveProperty("residentOutcomes");
+  });
+
+  it("observes a real native boundary before its cancellation check without prematurely committing the ID", async () => {
+    const { provider, create } = setup();
+    const controller = new AbortController();
+    const cancelled = new Error("cancelled at native callback entry");
+    create.mockImplementationOnce(async (_request, options) => {
+      controller.abort(cancelled);
+      // Models entry from the native SQL callback, not presence of a claim.
+      options.beforeCommit("selected-original", true);
+      throw new Error("Native cancellation check did not fence the create");
+    });
+    const failure = await provider.invoke("create", { name: "review", instructions: "Review.",
+      topics: ["pull.example.repo"], slotClaim: claim, idempotencyKey: "retry" }, context(controller.signal))
+      .catch((error: unknown) => error);
+    expect(failure).toMatchObject({ name: "ResidentOutcomeUnknownError", residentOutcome: { state: "unknown" } });
+    expect((failure as { residentOutcome: unknown }).residentOutcome).not.toHaveProperty("id");
+  });
+
+  it.each([false, true])("preserves commit/cancellation outcomes (actual native boundary=%s)", async nativeBoundary => {
     const { provider, create } = setup();
     const controller = new AbortController();
     const cancelled = new Error("cancelled");
     create.mockImplementationOnce(async (request, options) => {
-      options.beforeCommit("actor");
+      // This adapter explicitly models the actual SQL callback only in the native case.
+      options.beforeCommit("actor", nativeBoundary);
       const atBoundary = cancellationError(controller.signal, cancelled);
-      if (claimed) expect(atBoundary).toMatchObject({ name: "ResidentOutcomeUnknownError",
+      if (nativeBoundary) expect(atBoundary).toMatchObject({ name: "ResidentOutcomeUnknownError",
         residentOutcome: { state: "committed", id: "actor", ownerHostId: "main" } });
       else expect(atBoundary).toBe(cancelled);
       options.onCommit("actor");
@@ -119,6 +158,6 @@ describe("safe actor provider admission boundary", () => {
       return { ...request, id: "actor" };
     });
     await provider.invoke("create", { name: "review", instructions: "Review.",
-      ...(claimed ? { slotClaim: claim, idempotencyKey: "retry", topics: ["pull.example.repo"] } : {}) }, context(controller.signal));
+      ...(nativeBoundary ? { slotClaim: claim, idempotencyKey: "retry", topics: ["pull.example.repo"] } : {}) }, context(controller.signal));
   });
 });

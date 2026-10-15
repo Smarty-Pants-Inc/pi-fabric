@@ -15,9 +15,12 @@ import type { FabricActorRequest } from "../src/actors/types.js";
 import { SLOT_ADMISSION_PREFIX, slotAdmissionFor } from "../src/actors/slot-admission.js";
 import { initializeFreshSlotAuthority, slotPhysicalHostIdentity, slotRoutesDigest,
   type SlotAuthorityBinding } from "../src/actors/slot-authority.js";
+import { cancellationError, preserveCancellationOutcome } from "../src/async-settlement.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { readHostPolicy } from "../src/host-policy.js";
 import { MeshStore } from "../src/mesh/store.js";
+import type { FabricInvocationContext } from "../src/protocol.js";
+import { AgentsProvider } from "../src/providers/agents-provider.js";
 
 vi.mock("../src/host-policy.js", () => ({ readHostPolicy: vi.fn() }));
 
@@ -119,6 +122,20 @@ async function fixture() {
   return { root, actorRoots, binding, publishPolicy, mesh, claim, request, directory: openDirectory(mesh, actorRoots) };
 }
 
+// Public provider + real directory/manager/coordinator/SQLite. Only worker execution
+// and host UI/participant surfaces are non-executing fixtures, as above.
+function providerFor(directory: ActorDirectory): AgentsProvider {
+  type Args = ConstructorParameters<typeof AgentsProvider>;
+  return new AgentsProvider(directory.agents, directory, {} as Args[2],
+    { id: identity.id, local: true } as Args[3],
+    { scheduleRefresh() {} } as Args[4], undefined, {} as Args[6], () => false, undefined, false);
+}
+const providerContext = (signal: AbortSignal) => ({
+  cwd: process.cwd(), signal, parentToolCallId: "outer", nestedToolCallId: "nested",
+  extensionContext: { modelRegistry: { getAvailable: () => [], find: () => undefined } },
+  update() {}, activity() {},
+}) as unknown as FabricInvocationContext;
+
 const registryRows = (root: string) => new ActorRegistryStore(root).snapshot().actors;
 const actorDirs = (root: string) => fs.existsSync(root)
   ? fs.readdirSync(root).filter(name => /^[a-f0-9]{32}$/.test(name)).sort() : [];
@@ -162,6 +179,129 @@ afterEach(async () => {
 });
 
 describe.runIf(process.platform === "linux")("native local slot admission user flow", () => {
+  // KEEP: #1199 round 2 P2; a token must never impersonate native SQL custody.
+  it.each([false, true])("public provider cancels ordinary creation before materialization without a false commit (claim=%s)", async claimed => {
+    const f = await fixture();
+    await f.directory.recoverProtectedActors();
+    const provider = providerFor(f.directory);
+    const controller = new AbortController();
+    const cancelled = new Error("cancelled at ordinary beforeMaterialize");
+    const nativeBoundaries: Array<boolean | undefined> = [];
+    let boundaryOutcome: Error | undefined;
+    const onCommit = vi.fn();
+    const create = f.directory.create.bind(f.directory);
+    const probe = vi.spyOn(f.directory, "create").mockImplementation((request, options = {}) => create(request, {
+      ...options,
+      beforeCommit: (id, nativeBoundary) => {
+        nativeBoundaries.push(nativeBoundary);
+        return options.beforeCommit?.(id, nativeBoundary);
+      },
+      beforeMaterialize: () => {
+        controller.abort(cancelled);
+        boundaryOutcome = cancellationError(controller.signal, cancelled);
+      },
+      onCommit: id => { onCommit(id); options.onCommit?.(id); },
+    }));
+    try {
+      const before = effects(f.mesh, f.actorRoots);
+      const failure = await provider.invoke("create", { name: "ordinary-cancel", instructions: "Ordinary work.",
+        scope: "session", topics: ["ordinary.topic"],
+        ...(claimed ? { slotClaim: { key: claimKey, ifVersion: f.claim.version }, idempotencyKey: "irrelevant" } : {}),
+      }, providerContext(controller.signal)).catch((error: unknown) => error);
+      expect(nativeBoundaries).toEqual([undefined]);
+      expect(onCommit).not.toHaveBeenCalled();
+      expect(f.directory.listOwned()).toEqual([]);
+      expect(effects(f.mesh, f.actorRoots)).toEqual(before);
+      expect(boundaryOutcome).toBe(cancelled);
+      expect(failure).toBe(cancelled);
+      expect(preserveCancellationOutcome({ value: undefined, terminationReason: "aborted", error: cancelled.message },
+        controller.signal)).not.toHaveProperty("residentOutcomes");
+    } finally { probe.mockRestore(); }
+  });
+
+  it("retains native uncertainty and the selected ID when checkActive fails before the boundary notification", async () => {
+    const f = await fixture();
+    const provider = providerFor(f.directory);
+    const controller = new AbortController();
+    const cancelled = new Error("cancelled in native checkActive");
+    const beforeCommit = vi.fn();
+    const onCommit = vi.fn();
+    const create = f.directory.create.bind(f.directory);
+    const probe = vi.spyOn(f.directory, "create").mockImplementation((request, options = {}) => create(request, {
+      ...options,
+      checkActive: () => { controller.abort(cancelled); options.checkActive?.(); },
+      beforeCommit: (id, nativeBoundary) => { beforeCommit(id, nativeBoundary); return options.beforeCommit?.(id, nativeBoundary); },
+      beforeMaterialize: forbidMaterialization,
+      onCommit: id => { onCommit(id); options.onCommit?.(id); },
+    }));
+    try {
+      const failure = await provider.invoke("create", { ...f.request("session") }, providerContext(controller.signal))
+        .catch((error: unknown) => error);
+      expect(beforeCommit).not.toHaveBeenCalled();
+      expect(onCommit).not.toHaveBeenCalled();
+      expect(failure).toMatchObject({ code: "FABRIC_ACTOR_SLOT_CREATE_UNCERTAIN", actorId: expect.stringMatching(/^[a-f0-9]{32}$/) });
+      const originalId = (failure as { actorId: string }).actorId;
+      expect(cancellationError(controller.signal, cancelled)).toBe(failure);
+      expect(preserveCancellationOutcome({ value: undefined, terminationReason: "aborted", error: cancelled.message },
+        controller.signal)).toMatchObject({ residentOutcomes: [{ state: "unknown", id: originalId }] });
+      expect(actorDirs(f.actorRoots.session)).toEqual([]);
+      expect(registryRows(f.actorRoots.session)).toEqual([]);
+      expect(f.mesh.listAll(SLOT_ADMISSION_PREFIX, { fresh: true })).toEqual([]);
+    } finally { probe.mockRestore(); }
+  });
+
+  it("public provider observes the actual native SQL boundary, preserves uncertainty, and retries at the original ID", async () => {
+    const f = await fixture();
+    const provider = providerFor(f.directory);
+    const controller = new AbortController();
+    const cancelled = new Error("cancelled after native admission before materialization");
+    const boundaries: Array<{ id: string; nativeBoundary: boolean | undefined }> = [];
+    let boundaryOutcome: Error | undefined;
+    const onCommit = vi.fn();
+    const create = f.directory.create.bind(f.directory);
+    const probe = vi.spyOn(f.directory, "create").mockImplementation((request, options = {}) => create(request, {
+      ...options,
+      beforeCommit: (id, nativeBoundary) => {
+        boundaries.push({ id, nativeBoundary });
+        return options.beforeCommit?.(id, nativeBoundary);
+      },
+      beforeMaterialize: () => {
+        controller.abort(cancelled);
+        boundaryOutcome = cancellationError(controller.signal, cancelled);
+      },
+      onCommit: id => { onCommit(id); options.onCommit?.(id); },
+    }));
+    try {
+      const failure = await provider.invoke("create", { ...f.request("session") }, providerContext(controller.signal))
+        .catch((error: unknown) => error);
+      expect(boundaries).toHaveLength(1);
+      const originalId = boundaries[0]!.id;
+      expect(originalId).toMatch(/^[a-f0-9]{32}$/);
+      expect(boundaries[0]!.nativeBoundary).toBe(true);
+      expect(onCommit).not.toHaveBeenCalled();
+      expect(f.directory.listOwned()).toEqual([]);
+      expect(actorDirs(f.actorRoots.session)).toEqual([]);
+      expect(registryRows(f.actorRoots.session)).toEqual([]);
+      expect(f.mesh.listAll(SLOT_ADMISSION_PREFIX, { fresh: true })).toHaveLength(1);
+      expect(f.mesh.listAll(SLOT_ADMISSION_PREFIX, { fresh: true })[0]!.value).toMatchObject({ roles: {
+        review: { actorId: originalId, state: "admitted" },
+      } });
+      expect(boundaryOutcome).toMatchObject({ name: "ResidentOutcomeUnknownError",
+        residentOutcome: { state: "committed", id: originalId, ownerHostId: identity.id } });
+      expect(failure).toBe(boundaryOutcome);
+      expect(preserveCancellationOutcome({ value: undefined, terminationReason: "aborted", error: cancelled.message },
+        controller.signal)).toMatchObject({ residentOutcomes: [{ state: "committed", id: originalId }] });
+
+      const retry = await provider.invoke("create", { ...f.request("session") }, providerContext(new AbortController().signal));
+      expect(retry).toMatchObject({ id: originalId, scope: "session" });
+      expect(boundaries).toEqual([{ id: originalId, nativeBoundary: true }, { id: originalId, nativeBoundary: true }]);
+      expect(onCommit).toHaveBeenCalledExactlyOnceWith(originalId);
+      expect(actorDirs(f.actorRoots.session)).toEqual([originalId]);
+      expect(registryRows(f.actorRoots.session).map(row => row.id)).toEqual([originalId]);
+      expect(f.mesh.listAll(SLOT_ADMISSION_PREFIX, { fresh: true })).toHaveLength(1);
+    } finally { probe.mockRestore(); }
+  });
+
   it("refuses missing, stale and foreign claims without touching a cross-scope predecessor, directories or presence", async () => {
     const f = await fixture();
     await f.directory.recoverProtectedActors();

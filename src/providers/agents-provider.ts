@@ -1928,24 +1928,32 @@ export class AgentsProvider implements FabricProvider {
       };
       const { instructionsFile: _file, sha256: _digest, ...base } = request;
       const resolvedRequest: FabricActorRequest = { ...base, instructions: resolveActorInstructions(request, this.manager.config.instructionsRoot) };
-      // Native admission owns topic/authority policy. A supplied claim only
-      // makes uncertainty conservative; ordinary adapters need no slot metadata.
-      const protectedCreate = request.slotClaim !== undefined;
+      // A claim is not proof of native admission: ordinary topics may carry one.
+      // Only the manager's protected SQL callback establishes that boundary.
+      let nativeBoundaryObserved = false;
+      let nativeUncertainError: Error | undefined;
       let decision: { requestId: string; state: "committed"; id: string; ownerHostId: string } | undefined;
       let outcome: ResidentOutcomeUnknownError | undefined;
       let dispatched = true;
       registerCancellationEffect(signal, reason => {
-        if (!dispatched || (!protectedCreate && !decision)) return undefined;
+        if (!dispatched) return undefined;
+        // Native checkActive can fail before the boundary notification. Preserve
+        // that uncertainty and its recorded selected ID, not a fabricated commit.
+        if (!decision && nativeUncertainError) return nativeUncertainError;
+        if (!nativeBoundaryObserved && !decision) return undefined;
         return outcome ??= new ResidentOutcomeUnknownError(command, decision, reason, signal);
       });
       try {
         return await this.actorManager.create(resolvedRequest, {
           // The protected native path invokes this synchronously at its final
           // validated SQL boundary, with the original ID on an exact retry.
-          beforeCommit: id => {
+          beforeCommit: (id, nativeBoundary) => {
+            // Observe entry before checking cancellation, but never record a
+            // committed decision if the request-acceptance check itself fails.
+            if (nativeBoundary === true) nativeBoundaryObserved = true;
             checkCommit();
             const ownerHostId = creationOwnerHostId();
-            if (protectedCreate) decision = { requestId: command.requestId, state: "committed", id, ownerHostId };
+            if (nativeBoundary === true) decision = { requestId: command.requestId, state: "committed", id, ownerHostId };
           }, checkActive: checkCommit,
           onCommit: (id) => {
             decision = { requestId: command.requestId, state: "committed", id, ownerHostId: creationOwnerHostId() };
@@ -1954,12 +1962,13 @@ export class AgentsProvider implements FabricProvider {
       } catch (error) {
         const failure = error as { code?: unknown; actorId?: string } | undefined;
         if (failure?.code === "FABRIC_ACTOR_SLOT_CREATE_UNCERTAIN") {
+          if (error instanceof Error) nativeUncertainError = error;
           const actorId = failure.actorId ?? decision?.id;
           recordResidentOutcome(signal, { requestId: command.requestId, state: "unknown", operation: "createActor", entityKind: "actor",
             ...(actorId ? { id: actorId } : {}) });
         }
         if (failure?.code === "FABRIC_ACTOR_SLOT_CLAIM_REFUSED") dispatched = false;
-        else if (protectedCreate && signal?.aborted) {
+        else if ((nativeBoundaryObserved || decision) && signal?.aborted) {
           throw outcome ??= new ResidentOutcomeUnknownError(command, decision, error, signal);
         }
         throw error;

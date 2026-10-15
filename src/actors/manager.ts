@@ -1189,8 +1189,9 @@ export class ActorManager {
       asRegistryOwner?: boolean;
       /** Host-only: verified resident creator, never request fields. */
       supervisorOwner?: MeshIdentity;
-      /** Protected creates require a SYNCHRONOUS final request-acceptance fence. */
-      beforeCommit?: (id: string) => void | Promise<void>;
+      /** Protected creates require a SYNCHRONOUS final request-acceptance fence.
+       * nativeBoundary is true only inside the protected SQL beforeCommit callback. */
+      beforeCommit?: (id: string, nativeBoundary?: boolean) => void | Promise<void>;
       /** Async predecessor/materialization work, only after durable protected admission. */
       beforeMaterialize?: (id: string) => void | Promise<void>;
       checkActive?: () => void;
@@ -1361,7 +1362,7 @@ export class ActorManager {
         id = selectedId;
         checkActive?.();
         this.#assertReleaseAdmission();
-        const result = beforeCommit?.(id);
+        const result = beforeCommit?.(id, true);
         if (result && typeof result.then === "function") {
           void result.catch(() => undefined);
           throw new Error("Protected actor beforeCommit must be synchronous");

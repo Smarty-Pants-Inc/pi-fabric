@@ -3862,7 +3862,9 @@ export class AgentManager {
         if (settled) {
           this.#enodevSettledHere.add(result.id);
           this.#enodevRuns = this.#enodevRuns.filter(other => other !== directory);
-          this.#previousRuns.set(result.id, structuredClone(settled));
+          const resultFile = path.join(directory, MANAGER_RESULT_FILE);
+          const fingerprint = writePrivateJsonAtomic(resultFile, settled);
+          this.#rememberPreviousRun(settled, resultFile, fingerprint);
           this.#retentionRevision++;
         }
         return settled ?? result;

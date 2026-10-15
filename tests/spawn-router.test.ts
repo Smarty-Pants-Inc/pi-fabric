@@ -241,6 +241,100 @@ describe("native spawn router receipts", () => {
   });
 });
 
+describe("durable provider spawn router handoff receipts", () => {
+  it.each(["spawn", "create"] as const)("real client %s startup failure stays before the publication callback", async action => {
+    const dir = root();
+    const { ResidencyClient } = await import("../src/residency/client.js");
+    const identity = { id: "session:client-probe", name: "main", kind: "root", sessionId: "client-probe",
+      rootId: "session:client-probe", ownerHostId: "session:client-probe", ownerIdentityId: "session:client-probe" };
+    const client = new ResidencyClient({ config: { rootId: identity.id, sessionId: identity.sessionId,
+      meshRoot: dir, residencyRoot: path.join(dir, "residency"), cwd: dir, mainName: "main", mainStartedAt: 1,
+      agents: { runner: "pi", defaultTools: [] } }, mesh: {}, participants: { self: () => identity },
+      mainAgent: { id: identity.id, local: true } } as any);
+    const failure = new Error("private host startup failure");
+    const startup = vi.spyOn(client, "ensureHost").mockRejectedValue(failure);
+    const onDispatched = vi.fn();
+    await expect(action === "spawn" ? client.spawnAgent({ task: "no dispatch", residency: "durable" }, undefined, onDispatched)
+      : client.createActor({ name: "no dispatch", instructions: "no dispatch", residency: "durable" }, undefined, onDispatched)).rejects.toBe(failure);
+    expect(startup).toHaveBeenCalledOnce(); expect(onDispatched).not.toHaveBeenCalled();
+    expect(fs.existsSync(path.join(dir, "residency", "requests"))).toBe(false);
+  });
+  it("nested actor client rejects a missing host before publication custody transfers", async () => {
+    const dir = root();
+    const { ResidentActorClient } = await import("../src/residency/actor-client.js");
+    const client = new ResidentActorClient(dir, "session:missing-host");
+    const onDispatched = vi.fn();
+    await expect(client.createActor({ name: "no dispatch", instructions: "no dispatch", residency: "durable" },
+      undefined, undefined, onDispatched)).rejects.toThrow("Root resident host is not live");
+    expect(onDispatched).not.toHaveBeenCalled();
+    expect(fs.readdirSync(dir)).toEqual([]);
+  });
+  // Recorded public-provider boundary regression: no resident, worker, or native
+  // manager is started. The receiving side still uses the real ledger writer.
+  it.each((["spawn", "create"] as const).flatMap(action =>
+    (["before", "rejected", "uncertain"] as const).map(stage => ({ action, stage })),
+  ))("$action/$stage records exactly one outcome at the dispatch fence", async ({ action, stage }) => {
+    const dir = root();
+    const { AgentsProvider } = await import("../src/providers/agents-provider.js");
+    const { AgentManager } = await import("../src/agents/manager.js");
+    const { DEFAULT_FABRIC_CONFIG } = await import("../src/config.js");
+    // The fake receiver cannot execute durable work, even in a confined runner.
+    vi.stubEnv("PI_FABRIC_WRITE_POLICY", "");
+    const identity = { id: "session:receipt-probe", kind: "main", name: "main", sessionId: "receipt-probe" };
+    const config = { ...DEFAULT_FABRIC_CONFIG.agents };
+    delete config.model;
+    const manager = new AgentManager(dir, {
+      ...config, thinking: "medium",
+      router: { command: [], mode: "shadow", timeoutMs: 200, includeTask: false },
+    }, { runRoot: path.join(dir, "runs"), meshRoot: dir });
+    const failure = new Error(stage === "before" ? "local client preparation rejected before dispatch"
+      : stage === "rejected" ? "native receiver rejected admission" : "response uncertain after native admission");
+    const receive = vi.fn(async (creation: { spawnRouterDecisionId?: string }, _signal?: AbortSignal, onDispatched?: () => void) => {
+      const decisionId = creation.spawnRouterDecisionId;
+      expect(decisionId).toEqual(expect.any(String));
+      if (stage === "before") throw failure;
+      expect(onDispatched).toEqual(expect.any(Function));
+      onDispatched!();
+      if (stage === "rejected") await recordSpawnRouterStartFailed({ meshRoot: dir, decisionId: decisionId! });
+      else await recordSpawnRouterStart({ meshRoot: dir, decisionId: decisionId!, agentId: "native-record", sessionId: null,
+        model: "provider/applied", thinking: "low" });
+      throw failure;
+    });
+    const residency = { spawnAgent: receive, createActor: receive };
+    const participants = { self: () => ({ ...identity, kind: "root", rootId: identity.id, ownerHostId: identity.id,
+      ownerIdentityId: identity.id, cwd: dir, role: "task-agent" }), scheduleRefresh() {} };
+    // As in the recorded probe, unused actor/lifecycle services are inert: no
+    // timer-owning managers or disposal paths are needed for rejected calls.
+    const provider = new AgentsProvider(manager, { mesh: { root: dir }, identity } as any, {} as any,
+      { id: identity.id, local: true } as any, participants as any, undefined, {} as any, undefined, residency as any);
+    const privateName = "private durable receipt name";
+    const privateTask = "private durable receipt task 🦉";
+    const args = action === "spawn" ? { name: privateName, task: privateTask, residency: "durable" }
+      : { name: privateName, instructions: privateTask, residency: "durable" };
+    await expect(provider.invoke(action, args, {
+      cwd: dir, extensionContext: { modelRegistry: { getAvailable: () => [] } }, update() {}, activity() {},
+    } as any)).rejects.toBe(failure);
+    expect(receive).toHaveBeenCalledTimes(1);
+    const log = decisions(dir);
+    expect(log).toHaveLength(2);
+    expect(log.filter(entry => entry.kind === "decision")).toHaveLength(1);
+    expect(log.filter(entry => entry.kind !== "decision")).toHaveLength(1);
+    const decisionId = log[0]!.decisionId;
+    expect(decisionId).toMatch(/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/);
+    expect(receive.mock.calls[0]![0].spawnRouterDecisionId).toBe(decisionId);
+    expect(log[0]).toMatchObject({ kind: "decision", spawnKind: action === "spawn" ? "spawn" : "actor" });
+    expect(log[1]).toEqual(stage === "uncertain"
+      ? { ts: expect.any(String), kind: "start", decisionId, agentId: "native-record", sessionId: null,
+        model: "provider/applied", thinking: "low", ...unverifiedStart }
+      : { ts: expect.any(String), kind: "start-failed", decisionId, agentId: null, sessionId: null,
+        model: null, thinking: null, ...unverifiedStart, error: "start-failed" });
+    const ledger = fs.readFileSync(path.join(dir, "router", "decisions.jsonl"), "utf8");
+    expect(ledger).not.toContain(privateName);
+    expect(ledger).not.toContain(privateTask);
+    expect(ledger).not.toContain(failure.message);
+  });
+});
+
 describe("external spawn router behavior", () => {
   it("off starts no command and creates no ledger", async () => {
     const dir = root(); const opts = options(dir);

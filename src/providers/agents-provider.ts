@@ -944,6 +944,8 @@ export class AgentsProvider implements FabricProvider {
       case "spawn": {
         const routed = await this.#routeCreationDefault("spawn", args, await this.#prepareSpawnRequest(args, context), context);
         let handedOff = false;
+        const onDispatched = typeof (routed as { spawnRouterDecisionId?: unknown }).spawnRouterDecisionId === "string"
+          ? () => { handedOff = true; } : undefined;
         try {
         const request = this.#applySeed(args, routed, context);
         if (request.residency === "durable") this.#assertUnconfinedDurable();
@@ -977,10 +979,11 @@ export class AgentsProvider implements FabricProvider {
             : {}),
         }, context.extensionContext.sessionManager?.getEntries?.() ?? []);
         const resident = durableRequest.residency === "durable" ? this.#resident() : undefined;
-        // The native receiver owns the sole outcome once dispatched (including uncertain RPCs).
-        handedOff = true;
+        // Local admission owns its outcome immediately; resident custody begins only at publication.
+        if (!resident) handedOff = true;
         const handle = resident
-          ? await resident.spawnAgent(durableRequest, context.signal)
+          ? await (onDispatched ? resident.spawnAgent(durableRequest, context.signal, onDispatched)
+            : resident.spawnAgent(durableRequest, context.signal))
           : await this.manager.spawn(durableRequest, isInteractiveMain(context.extensionContext) ? withoutMainExecutionCeiling(context.signal) : context.signal);
         if (request.residency !== "durable") this.manager.detachSignal(handle.id);
         this.participants.scheduleRefresh();
@@ -1953,6 +1956,8 @@ export class AgentsProvider implements FabricProvider {
 
   async #createActor(request: FabricActorCreateRequest, context: FabricInvocationContext): Promise<FabricActorInfo> {
     let handedOff = false;
+    const onDispatched = typeof (request as { spawnRouterDecisionId?: unknown }).spawnRouterDecisionId === "string"
+      ? () => { handedOff = true; } : undefined;
     try {
     const { signal } = context;
     const checkCommit = (): void => throwIfExecutionExpired(context);
@@ -2036,17 +2041,21 @@ export class AgentsProvider implements FabricProvider {
     // Even the first actor in an empty registry must use the authoritative
     // host's capability check and request fence. A local-create/cede path can
     // publish after cancellation with neither a decision nor a known-ID receipt.
-    if (this.residency) return this.residency.createActor(request, signal);
+    if (this.residency) return await (onDispatched ? this.residency.createActor(request, signal, onDispatched)
+      : this.residency.createActor(request, signal));
     const client = this.#residentActorClient();
     // Ordinary child handoffs need no protected caller metadata. The receiving
     // host still requires an authenticated caller for every protected topic,
     // including a request that omitted its required claim.
-    if (request.slotClaim === undefined) return client.createActor(request, signal);
-    return client.createActor(request, signal, {
+    if (request.slotClaim === undefined) return await (onDispatched ? client.createActor(request, signal, undefined, onDispatched)
+      : client.createActor(request, signal));
+    const caller = {
       identity: { ...this.actorManager.identity }, hostId: this.participants.self().ownerHostId,
       ...(invocationFabricPrincipal(context) ? { principal: invocationFabricPrincipal(context) } : {}),
       ...(this.#toolCeiling === undefined ? {} : { toolCeiling: [...this.#toolCeiling] }),
-    });
+    };
+    return await (onDispatched ? client.createActor(request, signal, caller, onDispatched)
+      : client.createActor(request, signal, caller));
     } catch (error) {
       if (!handedOff) await this.#recordCreationStartFailed(request);
       throw error;

@@ -150,6 +150,13 @@ start shape: preserve `ts`, `decisionId`, and `host`; set unknown `agentId`,
 `verified` to false, and `evidenceRef` to null. Add only the fixed
 `error: "start-failed"`, never exception text.
 
+For durable calls, local validation and host-startup failures are recorded by
+the provider. Receipt custody transfers only at the native client's existing
+request-publication fence, via an optional host-only callback (never a wire
+field). From that point the receiver owns the sole outcome; a rejected or
+uncertain response must not append another failure. The fence precedes the
+atomic write because a publication error can itself be ambiguous.
+
 | name | type | meaning | when null |
 | --- | --- | --- | --- |
 | `ts` | string | Timestamp of this ledger line. | Never. |

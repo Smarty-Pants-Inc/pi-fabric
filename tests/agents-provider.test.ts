@@ -6793,7 +6793,7 @@ describe("external spawn router hook (#2890)", () => {
       actual: { model: pick.model, thinking: pick.thinking }, pick, error: null })]);
     expect(spawnAgent).toHaveBeenCalledTimes(1);
     expect(spawnAgent).toHaveBeenCalledWith(expect.objectContaining({ model: pick.model, thinking: pick.thinking, complexity,
-      spawnRouterDecisionId: entries[0].decisionId }), undefined);
+      spawnRouterDecisionId: entries[0].decisionId }), undefined, expect.any(Function));
     // The native resident receiver rejects meshRoot: keep its own configured root.
     expect(spawnAgent.mock.calls[0]![0]).not.toHaveProperty("meshRoot");
     expect(state.requests()).toEqual([expect.objectContaining({ requestedComplexity: complexity })]);

@@ -151,13 +151,17 @@ describe("nats reader proofs (smarty-dev#9690)", () => {
     expect(records.at(-1)).toMatchObject({ phase: "outcome", ok: true, stream: intent.stream });
     // Human status names the stream; the rollback is ungated and recorded, and gives back the same state.
     const status = await run(["status", "--root", root]);
-    expect(status.code).toBe(0);
+    // Offline status retains main's exit 3: the file/SQLite reader is fenced, while the stream is still displayed.
+    expect(status.code).toBe(3);
     expect(status.out).toContain(`moved marker (backend=nats, stream ${intent.stream}`);
     const back = await run(["rollback", "--root", root, ...nats, "--json"]);
     expect(back.code).toBe(0);
     expect(JSON.parse(back.out)).toMatchObject({ from: "nats", ok: true, stream: intent.stream, epoch: 2 });
     const file = new MeshStore(root, 64 * 1024, 1_000, { stateBackend: "file" });
     try { expect(file.get("a")?.value).toEqual({ n: 1 }); } finally { file.closeState(); }
+    const verified = await run(["rollback", "--root", root, ...nats, "--stream", intent.stream, "--json"]);
+    expect(verified.code, verified.err).toBe(0);
+    expect(JSON.parse(verified.out)).toMatchObject({ from: "nats", stream: intent.stream, converged: true });
   });
 
   it("--abandon deletes exactly the intent's unfinished stream and the intent", async () => {

@@ -278,8 +278,10 @@ const importChunks = (state: MeshStateSnapshot, epoch: number): Uint8Array[] => 
 
 /** Connects, refuses an unsafe server, ensures the stream, then runs `body` under the migration fence. */
 // `forImport`: an import is gated on the server version and creates its (intent's) stream; a rollback is neither.
-const run = async <T>(root: string, options: MeshNatsMigrationOptions, forImport: boolean, pickStream: (root: string) => string,
+const run = async <T>(root: string, options: MeshNatsMigrationOptions, forImport: boolean,
+  pickStream: (root: string, port: JetStreamPort) => string | Promise<string>,
   body: (port: JetStreamPort, stream: string, subject: string, target: { created: string; target: string | undefined }) => Promise<T>): Promise<T> => {
+  // (pickStream may await the port: the import's fixed-root preflight below.)
   root = path.resolve(root);
   if (!fs.statSync(root, { throwIfNoEntry: false })?.isDirectory()) throw new MeshBackendRefusedError(`No mesh root at ${root}`);
   // The backend's own endpoint path (pi-fabric#918 round 8): pinned URLs, refusals before any connect, and a remote
@@ -293,7 +295,7 @@ const run = async <T>(root: string, options: MeshNatsMigrationOptions, forImport
       throw new MeshBackendRefusedError(`nats-server does not report sync_always (got ${String(server.syncAlways)}): refusing to migrate state onto it`);
     }
     return await holdMeshFence(root, { lockProtocol: options.lockProtocol ?? 1, lockTimeoutMs: options.lockTimeoutMs ?? DEFAULT_LOCK_MS }, async () => {
-      const stream = pickStream(root);
+      const stream = await pickStream(root, port);
       // pi-fabric#937: whatever picked it, the stream is this root's (fixed or per-switch); two roots never share one.
       if (!isNatsStreamForRoot(root, stream)) throw new MeshBackendRefusedError(`Fabric mesh NATS stream ${stream} is not this root's`);
       const subject = `${stream}.state`;
@@ -406,7 +408,7 @@ const markerStream = (root: string, options: MeshNatsMigrationOptions): string |
  * The import's stream: the marker's (a rerun after it), else the intent's (a rerun before it), else a NEW per-switch
  * stream `natsStreamName(root)_<switch id>`, recorded in a new intent before it is created (never an override).
  */
-const importStream = (root: string, options: MeshNatsMigrationOptions): string => {
+const importStream = async (root: string, options: MeshNatsMigrationOptions, port: JetStreamPort): Promise<string> => {
   const marked = markerStream(root, options);
   const intent = readIntent(root);
   if (marked !== undefined) {
@@ -414,6 +416,16 @@ const importStream = (root: string, options: MeshNatsMigrationOptions): string =
     return marked;
   }
   if (intent) return intent.stream;
+  // Decision B preflight, BEFORE the intent or any new stream: a root that bootstrapped (or still serves) its fixed-root
+  // stream natsStreamName(root) without a marker has live NATS state there; a new per-switch import would silently fork
+  // it. Only an absent or retired fixed-root stream lets a new switch begin; anything else (or an unreadable one) refuses.
+  const fixed = natsStreamName(root);
+  if (await port.streamExists(fixed)) {
+    const { projection } = await project(port, fixed, limitsOf(options));
+    if (projection.status !== "retired") {
+      throw new MeshBackendRefusedError(`Fabric mesh NATS import refused for ${root}: its fixed-root stream ${fixed} exists and is ${projection.status}, not retired (live NATS state); a new switch would fork it. Roll it back or retire it first`);
+    }
+  }
   const switchId = randomUUID().replaceAll("-", "");
   const stream = natsSwitchStreamName(root, switchId);
   writeDurably(path.join(root, INTENT), JSON.stringify({ switchId, stream } satisfies NatsIntent));
@@ -432,11 +444,11 @@ const beginSwitch = async (port: JetStreamPort, stream: string): Promise<BeginRe
 
 /** Imports a file root's state into its NATS stream and moves state.json to the NATS marker. */
 export const importMeshStateToNats = (root: string, options: MeshNatsMigrationOptions = {}): Promise<MeshNatsMigrationResult> =>
-  run(root, options, true, (at) => {
+  run(root, options, true, (at, port) => {
     if (fs.existsSync(path.join(at, "state.db")) || readMeshStateMovedMarker(at)) {
       throw new MeshBackendRefusedError(`Fabric mesh NATS import refused for ${at}: it has state.db; roll it back to file first (rollbackMeshState)`);
     }
-    return importStream(at, options);
+    return importStream(at, options, port);
   }, async (port, stream, subject, { created, target }) => {
     root = path.resolve(root);
     const limits = limitsOf(options);

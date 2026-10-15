@@ -24,6 +24,7 @@ import {
 } from "./state-file.js";
 import { validateMeshStateKey } from "./state-sqlite.js";
 import { readMeshStateNatsMarker } from "./backend-fence.js";
+import { holdMeshFence } from "./fence-lock.js";
 import { MeshLockTimeoutError } from "../core/atomic-write.js";
 import { MeshSyncNotDurableError } from "./not-durable.js";
 
@@ -1543,6 +1544,7 @@ export const assertNatsMaxPayload = (server: { maxPayload?: number }): void => {
  */
 export const openNatsStateBackend = async (options: OpenNatsStateBackendOptions): Promise<NatsStateBackend> => {
   const root = path.resolve(options.root);
+  const decision = decideNatsRootOpen(root);
   const { port, owned, server } = await connectNatsEndpoint(options);
   try {
     assertNatsServerSupported(server.version);
@@ -1558,18 +1560,14 @@ export const openNatsStateBackend = async (options: OpenNatsStateBackendOptions)
       throw new MeshStateNatsRefusedError(`the stream ${legacy} holds this root's state under the old (c03c829f) name; ` +
         `migrate it to ${rootStream} (or remove it after an export), then open again: it is never replaced silently`);
     }
-    // smarty-dev#9690 (and #9663 item 7): a root's stream comes ONLY from its NATS moved marker, and the open never
-    // creates a stream. Nothing can find an import's stream before the marker names it; a root without the marker
-    // (live file state, or an unmigrated root) refuses instead of opening some derived, empty stream.
-    const marker = readMeshStateNatsMarker(root);
-    if (!marker) throw new MeshStateNatsRefusedError(`${root} has no NATS moved marker: migrate it first (importMeshStateToNats)`);
-    // pi-fabric#937: the marker's stream must be this root's (its fixed stream, or one of its per-switch streams).
-    if (!isNatsStreamForRoot(root, marker.natsStream)) {
-      throw new MeshStateNatsRefusedError(`${root}'s marker names stream ${marker.natsStream}, which is not this root's (${rootStream} or ${rootStream}_<switch id>)`);
-    }
-    const stream = marker.natsStream;
+    // Decision B (smarty-dev#9690 follow-up): a root's stream comes from its NATS moved marker (opened, never created);
+    // a root with NO file state, NO staged intent and NO kept-copy leftovers bootstraps its fixed-root stream
+    // natsStreamName(root) (create, replicas, readiness) as main always did. Anything else (live file state, a staged
+    // import, a partial or malformed marker, an unreadable entry) refuses: never an empty bootstrap beside real state.
+    assertSameNatsRootDecision(root, decision);
+    const stream = decision.stream;
     const backend = await NatsStateBackend.open({ port, stream, subject: `${stream}.state`, snapshotSubject: `${stream}.snapshot`,
-      maxEventBytes: options.maxEventBytes ?? 1024 * 1024, create: false,
+      maxEventBytes: options.maxEventBytes ?? 1024 * 1024, ...(decision.kind === "marker" ? { create: false } : {}),
       ...(options.snapshotEvery === undefined ? {} : { snapshotEvery: options.snapshotEvery }),
       ...(options.maxStateBytes === undefined ? {} : { maxStateBytes: options.maxStateBytes }),
       ...(options.maxReplay === undefined ? {} : { maxReplay: options.maxReplay }),
@@ -1578,12 +1576,79 @@ export const openNatsStateBackend = async (options: OpenNatsStateBackendOptions)
       ...(options.replicas === undefined ? {} : { replicas: options.replicas }),
       syncAlways: server.syncAlways });
     if (backend.diagnostics().nats?.status === "retired") { backend.close(); throw new MeshStateNatsRefusedError(`the stream ${stream} is retired`); }
-    prepared.get(root)?.close();
-    prepared.set(root, backend);
+    // File data may appear while the server, the ensure and the replay were awaited: recheck the same decision (and the
+    // root's identity) before registering. An existing root is rechecked and registered under the migration fence, so
+    // no import can stage between the recheck and the registration; an absent root is never created (no disk write).
+    const register = (): void => {
+      try { assertSameNatsRootDecision(root, decision); } catch (error) { backend.close(); throw error; }
+      prepared.get(root)?.close();
+      prepared.set(root, backend);
+    };
+    if (decision.identity === undefined) register();
+    else {
+      try { await holdMeshFence(root, { lockTimeoutMs: options.lockTimeoutMs ?? 5_000 }, register); }
+      catch (error) { if (prepared.get(root) !== backend) backend.close(); throw error; }
+    }
     return backend;
   } catch (error) {
     if (owned) await port.close().catch(() => undefined);
     throw error;
+  }
+};
+
+/** The root-open decision (decision B): the marker's stream, or the fixed-root bootstrap of a root with no file state. */
+export interface NatsRootOpenDecision {
+  kind: "marker" | "bootstrap";
+  stream: string;
+  /** The root directory's identity (`dev:ino`), undefined when the root does not exist (then nothing is written). */
+  identity: string | undefined;
+}
+
+const errnoOf = (error: unknown): string | undefined => (error as NodeJS.ErrnoException | undefined)?.code;
+/** lstat that returns undefined ONLY for ENOENT; anything else (EACCES, ENOTDIR, ELOOP) throws: fail closed. */
+const lstatOrAbsent = (file: string): fs.Stats | undefined => {
+  try { return fs.lstatSync(file); } catch (error) { if (errnoOf(error) === "ENOENT") return undefined; throw error; }
+};
+/** File-backend state, a staged import or kept-copy leftovers: any `state.json*` / `state.db*` entry. */
+const isFileStateEntry = (name: string): boolean => name.startsWith("state.json") || name.startsWith("state.db");
+
+/**
+ * Decides how a root opens on NATS (decision B). Fails closed: an unreadable root or entry throws its own error
+ * (EACCES); a non-directory root, a state.json that is not exactly a valid own-root NATS marker (live file state, a
+ * partial, truncated or malformed marker), a marker beside staged or leftover state, or any staged/leftover entry
+ * without a marker refuses. Never existsSync (it swallows EACCES).
+ */
+export const decideNatsRootOpen = (root: string): NatsRootOpenDecision => {
+  root = path.resolve(root);
+  const rootStream = natsStreamName(root);
+  const rootStat = lstatOrAbsent(root);
+  if (rootStat === undefined) return { kind: "bootstrap", stream: rootStream, identity: undefined };
+  if (!rootStat.isDirectory()) throw new MeshStateNatsRefusedError(`${root} is not a directory: refusing to open its NATS state`);
+  const identity = `${rootStat.dev}:${rootStat.ino}`;
+  const entries = fs.readdirSync(root).filter(isFileStateEntry).sort();
+  if (entries.length === 0) return { kind: "bootstrap", stream: rootStream, identity };
+  if (!entries.includes("state.json")) {
+    throw new MeshStateNatsRefusedError(`${root} holds ${entries.join(", ")} but no NATS moved marker (file or staged state, or an import's leftovers): migrate or abandon it first; it is never bootstrapped empty`);
+  }
+  const stateStat = lstatOrAbsent(path.join(root, "state.json"));
+  if (stateStat === undefined || !stateStat.isFile()) throw new MeshStateNatsRefusedError(`${root}/state.json changed or is not a regular file: refusing`);
+  const marker = readMeshStateNatsMarker(root);
+  if (!marker) throw new MeshStateNatsRefusedError(`${root} has no NATS moved marker (live file state, or a partial or malformed marker): migrate it first (importMeshStateToNats)`);
+  // pi-fabric#937: the marker's stream must be this root's (its fixed stream, or one of its per-switch streams).
+  if (!isNatsStreamForRoot(root, marker.natsStream)) {
+    throw new MeshStateNatsRefusedError(`${root}'s marker names stream ${marker.natsStream}, which is not this root's (${rootStream} or ${rootStream}_<switch id>)`);
+  }
+  if (entries.includes("state.json.nats-intent") || entries.some(name => name.startsWith("state.db"))) {
+    throw new MeshStateNatsRefusedError(`${root} has a NATS moved marker beside ${entries.filter(name => name !== "state.json").join(", ")}: an unfinished switch; rerun or roll it back first`);
+  }
+  return { kind: "marker", stream: marker.natsStream, identity };
+};
+
+/** The same decision again (after an await): anything else, including a replaced root, refuses. */
+const assertSameNatsRootDecision = (root: string, before: NatsRootOpenDecision): void => {
+  const after = decideNatsRootOpen(root);
+  if (after.kind !== before.kind || after.stream !== before.stream || after.identity !== before.identity) {
+    throw new MeshStateNatsRefusedError(`${root} changed while its NATS stream was opened (${before.kind} ${before.stream} -> ${after.kind} ${after.stream}): refusing; nothing was registered`);
   }
 };
 

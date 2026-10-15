@@ -190,6 +190,22 @@ then import. The details:
 - **Rollback:** it retires the stream and exports the projection through the `state.json`
   encoder into `state.json.nats-rollback-<E+2>-<uuid>.tmp`. It reads the temp back, checks the digest
   and renames it over the marker. A rerun redoes the export, or only verifies after the rename.
+  The CLI's `rollback --stream S` stays validated against the root (`natsStreamName(root)` or its per-switch
+  `natsStreamName(root)_<switch id>`) and is mapped to the migration's switch id: a per-switch name selects its id, the
+  fixed-root name selects no id (the earlier layout). With a marker present, an `S` that is not the marker's stream
+  refuses before anything is recorded; without one (a finished rollback's rerun) `S` picks the retired stream to verify.
+- **Opening a root on NATS (decision B):** `openNatsStateBackend` opens the stream its valid own-root NATS marker
+  names, never creating it. A root with no file state at all (no `state.json*`, no `state.db*`, no intent and no kept
+  copy; an absent root too) bootstraps its fixed-root stream `natsStreamName(root)` through the normal create,
+  replicas and readiness path, as before. Everything else refuses and nothing is bootstrapped: live file state, a staged
+  import (`state.json.nats-intent`), leftovers without a marker, a partial, truncated or malformed marker, a marker for
+  another root's stream, and any unreadable entry (its own error, e.g. EACCES). The decision is rechecked after the
+  stream is opened (same kind, stream and root `dev:ino`); an existing root is rechecked and registered under the
+  migration fence, an absent root is never created. A change (file state appearing during the await) closes the backend
+  and refuses, with nothing registered.
+- **Fixed-root preflight:** before a new import writes its intent or a stream, the root's fixed-root stream is
+  checked: if it exists and is not retired (live state of a bootstrapped root), the import refuses rather than fork it.
+  An absent or retired fixed-root stream lets the new switch begin.
 - **Files:** every file is created with O_CREAT|O_EXCL|O_NOFOLLOW at 0600 and checked as our own
   regular file. An existing kept copy must be ours and hold the source's digest, else the import refuses.
 - **Limits (`LIMIT: FABRIC_MESH_NATS_MIGRATION_LIMIT`):** `maxReplay` stream messages,

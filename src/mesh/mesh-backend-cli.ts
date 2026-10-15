@@ -14,7 +14,7 @@ import { BUILTIN_READERS, installReaderProof, probeStateDbLeases, scanStateDbHol
   type InstalledReader, type NatsGateBind, type ReaderBackend, type ReaderReadiness, type RequiredReader } from "./reader-proof.js";
 import { abandonMeshNatsImport, importMeshStateToNats, rollbackMeshStateFromNats, type MeshNatsCommitCheck, type MeshNatsMigrationOptions } from "./backend-migration-nats.js";
 import { meshStateMalformedMarkerError, readMeshStateNatsMarker, stateFileIsMalformedNatsMarker } from "./backend-fence.js";
-import { isNatsStreamForRoot, type JetStreamPort } from "./state-backend-nats.js";
+import { isNatsStreamForRoot, natsStreamName, type JetStreamPort } from "./state-backend-nats.js";
 
 const COMMANDS = ["census", "import", "status", "cutover", "rollback", "abort-rollback", "reader-proof", "lock-recover"] as const;
 type Command = typeof COMMANDS[number];
@@ -685,14 +685,33 @@ const natsImport = async (options: Options, io: NatsIo, library: MeshBackendOpti
   }
 };
 
+/**
+ * The rollback's stream selection: the migration takes only a switch id (never a stream name). A validated `--stream`
+ * (this root's, checked at parse) maps to its switch id (`natsStreamName(root)_<id>`) or, for the fixed-root name, to no
+ * id. A present marker naming another stream refuses (the marker decides; an explicit name must agree with it). With no
+ * marker (a finished rollback's rerun) the name selects the stream to converge on.
+ */
+export const natsRollbackSelection = (options: Pick<Options, "root" | "stream">): { switchId?: string } => {
+  if (options.stream === undefined) return {};
+  const root = path.resolve(options.root);
+  if (!isNatsStreamForRoot(root, options.stream)) throw new UsageError(`Bad --stream ${options.stream}: not a NATS stream of ${root}`);
+  if (stateFileIsMalformedNatsMarker(root)) throw meshStateMalformedMarkerError(path.join(root, "state.json"));
+  const marker = readMeshStateNatsMarker(root);
+  if (marker && marker.natsStream !== options.stream) {
+    throw new MeshBackendRefusedError(`rollback refused: --stream ${options.stream} disagrees with the moved marker's stream ${marker.natsStream}`);
+  }
+  const fixed = natsStreamName(root);
+  return options.stream === fixed ? {} : { switchId: options.stream.slice(fixed.length + 1) };
+};
+
 /** `rollback` of a NATS root (smarty-dev#9690): not gated (its target is file, as the sqlite rollback), recorded. */
 const natsRollback = async (options: Options, io: NatsIo, library: MeshBackendOptions, write: (text: string) => void,
   warn: (text: string) => void): Promise<number> => {
+  const selection = natsRollbackSelection(options);
   const switchId = randomUUID();
   recordSwitch(options.root, { switchId, phase: "intent", command: "rollback", backend: "file", from: "nats", gated: false });
   try {
-    const result = await rollbackMeshStateFromNats(options.root, { ...natsMigrationOptions(options, io, library),
-      ...(options.stream === undefined ? {} : { stream: options.stream }) });
+    const result = await rollbackMeshStateFromNats(options.root, { ...natsMigrationOptions(options, io, library), ...selection });
     recordSwitch(options.root, { switchId, phase: "outcome", ok: true, ...result });
     write(`${options.json ? JSON.stringify({ command: "rollback", from: "nats", ok: true, switchId, ...result }, null, 2) : formatNats("rollback from nats", { ...result })}\n`);
     return 0;

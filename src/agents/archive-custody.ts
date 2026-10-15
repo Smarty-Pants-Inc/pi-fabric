@@ -16,15 +16,17 @@ export interface PendingRunArchive {
   actorOnly?: boolean;
   routePending?: boolean;
 }
-type ArchiveCustodyRecord = { format: number; awaitingResult?: boolean; ownerPid?: number; stopIntent?: { reason: "explicit" | "deadline"; requestedAt: number }; pending?: Partial<Record<PendingRunArchive["kind"], PendingRunArchive>> } & Partial<PendingRunArchive>;
+type ArchiveCustodyRecord = { format: number; awaitingResult?: boolean; ownerPid?: number; stopIntent?: { reason: "explicit" | "deadline"; requestedAt: number; recoveryRecord?: Record<string, unknown> }; pending?: Partial<Record<PendingRunArchive["kind"], PendingRunArchive>> } & Partial<PendingRunArchive>;
 const read = (directory: string): ArchiveCustodyRecord => {
   try { return JSON.parse(fs.readFileSync(path.join(directory, ARCHIVE_PENDING_FILE), "utf8")); }
   catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return { format: 1 }; throw error; }
 };
 /** Persist manager stop intent in the existing durable archive-custody receipt. */
-export const persistRunStopIntent = (directory: string, reason: "explicit" | "deadline"): void => {
+export const persistRunStopIntent = (directory: string, reason: "explicit" | "deadline", recoveryRecord?: Record<string, unknown>): void => {
   const record = read(directory);
-  writeJsonAtomic(path.join(directory, ARCHIVE_PENDING_FILE), { ...record, stopIntent: { reason, requestedAt: Date.now() } }, { durable: true });
+  writeJsonAtomic(path.join(directory, ARCHIVE_PENDING_FILE), { ...record, stopIntent: {
+    reason, requestedAt: record.stopIntent?.requestedAt ?? Date.now(), ...(recoveryRecord ? { recoveryRecord } : {}),
+  } }, { durable: true });
 };
 
 export const readRunStopIntent = (directory: string, statusRecord?: Record<string, unknown>): ArchiveCustodyRecord["stopIntent"] => {

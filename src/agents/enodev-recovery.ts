@@ -102,13 +102,17 @@ const activationOf = (directory: string): string | undefined => {
  * A still-live or unproven worker at that deadline keeps custody and its running checkpoint.
  * Host close abandons observation, NOT custody: the promise stays pending for the next host to recover.
  */
-const waitForStoppedWorker = (directory: string, record: Record<string, unknown>, closeSignal: AbortSignal): Promise<void> =>
+const waitForStoppedWorker = (directory: string, currentRecord: () => Record<string, unknown>, closeSignal: AbortSignal): Promise<Record<string, unknown>> =>
   new Promise(resolve => {
-    if (enodevWorkerGone(record)) { resolve(); return; }
+    const initial = currentRecord();
+    if (enodevWorkerGone(initial)) { resolve(initial); return; }
     let watcher: fs.FSWatcher | undefined;
     let timer: ReturnType<typeof setTimeout> | undefined;
     const cleanup = (): void => { watcher?.close(); if (timer) clearTimeout(timer); closeSignal.removeEventListener("abort", cleanup); };
-    const check = (): void => { if (enodevWorkerGone(record)) { cleanup(); resolve(); } };
+    const check = (): void => {
+      const record = currentRecord();
+      if (enodevWorkerGone(record)) { cleanup(); resolve(record); }
+    };
     if (closeSignal.aborted) return;
     try { watcher = fs.watch(directory, check); watcher.unref(); watcher.on("error", () => { watcher?.close(); }); } catch { /* identity fallback below */ }
     timer = setTimeout(check, 60_000);
@@ -123,26 +127,47 @@ export const recoverDurableActorStop = async (runRoot: string, actorId: string, 
   let directories: string[];
   try { directories = fs.readdirSync(runRoot).map(name => path.join(runRoot, name)); } catch { return undefined; }
   for (const directory of directories) {
-    let record = readJson(path.join(directory, "status.json"));
-    if (!record || !RUN_ID.test(path.basename(directory)) || record.id !== path.basename(directory) ||
-        record.transport !== "process" || record.actorId !== actorId || activationOf(directory) !== activationId ||
-        !readRunStopIntent(directory, record)) continue;
-    await waitForStoppedWorker(directory, record, closeSignal);
-    const latest = readJson(path.join(directory, "status.json"));
-    if (latest?.id === record.id && latest.actorId === actorId && latest.transport === "process") record = latest;
+    const id = path.basename(directory);
+    if (!RUN_ID.test(id) || activationOf(directory) !== activationId) continue;
+    const statusFile = path.join(directory, "status.json");
+    const status = readJson(statusFile);
+    const intent = readRunStopIntent(directory, status);
+    if (!intent) continue;
+    // Legacy receipts have no identity snapshot. They still fence admission when
+    // retry removed status, but cannot prove an unknown replacement gone.
+    let taskActor: unknown;
+    try { taskActor = JSON.parse(fs.readFileSync(path.join(directory, "task.txt"), "utf8")).actorId; } catch { /* not an actor task */ }
+    const matches = (record: Record<string, unknown> | undefined): record is Record<string, unknown> =>
+      record?.id === id && record.transport === "process" && record.actorId === actorId;
+    const fallback = { id, actorId, transport: "process", status: "running" };
+    const snapshot = intent.recoveryRecord;
+    if (!matches(snapshot) && !matches(status) && taskActor !== actorId) continue;
+    const currentRecord = (): Record<string, unknown> => {
+      const latestStatus = readJson(statusFile);
+      const latestSnapshot = readRunStopIntent(directory, latestStatus)?.recoveryRecord;
+      // An explicit identity-less snapshot means launch is pending: never fall
+      // back to a superseded attempt's status/pid to discharge that custody.
+      return matches(latestSnapshot) ? latestSnapshot : matches(latestStatus) ? latestStatus : fallback;
+    };
+    let record = await waitForStoppedWorker(directory, currentRecord, closeSignal);
+    const latest = readJson(statusFile);
+    if (matches(latest)) record = latest;
+    // Restore the process record needed by the existing completion delivery/ack
+    // path, without consuming or changing its immutable settlement receipt.
+    if (!latest) writeJsonAtomic(statusFile, record, { durable: true });
     // Completion wins even without ENODEV. Reuse the existing delivery/queue-ack
     // protocol below rather than overwriting the receipt or settling before delivery.
     if (savedEnodevAnswer(directory) !== undefined) return undefined;
-    const intent = readRunStopIntent(directory, record)!;
+    const recoveredIntent = readRunStopIntent(directory, record) ?? intent;
     if (record.status !== "running" && record.status !== "queued") {
       if (!["completed", "failed", "stopped", "timed_out"].includes(String(record.status))) continue;
-      const outcome = { ...record, stopIntent: intent };
+      const outcome = { ...record, stopIntent: recoveredIntent };
       writeJsonAtomic(path.join(directory, "status.json"), outcome, { durable: true });
       return outcome as unknown as AgentRunResult;
     }
-    const outcome = { ...record, ...uncleanReceipt(record), status: intent.reason === "explicit" ? "stopped" : "timed_out",
-      error: intent.reason === "explicit" ? "Agent stopped" : "Agent timed out",
-      stopIntent: intent, finishedAt: Date.now() };
+    const outcome = { ...record, ...uncleanReceipt(record), status: recoveredIntent.reason === "explicit" ? "stopped" : "timed_out",
+      error: recoveredIntent.reason === "explicit" ? "Agent stopped" : "Agent timed out",
+      stopIntent: recoveredIntent, finishedAt: Date.now() };
     writeJsonAtomic(path.join(directory, "status.json"), outcome, { durable: true });
     return outcome as unknown as AgentRunResult;
   }

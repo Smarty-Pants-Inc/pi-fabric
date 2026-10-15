@@ -140,7 +140,7 @@ describe("durable explicit-stop recovery", () => {
     }
   });
 
-  it("preserves a completed receipt without ENODEV and commits only after delivery", async () => {
+  it.each([false, true])("preserves a completed receipt without ENODEV and commits only after delivery (missing status: %s)", async missingStatus => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "agent-stop-completed-"));
     roots.push(root);
     const id = "b1b2c3d4e5f60718293a4b5c6d7e8f90";
@@ -156,8 +156,11 @@ describe("durable explicit-stop recovery", () => {
       usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
     }));
     fs.writeFileSync(path.join(directory, "archive-pending.json"), JSON.stringify({
-      format: 1, awaitingResult: true, stopIntent: { reason: "explicit", requestedAt: 3 },
+      format: 1, awaitingResult: true, stopIntent: { reason: "explicit", requestedAt: 3,
+        ...(missingStatus ? { recoveryRecord: JSON.parse(fs.readFileSync(path.join(directory, "status.json"), "utf8")) } : {}),
+      },
     }));
+    if (missingStatus) fs.rmSync(path.join(directory, "status.json"));
     const receipt = JSON.stringify({ version: 1, runId: id, outcome: "completed", text: "genuine completed answer" });
     fs.writeFileSync(path.join(directory, "settlement.json"), receipt);
     const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents }, {
@@ -175,6 +178,164 @@ describe("durable explicit-stop recovery", () => {
       expect(JSON.parse(fs.readFileSync(path.join(directory, "status.json"), "utf8")))
         .toMatchObject({ status: "completed", text: "genuine completed answer", enodevDelivered: true });
       expect(fs.readFileSync(path.join(directory, "settlement.json"), "utf8")).toBe(receipt);
+    } finally { launch.mockRestore(); }
+  });
+
+  it("fences a stop persisted after retry removed status, then recovers the replacement once", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "agent-stop-retry-gap-"));
+    roots.push(root);
+    const actorId = "retry-gap-actor";
+    const activationId = "retry-gap-activation";
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, timeoutMs: 30_000 }, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root,
+    });
+    managers.push(manager);
+    let enteredLaunch!: () => void;
+    const entered = new Promise<void>(resolve => { enteredLaunch = resolve; });
+    let releaseLaunch!: () => void;
+    const launchGate = new Promise<void>(resolve => { releaseLaunch = resolve; });
+    let enteredStop!: () => void;
+    const stoppingReplacement = new Promise<void>(resolve => { enteredStop = resolve; });
+    let releaseStop!: () => void;
+    const stopGate = new Promise<void>(resolve => { releaseStop = resolve; });
+    let gone = false;
+    const replacementPid = process.ppid;
+    const originalIdentity = processIdentity.processStartTime;
+    const identity = vi.spyOn(processIdentity, "processStartTime").mockImplementation(pid =>
+      pid === replacementPid ? (gone ? "2" : "1") : originalIdentity(pid));
+    let calls = 0;
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async request => {
+      calls++;
+      const args = request.workerArguments;
+      const argument = (name: string): string => args[args.indexOf(name) + 1]!;
+      if (calls === 1) {
+        fs.writeFileSync(argument("--status-file"), JSON.stringify({
+          id: argument("--id"), actorId, name: argument("--name"), task: "retry gap", status: "failed",
+          runner: "pi", transport: "process", cwd: argument("--cwd"), startedAt: Date.now(), updatedAt: Date.now(),
+          sessionId: "2147483000", error: "Agent transport exited without a result", turns: 0, toolCalls: 0,
+          text: "", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
+        }));
+        return { kind: "process", sessionId: "2147483000", isAlive: async () => false,
+          closed: Promise.resolve(), stop: async () => {} } as Awaited<ReturnType<ProcessTransport["launch"]>>;
+      }
+      enteredLaunch();
+      await launchGate;
+      let close!: () => void;
+      const closed = new Promise<void>(resolve => { close = resolve; });
+      return { kind: "process", sessionId: String(replacementPid), isAlive: async () => !gone, closed,
+        stop: async () => { enteredStop(); await stopGate; gone = true; close(); },
+      } as Awaited<ReturnType<ProcessTransport["launch"]>>;
+    });
+    try {
+      const handle = await manager.spawn({
+        task: JSON.stringify({ actorId, id: activationId }, null, 2), actorId, activationId, transport: "process",
+      });
+      await entered;
+      const directory = path.join(root, handle.id);
+      const statusFile = path.join(directory, "status.json");
+      expect(fs.existsSync(statusFile)).toBe(false);
+      const stopping = manager.stop(handle.id);
+      const receipt = JSON.parse(fs.readFileSync(path.join(directory, "archive-pending.json"), "utf8"));
+      expect(receipt).toMatchObject({ stopIntent: { reason: "explicit" } });
+      const recovered = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents }, {
+        workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root,
+      });
+      managers.push(recovered);
+      let returned = false;
+      const recovery = recovered.run({ task: "same activation", actorId, activationId, transport: "process" })
+        .then(result => { returned = true; return result; });
+      await new Promise(resolve => setTimeout(resolve, 30));
+      expect(returned).toBe(false);
+      expect(launch).toHaveBeenCalledTimes(2);
+      releaseLaunch();
+      await stoppingReplacement;
+      await new Promise(resolve => setTimeout(resolve, 30));
+      expect(returned).toBe(false); // Even resolved launch is live, and status is still missing.
+      expect(fs.existsSync(statusFile)).toBe(false);
+      // Prove the replacement's exact birth gone and wake the existing directory watch.
+      // The old manager remains held: recovery must not depend on it publishing status.
+      gone = true;
+      fs.writeFileSync(path.join(directory, "identity-observed"), "gone");
+      const result = await recovery;
+      expect(result).toMatchObject({ id: handle.id, status: "stopped" });
+      expect(launch).toHaveBeenCalledTimes(2);
+      const second = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents }, {
+        workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root,
+      });
+      managers.push(second);
+      expect(await second.run({ task: "same activation again", actorId, activationId, transport: "process" }))
+        .toMatchObject({ id: handle.id, status: "stopped", finishedAt: result.finishedAt });
+      expect(launch).toHaveBeenCalledTimes(2);
+      releaseStop();
+      expect(await stopping).toMatchObject({ status: "stopped" });
+    } finally {
+      releaseLaunch();
+      releaseStop();
+      launch.mockRestore();
+      identity.mockRestore();
+    }
+  }, 15_000);
+
+  it("keeps legacy missing-status stop custody without an identity snapshot", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "agent-stop-no-identity-"));
+    roots.push(root);
+    const directory = path.join(root, "c1b2c3d4e5f60718293a4b5c6d7e8f90");
+    const actorId = "unknown-stop-actor";
+    const activationId = "unknown-stop-activation";
+    fs.mkdirSync(directory);
+    fs.writeFileSync(path.join(directory, "task.txt"), JSON.stringify({ actorId, id: activationId }, null, 2));
+    fs.writeFileSync(path.join(directory, "archive-pending.json"), JSON.stringify({
+      format: 1, awaitingResult: true, stopIntent: { reason: "explicit", requestedAt: 3 },
+    }));
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents }, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root,
+    });
+    managers.push(manager);
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    try {
+      let returned = false;
+      void manager.run({ task: "same activation", actorId, activationId, transport: "process" }).then(() => { returned = true; });
+      await new Promise(resolve => setTimeout(resolve, 30));
+      expect(returned).toBe(false);
+      expect(launch).not.toHaveBeenCalled();
+      expect(fs.existsSync(path.join(directory, "status.json"))).toBe(false);
+      await manager.close(); // Abandons observation, never manufactures worker-exit proof.
+      expect(returned).toBe(false);
+    } finally { launch.mockRestore(); }
+  });
+
+  it("does not fence a missing-status retry directory without stop intent", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "agent-no-stop-gap-"));
+    roots.push(root);
+    const oldId = "d1b2c3d4e5f60718293a4b5c6d7e8f90";
+    const directory = path.join(root, oldId);
+    const actorId = "no-stop-actor";
+    const activationId = "no-stop-activation";
+    fs.mkdirSync(directory);
+    fs.writeFileSync(path.join(directory, "task.txt"), JSON.stringify({ actorId, id: activationId }, null, 2));
+    fs.writeFileSync(path.join(directory, "archive-pending.json"), JSON.stringify({ format: 1, awaitingResult: true }));
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents }, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root,
+    });
+    managers.push(manager);
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async request => {
+      const args = request.workerArguments;
+      const argument = (name: string): string => args[args.indexOf(name) + 1]!;
+      fs.writeFileSync(argument("--status-file"), JSON.stringify({
+        id: argument("--id"), actorId, name: argument("--name"), task: "fresh launch", status: "completed",
+        runner: "pi", transport: "process", cwd: argument("--cwd"), startedAt: Date.now(), updatedAt: Date.now(),
+        text: "fresh answer", turns: 0, toolCalls: 0,
+        usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
+      }));
+      return { kind: "process", sessionId: "2147483000", isAlive: async () => false,
+        closed: Promise.resolve(), stop: async () => {} } as Awaited<ReturnType<ProcessTransport["launch"]>>;
+    });
+    try {
+      const result = await manager.run({ task: "same activation", actorId, activationId, transport: "process" });
+      expect(result).toMatchObject({ status: "completed", text: "fresh answer" });
+      expect(result.id).not.toBe(oldId);
+      expect(launch).toHaveBeenCalledTimes(1);
+      expect(fs.existsSync(path.join(directory, "status.json"))).toBe(false);
     } finally { launch.mockRestore(); }
   });
 

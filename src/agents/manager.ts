@@ -3544,6 +3544,20 @@ export class AgentManager {
     return this.#stop(id, options.consume !== false);
   }
 
+  /** A pending replacement has NO proven identity, even when the old attempt's pid is known. */
+  #persistStopIntent(managed: ManagedAgent, reason: "explicit" | "deadline", attemptKnown = !managed.relaunchPending): void {
+    const recoveryRecord: Record<string, unknown> = { ...failedRecord(managed, "stopped", "Agent stopped"), status: "running" };
+    delete recoveryRecord.sessionId;
+    delete recoveryRecord.processStartTime;
+    delete recoveryRecord.finishedAt;
+    delete recoveryRecord.error;
+    if (attemptKnown && managed.ownProcess) {
+      recoveryRecord.sessionId = String(managed.ownProcess.pid);
+      if (managed.ownProcess.started !== undefined) recoveryRecord.processStartTime = managed.ownProcess.started;
+    }
+    persistRunStopIntent(managed.runDirectory, reason, recoveryRecord);
+  }
+
   /** Internal close joins execution custody without acknowledging an actor result. */
   async #stop(id: string, consumeSettled: boolean): Promise<AgentRunResult> {
     const queued = this.#queued.get(id);
@@ -3562,7 +3576,7 @@ export class AgentManager {
     const managed = this.#requireRun(id);
     // Persist operator intent before transport work only while the run is open.
     // Settled runs can still own detached execution groups which must be drained below.
-    if (!managed.settled) persistRunStopIntent(managed.runDirectory, "explicit");
+    if (!managed.settled) this.#persistStopIntent(managed, "explicit");
     managed.stopRequested = true;
     // Stop retracts notices; guest publication still uses its deferred receipt.
     managed.background = false;
@@ -4671,6 +4685,10 @@ export class AgentManager {
       managed.transport = transport;
       const owned = transport.kind === "process" ? ownedProcess(transport.sessionId) : undefined;
       if (owned) managed.ownProcess = owned;
+      // A stop can land AFTER status removal while launch is pending. Publish only
+      // this resolved replacement's identity; the superseded pid proves nothing.
+      const stopIntent = readRunStopIntent(managed.runDirectory);
+      if (stopIntent) this.#persistStopIntent(managed, stopIntent.reason, true);
       managed.executionExited = false;
       delete managed.processStop;
       delete managed.processStopPending;
@@ -4924,7 +4942,7 @@ export class AgentManager {
         return;
       }
       if (Date.now() >= deadline) {
-        persistRunStopIntent(managed.runDirectory, "deadline");
+        this.#persistStopIntent(managed, "deadline");
         managed.stopRequested = true;
         await this.#stopWorkerRunner(managed);
         await this.#stopManagedTransport(managed);

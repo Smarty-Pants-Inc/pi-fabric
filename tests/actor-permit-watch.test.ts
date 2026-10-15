@@ -283,6 +283,10 @@ describe("resident actor permit watch (#9031)", () => {
   it.each([
     ["worker-gone", "active"], ["completed", "active"],
     ["worker-gone", "inherited"], ["completed", "inherited"],
+    ["failed-no-inference", "active"], ["failed-no-inference", "inherited"],
+    ["missing-optionals", "active"], ["missing-optionals", "inherited"],
+    ["launched-throw", "active"], ["launched-throw", "inherited"],
+    ["cleanup-throw", "active"], ["cleanup-throw", "inherited"],
   ] as const)("%s activation consumes its %s child-handoff exactly once", async (outcome, placement) => {
     let defer = placement === "inherited";
     const f = fixture(true, { preparePiModel: async model => {
@@ -290,6 +294,23 @@ describe("resident actor permit watch (#9031)", () => {
       return model;
     } });
     const actor = await f.actors.create({ name: "child-handoff", instructions: "Respond", responseMode: "text", coalesce: false });
+    const run = f.agents.run.bind(f.agents);
+    let returned: Awaited<ReturnType<typeof run>> | undefined;
+    let cleanupThrown = false;
+    vi.spyOn(f.agents, "run").mockImplementation(async (...args) => {
+      const result = await run(...args);
+      if (returned) return result;
+      if (outcome === "failed-no-inference") delete result.inferenceStarted;
+      if (outcome === "missing-optionals") {
+        // Keep every required field, but no optional evidence from the real manager.
+        const { id, name, task, status, runner, transport, cwd, startedAt, updatedAt,
+          turns, toolCalls, text, usage } = result;
+        returned = { id, name, task, status, runner, transport, cwd, startedAt, updatedAt,
+          turns, toolCalls, text, usage };
+      } else returned = result;
+      if (outcome === "launched-throw") throw new Error("transport cleanup threw after host launch");
+      return returned;
+    });
     const childId = "b".repeat(32);
     const store = new ActorChildCompletionStore(actor.sessionFile!);
     store.enqueue({ id: childId, name: "child", status: "completed", text: "child result payload",
@@ -316,9 +337,34 @@ describe("resident actor permit watch (#9031)", () => {
       await eventually(() => expect(f.agents.status(activation.launch.id)).toMatchObject({
         status: "failed", errorCode: "WORKER_GONE", settledLost: true,
       }));
-    } else complete(activation);
+    } else if (outcome === "failed-no-inference" || outcome === "missing-optionals") {
+      // An ordinary committed failure, not a missing-worker diagnosis.
+      save(activation, { status: "failed", error: "ordinary child activation failure",
+        toolCalls: outcome === "failed-no-inference" ? 2 : 0, finishedAt: Date.now(), exitCode: 1 });
+      activation.alive = false;
+      activation.nativeClose();
+      activation.treeClose();
+    } else {
+      if (outcome === "cleanup-throw") vi.mocked(f.agents.cleanup).mockImplementationOnce(id => {
+        recordedDeletionCalls.push(`agent-cleanup:${id}`);
+        cleanupThrown = true;
+        throw new Error("recorded cleanup threw after host launch");
+      });
+      complete(activation);
+    }
 
     await eventually(() => expect(f.actors.inFlightCount()).toBe(0));
+    if (outcome === "failed-no-inference" || outcome === "missing-optionals") {
+      expect(returned).toMatchObject({ status: "failed", toolCalls: outcome === "failed-no-inference" ? 2 : 0 });
+      expect(returned).not.toHaveProperty("inferenceStarted");
+      expect(f.agents.status(activation.launch.id)).not.toHaveProperty("errorCode", "WORKER_GONE");
+      if (outcome === "missing-optionals") expect(Object.keys(returned!).sort()).toEqual([
+        "id", "name", "task", "status", "runner", "transport", "cwd", "startedAt", "updatedAt",
+        "turns", "toolCalls", "text", "usage",
+      ].sort());
+    }
+    if (outcome === "cleanup-throw") expect(cleanupThrown).toBe(true);
+    expect(store.handoffConsumed(childId)).toBe(true);
     const successor = f.actors.ask(actor.id, "successor after child handoff");
     const next = await launched(f, actor.id);
     expect(next.record.task).toContain("successor after child handoff");
@@ -331,6 +377,20 @@ describe("resident actor permit watch (#9031)", () => {
     complete(next);
     await expect(successor).resolves.toMatchObject({ text: "finished" });
     expect(f.actors.messages(actor.id).filter(message => message.id === childId && message.direction === "in")).toHaveLength(1);
+    await eventually(() => expect(f.actors.inFlightCount()).toBe(0));
+    await f.actors.close();
+    f.actors = f.createActors();
+    f.actors.reclaim(actor.id);
+    f.actors.resumeQueued();
+    await ticks();
+    expect([...workers.values()]).toHaveLength(2);
+    const afterReload = f.actors.ask(actor.id, "successor after reload");
+    const reloaded = await launched(f, actor.id);
+    expect(reloaded.record.task).not.toContain(store.resultFile(childId));
+    expect(reloaded.record.task).not.toContain("child result payload");
+    expect(new ActorChildCompletionStore(actor.sessionFile!).handoffConsumed(childId)).toBe(true);
+    complete(reloaded);
+    await expect(afterReload).resolves.toMatchObject({ text: "finished" });
   });
 
   it("committed actor success with an already-gone worker remains deliverable success", async () => {
@@ -467,7 +527,7 @@ describe("resident actor permit watch (#9031)", () => {
     expect(f.agents.status(handle.id)).not.toHaveProperty("errorCode", "WORKER_GONE");
   });
 
-  it("queued confirmed-unlaunched auth timeout survives ownership transfer and reload, then executes exactly once", async () => {
+  it("queued confirmed-unlaunched auth timeout retains its child handoff across ownership transfer and reload, then executes exactly once", async () => {
     let releaseAuth!: () => void;
     const auth = new Promise<void>(resolve => { releaseAuth = resolve; });
     let authCalls = 0;
@@ -490,7 +550,11 @@ describe("resident actor permit watch (#9031)", () => {
         }
         return result;
       });
-      const accepted = await f.actors.tell(actor.id, "original queued activation");
+      const childId = "d".repeat(32);
+      const store = new ActorChildCompletionStore(actor.sessionFile!);
+      store.enqueue({ id: childId, name: "child", status: "completed", text: "original queued activation",
+        startedAt: Date.now(), finishedAt: Date.now() } as Parameters<ActorChildCompletionStore["enqueue"]>[0],
+      { id: actor.id, kind: "actor", runId: "e".repeat(32) });
       await eventually(() => expect(f.actors.status(actor.id).status).toBe("waiting"));
       const receiptId = f.actors.status(actor.id).preparing!.runId!;
       await eventually(() => expect(snapshot(f).waiting).toHaveLength(1));
@@ -502,11 +566,13 @@ describe("resident actor permit watch (#9031)", () => {
         expect(f.actors.inFlightCount()).toBe(0);
       });
       expect([...workers.values()]).toHaveLength(1); // Only the admission blocker launched.
+      expect(store.handoffConsumed(childId)).toBe(false);
+      expect(fs.existsSync(store.resultFile(childId))).toBe(true);
       await eventually(() => expect(snapshot(f).held).toEqual([]));
       const directory = path.dirname(actor.sessionFile!);
       const queueFile = path.join(directory, fs.readdirSync(directory).find(file => /^queue-.*\.json$/.test(file))!);
       expect(JSON.parse(fs.readFileSync(queueFile, "utf8")).items).toEqual([
-        expect.objectContaining({ id: accepted.messageId, executionStarted: false, attempts: 0 }),
+        expect.objectContaining({ id: childId, executionStarted: false, attempts: 0 }),
       ]);
       await f.actors.close();
       f.actors = f.createActors();
@@ -516,18 +582,21 @@ describe("resident actor permit watch (#9031)", () => {
       f.actors.reclaim(actor.id);
       f.actors.resumeQueued();
       const worker = await launched(f, actor.id);
-      expect(worker.record.task).toContain("original queued activation");
+      expect(worker.record.task).toContain(store.resultFile(childId));
+      expect(store.handoffConsumed(childId)).toBe(false);
       complete(worker);
       await eventually(() => {
         expect(f.actors.inFlightCount()).toBe(0);
         expect(f.actors.status(actor.id).queued).toBe(0);
       });
+      expect(store.handoffConsumed(childId)).toBe(true);
+      expect(fs.existsSync(store.resultFile(childId))).toBe(false);
       releaseAuth();
       await f.actors.close();
       f.actors = f.createActors();
       await ticks();
       expect(runs).toHaveBeenCalledTimes(2); // One unlaunched receipt, one actual activation.
-      expect([...workers.values()].filter(candidate => candidate.record.task.includes("original queued activation"))).toHaveLength(1);
+      expect([...workers.values()].filter(candidate => candidate.record.task.includes(store.resultFile(childId)))).toHaveLength(1);
       expect(f.actors.messages(actor.id).filter(message => message.direction === "out" && !message.error)).toHaveLength(1);
     } finally {
       releaseAuth();

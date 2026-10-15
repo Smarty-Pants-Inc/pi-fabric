@@ -4181,6 +4181,12 @@ export class ActorManager {
               ...(routeDecision ? { routeDecision } : {}) },
             abortController.signal,
             (handle) => {
+              // Host launch consumes the handoff even if this callback or run later throws.
+              workerLaunched = true;
+              handoffConsumed = true;
+              item.launchEvidenceVersion = 1;
+              item.executionStarted = true;
+              this.#persistQueue(actor.id);
               // AgentManager can canonicalize a selector after permit admission. Use
               // its actual handle, then piggyback on the existing running publication.
               this.#rememberResolvedBinding(actor, {
@@ -4188,10 +4194,6 @@ export class ActorManager {
                 ...(launchBinding.modelReason !== undefined ? { modelReason: launchBinding.modelReason } : {}),
                 ...(handle.thinking ? { thinking: handle.thinking } : {}),
               });
-              workerLaunched = true;
-              item.launchEvidenceVersion = 1;
-              item.executionStarted = true;
-              this.#persistQueue(actor.id);
               delete actor.preparing;
               this.#endPreparationClock(actor.id, item.id);
               actor.status = "running";
@@ -4222,22 +4224,22 @@ export class ActorManager {
             } },
           );
           runId = result.id;
-          // Worker status may diagnose overflow, but neither status nor logs authorize replay.
-          const contextOverflow = result.status !== "completed" && result.errorCode === "CONTEXT_OVERFLOW" &&
-            !CONTRADICTORY_OVERFLOW_CODES.has(classifyManagerActivationFailure({ lastError: result.error ?? "", error: result.error, evidence: result.warnings }, true).code);
-          runEvidence = result.warnings;
-          // Positive worker inference is a conservative consumption signal only.
-          handoffConsumed = result.status === "completed" || result.inferenceStarted === true;
-          // Captured before any check that can throw: a completed run is never parked and
-          // rerun, whatever happens to ownership afterwards.
+          // Fail closed on every returned run except the audited, confirmed-unlaunched timeout.
+          // Capture this before output classification or ownership checks can throw.
+          handoffConsumed = !(!workerLaunched && result.launchPreparationTimeoutMs !== undefined);
           runCompleted = result.status === "completed";
           enodevRecovered = result.enodevRecovered === true;
           runStopped = result.status === "stopped";
           runLost = result.status === "failed" && result.errorCode === "WORKER_GONE";
-          // Host launch admission is enough to fence ownership replay; worker zero is not proof.
-          runEffects = workerLaunched || result.toolCalls !== 0 || result.inferenceStarted === true;
+          // Returned activations are terminal without optional worker evidence too.
+          // A recovered ENODEV answer was not executed here and may still need parking.
+          runEffects = workerLaunched || (!enodevRecovered && handoffConsumed);
           runFailed = result.status === "failed" &&
             !(!workerLaunched && result.launchPreparationTimeoutMs !== undefined);
+          runEvidence = result.warnings;
+          // Worker status may diagnose overflow, but neither status nor logs authorize replay.
+          const contextOverflow = result.status !== "completed" && result.errorCode === "CONTEXT_OVERFLOW" &&
+            !CONTRADICTORY_OVERFLOW_CODES.has(classifyManagerActivationFailure({ lastError: result.error ?? "", error: result.error, evidence: result.warnings }, true).code);
           if (runLost) {
             // A lost activation may already have had effects. Consume it before
             // ownership/cancellation handling can park it for another launch.
@@ -4508,11 +4510,6 @@ export class ActorManager {
             this.#noteDroppedEvent(actor, item, message, runId);
           }
         } finally {
-          if (capabilityLease) {
-            if (!workerLaunched) await this.#prepare(actor, "capability-release", () => capabilityLease!.release())
-              .catch((error: unknown) => this.#recordPreparationFailure(actor, error));
-            else await capabilityLease.release().catch(() => undefined);
-          }
           // Retain a durable copy of the run's event log + status in the
           // actor's directory so agents.log / /fabric log can inspect what the
           // actor sent to and received from its model, even after a successful
@@ -4521,6 +4518,11 @@ export class ActorManager {
           // smarty-dev#11105: an ended run is never left recorded, even when this cleanup throws; otherwise a
           // finisher's join would stop the ended run and wait there.
           try {
+            if (capabilityLease) {
+              if (!workerLaunched) await this.#prepare(actor, "capability-release", () => capabilityLease!.release())
+                .catch((error: unknown) => this.#recordPreparationFailure(actor, error));
+              else await capabilityLease.release().catch(() => undefined);
+            }
             let archived = false;
             if (runId) {
               archived = await this.#retainRunLog(actor, runId).then(() => true, () => false);
@@ -4543,11 +4545,11 @@ export class ActorManager {
             delete actor.preparing;
             this.#endPreparationClock(actor.id, item.id);
             delete actor.inFlightRun;
+            actor.updatedAt = Date.now();
+            if (actor.status !== "stopped") actor.status = actor.queue.length > 0 ? "queued" : "idle";
+            // Only positively unlaunched preparation failures may defer handoff context.
+            this.#finishInFlight(actor.id, item, handoffConsumed, runCompleted);
           }
-          actor.updatedAt = Date.now();
-          if (actor.status !== "stopped") actor.status = actor.queue.length > 0 ? "queued" : "idle";
-          // Failed handoffs wait as context; never obstruct the next runnable item.
-          this.#finishInFlight(actor.id, item, handoffConsumed, runCompleted);
           if (enodevDelivered && (!this.#persistent || this.#persistQueue(actor.id, true))) {
             try { this.agents.commitEnodevRecovery?.(runId!); } catch { /* the receipt settles it at the next start */ }
           }

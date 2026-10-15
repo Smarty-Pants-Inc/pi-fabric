@@ -246,6 +246,8 @@ export interface BridgeSide {
   relayPresence?(): Promise<Pick<BridgePresence, "hosts" | "participants">>;
   /** Direct origin of a held root on another link, for captured control destinations. */
   relayOrigin?(id: string): string | undefined;
+  /** Hub-local only: a structurally attributable projection whose authority is stale; never routing authority. */
+  relayStaleOrigin?(id: string): string | undefined;
   /** Publish a bridged event; with `held`, only if this link holds each of those ids at commit. */
   publish(event: BridgePublish, held?: string[]): Promise<{ sequence: number }>;
   /** Hub-local only: persist a payload-free successful relay receipt under the sender fence. */
@@ -556,14 +558,23 @@ export class StoreBridgeSide implements BridgeSide {
     return this.#presenceSnapshot();
   }
 
-  relayOrigin(id: string): string | undefined {
+  #relayProjection(id: string): FabricHostRecord | undefined {
     const entry = this.store.get(keyFor(HOST_PREFIX, id), { fresh: true });
     const host = entry && hostOf(entry.key, entry.value);
     return host && host.remoteHost !== undefined && host.remoteHost !== this.peer && host.bridgeVia === undefined &&
       CANONICAL_ID.test(id) && host.rootId === id && host.identity.id === id &&
       !participantFilePresent(this.store.root, keyFor(PARTICIPANT_PREFIX, id)) &&
-      entry!.updatedBy.id === host.identity.id && hostLeaseExpiry(readHostLeases(this.store.root), host) > this.now()
-      ? host.remoteHost : undefined;
+      entry!.updatedBy.id === host.identity.id ? host : undefined;
+  }
+
+  relayOrigin(id: string): string | undefined {
+    const host = this.#relayProjection(id);
+    return host && hostLeaseExpiry(readHostLeases(this.store.root), host) > this.now() ? host.remoteHost : undefined;
+  }
+
+  relayStaleOrigin(id: string): string | undefined {
+    const host = this.#relayProjection(id);
+    return host && hostLeaseExpiry(readHostLeases(this.store.root), host) <= this.now() ? host.remoteHost : undefined;
   }
 
   async relayPresence(): Promise<Pick<BridgePresence, "hosts" | "participants">> {
@@ -1893,6 +1904,8 @@ export class MeshBridge {
   readonly #directionWake: Partial<Record<Direction, () => void>> = {};
   /** Last sampled, admitted source deadlines: evidence to WAIT only, never authority to publish. */
   #sampledDeadlines = new Map<string, number>();
+  /** One stable, bounded grace deadline for the retained relay boundary; bodies stay in the source log. */
+  readonly #relayGrace: Partial<Record<Direction, { sequence: number; until: number }>> = {};
   /** At most one pending boundary per direction. Bodies stay in the durable source, before its cursor. */
   readonly #membershipRetryAt: Partial<Record<Direction, number>> = {};
   readonly #membershipSequence: Partial<Record<Direction, number>> = {};
@@ -2379,6 +2392,7 @@ export class MeshBridge {
     const seen = this.#seen[direction];
     let forwarded = 0;
     let dropped = 0;
+    if ((this.#relayGrace[direction]?.sequence ?? Infinity) <= cursor.after) delete this.#relayGrace[direction];
     if ((this.#membershipSequence[direction] ?? Infinity) <= cursor.after) {
       delete this.#membershipSequence[direction];
       delete this.#membershipRetryAt[direction];
@@ -2516,7 +2530,17 @@ export class MeshBridge {
         }
         // Cross-spoke commands never enter either hub body-publication seam. Even a
         // missing/lapsed destination gets its refusal only on the original source link.
-        if (this.#isRelayCommand(event, rules, direction) && this.#relaySenderAllowed(event, rules)) {
+        const relayCommand = this.#isRelayCommand(event, rules, direction);
+        const relaySenderAllowed = relayCommand && this.#relaySenderAllowed(event, rules);
+        // If both ends are stale, retain the source uncertainty first. The destination
+        // observation is only a bounded wait signal; it never admits the sender.
+        if (relayCommand && this.#relayDestinationStale(event, rules) && !relaySenderAllowed) {
+          this.#relayGracePending(event);
+          this.#deferMembership(direction, event);
+          if (cursor.after > start) this.#save();
+          return { forwarded, dropped };
+        }
+        if (relayCommand && relaySenderAllowed) {
           if (!seen.has(event.id)) {
             if (this.#presenceDue()) await refresh();
             const result = await this.#relayCommand(event, rules);
@@ -2529,6 +2553,7 @@ export class MeshBridge {
               if (result.sequence !== undefined) cursor.mark = Math.max(cursor.mark, result.sequence);
               forwarded += 1;
             } else dropped += 1;
+            this.#clearRelayGrace(direction, event);
           }
           cursor.after = event.sequence;
           this.#save();
@@ -2648,6 +2673,35 @@ export class MeshBridge {
       !rules.reserved?.has(event.from.id) && rules.senders?.has(event.from.id) === true && rules.identities?.has(event.from.id) === true;
   }
 
+  #staleRelaySender(event: MeshEvent, rules: BridgeRules): boolean {
+    if (hasBridgeField(event) || isRelayReceipt(event) || !isIdentity(event.from) || !isObject(event.data) ||
+        !CANONICAL_ID.test(event.from.id) || rules.reserved?.has(event.from.id)) return false;
+    return (this.#sampledDeadlines.get(event.from.id) ?? Infinity) <= Date.now();
+  }
+
+  #relayDestinationStale(event: MeshEvent, rules: BridgeRules): boolean {
+    if (typeof event.to !== "string" || !isObject(event.data) ||
+        (!this.#relaySenderAllowed(event, rules) && !this.#staleRelaySender(event, rules))) return false;
+    const origin = this.options.local.relayStaleOrigin?.(event.to);
+    return origin !== undefined && event.data.destinationRemoteHost === origin;
+  }
+
+  #relayGracePending(event: MeshEvent): boolean {
+    const current = this.#relayGrace.toLocal;
+    if (current && current.sequence !== event.sequence) delete this.#relayGrace.toLocal;
+    const now = Date.now();
+    const retained = this.#relayGrace.toLocal;
+    if (!retained) {
+      this.#relayGrace.toLocal = { sequence: event.sequence, until: now + BRIDGE_LEASE_MS };
+      return true;
+    }
+    return now < retained.until;
+  }
+
+  #clearRelayGrace(direction: Direction, event: MeshEvent): void {
+    if (this.#relayGrace[direction]?.sequence === event.sequence) delete this.#relayGrace[direction];
+  }
+
   async #relayCommand(event: MeshEvent, rules: BridgeRules): Promise<{ delivered: boolean; sequence?: number; pending?: boolean }> {
     const { local, remote, relay, localName, remoteName } = this.options;
     const pub = this.#outbound(event, rules, "toLocal");
@@ -2656,7 +2710,11 @@ export class MeshBridge {
     // Do not turn a source sender's expired sampled projection into an unavailable ACK
     // and consume its command. This is a wait, not permission to bypass the sender fence.
     if (!senderHeld &&
-      this.#staleMembership(event, rules, "toLocal", this.#refusal(event, rules, "toLocal"))) return { delivered: false, pending: true };
+      (this.#staleMembership(event, rules, "toLocal", this.#refusal(event, rules, "toLocal")) ||
+        (this.#relayDestinationStale(event, rules) && this.#staleRelaySender(event, rules)))) return { delivered: false, pending: true };
+    const staleDestination = this.#relayDestinationStale(event, rules);
+    if (staleDestination && this.#relayGracePending(event)) return { delivered: false, pending: true };
+    if (!staleDestination) this.#clearRelayGrace("toLocal", event);
     try {
       if (this.#stopped || !this.#ready || this.#notificationError || this.#refusal(event, rules, "toLocal") || !relay ||
         !destination || destination === remoteName || destination === localName ||
@@ -2664,6 +2722,11 @@ export class MeshBridge {
         !senderHeld) throw relayUnavailable();
       await relay(destination, pub);
     } catch (error) {
+      // A destination can lapse after the first admission but before its own held fence.
+      // The same bounded grace defers, never routes, that stale observation.
+      if (!isIdempotencyKeyReused(error) && this.#relayDestinationStale(event, rules) && this.#relayGracePending(event)) {
+        return { delivered: false, pending: true };
+      }
       // Timeout remains ambiguous. A typed conflict is a fixed, nonretryable source-local
       // refusal; neither case exposes owner assertions, arbitrary errors, body or hash.
       const refusal = isIdempotencyKeyReused(error)

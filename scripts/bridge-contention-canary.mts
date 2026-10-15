@@ -15,9 +15,10 @@ import { writeParticipantFile } from "../src/topology/participant-files.js";
  * Cross-process bridge contention canary.  The parent owns the scratch directory after this
  * exits: this file deliberately never removes a store, a receipt, or a child-owned artifact.
  *
- * The hub runs the real mesh-bridge CLI. Its stdio command is a second real agent process. The
- * control planes below are real FabricControlPlane instances over the two SQLite stores; their
- * handlers are the receiver/ACK path, not a plain event listener.
+ * Phase 1 retains the real hub/agent pair. Phase 2 runs three real hub-link CLIs sharing one
+ * SQLite hub, each with its real stdio agent, and sends A <-> B through production relay UDS.
+ * FabricControlPlane and ParticipantDirectory own delivery, routing and authenticated ACKs.
+ * This is contention evidence, not a deterministic reproduction of a stale/inflight race.
  */
 
 const SCRIPT = fileURLToPath(import.meta.url);
@@ -35,6 +36,22 @@ const HUB_ID = "session:canary-hub-00000000";
 const AGENT_ID = "session:canary-agent-00000000";
 
 type Child = ChildProcess & { stderr: NonNullable<ChildProcess["stderr"]> };
+const childClosures = new WeakMap<Child, Promise<void>>();
+
+/** Every owned process has an absolute lifetime and a joined close, including failed spawns. */
+const ownChild = (child: Child): Child => {
+  const closed = new Promise<void>(resolve => {
+    let force: ReturnType<typeof setTimeout> | undefined;
+    const lifetime = setTimeout(() => {
+      child.kill("SIGTERM");
+      force = setTimeout(() => { child.kill("SIGKILL"); }, 8_000);
+    }, 240_000);
+    child.once("close", () => { clearTimeout(lifetime); if (force) clearTimeout(force); resolve(); });
+    child.on("error", () => undefined);
+  });
+  childClosures.set(child, closed);
+  return child;
+};
 
 interface Native {
   identity: MeshIdentity;
@@ -158,9 +175,9 @@ interface LockProcess {
 }
 
 const spawnLockHolder = (db: string, holdMs: number): LockProcess => {
-  const child = spawn(process.execPath, [SCRIPT, "lock-holder", "--db", db, "--hold-ms", String(holdMs)], {
+  const child = ownChild(spawn(process.execPath, [SCRIPT, "lock-holder", "--db", db, "--hold-ms", String(holdMs)], {
     stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, PI_FABRIC_MESH_STATE_BACKEND: "sqlite" },
-  }) as Child;
+  }) as Child);
   let output = "";
   let buffer = "";
   let readyDone = false;
@@ -233,12 +250,12 @@ const handlerFor = (state: Tally) => async (command: { data?: unknown; commandId
 };
 
 const terminate = async (child: Child | undefined): Promise<void> => {
-  if (!child || child.exitCode !== null || child.signalCode !== null) return;
+  if (!child) return;
+  const closed = childClosures.get(child);
+  if (!closed) throw new Error("cannot terminate an unowned canary child");
   if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
-  await new Promise<void>(resolve => {
-    const timer = setTimeout(() => { child.kill("SIGKILL"); }, 4_000);
-    child.once("close", () => { clearTimeout(timer); resolve(); });
-  });
+  const timer = setTimeout(() => { child.kill("SIGKILL"); }, 8_000);
+  try { await closed; } finally { clearTimeout(timer); }
 };
 
 const lockHolderMain = async (flags: Map<string, string>): Promise<void> => {
@@ -249,10 +266,10 @@ const lockHolderMain = async (flags: Map<string, string>): Promise<void> => {
     exec(sql: string): void; close(): void;
   } };
   const db = new sqlite.DatabaseSync(dbPath);
-  const readyAt = Date.now();
   try {
     db.exec("PRAGMA busy_timeout = 1000");
     db.exec("BEGIN IMMEDIATE");
+    const readyAt = Date.now();
     process.stdout.write(`${JSON.stringify({ phase: "ready", readyAt, holdMs })}\n`);
     await sleep(holdMs);
     db.exec("COMMIT");
@@ -263,11 +280,9 @@ const lockHolderMain = async (flags: Map<string, string>): Promise<void> => {
   }
 };
 
-const runCanary = async (): Promise<void> => {
-  process.env.PI_FABRIC_MESH_STATE_BACKEND = "sqlite";
-  const evidenceRoot = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-bridge-contention-canary-"));
-  currentEvidenceRoot = evidenceRoot;
-  fs.chmodSync(evidenceRoot, 0o700);
+const runPairCanary = async (evidenceRoot: string) => {
+  const runtime = path.join(evidenceRoot, "pair-runtime");
+  fs.mkdirSync(runtime, { mode: 0o700 });
   const hubRoot = path.join(evidenceRoot, HUB);
   const agentRoot = path.join(evidenceRoot, AGENT);
   const cursor = path.join(evidenceRoot, "hub-agent.cursor.json");
@@ -297,11 +312,12 @@ const runCanary = async (): Promise<void> => {
   try {
     // Two real bridge processes: the installed run command and its installed agent command over
     // local stdio.  The canary wrapper itself is not a bridge process.
-    hubProcess = spawn(process.execPath, [BIN, "run", "--mesh", hubRoot, "--name", HUB, "--remote", AGENT,
+    hubProcess = ownChild(spawn(process.execPath, [BIN, "run", "--mesh", hubRoot, "--name", HUB, "--remote", AGENT,
       "--cursor", cursor, "--lock-protocol", "3", "--call-timeout-ms", "10000", "--",
       process.execPath, BIN, "agent", "--mesh", agentRoot, "--peer", HUB], {
-      stdio: ["ignore", "ignore", "pipe"], env: { ...process.env, PI_FABRIC_MESH_STATE_BACKEND: "sqlite" },
-    }) as Child;
+      stdio: ["ignore", "ignore", "pipe"],
+      env: { ...process.env, XDG_RUNTIME_DIR: runtime, PI_FABRIC_MESH_STATE_BACKEND: "sqlite" },
+    }) as Child);
     hubProcess.stderr.on("data", chunk => { bridgeLog += String(chunk); });
     await waitForChildText(hubProcess, "linked hub <-> agent", 20_000, "hub bridge");
     await Promise.all([
@@ -363,23 +379,235 @@ const runCanary = async (): Promise<void> => {
     const result = {
       ok: drops === 0 && bridgeDrops === 0 && duplicates === 0 && hubTally.invalid === 0 && agentTally.invalid === 0 &&
         hubTally.entries.size === N && agentTally.entries.size === N && lockHoldsSatisfied,
-      evidenceRoot, sent: 2 * N, delivered, duplicates, drops, bridgeDrops,
+      phase: "pair", evidenceRoot, sent: 2 * N, delivered, duplicates, drops, bridgeDrops,
       deliveredEachWay: { hubToAgent: agentTally.entries.size, agentToHub: hubTally.entries.size },
       authenticatedAcks,
       receiverInvalid: hubTally.invalid + agentTally.invalid,
       receiverExactlyOnce: hubTally.entries.size === N && agentTally.entries.size === N && duplicates === 0,
       lockDurationsMs: lockDurations, elapsedMs: Math.round(performance.now() - started),
     };
-    fs.writeFileSync(path.join(evidenceRoot, "bridge-contention-canary.receipt.json"), `${JSON.stringify(result)}\n`, { mode: 0o600 });
-    process.stdout.write(`${JSON.stringify(result)}\n`);
-    if (!result.ok) throw new Error(`canary invariant failed: ${JSON.stringify(result)}`);
+    fs.writeFileSync(path.join(evidenceRoot, "pair.receipt.json"), `${JSON.stringify(result)}\n`, { mode: 0o600 });
+    if (!result.ok) throw new Error(`pair invariant failed: ${JSON.stringify(result)}`);
+    return result;
   } finally {
     for (const child of lockProcesses) await terminate(child);
     await Promise.allSettled([hubSender?.close(), agentSender?.close()].filter((value): value is Promise<void> => value !== undefined));
-    fs.writeFileSync(path.join(evidenceRoot, "bridge.log"), bridgeLog, { mode: 0o600 });
     await terminate(hubProcess);
+    fs.writeFileSync(path.join(evidenceRoot, "bridge.log"), bridgeLog, { mode: 0o600 });
     hubStore.closeState();
     agentStore.closeState();
+  }
+};
+
+/** Three independent production hub-link CLIs share ONE physical SQLite hub. */
+const runCrossSpokeCanary = async (evidenceRoot: string) => {
+  if (process.platform !== "linux" || process.release.name !== "node") {
+    throw new Error("cross-spoke production relay requires Linux Node; no substituted relay is permitted");
+  }
+  const base = path.join(evidenceRoot, "cross-spoke");
+  fs.mkdirSync(base, { mode: 0o700 });
+  const runtime = path.join(base, "runtime");
+  fs.mkdirSync(runtime, { mode: 0o700 });
+  const names = [HUB, "spoke-a", "spoke-b", "spoke-c"] as const;
+  const stores = new Map<string, MeshStore>();
+  const natives = new Map<string, Native>();
+  const directories = new Map<string, ParticipantDirectory>();
+  const links: Array<{ remote: string; child: Child; log: string }> = [];
+  const controls: FabricControlPlane[] = [];
+  const locks: LockProcess[] = [];
+  const started = performance.now();
+  const aMarkers = Array.from({ length: N }, (_, i) => `cross-a-to-b-${i}`);
+  const bMarkers = Array.from({ length: N }, (_, i) => `cross-b-to-a-${i}`);
+  const aTally = tally(bMarkers), bTally = tally(aMarkers);
+  let authenticatedAcks = 0;
+  let authenticatedCommands = 0;
+  const env = { ...process.env, XDG_RUNTIME_DIR: runtime, PI_FABRIC_MESH_STATE_BACKEND: "sqlite" };
+  const events = (store: MeshStore, topic: string) => store.read({ topic, after: 0, limit: MESH_READ });
+  const object = (value: unknown): value is Record<string, unknown> =>
+    typeof value === "object" && value !== null && !Array.isArray(value);
+  try {
+    for (const name of names) {
+      const store = openStore(path.join(base, name));
+      stores.set(name, store);
+      const native = await installNative(store, `session:canary-cross-${name}-00000000`, `cross-${name}`);
+      natives.set(name, native);
+      directories.set(name, new ParticipantDirectory(store, {
+        enabled: true, hostId: native.identity.id, rootId: native.identity.id, identity: native.identity,
+        heartbeatMs: 60_000, leaseMs: 600_000, reapDeadHosts: false,
+      }));
+    }
+    const hub = stores.get(HUB)!;
+    for (const remote of names.slice(1)) {
+      const child = ownChild(spawn(process.execPath, [BIN, "run", "--mesh", hub.root, "--name", HUB,
+        "--remote", remote, "--cursor", path.join(base, `${remote}.cursor.json`),
+        "--lock-protocol", "3", "--call-timeout-ms", "10000", "--",
+        process.execPath, BIN, "agent", "--mesh", stores.get(remote)!.root, "--peer", HUB,
+        "--lock-protocol", "3"], { env, stdio: ["ignore", "ignore", "pipe"] }) as Child);
+      const link = { remote, child, log: "" };
+      links.push(link);
+      child.stderr.on("data", chunk => { link.log += String(chunk); });
+      await waitForChildText(child, `linked ${HUB} <-> ${remote}`, 20_000, `${remote} bridge`);
+    }
+    const reexported = (source: string, target: string): boolean => {
+      const native = natives.get(target)!;
+      const store = stores.get(source)!;
+      const owner = directories.get(source)!.mirroredControlOwner(native.identity.id, native.identity.id, native.identity.id);
+      const row = store.get(hostKey(native.identity.id), { fresh: true })?.value;
+      return owner?.remoteHost === target && owner.ownerIncarnation === native.ownerIncarnation &&
+        object(row) && row.bridgeVia === HUB && row.remoteHost === target;
+    };
+    await Promise.all([
+      observe(stores.get("spoke-a")!.root, () => reexported("spoke-a", "spoke-b"), 20_000, "A observes B via hub"),
+      observe(stores.get("spoke-b")!.root, () => reexported("spoke-b", "spoke-a"), 20_000, "B observes A via hub"),
+      observe(hub.root, () => names.slice(1).every(name => {
+        const native = natives.get(name)!;
+        return directories.get(HUB)!.mirroredControlOwner(native.identity.id, native.identity.id, native.identity.id)?.remoteHost === name;
+      }), 20_000, "hub holds all three spokes"),
+    ]);
+    const mirrorsObservedAt = Date.now();
+    const relayRegistrations = links.map(({ remote, child }) => {
+      const dir = path.join(runtime, "mesh-bridge", "relay");
+      const registration = JSON.parse(fs.readFileSync(path.join(dir, `relay-${remote}.json`), "utf8")) as Record<string, unknown>;
+      const socket = fs.lstatSync(path.join(dir, `relay-${remote}.sock`));
+      if (registration.pid !== child.pid || registration.meshRoot !== fs.realpathSync(hub.root) ||
+        registration.remoteName !== remote || registration.localName !== HUB ||
+        registration.bridgeScriptPath !== fs.realpathSync(BIN) || !socket.isSocket() ||
+        (socket.mode & 0o777) !== 0o600 || socket.uid !== process.getuid!()) {
+        throw new Error(`missing production relay registration for ${remote}`);
+      }
+      return { remote, pid: child.pid };
+    });
+    const makeControl = (name: string, expectedSender: string, state: Tally): FabricControlPlane => {
+      const native = natives.get(name)!;
+      const control = new FabricControlPlane(stores.get(name)!, native.identity, {
+        enabled: true, hostId: native.identity.id, ownerIncarnation: native.ownerIncarnation,
+        acknowledgementTimeoutMs: 45_000, bridgeTimeoutMs: 45_000,
+        readMirroredOwner: (...args) => directories.get(name)!.mirroredControlOwner(...args),
+      });
+      controls.push(control);
+      const accept = handlerFor(state);
+      control.start((command, from, _signal, verification) => {
+        if (verification !== "bridge" || from.id !== natives.get(expectedSender)!.identity.id || command.operation !== "followUp") {
+          state.invalid++;
+          return { accepted: false, error: "unauthenticated cross-spoke command", notRun: true };
+        }
+        authenticatedCommands++;
+        return accept(command);
+      });
+      return control;
+    };
+    const aControl = makeControl("spoke-a", "spoke-b", aTally);
+    const bControl = makeControl("spoke-b", "spoke-a", bTally);
+    const hubLock = spawnLockHolder(path.join(hub.root, "state.db"), LOCK_HOLD_MS);
+    locks.push(hubLock);
+    await hubLock.ready;
+    const requestsStartedAt = Date.now();
+    const sourceQueuedAt: Record<string, number> = {};
+    const sourceQueued = ["spoke-a", "spoke-b"].map(name => observe(stores.get(name)!.root, () => {
+      const source = natives.get(name)!;
+      const count = events(stores.get(name)!, "fabric.control.command").filter(event => event.from.id === source.identity.id).length;
+      if (count !== N) return false;
+      sourceQueuedAt[name] = Date.now();
+      return true;
+    }, 15_000, `${name} source batch committed`));
+    const send = async (sender: FabricControlPlane, targetName: string, markers: string[]): Promise<void> => {
+      const target = natives.get(targetName)!;
+      await Promise.all(markers.map(async (marker, index) => {
+        const receipt = await sender.request(target.identity.id, target.identity.id, "followUp",
+          { message: marker, data: { marker, index }, ownerIncarnation: target.ownerIncarnation }, target.identity.id,
+          { routedRemoteHost: targetName, idempotencyKey: `bridge-contention:${marker}`, timeoutMs: 60_000 });
+        if (!receipt.acknowledged || receipt.routed !== "mesh" || receipt.messageId !== `ack:${marker}`) {
+          throw new Error(`invalid cross-spoke ACK for ${marker}`);
+        }
+        authenticatedAcks++;
+      }));
+    };
+    let deadline: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        Promise.all([...sourceQueued, send(aControl, "spoke-b", aMarkers), send(bControl, "spoke-a", bMarkers)]),
+        new Promise<never>((_, reject) => {
+          deadline = setTimeout(() => reject(new Error("cross-spoke receipts exceeded canary deadline")), DEADLINE_MS);
+        }),
+      ]);
+    } finally { if (deadline) clearTimeout(deadline); }
+    await observe(hub.root, () => events(hub, "fabric.control.command").length === 2 * N, 15_000, "all hub relay receipts");
+    const lockReceipt = await hubLock.done;
+    const lockDuration = lockReceipt.doneAt - lockReceipt.readyAt;
+    const queuedUnderLock = ["spoke-a", "spoke-b"].every(name =>
+      sourceQueuedAt[name]! >= lockReceipt.readyAt && sourceQueuedAt[name]! < lockReceipt.doneAt);
+    const received = (name: string, source: string) => events(stores.get(name)!, "fabric.control.command")
+      .filter(event => event.to === natives.get(name)!.identity.id && event.from.id === natives.get(source)!.identity.id);
+    const aReceived = received("spoke-a", "spoke-b"), bReceived = received("spoke-b", "spoke-a");
+    const deliveryStampValid = (event: (typeof aReceived)[number], source: string): boolean =>
+      event.verification === "bridge" && object(event.data) && object(event.data.bridge) &&
+      event.data.bridge.from === source && event.data.bridge.via === HUB;
+    const hubReceipts = events(hub, "fabric.control.command");
+    const hubBodyAbsent = hubReceipts.every(event =>
+      !Object.hasOwn(event, "data") && !Object.hasOwn(event, "text") && !Object.hasOwn(event, "message"));
+    const idleSpokeCommands = events(stores.get("spoke-c")!, "fabric.control.command").length;
+    const entries = [...aTally.entries.values(), ...bTally.entries.values()];
+    const delivered = entries.reduce((sum, entry) => sum + entry.accepted, 0);
+    const duplicates = aTally.duplicateCalls + bTally.duplicateCalls;
+    const receiverInvalid = aTally.invalid + bTally.invalid;
+    const drops = 2 * N - delivered;
+    const bridgeDrops = links.reduce((sum, link) => sum + link.log.split("\n")
+      .filter(line => /mesh-bridge: (toLocal|toRemote): (dropped|refused|skipped) /.test(line)).length, 0);
+    const linksLive = links.every(({ child }) => child.exitCode === null && child.signalCode === null);
+    const receiverExactlyOnce = aTally.entries.size === N && bTally.entries.size === N && duplicates === 0;
+    const productionRelayDelivered = aReceived.length === N && bReceived.length === N &&
+      aReceived.every(event => deliveryStampValid(event, "spoke-b")) &&
+      bReceived.every(event => deliveryStampValid(event, "spoke-a")) && hubBodyAbsent && hubReceipts.length === 2 * N;
+    const result = {
+      phase: "crossSpoke", evidenceRoot: base,
+      ok: drops === 0 && duplicates === 0 && bridgeDrops === 0 && receiverInvalid === 0 && receiverExactlyOnce &&
+        authenticatedAcks === 2 * N && authenticatedCommands === 2 * N && productionRelayDelivered && linksLive &&
+        idleSpokeCommands === 0 && queuedUnderLock && lockDuration >= 2_000 &&
+        requestsStartedAt >= lockReceipt.readyAt && requestsStartedAt < lockReceipt.doneAt,
+      sent: 2 * N, delivered, duplicates, drops, bridgeDrops, authenticatedAcks, authenticatedCommands,
+      deliveredEachWay: { aToB: bTally.entries.size, bToA: aTally.entries.size },
+      receiverInvalid, receiverExactlyOnce, productionRelayDelivered, hubBodyAbsent,
+      hubRelayReceipts: hubReceipts.length, idleSpokeCommands, relayRegistrations,
+      mirrorsObservedAt, requestsStartedAt, sourceQueuedAt, queuedUnderLock,
+      lockStores: [HUB], lockDurationsMs: [lockDuration], lockReceipt,
+      elapsedMs: Math.round(performance.now() - started),
+    };
+    fs.writeFileSync(path.join(base, "cross-spoke.receipt.json"), `${JSON.stringify(result)}\n`, { mode: 0o600 });
+    if (!result.ok) throw new Error(`cross-spoke invariant failed: ${JSON.stringify(result)}`);
+    return result;
+  } finally {
+    await Promise.all(locks.map(lock => terminate(lock.child)));
+    await Promise.allSettled(controls.map(control => control.close()));
+    await Promise.all(links.map(link => terminate(link.child)));
+    for (const link of links) fs.writeFileSync(path.join(base, `${link.remote}.bridge.log`), link.log, { mode: 0o600 });
+    for (const store of stores.values()) store.closeState();
+  }
+};
+
+const runCanary = async (): Promise<void> => {
+  process.env.PI_FABRIC_MESH_STATE_BACKEND = "sqlite";
+  const evidenceRoot = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-bridge-contention-canary-"));
+  currentEvidenceRoot = evidenceRoot;
+  fs.chmodSync(evidenceRoot, 0o700);
+  const phases: Record<string, unknown> = {};
+  let phase = "pair";
+  try {
+    phases.pair = await runPairCanary(evidenceRoot);
+    phase = "crossSpoke";
+    phases.crossSpoke = await runCrossSpokeCanary(evidenceRoot);
+    const result = { ok: true, evidenceRoot, ...phases };
+    fs.writeFileSync(path.join(evidenceRoot, "bridge-contention-canary.receipt.json"), `${JSON.stringify(result)}\n`, { mode: 0o600 });
+    process.stdout.write(`${JSON.stringify(result)}\n`);
+  } catch (error) {
+    const failure = { ok: false, phase, error: error instanceof Error ? error.message : String(error) };
+    const phaseReceipt = phase === "pair" ? path.join(evidenceRoot, "pair.receipt.json")
+      : path.join(evidenceRoot, "cross-spoke", "cross-spoke.receipt.json");
+    if (fs.existsSync(path.dirname(phaseReceipt)) && !fs.existsSync(phaseReceipt)) {
+      fs.writeFileSync(phaseReceipt, `${JSON.stringify(failure)}\n`, { mode: 0o600 });
+    }
+    const result = { ok: false, evidenceRoot, ...phases, failedPhase: phase, error: failure.error };
+    fs.writeFileSync(path.join(evidenceRoot, "bridge-contention-canary.receipt.json"), `${JSON.stringify(result)}\n`, { mode: 0o600 });
+    throw error;
   }
 };
 

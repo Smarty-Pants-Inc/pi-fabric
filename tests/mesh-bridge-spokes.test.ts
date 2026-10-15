@@ -121,7 +121,214 @@ const fixture = async (targetTtl = 60_000, targetToken?: string,
   return { dir, stores, mains, links, drain };
 };
 
+// RELAY-1 (Smarty-Pants-Inc/smarty-dev#10068): hold only B's hub-local mirror write.
+// The two RPC transports remain independent, so A can refresh without servicing B.
+const holdHubMirror = async (bridge: MeshBridge) => {
+  let resume!: () => void, entered!: () => void;
+  const gate = new Promise<void>(resolve => { resume = resolve; });
+  const observed = new Promise<void>(resolve => { entered = resolve; });
+  const mirror = bridge.options.local.mirror.bind(bridge.options.local);
+  vi.spyOn(bridge.options.local, "mirror").mockImplementationOnce(async (...args) => {
+    entered();
+    await gate;
+    await mirror(...args);
+  });
+  const syncing = bridge.syncPresence();
+  void syncing.catch(() => undefined);
+  await observed;
+  return async () => { resume(); await syncing; };
+};
+const sourceCursor = (bridge: MeshBridge): number =>
+  (JSON.parse(fs.readFileSync(bridge.options.cursorPath, "utf8")) as { toLocal: { after: number } }).toLocal.after;
+const relaySender = (f: Awaited<ReturnType<typeof fixture>>) => {
+  const a = f.stores.ryzen3!, source = f.mains.ryzen3!;
+  const directory = new ParticipantDirectory(a, { enabled: true, hostId: source.identity.id, rootId: source.identity.id, identity: source.identity });
+  const sender = new FabricControlPlane(a, source.identity, { enabled: true, hostId: source.identity.id,
+    acknowledgementTimeoutMs: 120_000, bridgeTimeoutMs: 120_000,
+    readMirroredOwner: (...args) => directory.mirroredControlOwner(...args) });
+  sender.start(() => ({ accepted: false }));
+  closers.push(() => sender.close());
+  return sender;
+};
+
 describe("spoke-to-spoke roots and addressed control through the hub", () => {
+  it("RELAY-1 retains A's cursor while live B's mirror is held and expired, then executes and ACKs once across retries/restart", async () => {
+    const f = await fixture();
+    const a = f.stores.ryzen3!, b = f.stores.ryzen2!, hub = f.stores.ryzen1!;
+    const source = f.mains.ryzen3!, target = f.mains.ryzen2!;
+    const sourceLink = f.links.find(link => link.bridge.options.remoteName === "ryzen3")!;
+    const destinationLink = f.links.find(link => link.bridge.options.remoteName === "ryzen2")!;
+    let now = Date.now();
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+    const sender = relaySender(f);
+    const receiver = new FabricControlPlane(b, target.identity, { enabled: true, hostId: target.identity.id,
+      ownerIncarnation: target.ownerIncarnation });
+    const receive = vi.fn(() => ({ accepted: true, messageId: "relay-1-recovered-on-B" }));
+    receiver.start(receive);
+    closers.push(() => receiver.close());
+    const marker = "relay-1-held-mirror-private-command";
+    const pending = sender.request(target.identity.id, target.identity.id, "followUp",
+      { message: marker, ownerIncarnation: target.ownerIncarnation }, target.identity.id,
+      { routedRemoteHost: "ryzen2", idempotencyKey: "relay-1-held-mirror-key" });
+    void pending.catch(() => undefined);
+    await vi.waitFor(() => expect(events(a, "fabric.control.command")).toHaveLength(1));
+    const command = events(a, "fabric.control.command")[0]!;
+    expect(command.data).toMatchObject({ destinationRemoteHost: "ryzen2", ownerIncarnation: target.ownerIncarnation });
+    const checkpoint = fs.readFileSync(sourceLink.bridge.options.cursorPath, "utf8");
+    const before = sourceCursor(sourceLink.bridge);
+    const release = await holdHubMirror(destinationLink.bridge);
+    try {
+      // Native leases have 40 s left; only translated bridge authority expired.
+      now += BRIDGE_LEASE_MS + 5_000;
+      expect(readHostLease(b.root, target.identity.id)!.expiresAt).toBeGreaterThan(now);
+      expect(readHostLease(hub.root, target.identity.id)!.expiresAt).toBeLessThan(now);
+      await sourceLink.bridge.syncPresence();
+      expect(sourceLink.bridge.options.local.holds!(source.identity.id, source.identity)).toBe(true);
+      await sourceLink.bridge.step();
+      expect(sourceCursor(sourceLink.bridge)).toBe(before);
+      expect(events(a, "fabric.control.ack")).toEqual([]);
+      expect(events(b, "fabric.control.command")).toEqual([]);
+      expect(events(b, "fabric.control.ack")).toEqual([]);
+      expect(receive).not.toHaveBeenCalled();
+      expect(events(hub, "fabric.control.command")).toEqual([]);
+      expect(events(hub, "fabric.control.ack")).toEqual([]);
+      expect(persistedMarkerFiles(hub.root, marker)).toEqual([]);
+      now += 1_000;
+      await sourceLink.bridge.syncPresence();
+      await sourceLink.bridge.step();
+      expect(sourceCursor(sourceLink.bridge)).toBe(before);
+      expect(events(a, "fabric.control.ack")).toEqual([]);
+      expect(receive).not.toHaveBeenCalled();
+      await release();
+      // The old held sample lands stale. A NEW B sample must authorize recovery.
+      await destinationLink.bridge.syncPresence();
+      await sourceLink.bridge.syncPresence();
+      await sourceLink.bridge.step();
+      await vi.waitFor(() => expect(events(b, "fabric.control.ack")).toHaveLength(1));
+      await destinationLink.bridge.step();
+      await sourceLink.bridge.step();
+      await expect(pending).resolves.toMatchObject({ acknowledged: true, messageId: "relay-1-recovered-on-B" });
+      expect(sourceCursor(sourceLink.bridge)).toBeGreaterThanOrEqual(command.sequence);
+      expect(receive).toHaveBeenCalledOnce();
+      expect(receive.mock.calls[0]).toEqual(expect.arrayContaining([expect.objectContaining({ message: marker }),
+        expect.objectContaining({ id: source.identity.id, verified: "bridge" })]));
+      expect(events(b, "fabric.control.command")).toHaveLength(1);
+      expect(events(b, "fabric.control.command")[0]).toMatchObject({ verification: "bridge", from: source.identity,
+        data: { bridge: { from: "ryzen3", via: "ryzen1" } } });
+      expect(events(a, "fabric.control.ack")).toHaveLength(1);
+      expect(events(a, "fabric.control.ack")[0]).toMatchObject({ from: target.identity,
+        data: { accepted: true, bridge: { from: "ryzen2", via: "ryzen1" } } });
+      await a.publish({ topic: command.topic, kind: command.kind, from: source.identity, to: target.identity.id, data: command.data });
+      await sourceLink.bridge.step();
+      // Rewind the checkpoint: real body-free receipts and durable dedupe must win.
+      fs.writeFileSync(sourceLink.bridge.options.cursorPath, checkpoint);
+      sourceLink.bridge = new MeshBridge({ ...sourceLink.bridge.options,
+        local: new StoreBridgeSide(new MeshStore(hub.root, 64 * 1024, 100), "ryzen3", () => Date.now()) });
+      await sourceLink.bridge.start();
+      await sourceLink.bridge.step();
+      await destinationLink.bridge.step();
+      await sourceLink.bridge.step();
+      expect(receive).toHaveBeenCalledOnce();
+      expect(events(b, "fabric.control.command")).toHaveLength(1);
+      expect(events(b, "fabric.control.ack")).toHaveLength(1);
+      expect(events(a, "fabric.control.ack")).toHaveLength(1);
+      expect(persistedMarkerFiles(hub.root, marker)).toEqual([]);
+      for (const receipt of events(hub, "fabric.control.command")) {
+        for (const field of ["data", "text", "message"]) expect(receipt).not.toHaveProperty(field);
+      }
+    } finally { await release(); }
+  });
+
+  it("RELAY-1 bounds unknown B authority to 15 s from the first pending event despite 1 s retries and fresh A mirrors", async () => {
+    const f = await fixture();
+    const a = f.stores.ryzen3!, b = f.stores.ryzen2!, hub = f.stores.ryzen1!;
+    const source = f.mains.ryzen3!, target = f.mains.ryzen2!;
+    const sourceLink = f.links.find(link => link.bridge.options.remoteName === "ryzen3")!;
+    const destinationLink = f.links.find(link => link.bridge.options.remoteName === "ryzen2")!;
+    let now = Date.now();
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+    const marker = "relay-1-bounded-unknown-private-command";
+    // Isolate the bridge grace from the sender's independent directory-stale auto-cancel.
+    // The recovery test above covers a real control-plane waiter and receiver.
+    await a.publish({ topic: "fabric.control.command", kind: "followUp", from: source.identity, to: target.identity.id,
+      data: { version: 1, commandId: "relay-1-bounded-unknown", targetId: target.identity.id, operation: "followUp",
+        replyTo: source.identity.id, requestedAt: Date.now(), deadlineAt: Date.now() + 120_000,
+        destinationRemoteHost: "ryzen2", ownerIncarnation: target.ownerIncarnation, message: marker } });
+    await vi.waitFor(() => expect(events(a, "fabric.control.command")).toHaveLength(1));
+    const command = events(a, "fabric.control.command")[0]!;
+    const before = sourceCursor(sourceLink.bridge);
+    const release = await holdHubMirror(destinationLink.bridge);
+    try {
+      now += BRIDGE_LEASE_MS + 5_000;
+      const firstPendingAt = now;
+      for (let elapsed = 0; elapsed < BRIDGE_LEASE_MS; elapsed += 1_000) {
+        now = firstPendingAt + elapsed;
+        await sourceLink.bridge.syncPresence();
+        expect(sourceLink.bridge.options.local.holds!(source.identity.id, source.identity)).toBe(true);
+        await sourceLink.bridge.step();
+        expect(sourceCursor(sourceLink.bridge), `retained at ${elapsed} ms`).toBe(before);
+        expect(events(a, "fabric.control.ack")).toEqual([]);
+        expect(events(b, "fabric.control.command")).toEqual([]);
+        expect(events(hub, "fabric.control.command")).toEqual([]);
+      }
+      now = firstPendingAt + BRIDGE_LEASE_MS + 1;
+      expect(readHostLease(b.root, target.identity.id)!.expiresAt).toBeGreaterThan(now);
+      await sourceLink.bridge.syncPresence();
+      await sourceLink.bridge.step();
+      expect(sourceCursor(sourceLink.bridge)).toBeGreaterThanOrEqual(command.sequence);
+      expect(events(a, "fabric.control.ack")).toHaveLength(1);
+      expect(events(a, "fabric.control.ack")[0]).toMatchObject({ verification: "bridge", to: source.identity.id,
+        from: { id: "bridge:ryzen1" }, data: { accepted: false, retryable: true,
+          errorCode: "FABRIC_RELAY_DESTINATION_UNAVAILABLE", bridge: { from: "ryzen1", id: command.id } } });
+      now += 1_000;
+      await sourceLink.bridge.syncPresence();
+      await sourceLink.bridge.step();
+      expect(events(a, "fabric.control.ack")).toHaveLength(1);
+      expect(events(b, "fabric.control.command")).toEqual([]);
+      expect(events(b, "fabric.control.ack")).toEqual([]);
+      expect(events(hub, "fabric.control.command")).toEqual([]);
+      expect(events(hub, "fabric.control.ack")).toEqual([]);
+      expect(persistedMarkerFiles(hub.root, marker)).toEqual([]);
+      await release();
+      await destinationLink.bridge.syncPresence();
+      await sourceLink.bridge.syncPresence();
+      await sourceLink.bridge.step();
+      await destinationLink.bridge.step();
+      await sourceLink.bridge.step();
+      expect(events(a, "fabric.control.ack")).toHaveLength(1);
+      expect(events(b, "fabric.control.command")).toEqual([]);
+      expect(events(b, "fabric.control.ack")).toEqual([]);
+      expect(events(hub, "fabric.control.command")).toEqual([]);
+    } finally { await release(); }
+  });
+
+  it("RELAY-1 immediately refuses a never-seen B destination once rather than granting uncertainty grace", async () => {
+    const f = await fixture();
+    const a = f.stores.ryzen3!, b = f.stores.ryzen2!, hub = f.stores.ryzen1!;
+    const source = f.mains.ryzen3!;
+    const sourceLink = f.links.find(link => link.bridge.options.remoteName === "ryzen3")!;
+    relaySender(f);
+    const targetId = "session:never-registered-00000000";
+    const marker = "relay-1-never-seen-private-command";
+    expect(hub.get(hostKey(targetId))).toBeUndefined();
+    await a.publish({ topic: "fabric.control.command", kind: "followUp", from: source.identity, to: targetId,
+      data: { version: 1, commandId: "relay-1-never-seen", targetId, operation: "followUp", replyTo: source.identity.id,
+        requestedAt: Date.now(), deadlineAt: Date.now() + 60_000, destinationRemoteHost: "ryzen2", message: marker } });
+    const command = events(a, "fabric.control.command")[0]!;
+    await sourceLink.bridge.step();
+    expect(sourceCursor(sourceLink.bridge)).toBeGreaterThanOrEqual(command.sequence);
+    expect(events(a, "fabric.control.ack")).toHaveLength(1);
+    expect(events(a, "fabric.control.ack")[0]).toMatchObject({ verification: "bridge", to: source.identity.id,
+      from: { id: "bridge:ryzen1" }, data: { accepted: false, retryable: true,
+        errorCode: "FABRIC_RELAY_DESTINATION_UNAVAILABLE", bridge: { from: "ryzen1", id: command.id } } });
+    await sourceLink.bridge.step();
+    expect(events(a, "fabric.control.ack")).toHaveLength(1);
+    expect(events(b, "fabric.control.command")).toEqual([]);
+    expect(events(b, "fabric.control.ack")).toEqual([]);
+    expect(events(hub, "fabric.control.command")).toEqual([]);
+    expect(events(hub, "fabric.control.ack")).toEqual([]);
+    expect(persistedMarkerFiles(hub.root, marker)).toEqual([]);
+  });
   it("routes a by-id followUp A -> hub -> B once, returns an origin-authenticated ACK, and keeps hub-local delivery", async () => {
     const f = await fixture();
     const a = f.stores.ryzen3!, b = f.stores.ryzen2!, hub = f.stores.ryzen1!;

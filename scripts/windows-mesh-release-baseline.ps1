@@ -1,4 +1,4 @@
-# Hosted-only #9569 T12: build the exact base in a private archive, then run one identical driver on base/head.
+# Hosted-only #9569 T11/T12: reuse the exact built base for rollout, then run one identical benchmark driver on base/head.
 $ErrorActionPreference = 'Stop'
 if ($env:OS -ne 'Windows_NT' -or $env:GITHUB_ACTIONS -ne 'true') { throw 'Requires hosted Windows CI; no local benchmark' }
 $base = 'dcc0825cb005ebfc37c37514f159cdb3570281f4'
@@ -40,6 +40,30 @@ try {
         & bun run build 2>&1 | Tee-Object -FilePath (Join-Path $results 'baseline-build.log')
         if ($LASTEXITCODE -ne 0) { throw 'Pinned baseline build failed' }
     } finally { Pop-Location }
+    # T11 uses the ACTUAL pinned baseline just built above, never a hand-written old-release facsimile.
+    # The ordinary affected/smoke invocation skips T11 until this registration supplies its old/current dist inputs.
+    $rolloutEnv = @{
+        FABRIC_9569_ROLLOUT = '1'
+        FABRIC_9569_ROLLOUT_BASE_PROJECT = $project
+        FABRIC_9569_ROLLOUT_BASE_HEAD = $base
+        FABRIC_9569_ROLLOUT_CURRENT_PROJECT = $checkout
+        FABRIC_9569_ROLLOUT_CURRENT_HEAD = $head
+        FABRIC_9569_ROLLOUT_RESULTS = $results
+    }
+    $savedRolloutEnv = @{}
+    foreach ($key in $rolloutEnv.Keys) {
+        $savedRolloutEnv[$key] = [Environment]::GetEnvironmentVariable($key, 'Process')
+        [Environment]::SetEnvironmentVariable($key, $rolloutEnv[$key], 'Process')
+    }
+    Push-Location $checkout
+    try {
+        & bunx vitest run --retry=0 tests/mesh-lock-windows-rollout.test.ts 2>&1 | Tee-Object -FilePath (Join-Path $results 'rollout-probe.log')
+        $rolloutExit = $LASTEXITCODE
+    } finally {
+        Pop-Location
+        foreach ($key in $rolloutEnv.Keys) { [Environment]::SetEnvironmentVariable($key, $savedRolloutEnv[$key], 'Process') }
+    }
+    # Preserve T12's identical driver, baseline-then-candidate order and 100 + 4x25 operations, even if T11 failed.
     $driver = Join-Path $checkout 'scripts/benchmark-windows-mesh-release.mjs'
     $baseReceipt = Join-Path $results 'baseline.json'
     $headReceipt = Join-Path $results 'candidate.json'
@@ -101,6 +125,7 @@ try {
     }
     Write-Output "#9569 receipts: $results"
     if ($baseExit -ne 0 -or $headExit -ne 0) { throw "Benchmark correctness/instrumentation failure: baseline=$baseExit candidate=$headExit (all worker close events joined)" }
+    if ($rolloutExit -ne 0) { throw "T11 pinned-old rollout/drain/canary failed: exit=$rolloutExit; see rollout-probe.log and t11-p*.json" }
 } finally {
     $env:TEMP = $oldTemp; $env:TMP = $oldTmp; $env:TMPDIR = $oldTmpdir
     $env:ZIG_GLOBAL_CACHE_DIR = $oldZigGlobal; $env:ZIG_LOCAL_CACHE_DIR = $oldZigLocal

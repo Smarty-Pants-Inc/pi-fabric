@@ -6,21 +6,25 @@
 //   automatic rule, run on demand; the best place to run it is INSIDE the holder's namespace (`docker exec`), where its
 //   pid means something. A legacy record, another boot, or Windows: never the safe form (pi-fabric#923).
 // - Unsafe override (`unsafeHolderStopped`): the operator states that the holder is stopped. Nothing here can check
-//   that. If the holder is in fact still running, its later release by name can remove its successor's lock (off Linux,
-//   until smarty-dev#9569 (b)/(d)), so two writers could run. The result says so and the caller must surface it.
+//   that. On Windows native C protects the recorded directory, but does not fence a live holder's application writes:
+//   two writers could still run. Elsewhere a live holder's later release by name can remove its successor's lock (off
+//   Linux, until smarty-dev#9569 (d)). The result says so and the caller must surface it.
 //
-// Both forms name the exact holder token, re-check the directory inode and the owner bytes right before acting, and
-// rename the directory to the same retained `.dead.<hash>` fence the automatic recovery uses.
+// Both forms name the exact holder token and retain the same `.dead.<hash>` fence as automatic recovery. Windows
+// submits the ORIGINAL pre-judgment bigint S/full R to native C: a delayed operator must never detach a successor.
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { ownPidNamespace, reclaimVerdict, type PidNamespaceVerdict } from "../core/pid-namespace.js";
 import { MESH_CUSTODY_LOCK_NAME } from "./custody-lock.js";
+import { prepareWindowsMeshCapability, type WindowsMeshCapability } from "../storage/windows-mesh-release.js";
+import { retireWindowsMeshOwner, windowsMeshRecoveryFence } from "../storage/windows-mesh-recovery.js";
 
 export class MeshLockRecoverRefusedError extends Error {
   readonly code = "FABRIC_MESH_LOCK_RECOVER_REFUSED";
-  constructor(message: string) {
+  // Keep the existing class/code for callers, but never collapse a possibly committed recovery into a refusal.
+  constructor(message: string, readonly recoveryOutcome: "refused" | "helper-unavailable/not-started" | "recovery-outcome-unknown" = "refused") {
     super(`FABRIC_MESH_LOCK_RECOVER_REFUSED: ${message}`);
     this.name = "MeshLockRecoverRefusedError";
   }
@@ -140,11 +144,28 @@ const namespaceOf = (fields: string[], kind: "mesh" | "custody"): string | null 
 
 export const recoverMeshLock = async (root: string, options: MeshLockRecoverOptions): Promise<MeshLockRecoverResult> => {
   const lock = path.join(root, options.lock === "mesh" ? ".lock" : MESH_CUSTODY_LOCK_NAME);
-  const stat = fs.lstatSync(lock, { throwIfNoEntry: false });
+  // options.platform is ONLY the audit seam. A Windows mutator never takes the JS rename path.
+  const windows = process.platform === "win32";
+  const stat = fs.lstatSync(lock, { bigint: true, throwIfNoEntry: false });
   if (!stat?.isDirectory()) throw new MeshLockRecoverRefusedError(`${lock} is not held`);
   let owner: string;
-  try { owner = fs.readFileSync(path.join(lock, "owner"), "utf8"); }
-  catch { throw new MeshLockRecoverRefusedError(`${lock} has no readable owner record`); }
+  let ownerStat: fs.BigIntStats | undefined;
+  try {
+    const ownerPath = path.join(lock, "owner");
+    if (windows) {
+      // Bind S and full R on the SAME descriptor before ANY namespace/death/operator judgment. Native C verifies
+      // this original owner object, its bytes and its location under the original directory; never resnapshot B.
+      const entry = fs.lstatSync(ownerPath, { bigint: true });
+      if (!entry.isFile() || entry.isSymbolicLink()) throw new Error("owner is not a regular file");
+      const fd = fs.openSync(ownerPath, "r");
+      try {
+        ownerStat = fs.fstatSync(fd, { bigint: true });
+        if (!ownerStat.isFile() || entry.dev !== ownerStat.dev || entry.ino !== ownerStat.ino ||
+            entry.mtimeNs !== ownerStat.mtimeNs || entry.size !== ownerStat.size) throw new Error("owner changed while opened");
+        owner = fs.readFileSync(fd, "utf8");
+      } finally { fs.closeSync(fd); }
+    } else owner = fs.readFileSync(ownerPath, "utf8");
+  } catch { throw new MeshLockRecoverRefusedError(`${lock} has no readable owner record`); }
   const fields = owner.split("\n");
   const pid = Number(fields[1]);
   const namespace = namespaceOf(fields, options.lock);
@@ -152,6 +173,13 @@ export const recoverMeshLock = async (root: string, options: MeshLockRecoverOpti
     throw new MeshLockRecoverRefusedError(`${lock} does not hold a complete owner record`);
   }
   if (fields[0] !== options.holder) throw new MeshLockRecoverRefusedError(`${lock} is held by ${fields[0]}, not ${options.holder}`);
+  let capability: WindowsMeshCapability | undefined;
+  if (windows) {
+    try { capability = prepareWindowsMeshCapability(); }
+    catch (error) {
+      throw new MeshLockRecoverRefusedError(`Windows recovery helper-unavailable/not-started: ${error instanceof Error ? error.message : String(error)}; no recovery was started`);
+    }
+  }
   // pi-fabric#923 (fabric-store decisions): a record without a namespace is UNPROVEN (its pid may name nothing here
   // although it is alive in another namespace); no previous-boot inference (VM clones share a machine id). The safe
   // form recovers only a holder of OUR namespace whose pid is gone; everything else is the audited unsafe override.
@@ -166,7 +194,7 @@ export const recoverMeshLock = async (root: string, options: MeshLockRecoverOpti
       : `the holder is in ${verdict === "foreign" ? `another PID namespace (${String(namespace)})` : "a PID namespace this process cannot prove"}; run this inside that namespace, or pass the unsafe override once the holder is stopped`);
   }
   // The same directory and the same bytes as checked above, right before acting.
-  const current = fs.lstatSync(lock, { throwIfNoEntry: false });
+  const current = fs.lstatSync(lock, { bigint: true, throwIfNoEntry: false });
   let again: string | undefined;
   try { again = fs.readFileSync(path.join(lock, "owner"), "utf8"); } catch { /* changed */ }
   if (!current?.isDirectory() || current.dev !== stat.dev || current.ino !== stat.ino || again !== owner) {
@@ -177,11 +205,23 @@ export const recoverMeshLock = async (root: string, options: MeshLockRecoverOpti
   const mode = provenDead ? "safe" : "unsafe";
   const audit: LockRecoverAudit = { at: new Date().toISOString(), root, lock, mode, holder: options.holder, holderPid: pid,
     holderNamespace: namespace, verdict, operator: operator() };
-  // The audit is written BEFORE the rename: a recovery that happened is always on record. A failed audit refuses.
+  // The audit is written BEFORE native C / rename: a recovery that happened is always on record. Failure refuses.
   appendAudit(path.join(root, "lock-recoveries.jsonl"), `${JSON.stringify(audit)}\n`, options.auditMaxBytes ?? AUDIT_MAX_BYTES, options.platform);
-  const fence = `${lock}.dead.${createHash("sha256").update(`${stat.dev}:${stat.ino}:${owner}`).digest("hex")}`;
-  fs.renameSync(lock, fence);
+  // Only naming rounds to legacy Number-Stats DECIMAL on ALL platforms; native identity authority stays bigint.
+  const fence = windows ? windowsMeshRecoveryFence(lock, stat, owner)
+    : `${lock}.dead.${createHash("sha256").update(`${Number(stat.dev)}:${Number(stat.ino)}:${owner}`).digest("hex")}`;
+  if (windows) {
+    if (!capability || !ownerStat) throw new MeshLockRecoverRefusedError("Windows recovery helper-unavailable/not-started: original authority unavailable; no recovery was started");
+    const outcome = retireWindowsMeshOwner(lock, owner, stat, ownerStat, capability);
+    if (outcome.outcome !== "recovered") {
+      // Unknown is NOT a clean refusal/no-mutation claim. No fallback, retry, reconciliation or new S/R here.
+      throw new MeshLockRecoverRefusedError(`Windows recovery ${outcome.outcome}: ${outcome.reason}; recovery success is not established`, outcome.outcome);
+    }
+  } else fs.renameSync(lock, fence);
+  const unsafeConsequence = windows
+    ? "If it is still running, native recovery does not fence its application writes and two writers can run."
+    : "If it is still running, its release can remove its successor's lock and two writers can run.";
   return { recovered: true, mode, lock, fence, holderPid: pid, holderNamespace: namespace, verdict, audit,
-    ...(provenDead ? {} : { warning: `UNSAFE override by ${audit.operator.user} (uid ${String(audit.operator.uid)}, pid ${audit.operator.pid}, parent pid ${audit.operator.ppid} ${audit.operator.parentExecutable}, host ${audit.operator.host}): ${lock} of holder ${options.holder} (pid ${pid}, namespace ${String(namespace)}) was recovered on the operator's word that the holder is stopped. If it is still running, its release can remove its successor's lock and two writers can run.` }) };
+    ...(provenDead ? {} : { warning: `UNSAFE override by ${audit.operator.user} (uid ${String(audit.operator.uid)}, pid ${audit.operator.pid}, parent pid ${audit.operator.ppid} ${audit.operator.parentExecutable}, host ${audit.operator.host}): ${lock} of holder ${options.holder} (pid ${pid}, namespace ${String(namespace)}) was recovered on the operator's word that the holder is stopped. ${unsafeConsequence}` }) };
   } finally { pin?.close(); }
 };

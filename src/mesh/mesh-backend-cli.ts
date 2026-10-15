@@ -43,8 +43,11 @@ const USAGE = `Usage: fabric-mesh-backend <census|import|status|cutover|rollback
                   named --holder token, only when that holder is provably dead here: our own PID namespace, its pid
                   gone (ESRCH), and the mesh root on a host-local filesystem (Linux; never on macOS or Windows). No
                   earlier-boot inference. Run it inside the holder's namespace when you can.
-                  --unsafe-holder-stopped recovers on YOUR word that the holder is stopped; if it still runs, its
-                  release can remove its successor's lock and two writers can run.
+                  --unsafe-holder-stopped recovers on YOUR word that the holder is stopped. This assertion
+                  does not fence a live holder's application writes: two writers can run.
+                  Windows native recovery protects the successor's lock, not application writes.
+                  On macOS, a live holder's by-name release can remove its successor's lock.
+                  Linux uses fd-pinned release; the unsafe assertion still does not fence application writes.
 
 Readiness gate (smarty-dev#7815, docs/mesh-backend.md): import and cutover refuse (exit 3) unless
 every REQUIRED reader holds a valid proof of sqlite for this switch, made within 24 h by its installed
@@ -73,7 +76,8 @@ The fence is the mesh .lock plus custody.lock, held for the whole section of imp
 rollback and abort-rollback. Stop every writer (Pi sessions, actors, mesh-bridge, the projector) first.
 The writer census is advisory only (smarty-dev#6982): each of those commands prints
 "advisory: N writers, M unknown" and never blocks, permits or changes the operation on it.
-Exit status: 0 done, 1 error, 2 usage, 3 refused or fence violation (nothing unsafe was done).`;
+Exit status: 0 done, 1 error (including recovery-outcome-unknown: mutation may have occurred),
+2 usage, 3 refused or fence violation (nothing unsafe was done).`;
 
 /**
  * smarty-dev#6477 W1: L4a's writer census as the advisory census provider (smarty-dev#6982). An
@@ -592,6 +596,12 @@ export const main = async (argv: string[], io: {
         return 0;
       } catch (error) {
         if (!(error instanceof MeshLockRecoverRefusedError)) throw error;
+        if (error.recoveryOutcome === "recovery-outcome-unknown") {
+          if (options.json) write(`${JSON.stringify({ command: "lock-recover", ok: false, recoveryOutcome: error.recoveryOutcome,
+            unknown: true, mutationMayHaveOccurred: true, code: error.code, error: error.message }, null, 2)}\n`);
+          warn(`fabric-mesh-backend: lock-recover recovery-outcome-unknown: mutation may have occurred; ${error.message}\n`);
+          return 1;
+        }
         if (options.json) write(`${JSON.stringify({ command: "lock-recover", ok: false, refused: true, code: error.code, error: error.message }, null, 2)}\n`);
         warn(`fabric-mesh-backend: lock-recover refused: ${error.message}\n`);
         return 3;

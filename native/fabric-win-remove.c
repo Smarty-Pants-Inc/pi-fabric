@@ -63,6 +63,12 @@
  * (before-commit, after-commit, before-owner-dispose, after-owner, after-directory), writing DIR\NAME.paused (this pid)
  * and waiting for DIR\go, bounded by the watchdog. At before-owner-dispose ONLY, exact go bytes "expire-deadline\n"
  * can shorten the main-thread logical deadline to now; they never lengthen it or change the armed watchdog.
+ * At any selected existing mesh checkpoint, exact "classic-disposition\n" or "trace-disposition\n" enables
+ * process-local mesh-only disposition tracing (DIR\disposition.jsonl, at most 64 actual calls); classic also
+ * selects the existing real classic fallback. Only at debris-verified, exact "classic-debris-after-I\n" (I one
+ * of 0,1,2,3,4,5) also selects ONE existing debris-after-I pause, which waits on DIR\debris-after-I.go instead
+ * of DIR\go (the first command cannot release it). No deadline/watchdog is extended or rearmed.
+ * Empty go files and the generic verified remover are unchanged.
  */
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -307,11 +313,20 @@ static int meshArm(DWORD ms) {
 }
 static int meshExpired(void) { return GetTickCount64() >= meshDeadline; }
 
+/* Activated ONLY by exact go bytes at an explicitly selected existing checkpoint, never by a standalone env/verb. */
+static int meshClassicDisposition;
+static wchar_t meshDispositionTrace[4200];
+static unsigned meshDispositionSequence;
+static wchar_t meshClassicAfterCheckpoint[64]; /* test-only second pause; six exact commands below */
+
 /* Tests only: see the header. Bounded by the watchdog (the request deadline). */
 static void meshCheckpoint(const wchar_t *name) {
     static wchar_t want[64], dir[4096], file[4200];
     DWORD got = GetEnvironmentVariableW(L"FABRIC_WIN_MESH_TEST_CHECKPOINT", want, 64);
-    if (got == 0 || got >= 64 || wcscmp(want, name) != 0) return;
+    if (got == 0 || got >= 64) return;
+    int later = wcscmp(want, L"debris-verified") == 0 && meshClassicAfterCheckpoint[0] &&
+        wcscmp(meshClassicAfterCheckpoint, name) == 0;
+    if (wcscmp(want, name) != 0 && !later) return;
     got = GetEnvironmentVariableW(L"FABRIC_WIN_MESH_TEST_DIR", dir, 4096);
     if (got == 0 || got >= 4096) return;
     swprintf(file, 4200, L"%ls\\%ls.paused", dir, name);
@@ -323,31 +338,90 @@ static void meshCheckpoint(const wchar_t *name) {
         if (length > 0) WriteFile(marker, pid, (DWORD)length, &written, NULL);
         CloseHandle(marker);
     }
-    swprintf(file, 4200, L"%ls\\go", dir);
+    if (later) swprintf(file, 4200, L"%ls\\%ls.go", dir, name);
+    else swprintf(file, 4200, L"%ls\\go", dir);
     while (GetFileAttributesW(file) == INVALID_FILE_ATTRIBUTES) Sleep(5);
-    /* One-shot fail-safe test request, only at the validated retired-owner boundary. No new inherited environment
-     * hook: the existing explicit checkpoint gate authorizes this read. The real watchdog is NEVER rearmed here. */
-    if (wcscmp(name, L"before-owner-dispose") == 0) {
-        HANDLE request = CreateFileW(file, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, NULL);
-        if (request != INVALID_HANDLE_VALUE) {
-            char command[sizeof("expire-deadline\n")];
-            DWORD length = 0;
-            if (ReadFile(request, command, sizeof(command), &length, NULL) && length == sizeof(command) - 1 &&
-                memcmp(command, "expire-deadline\n", sizeof(command) - 1) == 0) {
+    /* The existing explicit checkpoint gate alone authorizes this read. The watchdog is NEVER rearmed here. */
+    HANDLE request = CreateFileW(file, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+    if (request != INVALID_HANDLE_VALUE) {
+        char command[32];
+        DWORD length = 0;
+        if (ReadFile(request, command, sizeof(command), &length, NULL)) {
+            if (length == sizeof("expire-deadline\n") - 1 &&
+                memcmp(command, "expire-deadline\n", length) == 0 && wcscmp(name, L"before-owner-dispose") == 0) {
                 ULONGLONG now = GetTickCount64();
                 if (now < meshDeadline) meshDeadline = now; /* only shorten, even if already expired */
+            } else if ((length == sizeof("classic-disposition\n") - 1 && memcmp(command, "classic-disposition\n", length) == 0) ||
+                (length == sizeof("trace-disposition\n") - 1 && memcmp(command, "trace-disposition\n", length) == 0)) {
+                meshClassicDisposition = command[0] == 'c';
+                swprintf(meshDispositionTrace, 4200, L"%ls\\disposition.jsonl", dir);
+            } else if (wcscmp(name, L"debris-verified") == 0) {
+                static const char *const commands[] = {
+                    "classic-debris-after-0\n", "classic-debris-after-1\n", "classic-debris-after-2\n",
+                    "classic-debris-after-3\n", "classic-debris-after-4\n", "classic-debris-after-5\n"
+                };
+                for (unsigned i = 0; i < 6; i++) {
+                    if (length == sizeof("classic-debris-after-0\n") - 1 && memcmp(command, commands[i], length) == 0) {
+                        meshClassicDisposition = 1;
+                        swprintf(meshDispositionTrace, 4200, L"%ls\\disposition.jsonl", dir);
+                        swprintf(meshClassicAfterCheckpoint, 64, L"debris-after-%u", i);
+                        break;
+                    }
+                }
             }
-            CloseHandle(request);
         }
+        CloseHandle(request);
     }
 }
 
-/* Delete by handle: POSIX semantics, else classic (completes at the last close). A directory fails when not empty. */
+/* No paths in JSON. Missing/unwritable trace is a test failure, never manufactured evidence of a real call. */
+static void meshTraceDisposition(const BY_HANDLE_FILE_INFORMATION *info, const char *api, BOOL ok, DWORD error) {
+    if (meshDispositionSequence >= 64) return;
+    unsigned sequence = ++meshDispositionSequence;
+    char line[384];
+    int length = snprintf(line, sizeof(line),
+        "{\"pid\":%lu,\"sequence\":%u,\"api\":\"%s\",\"forced\":%s,\"ok\":%s,\"error\":%lu,"
+        "\"volume\":\"%lx\",\"index\":\"%llx\",\"directory\":%s}\n",
+        (unsigned long)GetCurrentProcessId(), sequence, api, meshClassicDisposition ? "true" : "false",
+        ok ? "true" : "false", (unsigned long)(ok ? ERROR_SUCCESS : error), (unsigned long)info->dwVolumeSerialNumber,
+        (unsigned long long)info->nFileIndexHigh << 32 | info->nFileIndexLow,
+        info->dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY ? "true" : "false");
+    HANDLE trace = CreateFileW(meshDispositionTrace, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+        OPEN_ALWAYS, FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+    if (trace != INVALID_HANDLE_VALUE) {
+        DWORD written = 0;
+        if (length > 0 && length < (int)sizeof(line)) WriteFile(trace, line, (DWORD)length, &written, NULL);
+        CloseHandle(trace);
+    }
+}
+
+/* Delete by handle: POSIX semantics, else classic (completes at the last close). A directory fails when not empty.
+ * This function serves mesh W/D only; the generic verified remover's inline disposal is deliberately untouched. */
 static BOOL disposeHandle(HANDLE handle) {
     FILE_DISPOSITION_INFO_EX extended = { FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS };
     FILE_DISPOSITION_INFO plain = { TRUE };
-    return SetFileInformationByHandle(handle, FileDispositionInfoEx, &extended, sizeof(extended)) ||
-        SetFileInformationByHandle(handle, FileDispositionInfo, &plain, sizeof(plain));
+    if (!meshDispositionTrace[0]) {
+        return SetFileInformationByHandle(handle, FileDispositionInfoEx, &extended, sizeof(extended)) ||
+            SetFileInformationByHandle(handle, FileDispositionInfo, &plain, sizeof(plain));
+    }
+    DWORD previous = GetLastError();
+    BY_HANDLE_FILE_INFORMATION info;
+    BOOL identified = GetFileInformationByHandle(handle, &info);
+    SetLastError(previous);
+    BOOL ok;
+    DWORD error;
+    if (!meshClassicDisposition) {
+        ok = SetFileInformationByHandle(handle, FileDispositionInfoEx, &extended, sizeof(extended));
+        error = GetLastError();
+        if (identified) meshTraceDisposition(&info, "extended", ok, error);
+        SetLastError(error);
+        if (ok) return ok;
+    }
+    ok = SetFileInformationByHandle(handle, FileDispositionInfo, &plain, sizeof(plain));
+    error = GetLastError();
+    if (identified) meshTraceDisposition(&info, "classic", ok, error);
+    SetLastError(error);
+    return ok;
 }
 
 static const char *finalPath(HANDLE handle, wchar_t *buffer) {
@@ -607,7 +681,9 @@ static int meshCleanup(HANDLE directory, const wchar_t *dest, unsigned long long
     return meshOut("released", "cleanup", "clean", 0);
 }
 
-static int meshRetire(void) {
+/* C uses the same guarded ORIGINAL-R/provided-S transaction as W, but keeps the complete F forever.
+ * Its framing is FMRC1; A's FMRQ1 request and ALL its output tuples remain unchanged. */
+static int meshRetire(int recovery) {
     meshTimer = CreateWaitableTimerW(NULL, TRUE, NULL);
     if (!meshTimer || !meshArm(MESH_BOOT_DEADLINE_MS) || !CreateThread(NULL, 0, meshWatchdog, NULL, 0, NULL)) return refusedAt("parse", "watchdog-unavailable");
     /* Parse: bounded read, then the exact framing. */
@@ -623,7 +699,7 @@ static int meshRetire(void) {
         total += got;
         if (total > MESH_MAX_MESSAGE) return refusedAt("parse", "message-too-large");
     }
-    if (total < 5 || memcmp(meshMessage, "FMRQ1", 5) != 0) return refusedAt("parse", "bad-magic");
+    if (total < 5 || memcmp(meshMessage, recovery ? "FMRC1" : "FMRQ1", 5) != 0) return refusedAt("parse", "bad-magic");
     const unsigned char *field[MESH_FIELDS];
     DWORD size[MESH_FIELDS];
     DWORD at = 5;
@@ -657,6 +733,14 @@ static int meshRetire(void) {
     int destName = wcslen(base) == 66 && base[0] == L'r' && base[1] == L'.';
     for (int i = 2; destName && i < 66; i++) destName = (base[i] >= L'0' && base[i] <= L'9') || (base[i] >= L'a' && base[i] <= L'f');
     const wchar_t *lockBase = lock + parent + 1;
+    if (recovery) {
+        size_t baseLength = wcslen(lockBase);
+        destName = (wcscmp(lockBase, L".lock") == 0 || wcscmp(lockBase, L"custody.lock") == 0) &&
+            wcslen(base) == baseLength + 6 + 64 && wcsncmp(base, lockBase, baseLength) == 0 &&
+            wcsncmp(base + baseLength, L".dead.", 6) == 0;
+        for (size_t i = baseLength + 6; destName && i < wcslen(base); i++)
+            destName = (base[i] >= L'0' && base[i] <= L'9') || (base[i] >= L'a' && base[i] <= L'f');
+    }
     if (parent < 4 || parentLength(dest) != parent || wcsncmp(lock, dest, parent) != 0 || !destName || !*lockBase ||
         wcscmp(lockBase, L".") == 0 || wcscmp(lockBase, L"..") == 0) return refusedAt("parse", "bad-placement");
     /* E3 caps logical mesh descendants, not namespace transport syntax or the independent cache path. */
@@ -671,12 +755,16 @@ static int meshRetire(void) {
     /* A retry of the SAME framed request may find its original object already retired. Check T BEFORE L:
      * only confirmed absence permits the ordinary W2 path. Existing destinations are never replaced; a wrong
      * identity/kind/SID/reparse target refuses. A verified T resumes W5 without EVER opening canonical B. */
-    HANDLE directory = openJudgedIds(dest, DELETE | FILE_LIST_DIRECTORY | READ_CONTROL | FILE_READ_ATTRIBUTES | SYNCHRONIZE, 1,
-        dirVolume, dirIndex, 0, 0, 0, &why);
-    if (directory) return meshCleanup(directory, dest, ownerVolume, ownerIndex, ownerTime, ownerSize, field[8], size[8]);
-    DWORD destError = GetLastError();
-    if (!why || strcmp(why, "open failed") != 0) return refusedAt("commit", "destination-exists");
-    if (destError != ERROR_FILE_NOT_FOUND && destError != ERROR_PATH_NOT_FOUND) return refusedAt("guard", "directory-not-held");
+    HANDLE directory;
+    /* Only W retirement T is resumable. C's destination is permanent F, never cleanup authority. */
+    if (!recovery) {
+        directory = openJudgedIds(dest, DELETE | FILE_LIST_DIRECTORY | READ_CONTROL | FILE_READ_ATTRIBUTES | SYNCHRONIZE, 1,
+            dirVolume, dirIndex, 0, 0, 0, &why);
+        if (directory) return meshCleanup(directory, dest, ownerVolume, ownerIndex, ownerTime, ownerSize, field[8], size[8]);
+        DWORD destError = GetLastError();
+        if (!why || strcmp(why, "open failed") != 0) return refusedAt("commit", "destination-exists");
+        if (destError != ERROR_FILE_NOT_FOUND && destError != ERROR_PATH_NOT_FOUND) return refusedAt("guard", "directory-not-held");
+    }
     directory = openJudgedIds(lock, DELETE | FILE_LIST_DIRECTORY | READ_CONTROL | FILE_READ_ATTRIBUTES | SYNCHRONIZE, 1,
         dirVolume, dirIndex, 0, 0, 0, &why);
     if (!directory) {
@@ -738,9 +826,218 @@ static int meshRetire(void) {
     }
     free(renameInfo);
     meshCheckpoint(L"after-commit");
+    /* C: F (including its original owner proof) is permanently retained. Never select W5, even on retry. */
+    if (recovery) {
+        static const char retained[] = "FMREC1 recovered commit retained\n";
+        DWORD written = 0;
+        WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), retained, sizeof(retained) - 1, &written, NULL);
+        return 0;
+    }
 
     /* W5: identical held-object cleanup for fresh retirement and same-receipt resume. */
     return meshCleanup(directory, dest, ownerVolume, ownerIndex, ownerTime, ownerSize, field[8], size[8]);
+}
+
+/* ---- smarty-dev#9569 Commit B: D, independently judged leaves; NEVER detach canonical L ----
+ * FMRD1 + fields: lock, deadline(decimal), count(decimal), then count * (path, kind, volume, index,
+ * FILETIME, size, full record). Same 8-lowercase-hex length framing/caps as A; exactly 3+7*count fields.
+ * Count <=64 includes L as the LAST directory; each parent follows ALL its descendants. All files carry their
+ * own complete, caller-independently-judged bytes. Native enforces grammar/binding, not the caller's death policy.
+ * Every handle/id/time/size/record AND every directory's initial entry set is checked BEFORE ANY disposal.
+ * Added entries after that check are unselected and survive; empty-only disposition then fails. A killed partial
+ * pass leaves independently judgeable records or empty directories, NEVER dependent raw payload.
+ * FMREC1 refused PHASE DETAIL (3) means nothing disposed. FMREC1 partial delete DETAIL (2) may have disposed
+ * selected handles; the wrapper reports recovery-outcome-unknown, never recovered or a pre-mutation refusal.
+ */
+#define DEBRIS_MAX_ENTRIES 64
+#define DEBRIS_MAX_FIELDS (3 + 7 * DEBRIS_MAX_ENTRIES)
+typedef struct {
+    wchar_t *path;
+    HANDLE handle;
+    int directory;
+    unsigned long long volume, index, time, size;
+    const unsigned char *record;
+    DWORD recordLength;
+} DebrisEntry;
+static DebrisEntry debris[DEBRIS_MAX_ENTRIES];
+
+static int debrisOut(const char *outcome, const char *phase, const char *detail, int status) {
+    char line[160];
+    int length = snprintf(line, sizeof(line), "FMREC1 %s %s %s\n", outcome, phase, detail);
+    DWORD written = 0;
+    if (length > 0 && length < (int)sizeof(line)) WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), line, (DWORD)length, &written, NULL);
+    return status;
+}
+static int debrisRefuse(const char *phase, const char *why) { return debrisOut("refused", phase, why, 3); }
+static int decimal(const unsigned char *text, DWORD length, DWORD max, DWORD *number) {
+    if (length < 1 || length > 5) return 0;
+    *number = 0;
+    for (DWORD i = 0; i < length; i++) {
+        if (text[i] < '0' || text[i] > '9') return 0;
+        *number = *number * 10 + (DWORD)(text[i] - '0');
+    }
+    return *number >= 1 && *number <= max;
+}
+static int legalRetiredComponent(const wchar_t *name, size_t length) {
+    if (length < 3 || name[0] != L'r' || name[1] != L'.' || name[length - 1] == L'.' || name[length - 1] == L' ') return 0;
+    for (size_t i = 2; i < length; i++) if (name[i] < 32 || wcschr(L"\\/:*?\"<>|", name[i])) return 0;
+    return 1;
+}
+static int releasedOwnerComponent(const wchar_t *name) {
+    static const wchar_t prefix[] = L"owner.released.";
+    if (wcslen(name) != 15 + 36 || wcsncmp(name, prefix, 15) != 0) return 0;
+    for (int i = 0; i < 36; i++) {
+        wchar_t c = name[15 + i];
+        if (i == 8 || i == 13 || i == 18 || i == 23) { if (c != L'-') return 0; }
+        else if (!((c >= L'0' && c <= L'9') || (c >= L'a' && c <= L'f') || (c >= L'A' && c <= L'F'))) return 0;
+    }
+    return 1;
+}
+/* Exact child-first inventory: no unknown positions, alias components, stream paths or implicit parents. */
+static int debrisPlacement(const wchar_t *lock, DWORD count) {
+    size_t topLength = wcslen(lock);
+    const wchar_t *base = lock + parentLength(lock) + 1;
+    if (wcscmp(base, L".lock") != 0 && wcscmp(base, L"custody.lock") != 0) return 0; /* F is NEVER collectible */
+    if (wcscmp(debris[count - 1].path, lock) != 0 || !debris[count - 1].directory) return 0;
+    for (DWORD i = 0; i < count - 1; i++) {
+        DebrisEntry *entry = &debris[i];
+        if (wcsncmp(entry->path, lock, topLength) != 0 || entry->path[topLength] != L'\\') return 0;
+        const wchar_t *component = entry->path + topLength + 1, *cut;
+        int depth = 1;
+        while ((cut = wcschr(component, L'\\')) != NULL) {
+            if (!legalRetiredComponent(component, (size_t)(cut - component))) return 0;
+            component = cut + 1;
+            if (++depth > 4) return 0;
+        }
+        if (entry->directory ? !legalRetiredComponent(component, wcslen(component)) :
+            !(releasedOwnerComponent(component) || (depth > 1 && wcscmp(component, L"owner") == 0))) return 0;
+        size_t parent = parentLength(entry->path);
+        int found = 0;
+        for (DWORD j = i + 1; j < count; j++) if (debris[j].directory && wcslen(debris[j].path) == parent &&
+            wcsncmp(entry->path, debris[j].path, parent) == 0) found = 1;
+        if (!found) return 0;
+    }
+    for (DWORD i = 0; i < count; i++) for (DWORD j = i + 1; j < count; j++)
+        if (_wcsicmp(debris[i].path, debris[j].path) == 0) return 0;
+    return 1;
+}
+/* Inspect each held directory without resolving it by name. Every initial child must be explicitly selected. */
+static int debrisEntrySet(DWORD directory, DWORD count) {
+    static ULONGLONG buffer[8192];
+    FILE_INFO_BY_HANDLE_CLASS kind = FileFullDirectoryRestartInfo;
+    DWORD observed = 0, expected = 0;
+    const wchar_t *up = debris[directory].path;
+    size_t length = wcslen(up);
+    for (DWORD i = 0; i < count; i++) if (i != directory && parentLength(debris[i].path) == length &&
+        wcsncmp(debris[i].path, up, length) == 0) expected++;
+    for (;;) {
+        if (!GetFileInformationByHandleEx(debris[directory].handle, kind, buffer, sizeof(buffer)))
+            return GetLastError() == ERROR_NO_MORE_FILES && observed == expected;
+        kind = FileFullDirectoryInfo;
+        FILE_FULL_DIR_INFO *info = (FILE_FULL_DIR_INFO *)buffer;
+        for (;;) {
+            size_t chars = info->FileNameLength / sizeof(WCHAR);
+            int dot = (chars == 1 && info->FileName[0] == L'.') || (chars == 2 && info->FileName[0] == L'.' && info->FileName[1] == L'.');
+            if (!dot) {
+                if (++observed > count || (info->FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) return 0;
+                int found = 0;
+                for (DWORD i = 0; i < count; i++) if (i != directory && parentLength(debris[i].path) == length &&
+                    wcsncmp(debris[i].path, up, length) == 0 && wcslen(debris[i].path + length + 1) == chars &&
+                    wcsncmp(debris[i].path + length + 1, info->FileName, chars) == 0) found = 1;
+                if (!found) return 0;
+            }
+            if (!info->NextEntryOffset) break;
+            info = (FILE_FULL_DIR_INFO *)((BYTE *)info + info->NextEntryOffset);
+        }
+    }
+}
+static int meshDebris(void) {
+    meshTimer = CreateWaitableTimerW(NULL, TRUE, NULL);
+    if (!meshTimer || !meshArm(MESH_BOOT_DEADLINE_MS) || !CreateThread(NULL, 0, meshWatchdog, NULL, 0, NULL))
+        return debrisRefuse("parse", "watchdog-unavailable");
+    DWORD total = 0;
+    for (;;) {
+        DWORD got = 0;
+        if (!ReadFile(GetStdHandle(STD_INPUT_HANDLE), meshMessage + total, (DWORD)sizeof(meshMessage) - total, &got, NULL)) {
+            if (GetLastError() == ERROR_BROKEN_PIPE) break;
+            return debrisRefuse("parse", "stdin-unreadable");
+        }
+        if (!got) break;
+        total += got;
+        if (total > MESH_MAX_MESSAGE) return debrisRefuse("parse", "message-too-large");
+    }
+    if (total < 5 || memcmp(meshMessage, "FMRD1", 5) != 0) return debrisRefuse("parse", "bad-magic");
+    const unsigned char *field[DEBRIS_MAX_FIELDS];
+    DWORD size[DEBRIS_MAX_FIELDS], fields = 0, at = 5;
+    while (at < total) {
+        unsigned long long length;
+        if (fields >= DEBRIS_MAX_FIELDS || total - at < 8 || !narrowHex(meshMessage + at, 8, &length))
+            return debrisRefuse("parse", "bad-field-length");
+        at += 8;
+        if (length > total - at) return debrisRefuse("parse", "truncated-field");
+        field[fields] = meshMessage + at;
+        size[fields++] = (DWORD)length;
+        at += (DWORD)length;
+    }
+    DWORD count, deadline;
+    if (fields < 3 || !decimal(field[1], size[1], MESH_MAX_DEADLINE_MS, &deadline) ||
+        !decimal(field[2], size[2], DEBRIS_MAX_ENTRIES, &count) || fields != 3 + 7 * count)
+        return debrisRefuse("parse", "bad-fields");
+    wchar_t *lock = widePath(field[0], size[0]);
+    if (!lock) return debrisRefuse("parse", "bad-path");
+    for (DWORD i = 0; i < count; i++) {
+        DWORD f = 3 + 7 * i;
+        DebrisEntry *entry = &debris[i];
+        entry->path = widePath(field[f], size[f]);
+        if (!entry->path) return debrisRefuse("parse", "bad-path");
+        size_t prefix = wcsncmp(entry->path, L"\\\\?\\UNC\\", 8) == 0 ? 6 : 4;
+        if (wcslen(entry->path) - prefix >= 240) return debrisRefuse("parse", "mesh-path-too-long");
+        if (size[f + 1] != 1 || (field[f + 1][0] != 'd' && field[f + 1][0] != 'f')) return debrisRefuse("parse", "bad-kind");
+        entry->directory = field[f + 1][0] == 'd';
+        if (!narrowHex(field[f + 2], size[f + 2], &entry->volume) || !narrowHex(field[f + 3], size[f + 3], &entry->index) ||
+            !narrowHex(field[f + 4], size[f + 4], &entry->time) || !narrowHex(field[f + 5], size[f + 5], &entry->size))
+            return debrisRefuse("parse", "bad-id");
+        entry->record = field[f + 6];
+        entry->recordLength = size[f + 6];
+        if (entry->directory ? entry->recordLength != 0 :
+            (entry->recordLength < 1 || entry->recordLength > MESH_MAX_OWNER || entry->size != entry->recordLength || memchr(entry->record, 0, entry->recordLength)))
+            return debrisRefuse("parse", "bad-record");
+    }
+    if (!debrisPlacement(lock, count)) return debrisRefuse("parse", "bad-placement");
+    if (!meshArm(deadline)) return debrisRefuse("parse", "watchdog-unavailable");
+    if (holdAncestors(lock, 0)) return debrisRefuse("guard", "ancestor-not-held");
+    /* Guard canonical FIRST. Descendants then open under this exact pinned incarnation. */
+    for (DWORD n = 0; n < count; n++) {
+        DWORD i = n == 0 ? count - 1 : n - 1;
+        DebrisEntry *entry = &debris[i];
+        const char *why = NULL;
+        entry->handle = openJudgedIds(entry->path, DELETE | READ_CONTROL | FILE_READ_ATTRIBUTES | SYNCHRONIZE |
+            (entry->directory ? FILE_LIST_DIRECTORY : FILE_READ_DATA), entry->directory, entry->volume, entry->index, 1, entry->time, entry->size, &why);
+        if (!entry->handle) return debrisRefuse("verify", "entry-unverified");
+        static wchar_t final[MESH_MAX_PATH + 1];
+        if (finalPath(entry->handle, final) || _wcsicmp(final, entry->path) != 0) return debrisRefuse("verify", "entry-location");
+        /* Unlike generic removal, D also checks the supplied directory times/sizes BEFORE any mutation. */
+        if (entry->directory) {
+            BY_HANDLE_FILE_INFORMATION info;
+            if (!GetFileInformationByHandle(entry->handle, &info) ||
+                ((unsigned long long)info.ftLastWriteTime.dwHighDateTime << 32 | info.ftLastWriteTime.dwLowDateTime) != entry->time ||
+                ((unsigned long long)info.nFileSizeHigh << 32 | info.nFileSizeLow) != entry->size)
+                return debrisRefuse("verify", "directory-modified");
+        } else if (sameRecord(entry->handle, entry->record, entry->recordLength) != 1) return debrisRefuse("verify", "record-unverified");
+    }
+    for (DWORD i = 0; i < count; i++) if (debris[i].directory && !debrisEntrySet(i, count)) return debrisRefuse("verify", "unexpected-entries");
+    meshCheckpoint(L"debris-verified");
+    if (meshExpired()) return debrisRefuse("verify", "deadline");
+    for (DWORD i = 0; i < count; i++) {
+        if (meshExpired()) return debrisOut("partial", "delete", "deadline", 2);
+        if (!disposeHandle(debris[i].handle)) return debrisOut("partial", "delete", "entry-delete", 2);
+        CloseHandle(debris[i].handle);
+        debris[i].handle = NULL;
+        wchar_t checkpoint[64];
+        swprintf(checkpoint, 64, L"debris-after-%lu", (unsigned long)i);
+        meshCheckpoint(checkpoint); /* hosted tests kill/join after EVERY real deletion, owner-first included */
+    }
+    return debrisOut("recovered", "cleanup", "clean", 0);
 }
 
 int wmain(int argc, wchar_t **argv) {
@@ -749,7 +1046,9 @@ int wmain(int argc, wchar_t **argv) {
     owner = tokenSid(TokenOwner, ownerBuffer, sizeof(ownerBuffer));
     if (!user || !owner) { printf("failed -1 token\n"); return 2; }
     const char *why = NULL;
-    if (argc == 2 && wcscmp(argv[1], L"--mesh-retire-v1") == 0) return meshRetire();
+    if (argc == 2 && wcscmp(argv[1], L"--mesh-retire-v1") == 0) return meshRetire(0);
+    if (argc == 2 && wcscmp(argv[1], L"--mesh-recover-owner-v1") == 0) return meshRetire(1);
+    if (argc == 2 && wcscmp(argv[1], L"--mesh-recover-debris-v1") == 0) return meshDebris();
     if (argc == 2 && wcscmp(argv[1], L"--capability-v1") == 0) { printf("FMRCAP1 mesh-retire-v1 abi=1\n"); return 0; }
     if (argc >= 2 && wcscmp(argv[1], L"--cache-create-v1") == 0) return cacheCreate(argc, argv);
     if (argc >= 2 && wcscmp(argv[1], L"--cache-private-v1") == 0) return cachePrivate(argc, argv);

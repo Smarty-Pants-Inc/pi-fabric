@@ -409,4 +409,51 @@ describe.skipIf(process.platform === "win32")("darwin file-data root under a roo
     expect([...createdBelow(mkdir.mock.calls, shared), ...createdBelow(mkdir.mock.calls, alias)]).toEqual([]);
     expect(fs.readdirSync(shared)).toEqual(["other-user-child"]);
   });
+
+  // Input validation: an existing non-directory is refused even if the link target becomes a directory after stat.
+  const entrypoints = ["fabricDataRoot", "AgentManager"] as const;
+  it.each(modes.flatMap(m => entrypoints.map(entry => [m, entry] as const)))("%s via %s: an alias naming a regular file, changed to a directory after validation stat, is refused (#9527 non-directory), nothing created", (mode, entry) => {
+    const { root, shared, mkdir, mkdtemp } = darwinFixture(true);
+    const file = path.join(root, "file");
+    fs.writeFileSync(file, "keep");
+    const destination = path.join(root, "destination");
+    fs.mkdirSync(destination, { mode: 0o700 }); fs.chmodSync(destination, 0o700);
+    const alias = path.join(root, "file-tmp");
+    fs.symlinkSync(file, alias, "file");
+    // Check the fixture before installing the target-change hook.
+    expect(fs.lstatSync(alias).isSymbolicLink()).toBe(true);
+    expect(fs.realpathSync(alias)).toBe(file);
+    expect(fs.lstatSync(file).isFile()).toBe(true);
+    expect(fs.statSync(alias).isFile()).toBe(true);
+    expect([fs.statSync(destination).uid, fs.statSync(destination).mode & 0o777]).toEqual([process.getuid!(), 0o700]);
+    expect(fs.readdirSync(destination)).toEqual([]);
+    // Return the existing file stat after changing the link to the empty directory, before any allocation.
+    const inner = vi.mocked(fs.statSync).getMockImplementation()!;
+    let changed = false;
+    vi.mocked(fs.statSync).mockImplementation(((target: fs.PathLike, ...rest: unknown[]) => {
+      const result = (inner as (...args: unknown[]) => fs.Stats | undefined)(target, ...rest);
+      if (!changed && path.resolve(String(target)) === alias) {
+        changed = true;
+        const next = path.join(root, "file-tmp.next");
+        fs.symlinkSync(destination, next, "dir");
+        fs.renameSync(next, alias);
+      }
+      return result;
+    }) as typeof fs.statSync);
+    mkdir.mockClear(); mkdtemp.mockClear();
+    useAlias(mode, alias);
+    const refusal = new RegExp(`^(?=[\\s\\S]*${alias.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")})(?=[\\s\\S]*(?:not a directory|non-?directory))(?=[\\s\\S]*smarty-dev#9527)`, "i");
+    // Soft: inspect the real entrypoint's filesystem effects even when the RED refusal assertion fails.
+    if (entry === "fabricDataRoot") expect.soft(() => fabricDataRoot()).toThrow(refusal);
+    else expect.soft(() => manager()).toThrow(refusal);
+    expect(changed).toBe(true);
+    expect(fs.realpathSync(alias)).toBe(destination);
+    expect(mkdtemp).not.toHaveBeenCalled();
+    expect(createdBelow(mkdir.mock.calls, root)).toEqual([]);
+    expect(fs.readdirSync(destination)).toEqual([]);
+    expect(fs.existsSync(path.join(destination, "missing"))).toBe(false);
+    expect(fs.readFileSync(file, "utf8")).toBe("keep");
+    expect(fs.readdirSync(root).sort()).toEqual(["destination", "file", "file-tmp", "shared"]);
+    expect(fs.readdirSync(shared)).toEqual([]);
+  });
 });

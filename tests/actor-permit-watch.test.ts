@@ -210,6 +210,41 @@ async function blockedSuccessor(f: Fixture) {
   return { actor, answer };
 }
 
+// Recorded native calls let the real retry path reach its launch await while
+// host PID proof is deliberately still alive. stop() joins only this fake's
+// captured close; no process is created or signalled.
+function deferredRetry() {
+  const launch = vi.mocked(ProcessTransport.prototype.launch).getMockImplementation()!;
+  const calls: Array<{ operation: string; id: string; pid?: number }> = [];
+  let firstId: string | undefined;
+  let attempts = 0;
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  vi.mocked(ProcessTransport.prototype.launch).mockImplementation(async request => {
+    firstId ??= request.id;
+    const attempt = request.id === firstId ? ++attempts : 0;
+    if (attempt === 2) {
+      calls.push({ operation: "launch-pending", id: request.id });
+      await gate;
+    }
+    const handle = await launch(request);
+    const worker = workers.get(Number(handle.sessionId))!;
+    calls.push({ operation: "launch-resolved", id: request.id, pid: worker.pid });
+    return { ...handle,
+      isAlive: async () => {
+        calls.push({ operation: "isAlive", id: request.id, pid: worker.pid });
+        return handle.isAlive();
+      },
+      stop: async () => {
+        calls.push({ operation: "stop", id: request.id, pid: worker.pid });
+        if (attempt === 1) worker.nativeClose();
+        return handle.stop();
+      },
+    };
+  });
+  return { calls, release };
+}
+
 describe("actor worker permit release (#9031)", () => {
   it.each(["absent", "reused"] as const)("host-proven %s worker releases real admission and launches the next activation", async mode => {
     const f = fixture();
@@ -268,6 +303,104 @@ describe("actor worker permit release (#9031)", () => {
     await observe();
     expect(workers.size).toBe(1); // No replay by the persistent queue restore path either.
     expect(f.actors.status(actor.id).queued).toBe(0);
+  });
+
+  it.each(["ESRCH", "different-birth"] as const)("old-attempt %s proof during deferred retry cannot release RUN or kill the live replacement", async proof => {
+    const trace = deferredRetry();
+    const f = fixture();
+    const actor = await create(f, "retry-owner");
+    const answer = f.actors.ask(actor.id, "one activation across a bounded startup retry");
+    const outcome = answer.then(value => ({ value }), error => ({ error: String(error) }));
+    const first = await launched(f, actor.id);
+    // Transport exit is known, but host death proof is not available yet. Keep
+    // this identity live through every pre-launch #actorWorkerGone check.
+    first.alive = false;
+    first.identityAlive = true;
+    save(first, { status: "failed", error: "Agent transport exited without a result" });
+    let next!: Awaited<ReturnType<typeof create>>;
+    let nextAnswer!: ReturnType<ActorManager["ask"]>;
+    try {
+      await eventually(() => expect(trace.calls.filter(call => call.operation === "launch-pending")).toHaveLength(1));
+      expect(trace.calls.some(call => call.operation === "stop" && call.pid === first.pid)).toBe(true);
+      expect(f.agents.workerIdentity(first.launch.id)?.pid).toBe(first.pid);
+      expect(process.kill(first.pid, 0)).toBe(true);
+      expect(snapshot(f).held.map(held => held.runId)).toEqual([first.launch.id]);
+      expect(workers.size).toBe(1); // Second launch is awaiting, not installed.
+
+      if (proof === "ESRCH") first.identityAlive = false;
+      else first.birth = "67890";
+      // Independent spawn is the event-driven proof hook. The previous native
+      // close was already joined while its host identity still appeared alive.
+      next = await create(f, "queued-during-retry");
+      nextAnswer = f.actors.ask(next.id, "independent actor must wait for replacement");
+      void nextAnswer.catch(() => undefined);
+      await eventually(() => expect(snapshot(f).waiting.length +
+        [...workers.values()].filter(worker => worker.launch.id !== first.launch.id).length).toBe(1));
+      await eventually(() => {
+        const admission = snapshot(f);
+        expect(admission.waiting.length === 1 || admission.held.some(held => held.runId !== first.launch.id)).toBe(true);
+      }); // Wait for the real snapshot writer, not a stale pre-spawn image.
+      console.info("deferred-retry pending evidence", JSON.stringify({ proof, admission: snapshot(f), calls: trace.calls }));
+      expect.soft(snapshot(f).held.map(held => held.runId), "old proof must not release raw RUN while relaunch is pending").toEqual([first.launch.id]);
+      expect.soft(snapshot(f).waiting).toHaveLength(1);
+      expect.soft(workers.size, "unrelated actor cannot launch during deferred replacement").toBe(1);
+    } finally {
+      trace.release(); // Even a RED assertion cannot strand teardown at launch.
+    }
+
+    let replacement!: Worker;
+    await eventually(() => {
+      replacement = [...workers.values()].find(worker => worker.launch.id === first.launch.id && worker.pid !== first.pid)!;
+      expect(replacement).toBeDefined();
+      expect(f.agents.workerIdentity(first.launch.id)?.pid).toBe(replacement.pid);
+    });
+    expect(replacement.alive).toBe(true);
+    expect(process.kill(replacement.pid, 0)).toBe(true);
+    // Existing bounded monitor observation, not a new production poller: the
+    // replacement must survive a full liveness pass before it publishes success.
+    await observe();
+    console.info("deferred-retry replacement evidence", JSON.stringify({ proof, admission: snapshot(f), calls: trace.calls }));
+    expect.soft(snapshot(f).held.map(held => held.runId), "live replacement inherits the same sole admission").toEqual([first.launch.id]);
+    expect.soft(snapshot(f).waiting).toHaveLength(1);
+    expect.soft(trace.calls.filter(call => call.operation === "stop" && call.pid === replacement.pid), "old workerGone cannot stop the replacement").toEqual([]);
+    expect.soft(f.actors.status(actor.id).inFlightRun?.id).toBe(first.launch.id);
+    expect.soft(f.agents.status(first.launch.id).status).toBe("running");
+    expect.soft([...workers.values()].filter(worker => worker.launch.id !== first.launch.id)).toHaveLength(0);
+    complete(replacement);
+    expect(await outcome).toMatchObject({ value: { text: "finished" } });
+    const successor = await launched(f, next.id);
+    expect(f.agents.status(first.launch.id).status).toBe("completed");
+    complete(successor);
+    await expect(nextAnswer).resolves.toMatchObject({ text: "finished" });
+    await eventually(() => expect(snapshot(f).held).toEqual([]));
+    expect([...workers.values()].filter(worker => worker.launch.id === first.launch.id)).toHaveLength(2);
+  });
+
+  it("ordinary task startup retry remains bounded and owns RUN across a deferred launch", async () => {
+    const trace = deferredRetry();
+    const f = fixture();
+    const run = await f.agents.spawn({ task: "ordinary retry counterexample" });
+    const first = [...workers.values()].find(worker => worker.launch.id === run.id)!;
+    first.alive = false;
+    first.identityAlive = true;
+    save(first, { status: "failed", error: "Agent transport exited without a result" });
+    try {
+      await eventually(() => expect(trace.calls.filter(call => call.operation === "launch-pending")).toHaveLength(1));
+      first.identityAlive = false;
+      expect(snapshot(f).held.map(held => held.runId)).toEqual([run.id]);
+    } finally { trace.release(); }
+    let replacement!: Worker;
+    await eventually(() => {
+      replacement = [...workers.values()].find(worker => worker.launch.id === run.id && worker.pid !== first.pid)!;
+      expect(replacement).toBeDefined();
+      expect(f.agents.workerIdentity(run.id)?.pid).toBe(replacement.pid);
+    });
+    await observe();
+    expect(snapshot(f).held.map(held => held.runId)).toEqual([run.id]);
+    expect(trace.calls.filter(call => call.operation === "stop" && call.pid === replacement.pid)).toEqual([]);
+    complete(replacement);
+    await expect(f.agents.wait(run.id)).resolves.toMatchObject({ status: "completed", text: "finished" });
+    expect(workers.size).toBe(2);
   });
 
   it("success committed during the native/tree join is not overwritten by the earlier running snapshot", async () => {

@@ -481,8 +481,8 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
   admissionRelease?: () => void;
   /** pi-fabric#939: the worker pid and birth this manager recorded at launch; the only proof source for release. */
   ownProcess?: OwnedProcess;
-  /** Monotonic host proof about this exact actor attempt, never a status-file identity. */
-  workerGone?: boolean;
+  /** Monotonic host proof bound to this exact actor transport, never a status-file identity. */
+  workerGone?: AgentTransportHandle;
   /** pi-fabric#939 round 2: its saved answer was delivered to the spawner after an unconfirmed exit (once). */
   recoveredAnswer?: boolean;
   /** Round 3: that delivery's save succeeded; only its completed mark is left. */
@@ -2485,7 +2485,9 @@ export class AgentManager {
     // stay joined. Settled runs retain the existing exact ENODEV recovery below;
     // heldPermit registration is not a prerequisite for this actor-only proof.
     for (const managed of this.#runs.values()) {
-      if (!managed.actorId || managed.settled || !managed.admissionRelease || !this.#actorWorkerGone(managed)) continue;
+      // A replacement may already be creating a worker while transport still names
+      // the old attempt. Its death cannot discharge the replacement's admission.
+      if (!managed.actorId || managed.settled || managed.relaunchPending || !managed.admissionRelease || !this.#actorWorkerGone(managed)) continue;
       const permit = managed.admissionRelease;
       delete managed.heldPermit;
       permit();
@@ -4657,7 +4659,13 @@ export class AgentManager {
     const pending = Promise.resolve().then(() => this.#relaunchAttempt(managed, record, resume, deadline));
     managed.relaunchPending = pending;
     try { return await pending; }
-    finally { delete managed.relaunchPending; }
+    finally {
+      delete managed.relaunchPending;
+      // Actor retry completion is an event, not a poll: a retry refused before
+      // launch can now release its old proven-dead attempt. Launch rejections
+      // retain the existing missing-ownProcess fence below.
+      if (managed.actorId) this.#releaseProvenGone();
+    }
   }
 
   async #relaunchAttempt(
@@ -4777,9 +4785,10 @@ export class AgentManager {
       // until the launch resolves, so nothing can be proven gone in between (or ever, if the launch is unknown).
       delete managed.ownProcess;
       const transport = await this.#launchTransport(managed.adapter, managed.launch);
-      // Stop receipts belong to one transport attempt, not the run id. Install
-      // the replacement and its fresh custody together, after launch resolves.
+      // Stop/death receipts belong to one transport attempt, not the run id.
+      // Install the replacement and invalidate old proof without yielding.
       managed.transport = transport;
+      delete managed.workerGone;
       const owned = transport.kind === "process" ? ownedProcess(transport.sessionId) : undefined;
       if (owned) managed.ownProcess = owned;
       managed.executionExited = false;
@@ -4964,24 +4973,27 @@ export class AgentManager {
   }
 
   #actorWorkerGone(managed: ManagedAgent): boolean {
-    if (!managed.actorId || managed.hosted || managed.transport.kind !== "process") return false;
-    if (managed.workerGone) return true;
-    const identity = this.#workerIdentities.get(managed.transport);
-    if (!identity || !Number.isSafeInteger(identity.pid) || identity.pid <= 1 || identity.pid === process.pid) return false;
+    if (!managed.actorId || managed.hosted || managed.transport.kind !== "process" || !managed.ownProcess) return false;
+    // ownProcess is absent throughout replacement creation, and stays absent
+    // after an UNKNOWN launch. Even cached old proof has no authority in that gap.
+    const transport = managed.transport;
+    const identity = this.#workerIdentities.get(transport);
+    if (!identity || managed.ownProcess.pid !== identity.pid || !Number.isSafeInteger(identity.pid) || identity.pid <= 1 || identity.pid === process.pid) return false;
+    if (managed.workerGone === transport) return true;
     try { process.kill(identity.pid, 0); }
     catch (error) {
       // EPERM and every other probe error are unknown, not permission to compare births.
-      if ((error as NodeJS.ErrnoException).code === "ESRCH") managed.workerGone = true;
-      return managed.workerGone === true;
+      if ((error as NodeJS.ErrnoException).code === "ESRCH") managed.workerGone = transport;
+      return managed.workerGone === transport;
     }
     const current = processStartTime(identity.pid);
-    if (identity.startTime?.trim() && current?.trim() && current !== identity.startTime) managed.workerGone = true;
-    return managed.workerGone === true;
+    if (identity.startTime?.trim() && current?.trim() && current !== identity.startTime) managed.workerGone = transport;
+    return managed.workerGone === transport;
   }
 
   /** A leader's death forbids replay, but never substitutes for the whole native/tree join. */
   async #settleGoneActorWorker(managed: ManagedAgent, record: AgentRunRecord | undefined): Promise<boolean> {
-    if ((managed.stopRequested && !managed.workerGone) || !this.#actorWorkerGone(managed)) return false;
+    if ((managed.stopRequested && managed.workerGone !== managed.transport) || !this.#actorWorkerGone(managed)) return false;
     // Preserve genuine terminal results; only missing/recoverable transport outcomes become loss.
     const terminalResult = (candidate: AgentRunRecord | undefined): boolean =>
       candidate !== undefined && terminalStatuses.has(candidate.status) &&

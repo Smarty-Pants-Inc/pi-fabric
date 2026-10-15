@@ -22,7 +22,7 @@ export interface ProviderErrorClass {
   status?: number;
   /** The body's error type, only when it is one of the known types below. */
   type?: string;
-  /** A fixed gateway code Fabric recognises (today only compaction_affinity_missing). */
+  /** A fixed gateway code Fabric recognises (compaction_affinity_missing or model_not_found). */
   code?: string;
   /**
    * One short line for wake status reasons, notices, and alarms, built ONLY from the status, the
@@ -50,7 +50,7 @@ const RETRYABLE_TYPES = new Set(["rate_limit_error", "overloaded_error", "api_er
 const AFFINITY = "compaction_affinity_missing";
 // The only body tokens a short line may carry (smarty-dev#8742 security review): known types, fixed codes.
 const KNOWN_TYPES = new Set([...NON_RETRYABLE_TYPES, ...RETRYABLE_TYPES]);
-const KNOWN_CODES = new Set([AFFINITY]);
+const KNOWN_CODES = new Set([AFFINITY, "model_not_found"]);
 const known = (value: string | undefined, allowed: ReadonlySet<string>): string | undefined =>
   value !== undefined && allowed.has(value) ? value : undefined;
 

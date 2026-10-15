@@ -2,7 +2,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { raiseCheckpointFlag, SqliteStateStore } from "../src/mesh/state-sqlite.js";
+import { openPrivateStateDb } from "../src/mesh/state-gate.js";
+import { openNodeSqlite, raiseCheckpointFlag, SqliteStateStore } from "../src/mesh/state-sqlite.js";
 import { aclOwner, icaclsGrant, icaclsShow, readAcl, setOwner, tokenSids } from "./helpers/windows-acl.js";
 
 // smarty-dev#8920: Windows ACL privacy of the SQLite mesh state root, its state files, its flag directory and its
@@ -116,6 +117,80 @@ describe.runIf(process.env.GITHUB_ACTIONS === "true" && process.platform === "wi
     expect(shown).not.toMatch(/\(I\)/);
     expect(shown).toMatch(/NT AUTHORITY\\SYSTEM:\(OI\)\(CI\)\(F\)/);
     expect(shown.toLowerCase()).toContain(`\\${os.userInfo().username.toLowerCase()}:(oi)(ci)(f)`);
+  }, 120_000);
+
+  it.each(["async", "sync"] as const)("refuses a missing root below an immediate parent with foreign inherit-only full control (%s) before creation", async mode => {
+    const parent = profileDir();
+    const root = path.join(parent, "new-root");
+    grant(parent, EVERYONE, "(OI)(CI)(IO)(F)", FULL);
+    const rule = readAcl(parent).rules.find(entry => entry.sid === EVERYONE && !entry.inherited && entry.type === "Allow"
+      && (entry.rights & FULL) === FULL);
+    expect(rule, readAcl(parent).sddl).toBeDefined();
+    expect(rule?.inheritance).toContain("ContainerInherit");
+    expect(rule?.inheritance).toContain("ObjectInherit");
+    expect(rule?.propagation).toContain("InheritOnly");
+    expect(icaclsShow(parent)).toMatch(/Everyone:\(OI\)\(CI\)\(IO\)\(F\)/);
+    const children = fs.readdirSync(parent);
+    expect(fs.existsSync(root)).toBe(false);
+
+    const open = () => mode === "async"
+      ? SqliteStateStore.open(root, 65_536, 1_000, { initialize: "create" })
+      : SqliteStateStore.openSync(root, 65_536, 1_000, { initialize: "create" });
+    const error = await refusal(open);
+    expect(error).toMatchObject({ ...UNSUPPORTED, message: expect.stringContaining(`refuses ${parent}:`) });
+    expect(fs.existsSync(root)).toBe(false);
+    expect(fs.existsSync(path.join(root, "state.db"))).toBe(false);
+    expect(fs.readdirSync(parent)).toEqual(children);
+  }, 120_000);
+
+  it("refuses a state.db planted with a genuine Everyone (M) ACL after the native snapshot, before SQLite opens it", () => {
+    const root = profileDir();
+    const file = path.join(root, "state.db");
+    const seed = path.join(root, "controlled-seed.db");
+    let openerCalls = 0;
+    let connection: ReturnType<typeof openNodeSqlite> | undefined;
+    let error: unknown;
+    const create = () => {
+      // Create a valid SQLite seed only after openPrivateStateDb has taken its real native ACL snapshot.
+      openNodeSqlite(seed).close();
+      grant(seed, EVERYONE, "(M)", MODIFY);
+      fs.renameSync(seed, file);
+      // Match the public O_EXCL create callback: an attacker winning with EEXIST is not itself fatal.
+      try { fs.closeSync(fs.openSync(file, "wx", 0o600)); }
+      catch (caught) { if ((caught as NodeJS.ErrnoException).code !== "EEXIST") throw caught; }
+    };
+
+    try {
+      connection = openPrivateStateDb(file, target => {
+        openerCalls += 1;
+        return openNodeSqlite(target);
+      }, create);
+    } catch (caught) { error = caught; }
+    finally { connection?.close(); }
+
+    expect(error).toMatchObject(UNSUPPORTED);
+    expect(openerCalls).toBe(0);
+    expect(fs.existsSync(seed)).toBe(false);
+    expect(fs.existsSync(file)).toBe(true);
+    const everyone = readAcl(file).rules.filter(rule => rule.sid === EVERYONE && !rule.inherited && rule.type === "Allow");
+    expect(everyone.some(rule => (rule.rights & MODIFY) === MODIFY), readAcl(file).sddl).toBe(true);
+  }, 120_000);
+
+  it("allows a clean state.db created by the gate callback with real node:sqlite", () => {
+    const root = profileDir();
+    const file = path.join(root, "state.db");
+    let creates = 0;
+    const db = openPrivateStateDb(file, openNodeSqlite, () => {
+      fs.closeSync(fs.openSync(file, "wx", 0o600));
+      creates += 1;
+    });
+    try {
+      expect(creates).toBe(1);
+      expect(fs.existsSync(file)).toBe(true);
+      expect(db.prepare("SELECT 1 AS value").get()?.value).toBe(1);
+      expect(readAcl(file).rules.filter(rule => rule.sid === EVERYONE && !rule.inherited && rule.type === "Allow"
+        && (rule.rights & MODIFY) === MODIFY)).toEqual([]);
+    } finally { db.close(); }
   }, 120_000);
 
   it.each([["delete child", "(DC)", 0x40], ["delete", "(DE)", 0x10000], ["change permissions", "(WDAC)", 0x40000],

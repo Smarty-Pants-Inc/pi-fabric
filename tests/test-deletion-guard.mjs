@@ -119,7 +119,7 @@ function callerFrame() {
 }
 
 /** Preserve caller options and any narrower ceiling, but never lose the pinned Bun preload/root. */
-function pinnedBunEnvironment(env, root) {
+export function pinnedBunEnvironment(env, root, preloadPath = guardPath, platform = process.platform) {
   let cap = root ?? sep;
   try {
     if (root && env.TEST_DELETION_GUARD_ROOT) {
@@ -127,7 +127,11 @@ function pinnedBunEnvironment(env, root) {
       if (within(root, requested)) cap = requested;
     }
   } catch { /* retain the pinned ceiling */ }
-  const path = /[\s"\\]/.test(guardPath) ? JSON.stringify(guardPath) : guardPath;
+  // Bun requires a path, not a file URL, and BUN_OPTIONS does not JSON-decode
+  // preload values. Avoid quoting/doubling Windows separators: Bun accepts
+  // forward-slash drive and UNC paths too. Keep the caller's option order.
+  const preload = platform === "win32" ? preloadPath.replaceAll("\\", "/") : preloadPath;
+  const path = /[\s"\\]/.test(preload) ? JSON.stringify(preload) : preload;
   const token = `--preload=${path}`;
   const options = env.BUN_OPTIONS ?? "";
   return {

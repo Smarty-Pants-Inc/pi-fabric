@@ -441,6 +441,20 @@ const incarnationOf = (record: { startedAt?: unknown; incarnationToken?: unknown
   ...(typeof record.incarnationToken === "string" && record.incarnationToken.length > 0 ? { incarnationToken: record.incarnationToken } : {}),
 });
 
+/** Start times prove age; random incarnation tokens identify owners, never order them. */
+const olderBridgeIncarnation = (
+  incoming: { startedAt?: unknown; incarnationToken?: unknown },
+  authority: { startedAt?: unknown; incarnationToken?: unknown },
+): boolean => {
+  const next = incarnationOf(incoming);
+  const held = incarnationOf(authority);
+  // A nonempty token is authoritative identity; start-time metadata can differ for that owner.
+  if (next.incarnationToken !== undefined && next.incarnationToken === held.incarnationToken) return false;
+  // Equal starts with different (or missing) tokens are ambiguous, not provably older.
+  // Keep their existing admission behavior, as for historical rows with no start evidence.
+  return next.startedAt !== undefined && held.startedAt !== undefined && next.startedAt < held.startedAt;
+};
+
 export class StoreBridgeSide implements BridgeSide {
   // The mirror's host-lease writes and removals run after its state commit, from rows recorded in
   // that commit (smarty-dev#6477 R11): a crash in between leaves them for the next pass, which
@@ -813,6 +827,7 @@ export class StoreBridgeSide implements BridgeSide {
   }
 
   #publication(event: BridgePublish, held: string[], fromHub: boolean): Parameters<MeshStore["publish"]>[0] {
+    if (this.#staleAdmission) throw this.#staleAdmission;
     const checked = checkBridgePublish(event);
     const stamp = checked.data.bridge;
     const data = { ...checked.data, bridge: fromHub && stamp.via === this.peer
@@ -863,6 +878,7 @@ export class StoreBridgeSide implements BridgeSide {
    * id, name, kind and session id (pi-fabric#876 security pass, (b)).
    */
   holds(id: string, identity?: MeshIdentity): boolean {
+    if (this.#staleAdmission) return false;
     // Inside #heldFence, after its proof: this exact (id, identity) was checked at a revision the fence
     // proved current. Set and cleared in one synchronous segment, so no other caller can see it.
     if (this.#proven.has(id) && this.#proven.get(id) === identity) return true;
@@ -998,6 +1014,7 @@ export class StoreBridgeSide implements BridgeSide {
 
 
   #fenced = false;
+  #staleAdmission: BridgeStaleIncarnationError | undefined;
   #inflight: Promise<void> = Promise.resolve();
 
   /**
@@ -1006,9 +1023,18 @@ export class StoreBridgeSide implements BridgeSide {
    * the withdrawal (security review round 2, F3).
    */
   mirror(presence: Pick<BridgePresence, "hosts" | "participants">, observedAt?: number, fromHub = false): Promise<void> {
+    if (this.#staleAdmission) return Promise.reject(this.#staleAdmission);
     if (this.#fenced) return Promise.resolve();
     // Only the forced-command agent sets fromHub for its trusted hub's mirror RPC.
-    const run = this.#inflight.then(() => this.#mirror(presence, false, observedAt, fromHub));
+    const run = this.#inflight.then(() => this.#mirror(presence, false, observedAt, fromHub)).catch((error: unknown) => {
+      if (error instanceof BridgeStaleIncarnationError) {
+        // This instance never acquired the newer incarnation. Fence queued writes and keep
+        // cleanup from withdrawing its predecessor's persisted authority after the refusal.
+        this.#staleAdmission = error;
+        this.#fenced = true;
+      }
+      throw error;
+    });
     this.#inflight = run.catch(() => undefined);
     return run;
   }
@@ -1016,6 +1042,7 @@ export class StoreBridgeSide implements BridgeSide {
   async withdraw(): Promise<void> {
     this.#fenced = true;
     await this.#inflight;
+    if (this.#staleAdmission) return;
     await this.#mirror({ hosts: [], participants: [] }, true);
   }
 
@@ -1071,12 +1098,31 @@ export class StoreBridgeSide implements BridgeSide {
         const participantEntries = view.listAll(PARTICIPANT_PREFIX);
         const scan = this.#scan(hostEntries, [...participantEntries, ...participantFiles.entries], view.listAll(BRIDGE_HANDOFF_PREFIX));
         const own = new Set(scan.presence.reserved);
+        // Same-peer mirrors are intentionally absent from reservations, but still prove a root's
+        // incarnation across new link objects. Lease authority also survives a missing state row.
+        const incarnations = new Map<string, Array<{ startedAt?: number; incarnationToken?: string }>>();
+        const remember = (rootId: string, record: { startedAt?: unknown; incarnationToken?: unknown }): void => {
+          const known = incarnations.get(rootId) ?? [];
+          known.push(incarnationOf(record));
+          incarnations.set(rootId, known);
+        };
+        for (const entry of hostEntries) {
+          const held = hostOf(entry.key, entry.value);
+          if (held && remoteHostOf(held) !== undefined) remember(held.rootId, held);
+        }
+        for (const lease of scan.leases.values()) remember(lease.rootId, lease);
         const wanted = new Map<string, { value: Record<string, unknown>; identity: MeshIdentity }>();
         const hosts = new Map<string, FabricHostRecord>();
         for (const { record, expiresAt } of presence.hosts) {
           const relayed = remoteHostOf(record) !== undefined;
           if (relayed && (!fromHub || record.bridgeVia !== this.peer || record.remoteHost === this.peer)) continue;
           if (own.has(record.id) || own.has(record.identity.id) || own.has(record.rootId)) continue;
+          // Refuse the whole batch, rather than omitting this host from wanted: omission would
+          // delete the newer mirror, its participants and its lease in the removal pass below.
+          // Check before liveness filtering too: an expired stale frame proves no withdrawal.
+          if (incarnations.get(record.rootId)?.some(held => olderBridgeIncarnation(record, held))) {
+            throw new BridgeStaleIncarnationError(record.rootId);
+          }
           // A mirror never outlives its origin (smarty-dev#6477): it keeps the origin's absolute
           // expiry, capped at one BRIDGE_LEASE_MS from this sync so a dead bridge still lapses it.
           // A mirror never renews: its lease carries the origin's last renewal, not this sync.
@@ -1156,11 +1202,11 @@ export class StoreBridgeSide implements BridgeSide {
       // A stale plan rolls back and plans again; the last attempt, a backend without a revision view, and
       // a recovery pass (whose replay must run on the transaction's snapshot) plan inside, as before.
       const early = this.#recovered && attempt < MIRROR_PLAN_ATTEMPTS - 1 ? this.store.stateView() : undefined;
-      // With a handoff row, #scan reads every lease file and judges each native lease live or not at its own
-      // time (bridgeHandoffScope: a live native voids a handoff). Stamp the directory first; in the transaction,
-      // every lease must also be judged the same at the time read there, or the plan runs again.
-      const leaseStamp = early && early.view.listAll(BRIDGE_HANDOFF_PREFIX).length > 0
-        ? meshDirectoryStamp(this.store.root, HOST_LEASE_DIR) : undefined;
+      // Every plan now reads lease incarnation authority, even without handoffs. Stamp the
+      // directory before computing it, so a lease-only replacement invalidates admission too.
+      // With handoffs, native lease liveness must also retain the scan's judgment at commit.
+      const leaseStamp = early ? meshDirectoryStamp(this.store.root, HOST_LEASE_DIR) : undefined;
+      const judgesLeaseLiveness = early !== undefined && early.view.listAll(BRIDGE_HANDOFF_PREFIX).length > 0;
       const planned = early && !halted() ? compute(early.view, files) : undefined;
       const plan = this.#outbox.plan();
       try {
@@ -1173,16 +1219,23 @@ export class StoreBridgeSide implements BridgeSide {
           // (security review rounds 2/3, F1/F2), including recreation over retained tombstones.
           prepare: (view) => {
             if (halted()) return plan.stage([], []);
-            // A crashed predecessor's effects run first, on this snapshot: no separate recovery read
-            // or transaction (smarty-dev#3752: one read, lock and commit per presence pass).
-            if (!this.#recovered) plan.replay(view);
             const sameFiles = meshDirectoryStamp(this.store.root, "participants") === filesStamp;
             let result: ReturnType<typeof compute>;
             if (early && planned && sameFiles && this.store.stateUnchangedSince(early.revision, HELD_STATE_PREFIXES) &&
               (leaseStamp === undefined || (meshDirectoryStamp(this.store.root, HOST_LEASE_DIR) === leaseStamp &&
-                sameLeaseLiveness(planned.judged.leases, planned.judged.now, this.now())))) result = planned;
+                (!judgesLeaseLiveness || sameLeaseLiveness(planned.judged.leases, planned.judged.now, this.now()))))) result = planned;
             else if (early) throw new MirrorPlanStale();
-            else result = compute(view, sameFiles ? files : participantFileSnapshot(this.store.root));
+            else {
+              const participantFiles = sameFiles ? files : participantFileSnapshot(this.store.root);
+              // Refuse stale presence BEFORE recovery can touch any lease file. A successful
+              // preflight then replays on this same transaction's snapshot and recomputes, so
+              // recovered lease authority participates in admission and handoff judgments too.
+              result = compute(view, participantFiles);
+              if (!this.#recovered && result && view.listAll(this.#outbox.prefix).length > 0) {
+                plan.replay(view);
+                result = compute(view, participantFiles);
+              }
+            }
             if (!result) return plan.stage([], []);
             ({ leases, removed } = result);
             // A changing commit records its lease effects in the same commit; a lease-only renewal
@@ -1215,6 +1268,8 @@ export class StoreBridgeSide implements BridgeSide {
       (held.incarnationToken !== undefined || lease.incarnationToken !== undefined
         ? lease.incarnationToken === undefined || lease.incarnationToken !== held.incarnationToken : false)) return;
     const onDisk = readHostLease(this.store.root, lease.id);
+    // Recovery must not erase newer file authority while its state row is still catching up.
+    if (onDisk?.rootId === lease.rootId && olderBridgeIncarnation(lease, onDisk)) return;
     // A replayed row never shortens a lease that a later pass already renewed.
     const sameIncarnation = onDisk && onDisk.startedAt === lease.startedAt && onDisk.identityId === lease.identityId &&
       onDisk.rootId === lease.rootId && onDisk.incarnationToken === lease.incarnationToken;
@@ -1256,6 +1311,18 @@ export class StoreBridgeSide implements BridgeSide {
 
 /** An event refused at commit: its sender or target is no longer bound to this link. */
 export class BridgeOwnershipError extends Error {}
+
+export const FABRIC_BRIDGE_STALE_INCARNATION = "FABRIC_BRIDGE_STALE_INCARNATION";
+
+/** Presence refused without changing the newer persisted root or its lease. */
+export class BridgeStaleIncarnationError extends Error {
+  override readonly name = "BridgeStaleIncarnationError";
+  readonly code = FABRIC_BRIDGE_STALE_INCARNATION;
+  readonly retryable = false;
+  constructor(readonly rootId?: string) {
+    super(`Bridge presence${rootId === undefined ? "" : ` for ${rootId}`} has an older incarnation than persisted authority`);
+  }
+}
 
 /** The shape and allow-list check a side applies to every event it is asked to publish. */
 export const checkBridgePublish = (input: unknown): BridgePublish => {
@@ -1375,7 +1442,8 @@ export const serveBridgeAgent = (side: StoreBridgeSide, input: Readable, output:
             }
             reply({
               id: request.id, ok: false, error: error instanceof Error ? error.message : String(error),
-              ...(isMeshIncarnationPending(error) ? { code: MESH_INCARNATION_PENDING_CODE }
+              ...(error instanceof BridgeStaleIncarnationError ? { code: error.code }
+                : isMeshIncarnationPending(error) ? { code: MESH_INCARNATION_PENDING_CODE }
                 : isMeshSnapshotRetriesExhausted(error) ? { code: MESH_SNAPSHOT_RETRIES_EXHAUSTED_CODE }
                   : isMeshRetryableBusy(error) ? { code: MESH_LOCK_TIMEOUT_CODE } : {}),
             });
@@ -1487,6 +1555,10 @@ export class RemoteBridgeSide implements BridgeSide {
         else {
           if (response.code === FABRIC_IDEMPOTENCY_KEY_REUSED) {
             pending.reject(new FabricIdempotencyKeyReusedError());
+            return;
+          }
+          if (response.code === FABRIC_BRIDGE_STALE_INCARNATION) {
+            pending.reject(new BridgeStaleIncarnationError());
             return;
           }
           const error = new Error(`Bridge agent: ${String(response.error)}`);
@@ -1776,6 +1848,7 @@ export class MeshBridge {
   #seen = { toRemote: new Set<string>(), toLocal: new Set<string>() };
   #presenceAt = Number.NEGATIVE_INFINITY;
   #presenceSync: Promise<void> | undefined;
+  #staleAdmission: BridgeStaleIncarnationError | undefined;
   #stopped = false;
   #ready = false;
   readonly #relayDeliveries = new Set<Promise<void>>();
@@ -1869,6 +1942,7 @@ export class MeshBridge {
    * Outbound it is the hub's own event's sender.
    */
   #outbound(event: MeshEvent, rules: BridgeRules, direction: "toRemote" | "toLocal"): BridgePublish {
+    if (this.#staleAdmission) throw this.#staleAdmission;
     const data = isObject(event.data) ? event.data : {};
     // smarty-dev#9751: a hub sender that is no participant (a factory host) still gets the ACK of a command
     // this link carried out for it. Only its own authenticated address: replyTo must be the carried command's
@@ -2073,6 +2147,7 @@ export class MeshBridge {
 
   /** Mirror each side's live roots into the other; concurrent callers share one pass. */
   syncPresence(): Promise<void> {
+    if (this.#staleAdmission) return Promise.reject(this.#staleAdmission);
     return this.#presenceSync ??= this.#syncPresence().finally(() => { this.#presenceSync = undefined; });
   }
 
@@ -2093,7 +2168,14 @@ export class MeshBridge {
     const results = await Promise.allSettled([this.options.remote.mirror(outbound.presence), this.options.local.mirror(remote, syncedAt)]);
     // A transient failure must not hide a simultaneous permanent/transport failure.
     const failures = results.filter((result) => result.status === "rejected");
+    const stale = failures.find(result => result.reason instanceof BridgeStaleIncarnationError);
+    if (stale) {
+      this.#staleAdmission = stale.reason as BridgeStaleIncarnationError;
+      this.#ready = false;
+    }
     const failure = failures.find((result) => !isMeshRetryableBusy(result.reason)) ?? failures[0];
+    // Propagate once to the CLI's existing permanent-error log; never continue routing from
+    // refused presence. stop() must fence this link without withdrawing newer authority.
     if (failure) throw failure.reason;
     // A lock-delayed write must not make an old snapshot look freshly observed.
     this.#presenceAt = syncedAt;
@@ -2123,6 +2205,7 @@ export class MeshBridge {
    * claim refused or lost in this pass is never trusted (security review round 2, F1/F2).
    */
   async #authority(refreshIfStale = true): Promise<{ local: BridgePresence; remote: Pick<BridgePresence, "hosts" | "participants"> }> {
+    if (this.#staleAdmission) throw this.#staleAdmission;
     const { local } = this.options;
     if (!local.owned) throw new Error("The hub side of a bridge must report the records it holds");
     // A page/read/write can wait on the mesh lock longer than a mirrored lease.
@@ -2700,11 +2783,14 @@ export class MeshBridge {
     await within(this.#running);
     await within(this.#directions);
     await within(Promise.allSettled([...this.#relayDeliveries]));
-    await within(this.options.remote.mirror({ hosts: [], participants: [] }));
+    // A refused reconnect acquired no right to withdraw the predecessor's projection on
+    // either side. Ordinary explicit stop still empties both mirrors exactly as before.
+    if (!this.#staleAdmission) await within(this.options.remote.mirror({ hosts: [], participants: [] }));
     this.options.remote.close?.(new Error("Bridge stopped"));
     await within(this.#running);
     await within(this.#directions);
     const { local } = this.options;
+    if (this.#staleAdmission) return;
     await (local.withdraw ? local.withdraw() : local.mirror({ hosts: [], participants: [] })).catch((error: unknown) => {
       this.#log(`local withdrawal failed: ${error instanceof Error ? error.message : String(error)}`);
     });

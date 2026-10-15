@@ -134,6 +134,29 @@ describe.each(["file", "sqlite"] as const)("%s Round 3", backend => {
     expect(readHostLeaseCurrent(s.root, s.lease.id)).toEqual(s.lease);
   });
 
+  // The expiry wake runs on libuv's monotonic loop clock, Date.now() on the truncated wall clock: the wake can land
+  // with Date.now() 1 ms short of expiresAt. One bounded catch-up wake must still claim it (no LegacyBusy).
+  it("claims an expired legacy predecessor when its wake lands with Date.now() 1 ms behind", async () => {
+    const s = setup(backend), legacy = { ...s.lease, expiresAt: Date.now() + 15 }; delete legacy.incarnationToken;
+    writeHostLease(s.root, legacy);
+    const realNow = Date.now.bind(Date), realTimeout = globalThis.setTimeout;
+    // From the expiry wake until the next timer fires, the wall clock reads 1 ms before expiresAt (as observed under
+    // load: "now-expiresAt -1 ms"); any later wake sees the real clock again.
+    let frozen: number | undefined, wakes = 0;
+    vi.spyOn(Date, "now").mockImplementation(() => frozen ?? realNow());
+    // The first timer renewHostLease arms is its legacy-expiry wake (the claim commits only after it).
+    vi.spyOn(globalThis, "setTimeout").mockImplementation(((callback: (...args: unknown[]) => void, ms?: number, ...args: unknown[]) => {
+      const first = wakes++ === 0;
+      return realTimeout((...inner: unknown[]) => {
+        frozen = first ? legacy.expiresAt - 1 : undefined;
+        callback(...inner);
+      }, ms, ...args);
+    }) as typeof setTimeout);
+    try { await renewHostLease(s.mesh, s.lease, { claim: true }); } finally { frozen = undefined; }
+    expect(wakes).toBeGreaterThan(0); // the early-wake condition did happen
+    expect(readHostLeaseCurrent(s.root, s.lease.id)).toEqual(s.lease);
+  });
+
   it("legacy overwrite after UUID claim is contested and terminal, never repaired", async () => {
     const s = setup(backend), directory = await makeDirectory(s.mesh);
     const before = s.mesh.listAll("", { fresh: true }), legacy = { ...readHostLeaseCurrent(s.root, s.lease.id)! };

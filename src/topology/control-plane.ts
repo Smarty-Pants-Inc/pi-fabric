@@ -1585,6 +1585,17 @@ export class FabricControlPlane {
         const record = controlSeenRecord(entry.value);
         return record?.hostId === this.options.hostId && this.#releaseNeedsFileEvidence(record);
       }).sort((a, b) => a.key.localeCompare(b.key));
+    const acknowledgements = this.#readFileReleaseAcknowledgements(localOutcomes);
+    const outcomes = new Map(localOutcomes.map(entry => [entry.key, controlSeenRecord(entry.value)]));
+    for (const entry of sharedClaims) {
+      const record = controlSeenRecord(entry.value)!;
+      if (!record.acceptance && !outcomes.get(entry.key)?.acceptance) throw new Error("Control shared claim outcome disk readback is unconfirmed");
+    }
+    return { localOutcomes, sharedClaims, acknowledgements, consumedSequence: this.#lastSequence };
+  }
+
+  /** File-era outcomes require the original command and correlated ACK, on either carrier. */
+  #readFileReleaseAcknowledgements(localOutcomes: readonly { value: unknown }[]): MeshEvent[] {
     const acknowledgements: MeshEvent[] = [];
     const commands = new Map<number, MeshEvent>();
     let offset = 0, read = 0;
@@ -1599,7 +1610,6 @@ export class FabricControlPlane {
       if (tail.events.length < 100 || tail.nextOffset === offset) break;
       offset = tail.nextOffset;
     }
-    const outcomes = new Map(localOutcomes.map(entry => [entry.key, controlSeenRecord(entry.value)]));
     for (const entry of localOutcomes) {
       const record = controlSeenRecord(entry.value);
       if (!record?.acceptance) throw new Error("Control disk readback has a claim without a confirmed outcome");
@@ -1615,11 +1625,7 @@ export class FabricControlPlane {
           JSON.stringify((event.data as Record<string, unknown>)[key]) === JSON.stringify((acceptance as unknown as Record<string, unknown>)[key])));
       if (!ack) throw new Error("Control outcome ACK disk readback is unavailable; retain A");
     }
-    for (const entry of sharedClaims) {
-      const record = controlSeenRecord(entry.value)!;
-      if (!record.acceptance && !outcomes.get(entry.key)?.acceptance) throw new Error("Control shared claim outcome disk readback is unconfirmed");
-    }
-    return { localOutcomes, sharedClaims, acknowledgements, consumedSequence: this.#lastSequence };
+    return acknowledgements;
   }
 
   releaseCheckpointReceipt(): unknown {
@@ -2660,6 +2666,9 @@ export class FabricControlPlane {
     const localOutcomes = this.#seen.listAll(CONTROL_SEEN_PREFIX, { fresh: true })
       .filter(entry => this.#releaseNeedsFileEvidence(entry.value)).sort((a, b) => a.key.localeCompare(b.key));
     if (localOutcomes.some(entry => !controlSeenRecord(entry.value)?.acceptance)) throw new Error("NATS control has a local claim without a durable outcome");
+    // E22: only retained file-era local records need the shared log; marked-only
+    // NATS histories must not touch it or read shared claims at release.
+    if (localOutcomes.length) this.#readFileReleaseAcknowledgements(localOutcomes);
     return localOutcomes;
   }
 

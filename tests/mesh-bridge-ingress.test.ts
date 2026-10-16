@@ -22,11 +22,11 @@ import { writeParticipantFile } from "../src/topology/participant-files.js";
 // Held-barrier characterization / future isolation gate, using the SAME real path:
 //   FABRIC_TEST_INGRESS_BARRIER=blocked     ...   # characterize the old implementation
 //   FABRIC_TEST_INGRESS_BARRIER=independent ...  # red before an isolation fix, green after
-// Default "observe" and the benchmark assert delivery, NOT the continued existence of HOL.
+// Default "independent" asserts progress with the topology barrier still held.
 // Requires serveBridgeAgent's optional fourth-argument debug callback for benchmark timings.
 const COMMANDS = 50, IN_FLIGHT = 10, WAVES = COMMANDS / IN_FLIGHT;
 const SEED = 0x64779751;
-const barrierMode = process.env.FABRIC_TEST_INGRESS_BARRIER ?? "observe";
+const barrierMode = process.env.FABRIC_TEST_INGRESS_BARRIER ?? "independent";
 if (!["observe", "blocked", "independent"].includes(barrierMode)) {
   throw new Error("FABRIC_TEST_INGRESS_BARRIER must be observe, blocked, or independent");
 }
@@ -102,6 +102,7 @@ interface Sample {
   acknowledgedAt?: number;
   mirrorDeferrals: number;
   admissions: number;
+  expectedSender?: string;
 }
 interface RpcFrame { id: number; op: string; args?: unknown; sentAt: number }
 interface RpcTiming {
@@ -113,6 +114,11 @@ interface RpcTiming {
   endedAt: number;
   queueMs: number;
   runMs: number;
+  queueDepth: number;
+  requestBytes: number;
+  hosts?: number;
+  participants?: number;
+  presenceBytes?: number;
 }
 
 const observeStore = (store: MeshStore) => {
@@ -156,7 +162,7 @@ const holdService = (side: StoreBridgeSide, op: "presence" | "mirror") => {
 };
 type Hold = ReturnType<typeof holdService>;
 
-const fixture = async () => {
+const fixture = async (legacyRpc = false) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-ingress-"));
   roots.push(root);
   // Explicit file backend: never inherit a developer's SQLite/live mesh configuration.
@@ -179,7 +185,15 @@ const fixture = async () => {
   // refuses missing telemetry instead of inventing server queue/start measurements.
   const serveWithDebug: (side: StoreBridgeSide, input: PassThrough, output: PassThrough,
     debug?: (message: string) => void) => Promise<void> = serveBridgeAgent;
-  const serving = serveWithDebug(agent, input, output, message => {
+  const servedOutput = legacyRpc ? new PassThrough() : output;
+  if (legacyRpc) servedOutput.on("data", chunk => {
+    // A genuine old hello lacks the additive scheduling capability. Keep the rest
+    // of the real agent/store path, but require the client to retain its old gate.
+    const frame = JSON.parse(String(chunk));
+    if (frame.result?.independentRpc === true) delete frame.result.independentRpc;
+    output.write(`${JSON.stringify(frame)}\n`);
+  });
+  const serving = serveWithDebug(agent, input, servedOutput, message => {
     if (message.startsWith("bridge rpc ")) timings.push(JSON.parse(message.slice("bridge rpc ".length)) as RpcTiming);
   });
   const remote = new RemoteBridgeSide(output, input, 15_000);
@@ -215,7 +229,7 @@ const fixture = async () => {
     plane.start(async (command, from) => {
       const sample = samples.get(command.commandId);
       if (!sample) throw new Error(`Unexpected ingress command ${command.commandId}`);
-      expect(from.id).toBe(store === far ? lead.identity.id : lane.identity.id);
+      expect(from.id).toBe(sample.expectedSender ?? (store === far ? lead.identity.id : lane.identity.id));
       expect(from.verified).toBe("bridge");
       sample.dispatchedAt = performance.now(); sample.admissions++;
       admitted.push(command.commandId);
@@ -329,6 +343,8 @@ const summarize = (f: Fixture, path_: "direct-rpc" | "run-inbound", delay: "none
     expect(Object.keys(timing).every(key => [...required, "hosts", "participants", "presenceBytes"].includes(key))).toBe(true);
     expect([timing.queuedAt, timing.startedAt, timing.endedAt, timing.queueMs, timing.runMs]
       .every(value => Number.isFinite(value) && value >= 0)).toBe(true);
+    expect(Number.isInteger(timing.queueDepth) && timing.queueDepth >= 0).toBe(true);
+    expect(Number.isInteger(timing.requestBytes) && timing.requestBytes > 0).toBe(true);
     expect(timing.queuedAt).toBeLessThanOrEqual(timing.startedAt);
     expect(timing.startedAt).toBeLessThanOrEqual(timing.endedAt);
     rpcKinds[timing.kind] = (rpcKinds[timing.kind] ?? 0) + 1;
@@ -337,7 +353,9 @@ const summarize = (f: Fixture, path_: "direct-rpc" | "run-inbound", delay: "none
   f.assertHealthy();
   return { path: path_, delay, commands: COMMANDS, maxInFlight: IN_FLIGHT, peakInFlight: peak,
     presenceChurn: { waves: WAVES, nativeParticipantWrites: WAVES, injectedServiceMs: delays },
-    rpcKinds, mirrorDeferrals: samples.reduce((n, sample) => n + sample.mirrorDeferrals, 0),
+    rpcKinds, maxRpcQueueDepth: Math.max(...f.timings.entries.map(timing => timing.queueDepth)),
+    mirrorShape: f.timings.entries.filter(timing => timing.op === "mirror").map(({ hosts, participants, presenceBytes }) => ({ hosts, participants, presenceBytes })),
+    mirrorDeferrals: samples.reduce((n, sample) => n + sample.mirrorDeferrals, 0),
     rpcSelection: path_ === "direct-rpc" ? "command publish" : "inbound read/tail (pages, not commands)",
     queue: stats(measured.map(timing => timing.queueMs)), run: stats(measured.map(timing => timing.runMs)),
     presenceService: stats(f.timings.entries.filter(timing => timing.op === "presence" || timing.op === "mirror").map(timing => timing.runMs)),
@@ -390,6 +408,7 @@ const benchmarkCase = async (path_: "direct-rpc" | "run-inbound", delay: "none" 
   const commands = destination.read({ topic: "fabric.control.command", after: 0, limit: 256 });
   const acks = source.read({ topic: "fabric.control.ack", after: 0, limit: 256 });
   expect(commands).toHaveLength(COMMANDS); expect(acks).toHaveLength(COMMANDS);
+  expect(commands.map(commandIdOf)).toEqual(source.read({ topic: "fabric.control.command", after: 0, limit: 256 }).map(commandIdOf));
   expect(new Set(commands.map(commandIdOf)).size).toBe(COMMANDS);
   expect(new Set(acks.map(commandIdOf))).toEqual(new Set(commands.map(commandIdOf)));
   expect(commands.every(event => event.verification === "bridge")).toBe(true);
@@ -400,7 +419,7 @@ const benchmarkCase = async (path_: "direct-rpc" | "run-inbound", delay: "none" 
 
 // This probe does not bake the existing failure into CI. "blocked" is a deliberate
 // pre-fix characterization; "independent" holds the barrier until delivery and is a
-// deterministic regression gate for a later fix. Default observes, then releases.
+// deterministic regression gate. Default requires progress before releasing.
 const heldObservation = async (f: Fixture, id: string) => {
   if (barrierMode === "independent") {
     await f.admitted.wait(value => value === id, "dispatch must not await held presence service", 1_000);
@@ -413,6 +432,19 @@ const heldObservation = async (f: Fixture, id: string) => {
 };
 
 describe("mesh bridge ingress: real file meshes and stdio", () => {
+  it("retains the global pending-mirror gate when an old hello has no independent RPC capability", async () => {
+    const f = await fixture(true), hold = f.hold("mirror");
+    const pending = f.remote.mirror(await f.local.presence());
+    void pending.catch(() => undefined);
+    try {
+      await within(hold.entered, "legacy mirror pending");
+      const before = f.wire.entries.length;
+      await expect(f.remote.read(0)).rejects.toMatchObject({ code: "FABRIC_BRIDGE_MIRROR_PENDING" });
+      expect(f.wire.entries).toHaveLength(before);
+    } finally { hold.release(); hold.restore(); await pending; }
+    f.assertHealthy();
+  });
+
   it.each(["presence", "mirror"] as const)("direct remote: valid command/ACK across a held %s service", async op => {
     const f = await fixture(), hold = f.hold(op);
     const snapshot = await f.local.presence();
@@ -472,6 +504,32 @@ describe("mesh bridge ingress: real file meshes and stdio", () => {
       await pending;
       expect(f.samples.get(id)!.admissions).toBe(1);
       expect(f.hub.read({ topic: "fabric.control.command", after: 0, limit: 256 })).toHaveLength(1);
+      f.assertHealthy();
+    } finally { hold.release(); hold.restore(); }
+  });
+
+  it("refreshes a newcomer after an older successful pass, without admitting it from an uncommitted claim", async () => {
+    const f = await fixture();
+    await f.launch();
+    const hold = f.hold("mirror");
+    churn(f, 0);
+    await within(hold.entered, "old presence snapshot awaiting outbound mirror");
+    const newcomer = await native(f.far, "new-during-old-pass");
+    const id = "new-root-during-successful-pass", sample = newSample(f, id);
+    sample.expectedSender = newcomer.identity.id;
+    const before = f.wire.entries.at(-1)!.id;
+    try {
+      await f.far.publish(command(newcomer, f.lead, id));
+      await f.wire.wait(frame => frame.id > before && (frame.op === "tail" || frame.op === "read"), "newcomer read during old pass");
+      expect(f.local.holds(newcomer.identity.id)).toBe(false);
+      expect(sample.admissions).toBe(0);
+      // This pass succeeds normally, well before the call deadline: no timeout/late
+      // response may be needed to trigger a genuinely new membership observation.
+      hold.release();
+      const ack = await f.farLog.wait(ackFor(id), "newcomer ACK after a fresh committed observation");
+      verifyAck(ack, f.lead, newcomer, id);
+      expect(sample.admissions).toBe(1);
+      expect(f.local.holds(newcomer.identity.id, newcomer.identity)).toBe(true);
       f.assertHealthy();
     } finally { hold.release(); hold.restore(); }
   });

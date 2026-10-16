@@ -578,17 +578,12 @@ export const validateFabricNatsOperatorMachine = (value: unknown, machine?: stri
 
 const meshNatsRollbackHoldUntil = (value: unknown): string | undefined => {
   if (value === undefined) return undefined;
-  // Date.parse alone accepts local times and normalizes impossible dates (e.g. February 30).
-  // Keep the original UTC string, including its precision, for the composition roots.
-  const match = typeof value === "string"
-    ? /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.\d+)?)?(?:Z|\+00:00)$/.exec(value)
-    : null;
-  if (typeof value === "string" && match && match[0] === value && Number.isFinite(Date.parse(value))) {
-    const [, year, month, day, hour, minute, second] = match;
-    const date = new Date(Date.parse(value));
-    if (date.getUTCFullYear() === Number(year) && date.getUTCMonth() + 1 === Number(month)
-      && date.getUTCDate() === Number(day) && Number(hour) < 24 && Number(minute) < 60
-      && (second === undefined || Number(second) < 60)) return value;
+  // Minimal eager shape/calendar check only. Date.parse normalizes impossible dates;
+  // compare the UTC date, and retain the literal precision for lazy root conversion.
+  if (typeof value === "string" &&
+    /^\d{4}-\d{2}-\d{2}T(?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d(?:\.\d+)?)?(?:Z|\+00:00)$/.exec(value)?.[0] === value) {
+    const instant = Date.parse(value);
+    if (Number.isFinite(instant) && new Date(instant).toISOString().slice(0, 10) === value.slice(0, 10)) return value;
   }
   throw new FabricMeshNatsConfigError("rollbackHoldUntil", "must be a valid UTC ISO-8601 timestamp");
 };

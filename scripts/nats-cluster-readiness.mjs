@@ -1,4 +1,6 @@
 import { pathToFileURL } from "node:url";
+// Node >= 24 (package engines) strips the helper's types; the product adapter shares the same selection (#13112).
+import { selectNatsSyncAlways } from "../src/mesh/nats-monitor-config.ts";
 
 // Test/CI only: this module is not in the product startup graph. NATS monitor
 // endpoints have no readiness push event, so polling is the bounded observation
@@ -85,7 +87,7 @@ function summarize(observations) {
       healthJs: healthJs?.status ?? null,
       serverId: server?.server_id ?? null,
       serverName: server?.server_name ?? null,
-      syncAlways: (server?.jetstream?.config?.sync_always ?? jetstream?.config?.sync_always) === true,
+      syncAlways: selectNatsSyncAlways(server, jetstream) === true,
       routeCount: routez?.num_routes ?? null,
       peers,
       leader: metaCluster?.leader ?? null,

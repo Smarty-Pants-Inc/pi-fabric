@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { waitForNatsCluster } from "../scripts/nats-cluster-readiness.mjs";
+import { selectNatsSyncAlways } from "../src/mesh/nats-monitor-config.js";
 
 beforeEach(() => { vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "performance", "Date"] }); });
 afterEach(() => { vi.useRealTimers(); });
@@ -84,6 +85,27 @@ const failure = async (fixtures: NodeFixture[], timeoutMs = 40, fetch: typeof gl
     return error instanceof Error ? error.message : String(error);
   }
 };
+
+describe("selectNatsSyncAlways (#13112, shared with the product adapter)", () => {
+  const varz = (value: unknown) => ({ jetstream: { config: { sync_always: value } } });
+  const jsz = (value: unknown) => ({ config: { sync_always: value } });
+  it.each([
+    ["varz false wins over jsz true", varz(false), jsz(true), false],
+    ["varz true wins over jsz false", varz(true), jsz(false), true],
+    ["missing varz config falls back to jsz true", { jetstream: {} }, jsz(true), true],
+    ["missing varz config falls back to jsz false", { jetstream: {} }, jsz(false), false],
+    ["null varz value falls back", varz(null), jsz(true), true],
+    ["non-boolean varz value falls back", varz("true"), jsz(true), true],
+    ["missing both is undefined", { jetstream: {} }, {}, undefined],
+    ["no jsz supplied is undefined", {}, undefined, undefined],
+    ["non-boolean jsz is undefined", {}, jsz("true"), undefined],
+    ["camelCase is not read", { jetstream: { config: { syncAlways: true } } }, { syncAlways: true }, undefined],
+    ["non-object bodies are undefined", [varz(true)], "ok", undefined],
+    ["null bodies are undefined", null, null, undefined],
+  ] as const)("%s", (_label, varzBody, jszBody, expected) => {
+    expect(selectNatsSyncAlways(varzBody, jszBody)).toBe(expected);
+  });
+});
 
 describe("shared NATS cluster readiness gate", () => {
   it("waits through staggered state, checks both health endpoints, and accepts follower jsz without replicas", async () => {

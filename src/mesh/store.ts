@@ -534,7 +534,7 @@ export class MeshStore {
     const { retryResidentWakes } = await import("../residency/wake.js");
     // Import preparation may have yielded to staging, drain or handover.
     if (!this.#canWakeResidents()) return;
-    await retryResidentWakes(this);
+    await retryResidentWakes(this, undefined, undefined, () => this.#canWakeResidents());
   }
 
   #scheduleDue(now = Date.now()): boolean {

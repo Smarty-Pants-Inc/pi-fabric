@@ -57,6 +57,10 @@ interface ResidentWakeFailure {
   claimId?: string;
 }
 type ResidentWakeMesh = Pick<MeshStore, "root" | "listAll" | "exclusive">;
+interface ResidentWakeAdmission { allowed: () => boolean; exclusive: ResidentWakeMesh["exclusive"] }
+class ResidentWakeAdmissionClosed extends Error {
+  constructor() { super("Resident wake maintenance admission closed"); }
+}
 const wakeFailureAt = (root: string): ResidentWakeFailure | undefined => readWakeJson<ResidentWakeFailure>(wakeFailurePath(root));
 const wakeRetryDelay = (failures: number): number => Math.min(RESIDENT_WAKE_RETRY_MAX_MS,
   RESIDENT_WAKE_RETRY_MIN_MS * 2 ** Math.min(16, Math.max(0, failures - 1)));
@@ -277,7 +281,9 @@ export function waitResidentChange(root: string, ready: () => boolean, timeoutMs
 /** Reuse the installed Node launcher, never keep a polling hostd warm. */
 export async function requestResidentWake(root: string, delivery: { id: string; sequence?: number },
   launch?: (configPath: string, config: ResidentHostConfig) => Promise<void>,
-  onIntentWritten?: (request: ResidentWakeRequest) => Promise<void>): Promise<void> {
+  onIntentWritten?: (request: ResidentWakeRequest) => Promise<void>, admission?: ResidentWakeAdmission): Promise<void> {
+  const assertAdmission = (): void => { if (admission && !admission.allowed()) throw new ResidentWakeAdmissionClosed(); };
+  assertAdmission();
   const configPath = path.join(root, "config.json");
   const config = assertResidentWakeConfig(root);
   // Short lock shared with the launcher's final snapshot AND release of lifetime wake.lock.
@@ -289,15 +295,21 @@ export async function requestResidentWake(root: string, delivery: { id: string; 
   let written: ResidentWakeRequest | undefined;
   let warm = false;
   try {
-    warm = residentOwnerLive(root) && !residentOwnerSleeping(root);
-    const previous = readWakeJson<ResidentWakeRequest>(residentWakeRequestPath(root));
-    const request = previous?.sequence !== undefined && delivery.sequence !== undefined && previous.sequence > delivery.sequence
-      ? previous : { format: 1 as const, ...delivery, requestedAt: Date.now() };
-    // Persist AFTER mesh commit and BEFORE spawn. The existing cursor owns delivery.
-    writeJsonAtomic(residentWakeRequestPath(root), request, { durable: true });
-    written = request;
+    const writeIntent = (): void => {
+      assertAdmission(); // Revalidated inside maintenance's mesh custody, after the intent-lock wait.
+      warm = residentOwnerLive(root) && !residentOwnerSleeping(root);
+      const previous = readWakeJson<ResidentWakeRequest>(residentWakeRequestPath(root));
+      const request = previous?.sequence !== undefined && delivery.sequence !== undefined && previous.sequence > delivery.sequence
+        ? previous : { format: 1 as const, ...delivery, requestedAt: Date.now() };
+      // Persist AFTER mesh commit and BEFORE spawn. The existing cursor owns delivery.
+      writeJsonAtomic(residentWakeRequestPath(root), request, { durable: true });
+      written = request;
+    };
+    if (admission) await admission.exclusive(writeIntent);
+    else writeIntent(); // Matching publication keeps its original intent/config path.
   } finally { if (fd !== undefined) fs.closeSync(fd); }
   if (written) await onIntentWritten?.(written);
+  assertAdmission();
   if (warm) return; // A racing warm owner covers this durable request without a new child.
   // Spawn is outside the short transaction. A busy contender is covered by the holder's final check.
   assertResidentWakeConfig(root, config);
@@ -305,6 +317,7 @@ export async function requestResidentWake(root: string, delivery: { id: string; 
   const { scriptSpawnArgs } = await import("../agents/transports/process-utils.js");
   const [runtime, ...args] = await scriptSpawnArgs(path.join(path.dirname(config.fabricExtensionPath), "residency", "launcher.js"),
     ["--config", configPath, "--wake"]);
+  assertAdmission(); // Runtime preparation may have yielded to staging, drain, handover or close.
   assertResidentWakeConfig(root, config); // the async runtime lookup may have yielded to a config rewrite
   const child = spawn(runtime!, args, { cwd: config.cwd, detached: process.platform !== "win32",
     env: childProcessEnvironment(), stdio: ["ignore", "ignore", "ignore", "ipc"] });
@@ -420,15 +433,19 @@ export async function wakeResidentActors(mesh: Pick<MeshStore, "root" | "listAll
 
 /** Retry durable pending/failure nudges on the existing retention cadence. No timer is armed here. */
 export async function retryResidentWakes(mesh: ResidentWakeMesh,
-  launch?: (configPath: string, config: ResidentHostConfig) => Promise<void>, now = Date.now()): Promise<void> {
+  launch?: (configPath: string, config: ResidentHostConfig) => Promise<void>, now = Date.now(),
+  canWake: () => boolean = () => true): Promise<void> {
+  if (!canWake()) return;
   const key = path.resolve(mesh.root);
   const running = residentWakeRetrySweeps.get(key);
   if (running) return running;
   const sweep = (async () => {
     const pending = await mesh.exclusive(() => {
+      if (!canWake()) return new Map<string, WakeDelivery>();
       const reader = new ResidentWakeRecoveryReader(mesh.root);
       try { return reader.next().pending; } finally { reader.close(); }
     });
+    if (!canWake()) return;
     const candidates = [...new Set([...pending.keys(),
       ...residentDirectories(mesh.root).filter(root => wakeFailureAt(root) !== undefined)])];
     if (!candidates.length) return;
@@ -437,10 +454,12 @@ export async function retryResidentWakes(mesh: ResidentWakeMesh,
     residentWakeRetryCursors.set(key, (offset + Math.min(RESIDENT_WAKE_INDEX_MAX_ROOTS, rotated.length)) % candidates.length);
     const attempts: Array<{ root: string; delivery: WakeDelivery; claimId: string }> = [];
     for (const root of rotated.slice(0, RESIDENT_WAKE_INDEX_MAX_ROOTS)) {
+      if (!canWake()) break;
       if (!retainedRoutesAt(root)) continue;
       const claimId = randomUUID();
       try {
         const delivery = await mesh.exclusive(() => {
+          if (!canWake()) return;
           const prior = wakeFailureAt(root);
           if (prior?.nextRetryAt !== undefined && prior.nextRetryAt > now) return;
           // Re-read under the claim lock; a stale snapshot cannot relaunch completed work.
@@ -465,11 +484,22 @@ export async function retryResidentWakes(mesh: ResidentWakeMesh,
       try {
         await requestResidentWake(root, delivery, launch, written => mesh.exclusive(() => {
           if (wakeFailureAt(root)?.claimId === claimId) acknowledgeResidentDelivery(mesh.root, root, written);
-        }));
+        }), { allowed: canWake, exclusive: mesh.exclusive.bind(mesh) });
         await mesh.exclusive(() => {
           if (wakeFailureAt(root)?.claimId === claimId) fs.rmSync(wakeFailurePath(root), { force: true });
         });
       } catch (error) {
+        if (error instanceof ResidentWakeAdmissionClosed) {
+          // Revocation is not a root failure. Retain the consolidated nudge, release
+          // only our claim, and make it eligible when the owner's gate opens again.
+          await mesh.exclusive(() => {
+            const current = wakeFailureAt(root);
+            if (current?.claimId !== claimId) return;
+            const { claimId: _claimId, ...retained } = current;
+            writeJsonAtomic(wakeFailurePath(root), { ...retained, nextRetryAt: now }, { durable: true });
+          });
+          return;
+        }
         await recordResidentWakeFailure(mesh, root, delivery, error, Math.max(now, Date.now()), claimId);
         diagnostics.warn("src/residency/wake.ts", `[pi-fabric] resident wake deferred for ${root}: ${String(error)}`);
       }

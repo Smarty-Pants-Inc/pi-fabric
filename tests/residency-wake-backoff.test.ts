@@ -146,6 +146,53 @@ describe("publication wake isolation and maintenance backoff", () => {
     } finally { await actors?.close(); await agents.close(); f.close(); }
   });
 
+  it.each([[1, false], [1, true], [2, false], [2, true], [3, false], [3, true], [4, false], [4, true]] as const)(
+    "rechecks maintenance admission after custody wait %i (gate stays open: %s)", async (heldCall, staysOpen) => {
+    let allowed = true;
+    const f = fixture(1, () => allowed);
+    const config = f.residents[0]!;
+    const configFile = path.join(config.residencyRoot, "config.json");
+    const saved = fs.readFileSync(configFile, "utf8");
+    const launch = vi.fn(async () => {});
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    let release!: () => void;
+    try {
+      fs.writeFileSync(configFile, JSON.stringify({ ...config, cwd: "unapproved-restart" }));
+      await f.mesh.publish({ topic: "stuck.delivery", from });
+      const before = fs.readFileSync(path.join(config.residencyRoot, "wake-failure.json"), "utf8");
+      vi.spyOn(Date, "now").mockReturnValue(failureAt(config.residencyRoot).nextRetryAt);
+      fs.writeFileSync(configFile, saved);
+      const retry = wake.retryResidentWakes as (mesh: MeshStore, launch?: (file: string, config: ResidentHostConfig) => Promise<void>,
+        now?: number, canWake?: () => boolean) => Promise<void>;
+      vi.spyOn(wake, "retryResidentWakes").mockImplementation((mesh, _launch, now, canWake = () => true) =>
+        retry(mesh as MeshStore, launch, now, canWake));
+      const exclusive = f.mesh.exclusive.bind(f.mesh);
+      let entered!: () => void;
+      const waiting = new Promise<void>(resolve => { entered = resolve; });
+      const held = new Promise<void>(resolve => { release = resolve; });
+      let calls = 0;
+      vi.spyOn(f.mesh, "exclusive").mockImplementation(async <T>(operation: () => T, timeout?: number): Promise<T> => {
+        if (++calls === heldCall) { entered(); await held; }
+        return exclusive(operation, timeout);
+      });
+      const sweeping = f.mesh.retryResidentWakes();
+      await waiting;
+      allowed = staysOpen;
+      release();
+      await sweeping;
+      expect(launch).toHaveBeenCalledTimes(staysOpen ? 1 : 0);
+      // Waits 1/2/3 precede intent commit; wait 4 is its ACK, so intent
+      // was admitted before revocation but launch must still be suppressed.
+      expect(fs.existsSync(wake.residentWakeRequestPath(config.residencyRoot))).toBe(staysOpen || heldCall === 4);
+      if (!staysOpen) {
+        expect(fs.readFileSync(path.join(config.residencyRoot, "wake-failure.json"), "utf8")).toBe(before);
+        allowed = true;
+        await f.mesh.retryResidentWakes();
+        expect(launch).toHaveBeenCalledOnce(); // Revocation retained the durable nudge and released our claim.
+      }
+    } finally { release?.(); f.close(); }
+  });
+
   it("retains real config refusals, backs off repeated sweeps, and recovers repaired config at the next due retry", async () => {
     const f = fixture(1);
     const config = f.residents[0]!;

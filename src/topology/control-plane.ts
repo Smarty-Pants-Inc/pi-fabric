@@ -25,7 +25,7 @@ import { eventReceipts } from "./root-inbox-shared.js";
 import { FileTransport } from "../transport/file.js";
 import { TransportInvalidError, TransportUncertainError, TransportUnavailableError, TransportUnsupportedError, type FabricTransport, type TransportDelivery, type TransportDrainState, type TransportEnvelope, type TransportSent } from "../transport/types.js";
 import type { ParticipantRoute, ParticipantView } from "./participant-view.js";
-import { readNatsDrainReceipt } from "./nats-drain-receipt.js";
+import { assertNatsDrainReceiptForRelease, readNatsDrainReceipt } from "./nats-drain-receipt.js";
 
 const CONTROL_TOPIC = "fabric.control.command";
 const ACK_TOPIC = "fabric.control.ack";
@@ -409,6 +409,8 @@ export interface FabricControlPlaneOptions {
   inboxLanes?: number;
   /** Required in NATS mode: reserved fabric-ops[-suffix] credential machine, injected by composition. */
   relayOperatorMachine?: string;
+  /** Host-only configured inbox stream, also supplied on FILE rollback; never caller/receipt authority. */
+  expectedNatsInboxStream?: string;
   /** Rollback withdrawal hold, epoch ms; composition converts mesh.nats.rollbackHoldUntil (E14-X1). */
   withdrawHoldUntil?: number;
   /** Missing epochs are admitted with sender warnings by default during mixed-release rollout. */
@@ -743,6 +745,7 @@ export class FabricControlPlane {
   readonly #inboxLanes: number;
   readonly #transport: FabricTransport;
   readonly #relayOperatorMachine: string | undefined;
+  readonly #expectedNatsInboxStream: string | undefined;
   // File-only access stays behind the legacy branches, including reader/cursor semantics.
   get #fileTransport(): FileTransport {
     if (!(this.#transport instanceof FileTransport)) throw new TransportUnsupportedError("Not a file control carrier");
@@ -854,6 +857,8 @@ export class FabricControlPlane {
     }
     this.#transport = transport;
     this.#relayOperatorMachine = transport.kind === "nats" ? options.relayOperatorMachine : undefined;
+    this.#expectedNatsInboxStream = options.expectedNatsInboxStream ??
+      (transport.kind === "nats" ? `FABRIC_IN_${transport.self.machine}` : undefined);
     // The file reader replays the retained log from its current generation. Durable claims
     // recover unclaimed commands and make interrupted outcomes explicit without re-execution.
     this.#lastSequence = transport instanceof FileTransport ? transport.reader.lastSequence : 0;
@@ -1573,16 +1578,17 @@ export class FabricControlPlane {
     this.#releaseCheckpoint = { epoch, state };
   }
 
-  /** E14-X1/E17: only a complete, host-bound receipt covering the last NATS write permits a skip. */
+  /** E14-X1/E17: only a host/stream-bound drain proof covering the last NATS write permits a skip. */
   #releaseNeedsFileEvidence(value: unknown): boolean {
     const record = controlSeenRecord(value);
-    if (record?.carrier !== "nats") return true; // File-only hosts never read a receipt.
-    const unproven = (): Error => new Error("NATS control has an unproven drain receipt; retain A");
-    if (typeof record.writtenAt !== "number" || !Number.isFinite(record.writtenAt) || record.writtenAt < 0) throw unproven();
-    let receipt: ReturnType<typeof readNatsDrainReceipt>;
-    try { receipt = readNatsDrainReceipt(this.#seen.root); } catch { throw unproven(); }
-    if (!receipt || receipt.version !== 1 || receipt.complete !== true || receipt.hostId !== this.options.hostId ||
-        !Number.isFinite(receipt.completedAt) || receipt.completedAt < record.writtenAt) throw unproven();
+    if (record?.carrier !== "nats") return true; // File-only hosts never read a receipt or require a stream.
+    assertNatsDrainReceiptForRelease(readNatsDrainReceipt(this.#seen.root), {
+      hostId: this.options.hostId,
+      writtenAt: record.writtenAt,
+      now: (this.options.now ?? Date.now)(),
+      ...(this.#expectedNatsInboxStream !== undefined
+        ? { expectedNatsInboxStream: this.#expectedNatsInboxStream } : {}),
+    });
     return false;
   }
 

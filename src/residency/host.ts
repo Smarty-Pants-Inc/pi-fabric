@@ -556,6 +556,8 @@ export class ResidentHost {
       bridgeTimeoutMs: config.mesh.bridgeControlTimeoutMs,
       ...(transport ? { inboxLanes: config.mesh.nats.inboxLanes ?? 8,
         relayOperatorMachine: config.mesh.nats.operatorMachine } : {}),
+      ...(config.mesh.nats.machine !== undefined
+        ? { expectedNatsInboxStream: `FABRIC_IN_${config.mesh.nats.machine}` } : {}),
       ...(config.mesh.nats.rollbackHoldUntil !== undefined
         ? { withdrawHoldUntil: Date.parse(config.mesh.nats.rollbackHoldUntil) } : {}),
       canConsumeMesh: () => this.#ready && (transport ? participants : this.participants).canConsumeMesh(),

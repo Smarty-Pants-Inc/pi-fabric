@@ -1150,6 +1150,8 @@ export class FabricRuntimeState {
       bridgeTimeoutMs: this.#config.mesh.bridgeControlTimeoutMs,
       ...(transport ? { inboxLanes: meshConfig.nats.inboxLanes ?? 8,
         relayOperatorMachine: meshConfig.nats.operatorMachine } : {}),
+      ...(meshConfig.nats.machine !== undefined
+        ? { expectedNatsInboxStream: `FABRIC_IN_${meshConfig.nats.machine}` } : {}),
       ...(meshConfig.nats.rollbackHoldUntil !== undefined
         ? { withdrawHoldUntil: Date.parse(meshConfig.nats.rollbackHoldUntil) } : {}),
       captureOwnerLease: (ownerHostId, ownerIdentityId, targetId) =>

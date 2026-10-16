@@ -3,9 +3,11 @@ import {
   createNatsAccount,
   createNatsOperator,
   mintNatsUser,
+  mintNatsBreakGlassUser,
   type NatsMintOutput,
 } from "../src/mesh/nats-auth/mint.js";
 import { decodeAndVerifyNatsJwt } from "../src/mesh/nats-auth/jwt.js";
+import { roleTemplate, type NatsRole } from "../src/mesh/nats-auth/permissions.js";
 
 const clock = { nowSeconds: () => Math.floor(Date.now() / 1_000) };
 const machines = ["ryzen2", "ryzen4"];
@@ -70,6 +72,30 @@ describe("Path B opt-in mint policy", () => {
     const { pathBMachines: omitted, ...withoutPolicy } = input;
     expect(omitted).toBeDefined();
     expect(() => mintNatsUser(withoutPolicy, clock)).toThrow();
+  });
+
+  it("keeps principal and break-glass issuance available in an opted-in account", () => {
+    const { account, common } = fixture();
+    const { pathBMachines: inventory, ...legacyCommon } = common;
+    expect(inventory).toEqual(machines);
+    const issued = [
+      mintNatsUser({ ...legacyCommon, role: "principal", signingSeed: artifact(account, "signing-principal.nk"), person: "test", device: "test" }, clock),
+      mintNatsBreakGlassUser({ ...legacyCommon, signingSeed: artifact(account, "signing-break-glass.nk"), person: "test", runId: "test", approvalRef: "issue:13871" }, clock),
+    ];
+    const scoped = claims(common.accountJwt).nats.signing_keys;
+    for (const [index, role] of ["principal", "break-glass"].entries()) {
+      const output = issued[index]!;
+      expect(output.metadata.role).toBe(role);
+      const jwt = artifact(output, "user.creds").match(/-{3,}BEGIN NATS USER JWT-{3,}\s*([^\s]+)\s*-{3,}END NATS USER JWT-{3,}/)?.[1];
+      expect(jwt).toBeDefined();
+      expect(claims(jwt!).nats.tags).toContain(`role:${role}`);
+      const key = scoped.find((entry: any) => entry.role === role);
+      expect(key.description).toBe("");
+      expect(key.template).toMatchObject(roleTemplate(role as NatsRole, streams));
+    }
+    for (const role of ["agent", "maintainer"]) {
+      expect(scoped.find((entry: any) => entry.role === role).description).toMatch(/^path-b\/[a-f0-9]{64}$/);
+    }
   });
 
   it("gives the messaging operator no stream lifecycle or inbox acknowledgement authority", () => {

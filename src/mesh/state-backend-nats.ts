@@ -1008,7 +1008,8 @@ export class NatsStateBackend implements StateBackend {
     let lostAck = false;
     for (;;) {
       const remaining = deadline - performance.now();
-      if (remaining <= 0) {
+      // nats-core rejects timeouts below 1ms; never round up beyond the remaining write budget.
+      if (remaining < 1) {
         if (lostAck) throw new MeshStateNatsOutcomeUnknownError(msgID, "the write budget expired without a publish answer");
         throw new MeshStateNatsBusyError("the write budget expired before the publish");
       }

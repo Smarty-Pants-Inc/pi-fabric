@@ -17,7 +17,7 @@ vi.mock("@nats-io/jetstream", async importOriginal => ({
 
 import { JetStreamApiError } from "@nats-io/jetstream";
 import {
-  closeNatsStateBackend, MeshStateNatsOutcomeUnknownError, NatsWrongLastSequenceError,
+  closeNatsStateBackend, MeshStateNatsBusyError, MeshStateNatsOutcomeUnknownError, NatsWrongLastSequenceError,
   openNatsStateBackend, type JetStreamPort,
 } from "../src/mesh/state-backend-nats.js";
 import { connectJetStream } from "../src/mesh/state-backend-nats-client.js";
@@ -46,7 +46,8 @@ const harness = async (server: FakeJetStreamServer, lockTimeoutMs: number | unde
   await backend.put({ key: "d/count", value: 0, identity });
   attempts.length = 0;
   vi.spyOn(performance, "now").mockImplementation(() => clock.now);
-  const write = () => backend.writeBatch({ identity, ops: [], prepare: view => [{ kind: "put", key: "d/count", value: (view.get("d/count")?.value as number) + 1 }] });
+  const write = (beforeCommit?: () => void) => backend.writeBatch({ identity, ops: [], ...(beforeCommit ? { beforeCommit } : {}),
+    prepare: view => [{ kind: "put", key: "d/count", value: (view.get("d/count")?.value as number) + 1 }] });
   /** The SDK request timed out: virtual time advances by exactly the attempt's native timeout. */
   const elapse = (attempt: number) => { clock.now += attempts[attempt - 1]!.timeoutMs ?? 5_000; };
   return { backend, attempts, clock, write, elapse, set: (next: Behaviour) => { behaviour = next; } };
@@ -108,6 +109,33 @@ describe("NATS publish attempt budget (fix A, smarty-dev#13112)", () => {
     await expect(h.write()).rejects.toBeInstanceOf(MeshStateNatsOutcomeUnknownError);
     expect(h.attempts.map(attempt => attempt.timeoutMs)).toEqual([1_000, 1_000, 500]);
     expect(h.clock.now - start).toBe(2_500);
+  });
+
+  it("a fractional remainder after a lost ACK returns OutcomeUnknown without a sub-millisecond retry", async () => {
+    const server = fakeJetStream();
+    const h = await harness(server, 1_000.5);
+    h.set(async attempt => { h.elapse(attempt); throw silent(); });
+    await expect(h.write()).rejects.toBeInstanceOf(MeshStateNatsOutcomeUnknownError);
+    expect(h.attempts.map(attempt => attempt.timeoutMs)).toEqual([1_000]);
+    expect(h.clock.now).toBe(1_001_000);
+  });
+
+  it("a fractional remainder before the first send returns Busy without publishing", async () => {
+    const server = fakeJetStream();
+    const h = await harness(server, 1_000.5);
+    await expect(h.write(() => { h.clock.now += 1_000; })).rejects.toBeInstanceOf(MeshStateNatsBusyError);
+    expect(h.attempts).toEqual([]);
+  });
+
+  it("an exact 1ms remainder is a valid final publish attempt", async () => {
+    const server = fakeJetStream();
+    const h = await harness(server, 1_001);
+    h.set(async (attempt, call) => { if (attempt === 1) { h.elapse(1); throw silent(); } return call(); });
+    await h.write();
+    expect(h.attempts.map(attempt => attempt.timeoutMs)).toEqual([1_000, 1]);
+    expect(h.attempts[1]!.msgID).toBe(h.attempts[0]!.msgID);
+    expect(h.attempts[1]!.expect).toBe(h.attempts[0]!.expect);
+    expect(h.backend.get("d/count")?.value).toBe(1);
   });
 
   it("a permanent publish error is final (no retry)", async () => {

@@ -2259,7 +2259,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       }
       return ops;
     }, (ops) => this.#withLeaseFence(() => this.mesh.writeBatch({ identity: this.options.identity, ops,
-      prepare: () => { assertHostLeaseOwner(this.mesh.root, leaseOwner); return []; } })));
+      beforeCommit: () => { assertHostLeaseOwner(this.mesh.root, leaseOwner); } })));
     // A superseded incarnation owns nothing left to lapse: its successor holds the lease.
     const failed = (reason: string): void => { if (!this.#superseded) this.#withdrawalFailure(reason); };
     // A reload leaves only its root and fixed host lease; the next session_start replaces both.
@@ -2700,12 +2700,15 @@ export class ParticipantDirectory implements FabricParticipantSource {
           expiresAt: this.#reloadUntil ?? leaseAt + this.#leaseMs,
         }),
       });
+      // Maintenance is independent of publication: select before custody, then retain exact
+      // row-version CAS and the fresh lease condition for each bounded candidate at commit.
+      ops.push(...compactExpiredHostRecords({ listAll: prefix => this.mesh.listAllShared(prefix, read) },
+        this.mesh.root, this.options.hostId));
       let committedAt = 0;
       const results = await this.#withLeaseFence(() => this.mesh.writeBatch({ identity: this.options.identity, ops,
-        prepare: view => {
+        beforeCommit: () => {
           assertHostLeaseOwner(this.mesh.root, this.#leaseFenceOwner());
           this.#assertRootPublishable(statePuts.get(keyFor(PARTICIPANT_PREFIX, this.options.rootId)));
-          return compactExpiredHostRecords(view, this.mesh.root, this.options.hostId);
         },
         // In-process bookkeeping only (no view, no file): it needs no state custody, so it runs as the
         // commit hook, after COMMIT on every backend. As afterCommit it cost SQLite a second

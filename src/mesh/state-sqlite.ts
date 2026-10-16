@@ -28,7 +28,8 @@
  * retried ASYNCHRONOUSLY with short jittered sleeps capped at 4 ms, and the waiter joins the existing advisory
  * `MeshLockTicket` FIFO (keyed on `state.db`, separate from the `.lock` queue) after `fifoAfterMs` (default 25 ms).
  * The FIFO head waits inside SQLite's busy handler for HEAD_BUSY_MS (5 ms: node:sqlite runs it synchronously, so it
- * is an event-loop stall, kept within the existing busy_timeout clamp) and re-polls after 1 ms.
+ * is an event-loop stall, kept within the existing busy_timeout clamp) and re-polls after 1 ms. Ineligible non-heads
+ * wake on their predecessor's receipt removal, with a 20 ms safety net for missed events and stalled-head checks.
  * Mixed releases (smarty-dev#10516): the default is the contest of the releases before pi-fabric#936 (8d0af4b0),
  * 25 ms without a ticket and then the FIFO, so on a shared store a writer does no worse than they do. Strict FIFO
  * (smarty-dev#9805: with `fifoAfterMs: 0` a newcomer that finds anyone queued takes its ticket before its first
@@ -536,6 +537,48 @@ export interface SqliteStateChanges {
   changes: Array<{ commit: number; key: string; version: number; deleted: boolean }>;
 }
 
+type BatchConflictPolicy = "skip" | "abort" | ((current: MeshStateEntry | undefined) => "skip" | "abort");
+type CapturedBatchOperation =
+  | Readonly<{
+      index: number;
+      kind: "put";
+      key: string;
+      value: unknown | ((now: number) => unknown);
+      identity: MeshIdentity;
+      ifVersion: number | undefined;
+      onConflict: BatchConflictPolicy | undefined;
+      condition: undefined;
+    }>
+  | Readonly<{
+      index: number;
+      kind: "delete";
+      key: string;
+      value: undefined;
+      identity: undefined;
+      ifVersion: number | undefined;
+      onConflict: BatchConflictPolicy | undefined;
+      condition: ((current: (key: string) => MeshStateEntry | undefined) => boolean) | undefined;
+    }>;
+
+const snapshotBatchOperation = (operation: MeshBatchOperation, index: number,
+  batchIdentity: MeshIdentity): CapturedBatchOperation => {
+  const kind = operation.kind;
+  const key = operation.key;
+  const ifVersion = operation.ifVersion;
+  const onConflict = operation.onConflict;
+  if (kind === "put") {
+    const value = operation.value;
+    const identity = operation.identity ?? batchIdentity;
+    return Object.freeze({ index, kind, key, value, identity, ifVersion, onConflict, condition: undefined });
+  }
+  const condition = operation.condition;
+  return Object.freeze({ index, kind, key, value: undefined, identity: undefined, ifVersion, onConflict, condition });
+};
+
+const snapshotBatchOperations = (operations: readonly MeshBatchOperation[], batchIdentity: MeshIdentity,
+  offset = 0): CapturedBatchOperation[] => operations.map((operation, index) =>
+  snapshotBatchOperation(operation, offset + index, batchIdentity));
+
 const SCHEMA_VERSION = 1;
 const DEFAULT_MAX_STATE_BYTES = 32 * 1024 * 1024;
 const DEFAULT_MAX_STATE_TOMBSTONES = 1_000;
@@ -557,6 +600,8 @@ const WRITER_YIELD_BUDGET_MS = 250;
 // handler synchronously, so this blocks the event loop; 5 ms (the busy_timeout clamp) plus a 1 ms re-poll.
 const HEAD_BUSY_MS = 5;
 const HEAD_REPOLL_MS = 1;
+// Non-heads wake when their predecessor leaves at BEGIN; bounded safety net for missed events/stalled heads.
+const NONHEAD_REPOLL_MS = 20;
 // The dead-flag reclaim's claim file (removeDeadFlag) keeps its own, unchanged staleness.
 const CHECKPOINT_FLAG_CLAIM_STALE_MS = 1_000;
 // After a busy maintainer/emergency TRUNCATE this store makes no new attempt for this long (a maintainer: at most
@@ -1205,19 +1250,38 @@ export class SqliteStateStore {
     lockClass?: "bridge";
   }): Promise<MeshBatchResult[]> {
     const lockClass: MeshLockClass = input.lockClass === "bridge" ? "bridge" : "writeBatch";
-    for (const op of input.ops) validateMeshStateKey(op.key);
-    if (input.ops.length === 0 && !input.prepare && !input.afterCommit && !input.beforeCommit) return [];
+    const batchIdentity = input.identity;
+    const prepare = input.prepare;
+    const afterCommit = input.afterCommit;
+    const beforeCommit = input.beforeCommit;
+    // Snapshot every caller operation before any serialization. Later toJSON hooks may mutate
+    // the caller's operations or input.ops; the frozen descriptors are the only operations used below.
+    const callerOps = snapshotBatchOperations(input.ops, batchIdentity);
+    for (const op of callerOps) validateMeshStateKey(op.key);
+    if (callerOps.length === 0 && !prepare && !afterCommit && !beforeCommit) return [];
+    // Static, unconditional caller payloads are captured once. CAS puts are deliberately absent:
+    // their value (and identity) is captured only after the locked CAS decision, so skipped values
+    // never invoke toJSON.
+    const captured = new Map<CapturedBatchOperation, ReturnType<typeof captureStoragePut> | { error: unknown }>();
+    for (const op of callerOps) {
+      if (op.kind !== "put" || typeof op.value === "function" || op.ifVersion !== undefined) continue;
+      try { captured.set(op, captureStoragePut({ key: op.key, value: op.value, identity: op.identity }, this.maxEventBytes)); }
+      catch (error) { captured.set(op, { error }); }
+    }
     let committed: number | undefined;
     const results = await this.#write(lockClass, (tx) => {
-      if (input.beforeCommit) tx.beforeCommit = input.beforeCommit;
+      if (beforeCommit) tx.beforeCommit = beforeCommit;
       const view = this.#view();
       const started = performance.now();
-      const prepared = input.prepare?.(view) ?? [];
+      const prepared = prepare?.(view) ?? [];
       if (typeof (prepared as unknown as { then?: unknown }).then === "function") {
         throw new Error("Fabric mesh writeBatch prepare must be synchronous");
       }
       this.#stats.maxPrepareMs = Math.max(this.#stats.maxPrepareMs, performance.now() - started);
-      const ops = [...input.ops, ...prepared];
+      // Prepare is one phase: snapshot all generated descriptors before any value or identity
+      // serialization. Caller descriptors were captured before entering this transaction.
+      const preparedOps = snapshotBatchOperations(prepared, batchIdentity, callerOps.length);
+      const ops = callerOps.concat(preparedOps);
       for (const op of ops) validateMeshStateKey(op.key);
       const results: MeshBatchResult[] = [];
       const now = Date.now();
@@ -1234,12 +1298,14 @@ export class SqliteStateStore {
           results.push({ key: op.key, applied: false, version: slot.version });
           continue;
         }
-        const request = op.kind === "delete"
+        const ready = captured.get(op);
+        if (ready && "error" in ready) throw ready.error;
+        const request = ready ?? (op.kind === "delete"
           ? captureStorageDelete({ key: op.key, ifVersion: op.ifVersion })
           : captureStoragePut({
-            key: op.key, ifVersion: op.ifVersion, identity: op.identity ?? input.identity,
-            value: typeof op.value === "function" ? (op.value as (now: number) => unknown)(now) : op.value,
-          }, this.maxEventBytes);
+            key: op.key, ifVersion: op.ifVersion, identity: op.identity,
+            value: typeof op.value === "function" ? op.value(now) : op.value,
+          }, this.maxEventBytes));
         const plan = request.transition(slot.present, slot.version, tx.highWater);
         if (plan.kind === "unchanged") {
           results.push({ key: op.key, applied: false, version: slot.version });
@@ -1252,14 +1318,13 @@ export class SqliteStateStore {
       if (tx.changes.length > 0) committed = tx.commit + 1;
       // A write-free batch still validates external ownership before its legacy effect.
       // Run that effect on the exact snapshot, preserving the write-free contract.
-      else if (input.afterCommit) {
-        input.beforeCommit?.();
-        this.#timedAfterCommit(input.afterCommit, view);
+      else if (afterCommit) {
+        beforeCommit?.();
+        this.#timedAfterCommit(afterCommit, view);
       }
       return results;
     });
-    if (committed !== undefined && input.afterCommit) {
-      const afterCommit = input.afterCommit;
+    if (committed !== undefined && afterCommit) {
       this.#stats.afterCommitReacquired += 1;
       await this.#write(lockClass, (tx) => {
         if (tx.commit !== committed) this.#stats.afterCommitIntervened += 1;
@@ -1825,9 +1890,12 @@ export class SqliteStateStore {
           if (ticket) this.#stats.fifoJoins += 1;
         }
         const cap = Math.min(4, 2 ** Math.min(attempts - 1, 2));
-        // The FIFO head re-polls at once (it alone may contend); everyone else keeps the jittered sleep.
+        // The FIFO head re-polls at once; plain contenders keep their jittered sleep.
         const head = headWaitMs > 0;
-        await delay(Math.min(deadline - now, head ? HEAD_REPOLL_MS : cap * (0.5 + Math.random() / 2)), this.#signal);
+        // Only non-heads use ticket.wait: its head watcher expects a directory/.lock, not this state.db.
+        // Receipt removal is their normal wake; avoid every queued writer re-statting WAL/flags every 2..4 ms.
+        if (ticket && !eligible) await ticket.wait(Math.min(deadline - now, NONHEAD_REPOLL_MS), this.#signal);
+        else await delay(Math.min(deadline - now, head ? HEAD_REPOLL_MS : cap * (0.5 + Math.random() / 2)), this.#signal);
         if (yielding) yieldedMs += performance.now() - iteration;
       }
     } finally {

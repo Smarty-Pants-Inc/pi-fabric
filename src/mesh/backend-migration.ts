@@ -868,6 +868,9 @@ const fencedCutover = async (root: string, options: MeshBackendOptions): Promise
   root = path.resolve(root);
   if (!fs.statSync(root, { throwIfNoEntry: false })?.isDirectory()) throw new MeshBackendRefusedError(`No mesh root at ${root}`);
   return holdFence(root, options, async (lock) => {
+    // smarty-dev#9501: before beforeOpen and any database file, the receipt that lets the exact rerun of a killed
+    // import recover this fence (import-fence-receipt.ts). Lazy module; best effort, never changes the import.
+    await import("./import-fence-receipt.js").then(module => module.writeImportFenceReceipt(root), () => false);
     await options.beforeOpen?.();
     const census = await adviseCensus(options);
     const owned = pinImportRoot(root);

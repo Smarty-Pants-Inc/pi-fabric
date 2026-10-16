@@ -234,10 +234,11 @@ describe("#4383 resident host presence batch", () => {
     const key = participantKey(records[0]!.id);
     const before = readParticipantFile(config.meshRoot, key)!;
     const file = path.join(config.meshRoot, "participants", key.slice("topology/participants/".length) + ".json");
-    // Repair of a missing committed file must acquire this key BEFORE shared
-    // confirmation. A registry-only name edit does not update an owned actor,
-    // and an unchanged heartbeat correctly never visits its participant key.
-    fs.renameSync(file, `${file}.fixture-held`);
+    // The explicit round below tests custody, not the automatic heartbeat. Drain
+    // startup and suspend its timer so a slow Windows holder boot cannot consume
+    // the planted recovery before the observation starts.
+    host.participants.suspend();
+    await host.participants.refresh();
     const keyLock = path.join(config.meshRoot, "participants", ".locks", createHash("sha256").update(records[0]!.id).digest("hex"));
     const deadOwner = "2147483647\n\ndead-key\n";
     const deletedReceipts: string[] = [];
@@ -251,13 +252,17 @@ describe("#4383 resident host presence batch", () => {
         remove(target, options);
       });
     }
-    fs.mkdirSync(keyLock, { recursive: true });
-    fs.writeFileSync(path.join(keyLock, "owner"), deadOwner);
     const child = spawn(process.execPath, [path.resolve("tests/fixtures/hold-mesh-lock.mjs"), config.meshRoot, "3000"],
       { stdio: ["ignore", "pipe", "inherit"] });
     const exited = new Promise<number | null>((resolve, reject) => { child.once("error", reject); child.once("close", resolve); });
     try {
       await new Promise<void>((resolve, reject) => { child.stdout.once("data", () => resolve()); child.once("error", reject); });
+      // Inject only AFTER mesh custody is held, with no await before observing
+      // the repair: an earlier refresh could otherwise heal the missing file.
+      fs.renameSync(file, `${file}.fixture-held`);
+      expect(readParticipantFile(config.meshRoot, key)).toBeUndefined();
+      fs.mkdirSync(keyLock, { recursive: true });
+      fs.writeFileSync(path.join(keyLock, "owner"), deadOwner);
       const custody = host.mesh.custody.bind(host.mesh);
       const recovery = vi.spyOn(host.mesh, "custody").mockImplementationOnce((operation, timeout) => {
         expect(fs.readFileSync(path.join(keyLock, "owner"), "utf8")).toBe(deadOwner);

@@ -23,7 +23,8 @@ export const deliverRootInbox = (
     return true;
   });
   // Budget once across provenance splits. Overflow is only a pending summary, never queued
-  // work, delivery evidence or a wake cause. Actions bypass row/total limits, not per-event caps.
+  // work, delivery evidence or a wake cause. Actions bypass ordinary row/total limits, but share
+  // one rendered-action cap across every carrier (each carrier adds its own wrapper overhead).
   const { shown, overflow } = rootInboxBudget(events);
   events = shown;
   let start = 0;

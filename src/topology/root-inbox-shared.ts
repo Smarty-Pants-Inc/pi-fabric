@@ -22,12 +22,22 @@ const AGENT_MESSAGE_CUSTOM_TYPE = "pi-fabric-agent-message";
 export const INBOX_HORIZON_MS = 2 * 60 * 60_000;
 /**
  * One injection (R-token-waste): at most this many events are rendered in full, with at most this
- * much event text in total and per event. Action events bypass the row/total-text limits, but
- * retain the per-event cap. Overflow remains pending; a summary is never a delivery receipt.
+ * much event text in total and per event. Action events bypass the ordinary row/total-text limits,
+ * but retain the per-event cap and share a hard rendered-payload cap. Overflow remains pending;
+ * a summary is never a delivery receipt.
  */
 export const INBOX_INJECT_MAX_EVENTS = 8;
 export const INBOX_INJECT_MAX_TEXT_BYTES = 12 * 1024;
 export const INBOX_INJECT_EVENT_TEXT_BYTES = 4 * 1024;
+/**
+ * Per turn, all rendered action rows plus their newlines: XML expansion, metadata and cut notices
+ * count too. A conservative one-token/UTF-8-byte planning allowance is 131072 tokens: below half
+ * the configured Sol context (272000 tokens), not a tokenizer-independent guarantee. Bounds the
+ * incremental inbox burst, not arbitrary full-history/model-context usage; short bursts (including
+ * 230/236 actions) still fit. Carrier wrappers and
+ * summaries are separate.
+ */
+export const INBOX_INJECT_MAX_ACTION_RENDERED_BYTES = 128 * 1024;
 
 export interface RootInboxEvent extends MeshEvent {
   /** Shaped on drain only: old actionable work never requests a turn. */
@@ -356,6 +366,18 @@ const bounded = (text: string, sequence: number): string => {
   return `${cut}\n[cut at ${INBOX_INJECT_EVENT_TEXT_BYTES} bytes; read the whole event with mesh.read({ after: ${sequence - 1}, limit: 1 })]`;
 };
 
+const renderEvent = (event: MeshEvent): string => {
+  const data = (event.data && typeof event.data === "object" ? event.data : {}) as { ref?: unknown; key?: unknown };
+  const attributes = [
+    `id="${event.id}"`, `sequence="${event.sequence}"`, `topic="${escapeXml(event.topic)}"`, `kind="${escapeXml(event.kind)}"`,
+    `from_name=${JSON.stringify(event.from.name)}`, `from_id=${JSON.stringify(event.from.id)}`,
+    ...(typeof data.ref === "string" ? [`ref=${JSON.stringify(data.ref.slice(0, 256))}`] : []),
+    ...(typeof data.key === "string" ? [`key=${JSON.stringify(data.key.slice(0, 256))}`] : []),
+    `at="${new Date(event.createdAt).toISOString()}"`,
+  ];
+  return `<event ${attributes.join(" ")}>${escapeXml(bounded(event.text ?? "", event.sequence))}</event>`;
+};
+
 /** Shared internally with priority lookahead; ordinary durable admission stays bounded. */
 export const ROOT_INBOX_ACTION_KINDS = new Set(["blocked", "blocker", "ask", "handoff"]);
 const INBOX_PRIORITY = ["blocked", "blocker", "ask", "handoff", "done", "wait", "answer", "info", "progress", "status", "ack"];
@@ -368,12 +390,23 @@ export const compareRootInboxEvents = (a: MeshEvent, b: MeshEvent): number => {
   return rank(a.kind) - rank(b.kind) || a.createdAt - b.createdAt || a.sequence - b.sequence;
 };
 
-/** Overflow is withheld work, not a receipt. All action rows retain their per-event text cap. */
+/** Overflow is withheld work, not a receipt. Action overflow withholds the remaining action suffix. */
 export const rootInboxBudget = (events: readonly MeshEvent[]): { shown: MeshEvent[]; overflow: MeshEvent[] } => {
   const shown: MeshEvent[] = [], overflow: MeshEvent[] = [];
   let bytes = 0;
   let full = false;
+  let actionBytes = 0;
+  let actionsFull = false;
   for (const event of [...events].sort(compareRootInboxEvents)) {
+    if (ROOT_INBOX_ACTION_KINDS.has(event.kind)) {
+      const renderedBytes = Buffer.byteLength(renderEvent(event)) + 1; // The row's joining newline.
+      if (actionsFull || actionBytes + renderedBytes > INBOX_INJECT_MAX_ACTION_RENDERED_BYTES) {
+        actionsFull = true;
+        overflow.push(event);
+        continue;
+      }
+      actionBytes += renderedBytes;
+    }
     const size = Math.min(Buffer.byteLength(event.text ?? ""), INBOX_INJECT_EVENT_TEXT_BYTES);
     if (!ROOT_INBOX_ACTION_KINDS.has(event.kind) &&
       (full || shown.length >= INBOX_INJECT_MAX_EVENTS || (shown.length > 0 && bytes + size > INBOX_INJECT_MAX_TEXT_BYTES))) {
@@ -421,17 +454,7 @@ export const rootInboxMessage = (input: readonly MeshEvent[], extra?: readonly M
   content: [
     `<fabric-inbox count="${all.length}"${rest.length ? ` shown="${events.length}"` : ""}>`,
     "Work events addressed to you that no steer or follow-up delivered (a shadow copy can repeat a message you already saw):",
-    ...events.map((event) => {
-      const data = (event.data && typeof event.data === "object" ? event.data : {}) as { ref?: unknown; key?: unknown };
-      const attributes = [
-        `id="${event.id}"`, `sequence="${event.sequence}"`, `topic="${escapeXml(event.topic)}"`, `kind="${escapeXml(event.kind)}"`,
-        `from_name=${JSON.stringify(event.from.name)}`, `from_id=${JSON.stringify(event.from.id)}`,
-        ...(typeof data.ref === "string" ? [`ref=${JSON.stringify(data.ref.slice(0, 256))}`] : []),
-        ...(typeof data.key === "string" ? [`key=${JSON.stringify(data.key.slice(0, 256))}`] : []),
-        `at="${new Date(event.createdAt).toISOString()}"`,
-      ];
-      return `<event ${attributes.join(" ")}>${escapeXml(bounded(event.text ?? "", event.sequence))}</event>`;
-    }),
+    ...events.map(renderEvent),
     ...(rest.length ? [overflowLine(rest)] : []),
     "</fabric-inbox>",
   ].join("\n"),

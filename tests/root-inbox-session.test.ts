@@ -257,6 +257,138 @@ describe.skipIf(!built)("the root inbox in a real Pi session", () => {
     expect(ids()).toHaveLength(31);
   }, 60_000);
 
+  it("bounds an XML-heavy all-action backlog across a failed real turn without losing withheld rows (#12356)", async () => {
+    const { session, faux, inboxMessages, missedWork, meshRoot } = await start(100_000, false, { persisted: true });
+    session.setAutoRetryEnabled(false);
+    session.setAutoCompactionEnabled(false);
+    const shared = await import("../src/topology/root-inbox-shared.js");
+    const { MeshStore } = await import("../src/mesh/store.js");
+    const mesh = new MeshStore(meshRoot, 64 * 1024, 1_000);
+    const key = "topology/inbox/" + createHash("sha256").update(`session:${session.sessionManager.getSessionId()}`).digest("hex").slice(0, 32);
+    const input = Array.from({ length: 280 }, (_, index) => {
+      // Exactly 4 KiB before XML escaping; interleaving kinds defeats sequence-only ordering.
+      const prefix = `action-backlog-${index.toString().padStart(3, "0")}:`;
+      const text = prefix + "<>&".repeat(1_366).slice(0, 4 * 1024 - prefix.length);
+      // Mature missed work is past main's intentionally retained 60-second steer grace.
+      return missedWork(text, undefined, 120_000, ["handoff", "ask", "blocked"][index % 3]);
+    });
+    const inputSet = new Set<string>(input);
+    const events = mesh.read({ after: 0, limit: 1_000 }).filter(event => inputSet.has(event.id));
+    expect(events).toHaveLength(input.length);
+    const expected = [...events].sort(shared.compareRootInboxEvents).map(event => event.id);
+    const byId = new Map(events.map(event => [event.id, event]));
+    type Carrier = { content: string; details: { nonce: string; ids: string[]; receipts: string[] } };
+    const carriers = () => inboxMessages() as unknown as Carrier[];
+    const issuedIds = () => carriers().flatMap(carrier => carrier.details.ids);
+    // This fixture contains action events only. The budget covers the rendered event rows
+    // and their joining newlines, not carrier wrappers, overflow summaries or retained history.
+    const renderedRowBytes = (contents: readonly string[]) => contents.reduce((total, content) => total +
+      [...content.matchAll(/<event [\s\S]*?<\/event>\n/g)]
+        .reduce((sum, match) => sum + Buffer.byteLength(match[0]), 0), 0);
+    const snapshots: Array<{ context: string; contextCarriers: string[]; issued: Carrier[] }> = [];
+    let captured = 0;
+    const capture = (messages: readonly unknown[]) => {
+      const text = messages.flatMap(message => {
+        const content = (message as { content?: unknown }).content;
+        return typeof content === "string" ? [content] : Array.isArray(content)
+          ? content.flatMap(part => part?.type === "text" && typeof part.text === "string" ? [part.text] : []) : [];
+      });
+      const all = carriers();
+      snapshots.push({ context: JSON.stringify(messages), contextCarriers: text.filter(value => value.includes("<fabric-inbox ")),
+        issued: structuredClone(all.slice(captured)) });
+      captured = all.length;
+    };
+    try {
+      faux.setResponses([(context) => {
+        capture(context.messages);
+        return fauxAssistantMessage("failed after consuming only this bounded carrier", {
+          stopReason: "error", errorMessage: "test failure without automatic retry",
+        });
+      }]);
+      await session.prompt("show the oversized action backlog");
+      expect(snapshots).toHaveLength(1);
+      expect(session.messages.at(-1)).toMatchObject({
+        stopReason: "error", errorMessage: "test failure without automatic retry",
+      });
+      const first = snapshots[0]!;
+      const firstIds = first.issued.flatMap(carrier => carrier.details.ids);
+      const firstContextRowBytes = renderedRowBytes(first.contextCarriers);
+      const firstIssuedRowBytes = renderedRowBytes(first.issued.map(carrier => carrier.content));
+      // Measure action rows in the actual first model request, not rootInboxBudget's own
+      // predicted selection. No earlier inbox history exists in this first request.
+      // Keep the literal so the unfixed bundle fails on measured row bytes even before
+      // the sibling's new exported constant exists in this source-only regression seed.
+      expect(firstContextRowBytes).toBeGreaterThan(0);
+      expect(firstContextRowBytes).toBeLessThanOrEqual(128 * 1024);
+      expect(shared.INBOX_INJECT_MAX_ACTION_RENDERED_BYTES).toBe(128 * 1024);
+      expect(firstIssuedRowBytes).toBe(firstContextRowBytes);
+      expect(firstIssuedRowBytes).toBeLessThanOrEqual(shared.INBOX_INJECT_MAX_ACTION_RENDERED_BYTES);
+      expect(firstIds.length).toBeGreaterThan(0);
+      expect(firstIds.length).toBeLessThan(input.length);
+      expect(firstIds).toEqual(expected.slice(0, firstIds.length));
+      expect(issuedIds()).toEqual(firstIds);
+      const shown = new Set(firstIds);
+      const state = mesh.get(key, { fresh: true })!.value as {
+        after: number; ackedThrough?: number; acked?: Array<[string, number]>; delivered?: string[];
+      };
+      const durableAcks = new Set(state.acked?.map(([id]) => id));
+      const durableReceipts = new Set(state.delivered ?? []);
+      for (const event of events) {
+        const acknowledged = durableAcks.has(event.id) || event.sequence <= Math.max(state.after, state.ackedThrough ?? 0);
+        expect(acknowledged, event.id).toBe(shown.has(event.id));
+        for (const receipt of shared.eventReceipts(event)) {
+          expect(durableReceipts.has(receipt), receipt).toBe(shown.has(event.id));
+          if (!shown.has(event.id)) expect(JSON.stringify(first.issued)).not.toContain(receipt);
+        }
+        if (!shown.has(event.id)) {
+          expect(first.context).not.toContain(event.id);
+          expect(JSON.stringify(first.issued)).not.toContain(event.id);
+        }
+      }
+      // Continue the same persisted SDK session. Normal followUps may drain several batches
+      // inside one prompt; explicit later prompts also cover a settle that retains overflow.
+      faux.setResponses(Array.from({ length: input.length + 1 }, () => (context) => {
+        capture(context.messages);
+        return fauxAssistantMessage("read the next bounded batch");
+      }));
+      for (let turn = 0; issuedIds().length < input.length && turn < input.length; turn++) {
+        const before = issuedIds().length;
+        await session.prompt("resume retained action work");
+        expect(issuedIds().length).toBeGreaterThan(before);
+      }
+      expect(issuedIds()).toHaveLength(input.length);
+      expect(new Set(issuedIds()).size).toBe(input.length);
+      expect(new Set(issuedIds())).toEqual(inputSet);
+      for (const snapshot of snapshots) {
+        // Main's active-turn grace/pinned prefix can affect cross-turn order (#12773).
+        // Each actual offer still preserves the shared action priority and FIFO comparator.
+        const offered = snapshot.issued.flatMap(carrier => carrier.details.ids).map(id => byId.get(id)!);
+        expect(offered).toEqual([...offered].sort(shared.compareRootInboxEvents));
+        // Bound only the newly issued action rows; full context legitimately retains old rows.
+        expect(renderedRowBytes(snapshot.issued.map(carrier => carrier.content)))
+          .toBeLessThanOrEqual(shared.INBOX_INJECT_MAX_ACTION_RENDERED_BYTES);
+        for (const carrier of snapshot.issued) {
+          expect(carrier.details.nonce).toEqual(expect.any(String));
+          expect(snapshot.contextCarriers.some(text => text.includes(carrier.content))).toBe(true);
+          expect([...carrier.content.matchAll(/<event id="([^"]+)"/g)].map(match => match[1]))
+            .toEqual(carrier.details.ids);
+          expect(carrier.details.receipts).toEqual(carrier.details.ids.flatMap(id => shared.eventReceipts(byId.get(id)!)));
+        }
+      }
+      // Historical rows can remain in subsequent model contexts; exactly-once here means
+      // one issued, rendered delivery per input ID, not removal of legitimate conversation history.
+      const delivered = snapshots.flatMap(snapshot => snapshot.issued.flatMap(carrier => carrier.details.ids));
+      expect(delivered).toHaveLength(input.length);
+      expect(new Set(delivered)).toEqual(inputSet);
+      const before = snapshots.length;
+      faux.setResponses([(context) => { capture(context.messages); return fauxAssistantMessage("nothing repeated"); }]);
+      await session.prompt("check the drained backlog once more");
+      expect(snapshots).toHaveLength(before + 1);
+      expect(snapshots.at(-1)!.issued).toEqual([]);
+      expect(issuedIds()).toEqual(delivered);
+    } finally { mesh.closeState(); }
+  }, 60_000);
+
   it("reconciles 50 steer-driven turns inside one real run, without duplicate inbox IDs (#4313)", async () => {
     const { session, faux, inboxMessages, missedWork, meshRoot } = await start(100_000, false, { persisted: true });
     const { MeshStore } = await import("../src/mesh/store.js");

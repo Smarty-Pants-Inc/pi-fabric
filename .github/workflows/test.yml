@@ -404,7 +404,7 @@ jobs:
             tar -xzf "$archive"
           )
           echo "NATS_BIN=$stage/nats-server-v${version}-linux-amd64/nats-server" >> "$GITHUB_ENV"
-      - name: Hosted authenticated NATS T2/T8 and Path B grants (source CLI)
+      - name: Hosted authenticated NATS T2/T8, Path B grants and carrier conformance
         env:
           NATS_AUTH_REQUIRED: '1'
-        run: bunx vitest run tests/nats-auth-server.test.ts tests/nats-auth-path-b-*.test.ts --retry=0
+        run: FABRIC_TRANSPORT_HOSTED_PRESENCE_RESET=1 bunx vitest run tests/nats-auth-server.test.ts tests/nats-auth-path-b-*.test.ts tests/transport-conformance.test.ts tests/transport-faults/broker-inbox.test.ts tests/transport-faults/e14-control.test.ts tests/transport-faults/presence-leases.test.ts --retry=0 --cache=false

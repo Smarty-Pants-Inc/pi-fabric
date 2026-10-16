@@ -1,5 +1,5 @@
 // expected-skip: missing nats-server binary: authenticated real-broker coverage needs NATS_BIN.
-// Required: PI_FABRIC_NATS_REQUIRED=1. PI_FABRIC_REQUIRE_CP_B2=1 demands separate native B2 crash coverage.
+// Required: NATS_AUTH_REQUIRED=1 (or PI_FABRIC_NATS_REQUIRED=1). PI_FABRIC_REQUIRE_CP_B2=1 demands separate native B2 crash coverage.
 // Keep reason: data safety/trust boundary; real ack-deadline loss and process/server death.
 // These are CARRIER tests, not T-B2a/b/c or application exactly-once evidence.
 import { spawn, type ChildProcess } from "node:child_process";
@@ -30,7 +30,7 @@ import {
 import { launchLog, same, type LaunchLog, type Owned } from "../helpers/owned-processes.js";
 
 const binary = resolveNatsBinary(); // Invalid explicit NATS_BIN is an error, never a skip.
-const required = process.env.PI_FABRIC_NATS_REQUIRED === "1";
+const required = process.env.NATS_AUTH_REQUIRED === "1" || process.env.PI_FABRIC_NATS_REQUIRED === "1";
 const ACK_WAIT_MS = 2_000;
 const PRODUCTION_ACK_WAIT_MS = 30_000;
 const A_HOST = "runtime:broker-fault-a";

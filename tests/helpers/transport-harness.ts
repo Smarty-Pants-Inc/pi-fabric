@@ -667,7 +667,10 @@ export async function openRealAdapterPair(kind: "file" | "nats", required = fals
   // Import B's fixture only on actual NATS use; no state-backend/admin carrier is involved.
   const natsModule = kind === "nats" ? await import("./nats-cluster.js") : undefined;
   const binary = natsModule?.resolveNatsBinary();
-  if (kind === "nats" && !binary) return unavailable("Path B real-server prerequisite missing: set absolute NATS_BIN");
+  if (kind === "nats" && !binary) {
+    if (process.env.NATS_AUTH_REQUIRED === "1") throw new Error("NATS_AUTH_REQUIRED: Path B real-server prerequisite missing: set absolute NATS_BIN");
+    return unavailable("Path B real-server prerequisite missing: set absolute NATS_BIN");
+  }
   const [{ mkdtempSync, rmSync }, { tmpdir }, { join }, { DEFAULT_FABRIC_CONFIG }, { MeshStore }] = await Promise.all([
     import("node:fs"), import("node:os"), import("node:path"), import("../../src/config.js"), import("../../src/mesh/store.js"),
   ]);

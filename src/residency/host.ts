@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { fabricTurnProvenance, fabricWakeCause, copyFabricWakeCause, type FabricWakeCause, type FabricPrincipal } from "../fabric-provenance.js";
+import { diagnostics } from "../core/diagnostics.js";
 import { randomUUID } from "node:crypto";
 import { detachedPreview } from "../core/preview.js";
 import { resolveActorInstructions, assertActorInstructionReplacement } from "../actors/instructions-file.js";
@@ -82,6 +83,7 @@ import type { FabricActorInfo } from "../actors/types.js";
 import type { AgentRunRecord } from "../agents/types.js";
 import type { StateProjector } from "../mesh/state-projector.js";
 import { AgentManager } from "../agents/manager.js";
+import type { SpawnRouterAdmission } from "../agents/spawn-router.js";
 import { FabricTargetTerminalError, terminalRejectionFields, type AgentTerminalNotice } from "../agents/terminal-target.js";
 import { launchScope } from "../scope.js";
 import { useBudgetLedger } from "../agents/budget-ledger.js";
@@ -97,7 +99,7 @@ import { MeshConsumptionPausedError, assertMeshConsumption } from "../topology/m
 import { ParticipantDirectory } from "../topology/participant-directory.js";
 import type { FabricTransport } from "../transport/types.js";
 import { hostLeasePath, readHostLeaseCurrent } from "../topology/host-leases.js";
-import { RESIDENT_IDLE_EXIT_MS, FabricMeshTransportConfigError, validateFabricNatsOperatorMachine } from "../config.js";
+import { RESIDENT_IDLE_EXIT_MS, FabricMeshTransportConfigError, normalizeFabricConfig, validateFabricNatsOperatorMachine } from "../config.js";
 import { residentIdleExitPath, type ResidentIdleExit } from "./idle-exit.js";
 import { rootPresenceAlarms } from "../topology/stall-alarms.js";
 import { actorParticipantRecord, agentParticipantRecords } from "../topology/records.js";
@@ -286,6 +288,7 @@ export class ResidentHost {
   participants!: ParticipantDirectory;
   control!: FabricControlPlane;
   #transport: FabricTransport | undefined;
+  #transportAbort: AbortController | undefined;
   #controlInboxBound = false;
   agents!: AgentManager;
   actors!: ActorDirectory;
@@ -423,7 +426,7 @@ export class ResidentHost {
     // Follow moved-marker/meta authority even after a stale backend config re-apply.
     const stateBackend = meshStateBackendFromMarker(config.meshRoot, config.mesh.stateBackend);
     if (stateBackend === "sqlite" && stateBackend !== config.mesh.stateBackend) {
-      console.warn(`[pi-fabric] resident mesh ${config.meshRoot}: SQLite moved marker overrides mesh.stateBackend=${config.mesh.stateBackend}; opening sqlite`);
+      diagnostics.warn("src/residency/host.ts", `[pi-fabric] resident mesh ${config.meshRoot}: SQLite moved marker overrides mesh.stateBackend=${config.mesh.stateBackend}; opening sqlite`);
     }
     return new MeshStore(config.meshRoot, config.mesh.maxEventBytes, config.mesh.maxReadEvents,
       { backgroundReadCacheMs: config.mesh.idleReadCoalesceMs ?? RUNTIME_MESH_READ_CACHE_MS, lockProtocol: config.mesh.lockProtocol,
@@ -434,6 +437,11 @@ export class ResidentHost {
   async #prepareNatsTransport(): Promise<string> {
     // Direct ResidentHost callers do not necessarily pass through config normalization.
     if (this.config.mesh.hostTransport !== "nats") throw new FabricMeshTransportConfigError("nats", this.config.mesh.hostTransport ?? "file");
+    const normalized = normalizeFabricConfig({ mesh: this.config.mesh }).mesh;
+    // Environment resolution must never turn this NATS activation into FILE policy.
+    if (normalized.transport !== "nats") throw new FabricMeshTransportConfigError("nats", normalized.transport);
+    // Only messaging settings are normalized; retain every other raw host mesh setting.
+    this.config.mesh.nats = normalized.nats;
     validateFabricNatsOperatorMachine(this.config.mesh.nats.operatorMachine, this.config.mesh.nats.machine);
     this.mesh = this.#createMesh();
     const { resolveAgentDir } = await import("../core/agent-dir.js");
@@ -444,9 +452,17 @@ export class ResidentHost {
     }
     const { mkdirPrivate } = await import("../storage/private-dir.js");
     mkdirPrivate(transportStateDir);
+    const transportAbort = new AbortController();
+    this.#transportAbort = transportAbort;
     const { openFabricTransport } = await import("../transport/index.js");
     // NatsTransport.open awaits ensureTransportConsumer before returning (inbox.ts).
-    this.#transport = await openFabricTransport({ config: structuredClone(this.config.mesh), hostId: this.hostId, mesh: this.mesh });
+    const opened = await openFabricTransport({ config: structuredClone(this.config.mesh), hostId: this.hostId, mesh: this.mesh, signal: transportAbort.signal });
+    // A close while open was pending must not publish a late carrier.
+    if (transportAbort.signal.aborted) {
+      await opened.close();
+      transportAbort.signal.throwIfAborted();
+    }
+    this.#transport = opened;
     if (this.#transport.kind !== "nats" || this.#transport.self.hostId !== this.hostId) {
       throw new Error("Fabric NATS transport factory returned a different carrier or owner");
     }
@@ -517,7 +533,6 @@ export class ResidentHost {
       ...(transport ? { transport } : {}),
       ...(transportStateDir ? { transportStateDir } : {}),
       enabled: true,
-      renewActorParticipants: true,                            // host fence outlives its Main
       actorRenewalAllowed,
       preparePublicationFence: () => {
         const generations = registries.map(store => store.fingerprint());
@@ -555,6 +570,8 @@ export class ResidentHost {
       bridgeTimeoutMs: config.mesh.bridgeControlTimeoutMs,
       ...(transport ? { inboxLanes: config.mesh.nats.inboxLanes ?? 8,
         relayOperatorMachine: config.mesh.nats.operatorMachine } : {}),
+      ...(config.mesh.nats.machine !== undefined
+        ? { expectedNatsInboxStream: `FABRIC_IN_${config.mesh.nats.machine}` } : {}),
       ...(config.mesh.nats.rollbackHoldUntil !== undefined
         ? { withdrawHoldUntil: Date.parse(config.mesh.nats.rollbackHoldUntil) } : {}),
       canConsumeMesh: () => this.#ready && (transport ? participants : this.participants).canConsumeMesh(),
@@ -794,7 +811,7 @@ export class ResidentHost {
               this.#scheduleIdleCheck();
             } catch (error) {
               // Scheduling must not replace the original presence rejection.
-              console.warn(`[pi-fabric] resident idle check scheduling failed: ${String(error)}`);
+              diagnostics.warn("src/residency/host.ts", `[pi-fabric] resident idle check scheduling failed: ${String(error)}`);
             }
           }
         }, schedule: () => (transport ? participants : this.participants).scheduleRefresh() },
@@ -913,7 +930,7 @@ export class ResidentHost {
       try { await this.actors.recoverProtectedActors(); }
       catch (error) {
         if (!(error instanceof ActorSlotRecoveryParkedError)) throw error;
-        console.warn(`[pi-fabric] ${this.actors.slotRecoveryStatus().error?.message}`);
+        diagnostics.warn("src/residency/host.ts", `[pi-fabric] ${this.actors.slotRecoveryStatus().error?.message}`);
       }
       if (this.#staged) { this.#drainActors().pauseForRelease({ strict: true }); this.#drainAgents().pauseForRelease(true); }
       fs.mkdirSync(this.#requestsPath, { recursive: true, mode: 0o700 });
@@ -1042,7 +1059,7 @@ export class ResidentHost {
           await this.#recoverWakeBatch(this.#wakeRecovery.next());
         } catch (error) {
           this.#wakeRecovery?.close(); this.#wakeRecovery = undefined;
-          console.warn(`[pi-fabric] resident startup wake recovery deferred: ${String(error)}`);
+          diagnostics.warn("src/residency/host.ts", `[pi-fabric] resident startup wake recovery deferred: ${String(error)}`);
         }
       }
       // The originating client may cancel this owned attempt until it sees the
@@ -1129,10 +1146,10 @@ export class ResidentHost {
         await this.#recoverWakeBatch(batch);
       }
     } catch (error) {
-      console.warn(`[pi-fabric] resident startup wake recovery deferred: ${String(error)}`);
+      diagnostics.warn("src/residency/host.ts", `[pi-fabric] resident startup wake recovery deferred: ${String(error)}`);
     } finally {
       reader.close(); this.#wakeRecovery = undefined;
-      console.warn(`[pi-fabric] resident startup wake recovery: ${deferred} deferred entries processed after readiness; ${this.#wakeRecoveryIgnored} ignored (foreign, unmatched or not pending)`);
+      diagnostics.warn("src/residency/host.ts", `[pi-fabric] resident startup wake recovery: ${deferred} deferred entries processed after readiness; ${this.#wakeRecoveryIgnored} ignored (foreign, unmatched or not pending)`);
     }
   }
 
@@ -1166,22 +1183,25 @@ export class ResidentHost {
 
   async #closeWithTransport(): Promise<void> {
     const transport = this.#transport;
+    const transportAbort = this.#transportAbort;
     const control = this.control;
     const participants = this.participants;
-    if (transport) {
+    if (transport || transportAbort) {
       this.#controlInboxBound = false;
       control?.pause();
     }
     try { await this.#close(); }
     finally {
-      if (transport) {
-        // Partial startup and failed teardown retain this order before host custody release.
+      if (transport || transportAbort) {
+        // Partial startup (including rejected open) preserves withdrawal before abort.
         try {
           await control?.close().catch(() => undefined);
           await participants?.close().catch(() => undefined);
         } finally {
-          this.#transport = undefined;
-          try { await transport.close(); }
+          transportAbort?.abort();
+          if (this.#transportAbort === transportAbort) this.#transportAbort = undefined;
+          if (this.#transport === transport) this.#transport = undefined;
+          try { await transport?.close(); }
           finally { try { this.mesh?.closeState(); } finally { this.#releaseLock(); } }
         }
       }
@@ -1242,7 +1262,7 @@ export class ResidentHost {
           // so Windows can remove or migrate state.db once the host is gone (pi-fabric#640).
           try { this.mesh?.closeState(); } catch { /* best effort at teardown */ }
         }
-      } finally { if (!this.#transport) this.#releaseLock(); }
+      } finally { if (!this.#transport && !this.#transportAbort) this.#releaseLock(); }
     }
   }
 
@@ -1759,14 +1779,14 @@ export class ResidentHost {
       if (watcherError && !this.#wakeWatchReprobeUsed) {
         this.#wakeWatchReprobeUsed = true;
         this.#wakeWatchSupported = undefined;
-        console.warn(`[pi-fabric] resident dormancy watcher failed for ${this.config.residencyRoot}: ${String(error)}`);
+        diagnostics.warn("src/residency/host.ts", `[pi-fabric] resident dormancy watcher failed for ${this.config.residencyRoot}: ${String(error)}`);
         // An error event authorizes exactly one re-probe. Silent and synchronous
         // failures remain cached as unsupported for this process and root.
         this.#scheduleIdleCheck();
         return false;
       }
       this.#wakeWatchSupported = false;
-      console.warn(`[pi-fabric] resident dormancy disabled for ${this.config.residencyRoot}: ${String(error)}`);
+      diagnostics.warn("src/residency/host.ts", `[pi-fabric] resident dormancy disabled for ${this.config.residencyRoot}: ${String(error)}`);
       return false;
     }
   }
@@ -1775,7 +1795,7 @@ export class ResidentHost {
   #hasWakeConfig(): boolean {
     const saved = readWakeJson<ResidentHostConfig>(path.join(this.config.residencyRoot, "config.json"));
     if (residentWakeConfigMatches(saved, this.config)) return true;
-    console.warn(`[pi-fabric] resident dormancy disabled: restart config differs or is unreadable for ${this.config.residencyRoot}`);
+    diagnostics.warn("src/residency/host.ts", `[pi-fabric] resident dormancy disabled: restart config differs or is unreadable for ${this.config.residencyRoot}`);
     return false;
   }
 
@@ -1793,7 +1813,7 @@ export class ResidentHost {
     if (available) this.#wakeCapacityWarned = false;
     else if (!this.#wakeCapacityWarned) {
       this.#wakeCapacityWarned = true;
-      console.warn(`[pi-fabric] resident dormancy deferred: wake capacity (${RESIDENT_WAKE_INDEX_MAX_ROOTS}) full or unavailable; staying resident for ${this.config.residencyRoot}`);
+      diagnostics.warn("src/residency/host.ts", `[pi-fabric] resident dormancy deferred: wake capacity (${RESIDENT_WAKE_INDEX_MAX_ROOTS}) full or unavailable; staying resident for ${this.config.residencyRoot}`);
     }
     return available;
   }
@@ -1962,7 +1982,7 @@ export class ResidentHost {
         pid: process.pid, token: this.#token, at: now, idleMs };
       atomicWrite(residentIdleExitPath(this.config.residencyRoot), marker);
       this.#idleExitRequested = true;
-      console.error(`resident exiting: root dead, no actors, idle ${Math.round(idleMs / 6_000) / 10} min`);
+      diagnostics.error("src/residency/host.ts", `resident exiting: root dead, no actors, idle ${Math.round(idleMs / 6_000) / 10} min`);
       this.onIdle("idle-exit"); // runResidentHost joins close(): withdraw lease/owner, then release the host fence.
       return;
     }
@@ -2265,7 +2285,7 @@ export class ResidentHost {
       outcome, code, reason, at: terminalAt, ...(!this.#closed && !resumeFailed ? { resumedAt: terminalAt } : {}),
       admissionHeld: this.#closed || resumeFailed, terminal: true };
     try { writeResidentDrainReceipt(this.config.residencyRoot, held.receipt); }
-    catch (error) { console.error(`[pi-fabric] resident drain terminal receipt unavailable: ${errorMessage(error)}`); }
+    catch (error) { diagnostics.error("src/residency/host.ts", `[pi-fabric] resident drain terminal receipt unavailable: ${errorMessage(error)}`); }
     this.#idleSince = Date.now();
     if (!this.#closed) { try { this.#armScheduleWake(this.mesh.nextScheduleDueAt()); } catch { /* durable schedule remains upstream */ } }
     this.#scheduleIdleCheck();
@@ -2648,9 +2668,24 @@ export class ResidentHost {
         : Math.max(Date.now(), residentRequestGeneration(command.requestId) ?? 0) };
   }
 
+  async #routerAdmission(command: ResidentCommand): Promise<SpawnRouterAdmission | undefined> {
+    if (command.operation !== "spawnBound" && command.operation !== "createActor") return undefined;
+    const decisionId = (command.request as { spawnRouterDecisionId?: unknown }).spawnRouterDecisionId;
+    if (typeof decisionId !== "string" || !decisionId) return undefined;
+    try {
+      const caller = command.operation === "spawnBound" ? command.caller : command.routerCaller;
+      const participant = caller && this.participants.get(caller.id, Date.now(), { fresh: true });
+      const { authenticatedSpawnRouterAdmission } = await import("../agents/spawn-router.js");
+      return authenticatedSpawnRouterAdmission(this.mesh, caller, participant, this.config.rootId, this.hostId,
+        command.operation === "spawnBound" ? "spawn" : "actor");
+    } catch { return undefined; } // Attribution never supplies launch authority or a new launch veto.
+  }
+
   async #executeRequest(command: ResidentCommand, boundaryAdmitted?: () => void): Promise<ResidentCommandResponse> {
     const requestId = command.requestId;
     let response: ResidentCommandResponse;
+    const routerAdmission = await this.#routerAdmission(command);
+    let routerHandedOff = false;
     try {
       await testResidentRequestDelay("before_commit");
       if (command.operation !== "releaseDrain") this.#businessAdmissions++;
@@ -2680,7 +2715,8 @@ export class ResidentHost {
         const caller = command.caller;
         const returnAddress = assertResidentTaskCaller(caller,
           caller && this.participants.get(caller.id, Date.now(), { fresh: true }), this.config.rootId);
-        const handle = await this.agents.spawn({ ...command.request, residency: "durable" }, undefined, undefined, commit, undefined, undefined, undefined, returnAddress);
+        routerHandedOff = true;
+        const handle = await this.agents.spawn({ ...command.request, residency: "durable" }, undefined, undefined, commit, undefined, undefined, undefined, returnAddress, routerAdmission);
         // spawn already validated the forwarded scope; record what the child received.
         const scope = launchScope(command.request.scope, command.request.inheritedScope);
         const runDirectory = this.agents.runDirectory(handle.id);
@@ -2750,10 +2786,12 @@ export class ResidentHost {
         if (protectedCreate) this.#authorizeResidentSetter(command.caller);
         const { instructionsFile: _file, sha256: _digest, idempotencyKey: _requestKey, ...base } = command.request;
         const instructions = resolveActorInstructions(command.request, this.config.agents.instructionsRoot);
+        routerHandedOff = true;
         const actor = await this.actors.create({ ...base, instructions,
           ...(command.idempotencyKey === undefined ? {} : { idempotencyKey: command.idempotencyKey }),
         }, {
           asRegistryOwner: true,
+          ...(routerAdmission ? { routerAdmission } : {}),
           ...(command.caller ? { supervisorOwner: command.caller.identity } : {}),
           beforeCommit: id => {
             if (protectedCreate || command.caller) this.#authorizeResidentSetter(command.caller);
@@ -2871,6 +2909,16 @@ export class ResidentHost {
         response = await pending;
       }
     } catch (error) {
+      if (!routerHandedOff && (command.operation === "spawnBound" || command.operation === "createActor")) {
+        const decisionId = (command.request as { spawnRouterDecisionId?: unknown }).spawnRouterDecisionId;
+        if (typeof decisionId === "string" && decisionId) {
+          try {
+            const { recordSpawnRouterStartFailed } = await import("../agents/spawn-router.js");
+            await recordSpawnRouterStartFailed({ meshRoot: this.mesh.root, decisionId, admission: routerAdmission,
+              spawnKind: command.operation === "spawnBound" ? "spawn" : "actor", request: command.request, cwd: this.config.cwd });
+          } catch { /* Attribution is advisory, not a replacement for the native error. */ }
+        }
+      }
       const drain = command.operation === "releaseDrain" ? this.#drainRefusal(command, error) : undefined;
       let slotFailure = residentSlotErrorFields(error);
       if (command.operation === "createActor" && (residentCreateMayBeProtected(command) ||

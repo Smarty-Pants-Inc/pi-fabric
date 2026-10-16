@@ -1,12 +1,53 @@
+import { diagnostics } from "../core/diagnostics.js";
 import { execFile, spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { constants } from "node:fs";
+import { constants, realpathSync } from "node:fs";
 import { lstat, mkdir, open, rename } from "node:fs/promises";
 import { hostname } from "node:os";
 import path from "node:path";
 import { readPiSessionHeader } from "../core/pi-session-header.js";
 import { isFabricThinking, type FabricThinking } from "../thinking.js";
 import type { FabricAgentRouterConfig } from "./router-config.js";
+import type { MeshStore, MeshIdentity } from "../mesh/store.js";
+import type { FabricParticipantInfo } from "../topology/types.js";
+import type { ResidentRouterCaller } from "../residency/protocol.js";
+import type { AgentsProvider } from "../providers/agents-provider.js";
+import type { FabricInvocationContext } from "../protocol.js";
+import type { AgentRunRequest } from "./types.js";
+import type { FabricAgentRunner } from "../config.js";
+import { resolveAvailablePiModel } from "../core/model-resolution.js";
+
+/** Native-only authority. Never copy this from a creation request or action arguments. */
+export interface SpawnRouterAdmission {
+  mesh: MeshStore;
+  requesterSessionId: string;
+  role: string;
+  targetRootId: string;
+  targetHostId: string;
+}
+
+interface AdmissionRequest {
+  model?: string | undefined;
+  thinking?: FabricThinking | undefined;
+  runner?: string | undefined;
+  name?: string | undefined;
+  cwd?: string | undefined;
+  residency?: AgentRunRequest["residency"] | undefined;
+  task?: string | undefined;
+  instructions?: string | undefined;
+  sha256?: string | undefined;
+}
+
+/** Build attribution authority only from a directory-validated resident caller. */
+export const authenticatedSpawnRouterAdmission = (mesh: MeshStore, caller: ResidentRouterCaller | undefined,
+  participant: FabricParticipantInfo | undefined, rootId: string, hostId: string, kind: "spawn" | "actor"): SpawnRouterAdmission | undefined => {
+  if (!caller || !participant || participant.stale || participant.remoteHost !== undefined ||
+    participant.id !== caller.id || participant.rootId !== rootId || caller.rootId !== rootId ||
+    !caller.sessionId || participant.sessionId !== caller.sessionId || participant.kind !== caller.kind ||
+    participant.ownerHostId !== caller.ownerHostId || participant.ownerIdentityId !== caller.ownerIdentityId) return undefined;
+  return { mesh, requesterSessionId: participant.sessionId!, role: participant.role ?? (kind === "actor" ? "actor" : "task-agent"),
+    targetRootId: rootId, targetHostId: hostId };
+};
 
 export interface SpawnRouterBinding { model?: string; thinking: FabricThinking }
 export interface SpawnRouterResult extends SpawnRouterBinding {
@@ -28,10 +69,18 @@ export interface SpawnRouterStartOptions {
   launch?: { runId: string | null; pid: number | null; processStartTime: string | null };
   verified?: boolean;
   evidenceRef?: string | null;
+  /** Separate native caller snapshot, not fields on the task/actor request. */
+  admission?: SpawnRouterAdmission | undefined;
+  spawnKind?: "spawn" | "actor" | undefined;
+  request?: AdmissionRequest | undefined;
+  /** Native manager's base cwd; task cwd is resolved relative to it. */
+  cwd?: string | undefined;
 }
 
 /** Fixed, privacy-safe code used when admission created no started record. */
 export const SPAWN_ROUTER_START_FAILED = "start-failed";
+/** Fixed, privacy-safe code used when native launch custody is unresolved. */
+export const SPAWN_ROUTER_START_UNKNOWN = "start-unknown";
 export interface SpawnRouterRequest {
   kind: "spawn" | "actor";
   role: string;
@@ -50,6 +99,84 @@ export interface SpawnRouterRequest {
 
 const digest = (text: string): string => createHash("sha256").update(text).digest("hex");
 const MAX_OUTPUT_BYTES = 64 * 1024;
+// decisions/ is host-internal: the public mesh provider forbids put/delete here.
+const ADMISSION_PREFIX = "decisions/spawn-router/admissions/";
+const ADMISSION_TTL_MS = 10 * 60_000;
+const MAX_ADMISSIONS = 4096;
+const DECISION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$(?![\s\S])/;
+const admissionIdentity: MeshIdentity = { id: "spawn-router", name: "Spawn router", kind: "agent" };
+const admissionValid = (admission: SpawnRouterAdmission | undefined): admission is SpawnRouterAdmission =>
+  !!admission && !!admission.mesh && typeof admission.mesh.root === "string" && typeof admission.mesh.writeBatch === "function" &&
+  [admission.requesterSessionId, admission.role, admission.targetRootId, admission.targetHostId]
+    .every(value => typeof value === "string" && value.length > 0);
+const canonicalCwd = (cwd: string): string => {
+  try { return realpathSync(cwd); } catch { return path.resolve(cwd); }
+};
+const admissionDigest = (admission: SpawnRouterAdmission, kind: "spawn" | "actor", request: AdmissionRequest, cwd: string): string =>
+  digest(JSON.stringify({ requesterSessionId: admission.requesterSessionId, targetRootId: admission.targetRootId,
+    targetHostId: admission.targetHostId, role: admission.role, kind,
+    // Omitted durable cwd belongs to the resident, not the caller's base directory.
+    // Keep omission distinct from every explicit cwd; local defaults still bind the base.
+    cwd: request.residency === "durable" && request.cwd === undefined ? null
+      : canonicalCwd(kind === "spawn" ? path.resolve(cwd, request.cwd ?? ".") : cwd),
+    model: request.model?.trim() || null, thinking: request.thinking ?? null, runner: request.runner ?? null,
+    name: request.name?.trim() ?? null,
+    taskDigest: kind === "spawn" ? digest(request.task ?? "")
+      : request.instructions !== undefined ? digest(request.instructions) : request.sha256 ?? null }));
+
+const issueAdmission = async (decisionId: string, admission: SpawnRouterAdmission | undefined,
+  kind: "spawn" | "actor", request: AdmissionRequest | undefined, cwd: string): Promise<void> => {
+  if (!admissionValid(admission) || !request) return;
+  const binding = admissionDigest(admission, kind, request, cwd);
+  await admission.mesh.writeBatch({ identity: admissionIdentity, ops: [], prepare: view => {
+    const now = Date.now();
+    const entries = view.listAll(ADMISSION_PREFIX);
+    const expired = entries.filter(entry => {
+      const value = entry.value as { expiresAt?: unknown } | null;
+      return typeof value?.expiresAt === "number" && value.expiresAt <= now;
+    });
+    if (entries.length - expired.length >= MAX_ADMISSIONS) throw new Error("admission-unavailable");
+    return [...expired.map(entry => ({ kind: "delete" as const, key: entry.key, ifVersion: entry.version })),
+      { kind: "put" as const, key: `${ADMISSION_PREFIX}${decisionId}`, ifVersion: 0,
+        value: { format: 1, decisionId, binding, state: "issued", issuedAt: now, expiresAt: now + ADMISSION_TTL_MS } }];
+  } });
+};
+
+/** The existing mesh transaction/CAS is the sole consume fence, across processes/backends. */
+type AttributionRefusal = "decision-unknown" | "decision-replayed" | "decision-mismatch";
+const consumeAdmission = async (options: Pick<SpawnRouterStartOptions, "meshRoot" | "decisionId" | "admission" | "spawnKind" | "request" | "cwd">): Promise<AttributionRefusal | undefined> => {
+  const { admission, decisionId, spawnKind, request, cwd } = options;
+  if (!DECISION_ID.test(decisionId) || admission === undefined) return "decision-unknown";
+  if (!admissionValid(admission) || !spawnKind || !request || cwd === undefined ||
+    canonicalCwd(admission.mesh.root) !== canonicalCwd(options.meshRoot)) return "decision-mismatch";
+  let binding: string;
+  try { binding = admissionDigest(admission, spawnKind, request, cwd); }
+  catch { return "decision-mismatch"; }
+  try {
+    let expiresAt = 0;
+    let refusal: AttributionRefusal = "decision-unknown";
+    const results = await admission.mesh.writeBatch({ identity: admissionIdentity, ops: [], prepare: view => {
+      expiresAt = 0;
+      refusal = "decision-unknown";
+      const key = `${ADMISSION_PREFIX}${decisionId}`;
+      const entry = view.get(key);
+      const value = entry?.value as Record<string, unknown> | undefined;
+      const now = Date.now();
+      if (!entry || entry.updatedBy.id !== admissionIdentity.id || !value || value.format !== 1 || value.decisionId !== decisionId ||
+        typeof value.issuedAt !== "number" || typeof value.expiresAt !== "number" ||
+        !Number.isSafeInteger(value.issuedAt) || !Number.isSafeInteger(value.expiresAt) || value.issuedAt < 0 ||
+        value.issuedAt > now || value.expiresAt <= now || value.expiresAt <= value.issuedAt ||
+        value.expiresAt - value.issuedAt > ADMISSION_TTL_MS) return [];
+      if (value.state === "consumed") { refusal = "decision-replayed"; return []; }
+      if (value.state !== "issued" || value.binding !== binding) { refusal = "decision-mismatch"; return []; }
+      expiresAt = value.expiresAt;
+      return [{ kind: "put", key, ifVersion: entry.version, value: { ...value, state: "consumed" } }];
+    }, beforeCommit: () => {
+      if (expiresAt && Date.now() >= expiresAt) throw new Error("admission-expired");
+    } });
+    return results.length === 1 && results[0]?.applied === true ? undefined : refusal;
+  } catch { return "decision-unknown"; } // Unavailable authority can never attribute success.
+};
 
 const routerEnv = (): NodeJS.ProcessEnv => {
   const env: NodeJS.ProcessEnv = { PATH: "/usr/bin:/bin" };
@@ -133,8 +260,11 @@ const appendStartRecord = async (meshRoot: string, record: Record<string, unknow
   }
 };
 
-/** Append the applied binding after its agent/actor record exists. */
+/** Append the applied binding only after this exact native admission wins consumption. */
 export const recordSpawnRouterStart = async (options: SpawnRouterStartOptions): Promise<void> => {
+  if (!options.decisionId) return;
+  const refusal = await consumeAdmission(options);
+  if (refusal) { await recordAttributionRefused(options, refusal); return; }
   let sessionId = options.sessionId;
   if (options.sessionFile) {
     try { sessionId = readPiSessionHeader(options.sessionFile)?.id ?? sessionId; } catch { /* No native session yet. */ }
@@ -148,13 +278,38 @@ export const recordSpawnRouterStart = async (options: SpawnRouterStartOptions): 
   });
 };
 
-/** Append one fixed, task-free failure when admission did not create a record. */
-export const recordSpawnRouterStartFailed = async (options: Pick<SpawnRouterStartOptions, "meshRoot" | "decisionId">): Promise<void> => {
+const recordAttributionRefused = async (options: Pick<SpawnRouterStartOptions, "meshRoot" | "decisionId">, error: AttributionRefusal): Promise<void> => {
+  await appendStartRecord(options.meshRoot, { ts: new Date().toISOString(), kind: "start-refused",
+    decisionId: DECISION_ID.test(options.decisionId) ? options.decisionId : null,
+    agentId: null, sessionId: null, launch: { runId: null, pid: null, processStartTime: null },
+    host: hostname(), model: null, thinking: null, verified: false, evidenceRef: null, error });
+};
+
+/** Provider retains this custody until publication; failures consume the same admission. */
+export const recordSpawnRouterStartFailed = async (options: Pick<SpawnRouterStartOptions,
+  "meshRoot" | "decisionId" | "admission" | "spawnKind" | "request" | "cwd">): Promise<void> => {
+  if (!options.decisionId) return;
+  const refusal = await consumeAdmission(options);
+  if (refusal) { await recordAttributionRefused(options, refusal); return; }
   await appendStartRecord(options.meshRoot, {
     ts: new Date().toISOString(), kind: "start-failed", decisionId: options.decisionId,
     agentId: null, sessionId: null, launch: { runId: null, pid: null, processStartTime: null },
     host: hostname(), model: null, thinking: null, verified: false, evidenceRef: null,
     error: SPAWN_ROUTER_START_FAILED,
+  });
+};
+
+/** A native launch may have started a worker without returning a confirmable handle. */
+export const recordSpawnRouterStartUnknown = async (options: Pick<SpawnRouterStartOptions,
+  "meshRoot" | "decisionId" | "admission" | "spawnKind" | "request" | "cwd">): Promise<void> => {
+  if (!options.decisionId) return;
+  const refusal = await consumeAdmission(options);
+  if (refusal) { await recordAttributionRefused(options, refusal); return; }
+  await appendStartRecord(options.meshRoot, {
+    ts: new Date().toISOString(), kind: "start-unknown", decisionId: options.decisionId,
+    agentId: null, sessionId: null, launch: { runId: null, pid: null, processStartTime: null },
+    host: hostname(), model: null, thinking: null, verified: false, evidenceRef: null,
+    error: SPAWN_ROUTER_START_UNKNOWN,
   });
 };
 
@@ -257,11 +412,19 @@ export const routeAgentCreation = async (options: {
   defaults: SpawnRouterBinding;
   explicit: boolean;
   validateModel: (model: string) => string;
+  /** Host-only native target/caller plus the actual prepared request (including seed text). */
+  admission?: SpawnRouterAdmission;
+  admissionRequest?: AdmissionRequest;
+  /** Base cwd before resolving a relative request.cwd (not the selected router cwd). */
+  admissionCwd?: string;
   signal?: AbortSignal;
 }): Promise<SpawnRouterResult | undefined> => {
   const config = options.config;
   const mode = config.mode ?? "off";
   if (mode !== "shadow" && mode !== "enforce") return undefined;
+  const admission = options.admission && { ...options.admission };
+  const admissionRequest = options.admissionRequest && { ...options.admissionRequest };
+  const admissionCwd = options.admissionCwd ?? options.cwd;
   // Keep the config normalizer out of this lazy entry: sharing a tiny runtime
   // helper creates another chunk in every host's eager static closure.
   const timeoutMs = typeof config.timeoutMs === "number" && Number.isFinite(config.timeoutMs)
@@ -310,6 +473,10 @@ export const routeAgentCreation = async (options: {
     }
   }
   const decisionId = randomUUID();
+  try {
+    await issueAdmission(decisionId, admission, options.kind,
+      admissionRequest && { ...admissionRequest, ...selected }, admissionCwd);
+  } catch { console.warn("[pi-fabric] spawn router admission unavailable"); }
   const decision = {
     ts: new Date().toISOString(), decisionId, kind: "decision", spawnKind: request.kind, mode, commandDigest,
     decision: options.explicit ? "explicit" : selected ? "enforce" : "default",
@@ -322,11 +489,54 @@ export const routeAgentCreation = async (options: {
     await writeDecision(dir, `${JSON.stringify(decision)}\n`);
   } catch {
     // A read-only/full mesh must not change launch selection or fail the spawn.
-    console.warn("[pi-fabric] spawn router decision log unavailable");
+    diagnostics.warn("src/agents/spawn-router.ts", "[pi-fabric] spawn router decision log unavailable");
   }
   const binding: SpawnRouterBinding = {
     ...(actual.model ? { model: actual.model } : {}),
     thinking: actual.thinking,
   };
   return { ...binding, decisionId, ...(selected ? { selected } : {}) };
+};
+
+/** Keep provider routing/identity preparation out of the eager registration graph. */
+export const routeProviderCreation = async <T extends AdmissionRequest & {
+  runner?: FabricAgentRunner; complexity?: AgentRunRequest["complexity"]; residency?: AgentRunRequest["residency"];
+}>(provider: AgentsProvider, kind: "spawn" | "actor", args: Record<string, unknown>, request: T,
+  context: FabricInvocationContext): Promise<{ request: T; admission: SpawnRouterAdmission } | undefined> => {
+  const config = provider.manager.config.router;
+  if (config?.mode !== "shadow" && config?.mode !== "enforce") return undefined;
+  const self = provider.participants.self();
+  request = { ...request };
+  // Copy the trusted runtime identity ONCE, before cwd/router awaits. Never use action arguments.
+  const admission: SpawnRouterAdmission = { mesh: provider.actorManager.mesh,
+    requesterSessionId: self.sessionId ?? context.extensionContext.sessionManager?.getSessionId() ?? "",
+    role: self.role ?? (kind === "actor" ? "actor" : "task-agent"), targetRootId: self.rootId,
+    targetHostId: request.residency === "durable" ? `resident:${digest(self.rootId).slice(0, 24)}`
+      : provider.manager.runtimeHostId ?? (provider.mainAgent.local ? provider.mainAgent.id : "") };
+  const runner = request.runner ?? provider.manager.config.runner;
+  const defaultModel = request.model ?? provider.manager.defaultModel(runner);
+  const selected = await routeAgentCreation({ config, meshRoot: admission.mesh.root, kind, role: admission.role,
+    ...(request.name !== undefined ? { name: request.name } : {}),
+    cwd: kind === "spawn" ? await provider.manager.resolveCwd(request.cwd, context.signal) : provider.manager.cwd,
+    project: self.projectRoot ?? self.project ?? provider.manager.cwd,
+    ...(kind === "spawn" ? { task: String(args.task) }
+      : typeof args.instructions === "string" ? { task: args.instructions }
+      : typeof args.sha256 === "string" ? { taskDigest: args.sha256 } : {}),
+    parentId: self.id, defaults: { ...(defaultModel ? { model: defaultModel } : {}), thinking: request.thinking ?? provider.manager.config.thinking },
+    admission, admissionRequest: request, admissionCwd: provider.manager.cwd,
+    ...(request.complexity ? { complexity: request.complexity } : {}),
+    explicit: (typeof args.model === "string" && !!args.model.trim()) || args.thinking !== undefined,
+    validateModel: model => {
+      provider.manager.assertModelAllowed(model, runner);
+      if (runner !== "pi" && model === provider.manager.defaultModel(runner)) return model;
+      const resolved = resolveAvailablePiModel(model, { aliases: provider.modelsConfig().aliases,
+        available: context.extensionContext.modelRegistry.getAvailable().map(model => ({ provider: String(model.provider), id: String(model.id) })),
+        exact: true, closest: false });
+      const canonical = `${resolved.provider}/${resolved.id}`;
+      provider.manager.assertModelAllowed(canonical, runner);
+      return canonical;
+    }, ...(context.signal ? { signal: context.signal } : {}) });
+  if (!selected) return undefined;
+  return { admission, request: { ...request, ...selected.selected, spawnRouterDecisionId: selected.decisionId,
+    ...(kind === "spawn" && request.residency !== "durable" ? { meshRoot: admission.mesh.root } : {}) } };
 };

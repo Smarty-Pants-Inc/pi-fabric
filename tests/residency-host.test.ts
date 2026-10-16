@@ -1,4 +1,4 @@
-import { beforeEach } from "vitest";
+import { afterEach, beforeEach } from "vitest";
 import { installInProcessResidentFence } from "./helpers/in-process-resident-fence.js";
 import fs from "node:fs";
 import os from "node:os";
@@ -7,11 +7,12 @@ import { describe, expect, it, vi } from "vitest";
 import { ActorRegistryStore } from "../src/actors/registry-store.js";
 import { ActorLogStore } from "../src/actors/log-store.js";
 import { ACTOR_RETENTION_BATCH_SIZE } from "../src/actors/manager.js";
-import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
+import { DEFAULT_FABRIC_CONFIG, FabricMeshNatsConfigError, normalizeFabricConfig } from "../src/config.js";
 import { execFileSync, spawn } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { routeAgentCreation } from "../src/agents/spawn-router.js";
 import { projectOf, repositoryOf } from "../src/topology/project-identity.js";
-import { residentDeliveryPrefix, residentRoot } from "../src/residency/protocol.js";
+import { residentDeliveryPrefix, residentRoot, type ResidentRouterCaller } from "../src/residency/protocol.js";
 import type { FabricParticipantRecord } from "../src/topology/types.js";
 import { removeParticipantFileIf, writeParticipantFile } from "../src/topology/participant-files.js";
 import { LIVENESS_POLICY_KEY } from "../src/topology/host-leases.js";
@@ -52,6 +53,77 @@ const fixture = (retention: Partial<ResidentHostConfig["retention"]> = {}, canon
   const host = new ResidentHost(config, idle);
   return { root, config, host, idle };
 };
+
+// Audit P P2: the public resident config boundary must enforce the shared NATS policy.
+describe("direct resident NATS config boundary", () => {
+  beforeEach(() => installInProcessResidentFence(true));
+  const direct = () => {
+    const f = fixture();
+    for (const key of ["PI_FABRIC_MESH_NATS", "PI_FABRIC_MESH_TRANSPORT", "PI_FABRIC_MESH_HOST_TRANSPORT"]) vi.stubEnv(key, undefined);
+    vi.stubEnv("PI_CODING_AGENT_DIR", path.join(f.root, "agent"));
+    f.config.mesh = { ...f.config.mesh, transport: "nats", hostTransport: "nats", maxEventBytes: 777,
+      nats: { replicas: 1, machine: "direct-host", operatorMachine: "fabric-ops",
+        servers: "tls://nats.example.invalid:4222", custodyStream: "DIRECT_CUSTODY", livenessStream: "DIRECT_LIVENESS",
+        pathBMachines: ["direct-host"], tls: { caFile: path.join(f.root, "unread-ca.pem") } } };
+    return f;
+  };
+
+  it.each(["relative caFile", "missing tls", "numeric IP", "missing policy field"] as const)("refuses %s with the normalizer's typed error before factory entry", async defect => {
+    const f = direct();
+    const nats = f.config.mesh.nats;
+    if (defect === "relative caFile") nats.tls = { caFile: "relative.pem" };
+    if (defect === "missing tls") delete nats.tls;
+    if (defect === "numeric IP") nats.servers = "tls://127.0.0.1:4222";
+    if (defect === "missing policy field") delete nats.custodyStream;
+    let expected: unknown;
+    try { normalizeFabricConfig({ mesh: f.config.mesh }); } catch (error) { expected = error; }
+    expect(expected).toBeInstanceOf(FabricMeshNatsConfigError);
+    const transport = await import("../src/transport/index.js");
+    const open = vi.spyOn(transport, "openFabricTransport").mockRejectedValue(new Error("unexpected direct factory entry"));
+    const host = new ResidentHost(f.config);
+    try {
+      await expect(host.start()).rejects.toMatchObject({ name: (expected as Error).name,
+        message: (expected as Error).message, code: "FABRIC_MESH_TRANSPORT_CONFIG", field: (expected as FabricMeshNatsConfigError).field });
+      expect(open).not.toHaveBeenCalled();
+      expect(host.agents).toBeUndefined();
+    } finally {
+      await host.close(); await f.host.close(); open.mockRestore(); vi.unstubAllEnvs();
+      fs.rmSync(f.root, { recursive: true, force: true });
+    }
+  });
+
+  it("normalizes valid raw NATS at the actual factory seam without aliasing input or changing other mesh values", async () => {
+    const f = direct();
+    const input = structuredClone(f.config);
+    const expected = normalizeFabricConfig({ mesh: f.config.mesh }).mesh.nats;
+    const sentinel = new Error("direct NATS normalized factory sentinel (before KV)");
+    const transport = await import("../src/transport/index.js");
+    const open = vi.spyOn(transport, "openFabricTransport").mockRejectedValue(sentinel);
+    const host = new ResidentHost(f.config);
+    // Mutation after construction cannot change the NATS activation snapshot.
+    f.config.mesh.nats.pathBMachines!.push("caller-mutated");
+    try {
+      await expect(host.start()).rejects.toBe(sentinel);
+      expect(open).toHaveBeenCalledOnce();
+      const options = open.mock.calls[0]![0];
+      expect(options.config).toEqual({ ...input.mesh, nats: expected });
+      expect(options.config.nats.servers).toEqual(["tls://nats.example.invalid:4222"]);
+      expect(options.config.nats.inboxLanes).toBe(8);
+      expect(options.config).not.toBe(host.config.mesh);
+      expect(options.config.nats).not.toBe(host.config.mesh.nats);
+      expect(options.config.nats.tls).not.toBe(host.config.mesh.nats.tls);
+      expect(options.config.nats.pathBMachines).not.toBe(host.config.mesh.nats.pathBMachines);
+      options.config.nats.pathBMachines!.push("factory-mutated");
+      expect(host.config.mesh.nats.pathBMachines).toEqual(["direct-host"]);
+      expect(f.config.mesh.nats.servers).toBe(input.mesh.nats.servers);
+      expect(f.config.mesh.nats.pathBMachines).toEqual(["direct-host", "caller-mutated"]);
+      expect(options.signal?.aborted).toBe(true);
+    } finally {
+      await host.close(); await f.host.close(); open.mockRestore(); vi.unstubAllEnvs();
+      fs.rmSync(f.root, { recursive: true, force: true });
+    }
+  });
+});
 
 describe("watchdog custody at host admission", () => {
   it("refuses custody before initialization and releases the acquired host fence", async () => {
@@ -271,6 +343,270 @@ describe("verified resident supervisor creation (#7452)", () => {
       fs.rmSync(root, { recursive: true, force: true });
     }
   });
+});
+
+describe("resident actor spawn router attribution", () => {
+  let current: ReturnType<typeof fixture>;
+  let mesh: MeshStore;
+  let participants: ParticipantDirectory;
+  let client: ResidentActorClient;
+  let caller: ResidentRouterCaller;
+  let otherCaller: ResidentRouterCaller;
+  let publishedSessionId: string;
+  const binding = { model: "fixture/visible", thinking: "medium" as const };
+  const request = () => ({ name: "router-bound", instructions: "Private durable actor instructions.",
+    residency: "durable" as const, ...binding });
+  const ledger = (): Array<Record<string, unknown>> => {
+    const file = path.join(current.config.meshRoot, "router", "decisions.jsonl");
+    return fs.existsSync(file) ? fs.readFileSync(file, "utf8").trim().split("\n").map(line => JSON.parse(line)) : [];
+  };
+  const issue = async (creation: ReturnType<typeof request>) => {
+    const { config, host } = current;
+    const role = participants.get(caller.id, Date.now(), { fresh: true })?.role ?? "actor";
+    // Explicit routing issues the real persisted admission without starting a policy process.
+    const routed = await routeAgentCreation({ config: { command: [], mode: "shadow" }, meshRoot: config.meshRoot,
+      kind: "actor", role, name: creation.name, cwd: config.cwd, project: config.projectRoot,
+      task: creation.instructions, parentId: caller.id, defaults: binding, explicit: true,
+      validateModel: model => model,
+      admission: { mesh, requesterSessionId: caller.sessionId, role,
+        targetRootId: config.rootId, targetHostId: host.hostId },
+      admissionRequest: creation, admissionCwd: config.cwd });
+    expect(routed).toBeDefined();
+    return { ...creation, spawnRouterDecisionId: routed!.decisionId };
+  };
+  const expectRefused = (entry: Record<string, unknown>, decisionId: string, error?: string) => {
+    expect(entry).toEqual({ ts: expect.any(String), kind: "start-refused", decisionId,
+      agentId: null, sessionId: null, launch: { runId: null, pid: null, processStartTime: null },
+      host: os.hostname(), model: null, thinking: null, verified: false, evidenceRef: null,
+      error: error ?? expect.stringMatching(/^decision-(unknown|mismatch)$/) });
+  };
+
+  beforeEach(async () => {
+    current = fixture({}, true);
+    const { root, config, host } = current;
+    config.cwd = root; config.projectRoot = root;
+    config.agents = { ...config.agents, ...binding, budgetUsd: 0 };
+    config.mesh = { ...config.mesh, idleReadCoalesceMs: 60_000 };
+    config.piModels = { available: [{ provider: "fixture", id: "visible" }], aliases: {}, defaultModel: binding.model };
+    fs.writeFileSync(path.join(config.residencyRoot, "config.json"), JSON.stringify(config));
+    const identity = { id: config.rootId, name: "Main", kind: "main" as const, sessionId: config.sessionId };
+    mesh = new MeshStore(config.meshRoot, 65536, 1000);
+    participants = new ParticipantDirectory(mesh, {
+      enabled: true, hostId: config.rootId, rootId: config.rootId, identity,
+    });
+    publishedSessionId = config.sessionId;
+    caller = { id: config.rootId, rootId: config.rootId, sessionId: config.sessionId,
+      ownerHostId: config.rootId, ownerIdentityId: config.rootId, kind: "root" };
+    otherCaller = { ...caller, id: "b".repeat(32), sessionId: "review-other", kind: "agent" };
+    participants.registerSource(() => [{
+      format: 1, id: config.rootId, kind: "root", rootId: config.rootId,
+      ownerHostId: config.rootId, ownerIdentityId: config.rootId, name: "Main", status: "idle",
+      residency: "session", runner: "pi", transport: "host", capabilities: [],
+      sessionId: publishedSessionId, startedAt: Date.now(), updatedAt: Date.now(), controlProtocol: "v1",
+    }, {
+      ...otherCaller, format: 1, name: "Other caller", status: "idle", residency: "session",
+      runner: "pi", transport: "process", capabilities: [], startedAt: Date.now(), updatedAt: Date.now(), controlProtocol: "v1",
+    }]);
+    client = new ResidentActorClient(config.meshRoot, config.rootId, 5_000);
+    await participants.start(); await host.start();
+  });
+
+  afterEach(async () => {
+    try { await current?.host.close(); }
+    finally {
+      try { await participants?.close(); }
+      finally { mesh?.closeState(); if (current) fs.rmSync(current.root, { recursive: true, force: true }); }
+    }
+  });
+
+  it("attributes one real durable birth and refuses a consumed ID on a different allowed actor", async () => {
+    const { host } = current;
+    const creation = await issue(request());
+    const first = await client.createActor(creation, undefined, undefined, undefined, caller);
+    expect(await client.actorStatus(first.id)).toMatchObject({ id: first.id, residency: "durable", status: "idle", ...binding });
+    expect(host.actors.owns(first.id)).toBe(true);
+    const key = `decisions/spawn-router/admissions/${creation.spawnRouterDecisionId}`;
+    expect(mesh.get(key, { fresh: true })?.value).toMatchObject({ state: "consumed" });
+    const second = await client.createActor({ ...creation, name: "router-replay" }, undefined, undefined, undefined, caller);
+    expect(second.id).not.toBe(first.id);
+    // Native dormancy may park an idle birth before this read; neither state launches inference.
+    expect(await client.actorStatus(second.id)).toMatchObject({ residency: "durable", status: expect.stringMatching(/^(idle|dormant)$/), ...binding });
+    expect(host.actors.owns(second.id)).toBe(true);
+    const log = ledger();
+    expect(log).toHaveLength(3);
+    expect(log.map(entry => entry.kind)).toEqual(["decision", "start", "start-refused"]);
+    expect(log[1]).toEqual({ ts: expect.any(String), kind: "start", decisionId: creation.spawnRouterDecisionId,
+      agentId: first.id, sessionId: null, launch: { runId: null, pid: null, processStartTime: null },
+      host: os.hostname(), ...binding, verified: false, evidenceRef: null });
+    expectRefused(log[2]!, creation.spawnRouterDecisionId, "decision-replayed");
+    expect(JSON.stringify(log)).not.toContain(creation.instructions);
+    expect(host.agents.listForUi()).toEqual([]);
+  });
+
+  it.each(["missing", "other-live-caller", "id", "sessionId", "rootId", "ownerHostId", "ownerIdentityId", "kind", "fresh-directory"] as const)(
+    "refuses %s caller attribution without burning the original valid admission", async fault => {
+      const { config, host } = current;
+      const creation = await issue(request());
+      const key = `decisions/spawn-router/admissions/${creation.spawnRouterDecisionId}`;
+      let supplied: ResidentRouterCaller | undefined = { ...caller };
+      let restoreDirectory: (() => void) | undefined;
+      if (fault === "missing") supplied = undefined;
+      else if (fault === "other-live-caller") {
+        supplied = { ...otherCaller };
+        expect(host.participants.get(supplied.id, Date.now(), { fresh: true })).toMatchObject(supplied);
+      } else if (fault === "kind") supplied.kind = "agent";
+      else if (fault !== "fresh-directory") supplied[fault] = `${supplied[fault]}-forged`;
+      else {
+        // Prime the receiver's list cache, then replace only the participant file:
+        // no shared-state signal can invalidate it on the receiver's behalf.
+        expect(host.participants.list({ scope: "project", fresh: true }).find(row => row.id === caller.id)?.sessionId).toBe(caller.sessionId);
+        const hash = createHash("sha256").update(caller.id).digest("hex");
+        const file = path.join(config.meshRoot, "participants", `${hash}.json`);
+        const original = fs.readFileSync(file, "utf8");
+        const entry = JSON.parse(original);
+        publishedSessionId = `${caller.sessionId}-replaced`;
+        entry.updatedAt += 1_000; entry.value.sessionId = publishedSessionId;
+        fs.writeFileSync(`${file}.new`, JSON.stringify(entry)); fs.renameSync(`${file}.new`, file);
+        restoreDirectory = () => { publishedSessionId = caller.sessionId; fs.writeFileSync(file, original); };
+        expect(host.participants.list({ scope: "project" }).find(row => row.id === caller.id)?.sessionId).toBe(caller.sessionId);
+      }
+      let unAttributed: Awaited<ReturnType<typeof client.createActor>>;
+      try {
+        unAttributed = await client.createActor(creation, undefined, undefined, undefined, supplied);
+        expect(await client.actorStatus(unAttributed.id)).toMatchObject({ residency: "durable", status: "idle", ...binding });
+        const refused = ledger();
+        expect(refused).toHaveLength(2);
+        expect(refused.map(entry => entry.kind)).toEqual(["decision", "start-refused"]);
+        expectRefused(refused[1]!, creation.spawnRouterDecisionId, fault === "other-live-caller" ? "decision-mismatch" : undefined);
+        expect(mesh.get(key, { fresh: true })?.value).toMatchObject({ state: "issued" });
+      } finally { restoreDirectory?.(); }
+      // Reuse the SAME issuance and body; remove only the idle fixture actor to
+      // release its name. A different body would not prove caller binding.
+      await client.removeActor(unAttributed.id);
+      const valid = await client.createActor(creation, undefined, undefined, undefined, caller);
+      expect(host.actors.owns(valid.id)).toBe(true);
+      expect(valid.id).not.toBe(unAttributed.id);
+      expect(mesh.get(key, { fresh: true })?.value).toMatchObject({ state: "consumed" });
+      const log = ledger();
+      expect(log).toHaveLength(3);
+      expect(log.map(entry => entry.kind)).toEqual(["decision", "start-refused", "start"]);
+      expect(log[2]).toMatchObject({ decisionId: creation.spawnRouterDecisionId, agentId: valid.id, ...binding });
+      expect(JSON.stringify(log)).not.toContain(creation.instructions);
+    },
+  );
+
+  it("refuses an unknown ID while the real receiver still creates the allowed actor", async () => {
+    const decisionId = randomUUID();
+    const creation = { ...request(), spawnRouterDecisionId: decisionId };
+    const actor = await client.createActor(creation, undefined, undefined, undefined, caller);
+    expect(await client.actorStatus(actor.id)).toMatchObject({ residency: "durable", status: "idle", ...binding });
+    const log = ledger();
+    expect(log).toHaveLength(1);
+    expectRefused(log[0]!, decisionId, "decision-unknown");
+    expect(mesh.get(`decisions/spawn-router/admissions/${decisionId}`, { fresh: true })).toBeUndefined();
+  });
+
+  it.each([false, true])("keeps a no-ID durable creation unchanged (router caller=%s)", async supplied => {
+    const actor = await client.createActor(request(), undefined, undefined, undefined, supplied ? caller : undefined);
+    expect(await client.actorStatus(actor.id)).toMatchObject({ residency: "durable", status: "idle", ...binding });
+    expect(current.host.actors.owns(actor.id)).toBe(true);
+    expect(ledger()).toEqual([]);
+    expect(mesh.listAll("decisions/spawn-router/admissions/", { fresh: true })).toEqual([]);
+  });
+});
+
+describe("resident default cwd attribution", () => {
+  it("attributes omitted durable cwd from a Main subdir while refusing an explicit cwd change", async () => {
+    const { root, config, host } = fixture({}, true);
+    const mainCwd = path.join(root, "subdir");
+    fs.mkdirSync(mainCwd);
+    const binding = { model: "fixture/visible", thinking: "medium" as const };
+    config.cwd = root; config.projectRoot = root;
+    config.workerPath = path.resolve("tests/fixtures/fake-worker.mjs");
+    config.agents = { ...config.agents, ...binding, budgetUsd: 0, maxConcurrent: 1,
+      transport: "process", extensions: false, sessionExport: false };
+    config.piModels = { available: [{ provider: "fixture", id: "visible" }], aliases: {}, defaultModel: binding.model };
+    fs.writeFileSync(path.join(config.residencyRoot, "config.json"), JSON.stringify(config));
+    const { AgentManager } = await import("../src/agents/manager.js");
+    const mainManager = new AgentManager(mainCwd, config.agents, {
+      runRoot: path.join(root, "main-runs"), meshRoot: config.meshRoot, workerPath: config.workerPath,
+      mainAgentId: config.rootId, hostId: config.rootId, identityId: config.rootId,
+    });
+    const identity = { id: config.rootId, name: "Main", kind: "main" as const, sessionId: config.sessionId };
+    const mesh = new MeshStore(config.meshRoot, 65536, 1000);
+    const participants = new ParticipantDirectory(mesh, {
+      enabled: true, hostId: config.rootId, rootId: config.rootId, identity,
+    });
+    const caller: ResidentRouterCaller = { id: config.rootId, rootId: config.rootId, sessionId: config.sessionId,
+      ownerHostId: config.rootId, ownerIdentityId: config.rootId, kind: "root" };
+    participants.registerSource(() => [{
+      ...caller, format: 1, name: "Main", status: "idle", residency: "session", runner: "pi", transport: "host",
+      cwd: mainManager.cwd, capabilities: [], startedAt: Date.now(), updatedAt: Date.now(), controlProtocol: "v1",
+    }]);
+    const client = new ResidencyClient({ config, mesh, participants, commandTimeoutMs: 5_000,
+      mainAgent: { id: config.rootId, local: true } as FabricMainAgentTarget });
+    const actors = new ResidentActorClient(config.meshRoot, config.rootId, 5_000);
+    const ledger = (): Array<Record<string, unknown>> => fs.readFileSync(path.join(config.meshRoot, "router", "decisions.jsonl"), "utf8")
+      .trim().split("\n").map(line => JSON.parse(line));
+    const issue = async (kind: "spawn" | "actor", request: {
+      name: string; task?: string; instructions?: string; cwd?: string; residency: "durable";
+      model: string; thinking: "medium";
+    }) => {
+      const role = kind === "spawn" ? "task-agent" : "actor";
+      const routed = await routeAgentCreation({ config: { command: [], mode: "shadow" }, meshRoot: config.meshRoot,
+        kind, role, name: request.name, cwd: kind === "spawn" ? await mainManager.resolveCwd(request.cwd) : mainManager.cwd,
+        project: root, task: request.task ?? request.instructions ?? "", parentId: caller.id, defaults: binding,
+        explicit: true, validateModel: model => model,
+        admission: { mesh, requesterSessionId: caller.sessionId, role, targetRootId: config.rootId, targetHostId: host.hostId },
+        admissionRequest: request, admissionCwd: mainManager.cwd });
+      expect(routed).toBeDefined();
+      return routed!.decisionId;
+    };
+    try {
+      await participants.start(); await host.start();
+      expect(mainManager.cwd).toBe(mainCwd);
+      expect(host.agents.cwd).toBe(root);
+      const task = { name: "default-cwd-task", task: "Private durable cwd fixture task.", residency: "durable" as const, ...binding };
+      const taskDecision = await issue("spawn", task);
+      const routedTask = { ...task, spawnRouterDecisionId: taskDecision };
+      const launched = await client.spawnAgent(routedTask);
+      expect(await host.agents.wait(launched.id)).toMatchObject({ status: "completed", cwd: fs.realpathSync(root) });
+      const actor = { name: "default-cwd-actor", instructions: "Private idle cwd fixture actor.", residency: "durable" as const, ...binding };
+      const actorDecision = await issue("actor", actor);
+      const routedActor = { ...actor, spawnRouterDecisionId: actorDecision };
+      const created = await actors.createActor(routedActor, undefined, undefined, undefined, caller);
+      expect(await actors.actorStatus(created.id)).toMatchObject({ residency: "durable", status: expect.stringMatching(/^(idle|dormant)$/), ...binding });
+      expect(host.actors.owns(created.id)).toBe(true);
+      // Idle actor participants do not publish cwd; their native manager owns it.
+      expect(host.actors.agents.cwd).toBe(root);
+      for (const [decisionId, agentId] of [[taskDecision, launched.id], [actorDecision, created.id]]) {
+        const outcomes = ledger().filter(entry => entry.decisionId === decisionId && entry.kind !== "decision");
+        expect(outcomes).toHaveLength(1);
+        expect(outcomes[0]).toMatchObject({ kind: "start", decisionId, agentId, ...binding });
+        expect(mesh.get(`decisions/spawn-router/admissions/${decisionId}`, { fresh: true })?.value).toMatchObject({ state: "consumed" });
+      }
+      expect(ledger().some(entry => entry.kind === "start-refused")).toBe(false);
+      // Explicit cwd still binds its canonical location, even for a durable task.
+      const explicit = { ...task, name: "explicit-cwd-task", cwd: mainCwd };
+      const explicitDecision = await issue("spawn", explicit);
+      const changedRequest = { ...explicit, cwd: root, spawnRouterDecisionId: explicitDecision };
+      const changed = await client.spawnAgent(changedRequest);
+      expect(await host.agents.wait(changed.id)).toMatchObject({ status: "completed", cwd: fs.realpathSync(root) });
+      expect(ledger().filter(entry => entry.decisionId === explicitDecision && entry.kind !== "decision"))
+        .toEqual([expect.objectContaining({ kind: "start-refused", error: "decision-mismatch" })]);
+      expect(mesh.get(`decisions/spawn-router/admissions/${explicitDecision}`, { fresh: true })?.value).toMatchObject({ state: "issued" });
+      const validRequest = { ...explicit, spawnRouterDecisionId: explicitDecision };
+      const valid = await client.spawnAgent(validRequest);
+      expect(await host.agents.wait(valid.id)).toMatchObject({ status: "completed", cwd: fs.realpathSync(mainCwd) });
+      expect(ledger().filter(entry => entry.decisionId === explicitDecision && entry.kind === "start"))
+        .toEqual([expect.objectContaining({ agentId: valid.id, ...binding })]);
+      expect(JSON.stringify(ledger())).not.toContain(task.task);
+      expect(JSON.stringify(ledger())).not.toContain(actor.instructions);
+    } finally {
+      await client.close(); await mainManager.close(); await host.close(); await participants.close();
+      mesh.closeState(); fs.rmSync(root, { recursive: true, force: true });
+    }
+  }, 20_000);
 });
 
 describe("resident maintenance readiness attachment", () => {

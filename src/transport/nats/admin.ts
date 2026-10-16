@@ -1,5 +1,6 @@
 import { existsSync, openSync, closeSync, fsyncSync, readFileSync, writeSync } from "node:fs";
-import { openNatsConnection } from "./connection.js";
+import { isAbsolute } from "node:path";
+import { openBootstrapNatsConnection, openNatsConnection, type NatsPermissionPolicy } from "./connection.js";
 import { consumeDeadLetters, ensureDeadLetterConsumer, type DeadLetterEnvelope, type DeadLetterSink } from "./dead-letter.js";
 import { openNatsKv } from "./kv.js";
 import { ensureTransportStream, type TransportStreamPolicy } from "./provision.js";
@@ -38,6 +39,24 @@ const machinesArg = (args: readonly string[]): string[] => {
   const machines = value.split(",").map((machine) => validateMachine(machine.trim()));
   if (machines.length === 0 || new Set(machines).size !== machines.length) throw new Error("machines must be unique");
   return machines;
+};
+
+/** Expected #1276 policy for verified admin connections. Values are validated by openNatsConnection (mint validators). */
+const policyFromEnv = (args: readonly string[]): NatsPermissionPolicy => ({
+  custodyStream: requiredEnv("PI_FABRIC_NATS_CUSTODY_STREAM"),
+  livenessStream: requiredEnv("PI_FABRIC_NATS_LIVENESS_STREAM"),
+  pathBMachines: machinesArg(args),
+});
+
+/** Optional explicit CA path; connection.ts owns TLS validation and transport policy. */
+const caFileArg = (args: readonly string[]): { readonly tls?: { readonly caFile: string } } => {
+  const index = args.indexOf("--ca-file");
+  if (index < 0) return {};
+  if (args.lastIndexOf("--ca-file") !== index) throw new Error("--ca-file must not be specified more than once");
+  const caFile = args[index + 1];
+  if (!caFile || caFile.startsWith("--")) throw new Error("--ca-file requires an absolute path");
+  if (!isAbsolute(caFile)) throw new Error("--ca-file must be an absolute path");
+  return { tls: { caFile } };
 };
 
 const operatorMachineArg = (args: readonly string[]): string => {
@@ -80,15 +99,13 @@ const jsonLineSink = (file: string): DeadLetterSink => {
 };
 
 async function provision(args: readonly string[]): Promise<void> {
-  const machine = validateMachine(requiredEnv("PI_FABRIC_MACHINE"));
   const machines = machinesArg(args);
-  const connection = await openNatsConnection({
+  // Separate bootstrap authority is intentionally broader than machine runtime credentials.
+  const connection = await openBootstrapNatsConnection({
     servers: requiredEnv("PI_FABRIC_NATS_SERVERS"),
     credentials: requiredEnv("PI_FABRIC_NATS_CREDENTIALS"),
-    machine,
     name: "fabric-transport-admin",
-    // Separate bootstrap authority is intentionally broader than machine runtime credentials.
-    verifyMachine: false,
+    ...caFileArg(args),
   });
   try {
     // This is deliberately first: advisories are otherwise lost before the operator consumer exists.
@@ -113,7 +130,9 @@ async function drain(args: readonly string[]): Promise<void> {
     servers: requiredEnv("PI_FABRIC_NATS_SERVERS"),
     credentials: requiredEnv("PI_FABRIC_NATS_CREDENTIALS"),
     machine,
+    ...policyFromEnv(args),
     name: "fabric-transport-admin-drain",
+    ...caFileArg(args),
   });
   try {
     const info = await connection.manager.consumers.info(transportInboxStream(machine), transportDurableName(hostId));
@@ -142,7 +161,10 @@ async function orphan(args: readonly string[]): Promise<void> {
     servers: requiredEnv("PI_FABRIC_NATS_SERVERS"),
     credentials: requiredEnv("PI_FABRIC_NATS_CREDENTIALS"),
     machine,
+    role: "operator",
+    ...policyFromEnv(args),
     name: "fabric-transport-admin-orphan-report",
+    ...caFileArg(args),
   });
   try {
     const stream = transportInboxStream(targetMachine);
@@ -167,7 +189,10 @@ async function dlq(args: readonly string[]): Promise<void> {
     servers: requiredEnv("PI_FABRIC_NATS_SERVERS"),
     credentials: requiredEnv("PI_FABRIC_NATS_CREDENTIALS"),
     machine,
+    role: "operator",
+    ...policyFromEnv(args),
     name: "fabric-transport-admin-dlq",
+    ...caFileArg(args),
   });
   const controller = new AbortController();
   const stop = (): void => controller.abort();
@@ -192,11 +217,12 @@ async function dlq(args: readonly string[]): Promise<void> {
 }
 
 export async function runTransportAdmin(args: readonly string[]): Promise<number> {
+  if (args.includes("--allow-insecure-loopback")) throw new Error("--allow-insecure-loopback is not supported");
   const [command] = args;
   if (command === "provision") await provision(args);
   else if (command === "drain") await drain(args);
   else if (command === "orphan") await orphan(args);
   else if (command === "dlq") await dlq(args);
-  else throw new Error("usage: fabric-transport-admin provision|dlq|drain|orphan");
+  else throw new Error("usage: fabric-transport-admin provision|dlq|drain|orphan [--ca-file <absolute path>]");
   return 0;
 }

@@ -1,5 +1,6 @@
 import { appendDeliveryOutcome, deliverySend, hasDeliveryOutcome, type DeliverySend, type DeliveryOutcome, type DeliveryOutcomeRecord } from "../mesh/delivery-outcomes.js";
 import { childProcessEnvironment } from "../core/atomic-write.js";
+import { diagnostics } from "../core/diagnostics.js";
 import { copyFabricProvenance, fabricTurnProvenance, fabricWakeCause, type FabricTurnProvenance, type FabricPrincipal } from "../fabric-provenance.js";
 import { eventReceipts, workKey } from "../topology/root-inbox-shared.js";
 import type { ImageContent } from "@earendil-works/pi-ai";
@@ -32,6 +33,7 @@ import { PARTICIPANT_NAME_PATTERN as ACTOR_NAME_PATTERN } from "../topology/part
 import { AgentLaunchPreparationTimeoutError, AgentManager } from "../agents/manager.js";
 import type { AgentRunRecord, AgentRunRequest, AgentRunResult } from "../agents/types.js";
 import type { ModelRouteDecision } from "../agents/model-route.js";
+import type { SpawnRouterAdmission } from "../agents/spawn-router.js";
 
 import { readJsonlPage } from "../log-tail.js";
 import { ActorChildCompletionStore, ActorChildCompletionWatch, ChildCompletionClaimLostError } from "./child-completions.js";
@@ -338,10 +340,6 @@ export const meshRetentionSweepArgs = (meshRoot: string, runsOlderThanMs: number
   [meshRoot, "--dry-run", "--runs-older-than", String(runsOlderThanMs), "--report", path.join(meshRoot, ".mesh-retention-report.json")];
 /** Retry delay for presence writes that failed on a contended mesh lock (smarty-dev#448). */
 const PRESENCE_RETRY_MS = 5_000;
-/** Presence carries no lease (owner liveness is the host lease), so a full heartbeat
- * rewrites an unchanged entry only this rarely: far inside the 24 h dead-session
- * presence window, and never once per beat per (often stopped) actor (smarty-dev#6729). */
-export const PRESENCE_REFRESH_MS = 60 * 60 * 1_000;
 /** Recent (actor, event) deliveries, so an event offered again reaches only actors that missed it. */
 const DELIVERED_EVENT_MEMORY = 4_096;
 /** Per durable actor: completed mesh subjects retained in its queue checkpoint. */
@@ -1201,7 +1199,7 @@ export class ActorManager {
     }
   }
 
-  async #recordSpawnRouterStart(request: FabricActorRequest, actor: ManagedActor): Promise<void> {
+  async #recordSpawnRouterStart(request: FabricActorRequest, actor: ManagedActor, admission?: SpawnRouterAdmission): Promise<void> {
     const decisionId = (request as FabricActorRequest & { spawnRouterDecisionId?: unknown }).spawnRouterDecisionId;
     if (typeof decisionId !== "string" || !decisionId) return;
     try {
@@ -1211,19 +1209,19 @@ export class ActorManager {
       if (actor.runner === "pi" || actor.runner === "pi-durable") {
         try { sessionId = readPiSessionHeader(actor.sessionFile)?.id ?? null; } catch { /* No native session yet. */ }
       }
-      await recordSpawnRouterStart({ meshRoot: this.mesh.root, decisionId, agentId: actor.id,
+      await recordSpawnRouterStart({ meshRoot: this.mesh.root, decisionId, admission, spawnKind: "actor", request, cwd: this.agents.cwd, agentId: actor.id,
         sessionId,
         model: binding.model ?? actor.model ?? this.agents.defaultModel(actor.runner) ?? null,
         thinking: binding.thinking ?? actor.thinking ?? this.agents.config.thinking });
     } catch { /* Ledger writes never change actor creation. */ }
   }
 
-  async #recordSpawnRouterStartFailed(request: FabricActorRequest): Promise<void> {
+  async #recordSpawnRouterStartFailed(request: FabricActorRequest, admission?: SpawnRouterAdmission): Promise<void> {
     const decisionId = (request as FabricActorRequest & { spawnRouterDecisionId?: unknown }).spawnRouterDecisionId;
     if (typeof decisionId !== "string" || !decisionId) return;
     try {
       const { recordSpawnRouterStartFailed } = await import("../agents/spawn-router.js");
-      await recordSpawnRouterStartFailed({ meshRoot: this.mesh.root, decisionId });
+      await recordSpawnRouterStartFailed({ meshRoot: this.mesh.root, decisionId, admission, spawnKind: "actor", request, cwd: this.agents.cwd });
     } catch { /* Ledger writes never change actor creation. */ }
   }
 
@@ -1238,8 +1236,10 @@ export class ActorManager {
    */
   async create(
     request: FabricActorRequest,
-    { asRegistryOwner = false, beforeCommit, beforeMaterialize, checkActive, onCommit, supervisorOwner = this.identity }: {
+    { asRegistryOwner = false, beforeCommit, beforeMaterialize, checkActive, onCommit, supervisorOwner = this.identity, routerAdmission }: {
       asRegistryOwner?: boolean;
+      /** Native-only authenticated attribution, independent of supervisor/launch authority. */
+      routerAdmission?: SpawnRouterAdmission;
       /** Host-only: verified resident creator, never request fields. */
       supervisorOwner?: MeshIdentity;
       /** Protected creates require a SYNCHRONOUS final request-acceptance fence.
@@ -1253,6 +1253,8 @@ export class ActorManager {
     } = {},
   ): Promise<FabricActorInfo> {
     ++this.#pendingCreates;
+    routerAdmission = routerAdmission && { ...routerAdmission, targetRootId: this.#rootId,
+      targetHostId: this.agents.runtimeHostId ?? routerAdmission.targetHostId };
     const routerDecisionId = (request as FabricActorRequest & { spawnRouterDecisionId?: unknown }).spawnRouterDecisionId;
     let routerStartSettled = typeof routerDecisionId !== "string" || routerDecisionId.length === 0;
     let reservedName: string | undefined;
@@ -1457,7 +1459,7 @@ export class ActorManager {
       }
       if (!routerStartSettled) {
         routerStartSettled = true;
-        await this.#recordSpawnRouterStart(request, actor);
+        await this.#recordSpawnRouterStart(request, actor, routerAdmission);
       }
     await this.#publishPresence(actor);
     await this.#publishSlotCreated(actor);
@@ -1470,7 +1472,7 @@ export class ActorManager {
     } catch (error) {
       if (!routerStartSettled) {
         routerStartSettled = true;
-        await this.#recordSpawnRouterStartFailed(request);
+        await this.#recordSpawnRouterStartFailed(request, routerAdmission);
       }
       throw error;
     } finally {
@@ -1799,18 +1801,14 @@ export class ActorManager {
       const pending = new Map([...this.#pendingPresence].map(id => [id, this.#presenceRevisions.get(id)]));
       const ids = new Set(pending.keys());
       if (full) for (const actor of this.#actors.values()) ids.add(actor.id);
-      // A full heartbeat renews every live actor's presence (#4383), but only verifies and
-      // repairs a STOPPED actor's: each put is re-versioned and re-encoded in the locked
-      // shared commit, and a host can own hundreds of stopped actors (smarty-dev#6729).
-      // An unchanged stopped entry this instance committed, still in the shared state as
-      // written, is skipped until PRESENCE_REFRESH_MS. The shared read is lazy, so a
-      // host without stopped actors does exactly what it did before.
+      // A full heartbeat publishes only changed actor payloads. Liveness belongs to
+      // the resident host lease, not to an actor envelope's mesh timestamp. The shared
+      // read is lazy, so an unchanged resident does not acquire actor rows for renewal.
       let shared: ReadonlyMap<string, Readonly<MeshStateEntry>> | undefined, sharedRead = false;
       const sharedPresence = () => {
         if (!sharedRead) { sharedRead = true; shared = this.#sharedPresence(); }
         return shared;
       };
-      const now = Date.now();
       const written = new Map<string, string | undefined>();
       const ops: MeshBatchOperation[] = [];
       for (const id of ids) {
@@ -1819,11 +1817,9 @@ export class ActorManager {
           if (this.#ownershipDecision(id) && this.#slotCurrent(actor)) {
             const value = this.#presenceValue(actor);
             if (!value) continue;
-            const serialized = actor.status === "stopped" ? JSON.stringify(value) : undefined;
-            if (full && serialized !== undefined && !pending.has(id) &&
-              this.#presenceUnchanged(id, serialized, sharedPresence(), now)) continue;
+            const serialized = JSON.stringify(value);
+            if (full && !pending.has(id) && this.#presenceUnchanged(id, serialized, sharedPresence())) continue;
             ops.push({ kind: "put", key: this.#presenceKey(id), value, identity: this.identity });
-            // Only stopped presence is remembered; a live put or delete forgets it.
             written.set(id, serialized);
           }
         } else {
@@ -1860,11 +1856,11 @@ export class ActorManager {
   }
 
   #presenceUnchanged(id: string, serialized: string,
-    shared: ReadonlyMap<string, Readonly<MeshStateEntry>> | undefined, now: number): boolean {
+    shared: ReadonlyMap<string, Readonly<MeshStateEntry>> | undefined): boolean {
     if (!shared || this.#publishedPresence.get(id) !== serialized) return false;
     const entry = shared.get(this.#presenceKey(id));
     return entry !== undefined && entry.updatedBy.id === this.identity.id &&
-      now - entry.updatedAt < PRESENCE_REFRESH_MS && JSON.stringify(entry.value) === serialized;
+      JSON.stringify(entry.value) === serialized;
   }
 
   async cede(id: string): Promise<FabricActorInfo> {
@@ -3985,7 +3981,7 @@ export class ActorManager {
     this.#registry.releaseReadCache();
     // Fenced like every whole-tree delete (smarty-dev#8090); without the fence the tree is kept, shutdown goes on.
     await deleteRootActorTree(this.mesh.root, this.#rootId, () => fs.rmSync(this.#actorRoot, { recursive: true, force: true }))
-      .catch(error => console.warn(`[pi-fabric] actor root ${this.#actorRoot} kept: ${errorText(error)}`));
+      .catch(error => diagnostics.warn("src/actors/manager.ts", `[pi-fabric] actor root ${this.#actorRoot} kept: ${errorText(error)}`));
   }
 
   /**
@@ -3999,16 +3995,16 @@ export class ActorManager {
     for (let failures = 1; ; failures++) {
       try {
         await this.#saveActors();
-        if (failures > 1) console.warn(`[pi-fabric] actor registry save at close committed after ${failures - 1} failed attempt(s)`);
+        if (failures > 1) diagnostics.warn("src/actors/manager.ts", `[pi-fabric] actor registry save at close committed after ${failures - 1} failed attempt(s)`);
         return;
       } catch (error) {
         if (!isRetryableRegistrySave(error)) throw error;
         const wait = registrySaveRetryMs(failures);
         if (Date.now() + wait >= deadline) {
-          console.warn(`[pi-fabric] actor registry save at close not committed; keeping the last committed registry: ${errorText(error)}`);
+          diagnostics.warn("src/actors/manager.ts", `[pi-fabric] actor registry save at close not committed; keeping the last committed registry: ${errorText(error)}`);
           return;
         }
-        if (failures === 1) console.warn(`[pi-fabric] actor registry save at close failed; retrying: ${errorText(error)}`);
+        if (failures === 1) diagnostics.warn("src/actors/manager.ts", `[pi-fabric] actor registry save at close failed; retrying: ${errorText(error)}`);
         await new Promise((resolve) => setTimeout(resolve, wait));
       }
     }
@@ -5090,7 +5086,7 @@ export class ActorManager {
             if (!enodevDelivered) {
               // Parked after a pause, never re-run at once: a failing disk must not spin the drain.
               const reason = `Fabric actor ${actor.name} (${actor.id}): its recovered answer's delivery receipt could not be written`;
-              console.warn(`[pi-fabric] ${reason} (smarty-dev#8935)`);
+              diagnostics.warn("src/actors/manager.ts", `[pi-fabric] ${reason} (smarty-dev#8935)`);
               await new Promise(resolve => setTimeout(resolve, ENODEV_RECEIPT_RETRY_MS));
               this.#park(actor, [item], reason);
               this.#scheduleRestoreParked();
@@ -6464,7 +6460,7 @@ export class ActorManager {
   #alarmSweepLock(meshRoot: string, reason: string): void {
     if (this.#sweepLockAlarmed) return;
     this.#sweepLockAlarmed = true;
-    console.warn(`[pi-fabric] mesh retention sweep skipped: its lock state is uncertain (${reason})`);
+    diagnostics.warn("src/actors/manager.ts", `[pi-fabric] mesh retention sweep skipped: its lock state is uncertain (${reason})`);
     void this.mesh.publish({ topic: FABRIC_RETENTION_SWEEP_LOCK_ALARM_TOPIC, kind: "retention-sweep-lock-uncertain", from: this.identity,
       data: { meshRoot, reason } }).catch(() => undefined);
   }
@@ -6855,7 +6851,7 @@ export class ActorManager {
         actor.presenceError = diagnostic;
         this.#scheduleRegistrySave(true);
         this.#emitChange();
-        console.warn(`[pi-fabric] actor ${actor.id}: ${diagnostic}`);
+        diagnostics.warn("src/actors/manager.ts", `[pi-fabric] actor ${actor.id}: ${diagnostic}`);
       }
       return undefined;
     }
@@ -6878,7 +6874,7 @@ export class ActorManager {
         // The class or code only: a mesh error's message can carry WAL reader diagnostics (pi-fabric#893 round 4).
         if (!isMeshLockTimeout(error)) {
           const code = (error as { code?: unknown } | null)?.code;
-          console.warn(`[pi-fabric] host actor presence: ${typeof code === "string" ? code : error instanceof Error ? error.name : typeof error}`);
+          diagnostics.warn("src/actors/manager.ts", `[pi-fabric] host actor presence: ${typeof code === "string" ? code : error instanceof Error ? error.name : typeof error}`);
         }
       }
       return;
@@ -6989,7 +6985,7 @@ export class ActorManager {
         }
       })().catch(error => {
         // Keep the owned timer contained even if a non-mesh presence precondition fails.
-        console.warn(`[pi-fabric] actor presence retry failed: ${error instanceof Error ? error.message : String(error)}`);
+        diagnostics.warn("src/actors/manager.ts", `[pi-fabric] actor presence retry failed: ${error instanceof Error ? error.message : String(error)}`);
         this.#schedulePresenceRetry();
       });
     }, Math.max(1, [...this.#pendingPresence].reduce((wait, id) =>
@@ -7174,7 +7170,7 @@ export class ActorManager {
     this.#registrySaveDurable ||= durable;
     if (this.#registrySaveTimer || this.#closing) return;
     if (this.#registrySaveFailures++ === 0) {
-      console.warn(`[pi-fabric] actor registry save failed; retrying until it commits: ${errorText(error)}`);
+      diagnostics.warn("src/actors/manager.ts", `[pi-fabric] actor registry save failed; retrying until it commits: ${errorText(error)}`);
     }
     this.#lastRegistrySaveAt = Date.now();
     this.#scheduleRegistrySave(durable, registrySaveRetryMs(this.#registrySaveFailures));
@@ -7332,7 +7328,7 @@ export class ActorManager {
     if (options?.operatorRow && options.requiredActor?.removal &&
         committed.owned.includes(options.requiredActor)) options.requiredActor.removal.operator = true;
     if (this.#registrySaveFailures > 0) {
-      console.warn(`[pi-fabric] actor registry save committed after ${this.#registrySaveFailures} failed attempt(s)`);
+      diagnostics.warn("src/actors/manager.ts", `[pi-fabric] actor registry save committed after ${this.#registrySaveFailures} failed attempt(s)`);
       this.#registrySaveFailures = 0;
     }
     if (this.#registrySaveTimer) clearTimeout(this.#registrySaveTimer);
@@ -7745,7 +7741,7 @@ export class ActorManager {
         if (starts > 0) {
           const text = `actor ${actor.name} (${actor.id}): a queue file is unreadable, so its ENODEV-unconfirmed runs ` +
             `stay unsettled (start ${starts} in a row; smarty-dev#8935)`;
-          console.warn(`[pi-fabric] ${text}`);
+          diagnostics.warn("src/actors/manager.ts", `[pi-fabric] ${text}`);
           // One alarm, when the (saturating) count reaches its threshold.
           if (count.alarm) void this.mesh.publish({ topic: "ops.owner", kind: "actor.alarm", from: this.identity, to: actor.rootId,
             text, data: { actorId: actor.id, reason: "enodev-queue-unknown", starts } }).catch(() => undefined);
@@ -8957,7 +8953,7 @@ export class ActorManager {
     if (item.ownershipRefusals !== RESUMED_REFUSAL_CAP) return;
     const text = `actor ${actor.name} (${actor.id}): a resumed activation (${item.id}) was refused by ownership ` +
       `${RESUMED_REFUSAL_CAP} times before it ran; it now counts against the parked queue limit (smarty-dev#8935)`;
-    console.warn(`[pi-fabric] ${text}`);
+    diagnostics.warn("src/actors/manager.ts", `[pi-fabric] ${text}`);
     void this.mesh.publish({ topic: "ops.owner", kind: "actor.alarm", from: this.identity, to: actor.rootId,
       text, data: { actorId: actor.id, itemId: item.id, reason: "resumed-ownership-refused", refusals: RESUMED_REFUSAL_CAP } })
       .catch(() => undefined);

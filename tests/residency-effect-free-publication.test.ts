@@ -295,27 +295,36 @@ describe("effect-free resident publication (#8526)", () => {
     } finally { await f.close(); }
   });
 
-  it("an effect-free files heartbeat still independently renews a stopped actor's matching lineage", async () => {
-    const f = await fixture(true);
+  it.each(modes)("the first hourly heartbeat leaves stopped actor envelopes unchanged ($backend files=$files)", async ({ files, backend }) => {
+    const f = await fixture(files, backend);
     try {
       const actor = await f.host.actors.create({ name: "stopped-actor", instructions: "wait", residency: "durable" });
       await f.host.actors.stop(actor.id);
       await f.host.participants.refresh();
       const key = participantKey(actor.id), before = readParticipantFile(f.config.meshRoot, key)!;
-      const token = (before.value as FabricParticipantRecord).actorOwnershipToken;
-      // The ordinary stopped-actor renewal cadence, not a relaxed lease/lineage gate.
+      const presenceKey = `actors/${f.config.sessionId}/${actor.id}`;
+      const presence = f.host.mesh.get(presenceKey, { fresh: true })!;
+      const shared = f.host.mesh.get(key, { fresh: true });
+      const lease = readHostLease(f.config.meshRoot, f.host.hostId)!;
+      // Crossing the former hourly renewal floor must not rewrite either actor
+      // envelope. The FIRST heartbeat is effect-free; no settling round is allowed.
       vi.spyOn(Date, "now").mockReturnValue(Date.now() + 60 * 60 * 1_000 + 5_000);
       const fence = vi.spyOn(f.host.participants.options, "withPublicationFence");
+      const batch = vi.spyOn(f.host.mesh, "writeBatch");
       f.clear();
       await f.host.participants.refresh();
-      expect(readParticipantFile(f.config.meshRoot, key)?.updatedAt).toBeGreaterThan(before.updatedAt);
-      expect((readParticipantFile(f.config.meshRoot, key)?.value as FabricParticipantRecord).actorOwnershipToken).toBe(token);
-      // presenceBatch may renew stopped legacy presence at the hour boundary;
-      // use the next stable full heartbeat to prove its exact empty actor set.
-      f.clear(); fence.mockClear();
-      await f.host.participants.refresh();
       expect(f.acquisitions()).toEqual([]);
+      expect(fence).toHaveBeenCalledOnce();
       expect(fence.mock.calls[0]?.[1]).toEqual(new Set());
+      expect(batch.mock.calls.flatMap(([input]) => input.ops).filter(op =>
+        op.key === key || op.key === presenceKey)).toEqual([]);
+      expect(readParticipantFile(f.config.meshRoot, key)).toEqual(before);
+      expect(f.host.mesh.get(key, { fresh: true })).toEqual(shared);
+      expect(f.host.mesh.get(presenceKey, { fresh: true })).toEqual(presence);
+      const renewed = readHostLease(f.config.meshRoot, f.host.hostId)!;
+      expect(renewed.updatedAt).toBeGreaterThan(lease.updatedAt);
+      expect(renewed.expiresAt).toBeGreaterThan(Date.now());
+      expect(f.host.participants.get(actor.id, Date.now(), { fresh: true })).toMatchObject({ status: "stopped", stale: false });
       expect(f.host.participants.canConsumeMesh()).toBe(true);
     } finally { await f.close(); }
   });

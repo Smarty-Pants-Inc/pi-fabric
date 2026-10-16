@@ -228,7 +228,7 @@ function canonical(value: unknown): string {
  * A fleet-policy JSON can retain its existing `hosts` map and add pathBMachines, then mint Path B
  * agent users only for those host keys. Other hosts keep their existing #7504 account/credentials.
  */
-function pathBMachines(value: unknown): string[] {
+export function pathBMachines(value: unknown): string[] {
   if (!Array.isArray(value) || value.length === 0 || value.length > 64) fail("pathBMachines");
   const machines = value.map((machine) => matching(machine, /^[a-z0-9][a-z0-9-]{0,31}$/, "pathBMachines"));
   if (new Set(machines).size !== machines.length || machines.some((machine) => PATH_B_OPERATOR_MACHINE_PATTERN.test(machine))) fail("pathBMachines");

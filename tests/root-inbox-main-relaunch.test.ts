@@ -152,7 +152,9 @@ describe("RootInbox after a Main session relaunch", () => {
 
     const box = inbox();
     await box.next(emptySession);
-    await work("a new shadow copy; matching must not use this body", sender, topic, "relaunch-key");
+    // Real shadows retain the source event id; a key-only fixture is unrelated work.
+    await work("a new shadow copy; matching must not use this body", sender, topic, "relaunch-key",
+      { messageId: written.controlEventId });
 
     const successorOwner: MeshIdentity = { ...main };
     const successorControl = new FabricControlPlane(mesh, successorOwner,
@@ -161,6 +163,11 @@ describe("RootInbox after a Main session relaunch", () => {
     expect(successorControl.incarnation).not.toBe(written.ownerIncarnation);
     try {
       expect((await inbox(successorOwner).next(confirmed, { priority: true })).events).toEqual([]);
+      await work("distinct event with the same sender, topic and key", sender, topic, "relaunch-key",
+        { messageId: `${written.controlEventId}:distinct` });
+      expect((await inbox(successorOwner).next(confirmed, { priority: true })).events.map(event => event.text)).toEqual([
+        "distinct event with the same sender, topic and key",
+      ]);
     } finally { await successorControl.close(); }
   });
 
@@ -171,7 +178,13 @@ describe("RootInbox after a Main session relaunch", () => {
     const confirmed = confirmedSession(root, main.sessionId!, [asSessionEntry(written.message)]);
     const box = inbox();
     await box.next(emptySession);
-    await work("same identity", sender, topic, "shared-key");
+    await work("distinct event with the same sender, topic and key", sender, topic, "shared-key",
+      { messageId: `${written.controlEventId}:distinct` });
+    const distinct = await box.next(confirmed, { priority: true });
+    expect(distinct.events.map(event => event.text)).toEqual(["distinct event with the same sender, topic and key"]);
+    await box.consume(distinct.events.map(event => event.id));
+    // Real shadows retain the source event id; the same key alone cannot establish identity.
+    await work("same identity", sender, topic, "shared-key", { messageId: written.controlEventId });
     await work("same sender and key, different topic", sender, "fleet.work.pi-fabric.other-topic", "shared-key");
     await work("same topic and key, different sender", { ...sender, id: "session:other-sender" }, topic, "shared-key");
 
@@ -343,9 +356,16 @@ describe("RootInbox after a Main session relaunch", () => {
     expect(written.message.details.data).toEqual(data);
     const box = inbox();
     await box.next(emptySession);
-    await work("nested key still claims its typed work", sender, data.topic, data.key);
+    // Real shadows retain the source event id even when the typed work has a nested key.
+    await work("nested key still claims its typed work", sender, data.topic, data.key,
+      { messageId: written.controlEventId });
     const confirmed = confirmedSession(root, main.sessionId!, [asSessionEntry(written.message)]);
     expect((await inbox({ ...main }).next(confirmed, { priority: true })).events).toEqual([]);
+    await work("distinct event with the same typed key", sender, data.topic, data.key,
+      { messageId: `${written.controlEventId}:distinct` });
+    expect((await inbox({ ...main }).next(confirmed, { priority: true })).events.map(event => event.text)).toEqual([
+      "distinct event with the same typed key",
+    ]);
   });
 
   it.each([undefined, { explicit: true }])("refuses an oversized retained inboxKey with data %j before journal mutation", data => {

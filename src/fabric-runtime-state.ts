@@ -1,4 +1,5 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { diagnostics, notifyDiagnostic } from "./core/diagnostics.js";
 import { RootInbox, type RootInboxBatch, type RootInboxSession, type RootInboxReconcileOptions } from "./topology/root-inbox.js";
 import { RootInboxWatch } from "./topology/root-inbox-wake.js";
 import { MainInboxMaintenance, registerMainInbox, recordMainSuccessor, mainInboxOwns, mainInboxActive, rootPresenceAlarms, stageMainSuccessor, confirmMainSuccessor, providerDeadAlarms, providerDeadAlarmFields, admissionAlarmRecipient } from "./topology/stall-alarms.js";
@@ -222,7 +223,7 @@ const MAIN_ACTOR_MESH_REPLAY_MS = 10 * 60_000;
 // ctx throws, and a throw there is uncaught and exits Pi, so the notice is dropped.
 const notifyDetached = (context: ExtensionContext, message: string): void => {
   try {
-    if (context.hasUI) context.ui.notify(message, "error");
+    if (context.hasUI) notifyDiagnostic(context, "src/fabric-runtime-state.ts", message, "error");
   } catch {
     // Stale ctx: the runtime that owned this callback is closing.
   }
@@ -261,6 +262,7 @@ export class FabricRuntimeState {
   #providerParticipants = new ProviderParticipantRegistry();
   #control: FabricControlPlane | undefined;
   #transport: FabricTransport | undefined;
+  #transportAbort: AbortController | undefined;
   #lifecycle: LifecycleBroker | undefined;
   #residency: ResidencyClient | undefined;
   #agentsProvider: AgentsProvider | undefined;
@@ -938,6 +940,8 @@ export class FabricRuntimeState {
     herdrLookup?.start();
     // Carrier configuration belongs to this activation, not reloadConfig's mutable object.
     const meshConfig = this.#config.mesh.transport === "nats" ? structuredClone(this.#config.mesh) : this.#config.mesh;
+    const transportAbort = natsMode ? new AbortController() : undefined;
+    this.#transportAbort = transportAbort;
     try {
     this.#backgroundMesh = new MeshBackgroundQueue("runtime lifecycle/compaction");
     this.#disposableMeshWrites = identity.kind === "actor" || identity.kind === "agent"
@@ -972,7 +976,13 @@ export class FabricRuntimeState {
       mkdirPrivate(transportStateDir);
       const { openFabricTransport } = await import("./transport/index.js");
       // NatsTransport.open awaits ensureTransportConsumer before returning (inbox.ts).
-      this.#transport = await openFabricTransport({ config: structuredClone(meshConfig), hostId, mesh });
+      const opened = await openFabricTransport({ config: structuredClone(meshConfig), hostId, mesh, signal: transportAbort!.signal });
+      // A teardown may have completed while the factory was still opening.
+      if (transportAbort!.signal.aborted) {
+        await opened.close();
+        transportAbort!.signal.throwIfAborted();
+      }
+      this.#transport = opened;
       if (this.#transport.kind !== "nats" || this.#transport.self.hostId !== hostId) {
         throw new Error("Fabric NATS transport factory returned a different carrier or owner");
       }
@@ -1023,8 +1033,8 @@ export class FabricRuntimeState {
       identity,
       onRootCollision: collision => {
         const warning = `Duplicate live Fabric root (${collision.reason}): ${collision.name}; ${collision.ids.join(", ")}. Fixture forks must use PI_FABRIC_FIXTURE=1.`;
-        console.warn(`[pi-fabric] ${warning}`);
-        live.read(ctx => { if (ctx.hasUI) ctx.ui.notify(warning, "warning"); });
+        diagnostics.warn("src/fabric-runtime-state.ts", `[pi-fabric] ${warning}`);
+        live.read(ctx => { if (ctx.hasUI) notifyDiagnostic(ctx, "src/fabric-runtime-state.ts", warning, "warning"); });
       },
       live: live.current,
       // No live ctx to rebind to (smarty-dev#5962/#4313): the lease lapses, so say it on the fleet
@@ -1133,9 +1143,9 @@ export class FabricRuntimeState {
       onUnfencedSenderWarning: message => {
         if (live.read(ctx => {
           if (!ctx.hasUI) return false;
-          ctx.ui.notify(message, "warning");
+          notifyDiagnostic(ctx, "src/fabric-runtime-state.ts", message, "warning");
           return true;
-        }) !== true) console.warn(`[pi-fabric] ${message}`);
+        }) !== true) diagnostics.warn("src/fabric-runtime-state.ts", `[pi-fabric] ${message}`);
       },
       // Both gates: this activation's custody/succession completed (main) AND its
       // directory epoch is committed under a live, renewed lease (#709).
@@ -1149,6 +1159,8 @@ export class FabricRuntimeState {
       bridgeTimeoutMs: this.#config.mesh.bridgeControlTimeoutMs,
       ...(transport ? { inboxLanes: meshConfig.nats.inboxLanes ?? 8,
         relayOperatorMachine: meshConfig.nats.operatorMachine } : {}),
+      ...(meshConfig.nats.machine !== undefined
+        ? { expectedNatsInboxStream: `FABRIC_IN_${meshConfig.nats.machine}` } : {}),
       ...(meshConfig.nats.rollbackHoldUntil !== undefined
         ? { withdrawHoldUntil: Date.parse(meshConfig.nats.rollbackHoldUntil) } : {}),
       captureOwnerLease: (ownerHostId, ownerIdentityId, targetId) =>
@@ -1346,7 +1358,7 @@ export class FabricRuntimeState {
         // Always addressed (pi-fabric#939 P2-b): the owner identity, else this Main itself; never a broadcast.
         const to = admissionAlarmRecipient(process.env.PI_FABRIC_OWNER_IDENTITY_ID, from);
         if (!to) {
-          console.warn("[pi-fabric] agent-admission alarm not published: no owner session address (the stderr line stands)");
+          diagnostics.warn("src/fabric-runtime-state.ts", "[pi-fabric] agent-admission alarm not published: no owner session address (the stderr line stands)");
           return;
         }
         // A named run's failed recovery save is an ops.owner alarm (pi-fabric#939 round 4); the held count stays a fabric.alarm.
@@ -1624,7 +1636,7 @@ export class FabricRuntimeState {
     try { await (transport ? actors : this.#actors).recoverProtectedActors(); }
     catch (error) {
       if (!(error instanceof ActorSlotRecoveryParkedError)) throw error;
-      console.warn(`[pi-fabric] ${(transport ? actors : this.#actors).slotRecoveryStatus().error?.message}`);
+      diagnostics.warn("src/fabric-runtime-state.ts", `[pi-fabric] ${(transport ? actors : this.#actors).slotRecoveryStatus().error?.message}`);
     }
     if (transport) {
       registerMainSource();
@@ -1724,11 +1736,12 @@ export class FabricRuntimeState {
     } catch (error) {
       if (transport) throw error;
       const detail = error instanceof Error ? error.message : String(error);
-      console.warn(
+      diagnostics.warn(
+        "src/fabric-runtime-state.ts",
         `[pi-fabric] Initial mesh publish failed (${detail}); the participant heartbeat will keep retrying.`,
       );
       if (context.hasUI) {
-        context.ui.notify(
+        notifyDiagnostic(context, "src/fabric-runtime-state.ts",
           `Pi Fabric could not reach the mesh (${detail}); retrying in the background.`,
           "warning",
         );
@@ -1943,7 +1956,7 @@ export class FabricRuntimeState {
         });
       });
       for (const warning of control.configuration().warnings) {
-        if (context.hasUI) context.ui.notify(warning, "warning");
+        if (context.hasUI) notifyDiagnostic(context, "src/fabric-runtime-state.ts", warning, "warning");
       }
     }
   }
@@ -2332,9 +2345,10 @@ export class FabricRuntimeState {
     // The session lifecycle retired: stop the background heartbeat before any teardown await.
     this.#participants?.suspend();
     const transport = this.#transport;
-    const control = transport ? this.#control : undefined;
-    const participants = transport ? this.#participants : undefined;
-    if (transport) control?.pause();
+    const transportAbort = this.#transportAbort;
+    const control = transport || transportAbort ? this.#control : undefined;
+    const participants = transport || transportAbort ? this.#participants : undefined;
+    if (transport || transportAbort) control?.pause();
     try {
       await this.#shutdownSteps(reason, targetSessionFile);
     } catch (error) {
@@ -2343,11 +2357,14 @@ export class FabricRuntimeState {
       await (transport ? participants : this.#participants)?.close().catch(() => undefined);
       throw error;
     } finally {
-      if (transport) {
+      if (transport || transportAbort) {
         // Exact instances survive clearing of the live fields by shutdown steps.
         await control?.close().catch(() => undefined);
         await participants?.close().catch(() => undefined);
-        if (this.#transport === transport) {
+        // CAS withdrawal needs a live carrier; retire refresh only after cleanup.
+        transportAbort?.abort();
+        if (this.#transportAbort === transportAbort) this.#transportAbort = undefined;
+        if (transport && this.#transport === transport) {
           await transport.close();
           this.#transport = undefined;
         }
@@ -2356,6 +2373,7 @@ export class FabricRuntimeState {
   }
 
   async #shutdownSteps(reason?: string, targetSessionFile?: string): Promise<void> {
+    const transportAbort = this.#transportAbort;
     this.sessionApprovals.reset();
     // Disposable actor/task results and journals belong to their worker, not
     // to this runtime's advisory presence/heartbeat writes. EOF must not convoy
@@ -2408,12 +2426,13 @@ export class FabricRuntimeState {
       await stageMainSuccessor(this.#mesh, this.#mainAgent.id, this.#mainAgent.sessionId, targetSessionFile);
     }
     const transport = this.#transport;
-    if (transport) {
+    if (transport || transportAbort) {
       // Release NATS ingress, directory lease, then carrier BEFORE native session custody.
       await this.#control?.close();
       if (reason === "exit") await this.#participants?.closeLineage();
       else await this.#participants?.close();
-      await transport.close();
+      transportAbort?.abort();
+      await transport?.close();
       if (this.#transport === transport) this.#transport = undefined;
     }
     try {
@@ -2490,7 +2509,7 @@ export class FabricRuntimeState {
     const mesh = this.#mesh, identity = this.#identity;
     const owner = process.env.PI_FABRIC_OWNER_IDENTITY_ID?.trim() || undefined;
     void this.#backgroundMesh.enqueue(() => providerDeadAlarms(mesh, identity, rootId, event, owner)).catch((error: unknown) => {
-      console.warn("[pi-fabric] provider-dead ops.owner alarm failed", error);
+      diagnostics.warn("src/fabric-runtime-state.ts", "[pi-fabric] provider-dead ops.owner alarm failed", error);
     });
   }
 
@@ -2544,16 +2563,19 @@ export class FabricRuntimeState {
 
   async #closeInternal(): Promise<void> {
     const transport = this.#transport;
-    const control = transport ? this.#control : undefined;
-    const participants = transport ? this.#participants : undefined;
+    const transportAbort = this.#transportAbort;
+    const control = transport || transportAbort ? this.#control : undefined;
+    const participants = transport || transportAbort ? this.#participants : undefined;
     try { await this.#closeInternalSteps(); }
     finally {
-      if (transport) {
-        // Also covers partial initialization and a teardown step rejecting early.
+      if (transport || transportAbort) {
+        // Also covers a rejected pending open, before a transport was assigned.
         control?.pause();
         await control?.close().catch(() => undefined);
         await participants?.close().catch(() => undefined);
-        if (this.#transport === transport) {
+        transportAbort?.abort();
+        if (this.#transportAbort === transportAbort) this.#transportAbort = undefined;
+        if (transport && this.#transport === transport) {
           await transport.close();
           this.#transport = undefined;
         }
@@ -2562,6 +2584,7 @@ export class FabricRuntimeState {
   }
 
   async #closeInternalSteps(): Promise<void> {
+    const transportAbort = this.#transportAbort;
     this.#stopHerdrLookup?.();
     this.#stopHerdrLookup = undefined;
     // /fabric reload and bootstrap replacement rebuild Fabric, not the creating
@@ -2605,11 +2628,12 @@ export class FabricRuntimeState {
     await this.#outputArtifacts.close();
     const externalNames = new Set(this.#externalProviders.keys());
     const transport = this.#transport;
-    if (transport) {
+    if (transport || transportAbort) {
       // Native session custody stays held until carrier teardown has completed.
       await this.#control?.close();
       await this.#participants?.close();
-      await transport.close();
+      transportAbort?.abort();
+      await transport?.close();
       if (this.#transport === transport) this.#transport = undefined;
     }
     try {

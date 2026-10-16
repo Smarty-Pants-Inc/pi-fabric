@@ -157,6 +157,8 @@ const command = (targetId: string, replyTo: string) => ({
 });
 
 const on = (store: MeshStore, topic: string): MeshEvent[] => store.read({ after: 0, limit: 100 }).filter((e) => e.topic === topic);
+// Presence/RPC timings share the opt-in debug channel; these assertions concern routing refusals.
+const notAddressedDebugs = (debugs: string[]): string[] => debugs.filter(line => line.includes(": not addressed across:"));
 
 const lockTimeout = (): Error => Object.assign(new Error("mesh busy"), { code: "FABRIC_MESH_LOCK_TIMEOUT" });
 
@@ -554,7 +556,7 @@ describe("presence mirror under contention (smarty-dev#2761)", () => {
     expect(logs.join("\n")).toContain("sender is not a live participant of the remote");
   });
 
-  it("single-flights an expired short-TTL mirror refresh across 100 concurrent refusal passes", async () => {
+  it("bounds 100 concurrent expired-mirror refusals to the existing pass plus one fresh single-flight wave", async () => {
     let now = 1_800_000_000_000;
     vi.spyOn(Date, "now").mockImplementation(() => now);
     const { hub, far, bridge, remote } = setup(undefined, { presenceMs: 60_000 });
@@ -576,7 +578,9 @@ describe("presence mirror under contention (smarty-dev#2761)", () => {
     await new Promise((resolve) => setTimeout(resolve, 20));
     release();
     const results = await passes;
-    expect(presence).toHaveBeenCalledTimes(1);
+    // Joiners cannot treat an existing pass as a fresh absence observation. They share
+    // one additional snapshot, not 100 serialized refreshes; the dead origin stays denied.
+    expect(presence).toHaveBeenCalledTimes(2);
     expect(results.every((result) => result.toLocal === 0)).toBe(true);
     expect(on(hub, "fabric.control.ack")).toHaveLength(0);
   });
@@ -1874,7 +1878,7 @@ describe("work events for the hub factory (smarty-dev#9352)", () => {
     });
     expect(on(hub, "ops.owner")).toEqual([expect.objectContaining({ kind: "pr.wake", to: "factory", data: { rootId: spoke.identity.id, bridge: { from: "forge", id: wake.id } } })]);
     expect(hub.read({ after: 0, limit: 100 }).some((event) => event.to === "nobody")).toBe(false);
-    expect(debugs).toEqual([`toLocal: not addressed across: fleet.work.smarty-dev.1 ${nobody.id} from ${spoke.identity.id} to nobody`]);
+    expect(notAddressedDebugs(debugs)).toEqual([`toLocal: not addressed across: fleet.work.smarty-dev.1 ${nobody.id} from ${spoke.identity.id} to nobody`]);
     expect(countLines(logs)).toEqual(["bridge: 1 events not addressed across (topics: fleet.work.smarty-dev.1; toRemote 0, toLocal 1 (to factory 0))"]);
     // Once across, never again: the cursor and the stamp keep a second pass from repeating it.
     expect(await bridge.step()).toMatchObject({ toLocal: 0 });
@@ -1902,7 +1906,7 @@ describe("work events for the hub factory (smarty-dev#9352)", () => {
     expect(hub.read({ after: 0, limit: 100 }).map((event) => event.topic)).toEqual(["fleet.work.hub.1"]);
     expect(logs.join("\n")).toMatch(/fleet\.work\.x\.3 .*: sender is not a live participant of the remote/);
     expect(logs.join("\n")).toMatch(/fleet\.work\.x\.4 .*: sender claims a hub identity/);
-    expect(debugs.map((line) => line.replace(/ \S+ from .* to /, " -> "))).toEqual([
+    expect(notAddressedDebugs(debugs).map((line) => line.replace(/ \S+ from .* to /, " -> "))).toEqual([
       "toRemote: not addressed across: fleet.work.hub.1 -> factory",
       "toLocal: not addressed across: fabric.control.command -> factory",
       "toLocal: not addressed across: fabric.control.ack -> factory",
@@ -1927,7 +1931,7 @@ describe("work events for the hub factory (smarty-dev#9352)", () => {
     await send("fleet.work.a.2", "nobody");
     await bridge.step();
     expect(countLines(logs)).toHaveLength(1); // within the minute: counted, not logged
-    expect(debugs).toHaveLength(4); // every drop at debug
+    expect(notAddressedDebugs(debugs)).toHaveLength(4); // every drop at debug
     now += 60_000;
     await bridge.step(); // idle past the minute: nothing happens, so nothing is logged
     expect(countLines(logs)).toHaveLength(1);
@@ -2021,7 +2025,7 @@ describe("work events for the hub factory (smarty-dev#9352)", () => {
       ["fleet.work.pi.fabric.876", "factory", dotted.id],
       ["fleet.work..github.7", "factory", dotRepo.id],
     ]);
-    expect(debugs.map((line) => line.replace(/ \S+ from \S+ to /, " -> "))).toEqual([
+    expect(notAddressedDebugs(debugs).map((line) => line.replace(/ \S+ from \S+ to /, " -> "))).toEqual([
       ...malformed.map((topic) => `toLocal: not addressed across: ${topic} -> factory`),
       "toLocal: not addressed across: fleet.work.smarty-dev.2 -> factory-lead",
       "toLocal: not addressed across: fleet.work.smarty-dev.3 -> factory\u0000",
@@ -2274,7 +2278,7 @@ describe("pi-fabric#876 security pass (round 3)", () => {
     smuggled.forEach(([topic], index) => {
       expect(logs).toContain(`toLocal: dropped ${topic} ${ids[index]} from ${spoke.identity.id}: not allowed`);
     });
-    expect(debugs.map((line) => line.replace(/ \S+ from \S+ to /, " -> "))).toEqual(outside.map(([topic]) => `toLocal: not addressed across: ${topic} -> factory`));
+    expect(notAddressedDebugs(debugs).map((line) => line.replace(/ \S+ from \S+ to /, " -> "))).toEqual(outside.map(([topic]) => `toLocal: not addressed across: ${topic} -> factory`));
   });
 
   // (c): the factory exception is bound in bytes as well as events per window; over it, work waits.

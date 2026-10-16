@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { diagnostics } from "../../core/diagnostics.js";
 import path from "node:path";
 import os from "node:os";
 import { pathToFileURL } from "node:url";
@@ -48,7 +49,7 @@ const selectWorkerRelease = (workerPath: string): { workerPath: string; fabricRe
   if (version === WORKER_PROTOCOL_VERSION && regularFile(selectedWorker) && regularFile(selectedExtension)) {
     return { workerPath: selectedWorker, fabricRelease: current, extensionPath: selectedExtension };
   }
-  console.warn(`[pi-fabric] Installed Fabric release ${current} (worker protocol ${typeof version === "number" ? version : "unknown"}) is incompatible or incomplete; using parent release ${parent} (worker protocol ${WORKER_PROTOCOL_VERSION}).`);
+  diagnostics.warn("src/agents/transports/process-transport.ts", `[pi-fabric] Installed Fabric release ${current} (worker protocol ${typeof version === "number" ? version : "unknown"}) is incompatible or incomplete; using parent release ${parent} (worker protocol ${WORKER_PROTOCOL_VERSION}).`);
   return fallback;
 };
 
@@ -273,7 +274,7 @@ export class ProcessTransport implements AgentTransportAdapter {
     if (this.#scopeWarningLogged) return;
     this.#scopeWarningLogged = true;
     const source = this.processSlice ? `agents.processSlice=${this.processSlice}` : "default task memory cap (app.slice)";
-    console.warn(`[pi-fabric] ${source}: ${reason}; launching worker normally`);
+    diagnostics.warn("src/agents/transports/process-transport.ts", `[pi-fabric] ${source}: ${reason}; launching worker normally`);
   };
 
   async available(): Promise<boolean> {

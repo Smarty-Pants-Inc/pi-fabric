@@ -8,8 +8,11 @@ import {
 } from "@nats-io/jetstream";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { openNatsConnection, type NatsConnectionHandle } from "../src/transport/nats/connection.js";
+import { openNatsTransport } from "../src/transport/nats/inbox.js";
 import { openNatsKv, openNatsKvForMachine, type NatsKvStore } from "../src/transport/nats/kv.js";
 import type { TransportKvEvent } from "../src/transport/types.js";
+import { ensureTransportStream } from "../src/transport/nats/provision.js";
+import { transportInboxStream, transportInboxStreamSubject } from "../src/transport/nats/subjects.js";
 import { createPathBHarness, resolveNatsBinary, type PathBHarness } from "./helpers/nats-cluster.js";
 
 // Keep: the real broker is the trust/data-safety boundary. Only this fixture's
@@ -82,11 +85,11 @@ const connections: NatsConnectionHandle[] = [];
 const watches: Array<{ controller: AbortController; iterator: Watch }> = [];
 const connectMachine = async (machine: typeof A | typeof B): Promise<NatsConnectionHandle> => {
   const user = machine === A ? harness.users.machineA : harness.users.machineB;
-  const connection = await openNatsConnection({ servers: harness.serverUrl, credentials: user.credsPath, machine });
+  const connection = await openNatsConnection({ ...harness.runtimeOptions(user), machine });
   connections.push(connection);
   return connection;
 };
-const watch = (store: NatsKvStore, prefix: string) => {
+const watch = (store: Pick<NatsKvStore, "watch">, prefix: string) => {
   const controller = new AbortController();
   const iterator = store.watch<{ n: number }>(prefix, controller.signal)[Symbol.asyncIterator]();
   watches.push({ controller, iterator });
@@ -100,9 +103,14 @@ const presence = async (machine: typeof A | typeof B) => {
 
 describe.skipIf(!binary)("real authenticated NATS KV snapshot/ready/reset", () => {
   beforeAll(async () => {
-    harness = await createPathBHarness({ binary: binary! });
+    harness = await createPathBHarness({ binary: binary!, tls: {} });
     const bootstrap = await harness.connect(harness.users.bootstrap);
-    await openNatsKvForMachine(jetstream(bootstrap), "presence", A);
+    const manager = await jetstreamManager(bootstrap);
+    const js = jetstream(bootstrap);
+    await openNatsKvForMachine(js, "leases", A);
+    await openNatsKvForMachine(js, "presence", A);
+    await ensureTransportStream(manager, { name: transportInboxStream(A), subjects: [transportInboxStreamSubject(A)],
+      maxBytes: 1_073_741_824, maxAgeMs: 0, maxMessageBytes: 1_048_576, duplicateWindowMs: 600_000, replicas: 1 });
   }, 30_000);
 
   afterEach(async () => {
@@ -224,20 +232,22 @@ describe.skipIf(!binary)("real authenticated NATS KV snapshot/ready/reset", () =
   }, 80_000);
 
   it("invalidates readiness on a real broker restart and resumes snapshot/ready/live updates", async () => {
-    const { connection, store } = await presence(A);
+    const transport = await openNatsTransport({ ...harness.runtimeOptions(harness.users.machineA), hostId: "watch-restart" });
+    const store = transport.kv("presence");
     const key = `${A}.p.restart`;
-    const revision = await store.put(key, OWNER, { n: 1 }, 0);
-    const { iterator } = watch(store, key);
-    expect(await snapshot(iterator)).toEqual([{ type: "put", entry: { key, machine: A, owner: OWNER, value: { n: 1 }, revision } }]);
-    const restart = harness.restart();
     try {
-      expect(await next(iterator)).toEqual({ type: "reset" });
-      await bounded(restart, "owned broker restart", 25_000);
+      const revision = await store.put(key, OWNER, { n: 1 }, 0);
+      const { iterator } = watch(store, key);
       expect(await snapshot(iterator)).toEqual([{ type: "put", entry: { key, machine: A, owner: OWNER, value: { n: 1 }, revision } }]);
-      const updated = await store.put(key, OWNER, { n: 2 }, revision);
-      expect(await next(iterator)).toMatchObject({ type: "put", entry: { key, revision: updated } });
-      expect(connection.nc.isClosed()).toBe(false);
-    } finally { await restart; }
+      const restart = harness.restart();
+      try {
+        expect(await next(iterator)).toEqual({ type: "reset" });
+        await bounded(restart, "owned broker restart", 25_000);
+        expect(await snapshot(iterator)).toEqual([{ type: "put", entry: { key, machine: A, owner: OWNER, value: { n: 1 }, revision } }]);
+        const updated = await store.put(key, OWNER, { n: 2 }, revision);
+        expect(await next(iterator)).toMatchObject({ type: "put", entry: { key, revision: updated } });
+      } finally { await restart; }
+    } finally { await transport.close(); }
   }, 40_000);
 
   it("keeps broker revision order for concurrent updates from both authenticated machines", async () => {

@@ -322,7 +322,7 @@ class ResidentWakeRetryCursor {
   }
 }
 const retryCursors = new Map<string, ResidentWakeRetryCursor>();
-/** Release native directory custody when a mesh closes, or when evicting an idle cursor. */
+/** Release native directory custody when a mesh closes or its page cursor finishes. */
 export function closeResidentWakeRetryCursor(meshRoot: string): void {
   const key = path.resolve(meshRoot);
   retryCursors.get(key)?.close();
@@ -333,7 +333,9 @@ export function residentWakeRetryCandidates(meshRoot: string): string[] {
   const key = path.resolve(meshRoot);
   let cursor = retryCursors.get(key);
   if (!cursor) {
-    if (retryCursors.size >= 32) closeResidentWakeRetryCursor(retryCursors.keys().next().value!);
+    // An unfinished cursor belongs to its open mesh. Evicting it restarts at
+    // page one and starves later pages when more meshes alternate maintenance.
+    // Exhaustion/error and MeshStore.closeState release its native handles.
     cursor = new ResidentWakeRetryCursor(meshRoot);
     retryCursors.set(key, cursor);
   }

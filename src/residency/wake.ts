@@ -383,8 +383,15 @@ export async function wakeResidentActors(mesh: Pick<MeshStore, "root" | "listAll
     const reader = new ResidentWakeRecoveryReader(mesh.root);
     try { return reader.next().pending; } finally { reader.close(); }
   });
-  const acknowledge = (root: string, delivery: WakeDelivery): Promise<void> =>
-    mesh.exclusive(() => acknowledgeResidentDelivery(mesh.root, root, delivery));
+  const acknowledge = (root: string, delivery: WakeDelivery, claimId: string): Promise<void> =>
+    mesh.exclusive(() => {
+      // Intent alone is not a maintenance retry source. Commit a retry receipt
+      // BEFORE removing the pending nudge: admission or failure recording may
+      // fail after this ACK. If either this write or custody fails, keep pending.
+      writeJsonAtomic(wakeFailurePath(root), { format: 1, delivery, claimId,
+        nextRetryAt: Date.now() + RESIDENT_WAKE_ATTEMPT_LEASE_MS }, { durable: true });
+      acknowledgeResidentDelivery(mesh.root, root, delivery);
+    });
   let attempted = 0;
   // A subsequent MATCHING delivery must not let a newly re-filled journal starve old overflow.
   const deferred = [...pending].filter(([, delivery]) => delivery.deferredAt !== undefined &&
@@ -394,10 +401,15 @@ export async function wakeResidentActors(mesh: Pick<MeshStore, "root" | "listAll
     if (!recovery && attempted >= RESIDENT_WAKE_INDEX_MAX_ROOTS) break; // Overflow stays pending for the next drain.
     let delivery: { id: string; sequence?: number } | undefined;
     let acknowledged = false;
+    const claimId = randomUUID();
     const onIntentWritten = async (written: ResidentWakeRequest): Promise<void> => {
-      await acknowledge(root, written);
+      await acknowledge(root, written, claimId);
       acknowledged = true;
     };
+    const clearReceipt = (): Promise<void> => mesh.exclusive(() => {
+      // A successful older publication must not erase a newer attempt's nudge.
+      if (wakeFailureAt(root)?.claimId === claimId) fs.rmSync(wakeFailurePath(root), { force: true });
+    });
     try {
       // Reject foreign paths before opening their retained config or route files.
       if (recovery && root !== recovery.config.residencyRoot) { recovery.ignored++; continue; }
@@ -416,6 +428,7 @@ export async function wakeResidentActors(mesh: Pick<MeshStore, "root" | "listAll
           delivery = covered;
           attempted++;
           await requestResidentWake(root, covered, launch, onIntentWritten, admission);
+          await clearReceipt();
         }
         continue;
       }
@@ -429,20 +442,20 @@ export async function wakeResidentActors(mesh: Pick<MeshStore, "root" | "listAll
       if (delivery) {
         attempted++;
         await requestResidentWake(root, delivery, launch, onIntentWritten, admission);
-        fs.rmSync(wakeFailurePath(root), { force: true });
+        await clearReceipt();
       }
     } catch (error) {
       if (error instanceof ResidentWakeAdmissionClosed) {
         // Admission can close while the intent ACK waits for custody (or during
         // runtime preparation). Once ACKed, the index no longer discovers this
-        // cold root: retain the existing failure receipt for maintenance retry.
-        // Before ACK the original pending watermark already owns that nudge.
-        if (acknowledged && delivery) await recordResidentWakeFailure(mesh, root, delivery, error, Date.now());
+        // cold root: the receipt committed BEFORE ACK owns the retry even if
+        // recording this refusal also fails. Before ACK, pending still owns it.
+        if (acknowledged && delivery) await recordResidentWakeFailure(mesh, root, delivery, error, Date.now(), claimId);
         return;
       }
       // One failed root must never abort the others or turn a committed publish into a retry.
       // The durable nudge survives spawn failure; a separate receipt retains write failures too.
-      if (delivery) await recordResidentWakeFailure(mesh, root, delivery, error, Date.now());
+      if (delivery) await recordResidentWakeFailure(mesh, root, delivery, error, Date.now(), acknowledged ? claimId : undefined);
       diagnostics.warn("src/residency/wake.ts", `[pi-fabric] resident wake deferred for ${root}: ${String(error)}`);
     }
   }

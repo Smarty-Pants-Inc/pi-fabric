@@ -3846,7 +3846,9 @@ export class AgentManager {
   // otherwise spawn refuses it and the marker is untouched), and it settles nothing: the actor commits after it
   // delivered the answer (commitEnodevRecovery). An uncommitted recovery keeps the marker and the answer.
   #recoverEnodevRun(request: AgentRunRequest, signal?: AbortSignal, authorize?: () => boolean): AgentRunResult | undefined {
-    if (!request.actorId || !request.activationId || process.platform !== "linux") return undefined;
+    if (!request.actorId || !request.activationId) return undefined;
+    // The receipt is Linux ENODEV evidence, but replay needs no Linux APIs:
+    // peekEnodevRun still requires a provably dead worker on every platform.
     if (signal?.aborted || (authorize && !authorize())) return undefined;
     this.#enodevRuns ??= enodevUnresolvedRuns(this.#runRoot);
     for (const directory of this.#enodevRuns) {

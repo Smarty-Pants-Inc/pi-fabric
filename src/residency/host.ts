@@ -2688,7 +2688,7 @@ export class ResidentHost {
         };
       } else if (command.operation !== "removeActor") {
         if (command.operation === "setInstructions" || command.operation === "setModel" ||
-          command.operation === "setThinking" || command.operation === "setActivationFilter" || command.operation === "setTools" ||
+          command.operation === "setThinking" || command.operation === "setBatching" || command.operation === "setActivationFilter" || command.operation === "setTools" ||
           command.operation === "resetSession" || command.operation === "stop") {
           this.#authorizeResidentSetter(command.caller);
           if (command.operation === "setTools") assertResidentActorToolCeiling(command.tools, command.caller?.toolCeiling);
@@ -2722,6 +2722,7 @@ export class ResidentHost {
           }
           case "setModel": updated = await this.actors.setModel(actor.id, command.model, command.scope, commit, command.modelReason); break;
           case "setThinking": updated = await this.actors.setThinking(actor.id, command.thinking, command.scope, commit); break;
+          case "setBatching": updated = await this.actors.setBatching(actor.id, command, commit); break;
           case "setActivationFilter": updated = await this.actors.setActivationFilter(actor.id, command.activationFilter, commit, command.expiresAt); break;
           case "setTools": updated = await this.actors.setTools(actor.id, command.tools, commit); break;
           default: throw new Error("Unknown resident actor operation");

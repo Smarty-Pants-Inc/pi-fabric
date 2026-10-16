@@ -47,7 +47,15 @@ export const assertAgentSpawnAllowed = (
   caller: AgentSpawnCaller,
   environment: NodeJS.ProcessEnv = process.env,
 ): void => {
-  if (!caller || (caller.kind !== "main" && caller.kind !== "actor")) {
+  // Minimal provider fixtures may omit the host identity. Preserve their
+  // historical Main behavior, but never let a worker-marked environment use
+  // that absence to bypass the boundary.
+  if (caller === null) throw new AgentSpawnForbiddenError();
+  if (caller === undefined) {
+    if (hasWorkerMarker(environment)) throw new AgentSpawnForbiddenError();
+    return;
+  }
+  if (caller.kind !== "main" && caller.kind !== "actor") {
     throw new AgentSpawnForbiddenError();
   }
   const actorId = environment.PI_FABRIC_ACTOR_ID?.trim();

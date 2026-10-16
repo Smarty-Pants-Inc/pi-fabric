@@ -22,12 +22,22 @@ const AGENT_MESSAGE_CUSTOM_TYPE = "pi-fabric-agent-message";
 export const INBOX_HORIZON_MS = 2 * 60 * 60_000;
 /**
  * One injection (R-token-waste): at most this many events are rendered in full, with at most this
- * much event text in total and per event; every further event of the batch is summarized in one
- * line. A 20-event batch was ~15k tokens per turn; the budget keeps one injection near 3k.
+ * much event text in total and per event. Action events bypass the ordinary row/total-text limits,
+ * but retain the per-event cap and share a hard rendered-payload cap. Overflow remains pending;
+ * a summary is never a delivery receipt.
  */
 export const INBOX_INJECT_MAX_EVENTS = 8;
 export const INBOX_INJECT_MAX_TEXT_BYTES = 12 * 1024;
 export const INBOX_INJECT_EVENT_TEXT_BYTES = 4 * 1024;
+/**
+ * Per turn, all rendered action rows plus their newlines: XML expansion, metadata and cut notices
+ * count too. A conservative one-token/UTF-8-byte planning allowance is 131072 tokens: below half
+ * the configured Sol context (272000 tokens), not a tokenizer-independent guarantee. Bounds the
+ * incremental inbox burst, not arbitrary full-history/model-context usage; short bursts (including
+ * 230/236 actions) still fit. Carrier wrappers and
+ * summaries are separate.
+ */
+export const INBOX_INJECT_MAX_ACTION_RENDERED_BYTES = 128 * 1024;
 
 export interface RootInboxEvent extends MeshEvent {
   /** Shaped on drain only: old actionable work never requests a turn. */
@@ -36,7 +46,7 @@ export interface RootInboxEvent extends MeshEvent {
 
 export interface RootInboxBatch {
   events: RootInboxEvent[];
-  /** The sequence the cursor moves to once these events are in the session. */
+  /** End of the contiguous durable prefix; priority lookahead may include higher sequences. */
   through: number;
   /** Expired addressed shadows skipped in this drain, never delivered as work. */
   skippedStale?: number;
@@ -52,20 +62,48 @@ export interface RootInboxReconcileOptions {
   priority?: boolean;
 }
 
-export const workKey = (data: unknown): string | undefined => {
-  const key = data && typeof data === "object" ? (data as { key?: unknown }).key : undefined;
-  return typeof key === "string" && key.trim() ? key.trim() : undefined;
+/** Authoritative shown-only receipt data bound to the issuer's rendered carrier. */
+export interface RootInboxReceiptSnapshot {
+  readonly ids: readonly string[];
+  readonly receipts: readonly string[];
+  readonly digest: string;
+}
+
+/** Authentication precedes scan-local nonce consumption; failed claims never burn a nonce. */
+export type RootInboxReceiptVerifier = (
+  details: unknown, carrier: unknown, accepted: Set<string>,
+) => RootInboxReceiptSnapshot | undefined;
+
+// Only the trusted raw-content projection can populate this cache; public digest fields are ignored.
+const projectedInboxDigests = new WeakMap<object, string>();
+export const rootInboxCarrierDigest = (carrier: unknown): string => {
+  const fields = carrier && typeof carrier === "object" ? carrier as { content?: unknown } : {};
+  const cached = projectedInboxDigests.get(fields);
+  if (cached && !("content" in fields)) return cached;
+  // Native string content and its single text-block context representation render identically.
+  const content = fields.content;
+  const rendered = typeof content === "string" ? [content] : Array.isArray(content)
+    ? content.map(part => part && typeof part === "object" && part.type === "text" && typeof part.text === "string"
+      ? part.text : { part }) : [];
+  return createHash("sha256").update(JSON.stringify(rendered)).digest("hex");
 };
+
+const trimmedField = (data: unknown, field: string): string | undefined => {
+  const value = data && typeof data === "object" ? (data as Record<string, unknown>)[field] : undefined;
+  return typeof value === "string" ? value.trim() || undefined : undefined;
+};
+export const workKey = (data: unknown): string | undefined => trimmedField(data, "key");
 
 const receipt = (fromId: string, kind: string, value: string): string =>
   createHash("sha256").update(JSON.stringify([fromId, kind, value])).digest("hex");
 
-/** A delivery identity outranks work-key/ref fallbacks, never the other way around. */
+/** Delivery identity precedence: deliveryId > messageId > commandId > work-key/ref fallbacks. */
 export const deliveryIdentity = (data: unknown): { kind: string; value: string } | undefined => {
   if (!data || typeof data !== "object") return undefined;
-  const fields = data as Record<string, unknown>;
-  if (typeof fields.deliveryId === "string" && fields.deliveryId) return { kind: "delivery", value: fields.deliveryId };
-  if (typeof fields.messageId === "string" && fields.messageId) return { kind: "id", value: fields.messageId };
+  for (const field of ["deliveryId", "messageId", "commandId"]) {
+    const value = (data as Record<string, unknown>)[field];
+    if (typeof value === "string" && value) return { kind: field === "messageId" ? "id" : "delivery", value };
+  }
   return undefined;
 };
 /**
@@ -75,22 +113,18 @@ export const deliveryIdentity = (data: unknown): { kind: string; value: string }
  * topic-less kinds ("key", "ref") are never matched again: without a verifiable topic the event
  * is injected, because a duplicate shadow is cheap and a lost event is not.
  */
+/** Native carriers claim topic-scoped work; mesh events retain their own identities. */
 export const topicWorkReceipt = (fromId: string, kind: "key" | "ref", topic: string, value: string): string =>
-  receipt(fromId, `topic-${kind}`, JSON.stringify([topic, value]));
-/** The topic a native carrier names for its work (data.topic); without one its key/ref claims nothing. */
-const carrierTopic = (data: unknown): string | undefined => {
-  const topic = data && typeof data === "object" ? (data as { topic?: unknown }).topic : undefined;
-  return typeof topic === "string" && topic.trim() ? topic.trim() : undefined;
-};
+  receipt(fromId, `native-topic-${kind}`, JSON.stringify([topic, value]));
 const workReceipts = (fromId: string, data: unknown, topic: string | undefined): string[] => {
-  if (!data || typeof data !== "object") return [];
   const identity = deliveryIdentity(data);
   if (identity) return [receipt(fromId, identity.kind, identity.value)];
-  if (topic === undefined) return [];
-  const fields = data as Record<string, unknown>;
-  const key = workKey(data);
-  const ref = typeof fields.ref === "string" && fields.ref.trim() ? fields.ref.trim() : undefined;
-  return key ? [topicWorkReceipt(fromId, "key", topic, key)] : ref ? [topicWorkReceipt(fromId, "ref", topic, ref)] : [];
+  // Only native carriers supply a topic; mesh events must never claim key/ref work.
+  if (topic !== undefined) for (const kind of ["key", "ref"] as const) {
+    const value = trimmedField(data, kind);
+    if (value) return [topicWorkReceipt(fromId, kind, topic, value)];
+  }
+  return [];
 };
 export const eventReceipt = (id: string): string => receipt("", "event", id);
 /**
@@ -105,16 +139,19 @@ export const crossIdentityReceipts = (fromId: string, data: unknown): string[] =
 };
 export const eventReceipts = (event: MeshEvent): string[] => [
   eventReceipt(event.id), receipt(event.from.id, "id", event.id),
-  // Host-only publication keys are mesh-wide, even when a different maintenance owner
-  // retries. Carry the key into recipient-scoped confirmed session/inbox receipts too.
   ...(event.dedupeKey ? [receipt("", "dedupe", event.dedupeKey)] : []),
-  ...workReceipts(event.from.id, event.data, event.topic),
+  // Control data is a protocol envelope; nested work identities belong to the native carrier.
+  ...(event.topic === "fabric.control.command" ? [] : [
+    ...workReceipts(event.from.id, event.data, undefined),
+    ...crossIdentityReceipts(event.from.id, event.data),
+  ]),
 ];
 /** What the session's own entries say it holds. */
 export interface RootInboxSession {
   /** Inbox messages collectively holding all of these event ids. */
   holdsBatch(ids: readonly string[]): boolean;
-  /** An agent message (a steer or follow-up) from this sender that carried this work key and topic. */
+  /** Agent-carrier presence for this sender/key/topic, including explicit identities.
+   * Legacy suppression additionally requires a matching, dated native-topic receipt. */
   holdsSteer(fromId: string, key: string, topic: string): boolean;
   /** Confirmed native/inbox receipts from the whole history, not the recent-entry window. */
   delivered?: ReadonlySet<string>;
@@ -122,9 +159,8 @@ export interface RootInboxSession {
   deliveredAt?: ReadonlyMap<string, number>;
 }
 
-/** Only receipt identity survives the canonical-file scan. Delivered bodies and
- * arbitrary metadata are already durable in Pi; caching them again defeats its
- * cold entries. Preserve every field consumed by both receipt readers below. */
+/** Only receipt identity and a private raw-content digest survive the canonical-file scan.
+ * Delivered bodies and arbitrary metadata stay durable in Pi, not duplicated in this cache. */
 export const projectRootInboxReceipt = (value: unknown): unknown => {
   const object = (item: unknown): Record<string, unknown> | undefined =>
     item !== null && typeof item === "object" ? item as Record<string, unknown> : undefined;
@@ -135,21 +171,24 @@ export const projectRootInboxReceipt = (value: unknown): unknown => {
     return {
       id: row.id, chain: row.chain, deliveryId: row.deliveryId,
       ...(from ? { from: { id: from.id } } : {}),
-      ...(data ? { data: { key: data.key, ref: data.ref, topic: data.topic, deliveryId: data.deliveryId, messageId: data.messageId } } : {}),
+      ...(data ? { data: { key: data.key, ref: data.ref, topic: data.topic, deliveryId: data.deliveryId, messageId: data.messageId, commandId: data.commandId } } : {}),
     };
   };
   const entry = object(value);
   if (!entry) return value;
   const details = object(entry.details);
-  return {
+  const projected = {
     type: entry.type, id: entry.id, timestamp: entry.timestamp, customType: entry.customType,
     ...(details ? { details: {
-      ...carried(details), ids: details.ids, receipts: details.receipts,
-      // Keep malformed shapes unchanged: consumers retain their existing
-      // validation/failure behavior; projection must not manufacture a receipt.
+      ...carried(details),
+      ...(typeof details.nonce === "string" ? { nonce: details.nonce } : {}),
+      ids: details.ids, receipts: details.receipts,
+      // Preserve malformed shapes: projection must not manufacture a receipt.
       items: Array.isArray(details.items) ? details.items.map(carried) : details.items,
     } } : {}),
   };
+  if (entry.customType === ROOT_INBOX_CUSTOM_TYPE) projectedInboxDigests.set(projected, rootInboxCarrierDigest(entry));
+  return projected;
 };
 
 const matchesInboxReceipt = (line: string): boolean =>
@@ -178,61 +217,114 @@ export const confirmedMainInboxIds = (manager: SessionReceiptManager, sessionId:
 
 /** Persisted sessions must use confirmed file receipts, never Pi's pre-write memory index.
  * A failed barrier supplies no positive delivery evidence, so shadows remain recoverable. */
-export const confirmedRootInboxSession = (manager: SessionReceiptManager): RootInboxSession => {
+const verifiedInboxReceipt = (
+  entry: { details?: unknown }, verifier: RootInboxReceiptVerifier | undefined, accepted: Set<string>,
+): RootInboxReceiptSnapshot | undefined => {
+  if (!verifier) return undefined;
+  const snapshot = verifier(entry.details, entry, accepted);
+  if (!snapshot || !Array.isArray(snapshot.ids) || !Array.isArray(snapshot.receipts)) return undefined;
+  // Do not let a verifier's mutable return value become shared reader state.
+  return Object.freeze({
+    ids: Object.freeze(snapshot.ids.filter((id): id is string => typeof id === "string")),
+    receipts: Object.freeze(snapshot.receipts.filter((id): id is string => typeof id === "string")),
+    digest: snapshot.digest,
+  });
+};
+
+export const confirmedRootInboxSession = (
+  manager: SessionReceiptManager, verifier?: RootInboxReceiptVerifier,
+): RootInboxSession => {
   try {
     const snapshot = confirmedSessionReceiptSnapshot(manager, matchesInboxReceipt, projectRootInboxReceipt);
-    return inboxReceiptSession(snapshot.entries, snapshot.count);
+    return inboxReceiptSession(snapshot.entries, snapshot.count, 500, verifier);
   } catch {
     return rootInboxSession([]);
   }
 };
 
 /** A receipt snapshot of canonical entries; async inbox reads must not retain the history.
- * Batch presence retains its compatibility lookback; delivery identity does not. */
-export const rootInboxSession = (entries: readonly unknown[], lookback = 500): RootInboxSession =>
-  inboxReceiptSession(Object.keys(entries).map((key): [number, unknown] => [Number(key), entries[Number(key)]]), entries.length, lookback);
+ * Batch presence retains its compatibility lookback; delivery identity does not. Unsigned inbox
+ * carriers are intentionally fail-open: only the live issuer verifier may grant inbox authority. */
+export const rootInboxSession = (
+  entries: readonly unknown[], lookbackOrVerifier: number | RootInboxReceiptVerifier = 500,
+  verifier?: RootInboxReceiptVerifier,
+): RootInboxSession => {
+  const lookback = typeof lookbackOrVerifier === "number" ? lookbackOrVerifier : 500;
+  const receiptVerifier = typeof lookbackOrVerifier === "function" ? lookbackOrVerifier : verifier;
+  return inboxReceiptSession(
+    Object.keys(entries).map((key): [number, unknown] => [Number(key), entries[Number(key)]]),
+    entries.length, lookback, receiptVerifier,
+  );
+};
 
-const inboxReceiptSession = (entries: Iterable<readonly [number, unknown]>, count: number, lookback = 500): RootInboxSession => {
+/** Only canonical native UTC ISO or integer epoch-ms can date a receipt claim. */
+const canonicalReceiptTimestamp = (value: unknown): number | undefined => {
+  const at = typeof value === "number" ? value
+    : typeof value === "string" && value.length === 24 ? Date.parse(value)
+    : Number.NaN;
+  if (!Number.isInteger(at) || at <= 0 || at > Date.now() + 60_000) return undefined;
+  if (typeof value === "string" && new Date(at).toISOString() !== value) return undefined;
+  return at;
+};
+
+const inboxReceiptSession = (
+  entries: Iterable<readonly [number, unknown]>, count: number, lookback = 500,
+  verifier?: RootInboxReceiptVerifier,
+): RootInboxSession => {
   const batchIds = new Set<string>();
+  const accepted = new Set<string>();
   let hasBatch = false;
   const steers = new Map<string, Set<string>>();
   const delivered = new Set<string>();
   const deliveredAt = new Map<string, number>();
-  const remember = (id: string, at: number): void => {
+  const remember = (id: string, at: number | undefined): void => {
     delivered.add(id);
-    deliveredAt.set(id, Math.max(deliveredAt.get(id) ?? Number.NEGATIVE_INFINITY, at));
+    if (at !== undefined) deliveredAt.set(id, Math.max(deliveredAt.get(id) ?? Number.NEGATIVE_INFINITY, at));
   };
   // Persisted snapshots contain receipts only, with original history positions. All-history
   // identities/legacy steers are needed for dedup; only batch presence uses a lookback.
   for (const [index, value] of [...entries].reverse()) {
     type Carried = { from?: { id?: unknown }; data?: unknown; id?: unknown; deliveryId?: unknown };
-    const entry = value as { timestamp?: string; type?: string; customType?: string; details?: Carried & { ids?: unknown; items?: unknown; receipts?: unknown } } | undefined;
+    const entry = value as { timestamp?: unknown; type?: string; customType?: string; details?: Carried & { ids?: unknown; items?: unknown; receipts?: unknown } } | undefined;
     if (entry?.type !== "custom_message") continue;
-    const parsedAt = Date.parse(entry.timestamp ?? "");
-    const at = Number.isFinite(parsedAt) ? parsedAt : Date.now();
-    if (entry.customType === ROOT_INBOX_CUSTOM_TYPE && Array.isArray(entry.details?.ids)) {
-      if (index >= Math.max(0, count - lookback)) {
-        hasBatch = true;
-        for (const id of entry.details.ids) if (typeof id === "string") batchIds.add(id);
-      }
-      // Mixed-version inbox messages carried only globally unique mesh event ids.
-      for (const id of entry.details.ids) if (typeof id === "string") remember(eventReceipt(id), at);
-      if (Array.isArray(entry.details.receipts)) {
-        for (const id of entry.details.receipts) if (typeof id === "string") remember(id, at);
+    // Invalid canonical timestamps never renew a legacy claim at scan time. Exact native
+    // identity replay evidence remains available without granting dated fallback authority.
+    const at = canonicalReceiptTimestamp(entry.timestamp);
+    if (entry.customType === ROOT_INBOX_CUSTOM_TYPE) {
+      const receipt = verifiedInboxReceipt(entry, verifier, accepted);
+      if (receipt) {
+        if (index >= Math.max(0, count - lookback)) {
+          hasBatch = true;
+          for (const id of receipt.ids) batchIds.add(id);
+        }
+        for (const id of receipt.ids) remember(eventReceipt(id), at);
+        for (const id of receipt.receipts) remember(id, at);
       }
     }
-    if (entry.customType !== AGENT_MESSAGE_CUSTOM_TYPE) continue;
+    const agent = entry.customType === AGENT_MESSAGE_CUSTOM_TYPE;
+    // Native admitted steer receipts retain main's #1226 extraction. Inbox receipts above
+    // require the private shown-content verifier; serialized details alone grant nothing.
+    if (agent && Array.isArray(entry.details?.receipts)) {
+      for (const id of entry.details.receipts) if (typeof id === "string") remember(id, at);
+    }
+    if (!agent) continue;
     // A batch of followUps (smarty-dev#1495) carries each one in items.
     const carried: Carried[] = Array.isArray(entry.details?.items) ? entry.details.items as Carried[] : [entry.details ?? {}];
     for (const item of carried) {
       const fromId = item?.from?.id;
       const key = workKey(item?.data);
-      const topic = carrierTopic(item?.data);
+      // A native carrier without data.topic claims no key/ref work.
+      const topic = trimmedField(item?.data, "topic");
+      const explicit = !!deliveryIdentity(item?.data) || (typeof item?.deliveryId === "string" && !!item.deliveryId);
       if (typeof fromId !== "string") continue;
-      for (const id of workReceipts(fromId, item.data, topic)) remember(id, at);
+      // A caller-supplied top-level deliveryId is explicit-only too; retain data identity
+      // receipts when present, but do not record a native-topic key/ref for this carrier.
+      for (const id of workReceipts(fromId, item.data, explicit ? undefined : topic)) remember(id, at);
       if (typeof item.id === "string") remember(receipt(fromId, "id", item.id), at);
       if (typeof item.deliveryId === "string") remember(receipt(fromId, "delivery", item.deliveryId), at);
-      // A carrier without a topic claims no work key: its shadow is injected (fail open).
+      // Presence is independent of suppression authority: explicit carriers also hold this
+      // sender/topic/key, but only identity-less carriers above can record native-topic receipts.
+      // holdsSteer alone never suppresses work; a matching, dated native-topic receipt is mandatory.
       if (key === undefined || topic === undefined) continue;
       const keys = steers.get(fromId) ?? new Set<string>();
       keys.add(JSON.stringify([topic, key]));
@@ -247,15 +339,20 @@ const inboxReceiptSession = (entries: Iterable<readonly [number, unknown]>, coun
 };
 
 /** Whether a session's recent entries hold the inbox message for these event ids. */
-export const sessionHoldsInboxBatch = (entries: readonly unknown[], ids: readonly string[], lookback = 500): boolean => {
+export const sessionHoldsInboxBatch = (
+  entries: readonly unknown[], ids: readonly string[], lookback = 500,
+  verifier?: RootInboxReceiptVerifier,
+): boolean => {
+  if (!verifier) return false;
   const missing = new Set(ids);
+  const accepted = new Set<string>();
   for (let index = entries.length - 1; index >= Math.max(0, entries.length - lookback); index--) {
-    const entry = entries[index] as { type?: string; customType?: string; details?: { ids?: unknown } } | undefined;
+    const entry = entries[index] as { type?: string; customType?: string; details?: unknown } | undefined;
     if (entry?.type !== "custom_message" || entry.customType !== ROOT_INBOX_CUSTOM_TYPE) continue;
-    if (Array.isArray(entry.details?.ids)) {
-      for (const id of entry.details.ids) if (typeof id === "string") missing.delete(id);
-      if (missing.size === 0) return true;
-    }
+    const receipt = verifiedInboxReceipt(entry, verifier, accepted);
+    if (!receipt) continue;
+    for (const id of receipt.ids) missing.delete(id);
+    if (missing.size === 0) return true;
   }
   return false;
 };
@@ -269,17 +366,58 @@ const bounded = (text: string, sequence: number): string => {
   return `${cut}\n[cut at ${INBOX_INJECT_EVENT_TEXT_BYTES} bytes; read the whole event with mesh.read({ after: ${sequence - 1}, limit: 1 })]`;
 };
 
-/** Split one injection into the events rendered in full and the overflow summarized in one line. */
+const renderEvent = (event: MeshEvent): string => {
+  const data = (event.data && typeof event.data === "object" ? event.data : {}) as { ref?: unknown; key?: unknown };
+  const attributes = [
+    `id="${event.id}"`, `sequence="${event.sequence}"`, `topic="${escapeXml(event.topic)}"`, `kind="${escapeXml(event.kind)}"`,
+    `from_name=${JSON.stringify(event.from.name)}`, `from_id=${JSON.stringify(event.from.id)}`,
+    ...(typeof data.ref === "string" ? [`ref=${JSON.stringify(data.ref.slice(0, 256))}`] : []),
+    ...(typeof data.key === "string" ? [`key=${JSON.stringify(data.key.slice(0, 256))}`] : []),
+    `at="${new Date(event.createdAt).toISOString()}"`,
+  ];
+  return `<event ${attributes.join(" ")}>${escapeXml(bounded(event.text ?? "", event.sequence))}</event>`;
+};
+
+/** Shared internally with priority lookahead; ordinary durable admission stays bounded. */
+export const ROOT_INBOX_ACTION_KINDS = new Set(["blocked", "blocker", "ask", "handoff"]);
+const INBOX_PRIORITY = ["blocked", "blocker", "ask", "handoff", "done", "wait", "answer", "info", "progress", "status", "ack"];
+export const compareRootInboxEvents = (a: MeshEvent, b: MeshEvent): number => {
+  // Scheduled waits only enter the mesh once due. Keep the legacy completion spelling with done.
+  const rank = (kind: string): number => {
+    const index = INBOX_PRIORITY.indexOf(kind === "completion" ? "done" : kind);
+    return index < 0 ? INBOX_PRIORITY.length : index;
+  };
+  return rank(a.kind) - rank(b.kind) || a.createdAt - b.createdAt || a.sequence - b.sequence;
+};
+
+/** Overflow is withheld work, not a receipt. Action overflow withholds the remaining action suffix. */
 export const rootInboxBudget = (events: readonly MeshEvent[]): { shown: MeshEvent[]; overflow: MeshEvent[] } => {
-  const shown: MeshEvent[] = [];
+  const shown: MeshEvent[] = [], overflow: MeshEvent[] = [];
   let bytes = 0;
-  for (const event of events) {
+  let full = false;
+  let actionBytes = 0;
+  let actionsFull = false;
+  for (const event of [...events].sort(compareRootInboxEvents)) {
+    if (ROOT_INBOX_ACTION_KINDS.has(event.kind)) {
+      const renderedBytes = Buffer.byteLength(renderEvent(event)) + 1; // The row's joining newline.
+      if (actionsFull || actionBytes + renderedBytes > INBOX_INJECT_MAX_ACTION_RENDERED_BYTES) {
+        actionsFull = true;
+        overflow.push(event);
+        continue;
+      }
+      actionBytes += renderedBytes;
+    }
     const size = Math.min(Buffer.byteLength(event.text ?? ""), INBOX_INJECT_EVENT_TEXT_BYTES);
-    if (shown.length >= INBOX_INJECT_MAX_EVENTS || (shown.length > 0 && bytes + size > INBOX_INJECT_MAX_TEXT_BYTES)) break;
+    if (!ROOT_INBOX_ACTION_KINDS.has(event.kind) &&
+      (full || shown.length >= INBOX_INJECT_MAX_EVENTS || (shown.length > 0 && bytes + size > INBOX_INJECT_MAX_TEXT_BYTES))) {
+      full = true;
+      overflow.push(event);
+      continue;
+    }
     shown.push(event);
     bytes += size;
   }
-  return { shown, overflow: events.slice(shown.length) };
+  return { shown, overflow };
 };
 
 const overflowLine = (events: readonly MeshEvent[]): string => {
@@ -288,7 +426,7 @@ const overflowLine = (events: readonly MeshEvent[]): string => {
   const senders = [...new Set(events.map((event) => event.from.name || event.from.id))];
   const from = senders.slice(0, 3).map((name) => JSON.stringify(name)).join(", ") + (senders.length > 3 ? ` and ${senders.length - 3} more` : "");
   return `<overflow count="${events.length}">+${events.length} more addressed event(s) not shown (sequence ${first}-${last}, from ${escapeXml(from)}); ` +
-    `they count as delivered and will not be injected again; read them with mesh.read({ after: ${first - 1}, limit: ${last - first + 1} }) if you need them.</overflow>`;
+    `${events.length} more pending, shown next turn.</overflow>`;
 };
 
 /** A single passive summary, never stale event bodies or a batch of work to act on. */
@@ -300,7 +438,8 @@ export const rootInboxSummary = (batch: RootInboxBatch) => ({
 });
 /**
  * The one message that brings a batch into the session. Without an explicit `overflow`, the batch
- * is cut to the injection budget itself; every event id (shown or summarized) is in details.
+ * is cut to the injection budget itself. Only shown event ids/receipts enter details: an overflow
+ * summary neither acknowledges work nor prevents that work from being shown on the next turn.
  */
 export const rootInboxMessage = (input: readonly MeshEvent[], extra?: readonly MeshEvent[]) => {
   // A re-read shadow can repeat an event id; the carrier names each event once (smarty-dev#5518).
@@ -315,21 +454,12 @@ export const rootInboxMessage = (input: readonly MeshEvent[], extra?: readonly M
   content: [
     `<fabric-inbox count="${all.length}"${rest.length ? ` shown="${events.length}"` : ""}>`,
     "Work events addressed to you that no steer or follow-up delivered (a shadow copy can repeat a message you already saw):",
-    ...events.map((event) => {
-      const data = (event.data && typeof event.data === "object" ? event.data : {}) as { ref?: unknown; key?: unknown };
-      const attributes = [
-        `id="${event.id}"`, `sequence="${event.sequence}"`, `topic="${escapeXml(event.topic)}"`, `kind="${escapeXml(event.kind)}"`,
-        `from_name=${JSON.stringify(event.from.name)}`, `from_id=${JSON.stringify(event.from.id)}`,
-        ...(typeof data.ref === "string" ? [`ref=${JSON.stringify(data.ref.slice(0, 256))}`] : []),
-        ...(typeof data.key === "string" ? [`key=${JSON.stringify(data.key.slice(0, 256))}`] : []),
-        `at="${new Date(event.createdAt).toISOString()}"`,
-      ];
-      return `<event ${attributes.join(" ")}>${escapeXml(bounded(event.text ?? "", event.sequence))}</event>`;
-    }),
+    ...events.map(renderEvent),
     ...(rest.length ? [overflowLine(rest)] : []),
     "</fabric-inbox>",
   ].join("\n"),
   display: true,
-  details: { ids: all.map((event) => event.id), receipts: all.flatMap(eventReceipts) },
+  // Main's event identities only: unseen overflow never claims native key/ref work.
+  details: { ids: events.map((event) => event.id), receipts: events.flatMap(eventReceipts) },
   };
 };

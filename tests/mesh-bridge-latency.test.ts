@@ -8,6 +8,7 @@ import { BRIDGE_LEASE_MS, MeshBridge, RemoteBridgeSide, serveBridgeAgent, StoreB
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { LIVENESS_POLICY_KEY, mirroredLeaseStatus, mirroredOwnerRoutingStatus, readHostLeases, writeHostLease } from "../src/topology/host-leases.js";
 import { writeParticipantFile } from "../src/topology/participant-files.js";
+import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 
 // smarty-dev#6477: slow presence passes must retain spoke attribution within bounded latency,
 // without resurrecting source authority whose original translated deadline has passed.
@@ -40,6 +41,45 @@ const liveMain = async (store: MeshStore, name: string, now: number) => {
 };
 
 describe("bridge presence latency (smarty-dev#6477)", () => {
+  // Mixed-release trust boundary: a 6ce-shaped source has no per-host observedAt. A current
+  // directory must accept its bounded legacy projection, not require evidence it never supplied.
+  it.each([false, true])("keeps legacy projections routable without weakening sampled freshness (sampled=%s)", async sampled => {
+    let now = 1_800_000_000_000;
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-compat-"));
+    roots.push(root);
+    const hub = new MeshStore(path.join(root, "hub"), 64 * 1024, 100);
+    const far = new MeshStore(path.join(root, "spoke"), 64 * 1024, 100);
+    const lead = await liveMain(hub, "lead", now);
+    const lane = await liveMain(far, "lane", now);
+    const snapshot = await new StoreBridgeSide(far, "dev1").presence();
+    if (!sampled) snapshot.hosts = snapshot.hosts.map(({ observedAt: _observedAt, ...host }) => host);
+    const side = new StoreBridgeSide(hub, "ryzen3");
+    await side.mirror(snapshot, now);
+    const lease = readHostLeases(hub.root).get(lane.id)!;
+    const host = hub.get(key("topology/hosts/", lane.id))!.value;
+    if (sampled) {
+      expect(host).toHaveProperty("mirrorLease", 1);
+      expect(lease).toMatchObject({ mirrorLease: 1, mirror: { remoteHost: "ryzen3", observedAt: now } });
+    } else {
+      expect(host).not.toHaveProperty("mirrorLease");
+      expect(lease).not.toHaveProperty("mirrorLease");
+      expect(lease).not.toHaveProperty("mirror");
+    }
+    expect(side.holds(lane.id)).toBe(true);
+    const directory = new ParticipantDirectory(hub, { enabled: true, hostId: lead.id, rootId: lead.id, identity: lead });
+    const owner = () => directory.mirroredControlOwner(lane.id, lane.id, lane.id)!;
+    expect(owner()).toMatchObject({ remoteHost: "ryzen3", expiresAt: now + 10_000 });
+    expect(owner()).not.toHaveProperty("bridgeStale");
+    expect(mirroredOwnerRoutingStatus(owner(), now)).toBe("live");
+    // Absence of a sample is not permission to keep an expired legacy deadline alive.
+    // Conversely, a sampled projection still requires fresh evidence; do not relax the reader.
+    now += BRIDGE_LEASE_MS;
+    expect(side.holds(lane.id)).toBe(false);
+    expect(mirroredOwnerRoutingStatus(owner(), now)).toBe("bridge-stale");
+    if (sampled) expect(mirroredLeaseStatus("ryzen3", owner().mirror, now)).toBe("bridge-stale");
+  });
+
   it("retains a spoke root's attribution after a slow pass without reviving its expired authority", async () => {
     let now = 1_800_000_000_000;
     vi.spyOn(Date, "now").mockImplementation(() => now);

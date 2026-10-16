@@ -1,10 +1,11 @@
 import fs from "node:fs";
+import { diagnostics } from "../core/diagnostics.js";
 import path from "node:path";
 import { writeJsonAtomic } from "../core/atomic-write.js";
 import { processStartTime } from "../residency/process-identity.js";
 import { ownedStat, processAlive } from "../storage/scratch.js";
 import { UNRESOLVED_WORKER_FILE } from "../storage/retention.js";
-import { commitRunArchive } from "./archive-custody.js";
+import { clearRunStopIntent, commitRunArchive, readRunStopIntent } from "./archive-custody.js";
 import type { AgentRunResult } from "./types.js";
 
 /**
@@ -26,6 +27,11 @@ import type { AgentRunResult } from "./types.js";
 export const ENODEV_UNRESOLVED_REASON = "Owned scope observation failed: Error: ENODEV";
 const RUN_ID = /^[a-f0-9]{32}$/;
 const MAX_FILE = 4 * 1024 * 1024;
+
+// Host-only provenance: neither worker fields nor serialized checkpoints can mark a result.
+const recoveredDurableStops = new WeakSet<AgentRunResult>();
+/** Only stopped/timed_out objects returned by recoverDurableActorStop carry this identity. */
+export const isRecoveredDurableStop = (result: AgentRunResult): boolean => recoveredDurableStops.has(result);
 
 const readJson = (file: string): Record<string, unknown> | undefined => {
   try {
@@ -52,7 +58,8 @@ export const enodevUnresolvedRuns = (runRoot: string): string[] => {
   try { names = fs.readdirSync(runRoot); } catch { return []; }
   return names.filter(name => RUN_ID.test(name)).map(name => path.join(runRoot, name)).filter(directory => {
     const marker = readJson(path.join(directory, UNRESOLVED_WORKER_FILE));
-    return typeof marker?.reason === "string" && marker.reason.startsWith(ENODEV_UNRESOLVED_REASON);
+    return (typeof marker?.reason === "string" && marker.reason.startsWith(ENODEV_UNRESOLVED_REASON)) ||
+      readRunStopIntent(directory, readJson(path.join(directory, "status.json"))) !== undefined;
   });
 };
 
@@ -80,7 +87,7 @@ export const countUnknownEnodevStarts = (directories: readonly string[], actorId
     highest = Math.max(highest, next);
     if (next !== prior) {
       try { writeJsonAtomic(file, { ...marker, unknownStarts: next }, { durable: true }); } catch (error) {
-        console.warn(`[pi-fabric] actor ${actorId}: could not save unknownStarts ${next} in ${file}: ${String(error)} (smarty-dev#8935)`);
+        diagnostics.warn("src/agents/enodev-recovery.ts", `[pi-fabric] actor ${actorId}: could not save unknownStarts ${next} in ${file}: ${String(error)} (smarty-dev#8935)`);
         if (unknown) { highest = Math.max(highest, UNKNOWN_STARTS_ALARM); alarm = true; }
       }
     }
@@ -88,12 +95,109 @@ export const countUnknownEnodevStarts = (directories: readonly string[], actorId
   return { starts: highest, alarm };
 };
 
-/** The actor activation a run served: the top-level `id` of the item JSON its task carries (ActorManager#runRequest). */
+/** Host-authored first line of task.txt; input data cannot impersonate this manifest. */
+export const ACTOR_ACTIVATION_HEADER = "Fabric activation: ";
+
+/** The immutable activation ID, independent of whether the input is an object or array. */
 const activationOf = (directory: string): string | undefined => {
   try {
-    const quoted = /^  "id": ("(?:[^"\\]|\\.)*")$/m.exec(fs.readFileSync(path.join(directory, "task.txt"), "utf8"))?.[1];
+    const task = fs.readFileSync(path.join(directory, "task.txt"), "utf8");
+    if (task.startsWith(ACTOR_ACTIVATION_HEADER)) {
+      const manifest: unknown = JSON.parse(task.split("\n", 1)[0]!.slice(ACTOR_ACTIVATION_HEADER.length));
+      if (typeof manifest !== "object" || manifest === null || Array.isArray(manifest)) return undefined;
+      const { activationId, batchIds } = manifest as Record<string, unknown>;
+      return typeof activationId === "string" && activationId.length > 0 && Array.isArray(batchIds) &&
+        batchIds.length > 0 && batchIds[0] === activationId && batchIds.every(id => typeof id === "string" && id.length > 0) &&
+        new Set(batchIds).size === batchIds.length ? activationId : undefined;
+    }
+    // Legacy single-event tasks remain recoverable. Never fall back from a malformed manifest.
+    const quoted = /^  "id": ("(?:[^"\\]|\\.)*")$/m.exec(task)?.[1];
     return quoted === undefined ? undefined : JSON.parse(quoted) as string;
   } catch { return undefined; }
+};
+
+/** Keep the restored activation in flight until the old process identity is proven gone.
+ * Run-file changes wake the join; one absolute 60s observation deadline also checks process identity.
+ * A still-live or unproven worker at that deadline keeps custody and its running checkpoint.
+ * Host close abandons observation, NOT custody: the promise stays pending for the next host to recover.
+ */
+const waitForStoppedWorker = (directory: string, currentRecord: () => Record<string, unknown>, closeSignal: AbortSignal): Promise<Record<string, unknown>> =>
+  new Promise(resolve => {
+    const initial = currentRecord();
+    if (enodevWorkerGone(initial)) { resolve(initial); return; }
+    let watcher: fs.FSWatcher | undefined;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const cleanup = (): void => { watcher?.close(); if (timer) clearTimeout(timer); closeSignal.removeEventListener("abort", cleanup); };
+    const check = (): void => {
+      const record = currentRecord();
+      if (enodevWorkerGone(record)) { cleanup(); resolve(record); }
+    };
+    if (closeSignal.aborted) return;
+    try { watcher = fs.watch(directory, check); watcher.unref(); watcher.on("error", () => { watcher?.close(); }); } catch { /* identity fallback below */ }
+    // ponytail: R-no-polling exception pi-fabric#1193: run-file events are primary; no process-exit
+    // event survives the dead host's lost transport/cgroup descriptors, and Node has no pidfd binding.
+    // One unref'd absolute 60s identity check per recovered stop, never rearmed: bounded run-file reads,
+    // kill(pid, 0) and /proc birth checks. It cannot launch Main or wake a resident on its own.
+    // Recovered terminal stops settle this activation quietly; saved completed answers retain delivery.
+    timer = setTimeout(check, 60_000);
+    timer.unref();
+    closeSignal.addEventListener("abort", cleanup, { once: true });
+    check(); // Covers an exit between the first identity check and registering the watcher.
+  });
+
+/** Recover explicit stops before requiring ENODEV evidence: stop intent is written before transport.stop(). */
+export const recoverDurableActorStop = async (runRoot: string, actorId: string, activationId: string,
+  closeSignal: AbortSignal): Promise<AgentRunResult | undefined> => {
+  let directories: string[];
+  try { directories = fs.readdirSync(runRoot).map(name => path.join(runRoot, name)); } catch { return undefined; }
+  for (const directory of directories) {
+    const id = path.basename(directory);
+    if (!RUN_ID.test(id) || activationOf(directory) !== activationId) continue;
+    const statusFile = path.join(directory, "status.json");
+    const status = readJson(statusFile);
+    const intent = readRunStopIntent(directory, status);
+    if (!intent) continue;
+    // Legacy receipts have no identity snapshot. They still fence admission when
+    // retry removed status, but cannot prove an unknown replacement gone.
+    let taskActor: unknown;
+    try { taskActor = JSON.parse(fs.readFileSync(path.join(directory, "task.txt"), "utf8")).actorId; } catch { /* not an actor task */ }
+    const matches = (record: Record<string, unknown> | undefined): record is Record<string, unknown> =>
+      record?.id === id && record.transport === "process" && record.actorId === actorId;
+    const fallback = { id, actorId, transport: "process", status: "running" };
+    const snapshot = intent.recoveryRecord;
+    if (!matches(snapshot) && !matches(status) && taskActor !== actorId) continue;
+    const currentRecord = (): Record<string, unknown> => {
+      const latestStatus = readJson(statusFile);
+      const latestSnapshot = readRunStopIntent(directory, latestStatus)?.recoveryRecord;
+      // An explicit identity-less snapshot means launch is pending: never fall
+      // back to a superseded attempt's status/pid to discharge that custody.
+      return matches(latestSnapshot) ? latestSnapshot : matches(latestStatus) ? latestStatus : fallback;
+    };
+    let record = await waitForStoppedWorker(directory, currentRecord, closeSignal);
+    const latest = readJson(statusFile);
+    if (matches(latest)) record = latest;
+    // Restore the process record needed by the existing completion delivery/ack
+    // path, without consuming or changing its immutable settlement receipt.
+    if (!latest) writeJsonAtomic(statusFile, record, { durable: true });
+    // Completion wins even without ENODEV. Reuse the existing delivery/queue-ack
+    // protocol below rather than overwriting the receipt or settling before delivery.
+    if (savedEnodevAnswer(directory) !== undefined) return undefined;
+    const recoveredIntent = readRunStopIntent(directory, record) ?? intent;
+    if (record.status !== "running" && record.status !== "queued") {
+      if (!["completed", "failed", "stopped", "timed_out"].includes(String(record.status))) continue;
+      const outcome = { ...record, stopIntent: recoveredIntent } as unknown as AgentRunResult;
+      writeJsonAtomic(path.join(directory, "status.json"), outcome, { durable: true });
+      if (outcome.status === "stopped" || outcome.status === "timed_out") recoveredDurableStops.add(outcome);
+      return outcome;
+    }
+    const outcome = { ...record, ...uncleanReceipt(record), status: recoveredIntent.reason === "explicit" ? "stopped" : "timed_out",
+      error: recoveredIntent.reason === "explicit" ? "Agent stopped" : "Agent timed out",
+      stopIntent: recoveredIntent, finishedAt: Date.now() } as unknown as AgentRunResult;
+    writeJsonAtomic(path.join(directory, "status.json"), outcome, { durable: true });
+    recoveredDurableStops.add(outcome);
+    return outcome;
+  }
+  return undefined;
 };
 
 interface EnodevRun { id: string; statusFile: string; record: Record<string, unknown>; activationId: string; text?: string }
@@ -101,10 +205,11 @@ interface EnodevRun { id: string; statusFile: string; record: Record<string, unk
 const inspect = (directory: string, actorId: string): EnodevRun | undefined => {
   const id = path.basename(directory);
   const marker = readJson(path.join(directory, UNRESOLVED_WORKER_FILE));
-  if (typeof marker?.reason !== "string" || !marker.reason.startsWith(ENODEV_UNRESOLVED_REASON)) return undefined;
   const statusFile = path.join(directory, "status.json");
   const record = readJson(statusFile);
   if (!record || record.id !== id || record.actorId !== actorId || record.transport !== "process") return undefined;
+  if (!(typeof marker?.reason === "string" && marker.reason.startsWith(ENODEV_UNRESOLVED_REASON)) &&
+      !readRunStopIntent(directory, record)) return undefined;
   const activationId = activationOf(directory);
   if (activationId === undefined || !enodevWorkerGone(record)) return undefined;
   const settlement = readJson(path.join(directory, "settlement.json"));
@@ -115,10 +220,12 @@ const inspect = (directory: string, actorId: string): EnodevRun | undefined => {
 
 /** Writes the terminal record, discharges the archive custody, and removes the marker LAST (so it runs once). */
 const settle = (directory: string, run: EnodevRun, terminal: Record<string, unknown>): AgentRunResult => {
-  const result = { ...run.record, id: run.id, ...terminal, ...uncleanReceipt(run.record),
+  const stopIntent = readRunStopIntent(directory, run.record);
+  const result = { ...run.record, id: run.id, ...terminal, ...(stopIntent ? { stopIntent } : {}), ...uncleanReceipt(run.record),
     finishedAt: typeof run.record.finishedAt === "number" ? run.record.finishedAt : Date.now() } as unknown as AgentRunResult;
   writeJsonAtomic(run.statusFile, result, { durable: true });
   try { commitRunArchive(directory, "settlement"); } catch { /* no awaiting archive: nothing to discharge */ }
+  clearRunStopIntent(directory);
   fs.rmSync(path.join(directory, UNRESOLVED_WORKER_FILE), { force: true });
   return result;
 };
@@ -188,8 +295,11 @@ export const uncleanReceipt = (record: Record<string, unknown>): { writeReceipt?
 export const goneEnodevOutcome = (directory: string, record: Record<string, unknown>): AgentRunResult => {
   const id = path.basename(directory);
   const text = savedEnodevAnswer(directory);
+  const stopIntent = readRunStopIntent(directory, record);
   const terminal = record.status !== "running" && record.status !== "queued" ? {}
     : text !== undefined ? { status: "completed", text }
+    : stopIntent?.reason === "explicit" ? { status: "stopped", error: "Agent stopped" }
+    : stopIntent?.reason === "deadline" ? { status: "timed_out", error: "Agent timed out" }
     : { status: "failed", settledLost: true, error: "lost: the worker exit was unconfirmed (ENODEV) and no answer was saved" };
   return { ...record, id, ...terminal, ...uncleanReceipt(record), finishedAt: typeof record.finishedAt === "number" ? record.finishedAt : Date.now() } as unknown as AgentRunResult;
 };
@@ -211,8 +321,11 @@ export const settleGoneEnodevLaunch = (directory: string, owned: OwnedProcess | 
   const text = settlement?.version === 1 && settlement.runId === id && settlement.outcome === "completed" &&
     typeof settlement.text === "string" ? settlement.text : undefined;
   const run: EnodevRun = { id, statusFile, record, activationId: "", ...(text === undefined ? {} : { text }) };
+  const stopIntent = readRunStopIntent(directory, record);
   const terminal = record.status !== "running" && record.status !== "queued" ? {}
     : text !== undefined ? { status: "completed", text }
+    : stopIntent?.reason === "explicit" ? { status: "stopped", error: "Agent stopped" }
+    : stopIntent?.reason === "deadline" ? { status: "timed_out", error: "Agent timed out" }
     : { status: "failed", settledLost: true, error: "lost: the worker exit was unconfirmed (ENODEV) and no answer was saved" };
   return settle(directory, run, terminal);
 };
@@ -224,16 +337,26 @@ export const settleGoneEnodevLaunch = (directory: string, owned: OwnedProcess | 
  */
 export const peekEnodevRun = (directory: string, actorId: string, activationId: string): AgentRunResult | undefined => {
   const run = inspect(directory, actorId);
-  if (!run || run.activationId !== activationId || run.text === undefined) return undefined;
-  return { ...run.record, id: run.id, status: "completed", text: run.text, ...uncleanReceipt(run.record),
-    finishedAt: typeof run.record.finishedAt === "number" ? run.record.finishedAt : Date.now() } as unknown as AgentRunResult;
+  if (!run || run.activationId !== activationId) return undefined;
+  const stopIntent = readRunStopIntent(directory, run.record);
+  if (run.text === undefined && !stopIntent) return undefined;
+  const stopped = run.text === undefined && stopIntent?.reason === "explicit";
+  const timedOut = run.text === undefined && stopIntent?.reason === "deadline";
+  return { ...run.record, id: run.id, status: stopped ? "stopped" : timedOut ? "timed_out" : "completed",
+    ...(run.text !== undefined ? { text: run.text } : {}),
+    ...(stopped ? { error: "Agent stopped" } : timedOut ? { error: "Agent timed out" } : {}),
+    ...uncleanReceipt(run.record), finishedAt: typeof run.record.finishedAt === "number" ? run.record.finishedAt : Date.now() } as unknown as AgentRunResult;
 };
 
 /** Settles `directory` for this restored actor activation when every fact above holds; undefined keeps the veto. */
 export const settleEnodevRun = (directory: string, actorId: string, activationId: string): AgentRunResult | undefined => {
   const run = inspect(directory, actorId);
-  if (!run || run.activationId !== activationId || run.text === undefined) return undefined;
-  return settle(directory, run, { status: "completed", enodevDelivered: true, text: run.text });
+  if (!run || run.activationId !== activationId) return undefined;
+  if (run.text !== undefined) return settle(directory, run, { status: "completed", enodevDelivered: true, text: run.text });
+  const stopIntent = readRunStopIntent(directory, run.record);
+  if (stopIntent?.reason === "explicit") return settle(directory, run, { status: "stopped", error: "Agent stopped" });
+  if (stopIntent?.reason === "deadline") return settle(directory, run, { status: "timed_out", error: "Agent timed out" });
+  return undefined;
 };
 
 /**
@@ -256,11 +379,14 @@ export const recoverEnodevTaskRun = (directory: string): "lost" | undefined => {
   if (!record || record.id !== id || record.transport !== "process" || record.actorId !== undefined) return undefined;
   if (!enodevWorkerGone(record)) return undefined;
   const saved = savedEnodevAnswer(directory) !== undefined;
+  const stopIntent = readRunStopIntent(directory, record);
   const terminal = record.status !== "running" && record.status !== "queued";
   // settle() writes the record plus these fields only: no answer text is added (or removed).
-  settle(directory, { id, statusFile, record, activationId: "" }, terminal ? { settledLost: true } : !saved
-    ? { status: "failed", settledLost: true, error: "lost: the worker exit was unconfirmed (ENODEV), no answer was saved and its manager is gone" }
-    : { status: "completed", settledLost: true });
+  settle(directory, { id, statusFile, record, activationId: "" }, terminal ? { settledLost: true } : saved
+    ? { status: "completed", settledLost: true }
+    : stopIntent?.reason === "explicit" ? { status: "stopped", error: "Agent stopped" }
+    : stopIntent?.reason === "deadline" ? { status: "timed_out", error: "Agent timed out" }
+    : { status: "failed", settledLost: true, error: "lost: the worker exit was unconfirmed (ENODEV), no answer was saved and its manager is gone" });
   return "lost";
 };
 
@@ -296,8 +422,11 @@ export const settleLostEnodevRun = (directory: string, actorId: string, pending:
     return run.activationId;
   }
   // settledLost marks it for the install check (pi-fabric#912): a lost run's answer reached no actor.
-  settle(directory, run, run.text === undefined
-    ? { status: "failed", settledLost: true, error: "lost: the worker exit was unconfirmed (ENODEV) and its activation is no longer pending" }
-    : { status: "completed", settledLost: true, text: run.text });
+  const stopIntent = readRunStopIntent(directory, run.record);
+  settle(directory, run, run.text !== undefined
+    ? { status: "completed", settledLost: true, text: run.text }
+    : stopIntent?.reason === "explicit" ? { status: "stopped", error: "Agent stopped" }
+    : stopIntent?.reason === "deadline" ? { status: "timed_out", error: "Agent timed out" }
+    : { status: "failed", settledLost: true, error: "lost: the worker exit was unconfirmed (ENODEV) and its activation is no longer pending" });
   return run.activationId;
 };

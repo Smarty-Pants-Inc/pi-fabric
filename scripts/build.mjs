@@ -52,6 +52,10 @@ const primaryEntryPoints = [
 // path lets a session that loaded the previous index resolve delayed modules
 // after the installed package is replaced, while preserving lazy evaluation.
 const lazyEntryPoints = [
+  // Principal diagnostics load their private file sink only on the first diverted line.
+  "src/core/diagnostics-log.ts",
+  // Command registration is eager; the subcommand implementation loads on invocation.
+  "src/commands/fabric-handler.ts",
   // Native installer bootstrap; never exposed as a guest authority grant.
   "src/actors/slot-authority.ts",
   // Import-only per-materialization claim parsing, not idle registration work.
@@ -85,12 +89,22 @@ const lazyEntryPoints = [
   "src/cli/mesh.ts",
   "src/cli/decisions.ts",
   "src/mesh/nats-auth/cli.ts",
+  // First-use host custody and participant snapshots keep stable lazy paths.
+  "src/topology/host-leases.ts",
+  "src/topology/participant-view.ts",
+  "src/storage/private-dir.ts",
+  "src/topology/nats-drain-receipt.ts",
+  "src/mesh/custody-lock.ts",
+  // Carrier selection and its first-use NATS module have stable lazy paths.
+  "src/transport/index.ts",
+  "src/transport/nats/index.ts",
   "src/thinking-control.ts",
   "src/compaction/owner.ts",
   "src/compaction/orphan-repair.ts",
   "src/decisions/command.ts",
   "src/programs/host.ts",
   "src/core/provider-operations.ts",
+  "src/core/model-served.ts",
   "src/core/auto-approval-classifier-impl.ts",
   "src/guards/foreground-wait.ts",
   "src/agents/model-route.ts",
@@ -197,6 +211,9 @@ const result = await build({
     setup(pluginBuild) {
       pluginBuild.onResolve({ filter: /\/(?:model-policy|fabric-provenance)\.js$/ }, () => ({
         path: resolve("src/host-compatibility.ts"),
+      }));
+      pluginBuild.onResolve({ filter: /\/diagnostics\.js$/ }, () => ({
+        path: resolve("src/core/agent-dir.ts"),
       }));
     },
   }],

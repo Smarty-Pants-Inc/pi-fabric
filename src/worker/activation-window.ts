@@ -211,6 +211,9 @@ export default async function activationWindow(pi: ExtensionAPI): Promise<void> 
     // inventory: opaque keys a trusted report covers, one per occurrence (this dispatch's input, then its output).
     let lastPayload: { tokens: number; wireTokens: number; modelKey: string; reportedTokens?: number | undefined;
       contextWindow: number; overheadTokens: number; inventory: string[] } | undefined;
+    // Like Pi's estimateContextTokens, skip failed/zero-usage turns, not the last good anchor.
+    // Keep its exact dispatch baseline and covered inventory: a retry reports no new coverage.
+    let usageAnchor: typeof lastPayload;
     let admissions = 0;
     pi.on("turn_end", async event => {
       try {
@@ -219,14 +222,19 @@ export default async function activationWindow(pi: ExtensionAPI): Promise<void> 
         admissions = 0;
         if (!window || !lastPayload) return;
         const message = event.message;
-        if (single && message.role === "assistant" && message.stopReason !== "error" && message.stopReason !== "aborted" &&
-            JSON.stringify([message.provider, message.model, message.api]) === lastPayload.modelKey) {
+        if (!single || message.role !== "assistant" ||
+            JSON.stringify([message.provider, message.model, message.api]) !== lastPayload.modelKey) {
+          usageAnchor = undefined; // Ambiguous or foreign reports cannot retain coverage.
+        } else if (message.stopReason !== "error" && message.stopReason !== "aborted") {
           const { input, output, cacheRead, cacheWrite } = message.usage ?? {};
           const parts = [input, output, cacheRead, cacheWrite];
-          const reported = parts.every(n => typeof n === "number" && Number.isFinite(n) && n >= 0)
+          const valid = parts.every(n => typeof n === "number" && Number.isFinite(n) && n >= 0);
+          const reported = valid
             ? Math.max(calculateContextTokens(message.usage), input! + output! + cacheRead! + cacheWrite!) : 0;
+          if (!valid || !Number.isFinite(reported)) usageAnchor = undefined;
           if (Number.isFinite(reported) && reported > 0) {
             lastPayload.reportedTokens = reported;
+            usageAnchor = lastPayload;
             // Usage includes this response's output: its reasoning items are covered. A malformed
             // signature exempts nothing. Parts naming the same native item cover one occurrence.
             const emitted = new Set<string>();
@@ -355,7 +363,8 @@ export default async function activationWindow(pi: ExtensionAPI): Promise<void> 
             const fullTokens = estimateTextTokens(encoded);
             const input = RESPONSES.has(model.api) ? (admitted as { input?: unknown }).input : undefined;
             const modelKey = JSON.stringify([model.provider, model.id, model.api]);
-            const anchor = lastPayload?.modelKey === modelKey ? lastPayload : undefined;
+            if (usageAnchor?.modelKey !== modelKey) usageAnchor = undefined;
+            const anchor = usageAnchor;
             // smarty-dev#10560 R3: only ciphertext the trusted report covers is exempt, once per covered
             // occurrence. Opaque data added, changed, re-identified or duplicated by any transform or the
             // awaited callback is not covered, so it counts in full.
@@ -378,7 +387,8 @@ export default async function activationWindow(pi: ExtensionAPI): Promise<void> 
             });
             // The last same-model report plus all growth since its dispatch (new content, callback or prefix
             // expansions anywhere). Shrinks earn no credit. Without a valid, unambiguous same-model report
-            // (none, invalid, zero, error/aborted, foreign model, side request), the full encoded estimate.
+            // (none, invalid, foreign model, side request), the full encoded estimate. Failed and zero-usage
+            // turns do not replace a good anchor or extend its coverage (smarty-dev#14075).
             const tokens = anchor?.reportedTokens === undefined ? fullTokens
               : Math.max(currentTokens, anchor.reportedTokens + Math.max(0, currentTokens - anchor.wireTokens));
             if (tokens > model.contextWindow) {

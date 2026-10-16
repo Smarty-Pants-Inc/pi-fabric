@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { diagnostics } from "../../core/diagnostics.js";
 import path from "node:path";
 import os from "node:os";
 import { pathToFileURL } from "node:url";
@@ -48,7 +49,7 @@ const selectWorkerRelease = (workerPath: string): { workerPath: string; fabricRe
   if (version === WORKER_PROTOCOL_VERSION && regularFile(selectedWorker) && regularFile(selectedExtension)) {
     return { workerPath: selectedWorker, fabricRelease: current, extensionPath: selectedExtension };
   }
-  console.warn(`[pi-fabric] Installed Fabric release ${current} (worker protocol ${typeof version === "number" ? version : "unknown"}) is incompatible or incomplete; using parent release ${parent} (worker protocol ${WORKER_PROTOCOL_VERSION}).`);
+  diagnostics.warn("src/agents/transports/process-transport.ts", `[pi-fabric] Installed Fabric release ${current} (worker protocol ${typeof version === "number" ? version : "unknown"}) is incompatible or incomplete; using parent release ${parent} (worker protocol ${WORKER_PROTOCOL_VERSION}).`);
   return fallback;
 };
 
@@ -273,7 +274,7 @@ export class ProcessTransport implements AgentTransportAdapter {
     if (this.#scopeWarningLogged) return;
     this.#scopeWarningLogged = true;
     const source = this.processSlice ? `agents.processSlice=${this.processSlice}` : "default task memory cap (app.slice)";
-    console.warn(`[pi-fabric] ${source}: ${reason}; launching worker normally`);
+    diagnostics.warn("src/agents/transports/process-transport.ts", `[pi-fabric] ${source}: ${reason}; launching worker normally`);
   };
 
   async available(): Promise<boolean> {
@@ -287,7 +288,7 @@ export class ProcessTransport implements AgentTransportAdapter {
     request = { ...request, ...(needs !== undefined ? { needs } : {}), ...(requires !== undefined ? { requires } : {}) };
     const placement = this.#placement();
     if (placement) {
-      const preflightDeadline = Date.now() + Math.min(placement.commandTimeoutMs, 8_000);
+      const preflightDeadline = Date.now() + Math.min(placement.commandTimeoutMs, 5_000);
       const capabilities = normalizeAgentCapabilityTokens(placement.capabilities, "agents.placement.capabilities")!;
       const unmet = (needs ?? []).filter(need => !capabilities.includes(need));
       let reason = request.needs?.includes("local") ? "reserved need: local pins to the Main host"
@@ -399,7 +400,7 @@ export class ProcessTransport implements AgentTransportAdapter {
       prepared.workerArguments,
       request.cwd,
       request,
-      prepared.environment,
+      request.childEnvironment ? request.childEnvironment(prepared.environment) : prepared.environment,
       scope,
       7_000, // allow the worker's five-second execution-child cleanup
       process.platform !== "win32", // Windows retains its native-close/helper contract

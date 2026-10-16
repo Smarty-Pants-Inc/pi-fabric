@@ -8,7 +8,7 @@ import {
   type FabricLifecycleEvent,
   type FabricLifecycleSubscription,
 } from "../src/lifecycle/types.js";
-import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
+import { MeshStore, type MeshBatchOperation, type MeshIdentity } from "../src/mesh/store.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { removeHostLease } from "../src/topology/host-leases.js";
 import type {
@@ -95,6 +95,30 @@ afterEach(async () => {
 });
 
 describe("LifecycleBroker", () => {
+  it.each(["file", "sqlite"] as const)("rechecks strict admission after operations, before durable subscription commit (%s)", async stateBackend => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-lifecycle-admission-")); roots.push(root);
+    const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100, { stateBackend });
+    const broker = new LifecycleBroker(mesh, targetIdentity, participants(targetIdentity.id),
+      { enabled: true, pollMs: 20, maxReadEvents: 100 }, vi.fn());
+    brokers.push(broker);
+    const request = { from: source.id, events: ["pi.agent_settled" as const], to: targetIdentity.id,
+      delivery: "followUp" as const, triggerTurn: false };
+    const subscription = await broker.subscribe(request);
+    const original = mesh.writeBatch.bind(mesh);
+    const arm = (ops: MeshBatchOperation[]): MeshBatchOperation[] => ops.map(op => op.kind === "put"
+      ? { ...op, value: (now: number) => { broker.pause(true); return typeof op.value === "function" ? op.value(now) : op.value; } }
+      : { ...op, condition: current => { broker.pause(true); return op.condition?.(current) ?? true; } });
+    const batch = vi.spyOn(mesh, "writeBatch").mockImplementation(input => original({ ...input, ops: arm(input.ops),
+      prepare: (view, files) => arm(input.prepare?.(view, files) ?? []) }));
+    try {
+      await expect(broker.subscribe(request)).rejects.toThrow("admission is held");
+      expect(broker.list().map(row => row.id)).toEqual([subscription.id]);
+      broker.resume();
+      await expect(broker.unsubscribe(subscription.id)).rejects.toThrow("admission is held");
+      expect(broker.list().map(row => row.id)).toEqual([subscription.id]);
+    } finally { batch.mockRestore(); broker.resume(); await broker.close(); mesh.closeState(); }
+  });
+
   it("3864 retains an awaited delivery receipt without advancing a cursor after lease loss", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-lifecycle-lease-")); roots.push(root);
     const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);

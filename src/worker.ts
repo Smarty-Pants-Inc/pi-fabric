@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { childProcessEnvironment } from "./core/atomic-write.js";
+import { diagnostics } from "./core/diagnostics.js";
 import { detachedPreview } from "./core/preview.js";
 import fs from "node:fs";
 import { followUpFile, followUpState, followUpMessageId, releaseFollowUpPayload } from "./agents/follow-up-delivery.js";
@@ -46,6 +47,7 @@ const executionSettled = (): Promise<void> => new Promise(resolve => {
   else resolve();
 });
 import { interruptedModelStreamError, retryableProviderError, WARNING_RETENTION_CAP } from "./worker/provider-error.js";
+import { classifyProviderError } from "./provider-error-class.js";
 import { copyFabricProvenance, type FabricTurnProvenance } from "./fabric-provenance.js";
 import { ActivationSession } from "./worker/activation-session.js";
 import type { ActorContextReseed } from "./worker/context-admission.js";
@@ -296,7 +298,7 @@ const executionGroups = new WeakMap<ChildProcess, ReturnType<typeof executionGro
 let executionCleanup: () => Promise<void> = async () => {};
 const terminateChild = (child: ChildProcess, signal: NodeJS.Signals): void => {
   try { executionGroups.get(child)?.signal(signal); }
-  catch (error) { console.error(`Execution cleanup unresolved: ${String(error)}`); }
+  catch (error) { diagnostics.error("src/worker.ts", `Execution cleanup unresolved: ${String(error)}`); }
 };
 
 
@@ -326,7 +328,7 @@ const crash = createCrashFinisher({
   settled: () => executionSettled(),
   report: writeCrashStatus,
   exit: code => process.exit(code),
-  log: text => console.error(text),
+  log: text => diagnostics.error("src/worker.ts", text),
   // Keep the custodian available to its parent even if no native pipes remain.
   retain: () => { setInterval(() => {}, 1000); },
 });
@@ -1841,8 +1843,23 @@ const main = async (): Promise<void> => {
     }
     // smarty-dev#3238 round 2: the activation window's own window refusal, typed by its bound frame.
     if (activationWindow && event.type === "fabric_activation_window_refusal") {
-      if (event.runId === options.id && event.nonce === activationNonce && event.protocol === 1 &&
-          event.hook === activationHookPath && event.code === "context-overflow") contextOverflowSignal = true;
+      if (!terminalStatus && event.runId === options.id && event.nonce === activationNonce && event.protocol === 1 &&
+          event.hook === activationHookPath && event.code === "context-overflow") {
+        contextOverflowSignal = true;
+        // A native retry preserves its prior provider error until another assistant response.
+        // This bound refusal is the terminal cause, not that stale transient (#14075 CODE-01).
+        // Only finite numeric details may reach the error, never arbitrary frame/provider text.
+        const { tokens, contextWindow } = event;
+        const estimate = typeof tokens === "number" && Number.isFinite(tokens) && tokens >= 0 &&
+          typeof contextWindow === "number" && Number.isFinite(contextWindow) && contextWindow > 0
+          ? `: estimated ${tokens} input tokens, window ${contextWindow}` : "";
+        terminalStatus = "failed";
+        terminalError = `Fabric activation window failed: Context exceeds window${estimate}`;
+        record.error = terminalError;
+        sawAgentError = true;
+        update();
+        killChild();
+      }
       return;
     }
     if (residentProbeNonce && event.type === "fabric_resident_extension_ready") {
@@ -2100,7 +2117,13 @@ const main = async (): Promise<void> => {
         terminalError = silentOverflow ? silentOverflowError(messageRecord, childContextWindow ?? 0) : assistantError(messageRecord);
         // Pi never retries a silent "stop" overflow (it compacts and keeps the answer), so no
         // recovery is pending; any other failed turn may still be recovered by Pi.
-        if (silentOverflow && messageRecord.stopReason === "stop") recoveryWatchdog.clear();
+        const providerError = classifyProviderError(messageRecord);
+        if ((providerError?.type === "model_not_found" || providerError?.code === "model_not_found") &&
+          (providerError.status === 400 || providerError.status === 404)) {
+          // A catalog miss cannot recover on the same model. Stop before native or worker retries;
+          // retain the provider error in the failed result and the existing spawner completion.
+          failStalledChild(terminalError);
+        } else if (silentOverflow && messageRecord.stopReason === "stop") recoveryWatchdog.clear();
         else recoveryWatchdog.arm(terminalError);
       } else {
         recoveryWatchdog.clear();

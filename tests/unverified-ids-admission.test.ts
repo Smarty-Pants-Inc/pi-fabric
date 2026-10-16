@@ -13,8 +13,10 @@ import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import type { FabricInvocationContext } from "../src/protocol.js";
 import { AgentsProvider } from "../src/providers/agents-provider.js";
 import { MeshProvider } from "../src/providers/mesh-provider.js";
-import { RootInbox, rootInboxMessage, rootInboxSession } from "../src/topology/root-inbox.js";
+import { RootInbox, rootInboxSession as unsignedRootInboxSession } from "../src/topology/root-inbox.js";
+import { rootInboxMessage, rootInboxSession } from "./root-inbox-issued-fixture.js";
 import { FabricControlPlane } from "../src/topology/control-plane.js";
+import { eventReceipts } from "../src/topology/root-inbox-shared.js";
 import { AgentMessageRouter } from "../src/providers/agents-message-router.js";
 
 const text = "head fedc9876";
@@ -153,10 +155,12 @@ describe("round-1 admission invariance", () => {
       enabled: true, hostId: "owner-host", pollMs: 10, acknowledgementTimeoutMs: 1_000,
     });
     try {
-      // Stable control IDs are SHA-256 hex (64 chars), not the old 36-char UUID.
-      // Their serialized journal cost remains charged to the same real quota.
+      // Stable control IDs and the two event inbox receipts are SHA-256 hex (64 chars).
+      // smarty-dev#13383 preserves/charges serialized inboxReceipts too: reserve their
+      // real journal cost so only the optional marker exceeds the unchanged quota.
       const deliveryIdBytes = Buffer.byteLength(JSON.stringify("0".repeat(64)));
-      const seed = { from: identity, message: "x".repeat(FOLLOW_UP_LIMITS.senderBytes - Buffer.byteLength(text) - deliveryIdBytes - 16), delivery: "followUp" as const };
+      const inboxReceiptBytes = Buffer.byteLength(JSON.stringify(["0".repeat(64), "0".repeat(64)]));
+      const seed = { from: identity, message: "x".repeat(FOLLOW_UP_LIMITS.senderBytes - Buffer.byteLength(text) - deliveryIdBytes - inboxReceiptBytes - 16), delivery: "followUp" as const };
       before.main.deliverAgent(seed);
       after.main.deliverAgent(seed);
       expect(before.main.deliverAgent({ from: identity, message: text, delivery: "followUp" })).toMatchObject({ queued: true });
@@ -175,11 +179,36 @@ describe("round-1 admission invariance", () => {
       expect(commands).toHaveLength(2);
       expect(commands.every(event => /^[a-f0-9]{64}$/.test((event.data as { commandId: string }).commandId))).toBe(true);
       expect(commands.map(event => (event.data as { message: string }).message)).toEqual([`${text}\n\n${notice}`, text]);
-      expect(fs.existsSync(journal)).toBe(true);
+      const acknowledgements = () => senderStore.read({ topic: "fabric.control.ack" })
+        .map(event => event.data as { commandId: string; accepted: boolean; error?: string; notRun?: boolean });
+      expect(acknowledgements()).toMatchObject([
+        { commandId: (commands[0]!.data as { commandId: string }).commandId, accepted: false, error: expect.stringContaining("Main's followUp queue is full") },
+        { commandId: (commands[1]!.data as { commandId: string }).commandId, accepted: true },
+      ]);
+      const items = JSON.parse(fs.readFileSync(journal, "utf8")).items as Array<{
+        message: string; deliveryId?: string; inboxReceipts?: string[];
+      }>;
+      expect(items).toHaveLength(2);
+      expect(items[1]).toMatchObject({ message: text, inboxReceipts: eventReceipts(commands[1]!) });
+      expect(Buffer.byteLength(JSON.stringify(items[1]!.inboxReceipts))).toBe(inboxReceiptBytes);
+      expect(Buffer.byteLength(JSON.stringify(items[1]!.deliveryId))).toBe(deliveryIdBytes);
+
+      // Only 16 bytes remain: another bare report genuinely cannot fit. The marker
+      // fallback must preserve that refusal, not claim it is safe to resend or deliver twice.
+      await expect(provider.invoke("followUp", { id: after.main.id, message: text }, invocation(session())))
+        .rejects.toThrow(/^Main's followUp queue is full \([^\n]*\); Main is busy and reads followUps only at its next tool boundary\. Wait, or send a short steer\.$/);
+      expect(after.main.queueDepth().pendingFollowUps).toBe(2);
+      expect(senderStore.read({ topic: "fabric.control.command" })
+        .map(event => (event.data as { message: string }).message)).toEqual([`${text}\n\n${notice}`, text, `${text}\n\n${notice}`, text]);
+      expect(acknowledgements().map(ack => ack.accepted)).toEqual([false, true, false, false]);
+      expect(acknowledgements().filter(ack => !ack.accepted).every(ack =>
+        ack.error?.startsWith("Main's followUp queue is full") && !ack.error.includes("not delivered, safe to resend") && ack.notRun !== true)).toBe(true);
+      expect(JSON.parse(fs.readFileSync(journal, "utf8")).items).toEqual(items);
       after.emit("agent_before_settle", { outcome: "completed", context: { pendingMessages: [] } });
       after.main.closeFollowUpDrain();
       expect(after.sent.join("\n")).toContain(text);
       expect(after.sent.join("\n")).not.toContain(notice);
+      expect(after.sent.join("\n").split(text)).toHaveLength(2); // Exactly one report handed to Pi.
     } finally {
       await Promise.all([sender.close(), owner.close()]);
       before.main.closeFollowUpDrain();
@@ -220,6 +249,7 @@ describe("round-1 native root inbox read provenance", () => {
       expect(batch.events).toHaveLength(mixed ? 2 : 1);
       const message = rootInboxMessage(batch.events);
       expect(message.details).toEqual({
+        nonce: expect.any(String),
         ids: batch.events.map(event => event.id),
         receipts: batch.events.flatMap(event => [
           ["", "event", event.id],
@@ -227,6 +257,8 @@ describe("round-1 native root inbox read provenance", () => {
         ].map(fields => createHash("sha256").update(JSON.stringify(fields)).digest("hex"))),
       });
       manager.appendCustomMessageEntry(message.customType, message.content, message.display, message.details);
+      // The same public carrier cannot settle work without its private issuer verifier.
+      expect((await inbox.next(unsignedRootInboxSession(manager.getEntries()))).events).toEqual(batch.events);
       expect((await inbox.next(rootInboxSession(manager.getEntries()))).events).toEqual([]);
       const result = await provider.invoke("publish", { topic: "team", text: mixed ? `${text}; head abc1234` : text }, invocation(manager));
       expect(result).toHaveProperty("notice", notice); // The self echo is not a read; the peer event is.

@@ -212,7 +212,8 @@ function canonical(value: unknown): string {
  * Path B mint schema (opt-in; all original #7504 fields stay unchanged):
  * - account input adds pathBMachines: a nonempty, unique array of 1..64 machine literals
  *   /^[a-z0-9][a-z0-9-]{0,31}$/; canary value ["ryzen2", "ryzen4"].
- * - every user input for that account repeats the same pathBMachines to verify the exact scope.
+ * - Path B agent/maintainer user inputs repeat the same pathBMachines to verify the exact scope.
+ *   Principal and break-glass keys retain their original templates and need no Path B input.
  * - agent input uses its existing `host` field as the machine; it must be in pathBMachines.
  * - maintainer input adds `machine`, in /^fabric-ops(-[a-z0-9]+)?$/ (default choice "fabric-ops").
  *   This is a reserved role namespace, not a host; it is forbidden in pathBMachines and agent credentials.
@@ -322,7 +323,8 @@ export function createNatsAccount(input: unknown, clock: NatsMintClock = systemC
           subject: account.getPublicKey(),
           signingKeys: ORG_ROLES.map((role, index) => ({
             key: scoped[index]!.getPublicKey(), role, template: byRole[role],
-            ...(value.pathBMachines === undefined ? {} : { description: pathBScopeDescription(value.pathBMachines) }),
+            ...(value.pathBMachines === undefined || (role !== "agent" && role !== "maintainer")
+              ? {} : { description: pathBScopeDescription(value.pathBMachines) }),
           })),
           limits,
         },

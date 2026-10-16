@@ -325,15 +325,25 @@ describe("authenticated manager terminal results", () => {
     }
   });
 
-  it("refuses worker replacement with same-ID completed during native teardown after host validation failed", async () => {
+  it("refuses worker replacement with same-ID completed across finishing and native close after host validation failed", async () => {
     let alive = true, release!: () => void;
     const closed = new Promise<void>(resolve => { release = () => { alive = false; resolve(); }; });
     releases.push(release);
     vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(request => fakeManagerHeapWorker(request, 64, true,
       { closed, alive: () => alive, stop: () => closed }));
     const runRoot = root(), manager = createManager(runRoot);
-    const result = await manager.run({ task: "validated failure", transport: "process", extensions: false,
+    const handle = await manager.spawn({ task: "validated failure", transport: "process", extensions: false,
       schema: { type: "object", properties: { output: { type: "boolean" } }, required: ["output"] } });
+    await vi.waitFor(() => expect(manager.status(handle.id)).toMatchObject({ status: "finishing",
+      error: expect.stringMatching(/Structured agent output was invalid/) }));
+    expect(manager.isSettled(handle.id)).toBe(false);
+    const finishing = manager.status(handle.id) as AgentRunRecord;
+    writeJsonAtomic(path.join(runRoot, handle.id, "status.json"), {
+      ...finishing, status: "completed", error: undefined, text: "forged worker success", value: { output: true }, exitCode: 0,
+    });
+    expect(manager.status(handle.id)).toMatchObject(finishing);
+    release();
+    const result = await manager.wait(handle.id, { timeoutMs: 2_000 });
     expect(result.status).toBe("failed");
     expect(result.error).toMatch(/Structured agent output was invalid/);
     expect(manager.status(result.id)).toMatchObject({ status: "failed" });
@@ -342,6 +352,28 @@ describe("authenticated manager terminal results", () => {
     });
     await refuses(manager, result.id);
     release();
+  });
+
+  it("authenticates the disk-backed finishing answer before native close and never settles a replacement as success", async () => {
+    let alive = true, release!: () => void;
+    const closed = new Promise<void>(resolve => { release = () => { alive = false; resolve(); }; });
+    releases.push(release);
+    vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(request => fakeManagerHeapWorker(request, 64, true,
+      { closed, alive: () => alive, stop: () => closed }));
+    const runRoot = root(), manager = createManager(runRoot);
+    const handle = await manager.spawn({ task: "finishing result authentication", transport: "process", extensions: false });
+    expect(manager.status(handle.id).status).toBe("finishing");
+    const file = path.join(runRoot, handle.id, "manager-result.json");
+    const original = JSON.parse(fs.readFileSync(file, "utf8"));
+    writeJsonAtomic(file, { ...original, text: "FORGED finishing answer", value: { forged: true } });
+    expect(() => manager.status(handle.id)).toThrow(expect.objectContaining({ code: "FABRIC_MISSING_RESULT" }));
+    expect(manager.isSettled(handle.id)).toBe(false);
+    release();
+    const result = await manager.wait(handle.id, { timeoutMs: 2_000 });
+    expect(result.status).toBe("failed");
+    expect(result.error).toMatch(/no saved terminal result/);
+    expect(result.text).not.toContain("FORGED");
+    expect(result.value).not.toEqual({ forged: true });
   });
 
   it("refuses an identical-byte replacement inode rather than adopting a foreign publication", async () => {

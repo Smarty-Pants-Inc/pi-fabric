@@ -571,8 +571,7 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
    *  `stopRequested`, a monitor deadline never sets it. */
   explicitStopRequested?: boolean;
   finalAnswer?: FinalAnswerReceipt;
-  finalAnswerResult?: AgentRunResult;
-  /** Full immutable published outcome, demand-loaded after settlement. */
+  /** Full immutable validated answer/outcome, demand-loaded during finishing and after settlement. */
   settledResultFile?: string;
   /** Constant-sized proof of the manager-origin result publication. */
   resultFingerprint?: PrivateFileFingerprint;
@@ -3504,8 +3503,7 @@ export class AgentManager {
     const managed = this.#requireRun(id);
     this.#observeFinalAnswer(managed);
     this.#routeTerminalNotices(managed);
-    const record = managed.settled ? this.#readResult(managed)
-      : managed.finalAnswerResult ?? this.#readResult(managed) ?? managed.latestRecord;
+    const record = this.#readResult(managed) ?? managed.latestRecord;
     if (!record) {
       const info = this.#handleInfo(managed, "running");
       const deliveries = this.#checkFollowUps(managed);
@@ -3547,6 +3545,10 @@ export class AgentManager {
     const projection = (managed: ManagedAgent): AgentRunRecord | AgentHandleInfo => {
       let record = managed.latestUiRecord;
       if (!record) {
+        // A finishing task whose preview was byte-evicted remains visible as a
+        // handle. Rehydrating every full answer here defeats the UI byte budget
+        // and makes each refresh read all native-close obligations' payloads.
+        if (!managed.settled && managed.finalAnswerStatus && !managed.latestRecord) return this.#handleInfo(managed, "finishing");
         const latest = managed.latestRecord ?? this.#readResult(managed);
         if (!latest) return this.#handleInfo(managed, "running");
         record = compactUiRecord(latest);
@@ -4388,7 +4390,7 @@ export class AgentManager {
 
   #terminalError(managed: ManagedAgent): FabricTargetTerminalError {
     return new FabricTargetTerminalError(managed.id, managed.finalAnswer!.id,
-      managed.finalAnswerResult?.status ?? managed.finalAnswerStatus ?? "final-answer-pending");
+      managed.finalAnswerStatus ?? "final-answer-pending");
   }
 
   /** Close the receipt-publication race between ingress preflight and append. */
@@ -5378,7 +5380,7 @@ export class AgentManager {
     if (managed.actorId || managed.runner !== "pi" || managed.transport.kind !== "process") return false;
     if (managed.finalAnswer) return true;
     // Settlement already authenticated its outcome; a later worker receipt
-    // cannot create a new finalAnswerResult or replace that terminal boundary.
+    // cannot create a new answer or replace that terminal boundary.
     if (managed.settled) return false;
     const receipt = readFinalAnswerReceipt(managed.runDirectory, managed.id);
     if (!receipt) return false;
@@ -5405,7 +5407,7 @@ export class AgentManager {
           snapshot = failedRecord(managed, "failed", "Final answer has no associated validated worker status");
         }
       }
-      const record = { ...(snapshot ?? failedRecord(managed, "failed", "Final answer has no worker status")),
+      let record: AgentRunResult | undefined = { ...(snapshot ?? failedRecord(managed, "failed", "Final answer has no worker status")),
         finalAnswerReceipt: { id: receipt.id, recordedAt: receipt.recordedAt },
         finishedAt: receipt.recordedAt,
       } as AgentRunResult;
@@ -5428,7 +5430,24 @@ export class AgentManager {
       // The receipt freezes the validated answer and rejects late controls.
       // Public terminal publication still joins captured execution-tree exit.
       if (record.status === "completed") record.exitCode = 0;
-      managed.finalAnswerResult = record;
+      // Freeze the host-validated answer through main's authenticated file seam,
+      // without publishing settlement or retaining its full payload until close.
+      const resultFile = path.join(managed.runDirectory, MANAGER_RESULT_FILE);
+      try {
+        managed.resultFingerprint = writePrivateJsonAtomic(resultFile, this.#withTransportMetadata(record, managed, false));
+        managed.settledResultFile = resultFile;
+      } catch (error) {
+        // Storage failure retains the original validated payload for retry, as
+        // main's terminal publication does; it is not native-exit uncertainty.
+        managed.settlementSaveFailure = {
+          result: structuredClone(record),
+          warning: `Terminal result save failed; run retained: ${error instanceof Error ? error.message : String(error)}`,
+        };
+      }
+      managed.finalAnswerStatus = record.status;
+      managed.latestRecord = compactUiRecord(record);
+      snapshot = undefined;
+      record = undefined;
       this.#invalidateUiList();
       // The receipt closes input now, not result custody. Route admitted sender
       // refusals without waiting for the execution tree to empty.
@@ -5437,6 +5456,8 @@ export class AgentManager {
       this.#routeTerminalNotices(managed);
       await this.#waitForTransportExit(managed, Date.now() + (managed.transport.finishingGraceMs ?? TRANSPORT_EXIT_GRACE_MS) * 2);
       await this.#drainExecution(managed);
+      // Demand-load the exact authenticated answer only after native close.
+      record = this.#readResult(managed) as AgentRunResult;
       // Cleanup may append diagnostics after the answer snapshot was sealed.
       // Only the same receipt's worker record can supplement its warnings.
       const drained = readRecord(managed.statusFile);
@@ -5449,7 +5470,7 @@ export class AgentManager {
       const record = { ...failedRecord(managed, "failed", `Final answer validation failed: ${String(error)}`),
         finalAnswerReceipt: { id: receipt.id, recordedAt: receipt.recordedAt } };
       this.#markLost(managed, String(error));
-      managed.finalAnswerResult = record;
+      managed.finalAnswerStatus = record.status;
       this.#settle(managed, record);
     });
     // Observation from status/late ingress can settle outside the monitor. It
@@ -5546,8 +5567,8 @@ export class AgentManager {
       }
       this.#drainLifecycle(managed);
       if (this.#observeFinalAnswer(managed)) {
-        // Result observers release now. Native admission/files remain fenced by
-        // executionRelease until the existing owned-tree drain proves close.
+        // The receipt freezes input; result observers still join the owned-tree
+        // drain before settlement, completion callbacks, and permit release.
         await managed.finalAnswerCompletion;
         await this.#drainExecution(managed);
         this.#drainLifecycle(managed);
@@ -6063,8 +6084,7 @@ export class AgentManager {
         ...(full.error !== undefined ? { error: uiText(full.error, SETTLED_SUMMARY_ERROR_CHARS) } : {}),
       };
       // Main's terminal refusal reports the associated validated status; keep only that scalar.
-      if (managed.finalAnswerResult) managed.finalAnswerStatus = managed.finalAnswerResult.status;
-      delete managed.finalAnswerResult;
+      if (managed.finalAnswer) managed.finalAnswerStatus = full.status;
       return true;
     } catch (error) {
       managed.settlementSaveFailure = {
@@ -6570,12 +6590,6 @@ export class AgentManager {
     return {
       ...safeRecord,
       ...(managed.finalAnswer ? { finalAnswerReceipt: { id: managed.finalAnswer.id, recordedAt: managed.finalAnswer.recordedAt } } : {}),
-      ...(managed.finalAnswerResult && record.errorCode !== "CUSTODY_UNCONFIRMED" ? {
-        status: managed.finalAnswerResult.status, text: managed.finalAnswerResult.text,
-        finishedAt: managed.finalAnswerResult.finishedAt, finalAnswerReceipt: managed.finalAnswerResult.finalAnswerReceipt,
-        value: managed.finalAnswerResult.value, error: managed.finalAnswerResult.error,
-        exitCode: managed.finalAnswerResult.exitCode,
-      } : {}),
       ...managed.runRoute,
       ...(includeSaveFailure && managed.settlementSaveFailure
         ? { warnings: [...(record.warnings ?? []), managed.settlementSaveFailure.warning] }

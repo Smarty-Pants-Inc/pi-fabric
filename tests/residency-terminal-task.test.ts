@@ -47,19 +47,54 @@ const fixture = () => {
   writeJsonAtomic(path.join(config.residencyRoot, "config.json"), config);
   // The resident broker/bootstrap is real; capture transport close explicitly
   // so final-answer routing cannot accidentally stand in for execution exit.
+  // This in-process adapter mirrors the fake worker's boot gate: launch returns
+  // before readiness, the worker announces entry, and status appears only after
+  // the release. Stop also closes the handle, as the native transport does.
   const closures = new Map<string, () => void>();
   const launch = vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async request => {
     const args = new Map<string, string>();
     for (let i = 0; i < request.workerArguments.length; i += 2) args.set(request.workerArguments[i]!, request.workerArguments[i + 1]!);
-    writeJsonAtomic(args.get("--status-file")!, { id: request.id, name: request.name, task: "task", status: "running", runner: "pi", transport: "process",
-      cwd: request.cwd, startedAt: Date.now(), updatedAt: Date.now(), turns: 1, toolCalls: 0, text: "progress",
-      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 } });
+    const task = args.get("--task-file") ? fs.readFileSync(args.get("--task-file")!, "utf8") : "";
+    const gateMatch = task.match(/"fakeWorkerBootGate":\s*("(?:\\\\.|[^"\\\\])*")/);
+    const gate = gateMatch ? JSON.parse(gateMatch[1]!) as string : undefined;
     let alive = true;
-    const closed = new Promise<void>(resolve => { closures.set(request.id, () => { alive = false; resolve(); }); });
-    return { kind: "process", closed, isAlive: async () => alive, waitForClose: () => closed, stop: async () => { await closed; } };
+    let resolveBoot!: () => void;
+    let bootReleased = !gate;
+    const bootReady = new Promise<void>(resolve => {
+      resolveBoot = () => {
+        if (bootReleased) return;
+        bootReleased = true;
+        resolve();
+      };
+      if (!gate) resolve();
+    });
+    let watcher: fs.FSWatcher | undefined;
+    if (gate) {
+      fs.writeFileSync(`${gate}.entered`, "ready");
+      watcher = fs.watch(path.dirname(gate), () => { if (fs.existsSync(gate)) resolveBoot(); });
+      if (fs.existsSync(gate)) resolveBoot();
+    }
+    let resolveClosed!: () => void;
+    const closed = new Promise<void>(resolve => { resolveClosed = resolve; });
+    const close = () => {
+      if (!alive) return;
+      alive = false;
+      watcher?.close();
+      resolveBoot();
+      resolveClosed();
+    };
+    closures.set(request.id, close);
+    void (async () => {
+      await bootReady;
+      if (!alive) return;
+      writeJsonAtomic(args.get("--status-file")!, { id: request.id, name: request.name, task, status: "running", runner: "pi", transport: "process",
+        cwd: request.cwd, startedAt: Date.now(), updatedAt: Date.now(), turns: 0, toolCalls: 0, text: "",
+        usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 } });
+    })();
+    return { kind: "process", closed, isAlive: async () => alive, waitForClose: () => closed, stop: async () => close() };
   });
   return { root, config, host: new ResidentHost(config, () => {}), close: (id?: string) => {
-    if (id) closures.get(id)!(); else for (const close of closures.values()) close();
+    if (id) closures.get(id)?.(); else for (const close of closures.values()) close();
   }, launch };
 };
 // A transport handle is not worker readiness. Read and validate in the retry,

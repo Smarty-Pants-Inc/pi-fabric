@@ -162,82 +162,151 @@ export class NatsKvStore implements TransportKv {
 
   async *watch<V>(prefix: string, signal: AbortSignal): AsyncIterable<TransportKvEvent<V>> {
     validatePrefix(prefix);
+    if (signal.aborted) return;
     const stream = `KV_${this.#policy.bucket}`;
     const subjectPrefix = `$KV.${this.#policy.bucket}.`;
-    while (!signal.aborted) {
-      const queue = new Readable({ objectMode: true, read() {} });
-      let messages: ConsumerMessages | undefined;
-      let reset = false;
-      let ready = false;
-      let reconnect: Promise<void> | undefined;
-      let releaseReconnect: (() => void) | undefined;
-      const emit = (event: TransportKvEvent<V>): void => { if (!queue.readableEnded && !queue.destroyed) queue.push(event); };
-      const end = (): void => { messages?.stop(); if (!queue.destroyed) queue.push(null); };
-      const gap = (): void => {
-        if (reset || signal.aborted) return;
-        reset = true;
-        emit({ type: "reset" });
-        end();
-      };
-      const stop = (): void => { releaseReconnect?.(); end(); };
-      signal.addEventListener("abort", stop, { once: true });
-      const unsubscribe = this.#onStatus?.((status) => {
-        if (status.type === "disconnect") {
+    let disconnected = false;
+    let closed = false;
+    let reconnect = Promise.resolve();
+    let releaseReconnect: (() => void) | undefined;
+    let invalidate: (() => void) | undefined;
+    let endEpoch: (() => void) | undefined;
+    const stop = (): void => { releaseReconnect?.(); endEpoch?.(); };
+    // Keep connection observation across snapshot generations, including setup and
+    // the reconnect wait. Re-subscribing per generation can miss a disconnect.
+    signal.addEventListener("abort", stop, { once: true });
+    const unsubscribe = this.#onStatus?.((status) => {
+      if (status.type === "disconnect") {
+        if (!disconnected) {
+          disconnected = true;
           reconnect = new Promise<void>((resolve) => { releaseReconnect = resolve; });
-          gap();
         }
-        if (status.type === "reconnect" || status.type === "close") releaseReconnect?.();
-      });
-      try {
-        // The official ordered consumer exposes the creation snapshot and status markers
-        // hidden by KV.watch(). No keys() race or private client fields are involved.
-        const consumer = await this.#js.consumers.getPushConsumer(stream, {
-          filter_subjects: `${subjectPrefix}${prefix}`,
-          deliver_policy: DeliverPolicy.LastPerSubject,
-        });
-        const snapshot = await consumer.info(true);
-        const apply = (msg: JsMsg): void => {
-          if (reset || signal.aborted) return;
-          const key = msg.subject.slice(subjectPrefix.length);
-          const operation = msg.headers?.get("KV-Operation");
-          if (operation === "DEL" || operation === "PURGE") {
-            const [machine] = splitKey(key);
-            emit({ type: "gone", key, machine, revision: msg.info.streamSequence,
-              reason: msg.headers?.get("Nats-Marker-Reason") === "MaxAge" ? "expired" : "deleted" });
-          } else {
-            emit({ type: "put", entry: decodeValue<V>(key, msg.data, msg.info.streamSequence) });
-          }
-          if (!ready && msg.info.pending === 0) {
-            ready = true;
-            emit({ type: "ready" });
-          }
+        invalidate?.();
+      }
+      if (status.type === "reconnect" || status.type === "close") {
+        disconnected = false;
+        closed = status.type === "close";
+        if (closed) invalidate?.();
+        releaseReconnect?.();
+      }
+    });
+    try {
+      while (!signal.aborted && !closed) {
+        if (disconnected) await reconnect;
+        if (signal.aborted || closed) return;
+        const queue = new Readable({ objectMode: true, read() {} });
+        let messages: ConsumerMessages | undefined;
+        let statusTask: Promise<void> | undefined;
+        let closedTask: Promise<void> | undefined;
+        let reset = false;
+        let ready = false;
+        let ended = false;
+        let failure: unknown;
+        let delivered = 0;
+        const emit = (event: TransportKvEvent<V>): void => { if (!ended && !queue.destroyed) queue.push(event); };
+        const end = (): void => {
+          messages?.stop();
+          if (!ended && !queue.destroyed) queue.push(null);
+          ended = true;
         };
-        if (snapshot.num_pending === 0) {
+        const gap = (): void => {
+          if (reset || signal.aborted || ended) return;
+          reset = true;
+          emit({ type: "reset" });
+          end();
+        };
+        const markReady = (): void => {
+          if (ready || reset || signal.aborted || closed || ended) return;
           ready = true;
           emit({ type: "ready" });
-        }
-        messages = await consumer.consume({ callback: apply });
-        const statusTask = (async () => {
-          for await (const status of messages!.status()) {
-            if (["heartbeats_missed", "ordered_consumer_recreated", "consumer_deleted", "stream_not_found"].includes(status.type)) gap();
-            if (status.type === "heartbeat" && !ready && !reset) {
-              ready = true;
-              emit({ type: "ready" });
+        };
+        invalidate = gap;
+        endEpoch = end;
+        try {
+          try {
+            // Official ordered push API: creation metadata covers an empty snapshot;
+            // pending=0 or an in-order heartbeat covers the last snapshot delivery.
+            // Do not count the initial pending entries: deletes/expiry can remove them.
+            const consumer = await this.#js.consumers.getPushConsumer(stream, {
+              filter_subjects: `${subjectPrefix}${prefix}`,
+              deliver_policy: DeliverPolicy.LastPerSubject,
+            });
+            const initial = await consumer.info(true);
+            const apply = (msg: JsMsg): void => {
+              if (reset || signal.aborted || ended) return;
+              try {
+                const info = msg.info;
+                // Recreation status is asynchronous; reject a new generation's data
+                // synchronously, before it can leak into the old ready view.
+                if (info.consumer !== initial.name || info.deliverySequence !== delivered + 1) {
+                  gap();
+                  return;
+                }
+                delivered = info.deliverySequence;
+                const key = msg.subject.slice(subjectPrefix.length);
+                const operation = msg.headers?.get("KV-Operation");
+                // Server-generated expiry markers have no KV-Operation header.
+                const expired = msg.headers?.get("Nats-Marker-Reason") === "MaxAge";
+                if (expired || operation === "DEL" || operation === "PURGE") {
+                  const [machine] = splitKey(key);
+                  emit({ type: "gone", key, machine, revision: info.streamSequence,
+                    reason: expired ? "expired" : "deleted" });
+                } else {
+                  emit({ type: "put", entry: decodeValue<V>(key, msg.data, info.streamSequence) });
+                }
+                if (info.pending === 0) markReady();
+              } catch (error) {
+                failure = error;
+                end();
+              }
+            };
+            if (initial.num_pending === 0) markReady();
+            if (!reset && !signal.aborted && !closed) {
+              messages = await consumer.consume({ callback: apply });
+              statusTask = (async () => {
+                for await (const status of messages!.status()) {
+                  switch (status.type) {
+                    case "heartbeats_missed":
+                    case "ordered_consumer_recreated":
+                    case "consumer_deleted":
+                    case "consumer_not_found":
+                    case "stream_not_found":
+                    case "reset":
+                      gap();
+                      break;
+                    case "heartbeat":
+                      if (status.lastConsumerSequence > delivered) gap();
+                      else if (status.lastConsumerSequence === delivered) markReady();
+                      break;
+                  }
+                }
+              })();
+              closedTask = messages.closed().then((error) => {
+                if (error) { failure = error; end(); }
+                else if (!signal.aborted) gap();
+                else end();
+              });
+              if (reset || signal.aborted || closed) end();
             }
+          } catch (error) {
+            // A disconnect during consumer creation still owes the caller reset,
+            // then a fresh snapshot after reconnect, not a terminal request error.
+            if (!reset && !signal.aborted && !closed) throw error;
           }
-        })();
-        const closedTask = messages.closed().then(() => { if (!signal.aborted) gap(); else end(); });
-        for await (const event of queue) yield event as TransportKvEvent<V>;
-        await messages.close();
-        await Promise.all([statusTask, closedTask]);
-        if (reconnect && !signal.aborted) await reconnect;
-      } finally {
-        signal.removeEventListener("abort", stop);
-        messages?.stop();
-        unsubscribe?.();
-        queue.destroy();
+          for await (const event of queue) yield event as TransportKvEvent<V>;
+          if (failure) throw failure;
+          if (!reset) return;
+        } finally {
+          invalidate = undefined;
+          endEpoch = undefined;
+          await messages?.close();
+          await Promise.all([statusTask, closedTask]);
+          queue.destroy();
+        }
       }
-      if (!reset) return;
+    } finally {
+      signal.removeEventListener("abort", stop);
+      unsubscribe?.();
     }
   }
 

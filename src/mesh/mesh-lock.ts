@@ -47,6 +47,11 @@ interface MeshInvocationContext {
 
 const meshInvocationStorage = new AsyncLocalStorage<MeshInvocationContext>();
 
+/** Host-only: publication owed by an already committed actor, not a new guest write.
+ * Exit only for this continuation; never detach the dispatch or its sibling writers.
+ * Store shutdown signals and the ordinary lock budget still apply. */
+export const withCommittedMeshPublication = <T>(operation: () => T): T => meshInvocationStorage.exit(operation);
+
 export const withMeshInvocationContext = async <T>(
   context: Omit<MeshInvocationContext, "closed" | "detached" | "expired">,
   operation: () => T | Promise<T>,

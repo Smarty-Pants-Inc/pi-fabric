@@ -10,6 +10,7 @@ import { ActionRegistry } from "../src/core/action-registry.js";
 import { FabricExecutionService } from "../src/execution-service.js";
 import type { FabricActionDescriptor } from "../src/protocol.js";
 import { formatFailureProgress } from "../src/failure-progress.js";
+import { executeAfterAdmission } from "./helpers/admission-clock.js";
 
 const trace = (
   outcome: FabricExecutionTraceV1["outcome"],
@@ -218,12 +219,15 @@ describe("formatFailureProgress", () => {
         };
       },
     });
+    let admitted = false;
+    let admit = () => {};
     registry.register({
       name: "demo",
       description: "demo",
       async list() { return [block]; },
       async describe(name) { return name === block.name ? block : undefined; },
       async invoke(_name, _args, context) {
+        admit();
         return new Promise((_resolve, reject) => {
           context.signal?.addEventListener("abort", () => reject(context.signal!.reason), { once: true });
         });
@@ -234,27 +238,32 @@ describe("formatFailureProgress", () => {
     config.approvals.network = "allow";
     config.approvals.read = "allow";
     config.executor.timeoutMs = 50;
-    const result = await new FabricExecutionService(registry, config).execute({
-      code: `
+    try {
+      const result = await executeAfterAdmission((signal, startClock) => {
+        admit = () => { admitted = true; startClock(); };
+        return new FabricExecutionService(registry, config).execute({
+          code: `
 await tools.call({ ref: "agents.followUp", args: { id: "target", message: "private follow-up" } });
 await tools.call({ ref: "mesh.publish", args: { topic: "private-topic" } });
 await tools.call({ ref: "demo.block", args: {} });
 `,
-      signal: undefined,
-      parentToolCallId: "failure-progress-integration",
-      context: { cwd: process.cwd(), hasUI: false } as ExtensionContext,
-      onPartial() {},
-    });
+          signal,
+          parentToolCallId: "failure-progress-integration",
+          context: { cwd: process.cwd(), hasUI: false } as ExtensionContext,
+          onPartial() {},
+        });
+      }, () => admitted);
 
-    expect(result.success).toBe(false);
-    const formatted = formatFailureProgress(result.trace)!;
-    expect(formatted).toContain("messageId=message-actual");
-    expect(formatted).toContain("deliveryId=delivery-actual");
-    expect(formatted).toContain("id=event-actual");
-    expect(formatted).toContain("sequence=17");
-    expect(formatted).toContain("Started but not confirmed (delivery outcome unknown): demo.block");
-    expect(formatted).not.toContain("private follow-up");
-    expect(formatted).not.toContain("private event text");
+      expect(result.success).toBe(false);
+      const formatted = formatFailureProgress(result.trace)!;
+      expect(formatted).toContain("messageId=message-actual");
+      expect(formatted).toContain("deliveryId=delivery-actual");
+      expect(formatted).toContain("id=event-actual");
+      expect(formatted).toContain("sequence=17");
+      expect(formatted).toContain("Started but not confirmed (delivery outcome unknown): demo.block");
+      expect(formatted).not.toContain("private follow-up");
+      expect(formatted).not.toContain("private event text");
+    } finally { await registry.close(); }
   });
 
   it("bounds long ordinary call lists and paths", () => {

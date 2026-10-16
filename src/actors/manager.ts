@@ -84,6 +84,7 @@ import { ActorSlotRecovery } from "./slot-recovery.js";
 import { ActorSlotClaimRefusedError } from "./slot-authority.js";
 import { observeActorOwnership, ownershipPointReads } from "../topology/publication-generation.js";
 import { withStateFence } from "../mesh/commit-outbox.js";
+import { withCommittedMeshPublication } from "../mesh/mesh-lock.js";
 import { deleteRootActorTree } from "../topology/main-publication-fence.js";
 import { writeJsonAtomic, syncPathNamespace, syncDirectoryChain } from "../core/atomic-write.js";
 import { mainExecutionCeilingAbortReason, settleWithin } from "../async-settlement.js";
@@ -1833,10 +1834,15 @@ export class ActorManager {
         routerStartSettled = true;
         await this.#recordSpawnRouterStart(request, actor, routerAdmission);
       }
-    await this.#publishPresence(actor);
-    await this.#publishSlotCreated(actor);
-    this.#scheduleNatsEventsSync();
-    return this.#publicInfo(actor);
+      // Birth is committed: the known-ID receipt and materialized actor now owe
+      // registry/presence publication even if guest observation ends while a lock
+      // is held. Transfer only this obligation, never the caller's mesh authority.
+      await withCommittedMeshPublication(async () => {
+        await this.#publishPresence(actor);
+        await this.#publishSlotCreated(actor);
+      });
+      this.#scheduleNatsEventsSync();
+      return this.#publicInfo(actor);
     } catch (error) {
       if (!admitted) throw error;
       throw new ActorSlotCreateUncertainError({ actorId: id, claimKey: request.slotClaim?.key,

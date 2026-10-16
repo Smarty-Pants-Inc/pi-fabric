@@ -399,7 +399,7 @@ export class ProcessTransport implements AgentTransportAdapter {
       prepared.workerArguments,
       request.cwd,
       request,
-      prepared.environment,
+      request.childEnvironment ? request.childEnvironment(prepared.environment) : prepared.environment,
       scope,
       7_000, // allow the worker's five-second execution-child cleanup
       process.platform !== "win32", // Windows retains its native-close/helper contract

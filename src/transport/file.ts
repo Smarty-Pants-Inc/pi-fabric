@@ -88,18 +88,21 @@ export class FileTransport implements FabricTransport {
     this.reader = new FileControlReader(mesh, self.hostId);
   }
 
-  /** Legacy-envelope entry used by the control plane: retain its random event id and all
-   * native commit predicates. E1: a wake/barrier failure cannot be called "not persisted".
-   * Capture the native fenced append's positive receipt, or reconcile by its unique
-   * event id. An unchanged complete log boundary proves a pre-append failure; missing
-   * readback after compaction or an I/O error remains uncertain. */
+  /** Legacy-envelope entry: preserve native ids, stamps, fences and completion errors.
+   * The control plane must observe publication uncertainty even after a positive append. */
   publish(input: MeshPublishInput): Promise<MeshEvent> {
-    const operation = this.#publish(input);
+    if (this.#closed) return Promise.reject(new TransportUnavailableError("File transport closed"));
+    return this.#trackPublish(this.mesh.publish(input));
+  }
+
+  #trackPublish(operation: Promise<MeshEvent>): Promise<MeshEvent> {
     this.#publishes.add(operation);
     void operation.finally(() => this.#publishes.delete(operation)).catch(() => undefined);
     return operation;
   }
 
+  /** Generic E1 send reconciliation: keep positive append evidence despite completion
+   * failures; only an unchanged complete log boundary proves a pre-append failure. */
   async #publish(input: MeshPublishInput): Promise<MeshEvent> {
     if (this.#closed) throw new TransportUnavailableError("File transport closed");
     const id = input.id ?? randomUUID();
@@ -185,12 +188,12 @@ export class FileTransport implements FabricTransport {
     // control-seen dedupes the stable commandId, not MeshEvent.id (E1).
     let event: MeshEvent;
     try {
-      event = await this.publish({
+      event = await this.#trackPublish(this.#publish({
         id: randomUUID(), topic: captured.kind === "command" ? CONTROL_TOPIC : ACK_TOPIC,
         kind: captured.operation, to: captured.to.hostId, from: captured.from,
         principal: captured.principal, ...(captured.sender ? { sender: captured.sender } : {}),
         data: captured.body, signal,
-      });
+      }));
     } catch (error) {
       // A port caller retries its logical id, never the private native append id.
       if (error instanceof TransportUncertainError) {

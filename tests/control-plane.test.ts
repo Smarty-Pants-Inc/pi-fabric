@@ -15,7 +15,7 @@ import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { createMainExecutionCeilingError } from "../src/async-settlement.js";
 import { removeHostLease, writeHostLease } from "../src/topology/host-leases.js";
 import type { FabricParticipantRecord } from "../src/topology/types.js";
-import { FileControlReader } from "../src/transport/file.js";
+import { FileControlReader, FileTransport } from "../src/transport/file.js";
 
 const roots: string[] = [];
 const planes: FabricControlPlane[] = [];
@@ -129,6 +129,94 @@ describe("saved steer/followUp ACK obligations (#9751)", () => {
     });
     return { release, spy, calls: () => calls, highWater: () => highWater };
   };
+
+  // Keep reason: the recorded #9751 custody regression needs native completion-error
+  // transparency, while E1 deliberately reconciles the generic send path differently.
+  it("9751: FILE native publish and generic send preserve definite pre-append errors and permit a real retry", async () => {
+    const f = setup(), transport = new FileTransport(f.mesh, { machine: "mesh", hostId: ownerId });
+    const publish = f.mesh.publish.bind(f.mesh);
+    const exactError = Object.assign(new Error("definite pre-append refusal"), { code: "FABRIC_MESH_LOCK_TIMEOUT" });
+    const native = { ...f.command("native-definite"), id: "native:definite" };
+    const generic = f.command("generic-definite");
+    const envelope = { id: "logical:definite", kind: "command" as const,
+      to: { machine: "mesh", hostId: ownerId }, targetId: "agent:same", operation: "steer",
+      from: generic.from, body: generic.data };
+    let refuse = true;
+    const spy = vi.spyOn(f.mesh, "publish").mockImplementation(async input => {
+      if (refuse) throw exactError; // No call-through: the native append has not begun.
+      return publish(input);
+    });
+    try {
+      await expect(transport.publish(native)).rejects.toBe(exactError);
+      await expect(transport.send(envelope)).rejects.toBe(exactError);
+      expect(spy).toHaveBeenCalledTimes(2);
+      expect(spy.mock.calls[0]![0].id).toBe(native.id);
+      const failedGenericId = spy.mock.calls[1]![0].id;
+      expect(failedGenericId).toEqual(expect.any(String));
+      expect(failedGenericId).not.toBe(envelope.id);
+      expect(f.mesh.read({ limit: 1_000 })).toEqual([]);
+
+      // Neither rejected operation may be reported as successful custody. Once the
+      // definite refusal clears, explicit retries must reach the real append once each.
+      refuse = false;
+      const nativeReceipt = await transport.publish(native);
+      const genericReceipt = await transport.send(envelope);
+      const events = f.mesh.read({ limit: 1_000 });
+      expect(spy).toHaveBeenCalledTimes(4);
+      expect(events).toHaveLength(2);
+      expect(events[0]).toEqual(nativeReceipt);
+      expect(nativeReceipt).toMatchObject({ id: native.id, data: native.data });
+      expect(events.filter(event => event.id === native.id)).toHaveLength(1);
+      const genericEvent = events[1]!;
+      expect(genericEvent.id).toBe(spy.mock.calls[3]![0].id);
+      expect(genericEvent.id).not.toBe(failedGenericId);
+      expect(genericEvent.id).not.toBe(envelope.id);
+      expect(genericEvent.data).toEqual(envelope.body);
+      expect(genericReceipt).toMatchObject({ id: envelope.id, sequence: genericEvent.sequence, duplicate: false,
+        envelope: { id: envelope.id, body: envelope.body } });
+    } finally { await transport.close(); }
+  });
+
+  it("9751: FILE native publish rejects the exact post-append error while generic send resolves the positive E1 sequence", async () => {
+    const f = setup(), transport = new FileTransport(f.mesh, { machine: "mesh", hostId: ownerId });
+    const publish = f.mesh.publish.bind(f.mesh), exactError = new Error("append completed, publisher completion failed");
+    const command = f.command("native-postappend"), stamp = vi.fn(() => command.data);
+    const native = { ...command, id: "native:postappend", data: stamp };
+    const generic = f.command("generic-postappend");
+    const envelope = { id: "logical:postappend", kind: "command" as const,
+      to: { machine: "mesh", hostId: ownerId }, targetId: "agent:same", operation: "steer",
+      from: generic.from, body: generic.data };
+    const appended: MeshEvent[] = [];
+    const spy = vi.spyOn(f.mesh, "publish").mockImplementation(async input => {
+      const event = await publish(input); // Real native append and positive receipt, not a fabricated event.
+      appended.push(event);
+      throw exactError;
+    });
+    try {
+      let nativeError: unknown;
+      await transport.publish(native).catch(error => { nativeError = error; });
+      // The identical call-through fault is NOT a native error for the generic E1 port.
+      const receipt = await transport.send(envelope);
+      const events = f.mesh.read({ limit: 1_000 });
+      expect(spy).toHaveBeenCalledTimes(2);
+      expect(events).toHaveLength(2);
+      expect(events).toEqual(appended);
+      expect(spy.mock.calls[0]![0].id).toBe(native.id);
+      expect(events[0]).toMatchObject({ id: native.id, data: command.data });
+      expect(events.filter(event => event.id === native.id)).toHaveLength(1);
+      expect(stamp).toHaveBeenCalledOnce();
+      const genericEvent = events[1]!;
+      expect(genericEvent.id).toBe(spy.mock.calls[1]![0].id);
+      expect(genericEvent.id).not.toBe(envelope.id);
+      expect(genericEvent.id).not.toBe(native.id);
+      expect(genericEvent.data).toEqual(envelope.body);
+      expect(genericEvent.sequence).toBeGreaterThan(0);
+      expect(receipt).toMatchObject({ id: envelope.id, sequence: genericEvent.sequence, duplicate: false,
+        envelope: { id: envelope.id, body: envelope.body } });
+      // A positive on-disk native event must not erase the publisher's completion error.
+      expect(nativeError).toBe(exactError);
+    } finally { await transport.close(); }
+  });
 
   it("9751: saved ACK backlog does not block ordered steer/followUp admission", async () => {
     const f = setup(), blocked = holdFirstAck(f), order: string[] = [];

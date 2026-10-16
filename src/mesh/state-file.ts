@@ -968,7 +968,12 @@ export class StateFile implements StateBackend {
   }
 
   async #withWriteSnapshot<T, P>(prepare: (snapshot: WriteStateSnapshot) => P,
-    commit: (prepared: P) => T, cleanup?: (prepared: P) => void, lockClass: MeshLockClass = "other", maxAttempts = Infinity): Promise<T> {
+    commit: (prepared: P, checkDeadline?: () => void) => T, cleanup?: (prepared: P) => void,
+    lockClass: MeshLockClass = "other", maxAttempts = Infinity, lockedFallback = false): Promise<T> {
+    // Only bridge batches with a prepare callback opt into this progress fallback.
+    // Static/CAS batches and put/delete retain their existing exhaustion policy.
+    // Reserve part of the ORIGINAL budget for one authoritative locked preparation.
+    const optimisticAttempts = lockedFallback ? 2 : maxAttempts;
     const scope = this.#lock.tryLockScope.getStore();
     if (!scope?.active) this.#sweepPreparedState();
     const deadline = Date.now() + this.#lock.lockTimeoutMs;
@@ -1012,7 +1017,11 @@ export class StateFile implements StateBackend {
         }
         // Never retry inside an actor registry fence: its caller releases custody and
         // retries the whole admission step, just as for a busy mesh.
-        if (scope?.active || attempts >= maxAttempts || Date.now() >= deadline) {
+        if (scope?.active || Date.now() >= deadline) {
+          throw new MeshSnapshotRetriesExhaustedError(attempts);
+        }
+        if (attempts >= optimisticAttempts) {
+          if (lockedFallback) break;
           throw new MeshSnapshotRetriesExhaustedError(attempts);
         }
         await delay(0, this.#lock.writeAbortSignal);
@@ -1020,12 +1029,30 @@ export class StateFile implements StateBackend {
         if (prepared !== undefined) cleanup?.(prepared);
       }
     }
+    // The discarded preparation has been cleaned before acquisition. Never reuse it:
+    // callback admission, CAS and lease decisions need the fresh locked snapshot.
+    const checkDeadline = (): void => {
+      this.#lock.writeAbortSignal?.throwIfAborted();
+      if (Date.now() >= deadline) throw new MeshSnapshotRetriesExhaustedError(attempts);
+    };
+    checkDeadline();
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) throw new MeshSnapshotRetriesExhaustedError(attempts);
+    return this.#lock.withLock(() => {
+      checkDeadline();
+      const prepared = prepare(this.#readStateForWrite());
+      try {
+        checkDeadline();
+        return commit(prepared, checkDeadline);
+      } finally { cleanup?.(prepared); }
+    }, remaining, lockClass);
   }
 
   // Pure transitions stage optimistically; lockedKeys keeps callback batches authoritative.
   async #writeState<T>(change: (state: MeshStateFile) => { result: T; keys?: string[] | undefined }, caller?: string[], options: {
     lockedKeys?: string[] | undefined; validate?: () => void; beforeCommit?: (() => void) | undefined;
     afterCommit?: (result: T, keys?: string[]) => void; lockClass?: MeshLockClass; maxAttempts?: number | undefined;
+    lockedFallback?: boolean;
   } = {}): Promise<T> {
     return this.#withWriteSnapshot(({ state, reuse, base }) => {
       let namespaces: Record<string, string> | undefined;
@@ -1062,10 +1089,13 @@ export class StateFile implements StateBackend {
         prepared.releaseTemporary = release;
       }
       return { state, reuse, base, namespaces, outcome, prepared };
-    }, ({ state, reuse, base, namespaces, outcome, prepared }) => {
+    }, ({ state, reuse, base, namespaces, outcome, prepared }, checkDeadline) => {
       options.validate?.();
       const { result, keys } = outcome ?? change(state);
       prepared ??= keys ? this.#prepareStateCommit(state, reuse, keys, base, namespaces) : undefined;
+      // Fresh callback/encoding can itself spend a locked fallback's remaining budget.
+      // Refuse before publication and before/after-commit effects, never on stale state.
+      checkDeadline?.();
       if (prepared) this.#commitPreparedState(prepared, keys!, caller, options.beforeCommit);
       else {
         options.beforeCommit?.();
@@ -1079,7 +1109,7 @@ export class StateFile implements StateBackend {
         try { fs.rmSync(prepared.temporary, { force: true }); } catch { /* Best-effort private staging cleanup. */ }
         prepared.releaseTemporary?.();
       }
-    }, options.lockClass ?? "put/delete", options.maxAttempts);
+    }, options.lockClass ?? "put/delete", options.maxAttempts, options.lockedFallback);
   }
 
   #prepareStateCommit(state: MeshStateFile, reuse: Map<string, EncodedStateEntry> | undefined,
@@ -1462,6 +1492,7 @@ export class StateFile implements StateBackend {
     }, caller, {
       lockedKeys: locked ? callerOps.map(op => op.key) : undefined,
       maxAttempts: locked ? undefined : 2,
+      lockedFallback: lockClass === "bridge" && prepare !== undefined,
       validate: () => { if (stampHolds && !stampHolds()) throw FILE_READ_CHANGED; },
       beforeCommit,
       afterCommit: (result, keys) => {
